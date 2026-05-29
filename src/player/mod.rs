@@ -128,6 +128,7 @@ fn spawn_player(
     ));
 }
 
+#[allow(clippy::type_complexity)] // Bevy query tuple; an alias hurts readability here.
 pub fn move_player(
     keyboard: Res<ButtonInput<KeyCode>>,
     time: Res<Time>,

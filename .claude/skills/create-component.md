@@ -1,133 +1,158 @@
 ---
 name: create-component
-description: Guide for creating well-designed Bevy 0.18 components in the adventure project
+description: Create a well-designed Bevy 0.18 component in the adventure project — pick the right kind, derives, storage, and registration. Trigger when adding any new Component, or when unsure whether something should even be a component.
 ---
 
 # Create Bevy Component
 
-Decision tree and checklist for adding a new component to this project.
+Decision tree for adding a component. Every example below is a real pattern from
+this codebase — copy them, don't invent. Part of the `/add-feature` workflow.
 
-## Step 1: Choose Component Type
+## Step 1: Should it even be a component?
 
-### Marker (ZST)
-Use when: tagging entities for query filtering, no data needed.
+A component is data attached to an *entity*. If the data lives in a `Vec` inside a
+`Resource`, or is global singleton state, it is NOT a component — use a `Resource`.
+Don't derive `Component` just to store something.
+
+## Step 2: Pick the kind
+
+### Marker (zero-sized)
+Tag entities for query filtering. No data, no memory cost.
 ```rust
+// src/player/mod.rs
 #[derive(Component)]
 pub struct Player;
+
+// src/sdf_render/mod.rs:28-35 — markers don't need Reflect unless serialized
+#[derive(Component)]
+pub struct SdfVolume;
 ```
 
 ### Newtype
-Use when: single value with type safety.
+Single value with type safety. Note the **manual `Default`** when zero isn't right:
 ```rust
+// src/player/mod.rs:38 — MovementSpeed defaults to 5.0, not 0.0
 #[derive(Component, Reflect)]
 #[reflect(Component)]
 pub struct MovementSpeed(pub f32);
+
+impl Default for MovementSpeed {
+    fn default() -> Self {
+        Self(5.0)
+    }
+}
 ```
 
-### Data Component
-Use when: multiple fields, coherent single responsibility.
+### Data component
+Multiple fields, one responsibility. Provide constructors instead of public-field
+churn at call sites:
 ```rust
-#[derive(Component, Reflect)]
+// src/player/mod.rs:12 — derives Default (zero is a valid empty bar)
+#[derive(Component, Reflect, Default)]
 #[reflect(Component)]
 pub struct Health {
     pub current: f32,
     pub max: f32,
 }
+
+impl Health {
+    pub fn full(max: f32) -> Self {
+        Self { current: max, max }
+    }
+}
 ```
 
-### Required Component
-Use when: component X should always exist when Y is spawned.
+### Required components
+When spawning X must always pull in Y. **Bevy 0.18 syntax** — bare type list using
+each type's `Default`:
 ```rust
+// src/player/mod.rs:8 — the ONLY require form used in this repo
 #[derive(Component)]
-#[require(Health(|| Health { current: 100.0, max: 100.0 }))]
+#[require(Health, Mana, MovementSpeed, PlayerName, PlayerLevel)]
 pub struct Player;
 ```
+Each required type supplies its own value via `Default` (see the `impl Default`s
+above). Spawning `Player` auto-inserts all five.
 
-## Step 2: Derives
+**To override a required default**, Bevy 0.18 also accepts (verify before use — none
+of these appear in this repo yet):
+| Form | Meaning |
+|---|---|
+| `Health` | uses `Health::default()` |
+| `Health::full(100.0)` | constructor call |
+| `MovementSpeed(8.0)` | tuple-struct literal |
+| `Health { current: 50.0, max: 50.0 }` | struct literal |
+| `Foo = some_expr()` | arbitrary expression |
+
+The **closure form `Foo(\|\| ...)` was removed** — do not use it.
+
+## Step 3: Derives
 
 | Need | Add |
 |------|-----|
 | Always | `#[derive(Component)]` |
-| Scene/BRP serialization | `+ Reflect` + `#[reflect(Component)]` |
-| Stored in Resources/Messages | `+ Clone` |
-| Sensible zero-value | `+ Default` |
+| Scene / BRP / inspector serialization | `+ Reflect` and `#[reflect(Component)]` |
+| Stored in a Resource or Message | `+ Clone` |
+| Sensible zero-value | `+ Default` (else write `impl Default` by hand) |
 
-Never auto-derive `Clone` or `Default` on components that represent unique runtime state.
+Don't auto-derive `Default`/`Clone` on components holding unique runtime state.
 
-## Step 3: Storage
+## Step 4: Storage
 
-| Default (Table) | SparseSet |
-|-----------------|-----------|
-| Frequently queried | Rarely queried |
-| Stable composition | Frequently added/removed |
-| Cache-friendly iteration | Fast insert/remove |
-
+Default `Table` storage is right for almost everything here (nothing in this repo
+uses SparseSet yet). Reach for SparseSet ONLY for components added/removed every few
+frames on many entities — status effects are the textbook case:
 ```rust
+#[derive(Component)]
 #[component(storage = "SparseSet")]
+pub struct Stunned;
 ```
 
-Use for status effects: `Stunned`, `Invulnerable`, `Poisoned`.
+## Step 5: Register if Reflect
 
-## Step 4: Registration
-
-In the plugin's `build()` method:
+Any `Reflect` component must be registered in the owning plugin's `build()`, or
+scenes/BRP/inspector won't see it:
 ```rust
-app.register_type::<MyComponent>();
+// src/player/mod.rs:83 — register every Reflect type
+app.register_type::<Health>()
+    .register_type::<Mana>()
+    .register_type::<MovementSpeed>();
 ```
 
-Required for any component with `Reflect`. Enables scene serialization and BRP queries.
+## Step 6: Module placement
 
-## Step 5: Module Placement
-
-| Component domain | Module |
-|-----------------|--------|
+| Domain | Module |
+|--------|--------|
 | Player stats/movement | `src/player/mod.rs` |
-| Combat mechanics | `src/combat/mod.rs` |
+| Combat | `src/combat/mod.rs` |
 | Items/inventory | `src/inventory/mod.rs` |
 | World/NPCs | `src/world/mod.rs` |
-| UI markers | `src/ui/mod.rs` |
+| UI | `src/ui/mod.rs` |
 | Camera | `src/camera/mod.rs` |
 | Chat/networking | `src/networking/mod.rs` |
+| SDF editor/render | `src/sdf_render/` |
 
-Cross-cutting components: create a new module or place in the primary consumer.
+Cross-cutting types go in their primary consumer, or a new module.
 
-## Step 6: Spawn Pattern
+## Step 7: Tests
 
-```rust
-// In a Startup or OnEnter system:
-commands.spawn((
-    MyMarker,
-    MyDataComponent { field: value },
-    Transform::from_xyz(0.0, 0.0, 0.0),
-));
+See `/add-feature` for the per-feature test bar. At minimum for a new component:
+- `Default` value test if it has a non-trivial default (`MovementSpeed` → 5.0).
+- Registration test if `Reflect`: build the plugin, assert the type is registered.
+- If a system reads/writes it, exercise that system via `test_utils::test_app()`.
 
-// With required components (auto-fills defaults):
-commands.spawn(Player);
-```
+## Anti-patterns
 
-## Step 7: Query Pattern
+1. **God component** — unrelated fields (speed + health + name) in one struct.
+2. **`Component` on Resource-stored data** — if it lives in a `Vec` in a resource it
+   isn't a component.
+3. **Missing `Reflect`** on a type used in scenes/messages/BRP.
+4. **Closure `#[require]`** — removed in 0.18; use the type-list or `= expr` forms.
+5. **Logic in components** — components are data; logic goes in systems.
+6. **Marker on every entity** — needless archetype fragmentation.
 
-```rust
-fn my_system(
-    markers: Query<Entity, With<MyMarker>>,
-    data: Query<&MyDataComponent, With<MyMarker>>,
-    mut_data: Query<&mut MyDataComponent, With<MyMarker>>,
-    filtered: Query<&MyDataComponent, (With<MyMarker>, Without<OtherMarker>)>,
-) { ... }
-```
+## Related
 
-## Step 8: Tests
-
-- Unit test for `Default` values (if applicable)
-- If `Reflect`: test registration via `app.register_type::<T>()` + `world.contains::<T>()`
-- If used in systems: test with `test_utils::test_app()` helper
-
-## Anti-Patterns to Avoid
-
-1. **God components** — one struct holding unrelated data (speed + health + name)
-2. **Component on data only stored in Resources** — if it lives in a `Vec` inside a `Resource`, it doesn't need `#[derive(Component)]`
-3. **Missing `Reflect`** on types used in scenes or messages
-4. **Early returns** instead of run conditions (`.run_if(...)`)
-5. **Manual cleanup** instead of `StateScoped<S>`
-6. **Logic in components** — keep components as pure data, put logic in systems
-7. **Excessive archetype fragmentation** — don't add unique marker to every entity
+- `/add-feature` — the full feature workflow this fits into.
+- `design-ecs` — deeper ECS design principles (single-source-of-truth, ordering, guards).
+- `/create-scene` — if the component goes in a `.scn.ron`.

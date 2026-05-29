@@ -15,8 +15,17 @@ struct SdfCameraUniform {
     screen_params: vec4<f32>,
     grid_origin: vec4<f32>,
     grid_dims: vec4<f32>,
-    debug_params: vec4<f32>,   // x = max_steps, y = max_dist, z = sdf_eps
-    object_colors: array<vec4<f32>, 8u>,
+    debug_params: vec4<f32>,   // x = max_steps, y = max_dist, z = sdf_eps, w = bvh_node_count
+};
+
+// One material row, indexed by material id. Mirrors `GpuSdfMaterial` (render.rs).
+// PBR/texture fields will be appended here and on the CPU side together.
+struct SdfMaterial {
+    base_color: vec4<f32>,
+    blend_softness: f32,   // world-units colour-feather width at a seam
+    _pad0: f32,
+    _pad1: f32,
+    _pad2: f32,
 };
 
 struct BrickLookup {
@@ -47,6 +56,7 @@ struct BvhNode {
 @group(1) @binding(3) var mat_lo_tex: texture_2d<f32>;      // Rgba16Snorm material dist, ids 0..3
 @group(1) @binding(4) var mat_hi_tex: texture_2d<f32>;      // Rgba16Snorm material dist, ids 4..7
 @group(1) @binding(5) var<storage, read> bvh_buf: array<BvhNode>;  // edit-AABB BVH (empty-space skip)
+@group(1) @binding(6) var<storage, read> materials: array<SdfMaterial>;  // material table, by id
 
 fn num_bvh_nodes() -> u32 { return u32(camera.debug_params.w); }
 const BVH_INTERNAL_FLAG: u32 = 0x80000000u;
@@ -320,15 +330,23 @@ fn scene_sdf(p: vec3<f32>) -> SceneSdfResult {
     return SceneSdfResult(d, pick.id, pick.id2, pick.gap, true);
 }
 
-// Resolve the final surface colour with anti-aliased material seams. Safe to call
-// fwidth here: `main` runs in uniform control flow. The seam (gap == 0) is widened
-// to ~1 screen pixel via fwidth, so the boundary tracks projected size.
+// Resolve the final surface colour with anti-aliased / artist-controlled material
+// seams. Safe to call fwidth here: `main` runs in uniform control flow.
+//
+// The seam lives where the two nearest materials are equidistant (gap == 0). The
+// cross-fade half-width is the larger of:
+//   * fwidth(gap) — keeps the boundary ≥ 1 screen pixel so it never aliases, and
+//   * the pair's blend_softness (world units) — the artist control: a soft
+//     material (e.g. sand) feathers widely into its neighbour (e.g. rock), a hard
+//     material stays crisp. Seam width uses max(soft_a, soft_b) so one soft
+//     material is enough to soften the contact.
 fn shade_material(res: SceneSdfResult) -> vec3<f32> {
-    let col_a = camera.object_colors[i32(res.object_id)].rgb;
-    let col_b = camera.object_colors[i32(res.object_id2)].rgb;
-    let band = max(fwidth(res.gap), 1e-5);
+    let mat_a = materials[res.object_id];
+    let mat_b = materials[res.object_id2];
+    let soft = max(mat_a.blend_softness, mat_b.blend_softness);
+    let band = max(max(fwidth(res.gap), soft), 1e-5);
     let w = clamp(0.5 + 0.5 * res.gap / band, 0.5, 1.0);  // 0.5 at seam → 1 away
-    return mix(col_b, col_a, w);
+    return mix(mat_b.base_color.rgb, mat_a.base_color.rgb, w);
 }
 
 // Distance along the ray to the far side of the brick containing `p`.

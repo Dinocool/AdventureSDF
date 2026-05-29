@@ -102,3 +102,8 @@ fn setup_visuals(
 ## File Location
 
 Scenes go in `assets/scenes/`. Load with `asset_server.load("scenes/name.scn.ron")`.
+
+## Related
+
+- `/add-feature` — when a feature's entities belong in a saved scene, this is Step 7.
+- `/create-component` — components need `Reflect` + `register_type` to serialize.

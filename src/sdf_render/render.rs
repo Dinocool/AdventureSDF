@@ -17,9 +17,9 @@ use bevy::render::view::{ViewDepthTexture, ViewTarget};
 use bevy::render::{Extract, ExtractSchedule, Render, RenderApp, RenderStartup};
 
 use super::atlas::{BRICK_EDGE, SdfAtlas};
-use super::edits::MATERIAL_SLOTS;
 use super::bvh::Bvh;
-use super::{SdfCamera, SdfColor, SdfGridConfig, SdfOrder, SdfRenderEnabled, SdfVolume};
+use super::edits::MATERIAL_SLOTS;
+use super::{SdfCamera, SdfGridConfig, SdfOrder, SdfRenderEnabled, SdfVolume};
 
 // --- GPU Types ---
 
@@ -58,7 +58,20 @@ struct SdfCameraData {
     grid_origin: Vec4,   // xyz = grid origin, w = voxel_size
     grid_dims: Vec4, // x = grid_size, y = bricks_per_axis, z = brick_size (8.0), w = num_lookups
     debug_params: Vec4, // x = max_steps, y = max_dist, z = sdf_eps, w = bvh_node_count
-    object_colors: [Vec4; 8],
+}
+
+/// GPU mirror of [`super::edits::SdfMaterial`], one per material id. Indexed by the
+/// edit's resolved material id in a storage buffer (replaces the old fixed
+/// `object_colors[8]` uniform). This is the row the PBR workflow extends: add
+/// `metallic`, `roughness`, `emissive`, and texture indices here + in the shader's
+/// matching struct, no other plumbing changes. 16-byte aligned for std430.
+#[derive(ShaderType, Clone, Copy, Default)]
+struct GpuSdfMaterial {
+    base_color: Vec4,
+    blend_softness: f32,
+    _pad0: f32,
+    _pad1: f32,
+    _pad2: f32,
 }
 
 // --- Extracted Atlas ---
@@ -101,6 +114,14 @@ struct SdfGpuAtlas {
     lookup_buffer: Option<Buffer>,
     bvh_buffer: Option<Buffer>,
     bvh_node_count: u32,
+    /// Material table (storage buffer of `GpuSdfMaterial`, indexed by material id).
+    material_buffer: Option<Buffer>,
+}
+
+/// Material table extracted from the main world for GPU upload.
+#[derive(Resource, Default)]
+struct ExtractedSdfMaterials {
+    materials: Vec<GpuSdfMaterial>,
 }
 
 // --- Pipeline ---
@@ -160,10 +181,10 @@ impl ViewNode for SdfNode {
         }
 
         // Skip SDF pass when toggled off (F1)
-        if let Some(enabled) = world.get_resource::<SdfRenderEnabled>() {
-            if !enabled.0 {
-                return Ok(());
-            }
+        if let Some(enabled) = world.get_resource::<SdfRenderEnabled>()
+            && !enabled.0
+        {
+            return Ok(());
         }
 
         let pipeline_res = world.resource::<SdfPipeline>();
@@ -175,13 +196,11 @@ impl ViewNode for SdfNode {
         if pipeline.is_none() {
             use std::sync::atomic::{AtomicBool, Ordering};
             static LOGGED: AtomicBool = AtomicBool::new(false);
-            if !LOGGED.swap(true, Ordering::Relaxed) {
-                match pipeline_cache.get_render_pipeline_state(pipeline_res.pipeline_id) {
-                    bevy::render::render_resource::CachedPipelineState::Err(err) => {
-                        bevy::log::error!("SDF pipeline error: {err}");
-                    }
-                    _ => {}
-                }
+            if !LOGGED.swap(true, Ordering::Relaxed)
+                && let bevy::render::render_resource::CachedPipelineState::Err(err) =
+                    pipeline_cache.get_render_pipeline_state(pipeline_res.pipeline_id)
+            {
+                bevy::log::error!("SDF pipeline error: {err}");
             }
         }
         let layout_0 = pipeline_cache.get_bind_group_layout(&pipeline_res.layout_0);
@@ -209,10 +228,10 @@ impl ViewNode for SdfNode {
                     &BindGroupEntries::sequential((binding.clone(),)),
                 )
             } else {
-                create_dummy_bg0(&device, &layout_0)
+                create_dummy_bg0(device, &layout_0)
             }
         } else {
-            create_dummy_bg0(&device, &layout_0)
+            create_dummy_bg0(device, &layout_0)
         };
 
         // Bind group 1: atlas (always available — dummy in init)
@@ -232,6 +251,11 @@ impl ViewNode for SdfNode {
                 gpu_atlas.mat_hi_view.as_ref().unwrap(),
                 gpu_atlas
                     .bvh_buffer
+                    .as_ref()
+                    .unwrap()
+                    .as_entire_buffer_binding(),
+                gpu_atlas
+                    .material_buffer
                     .as_ref()
                     .unwrap()
                     .as_entire_buffer_binding(),
@@ -280,6 +304,7 @@ impl Plugin for SdfRenderPlugin {
         let shader_handle = app.world().resource::<AssetServer>().load(SDF_SHADER_PATH);
         app.insert_resource(SdfShaderHandle(shader_handle))
             .init_resource::<SdfShaderDefs>()
+            .init_resource::<SdfMaterialTable>()
             .register_type::<SdfCameraData>()
             // These plugins must be added to the main app — they internally
             // find the render app via get_sub_app_mut(RenderApp)
@@ -312,9 +337,11 @@ impl Plugin for SdfRenderPlugin {
         render_app
             .add_systems(ExtractSchedule, extract_sdf_atlas)
             .add_systems(ExtractSchedule, extract_sdf_bvh)
+            .add_systems(ExtractSchedule, extract_sdf_materials)
             .add_systems(ExtractSchedule, extract_shader_defs)
             .add_systems(Render, prepare_sdf_atlas_gpu)
             .add_systems(Render, prepare_sdf_bvh_gpu)
+            .add_systems(Render, prepare_sdf_materials_gpu)
             .add_systems(Render, rebuild_pipeline_on_def_change)
             .add_systems(RenderStartup, init_sdf_pipeline)
             .add_render_graph_node::<ViewNodeRunner<SdfNode>>(Core3d, SdfLabel)
@@ -336,26 +363,42 @@ impl Plugin for SdfRenderPlugin {
 
 // --- Main World: Prepare Camera Data ---
 
+/// Main-world material table, rebuilt each frame from the SDF volumes in resolved
+/// material-id order. Extracted into the render world and uploaded as a storage
+/// buffer. The PBR workflow extends [`GpuSdfMaterial`]; this builder just copies
+/// the extra fields across.
+#[derive(Resource, Default)]
+pub struct SdfMaterialTable {
+    materials: Vec<GpuSdfMaterial>,
+}
+
+#[allow(clippy::too_many_arguments)] // Bevy system params; splitting is artificial.
 fn prepare_sdf_camera_data(
     mut commands: Commands,
     cameras: Query<(Entity, &Camera, &Transform), With<SdfCamera>>,
-    volumes: Query<(Entity, &SdfColor, &SdfOrder), With<SdfVolume>>,
+    volumes: Query<(Entity, &super::SdfMaterial, &SdfOrder), With<SdfVolume>>,
     atlas: Res<SdfAtlas>,
     config: Res<SdfGridConfig>,
     raymarch: Res<super::SdfRaymarchParams>,
     bvh: Res<Bvh>,
+    mut material_table: ResMut<SdfMaterialTable>,
 ) {
-    let mut object_colors = [Vec4::ZERO; 8];
-
     // Material id = position in SdfOrder order (ties by entity index), matching
-    // `gather_sorted_edits` so colours line up with the baked per-voxel ids.
-    let mut ordered: Vec<(Entity, Color, SdfOrder)> =
-        volumes.iter().map(|(e, c, o)| (e, c.0, *o)).collect();
+    // `gather_sorted_edits` so the table lines up with the baked per-voxel ids.
+    let mut ordered: Vec<(Entity, super::SdfMaterial, SdfOrder)> =
+        volumes.iter().map(|(e, m, o)| (e, *m, *o)).collect();
     ordered.sort_by(|a, b| a.2.cmp(&b.2).then(a.0.index().cmp(&b.0.index())));
 
-    for (i, (_, color, _)) in ordered.iter().take(8).enumerate() {
-        let linear = color.to_linear();
-        object_colors[i] = Vec4::new(linear.red, linear.green, linear.blue, 1.0);
+    material_table.materials.clear();
+    for (_, mat, _) in ordered.iter() {
+        let lin = mat.base_color.to_linear();
+        material_table.materials.push(GpuSdfMaterial {
+            base_color: Vec4::new(lin.red, lin.green, lin.blue, 1.0),
+            blend_softness: mat.blend_softness,
+            _pad0: 0.0,
+            _pad1: 0.0,
+            _pad2: 0.0,
+        });
     }
 
     let num_lookups = atlas.bricks.len() as u32;
@@ -394,7 +437,6 @@ fn prepare_sdf_camera_data(
                 raymarch.sdf_eps,
                 bvh.nodes.len() as f32,
             ),
-            object_colors,
         });
     }
 }
@@ -557,6 +599,47 @@ fn extract_sdf_atlas(
         texture_height,
         dirty: true,
     });
+}
+
+// --- Extract: Material table ---
+
+fn extract_sdf_materials(table: Extract<Res<SdfMaterialTable>>, mut commands: Commands) {
+    // Always carry at least one row so the storage buffer is never zero-sized.
+    let mut materials = table.materials.clone();
+    if materials.is_empty() {
+        materials.push(GpuSdfMaterial::default());
+    }
+    commands.insert_resource(ExtractedSdfMaterials { materials });
+}
+
+fn prepare_sdf_materials_gpu(
+    device: Res<RenderDevice>,
+    extracted: Option<Res<ExtractedSdfMaterials>>,
+    mut gpu_atlas: ResMut<SdfGpuAtlas>,
+) {
+    let Some(extracted) = extracted else { return };
+    // std430: each GpuSdfMaterial is 32 bytes (vec4 + 4 f32). Pack LE bytes.
+    let mut bytes = Vec::with_capacity(extracted.materials.len() * 32);
+    for m in &extracted.materials {
+        for c in [
+            m.base_color.x,
+            m.base_color.y,
+            m.base_color.z,
+            m.base_color.w,
+        ] {
+            bytes.extend_from_slice(&c.to_le_bytes());
+        }
+        bytes.extend_from_slice(&m.blend_softness.to_le_bytes());
+        bytes.extend_from_slice(&0f32.to_le_bytes());
+        bytes.extend_from_slice(&0f32.to_le_bytes());
+        bytes.extend_from_slice(&0f32.to_le_bytes());
+    }
+    let buffer = device.create_buffer_with_data(&BufferInitDescriptor {
+        label: Some("sdf_material_buffer"),
+        contents: &bytes,
+        usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
+    });
+    gpu_atlas.material_buffer = Some(buffer);
 }
 
 // --- Extract: Flatten BVH for GPU ---
@@ -747,6 +830,8 @@ fn init_sdf_pipeline(
                 texture_2d(TextureSampleType::Float { filterable: false }),
                 // binding 5: BVH nodes (empty-space-skip acceleration)
                 storage_buffer_read_only::<GpuBvhNode>(false),
+                // binding 6: material table (indexed by material id)
+                storage_buffer_read_only::<GpuSdfMaterial>(false),
             ),
         ),
     );
@@ -816,6 +901,12 @@ fn init_sdf_pipeline(
         contents: &[0u8; 32],
         usage: BufferUsages::STORAGE,
     });
+    // One zeroed 32-byte material row so binding 6 is always valid pre-upload.
+    let dummy_material = device.create_buffer_with_data(&BufferInitDescriptor {
+        label: Some("sdf_dummy_material"),
+        contents: &[0u8; 32],
+        usage: BufferUsages::STORAGE,
+    });
     // Matching dummy material atlases (Rgba16Snorm = 8 bytes/texel) so bind group
     // 1 is always valid before the first bake.
     let dummy_mat = |label: &'static str| {
@@ -856,5 +947,6 @@ fn init_sdf_pipeline(
         lookup_buffer: Some(dummy_lookup),
         bvh_buffer: Some(dummy_bvh),
         bvh_node_count: 0,
+        material_buffer: Some(dummy_material),
     });
 }

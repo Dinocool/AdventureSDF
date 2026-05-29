@@ -13,6 +13,14 @@ pub fn test_app_with_input() -> App {
     app
 }
 
+/// Headless app with state `S` initialized, for testing state-scoped features
+/// (`OnEnter`/`OnExit` systems, `run_if(in_state(...))`). Starts in `S::default()`.
+pub fn test_app_with_state<S: bevy::state::state::FreelyMutableState + FromWorld>() -> App {
+    let mut app = test_app();
+    app.init_state::<S>();
+    app
+}
+
 pub fn press_key(app: &mut App, key: KeyCode) {
     app.world_mut()
         .resource_mut::<ButtonInput<KeyCode>>()
@@ -50,6 +58,25 @@ pub fn spawn_test_player(world: &mut World) -> Entity {
                 vertical_velocity: 0.0,
             },
             Transform::from_xyz(0.0, 1.0, 0.0),
+        ))
+        .id()
+}
+
+/// Spawn an NPC quest-giver for world/interaction tests. Mirrors the entity built
+/// by the `generate_world_scene` test in `src/world/mod.rs`.
+pub fn spawn_test_npc(world: &mut World) -> Entity {
+    world
+        .spawn((
+            crate::world::Npc {
+                name: "TestNpc".into(),
+                level: 5,
+                hostile: false,
+            },
+            crate::world::QuestGiver {
+                quest_name: "Test Quest".into(),
+                quest_description: "A test quest.".into(),
+            },
+            Transform::from_xyz(2.0, 0.0, 2.0),
         ))
         .id()
 }

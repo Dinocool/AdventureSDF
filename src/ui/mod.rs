@@ -265,7 +265,7 @@ fn update_lootable_cursor(
         .with_visibility(RayCastVisibility::Any);
 
     let hits = ray_cast.cast_ray(ray, &settings);
-    *icon = if hits.first().is_some() {
+    *icon = if !hits.is_empty() {
         CursorIcon::System(SystemCursorIcon::Pointer)
     } else {
         CursorIcon::System(SystemCursorIcon::Default)
@@ -361,7 +361,7 @@ fn spawn_inventory_panel(
                                         ..default()
                                     },
                                     children![
-                                        (Text(format!("{label}")),),
+                                        (Text(label.to_string()),),
                                         (Text(format!("x{qty}")),),
                                     ],
                                 ));
@@ -515,6 +515,7 @@ fn despawn_loot_window(mut commands: Commands, window_query: Query<Entity, With<
 
 // --- Window Dragging ---
 
+#[allow(clippy::type_complexity)] // Bevy query tuples; aliases hurt readability here.
 fn handle_window_drag(
     mouse_buttons: Res<ButtonInput<MouseButton>>,
     mut motion_events: MessageReader<MouseMotion>,
@@ -586,66 +587,63 @@ fn handle_tooltip(
 
     // Check inventory slots
     for (interaction, slot, _slot_entity) in &_inventory_slot_query {
-        if *interaction == Interaction::Hovered {
-            if slot.0 < inventory.items.len() {
-                let (item, qty) = &inventory.items[slot.0];
-                tooltip_data = Some((
-                    format!(
-                        "{} (x{})\n{} | Lv{}",
-                        item.name,
-                        qty,
-                        item_rarity_label(&item.rarity),
-                        item.level_requirement
-                    ),
-                    item.rarity.color(),
-                    Vec2::ZERO, // will be offset below
-                ));
-            }
+        if *interaction == Interaction::Hovered && slot.0 < inventory.items.len() {
+            let (item, qty) = &inventory.items[slot.0];
+            tooltip_data = Some((
+                format!(
+                    "{} (x{})\n{} | Lv{}",
+                    item.name,
+                    qty,
+                    item_rarity_label(&item.rarity),
+                    item.level_requirement
+                ),
+                item.rarity.color(),
+                Vec2::ZERO, // will be offset below
+            ));
         }
     }
 
     // Check loot slots
     for (interaction, slot) in &loot_slot_query {
-        if *interaction == Interaction::Hovered {
-            if let Ok(lootable) = lootable_query.get(slot.source_entity) {
-                if slot.item_index < lootable.items.len() {
-                    let (item, qty) = &lootable.items[slot.item_index];
-                    tooltip_data = Some((
-                        format!(
-                            "{} (x{})\n{} | Lv{}",
-                            item.name,
-                            qty,
-                            item_rarity_label(&item.rarity),
-                            item.level_requirement
-                        ),
-                        item.rarity.color(),
-                        Vec2::ZERO,
-                    ));
-                }
-            }
+        if *interaction == Interaction::Hovered
+            && let Ok(lootable) = lootable_query.get(slot.source_entity)
+            && slot.item_index < lootable.items.len()
+        {
+            let (item, qty) = &lootable.items[slot.item_index];
+            tooltip_data = Some((
+                format!(
+                    "{} (x{})\n{} | Lv{}",
+                    item.name,
+                    qty,
+                    item_rarity_label(&item.rarity),
+                    item.level_requirement
+                ),
+                item.rarity.color(),
+                Vec2::ZERO,
+            ));
         }
     }
 
-    if let Some((text, color, _)) = tooltip_data {
-        if let Ok(window) = windows.single() {
-            let cursor_pos = window.cursor_position().unwrap_or(Vec2::ZERO);
+    if let Some((text, color, _)) = tooltip_data
+        && let Ok(window) = windows.single()
+    {
+        let cursor_pos = window.cursor_position().unwrap_or(Vec2::ZERO);
 
-            commands.spawn((
-                Node {
-                    position_type: PositionType::Absolute,
-                    left: Val::Px(cursor_pos.x + 15.0),
-                    top: Val::Px(cursor_pos.y + 15.0),
-                    padding: UiRect::all(Val::Px(6.0)),
-                    ..default()
-                },
-                BackgroundColor(Color::srgba(0.05, 0.05, 0.1, 0.95)),
-                BorderColor::all(color),
-                ZIndex(100),
-                Tooltip,
-                Text(text),
-                TextColor(color),
-            ));
-        }
+        commands.spawn((
+            Node {
+                position_type: PositionType::Absolute,
+                left: Val::Px(cursor_pos.x + 15.0),
+                top: Val::Px(cursor_pos.y + 15.0),
+                padding: UiRect::all(Val::Px(6.0)),
+                ..default()
+            },
+            BackgroundColor(Color::srgba(0.05, 0.05, 0.1, 0.95)),
+            BorderColor::all(color),
+            ZIndex(100),
+            Tooltip,
+            Text(text),
+            TextColor(color),
+        ));
     }
 }
 

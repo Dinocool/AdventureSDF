@@ -1,11 +1,12 @@
 //! Modular SDF edit system: primitives, CSG operations, and the single shared
 //! evaluation path used by baking, CPU picking, and CPU raycasting.
 //!
-//! An "edit" is a Bevy entity carrying [`SdfPrimitive`] + [`SdfOp`] + [`SdfOrder`]
-//! + a `Transform`. Edits are folded in `SdfOrder` order into one signed distance
-//! field via [`fold_csg`]; the fold also resolves a single material id per sample
-//! following CSG semantics (a subtractor carves but contributes no surface
-//! material; an intersector keeps the more-constraining surface's material).
+//! An "edit" is a Bevy entity carrying a [`SdfPrimitive`], an [`SdfOp`], an
+//! [`SdfOrder`], and a `Transform`. Edits are folded in `SdfOrder` order into one
+//! signed distance field via [`fold_csg`]; the fold also resolves a single
+//! material id per sample following CSG semantics (a subtractor carves but
+//! contributes no surface material; an intersector keeps the more-constraining
+//! surface's material).
 
 use bevy::math::bounding::Aabb3d;
 use bevy::prelude::*;
@@ -87,13 +88,34 @@ impl Default for SdfOp {
 
 /// Explicit evaluation order within the CSG stack. Lower values are applied
 /// first. The first edit's `SdfOp` is effectively a Union onto empty space.
-#[derive(Component, Reflect, Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Component, Reflect, Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
 #[reflect(Component)]
 pub struct SdfOrder(pub u32);
 
-impl Default for SdfOrder {
+/// Per-edit material. Uploaded to the GPU as an entry in a material storage-buffer
+/// table indexed by the edit's resolved material id (see render.rs). This is the
+/// extension point for the upcoming PBR/texture workflow — metallic, roughness,
+/// emissive, and base/normal/etc. texture indices will be added here and to the
+/// GPU mirror, without touching the bake or the dense per-material distance field.
+///
+/// `blend_softness` is a *shading-time* control (world units): at a seam between
+/// two different materials, the colour cross-fade spans `max(softness_a,
+/// softness_b)`. `0` keeps the material boundary as crisp as the dense field's
+/// sub-voxel bisector allows; larger values feather it (e.g. rock fading into
+/// sand). It does not affect geometry — that is `SdfOp::smoothing`.
+#[derive(Component, Reflect, Clone, Copy, Debug)]
+#[reflect(Component)]
+pub struct SdfMaterial {
+    pub base_color: Color,
+    pub blend_softness: f32,
+}
+
+impl Default for SdfMaterial {
     fn default() -> Self {
-        Self(0)
+        Self {
+            base_color: Color::srgb(0.8, 0.8, 0.8),
+            blend_softness: 0.0,
+        }
     }
 }
 
@@ -499,18 +521,6 @@ pub fn material_distances(edits: &[ResolvedEdit], pos: Vec3) -> [f32; MATERIAL_S
         }
     }
     slots
-}
-
-/// Index of the smallest slot in a per-material distance array (the material that
-/// owns the surface at that point). Ties resolve to the lower index for stability.
-pub fn argmin_material(slots: &[f32; MATERIAL_SLOTS]) -> u8 {
-    let mut best = 0usize;
-    for m in 1..MATERIAL_SLOTS {
-        if slots[m] < slots[best] {
-            best = m;
-        }
-    }
-    best as u8
 }
 
 #[cfg(test)]

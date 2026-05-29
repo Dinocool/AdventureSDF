@@ -8,6 +8,9 @@ pub enum DockSide {
     Bottom,
 }
 
+/// A panel's render callback: exclusive `World` access + the egui `Ui` to draw into.
+pub type PanelRenderFn = dyn Fn(&mut World, &mut bevy_egui::egui::Ui) + Send + Sync;
+
 /// A debug panel contributed by any plugin. The `render` closure is called once
 /// per frame with exclusive `World` access inside a collapsing section.
 pub struct DebugPanel {
@@ -15,7 +18,7 @@ pub struct DebugPanel {
     pub title: String,
     pub dock: DockSide,
     pub order: i32,
-    pub render: Box<dyn Fn(&mut World, &mut bevy_egui::egui::Ui) + Send + Sync>,
+    pub render: Box<PanelRenderFn>,
 }
 
 /// Write-once catalog of debug panels. Plugins register at build time; the dock

@@ -23,10 +23,10 @@ pub struct BvhNode {
     pub count_or_right: u32,
 }
 
-/// Internal vs leaf is encoded by the high bit of `count_or_right` (see
-/// [`INTERNAL_FLAG`]): set => internal node (the field is the right-child index);
-/// clear => leaf (the field is the edit count). This keeps the node a tight 32
-/// bytes with no extra flag word and stays unambiguous even for child index 0.
+// Internal vs leaf is encoded by the high bit of `count_or_right` (see
+// `INTERNAL_FLAG`): set => internal node (the field is the right-child index);
+// clear => leaf (the field is the edit count). This keeps the node a tight 32
+// bytes with no extra flag word and stays unambiguous even for child index 0.
 
 /// Maximum edits stored in a single leaf before we stop trying to split.
 const LEAF_SIZE: usize = 4;
@@ -319,23 +319,36 @@ mod tests {
         assert!(root.aabb_max[2] >= 6.0 - 1e-3);
     }
 
+    /// `query_aabb` is a broad phase: it returns every edit in any leaf whose
+    /// subtree AABB overlaps the query (a superset — extra far edits are harmless
+    /// for the bake, which evaluates them and lets them lose the min/argmin). The
+    /// guarantee is that an overlapping edit is always included, and edits in a
+    /// non-overlapping subtree are excluded. With enough spatial separation the
+    /// tree splits so the far edit is pruned.
     #[test]
-    fn query_returns_only_overlapping() {
+    fn query_includes_overlapping_and_prunes_distant() {
+        // Two far-apart clusters of 3; >LEAF_SIZE total forces a split so the
+        // median plane separates left (0,1,2) from right (3,4,5).
         let boxes = vec![
-            aabb(-5.0, 0.0, 0.0, 1.0), // edit 0
-            aabb(5.0, 0.0, 0.0, 1.0),  // edit 1
-            aabb(0.0, 0.0, 0.0, 1.0),  // edit 2
+            aabb(-50.0, 0.0, 0.0, 1.0), // edit 0
+            aabb(-49.0, 0.0, 0.0, 1.0), // edit 1
+            aabb(-48.0, 0.0, 0.0, 1.0), // edit 2
+            aabb(48.0, 0.0, 0.0, 1.0),  // edit 3
+            aabb(49.0, 0.0, 0.0, 1.0),  // edit 4
+            aabb(50.0, 0.0, 0.0, 1.0),  // edit 5
         ];
         let bvh = Bvh::build(&boxes);
 
         let mut out = Vec::new();
-        bvh.query_aabb(&aabb(5.0, 0.0, 0.0, 0.5), &mut out);
+        bvh.query_aabb(&aabb(50.0, 0.0, 0.0, 0.5), &mut out);
         out.sort();
-        assert_eq!(out, vec![1]);
-
-        bvh.query_aabb(&aabb(0.0, 0.0, 0.0, 0.5), &mut out);
-        out.sort();
-        assert_eq!(out, vec![2]);
+        // Must include the overlapping edit 5, and must NOT include the far-left
+        // cluster (0,1,2) which lives in the other subtree.
+        assert!(out.contains(&5), "overlapping edit must be returned");
+        assert!(
+            !out.contains(&0) && !out.contains(&1) && !out.contains(&2),
+            "distant subtree must be pruned, got {out:?}"
+        );
     }
 
     #[test]
