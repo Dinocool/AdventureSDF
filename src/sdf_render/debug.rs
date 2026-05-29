@@ -18,7 +18,7 @@ use crate::scene_manager::{AppScene, SceneEntity};
 
 use super::atlas::{BRICK_EDGE, BRICK_VOXELS, SdfAtlas};
 use super::bvh::Bvh;
-use super::edits::MATERIAL_SLOTS;
+use super::edits::PALETTE_K;
 use super::{
     CsgKind, RayStepCapture, SdfCamera, SdfGridConfig, SdfMaterial, SdfOp, SdfOrbitCamera,
     SdfOrder, SdfOverlayGizmos, SdfPrimitive, SdfRaymarchParams, SdfSelection, SdfVolume,
@@ -90,12 +90,14 @@ impl Default for BvhDebugState {
     }
 }
 
-/// Authoring panel state: the primitive/op to spawn next.
+/// Authoring panel state: the primitive/op/material to spawn next.
 #[derive(Resource)]
 pub struct SpawnState {
     pub kind: SpawnKind,
     pub op: CsgKind,
     pub smoothing: f32,
+    /// Registry id for the next spawn, or `u32::MAX` = create a fresh material.
+    pub material: u32,
 }
 
 impl Default for SpawnState {
@@ -104,6 +106,7 @@ impl Default for SpawnState {
             kind: SpawnKind::Sphere,
             op: CsgKind::Union,
             smoothing: 0.0,
+            material: u32::MAX,
         }
     }
 }
@@ -343,8 +346,11 @@ fn update_atlas_stats(mut stats: ResMut<SdfAtlasStats>, atlas: Res<SdfAtlas>) {
         stats.dist_bytes + stats.object_bytes + stats.blend_bytes + stats.lookup_bytes;
 
     stats.total_bricks = total as u32;
-    stats.atlas_width = total as u32 * (BRICK_EDGE * BRICK_EDGE) as u32;
-    stats.atlas_height = BRICK_EDGE as u32;
+    // 2D-tiled dims (matches the render atlas + preview): tiles wrap at 256/row.
+    let tiles_per_row: u32 = 256;
+    let num_rows = (total as u32).div_ceil(tiles_per_row).max(1);
+    stats.atlas_width = tiles_per_row * (BRICK_EDGE * BRICK_EDGE) as u32;
+    stats.atlas_height = num_rows * BRICK_EDGE as u32;
     stats.dirty = atlas.dirty;
 }
 
@@ -383,21 +389,28 @@ fn update_atlas_textures(
 
     let edge = BRICK_EDGE as u32;
     let tile_width = edge * edge; // 64
-    let width = num_bricks * tile_width;
-    let height = edge;
+    // 2D-tile (wrap into rows) so the egui preview image never exceeds the GPU's
+    // max texture dimension — mirrors the render atlas packing.
+    let tiles_per_row: u32 = 256;
+    let num_rows = num_bricks.div_ceil(tiles_per_row);
+    let width = tiles_per_row * tile_width;
+    let height = num_rows * edge;
     let pixels = (width * height) as usize;
 
     let mut dist_rgba = vec![0u8; pixels * 4];
     let mut object_rgba = vec![0u8; pixels * 4];
 
     for (i, packed) in atlas.bricks.values().enumerate() {
-        let base_u = i as u32 * tile_width;
+        let tile = i as u32;
+        let col_px = (tile % tiles_per_row) * tile_width;
+        let row_px = (tile / tiles_per_row) * edge;
         for z in 0..edge {
             for y in 0..edge {
                 for x in 0..edge {
                     let src = (z * edge * edge + y * edge + x) as usize;
-                    let dst_u = base_u + y * edge + x;
-                    let dst = (z * width + dst_u) as usize;
+                    let dst_u = col_px + y * edge + x;
+                    let dst_v = row_px + z;
+                    let dst = (dst_v * width + dst_u) as usize;
 
                     // Distance: snorm [-1,1] -> grayscale, with the zero-crossing
                     // at mid gray so surfaces read as a clear edge.
@@ -408,16 +421,18 @@ fn update_atlas_textures(
                     dist_rgba[dst * 4 + 2] = g;
                     dist_rgba[dst * 4 + 3] = 255;
 
-                    // Material id = argmin over the 8 per-material distance slots
-                    // (what the shader resolves per pixel) -> distinct palette color.
-                    let base = src * MATERIAL_SLOTS;
+                    // Material = argmin over the K palette-slot distances (what the
+                    // shader resolves per pixel), mapped through the brick palette to
+                    // a global id -> distinct palette color.
+                    let base = src * PALETTE_K;
                     let mut best = 0usize;
-                    for m in 1..MATERIAL_SLOTS {
-                        if packed.mat_dist[base + m] < packed.mat_dist[base + best] {
-                            best = m;
+                    for k in 1..PALETTE_K {
+                        if packed.mat_dist[base + k] < packed.mat_dist[base + best] {
+                            best = k;
                         }
                     }
-                    let [r, gg, b] = object_color(best as u8);
+                    let global_id = packed.palette[best];
+                    let [r, gg, b] = object_color((global_id & 0xff) as u8);
                     object_rgba[dst * 4] = r;
                     object_rgba[dst * 4 + 1] = gg;
                     object_rgba[dst * 4 + 2] = b;
@@ -529,6 +544,7 @@ fn depth_color(depth: u32) -> Color {
 fn draw_bounds(
     mut gizmos: Gizmos<SdfOverlayGizmos>,
     visible: Res<WireframeBoundsVisible>,
+    registry: Res<super::edits::MaterialRegistry>,
     volumes: Query<(&Transform, &SdfPrimitive, &SdfMaterial), With<SdfVolume>>,
 ) {
     if !visible.0 {
@@ -536,7 +552,12 @@ fn draw_bounds(
     }
     for (transform, prim, material) in &volumes {
         let iso = Isometry3d::new(transform.translation, transform.rotation);
-        prim.draw_wireframe(&mut gizmos, iso, transform.scale, material.base_color);
+        let color = registry
+            .defs
+            .get(material.registry_id as usize)
+            .map(|d| d.base_color)
+            .unwrap_or(Color::WHITE);
+        prim.draw_wireframe(&mut gizmos, iso, transform.scale, color);
     }
 }
 
@@ -692,7 +713,7 @@ fn live_ray_capture(
     keyboard: Res<ButtonInput<KeyCode>>,
     windows: Query<&Window>,
     cameras: Query<(&Camera, &Transform), With<SdfCamera>>,
-    volumes: Query<(Entity, &Transform, &SdfPrimitive, &SdfOp, &SdfOrder), With<SdfVolume>>,
+    volumes: Query<super::VolumeQueryData, With<SdfVolume>>,
     atlas: Res<SdfAtlas>,
     config: Res<SdfGridConfig>,
     mut capture: ResMut<RayStepCapture>,
@@ -815,18 +836,39 @@ fn spawn_panel(world: &mut World, ui: &mut egui::Ui) {
         s.smoothing = smoothing;
     }
 
-    // Material cap: ids beyond 8 are clamped by baking, so warn at the limit.
-    let edit_count = world
-        .query_filtered::<(), With<SdfVolume>>()
-        .iter(world)
-        .count();
-    let at_cap = edit_count >= 8;
-    if at_cap {
-        ui.colored_label(
-            egui::Color32::YELLOW,
-            "8 material slots in use — new edits share the last colour.",
-        );
-    }
+    // Material picker: choose an existing registry material, or spawn a fresh one.
+    // (A brick still only shows its K=4 nearest materials, but the world/registry is
+    // unbounded — no global cap.)
+    let mut spawn_mat = world.resource::<SpawnState>().material;
+    let mat_names: Vec<(u32, String)> = {
+        let reg = world.resource::<super::edits::MaterialRegistry>();
+        reg.defs
+            .iter()
+            .enumerate()
+            .map(|(i, d)| {
+                let c = d.base_color.to_srgba();
+                (
+                    i as u32,
+                    format!("#{i} ({:.2},{:.2},{:.2})", c.red, c.green, c.blue),
+                )
+            })
+            .collect()
+    };
+    let sel_label = mat_names
+        .iter()
+        .find(|(i, _)| *i == spawn_mat)
+        .map(|(_, n)| n.clone())
+        .unwrap_or_else(|| "New material".into());
+    egui::ComboBox::from_label("Material")
+        .selected_text(sel_label)
+        .show_ui(ui, |ui| {
+            // u32::MAX sentinel = "create a fresh registry material on spawn".
+            ui.selectable_value(&mut spawn_mat, u32::MAX, "New material");
+            for (id, name) in &mat_names {
+                ui.selectable_value(&mut spawn_mat, *id, name);
+            }
+        });
+    world.resource_mut::<SpawnState>().material = spawn_mat;
 
     ui.horizontal(|ui| {
         if ui.button("Spawn").clicked() {
@@ -841,7 +883,21 @@ fn spawn_panel(world: &mut World, ui: &mut egui::Ui) {
                 .max()
                 .map(|m| m + 1)
                 .unwrap_or(0);
-            let color = spawn_color(edit_count);
+
+            // Resolve the material id: either the picked existing one, or a new
+            // registry entry with a distinct palette colour.
+            let registry_id = if spawn_mat == u32::MAX {
+                let mut reg = world.resource_mut::<super::edits::MaterialRegistry>();
+                let id = reg.defs.len() as u32;
+                reg.defs.push(super::edits::MaterialDef {
+                    base_color: spawn_color(id as usize),
+                    blend_softness: 0.0,
+                    ..Default::default()
+                });
+                id
+            } else {
+                spawn_mat
+            };
 
             world.spawn((
                 Transform::from_translation(pos),
@@ -851,10 +907,7 @@ fn spawn_panel(world: &mut World, ui: &mut egui::Ui) {
                     smoothing,
                 },
                 SdfOrder(next_order),
-                SdfMaterial {
-                    base_color: color,
-                    blend_softness: 0.0,
-                },
+                SdfMaterial { registry_id },
                 SdfVolume,
                 SceneEntity,
             ));
@@ -961,38 +1014,81 @@ fn inspect_panel(world: &mut World, ui: &mut egui::Ui) {
     }
 
     ui.separator();
-    let mut rgb = {
-        let lin = material.base_color.to_linear();
-        [lin.red, lin.green, lin.blue]
-    };
-    if ui.color_edit_button_rgb(&mut rgb).changed() {
-        material.base_color = Color::linear_rgb(rgb[0], rgb[1], rgb[2]);
-        changed = true;
-    }
-    // Per-material colour-feather width at seams (world units). Does not affect
-    // geometry — see SdfOp::smoothing for that.
-    if ui
-        .add(egui::Slider::new(&mut material.blend_softness, 0.0..=1.0).text("Blend softness"))
-        .changed()
-    {
-        changed = true;
-    }
 
-    if changed {
-        if let Ok(mut e) = world.get_entity_mut(entity) {
-            if let Some(mut p) = e.get_mut::<SdfPrimitive>() {
-                *p = prim;
+    // Material assignment: pick which registry material this edit uses.
+    let mat_names: Vec<(u32, String)> = {
+        let reg = world.resource::<super::edits::MaterialRegistry>();
+        reg.defs
+            .iter()
+            .enumerate()
+            .map(|(i, d)| {
+                let c = d.base_color.to_srgba();
+                (
+                    i as u32,
+                    format!("#{i} ({:.2},{:.2},{:.2})", c.red, c.green, c.blue),
+                )
+            })
+            .collect()
+    };
+    let cur_label = mat_names
+        .iter()
+        .find(|(i, _)| *i == material.registry_id)
+        .map(|(_, n)| n.clone())
+        .unwrap_or_else(|| "?".into());
+    egui::ComboBox::from_label("Material")
+        .selected_text(cur_label)
+        .show_ui(ui, |ui| {
+            for (id, name) in &mat_names {
+                if ui
+                    .selectable_value(&mut material.registry_id, *id, name)
+                    .changed()
+                {
+                    changed = true;
+                }
             }
-            if let Some(mut o) = e.get_mut::<SdfOp>() {
-                *o = op;
+        });
+
+    // Edit the *referenced registry material's* appearance (shared by every edit
+    // that uses it). Color + seam blend softness.
+    let mut reg_changed = false;
+    {
+        let mut reg = world.resource_mut::<super::edits::MaterialRegistry>();
+        if let Some(def) = reg.defs.get_mut(material.registry_id as usize) {
+            let lin = def.base_color.to_linear();
+            let mut rgb = [lin.red, lin.green, lin.blue];
+            if ui.color_edit_button_rgb(&mut rgb).changed() {
+                def.base_color = Color::linear_rgb(rgb[0], rgb[1], rgb[2]);
+                reg_changed = true;
             }
-            if let Some(mut ord) = e.get_mut::<SdfOrder>() {
-                *ord = order;
-            }
-            if let Some(mut m) = e.get_mut::<SdfMaterial>() {
-                *m = material;
+            // Per-material colour-feather width at seams (world units). Does not
+            // affect geometry — see SdfOp::smoothing for that.
+            if ui
+                .add(egui::Slider::new(&mut def.blend_softness, 0.0..=1.0).text("Blend softness"))
+                .changed()
+            {
+                reg_changed = true;
             }
         }
+    }
+
+    if changed && let Ok(mut e) = world.get_entity_mut(entity) {
+        if let Some(mut p) = e.get_mut::<SdfPrimitive>() {
+            *p = prim;
+        }
+        if let Some(mut o) = e.get_mut::<SdfOp>() {
+            *o = op;
+        }
+        if let Some(mut ord) = e.get_mut::<SdfOrder>() {
+            *ord = order;
+        }
+        if let Some(mut m) = e.get_mut::<SdfMaterial>() {
+            *m = material;
+        }
+    }
+    // A geometry/material-id change needs a rebake; a registry colour/softness change
+    // is shading-only (the GPU material table re-uploads on registry change), but
+    // mark dirty either way for simplicity.
+    if changed || reg_changed {
         world.resource_mut::<SdfAtlas>().mark_dirty();
     }
 }

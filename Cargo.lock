@@ -94,7 +94,12 @@ dependencies = [
  "bevy_brp_extras",
  "bevy_egui",
  "bevy_rapier3d",
+ "image",
+ "intel_tex_2",
  "naga",
+ "naga_oil",
+ "ron",
+ "serde",
  "wgpu",
 ]
 
@@ -3561,12 +3566,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "intel_tex_2"
+version = "0.2.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8183b892d72cefc079675302f0e69658fe8dec871f5551f556c65b394b63ccbf"
+dependencies = [
+ "ispc_rt",
+]
+
+[[package]]
 name = "inventory"
 version = "0.3.24"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a4f0c30c76f2f4ccee3fe55a2435f691ca00c0e4bd87abe4f4a851b1d4dac39b"
 dependencies = [
  "rustversion",
+]
+
+[[package]]
+name = "ispc_rt"
+version = "2.0.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a396f76fd253fab9945bb4c6080f515d0c4036bc30219462d199b58886fd37b4"
+dependencies = [
+ "libc",
+ "num_cpus",
 ]
 
 [[package]]
@@ -4193,6 +4217,16 @@ checksum = "071dfc062690e90b734c0b2273ce72ad0ffa95f0c74596bc250dcfd960262841"
 dependencies = [
  "autocfg",
  "libm",
+]
+
+[[package]]
+name = "num_cpus"
+version = "1.17.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "91df4bbde75afed763b708b7eee1e8e7651e02d97f6d5dd763e89367e957b23b"
+dependencies = [
+ "hermit-abi",
+ "libc",
 ]
 
 [[package]]

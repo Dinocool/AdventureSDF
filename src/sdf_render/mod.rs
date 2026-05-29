@@ -1,4 +1,5 @@
 pub mod atlas;
+pub mod bc7;
 pub mod bvh;
 #[cfg(feature = "debug_toolkit")]
 pub mod debug;
@@ -6,6 +7,7 @@ pub mod edits;
 pub mod gizmo;
 pub mod picking;
 pub mod render;
+pub mod textures;
 
 use bevy::core_pipeline::prepass::DepthPrepass;
 use bevy::input::mouse::{MouseMotion, MouseWheel};
@@ -194,6 +196,8 @@ impl Plugin for SdfScenePlugin {
         app.init_resource::<SdfGridConfig>()
             .init_resource::<SdfSelection>()
             .init_resource::<SdfOrbitCamera>()
+            .init_resource::<edits::MaterialRegistry>()
+            .init_resource::<textures::TextureLibrary>()
             .init_resource::<atlas::SdfAtlas>()
             .init_resource::<bvh::Bvh>()
             .init_resource::<SdfRenderEnabled>()
@@ -206,7 +210,15 @@ impl Plugin for SdfScenePlugin {
             .register_type::<SdfMaterial>()
             .register_type::<CsgKind>()
             .register_type::<SdfRaymarchParams>()
-            .add_systems(OnEnter(AppScene::SdfEditor), setup_sdf_scene)
+            // Build the material registry from the texture-library manifests, then
+            // spawn the scene — chained so the registry is populated before the
+            // spawns resolve their material ids. (The initial-state `OnEnter` fires
+            // during startup state-transition, *before* the `Startup` schedule, so
+            // a plain `Startup` system would run too late.)
+            .add_systems(
+                OnEnter(AppScene::SdfEditor),
+                (textures::build_texture_library, setup_sdf_scene).chain(),
+            )
             .add_systems(
                 Update,
                 (
@@ -243,7 +255,35 @@ impl Plugin for SdfScenePlugin {
 
 // --- Scene Setup ---
 
-fn setup_sdf_scene(mut commands: Commands) {
+fn setup_sdf_scene(mut commands: Commands, library: Res<textures::TextureLibrary>) {
+    // Demo materials reference library variants by slug (registry id = 1 + layer,
+    // built in `build_texture_library`). Falls back to id 0 if the library is
+    // missing, so the scene still renders.
+    let mat_of = |slug: &str| -> u32 {
+        library
+            .variants
+            .iter()
+            .position(|v| v.slug == slug)
+            .map(|layer| 1 + layer as u32)
+            .unwrap_or(0)
+    };
+    let mat_cobble = mat_of("cobble_stone");
+    let mat_sand = mat_of("sand");
+    let mat_ground = mat_of("ground");
+    // Distinct variants within a slug so neighbours look different (registry id =
+    // 1 + layer; consecutive ids are consecutive variants). `nth` clamps the offset
+    // so it stays a valid registry id even if a slug has few variants.
+    let n_mats = library.variants.len() as u32 + 1; // +1 for the fallback at id 0
+    let nth = |base: u32, off: u32| -> u32 {
+        if base == 0 {
+            0
+        } else {
+            (base + off).min(n_mats.saturating_sub(1))
+        }
+    };
+    let mat_cobble2 = nth(mat_cobble, 2);
+    let mat_ground2 = nth(mat_ground, 3);
+
     // Camera
     let orbit = SdfOrbitCamera::default();
     let pos = orbit.target
@@ -261,58 +301,89 @@ fn setup_sdf_scene(mut commands: Commands) {
         SceneEntity,
     ));
 
-    // CSG demo: a box body, a sphere smooth-unioned onto it, and a sphere that
-    // subtracts (carves) a bite out — exercising all three op kinds at startup.
-    commands.spawn((
-        Transform::from_xyz(-0.6, 0.5, 0.0),
-        SdfPrimitive::Box {
-            half_extents: Vec3::splat(0.5),
-        },
-        SdfOp {
-            kind: CsgKind::Union,
-            smoothing: 0.0,
-        },
-        SdfOrder(0),
-        SdfMaterial {
-            base_color: Color::srgb(0.3, 0.4, 0.9),
-            blend_softness: 0.0,
-        },
-        SdfVolume,
-        SceneEntity,
-    ));
+    // Demo gallery: a wide, flat sand "ground plane" cube with a spread of distinct
+    // primitives resting on its top surface. All plain unions (no subtracts). The
+    // plane is centred so its top face sits at y = 0; each object's centre is then
+    // placed at y = its half-height so it rests exactly on the surface.
+    // (order, transform, primitive, material)
+    const PLANE_HALF_Y: f32 = 0.15; // thin slab → reads like a plane
+    let demo: [(u32, Transform, SdfPrimitive, u32); 7] = [
+        // Ground plane: wide + thin, top face at y = 0 (centre at y = -half_y).
+        (
+            0,
+            Transform::from_xyz(0.0, -PLANE_HALF_Y, 0.0),
+            SdfPrimitive::Box {
+                half_extents: Vec3::new(4.0, PLANE_HALF_Y, 3.0),
+            },
+            mat_sand,
+        ),
+        // Box resting on the plane (half-height 0.4 → centre at y = 0.4).
+        (
+            1,
+            Transform::from_xyz(-2.4, 0.4, 0.4),
+            SdfPrimitive::Box {
+                half_extents: Vec3::splat(0.4),
+            },
+            mat_cobble,
+        ),
+        (
+            2,
+            Transform::from_xyz(-1.1, 0.55, -0.3),
+            SdfPrimitive::Sphere { radius: 0.55 },
+            mat_cobble2,
+        ),
+        // Torus lies flat: its half-thickness above centre is `minor` (0.18).
+        (
+            3,
+            Transform::from_xyz(0.2, 0.18, 0.5),
+            SdfPrimitive::Torus {
+                major: 0.5,
+                minor: 0.18,
+            },
+            mat_ground,
+        ),
+        // Capsule standing up: half-height + radius above centre.
+        (
+            4,
+            Transform::from_xyz(1.3, 0.68, -0.4),
+            SdfPrimitive::Capsule {
+                half_height: 0.4,
+                radius: 0.28,
+            },
+            mat_ground2,
+        ),
+        // Cylinder standing up: half-height above centre.
+        (
+            5,
+            Transform::from_xyz(2.4, 0.5, 0.3),
+            SdfPrimitive::Cylinder {
+                radius: 0.4,
+                half_height: 0.5,
+            },
+            mat_cobble,
+        ),
+        (
+            6,
+            Transform::from_xyz(0.6, 0.45, -1.1),
+            SdfPrimitive::Sphere { radius: 0.45 },
+            mat_ground,
+        ),
+    ];
 
-    commands.spawn((
-        Transform::from_xyz(0.4, 0.5, 0.0),
-        SdfPrimitive::Sphere { radius: 0.5 },
-        SdfOp {
-            kind: CsgKind::Union,
-            smoothing: 0.3,
-        },
-        SdfOrder(1),
-        // Soft material: its colour feathers widely into neighbours at the seam.
-        SdfMaterial {
-            base_color: Color::srgb(0.9, 0.5, 0.2),
-            blend_softness: 0.25,
-        },
-        SdfVolume,
-        SceneEntity,
-    ));
-
-    commands.spawn((
-        Transform::from_xyz(0.0, 0.9, 0.4),
-        SdfPrimitive::Sphere { radius: 0.35 },
-        SdfOp {
-            kind: CsgKind::Subtract,
-            smoothing: 0.1,
-        },
-        SdfOrder(2),
-        SdfMaterial {
-            base_color: Color::srgb(0.8, 0.2, 0.2),
-            blend_softness: 0.0,
-        },
-        SdfVolume,
-        SceneEntity,
-    ));
+    for (order, transform, prim, registry_id) in demo {
+        commands.spawn((
+            transform,
+            prim,
+            SdfOp {
+                kind: CsgKind::Union,
+                smoothing: 0.0,
+            },
+            SdfOrder(order),
+            SdfMaterial { registry_id },
+            SdfVolume,
+            SceneEntity,
+        ));
+    }
 
     // Directional light so 3D geometry (and debug wireframes) are visible.
     commands.spawn((
@@ -366,30 +437,47 @@ fn orbit_camera(
 
 // --- Picking ---
 
-/// A volume entity paired with its resolved edit + world AABB, sorted by
-/// `SdfOrder` so the material id (its index, capped at the 8-slot limit) is stable
-/// and matches the colour table built in `prepare_sdf_camera_data`.
+/// A volume entity paired with its resolved edit + world AABB, sorted by `SdfOrder`
+/// (ties by entity index) so CSG evaluation order is deterministic. Each edit's
+/// material id is its `SdfMaterial.registry_id` — a global id into the material
+/// registry, independent of spawn/sort order.
 pub struct GatheredEdit {
     pub entity: Entity,
     pub edit: edits::ResolvedEdit,
     pub aabb: bevy::math::bounding::Aabb3d,
 }
 
-/// Collect all SDF volume edits from the world, sorted by `SdfOrder` (ties broken
-/// by entity index for determinism), assigning each a material id by position.
-pub fn gather_sorted_edits(
-    volumes: &Query<(Entity, &Transform, &SdfPrimitive, &SdfOp, &SdfOrder), With<SdfVolume>>,
-) -> Vec<GatheredEdit> {
-    let mut rows: Vec<(SdfOrder, Entity, Transform, SdfPrimitive, SdfOp)> = volumes
+/// Query data for reading an SDF volume edit's full definition. Aliased so the same
+/// (6-field) query reads identically across the bake, picking, and debug systems
+/// without tripping the type-complexity lint.
+pub type VolumeQueryData = (
+    Entity,
+    &'static Transform,
+    &'static SdfPrimitive,
+    &'static SdfOp,
+    &'static SdfOrder,
+    &'static SdfMaterial,
+);
+
+/// Collect all SDF volume edits from the world, sorted by `SdfOrder` (ties broken by
+/// entity index for determinism). The material id comes from each edit's
+/// `SdfMaterial` registry reference.
+pub fn gather_sorted_edits(volumes: &Query<VolumeQueryData, With<SdfVolume>>) -> Vec<GatheredEdit> {
+    let mut rows: Vec<(
+        SdfOrder,
+        Entity,
+        Transform,
+        SdfPrimitive,
+        SdfOp,
+        SdfMaterial,
+    )> = volumes
         .iter()
-        .map(|(e, t, p, op, order)| (*order, e, *t, p.clone(), *op))
+        .map(|(e, t, p, op, order, m)| (*order, e, *t, p.clone(), *op, *m))
         .collect();
     rows.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.index().cmp(&b.1.index())));
 
     rows.into_iter()
-        .enumerate()
-        .map(|(i, (_, entity, transform, prim, op))| {
-            let material_id = i.min(7) as u8;
+        .map(|(_, entity, transform, prim, op, material)| {
             let aabb = edits::edit_world_aabb(&prim, &transform, op.smoothing);
             GatheredEdit {
                 entity,
@@ -397,7 +485,7 @@ pub fn gather_sorted_edits(
                     prim,
                     transform,
                     op,
-                    material_id,
+                    material_id: material.registry_id as u16,
                 },
                 aabb,
             }
@@ -410,7 +498,7 @@ fn sdf_picking(
     mut selection: ResMut<SdfSelection>,
     cameras: Query<(&Camera, &Transform), With<SdfCamera>>,
     windows: Query<&Window>,
-    volumes: Query<(Entity, &Transform, &SdfPrimitive, &SdfOp, &SdfOrder), With<SdfVolume>>,
+    volumes: Query<VolumeQueryData, With<SdfVolume>>,
     bvh: Res<bvh::Bvh>,
 ) {
     if !mouse.just_pressed(MouseButton::Left) || selection.dragging.is_some() {
@@ -432,7 +520,7 @@ fn sdf_picking(
 
     // Don't change selection if clicking on a gizmo handle.
     if let Some(entity) = selection.entity
-        && let Ok((_, transform, _, _, _)) = volumes.get(entity)
+        && let Ok((_, transform, _, _, _, _)) = volumes.get(entity)
         && picking::raymarch_gizmo(&ray, transform.translation).is_some()
     {
         return;
@@ -650,7 +738,7 @@ fn bake_dirty_bricks(
     mut atlas: ResMut<atlas::SdfAtlas>,
     mut bvh: ResMut<bvh::Bvh>,
     config: Res<SdfGridConfig>,
-    volumes: Query<(Entity, &Transform, &SdfPrimitive, &SdfOp, &SdfOrder), With<SdfVolume>>,
+    volumes: Query<VolumeQueryData, With<SdfVolume>>,
 ) {
     if !atlas.dirty {
         return;
