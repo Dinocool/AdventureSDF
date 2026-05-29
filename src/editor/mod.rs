@@ -74,7 +74,7 @@ impl Plugin for EditorPlugin {
         panels::register_panel(
             app,
             "core/viewport_ops",
-            "Viewport",
+            "Transform",
             DockSide::Left,
             1,
             viewport_ops_ui,
@@ -98,34 +98,30 @@ impl Plugin for EditorPlugin {
     }
 }
 
-/// Panel: gizmo mode buttons + snap settings, bound to the transform-gizmo
-/// [`GizmoOptions`].
+/// Panel: gizmo mode buttons + snap settings, bound to the in-tree [`GizmoState`].
 fn viewport_ops_ui(world: &mut World, ui: &mut bevy_egui::egui::Ui) {
-    use transform_gizmo_bevy::{GizmoMode, GizmoOptions};
+    use crate::sdf_render::gizmo::{GizmoModes, GizmoState};
 
-    let mut options = world.resource_mut::<GizmoOptions>();
+    let mut state = world.resource_mut::<GizmoState>();
     ui.label("Gizmo mode");
     ui.horizontal(|ui| {
         for (modes, label) in [
-            (GizmoMode::all_translate(), "Move (W)"),
-            (GizmoMode::all_rotate(), "Rotate (E)"),
-            (GizmoMode::all_scale(), "Scale (R)"),
-            (GizmoMode::all(), "All (Q)"),
+            (GizmoModes::TRANSLATE, "Move (W)"),
+            (GizmoModes::ROTATE, "Rotate (E)"),
+            (GizmoModes::SCALE, "Scale (R)"),
+            (GizmoModes::all(), "All (Q)"),
         ] {
-            if ui
-                .selectable_label(options.gizmo_modes == modes, label)
-                .clicked()
-            {
-                options.gizmo_modes = modes;
+            if ui.selectable_label(state.modes == modes, label).clicked() {
+                state.modes = modes;
             }
         }
     });
     ui.separator();
-    ui.checkbox(&mut options.snapping, "Snap (hold Ctrl)");
-    ui.add(bevy_egui::egui::Slider::new(&mut options.snap_distance, 0.0..=2.0).text("Move step"));
+    ui.checkbox(&mut state.snap, "Snap (hold Ctrl)");
+    ui.add(bevy_egui::egui::Slider::new(&mut state.snap_move, 0.0..=2.0).text("Move step"));
     ui.add(
-        bevy_egui::egui::Slider::new(&mut options.snap_angle, 0.0..=std::f32::consts::FRAC_PI_2)
+        bevy_egui::egui::Slider::new(&mut state.snap_angle, 0.0..=std::f32::consts::FRAC_PI_2)
             .text("Rotate step (rad)"),
     );
-    ui.add(bevy_egui::egui::Slider::new(&mut options.snap_scale, 0.0..=1.0).text("Scale step"));
+    ui.add(bevy_egui::egui::Slider::new(&mut state.snap_scale, 0.0..=1.0).text("Scale step"));
 }

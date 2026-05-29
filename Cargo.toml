@@ -29,9 +29,13 @@ serde = { version = "1", features = ["derive"] }
 # Offline BC7 encode of the PBR texture arrays (cached to disk; ~1/6 the VRAM).
 intel_tex_2 = "0.2"
 egui_dock = { version = "0.18", optional = true }
-# Solid 3D transform manipulator (translate/rotate/scale handles + picking +
-# snapping) for the SDF editor. Replaces the custom wireframe-gizmo manipulator.
-transform-gizmo-bevy = "0.9"
+# egui's 2D tessellation (filled, antialiased shapes) for the in-tree gizmo overlay
+# renderer. Pinned to 0.33 to reuse the copies bevy_egui 0.39 (egui 0.33) pulls in.
+epaint = "0.33"
+ecolor = "0.33"
+emath = "0.33"
+# Cast gizmo vertex/index Vec<[f32;N]>/Vec<u32> to &[u8] for GPU buffer upload.
+bytemuck = "1"
 
 [dev-dependencies]
 naga = "27"

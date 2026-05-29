@@ -241,11 +241,13 @@ pub fn show_editor_dock(world: &mut World) {
         .resource_mut::<crate::sdf_render::ViewportInputAllowed>()
         .0 = in_viewport;
 
-    // NOTE: we intentionally leave `GizmoOptions.viewport_rect = None`. The SDF
-    // camera renders full-window (its viewport is not confined), so the gizmo must
-    // use full-window cursor coords for both projection and hit-testing to stay
-    // consistent. Setting a custom viewport_rect here without also confining the
-    // camera viewport double-applies the offset and breaks handle picking.
+    // NOTE: the SDF camera is left full-window (its `viewport` is NOT confined to the
+    // dock rect). bevy_egui auto-attaches the PrimaryEguiContext to that same camera,
+    // so shrinking its viewport collapses egui's layout area to a degenerate rect and
+    // egui_dock panics with a NaN separator. With a full-window camera + the gizmo's
+    // `viewport_rect = None`, the gizmo maps the cursor in full-window coords too, so
+    // handles stay aligned with where they're drawn. (A future dedicated full-window
+    // UI camera would let us confine the SDF camera to the center region.)
 
     world.insert_resource(dock);
     world.insert_resource(registry);
