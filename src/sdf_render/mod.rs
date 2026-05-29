@@ -21,12 +21,10 @@ pub struct SdfOverlayGizmos;
 
 // --- Components ---
 
-// Edit primitives, CSG ops, and ordering live in `edits`. Re-exported here so the
-// rest of the module (and external callers) keep a stable `sdf_render::` path.
-pub use edits::{CsgKind, SdfOp, SdfOrder, SdfPrimitive};
-
-#[derive(Component)]
-pub struct SdfColor(pub Color);
+// Edit primitives, CSG ops, ordering, and material live in `edits`. Re-exported
+// here so the rest of the module (and external callers) keep a stable
+// `sdf_render::` path.
+pub use edits::{CsgKind, SdfMaterial, SdfOp, SdfOrder, SdfPrimitive};
 
 #[derive(Component)]
 pub struct SdfVolume;
@@ -205,6 +203,7 @@ impl Plugin for SdfScenePlugin {
             .register_type::<SdfPrimitive>()
             .register_type::<SdfOp>()
             .register_type::<SdfOrder>()
+            .register_type::<SdfMaterial>()
             .register_type::<CsgKind>()
             .register_type::<SdfRaymarchParams>()
             .add_systems(OnEnter(AppScene::SdfEditor), setup_sdf_scene)
@@ -274,7 +273,10 @@ fn setup_sdf_scene(mut commands: Commands) {
             smoothing: 0.0,
         },
         SdfOrder(0),
-        SdfColor(Color::srgb(0.3, 0.4, 0.9)),
+        SdfMaterial {
+            base_color: Color::srgb(0.3, 0.4, 0.9),
+            blend_softness: 0.0,
+        },
         SdfVolume,
         SceneEntity,
     ));
@@ -287,7 +289,11 @@ fn setup_sdf_scene(mut commands: Commands) {
             smoothing: 0.3,
         },
         SdfOrder(1),
-        SdfColor(Color::srgb(0.9, 0.5, 0.2)),
+        // Soft material: its colour feathers widely into neighbours at the seam.
+        SdfMaterial {
+            base_color: Color::srgb(0.9, 0.5, 0.2),
+            blend_softness: 0.25,
+        },
         SdfVolume,
         SceneEntity,
     ));
@@ -300,7 +306,10 @@ fn setup_sdf_scene(mut commands: Commands) {
             smoothing: 0.1,
         },
         SdfOrder(2),
-        SdfColor(Color::srgb(0.8, 0.2, 0.2)),
+        SdfMaterial {
+            base_color: Color::srgb(0.8, 0.2, 0.2),
+            blend_softness: 0.0,
+        },
         SdfVolume,
         SceneEntity,
     ));
@@ -330,7 +339,7 @@ fn orbit_camera(
     mut scroll: MessageReader<MouseWheel>,
 ) {
     for ev in scroll.read() {
-        orbit.distance = (orbit.distance - ev.y * 0.5).max(1.0).min(50.0);
+        orbit.distance = (orbit.distance - ev.y * 0.5).clamp(1.0, 50.0);
     }
 
     if !mouse.pressed(MouseButton::Right) {
@@ -422,12 +431,11 @@ fn sdf_picking(
     };
 
     // Don't change selection if clicking on a gizmo handle.
-    if let Some(entity) = selection.entity {
-        if let Ok((_, transform, _, _, _)) = volumes.get(entity) {
-            if picking::raymarch_gizmo(&ray, transform.translation).is_some() {
-                return;
-            }
-        }
+    if let Some(entity) = selection.entity
+        && let Ok((_, transform, _, _, _)) = volumes.get(entity)
+        && picking::raymarch_gizmo(&ray, transform.translation).is_some()
+    {
+        return;
     }
 
     let gathered = gather_sorted_edits(&volumes);

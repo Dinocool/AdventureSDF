@@ -3,7 +3,7 @@ use bevy::prelude::*;
 use std::collections::HashMap;
 
 use crate::sdf_render::bvh::Bvh;
-use crate::sdf_render::edits::{MATERIAL_SLOTS, ResolvedEdit, argmin_material, fold_csg, material_distances};
+use crate::sdf_render::edits::{MATERIAL_SLOTS, ResolvedEdit, fold_csg, material_distances};
 
 /// Number of voxels stored per brick edge (8 samples spanning 7 cells + apron).
 pub const BRICK_EDGE: usize = 8;

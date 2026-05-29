@@ -36,18 +36,9 @@ impl Plugin for SceneManagerPlugin {
             .add_systems(Update, toggle_menu)
             .add_systems(Update, handle_menu_buttons)
             .add_systems(OnEnter(AppScene::WireframeTest), setup_wireframe_test)
-            .add_systems(
-                OnExit(AppScene::WireframeTest),
-                cleanup_scene_entities::<AppScene>,
-            )
-            .add_systems(
-                OnExit(AppScene::SdfEditor),
-                cleanup_scene_entities::<AppScene>,
-            )
-            .add_systems(
-                OnExit(AppScene::AdventureGame),
-                cleanup_scene_entities::<AppScene>,
-            );
+            .add_systems(OnExit(AppScene::WireframeTest), cleanup_scene_entities)
+            .add_systems(OnExit(AppScene::SdfEditor), cleanup_scene_entities)
+            .add_systems(OnExit(AppScene::AdventureGame), cleanup_scene_entities);
     }
 }
 
@@ -232,6 +223,7 @@ fn spawn_menu(commands: &mut Commands, current_scene: &AppScene) {
         });
 }
 
+#[allow(clippy::too_many_arguments)] // Bevy system params; splitting is artificial.
 fn handle_menu_buttons(
     mut commands: Commands,
     query_wf: Query<&Interaction, (With<WireframeTestButton>, Changed<Interaction>)>,
@@ -276,10 +268,7 @@ fn close_menu(
     }
 }
 
-fn cleanup_scene_entities<S: States>(
-    mut commands: Commands,
-    entities: Query<Entity, With<SceneEntity>>,
-) {
+fn cleanup_scene_entities(mut commands: Commands, entities: Query<Entity, With<SceneEntity>>) {
     for entity in &entities {
         commands.entity(entity).despawn();
     }

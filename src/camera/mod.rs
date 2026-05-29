@@ -131,14 +131,13 @@ fn track_right_click(
     }
 
     if mouse_buttons.just_released(MouseButton::Right) {
-        if !state.dragging {
-            if let Ok(window) = windows.single() {
-                if let Some(pos) = window.cursor_position() {
-                    messages.write(RightClickEvent {
-                        screen_position: pos,
-                    });
-                }
-            }
+        if !state.dragging
+            && let Ok(window) = windows.single()
+            && let Some(pos) = window.cursor_position()
+        {
+            messages.write(RightClickEvent {
+                screen_position: pos,
+            });
         }
         state.drag_accumulated = Vec2::ZERO;
         state.dragging = false;
@@ -337,7 +336,7 @@ mod tests {
 
     #[test]
     fn forward_from_yaw_has_zero_y() {
-        for yaw in [0.0, 1.0, -1.0, 3.14] {
+        for yaw in [0.0, 1.0, -1.0, std::f32::consts::PI] {
             assert_eq!(forward_from_yaw(yaw).y, 0.0, "yaw={yaw}");
         }
     }

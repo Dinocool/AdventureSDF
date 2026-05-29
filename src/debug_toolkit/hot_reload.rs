@@ -38,10 +38,10 @@ fn detect_shader_changes(
         return;
     }
 
-    if let Some(last) = state.last_reload {
-        if last.elapsed().as_millis() < state.debounce_ms as u128 {
-            return;
-        }
+    if let Some(last) = state.last_reload
+        && last.elapsed().as_millis() < state.debounce_ms as u128
+    {
+        return;
     }
 
     state.reload_count += 1;

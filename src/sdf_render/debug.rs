@@ -20,8 +20,8 @@ use super::atlas::{BRICK_EDGE, BRICK_VOXELS, SdfAtlas};
 use super::bvh::Bvh;
 use super::edits::MATERIAL_SLOTS;
 use super::{
-    CsgKind, RayStepCapture, SdfCamera, SdfColor, SdfGridConfig, SdfOp, SdfOrbitCamera, SdfOrder,
-    SdfOverlayGizmos, SdfPrimitive, SdfRaymarchParams, SdfSelection, SdfVolume,
+    CsgKind, RayStepCapture, SdfCamera, SdfGridConfig, SdfMaterial, SdfOp, SdfOrbitCamera,
+    SdfOrder, SdfOverlayGizmos, SdfPrimitive, SdfRaymarchParams, SdfSelection, SdfVolume,
     WireframeBoundsVisible, picking,
 };
 
@@ -529,14 +529,14 @@ fn depth_color(depth: u32) -> Color {
 fn draw_bounds(
     mut gizmos: Gizmos<SdfOverlayGizmos>,
     visible: Res<WireframeBoundsVisible>,
-    volumes: Query<(&Transform, &SdfPrimitive, &SdfColor), With<SdfVolume>>,
+    volumes: Query<(&Transform, &SdfPrimitive, &SdfMaterial), With<SdfVolume>>,
 ) {
     if !visible.0 {
         return;
     }
-    for (transform, prim, color) in &volumes {
+    for (transform, prim, material) in &volumes {
         let iso = Isometry3d::new(transform.translation, transform.rotation);
-        prim.draw_wireframe(&mut gizmos, iso, transform.scale, color.0);
+        prim.draw_wireframe(&mut gizmos, iso, transform.scale, material.base_color);
     }
 }
 
@@ -687,6 +687,7 @@ fn ray_inspector_panel(world: &mut World, ui: &mut egui::Ui) {
 /// trace. A per-frame system (not a panel button) so the cast follows the cursor
 /// in the viewport rather than landing on the button. Also draws the path as
 /// overlay gizmos: green segments inside a baked brick, gray in empty space.
+#[allow(clippy::too_many_arguments)] // Bevy system params; splitting is artificial.
 fn live_ray_capture(
     keyboard: Res<ButtonInput<KeyCode>>,
     windows: Query<&Window>,
@@ -726,14 +727,14 @@ fn live_ray_capture(
         };
         gizmos.line(pair[0].pos, pair[1].pos, color);
     }
-    if let Some(last) = steps.last() {
-        if last.dist < 0.01 {
-            gizmos.sphere(
-                Isometry3d::from_translation(last.pos),
-                0.04,
-                Srgba::rgb(1.0, 0.9, 0.2),
-            );
-        }
+    if let Some(last) = steps.last()
+        && last.dist < 0.01
+    {
+        gizmos.sphere(
+            Isometry3d::from_translation(last.pos),
+            0.04,
+            Srgba::rgb(1.0, 0.9, 0.2),
+        );
     }
 
     capture.steps = steps;
@@ -829,8 +830,10 @@ fn spawn_panel(world: &mut World, ui: &mut egui::Ui) {
 
     ui.horizontal(|ui| {
         if ui.button("Spawn").clicked() {
-            // Place the new edit at the orbit target so it lands in view.
+            // Scatter around the orbit target so successive spawns don't stack on
+            // top of each other. A small random offset keeps them in view.
             let target = world.resource::<SdfOrbitCamera>().target;
+            let pos = target + random_spawn_offset();
             let next_order = world
                 .query_filtered::<&SdfOrder, With<SdfVolume>>()
                 .iter(world)
@@ -841,14 +844,17 @@ fn spawn_panel(world: &mut World, ui: &mut egui::Ui) {
             let color = spawn_color(edit_count);
 
             world.spawn((
-                Transform::from_translation(target),
+                Transform::from_translation(pos),
                 kind.default_primitive(),
                 SdfOp {
                     kind: op,
                     smoothing,
                 },
                 SdfOrder(next_order),
-                SdfColor(color),
+                SdfMaterial {
+                    base_color: color,
+                    blend_softness: 0.0,
+                },
                 SdfVolume,
                 SceneEntity,
             ));
@@ -873,6 +879,27 @@ fn spawn_color(index: usize) -> Color {
     Color::srgb(r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0)
 }
 
+/// A small random offset (world units) for scattering newly-spawned edits around
+/// the orbit target. Seeded from the wall clock so each click lands somewhere new;
+/// avoids pulling in a full RNG dependency for a debug-only jitter.
+fn random_spawn_offset() -> Vec3 {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0);
+    // Three decorrelated hashes -> [-1, 1] per axis, scaled to a modest radius.
+    let comp = |salt: u32| -> f32 {
+        let mut h = nanos
+            .wrapping_mul(2_654_435_761)
+            .wrapping_add(salt.wrapping_mul(40_503));
+        h ^= h >> 15;
+        h = h.wrapping_mul(2_246_822_519);
+        h ^= h >> 13;
+        (h as f32 / u32::MAX as f32) * 2.0 - 1.0
+    };
+    Vec3::new(comp(1), comp(2), comp(3)) * 1.5
+}
+
 // --- Inspect panel ---
 
 fn inspect_panel(world: &mut World, ui: &mut egui::Ui) {
@@ -882,10 +909,10 @@ fn inspect_panel(world: &mut World, ui: &mut egui::Ui) {
     };
 
     // Pull the current components out, edit copies in the UI, write back if changed.
-    let Ok((mut prim, mut op, mut order, mut color)) = world
-        .query::<(&SdfPrimitive, &SdfOp, &SdfOrder, &SdfColor)>()
+    let Ok((mut prim, mut op, mut order, mut material)) = world
+        .query::<(&SdfPrimitive, &SdfOp, &SdfOrder, &SdfMaterial)>()
         .get(world, entity)
-        .map(|(p, o, ord, c)| (p.clone(), *o, *ord, c.0))
+        .map(|(p, o, ord, m)| (p.clone(), *o, *ord, *m))
     else {
         ui.label("Selected entity is not an SDF edit.");
         return;
@@ -933,12 +960,21 @@ fn inspect_panel(world: &mut World, ui: &mut egui::Ui) {
         changed = true;
     }
 
+    ui.separator();
     let mut rgb = {
-        let lin = color.to_linear();
+        let lin = material.base_color.to_linear();
         [lin.red, lin.green, lin.blue]
     };
     if ui.color_edit_button_rgb(&mut rgb).changed() {
-        color = Color::linear_rgb(rgb[0], rgb[1], rgb[2]);
+        material.base_color = Color::linear_rgb(rgb[0], rgb[1], rgb[2]);
+        changed = true;
+    }
+    // Per-material colour-feather width at seams (world units). Does not affect
+    // geometry — see SdfOp::smoothing for that.
+    if ui
+        .add(egui::Slider::new(&mut material.blend_softness, 0.0..=1.0).text("Blend softness"))
+        .changed()
+    {
         changed = true;
     }
 
@@ -953,8 +989,8 @@ fn inspect_panel(world: &mut World, ui: &mut egui::Ui) {
             if let Some(mut ord) = e.get_mut::<SdfOrder>() {
                 *ord = order;
             }
-            if let Some(mut c) = e.get_mut::<SdfColor>() {
-                c.0 = color;
+            if let Some(mut m) = e.get_mut::<SdfMaterial>() {
+                *m = material;
             }
         }
         world.resource_mut::<SdfAtlas>().mark_dirty();

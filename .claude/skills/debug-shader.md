@@ -1,5 +1,5 @@
 ---
-name: shader-debug
+name: debug-shader
 description: Add debug panels and shader debug modes via the debug_toolkit framework. Trigger when adding debug/inspection tooling to any pipeline, registering a debug UI panel, or adding shader visualization modes.
 ---
 
@@ -118,3 +118,16 @@ panel just edits the resource. This avoids a pipeline rebuild per slider tick.
 
 - **Toggle**: independent on/off (additive overlays: wireframe, grid).
 - **Exclusive { group }**: one active per group (replacement views: normals, heatmaps).
+
+## Writing the WGSL
+
+WGSL has sharp edges that the compiler error messages don't make obvious (no tuples,
+no `{field: val}` struct init, no implicit u32/f32 mixing, etc.). Before editing any
+`.wgsl`, check the `wgsl-gotchas` memory note, and after, run `cargo test` — the
+`tests/shader_validation.rs` rig parses every shader and catches these without a GPU.
+
+## Related
+
+- `/add-feature` — Step 7 covers shader/debug work.
+- `design-ecs` — rule 4 (plugins own data; tools are consumers) is the model this
+  toolkit follows.

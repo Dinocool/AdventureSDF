@@ -51,7 +51,7 @@ impl Plugin for DebugToolkitPlugin {
             "Shader Uniforms",
             DockSide::Right,
             10,
-            |world, ui| uniform_inspector::uniforms_ui(world, ui),
+            uniform_inspector::uniforms_ui,
         );
         panels::register_panel(
             app,
@@ -59,7 +59,7 @@ impl Plugin for DebugToolkitPlugin {
             "Perf",
             DockSide::Bottom,
             0,
-            |world, ui| profiling::profiling_ui(world, ui),
+            profiling::profiling_ui,
         );
         panels::register_panel(
             app,
@@ -67,7 +67,7 @@ impl Plugin for DebugToolkitPlugin {
             "Hot Reload",
             DockSide::Bottom,
             10,
-            |world, ui| hot_reload::hot_reload_ui(world, ui),
+            hot_reload::hot_reload_ui,
         );
 
         app.add_systems(bevy_egui::EguiPrimaryContextPass, dock_layout);

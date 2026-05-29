@@ -110,7 +110,7 @@ pub fn debug_modes_ui(world: &mut World, ui: &mut bevy_egui::egui::Ui) {
     // Clone mode data so we can drop the registry borrow
     let grouped = {
         let registry = world.resource::<ShaderDebugRegistry>();
-        snapshot_modes(&registry)
+        snapshot_modes(registry)
     };
 
     // Render exclusive groups
@@ -132,12 +132,10 @@ pub fn debug_modes_ui(world: &mut World, ui: &mut bevy_egui::egui::Ui) {
                 let state = world.resource::<ShaderDebugState>();
                 modes.iter().any(|m| state.is_active(&m.id))
             };
-            if any_active {
-                if ui.selectable_label(false, "Off").clicked() {
-                    let mut state = world.resource_mut::<ShaderDebugState>();
-                    for m in modes {
-                        state.set(&m.id, false);
-                    }
+            if any_active && ui.selectable_label(false, "Off").clicked() {
+                let mut state = world.resource_mut::<ShaderDebugState>();
+                for m in modes {
+                    state.set(&m.id, false);
                 }
             }
         });
