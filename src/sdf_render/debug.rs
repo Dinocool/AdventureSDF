@@ -1,4 +1,4 @@
-//! SDF-specific debug tooling. The whole module is gated behind `debug_toolkit`.
+//! SDF-specific debug tooling. The whole module is gated behind `editor`.
 //!
 //! Everything here registers itself into the generic debug toolkit (panels +
 //! shader-mode registry) at plugin build. The toolkit framework knows nothing
@@ -10,8 +10,8 @@ use bevy::prelude::*;
 use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
 use bevy_egui::{EguiTextureHandle, EguiUserTextures, egui};
 
-use crate::debug_toolkit::panels::{DockSide, register_panel};
-use crate::debug_toolkit::registry::{
+use crate::editor::panels::{DockSide, register_panel};
+use crate::editor::registry::{
     DebugModeKind, ShaderDebugMode, ShaderDebugRegistry, debug_modes_ui,
 };
 use crate::scene_manager::{AppScene, SceneEntity};
@@ -191,7 +191,7 @@ impl Plugin for SdfDebugPlugin {
                 Update,
                 update_atlas_stats.run_if(in_state(AppScene::SdfEditor)),
             )
-            // Needs EguiUserTextures (provided by DebugToolkitPlugin). Guarded so
+            // Needs EguiUserTextures (provided by EditorPlugin). Guarded so
             // SdfScenePlugin can run standalone (e.g. in tests) without egui.
             .add_systems(
                 Update,
@@ -282,7 +282,7 @@ impl Plugin for SdfDebugPlugin {
 }
 
 fn register_shader_modes(app: &mut App) {
-    // Init in case SdfScenePlugin builds before DebugToolkitPlugin (main.rs order).
+    // Init in case SdfScenePlugin builds before EditorPlugin (main.rs order).
     app.init_resource::<ShaderDebugRegistry>();
     let mut registry = app.world_mut().resource_mut::<ShaderDebugRegistry>();
 
@@ -644,8 +644,6 @@ fn gizmo_panel(world: &mut World, ui: &mut egui::Ui) {
         Some(e) => ui.label(format!("Selected: Entity {:?}", e.index())),
         None => ui.label("Selected: None"),
     };
-    ui.label(format!("Active handle: {:?}", selection.active_handle));
-    ui.label(format!("Dragging: {}", selection.dragging.is_some()));
 
     let orbit = world.resource::<SdfOrbitCamera>();
     ui.separator();

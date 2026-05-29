@@ -1,7 +1,7 @@
 use bevy::diagnostic::DiagnosticsStore;
 use bevy::prelude::*;
 
-use super::config::DebugToolkitConfig;
+use super::config::EditorConfig;
 
 #[derive(Resource, Default)]
 pub struct ShaderProfilingData {
@@ -41,7 +41,7 @@ fn collect_profiling_data(
 }
 
 pub fn profiling_ui(world: &mut World, ui: &mut bevy_egui::egui::Ui) {
-    let config = world.resource::<DebugToolkitConfig>();
+    let config = world.resource::<EditorConfig>();
     if !config.enabled {
         return;
     }

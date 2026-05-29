@@ -36,6 +36,7 @@ fn main() {
     .add_plugins(BrpExtrasPlugin)
     .add_plugins(WireframePlugin::default())
     .add_plugins(adventure::scene_manager::SceneManagerPlugin)
+    .add_plugins(adventure::soul_scene::SoulScenePlugin)
     .add_plugins(adventure::sdf_render::SdfScenePlugin)
     .add_plugins(adventure::sdf_render::render::SdfRenderPlugin)
     .add_plugins(adventure::camera::CameraPlugin)
@@ -47,9 +48,9 @@ fn main() {
     .add_plugins(adventure::networking::NetworkingPlugin)
     .insert_resource(ClearColor(Color::srgb(0.1, 0.1, 0.15)));
 
-    #[cfg(feature = "debug_toolkit")]
+    #[cfg(feature = "editor")]
     {
-        app.add_plugins(adventure::debug_toolkit::DebugToolkitPlugin);
+        app.add_plugins(adventure::editor::EditorPlugin);
     }
 
     app.run();

@@ -392,7 +392,7 @@ impl Plugin for SdfRenderPlugin {
                     .after(super::orbit_camera),
             );
 
-        #[cfg(feature = "debug_toolkit")]
+        #[cfg(feature = "editor")]
         {
             app.add_systems(Update, sync_sdf_shader_defs);
         }
@@ -524,10 +524,10 @@ fn prepare_sdf_camera_data(
 
 // --- Bridge: Sync debug state to shader defs ---
 
-#[cfg(feature = "debug_toolkit")]
+#[cfg(feature = "editor")]
 fn sync_sdf_shader_defs(
-    registry: Res<crate::debug_toolkit::registry::ShaderDebugRegistry>,
-    state: Res<crate::debug_toolkit::registry::ShaderDebugState>,
+    registry: Res<crate::editor::registry::ShaderDebugRegistry>,
+    state: Res<crate::editor::registry::ShaderDebugState>,
     mut defs: ResMut<SdfShaderDefs>,
 ) {
     let active = state.active_defines_for_prefix(&registry, "sdf/");
