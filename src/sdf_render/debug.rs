@@ -326,6 +326,12 @@ fn register_shader_modes(app: &mut App) {
         "SDF_DEBUG_BVH_STEPS",
         "Raymarch step heatmap with BVH skipping (compare vs Steps)",
     ));
+    registry.register(overlay(
+        "sdf/ray_fate",
+        "Ray fate",
+        "SDF_DEBUG_RAY_FATE",
+        "Every pixel: green=hit, red=escaped (over-skip), blue=out of steps",
+    ));
 }
 
 // --- Atlas stats ---
@@ -351,7 +357,7 @@ fn update_atlas_stats(mut stats: ResMut<SdfAtlasStats>, atlas: Res<SdfAtlas>) {
     let num_rows = (total as u32).div_ceil(tiles_per_row).max(1);
     stats.atlas_width = tiles_per_row * (BRICK_EDGE * BRICK_EDGE) as u32;
     stats.atlas_height = num_rows * BRICK_EDGE as u32;
-    stats.dirty = atlas.dirty;
+    stats.dirty = atlas.rebake_all || !atlas.dirty_bricks.is_empty();
 }
 
 /// Human-readable byte size (B / KB / MB).
@@ -687,14 +693,27 @@ fn ray_inspector_panel(world: &mut World, ui: &mut egui::Ui) {
         return;
     }
     let steps = capture.steps.clone();
+
+    // Surface hit (last step): the world point the CPU march converged on. Compare
+    // this against where the GPU renders the surface to spot atlas-upload drift.
+    if let Some(last) = steps.last() {
+        let hit = if last.dist < 0.01 { "HIT" } else { "miss" };
+        ui.label(format!(
+            "{hit} @ ({:.3}, {:.3}, {:.3})  d={:.3}",
+            last.pos.x, last.pos.y, last.pos.z, last.dist
+        ));
+    }
     egui::ScrollArea::vertical()
         .max_height(140.0)
         .show(ui, |ui| {
             for (i, s) in steps.iter().enumerate() {
                 ui.label(format!(
-                    "{i:>3}  t={:.3}  d={:.3}  brick=({},{},{}) {}",
+                    "{i:>3}  t={:.3}  d={:.3}  pos=({:.2},{:.2},{:.2})  brick=({},{},{}) {}",
                     s.t,
                     s.dist,
+                    s.pos.x,
+                    s.pos.y,
+                    s.pos.z,
                     s.brick.x,
                     s.brick.y,
                     s.brick.z,
@@ -911,7 +930,8 @@ fn spawn_panel(world: &mut World, ui: &mut egui::Ui) {
                 SdfVolume,
                 SceneEntity,
             ));
-            world.resource_mut::<SdfAtlas>().mark_dirty();
+            // Spawn changes the edit set → `bake_dirty_bricks` detects the new
+            // entity and does a full rebuild.
         }
 
         if ui.button("Delete selected").clicked() {
@@ -919,7 +939,7 @@ fn spawn_panel(world: &mut World, ui: &mut egui::Ui) {
             if let Some(e) = selected {
                 world.despawn(e);
                 world.resource_mut::<SdfSelection>().entity = None;
-                world.resource_mut::<SdfAtlas>().mark_dirty();
+                // Despawn changes the edit set → full rebuild on the next bake.
             }
         }
     });
@@ -1085,12 +1105,11 @@ fn inspect_panel(world: &mut World, ui: &mut egui::Ui) {
             *m = material;
         }
     }
-    // A geometry/material-id change needs a rebake; a registry colour/softness change
-    // is shading-only (the GPU material table re-uploads on registry change), but
-    // mark dirty either way for simplicity.
-    if changed || reg_changed {
-        world.resource_mut::<SdfAtlas>().mark_dirty();
-    }
+    // Geometry/material-id edits go through `get_mut` above, which triggers the
+    // `Changed<…>` filters `bake_dirty_bricks` watches → targeted rebake. A
+    // registry colour/softness change is shading-only (the GPU material table
+    // re-uploads on registry change), so it needs no rebake.
+    let _ = (changed, reg_changed);
 }
 
 /// Per-primitive parameter sliders. Returns true if any value changed.

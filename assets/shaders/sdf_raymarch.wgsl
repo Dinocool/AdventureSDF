@@ -33,12 +33,16 @@ struct RaymarchResult {
     object_id: u32,
     steps: u32,
     hit_pos: vec3<f32>,
+    // Why the march ended: 0 = hit, 1 = escaped (t > MAX_DIST, i.e. skipped past
+    // everything), 2 = ran out of steps. Lets the ray-fate debug view distinguish a
+    // genuine empty-space miss from a BVH over-skip that jumps over real geometry.
+    fate: u32,
 };
 
 fn raymarch(origin: vec3<f32>, dir: vec3<f32>) -> RaymarchResult {
     var t = 0.0;
     var steps = 0u;
-    var result = RaymarchResult(false, 0.0, 0u, 0u, vec3<f32>(0.0));
+    var result = RaymarchResult(false, 0.0, 0u, 0u, vec3<f32>(0.0), 2u);
 
     let MAX_STEPS = max_steps();
     let MAX_DIST = max_dist();
@@ -59,6 +63,7 @@ fn raymarch(origin: vec3<f32>, dir: vec3<f32>) -> RaymarchResult {
 
         if (t > MAX_DIST) {
             result.steps = steps;
+            result.fate = 1u; // escaped: marched past MAX_DIST without a hit
             return result;
         }
 
@@ -101,6 +106,7 @@ fn raymarch(origin: vec3<f32>, dir: vec3<f32>) -> RaymarchResult {
                     pick_material(load_material_distances(loc.atlas_base, hit_p), loc.palette).id;
                 result.steps = steps;
                 result.hit_pos = hit_p;
+                result.fate = 0u; // hit
                 return result;
             }
 
@@ -144,6 +150,25 @@ fn main(in: FullscreenVertexOutput) -> FragmentOutput {
     );
 
     let rm = raymarch(ray_origin, ray_dir);
+
+    #ifdef SDF_DEBUG_RAY_FATE
+    // Paint EVERY pixel by how its ray ended — placed BEFORE the miss early-return so
+    // missed rays are visible (not painted as background): green = hit, red = escaped
+    // past MAX_DIST (skipped over everything — the BVH-over-skip signature), blue =
+    // exhausted MAX_STEPS. If the visual gap is RED, the marcher is wrongly skipping
+    // geometry; if it's GREEN yet still a gap in the real render, shading is at fault.
+    {
+        var fate_col = vec3<f32>(0.0, 1.0, 0.0);   // hit
+        if (rm.fate == 1u) { fate_col = vec3<f32>(1.0, 0.0, 0.0); }   // escaped
+        if (rm.fate == 2u) { fate_col = vec3<f32>(0.0, 0.0, 1.0); }   // out of steps
+        var fd = 1.0;
+        if (rm.hit) {
+            let c = camera.clip_from_world * vec4<f32>(rm.hit_pos, 1.0);
+            fd = c.z / c.w;
+        }
+        return FragmentOutput(vec4<f32>(fate_col, 1.0), fd);
+    }
+    #endif
 
     if (!rm.hit) {
         return FragmentOutput(vec4<f32>(bg_color, 1.0), 0.0);
