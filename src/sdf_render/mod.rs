@@ -4,6 +4,7 @@ pub mod bvh;
 #[cfg(feature = "editor")]
 pub mod debug;
 pub mod edits;
+pub mod gizmo;
 pub mod picking;
 pub mod render;
 pub mod textures;
@@ -215,6 +216,7 @@ impl Plugin for SdfScenePlugin {
             .init_resource::<WireframeBoundsVisible>()
             .init_resource::<RayStepCapture>()
             .init_resource::<ViewportInputAllowed>()
+            .init_resource::<gizmo::GizmoState>()
             .register_type::<SdfVolume>()
             .register_type::<SdfCamera>()
             .register_type::<SdfPrimitive>()
@@ -228,30 +230,30 @@ impl Plugin for SdfScenePlugin {
             // `assets::compile` fills the registry once assets resolve, and the GPU
             // table re-uploads via change detection.
             .add_systems(OnEnter(AppScene::SdfEditor), setup_sdf_scene)
-            // Camera control + click-selection: skipped when the pointer is over a
-            // dock panel (editor sets ViewportInputAllowed). Non-editor build leaves
-            // it true, so the full-window viewport behaves as before.
+            // Camera control: skipped when the pointer is over a dock panel (editor
+            // sets ViewportInputAllowed). Non-editor build leaves it true.
             .add_systems(
                 Update,
-                (orbit_camera, sdf_picking)
+                orbit_camera
+                    .run_if(in_state(AppScene::SdfEditor))
+                    .run_if(|allowed: Res<ViewportInputAllowed>| allowed.0),
+            )
+            // Gizmo interaction THEN click-selection, both in `Last`, chained so the
+            // gizmo claims a handle click before `sdf_picking` would reselect the
+            // volume underneath (`sdf_picking` bails when `GizmoState.claimed_click`).
+            .add_systems(
+                Last,
+                (gizmo::gizmo_update, sdf_picking)
                     .chain()
                     .run_if(in_state(AppScene::SdfEditor))
                     .run_if(|allowed: Res<ViewportInputAllowed>| allowed.0),
             )
-            // Selection→GizmoTarget sync + re-bake when the manipulator moves a
-            // volume. These run regardless of pointer position (the gizmo handles
-            // its own input via bevy_picking).
-            .add_systems(
-                Update,
-                (sync_gizmo_target, rebake_on_gizmo_move).run_if(in_state(AppScene::SdfEditor)),
-            )
             // Bake/upload/render-toggle always run in the editor scene — property
-            // edits in the inspector must still re-bake even with the pointer on a panel.
+            // edits in the inspector (and gizmo drags) must still re-bake.
             .add_systems(
                 Update,
                 (bake_dirty_bricks, upload_sdf_buffers, toggle_sdf_render)
                     .chain()
-                    .after(rebake_on_gizmo_move)
                     .run_if(in_state(AppScene::SdfEditor)),
             );
 
@@ -261,19 +263,17 @@ impl Plugin for SdfScenePlugin {
         if app.world().is_resource_added::<Assets<GizmoAsset>>()
             || app.world().get_resource::<Assets<GizmoAsset>>().is_some()
         {
+            // The filled-overlay gizmo renderer (reusable; consumed by `draw_gizmo`).
+            if !app.is_plugin_added::<crate::gizmo_render::GizmoRenderPlugin>() {
+                app.add_plugins(crate::gizmo_render::GizmoRenderPlugin);
+            }
             app.init_gizmo_group::<SdfOverlayGizmos>()
                 .init_gizmo_group::<SdfGridGizmos>()
                 .add_systems(OnEnter(AppScene::SdfEditor), configure_overlay_gizmos)
                 .add_systems(
                     Update,
-                    draw_ground_grid.run_if(in_state(AppScene::SdfEditor)),
+                    (draw_ground_grid, gizmo::draw_gizmo).run_if(in_state(AppScene::SdfEditor)),
                 );
-
-            // The transform manipulator (solid handles, picking, snapping). Needs the
-            // full render app, so it's gated behind the same render-infra check.
-            if !app.is_plugin_added::<transform_gizmo_bevy::TransformGizmoPlugin>() {
-                app.add_plugins(transform_gizmo_bevy::TransformGizmoPlugin);
-            }
         }
 
         #[cfg(feature = "editor")]
@@ -336,8 +336,8 @@ fn setup_sdf_scene(
         Transform::from_translation(pos).looking_at(orbit.target, Vec3::Y),
         Msaa::Off,
         SdfCamera,
-        // Drives the transform-gizmo manipulator (transform-gizmo-bevy).
-        transform_gizmo_bevy::GizmoCamera,
+        // Target for the filled gizmo overlay (gizmo_render).
+        crate::gizmo_render::GizmoCamera,
         DepthPrepass,
         SceneEntity,
     ));
@@ -561,28 +561,19 @@ pub fn gather_sorted_edits(volumes: &Query<VolumeQueryData, With<SdfVolume>>) ->
         .collect()
 }
 
-/// Left-click selects the SDF volume under the cursor (CPU raymarch pick). The
-/// transform manipulator itself is transform-gizmo-bevy, which consumes the click
-/// when a handle is hit; we skip selection while a gizmo target is being dragged
-/// so grabbing a handle doesn't reselect.
+/// Left-click selects the SDF volume under the cursor (CPU raymarch pick). Runs
+/// after `gizmo_update` in `Last`; if the gizmo claimed the click (a handle was
+/// grabbed), it bails so grabbing a handle doesn't reselect the volume underneath.
 fn sdf_picking(
     mouse: Res<ButtonInput<MouseButton>>,
     mut selection: ResMut<SdfSelection>,
+    gizmo_state: Res<gizmo::GizmoState>,
     cameras: Query<(&Camera, &Transform), With<SdfCamera>>,
     windows: Query<&Window>,
     volumes: Query<VolumeQueryData, With<SdfVolume>>,
     bvh: Res<bvh::Bvh>,
-    gizmo_targets: Query<&transform_gizmo_bevy::GizmoTarget>,
 ) {
-    if !mouse.just_pressed(MouseButton::Left) {
-        return;
-    }
-    // If the active gizmo is focused/being used, the click is a handle grab — don't
-    // change the selection.
-    if gizmo_targets
-        .iter()
-        .any(|t| t.is_focused() || t.is_active())
-    {
+    if !mouse.just_pressed(MouseButton::Left) || gizmo_state.claimed_click {
         return;
     }
 
@@ -601,50 +592,6 @@ fn sdf_picking(
 
     let gathered = gather_sorted_edits(&volumes);
     selection.entity = picking::pick_entity(&bvh, &ray, &gathered);
-}
-
-// --- Transform manipulator (transform-gizmo-bevy) ---
-
-/// Attach a [`GizmoTarget`] to the selected volume and remove it from everything
-/// else, so the transform-gizmo manipulator follows the selection. The gizmo
-/// writes the entity `Transform` directly; [`rebake_on_gizmo_move`] re-bakes when
-/// it changes.
-fn sync_gizmo_target(
-    mut commands: Commands,
-    selection: Res<SdfSelection>,
-    targets: Query<Entity, With<transform_gizmo_bevy::GizmoTarget>>,
-) {
-    let selected = selection.entity;
-    // Remove the target from any entity that shouldn't have it.
-    for entity in &targets {
-        if Some(entity) != selected {
-            commands
-                .entity(entity)
-                .remove::<transform_gizmo_bevy::GizmoTarget>();
-        }
-    }
-    // Ensure the selected entity has one.
-    if let Some(entity) = selected
-        && targets.get(entity).is_err()
-    {
-        commands
-            .entity(entity)
-            .insert(transform_gizmo_bevy::GizmoTarget::default());
-    }
-}
-
-/// Filter for volumes the manipulator moved this frame.
-type GizmoMovedVolume = (
-    With<SdfVolume>,
-    With<transform_gizmo_bevy::GizmoTarget>,
-    Changed<Transform>,
-);
-
-/// Re-bake the SDF atlas whenever a gizmo-manipulated volume's transform changes.
-fn rebake_on_gizmo_move(mut atlas: ResMut<atlas::SdfAtlas>, moved: Query<(), GizmoMovedVolume>) {
-    if !moved.is_empty() {
-        atlas.mark_dirty();
-    }
 }
 
 /// Push the overlay gizmo group in front of everything (always-on-top handles).

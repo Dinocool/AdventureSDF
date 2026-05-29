@@ -1,6 +1,7 @@
 pub mod assets;
 pub mod camera;
 pub mod combat;
+pub mod gizmo_render;
 pub mod inventory;
 pub mod networking;
 pub mod player;
