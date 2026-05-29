@@ -14,6 +14,7 @@ struct SdfCameraUniform {
     grid_origin: vec4<f32>,
     grid_dims: vec4<f32>,
     debug_params: vec4<f32>,   // x = max_steps, y = max_dist, z = sdf_eps, w = bvh_node_count
+    bake_reach: vec4<f32>,     // x = world-units a baked brick reaches beyond a tight edit AABB
 };
 
 // One material row, indexed by global material id. Mirrors `GpuSdfMaterial`
@@ -83,3 +84,7 @@ fn num_bvh_nodes() -> u32 { return u32(camera.debug_params.w); }
 fn max_steps() -> u32 { return u32(camera.debug_params.x); }
 fn max_dist() -> f32 { return camera.debug_params.y; }
 fn sdf_eps() -> f32 { return camera.debug_params.z; }
+// World-units a baked brick can reach beyond a tight edit AABB (single-sourced from
+// `bricks_in_aabb`: SNORM_CLAMP_DIST + one brick). The BVH skip inflates every box by
+// this so it never jumps past a baked shell brick.
+fn bake_reach() -> f32 { return camera.bake_reach.x; }
