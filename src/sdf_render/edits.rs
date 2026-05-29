@@ -107,7 +107,7 @@ pub const MATERIAL_TEX_MAPS: usize = 5;
 /// keeps the boundary as crisp as the per-material distance field's sub-voxel
 /// bisector allows; larger feathers it (rock → sand). It does not affect geometry —
 /// that is `SdfOp::smoothing`.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Reflect)]
 pub struct MaterialDef {
     pub base_color: Color,
     pub blend_softness: f32,

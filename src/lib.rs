@@ -1,3 +1,4 @@
+pub mod assets;
 pub mod camera;
 pub mod combat;
 pub mod inventory;
