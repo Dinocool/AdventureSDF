@@ -3,7 +3,9 @@ use bevy::prelude::*;
 use std::collections::HashMap;
 
 use crate::sdf_render::bvh::Bvh;
-use crate::sdf_render::edits::{MATERIAL_SLOTS, ResolvedEdit, fold_csg, material_distances};
+use crate::sdf_render::edits::{
+    PALETTE_K, Palette, ResolvedEdit, build_palette, fold_csg, material_distances,
+};
 
 /// Number of voxels stored per brick edge (8 samples spanning 7 cells + apron).
 pub const BRICK_EDGE: usize = 8;
@@ -14,10 +16,10 @@ pub const BRICK_VOXELS: usize = BRICK_EDGE * BRICK_EDGE * BRICK_EDGE; // 512
 /// the gradient (and thus shading normals) smooth — 8-bit quantization steps
 /// are large enough to produce visible normal noise on flat surfaces.
 pub type SdfBrick = [i16; BRICK_VOXELS];
-/// Per-voxel, per-material distance field for one brick: `MATERIAL_SLOTS` (8)
+/// Per-voxel, per-palette-slot distance field for one brick: `PALETTE_K` (4)
 /// 16-bit-snorm distances per voxel, laid out voxel-major
-/// (`voxel * MATERIAL_SLOTS + material`).
-pub type MaterialBrick = [i16; BRICK_VOXELS * MATERIAL_SLOTS];
+/// (`voxel * PALETTE_K + slot`). Slot `k` is keyed to `PackedBrick::palette[k]`.
+pub type MaterialBrick = [i16; BRICK_VOXELS * PALETTE_K];
 
 pub type BrickCoord = IVec3;
 
@@ -25,17 +27,22 @@ pub type BrickCoord = IVec3;
 ///
 /// `dist` is the CSG-combined signed distance the cubic surface solver marches.
 ///
-/// `mat_dist` is a *dense per-material* distance field: for each voxel, the signed
-/// distance to the nearest matter of each of the 8 materials. The shader
-/// trilinearly interpolates these and takes the per-pixel argmin, so the material
+/// `mat_dist` is a per-*palette-slot* distance field: for each voxel, the signed
+/// distance to the nearest matter of each of the brick's ≤K palette materials. The
+/// shader trilinearly interpolates these K slots and argmins them, so the material
 /// boundary is the exact sub-voxel bisector between the two nearest materials —
-/// crisp even at `smoothing = 0`, and correct where three+ materials meet. This
-/// replaces the old discrete `object_ids` + canonical-pair blend, which snapped
-/// the material boundary to voxel centres (the jagged-seam artifact).
+/// crisp even at `smoothing = 0`. Storing only the brick's local palette (not every
+/// material in the world) bounds per-pixel cost and VRAM to K regardless of how many
+/// materials the world contains.
+///
+/// `palette` maps each local slot to a global material id (`PALETTE_EMPTY` =
+/// unused). It is uniform across the brick, so slot `k` is the same material at all
+/// 8 corners of every cell — keeping the trilinear interpolation valid.
 #[derive(Clone)]
 pub struct PackedBrick {
     pub dist: SdfBrick,
     pub mat_dist: MaterialBrick,
+    pub palette: Palette,
 }
 
 /// CPU-side atlas: brick origin -> baked brick, with dirty tracking.
@@ -72,44 +79,68 @@ impl SdfAtlas {
         z * BRICK_EDGE * BRICK_EDGE + y * BRICK_EDGE + x
     }
 
-    /// Bake a single brick from its culled candidate edits (from the BVH). Each
-    /// voxel stores both the CSG-combined distance (`fold_csg`, for the surface
-    /// solver) and the dense per-material distance field (`material_distances`,
-    /// for the shader's argmin material boundary).
+    /// World position of voxel `(x,y,z)` within the brick at `brick_origin`.
+    fn voxel_world_pos(
+        brick_origin: BrickCoord,
+        x: usize,
+        y: usize,
+        z: usize,
+        grid_origin: Vec3,
+        voxel_size: f32,
+    ) -> Vec3 {
+        grid_origin
+            + Vec3::new(
+                (brick_origin.x + x as i32) as f32 * voxel_size,
+                (brick_origin.y + y as i32) as f32 * voxel_size,
+                (brick_origin.z + z as i32) as f32 * voxel_size,
+            )
+    }
+
+    /// Bake a single brick from its culled candidate edits (from the BVH). First
+    /// builds the brick's material palette (the ≤K global ids present), then per
+    /// voxel stores the CSG-combined distance (`fold_csg`, for the surface solver)
+    /// and the per-palette-slot distance field (`material_distances`, for the
+    /// shader's argmin material boundary).
     fn bake_single_brick(
         brick_origin: BrickCoord,
         config: &super::SdfGridConfig,
         edits: &[ResolvedEdit],
     ) -> PackedBrick {
         let mut dist: SdfBrick = [0; BRICK_VOXELS];
-        let mut mat_dist: MaterialBrick = [0; BRICK_VOXELS * MATERIAL_SLOTS];
+        let mut mat_dist: MaterialBrick = [0; BRICK_VOXELS * PALETTE_K];
         let grid_origin = config.world_origin();
         let voxel_size = config.voxel_size;
 
+        // All voxel world positions, reused for the palette build and the bake.
+        let mut positions = [Vec3::ZERO; BRICK_VOXELS];
         for z in 0..BRICK_EDGE {
             for y in 0..BRICK_EDGE {
                 for x in 0..BRICK_EDGE {
-                    let idx = Self::voxel_index(x, y, z);
-
-                    let world_pos = grid_origin
-                        + Vec3::new(
-                            (brick_origin.x + x as i32) as f32 * voxel_size,
-                            (brick_origin.y + y as i32) as f32 * voxel_size,
-                            (brick_origin.z + z as i32) as f32 * voxel_size,
-                        );
-
-                    dist[idx] = Self::dist_to_snorm(fold_csg(edits, world_pos).dist);
-
-                    let slots = material_distances(edits, world_pos);
-                    let base = idx * MATERIAL_SLOTS;
-                    for (m, &d) in slots.iter().enumerate() {
-                        mat_dist[base + m] = Self::dist_to_snorm(d);
-                    }
+                    positions[Self::voxel_index(x, y, z)] =
+                        Self::voxel_world_pos(brick_origin, x, y, z, grid_origin, voxel_size);
                 }
             }
         }
 
-        PackedBrick { dist, mat_dist }
+        // The palette is the ≤K global ids nearest anywhere in this brick. Slot k
+        // of `mat_dist` is keyed to `palette[k]` for every voxel (uniform per brick).
+        let palette = build_palette(edits, &positions);
+
+        for (idx, &world_pos) in positions.iter().enumerate() {
+            dist[idx] = Self::dist_to_snorm(fold_csg(edits, world_pos).dist);
+
+            let slots = material_distances(edits, &palette, world_pos);
+            let base = idx * PALETTE_K;
+            for (k, &d) in slots.iter().enumerate() {
+                mat_dist[base + k] = Self::dist_to_snorm(d);
+            }
+        }
+
+        PackedBrick {
+            dist,
+            mat_dist,
+            palette,
+        }
     }
 
     /// Re-evaluate every edit and rebuild all bricks that overlap them.
@@ -205,7 +236,7 @@ mod tests {
     use super::*;
     use crate::sdf_render::edits::{CsgKind, SdfOp, SdfPrimitive};
 
-    fn resolved(prim: SdfPrimitive, t: Transform, op: SdfOp, id: u8) -> ResolvedEdit {
+    fn resolved(prim: SdfPrimitive, t: Transform, op: SdfOp, id: u16) -> ResolvedEdit {
         ResolvedEdit {
             prim,
             transform: t,
@@ -223,17 +254,19 @@ mod tests {
         SdfAtlas::bake_single_brick(origin, config, edits)
     }
 
-    /// The winning (nearest) material id for voxel `idx`, by argmin over its 8
-    /// per-material distance slots — mirrors what the shader computes per pixel.
-    fn voxel_material(brick: &PackedBrick, idx: usize) -> u8 {
-        let base = idx * MATERIAL_SLOTS;
+    /// The winning (nearest) GLOBAL material id for voxel `idx`: argmin over the K
+    /// palette-slot distances, then map the local slot through the brick palette —
+    /// mirrors what the shader computes per pixel. `PALETTE_EMPTY` if the winning
+    /// slot is unused.
+    fn voxel_material(brick: &PackedBrick, idx: usize) -> u16 {
+        let base = idx * PALETTE_K;
         let mut best = 0usize;
-        for m in 1..MATERIAL_SLOTS {
-            if brick.mat_dist[base + m] < brick.mat_dist[base + best] {
-                best = m;
+        for k in 1..PALETTE_K {
+            if brick.mat_dist[base + k] < brick.mat_dist[base + best] {
+                best = k;
             }
         }
-        best as u8
+        brick.palette[best]
     }
 
     #[test]
@@ -283,12 +316,13 @@ mod tests {
         );
     }
 
-    /// The per-material distance field must record each material's own surface: at
-    /// a point inside shape 0, slot 0 is negative and well below slot 1 (and vice
-    /// versa). This is what lets the shader find the exact sub-voxel bisector.
+    /// The per-palette-slot distance field must record each material's own surface.
+    /// With a palette of [mat 0 -> slot 0, mat 1 -> slot 1]: inside shape 0, slot 0
+    /// is negative and below slot 1, and vice versa. This is what lets the shader
+    /// find the exact sub-voxel bisector.
     #[test]
     fn material_slots_track_their_own_surface() {
-        use crate::sdf_render::edits::material_distances;
+        use crate::sdf_render::edits::{build_palette, material_distances};
         let edits = vec![
             resolved(
                 SdfPrimitive::Sphere { radius: 0.3 },
@@ -303,13 +337,38 @@ mod tests {
                 1,
             ),
         ];
+        // Sorted palette => slot 0 = material 0, slot 1 = material 1.
+        let palette = build_palette(&edits, &[Vec3::ZERO, Vec3::new(0.5, 0.0, 0.0)]);
+        assert_eq!(palette[0], 0);
+        assert_eq!(palette[1], 1);
+
         // Deep inside sphere 0.
-        let s = material_distances(&edits, Vec3::ZERO);
+        let s = material_distances(&edits, &palette, Vec3::ZERO);
         assert!(s[0] < 0.0, "inside shape 0, slot 0 must be negative");
         assert!(s[0] < s[1], "slot 0 must be nearer than slot 1 here");
         // Deep inside sphere 1.
-        let s = material_distances(&edits, Vec3::new(0.5, 0.0, 0.0));
+        let s = material_distances(&edits, &palette, Vec3::new(0.5, 0.0, 0.0));
         assert!(s[1] < 0.0 && s[1] < s[0]);
+    }
+
+    /// A brick with more than K materials keeps only the K nearest in its palette.
+    #[test]
+    fn palette_caps_at_k() {
+        use crate::sdf_render::edits::{PALETTE_EMPTY, build_palette};
+        // K+1 = 5 spheres, each a distinct material, all near the origin.
+        let edits: Vec<ResolvedEdit> = (0..(PALETTE_K as u16 + 1))
+            .map(|i| {
+                resolved(
+                    SdfPrimitive::Sphere { radius: 0.2 },
+                    Transform::from_xyz(i as f32 * 0.15, 0.0, 0.0),
+                    SdfOp::default(),
+                    i,
+                )
+            })
+            .collect();
+        let palette = build_palette(&edits, &[Vec3::ZERO]);
+        let filled = palette.iter().filter(|&&id| id != PALETTE_EMPTY).count();
+        assert_eq!(filled, PALETTE_K, "palette must cap at K filled slots");
     }
 
     /// A subtractor's material id must never win a surface voxel: Subtract edits

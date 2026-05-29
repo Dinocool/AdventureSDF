@@ -1,20 +1,36 @@
 use bevy::pbr::wireframe::WireframePlugin;
 use bevy::prelude::*;
 use bevy::remote::RemotePlugin;
+use bevy::render::RenderPlugin;
+use bevy::render::render_resource::WgpuFeatures;
+use bevy::render::settings::{RenderCreation, WgpuSettings};
 use bevy::window::WindowResolution;
 use bevy_brp_extras::BrpExtrasPlugin;
 use bevy_rapier3d::prelude::*;
 
 fn main() {
     let mut app = App::new();
-    app.add_plugins(DefaultPlugins.set(WindowPlugin {
-        primary_window: Some(Window {
-            title: "Adventure".into(),
-            resolution: WindowResolution::new(1920, 1080),
-            ..default()
-        }),
-        ..default()
-    }))
+    app.add_plugins(
+        DefaultPlugins
+            .set(WindowPlugin {
+                primary_window: Some(Window {
+                    title: "Adventure".into(),
+                    resolution: WindowResolution::new(1920, 1080),
+                    ..default()
+                }),
+                ..default()
+            })
+            // Enable BC texture compression so the SDF PBR atlases can upload as
+            // BC7 (~⅙ the VRAM of RGBA8). Desktop Vulkan/DX12/Metal support BC
+            // universally; device init fails loudly if a backend somehow lacks it.
+            .set(RenderPlugin {
+                render_creation: RenderCreation::Automatic(WgpuSettings {
+                    features: WgpuFeatures::TEXTURE_COMPRESSION_BC,
+                    ..default()
+                }),
+                ..default()
+            }),
+    )
     .add_plugins(RapierPhysicsPlugin::<NoUserData>::default())
     .add_plugins(RemotePlugin::default())
     .add_plugins(BrpExtrasPlugin)

@@ -92,31 +92,62 @@ impl Default for SdfOp {
 #[reflect(Component)]
 pub struct SdfOrder(pub u32);
 
-/// Per-edit material. Uploaded to the GPU as an entry in a material storage-buffer
-/// table indexed by the edit's resolved material id (see render.rs). This is the
-/// extension point for the upcoming PBR/texture workflow — metallic, roughness,
-/// emissive, and base/normal/etc. texture indices will be added here and to the
-/// GPU mirror, without touching the bake or the dense per-material distance field.
+/// Number of PBR texture layer indices carried per material. Order matches the
+/// shader's `sample_material_map` map enum: diffuse, normal, mra (metallic-
+/// roughness-ao packed), height, edge. Filled from the texture-library manifests
+/// (see render.rs); `u32::MAX` means "no texture for this map".
+pub const MATERIAL_TEX_MAPS: usize = 5;
+
+/// A material in the global registry. Indexed by a stable global id (its position
+/// in [`MaterialRegistry::defs`]). The registry holds *all* materials a world can
+/// use (potentially hundreds); a brick only references the handful in its palette.
 ///
-/// `blend_softness` is a *shading-time* control (world units): at a seam between
-/// two different materials, the colour cross-fade spans `max(softness_a,
-/// softness_b)`. `0` keeps the material boundary as crisp as the dense field's
-/// sub-voxel bisector allows; larger values feather it (e.g. rock fading into
-/// sand). It does not affect geometry — that is `SdfOp::smoothing`.
-#[derive(Component, Reflect, Clone, Copy, Debug)]
-#[reflect(Component)]
-pub struct SdfMaterial {
+/// `blend_softness` is a *shading-time* control (world units): at a seam between two
+/// materials, the colour/PBR cross-fade spans `max(softness_a, softness_b)`. `0`
+/// keeps the boundary as crisp as the per-material distance field's sub-voxel
+/// bisector allows; larger feathers it (rock → sand). It does not affect geometry —
+/// that is `SdfOp::smoothing`.
+#[derive(Clone, Copy, Debug)]
+pub struct MaterialDef {
     pub base_color: Color,
     pub blend_softness: f32,
+    /// PBR texture-array layer per map, or `u32::MAX` if absent. See [`MATERIAL_TEX_MAPS`].
+    pub tex_layers: [u32; MATERIAL_TEX_MAPS],
 }
 
-impl Default for SdfMaterial {
+impl Default for MaterialDef {
     fn default() -> Self {
         Self {
             base_color: Color::srgb(0.8, 0.8, 0.8),
             blend_softness: 0.0,
+            tex_layers: [u32::MAX; MATERIAL_TEX_MAPS],
         }
     }
+}
+
+/// Global material registry: the single source of truth for material appearance,
+/// uploaded once (and on change) to the GPU material table. Edits reference entries
+/// by global id via [`SdfMaterial`]. Index 0 is a default fallback so an
+/// unconfigured edit still renders.
+#[derive(Resource, Clone)]
+pub struct MaterialRegistry {
+    pub defs: Vec<MaterialDef>,
+}
+
+impl Default for MaterialRegistry {
+    fn default() -> Self {
+        Self {
+            defs: vec![MaterialDef::default()],
+        }
+    }
+}
+
+/// Per-edit material reference: an index into [`MaterialRegistry::defs`]. Appearance
+/// lives in the registry (keeps the GPU table static), not on the edit.
+#[derive(Component, Reflect, Clone, Copy, Debug, Default)]
+#[reflect(Component)]
+pub struct SdfMaterial {
+    pub registry_id: u32,
 }
 
 // --- Smooth min/max (iq polynomial) ---
@@ -421,15 +452,16 @@ pub struct ResolvedEdit {
     pub prim: SdfPrimitive,
     pub transform: Transform,
     pub op: SdfOp,
-    pub material_id: u8,
+    /// Global material id (index into [`MaterialRegistry::defs`]).
+    pub material_id: u16,
 }
 
 /// Result of folding the CSG stack at one point: the combined signed distance and
-/// the resolved surface material id.
+/// the resolved global material id.
 #[derive(Clone, Copy, Debug)]
 pub struct EditSample {
     pub dist: f32,
-    pub material_id: u8,
+    pub material_id: u16,
 }
 
 /// Fold an ordered edit list into a single signed distance + material id at `pos`.
@@ -440,7 +472,7 @@ pub struct EditSample {
 /// - Intersect: the more-constraining (larger-distance) surface owns the material.
 pub fn fold_csg(edits: &[ResolvedEdit], pos: Vec3) -> EditSample {
     let mut acc = f32::MAX;
-    let mut mat: u8 = 0;
+    let mut mat: u16 = 0;
     let mut started = false;
 
     for e in edits {
@@ -486,38 +518,82 @@ pub fn fold_csg(edits: &[ResolvedEdit], pos: Vec3) -> EditSample {
     }
 }
 
-/// Number of distinct materials the dense per-material distance field tracks.
-/// Matches the shader's `object_colors[8]` table.
-pub const MATERIAL_SLOTS: usize = 8;
+/// Max distinct materials a single brick tracks. The shader argmins over exactly
+/// this many local slots per pixel — bounding per-pixel material cost to a small
+/// constant regardless of how many materials the world contains.
+pub const PALETTE_K: usize = 4;
 
-/// Sentinel distance for a material slot that no edit contributes to at `pos`.
-/// Large and positive so it never wins the argmin; small enough to survive the
-/// i16 snorm clamp ([-1, 1]) without collapsing toward the real surface.
+/// Sentinel for an empty palette slot / a material absent at `pos`. The id sentinel
+/// is `u16::MAX`; the distance sentinel is large and positive so it never wins the
+/// argmin, yet within the i16 snorm clamp ([-1, 1]) so it survives baking.
 pub const MATERIAL_FAR: f32 = 1.0;
+pub const PALETTE_EMPTY: u16 = u16::MAX;
 
-/// Per-material *surface* distance field at `pos`: slot `m` holds the signed
-/// distance to the nearest matter owned by material `m`, or [`MATERIAL_FAR`] if no
-/// edit contributes that material here.
-///
-/// This is the data the shader interpolates and takes the argmin of, so the
-/// material boundary is the exact piecewise-trilinear bisector between the two
-/// nearest materials — sub-voxel sharp, with no dependence on smoothing `k` (so it
-/// is clean even at `smoothing = 0`). Subtract edits define no material (they only
-/// carve geometry, handled by the combined `fold_csg` distance), so they do not
-/// write a slot. Union and Intersect surfaces both own their material.
-pub fn material_distances(edits: &[ResolvedEdit], pos: Vec3) -> [f32; MATERIAL_SLOTS] {
-    let mut slots = [MATERIAL_FAR; MATERIAL_SLOTS];
+/// A brick's material palette: up to [`PALETTE_K`] global material ids present in
+/// that brick. Slot order is the local index the per-voxel distance field is keyed
+/// by; unused slots hold [`PALETTE_EMPTY`].
+pub type Palette = [u16; PALETTE_K];
+
+/// Build a brick's palette from its culled candidate edits: the (up to K) distinct
+/// global material ids with the smallest distance to `sample_points` (the brick's
+/// voxel corners), so a material that wins anywhere in the brick is kept. Subtract
+/// edits contribute no material. Returned ids are sorted ascending for a stable,
+/// neighbour-agnostic slot assignment; empty slots are [`PALETTE_EMPTY`].
+pub fn build_palette(edits: &[ResolvedEdit], sample_points: &[Vec3]) -> Palette {
+    // Nearest distance achieved by each global id over all sample points.
+    let mut best: Vec<(u16, f32)> = Vec::new();
     for e in edits {
         if e.op.kind == CsgKind::Subtract {
             continue;
         }
-        let m = e.material_id as usize;
-        if m >= MATERIAL_SLOTS {
+        let mut dmin = f32::MAX;
+        for &p in sample_points {
+            dmin = dmin.min(eval_world(&e.prim, &e.transform, p));
+        }
+        match best.iter_mut().find(|(id, _)| *id == e.material_id) {
+            Some((_, d)) => *d = d.min(dmin),
+            None => best.push((e.material_id, dmin)),
+        }
+    }
+    // Keep the K nearest, then sort ascending by id for a stable slot order.
+    best.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+    best.truncate(PALETTE_K);
+    best.sort_by_key(|(id, _)| *id);
+
+    let mut palette = [PALETTE_EMPTY; PALETTE_K];
+    for (slot, (id, _)) in best.iter().enumerate() {
+        palette[slot] = *id;
+    }
+    palette
+}
+
+/// Per-*palette-slot* surface distance field at `pos`: slot `k` holds the signed
+/// distance to the nearest matter owned by `palette[k]`, or [`MATERIAL_FAR`] if that
+/// slot is empty or no edit of that material reaches here.
+///
+/// The shader trilinearly interpolates these K slots and argmins them, so the
+/// material boundary is the exact piecewise-trilinear bisector between the two
+/// nearest materials — sub-voxel sharp, independent of smoothing `k`. Subtract edits
+/// define no material (geometry-only, handled by `fold_csg`). Because the palette is
+/// uniform across a brick, slot `k` means the same material at all 8 cell corners,
+/// keeping the interpolation valid.
+pub fn material_distances(
+    edits: &[ResolvedEdit],
+    palette: &Palette,
+    pos: Vec3,
+) -> [f32; PALETTE_K] {
+    let mut slots = [MATERIAL_FAR; PALETTE_K];
+    for e in edits {
+        if e.op.kind == CsgKind::Subtract {
             continue;
         }
+        // Map this edit's global id to its local palette slot, if present.
+        let Some(k) = palette.iter().position(|&id| id == e.material_id) else {
+            continue;
+        };
         let d = eval_world(&e.prim, &e.transform, pos);
-        if d < slots[m] {
-            slots[m] = d;
+        if d < slots[k] {
+            slots[k] = d;
         }
     }
     slots

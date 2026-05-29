@@ -1,22 +1,24 @@
 //! WGSL shader validation test rig.
 //!
-//! Uses `naga` (the same WGSL frontend that wgpu uses) to parse and validate
-//! all shader files at test time. Catches syntax errors, type mismatches, and
-//! invalid constructs *before* runtime — no GPU, no window, no game launch.
+//! Validates all shader files at test time — no GPU, no window, no game launch.
+//! Catches syntax errors, type mismatches, and invalid constructs before runtime.
 //!
-//! Limitations:
-//! - naga validates WGSL in isolation. Bevy's `#import` directives and
-//!   `#define` macros are handled by `naga-oil` at load time, which naga
-//!   doesn't know about. We strip `#import` lines and inject stub definitions
-//!   for common Bevy types.
-//! - Pipeline layout validation (bind group compatibility) is not checked
-//!   here — only WGSL syntax and type correctness.
+//! The SDF shader is split into `#import`-composed modules under `shaders/sdf/`, so
+//! we resolve them with `naga_oil`'s `Composer` (the same library Bevy's ShaderCache
+//! uses at runtime) before validating — composing the whole import graph, exactly
+//! as the GPU pipeline would. Standalone files (no `#import` of local modules) are
+//! still validated directly with naga.
 
+use naga_oil::compose::{
+    ComposableModuleDescriptor, Composer, NagaModuleDescriptor, ShaderLanguage,
+};
 use std::path::Path;
 
-/// Bevy import stubs — minimal definitions that satisfy naga when `#import`
-/// directives would normally be resolved by naga-oil.
-const BEVY_STUBS: &str = r#"
+/// A `bevy_core_pipeline` import the SDF entry shader uses. naga_oil doesn't know
+/// Bevy's built-in modules, so we register a minimal stand-in providing only the
+/// `FullscreenVertexOutput` the entry shader imports.
+const FULLSCREEN_STUB: &str = r#"
+#define_import_path bevy_core_pipeline::fullscreen_vertex_shader
 struct FullscreenVertexOutput {
     @builtin(position) position: vec4<f32>,
     @location(0) uv: vec2<f32>,
@@ -24,123 +26,116 @@ struct FullscreenVertexOutput {
 };
 "#;
 
-/// Preprocess a shader file: strip `#import`, `#ifndef`, `#ifdef`, `#endif`
-/// lines (naga-oil directives that naga doesn't understand) and inject Bevy stubs.
-/// For `#ifndef CONST / const X = val; / #endif` blocks, keep the const definition.
-fn preprocess_shader(source: &str) -> String {
-    let mut lines: Vec<String> = Vec::new();
-    let skip_depth = 0;
+/// The SDF module files, in dependency order (a module must be added before any
+/// module that imports it). The entry shader is composed last via `make_naga_module`.
+const SDF_MODULES: [&str; 6] = [
+    "assets/shaders/sdf/bindings.wgsl",
+    "assets/shaders/sdf/brick.wgsl",
+    "assets/shaders/sdf/cubic.wgsl",
+    "assets/shaders/sdf/bvh.wgsl",
+    "assets/shaders/sdf/material.wgsl",
+    "assets/shaders/sdf/pbr.wgsl",
+];
 
-    for line in source.lines() {
-        let trimmed = line.trim();
+const SDF_ENTRY: &str = "assets/shaders/sdf_raymarch.wgsl";
 
-        if trimmed.starts_with("#import") {
-            continue;
-        }
+/// Compose the SDF import graph into a single naga module, then validate it.
+fn validate_composed_sdf() -> Result<(), String> {
+    let mut composer = composer_with_stub();
 
-        // Handle #ifndef / #ifdef — strip the directive but keep the body
-        if trimmed.starts_with("#ifndef") || trimmed.starts_with("#ifdef") {
-            if skip_depth == 0 {
-                // Keep the body lines (don't increment skip_depth for the directive itself)
-            }
-            continue;
-        }
-
-        if trimmed.starts_with("#endif") {
-            continue;
-        }
-
-        // Strip other naga-oil preprocessor directives
-        if trimmed.starts_with("#define") || trimmed.starts_with("#else") {
-            continue;
-        }
-
-        lines.push(line.to_string());
+    // Add each SDF module, dependencies first.
+    for path in SDF_MODULES {
+        let source = std::fs::read_to_string(path).map_err(|e| format!("read {path}: {e}"))?;
+        composer
+            .add_composable_module(ComposableModuleDescriptor {
+                source: &source,
+                file_path: path,
+                language: ShaderLanguage::Wgsl,
+                ..Default::default()
+            })
+            .map_err(|e| format!("compose {path} failed: {e}"))?;
     }
 
-    format!("{BEVY_STUBS}\n{}\n", lines.join("\n"))
-}
+    // Compose the entry shader (resolves all #import lines into one naga module).
+    let entry_src =
+        std::fs::read_to_string(SDF_ENTRY).map_err(|e| format!("read {SDF_ENTRY}: {e}"))?;
+    let module = composer
+        .make_naga_module(NagaModuleDescriptor {
+            source: &entry_src,
+            file_path: SDF_ENTRY,
+            ..Default::default()
+        })
+        .map_err(|e| format!("compose {SDF_ENTRY} failed:\n{e}"))?;
 
-/// Validate a single WGSL file using naga.
-fn validate_wgsl_file(path: &Path) -> Result<(), String> {
-    let source = std::fs::read_to_string(path)
-        .map_err(|e| format!("Failed to read {}: {e}", path.display()))?;
-
-    let processed = preprocess_shader(&source);
-
-    let result = naga::front::wgsl::parse_str(&processed);
-    let module = result.map_err(|e| {
-        let mut report = format!("WGSL parse error in {}:\n{e}", path.display());
-        report.push_str("\n\n--- Preprocessed source ---\n");
-        for (i, line) in processed.lines().enumerate() {
-            report.push_str(&format!("{:4}: {}\n", i + 1, line));
-        }
-        report
-    })?;
-
+    // naga_oil hands back a naga::Module directly; validate it.
     let mut validator = naga::valid::Validator::new(
         naga::valid::ValidationFlags::all(),
         naga::valid::Capabilities::all(),
     );
     validator
         .validate(&module)
-        .map_err(|e| format!("WGSL validation error in {}:\n{e}", path.display()))?;
-
+        .map_err(|e| format!("WGSL validation error in composed SDF shader:\n{e:?}"))?;
     Ok(())
 }
 
-/// Discover all .wgsl files under assets/shaders/
-fn collect_shaders() -> Vec<std::path::PathBuf> {
-    let dir = std::path::Path::new("assets/shaders");
-    if !dir.exists() {
-        return Vec::new();
-    }
-    let mut shaders: Vec<_> = walkdir(dir)
-        .into_iter()
-        .filter(|p| p.extension().is_some_and(|ext| ext == "wgsl"))
-        .collect();
-    shaders.sort();
-    shaders
+/// Register the Bevy fullscreen stub into a fresh composer.
+fn composer_with_stub() -> Composer {
+    let mut composer = Composer::default();
+    composer
+        .add_composable_module(ComposableModuleDescriptor {
+            source: FULLSCREEN_STUB,
+            file_path: "bevy_core_pipeline::fullscreen_vertex_shader",
+            language: ShaderLanguage::Wgsl,
+            ..Default::default()
+        })
+        .expect("fullscreen stub must compose");
+    composer
 }
 
-fn walkdir(dir: &Path) -> Vec<std::path::PathBuf> {
-    let mut result = Vec::new();
-    if let Ok(entries) = std::fs::read_dir(dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                result.extend(walkdir(&path));
-            } else {
-                result.push(path);
-            }
-        }
-    }
-    result
-}
-
-#[test]
-fn all_wgsl_shaders_parse_and_validate() {
-    let shaders = collect_shaders();
-    assert!(
-        !shaders.is_empty(),
-        "No .wgsl files found in assets/shaders"
+/// Compose an entry shader that only imports the Bevy fullscreen stub (no local
+/// `sdf::*` modules), then validate. Used for self-contained shaders like
+/// `sdf_debug.wgsl`.
+fn validate_entry(path: &Path) -> Result<(), String> {
+    let mut composer = composer_with_stub();
+    let source =
+        std::fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()))?;
+    let module = composer
+        .make_naga_module(NagaModuleDescriptor {
+            source: &source,
+            file_path: &path.to_string_lossy(),
+            ..Default::default()
+        })
+        .map_err(|e| format!("compose {} failed:\n{e}", path.display()))?;
+    let mut validator = naga::valid::Validator::new(
+        naga::valid::ValidationFlags::all(),
+        naga::valid::Capabilities::all(),
     );
-
-    let mut failures = Vec::new();
-    for path in &shaders {
-        if let Err(e) = validate_wgsl_file(path) {
-            failures.push(e);
-        }
-    }
-
-    if !failures.is_empty() {
-        let report = failures.join("\n\n");
-        panic!("{report}");
-    }
+    validator
+        .validate(&module)
+        .map_err(|e| format!("WGSL validation error in {}:\n{e:?}", path.display()))?;
+    Ok(())
 }
 
 #[test]
 fn sdf_raymarch_wgsl_validates() {
-    validate_wgsl_file(std::path::Path::new("assets/shaders/sdf_raymarch.wgsl"))
-        .unwrap_or_else(|e| panic!("{e}"));
+    validate_composed_sdf().unwrap_or_else(|e| panic!("{e}"));
+}
+
+#[test]
+fn standalone_shaders_validate() {
+    // Self-contained entry shaders that only import the Bevy fullscreen stub (the
+    // `sdf/` modules are validated composed via `sdf_raymarch_wgsl_validates`).
+    let entries = ["assets/shaders/sdf_debug.wgsl"];
+    let mut failures = Vec::new();
+    for path in entries {
+        let p = Path::new(path);
+        if p.exists()
+            && let Err(e) = validate_entry(p)
+        {
+            failures.push(e);
+        }
+    }
+    if !failures.is_empty() {
+        panic!("{}", failures.join("\n\n"));
+    }
 }
