@@ -19,7 +19,7 @@ pub fn status_bar_ui(world: &mut World, ctx: &egui::Context) {
         .count();
     let (bricks, dirty) = world
         .get_resource::<SdfAtlas>()
-        .map(|a| (a.bricks.len(), a.dirty))
+        .map(|a| (a.bricks.len(), a.rebake_all || !a.dirty_bricks.is_empty()))
         .unwrap_or((0, false));
 
     egui::TopBottomPanel::bottom("editor_status_bar").show(ctx, |ui| {

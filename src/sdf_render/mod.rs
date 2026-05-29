@@ -210,6 +210,7 @@ impl Plugin for SdfScenePlugin {
             .init_resource::<SdfOrbitCamera>()
             .init_resource::<edits::MaterialRegistry>()
             .init_resource::<atlas::SdfAtlas>()
+            .init_resource::<PrevEditAabbs>()
             .init_resource::<bvh::Bvh>()
             .init_resource::<SdfRenderEnabled>()
             .init_resource::<SdfRaymarchParams>()
@@ -663,22 +664,71 @@ fn line_color(index: i32, axis: Color, major: Color, minor: Color) -> Color {
 
 // --- Atlas Baking ---
 
+/// Last frame's per-edit world AABB, keyed by entity. Lets `bake_dirty_bricks`
+/// dirty an edit's *former* footprint (not just where it moved to) so vacated
+/// bricks get rebuilt/removed. Also serves as the previous entity set for
+/// add/remove detection.
+#[derive(Resource, Default)]
+struct PrevEditAabbs {
+    map: std::collections::HashMap<Entity, bevy::math::bounding::Aabb3d>,
+}
+
+/// Any component that affects an edit's baked result. A change to one of these
+/// triggers a targeted rebake of the bricks the edit touches.
+type ChangedEdit = Or<(
+    Changed<Transform>,
+    Changed<SdfOp>,
+    Changed<SdfPrimitive>,
+    Changed<SdfMaterial>,
+)>;
+
 fn bake_dirty_bricks(
     mut atlas: ResMut<atlas::SdfAtlas>,
     mut bvh: ResMut<bvh::Bvh>,
+    mut prev_aabbs: ResMut<PrevEditAabbs>,
     config: Res<SdfGridConfig>,
     volumes: Query<VolumeQueryData, With<SdfVolume>>,
+    changed: Query<Entity, (With<SdfVolume>, ChangedEdit)>,
 ) {
-    if !atlas.dirty {
-        return;
-    }
     let gathered = gather_sorted_edits(&volumes);
     let resolved: Vec<edits::ResolvedEdit> = gathered.iter().map(|g| g.edit.clone()).collect();
     let aabbs: Vec<bevy::math::bounding::Aabb3d> = gathered.iter().map(|g| g.aabb).collect();
+    let current: std::collections::HashMap<Entity, bevy::math::bounding::Aabb3d> =
+        gathered.iter().map(|g| (g.entity, g.aabb)).collect();
 
-    // Rebuild the BVH from the current edits, then bake using it to cull per brick.
+    // An edit added or removed changes the whole BVH → full rebuild. (Equal count
+    // with a swapped entity is caught by the membership check.)
+    let set_changed = current.len() != prev_aabbs.map.len()
+        || current.keys().any(|e| !prev_aabbs.map.contains_key(e));
+
+    if atlas.rebake_all || set_changed {
+        *bvh = bvh::Bvh::build(&aabbs);
+        atlas.full_bake(&resolved, &aabbs, &bvh, &config);
+        prev_aabbs.map = current;
+        return;
+    }
+
+    // Existing edits only: union each changed edit's old+new footprint into the
+    // dirty set. Nothing changed → idle, no bake, no BVH rebuild.
+    if changed.is_empty() {
+        return;
+    }
+
+    let mut dirty = std::mem::take(&mut atlas.dirty_bricks);
+    for entity in &changed {
+        if let Some(old) = prev_aabbs.map.get(&entity) {
+            dirty.extend(atlas::bricks_in_aabb(&config, old));
+        }
+        if let Some(new) = current.get(&entity) {
+            dirty.extend(atlas::bricks_in_aabb(&config, new));
+        }
+    }
+
+    // An edit moved → its BVH leaf AABB moved; rebuild so the incremental bake culls
+    // against current positions.
     *bvh = bvh::Bvh::build(&aabbs);
-    atlas.full_bake(&resolved, &aabbs, &bvh, &config);
+    atlas.bake_incremental(&dirty, &resolved, &bvh, &config);
+    prev_aabbs.map = current;
 }
 
 // --- Upload to GPU (placeholder — render.rs handles actual upload) ---

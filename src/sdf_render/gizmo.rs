@@ -17,7 +17,7 @@ use bevy::prelude::*;
 use crate::gizmo_render::{GizmoDraw, GizmoMesh, ShapeBuilder};
 
 use super::picking::{Ray, mouse_to_ray};
-use super::{SdfCamera, SdfSelection, SdfVolume, atlas};
+use super::{SdfCamera, SdfSelection, SdfVolume};
 
 // --- Pixel constants (matched to transform-gizmo defaults) ---
 /// Axis length / outer extent, in pixels (the plugin's `gizmo_size`).
@@ -460,7 +460,6 @@ pub fn gizmo_update(
     windows: Query<&Window>,
     cameras: Query<(&Camera, &Transform), With<SdfCamera>>,
     mut volumes: Query<&mut Transform, (With<SdfVolume>, Without<SdfCamera>)>,
-    mut atlas: ResMut<atlas::SdfAtlas>,
 ) {
     state.claimed_click = false;
 
@@ -498,8 +497,9 @@ pub fn gizmo_update(
     // Continue an active drag.
     if let Some(drag) = state.drag.take() {
         if let Ok(mut t) = volumes.get_mut(entity) {
+            // Mutating Transform fires `Changed<Transform>`, which `bake_dirty_bricks`
+            // uses to rebake just the affected bricks — no explicit dirty flag needed.
             apply_drag(&drag, &ray, &mut t, &state);
-            atlas.mark_dirty();
         }
         state.hovered = Some(drag.id);
         state.drag = Some(drag);

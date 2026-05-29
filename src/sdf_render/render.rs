@@ -17,7 +17,7 @@ use bevy::render::view::{ViewDepthTexture, ViewTarget};
 use bevy::render::{Extract, ExtractSchedule, Render, RenderApp, RenderStartup};
 use bevy::tasks::{AsyncComputeTaskPool, Task, block_on, poll_once};
 
-use super::atlas::{BRICK_EDGE, SdfAtlas};
+use super::atlas::{BRICK_EDGE, SNORM_CLAMP_DIST, SdfAtlas};
 use super::bvh::Bvh;
 use super::edits::PALETTE_K;
 use super::{SdfCamera, SdfGridConfig, SdfRenderEnabled};
@@ -64,6 +64,7 @@ struct SdfCameraData {
     grid_origin: Vec4,   // xyz = grid origin, w = voxel_size
     grid_dims: Vec4, // x = grid_size, y = bricks_per_axis, z = brick_size (8.0), w = num_lookups
     debug_params: Vec4, // x = max_steps, y = max_dist, z = sdf_eps, w = bvh_node_count
+    bake_reach: Vec4, // x = world-units a baked brick reaches beyond a tight edit AABB
 }
 
 /// GPU mirror of a [`super::edits::MaterialDef`], one per global material id, in a
@@ -85,17 +86,51 @@ struct GpuSdfMaterial {
 
 // --- Extracted Atlas ---
 
+/// One brick's texels for a partial upload: a 64×8 sub-rect at the tile's pixel
+/// origin. `dist` is BRICK_VOXELS i16; `mat` is BRICK_VOXELS×4 i16 (the 4 palette
+/// slots). Laid out tile-local (the same y*EDGE+x / z mapping the full path uses).
+struct TileTexels {
+    /// Pixel origin of the tile in the atlas (`col_px | row_px<<16`, as packed into
+    /// `atlas_base`). Split in `prepare` for the `write_texture` origin.
+    atlas_base: u32,
+    dist: Vec<i16>,
+    mat: Vec<i16>,
+}
+
 #[derive(Resource, Default)]
 struct ExtractedSdfAtlas {
-    /// R16Snorm distance values, one i16 per voxel (the CSG-combined surface).
+    /// Full atlas pixel buffers, present only on a realloc (full rebuild / grow).
+    /// R16Snorm distance + Rgba16Snorm 4-slot material, whole-texture sized.
     dist_data: Vec<i16>,
-    /// Per-palette-slot distance field, Rgba16Snorm: 4 channels = the brick's 4
-    /// palette slots. Same tile layout as `dist_data` (4 i16 per texel).
     mat_data: Vec<i16>,
+    /// Per-tile deltas for an in-place partial upload (only the bricks that changed
+    /// this bake). Empty on a realloc.
+    changed_tiles: Vec<TileTexels>,
+    /// Full lookup buffer (small: 16 B × brick count). Always rebuilt — tile origins
+    /// are stable so this stays cheap and the shader's binary search is unaffected.
     lookup_data: Vec<GpuBrickLookup>,
     texture_width: u32,
     texture_height: u32,
+    /// Recreate the textures + views (full rebuild or capacity grow). When false,
+    /// `prepare` keeps the existing textures and only `write_texture`s `changed_tiles`.
+    realloc: bool,
     dirty: bool,
+}
+
+/// Render-world memo of the last atlas generation uploaded, so `extract_sdf_atlas`
+/// only flags `dirty` (and `prepare_sdf_atlas_gpu` only re-uploads) when the
+/// main-world bake actually changed something. Without this the atlas was rebuilt
+/// every frame.
+#[derive(Resource, Default)]
+struct LastAtlasGen(u64);
+
+/// Render-world record of how many tile rows the persistent atlas texture currently
+/// spans. `extract_sdf_atlas` reads it to decide grow-vs-partial-upload; the texture
+/// only grows (never shrinks except on a full rebuild), so a tile origin assigned
+/// once stays valid until the next full bake.
+#[derive(Resource, Default)]
+struct AtlasCapacity {
+    rows: u32,
 }
 
 /// Flattened BVH nodes (raw std430 bytes, 32B each) extracted from the main world
@@ -112,9 +147,14 @@ struct ExtractedSdfBvh {
 
 #[derive(Resource, Default)]
 struct SdfGpuAtlas {
+    /// Persistent distance atlas (R16Snorm). Kept (not just its view) so partial
+    /// bakes can `write_texture` only the changed tiles instead of recreating it.
+    dist_tex: Option<Texture>,
     dist_view: Option<TextureView>,
-    /// Per-palette-slot distance atlas (Rgba16Snorm, 4 channels). The shader argmins
-    /// the 4 slots for the local material index, then maps it via the brick palette.
+    /// Persistent per-palette-slot distance atlas (Rgba16Snorm, 4 channels). The
+    /// shader argmins the 4 slots for the local material index, then maps it via the
+    /// brick palette. Kept across frames for the same partial-upload reason.
+    mat_tex: Option<Texture>,
     mat_view: Option<TextureView>,
     sampler: Option<Sampler>,
     lookup_buffer: Option<Buffer>,
@@ -394,7 +434,14 @@ impl Plugin for SdfRenderPlugin {
                 Update,
                 prepare_sdf_camera_data
                     .run_if(in_state(crate::scene_manager::AppScene::SdfEditor))
-                    .after(super::orbit_camera),
+                    .after(super::orbit_camera)
+                    // MUST run after the bake: the shader's binary-search bound
+                    // (`grid_dims.w = atlas.bricks.len()`) has to match the lookup
+                    // buffer `extract_sdf_atlas` builds from the *same* post-bake
+                    // brick set. Reading the count before the bake desyncs them while
+                    // dragging (count too high → past-end reads = phantom geometry;
+                    // too low → missed bricks = gaps).
+                    .after(super::bake_dirty_bricks),
             );
 
         #[cfg(feature = "editor")]
@@ -419,6 +466,8 @@ impl Plugin for SdfRenderPlugin {
             .add_systems(ExtractSchedule, extract_texture_library)
             .add_systems(ExtractSchedule, extract_shader_defs)
             .init_resource::<TextureStreamState>()
+            .init_resource::<LastAtlasGen>()
+            .init_resource::<AtlasCapacity>()
             .add_systems(Render, prepare_sdf_atlas_gpu)
             .add_systems(Render, prepare_sdf_bvh_gpu)
             .add_systems(Render, prepare_sdf_materials_gpu)
@@ -523,6 +572,15 @@ fn prepare_sdf_camera_data(
                 raymarch.sdf_eps,
                 bvh.nodes.len() as f32,
             ),
+            // Same footprint `bricks_in_aabb` bakes with: tight AABB grown by
+            // SNORM_CLAMP_DIST, then one brick of grid-snap pad. The BVH skip inflates
+            // every box by this so it never overshoots a baked shell brick.
+            bake_reach: Vec4::new(
+                SNORM_CLAMP_DIST + config.voxel_size * config.cell_stride() as f32,
+                0.0,
+                0.0,
+                0.0,
+            ),
         });
     }
 }
@@ -618,60 +676,82 @@ fn rebuild_pipeline_on_def_change(
 
 // --- Extract: Pack Atlas for GPU ---
 
+/// Pixel origin of `tile` in the 2D-tiled atlas. Tiles wrap into rows so the width
+/// stays bounded (a single strip overflows wgpu's 32768 max once brick count passes
+/// ~512). Returns `(col_px, row_px)`; `atlas_base = col_px | row_px<<16`.
+fn tile_origin(tile: u32) -> (u32, u32) {
+    let edge = BRICK_EDGE as u32;
+    let tile_width = edge * edge; // 64
+    let col_px = (tile % ATLAS_TILES_PER_ROW) * tile_width;
+    let row_px = (tile / ATLAS_TILES_PER_ROW) * edge;
+    (col_px, row_px)
+}
+
+/// Pack one brick's voxels into a tile-local `(dist[512], mat[2048])` pair, in the
+/// same `(y*EDGE+x, z)` pixel layout the atlas uses. Shared by the full and partial
+/// upload paths so they're byte-identical.
+fn pack_tile_texels(packed: &super::atlas::PackedBrick) -> (Vec<i16>, Vec<i16>) {
+    let edge = BRICK_EDGE as u32;
+    let tile_width = (edge * edge) as usize; // 64 px wide, EDGE tall
+    let mut dist = vec![0i16; tile_width * edge as usize];
+    let mut mat = vec![i16::MAX; tile_width * edge as usize * 4];
+    for z in 0..edge {
+        for y in 0..edge {
+            for x in 0..edge {
+                let src_idx = (z * edge * edge + y * edge + x) as usize;
+                // Tile-local destination: u in [0,64), v in [0,EDGE).
+                let local = (z * tile_width as u32 + y * edge + x) as usize;
+                dist[local] = packed.dist[src_idx];
+                let mat_base = src_idx * PALETTE_K;
+                for k in 0..PALETTE_K {
+                    mat[local * 4 + k] = packed.mat_dist[mat_base + k];
+                }
+            }
+        }
+    }
+    (dist, mat)
+}
+
 fn extract_sdf_atlas(
     atlas: Extract<Res<SdfAtlas>>,
     config: Extract<Res<SdfGridConfig>>,
+    mut last_gen: ResMut<LastAtlasGen>,
+    mut capacity: ResMut<AtlasCapacity>,
     mut commands: Commands,
 ) {
+    // Nothing changed since the last upload — skip the rebuild entirely so idle
+    // frames cost no extract/prepare work. `prepare_sdf_atlas_gpu` keeps last
+    // frame's GPU resources because the inserted resource has `dirty = false`.
+    if atlas.generation == last_gen.0 {
+        commands.insert_resource(ExtractedSdfAtlas::default()); // dirty = false
+        return;
+    }
+    last_gen.0 = atlas.generation;
+
     let num_bricks = atlas.bricks.len() as u32;
     if num_bricks == 0 {
         commands.insert_resource(ExtractedSdfAtlas::default());
         return;
     }
 
-    // Atlas is a 2D-tiled texture: each brick is an EDGE*EDGE-wide, EDGE-tall tile;
-    // tiles wrap into rows so the width stays bounded (a single strip overflows
-    // wgpu's 32768 max texture dimension once brick count passes ~512). Within a
-    // tile pixel (u,v) = (tile_col*64 + y*EDGE + x, tile_row*EDGE + z).
     let edge = BRICK_EDGE as u32;
     let tile_width = edge * edge; // 64
-    let tiles_per_row = ATLAS_TILES_PER_ROW; // bounds width to tiles_per_row*64
-    let num_rows = num_bricks.div_ceil(tiles_per_row);
-    let texture_width = tiles_per_row * tile_width;
-    let texture_height = num_rows * edge;
-    let pixels = (texture_width * texture_height) as usize;
-    let mut dist_data = vec![0i16; pixels];
-    // Far sentinel (+1.0 snorm) so empty material slots lose the argmin.
-    let far = i16::MAX;
-    // Single Rgba16Snorm atlas: 4 channels = the brick's 4 palette-slot distances.
-    let mut mat_data = vec![far; pixels * 4];
+    let texture_width = ATLAS_TILES_PER_ROW * tile_width;
+
+    // Tile origins come from the stable allocator (its high-water mark), NOT brick
+    // iteration order — so a re-baked brick keeps its sub-rect across frames.
+    let required_rows = atlas.tiles.high_water().div_ceil(ATLAS_TILES_PER_ROW).max(1);
+    let texture_height = required_rows * edge;
+
+    // Always rebuild the (small) lookup buffer; tile origins are stable so this is
+    // cheap and keeps the shader's brick_id binary search correct.
     let mut lookups = Vec::with_capacity(num_bricks as usize);
-
-    for (i, (coord, packed)) in atlas.bricks.iter().enumerate() {
-        let tile = i as u32;
-        let col_px = (tile % tiles_per_row) * tile_width;
-        let row_px = (tile / tiles_per_row) * edge;
-
-        for z in 0..edge {
-            for y in 0..edge {
-                for x in 0..edge {
-                    let src_idx = (z * edge * edge + y * edge + x) as usize;
-                    let dst_u = col_px + y * edge + x;
-                    let dst_v = row_px + z;
-                    let dst_idx = (dst_v * texture_width + dst_u) as usize;
-                    dist_data[dst_idx] = packed.dist[src_idx];
-
-                    // The 4 palette-slot distances map straight to RGBA channels.
-                    let mat_base = src_idx * PALETTE_K;
-                    for k in 0..PALETTE_K {
-                        mat_data[dst_idx * 4 + k] = packed.mat_dist[mat_base + k];
-                    }
-                }
-            }
-        }
-
-        // Pack the tile's pixel origin (col | row<<16) into `atlas_base`; the shader
-        // unpacks it in `voxel_pixel`. Palette ids pack into two u32 (low/high 16).
+    for (coord, packed) in atlas.bricks.iter() {
+        let tile = atlas
+            .tiles
+            .tile(coord)
+            .expect("baked brick must have an allocated tile");
+        let (col_px, row_px) = tile_origin(tile);
         let p = packed.palette;
         lookups.push(GpuBrickLookup {
             brick_id: config.brick_id(*coord),
@@ -680,16 +760,70 @@ fn extract_sdf_atlas(
             pal23: p[2] as u32 | ((p[3] as u32) << 16),
         });
     }
+    lookups.sort_by_key(|l| l.brick_id); // shader binary-searches by brick_id
 
-    // Sorted so the shader can binary-search by brick_id.
-    lookups.sort_by_key(|l| l.brick_id);
+    // Realloc when a full bake happened or the atlas must grow taller. The texture
+    // never shrinks except on a full bake, so a tile origin stays valid until then.
+    let realloc = atlas.last_bake_was_full || required_rows > capacity.rows;
+
+    if realloc {
+        capacity.rows = required_rows;
+        let pixels = (texture_width * texture_height) as usize;
+        let mut dist_data = vec![0i16; pixels];
+        let mut mat_data = vec![i16::MAX; pixels * 4]; // far sentinel loses the argmin
+        for (coord, packed) in atlas.bricks.iter() {
+            let tile = atlas.tiles.tile(coord).unwrap();
+            let (col_px, row_px) = tile_origin(tile);
+            let (dist, mat) = pack_tile_texels(packed);
+            // Blit the tile-local buffers into the full texture at (col_px,row_px).
+            for v in 0..edge {
+                for u in 0..tile_width {
+                    let local = (v * tile_width + u) as usize;
+                    let dst = ((row_px + v) * texture_width + col_px + u) as usize;
+                    dist_data[dst] = dist[local];
+                    mat_data[dst * 4..dst * 4 + 4].copy_from_slice(&mat[local * 4..local * 4 + 4]);
+                }
+            }
+        }
+        commands.insert_resource(ExtractedSdfAtlas {
+            dist_data,
+            mat_data,
+            changed_tiles: Vec::new(),
+            lookup_data: lookups,
+            texture_width,
+            texture_height,
+            realloc: true,
+            dirty: true,
+        });
+        return;
+    }
+
+    // Partial upload: only the tiles the incremental bake touched.
+    let mut changed_tiles = Vec::with_capacity(atlas.changed_tiles.len());
+    // Map tile → coord once so we can pull the baked brick. (changed_tiles holds tile
+    // indices; bricks are keyed by coord.)
+    for (coord, packed) in atlas.bricks.iter() {
+        let tile = atlas.tiles.tile(coord).unwrap();
+        if !atlas.changed_tiles.contains(&tile) {
+            continue;
+        }
+        let (col_px, row_px) = tile_origin(tile);
+        let (dist, mat) = pack_tile_texels(packed);
+        changed_tiles.push(TileTexels {
+            atlas_base: col_px | (row_px << 16),
+            dist,
+            mat,
+        });
+    }
 
     commands.insert_resource(ExtractedSdfAtlas {
-        dist_data,
-        mat_data,
+        dist_data: Vec::new(),
+        mat_data: Vec::new(),
+        changed_tiles,
         lookup_data: lookups,
         texture_width,
         texture_height,
+        realloc: false,
         dirty: true,
     });
 }
@@ -982,7 +1116,8 @@ fn prepare_sdf_atlas_gpu(
         return;
     }
 
-    // Lookup buffer (std430: 4 x u32 per entry).
+    // Lookup buffer (std430: 4 x u32 per entry). Always rebuilt — it's small and tile
+    // origins are stable, so the shader's brick_id binary search stays valid.
     let mut buffer_bytes = Vec::with_capacity(extracted.lookup_data.len() * 16);
     for l in &extracted.lookup_data {
         buffer_bytes.extend_from_slice(&l.brick_id.to_le_bytes());
@@ -990,72 +1125,130 @@ fn prepare_sdf_atlas_gpu(
         buffer_bytes.extend_from_slice(&l.pal01.to_le_bytes());
         buffer_bytes.extend_from_slice(&l.pal23.to_le_bytes());
     }
-
-    let lookup_buffer = device.create_buffer_with_data(&BufferInitDescriptor {
+    gpu_atlas.lookup_buffer = Some(device.create_buffer_with_data(&BufferInitDescriptor {
         label: Some("sdf_lookup_buffer"),
         contents: &buffer_bytes,
         usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
-    });
+    }));
 
-    let size = Extent3d {
-        width: extracted.texture_width,
-        height: extracted.texture_height,
-        depth_or_array_layers: 1,
-    };
+    if extracted.realloc {
+        // Full rebuild / grow: recreate both textures sized to the new height and
+        // upload everything. Keep the Texture handles so later partial bakes can
+        // write_texture into them.
+        let size = Extent3d {
+            width: extracted.texture_width,
+            height: extracted.texture_height,
+            depth_or_array_layers: 1,
+        };
+        let mut dist_bytes = Vec::with_capacity(extracted.dist_data.len() * 2);
+        for v in &extracted.dist_data {
+            dist_bytes.extend_from_slice(&v.to_le_bytes());
+        }
+        let dist_tex = device.create_texture_with_data(
+            &queue,
+            &TextureDescriptor {
+                label: Some("sdf_dist_atlas"),
+                size,
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: TextureDimension::D2,
+                format: TextureFormat::R16Snorm,
+                usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST,
+                view_formats: &[],
+            },
+            TextureDataOrder::default(),
+            &dist_bytes,
+        );
+        let mat_tex = device.create_texture_with_data(
+            &queue,
+            &TextureDescriptor {
+                label: Some("sdf_mat_atlas"),
+                size,
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: TextureDimension::D2,
+                format: TextureFormat::Rgba16Snorm,
+                usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST,
+                view_formats: &[],
+            },
+            TextureDataOrder::default(),
+            &i16s_to_le_bytes(&extracted.mat_data),
+        );
 
-    // Distance atlas: R16Snorm, the trilinearly-interpolated SDF. i16 values
-    // are uploaded as little-endian bytes (2 per texel).
-    let mut dist_bytes = Vec::with_capacity(extracted.dist_data.len() * 2);
-    for v in &extracted.dist_data {
-        dist_bytes.extend_from_slice(&v.to_le_bytes());
+        gpu_atlas.dist_view = Some(dist_tex.create_view(&TextureViewDescriptor::default()));
+        gpu_atlas.mat_view = Some(mat_tex.create_view(&TextureViewDescriptor::default()));
+        gpu_atlas.dist_tex = Some(dist_tex);
+        gpu_atlas.mat_tex = Some(mat_tex);
+        if gpu_atlas.sampler.is_none() {
+            gpu_atlas.sampler = Some(device.create_sampler(&SamplerDescriptor {
+                label: Some("sdf_atlas_sampler"),
+                mag_filter: FilterMode::Nearest,
+                min_filter: FilterMode::Nearest,
+                mipmap_filter: FilterMode::Nearest,
+                ..default()
+            }));
+        }
+        return;
     }
-    let dist_tex = device.create_texture_with_data(
-        &queue,
-        &TextureDescriptor {
-            label: Some("sdf_dist_atlas"),
-            size,
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: TextureDimension::D2,
-            format: TextureFormat::R16Snorm,
-            usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST,
-            view_formats: &[],
-        },
-        TextureDataOrder::default(),
-        &dist_bytes,
+
+    // Partial upload: write_texture only the changed tiles into the existing
+    // textures (64×8 sub-rects). No realloc, no view change → bind group unaffected.
+    let (Some(dist_tex), Some(mat_tex)) = (&gpu_atlas.dist_tex, &gpu_atlas.mat_tex) else {
+        return; // never reallocated yet — nothing to patch into
+    };
+    let edge = BRICK_EDGE as u32;
+    let tile_width = edge * edge; // 64
+    for t in &extracted.changed_tiles {
+        let col_px = t.atlas_base & 0xffff;
+        let row_px = t.atlas_base >> 16;
+        let tile_extent = Extent3d {
+            width: tile_width,
+            height: edge,
+            depth_or_array_layers: 1,
+        };
+        queue.write_texture(
+            TexelCopyTextureInfo {
+                texture: dist_tex,
+                mip_level: 0,
+                origin: Origin3d {
+                    x: col_px,
+                    y: row_px,
+                    z: 0,
+                },
+                aspect: TextureAspect::All,
+            },
+            &i16s_to_le_bytes(&t.dist),
+            TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(tile_width * 2), // R16: 2 bytes/texel
+                rows_per_image: Some(edge),
+            },
+            tile_extent,
+        );
+        queue.write_texture(
+            TexelCopyTextureInfo {
+                texture: mat_tex,
+                mip_level: 0,
+                origin: Origin3d {
+                    x: col_px,
+                    y: row_px,
+                    z: 0,
+                },
+                aspect: TextureAspect::All,
+            },
+            &i16s_to_le_bytes(&t.mat),
+            TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(tile_width * 8), // Rgba16: 8 bytes/texel
+                rows_per_image: Some(edge),
+            },
+            tile_extent,
+        );
+    }
+    debug!(
+        "SDF atlas: patched {} changed tile(s)",
+        extracted.changed_tiles.len()
     );
-
-    // Per-palette-slot distance atlas: Rgba16Snorm, 4 channels = the brick's 4
-    // palette slots. The shader trilinearly interpolates these and argmins for the
-    // local material index, so the boundary is the exact sub-voxel bisector.
-    let mat_tex = device.create_texture_with_data(
-        &queue,
-        &TextureDescriptor {
-            label: Some("sdf_mat_atlas"),
-            size,
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: TextureDimension::D2,
-            format: TextureFormat::Rgba16Snorm,
-            usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST,
-            view_formats: &[],
-        },
-        TextureDataOrder::default(),
-        &i16s_to_le_bytes(&extracted.mat_data),
-    );
-
-    let atlas_sampler = device.create_sampler(&SamplerDescriptor {
-        label: Some("sdf_atlas_sampler"),
-        mag_filter: FilterMode::Nearest,
-        min_filter: FilterMode::Nearest,
-        mipmap_filter: FilterMode::Nearest,
-        ..default()
-    });
-
-    gpu_atlas.dist_view = Some(dist_tex.create_view(&TextureViewDescriptor::default()));
-    gpu_atlas.mat_view = Some(mat_tex.create_view(&TextureViewDescriptor::default()));
-    gpu_atlas.sampler = Some(atlas_sampler);
-    gpu_atlas.lookup_buffer = Some(lookup_buffer);
 }
 
 /// Flatten an i16 slice to little-endian bytes for texture upload.
@@ -1254,7 +1447,9 @@ fn init_sdf_pipeline(
         shader_handle: shader,
     });
     commands.insert_resource(SdfGpuAtlas {
+        dist_tex: None,
         dist_view: Some(dummy_tex.create_view(&TextureViewDescriptor::default())),
+        mat_tex: None,
         mat_view: Some(dummy_mat_tex.create_view(&TextureViewDescriptor::default())),
         sampler: Some(dummy_sampler),
         lookup_buffer: Some(dummy_lookup),
