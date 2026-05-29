@@ -1,0 +1,30 @@
+[package]
+name = "adventure"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+default = ["fast"]
+debug_toolkit = [
+    "dep:bevy-inspector-egui",
+    "dep:bevy_egui",
+]
+# Faster incremental compiles via dynamic linking of Bevy. Dev-only — never ship.
+fast = ["bevy/dynamic_linking"]
+
+[dependencies]
+bevy = { version = "0.18", features = ["bevy_remote"] }
+bevy_brp_extras = "0.18"
+bevy_rapier3d = "0.34.0"
+wgpu = "27"
+bevy-inspector-egui = { version = "0.36", optional = true }
+bevy_egui = { version = "0.39", optional = true }
+
+[dev-dependencies]
+naga = "27"
+
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3
