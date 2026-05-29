@@ -1,0 +1,25 @@
+(
+  resources: {},
+  entities: {
+    4294967295: (
+      components: {
+        "adventure::world::Npc": (
+          name: "Guard Thomas",
+          level: 5,
+          hostile: false,
+        ),
+        "adventure::world::QuestGiver": (
+          quest_name: "A Threat Within",
+          quest_description: "Defeat the kobolds threatening the forest.",
+        ),
+        "bevy_transform::components::global_transform::GlobalTransform": ((1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0)),
+        "bevy_transform::components::transform::Transform": (
+          translation: (5.0, 1.0, -3.0),
+          rotation: (0.0, 0.0, 0.0, 1.0),
+          scale: (1.0, 1.0, 1.0),
+        ),
+        "bevy_transform::components::transform::TransformTreeChanged": (),
+      },
+    ),
+  },
+)

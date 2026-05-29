@@ -1,0 +1,343 @@
+use bevy::prelude::*;
+
+use crate::scene_manager::AppScene;
+
+pub struct InventoryPlugin;
+
+#[derive(Clone, Reflect)]
+pub struct Item {
+    pub name: String,
+    pub item_type: ItemType,
+    pub rarity: Rarity,
+    pub level_requirement: u32,
+}
+
+#[derive(Clone, Reflect)]
+pub enum ItemType {
+    Weapon,
+    Armor,
+    Consumable,
+    QuestItem,
+    Material,
+}
+
+#[derive(Clone, Reflect)]
+pub enum Rarity {
+    Common,
+    Uncommon,
+    Rare,
+    Epic,
+    Legendary,
+}
+
+impl Rarity {
+    pub fn color(&self) -> Color {
+        match self {
+            Rarity::Common => Color::srgb(0.6, 0.6, 0.6),
+            Rarity::Uncommon => Color::srgb(0.1, 0.8, 0.1),
+            Rarity::Rare => Color::srgb(0.2, 0.4, 1.0),
+            Rarity::Epic => Color::srgb(0.6, 0.2, 0.8),
+            Rarity::Legendary => Color::srgb(1.0, 0.5, 0.0),
+        }
+    }
+}
+
+#[derive(Resource)]
+pub struct PlayerInventory {
+    pub items: Vec<(Item, u32)>,
+    pub gold: u32,
+    pub max_slots: usize,
+}
+
+impl Default for PlayerInventory {
+    fn default() -> Self {
+        Self {
+            items: Vec::new(),
+            gold: 0,
+            max_slots: 20,
+        }
+    }
+}
+
+#[derive(Component, Reflect)]
+#[reflect(Component)]
+pub struct Lootable {
+    pub items: Vec<(Item, u32)>,
+}
+
+#[derive(Message)]
+pub struct LootEvent {
+    pub item: Item,
+    pub quantity: u32,
+}
+
+#[derive(Message)]
+pub struct LootTransferEvent {
+    pub source_entity: Entity,
+    pub item_index: usize,
+}
+
+#[derive(Message)]
+pub struct ContainerEmptyEvent {
+    pub entity: Entity,
+}
+
+#[derive(Message)]
+pub struct EquipEvent {
+    pub slot: EquipSlot,
+    pub item_index: usize,
+}
+
+#[derive(Clone, Reflect)]
+pub enum EquipSlot {
+    Head,
+    Chest,
+    Legs,
+    Feet,
+    Weapon,
+    OffHand,
+}
+
+#[derive(SystemSet, Debug, Clone, PartialEq, Eq, Hash)]
+pub struct InventorySet;
+
+impl Plugin for InventoryPlugin {
+    fn build(&self, app: &mut App) {
+        app.register_type::<Item>()
+            .register_type::<ItemType>()
+            .register_type::<Rarity>()
+            .register_type::<EquipSlot>()
+            .register_type::<Lootable>()
+            .init_resource::<PlayerInventory>()
+            .add_message::<LootEvent>()
+            .add_message::<LootTransferEvent>()
+            .add_message::<ContainerEmptyEvent>()
+            .add_message::<EquipEvent>()
+            .configure_sets(Update, InventorySet)
+            .add_systems(
+                Update,
+                (handle_loot, handle_loot_transfer, handle_equip)
+                    .in_set(InventorySet)
+                    .run_if(in_state(AppScene::AdventureGame)),
+            );
+    }
+}
+
+fn handle_loot(mut messages: MessageReader<LootEvent>, mut inventory: ResMut<PlayerInventory>) {
+    for event in messages.read() {
+        if inventory.items.len() < inventory.max_slots {
+            inventory.items.push((event.item.clone(), event.quantity));
+        }
+    }
+}
+
+fn handle_loot_transfer(
+    mut messages: MessageReader<LootTransferEvent>,
+    mut empty_messages: MessageWriter<ContainerEmptyEvent>,
+    mut lootable_query: Query<&mut Lootable>,
+    mut inventory: ResMut<PlayerInventory>,
+) {
+    for event in messages.read() {
+        if inventory.items.len() >= inventory.max_slots {
+            continue;
+        }
+        let Ok(mut lootable) = lootable_query.get_mut(event.source_entity) else {
+            continue;
+        };
+        if event.item_index >= lootable.items.len() {
+            continue;
+        }
+        let (item, qty) = lootable.items.remove(event.item_index);
+        inventory.items.push((item, qty));
+        if lootable.items.is_empty() {
+            empty_messages.write(ContainerEmptyEvent {
+                entity: event.source_entity,
+            });
+        }
+    }
+}
+
+fn handle_equip(mut messages: MessageReader<EquipEvent>) {
+    for _event in messages.read() {
+        // Handle equipping items
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_utils::*;
+
+    fn test_item(name: &str) -> Item {
+        Item {
+            name: name.into(),
+            item_type: ItemType::Weapon,
+            rarity: Rarity::Common,
+            level_requirement: 1,
+        }
+    }
+
+    #[test]
+    fn loot_adds_item_to_inventory() {
+        let mut app = test_app();
+        app.add_message::<LootEvent>();
+        app.insert_resource(PlayerInventory {
+            max_slots: 20,
+            ..default()
+        });
+        app.add_systems(Update, handle_loot);
+
+        app.world_mut()
+            .resource_mut::<Messages<LootEvent>>()
+            .write(LootEvent {
+                item: test_item("Sword"),
+                quantity: 1,
+            });
+
+        app.update();
+
+        let inv = app.world().resource::<PlayerInventory>();
+        assert_eq!(inv.items.len(), 1);
+        assert_eq!(inv.items[0].0.name, "Sword");
+        assert_eq!(inv.items[0].1, 1);
+    }
+
+    #[test]
+    fn loot_rejected_when_bag_full() {
+        let mut app = test_app();
+        app.add_message::<LootEvent>();
+        app.insert_resource(PlayerInventory {
+            items: (0..20)
+                .map(|i| (test_item(&format!("Item {i}")), 1))
+                .collect(),
+            gold: 0,
+            max_slots: 20,
+        });
+        app.add_systems(Update, handle_loot);
+
+        app.world_mut()
+            .resource_mut::<Messages<LootEvent>>()
+            .write(LootEvent {
+                item: test_item("Overflow"),
+                quantity: 1,
+            });
+
+        app.update();
+
+        let inv = app.world().resource::<PlayerInventory>();
+        assert_eq!(inv.items.len(), 20);
+    }
+
+    #[test]
+    fn multiple_loot_events_same_frame() {
+        let mut app = test_app();
+        app.add_message::<LootEvent>();
+        app.insert_resource(PlayerInventory {
+            max_slots: 20,
+            ..default()
+        });
+        app.add_systems(Update, handle_loot);
+
+        let mut msgs = app.world_mut().resource_mut::<Messages<LootEvent>>();
+        msgs.write(LootEvent {
+            item: test_item("Axe"),
+            quantity: 1,
+        });
+        msgs.write(LootEvent {
+            item: test_item("Shield"),
+            quantity: 2,
+        });
+
+        app.update();
+
+        let inv = app.world().resource::<PlayerInventory>();
+        assert_eq!(inv.items.len(), 2);
+    }
+
+    #[test]
+    fn inventory_defaults() {
+        let inv = PlayerInventory::default();
+        assert!(inv.items.is_empty());
+        assert_eq!(inv.gold, 0);
+        assert_eq!(inv.max_slots, 20);
+    }
+
+    #[test]
+    fn loot_transfer_moves_item_from_lootable() {
+        let mut app = test_app();
+        app.add_message::<LootTransferEvent>();
+        app.add_message::<ContainerEmptyEvent>();
+        app.insert_resource(PlayerInventory::default());
+        app.add_systems(Update, handle_loot_transfer);
+
+        let entity = app
+            .world_mut()
+            .spawn(Lootable {
+                items: vec![(test_item("Sword"), 1), (test_item("Potion"), 3)],
+            })
+            .id();
+
+        app.world_mut()
+            .resource_mut::<Messages<LootTransferEvent>>()
+            .write(LootTransferEvent {
+                source_entity: entity,
+                item_index: 0,
+            });
+
+        app.update();
+
+        let inv = app.world().resource::<PlayerInventory>();
+        assert_eq!(inv.items.len(), 1);
+        assert_eq!(inv.items[0].0.name, "Sword");
+
+        let lootable = app.world().get::<Lootable>(entity).unwrap();
+        assert_eq!(lootable.items.len(), 1);
+        assert_eq!(lootable.items[0].0.name, "Potion");
+    }
+
+    #[test]
+    fn loot_transfer_rejected_when_full() {
+        let mut app = test_app();
+        app.add_message::<LootTransferEvent>();
+        app.add_message::<ContainerEmptyEvent>();
+        app.insert_resource(PlayerInventory {
+            items: (0..20)
+                .map(|i| (test_item(&format!("Item {i}")), 1))
+                .collect(),
+            gold: 0,
+            max_slots: 20,
+        });
+        app.add_systems(Update, handle_loot_transfer);
+
+        let entity = app
+            .world_mut()
+            .spawn(Lootable {
+                items: vec![(test_item("Overflow"), 1)],
+            })
+            .id();
+
+        app.world_mut()
+            .resource_mut::<Messages<LootTransferEvent>>()
+            .write(LootTransferEvent {
+                source_entity: entity,
+                item_index: 0,
+            });
+
+        app.update();
+
+        let inv = app.world().resource::<PlayerInventory>();
+        assert_eq!(inv.items.len(), 20);
+
+        let lootable = app.world().get::<Lootable>(entity).unwrap();
+        assert_eq!(lootable.items.len(), 1);
+    }
+
+    #[test]
+    fn rarity_colors() {
+        assert_eq!(Rarity::Common.color(), Color::srgb(0.6, 0.6, 0.6));
+        assert_eq!(Rarity::Uncommon.color(), Color::srgb(0.1, 0.8, 0.1));
+        assert_eq!(Rarity::Rare.color(), Color::srgb(0.2, 0.4, 1.0));
+        assert_eq!(Rarity::Epic.color(), Color::srgb(0.6, 0.2, 0.8));
+        assert_eq!(Rarity::Legendary.color(), Color::srgb(1.0, 0.5, 0.0));
+    }
+}
