@@ -3,3 +3,6 @@
 .claude/worktrees/
 # Generated per-variant BC7 texture cache (regenerated from source PNGs on demand).
 assets/textures/**/pbr.bc7
+
+# SDF diagnostic log (throwaway dev output)
+sdf_diag.log
