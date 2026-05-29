@@ -37,6 +37,7 @@ fn main() {
     .add_plugins(WireframePlugin::default())
     .add_plugins(adventure::scene_manager::SceneManagerPlugin)
     .add_plugins(adventure::soul_scene::SoulScenePlugin)
+    .add_plugins(adventure::assets::AssetsPlugin)
     .add_plugins(adventure::sdf_render::SdfScenePlugin)
     .add_plugins(adventure::sdf_render::render::SdfRenderPlugin)
     .add_plugins(adventure::camera::CameraPlugin)

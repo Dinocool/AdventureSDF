@@ -208,7 +208,6 @@ impl Plugin for SdfScenePlugin {
             .init_resource::<SdfSelection>()
             .init_resource::<SdfOrbitCamera>()
             .init_resource::<edits::MaterialRegistry>()
-            .init_resource::<textures::TextureLibrary>()
             .init_resource::<atlas::SdfAtlas>()
             .init_resource::<bvh::Bvh>()
             .init_resource::<SdfRenderEnabled>()
@@ -224,15 +223,11 @@ impl Plugin for SdfScenePlugin {
             .register_type::<SdfMaterial>()
             .register_type::<CsgKind>()
             .register_type::<SdfRaymarchParams>()
-            // Build the material registry from the texture-library manifests, then
-            // spawn the scene — chained so the registry is populated before the
-            // spawns resolve their material ids. (The initial-state `OnEnter` fires
-            // during startup state-transition, *before* the `Startup` schedule, so
-            // a plain `Startup` system would run too late.)
-            .add_systems(
-                OnEnter(AppScene::SdfEditor),
-                (textures::build_texture_library, setup_sdf_scene).chain(),
-            )
+            // Spawn the scene. Material ids come from the demand-driven asset table
+            // (loaded MaterialAssets get stable registry ids); the compile step in
+            // `assets::compile` fills the registry once assets resolve, and the GPU
+            // table re-uploads via change detection.
+            .add_systems(OnEnter(AppScene::SdfEditor), setup_sdf_scene)
             // Camera control + click-selection: skipped when the pointer is over a
             // dock panel (editor sets ViewportInputAllowed). Non-editor build leaves
             // it true, so the full-window viewport behaves as before.
@@ -288,34 +283,45 @@ impl Plugin for SdfScenePlugin {
 
 // --- Scene Setup ---
 
-fn setup_sdf_scene(mut commands: Commands, library: Res<textures::TextureLibrary>) {
-    // Demo materials reference library variants by slug (registry id = 1 + layer,
-    // built in `build_texture_library`). Falls back to id 0 if the library is
-    // missing, so the scene still renders.
-    let mat_of = |slug: &str| -> u32 {
-        library
-            .variants
-            .iter()
-            .position(|v| v.slug == slug)
-            .map(|layer| 1 + layer as u32)
-            .unwrap_or(0)
-    };
-    let mat_cobble = mat_of("cobble_stone");
-    let mat_sand = mat_of("sand");
-    let mat_ground = mat_of("ground");
-    // Distinct variants within a slug so neighbours look different (registry id =
-    // 1 + layer; consecutive ids are consecutive variants). `nth` clamps the offset
-    // so it stays a valid registry id even if a slug has few variants.
-    let n_mats = library.variants.len() as u32 + 1; // +1 for the fallback at id 0
-    let nth = |base: u32, off: u32| -> u32 {
-        if base == 0 {
-            0
+fn setup_sdf_scene(
+    mut commands: Commands,
+    asset_server: Res<AssetServer>,
+    mut material_assets: ResMut<Assets<crate::assets::MaterialAsset>>,
+    mut asset_table: ResMut<crate::assets::MaterialAssetTable>,
+) {
+    use crate::assets::{MaterialAsset, TexRef};
+
+    asset_table.ensure_fallback();
+
+    // Demo materials. Each references a texture variant by path (slug/dir). If a
+    // matching `assets/materials/<name>.material.ron` exists on disk we load it (the
+    // authored source of truth); otherwise we synthesize one in-memory so the demo
+    // scene still renders. Either way it gets a stable registry id from the table,
+    // and `assets::compile` fills the GPU registry once the asset resolves.
+    let mut mat = |name: &str, slug: &str, dir: &str| -> u32 {
+        let path = format!("materials/{name}.material.ron");
+        let handle = if std::path::Path::new(&format!("assets/{path}")).exists() {
+            asset_server.load::<MaterialAsset>(path)
         } else {
-            (base + off).min(n_mats.saturating_sub(1))
-        }
+            material_assets.add(MaterialAsset {
+                base_color: [1.0, 1.0, 1.0, 1.0],
+                blend_softness: 0.0,
+                maps: std::array::from_fn(|_| {
+                    Some(TexRef {
+                        slug: slug.to_string(),
+                        dir: dir.to_string(),
+                    })
+                }),
+            })
+        };
+        asset_table.register(handle)
     };
-    let mat_cobble2 = nth(mat_cobble, 2);
-    let mat_ground2 = nth(mat_ground, 3);
+
+    let mat_sand = mat("sand", "sand", "1");
+    let mat_cobble = mat("cobble", "cobble_stone", "1");
+    let mat_cobble2 = mat("cobble2", "cobble_stone", "3");
+    let mat_ground = mat("ground", "ground", "1");
+    let mat_ground2 = mat("ground2", "ground", "4");
 
     // Camera
     let orbit = SdfOrbitCamera::default();

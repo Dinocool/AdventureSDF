@@ -11,7 +11,7 @@
 use bevy::prelude::*;
 use serde::Deserialize;
 
-use super::edits::{MATERIAL_TEX_MAPS, MaterialDef, MaterialRegistry};
+use super::edits::MATERIAL_TEX_MAPS;
 
 /// Texture-array layer edge length. The importer emits 1024²; we resize on decode
 /// so the arrays are uniform regardless of on-disk size. Uploaded as BC7 with a full
@@ -41,90 +41,51 @@ pub struct LibraryVariant {
     pub display_name: String,
 }
 
-/// The ordered list of all library variants. Index = texture-array layer. Built
-/// once at startup (main world) and extracted to the render world for upload.
-#[derive(Resource, Default, Clone)]
-pub struct TextureLibrary {
-    pub variants: Vec<LibraryVariant>,
-}
+// --- Manifest parsing (used by the Resource Inspector to list available textures) ---
 
-// --- Manifest parsing ---
-
+/// Serde struct for a variant entry inside a `material.ron` manifest.
 #[derive(Deserialize)]
-struct ManifestVariant {
+pub struct ManifestVariant {
     #[allow(dead_code)]
-    id: u32,
-    dir: String,
+    pub id: u32,
+    pub dir: String,
 }
 
+/// Serde struct for a `assets/textures/<slug>/material.ron` file.
 #[derive(Deserialize)]
-struct Manifest {
-    name: String,
-    slug: String,
-    variants: Vec<ManifestVariant>,
+pub struct Manifest {
+    pub name: String,
+    pub slug: String,
+    pub variants: Vec<ManifestVariant>,
 }
 
-/// Slugs to load, in registry order. (Could be discovered by directory scan, but an
-/// explicit list keeps load order stable and obvious.)
-const LIBRARY_SLUGS: [&str; 3] = ["cobble_stone", "sand", "ground"];
-
-/// Read all manifests and flatten into the ordered variant list.
-fn read_library() -> TextureLibrary {
-    let mut variants = Vec::new();
-    for slug in LIBRARY_SLUGS {
-        let path = format!("{TEXTURE_ROOT}/{slug}/material.ron");
-        let text = match std::fs::read_to_string(&path) {
-            Ok(t) => t,
-            Err(e) => {
-                warn!("SDF texture library: cannot read {path}: {e}");
-                continue;
-            }
-        };
-        let manifest: Manifest = match ron::from_str(&text) {
-            Ok(m) => m,
-            Err(e) => {
-                warn!("SDF texture library: cannot parse {path}: {e}");
-                continue;
-            }
-        };
-        for v in &manifest.variants {
-            variants.push(LibraryVariant {
-                slug: manifest.slug.clone(),
-                dir: v.dir.clone(),
-                display_name: format!("{} {}", manifest.name, v.dir),
-            });
+/// Parse the manifest at `assets/textures/<slug>/material.ron` and return its
+/// variants as [`LibraryVariant`]s. Returns an empty vec and logs on error.
+pub fn read_manifest(slug: &str) -> Vec<LibraryVariant> {
+    let path = format!("{TEXTURE_ROOT}/{slug}/material.ron");
+    let text = match std::fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(e) => {
+            warn!("SDF texture manifest: cannot read {path}: {e}");
+            return Vec::new();
         }
-    }
-    TextureLibrary { variants }
-}
-
-/// Startup system (main world): read the manifests, populate [`TextureLibrary`], and
-/// build the [`MaterialRegistry`]. Registry id 0 stays the default fallback; each
-/// library variant gets id `1 + layer`, with `tex_layers` all pointing at its layer.
-pub fn build_texture_library(
-    mut library: ResMut<TextureLibrary>,
-    mut registry: ResMut<MaterialRegistry>,
-) {
-    *library = read_library();
-
-    registry.defs.truncate(1); // keep the fallback at id 0
-    for (layer, variant) in library.variants.iter().enumerate() {
-        let l = layer as u32;
-        registry.defs.push(MaterialDef {
-            // White tint so the triplanar diffuse texture shows at full colour
-            // (base_color multiplies the sampled diffuse).
-            base_color: Color::WHITE,
-            blend_softness: 0.0,
-            tex_layers: [l; MATERIAL_TEX_MAPS],
-        });
-        let _ = &variant.display_name; // (used by the debug material dropdown)
-    }
-
-    info!(
-        "SDF texture library: {} variants across {} materials",
-        library.variants.len(),
-        LIBRARY_SLUGS.len()
-    );
+    };
+    let manifest: Manifest = match ron::from_str(&text) {
+        Ok(m) => m,
+        Err(e) => {
+            warn!("SDF texture manifest: cannot parse {path}: {e}");
+            return Vec::new();
+        }
+    };
+    manifest
+        .variants
+        .iter()
+        .map(|v| LibraryVariant {
+            slug: manifest.slug.clone(),
+            dir: v.dir.clone(),
+            display_name: format!("{} {}", manifest.name, v.dir),
+        })
+        .collect()
 }
 
 /// BC7-compressed maps for ONE variant (one array layer): `[diffuse, normal, mra,

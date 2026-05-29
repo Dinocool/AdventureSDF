@@ -151,8 +151,11 @@ struct TextureStreamState {
     textures: Vec<Texture>,
     /// Background encode tasks, drained as they complete.
     tasks: Vec<Task<EncodedVariant>>,
-    /// Whether textures were created + tasks spawned (one-shot init guard).
-    started: bool,
+    /// Whether the (fixed-cap) arrays were allocated (one-shot allocation guard).
+    allocated: bool,
+    /// How many variants have had an encode task spawned. Grows as the demand-driven
+    /// library appends variants; we spawn tasks for `[spawned_layers, variants.len())`.
+    spawned_layers: u32,
 }
 
 /// Material table extracted from the main world for GPU upload.
@@ -161,10 +164,12 @@ struct ExtractedSdfMaterials {
     materials: Vec<GpuSdfMaterial>,
 }
 
-/// The texture library extracted from the main world, decoded + uploaded once.
+/// The texture library extracted from the main world. `variants` grows on demand as
+/// materials reference new textures; index = GPU array layer. The render world
+/// streams any layers that appear beyond what it has already uploaded.
 #[derive(Resource, Default)]
 struct ExtractedTextureLibrary {
-    library: super::textures::TextureLibrary,
+    variants: Vec<super::textures::LibraryVariant>,
 }
 
 // --- Pipeline ---
@@ -737,11 +742,11 @@ fn prepare_sdf_materials_gpu(
 // --- Extract + upload: PBR texture-array library ---
 
 fn extract_texture_library(
-    library: Extract<Res<super::textures::TextureLibrary>>,
+    library: Extract<Res<crate::assets::MaterialTextureLibrary>>,
     mut commands: Commands,
 ) {
     commands.insert_resource(ExtractedTextureLibrary {
-        library: library.clone(),
+        variants: library.variants.clone(),
     });
 }
 
@@ -765,99 +770,98 @@ fn init_texture_streaming(
     mut gpu_atlas: ResMut<SdfGpuAtlas>,
     mut stream: ResMut<TextureStreamState>,
 ) {
-    if stream.started {
+    use super::textures::TEXTURE_SIZE;
+    use crate::assets::MAX_TEXTURE_LAYERS;
+
+    // 1) Allocate the fixed-cap arrays once (the moment the render device is up). The
+    // arrays are sized to MAX_TEXTURE_LAYERS so the demand-driven library can append
+    // variants without ever recreating the textures or rebuilding the bind group.
+    if !stream.allocated {
+        let mips = super::bc7::mip_count(TEXTURE_SIZE);
+        let labels = [
+            "sdf_tex_diffuse",
+            "sdf_tex_normal",
+            "sdf_tex_mra",
+            "sdf_tex_height",
+            "sdf_tex_edge",
+        ];
+        // Per-map fallback fill shown until a layer streams in: magenta diffuse (an
+        // obvious "loading" colour), NEUTRAL data maps so lit surfaces still look sane
+        // (flat normal, mid-rough/unoccluded MRA, zero height, no edge wear).
+        let fallback: [[u8; 4]; super::edits::MATERIAL_TEX_MAPS] = [
+            [255, 0, 255, 255],
+            [128, 128, 255, 255],
+            [0, 255, 255, 255],
+            [0, 0, 0, 255],
+            [0, 0, 0, 255],
+        ];
+
+        let mut textures = Vec::with_capacity(super::edits::MATERIAL_TEX_MAPS);
+        let views: [TextureView; super::edits::MATERIAL_TEX_MAPS] = std::array::from_fn(|i| {
+            let fill = super::bc7::solid_fill_bc7(fallback[i], TEXTURE_SIZE, MAX_TEXTURE_LAYERS);
+            let tex = device.create_texture_with_data(
+                &queue,
+                &TextureDescriptor {
+                    label: Some(labels[i]),
+                    size: Extent3d {
+                        width: TEXTURE_SIZE,
+                        height: TEXTURE_SIZE,
+                        depth_or_array_layers: MAX_TEXTURE_LAYERS,
+                    },
+                    mip_level_count: mips,
+                    sample_count: 1,
+                    dimension: TextureDimension::D2,
+                    format: PBR_ARRAY_FORMATS[i],
+                    usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST,
+                    view_formats: &[],
+                },
+                TextureDataOrder::LayerMajor,
+                &fill.data,
+            );
+            let view = tex.create_view(&TextureViewDescriptor {
+                dimension: Some(TextureViewDimension::D2Array),
+                ..default()
+            });
+            textures.push(tex);
+            view
+        });
+
+        gpu_atlas.tex_sampler = Some(device.create_sampler(&SamplerDescriptor {
+            label: Some("sdf_tex_sampler"),
+            mag_filter: FilterMode::Linear,
+            min_filter: FilterMode::Linear,
+            mipmap_filter: FilterMode::Linear,
+            address_mode_u: AddressMode::Repeat,
+            address_mode_v: AddressMode::Repeat,
+            ..default()
+        }));
+        gpu_atlas.tex_array_views = Some(views);
+        stream.textures = textures;
+        stream.allocated = true;
+    }
+
+    // 2) Spawn encode tasks for any variants the library appended since last frame
+    // (demand-driven: a variant appears when a used material first references it).
+    let Some(extracted) = extracted else { return };
+    let want = (extracted.variants.len() as u32).min(MAX_TEXTURE_LAYERS);
+    if want <= stream.spawned_layers {
         return;
     }
-    let Some(extracted) = extracted else { return };
-    let variants = &extracted.library.variants;
-    if variants.is_empty() {
-        return; // library not built yet
-    }
-
-    use super::textures::TEXTURE_SIZE;
-    let layers = variants.len() as u32;
-    let mips = super::bc7::mip_count(TEXTURE_SIZE);
-    let labels = [
-        "sdf_tex_diffuse",
-        "sdf_tex_normal",
-        "sdf_tex_mra",
-        "sdf_tex_height",
-        "sdf_tex_edge",
-    ];
-
-    // Per-map fallback fill shown until a layer streams in: magenta diffuse (an
-    // obvious "loading" colour), but NEUTRAL data maps so lit surfaces still look
-    // sane during the brief load — flat normal (128,128,255), mid-rough/unoccluded
-    // MRA (metal 0, rough 255, ao 255), zero height, no edge wear.
-    let fallback: [[u8; 4]; super::edits::MATERIAL_TEX_MAPS] = [
-        [255, 0, 255, 255],   // diffuse: magenta
-        [128, 128, 255, 255], // normal: flat
-        [0, 255, 255, 255],   // mra: metal 0, rough 1, ao 1
-        [0, 0, 0, 255],       // height: 0
-        [0, 0, 0, 255],       // edge: no wear
-    ];
-
-    // Create each array pre-filled with its fallback (a solid colour is one tiled
-    // BC7 block — near-free). Streamed layers overwrite it via `write_texture`.
-    let mut textures = Vec::with_capacity(super::edits::MATERIAL_TEX_MAPS);
-    let views: [TextureView; super::edits::MATERIAL_TEX_MAPS] = std::array::from_fn(|i| {
-        let fill = super::bc7::solid_fill_bc7(fallback[i], TEXTURE_SIZE, layers);
-        let tex = device.create_texture_with_data(
-            &queue,
-            &TextureDescriptor {
-                label: Some(labels[i]),
-                size: Extent3d {
-                    width: TEXTURE_SIZE,
-                    height: TEXTURE_SIZE,
-                    depth_or_array_layers: layers,
-                },
-                mip_level_count: mips,
-                sample_count: 1,
-                dimension: TextureDimension::D2,
-                format: PBR_ARRAY_FORMATS[i],
-                usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST,
-                view_formats: &[],
-            },
-            TextureDataOrder::LayerMajor,
-            &fill.data,
-        );
-        let view = tex.create_view(&TextureViewDescriptor {
-            dimension: Some(TextureViewDimension::D2Array),
-            ..default()
-        });
-        textures.push(tex);
-        view
-    });
-
-    gpu_atlas.tex_sampler = Some(device.create_sampler(&SamplerDescriptor {
-        label: Some("sdf_tex_sampler"),
-        mag_filter: FilterMode::Linear,
-        min_filter: FilterMode::Linear,
-        mipmap_filter: FilterMode::Linear,
-        address_mode_u: AddressMode::Repeat,
-        address_mode_v: AddressMode::Repeat,
-        ..default()
-    }));
-    gpu_atlas.tex_array_views = Some(views);
-
-    // Spawn one CPU encode task per variant (each captures owned paths only).
     let pool = AsyncComputeTaskPool::get();
-    for (layer, v) in variants.iter().enumerate() {
+    for layer in stream.spawned_layers..want {
+        let v = &extracted.variants[layer as usize];
         let slug = v.slug.clone();
         let dir = v.dir.clone();
-        let layer = layer as u32;
         stream.tasks.push(pool.spawn(async move {
             let maps = super::textures::encode_variant_bc7(&slug, &dir);
             EncodedVariant { layer, maps }
         }));
     }
-
-    stream.textures = textures;
-    stream.started = true;
     info!(
-        "SDF textures: streaming {} variants ({} BC7 encode tasks)",
-        layers, layers
+        "SDF textures: streaming layers {}..{}",
+        stream.spawned_layers, want
     );
+    stream.spawned_layers = want;
 }
 
 /// Each frame, drain any finished encode tasks and `write_texture` their BC7 mip

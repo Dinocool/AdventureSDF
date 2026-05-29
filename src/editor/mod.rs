@@ -15,6 +15,7 @@ pub mod panels;
 pub mod profiling;
 pub mod project_files;
 pub mod registry;
+pub mod resource_inspector;
 pub mod status_bar;
 pub mod uniform_inspector;
 
@@ -77,6 +78,17 @@ impl Plugin for EditorPlugin {
             DockSide::Left,
             1,
             viewport_ops_ui,
+        );
+
+        // Resource Inspector (Godot-style): edit material resources + browse textures.
+        app.init_resource::<resource_inspector::ResourceInspectorState>();
+        panels::register_panel(
+            app,
+            "core/resources",
+            "Resources",
+            DockSide::Left,
+            2,
+            resource_inspector::resource_inspector_ui,
         );
 
         // Build the dock layout once, after `Startup` (so every plugin — including
