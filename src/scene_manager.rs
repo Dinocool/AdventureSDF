@@ -9,7 +9,8 @@ pub enum AppScene {
     AdventureGame,
 }
 
-#[derive(Component)]
+#[derive(Component, Reflect, Default)]
+#[reflect(Component)]
 pub struct SceneEntity;
 
 #[derive(Resource, Default)]
@@ -33,6 +34,7 @@ impl Plugin for SceneManagerPlugin {
     fn build(&self, app: &mut App) {
         app.init_state::<AppScene>()
             .init_resource::<MenuOpen>()
+            .register_type::<SceneEntity>()
             .add_systems(Update, toggle_menu)
             .add_systems(Update, handle_menu_buttons)
             .add_systems(OnEnter(AppScene::WireframeTest), setup_wireframe_test)

@@ -5,9 +5,10 @@ edition = "2024"
 
 [features]
 default = ["fast"]
-debug_toolkit = [
+editor = [
     "dep:bevy-inspector-egui",
     "dep:bevy_egui",
+    "dep:egui_dock",
 ]
 # Faster incremental compiles via dynamic linking of Bevy. Dev-only — never ship.
 fast = ["bevy/dynamic_linking"]
@@ -21,10 +22,16 @@ bevy-inspector-egui = { version = "0.36", optional = true }
 bevy_egui = { version = "0.39", optional = true }
 # PBR texture-library loading: decode PNG maps (image) and read material manifests (ron).
 image = { version = "0.25", default-features = false, features = ["png"] }
+# RON + serde: PBR material manifests AND the custom .scene format (soul_scene).
+# Otherwise only transitive via bevy_scene.
 ron = "0.12"
 serde = { version = "1", features = ["derive"] }
 # Offline BC7 encode of the PBR texture arrays (cached to disk; ~1/6 the VRAM).
 intel_tex_2 = "0.2"
+egui_dock = { version = "0.18", optional = true }
+# Solid 3D transform manipulator (translate/rotate/scale handles + picking +
+# snapping) for the SDF editor. Replaces the custom wireframe-gizmo manipulator.
+transform-gizmo-bevy = "0.9"
 
 [dev-dependencies]
 naga = "27"

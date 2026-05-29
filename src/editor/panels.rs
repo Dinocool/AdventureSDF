@@ -42,6 +42,27 @@ impl DebugPanelRegistry {
         matching.sort_by(|a, b| a.order.cmp(&b.order).then(a.id.cmp(&b.id)));
         matching
     }
+
+    /// Panel ids for one side, in display order. Used to seed the egui_dock layout.
+    pub fn ids_for(&self, side: DockSide) -> Vec<String> {
+        self.panels_for(side)
+            .into_iter()
+            .map(|p| p.id.clone())
+            .collect()
+    }
+
+    /// Look up a panel by id so the dock `TabViewer` can dispatch its render
+    /// closure (panels keyed by stable id survive layout serialization/reorder).
+    pub fn panel_by_id(&self, id: &str) -> Option<&DebugPanel> {
+        self.panels.iter().find(|p| p.id == id)
+    }
+
+    /// Human-readable title for a panel id, falling back to the id itself.
+    pub fn title_for(&self, id: &str) -> String {
+        self.panel_by_id(id)
+            .map(|p| p.title.clone())
+            .unwrap_or_else(|| id.to_string())
+    }
 }
 
 pub struct DebugPanelRegistryPlugin;
@@ -55,7 +76,7 @@ impl Plugin for DebugPanelRegistryPlugin {
 /// Helper for registering a panel from a plugin `build`.
 ///
 /// Inits the registry if absent so plugins can register panels regardless of
-/// whether they build before or after [`DebugToolkitPlugin`] — the toolkit's own
+/// whether they build before or after [`EditorPlugin`] — the toolkit's own
 /// `init_resource` is then a no-op that preserves these entries.
 pub fn register_panel(
     app: &mut App,

@@ -2,7 +2,7 @@ use std::time::Instant;
 
 use bevy::prelude::*;
 
-use super::config::DebugToolkitConfig;
+use super::config::EditorConfig;
 
 #[derive(Resource, Default)]
 pub struct ShaderHotReloadState {
@@ -23,7 +23,7 @@ impl Plugin for HotReloadPlugin {
 fn detect_shader_changes(
     mut events: MessageReader<AssetEvent<Shader>>,
     mut state: ResMut<ShaderHotReloadState>,
-    config: Res<DebugToolkitConfig>,
+    config: Res<EditorConfig>,
 ) {
     if !config.enabled || !config.hot_reload_enabled {
         return;
@@ -49,7 +49,7 @@ fn detect_shader_changes(
 }
 
 pub fn hot_reload_ui(world: &mut World, ui: &mut bevy_egui::egui::Ui) {
-    if !world.resource::<DebugToolkitConfig>().enabled {
+    if !world.resource::<EditorConfig>().enabled {
         return;
     }
 

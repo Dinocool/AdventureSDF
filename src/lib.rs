@@ -5,11 +5,12 @@ pub mod networking;
 pub mod player;
 pub mod scene_manager;
 pub mod sdf_render;
+pub mod soul_scene;
 pub mod ui;
 pub mod world;
 
-#[cfg(feature = "debug_toolkit")]
-pub mod debug_toolkit;
+#[cfg(feature = "editor")]
+pub mod editor;
 
 #[cfg(test)]
 pub mod test_utils;

@@ -6,13 +6,13 @@
 - Engine: Bevy 0.18
 - Physics: bevy_rapier3d 0.34
 - BRP: bevy_brp_extras 0.18
-- Modules: `camera`, `combat`, `inventory`, `networking`, `player`, `scene_manager`, `sdf_render`, `ui`, `world` (+ `debug_toolkit`, feature-gated)
+- Modules: `camera`, `combat`, `inventory`, `networking`, `player`, `scene_manager`, `sdf_render`, `soul_scene`, `ui`, `world` (+ `editor`, feature-gated)
 
 ## Build & Run
 
 ```sh
 cargo build
-cargo build --features debug_toolkit                # dev tooling build
+cargo build --features editor                       # soul-engine editor build
 cargo run
 cargo test
 cargo test -- generate_world_scene --nocapture      # regenerate scene RON
@@ -32,14 +32,15 @@ src/
   networking/mod.rs   — NetworkingPlugin: chat channels
   ui/mod.rs           — UiPlugin: health/mana bars
   scene_manager.rs    — SceneManagerPlugin: ESC menu, scene switching
-  sdf_render/mod.rs   — SdfScenePlugin: SDF voxel editor
+  sdf_render/mod.rs   — SdfScenePlugin: SDF voxel editor (+ GizmoEditState: gizmo mode/snap)
   sdf_render/render.rs— SdfRenderPlugin: render-graph node (registered SEPARATELY in main.rs)
-  debug_toolkit/      — DebugToolkitPlugin: dev panels + shader debug (feature "debug_toolkit" only)
+  soul_scene/         — SoulScenePlugin: custom `.scene` format (nested instances + overrides)
+  editor/             — EditorPlugin: soul-engine egui_dock editor shell (feature "editor" only)
   test_utils.rs       — shared test helpers
 ```
 
 All plugins are structs implementing `Plugin`, registered in `main.rs`. Render
-sub-plugins (`SdfRenderPlugin`) and feature-gated plugins (`DebugToolkitPlugin`) are
+sub-plugins (`SdfRenderPlugin`) and feature-gated plugins (`EditorPlugin`) are
 added in their own blocks — see `main.rs`.
 
 ---
@@ -49,7 +50,7 @@ added in their own blocks — see `main.rs`.
 Non-negotiables. These hold even if the skills below are unavailable:
 
 1. **Zero warnings.** A build/clippy warning is a failure. Fix all before reporting done.
-2. **Build both feature configs.** `cargo build` AND `cargo build --features debug_toolkit`.
+2. **Build both feature configs.** `cargo build` AND `cargo build --features editor`.
 3. **Never hand-write `.scn.ron`.** Generate scenes from code (see `/create-scene`).
 4. **Register every `Reflect` type** with `app.register_type::<T>()` in its plugin.
 

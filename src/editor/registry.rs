@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use bevy::prelude::*;
 
-use super::config::DebugToolkitConfig;
+use super::config::EditorConfig;
 
 #[derive(Clone, Debug)]
 pub enum DebugModeKind {
@@ -102,7 +102,7 @@ fn snapshot_modes(registry: &ShaderDebugRegistry) -> GroupedModes {
 }
 
 pub fn debug_modes_ui(world: &mut World, ui: &mut bevy_egui::egui::Ui) {
-    let config = world.resource::<DebugToolkitConfig>();
+    let config = world.resource::<EditorConfig>();
     if !config.enabled {
         return;
     }
