@@ -28,12 +28,13 @@ struct FullscreenVertexOutput {
 
 /// The SDF module files, in dependency order (a module must be added before any
 /// module that imports it). The entry shader is composed last via `make_naga_module`.
-const SDF_MODULES: [&str; 5] = [
+const SDF_MODULES: [&str; 6] = [
     "assets/shaders/sdf/bindings.wgsl",
     "assets/shaders/sdf/brick.wgsl",
     "assets/shaders/sdf/cubic.wgsl",
     "assets/shaders/sdf/material.wgsl",
     "assets/shaders/sdf/pbr.wgsl",
+    "assets/shaders/sdf/volume.wgsl",
 ];
 
 const SDF_ENTRY: &str = "assets/shaders/sdf_raymarch.wgsl";
@@ -159,6 +160,7 @@ fn sdf_debug_modes_validate() {
         "SDF_LINEAR_CHUNK_SEARCH",
         "SDF_DEBUG_TILE_ID",
         "SDF_DEBUG_CHUNK_ID",
+        "SDF_DEBUG_VOLUME",
     ] {
         validate_composed_sdf_with_defs(&[def]).unwrap_or_else(|e| panic!("{e}"));
     }

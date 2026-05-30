@@ -25,6 +25,8 @@
 }
 #import sdf::cubic::{build_cell_cubic, solve_cell_cubic, dist_to_cell_exit}
 #import sdf::pbr::shade_material
+#import sdf::volume::{sample_volume, volume_serving_level}
+#import sdf::bindings::brick_world_at
 
 // --- Raymarching ---
 
@@ -95,10 +97,27 @@ fn raymarch(origin: vec3<f32>, dir: vec3<f32>) -> RaymarchResult {
 
         let scene = resolve_march(p, &cache);
 
-        // --- 1. Empty space: brick-geometry DDA to the next brick face ---------------
+        // --- 1. Empty space: 3D distance-clipmap jump, falling back to brick-DDA -------
+        //
+        // The brick-DDA alone advances one brick face at a time (~150 steps through sky).
+        // The dense distance volume gives a CONSERVATIVE distance to the nearest surface, so
+        // far/empty rays can sphere-trace it in big steps. We take the LARGER of the volume
+        // distance and the brick-exit step: in true empty space the volume dominates (huge
+        // jumps); near geometry — within ~one finest brick — the volume's bound is small, so
+        // the brick-DDA floor takes over and the cubic/sphere-trace branches engage on the
+        // next iteration. The volume is a conservative lower bound, so this never overshoots.
         if (!scene.in_brick) {
             let wl = scene.window_lod;
-            t += dist_to_brick_exit_lod(p, dir, wl) + voxel_size_at(wl) * 0.01;
+            let brick_step = dist_to_brick_exit_lod(p, dir, wl) + voxel_size_at(wl) * 0.01;
+            let vol = sample_volume(p);
+            // Hand off to the brick march once the volume says we're within ~one finest
+            // brick of a surface; otherwise jump by the (larger) conservative volume step.
+            let handoff = brick_world_at(0u);
+            var adv = brick_step;
+            if (vol > handoff) {
+                adv = max(brick_step, vol);
+            }
+            t += adv;
             prev_d = 0.0;
             prev_step = 0.0;
             continue;
@@ -420,6 +439,27 @@ fn main(in: FullscreenVertexOutput) -> FragmentOutput {
         return FragmentOutput(vec4<f32>(shaded_lod, 1.0), ndc_depth);
     }
     return FragmentOutput(vec4<f32>(bg_color * 0.3, 1.0), 1.0);
+    #endif
+
+    #ifdef SDF_DEBUG_VOLUME
+    // Visualise the 3D distance clipmap: tint each pixel by the FINEST volume level serving
+    // the hit point (or the camera ray's first in-volume point on a miss), with brightness
+    // from the volume distance band. Confirms the volume is resident where expected and that
+    // sky rays sample a coarse (far-reaching) level. Level palette matches SDF_DEBUG_LOD:
+    // 0 white, 1 green, 2 blue, 3 red; outside all levels = dim grey.
+    {
+        let probe = select(ray_origin + ray_dir * 4.0, rm.hit_pos, rm.hit);
+        let serving = volume_serving_level(probe);
+        let vd = sample_volume(probe);
+        var col = vec3<f32>(0.15, 0.15, 0.15);     // outside every level
+        if (serving == 0u) { col = vec3<f32>(1.0, 1.0, 1.0); }
+        else if (serving == 1u) { col = vec3<f32>(0.0, 1.0, 0.0); }
+        else if (serving == 2u) { col = vec3<f32>(0.0, 0.4, 1.0); }
+        else if (serving == 3u) { col = vec3<f32>(1.0, 0.0, 0.0); }
+        // Distance band as brightness: near surface dark, far bright (saturating at ~8u).
+        let band = clamp(vd / 8.0, 0.1, 1.0);
+        return FragmentOutput(vec4<f32>(col * band, 1.0), select(0.0, ndc_depth, rm.hit));
+    }
     #endif
 
     return FragmentOutput(vec4<f32>(shaded, 1.0), ndc_depth);

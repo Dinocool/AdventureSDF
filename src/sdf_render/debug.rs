@@ -358,6 +358,12 @@ fn register_shader_modes(app: &mut App) {
         "Tint hit by clipmap LOD: 0 white, 1 green, 2 blue, 3 red, 4+ yellow",
     ));
     registry.register(overlay(
+        "sdf/volume",
+        "Volume",
+        "SDF_DEBUG_VOLUME",
+        "Tint by 3D distance-clipmap level (0 white,1 green,2 blue,3 red); brightness = volume distance",
+    ));
+    registry.register(overlay(
         "sdf/tile_id",
         "Tile ID",
         "SDF_DEBUG_TILE_ID",
