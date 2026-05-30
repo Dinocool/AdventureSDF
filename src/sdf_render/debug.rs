@@ -12,7 +12,7 @@ use bevy_egui::{EguiTextureHandle, EguiUserTextures, egui};
 
 use crate::editor::panels::{DockSide, register_panel};
 use crate::editor::registry::{
-    DebugModeKind, ShaderDebugMode, ShaderDebugRegistry, debug_modes_ui,
+    DebugModeKind, ShaderDebugMode, ShaderDebugRegistry, ShaderDebugState, debug_modes_ui,
 };
 use crate::scene_manager::{AppScene, SceneEntity};
 
@@ -21,7 +21,7 @@ use super::bvh::Bvh;
 use super::edits::PALETTE_K;
 use super::{
     CsgKind, RayStepCapture, SdfCamera, SdfGridConfig, SdfMaterial, SdfOp, SdfOrbitCamera,
-    SdfOrder, SdfOverlayGizmos, SdfPrimitive, SdfRaymarchParams, SdfSelection, SdfVolume,
+    SdfOrder, SdfOverlayGizmos, SdfPrimitive, SdfRaymarchParams, SdfVolume,
     WireframeBoundsVisible, picking,
 };
 
@@ -98,89 +98,6 @@ pub struct ChunkDebugState {
     pub visible: bool,
 }
 
-/// Authoring panel state: the primitive/op/material to spawn next.
-#[derive(Resource)]
-pub struct SpawnState {
-    pub kind: SpawnKind,
-    pub op: CsgKind,
-    pub smoothing: f32,
-    /// Registry id for the next spawn, or `u32::MAX` = create a fresh material.
-    pub material: u32,
-}
-
-impl Default for SpawnState {
-    fn default() -> Self {
-        Self {
-            kind: SpawnKind::Sphere,
-            op: CsgKind::Union,
-            smoothing: 0.0,
-            material: u32::MAX,
-        }
-    }
-}
-
-/// Which primitive the spawn panel will create (decoupled from the parameterised
-/// [`SdfPrimitive`] so the combo box has a simple discriminant).
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum SpawnKind {
-    Sphere,
-    Box,
-    Torus,
-    Capsule,
-    Cylinder,
-    Heightmap,
-}
-
-impl SpawnKind {
-    const ALL: [SpawnKind; 6] = [
-        SpawnKind::Sphere,
-        SpawnKind::Box,
-        SpawnKind::Torus,
-        SpawnKind::Capsule,
-        SpawnKind::Cylinder,
-        SpawnKind::Heightmap,
-    ];
-
-    fn label(self) -> &'static str {
-        match self {
-            SpawnKind::Sphere => "Sphere",
-            SpawnKind::Box => "Box",
-            SpawnKind::Torus => "Torus",
-            SpawnKind::Capsule => "Capsule",
-            SpawnKind::Cylinder => "Cylinder",
-            SpawnKind::Heightmap => "Heightmap",
-        }
-    }
-
-    fn default_primitive(self) -> SdfPrimitive {
-        match self {
-            SpawnKind::Sphere => SdfPrimitive::Sphere { radius: 0.5 },
-            SpawnKind::Box => SdfPrimitive::Box {
-                half_extents: Vec3::splat(0.5),
-            },
-            SpawnKind::Torus => SdfPrimitive::Torus {
-                major: 0.5,
-                minor: 0.2,
-            },
-            SpawnKind::Capsule => SdfPrimitive::Capsule {
-                half_height: 0.4,
-                radius: 0.25,
-            },
-            SpawnKind::Cylinder => SdfPrimitive::Cylinder {
-                radius: 0.4,
-                half_height: 0.5,
-            },
-            SpawnKind::Heightmap => SdfPrimitive::Heightmap {
-                half_xz: Vec2::splat(1.5),
-                max_height: 0.6,
-                freq: 1.5,
-                amp: 0.4,
-                seed: 1,
-            },
-        }
-    }
-}
-
 // --- Plugin ---
 
 pub struct SdfDebugPlugin;
@@ -189,11 +106,17 @@ impl Plugin for SdfDebugPlugin {
     fn build(&self, app: &mut App) {
         register_shader_modes(app);
 
+        // Custom Inspector editor for SdfMaterial (registry picker + colour). The other
+        // SDF components reflect cleanly, so the generic inspector handles those.
+        crate::editor::inspector::register_component_editor::<SdfMaterial>(
+            app,
+            sdf_material_editor,
+        );
+
         app.init_resource::<SdfAtlasStats>()
             .init_resource::<SdfAtlasTextures>()
             .init_resource::<BvhDebugState>()
             .init_resource::<ChunkDebugState>()
-            .init_resource::<SpawnState>()
             .register_type::<SdfAtlasStats>()
             .register_type::<BvhDebugState>()
             .register_type::<ChunkDebugState>()
@@ -230,22 +153,6 @@ impl Plugin for SdfDebugPlugin {
             0,
             atlas_panel,
         );
-        register_panel(
-            app,
-            "sdf/spawn",
-            "SDF Spawn",
-            DockSide::Left,
-            5,
-            spawn_panel,
-        );
-        register_panel(
-            app,
-            "sdf/inspect",
-            "SDF Inspect",
-            DockSide::Left,
-            6,
-            inspect_panel,
-        );
         register_panel(app, "sdf/bvh", "SDF BVH", DockSide::Left, 25, bvh_panel);
         register_panel(
             app,
@@ -255,39 +162,14 @@ impl Plugin for SdfDebugPlugin {
             26,
             chunk_panel,
         );
+        // Bottom dock: combined render tuning (overlay + raymarch), ray inspector.
         register_panel(
             app,
-            "sdf/gizmo",
-            "SDF Gizmo",
-            DockSide::Left,
-            10,
-            gizmo_panel,
-        );
-        register_panel(
-            app,
-            "sdf/wireframe",
-            "SDF Wireframe",
-            DockSide::Left,
-            20,
-            wireframe_panel,
-        );
-
-        // Bottom dock: overlay modes, raymarch tuning, ray inspector.
-        register_panel(
-            app,
-            "sdf/modes",
-            "SDF Modes",
+            "sdf/render",
+            "SDF Render",
             DockSide::Bottom,
             20,
-            modes_panel,
-        );
-        register_panel(
-            app,
-            "sdf/raymarch",
-            "SDF Raymarch",
-            DockSide::Bottom,
-            30,
-            raymarch_panel,
+            render_panel,
         );
         register_panel(
             app,
@@ -303,7 +185,7 @@ impl Plugin for SdfDebugPlugin {
 fn register_shader_modes(app: &mut App) {
     // Init in case SdfScenePlugin builds before EditorPlugin (main.rs order).
     app.init_resource::<ShaderDebugRegistry>();
-    let mut registry = app.world_mut().resource_mut::<ShaderDebugRegistry>();
+    app.init_resource::<ShaderDebugState>();
 
     let overlay = |id: &str, label: &str, define: &str, desc: &str| ShaderDebugMode {
         id: id.into(),
@@ -315,6 +197,7 @@ fn register_shader_modes(app: &mut App) {
         description: desc.into(),
     };
 
+    let mut registry = app.world_mut().resource_mut::<ShaderDebugRegistry>();
     registry.register(overlay(
         "sdf/step_count",
         "Steps",
@@ -417,6 +300,35 @@ fn register_shader_modes(app: &mut App) {
         kind: DebugModeKind::Toggle,
         description: "Brute-force linear chunk lookup (bypass binary search)".into(),
     });
+
+    // PBR feature toggles (independent checkboxes, not exclusive overlays). These
+    // gate real shading features behind shader-defs so their cost is opt-in/measurable.
+    registry.register(ShaderDebugMode {
+        id: "sdf/shadows".into(),
+        label: "Shadows".into(),
+        shader_define: "SDF_SHADOWS".into(),
+        kind: DebugModeKind::Toggle,
+        description: "SDF soft shadows (secondary ray toward the sun)".into(),
+    });
+    registry.register(ShaderDebugMode {
+        id: "sdf/reflections".into(),
+        label: "Reflections".into(),
+        shader_define: "SDF_REFLECTIONS".into(),
+        kind: DebugModeKind::Toggle,
+        description: "SDF-traced reflections on metallic/smooth surfaces (secondary ray)"
+            .into(),
+    });
+    // Note: height-map relief is baked into the SDF field (see sdf_render::height) — no shader
+    // toggle. Strength is the per-material "Relief depth" (Inspect panel).
+
+    // Default the PBR feature toggles ON so the enhanced shading shows without hunting
+    // for the checkbox. The state resource is separate from the registry; seed it after
+    // the `registry` borrow above ends (NLL drops it at last use).
+    {
+        let mut state = app.world_mut().resource_mut::<ShaderDebugState>();
+        state.set("sdf/shadows", true);
+        state.set("sdf/reflections", true);
+    }
 }
 
 // --- Atlas stats ---
@@ -802,43 +714,19 @@ fn atlas_panel(world: &mut World, ui: &mut egui::Ui) {
         });
 }
 
-fn gizmo_panel(world: &mut World, ui: &mut egui::Ui) {
-    let selection = world.resource::<SdfSelection>();
-    match selection.entity {
-        Some(e) => ui.label(format!("Selected: Entity {:?}", e.index())),
-        None => ui.label("Selected: None"),
-    };
-
-    let orbit = world.resource::<SdfOrbitCamera>();
-    ui.separator();
-    ui.label(format!("Cam dist: {:.2}", orbit.distance));
-    ui.label(format!("Yaw: {:.2}  Pitch: {:.2}", orbit.yaw, orbit.pitch));
-    ui.label(format!(
-        "Target: {:.2}, {:.2}, {:.2}",
-        orbit.target.x, orbit.target.y, orbit.target.z
-    ));
-}
-
-fn wireframe_panel(world: &mut World, ui: &mut egui::Ui) {
-    let mut visible = world.resource::<WireframeBoundsVisible>().0;
-    if ui
-        .checkbox(&mut visible, "Show bounds wireframes")
-        .changed()
-    {
-        world.resource_mut::<WireframeBoundsVisible>().0 = visible;
-    }
-}
-
-fn modes_panel(world: &mut World, ui: &mut egui::Ui) {
+/// Combined render-tuning panel: debug-overlay selection (dropdowns + diagnostics)
+/// plus the raymarch quality sliders. One tab for "how the SDF is drawn".
+fn render_panel(world: &mut World, ui: &mut egui::Ui) {
     debug_modes_ui(world, ui);
-}
 
-fn raymarch_panel(world: &mut World, ui: &mut egui::Ui) {
+    ui.separator();
+    ui.label("Raymarch");
     let mut params = world.resource_mut::<SdfRaymarchParams>();
     ui.add(egui::Slider::new(&mut params.max_steps, 16..=512).text("Steps"));
     ui.add(egui::Slider::new(&mut params.max_dist, 10.0..=500.0).text("Max Dist"));
     ui.add(egui::Slider::new(&mut params.sdf_eps, 0.0001..=0.1).text("Epsilon"));
     ui.add(egui::Slider::new(&mut params.lod_blend_band, 0.0..=0.5).text("LOD Blend Band"));
+    ui.add(egui::Slider::new(&mut params.surface_bias, 0.0..=0.5).text("Surface Bias"));
 }
 
 fn ray_inspector_panel(world: &mut World, ui: &mut egui::Ui) {
@@ -978,128 +866,50 @@ fn bvh_panel(world: &mut World, ui: &mut egui::Ui) {
     ui.add(egui::Slider::new(&mut state.max_depth, 0..=24).text("Max depth"));
 }
 
-// --- Spawn panel ---
+// --- Spawn helper ---
 
-fn spawn_panel(world: &mut World, ui: &mut egui::Ui) {
-    // Snapshot panel state for the combo boxes.
-    let (mut kind, mut op, mut smoothing) = {
-        let s = world.resource::<SpawnState>();
-        (s.kind, s.op, s.smoothing)
+/// Spawn a new SDF volume with sensible defaults (unit sphere, Union, a fresh
+/// material), scattered near the orbit target, and return its entity. The reusable
+/// "add a node to the scene" primitive — used by the Scene panel's `+` button.
+/// Spawning changes the edit set, so `schedule_bakes` re-dirties the affected chunks.
+pub fn spawn_default_sdf(world: &mut World) -> Entity {
+    let target = world.resource::<SdfOrbitCamera>().target;
+    let pos = target + random_spawn_offset();
+    let next_order = world
+        .query_filtered::<&SdfOrder, With<SdfVolume>>()
+        .iter(world)
+        .map(|o| o.0)
+        .max()
+        .map(|m| m + 1)
+        .unwrap_or(0);
+
+    // Fresh registry material with a distinct palette colour.
+    let registry_id = {
+        let mut reg = world.resource_mut::<super::edits::MaterialRegistry>();
+        let id = reg.defs.len() as u32;
+        reg.defs.push(super::edits::MaterialDef {
+            base_color: spawn_color(id as usize),
+            blend_softness: 0.0,
+            ..Default::default()
+        });
+        id
     };
 
-    egui::ComboBox::from_label("Primitive")
-        .selected_text(kind.label())
-        .show_ui(ui, |ui| {
-            for k in SpawnKind::ALL {
-                ui.selectable_value(&mut kind, k, k.label());
-            }
-        });
-
-    egui::ComboBox::from_label("Operation")
-        .selected_text(format!("{op:?}"))
-        .show_ui(ui, |ui| {
-            ui.selectable_value(&mut op, CsgKind::Union, "Union");
-            ui.selectable_value(&mut op, CsgKind::Subtract, "Subtract");
-            ui.selectable_value(&mut op, CsgKind::Intersect, "Intersect");
-        });
-
-    ui.add(egui::Slider::new(&mut smoothing, 0.0..=1.0).text("Smoothing"));
-
-    {
-        let mut s = world.resource_mut::<SpawnState>();
-        s.kind = kind;
-        s.op = op;
-        s.smoothing = smoothing;
-    }
-
-    // Material picker: choose an existing registry material, or spawn a fresh one.
-    // (A brick still only shows its K=4 nearest materials, but the world/registry is
-    // unbounded — no global cap.)
-    let mut spawn_mat = world.resource::<SpawnState>().material;
-    let mat_names: Vec<(u32, String)> = {
-        let reg = world.resource::<super::edits::MaterialRegistry>();
-        reg.defs
-            .iter()
-            .enumerate()
-            .map(|(i, d)| {
-                let c = d.base_color.to_srgba();
-                (
-                    i as u32,
-                    format!("#{i} ({:.2},{:.2},{:.2})", c.red, c.green, c.blue),
-                )
-            })
-            .collect()
-    };
-    let sel_label = mat_names
-        .iter()
-        .find(|(i, _)| *i == spawn_mat)
-        .map(|(_, n)| n.clone())
-        .unwrap_or_else(|| "New material".into());
-    egui::ComboBox::from_label("Material")
-        .selected_text(sel_label)
-        .show_ui(ui, |ui| {
-            // u32::MAX sentinel = "create a fresh registry material on spawn".
-            ui.selectable_value(&mut spawn_mat, u32::MAX, "New material");
-            for (id, name) in &mat_names {
-                ui.selectable_value(&mut spawn_mat, *id, name);
-            }
-        });
-    world.resource_mut::<SpawnState>().material = spawn_mat;
-
-    ui.horizontal(|ui| {
-        if ui.button("Spawn").clicked() {
-            // Scatter around the orbit target so successive spawns don't stack on
-            // top of each other. A small random offset keeps them in view.
-            let target = world.resource::<SdfOrbitCamera>().target;
-            let pos = target + random_spawn_offset();
-            let next_order = world
-                .query_filtered::<&SdfOrder, With<SdfVolume>>()
-                .iter(world)
-                .map(|o| o.0)
-                .max()
-                .map(|m| m + 1)
-                .unwrap_or(0);
-
-            // Resolve the material id: either the picked existing one, or a new
-            // registry entry with a distinct palette colour.
-            let registry_id = if spawn_mat == u32::MAX {
-                let mut reg = world.resource_mut::<super::edits::MaterialRegistry>();
-                let id = reg.defs.len() as u32;
-                reg.defs.push(super::edits::MaterialDef {
-                    base_color: spawn_color(id as usize),
-                    blend_softness: 0.0,
-                    ..Default::default()
-                });
-                id
-            } else {
-                spawn_mat
-            };
-
-            world.spawn((
-                Transform::from_translation(pos),
-                kind.default_primitive(),
-                SdfOp {
-                    kind: op,
-                    smoothing,
-                },
-                SdfOrder(next_order),
-                SdfMaterial { registry_id },
-                SdfVolume,
-                SceneEntity,
-            ));
-            // Spawn changes the edit set → `schedule_bakes` detects the new
-            // entity and re-dirties the affected chunks.
-        }
-
-        if ui.button("Delete selected").clicked() {
-            let selected = world.resource::<SdfSelection>().entity;
-            if let Some(e) = selected {
-                world.despawn(e);
-                world.resource_mut::<SdfSelection>().entity = None;
-                // Despawn changes the edit set → full rebuild on the next bake.
-            }
-        }
-    });
+    world
+        .spawn((
+            Name::new(format!("Sphere {next_order}")),
+            Transform::from_translation(pos),
+            SdfPrimitive::Sphere { radius: 0.5 },
+            SdfOp {
+                kind: CsgKind::Union,
+                smoothing: 0.0,
+            },
+            SdfOrder(next_order),
+            SdfMaterial { registry_id },
+            SdfVolume,
+            SceneEntity,
+        ))
+        .id()
 }
 
 /// A distinct spawn colour per material slot (golden-ratio hue), matching the
@@ -1130,69 +940,21 @@ fn random_spawn_offset() -> Vec3 {
     Vec3::new(comp(1), comp(2), comp(3)) * 1.5
 }
 
-// --- Inspect panel ---
+// --- Inspector: SdfMaterial editor ---
 
-fn inspect_panel(world: &mut World, ui: &mut egui::Ui) {
-    let Some(entity) = world.resource::<SdfSelection>().entity else {
-        ui.label("No edit selected. Click an edit in the viewport.");
+/// Custom Inspector editor for [`SdfMaterial`]: pick the registry material this edit
+/// references, and edit that material's shared appearance (base colour + seam blend
+/// softness). The generic reflection inspector would only show a bare `registry_id`
+/// u32, so this override gives it meaning. Registered via `register_component_editor`.
+///
+/// `SdfPrimitive`, `SdfOp`, and `SdfOrder` reflect cleanly, so the generic inspector
+/// already handles those — only the material needs a hand-built editor.
+pub fn sdf_material_editor(world: &mut World, entity: Entity, ui: &mut egui::Ui) {
+    let Some(mut material) = world.get::<SdfMaterial>(entity).copied() else {
         return;
     };
 
-    // Pull the current components out, edit copies in the UI, write back if changed.
-    let Ok((mut prim, mut op, mut order, mut material)) = world
-        .query::<(&SdfPrimitive, &SdfOp, &SdfOrder, &SdfMaterial)>()
-        .get(world, entity)
-        .map(|(p, o, ord, m)| (p.clone(), *o, *ord, *m))
-    else {
-        ui.label("Selected entity is not an SDF edit.");
-        return;
-    };
-
-    let mut changed = false;
-    changed |= primitive_params_ui(ui, &mut prim);
-
-    ui.separator();
-    let mut op_kind = op.kind;
-    egui::ComboBox::from_label("Operation")
-        .selected_text(format!("{op_kind:?}"))
-        .show_ui(ui, |ui| {
-            for (k, name) in [
-                (CsgKind::Union, "Union"),
-                (CsgKind::Subtract, "Subtract"),
-                (CsgKind::Intersect, "Intersect"),
-            ] {
-                if ui.selectable_value(&mut op_kind, k, name).changed() {
-                    changed = true;
-                }
-            }
-        });
-    if op_kind != op.kind {
-        op.kind = op_kind;
-        changed = true;
-    }
-    if ui
-        .add(egui::Slider::new(&mut op.smoothing, 0.0..=1.0).text("Smoothing"))
-        .changed()
-    {
-        changed = true;
-    }
-
-    let mut order_v = order.0;
-    if ui
-        .add(
-            egui::DragValue::new(&mut order_v)
-                .range(0..=64)
-                .prefix("Order "),
-        )
-        .changed()
-    {
-        order.0 = order_v;
-        changed = true;
-    }
-
-    ui.separator();
-
-    // Material assignment: pick which registry material this edit uses.
+    // Pick which registry material this edit uses.
     let mat_names: Vec<(u32, String)> = {
         let reg = world.resource::<super::edits::MaterialRegistry>();
         reg.defs
@@ -1212,6 +974,7 @@ fn inspect_panel(world: &mut World, ui: &mut egui::Ui) {
         .find(|(i, _)| *i == material.registry_id)
         .map(|(_, n)| n.clone())
         .unwrap_or_else(|| "?".into());
+    let mut id_changed = false;
     egui::ComboBox::from_label("Material")
         .selected_text(cur_label)
         .show_ui(ui, |ui| {
@@ -1220,14 +983,14 @@ fn inspect_panel(world: &mut World, ui: &mut egui::Ui) {
                     .selectable_value(&mut material.registry_id, *id, name)
                     .changed()
                 {
-                    changed = true;
+                    id_changed = true;
                 }
             }
         });
 
-    // Edit the *referenced registry material's* appearance (shared by every edit
-    // that uses it). Color + seam blend softness.
-    let mut reg_changed = false;
+    // Edit the *referenced registry material's* appearance (shared by every edit that
+    // uses it). Color + seam blend softness. Shading-only → no rebake needed (the GPU
+    // material table re-uploads on registry change).
     {
         let mut reg = world.resource_mut::<super::edits::MaterialRegistry>();
         if let Some(def) = reg.defs.get_mut(material.registry_id as usize) {
@@ -1235,121 +998,23 @@ fn inspect_panel(world: &mut World, ui: &mut egui::Ui) {
             let mut rgb = [lin.red, lin.green, lin.blue];
             if ui.color_edit_button_rgb(&mut rgb).changed() {
                 def.base_color = Color::linear_rgb(rgb[0], rgb[1], rgb[2]);
-                reg_changed = true;
             }
-            // Per-material colour-feather width at seams (world units). Does not
-            // affect geometry — see SdfOp::smoothing for that.
-            if ui
-                .add(egui::Slider::new(&mut def.blend_softness, 0.0..=1.0).text("Blend softness"))
-                .changed()
-            {
-                reg_changed = true;
-            }
+            // Per-material colour-feather width at seams (world units). Does not affect
+            // geometry — see SdfOp::smoothing for that.
+            ui.add(egui::Slider::new(&mut def.blend_softness, 0.0..=1.0).text("Blend softness"));
+            // Scalar metallic/roughness — these drive shading only when the material has
+            // NO MRA texture (the textureless exemplars). For a textured material the MRA
+            // map wins and these sliders have no visible effect. Shading-only, no rebake.
+            ui.add(egui::Slider::new(&mut def.metallic, 0.0..=1.0).text("Metallic"));
+            ui.add(egui::Slider::new(&mut def.roughness, 0.0..=1.0).text("Roughness"));
+            // Height relief displacement depth (world units). Only visible with a height map.
+            ui.add(egui::Slider::new(&mut def.parallax_scale, 0.0..=0.4).text("Relief depth"));
         }
     }
 
-    if changed && let Ok(mut e) = world.get_entity_mut(entity) {
-        if let Some(mut p) = e.get_mut::<SdfPrimitive>() {
-            *p = prim;
-        }
-        if let Some(mut o) = e.get_mut::<SdfOp>() {
-            *o = op;
-        }
-        if let Some(mut ord) = e.get_mut::<SdfOrder>() {
-            *ord = order;
-        }
-        if let Some(mut m) = e.get_mut::<SdfMaterial>() {
-            *m = material;
-        }
+    // Write the chosen id back. `get_mut` fires `Changed<SdfMaterial>`, which
+    // `schedule_bakes` watches → targeted rebake of the affected chunks.
+    if id_changed && let Some(mut m) = world.get_mut::<SdfMaterial>(entity) {
+        *m = material;
     }
-    // Geometry/material-id edits go through `get_mut` above, which triggers the
-    // `Changed<…>` filters `schedule_bakes` watches → targeted rebake. A
-    // registry colour/softness change is shading-only (the GPU material table
-    // re-uploads on registry change), so it needs no rebake.
-    let _ = (changed, reg_changed);
-}
-
-/// Per-primitive parameter sliders. Returns true if any value changed.
-fn primitive_params_ui(ui: &mut egui::Ui, prim: &mut SdfPrimitive) -> bool {
-    let mut changed = false;
-    match prim {
-        SdfPrimitive::Sphere { radius } => {
-            changed |= ui
-                .add(egui::Slider::new(radius, 0.05..=3.0).text("Radius"))
-                .changed();
-        }
-        SdfPrimitive::Box { half_extents } => {
-            changed |= ui
-                .add(egui::Slider::new(&mut half_extents.x, 0.05..=3.0).text("Half X"))
-                .changed();
-            changed |= ui
-                .add(egui::Slider::new(&mut half_extents.y, 0.05..=3.0).text("Half Y"))
-                .changed();
-            changed |= ui
-                .add(egui::Slider::new(&mut half_extents.z, 0.05..=3.0).text("Half Z"))
-                .changed();
-        }
-        SdfPrimitive::Torus { major, minor } => {
-            changed |= ui
-                .add(egui::Slider::new(major, 0.1..=3.0).text("Major"))
-                .changed();
-            changed |= ui
-                .add(egui::Slider::new(minor, 0.02..=1.0).text("Minor"))
-                .changed();
-        }
-        SdfPrimitive::Capsule {
-            half_height,
-            radius,
-        } => {
-            changed |= ui
-                .add(egui::Slider::new(half_height, 0.05..=3.0).text("Half height"))
-                .changed();
-            changed |= ui
-                .add(egui::Slider::new(radius, 0.05..=2.0).text("Radius"))
-                .changed();
-        }
-        SdfPrimitive::Cylinder {
-            radius,
-            half_height,
-        } => {
-            changed |= ui
-                .add(egui::Slider::new(radius, 0.05..=2.0).text("Radius"))
-                .changed();
-            changed |= ui
-                .add(egui::Slider::new(half_height, 0.05..=3.0).text("Half height"))
-                .changed();
-        }
-        SdfPrimitive::Heightmap {
-            half_xz,
-            max_height,
-            freq,
-            amp,
-            seed,
-        } => {
-            changed |= ui
-                .add(egui::Slider::new(&mut half_xz.x, 0.5..=5.0).text("Half X"))
-                .changed();
-            changed |= ui
-                .add(egui::Slider::new(&mut half_xz.y, 0.5..=5.0).text("Half Z"))
-                .changed();
-            changed |= ui
-                .add(egui::Slider::new(max_height, 0.1..=3.0).text("Max height"))
-                .changed();
-            changed |= ui
-                .add(egui::Slider::new(freq, 0.1..=5.0).text("Freq"))
-                .changed();
-            changed |= ui
-                .add(egui::Slider::new(amp, 0.0..=2.0).text("Amp"))
-                .changed();
-            let mut seed_v = *seed;
-            if ui
-                .add(egui::DragValue::new(&mut seed_v).prefix("Seed "))
-                .changed()
-            {
-                *seed = seed_v;
-                changed = true;
-            }
-        }
-    }
-    changed
 }

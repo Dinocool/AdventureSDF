@@ -10,7 +10,7 @@ struct SdfCameraUniform {
     inv_view_proj: mat4x4<f32>,
     clip_from_world: mat4x4<f32>,
     camera_pos: vec4<f32>,
-    screen_params: vec4<f32>,
+    screen_params: vec4<f32>,  // xy = screen_size, z = surface_bias (coarse-LOD iso-offset α), w unused
     grid_origin: vec4<f32>,
     grid_dims: vec4<f32>,
     debug_params: vec4<f32>,   // x = max_steps, y = max_dist, z = sdf_eps, w = recenter_snap_chunks
@@ -20,7 +20,7 @@ struct SdfCameraUniform {
 
 // One material row, indexed by global material id. Mirrors `GpuSdfMaterial`
 // (render.rs): base colour + seam softness + per-map texture-array layer indices
-// (0xffffffff = no texture for that map). 48 bytes.
+// (0xffffffff = no texture for that map) + scalar metallic/roughness fallbacks. 48 bytes.
 struct SdfMaterial {
     base_color: vec4<f32>,
     blend_softness: f32,   // world-units colour-feather width at a seam
@@ -29,7 +29,18 @@ struct SdfMaterial {
     tex_mra: u32,
     tex_height: u32,
     tex_edge: u32,
-    pad: vec2<u32>,
+    // Used when tex_mra is absent (0xffffffff): lets a material be a plain metal/dielectric
+    // without an MRA texture. Range 0..1 each.
+    metallic: f32,
+    roughness: f32,
+    // Parallax-occlusion relief depth (UV units) for this material's height map. 0 = flat.
+    parallax_scale: f32,
+    // Three SEPARATE u32 pads — NOT vec3<u32>, which has 16-byte alignment in WGSL and would
+    // bump the struct to 80 bytes, mismatching the 64-byte Rust GpuSdfMaterial (flat u32s).
+    // Names avoid trailing digits (naga_oil writeback rejects `pad0` etc).
+    pad_a: u32,
+    pad_b: u32,
+    pad_c: u32,
 };
 
 // Per-brick lookup. `key_hi`/`key_lo` are the absolute 64-bit brick key (lod + biased
@@ -116,6 +127,10 @@ fn lod_blend_band() -> f32 { return camera.march_params.w; }
 // The LOD cross-fade keys off the chunk-SNAPPED ring centre, so the shader recomputes it
 // from camera_pos + this (mirrors bake_scheduler::ring_chunk_origin). >= 1.
 fn recenter_snap() -> i32 { return max(i32(camera.debug_params.w), 1); }
+// Coarse-LOD iso-offset α. The sphere-trace march renders the surface where the field
+// equals `α · voxel_size(lod)² / base` (not 0), re-inflating the trilinear shrink that
+// makes convex objects thinner at coarse LODs. 0 = off; zero at LOD 0 (cubic owns it).
+fn surface_bias() -> f32 { return camera.screen_params.z; }
 
 // --- LOD clipmap / chunk accessors ---
 

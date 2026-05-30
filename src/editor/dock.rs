@@ -128,7 +128,7 @@ impl TabViewer for EditorTabViewer<'_> {
     fn title(&mut self, tab: &mut Self::Tab) -> egui::WidgetText {
         match tab {
             EditorTab::Viewport => "Viewport".into(),
-            EditorTab::Hierarchy => "Hierarchy".into(),
+            EditorTab::Hierarchy => "Scene".into(),
             EditorTab::Inspector => "Inspector".into(),
             EditorTab::ProjectFiles => "Project Files".into(),
             EditorTab::AssetsDrawer => "Assets".into(),
@@ -256,11 +256,13 @@ pub fn show_editor_dock(world: &mut World) {
     world.insert_resource(registry);
 }
 
-/// Toolbar strip rendered across the top of the Viewport tab. Currently hosts the
-/// camera-mode toggle (Orbit ⇄ FPS free-fly). Drawn with a `TopBottomPanel::top` scoped
-/// to the tab's `ui`, so the 3D camera's reserved rect (captured after) sits below it.
+/// Toolbar strip rendered across the top of the Viewport tab: camera-mode toggle
+/// (Orbit ⇄ FPS), gizmo transform tools (mode + snap), and a view-options dropdown.
+/// Drawn with a `TopBottomPanel::top` scoped to the tab's `ui`, so the 3D camera's
+/// reserved rect (captured after) sits below it.
 fn viewport_toolbar(world: &mut World, ui: &mut egui::Ui) {
-    use crate::sdf_render::{SdfCameraMode, SdfOrbitCamera};
+    use crate::sdf_render::gizmo::{GizmoModes, GizmoState};
+    use crate::sdf_render::{SdfCameraMode, SdfOrbitCamera, WireframeBoundsVisible};
 
     egui::TopBottomPanel::top("viewport_toolbar")
         .exact_height(28.0)
@@ -287,12 +289,77 @@ fn viewport_toolbar(world: &mut World, ui: &mut egui::Ui) {
                 }
 
                 ui.separator();
+
+                // Camera-mode instructions, to the left of the gizmo tools.
                 if fps {
                     let speed = world.resource::<SdfCameraMode>().speed;
                     ui.label(format!("Fly: RMB look · WASD · Space/Ctrl · {speed:.0} u/s"));
                 } else {
                     ui.label("Orbit: MMB rotate · Shift+MMB pan · wheel zoom");
                 }
+
+                ui.separator();
+
+                // Gizmo transform tools: mode icon buttons + snap magnet. Disabled in
+                // FPS mode (the gizmo only operates under the orbit camera). Icons are
+                // Phosphor glyphs (installed via `install_phosphor_font`).
+                ui.add_enabled_ui(!fps, |ui| {
+                    use egui_phosphor::regular as icon;
+                    let cur = world.resource::<GizmoState>().modes;
+                    // (mode, icon glyph, tooltip incl. keybind).
+                    for (modes, glyph, tip) in [
+                        (GizmoModes::TRANSLATE, icon::ARROWS_OUT_CARDINAL, "Move (W)"),
+                        (GizmoModes::ROTATE, icon::ARROW_CLOCKWISE, "Rotate (E)"),
+                        (GizmoModes::SCALE, icon::ARROWS_OUT, "Scale (R)"),
+                        (GizmoModes::all(), icon::CUBE, "All modes (Q)"),
+                    ] {
+                        if ui
+                            .selectable_label(cur == modes, glyph)
+                            .on_hover_text(tip)
+                            .clicked()
+                        {
+                            world.resource_mut::<GizmoState>().modes = modes;
+                        }
+                    }
+
+                    // Snap magnet: sticky toggle (Ctrl-hold still forces snap on too).
+                    let sticky = world.resource::<GizmoState>().snap_sticky;
+                    if ui
+                        .selectable_label(sticky, icon::MAGNET)
+                        .on_hover_text("Snap (toggle; or hold Ctrl)")
+                        .clicked()
+                    {
+                        world.resource_mut::<GizmoState>().snap_sticky = !sticky;
+                    }
+
+                    // Snap settings dropdown: per-axis snap step sizes.
+                    egui::ComboBox::from_id_salt("viewport_snap_settings")
+                        .selected_text(format!("{} Snap settings", icon::GEAR))
+                        .show_ui(ui, |ui| {
+                            let mut g = world.resource_mut::<GizmoState>();
+                            ui.add(egui::Slider::new(&mut g.snap_move, 0.0..=2.0).text("Move"));
+                            ui.add(
+                                egui::Slider::new(
+                                    &mut g.snap_angle,
+                                    0.0..=std::f32::consts::FRAC_PI_2,
+                                )
+                                .text("Rotate (rad)"),
+                            );
+                            ui.add(egui::Slider::new(&mut g.snap_scale, 0.0..=1.0).text("Scale"));
+                        });
+                });
+
+                // Blender-style view-options dropdown, right-aligned. Display toggles.
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    egui::ComboBox::from_id_salt("viewport_view_options")
+                        .selected_text("View")
+                        .show_ui(ui, |ui| {
+                            let mut wf = world.resource::<WireframeBoundsVisible>().0;
+                            if ui.checkbox(&mut wf, "Bounds wireframe").changed() {
+                                world.resource_mut::<WireframeBoundsVisible>().0 = wf;
+                            }
+                        });
+                });
             });
         });
 }

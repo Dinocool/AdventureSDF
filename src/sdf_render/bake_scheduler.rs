@@ -22,6 +22,19 @@ use super::{
     edits, gather_sorted_edits,
 };
 
+/// One-frame request to bake this frame's dirty chunks **synchronously** (on the main
+/// thread, same frame) instead of deferring them to the async task pool.
+///
+/// Reusable seam for "I need this edit visible *now*": set `.0 = true` from any system
+/// that mutates an [`SdfVolume`] and wants the result on screen immediately — a live
+/// gizmo drag, an inspector slider, a programmatic edit. Without it the async path
+/// applies a frame or two later, and during a *continuous* edit (e.g. a drag) every
+/// frame bumps `edit_epoch`, so the in-flight async results are discarded as stale and
+/// nothing lands until the edit stops. `schedule_bakes` consumes (clears) the flag each
+/// frame after honoring it.
+#[derive(Resource, Default)]
+pub struct SyncBakeRequest(pub bool);
+
 /// Last frame's per-edit world AABB, keyed by entity. Lets the scheduler dirty an edit's
 /// *former* footprint (not just where it moved to) so vacated chunks get rebuilt/removed.
 /// Also serves as the previous entity set for add/remove detection.
@@ -65,6 +78,10 @@ pub struct BakeScheduler {
     /// Snapshot of the current edits + BVH handed to bake tasks (cheap Arc clone).
     edits: Arc<Vec<edits::ResolvedEdit>>,
     bvh: Arc<bvh::Bvh>,
+    /// Decoded height maps for bake-time displacement, snapshotted alongside edits/BVH so
+    /// async bake tasks can sample it. Rebuilt when the material registry's displacement
+    /// columns change (see `update_height_field`).
+    height: super::height::SharedHeightField,
     /// Per-LOD chunk-ring origin currently resident (index = lod), in chunk coords. Used
     /// to diff which chunks entered/exited as the camera moves. Empty until first run.
     ring_chunk_origin: Vec<IVec3>,
@@ -80,10 +97,25 @@ impl Default for BakeScheduler {
             edit_epoch: 0,
             edits: Arc::new(Vec::new()),
             bvh: Arc::new(bvh::Bvh::default()),
+            height: Arc::new(super::height::HeightField::default()),
             ring_chunk_origin: Vec::new(),
             pending: std::collections::HashSet::new(),
             inflight: Vec::new(),
         }
+    }
+}
+
+impl BakeScheduler {
+    /// Replace the height-field snapshot used by subsequent bakes (rebuilt when the material
+    /// registry's displacement columns change). Async tasks clone the `Arc`.
+    pub fn set_height(&mut self, height: super::height::SharedHeightField) {
+        self.height = height;
+    }
+
+    /// The current height-field snapshot (for the synchronous diagnostic bake, which baked
+    /// off the scheduler's edits/bvh too).
+    pub fn height_field(&self) -> &super::height::HeightField {
+        &self.height
     }
 }
 
@@ -267,11 +299,14 @@ pub fn schedule_bakes(
     mut bvh: ResMut<bvh::Bvh>,
     mut sched: ResMut<BakeScheduler>,
     mut prev_aabbs: ResMut<PrevEditAabbs>,
+    mut sync_request: ResMut<SyncBakeRequest>,
     config: Res<SdfGridConfig>,
     volumes: Query<VolumeQueryData, With<SdfVolume>>,
     changed: Query<Entity, (With<SdfVolume>, ChangedEdit)>,
     camera: Query<&Transform, (With<SdfCamera>, Without<SdfVolume>)>,
 ) {
+    // Consume the one-frame "bake now, synchronously" request (see SyncBakeRequest).
+    let bake_sync = std::mem::take(&mut sync_request.0);
     let camera_pos = camera.iter().next().map(|t| t.translation).unwrap_or(Vec3::ZERO);
     let lod_count = config.lod_count;
     let r = ring_chunks_per_axis(&config);
@@ -367,16 +402,40 @@ pub fn schedule_bakes(
         sched.ring_chunk_origin[li] = new_origin;
     }
 
-    // --- 3. Spawn async bake tasks (chunk-batched, budgeted, nearest-first) ----------
+    // --- 3. Bake the dirty chunks (sync inline, or async tasks) -----------------------
     if sched.pending.is_empty() {
         return;
     }
-    let pool = AsyncComputeTaskPool::get();
-    let epoch = sched.edit_epoch;
 
     // Take only this frame's budget, nearest-camera-first, so the visible shell fills
     // before far chunks. Leftover pending chunks persist (dedup set) for next frame.
     let drained = drain_budget(&mut sched.pending, camera_pos, &config, SCHEDULE_BUDGET_CHUNKS);
+
+    // Sync path: bake on the main thread and apply this frame, so a live edit (gizmo
+    // drag, slider) is visible immediately. Skips the task pool entirely, so there's no
+    // epoch race to lose — what we drain, we apply now. Same per-frame budget bounds cost.
+    if bake_sync {
+        let mut applied = false;
+        for ck in &drained {
+            for key in chunk_brick_keys(*ck, &config) {
+                match SdfAtlas::bake_brick(key, &sched.edits, &sched.bvh, &config, &sched.height) {
+                    Some(brick) => {
+                        atlas.insert_brick(key, brick);
+                        applied = true;
+                    }
+                    None => applied |= atlas.remove_brick(&key),
+                }
+            }
+        }
+        if applied {
+            atlas.last_bake_was_full = false;
+            atlas.bump_generation();
+        }
+        return;
+    }
+
+    let pool = AsyncComputeTaskPool::get();
+    let epoch = sched.edit_epoch;
 
     for group in drained.chunks(BAKE_CHUNKS_PER_TASK) {
         // Expand the group's chunks into their brick keys for the task.
@@ -386,11 +445,12 @@ pub fn schedule_bakes(
         }
         let edits = Arc::clone(&sched.edits);
         let bvh_snapshot = Arc::clone(&sched.bvh);
+        let height = Arc::clone(&sched.height);
         let cfg = config.clone();
         let task = pool.spawn(async move {
             keys.into_iter()
                 .map(|key| {
-                    let baked = SdfAtlas::bake_brick(key, &edits, &bvh_snapshot, &cfg);
+                    let baked = SdfAtlas::bake_brick(key, &edits, &bvh_snapshot, &cfg, &height);
                     (key, baked)
                 })
                 .collect::<Vec<_>>()
@@ -553,7 +613,7 @@ mod tests {
                 self.pending.remove(&ck);
                 let results: Vec<_> = chunk_brick_keys(ck, cfg)
                     .into_iter()
-                    .map(|bk| (bk, SdfAtlas::bake_brick(bk, edits, bvh, cfg)))
+                    .map(|bk| (bk, SdfAtlas::bake_brick(bk, edits, bvh, cfg, &super::super::height::HeightField::default())))
                     .collect();
                 self.inflight.push_back((ck, results));
             }
@@ -567,7 +627,7 @@ mod tests {
             for ck in take {
                 let results: Vec<_> = chunk_brick_keys(ck, cfg)
                     .into_iter()
-                    .map(|bk| (bk, SdfAtlas::bake_brick(bk, edits, bvh, cfg)))
+                    .map(|bk| (bk, SdfAtlas::bake_brick(bk, edits, bvh, cfg, &super::super::height::HeightField::default())))
                     .collect();
                 self.inflight.push_back((ck, results));
             }
@@ -674,7 +734,7 @@ mod tests {
 
         // The payoff: byte-identical to a fresh full_bake at the final camera.
         let mut reference = SdfAtlas::default();
-        reference.full_bake(&edits, &bvh, &cfg, final_cam);
+        reference.full_bake(&edits, &bvh, &cfg, &super::super::height::HeightField::default(), final_cam);
         let inc: HashSet<_> = atlas.bricks.keys().copied().collect();
         let refk: HashSet<_> = reference.bricks.keys().copied().collect();
         assert_eq!(inc, refk, "async emulation diverged from full_bake (stale/missing bricks)");

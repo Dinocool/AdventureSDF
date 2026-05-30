@@ -11,7 +11,7 @@
 
 #import bevy_core_pipeline::fullscreen_vertex_shader::FullscreenVertexOutput
 
-#import sdf::bindings::{camera, max_steps, max_dist, sdf_eps, pixel_cone, cubic_band, over_relax, lod_blend_band, recenter_snap, lod_count, brick_world_at, CHUNK_BRICKS, cell_stride, voxel_size_at, abs_chunk_key, local_brick_index, chunk_buf, ChunkLookup}
+#import sdf::bindings::{camera, max_steps, max_dist, sdf_eps, pixel_cone, cubic_band, over_relax, lod_blend_band, recenter_snap, surface_bias, lod_count, brick_world_at, CHUNK_BRICKS, cell_stride, voxel_size_at, abs_chunk_key, local_brick_index, chunk_buf, ChunkLookup}
 #import sdf::brick::{
     world_to_brick_lod,
     scene_sdf,
@@ -30,7 +30,8 @@
     in_ring_chunk,
 }
 #import sdf::cubic::{build_cell_cubic, solve_cell_cubic, dist_to_cell_exit}
-#import sdf::pbr::shade_material
+#import sdf::pbr::{resolve_surface, shade_surface, shade_material_env, sun_dir, PbrInputs}
+#import sdf::sky::sky_color
 
 // Cone-prepass seed texture: per-8×8-tile start distance (R32Float), written by
 // sdf_cone_prepass.wgsl. The march starts each pixel at its tile's seed-t instead of 0,
@@ -232,17 +233,32 @@ fn raymarch(origin: vec3<f32>, dir: vec3<f32>, start_t: f32) -> RaymarchResult {
             continue;
         }
 
-        // --- 3. Coarse LOD / far: sphere-trace the trilinear field -------------------
+        // --- Coarse-LOD iso-offset: re-inflate the trilinear shrink ------------------
+        // Trilinear interpolation over-estimates distance on a convex surface, pulling the
+        // zero-isosurface inward by ≈(h²/8)·κ — so coarse LODs render objects too thin. Take
+        // the surface where the field equals `eff_eps` (> 0) instead of 0, pushing it back
+        // out by ≈eff_eps (|∇field| ≈ 1). QUADRATIC in voxel size to match the h² bias law
+        // (one α works across LODs); ZERO at LOD 0 so the analytic cubic's crisp near surface
+        // is untouched. Lerp by `blend_w` so it stays continuous into LOD+1's (2×) offset
+        // across the cross-fade. `d_iso` is the distance to this inflated surface.
+        let eps_l = select(
+            0.0,
+            surface_bias() * voxel_size * voxel_size / camera.lod_params.z,
+            lod > 0u,
+        );
+        let eff_eps = mix(eps_l, 2.0 * eps_l, blend_w);
+        let d_iso = d_eff - eff_eps;
+
+        // --- 3. Coarse LOD / far: sphere-trace the (inflated) trilinear field ---------
         //
-        // Traces the (possibly LOD-cross-faded) field `d_eff` — equal to `d` outside the
-        // blend shell. Over-relaxation validation FIRST (Keinert 2014): the previous relaxed
-        // step `prev_step` was safe only if the new unbounding sphere of radius `d_eff` still
-        // reaches back over it (`d_eff + prev_d >= prev_step`). If not, the relaxed step
-        // jumped PAST the surface — `p` is now inside/beyond it, so we must NOT accept this
-        // point as a hit (doing so lands the hit at a view-dependent spot → swimming normals/
-        // textures on camera rotation). Back up to the previous safe radius and resume plain
-        // tracing.
-        if (prev_step > 0.0 && d_eff + prev_d < prev_step) {
+        // Traces `d_iso` (the cross-faded field shifted out by the iso-offset; = `d` when
+        // both are off). Over-relaxation validation FIRST (Keinert 2014): the previous
+        // relaxed step `prev_step` was safe only if the new unbounding sphere of radius
+        // `d_iso` still reaches back over it (`d_iso + prev_d >= prev_step`). If not, the
+        // relaxed step jumped PAST the surface — `p` is now inside/beyond it, so we must NOT
+        // accept this point as a hit (doing so lands the hit at a view-dependent spot →
+        // swimming normals/textures on camera rotation). Back up and resume plain tracing.
+        if (prev_step > 0.0 && d_iso + prev_d < prev_step) {
             t += prev_d - prev_step;                 // undo the overshoot (negative)
             prev_d = 0.0;
             prev_step = 0.0;
@@ -250,7 +266,7 @@ fn raymarch(origin: vec3<f32>, dir: vec3<f32>, start_t: f32) -> RaymarchResult {
         }
 
         // Accept only a point reached by a validated step (never an overshoot).
-        if (d_eff < max(SDF_EPS, cone)) {
+        if (d_iso < max(SDF_EPS, cone)) {
             let hit_p = p;
             result.hit = true;
             result.dist = t;
@@ -265,21 +281,45 @@ fn raymarch(origin: vec3<f32>, dir: vec3<f32>, start_t: f32) -> RaymarchResult {
             return result;
         }
 
-        // Step `omega * d_eff`, floored so we never stall, and capped at the brick exit so we
-        // re-resolve LOD as the ray crosses bricks. omega = 1 is plain sphere tracing. Inside
-        // the cross-fade shell force omega = 1: the blended field's weight gradient makes it
-        // mildly non-eikonal, so over-relaxation could overshoot — and the fade is a thin far
-        // shell where over-relaxation buys almost nothing anyway.
+        // Step `omega * d_iso`, floored so we never stall (a negative `d_iso` just inside the
+        // inflated surface becomes a safe tiny forward step), and capped at the brick exit so
+        // we re-resolve LOD as the ray crosses bricks. omega = 1 is plain sphere tracing.
+        // Force omega = 1 whenever the cross-fade OR the iso-offset is active: both make the
+        // effective field mildly non-eikonal, so over-relaxation could overshoot — and these
+        // are far/thin shells where over-relaxation buys almost nothing anyway.
         let brick_exit = dist_to_brick_exit_lod(p, dir, lod);
-        let local_omega = select(OMEGA, 1.0, blending);
-        let step = clamp(local_omega * d_eff, voxel_size * 0.01, brick_exit + voxel_size * 0.01);
+        let local_omega = select(OMEGA, 1.0, blending || eff_eps > 0.0);
+        let step = clamp(local_omega * d_iso, voxel_size * 0.01, brick_exit + voxel_size * 0.01);
         t += step;
-        prev_d = d_eff;
+        prev_d = d_iso;
         prev_step = step;
     }
 
     result.steps = MAX_STEPS;
     return result;
+}
+
+// --- Reflections (Stage 4) ---------------------------------------------------------
+//
+// Mirror radiance along `refl_dir` from a primary hit: march a SECONDARY ray through the
+// same SDF. On a hit, shade that surface with the analytic sky as ITS environment (one
+// bounce only — the reflected surface doesn't itself spawn another reflection ray, which
+// would be unbounded recursion). On a miss, return the sky. The result is the env_radiance
+// the primary surface's specular term consumes, so a smooth metal mirrors real geometry.
+//
+// `origin` is the primary hit nudged off its surface (caller offsets by the geometric
+// normal) so the reflection ray doesn't immediately re-hit the surface it left.
+fn trace_reflection(origin: vec3<f32>, refl_dir: vec3<f32>) -> vec3<f32> {
+    let rm = raymarch(origin, refl_dir);
+    if (!rm.hit) {
+        return sky_color(refl_dir, sun_dir());
+    }
+    let hp = rm.hit_pos;
+    let n = calc_normal(hp);
+    let lod = clamp(log2(max(rm.dist, 1.0)) - 1.0, 0.0, 8.0);
+    // One bounce: the reflected surface uses the sky as its own environment.
+    let sky_env = sky_color(reflect(refl_dir, n), sun_dir());
+    return shade_material_env(scene_sdf(hp), hp, n, lod, sky_env);
 }
 
 struct FragmentOutput {
@@ -322,12 +362,10 @@ fn main(in: FullscreenVertexOutput) -> FragmentOutput {
     let ray_dir = normalize(world_pos - camera.camera_pos.xyz);
     let ray_origin = camera.camera_pos.xyz;
 
-    // Background gradient
-    let bg_color = mix(
-        vec3<f32>(0.05, 0.05, 0.12),
-        vec3<f32>(0.1, 0.1, 0.18),
-        uv.y,
-    );
+    // Background = the same analytic sky the IBL/reflections sample, so a ray miss and
+    // a metal's reflection of the horizon agree. Tonemapped to match shaded surfaces.
+    let sky = sky_color(ray_dir, sun_dir());
+    let bg_color = pow(sky / (sky + vec3<f32>(1.0)), vec3<f32>(1.0 / 2.2));
 
     // Seed the march from the cone prepass: the per-tile start distance for this pixel's
     // 8×8 tile (a guaranteed lower bound on its hit distance, so no geometry is skipped).
@@ -380,25 +418,47 @@ fn main(in: FullscreenVertexOutput) -> FragmentOutput {
         return FragmentOutput(vec4<f32>(bg_color, 1.0), 0.0);
     }
 
-    let hit_pos = rm.hit_pos;
+    // Texture LOD from hit distance: farther hits cover more texels per pixel, so
+    // bias up the mip to avoid shimmer. (No screen-space derivatives in a fullscreen
+    // raymarch, so we derive LOD analytically.) Tuned constant; clamped to a sane range.
+    let lod = clamp(log2(max(rm.dist, 1.0)) - 1.0, 0.0, 8.0);
 
-    // True reverse-Z projection depth so the SDF surface shares the depth buffer
-    // with normal geometry (wireframe, gizmos): project the world hit through the
-    // forward view-proj and divide. Bevy clip space is z in [0,1], near = 1.
+    // Height-map relief is baked into the SDF field (see sdf_render::height) — the hit position
+    // and its gradient normal already reflect the carved surface, so shading needs no extra work.
+    let hit_pos = rm.hit_pos;
+    let geo_normal = calc_normal(rm.hit_pos);
+
+    // True reverse-Z projection depth so the SDF surface shares the depth buffer with normal
+    // geometry (wireframe, gizmos): project the (displaced) world hit through the forward
+    // view-proj and divide. Bevy clip space is z in [0,1], near = 1.
     let clip = camera.clip_from_world * vec4<f32>(hit_pos, 1.0);
     let ndc_depth = clip.z / clip.w;
 
-    let normal = calc_normal(hit_pos);
-    // Texture LOD from hit distance: farther hits cover more texels per pixel, so
-    // bias up the mip to avoid shimmer. (No screen-space derivatives in a fullscreen
-    // raymarch, so we derive LOD analytically.) Tuned constant; clamped to a sane
-    // range. With single-mip textures this is currently a no-op but keeps the call
-    // shape ready for the mip follow-up.
-    let lod = clamp(log2(max(rm.dist, 1.0)) - 1.0, 0.0, 8.0);
-    // Full PBR: triplanar textures + Cook-Torrance + material-seam cross-fade,
-    // returned tonemapped/gamma-corrected. `normal` is the geometric SDF normal;
-    // shade_material perturbs it per-material with the normal map.
-    let shaded = shade_material(scene_sdf(hit_pos), hit_pos, normal, lod);
+    let normal = geo_normal;
+
+    // Resolve the cross-faded PBR inputs at the (displaced) surface, pick the environment
+    // radiance, then shade once. `p.normal` is the normal-mapped shading normal; `normal` is
+    // the geometric one (used for the reflection-ray offset so it leaves along the surface).
+    let scene = scene_sdf(hit_pos);
+    let p: PbrInputs = resolve_surface(scene, hit_pos, normal, lod);
+
+    // Environment radiance for the specular/IBL term: the analytic sky by default. With
+    // SDF_REFLECTIONS, smooth/metallic surfaces trace a real reflection ray for true
+    // geometry-to-geometry mirroring; rough/diffuse surfaces keep the cheap sky (the
+    // gate keeps the common case at one march).
+    var env_radiance = sky_color(reflect(-normalize(camera.camera_pos.xyz - hit_pos), p.normal), sun_dir());
+#ifdef SDF_REFLECTIONS
+    if (p.metallic > 0.1 || p.roughness < 0.3) {
+        let view = normalize(camera.camera_pos.xyz - hit_pos);
+        let refl_dir = reflect(-view, p.normal);
+        let bias = voxel_size_at(rm.lod) * 2.0;
+        env_radiance = trace_reflection(hit_pos + normal * bias, refl_dir);
+    }
+#endif
+
+    // Shade to LINEAR radiance, then tonemap (Reinhard) + approximate gamma once here.
+    let lit = shade_surface(p, hit_pos, normal, rm.lod, env_radiance);
+    let shaded = pow(lit / (lit + vec3<f32>(1.0)), vec3<f32>(1.0 / 2.2));
 
     // --- Debug output modes (hit-only; cost/fate modes return earlier) ---
 

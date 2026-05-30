@@ -32,9 +32,31 @@ pub struct MaterialAsset {
     pub base_color: [f32; 4],
     /// Shading-time seam cross-fade width (world units). See `MaterialDef`.
     pub blend_softness: f32,
+    /// Scalar metallic/roughness fallbacks, used when no MRA texture is set (`maps[2]`
+    /// is `None`). `#[serde(default)]` so older RON without these fields still loads
+    /// (defaulting to a fully-rough dielectric, the prior behaviour).
+    #[serde(default)]
+    pub metallic: f32,
+    #[serde(default = "default_roughness")]
+    pub roughness: f32,
+    /// Parallax relief depth (UV units) for the height map. `#[serde(default)]` →
+    /// `default_parallax` so older RON without the field gets a sensible visible relief.
+    #[serde(default = "default_parallax")]
+    pub parallax_scale: f32,
     /// One texture reference per PBR map (diffuse, normal, mra, height, edge);
     /// `None` = no texture for that map.
     pub maps: [Option<TexRef>; MATERIAL_TEX_MAPS],
+}
+
+/// serde default for `roughness` (1.0 = fully diffuse). A bare `Default` would give 0.0
+/// (a mirror), which is the wrong fallback for un-annotated legacy material RON.
+fn default_roughness() -> f32 {
+    1.0
+}
+
+/// serde default for `parallax_scale` (matches `MaterialDef::default`).
+fn default_parallax() -> f32 {
+    0.15
 }
 
 impl Default for MaterialAsset {
@@ -42,6 +64,9 @@ impl Default for MaterialAsset {
         Self {
             base_color: [0.8, 0.8, 0.8, 1.0],
             blend_softness: 0.0,
+            metallic: 0.0,
+            roughness: 1.0,
+            parallax_scale: 0.15,
             maps: std::array::from_fn(|_| None),
         }
     }

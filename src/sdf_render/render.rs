@@ -60,7 +60,7 @@ struct SdfCameraData {
     /// (wireframe, gizmos) through the normal depth buffer.
     clip_from_world: Mat4,
     camera_pos: Vec4,
-    screen_params: Vec4, // xy = screen_size, zw = unused
+    screen_params: Vec4, // xy = screen_size, z = surface_bias, w = unused
     grid_origin: Vec4,   // xyz = grid origin, w = voxel_size
     grid_dims: Vec4, // x = grid_size, y = bricks_per_axis, z = brick_size (8.0), w = num_lookups
     debug_params: Vec4, // x = max_steps, y = max_dist, z = sdf_eps, w = unused
@@ -74,7 +74,7 @@ struct SdfCameraData {
 /// GPU mirror of a [`super::edits::MaterialDef`], one per global material id, in a
 /// storage buffer indexed by id. Carries the PBR texture-array layer for each map
 /// (`u32::MAX` = none); the shader samples those layers via triplanar projection.
-/// 48 bytes, 16-byte aligned for std430.
+/// 64 bytes, 16-byte aligned for std430 (Vec4 forces the size up to a 16-byte multiple).
 #[derive(ShaderType, Clone, Copy, Default)]
 struct GpuSdfMaterial {
     base_color: Vec4,
@@ -84,8 +84,14 @@ struct GpuSdfMaterial {
     tex_mra: u32,
     tex_height: u32,
     tex_edge: u32,
+    /// Scalar metallic/roughness fallbacks (used by the shader when `tex_mra` is absent).
+    metallic: f32,
+    roughness: f32,
+    /// Parallax-occlusion relief depth (UV units) for this material's height map. 0 = flat.
+    parallax_scale: f32,
     _pad0: u32,
     _pad1: u32,
+    _pad2: u32,
 }
 
 // --- Extracted Atlas ---
@@ -236,6 +242,10 @@ struct SdfPipeline {
     layout_2: BindGroupLayoutDescriptor,
     #[expect(dead_code)]
     shader_handle: Handle<Shader>,
+    /// The shader defs the current `pipeline_id` was queued with. Rebuild compares the
+    /// extracted defs against this (not a per-frame `changed` flag, which is fragile at
+    /// startup when the defs haven't synced yet) and re-queues only on a real mismatch.
+    current_defs: Vec<String>,
 }
 
 /// Compute pipeline + layouts for the cone prepass (one tile-cone march per 8×8 tile,
@@ -451,11 +461,13 @@ struct SdfShaderHandle(Handle<Shader>);
 struct SdfShaderModules(#[expect(dead_code)] Vec<Handle<Shader>>);
 
 /// The `#define_import_path` module files the entry shader composes.
-const SDF_SHADER_MODULES: [&str; 5] = [
+const SDF_SHADER_MODULES: [&str; 7] = [
     "shaders/sdf/bindings.wgsl",
     "shaders/sdf/brick.wgsl",
     "shaders/sdf/cubic.wgsl",
     "shaders/sdf/material.wgsl",
+    "shaders/sdf/shadows.wgsl",
+    "shaders/sdf/sky.wgsl",
     "shaders/sdf/pbr.wgsl",
 ];
 
@@ -585,8 +597,12 @@ fn prepare_sdf_camera_data(
                 tex_mra: t[2],
                 tex_height: t[3],
                 tex_edge: t[4],
+                metallic: def.metallic,
+                roughness: def.roughness,
+                parallax_scale: def.parallax_scale,
                 _pad0: 0,
                 _pad1: 0,
+                _pad2: 0,
             });
         }
     }
@@ -619,7 +635,8 @@ fn prepare_sdf_camera_data(
             inv_view_proj,
             clip_from_world,
             camera_pos: transform.translation.extend(0.0),
-            screen_params: Vec4::new(size.x as f32, size.y as f32, 0.0, 0.0),
+            // z = surface_bias (coarse-LOD iso-offset α); w unused.
+            screen_params: Vec4::new(size.x as f32, size.y as f32, raymarch.surface_bias, 0.0),
             grid_origin: Vec4::new(
                 config.world_origin().x,
                 config.world_origin().y,
@@ -681,31 +698,12 @@ fn sync_sdf_shader_defs(
 #[derive(Resource, Default)]
 struct ExtractedShaderDefs {
     defs: Vec<String>,
-    changed: bool,
 }
 
-fn extract_shader_defs(
-    defs: Extract<Res<SdfShaderDefs>>,
-    mut commands: Commands,
-    existing: Option<ResMut<ExtractedShaderDefs>>,
-) {
-    let new_defs = defs.defs.clone();
-    match existing {
-        Some(mut existing) => {
-            if existing.defs != new_defs {
-                existing.defs = new_defs;
-                existing.changed = true;
-            } else {
-                existing.changed = false;
-            }
-        }
-        None => {
-            commands.insert_resource(ExtractedShaderDefs {
-                defs: new_defs,
-                changed: false,
-            });
-        }
-    }
+fn extract_shader_defs(defs: Extract<Res<SdfShaderDefs>>, mut commands: Commands) {
+    commands.insert_resource(ExtractedShaderDefs {
+        defs: defs.defs.clone(),
+    });
 }
 
 fn rebuild_pipeline_on_def_change(
@@ -716,7 +714,10 @@ fn rebuild_pipeline_on_def_change(
     fullscreen_shader: Res<FullscreenShader>,
 ) {
     let Some(extracted) = extracted else { return };
-    if !extracted.changed {
+    // Rebuild whenever the extracted defs differ from what the live pipeline was built
+    // with — timing-independent, so the startup case (defs sync in a frame or two after
+    // the pipeline was first queued with empty defs) rebuilds without a manual toggle.
+    if extracted.defs == pipeline.current_defs {
         return;
     }
 
@@ -753,6 +754,7 @@ fn rebuild_pipeline_on_def_change(
     });
 
     pipeline.pipeline_id = new_id;
+    pipeline.current_defs = extracted.defs.clone();
 }
 
 // --- Extract: Pack Atlas for GPU ---
@@ -961,8 +963,8 @@ fn prepare_sdf_materials_gpu(
     mut gpu_atlas: ResMut<SdfGpuAtlas>,
 ) {
     let Some(extracted) = extracted else { return };
-    // std430: each GpuSdfMaterial is 48 bytes (vec4 + f32 + 5×u32 + 2×u32 pad).
-    let mut bytes = Vec::with_capacity(extracted.materials.len() * 48);
+    // std430: each GpuSdfMaterial is 64 bytes (vec4 + f32 + 5×u32 + 3×f32 + 3×u32 pad).
+    let mut bytes = Vec::with_capacity(extracted.materials.len() * 64);
     for m in &extracted.materials {
         for c in [
             m.base_color.x,
@@ -978,6 +980,10 @@ fn prepare_sdf_materials_gpu(
         bytes.extend_from_slice(&m.tex_mra.to_le_bytes());
         bytes.extend_from_slice(&m.tex_height.to_le_bytes());
         bytes.extend_from_slice(&m.tex_edge.to_le_bytes());
+        bytes.extend_from_slice(&m.metallic.to_le_bytes());
+        bytes.extend_from_slice(&m.roughness.to_le_bytes());
+        bytes.extend_from_slice(&m.parallax_scale.to_le_bytes());
+        bytes.extend_from_slice(&0u32.to_le_bytes());
         bytes.extend_from_slice(&0u32.to_le_bytes());
         bytes.extend_from_slice(&0u32.to_le_bytes());
     }
@@ -1493,7 +1499,7 @@ fn init_sdf_pipeline(
     // size before the real table uploads.
     let dummy_material = device.create_buffer_with_data(&BufferInitDescriptor {
         label: Some("sdf_dummy_material"),
-        contents: &[0u8; 48],
+        contents: &[0u8; 64],
         usage: BufferUsages::STORAGE,
     });
     // Matching dummy material atlas (Rgba16Snorm = 8 bytes/texel) so bind group 1 is
@@ -1563,6 +1569,8 @@ fn init_sdf_pipeline(
         layout_1,
         layout_2,
         shader_handle: shader,
+        // Queued above with empty shader_defs; rebuild fires once the synced defs differ.
+        current_defs: Vec::new(),
     });
     commands.insert_resource(SdfGpuAtlas {
         dist_tex: None,
