@@ -204,8 +204,9 @@ fn raymarch(origin: vec3<f32>, dir: vec3<f32>) -> RaymarchResult {
             return result;
         }
 
-        // Step `omega * d`, floored so we never stall, and capped at the brick exit so we
-        // re-resolve LOD as the ray crosses bricks. omega = 1 is plain sphere tracing.
+        // Step `omega * d` (sphere trace), floored so we never stall, and capped at the brick
+        // exit so we re-resolve LOD as the ray crosses bricks. omega = 1 is plain sphere
+        // tracing. (Capping at brick_exit is conservative — `d` is the only safe jump.)
         let brick_exit = dist_to_brick_exit_lod(p, dir, lod);
         let step = clamp(OMEGA * d, voxel_size * 0.01, brick_exit + voxel_size * 0.01);
         t += step;
