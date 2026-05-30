@@ -11,7 +11,7 @@
 
 #import bevy_core_pipeline::fullscreen_vertex_shader::FullscreenVertexOutput
 
-#import sdf::bindings::{camera, max_steps, max_dist, sdf_eps, pixel_cone, cubic_band, over_relax, lod_blend_band, recenter_snap, lod_count, brick_world_at, CHUNK_BRICKS, cell_stride, voxel_size_at, abs_chunk_key, local_brick_index, chunk_buf, ChunkLookup}
+#import sdf::bindings::{camera, max_steps, max_dist, sdf_eps, pixel_cone, cubic_band, over_relax, lod_blend_band, recenter_snap, surface_bias, lod_count, brick_world_at, CHUNK_BRICKS, cell_stride, voxel_size_at, abs_chunk_key, local_brick_index, chunk_buf, ChunkLookup}
 #import sdf::brick::{
     world_to_brick_lod,
     scene_sdf,
@@ -225,17 +225,32 @@ fn raymarch(origin: vec3<f32>, dir: vec3<f32>) -> RaymarchResult {
             continue;
         }
 
-        // --- 3. Coarse LOD / far: sphere-trace the trilinear field -------------------
+        // --- Coarse-LOD iso-offset: re-inflate the trilinear shrink ------------------
+        // Trilinear interpolation over-estimates distance on a convex surface, pulling the
+        // zero-isosurface inward by ≈(h²/8)·κ — so coarse LODs render objects too thin. Take
+        // the surface where the field equals `eff_eps` (> 0) instead of 0, pushing it back
+        // out by ≈eff_eps (|∇field| ≈ 1). QUADRATIC in voxel size to match the h² bias law
+        // (one α works across LODs); ZERO at LOD 0 so the analytic cubic's crisp near surface
+        // is untouched. Lerp by `blend_w` so it stays continuous into LOD+1's (2×) offset
+        // across the cross-fade. `d_iso` is the distance to this inflated surface.
+        let eps_l = select(
+            0.0,
+            surface_bias() * voxel_size * voxel_size / camera.lod_params.z,
+            lod > 0u,
+        );
+        let eff_eps = mix(eps_l, 2.0 * eps_l, blend_w);
+        let d_iso = d_eff - eff_eps;
+
+        // --- 3. Coarse LOD / far: sphere-trace the (inflated) trilinear field ---------
         //
-        // Traces the (possibly LOD-cross-faded) field `d_eff` — equal to `d` outside the
-        // blend shell. Over-relaxation validation FIRST (Keinert 2014): the previous relaxed
-        // step `prev_step` was safe only if the new unbounding sphere of radius `d_eff` still
-        // reaches back over it (`d_eff + prev_d >= prev_step`). If not, the relaxed step
-        // jumped PAST the surface — `p` is now inside/beyond it, so we must NOT accept this
-        // point as a hit (doing so lands the hit at a view-dependent spot → swimming normals/
-        // textures on camera rotation). Back up to the previous safe radius and resume plain
-        // tracing.
-        if (prev_step > 0.0 && d_eff + prev_d < prev_step) {
+        // Traces `d_iso` (the cross-faded field shifted out by the iso-offset; = `d` when
+        // both are off). Over-relaxation validation FIRST (Keinert 2014): the previous
+        // relaxed step `prev_step` was safe only if the new unbounding sphere of radius
+        // `d_iso` still reaches back over it (`d_iso + prev_d >= prev_step`). If not, the
+        // relaxed step jumped PAST the surface — `p` is now inside/beyond it, so we must NOT
+        // accept this point as a hit (doing so lands the hit at a view-dependent spot →
+        // swimming normals/textures on camera rotation). Back up and resume plain tracing.
+        if (prev_step > 0.0 && d_iso + prev_d < prev_step) {
             t += prev_d - prev_step;                 // undo the overshoot (negative)
             prev_d = 0.0;
             prev_step = 0.0;
@@ -243,7 +258,7 @@ fn raymarch(origin: vec3<f32>, dir: vec3<f32>) -> RaymarchResult {
         }
 
         // Accept only a point reached by a validated step (never an overshoot).
-        if (d_eff < max(SDF_EPS, cone)) {
+        if (d_iso < max(SDF_EPS, cone)) {
             let hit_p = p;
             result.hit = true;
             result.dist = t;
@@ -258,16 +273,17 @@ fn raymarch(origin: vec3<f32>, dir: vec3<f32>) -> RaymarchResult {
             return result;
         }
 
-        // Step `omega * d_eff`, floored so we never stall, and capped at the brick exit so we
-        // re-resolve LOD as the ray crosses bricks. omega = 1 is plain sphere tracing. Inside
-        // the cross-fade shell force omega = 1: the blended field's weight gradient makes it
-        // mildly non-eikonal, so over-relaxation could overshoot — and the fade is a thin far
-        // shell where over-relaxation buys almost nothing anyway.
+        // Step `omega * d_iso`, floored so we never stall (a negative `d_iso` just inside the
+        // inflated surface becomes a safe tiny forward step), and capped at the brick exit so
+        // we re-resolve LOD as the ray crosses bricks. omega = 1 is plain sphere tracing.
+        // Force omega = 1 whenever the cross-fade OR the iso-offset is active: both make the
+        // effective field mildly non-eikonal, so over-relaxation could overshoot — and these
+        // are far/thin shells where over-relaxation buys almost nothing anyway.
         let brick_exit = dist_to_brick_exit_lod(p, dir, lod);
-        let local_omega = select(OMEGA, 1.0, blending);
-        let step = clamp(local_omega * d_eff, voxel_size * 0.01, brick_exit + voxel_size * 0.01);
+        let local_omega = select(OMEGA, 1.0, blending || eff_eps > 0.0);
+        let step = clamp(local_omega * d_iso, voxel_size * 0.01, brick_exit + voxel_size * 0.01);
         t += step;
-        prev_d = d_eff;
+        prev_d = d_iso;
         prev_step = step;
     }
 
