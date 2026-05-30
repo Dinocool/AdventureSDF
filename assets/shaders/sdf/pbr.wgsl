@@ -2,13 +2,15 @@
 
 // Cook-Torrance PBR: GGX distribution, Smith geometry, Schlick fresnel, plus the
 // per-material PBR-input gather (triplanar diffuse/normal/MRA + edge wear) and the
-// material-seam cross-fade. `shade_material` returns the final tonemapped colour.
+// material-seam cross-fade. `resolve_surface` returns the cross-faded PBR inputs;
+// `shade_surface` shades them to LINEAR radiance (the entry shader tonemaps once), taking
+// the environment radiance (sky or a traced reflection) for the specular/IBL term.
 
 #import sdf::bindings::{camera, PI}
 #import sdf::brick::SceneSdfResult
 #import sdf::material::{material_at, sample_material_map, triplanar_normal}
 #import sdf::shadows::surface_shadow
-#import sdf::sky::{sky_color, sky_ambient}
+#import sdf::sky::sky_ambient
 
 fn distribution_ggx(n: vec3<f32>, h: vec3<f32>, rough: f32) -> f32 {
     let a = rough * rough;
@@ -84,10 +86,11 @@ fn shade_pbr(
     return (diffuse + specular) * light_color * ndl * shadow;
 }
 
-// Environment ambient (image-based-lighting approximation) from the analytic sky: a
-// diffuse hemisphere-irradiance term plus a specular reflection of the sky along the
-// view-reflected normal. This is what makes metals read as metal — a pure-metal surface
-// has no diffuse and was previously near-black; now it mirrors the sky tinted by its F0.
+// Environment ambient (image-based-lighting approximation): a diffuse hemisphere-
+// irradiance term plus a specular reflection along the view-reflected normal. The mirror
+// radiance comes IN as `env_radiance` — the caller passes the analytic sky (Stage 3) or a
+// secondary SDF-traced reflection of nearby geometry (Stage 4). This is what makes metals
+// read as metal — a pure-metal surface has no diffuse and would be near-black otherwise.
 fn ambient_ibl(
     albedo: vec3<f32>,
     n: vec3<f32>,
@@ -96,6 +99,7 @@ fn ambient_ibl(
     ao: f32,
     view_dir: vec3<f32>,
     sun: vec3<f32>,
+    env_radiance: vec3<f32>,
 ) -> vec3<f32> {
     let ndv = max(dot(n, view_dir), 0.0);
     let f0 = mix(vec3<f32>(0.04), albedo, metallic);
@@ -106,10 +110,9 @@ fn ambient_ibl(
     let irradiance = sky_ambient(n, sun);
     let diffuse = kd * albedo * irradiance;
 
-    // Specular: the sky seen along the reflected view ray. Rougher surfaces blur toward
-    // the diffuse irradiance (a cheap stand-in for a prefiltered mip chain).
-    let refl = reflect(-view_dir, n);
-    let env = mix(sky_color(refl, sun), irradiance, roughness);
+    // Specular: the mirror radiance along the reflected view ray. Rougher surfaces blur
+    // toward the diffuse irradiance (a cheap stand-in for a prefiltered mip chain).
+    let env = mix(env_radiance, irradiance, roughness);
     let specular = env * f;
 
     return (diffuse + specular) * ao;
@@ -157,15 +160,16 @@ fn gather_pbr(id: u32, wpos: vec3<f32>, geo_n: vec3<f32>, lod: f32) -> PbrInputs
     return PbrInputs(albedo_worn, nrm, metal, rough_worn, ao);
 }
 
-// Resolve the final lit surface colour, cross-fading the two nearest materials'
-// fully-resolved PBR inputs across the seam, then running Cook-Torrance once.
+// Resolve the cross-faded PBR inputs at a hit: the two nearest materials' fully-resolved
+// inputs lerped across the seam. Split out from shading so the entry shader can read the
+// surface (its reflected normal, metallic/roughness) to decide whether to trace a
+// reflection ray, then shade once with the resulting environment radiance.
 //
-// The seam lives where the two nearest materials are equidistant (gap == 0). The
-// cross-fade half-width is the larger of fwidth(gap) (≥1px, anti-aliased) and the
-// pair's blend_softness (world units, the artist control: soft materials feather
-// widely, hard ones stay crisp). Safe to call fwidth: `main` is uniform control
-// flow. Fully sampling both materials is gated to the seam band to save taps.
-fn shade_material(res: SceneSdfResult, wpos: vec3<f32>, geo_n: vec3<f32>, lod: f32) -> vec3<f32> {
+// The seam lives where the two nearest materials are equidistant (gap == 0). The cross-
+// fade half-width is the larger of fwidth(gap) (≥1px, anti-aliased) and the pair's
+// blend_softness (world units; the artist control). Safe to call fwidth: `main` is uniform
+// control flow. Fully sampling both materials is gated to the seam band to save taps.
+fn resolve_surface(res: SceneSdfResult, wpos: vec3<f32>, geo_n: vec3<f32>, lod: f32) -> PbrInputs {
     let mat_a = material_at(res.object_id);
     let mat_b = material_at(res.object_id_b);
     let soft = max(mat_a.blend_softness, mat_b.blend_softness);
@@ -182,16 +186,28 @@ fn shade_material(res: SceneSdfResult, wpos: vec3<f32>, geo_n: vec3<f32>, lod: f
         p.roughness = mix(pb.roughness, p.roughness, w);
         p.ao = mix(pb.ao, p.ao, w);
     }
+    return p;
+}
 
+// Shade a resolved surface to LINEAR radiance (the caller tonemaps once): Cook-Torrance
+// direct lighting + environment ambient. `env_radiance` is the mirror reflection colour —
+// the analytic sky (Stage 3) or a secondary SDF-traced reflection (Stage 4). `geo_n` is
+// the geometric normal (not the normal-mapped `p.normal`) so the shadow bias tracks the
+// real surface.
+fn shade_surface(
+    p: PbrInputs,
+    wpos: vec3<f32>,
+    geo_n: vec3<f32>,
+    res_lod: u32,
+    env_radiance: vec3<f32>,
+) -> vec3<f32> {
     let view_dir = normalize(camera.camera_pos.xyz - wpos);
     let light_dir = sun_dir();
     let light_color = sun_color();
 
-    // Soft shadow toward the sun (secondary SDF march). Geometric normal `geo_n` (not
-    // the normal-mapped `p.normal`) anchors the bias so it tracks the real surface.
     var shadow = 1.0;
 #ifdef SDF_SHADOWS
-    shadow = surface_shadow(wpos, geo_n, light_dir, res.lod, 256.0);
+    shadow = surface_shadow(wpos, geo_n, light_dir, res_lod, 256.0);
 #endif
 
     let direct = shade_pbr(
@@ -199,10 +215,21 @@ fn shade_material(res: SceneSdfResult, wpos: vec3<f32>, geo_n: vec3<f32>, lod: f
         view_dir, light_dir, light_color, shadow,
     );
     let ambient = ambient_ibl(
-        p.albedo, p.normal, p.metallic, p.roughness, p.ao, view_dir, light_dir,
+        p.albedo, p.normal, p.metallic, p.roughness, p.ao, view_dir, light_dir, env_radiance,
     );
-    let lit = direct + ambient;
-    // Tonemap (Reinhard) + approximate gamma so the linear PBR result displays well.
-    let mapped = lit / (lit + vec3<f32>(1.0));
-    return pow(mapped, vec3<f32>(1.0 / 2.2));
+    return direct + ambient;
+}
+
+// Convenience: resolve + shade with the analytic sky as the environment. Used for the
+// reflection ray's own hit (one bounce — no further reflection) and any caller that
+// doesn't trace reflections. Returns LINEAR radiance.
+fn shade_material_env(
+    res: SceneSdfResult,
+    wpos: vec3<f32>,
+    geo_n: vec3<f32>,
+    lod: f32,
+    env_radiance: vec3<f32>,
+) -> vec3<f32> {
+    let p = resolve_surface(res, wpos, geo_n, lod);
+    return shade_surface(p, wpos, geo_n, res.lod, env_radiance);
 }

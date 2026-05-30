@@ -422,13 +422,23 @@ fn register_shader_modes(app: &mut App) {
         kind: DebugModeKind::Toggle,
         description: "SDF soft shadows (secondary ray toward the sun)".into(),
     });
+    registry.register(ShaderDebugMode {
+        id: "sdf/reflections".into(),
+        label: "Reflections".into(),
+        shader_define: "SDF_REFLECTIONS".into(),
+        kind: DebugModeKind::Toggle,
+        description: "SDF-traced reflections on metallic/smooth surfaces (secondary ray)"
+            .into(),
+    });
 
     // Default the PBR feature toggles ON so the enhanced shading shows without hunting
     // for the checkbox. The state resource is separate from the registry; seed it after
     // the `registry` borrow above ends (NLL drops it at last use).
-    app.world_mut()
-        .resource_mut::<ShaderDebugState>()
-        .set("sdf/shadows", true);
+    {
+        let mut state = app.world_mut().resource_mut::<ShaderDebugState>();
+        state.set("sdf/shadows", true);
+        state.set("sdf/reflections", true);
+    }
 }
 
 // --- Atlas stats ---
