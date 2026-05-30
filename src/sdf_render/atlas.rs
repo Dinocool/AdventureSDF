@@ -7,6 +7,12 @@ use crate::sdf_render::edits::{
     PALETTE_K, Palette, ResolvedEdit, build_palette, fold_csg, material_distances,
 };
 
+/// Atlas tiles per texture row. The atlas texture is `ATLAS_TILES_PER_ROW × 64` px wide;
+/// its height grows in 8-px tile rows as `high_water().div_ceil(ATLAS_TILES_PER_ROW)`.
+/// Single source of truth for the layout — render.rs and the GPU-bake realloc mirror in
+/// `bake_scheduler.rs` both read it so the CPU and render world agree on tile→pixel.
+pub const ATLAS_TILES_PER_ROW: u32 = 256;
+
 /// Number of voxels stored per brick edge (8 samples spanning 7 cells + apron).
 pub const BRICK_EDGE: usize = 8;
 /// Total voxel samples in one brick.
@@ -150,6 +156,13 @@ pub struct SdfAtlas {
     /// True if the most recent bake was a `full_bake` (everything re-allocated). The
     /// render world treats this as "re-upload all tiles" and rebuilds the texture.
     pub last_bake_was_full: bool,
+    /// Tiles whose texels are produced by the GPU compute bake this frame (see
+    /// [`BakeBackend::Gpu`](super::BakeBackend)). The render world's partial-upload path
+    /// MUST skip these — the CPU holds only a palette-only placeholder for them (no
+    /// texel data), so a `write_texture` would stamp zeros over the GPU result. The GPU
+    /// bake node writes them directly into the atlas instead. Cleared each frame after
+    /// extract consumes it.
+    pub gpu_baked_tiles: HashSet<u32>,
 }
 
 impl Default for SdfAtlas {
@@ -163,6 +176,7 @@ impl Default for SdfAtlas {
             tiles: TileAllocator::default(),
             changed_tiles: HashSet::new(),
             last_bake_was_full: false,
+            gpu_baked_tiles: HashSet::new(),
         }
     }
 }
@@ -242,6 +256,23 @@ impl SdfAtlas {
     /// position at every LOD (no inter-LOD seam). The trade-off is that a feature thinner
     /// than a voxel can be missed at coarse LOD (its zero-crossing falls between samples);
     /// that sub-voxel detail loss is accepted as the cost of a clean, artifact-free field.
+    /// The 512 voxel-centre world positions of brick `key`, in the canonical
+    /// `z*64 + y*8 + x` order. Shared so the GPU-bake palette build (`bake_scheduler`)
+    /// samples the *exact* same points the CPU bake does — the palette must match
+    /// bit-for-bit or the two backends would key their material slots differently.
+    pub fn brick_voxel_positions(key: BrickKey, voxel_size: f32) -> [Vec3; BRICK_VOXELS] {
+        let mut positions = [Vec3::ZERO; BRICK_VOXELS];
+        for z in 0..BRICK_EDGE {
+            for y in 0..BRICK_EDGE {
+                for x in 0..BRICK_EDGE {
+                    positions[Self::voxel_index(x, y, z)] =
+                        Self::voxel_world_pos(key.coord, x, y, z, voxel_size);
+                }
+            }
+        }
+        positions
+    }
+
     fn bake_single_brick(
         key: BrickKey,
         config: &super::SdfGridConfig,
@@ -255,15 +286,7 @@ impl SdfAtlas {
         let dist_band = dist_band_world(config, key.lod);
 
         // All voxel world positions, reused for the palette build and the bake.
-        let mut positions = [Vec3::ZERO; BRICK_VOXELS];
-        for z in 0..BRICK_EDGE {
-            for y in 0..BRICK_EDGE {
-                for x in 0..BRICK_EDGE {
-                    positions[Self::voxel_index(x, y, z)] =
-                        Self::voxel_world_pos(key.coord, x, y, z, voxel_size);
-                }
-            }
-        }
+        let positions = Self::brick_voxel_positions(key, voxel_size);
 
         // The palette is the ≤K global ids nearest anywhere in this brick. Slot k
         // of `mat_dist` is keyed to `palette[k]` for every voxel (uniform per brick).
@@ -326,16 +349,31 @@ impl SdfAtlas {
         height: &super::height::HeightField,
         scratch: &mut Vec<u32>,
     ) -> Option<PackedBrick> {
+        Self::cull_edit_indices(key, bvh, config, scratch)?;
+        let culled: Vec<ResolvedEdit> = scratch.iter().map(|&i| edits[i as usize].clone()).collect();
+        Some(Self::bake_single_brick(key, config, &culled, height))
+    }
+
+    /// BVH-cull the edits overlapping brick `key` into `out` (sorted, preserving
+    /// `SdfOrder` since candidates index the already-sorted edit list). Returns `None`
+    /// for empty space (no edit reaches the brick — the brick should not exist); on
+    /// `Some(())`, `out` holds the candidate edit indices. This is the topology decision
+    /// the CPU keeps in GPU bake mode (the per-voxel eval moves to the compute shader).
+    pub fn cull_edit_indices(
+        key: BrickKey,
+        bvh: &Bvh,
+        config: &super::SdfGridConfig,
+        out: &mut Vec<u32>,
+    ) -> Option<()> {
         let brick_world = config.brick_world_size(key.lod);
         let brick_min = config.brick_min_world(key.coord, key.lod);
         let brick_aabb = Aabb3d::from_min_max(brick_min, brick_min + Vec3::splat(brick_world));
-        bvh.query_aabb(&brick_aabb, scratch);
-        if scratch.is_empty() {
+        bvh.query_aabb(&brick_aabb, out);
+        if out.is_empty() {
             return None;
         }
-        scratch.sort_unstable();
-        let culled: Vec<ResolvedEdit> = scratch.iter().map(|&i| edits[i as usize].clone()).collect();
-        Some(Self::bake_single_brick(key, config, &culled, height))
+        out.sort_unstable();
+        Some(())
     }
 
     /// Public, self-contained bake of one brick — the entry point the async bake tasks
@@ -375,6 +413,31 @@ impl SdfAtlas {
         if is_new || palette_changed {
             self.topology_generation = self.topology_generation.wrapping_add(1);
         }
+    }
+
+    /// GPU-bake variant of [`insert_brick`](Self::insert_brick): insert a *palette-only*
+    /// placeholder for a brick whose texels the compute bake will write directly into the
+    /// atlas. Allocates/keeps the stable tile and records it in `gpu_baked_tiles` (so the
+    /// CPU upload path skips it) and returns that tile so the caller can build the GPU job.
+    /// Bumps `generation` (re-extract) always; bumps `topology_generation` on a new key or
+    /// palette change, exactly like `insert_brick` — the chunk tables read only the palette
+    /// and tile, both of which are present here. The placeholder's `dist`/`mat_dist` are
+    /// never read (the GPU owns those texels), so they stay zero-filled.
+    pub fn insert_gpu_brick(&mut self, key: BrickKey, palette: Palette) -> u32 {
+        let tile = self.tiles.alloc(key);
+        self.gpu_baked_tiles.insert(tile);
+        self.generation = self.generation.wrapping_add(1);
+        let palette_changed = self.bricks.get(&key).is_some_and(|old| old.palette != palette);
+        let placeholder = PackedBrick {
+            dist: [0; BRICK_VOXELS],
+            mat_dist: [0; BRICK_VOXELS * PALETTE_K],
+            palette,
+        };
+        let is_new = self.bricks.insert(key, placeholder).is_none();
+        if is_new || palette_changed {
+            self.topology_generation = self.topology_generation.wrapping_add(1);
+        }
+        tile
     }
 
     /// Remove the brick at `key` (if present), freeing its tile. Returns whether a brick

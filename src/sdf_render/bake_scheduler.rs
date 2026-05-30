@@ -15,11 +15,11 @@ use std::sync::Arc;
 use bevy::prelude::*;
 use bevy::tasks::{AsyncComputeTaskPool, Task, block_on, poll_once};
 
-use super::atlas::{self, SdfAtlas};
+use super::atlas::{self, ATLAS_TILES_PER_ROW, SdfAtlas};
 use super::chunk;
 use super::{
-    SdfCamera, SdfGridConfig, SdfMaterial, SdfOp, SdfPrimitive, SdfVolume, VolumeQueryData, bvh,
-    edits, gather_sorted_edits,
+    BakeBackend, SdfCamera, SdfGridConfig, SdfMaterial, SdfOp, SdfPrimitive, SdfVolume,
+    VolumeQueryData, bvh, edits, gather_sorted_edits,
 };
 
 /// One-frame request to bake this frame's dirty chunks **synchronously** (on the main
@@ -34,6 +34,43 @@ use super::{
 /// frame after honoring it.
 #[derive(Resource, Default)]
 pub struct SyncBakeRequest(pub bool);
+
+/// One brick the GPU compute bake must fill this frame. The CPU has already done the
+/// topology work (BVH cull → `edit_indices` into the frame's flat edit list, palette,
+/// tile allocation); the compute shader runs the 512-voxel `fold_csg` eval and writes the
+/// brick's texels straight into the atlas tile at `tile`. `lod`/`coord` give the shader
+/// each voxel's world position; `dist_band` is the per-LOD snorm clamp band so the shader
+/// needs no `SdfGridConfig`.
+#[derive(Clone)]
+pub struct GpuBakeJob {
+    pub tile: u32,
+    pub lod: u32,
+    pub coord: IVec3,
+    pub voxel_size: f32,
+    pub dist_band: f32,
+    pub palette: edits::Palette,
+    /// Range into [`PendingGpuBakes::edits`] of this brick's culled candidate edits.
+    pub edit_start: u32,
+    pub edit_count: u32,
+}
+
+/// Main-world hand-off for the GPU brick bake: this frame's jobs plus the flat edit list
+/// they index. Filled by `schedule_bakes`/`apply_bakes` in [`BakeBackend::Gpu`] mode and
+/// drained by the render-world extract. `atlas_rows` is how many tile rows the atlas spans
+/// this frame so the render world can size the destination/scratch consistently.
+#[derive(Resource, Default)]
+pub struct PendingGpuBakes {
+    pub jobs: Vec<GpuBakeJob>,
+    pub edits: Vec<edits::GpuEdit>,
+    pub atlas_rows: u32,
+}
+
+impl PendingGpuBakes {
+    fn clear(&mut self) {
+        self.jobs.clear();
+        self.edits.clear();
+    }
+}
 
 /// Last frame's per-edit world AABB, keyed by entity. Lets the scheduler dirty an edit's
 /// *former* footprint (not just where it moved to) so vacated chunks get rebuilt/removed.
@@ -89,6 +126,12 @@ pub struct BakeScheduler {
     pending: std::collections::HashSet<chunk::ChunkKey>,
     /// Tasks currently baking.
     inflight: Vec<BakeJob>,
+    /// (GPU bake mode) How many atlas tile rows the render world has committed to the GPU
+    /// atlas texture. When `high_water` pushes `required_rows` past this, the render world
+    /// reallocs (recreates + zero-fills) the texture, dropping every GPU-written tile — so
+    /// on that frame we must re-emit the WHOLE resident set as bake jobs, not just the
+    /// dirty shell. Mirrors `AtlasCapacity::rows` in render.rs from the main world.
+    gpu_atlas_rows: u32,
 }
 
 impl Default for BakeScheduler {
@@ -101,6 +144,7 @@ impl Default for BakeScheduler {
             ring_chunk_origin: Vec::new(),
             pending: std::collections::HashSet::new(),
             inflight: Vec::new(),
+            gpu_atlas_rows: 0,
         }
     }
 }
@@ -300,11 +344,18 @@ pub fn schedule_bakes(
     mut sched: ResMut<BakeScheduler>,
     mut prev_aabbs: ResMut<PrevEditAabbs>,
     mut sync_request: ResMut<SyncBakeRequest>,
+    mut gpu_bakes: ResMut<PendingGpuBakes>,
+    backend: Res<BakeBackend>,
     config: Res<SdfGridConfig>,
     volumes: Query<VolumeQueryData, With<SdfVolume>>,
     changed: Query<Entity, (With<SdfVolume>, ChangedEdit)>,
     camera: Query<&Transform, (With<SdfCamera>, Without<SdfVolume>)>,
 ) {
+    // GPU bake jobs are rebuilt from scratch each frame; the render world consumed last
+    // frame's. `gpu_baked_tiles` likewise holds only THIS frame's GPU-written tiles.
+    gpu_bakes.clear();
+    atlas.gpu_baked_tiles.clear();
+    let gpu_mode = *backend == BakeBackend::Gpu;
     // Consume the one-frame "bake now, synchronously" request (see SyncBakeRequest).
     let bake_sync = std::mem::take(&mut sync_request.0);
     let camera_pos = camera.iter().next().map(|t| t.translation).unwrap_or(Vec3::ZERO);
@@ -402,7 +453,17 @@ pub fn schedule_bakes(
         sched.ring_chunk_origin[li] = new_origin;
     }
 
-    // --- 3. Bake the dirty chunks (sync inline, or async tasks) -----------------------
+    // --- 3. Bake the dirty chunks (GPU compute, sync inline, or async tasks) ----------
+    //
+    // GPU mode: the CPU does only topology (BVH cull + palette + tile alloc) and emits a
+    // GpuBakeJob per brick; the compute shader fills the texels. A realloc on the render
+    // side (the atlas grew taller) zero-fills the texture and drops every GPU-written tile,
+    // so on a grow frame we re-emit the WHOLE resident set, not just this frame's shell.
+    if gpu_mode {
+        emit_gpu_bakes(&mut atlas, &mut sched, &mut gpu_bakes, &config, camera_pos);
+        return;
+    }
+
     if sched.pending.is_empty() {
         return;
     }
@@ -457,6 +518,103 @@ pub fn schedule_bakes(
         });
         sched.inflight.push(BakeJob { epoch, task });
     }
+}
+
+/// (GPU bake mode) Turn this frame's dirty chunks into [`GpuBakeJob`]s: the CPU does only
+/// the topology work (BVH cull → which bricks exist + their palette + a stable tile), and
+/// the compute shader fills each brick's 512 texels straight into the atlas. No main-thread
+/// voxel loop — that's the whole point.
+///
+/// Two-pass so a leading-edge brick that grows the atlas is handled correctly: pass 1 culls
+/// and allocates tiles for the dirty shell (growing the tile high-water), then we learn
+/// whether the render world will realloc (recreate + zero-fill) the atlas this frame. On a
+/// realloc every previously-GPU-written tile is about to be wiped, so pass 2 emits jobs for
+/// the WHOLE resident set; otherwise just the dirty shell.
+fn emit_gpu_bakes(
+    atlas: &mut SdfAtlas,
+    sched: &mut BakeScheduler,
+    gpu_bakes: &mut PendingGpuBakes,
+    config: &SdfGridConfig,
+    camera_pos: Vec3,
+) {
+    let edits_snapshot = Arc::clone(&sched.edits);
+    let bvh_snapshot = Arc::clone(&sched.bvh);
+    let mut scratch: Vec<u32> = Vec::new();
+
+    // Pass 1: cull + allocate the dirty shell (or drop empty bricks). Collect the live keys
+    // so pass 2 can build their jobs once the realloc decision is known.
+    let drained = drain_budget(&mut sched.pending, camera_pos, config, SCHEDULE_BUDGET_CHUNKS);
+    let mut dirty_live: Vec<atlas::BrickKey> = Vec::new();
+    for ck in &drained {
+        for key in chunk_brick_keys(*ck, config) {
+            if atlas::SdfAtlas::cull_edit_indices(key, &bvh_snapshot, config, &mut scratch).is_some()
+            {
+                let voxel_size = config.voxel_size_at(key.lod);
+                let positions = atlas::SdfAtlas::brick_voxel_positions(key, voxel_size);
+                let culled: Vec<edits::ResolvedEdit> =
+                    scratch.iter().map(|&i| edits_snapshot[i as usize].clone()).collect();
+                let palette = edits::build_palette(&culled, &positions);
+                atlas.insert_gpu_brick(key, palette);
+                dirty_live.push(key);
+            } else {
+                atlas.remove_brick(&key);
+            }
+        }
+    }
+
+    // Will the render world recreate the atlas texture this frame? It reallocs on a full
+    // bake or when the tile high-water needs more rows than it has committed. On a realloc
+    // the texture is zero-filled, dropping every GPU-written tile — so we must re-emit all.
+    let required_rows = atlas.tiles.high_water().div_ceil(ATLAS_TILES_PER_ROW).max(1);
+    let realloc = atlas.last_bake_was_full || required_rows > sched.gpu_atlas_rows;
+
+    // Pass 2: build the jobs. On a realloc, every resident brick; otherwise the dirty shell.
+    let bake_keys: Vec<atlas::BrickKey> = if realloc {
+        atlas.bricks.keys().copied().collect()
+    } else {
+        dirty_live
+    };
+
+    for key in bake_keys {
+        // The tile was allocated in pass 1 (dirty shell) or on a prior frame (already
+        // resident); either way it exists. Re-cull for the shader's edit list + palette.
+        let Some(tile) = atlas.tiles.tile(&key) else { continue };
+        if atlas::SdfAtlas::cull_edit_indices(key, &bvh_snapshot, config, &mut scratch).is_none() {
+            continue;
+        }
+        let voxel_size = config.voxel_size_at(key.lod);
+        let dist_band = atlas::dist_band_world(config, key.lod);
+        let positions = atlas::SdfAtlas::brick_voxel_positions(key, voxel_size);
+        let culled: Vec<edits::ResolvedEdit> =
+            scratch.iter().map(|&i| edits_snapshot[i as usize].clone()).collect();
+        let palette = edits::build_palette(&culled, &positions);
+
+        let edit_start = gpu_bakes.edits.len() as u32;
+        for e in &culled {
+            gpu_bakes.edits.push(edits::to_gpu_edit(e));
+        }
+        gpu_bakes.jobs.push(GpuBakeJob {
+            tile,
+            lod: key.lod,
+            coord: key.coord,
+            voxel_size,
+            dist_band,
+            palette,
+            edit_start,
+            edit_count: culled.len() as u32,
+        });
+        atlas.gpu_baked_tiles.insert(tile);
+    }
+
+    if realloc {
+        // Tell the render world to recreate the texture (then our bake node fills it), and
+        // remember the committed height so we don't re-emit the full set every frame.
+        atlas.last_bake_was_full = true;
+        sched.gpu_atlas_rows = required_rows;
+    } else {
+        atlas.last_bake_was_full = false;
+    }
+    gpu_bakes.atlas_rows = required_rows;
 }
 
 /// Main-thread, non-blocking drain of finished bake tasks. Inserts baked bricks (per-brick

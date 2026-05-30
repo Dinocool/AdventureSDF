@@ -154,6 +154,15 @@ fn sdf_cone_prepass_wgsl_validates() {
 }
 
 #[test]
+fn sdf_brick_bake_wgsl_validates() {
+    // The brick-bake compute shader is fully self-contained (no sdf::* imports), so it
+    // composes against an empty composer. Validates the ported eval_primitive/fold_csg/
+    // material slots + the packed storage-buffer writes.
+    let path = Path::new("assets/shaders/sdf_brick_bake.wgsl");
+    validate_entry(path).unwrap_or_else(|e| panic!("{e}"));
+}
+
+#[test]
 fn sdf_debug_modes_validate() {
     for def in [
         "SDF_DEBUG_STEP_COUNT",
