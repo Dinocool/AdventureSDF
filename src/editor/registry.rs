@@ -101,7 +101,20 @@ fn snapshot_modes(registry: &ShaderDebugRegistry) -> GroupedModes {
     GroupedModes { exclusive, toggles }
 }
 
+/// Prettify an exclusive-group id for display: strip a leading `sdf_` and
+/// capitalise (`sdf_overlay` -> `Overlay`).
+fn pretty_group(name: &str) -> String {
+    let n = name.strip_prefix("sdf_").unwrap_or(name);
+    let mut chars = n.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+        None => String::new(),
+    }
+}
+
 pub fn debug_modes_ui(world: &mut World, ui: &mut bevy_egui::egui::Ui) {
+    use bevy_egui::egui;
+
     let config = world.resource::<EditorConfig>();
     if !config.enabled {
         return;
@@ -113,52 +126,72 @@ pub fn debug_modes_ui(world: &mut World, ui: &mut bevy_egui::egui::Ui) {
         snapshot_modes(registry)
     };
 
-    // Render exclusive groups
+    // Each exclusive group is a single-select dropdown: "Off" plus one entry per mode.
     for (group_name, modes) in &grouped.exclusive {
-        ui.heading(group_name);
+        let active = {
+            let state = world.resource::<ShaderDebugState>();
+            modes.iter().find(|m| state.is_active(&m.id)).cloned()
+        };
+        let selected_text = active
+            .as_ref()
+            .map(|m| m.label.clone())
+            .unwrap_or_else(|| "Off".to_string());
+
+        // `Some(None)` = pick Off; `Some(Some(id))` = activate that mode.
+        let mut pick: Option<Option<String>> = None;
         ui.horizontal(|ui| {
-            for mode in modes {
-                let active = world.resource::<ShaderDebugState>().is_active(&mode.id);
-                if ui.selectable_label(active, &mode.label).clicked() {
-                    let mut state = world.resource_mut::<ShaderDebugState>();
-                    for m in modes {
-                        state.set(&m.id, false);
+            ui.label(pretty_group(group_name));
+            egui::ComboBox::from_id_salt(group_name)
+                .selected_text(selected_text)
+                .show_ui(ui, |ui| {
+                    if ui.selectable_label(active.is_none(), "Off").clicked() {
+                        pick = Some(None);
                     }
-                    state.set(&mode.id, true);
-                }
-            }
-
-            let any_active = {
-                let state = world.resource::<ShaderDebugState>();
-                modes.iter().any(|m| state.is_active(&m.id))
-            };
-            if any_active && ui.selectable_label(false, "Off").clicked() {
-                let mut state = world.resource_mut::<ShaderDebugState>();
-                for m in modes {
-                    state.set(&m.id, false);
-                }
-            }
+                    for mode in modes {
+                        let is_on = active.as_ref().is_some_and(|a| a.id == mode.id);
+                        if ui
+                            .selectable_label(is_on, &mode.label)
+                            .on_hover_text(&mode.description)
+                            .clicked()
+                        {
+                            pick = Some(Some(mode.id.clone()));
+                        }
+                    }
+                });
         });
-
-        let state = world.resource::<ShaderDebugState>();
-        if let Some(active) = modes.iter().find(|m| state.is_active(&m.id)) {
+        if let Some(choice) = pick {
+            let mut state = world.resource_mut::<ShaderDebugState>();
+            for m in modes {
+                state.set(&m.id, false);
+            }
+            if let Some(id) = choice {
+                state.set(&id, true);
+            }
+        }
+        if let Some(active) = &active {
             ui.label(&active.description);
-        } else {
-            ui.label("No overlay");
         }
     }
 
+    // Diagnostic toggles: independent checkboxes, tucked away (default-collapsed) so
+    // they don't crowd the common overlay/raymarch controls.
     if !grouped.toggles.is_empty() {
-        ui.separator();
-        ui.heading("Toggles");
-        for mode in &grouped.toggles {
-            let active = world.resource::<ShaderDebugState>().is_active(&mode.id);
-            let mut toggled = active;
-            if ui.checkbox(&mut toggled, &mode.label).changed() {
-                world
-                    .resource_mut::<ShaderDebugState>()
-                    .set(&mode.id, toggled);
-            }
-        }
+        egui::CollapsingHeader::new("Diagnostics")
+            .default_open(false)
+            .show(ui, |ui| {
+                for mode in &grouped.toggles {
+                    let active = world.resource::<ShaderDebugState>().is_active(&mode.id);
+                    let mut toggled = active;
+                    if ui
+                        .checkbox(&mut toggled, &mode.label)
+                        .on_hover_text(&mode.description)
+                        .changed()
+                    {
+                        world
+                            .resource_mut::<ShaderDebugState>()
+                            .set(&mode.id, toggled);
+                    }
+                }
+            });
     }
 }
