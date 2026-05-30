@@ -175,7 +175,7 @@ impl Default for SdfRaymarchParams {
             cone_scale: 1.0,
             cubic_band: 0.5,
             over_relax: 1.0,
-            lod_blend_band: 0.02,
+            lod_blend_band: 0.2,
         }
     }
 }
