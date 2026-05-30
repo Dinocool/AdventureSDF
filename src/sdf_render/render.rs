@@ -462,7 +462,7 @@ impl Plugin for SdfRenderPlugin {
                     // brick set. Reading the count before the bake desyncs them while
                     // dragging (count too high → past-end reads = phantom geometry;
                     // too low → missed bricks = gaps).
-                    .after(super::apply_bakes),
+                    .after(super::bake_scheduler::apply_bakes),
             );
 
         #[cfg(feature = "editor")]
