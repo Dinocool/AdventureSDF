@@ -9,7 +9,7 @@ use bevy::render::render_graph::{
     NodeRunError, RenderGraphContext, RenderGraphExt, RenderLabel, ViewNode, ViewNodeRunner,
 };
 use bevy::render::render_resource::binding_types::{
-    sampler, storage_buffer_read_only, texture_2d, texture_2d_array, uniform_buffer,
+    sampler, storage_buffer_read_only, texture_2d, texture_2d_array, texture_3d, uniform_buffer,
 };
 use bevy::render::render_resource::*;
 use bevy::render::renderer::{RenderContext, RenderDevice, RenderQueue};
@@ -68,6 +68,32 @@ struct SdfCameraData {
     march_params: Vec4,
     /// x = lod_count, y = ring_bricks, z = base voxel_size, w = cell_stride.
     lod_params: Vec4,
+}
+
+/// Number of 3D distance-clipmap volume levels. MUST match `VOLUME_LEVELS` in
+/// bindings.wgsl and `VolumeConfig::levels` cap on the CPU.
+const VOLUME_LEVELS: usize = 4;
+
+/// GPU mirror of `SdfVolumeUniform` (bindings.wgsl): per-level placement + decode for the
+/// 3D distance clipmap. Bound at group 0 binding 1. Driven from `VolumeClipmap` each frame.
+#[derive(Resource, Clone, Copy, ShaderType)]
+struct SdfVolumeData {
+    /// Per level: xyz = world-space min corner, w = level voxel_size.
+    levels: [Vec4; VOLUME_LEVELS],
+    /// Per level: x = decode scale (K · voxel_size); world_dist = sample · x. yzw unused.
+    decode: [Vec4; VOLUME_LEVELS],
+    /// x = active level count, y = resolution (voxels/axis). zw unused.
+    volume_dims: Vec4,
+}
+
+impl Default for SdfVolumeData {
+    fn default() -> Self {
+        Self {
+            levels: [Vec4::ZERO; VOLUME_LEVELS],
+            decode: [Vec4::ZERO; VOLUME_LEVELS],
+            volume_dims: Vec4::ZERO, // level_count = 0 ⇒ shader treats volume as absent
+        }
+    }
 }
 
 /// GPU mirror of a [`super::edits::MaterialDef`], one per global material id, in a
@@ -165,6 +191,14 @@ struct SdfGpuAtlas {
     tex_array_views: Option<[TextureView; super::edits::MATERIAL_TEX_MAPS]>,
     /// Filtering+mip sampler for the PBR arrays (distinct from the nearest atlas one).
     tex_sampler: Option<Sampler>,
+    /// 3D distance-clipmap volume (Stage 2): one persistent texture + view per level
+    /// (binding 12..15), a linear ClampToEdge sampler (binding 16), and the uniform
+    /// buffer of per-level placement/decode (group 0 binding 1). A 1×1×1 dummy per level
+    /// keeps the bind group valid before the first volume bake.
+    volume_textures: Option<[Texture; VOLUME_LEVELS]>,
+    volume_views: Option<[TextureView; VOLUME_LEVELS]>,
+    volume_sampler: Option<Sampler>,
+    volume_uniform: Option<Buffer>,
 }
 
 /// One variant's encoded BC7 maps + its destination array layer, produced by a
@@ -231,16 +265,25 @@ pub struct SdfShaderDefs {
 struct SdfLabel;
 
 fn create_dummy_bg0(device: &RenderDevice, layout: &BindGroupLayout) -> BindGroup {
-    let buf = device.create_buffer(&BufferDescriptor {
-        label: Some("sdf_dummy_uniform"),
+    let camera_buf = device.create_buffer(&BufferDescriptor {
+        label: Some("sdf_dummy_camera_uniform"),
         size: 512,
+        usage: BufferUsages::UNIFORM,
+        mapped_at_creation: false,
+    });
+    let volume_buf = device.create_buffer(&BufferDescriptor {
+        label: Some("sdf_dummy_volume_uniform"),
+        size: SdfVolumeData::min_size().get(),
         usage: BufferUsages::UNIFORM,
         mapped_at_creation: false,
     });
     device.create_bind_group(
         "sdf_bind_group_0_empty",
         layout,
-        &BindGroupEntries::sequential((buf.as_entire_buffer_binding(),)),
+        &BindGroupEntries::sequential((
+            camera_buf.as_entire_buffer_binding(),
+            volume_buf.as_entire_buffer_binding(),
+        )),
     )
 }
 
@@ -301,6 +344,11 @@ impl ViewNode for SdfNode {
                 warn!("SDF: no camera uniform — using dummy data");
             }
         }
+        let volume_uniform = world
+            .resource::<SdfGpuAtlas>()
+            .volume_uniform
+            .as_ref()
+            .unwrap();
         let bind_group_0 = if let Some(camera_uniforms) =
             world.get_resource::<ComponentUniforms<SdfCameraData>>()
         {
@@ -308,7 +356,10 @@ impl ViewNode for SdfNode {
                 device.create_bind_group(
                     "sdf_bind_group_0",
                     &layout_0,
-                    &BindGroupEntries::sequential((binding.clone(),)),
+                    &BindGroupEntries::sequential((
+                        binding.clone(),
+                        volume_uniform.as_entire_buffer_binding(),
+                    )),
                 )
             } else {
                 create_dummy_bg0(device, &layout_0)
@@ -348,6 +399,13 @@ impl ViewNode for SdfNode {
                     .as_ref()
                     .unwrap()
                     .as_entire_buffer_binding(),
+                // bindings 12..15: 3D distance-clipmap volume textures (one per level)
+                &gpu_atlas.volume_views.as_ref().unwrap()[0],
+                &gpu_atlas.volume_views.as_ref().unwrap()[1],
+                &gpu_atlas.volume_views.as_ref().unwrap()[2],
+                &gpu_atlas.volume_views.as_ref().unwrap()[3],
+                // binding 16: volume sampler (linear, ClampToEdge)
+                gpu_atlas.volume_sampler.as_ref().unwrap(),
             )),
         );
 
@@ -1281,7 +1339,12 @@ fn init_sdf_pipeline(
         "sdf_bind_group_0",
         &BindGroupLayoutEntries::sequential(
             ShaderStages::FRAGMENT,
-            (uniform_buffer::<SdfCameraData>(true),),
+            (
+                // binding 0: per-view camera uniform (dynamic offset)
+                uniform_buffer::<SdfCameraData>(true),
+                // binding 1: global 3D distance-clipmap params (no dynamic offset)
+                uniform_buffer::<SdfVolumeData>(false),
+            ),
         ),
     );
     let layout_1 = BindGroupLayoutDescriptor::new(
@@ -1309,6 +1372,13 @@ fn init_sdf_pipeline(
                 texture_2d_array(TextureSampleType::Float { filterable: true }),
                 // binding 11: packed per-chunk brick tile runs
                 storage_buffer_read_only::<GpuBrickTile>(false),
+                // bindings 12..15: 3D distance-clipmap volume textures (filterable)
+                texture_3d(TextureSampleType::Float { filterable: true }),
+                texture_3d(TextureSampleType::Float { filterable: true }),
+                texture_3d(TextureSampleType::Float { filterable: true }),
+                texture_3d(TextureSampleType::Float { filterable: true }),
+                // binding 16: volume sampler (linear, ClampToEdge)
+                sampler(SamplerBindingType::Filtering),
             ),
         ),
     );
@@ -1447,6 +1517,54 @@ fn init_sdf_pipeline(
         ..default()
     });
 
+    // Dummy 1×1×1 R16Snorm 3D volume textures (one per clipmap level) + a linear
+    // ClampToEdge sampler, so bindings 12..16 are valid before the first volume bake.
+    let dummy_volume_textures: [Texture; VOLUME_LEVELS] = std::array::from_fn(|_| {
+        device.create_texture_with_data(
+            &queue,
+            &TextureDescriptor {
+                label: Some("sdf_dummy_volume"),
+                size: Extent3d {
+                    width: 1,
+                    height: 1,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: TextureDimension::D3,
+                format: TextureFormat::R16Snorm,
+                usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST,
+                view_formats: &[],
+            },
+            TextureDataOrder::default(),
+            &[0u8, 0u8],
+        )
+    });
+    let dummy_volume_views: [TextureView; VOLUME_LEVELS] = std::array::from_fn(|i| {
+        dummy_volume_textures[i].create_view(&TextureViewDescriptor {
+            dimension: Some(TextureViewDimension::D3),
+            ..default()
+        })
+    });
+    let dummy_volume_sampler = device.create_sampler(&SamplerDescriptor {
+        label: Some("sdf_volume_sampler"),
+        address_mode_u: AddressMode::ClampToEdge,
+        address_mode_v: AddressMode::ClampToEdge,
+        address_mode_w: AddressMode::ClampToEdge,
+        mag_filter: FilterMode::Linear,
+        min_filter: FilterMode::Linear,
+        mipmap_filter: FilterMode::Nearest,
+        ..default()
+    });
+    // Volume uniform buffer (group 0 binding 1) — sized to SdfVolumeData, zero-filled
+    // (level_count = 0 ⇒ shader treats the volume as absent until the first prepare).
+    let volume_uniform = device.create_buffer(&BufferDescriptor {
+        label: Some("sdf_volume_uniform"),
+        size: SdfVolumeData::min_size().get(),
+        usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+
     commands.insert_resource(SdfPipeline {
         pipeline_id,
         layout_0,
@@ -1464,5 +1582,9 @@ fn init_sdf_pipeline(
         material_buffer: Some(dummy_material),
         tex_array_views: Some(dummy_tex_views),
         tex_sampler: Some(dummy_tex_sampler),
+        volume_textures: Some(dummy_volume_textures),
+        volume_views: Some(dummy_volume_views),
+        volume_sampler: Some(dummy_volume_sampler),
+        volume_uniform: Some(volume_uniform),
     });
 }
