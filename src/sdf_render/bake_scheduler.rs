@@ -361,3 +361,128 @@ pub fn apply_bakes(
         atlas.bump_generation();
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bevy::math::bounding::Aabb3d;
+
+    fn config() -> SdfGridConfig {
+        SdfGridConfig::default()
+    }
+
+    /// `ring_bricks / CHUNK_BRICKS` chunks per axis. With the defaults (12 / 4) that is 3.
+    #[test]
+    fn ring_window_is_chunks_per_axis() {
+        let cfg = config();
+        let r = ring_chunks_per_axis(&cfg);
+        assert_eq!(r, (cfg.ring_bricks / chunk::CHUNK_BRICKS as u32) as i32);
+        assert!(r >= 1, "ring must be at least one chunk wide");
+    }
+
+    /// The ring is centred on the camera: the camera's own chunk sits at the window's
+    /// middle (`origin + half`), so re-deriving the camera chunk from the world position
+    /// lands inside the window.
+    #[test]
+    fn ring_origin_centres_camera_chunk() {
+        let cfg = config();
+        let r = ring_chunks_per_axis(&cfg);
+        let half = r / 2;
+        for lod in 0..cfg.lod_count {
+            // A few world positions, including off-origin and negative.
+            for cam in [
+                Vec3::ZERO,
+                Vec3::new(37.0, -12.0, 250.0),
+                Vec3::new(-400.0, 8.0, -130.0),
+            ] {
+                let origin = ring_chunk_origin(&cfg, cam, lod);
+                // Camera's chunk = origin + half on each axis.
+                let cam_chunk = origin + IVec3::splat(half);
+                assert!(
+                    chunk_in_window(cam_chunk, origin, r),
+                    "camera chunk must be inside its own ring (lod={lod}, cam={cam:?})"
+                );
+            }
+        }
+    }
+
+    /// `chunk_in_window` is a half-open `[origin, origin+r)` box on every axis.
+    #[test]
+    fn chunk_in_window_boundaries() {
+        let origin = IVec3::new(5, -2, 0);
+        let r = 3;
+        assert!(chunk_in_window(origin, origin, r), "corner is inside");
+        assert!(chunk_in_window(origin + IVec3::splat(r - 1), origin, r), "far corner inside");
+        assert!(!chunk_in_window(origin + IVec3::splat(r), origin, r), "one past is outside");
+        assert!(!chunk_in_window(origin - IVec3::X, origin, r), "one before is outside");
+    }
+
+    /// `chunk_window_keys` yields exactly `r³` distinct keys, all inside the window and
+    /// all at the requested LOD.
+    #[test]
+    fn chunk_window_keys_cover_the_box() {
+        use std::collections::HashSet;
+        let origin = IVec3::new(-1, 4, 2);
+        let r = 3;
+        let lod = 2u32;
+        let keys: Vec<_> = chunk_window_keys(origin, r, lod).collect();
+        assert_eq!(keys.len(), (r * r * r) as usize, "must enumerate r^3 chunks");
+        let set: HashSet<_> = keys.iter().map(|k| k.coord).collect();
+        assert_eq!(set.len(), keys.len(), "no duplicate chunk coords");
+        for k in &keys {
+            assert_eq!(k.lod, lod);
+            assert!(chunk_in_window(k.coord, origin, r));
+        }
+    }
+
+    /// Each brick key a chunk emits maps back to that exact chunk + a unique local slot
+    /// 0..CHUNK_VOLUME — the round-trip the GPU resolve relies on.
+    #[test]
+    fn chunk_brick_keys_roundtrip_through_chunk_of() {
+        use std::collections::HashSet;
+        let cfg = config();
+        let ck = chunk::ChunkKey::new(1, IVec3::new(-2, 0, 3));
+        let bricks = chunk_brick_keys(ck, &cfg);
+        assert_eq!(bricks.len(), chunk::CHUNK_VOLUME as usize);
+        let mut locals = HashSet::new();
+        for bk in &bricks {
+            let (back, local) = chunk::chunk_of(*bk, &cfg);
+            assert_eq!(back, ck, "brick must belong to the chunk that emitted it");
+            assert!(local < chunk::CHUNK_VOLUME, "local slot in range");
+            assert!(locals.insert(local), "each brick occupies a distinct local slot");
+        }
+        assert_eq!(locals.len(), chunk::CHUNK_VOLUME as usize, "all 64 slots covered");
+    }
+
+    /// A small edit AABB at the origin dirties the chunk(s) it overlaps at LOD 0, and the
+    /// chunk containing the origin is always among them (footprint pad ⇒ never misses).
+    #[test]
+    fn chunks_in_aabb_covers_origin_chunk() {
+        let cfg = config();
+        let aabb = Aabb3d::new(Vec3::ZERO, Vec3::splat(0.3));
+        let chunks = chunks_in_aabb(&cfg, &aabb, 0);
+        assert!(!chunks.is_empty(), "an edit must dirty at least one chunk");
+        let origin_chunk = chunk::chunk_of(atlas::BrickKey::new(0, IVec3::ZERO), &cfg).0;
+        assert!(
+            chunks.contains(&origin_chunk),
+            "the origin's chunk must be in the dirtied set"
+        );
+        // All returned chunks are at the requested LOD.
+        assert!(chunks.iter().all(|c| c.lod == 0));
+    }
+
+    /// A one-chunk camera shift exposes only a thin shell: the entered chunks are a face
+    /// of the window (`r²`), never the whole `r³` volume. This is what keeps incremental
+    /// recenter cheap (vs re-baking the full ring).
+    #[test]
+    fn one_chunk_shift_exposes_only_a_shell() {
+        let r = 3;
+        let old_origin = IVec3::ZERO;
+        let new_origin = IVec3::new(1, 0, 0); // shift +1 chunk on X
+        let entered = chunk_window_keys(new_origin, r, 0)
+            .filter(|k| !chunk_in_window(k.coord, old_origin, r))
+            .count();
+        assert_eq!(entered, (r * r) as usize, "a 1-chunk shift enters exactly one r^2 face");
+        assert!(entered < (r * r * r) as usize, "shell is far smaller than the volume");
+    }
+}
