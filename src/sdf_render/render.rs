@@ -595,15 +595,13 @@ fn prepare_sdf_camera_data(
                 raymarch.sdf_eps,
                 bvh.nodes.len() as f32,
             ),
-            // Same footprint `bricks_in_aabb` bakes with: tight AABB grown by
-            // SNORM_CLAMP_DIST, then one brick of grid-snap pad. The BVH skip inflates
-            // every box by this so it never overshoots a baked shell brick.
-            bake_reach: Vec4::new(
-                SNORM_CLAMP_DIST + config.voxel_size * config.cell_stride() as f32,
-                0.0,
-                0.0,
-                0.0,
-            ),
+            // The LOD-independent part of a baked brick's reach beyond a tight edit AABB
+            // (`bricks_in_aabb_lod` grows the AABB by SNORM_CLAMP_DIST before snapping to
+            // the lattice). The BVH skip adds the LOD-scaled brick-margin per node in the
+            // shader (`brick_world_at(lod)`), since a LOD-L brick reaches 2^L further —
+            // a single LOD-0 value here under-inflates coarse rings and the skip jumps
+            // over their shells (escaped rays / graininess at LOD 2+).
+            bake_reach: Vec4::new(SNORM_CLAMP_DIST, 0.0, 0.0, 0.0),
             lod_params: Vec4::new(
                 config.lod_count as f32,
                 config.ring_bricks as f32,
