@@ -32,6 +32,14 @@
 #import sdf::cubic::{build_cell_cubic, solve_cell_cubic, dist_to_cell_exit}
 #import sdf::pbr::shade_material
 
+// Cone-prepass seed texture: per-8×8-tile start distance (R32Float), written by
+// sdf_cone_prepass.wgsl. The march starts each pixel at its tile's seed-t instead of 0,
+// amortising the empty-corridor march across the tile. The seed is a guaranteed lower
+// bound on every pixel's hit distance (the cone stops before any surface enters the tile),
+// so starting from it never skips geometry. Group 2 — groups 0/1 are camera + atlas.
+@group(2) @binding(0) var cone_seed: texture_2d<f32>;
+const CONE_TILE: i32 = 8;
+
 // --- Raymarching ---
 
 struct RaymarchResult {
@@ -68,8 +76,8 @@ struct RaymarchResult {
 // The stored field is the true trilinear SDF sampled at voxel centres (atlas.rs); empty-space
 // DDA steps by brick geometry (always safe) and the in-brick sphere-trace is bounded by the
 // brick exit, so the march is robust. There is no GPU BVH in this path.
-fn raymarch(origin: vec3<f32>, dir: vec3<f32>) -> RaymarchResult {
-    var t = 0.0;
+fn raymarch(origin: vec3<f32>, dir: vec3<f32>, start_t: f32) -> RaymarchResult {
+    var t = start_t;
     var steps = 0u;
     var result = RaymarchResult(false, 0.0, 0u, 0u, vec3<f32>(0.0), 2u, 0u, 0u, 0.0);
 
@@ -321,7 +329,12 @@ fn main(in: FullscreenVertexOutput) -> FragmentOutput {
         uv.y,
     );
 
-    let rm = raymarch(ray_origin, ray_dir);
+    // Seed the march from the cone prepass: the per-tile start distance for this pixel's
+    // 8×8 tile (a guaranteed lower bound on its hit distance, so no geometry is skipped).
+    let tile = vec2<i32>(uv * camera.screen_params.xy) / CONE_TILE;
+    let start_t = textureLoad(cone_seed, tile, 0).r;
+
+    let rm = raymarch(ray_origin, ray_dir, start_t);
 
     // --- Cost / fate debug modes -------------------------------------------------
     // These are placed BEFORE the miss early-return so they paint EVERY pixel — hit
