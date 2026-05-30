@@ -4,15 +4,11 @@ use bevy::prelude::*;
 #[reflect(Resource)]
 pub struct EditorConfig {
     pub enabled: bool,
-    pub hot_reload_enabled: bool,
 }
 
 impl Default for EditorConfig {
     fn default() -> Self {
-        Self {
-            enabled: true,
-            hot_reload_enabled: true,
-        }
+        Self { enabled: true }
     }
 }
 

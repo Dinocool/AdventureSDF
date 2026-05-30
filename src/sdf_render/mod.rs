@@ -396,6 +396,7 @@ impl Plugin for SdfScenePlugin {
             .init_resource::<atlas::SdfAtlas>()
             .init_resource::<bake_scheduler::PrevEditAabbs>()
             .init_resource::<bake_scheduler::BakeScheduler>()
+            .init_resource::<bake_scheduler::SyncBakeRequest>()
             .init_resource::<LodRingsVisible>()
             .init_resource::<bvh::Bvh>()
             .init_resource::<SdfRenderEnabled>()
@@ -428,6 +429,15 @@ impl Plugin for SdfScenePlugin {
                 )
                     .run_if(in_state(AppScene::SdfEditor))
                     .run_if(|allowed: Res<ViewportInputAllowed>| allowed.0),
+            )
+            // Focus easing runs even while the pointer is over a dock panel, so a
+            // Hierarchy double-click animates the camera without re-entering the
+            // viewport. NOT gated on ViewportInputAllowed (unlike orbit_camera).
+            .add_systems(
+                Update,
+                ease_orbit_focus
+                    .run_if(in_state(AppScene::SdfEditor))
+                    .run_if(|m: Res<SdfCameraMode>| !m.fps),
             )
             // Gizmo interaction THEN click-selection, both in `Last`, chained so the
             // gizmo claims a handle click before `sdf_picking` would reselect the
@@ -686,17 +696,6 @@ fn orbit_camera(
         orbit.distance = (orbit.distance - ev.y * 0.5).clamp(0.5, 50.0);
     }
 
-    // Smoothly ease the orbit target toward a double-click focus point. Exponential
-    // smoothing (frame-rate independent); cleared once we're within a hair of it.
-    if let Some(dest) = focus.target {
-        let t = 1.0 - (-12.0 * input.time.delta_secs()).exp();
-        orbit.target = orbit.target.lerp(dest, t);
-        if orbit.target.distance(dest) < 0.01 {
-            orbit.target = dest;
-            focus.target = None;
-        }
-    }
-
     let orbiting = input.mouse.pressed(MouseButton::Middle);
     let panning = orbiting
         && (input.keyboard.pressed(KeyCode::ShiftLeft)
@@ -738,6 +737,40 @@ fn orbit_camera(
             orbit.distance * orbit.yaw.sin() * orbit.pitch.cos(),
         );
 
+    for mut transform in &mut camera_query {
+        *transform = Transform::from_translation(pos).looking_at(orbit.target, Vec3::Y);
+    }
+}
+
+/// Ease the orbit target toward a double-click focus point and recompute the camera
+/// transform. Separate from `orbit_camera` (and NOT gated on `ViewportInputAllowed`)
+/// so a focus triggered from a dock panel — e.g. double-clicking a Hierarchy row —
+/// animates immediately, instead of stalling until the pointer re-enters the
+/// viewport. Orbit-mode only; the FPS camera ignores the orbit target.
+fn ease_orbit_focus(
+    mut orbit: ResMut<SdfOrbitCamera>,
+    mut focus: ResMut<OrbitFocus>,
+    time: Res<Time>,
+    mut camera_query: Query<&mut Transform, (With<SdfCamera>, Without<SdfVolume>)>,
+) {
+    let Some(dest) = focus.target else {
+        return;
+    };
+
+    // Exponential smoothing (frame-rate independent); snap + clear once we're close.
+    let t = 1.0 - (-12.0 * time.delta_secs()).exp();
+    orbit.target = orbit.target.lerp(dest, t);
+    if orbit.target.distance(dest) < 0.01 {
+        orbit.target = dest;
+        focus.target = None;
+    }
+
+    let pos = orbit.target
+        + Vec3::new(
+            orbit.distance * orbit.yaw.cos() * orbit.pitch.cos(),
+            orbit.distance * orbit.pitch.sin(),
+            orbit.distance * orbit.yaw.sin() * orbit.pitch.cos(),
+        );
     for mut transform in &mut camera_query {
         *transform = Transform::from_translation(pos).looking_at(orbit.target, Vec3::Y);
     }

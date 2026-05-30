@@ -16,6 +16,7 @@ use bevy::prelude::*;
 
 use crate::gizmo_render::{GizmoDraw, GizmoMesh, ShapeBuilder};
 
+use super::bake_scheduler::SyncBakeRequest;
 use super::picking::{Ray, mouse_to_ray};
 use super::{SdfCamera, SdfSelection, SdfVolume};
 
@@ -145,7 +146,12 @@ pub struct DragState {
 pub struct GizmoState {
     pub modes: GizmoModes,
     pub orientation: Orientation,
+    /// Effective snap for this frame (what `apply_drag` reads): `snap_sticky` OR Ctrl
+    /// held. Recomputed each frame by the keybind system.
     pub snap: bool,
+    /// Sticky snap toggle, driven by the toolbar magnet button. Persists across frames
+    /// (unlike the momentary Ctrl-hold).
+    pub snap_sticky: bool,
     pub snap_move: f32,
     pub snap_angle: f32,
     pub snap_scale: f32,
@@ -162,6 +168,7 @@ impl Default for GizmoState {
             modes: GizmoModes::all(),
             orientation: Orientation::World,
             snap: false,
+            snap_sticky: false,
             snap_move: 0.25,
             snap_angle: std::f32::consts::FRAC_PI_8,
             snap_scale: 0.1,
@@ -457,6 +464,7 @@ pub fn gizmo_update(
     mouse: Res<ButtonInput<MouseButton>>,
     mut state: ResMut<GizmoState>,
     selection: Res<SdfSelection>,
+    mut sync_bake: ResMut<SyncBakeRequest>,
     windows: Query<&Window>,
     cameras: Query<(&Camera, &Transform), With<SdfCamera>>,
     mut volumes: Query<&mut Transform, (With<SdfVolume>, Without<SdfCamera>)>,
@@ -500,6 +508,10 @@ pub fn gizmo_update(
             // Mutating Transform fires `Changed<Transform>`, which `schedule_bakes`
             // uses to rebake just the affected chunks — no explicit dirty flag needed.
             apply_drag(&drag, &ray, &mut t, &state);
+            // Bake the touched chunks this frame so the volume tracks the cursor live;
+            // the async path would otherwise lose every frame's result to the epoch
+            // race and not show until release.
+            sync_bake.0 = true;
         }
         state.hovered = Some(drag.id);
         state.drag = Some(drag);
