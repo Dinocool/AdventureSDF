@@ -28,11 +28,12 @@ struct FullscreenVertexOutput {
 
 /// The SDF module files, in dependency order (a module must be added before any
 /// module that imports it). The entry shader is composed last via `make_naga_module`.
-const SDF_MODULES: [&str; 5] = [
+const SDF_MODULES: [&str; 6] = [
     "assets/shaders/sdf/bindings.wgsl",
     "assets/shaders/sdf/brick.wgsl",
     "assets/shaders/sdf/cubic.wgsl",
     "assets/shaders/sdf/material.wgsl",
+    "assets/shaders/sdf/shadows.wgsl",
     "assets/shaders/sdf/pbr.wgsl",
 ];
 
@@ -160,6 +161,15 @@ fn sdf_debug_modes_validate() {
         "SDF_DEBUG_TILE_ID",
         "SDF_DEBUG_CHUNK_ID",
     ] {
+        validate_composed_sdf_with_defs(&[def]).unwrap_or_else(|e| panic!("{e}"));
+    }
+}
+
+/// PBR feature toggles (shadows/reflections/parallax) gate `#ifdef` branches that the
+/// default compose skips — validate each so errors inside them are caught.
+#[test]
+fn sdf_feature_defs_validate() {
+    for def in ["SDF_SHADOWS"] {
         validate_composed_sdf_with_defs(&[def]).unwrap_or_else(|e| panic!("{e}"));
     }
 }
