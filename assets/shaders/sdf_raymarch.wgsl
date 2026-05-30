@@ -32,7 +32,7 @@
 #import sdf::cubic::{build_cell_cubic, solve_cell_cubic, dist_to_cell_exit}
 #import sdf::pbr::{resolve_surface, shade_surface, shade_material_env, sun_dir, PbrInputs}
 #import sdf::sky::sky_color
-#import sdf::material::{relief_depth, relief_height_at}
+#import sdf::material::{relief_depth, relief_height_plane, relief_axis}
 
 // --- Raymarching ---
 
@@ -65,46 +65,69 @@ struct RaymarchResult {
 // #ifdef SDF_DISPLACE, so the default pipeline is byte-identical.
 struct DetailHit { pos: vec3<f32>, n: vec3<f32>, hit: bool };
 
-fn relief_normal(id: u32, p: vec3<f32>, env_n: vec3<f32>, depth: f32, lod: f32) -> vec3<f32> {
-    // Tilt the envelope normal by the in-plane height gradient (central differences).
+// Cheap pre-gate band (world units): the largest relief the per-material depth slider can
+// produce, ×1.5 (the inner band factor). The detail-march hand-off only even resolves the
+// material once the envelope distance is within this, so the common near-surface path pays
+// nothing. Must cover slider_max (0.4) × 1.5.
+const RELIEF_MAX_BAND: f32 = 0.6;
+
+// Shading normal at a displaced point: tilt the envelope normal by the in-plane height slope.
+// Two single-plane taps (the dominant axis' two in-plane world directions), not the 6-tap 3D
+// gradient — the relief lives in the plane, so the out-of-plane axis carries no slope.
+fn relief_normal(id: u32, p: vec3<f32>, env_n: vec3<f32>, axis: u32, depth: f32, lod: f32) -> vec3<f32> {
+    // In-plane world basis for the dominant axis (matches relief_height_plane's uv pairing).
+    var ua = vec3<f32>(1.0, 0.0, 0.0);
+    var va = vec3<f32>(0.0, 1.0, 0.0);
+    if (axis == 0u) { ua = vec3<f32>(0.0, 0.0, 1.0); va = vec3<f32>(0.0, 1.0, 0.0); }   // zy
+    else if (axis == 1u) { ua = vec3<f32>(1.0, 0.0, 0.0); va = vec3<f32>(0.0, 0.0, 1.0); } // xz
     let e = depth * 0.5;
-    let hx = relief_height_at(id, p + vec3<f32>(e, 0.0, 0.0), env_n, lod)
-           - relief_height_at(id, p - vec3<f32>(e, 0.0, 0.0), env_n, lod);
-    let hy = relief_height_at(id, p + vec3<f32>(0.0, e, 0.0), env_n, lod)
-           - relief_height_at(id, p - vec3<f32>(0.0, e, 0.0), env_n, lod);
-    let hz = relief_height_at(id, p + vec3<f32>(0.0, 0.0, e), env_n, lod)
-           - relief_height_at(id, p - vec3<f32>(0.0, 0.0, e), env_n, lod);
-    let grad = vec3<f32>(hx, hy, hz) * (depth / max(e, 1e-5));
-    let tangent_grad = grad - env_n * dot(grad, env_n);
-    return normalize(env_n - tangent_grad);
+    let du = relief_height_plane(id, p + ua * e, axis, lod) - relief_height_plane(id, p - ua * e, axis, lod);
+    let dv = relief_height_plane(id, p + va * e, axis, lod) - relief_height_plane(id, p - va * e, axis, lod);
+    let slope = (ua * du + va * dv) * (depth / max(e, 1e-5));
+    return normalize(env_n - slope);
 }
 
-// Walk the displaced field forward from `p_in` (already within the band). Returns a hit on the
-// displaced surface, or hit=false to tell the loop to skip past the band and continue.
+// Walk the relief surface forward from `p_in` (entering the band). Two cost wins over a naive
+// SDF march: (1) the envelope distance is the LOCAL TANGENT PLANE `d0 - t·cos_in` (no scene_sdf
+// in the loop — over a few texels the surface is flat), and (2) height is sampled on ONE pinned
+// plane (1 tap/step, not the 3-tap triplanar blend). A coarse fixed-count linear search brackets
+// the first crossing, then a few BINARY-SEARCH bisections refine it — so the surface is found to
+// sub-step precision regardless of `depth`, which removes the terracing/banding that a pure
+// linear march shows as displacement grows.
 fn march_relief_band(id: u32, p_in: vec3<f32>, dir: vec3<f32>, depth: f32, lod: f32) -> DetailHit {
-    let env_n = calc_normal(p_in);   // envelope normal — selects the triplanar plane + tilt base
-    var p = p_in;
-    let step = depth * 0.08;         // fixed sub-depth step (field is non-Euclidean)
-    var prev_g = 1e9;
-    for (var i = 0; i < 40; i = i + 1) {
-        let base = scene_sdf(p);
-        // Once the envelope distance grows back beyond the band, the ray has curved away from
-        // the surface without meeting a peak → this segment misses the relief.
-        if (base.dist > depth * 1.5) {
-            return DetailHit(p, env_n, false);
-        }
-        let disp = (relief_height_at(id, p, env_n, lod) - 0.5) * depth;
-        let g = base.dist - disp;    // displaced field (peak: disp>0 → g<base, pokes out)
-        if (g < 0.0) {
-            // Crossed the displaced surface between the previous sample and here; refine.
-            let w = clamp(prev_g / max(prev_g - g, 1e-6), 0.0, 1.0);
-            let hit_p = p - dir * step * w;
-            return DetailHit(hit_p, relief_normal(id, hit_p, env_n, depth, lod), true);
-        }
-        prev_g = g;
-        p += dir * step;
+    let env_n = calc_normal(p_in);          // local tangent plane normal (one gradient eval)
+    let axis = relief_axis(env_n);          // pin the height plane once
+    let cos_in = max(-dot(dir, env_n), 0.15);
+    let d0 = scene_sdf(p_in).dist;          // envelope distance at band entry (one eval)
+
+    // g(t) = (d0 - t·cos_in) - (H(p_in + t·dir) - 0.5)·depth. Negative = below the relief.
+    let LINEAR = 12;
+    let span = depth * 2.0;                 // cover the ±depth shell
+    let step = span / f32(LINEAR);
+    var t_prev = 0.0;
+    var t_hit = -1.0;
+    for (var i = 1; i <= LINEAR; i = i + 1) {
+        let t = step * f32(i);
+        let p = p_in + dir * t;
+        let g = (d0 - t * cos_in) - (relief_height_plane(id, p, axis, lod) - 0.5) * depth;
+        if (g < 0.0) { t_hit = t; break; }
+        t_prev = t;
     }
-    return DetailHit(p, env_n, false);
+    if (t_hit < 0.0) {
+        return DetailHit(p_in + dir * span, env_n, false);   // no crossing in the band
+    }
+    // Binary-search the bracket [t_prev, t_hit] — converges to sub-step precision, so the
+    // visible relief no longer terraces at high `depth`.
+    var lo = t_prev;
+    var hi = t_hit;
+    for (var b = 0; b < 5; b = b + 1) {
+        let tm = 0.5 * (lo + hi);
+        let pm = p_in + dir * tm;
+        let g = (d0 - tm * cos_in) - (relief_height_plane(id, pm, axis, lod) - 0.5) * depth;
+        if (g < 0.0) { hi = tm; } else { lo = tm; }
+    }
+    let hit_p = p_in + dir * (0.5 * (lo + hi));
+    return DetailHit(hit_p, relief_normal(id, hit_p, env_n, axis, depth, lod), true);
 }
 
 // Single unified raymarch. One cached resolve per step (`resolve_march` → finest resident
@@ -202,7 +225,11 @@ fn raymarch(origin: vec3<f32>, dir: vec3<f32>) -> RaymarchResult {
         // passing JUST OUTSIDE the envelope can still strike a peak (real outline bump). Only
         // at LOD 0, within a small near-surface band, and only when the material actually has
         // relief (`depth > 0`), so non-height-mapped surfaces take the normal march unchanged.
-        if (lod == 0u && d < voxel_size * 6.0) {
+        //
+        // Two-stage gate keeps the cost off the common path: a cheap fixed-band pre-test
+        // (RELIEF_MAX_BAND covers the largest relief the slider allows) bounds how often we pay
+        // the per-step `pick_material` tap; only then resolve the material + its true band.
+        if (lod == 0u && d < RELIEF_MAX_BAND) {
             let mid = pick_material(load_material_distances(scene.atlas_base, p, lod), scene.palette).id;
             let tex_lod = clamp(log2(max(t, 1.0)) - 1.0, 0.0, 8.0);
             let depth = relief_depth(mid, tex_lod);
@@ -490,7 +517,8 @@ fn main(in: FullscreenVertexOutput) -> FragmentOutput {
     {
         let depth = relief_depth(rm.object_id, lod);
         if (depth > 0.0) {
-            geo_normal = relief_normal(rm.object_id, hit_pos, geo_normal, depth, lod);
+            let axis = relief_axis(geo_normal);
+            geo_normal = relief_normal(rm.object_id, hit_pos, geo_normal, axis, depth, lod);
         }
     }
 
