@@ -10,7 +10,7 @@ struct SdfCameraUniform {
     inv_view_proj: mat4x4<f32>,
     clip_from_world: mat4x4<f32>,
     camera_pos: vec4<f32>,
-    screen_params: vec4<f32>,
+    screen_params: vec4<f32>,  // xy = screen_size, z = surface_bias (coarse-LOD iso-offset α), w unused
     grid_origin: vec4<f32>,
     grid_dims: vec4<f32>,
     debug_params: vec4<f32>,   // x = max_steps, y = max_dist, z = sdf_eps, w = recenter_snap_chunks
@@ -127,6 +127,10 @@ fn lod_blend_band() -> f32 { return camera.march_params.w; }
 // The LOD cross-fade keys off the chunk-SNAPPED ring centre, so the shader recomputes it
 // from camera_pos + this (mirrors bake_scheduler::ring_chunk_origin). >= 1.
 fn recenter_snap() -> i32 { return max(i32(camera.debug_params.w), 1); }
+// Coarse-LOD iso-offset α. The sphere-trace march renders the surface where the field
+// equals `α · voxel_size(lod)² / base` (not 0), re-inflating the trilinear shrink that
+// makes convex objects thinner at coarse LODs. 0 = off; zero at LOD 0 (cubic owns it).
+fn surface_bias() -> f32 { return camera.screen_params.z; }
 
 // --- LOD clipmap / chunk accessors ---
 

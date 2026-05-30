@@ -726,6 +726,7 @@ fn render_panel(world: &mut World, ui: &mut egui::Ui) {
     ui.add(egui::Slider::new(&mut params.max_dist, 10.0..=500.0).text("Max Dist"));
     ui.add(egui::Slider::new(&mut params.sdf_eps, 0.0001..=0.1).text("Epsilon"));
     ui.add(egui::Slider::new(&mut params.lod_blend_band, 0.0..=0.5).text("LOD Blend Band"));
+    ui.add(egui::Slider::new(&mut params.surface_bias, 0.0..=0.5).text("Surface Bias"));
 }
 
 fn ray_inspector_panel(world: &mut World, ui: &mut egui::Ui) {
