@@ -138,24 +138,6 @@ impl Bvh {
         }
     }
 
-    /// Flatten the node array into raw little-endian bytes for GPU upload (std430:
-    /// each node = [min.xyz, first/left as f32-bits, max.xyz, count/right as bits]).
-    /// We pack the two u32 fields as raw bits in f32 slots so the whole node is a
-    /// tight 32-byte block of 8 x 4-byte words.
-    pub fn to_gpu_bytes(&self) -> Vec<u8> {
-        let mut bytes = Vec::with_capacity(self.nodes.len() * 32);
-        for n in &self.nodes {
-            for c in n.aabb_min {
-                bytes.extend_from_slice(&c.to_le_bytes());
-            }
-            bytes.extend_from_slice(&n.left_or_first.to_le_bytes());
-            for c in n.aabb_max {
-                bytes.extend_from_slice(&c.to_le_bytes());
-            }
-            bytes.extend_from_slice(&n.count_or_right.to_le_bytes());
-        }
-        bytes
-    }
 }
 
 fn is_internal(node: &BvhNode) -> bool {
@@ -375,12 +357,5 @@ mod tests {
         // Ray pointing away misses.
         bvh.raycast_candidates(Vec3::ZERO, -Vec3::Z, 100.0, &mut out);
         assert!(out.is_empty());
-    }
-
-    #[test]
-    fn gpu_bytes_size_matches() {
-        let boxes = vec![aabb(0.0, 0.0, 0.0, 1.0), aabb(3.0, 0.0, 0.0, 1.0)];
-        let bvh = Bvh::build(&boxes);
-        assert_eq!(bvh.to_gpu_bytes().len(), bvh.nodes.len() * 32);
     }
 }

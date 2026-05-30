@@ -204,6 +204,10 @@ fn b0001_sdf_editor_scene() {
     use adventure::sdf_render::SdfScenePlugin;
 
     let mut app = scene_test_app();
+    // setup_sdf_scene loads demo materials, so it needs AssetServer (AssetPlugin) plus
+    // the MaterialAsset registration + tables/registry that AssetsPlugin sets up.
+    app.add_plugins(bevy::asset::AssetPlugin::default());
+    app.add_plugins(adventure::assets::AssetsPlugin);
     app.add_plugins(SdfScenePlugin);
     run_scene_frames(&mut app, AppScene::SdfEditor, 5);
 }

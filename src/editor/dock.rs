@@ -275,12 +275,15 @@ fn viewport_toolbar(world: &mut World, ui: &mut egui::Ui) {
                 if ui.selectable_label(fps, "🎮 FPS").clicked() && !fps {
                     // Seed the free-fly yaw/pitch from the orbit view so toggling in
                     // doesn't snap the camera to a new orientation.
+                    // Orbit stores the target→camera offset (view looks along -dir),
+                    // while FPS stores the look direction (+dir); they differ by π in
+                    // yaw and a negated pitch.
                     let orbit = world.resource::<SdfOrbitCamera>();
                     let (yaw, pitch) = (orbit.yaw, orbit.pitch);
                     let mut mode = world.resource_mut::<SdfCameraMode>();
                     mode.fps = true;
-                    mode.yaw = yaw;
-                    mode.pitch = pitch;
+                    mode.yaw = yaw + std::f32::consts::PI;
+                    mode.pitch = -pitch;
                 }
 
                 ui.separator();

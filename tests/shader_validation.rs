@@ -28,11 +28,10 @@ struct FullscreenVertexOutput {
 
 /// The SDF module files, in dependency order (a module must be added before any
 /// module that imports it). The entry shader is composed last via `make_naga_module`.
-const SDF_MODULES: [&str; 6] = [
+const SDF_MODULES: [&str; 5] = [
     "assets/shaders/sdf/bindings.wgsl",
     "assets/shaders/sdf/brick.wgsl",
     "assets/shaders/sdf/cubic.wgsl",
-    "assets/shaders/sdf/bvh.wgsl",
     "assets/shaders/sdf/material.wgsl",
     "assets/shaders/sdf/pbr.wgsl",
 ];

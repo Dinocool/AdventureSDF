@@ -11,7 +11,7 @@
 
 #import bevy_core_pipeline::fullscreen_vertex_shader::FullscreenVertexOutput
 
-#import sdf::bindings::{camera, max_steps, max_dist, sdf_eps, cell_stride, voxel_size_at}
+#import sdf::bindings::{camera, max_steps, max_dist, sdf_eps, pixel_cone, cubic_band, cell_stride, voxel_size_at}
 #import sdf::brick::{
     world_to_brick_lod,
     scene_sdf,
@@ -19,9 +19,9 @@
     pick_material,
     calc_normal,
     step_voxel_at,
+    dist_to_brick_exit,
 }
 #import sdf::cubic::{build_cell_cubic, solve_cell_cubic, dist_to_cell_exit}
-#import sdf::bvh::bvh_ray_advance
 #import sdf::pbr::shade_material
 
 // --- Raymarching ---
@@ -39,6 +39,19 @@ struct RaymarchResult {
     lod: u32,  // LOD level that served the hit (for the SDF_DEBUG_LOD overlay)
 };
 
+// Single unified raymarch. One loop, one resolve per step (`scene_sdf` → finest resident
+// LOD + conservative distance + tile/palette), branching three ways:
+//
+//   1. Empty here (no resident brick at `p`): advance to the next brick face at the
+//      finest resident LOD (conservative DDA — never skips over a baked surface).
+//   2. LOD 0 and near the surface (`d < cubic_band`): solve the exact analytic cubic in
+//      this cell for a crisp silhouette; on a miss step to the cell exit.
+//   3. Otherwise (coarse LOD, or far): sphere-trace the conservative field, and accept a
+//      hit once the surface is within the pixel cone (`d < max(eps, cone·t)`), so distant
+//      geometry resolves at coarse LOD instead of marching all the way down to LOD 0.
+//
+// The conservative bake (atlas.rs) guarantees the stored field is a lower bound, so every
+// sphere-trace step and DDA skip is safe — there is no GPU BVH in this path.
 fn raymarch(origin: vec3<f32>, dir: vec3<f32>) -> RaymarchResult {
     var t = 0.0;
     var steps = 0u;
@@ -47,6 +60,8 @@ fn raymarch(origin: vec3<f32>, dir: vec3<f32>) -> RaymarchResult {
     let MAX_STEPS = max_steps();
     let MAX_DIST = max_dist();
     let SDF_EPS = sdf_eps();
+    let CONE = pixel_cone();
+    let CUBIC_BAND = cubic_band();
 
     let edge = i32(camera.grid_dims.z);
     let s = cell_stride();
@@ -61,38 +76,33 @@ fn raymarch(origin: vec3<f32>, dir: vec3<f32>) -> RaymarchResult {
             return result;
         }
 
-        // Resolve the finest LOD with a baked brick at `p` (scene_sdf carries the LOD,
-        // tile base, and palette so we don't re-search here).
         let scene = scene_sdf(p);
 
-        if (scene.in_brick) {
-            let lod = scene.lod;
-            let voxel_size = voxel_size_at(lod);
-            // Ray direction in voxels-per-world-unit at THIS LOD, so the cubic's
-            // parameter is the world distance from the cell entry.
-            let ray_d_voxel = dir / voxel_size;
+        // --- 1. Empty space: conservative DDA to the next brick face -----------------
+        if (!scene.in_brick) {
+            t += dist_to_brick_exit(p, dir) + step_voxel_at(p) * 0.01;
+            continue;
+        }
 
-            // Inside a baked brick: solve the cubic for the single voxel cell
-            // containing `p` at this LOD. Exact ray/trilinear-surface intersection.
-            let gv = p / voxel_size;            // LOD voxel space (anchored at world 0)
+        let lod = scene.lod;
+        let voxel_size = voxel_size_at(lod);
+        let d = scene.dist;                          // conservative field (lower bound)
+        let cone = CONE * t;                         // pixel-cone half-width here
+
+        // --- 2. LOD 0 near the surface: exact analytic cubic -------------------------
+        if (lod == 0u && d < CUBIC_BAND) {
+            let ray_d_voxel = dir / voxel_size;       // voxels per world unit at LOD 0
+            let gv = p / voxel_size;                  // LOD voxel space (world-0 anchored)
             let cell_g = floor(gv);
-            let o_local = gv - cell_g;          // entry point in [0,1]^3 (small, stable)
-
-            // Brick-local cell index; clamp so cell+1 stays within stored samples
-            // (0..edge-1, the last being the shared apron plane).
+            let o_local = gv - cell_g;                // entry in [0,1]^3 (small, stable)
             let brick_origin_v = floor(gv / f32(s)) * f32(s);
             let cell_local = clamp(
                 vec3<i32>(cell_g - brick_origin_v),
                 vec3<i32>(0),
                 vec3<i32>(edge - 2),
             );
-
             let cubic = build_cell_cubic(scene.atlas_base, cell_local, o_local, ray_d_voxel);
-
             let advance = dist_to_cell_exit(p, dir, lod);
-
-            // Solve in the cell-local parameter [0, advance] (distance from `p`),
-            // then offset by the global `t` to recover the true ray distance.
             let cell_hit = solve_cell_cubic(cubic, 0.0, advance);
             if (cell_hit.hit) {
                 let t_hit = t + cell_hit.t;
@@ -103,20 +113,31 @@ fn raymarch(origin: vec3<f32>, dir: vec3<f32>) -> RaymarchResult {
                     pick_material(load_material_distances(scene.atlas_base, hit_p, lod), scene.palette).id;
                 result.steps = steps;
                 result.hit_pos = hit_p;
-                result.fate = 0u; // hit
+                result.fate = 0u;
                 result.lod = lod;
                 return result;
             }
-
             t += advance + voxel_size * 0.001;
-        } else {
-            // Empty space: jump straight to the next occupied edit-AABB using the
-            // BVH (big skips across truly empty space), instead of stepping one
-            // brick at a time. Falls back to the finest-covering brick DDA when the BVH
-            // is empty. The nudge is scaled to the finest LOD window covering `p` so it
-            // clears the brick boundary without overshooting a fine surface near camera.
-            t += bvh_ray_advance(p, dir) + step_voxel_at(p) * 0.01;
+            continue;
         }
+
+        // --- 3. Coarse LOD / far: sphere-trace the conservative field ----------------
+        if (d < max(SDF_EPS, cone)) {
+            let hit_p = p;
+            result.hit = true;
+            result.dist = t;
+            result.object_id =
+                pick_material(load_material_distances(scene.atlas_base, hit_p, lod), scene.palette).id;
+            result.steps = steps;
+            result.hit_pos = hit_p;
+            result.fate = 0u;
+            result.lod = lod;
+            return result;
+        }
+        // Step by the conservative distance (safe lower bound), with a floor so we never
+        // stall, and never past the brick exit so we re-resolve LOD as the ray moves.
+        let brick_exit = dist_to_brick_exit(p, dir);
+        t += clamp(d, voxel_size * 0.01, brick_exit + voxel_size * 0.01);
     }
 
     result.steps = MAX_STEPS;
@@ -127,6 +148,16 @@ struct FragmentOutput {
     @location(0) color: vec4<f32>,
     @builtin(frag_depth) depth: f32,
 };
+
+// Reverse-Z projected depth for a debug pixel: the hit's true depth so the overlay
+// shares the depth buffer with other geometry, or far (1.0) on a miss.
+fn debug_depth(rm: RaymarchResult) -> f32 {
+    if (rm.hit) {
+        let c = camera.clip_from_world * vec4<f32>(rm.hit_pos, 1.0);
+        return c.z / c.w;
+    }
+    return 1.0;
+}
 
 // --- Fragment shader ---
 
@@ -151,22 +182,43 @@ fn main(in: FullscreenVertexOutput) -> FragmentOutput {
 
     let rm = raymarch(ray_origin, ray_dir);
 
+    // --- Cost / fate debug modes -------------------------------------------------
+    // These are placed BEFORE the miss early-return so they paint EVERY pixel — hit
+    // AND miss. Missed rays (escaped past MAX_DIST or out of steps) are usually the
+    // most expensive, so a cost heatmap that drops them to background hides exactly
+    // the rays you want to measure. Depth is the hit's projected depth when there is a
+    // hit, else far (1.0).
+
     #ifdef SDF_DEBUG_RAY_FATE
-    // Paint EVERY pixel by how its ray ended — placed BEFORE the miss early-return so
-    // missed rays are visible (not painted as background): green = hit, red = escaped
-    // past MAX_DIST (skipped over everything — the BVH-over-skip signature), blue =
-    // exhausted MAX_STEPS. If the visual gap is RED, the marcher is wrongly skipping
-    // geometry; if it's GREEN yet still a gap in the real render, shading is at fault.
+    // Colour by how the ray ended: green = hit, red = escaped past MAX_DIST (skipped
+    // over everything), blue = exhausted MAX_STEPS. If a visual gap is RED the marcher
+    // is wrongly skipping geometry; if GREEN yet still a gap in the real render, shading
+    // is at fault.
     {
         var fate_col = vec3<f32>(0.0, 1.0, 0.0);   // hit
         if (rm.fate == 1u) { fate_col = vec3<f32>(1.0, 0.0, 0.0); }   // escaped
         if (rm.fate == 2u) { fate_col = vec3<f32>(0.0, 0.0, 1.0); }   // out of steps
-        var fd = 1.0;
-        if (rm.hit) {
-            let c = camera.clip_from_world * vec4<f32>(rm.hit_pos, 1.0);
-            fd = c.z / c.w;
-        }
-        return FragmentOutput(vec4<f32>(fate_col, 1.0), fd);
+        return FragmentOutput(vec4<f32>(fate_col, 1.0), debug_depth(rm));
+    }
+    #endif
+
+    #ifdef SDF_DEBUG_STEP_COUNT
+    // March-cost heatmap over every pixel: blue (few steps) → red (many). Misses are
+    // included so escaped / out-of-steps rays show their true cost, not background.
+    {
+        let c = f32(rm.steps) / f32(max_steps());
+        let heatmap = vec3<f32>(c, 0.3 * (1.0 - c), 1.0 - c);
+        return FragmentOutput(vec4<f32>(heatmap, 1.0), debug_depth(rm));
+    }
+    #endif
+
+    #ifdef SDF_DEBUG_BVH_STEPS
+    // Same march-cost heatmap, kept as a distinct toggle for empty-space-traversal
+    // analysis. Also covers every pixel (hit and miss).
+    {
+        let c = f32(rm.steps) / f32(max_steps());
+        let heat = vec3<f32>(c, 0.3 * (1.0 - c), 1.0 - c);
+        return FragmentOutput(vec4<f32>(heat, 1.0), debug_depth(rm));
     }
     #endif
 
@@ -194,28 +246,7 @@ fn main(in: FullscreenVertexOutput) -> FragmentOutput {
     // shade_material perturbs it per-material with the normal map.
     let shaded = shade_material(scene_sdf(hit_pos), hit_pos, normal, lod);
 
-    // --- Debug output modes (toggled via shader_defs) ---
-
-    #ifdef SDF_DEBUG_STEP_COUNT
-    // Step count heatmap: blue (few) -> red (many)
-    let t = f32(rm.steps) / f32(max_steps());
-    let heatmap = vec3<f32>(t, 0.3 * (1.0 - t), 1.0 - t);
-    if (rm.hit) {
-        return FragmentOutput(vec4<f32>(heatmap, 1.0), ndc_depth);
-    }
-    return FragmentOutput(vec4<f32>(bg_color * 0.3, 1.0), 1.0);
-    #endif
-
-    #ifdef SDF_DEBUG_BVH_STEPS
-    // Like the step heatmap, but colours *every* pixel (hit and miss) by march
-    // cost so the empty-space traversal — which the BVH accelerates — is visible.
-    // Compare against SDF_DEBUG_STEP_COUNT: with the BVH, background rays should
-    // resolve in far fewer steps (deep blue) than brick-by-brick DDA.
-    let bt = f32(rm.steps) / f32(max_steps());
-    let bvh_heat = vec3<f32>(bt, 0.3 * (1.0 - bt), 1.0 - bt);
-    let depth_out = select(1.0, ndc_depth, rm.hit);
-    return FragmentOutput(vec4<f32>(bvh_heat, 1.0), depth_out);
-    #endif
+    // --- Debug output modes (hit-only; cost/fate modes return earlier) ---
 
     #ifdef SDF_DEBUG_NORMALS
     if (rm.hit) {
