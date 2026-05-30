@@ -156,6 +156,12 @@ pub struct SdfRaymarchParams {
     /// artifact-free); (1,2) accelerates but can interact poorly with the loose
     /// conservative field, so it is opt-in.
     pub over_relax: f32,
+    /// LOD cross-fade band width, as a fraction of each clipmap ring's half-extent. In the
+    /// outer `lod_blend_band` shell of a ring the marched field is `mix`-faded from the
+    /// serving LOD toward its coarser neighbour, so the surface morphs smoothly across the
+    /// ring boundary instead of snapping (removes the visible LOD pop/seam). 0 = disabled
+    /// (hard LOD seams, the original behaviour). Tunable live via the editor raymarch panel.
+    pub lod_blend_band: f32,
 }
 
 impl Default for SdfRaymarchParams {
@@ -169,6 +175,7 @@ impl Default for SdfRaymarchParams {
             cone_scale: 1.0,
             cubic_band: 0.5,
             over_relax: 1.0,
+            lod_blend_band: 0.02,
         }
     }
 }
