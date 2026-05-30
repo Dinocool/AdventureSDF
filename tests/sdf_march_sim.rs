@@ -337,7 +337,7 @@ fn measure_grazing_overrelax() {
     let (edits, bvh) = single_sphere();
     let mut atlas = SdfAtlas::default();
     let camera_pos = Vec3::new(0.0, 2.0, 6.0);
-    atlas.full_bake(&edits, &bvh, &cfg, camera_pos);
+    atlas.full_bake(&edits, &bvh, &cfg, &adventure::sdf_render::height::HeightField::default(), camera_pos);
     let tables = chunk::build_chunk_tables(&atlas, &cfg, |_k| chunk::BrickTile::default());
 
     // Silhouette of the unit sphere from (0,2,6): centre dist √40≈6.32, half-angle
@@ -440,7 +440,7 @@ fn measure_per_lod_clamp_k_sweep() {
     let (edits, bvh) = single_sphere();
     let mut atlas = SdfAtlas::default();
     let camera_pos = Vec3::new(0.0, 2.0, 6.0);
-    atlas.full_bake(&edits, &bvh, &cfg, camera_pos);
+    atlas.full_bake(&edits, &bvh, &cfg, &adventure::sdf_render::height::HeightField::default(), camera_pos);
     let tables = chunk::build_chunk_tables(&atlas, &cfg, |_k| chunk::BrickTile::default());
 
     let dirs = [
@@ -473,7 +473,7 @@ fn measure_march_steps_single_sphere() {
     let mut atlas = SdfAtlas::default();
     // Camera looking at the sphere from a few units back (matches the orbit default-ish).
     let camera_pos = Vec3::new(0.0, 2.0, 6.0);
-    atlas.full_bake(&edits, &bvh, &cfg, camera_pos);
+    atlas.full_bake(&edits, &bvh, &cfg, &adventure::sdf_render::height::HeightField::default(), camera_pos);
     let tables = chunk::build_chunk_tables(&atlas, &cfg, |_key| chunk::BrickTile::default());
 
     println!(

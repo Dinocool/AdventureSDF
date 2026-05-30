@@ -55,7 +55,7 @@ impl BakeHarness {
     fn new(config: SdfGridConfig, edits: Vec<ResolvedEdit>, cam0: Vec3) -> Self {
         let bvh = build_bvh(&edits, &config);
         let mut atlas = SdfAtlas::default();
-        atlas.full_bake(&edits, &bvh, &config, cam0);
+        atlas.full_bake(&edits, &bvh, &config, &adventure::sdf_render::height::HeightField::default(), cam0);
         Self { config, edits, bvh, atlas, cam: cam0 }
     }
 
@@ -76,7 +76,7 @@ impl BakeHarness {
                 if !coord_in_window(&self.config, coord, old_origin) {
                     stats.entered += 1;
                     let key = BrickKey::new(lod, coord);
-                    match SdfAtlas::bake_brick(key, &self.edits, &self.bvh, &self.config) {
+                    match SdfAtlas::bake_brick(key, &self.edits, &self.bvh, &self.config, &adventure::sdf_render::height::HeightField::default()) {
                         Some(b) => self.atlas.insert_brick(key, b),
                         None => {
                             self.atlas.remove_brick(&key);
@@ -107,7 +107,7 @@ impl BakeHarness {
     fn reference_full_bake(&self) -> (HashSet<BrickKey>, u128) {
         let mut reference = SdfAtlas::default();
         let t0 = Instant::now();
-        reference.full_bake(&self.edits, &self.bvh, &self.config, self.cam);
+        reference.full_bake(&self.edits, &self.bvh, &self.config, &adventure::sdf_render::height::HeightField::default(), self.cam);
         let nanos = t0.elapsed().as_nanos();
         (reference.bricks.keys().copied().collect(), nanos)
     }
@@ -116,7 +116,7 @@ impl BakeHarness {
     /// camera, both in resident set and per-brick distance data.
     fn assert_matches_full_bake(&self, label: &str) {
         let mut reference = SdfAtlas::default();
-        reference.full_bake(&self.edits, &self.bvh, &self.config, self.cam);
+        reference.full_bake(&self.edits, &self.bvh, &self.config, &adventure::sdf_render::height::HeightField::default(), self.cam);
         let inc = self.brick_set();
         let refk: HashSet<BrickKey> = reference.bricks.keys().copied().collect();
         assert_eq!(inc, refk, "{label}: incremental brick set diverged from full_bake");

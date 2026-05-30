@@ -310,7 +310,9 @@ fn raymarch(origin: vec3<f32>, dir: vec3<f32>, start_t: f32) -> RaymarchResult {
 // `origin` is the primary hit nudged off its surface (caller offsets by the geometric
 // normal) so the reflection ray doesn't immediately re-hit the surface it left.
 fn trace_reflection(origin: vec3<f32>, refl_dir: vec3<f32>) -> vec3<f32> {
-    let rm = raymarch(origin, refl_dir);
+    // Reflection rays aren't primary screen rays, so they have no cone-prepass tile seed —
+    // march from t = 0.
+    let rm = raymarch(origin, refl_dir, 0.0);
     if (!rm.hit) {
         return sky_color(refl_dir, sun_dir());
     }
