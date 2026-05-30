@@ -126,7 +126,11 @@ type ChangedEdit = ChangedEditFilter;
 /// The chunk coord (per axis) of the chunk-ring window corner for `camera_pos` at `lod`:
 /// the camera's chunk minus half the ring (in chunks) on each axis, so the ring is
 /// centred on the camera. `ring_bricks / CHUNK_BRICKS` chunks per axis.
-fn ring_chunk_origin(config: &SdfGridConfig, camera_pos: Vec3, lod: u32) -> IVec3 {
+///
+/// `pub` so the GPU rig (`tests/sdf_gpu_rig.rs`) can assert the shader's `in_ring_chunk`
+/// agrees with THIS source-of-truth window — they're hand-duplicated across Rust/WGSL, and
+/// a silent divergence would make the chunk-DDA skip step past real geometry.
+pub fn ring_chunk_origin(config: &SdfGridConfig, camera_pos: Vec3, lod: u32) -> IVec3 {
     let s = config.cell_stride();
     let cam_brick = config.world_to_brick_lod(camera_pos, lod);
     let cam_brick_idx = IVec3::new(

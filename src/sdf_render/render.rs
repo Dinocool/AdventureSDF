@@ -243,8 +243,8 @@ pub struct SdfShaderDefs {
 struct SdfLabel;
 
 fn create_dummy_bg0(device: &RenderDevice, layout: &BindGroupLayout) -> BindGroup {
-    let buf = device.create_buffer(&BufferDescriptor {
-        label: Some("sdf_dummy_uniform"),
+    let camera_buf = device.create_buffer(&BufferDescriptor {
+        label: Some("sdf_dummy_camera_uniform"),
         size: 512,
         usage: BufferUsages::UNIFORM,
         mapped_at_creation: false,
@@ -252,7 +252,7 @@ fn create_dummy_bg0(device: &RenderDevice, layout: &BindGroupLayout) -> BindGrou
     device.create_bind_group(
         "sdf_bind_group_0_empty",
         layout,
-        &BindGroupEntries::sequential((buf.as_entire_buffer_binding(),)),
+        &BindGroupEntries::sequential((camera_buf.as_entire_buffer_binding(),)),
     )
 }
 
@@ -581,21 +581,25 @@ fn prepare_sdf_camera_data(
                 config.brick_size as f32,
                 num_chunks as f32,
             ),
+            // `w` carries `recenter_snap_chunks` so the shader can recompute the chunk-
+            // snapped ring centre (the LOD cross-fade must key off the true resident-ring
+            // boundary, which is hysteresis-snapped — see bake_scheduler::ring_chunk_origin).
             debug_params: Vec4::new(
                 raymarch.max_steps as f32,
                 raymarch.max_dist,
                 raymarch.sdf_eps,
-                0.0,
+                config.recenter_snap_chunks as f32,
             ),
             // March tuning: the pixel cone half-width per unit ray distance drives the
             // screen-space termination (a surface within a pixel ends the march, so far
             // geometry resolves at coarse LOD); `cubic_band` is the near-surface distance
-            // within which a LOD-0 sample switches to the exact analytic cubic.
+            // within which a LOD-0 sample switches to the exact analytic cubic; `w` is the
+            // LOD cross-fade band (fraction of each ring's half-extent; 0 = hard seams).
             march_params: Vec4::new(
                 pixel_cone,
                 raymarch.cubic_band,
                 raymarch.over_relax,
-                0.0,
+                raymarch.lod_blend_band,
             ),
             lod_params: Vec4::new(
                 config.lod_count as f32,
@@ -1317,7 +1321,10 @@ fn init_sdf_pipeline(
         "sdf_bind_group_0",
         &BindGroupLayoutEntries::sequential(
             ShaderStages::FRAGMENT,
-            (uniform_buffer::<SdfCameraData>(true),),
+            (
+                // binding 0: per-view camera uniform (dynamic offset)
+                uniform_buffer::<SdfCameraData>(true),
+            ),
         ),
     );
     let layout_1 = BindGroupLayoutDescriptor::new(

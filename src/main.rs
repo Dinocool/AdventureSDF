@@ -25,7 +25,12 @@ fn main() {
             // universally; device init fails loudly if a backend somehow lacks it.
             .set(RenderPlugin {
                 render_creation: RenderCreation::Automatic(WgpuSettings {
-                    features: WgpuFeatures::TEXTURE_COMPRESSION_BC,
+                    // BC7 texture compression (~1/6 the VRAM of RGBA8) + 16-bit-norm texture
+                    // formats. TEXTURE_FORMAT_16BIT_NORM is required for the R16Snorm /
+                    // Rgba16Snorm SDF distance atlases AND the 3D R16Snorm distance-clipmap
+                    // volume — without it those `create_texture` calls fail validation.
+                    features: WgpuFeatures::TEXTURE_COMPRESSION_BC
+                        | WgpuFeatures::TEXTURE_FORMAT_16BIT_NORM,
                     ..default()
                 }),
                 ..default()
