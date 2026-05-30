@@ -21,6 +21,10 @@
     abs_chunk_key,
     local_brick_index,
     euclid_mod,
+    floor_div,
+    ring_bricks,
+    recenter_snap,
+    DIST_BAND_VOXELS,
 }
 
 // --- Brick coordinate helpers ---
@@ -293,7 +297,10 @@ fn sample_brick_sdf(base_u: u32, world_pos: vec3<f32>, lod: u32) -> f32 {
     let x11 = mix(c011, c111, fx);
     let y0 = mix(x00, x10, fy);
     let y1 = mix(x01, x11, fy);
-    return mix(y0, y1, fz);
+    // Decode the per-LOD voxel-unit clamp: the bake stored `d / (DIST_BAND_VOXELS·voxel_size)`
+    // as snorm (atlas::dist_to_snorm_band), so multiply back to recover world distance. A
+    // coarse LOD's large band lets the sphere-trace take big steps far from the surface.
+    return mix(y0, y1, fz) * (DIST_BAND_VOXELS * voxel_size);
 }
 
 // Find the finest LOD with a baked brick at `world_pos`. Returns the brick location plus
@@ -482,6 +489,71 @@ fn dist_to_brick_exit_lod(p: vec3<f32>, dir: vec3<f32>, lod: u32) -> f32 {
         }
     }
     return t;
+}
+
+// Distance along the ray to the far side of the CHUNK containing `p`, at LOD `lod`. The
+// chunk-DDA empty-space skip uses this to step across a whole provably-empty chunk box in
+// one jump (a chunk is CHUNK_BRICKS bricks per axis). Identical slab test to
+// `dist_to_brick_exit_lod`, scaled to chunk size.
+fn dist_to_chunk_exit_lod(p: vec3<f32>, dir: vec3<f32>, lod: u32) -> f32 {
+    let chunk_world = f32(CHUNK_BRICKS) * brick_world_at(lod);
+
+    let chunk_min = floor(p / chunk_world) * chunk_world;
+    let chunk_max = chunk_min + vec3<f32>(chunk_world);
+
+    var t = 1e10;
+    for (var a = 0u; a < 3u; a = a + 1u) {
+        let d = dir[a];
+        if (abs(d) > 1e-6) {
+            let bound = select(chunk_min[a], chunk_max[a], d > 0.0);
+            let ta = (bound - p[a]) / d;
+            if (ta > 0.0) {
+                t = min(t, ta);
+            }
+        }
+    }
+    return t;
+}
+
+// True if the chunk containing brick `coord` at `lod` is inside that LOD's resident ring
+// window. Mirrors bake_scheduler::ring_chunk_origin EXACTLY (camera chunk minus half-ring,
+// snapped to the recenter_snap_chunks lattice) — must match or the chunk-DDA skip will
+// mis-classify chunks near the ring edge. All integer math via floor_div (never raw `%`/`/`,
+// the GPU signed-op hazard — see bindings.wgsl floor_div).
+//
+// Distinguishes "empty-culled" (in-ring + absent ⇒ provably empty ⇒ safe to skip) from
+// "unbaked" (out-of-ring ⇒ unknown ⇒ a coarser LOD's ring covers it; not skipped here).
+fn in_ring_chunk(coord: vec3<i32>, lod: u32) -> bool {
+    let s = cell_stride();
+    let c = CHUNK_BRICKS;
+    let r = ring_bricks() / c;                  // ring chunks per axis
+
+    // Camera chunk coord at this LOD (brick → brick-index → chunk-index, Euclidean).
+    let cam_brick = world_to_brick_lod(camera.camera_pos.xyz, lod);
+    let cam_cx = floor_div(floor_div(cam_brick.x, s), c);
+    let cam_cy = floor_div(floor_div(cam_brick.y, s), c);
+    let cam_cz = floor_div(floor_div(cam_brick.z, s), c);
+
+    // Hysteresis snap to the coarse recenter lattice (mirrors ring_chunk_origin).
+    let snap = recenter_snap();  // already max(,1)
+    let scx = floor_div(cam_cx, snap) * snap;
+    let scy = floor_div(cam_cy, snap) * snap;
+    let scz = floor_div(cam_cz, snap) * snap;
+
+    let half = r / 2;
+    let ox = scx - half;
+    let oy = scy - half;
+    let oz = scz - half;
+
+    // p's own chunk coord at this LOD.
+    let cx = floor_div(floor_div(coord.x, s), c);
+    let cy = floor_div(floor_div(coord.y, s), c);
+    let cz = floor_div(floor_div(coord.z, s), c);
+
+    let rx = cx - ox;
+    let ry = cy - oy;
+    let rz = cz - oz;
+    return rx >= 0 && ry >= 0 && rz >= 0 && rx < r && ry < r && rz < r;
 }
 
 // --- Surface normal from the trilinear gradient ---

@@ -243,8 +243,8 @@ pub struct SdfShaderDefs {
 struct SdfLabel;
 
 fn create_dummy_bg0(device: &RenderDevice, layout: &BindGroupLayout) -> BindGroup {
-    let buf = device.create_buffer(&BufferDescriptor {
-        label: Some("sdf_dummy_uniform"),
+    let camera_buf = device.create_buffer(&BufferDescriptor {
+        label: Some("sdf_dummy_camera_uniform"),
         size: 512,
         usage: BufferUsages::UNIFORM,
         mapped_at_creation: false,
@@ -252,7 +252,7 @@ fn create_dummy_bg0(device: &RenderDevice, layout: &BindGroupLayout) -> BindGrou
     device.create_bind_group(
         "sdf_bind_group_0_empty",
         layout,
-        &BindGroupEntries::sequential((buf.as_entire_buffer_binding(),)),
+        &BindGroupEntries::sequential((camera_buf.as_entire_buffer_binding(),)),
     )
 }
 
@@ -1322,7 +1322,10 @@ fn init_sdf_pipeline(
         "sdf_bind_group_0",
         &BindGroupLayoutEntries::sequential(
             ShaderStages::FRAGMENT,
-            (uniform_buffer::<SdfCameraData>(true),),
+            (
+                // binding 0: per-view camera uniform (dynamic offset)
+                uniform_buffer::<SdfCameraData>(true),
+            ),
         ),
     );
     let layout_1 = BindGroupLayoutDescriptor::new(

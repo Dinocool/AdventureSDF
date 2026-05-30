@@ -26,6 +26,8 @@
     find_chunk_cached,
     resolve_march,
     dist_to_brick_exit_lod,
+    dist_to_chunk_exit_lod,
+    in_ring_chunk,
 }
 #import sdf::cubic::{build_cell_cubic, solve_cell_cubic, dist_to_cell_exit}
 #import sdf::pbr::shade_material
@@ -102,10 +104,32 @@ fn raymarch(origin: vec3<f32>, dir: vec3<f32>) -> RaymarchResult {
 
         let scene = resolve_march(p, &cache);
 
-        // --- 1. Empty space: brick-geometry DDA to the next brick face ---------------
+        // --- 1. Empty space: hierarchical chunk-DDA skip -----------------------------
+        //
+        // Skip whole CHUNK boxes, not one brick at a time. A chunk absent from the table
+        // AND inside its LOD's resident ring is (treated as) empty — the bake cull never
+        // enqueues a chunk that has geometry — so we step to the far face of the LARGEST
+        // such box around `p`. Walk coarse→fine so the biggest provably-empty box wins.
+        // A present chunk (may hold occupied bricks) or an out-of-ring chunk (unbaked;
+        // a coarser LOD's ring covers it) is never chunk-skipped — we fall through to the
+        // brick-exit floor, which never crosses a baked brick. (Accepted caveat: a chunk
+        // still queued for bake reads as empty and may be skipped for a few frames under
+        // fast camera motion — a transient hole that fills in.)
         if (!scene.in_brick) {
             let wl = scene.window_lod;
-            t += dist_to_brick_exit_lod(p, dir, wl) + voxel_size_at(wl) * 0.01;
+            var adv = dist_to_brick_exit_lod(p, dir, wl) + voxel_size_at(wl) * 0.01;
+            let levels = lod_count();
+            for (var L = levels; L > 0u; ) {
+                L = L - 1u;                              // coarsest first = biggest box
+                let coord = world_to_brick_lod(p, L);
+                let key = abs_chunk_key(coord, L);
+                let ci = find_chunk_cached(L, key.x, key.y, &cache);
+                if (ci < 0 && in_ring_chunk(coord, L)) {
+                    adv = max(adv, dist_to_chunk_exit_lod(p, dir, L) + voxel_size_at(L) * 0.01);
+                    break;
+                }
+            }
+            t += adv;
             prev_d = 0.0;
             prev_step = 0.0;
             continue;
