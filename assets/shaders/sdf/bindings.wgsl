@@ -13,26 +13,9 @@ struct SdfCameraUniform {
     screen_params: vec4<f32>,
     grid_origin: vec4<f32>,
     grid_dims: vec4<f32>,
-    debug_params: vec4<f32>,   // x = max_steps, y = max_dist, z = sdf_eps, w = unused
+    debug_params: vec4<f32>,   // x = max_steps, y = max_dist, z = sdf_eps, w = recenter_snap_chunks
     march_params: vec4<f32>,   // x = pixel_cone (world radius/unit-dist/pixel), y = cubic_band, z = over_relax, w unused
     lod_params: vec4<f32>,     // x = lod_count, y = ring_bricks, z = base voxel_size, w = cell_stride
-};
-
-// Number of 3D distance-clipmap volume levels (Stage 2 empty-space accelerator). Mirrors
-// VolumeConfig::levels on the CPU; the `wgsl_volume_constants_match_rust` test pins them.
-const VOLUME_LEVELS: u32 = 4u;
-
-// Per-level parameters for the dense 3D distance clipmap. One `levels`/`decode` row per
-// resident clipmap level (finest = 0). The volume textures themselves are bound separately
-// (group 1, slots 12..15); this block carries where each level sits in the world + how to
-// decode its snorm samples back to world distance.
-struct SdfVolumeUniform {
-    // xyz = level's world-space min corner (origin_voxel * voxel_size); w = level voxel_size.
-    levels: array<vec4<f32>, 4>,
-    // x = decode scale (K * voxel_size): world_dist = sample * decode.x. yzw unused.
-    decode: array<vec4<f32>, 4>,
-    // x = active level count (<= VOLUME_LEVELS); y = resolution (voxels per axis). zw unused.
-    volume_dims: vec4<f32>,
 };
 
 // One material row, indexed by global material id. Mirrors `GpuSdfMaterial`
@@ -81,7 +64,6 @@ struct BrickTile {
 // lives CPU-side only, as the bake cull.
 
 @group(0) @binding(0) var<uniform> camera: SdfCameraUniform;
-@group(0) @binding(1) var<uniform> volume: SdfVolumeUniform;  // 3D distance-clipmap params
 @group(1) @binding(0) var atlas_tex: texture_2d<f32>;       // R16Snorm distance field
 @group(1) @binding(1) var atlas_sampler: sampler;
 @group(1) @binding(2) var<storage, read> chunk_buf: array<ChunkLookup>;  // sorted, binary-searched
@@ -96,14 +78,6 @@ struct BrickTile {
 @group(1) @binding(9) var tex_height: texture_2d_array<f32>;
 @group(1) @binding(10) var tex_edge: texture_2d_array<f32>;
 @group(1) @binding(11) var<storage, read> chunk_tile_buf: array<BrickTile>;  // packed per-chunk brick runs
-// 3D distance-clipmap volume textures (Stage 2), one per level (finest = l0). R16Snorm;
-// sampled trilinearly via `volume_sampler` in `sdf::volume`. Decoded to world distance with
-// `volume.decode[L].x`. Bound as 4 separate texture_3d (wgpu has no 3D texture arrays).
-@group(1) @binding(12) var volume_l0: texture_3d<f32>;
-@group(1) @binding(13) var volume_l1: texture_3d<f32>;
-@group(1) @binding(14) var volume_l2: texture_3d<f32>;
-@group(1) @binding(15) var volume_l3: texture_3d<f32>;
-@group(1) @binding(16) var volume_sampler: sampler;          // linear, ClampToEdge
 
 // --- Shared constants ---
 
@@ -136,6 +110,13 @@ fn over_relax() -> f32 { return camera.march_params.z; }
 const CHUNK_BRICKS: i32 = 4;
 
 fn lod_count() -> u32 { return u32(camera.lod_params.x); }
+// Ring window size in BRICKS per axis (mirrors SdfGridConfig::ring_bricks). The chunk-DDA
+// empty-space skip uses ring_bricks/CHUNK_BRICKS chunks per axis.
+fn ring_bricks() -> i32 { return i32(camera.lod_params.y); }
+// Coarse chunk lattice the per-LOD ring origin snaps to (hysteresis). Mirrors
+// SdfGridConfig::recenter_snap_chunks; the chunk-DDA in-ring test must use the SAME snap as
+// bake_scheduler::ring_chunk_origin or it will mis-classify chunks near the ring edge.
+fn recenter_snap_chunks() -> i32 { return i32(camera.debug_params.w); }
 // Brick spatial stride in voxels (cell_stride; same at every LOD — only the world
 // size of a voxel changes). Mirrors SdfGridConfig::cell_stride.
 fn cell_stride() -> i32 { return i32(camera.lod_params.w); }

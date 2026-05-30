@@ -11,7 +11,7 @@
 
 #import bevy_core_pipeline::fullscreen_vertex_shader::FullscreenVertexOutput
 
-#import sdf::bindings::{camera, max_steps, max_dist, sdf_eps, pixel_cone, cubic_band, over_relax, cell_stride, voxel_size_at, abs_chunk_key, local_brick_index}
+#import sdf::bindings::{camera, max_steps, max_dist, sdf_eps, pixel_cone, cubic_band, over_relax, cell_stride, voxel_size_at, abs_chunk_key, local_brick_index, lod_count}
 #import sdf::brick::{
     world_to_brick_lod,
     scene_sdf,
@@ -22,11 +22,12 @@
     new_chunk_cache,
     resolve_march,
     dist_to_brick_exit_lod,
+    dist_to_chunk_exit_lod,
+    in_ring_chunk,
+    find_chunk_cached,
 }
 #import sdf::cubic::{build_cell_cubic, solve_cell_cubic, dist_to_cell_exit}
 #import sdf::pbr::shade_material
-#import sdf::volume::{sample_volume, volume_serving_level}
-#import sdf::bindings::{brick_world_at, volume}
 
 // --- Raymarching ---
 
@@ -97,25 +98,30 @@ fn raymarch(origin: vec3<f32>, dir: vec3<f32>) -> RaymarchResult {
 
         let scene = resolve_march(p, &cache);
 
-        // --- 1. Empty space: 3D distance-clipmap jump, falling back to brick-DDA -------
+        // --- 1. Empty space: hierarchical chunk-DDA skip -----------------------------
         //
-        // The brick-DDA alone advances one brick face at a time (~150 steps through sky).
-        // The dense distance volume gives a CONSERVATIVE distance to the nearest surface, so
-        // far/empty rays can sphere-trace it in big steps. We take the LARGER of the volume
-        // distance and the brick-exit step: in true empty space the volume dominates (huge
-        // jumps); near geometry — within ~one finest brick — the volume's bound is small, so
-        // the brick-DDA floor takes over and the cubic/sphere-trace branches engage on the
-        // next iteration. The volume is a conservative lower bound, so this never overshoots.
+        // Skip whole CHUNK boxes, not one brick at a time. A chunk absent from the table
+        // AND inside its LOD's resident ring is (treated as) empty — the bake cull never
+        // enqueues a chunk that has geometry — so we step to the far face of the LARGEST
+        // such box around `p`. Walk coarse→fine so the biggest provably-empty box wins.
+        // A present chunk (may hold occupied bricks) or an out-of-ring chunk (unbaked;
+        // a coarser LOD's ring covers it) is never chunk-skipped — we fall through to the
+        // brick-exit floor, which never crosses a baked brick. (Accepted caveat: a chunk
+        // still queued for bake reads as empty and may be skipped for a few frames under
+        // fast camera motion — a transient hole that fills in.)
         if (!scene.in_brick) {
             let wl = scene.window_lod;
-            let brick_step = dist_to_brick_exit_lod(p, dir, wl) + voxel_size_at(wl) * 0.01;
-            let vol = sample_volume(p);
-            // Hand off to the brick march once the volume says we're within ~one finest
-            // brick of a surface; otherwise jump by the (larger) conservative volume step.
-            let handoff = brick_world_at(0u);
-            var adv = brick_step;
-            if (vol > handoff) {
-                adv = max(brick_step, vol);
+            var adv = dist_to_brick_exit_lod(p, dir, wl) + voxel_size_at(wl) * 0.01;
+            let levels = lod_count();
+            for (var L = levels; L > 0u; ) {
+                L = L - 1u;                              // coarsest first = biggest box
+                let coord = world_to_brick_lod(p, L);
+                let key = abs_chunk_key(coord, L);
+                let ci = find_chunk_cached(L, key.x, key.y, &cache);
+                if (ci < 0 && in_ring_chunk(coord, L)) {
+                    adv = max(adv, dist_to_chunk_exit_lod(p, dir, L) + voxel_size_at(L) * 0.01);
+                    break;
+                }
             }
             t += adv;
             prev_d = 0.0;
@@ -286,42 +292,6 @@ fn main(in: FullscreenVertexOutput) -> FragmentOutput {
         let c = f32(rm.steps) / f32(max_steps());
         let heat = vec3<f32>(c, 0.3 * (1.0 - c), 1.0 - c);
         return FragmentOutput(vec4<f32>(heat, 1.0), debug_depth(rm));
-    }
-    #endif
-
-    #ifdef SDF_DEBUG_VOLUME
-    // Visualise the 3D distance clipmap on EVERY pixel (hit AND miss) — placed before the
-    // miss early-return so sky rays still show which volume level covers them. On a hit we
-    // probe the hit point; on a miss we sample several points along the ray and show the
-    // FARTHEST level any of them reaches, so the sky reads as "covered by level N" rather
-    // than blank. Level palette matches SDF_DEBUG_LOD (0 white,1 green,2 blue,3 red,4+
-    // yellow); outside every level = dark violet. Brightness = volume distance band.
-    {
-        var serving = u32(volume.volume_dims.x);   // "outside" until a probe lands inside
-        var vd = 0.0;
-        if (rm.hit) {
-            serving = volume_serving_level(rm.hit_pos);
-            vd = sample_volume(rm.hit_pos);
-        } else {
-            // Walk a few points down the ray; report the deepest level reached + its distance.
-            serving = u32(volume.volume_dims.x);   // start "outside"
-            for (var k = 1u; k <= 8u; k = k + 1u) {
-                let p = ray_origin + ray_dir * (f32(k) * 6.0);
-                let sl = volume_serving_level(p);
-                if (sl < u32(volume.volume_dims.x)) {
-                    serving = sl;
-                    vd = sample_volume(p);
-                }
-            }
-        }
-        var col = vec3<f32>(0.05, 0.0, 0.1);       // outside every level: dark violet
-        if (serving == 0u) { col = vec3<f32>(1.0, 1.0, 1.0); }
-        else if (serving == 1u) { col = vec3<f32>(0.0, 1.0, 0.0); }
-        else if (serving == 2u) { col = vec3<f32>(0.0, 0.4, 1.0); }
-        else if (serving == 3u) { col = vec3<f32>(1.0, 0.0, 0.0); }
-        else if (serving != u32(volume.volume_dims.x)) { col = vec3<f32>(1.0, 1.0, 0.0); }
-        let band = clamp(vd / 16.0, 0.35, 1.0);
-        return FragmentOutput(vec4<f32>(col * band, 1.0), debug_depth(rm));
     }
     #endif
 
