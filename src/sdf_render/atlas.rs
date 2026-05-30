@@ -130,6 +130,14 @@ pub struct SdfAtlas {
     /// world compares it against its own last-seen value to skip re-uploading the
     /// atlas on frames where nothing changed (idle = zero GPU atlas work).
     pub generation: u64,
+    /// Monotonic counter bumped whenever the GPU chunk lookup / tile-run tables would
+    /// differ: a brick enters or exits the resident set, OR a resident brick's palette
+    /// changes (the tile-run carries each brick's palette + atlas slot). It is NOT bumped
+    /// when only a brick's *texels* change with its palette intact — that case needs a
+    /// `changed_tiles` texture write, not a table rebuild. The render world memos this and
+    /// rebuilds the O(bricks) chunk tables + re-uploads the lookup buffers only when it
+    /// advances, so a pure in-place texel re-bake no longer forces the table rebuild.
+    pub topology_generation: u64,
     /// Stable brick→tile mapping (see [`TileAllocator`]). Drives where each brick's
     /// texels live in the atlas texture and survives across bakes so partial uploads
     /// target the right sub-rect.
@@ -151,6 +159,7 @@ impl Default for SdfAtlas {
             rebake_all: true,
             dirty_bricks: HashSet::new(),
             generation: 0,
+            topology_generation: 0,
             tiles: TileAllocator::default(),
             changed_tiles: HashSet::new(),
             last_bake_was_full: false,
@@ -298,7 +307,17 @@ impl SdfAtlas {
     pub fn insert_brick(&mut self, key: BrickKey, brick: PackedBrick) {
         let tile = self.tiles.alloc(key);
         self.changed_tiles.insert(tile);
-        self.bricks.insert(key, brick);
+        // Any resident-set/texel change must make the render world re-extract, so bump the
+        // upload generation unconditionally. Additionally bump the *topology* generation
+        // when the GPU chunk tables would differ — a brand-new key, or a replaced brick
+        // whose palette changed (the tile-run carries the palette). A same-palette in-place
+        // re-bake only needs the `changed_tiles` texture write above (no table rebuild).
+        self.generation = self.generation.wrapping_add(1);
+        let palette_changed = self.bricks.get(&key).is_some_and(|old| old.palette != brick.palette);
+        let is_new = self.bricks.insert(key, brick).is_none();
+        if is_new || palette_changed {
+            self.topology_generation = self.topology_generation.wrapping_add(1);
+        }
     }
 
     /// Remove the brick at `key` (if present), freeing its tile. Returns whether a brick
@@ -307,6 +326,13 @@ impl SdfAtlas {
     pub fn remove_brick(&mut self, key: &BrickKey) -> bool {
         if self.bricks.remove(key).is_some() {
             self.tiles.release(key);
+            // Eviction changes both the resident set and the GPU chunk tables. Bump BOTH
+            // generations so the render world re-extracts (it gates on `generation`) and
+            // rebuilds the lookup tables (gated on `topology_generation`). Missing the
+            // `generation` bump here is what froze the GPU on stale bricks when a frame only
+            // evicted (e.g. flying away from the scene) without applying any new bake.
+            self.generation = self.generation.wrapping_add(1);
+            self.topology_generation = self.topology_generation.wrapping_add(1);
             true
         } else {
             false
@@ -334,6 +360,8 @@ impl SdfAtlas {
         self.rebake_all = false;
         self.dirty_bricks.clear();
         self.generation = self.generation.wrapping_add(1);
+        // A full bake replaces the entire resident set — the GPU chunk tables must rebuild.
+        self.topology_generation = self.topology_generation.wrapping_add(1);
 
         if edits.is_empty() {
             return;
@@ -376,13 +404,21 @@ impl SdfAtlas {
                     // (possibly freed) slot. Either way its texels changed.
                     let tile = self.tiles.alloc(key);
                     self.changed_tiles.insert(tile);
-                    self.bricks.insert(key, brick);
+                    // New key or changed palette ⇒ the GPU tables differ; same-palette
+                    // re-bake only needs the texel write above.
+                    let palette_changed = self.bricks.get(&key).is_some_and(|old| old.palette != brick.palette);
+                    let is_new = self.bricks.insert(key, brick).is_none();
+                    if is_new || palette_changed {
+                        self.topology_generation = self.topology_generation.wrapping_add(1);
+                    }
                 }
                 None => {
                     // Vacated: free the slot. No live lookup references it after the
                     // lookup buffer is rebuilt, so its stale texels are harmless.
                     self.tiles.release(&key);
-                    self.bricks.remove(&key);
+                    if self.bricks.remove(&key).is_some() {
+                        self.topology_generation = self.topology_generation.wrapping_add(1);
+                    }
                 }
             }
         }
@@ -1015,6 +1051,33 @@ mod tests {
             assert_eq!(baked.dist, ref_brick.dist, "dist mismatch at {key:?}");
             assert_eq!(baked.palette, ref_brick.palette, "palette mismatch at {key:?}");
         }
+    }
+
+    /// Evicting a brick must bump BOTH `generation` and `topology_generation`. The render
+    /// world's `extract_sdf_atlas` early-returns when `generation` is unchanged, so if
+    /// eviction skipped the bump, a frame that only evicted (e.g. flying away from the
+    /// scene, no new bake applied) would leave the GPU rendering the just-dropped bricks —
+    /// the LOD-stall-until-you-fly-forward bug.
+    #[test]
+    fn eviction_bumps_generation_for_gpu_extract() {
+        let config = super::super::SdfGridConfig { lod_count: 1, ..Default::default() };
+        let edits = vec![resolved(SdfPrimitive::Sphere { radius: 0.4 }, Transform::IDENTITY, SdfOp::default(), 0)];
+        let (_aabbs, bvh) = build_bvh(&edits);
+
+        let mut atlas = SdfAtlas::default();
+        atlas.full_bake(&edits, &bvh, &config, Vec3::ZERO);
+        let key = *atlas.bricks.keys().next().expect("scene must bake at least one brick");
+
+        let gen_before = atlas.generation;
+        let topo_before = atlas.topology_generation;
+        assert!(atlas.remove_brick(&key), "brick must actually be removed");
+        assert_ne!(atlas.generation, gen_before, "eviction must bump the upload generation");
+        assert_ne!(atlas.topology_generation, topo_before, "eviction must bump the topology generation");
+
+        // Removing a non-resident key must NOT bump (no spurious re-extract).
+        let gen_after = atlas.generation;
+        assert!(!atlas.remove_brick(&key), "second remove is a no-op");
+        assert_eq!(atlas.generation, gen_after, "no-op remove must not bump the generation");
     }
 
     /// A one-brick camera recenter on a LOD ring exposes only a thin shell — the count
