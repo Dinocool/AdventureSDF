@@ -245,6 +245,135 @@ fn march(
     MarchResult { steps: MAX_STEPS, hit: false, trace }
 }
 
+// --- Over-relaxation (Keinert 2014) measurement ------------------------------------
+//
+// The cone prepass removed the empty-corridor cost; the only hot pixels left are GRAZING
+// rays that skim a surface — `d` shrinks to a small min near closest approach, steps shrink
+// to ~`d`, and the march crawls many tiny steps through the near-tangent band. Plain sphere
+// tracing converges geometrically there, the inherent slow case.
+//
+// Over-relaxation steps `ω·d` (ω in [1,2)) instead of `d`, with the Keinert fallback: if the
+// new unbounding sphere of radius `d` doesn't reach back over the prior relaxed step, the
+// step overshot the surface — undo it and re-take safely. So hits never land at an overshoot
+// (no swimming normals); the win is purely on the grazing crawl.
+//
+// MEASURED (this test): a fixed ω≈1.8 cuts grazing-miss steps ~40% with ZERO hit↔miss flips;
+// gains flatten past 1.8 (near the ω<2 safety ceiling). Adaptive ω (Bálint & Valasek 2018,
+// ω=1/along-ray-slope) and a "receding boost" were BOTH measured WORSE here — on a true miss
+// the predicted surface never arrives, so the big jumps overshoot, fall back, and churn. So
+// the shipped change is just the fixed-ω default (sdf_render::SdfRaymarchParams::over_relax).
+
+/// March the real baked field with a fixed over-relaxation factor `omega`. Mirrors the
+/// shader's Keinert undo fallback + brick-exit clamp. Returns (steps, hit).
+fn march_relax(
+    origin: Vec3,
+    dir: Vec3,
+    cfg: &SdfGridConfig,
+    tables: &ChunkTables,
+    bricks: &HashMap<adventure::sdf_render::atlas::BrickKey, PackedBrick>,
+    camera_pos: Vec3,
+    omega: f32,
+) -> (u32, bool) {
+    const MAX_STEPS: u32 = 192;
+    const MAX_DIST: f32 = 2000.0;
+    const SDF_EPS: f32 = 0.001;
+    let mut t = 0.0f32;
+    let mut prev_d = 0.0f32;
+    let mut prev_step = 0.0f32;
+    for i in 0..MAX_STEPS {
+        if t > MAX_DIST {
+            return (i, false);
+        }
+        let p = origin + dir * t;
+        let scene = resolve_march(p, cfg, tables, bricks);
+
+        if !scene.in_brick {
+            let wl = scene.window_lod;
+            let vs_wl = cfg.voxel_size_at(wl);
+            let mut adv = dist_to_box_exit(p, dir, cfg.brick_world_size(wl)) + vs_wl * 0.01;
+            for l in (0..cfg.lod_count).rev() {
+                let coord = cfg.world_to_brick_lod(p, l);
+                if !chunk_resident(coord, l, cfg, tables) && in_ring_chunk(coord, l, cfg, camera_pos) {
+                    let cw = chunk::CHUNK_BRICKS as f32 * cfg.brick_world_size(l);
+                    adv = adv.max(dist_to_box_exit(p, dir, cw) + cfg.voxel_size_at(l) * 0.01);
+                    break;
+                }
+            }
+            t += adv;
+            prev_d = 0.0;
+            prev_step = 0.0;
+            continue;
+        }
+
+        let lod = scene.lod;
+        let voxel_size = cfg.voxel_size_at(lod);
+        let d = scene.dist;
+
+        // Keinert overshoot undo: if the prior relaxed step jumped past the surface (the new
+        // unbounding sphere doesn't reach back over it), step back and re-take safely.
+        if prev_step > 0.0 && d + prev_d < prev_step {
+            t += prev_d - prev_step; // negative
+            prev_d = 0.0;
+            prev_step = 0.0;
+            continue;
+        }
+
+        if d < SDF_EPS {
+            return (i + 1, true);
+        }
+
+        let brick_exit = dist_to_box_exit(p, dir, cfg.brick_world_size(lod));
+        let step = (omega * d).clamp(voxel_size * 0.01, brick_exit + voxel_size * 0.01);
+        t += step;
+        prev_d = d;
+        prev_step = step;
+    }
+    (MAX_STEPS, false)
+}
+
+#[test]
+fn measure_grazing_overrelax() {
+    let cfg = SdfGridConfig::default();
+    let (edits, bvh) = single_sphere();
+    let mut atlas = SdfAtlas::default();
+    let camera_pos = Vec3::new(0.0, 2.0, 6.0);
+    atlas.full_bake(&edits, &bvh, &cfg, camera_pos);
+    let tables = chunk::build_chunk_tables(&atlas, &cfg, |_k| chunk::BrickTile::default());
+
+    // Silhouette of the unit sphere from (0,2,6): centre dist √40≈6.32, half-angle
+    // asin(1/6.32)≈9.1°. Sweep the grazing band 7–12° around the to-centre direction.
+    let to_centre = (Vec3::ZERO - camera_pos).normalize();
+    let right = to_centre.cross(Vec3::Y).normalize();
+
+    println!("grazing fixed-omega sweep — steps + fate (silhouette ≈9.1°, shipped ω=1.8):");
+    println!("  angle   w1.0     w1.4     w1.8     w1.9     w1.95");
+    let mut flips = 0;
+    let baseline_hit: Vec<bool> = (700..=1250)
+        .step_by(25)
+        .map(|q| {
+            let ang = (q as f32 / 100.0).to_radians();
+            let dir = (to_centre * ang.cos() + right * ang.sin()).normalize();
+            march_relax(camera_pos, dir, &cfg, &tables, &atlas.bricks, camera_pos, 1.0).1
+        })
+        .collect();
+    for (idx, q) in (700..=1250).step_by(25).enumerate() {
+        let ang = (q as f32 / 100.0).to_radians();
+        let dir = (to_centre * ang.cos() + right * ang.sin()).normalize();
+        let run = |w: f32| march_relax(camera_pos, dir, &cfg, &tables, &atlas.bricks, camera_pos, w);
+        let f = |(s, h): (u32, bool)| format!("{:3}{}", s, if h { "H" } else { "m" });
+        let r18 = run(1.8);
+        if r18.1 != baseline_hit[idx] {
+            flips += 1;
+        }
+        println!(
+            "  {:>5.2}°   {:>6}   {:>6}   {:>6}   {:>6}   {:>6}",
+            ang.to_degrees(), f(run(1.0)), f(run(1.4)), f(r18), f(run(1.9)), f(run(1.95))
+        );
+    }
+    // The shipped ω=1.8 must not change any ray's fate vs plain sphere tracing (ω=1.0).
+    assert_eq!(flips, 0, "ω=1.8 flipped {flips} ray fate(s) vs ω=1.0 — quality regression");
+}
+
 // --- Per-LOD voxel-unit clamp simulation -------------------------------------------
 //
 // Model the proposed fix WITHOUT re-baking: the scene is one analytic sphere (r=1 at
