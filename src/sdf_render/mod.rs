@@ -524,6 +524,7 @@ fn setup_sdf_scene(
                 // scalar fallbacks are unused. Keep the prior neutral values.
                 metallic: 0.0,
                 roughness: 1.0,
+                parallax_scale: 0.15,
                 maps: std::array::from_fn(|_| {
                     Some(TexRef {
                         slug: slug.to_string(),
@@ -548,6 +549,8 @@ fn setup_sdf_scene(
             blend_softness: 0.0,
             metallic,
             roughness,
+            // Exemplars are textureless (no height map) so parallax is a no-op for them.
+            parallax_scale: 0.06,
             maps: std::array::from_fn(|_| None),
         });
         asset_table.register(handle)

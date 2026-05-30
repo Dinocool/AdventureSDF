@@ -39,6 +39,10 @@ pub struct MaterialAsset {
     pub metallic: f32,
     #[serde(default = "default_roughness")]
     pub roughness: f32,
+    /// Parallax relief depth (UV units) for the height map. `#[serde(default)]` →
+    /// `default_parallax` so older RON without the field gets a sensible visible relief.
+    #[serde(default = "default_parallax")]
+    pub parallax_scale: f32,
     /// One texture reference per PBR map (diffuse, normal, mra, height, edge);
     /// `None` = no texture for that map.
     pub maps: [Option<TexRef>; MATERIAL_TEX_MAPS],
@@ -50,6 +54,11 @@ fn default_roughness() -> f32 {
     1.0
 }
 
+/// serde default for `parallax_scale` (matches `MaterialDef::default`).
+fn default_parallax() -> f32 {
+    0.15
+}
+
 impl Default for MaterialAsset {
     fn default() -> Self {
         Self {
@@ -57,6 +66,7 @@ impl Default for MaterialAsset {
             blend_softness: 0.0,
             metallic: 0.0,
             roughness: 1.0,
+            parallax_scale: 0.15,
             maps: std::array::from_fn(|_| None),
         }
     }

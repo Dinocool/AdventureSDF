@@ -33,6 +33,14 @@ struct SdfMaterial {
     // without an MRA texture. Range 0..1 each.
     metallic: f32,
     roughness: f32,
+    // Parallax-occlusion relief depth (UV units) for this material's height map. 0 = flat.
+    parallax_scale: f32,
+    // Three SEPARATE u32 pads — NOT vec3<u32>, which has 16-byte alignment in WGSL and would
+    // bump the struct to 80 bytes, mismatching the 64-byte Rust GpuSdfMaterial (flat u32s).
+    // Names avoid trailing digits (naga_oil writeback rejects `pad0` etc).
+    pad_a: u32,
+    pad_b: u32,
+    pad_c: u32,
 };
 
 // Per-brick lookup. `key_hi`/`key_lo` are the absolute 64-bit brick key (lod + biased

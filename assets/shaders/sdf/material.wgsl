@@ -34,6 +34,99 @@ fn triplanar_weights(n: vec3<f32>) -> vec3<f32> {
     return w / max(w.x + w.y + w.z, 1e-5);
 }
 
+// --- Relief displacement (height map) ---
+//
+// Real displacement, not parallax: the visible surface point is MOVED inward to where the
+// height field actually carves it, so recesses (mortar between cobbles) genuinely recede —
+// visible head-on, with self-occlusion and correct view parallax. Scope: the displacement
+// lives WITHIN the smooth SDF envelope (it can't push past the silhouette, and the base
+// field's shadows/reflections still see the envelope) — only the directly-viewed surface is
+// carved. That's the standard contained scope for relief on an implicit surface.
+//
+// Method: after the base march hits the envelope at `hit_pos`, walk the view ray inward in
+// fixed depth steps. The relief surface sits `(1 - h) · depth` below the envelope along the
+// normal (h = height, 1 = peak/envelope, 0 = deepest). Find the first step where the ray has
+// gone below the relief surface, refine linearly, return the displaced world position. Bounded
+// 16 steps with the inward cosine floored, so grazing angles can't explode the march.
+
+// World→UV for the chosen triplanar plane (axis 0=X→zy, 1=Y→xz, 2=Z→xy), matching the
+// uv↔world pairings `sample_material_map` uses so the relief lines up with the textures.
+fn plane_uv(p: vec3<f32>, axis: u32) -> vec2<f32> {
+    if (axis == 0u) { return p.zy * TEXTURE_WORLD_SCALE; }
+    if (axis == 1u) { return p.xz * TEXTURE_WORLD_SCALE; }
+    return p.xy * TEXTURE_WORLD_SCALE;
+}
+
+// Height sample (0..1) for material `id` at world point `p`, on the dominant triplanar
+// plane of normal `n`. 0.5 when there's no height map (the centered neutral). Used by the
+// SDF_DISPLACE detail march to evaluate the displaced field g(p) = envelope_d - (H-0.5)·depth.
+fn relief_height_at(id: u32, p: vec3<f32>, n: vec3<f32>, lod: f32) -> f32 {
+    let mat = material_at(id);
+    if (mat.tex_height == 0xffffffffu) { return 0.5; }
+    let layer = i32(mat.tex_height);
+    let an = abs(n);
+    var axis = 2u;
+    if (an.x >= an.y && an.x >= an.z) { axis = 0u; }
+    else if (an.y >= an.z) { axis = 1u; }
+    return textureSampleLevel(tex_height, pbr_sampler, plane_uv(p, axis), layer, lod).r;
+}
+
+// Relief depth (world units) for this material, distance-faded; 0 if disabled / no height
+// map / far. Shared by the inward relief-displace and the SDF_DISPLACE detail march.
+fn relief_depth(id: u32, lod: f32) -> f32 {
+    let mat = material_at(id);
+    if (mat.tex_height == 0xffffffffu || mat.parallax_scale <= 0.0 || lod > 3.0) {
+        return 0.0;
+    }
+    return mat.parallax_scale * clamp(1.0 - lod / 3.0, 0.0, 1.0);
+}
+
+const RELIEF_STEPS: i32 = 16;
+
+// Displace `hit_pos` inward along `ray_dir` onto the height-field relief surface. Returns the
+// envelope hit unchanged when there's no height map, relief is disabled, or the hit is far.
+// `n` is the outward geometric normal; `depth_world` is the max relief depth in world units.
+fn relief_displace(id: u32, hit_pos: vec3<f32>, n: vec3<f32>, ray_dir: vec3<f32>, lod: f32) -> vec3<f32> {
+    let mat = material_at(id);
+    if (mat.tex_height == 0xffffffffu || mat.parallax_scale <= 0.0 || lod > 3.0) {
+        return hit_pos;
+    }
+    let layer = i32(mat.tex_height);
+    // Fade relief out with distance so far surfaces don't shimmer or pay for taps.
+    let depth_world = mat.parallax_scale * clamp(1.0 - lod / 3.0, 0.0, 1.0);
+    if (depth_world <= 0.0) { return hit_pos; }
+
+    // Inward cosine of the view ray vs the surface (floored so grazing rays stay bounded).
+    let cos_in = max(-dot(ray_dir, n), 0.2);
+
+    // Dominant triplanar axis selects the projection plane.
+    let an = abs(n);
+    var axis = 2u;
+    if (an.x >= an.y && an.x >= an.z) { axis = 0u; }
+    else if (an.y >= an.z) { axis = 1u; }
+
+    // Walk inward in equal depth steps. f(t) = ray_depth - relief_depth: starts negative (ray
+    // above the relief surface), we stop at the first step where it turns non-negative.
+    var prev_t = 0.0;
+    var prev_f = -((1.0 - textureSampleLevel(tex_height, pbr_sampler, plane_uv(hit_pos, axis), layer, lod).r) * depth_world);
+    for (var i = 1; i <= RELIEF_STEPS; i = i + 1) {
+        let ray_depth = (f32(i) / f32(RELIEF_STEPS)) * depth_world;  // target inward depth
+        let t = ray_depth / cos_in;                                  // ray param for that depth
+        let q = hit_pos + ray_dir * t;
+        let h = textureSampleLevel(tex_height, pbr_sampler, plane_uv(q, axis), layer, lod).r;
+        let f = ray_depth - (1.0 - h) * depth_world;
+        if (f >= 0.0) {
+            // Crossed between prev_t and t — linear refine where f == 0.
+            let w = f / max(f - prev_f, 1e-5);   // 0 → t, 1 → prev_t
+            return hit_pos + ray_dir * mix(t, prev_t, clamp(w, 0.0, 1.0));
+        }
+        prev_t = t;
+        prev_f = f;
+    }
+    // Never crossed (deepest recess): clamp to the max depth point.
+    return hit_pos + ray_dir * (depth_world / cos_in);
+}
+
 // Sample one PBR map for material `id` via triplanar projection at `lod`. The
 // `map` selector picks the array; an absent layer (tex == 0xffffffff) returns a
 // neutral default so unconfigured materials still shade. The map enum mirrors
