@@ -24,6 +24,7 @@
     floor_div,
     ring_bricks,
     recenter_snap_chunks,
+    DIST_BAND_VOXELS,
 }
 
 // --- Brick coordinate helpers ---
@@ -296,7 +297,10 @@ fn sample_brick_sdf(base_u: u32, world_pos: vec3<f32>, lod: u32) -> f32 {
     let x11 = mix(c011, c111, fx);
     let y0 = mix(x00, x10, fy);
     let y1 = mix(x01, x11, fy);
-    return mix(y0, y1, fz);
+    // Decode the per-LOD voxel-unit clamp: the bake stored `d / (DIST_BAND_VOXELS·voxel_size)`
+    // as snorm (atlas::dist_to_snorm_band), so multiply back to recover world distance. A
+    // coarse LOD's large band lets the sphere-trace take big steps far from the surface.
+    return mix(y0, y1, fz) * (DIST_BAND_VOXELS * voxel_size);
 }
 
 // Find the finest LOD with a baked brick at `world_pos`. Returns the brick location plus

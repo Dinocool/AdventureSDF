@@ -84,6 +84,11 @@ struct BrickTile {
 const PALETTE_EMPTY: u32 = 0xffffu;
 const TEXTURE_WORLD_SCALE: f32 = 0.5;  // world units per texture tile = 2.0
 const PI: f32 = 3.14159265359;
+// Per-LOD distance-field clamp band in VOXELS. The geometry distance atlas stores
+// `d / (DIST_BAND_VOXELS · voxel_size_at(lod))` as snorm; `sample_brick_sdf` multiplies back.
+// MUST match atlas::DIST_BAND_VOXELS on the CPU. Coarse LODs get a large world band → big
+// sphere-trace steps far from the surface (the per-LOD voxel-unit clamp).
+const DIST_BAND_VOXELS: f32 = 4.0;
 
 // --- Uniform accessors ---
 
