@@ -312,4 +312,112 @@ mod tests {
             "WGSL chunk key bias ({wgsl_bias}) != Rust chunk::KEY_BIAS ({KEY_BIAS})"
         );
     }
+
+    // --- Chunk-table build ↔ shader-resolve round-trip ------------------------------
+
+    use super::super::atlas::PackedBrick;
+
+    /// Mirror EXACTLY what `brick.wgsl::find_brick_lookup` does on the GPU: binary-search
+    /// the sorted chunk table by absolute key, test the occupancy bit for the brick's
+    /// local slot, and (if set) index the tile run at `tile_run_base + popcount(bits
+    /// strictly below the slot)`. Returns the resolved `BrickTile`, or `None` if not
+    /// resident. Keeping this in lockstep with the shader is the point of the test below.
+    fn shader_resolve(
+        tables: &ChunkTables,
+        config: &SdfGridConfig,
+        brick: BrickKey,
+    ) -> Option<BrickTile> {
+        let (ck, li) = chunk_of(brick, config); // li = local slot 0..63
+        let (key_hi, key_lo) = chunk_gpu_key(ck);
+        let idx = tables
+            .chunks
+            .binary_search_by(|c| (c.key_hi, c.key_lo).cmp(&(key_hi, key_lo)))
+            .ok()?;
+        let chunk = tables.chunks[idx];
+        let occ = (chunk.occ_lo as u64) | ((chunk.occ_hi as u64) << 32);
+        if (occ >> li) & 1 == 0 {
+            return None; // brick not resident in this chunk
+        }
+        let below = occ & ((1u64 << li) - 1); // bits strictly below the slot
+        let off = below.count_ones();
+        Some(tables.tile_run[(chunk.tile_run_base + off) as usize])
+    }
+
+    fn dummy_brick() -> PackedBrick {
+        use crate::sdf_render::edits::{PALETTE_EMPTY, PALETTE_K};
+        PackedBrick {
+            dist: [0; super::super::atlas::BRICK_VOXELS],
+            mat_dist: [0; super::super::atlas::BRICK_VOXELS * PALETTE_K],
+            palette: [PALETTE_EMPTY; PALETTE_K],
+        }
+    }
+
+    /// End-to-end CPU↔GPU contract: bricks scattered across several chunks and LODs must
+    /// each resolve — via the shader's occupancy-mask + popcount-offset unpack — back to
+    /// the exact tile `build_chunk_tables` assigned them, and a brick that isn't resident
+    /// must miss. A packing bug here silently maps a brick to the wrong tile (the visual
+    /// corruption class the chunked rework fixed), so this is the key regression guard.
+    #[test]
+    fn build_chunk_tables_resolves_each_brick_to_its_tile() {
+        let cfg = config();
+        let s = cfg.cell_stride();
+        let c = CHUNK_BRICKS;
+
+        // Encode each brick's identity into a unique tile so a wrong-tile mapping shows.
+        let tile_of = |k: &BrickKey| -> BrickTile {
+            let base = (k.lod << 28)
+                ^ ((k.coord.x as u32) << 16)
+                ^ ((k.coord.y as u32) << 8)
+                ^ (k.coord.z as u32);
+            BrickTile { atlas_base: base, pal01: base ^ 0x1111, pal23: base ^ 0x2222 }
+        };
+
+        // Bricks across: a sparse subset of slots in chunk (0,0,0), a neighbouring chunk,
+        // and a negative-coord chunk at lod 1.
+        let mut atlas = SdfAtlas::default();
+        let mut keys = Vec::new();
+        for (lx, ly, lz) in [(0, 0, 0), (1, 0, 0), (3, 2, 1)] {
+            keys.push(BrickKey::new(0, IVec3::new(lx * s, ly * s, lz * s)));
+        }
+        keys.push(BrickKey::new(0, IVec3::new(c * s, 0, 0))); // chunk (+x), local 0
+        keys.push(BrickKey::new(1, IVec3::new(-s, -s, -s))); // lod1, chunk (-1,-1,-1)
+        for k in &keys {
+            atlas.bricks.insert(*k, dummy_brick());
+        }
+
+        let tables = build_chunk_tables(&atlas, &cfg, tile_of);
+
+        assert!(
+            tables
+                .chunks
+                .windows(2)
+                .all(|w| (w[0].key_hi, w[0].key_lo) <= (w[1].key_hi, w[1].key_lo)),
+            "chunk table must be sorted by gpu key (binary-searchable)"
+        );
+        assert_eq!(
+            tables.tile_run.len(),
+            keys.len(),
+            "tile_run holds exactly one entry per resident brick"
+        );
+
+        for k in &keys {
+            let got = shader_resolve(&tables, &cfg, *k)
+                .unwrap_or_else(|| panic!("brick {k:?} failed to resolve"));
+            assert_eq!(got, tile_of(k), "brick {k:?} resolved to the wrong tile");
+        }
+
+        // Unoccupied slot in a resident chunk must miss (not alias a neighbour's tile).
+        let absent = BrickKey::new(0, IVec3::new(2 * s, 2 * s, 2 * s));
+        assert!(
+            shader_resolve(&tables, &cfg, absent).is_none(),
+            "an unoccupied slot in a resident chunk must not resolve"
+        );
+
+        // A brick in a chunk that isn't resident at all must miss.
+        let no_chunk = BrickKey::new(0, IVec3::new(50 * c * s, 0, 0));
+        assert!(
+            shader_resolve(&tables, &cfg, no_chunk).is_none(),
+            "a brick in an absent chunk must not resolve"
+        );
+    }
 }
