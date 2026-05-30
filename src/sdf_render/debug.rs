@@ -318,13 +318,21 @@ fn register_shader_modes(app: &mut App) {
         description: "SDF-traced reflections on metallic/smooth surfaces (secondary ray)"
             .into(),
     });
-    // Note: height-map relief displacement is always on (no shader-def toggle) — it's the
-    // sole height-map path. Its strength is the per-material `parallax_scale` (Inspect panel),
-    // 0 = flat.
+    // Per-pixel GPU relief march. Default OFF: height relief is baked into the SDF field at
+    // bake time (so shadows/reflections see it free). This toggle compiles in the A/B GPU path,
+    // which can exceed voxel resolution on the directly-viewed surface but costs per-pixel.
+    registry.register(ShaderDebugMode {
+        id: "sdf/gpu_relief".into(),
+        label: "GPU relief".into(),
+        shader_define: "SDF_GPU_RELIEF".into(),
+        kind: DebugModeKind::Toggle,
+        description: "Per-pixel GPU relief march (A/B vs the baked-in displacement; costlier)"
+            .into(),
+    });
 
     // Default the PBR feature toggles ON so the enhanced shading shows without hunting
     // for the checkbox. The state resource is separate from the registry; seed it after
-    // the `registry` borrow above ends (NLL drops it at last use).
+    // the `registry` borrow above ends (NLL drops it at last use). GPU relief stays OFF.
     {
         let mut state = app.world_mut().resource_mut::<ShaderDebugState>();
         state.set("sdf/shadows", true);

@@ -219,16 +219,14 @@ fn raymarch(origin: vec3<f32>, dir: vec3<f32>) -> RaymarchResult {
         let d = scene.dist;                          // trilinear SDF at p
         let cone = CONE * t;                         // pixel-cone half-width here
 
-        // --- 1b. Relief displacement band --------------------------------------------
-        // True height displacement that changes the silhouette. As the ray nears a fine-LOD
-        // height-mapped surface, hand off to a band march of the displaced field so a ray
-        // passing JUST OUTSIDE the envelope can still strike a peak (real outline bump). Only
-        // at LOD 0, within a small near-surface band, and only when the material actually has
-        // relief (`depth > 0`), so non-height-mapped surfaces take the normal march unchanged.
-        //
-        // Two-stage gate keeps the cost off the common path: a cheap fixed-band pre-test
-        // (RELIEF_MAX_BAND covers the largest relief the slider allows) bounds how often we pay
-        // the per-step `pick_material` tap; only then resolve the material + its true band.
+        // --- 1b. Relief displacement band (SDF_GPU_RELIEF, default OFF) ----------------
+        // The per-pixel A/B path. Height relief is normally BAKED into the SDF field at bake
+        // time (shadows/reflections see it free); this GPU march is compiled in only with the
+        // SDF_GPU_RELIEF shader-def. It hands off to a band march of the displaced field as the
+        // ray nears a fine-LOD height-mapped surface, so a ray passing JUST OUTSIDE the envelope
+        // can still strike a peak (silhouette bump beyond voxel resolution). Two-stage gate
+        // (cheap RELIEF_MAX_BAND pre-test, then the material's true band) keeps the cost local.
+#ifdef SDF_GPU_RELIEF
         if (lod == 0u && d < RELIEF_MAX_BAND) {
             let mid = pick_material(load_material_distances(scene.atlas_base, p, lod), scene.palette).id;
             let tex_lod = clamp(log2(max(t, 1.0)) - 1.0, 0.0, 8.0);
@@ -254,6 +252,7 @@ fn raymarch(origin: vec3<f32>, dir: vec3<f32>) -> RaymarchResult {
                 continue;
             }
         }
+#endif
 
         // --- LOD cross-fade: morph L → L+1, gliding PER-PIXEL with the camera ----------
         // The serving LOD L's resident ring box is chunk-snapped (it only re-centres in
@@ -514,6 +513,7 @@ fn main(in: FullscreenVertexOutput) -> FragmentOutput {
     // the material has no height map (`depth == 0`).
     let hit_pos = rm.hit_pos;
     var geo_normal = calc_normal(rm.hit_pos);
+#ifdef SDF_GPU_RELIEF
     {
         let depth = relief_depth(rm.object_id, lod);
         if (depth > 0.0) {
@@ -521,6 +521,7 @@ fn main(in: FullscreenVertexOutput) -> FragmentOutput {
             geo_normal = relief_normal(rm.object_id, hit_pos, geo_normal, axis, depth, lod);
         }
     }
+#endif
 
     // True reverse-Z projection depth so the SDF surface shares the depth buffer with normal
     // geometry (wireframe, gizmos): project the (displaced) world hit through the forward
