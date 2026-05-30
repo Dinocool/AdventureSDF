@@ -6,3 +6,10 @@ assets/textures/**/pbr.bc7
 
 # SDF diagnostic log (throwaway dev output)
 sdf_diag.log
+
+# Autonomous-loop runtime state (session-only, never committed).
+.claude/scheduled_tasks.lock
+
+# Editor's default unsaved-scene placeholder (real scenes are saved with a name,
+# e.g. world.scn.ron). Empty scratch file — should never be committed.
+assets/scenes/untitled.scene
