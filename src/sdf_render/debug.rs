@@ -12,7 +12,7 @@ use bevy_egui::{EguiTextureHandle, EguiUserTextures, egui};
 
 use crate::editor::panels::{DockSide, register_panel};
 use crate::editor::registry::{
-    DebugModeKind, ShaderDebugMode, ShaderDebugRegistry, debug_modes_ui,
+    DebugModeKind, ShaderDebugMode, ShaderDebugRegistry, ShaderDebugState, debug_modes_ui,
 };
 use crate::scene_manager::{AppScene, SceneEntity};
 
@@ -303,7 +303,7 @@ impl Plugin for SdfDebugPlugin {
 fn register_shader_modes(app: &mut App) {
     // Init in case SdfScenePlugin builds before EditorPlugin (main.rs order).
     app.init_resource::<ShaderDebugRegistry>();
-    let mut registry = app.world_mut().resource_mut::<ShaderDebugRegistry>();
+    app.init_resource::<ShaderDebugState>();
 
     let overlay = |id: &str, label: &str, define: &str, desc: &str| ShaderDebugMode {
         id: id.into(),
@@ -315,6 +315,7 @@ fn register_shader_modes(app: &mut App) {
         description: desc.into(),
     };
 
+    let mut registry = app.world_mut().resource_mut::<ShaderDebugRegistry>();
     registry.register(overlay(
         "sdf/step_count",
         "Steps",
@@ -411,6 +412,23 @@ fn register_shader_modes(app: &mut App) {
         kind: DebugModeKind::Toggle,
         description: "Brute-force linear chunk lookup (bypass binary search)".into(),
     });
+
+    // PBR feature toggles (independent checkboxes, not exclusive overlays). These
+    // gate real shading features behind shader-defs so their cost is opt-in/measurable.
+    registry.register(ShaderDebugMode {
+        id: "sdf/shadows".into(),
+        label: "Shadows".into(),
+        shader_define: "SDF_SHADOWS".into(),
+        kind: DebugModeKind::Toggle,
+        description: "SDF soft shadows (secondary ray toward the sun)".into(),
+    });
+
+    // Default the PBR feature toggles ON so the enhanced shading shows without hunting
+    // for the checkbox. The state resource is separate from the registry; seed it after
+    // the `registry` borrow above ends (NLL drops it at last use).
+    app.world_mut()
+        .resource_mut::<ShaderDebugState>()
+        .set("sdf/shadows", true);
 }
 
 // --- Atlas stats ---

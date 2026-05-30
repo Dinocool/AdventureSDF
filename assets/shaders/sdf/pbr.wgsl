@@ -7,6 +7,7 @@
 #import sdf::bindings::{camera, PI}
 #import sdf::brick::SceneSdfResult
 #import sdf::material::{material_at, sample_material_map, triplanar_normal}
+#import sdf::shadows::surface_shadow
 
 fn distribution_ggx(n: vec3<f32>, h: vec3<f32>, rough: f32) -> f32 {
     let a = rough * rough;
@@ -30,6 +31,16 @@ fn fresnel_schlick(cos_theta: f32, f0: vec3<f32>) -> vec3<f32> {
     return f0 + (vec3<f32>(1.0) - f0) * pow(clamp(1.0 - cos_theta, 0.0, 1.0), 5.0);
 }
 
+// Single source for the scene's key light. Hardcoded for now — the deferred lighting
+// pass rewrites ONLY these two helpers to read a light uniform, leaving the shadow /
+// reflection / ambient code (which all route through them) untouched.
+fn sun_dir() -> vec3<f32> {
+    return normalize(vec3<f32>(0.5, 1.0, 0.3));
+}
+fn sun_color() -> vec3<f32> {
+    return vec3<f32>(3.0);
+}
+
 // Evaluate Cook-Torrance for one material's resolved PBR inputs.
 fn shade_pbr(
     albedo: vec3<f32>,
@@ -40,6 +51,7 @@ fn shade_pbr(
     view_dir: vec3<f32>,
     light_dir: vec3<f32>,
     light_color: vec3<f32>,
+    shadow: f32,
 ) -> vec3<f32> {
     let h = normalize(view_dir + light_dir);
     let ndl = max(dot(n, light_dir), 0.0);
@@ -58,7 +70,7 @@ fn shade_pbr(
     let kd = (vec3<f32>(1.0) - f) * (1.0 - metallic);
     let diffuse = kd * albedo / PI;
 
-    let direct = (diffuse + specular) * light_color * ndl;
+    let direct = (diffuse + specular) * light_color * ndl * shadow;
     let ambient = albedo * 0.12 * ao;
     return ambient + direct;
 }
@@ -116,11 +128,19 @@ fn shade_material(res: SceneSdfResult, wpos: vec3<f32>, geo_n: vec3<f32>, lod: f
     }
 
     let view_dir = normalize(camera.camera_pos.xyz - wpos);
-    let light_dir = normalize(vec3<f32>(0.5, 1.0, 0.3));
-    let light_color = vec3<f32>(3.0);
+    let light_dir = sun_dir();
+    let light_color = sun_color();
+
+    // Soft shadow toward the sun (secondary SDF march). Geometric normal `geo_n` (not
+    // the normal-mapped `p.normal`) anchors the bias so it tracks the real surface.
+    var shadow = 1.0;
+#ifdef SDF_SHADOWS
+    shadow = surface_shadow(wpos, geo_n, light_dir, res.lod, 256.0);
+#endif
+
     let lit = shade_pbr(
         p.albedo, p.normal, p.metallic, p.roughness, p.ao,
-        view_dir, light_dir, light_color,
+        view_dir, light_dir, light_color, shadow,
     );
     // Tonemap (Reinhard) + approximate gamma so the linear PBR result displays well.
     let mapped = lit / (lit + vec3<f32>(1.0));

@@ -230,6 +230,10 @@ struct SdfPipeline {
     layout_1: BindGroupLayoutDescriptor,
     #[expect(dead_code)]
     shader_handle: Handle<Shader>,
+    /// The shader defs the current `pipeline_id` was queued with. Rebuild compares the
+    /// extracted defs against this (not a per-frame `changed` flag, which is fragile at
+    /// startup when the defs haven't synced yet) and re-queues only on a real mismatch.
+    current_defs: Vec<String>,
 }
 
 #[derive(Resource, Default)]
@@ -405,11 +409,12 @@ struct SdfShaderHandle(Handle<Shader>);
 struct SdfShaderModules(#[expect(dead_code)] Vec<Handle<Shader>>);
 
 /// The `#define_import_path` module files the entry shader composes.
-const SDF_SHADER_MODULES: [&str; 5] = [
+const SDF_SHADER_MODULES: [&str; 6] = [
     "shaders/sdf/bindings.wgsl",
     "shaders/sdf/brick.wgsl",
     "shaders/sdf/cubic.wgsl",
     "shaders/sdf/material.wgsl",
+    "shaders/sdf/shadows.wgsl",
     "shaders/sdf/pbr.wgsl",
 ];
 
@@ -626,31 +631,12 @@ fn sync_sdf_shader_defs(
 #[derive(Resource, Default)]
 struct ExtractedShaderDefs {
     defs: Vec<String>,
-    changed: bool,
 }
 
-fn extract_shader_defs(
-    defs: Extract<Res<SdfShaderDefs>>,
-    mut commands: Commands,
-    existing: Option<ResMut<ExtractedShaderDefs>>,
-) {
-    let new_defs = defs.defs.clone();
-    match existing {
-        Some(mut existing) => {
-            if existing.defs != new_defs {
-                existing.defs = new_defs;
-                existing.changed = true;
-            } else {
-                existing.changed = false;
-            }
-        }
-        None => {
-            commands.insert_resource(ExtractedShaderDefs {
-                defs: new_defs,
-                changed: false,
-            });
-        }
-    }
+fn extract_shader_defs(defs: Extract<Res<SdfShaderDefs>>, mut commands: Commands) {
+    commands.insert_resource(ExtractedShaderDefs {
+        defs: defs.defs.clone(),
+    });
 }
 
 fn rebuild_pipeline_on_def_change(
@@ -661,7 +647,10 @@ fn rebuild_pipeline_on_def_change(
     fullscreen_shader: Res<FullscreenShader>,
 ) {
     let Some(extracted) = extracted else { return };
-    if !extracted.changed {
+    // Rebuild whenever the extracted defs differ from what the live pipeline was built
+    // with — timing-independent, so the startup case (defs sync in a frame or two after
+    // the pipeline was first queued with empty defs) rebuilds without a manual toggle.
+    if extracted.defs == pipeline.current_defs {
         return;
     }
 
@@ -694,6 +683,7 @@ fn rebuild_pipeline_on_def_change(
     });
 
     pipeline.pipeline_id = new_id;
+    pipeline.current_defs = extracted.defs.clone();
 }
 
 // --- Extract: Pack Atlas for GPU ---
@@ -1488,6 +1478,8 @@ fn init_sdf_pipeline(
         layout_0,
         layout_1,
         shader_handle: shader,
+        // Queued above with empty shader_defs; rebuild fires once the synced defs differ.
+        current_defs: Vec::new(),
     });
     commands.insert_resource(SdfGpuAtlas {
         dist_tex: None,
