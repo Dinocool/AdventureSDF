@@ -26,7 +26,7 @@
 #import sdf::cubic::{build_cell_cubic, solve_cell_cubic, dist_to_cell_exit}
 #import sdf::pbr::shade_material
 #import sdf::volume::{sample_volume, volume_serving_level}
-#import sdf::bindings::brick_world_at
+#import sdf::bindings::{brick_world_at, volume}
 
 // --- Raymarching ---
 
@@ -289,6 +289,42 @@ fn main(in: FullscreenVertexOutput) -> FragmentOutput {
     }
     #endif
 
+    #ifdef SDF_DEBUG_VOLUME
+    // Visualise the 3D distance clipmap on EVERY pixel (hit AND miss) — placed before the
+    // miss early-return so sky rays still show which volume level covers them. On a hit we
+    // probe the hit point; on a miss we sample several points along the ray and show the
+    // FARTHEST level any of them reaches, so the sky reads as "covered by level N" rather
+    // than blank. Level palette matches SDF_DEBUG_LOD (0 white,1 green,2 blue,3 red,4+
+    // yellow); outside every level = dark violet. Brightness = volume distance band.
+    {
+        var serving = u32(volume.volume_dims.x);   // "outside" until a probe lands inside
+        var vd = 0.0;
+        if (rm.hit) {
+            serving = volume_serving_level(rm.hit_pos);
+            vd = sample_volume(rm.hit_pos);
+        } else {
+            // Walk a few points down the ray; report the deepest level reached + its distance.
+            serving = u32(volume.volume_dims.x);   // start "outside"
+            for (var k = 1u; k <= 8u; k = k + 1u) {
+                let p = ray_origin + ray_dir * (f32(k) * 6.0);
+                let sl = volume_serving_level(p);
+                if (sl < u32(volume.volume_dims.x)) {
+                    serving = sl;
+                    vd = sample_volume(p);
+                }
+            }
+        }
+        var col = vec3<f32>(0.05, 0.0, 0.1);       // outside every level: dark violet
+        if (serving == 0u) { col = vec3<f32>(1.0, 1.0, 1.0); }
+        else if (serving == 1u) { col = vec3<f32>(0.0, 1.0, 0.0); }
+        else if (serving == 2u) { col = vec3<f32>(0.0, 0.4, 1.0); }
+        else if (serving == 3u) { col = vec3<f32>(1.0, 0.0, 0.0); }
+        else if (serving != u32(volume.volume_dims.x)) { col = vec3<f32>(1.0, 1.0, 0.0); }
+        let band = clamp(vd / 16.0, 0.35, 1.0);
+        return FragmentOutput(vec4<f32>(col * band, 1.0), debug_depth(rm));
+    }
+    #endif
+
     if (!rm.hit) {
         return FragmentOutput(vec4<f32>(bg_color, 1.0), 0.0);
     }
@@ -439,27 +475,6 @@ fn main(in: FullscreenVertexOutput) -> FragmentOutput {
         return FragmentOutput(vec4<f32>(shaded_lod, 1.0), ndc_depth);
     }
     return FragmentOutput(vec4<f32>(bg_color * 0.3, 1.0), 1.0);
-    #endif
-
-    #ifdef SDF_DEBUG_VOLUME
-    // Visualise the 3D distance clipmap: tint each pixel by the FINEST volume level serving
-    // the hit point (or the camera ray's first in-volume point on a miss), with brightness
-    // from the volume distance band. Confirms the volume is resident where expected and that
-    // sky rays sample a coarse (far-reaching) level. Level palette matches SDF_DEBUG_LOD:
-    // 0 white, 1 green, 2 blue, 3 red; outside all levels = dim grey.
-    {
-        let probe = select(ray_origin + ray_dir * 4.0, rm.hit_pos, rm.hit);
-        let serving = volume_serving_level(probe);
-        let vd = sample_volume(probe);
-        var col = vec3<f32>(0.15, 0.15, 0.15);     // outside every level
-        if (serving == 0u) { col = vec3<f32>(1.0, 1.0, 1.0); }
-        else if (serving == 1u) { col = vec3<f32>(0.0, 1.0, 0.0); }
-        else if (serving == 2u) { col = vec3<f32>(0.0, 0.4, 1.0); }
-        else if (serving == 3u) { col = vec3<f32>(1.0, 0.0, 0.0); }
-        // Distance band as brightness: near surface dark, far bright (saturating at ~8u).
-        let band = clamp(vd / 8.0, 0.1, 1.0);
-        return FragmentOutput(vec4<f32>(col * band, 1.0), select(0.0, ndc_depth, rm.hit));
-    }
     #endif
 
     return FragmentOutput(vec4<f32>(shaded, 1.0), ndc_depth);

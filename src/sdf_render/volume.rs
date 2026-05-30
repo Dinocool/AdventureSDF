@@ -152,24 +152,38 @@ fn sub_offsets() -> [f32; VOLUME_SUBSAMPLES] {
     offs
 }
 
-/// Minimum analytic CSG distance over a voxel's cell (centre + `±½`-voxel sub-grid). Seeding
-/// with the centre guarantees the result is `<=` the centre sample, so the stored field is a
-/// conservative lower bound — the empty-space march can step it without overshooting.
+/// Conservative lower bound on the true distance over a voxel's whole cell.
+///
+/// CRITICAL: the march uses this value directly AS a sphere-trace step, AND `sample_volume`
+/// takes the MAX over overlapping levels — so it must NEVER exceed the true distance to the
+/// nearest surface anywhere in the cell, or the march overshoots and punches holes. A plain
+/// centre (or even min-over-corners) sample is NOT safe: a thin surface passing between the
+/// sample points would be missed and the voxel would report "far".
+///
+/// The CSG field is (at worst) Lipschitz-1 for the box/sphere/etc. primitives here, so the
+/// true distance can decrease by at most the distance travelled. From the cell centre the
+/// farthest cell point is the half-diagonal `½·√3·voxel_size`, so
+/// `centre_distance − ½·√3·voxel_size` is a guaranteed lower bound over the entire cell. We
+/// also fold in the corner min (it's cheap and only ever tightens the bound upward toward
+/// the true value when the centre estimate is loose), then take the smaller of the two.
 fn conservative_sample(edits: &[ResolvedEdit], world_pos: Vec3, voxel_size: f32) -> f32 {
-    let mut best = fold_csg(edits, world_pos).dist;
+    const HALF_DIAG: f32 = 0.866_025_4; // ½·√3
+    let centre = fold_csg(edits, world_pos).dist;
+    // Lipschitz lower bound over the cell from the centre sample.
+    let lipschitz = centre - HALF_DIAG * voxel_size;
+    // Corner min (a sampled lower bound); take the smaller so the result is conservative
+    // against both estimates.
+    let mut corner_min = centre;
     let offs = sub_offsets();
     for &oz in &offs {
         for &oy in &offs {
             for &ox in &offs {
                 let p = world_pos + Vec3::new(ox, oy, oz) * voxel_size;
-                let d = fold_csg(edits, p).dist;
-                if d < best {
-                    best = d;
-                }
+                corner_min = corner_min.min(fold_csg(edits, p).dist);
             }
         }
     }
-    best
+    lipschitz.min(corner_min)
 }
 
 /// Bake one dense clipmap level from the analytic CSG field. `Send`, no `&mut self`, no
