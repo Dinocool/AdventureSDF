@@ -376,18 +376,6 @@ fn main(in: FullscreenVertexOutput) -> FragmentOutput {
     return FragmentOutput(vec4<f32>(bg_color * 0.3, 1.0), 1.0);
     #endif
 
-    #ifdef SDF_DEBUG_HITPOS
-    if (rm.hit) {
-        // Color by the WORLD hit position octant sign (x→R, y→G, z→B channel = positive).
-        // Tests whether a left-screen ray is actually hitting LEFT geometry or has marched
-        // to the RIGHT half: if the "duplicated" left region shows the +x (red) colour, the
-        // ray hit right-side geometry → the bug is in the march/field, NOT tile addressing.
-        let s = step(vec3<f32>(0.0), hit_pos);   // 1 where coord >= 0
-        return FragmentOutput(vec4<f32>(s, 1.0), ndc_depth);
-    }
-    return FragmentOutput(vec4<f32>(bg_color * 0.3, 1.0), 1.0);
-    #endif
-
     #ifdef SDF_DEBUG_CHUNK_ID
     if (rm.hit) {
         // Colour by the resolved CHUNK key at the hit (same key the lookup binary-searches).

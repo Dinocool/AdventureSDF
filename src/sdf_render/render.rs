@@ -504,9 +504,6 @@ fn prepare_sdf_camera_data(
     raymarch: Res<super::SdfRaymarchParams>,
     registry: Res<super::edits::MaterialRegistry>,
     mut material_table: ResMut<SdfMaterialTable>,
-    // ISOLATION: live box transform for the analytic-box min shader. Packed into
-    // grid_origin (unused by the min shader's analytic scene_dist) so dragging works.
-    boxes: Query<(&Transform, &super::edits::SdfPrimitive), With<super::SdfVolume>>,
 ) {
     // The GPU material table mirrors the global registry verbatim: row i = the
     // material with global id i. Bricks index it by their palette ids. Rebuilt only
@@ -536,17 +533,6 @@ fn prepare_sdf_camera_data(
     let bpa = config.bricks_per_axis();
     let grid_size = config.grid_size;
 
-    // ISOLATION: pull the live box center + half-extent for the analytic-box min shader.
-    let (box_center, box_half) = boxes
-        .iter()
-        .find_map(|(t, prim)| match prim {
-            super::edits::SdfPrimitive::Box { half_extents } => {
-                Some((t.translation, half_extents.x))
-            }
-            _ => None,
-        })
-        .unwrap_or((Vec3::ZERO, 1.0));
-
     for (entity, camera, transform) in &cameras {
         let view_from_world = transform.to_matrix().inverse();
         let clip_from_world = camera.clip_from_view() * view_from_world;
@@ -570,8 +556,12 @@ fn prepare_sdf_camera_data(
             clip_from_world,
             camera_pos: transform.translation.extend(0.0),
             screen_params: Vec4::new(size.x as f32, size.y as f32, 0.0, 0.0),
-            // ISOLATION: xyz = live box center, w = half-extent (analytic-box min shader).
-            grid_origin: box_center.extend(box_half),
+            grid_origin: Vec4::new(
+                config.world_origin().x,
+                config.world_origin().y,
+                config.world_origin().z,
+                config.voxel_size,
+            ),
             grid_dims: Vec4::new(
                 grid_size as f32,
                 bpa as f32,

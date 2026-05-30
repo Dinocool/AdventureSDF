@@ -101,16 +101,10 @@ pub struct RayStepCapture {
 /// Diagnostic: when true, bypass the async/incremental bake scheduler and rebuild the
 /// whole atlas synchronously via `full_bake` every frame the edit set changes. Used to
 /// bisect whether a visual artifact lives in the async/incremental upload path (the thing
-/// `full_bake` skips) vs the bake math itself. Currently defaulted ON for diagnosis (async
-/// path ruled out for the duplication bug); flip back to async once the bug is found.
-#[derive(Resource)]
+/// `full_bake` skips) vs the bake math itself. Defaults OFF (async/incremental is the
+/// production path); the editor's "Sync bake" checkbox flips it on for diagnosis.
+#[derive(Resource, Default)]
 pub struct SyncBakeMode(pub bool);
-
-impl Default for SyncBakeMode {
-    fn default() -> Self {
-        Self(true)
-    }
-}
 
 /// Toggle for the SDF fullscreen raymarch pass. F1 flips this.
 #[derive(Resource)]
@@ -520,26 +514,14 @@ fn setup_sdf_scene(
         asset_table.register(handle)
     };
 
+    let mat_sand = mat("sand", "sand", "1");
     let mat_cobble = mat("cobble", "cobble_stone", "1");
+    let mat_cobble2 = mat("cobble2", "cobble_stone", "3");
+    let mat_ground = mat("ground", "ground", "1");
+    let mat_ground2 = mat("ground2", "ground", "4");
 
-    // Multi-LOD clipmap restored (the min shader now walks LODs via sample_sdf_world).
-    // A few levels exercises the LOD seam / coarse-shell behavior on the single cube.
-    commands.insert_resource(SdfGridConfig {
-        lod_count: 4,
-        ring_bricks: 16,
-        ..SdfGridConfig::default()
-    });
-
-    // MINIMAL REPRO SCENE: a single cube far out at all-negative coords. This is the
-    // smallest case that reproduces the "half renders twice" duplication, so the demo is
-    // pared down to it while we bisect the bug. (Restore the gallery once it's fixed.)
-    const CUBE_CENTRE: Vec3 = Vec3::new(-10.822, -0.339, -5.058);
-
-    // Camera: frame the cube (orbit target = cube centre).
-    let orbit = SdfOrbitCamera {
-        target: CUBE_CENTRE,
-        ..SdfOrbitCamera::default()
-    };
+    // Camera
+    let orbit = SdfOrbitCamera::default();
     let pos = orbit.target
         + Vec3::new(
             orbit.distance * orbit.yaw.cos() * orbit.pitch.cos(),
@@ -558,22 +540,89 @@ fn setup_sdf_scene(
     ));
     commands.insert_resource(orbit);
 
-    commands.spawn((
-        Transform::from_translation(CUBE_CENTRE),
-        SdfPrimitive::Box {
-            half_extents: Vec3::splat(1.0),
-        },
-        SdfOp {
-            kind: CsgKind::Union,
-            smoothing: 0.0,
-        },
-        SdfOrder(0),
-        SdfMaterial {
-            registry_id: mat_cobble,
-        },
-        SdfVolume,
-        SceneEntity,
-    ));
+    // Demo gallery: a wide, flat sand "ground plane" cube with a spread of distinct
+    // primitives resting on its top surface. All plain unions (no subtracts). The
+    // plane is centred so its top face sits at y = 0; each object's centre is then
+    // placed at y = its half-height so it rests exactly on the surface.
+    // (order, transform, primitive, material)
+    const PLANE_HALF_Y: f32 = 0.15; // thin slab → reads like a plane
+    let demo: [(u32, Transform, SdfPrimitive, u32); 7] = [
+        // Ground plane: wide + thin, top face at y = 0 (centre at y = -half_y).
+        (
+            0,
+            Transform::from_xyz(0.0, -PLANE_HALF_Y, 0.0),
+            SdfPrimitive::Box {
+                half_extents: Vec3::new(4.0, PLANE_HALF_Y, 3.0),
+            },
+            mat_sand,
+        ),
+        // Box resting on the plane (half-height 0.4 → centre at y = 0.4).
+        (
+            1,
+            Transform::from_xyz(-2.4, 0.4, 0.4),
+            SdfPrimitive::Box {
+                half_extents: Vec3::splat(0.4),
+            },
+            mat_cobble,
+        ),
+        (
+            2,
+            Transform::from_xyz(-1.1, 0.55, -0.3),
+            SdfPrimitive::Sphere { radius: 0.55 },
+            mat_cobble2,
+        ),
+        // Torus lies flat: its half-thickness above centre is `minor` (0.18).
+        (
+            3,
+            Transform::from_xyz(0.2, 0.18, 0.5),
+            SdfPrimitive::Torus {
+                major: 0.5,
+                minor: 0.18,
+            },
+            mat_ground,
+        ),
+        // Capsule standing up: half-height + radius above centre.
+        (
+            4,
+            Transform::from_xyz(1.3, 0.68, -0.4),
+            SdfPrimitive::Capsule {
+                half_height: 0.4,
+                radius: 0.28,
+            },
+            mat_ground2,
+        ),
+        // Cylinder standing up: half-height above centre.
+        (
+            5,
+            Transform::from_xyz(2.4, 0.5, 0.3),
+            SdfPrimitive::Cylinder {
+                radius: 0.4,
+                half_height: 0.5,
+            },
+            mat_cobble,
+        ),
+        (
+            6,
+            Transform::from_xyz(0.6, 0.45, -1.1),
+            SdfPrimitive::Sphere { radius: 0.45 },
+            mat_ground,
+        ),
+    ];
+
+    for (order, transform, prim, registry_id) in demo {
+        commands.spawn((
+            transform,
+            prim,
+            SdfOp {
+                kind: CsgKind::Union,
+                smoothing: 0.0,
+            },
+            SdfOrder(order),
+            SdfMaterial { registry_id },
+            SdfVolume,
+            SceneEntity,
+        ));
+    }
 
     // Directional light so 3D geometry (and debug wireframes) are visible.
     commands.spawn((

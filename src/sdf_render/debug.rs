@@ -12,7 +12,7 @@ use bevy_egui::{EguiTextureHandle, EguiUserTextures, egui};
 
 use crate::editor::panels::{DockSide, register_panel};
 use crate::editor::registry::{
-    DebugModeKind, ShaderDebugMode, ShaderDebugRegistry, ShaderDebugState, debug_modes_ui,
+    DebugModeKind, ShaderDebugMode, ShaderDebugRegistry, debug_modes_ui,
 };
 use crate::scene_manager::{AppScene, SceneEntity};
 
@@ -197,9 +197,6 @@ impl Plugin for SdfDebugPlugin {
             .register_type::<SdfAtlasStats>()
             .register_type::<BvhDebugState>()
             .register_type::<ChunkDebugState>()
-            // Diagnostic: start with "LOD 0 only" enabled so the LOD-disable bisect step
-            // is active on launch (per request). Remove this seed once the LOD bug is found.
-            .add_systems(Startup, seed_lod_debug_toggle)
             .add_systems(
                 Update,
                 update_atlas_stats.run_if(in_state(AppScene::SdfEditor)),
@@ -303,14 +300,6 @@ impl Plugin for SdfDebugPlugin {
     }
 }
 
-/// Diagnostic seed: enable the current bisect toggle at startup so it is active on launch.
-/// `ShaderDebugState` is the editor's checkbox-state resource; guarded by `Option` so a
-/// non-editor/test harness without it is a no-op. Remove once the bug is identified.
-fn seed_lod_debug_toggle(_state: Option<ResMut<ShaderDebugState>>) {
-    // No diagnostic toggle seeded — launch into the normal shaded render. (The toggles
-    // remain available in the shader-debug panel; re-enable a seed here if needed.)
-}
-
 fn register_shader_modes(app: &mut App) {
     // Init in case SdfScenePlugin builds before EditorPlugin (main.rs order).
     app.init_resource::<ShaderDebugRegistry>();
@@ -379,12 +368,6 @@ fn register_shader_modes(app: &mut App) {
         "Chunk ID",
         "SDF_DEBUG_CHUNK_ID",
         "Color by resolved chunk key (shade = local slot): same=one chunk, diff=cross-chunk",
-    ));
-    registry.register(overlay(
-        "sdf/hitpos",
-        "Hit pos sign",
-        "SDF_DEBUG_HITPOS",
-        "Color by world hit-pos sign (R=+x,G=+y,B=+z): does a left ray hit right geometry?",
     ));
 
     // Independent toggle (not part of the overlay group): bypass the per-ray chunk

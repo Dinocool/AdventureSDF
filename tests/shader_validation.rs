@@ -140,12 +140,6 @@ fn sdf_raymarch_wgsl_validates() {
     validate_composed_sdf().unwrap_or_else(|e| panic!("{e}"));
 }
 
-#[test]
-fn sdf_raymarch_min_wgsl_validates() {
-    // The bisect-baseline minimal entry must also compose against the sdf/ modules.
-    validate_composed_entry("assets/shaders/sdf_raymarch_min.wgsl", &[])
-        .unwrap_or_else(|e| panic!("{e}"));
-}
 
 /// Each `#ifdef` debug branch must also compile + validate (they're skipped when no
 /// def is set, so the default compose would miss errors inside them).
@@ -165,7 +159,6 @@ fn sdf_debug_modes_validate() {
         "SDF_LINEAR_CHUNK_SEARCH",
         "SDF_DEBUG_TILE_ID",
         "SDF_DEBUG_CHUNK_ID",
-        "SDF_DEBUG_HITPOS",
     ] {
         validate_composed_sdf_with_defs(&[def]).unwrap_or_else(|e| panic!("{e}"));
     }
