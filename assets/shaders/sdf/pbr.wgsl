@@ -130,9 +130,9 @@ struct PbrInputs {
 
 fn gather_pbr(id: u32, wpos: vec3<f32>, geo_n: vec3<f32>, lod: f32) -> PbrInputs {
     let mat = material_at(id);
-    // Note: relief DISPLACEMENT (the height map) happens at the hit in the entry shader
-    // (`relief_displace`), which moves `wpos` itself before this is called — so the maps
-    // here already sample the carved surface position. No UV-shift parallax here.
+    // Note: relief DISPLACEMENT (the height map) happens in the entry shader's march, which
+    // moves the hit `wpos` onto the displaced surface before this is called — so the maps here
+    // already sample the carved surface position. No UV-shift parallax here.
     let albedo = sample_material_map(id, 0u, wpos, geo_n, lod).rgb * mat.base_color.rgb;
     let edge = sample_material_map(id, 4u, wpos, geo_n, lod).r;
     let nrm = triplanar_normal(id, wpos, geo_n, lod);

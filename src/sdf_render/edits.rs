@@ -117,9 +117,8 @@ pub struct MaterialDef {
     /// `roughness` 0 = mirror, 1 = fully diffuse.
     pub metallic: f32,
     pub roughness: f32,
-    /// Parallax relief strength applied to this material's height map. 0 = flat (no
-    /// parallax); ~0.15 = clearly visible, ~0.3 = strong. Only has an effect when a height
-    /// map is present and `SDF_PARALLAX` is on.
+    /// Height-map relief displacement depth (world units). 0 = flat (no displacement);
+    /// ~0.15 = clearly visible, ~0.3 = strong. Only has an effect when a height map is present.
     pub parallax_scale: f32,
     /// PBR texture-array layer per map, or `u32::MAX` if absent. See [`MATERIAL_TEX_MAPS`].
     pub tex_layers: [u32; MATERIAL_TEX_MAPS],

@@ -26,7 +26,7 @@
 #import sdf::cubic::{build_cell_cubic, solve_cell_cubic, dist_to_cell_exit}
 #import sdf::pbr::{resolve_surface, shade_surface, shade_material_env, sun_dir, PbrInputs}
 #import sdf::sky::sky_color
-#import sdf::material::{relief_displace, relief_depth, relief_height_at}
+#import sdf::material::{relief_depth, relief_height_at}
 
 // --- Raymarching ---
 
@@ -165,13 +165,12 @@ fn raymarch(origin: vec3<f32>, dir: vec3<f32>) -> RaymarchResult {
         let d = scene.dist;                          // trilinear SDF at p
         let cone = CONE * t;                         // pixel-cone half-width here
 
-        // --- 1b. Relief displacement band (SDF_DISPLACE) -----------------------------
+        // --- 1b. Relief displacement band --------------------------------------------
         // True height displacement that changes the silhouette. As the ray nears a fine-LOD
         // height-mapped surface, hand off to a band march of the displaced field so a ray
         // passing JUST OUTSIDE the envelope can still strike a peak (real outline bump). Only
-        // at LOD 0 and within a small near-surface band; entirely #ifdef-gated so the default
-        // march is unchanged.
-#ifdef SDF_DISPLACE
+        // at LOD 0, within a small near-surface band, and only when the material actually has
+        // relief (`depth > 0`), so non-height-mapped surfaces take the normal march unchanged.
         if (lod == 0u && d < voxel_size * 6.0) {
             let mid = pick_material(load_material_distances(scene.atlas_base, p, lod), scene.palette).id;
             let tex_lod = clamp(log2(max(t, 1.0)) - 1.0, 0.0, 8.0);
@@ -197,7 +196,6 @@ fn raymarch(origin: vec3<f32>, dir: vec3<f32>) -> RaymarchResult {
                 continue;
             }
         }
-#endif
 
         // --- 2. LOD 0 near the surface: exact analytic cubic -------------------------
         // (SDF_DISABLE_CUBIC skips this branch → pure sphere-trace everywhere, for bisect.)
@@ -390,31 +388,18 @@ fn main(in: FullscreenVertexOutput) -> FragmentOutput {
     // raymarch, so we derive LOD analytically.) Tuned constant; clamped to a sane range.
     let lod = clamp(log2(max(rm.dist, 1.0)) - 1.0, 0.0, 8.0);
 
-    // Height-map relief. Two paths, gated by shader-def:
-    //   SDF_DISPLACE — TRUE displacement: sphere-trace the displaced field around the hit so
-    //     peaks bulge OUTWARD past the envelope (real silhouette change) and valleys recede.
-    //   SDF_PARALLAX — inward-only relief (carve within the envelope; cheaper, no silhouette).
-    // The displaced hit's geometric normal comes from the detail march (height gradient);
-    // otherwise it's the envelope gradient. Recompute depth at the moved point either way.
-    var hit_pos = rm.hit_pos;
+    // Height-map relief (true displacement). The displaced hit position already comes from the
+    // in-loop band march; here we only re-derive the relief-tilted shading normal (the envelope
+    // normal tilted by the local height gradient) so lighting follows the bumps. A no-op when
+    // the material has no height map (`depth == 0`).
+    let hit_pos = rm.hit_pos;
     var geo_normal = calc_normal(rm.hit_pos);
-    let view_to_cam = normalize(camera.camera_pos.xyz - rm.hit_pos);
-#ifdef SDF_DISPLACE
-    // The displaced hit position already comes from the in-loop band march; here we only
-    // re-derive the relief-tilted shading normal (envelope normal tilted by the local height
-    // gradient) so lighting follows the bumps.
     {
         let depth = relief_depth(rm.object_id, lod);
         if (depth > 0.0) {
             geo_normal = relief_normal(rm.object_id, hit_pos, geo_normal, depth, lod);
         }
     }
-#else
-#ifdef SDF_PARALLAX
-    hit_pos = relief_displace(rm.object_id, rm.hit_pos, geo_normal, -view_to_cam, lod);
-    geo_normal = calc_normal(hit_pos);
-#endif
-#endif
 
     // True reverse-Z projection depth so the SDF surface shares the depth buffer with normal
     // geometry (wireframe, gizmos): project the (displaced) world hit through the forward

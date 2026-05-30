@@ -81,52 +81,6 @@ fn relief_depth(id: u32, lod: f32) -> f32 {
     return mat.parallax_scale * clamp(1.0 - lod / 3.0, 0.0, 1.0);
 }
 
-const RELIEF_STEPS: i32 = 16;
-
-// Displace `hit_pos` inward along `ray_dir` onto the height-field relief surface. Returns the
-// envelope hit unchanged when there's no height map, relief is disabled, or the hit is far.
-// `n` is the outward geometric normal; `depth_world` is the max relief depth in world units.
-fn relief_displace(id: u32, hit_pos: vec3<f32>, n: vec3<f32>, ray_dir: vec3<f32>, lod: f32) -> vec3<f32> {
-    let mat = material_at(id);
-    if (mat.tex_height == 0xffffffffu || mat.parallax_scale <= 0.0 || lod > 3.0) {
-        return hit_pos;
-    }
-    let layer = i32(mat.tex_height);
-    // Fade relief out with distance so far surfaces don't shimmer or pay for taps.
-    let depth_world = mat.parallax_scale * clamp(1.0 - lod / 3.0, 0.0, 1.0);
-    if (depth_world <= 0.0) { return hit_pos; }
-
-    // Inward cosine of the view ray vs the surface (floored so grazing rays stay bounded).
-    let cos_in = max(-dot(ray_dir, n), 0.2);
-
-    // Dominant triplanar axis selects the projection plane.
-    let an = abs(n);
-    var axis = 2u;
-    if (an.x >= an.y && an.x >= an.z) { axis = 0u; }
-    else if (an.y >= an.z) { axis = 1u; }
-
-    // Walk inward in equal depth steps. f(t) = ray_depth - relief_depth: starts negative (ray
-    // above the relief surface), we stop at the first step where it turns non-negative.
-    var prev_t = 0.0;
-    var prev_f = -((1.0 - textureSampleLevel(tex_height, pbr_sampler, plane_uv(hit_pos, axis), layer, lod).r) * depth_world);
-    for (var i = 1; i <= RELIEF_STEPS; i = i + 1) {
-        let ray_depth = (f32(i) / f32(RELIEF_STEPS)) * depth_world;  // target inward depth
-        let t = ray_depth / cos_in;                                  // ray param for that depth
-        let q = hit_pos + ray_dir * t;
-        let h = textureSampleLevel(tex_height, pbr_sampler, plane_uv(q, axis), layer, lod).r;
-        let f = ray_depth - (1.0 - h) * depth_world;
-        if (f >= 0.0) {
-            // Crossed between prev_t and t — linear refine where f == 0.
-            let w = f / max(f - prev_f, 1e-5);   // 0 → t, 1 → prev_t
-            return hit_pos + ray_dir * mix(t, prev_t, clamp(w, 0.0, 1.0));
-        }
-        prev_t = t;
-        prev_f = f;
-    }
-    // Never crossed (deepest recess): clamp to the max depth point.
-    return hit_pos + ray_dir * (depth_world / cos_in);
-}
-
 // Sample one PBR map for material `id` via triplanar projection at `lod`. The
 // `map` selector picks the array; an absent layer (tex == 0xffffffff) returns a
 // neutral default so unconfigured materials still shade. The map enum mirrors
