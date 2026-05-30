@@ -109,6 +109,21 @@ pub struct RayStepCapture {
 #[derive(Resource, Default)]
 pub struct SyncBakeMode(pub bool);
 
+/// Which backend evaluates the per-voxel brick bake. The CPU always owns topology (BVH
+/// cull, which bricks exist, tile allocation, palette, chunk tables); this only chooses
+/// who fills the 512 voxel distance/material texels. `Gpu` (default) dispatches the
+/// `sdf_brick_bake.wgsl` compute shader to write the atlas directly; `Cpu` runs the
+/// legacy `fold_csg` voxel loop on the main thread. F9 flips it live so the two can be
+/// A/B'd on the same scene — they should be visually identical (see the divergence budget
+/// in the design plan). Default `Gpu`: the whole point is to keep the bake off the main
+/// thread so object drags don't tank the framerate.
+#[derive(Resource, Default, PartialEq, Eq, Clone, Copy, Debug)]
+pub enum BakeBackend {
+    #[default]
+    Gpu,
+    Cpu,
+}
+
 /// Toggle for the SDF fullscreen raymarch pass. F1 flips this.
 #[derive(Resource)]
 pub struct SdfRenderEnabled(pub bool);
@@ -417,6 +432,7 @@ impl Plugin for SdfScenePlugin {
             .init_resource::<bake_scheduler::PrevEditAabbs>()
             .init_resource::<bake_scheduler::BakeScheduler>()
             .init_resource::<bake_scheduler::SyncBakeRequest>()
+            .init_resource::<bake_scheduler::PendingGpuBakes>()
             .init_resource::<LodRingsVisible>()
             .init_resource::<bvh::Bvh>()
             .init_resource::<SdfRenderEnabled>()
@@ -424,6 +440,7 @@ impl Plugin for SdfScenePlugin {
             .init_resource::<WireframeBoundsVisible>()
             .init_resource::<RayStepCapture>()
             .init_resource::<SyncBakeMode>()
+            .init_resource::<BakeBackend>()
             .init_resource::<ViewportInputAllowed>()
             .init_resource::<gizmo::GizmoState>()
             .register_type::<SdfVolume>()
@@ -1203,6 +1220,8 @@ fn toggle_sdf_render(
     keyboard: Res<ButtonInput<KeyCode>>,
     mut enabled: ResMut<SdfRenderEnabled>,
     mut lod_rings: ResMut<LodRingsVisible>,
+    mut backend: ResMut<BakeBackend>,
+    mut atlas: ResMut<atlas::SdfAtlas>,
 ) {
     if keyboard.just_pressed(KeyCode::F1) {
         enabled.0 = !enabled.0;
@@ -1211,5 +1230,16 @@ fn toggle_sdf_render(
     if keyboard.just_pressed(KeyCode::F8) {
         lod_rings.0 = !lod_rings.0;
         info!("LOD ring overlay: {}", if lod_rings.0 { "ON" } else { "OFF" });
+    }
+    if keyboard.just_pressed(KeyCode::F9) {
+        *backend = match *backend {
+            BakeBackend::Gpu => BakeBackend::Cpu,
+            BakeBackend::Cpu => BakeBackend::Gpu,
+        };
+        // Force a full rebake so the whole resident set is re-evaluated by the newly
+        // selected backend — otherwise only future dirty bricks would switch and the
+        // A/B comparison would be a mix of both.
+        atlas.rebake_all = true;
+        info!("SDF bake backend: {:?}", *backend);
     }
 }
