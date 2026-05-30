@@ -358,7 +358,7 @@ fn gpu_world_to_brick_matches_cpu_for_negative_cube() {
     for center in centers {
         let (edits, bvh) = single_cube(center);
         let mut atlas = SdfAtlas::default();
-        atlas.full_bake(&edits, &bvh, &config, center);
+        atlas.full_bake(&edits, &bvh, &config, &adventure::sdf_render::height::HeightField::default(), center);
         let brick_coords: Vec<IVec3> = atlas.bricks.keys().map(|k| k.coord).collect();
         assert!(!brick_coords.is_empty(), "cube at {center:?} baked no bricks");
 
@@ -782,7 +782,7 @@ fn gpu_find_brick_lookup_matches_cpu() {
     let center = Vec3::new(-10.822, -0.339, -5.058);
     let (edits, bvh) = single_cube(center);
     let mut atlas = SdfAtlas::default();
-    atlas.full_bake(&edits, &bvh, &config, center);
+    atlas.full_bake(&edits, &bvh, &config, &adventure::sdf_render::height::HeightField::default(), center);
 
     // Deterministic atlas_base per brick so a wrong-tile resolve is detectable.
     let tables = build_chunk_tables(&atlas, &config, |key| {
