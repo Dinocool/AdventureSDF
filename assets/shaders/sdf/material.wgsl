@@ -34,6 +34,10 @@ fn triplanar_weights(n: vec3<f32>) -> vec3<f32> {
     return w / max(w.x + w.y + w.z, 1e-5);
 }
 
+// Height-map relief is applied at BAKE TIME (folded into the SDF field; see
+// sdf_render::height), not in the shader — so there are no relief helpers here. The shader
+// just marches the already-displaced field.
+
 // Sample one PBR map for material `id` via triplanar projection at `lod`. The
 // `map` selector picks the array; an absent layer (tex == 0xffffffff) returns a
 // neutral default so unconfigured materials still shade. The map enum mirrors

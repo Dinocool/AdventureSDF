@@ -246,6 +246,7 @@ impl SdfAtlas {
         key: BrickKey,
         config: &super::SdfGridConfig,
         edits: &[ResolvedEdit],
+        height: &super::height::HeightField,
     ) -> PackedBrick {
         let mut dist: SdfBrick = [0; BRICK_VOXELS];
         let mut mat_dist: MaterialBrick = [0; BRICK_VOXELS * PALETTE_K];
@@ -268,13 +269,40 @@ impl SdfAtlas {
         // of `mat_dist` is keyed to `palette[k]` for every voxel (uniform per brick).
         let palette = build_palette(edits, &positions);
 
+        // Relief is only applied at the finest LOD (the relief detail is smaller than a coarse
+        // voxel, so coarse bricks would only alias it) and only when some material carries it.
+        let apply_relief = key.lod == 0 && height.any_relief();
+
         for (idx, &world_pos) in positions.iter().enumerate() {
-            dist[idx] = Self::dist_to_snorm_band(fold_csg(edits, world_pos).dist, dist_band);
+            let sample = fold_csg(edits, world_pos);
+            let mut d = sample.dist;
+
+            // Bake-time height DISPLACEMENT: subtract the material's `(h-0.5)·depth` from the
+            // envelope distance so coarse relief lives in the field (shadows/reflections see it
+            // free). The triplanar axis needs the surface normal — the gradient of the CSG
+            // field, central-differenced at a voxel-scale offset.
+            if apply_relief {
+                let off = voxel_size * 0.5;
+                let n = Vec3::new(
+                    fold_csg(edits, world_pos + Vec3::X * off).dist
+                        - fold_csg(edits, world_pos - Vec3::X * off).dist,
+                    fold_csg(edits, world_pos + Vec3::Y * off).dist
+                        - fold_csg(edits, world_pos - Vec3::Y * off).dist,
+                    fold_csg(edits, world_pos + Vec3::Z * off).dist
+                        - fold_csg(edits, world_pos - Vec3::Z * off).dist,
+                );
+                let normal = n.normalize_or_zero();
+                if normal != Vec3::ZERO {
+                    d -= height.displacement(sample.material_id, world_pos, normal);
+                }
+            }
+
+            dist[idx] = Self::dist_to_snorm_band(d, dist_band);
 
             let slots = material_distances(edits, &palette, world_pos);
             let base = idx * PALETTE_K;
-            for (k, &d) in slots.iter().enumerate() {
-                mat_dist[base + k] = Self::dist_to_snorm(d);
+            for (k, &dd) in slots.iter().enumerate() {
+                mat_dist[base + k] = Self::dist_to_snorm(dd);
             }
         }
 
@@ -295,6 +323,7 @@ impl SdfAtlas {
         edits: &[ResolvedEdit],
         bvh: &Bvh,
         config: &super::SdfGridConfig,
+        height: &super::height::HeightField,
         scratch: &mut Vec<u32>,
     ) -> Option<PackedBrick> {
         let brick_world = config.brick_world_size(key.lod);
@@ -306,21 +335,22 @@ impl SdfAtlas {
         }
         scratch.sort_unstable();
         let culled: Vec<ResolvedEdit> = scratch.iter().map(|&i| edits[i as usize].clone()).collect();
-        Some(Self::bake_single_brick(key, config, &culled))
+        Some(Self::bake_single_brick(key, config, &culled, height))
     }
 
     /// Public, self-contained bake of one brick — the entry point the async bake tasks
     /// call (no `&mut self`, no shared scratch, so it's `Send` over a snapshot of the
-    /// edits, BVH, and config). Returns `None` for empty space (no edit reaches the
-    /// brick). Byte-identical to `bake_coord` for the same inputs.
+    /// edits, BVH, config, and height field). Returns `None` for empty space (no edit reaches
+    /// the brick). Byte-identical to `bake_coord` for the same inputs.
     pub fn bake_brick(
         key: BrickKey,
         edits: &[ResolvedEdit],
         bvh: &Bvh,
         config: &super::SdfGridConfig,
+        height: &super::height::HeightField,
     ) -> Option<PackedBrick> {
         let mut scratch: Vec<u32> = Vec::new();
-        Self::bake_coord(key, edits, bvh, config, &mut scratch)
+        Self::bake_coord(key, edits, bvh, config, height, &mut scratch)
     }
 
     /// Bump the change counter so the render world re-extracts the atlas next frame.
@@ -378,6 +408,7 @@ impl SdfAtlas {
         edits: &[ResolvedEdit],
         bvh: &Bvh,
         config: &super::SdfGridConfig,
+        height: &super::height::HeightField,
         camera_pos: Vec3,
     ) {
         self.bricks.clear();
@@ -396,7 +427,7 @@ impl SdfAtlas {
 
         let mut scratch: Vec<u32> = Vec::new();
         for key in ring_brick_keys(config, camera_pos) {
-            if let Some(brick) = Self::bake_coord(key, edits, bvh, config, &mut scratch) {
+            if let Some(brick) = Self::bake_coord(key, edits, bvh, config, height, &mut scratch) {
                 self.tiles.alloc(key);
                 self.bricks.insert(key, brick);
             }
@@ -415,6 +446,7 @@ impl SdfAtlas {
         edits: &[ResolvedEdit],
         bvh: &Bvh,
         config: &super::SdfGridConfig,
+        height: &super::height::HeightField,
     ) {
         if dirty.is_empty() {
             return;
@@ -425,7 +457,7 @@ impl SdfAtlas {
 
         let mut scratch: Vec<u32> = Vec::new();
         for &key in dirty {
-            match Self::bake_coord(key, edits, bvh, config, &mut scratch) {
+            match Self::bake_coord(key, edits, bvh, config, height, &mut scratch) {
                 Some(brick) => {
                     // Stable tile: a re-baked brick keeps its slot, a new one gets a
                     // (possibly freed) slot. Either way its texels changed.
@@ -553,7 +585,12 @@ mod tests {
         edits: &[ResolvedEdit],
     ) -> PackedBrick {
         let coord = config.world_to_brick_lod(Vec3::ZERO, 0);
-        SdfAtlas::bake_single_brick(BrickKey::new(0, coord), config, edits)
+        SdfAtlas::bake_single_brick(
+            BrickKey::new(0, coord),
+            config,
+            edits,
+            &super::super::height::HeightField::default(),
+        )
     }
 
     /// The winning (nearest) GLOBAL material id for voxel `idx`: argmin over the K
@@ -590,7 +627,12 @@ mod tests {
             0,
         )];
         let coord = config.world_to_brick_lod(Vec3::ZERO, lod);
-        let brick = SdfAtlas::bake_single_brick(BrickKey::new(lod, coord), &config, &edits);
+        let brick = SdfAtlas::bake_single_brick(
+            BrickKey::new(lod, coord),
+            &config,
+            &edits,
+            &super::super::height::HeightField::default(),
+        );
 
         let slack = band / 32767.0;
         for z in 0..BRICK_EDGE {
@@ -818,7 +860,7 @@ mod tests {
 
         let mut atlas = SdfAtlas::default();
         let (aabbs, bvh) = build_bvh(&edits);
-        atlas.full_bake(&edits, &bvh, &config, camera);
+        atlas.full_bake(&edits, &bvh, &config, &super::super::height::HeightField::default(), camera);
         let gen0 = atlas.generation;
 
         // Snapshot a brick owned by the far sphere.
@@ -842,7 +884,7 @@ mod tests {
             "far sphere's brick must not be in the dirty set"
         );
 
-        atlas.bake_incremental(&dirty, &moved, &new_bvh, &config);
+        atlas.bake_incremental(&dirty, &moved, &new_bvh, &config, &super::super::height::HeightField::default());
 
         assert_ne!(atlas.generation, gen0, "incremental bake must bump generation");
         let far_after = atlas
@@ -871,7 +913,7 @@ mod tests {
 
         let mut atlas = SdfAtlas::default();
         let (aabbs, bvh) = build_bvh(&edits);
-        atlas.full_bake(&edits, &bvh, &config, camera);
+        atlas.full_bake(&edits, &bvh, &config, &super::super::height::HeightField::default(), camera);
 
         // Move it, then update via incremental on the old+new union.
         let mut moved = edits.clone();
@@ -879,11 +921,11 @@ mod tests {
         let (new_aabbs, new_bvh) = build_bvh(&moved);
         let mut dirty = dirty_for_aabb(&config, &aabbs[0], camera);
         dirty.extend(dirty_for_aabb(&config, &new_aabbs[0], camera));
-        atlas.bake_incremental(&dirty, &moved, &new_bvh, &config);
+        atlas.bake_incremental(&dirty, &moved, &new_bvh, &config, &super::super::height::HeightField::default());
 
         // Reference: full bake of the moved scene from scratch (same camera/rings).
         let mut reference = SdfAtlas::default();
-        reference.full_bake(&moved, &new_bvh, &config, camera);
+        reference.full_bake(&moved, &new_bvh, &config, &super::super::height::HeightField::default(), camera);
 
         // Every brick the reference has, the incremental atlas must match exactly.
         for (key, ref_brick) in &reference.bricks {
@@ -924,7 +966,7 @@ mod tests {
 
         let mut atlas = SdfAtlas::default();
         let (aabbs, bvh) = build_bvh(&edits);
-        atlas.full_bake(&edits, &bvh, &config, camera);
+        atlas.full_bake(&edits, &bvh, &config, &super::super::height::HeightField::default(), camera);
         // prev footprint, as schedule_bakes tracks via PrevEditAabbs.
         let mut prev_aabb = aabbs[0];
 
@@ -938,11 +980,11 @@ mod tests {
 
             let mut dirty = dirty_for_aabb(&config, &prev_aabb, camera);
             dirty.extend(dirty_for_aabb(&config, &new_aabbs[0], camera));
-            atlas.bake_incremental(&dirty, &edits, &new_bvh, &config);
+            atlas.bake_incremental(&dirty, &edits, &new_bvh, &config, &super::super::height::HeightField::default());
             prev_aabb = new_aabbs[0];
 
             let mut reference = SdfAtlas::default();
-            reference.full_bake(&edits, &new_bvh, &config, camera);
+            reference.full_bake(&edits, &new_bvh, &config, &super::super::height::HeightField::default(), camera);
 
             // Same set of live brick keys (no missing, no stale).
             let inc_keys: HashSet<_> = atlas.bricks.keys().copied().collect();
@@ -991,7 +1033,7 @@ mod tests {
         let mut atlas = SdfAtlas::default();
         let camera = Vec3::ZERO;
         let (aabbs, bvh) = build_bvh(&edits);
-        atlas.full_bake(&edits, &bvh, &config, camera);
+        atlas.full_bake(&edits, &bvh, &config, &super::super::height::HeightField::default(), camera);
         let mut prev_sphere_aabb = aabbs[1];
 
         for step in 1..=50 {
@@ -1002,11 +1044,11 @@ mod tests {
             // Only the sphere changed → dirty = its old∪new footprint.
             let mut dirty = dirty_for_aabb(&config, &prev_sphere_aabb, camera);
             dirty.extend(dirty_for_aabb(&config, &new_aabbs[1], camera));
-            atlas.bake_incremental(&dirty, &edits, &new_bvh, &config);
+            atlas.bake_incremental(&dirty, &edits, &new_bvh, &config, &super::super::height::HeightField::default());
             prev_sphere_aabb = new_aabbs[1];
 
             let mut reference = SdfAtlas::default();
-            reference.full_bake(&edits, &new_bvh, &config, camera);
+            reference.full_bake(&edits, &new_bvh, &config, &super::super::height::HeightField::default(), camera);
 
             let inc_keys: HashSet<_> = atlas.bricks.keys().copied().collect();
             let ref_keys: HashSet<_> = reference.bricks.keys().copied().collect();
@@ -1054,7 +1096,7 @@ mod tests {
         )];
         let mut atlas = SdfAtlas::default();
         let (_aabbs, bvh) = build_bvh(&edits);
-        atlas.full_bake(&edits, &bvh, &config, Vec3::ZERO);
+        atlas.full_bake(&edits, &bvh, &config, &super::super::height::HeightField::default(), Vec3::ZERO);
         let candidates = (config.ring_bricks * config.ring_bricks * config.ring_bricks) as usize;
         assert!(
             atlas.bricks.len() < candidates,
@@ -1082,11 +1124,11 @@ mod tests {
         let (_aabbs, bvh) = build_bvh(&edits);
 
         let mut atlas = SdfAtlas::default();
-        atlas.full_bake(&edits, &bvh, &config, Vec3::ZERO);
+        atlas.full_bake(&edits, &bvh, &config, &super::super::height::HeightField::default(), Vec3::ZERO);
 
         // Every brick full_bake produced must match a standalone bake_brick of its key.
         for (key, ref_brick) in &atlas.bricks {
-            let baked = SdfAtlas::bake_brick(*key, &edits, &bvh, &config)
+            let baked = SdfAtlas::bake_brick(*key, &edits, &bvh, &config, &super::super::height::HeightField::default())
                 .expect("a baked key must rebake non-empty");
             assert_eq!(baked.dist, ref_brick.dist, "dist mismatch at {key:?}");
             assert_eq!(baked.palette, ref_brick.palette, "palette mismatch at {key:?}");
@@ -1105,7 +1147,7 @@ mod tests {
         let (_aabbs, bvh) = build_bvh(&edits);
 
         let mut atlas = SdfAtlas::default();
-        atlas.full_bake(&edits, &bvh, &config, Vec3::ZERO);
+        atlas.full_bake(&edits, &bvh, &config, &super::super::height::HeightField::default(), Vec3::ZERO);
         let key = *atlas.bricks.keys().next().expect("scene must bake at least one brick");
 
         let gen_before = atlas.generation;
@@ -1174,7 +1216,7 @@ mod tests {
             for coord in ring_window_coords(config, new_origin) {
                 if !coord_in_window(config, coord, old_origin) {
                     let key = BrickKey::new(lod, coord);
-                    match SdfAtlas::bake_brick(key, edits, bvh, config) {
+                    match SdfAtlas::bake_brick(key, edits, bvh, config, &super::super::height::HeightField::default()) {
                         Some(b) => atlas.insert_brick(key, b),
                         None => {
                             atlas.remove_brick(&key);
@@ -1218,7 +1260,7 @@ mod tests {
 
         let cam0 = Vec3::ZERO;
         let mut atlas = SdfAtlas::default();
-        atlas.full_bake(&edits, &bvh, &config, cam0);
+        atlas.full_bake(&edits, &bvh, &config, &super::super::height::HeightField::default(), cam0);
 
         // Walk the camera across several brick widths in small steps (crosses LOD-0 and
         // LOD-1 boundaries), recentering incrementally each step.
@@ -1229,7 +1271,7 @@ mod tests {
             cam = next;
 
             let mut reference = SdfAtlas::default();
-            reference.full_bake(&edits, &bvh, &config, cam);
+            reference.full_bake(&edits, &bvh, &config, &super::super::height::HeightField::default(), cam);
 
             let inc: HashSet<_> = atlas.bricks.keys().copied().collect();
             let refk: HashSet<_> = reference.bricks.keys().copied().collect();
@@ -1265,7 +1307,7 @@ mod tests {
         let (_aabbs, bvh) = build_bvh(&edits);
 
         let mut atlas = SdfAtlas::default();
-        atlas.full_bake(&edits, &bvh, &config, Vec3::ZERO);
+        atlas.full_bake(&edits, &bvh, &config, &super::super::height::HeightField::default(), Vec3::ZERO);
 
         // Fly far past the sphere (it leaves every ring) then back to the origin.
         recenter_sync(&mut atlas, &config, &edits, &bvh, Vec3::ZERO, Vec3::new(50.0, 0.0, 0.0));
@@ -1279,7 +1321,7 @@ mod tests {
         );
 
         let mut reference = SdfAtlas::default();
-        reference.full_bake(&edits, &bvh, &config, Vec3::ZERO);
+        reference.full_bake(&edits, &bvh, &config, &super::super::height::HeightField::default(), Vec3::ZERO);
 
         let inc: HashSet<_> = atlas.bricks.keys().copied().collect();
         let refk: HashSet<_> = reference.bricks.keys().copied().collect();
@@ -1304,7 +1346,7 @@ mod tests {
         let (_aabbs, bvh) = build_bvh(&edits);
 
         let mut atlas = SdfAtlas::default();
-        atlas.full_bake(&edits, &bvh, &config, Vec3::ZERO);
+        atlas.full_bake(&edits, &bvh, &config, &super::super::height::HeightField::default(), Vec3::ZERO);
         assert!(!atlas.bricks.is_empty(), "sphere bakes some bricks at origin");
 
         recenter_sync(

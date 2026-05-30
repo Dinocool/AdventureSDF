@@ -42,6 +42,7 @@ pub mod chunk;
 pub mod debug;
 pub mod edits;
 pub mod gizmo;
+pub mod height;
 pub mod picking;
 pub mod render;
 pub mod textures;
@@ -165,6 +166,14 @@ pub struct SdfRaymarchParams {
     /// ring boundary instead of snapping (removes the visible LOD pop/seam). 0 = disabled
     /// (hard LOD seams, the original behaviour). Tunable live via the editor raymarch panel.
     pub lod_blend_band: f32,
+    /// Coarse-LOD iso-offset α. Convex objects render thinner at coarse LODs because
+    /// trilinear interpolation of the sampled field over-estimates distance on a convex
+    /// surface, pushing the zero-isosurface inward by ≈ `(h²/8)·κ` (h = voxel size). To
+    /// re-inflate, the sphere-trace march takes the surface where the field equals
+    /// `α · voxel_size(lod)² / base_voxel_size` (quadratic in h to match the bias law)
+    /// instead of 0. Zero at LOD 0 (the analytic cubic owns the near surface), so fine
+    /// detail is untouched; grows with the LOD. 0 = off. Tunable live in the raymarch panel.
+    pub surface_bias: f32,
 }
 
 impl Default for SdfRaymarchParams {
@@ -179,6 +188,7 @@ impl Default for SdfRaymarchParams {
             cubic_band: 0.5,
             over_relax: 1.6,
             lod_blend_band: 0.2,
+            surface_bias: 0.0,
         }
     }
 }
@@ -406,6 +416,7 @@ impl Plugin for SdfScenePlugin {
             .init_resource::<atlas::SdfAtlas>()
             .init_resource::<bake_scheduler::PrevEditAabbs>()
             .init_resource::<bake_scheduler::BakeScheduler>()
+            .init_resource::<bake_scheduler::SyncBakeRequest>()
             .init_resource::<LodRingsVisible>()
             .init_resource::<bvh::Bvh>()
             .init_resource::<SdfRenderEnabled>()
@@ -439,6 +450,15 @@ impl Plugin for SdfScenePlugin {
                     .run_if(in_state(AppScene::SdfEditor))
                     .run_if(|allowed: Res<ViewportInputAllowed>| allowed.0),
             )
+            // Focus easing runs even while the pointer is over a dock panel, so a
+            // Hierarchy double-click animates the camera without re-entering the
+            // viewport. NOT gated on ViewportInputAllowed (unlike orbit_camera).
+            .add_systems(
+                Update,
+                ease_orbit_focus
+                    .run_if(in_state(AppScene::SdfEditor))
+                    .run_if(|m: Res<SdfCameraMode>| !m.fps),
+            )
             // Gizmo interaction THEN click-selection, both in `Last`, chained so the
             // gizmo claims a handle click before `sdf_picking` would reselect the
             // volume underneath (`sdf_picking` bails when `GizmoState.claimed_click`).
@@ -453,6 +473,15 @@ impl Plugin for SdfScenePlugin {
             // edits in the inspector (and gizmo drags) must still re-bake. The async
             // scheduler pair runs unless SyncBakeMode is on (diagnostic), in which case
             // the synchronous whole-atlas `sync_bake` runs instead.
+            // Rebuild the bake-time height cache when materials change, BEFORE the bakers, so a
+            // displacement edit triggers a rebake the same frame.
+            .add_systems(
+                Update,
+                update_height_field
+                    .run_if(in_state(AppScene::SdfEditor))
+                    .before(bake_scheduler::schedule_bakes)
+                    .before(sync_bake),
+            )
             .add_systems(
                 Update,
                 (bake_scheduler::schedule_bakes, bake_scheduler::apply_bakes)
@@ -530,6 +559,11 @@ fn setup_sdf_scene(
             material_assets.add(MaterialAsset {
                 base_color: [1.0, 1.0, 1.0, 1.0],
                 blend_softness: 0.0,
+                // Textured material: MRA texture supplies metallic/roughness, so these
+                // scalar fallbacks are unused. Keep the prior neutral values.
+                metallic: 0.0,
+                roughness: 1.0,
+                parallax_scale: 0.15,
                 maps: std::array::from_fn(|_| {
                     Some(TexRef {
                         slug: slug.to_string(),
@@ -543,9 +577,29 @@ fn setup_sdf_scene(
 
     let mat_sand = mat("sand", "sand", "1");
     let mat_cobble = mat("cobble", "cobble_stone", "1");
-    let mat_cobble2 = mat("cobble2", "cobble_stone", "3");
     let mat_ground = mat("ground", "ground", "1");
-    let mat_ground2 = mat("ground2", "ground", "4");
+
+    // Textureless PBR exemplars: synthesized in-memory with NO maps, so the shader uses
+    // the scalar metallic/roughness fallbacks. These show the Stage-3 IBL clearly — a
+    // smooth metal mirrors the sky, a rough one reads as brushed/satin metal.
+    let mut exemplar = |color: [f32; 4], metallic: f32, roughness: f32| -> u32 {
+        let handle = material_assets.add(MaterialAsset {
+            base_color: color,
+            blend_softness: 0.0,
+            metallic,
+            roughness,
+            // Exemplars are textureless (no height map) so parallax is a no-op for them.
+            parallax_scale: 0.06,
+            maps: std::array::from_fn(|_| None),
+        });
+        asset_table.register(handle)
+    };
+    // Deep red, fully metallic, fairly smooth — the headline mirror-metal sphere.
+    let mat_red_metal = exemplar([0.55, 0.04, 0.03, 1.0], 1.0, 0.18);
+    // Gold-ish metal, medium roughness — satin highlight, softer sky reflection.
+    let mat_gold_rough = exemplar([0.83, 0.62, 0.18, 1.0], 1.0, 0.45);
+    // Glossy white dielectric — near-mirror clearcoat look, strong fresnel rim.
+    let mat_white_gloss = exemplar([0.9, 0.9, 0.92, 1.0], 0.0, 0.08);
 
     // Camera
     let orbit = SdfOrbitCamera::default();
@@ -592,11 +646,12 @@ fn setup_sdf_scene(
             },
             mat_cobble,
         ),
+        // Headline exemplar: deep-red mirror metal sphere (textureless, scalar PBR).
         (
             2,
             Transform::from_xyz(-1.1, 0.55, -0.3),
             SdfPrimitive::Sphere { radius: 0.55 },
-            mat_cobble2,
+            mat_red_metal,
         ),
         // Torus lies flat: its half-thickness above centre is `minor` (0.18).
         (
@@ -608,7 +663,7 @@ fn setup_sdf_scene(
             },
             mat_ground,
         ),
-        // Capsule standing up: half-height + radius above centre.
+        // Rough gold metal exemplar: satin highlight, softer sky reflection.
         (
             4,
             Transform::from_xyz(1.3, 0.68, -0.4),
@@ -616,7 +671,7 @@ fn setup_sdf_scene(
                 half_height: 0.4,
                 radius: 0.28,
             },
-            mat_ground2,
+            mat_gold_rough,
         ),
         // Cylinder standing up: half-height above centre.
         (
@@ -628,11 +683,12 @@ fn setup_sdf_scene(
             },
             mat_cobble,
         ),
+        // Glossy white dielectric exemplar: near-mirror clearcoat, strong fresnel rim.
         (
             6,
             Transform::from_xyz(0.6, 0.45, -1.1),
             SdfPrimitive::Sphere { radius: 0.45 },
-            mat_ground,
+            mat_white_gloss,
         ),
     ];
 
@@ -696,17 +752,6 @@ fn orbit_camera(
         orbit.distance = (orbit.distance - ev.y * 0.5).clamp(0.5, 50.0);
     }
 
-    // Smoothly ease the orbit target toward a double-click focus point. Exponential
-    // smoothing (frame-rate independent); cleared once we're within a hair of it.
-    if let Some(dest) = focus.target {
-        let t = 1.0 - (-12.0 * input.time.delta_secs()).exp();
-        orbit.target = orbit.target.lerp(dest, t);
-        if orbit.target.distance(dest) < 0.01 {
-            orbit.target = dest;
-            focus.target = None;
-        }
-    }
-
     let orbiting = input.mouse.pressed(MouseButton::Middle);
     let panning = orbiting
         && (input.keyboard.pressed(KeyCode::ShiftLeft)
@@ -748,6 +793,40 @@ fn orbit_camera(
             orbit.distance * orbit.yaw.sin() * orbit.pitch.cos(),
         );
 
+    for mut transform in &mut camera_query {
+        *transform = Transform::from_translation(pos).looking_at(orbit.target, Vec3::Y);
+    }
+}
+
+/// Ease the orbit target toward a double-click focus point and recompute the camera
+/// transform. Separate from `orbit_camera` (and NOT gated on `ViewportInputAllowed`)
+/// so a focus triggered from a dock panel — e.g. double-clicking a Hierarchy row —
+/// animates immediately, instead of stalling until the pointer re-enters the
+/// viewport. Orbit-mode only; the FPS camera ignores the orbit target.
+fn ease_orbit_focus(
+    mut orbit: ResMut<SdfOrbitCamera>,
+    mut focus: ResMut<OrbitFocus>,
+    time: Res<Time>,
+    mut camera_query: Query<&mut Transform, (With<SdfCamera>, Without<SdfVolume>)>,
+) {
+    let Some(dest) = focus.target else {
+        return;
+    };
+
+    // Exponential smoothing (frame-rate independent); snap + clear once we're close.
+    let t = 1.0 - (-12.0 * time.delta_secs()).exp();
+    orbit.target = orbit.target.lerp(dest, t);
+    if orbit.target.distance(dest) < 0.01 {
+        orbit.target = dest;
+        focus.target = None;
+    }
+
+    let pos = orbit.target
+        + Vec3::new(
+            orbit.distance * orbit.yaw.cos() * orbit.pitch.cos(),
+            orbit.distance * orbit.pitch.sin(),
+            orbit.distance * orbit.yaw.sin() * orbit.pitch.cos(),
+        );
     for mut transform in &mut camera_query {
         *transform = Transform::from_translation(pos).looking_at(orbit.target, Vec3::Y);
     }
@@ -1059,6 +1138,27 @@ fn upload_sdf_buffers(_atlas: Res<atlas::SdfAtlas>) {
     // Render world will pick up atlas changes via extract
 }
 
+/// Rebuild the bake-time height cache when the material registry's displacement columns
+/// (`tex_layers[3]`, `parallax_scale`) change, snapshot it into the scheduler for async tasks,
+/// and force a rebake so the new relief is folded into the field. A no-op when nothing
+/// displacement-relevant changed (fingerprint match) — colour-only edits don't rebake.
+fn update_height_field(
+    registry: Res<edits::MaterialRegistry>,
+    library: Res<crate::assets::MaterialTextureLibrary>,
+    mut sched: ResMut<bake_scheduler::BakeScheduler>,
+    mut atlas: ResMut<atlas::SdfAtlas>,
+    mut last_fingerprint: Local<u64>,
+) {
+    if let Some(rebuilt) = height::build(&registry, &library, *last_fingerprint) {
+        *last_fingerprint = rebuilt.fingerprint;
+        // The scheduler owns the canonical Arc snapshot (async bake tasks clone it; sync_bake
+        // reads it via `height_field`). A registry change that alters displacement forces a
+        // full rebake so the relief is folded into the field.
+        sched.set_height(std::sync::Arc::new(rebuilt));
+        atlas.rebake_all = true;
+    }
+}
+
 /// Diagnostic synchronous bake (active only when [`SyncBakeMode`] is on): rebuild the whole
 /// atlas via `full_bake` whenever the edit set changes or the camera crosses a brick, fully
 /// bypassing the async/incremental scheduler + partial-upload path. `full_bake` sets
@@ -1071,6 +1171,7 @@ fn sync_bake(
     mut prev_aabbs: ResMut<bake_scheduler::PrevEditAabbs>,
     mut last_origin: Local<Option<IVec3>>,
     config: Res<SdfGridConfig>,
+    sched: Res<bake_scheduler::BakeScheduler>,
     volumes: Query<VolumeQueryData, With<SdfVolume>>,
     changed: Query<Entity, (With<SdfVolume>, bake_scheduler::ChangedEditFilter)>,
     camera: Query<&Transform, (With<SdfCamera>, Without<SdfVolume>)>,
@@ -1092,7 +1193,7 @@ fn sync_bake(
     let resolved: Vec<edits::ResolvedEdit> = gathered.iter().map(|g| g.edit.clone()).collect();
     let aabbs: Vec<bevy::math::bounding::Aabb3d> = gathered.iter().map(|g| g.aabb).collect();
     *bvh = bvh::Bvh::build(&aabbs);
-    atlas.full_bake(&resolved, &bvh, &config, camera_pos);
+    atlas.full_bake(&resolved, &bvh, &config, sched.height_field(), camera_pos);
 
     prev_aabbs.set_map(current);
     *last_origin = Some(origin0);

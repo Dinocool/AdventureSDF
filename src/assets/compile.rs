@@ -43,6 +43,9 @@ fn compile_materials(
             Some(asset) => MaterialDef {
                 base_color: asset.color(),
                 blend_softness: asset.blend_softness,
+                metallic: asset.metallic,
+                roughness: asset.roughness,
+                parallax_scale: asset.parallax_scale,
                 tex_layers: std::array::from_fn(|m| resolve(&mut library, asset, m)),
             },
             // Still loading: leave a fallback row; an AssetEvent::Added re-runs us.
@@ -73,6 +76,9 @@ fn defs_equal(a: &[MaterialDef], b: &[MaterialDef]) -> bool {
         && a.iter().zip(b).all(|(x, y)| {
             x.base_color == y.base_color
                 && x.blend_softness == y.blend_softness
+                && x.metallic == y.metallic
+                && x.roughness == y.roughness
+                && x.parallax_scale == y.parallax_scale
                 && x.tex_layers == y.tex_layers
         })
 }
