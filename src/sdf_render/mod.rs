@@ -42,6 +42,7 @@ pub mod chunk;
 pub mod debug;
 pub mod edits;
 pub mod gizmo;
+pub mod height;
 pub mod picking;
 pub mod render;
 pub mod textures;
@@ -460,6 +461,15 @@ impl Plugin for SdfScenePlugin {
             // edits in the inspector (and gizmo drags) must still re-bake. The async
             // scheduler pair runs unless SyncBakeMode is on (diagnostic), in which case
             // the synchronous whole-atlas `sync_bake` runs instead.
+            // Rebuild the bake-time height cache when materials change, BEFORE the bakers, so a
+            // displacement edit triggers a rebake the same frame.
+            .add_systems(
+                Update,
+                update_height_field
+                    .run_if(in_state(AppScene::SdfEditor))
+                    .before(bake_scheduler::schedule_bakes)
+                    .before(sync_bake),
+            )
             .add_systems(
                 Update,
                 (bake_scheduler::schedule_bakes, bake_scheduler::apply_bakes)
@@ -1116,6 +1126,27 @@ fn upload_sdf_buffers(_atlas: Res<atlas::SdfAtlas>) {
     // Render world will pick up atlas changes via extract
 }
 
+/// Rebuild the bake-time height cache when the material registry's displacement columns
+/// (`tex_layers[3]`, `parallax_scale`) change, snapshot it into the scheduler for async tasks,
+/// and force a rebake so the new relief is folded into the field. A no-op when nothing
+/// displacement-relevant changed (fingerprint match) — colour-only edits don't rebake.
+fn update_height_field(
+    registry: Res<edits::MaterialRegistry>,
+    library: Res<crate::assets::MaterialTextureLibrary>,
+    mut sched: ResMut<bake_scheduler::BakeScheduler>,
+    mut atlas: ResMut<atlas::SdfAtlas>,
+    mut last_fingerprint: Local<u64>,
+) {
+    if let Some(rebuilt) = height::build(&registry, &library, *last_fingerprint) {
+        *last_fingerprint = rebuilt.fingerprint;
+        // The scheduler owns the canonical Arc snapshot (async bake tasks clone it; sync_bake
+        // reads it via `height_field`). A registry change that alters displacement forces a
+        // full rebake so the relief is folded into the field.
+        sched.set_height(std::sync::Arc::new(rebuilt));
+        atlas.rebake_all = true;
+    }
+}
+
 /// Diagnostic synchronous bake (active only when [`SyncBakeMode`] is on): rebuild the whole
 /// atlas via `full_bake` whenever the edit set changes or the camera crosses a brick, fully
 /// bypassing the async/incremental scheduler + partial-upload path. `full_bake` sets
@@ -1128,6 +1159,7 @@ fn sync_bake(
     mut prev_aabbs: ResMut<bake_scheduler::PrevEditAabbs>,
     mut last_origin: Local<Option<IVec3>>,
     config: Res<SdfGridConfig>,
+    sched: Res<bake_scheduler::BakeScheduler>,
     volumes: Query<VolumeQueryData, With<SdfVolume>>,
     changed: Query<Entity, (With<SdfVolume>, bake_scheduler::ChangedEditFilter)>,
     camera: Query<&Transform, (With<SdfCamera>, Without<SdfVolume>)>,
@@ -1149,7 +1181,7 @@ fn sync_bake(
     let resolved: Vec<edits::ResolvedEdit> = gathered.iter().map(|g| g.edit.clone()).collect();
     let aabbs: Vec<bevy::math::bounding::Aabb3d> = gathered.iter().map(|g| g.aabb).collect();
     *bvh = bvh::Bvh::build(&aabbs);
-    atlas.full_bake(&resolved, &bvh, &config, camera_pos);
+    atlas.full_bake(&resolved, &bvh, &config, sched.height_field(), camera_pos);
 
     prev_aabbs.set_map(current);
     *last_origin = Some(origin0);

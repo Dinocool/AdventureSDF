@@ -34,57 +34,9 @@ fn triplanar_weights(n: vec3<f32>) -> vec3<f32> {
     return w / max(w.x + w.y + w.z, 1e-5);
 }
 
-// --- Relief displacement (height map) ---
-//
-// Real displacement, not parallax: the visible surface point is MOVED inward to where the
-// height field actually carves it, so recesses (mortar between cobbles) genuinely recede —
-// visible head-on, with self-occlusion and correct view parallax. Scope: the displacement
-// lives WITHIN the smooth SDF envelope (it can't push past the silhouette, and the base
-// field's shadows/reflections still see the envelope) — only the directly-viewed surface is
-// carved. That's the standard contained scope for relief on an implicit surface.
-//
-// Method: after the base march hits the envelope at `hit_pos`, walk the view ray inward in
-// fixed depth steps. The relief surface sits `(1 - h) · depth` below the envelope along the
-// normal (h = height, 1 = peak/envelope, 0 = deepest). Find the first step where the ray has
-// gone below the relief surface, refine linearly, return the displaced world position. Bounded
-// 16 steps with the inward cosine floored, so grazing angles can't explode the march.
-
-// Dominant triplanar axis of a normal: 0 = X plane (uv = zy), 1 = Y (xz), 2 = Z (xy). The
-// relief march pins this ONCE at band entry so the inner loop samples a single plane (1 tap)
-// instead of the full triplanar blend (3 taps) — a 3× cut in the hottest code. The uv↔world
-// pairings are the same ones `sample_material_map` uses, so on an axis-dominant face (the
-// common case) the carve lines up with the diffuse exactly.
-fn relief_axis(n: vec3<f32>) -> u32 {
-    let an = abs(n);
-    if (an.x >= an.y && an.x >= an.z) { return 0u; }
-    if (an.y >= an.z) { return 1u; }
-    return 2u;
-}
-
-// Single-plane height sample (0..1) for material `id` at `p` on the given triplanar `axis`.
-// 0.5 (centred neutral) when there's no height map. One texture tap.
-fn relief_height_plane(id: u32, p: vec3<f32>, axis: u32, lod: f32) -> f32 {
-    let mat = material_at(id);
-    let layer = i32(mat.tex_height);
-    // Select UV without an early return so texture access is uniform (naga requires
-    // textureSampleLevel to be in uniform control flow at the call site).
-    let uv_x = p.zy * TEXTURE_WORLD_SCALE;
-    let uv_y = p.xz * TEXTURE_WORLD_SCALE;
-    let uv_z = p.xy * TEXTURE_WORLD_SCALE;
-    let uv = select(select(uv_z, uv_y, axis == 1u), uv_x, axis == 0u);
-    let h = textureSampleLevel(tex_height, pbr_sampler, uv, max(layer, 0), lod).r;
-    return select(h, 0.5, mat.tex_height == 0xffffffffu);
-}
-
-// Relief depth (world units) for this material, distance-faded; 0 if disabled / no height
-// map / far. Shared by the inward relief-displace and the SDF_DISPLACE detail march.
-fn relief_depth(id: u32, lod: f32) -> f32 {
-    let mat = material_at(id);
-    if (mat.tex_height == 0xffffffffu || mat.parallax_scale <= 0.0 || lod > 3.0) {
-        return 0.0;
-    }
-    return mat.parallax_scale * clamp(1.0 - lod / 3.0, 0.0, 1.0);
-}
+// Height-map relief is applied at BAKE TIME (folded into the SDF field; see
+// sdf_render::height), not in the shader — so there are no relief helpers here. The shader
+// just marches the already-displaced field.
 
 // Sample one PBR map for material `id` via triplanar projection at `lod`. The
 // `map` selector picks the array; an absent layer (tex == 0xffffffff) returns a
