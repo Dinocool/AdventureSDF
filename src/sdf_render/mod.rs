@@ -98,13 +98,21 @@ pub struct RayStepCapture {
     pub steps: Vec<picking::RayStep>,
 }
 
-/// Diagnostic: when true, bypass the async/incremental bake scheduler and rebuild the
-/// whole atlas synchronously via `full_bake` every frame the edit set changes. Used to
-/// bisect whether a visual artifact lives in the async/incremental upload path (the thing
-/// `full_bake` skips) vs the bake math itself. Defaults OFF (async/incremental is the
-/// production path); the editor's "Sync bake" checkbox flips it on for diagnosis.
-#[derive(Resource, Default)]
+/// When true, bypass the async/incremental bake scheduler and rebuild the whole atlas
+/// synchronously via `full_bake` every frame the edit set changes. The editor's "Sync
+/// bake" checkbox flips it.
+///
+/// Defaults ON: the async/incremental path currently has outstanding correctness issues,
+/// so sync bake is the stable path for now. Flip the default back to false once the async
+/// scheduler is fixed.
+#[derive(Resource)]
 pub struct SyncBakeMode(pub bool);
+
+impl Default for SyncBakeMode {
+    fn default() -> Self {
+        Self(true)
+    }
+}
 
 /// Toggle for the SDF fullscreen raymarch pass. F1 flips this.
 #[derive(Resource)]
@@ -247,8 +255,10 @@ pub const DEFAULT_LOD_COUNT: u32 = 8;
 /// Bricks per axis in each LOD ring window centred on the camera. The ring at level
 /// `L` covers `ring_bricks · cell_stride · voxel_size · 2^L` world units per axis, so
 /// the same count reaches twice as far each coarser level (the clipmap nesting). Must be
-/// a multiple of [`chunk::CHUNK_BRICKS`] (the ring is enumerated in whole chunks).
-pub const DEFAULT_RING_BRICKS: u32 = 12;
+/// a multiple of [`chunk::CHUNK_BRICKS`] (= 4; the ring is enumerated in whole chunks).
+/// 64 = 4·16 gives each band ~5x the world reach of the old 12 at the same voxel
+/// resolution (detail preserved; the sparse cull keeps only non-empty bricks resident).
+pub const DEFAULT_RING_BRICKS: u32 = 64;
 
 #[derive(Resource, Clone)]
 pub struct SdfGridConfig {
