@@ -11,15 +11,14 @@
 
 #import bevy_core_pipeline::fullscreen_vertex_shader::FullscreenVertexOutput
 
-#import sdf::bindings::{camera, max_steps, max_dist, sdf_eps, brick_stride}
+#import sdf::bindings::{camera, max_steps, max_dist, sdf_eps, cell_stride, voxel_size_at}
 #import sdf::brick::{
-    world_to_brick,
-    compute_brick_id,
-    find_brick_lookup,
+    world_to_brick_lod,
     scene_sdf,
     load_material_distances,
     pick_material,
     calc_normal,
+    step_voxel_at,
 }
 #import sdf::cubic::{build_cell_cubic, solve_cell_cubic, dist_to_cell_exit}
 #import sdf::bvh::bvh_ray_advance
@@ -37,25 +36,20 @@ struct RaymarchResult {
     // everything), 2 = ran out of steps. Lets the ray-fate debug view distinguish a
     // genuine empty-space miss from a BVH over-skip that jumps over real geometry.
     fate: u32,
+    lod: u32,  // LOD level that served the hit (for the SDF_DEBUG_LOD overlay)
 };
 
 fn raymarch(origin: vec3<f32>, dir: vec3<f32>) -> RaymarchResult {
     var t = 0.0;
     var steps = 0u;
-    var result = RaymarchResult(false, 0.0, 0u, 0u, vec3<f32>(0.0), 2u);
+    var result = RaymarchResult(false, 0.0, 0u, 0u, vec3<f32>(0.0), 2u, 0u);
 
     let MAX_STEPS = max_steps();
     let MAX_DIST = max_dist();
     let SDF_EPS = sdf_eps();
 
-    let voxel_size = camera.grid_origin.w;
-    let grid_orig = camera.grid_origin.xyz;
     let edge = i32(camera.grid_dims.z);
-
-    // Ray direction in voxels-per-world-unit. The per-cell cubic uses a local
-    // entry point for its origin (computed inside the loop) so coefficients stay
-    // well-conditioned; only the direction is precomputed here.
-    let ray_d_voxel = dir / voxel_size;
+    let s = cell_stride();
 
     for (var i = 0u; i < MAX_STEPS; i = i + 1u) {
         steps = i + 1u;
@@ -67,32 +61,35 @@ fn raymarch(origin: vec3<f32>, dir: vec3<f32>) -> RaymarchResult {
             return result;
         }
 
+        // Resolve the finest LOD with a baked brick at `p` (scene_sdf carries the LOD,
+        // tile base, and palette so we don't re-search here).
         let scene = scene_sdf(p);
 
         if (scene.in_brick) {
-            // Inside a baked brick: solve the cubic for the single voxel cell
-            // containing `p`. This yields the exact ray/trilinear-surface
-            // intersection rather than a sphere-traced approximation.
-            let loc = find_brick_lookup(compute_brick_id(world_to_brick(p)));
+            let lod = scene.lod;
+            let voxel_size = voxel_size_at(lod);
+            // Ray direction in voxels-per-world-unit at THIS LOD, so the cubic's
+            // parameter is the world distance from the cell entry.
+            let ray_d_voxel = dir / voxel_size;
 
-            // Global voxel-space position and the integer cell (lower corner)
-            // containing it. The cell's local frame is [0,1]^3 over that voxel.
-            let gv = (p - grid_orig) / voxel_size;
+            // Inside a baked brick: solve the cubic for the single voxel cell
+            // containing `p` at this LOD. Exact ray/trilinear-surface intersection.
+            let gv = p / voxel_size;            // LOD voxel space (anchored at world 0)
             let cell_g = floor(gv);
-            let o_local = gv - cell_g;   // entry point in [0,1]^3 (small, stable)
+            let o_local = gv - cell_g;          // entry point in [0,1]^3 (small, stable)
 
             // Brick-local cell index; clamp so cell+1 stays within stored samples
             // (0..edge-1, the last being the shared apron plane).
-            let brick_origin_v = vec3<f32>(world_to_brick(p));
+            let brick_origin_v = floor(gv / f32(s)) * f32(s);
             let cell_local = clamp(
                 vec3<i32>(cell_g - brick_origin_v),
                 vec3<i32>(0),
                 vec3<i32>(edge - 2),
             );
 
-            let cubic = build_cell_cubic(loc.atlas_base, cell_local, o_local, ray_d_voxel);
+            let cubic = build_cell_cubic(scene.atlas_base, cell_local, o_local, ray_d_voxel);
 
-            let advance = dist_to_cell_exit(p, dir);
+            let advance = dist_to_cell_exit(p, dir, lod);
 
             // Solve in the cell-local parameter [0, advance] (distance from `p`),
             // then offset by the global `t` to recover the true ray distance.
@@ -103,10 +100,11 @@ fn raymarch(origin: vec3<f32>, dir: vec3<f32>) -> RaymarchResult {
                 result.hit = true;
                 result.dist = t_hit;
                 result.object_id =
-                    pick_material(load_material_distances(loc.atlas_base, hit_p), loc.palette).id;
+                    pick_material(load_material_distances(scene.atlas_base, hit_p, lod), scene.palette).id;
                 result.steps = steps;
                 result.hit_pos = hit_p;
                 result.fate = 0u; // hit
+                result.lod = lod;
                 return result;
             }
 
@@ -114,8 +112,10 @@ fn raymarch(origin: vec3<f32>, dir: vec3<f32>) -> RaymarchResult {
         } else {
             // Empty space: jump straight to the next occupied edit-AABB using the
             // BVH (big skips across truly empty space), instead of stepping one
-            // brick at a time. Falls back to the brick DDA when the BVH is empty.
-            t += bvh_ray_advance(p, dir) + voxel_size * 0.01;
+            // brick at a time. Falls back to the finest-covering brick DDA when the BVH
+            // is empty. The nudge is scaled to the finest LOD window covering `p` so it
+            // clears the brick boundary without overshooting a fine surface near camera.
+            t += bvh_ray_advance(p, dir) + step_voxel_at(p) * 0.01;
         }
     }
 
@@ -243,11 +243,13 @@ fn main(in: FullscreenVertexOutput) -> FragmentOutput {
 
     #ifdef SDF_DEBUG_BRICK_BOUNDS
     if (rm.hit) {
-        // Color the surface by the brick that contains the hit, and draw grid
-        // lines on brick-cell boundaries to expose the sparse brick layout.
-        let brick = world_to_brick(hit_pos);
-        let brick_id = compute_brick_id(brick);
-        let hue = f32(brick_id) * 0.618033988749895;
+        // Color the surface by the brick that contains the hit (at the serving LOD),
+        // and draw grid lines on brick-cell boundaries to expose the brick layout.
+        let lod = rm.lod;
+        let voxel_size = voxel_size_at(lod);
+        let brick = world_to_brick_lod(hit_pos, lod);
+        let brick_hash = u32(brick.x * 73856093 ^ brick.y * 19349663 ^ brick.z * 83492791);
+        let hue = f32(brick_hash & 0xffu) * 0.618033988749895;
         let h = fract(hue) * 6.0;
         let tint = vec3<f32>(
             clamp(1.0 - abs(h - 3.0), 0.0, 1.0),
@@ -256,9 +258,8 @@ fn main(in: FullscreenVertexOutput) -> FragmentOutput {
         );
 
         // Distance (in voxels) from the nearest brick-cell boundary plane.
-        let voxel_size = camera.grid_origin.w;
-        let s = f32(brick_stride());
-        let rel = (hit_pos - camera.grid_origin.xyz) / voxel_size;
+        let s = f32(cell_stride());
+        let rel = hit_pos / voxel_size;
         let cell = rel / s;
         let frac3 = abs(fract(cell) - 0.5);
         let edge_dist = (0.5 - max(max(frac3.x, frac3.y), frac3.z)) * s;
@@ -266,6 +267,21 @@ fn main(in: FullscreenVertexOutput) -> FragmentOutput {
 
         let col = mix(vec3<f32>(0.05), tint, line * 0.85 + 0.15);
         return FragmentOutput(vec4<f32>(col, 1.0), ndc_depth);
+    }
+    return FragmentOutput(vec4<f32>(bg_color * 0.3, 1.0), 1.0);
+    #endif
+
+    #ifdef SDF_DEBUG_LOD
+    // Tint the hit by the LOD that served it, so the clipmap rings are directly
+    // visible. Discrete 4-colour cycle by `lod % 4`: white, green, blue, red.
+    if (rm.hit) {
+        var col = vec3<f32>(1.0, 1.0, 0.0);        // 4+: yellow
+        if (rm.lod == 0u) { col = vec3<f32>(1.0, 1.0, 1.0); }   // 0: white
+        else if (rm.lod == 1u) { col = vec3<f32>(0.0, 1.0, 0.0); }   // 1: green
+        else if (rm.lod == 2u) { col = vec3<f32>(0.0, 0.4, 1.0); }   // 2: blue
+        else if (rm.lod == 3u) { col = vec3<f32>(1.0, 0.0, 0.0); }   // 3: red
+        let shaded_lod = mix(shaded, col, 0.65);
+        return FragmentOutput(vec4<f32>(shaded_lod, 1.0), ndc_depth);
     }
     return FragmentOutput(vec4<f32>(bg_color * 0.3, 1.0), 1.0);
     #endif

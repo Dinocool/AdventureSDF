@@ -15,6 +15,7 @@ struct SdfCameraUniform {
     grid_dims: vec4<f32>,
     debug_params: vec4<f32>,   // x = max_steps, y = max_dist, z = sdf_eps, w = bvh_node_count
     bake_reach: vec4<f32>,     // x = world-units a baked brick reaches beyond a tight edit AABB
+    lod_params: vec4<f32>,     // x = lod_count, y = ring_bricks, z = base voxel_size, w = cell_stride
 };
 
 // One material row, indexed by global material id. Mirrors `GpuSdfMaterial`
@@ -31,14 +32,29 @@ struct SdfMaterial {
     pad: vec2<u32>,
 };
 
-// Per-brick lookup. `pal01`/`pal23` pack the brick's 4-entry material palette:
-// pal01 = id0 | id1<<16, pal23 = id2 | id3<<16. Slot k of the per-voxel distance
-// atlas is keyed to palette entry k; PALETTE_EMPTY (0xffff) marks an unused slot.
-struct BrickLookup {
-    brick_id: u32,
-    atlas_base: u32,  // tile origin in the 2D-tiled atlas: col_px | row_px<<16
-    pal_lo: u32,      // palette ids 0,1 packed (id0 | id1<<16)
-    pal_hi: u32,      // palette ids 2,3 packed (id2 | id3<<16)
+// Per-brick lookup. `key_hi`/`key_lo` are the absolute 64-bit brick key (lod + biased
+// world-lattice brick index; see SdfGridConfig::abs_brick_key), independent of camera
+// position so the CPU table and shader agree. `pal01`/`pal23` pack the brick's 4-entry
+// material palette: pal01 = id0 | id1<<16, pal23 = id2 | id3<<16. Slot k of the
+// per-voxel distance atlas is keyed to palette entry k; PALETTE_EMPTY (0xffff) unused.
+
+// One entry in the sorted chunk lookup table (binary-searched by absolute key). `key_*`
+// is the camera-independent chunk key (see chunk.rs); `occ_*` is the 64-bit occupancy
+// mask (bit i ⇒ local brick i resident); `tile_run_base` indexes `chunk_tile_buf` where
+// this chunk's popcount(occ) resident bricks live in ascending local order.
+struct ChunkLookup {
+    key_hi: u32,
+    key_lo: u32,
+    occ_lo: u32,
+    occ_hi: u32,
+    tile_run_base: u32,
+};
+
+// One resident brick's record in the packed chunk tile run: atlas tile origin + palette.
+struct BrickTile {
+    atlas_base: u32,  // col_px | row_px<<16
+    pal_lo: u32,      // palette ids 0,1 (id0 | id1<<16)
+    pal_hi: u32,      // palette ids 2,3 (id2 | id3<<16)
 };
 
 // BVH node: 32 bytes (two vec3<f32> + u32 rows). `count_or_right`'s high bit
@@ -58,7 +74,7 @@ struct BvhNode {
 @group(0) @binding(0) var<uniform> camera: SdfCameraUniform;
 @group(1) @binding(0) var atlas_tex: texture_2d<f32>;       // R16Snorm distance field
 @group(1) @binding(1) var atlas_sampler: sampler;
-@group(1) @binding(2) var<storage, read> lookup_buf: array<BrickLookup>;
+@group(1) @binding(2) var<storage, read> chunk_buf: array<ChunkLookup>;  // sorted, binary-searched
 @group(1) @binding(3) var mat_tex: texture_2d<f32>;         // Rgba16Snorm: 4 palette-slot distances
 @group(1) @binding(4) var<storage, read> bvh_buf: array<BvhNode>;  // edit-AABB BVH (empty-space skip)
 @group(1) @binding(5) var<storage, read> materials: array<SdfMaterial>;  // material table, by global id
@@ -70,6 +86,7 @@ struct BvhNode {
 @group(1) @binding(9) var tex_mra: texture_2d_array<f32>;
 @group(1) @binding(10) var tex_height: texture_2d_array<f32>;
 @group(1) @binding(11) var tex_edge: texture_2d_array<f32>;
+@group(1) @binding(12) var<storage, read> chunk_tile_buf: array<BrickTile>;  // packed per-chunk brick runs
 
 // --- Shared constants ---
 
@@ -88,3 +105,46 @@ fn sdf_eps() -> f32 { return camera.debug_params.z; }
 // `bricks_in_aabb`: SNORM_CLAMP_DIST + one brick). The BVH skip inflates every box by
 // this so it never jumps past a baked shell brick.
 fn bake_reach() -> f32 { return camera.bake_reach.x; }
+
+// --- LOD clipmap / chunk accessors ---
+
+// Bricks per axis in a chunk. Must match chunk::CHUNK_BRICKS on the CPU.
+const CHUNK_BRICKS: i32 = 4;
+
+fn lod_count() -> u32 { return u32(camera.lod_params.x); }
+// Brick spatial stride in voxels (cell_stride; same at every LOD — only the world
+// size of a voxel changes). Mirrors SdfGridConfig::cell_stride.
+fn cell_stride() -> i32 { return i32(camera.lod_params.w); }
+// Voxel size (world units) at LOD `lod`: base · 2^lod.
+fn voxel_size_at(lod: u32) -> f32 { return camera.lod_params.z * exp2(f32(lod)); }
+// World edge length of one brick at LOD `lod`.
+fn brick_world_at(lod: u32) -> f32 { return f32(cell_stride()) * voxel_size_at(lod); }
+
+// floor-divide an i32 (WGSL `/` truncates toward zero; we need Euclidean for negatives).
+fn floor_div(a: i32, b: i32) -> i32 {
+    return i32(floor(f32(a) / f32(b)));
+}
+
+// Absolute 64-bit CHUNK key for the chunk containing brick `coord` at `lod` — mirrors
+// chunk::chunk_gpu_key + chunk_of. Independent of camera so the CPU table and this agree.
+// vec2(key_hi, key_lo): key_hi=(lod<<16)|cx, key_lo=(cy<<16)|cz, each chunk index biased
+// by 2^15 into a 16-bit field.
+fn abs_chunk_key(coord: vec3<i32>, lod: u32) -> vec2<u32> {
+    let s = cell_stride();
+    let bias = 32768;
+    // brick index → chunk index, Euclidean so negatives map continuously.
+    let cx = u32((floor_div(floor_div(coord.x, s), CHUNK_BRICKS) + bias) & 0xffff);
+    let cy = u32((floor_div(floor_div(coord.y, s), CHUNK_BRICKS) + bias) & 0xffff);
+    let cz = u32((floor_div(floor_div(coord.z, s), CHUNK_BRICKS) + bias) & 0xffff);
+    return vec2<u32>((lod << 16u) | cx, (cy << 16u) | cz);
+}
+
+// Local brick slot (0..63) of brick `coord` within its chunk — mirrors chunk_of.
+fn local_brick_index(coord: vec3<i32>) -> u32 {
+    let s = cell_stride();
+    let c = CHUNK_BRICKS;
+    let lx = ((floor_div(coord.x, s) % c) + c) % c;
+    let ly = ((floor_div(coord.y, s) % c) + c) % c;
+    let lz = ((floor_div(coord.z, s) % c) + c) % c;
+    return u32(lz * c * c + ly * c + lx);
+}

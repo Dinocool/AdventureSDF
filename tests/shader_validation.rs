@@ -39,8 +39,12 @@ const SDF_MODULES: [&str; 6] = [
 
 const SDF_ENTRY: &str = "assets/shaders/sdf_raymarch.wgsl";
 
-/// Compose the SDF import graph into a single naga module, then validate it.
-fn validate_composed_sdf() -> Result<(), String> {
+/// Compose the SDF import graph into a single naga module, then validate it, with the
+/// given shader defs enabled (so `#ifdef` debug branches are actually compiled).
+fn validate_composed_sdf_with_defs(defs: &[&str]) -> Result<(), String> {
+    use naga_oil::compose::ShaderDefValue;
+    use std::collections::HashMap;
+
     let mut composer = composer_with_stub();
 
     // Add each SDF module, dependencies first.
@@ -56,6 +60,11 @@ fn validate_composed_sdf() -> Result<(), String> {
             .map_err(|e| format!("compose {path} failed: {e}"))?;
     }
 
+    let shader_defs: HashMap<String, ShaderDefValue> = defs
+        .iter()
+        .map(|d| ((*d).to_string(), ShaderDefValue::Bool(true)))
+        .collect();
+
     // Compose the entry shader (resolves all #import lines into one naga module).
     let entry_src =
         std::fs::read_to_string(SDF_ENTRY).map_err(|e| format!("read {SDF_ENTRY}: {e}"))?;
@@ -63,9 +72,10 @@ fn validate_composed_sdf() -> Result<(), String> {
         .make_naga_module(NagaModuleDescriptor {
             source: &entry_src,
             file_path: SDF_ENTRY,
+            shader_defs,
             ..Default::default()
         })
-        .map_err(|e| format!("compose {SDF_ENTRY} failed:\n{e}"))?;
+        .map_err(|e| format!("compose {SDF_ENTRY} (defs={defs:?}) failed:\n{e}"))?;
 
     // naga_oil hands back a naga::Module directly; validate it.
     let mut validator = naga::valid::Validator::new(
@@ -74,8 +84,13 @@ fn validate_composed_sdf() -> Result<(), String> {
     );
     validator
         .validate(&module)
-        .map_err(|e| format!("WGSL validation error in composed SDF shader:\n{e:?}"))?;
+        .map_err(|e| format!("WGSL validation error (defs={defs:?}):\n{e:?}"))?;
     Ok(())
+}
+
+/// Compose the SDF import graph into a single naga module, then validate it.
+fn validate_composed_sdf() -> Result<(), String> {
+    validate_composed_sdf_with_defs(&[])
 }
 
 /// Register the Bevy fullscreen stub into a fresh composer.
@@ -119,6 +134,23 @@ fn validate_entry(path: &Path) -> Result<(), String> {
 #[test]
 fn sdf_raymarch_wgsl_validates() {
     validate_composed_sdf().unwrap_or_else(|e| panic!("{e}"));
+}
+
+/// Each `#ifdef` debug branch must also compile + validate (they're skipped when no
+/// def is set, so the default compose would miss errors inside them).
+#[test]
+fn sdf_debug_modes_validate() {
+    for def in [
+        "SDF_DEBUG_STEP_COUNT",
+        "SDF_DEBUG_BVH_STEPS",
+        "SDF_DEBUG_NORMALS",
+        "SDF_DEBUG_OBJECT_ID",
+        "SDF_DEBUG_BRICK_BOUNDS",
+        "SDF_DEBUG_RAY_FATE",
+        "SDF_DEBUG_LOD",
+    ] {
+        validate_composed_sdf_with_defs(&[def]).unwrap_or_else(|e| panic!("{e}"));
+    }
 }
 
 #[test]

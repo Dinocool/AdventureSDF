@@ -5,7 +5,7 @@
 // we solve it exactly per cell instead of sphere-tracing — crisp silhouettes, no
 // stepping staircase. Also the per-cell exit-distance helper for the march.
 
-#import sdf::bindings::camera
+#import sdf::bindings::{camera, voxel_size_at}
 #import sdf::brick::load_voxel
 
 // Cubic coefficients f(t) = const_term + t*(lin + t*(quad + t*cube)). Named (not
@@ -149,12 +149,11 @@ fn solve_cell_cubic(c: CellCubic, t0: f32, t1: f32) -> CellHit {
     return test_subinterval(c, c_hi, t1);
 }
 
-// Distance along the ray to the far face of the voxel cell containing `p`.
-fn dist_to_cell_exit(p: vec3<f32>, dir: vec3<f32>) -> f32 {
-    let vs = camera.grid_origin.w;
-    let go = camera.grid_origin.xyz;
-    let rel = p - go;
-    let cell_min = floor(rel / vs) * vs + go;
+// Distance along the ray to the far face of the voxel cell containing `p`, at LOD
+// `lod`. The cell lattice is anchored at world 0 with the LOD's voxel size.
+fn dist_to_cell_exit(p: vec3<f32>, dir: vec3<f32>, lod: u32) -> f32 {
+    let vs = voxel_size_at(lod);
+    let cell_min = floor(p / vs) * vs;
     let cell_max = cell_min + vec3<f32>(vs);
 
     var t = 1e10;

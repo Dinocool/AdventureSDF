@@ -7,11 +7,19 @@
 
 #import sdf::bindings::{
     camera,
-    BrickLookup,
+    ChunkLookup,
     PALETTE_EMPTY,
-    lookup_buf,
+    chunk_buf,
+    chunk_tile_buf,
     atlas_tex,
     mat_tex,
+    cell_stride,
+    voxel_size_at,
+    lod_count,
+    brick_world_at,
+    CHUNK_BRICKS,
+    abs_chunk_key,
+    local_brick_index,
 }
 
 // --- Brick coordinate helpers ---
@@ -23,26 +31,23 @@ fn brick_stride() -> i32 {
     return i32(camera.grid_dims.z) - 1;
 }
 
-fn world_to_brick(world_pos: vec3<f32>) -> vec3<i32> {
-    let grid_orig = camera.grid_origin.xyz;
-    let voxel_size = camera.grid_origin.w;
-    let s = brick_stride();
-    let relative = world_pos - grid_orig;
-    let vox = vec3<i32>(
-        i32(relative.x / voxel_size),
-        i32(relative.y / voxel_size),
-        i32(relative.z / voxel_size),
+// Brick origin coord (stride-aligned voxel coords on LOD `lod`'s lattice, anchored at
+// world 0) containing `world_pos`. `floor` + Euclidean snap so the lattice is
+// continuous through the origin — mirrors SdfGridConfig::world_to_brick_lod.
+fn world_to_brick_lod(world_pos: vec3<f32>, lod: u32) -> vec3<i32> {
+    let s = cell_stride();
+    let vs = voxel_size_at(lod);
+    let vox = vec3<i32>(floor(world_pos / vs));
+    // div_euclid for negative coords: floor(vox / s) * s.
+    let snapped = vec3<i32>(
+        i32(floor(f32(vox.x) / f32(s))) * s,
+        i32(floor(f32(vox.y) / f32(s))) * s,
+        i32(floor(f32(vox.z) / f32(s))) * s,
     );
-    return (vox / s) * s;
+    return snapped;
 }
 
-fn compute_brick_id(coord: vec3<i32>) -> u32 {
-    let bpa = u32(camera.grid_dims.y);
-    let s = brick_stride();
-    return u32(coord.z / s) * bpa * bpa + u32(coord.y / s) * bpa + u32(coord.x / s);
-}
-
-// --- Binary search in lookup buffer ---
+// --- Chunk lookup: binary search + occupancy resolve ---
 
 struct BrickLocation {
     atlas_base: u32,     // packed tile origin (col_px | row_px<<16); see voxel_pixel
@@ -59,31 +64,69 @@ fn unpack_palette(lo: u32, hi: u32) -> vec4<u32> {
     );
 }
 
-// Binary search the sorted lookup buffer for a brick id.
-fn find_brick_lookup(brick_id: u32) -> BrickLocation {
+// Lexicographic compare of two 64-bit keys (hi then lo): -1 a<b, 0 equal, 1 a>b.
+fn key_cmp(a_hi: u32, a_lo: u32, b_hi: u32, b_lo: u32) -> i32 {
+    if (a_hi < b_hi) { return -1; }
+    if (a_hi > b_hi) { return 1; }
+    if (a_lo < b_lo) { return -1; }
+    if (a_lo > b_lo) { return 1; }
+    return 0;
+}
+
+// Binary search the sorted chunk table for the chunk with key (key_hi,key_lo). Returns
+// its index, or -1 if absent. `count` = camera.grid_dims.w (resident chunk count).
+fn find_chunk(key_hi: u32, key_lo: u32) -> i32 {
+    let count = i32(camera.grid_dims.w);
+    var lo: i32 = 0;
+    var hi: i32 = count - 1;
+    while (lo <= hi) {
+        let mid = (lo + hi) / 2;
+        let e = chunk_buf[u32(mid)];
+        let c = key_cmp(e.key_hi, e.key_lo, key_hi, key_lo);
+        if (c == 0) { return mid; }
+        else if (c < 0) { lo = mid + 1; }
+        else { hi = mid - 1; }
+    }
+    return -1;
+}
+
+// Resolve the baked brick at `coord` on LOD `lod` via its chunk: find the chunk, test
+// the occupancy bit for the brick's local slot, and if present index into the chunk's
+// packed tile run (popcount of mask bits below the slot gives the offset).
+fn find_brick_lookup(coord: vec3<i32>, lod: u32) -> BrickLocation {
     let count = u32(camera.grid_dims.w);
     if (count == 0u) {
         return BrickLocation(0u, vec4<u32>(PALETTE_EMPTY), false);
     }
+    let key = abs_chunk_key(coord, lod);
+    let ci = find_chunk(key.x, key.y);
+    if (ci < 0) {
+        return BrickLocation(0u, vec4<u32>(PALETTE_EMPTY), false);
+    }
+    let chunk = chunk_buf[u32(ci)];
+    let li = local_brick_index(coord);   // 0..63
 
-    var lo: i32 = 0;
-    var hi: i32 = i32(count) - 1;
-
-    while (lo <= hi) {
-        let mid = (lo + hi) / 2;
-        let entry = lookup_buf[u32(mid)];
-        let mid_id = entry.brick_id;
-
-        if (mid_id == brick_id) {
-            return BrickLocation(entry.atlas_base, unpack_palette(entry.pal_lo, entry.pal_hi), true);
-        } else if (mid_id < brick_id) {
-            lo = mid + 1;
-        } else {
-            hi = mid - 1;
-        }
+    // Occupancy bit test (mask split across two u32). Bit li set ⇒ brick resident.
+    var bit: u32;
+    if (li < 32u) { bit = (chunk.occ_lo >> li) & 1u; }
+    else { bit = (chunk.occ_hi >> (li - 32u)) & 1u; }
+    if (bit == 0u) {
+        return BrickLocation(0u, vec4<u32>(PALETTE_EMPTY), false);
     }
 
-    return BrickLocation(0u, vec4<u32>(PALETTE_EMPTY), false);
+    // Offset within the chunk's tile run = popcount of mask bits below li.
+    var below_lo: u32;
+    var below_hi: u32;
+    if (li < 32u) {
+        below_lo = chunk.occ_lo & ((1u << li) - 1u);
+        below_hi = 0u;
+    } else {
+        below_lo = chunk.occ_lo;
+        below_hi = chunk.occ_hi & ((1u << (li - 32u)) - 1u);
+    }
+    let off = countOneBits(below_lo) + countOneBits(below_hi);
+    let tile = chunk_tile_buf[chunk.tile_run_base + off];
+    return BrickLocation(tile.atlas_base, unpack_palette(tile.pal_lo, tile.pal_hi), true);
 }
 
 // --- Sample brick SDF via trilinear interpolation ---
@@ -136,12 +179,11 @@ fn sample_mat_tex(base_u: u32, i0: vec3<i32>, f: vec3<f32>) -> vec4<f32> {
 }
 
 // The 4 interpolated palette-slot distances at `world_pos` (one Rgba16Snorm fetch
-// set). `.x..w` correspond to palette slots 0..3.
-fn load_material_distances(base_u: u32, world_pos: vec3<f32>) -> vec4<f32> {
-    let voxel_size = camera.grid_origin.w;
-    let grid_orig = camera.grid_origin.xyz;
-    let stride_f = f32(brick_stride());
-    let voxel_f = (world_pos - grid_orig) / voxel_size;
+// set), sampling the brick at LOD `lod`. `.x..w` correspond to palette slots 0..3.
+fn load_material_distances(base_u: u32, world_pos: vec3<f32>, lod: u32) -> vec4<f32> {
+    let voxel_size = voxel_size_at(lod);
+    let stride_f = f32(cell_stride());
+    let voxel_f = world_pos / voxel_size;
     let brick_origin_voxel = floor(voxel_f / stride_f) * stride_f;
     let local_f = voxel_f - brick_origin_voxel;
     let i0 = vec3<i32>(floor(local_f));
@@ -178,16 +220,15 @@ fn pick_material(slots: vec4<f32>, palette: vec4<u32>) -> MaterialPick {
     return MaterialPick(palette[best], palette[second], second_d - best_d);
 }
 
-fn sample_brick_sdf(base_u: u32, world_pos: vec3<f32>) -> f32 {
-    let voxel_size = camera.grid_origin.w;
-    let grid_orig = camera.grid_origin.xyz;
+fn sample_brick_sdf(base_u: u32, world_pos: vec3<f32>, lod: u32) -> f32 {
+    let voxel_size = voxel_size_at(lod);
 
     // Continuous voxel-space position, then split into the brick-local integer
     // corner and the sub-voxel fraction used for trilinear interpolation.
     // Brick stride is `stride` cells; sample `stride` (the apron) is shared with
     // the neighbour, so local coords stay in [0, stride) and i0+1 never exceeds it.
-    let stride_f = f32(brick_stride());
-    let voxel_f = (world_pos - grid_orig) / voxel_size;
+    let stride_f = f32(cell_stride());
+    let voxel_f = world_pos / voxel_size;
     let brick_origin_voxel = floor(voxel_f / stride_f) * stride_f;
     let local_f = voxel_f - brick_origin_voxel;      // [0, stride)
 
@@ -215,16 +256,52 @@ fn sample_brick_sdf(base_u: u32, world_pos: vec3<f32>) -> f32 {
     return mix(y0, y1, fz);
 }
 
-// Trilinear SDF at any world position, resolving the brick by lookup. Returns a
-// large positive value in empty (unbaked) space. Unlike sampling a fixed brick
-// tile, this re-derives the brick per call, so it reads correct values across
-// brick seams — essential for computing gradients near brick boundaries.
+// Find the finest LOD with a baked brick at `world_pos`. Returns the brick location plus
+// the LOD it was found at (via `out_lod`). Misses (`found == false`) when no LOD has a
+// brick here (empty space).
+fn find_brick_at(world_pos: vec3<f32>, out_lod: ptr<function, u32>) -> BrickLocation {
+    let levels = lod_count();
+    for (var lod = 0u; lod < levels; lod = lod + 1u) {
+        let coord = world_to_brick_lod(world_pos, lod);
+        let loc = find_brick_lookup(coord, lod);
+        if (loc.found) {
+            *out_lod = lod;
+            return loc;
+        }
+    }
+    *out_lod = 0u;
+    return BrickLocation(0u, vec4<u32>(PALETTE_EMPTY), false);
+}
+
+// The finest LOD with a resident CHUNK at `world_pos` (whether or not the specific brick
+// is occupied). This is the resolution at which a brick *could* exist at `p`, so the
+// empty-space DDA must step by THIS LOD's brick size — never coarser, or it would jump
+// over a thin baked surface near the camera (the "gaps in objects" bug). Near the camera
+// LOD 0's chunk is resident → small steps; far out only coarse chunks reach `p` → big
+// steps. Returns the coarsest LOD if no chunk covers `p`.
+fn finest_lod_window_at(world_pos: vec3<f32>) -> u32 {
+    let levels = lod_count();
+    for (var lod = 0u; lod < levels; lod = lod + 1u) {
+        let coord = world_to_brick_lod(world_pos, lod);
+        let key = abs_chunk_key(coord, lod);
+        if (find_chunk(key.x, key.y) >= 0) {
+            return lod;
+        }
+    }
+    return levels - 1u;
+}
+
+// Trilinear SDF at any world position, resolving the brick by finest-LOD lookup.
+// Returns a large positive value in empty (unbaked) space. Re-derives the brick per
+// call, so it reads correct values across brick seams — essential for gradients near
+// brick boundaries.
 fn sample_sdf_world(world_pos: vec3<f32>) -> f32 {
-    let loc = find_brick_lookup(compute_brick_id(world_to_brick(world_pos)));
+    var lod = 0u;
+    let loc = find_brick_at(world_pos, &lod);
     if (!loc.found) {
         return 1e10;
     }
-    return sample_brick_sdf(loc.atlas_base, world_pos);
+    return sample_brick_sdf(loc.atlas_base, world_pos, lod);
 }
 
 // --- Scene SDF (atlas-based union) ---
@@ -235,44 +312,43 @@ struct SceneSdfResult {
     object_id_b: u32,  // runner-up material (for seam anti-aliasing)
     gap: f32,          // runner_up_dist - nearest_dist, >= 0 (0 exactly on the seam)
     in_brick: bool,    // false => p lies in empty (unbaked) space
+    lod: u32,          // LOD level that served this sample (for cubic solve + debug)
+    atlas_base: u32,   // tile origin of the serving brick (so the loop skips re-search)
+    palette: vec4<u32>,// the serving brick's palette (for material pick at the hit)
 };
 
 // NOTE: callable inside the raymarch loop. Must NOT use derivative ops (fwidth):
 // control flow there is non-uniform. The seam anti-aliasing is done once, at the
 // fragment level, from `object_id`/`object_id2`/`gap` (see `main`).
 fn scene_sdf(p: vec3<f32>) -> SceneSdfResult {
-    let brick_coord = world_to_brick(p);
-    let brick_id = compute_brick_id(brick_coord);
-    let loc = find_brick_lookup(brick_id);
+    var lod = 0u;
+    let loc = find_brick_at(p, &lod);
 
     if (!loc.found) {
-        return SceneSdfResult(1e10, 0u, 0u, 1e10, false);
+        return SceneSdfResult(1e10, 0u, 0u, 1e10, false, 0u, 0u, vec4<u32>(PALETTE_EMPTY));
     }
 
-    let d = sample_brick_sdf(loc.atlas_base, p);
+    let d = sample_brick_sdf(loc.atlas_base, p, lod);
 
     // Material from the per-palette-slot distance field: the nearest palette slot
     // owns the surface (mapped to a global id); the boundary against the runner-up
     // is the bisector where their interpolated distances are equal (`gap == 0`).
     // Both distances are continuous, so that bisector is sub-voxel sharp and
     // independent of geometric smoothing — clean even at smoothing = 0.
-    let md = load_material_distances(loc.atlas_base, p);
+    let md = load_material_distances(loc.atlas_base, p, lod);
     let pick = pick_material(md, loc.palette);
 
-    return SceneSdfResult(d, pick.id, pick.id_b, pick.gap, true);
+    return SceneSdfResult(d, pick.id, pick.id_b, pick.gap, true, lod, loc.atlas_base, loc.palette);
 }
 
-// Distance along the ray to the far side of the brick containing `p`.
-// Used for empty-space skipping (DDA-style): when `p` is in an unbaked brick,
-// advance the ray to the next brick boundary instead of taking an infinite step.
-fn dist_to_brick_exit(p: vec3<f32>, dir: vec3<f32>) -> f32 {
-    let voxel_size = camera.grid_origin.w;
-    let grid_orig = camera.grid_origin.xyz;
-    let brick_world = voxel_size * f32(brick_stride());
+// Distance along the ray to the far side of the brick containing `p`, at LOD `lod`.
+// Used for empty-space skipping (DDA-style): when `p` is in an unbaked brick, advance
+// the ray to the next brick boundary instead of taking an infinite step. The lattice
+// is anchored at world 0 with the LOD's voxel size.
+fn dist_to_brick_exit_lod(p: vec3<f32>, dir: vec3<f32>, lod: u32) -> f32 {
+    let brick_world = brick_world_at(lod);
 
-    // Position within the current brick, in world units.
-    let rel = p - grid_orig;
-    let brick_min = floor(rel / brick_world) * brick_world + grid_orig;
+    let brick_min = floor(p / brick_world) * brick_world;
     let brick_max = brick_min + vec3<f32>(brick_world);
 
     // Per-axis distance to the slab boundary in the ray's direction.
@@ -290,6 +366,21 @@ fn dist_to_brick_exit(p: vec3<f32>, dir: vec3<f32>) -> f32 {
     return t;
 }
 
+// Empty-space advance for a point in no baked brick: step to the far face of the brick
+// at the FINEST LOD window covering `p`. Using the finest covering resolution (not the
+// coarsest) guarantees the step never overshoots a thin baked surface near the camera,
+// while still taking large steps far out where only coarse rings reach. This is the
+// safe DDA floor the BVH skip builds on.
+fn dist_to_brick_exit(p: vec3<f32>, dir: vec3<f32>) -> f32 {
+    return dist_to_brick_exit_lod(p, dir, finest_lod_window_at(p));
+}
+
+// Voxel size at the finest LOD window covering `p` — the right scale for the
+// post-advance epsilon nudge so it clears the brick boundary without overshooting.
+fn step_voxel_at(p: vec3<f32>) -> f32 {
+    return voxel_size_at(finest_lod_window_at(p));
+}
+
 // --- Surface normal from the trilinear gradient ---
 
 // Surface normal via the tetrahedron finite-difference technique, sampling the
@@ -299,7 +390,11 @@ fn dist_to_brick_exit(p: vec3<f32>, dir: vec3<f32>) -> f32 {
 // The offset spans roughly one voxel so quantization in the snorm field doesn't
 // dominate the difference.
 fn calc_normal(p: vec3<f32>) -> vec3<f32> {
-    let h = camera.grid_origin.w; // one voxel
+    // Probe offset ≈ one voxel at the LOD serving this point (coarser LODs need a
+    // proportionally larger offset so the finite difference spans a real sample gap).
+    var hit_lod = 0u;
+    let loc = find_brick_at(p, &hit_lod);
+    let h = voxel_size_at(hit_lod);
     let k = vec2<f32>(1.0, -1.0);
     let n = k.xyy * sample_sdf_world(p + k.xyy * h)
           + k.yyx * sample_sdf_world(p + k.yyx * h)
