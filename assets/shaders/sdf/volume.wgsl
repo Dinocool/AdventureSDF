@@ -49,27 +49,46 @@ fn volume_sample_level(level: u32, uv: vec3<f32>) -> f32 {
     return s * volume.decode[level].x;
 }
 
-// Conservative world distance to the nearest surface at `p` from the finest clipmap level
-// containing `p`. Returns a large sentinel when `p` is outside all levels (sky).
+// Conservative world distance to the nearest surface at `p`, taken as the MAXIMUM over all
+// clipmap levels containing `p`. Every level stores a conservative lower bound (min over the
+// cell, clamped), so the true distance is >= each level's sample and therefore >= their max
+// — the max is still a valid lower bound, and it's the LARGEST safe step. This is the whole
+// point: in open space the coarse levels' big voxel-unit clamps dominate (huge jumps); near
+// a surface even the coarse level's min-over-cell reports small, so the step stays safe.
+// Returns a large sentinel when `p` is outside every level (open sky → maximum step).
 fn sample_volume(p: vec3<f32>) -> f32 {
     let count = u32(volume.volume_dims.x);   // active level count (0 ⇒ volume absent)
+    var best = -1.0;
+    var any = false;
     for (var level = 0u; level < count; level = level + 1u) {
         let uv = volume_uv(p, level);
         if (volume_uv_inside(uv)) {
-            return volume_sample_level(level, uv);
+            let d = volume_sample_level(level, uv);
+            if (!any || d > best) { best = d; }
+            any = true;
         }
     }
-    return 1e9;   // outside every level: open sky, take a maximum step
+    if (!any) {
+        return 1e9;   // outside every level: open sky
+    }
+    return best;
 }
 
-// The level that would serve `p` (finest containing it), or `count` if none. Used by the
-// SDF_DEBUG_VOLUME overlay to tint by serving level.
+// The level whose sample is largest at `p` (the one that drives the step), or `count` if
+// `p` is outside every level. Used by the SDF_DEBUG_VOLUME overlay to tint by serving level.
 fn volume_serving_level(p: vec3<f32>) -> u32 {
     let count = u32(volume.volume_dims.x);
+    var best = -1.0;
+    var best_level = count;
     for (var level = 0u; level < count; level = level + 1u) {
-        if (volume_uv_inside(volume_uv(p, level))) {
-            return level;
+        let uv = volume_uv(p, level);
+        if (volume_uv_inside(uv)) {
+            let d = volume_sample_level(level, uv);
+            if (best_level == count || d > best) {
+                best = d;
+                best_level = level;
+            }
         }
     }
-    return count;
+    return best_level;
 }
