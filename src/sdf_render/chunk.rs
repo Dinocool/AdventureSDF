@@ -420,4 +420,84 @@ mod tests {
             "a brick in an absent chunk must not resolve"
         );
     }
+
+    // --- Chunk world geometry (debug-viz boxes + LOD-shell convention) --------------
+
+    /// A LOD-`L` chunk covers exactly 2× the world extent of LOD `L-1` — the nested
+    /// "twice as coarse / twice the area" shell property the clipmap is built on.
+    #[test]
+    fn chunk_world_size_doubles_per_lod() {
+        let cfg = config();
+        for lod in 1..cfg.lod_count {
+            let coarse = chunk_world_size(lod, &cfg);
+            let fine = chunk_world_size(lod - 1, &cfg);
+            assert!(
+                (coarse - 2.0 * fine).abs() < 1e-4,
+                "lod {lod} chunk ({coarse}) must be 2x lod {} ({fine})",
+                lod - 1
+            );
+        }
+        // Anchor the absolute scale: a LOD-0 chunk spans cell_stride·voxel·CHUNK_BRICKS.
+        let expect0 = cfg.cell_stride() as f32 * cfg.voxel_size_at(0) * CHUNK_BRICKS as f32;
+        assert!((chunk_world_size(0, &cfg) - expect0).abs() < 1e-6);
+    }
+
+    /// The world point → chunk mapping is geometrically self-consistent: the chunk a
+    /// point resolves to (`chunk_of(world_to_brick_lod(p))`) has a world box that
+    /// actually encloses `p` on every axis: `min ≤ p < min + size`. A drift between the
+    /// addressing math and the debug-viz geometry would break this.
+    #[test]
+    fn chunk_box_contains_its_world_point() {
+        use bevy::math::Vec3;
+        let cfg = config();
+        for lod in 0..cfg.lod_count {
+            let size = chunk_world_size(lod, &cfg);
+            for p in [
+                Vec3::ZERO,
+                Vec3::new(0.05, 0.05, 0.05),
+                Vec3::new(13.7, -4.2, 88.1),
+                Vec3::new(-260.0, 30.0, -9.0),
+            ] {
+                let brick = cfg.world_to_brick_lod(p, lod);
+                let (ck, _) = chunk_of(BrickKey::new(lod, brick), &cfg);
+                let min = chunk_min_world(ck, &cfg);
+                let max = min + Vec3::splat(size);
+                assert!(
+                    p.x >= min.x && p.x < max.x
+                        && p.y >= min.y && p.y < max.y
+                        && p.z >= min.z && p.z < max.z,
+                    "lod {lod}: point {p:?} not in its chunk box [{min:?}, {max:?})"
+                );
+            }
+        }
+    }
+
+    /// Adjacent chunks tile exactly — the next chunk's min corner is one full chunk
+    /// further on, with no gap or overlap (so the debug overlay reads as a clean grid).
+    #[test]
+    fn adjacent_chunks_tile_without_gaps() {
+        let cfg = config();
+        for lod in 0..cfg.lod_count {
+            let size = chunk_world_size(lod, &cfg);
+            let base = ChunkKey::new(lod, IVec3::new(2, -1, 0));
+            let min = chunk_min_world(base, &cfg);
+            for (axis, delta) in [
+                (0, IVec3::X),
+                (1, IVec3::Y),
+                (2, IVec3::Z),
+            ] {
+                let next = chunk_min_world(ChunkKey::new(lod, base.coord + delta), &cfg);
+                let step = next - min;
+                // Only the stepped axis advances, by exactly one chunk world size.
+                for a in 0..3 {
+                    let want = if a == axis { size } else { 0.0 };
+                    assert!(
+                        (step[a] - want).abs() < 1e-4,
+                        "lod {lod} axis {axis}: neighbour offset[{a}]={} want {want}",
+                        step[a]
+                    );
+                }
+            }
+        }
+    }
 }
