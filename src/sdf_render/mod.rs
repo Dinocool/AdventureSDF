@@ -102,17 +102,11 @@ pub struct RayStepCapture {
 /// synchronously via `full_bake` every frame the edit set changes. The editor's "Sync
 /// bake" checkbox flips it.
 ///
-/// Defaults ON: the async/incremental path currently has outstanding correctness issues,
-/// so sync bake is the stable path for now. Flip the default back to false once the async
-/// scheduler is fixed.
-#[derive(Resource)]
+/// Defaults OFF: the async/incremental clipmap scheduler only re-bakes the shell of
+/// bricks that enter/exit each LOD ring as the camera moves, so camera motion no longer
+/// triggers a full-atlas rebuild. Sync mode is kept as an A/B diagnostic toggle.
+#[derive(Resource, Default)]
 pub struct SyncBakeMode(pub bool);
-
-impl Default for SyncBakeMode {
-    fn default() -> Self {
-        Self(true)
-    }
-}
 
 /// Toggle for the SDF fullscreen raymarch pass. F1 flips this.
 #[derive(Resource)]
@@ -259,6 +253,12 @@ pub const DEFAULT_LOD_COUNT: u32 = 8;
 /// 64 = 4·16 gives each band ~5x the world reach of the old 12 at the same voxel
 /// resolution (detail preserved; the sparse cull keeps only non-empty bricks resident).
 pub const DEFAULT_RING_BRICKS: u32 = 64;
+/// Default ring-recenter hysteresis, in whole chunks (see
+/// [`SdfGridConfig::recenter_snap_chunks`]). With `CHUNK_BRICKS = 4` and a 64-brick ring
+/// (16 chunks/axis), snapping to 2 chunks means the window recenters every ~5.6 m at LOD
+/// 0 instead of every brick crossing, while still keeping the camera 6+ chunks from any
+/// window edge.
+pub const DEFAULT_RECENTER_SNAP_CHUNKS: i32 = 2;
 
 #[derive(Resource, Clone)]
 pub struct SdfGridConfig {
@@ -270,6 +270,12 @@ pub struct SdfGridConfig {
     pub lod_count: u32,
     /// Bricks per axis in each LOD ring window centred on the camera.
     pub ring_bricks: u32,
+    /// Hysteresis: the ring window only recenters when the camera crosses this many
+    /// whole chunks, so the per-LOD origin snaps to a coarse `recenter_snap_chunks`
+    /// lattice instead of moving every brick crossing (~0.7 m at LOD 0). `1` = recenter
+    /// on every chunk crossing (no hysteresis). Must stay well below
+    /// `ring_bricks / CHUNK_BRICKS` so the camera never leaves its own window.
+    pub recenter_snap_chunks: i32,
 }
 
 impl Default for SdfGridConfig {
@@ -280,6 +286,7 @@ impl Default for SdfGridConfig {
             voxel_size: 0.1,
             lod_count: DEFAULT_LOD_COUNT,
             ring_bricks: DEFAULT_RING_BRICKS,
+            recenter_snap_chunks: DEFAULT_RECENTER_SNAP_CHUNKS,
         }
     }
 }
