@@ -4,8 +4,8 @@
 // of the edit-AABB tree that jumps the ray to the next occupied region, instead of
 // stepping brick-by-brick. Falls back to the brick DDA when the BVH is empty.
 
-#import sdf::bindings::{camera, bvh_buf, BVH_INTERNAL_FLAG, num_bvh_nodes, max_dist, bake_reach}
-#import sdf::brick::dist_to_brick_exit
+#import sdf::bindings::{camera, bvh_buf, BVH_INTERNAL_FLAG, num_bvh_nodes, max_dist, bake_reach, brick_world_at}
+#import sdf::brick::{dist_to_brick_exit, finest_lod_window_at}
 
 // Slab test: returns the entry distance t (>= t_min) if the ray hits the box
 // within (t_min, t_max), else a negative sentinel.
@@ -42,8 +42,6 @@ fn bvh_ray_advance(p: vec3<f32>, dir: vec3<f32>) -> f32 {
         return t_brick;
     }
 
-    let pad = vec3<f32>(bake_reach());
-
     let inv_d = vec3<f32>(
         1.0 / select(dir.x, 1e-8, abs(dir.x) < 1e-8),
         1.0 / select(dir.y, 1e-8, abs(dir.y) < 1e-8),
@@ -68,7 +66,15 @@ fn bvh_ray_advance(p: vec3<f32>, dir: vec3<f32>) -> f32 {
         let node = bvh_buf[ni];
 
         // Inflate by the full bake footprint so the skip lands at or before any baked
-        // brick — for both internal and leaf nodes.
+        // brick — for both internal and leaf nodes. The reach is LOD-dependent: a baked
+        // brick at LOD L extends `~brick_world_at(L)` beyond the tight edit AABB stored
+        // here, and L grows 2^L per level. Size the pad to the LOD actually resident at
+        // this box (its centre), plus a 2-brick margin so over-inflation (harmless: skips
+        // a hair early) covers the lattice snap. A single LOD-0 pad under-inflates coarse
+        // rings → the skip jumps over their shells → escaped rays / grain at LOD 2+.
+        let box_center = (node.aabb_min + node.aabb_max) * 0.5;
+        let box_lod = finest_lod_window_at(box_center);
+        let pad = vec3<f32>(bake_reach() + 2.0 * brick_world_at(box_lod));
         let lo = node.aabb_min - pad;
         let hi = node.aabb_max + pad;
 
