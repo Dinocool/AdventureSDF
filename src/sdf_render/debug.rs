@@ -359,6 +359,12 @@ fn register_shader_modes(app: &mut App) {
         "Tint hit by clipmap LOD: 0 white, 1 green, 2 blue, 3 red, 4+ yellow",
     ));
     registry.register(overlay(
+        "sdf/volume",
+        "Volume",
+        "SDF_DEBUG_VOLUME",
+        "Tint by 3D distance-clipmap level (0 white,1 green,2 blue,3 red); brightness = volume distance",
+    ));
+    registry.register(overlay(
         "sdf/tile_id",
         "Tile ID",
         "SDF_DEBUG_TILE_ID",
@@ -863,6 +869,7 @@ fn raymarch_panel(world: &mut World, ui: &mut egui::Ui) {
     ui.add(egui::Slider::new(&mut params.max_steps, 16..=512).text("Steps"));
     ui.add(egui::Slider::new(&mut params.max_dist, 10.0..=500.0).text("Max Dist"));
     ui.add(egui::Slider::new(&mut params.sdf_eps, 0.0001..=0.1).text("Epsilon"));
+    ui.add(egui::Slider::new(&mut params.lod_blend_band, 0.0..=0.5).text("LOD Blend Band"));
 }
 
 fn ray_inspector_panel(world: &mut World, ui: &mut egui::Ui) {

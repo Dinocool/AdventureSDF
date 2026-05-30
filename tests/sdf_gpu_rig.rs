@@ -40,8 +40,13 @@ fn device_queue() -> Option<(wgpu::Device, wgpu::Queue)> {
         "GPU adapter: name={:?} backend={:?} driver={:?} driver_info={:?} device_type={:?}",
         info.name, info.backend, info.driver, info.driver_info, info.device_type
     );
+    // R16Snorm (the brick atlas + volume distance format) needs TEXTURE_FORMAT_16BIT_NORM;
+    // request it if the adapter supports it so the rig can create those textures.
+    let wanted = wgpu::Features::TEXTURE_FORMAT_16BIT_NORM;
+    let features = adapter.features() & wanted;
     let (device, queue) = block_on(adapter.request_device(&wgpu::DeviceDescriptor {
         label: Some("sdf_gpu_rig"),
+        required_features: features,
         ..Default::default()
     }))
     .ok()?;
@@ -899,4 +904,157 @@ fn gpu_find_brick_lookup_matches_cpu() {
         println!("  {line}");
     }
     assert!(bad.is_empty(), "find_brick_lookup diverged on {} bricks", bad.len());
+}
+
+// =====================================================================================
+// IN-RING PARITY: the chunk-DDA empty-space skip's `in_ring_chunk` (brick.wgsl) must compute
+// the SAME resident-ring window as bake_scheduler::ring_chunk_origin (the source of truth).
+// They're hand-duplicated across WGSL/Rust; a silent divergence makes the skip step past
+// real geometry (permanent holes) or never fire (lost perf). Run the real WGSL on-device and
+// compare to the real CPU window for a batch of chunk coords across LODs.
+// =====================================================================================
+
+// Camera uniform with camera_pos (floats 32..35) + recenter_snap_chunks (debug_params.w =
+// float 51) filled, on top of the lod_params the base helper sets. `in_ring_chunk` reads
+// camera_pos.xyz, ring_bricks()=lod_params.y, recenter_snap_chunks()=debug_params.w,
+// cell_stride()=lod_params.w, and voxel_size_at via lod_params.z.
+fn camera_uniform_bytes_full(config: &SdfGridConfig, camera_pos: Vec3) -> Vec<u8> {
+    let mut f = [0.0f32; 60];
+    f[32] = camera_pos.x; // camera_pos.xyz
+    f[33] = camera_pos.y;
+    f[34] = camera_pos.z;
+    f[51] = config.recenter_snap_chunks as f32; // debug_params.w
+    f[56] = config.lod_count as f32; // lod_params
+    f[57] = config.ring_bricks as f32;
+    f[58] = config.voxel_size;
+    f[59] = config.cell_stride() as f32;
+    bytemuck::cast_slice(&f).to_vec()
+}
+
+const IN_RING_PROBE_WGSL: &str = r#"
+#import sdf::bindings::camera
+#import sdf::brick::in_ring_chunk
+
+struct CoordIn { x: i32, y: i32, z: i32, lod: u32 };
+@group(0) @binding(1) var<storage, read> coords: array<CoordIn>;
+@group(0) @binding(2) var<storage, read_write> out_in_ring: array<u32>;
+@compute @workgroup_size(1)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    let c = vec3<i32>(coords[i].x, coords[i].y, coords[i].z);
+    out_in_ring[i] = select(0u, 1u, in_ring_chunk(c, coords[i].lod));
+}
+"#;
+
+#[test]
+fn gpu_in_ring_chunk_matches_cpu() {
+    use wgpu::util::DeviceExt;
+    use adventure::sdf_render::atlas::BrickKey;
+    use adventure::sdf_render::bake_scheduler::ring_chunk_origin;
+
+    let Some((device, queue)) = device_queue() else {
+        eprintln!("no GPU adapter — skipping");
+        return;
+    };
+    let config = SdfGridConfig::default();
+    let camera_pos = Vec3::new(3.0, 2.0, -5.0); // off-origin so negative coords are exercised
+
+    // Brick coords spanning a wide range around + far from the camera, at several LODs, so
+    // we hit both in-ring and out-of-ring cases (incl. negative coords — the GPU op hazard).
+    let s = config.cell_stride();
+    let mut in_data: Vec<CoordIn> = Vec::new();
+    let mut probe: Vec<(IVec3, u32)> = Vec::new();
+    for lod in 0..config.lod_count {
+        for bx in [-40i32, -8, 0, 8, 40] {
+            for by in [-8i32, 0, 8] {
+                for bz in [-40i32, 0, 40] {
+                    let coord = IVec3::new(bx * s, by * s, bz * s);
+                    in_data.push(CoordIn { x: coord.x, y: coord.y, z: coord.z, lod });
+                    probe.push((coord, lod));
+                }
+            }
+        }
+    }
+
+    let module = compose_entry(IN_RING_PROBE_WGSL, "in_ring_probe.wgsl");
+    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("in_ring_probe"),
+        source: wgpu::ShaderSource::Naga(Cow::Owned(module)),
+    });
+    let camera_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("camera"),
+        contents: &camera_uniform_bytes_full(&config, camera_pos),
+        usage: wgpu::BufferUsages::UNIFORM,
+    });
+    let coords_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("coords"),
+        contents: bytemuck::cast_slice(&in_data),
+        usage: wgpu::BufferUsages::STORAGE,
+    });
+    let out_size = (in_data.len() * 4) as u64;
+    let out_buf = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("out"),
+        size: out_size,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        mapped_at_creation: false,
+    });
+    let readback = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("rb"),
+        size: out_size,
+        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+        mapped_at_creation: false,
+    });
+    let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+        label: Some("in_ring_pipeline"),
+        layout: None,
+        module: &shader,
+        entry_point: Some("main"),
+        compilation_options: Default::default(),
+        cache: None,
+    });
+    let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("bg"),
+        layout: &pipeline.get_bind_group_layout(0),
+        entries: &[
+            wgpu::BindGroupEntry { binding: 0, resource: camera_buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 1, resource: coords_buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 2, resource: out_buf.as_entire_binding() },
+        ],
+    });
+    let mut enc = device.create_command_encoder(&Default::default());
+    {
+        let mut pass = enc.begin_compute_pass(&Default::default());
+        pass.set_pipeline(&pipeline);
+        pass.set_bind_group(0, &bg, &[]);
+        pass.dispatch_workgroups(in_data.len() as u32, 1, 1);
+    }
+    enc.copy_buffer_to_buffer(&out_buf, 0, &readback, 0, out_size);
+    queue.submit([enc.finish()]);
+    let slice = readback.slice(..);
+    slice.map_async(wgpu::MapMode::Read, |_| {});
+    device.poll(wgpu::PollType::wait_indefinitely()).ok();
+    let gpu: Vec<u32> = bytemuck::cast_slice(&slice.get_mapped_range()).to_vec();
+    readback.unmap();
+
+    // CPU reference: the actual scheduler window membership.
+    let r = (config.ring_bricks / adventure::sdf_render::chunk::CHUNK_BRICKS as u32) as i32;
+    let mut diffs = Vec::new();
+    for ((coord, lod), &g) in probe.iter().zip(&gpu) {
+        let origin = ring_chunk_origin(&config, camera_pos, *lod);
+        let (ck, _) = adventure::sdf_render::chunk::chunk_of(BrickKey::new(*lod, *coord), &config);
+        let rel = ck.coord - origin;
+        let cpu = rel.x >= 0 && rel.y >= 0 && rel.z >= 0 && rel.x < r && rel.y < r && rel.z < r;
+        if (g == 1) != cpu {
+            diffs.push(format!("coord={coord:?} lod={lod}: gpu={} cpu={cpu}", g == 1));
+        }
+    }
+    println!("in_ring parity: {} coords, {} divergences", probe.len(), diffs.len());
+    for d in diffs.iter().take(12) {
+        println!("  {d}");
+    }
+    assert!(
+        diffs.is_empty(),
+        "in_ring_chunk (WGSL) diverged from ring_chunk_origin (Rust) on {} coords",
+        diffs.len()
+    );
 }
