@@ -386,3 +386,98 @@ fn measure_march_steps_single_sphere() {
         }
     }
 }
+
+// --- Cone-marching prototype (Skipping Spheres / Claybook / Gunk) ------------------------
+//
+// PROTOTYPE ONLY (analytic sphere ground truth, no brick resolve) to measure whether a
+// coarse low-res CONE pre-pass cuts the per-ray step count enough to justify a real GPU
+// second pass. The expensive grazing rays (measured earlier) crawl ~30-54 small steps in a
+// near-surface band; a cone trace amortized over an 8×8 tile should advance all 64 rays to
+// the START of that band for ~free, so each full-res ray resumes there.
+//
+// Cone trace: advance by the SDF distance `d`, but the cone has radius `cone_k · t` (the
+// world-width of the tile at distance t). Stop when `d <= cone_radius` — the surface is
+// within the cone, so SOME ray in the tile may hit beyond here; we must hand off to per-ray.
+// Conservative: the cone encloses all 64 rays, so no ray hit anything before this t.
+
+fn analytic_sphere(p: Vec3) -> f32 {
+    p.length() - 1.0 // unit sphere at origin
+}
+
+/// Coarse cone trace for a tile (represented by its centre ray). Returns the handoff `t`
+/// (where the cone first touches the surface) and the coarse step count. `cone_k` = the
+/// tile's angular half-width per unit distance = pixel_cone · tile_pixels.
+fn cone_trace(origin: Vec3, dir: Vec3, cone_k: f32, max_dist: f32) -> (f32, u32) {
+    const MAX_STEPS: u32 = 192;
+    let mut t = 0.0f32;
+    for i in 0..MAX_STEPS {
+        if t > max_dist {
+            return (t, i); // cone escaped — whole tile is sky, full-res rays can skip to here
+        }
+        let d = analytic_sphere(origin + dir * t);
+        let cone_radius = cone_k * t;
+        if d <= cone_radius {
+            return (t, i + 1); // surface within the cone — hand off to per-ray here
+        }
+        t += d.max(1e-4);
+    }
+    (t, MAX_STEPS)
+}
+
+/// Per-ray sphere trace of the analytic sphere starting from `t0` (the cone handoff).
+/// Returns (steps, hit). Mirrors the production hit-accept (`d < max(eps, pixel_cone·t)`).
+fn ray_trace_from(origin: Vec3, dir: Vec3, t0: f32, pixel_cone: f32) -> (u32, bool) {
+    const MAX_STEPS: u32 = 192;
+    const MAX_DIST: f32 = 2000.0;
+    const SDF_EPS: f32 = 0.001;
+    let mut t = t0;
+    for i in 0..MAX_STEPS {
+        if t > MAX_DIST {
+            return (i, false);
+        }
+        let d = analytic_sphere(origin + dir * t);
+        if d < SDF_EPS.max(pixel_cone * t) {
+            return (i + 1, true);
+        }
+        t += d.max(1e-4);
+    }
+    (MAX_STEPS, false)
+}
+
+#[test]
+fn measure_cone_marching() {
+    let camera_pos = Vec3::new(0.0, 2.0, 6.0);
+    let to_centre = (Vec3::ZERO - camera_pos).normalize();
+    let right = to_centre.cross(Vec3::Y).normalize();
+
+    let fov_y = 60.0f32.to_radians();
+    let pixel_cone = (fov_y * 0.5).tan() / 1080.0; // per-pixel half-width per unit t
+    const TILE: f32 = 8.0; // 8×8 pixel tile → 64 rays share one cone
+    let cone_k = pixel_cone * TILE;
+
+    println!("cone marching: tile={TILE}px  baseline=full ray from t=0 vs cone-seeded");
+    println!("angle  baseline_steps  cone_steps  perray_after  amortized  fate");
+
+    // Sweep the silhouette band where the expensive grazing rays live (9-12°).
+    for q in (700..1250).step_by(50) {
+        let ang = (q as f32 / 100.0).to_radians();
+        let dir = (to_centre * ang.cos() + right * ang.sin()).normalize();
+
+        // Baseline: full-res ray from t=0.
+        let (base_steps, base_hit) = ray_trace_from(camera_pos, dir, 0.0, pixel_cone);
+
+        // Cone-marched: coarse cone to handoff t0, then per-ray from t0.
+        let (t0, cone_steps) = cone_trace(camera_pos, dir, cone_k, 2000.0);
+        let (after_steps, hit) = ray_trace_from(camera_pos, dir, t0, pixel_cone);
+        // Amortized per-pixel cost: the cone is shared by 64 rays, so its cost / 64 + the
+        // per-ray steps after handoff.
+        let amortized = cone_steps as f32 / (TILE * TILE) + after_steps as f32;
+
+        let fate = if hit { "Hit" } else { "miss" };
+        println!(
+            "  {:>5.2}°  base={:3}({})  cone={:3}  after={:3}  amort={:.1}  {fate}",
+            ang.to_degrees(), base_steps, if base_hit { "H" } else { "m" },
+            cone_steps, after_steps, amortized
+        );
+    }
+}
