@@ -59,7 +59,7 @@ struct SdfCameraData {
     /// (wireframe, gizmos) through the normal depth buffer.
     clip_from_world: Mat4,
     camera_pos: Vec4,
-    screen_params: Vec4, // xy = screen_size, zw = unused
+    screen_params: Vec4, // xy = screen_size, z = surface_bias, w = unused
     grid_origin: Vec4,   // xyz = grid origin, w = voxel_size
     grid_dims: Vec4, // x = grid_size, y = bricks_per_axis, z = brick_size (8.0), w = num_lookups
     debug_params: Vec4, // x = max_steps, y = max_dist, z = sdf_eps, w = unused
@@ -568,7 +568,8 @@ fn prepare_sdf_camera_data(
             inv_view_proj,
             clip_from_world,
             camera_pos: transform.translation.extend(0.0),
-            screen_params: Vec4::new(size.x as f32, size.y as f32, 0.0, 0.0),
+            // z = surface_bias (coarse-LOD iso-offset α); w unused.
+            screen_params: Vec4::new(size.x as f32, size.y as f32, raymarch.surface_bias, 0.0),
             grid_origin: Vec4::new(
                 config.world_origin().x,
                 config.world_origin().y,

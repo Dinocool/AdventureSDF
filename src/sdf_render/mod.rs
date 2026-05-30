@@ -162,6 +162,14 @@ pub struct SdfRaymarchParams {
     /// ring boundary instead of snapping (removes the visible LOD pop/seam). 0 = disabled
     /// (hard LOD seams, the original behaviour). Tunable live via the editor raymarch panel.
     pub lod_blend_band: f32,
+    /// Coarse-LOD iso-offset α. Convex objects render thinner at coarse LODs because
+    /// trilinear interpolation of the sampled field over-estimates distance on a convex
+    /// surface, pushing the zero-isosurface inward by ≈ `(h²/8)·κ` (h = voxel size). To
+    /// re-inflate, the sphere-trace march takes the surface where the field equals
+    /// `α · voxel_size(lod)² / base_voxel_size` (quadratic in h to match the bias law)
+    /// instead of 0. Zero at LOD 0 (the analytic cubic owns the near surface), so fine
+    /// detail is untouched; grows with the LOD. 0 = off. Tunable live in the raymarch panel.
+    pub surface_bias: f32,
 }
 
 impl Default for SdfRaymarchParams {
@@ -176,6 +184,7 @@ impl Default for SdfRaymarchParams {
             cubic_band: 0.5,
             over_relax: 1.0,
             lod_blend_band: 0.2,
+            surface_bias: 0.0,
         }
     }
 }
