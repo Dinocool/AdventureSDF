@@ -90,6 +90,14 @@ impl Default for BvhDebugState {
     }
 }
 
+/// Controls the non-empty-chunk wireframe overlay (drawn via [`draw_chunks`]). One box
+/// per resident chunk, coloured by LOD — the chunk-grid analogue of the BVH visualizer.
+#[derive(Resource, Reflect, Default)]
+#[reflect(Resource)]
+pub struct ChunkDebugState {
+    pub visible: bool,
+}
+
 /// Authoring panel state: the primitive/op/material to spawn next.
 #[derive(Resource)]
 pub struct SpawnState {
@@ -184,9 +192,11 @@ impl Plugin for SdfDebugPlugin {
         app.init_resource::<SdfAtlasStats>()
             .init_resource::<SdfAtlasTextures>()
             .init_resource::<BvhDebugState>()
+            .init_resource::<ChunkDebugState>()
             .init_resource::<SpawnState>()
             .register_type::<SdfAtlasStats>()
             .register_type::<BvhDebugState>()
+            .register_type::<ChunkDebugState>()
             .add_systems(
                 Update,
                 update_atlas_stats.run_if(in_state(AppScene::SdfEditor)),
@@ -206,7 +216,8 @@ impl Plugin for SdfDebugPlugin {
         if app.world().get_resource::<Assets<GizmoAsset>>().is_some() {
             app.add_systems(
                 Update,
-                (draw_bounds, draw_bvh, live_ray_capture).run_if(in_state(AppScene::SdfEditor)),
+                (draw_bounds, draw_bvh, draw_chunks, live_ray_capture)
+                    .run_if(in_state(AppScene::SdfEditor)),
             );
         }
 
@@ -236,6 +247,14 @@ impl Plugin for SdfDebugPlugin {
             inspect_panel,
         );
         register_panel(app, "sdf/bvh", "SDF BVH", DockSide::Left, 25, bvh_panel);
+        register_panel(
+            app,
+            "sdf/chunks",
+            "SDF Chunks",
+            DockSide::Left,
+            26,
+            chunk_panel,
+        );
         register_panel(
             app,
             "sdf/gizmo",
@@ -331,6 +350,12 @@ fn register_shader_modes(app: &mut App) {
         "Ray fate",
         "SDF_DEBUG_RAY_FATE",
         "Every pixel: green=hit, red=escaped (over-skip), blue=out of steps",
+    ));
+    registry.register(overlay(
+        "sdf/lod",
+        "LOD",
+        "SDF_DEBUG_LOD",
+        "Tint hit by clipmap LOD: 0 white, 1 green, 2 blue, 3 red, 4+ yellow",
     ));
 }
 
@@ -538,6 +563,69 @@ fn depth_color(depth: u32) -> Color {
     let g = (1.0 - (hue - 2.0).abs()).clamp(0.0, 1.0);
     let b = (1.0 - (hue - 1.0).abs()).clamp(0.0, 1.0);
     Color::srgb(r.max(0.2), g.max(0.2), b.max(0.2))
+}
+
+// --- Chunk visualizer ---
+
+/// Per-LOD chunk wireframe colour, matching the `SDF_DEBUG_LOD` shader ramp:
+/// 0 white, 1 green, 2 blue, 3 red, 4+ yellow.
+fn lod_color(lod: u32) -> Color {
+    match lod {
+        0 => Color::srgb(1.0, 1.0, 1.0),
+        1 => Color::srgb(0.0, 1.0, 0.0),
+        2 => Color::srgb(0.0, 0.4, 1.0),
+        3 => Color::srgb(1.0, 0.0, 0.0),
+        _ => Color::srgb(1.0, 1.0, 0.0),
+    }
+}
+
+/// Draw a wireframe box around every resident (non-empty) chunk, coloured by LOD, when
+/// the `ChunkDebugState` toggle is on. The chunk-grid analogue of [`draw_bvh`]: shows
+/// exactly the sparse set of chunks the clipmap has baked + their nested LOD shells.
+fn draw_chunks(
+    mut gizmos: Gizmos<SdfOverlayGizmos>,
+    state: Res<ChunkDebugState>,
+    atlas: Res<SdfAtlas>,
+    config: Res<SdfGridConfig>,
+) {
+    if !state.visible {
+        return;
+    }
+    for ck in super::chunk::resident_chunks(&atlas, &config) {
+        let min = super::chunk::chunk_min_world(ck, &config);
+        let size = super::chunk::chunk_world_size(ck.lod, &config);
+        let center = min + Vec3::splat(size * 0.5);
+        gizmos.primitive_3d(
+            &Cuboid::new(size, size, size),
+            Isometry3d::from_translation(center),
+            lod_color(ck.lod),
+        );
+    }
+}
+
+/// Panel: resident-chunk count + the overlay toggle (mirrors `bvh_panel`).
+fn chunk_panel(world: &mut World, ui: &mut egui::Ui) {
+    let (count, by_lod) = {
+        let atlas = world.resource::<SdfAtlas>();
+        let config = world.resource::<SdfGridConfig>();
+        let chunks = super::chunk::resident_chunks(atlas, config);
+        let mut by_lod = [0u32; 16];
+        for ck in &chunks {
+            if (ck.lod as usize) < by_lod.len() {
+                by_lod[ck.lod as usize] += 1;
+            }
+        }
+        (chunks.len(), by_lod)
+    };
+    ui.label(format!("Resident chunks: {count}"));
+    for (lod, n) in by_lod.iter().enumerate() {
+        if *n > 0 {
+            ui.label(format!("  LOD {lod}: {n}"));
+        }
+    }
+    ui.separator();
+    let mut state = world.resource_mut::<ChunkDebugState>();
+    ui.checkbox(&mut state.visible, "Show chunk boxes");
 }
 
 // --- Wireframe bounds ---

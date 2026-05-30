@@ -139,6 +139,9 @@ impl TabViewer for EditorTabViewer<'_> {
     fn ui(&mut self, ui: &mut egui::Ui, tab: &mut Self::Tab) {
         match tab {
             EditorTab::Viewport => {
+                // Toolbar strip across the top of the viewport tab. The remaining area
+                // below it is what the 3D camera renders into.
+                viewport_toolbar(self.world, ui);
                 // Capture the region the 3D camera should render into. The SDF pass
                 // fills this rect; everything else here is just reserved space.
                 *self.viewport_rect = ui.clip_rect();
@@ -251,4 +254,42 @@ pub fn show_editor_dock(world: &mut World) {
 
     world.insert_resource(dock);
     world.insert_resource(registry);
+}
+
+/// Toolbar strip rendered across the top of the Viewport tab. Currently hosts the
+/// camera-mode toggle (Orbit ⇄ FPS free-fly). Drawn with a `TopBottomPanel::top` scoped
+/// to the tab's `ui`, so the 3D camera's reserved rect (captured after) sits below it.
+fn viewport_toolbar(world: &mut World, ui: &mut egui::Ui) {
+    use crate::sdf_render::{SdfCameraMode, SdfOrbitCamera};
+
+    egui::TopBottomPanel::top("viewport_toolbar")
+        .exact_height(28.0)
+        .show_inside(ui, |ui| {
+            ui.horizontal_centered(|ui| {
+                let fps = world.resource::<SdfCameraMode>().fps;
+
+                // Orbit / FPS segmented toggle.
+                if ui.selectable_label(!fps, "🛰 Orbit").clicked() && fps {
+                    world.resource_mut::<SdfCameraMode>().fps = false;
+                }
+                if ui.selectable_label(fps, "🎮 FPS").clicked() && !fps {
+                    // Seed the free-fly yaw/pitch from the orbit view so toggling in
+                    // doesn't snap the camera to a new orientation.
+                    let orbit = world.resource::<SdfOrbitCamera>();
+                    let (yaw, pitch) = (orbit.yaw, orbit.pitch);
+                    let mut mode = world.resource_mut::<SdfCameraMode>();
+                    mode.fps = true;
+                    mode.yaw = yaw;
+                    mode.pitch = pitch;
+                }
+
+                ui.separator();
+                if fps {
+                    let speed = world.resource::<SdfCameraMode>().speed;
+                    ui.label(format!("Fly: RMB look · WASD · Space/Ctrl · {speed:.0} u/s"));
+                } else {
+                    ui.label("Orbit: MMB rotate · Shift+MMB pan · wheel zoom");
+                }
+            });
+        });
 }

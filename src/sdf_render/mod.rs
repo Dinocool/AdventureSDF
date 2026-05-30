@@ -1,6 +1,7 @@
 pub mod atlas;
 pub mod bc7;
 pub mod bvh;
+pub mod chunk;
 #[cfg(feature = "editor")]
 pub mod debug;
 pub mod edits;
@@ -9,9 +10,12 @@ pub mod picking;
 pub mod render;
 pub mod textures;
 
+use std::sync::Arc;
+
 use bevy::core_pipeline::prepass::DepthPrepass;
 use bevy::input::mouse::{MouseMotion, MouseWheel};
 use bevy::prelude::*;
+use bevy::tasks::{AsyncComputeTaskPool, Task, block_on, poll_once};
 
 use crate::scene_manager::{AppScene, SceneEntity};
 
@@ -47,6 +51,11 @@ pub struct SdfCamera;
 /// without the resource type vanishing from the core build.
 #[derive(Resource, Default)]
 pub struct WireframeBoundsVisible(pub bool);
+
+/// Whether the per-LOD clipmap ring wire boxes are drawn (toggled with F8). Off by
+/// default so the overlay stays clean; see `draw_lod_rings`.
+#[derive(Resource, Default)]
+pub struct LodRingsVisible(pub bool);
 
 /// Last CPU ray-step capture from the debug ray inspector. Empty until a capture
 /// is requested.
@@ -129,13 +138,54 @@ impl Default for SdfOrbitCamera {
     }
 }
 
+/// SDF editor camera mode. Default is the orbit camera; the viewport toolbar toggles
+/// `fps` to switch to a free-fly (WASD + mouse-look) camera, useful for flying out
+/// across the km-scale clipmap terrain instead of orbiting a point.
+#[derive(Resource)]
+pub struct SdfCameraMode {
+    /// True = free-fly (FPS) camera; false = orbit camera.
+    pub fps: bool,
+    /// Free-fly yaw/pitch (radians). Seeded from the orbit camera on each toggle so the
+    /// view doesn't jump.
+    pub yaw: f32,
+    pub pitch: f32,
+    /// Movement speed in world units/second (adjustable with the mouse wheel in FPS).
+    pub speed: f32,
+}
+
+impl Default for SdfCameraMode {
+    fn default() -> Self {
+        Self {
+            fps: false,
+            yaw: 0.0,
+            pitch: 0.0,
+            speed: 15.0,
+        }
+    }
+}
+
 // --- Grid Config ---
+
+/// Number of LOD levels the clipmap generates by default. Level 0 is the base
+/// resolution; each coarser level doubles `voxel_size` (and so covers 2× the linear
+/// extent / 8× the volume) of the one below it.
+pub const DEFAULT_LOD_COUNT: u32 = 8;
+/// Bricks per axis in each LOD ring window centred on the camera. The ring at level
+/// `L` covers `ring_bricks · cell_stride · voxel_size · 2^L` world units per axis, so
+/// the same count reaches twice as far each coarser level (the clipmap nesting). Must be
+/// a multiple of [`chunk::CHUNK_BRICKS`] (the ring is enumerated in whole chunks).
+pub const DEFAULT_RING_BRICKS: u32 = 12;
 
 #[derive(Resource, Clone)]
 pub struct SdfGridConfig {
     pub grid_size: u32,
     pub brick_size: u32,
+    /// Base (level-0) voxel size in world units. Level `L` uses `voxel_size · 2^L`.
     pub voxel_size: f32,
+    /// How many LOD levels the clipmap bakes (level `0..lod_count`).
+    pub lod_count: u32,
+    /// Bricks per axis in each LOD ring window centred on the camera.
+    pub ring_bricks: u32,
 }
 
 impl Default for SdfGridConfig {
@@ -144,6 +194,8 @@ impl Default for SdfGridConfig {
             grid_size: 1024,
             brick_size: 8,
             voxel_size: 0.1,
+            lod_count: DEFAULT_LOD_COUNT,
+            ring_bricks: DEFAULT_RING_BRICKS,
         }
     }
 }
@@ -167,8 +219,19 @@ impl SdfGridConfig {
         Vec3::splat(-self.world_extent() * 0.5)
     }
 
+    /// Voxel size (world units) at LOD level `lod`: `base · 2^lod`.
+    pub fn voxel_size_at(&self, lod: u32) -> f32 {
+        self.voxel_size * (1u32 << lod) as f32
+    }
+
+    /// World-space edge length of one brick at LOD `lod` (`cell_stride · voxel_size`).
+    pub fn brick_world_size(&self, lod: u32) -> f32 {
+        self.cell_stride() as f32 * self.voxel_size_at(lod)
+    }
+
     /// Convert world position to brick origin (grid-relative voxel coords,
-    /// snapped down to the brick stride).
+    /// snapped down to the brick stride). Single-resolution (level-0, centred grid);
+    /// kept for the non-LOD bake/test paths. LOD bakes use [`Self::world_to_brick_lod`].
     pub fn world_to_brick(&self, world_pos: Vec3) -> IVec3 {
         let s = self.cell_stride();
         let relative = world_pos - self.world_origin();
@@ -178,17 +241,45 @@ impl SdfGridConfig {
         IVec3::new((vox_x / s) * s, (vox_y / s) * s, (vox_z / s) * s)
     }
 
-    /// Convert world position to voxel index within its brick (0..=stride).
-    pub fn world_to_voxel(&self, world_pos: Vec3) -> IVec3 {
+    /// Brick origin (stride-aligned voxel coords at LOD `lod`) containing `world_pos`.
+    /// Each LOD lattice is anchored at world 0 (not the centred grid origin), so coords
+    /// are signed and a ring can sit anywhere around the camera. `div_euclid` floors
+    /// toward negative infinity so the lattice is continuous across the origin.
+    pub fn world_to_brick_lod(&self, world_pos: Vec3, lod: u32) -> IVec3 {
         let s = self.cell_stride();
-        let relative = world_pos - self.world_origin();
-        let vox_x = (relative.x / self.voxel_size) as i32;
-        let vox_y = (relative.y / self.voxel_size) as i32;
-        let vox_z = (relative.z / self.voxel_size) as i32;
-        IVec3::new(vox_x % s, vox_y % s, vox_z % s)
+        let vs = self.voxel_size_at(lod);
+        let vox = IVec3::new(
+            (world_pos.x / vs).floor() as i32,
+            (world_pos.y / vs).floor() as i32,
+            (world_pos.z / vs).floor() as i32,
+        );
+        IVec3::new(
+            vox.x.div_euclid(s) * s,
+            vox.y.div_euclid(s) * s,
+            vox.z.div_euclid(s) * s,
+        )
     }
 
-    /// Compute linear brick ID from a brick origin coordinate.
+    /// World-space minimum corner of the brick at LOD `lod` with origin coord `coord`.
+    pub fn brick_min_world(&self, coord: IVec3, lod: u32) -> Vec3 {
+        let vs = self.voxel_size_at(lod);
+        Vec3::new(coord.x as f32, coord.y as f32, coord.z as f32) * vs
+    }
+
+    /// The ring window's corner brick coord at LOD `lod` for a camera at `camera_pos`:
+    /// the camera's brick minus half the ring on each axis, so the ring is centred on
+    /// the camera. Coords are multiples of `cell_stride`.
+    pub fn ring_origin(&self, camera_pos: Vec3, lod: u32) -> IVec3 {
+        let s = self.cell_stride();
+        let center = self.world_to_brick_lod(camera_pos, lod);
+        let half = (self.ring_bricks / 2) as i32 * s;
+        center - IVec3::splat(half)
+    }
+
+    // Chunk addressing (absolute keys, sparse occupancy) lives in `super::chunk`.
+
+    /// Compute linear brick ID from a brick origin coordinate (single-resolution,
+    /// level-0). Kept for the non-LOD path.
     pub fn brick_id(&self, coord: IVec3) -> u32 {
         let bpa = self.bricks_per_axis();
         let s = self.cell_stride();
@@ -208,9 +299,12 @@ impl Plugin for SdfScenePlugin {
         app.init_resource::<SdfGridConfig>()
             .init_resource::<SdfSelection>()
             .init_resource::<SdfOrbitCamera>()
+            .init_resource::<SdfCameraMode>()
             .init_resource::<edits::MaterialRegistry>()
             .init_resource::<atlas::SdfAtlas>()
             .init_resource::<PrevEditAabbs>()
+            .init_resource::<BakeScheduler>()
+            .init_resource::<LodRingsVisible>()
             .init_resource::<bvh::Bvh>()
             .init_resource::<SdfRenderEnabled>()
             .init_resource::<SdfRaymarchParams>()
@@ -235,7 +329,10 @@ impl Plugin for SdfScenePlugin {
             // sets ViewportInputAllowed). Non-editor build leaves it true.
             .add_systems(
                 Update,
-                orbit_camera
+                (
+                    orbit_camera.run_if(|m: Res<SdfCameraMode>| !m.fps),
+                    fps_camera.run_if(|m: Res<SdfCameraMode>| m.fps),
+                )
                     .run_if(in_state(AppScene::SdfEditor))
                     .run_if(|allowed: Res<ViewportInputAllowed>| allowed.0),
             )
@@ -253,7 +350,7 @@ impl Plugin for SdfScenePlugin {
             // edits in the inspector (and gizmo drags) must still re-bake.
             .add_systems(
                 Update,
-                (bake_dirty_bricks, upload_sdf_buffers, toggle_sdf_render)
+                (schedule_bakes, apply_bakes, upload_sdf_buffers, toggle_sdf_render)
                     .chain()
                     .run_if(in_state(AppScene::SdfEditor)),
             );
@@ -274,6 +371,14 @@ impl Plugin for SdfScenePlugin {
                 .add_systems(
                     Update,
                     (draw_ground_grid, gizmo::draw_gizmo).run_if(in_state(AppScene::SdfEditor)),
+                )
+                // LOD ring overlay: only while the toggle is on (LodRingsVisible, F8),
+                // so it doesn't clutter the normal view.
+                .add_systems(
+                    Update,
+                    draw_lod_rings
+                        .run_if(in_state(AppScene::SdfEditor))
+                        .run_if(|v: Res<LodRingsVisible>| v.0),
                 );
         }
 
@@ -343,88 +448,110 @@ fn setup_sdf_scene(
         SceneEntity,
     ));
 
-    // Demo gallery: a wide, flat sand "ground plane" cube with a spread of distinct
-    // primitives resting on its top surface. All plain unions (no subtracts). The
-    // plane is centred so its top face sits at y = 0; each object's centre is then
-    // placed at y = its half-height so it rests exactly on the surface.
-    // (order, transform, primitive, material)
-    const PLANE_HALF_Y: f32 = 0.15; // thin slab → reads like a plane
-    let demo: [(u32, Transform, SdfPrimitive, u32); 7] = [
-        // Ground plane: wide + thin, top face at y = 0 (centre at y = -half_y).
-        (
-            0,
-            Transform::from_xyz(0.0, -PLANE_HALF_Y, 0.0),
-            SdfPrimitive::Box {
-                half_extents: Vec3::new(4.0, PLANE_HALF_Y, 3.0),
-            },
-            mat_sand,
-        ),
-        // Box resting on the plane (half-height 0.4 → centre at y = 0.4).
-        (
-            1,
-            Transform::from_xyz(-2.4, 0.4, 0.4),
-            SdfPrimitive::Box {
-                half_extents: Vec3::splat(0.4),
-            },
-            mat_cobble,
-        ),
-        (
-            2,
-            Transform::from_xyz(-1.1, 0.55, -0.3),
-            SdfPrimitive::Sphere { radius: 0.55 },
-            mat_cobble2,
-        ),
-        // Torus lies flat: its half-thickness above centre is `minor` (0.18).
-        (
-            3,
-            Transform::from_xyz(0.2, 0.18, 0.5),
-            SdfPrimitive::Torus {
-                major: 0.5,
-                minor: 0.18,
-            },
-            mat_ground,
-        ),
-        // Capsule standing up: half-height + radius above centre.
-        (
-            4,
-            Transform::from_xyz(1.3, 0.68, -0.4),
-            SdfPrimitive::Capsule {
-                half_height: 0.4,
-                radius: 0.28,
-            },
-            mat_ground2,
-        ),
-        // Cylinder standing up: half-height above centre.
-        (
-            5,
-            Transform::from_xyz(2.4, 0.5, 0.3),
-            SdfPrimitive::Cylinder {
-                radius: 0.4,
-                half_height: 0.5,
-            },
-            mat_cobble,
-        ),
-        (
-            6,
-            Transform::from_xyz(0.6, 0.45, -1.1),
-            SdfPrimitive::Sphere { radius: 0.45 },
-            mat_ground,
-        ),
-    ];
+    // --- Clipmap LOD test scene: km-scale heightmap terrain + scattered pillars ---
+    //
+    // A large noise heightmap is the base terrain (Union, order 0). Cube pillars are
+    // sparsely scattered across it (deterministic from a hash), each topped by a sphere
+    // of a DIFFERENT material than the pillar, so the LOD rings and material handling
+    // are both visible as the camera moves out across the terrain.
+    let terrain_mats = [mat_sand, mat_ground, mat_ground2];
+    let pillar_mats = [mat_cobble, mat_cobble2];
+    let sphere_mats = [mat_ground2, mat_sand, mat_cobble];
 
-    for (order, transform, prim, registry_id) in demo {
-        commands.spawn((
-            transform,
-            prim,
-            SdfOp {
-                kind: CsgKind::Union,
-                smoothing: 0.0,
-            },
-            SdfOrder(order),
-            SdfMaterial { registry_id },
-            SdfVolume,
-            SceneEntity,
-        ));
+    let union = || SdfOp {
+        kind: CsgKind::Union,
+        smoothing: 0.0,
+    };
+
+    let mut order = 0u32;
+    let mut spawn_edit =
+        |commands: &mut Commands, transform: Transform, prim: SdfPrimitive, registry_id: u32| {
+            commands.spawn((
+                transform,
+                prim,
+                union(),
+                SdfOrder(order),
+                SdfMaterial { registry_id },
+                SdfVolume,
+                SceneEntity,
+            ));
+            order += 1;
+        };
+
+    // Base terrain: a wide heightmap. half_xz spans hundreds of metres so the clipmap
+    // rings have far terrain to coarsen. The field is a vertical-distance approximation
+    // (valid when densely sampled, which the fine LODs near the camera guarantee).
+    const TERRAIN_HALF_XZ: f32 = 400.0;
+    spawn_edit(
+        &mut commands,
+        Transform::from_xyz(0.0, 0.0, 0.0),
+        SdfPrimitive::Heightmap {
+            half_xz: Vec2::splat(TERRAIN_HALF_XZ),
+            max_height: 40.0,
+            freq: 0.02,
+            amp: 18.0,
+            seed: 1337,
+        },
+        terrain_mats[0],
+    );
+
+    // Sparse pillars on a jittered grid. Deterministic pseudo-random from a small
+    // integer hash so the scene is stable across runs. Each pillar is a tall thin box;
+    // a sphere of a different material caps it.
+    let hash = |x: i32, z: i32, salt: u32| -> f32 {
+        let mut h = (x as u32).wrapping_mul(73856093)
+            ^ (z as u32).wrapping_mul(19349663)
+            ^ salt.wrapping_mul(83492791);
+        h ^= h >> 13;
+        h = h.wrapping_mul(0x5bd1e995);
+        h ^= h >> 15;
+        (h & 0xffff) as f32 / 65535.0 // [0,1)
+    };
+    let terrain_h = |x: f32, z: f32| -> f32 {
+        // Mirror the Heightmap primitive's vertical field closely enough to seat the
+        // pillars on the surface (value-noise * amp). Exact placement isn't critical —
+        // pillars sink slightly into / rise above terrain, both fine for the demo.
+        let n = (x * 0.02).sin() * (z * 0.02).cos();
+        n * 18.0
+    };
+
+    const GRID: i32 = 6; // pillars on a -GRID..=GRID grid (jittered), pruned by density
+    const SPACING: f32 = 22.0;
+    for gz in -GRID..=GRID {
+        for gx in -GRID..=GRID {
+            // ~45% of cells get a pillar — sparse scatter.
+            if hash(gx, gz, 7) > 0.45 {
+                continue;
+            }
+            let jitter_x = (hash(gx, gz, 11) - 0.5) * SPACING * 0.6;
+            let jitter_z = (hash(gx, gz, 13) - 0.5) * SPACING * 0.6;
+            let x = gx as f32 * SPACING + jitter_x;
+            let z = gz as f32 * SPACING + jitter_z;
+            let base_y = terrain_h(x, z);
+
+            let pillar_h = 4.0 + hash(gx, gz, 17) * 6.0; // 4..10 m tall
+            let pillar_half = Vec3::new(1.2, pillar_h * 0.5, 1.2);
+            let pillar_cy = base_y + pillar_half.y;
+            let pi = ((gx + gz).rem_euclid(pillar_mats.len() as i32)) as usize;
+            spawn_edit(
+                &mut commands,
+                Transform::from_xyz(x, pillar_cy, z),
+                SdfPrimitive::Box {
+                    half_extents: pillar_half,
+                },
+                pillar_mats[pi],
+            );
+
+            // Sphere cap, different material, resting on the pillar top.
+            let sphere_r = 1.8;
+            let si = ((gx + gz + 1).rem_euclid(sphere_mats.len() as i32)) as usize;
+            spawn_edit(
+                &mut commands,
+                Transform::from_xyz(x, base_y + pillar_h + sphere_r * 0.5, z),
+                SdfPrimitive::Sphere { radius: sphere_r },
+                sphere_mats[si],
+            );
+        }
     }
 
     // Directional light so 3D geometry (and debug wireframes) are visible.
@@ -502,6 +629,86 @@ fn orbit_camera(
     for mut transform in &mut camera_query {
         *transform = Transform::from_translation(pos).looking_at(orbit.target, Vec3::Y);
     }
+}
+
+/// Free-fly (FPS) camera for the SDF editor: hold right mouse to look, WASD to move,
+/// Space/Ctrl for up/down, wheel adjusts speed. Lets you fly out across the km-scale
+/// clipmap terrain. Active only when `SdfCameraMode.fps` is set (the viewport toolbar
+/// toggle); the orbit camera is disabled in that mode so they don't fight.
+#[expect(clippy::too_many_arguments)]
+fn fps_camera(
+    mut mode: ResMut<SdfCameraMode>,
+    mut orbit: ResMut<SdfOrbitCamera>,
+    mut camera_query: Query<&mut Transform, (With<SdfCamera>, Without<SdfVolume>)>,
+    mouse: Res<ButtonInput<MouseButton>>,
+    keyboard: Res<ButtonInput<KeyCode>>,
+    time: Res<Time>,
+    mut motion: MessageReader<MouseMotion>,
+    mut scroll: MessageReader<MouseWheel>,
+) {
+    // Wheel adjusts fly speed (exponential feel), clamped to a sane range.
+    for ev in scroll.read() {
+        mode.speed = (mode.speed * (1.0 + ev.y * 0.1)).clamp(1.0, 500.0);
+    }
+
+    // Mouse-look only while holding right mouse (so panel clicks don't spin the view).
+    let looking = mouse.pressed(MouseButton::Right);
+    if looking {
+        for ev in motion.read() {
+            mode.yaw -= ev.delta.x * 0.003;
+            mode.pitch = (mode.pitch - ev.delta.y * 0.003)
+                .clamp(-std::f32::consts::FRAC_PI_2 + 0.01, std::f32::consts::FRAC_PI_2 - 0.01);
+        }
+    } else {
+        motion.clear();
+    }
+
+    let forward = Vec3::new(
+        mode.yaw.cos() * mode.pitch.cos(),
+        mode.pitch.sin(),
+        mode.yaw.sin() * mode.pitch.cos(),
+    )
+    .normalize_or_zero();
+    let right = forward.cross(Vec3::Y).normalize_or_zero();
+    let up = Vec3::Y;
+
+    let mut dir = Vec3::ZERO;
+    if keyboard.pressed(KeyCode::KeyW) {
+        dir += forward;
+    }
+    if keyboard.pressed(KeyCode::KeyS) {
+        dir -= forward;
+    }
+    if keyboard.pressed(KeyCode::KeyD) {
+        dir += right;
+    }
+    if keyboard.pressed(KeyCode::KeyA) {
+        dir -= right;
+    }
+    if keyboard.pressed(KeyCode::Space) {
+        dir += up;
+    }
+    if keyboard.pressed(KeyCode::ControlLeft) || keyboard.pressed(KeyCode::ControlRight) {
+        dir -= up;
+    }
+
+    let Some(mut transform) = camera_query.iter_mut().next() else {
+        return;
+    };
+
+    let mut pos = transform.translation;
+    if dir != Vec3::ZERO {
+        let mut speed = mode.speed;
+        if keyboard.pressed(KeyCode::ShiftLeft) || keyboard.pressed(KeyCode::ShiftRight) {
+            speed *= 3.0; // sprint
+        }
+        pos += dir.normalize() * speed * time.delta_secs();
+    }
+    *transform = Transform::from_translation(pos).looking_at(pos + forward, Vec3::Y);
+
+    // Keep the orbit camera's target tracking in front of us, so toggling back to orbit
+    // resumes smoothly around what we're looking at rather than snapping to the origin.
+    orbit.target = pos + forward * orbit.distance;
 }
 
 // --- Picking ---
@@ -662,6 +869,44 @@ fn line_color(index: i32, axis: Color, major: Color, minor: Color) -> Color {
     }
 }
 
+/// Draw each LOD clipmap ring's world-AABB as a wire box, colour-matched to the
+/// `SDF_DEBUG_LOD` shader ramp (green = fine/near, red = coarse/far). Makes the nested
+/// ring extents and their camera-centred recentering directly visible. Uses the same
+/// `ring_origin` math the bake froze, so the boxes track exactly what got baked.
+fn draw_lod_rings(
+    mut gizmos: Gizmos<SdfOverlayGizmos>,
+    config: Res<SdfGridConfig>,
+    camera: Query<&Transform, (With<SdfCamera>, Without<SdfVolume>)>,
+) {
+    let Some(cam) = camera.iter().next() else {
+        return;
+    };
+    let cam_pos = cam.translation;
+
+    for lod in 0..config.lod_count {
+        let origin = config.ring_origin(cam_pos, lod);
+        let min = config.brick_min_world(origin, lod);
+        // The ring spans `ring_bricks` bricks per axis at this LOD's voxel size.
+        let extent = Vec3::splat(config.brick_world_size(lod) * config.ring_bricks as f32);
+        let center = min + extent * 0.5;
+
+        // Discrete colours matching the SDF_DEBUG_LOD shader: 0 white, 1 green,
+        // 2 blue, 3 red, 4+ yellow.
+        let color = match lod {
+            0 => Color::srgb(1.0, 1.0, 1.0),
+            1 => Color::srgb(0.0, 1.0, 0.0),
+            2 => Color::srgb(0.0, 0.4, 1.0),
+            3 => Color::srgb(1.0, 0.0, 0.0),
+            _ => Color::srgb(1.0, 1.0, 0.0),
+        };
+        gizmos.primitive_3d(
+            &Cuboid::new(extent.x, extent.y, extent.z),
+            Isometry3d::from_translation(center),
+            color,
+        );
+    }
+}
+
 // --- Atlas Baking ---
 
 /// Last frame's per-edit world AABB, keyed by entity. Lets `bake_dirty_bricks`
@@ -673,6 +918,58 @@ struct PrevEditAabbs {
     map: std::collections::HashMap<Entity, bevy::math::bounding::Aabb3d>,
 }
 
+/// One in-flight async bake: a pool task baking the bricks of one or more chunks, tagged
+/// with the `edit_epoch` it was scheduled under (results baked against superseded edits
+/// are detected and requeued).
+struct BakeJob {
+    epoch: u64,
+    task: Task<Vec<(atlas::BrickKey, Option<atlas::PackedBrick>)>>,
+}
+
+/// Drives incremental, async clipmap baking in **chunk units**. The main thread only
+/// does cheap integer chunk-ring window diffs (enqueue entered chunks, evict exited
+/// chunks) and applies finished task results; the actual `bake_brick` work runs on
+/// `AsyncComputeTaskPool`, so camera motion never blocks.
+///
+/// Eager eviction is safe here because addressing is **absolute** (chunk keys, not a
+/// camera-relative ring origin — see `super::chunk`): a not-yet-baked chunk is simply
+/// absent from the GPU chunk table, and the nested coarser LOD shell already covers that
+/// region, so the leading edge shows coarser-correct terrain that refines in — never a
+/// hole, never a shift.
+#[derive(Resource)]
+struct BakeScheduler {
+    /// Bumped whenever the edit set changes (add/remove/move). Results carrying an
+    /// older epoch are stale and get requeued.
+    edit_epoch: u64,
+    /// Snapshot of the current edits + BVH handed to bake tasks (cheap Arc clone).
+    edits: Arc<Vec<edits::ResolvedEdit>>,
+    bvh: Arc<bvh::Bvh>,
+    /// Per-LOD chunk-ring origin currently resident (index = lod), in chunk coords. Used
+    /// to diff which chunks entered/exited as the camera moves. Empty until first run.
+    ring_chunk_origin: Vec<IVec3>,
+    /// Chunk keys awaiting a bake (deduped).
+    pending: std::collections::HashSet<chunk::ChunkKey>,
+    /// Tasks currently baking.
+    inflight: Vec<BakeJob>,
+}
+
+impl Default for BakeScheduler {
+    fn default() -> Self {
+        Self {
+            edit_epoch: 0,
+            edits: Arc::new(Vec::new()),
+            bvh: Arc::new(bvh::Bvh::default()),
+            ring_chunk_origin: Vec::new(),
+            pending: std::collections::HashSet::new(),
+            inflight: Vec::new(),
+        }
+    }
+}
+
+/// Max chunks baked per pool task. Each chunk is up to `CHUNK_VOLUME` (64) `bake_brick`
+/// calls, so keep the per-task chunk count small to stream results back promptly.
+const BAKE_CHUNKS_PER_TASK: usize = 2;
+
 /// Any component that affects an edit's baked result. A change to one of these
 /// triggers a targeted rebake of the bricks the edit touches.
 type ChangedEdit = Or<(
@@ -682,53 +979,284 @@ type ChangedEdit = Or<(
     Changed<SdfMaterial>,
 )>;
 
-fn bake_dirty_bricks(
+/// The chunk coord (per axis) of the chunk-ring window corner for `camera_pos` at `lod`:
+/// the camera's chunk minus half the ring (in chunks) on each axis, so the ring is
+/// centred on the camera. `ring_bricks / CHUNK_BRICKS` chunks per axis.
+fn ring_chunk_origin(config: &SdfGridConfig, camera_pos: Vec3, lod: u32) -> IVec3 {
+    let s = config.cell_stride();
+    let cam_brick = config.world_to_brick_lod(camera_pos, lod);
+    let cam_brick_idx = IVec3::new(
+        cam_brick.x.div_euclid(s),
+        cam_brick.y.div_euclid(s),
+        cam_brick.z.div_euclid(s),
+    );
+    let cam_chunk = IVec3::new(
+        cam_brick_idx.x.div_euclid(chunk::CHUNK_BRICKS),
+        cam_brick_idx.y.div_euclid(chunk::CHUNK_BRICKS),
+        cam_brick_idx.z.div_euclid(chunk::CHUNK_BRICKS),
+    );
+    let half = (config.ring_bricks / chunk::CHUNK_BRICKS as u32 / 2) as i32;
+    cam_chunk - IVec3::splat(half)
+}
+
+/// Chunks per axis in a ring window.
+fn ring_chunks_per_axis(config: &SdfGridConfig) -> i32 {
+    (config.ring_bricks / chunk::CHUNK_BRICKS as u32) as i32
+}
+
+/// Whether chunk coord `c` is inside the `R³` chunk window with corner `origin`.
+fn chunk_in_window(c: IVec3, origin: IVec3, r: i32) -> bool {
+    let rel = c - origin;
+    rel.x >= 0 && rel.y >= 0 && rel.z >= 0 && rel.x < r && rel.y < r && rel.z < r
+}
+
+/// Every chunk key in the `R³` window with corner `origin` at `lod`.
+fn chunk_window_keys(origin: IVec3, r: i32, lod: u32) -> impl Iterator<Item = chunk::ChunkKey> {
+    (0..r).flat_map(move |iz| {
+        (0..r).flat_map(move |iy| {
+            (0..r).map(move |ix| chunk::ChunkKey::new(lod, origin + IVec3::new(ix, iy, iz)))
+        })
+    })
+}
+
+/// All brick keys belonging to chunk `ck` (its `CHUNK_BRICKS³` local slots).
+fn chunk_brick_keys(ck: chunk::ChunkKey, config: &SdfGridConfig) -> Vec<atlas::BrickKey> {
+    let s = config.cell_stride();
+    let c = chunk::CHUNK_BRICKS;
+    let base = ck.coord * c; // brick-index space
+    let mut keys = Vec::with_capacity(chunk::CHUNK_VOLUME as usize);
+    for lz in 0..c {
+        for ly in 0..c {
+            for lx in 0..c {
+                let bi = base + IVec3::new(lx, ly, lz);
+                keys.push(atlas::BrickKey::new(ck.lod, bi * s)); // back to coord space
+            }
+        }
+    }
+    keys
+}
+
+/// The chunks at `lod` whose world extent overlaps `aabb` (grown by the bake footprint
+/// pad so a moved edit re-dirties every chunk that could fold it). Computed directly in
+/// chunk-coord space — no per-brick enumeration.
+fn chunks_in_aabb(
+    config: &SdfGridConfig,
+    aabb: &bevy::math::bounding::Aabb3d,
+    lod: u32,
+) -> Vec<chunk::ChunkKey> {
+    let chunk_world = chunk::chunk_world_size(lod, config);
+    let pad = Vec3::splat(atlas::SNORM_CLAMP_DIST + config.brick_world_size(lod));
+    let lo = (Vec3::from(aabb.min) - pad) / chunk_world;
+    let hi = (Vec3::from(aabb.max) + pad) / chunk_world;
+    let lo = IVec3::new(lo.x.floor() as i32, lo.y.floor() as i32, lo.z.floor() as i32);
+    let hi = IVec3::new(hi.x.ceil() as i32, hi.y.ceil() as i32, hi.z.ceil() as i32);
+
+    let mut out = Vec::new();
+    for z in lo.z..=hi.z {
+        for y in lo.y..=hi.y {
+            for x in lo.x..=hi.x {
+                out.push(chunk::ChunkKey::new(lod, IVec3::new(x, y, z)));
+            }
+        }
+    }
+    out
+}
+
+/// Main-thread scheduling only — no baking. Diffs the per-LOD chunk-ring window as the
+/// camera moves (enqueue entered chunks, evict exited chunks), dirties edited regions,
+/// and spawns async bake tasks. All integer window math + Arc clones — microseconds.
+#[expect(clippy::too_many_arguments)]
+fn schedule_bakes(
     mut atlas: ResMut<atlas::SdfAtlas>,
     mut bvh: ResMut<bvh::Bvh>,
+    mut sched: ResMut<BakeScheduler>,
     mut prev_aabbs: ResMut<PrevEditAabbs>,
     config: Res<SdfGridConfig>,
     volumes: Query<VolumeQueryData, With<SdfVolume>>,
     changed: Query<Entity, (With<SdfVolume>, ChangedEdit)>,
+    camera: Query<&Transform, (With<SdfCamera>, Without<SdfVolume>)>,
 ) {
+    let camera_pos = camera.iter().next().map(|t| t.translation).unwrap_or(Vec3::ZERO);
+    let lod_count = config.lod_count;
+    let r = ring_chunks_per_axis(&config);
+    let first_run = sched.ring_chunk_origin.is_empty();
+    if first_run {
+        sched.ring_chunk_origin = vec![IVec3::splat(i32::MIN); lod_count as usize];
+    }
+
+    // --- 1. Edit changes → dirty affected chunks (within current windows) ------------
     let gathered = gather_sorted_edits(&volumes);
-    let resolved: Vec<edits::ResolvedEdit> = gathered.iter().map(|g| g.edit.clone()).collect();
-    let aabbs: Vec<bevy::math::bounding::Aabb3d> = gathered.iter().map(|g| g.aabb).collect();
     let current: std::collections::HashMap<Entity, bevy::math::bounding::Aabb3d> =
         gathered.iter().map(|g| (g.entity, g.aabb)).collect();
-
-    // An edit added or removed changes the whole BVH → full rebuild. (Equal count
-    // with a swapped entity is caught by the membership check.)
     let set_changed = current.len() != prev_aabbs.map.len()
         || current.keys().any(|e| !prev_aabbs.map.contains_key(e));
+    let edits_changed = atlas.rebake_all || set_changed || !changed.is_empty();
 
-    if atlas.rebake_all || set_changed {
-        *bvh = bvh::Bvh::build(&aabbs);
-        atlas.full_bake(&resolved, &aabbs, &bvh, &config);
+    if edits_changed {
+        let resolved: Vec<edits::ResolvedEdit> = gathered.iter().map(|g| g.edit.clone()).collect();
+        let aabbs: Vec<bevy::math::bounding::Aabb3d> = gathered.iter().map(|g| g.aabb).collect();
+        let new_bvh = bvh::Bvh::build(&aabbs);
+        *bvh = new_bvh.clone();
+        sched.bvh = Arc::new(new_bvh);
+        sched.edits = Arc::new(resolved);
+        sched.edit_epoch = sched.edit_epoch.wrapping_add(1);
+
+        if atlas.rebake_all || set_changed {
+            // Whole set changed → re-dirty every resident-window chunk at each LOD.
+            for lod in 0..lod_count {
+                let origin = ring_chunk_origin(&config, camera_pos, lod);
+                for ck in chunk_window_keys(origin, r, lod) {
+                    sched.pending.insert(ck);
+                }
+            }
+            atlas.rebake_all = false;
+        } else {
+            // Existing edits moved → dirty the chunks over each changed edit's old∪new
+            // footprint, clamped to the resident window for that LOD.
+            for entity in &changed {
+                for lod in 0..lod_count {
+                    let origin = ring_chunk_origin(&config, camera_pos, lod);
+                    let mut dirty_one = |aabb: &bevy::math::bounding::Aabb3d| {
+                        for ck in chunks_in_aabb(&config, aabb, lod) {
+                            if chunk_in_window(ck.coord, origin, r) {
+                                sched.pending.insert(ck);
+                            }
+                        }
+                    };
+                    if let Some(old) = prev_aabbs.map.get(&entity) {
+                        dirty_one(old);
+                    }
+                    if let Some(new) = current.get(&entity) {
+                        dirty_one(new);
+                    }
+                }
+            }
+        }
         prev_aabbs.map = current;
+    }
+
+    // --- 2. Camera chunk-ring recenter (eager enter/evict, absolute addressing) ------
+    for lod in 0..lod_count {
+        let li = lod as usize;
+        let new_origin = ring_chunk_origin(&config, camera_pos, lod);
+        let old_origin = sched.ring_chunk_origin[li];
+        if new_origin == old_origin {
+            continue;
+        }
+        // Entered chunks → enqueue a bake.
+        for ck in chunk_window_keys(new_origin, r, lod) {
+            if first_run || !chunk_in_window(ck.coord, old_origin, r) {
+                sched.pending.insert(ck);
+            }
+        }
+        // Exited chunks → drop all their bricks (and cancel any pending bake).
+        if !first_run {
+            for ck in chunk_window_keys(old_origin, r, lod) {
+                if !chunk_in_window(ck.coord, new_origin, r) {
+                    sched.pending.remove(&ck);
+                    for bk in chunk_brick_keys(ck, &config) {
+                        atlas.remove_brick(&bk);
+                    }
+                }
+            }
+        }
+        sched.ring_chunk_origin[li] = new_origin;
+    }
+
+    // --- 3. Spawn async bake tasks (chunk-batched) -----------------------------------
+    if sched.pending.is_empty() {
         return;
     }
+    let pool = AsyncComputeTaskPool::get();
+    let epoch = sched.edit_epoch;
+    let drained: Vec<chunk::ChunkKey> = sched.pending.drain().collect();
+    for group in drained.chunks(BAKE_CHUNKS_PER_TASK) {
+        // Expand the group's chunks into their brick keys for the task.
+        let mut keys: Vec<atlas::BrickKey> = Vec::new();
+        for ck in group {
+            keys.extend(chunk_brick_keys(*ck, &config));
+        }
+        let edits = Arc::clone(&sched.edits);
+        let bvh_snapshot = Arc::clone(&sched.bvh);
+        let cfg = config.clone();
+        let task = pool.spawn(async move {
+            keys.into_iter()
+                .map(|key| {
+                    let baked = atlas::SdfAtlas::bake_brick(key, &edits, &bvh_snapshot, &cfg);
+                    (key, baked)
+                })
+                .collect::<Vec<_>>()
+        });
+        sched.inflight.push(BakeJob { epoch, task });
+    }
+}
 
-    // Existing edits only: union each changed edit's old+new footprint into the
-    // dirty set. Nothing changed → idle, no bake, no BVH rebuild.
-    if changed.is_empty() {
+/// Main-thread, non-blocking drain of finished bake tasks. Inserts baked bricks (per-brick
+/// tiles as before) and bumps the generation so the incremental GPU upload picks up the
+/// changed tiles. Stale results (superseded edit epoch) are requeued by chunk.
+fn apply_bakes(
+    mut atlas: ResMut<atlas::SdfAtlas>,
+    mut sched: ResMut<BakeScheduler>,
+    config: Res<SdfGridConfig>,
+) {
+    if sched.inflight.is_empty() {
         return;
     }
+    let current_epoch = sched.edit_epoch;
+    let lod_count = config.lod_count;
+    let r = ring_chunks_per_axis(&config);
+    let mut applied = false;
+    let mut requeue: Vec<chunk::ChunkKey> = Vec::new();
 
-    let mut dirty = std::mem::take(&mut atlas.dirty_bricks);
-    for entity in &changed {
-        if let Some(old) = prev_aabbs.map.get(&entity) {
-            dirty.extend(atlas::bricks_in_aabb(&config, old));
+    let mut i = 0;
+    while i < sched.inflight.len() {
+        let Some(results) = block_on(poll_once(&mut sched.inflight[i].task)) else {
+            i += 1;
+            continue;
+        };
+        let job_epoch = sched.inflight[i].epoch;
+        sched.inflight.swap_remove(i);
+
+        if job_epoch != current_epoch {
+            // Stale → requeue the affected chunks (deduped) under the current edits.
+            for (key, _) in &results {
+                requeue.push(chunk::chunk_of(*key, &config).0);
+            }
+            continue;
         }
-        if let Some(new) = current.get(&entity) {
-            dirty.extend(atlas::bricks_in_aabb(&config, new));
+
+        for (key, baked) in results {
+            // Skip a brick whose chunk left its LOD window while baking.
+            let ck = chunk::chunk_of(key, &config).0;
+            let li = ck.lod as usize;
+            if li < lod_count as usize {
+                let origin = sched.ring_chunk_origin[li];
+                if !chunk_in_window(ck.coord, origin, r) {
+                    atlas.remove_brick(&key);
+                    continue;
+                }
+            }
+            match baked {
+                Some(brick) => {
+                    atlas.insert_brick(key, brick);
+                    applied = true;
+                }
+                None => {
+                    if atlas.remove_brick(&key) {
+                        applied = true;
+                    }
+                }
+            }
         }
     }
 
-    // An edit moved → its BVH leaf AABB moved; rebuild so the incremental bake culls
-    // against current positions.
-    *bvh = bvh::Bvh::build(&aabbs);
-    atlas.bake_incremental(&dirty, &resolved, &bvh, &config);
-    prev_aabbs.map = current;
+    for ck in requeue {
+        sched.pending.insert(ck);
+    }
+    if applied {
+        atlas.last_bake_was_full = false;
+        atlas.bump_generation();
+    }
 }
 
 // --- Upload to GPU (placeholder — render.rs handles actual upload) ---
@@ -737,9 +1265,17 @@ fn upload_sdf_buffers(_atlas: Res<atlas::SdfAtlas>) {
     // Render world will pick up atlas changes via extract
 }
 
-fn toggle_sdf_render(keyboard: Res<ButtonInput<KeyCode>>, mut enabled: ResMut<SdfRenderEnabled>) {
+fn toggle_sdf_render(
+    keyboard: Res<ButtonInput<KeyCode>>,
+    mut enabled: ResMut<SdfRenderEnabled>,
+    mut lod_rings: ResMut<LodRingsVisible>,
+) {
     if keyboard.just_pressed(KeyCode::F1) {
         enabled.0 = !enabled.0;
         info!("SDF render pass: {}", if enabled.0 { "ON" } else { "OFF" });
+    }
+    if keyboard.just_pressed(KeyCode::F8) {
+        lod_rings.0 = !lod_rings.0;
+        info!("LOD ring overlay: {}", if lod_rings.0 { "ON" } else { "OFF" });
     }
 }

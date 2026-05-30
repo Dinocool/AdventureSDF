@@ -24,13 +24,24 @@ use super::{SdfCamera, SdfGridConfig, SdfRenderEnabled};
 
 // --- GPU Types ---
 
-/// One entry in the brick lookup buffer (16 bytes, std430): maps a brick id to its
-/// tile origin in the 2D-tiled atlas (`atlas_base = col_px | row_px<<16`) and the
-/// brick's 4-entry material palette packed into two u32s (`pal01 = id0 | id1<<16`,
-/// `pal23 = id2 | id3<<16`). The shader unpacks both.
+/// One entry in the chunk lookup buffer (20 bytes, std430), sorted by `(key_hi,key_lo)`
+/// and binary-searched by the shader. `key_*` = the absolute chunk key (see
+/// `super::chunk`), independent of camera so CPU and GPU agree. `occ_*` = 64-bit
+/// occupancy mask (bit i ⇒ local brick i resident); `tile_run_base` indexes the packed
+/// `chunk_tile_table` where this chunk's `popcount(occ)` brick `atlas_base`s live.
 #[derive(ShaderType, Clone, Copy, Default)]
-struct GpuBrickLookup {
-    brick_id: u32,
+struct GpuChunkLookup {
+    key_hi: u32,
+    key_lo: u32,
+    occ_lo: u32,
+    occ_hi: u32,
+    tile_run_base: u32,
+}
+
+/// One resident brick's record in the packed chunk tile-run buffer (12 bytes): atlas
+/// tile origin (`col_px | row_px<<16`) + packed 4-entry material palette.
+#[derive(ShaderType, Clone, Copy, Default)]
+struct GpuBrickTile {
     atlas_base: u32,
     pal01: u32,
     pal23: u32,
@@ -65,6 +76,8 @@ struct SdfCameraData {
     grid_dims: Vec4, // x = grid_size, y = bricks_per_axis, z = brick_size (8.0), w = num_lookups
     debug_params: Vec4, // x = max_steps, y = max_dist, z = sdf_eps, w = bvh_node_count
     bake_reach: Vec4, // x = world-units a baked brick reaches beyond a tight edit AABB
+    /// x = lod_count, y = ring_bricks, z = base voxel_size, w = cell_stride.
+    lod_params: Vec4,
 }
 
 /// GPU mirror of a [`super::edits::MaterialDef`], one per global material id, in a
@@ -106,9 +119,10 @@ struct ExtractedSdfAtlas {
     /// Per-tile deltas for an in-place partial upload (only the bricks that changed
     /// this bake). Empty on a realloc.
     changed_tiles: Vec<TileTexels>,
-    /// Full lookup buffer (small: 16 B × brick count). Always rebuilt — tile origins
-    /// are stable so this stays cheap and the shader's binary search is unaffected.
-    lookup_data: Vec<GpuBrickLookup>,
+    /// Sorted chunk lookup table + packed per-chunk tile runs (see `super::chunk`).
+    /// Rebuilt each upload from the resident bricks; small and cheap.
+    chunk_data: Vec<GpuChunkLookup>,
+    tile_run_data: Vec<GpuBrickTile>,
     texture_width: u32,
     texture_height: u32,
     /// Recreate the textures + views (full rebuild or capacity grow). When false,
@@ -157,7 +171,9 @@ struct SdfGpuAtlas {
     mat_tex: Option<Texture>,
     mat_view: Option<TextureView>,
     sampler: Option<Sampler>,
+    /// Chunk lookup table (binding 2) + packed per-chunk tile runs (binding 12).
     lookup_buffer: Option<Buffer>,
+    chunk_tile_buffer: Option<Buffer>,
     bvh_buffer: Option<Buffer>,
     bvh_node_count: u32,
     /// Material table (storage buffer of `GpuSdfMaterial`, indexed by material id).
@@ -353,6 +369,11 @@ impl ViewNode for SdfNode {
                 &tex_views[2],
                 &tex_views[3],
                 &tex_views[4],
+                gpu_atlas
+                    .chunk_tile_buffer
+                    .as_ref()
+                    .unwrap()
+                    .as_entire_buffer_binding(),
             )),
         );
 
@@ -435,13 +456,13 @@ impl Plugin for SdfRenderPlugin {
                 prepare_sdf_camera_data
                     .run_if(in_state(crate::scene_manager::AppScene::SdfEditor))
                     .after(super::orbit_camera)
-                    // MUST run after the bake: the shader's binary-search bound
+                    // MUST run after the bake apply: the shader's binary-search bound
                     // (`grid_dims.w = atlas.bricks.len()`) has to match the lookup
                     // buffer `extract_sdf_atlas` builds from the *same* post-bake
                     // brick set. Reading the count before the bake desyncs them while
                     // dragging (count too high → past-end reads = phantom geometry;
                     // too low → missed bricks = gaps).
-                    .after(super::bake_dirty_bricks),
+                    .after(super::apply_bakes),
             );
 
         #[cfg(feature = "editor")]
@@ -536,7 +557,9 @@ fn prepare_sdf_camera_data(
         }
     }
 
-    let num_lookups = atlas.bricks.len() as u32;
+    // grid_dims.w = the shader's chunk-table binary-search bound = distinct resident
+    // chunks (NOT brick count). Must match `chunk_data.len()` extract uploads.
+    let num_chunks = super::chunk::resident_chunks(&atlas, &config).len() as u32;
     let bpa = config.bricks_per_axis();
     let grid_size = config.grid_size;
 
@@ -564,7 +587,7 @@ fn prepare_sdf_camera_data(
                 grid_size as f32,
                 bpa as f32,
                 config.brick_size as f32,
-                num_lookups as f32,
+                num_chunks as f32,
             ),
             debug_params: Vec4::new(
                 raymarch.max_steps as f32,
@@ -580,6 +603,12 @@ fn prepare_sdf_camera_data(
                 0.0,
                 0.0,
                 0.0,
+            ),
+            lod_params: Vec4::new(
+                config.lod_count as f32,
+                config.ring_bricks as f32,
+                config.voxel_size,
+                config.cell_stride() as f32,
             ),
         });
     }
@@ -743,24 +772,42 @@ fn extract_sdf_atlas(
     let required_rows = atlas.tiles.high_water().div_ceil(ATLAS_TILES_PER_ROW).max(1);
     let texture_height = required_rows * edge;
 
-    // Always rebuild the (small) lookup buffer; tile origins are stable so this is
-    // cheap and keeps the shader's brick_id binary search correct.
-    let mut lookups = Vec::with_capacity(num_bricks as usize);
-    for (coord, packed) in atlas.bricks.iter() {
+    // Build the sorted chunk lookup table + packed per-chunk brick runs from the
+    // resident bricks. Absolute chunk keys (no ring origin) → CPU/GPU agree by
+    // construction. `chunk::build_chunk_tables` owns the grouping + sort.
+    let tables = super::chunk::build_chunk_tables(&atlas, &config, |key| {
         let tile = atlas
             .tiles
-            .tile(coord)
+            .tile(key)
             .expect("baked brick must have an allocated tile");
         let (col_px, row_px) = tile_origin(tile);
-        let p = packed.palette;
-        lookups.push(GpuBrickLookup {
-            brick_id: config.brick_id(*coord),
+        let p = atlas.bricks[key].palette;
+        super::chunk::BrickTile {
             atlas_base: col_px | (row_px << 16),
             pal01: p[0] as u32 | ((p[1] as u32) << 16),
             pal23: p[2] as u32 | ((p[3] as u32) << 16),
-        });
-    }
-    lookups.sort_by_key(|l| l.brick_id); // shader binary-searches by brick_id
+        }
+    });
+    let chunk_data: Vec<GpuChunkLookup> = tables
+        .chunks
+        .iter()
+        .map(|c| GpuChunkLookup {
+            key_hi: c.key_hi,
+            key_lo: c.key_lo,
+            occ_lo: c.occ_lo,
+            occ_hi: c.occ_hi,
+            tile_run_base: c.tile_run_base,
+        })
+        .collect();
+    let tile_run_data: Vec<GpuBrickTile> = tables
+        .tile_run
+        .iter()
+        .map(|b| GpuBrickTile {
+            atlas_base: b.atlas_base,
+            pal01: b.pal01,
+            pal23: b.pal23,
+        })
+        .collect();
 
     // Realloc when a full bake happened or the atlas must grow taller. The texture
     // never shrinks except on a full bake, so a tile origin stays valid until then.
@@ -771,8 +818,8 @@ fn extract_sdf_atlas(
         let pixels = (texture_width * texture_height) as usize;
         let mut dist_data = vec![0i16; pixels];
         let mut mat_data = vec![i16::MAX; pixels * 4]; // far sentinel loses the argmin
-        for (coord, packed) in atlas.bricks.iter() {
-            let tile = atlas.tiles.tile(coord).unwrap();
+        for (key, packed) in atlas.bricks.iter() {
+            let tile = atlas.tiles.tile(key).unwrap();
             let (col_px, row_px) = tile_origin(tile);
             let (dist, mat) = pack_tile_texels(packed);
             // Blit the tile-local buffers into the full texture at (col_px,row_px).
@@ -789,7 +836,8 @@ fn extract_sdf_atlas(
             dist_data,
             mat_data,
             changed_tiles: Vec::new(),
-            lookup_data: lookups,
+            chunk_data,
+            tile_run_data,
             texture_width,
             texture_height,
             realloc: true,
@@ -802,8 +850,8 @@ fn extract_sdf_atlas(
     let mut changed_tiles = Vec::with_capacity(atlas.changed_tiles.len());
     // Map tile → coord once so we can pull the baked brick. (changed_tiles holds tile
     // indices; bricks are keyed by coord.)
-    for (coord, packed) in atlas.bricks.iter() {
-        let tile = atlas.tiles.tile(coord).unwrap();
+    for (key, packed) in atlas.bricks.iter() {
+        let tile = atlas.tiles.tile(key).unwrap();
         if !atlas.changed_tiles.contains(&tile) {
             continue;
         }
@@ -820,7 +868,8 @@ fn extract_sdf_atlas(
         dist_data: Vec::new(),
         mat_data: Vec::new(),
         changed_tiles,
-        lookup_data: lookups,
+        chunk_data,
+        tile_run_data,
         texture_width,
         texture_height,
         realloc: false,
@@ -1111,23 +1160,39 @@ fn prepare_sdf_atlas_gpu(
         return;
     }
 
-    let num_lookups = extracted.lookup_data.len() as u32;
-    if num_lookups == 0 {
+    if extracted.chunk_data.is_empty() {
+        // No resident chunks (atlas empty / fully evicted). Leave last frame's buffers;
+        // the camera uniform's chunk count (grid_dims.w) is 0 so the shader searches
+        // nothing and renders background. Avoids a zero-sized storage buffer.
         return;
     }
 
-    // Lookup buffer (std430: 4 x u32 per entry). Always rebuilt — it's small and tile
-    // origins are stable, so the shader's brick_id binary search stays valid.
-    let mut buffer_bytes = Vec::with_capacity(extracted.lookup_data.len() * 16);
-    for l in &extracted.lookup_data {
-        buffer_bytes.extend_from_slice(&l.brick_id.to_le_bytes());
-        buffer_bytes.extend_from_slice(&l.atlas_base.to_le_bytes());
-        buffer_bytes.extend_from_slice(&l.pal01.to_le_bytes());
-        buffer_bytes.extend_from_slice(&l.pal23.to_le_bytes());
+    // Chunk lookup table (std430: 5 × u32 per entry), sorted by absolute key — the
+    // shader binary-searches it. Small; rebuilt each upload.
+    let mut chunk_bytes = Vec::with_capacity(extracted.chunk_data.len() * 20);
+    for c in &extracted.chunk_data {
+        chunk_bytes.extend_from_slice(&c.key_hi.to_le_bytes());
+        chunk_bytes.extend_from_slice(&c.key_lo.to_le_bytes());
+        chunk_bytes.extend_from_slice(&c.occ_lo.to_le_bytes());
+        chunk_bytes.extend_from_slice(&c.occ_hi.to_le_bytes());
+        chunk_bytes.extend_from_slice(&c.tile_run_base.to_le_bytes());
     }
     gpu_atlas.lookup_buffer = Some(device.create_buffer_with_data(&BufferInitDescriptor {
-        label: Some("sdf_lookup_buffer"),
-        contents: &buffer_bytes,
+        label: Some("sdf_chunk_lookup_buffer"),
+        contents: &chunk_bytes,
+        usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
+    }));
+
+    // Packed per-chunk brick tile-run buffer (std430: 3 × u32 per resident brick).
+    let mut tile_bytes = Vec::with_capacity(extracted.tile_run_data.len() * 12);
+    for b in &extracted.tile_run_data {
+        tile_bytes.extend_from_slice(&b.atlas_base.to_le_bytes());
+        tile_bytes.extend_from_slice(&b.pal01.to_le_bytes());
+        tile_bytes.extend_from_slice(&b.pal23.to_le_bytes());
+    }
+    gpu_atlas.chunk_tile_buffer = Some(device.create_buffer_with_data(&BufferInitDescriptor {
+        label: Some("sdf_chunk_tile_buffer"),
+        contents: &tile_bytes,
         usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
     }));
 
@@ -1286,8 +1351,8 @@ fn init_sdf_pipeline(
                 texture_2d(TextureSampleType::Float { filterable: true }),
                 // binding 1: nearest sampler
                 sampler(SamplerBindingType::Filtering),
-                // binding 2: brick lookup buffer
-                storage_buffer_read_only::<GpuBrickLookup>(false),
+                // binding 2: chunk lookup table (sorted, binary-searched)
+                storage_buffer_read_only::<GpuChunkLookup>(false),
                 // binding 3: per-palette-slot distance atlas (Rgba16Snorm, 4 slots)
                 texture_2d(TextureSampleType::Float { filterable: false }),
                 // binding 4: BVH nodes (empty-space-skip acceleration)
@@ -1302,6 +1367,8 @@ fn init_sdf_pipeline(
                 texture_2d_array(TextureSampleType::Float { filterable: true }),
                 texture_2d_array(TextureSampleType::Float { filterable: true }),
                 texture_2d_array(TextureSampleType::Float { filterable: true }),
+                // binding 12: packed per-chunk brick tile runs
+                storage_buffer_read_only::<GpuBrickTile>(false),
             ),
         ),
     );
@@ -1360,9 +1427,16 @@ fn init_sdf_pipeline(
         mipmap_filter: FilterMode::Nearest,
         ..default()
     });
+    // One zeroed 20-byte chunk lookup entry so binding 2 is valid pre-bake.
     let dummy_lookup = device.create_buffer_with_data(&BufferInitDescriptor {
-        label: Some("sdf_dummy_lookup"),
-        contents: &[0u8; 16],
+        label: Some("sdf_dummy_chunk_lookup"),
+        contents: &[0u8; 20],
+        usage: BufferUsages::STORAGE,
+    });
+    // One zeroed 12-byte brick-tile entry so binding 12 is valid pre-bake.
+    let dummy_chunk_tile = device.create_buffer_with_data(&BufferInitDescriptor {
+        label: Some("sdf_dummy_chunk_tile"),
+        contents: &[0u8; 12],
         usage: BufferUsages::STORAGE,
     });
     // One zeroed 32-byte BVH node so binding 5 is always valid pre-bake.
@@ -1453,6 +1527,7 @@ fn init_sdf_pipeline(
         mat_view: Some(dummy_mat_tex.create_view(&TextureViewDescriptor::default())),
         sampler: Some(dummy_sampler),
         lookup_buffer: Some(dummy_lookup),
+        chunk_tile_buffer: Some(dummy_chunk_tile),
         bvh_buffer: Some(dummy_bvh),
         bvh_node_count: 0,
         material_buffer: Some(dummy_material),

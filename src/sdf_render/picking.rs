@@ -120,8 +120,11 @@ pub fn debug_capture_march(
         let pos = ray.origin + ray.direction * t;
         let closest_dist = fold_csg(edits, pos).dist;
 
-        let brick = config.world_to_brick(pos);
-        let in_brick = atlas.bricks.contains_key(&brick);
+        // Informational only (debug ray inspector): does a level-0 brick exist here?
+        let brick = config.world_to_brick_lod(pos, 0);
+        let in_brick = atlas
+            .bricks
+            .contains_key(&crate::sdf_render::atlas::BrickKey::new(0, brick));
         steps.push(RayStep {
             t,
             pos,
