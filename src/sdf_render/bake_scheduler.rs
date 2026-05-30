@@ -22,6 +22,19 @@ use super::{
     edits, gather_sorted_edits,
 };
 
+/// One-frame request to bake this frame's dirty chunks **synchronously** (on the main
+/// thread, same frame) instead of deferring them to the async task pool.
+///
+/// Reusable seam for "I need this edit visible *now*": set `.0 = true` from any system
+/// that mutates an [`SdfVolume`] and wants the result on screen immediately — a live
+/// gizmo drag, an inspector slider, a programmatic edit. Without it the async path
+/// applies a frame or two later, and during a *continuous* edit (e.g. a drag) every
+/// frame bumps `edit_epoch`, so the in-flight async results are discarded as stale and
+/// nothing lands until the edit stops. `schedule_bakes` consumes (clears) the flag each
+/// frame after honoring it.
+#[derive(Resource, Default)]
+pub struct SyncBakeRequest(pub bool);
+
 /// Last frame's per-edit world AABB, keyed by entity. Lets the scheduler dirty an edit's
 /// *former* footprint (not just where it moved to) so vacated chunks get rebuilt/removed.
 /// Also serves as the previous entity set for add/remove detection.
@@ -113,7 +126,11 @@ type ChangedEdit = ChangedEditFilter;
 /// The chunk coord (per axis) of the chunk-ring window corner for `camera_pos` at `lod`:
 /// the camera's chunk minus half the ring (in chunks) on each axis, so the ring is
 /// centred on the camera. `ring_bricks / CHUNK_BRICKS` chunks per axis.
-fn ring_chunk_origin(config: &SdfGridConfig, camera_pos: Vec3, lod: u32) -> IVec3 {
+///
+/// `pub` so the GPU rig (`tests/sdf_gpu_rig.rs`) can assert the shader's `in_ring_chunk`
+/// agrees with THIS source-of-truth window — they're hand-duplicated across Rust/WGSL, and
+/// a silent divergence would make the chunk-DDA skip step past real geometry.
+pub fn ring_chunk_origin(config: &SdfGridConfig, camera_pos: Vec3, lod: u32) -> IVec3 {
     let s = config.cell_stride();
     let cam_brick = config.world_to_brick_lod(camera_pos, lod);
     let cam_brick_idx = IVec3::new(
@@ -263,11 +280,14 @@ pub fn schedule_bakes(
     mut bvh: ResMut<bvh::Bvh>,
     mut sched: ResMut<BakeScheduler>,
     mut prev_aabbs: ResMut<PrevEditAabbs>,
+    mut sync_request: ResMut<SyncBakeRequest>,
     config: Res<SdfGridConfig>,
     volumes: Query<VolumeQueryData, With<SdfVolume>>,
     changed: Query<Entity, (With<SdfVolume>, ChangedEdit)>,
     camera: Query<&Transform, (With<SdfCamera>, Without<SdfVolume>)>,
 ) {
+    // Consume the one-frame "bake now, synchronously" request (see SyncBakeRequest).
+    let bake_sync = std::mem::take(&mut sync_request.0);
     let camera_pos = camera.iter().next().map(|t| t.translation).unwrap_or(Vec3::ZERO);
     let lod_count = config.lod_count;
     let r = ring_chunks_per_axis(&config);
@@ -363,16 +383,40 @@ pub fn schedule_bakes(
         sched.ring_chunk_origin[li] = new_origin;
     }
 
-    // --- 3. Spawn async bake tasks (chunk-batched, budgeted, nearest-first) ----------
+    // --- 3. Bake the dirty chunks (sync inline, or async tasks) -----------------------
     if sched.pending.is_empty() {
         return;
     }
-    let pool = AsyncComputeTaskPool::get();
-    let epoch = sched.edit_epoch;
 
     // Take only this frame's budget, nearest-camera-first, so the visible shell fills
     // before far chunks. Leftover pending chunks persist (dedup set) for next frame.
     let drained = drain_budget(&mut sched.pending, camera_pos, &config, SCHEDULE_BUDGET_CHUNKS);
+
+    // Sync path: bake on the main thread and apply this frame, so a live edit (gizmo
+    // drag, slider) is visible immediately. Skips the task pool entirely, so there's no
+    // epoch race to lose — what we drain, we apply now. Same per-frame budget bounds cost.
+    if bake_sync {
+        let mut applied = false;
+        for ck in &drained {
+            for key in chunk_brick_keys(*ck, &config) {
+                match SdfAtlas::bake_brick(key, &sched.edits, &sched.bvh, &config) {
+                    Some(brick) => {
+                        atlas.insert_brick(key, brick);
+                        applied = true;
+                    }
+                    None => applied |= atlas.remove_brick(&key),
+                }
+            }
+        }
+        if applied {
+            atlas.last_bake_was_full = false;
+            atlas.bump_generation();
+        }
+        return;
+    }
+
+    let pool = AsyncComputeTaskPool::get();
+    let epoch = sched.edit_epoch;
 
     for group in drained.chunks(BAKE_CHUNKS_PER_TASK) {
         // Expand the group's chunks into their brick keys for the task.

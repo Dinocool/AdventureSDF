@@ -84,6 +84,11 @@ struct BrickTile {
 const PALETTE_EMPTY: u32 = 0xffffu;
 const TEXTURE_WORLD_SCALE: f32 = 0.5;  // world units per texture tile = 2.0
 const PI: f32 = 3.14159265359;
+// Per-LOD distance-field clamp band in VOXELS. The geometry distance atlas stores
+// `d / (DIST_BAND_VOXELS · voxel_size_at(lod))` as snorm; `sample_brick_sdf` multiplies back.
+// MUST match atlas::DIST_BAND_VOXELS on the CPU. Coarse LODs get a large world band → big
+// sphere-trace steps far from the surface (the per-LOD voxel-unit clamp).
+const DIST_BAND_VOXELS: f32 = 4.0;
 
 // --- Uniform accessors ---
 
@@ -122,6 +127,9 @@ fn surface_bias() -> f32 { return camera.screen_params.z; }
 const CHUNK_BRICKS: i32 = 4;
 
 fn lod_count() -> u32 { return u32(camera.lod_params.x); }
+// Ring window size in BRICKS per axis (mirrors SdfGridConfig::ring_bricks). The chunk-DDA
+// empty-space skip uses ring_bricks/CHUNK_BRICKS chunks per axis.
+fn ring_bricks() -> i32 { return i32(camera.lod_params.y); }
 // Brick spatial stride in voxels (cell_stride; same at every LOD — only the world
 // size of a voxel changes). Mirrors SdfGridConfig::cell_stride.
 fn cell_stride() -> i32 { return i32(camera.lod_params.w); }
@@ -158,8 +166,6 @@ fn ring_center_lod(cam: vec3<f32>, lod: u32) -> vec3<f32> {
     return vec3<f32>(snapped) * chunk_world;
 }
 
-// Floored division of `a` by `b` (b > 0), rounding toward negative infinity.
-//
 // Floored division of `a` by `b` (b > 0), rounding toward negative infinity.
 //
 // Avoids BOTH broken ops observed on this hardware (verified in tests/sdf_gpu_rig.rs):

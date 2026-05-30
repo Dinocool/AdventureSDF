@@ -176,12 +176,37 @@ impl Default for SdfAtlas {
 /// outside a 1-brick pad, never got re-dirtied when the edit left.)
 pub const SNORM_CLAMP_DIST: f32 = 1.0;
 
+/// Distance-band clamp in VOXELS for the per-LOD distance field. A LOD-`L` brick stores its
+/// signed distance clamped to `±DIST_BAND_VOXELS · voxel_size_at(L)`, so a COARSE brick (big
+/// voxels) encodes a LARGE world distance and the sphere-trace takes big steps far from the
+/// surface — instead of the old fixed ±1.0-world plateau that capped every LOD's step at ~1u
+/// (the 100+-step sky cost). The shader decodes by multiplying the snorm sample by the same
+/// `band · voxel_size_at(L)` (see `sample_brick_sdf`). A K-sweep (tests/sdf_march_sim.rs)
+/// showed step count plateaus at K=4 — larger buys nothing and costs snorm precision.
+pub const DIST_BAND_VOXELS: f32 = 4.0;
+
+/// World-units distance band a LOD-`lod` brick's distance field clamps to.
+pub fn dist_band_world(config: &super::SdfGridConfig, lod: u32) -> f32 {
+    DIST_BAND_VOXELS * config.voxel_size_at(lod)
+}
+
 impl SdfAtlas {
-    /// Convert a signed distance to 16-bit signed normalized.
-    /// Range: [-1.0, 1.0] maps to [-32767, 32767].
+    /// Convert a material-slot signed distance to 16-bit snorm over the fixed ±1.0-world
+    /// band. Material distances only matter at the surface (the argmin picks the nearest
+    /// material there), so they keep the tight fixed band — only the geometry `dist` field
+    /// uses the per-LOD voxel-unit band (`dist_to_snorm_band`).
     fn dist_to_snorm(d: f32) -> i16 {
         let clamped = d.clamp(-SNORM_CLAMP_DIST, SNORM_CLAMP_DIST);
         (clamped * 32767.0) as i16
+    }
+
+    /// Convert a geometry signed distance to snorm over a per-LOD `band` (world units): the
+    /// stored value is `d/band` clamped to [-1,1]. The shader multiplies back by `band`
+    /// (= `dist_band_world(lod)`) to recover world distance. Coarse LODs use a large band so
+    /// far-from-surface samples report a large (still conservative) distance.
+    fn dist_to_snorm_band(d: f32, band: f32) -> i16 {
+        let ratio = (d / band).clamp(-1.0, 1.0);
+        (ratio * 32767.0) as i16
     }
 
     /// Linear voxel index within a brick from local (x, y, z) corner coords.
@@ -225,6 +250,8 @@ impl SdfAtlas {
         let mut dist: SdfBrick = [0; BRICK_VOXELS];
         let mut mat_dist: MaterialBrick = [0; BRICK_VOXELS * PALETTE_K];
         let voxel_size = config.voxel_size_at(key.lod);
+        // Per-LOD voxel-unit clamp band for the geometry distance field (see DIST_BAND_VOXELS).
+        let dist_band = dist_band_world(config, key.lod);
 
         // All voxel world positions, reused for the palette build and the bake.
         let mut positions = [Vec3::ZERO; BRICK_VOXELS];
@@ -242,7 +269,7 @@ impl SdfAtlas {
         let palette = build_palette(edits, &positions);
 
         for (idx, &world_pos) in positions.iter().enumerate() {
-            dist[idx] = Self::dist_to_snorm(fold_csg(edits, world_pos).dist);
+            dist[idx] = Self::dist_to_snorm_band(fold_csg(edits, world_pos).dist, dist_band);
 
             let slots = material_distances(edits, &palette, world_pos);
             let base = idx * PALETTE_K;
@@ -544,18 +571,18 @@ mod tests {
         brick.palette[best]
     }
 
-    /// The bake stores the TRUE trilinear field: every baked voxel equals the analytic
-    /// `fold_csg` distance sampled at the voxel centre (within snorm quantization + the
-    /// ±SNORM_CLAMP_DIST clamp). This is the contract that keeps the field a real SDF —
-    /// correct shape, no grid-snapped blockiness, and the same surface position at every
-    /// LOD (so no inter-LOD seam). A prior min-over-cell bake violated this (it stored a
-    /// lower bound, inflating coarse surfaces); this guards against reintroducing it.
+    /// The bake stores the TRUE trilinear field: every baked voxel decodes to the analytic
+    /// `fold_csg` distance at the voxel centre (within snorm quantization + the per-LOD
+    /// voxel-unit clamp `dist_band_world`). This is the contract that keeps the field a real
+    /// SDF — correct shape, no blockiness, same surface position at every LOD. The decode
+    /// matches the shader: `stored_ratio · band`, where `band = DIST_BAND_VOXELS·voxel_size`.
     #[test]
     fn baked_voxel_is_true_centre_distance() {
         let config = super::super::SdfGridConfig::default();
         // A coarse LOD (big voxels) is where any deviation from the true field shows most.
         let lod = 2u32;
         let voxel_size = config.voxel_size_at(lod);
+        let band = dist_band_world(&config, lod);
         let edits = vec![resolved(
             SdfPrimitive::Sphere { radius: 0.5 },
             Transform::from_xyz(0.3, 0.1, -0.2),
@@ -565,16 +592,16 @@ mod tests {
         let coord = config.world_to_brick_lod(Vec3::ZERO, lod);
         let brick = SdfAtlas::bake_single_brick(BrickKey::new(lod, coord), &config, &edits);
 
-        let slack = SNORM_CLAMP_DIST / 32767.0;
+        let slack = band / 32767.0;
         for z in 0..BRICK_EDGE {
             for y in 0..BRICK_EDGE {
                 for x in 0..BRICK_EDGE {
                     let idx = z * BRICK_EDGE * BRICK_EDGE + y * BRICK_EDGE + x;
                     let centre = SdfAtlas::voxel_world_pos(coord, x, y, z, voxel_size);
-                    let expected = fold_csg(&edits, centre)
-                        .dist
-                        .clamp(-SNORM_CLAMP_DIST, SNORM_CLAMP_DIST);
-                    let stored = brick.dist[idx] as f32 / 32767.0 * SNORM_CLAMP_DIST;
+                    // Clamp to the per-LOD band (matches the bake), then decode the snorm
+                    // ratio back through the same band (matches the shader).
+                    let expected = fold_csg(&edits, centre).dist.clamp(-band, band);
+                    let stored = brick.dist[idx] as f32 / 32767.0 * band;
                     assert!(
                         (stored - expected).abs() <= slack,
                         "voxel ({x},{y},{z}): stored {stored} must equal true centre {expected}"
@@ -586,11 +613,24 @@ mod tests {
 
     #[test]
     fn snorm_clamps_correctly() {
+        // Material-slot encoder: fixed ±1.0-world band.
         assert_eq!(SdfAtlas::dist_to_snorm(-2.0), -32767);
         assert_eq!(SdfAtlas::dist_to_snorm(-1.0), -32767);
         assert_eq!(SdfAtlas::dist_to_snorm(0.0), 0);
         assert_eq!(SdfAtlas::dist_to_snorm(1.0), 32767);
         assert_eq!(SdfAtlas::dist_to_snorm(2.0), 32767);
+    }
+
+    #[test]
+    fn dist_band_encoder_decodes_per_lod() {
+        // The geometry encoder stores d/band; decoding (·band) round-trips within the band.
+        let band = 4.0; // arbitrary
+        assert_eq!(SdfAtlas::dist_to_snorm_band(band, band), 32767); // +band → +1
+        assert_eq!(SdfAtlas::dist_to_snorm_band(-band, band), -32767);
+        assert_eq!(SdfAtlas::dist_to_snorm_band(2.0 * band, band), 32767); // clamps
+        assert_eq!(SdfAtlas::dist_to_snorm_band(0.0, band), 0);
+        let half = SdfAtlas::dist_to_snorm_band(band * 0.5, band);
+        assert!((half as f32 / 32767.0 * band - band * 0.5).abs() <= band / 32767.0);
     }
 
     #[test]
