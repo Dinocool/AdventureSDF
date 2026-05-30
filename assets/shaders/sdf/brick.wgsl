@@ -23,7 +23,7 @@
     euclid_mod,
     floor_div,
     ring_bricks,
-    recenter_snap_chunks,
+    recenter_snap,
     DIST_BAND_VOXELS,
 }
 
@@ -535,7 +535,7 @@ fn in_ring_chunk(coord: vec3<i32>, lod: u32) -> bool {
     let cam_cz = floor_div(floor_div(cam_brick.z, s), c);
 
     // Hysteresis snap to the coarse recenter lattice (mirrors ring_chunk_origin).
-    let snap = max(recenter_snap_chunks(), 1);
+    let snap = recenter_snap();  // already max(,1)
     let scx = floor_div(cam_cx, snap) * snap;
     let scy = floor_div(cam_cy, snap) * snap;
     let scz = floor_div(cam_cz, snap) * snap;

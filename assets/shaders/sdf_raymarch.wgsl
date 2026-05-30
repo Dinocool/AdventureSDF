@@ -11,20 +11,23 @@
 
 #import bevy_core_pipeline::fullscreen_vertex_shader::FullscreenVertexOutput
 
-#import sdf::bindings::{camera, max_steps, max_dist, sdf_eps, pixel_cone, cubic_band, over_relax, cell_stride, voxel_size_at, abs_chunk_key, local_brick_index, lod_count}
+#import sdf::bindings::{camera, max_steps, max_dist, sdf_eps, pixel_cone, cubic_band, over_relax, lod_blend_band, lod_count, brick_world_at, ring_center_lod, cell_stride, voxel_size_at, abs_chunk_key, local_brick_index, chunk_buf, ChunkLookup}
 #import sdf::brick::{
     world_to_brick_lod,
     scene_sdf,
+    sample_brick_sdf,
     load_material_distances,
     pick_material,
     calc_normal,
+    BrickLocation,
+    brick_in_chunk,
     ChunkCache,
     new_chunk_cache,
+    find_chunk_cached,
     resolve_march,
     dist_to_brick_exit_lod,
     dist_to_chunk_exit_lod,
     in_ring_chunk,
-    find_chunk_cached,
 }
 #import sdf::cubic::{build_cell_cubic, solve_cell_cubic, dist_to_cell_exit}
 #import sdf::pbr::shade_material
@@ -134,12 +137,48 @@ fn raymarch(origin: vec3<f32>, dir: vec3<f32>) -> RaymarchResult {
         let d = scene.dist;                          // trilinear SDF at p
         let cone = CONE * t;                         // pixel-cone half-width here
 
+        // --- LOD cross-fade: morph L → L+1 across the outer band of L's ring ----------
+        // The serving LOD L is resident only within its (chunk-snapped) ring box; just
+        // outside, `resolve_march` would return L+1, so the raw single-LOD surface steps
+        // (C0 discontinuity = the visible pop). Fade `d` (LOD L) toward the L+1 field over
+        // the outer `band` fraction of L's half-extent so the surface reaches pure L+1
+        // exactly at the boundary — continuous hand-off. Keyed off the SNAPPED ring centre
+        // (see `ring_center_lod`), else the band sits off the true boundary and the pop
+        // stays. Defaults to off (band == 0). `d_eff` is the field the march below traces.
+        let band = lod_blend_band();
+        var d_eff = d;
+        var blending = false;
+        if (band > 0.0) {
+            let center_l = ring_center_lod(camera.camera_pos.xyz, lod);
+            let cheb = max(max(abs(p.x - center_l.x), abs(p.y - center_l.y)), abs(p.z - center_l.z));
+            let half_l = 0.5 * camera.lod_params.y * brick_world_at(lod);   // ring half-extent
+            let frac = cheb / max(half_l, 1e-6);
+            if (frac > 1.0 - band && lod + 1u < lod_count()) {
+                // Probe the coarser neighbour through the per-ray chunk cache (the fine→
+                // coarse resolve already searched + cached L+1's chunk, so this is ~free).
+                let coord1 = world_to_brick_lod(p, lod + 1u);
+                let key1 = abs_chunk_key(coord1, lod + 1u);
+                let ci1 = find_chunk_cached(lod + 1u, key1.x, key1.y, &cache);
+                if (ci1 >= 0) {
+                    let loc1 = brick_in_chunk(chunk_buf[u32(ci1)], coord1);
+                    if (loc1.found) {
+                        let d_l1 = sample_brick_sdf(loc1.atlas_base, p, lod + 1u);
+                        let w = smoothstep(1.0 - band, 1.0, frac);
+                        d_eff = mix(d, d_l1, w);
+                        blending = w > 0.0;
+                    }
+                }
+            }
+        }
+
         // --- 2. LOD 0 near the surface: exact analytic cubic -------------------------
         // (SDF_DISABLE_CUBIC skips this branch → pure sphere-trace everywhere, for bisect.)
+        // Gated off inside the cross-fade shell (`blending`) so those near-surface hits fall
+        // through to the sphere-trace and blend, instead of snapping via the unblended cubic.
 #ifdef SDF_DISABLE_CUBIC
         if (false) {
 #else
-        if (lod == 0u && d < CUBIC_BAND) {
+        if (lod == 0u && d < CUBIC_BAND && !blending) {
 #endif
             let ray_d_voxel = dir / voxel_size;       // voxels per world unit at LOD 0
             let gv = p / voxel_size;                  // LOD voxel space (world-0 anchored)
@@ -176,13 +215,15 @@ fn raymarch(origin: vec3<f32>, dir: vec3<f32>) -> RaymarchResult {
 
         // --- 3. Coarse LOD / far: sphere-trace the trilinear field -------------------
         //
-        // Over-relaxation validation FIRST (Keinert 2014): the previous relaxed step
-        // `prev_step` was safe only if the new unbounding sphere of radius `d` still reaches
-        // back over it (`d + prev_d >= prev_step`). If not, the relaxed step jumped PAST the
-        // surface — `p` is now inside/beyond it, so we must NOT accept this point as a hit
-        // (doing so lands the hit at a view-dependent spot → swimming normals/textures on
-        // camera rotation). Back up to the previous safe radius and resume plain tracing.
-        if (prev_step > 0.0 && d + prev_d < prev_step) {
+        // Traces the (possibly LOD-cross-faded) field `d_eff` — equal to `d` outside the
+        // blend shell. Over-relaxation validation FIRST (Keinert 2014): the previous relaxed
+        // step `prev_step` was safe only if the new unbounding sphere of radius `d_eff` still
+        // reaches back over it (`d_eff + prev_d >= prev_step`). If not, the relaxed step
+        // jumped PAST the surface — `p` is now inside/beyond it, so we must NOT accept this
+        // point as a hit (doing so lands the hit at a view-dependent spot → swimming normals/
+        // textures on camera rotation). Back up to the previous safe radius and resume plain
+        // tracing.
+        if (prev_step > 0.0 && d_eff + prev_d < prev_step) {
             t += prev_d - prev_step;                 // undo the overshoot (negative)
             prev_d = 0.0;
             prev_step = 0.0;
@@ -190,7 +231,7 @@ fn raymarch(origin: vec3<f32>, dir: vec3<f32>) -> RaymarchResult {
         }
 
         // Accept only a point reached by a validated step (never an overshoot).
-        if (d < max(SDF_EPS, cone)) {
+        if (d_eff < max(SDF_EPS, cone)) {
             let hit_p = p;
             result.hit = true;
             result.dist = t;
@@ -204,13 +245,16 @@ fn raymarch(origin: vec3<f32>, dir: vec3<f32>) -> RaymarchResult {
             return result;
         }
 
-        // Step `omega * d` (sphere trace), floored so we never stall, and capped at the brick
-        // exit so we re-resolve LOD as the ray crosses bricks. omega = 1 is plain sphere
-        // tracing. (Capping at brick_exit is conservative — `d` is the only safe jump.)
+        // Step `omega * d_eff`, floored so we never stall, and capped at the brick exit so we
+        // re-resolve LOD as the ray crosses bricks. omega = 1 is plain sphere tracing. Inside
+        // the cross-fade shell force omega = 1: the blended field's weight gradient makes it
+        // mildly non-eikonal, so over-relaxation could overshoot — and the fade is a thin far
+        // shell where over-relaxation buys almost nothing anyway.
         let brick_exit = dist_to_brick_exit_lod(p, dir, lod);
-        let step = clamp(OMEGA * d, voxel_size * 0.01, brick_exit + voxel_size * 0.01);
+        let local_omega = select(OMEGA, 1.0, blending);
+        let step = clamp(local_omega * d_eff, voxel_size * 0.01, brick_exit + voxel_size * 0.01);
         t += step;
-        prev_d = d;
+        prev_d = d_eff;
         prev_step = step;
     }
 

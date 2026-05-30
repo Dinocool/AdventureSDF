@@ -14,7 +14,7 @@ struct SdfCameraUniform {
     grid_origin: vec4<f32>,
     grid_dims: vec4<f32>,
     debug_params: vec4<f32>,   // x = max_steps, y = max_dist, z = sdf_eps, w = recenter_snap_chunks
-    march_params: vec4<f32>,   // x = pixel_cone (world radius/unit-dist/pixel), y = cubic_band, z = over_relax, w unused
+    march_params: vec4<f32>,   // x = pixel_cone (world radius/unit-dist/pixel), y = cubic_band, z = over_relax, w = lod_blend_band
     lod_params: vec4<f32>,     // x = lod_count, y = ring_bricks, z = base voxel_size, w = cell_stride
 };
 
@@ -108,6 +108,14 @@ fn cubic_band() -> f32 { return camera.march_params.y; }
 // instead of `d`, with a safe fallback when consecutive unbounding spheres separate.
 // 1.0 = plain sphere tracing; (1,2) accelerates convergence on grazing rays.
 fn over_relax() -> f32 { return camera.march_params.z; }
+// LOD cross-fade band width, as a fraction of each ring's half-extent. In the outer
+// `lod_blend_band` shell the march fades the serving LOD toward its coarser neighbour so
+// the surface morphs smoothly across the ring boundary. 0 = hard LOD seams (disabled).
+fn lod_blend_band() -> f32 { return camera.march_params.w; }
+// `recenter_snap_chunks` (hysteresis snap of the resident ring origin, in whole chunks).
+// The LOD cross-fade keys off the chunk-SNAPPED ring centre, so the shader recomputes it
+// from camera_pos + this (mirrors bake_scheduler::ring_chunk_origin). >= 1.
+fn recenter_snap() -> i32 { return max(i32(camera.debug_params.w), 1); }
 
 // --- LOD clipmap / chunk accessors ---
 
@@ -118,10 +126,6 @@ fn lod_count() -> u32 { return u32(camera.lod_params.x); }
 // Ring window size in BRICKS per axis (mirrors SdfGridConfig::ring_bricks). The chunk-DDA
 // empty-space skip uses ring_bricks/CHUNK_BRICKS chunks per axis.
 fn ring_bricks() -> i32 { return i32(camera.lod_params.y); }
-// Coarse chunk lattice the per-LOD ring origin snaps to (hysteresis). Mirrors
-// SdfGridConfig::recenter_snap_chunks; the chunk-DDA in-ring test must use the SAME snap as
-// bake_scheduler::ring_chunk_origin or it will mis-classify chunks near the ring edge.
-fn recenter_snap_chunks() -> i32 { return i32(camera.debug_params.w); }
 // Brick spatial stride in voxels (cell_stride; same at every LOD — only the world
 // size of a voxel changes). Mirrors SdfGridConfig::cell_stride.
 fn cell_stride() -> i32 { return i32(camera.lod_params.w); }
@@ -129,6 +133,34 @@ fn cell_stride() -> i32 { return i32(camera.lod_params.w); }
 fn voxel_size_at(lod: u32) -> f32 { return camera.lod_params.z * exp2(f32(lod)); }
 // World edge length of one brick at LOD `lod`.
 fn brick_world_at(lod: u32) -> f32 { return f32(cell_stride()) * voxel_size_at(lod); }
+
+// World-space CENTRE of the resident clipmap ring window at LOD `lod` for a camera at
+// `cam`. Mirrors `bake_scheduler::ring_chunk_origin` (the async/default bake path): the
+// window is centred on the camera's chunk SNAPPED to the `recenter_snap` lattice
+// (hysteresis), so the cross-fade must key off this snapped centre, not raw `cam`, or the
+// boundary is off by up to a snap cell and the LOD pop persists. The window spans whole
+// chunks, so its centre lands on the chunk-index `cam_chunk_snapped` ⇒ that index times the
+// chunk world size. `floor_div` (forward-declared below) floors toward -inf so the lattice
+// is continuous across the world origin, matching the CPU's `div_euclid`.
+fn ring_center_lod(cam: vec3<f32>, lod: u32) -> vec3<f32> {
+    let s = cell_stride();
+    let vs = voxel_size_at(lod);
+    let snap = recenter_snap();
+    let vox = vec3<i32>(floor(cam / vs));                                  // voxel coord on this LOD
+    let brick = vec3<i32>(floor_div(vox.x, s), floor_div(vox.y, s), floor_div(vox.z, s));
+    let chunk = vec3<i32>(
+        floor_div(brick.x, CHUNK_BRICKS),
+        floor_div(brick.y, CHUNK_BRICKS),
+        floor_div(brick.z, CHUNK_BRICKS),
+    );
+    let snapped = vec3<i32>(
+        floor_div(chunk.x, snap) * snap,
+        floor_div(chunk.y, snap) * snap,
+        floor_div(chunk.z, snap) * snap,
+    );
+    let chunk_world = f32(CHUNK_BRICKS) * brick_world_at(lod);
+    return vec3<f32>(snapped) * chunk_world;
+}
 
 // Floored division of `a` by `b` (b > 0), rounding toward negative infinity.
 //
