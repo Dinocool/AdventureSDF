@@ -24,7 +24,7 @@
     dist_to_brick_exit_lod,
 }
 #import sdf::cubic::{build_cell_cubic, solve_cell_cubic, dist_to_cell_exit}
-#import sdf::pbr::{shade_material, sun_dir}
+#import sdf::pbr::{resolve_surface, shade_surface, shade_material_env, sun_dir, PbrInputs}
 #import sdf::sky::sky_color
 
 // --- Raymarching ---
@@ -193,6 +193,29 @@ fn raymarch(origin: vec3<f32>, dir: vec3<f32>) -> RaymarchResult {
     return result;
 }
 
+// --- Reflections (Stage 4) ---------------------------------------------------------
+//
+// Mirror radiance along `refl_dir` from a primary hit: march a SECONDARY ray through the
+// same SDF. On a hit, shade that surface with the analytic sky as ITS environment (one
+// bounce only — the reflected surface doesn't itself spawn another reflection ray, which
+// would be unbounded recursion). On a miss, return the sky. The result is the env_radiance
+// the primary surface's specular term consumes, so a smooth metal mirrors real geometry.
+//
+// `origin` is the primary hit nudged off its surface (caller offsets by the geometric
+// normal) so the reflection ray doesn't immediately re-hit the surface it left.
+fn trace_reflection(origin: vec3<f32>, refl_dir: vec3<f32>) -> vec3<f32> {
+    let rm = raymarch(origin, refl_dir);
+    if (!rm.hit) {
+        return sky_color(refl_dir, sun_dir());
+    }
+    let hp = rm.hit_pos;
+    let n = calc_normal(hp);
+    let lod = clamp(log2(max(rm.dist, 1.0)) - 1.0, 0.0, 8.0);
+    // One bounce: the reflected surface uses the sky as its own environment.
+    let sky_env = sky_color(reflect(refl_dir, n), sun_dir());
+    return shade_material_env(scene_sdf(hp), hp, n, lod, sky_env);
+}
+
 struct FragmentOutput {
     @location(0) color: vec4<f32>,
     @builtin(frag_depth) depth: f32,
@@ -288,10 +311,30 @@ fn main(in: FullscreenVertexOutput) -> FragmentOutput {
     // range. With single-mip textures this is currently a no-op but keeps the call
     // shape ready for the mip follow-up.
     let lod = clamp(log2(max(rm.dist, 1.0)) - 1.0, 0.0, 8.0);
-    // Full PBR: triplanar textures + Cook-Torrance + material-seam cross-fade,
-    // returned tonemapped/gamma-corrected. `normal` is the geometric SDF normal;
-    // shade_material perturbs it per-material with the normal map.
-    let shaded = shade_material(scene_sdf(hit_pos), hit_pos, normal, lod);
+
+    // Resolve the cross-faded PBR inputs, pick the environment radiance, then shade once.
+    // `p.normal` is the normal-mapped shading normal; `normal` is the geometric one (used
+    // for the reflection-ray offset so it leaves along the true surface).
+    let scene = scene_sdf(hit_pos);
+    let p: PbrInputs = resolve_surface(scene, hit_pos, normal, lod);
+
+    // Environment radiance for the specular/IBL term: the analytic sky by default. With
+    // SDF_REFLECTIONS, smooth/metallic surfaces trace a real reflection ray for true
+    // geometry-to-geometry mirroring; rough/diffuse surfaces keep the cheap sky (the
+    // gate keeps the common case at one march).
+    var env_radiance = sky_color(reflect(-normalize(camera.camera_pos.xyz - hit_pos), p.normal), sun_dir());
+#ifdef SDF_REFLECTIONS
+    if (p.metallic > 0.1 || p.roughness < 0.3) {
+        let view = normalize(camera.camera_pos.xyz - hit_pos);
+        let refl_dir = reflect(-view, p.normal);
+        let bias = voxel_size_at(rm.lod) * 2.0;
+        env_radiance = trace_reflection(hit_pos + normal * bias, refl_dir);
+    }
+#endif
+
+    // Shade to LINEAR radiance, then tonemap (Reinhard) + approximate gamma once here.
+    let lit = shade_surface(p, hit_pos, normal, rm.lod, env_radiance);
+    let shaded = pow(lit / (lit + vec3<f32>(1.0)), vec3<f32>(1.0 / 2.2));
 
     // --- Debug output modes (hit-only; cost/fate modes return earlier) ---
 
