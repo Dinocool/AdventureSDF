@@ -430,6 +430,20 @@ fn register_shader_modes(app: &mut App) {
         description: "SDF-traced reflections on metallic/smooth surfaces (secondary ray)"
             .into(),
     });
+    registry.register(ShaderDebugMode {
+        id: "sdf/parallax".into(),
+        label: "Parallax".into(),
+        shader_define: "SDF_PARALLAX".into(),
+        kind: DebugModeKind::Toggle,
+        description: "Inward relief from the height map (carve within the envelope, no silhouette change)".into(),
+    });
+    registry.register(ShaderDebugMode {
+        id: "sdf/displace".into(),
+        label: "Displace".into(),
+        shader_define: "SDF_DISPLACE".into(),
+        kind: DebugModeKind::Toggle,
+        description: "TRUE height displacement: peaks bulge past the envelope (real silhouette). Overrides Parallax; costs a detail march.".into(),
+    });
 
     // Default the PBR feature toggles ON so the enhanced shading shows without hunting
     // for the checkbox. The state resource is separate from the registry; seed it after
@@ -438,6 +452,7 @@ fn register_shader_modes(app: &mut App) {
         let mut state = app.world_mut().resource_mut::<ShaderDebugState>();
         state.set("sdf/shadows", true);
         state.set("sdf/reflections", true);
+        state.set("sdf/parallax", true);
     }
 }
 
@@ -1277,6 +1292,13 @@ fn inspect_panel(world: &mut World, ui: &mut egui::Ui) {
             }
             if ui
                 .add(egui::Slider::new(&mut def.roughness, 0.0..=1.0).text("Roughness"))
+                .changed()
+            {
+                reg_changed = true;
+            }
+            // Parallax relief depth (UV units). Only visible with a height map + SDF_PARALLAX.
+            if ui
+                .add(egui::Slider::new(&mut def.parallax_scale, 0.0..=0.4).text("Parallax"))
                 .changed()
             {
                 reg_changed = true;

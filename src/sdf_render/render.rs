@@ -73,7 +73,7 @@ struct SdfCameraData {
 /// GPU mirror of a [`super::edits::MaterialDef`], one per global material id, in a
 /// storage buffer indexed by id. Carries the PBR texture-array layer for each map
 /// (`u32::MAX` = none); the shader samples those layers via triplanar projection.
-/// 48 bytes, 16-byte aligned for std430.
+/// 64 bytes, 16-byte aligned for std430 (Vec4 forces the size up to a 16-byte multiple).
 #[derive(ShaderType, Clone, Copy, Default)]
 struct GpuSdfMaterial {
     base_color: Vec4,
@@ -84,9 +84,13 @@ struct GpuSdfMaterial {
     tex_height: u32,
     tex_edge: u32,
     /// Scalar metallic/roughness fallbacks (used by the shader when `tex_mra` is absent).
-    /// Reuse the former std430 tail padding — no size/layout change (still 48 bytes).
     metallic: f32,
     roughness: f32,
+    /// Parallax-occlusion relief depth (UV units) for this material's height map. 0 = flat.
+    parallax_scale: f32,
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
 }
 
 // --- Extracted Atlas ---
@@ -544,6 +548,10 @@ fn prepare_sdf_camera_data(
                 tex_edge: t[4],
                 metallic: def.metallic,
                 roughness: def.roughness,
+                parallax_scale: def.parallax_scale,
+                _pad0: 0,
+                _pad1: 0,
+                _pad2: 0,
             });
         }
     }
@@ -895,8 +903,8 @@ fn prepare_sdf_materials_gpu(
     mut gpu_atlas: ResMut<SdfGpuAtlas>,
 ) {
     let Some(extracted) = extracted else { return };
-    // std430: each GpuSdfMaterial is 48 bytes (vec4 + f32 + 5×u32 + 2×u32 pad).
-    let mut bytes = Vec::with_capacity(extracted.materials.len() * 48);
+    // std430: each GpuSdfMaterial is 64 bytes (vec4 + f32 + 5×u32 + 3×f32 + 3×u32 pad).
+    let mut bytes = Vec::with_capacity(extracted.materials.len() * 64);
     for m in &extracted.materials {
         for c in [
             m.base_color.x,
@@ -914,6 +922,10 @@ fn prepare_sdf_materials_gpu(
         bytes.extend_from_slice(&m.tex_edge.to_le_bytes());
         bytes.extend_from_slice(&m.metallic.to_le_bytes());
         bytes.extend_from_slice(&m.roughness.to_le_bytes());
+        bytes.extend_from_slice(&m.parallax_scale.to_le_bytes());
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.extend_from_slice(&0u32.to_le_bytes());
     }
     let buffer = device.create_buffer_with_data(&BufferInitDescriptor {
         label: Some("sdf_material_buffer"),
@@ -1412,7 +1424,7 @@ fn init_sdf_pipeline(
     // size before the real table uploads.
     let dummy_material = device.create_buffer_with_data(&BufferInitDescriptor {
         label: Some("sdf_dummy_material"),
-        contents: &[0u8; 48],
+        contents: &[0u8; 64],
         usage: BufferUsages::STORAGE,
     });
     // Matching dummy material atlas (Rgba16Snorm = 8 bytes/texel) so bind group 1 is
