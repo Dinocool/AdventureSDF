@@ -49,26 +49,31 @@ fn triplanar_weights(n: vec3<f32>) -> vec3<f32> {
 // gone below the relief surface, refine linearly, return the displaced world position. Bounded
 // 16 steps with the inward cosine floored, so grazing angles can't explode the march.
 
-// World→UV for the chosen triplanar plane (axis 0=X→zy, 1=Y→xz, 2=Z→xy), matching the
-// uv↔world pairings `sample_material_map` uses so the relief lines up with the textures.
-fn plane_uv(p: vec3<f32>, axis: u32) -> vec2<f32> {
-    if (axis == 0u) { return p.zy * TEXTURE_WORLD_SCALE; }
-    if (axis == 1u) { return p.xz * TEXTURE_WORLD_SCALE; }
-    return p.xy * TEXTURE_WORLD_SCALE;
+// Dominant triplanar axis of a normal: 0 = X plane (uv = zy), 1 = Y (xz), 2 = Z (xy). The
+// relief march pins this ONCE at band entry so the inner loop samples a single plane (1 tap)
+// instead of the full triplanar blend (3 taps) — a 3× cut in the hottest code. The uv↔world
+// pairings are the same ones `sample_material_map` uses, so on an axis-dominant face (the
+// common case) the carve lines up with the diffuse exactly.
+fn relief_axis(n: vec3<f32>) -> u32 {
+    let an = abs(n);
+    if (an.x >= an.y && an.x >= an.z) { return 0u; }
+    if (an.y >= an.z) { return 1u; }
+    return 2u;
 }
 
-// Height sample (0..1) for material `id` at world point `p`, on the dominant triplanar
-// plane of normal `n`. 0.5 when there's no height map (the centered neutral). Used by the
-// SDF_DISPLACE detail march to evaluate the displaced field g(p) = envelope_d - (H-0.5)·depth.
-fn relief_height_at(id: u32, p: vec3<f32>, n: vec3<f32>, lod: f32) -> f32 {
+// Single-plane height sample (0..1) for material `id` at `p` on the given triplanar `axis`.
+// 0.5 (centred neutral) when there's no height map. One texture tap.
+fn relief_height_plane(id: u32, p: vec3<f32>, axis: u32, lod: f32) -> f32 {
     let mat = material_at(id);
-    if (mat.tex_height == 0xffffffffu) { return 0.5; }
     let layer = i32(mat.tex_height);
-    let an = abs(n);
-    var axis = 2u;
-    if (an.x >= an.y && an.x >= an.z) { axis = 0u; }
-    else if (an.y >= an.z) { axis = 1u; }
-    return textureSampleLevel(tex_height, pbr_sampler, plane_uv(p, axis), layer, lod).r;
+    // Select UV without an early return so texture access is uniform (naga requires
+    // textureSampleLevel to be in uniform control flow at the call site).
+    let uv_x = p.zy * TEXTURE_WORLD_SCALE;
+    let uv_y = p.xz * TEXTURE_WORLD_SCALE;
+    let uv_z = p.xy * TEXTURE_WORLD_SCALE;
+    let uv = select(select(uv_z, uv_y, axis == 1u), uv_x, axis == 0u);
+    let h = textureSampleLevel(tex_height, pbr_sampler, uv, max(layer, 0), lod).r;
+    return select(h, 0.5, mat.tex_height == 0xffffffffu);
 }
 
 // Relief depth (world units) for this material, distance-faded; 0 if disabled / no height
