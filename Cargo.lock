@@ -99,6 +99,7 @@ dependencies = [
  "egui_dock",
  "emath",
  "epaint",
+ "futures-lite",
  "image",
  "intel_tex_2",
  "naga",

@@ -7,12 +7,13 @@
 //! 1. **Edits → analytic CSG field** (`edits`). Each [`SdfVolume`] is a primitive + CSG op
 //!    (`fold_csg`). This field is *resolution-independent*: callable at any point and any
 //!    scale. Everything downstream samples it.
-//! 2. **Conservative per-LOD bake** (`atlas`). For each resident brick, every voxel stores
-//!    the **minimum** analytic distance over a small sub-grid spanning the voxel cell
-//!    (`atlas::SUBSAMPLES`). The min is a *conservative lower bound*: thin features survive
-//!    at coarse LOD (no "grain") and a sphere-trace step of the stored value can never
-//!    overshoot a surface. A coarse brick samples the analytic field at its own scale, so
-//!    far geometry bakes correctly without any LOD-0 data.
+//! 2. **Per-LOD bake** (`atlas`). For each resident brick, every voxel stores the analytic
+//!    CSG distance (`edits::fold_csg`) sampled at the voxel centre — a true trilinear SDF.
+//!    A coarse brick samples the analytic field at its own (larger) voxel scale, so far
+//!    geometry bakes correctly without any LOD-0 data, and the surface sits at the same
+//!    place at every LOD (no inter-LOD seam). Trade-off: a feature thinner than a voxel can
+//!    be missed at coarse LOD (its zero-crossing falls between samples) — accepted as the
+//!    cost of a clean, un-inflated field.
 //! 3. **Sparse storage + GPU lookup** (`chunk`, `render`, `bindings.wgsl`). Bricks group
 //!    into 4³=64-brick **chunks** addressed by an *absolute* world-lattice key (independent
 //!    of the camera, so CPU and GPU agree by construction). Resident chunks form a sorted
@@ -24,10 +25,10 @@
 //! 5. **Unified raymarch** (`sdf_raymarch.wgsl`, helpers in `brick`/`cubic`). One loop:
 //!    resolve the finest resident LOD at `p`; skip empty space by brick-DDA; at LOD 0 near
 //!    the surface solve the exact analytic **cubic** for a crisp silhouette; otherwise
-//!    sphere-trace the conservative field and accept the hit once the surface is within the
+//!    sphere-trace the trilinear field and accept the hit once the surface is within the
 //!    pixel cone (screen-space termination — the vast-distance speed win). There is **no GPU
-//!    BVH** in the march; the conservative field drives all skipping. The `bvh` module is
-//!    CPU-only, used solely as the bake's edit-culling acceleration structure.
+//!    BVH** in the march; the field + brick-geometry DDA drive all skipping. The `bvh` module
+//!    is CPU-only, used solely as the bake's edit-culling acceleration structure.
 //!
 //! Editor-only pieces (`debug`, `gizmo`, `picking`, overlays) sit alongside but are not on
 //! the render hot path.
@@ -97,6 +98,20 @@ pub struct RayStepCapture {
     pub steps: Vec<picking::RayStep>,
 }
 
+/// Diagnostic: when true, bypass the async/incremental bake scheduler and rebuild the
+/// whole atlas synchronously via `full_bake` every frame the edit set changes. Used to
+/// bisect whether a visual artifact lives in the async/incremental upload path (the thing
+/// `full_bake` skips) vs the bake math itself. Currently defaulted ON for diagnosis (async
+/// path ruled out for the duplication bug); flip back to async once the bug is found.
+#[derive(Resource)]
+pub struct SyncBakeMode(pub bool);
+
+impl Default for SyncBakeMode {
+    fn default() -> Self {
+        Self(true)
+    }
+}
+
 /// Toggle for the SDF fullscreen raymarch pass. F1 flips this.
 #[derive(Resource)]
 pub struct SdfRenderEnabled(pub bool);
@@ -139,6 +154,12 @@ pub struct SdfRaymarchParams {
     /// the exact analytic cubic for a crisp silhouette. Outside it (or at any coarser
     /// LOD) the march sphere-traces the conservative field.
     pub cubic_band: f32,
+    /// Sphere-trace over-relaxation factor (Keinert 2014). The march steps `over_relax · d`
+    /// with a safe fallback when consecutive unbounding spheres separate, converging on
+    /// grazing rays in fewer steps. 1.0 = plain sphere tracing (default — correct and
+    /// artifact-free); (1,2) accelerates but can interact poorly with the loose
+    /// conservative field, so it is opt-in.
+    pub over_relax: f32,
 }
 
 impl Default for SdfRaymarchParams {
@@ -151,6 +172,7 @@ impl Default for SdfRaymarchParams {
             sdf_eps: 0.001,
             cone_scale: 1.0,
             cubic_band: 0.5,
+            over_relax: 1.0,
         }
     }
 }
@@ -369,6 +391,7 @@ impl Plugin for SdfScenePlugin {
             .init_resource::<SdfRaymarchParams>()
             .init_resource::<WireframeBoundsVisible>()
             .init_resource::<RayStepCapture>()
+            .init_resource::<SyncBakeMode>()
             .init_resource::<ViewportInputAllowed>()
             .init_resource::<gizmo::GizmoState>()
             .register_type::<SdfVolume>()
@@ -406,15 +429,25 @@ impl Plugin for SdfScenePlugin {
                     .run_if(|allowed: Res<ViewportInputAllowed>| allowed.0),
             )
             // Bake/upload/render-toggle always run in the editor scene — property
-            // edits in the inspector (and gizmo drags) must still re-bake.
+            // edits in the inspector (and gizmo drags) must still re-bake. The async
+            // scheduler pair runs unless SyncBakeMode is on (diagnostic), in which case
+            // the synchronous whole-atlas `sync_bake` runs instead.
             .add_systems(
                 Update,
-                (
-                    bake_scheduler::schedule_bakes,
-                    bake_scheduler::apply_bakes,
-                    upload_sdf_buffers,
-                    toggle_sdf_render,
-                )
+                (bake_scheduler::schedule_bakes, bake_scheduler::apply_bakes)
+                    .chain()
+                    .run_if(in_state(AppScene::SdfEditor))
+                    .run_if(|m: Res<SyncBakeMode>| !m.0),
+            )
+            .add_systems(
+                Update,
+                sync_bake
+                    .run_if(in_state(AppScene::SdfEditor))
+                    .run_if(|m: Res<SyncBakeMode>| m.0),
+            )
+            .add_systems(
+                Update,
+                (upload_sdf_buffers, toggle_sdf_render)
                     .chain()
                     .run_if(in_state(AppScene::SdfEditor)),
             );
@@ -487,14 +520,26 @@ fn setup_sdf_scene(
         asset_table.register(handle)
     };
 
-    let mat_sand = mat("sand", "sand", "1");
     let mat_cobble = mat("cobble", "cobble_stone", "1");
-    let mat_cobble2 = mat("cobble2", "cobble_stone", "3");
-    let mat_ground = mat("ground", "ground", "1");
-    let mat_ground2 = mat("ground2", "ground", "4");
 
-    // Camera
-    let orbit = SdfOrbitCamera::default();
+    // Multi-LOD clipmap restored (the min shader now walks LODs via sample_sdf_world).
+    // A few levels exercises the LOD seam / coarse-shell behavior on the single cube.
+    commands.insert_resource(SdfGridConfig {
+        lod_count: 4,
+        ring_bricks: 16,
+        ..SdfGridConfig::default()
+    });
+
+    // MINIMAL REPRO SCENE: a single cube far out at all-negative coords. This is the
+    // smallest case that reproduces the "half renders twice" duplication, so the demo is
+    // pared down to it while we bisect the bug. (Restore the gallery once it's fixed.)
+    const CUBE_CENTRE: Vec3 = Vec3::new(-10.822, -0.339, -5.058);
+
+    // Camera: frame the cube (orbit target = cube centre).
+    let orbit = SdfOrbitCamera {
+        target: CUBE_CENTRE,
+        ..SdfOrbitCamera::default()
+    };
     let pos = orbit.target
         + Vec3::new(
             orbit.distance * orbit.yaw.cos() * orbit.pitch.cos(),
@@ -511,90 +556,24 @@ fn setup_sdf_scene(
         DepthPrepass,
         SceneEntity,
     ));
+    commands.insert_resource(orbit);
 
-    // Demo gallery: a wide, flat sand "ground plane" cube with a spread of distinct
-    // primitives resting on its top surface. All plain unions (no subtracts). The
-    // plane is centred so its top face sits at y = 0; each object's centre is then
-    // placed at y = its half-height so it rests exactly on the surface.
-    // (order, transform, primitive, material)
-    const PLANE_HALF_Y: f32 = 0.15; // thin slab → reads like a plane
-    let demo: [(u32, Transform, SdfPrimitive, u32); 7] = [
-        // Ground plane: wide + thin, top face at y = 0 (centre at y = -half_y).
-        (
-            0,
-            Transform::from_xyz(0.0, -PLANE_HALF_Y, 0.0),
-            SdfPrimitive::Box {
-                half_extents: Vec3::new(4.0, PLANE_HALF_Y, 3.0),
-            },
-            mat_sand,
-        ),
-        // Box resting on the plane (half-height 0.4 → centre at y = 0.4).
-        (
-            1,
-            Transform::from_xyz(-2.4, 0.4, 0.4),
-            SdfPrimitive::Box {
-                half_extents: Vec3::splat(0.4),
-            },
-            mat_cobble,
-        ),
-        (
-            2,
-            Transform::from_xyz(-1.1, 0.55, -0.3),
-            SdfPrimitive::Sphere { radius: 0.55 },
-            mat_cobble2,
-        ),
-        // Torus lies flat: its half-thickness above centre is `minor` (0.18).
-        (
-            3,
-            Transform::from_xyz(0.2, 0.18, 0.5),
-            SdfPrimitive::Torus {
-                major: 0.5,
-                minor: 0.18,
-            },
-            mat_ground,
-        ),
-        // Capsule standing up: half-height + radius above centre.
-        (
-            4,
-            Transform::from_xyz(1.3, 0.68, -0.4),
-            SdfPrimitive::Capsule {
-                half_height: 0.4,
-                radius: 0.28,
-            },
-            mat_ground2,
-        ),
-        // Cylinder standing up: half-height above centre.
-        (
-            5,
-            Transform::from_xyz(2.4, 0.5, 0.3),
-            SdfPrimitive::Cylinder {
-                radius: 0.4,
-                half_height: 0.5,
-            },
-            mat_cobble,
-        ),
-        (
-            6,
-            Transform::from_xyz(0.6, 0.45, -1.1),
-            SdfPrimitive::Sphere { radius: 0.45 },
-            mat_ground,
-        ),
-    ];
-
-    for (order, transform, prim, registry_id) in demo {
-        commands.spawn((
-            transform,
-            prim,
-            SdfOp {
-                kind: CsgKind::Union,
-                smoothing: 0.0,
-            },
-            SdfOrder(order),
-            SdfMaterial { registry_id },
-            SdfVolume,
-            SceneEntity,
-        ));
-    }
+    commands.spawn((
+        Transform::from_translation(CUBE_CENTRE),
+        SdfPrimitive::Box {
+            half_extents: Vec3::splat(1.0),
+        },
+        SdfOp {
+            kind: CsgKind::Union,
+            smoothing: 0.0,
+        },
+        SdfOrder(0),
+        SdfMaterial {
+            registry_id: mat_cobble,
+        },
+        SdfVolume,
+        SceneEntity,
+    ));
 
     // Directional light so 3D geometry (and debug wireframes) are visible.
     commands.spawn((
@@ -1002,6 +981,45 @@ fn draw_lod_rings(
 
 fn upload_sdf_buffers(_atlas: Res<atlas::SdfAtlas>) {
     // Render world will pick up atlas changes via extract
+}
+
+/// Diagnostic synchronous bake (active only when [`SyncBakeMode`] is on): rebuild the whole
+/// atlas via `full_bake` whenever the edit set changes or the camera crosses a brick, fully
+/// bypassing the async/incremental scheduler + partial-upload path. `full_bake` sets
+/// `last_bake_was_full`, so the extract does a full texture realloc each time — no partial
+/// `write_texture`. If the duplication vanishes in this mode, the bug is in the async path.
+#[expect(clippy::too_many_arguments)]
+fn sync_bake(
+    mut atlas: ResMut<atlas::SdfAtlas>,
+    mut bvh: ResMut<bvh::Bvh>,
+    mut prev_aabbs: ResMut<bake_scheduler::PrevEditAabbs>,
+    mut last_origin: Local<Option<IVec3>>,
+    config: Res<SdfGridConfig>,
+    volumes: Query<VolumeQueryData, With<SdfVolume>>,
+    changed: Query<Entity, (With<SdfVolume>, bake_scheduler::ChangedEditFilter)>,
+    camera: Query<&Transform, (With<SdfCamera>, Without<SdfVolume>)>,
+) {
+    let camera_pos = camera.iter().next().map(|t| t.translation).unwrap_or(Vec3::ZERO);
+    let origin0 = config.world_to_brick_lod(camera_pos, 0);
+
+    let gathered = gather_sorted_edits(&volumes);
+    let current: std::collections::HashMap<Entity, bevy::math::bounding::Aabb3d> =
+        gathered.iter().map(|g| (g.entity, g.aabb)).collect();
+    let set_changed = current.len() != prev_aabbs.len()
+        || current.keys().any(|e| !prev_aabbs.contains(e));
+    let camera_moved = *last_origin != Some(origin0);
+
+    if !(atlas.rebake_all || set_changed || camera_moved || !changed.is_empty()) {
+        return;
+    }
+
+    let resolved: Vec<edits::ResolvedEdit> = gathered.iter().map(|g| g.edit.clone()).collect();
+    let aabbs: Vec<bevy::math::bounding::Aabb3d> = gathered.iter().map(|g| g.aabb).collect();
+    *bvh = bvh::Bvh::build(&aabbs);
+    atlas.full_bake(&resolved, &bvh, &config, camera_pos);
+
+    prev_aabbs.set_map(current);
+    *last_origin = Some(origin0);
 }
 
 fn toggle_sdf_render(

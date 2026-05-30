@@ -14,7 +14,7 @@ struct SdfCameraUniform {
     grid_origin: vec4<f32>,
     grid_dims: vec4<f32>,
     debug_params: vec4<f32>,   // x = max_steps, y = max_dist, z = sdf_eps, w = unused
-    march_params: vec4<f32>,   // x = pixel_cone (world radius/unit-dist/pixel), y = cubic_band, zw unused
+    march_params: vec4<f32>,   // x = pixel_cone (world radius/unit-dist/pixel), y = cubic_band, z = over_relax, w unused
     lod_params: vec4<f32>,     // x = lod_count, y = ring_bricks, z = base voxel_size, w = cell_stride
 };
 
@@ -99,6 +99,10 @@ fn pixel_cone() -> f32 { return camera.march_params.x; }
 // cubic for a crisp near silhouette. Outside it (or at coarse LOD) the march sphere-traces
 // the conservative field.
 fn cubic_band() -> f32 { return camera.march_params.y; }
+// Sphere-trace over-relaxation factor (Keinert 2014): the march steps `over_relax * d`
+// instead of `d`, with a safe fallback when consecutive unbounding spheres separate.
+// 1.0 = plain sphere tracing; (1,2) accelerates convergence on grazing rays.
+fn over_relax() -> f32 { return camera.march_params.z; }
 
 // --- LOD clipmap / chunk accessors ---
 
@@ -114,9 +118,28 @@ fn voxel_size_at(lod: u32) -> f32 { return camera.lod_params.z * exp2(f32(lod));
 // World edge length of one brick at LOD `lod`.
 fn brick_world_at(lod: u32) -> f32 { return f32(cell_stride()) * voxel_size_at(lod); }
 
-// floor-divide an i32 (WGSL `/` truncates toward zero; we need Euclidean for negatives).
+// Floored division of `a` by `b` (b > 0), rounding toward negative infinity.
+//
+// Floored division of `a` by `b` (b > 0), rounding toward negative infinity.
+//
+// Avoids BOTH broken ops observed on this hardware (verified in tests/sdf_gpu_rig.rs):
+//   1. Signed `%` on a runtime negative returns the UNSIGNED result (`-109 % 7` -> 0
+//      instead of -4), so it can't be used to build a remainder.
+//   2. Float `/` has a 1-ULP error, so `i32(floor(f32(a)/f32(b)))` mis-floors exact
+//      multiples: `-49/7` computes as -7.0000001, `floor` -> -8 instead of -7.
+// Integer truncating `/` IS correct on this hardware, so: take the truncated quotient,
+// reconstruct the remainder by multiply/subtract (no `%`), and step the quotient down by
+// one when the remainder is negative (b > 0), converting truncation to floor.
 fn floor_div(a: i32, b: i32) -> i32 {
-    return i32(floor(f32(a) / f32(b)));
+    let q = a / b;              // truncated toward zero — verified correct on GPU
+    let r = a - q * b;          // remainder without the `%` operator
+    return select(q, q - 1, r < 0);  // floor: step down when remainder is negative (b > 0)
+}
+
+// Euclidean remainder of `a` by `b` (b > 0): always in [0, b). Built from `floor_div`
+// (multiply/subtract), so it never touches the signed `%` operator.
+fn euclid_mod(a: i32, b: i32) -> i32 {
+    return a - floor_div(a, b) * b;
 }
 
 // Absolute 64-bit CHUNK key for the chunk containing brick `coord` at `lod` — mirrors
@@ -137,8 +160,8 @@ fn abs_chunk_key(coord: vec3<i32>, lod: u32) -> vec2<u32> {
 fn local_brick_index(coord: vec3<i32>) -> u32 {
     let s = cell_stride();
     let c = CHUNK_BRICKS;
-    let lx = ((floor_div(coord.x, s) % c) + c) % c;
-    let ly = ((floor_div(coord.y, s) % c) + c) % c;
-    let lz = ((floor_div(coord.z, s) % c) + c) % c;
+    let lx = euclid_mod(floor_div(coord.x, s), c);
+    let ly = euclid_mod(floor_div(coord.y, s), c);
+    let lz = euclid_mod(floor_div(coord.z, s), c);
     return u32(lz * c * c + ly * c + lx);
 }

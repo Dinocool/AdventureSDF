@@ -38,10 +38,14 @@ emath = "0.33"
 bytemuck = "1"
 
 [dev-dependencies]
-naga = "27"
+# spv-out: emit SPIR-V from naga in tests so we can inspect which opcode signed `%`
+# lowers to (OpUMod vs OpSRem) — root-cause evidence for the negative-modulo divergence.
+naga = { version = "27", features = ["spv-out", "wgsl-in"] }
 # Composes #import-based WGSL modules so the shader-validation test can resolve the
 # split sdf shader the same way Bevy's ShaderCache does at runtime.
 naga_oil = "0.20"
+# block_on for the GPU compute rig (tests/sdf_gpu_rig.rs) — run real WGSL, read back buffers.
+futures-lite = "2"
 
 [profile.dev]
 opt-level = 1

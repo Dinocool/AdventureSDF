@@ -20,6 +20,7 @@
     CHUNK_BRICKS,
     abs_chunk_key,
     local_brick_index,
+    euclid_mod,
 }
 
 // --- Brick coordinate helpers ---
@@ -31,6 +32,13 @@ fn brick_stride() -> i32 {
     return i32(camera.grid_dims.z) - 1;
 }
 
+// Stride-align a voxel coord to its brick origin: subtract the euclidean remainder so the
+// origin is the largest multiple of `s` that is <= coord. This is `floor(coord/s)*s` WITHOUT
+// any division — `coord - euclid_mod(coord, s)`.
+fn brick_snap(coord: i32, s: i32) -> i32 {
+    return coord - euclid_mod(coord, s);
+}
+
 // Brick origin coord (stride-aligned voxel coords on LOD `lod`'s lattice, anchored at
 // world 0) containing `world_pos`. `floor` + Euclidean snap so the lattice is
 // continuous through the origin — mirrors SdfGridConfig::world_to_brick_lod.
@@ -38,11 +46,10 @@ fn world_to_brick_lod(world_pos: vec3<f32>, lod: u32) -> vec3<i32> {
     let s = cell_stride();
     let vs = voxel_size_at(lod);
     let vox = vec3<i32>(floor(world_pos / vs));
-    // div_euclid for negative coords: floor(vox / s) * s.
     let snapped = vec3<i32>(
-        i32(floor(f32(vox.x) / f32(s))) * s,
-        i32(floor(f32(vox.y) / f32(s))) * s,
-        i32(floor(f32(vox.z) / f32(s))) * s,
+        brick_snap(vox.x, s),
+        brick_snap(vox.y, s),
+        brick_snap(vox.z, s),
     );
     return snapped;
 }
@@ -73,10 +80,21 @@ fn key_cmp(a_hi: u32, a_lo: u32, b_hi: u32, b_lo: u32) -> i32 {
     return 0;
 }
 
-// Binary search the sorted chunk table for the chunk with key (key_hi,key_lo). Returns
-// its index, or -1 if absent. `count` = camera.grid_dims.w (resident chunk count).
+// Find the chunk table index whose key matches (key_hi,key_lo), or -1 if absent.
+// `count` = camera.grid_dims.w (resident chunk count). Normally a binary search over the
+// sorted table; SDF_LINEAR_CHUNK_SEARCH forces a brute-force linear scan (diagnostic — if
+// that fixes a bug, the cause is the binary search / table sortedness / the count bound).
 fn find_chunk(key_hi: u32, key_lo: u32) -> i32 {
     let count = i32(camera.grid_dims.w);
+#ifdef SDF_LINEAR_CHUNK_SEARCH
+    for (var i: i32 = 0; i < count; i = i + 1) {
+        let e = chunk_buf[u32(i)];
+        if (e.key_hi == key_hi && e.key_lo == key_lo) {
+            return i;
+        }
+    }
+    return -1;
+#else
     var lo: i32 = 0;
     var hi: i32 = count - 1;
     while (lo <= hi) {
@@ -88,22 +106,14 @@ fn find_chunk(key_hi: u32, key_lo: u32) -> i32 {
         else { hi = mid - 1; }
     }
     return -1;
+#endif
 }
 
-// Resolve the baked brick at `coord` on LOD `lod` via its chunk: find the chunk, test
-// the occupancy bit for the brick's local slot, and if present index into the chunk's
-// packed tile run (popcount of mask bits below the slot gives the offset).
-fn find_brick_lookup(coord: vec3<i32>, lod: u32) -> BrickLocation {
-    let count = u32(camera.grid_dims.w);
-    if (count == 0u) {
-        return BrickLocation(0u, vec4<u32>(PALETTE_EMPTY), false);
-    }
-    let key = abs_chunk_key(coord, lod);
-    let ci = find_chunk(key.x, key.y);
-    if (ci < 0) {
-        return BrickLocation(0u, vec4<u32>(PALETTE_EMPTY), false);
-    }
-    let chunk = chunk_buf[u32(ci)];
+// Resolve the brick at `coord` WITHIN an already-found chunk: test the occupancy bit for
+// the brick's local slot, and if present index into the chunk's packed tile run (popcount
+// of mask bits below the slot gives the offset). Split out of `find_brick_lookup` so the
+// cached march resolve can reuse it after its own (cached) chunk search.
+fn brick_in_chunk(chunk: ChunkLookup, coord: vec3<i32>) -> BrickLocation {
     let li = local_brick_index(coord);   // 0..63
 
     // Occupancy bit test (mask split across two u32). Bit li set ⇒ brick resident.
@@ -127,6 +137,21 @@ fn find_brick_lookup(coord: vec3<i32>, lod: u32) -> BrickLocation {
     let off = countOneBits(below_lo) + countOneBits(below_hi);
     let tile = chunk_tile_buf[chunk.tile_run_base + off];
     return BrickLocation(tile.atlas_base, unpack_palette(tile.pal_lo, tile.pal_hi), true);
+}
+
+// Resolve the baked brick at `coord` on LOD `lod` via its chunk: find the chunk, then test
+// the occupancy bit / index the tile run via `brick_in_chunk`.
+fn find_brick_lookup(coord: vec3<i32>, lod: u32) -> BrickLocation {
+    let count = u32(camera.grid_dims.w);
+    if (count == 0u) {
+        return BrickLocation(0u, vec4<u32>(PALETTE_EMPTY), false);
+    }
+    let key = abs_chunk_key(coord, lod);
+    let ci = find_chunk(key.x, key.y);
+    if (ci < 0) {
+        return BrickLocation(0u, vec4<u32>(PALETTE_EMPTY), false);
+    }
+    return brick_in_chunk(chunk_buf[u32(ci)], coord);
 }
 
 // --- Sample brick SDF via trilinear interpolation ---
@@ -182,9 +207,16 @@ fn sample_mat_tex(base_u: u32, i0: vec3<i32>, f: vec3<f32>) -> vec4<f32> {
 // set), sampling the brick at LOD `lod`. `.x..w` correspond to palette slots 0..3.
 fn load_material_distances(base_u: u32, world_pos: vec3<f32>, lod: u32) -> vec4<f32> {
     let voxel_size = voxel_size_at(lod);
-    let stride_f = f32(cell_stride());
+    let s = cell_stride();
     let voxel_f = world_pos / voxel_size;
-    let brick_origin_voxel = floor(voxel_f / stride_f) * stride_f;
+    // Brick origin via the SAME exact integer floor-div as world_to_brick_lod — a float
+    // `floor(voxel_f/stride)*stride` mis-snaps brick-boundary points (apron collapse).
+    let vox = vec3<i32>(floor(voxel_f));
+    let brick_origin_voxel = vec3<f32>(
+        f32(brick_snap(vox.x, s)),
+        f32(brick_snap(vox.y, s)),
+        f32(brick_snap(vox.z, s)),
+    );
     let local_f = voxel_f - brick_origin_voxel;
     let i0 = vec3<i32>(floor(local_f));
     let f = local_f - floor(local_f);
@@ -227,9 +259,17 @@ fn sample_brick_sdf(base_u: u32, world_pos: vec3<f32>, lod: u32) -> f32 {
     // corner and the sub-voxel fraction used for trilinear interpolation.
     // Brick stride is `stride` cells; sample `stride` (the apron) is shared with
     // the neighbour, so local coords stay in [0, stride) and i0+1 never exceeds it.
-    let stride_f = f32(cell_stride());
+    let s = cell_stride();
     let voxel_f = world_pos / voxel_size;
-    let brick_origin_voxel = floor(voxel_f / stride_f) * stride_f;
+    // Brick origin via exact integer floor-div (matches world_to_brick_lod). A float
+    // `floor(voxel_f/stride)*stride` rounds brick-boundary points one brick too low →
+    // local index 7 (apron) → trilinear corners collapse onto the apron → seam fragments.
+    let vox = vec3<i32>(floor(voxel_f));
+    let brick_origin_voxel = vec3<f32>(
+        f32(brick_snap(vox.x, s)),
+        f32(brick_snap(vox.y, s)),
+        f32(brick_snap(vox.z, s)),
+    );
     let local_f = voxel_f - brick_origin_voxel;      // [0, stride)
 
     let i0 = vec3<i32>(floor(local_f));
@@ -260,7 +300,11 @@ fn sample_brick_sdf(base_u: u32, world_pos: vec3<f32>, lod: u32) -> f32 {
 // the LOD it was found at (via `out_lod`). Misses (`found == false`) when no LOD has a
 // brick here (empty space).
 fn find_brick_at(world_pos: vec3<f32>, out_lod: ptr<function, u32>) -> BrickLocation {
+#ifdef SDF_DISABLE_LOD
+    let levels = 1u;                 // diagnostic: LOD 0 only (match resolve_march)
+#else
     let levels = lod_count();
+#endif
     for (var lod = 0u; lod < levels; lod = lod + 1u) {
         let coord = world_to_brick_lod(world_pos, lod);
         let loc = find_brick_lookup(coord, lod);
@@ -271,24 +315,6 @@ fn find_brick_at(world_pos: vec3<f32>, out_lod: ptr<function, u32>) -> BrickLoca
     }
     *out_lod = 0u;
     return BrickLocation(0u, vec4<u32>(PALETTE_EMPTY), false);
-}
-
-// The finest LOD with a resident CHUNK at `world_pos` (whether or not the specific brick
-// is occupied). This is the resolution at which a brick *could* exist at `p`, so the
-// empty-space DDA must step by THIS LOD's brick size — never coarser, or it would jump
-// over a thin baked surface near the camera (the "gaps in objects" bug). Near the camera
-// LOD 0's chunk is resident → small steps; far out only coarse chunks reach `p` → big
-// steps. Returns the coarsest LOD if no chunk covers `p`.
-fn finest_lod_window_at(world_pos: vec3<f32>) -> u32 {
-    let levels = lod_count();
-    for (var lod = 0u; lod < levels; lod = lod + 1u) {
-        let coord = world_to_brick_lod(world_pos, lod);
-        let key = abs_chunk_key(coord, lod);
-        if (find_chunk(key.x, key.y) >= 0) {
-            return lod;
-        }
-    }
-    return levels - 1u;
 }
 
 // Trilinear SDF at any world position, resolving the brick by finest-LOD lookup.
@@ -341,6 +367,98 @@ fn scene_sdf(p: vec3<f32>) -> SceneSdfResult {
     return SceneSdfResult(d, pick.id, pick.id_b, pick.gap, true, lod, loc.atlas_base, loc.palette);
 }
 
+// --- Cached march resolve (per-ray accessor) ---
+//
+// The raymarch loop resolves the scene every step. Resolving the brick AND the empty-space
+// window LOD separately walks the LODs twice and binary-searches the chunk table on every
+// probe. `resolve_march` does it in ONE coarse→fine walk and memoises the chunk
+// search through a per-ray `ChunkCache`: a marching ray stays in the same chunk for many
+// consecutive steps, so the dominant (serving) chunk probe becomes O(1). Shading/normal
+// paths still use the plain `scene_sdf`/`sample_sdf_world` (called once at the hit, not in
+// the loop), so they are unaffected.
+
+// Per-LOD memo of the last `find_chunk` query (key → table index, hit OR miss). Per-LOD
+// (not single-entry) because each resolve probes one chunk key PER LOD; a single entry
+// would be overwritten within a step. A marching ray stays in the same chunk at each LOD
+// for many consecutive steps, so each LOD's probe becomes O(1) until it crosses that LOD's
+// chunk boundary. `MAX_LODS` bounds the array; lod_count() <= this (DEFAULT_LOD_COUNT = 8).
+const MAX_LODS: u32 = 8u;
+
+struct ChunkCache {
+    key_hi: array<u32, MAX_LODS>,
+    key_lo: array<u32, MAX_LODS>,
+    index: array<i32, MAX_LODS>,
+    valid: array<bool, MAX_LODS>,
+};
+
+fn new_chunk_cache() -> ChunkCache {
+    var c: ChunkCache;
+    for (var i = 0u; i < MAX_LODS; i = i + 1u) {
+        c.valid[i] = false;
+    }
+    return c;
+}
+
+fn find_chunk_cached(lod: u32, key_hi: u32, key_lo: u32, cache: ptr<function, ChunkCache>) -> i32 {
+#ifndef SDF_DISABLE_CHUNK_CACHE
+    if ((*cache).valid[lod] && (*cache).key_hi[lod] == key_hi && (*cache).key_lo[lod] == key_lo) {
+        return (*cache).index[lod];
+    }
+#endif
+    let ci = find_chunk(key_hi, key_lo);
+    (*cache).valid[lod] = true;
+    (*cache).key_hi[lod] = key_hi;
+    (*cache).key_lo[lod] = key_lo;
+    (*cache).index[lod] = ci;
+    return ci;
+}
+
+// Everything the march loop needs from one resolve at `p`. `in_brick` false ⇒ empty space;
+// `window_lod` is then the finest LOD with a resident chunk at `p` (the DDA step scale),
+// or the coarsest LOD if none. On a hit, `lod` is the serving (finest occupied) LOD.
+struct MarchSample {
+    dist: f32,
+    in_brick: bool,
+    window_lod: u32,
+    lod: u32,
+    atlas_base: u32,
+    palette: vec4<u32>,
+};
+
+// One fine→coarse walk: capture the finest resident-chunk LOD (window) and return at the
+// finest OCCUPIED brick (matching `find_brick_at` semantics — a coarse brick still shows
+// through where a finer chunk is resident-but-empty). Uses the cached chunk search.
+fn resolve_march(p: vec3<f32>, cache: ptr<function, ChunkCache>) -> MarchSample {
+#ifdef SDF_DISABLE_LOD
+    let levels = 1u;                 // diagnostic: LOD 0 only
+#else
+    let levels = lod_count();
+#endif
+    let count = u32(camera.grid_dims.w);
+    var window_lod = levels - 1u;
+    var has_window = false;
+
+    if (count != 0u) {
+        for (var lod = 0u; lod < levels; lod = lod + 1u) {
+            let coord = world_to_brick_lod(p, lod);
+            let key = abs_chunk_key(coord, lod);
+            let ci = find_chunk_cached(lod, key.x, key.y, cache);
+            if (ci >= 0) {
+                if (!has_window) {
+                    window_lod = lod;
+                    has_window = true;
+                }
+                let loc = brick_in_chunk(chunk_buf[u32(ci)], coord);
+                if (loc.found) {
+                    let d = sample_brick_sdf(loc.atlas_base, p, lod);
+                    return MarchSample(d, true, window_lod, lod, loc.atlas_base, loc.palette);
+                }
+            }
+        }
+    }
+    return MarchSample(1e10, false, window_lod, 0u, 0u, vec4<u32>(PALETTE_EMPTY));
+}
+
 // Distance along the ray to the far side of the brick containing `p`, at LOD `lod`.
 // Used for empty-space skipping (DDA-style): when `p` is in an unbaked brick, advance
 // the ray to the next brick boundary instead of taking an infinite step. The lattice
@@ -364,21 +482,6 @@ fn dist_to_brick_exit_lod(p: vec3<f32>, dir: vec3<f32>, lod: u32) -> f32 {
         }
     }
     return t;
-}
-
-// Empty-space advance for a point in no baked brick: step to the far face of the brick
-// at the FINEST LOD window covering `p`. Using the finest covering resolution (not the
-// coarsest) guarantees the step never overshoots a thin baked surface near the camera,
-// while still taking large steps far out where only coarse rings reach. This is the
-// safe DDA floor the BVH skip builds on.
-fn dist_to_brick_exit(p: vec3<f32>, dir: vec3<f32>) -> f32 {
-    return dist_to_brick_exit_lod(p, dir, finest_lod_window_at(p));
-}
-
-// Voxel size at the finest LOD window covering `p` — the right scale for the
-// post-advance epsilon nudge so it clears the brick boundary without overshooting.
-fn step_voxel_at(p: vec3<f32>) -> f32 {
-    return voxel_size_at(finest_lod_window_at(p));
 }
 
 // --- Surface normal from the trilinear gradient ---

@@ -63,7 +63,8 @@ struct SdfCameraData {
     grid_origin: Vec4,   // xyz = grid origin, w = voxel_size
     grid_dims: Vec4, // x = grid_size, y = bricks_per_axis, z = brick_size (8.0), w = num_lookups
     debug_params: Vec4, // x = max_steps, y = max_dist, z = sdf_eps, w = unused
-    /// x = pixel_cone (world radius per unit ray distance per pixel), y = cubic_band, zw unused.
+    /// x = pixel_cone (world radius per unit ray distance per pixel), y = cubic_band,
+    /// z = over_relax, w unused.
     march_params: Vec4,
     /// x = lod_count, y = ring_bricks, z = base voxel_size, w = cell_stride.
     lod_params: Vec4,
@@ -207,6 +208,7 @@ struct ExtractedTextureLibrary {
 
 // --- Pipeline ---
 
+// BISECT: minimal shader while building features back up after the division-free fix.
 const SDF_SHADER_PATH: &str = "shaders/sdf_raymarch.wgsl";
 
 #[derive(Resource)]
@@ -502,6 +504,9 @@ fn prepare_sdf_camera_data(
     raymarch: Res<super::SdfRaymarchParams>,
     registry: Res<super::edits::MaterialRegistry>,
     mut material_table: ResMut<SdfMaterialTable>,
+    // ISOLATION: live box transform for the analytic-box min shader. Packed into
+    // grid_origin (unused by the min shader's analytic scene_dist) so dragging works.
+    boxes: Query<(&Transform, &super::edits::SdfPrimitive), With<super::SdfVolume>>,
 ) {
     // The GPU material table mirrors the global registry verbatim: row i = the
     // material with global id i. Bricks index it by their palette ids. Rebuilt only
@@ -531,6 +536,17 @@ fn prepare_sdf_camera_data(
     let bpa = config.bricks_per_axis();
     let grid_size = config.grid_size;
 
+    // ISOLATION: pull the live box center + half-extent for the analytic-box min shader.
+    let (box_center, box_half) = boxes
+        .iter()
+        .find_map(|(t, prim)| match prim {
+            super::edits::SdfPrimitive::Box { half_extents } => {
+                Some((t.translation, half_extents.x))
+            }
+            _ => None,
+        })
+        .unwrap_or((Vec3::ZERO, 1.0));
+
     for (entity, camera, transform) in &cameras {
         let view_from_world = transform.to_matrix().inverse();
         let clip_from_world = camera.clip_from_view() * view_from_world;
@@ -554,12 +570,8 @@ fn prepare_sdf_camera_data(
             clip_from_world,
             camera_pos: transform.translation.extend(0.0),
             screen_params: Vec4::new(size.x as f32, size.y as f32, 0.0, 0.0),
-            grid_origin: Vec4::new(
-                config.world_origin().x,
-                config.world_origin().y,
-                config.world_origin().z,
-                config.voxel_size,
-            ),
+            // ISOLATION: xyz = live box center, w = half-extent (analytic-box min shader).
+            grid_origin: box_center.extend(box_half),
             grid_dims: Vec4::new(
                 grid_size as f32,
                 bpa as f32,
@@ -579,7 +591,7 @@ fn prepare_sdf_camera_data(
             march_params: Vec4::new(
                 pixel_cone,
                 raymarch.cubic_band,
-                0.0,
+                raymarch.over_relax,
                 0.0,
             ),
             lod_params: Vec4::new(
@@ -750,9 +762,6 @@ fn extract_sdf_atlas(
     let required_rows = atlas.tiles.high_water().div_ceil(ATLAS_TILES_PER_ROW).max(1);
     let texture_height = required_rows * edge;
 
-    // Build the sorted chunk lookup table + packed per-chunk brick runs from the
-    // resident bricks. Absolute chunk keys (no ring origin) → CPU/GPU agree by
-    // construction. `chunk::build_chunk_tables` owns the grouping + sort.
     let tables = super::chunk::build_chunk_tables(&atlas, &config, |key| {
         let tile = atlas
             .tiles
