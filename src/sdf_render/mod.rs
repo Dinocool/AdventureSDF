@@ -153,10 +153,11 @@ pub struct SdfRaymarchParams {
     /// Sphere-trace over-relaxation factor (Keinert 2014). The march steps `over_relax · d`
     /// with a safe fallback when consecutive unbounding spheres separate, converging on
     /// grazing rays in fewer steps. 1.0 = plain sphere tracing; (1,2) accelerates. Default
-    /// 1.8: measured (tests/sdf_march_sim.rs) ~40% fewer steps on grazing-MISS rays (the slow
+    /// 1.6: measured (tests/sdf_march_sim.rs) big step cut on grazing-MISS rays (the slow
     /// tangent-band crawl) with zero hit↔miss flips — the fallback undoes any overshoot on
     /// hits, and the cross-fade shell forces ω=1 where the blended field is non-eikonal.
-    /// Near the ω<2 overlapping-sphere safety ceiling; gains flatten past 1.8.
+    /// (1.8 cut more in the sim but showed visual artifacts on the real scene, so backed off
+    /// to 1.6 for margin below the ω<2 overlapping-sphere safety ceiling.)
     pub over_relax: f32,
     /// LOD cross-fade band width, as a fraction of each clipmap ring's half-extent. In the
     /// outer `lod_blend_band` shell of a ring the marched field is `mix`-faded from the
@@ -176,7 +177,7 @@ impl Default for SdfRaymarchParams {
             sdf_eps: 0.001,
             cone_scale: 1.0,
             cubic_band: 0.5,
-            over_relax: 1.8,
+            over_relax: 1.6,
             lod_blend_band: 0.2,
         }
     }
