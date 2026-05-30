@@ -451,110 +451,88 @@ fn setup_sdf_scene(
         SceneEntity,
     ));
 
-    // --- Clipmap LOD test scene: km-scale heightmap terrain + scattered pillars ---
-    //
-    // A large noise heightmap is the base terrain (Union, order 0). Cube pillars are
-    // sparsely scattered across it (deterministic from a hash), each topped by a sphere
-    // of a DIFFERENT material than the pillar, so the LOD rings and material handling
-    // are both visible as the camera moves out across the terrain.
-    let terrain_mats = [mat_sand, mat_ground, mat_ground2];
-    let pillar_mats = [mat_cobble, mat_cobble2];
-    let sphere_mats = [mat_ground2, mat_sand, mat_cobble];
+    // Demo gallery: a wide, flat sand "ground plane" cube with a spread of distinct
+    // primitives resting on its top surface. All plain unions (no subtracts). The
+    // plane is centred so its top face sits at y = 0; each object's centre is then
+    // placed at y = its half-height so it rests exactly on the surface.
+    // (order, transform, primitive, material)
+    const PLANE_HALF_Y: f32 = 0.15; // thin slab → reads like a plane
+    let demo: [(u32, Transform, SdfPrimitive, u32); 7] = [
+        // Ground plane: wide + thin, top face at y = 0 (centre at y = -half_y).
+        (
+            0,
+            Transform::from_xyz(0.0, -PLANE_HALF_Y, 0.0),
+            SdfPrimitive::Box {
+                half_extents: Vec3::new(4.0, PLANE_HALF_Y, 3.0),
+            },
+            mat_sand,
+        ),
+        // Box resting on the plane (half-height 0.4 → centre at y = 0.4).
+        (
+            1,
+            Transform::from_xyz(-2.4, 0.4, 0.4),
+            SdfPrimitive::Box {
+                half_extents: Vec3::splat(0.4),
+            },
+            mat_cobble,
+        ),
+        (
+            2,
+            Transform::from_xyz(-1.1, 0.55, -0.3),
+            SdfPrimitive::Sphere { radius: 0.55 },
+            mat_cobble2,
+        ),
+        // Torus lies flat: its half-thickness above centre is `minor` (0.18).
+        (
+            3,
+            Transform::from_xyz(0.2, 0.18, 0.5),
+            SdfPrimitive::Torus {
+                major: 0.5,
+                minor: 0.18,
+            },
+            mat_ground,
+        ),
+        // Capsule standing up: half-height + radius above centre.
+        (
+            4,
+            Transform::from_xyz(1.3, 0.68, -0.4),
+            SdfPrimitive::Capsule {
+                half_height: 0.4,
+                radius: 0.28,
+            },
+            mat_ground2,
+        ),
+        // Cylinder standing up: half-height above centre.
+        (
+            5,
+            Transform::from_xyz(2.4, 0.5, 0.3),
+            SdfPrimitive::Cylinder {
+                radius: 0.4,
+                half_height: 0.5,
+            },
+            mat_cobble,
+        ),
+        (
+            6,
+            Transform::from_xyz(0.6, 0.45, -1.1),
+            SdfPrimitive::Sphere { radius: 0.45 },
+            mat_ground,
+        ),
+    ];
 
-    let union = || SdfOp {
-        kind: CsgKind::Union,
-        smoothing: 0.0,
-    };
-
-    let mut order = 0u32;
-    let mut spawn_edit =
-        |commands: &mut Commands, transform: Transform, prim: SdfPrimitive, registry_id: u32| {
-            commands.spawn((
-                transform,
-                prim,
-                union(),
-                SdfOrder(order),
-                SdfMaterial { registry_id },
-                SdfVolume,
-                SceneEntity,
-            ));
-            order += 1;
-        };
-
-    // Base terrain: a wide heightmap. half_xz spans hundreds of metres so the clipmap
-    // rings have far terrain to coarsen. The field is a vertical-distance approximation
-    // (valid when densely sampled, which the fine LODs near the camera guarantee).
-    const TERRAIN_HALF_XZ: f32 = 400.0;
-    spawn_edit(
-        &mut commands,
-        Transform::from_xyz(0.0, 0.0, 0.0),
-        SdfPrimitive::Heightmap {
-            half_xz: Vec2::splat(TERRAIN_HALF_XZ),
-            max_height: 40.0,
-            freq: 0.02,
-            amp: 18.0,
-            seed: 1337,
-        },
-        terrain_mats[0],
-    );
-
-    // Sparse pillars on a jittered grid. Deterministic pseudo-random from a small
-    // integer hash so the scene is stable across runs. Each pillar is a tall thin box;
-    // a sphere of a different material caps it.
-    let hash = |x: i32, z: i32, salt: u32| -> f32 {
-        let mut h = (x as u32).wrapping_mul(73856093)
-            ^ (z as u32).wrapping_mul(19349663)
-            ^ salt.wrapping_mul(83492791);
-        h ^= h >> 13;
-        h = h.wrapping_mul(0x5bd1e995);
-        h ^= h >> 15;
-        (h & 0xffff) as f32 / 65535.0 // [0,1)
-    };
-    let terrain_h = |x: f32, z: f32| -> f32 {
-        // Mirror the Heightmap primitive's vertical field closely enough to seat the
-        // pillars on the surface (value-noise * amp). Exact placement isn't critical —
-        // pillars sink slightly into / rise above terrain, both fine for the demo.
-        let n = (x * 0.02).sin() * (z * 0.02).cos();
-        n * 18.0
-    };
-
-    const GRID: i32 = 6; // pillars on a -GRID..=GRID grid (jittered), pruned by density
-    const SPACING: f32 = 22.0;
-    for gz in -GRID..=GRID {
-        for gx in -GRID..=GRID {
-            // ~45% of cells get a pillar — sparse scatter.
-            if hash(gx, gz, 7) > 0.45 {
-                continue;
-            }
-            let jitter_x = (hash(gx, gz, 11) - 0.5) * SPACING * 0.6;
-            let jitter_z = (hash(gx, gz, 13) - 0.5) * SPACING * 0.6;
-            let x = gx as f32 * SPACING + jitter_x;
-            let z = gz as f32 * SPACING + jitter_z;
-            let base_y = terrain_h(x, z);
-
-            let pillar_h = 4.0 + hash(gx, gz, 17) * 6.0; // 4..10 m tall
-            let pillar_half = Vec3::new(1.2, pillar_h * 0.5, 1.2);
-            let pillar_cy = base_y + pillar_half.y;
-            let pi = ((gx + gz).rem_euclid(pillar_mats.len() as i32)) as usize;
-            spawn_edit(
-                &mut commands,
-                Transform::from_xyz(x, pillar_cy, z),
-                SdfPrimitive::Box {
-                    half_extents: pillar_half,
-                },
-                pillar_mats[pi],
-            );
-
-            // Sphere cap, different material, resting on the pillar top.
-            let sphere_r = 1.8;
-            let si = ((gx + gz + 1).rem_euclid(sphere_mats.len() as i32)) as usize;
-            spawn_edit(
-                &mut commands,
-                Transform::from_xyz(x, base_y + pillar_h + sphere_r * 0.5, z),
-                SdfPrimitive::Sphere { radius: sphere_r },
-                sphere_mats[si],
-            );
-        }
+    for (order, transform, prim, registry_id) in demo {
+        commands.spawn((
+            transform,
+            prim,
+            SdfOp {
+                kind: CsgKind::Union,
+                smoothing: 0.0,
+            },
+            SdfOrder(order),
+            SdfMaterial { registry_id },
+            SdfVolume,
+            SceneEntity,
+        ));
     }
 
     // Directional light so 3D geometry (and debug wireframes) are visible.
