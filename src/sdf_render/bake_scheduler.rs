@@ -78,6 +78,10 @@ pub struct BakeScheduler {
     /// Snapshot of the current edits + BVH handed to bake tasks (cheap Arc clone).
     edits: Arc<Vec<edits::ResolvedEdit>>,
     bvh: Arc<bvh::Bvh>,
+    /// Decoded height maps for bake-time displacement, snapshotted alongside edits/BVH so
+    /// async bake tasks can sample it. Rebuilt when the material registry's displacement
+    /// columns change (see `update_height_field`).
+    height: super::height::SharedHeightField,
     /// Per-LOD chunk-ring origin currently resident (index = lod), in chunk coords. Used
     /// to diff which chunks entered/exited as the camera moves. Empty until first run.
     ring_chunk_origin: Vec<IVec3>,
@@ -93,10 +97,25 @@ impl Default for BakeScheduler {
             edit_epoch: 0,
             edits: Arc::new(Vec::new()),
             bvh: Arc::new(bvh::Bvh::default()),
+            height: Arc::new(super::height::HeightField::default()),
             ring_chunk_origin: Vec::new(),
             pending: std::collections::HashSet::new(),
             inflight: Vec::new(),
         }
+    }
+}
+
+impl BakeScheduler {
+    /// Replace the height-field snapshot used by subsequent bakes (rebuilt when the material
+    /// registry's displacement columns change). Async tasks clone the `Arc`.
+    pub fn set_height(&mut self, height: super::height::SharedHeightField) {
+        self.height = height;
+    }
+
+    /// The current height-field snapshot (for the synchronous diagnostic bake, which baked
+    /// off the scheduler's edits/bvh too).
+    pub fn height_field(&self) -> &super::height::HeightField {
+        &self.height
     }
 }
 
@@ -399,7 +418,7 @@ pub fn schedule_bakes(
         let mut applied = false;
         for ck in &drained {
             for key in chunk_brick_keys(*ck, &config) {
-                match SdfAtlas::bake_brick(key, &sched.edits, &sched.bvh, &config) {
+                match SdfAtlas::bake_brick(key, &sched.edits, &sched.bvh, &config, &sched.height) {
                     Some(brick) => {
                         atlas.insert_brick(key, brick);
                         applied = true;
@@ -426,11 +445,12 @@ pub fn schedule_bakes(
         }
         let edits = Arc::clone(&sched.edits);
         let bvh_snapshot = Arc::clone(&sched.bvh);
+        let height = Arc::clone(&sched.height);
         let cfg = config.clone();
         let task = pool.spawn(async move {
             keys.into_iter()
                 .map(|key| {
-                    let baked = SdfAtlas::bake_brick(key, &edits, &bvh_snapshot, &cfg);
+                    let baked = SdfAtlas::bake_brick(key, &edits, &bvh_snapshot, &cfg, &height);
                     (key, baked)
                 })
                 .collect::<Vec<_>>()
@@ -593,7 +613,7 @@ mod tests {
                 self.pending.remove(&ck);
                 let results: Vec<_> = chunk_brick_keys(ck, cfg)
                     .into_iter()
-                    .map(|bk| (bk, SdfAtlas::bake_brick(bk, edits, bvh, cfg)))
+                    .map(|bk| (bk, SdfAtlas::bake_brick(bk, edits, bvh, cfg, &super::super::height::HeightField::default())))
                     .collect();
                 self.inflight.push_back((ck, results));
             }
@@ -607,7 +627,7 @@ mod tests {
             for ck in take {
                 let results: Vec<_> = chunk_brick_keys(ck, cfg)
                     .into_iter()
-                    .map(|bk| (bk, SdfAtlas::bake_brick(bk, edits, bvh, cfg)))
+                    .map(|bk| (bk, SdfAtlas::bake_brick(bk, edits, bvh, cfg, &super::super::height::HeightField::default())))
                     .collect();
                 self.inflight.push_back((ck, results));
             }
@@ -714,7 +734,7 @@ mod tests {
 
         // The payoff: byte-identical to a fresh full_bake at the final camera.
         let mut reference = SdfAtlas::default();
-        reference.full_bake(&edits, &bvh, &cfg, final_cam);
+        reference.full_bake(&edits, &bvh, &cfg, &super::super::height::HeightField::default(), final_cam);
         let inc: HashSet<_> = atlas.bricks.keys().copied().collect();
         let refk: HashSet<_> = reference.bricks.keys().copied().collect();
         assert_eq!(inc, refk, "async emulation diverged from full_bake (stale/missing bricks)");

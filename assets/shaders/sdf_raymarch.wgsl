@@ -32,7 +32,6 @@
 #import sdf::cubic::{build_cell_cubic, solve_cell_cubic, dist_to_cell_exit}
 #import sdf::pbr::{resolve_surface, shade_surface, shade_material_env, sun_dir, PbrInputs}
 #import sdf::sky::sky_color
-#import sdf::material::{relief_depth, relief_height_plane, relief_axis}
 
 // --- Raymarching ---
 
@@ -52,83 +51,6 @@ struct RaymarchResult {
     // Surfaced for the SDF_DEBUG_LOD overlay so the per-pixel blend band is visible.
     blend_w: f32,
 };
-
-// --- True relief displacement (SDF_DISPLACE), helpers used by the march loop ---------
-//
-// Real displacement that CHANGES THE SILHOUETTE. The relief-displace path only moves an
-// existing envelope hit inward, so a peak can never poke past the smooth surface — silhouette
-// pixels are rays that MISS the envelope, and that path never runs there. This marches the
-// DISPLACED field g(p) = envelope_d(p) - (H(p)-0.5)·depth (IQ opDisplace) through the near-band
-// INSIDE the primary loop: a ray passing just outside the envelope but within `depth` hits a
-// peak there (g < 0) → the outline gains real bumps. g is non-Euclidean, so we take fixed
-// sub-`depth` steps with capped iterations, bounded to the band — and the whole thing is behind
-// #ifdef SDF_DISPLACE, so the default pipeline is byte-identical.
-struct DetailHit { pos: vec3<f32>, n: vec3<f32>, hit: bool };
-
-// Cheap pre-gate band (world units): the largest relief the per-material depth slider can
-// produce, ×1.5 (the inner band factor). The detail-march hand-off only even resolves the
-// material once the envelope distance is within this, so the common near-surface path pays
-// nothing. Must cover slider_max (0.4) × 1.5.
-const RELIEF_MAX_BAND: f32 = 0.6;
-
-// Shading normal at a displaced point: tilt the envelope normal by the in-plane height slope.
-// Two single-plane taps (the dominant axis' two in-plane world directions), not the 6-tap 3D
-// gradient — the relief lives in the plane, so the out-of-plane axis carries no slope.
-fn relief_normal(id: u32, p: vec3<f32>, env_n: vec3<f32>, axis: u32, depth: f32, lod: f32) -> vec3<f32> {
-    // In-plane world basis for the dominant axis (matches relief_height_plane's uv pairing).
-    var ua = vec3<f32>(1.0, 0.0, 0.0);
-    var va = vec3<f32>(0.0, 1.0, 0.0);
-    if (axis == 0u) { ua = vec3<f32>(0.0, 0.0, 1.0); va = vec3<f32>(0.0, 1.0, 0.0); }   // zy
-    else if (axis == 1u) { ua = vec3<f32>(1.0, 0.0, 0.0); va = vec3<f32>(0.0, 0.0, 1.0); } // xz
-    let e = depth * 0.5;
-    let du = relief_height_plane(id, p + ua * e, axis, lod) - relief_height_plane(id, p - ua * e, axis, lod);
-    let dv = relief_height_plane(id, p + va * e, axis, lod) - relief_height_plane(id, p - va * e, axis, lod);
-    let slope = (ua * du + va * dv) * (depth / max(e, 1e-5));
-    return normalize(env_n - slope);
-}
-
-// Walk the relief surface forward from `p_in` (entering the band). Two cost wins over a naive
-// SDF march: (1) the envelope distance is the LOCAL TANGENT PLANE `d0 - t·cos_in` (no scene_sdf
-// in the loop — over a few texels the surface is flat), and (2) height is sampled on ONE pinned
-// plane (1 tap/step, not the 3-tap triplanar blend). A coarse fixed-count linear search brackets
-// the first crossing, then a few BINARY-SEARCH bisections refine it — so the surface is found to
-// sub-step precision regardless of `depth`, which removes the terracing/banding that a pure
-// linear march shows as displacement grows.
-fn march_relief_band(id: u32, p_in: vec3<f32>, dir: vec3<f32>, depth: f32, lod: f32) -> DetailHit {
-    let env_n = calc_normal(p_in);          // local tangent plane normal (one gradient eval)
-    let axis = relief_axis(env_n);          // pin the height plane once
-    let cos_in = max(-dot(dir, env_n), 0.15);
-    let d0 = scene_sdf(p_in).dist;          // envelope distance at band entry (one eval)
-
-    // g(t) = (d0 - t·cos_in) - (H(p_in + t·dir) - 0.5)·depth. Negative = below the relief.
-    let LINEAR = 12;
-    let span = depth * 2.0;                 // cover the ±depth shell
-    let step = span / f32(LINEAR);
-    var t_prev = 0.0;
-    var t_hit = -1.0;
-    for (var i = 1; i <= LINEAR; i = i + 1) {
-        let t = step * f32(i);
-        let p = p_in + dir * t;
-        let g = (d0 - t * cos_in) - (relief_height_plane(id, p, axis, lod) - 0.5) * depth;
-        if (g < 0.0) { t_hit = t; break; }
-        t_prev = t;
-    }
-    if (t_hit < 0.0) {
-        return DetailHit(p_in + dir * span, env_n, false);   // no crossing in the band
-    }
-    // Binary-search the bracket [t_prev, t_hit] — converges to sub-step precision, so the
-    // visible relief no longer terraces at high `depth`.
-    var lo = t_prev;
-    var hi = t_hit;
-    for (var b = 0; b < 5; b = b + 1) {
-        let tm = 0.5 * (lo + hi);
-        let pm = p_in + dir * tm;
-        let g = (d0 - tm * cos_in) - (relief_height_plane(id, pm, axis, lod) - 0.5) * depth;
-        if (g < 0.0) { hi = tm; } else { lo = tm; }
-    }
-    let hit_p = p_in + dir * (0.5 * (lo + hi));
-    return DetailHit(hit_p, relief_normal(id, hit_p, env_n, axis, depth, lod), true);
-}
 
 // Single unified raymarch. One cached resolve per step (`resolve_march` → finest resident
 // LOD + trilinear distance + tile/palette, memoising the chunk search across steps via a
@@ -218,41 +140,6 @@ fn raymarch(origin: vec3<f32>, dir: vec3<f32>) -> RaymarchResult {
         let voxel_size = voxel_size_at(lod);
         let d = scene.dist;                          // trilinear SDF at p
         let cone = CONE * t;                         // pixel-cone half-width here
-
-        // --- 1b. Relief displacement band (SDF_GPU_RELIEF, default OFF) ----------------
-        // The per-pixel A/B path. Height relief is normally BAKED into the SDF field at bake
-        // time (shadows/reflections see it free); this GPU march is compiled in only with the
-        // SDF_GPU_RELIEF shader-def. It hands off to a band march of the displaced field as the
-        // ray nears a fine-LOD height-mapped surface, so a ray passing JUST OUTSIDE the envelope
-        // can still strike a peak (silhouette bump beyond voxel resolution). Two-stage gate
-        // (cheap RELIEF_MAX_BAND pre-test, then the material's true band) keeps the cost local.
-#ifdef SDF_GPU_RELIEF
-        if (lod == 0u && d < RELIEF_MAX_BAND) {
-            let mid = pick_material(load_material_distances(scene.atlas_base, p, lod), scene.palette).id;
-            let tex_lod = clamp(log2(max(t, 1.0)) - 1.0, 0.0, 8.0);
-            let depth = relief_depth(mid, tex_lod);
-            if (depth > 0.0 && d < depth * 1.5) {
-                let dh = march_relief_band(mid, p, dir, depth, tex_lod);
-                if (dh.hit) {
-                    result.hit = true;
-                    result.dist = length(dh.pos - origin);
-                    result.object_id = mid;
-                    result.steps = steps;
-                    result.hit_pos = dh.pos;
-                    result.fate = 0u;
-                    result.lod = lod;
-                    result.atlas_base = scene.atlas_base;
-                    return result;
-                }
-                // No peak/valley met in the band → skip past it (a genuine silhouette gap;
-                // showing the smooth envelope here would defeat the displacement).
-                t += depth * 1.5;
-                prev_d = 0.0;
-                prev_step = 0.0;
-                continue;
-            }
-        }
-#endif
 
         // --- LOD cross-fade: morph L → L+1, gliding PER-PIXEL with the camera ----------
         // The serving LOD L's resident ring box is chunk-snapped (it only re-centres in
@@ -507,21 +394,10 @@ fn main(in: FullscreenVertexOutput) -> FragmentOutput {
     // raymarch, so we derive LOD analytically.) Tuned constant; clamped to a sane range.
     let lod = clamp(log2(max(rm.dist, 1.0)) - 1.0, 0.0, 8.0);
 
-    // Height-map relief (true displacement). The displaced hit position already comes from the
-    // in-loop band march; here we only re-derive the relief-tilted shading normal (the envelope
-    // normal tilted by the local height gradient) so lighting follows the bumps. A no-op when
-    // the material has no height map (`depth == 0`).
+    // Height-map relief is baked into the SDF field (see sdf_render::height) — the hit position
+    // and its gradient normal already reflect the carved surface, so shading needs no extra work.
     let hit_pos = rm.hit_pos;
-    var geo_normal = calc_normal(rm.hit_pos);
-#ifdef SDF_GPU_RELIEF
-    {
-        let depth = relief_depth(rm.object_id, lod);
-        if (depth > 0.0) {
-            let axis = relief_axis(geo_normal);
-            geo_normal = relief_normal(rm.object_id, hit_pos, geo_normal, axis, depth, lod);
-        }
-    }
-#endif
+    let geo_normal = calc_normal(rm.hit_pos);
 
     // True reverse-Z projection depth so the SDF surface shares the depth buffer with normal
     // geometry (wireframe, gizmos): project the (displaced) world hit through the forward
