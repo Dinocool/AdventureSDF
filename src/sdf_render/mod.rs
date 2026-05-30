@@ -568,7 +568,7 @@ fn setup_sdf_scene(
         SceneEntity,
     ));
 
-    // Initial bake happens on the first `bake_dirty_bricks` tick (atlas starts
+    // Initial bake happens on the first `schedule_bakes` tick (atlas starts
     // dirty), once the edit entities exist and the BVH can be built from them.
 }
 
@@ -875,7 +875,7 @@ fn line_color(index: i32, axis: Color, major: Color, minor: Color) -> Color {
 /// Draw each LOD clipmap ring's world-AABB as a wire box, colour-matched to the
 /// `SDF_DEBUG_LOD` shader ramp (green = fine/near, red = coarse/far). Makes the nested
 /// ring extents and their camera-centred recentering directly visible. Uses the same
-/// `ring_origin` math the bake froze, so the boxes track exactly what got baked.
+/// `ring_origin` math the bake centres each ring on, so the boxes track the resident set.
 fn draw_lod_rings(
     mut gizmos: Gizmos<SdfOverlayGizmos>,
     config: Res<SdfGridConfig>,

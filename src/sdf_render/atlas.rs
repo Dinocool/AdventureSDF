@@ -639,7 +639,7 @@ mod tests {
 
     use crate::sdf_render::edits::edit_world_aabb;
 
-    /// Build the AABBs + BVH for a set of edits (mirrors `bake_dirty_bricks`).
+    /// Build the AABBs + BVH for a set of edits (mirrors `schedule_bakes`).
     fn build_bvh(edits: &[ResolvedEdit]) -> (Vec<Aabb3d>, Bvh) {
         let aabbs: Vec<Aabb3d> = edits
             .iter()
@@ -650,7 +650,7 @@ mod tests {
     }
 
     /// The incremental dirty set for one changed edit's `aabb`, across every LOD ring
-    /// centred on `camera_pos` — mirrors what `bake_dirty_bricks` unions per frame.
+    /// centred on `camera_pos` — mirrors what `schedule_bakes` unions per frame.
     fn dirty_for_aabb(
         config: &super::super::SdfGridConfig,
         aabb: &Aabb3d,
@@ -785,7 +785,7 @@ mod tests {
     }
 
     /// Simulate a real drag: many small incremental steps, each dirtying only the
-    /// moved edit's old∪new footprint (exactly as `bake_dirty_bricks` does). After
+    /// moved edit's old∪new footprint (exactly as `schedule_bakes` does). After
     /// EVERY step the live brick set must equal a from-scratch full bake of that
     /// pose. Regression guard for the "gaps appear past certain thresholds" bug —
     /// i.e. a brick that should exist at the new pose never gets into the dirty set.
@@ -803,7 +803,7 @@ mod tests {
         let mut atlas = SdfAtlas::default();
         let (aabbs, bvh) = build_bvh(&edits);
         atlas.full_bake(&edits, &bvh, &config, camera);
-        // prev footprint, as bake_dirty_bricks tracks via PrevEditAabbs.
+        // prev footprint, as schedule_bakes tracks via PrevEditAabbs.
         let mut prev_aabb = aabbs[0];
 
         // Drag across several brick widths in small sub-brick steps (0.07 world units

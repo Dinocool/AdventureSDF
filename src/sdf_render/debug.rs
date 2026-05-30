@@ -1016,8 +1016,8 @@ fn spawn_panel(world: &mut World, ui: &mut egui::Ui) {
                 SdfVolume,
                 SceneEntity,
             ));
-            // Spawn changes the edit set → `bake_dirty_bricks` detects the new
-            // entity and does a full rebuild.
+            // Spawn changes the edit set → `schedule_bakes` detects the new
+            // entity and re-dirties the affected chunks.
         }
 
         if ui.button("Delete selected").clicked() {
@@ -1192,7 +1192,7 @@ fn inspect_panel(world: &mut World, ui: &mut egui::Ui) {
         }
     }
     // Geometry/material-id edits go through `get_mut` above, which triggers the
-    // `Changed<…>` filters `bake_dirty_bricks` watches → targeted rebake. A
+    // `Changed<…>` filters `schedule_bakes` watches → targeted rebake. A
     // registry colour/softness change is shading-only (the GPU material table
     // re-uploads on registry change), so it needs no rebake.
     let _ = (changed, reg_changed);
