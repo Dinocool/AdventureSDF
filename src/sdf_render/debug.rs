@@ -1256,6 +1256,21 @@ fn inspect_panel(world: &mut World, ui: &mut egui::Ui) {
             {
                 reg_changed = true;
             }
+            // Scalar metallic/roughness — these drive shading only when the material has
+            // NO MRA texture (the textureless exemplars). For a textured material the MRA
+            // map wins and these sliders have no visible effect.
+            if ui
+                .add(egui::Slider::new(&mut def.metallic, 0.0..=1.0).text("Metallic"))
+                .changed()
+            {
+                reg_changed = true;
+            }
+            if ui
+                .add(egui::Slider::new(&mut def.roughness, 0.0..=1.0).text("Roughness"))
+                .changed()
+            {
+                reg_changed = true;
+            }
         }
     }
 

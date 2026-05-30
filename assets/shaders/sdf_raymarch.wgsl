@@ -24,7 +24,8 @@
     dist_to_brick_exit_lod,
 }
 #import sdf::cubic::{build_cell_cubic, solve_cell_cubic, dist_to_cell_exit}
-#import sdf::pbr::shade_material
+#import sdf::pbr::{shade_material, sun_dir}
+#import sdf::sky::sky_color
 
 // --- Raymarching ---
 
@@ -221,12 +222,10 @@ fn main(in: FullscreenVertexOutput) -> FragmentOutput {
     let ray_dir = normalize(world_pos - camera.camera_pos.xyz);
     let ray_origin = camera.camera_pos.xyz;
 
-    // Background gradient
-    let bg_color = mix(
-        vec3<f32>(0.05, 0.05, 0.12),
-        vec3<f32>(0.1, 0.1, 0.18),
-        uv.y,
-    );
+    // Background = the same analytic sky the IBL/reflections sample, so a ray miss and
+    // a metal's reflection of the horizon agree. Tonemapped to match shaded surfaces.
+    let sky = sky_color(ray_dir, sun_dir());
+    let bg_color = pow(sky / (sky + vec3<f32>(1.0)), vec3<f32>(1.0 / 2.2));
 
     let rm = raymarch(ray_origin, ray_dir);
 

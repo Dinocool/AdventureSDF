@@ -21,6 +21,8 @@ fn material_asset_round_trip_is_stable() {
     let mut asset = MaterialAsset {
         base_color: [0.2, 0.4, 0.6, 1.0],
         blend_softness: 0.3,
+        metallic: 0.8,
+        roughness: 0.25,
         maps: std::array::from_fn(|_| None),
     };
     asset.maps[0] = Some(TexRef {

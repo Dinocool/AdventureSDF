@@ -83,8 +83,10 @@ struct GpuSdfMaterial {
     tex_mra: u32,
     tex_height: u32,
     tex_edge: u32,
-    _pad0: u32,
-    _pad1: u32,
+    /// Scalar metallic/roughness fallbacks (used by the shader when `tex_mra` is absent).
+    /// Reuse the former std430 tail padding — no size/layout change (still 48 bytes).
+    metallic: f32,
+    roughness: f32,
 }
 
 // --- Extracted Atlas ---
@@ -409,12 +411,13 @@ struct SdfShaderHandle(Handle<Shader>);
 struct SdfShaderModules(#[expect(dead_code)] Vec<Handle<Shader>>);
 
 /// The `#define_import_path` module files the entry shader composes.
-const SDF_SHADER_MODULES: [&str; 6] = [
+const SDF_SHADER_MODULES: [&str; 7] = [
     "shaders/sdf/bindings.wgsl",
     "shaders/sdf/brick.wgsl",
     "shaders/sdf/cubic.wgsl",
     "shaders/sdf/material.wgsl",
     "shaders/sdf/shadows.wgsl",
+    "shaders/sdf/sky.wgsl",
     "shaders/sdf/pbr.wgsl",
 ];
 
@@ -539,8 +542,8 @@ fn prepare_sdf_camera_data(
                 tex_mra: t[2],
                 tex_height: t[3],
                 tex_edge: t[4],
-                _pad0: 0,
-                _pad1: 0,
+                metallic: def.metallic,
+                roughness: def.roughness,
             });
         }
     }
@@ -909,8 +912,8 @@ fn prepare_sdf_materials_gpu(
         bytes.extend_from_slice(&m.tex_mra.to_le_bytes());
         bytes.extend_from_slice(&m.tex_height.to_le_bytes());
         bytes.extend_from_slice(&m.tex_edge.to_le_bytes());
-        bytes.extend_from_slice(&0u32.to_le_bytes());
-        bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.extend_from_slice(&m.metallic.to_le_bytes());
+        bytes.extend_from_slice(&m.roughness.to_le_bytes());
     }
     let buffer = device.create_buffer_with_data(&BufferInitDescriptor {
         label: Some("sdf_material_buffer"),

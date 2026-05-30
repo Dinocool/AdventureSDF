@@ -20,7 +20,7 @@ struct SdfCameraUniform {
 
 // One material row, indexed by global material id. Mirrors `GpuSdfMaterial`
 // (render.rs): base colour + seam softness + per-map texture-array layer indices
-// (0xffffffff = no texture for that map). 48 bytes.
+// (0xffffffff = no texture for that map) + scalar metallic/roughness fallbacks. 48 bytes.
 struct SdfMaterial {
     base_color: vec4<f32>,
     blend_softness: f32,   // world-units colour-feather width at a seam
@@ -29,7 +29,10 @@ struct SdfMaterial {
     tex_mra: u32,
     tex_height: u32,
     tex_edge: u32,
-    pad: vec2<u32>,
+    // Used when tex_mra is absent (0xffffffff): lets a material be a plain metal/dielectric
+    // without an MRA texture. Range 0..1 each.
+    metallic: f32,
+    roughness: f32,
 };
 
 // Per-brick lookup. `key_hi`/`key_lo` are the absolute 64-bit brick key (lod + biased

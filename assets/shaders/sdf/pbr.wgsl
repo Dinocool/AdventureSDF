@@ -8,6 +8,7 @@
 #import sdf::brick::SceneSdfResult
 #import sdf::material::{material_at, sample_material_map, triplanar_normal}
 #import sdf::shadows::surface_shadow
+#import sdf::sky::{sky_color, sky_ambient}
 
 fn distribution_ggx(n: vec3<f32>, h: vec3<f32>, rough: f32) -> f32 {
     let a = rough * rough;
@@ -29,6 +30,14 @@ fn geometry_smith(n: vec3<f32>, v: vec3<f32>, l: vec3<f32>, rough: f32) -> f32 {
 
 fn fresnel_schlick(cos_theta: f32, f0: vec3<f32>) -> vec3<f32> {
     return f0 + (vec3<f32>(1.0) - f0) * pow(clamp(1.0 - cos_theta, 0.0, 1.0), 5.0);
+}
+
+// Roughness-aware Fresnel (Sébastien Lagarde) for environment/IBL terms: rough surfaces
+// keep a higher grazing reflectance than the sharp Schlick gives, so ambient specular on
+// a rough metal doesn't darken at glancing angles.
+fn fresnel_schlick_roughness(cos_theta: f32, f0: vec3<f32>, roughness: f32) -> vec3<f32> {
+    let inv_rough = vec3<f32>(1.0 - roughness);
+    return f0 + (max(inv_rough, f0) - f0) * pow(clamp(1.0 - cos_theta, 0.0, 1.0), 5.0);
 }
 
 // Single source for the scene's key light. Hardcoded for now — the deferred lighting
@@ -70,9 +79,40 @@ fn shade_pbr(
     let kd = (vec3<f32>(1.0) - f) * (1.0 - metallic);
     let diffuse = kd * albedo / PI;
 
-    let direct = (diffuse + specular) * light_color * ndl * shadow;
-    let ambient = albedo * 0.12 * ao;
-    return ambient + direct;
+    // Direct lighting only — ambient/environment is added once in `shade_material` via
+    // `ambient_ibl` (it's view/normal dependent, not per-light).
+    return (diffuse + specular) * light_color * ndl * shadow;
+}
+
+// Environment ambient (image-based-lighting approximation) from the analytic sky: a
+// diffuse hemisphere-irradiance term plus a specular reflection of the sky along the
+// view-reflected normal. This is what makes metals read as metal — a pure-metal surface
+// has no diffuse and was previously near-black; now it mirrors the sky tinted by its F0.
+fn ambient_ibl(
+    albedo: vec3<f32>,
+    n: vec3<f32>,
+    metallic: f32,
+    roughness: f32,
+    ao: f32,
+    view_dir: vec3<f32>,
+    sun: vec3<f32>,
+) -> vec3<f32> {
+    let ndv = max(dot(n, view_dir), 0.0);
+    let f0 = mix(vec3<f32>(0.04), albedo, metallic);
+    let f = fresnel_schlick_roughness(ndv, f0, roughness);
+
+    // Diffuse: hemisphere irradiance, only the non-metal / non-reflected fraction.
+    let kd = (vec3<f32>(1.0) - f) * (1.0 - metallic);
+    let irradiance = sky_ambient(n, sun);
+    let diffuse = kd * albedo * irradiance;
+
+    // Specular: the sky seen along the reflected view ray. Rougher surfaces blur toward
+    // the diffuse irradiance (a cheap stand-in for a prefiltered mip chain).
+    let refl = reflect(-view_dir, n);
+    let env = mix(sky_color(refl, sun), irradiance, roughness);
+    let specular = env * f;
+
+    return (diffuse + specular) * ao;
 }
 
 // Per-material resolved PBR inputs at a point (post-triplanar). Cross-faded across
@@ -88,17 +128,33 @@ struct PbrInputs {
 fn gather_pbr(id: u32, wpos: vec3<f32>, geo_n: vec3<f32>, lod: f32) -> PbrInputs {
     let mat = material_at(id);
     let albedo = sample_material_map(id, 0u, wpos, geo_n, lod).rgb * mat.base_color.rgb;
-    let mra = sample_material_map(id, 2u, wpos, geo_n, lod).rgb; // r=metal g=rough b=ao
     let edge = sample_material_map(id, 4u, wpos, geo_n, lod).r;
     let nrm = triplanar_normal(id, wpos, geo_n, lod);
+
+    // Metallic / roughness / AO: from the MRA texture when present, else the material's
+    // scalar fallbacks (AO = 1). This lets a textureless material be a plain metal or
+    // dielectric — e.g. a deep-red metallic exemplar with no map set.
+    var metal: f32;
+    var rough: f32;
+    var ao: f32;
+    if (mat.tex_mra == 0xffffffffu) {
+        metal = mat.metallic;
+        rough = mat.roughness;
+        ao = 1.0;
+    } else {
+        let mra = sample_material_map(id, 2u, wpos, geo_n, lod).rgb; // r=metal g=rough b=ao
+        metal = mra.r;
+        rough = mra.g;
+        ao = mra.b;
+    }
 
     // Edge-wear: convex edges (bright in the edge map) read as worn — lighter and
     // rougher, a cheap stand-in for exposed/scuffed material until it's art-driven.
     let wear = smoothstep(0.6, 1.0, edge);
     let albedo_worn = mix(albedo, albedo * 1.3 + vec3<f32>(0.05), wear * 0.5);
-    let rough_worn = clamp(mra.g + wear * 0.3, 0.04, 1.0);
+    let rough_worn = clamp(rough + wear * 0.3, 0.04, 1.0);
 
-    return PbrInputs(albedo_worn, nrm, mra.r, rough_worn, mra.b);
+    return PbrInputs(albedo_worn, nrm, metal, rough_worn, ao);
 }
 
 // Resolve the final lit surface colour, cross-fading the two nearest materials'
@@ -138,10 +194,14 @@ fn shade_material(res: SceneSdfResult, wpos: vec3<f32>, geo_n: vec3<f32>, lod: f
     shadow = surface_shadow(wpos, geo_n, light_dir, res.lod, 256.0);
 #endif
 
-    let lit = shade_pbr(
+    let direct = shade_pbr(
         p.albedo, p.normal, p.metallic, p.roughness, p.ao,
         view_dir, light_dir, light_color, shadow,
     );
+    let ambient = ambient_ibl(
+        p.albedo, p.normal, p.metallic, p.roughness, p.ao, view_dir, light_dir,
+    );
+    let lit = direct + ambient;
     // Tonemap (Reinhard) + approximate gamma so the linear PBR result displays well.
     let mapped = lit / (lit + vec3<f32>(1.0));
     return pow(mapped, vec3<f32>(1.0 / 2.2));
