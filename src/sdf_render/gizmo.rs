@@ -497,8 +497,8 @@ pub fn gizmo_update(
     // Continue an active drag.
     if let Some(drag) = state.drag.take() {
         if let Ok(mut t) = volumes.get_mut(entity) {
-            // Mutating Transform fires `Changed<Transform>`, which `bake_dirty_bricks`
-            // uses to rebake just the affected bricks — no explicit dirty flag needed.
+            // Mutating Transform fires `Changed<Transform>`, which `schedule_bakes`
+            // uses to rebake just the affected chunks — no explicit dirty flag needed.
             apply_drag(&drag, &ray, &mut t, &state);
         }
         state.hovered = Some(drag.id);
