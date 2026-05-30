@@ -17,8 +17,7 @@ use bevy::render::view::{ViewDepthTexture, ViewTarget};
 use bevy::render::{Extract, ExtractSchedule, Render, RenderApp, RenderStartup};
 use bevy::tasks::{AsyncComputeTaskPool, Task, block_on, poll_once};
 
-use super::atlas::{BRICK_EDGE, SNORM_CLAMP_DIST, SdfAtlas};
-use super::bvh::Bvh;
+use super::atlas::{BRICK_EDGE, SdfAtlas};
 use super::edits::PALETTE_K;
 use super::{SdfCamera, SdfGridConfig, SdfRenderEnabled};
 
@@ -51,17 +50,6 @@ struct GpuBrickTile {
 /// wgpu limit, so it never overflows while keeping the texture reasonably square.
 const ATLAS_TILES_PER_ROW: u32 = 256;
 
-/// GPU mirror of [`super::bvh::BvhNode`] for the storage-buffer layout (32 bytes:
-/// two `vec3<f32> + u32` rows). Only used to declare the bind-group layout; the
-/// actual node bytes come straight from `Bvh::to_gpu_bytes`.
-#[derive(ShaderType, Clone, Copy, Default)]
-struct GpuBvhNode {
-    aabb_min: Vec3,
-    left_or_first: u32,
-    aabb_max: Vec3,
-    count_or_right: u32,
-}
-
 #[derive(Component, Clone, Copy, ShaderType, Default, ExtractComponent, Reflect)]
 #[reflect(Component)]
 struct SdfCameraData {
@@ -74,8 +62,9 @@ struct SdfCameraData {
     screen_params: Vec4, // xy = screen_size, zw = unused
     grid_origin: Vec4,   // xyz = grid origin, w = voxel_size
     grid_dims: Vec4, // x = grid_size, y = bricks_per_axis, z = brick_size (8.0), w = num_lookups
-    debug_params: Vec4, // x = max_steps, y = max_dist, z = sdf_eps, w = bvh_node_count
-    bake_reach: Vec4, // x = world-units a baked brick reaches beyond a tight edit AABB
+    debug_params: Vec4, // x = max_steps, y = max_dist, z = sdf_eps, w = unused
+    /// x = pixel_cone (world radius per unit ray distance per pixel), y = cubic_band, zw unused.
+    march_params: Vec4,
     /// x = lod_count, y = ring_bricks, z = base voxel_size, w = cell_stride.
     lod_params: Vec4,
 }
@@ -147,16 +136,6 @@ struct AtlasCapacity {
     rows: u32,
 }
 
-/// Flattened BVH nodes (raw std430 bytes, 32B each) extracted from the main world
-/// for GPU upload. Used by the raymarch only to accelerate empty-space skipping —
-/// the surface is still sampled from the atlas textures.
-#[derive(Resource, Default)]
-struct ExtractedSdfBvh {
-    node_bytes: Vec<u8>,
-    node_count: u32,
-    dirty: bool,
-}
-
 // --- GPU Atlas ---
 
 #[derive(Resource, Default)]
@@ -171,11 +150,9 @@ struct SdfGpuAtlas {
     mat_tex: Option<Texture>,
     mat_view: Option<TextureView>,
     sampler: Option<Sampler>,
-    /// Chunk lookup table (binding 2) + packed per-chunk tile runs (binding 12).
+    /// Chunk lookup table (binding 2) + packed per-chunk tile runs (binding 11).
     lookup_buffer: Option<Buffer>,
     chunk_tile_buffer: Option<Buffer>,
-    bvh_buffer: Option<Buffer>,
-    bvh_node_count: u32,
     /// Material table (storage buffer of `GpuSdfMaterial`, indexed by material id).
     material_buffer: Option<Buffer>,
     /// PBR texture-array views (one per `MapArray`: diffuse, normal, mra, height,
@@ -354,11 +331,6 @@ impl ViewNode for SdfNode {
                     .as_entire_buffer_binding(),
                 gpu_atlas.mat_view.as_ref().unwrap(),
                 gpu_atlas
-                    .bvh_buffer
-                    .as_ref()
-                    .unwrap()
-                    .as_entire_buffer_binding(),
-                gpu_atlas
                     .material_buffer
                     .as_ref()
                     .unwrap()
@@ -419,11 +391,10 @@ struct SdfShaderHandle(Handle<Shader>);
 struct SdfShaderModules(#[expect(dead_code)] Vec<Handle<Shader>>);
 
 /// The `#define_import_path` module files the entry shader composes.
-const SDF_SHADER_MODULES: [&str; 6] = [
+const SDF_SHADER_MODULES: [&str; 5] = [
     "shaders/sdf/bindings.wgsl",
     "shaders/sdf/brick.wgsl",
     "shaders/sdf/cubic.wgsl",
-    "shaders/sdf/bvh.wgsl",
     "shaders/sdf/material.wgsl",
     "shaders/sdf/pbr.wgsl",
 ];
@@ -482,7 +453,6 @@ impl Plugin for SdfRenderPlugin {
 
         render_app
             .add_systems(ExtractSchedule, extract_sdf_atlas)
-            .add_systems(ExtractSchedule, extract_sdf_bvh)
             .add_systems(ExtractSchedule, extract_sdf_materials)
             .add_systems(ExtractSchedule, extract_texture_library)
             .add_systems(ExtractSchedule, extract_shader_defs)
@@ -490,7 +460,6 @@ impl Plugin for SdfRenderPlugin {
             .init_resource::<LastAtlasGen>()
             .init_resource::<AtlasCapacity>()
             .add_systems(Render, prepare_sdf_atlas_gpu)
-            .add_systems(Render, prepare_sdf_bvh_gpu)
             .add_systems(Render, prepare_sdf_materials_gpu)
             .add_systems(Render, init_texture_streaming)
             .add_systems(Render, upload_texture_layers.after(init_texture_streaming))
@@ -531,7 +500,6 @@ fn prepare_sdf_camera_data(
     atlas: Res<SdfAtlas>,
     config: Res<SdfGridConfig>,
     raymarch: Res<super::SdfRaymarchParams>,
-    bvh: Res<Bvh>,
     registry: Res<super::edits::MaterialRegistry>,
     mut material_table: ResMut<SdfMaterialTable>,
 ) {
@@ -572,6 +540,15 @@ fn prepare_sdf_camera_data(
             .physical_viewport_size()
             .unwrap_or(UVec2::new(1920, 1080));
 
+        // Pixel cone half-width per unit ray distance: the world radius one pixel covers
+        // at distance 1. For a perspective projection `proj.y_axis.y = cot(fov_y/2)`, the
+        // full vertical world extent at distance 1 is `2·tan(fov_y/2)`, so one pixel spans
+        // `2·tan(fov_y/2)/height` and its half-width (radius) is `tan(fov_y/2)/height`.
+        // Scaled by `cone_scale` so the surface-within-a-pixel test can be tuned.
+        let proj = camera.clip_from_view();
+        let tan_half_fov_y = 1.0 / proj.y_axis.y.max(1e-6);
+        let pixel_cone = (tan_half_fov_y / size.y.max(1) as f32) * raymarch.cone_scale;
+
         commands.entity(entity).insert(SdfCameraData {
             inv_view_proj,
             clip_from_world,
@@ -593,15 +570,18 @@ fn prepare_sdf_camera_data(
                 raymarch.max_steps as f32,
                 raymarch.max_dist,
                 raymarch.sdf_eps,
-                bvh.nodes.len() as f32,
+                0.0,
             ),
-            // The LOD-independent part of a baked brick's reach beyond a tight edit AABB
-            // (`bricks_in_aabb_lod` grows the AABB by SNORM_CLAMP_DIST before snapping to
-            // the lattice). The BVH skip adds the LOD-scaled brick-margin per node in the
-            // shader (`brick_world_at(lod)`), since a LOD-L brick reaches 2^L further —
-            // a single LOD-0 value here under-inflates coarse rings and the skip jumps
-            // over their shells (escaped rays / graininess at LOD 2+).
-            bake_reach: Vec4::new(SNORM_CLAMP_DIST, 0.0, 0.0, 0.0),
+            // March tuning: the pixel cone half-width per unit ray distance drives the
+            // screen-space termination (a surface within a pixel ends the march, so far
+            // geometry resolves at coarse LOD); `cubic_band` is the near-surface distance
+            // within which a LOD-0 sample switches to the exact analytic cubic.
+            march_params: Vec4::new(
+                pixel_cone,
+                raymarch.cubic_band,
+                0.0,
+                0.0,
+            ),
             lod_params: Vec4::new(
                 config.lod_count as f32,
                 config.ring_bricks as f32,
@@ -1110,42 +1090,7 @@ fn upload_texture_layers(queue: Res<RenderQueue>, mut stream: ResMut<TextureStre
     }
 }
 
-// --- Extract: Flatten BVH for GPU ---
-
-fn extract_sdf_bvh(bvh: Extract<Res<Bvh>>, mut commands: Commands) {
-    // A single empty node keeps the storage buffer non-zero-sized so the bind
-    // group is always valid even before the first bake.
-    let (node_bytes, node_count) = if bvh.nodes.is_empty() {
-        (vec![0u8; 32], 0)
-    } else {
-        (bvh.to_gpu_bytes(), bvh.nodes.len() as u32)
-    };
-    commands.insert_resource(ExtractedSdfBvh {
-        node_bytes,
-        node_count,
-        dirty: true,
-    });
-}
-
 // --- Prepare: Upload to GPU ---
-
-fn prepare_sdf_bvh_gpu(
-    device: Res<RenderDevice>,
-    extracted: Option<Res<ExtractedSdfBvh>>,
-    mut gpu_atlas: ResMut<SdfGpuAtlas>,
-) {
-    let Some(extracted) = extracted else { return };
-    if !extracted.dirty {
-        return;
-    }
-    let buffer = device.create_buffer_with_data(&BufferInitDescriptor {
-        label: Some("sdf_bvh_buffer"),
-        contents: &extracted.node_bytes,
-        usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
-    });
-    gpu_atlas.bvh_buffer = Some(buffer);
-    gpu_atlas.bvh_node_count = extracted.node_count;
-}
 
 fn prepare_sdf_atlas_gpu(
     device: Res<RenderDevice>,
@@ -1353,19 +1298,17 @@ fn init_sdf_pipeline(
                 storage_buffer_read_only::<GpuChunkLookup>(false),
                 // binding 3: per-palette-slot distance atlas (Rgba16Snorm, 4 slots)
                 texture_2d(TextureSampleType::Float { filterable: false }),
-                // binding 4: BVH nodes (empty-space-skip acceleration)
-                storage_buffer_read_only::<GpuBvhNode>(false),
-                // binding 5: material table (indexed by global material id)
+                // binding 4: material table (indexed by global material id)
                 storage_buffer_read_only::<GpuSdfMaterial>(false),
-                // binding 6: PBR-array filtering+mip sampler
+                // binding 5: PBR-array filtering+mip sampler
                 sampler(SamplerBindingType::Filtering),
-                // bindings 7..11: PBR texture arrays (diffuse, normal, mra, height, edge)
+                // bindings 6..10: PBR texture arrays (diffuse, normal, mra, height, edge)
                 texture_2d_array(TextureSampleType::Float { filterable: true }),
                 texture_2d_array(TextureSampleType::Float { filterable: true }),
                 texture_2d_array(TextureSampleType::Float { filterable: true }),
                 texture_2d_array(TextureSampleType::Float { filterable: true }),
                 texture_2d_array(TextureSampleType::Float { filterable: true }),
-                // binding 12: packed per-chunk brick tile runs
+                // binding 11: packed per-chunk brick tile runs
                 storage_buffer_read_only::<GpuBrickTile>(false),
             ),
         ),
@@ -1437,14 +1380,7 @@ fn init_sdf_pipeline(
         contents: &[0u8; 12],
         usage: BufferUsages::STORAGE,
     });
-    // One zeroed 32-byte BVH node so binding 5 is always valid pre-bake.
-    let dummy_bvh = device.create_buffer_with_data(&BufferInitDescriptor {
-        label: Some("sdf_dummy_bvh"),
-        contents: &[0u8; 32],
-        usage: BufferUsages::STORAGE,
-    });
-    // One zeroed 32-byte material row so binding 6 is always valid pre-upload.
-    // One zeroed 48-byte GpuSdfMaterial row so binding 5 meets the struct's minimum
+    // One zeroed 48-byte GpuSdfMaterial row so binding 4 meets the struct's minimum
     // size before the real table uploads.
     let dummy_material = device.create_buffer_with_data(&BufferInitDescriptor {
         label: Some("sdf_dummy_material"),
@@ -1526,8 +1462,6 @@ fn init_sdf_pipeline(
         sampler: Some(dummy_sampler),
         lookup_buffer: Some(dummy_lookup),
         chunk_tile_buffer: Some(dummy_chunk_tile),
-        bvh_buffer: Some(dummy_bvh),
-        bvh_node_count: 0,
         material_buffer: Some(dummy_material),
         tex_array_views: Some(dummy_tex_views),
         tex_sampler: Some(dummy_tex_sampler),

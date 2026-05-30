@@ -1,3 +1,37 @@
+//! # SDF clipmap renderer
+//!
+//! Renders an editable signed-distance-field world by raymarching a sparse brick atlas,
+//! with camera-centred LOD shells so it can reach vast distances. The data flow, in order,
+//! and where each stage lives:
+//!
+//! 1. **Edits → analytic CSG field** (`edits`). Each [`SdfVolume`] is a primitive + CSG op
+//!    (`fold_csg`). This field is *resolution-independent*: callable at any point and any
+//!    scale. Everything downstream samples it.
+//! 2. **Conservative per-LOD bake** (`atlas`). For each resident brick, every voxel stores
+//!    the **minimum** analytic distance over a small sub-grid spanning the voxel cell
+//!    (`atlas::SUBSAMPLES`). The min is a *conservative lower bound*: thin features survive
+//!    at coarse LOD (no "grain") and a sphere-trace step of the stored value can never
+//!    overshoot a surface. A coarse brick samples the analytic field at its own scale, so
+//!    far geometry bakes correctly without any LOD-0 data.
+//! 3. **Sparse storage + GPU lookup** (`chunk`, `render`, `bindings.wgsl`). Bricks group
+//!    into 4³=64-brick **chunks** addressed by an *absolute* world-lattice key (independent
+//!    of the camera, so CPU and GPU agree by construction). Resident chunks form a sorted
+//!    table (binary-searched on the GPU) with a 64-bit occupancy mask + popcount index into
+//!    a packed tile-run buffer. Brick texels live in a 2D-tiled atlas texture.
+//! 4. **Async incremental bake** (`bake_scheduler`). The camera-centred chunk ring recenters
+//!    as the camera moves; entered chunks bake on a task pool, exited chunks evict — never
+//!    blocking the main thread.
+//! 5. **Unified raymarch** (`sdf_raymarch.wgsl`, helpers in `brick`/`cubic`). One loop:
+//!    resolve the finest resident LOD at `p`; skip empty space by brick-DDA; at LOD 0 near
+//!    the surface solve the exact analytic **cubic** for a crisp silhouette; otherwise
+//!    sphere-trace the conservative field and accept the hit once the surface is within the
+//!    pixel cone (screen-space termination — the vast-distance speed win). There is **no GPU
+//!    BVH** in the march; the conservative field drives all skipping. The `bvh` module is
+//!    CPU-only, used solely as the bake's edit-culling acceleration structure.
+//!
+//! Editor-only pieces (`debug`, `gizmo`, `picking`, overlays) sit alongside but are not on
+//! the render hot path.
+
 pub mod atlas;
 pub mod bake_scheduler;
 pub mod bc7;
@@ -12,6 +46,7 @@ pub mod render;
 pub mod textures;
 
 use bevy::core_pipeline::prepass::DepthPrepass;
+use bevy::ecs::system::SystemParam;
 use bevy::input::mouse::{MouseMotion, MouseWheel};
 use bevy::prelude::*;
 
@@ -94,14 +129,28 @@ pub struct SdfRaymarchParams {
     pub max_steps: u32,
     pub max_dist: f32,
     pub sdf_eps: f32,
+    /// Multiplier on the per-pixel cone half-width used for screen-space march
+    /// termination. The march stops when the conservative field drops below
+    /// `pixel_cone · t` (surface within ~`cone_scale` pixels), so far geometry resolves
+    /// at coarse LOD instead of marching down to LOD 0 — the vast-distance speed win.
+    /// 1.0 = exactly one pixel; larger = coarser/cheaper, smaller = sharper/costlier.
+    pub cone_scale: f32,
+    /// Near-surface distance band (world units) within which a LOD-0 sample switches to
+    /// the exact analytic cubic for a crisp silhouette. Outside it (or at any coarser
+    /// LOD) the march sphere-traces the conservative field.
+    pub cubic_band: f32,
 }
 
 impl Default for SdfRaymarchParams {
     fn default() -> Self {
         Self {
-            max_steps: 128,
-            max_dist: 100.0,
+            // Raised for vast-distance marching: cone termination keeps the step count
+            // bounded even though the reach is far larger than the old 100-unit cap.
+            max_steps: 192,
+            max_dist: 2000.0,
             sdf_eps: 0.001,
+            cone_scale: 1.0,
+            cubic_band: 0.5,
         }
     }
 }
@@ -113,6 +162,17 @@ impl Default for SdfRaymarchParams {
 #[derive(Resource, Default)]
 pub struct SdfSelection {
     pub entity: Option<Entity>,
+}
+
+/// Double-click-to-focus state for the orbit camera. `sdf_picking` records each
+/// left-click time to detect double-clicks; a double-click on a volume sets
+/// `target`, which `orbit_camera` eases `SdfOrbitCamera.target` toward.
+#[derive(Resource, Default)]
+pub struct OrbitFocus {
+    /// World point the orbit target is easing toward; cleared once reached.
+    pub target: Option<Vec3>,
+    /// Elapsed-seconds timestamp of the previous left-click (double-click detection).
+    last_click: f32,
 }
 
 // --- Orbit Camera ---
@@ -296,6 +356,7 @@ impl Plugin for SdfScenePlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<SdfGridConfig>()
             .init_resource::<SdfSelection>()
+            .init_resource::<OrbitFocus>()
             .init_resource::<SdfOrbitCamera>()
             .init_resource::<SdfCameraMode>()
             .init_resource::<edits::MaterialRegistry>()
@@ -339,7 +400,7 @@ impl Plugin for SdfScenePlugin {
             // volume underneath (`sdf_picking` bails when `GizmoState.claimed_click`).
             .add_systems(
                 Last,
-                (gizmo::gizmo_update, sdf_picking)
+                (gizmo::gizmo_update, sdf_picking, focus_on_double_click)
                     .chain()
                     .run_if(in_state(AppScene::SdfEditor))
                     .run_if(|allowed: Res<ViewportInputAllowed>| allowed.0),
@@ -552,26 +613,49 @@ fn setup_sdf_scene(
 
 // --- Orbit Camera ---
 
+/// The raw per-frame input the editor cameras share: mouse buttons, keyboard, frame
+/// time, and the mouse-motion / scroll message readers. Bundled so both camera
+/// systems (and any future view tool) take one param instead of repeating the same
+/// five reads.
+#[derive(SystemParam)]
+pub struct CameraInput<'w, 's> {
+    pub mouse: Res<'w, ButtonInput<MouseButton>>,
+    pub keyboard: Res<'w, ButtonInput<KeyCode>>,
+    pub time: Res<'w, Time>,
+    pub motion: MessageReader<'w, 's, MouseMotion>,
+    pub scroll: MessageReader<'w, 's, MouseWheel>,
+}
+
 /// Godot-style editor camera: middle-mouse orbits, Shift+middle pans, wheel zooms.
 /// The camera transform is recomputed every frame so zoom/pan take effect
 /// immediately (the previous version only rebuilt it while orbiting, so scroll
 /// appeared to do nothing until you dragged).
 fn orbit_camera(
     mut orbit: ResMut<SdfOrbitCamera>,
+    mut focus: ResMut<OrbitFocus>,
+    mut input: CameraInput,
     mut camera_query: Query<&mut Transform, (With<SdfCamera>, Without<SdfVolume>)>,
-    mouse: Res<ButtonInput<MouseButton>>,
-    keyboard: Res<ButtonInput<KeyCode>>,
-    mut motion: MessageReader<MouseMotion>,
-    mut scroll: MessageReader<MouseWheel>,
 ) {
     // Wheel zoom (dolly toward/away from the target).
-    for ev in scroll.read() {
+    for ev in input.scroll.read() {
         orbit.distance = (orbit.distance - ev.y * 0.5).clamp(0.5, 50.0);
     }
 
-    let orbiting = mouse.pressed(MouseButton::Middle);
-    let panning =
-        orbiting && (keyboard.pressed(KeyCode::ShiftLeft) || keyboard.pressed(KeyCode::ShiftRight));
+    // Smoothly ease the orbit target toward a double-click focus point. Exponential
+    // smoothing (frame-rate independent); cleared once we're within a hair of it.
+    if let Some(dest) = focus.target {
+        let t = 1.0 - (-12.0 * input.time.delta_secs()).exp();
+        orbit.target = orbit.target.lerp(dest, t);
+        if orbit.target.distance(dest) < 0.01 {
+            orbit.target = dest;
+            focus.target = None;
+        }
+    }
+
+    let orbiting = input.mouse.pressed(MouseButton::Middle);
+    let panning = orbiting
+        && (input.keyboard.pressed(KeyCode::ShiftLeft)
+            || input.keyboard.pressed(KeyCode::ShiftRight));
 
     if orbiting {
         // Basis vectors of the current view for screen-space panning.
@@ -583,12 +667,14 @@ fn orbit_camera(
         let right = dir.cross(Vec3::Y).normalize_or_zero();
         let up = right.cross(dir).normalize_or_zero();
 
-        for ev in motion.read() {
+        for ev in input.motion.read() {
             if panning {
                 // Shift+MMB: pan the target across the view plane (scaled by distance
                 // so the world tracks the cursor at any zoom).
                 let pan = orbit.distance * 0.0015;
                 orbit.target += -right * ev.delta.x * pan + up * ev.delta.y * pan;
+                // Manual pan overrides any in-progress double-click focus ease.
+                focus.target = None;
             } else {
                 // MMB: orbit yaw/pitch.
                 orbit.yaw -= ev.delta.x * 0.005;
@@ -596,7 +682,7 @@ fn orbit_camera(
             }
         }
     } else {
-        motion.clear();
+        input.motion.clear();
     }
 
     // Always recompute so zoom/pan/orbit all apply immediately.
@@ -616,32 +702,27 @@ fn orbit_camera(
 /// Space/Ctrl for up/down, wheel adjusts speed. Lets you fly out across the km-scale
 /// clipmap terrain. Active only when `SdfCameraMode.fps` is set (the viewport toolbar
 /// toggle); the orbit camera is disabled in that mode so they don't fight.
-#[expect(clippy::too_many_arguments)]
 fn fps_camera(
     mut mode: ResMut<SdfCameraMode>,
     mut orbit: ResMut<SdfOrbitCamera>,
+    mut input: CameraInput,
     mut camera_query: Query<&mut Transform, (With<SdfCamera>, Without<SdfVolume>)>,
-    mouse: Res<ButtonInput<MouseButton>>,
-    keyboard: Res<ButtonInput<KeyCode>>,
-    time: Res<Time>,
-    mut motion: MessageReader<MouseMotion>,
-    mut scroll: MessageReader<MouseWheel>,
 ) {
     // Wheel adjusts fly speed (exponential feel), clamped to a sane range.
-    for ev in scroll.read() {
+    for ev in input.scroll.read() {
         mode.speed = (mode.speed * (1.0 + ev.y * 0.1)).clamp(1.0, 500.0);
     }
 
     // Mouse-look only while holding right mouse (so panel clicks don't spin the view).
-    let looking = mouse.pressed(MouseButton::Right);
+    let looking = input.mouse.pressed(MouseButton::Right);
     if looking {
-        for ev in motion.read() {
-            mode.yaw -= ev.delta.x * 0.003;
+        for ev in input.motion.read() {
+            mode.yaw += ev.delta.x * 0.003;
             mode.pitch = (mode.pitch - ev.delta.y * 0.003)
                 .clamp(-std::f32::consts::FRAC_PI_2 + 0.01, std::f32::consts::FRAC_PI_2 - 0.01);
         }
     } else {
-        motion.clear();
+        input.motion.clear();
     }
 
     let forward = Vec3::new(
@@ -654,22 +735,23 @@ fn fps_camera(
     let up = Vec3::Y;
 
     let mut dir = Vec3::ZERO;
-    if keyboard.pressed(KeyCode::KeyW) {
+    if input.keyboard.pressed(KeyCode::KeyW) {
         dir += forward;
     }
-    if keyboard.pressed(KeyCode::KeyS) {
+    if input.keyboard.pressed(KeyCode::KeyS) {
         dir -= forward;
     }
-    if keyboard.pressed(KeyCode::KeyD) {
+    if input.keyboard.pressed(KeyCode::KeyD) {
         dir += right;
     }
-    if keyboard.pressed(KeyCode::KeyA) {
+    if input.keyboard.pressed(KeyCode::KeyA) {
         dir -= right;
     }
-    if keyboard.pressed(KeyCode::Space) {
+    if input.keyboard.pressed(KeyCode::Space) {
         dir += up;
     }
-    if keyboard.pressed(KeyCode::ControlLeft) || keyboard.pressed(KeyCode::ControlRight) {
+    if input.keyboard.pressed(KeyCode::ControlLeft) || input.keyboard.pressed(KeyCode::ControlRight)
+    {
         dir -= up;
     }
 
@@ -680,10 +762,11 @@ fn fps_camera(
     let mut pos = transform.translation;
     if dir != Vec3::ZERO {
         let mut speed = mode.speed;
-        if keyboard.pressed(KeyCode::ShiftLeft) || keyboard.pressed(KeyCode::ShiftRight) {
+        if input.keyboard.pressed(KeyCode::ShiftLeft) || input.keyboard.pressed(KeyCode::ShiftRight)
+        {
             speed *= 3.0; // sprint
         }
-        pos += dir.normalize() * speed * time.delta_secs();
+        pos += dir.normalize() * speed * input.time.delta_secs();
     }
     *transform = Transform::from_translation(pos).looking_at(pos + forward, Vec3::Y);
 
@@ -781,6 +864,33 @@ fn sdf_picking(
 
     let gathered = gather_sorted_edits(&volumes);
     selection.entity = picking::pick_entity(&bvh, &ray, &gathered);
+}
+
+/// Double-click (within 300ms) on the selected volume eases the orbit camera onto
+/// it. Runs right after `sdf_picking` so `SdfSelection.entity` is already current;
+/// kept separate so picking stays a single-responsibility pick. Orbit-mode only —
+/// the FPS camera flies freely and ignores the orbit target.
+fn focus_on_double_click(
+    mouse: Res<ButtonInput<MouseButton>>,
+    time: Res<Time>,
+    mode: Res<SdfCameraMode>,
+    selection: Res<SdfSelection>,
+    mut focus: ResMut<OrbitFocus>,
+    volumes: Query<&Transform, With<SdfVolume>>,
+) {
+    if !mouse.just_pressed(MouseButton::Left) {
+        return;
+    }
+    let now = time.elapsed_secs();
+    let double_click = now - focus.last_click < 0.3;
+    focus.last_click = now;
+    if double_click
+        && !mode.fps
+        && let Some(entity) = selection.entity
+        && let Ok(transform) = volumes.get(entity)
+    {
+        focus.target = Some(transform.translation);
+    }
 }
 
 /// Push the overlay gizmo group in front of everything (always-on-top handles).

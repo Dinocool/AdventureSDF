@@ -167,6 +167,23 @@ impl Default for SdfAtlas {
 /// outside a 1-brick pad, never got re-dirtied when the edit left.)
 pub const SNORM_CLAMP_DIST: f32 = 1.0;
 
+/// Sub-grid resolution per axis used to make a baked voxel a **conservative lower
+/// bound** on the true signed distance over its cell. Instead of one analytic sample
+/// at the voxel centre, each voxel is sampled on a `SUBSAMPLES³` grid spanning its
+/// cell (`±½ voxel`) and the **minimum** signed distance is stored.
+///
+/// Why min, and why this matters for LOD: a coarse voxel (`voxel_size · 2^L`) sampled
+/// only at its centre misses any feature thinner than the voxel — the trilinear field
+/// never crosses zero and rays pass straight through (the "grain / escaped rays" at
+/// coarse LOD). Taking the min over the cell guarantees that if *any* sub-sample is
+/// inside the surface, the voxel reads negative, so thin slabs survive at every LOD.
+/// The min is also never an over-estimate of the true distance, so the stored field is
+/// a conservative lower bound — a sphere-trace step of the stored value can never pass
+/// through a surface, which is what lets the march skip empty space safely without the
+/// GPU BVH. `N=2` (the cell corners) is the cheapest grid that brackets the cell;
+/// raise for thinner features at higher bake cost.
+pub const SUBSAMPLES: usize = 2;
+
 impl SdfAtlas {
     /// Convert a signed distance to 16-bit signed normalized.
     /// Range: [-1.0, 1.0] maps to [-32767, 32767].
@@ -196,12 +213,55 @@ impl SdfAtlas {
         )
     }
 
+    /// The signed offsets (in fractions of a voxel, per axis) of the conservative
+    /// sub-grid spanning `[-½, +½]` of a voxel. The voxel centre (offset 0) is always
+    /// sampled separately by [`conservative_sample`], so these are the `SUBSAMPLES`
+    /// span points: `N=1` → centre only (empty span); `N=2` → the cell's ±½ corners.
+    /// See [`SUBSAMPLES`].
+    fn sub_offsets() -> [f32; SUBSAMPLES] {
+        let mut offs = [0.0; SUBSAMPLES];
+        if SUBSAMPLES > 1 {
+            for (i, o) in offs.iter_mut().enumerate() {
+                *o = i as f32 / (SUBSAMPLES - 1) as f32 - 0.5;
+            }
+        }
+        offs
+    }
+
+    /// Conservative analytic sample at voxel point `world_pos`: the **minimum**
+    /// signed distance over the voxel centre plus a `SUBSAMPLES³` sub-grid spanning the
+    /// voxel's cell (`±½ voxel`), and the world point that achieved it. Seeding with the
+    /// centre guarantees the result is always ≤ the plain centre sample, so the stored
+    /// field is a conservative lower bound that preserves sub-voxel features at coarse
+    /// LOD (see [`SUBSAMPLES`]). The min-achieving point is where the material slots are
+    /// sampled, so the per-voxel material stays consistent with the distance.
+    fn conservative_sample(edits: &[ResolvedEdit], world_pos: Vec3, voxel_size: f32) -> (f32, Vec3) {
+        // Seed with the voxel centre so the min can only improve (lower) on it.
+        let mut best_d = fold_csg(edits, world_pos).dist;
+        let mut best_p = world_pos;
+        let offs = Self::sub_offsets();
+        for &oz in &offs {
+            for &oy in &offs {
+                for &ox in &offs {
+                    let p = world_pos + Vec3::new(ox, oy, oz) * voxel_size;
+                    let d = fold_csg(edits, p).dist;
+                    if d < best_d {
+                        best_d = d;
+                        best_p = p;
+                    }
+                }
+            }
+        }
+        (best_d, best_p)
+    }
+
     /// Bake a single brick from its culled candidate edits (from the BVH). First
     /// builds the brick's material palette (the ≤K global ids present), then per
-    /// voxel stores the CSG-combined distance (`fold_csg`, for the surface solver)
-    /// and the per-palette-slot distance field (`material_distances`, for the
-    /// shader's argmin material boundary). `key` carries the LOD whose voxel size
-    /// scales the sample spacing.
+    /// voxel stores the **conservative** CSG-combined distance (the min over a
+    /// `SUBSAMPLES³` sub-grid spanning the voxel cell — see [`conservative_sample`])
+    /// and the per-palette-slot distance field (`material_distances`, for the shader's
+    /// argmin material boundary). `key` carries the LOD whose voxel size scales the
+    /// sample spacing.
     fn bake_single_brick(
         key: BrickKey,
         config: &super::SdfGridConfig,
@@ -227,9 +287,14 @@ impl SdfAtlas {
         let palette = build_palette(edits, &positions);
 
         for (idx, &world_pos) in positions.iter().enumerate() {
-            dist[idx] = Self::dist_to_snorm(fold_csg(edits, world_pos).dist);
+            // Conservative distance: min over the voxel cell so thin features survive
+            // at coarse LOD and the field stays a safe lower bound for skipping.
+            let (d, mat_pos) = Self::conservative_sample(edits, world_pos, voxel_size);
+            dist[idx] = Self::dist_to_snorm(d);
 
-            let slots = material_distances(edits, &palette, world_pos);
+            // Materials are sampled at the min-achieving point so the per-voxel
+            // material matches the surface the conservative distance represents.
+            let slots = material_distances(edits, &palette, mat_pos);
             let base = idx * PALETTE_K;
             for (k, &d) in slots.iter().enumerate() {
                 mat_dist[base + k] = Self::dist_to_snorm(d);
@@ -500,6 +565,75 @@ mod tests {
             }
         }
         brick.palette[best]
+    }
+
+    /// Conservative-bake invariant: every baked voxel distance is ≤ the single-sample
+    /// `fold_csg` at the voxel centre. The stored field is the min over the voxel cell,
+    /// so it can only be a lower bound — never larger than the centre sample. This is
+    /// what makes a sphere-trace step of the stored value safe (it can't overshoot a
+    /// surface) and is the formal statement of "conservative".
+    #[test]
+    fn baked_voxel_is_conservative_lower_bound() {
+        let config = super::super::SdfGridConfig::default();
+        // A coarse LOD (big voxels) makes the sub-grid min vs centre gap visible.
+        let lod = 2u32;
+        let voxel_size = config.voxel_size_at(lod);
+        let edits = vec![resolved(
+            SdfPrimitive::Sphere { radius: 0.5 },
+            Transform::from_xyz(0.3, 0.1, -0.2),
+            SdfOp::default(),
+            0,
+        )];
+        let coord = config.world_to_brick_lod(Vec3::ZERO, lod);
+        let brick = SdfAtlas::bake_single_brick(BrickKey::new(lod, coord), &config, &edits);
+
+        for z in 0..BRICK_EDGE {
+            for y in 0..BRICK_EDGE {
+                for x in 0..BRICK_EDGE {
+                    let idx = z * BRICK_EDGE * BRICK_EDGE + y * BRICK_EDGE + x;
+                    let centre =
+                        SdfAtlas::voxel_world_pos(coord, x, y, z, voxel_size);
+                    let centre_d = fold_csg(&edits, centre).dist;
+                    // Decode the stored snorm back to world units (clamped range).
+                    let stored = brick.dist[idx] as f32 / 32767.0 * SNORM_CLAMP_DIST;
+                    // Allow one snorm quantization step of slack.
+                    let slack = SNORM_CLAMP_DIST / 32767.0;
+                    assert!(
+                        stored <= centre_d.clamp(-SNORM_CLAMP_DIST, SNORM_CLAMP_DIST) + slack,
+                        "voxel ({x},{y},{z}): stored {stored} must be ≤ centre sample {centre_d}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Thin-feature survival: a slab thinner than a coarse voxel must still produce a
+    /// negative (inside-surface) voxel at that LOD. With centre-only sampling the
+    /// trilinear field never crosses zero and the slab vanishes (the grain bug); the
+    /// conservative sub-grid min guarantees at least one negative voxel where the slab
+    /// passes through the brick.
+    #[test]
+    fn thin_slab_survives_coarse_lod() {
+        let config = super::super::SdfGridConfig::default();
+        // LOD 2 voxel = 0.1 * 4 = 0.4 world units. A slab half this thick (0.1, full
+        // thickness 0.2) is thinner than one voxel — the regime where it disappears.
+        let lod = 2u32;
+        let edits = vec![resolved(
+            SdfPrimitive::Box {
+                half_extents: Vec3::new(2.0, 0.1, 2.0),
+            },
+            Transform::IDENTITY,
+            SdfOp::default(),
+            0,
+        )];
+        // Bake the brick straddling the slab plane (y = 0).
+        let coord = config.world_to_brick_lod(Vec3::ZERO, lod);
+        let brick = SdfAtlas::bake_single_brick(BrickKey::new(lod, coord), &config, &edits);
+        let any_inside = brick.dist.iter().any(|&d| d < 0);
+        assert!(
+            any_inside,
+            "a slab thinner than a LOD-{lod} voxel must still bake at least one inside voxel"
+        );
     }
 
     #[test]

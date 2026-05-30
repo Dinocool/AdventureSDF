@@ -13,8 +13,8 @@ struct SdfCameraUniform {
     screen_params: vec4<f32>,
     grid_origin: vec4<f32>,
     grid_dims: vec4<f32>,
-    debug_params: vec4<f32>,   // x = max_steps, y = max_dist, z = sdf_eps, w = bvh_node_count
-    bake_reach: vec4<f32>,     // x = world-units a baked brick reaches beyond a tight edit AABB
+    debug_params: vec4<f32>,   // x = max_steps, y = max_dist, z = sdf_eps, w = unused
+    march_params: vec4<f32>,   // x = pixel_cone (world radius/unit-dist/pixel), y = cubic_band, zw unused
     lod_params: vec4<f32>,     // x = lod_count, y = ring_bricks, z = base voxel_size, w = cell_stride
 };
 
@@ -57,54 +57,48 @@ struct BrickTile {
     pal_hi: u32,      // palette ids 2,3 (id2 | id3<<16)
 };
 
-// BVH node: 32 bytes (two vec3<f32> + u32 rows). `count_or_right`'s high bit
-// (0x80000000) marks an internal node — then the field is the right-child index
-// and `left_or_first` is the left child. Clear high bit => leaf, where the field
-// is the edit count and `left_or_first` the first edit index. The shader only
-// needs the AABBs for empty-space skipping, so it ignores edit indices entirely.
-struct BvhNode {
-    aabb_min: vec3<f32>,
-    left_or_first: u32,
-    aabb_max: vec3<f32>,
-    count_or_right: u32,
-};
-
 // --- Bindings ---
+//
+// Empty-space skipping is driven by the conservative SDF field itself (see the bake in
+// atlas.rs and the march in sdf_raymarch.wgsl), so there is NO GPU BVH binding — the BVH
+// lives CPU-side only, as the bake cull.
 
 @group(0) @binding(0) var<uniform> camera: SdfCameraUniform;
 @group(1) @binding(0) var atlas_tex: texture_2d<f32>;       // R16Snorm distance field
 @group(1) @binding(1) var atlas_sampler: sampler;
 @group(1) @binding(2) var<storage, read> chunk_buf: array<ChunkLookup>;  // sorted, binary-searched
 @group(1) @binding(3) var mat_tex: texture_2d<f32>;         // Rgba16Snorm: 4 palette-slot distances
-@group(1) @binding(4) var<storage, read> bvh_buf: array<BvhNode>;  // edit-AABB BVH (empty-space skip)
-@group(1) @binding(5) var<storage, read> materials: array<SdfMaterial>;  // material table, by global id
+@group(1) @binding(4) var<storage, read> materials: array<SdfMaterial>;  // material table, by global id
 // PBR texture arrays + their filtering sampler. Each is a texture_2d_array indexed
 // by a material's tex layer; sampled triplanar in `material`/`pbr`.
-@group(1) @binding(6) var pbr_sampler: sampler;
-@group(1) @binding(7) var tex_diffuse: texture_2d_array<f32>;
-@group(1) @binding(8) var tex_normal: texture_2d_array<f32>;
-@group(1) @binding(9) var tex_mra: texture_2d_array<f32>;
-@group(1) @binding(10) var tex_height: texture_2d_array<f32>;
-@group(1) @binding(11) var tex_edge: texture_2d_array<f32>;
-@group(1) @binding(12) var<storage, read> chunk_tile_buf: array<BrickTile>;  // packed per-chunk brick runs
+@group(1) @binding(5) var pbr_sampler: sampler;
+@group(1) @binding(6) var tex_diffuse: texture_2d_array<f32>;
+@group(1) @binding(7) var tex_normal: texture_2d_array<f32>;
+@group(1) @binding(8) var tex_mra: texture_2d_array<f32>;
+@group(1) @binding(9) var tex_height: texture_2d_array<f32>;
+@group(1) @binding(10) var tex_edge: texture_2d_array<f32>;
+@group(1) @binding(11) var<storage, read> chunk_tile_buf: array<BrickTile>;  // packed per-chunk brick runs
 
 // --- Shared constants ---
 
 const PALETTE_EMPTY: u32 = 0xffffu;
-const BVH_INTERNAL_FLAG: u32 = 0x80000000u;
 const TEXTURE_WORLD_SCALE: f32 = 0.5;  // world units per texture tile = 2.0
 const PI: f32 = 3.14159265359;
 
 // --- Uniform accessors ---
 
-fn num_bvh_nodes() -> u32 { return u32(camera.debug_params.w); }
 fn max_steps() -> u32 { return u32(camera.debug_params.x); }
 fn max_dist() -> f32 { return camera.debug_params.y; }
 fn sdf_eps() -> f32 { return camera.debug_params.z; }
-// World-units a baked brick can reach beyond a tight edit AABB (single-sourced from
-// `bricks_in_aabb`: SNORM_CLAMP_DIST + one brick). The BVH skip inflates every box by
-// this so it never jumps past a baked shell brick.
-fn bake_reach() -> f32 { return camera.bake_reach.x; }
+// Pixel cone half-width per unit ray distance (world radius a pixel covers at t=1).
+// The march terminates when the conservative field is below `pixel_cone * t` — i.e. the
+// surface is within a pixel — so far geometry resolves at coarse LOD instead of marching
+// down to LOD 0 (the vast-distance efficiency win).
+fn pixel_cone() -> f32 { return camera.march_params.x; }
+// Distance band (world units) within which a LOD-0 sample switches to the exact analytic
+// cubic for a crisp near silhouette. Outside it (or at coarse LOD) the march sphere-traces
+// the conservative field.
+fn cubic_band() -> f32 { return camera.march_params.y; }
 
 // --- LOD clipmap / chunk accessors ---
 
