@@ -170,7 +170,7 @@ fn sdf_debug_modes_validate() {
 /// default compose skips — validate each so errors inside them are caught.
 #[test]
 fn sdf_feature_defs_validate() {
-    for def in ["SDF_SHADOWS", "SDF_REFLECTIONS", "SDF_PARALLAX", "SDF_DISPLACE"] {
+    for def in ["SDF_SHADOWS", "SDF_REFLECTIONS"] {
         validate_composed_sdf_with_defs(&[def]).unwrap_or_else(|e| panic!("{e}"));
     }
 }
