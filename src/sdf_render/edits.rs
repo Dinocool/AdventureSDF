@@ -111,6 +111,12 @@ pub const MATERIAL_TEX_MAPS: usize = 5;
 pub struct MaterialDef {
     pub base_color: Color,
     pub blend_softness: f32,
+    /// Scalar PBR fallbacks used when this material has NO MRA texture (`tex_layers[2]`
+    /// absent). Lets a material be authored as a plain metal/dielectric without a texture
+    /// set. When an MRA texture IS present it wins. `metallic` 0 = dielectric, 1 = metal;
+    /// `roughness` 0 = mirror, 1 = fully diffuse.
+    pub metallic: f32,
+    pub roughness: f32,
     /// PBR texture-array layer per map, or `u32::MAX` if absent. See [`MATERIAL_TEX_MAPS`].
     pub tex_layers: [u32; MATERIAL_TEX_MAPS],
 }
@@ -120,6 +126,9 @@ impl Default for MaterialDef {
         Self {
             base_color: Color::srgb(0.8, 0.8, 0.8),
             blend_softness: 0.0,
+            // Matches the shader's old textureless neutral: dielectric, fully rough.
+            metallic: 0.0,
+            roughness: 1.0,
             tex_layers: [u32::MAX; MATERIAL_TEX_MAPS],
         }
     }

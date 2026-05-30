@@ -520,6 +520,10 @@ fn setup_sdf_scene(
             material_assets.add(MaterialAsset {
                 base_color: [1.0, 1.0, 1.0, 1.0],
                 blend_softness: 0.0,
+                // Textured material: MRA texture supplies metallic/roughness, so these
+                // scalar fallbacks are unused. Keep the prior neutral values.
+                metallic: 0.0,
+                roughness: 1.0,
                 maps: std::array::from_fn(|_| {
                     Some(TexRef {
                         slug: slug.to_string(),
@@ -533,9 +537,27 @@ fn setup_sdf_scene(
 
     let mat_sand = mat("sand", "sand", "1");
     let mat_cobble = mat("cobble", "cobble_stone", "1");
-    let mat_cobble2 = mat("cobble2", "cobble_stone", "3");
     let mat_ground = mat("ground", "ground", "1");
-    let mat_ground2 = mat("ground2", "ground", "4");
+
+    // Textureless PBR exemplars: synthesized in-memory with NO maps, so the shader uses
+    // the scalar metallic/roughness fallbacks. These show the Stage-3 IBL clearly — a
+    // smooth metal mirrors the sky, a rough one reads as brushed/satin metal.
+    let mut exemplar = |color: [f32; 4], metallic: f32, roughness: f32| -> u32 {
+        let handle = material_assets.add(MaterialAsset {
+            base_color: color,
+            blend_softness: 0.0,
+            metallic,
+            roughness,
+            maps: std::array::from_fn(|_| None),
+        });
+        asset_table.register(handle)
+    };
+    // Deep red, fully metallic, fairly smooth — the headline mirror-metal sphere.
+    let mat_red_metal = exemplar([0.55, 0.04, 0.03, 1.0], 1.0, 0.18);
+    // Gold-ish metal, medium roughness — satin highlight, softer sky reflection.
+    let mat_gold_rough = exemplar([0.83, 0.62, 0.18, 1.0], 1.0, 0.45);
+    // Glossy white dielectric — near-mirror clearcoat look, strong fresnel rim.
+    let mat_white_gloss = exemplar([0.9, 0.9, 0.92, 1.0], 0.0, 0.08);
 
     // Camera
     let orbit = SdfOrbitCamera::default();
@@ -582,11 +604,12 @@ fn setup_sdf_scene(
             },
             mat_cobble,
         ),
+        // Headline exemplar: deep-red mirror metal sphere (textureless, scalar PBR).
         (
             2,
             Transform::from_xyz(-1.1, 0.55, -0.3),
             SdfPrimitive::Sphere { radius: 0.55 },
-            mat_cobble2,
+            mat_red_metal,
         ),
         // Torus lies flat: its half-thickness above centre is `minor` (0.18).
         (
@@ -598,7 +621,7 @@ fn setup_sdf_scene(
             },
             mat_ground,
         ),
-        // Capsule standing up: half-height + radius above centre.
+        // Rough gold metal exemplar: satin highlight, softer sky reflection.
         (
             4,
             Transform::from_xyz(1.3, 0.68, -0.4),
@@ -606,7 +629,7 @@ fn setup_sdf_scene(
                 half_height: 0.4,
                 radius: 0.28,
             },
-            mat_ground2,
+            mat_gold_rough,
         ),
         // Cylinder standing up: half-height above centre.
         (
@@ -618,11 +641,12 @@ fn setup_sdf_scene(
             },
             mat_cobble,
         ),
+        // Glossy white dielectric exemplar: near-mirror clearcoat, strong fresnel rim.
         (
             6,
             Transform::from_xyz(0.6, 0.45, -1.1),
             SdfPrimitive::Sphere { radius: 0.45 },
-            mat_ground,
+            mat_white_gloss,
         ),
     ];
 
