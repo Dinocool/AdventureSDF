@@ -30,6 +30,24 @@ pub struct PrevEditAabbs {
     map: std::collections::HashMap<Entity, bevy::math::bounding::Aabb3d>,
 }
 
+impl PrevEditAabbs {
+    /// Number of tracked edits (for add/remove detection in the diagnostic sync bake).
+    pub fn len(&self) -> usize {
+        self.map.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.map.is_empty()
+    }
+    /// Whether `entity` was present last frame.
+    pub fn contains(&self, entity: &Entity) -> bool {
+        self.map.contains_key(entity)
+    }
+    /// Replace the tracked set (diagnostic sync bake bookkeeping).
+    pub fn set_map(&mut self, map: std::collections::HashMap<Entity, bevy::math::bounding::Aabb3d>) {
+        self.map = map;
+    }
+}
+
 /// One in-flight async bake: a pool task baking the bricks of one or more chunks, tagged
 /// with the `edit_epoch` it was scheduled under (results baked against superseded edits
 /// are detected and requeued).
@@ -74,13 +92,15 @@ impl Default for BakeScheduler {
 const BAKE_CHUNKS_PER_TASK: usize = 2;
 
 /// Any component that affects an edit's baked result. A change to one of these
-/// triggers a targeted rebake of the bricks the edit touches.
-type ChangedEdit = Or<(
+/// triggers a targeted rebake of the bricks the edit touches. Exposed as
+/// [`ChangedEditFilter`] so the diagnostic sync bake can reuse the same change filter.
+pub type ChangedEditFilter = Or<(
     Changed<Transform>,
     Changed<SdfOp>,
     Changed<SdfPrimitive>,
     Changed<SdfMaterial>,
 )>;
+type ChangedEdit = ChangedEditFilter;
 
 /// The chunk coord (per axis) of the chunk-ring window corner for `camera_pos` at `lod`:
 /// the camera's chunk minus half the ring (in chunks) on each axis, so the ring is

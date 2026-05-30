@@ -11,15 +11,17 @@
 
 #import bevy_core_pipeline::fullscreen_vertex_shader::FullscreenVertexOutput
 
-#import sdf::bindings::{camera, max_steps, max_dist, sdf_eps, pixel_cone, cubic_band, cell_stride, voxel_size_at}
+#import sdf::bindings::{camera, max_steps, max_dist, sdf_eps, pixel_cone, cubic_band, over_relax, cell_stride, voxel_size_at, abs_chunk_key, local_brick_index}
 #import sdf::brick::{
     world_to_brick_lod,
     scene_sdf,
     load_material_distances,
     pick_material,
     calc_normal,
-    step_voxel_at,
-    dist_to_brick_exit,
+    ChunkCache,
+    new_chunk_cache,
+    resolve_march,
+    dist_to_brick_exit_lod,
 }
 #import sdf::cubic::{build_cell_cubic, solve_cell_cubic, dist_to_cell_exit}
 #import sdf::pbr::shade_material
@@ -37,34 +39,49 @@ struct RaymarchResult {
     // genuine empty-space miss from a BVH over-skip that jumps over real geometry.
     fate: u32,
     lod: u32,  // LOD level that served the hit (for the SDF_DEBUG_LOD overlay)
+    atlas_base: u32,  // packed tile origin of the serving brick (for SDF_DEBUG_TILE_ID)
 };
 
-// Single unified raymarch. One loop, one resolve per step (`scene_sdf` → finest resident
-// LOD + conservative distance + tile/palette), branching three ways:
+// Single unified raymarch. One cached resolve per step (`resolve_march` → finest resident
+// LOD + trilinear distance + tile/palette, memoising the chunk search across steps via a
+// per-ray `ChunkCache`), branching three ways:
 //
-//   1. Empty here (no resident brick at `p`): advance to the next brick face at the
-//      finest resident LOD (conservative DDA — never skips over a baked surface).
-//   2. LOD 0 and near the surface (`d < cubic_band`): solve the exact analytic cubic in
-//      this cell for a crisp silhouette; on a miss step to the cell exit.
-//   3. Otherwise (coarse LOD, or far): sphere-trace the conservative field, and accept a
-//      hit once the surface is within the pixel cone (`d < max(eps, cone·t)`), so distant
-//      geometry resolves at coarse LOD instead of marching all the way down to LOD 0.
+//   1. Empty here (no resident brick at `p`): advance to the next brick face at the finest
+//      resident-window LOD via brick-geometry DDA (`dist_to_brick_exit_lod` — a pure lattice
+//      step, so it never skips over a baked brick). The LOD comes from the SAME resolve, so
+//      empty steps cost no second chunk search.
+//   2. LOD 0 and near the surface (`d < cubic_band`): solve the exact analytic cubic in this
+//      cell for a crisp silhouette; on a miss step to the cell exit.
+//   3. Otherwise (coarse LOD, or far): sphere-trace the trilinear field with Keinert
+//      over-relaxation (step `over_relax · d`, fall back when unbounding spheres separate),
+//      accepting a hit once the surface is within the pixel cone (`d < max(eps, cone·t)`).
 //
-// The conservative bake (atlas.rs) guarantees the stored field is a lower bound, so every
-// sphere-trace step and DDA skip is safe — there is no GPU BVH in this path.
+// The stored field is the true trilinear SDF sampled at voxel centres (atlas.rs); empty-space
+// DDA steps by brick geometry (always safe) and the in-brick sphere-trace is bounded by the
+// brick exit, so the march is robust. There is no GPU BVH in this path.
 fn raymarch(origin: vec3<f32>, dir: vec3<f32>) -> RaymarchResult {
     var t = 0.0;
     var steps = 0u;
-    var result = RaymarchResult(false, 0.0, 0u, 0u, vec3<f32>(0.0), 2u, 0u);
+    var result = RaymarchResult(false, 0.0, 0u, 0u, vec3<f32>(0.0), 2u, 0u, 0u);
 
     let MAX_STEPS = max_steps();
     let MAX_DIST = max_dist();
     let SDF_EPS = sdf_eps();
     let CONE = pixel_cone();
     let CUBIC_BAND = cubic_band();
+    let OMEGA = over_relax();
 
     let edge = i32(camera.grid_dims.z);
     let s = cell_stride();
+
+    // Per-ray chunk-search memo (NanoVDB/Tree64 accessor): a marching ray stays in the same
+    // chunk for many steps, so each LOD's probe is O(1) until it crosses a chunk boundary.
+    var cache = new_chunk_cache();
+    // Previous unbounding-sphere radius + the step actually taken, for over-relaxation
+    // fallback (Keinert 2014): if the new sphere doesn't reach back to the previous one,
+    // the relaxed step overshot — undo it and re-take the safe `d` step.
+    var prev_d = 0.0;
+    var prev_step = 0.0;
 
     for (var i = 0u; i < MAX_STEPS; i = i + 1u) {
         steps = i + 1u;
@@ -76,21 +93,29 @@ fn raymarch(origin: vec3<f32>, dir: vec3<f32>) -> RaymarchResult {
             return result;
         }
 
-        let scene = scene_sdf(p);
+        let scene = resolve_march(p, &cache);
 
-        // --- 1. Empty space: conservative DDA to the next brick face -----------------
+        // --- 1. Empty space: brick-geometry DDA to the next brick face ---------------
         if (!scene.in_brick) {
-            t += dist_to_brick_exit(p, dir) + step_voxel_at(p) * 0.01;
+            let wl = scene.window_lod;
+            t += dist_to_brick_exit_lod(p, dir, wl) + voxel_size_at(wl) * 0.01;
+            prev_d = 0.0;
+            prev_step = 0.0;
             continue;
         }
 
         let lod = scene.lod;
         let voxel_size = voxel_size_at(lod);
-        let d = scene.dist;                          // conservative field (lower bound)
+        let d = scene.dist;                          // trilinear SDF at p
         let cone = CONE * t;                         // pixel-cone half-width here
 
         // --- 2. LOD 0 near the surface: exact analytic cubic -------------------------
+        // (SDF_DISABLE_CUBIC skips this branch → pure sphere-trace everywhere, for bisect.)
+#ifdef SDF_DISABLE_CUBIC
+        if (false) {
+#else
         if (lod == 0u && d < CUBIC_BAND) {
+#endif
             let ray_d_voxel = dir / voxel_size;       // voxels per world unit at LOD 0
             let gv = p / voxel_size;                  // LOD voxel space (world-0 anchored)
             let cell_g = floor(gv);
@@ -115,13 +140,31 @@ fn raymarch(origin: vec3<f32>, dir: vec3<f32>) -> RaymarchResult {
                 result.hit_pos = hit_p;
                 result.fate = 0u;
                 result.lod = lod;
+                result.atlas_base = scene.atlas_base;
                 return result;
             }
             t += advance + voxel_size * 0.001;
+            prev_d = 0.0;
+            prev_step = 0.0;
             continue;
         }
 
-        // --- 3. Coarse LOD / far: sphere-trace the conservative field ----------------
+        // --- 3. Coarse LOD / far: sphere-trace the trilinear field -------------------
+        //
+        // Over-relaxation validation FIRST (Keinert 2014): the previous relaxed step
+        // `prev_step` was safe only if the new unbounding sphere of radius `d` still reaches
+        // back over it (`d + prev_d >= prev_step`). If not, the relaxed step jumped PAST the
+        // surface — `p` is now inside/beyond it, so we must NOT accept this point as a hit
+        // (doing so lands the hit at a view-dependent spot → swimming normals/textures on
+        // camera rotation). Back up to the previous safe radius and resume plain tracing.
+        if (prev_step > 0.0 && d + prev_d < prev_step) {
+            t += prev_d - prev_step;                 // undo the overshoot (negative)
+            prev_d = 0.0;
+            prev_step = 0.0;
+            continue;
+        }
+
+        // Accept only a point reached by a validated step (never an overshoot).
         if (d < max(SDF_EPS, cone)) {
             let hit_p = p;
             result.hit = true;
@@ -132,12 +175,17 @@ fn raymarch(origin: vec3<f32>, dir: vec3<f32>) -> RaymarchResult {
             result.hit_pos = hit_p;
             result.fate = 0u;
             result.lod = lod;
+            result.atlas_base = scene.atlas_base;
             return result;
         }
-        // Step by the conservative distance (safe lower bound), with a floor so we never
-        // stall, and never past the brick exit so we re-resolve LOD as the ray moves.
-        let brick_exit = dist_to_brick_exit(p, dir);
-        t += clamp(d, voxel_size * 0.01, brick_exit + voxel_size * 0.01);
+
+        // Step `omega * d`, floored so we never stall, and capped at the brick exit so we
+        // re-resolve LOD as the ray crosses bricks. omega = 1 is plain sphere tracing.
+        let brick_exit = dist_to_brick_exit_lod(p, dir, lod);
+        let step = clamp(OMEGA * d, voxel_size * 0.01, brick_exit + voxel_size * 0.01);
+        t += step;
+        prev_d = d;
+        prev_step = step;
     }
 
     result.steps = MAX_STEPS;
@@ -274,29 +322,98 @@ fn main(in: FullscreenVertexOutput) -> FragmentOutput {
 
     #ifdef SDF_DEBUG_BRICK_BOUNDS
     if (rm.hit) {
-        // Color the surface by the brick that contains the hit (at the serving LOD),
-        // and draw grid lines on brick-cell boundaries to expose the brick layout.
+        // Per-brick colour cycle, keyed on the INTEGER brick index the lookup uses
+        // (`world_to_brick_lod` → stride-aligned origin → / stride). Adjacent bricks step
+        // through a hue sequence, so the grid reads as a smoothly cycling patchwork. A
+        // duplicated brick shows the SAME colour repeating where the hue should have
+        // advanced; a missing brick shows background. Distinct colours in a duplicated
+        // region mean the lookup is returning genuinely different bricks there.
         let lod = rm.lod;
-        let voxel_size = voxel_size_at(lod);
-        let brick = world_to_brick_lod(hit_pos, lod);
-        let brick_hash = u32(brick.x * 73856093 ^ brick.y * 19349663 ^ brick.z * 83492791);
-        let hue = f32(brick_hash & 0xffu) * 0.618033988749895;
-        let h = fract(hue) * 6.0;
-        let tint = vec3<f32>(
-            clamp(1.0 - abs(h - 3.0), 0.0, 1.0),
-            clamp(1.0 - abs(h - 2.0), 0.0, 1.0),
-            clamp(1.0 - abs(h - 1.0), 0.0, 1.0),
+        let s = cell_stride();
+        let origin = world_to_brick_lod(hit_pos, lod);   // stride-aligned, signed
+        // Exact-multiple-of-stride / stride → the integer brick index (works for negatives).
+        let bi = origin / s;
+
+        // Sequential hue: weight the axes by small coprime steps so neighbours in any
+        // direction land on clearly different hues that cycle through the full wheel.
+        let seq = f32(bi.x) * 0.13 + f32(bi.y) * 0.27 + f32(bi.z) * 0.41;
+        let h = fract(seq) * 6.0;
+        let col = clamp(
+            vec3<f32>(abs(h - 3.0) - 1.0, 2.0 - abs(h - 2.0), 2.0 - abs(h - 4.0)),
+            vec3<f32>(0.0),
+            vec3<f32>(1.0),
         );
 
-        // Distance (in voxels) from the nearest brick-cell boundary plane.
-        let s = f32(cell_stride());
-        let rel = hit_pos / voxel_size;
-        let cell = rel / s;
-        let frac3 = abs(fract(cell) - 0.5);
-        let edge_dist = (0.5 - max(max(frac3.x, frac3.y), frac3.z)) * s;
-        let line = select(1.0, 0.0, edge_dist < 0.15);
+        // Light shading so the surface shape still reads under the colours.
+        let shade = clamp(dot(normal, normalize(vec3<f32>(0.4, 0.8, 0.3))) * 0.4 + 0.6, 0.2, 1.0);
+        return FragmentOutput(vec4<f32>(col * shade, 1.0), ndc_depth);
+    }
+    return FragmentOutput(vec4<f32>(bg_color * 0.3, 1.0), 1.0);
+    #endif
 
-        let col = mix(vec3<f32>(0.05), tint, line * 0.85 + 0.15);
+    #ifdef SDF_DEBUG_TILE_ID
+    if (rm.hit) {
+        // Colour by the resolved ATLAS TILE (atlas_base) — the actual texels the hit
+        // sampled. Distinguishes two failure modes for the "half renders twice" bug:
+        //   • duplicated halves SAME colour  → tile collision (two bricks → one tile)
+        //   • duplicated halves DIFFERENT    → distinct tiles holding duplicated bake data
+        // Integer hash of atlas_base (Wang-style mix) so ADJACENT tiles get unrelated hues
+        // — a linear-in-base hue makes neighbouring tiles look identical and mislead the
+        // "same tile?" read (col_px differs by only 64 between adjacent tiles).
+        var hsh = rm.atlas_base * 0x9e3779b9u + 0x85ebca6bu;
+        hsh = hsh ^ (hsh >> 16u);
+        hsh = hsh * 0x7feb352du;
+        hsh = hsh ^ (hsh >> 15u);
+        let h = f32(hsh & 0xffffu) / 65535.0 * 6.0;
+        let col = clamp(
+            vec3<f32>(abs(h - 3.0) - 1.0, 2.0 - abs(h - 2.0), 2.0 - abs(h - 4.0)),
+            vec3<f32>(0.0),
+            vec3<f32>(1.0),
+        );
+        let shade = clamp(dot(normal, normalize(vec3<f32>(0.4, 0.8, 0.3))) * 0.4 + 0.6, 0.2, 1.0);
+        return FragmentOutput(vec4<f32>(col * shade, 1.0), ndc_depth);
+    }
+    return FragmentOutput(vec4<f32>(bg_color * 0.3, 1.0), 1.0);
+    #endif
+
+    #ifdef SDF_DEBUG_HITPOS
+    if (rm.hit) {
+        // Color by the WORLD hit position octant sign (x→R, y→G, z→B channel = positive).
+        // Tests whether a left-screen ray is actually hitting LEFT geometry or has marched
+        // to the RIGHT half: if the "duplicated" left region shows the +x (red) colour, the
+        // ray hit right-side geometry → the bug is in the march/field, NOT tile addressing.
+        let s = step(vec3<f32>(0.0), hit_pos);   // 1 where coord >= 0
+        return FragmentOutput(vec4<f32>(s, 1.0), ndc_depth);
+    }
+    return FragmentOutput(vec4<f32>(bg_color * 0.3, 1.0), 1.0);
+    #endif
+
+    #ifdef SDF_DEBUG_CHUNK_ID
+    if (rm.hit) {
+        // Colour by the resolved CHUNK key at the hit (same key the lookup binary-searches).
+        // Paired with Tile ID (which showed the two duplicated halves share ONE tile): if
+        // the halves here are the SAME colour → both bricks are in the same chunk (a local
+        // index / popcount collapse); DIFFERENT colour → two chunks alias to one tile
+        // (cross-chunk tile-run packing overlap).
+        let coord = world_to_brick_lod(hit_pos, rm.lod);
+        let key = abs_chunk_key(coord, rm.lod);
+        let li = local_brick_index(coord);
+        // Integer hash of the full chunk key (Wang-style mix) so ADJACENT chunks get
+        // unrelated hues — a linear-in-index hue makes neighbouring chunks (e.g. -1 vs 0
+        // where a sphere straddles the origin) look identical and mislead the diagnosis.
+        var hsh = key.x * 0x9e3779b9u + key.y;
+        hsh = hsh ^ (hsh >> 16u);
+        hsh = hsh * 0x7feb352du;
+        hsh = hsh ^ (hsh >> 15u);
+        let h = f32(hsh & 0xffffu) / 65535.0 * 6.0;
+        var col = clamp(
+            vec3<f32>(abs(h - 3.0) - 1.0, 2.0 - abs(h - 2.0), 2.0 - abs(h - 4.0)),
+            vec3<f32>(0.0),
+            vec3<f32>(1.0),
+        );
+        // Brightness by local slot so two bricks in the SAME chunk are the same hue but
+        // distinguishable shades (and identical shade ⇒ literally the same local slot).
+        col = col * (0.4 + 0.6 * f32(li) / 63.0);
         return FragmentOutput(vec4<f32>(col, 1.0), ndc_depth);
     }
     return FragmentOutput(vec4<f32>(bg_color * 0.3, 1.0), 1.0);

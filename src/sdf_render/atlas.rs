@@ -167,23 +167,6 @@ impl Default for SdfAtlas {
 /// outside a 1-brick pad, never got re-dirtied when the edit left.)
 pub const SNORM_CLAMP_DIST: f32 = 1.0;
 
-/// Sub-grid resolution per axis used to make a baked voxel a **conservative lower
-/// bound** on the true signed distance over its cell. Instead of one analytic sample
-/// at the voxel centre, each voxel is sampled on a `SUBSAMPLES³` grid spanning its
-/// cell (`±½ voxel`) and the **minimum** signed distance is stored.
-///
-/// Why min, and why this matters for LOD: a coarse voxel (`voxel_size · 2^L`) sampled
-/// only at its centre misses any feature thinner than the voxel — the trilinear field
-/// never crosses zero and rays pass straight through (the "grain / escaped rays" at
-/// coarse LOD). Taking the min over the cell guarantees that if *any* sub-sample is
-/// inside the surface, the voxel reads negative, so thin slabs survive at every LOD.
-/// The min is also never an over-estimate of the true distance, so the stored field is
-/// a conservative lower bound — a sphere-trace step of the stored value can never pass
-/// through a surface, which is what lets the march skip empty space safely without the
-/// GPU BVH. `N=2` (the cell corners) is the cheapest grid that brackets the cell;
-/// raise for thinner features at higher bake cost.
-pub const SUBSAMPLES: usize = 2;
-
 impl SdfAtlas {
     /// Convert a signed distance to 16-bit signed normalized.
     /// Range: [-1.0, 1.0] maps to [-32767, 32767].
@@ -213,55 +196,18 @@ impl SdfAtlas {
         )
     }
 
-    /// The signed offsets (in fractions of a voxel, per axis) of the conservative
-    /// sub-grid spanning `[-½, +½]` of a voxel. The voxel centre (offset 0) is always
-    /// sampled separately by [`conservative_sample`], so these are the `SUBSAMPLES`
-    /// span points: `N=1` → centre only (empty span); `N=2` → the cell's ±½ corners.
-    /// See [`SUBSAMPLES`].
-    fn sub_offsets() -> [f32; SUBSAMPLES] {
-        let mut offs = [0.0; SUBSAMPLES];
-        if SUBSAMPLES > 1 {
-            for (i, o) in offs.iter_mut().enumerate() {
-                *o = i as f32 / (SUBSAMPLES - 1) as f32 - 0.5;
-            }
-        }
-        offs
-    }
-
-    /// Conservative analytic sample at voxel point `world_pos`: the **minimum**
-    /// signed distance over the voxel centre plus a `SUBSAMPLES³` sub-grid spanning the
-    /// voxel's cell (`±½ voxel`), and the world point that achieved it. Seeding with the
-    /// centre guarantees the result is always ≤ the plain centre sample, so the stored
-    /// field is a conservative lower bound that preserves sub-voxel features at coarse
-    /// LOD (see [`SUBSAMPLES`]). The min-achieving point is where the material slots are
-    /// sampled, so the per-voxel material stays consistent with the distance.
-    fn conservative_sample(edits: &[ResolvedEdit], world_pos: Vec3, voxel_size: f32) -> (f32, Vec3) {
-        // Seed with the voxel centre so the min can only improve (lower) on it.
-        let mut best_d = fold_csg(edits, world_pos).dist;
-        let mut best_p = world_pos;
-        let offs = Self::sub_offsets();
-        for &oz in &offs {
-            for &oy in &offs {
-                for &ox in &offs {
-                    let p = world_pos + Vec3::new(ox, oy, oz) * voxel_size;
-                    let d = fold_csg(edits, p).dist;
-                    if d < best_d {
-                        best_d = d;
-                        best_p = p;
-                    }
-                }
-            }
-        }
-        (best_d, best_p)
-    }
-
     /// Bake a single brick from its culled candidate edits (from the BVH). First
-    /// builds the brick's material palette (the ≤K global ids present), then per
-    /// voxel stores the **conservative** CSG-combined distance (the min over a
-    /// `SUBSAMPLES³` sub-grid spanning the voxel cell — see [`conservative_sample`])
-    /// and the per-palette-slot distance field (`material_distances`, for the shader's
-    /// argmin material boundary). `key` carries the LOD whose voxel size scales the
-    /// sample spacing.
+    /// builds the brick's material palette (the ≤K global ids present), then per voxel
+    /// stores the CSG-combined signed distance sampled at the voxel centre (`fold_csg`,
+    /// the trilinear field the surface solver marches) and the per-palette-slot distance
+    /// field (`material_distances`, for the shader's argmin material boundary). `key`
+    /// carries the LOD whose voxel size scales the sample spacing.
+    ///
+    /// Sampling at the voxel centre (not a min over the cell) keeps the field a true
+    /// trilinear SDF — correct shape, no grid-snapped blockiness, and the same surface
+    /// position at every LOD (no inter-LOD seam). The trade-off is that a feature thinner
+    /// than a voxel can be missed at coarse LOD (its zero-crossing falls between samples);
+    /// that sub-voxel detail loss is accepted as the cost of a clean, artifact-free field.
     fn bake_single_brick(
         key: BrickKey,
         config: &super::SdfGridConfig,
@@ -287,14 +233,9 @@ impl SdfAtlas {
         let palette = build_palette(edits, &positions);
 
         for (idx, &world_pos) in positions.iter().enumerate() {
-            // Conservative distance: min over the voxel cell so thin features survive
-            // at coarse LOD and the field stays a safe lower bound for skipping.
-            let (d, mat_pos) = Self::conservative_sample(edits, world_pos, voxel_size);
-            dist[idx] = Self::dist_to_snorm(d);
+            dist[idx] = Self::dist_to_snorm(fold_csg(edits, world_pos).dist);
 
-            // Materials are sampled at the min-achieving point so the per-voxel
-            // material matches the surface the conservative distance represents.
-            let slots = material_distances(edits, &palette, mat_pos);
+            let slots = material_distances(edits, &palette, world_pos);
             let base = idx * PALETTE_K;
             for (k, &d) in slots.iter().enumerate() {
                 mat_dist[base + k] = Self::dist_to_snorm(d);
@@ -552,6 +493,288 @@ mod tests {
         SdfAtlas::bake_single_brick(BrickKey::new(0, coord), config, edits)
     }
 
+    /// Reproduce the full GPU resolve+sample for a sphere across a grid of world points and
+    /// compare the reconstructed brick field against the analytic field. A brick that holds
+    /// the wrong region's geometry (the "object baked into two separate bricks" duplication)
+    /// shows up as a clamp-range point where the brick sample's sign disagrees with the
+    /// analytic sign — printed with its world pos + the brick coord that served it.
+    #[test]
+    fn baked_field_matches_analytic_across_sphere() {
+        let config = super::super::SdfGridConfig::default();
+        let lod = 0u32;
+        let voxel_size = config.voxel_size_at(lod);
+        let stride = config.cell_stride();
+        // Reproduce the reported single-cube repro: ONE box far out at all-negative coords
+        // (-10.822, -0.339, -5.058), 1.0 half-extents. A single edit means no CSG/cull
+        // interaction — so any duplication here is pure coordinate→brick→chunk→tile
+        // addressing at a negative, off-origin location.
+        let cube_centre = Vec3::new(-10.822, -0.339, -5.058);
+        let edits = vec![resolved(
+            SdfPrimitive::Box {
+                half_extents: Vec3::splat(1.0),
+            },
+            Transform::from_translation(cube_centre),
+            SdfOp::default(),
+            0,
+        )];
+        let (_aabbs, bvh) = build_bvh(&edits);
+
+        // Bake every brick the scene touches, with the LOD rings centred on the cube so it
+        // is fully resident (full_bake rings follow the camera position).
+        let mut atlas = SdfAtlas::default();
+        atlas.full_bake(&edits, &bvh, &config, cube_centre);
+
+        // Build the FULL GPU-side data exactly as the render path does:
+        // 1. tile origins from the stable allocator (col_px|row_px<<16), wrapped per row;
+        // 2. the chunk lookup + packed tile-run tables (sorted chunks, occupancy popcount);
+        // 3. the atlas pixel buffer via the real per-tile blit (pack_tile_texels layout).
+        // Then resolve every world point the way the shader does — chunk binary-search →
+        // occupancy bit → popcount offset → atlas_base → voxel_pixel — and trilinear-sample
+        // the pixel buffer. This exercises the upload-side packing the direct-brick test
+        // skips, which is where the multi-edit (cube-dependent) duplication must live.
+        const TILES_PER_ROW: u32 = 256;
+        let edge = BRICK_EDGE as u32;
+        let tile_w = edge * edge; // 64
+        let tile_origin = |tile: u32| -> (u32, u32) {
+            ((tile % TILES_PER_ROW) * tile_w, (tile / TILES_PER_ROW) * edge)
+        };
+        let tex_w = TILES_PER_ROW * tile_w;
+        let rows = atlas.tiles.high_water().div_ceil(TILES_PER_ROW).max(1);
+        let tex_h = rows * edge;
+
+        // Atlas pixel buffer (R16 snorm i16), blitted per the production layout.
+        let mut pixels = vec![0i16; (tex_w * tex_h) as usize];
+        for (key, brick) in atlas.bricks.iter() {
+            let tile = atlas.tiles.tile(key).unwrap();
+            let (col_px, row_px) = tile_origin(tile);
+            for z in 0..edge {
+                for y in 0..edge {
+                    for x in 0..edge {
+                        let src = (z * edge * edge + y * edge + x) as usize;
+                        let u = col_px + y * edge + x; // tile-local: y*EDGE+x across width
+                        let v = row_px + z;
+                        pixels[(v * tex_w + u) as usize] = brick.dist[src];
+                    }
+                }
+            }
+        }
+
+        // Chunk tables with real atlas_base packing.
+        let tables = crate::sdf_render::chunk::build_chunk_tables(&atlas, &config, |key| {
+            let tile = atlas.tiles.tile(key).unwrap();
+            let (col_px, row_px) = tile_origin(tile);
+            crate::sdf_render::chunk::BrickTile {
+                atlas_base: col_px | (row_px << 16),
+                pal01: 0,
+                pal23: 0,
+            }
+        });
+
+        // The shader binary-searches `grid_dims.w` = resident_chunks().len() entries, but
+        // the uploaded table is build_chunk_tables().chunks.len(). If those differ the search
+        // bound is wrong → reads past/short of the real table → wrong brick. Pin them equal.
+        let resident = crate::sdf_render::chunk::resident_chunks(&atlas, &config).len();
+        assert_eq!(
+            resident,
+            tables.chunks.len(),
+            "shader chunk-count bound (resident_chunks={resident}) must equal uploaded chunk table len ({})",
+            tables.chunks.len()
+        );
+
+        // DIRECT TILE-COLLISION CHECK (the reported symptom: two halves share one tile id).
+        // Every resolvable brick the scene resolves to must own a UNIQUE atlas_base; if two
+        // distinct world bricks map to the same tile, one brick's geometry shows at the
+        // other's location. Scan all resident brick coords, resolve each to its atlas_base,
+        // and assert no two distinct bricks collide.
+        {
+            use std::collections::HashMap;
+            let mut base_owner: HashMap<u32, BrickKey> = HashMap::new();
+            for key in atlas.bricks.keys() {
+                // Resolve this brick's atlas_base via the SAME path the shader uses, at the
+                // brick's OWN lod (not the fixed scan lod).
+                let resolved = {
+                    let (ck, li) = crate::sdf_render::chunk::chunk_of(*key, &config);
+                    let (kh, kl) = crate::sdf_render::chunk::chunk_gpu_key(ck);
+                    tables
+                        .chunks
+                        .binary_search_by(|c| (c.key_hi, c.key_lo).cmp(&(kh, kl)))
+                        .ok()
+                        .and_then(|idx| {
+                            let chunk = tables.chunks[idx];
+                            let occ = (chunk.occ_lo as u64) | ((chunk.occ_hi as u64) << 32);
+                            if (occ >> li) & 1 == 0 {
+                                return None;
+                            }
+                            let off = (occ & ((1u64 << li) - 1)).count_ones();
+                            Some(tables.tile_run[(chunk.tile_run_base + off) as usize].atlas_base)
+                        })
+                };
+                if let Some(base) = resolved
+                    && let Some(other) = base_owner.insert(base, *key)
+                {
+                    assert!(
+                        other == *key,
+                        "TILE COLLISION: bricks {key:?} and {other:?} both resolve to atlas_base {base:#x}"
+                    );
+                }
+            }
+        }
+
+        // Shader-equivalent resolve: world point → brick coord → chunk key → binary search
+        // → occupancy popcount → tile_run[base+off].atlas_base. Returns the packed base.
+        let resolve_atlas_base = |p: Vec3| -> Option<u32> {
+            let coord = config.world_to_brick_lod(p, lod);
+            let (ck, li) = crate::sdf_render::chunk::chunk_of(BrickKey::new(lod, coord), &config);
+            let (kh, kl) = crate::sdf_render::chunk::chunk_gpu_key(ck);
+            let idx = tables
+                .chunks
+                .binary_search_by(|c| (c.key_hi, c.key_lo).cmp(&(kh, kl)))
+                .ok()?;
+            let chunk = tables.chunks[idx];
+            let occ = (chunk.occ_lo as u64) | ((chunk.occ_hi as u64) << 32);
+            if (occ >> li) & 1 == 0 {
+                return None;
+            }
+            let off = (occ & ((1u64 << li) - 1)).count_ones();
+            Some(tables.tile_run[(chunk.tile_run_base + off) as usize].atlas_base)
+        };
+
+        // Trilinear-sample the atlas pixel buffer at `p` from a resolved `atlas_base`,
+        // mirroring brick.wgsl voxel_pixel + sample_brick_sdf exactly.
+        let sample_atlas = |atlas_base: u32, p: Vec3| -> f32 {
+            let col_px = (atlas_base & 0xffff) as i32;
+            let row_px = (atlas_base >> 16) as i32;
+            let e = BRICK_EDGE as i32;
+            let load = |lx: i32, ly: i32, lz: i32| -> f32 {
+                let cx = lx.clamp(0, e - 1);
+                let cy = ly.clamp(0, e - 1);
+                let cz = lz.clamp(0, e - 1);
+                let u = col_px + cy * e + cx;
+                let v = row_px + cz;
+                pixels[(v * tex_w as i32 + u) as usize] as f32 / 32767.0 * SNORM_CLAMP_DIST
+            };
+            let stride_f = stride as f32;
+            let voxel_f = p / voxel_size;
+            let bo = (voxel_f / stride_f).floor() * stride_f;
+            let local_f = voxel_f - bo;
+            let i0f = local_f.floor();
+            let f = local_f - i0f;
+            let i0 = IVec3::new(i0f.x as i32, i0f.y as i32, i0f.z as i32);
+            let lp = |a: f32, b: f32, w: f32| a + (b - a) * w;
+            let c000 = load(i0.x, i0.y, i0.z);
+            let c100 = load(i0.x + 1, i0.y, i0.z);
+            let c010 = load(i0.x, i0.y + 1, i0.z);
+            let c110 = load(i0.x + 1, i0.y + 1, i0.z);
+            let c001 = load(i0.x, i0.y, i0.z + 1);
+            let c101 = load(i0.x + 1, i0.y, i0.z + 1);
+            let c011 = load(i0.x, i0.y + 1, i0.z + 1);
+            let c111 = load(i0.x + 1, i0.y + 1, i0.z + 1);
+            let x00 = lp(c000, c100, f.x);
+            let x10 = lp(c010, c110, f.x);
+            let x01 = lp(c001, c101, f.x);
+            let x11 = lp(c011, c111, f.x);
+            let y0 = lp(x00, x10, f.y);
+            let y1 = lp(x01, x11, f.y);
+            lp(y0, y1, f.z)
+        };
+
+        let n = 81;
+        let span = 2.5_f32; // cover the 1.0-half-extent cube + a margin, centred on it
+        let mut mismatches = Vec::new();
+        for iz in 0..n {
+            for iy in 0..n {
+                for ix in 0..n {
+                    let p = cube_centre + Vec3::new(
+                        (ix as f32 / (n - 1) as f32 - 0.5) * 2.0 * span,
+                        (iy as f32 / (n - 1) as f32 - 0.5) * 2.0 * span,
+                        (iz as f32 / (n - 1) as f32 - 0.5) * 2.0 * span,
+                    );
+                    let analytic = fold_csg(&edits, p).dist;
+                    if analytic.abs() > SNORM_CLAMP_DIST - voxel_size || analytic.abs() < voxel_size {
+                        continue;
+                    }
+                    match resolve_atlas_base(p) {
+                        Some(base) => {
+                            let baked = sample_atlas(base, p);
+                            if (baked < 0.0) != (analytic < 0.0) {
+                                mismatches.push((p, baked, analytic));
+                            }
+                        }
+                        None => {
+                            if analytic < 0.0 {
+                                mismatches.push((p, f32::NAN, analytic));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            mismatches.is_empty(),
+            "GPU-resolved baked field sign diverges from analytic at {} point(s) (p, baked, analytic); first few: {:?}",
+            mismatches.len(),
+            &mismatches[..mismatches.len().min(8)]
+        );
+    }
+
+    /// Parity check: the GPU computes a brick's chunk key + local slot with WGSL functions
+    /// (`abs_chunk_key`, `local_brick_index`) built on `floor_div(a,b) = i32(floor(f32(a)/
+    /// f32(b)))` — FLOAT division. The CPU uses Rust integer `div_euclid`/`rem_euclid`
+    /// (`chunk_of` + `chunk_gpu_key`). If these disagree for any coord (e.g. large negative
+    /// coords where f32 rounding bites, or where f32 can't exactly represent the integer),
+    /// the GPU searches a different key/slot than the CPU stored → wrong tile, no CPU test
+    /// using `chunk_of` could ever catch it. This ports the WGSL ops verbatim and compares.
+    #[test]
+    fn wgsl_chunk_math_matches_rust_over_negative_range() {
+        let config = super::super::SdfGridConfig::default();
+        let s = config.cell_stride();
+        let c = crate::sdf_render::chunk::CHUNK_BRICKS;
+
+        // Verbatim port of bindings.wgsl `floor_div`: i32(floor(f32(a)/f32(b))).
+        let floor_div = |a: i32, b: i32| -> i32 { (a as f32 / b as f32).floor() as i32 };
+
+        // Verbatim port of `abs_chunk_key` (returns key_hi, key_lo).
+        let wgsl_key = |coord: IVec3, lod: u32| -> (u32, u32) {
+            let bias = 32768i32;
+            let cx = ((floor_div(floor_div(coord.x, s), c) + bias) & 0xffff) as u32;
+            let cy = ((floor_div(floor_div(coord.y, s), c) + bias) & 0xffff) as u32;
+            let cz = ((floor_div(floor_div(coord.z, s), c) + bias) & 0xffff) as u32;
+            ((lod << 16) | cx, (cy << 16) | cz)
+        };
+        // Verbatim port of `local_brick_index`.
+        let wgsl_local = |coord: IVec3| -> u32 {
+            let lx = ((floor_div(coord.x, s) % c) + c) % c;
+            let ly = ((floor_div(coord.y, s) % c) + c) % c;
+            let lz = ((floor_div(coord.z, s) % c) + c) % c;
+            (lz * c * c + ly * c + lx) as u32
+        };
+
+        // Scan brick coords across a wide negative range covering the failing cube
+        // (-10.8,-0.3,-5.1 → brick indices around -108..-50). Use stride-aligned coords.
+        let mut mismatches = Vec::new();
+        for bz in -180..20 {
+            for by in -20..20 {
+                for bx in -180..20 {
+                    let coord = IVec3::new(bx * s, by * s, bz * s);
+                    let key = BrickKey::new(0, coord);
+                    let (ck, li) = crate::sdf_render::chunk::chunk_of(key, &config);
+                    let (rust_hi, rust_lo) = crate::sdf_render::chunk::chunk_gpu_key(ck);
+                    let (g_hi, g_lo) = wgsl_key(coord, 0);
+                    let g_li = wgsl_local(coord);
+                    if (rust_hi, rust_lo, li) != (g_hi, g_lo, g_li) {
+                        mismatches.push((coord, (rust_hi, rust_lo, li), (g_hi, g_lo, g_li)));
+                    }
+                }
+            }
+        }
+        assert!(
+            mismatches.is_empty(),
+            "WGSL chunk math diverges from Rust at {} coord(s) (coord, rust(hi,lo,li), wgsl(hi,lo,li)); first few: {:?}",
+            mismatches.len(),
+            &mismatches[..mismatches.len().min(8)]
+        );
+    }
+
     /// The winning (nearest) GLOBAL material id for voxel `idx`: argmin over the K
     /// palette-slot distances, then map the local slot through the brick palette —
     /// mirrors what the shader computes per pixel. `PALETTE_EMPTY` if the winning
@@ -567,15 +790,16 @@ mod tests {
         brick.palette[best]
     }
 
-    /// Conservative-bake invariant: every baked voxel distance is ≤ the single-sample
-    /// `fold_csg` at the voxel centre. The stored field is the min over the voxel cell,
-    /// so it can only be a lower bound — never larger than the centre sample. This is
-    /// what makes a sphere-trace step of the stored value safe (it can't overshoot a
-    /// surface) and is the formal statement of "conservative".
+    /// The bake stores the TRUE trilinear field: every baked voxel equals the analytic
+    /// `fold_csg` distance sampled at the voxel centre (within snorm quantization + the
+    /// ±SNORM_CLAMP_DIST clamp). This is the contract that keeps the field a real SDF —
+    /// correct shape, no grid-snapped blockiness, and the same surface position at every
+    /// LOD (so no inter-LOD seam). A prior min-over-cell bake violated this (it stored a
+    /// lower bound, inflating coarse surfaces); this guards against reintroducing it.
     #[test]
-    fn baked_voxel_is_conservative_lower_bound() {
+    fn baked_voxel_is_true_centre_distance() {
         let config = super::super::SdfGridConfig::default();
-        // A coarse LOD (big voxels) makes the sub-grid min vs centre gap visible.
+        // A coarse LOD (big voxels) is where any deviation from the true field shows most.
         let lod = 2u32;
         let voxel_size = config.voxel_size_at(lod);
         let edits = vec![resolved(
@@ -587,53 +811,23 @@ mod tests {
         let coord = config.world_to_brick_lod(Vec3::ZERO, lod);
         let brick = SdfAtlas::bake_single_brick(BrickKey::new(lod, coord), &config, &edits);
 
+        let slack = SNORM_CLAMP_DIST / 32767.0;
         for z in 0..BRICK_EDGE {
             for y in 0..BRICK_EDGE {
                 for x in 0..BRICK_EDGE {
                     let idx = z * BRICK_EDGE * BRICK_EDGE + y * BRICK_EDGE + x;
-                    let centre =
-                        SdfAtlas::voxel_world_pos(coord, x, y, z, voxel_size);
-                    let centre_d = fold_csg(&edits, centre).dist;
-                    // Decode the stored snorm back to world units (clamped range).
+                    let centre = SdfAtlas::voxel_world_pos(coord, x, y, z, voxel_size);
+                    let expected = fold_csg(&edits, centre)
+                        .dist
+                        .clamp(-SNORM_CLAMP_DIST, SNORM_CLAMP_DIST);
                     let stored = brick.dist[idx] as f32 / 32767.0 * SNORM_CLAMP_DIST;
-                    // Allow one snorm quantization step of slack.
-                    let slack = SNORM_CLAMP_DIST / 32767.0;
                     assert!(
-                        stored <= centre_d.clamp(-SNORM_CLAMP_DIST, SNORM_CLAMP_DIST) + slack,
-                        "voxel ({x},{y},{z}): stored {stored} must be ≤ centre sample {centre_d}"
+                        (stored - expected).abs() <= slack,
+                        "voxel ({x},{y},{z}): stored {stored} must equal true centre {expected}"
                     );
                 }
             }
         }
-    }
-
-    /// Thin-feature survival: a slab thinner than a coarse voxel must still produce a
-    /// negative (inside-surface) voxel at that LOD. With centre-only sampling the
-    /// trilinear field never crosses zero and the slab vanishes (the grain bug); the
-    /// conservative sub-grid min guarantees at least one negative voxel where the slab
-    /// passes through the brick.
-    #[test]
-    fn thin_slab_survives_coarse_lod() {
-        let config = super::super::SdfGridConfig::default();
-        // LOD 2 voxel = 0.1 * 4 = 0.4 world units. A slab half this thick (0.1, full
-        // thickness 0.2) is thinner than one voxel — the regime where it disappears.
-        let lod = 2u32;
-        let edits = vec![resolved(
-            SdfPrimitive::Box {
-                half_extents: Vec3::new(2.0, 0.1, 2.0),
-            },
-            Transform::IDENTITY,
-            SdfOp::default(),
-            0,
-        )];
-        // Bake the brick straddling the slab plane (y = 0).
-        let coord = config.world_to_brick_lod(Vec3::ZERO, lod);
-        let brick = SdfAtlas::bake_single_brick(BrickKey::new(lod, coord), &config, &edits);
-        let any_inside = brick.dist.iter().any(|&d| d < 0);
-        assert!(
-            any_inside,
-            "a slab thinner than a LOD-{lod} voxel must still bake at least one inside voxel"
-        );
     }
 
     #[test]

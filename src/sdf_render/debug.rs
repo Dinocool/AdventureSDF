@@ -12,7 +12,7 @@ use bevy_egui::{EguiTextureHandle, EguiUserTextures, egui};
 
 use crate::editor::panels::{DockSide, register_panel};
 use crate::editor::registry::{
-    DebugModeKind, ShaderDebugMode, ShaderDebugRegistry, debug_modes_ui,
+    DebugModeKind, ShaderDebugMode, ShaderDebugRegistry, ShaderDebugState, debug_modes_ui,
 };
 use crate::scene_manager::{AppScene, SceneEntity};
 
@@ -197,6 +197,9 @@ impl Plugin for SdfDebugPlugin {
             .register_type::<SdfAtlasStats>()
             .register_type::<BvhDebugState>()
             .register_type::<ChunkDebugState>()
+            // Diagnostic: start with "LOD 0 only" enabled so the LOD-disable bisect step
+            // is active on launch (per request). Remove this seed once the LOD bug is found.
+            .add_systems(Startup, seed_lod_debug_toggle)
             .add_systems(
                 Update,
                 update_atlas_stats.run_if(in_state(AppScene::SdfEditor)),
@@ -300,6 +303,14 @@ impl Plugin for SdfDebugPlugin {
     }
 }
 
+/// Diagnostic seed: enable the current bisect toggle at startup so it is active on launch.
+/// `ShaderDebugState` is the editor's checkbox-state resource; guarded by `Option` so a
+/// non-editor/test harness without it is a no-op. Remove once the bug is identified.
+fn seed_lod_debug_toggle(_state: Option<ResMut<ShaderDebugState>>) {
+    // No diagnostic toggle seeded — launch into the normal shaded render. (The toggles
+    // remain available in the shader-debug panel; re-enable a seed here if needed.)
+}
+
 fn register_shader_modes(app: &mut App) {
     // Init in case SdfScenePlugin builds before EditorPlugin (main.rs order).
     app.init_resource::<ShaderDebugRegistry>();
@@ -357,6 +368,66 @@ fn register_shader_modes(app: &mut App) {
         "SDF_DEBUG_LOD",
         "Tint hit by clipmap LOD: 0 white, 1 green, 2 blue, 3 red, 4+ yellow",
     ));
+    registry.register(overlay(
+        "sdf/tile_id",
+        "Tile ID",
+        "SDF_DEBUG_TILE_ID",
+        "Color by resolved atlas tile: same color on duplicated halves = tile collision",
+    ));
+    registry.register(overlay(
+        "sdf/chunk_id",
+        "Chunk ID",
+        "SDF_DEBUG_CHUNK_ID",
+        "Color by resolved chunk key (shade = local slot): same=one chunk, diff=cross-chunk",
+    ));
+    registry.register(overlay(
+        "sdf/hitpos",
+        "Hit pos sign",
+        "SDF_DEBUG_HITPOS",
+        "Color by world hit-pos sign (R=+x,G=+y,B=+z): does a left ray hit right geometry?",
+    ));
+
+    // Independent toggle (not part of the overlay group): bypass the per-ray chunk
+    // lookup cache, forcing a fresh binary search every probe. If enabling this fixes a
+    // visual artifact, the cache is the cause. Diagnostic — leave OFF normally.
+    registry.register(ShaderDebugMode {
+        id: "sdf/no_chunk_cache".into(),
+        label: "No chunk cache".into(),
+        shader_define: "SDF_DISABLE_CHUNK_CACHE".into(),
+        kind: DebugModeKind::Toggle,
+        description: "Bypass the per-ray chunk lookup cache (always binary-search)".into(),
+    });
+
+    // Independent toggle: force LOD 0 only (no clipmap shells). If enabling this fixes a
+    // visual artifact, the bug is LOD/shell related. Diagnostic — leave OFF normally.
+    registry.register(ShaderDebugMode {
+        id: "sdf/disable_lod".into(),
+        label: "LOD 0 only".into(),
+        shader_define: "SDF_DISABLE_LOD".into(),
+        kind: DebugModeKind::Toggle,
+        description: "Force LOD 0 only (disable clipmap shells)".into(),
+    });
+
+    // Independent toggle: skip the LOD-0 analytic cubic solver → pure sphere-trace
+    // everywhere. If enabling this fixes a visual artifact, the cubic is the cause.
+    registry.register(ShaderDebugMode {
+        id: "sdf/disable_cubic".into(),
+        label: "No cubic".into(),
+        shader_define: "SDF_DISABLE_CUBIC".into(),
+        kind: DebugModeKind::Toggle,
+        description: "Skip the LOD-0 cubic solver (pure sphere-trace)".into(),
+    });
+
+    // Independent toggle: linear chunk-table scan instead of the binary search. If enabling
+    // this fixes a visual artifact, the cause is the binary search / table sortedness / the
+    // grid_dims.w count bound.
+    registry.register(ShaderDebugMode {
+        id: "sdf/linear_chunk_search".into(),
+        label: "Linear chunk search".into(),
+        shader_define: "SDF_LINEAR_CHUNK_SEARCH".into(),
+        kind: DebugModeKind::Toggle,
+        description: "Brute-force linear chunk lookup (bypass binary search)".into(),
+    });
 }
 
 // --- Atlas stats ---
@@ -624,8 +695,18 @@ fn chunk_panel(world: &mut World, ui: &mut egui::Ui) {
         }
     }
     ui.separator();
-    let mut state = world.resource_mut::<ChunkDebugState>();
-    ui.checkbox(&mut state.visible, "Show chunk boxes");
+    {
+        let mut state = world.resource_mut::<ChunkDebugState>();
+        ui.checkbox(&mut state.visible, "Show chunk boxes");
+    }
+    ui.separator();
+    {
+        // Diagnostic: bypass the async/incremental bake + partial upload, rebuilding the
+        // whole atlas synchronously each change. If a visual bug disappears here, it lives
+        // in the async path.
+        let mut sync = world.resource_mut::<super::SyncBakeMode>();
+        ui.checkbox(&mut sync.0, "Sync bake (no async)");
+    }
 }
 
 // --- Wireframe bounds ---
