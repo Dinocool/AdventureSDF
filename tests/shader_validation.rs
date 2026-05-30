@@ -144,6 +144,14 @@ fn sdf_raymarch_wgsl_validates() {
 /// Each `#ifdef` debug branch must also compile + validate (they're skipped when no
 /// def is set, so the default compose would miss errors inside them).
 #[test]
+fn sdf_cone_prepass_wgsl_validates() {
+    // The cone-prepass compute shader imports the same sdf::* modules; compose + validate
+    // the whole graph exactly as the GPU pipeline would.
+    validate_composed_entry("assets/shaders/sdf_cone_prepass.wgsl", &[])
+        .unwrap_or_else(|e| panic!("{e}"));
+}
+
+#[test]
 fn sdf_debug_modes_validate() {
     for def in [
         "SDF_DEBUG_STEP_COUNT",

@@ -9,7 +9,8 @@ use bevy::render::render_graph::{
     NodeRunError, RenderGraphContext, RenderGraphExt, RenderLabel, ViewNode, ViewNodeRunner,
 };
 use bevy::render::render_resource::binding_types::{
-    sampler, storage_buffer_read_only, texture_2d, texture_2d_array, uniform_buffer,
+    sampler, storage_buffer_read_only, texture_2d, texture_2d_array, texture_storage_2d,
+    uniform_buffer,
 };
 use bevy::render::render_resource::*;
 use bevy::render::renderer::{RenderContext, RenderDevice, RenderQueue};
@@ -222,15 +223,50 @@ struct ExtractedTextureLibrary {
 
 // BISECT: minimal shader while building features back up after the division-free fix.
 const SDF_SHADER_PATH: &str = "shaders/sdf_raymarch.wgsl";
+/// Cone-prepass compute shader (per-tile seed-distance march).
+const SDF_CONE_SHADER_PATH: &str = "shaders/sdf_cone_prepass.wgsl";
 
 #[derive(Resource)]
 struct SdfPipeline {
     pipeline_id: CachedRenderPipelineId,
     layout_0: BindGroupLayoutDescriptor,
     layout_1: BindGroupLayoutDescriptor,
+    /// Cone-prepass seed texture, read (textureLoad) by the fragment march to start each
+    /// pixel at its tile's seed distance instead of 0.
+    layout_2: BindGroupLayoutDescriptor,
     #[expect(dead_code)]
     shader_handle: Handle<Shader>,
 }
+
+/// Compute pipeline + layouts for the cone prepass (one tile-cone march per 8×8 tile,
+/// writing per-tile seed distances). Reuses the SDF camera (layout_0) and atlas (layout_1)
+/// bind groups; `layout_2` is the write-only storage texture.
+#[derive(Resource)]
+struct SdfConePipeline {
+    pipeline_id: CachedComputePipelineId,
+    layout_2: BindGroupLayoutDescriptor,
+}
+
+/// Per-tile seed-distance texture written by the cone prepass and read by the fragment
+/// march. R32Float, one texel per 8×8 screen tile. Sized for 4K (480×270 tiles); the
+/// compute shader and fragment both bounds-check against the actual viewport.
+#[derive(Resource)]
+struct SdfConePrepass {
+    /// Storage-write view for the compute pass.
+    storage_view: TextureView,
+    /// Sampled (textureLoad) view for the fragment pass — same texture.
+    read_view: TextureView,
+}
+
+/// Screen-tile edge in pixels. MUST match `TILE` in sdf_cone_prepass.wgsl and the divisor
+/// the fragment pass uses to index the seed texture.
+const CONE_TILE: u32 = 8;
+/// Seed-texture capacity in tiles (covers 4K: ceil(3840/8) × ceil(2160/8)).
+const CONE_TEX_TILES_X: u32 = 480;
+const CONE_TEX_TILES_Y: u32 = 270;
+
+#[derive(Resource)]
+struct SdfConeShaderHandle(Handle<Shader>);
 
 #[derive(Resource, Default)]
 pub struct SdfShaderDefs {
@@ -300,6 +336,7 @@ impl ViewNode for SdfNode {
         }
         let layout_0 = pipeline_cache.get_bind_group_layout(&pipeline_res.layout_0);
         let layout_1 = pipeline_cache.get_bind_group_layout(&pipeline_res.layout_1);
+        let layout_2 = pipeline_cache.get_bind_group_layout(&pipeline_res.layout_2);
 
         // Bind group 0: camera uniform or fallback
         let has_camera = world
@@ -363,6 +400,14 @@ impl ViewNode for SdfNode {
             )),
         );
 
+        // Bind group 2: cone-prepass seed texture (per-tile start distance).
+        let prepass = world.resource::<SdfConePrepass>();
+        let bind_group_2 = device.create_bind_group(
+            "sdf_bind_group_2",
+            &layout_2,
+            &BindGroupEntries::sequential((&prepass.read_view,)),
+        );
+
         let post_process = view_target.post_process_write();
 
         let mut render_pass = render_context.begin_tracked_render_pass(RenderPassDescriptor {
@@ -385,6 +430,7 @@ impl ViewNode for SdfNode {
             render_pass.set_render_pipeline(pipeline);
             render_pass.set_bind_group(0, &bind_group_0, &[0]);
             render_pass.set_bind_group(1, &bind_group_1, &[]);
+            render_pass.set_bind_group(2, &bind_group_2, &[]);
             render_pass.draw(0..3, 0..1);
         }
 
@@ -420,6 +466,7 @@ impl Plugin for SdfRenderPlugin {
         // Load shader asset in main world so it's available for extraction
         let asset_server = app.world().resource::<AssetServer>();
         let shader_handle = asset_server.load(SDF_SHADER_PATH);
+        let cone_shader_handle: Handle<Shader> = asset_server.load(SDF_CONE_SHADER_PATH);
         // Load + retain the imported modules (Custom-path imports aren't auto-loaded).
         let module_handles: Vec<Handle<Shader>> = SDF_SHADER_MODULES
             .iter()
@@ -462,8 +509,9 @@ impl Plugin for SdfRenderPlugin {
             return;
         };
 
-        // Pass shader handle directly to render app (RenderStartup runs before Extract)
+        // Pass shader handles directly to render app (RenderStartup runs before Extract)
         render_app.insert_resource(SdfShaderHandle(shader_handle));
+        render_app.insert_resource(SdfConeShaderHandle(cone_shader_handle));
 
         render_app
             .add_systems(ExtractSchedule, extract_sdf_atlas)
@@ -480,6 +528,8 @@ impl Plugin for SdfRenderPlugin {
             .add_systems(Render, upload_texture_layers.after(init_texture_streaming))
             .add_systems(Render, rebuild_pipeline_on_def_change)
             .add_systems(RenderStartup, init_sdf_pipeline)
+            .add_systems(RenderStartup, init_cone_pipeline.after(init_sdf_pipeline))
+            .add_render_graph_node::<ViewNodeRunner<SdfConeNode>>(Core3d, SdfConeLabel)
             .add_render_graph_node::<ViewNodeRunner<SdfNode>>(Core3d, SdfLabel)
             // Run the SDF fullscreen pass between the opaque and transparent
             // passes. Gizmos (transform handles, bounds) draw in the Transparent3d
@@ -490,6 +540,7 @@ impl Plugin for SdfRenderPlugin {
                 Core3d,
                 (
                     Node3d::MainOpaquePass,
+                    SdfConeLabel,
                     SdfLabel,
                     Node3d::MainTransparentPass,
                 ),
@@ -675,7 +726,11 @@ fn rebuild_pipeline_on_def_change(
 
     let new_id = pipeline_cache.queue_render_pipeline(RenderPipelineDescriptor {
         label: Some("sdf_pipeline".into()),
-        layout: vec![pipeline.layout_0.clone(), pipeline.layout_1.clone()],
+        layout: vec![
+            pipeline.layout_0.clone(),
+            pipeline.layout_1.clone(),
+            pipeline.layout_2.clone(),
+        ],
         vertex: vertex_state,
         fragment: Some(FragmentState {
             shader,
@@ -1317,10 +1372,13 @@ fn init_sdf_pipeline(
     shader_handle: Res<SdfShaderHandle>,
     pipeline_cache: Res<PipelineCache>,
 ) {
+    // Visible to FRAGMENT (the raymarch pass) AND COMPUTE (the cone prepass reuses the
+    // same camera + atlas bind groups), so both pipelines share one layout source.
+    let vis = ShaderStages::FRAGMENT | ShaderStages::COMPUTE;
     let layout_0 = BindGroupLayoutDescriptor::new(
         "sdf_bind_group_0",
         &BindGroupLayoutEntries::sequential(
-            ShaderStages::FRAGMENT,
+            vis,
             (
                 // binding 0: per-view camera uniform (dynamic offset)
                 uniform_buffer::<SdfCameraData>(true),
@@ -1330,7 +1388,7 @@ fn init_sdf_pipeline(
     let layout_1 = BindGroupLayoutDescriptor::new(
         "sdf_bind_group_1",
         &BindGroupLayoutEntries::sequential(
-            ShaderStages::FRAGMENT,
+            vis,
             (
                 // binding 0: distance atlas (R8Snorm, filterable)
                 texture_2d(TextureSampleType::Float { filterable: true }),
@@ -1355,13 +1413,22 @@ fn init_sdf_pipeline(
             ),
         ),
     );
+    // group 2: cone-prepass seed texture (read in the fragment march as a per-tile start-t
+    // via textureLoad — no sampler). R32Float, non-filterable.
+    let layout_2 = BindGroupLayoutDescriptor::new(
+        "sdf_bind_group_2",
+        &BindGroupLayoutEntries::sequential(
+            ShaderStages::FRAGMENT,
+            (texture_2d(TextureSampleType::Float { filterable: false }),),
+        ),
+    );
 
     let shader = shader_handle.0.clone();
     let vertex_state = fullscreen_shader.to_vertex_state();
 
     let pipeline_id = pipeline_cache.queue_render_pipeline(RenderPipelineDescriptor {
         label: Some("sdf_pipeline".into()),
-        layout: vec![layout_0.clone(), layout_1.clone()],
+        layout: vec![layout_0.clone(), layout_1.clone(), layout_2.clone()],
         vertex: vertex_state,
         fragment: Some(FragmentState {
             shader: shader.clone(),
@@ -1494,6 +1561,7 @@ fn init_sdf_pipeline(
         pipeline_id,
         layout_0,
         layout_1,
+        layout_2,
         shader_handle: shader,
     });
     commands.insert_resource(SdfGpuAtlas {
@@ -1508,4 +1576,196 @@ fn init_sdf_pipeline(
         tex_array_views: Some(dummy_tex_views),
         tex_sampler: Some(dummy_tex_sampler),
     });
+}
+
+/// Allocate the per-tile seed texture (storage-write + sampled views) and queue the cone-
+/// prepass compute pipeline. Runs after `init_sdf_pipeline` so the shared camera/atlas
+/// layouts (layout_0/1) already exist on `SdfPipeline`.
+fn init_cone_pipeline(
+    mut commands: Commands,
+    device: Res<RenderDevice>,
+    pipeline_cache: Res<PipelineCache>,
+    sdf_pipeline: Res<SdfPipeline>,
+    cone_shader: Res<SdfConeShaderHandle>,
+) {
+    // group 2 for the COMPUTE side: write-only R32Float storage texture (one texel/tile).
+    let layout_2 = BindGroupLayoutDescriptor::new(
+        "sdf_cone_bind_group_2",
+        &BindGroupLayoutEntries::sequential(
+            ShaderStages::COMPUTE,
+            (texture_storage_2d(
+                TextureFormat::R32Float,
+                StorageTextureAccess::WriteOnly,
+            ),),
+        ),
+    );
+
+    let pipeline_id = pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
+        label: Some("sdf_cone_pipeline".into()),
+        layout: vec![
+            sdf_pipeline.layout_0.clone(),
+            sdf_pipeline.layout_1.clone(),
+            layout_2.clone(),
+        ],
+        shader: cone_shader.0.clone(),
+        ..default()
+    });
+
+    // The seed texture: STORAGE_BINDING (compute writes) + TEXTURE_BINDING (fragment reads).
+    let seed_tex = device.create_texture(&TextureDescriptor {
+        label: Some("sdf_cone_seed"),
+        size: Extent3d {
+            width: CONE_TEX_TILES_X,
+            height: CONE_TEX_TILES_Y,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: TextureDimension::D2,
+        format: TextureFormat::R32Float,
+        usage: TextureUsages::STORAGE_BINDING | TextureUsages::TEXTURE_BINDING,
+        view_formats: &[],
+    });
+    let storage_view = seed_tex.create_view(&TextureViewDescriptor::default());
+    let read_view = seed_tex.create_view(&TextureViewDescriptor::default());
+
+    commands.insert_resource(SdfConePipeline {
+        pipeline_id,
+        layout_2,
+    });
+    commands.insert_resource(SdfConePrepass {
+        storage_view,
+        read_view,
+    });
+}
+
+// --- Render Graph: cone prepass node ---
+
+#[derive(Debug, Hash, PartialEq, Eq, Clone, RenderLabel)]
+struct SdfConeLabel;
+
+#[derive(Default)]
+struct SdfConeNode;
+
+impl ViewNode for SdfConeNode {
+    // Run on the SDF camera view; we only need to gate on the view entity (camera uniform)
+    // and read the viewport size off the camera uniform itself.
+    type ViewQuery = &'static ViewTarget;
+
+    fn run(
+        &self,
+        graph: &mut RenderGraphContext,
+        render_context: &mut RenderContext,
+        _view_target: QueryItem<Self::ViewQuery>,
+        world: &World,
+    ) -> Result<(), NodeRunError> {
+        // Only run on SDF cameras.
+        let view_entity = graph.view_entity();
+        if world.get::<SdfCameraData>(view_entity).is_none() {
+            return Ok(());
+        }
+        if let Some(enabled) = world.get_resource::<SdfRenderEnabled>()
+            && !enabled.0
+        {
+            return Ok(());
+        }
+
+        let cone = world.resource::<SdfConePipeline>();
+        let sdf = world.resource::<SdfPipeline>();
+        let pipeline_cache = world.resource::<PipelineCache>();
+        let device = render_context.render_device();
+
+        let Some(pipeline) = pipeline_cache.get_compute_pipeline(cone.pipeline_id) else {
+            return Ok(());
+        };
+
+        // The compute pass reuses the fragment camera + atlas bind groups, so it needs the
+        // same camera uniform (with dynamic offset) and the atlas bind group 1.
+        let Some(camera_uniforms) = world.get_resource::<ComponentUniforms<SdfCameraData>>()
+        else {
+            return Ok(());
+        };
+        let Some(camera_binding) = camera_uniforms.binding() else {
+            return Ok(());
+        };
+        // Dynamic offset for this view's camera uniform.
+        let Some(dyn_off) = world.get::<bevy::render::extract_component::DynamicUniformIndex<SdfCameraData>>(view_entity)
+        else {
+            return Ok(());
+        };
+
+        let layout_0 = pipeline_cache.get_bind_group_layout(&sdf.layout_0);
+        let layout_1 = pipeline_cache.get_bind_group_layout(&sdf.layout_1);
+        let layout_2 = pipeline_cache.get_bind_group_layout(&cone.layout_2);
+
+        let bind_group_0 = device.create_bind_group(
+            "sdf_cone_bind_group_0",
+            &layout_0,
+            &BindGroupEntries::sequential((camera_binding.clone(),)),
+        );
+
+        let gpu_atlas = world.resource::<SdfGpuAtlas>();
+        let tex_views = gpu_atlas.tex_array_views.as_ref().unwrap();
+        let bind_group_1 = device.create_bind_group(
+            "sdf_cone_bind_group_1",
+            &layout_1,
+            &BindGroupEntries::sequential((
+                gpu_atlas.dist_view.as_ref().unwrap(),
+                gpu_atlas.sampler.as_ref().unwrap(),
+                gpu_atlas
+                    .lookup_buffer
+                    .as_ref()
+                    .unwrap()
+                    .as_entire_buffer_binding(),
+                gpu_atlas.mat_view.as_ref().unwrap(),
+                gpu_atlas
+                    .material_buffer
+                    .as_ref()
+                    .unwrap()
+                    .as_entire_buffer_binding(),
+                gpu_atlas.tex_sampler.as_ref().unwrap(),
+                &tex_views[0],
+                &tex_views[1],
+                &tex_views[2],
+                &tex_views[3],
+                &tex_views[4],
+                gpu_atlas
+                    .chunk_tile_buffer
+                    .as_ref()
+                    .unwrap()
+                    .as_entire_buffer_binding(),
+            )),
+        );
+
+        let prepass = world.resource::<SdfConePrepass>();
+        let bind_group_2 = device.create_bind_group(
+            "sdf_cone_bind_group_2",
+            &layout_2,
+            &BindGroupEntries::sequential((&prepass.storage_view,)),
+        );
+
+        // Viewport in tiles → workgroup count (workgroup is 8×8 = one tile per invocation).
+        let size = world
+            .get::<SdfCameraData>(view_entity)
+            .map(|c| UVec2::new(c.screen_params.x as u32, c.screen_params.y as u32))
+            .unwrap_or(UVec2::new(1920, 1080));
+        let tiles_x = size.x.div_ceil(CONE_TILE);
+        let tiles_y = size.y.div_ceil(CONE_TILE);
+        let wg_x = tiles_x.div_ceil(8);
+        let wg_y = tiles_y.div_ceil(8);
+
+        let mut pass = render_context
+            .command_encoder()
+            .begin_compute_pass(&ComputePassDescriptor {
+                label: Some("sdf_cone_prepass"),
+                timestamp_writes: None,
+            });
+        pass.set_pipeline(pipeline);
+        pass.set_bind_group(0, &bind_group_0, &[dyn_off.index()]);
+        pass.set_bind_group(1, &bind_group_1, &[]);
+        pass.set_bind_group(2, &bind_group_2, &[]);
+        pass.dispatch_workgroups(wg_x, wg_y, 1);
+
+        Ok(())
+    }
 }
