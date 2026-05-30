@@ -7,7 +7,6 @@ use bevy::prelude::*;
 pub mod config;
 pub mod dock;
 pub mod hierarchy;
-pub mod hot_reload;
 pub mod inspector;
 pub mod keybinds;
 pub mod menu_bar;
@@ -33,7 +32,6 @@ impl Plugin for EditorPlugin {
             registry::ShaderDebugRegistryPlugin,
             uniform_inspector::UniformInspectorPlugin,
             profiling::ProfilingPlugin,
-            hot_reload::HotReloadPlugin,
         ))
         .init_resource::<menu_bar::EditorRequests>()
         .init_resource::<menu_bar::CurrentScenePath>()
@@ -58,27 +56,11 @@ impl Plugin for EditorPlugin {
             0,
             profiling::profiling_ui,
         );
-        panels::register_panel(
-            app,
-            "core/hot_reload",
-            "Hot Reload",
-            DockSide::Bottom,
-            10,
-            hot_reload::hot_reload_ui,
-        );
 
         keybinds::plugin(app);
 
-        // A small viewport-ops panel so gizmo mode + snapping are visible/settable
-        // in the UI, not only via keybinds.
-        panels::register_panel(
-            app,
-            "core/viewport_ops",
-            "Transform",
-            DockSide::Left,
-            1,
-            viewport_ops_ui,
-        );
+        // Gizmo transform tools (mode + snap) now live in the viewport toolbar
+        // (see `dock::viewport_toolbar`), so there's no separate Transform panel.
 
         // Resource Inspector (Godot-style): edit material resources + browse textures.
         app.init_resource::<resource_inspector::ResourceInspectorState>();
@@ -93,35 +75,29 @@ impl Plugin for EditorPlugin {
 
         // Build the dock layout once, after `Startup` (so every plugin — including
         // the SDF debug plugin — has registered its panels), then render each frame.
-        app.add_systems(PostStartup, dock::init_dock_state)
-            .add_systems(bevy_egui::EguiPrimaryContextPass, dock::show_editor_dock);
+        // Install the Phosphor icon font once, after the egui context exists, so the
+        // toolbar can use icon glyphs (see `dock::viewport_toolbar`).
+        app.add_systems(
+            PostStartup,
+            install_phosphor_font.after(bevy_egui::EguiStartupSet::InitContexts),
+        )
+        .add_systems(PostStartup, dock::init_dock_state)
+        .add_systems(bevy_egui::EguiPrimaryContextPass, dock::show_editor_dock);
     }
 }
 
-/// Panel: gizmo mode buttons + snap settings, bound to the in-tree [`GizmoState`].
-fn viewport_ops_ui(world: &mut World, ui: &mut bevy_egui::egui::Ui) {
-    use crate::sdf_render::gizmo::{GizmoModes, GizmoState};
-
-    let mut state = world.resource_mut::<GizmoState>();
-    ui.label("Gizmo mode");
-    ui.horizontal(|ui| {
-        for (modes, label) in [
-            (GizmoModes::TRANSLATE, "Move (W)"),
-            (GizmoModes::ROTATE, "Rotate (E)"),
-            (GizmoModes::SCALE, "Scale (R)"),
-            (GizmoModes::all(), "All (Q)"),
-        ] {
-            if ui.selectable_label(state.modes == modes, label).clicked() {
-                state.modes = modes;
-            }
-        }
-    });
-    ui.separator();
-    ui.checkbox(&mut state.snap, "Snap (hold Ctrl)");
-    ui.add(bevy_egui::egui::Slider::new(&mut state.snap_move, 0.0..=2.0).text("Move step"));
-    ui.add(
-        bevy_egui::egui::Slider::new(&mut state.snap_angle, 0.0..=std::f32::consts::FRAC_PI_2)
-            .text("Rotate step (rad)"),
-    );
-    ui.add(bevy_egui::egui::Slider::new(&mut state.snap_scale, 0.0..=1.0).text("Scale step"));
+/// Merge the Phosphor icon font into the primary egui context's fonts, once at startup.
+/// `add_to_fonts` inserts it into the Proportional family alongside egui's built-ins, so
+/// icon glyphs (`egui_phosphor::regular::*`) render inline with normal toolbar text.
+fn install_phosphor_font(world: &mut World) {
+    let Ok(mut egui_ctx) = world
+        .query_filtered::<&mut bevy_egui::EguiContext, With<bevy_egui::PrimaryEguiContext>>()
+        .single_mut(world)
+    else {
+        return;
+    };
+    let ctx = egui_ctx.get_mut();
+    let mut fonts = bevy_egui::egui::FontDefinitions::default();
+    egui_phosphor::add_to_fonts(&mut fonts, egui_phosphor::Variant::Regular);
+    ctx.set_fonts(fonts);
 }

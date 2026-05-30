@@ -49,6 +49,12 @@ pub fn inspector_ui(world: &mut World, ui: &mut egui::Ui) {
     }
 
     ui.heading(format!("Entity #{}", entity.index()));
+
+    // Name field at the top: edit (or add) the entity's display name. Rendered here
+    // explicitly — and skipped in the generic section below — so it reads as the
+    // entity's title rather than just another reflected component.
+    name_field_ui(world, entity, ui);
+
     ui.separator();
 
     // Run any registered per-component overrides first (curated editors), taking
@@ -70,10 +76,12 @@ pub fn inspector_ui(world: &mut World, ui: &mut egui::Ui) {
     }
     world.insert_resource(overrides);
 
-    let custom_paths: Vec<String> = {
+    let mut custom_paths: Vec<String> = {
         let overrides = world.resource::<InspectorOverrides>();
         overrides.editors.keys().cloned().collect()
     };
+    // Name is rendered by `name_field_ui` above; keep it out of the generic section.
+    custom_paths.push(std::any::type_name::<Name>().to_string());
 
     if rendered_custom {
         ui.separator();
@@ -206,4 +214,26 @@ fn entity_has_type_path(world: &World, entity: Entity, type_path: &str) -> bool 
 /// Last path segment of a type path (`a::b::Foo` -> `Foo`).
 fn short_name(type_path: &str) -> &str {
     type_path.rsplit("::").next().unwrap_or(type_path)
+}
+
+/// Editable Name field for `entity`. Edits the existing [`Name`], or inserts one on
+/// first edit if the entity has none. Mirrors the Scene panel's inline rename.
+fn name_field_ui(world: &mut World, entity: Entity, ui: &mut egui::Ui) {
+    let mut name = world
+        .get::<Name>(entity)
+        .map(|n| n.as_str().to_string())
+        .unwrap_or_default();
+    ui.horizontal(|ui| {
+        ui.label("Name");
+        let resp = ui.add(
+            egui::TextEdit::singleline(&mut name)
+                .hint_text("(unnamed)")
+                .desired_width(f32::INFINITY),
+        );
+        if resp.changed()
+            && let Ok(mut e) = world.get_entity_mut(entity)
+        {
+            e.insert(Name::new(name.clone()));
+        }
+    });
 }

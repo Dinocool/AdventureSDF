@@ -9,6 +9,7 @@ editor = [
     "dep:bevy-inspector-egui",
     "dep:bevy_egui",
     "dep:egui_dock",
+    "dep:egui-phosphor",
 ]
 # Faster incremental compiles via dynamic linking of Bevy. Dev-only — never ship.
 fast = ["bevy/dynamic_linking"]
@@ -29,6 +30,9 @@ serde = { version = "1", features = ["derive"] }
 # Offline BC7 encode of the PBR texture arrays (cached to disk; ~1/6 the VRAM).
 intel_tex_2 = "0.2"
 egui_dock = { version = "0.18", optional = true }
+# Phosphor icon font for the editor toolbar (egui 0.33-compatible). Installed into the
+# egui context at startup; gives named glyph constants so toolbar buttons show real icons.
+egui-phosphor = { version = "0.11", optional = true }
 # egui's 2D tessellation (filled, antialiased shapes) for the in-tree gizmo overlay
 # renderer. Pinned to 0.33 to reuse the copies bevy_egui 0.39 (egui 0.33) pulls in.
 epaint = "0.33"
