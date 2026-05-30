@@ -26,6 +26,7 @@ use bevy::prelude::*;
 
 use super::bvh::Bvh;
 use super::edits::{ResolvedEdit, fold_csg};
+use super::{SdfCamera, SdfVolume, VolumeQueryData, gather_sorted_edits};
 
 /// Hard cap on clipmap levels — mirrors `VOLUME_LEVELS` in `render.rs` and bindings.wgsl
 /// (the GPU binds exactly this many 3D textures). `VolumeConfig::levels` must be `<=` this.
@@ -102,22 +103,12 @@ pub struct VolumeLevel {
 
 /// The CPU-side 3D distance clipmap: one `VolumeLevel` per active level + a generation
 /// counter the render world watches to decide when to re-upload (mirrors `SdfAtlas`).
-#[derive(Resource)]
+#[derive(Resource, Default)]
 pub struct VolumeClipmap {
     pub config: VolumeConfig,
     pub levels: Vec<VolumeLevel>,
     /// Bumped whenever any level is re-extracted, so the render world re-uploads.
     pub generation: u64,
-}
-
-impl Default for VolumeClipmap {
-    fn default() -> Self {
-        Self {
-            config: VolumeConfig::default(),
-            levels: Vec::new(),
-            generation: 0,
-        }
-    }
 }
 
 /// Convert a signed distance to voxel-unit snorm for level `lod`: clamp to `±decode_scale`
@@ -232,6 +223,110 @@ pub fn bake_level(
     data
 }
 
+/// Per-edit AABB set the volume last baked against, so a moved/added/removed edit forces a
+/// re-extract of every level (the volume is global, not per-edit-incremental). Mirrors
+/// `bake_scheduler::PrevEditAabbs`'s role for the brick atlas.
+#[derive(Resource, Default)]
+pub struct VolumePrevEdits {
+    count: usize,
+    entities: std::collections::HashSet<Entity>,
+}
+
+/// Synchronous clipmap recenter + re-extract. Each frame: for every active level, compute
+/// its camera-centred snapped origin; if it moved (camera crossed a level cell), or the edit
+/// set changed, or the level isn't built yet, re-bake that level densely from the analytic
+/// field. Bumps `generation` so the render world re-uploads only on change.
+///
+/// Re-extracts the WHOLE level on any cross (simplest-correct; a level is at most a few MB).
+/// `bake_level` is `Send`, so this can move to `AsyncComputeTaskPool` later — see the plan's
+/// Deferred section. Runs every frame in the editor scene (cheap when nothing changed: just
+/// the origin compare).
+pub fn recenter_volume(
+    mut clipmap: ResMut<VolumeClipmap>,
+    mut prev: ResMut<VolumePrevEdits>,
+    mut bvh: Local<Bvh>,
+    mut have_bvh: Local<bool>,
+    volumes: Query<VolumeQueryData, With<SdfVolume>>,
+    camera: Query<&Transform, (With<SdfCamera>, Without<SdfVolume>)>,
+) {
+    let camera_pos = camera.iter().next().map(|t| t.translation).unwrap_or(Vec3::ZERO);
+
+    // Detect edit-set changes (add/remove). Any geometry change re-bakes all levels, since a
+    // far edit can still set a coarse level's distance.
+    let gathered = gather_sorted_edits(&volumes);
+    let entities: std::collections::HashSet<Entity> = gathered.iter().map(|g| g.entity).collect();
+    let edits_changed =
+        !*have_bvh || entities.len() != prev.count || entities.iter().any(|e| !prev.entities.contains(e));
+
+    if edits_changed {
+        let resolved: Vec<ResolvedEdit> = gathered.iter().map(|g| g.edit.clone()).collect();
+        let aabbs: Vec<Aabb3d> = gathered.iter().map(|g| g.aabb).collect();
+        *bvh = Bvh::build(&aabbs);
+        *have_bvh = true;
+        prev.count = entities.len();
+        prev.entities = entities;
+        // We need the resolved edits available for baking below; stash via a closure scope.
+        recenter_levels(&mut clipmap, &resolved, &bvh, camera_pos, true);
+        return;
+    }
+
+    // Edits unchanged: only re-extract levels whose camera-centred origin moved. Rebuild the
+    // resolved-edit slice once (cheap; the gather already cloned the components).
+    let resolved: Vec<ResolvedEdit> = gathered.iter().map(|g| g.edit.clone()).collect();
+    recenter_levels(&mut clipmap, &resolved, &bvh, camera_pos, false);
+}
+
+/// Re-extract any level whose snapped origin changed (or all of them when `force`). Shared by
+/// the edits-changed and camera-moved paths above.
+fn recenter_levels(
+    clipmap: &mut VolumeClipmap,
+    edits: &[ResolvedEdit],
+    bvh: &Bvh,
+    camera_pos: Vec3,
+    force: bool,
+) {
+    let cfg = clipmap.config.clone();
+    let level_count = (cfg.levels as usize).min(MAX_VOLUME_LEVELS);
+
+    // Grow/shrink the level vec to the configured count (first run builds it).
+    if clipmap.levels.len() != level_count {
+        clipmap.levels.clear();
+        clipmap.levels.reserve(level_count);
+    }
+
+    let mut any_changed = false;
+    for lod in 0..level_count {
+        let vs = cfg.level_voxel_size(lod as u32);
+        let decode = cfg.decode_scale(lod as u32);
+        let new_origin = snap_origin(camera_pos, vs, cfg.resolution);
+
+        let needs = force
+            || clipmap.levels.len() <= lod
+            || clipmap.levels[lod].origin_voxel != new_origin;
+        if !needs {
+            continue;
+        }
+
+        let data = bake_level(new_origin, vs, decode, cfg.resolution, edits, bvh);
+        let level = VolumeLevel {
+            origin_voxel: new_origin,
+            voxel_size: vs,
+            data,
+            dirty: true,
+        };
+        if clipmap.levels.len() <= lod {
+            clipmap.levels.push(level);
+        } else {
+            clipmap.levels[lod] = level;
+        }
+        any_changed = true;
+    }
+
+    if any_changed {
+        clipmap.generation = clipmap.generation.wrapping_add(1);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -320,16 +415,21 @@ mod tests {
     fn origin_snap_is_stable_under_subcell_motion() {
         let cfg = VolumeConfig::default();
         let vs = cfg.level_voxel_size(0);
-        let base = snap_origin(Vec3::new(10.0, -4.0, 7.0), vs, cfg.resolution);
-        // Move less than one voxel on each axis.
+        // Start at a voxel CENTRE on each axis (n·vs + vs/2) so a small move can't cross a
+        // boundary — sitting exactly on a boundary would flip the floor and is not the
+        // stability case under test.
+        let centre = |n: i32| n as f32 * vs + vs * 0.5;
+        let p = Vec3::new(centre(25), centre(-10), centre(17));
+        let base = snap_origin(p, vs, cfg.resolution);
+        // Move less than HALF a voxel on each axis: still inside the same cell.
         let moved = snap_origin(
-            Vec3::new(10.0 + vs * 0.4, -4.0 - vs * 0.3, 7.0 + vs * 0.2),
+            p + Vec3::new(vs * 0.4, -vs * 0.4, vs * 0.3),
             vs,
             cfg.resolution,
         );
         assert_eq!(base, moved, "sub-voxel move must keep the same snapped origin");
-        // Crossing a full voxel shifts the origin by exactly one.
-        let crossed = snap_origin(Vec3::new(10.0 + vs, -4.0, 7.0), vs, cfg.resolution);
+        // Crossing a full voxel on +X shifts the origin by exactly one.
+        let crossed = snap_origin(p + Vec3::new(vs, 0.0, 0.0), vs, cfg.resolution);
         assert_eq!(crossed, base + IVec3::new(1, 0, 0));
     }
 }

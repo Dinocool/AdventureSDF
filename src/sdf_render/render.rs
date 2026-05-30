@@ -10,7 +10,9 @@ use bevy::render::render_graph::{
 };
 use bevy::render::render_resource::binding_types::{
     sampler, storage_buffer_read_only, texture_2d, texture_2d_array, texture_3d, uniform_buffer,
+    uniform_buffer_sized,
 };
+use std::num::NonZero;
 use bevy::render::render_resource::*;
 use bevy::render::renderer::{RenderContext, RenderDevice, RenderQueue};
 use bevy::render::view::{ViewDepthTexture, ViewTarget};
@@ -76,7 +78,12 @@ const VOLUME_LEVELS: usize = 4;
 
 /// GPU mirror of `SdfVolumeUniform` (bindings.wgsl): per-level placement + decode for the
 /// 3D distance clipmap. Bound at group 0 binding 1. Driven from `VolumeClipmap` each frame.
-#[derive(Resource, Clone, Copy, ShaderType)]
+///
+/// All fields are `vec4`/arrays-of-`vec4`, which are 16-byte aligned in both Rust (`Vec4` =
+/// `[f32;4]` repr) and WGSL std140 array stride — so the struct is layout-compatible as
+/// plain bytes and we upload it via `bytemuck` (no encase/`ShaderType` needed).
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct SdfVolumeData {
     /// Per level: xyz = world-space min corner, w = level voxel_size.
     levels: [Vec4; VOLUME_LEVELS],
@@ -84,6 +91,11 @@ struct SdfVolumeData {
     decode: [Vec4; VOLUME_LEVELS],
     /// x = active level count, y = resolution (voxels/axis). zw unused.
     volume_dims: Vec4,
+}
+
+impl SdfVolumeData {
+    /// Byte size of the uniform (used to size the buffer + layout min binding size).
+    const SIZE: u64 = std::mem::size_of::<Self>() as u64;
 }
 
 impl Default for SdfVolumeData {
@@ -162,6 +174,30 @@ struct LastAtlasGen(u64);
 struct AtlasCapacity {
     rows: u32,
 }
+
+/// One clipmap level's extracted data for GPU upload (Stage 2). Snapshot of the CPU
+/// `VolumeLevel` plus the decode scale the shader needs.
+#[derive(Clone, Default)]
+struct ExtractedVolumeLevel {
+    origin_world: Vec3,
+    voxel_size: f32,
+    decode_scale: f32,
+    data: Vec<i16>,
+}
+
+/// Extracted 3D distance clipmap (Stage 2): per-level snapshots + resolution. `dirty`
+/// false ⇒ `prepare_volume_gpu` keeps last frame's textures (idle = no GPU work), mirroring
+/// `ExtractedSdfAtlas`.
+#[derive(Resource, Default)]
+struct ExtractedVolume {
+    levels: Vec<ExtractedVolumeLevel>,
+    resolution: u32,
+    dirty: bool,
+}
+
+/// Render-world memo of the last volume generation uploaded (see `LastAtlasGen`).
+#[derive(Resource, Default)]
+struct LastVolumeGen(u64);
 
 // --- GPU Atlas ---
 
@@ -273,7 +309,7 @@ fn create_dummy_bg0(device: &RenderDevice, layout: &BindGroupLayout) -> BindGrou
     });
     let volume_buf = device.create_buffer(&BufferDescriptor {
         label: Some("sdf_dummy_volume_uniform"),
-        size: SdfVolumeData::min_size().get(),
+        size: SdfVolumeData::SIZE,
         usage: BufferUsages::UNIFORM,
         mapped_at_creation: false,
     });
@@ -451,12 +487,13 @@ struct SdfShaderHandle(Handle<Shader>);
 struct SdfShaderModules(#[expect(dead_code)] Vec<Handle<Shader>>);
 
 /// The `#define_import_path` module files the entry shader composes.
-const SDF_SHADER_MODULES: [&str; 5] = [
+const SDF_SHADER_MODULES: [&str; 6] = [
     "shaders/sdf/bindings.wgsl",
     "shaders/sdf/brick.wgsl",
     "shaders/sdf/cubic.wgsl",
     "shaders/sdf/material.wgsl",
     "shaders/sdf/pbr.wgsl",
+    "shaders/sdf/volume.wgsl",
 ];
 
 pub struct SdfRenderPlugin;
@@ -516,10 +553,13 @@ impl Plugin for SdfRenderPlugin {
             .add_systems(ExtractSchedule, extract_sdf_materials)
             .add_systems(ExtractSchedule, extract_texture_library)
             .add_systems(ExtractSchedule, extract_shader_defs)
+            .add_systems(ExtractSchedule, extract_volume)
             .init_resource::<TextureStreamState>()
             .init_resource::<LastAtlasGen>()
+            .init_resource::<LastVolumeGen>()
             .init_resource::<AtlasCapacity>()
             .add_systems(Render, prepare_sdf_atlas_gpu)
+            .add_systems(Render, prepare_volume_gpu)
             .add_systems(Render, prepare_sdf_materials_gpu)
             .add_systems(Render, init_texture_streaming)
             .add_systems(Render, upload_texture_layers.after(init_texture_streaming))
@@ -1325,6 +1365,110 @@ fn i16s_to_le_bytes(data: &[i16]) -> Vec<u8> {
     bytes
 }
 
+// --- Stage 2: 3D distance clipmap extract + upload ---
+
+/// Extract the CPU `VolumeClipmap` into the render world when its generation changes.
+/// Snapshots each level's data + placement; idle frames insert a `dirty = false` resource
+/// so `prepare_volume_gpu` keeps last frame's textures.
+fn extract_volume(
+    clipmap: Extract<Res<super::volume::VolumeClipmap>>,
+    mut last_gen: ResMut<LastVolumeGen>,
+    mut commands: Commands,
+) {
+    if clipmap.generation == last_gen.0 {
+        commands.insert_resource(ExtractedVolume::default()); // dirty = false
+        return;
+    }
+    last_gen.0 = clipmap.generation;
+
+    let cfg = &clipmap.config;
+    let levels = clipmap
+        .levels
+        .iter()
+        .map(|lvl| {
+            let origin_world = Vec3::new(
+                lvl.origin_voxel.x as f32,
+                lvl.origin_voxel.y as f32,
+                lvl.origin_voxel.z as f32,
+            ) * lvl.voxel_size;
+            ExtractedVolumeLevel {
+                origin_world,
+                voxel_size: lvl.voxel_size,
+                decode_scale: cfg.k_voxels * lvl.voxel_size,
+                data: lvl.data.clone(),
+            }
+        })
+        .collect();
+
+    commands.insert_resource(ExtractedVolume {
+        levels,
+        resolution: cfg.resolution,
+        dirty: true,
+    });
+}
+
+/// Upload the extracted clipmap to GPU: (re)create each level's 3D R16Snorm texture and
+/// write the `SdfVolumeData` uniform (per-level origin / voxel_size / decode + level count).
+/// Full per-level realloc on any change (a level is a few MB — cheap; no partial writes in
+/// Stage 2). Levels beyond the active count keep their 1³ dummy and report decode 0.
+fn prepare_volume_gpu(
+    device: Res<RenderDevice>,
+    queue: Res<RenderQueue>,
+    extracted: Option<Res<ExtractedVolume>>,
+    mut gpu_atlas: ResMut<SdfGpuAtlas>,
+) {
+    let Some(extracted) = extracted else { return };
+    if !extracted.dirty {
+        return;
+    }
+
+    let res = extracted.resolution;
+    let size = Extent3d {
+        width: res,
+        height: res,
+        depth_or_array_layers: res,
+    };
+
+    let mut uniform = SdfVolumeData::default();
+    let active = extracted.levels.len().min(VOLUME_LEVELS);
+
+    // Build the new textures + views into the gpu_atlas in-place. Each level recreates its
+    // texture (full realloc, a few MB — cheap; no partial writes in Stage 2). Levels beyond
+    // the active count keep their existing (dummy) texture and contribute no uniform entry.
+    for (i, lvl) in extracted.levels.iter().take(VOLUME_LEVELS).enumerate() {
+        let tex = device.create_texture_with_data(
+            &queue,
+            &TextureDescriptor {
+                label: Some("sdf_volume_level"),
+                size,
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: TextureDimension::D3,
+                format: TextureFormat::R16Snorm,
+                usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST,
+                view_formats: &[],
+            },
+            TextureDataOrder::default(),
+            &i16s_to_le_bytes(&lvl.data),
+        );
+        let view = tex.create_view(&TextureViewDescriptor {
+            dimension: Some(TextureViewDimension::D3),
+            ..default()
+        });
+        gpu_atlas.volume_views.as_mut().unwrap()[i] = view;
+        gpu_atlas.volume_textures.as_mut().unwrap()[i] = tex;
+        uniform.levels[i] = lvl.origin_world.extend(lvl.voxel_size);
+        uniform.decode[i] = Vec4::new(lvl.decode_scale, 0.0, 0.0, 0.0);
+    }
+    uniform.volume_dims = Vec4::new(active as f32, res as f32, 0.0, 0.0);
+
+    queue.write_buffer(
+        gpu_atlas.volume_uniform.as_ref().unwrap(),
+        0,
+        bytemuck::bytes_of(&uniform),
+    );
+}
+
 // --- Render World: Pipeline Init ---
 
 fn init_sdf_pipeline(
@@ -1342,8 +1486,9 @@ fn init_sdf_pipeline(
             (
                 // binding 0: per-view camera uniform (dynamic offset)
                 uniform_buffer::<SdfCameraData>(true),
-                // binding 1: global 3D distance-clipmap params (no dynamic offset)
-                uniform_buffer::<SdfVolumeData>(false),
+                // binding 1: global 3D distance-clipmap params (no dynamic offset).
+                // Sized explicitly since SdfVolumeData is a bytemuck (not ShaderType) type.
+                uniform_buffer_sized(false, Some(NonZero::new(SdfVolumeData::SIZE).unwrap())),
             ),
         ),
     );
@@ -1560,7 +1705,7 @@ fn init_sdf_pipeline(
     // (level_count = 0 ⇒ shader treats the volume as absent until the first prepare).
     let volume_uniform = device.create_buffer(&BufferDescriptor {
         label: Some("sdf_volume_uniform"),
-        size: SdfVolumeData::min_size().get(),
+        size: SdfVolumeData::SIZE,
         usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
         mapped_at_creation: false,
     });

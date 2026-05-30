@@ -45,6 +45,7 @@ pub mod gizmo;
 pub mod picking;
 pub mod render;
 pub mod textures;
+pub mod volume;
 
 use bevy::core_pipeline::prepass::DepthPrepass;
 use bevy::ecs::system::SystemParam;
@@ -398,6 +399,11 @@ impl Plugin for SdfScenePlugin {
             .init_resource::<SyncBakeMode>()
             .init_resource::<ViewportInputAllowed>()
             .init_resource::<gizmo::GizmoState>()
+            // 3D distance-clipmap volume (Stage 2 empty-space accelerator). The clipmap
+            // owns its VolumeConfig; register the type so it shows in the inspector.
+            .init_resource::<volume::VolumeClipmap>()
+            .init_resource::<volume::VolumePrevEdits>()
+            .register_type::<volume::VolumeConfig>()
             .register_type::<SdfVolume>()
             .register_type::<SdfCamera>()
             .register_type::<SdfPrimitive>()
@@ -448,6 +454,13 @@ impl Plugin for SdfScenePlugin {
                 sync_bake
                     .run_if(in_state(AppScene::SdfEditor))
                     .run_if(|m: Res<SyncBakeMode>| m.0),
+            )
+            // 3D distance-clipmap recenter/re-extract — independent of the brick bake path
+            // (always synchronous for now). Re-extracts only levels the camera crossed, or
+            // all levels when the edit set changes.
+            .add_systems(
+                Update,
+                volume::recenter_volume.run_if(in_state(AppScene::SdfEditor)),
             )
             .add_systems(
                 Update,

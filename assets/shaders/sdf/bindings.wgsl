@@ -146,8 +146,6 @@ fn brick_world_at(lod: u32) -> f32 { return f32(cell_stride()) * voxel_size_at(l
 
 // Floored division of `a` by `b` (b > 0), rounding toward negative infinity.
 //
-// Floored division of `a` by `b` (b > 0), rounding toward negative infinity.
-//
 // Avoids BOTH broken ops observed on this hardware (verified in tests/sdf_gpu_rig.rs):
 //   1. Signed `%` on a runtime negative returns the UNSIGNED result (`-109 % 7` -> 0
 //      instead of -4), so it can't be used to build a remainder.
