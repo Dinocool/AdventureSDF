@@ -3,9 +3,7 @@ use bevy::prelude::*;
 use std::collections::{HashMap, HashSet};
 
 use crate::sdf_render::bvh::Bvh;
-use crate::sdf_render::edits::{
-    PALETTE_K, Palette, ResolvedEdit, build_palette, fold_csg, material_distances,
-};
+use crate::sdf_render::edits::{PALETTE_K, Palette};
 
 /// Atlas tiles per texture row. The atlas texture is `ATLAS_TILES_PER_ROW × 64` px wide;
 /// its height grows in 8-px tile rows as `high_water().div_ceil(ATLAS_TILES_PER_ROW)`.
@@ -93,11 +91,6 @@ impl TileAllocator {
         }
     }
 
-    fn clear(&mut self) {
-        self.tile_of.clear();
-        self.free.clear();
-        self.next = 0;
-    }
 }
 
 /// One brick's baked data.
@@ -122,46 +115,34 @@ pub struct PackedBrick {
     pub palette: Palette,
 }
 
-/// CPU-side atlas: brick key (lod + origin) -> baked brick, with dirty tracking.
+/// CPU-side atlas topology: brick key (lod + origin) -> palette-only placeholder, plus the
+/// dirty-tracking the GPU bake + render extract read. The texels live on the GPU.
 #[derive(Resource)]
 pub struct SdfAtlas {
     pub bricks: HashMap<BrickKey, PackedBrick>,
-    /// Force a full rebuild of every brick on the next bake (first bake, or an edit
-    /// was added/removed so the whole BVH changed). Cleared after `full_bake`.
+    /// Force a re-emit of every resident brick on the next schedule (first bake, or an edit
+    /// was added/removed so the whole BVH changed).
     pub rebake_all: bool,
-    /// Brick keys needing a targeted rebake (an existing edit moved/changed). The
-    /// union of each changed edit's old+new AABB. Drained by `bake_incremental`.
-    pub dirty_bricks: HashSet<BrickKey>,
     /// Monotonic counter bumped whenever the baked brick set changes. The render
     /// world compares it against its own last-seen value to skip re-uploading the
     /// atlas on frames where nothing changed (idle = zero GPU atlas work).
     pub generation: u64,
     /// Monotonic counter bumped whenever the GPU chunk lookup / tile-run tables would
     /// differ: a brick enters or exits the resident set, OR a resident brick's palette
-    /// changes (the tile-run carries each brick's palette + atlas slot). It is NOT bumped
-    /// when only a brick's *texels* change with its palette intact — that case needs a
-    /// `changed_tiles` texture write, not a table rebuild. The render world memos this and
-    /// rebuilds the O(bricks) chunk tables + re-uploads the lookup buffers only when it
-    /// advances, so a pure in-place texel re-bake no longer forces the table rebuild.
+    /// changes (the tile-run carries each brick's palette + atlas slot). The render world
+    /// memos this and rebuilds the O(bricks) chunk tables + re-uploads the lookup buffers only
+    /// when it advances.
     pub topology_generation: u64,
     /// Stable brick→tile mapping (see [`TileAllocator`]). Drives where each brick's
-    /// texels live in the atlas texture and survives across bakes so partial uploads
-    /// target the right sub-rect.
+    /// texels live in the atlas texture and survives across bakes so the GPU bake node
+    /// targets the right sub-rect.
     pub tiles: TileAllocator,
-    /// Tiles whose texels changed in the most recent bake (re-baked or newly
-    /// allocated). The render world uploads only these via `write_texture`. Cleared
-    /// at the start of each bake; ignored when `last_bake_was_full` (everything is
-    /// re-uploaded then).
-    pub changed_tiles: HashSet<u32>,
-    /// True if the most recent bake was a `full_bake` (everything re-allocated). The
-    /// render world treats this as "re-upload all tiles" and rebuilds the texture.
+    /// True when the atlas must grow this frame (the GPU bake never shrinks it). The render
+    /// world reads this as the grow signal; currently set indirectly via the tile high-water.
     pub last_bake_was_full: bool,
-    /// Tiles whose texels are produced by the GPU compute bake this frame (see
-    /// [`BakeBackend::Gpu`](super::BakeBackend)). The render world's partial-upload path
-    /// MUST skip these — the CPU holds only a palette-only placeholder for them (no
-    /// texel data), so a `write_texture` would stamp zeros over the GPU result. The GPU
-    /// bake node writes them directly into the atlas instead. Cleared each frame after
-    /// extract consumes it.
+    /// Tiles whose texels the GPU compute bake fills this frame. The render world reads these
+    /// so it knows which tiles the bake node will write; the CPU holds only a palette-only
+    /// placeholder for them. Cleared each frame at the start of `schedule_bakes`.
     pub gpu_baked_tiles: HashSet<u32>,
 }
 
@@ -170,11 +151,9 @@ impl Default for SdfAtlas {
         Self {
             bricks: HashMap::new(),
             rebake_all: true,
-            dirty_bricks: HashSet::new(),
             generation: 0,
             topology_generation: 0,
             tiles: TileAllocator::default(),
-            changed_tiles: HashSet::new(),
             last_bake_was_full: false,
             gpu_baked_tiles: HashSet::new(),
         }
@@ -205,29 +184,6 @@ pub fn dist_band_world(config: &super::SdfGridConfig, lod: u32) -> f32 {
 }
 
 impl SdfAtlas {
-    /// Convert a material-slot signed distance to 16-bit snorm over the fixed ±1.0-world
-    /// band. Material distances only matter at the surface (the argmin picks the nearest
-    /// material there), so they keep the tight fixed band — only the geometry `dist` field
-    /// uses the per-LOD voxel-unit band (`dist_to_snorm_band`).
-    fn dist_to_snorm(d: f32) -> i16 {
-        let clamped = d.clamp(-SNORM_CLAMP_DIST, SNORM_CLAMP_DIST);
-        (clamped * 32767.0) as i16
-    }
-
-    /// Convert a geometry signed distance to snorm over a per-LOD `band` (world units): the
-    /// stored value is `d/band` clamped to [-1,1]. The shader multiplies back by `band`
-    /// (= `dist_band_world(lod)`) to recover world distance. Coarse LODs use a large band so
-    /// far-from-surface samples report a large (still conservative) distance.
-    fn dist_to_snorm_band(d: f32, band: f32) -> i16 {
-        let ratio = (d / band).clamp(-1.0, 1.0);
-        (ratio * 32767.0) as i16
-    }
-
-    /// Linear voxel index within a brick from local (x, y, z) corner coords.
-    fn voxel_index(x: usize, y: usize, z: usize) -> usize {
-        z * BRICK_EDGE * BRICK_EDGE + y * BRICK_EDGE + x
-    }
-
     /// World position of voxel `(x,y,z)` within the brick at `brick_origin` (origin
     /// coords on the LOD lattice, anchored at world 0), at voxel size `voxel_size`.
     fn voxel_world_pos(
@@ -256,29 +212,12 @@ impl SdfAtlas {
     /// position at every LOD (no inter-LOD seam). The trade-off is that a feature thinner
     /// than a voxel can be missed at coarse LOD (its zero-crossing falls between samples);
     /// that sub-voxel detail loss is accepted as the cost of a clean, artifact-free field.
-    /// The 512 voxel-centre world positions of brick `key`, in the canonical
-    /// `z*64 + y*8 + x` order. Shared so the GPU-bake palette build (`bake_scheduler`)
-    /// samples the *exact* same points the CPU bake does — the palette must match
-    /// bit-for-bit or the two backends would key their material slots differently.
-    pub fn brick_voxel_positions(key: BrickKey, voxel_size: f32) -> [Vec3; BRICK_VOXELS] {
-        let mut positions = [Vec3::ZERO; BRICK_VOXELS];
-        for z in 0..BRICK_EDGE {
-            for y in 0..BRICK_EDGE {
-                for x in 0..BRICK_EDGE {
-                    positions[Self::voxel_index(x, y, z)] =
-                        Self::voxel_world_pos(key.coord, x, y, z, voxel_size);
-                }
-            }
-        }
-        positions
-    }
-
     /// 9 sample points for a cheap palette build: the brick's 8 corners + centre. The palette
     /// only needs the ≤K material ids *present* in the brick, and a material that owns any
-    /// voxel is essentially always nearest at a corner or the centre too — so this matches the
-    /// full 512-point [`brick_voxel_positions`] palette for any brick with ≤K materials (the
-    /// overwhelming common case), at 1/57th the `eval_world` cost. Used by the GPU bake job
-    /// emission, where the per-frame brick count makes the 512-point build the drag bottleneck.
+    /// voxel is essentially always nearest at a corner or the centre too — so this matches a
+    /// full per-voxel palette for any brick with ≤K materials (the overwhelming common case),
+    /// at a fraction of the `eval_world` cost. Used by the GPU bake job emission, where the
+    /// per-frame brick count makes a denser palette build the drag bottleneck.
     pub fn brick_palette_samples(key: BrickKey, voxel_size: f32) -> [Vec3; 9] {
         let e = BRICK_EDGE - 1;
         let c = |x: usize, y: usize, z: usize| Self::voxel_world_pos(key.coord, x, y, z, voxel_size);
@@ -287,87 +226,6 @@ impl SdfAtlas {
             c(0, 0, e), c(e, 0, e), c(0, e, e), c(e, e, e),
             c(e / 2, e / 2, e / 2),
         ]
-    }
-
-    fn bake_single_brick(
-        key: BrickKey,
-        config: &super::SdfGridConfig,
-        edits: &[ResolvedEdit],
-        height: &super::height::HeightField,
-    ) -> PackedBrick {
-        let mut dist: SdfBrick = [0; BRICK_VOXELS];
-        let mut mat_dist: MaterialBrick = [0; BRICK_VOXELS * PALETTE_K];
-        let voxel_size = config.voxel_size_at(key.lod);
-        // Per-LOD voxel-unit clamp band for the geometry distance field (see DIST_BAND_VOXELS).
-        let dist_band = dist_band_world(config, key.lod);
-
-        // All voxel world positions, reused for the palette build and the bake.
-        let positions = Self::brick_voxel_positions(key, voxel_size);
-
-        // The palette is the ≤K global ids nearest anywhere in this brick. Slot k
-        // of `mat_dist` is keyed to `palette[k]` for every voxel (uniform per brick).
-        let palette = build_palette(edits, &positions);
-
-        // Relief is only applied at the finest LOD (the relief detail is smaller than a coarse
-        // voxel, so coarse bricks would only alias it) and only when some material carries it.
-        let apply_relief = key.lod == 0 && height.any_relief();
-
-        for (idx, &world_pos) in positions.iter().enumerate() {
-            let sample = fold_csg(edits, world_pos);
-            let mut d = sample.dist;
-
-            // Bake-time height DISPLACEMENT: subtract the material's `(h-0.5)·depth` from the
-            // envelope distance so coarse relief lives in the field (shadows/reflections see it
-            // free). The triplanar axis needs the surface normal — the gradient of the CSG
-            // field, central-differenced at a voxel-scale offset.
-            if apply_relief {
-                let off = voxel_size * 0.5;
-                let n = Vec3::new(
-                    fold_csg(edits, world_pos + Vec3::X * off).dist
-                        - fold_csg(edits, world_pos - Vec3::X * off).dist,
-                    fold_csg(edits, world_pos + Vec3::Y * off).dist
-                        - fold_csg(edits, world_pos - Vec3::Y * off).dist,
-                    fold_csg(edits, world_pos + Vec3::Z * off).dist
-                        - fold_csg(edits, world_pos - Vec3::Z * off).dist,
-                );
-                let normal = n.normalize_or_zero();
-                if normal != Vec3::ZERO {
-                    d -= height.displacement(sample.material_id, world_pos, normal);
-                }
-            }
-
-            dist[idx] = Self::dist_to_snorm_band(d, dist_band);
-
-            let slots = material_distances(edits, &palette, world_pos);
-            let base = idx * PALETTE_K;
-            for (k, &dd) in slots.iter().enumerate() {
-                mat_dist[base + k] = Self::dist_to_snorm(dd);
-            }
-        }
-
-        PackedBrick {
-            dist,
-            mat_dist,
-            palette,
-        }
-    }
-
-    /// Bake one brick at `coord` from the edits the BVH says overlap it, or `None`
-    /// if no edit reaches it (empty space — the brick should not exist). The culled
-    /// edit slice preserves `SdfOrder` (candidates index into the already-sorted
-    /// `edits`). Shared by `full_bake` and `bake_incremental` so both produce
-    /// byte-identical bricks for the same inputs.
-    fn bake_coord(
-        key: BrickKey,
-        edits: &[ResolvedEdit],
-        bvh: &Bvh,
-        config: &super::SdfGridConfig,
-        height: &super::height::HeightField,
-        scratch: &mut Vec<u32>,
-    ) -> Option<PackedBrick> {
-        Self::cull_edit_indices(key, bvh, config, scratch)?;
-        let culled: Vec<ResolvedEdit> = scratch.iter().map(|&i| edits[i as usize].clone()).collect();
-        Some(Self::bake_single_brick(key, config, &culled, height))
     }
 
     /// BVH-cull the edits overlapping brick `key` into `out` (sorted, preserving
@@ -392,53 +250,18 @@ impl SdfAtlas {
         Some(())
     }
 
-    /// Public, self-contained bake of one brick — the entry point the async bake tasks
-    /// call (no `&mut self`, no shared scratch, so it's `Send` over a snapshot of the
-    /// edits, BVH, config, and height field). Returns `None` for empty space (no edit reaches
-    /// the brick). Byte-identical to `bake_coord` for the same inputs.
-    pub fn bake_brick(
-        key: BrickKey,
-        edits: &[ResolvedEdit],
-        bvh: &Bvh,
-        config: &super::SdfGridConfig,
-        height: &super::height::HeightField,
-    ) -> Option<PackedBrick> {
-        let mut scratch: Vec<u32> = Vec::new();
-        Self::bake_coord(key, edits, bvh, config, height, &mut scratch)
-    }
-
     /// Bump the change counter so the render world re-extracts the atlas next frame.
     pub fn bump_generation(&mut self) {
         self.generation = self.generation.wrapping_add(1);
     }
 
-    /// Insert (or replace) a baked brick at `key`, allocating/keeping its stable atlas
-    /// tile and marking that tile changed for the incremental GPU upload. Used by the
-    /// async-bake apply path.
-    pub fn insert_brick(&mut self, key: BrickKey, brick: PackedBrick) {
-        let tile = self.tiles.alloc(key);
-        self.changed_tiles.insert(tile);
-        // Any resident-set/texel change must make the render world re-extract, so bump the
-        // upload generation unconditionally. Additionally bump the *topology* generation
-        // when the GPU chunk tables would differ — a brand-new key, or a replaced brick
-        // whose palette changed (the tile-run carries the palette). A same-palette in-place
-        // re-bake only needs the `changed_tiles` texture write above (no table rebuild).
-        self.generation = self.generation.wrapping_add(1);
-        let palette_changed = self.bricks.get(&key).is_some_and(|old| old.palette != brick.palette);
-        let is_new = self.bricks.insert(key, brick).is_none();
-        if is_new || palette_changed {
-            self.topology_generation = self.topology_generation.wrapping_add(1);
-        }
-    }
-
-    /// GPU-bake variant of [`insert_brick`](Self::insert_brick): insert a *palette-only*
-    /// placeholder for a brick whose texels the compute bake will write directly into the
-    /// atlas. Allocates/keeps the stable tile and records it in `gpu_baked_tiles` (so the
-    /// CPU upload path skips it) and returns that tile so the caller can build the GPU job.
-    /// Bumps `generation` (re-extract) always; bumps `topology_generation` on a new key or
-    /// palette change, exactly like `insert_brick` — the chunk tables read only the palette
-    /// and tile, both of which are present here. The placeholder's `dist`/`mat_dist` are
-    /// never read (the GPU owns those texels), so they stay zero-filled.
+    /// Insert a *palette-only* placeholder for a brick whose texels the compute bake will
+    /// write directly into the atlas. Allocates/keeps the stable tile and records it in
+    /// `gpu_baked_tiles` and returns that tile so the caller can build the GPU job. Bumps
+    /// `generation` (re-extract) always; bumps `topology_generation` on a new key or palette
+    /// change — the chunk tables read only the palette and tile, both present here. The
+    /// placeholder's `dist`/`mat_dist` are never read (the GPU owns those texels), so they
+    /// stay zero-filled.
     pub fn insert_gpu_brick(&mut self, key: BrickKey, palette: Palette) -> u32 {
         let tile = self.tiles.alloc(key);
         self.gpu_baked_tiles.insert(tile);
@@ -475,92 +298,6 @@ impl SdfAtlas {
         }
     }
 
-    /// Full clipmap bake: for each LOD ring centred on `camera_pos`, enumerate the
-    /// ring's candidate brick coords and bake only the sparse non-empty set (the BVH
-    /// cull in `bake_coord` returns `None` for bricks no edit reaches). Coarser rings
-    /// reach 2× further per level, so the same `ring_bricks` count nests outward.
-    ///
-    /// Used on the first bake and whenever an edit is added/removed (`rebake_all`) or
-    /// the camera crosses a brick boundary (the ring window shifts).
-    pub fn full_bake(
-        &mut self,
-        edits: &[ResolvedEdit],
-        bvh: &Bvh,
-        config: &super::SdfGridConfig,
-        height: &super::height::HeightField,
-        camera_pos: Vec3,
-    ) {
-        self.bricks.clear();
-        self.tiles.clear();
-        self.changed_tiles.clear();
-        self.last_bake_was_full = true;
-        self.rebake_all = false;
-        self.dirty_bricks.clear();
-        self.generation = self.generation.wrapping_add(1);
-        // A full bake replaces the entire resident set — the GPU chunk tables must rebuild.
-        self.topology_generation = self.topology_generation.wrapping_add(1);
-
-        if edits.is_empty() {
-            return;
-        }
-
-        let mut scratch: Vec<u32> = Vec::new();
-        for key in ring_brick_keys(config, camera_pos) {
-            if let Some(brick) = Self::bake_coord(key, edits, bvh, config, height, &mut scratch) {
-                self.tiles.alloc(key);
-                self.bricks.insert(key, brick);
-            }
-        }
-    }
-
-    /// Rebuild only the bricks in `dirty`, re-folding all edits that overlap each
-    /// (so a moved neighbour is handled correctly). A dirty brick that no edit
-    /// reaches any more is removed. `dirty` is the union, over the affected LODs, of
-    /// each changed edit's old+new footprint → brick keys, so this is correct as long
-    /// as a changed edit's former footprint is included (the caller guarantees it via
-    /// `prev_aabbs`).
-    pub fn bake_incremental(
-        &mut self,
-        dirty: &HashSet<BrickKey>,
-        edits: &[ResolvedEdit],
-        bvh: &Bvh,
-        config: &super::SdfGridConfig,
-        height: &super::height::HeightField,
-    ) {
-        if dirty.is_empty() {
-            return;
-        }
-        self.generation = self.generation.wrapping_add(1);
-        self.last_bake_was_full = false;
-        self.changed_tiles.clear();
-
-        let mut scratch: Vec<u32> = Vec::new();
-        for &key in dirty {
-            match Self::bake_coord(key, edits, bvh, config, height, &mut scratch) {
-                Some(brick) => {
-                    // Stable tile: a re-baked brick keeps its slot, a new one gets a
-                    // (possibly freed) slot. Either way its texels changed.
-                    let tile = self.tiles.alloc(key);
-                    self.changed_tiles.insert(tile);
-                    // New key or changed palette ⇒ the GPU tables differ; same-palette
-                    // re-bake only needs the texel write above.
-                    let palette_changed = self.bricks.get(&key).is_some_and(|old| old.palette != brick.palette);
-                    let is_new = self.bricks.insert(key, brick).is_none();
-                    if is_new || palette_changed {
-                        self.topology_generation = self.topology_generation.wrapping_add(1);
-                    }
-                }
-                None => {
-                    // Vacated: free the slot. No live lookup references it after the
-                    // lookup buffer is rebuilt, so its stale texels are harmless.
-                    self.tiles.release(&key);
-                    if self.bricks.remove(&key).is_some() {
-                        self.topology_generation = self.topology_generation.wrapping_add(1);
-                    }
-                }
-            }
-        }
-    }
 }
 
 /// The stride-aligned brick coords of one LOD ring window whose corner is `origin`:
@@ -644,114 +381,14 @@ pub fn bricks_in_aabb_lod(
     keys
 }
 
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sdf_render::edits::{CsgKind, SdfOp, SdfPrimitive};
+    use crate::sdf_render::edits::{PALETTE_EMPTY, ResolvedEdit, SdfOp, SdfPrimitive, build_palette};
 
-    fn resolved(prim: SdfPrimitive, t: Transform, op: SdfOp, id: u16) -> ResolvedEdit {
-        ResolvedEdit {
-            prim,
-            transform: t,
-            op,
-            material_id: id,
-        }
-    }
-
-    /// Helper: bake one level-0 brick straddling the given edits at the world origin.
-    fn bake_origin_brick(
-        config: &super::super::SdfGridConfig,
-        edits: &[ResolvedEdit],
-    ) -> PackedBrick {
-        let coord = config.world_to_brick_lod(Vec3::ZERO, 0);
-        SdfAtlas::bake_single_brick(
-            BrickKey::new(0, coord),
-            config,
-            edits,
-            &super::super::height::HeightField::default(),
-        )
-    }
-
-    /// The winning (nearest) GLOBAL material id for voxel `idx`: argmin over the K
-    /// palette-slot distances, then map the local slot through the brick palette —
-    /// mirrors what the shader computes per pixel. `PALETTE_EMPTY` if the winning
-    /// slot is unused.
-    fn voxel_material(brick: &PackedBrick, idx: usize) -> u16 {
-        let base = idx * PALETTE_K;
-        let mut best = 0usize;
-        for k in 1..PALETTE_K {
-            if brick.mat_dist[base + k] < brick.mat_dist[base + best] {
-                best = k;
-            }
-        }
-        brick.palette[best]
-    }
-
-    /// The bake stores the TRUE trilinear field: every baked voxel decodes to the analytic
-    /// `fold_csg` distance at the voxel centre (within snorm quantization + the per-LOD
-    /// voxel-unit clamp `dist_band_world`). This is the contract that keeps the field a real
-    /// SDF — correct shape, no blockiness, same surface position at every LOD. The decode
-    /// matches the shader: `stored_ratio · band`, where `band = DIST_BAND_VOXELS·voxel_size`.
-    #[test]
-    fn baked_voxel_is_true_centre_distance() {
-        let config = super::super::SdfGridConfig::default();
-        // A coarse LOD (big voxels) is where any deviation from the true field shows most.
-        let lod = 2u32;
-        let voxel_size = config.voxel_size_at(lod);
-        let band = dist_band_world(&config, lod);
-        let edits = vec![resolved(
-            SdfPrimitive::Sphere { radius: 0.5 },
-            Transform::from_xyz(0.3, 0.1, -0.2),
-            SdfOp::default(),
-            0,
-        )];
-        let coord = config.world_to_brick_lod(Vec3::ZERO, lod);
-        let brick = SdfAtlas::bake_single_brick(
-            BrickKey::new(lod, coord),
-            &config,
-            &edits,
-            &super::super::height::HeightField::default(),
-        );
-
-        let slack = band / 32767.0;
-        for z in 0..BRICK_EDGE {
-            for y in 0..BRICK_EDGE {
-                for x in 0..BRICK_EDGE {
-                    let idx = z * BRICK_EDGE * BRICK_EDGE + y * BRICK_EDGE + x;
-                    let centre = SdfAtlas::voxel_world_pos(coord, x, y, z, voxel_size);
-                    // Clamp to the per-LOD band (matches the bake), then decode the snorm
-                    // ratio back through the same band (matches the shader).
-                    let expected = fold_csg(&edits, centre).dist.clamp(-band, band);
-                    let stored = brick.dist[idx] as f32 / 32767.0 * band;
-                    assert!(
-                        (stored - expected).abs() <= slack,
-                        "voxel ({x},{y},{z}): stored {stored} must equal true centre {expected}"
-                    );
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn snorm_clamps_correctly() {
-        // Material-slot encoder: fixed ±1.0-world band.
-        assert_eq!(SdfAtlas::dist_to_snorm(-2.0), -32767);
-        assert_eq!(SdfAtlas::dist_to_snorm(-1.0), -32767);
-        assert_eq!(SdfAtlas::dist_to_snorm(0.0), 0);
-        assert_eq!(SdfAtlas::dist_to_snorm(1.0), 32767);
-        assert_eq!(SdfAtlas::dist_to_snorm(2.0), 32767);
-    }
-
-    #[test]
-    fn dist_band_encoder_decodes_per_lod() {
-        // The geometry encoder stores d/band; decoding (·band) round-trips within the band.
-        let band = 4.0; // arbitrary
-        assert_eq!(SdfAtlas::dist_to_snorm_band(band, band), 32767); // +band → +1
-        assert_eq!(SdfAtlas::dist_to_snorm_band(-band, band), -32767);
-        assert_eq!(SdfAtlas::dist_to_snorm_band(2.0 * band, band), 32767); // clamps
-        assert_eq!(SdfAtlas::dist_to_snorm_band(0.0, band), 0);
-        let half = SdfAtlas::dist_to_snorm_band(band * 0.5, band);
-        assert!((half as f32 / 32767.0 * band - band * 0.5).abs() <= band / 32767.0);
+    fn resolved(prim: SdfPrimitive, t: Transform, id: u16) -> ResolvedEdit {
+        ResolvedEdit { prim, transform: t, op: SdfOp::default(), material_id: id }
     }
 
     #[test]
@@ -759,389 +396,7 @@ mod tests {
         let atlas = SdfAtlas::default();
         assert!(atlas.bricks.is_empty());
         assert!(atlas.rebake_all, "fresh atlas must force a first full bake");
-        assert!(atlas.dirty_bricks.is_empty());
-    }
-
-    /// Two union shapes far apart must resolve to distinct per-voxel materials via
-    /// the dense argmin — voxels near shape 0 win material 0, voxels near shape 1
-    /// win material 1. Regression guard for the "orange bleed" bug (a whole brick
-    /// adopting one nearest-shape id).
-    #[test]
-    fn materials_are_per_voxel() {
-        let config = super::super::SdfGridConfig::default();
-        let edits = vec![
-            resolved(
-                SdfPrimitive::Sphere { radius: 0.2 },
-                Transform::IDENTITY,
-                SdfOp::default(),
-                0,
-            ),
-            resolved(
-                SdfPrimitive::Sphere { radius: 0.2 },
-                Transform::from_xyz(0.6, 0.0, 0.0),
-                SdfOp::default(),
-                1,
-            ),
-        ];
-        let brick = bake_origin_brick(&config, &edits);
-
-        let saw_zero = (0..BRICK_VOXELS).any(|i| voxel_material(&brick, i) == 0);
-        let saw_one = (0..BRICK_VOXELS).any(|i| voxel_material(&brick, i) == 1);
-        assert!(
-            saw_zero && saw_one,
-            "brick should resolve both materials, got zero={saw_zero} one={saw_one}"
-        );
-    }
-
-    /// The per-palette-slot distance field must record each material's own surface.
-    /// With a palette of [mat 0 -> slot 0, mat 1 -> slot 1]: inside shape 0, slot 0
-    /// is negative and below slot 1, and vice versa. This is what lets the shader
-    /// find the exact sub-voxel bisector.
-    #[test]
-    fn material_slots_track_their_own_surface() {
-        use crate::sdf_render::edits::{build_palette, material_distances};
-        let edits = vec![
-            resolved(
-                SdfPrimitive::Sphere { radius: 0.3 },
-                Transform::IDENTITY,
-                SdfOp::default(),
-                0,
-            ),
-            resolved(
-                SdfPrimitive::Sphere { radius: 0.3 },
-                Transform::from_xyz(0.5, 0.0, 0.0),
-                SdfOp::default(),
-                1,
-            ),
-        ];
-        // Sorted palette => slot 0 = material 0, slot 1 = material 1.
-        let palette = build_palette(&edits, &[Vec3::ZERO, Vec3::new(0.5, 0.0, 0.0)]);
-        assert_eq!(palette[0], 0);
-        assert_eq!(palette[1], 1);
-
-        // Deep inside sphere 0.
-        let s = material_distances(&edits, &palette, Vec3::ZERO);
-        assert!(s[0] < 0.0, "inside shape 0, slot 0 must be negative");
-        assert!(s[0] < s[1], "slot 0 must be nearer than slot 1 here");
-        // Deep inside sphere 1.
-        let s = material_distances(&edits, &palette, Vec3::new(0.5, 0.0, 0.0));
-        assert!(s[1] < 0.0 && s[1] < s[0]);
-    }
-
-    /// A brick with more than K materials keeps only the K nearest in its palette.
-    #[test]
-    fn palette_caps_at_k() {
-        use crate::sdf_render::edits::{PALETTE_EMPTY, build_palette};
-        // K+1 = 5 spheres, each a distinct material, all near the origin.
-        let edits: Vec<ResolvedEdit> = (0..(PALETTE_K as u16 + 1))
-            .map(|i| {
-                resolved(
-                    SdfPrimitive::Sphere { radius: 0.2 },
-                    Transform::from_xyz(i as f32 * 0.15, 0.0, 0.0),
-                    SdfOp::default(),
-                    i,
-                )
-            })
-            .collect();
-        let palette = build_palette(&edits, &[Vec3::ZERO]);
-        let filled = palette.iter().filter(|&&id| id != PALETTE_EMPTY).count();
-        assert_eq!(filled, PALETTE_K, "palette must cap at K filled slots");
-    }
-
-    /// A subtractor's material id must never win a surface voxel: Subtract edits
-    /// write no material slot, so their id stays at the far sentinel and loses the
-    /// argmin everywhere.
-    #[test]
-    fn subtract_writes_no_material() {
-        let config = super::super::SdfGridConfig::default();
-        let edits = vec![
-            resolved(
-                SdfPrimitive::Box {
-                    half_extents: Vec3::splat(0.3),
-                },
-                Transform::IDENTITY,
-                SdfOp::default(),
-                1,
-            ),
-            resolved(
-                SdfPrimitive::Sphere { radius: 0.2 },
-                Transform::from_xyz(0.3, 0.3, 0.3),
-                SdfOp {
-                    kind: CsgKind::Subtract,
-                    smoothing: 0.0,
-                },
-                2,
-            ),
-        ];
-        let brick = bake_origin_brick(&config, &edits);
-        assert!(
-            (0..BRICK_VOXELS).all(|i| voxel_material(&brick, i) != 2),
-            "subtractor id 2 must never win the material argmin"
-        );
-    }
-
-    use crate::sdf_render::edits::edit_world_aabb;
-
-    /// Build the AABBs + BVH for a set of edits (mirrors `schedule_bakes`).
-    fn build_bvh(edits: &[ResolvedEdit]) -> (Vec<Aabb3d>, Bvh) {
-        let aabbs: Vec<Aabb3d> = edits
-            .iter()
-            .map(|e| edit_world_aabb(&e.prim, &e.transform, e.op.smoothing))
-            .collect();
-        let bvh = Bvh::build(&aabbs);
-        (aabbs, bvh)
-    }
-
-    /// The incremental dirty set for one changed edit's `aabb`, across every LOD ring
-    /// centred on `camera_pos` — mirrors what `schedule_bakes` unions per frame.
-    fn dirty_for_aabb(
-        config: &super::super::SdfGridConfig,
-        aabb: &Aabb3d,
-        camera_pos: Vec3,
-    ) -> HashSet<BrickKey> {
-        let mut dirty = HashSet::new();
-        for lod in 0..config.lod_count {
-            let origin = config.ring_origin(camera_pos, lod);
-            dirty.extend(bricks_in_aabb_lod(config, aabb, lod, origin));
-        }
-        dirty
-    }
-
-    /// Moving one of two distant edits must rebake only the bricks near its old+new
-    /// position; the far edit's bricks stay byte-identical. Regression guard for the
-    /// incremental-bake path (it must match a from-scratch full bake locally without
-    /// touching unrelated bricks).
-    #[test]
-    fn incremental_bake_leaves_distant_bricks_untouched() {
-        // Small ring so two spheres a few units apart both stay resident at LOD 0.
-        let config = super::super::SdfGridConfig {
-            lod_count: 1,
-            ring_bricks: 40,
-            ..Default::default()
-        };
-        let camera = Vec3::ZERO;
-        // Two spheres far apart on X (well over a brick's world extent).
-        let far_pos = Transform::from_xyz(8.0, 0.0, 0.0);
-        let edits = vec![
-            resolved(
-                SdfPrimitive::Sphere { radius: 0.3 },
-                Transform::IDENTITY,
-                SdfOp::default(),
-                0,
-            ),
-            resolved(
-                SdfPrimitive::Sphere { radius: 0.3 },
-                far_pos,
-                SdfOp::default(),
-                1,
-            ),
-        ];
-
-        let mut atlas = SdfAtlas::default();
-        let (aabbs, bvh) = build_bvh(&edits);
-        atlas.full_bake(&edits, &bvh, &config, &super::super::height::HeightField::default(), camera);
-        let gen0 = atlas.generation;
-
-        // Snapshot a brick owned by the far sphere.
-        let far_key = BrickKey::new(0, config.world_to_brick_lod(far_pos.translation, 0));
-        let far_before = atlas
-            .bricks
-            .get(&far_key)
-            .expect("far sphere should occupy a brick")
-            .dist;
-
-        // Move only the first sphere a little; dirty = union(old, new) of its AABB.
-        let mut moved = edits.clone();
-        let old_aabb = aabbs[0];
-        moved[0].transform = Transform::from_xyz(0.4, 0.0, 0.0);
-        let (new_aabbs, new_bvh) = build_bvh(&moved);
-
-        let mut dirty = dirty_for_aabb(&config, &old_aabb, camera);
-        dirty.extend(dirty_for_aabb(&config, &new_aabbs[0], camera));
-        assert!(
-            !dirty.contains(&far_key),
-            "far sphere's brick must not be in the dirty set"
-        );
-
-        atlas.bake_incremental(&dirty, &moved, &new_bvh, &config, &super::super::height::HeightField::default());
-
-        assert_ne!(atlas.generation, gen0, "incremental bake must bump generation");
-        let far_after = atlas
-            .bricks
-            .get(&far_key)
-            .expect("far sphere brick must still exist")
-            .dist;
-        assert_eq!(
-            far_before, far_after,
-            "untouched far brick must be byte-identical after incremental bake"
-        );
-    }
-
-    /// An incremental rebake of a region must produce the same brick a full bake of
-    /// the moved scene would — i.e. incremental is not a lossy shortcut.
-    #[test]
-    fn incremental_matches_full_bake_locally() {
-        let config = super::super::SdfGridConfig::default();
-        let camera = Vec3::ZERO;
-        let edits = vec![resolved(
-            SdfPrimitive::Sphere { radius: 0.3 },
-            Transform::IDENTITY,
-            SdfOp::default(),
-            0,
-        )];
-
-        let mut atlas = SdfAtlas::default();
-        let (aabbs, bvh) = build_bvh(&edits);
-        atlas.full_bake(&edits, &bvh, &config, &super::super::height::HeightField::default(), camera);
-
-        // Move it, then update via incremental on the old+new union.
-        let mut moved = edits.clone();
-        moved[0].transform = Transform::from_xyz(0.5, 0.2, -0.1);
-        let (new_aabbs, new_bvh) = build_bvh(&moved);
-        let mut dirty = dirty_for_aabb(&config, &aabbs[0], camera);
-        dirty.extend(dirty_for_aabb(&config, &new_aabbs[0], camera));
-        atlas.bake_incremental(&dirty, &moved, &new_bvh, &config, &super::super::height::HeightField::default());
-
-        // Reference: full bake of the moved scene from scratch (same camera/rings).
-        let mut reference = SdfAtlas::default();
-        reference.full_bake(&moved, &new_bvh, &config, &super::super::height::HeightField::default(), camera);
-
-        // Every brick the reference has, the incremental atlas must match exactly.
-        for (key, ref_brick) in &reference.bricks {
-            let inc = atlas
-                .bricks
-                .get(key)
-                .unwrap_or_else(|| panic!("incremental atlas missing brick {key:?}"));
-            assert_eq!(inc.dist, ref_brick.dist, "dist mismatch at {key:?}");
-            assert_eq!(inc.palette, ref_brick.palette, "palette mismatch at {key:?}");
-        }
-        // And it must not have leftover bricks the reference lacks within the dirty
-        // region (vacated bricks removed).
-        for key in &dirty {
-            if !reference.bricks.contains_key(key) {
-                assert!(
-                    !atlas.bricks.contains_key(key),
-                    "stale brick {key:?} should have been removed"
-                );
-            }
-        }
-    }
-
-    /// Simulate a real drag: many small incremental steps, each dirtying only the
-    /// moved edit's old∪new footprint (exactly as `schedule_bakes` does). After
-    /// EVERY step the live brick set must equal a from-scratch full bake of that
-    /// pose. Regression guard for the "gaps appear past certain thresholds" bug —
-    /// i.e. a brick that should exist at the new pose never gets into the dirty set.
-    #[test]
-    fn incremental_drag_matches_full_bake_every_step() {
-        let config = super::super::SdfGridConfig::default();
-        let camera = Vec3::ZERO;
-        let mut edits = vec![resolved(
-            SdfPrimitive::Sphere { radius: 0.3 },
-            Transform::IDENTITY,
-            SdfOp::default(),
-            0,
-        )];
-
-        let mut atlas = SdfAtlas::default();
-        let (aabbs, bvh) = build_bvh(&edits);
-        atlas.full_bake(&edits, &bvh, &config, &super::super::height::HeightField::default(), camera);
-        // prev footprint, as schedule_bakes tracks via PrevEditAabbs.
-        let mut prev_aabb = aabbs[0];
-
-        // Drag across several brick widths in small sub-brick steps (0.07 world units
-        // ≈ under one voxel at the default 0.1 voxel size, so we cross boundaries
-        // gradually — the regime where gaps appeared).
-        for step in 1..=40 {
-            let x = step as f32 * 0.07;
-            edits[0].transform = Transform::from_xyz(x, 0.0, 0.0);
-            let (new_aabbs, new_bvh) = build_bvh(&edits);
-
-            let mut dirty = dirty_for_aabb(&config, &prev_aabb, camera);
-            dirty.extend(dirty_for_aabb(&config, &new_aabbs[0], camera));
-            atlas.bake_incremental(&dirty, &edits, &new_bvh, &config, &super::super::height::HeightField::default());
-            prev_aabb = new_aabbs[0];
-
-            let mut reference = SdfAtlas::default();
-            reference.full_bake(&edits, &new_bvh, &config, &super::super::height::HeightField::default(), camera);
-
-            // Same set of live brick keys (no missing, no stale).
-            let inc_keys: HashSet<_> = atlas.bricks.keys().copied().collect();
-            let ref_keys: HashSet<_> = reference.bricks.keys().copied().collect();
-            assert_eq!(
-                inc_keys, ref_keys,
-                "step {step} (x={x}): live brick set diverged from full bake"
-            );
-            for (key, ref_brick) in &reference.bricks {
-                assert_eq!(
-                    atlas.bricks[key].dist, ref_brick.dist,
-                    "step {step}: dist mismatch at {key:?}"
-                );
-            }
-        }
-    }
-
-    /// Drag a sphere PAST a large static box (a "plane") — the scene in the bug
-    /// report. After every step the incremental atlas must match a full bake: a
-    /// shared brick (plane ∩ sphere-footprint) must keep the plane surface, never
-    /// get carved into an empty hole. If incremental diverges here, the CPU bake is
-    /// at fault; if it matches, the desync is in the GPU upload.
-    #[test]
-    fn incremental_drag_preserves_static_neighbor() {
-        let config = super::super::SdfGridConfig::default();
-        // id 0 = wide thin "plane" box at the origin; id 1 = the dragged sphere,
-        // starting to one side and moving across the top of the plane.
-        let plane = resolved(
-            SdfPrimitive::Box {
-                half_extents: Vec3::new(2.0, 0.1, 1.0),
-            },
-            Transform::IDENTITY,
-            SdfOp::default(),
-            0,
-        );
-        let mut edits = vec![
-            plane.clone(),
-            resolved(
-                SdfPrimitive::Sphere { radius: 0.3 },
-                Transform::from_xyz(-1.5, 0.3, 0.0),
-                SdfOp::default(),
-                1,
-            ),
-        ];
-
-        let mut atlas = SdfAtlas::default();
-        let camera = Vec3::ZERO;
-        let (aabbs, bvh) = build_bvh(&edits);
-        atlas.full_bake(&edits, &bvh, &config, &super::super::height::HeightField::default(), camera);
-        let mut prev_sphere_aabb = aabbs[1];
-
-        for step in 1..=50 {
-            let x = -1.5 + step as f32 * 0.06;
-            edits[1].transform = Transform::from_xyz(x, 0.3, 0.0);
-            let (new_aabbs, new_bvh) = build_bvh(&edits);
-
-            // Only the sphere changed → dirty = its old∪new footprint.
-            let mut dirty = dirty_for_aabb(&config, &prev_sphere_aabb, camera);
-            dirty.extend(dirty_for_aabb(&config, &new_aabbs[1], camera));
-            atlas.bake_incremental(&dirty, &edits, &new_bvh, &config, &super::super::height::HeightField::default());
-            prev_sphere_aabb = new_aabbs[1];
-
-            let mut reference = SdfAtlas::default();
-            reference.full_bake(&edits, &new_bvh, &config, &super::super::height::HeightField::default(), camera);
-
-            let inc_keys: HashSet<_> = atlas.bricks.keys().copied().collect();
-            let ref_keys: HashSet<_> = reference.bricks.keys().copied().collect();
-            assert_eq!(
-                inc_keys, ref_keys,
-                "step {step} (x={x}): live brick set diverged from full bake"
-            );
-            for (key, ref_brick) in &reference.bricks {
-                assert_eq!(
-                    atlas.bricks[key].dist, ref_brick.dist,
-                    "step {step} (x={x}): dist mismatch at {key:?} — static neighbor carved?"
-                );
-            }
-        }
+        assert!(atlas.gpu_baked_tiles.is_empty());
     }
 
     /// A level-1 brick covers exactly 2× the world extent of a level-0 brick (the
@@ -1156,101 +411,15 @@ mod tests {
         assert!((l2 - 4.0 * l0).abs() < 1e-6, "L2 must be 4× L0");
     }
 
-    // (Brick addressing now uses absolute chunk keys — see `super::chunk` tests.)
-
-    /// The sparse cull bakes only bricks an edit actually reaches: a single small
-    /// sphere at the origin must occupy only a handful of the ring's candidate bricks,
-    /// not the whole `ring_bricks³` window.
-    #[test]
-    fn ring_bake_is_sparse() {
-        let config = super::super::SdfGridConfig {
-            lod_count: 1,
-            ..Default::default()
-        };
-        let edits = vec![resolved(
-            SdfPrimitive::Sphere { radius: 0.3 },
-            Transform::IDENTITY,
-            SdfOp::default(),
-            0,
-        )];
-        let mut atlas = SdfAtlas::default();
-        let (_aabbs, bvh) = build_bvh(&edits);
-        atlas.full_bake(&edits, &bvh, &config, &super::super::height::HeightField::default(), Vec3::ZERO);
-        let candidates = (config.ring_bricks * config.ring_bricks * config.ring_bricks) as usize;
-        assert!(
-            atlas.bricks.len() < candidates,
-            "bake must be sparse: {} baked vs {} candidates",
-            atlas.bricks.len(),
-            candidates
-        );
-        assert!(!atlas.bricks.is_empty(), "the sphere must bake some bricks");
-    }
-
-    /// The async `bake_brick` must produce byte-identical bricks to the synchronous
-    /// `full_bake` for the same key (the async path is just a re-host of `bake_coord`).
-    #[test]
-    fn bake_brick_matches_full_bake() {
-        let config = super::super::SdfGridConfig {
-            lod_count: 1,
-            ..Default::default()
-        };
-        let edits = vec![resolved(
-            SdfPrimitive::Sphere { radius: 0.4 },
-            Transform::IDENTITY,
-            SdfOp::default(),
-            0,
-        )];
-        let (_aabbs, bvh) = build_bvh(&edits);
-
-        let mut atlas = SdfAtlas::default();
-        atlas.full_bake(&edits, &bvh, &config, &super::super::height::HeightField::default(), Vec3::ZERO);
-
-        // Every brick full_bake produced must match a standalone bake_brick of its key.
-        for (key, ref_brick) in &atlas.bricks {
-            let baked = SdfAtlas::bake_brick(*key, &edits, &bvh, &config, &super::super::height::HeightField::default())
-                .expect("a baked key must rebake non-empty");
-            assert_eq!(baked.dist, ref_brick.dist, "dist mismatch at {key:?}");
-            assert_eq!(baked.palette, ref_brick.palette, "palette mismatch at {key:?}");
-        }
-    }
-
-    /// Evicting a brick must bump BOTH `generation` and `topology_generation`. The render
-    /// world's `extract_sdf_atlas` early-returns when `generation` is unchanged, so if
-    /// eviction skipped the bump, a frame that only evicted (e.g. flying away from the
-    /// scene, no new bake applied) would leave the GPU rendering the just-dropped bricks —
-    /// the LOD-stall-until-you-fly-forward bug.
-    #[test]
-    fn eviction_bumps_generation_for_gpu_extract() {
-        let config = super::super::SdfGridConfig { lod_count: 1, ..Default::default() };
-        let edits = vec![resolved(SdfPrimitive::Sphere { radius: 0.4 }, Transform::IDENTITY, SdfOp::default(), 0)];
-        let (_aabbs, bvh) = build_bvh(&edits);
-
-        let mut atlas = SdfAtlas::default();
-        atlas.full_bake(&edits, &bvh, &config, &super::super::height::HeightField::default(), Vec3::ZERO);
-        let key = *atlas.bricks.keys().next().expect("scene must bake at least one brick");
-
-        let gen_before = atlas.generation;
-        let topo_before = atlas.topology_generation;
-        assert!(atlas.remove_brick(&key), "brick must actually be removed");
-        assert_ne!(atlas.generation, gen_before, "eviction must bump the upload generation");
-        assert_ne!(atlas.topology_generation, topo_before, "eviction must bump the topology generation");
-
-        // Removing a non-resident key must NOT bump (no spurious re-extract).
-        let gen_after = atlas.generation;
-        assert!(!atlas.remove_brick(&key), "second remove is a no-op");
-        assert_eq!(atlas.generation, gen_after, "no-op remove must not bump the generation");
-    }
-
     /// A one-brick camera recenter on a LOD ring exposes only a thin shell — the count
     /// of ENTERED coords must be a face of the window (~R²), never the whole R³ volume.
-    /// This is the property that makes incremental recenter cheap (vs the old full bake).
+    /// This is the property that makes incremental recenter cheap (vs a full rebake).
     #[test]
     fn ring_shift_exposes_only_a_shell() {
         let config = super::super::SdfGridConfig::default();
         let stride = config.cell_stride();
         let r = config.ring_bricks as i32;
 
-        // Shift the window by exactly one brick on +X.
         let old_origin = IVec3::ZERO;
         let new_origin = IVec3::new(stride, 0, 0);
 
@@ -1261,185 +430,67 @@ mod tests {
 
         let volume = (r * r * r) as usize;
         let face = (r * r) as usize;
-        assert_eq!(
-            entered, face,
-            "a 1-brick shift must expose exactly one R² face, not the R³ volume ({volume})"
-        );
+        assert_eq!(entered, face, "a 1-brick shift must expose exactly one R² face, not the R³ volume ({volume})");
         assert!(entered < volume, "shell must be far smaller than the full window");
     }
 
-    // --- Incremental-recenter convergence -------------------------------------------
-    //
-    // These model exactly what `schedule_bakes` + `apply_bakes` do to the atlas on a
-    // camera move (the ECS systems are thin wrappers over this atlas API), so they pin
-    // the core correctness invariant without needing a running App / task pool.
-
-    /// Apply one incremental recenter step to `atlas` for a camera move old→new, baking
-    /// entered bricks synchronously and dropping exited ones — the same diff
-    /// `schedule_bakes` enqueues and `apply_bakes` applies (eager eviction).
-    fn recenter_sync(
-        atlas: &mut SdfAtlas,
-        config: &super::super::SdfGridConfig,
-        edits: &[ResolvedEdit],
-        bvh: &Bvh,
-        old_cam: Vec3,
-        new_cam: Vec3,
-    ) {
-        for lod in 0..config.lod_count {
-            let old_origin = config.ring_origin(old_cam, lod);
-            let new_origin = config.ring_origin(new_cam, lod);
-            if old_origin == new_origin {
-                continue;
-            }
-            // Entered → bake.
-            for coord in ring_window_coords(config, new_origin) {
-                if !coord_in_window(config, coord, old_origin) {
-                    let key = BrickKey::new(lod, coord);
-                    match SdfAtlas::bake_brick(key, edits, bvh, config, &super::super::height::HeightField::default()) {
-                        Some(b) => atlas.insert_brick(key, b),
-                        None => {
-                            atlas.remove_brick(&key);
-                        }
-                    }
-                }
-            }
-            // Exited → drop.
-            for coord in ring_window_coords(config, old_origin) {
-                if !coord_in_window(config, coord, new_origin) {
-                    atlas.remove_brick(&BrickKey::new(lod, coord));
-                }
-            }
-        }
+    /// A brick with more than K materials keeps only the K nearest in its palette.
+    #[test]
+    fn palette_caps_at_k() {
+        let edits: Vec<ResolvedEdit> = (0..(PALETTE_K as u16 + 1))
+            .map(|i| resolved(SdfPrimitive::Sphere { radius: 0.2 }, Transform::from_xyz(i as f32 * 0.15, 0.0, 0.0), i))
+            .collect();
+        let palette = build_palette(&edits, &[Vec3::ZERO]);
+        let filled = palette.iter().filter(|&&id| id != PALETTE_EMPTY).count();
+        assert_eq!(filled, PALETTE_K, "palette must cap at K filled slots");
     }
 
-    /// After an incremental recenter to a new camera position, the resident brick set
-    /// must be byte-identical to a from-scratch `full_bake` at that position. This is
-    /// the core guarantee that flying the camera never corrupts the atlas.
+    /// Sorted palette assigns slot order by ascending global id (stable, neighbour-agnostic).
     #[test]
-    fn incremental_recenter_matches_full_bake() {
-        let config = super::super::SdfGridConfig {
-            lod_count: 3,
-            ring_bricks: 6,
-            ..Default::default()
-        };
-        // A terrain-ish row of boxes spread along X so a camera move crosses real
-        // surface at several LODs.
-        let mut edits = Vec::new();
-        for i in -3i32..=3 {
-            edits.push(resolved(
-                SdfPrimitive::Box {
-                    half_extents: Vec3::new(0.4, 0.4, 0.4),
-                },
-                Transform::from_xyz(i as f32 * 1.5, 0.0, 0.0),
-                SdfOp::default(),
-                (i.rem_euclid(3)) as u16,
-            ));
-        }
-        let (_aabbs, bvh) = build_bvh(&edits);
-
-        let cam0 = Vec3::ZERO;
-        let mut atlas = SdfAtlas::default();
-        atlas.full_bake(&edits, &bvh, &config, &super::super::height::HeightField::default(), cam0);
-
-        // Walk the camera across several brick widths in small steps (crosses LOD-0 and
-        // LOD-1 boundaries), recentering incrementally each step.
-        let mut cam = cam0;
-        for step in 1..=12 {
-            let next = Vec3::new(step as f32 * 0.35, 0.0, 0.0);
-            recenter_sync(&mut atlas, &config, &edits, &bvh, cam, next);
-            cam = next;
-
-            let mut reference = SdfAtlas::default();
-            reference.full_bake(&edits, &bvh, &config, &super::super::height::HeightField::default(), cam);
-
-            let inc: HashSet<_> = atlas.bricks.keys().copied().collect();
-            let refk: HashSet<_> = reference.bricks.keys().copied().collect();
-            assert_eq!(
-                inc, refk,
-                "step {step}: incremental recenter brick set diverged from full bake"
-            );
-            for (key, rb) in &reference.bricks {
-                assert_eq!(
-                    atlas.bricks[key].dist, rb.dist,
-                    "step {step}: dist mismatch at {key:?}"
-                );
-            }
-        }
+    fn palette_is_sorted_by_id() {
+        let edits = vec![
+            resolved(SdfPrimitive::Sphere { radius: 0.3 }, Transform::IDENTITY, 5),
+            resolved(SdfPrimitive::Sphere { radius: 0.3 }, Transform::from_xyz(0.5, 0.0, 0.0), 2),
+        ];
+        let palette = build_palette(&edits, &[Vec3::ZERO, Vec3::new(0.5, 0.0, 0.0)]);
+        assert_eq!(palette[0], 2);
+        assert_eq!(palette[1], 5);
     }
 
-    /// Moving the camera far away and back must leave no stale bricks: after returning
-    /// to the origin the resident set equals a fresh full_bake there (exited bricks were
-    /// truly evicted, not leaked).
+    /// `insert_gpu_brick` allocates a stable tile, records it for the GPU bake, and bumps the
+    /// generations so the render world re-extracts + rebuilds the chunk tables.
     #[test]
-    fn recenter_round_trip_leaves_no_stale_bricks() {
-        let config = super::super::SdfGridConfig {
-            lod_count: 2,
-            ring_bricks: 6,
-            ..Default::default()
-        };
-        let edits = vec![resolved(
-            SdfPrimitive::Sphere { radius: 0.5 },
-            Transform::IDENTITY,
-            SdfOp::default(),
-            0,
-        )];
-        let (_aabbs, bvh) = build_bvh(&edits);
-
+    fn insert_gpu_brick_allocates_and_bumps() {
         let mut atlas = SdfAtlas::default();
-        atlas.full_bake(&edits, &bvh, &config, &super::super::height::HeightField::default(), Vec3::ZERO);
-
-        // Fly far past the sphere (it leaves every ring) then back to the origin.
-        recenter_sync(&mut atlas, &config, &edits, &bvh, Vec3::ZERO, Vec3::new(50.0, 0.0, 0.0));
-        recenter_sync(
-            &mut atlas,
-            &config,
-            &edits,
-            &bvh,
-            Vec3::new(50.0, 0.0, 0.0),
-            Vec3::ZERO,
-        );
-
-        let mut reference = SdfAtlas::default();
-        reference.full_bake(&edits, &bvh, &config, &super::super::height::HeightField::default(), Vec3::ZERO);
-
-        let inc: HashSet<_> = atlas.bricks.keys().copied().collect();
-        let refk: HashSet<_> = reference.bricks.keys().copied().collect();
-        assert_eq!(inc, refk, "round-trip left stale or missing bricks");
+        let key = BrickKey::new(0, IVec3::ZERO);
+        let gen0 = atlas.generation;
+        let topo0 = atlas.topology_generation;
+        let tile = atlas.insert_gpu_brick(key, [0; PALETTE_K]);
+        assert_eq!(atlas.tiles.tile(&key), Some(tile));
+        assert!(atlas.gpu_baked_tiles.contains(&tile));
+        assert!(atlas.bricks.contains_key(&key));
+        assert_ne!(atlas.generation, gen0, "new brick must bump the upload generation");
+        assert_ne!(atlas.topology_generation, topo0, "new brick must bump the topology generation");
     }
 
-    /// While far from all geometry, the atlas must hold zero bricks (the sparse cull +
-    /// eviction keep VRAM bounded as the camera roams empty space).
+    /// Evicting a brick must bump BOTH `generation` and `topology_generation` so the render
+    /// world re-extracts (it early-returns on an unchanged `generation`) and rebuilds the
+    /// chunk tables — otherwise a frame that only evicts (flying away) leaves the GPU
+    /// rendering just-dropped bricks. A no-op remove must NOT bump.
     #[test]
-    fn far_from_geometry_evicts_everything() {
-        let config = super::super::SdfGridConfig {
-            lod_count: 2,
-            ring_bricks: 6,
-            ..Default::default()
-        };
-        let edits = vec![resolved(
-            SdfPrimitive::Sphere { radius: 0.5 },
-            Transform::IDENTITY,
-            SdfOp::default(),
-            0,
-        )];
-        let (_aabbs, bvh) = build_bvh(&edits);
-
+    fn eviction_bumps_generation_for_gpu_extract() {
         let mut atlas = SdfAtlas::default();
-        atlas.full_bake(&edits, &bvh, &config, &super::super::height::HeightField::default(), Vec3::ZERO);
-        assert!(!atlas.bricks.is_empty(), "sphere bakes some bricks at origin");
+        let key = BrickKey::new(0, IVec3::ZERO);
+        atlas.insert_gpu_brick(key, [0; PALETTE_K]);
 
-        recenter_sync(
-            &mut atlas,
-            &config,
-            &edits,
-            &bvh,
-            Vec3::ZERO,
-            Vec3::new(200.0, 0.0, 0.0),
-        );
-        assert!(
-            atlas.bricks.is_empty(),
-            "no geometry near the camera → all bricks evicted, got {}",
-            atlas.bricks.len()
-        );
+        let gen_before = atlas.generation;
+        let topo_before = atlas.topology_generation;
+        assert!(atlas.remove_brick(&key), "brick must actually be removed");
+        assert_ne!(atlas.generation, gen_before, "eviction must bump the upload generation");
+        assert_ne!(atlas.topology_generation, topo_before, "eviction must bump the topology generation");
+
+        let gen_after = atlas.generation;
+        assert!(!atlas.remove_brick(&key), "second remove is a no-op");
+        assert_eq!(atlas.generation, gen_after, "no-op remove must not bump the generation");
     }
 }

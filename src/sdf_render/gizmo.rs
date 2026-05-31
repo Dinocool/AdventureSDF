@@ -16,7 +16,6 @@ use bevy::prelude::*;
 
 use crate::gizmo_render::{GizmoDraw, GizmoMesh, ShapeBuilder};
 
-use super::bake_scheduler::SyncBakeRequest;
 use super::picking::{Ray, mouse_to_ray};
 use super::{SdfCamera, SdfSelection, SdfVolume};
 
@@ -464,7 +463,6 @@ pub fn gizmo_update(
     mouse: Res<ButtonInput<MouseButton>>,
     mut state: ResMut<GizmoState>,
     selection: Res<SdfSelection>,
-    mut sync_bake: ResMut<SyncBakeRequest>,
     windows: Query<&Window>,
     cameras: Query<(&Camera, &Transform), With<SdfCamera>>,
     mut volumes: Query<&mut Transform, (With<SdfVolume>, Without<SdfCamera>)>,
@@ -507,11 +505,9 @@ pub fn gizmo_update(
         if let Ok(mut t) = volumes.get_mut(entity) {
             // Mutating Transform fires `Changed<Transform>`, which `schedule_bakes`
             // uses to rebake just the affected chunks — no explicit dirty flag needed.
+            // `emit_gpu_bakes` bakes the touched chunks the same frame, so the volume
+            // tracks the cursor live with no extra signal.
             apply_drag(&drag, &ray, &mut t, &state);
-            // Bake the touched chunks this frame so the volume tracks the cursor live;
-            // the async path would otherwise lose every frame's result to the epoch
-            // race and not show until release.
-            sync_bake.0 = true;
         }
         state.hovered = Some(drag.id);
         state.drag = Some(drag);
