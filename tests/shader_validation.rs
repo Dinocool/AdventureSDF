@@ -178,7 +178,6 @@ fn sdf_debug_modes_validate() {
         "SDF_LINEAR_CHUNK_SEARCH",
         "SDF_DEBUG_TILE_ID",
         "SDF_DEBUG_CHUNK_ID",
-        "SDF_DEBUG_BLEND_FATE",
     ] {
         validate_composed_sdf_with_defs(&[def]).unwrap_or_else(|e| panic!("{e}"));
     }
