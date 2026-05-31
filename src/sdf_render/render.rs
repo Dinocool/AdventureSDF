@@ -222,7 +222,7 @@ struct ExtractedSdfMaterials {
 /// streams any layers that appear beyond what it has already uploaded.
 #[derive(Resource, Default)]
 struct ExtractedTextureLibrary {
-    variants: Vec<super::textures::LibraryVariant>,
+    variants: Vec<crate::assets::MapSet>,
 }
 
 // --- Pipeline ---
@@ -1105,11 +1105,9 @@ fn init_texture_streaming(
     }
     let pool = AsyncComputeTaskPool::get();
     for layer in stream.spawned_layers..want {
-        let v = &extracted.variants[layer as usize];
-        let slug = v.slug.clone();
-        let dir = v.dir.clone();
+        let map_set = extracted.variants[layer as usize].clone();
         stream.tasks.push(pool.spawn(async move {
-            let maps = super::textures::encode_variant_bc7(&slug, &dir);
+            let maps = super::textures::encode_mapset_bc7(&map_set);
             EncodedVariant { layer, maps }
         }));
     }

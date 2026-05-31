@@ -14,13 +14,15 @@ use bevy::prelude::*;
 
 pub mod compile;
 pub mod material;
+pub mod pbr_texture;
 pub mod save;
 pub mod texture_lib;
 
 #[cfg(test)]
 mod tests;
 
-pub use material::{MaterialAsset, TexRef};
+pub use material::MaterialAsset;
+pub use pbr_texture::{MapSet, PbrTextureAsset, PbrTextureHandles};
 pub use texture_lib::{MAX_TEXTURE_LAYERS, MaterialAssetTable, MaterialTextureLibrary};
 
 /// A soul-engine resource: a concrete, serde + reflect type that loads via a
@@ -46,11 +48,14 @@ pub struct AssetsPlugin;
 impl Plugin for AssetsPlugin {
     fn build(&self, app: &mut App) {
         app.init_asset::<MaterialAsset>()
+            .init_asset::<PbrTextureAsset>()
             .register_asset_loader(material::MaterialAssetLoader)
+            .register_asset_loader(pbr_texture::PbrTextureAssetLoader)
             .register_type::<MaterialAsset>()
-            .register_type::<TexRef>()
+            .register_type::<PbrTextureAsset>()
             .init_resource::<MaterialTextureLibrary>()
-            .init_resource::<MaterialAssetTable>();
+            .init_resource::<MaterialAssetTable>()
+            .init_resource::<pbr_texture::PbrTextureHandles>();
 
         compile::register(app);
     }

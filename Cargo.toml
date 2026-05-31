@@ -15,14 +15,17 @@ editor = [
 fast = ["bevy/dynamic_linking"]
 
 [dependencies]
-bevy = { version = "0.18", features = ["bevy_remote"] }
+# `jpeg`/`bmp`/`tga` so the editor can preview PBR-texture role files in any of the
+# formats the importer accepts (png is already a Bevy default).
+bevy = { version = "0.18", features = ["bevy_remote", "jpeg", "bmp", "tga"] }
 bevy_brp_extras = "0.18"
 bevy_rapier3d = "0.34.0"
 wgpu = "27"
 bevy-inspector-egui = { version = "0.36", optional = true }
 bevy_egui = { version = "0.39", optional = true }
-# PBR texture-library loading: decode PNG maps (image) and read material manifests (ron).
-image = { version = "0.25", default-features = false, features = ["png"] }
+# PBR texture-library loading: decode role-map source files (image) and read material
+# manifests (ron). Multiple formats so a PBR-texture resource can reference any of them.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "bmp", "tga"] }
 # RON + serde: PBR material manifests AND the custom .scene format (soul_scene).
 # Otherwise only transitive via bevy_scene.
 ron = "0.12"

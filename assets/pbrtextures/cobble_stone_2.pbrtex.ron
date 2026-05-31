@@ -1,0 +1,9 @@
+PbrTextureAsset(
+  diffuse: Some("textures/cobble_stone/2/diffuse.png"),
+  normal: Some("textures/cobble_stone/2/normal.png"),
+  metallic: Some("textures/cobble_stone/2/metallic.png"),
+  roughness: Some("textures/cobble_stone/2/roughness.png"),
+  ao: Some("textures/cobble_stone/2/ao.png"),
+  height: Some("textures/cobble_stone/2/height.png"),
+  edge: Some("textures/cobble_stone/2/edge.png"),
+)

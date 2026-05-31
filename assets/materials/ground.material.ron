@@ -1,0 +1,8 @@
+MaterialAsset(
+  base_color: (1.0, 1.0, 1.0, 1.0),
+  blend_softness: 0.0,
+  metallic: 0.0,
+  roughness: 1.0,
+  parallax_scale: 0.15,
+  texture: Some("pbrtextures/ground_1.pbrtex.ron"),
+)
