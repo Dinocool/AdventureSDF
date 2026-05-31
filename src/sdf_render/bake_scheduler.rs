@@ -445,6 +445,43 @@ fn emit_gpu_bakes(
         for key in chunk_brick_keys(*ck, config) {
             if atlas::SdfAtlas::cull_edit_indices(key, &bvh_snapshot, config, &mut scratch).is_some()
             {
+                // Narrow-band cull: bake only the surface SHELL, dropping bricks the isosurface
+                // cannot reach. The AABB overlap above is coarse — it keeps every brick inside a
+                // solid (DEEP INTERIOR) and, for a non-box primitive, every brick in the edit's
+                // bounding box including its FAR-EXTERIOR corners. The march reads neither: rays
+                // approach from outside through empty space (brick-DDA skips non-resident space),
+                // read the field only in the thin band where it crosses zero, accept the hit, and
+                // stop. Interior + far-exterior texels (saturated ±band) are baked, uploaded, and
+                // never sampled — and the interior is r³ vs the shell's r², the bulk that drives
+                // the approach-bake hitch on a large solid.
+                //
+                // Keep a brick iff the folded surface can reach it: |d| at the brick centre is
+                // within the brick circumradius (half the space diagonal — the farthest a corner
+                // sits from the centre) plus the snorm band the brick stores. That keeps the full
+                // shell the march samples; everything deeper-in or farther-out is dropped. A
+                // dropped brick reads as empty (non-resident → brick-DDA / coarse-LOD fallback),
+                // exactly as genuinely empty space does.
+                //
+                // KNOWN LIMITATION (interior cavities — NOT handled, by decision): a carve fully
+                // ENCLOSED inside a solid (a Subtract bubble that never breaks the outer surface)
+                // has its own surface in the brick INTERIOR. Centre-only sampling can mis-classify
+                // a brick the cavity surface merely grazes as deep-interior and drop it, leaving a
+                // hole when the camera is inside the cavity. We will carve interior cavities later;
+                // when that lands, replace this single centre eval with an 8-corner (min-over-
+                // corners of |d|) test so an enclosed cavity surface is never missed.
+                let center = config.brick_min_world(key.coord, key.lod)
+                    + Vec3::splat(0.5 * config.brick_world_size(key.lod));
+                let d_center = edits::fold_csg_dist_indexed(&edits_snapshot, &scratch, center);
+                let reach = config.brick_world_size(key.lod) * (0.5 * 3.0_f32.sqrt())
+                    + atlas::dist_band_world(config, key.lod);
+                if d_center.abs() > reach {
+                    // Surface out of reach (deep interior OR far exterior) → never sampled by the
+                    // march. Evict any stale resident brick (e.g. a shrinking/moving edit) and
+                    // skip: no insert, no job, no cap/spill cost.
+                    atlas.remove_brick(&key);
+                    continue;
+                }
+
                 // Over the per-frame job cap → defer this brick's BAKE. Do NOT insert it
                 // (must stay non-resident → coarse-LOD fallback). The chunk is re-queued.
                 if gpu_bakes.jobs.len() >= GPU_BAKE_JOB_CAP {
@@ -573,6 +610,15 @@ mod tests {
         }
     }
 
+    fn sphere_edit(pos: Vec3, radius: f32, mat: u16) -> ResolvedEdit {
+        ResolvedEdit {
+            prim: SdfPrimitive::Sphere { radius },
+            transform: Transform::from_translation(pos),
+            op: SdfOp { kind: CsgKind::Union, smoothing: 0.0 },
+            material_id: mat,
+        }
+    }
+
     /// A scheduler primed with `edits` + their BVH, as `schedule_bakes` would leave it after
     /// the edit-change step — so `emit_gpu_bakes` can be driven directly in a test.
     fn primed_sched(edits: &[ResolvedEdit]) -> BakeScheduler {
@@ -588,17 +634,18 @@ mod tests {
     #[test]
     fn gpu_emit_caps_jobs_and_spills_overflow() {
         let cfg = SdfGridConfig { lod_count: 1, ring_bricks: 8, recenter_snap_chunks: 1, ..config() };
-        // One big edit covering a wide region so many chunks are dirty and non-empty.
-        let edits = vec![box_edit(Vec3::ZERO, 40.0, 0)];
+        // A big SOLID sphere. The narrow-band cull drops its deep interior, so the overflow
+        // must come from the SHELL alone — radius 22 gives a surface band of ~30k+ bricks,
+        // comfortably over the 16384 cap. (A solid box would now cull to almost nothing.)
+        let edits = vec![sphere_edit(Vec3::ZERO, 22.0, 0)];
         let mut sched = primed_sched(&edits);
         let mut atlas = SdfAtlas::default();
         let mut gpu = PendingGpuBakes::default();
 
-        // Dirty far more chunks than the cap can bake in one frame: each chunk = 64 bricks,
-        // so 512 chunks ≈ 32768 candidate bricks > GPU_BAKE_JOB_CAP (16384).
-        for x in 0..8 {
-            for y in 0..8 {
-                for z in 0..8 {
+        // Dirty a chunk cube bounding the whole sphere (chunk_world ≈ 2.8, so ±22 ⇒ chunk ±8).
+        for x in -9..=9 {
+            for y in -9..=9 {
+                for z in -9..=9 {
                     sched.pending.insert(chunk::ChunkKey::new(0, IVec3::new(x, y, z)));
                 }
             }
@@ -630,13 +677,15 @@ mod tests {
     #[test]
     fn gpu_emit_spilled_bricks_stay_non_resident() {
         let cfg = SdfGridConfig { lod_count: 1, ring_bricks: 8, recenter_snap_chunks: 1, ..config() };
-        let edits = vec![box_edit(Vec3::ZERO, 40.0, 0)];
+        // Big SOLID sphere: the cull drops its deep interior, so the >cap overflow rides on the
+        // shell + bounding-box exterior alone (~100k+ bricks). (A solid box would cull to ~0.)
+        let edits = vec![sphere_edit(Vec3::ZERO, 22.0, 0)];
         let mut sched = primed_sched(&edits);
         let mut atlas = SdfAtlas::default();
         let mut gpu = PendingGpuBakes::default();
-        for x in 0..8 {
-            for y in 0..8 {
-                for z in 0..8 {
+        for x in -9..=9 {
+            for y in -9..=9 {
+                for z in -9..=9 {
                     sched.pending.insert(chunk::ChunkKey::new(0, IVec3::new(x, y, z)));
                 }
             }
@@ -664,6 +713,67 @@ mod tests {
             assert!(guard < 100, "spill drain did not converge");
         }
         assert!(atlas.bricks.len() > GPU_BAKE_JOB_CAP, "all dirty bricks eventually resident");
+    }
+
+    /// Narrow-band interior cull: a solid object bakes only its surface SHELL, not its deep
+    /// interior. The march reads the field from OUTSIDE (rays shrink to the surface and stop),
+    /// so interior bricks are write-only waste — and for a big solid they're the r³ bulk that
+    /// drives the approach-bake hitch. Assert: (a) the brick at the centre of a large solid is
+    /// NOT resident, (b) a brick straddling the surface IS, (c) the resident count is far below
+    /// the solid's full bounding-box brick count (what the old AABB-only cull kept).
+    #[test]
+    fn gpu_emit_culls_deep_interior_of_solid() {
+        let cfg = SdfGridConfig { lod_count: 1, ring_bricks: 8, recenter_snap_chunks: 1, ..config() };
+        let radius = 10.0;
+        let edits = vec![sphere_edit(Vec3::ZERO, radius, 0)];
+        let mut sched = primed_sched(&edits);
+        let mut atlas = SdfAtlas::default();
+
+        // Dirty a chunk cube bounding the sphere (chunk_world = 2.8 ⇒ ±10 ⇒ chunk ±4).
+        for x in -5..=5 {
+            for y in -5..=5 {
+                for z in -5..=5 {
+                    sched.pending.insert(chunk::ChunkKey::new(0, IVec3::new(x, y, z)));
+                }
+            }
+        }
+        // Drain fully (cap may spill across frames) so the resident set is the final one.
+        let mut gpu = PendingGpuBakes::default();
+        let mut guard = 0;
+        loop {
+            gpu.jobs.clear();
+            gpu.edits.clear();
+            atlas.gpu_baked_tiles.clear();
+            emit_gpu_bakes(&mut atlas, &mut sched, &mut gpu, &cfg);
+            guard += 1;
+            assert!(guard < 1000, "cull-test settle did not converge");
+            if sched.pending.is_empty() {
+                break;
+            }
+        }
+
+        let brick_at = |p: Vec3| atlas::BrickKey::new(0, cfg.world_to_brick_lod(p, 0));
+        // (a) Dead centre of the solid: surface is `radius` away ≫ brick reach → culled.
+        assert!(
+            !atlas.bricks.contains_key(&brick_at(Vec3::ZERO)),
+            "deep-interior brick at the sphere centre must be culled (write-only waste)"
+        );
+        // (b) A brick straddling the surface (just inside it) must stay resident.
+        assert!(
+            atlas.bricks.contains_key(&brick_at(Vec3::new(radius - 0.05, 0.0, 0.0))),
+            "surface-shell brick must remain resident (the march reads it)"
+        );
+        // (c) Resident ≪ what the OLD (AABB-only) cull kept. That cull kept every brick whose
+        // box overlapped the sphere's bounding BOX — i.e. the full (2r)³ cube. The narrow-band
+        // cull keeps only the shell, so it must be well under half that cube.
+        let bw = cfg.brick_world_size(0);
+        let bbox_bricks = ((2.0 * radius / bw).ceil() as usize).pow(3);
+        assert!(
+            atlas.bricks.len() < bbox_bricks / 2,
+            "resident {} should be far below the AABB-cull bounding-box count {}",
+            atlas.bricks.len(),
+            bbox_bricks
+        );
     }
 
     /// Empty-space bricks are evicted the same frame even under the job cap (eviction is
