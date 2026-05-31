@@ -80,8 +80,17 @@ impl Plugin for EditorPlugin {
             .resource_mut::<bevy_egui::EguiGlobalSettings>()
             .enable_absorb_bevy_input_system = false;
 
-        // Perf (FPS / frame time) now lives in the bottom status bar alongside the bake
-        // status — see `status_bar::status_bar_ui` — so no separate dock tab.
+        // Compact FPS / frame-time readout lives in the bottom status bar
+        // (`status_bar::status_bar_ui`); the full Performance tab (readout + shared FPS /
+        // frame-time graph) is a dedicated bottom dock panel.
+        panels::register_panel(
+            app,
+            "core/performance",
+            "Performance",
+            DockSide::Bottom,
+            0,
+            profiling::performance_panel,
+        );
 
         keybinds::plugin(app);
 
