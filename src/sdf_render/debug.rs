@@ -1015,44 +1015,71 @@ pub fn sdf_material_editor(world: &mut World, entity: Entity, ui: &mut egui::Ui)
         return;
     };
 
-    // Pick which registry material this edit uses.
-    let mat_names: Vec<(u32, String)> = {
-        let reg = world.resource::<super::edits::MaterialRegistry>();
-        reg.defs
-            .iter()
-            .enumerate()
-            .map(|(i, d)| {
-                let c = d.base_color.to_srgba();
-                (
-                    i as u32,
-                    format!("#{i} ({:.2},{:.2},{:.2})", c.red, c.green, c.blue),
-                )
-            })
-            .collect()
-    };
-    let cur_label = mat_names
-        .iter()
-        .find(|(i, _)| *i == material.registry_id)
-        .map(|(_, n)| n.clone())
-        .unwrap_or_else(|| "?".into());
-    let mut id_changed = false;
-    egui::ComboBox::from_label("Material")
-        .selected_text(cur_label)
-        .show_ui(ui, |ui| {
-            for (id, name) in &mat_names {
-                if ui
-                    .selectable_value(&mut material.registry_id, *id, name)
-                    .changed()
-                {
-                    id_changed = true;
-                }
-            }
-        });
+    // Pick which material asset this edit uses, via the searchable resource picker
+    // (a grid of material spheres). The current selection is resolved back to its file.
+    use crate::editor::material_editor::{material_path_for_registry_id, material_picker_entries};
+    use crate::editor::resource_picker::{PickResult, PickerEntry, resource_picker};
 
-    // Edit the *referenced registry material's* appearance (shared by every edit that
-    // uses it). Color + seam blend softness. Shading-only → no rebake needed (the GPU
-    // material table re-uploads on registry change).
-    {
+    let current_path = material_path_for_registry_id(world, material.registry_id);
+    let current_entry = current_path.as_ref().map(|p| PickerEntry {
+        key: p.to_string_lossy().into_owned(),
+        label: p
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(|n| n.trim_end_matches(".material.ron").to_string())
+            .unwrap_or_default(),
+        thumb: crate::editor::assets_browser::TileThumb::Path(p.clone()),
+    });
+
+    ui.label("Material");
+    let picked = resource_picker(
+        world,
+        ui,
+        ui.make_persistent_id(("sdf_mat_picker", entity)),
+        current_entry.as_ref(),
+        false,
+        material_picker_entries,
+    );
+
+    // On pick: load + register the chosen material file, set the edit's registry id.
+    // `get_mut` fires `Changed<SdfMaterial>` → `schedule_bakes` targeted rebake.
+    if let Some(PickResult::Key(path)) = picked {
+        let handle = world
+            .resource::<AssetServer>()
+            .load::<crate::assets::MaterialAsset>(
+                std::path::Path::new(&path)
+                    .strip_prefix(crate::editor::assets_browser::ASSETS_ROOT)
+                    .map(std::path::Path::to_path_buf)
+                    .unwrap_or_else(|_| std::path::PathBuf::from(&path)),
+            );
+        let new_id = world
+            .resource_mut::<crate::assets::MaterialAssetTable>()
+            .register(handle);
+        material.registry_id = new_id;
+        if let Some(mut m) = world.get_mut::<SdfMaterial>(entity) {
+            *m = material;
+        }
+    }
+
+    // The selected material is either backed by an on-disk `MaterialAsset` or it's a
+    // registry-only material. Edit the appropriate one — never both (the asset editor
+    // and the registry sliders cover the same fields, so showing both is redundant).
+    let asset_handle = {
+        let table = world.resource::<crate::assets::MaterialAssetTable>();
+        table
+            .handles
+            .get(material.registry_id as usize)
+            .filter(|h| h.id() != Handle::<crate::assets::MaterialAsset>::default().id())
+            .cloned()
+    };
+
+    if let Some(handle) = asset_handle {
+        // Asset-backed: edit the source asset (the authored truth; recompiles into the
+        // registry). Full editor + interactive preview.
+        crate::editor::material_editor::material_editor_ui(world, &handle, ui);
+    } else {
+        // Registry-only material (no asset file): edit the GPU registry def directly.
+        // Shading-only → no rebake (the GPU material table re-uploads on registry change).
         let mut reg = world.resource_mut::<super::edits::MaterialRegistry>();
         if let Some(def) = reg.defs.get_mut(material.registry_id as usize) {
             let lin = def.base_color.to_linear();
@@ -1063,19 +1090,12 @@ pub fn sdf_material_editor(world: &mut World, entity: Entity, ui: &mut egui::Ui)
             // Per-material colour-feather width at seams (world units). Does not affect
             // geometry — see SdfOp::smoothing for that.
             ui.add(egui::Slider::new(&mut def.blend_softness, 0.0..=1.0).text("Blend softness"));
-            // Scalar metallic/roughness — these drive shading only when the material has
-            // NO MRA texture (the textureless exemplars). For a textured material the MRA
-            // map wins and these sliders have no visible effect. Shading-only, no rebake.
+            // Scalar metallic/roughness — drive shading only when the material has no MRA
+            // texture (the textureless exemplars).
             ui.add(egui::Slider::new(&mut def.metallic, 0.0..=1.0).text("Metallic"));
             ui.add(egui::Slider::new(&mut def.roughness, 0.0..=1.0).text("Roughness"));
             // Height relief displacement depth (world units). Only visible with a height map.
             ui.add(egui::Slider::new(&mut def.parallax_scale, 0.0..=0.4).text("Relief depth"));
         }
-    }
-
-    // Write the chosen id back. `get_mut` fires `Changed<SdfMaterial>`, which
-    // `schedule_bakes` watches → targeted rebake of the affected chunks.
-    if id_changed && let Some(mut m) = world.get_mut::<SdfMaterial>(entity) {
-        *m = material;
     }
 }

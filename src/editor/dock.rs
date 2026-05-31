@@ -158,8 +158,7 @@ impl TabViewer for EditorTabViewer<'_> {
                 super::project_files::project_files_ui(self.world, ui);
             }
             EditorTab::AssetsDrawer => {
-                // Stub: gains tabs (asset browser, output log, etc.) in a later pass.
-                ui.weak("Assets — coming soon.");
+                super::assets_browser::assets_browser_ui(self.world, ui);
             }
             EditorTab::Registered(id) => {
                 if let Some(render) = self.registry.panel_by_id(id).map(|p| &p.render) {

@@ -547,67 +547,28 @@ impl Plugin for SdfScenePlugin {
 fn setup_sdf_scene(
     mut commands: Commands,
     asset_server: Res<AssetServer>,
-    mut material_assets: ResMut<Assets<crate::assets::MaterialAsset>>,
     mut asset_table: ResMut<crate::assets::MaterialAssetTable>,
 ) {
-    use crate::assets::{MaterialAsset, TexRef};
+    use crate::assets::MaterialAsset;
 
     asset_table.ensure_fallback();
 
-    // Demo materials. Each references a texture variant by path (slug/dir). If a
-    // matching `assets/materials/<name>.material.ron` exists on disk we load it (the
-    // authored source of truth); otherwise we synthesize one in-memory so the demo
-    // scene still renders. Either way it gets a stable registry id from the table,
-    // and `assets::compile` fills the GPU registry once the asset resolves.
-    let mut mat = |name: &str, slug: &str, dir: &str| -> u32 {
-        let path = format!("materials/{name}.material.ron");
-        let handle = if std::path::Path::new(&format!("assets/{path}")).exists() {
-            asset_server.load::<MaterialAsset>(path)
-        } else {
-            material_assets.add(MaterialAsset {
-                base_color: [1.0, 1.0, 1.0, 1.0],
-                blend_softness: 0.0,
-                // Textured material: MRA texture supplies metallic/roughness, so these
-                // scalar fallbacks are unused. Keep the prior neutral values.
-                metallic: 0.0,
-                roughness: 1.0,
-                parallax_scale: 0.15,
-                maps: std::array::from_fn(|_| {
-                    Some(TexRef {
-                        slug: slug.to_string(),
-                        dir: dir.to_string(),
-                    })
-                }),
-            })
-        };
+    // Demo materials are authored on-disk resources under `assets/materials/`
+    // (exported once via the `export_demo_materials` test). Load each by name and
+    // register it for a stable registry id; `assets::compile` fills the GPU registry
+    // once the asset resolves. If a file were missing the loader yields an unresolved
+    // handle (the fallback material renders) — but they ship with the project.
+    let mut mat = |name: &str| -> u32 {
+        let handle = asset_server.load::<MaterialAsset>(format!("materials/{name}.material.ron"));
         asset_table.register(handle)
     };
 
-    let mat_sand = mat("sand", "sand", "1");
-    let mat_cobble = mat("cobble", "cobble_stone", "1");
-    let mat_ground = mat("ground", "ground", "1");
-
-    // Textureless PBR exemplars: synthesized in-memory with NO maps, so the shader uses
-    // the scalar metallic/roughness fallbacks. These show the Stage-3 IBL clearly — a
-    // smooth metal mirrors the sky, a rough one reads as brushed/satin metal.
-    let mut exemplar = |color: [f32; 4], metallic: f32, roughness: f32| -> u32 {
-        let handle = material_assets.add(MaterialAsset {
-            base_color: color,
-            blend_softness: 0.0,
-            metallic,
-            roughness,
-            // Exemplars are textureless (no height map) so parallax is a no-op for them.
-            parallax_scale: 0.06,
-            maps: std::array::from_fn(|_| None),
-        });
-        asset_table.register(handle)
-    };
-    // Deep red, fully metallic, fairly smooth — the headline mirror-metal sphere.
-    let mat_red_metal = exemplar([0.55, 0.04, 0.03, 1.0], 1.0, 0.18);
-    // Gold-ish metal, medium roughness — satin highlight, softer sky reflection.
-    let mat_gold_rough = exemplar([0.83, 0.62, 0.18, 1.0], 1.0, 0.45);
-    // Glossy white dielectric — near-mirror clearcoat look, strong fresnel rim.
-    let mat_white_gloss = exemplar([0.9, 0.9, 0.92, 1.0], 0.0, 0.08);
+    let mat_sand = mat("sand");
+    let mat_cobble = mat("cobble");
+    let mat_ground = mat("ground");
+    let mat_red_metal = mat("red_metal");
+    let mat_gold_rough = mat("gold_rough");
+    let mat_white_gloss = mat("white_gloss");
 
     // Camera
     let orbit = SdfOrbitCamera::default();

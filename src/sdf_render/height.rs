@@ -104,12 +104,11 @@ impl HeightField {
     }
 }
 
-/// Decode a material's height PNG into a grayscale `[0,1]` buffer. Reuses the same load +
+/// Decode a material's height image into a grayscale `[0,1]` buffer. Reuses the same load +
 /// resize the BC7 encoder uses (`image::open` → resize → luma) so CPU and GPU see the same
 /// pixels. `None` on a missing/unreadable file.
-fn load_height_image(slug: &str, dir: &str) -> Option<MaterialHeight> {
-    let path = format!("assets/textures/{slug}/{dir}/height.png");
-    let img = match image::open(&path) {
+fn load_height_image(path: &std::path::Path) -> Option<MaterialHeight> {
+    let img = match image::open(path) {
         Ok(img) => img,
         Err(_) => return None,
     };
@@ -164,7 +163,9 @@ pub fn build(
             continue;
         }
         let variant = library.variants.get(layer as usize);
-        let loaded = variant.and_then(|v| load_height_image(&v.slug, &v.dir));
+        let loaded = variant
+            .and_then(|v| crate::assets::MapSet::role_abs(&v.height))
+            .and_then(|path| load_height_image(&path));
         mats.push(loaded.map(|mut mh| {
             mh.depth = def.parallax_scale;
             mh

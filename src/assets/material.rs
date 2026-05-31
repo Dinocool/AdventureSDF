@@ -10,18 +10,10 @@ use bevy::asset::{AssetLoader, LoadContext, io::Reader};
 use bevy::prelude::*;
 use serde::{Deserialize, Serialize};
 
-use crate::sdf_render::edits::MATERIAL_TEX_MAPS;
-
-/// Reference to a texture variant on disk: `assets/textures/<slug>/<dir>`. Resolved
-/// to a GPU array layer on demand by the material compile step.
-#[derive(Reflect, Serialize, Deserialize, Clone, PartialEq, Eq, Debug, Default)]
-pub struct TexRef {
-    pub slug: String,
-    pub dir: String,
-}
+use super::pbr_texture::PbrTextureAsset;
 
 /// An authored material resource. The editable source of truth on disk; the compile
-/// step flattens it (+ resolved texture layers) into a `MaterialDef` row in the
+/// step flattens it (+ a resolved texture layer) into a `MaterialDef` row in the
 /// `MaterialRegistry` that the GPU table mirrors.
 ///
 /// `base_color` is stored as `[f32; 4]` (linear RGBA) rather than `Color` so the RON
@@ -32,20 +24,23 @@ pub struct MaterialAsset {
     pub base_color: [f32; 4],
     /// Shading-time seam cross-fade width (world units). See `MaterialDef`.
     pub blend_softness: f32,
-    /// Scalar metallic/roughness fallbacks, used when no MRA texture is set (`maps[2]`
-    /// is `None`). `#[serde(default)]` so older RON without these fields still loads
-    /// (defaulting to a fully-rough dielectric, the prior behaviour).
+    /// Scalar metallic/roughness fallbacks, used when no MRA texture is set.
+    /// `#[serde(default)]` so older RON without these fields still loads.
     #[serde(default)]
     pub metallic: f32,
     #[serde(default = "default_roughness")]
     pub roughness: f32,
-    /// Parallax relief depth (UV units) for the height map. `#[serde(default)]` →
-    /// `default_parallax` so older RON without the field gets a sensible visible relief.
+    /// Parallax relief depth (UV units) for the height map.
     #[serde(default = "default_parallax")]
     pub parallax_scale: f32,
-    /// One texture reference per PBR map (diffuse, normal, mra, height, edge);
-    /// `None` = no texture for that map.
-    pub maps: [Option<TexRef>; MATERIAL_TEX_MAPS],
+    /// Path (relative to `assets/`) of the `.pbrtex.ron` PBR-texture bundle this
+    /// material uses. `None` = untextured. `#[serde(default)]` for back-compat.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub texture: Option<std::path::PathBuf>,
+    /// Per-role file overrides applied on top of the bundle (a role set here replaces
+    /// the bundle's). `#[serde(default)]` so older RON loads with no overrides.
+    #[serde(default, skip_serializing_if = "PbrTextureAsset::is_empty")]
+    pub overrides: PbrTextureAsset,
 }
 
 /// serde default for `roughness` (1.0 = fully diffuse). A bare `Default` would give 0.0
@@ -67,7 +62,8 @@ impl Default for MaterialAsset {
             metallic: 0.0,
             roughness: 1.0,
             parallax_scale: 0.15,
-            maps: std::array::from_fn(|_| None),
+            texture: None,
+            overrides: PbrTextureAsset::default(),
         }
     }
 }
