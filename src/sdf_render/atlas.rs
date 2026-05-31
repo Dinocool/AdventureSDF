@@ -113,6 +113,12 @@ pub struct PackedBrick {
     pub dist: SdfBrick,
     pub mat_dist: MaterialBrick,
     pub palette: Palette,
+    /// The atlas `edit_epoch` this brick was baked under. The bake emit skips re-baking a
+    /// resident brick whose `baked_epoch` equals the current `edit_epoch` — its GPU texels are
+    /// still valid (the edits it folded haven't changed), so a spilled chunk re-queued over
+    /// several frames doesn't re-cull / re-bake the bricks it already baked. Set in
+    /// [`SdfAtlas::insert_gpu_brick`]; compared in `emit_gpu_bakes`.
+    pub baked_epoch: u64,
 }
 
 /// CPU-side atlas topology: brick key (lod + origin) -> palette-only placeholder, plus the
@@ -144,6 +150,12 @@ pub struct SdfAtlas {
     /// so it knows which tiles the bake node will write; the CPU holds only a palette-only
     /// placeholder for them. Cleared each frame at the start of `schedule_bakes`.
     pub gpu_baked_tiles: HashSet<u32>,
+    /// Monotonic edit epoch: bumped whenever the edit set / BVH changes (a moved, added, or
+    /// removed edit). A brick baked under epoch E folds the edits as they were at E; if the
+    /// epoch is still E when its chunk is re-visited (e.g. a spilled chunk re-queued during a
+    /// large object's multi-frame bake), the brick's texels are still valid and the bake emit
+    /// skips it. Stored per brick as [`PackedBrick::baked_epoch`].
+    pub edit_epoch: u64,
 }
 
 impl Default for SdfAtlas {
@@ -156,6 +168,7 @@ impl Default for SdfAtlas {
             tiles: TileAllocator::default(),
             last_bake_was_full: false,
             gpu_baked_tiles: HashSet::new(),
+            edit_epoch: 0,
         }
     }
 }
@@ -271,6 +284,7 @@ impl SdfAtlas {
             dist: [0; BRICK_VOXELS],
             mat_dist: [0; BRICK_VOXELS * PALETTE_K],
             palette,
+            baked_epoch: self.edit_epoch,
         };
         let is_new = self.bricks.insert(key, placeholder).is_none();
         if is_new || palette_changed {

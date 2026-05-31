@@ -349,6 +349,7 @@ mod tests {
             dist: [0; super::super::atlas::BRICK_VOXELS],
             mat_dist: [0; super::super::atlas::BRICK_VOXELS * PALETTE_K],
             palette: [PALETTE_EMPTY; PALETTE_K],
+            baked_epoch: 0,
         }
     }
 
