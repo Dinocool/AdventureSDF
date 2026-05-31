@@ -127,6 +127,7 @@ impl GpuAtlas {
     /// Run this frame's bake jobs: dispatch the real bake shader into output buffers, grow the
     /// texture if needed (recreate taller + copy old), then copy each job's tile in. Mirrors
     /// `prepare_sdf_atlas_gpu` (grow) + `SdfBrickBakeNode` (dispatch+copy).
+    #[allow(clippy::too_many_arguments)]
     fn bake_frame(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, pipeline: &wgpu::ComputePipeline, layout: &wgpu::BindGroupLayout, jobs: &[Job], edits: &[GpuEdit], high_water: u32) {
         // Grow first (separate submit, like prepare_sdf_atlas_gpu).
         let required_rows = high_water.div_ceil(TEST_TILES_PER_ROW).max(1);

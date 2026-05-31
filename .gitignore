@@ -16,3 +16,8 @@ assets/scenes/untitled.scene
 
 # Chrome tracing profiler output (editor feature)
 trace-*.json
+
+# RenderDoc captures + analysis artifacts
+rdoc/
+*.cap
+*.rdc
