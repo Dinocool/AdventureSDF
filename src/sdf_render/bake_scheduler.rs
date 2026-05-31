@@ -337,13 +337,6 @@ pub fn schedule_bakes(
     // frame (e.g. flying away from the scene) still makes the render world re-extract and
     // drop the stale bricks — it doesn't depend on a bake being applied that frame.
     let mut bvh_scratch: Vec<u32> = Vec::new();
-    // DIAGNOSTIC (LOD-shift flicker): which LODs recentred this frame, so we can see if a
-    // fine LOD shifts on the SAME frame its coarse fallback shifts (nesting-break window).
-    let shifted_lods: Vec<u32> = (0..lod_count)
-        .filter(|&lod| {
-            ring_chunk_origin(&config, camera_pos, lod) != sched.ring_chunk_origin[lod as usize]
-        })
-        .collect();
     for lod in 0..lod_count {
         let li = lod as usize;
         let new_origin = ring_chunk_origin(&config, camera_pos, lod);
@@ -355,40 +348,23 @@ pub fn schedule_bakes(
         // resident bricks yet, so a chunk no edit reaches has nothing to bake. Enqueuing it
         // anyway would burn the per-frame budget on all-`None` bakes and starve the real
         // geometry entering far rings (the fly-away-from-scene LOD-stall bug).
-        let mut entered_geo = 0u32;
         for ck in chunk_window_keys(new_origin, r, lod) {
             let entered = first_run || !chunk_in_window(ck.coord, old_origin, r);
             if entered && chunk_has_geometry(ck, &bvh, &config, &mut bvh_scratch) {
                 sched.pending.insert(ck);
-                entered_geo += 1;
             }
         }
         // Exited chunks → drop all their bricks (and cancel any pending bake).
-        let mut exited_chunks = 0u32;
-        let mut evicted_bricks = 0u32;
         if !first_run {
             for ck in chunk_window_keys(old_origin, r, lod) {
                 if !chunk_in_window(ck.coord, new_origin, r) {
                     sched.pending.remove(&ck);
-                    exited_chunks += 1;
                     for bk in chunk_brick_keys(ck, &config) {
-                        if atlas.remove_brick(&bk) {
-                            evicted_bricks += 1;
-                        }
+                        atlas.remove_brick(&bk);
                     }
                 }
             }
         }
-        // DIAGNOSTIC: is the coarser fallback (lod+1) ALSO shifting this same frame? If so,
-        // the cross-fade's L+1 sample can be mid-transition exactly where L just evicted —
-        // the suspected hole. `coarse_also_shifting=true` on a flicker frame would confirm it.
-        let coarse_also_shifting = shifted_lods.contains(&(lod + 1));
-        info!(
-            "LOD-SHIFT lod={lod} entered_geo={entered_geo} exited_chunks={exited_chunks} \
-             evicted_bricks={evicted_bricks} pending={} coarse(lod+1)_also_shifting={coarse_also_shifting} \
-             all_shifted={shifted_lods:?}",
-            sched.pending.len(),
-        );
         sched.ring_chunk_origin[li] = new_origin;
     }
 
