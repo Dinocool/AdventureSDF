@@ -361,7 +361,7 @@ fn update_atlas_stats(mut stats: ResMut<SdfAtlasStats>, atlas: Res<SdfAtlas>) {
     let num_rows = (total as u32).div_ceil(tiles_per_row).max(1);
     stats.atlas_width = tiles_per_row * (BRICK_EDGE * BRICK_EDGE) as u32;
     stats.atlas_height = num_rows * BRICK_EDGE as u32;
-    stats.dirty = atlas.rebake_all || !atlas.dirty_bricks.is_empty();
+    stats.dirty = atlas.rebake_all || !atlas.gpu_baked_tiles.is_empty();
 }
 
 /// Human-readable byte size (B / KB / MB).
@@ -619,14 +619,6 @@ fn chunk_panel(world: &mut World, ui: &mut egui::Ui) {
     {
         let mut state = world.resource_mut::<ChunkDebugState>();
         ui.checkbox(&mut state.visible, "Show chunk boxes");
-    }
-    ui.separator();
-    {
-        // Diagnostic: bypass the async/incremental bake + partial upload, rebuilding the
-        // whole atlas synchronously each change. If a visual bug disappears here, it lives
-        // in the async path.
-        let mut sync = world.resource_mut::<super::SyncBakeMode>();
-        ui.checkbox(&mut sync.0, "Sync bake (no async)");
     }
 }
 

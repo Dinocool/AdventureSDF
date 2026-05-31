@@ -583,38 +583,6 @@ pub fn build_palette(edits: &[ResolvedEdit], sample_points: &[Vec3]) -> Palette 
     palette
 }
 
-/// Per-*palette-slot* surface distance field at `pos`: slot `k` holds the signed
-/// distance to the nearest matter owned by `palette[k]`, or [`MATERIAL_FAR`] if that
-/// slot is empty or no edit of that material reaches here.
-///
-/// The shader trilinearly interpolates these K slots and argmins them, so the
-/// material boundary is the exact piecewise-trilinear bisector between the two
-/// nearest materials — sub-voxel sharp, independent of smoothing `k`. Subtract edits
-/// define no material (geometry-only, handled by `fold_csg`). Because the palette is
-/// uniform across a brick, slot `k` means the same material at all 8 cell corners,
-/// keeping the interpolation valid.
-pub fn material_distances(
-    edits: &[ResolvedEdit],
-    palette: &Palette,
-    pos: Vec3,
-) -> [f32; PALETTE_K] {
-    let mut slots = [MATERIAL_FAR; PALETTE_K];
-    for e in edits {
-        if e.op.kind == CsgKind::Subtract {
-            continue;
-        }
-        // Map this edit's global id to its local palette slot, if present.
-        let Some(k) = palette.iter().position(|&id| id == e.material_id) else {
-            continue;
-        };
-        let d = eval_world(&e.prim, &e.transform, pos);
-        if d < slots[k] {
-            slots[k] = d;
-        }
-    }
-    slots
-}
-
 // --- GPU edit (flat, for the compute bake) ---
 
 /// Primitive tag in [`GpuEdit::tag`] — must match the `PRIM_*` consts in

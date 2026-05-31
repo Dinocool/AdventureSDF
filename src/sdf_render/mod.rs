@@ -99,31 +99,6 @@ pub struct RayStepCapture {
     pub steps: Vec<picking::RayStep>,
 }
 
-/// When true, bypass the async/incremental bake scheduler and rebuild the whole atlas
-/// synchronously via `full_bake` every frame the edit set changes. The editor's "Sync
-/// bake" checkbox flips it.
-///
-/// Defaults OFF: the async/incremental clipmap scheduler only re-bakes the shell of
-/// bricks that enter/exit each LOD ring as the camera moves, so camera motion no longer
-/// triggers a full-atlas rebuild. Sync mode is kept as an A/B diagnostic toggle.
-#[derive(Resource, Default)]
-pub struct SyncBakeMode(pub bool);
-
-/// Which backend evaluates the per-voxel brick bake. The CPU always owns topology (BVH
-/// cull, which bricks exist, tile allocation, palette, chunk tables); this only chooses
-/// who fills the 512 voxel distance/material texels. `Gpu` (default) dispatches the
-/// `sdf_brick_bake.wgsl` compute shader to write the atlas directly; `Cpu` runs the
-/// legacy `fold_csg` voxel loop on the main thread. F9 flips it live so the two can be
-/// A/B'd on the same scene — they should be visually identical (see the divergence budget
-/// in the design plan). Default `Gpu`: the whole point is to keep the bake off the main
-/// thread so object drags don't tank the framerate.
-#[derive(Resource, Default, PartialEq, Eq, Clone, Copy, Debug)]
-pub enum BakeBackend {
-    #[default]
-    Gpu,
-    Cpu,
-}
-
 /// Toggle for the SDF fullscreen raymarch pass. F1 flips this.
 #[derive(Resource)]
 pub struct SdfRenderEnabled(pub bool);
@@ -431,7 +406,6 @@ impl Plugin for SdfScenePlugin {
             .init_resource::<atlas::SdfAtlas>()
             .init_resource::<bake_scheduler::PrevEditAabbs>()
             .init_resource::<bake_scheduler::BakeScheduler>()
-            .init_resource::<bake_scheduler::SyncBakeRequest>()
             .init_resource::<bake_scheduler::PendingGpuBakes>()
             .init_resource::<LodRingsVisible>()
             .init_resource::<bvh::Bvh>()
@@ -439,8 +413,6 @@ impl Plugin for SdfScenePlugin {
             .init_resource::<SdfRaymarchParams>()
             .init_resource::<WireframeBoundsVisible>()
             .init_resource::<RayStepCapture>()
-            .init_resource::<SyncBakeMode>()
-            .init_resource::<BakeBackend>()
             .init_resource::<ViewportInputAllowed>()
             .init_resource::<gizmo::GizmoState>()
             .register_type::<SdfVolume>()
@@ -487,30 +459,20 @@ impl Plugin for SdfScenePlugin {
                     .run_if(|allowed: Res<ViewportInputAllowed>| allowed.0),
             )
             // Bake/upload/render-toggle always run in the editor scene — property
-            // edits in the inspector (and gizmo drags) must still re-bake. The async
-            // scheduler pair runs unless SyncBakeMode is on (diagnostic), in which case
-            // the synchronous whole-atlas `sync_bake` runs instead.
-            // Rebuild the bake-time height cache when materials change, BEFORE the bakers, so a
+            // edits in the inspector (and gizmo drags) must still re-bake. The GPU bake is
+            // the only path: `schedule_bakes` does topology (edit detection + camera
+            // recenter) and emits GPU compute jobs.
+            // Rebuild the bake-time height cache when materials change, BEFORE the baker, so a
             // displacement edit triggers a rebake the same frame.
             .add_systems(
                 Update,
                 update_height_field
                     .run_if(in_state(AppScene::SdfEditor))
-                    .before(bake_scheduler::schedule_bakes)
-                    .before(sync_bake),
+                    .before(bake_scheduler::schedule_bakes),
             )
             .add_systems(
                 Update,
-                (bake_scheduler::schedule_bakes, bake_scheduler::apply_bakes)
-                    .chain()
-                    .run_if(in_state(AppScene::SdfEditor))
-                    .run_if(|m: Res<SyncBakeMode>| !m.0),
-            )
-            .add_systems(
-                Update,
-                sync_bake
-                    .run_if(in_state(AppScene::SdfEditor))
-                    .run_if(|m: Res<SyncBakeMode>| m.0),
+                bake_scheduler::schedule_bakes.run_if(in_state(AppScene::SdfEditor)),
             )
             .add_systems(
                 Update,
@@ -1176,52 +1138,10 @@ fn update_height_field(
     }
 }
 
-/// Diagnostic synchronous bake (active only when [`SyncBakeMode`] is on): rebuild the whole
-/// atlas via `full_bake` whenever the edit set changes or the camera crosses a brick, fully
-/// bypassing the async/incremental scheduler + partial-upload path. `full_bake` sets
-/// `last_bake_was_full`, so the extract does a full texture realloc each time — no partial
-/// `write_texture`. If the duplication vanishes in this mode, the bug is in the async path.
-#[expect(clippy::too_many_arguments)]
-fn sync_bake(
-    mut atlas: ResMut<atlas::SdfAtlas>,
-    mut bvh: ResMut<bvh::Bvh>,
-    mut prev_aabbs: ResMut<bake_scheduler::PrevEditAabbs>,
-    mut last_origin: Local<Option<IVec3>>,
-    config: Res<SdfGridConfig>,
-    sched: Res<bake_scheduler::BakeScheduler>,
-    volumes: Query<VolumeQueryData, With<SdfVolume>>,
-    changed: Query<Entity, (With<SdfVolume>, bake_scheduler::ChangedEditFilter)>,
-    camera: Query<&Transform, (With<SdfCamera>, Without<SdfVolume>)>,
-) {
-    let camera_pos = camera.iter().next().map(|t| t.translation).unwrap_or(Vec3::ZERO);
-    let origin0 = config.world_to_brick_lod(camera_pos, 0);
-
-    let gathered = gather_sorted_edits(&volumes);
-    let current: std::collections::HashMap<Entity, bevy::math::bounding::Aabb3d> =
-        gathered.iter().map(|g| (g.entity, g.aabb)).collect();
-    let set_changed = current.len() != prev_aabbs.len()
-        || current.keys().any(|e| !prev_aabbs.contains(e));
-    let camera_moved = *last_origin != Some(origin0);
-
-    if !(atlas.rebake_all || set_changed || camera_moved || !changed.is_empty()) {
-        return;
-    }
-
-    let resolved: Vec<edits::ResolvedEdit> = gathered.iter().map(|g| g.edit.clone()).collect();
-    let aabbs: Vec<bevy::math::bounding::Aabb3d> = gathered.iter().map(|g| g.aabb).collect();
-    *bvh = bvh::Bvh::build(&aabbs);
-    atlas.full_bake(&resolved, &bvh, &config, sched.height_field(), camera_pos);
-
-    prev_aabbs.set_map(current);
-    *last_origin = Some(origin0);
-}
-
 fn toggle_sdf_render(
     keyboard: Res<ButtonInput<KeyCode>>,
     mut enabled: ResMut<SdfRenderEnabled>,
     mut lod_rings: ResMut<LodRingsVisible>,
-    mut backend: ResMut<BakeBackend>,
-    mut atlas: ResMut<atlas::SdfAtlas>,
 ) {
     if keyboard.just_pressed(KeyCode::F1) {
         enabled.0 = !enabled.0;
@@ -1230,16 +1150,5 @@ fn toggle_sdf_render(
     if keyboard.just_pressed(KeyCode::F8) {
         lod_rings.0 = !lod_rings.0;
         info!("LOD ring overlay: {}", if lod_rings.0 { "ON" } else { "OFF" });
-    }
-    if keyboard.just_pressed(KeyCode::F9) {
-        *backend = match *backend {
-            BakeBackend::Gpu => BakeBackend::Cpu,
-            BakeBackend::Cpu => BakeBackend::Gpu,
-        };
-        // Force a full rebake so the whole resident set is re-evaluated by the newly
-        // selected backend — otherwise only future dirty bricks would switch and the
-        // A/B comparison would be a mix of both.
-        atlas.rebake_all = true;
-        info!("SDF bake backend: {:?}", *backend);
     }
 }

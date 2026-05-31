@@ -19,7 +19,6 @@ use bevy::render::{Extract, ExtractSchedule, Render, RenderApp, RenderStartup};
 use bevy::tasks::{AsyncComputeTaskPool, Task, block_on, poll_once};
 
 use super::atlas::{BRICK_EDGE, SdfAtlas};
-use super::edits::PALETTE_K;
 use super::{SdfCamera, SdfGridConfig, SdfRenderEnabled};
 
 // --- GPU Types ---
@@ -97,26 +96,8 @@ struct GpuSdfMaterial {
 
 // --- Extracted Atlas ---
 
-/// One brick's texels for a partial upload: a 64×8 sub-rect at the tile's pixel
-/// origin. `dist` is BRICK_VOXELS i16; `mat` is BRICK_VOXELS×4 i16 (the 4 palette
-/// slots). Laid out tile-local (the same y*EDGE+x / z mapping the full path uses).
-struct TileTexels {
-    /// Pixel origin of the tile in the atlas (`col_px | row_px<<16`, as packed into
-    /// `atlas_base`). Split in `prepare` for the `write_texture` origin.
-    atlas_base: u32,
-    dist: Vec<i16>,
-    mat: Vec<i16>,
-}
-
 #[derive(Resource, Default)]
 struct ExtractedSdfAtlas {
-    /// Full atlas pixel buffers, present only on a realloc (full rebuild / grow).
-    /// R16Snorm distance + Rgba16Snorm 4-slot material, whole-texture sized.
-    dist_data: Vec<i16>,
-    mat_data: Vec<i16>,
-    /// Per-tile deltas for an in-place partial upload (only the bricks that changed
-    /// this bake). Empty on a realloc.
-    changed_tiles: Vec<TileTexels>,
     /// Sorted chunk lookup table + packed per-chunk tile runs (see `super::chunk`).
     /// Populated only when `tables_dirty` (the atlas topology changed); empty otherwise,
     /// so the GPU prepare keeps the existing buffers instead of rebuilding them.
@@ -127,15 +108,11 @@ struct ExtractedSdfAtlas {
     tables_dirty: bool,
     texture_width: u32,
     texture_height: u32,
-    /// Recreate the textures + views (full rebuild or capacity grow). When false,
-    /// `prepare` keeps the existing textures and only `write_texture`s `changed_tiles`.
+    /// Grow the atlas texture taller this frame: `prepare` recreates the dist+mat textures at
+    /// the new height and `copy_texture_to_texture`s the old content in (the GPU owns the
+    /// texels — there is no CPU upload), then the bake node fills the genuinely-new tiles. When
+    /// false, `prepare` keeps the existing textures and the bake node patches tiles in place.
     realloc: bool,
-    /// Realloc sub-mode: a GPU-bake GROW (taller texture, but existing texels must survive).
-    /// `prepare` recreates the textures at the new height and `copy_texture_to_texture`s the
-    /// old content in, instead of uploading `dist_data`/`mat_data` (which are zero in GPU
-    /// mode — the GPU owns those texels). The genuinely-new tiles are filled by the bake node
-    /// this same frame. False ⇒ the realloc is a full CPU rebuild that uploads the buffers.
-    preserve_grow: bool,
     dirty: bool,
 }
 
@@ -584,13 +561,13 @@ impl Plugin for SdfRenderPlugin {
                 prepare_sdf_camera_data
                     .run_if(in_state(crate::scene_manager::AppScene::SdfEditor))
                     .after(super::orbit_camera)
-                    // MUST run after the bake apply: the shader's binary-search bound
+                    // MUST run after the bake scheduling: the shader's binary-search bound
                     // (`grid_dims.w = atlas.bricks.len()`) has to match the lookup
                     // buffer `extract_sdf_atlas` builds from the *same* post-bake
                     // brick set. Reading the count before the bake desyncs them while
                     // dragging (count too high → past-end reads = phantom geometry;
                     // too low → missed bricks = gaps).
-                    .after(super::bake_scheduler::apply_bakes),
+                    .after(super::bake_scheduler::schedule_bakes),
             );
 
         #[cfg(feature = "editor")]
@@ -866,35 +843,9 @@ fn tile_origin(tile: u32) -> (u32, u32) {
     (col_px, row_px)
 }
 
-/// Pack one brick's voxels into a tile-local `(dist[512], mat[2048])` pair, in the
-/// same `(y*EDGE+x, z)` pixel layout the atlas uses. Shared by the full and partial
-/// upload paths so they're byte-identical.
-fn pack_tile_texels(packed: &super::atlas::PackedBrick) -> (Vec<i16>, Vec<i16>) {
-    let edge = BRICK_EDGE as u32;
-    let tile_width = (edge * edge) as usize; // 64 px wide, EDGE tall
-    let mut dist = vec![0i16; tile_width * edge as usize];
-    let mut mat = vec![i16::MAX; tile_width * edge as usize * 4];
-    for z in 0..edge {
-        for y in 0..edge {
-            for x in 0..edge {
-                let src_idx = (z * edge * edge + y * edge + x) as usize;
-                // Tile-local destination: u in [0,64), v in [0,EDGE).
-                let local = (z * tile_width as u32 + y * edge + x) as usize;
-                dist[local] = packed.dist[src_idx];
-                let mat_base = src_idx * PALETTE_K;
-                for k in 0..PALETTE_K {
-                    mat[local * 4 + k] = packed.mat_dist[mat_base + k];
-                }
-            }
-        }
-    }
-    (dist, mat)
-}
-
 fn extract_sdf_atlas(
     atlas: Extract<Res<SdfAtlas>>,
     config: Extract<Res<SdfGridConfig>>,
-    backend: Extract<Res<super::BakeBackend>>,
     mut last_gen: ResMut<LastAtlasGen>,
     mut last_topology: ResMut<LastAtlasTopology>,
     mut capacity: ResMut<AtlasCapacity>,
@@ -924,18 +875,12 @@ fn extract_sdf_atlas(
     let required_rows = atlas.tiles.high_water().div_ceil(ATLAS_TILES_PER_ROW).max(1);
     let texture_height = required_rows * edge;
 
-    // Realloc when a full bake happened or the atlas must grow taller. The texture
-    // never shrinks except on a full bake, so a tile origin stays valid until then.
-    let grow = required_rows > capacity.rows;
-    let realloc = atlas.last_bake_was_full || grow;
-
-    // A GPU-bake GROW (taller, but not a full rebuild) must PRESERVE existing texels — the
-    // CPU `packed.dist`/`mat_dist` are zero placeholders in GPU mode, so re-uploading them
-    // would wipe the GPU-written atlas. `prepare` instead copies the old texture into the
-    // taller new one and lets the bake node fill the genuinely-new tiles this frame. A full
-    // rebuild (`last_bake_was_full`: F9 switch / first bake) still uploads the CPU buffers.
-    let gpu_mode = matches!(**backend, super::BakeBackend::Gpu);
-    let preserve_grow = realloc && gpu_mode && !atlas.last_bake_was_full;
+    // Realloc when the atlas must grow taller (the GPU bake never shrinks it). The texture
+    // grows by PRESERVING existing texels: the GPU owns the texels (CPU has only palette-only
+    // placeholders), so `prepare` recreates the taller texture and copies the old content in,
+    // then the bake node fills the genuinely-new tiles this frame. There is no CPU texel
+    // upload — the only realloc kind is this grow.
+    let realloc = required_rows > capacity.rows;
 
     // The chunk lookup / tile-run tables only need rebuilding when the atlas topology
     // changed (a brick entered/exited, or a palette changed) or on a realloc. A frame
@@ -988,88 +933,19 @@ fn extract_sdf_atlas(
 
     if realloc {
         capacity.rows = required_rows;
-
-        // GPU-bake grow: don't repack CPU texels (they're zero placeholders). `prepare`
-        // copies the old texture into the taller new one; the bake node fills new tiles.
-        if preserve_grow {
-            commands.insert_resource(ExtractedSdfAtlas {
-                dist_data: Vec::new(),
-                mat_data: Vec::new(),
-                changed_tiles: Vec::new(),
-                chunk_data,
-                tile_run_data,
-                tables_dirty: true,
-                texture_width,
-                texture_height,
-                realloc: true,
-                preserve_grow: true,
-                dirty: true,
-            });
-            return;
-        }
-
-        let pixels = (texture_width * texture_height) as usize;
-        let mut dist_data = vec![0i16; pixels];
-        let mut mat_data = vec![i16::MAX; pixels * 4]; // far sentinel loses the argmin
-        for (key, packed) in atlas.bricks.iter() {
-            let tile = atlas.tiles.tile(key).unwrap();
-            let (col_px, row_px) = tile_origin(tile);
-            let (dist, mat) = pack_tile_texels(packed);
-            // Blit the tile-local buffers into the full texture at (col_px,row_px).
-            for v in 0..edge {
-                for u in 0..tile_width {
-                    let local = (v * tile_width + u) as usize;
-                    let dst = ((row_px + v) * texture_width + col_px + u) as usize;
-                    dist_data[dst] = dist[local];
-                    mat_data[dst * 4..dst * 4 + 4].copy_from_slice(&mat[local * 4..local * 4 + 4]);
-                }
-            }
-        }
-        commands.insert_resource(ExtractedSdfAtlas {
-            dist_data,
-            mat_data,
-            changed_tiles: Vec::new(),
-            chunk_data,
-            tile_run_data,
-            tables_dirty: true,
-            texture_width,
-            texture_height,
-            realloc: true,
-            preserve_grow: false,
-            dirty: true,
-        });
-        return;
     }
 
-    // Partial upload: only the tiles the incremental bake touched.
-    let mut changed_tiles = Vec::with_capacity(atlas.changed_tiles.len());
-    // Map tile → coord once so we can pull the baked brick. (changed_tiles holds tile
-    // indices; bricks are keyed by coord.)
-    for (key, packed) in atlas.bricks.iter() {
-        let tile = atlas.tiles.tile(key).unwrap();
-        if !atlas.changed_tiles.contains(&tile) {
-            continue;
-        }
-        let (col_px, row_px) = tile_origin(tile);
-        let (dist, mat) = pack_tile_texels(packed);
-        changed_tiles.push(TileTexels {
-            atlas_base: col_px | (row_px << 16),
-            dist,
-            mat,
-        });
-    }
-
+    // The GPU bake writes all texels directly into the atlas (via the bake node's
+    // copy_buffer_to_texture). The extract only carries the texture-size decision + the chunk
+    // tables: on a grow (`realloc`) `prepare` recreates the taller texture and copies the old
+    // content in; otherwise it keeps the existing texture and the bake node patches tiles.
     commands.insert_resource(ExtractedSdfAtlas {
-        dist_data: Vec::new(),
-        mat_data: Vec::new(),
-        changed_tiles,
         chunk_data,
         tile_run_data,
         tables_dirty,
         texture_width,
         texture_height,
-        realloc: false,
-        preserve_grow: false,
+        realloc,
         dirty: true,
     });
 }
@@ -1368,124 +1244,68 @@ fn prepare_sdf_atlas_gpu(
     }
 
     if extracted.realloc {
-        // Full rebuild / grow: recreate both textures sized to the new height. All atlas
-        // textures carry COPY_SRC so a later GPU-bake grow can copy their content into the
-        // taller replacement (see the preserve_grow branch below). COPY_DST for both the
-        // initial upload and the bake node's per-tile copy_buffer_to_texture.
+        // Grow the atlas taller. The GPU owns the texels (the CPU has only palette-only
+        // placeholders), so create EMPTY textures and copy any prior content into the taller
+        // replacement; the bake node fills the genuinely-new tiles this same frame. On the
+        // very first bake there's no prior texture — just the empty allocation, no copy. All
+        // atlas textures carry COPY_SRC (for this grow copy) + COPY_DST (the bake node's
+        // per-tile copy_buffer_to_texture).
         let usage = TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST | TextureUsages::COPY_SRC;
         let size = Extent3d {
             width: extracted.texture_width,
             height: extracted.texture_height,
             depth_or_array_layers: 1,
         };
-
-        // GPU bake mode: the CPU has no texel data, so create EMPTY textures (never
-        // zero-upload-from-CPU) and let the bake node fill the tiles this same frame. If a
-        // prior atlas exists (a grow), copy its content into the taller replacement first so
-        // already-baked tiles survive; only genuinely-new tiles are re-baked. On the very
-        // first bake there's no prior texture — just the empty allocation, no copy.
-        if extracted.preserve_grow {
-            let dist_tex = device.create_texture(&TextureDescriptor {
-                label: Some("sdf_dist_atlas"),
-                size,
-                mip_level_count: 1,
-                sample_count: 1,
-                dimension: TextureDimension::D2,
-                format: TextureFormat::R16Snorm,
-                usage,
-                view_formats: &[],
+        let dist_tex = device.create_texture(&TextureDescriptor {
+            label: Some("sdf_dist_atlas"),
+            size,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: TextureDimension::D2,
+            format: TextureFormat::R16Snorm,
+            usage,
+            view_formats: &[],
+        });
+        let mat_tex = device.create_texture(&TextureDescriptor {
+            label: Some("sdf_mat_atlas"),
+            size,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: TextureDimension::D2,
+            format: TextureFormat::Rgba16Snorm,
+            usage,
+            view_formats: &[],
+        });
+        // Copy prior content (full width, old height) into the new taller textures, if any.
+        if let (Some(old_dist), Some(old_mat)) = (&gpu_atlas.dist_tex, &gpu_atlas.mat_tex) {
+            let old_h = old_dist.height().min(extracted.texture_height);
+            let mut encoder = device.create_command_encoder(&CommandEncoderDescriptor {
+                label: Some("sdf_atlas_grow_copy"),
             });
-            let mat_tex = device.create_texture(&TextureDescriptor {
-                label: Some("sdf_mat_atlas"),
-                size,
-                mip_level_count: 1,
-                sample_count: 1,
-                dimension: TextureDimension::D2,
-                format: TextureFormat::Rgba16Snorm,
-                usage,
-                view_formats: &[],
-            });
-            // Copy prior content (full width, old height) into the new taller textures, if any.
-            if let (Some(old_dist), Some(old_mat)) = (&gpu_atlas.dist_tex, &gpu_atlas.mat_tex) {
-                let old_h = old_dist.height().min(extracted.texture_height);
-                let mut encoder = device.create_command_encoder(&CommandEncoderDescriptor {
-                    label: Some("sdf_atlas_grow_copy"),
-                });
-                let copy_extent = Extent3d {
-                    width: extracted.texture_width,
-                    height: old_h,
-                    depth_or_array_layers: 1,
-                };
-                for (src, dst) in [(old_dist, &dist_tex), (old_mat, &mat_tex)] {
-                    encoder.copy_texture_to_texture(
-                        TexelCopyTextureInfo {
-                            texture: src,
-                            mip_level: 0,
-                            origin: Origin3d::ZERO,
-                            aspect: TextureAspect::All,
-                        },
-                        TexelCopyTextureInfo {
-                            texture: dst,
-                            mip_level: 0,
-                            origin: Origin3d::ZERO,
-                            aspect: TextureAspect::All,
-                        },
-                        copy_extent,
-                    );
-                }
-                queue.submit([encoder.finish()]);
+            let copy_extent = Extent3d {
+                width: extracted.texture_width,
+                height: old_h,
+                depth_or_array_layers: 1,
+            };
+            for (src, dst) in [(old_dist, &dist_tex), (old_mat, &mat_tex)] {
+                encoder.copy_texture_to_texture(
+                    TexelCopyTextureInfo {
+                        texture: src,
+                        mip_level: 0,
+                        origin: Origin3d::ZERO,
+                        aspect: TextureAspect::All,
+                    },
+                    TexelCopyTextureInfo {
+                        texture: dst,
+                        mip_level: 0,
+                        origin: Origin3d::ZERO,
+                        aspect: TextureAspect::All,
+                    },
+                    copy_extent,
+                );
             }
-
-            gpu_atlas.dist_view = Some(dist_tex.create_view(&TextureViewDescriptor::default()));
-            gpu_atlas.mat_view = Some(mat_tex.create_view(&TextureViewDescriptor::default()));
-            gpu_atlas.dist_tex = Some(dist_tex);
-            gpu_atlas.mat_tex = Some(mat_tex);
-            if gpu_atlas.sampler.is_none() {
-                gpu_atlas.sampler = Some(device.create_sampler(&SamplerDescriptor {
-                    label: Some("sdf_atlas_sampler"),
-                    mag_filter: FilterMode::Nearest,
-                    min_filter: FilterMode::Nearest,
-                    mipmap_filter: FilterMode::Nearest,
-                    ..default()
-                }));
-            }
-            return;
+            queue.submit([encoder.finish()]);
         }
-
-        let mut dist_bytes = Vec::with_capacity(extracted.dist_data.len() * 2);
-        for v in &extracted.dist_data {
-            dist_bytes.extend_from_slice(&v.to_le_bytes());
-        }
-        let dist_tex = device.create_texture_with_data(
-            &queue,
-            &TextureDescriptor {
-                label: Some("sdf_dist_atlas"),
-                size,
-                mip_level_count: 1,
-                sample_count: 1,
-                dimension: TextureDimension::D2,
-                format: TextureFormat::R16Snorm,
-                usage,
-                view_formats: &[],
-            },
-            TextureDataOrder::default(),
-            &dist_bytes,
-        );
-        let mat_tex = device.create_texture_with_data(
-            &queue,
-            &TextureDescriptor {
-                label: Some("sdf_mat_atlas"),
-                size,
-                mip_level_count: 1,
-                sample_count: 1,
-                dimension: TextureDimension::D2,
-                format: TextureFormat::Rgba16Snorm,
-                usage,
-                view_formats: &[],
-            },
-            TextureDataOrder::default(),
-            &i16s_to_le_bytes(&extracted.mat_data),
-        );
 
         gpu_atlas.dist_view = Some(dist_tex.create_view(&TextureViewDescriptor::default()));
         gpu_atlas.mat_view = Some(mat_tex.create_view(&TextureViewDescriptor::default()));
@@ -1500,77 +1320,11 @@ fn prepare_sdf_atlas_gpu(
                 ..default()
             }));
         }
-        return;
     }
-
-    // Partial upload: write_texture only the changed tiles into the existing
-    // textures (64×8 sub-rects). No realloc, no view change → bind group unaffected.
-    let (Some(dist_tex), Some(mat_tex)) = (&gpu_atlas.dist_tex, &gpu_atlas.mat_tex) else {
-        return; // never reallocated yet — nothing to patch into
-    };
-    let edge = BRICK_EDGE as u32;
-    let tile_width = edge * edge; // 64
-    for t in &extracted.changed_tiles {
-        let col_px = t.atlas_base & 0xffff;
-        let row_px = t.atlas_base >> 16;
-        let tile_extent = Extent3d {
-            width: tile_width,
-            height: edge,
-            depth_or_array_layers: 1,
-        };
-        queue.write_texture(
-            TexelCopyTextureInfo {
-                texture: dist_tex,
-                mip_level: 0,
-                origin: Origin3d {
-                    x: col_px,
-                    y: row_px,
-                    z: 0,
-                },
-                aspect: TextureAspect::All,
-            },
-            &i16s_to_le_bytes(&t.dist),
-            TexelCopyBufferLayout {
-                offset: 0,
-                bytes_per_row: Some(tile_width * 2), // R16: 2 bytes/texel
-                rows_per_image: Some(edge),
-            },
-            tile_extent,
-        );
-        queue.write_texture(
-            TexelCopyTextureInfo {
-                texture: mat_tex,
-                mip_level: 0,
-                origin: Origin3d {
-                    x: col_px,
-                    y: row_px,
-                    z: 0,
-                },
-                aspect: TextureAspect::All,
-            },
-            &i16s_to_le_bytes(&t.mat),
-            TexelCopyBufferLayout {
-                offset: 0,
-                bytes_per_row: Some(tile_width * 8), // Rgba16: 8 bytes/texel
-                rows_per_image: Some(edge),
-            },
-            tile_extent,
-        );
-    }
-    debug!(
-        "SDF atlas: patched {} changed tile(s)",
-        extracted.changed_tiles.len()
-    );
+    // Non-grow frames: the existing textures are kept; the bake node patches changed tiles in
+    // place via copy_buffer_to_texture. Nothing to upload here.
 }
 
-/// Flatten an i16 slice to little-endian bytes for texture upload.
-fn i16s_to_le_bytes(data: &[i16]) -> Vec<u8> {
-    let mut bytes = Vec::with_capacity(data.len() * 2);
-    for v in data {
-        bytes.extend_from_slice(&v.to_le_bytes());
-    }
-    bytes
-}
 
 // --- Render World: Pipeline Init ---
 
