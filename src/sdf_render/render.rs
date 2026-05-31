@@ -1914,6 +1914,7 @@ fn prepare_brick_bake_buffers(
     if n == 0 {
         return;
     }
+    let _span = info_span!("sdf_prepare_bake_buffers", jobs = n).entered();
 
     // Headers (std430, GpuJobHeader = 48 bytes).
     let mut header_bytes: Vec<u8> = Vec::with_capacity(extracted.headers.len() * 48);
@@ -2037,6 +2038,7 @@ impl Node for SdfBrickBakeNode {
         if buffers.job_count == 0 {
             return Ok(());
         }
+        let _span = info_span!("sdf_brick_bake_node", jobs = buffers.job_count).entered();
         let bake = world.resource::<SdfBakePipeline>();
         let pipeline_cache = world.resource::<PipelineCache>();
         let Some(pipeline) = pipeline_cache.get_compute_pipeline(bake.pipeline_id) else {

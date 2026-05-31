@@ -13,3 +13,6 @@ sdf_diag.log
 # Editor's default unsaved-scene placeholder (real scenes are saved with a name,
 # e.g. world.scn.ron). Empty scratch file — should never be committed.
 assets/scenes/untitled.scene
+
+# Chrome tracing profiler output (editor feature)
+trace-*.json

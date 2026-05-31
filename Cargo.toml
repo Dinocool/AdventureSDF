@@ -10,6 +10,10 @@ editor = [
     "dep:bevy_egui",
     "dep:egui_dock",
     "dep:egui-phosphor",
+    # Chrome-tracing profiler. Writes `trace-<timestamp>.json` on exit (load in Perfetto /
+    # chrome://tracing, or hand the file to Claude to rank hot spans). Captures every Bevy
+    # system + render-graph node span plus our own `info_span!` SDF spans.
+    "bevy/trace_chrome",
 ]
 # Faster incremental compiles via dynamic linking of Bevy. Dev-only — never ship.
 fast = ["bevy/dynamic_linking"]
