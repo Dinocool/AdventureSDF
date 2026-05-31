@@ -388,7 +388,7 @@ mod tests {
     use crate::sdf_render::edits::{PALETTE_EMPTY, ResolvedEdit, SdfOp, SdfPrimitive, build_palette};
 
     fn resolved(prim: SdfPrimitive, t: Transform, id: u16) -> ResolvedEdit {
-        ResolvedEdit { prim, transform: t, op: SdfOp::default(), material_id: id }
+        ResolvedEdit::new(prim, t, SdfOp::default(), id)
     }
 
     #[test]

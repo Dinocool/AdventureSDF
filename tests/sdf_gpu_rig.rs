@@ -340,12 +340,12 @@ fn run_probe(
 }
 
 fn single_cube(center: Vec3) -> (Vec<ResolvedEdit>, Bvh) {
-    let edits = vec![ResolvedEdit {
-        prim: SdfPrimitive::Box { half_extents: Vec3::splat(1.0) },
-        transform: bevy::prelude::Transform::from_translation(center),
-        op: SdfOp::default(),
-        material_id: 0,
-    }];
+    let edits = vec![ResolvedEdit::new(
+        SdfPrimitive::Box { half_extents: Vec3::splat(1.0) },
+        bevy::prelude::Transform::from_translation(center),
+        SdfOp::default(),
+        0,
+    )];
     let aabbs: Vec<_> = edits
         .iter()
         .map(|e| edit_world_aabb(&e.prim, &e.transform, e.op.smoothing))

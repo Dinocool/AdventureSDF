@@ -115,12 +115,12 @@ fn gpu_bake_sphere_matches_analytic_distance() {
     // One sphere at the origin. Bake the brick whose origin is the stride-aligned coord at
     // world 0 — it straddles the sphere so its voxels span inside/surface/outside.
     let radius = 0.3f32;
-    let edit = ResolvedEdit {
-        prim: SdfPrimitive::Sphere { radius },
-        transform: bevy::prelude::Transform::IDENTITY,
-        op: SdfOp::default(),
-        material_id: 0,
-    };
+    let edit = ResolvedEdit::new(
+        SdfPrimitive::Sphere { radius },
+        bevy::prelude::Transform::IDENTITY,
+        SdfOp::default(),
+        0,
+    );
     let gpu_edit = to_gpu_edit(&edit);
     assert_eq!(gpu_edit.tag, GPU_PRIM_SPHERE);
     assert_eq!(gpu_edit.op_kind, GPU_OP_UNION);
@@ -285,12 +285,12 @@ fn gpu_bake_copy_to_atlas_texture_roundtrips() {
     let voxel_size = cfg.voxel_size_at(lod);
     let band = dist_band_world(&cfg, lod);
     let radius = 0.3f32;
-    let edit = ResolvedEdit {
-        prim: SdfPrimitive::Sphere { radius },
-        transform: bevy::prelude::Transform::IDENTITY,
-        op: SdfOp::default(),
-        material_id: 0,
-    };
+    let edit = ResolvedEdit::new(
+        SdfPrimitive::Sphere { radius },
+        bevy::prelude::Transform::IDENTITY,
+        SdfOp::default(),
+        0,
+    );
     let gpu_edit = to_gpu_edit(&edit);
     let coord = cfg.world_to_brick_lod(Vec3::ZERO, lod);
 

@@ -934,12 +934,7 @@ pub fn gather_sorted_edits(volumes: &Query<VolumeQueryData, With<SdfVolume>>) ->
             let aabb = edits::edit_world_aabb(&prim, &transform, op.smoothing);
             GatheredEdit {
                 entity,
-                edit: edits::ResolvedEdit {
-                    prim,
-                    transform,
-                    op,
-                    material_id: material.registry_id as u16,
-                },
+                edit: edits::ResolvedEdit::new(prim, transform, op, material.registry_id as u16),
                 aabb,
             }
         })
