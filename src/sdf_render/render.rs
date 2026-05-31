@@ -6,11 +6,11 @@ use bevy::render::extract_component::{
     ComponentUniforms, ExtractComponent, ExtractComponentPlugin, UniformComponentPlugin,
 };
 use bevy::render::render_graph::{
-    NodeRunError, RenderGraphContext, RenderGraphExt, RenderLabel, ViewNode, ViewNodeRunner,
+    Node, NodeRunError, RenderGraphContext, RenderGraphExt, RenderLabel, ViewNode, ViewNodeRunner,
 };
 use bevy::render::render_resource::binding_types::{
-    sampler, storage_buffer_read_only, texture_2d, texture_2d_array, texture_storage_2d,
-    uniform_buffer,
+    sampler, storage_buffer_read_only, storage_buffer_sized, texture_2d, texture_2d_array,
+    texture_storage_2d, uniform_buffer,
 };
 use bevy::render::render_resource::*;
 use bevy::render::renderer::{RenderContext, RenderDevice, RenderQueue};
@@ -19,7 +19,6 @@ use bevy::render::{Extract, ExtractSchedule, Render, RenderApp, RenderStartup};
 use bevy::tasks::{AsyncComputeTaskPool, Task, block_on, poll_once};
 
 use super::atlas::{BRICK_EDGE, SdfAtlas};
-use super::edits::PALETTE_K;
 use super::{SdfCamera, SdfGridConfig, SdfRenderEnabled};
 
 // --- GPU Types ---
@@ -49,7 +48,8 @@ struct GpuBrickTile {
 
 /// Atlas tiles per row. Width = this × 64 px. 256 → 16384 px wide, half the 32768
 /// wgpu limit, so it never overflows while keeping the texture reasonably square.
-const ATLAS_TILES_PER_ROW: u32 = 256;
+/// Defined in `atlas` so the GPU-bake realloc mirror agrees on the layout.
+use super::atlas::ATLAS_TILES_PER_ROW;
 
 #[derive(Component, Clone, Copy, ShaderType, Default, ExtractComponent, Reflect)]
 #[reflect(Component)]
@@ -62,7 +62,7 @@ struct SdfCameraData {
     camera_pos: Vec4,
     screen_params: Vec4, // xy = screen_size, z = surface_bias, w = unused
     grid_origin: Vec4,   // xyz = grid origin, w = voxel_size
-    grid_dims: Vec4, // x = grid_size, y = bricks_per_axis, z = brick_size (8.0), w = num_lookups
+    grid_dims: Vec4, // z = brick_size (8.0); x/y/w unused (chunk count = arrayLength(&chunk_buf))
     debug_params: Vec4, // x = max_steps, y = max_dist, z = sdf_eps, w = unused
     /// x = pixel_cone (world radius per unit ray distance per pixel), y = cubic_band,
     /// z = over_relax, w unused.
@@ -96,26 +96,8 @@ struct GpuSdfMaterial {
 
 // --- Extracted Atlas ---
 
-/// One brick's texels for a partial upload: a 64×8 sub-rect at the tile's pixel
-/// origin. `dist` is BRICK_VOXELS i16; `mat` is BRICK_VOXELS×4 i16 (the 4 palette
-/// slots). Laid out tile-local (the same y*EDGE+x / z mapping the full path uses).
-struct TileTexels {
-    /// Pixel origin of the tile in the atlas (`col_px | row_px<<16`, as packed into
-    /// `atlas_base`). Split in `prepare` for the `write_texture` origin.
-    atlas_base: u32,
-    dist: Vec<i16>,
-    mat: Vec<i16>,
-}
-
 #[derive(Resource, Default)]
 struct ExtractedSdfAtlas {
-    /// Full atlas pixel buffers, present only on a realloc (full rebuild / grow).
-    /// R16Snorm distance + Rgba16Snorm 4-slot material, whole-texture sized.
-    dist_data: Vec<i16>,
-    mat_data: Vec<i16>,
-    /// Per-tile deltas for an in-place partial upload (only the bricks that changed
-    /// this bake). Empty on a realloc.
-    changed_tiles: Vec<TileTexels>,
     /// Sorted chunk lookup table + packed per-chunk tile runs (see `super::chunk`).
     /// Populated only when `tables_dirty` (the atlas topology changed); empty otherwise,
     /// so the GPU prepare keeps the existing buffers instead of rebuilding them.
@@ -126,8 +108,10 @@ struct ExtractedSdfAtlas {
     tables_dirty: bool,
     texture_width: u32,
     texture_height: u32,
-    /// Recreate the textures + views (full rebuild or capacity grow). When false,
-    /// `prepare` keeps the existing textures and only `write_texture`s `changed_tiles`.
+    /// Grow the atlas texture taller this frame: `prepare` recreates the dist+mat textures at
+    /// the new height and `copy_texture_to_texture`s the old content in (the GPU owns the
+    /// texels — there is no CPU upload), then the bake node fills the genuinely-new tiles. When
+    /// false, `prepare` keeps the existing textures and the bake node patches tiles in place.
     realloc: bool,
     dirty: bool,
 }
@@ -231,6 +215,9 @@ struct ExtractedTextureLibrary {
 const SDF_SHADER_PATH: &str = "shaders/sdf_raymarch.wgsl";
 /// Cone-prepass compute shader (per-tile seed-distance march).
 const SDF_CONE_SHADER_PATH: &str = "shaders/sdf_cone_prepass.wgsl";
+/// Brick-bake compute shader (per-voxel CSG eval → atlas tile buffers). The GPU half of the
+/// hybrid bake; see `BakeBackend` and `bake_scheduler::emit_gpu_bakes`.
+const SDF_BAKE_SHADER_PATH: &str = "shaders/sdf_brick_bake.wgsl";
 
 #[derive(Resource)]
 struct SdfPipeline {
@@ -277,6 +264,79 @@ const CONE_TEX_TILES_Y: u32 = 270;
 
 #[derive(Resource)]
 struct SdfConeShaderHandle(Handle<Shader>);
+
+#[derive(Resource)]
+struct SdfBakeShaderHandle(Handle<Shader>);
+
+// --- GPU brick bake (compute) ---
+
+/// Width of the 2D bake dispatch grid in workgroups. The compute dispatch uses one workgroup
+/// per brick job; a single dimension caps at 65535 (wgpu/Vulkan limit), which a large edit can
+/// blow past (a big sphere dirties 70k+ bricks). So we lay the jobs out in a 2D grid of this
+/// width and reconstruct the linear job index in the shader as `wg.y * DISPATCH_WIDTH + wg.x`.
+/// 256² = 65536 jobs per "page"; the Y extent then carries the rest, well under the limit.
+/// Must match `DISPATCH_WIDTH` in sdf_brick_bake.wgsl.
+const BAKE_DISPATCH_WIDTH: u32 = 256;
+
+/// u32s per distance tile in the bake output buffer. Each tile is 64×8 R16 texels = 512
+/// texels = 256 u32 (two R16 packed per u32), but rows are padded to 64 u32 so each tile row
+/// is 256 bytes — `copy_buffer_to_texture` requires `bytes_per_row` to be a multiple of 256.
+/// 64 u32/row × 8 rows = 512 u32 per tile (32 real + 32 pad per row). Must match the bake
+/// shader's `DIST_ROW_U32`/`DIST_TILE_U32`.
+const BAKE_DIST_ROW_U32: u32 = 64;
+const BAKE_DIST_TILE_U32: u32 = BAKE_DIST_ROW_U32 * 8;
+/// u32s per material tile: 64×8 Rgba16 texels, 2 u32 per texel, 128 u32/row × 8 = 1024.
+/// Row stride = 128 u32 = 512 bytes (already a multiple of 256). Matches `MAT_TILE_U32`.
+const BAKE_MAT_ROW_U32: u32 = 128;
+const BAKE_MAT_TILE_U32: u32 = BAKE_MAT_ROW_U32 * 8;
+
+/// One brick bake job's header, std430. Mirror of the WGSL `JobHeader` in
+/// `sdf_brick_bake.wgsl` and built from `bake_scheduler::GpuBakeJob`.
+#[derive(ShaderType, Clone, Copy, Default)]
+struct GpuJobHeader {
+    coord: IVec3,
+    voxel_size: f32,
+    dist_band: f32,
+    edit_start: u32,
+    edit_count: u32,
+    pal01: u32,
+    pal23: u32,
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
+}
+
+/// Render-world copy of this frame's GPU bake jobs (extracted from
+/// `bake_scheduler::PendingGpuBakes`). `tiles` parallels `headers`: job i writes the atlas
+/// tile `tiles[i]`. Empty on frames with no bake work (the node early-outs).
+#[derive(Resource, Default)]
+struct ExtractedBrickBakes {
+    headers: Vec<GpuJobHeader>,
+    edits: Vec<super::edits::GpuEdit>,
+    /// Destination atlas tile index per job (drives the `copy_buffer_to_texture` origin).
+    tiles: Vec<u32>,
+}
+
+/// The bake compute pipeline + the storage buffers the dispatch writes (sized to the job
+/// count each frame). The buffers are re-created when the job count grows; the per-tile
+/// `copy_buffer_to_texture` into the persistent atlas happens in the bake node.
+#[derive(Resource)]
+struct SdfBakePipeline {
+    pipeline_id: CachedComputePipelineId,
+    layout: BindGroupLayoutDescriptor,
+}
+
+#[derive(Resource, Default)]
+struct SdfBakeBuffers {
+    header_buffer: Option<Buffer>,
+    edit_buffer: Option<Buffer>,
+    dist_buffer: Option<Buffer>,
+    mat_buffer: Option<Buffer>,
+    /// Number of jobs prepared this frame (workgroup dispatch count + copy loop bound).
+    job_count: u32,
+    /// Destination atlas tiles for this frame's jobs (parallels the dispatch order).
+    tiles: Vec<u32>,
+}
 
 #[derive(Resource, Default)]
 pub struct SdfShaderDefs {
@@ -479,6 +539,7 @@ impl Plugin for SdfRenderPlugin {
         let asset_server = app.world().resource::<AssetServer>();
         let shader_handle = asset_server.load(SDF_SHADER_PATH);
         let cone_shader_handle: Handle<Shader> = asset_server.load(SDF_CONE_SHADER_PATH);
+        let bake_shader_handle: Handle<Shader> = asset_server.load(SDF_BAKE_SHADER_PATH);
         // Load + retain the imported modules (Custom-path imports aren't auto-loaded).
         let module_handles: Vec<Handle<Shader>> = SDF_SHADER_MODULES
             .iter()
@@ -500,13 +561,11 @@ impl Plugin for SdfRenderPlugin {
                 prepare_sdf_camera_data
                     .run_if(in_state(crate::scene_manager::AppScene::SdfEditor))
                     .after(super::orbit_camera)
-                    // MUST run after the bake apply: the shader's binary-search bound
-                    // (`grid_dims.w = atlas.bricks.len()`) has to match the lookup
-                    // buffer `extract_sdf_atlas` builds from the *same* post-bake
-                    // brick set. Reading the count before the bake desyncs them while
-                    // dragging (count too high → past-end reads = phantom geometry;
-                    // too low → missed bricks = gaps).
-                    .after(super::bake_scheduler::apply_bakes),
+                    // Run after the bake scheduling so the camera uniform reflects this frame's
+                    // post-bake state. (The shader's chunk-search bound no longer comes from
+                    // this uniform — it reads `arrayLength(&chunk_buf)` — so this ordering is
+                    // for tidiness, not the old bound/table consistency requirement.)
+                    .after(super::bake_scheduler::schedule_bakes),
             );
 
         #[cfg(feature = "editor")]
@@ -524,16 +583,20 @@ impl Plugin for SdfRenderPlugin {
         // Pass shader handles directly to render app (RenderStartup runs before Extract)
         render_app.insert_resource(SdfShaderHandle(shader_handle));
         render_app.insert_resource(SdfConeShaderHandle(cone_shader_handle));
+        render_app.insert_resource(SdfBakeShaderHandle(bake_shader_handle));
 
         render_app
             .add_systems(ExtractSchedule, extract_sdf_atlas)
             .add_systems(ExtractSchedule, extract_sdf_materials)
             .add_systems(ExtractSchedule, extract_texture_library)
             .add_systems(ExtractSchedule, extract_shader_defs)
+            .add_systems(ExtractSchedule, extract_brick_bakes)
             .init_resource::<TextureStreamState>()
             .init_resource::<LastAtlasGen>()
             .init_resource::<LastAtlasTopology>()
             .init_resource::<AtlasCapacity>()
+            .init_resource::<SdfBakeBuffers>()
+            .add_systems(Render, prepare_brick_bake_buffers.before(prepare_sdf_atlas_gpu))
             .add_systems(Render, prepare_sdf_atlas_gpu)
             .add_systems(Render, prepare_sdf_materials_gpu)
             .add_systems(Render, init_texture_streaming)
@@ -541,8 +604,15 @@ impl Plugin for SdfRenderPlugin {
             .add_systems(Render, rebuild_pipeline_on_def_change)
             .add_systems(RenderStartup, init_sdf_pipeline)
             .add_systems(RenderStartup, init_cone_pipeline.after(init_sdf_pipeline))
+            .add_systems(RenderStartup, init_bake_pipeline.after(init_sdf_pipeline))
+            .add_render_graph_node::<SdfBrickBakeNode>(Core3d, SdfBrickBakeLabel)
             .add_render_graph_node::<ViewNodeRunner<SdfConeNode>>(Core3d, SdfConeLabel)
             .add_render_graph_node::<ViewNodeRunner<SdfNode>>(Core3d, SdfLabel)
+            // The brick-bake compute pass writes the atlas BEFORE the view passes read it,
+            // so it runs first (after the opaque pass, before the cone prepass + raymarch).
+            // It's a standalone (non-view) node — it fills the shared atlas once per frame,
+            // not per view.
+            //
             // Run the SDF fullscreen pass between the opaque and transparent
             // passes. Gizmos (transform handles, bounds) draw in the Transparent3d
             // phase, so the SDF surface must be composited *before* them — otherwise
@@ -552,6 +622,7 @@ impl Plugin for SdfRenderPlugin {
                 Core3d,
                 (
                     Node3d::MainOpaquePass,
+                    SdfBrickBakeLabel,
                     SdfConeLabel,
                     SdfLabel,
                     Node3d::MainTransparentPass,
@@ -575,7 +646,6 @@ pub struct SdfMaterialTable {
 fn prepare_sdf_camera_data(
     mut commands: Commands,
     cameras: Query<(Entity, &Camera, &Transform), With<SdfCamera>>,
-    atlas: Res<SdfAtlas>,
     config: Res<SdfGridConfig>,
     raymarch: Res<super::SdfRaymarchParams>,
     registry: Res<super::edits::MaterialRegistry>,
@@ -607,12 +677,6 @@ fn prepare_sdf_camera_data(
         }
     }
 
-    // grid_dims.w = the shader's chunk-table binary-search bound = distinct resident
-    // chunks (NOT brick count). Must match `chunk_data.len()` extract uploads.
-    let num_chunks = super::chunk::resident_chunks(&atlas, &config).len() as u32;
-    let bpa = config.bricks_per_axis();
-    let grid_size = config.grid_size;
-
     for (entity, camera, transform) in &cameras {
         let view_from_world = transform.to_matrix().inverse();
         let clip_from_world = camera.clip_from_view() * view_from_world;
@@ -643,12 +707,11 @@ fn prepare_sdf_camera_data(
                 config.world_origin().z,
                 config.voxel_size,
             ),
-            grid_dims: Vec4::new(
-                grid_size as f32,
-                bpa as f32,
-                config.brick_size as f32,
-                num_chunks as f32,
-            ),
+            // Only `.z` (brick_size / samples-per-edge) is read by the shader. `.x`/`.y`/`.w`
+            // are unused: the chunk-search bound is now `arrayLength(&chunk_buf)` in the shader
+            // (not `.w`), which is consistent with the bound lookup buffer by construction — see
+            // `find_chunk`. Kept as a vec4 for std140 alignment of the following fields.
+            grid_dims: Vec4::new(0.0, 0.0, config.brick_size as f32, 0.0),
             // `w` carries `recenter_snap_chunks` so the shader can recompute the chunk-
             // snapped ring centre (the LOD cross-fade must key off the true resident-ring
             // boundary, which is hysteresis-snapped — see bake_scheduler::ring_chunk_origin).
@@ -770,31 +833,6 @@ fn tile_origin(tile: u32) -> (u32, u32) {
     (col_px, row_px)
 }
 
-/// Pack one brick's voxels into a tile-local `(dist[512], mat[2048])` pair, in the
-/// same `(y*EDGE+x, z)` pixel layout the atlas uses. Shared by the full and partial
-/// upload paths so they're byte-identical.
-fn pack_tile_texels(packed: &super::atlas::PackedBrick) -> (Vec<i16>, Vec<i16>) {
-    let edge = BRICK_EDGE as u32;
-    let tile_width = (edge * edge) as usize; // 64 px wide, EDGE tall
-    let mut dist = vec![0i16; tile_width * edge as usize];
-    let mut mat = vec![i16::MAX; tile_width * edge as usize * 4];
-    for z in 0..edge {
-        for y in 0..edge {
-            for x in 0..edge {
-                let src_idx = (z * edge * edge + y * edge + x) as usize;
-                // Tile-local destination: u in [0,64), v in [0,EDGE).
-                let local = (z * tile_width as u32 + y * edge + x) as usize;
-                dist[local] = packed.dist[src_idx];
-                let mat_base = src_idx * PALETTE_K;
-                for k in 0..PALETTE_K {
-                    mat[local * 4 + k] = packed.mat_dist[mat_base + k];
-                }
-            }
-        }
-    }
-    (dist, mat)
-}
-
 fn extract_sdf_atlas(
     atlas: Extract<Res<SdfAtlas>>,
     config: Extract<Res<SdfGridConfig>>,
@@ -814,7 +852,16 @@ fn extract_sdf_atlas(
 
     let num_bricks = atlas.bricks.len() as u32;
     if num_bricks == 0 {
-        commands.insert_resource(ExtractedSdfAtlas::default());
+        // Fully evicted (roamed into empty space). Signal a tables rebuild with EMPTY chunk
+        // data so `prepare_sdf_atlas_gpu` replaces the lookup buffer with a miss-only sentinel.
+        // The shader bounds its search by `arrayLength(&chunk_buf)`, so leaving the old buffer
+        // bound would search stale entries and render ghost geometry.
+        last_topology.0 = atlas.topology_generation;
+        commands.insert_resource(ExtractedSdfAtlas {
+            tables_dirty: true,
+            dirty: true,
+            ..Default::default()
+        });
         return;
     }
 
@@ -827,9 +874,12 @@ fn extract_sdf_atlas(
     let required_rows = atlas.tiles.high_water().div_ceil(ATLAS_TILES_PER_ROW).max(1);
     let texture_height = required_rows * edge;
 
-    // Realloc when a full bake happened or the atlas must grow taller. The texture
-    // never shrinks except on a full bake, so a tile origin stays valid until then.
-    let realloc = atlas.last_bake_was_full || required_rows > capacity.rows;
+    // Realloc when the atlas must grow taller (the GPU bake never shrinks it). The texture
+    // grows by PRESERVING existing texels: the GPU owns the texels (CPU has only palette-only
+    // placeholders), so `prepare` recreates the taller texture and copies the old content in,
+    // then the bake node fills the genuinely-new tiles this frame. There is no CPU texel
+    // upload — the only realloc kind is this grow.
+    let realloc = required_rows > capacity.rows;
 
     // The chunk lookup / tile-run tables only need rebuilding when the atlas topology
     // changed (a brick entered/exited, or a palette changed) or on a realloc. A frame
@@ -882,66 +932,19 @@ fn extract_sdf_atlas(
 
     if realloc {
         capacity.rows = required_rows;
-        let pixels = (texture_width * texture_height) as usize;
-        let mut dist_data = vec![0i16; pixels];
-        let mut mat_data = vec![i16::MAX; pixels * 4]; // far sentinel loses the argmin
-        for (key, packed) in atlas.bricks.iter() {
-            let tile = atlas.tiles.tile(key).unwrap();
-            let (col_px, row_px) = tile_origin(tile);
-            let (dist, mat) = pack_tile_texels(packed);
-            // Blit the tile-local buffers into the full texture at (col_px,row_px).
-            for v in 0..edge {
-                for u in 0..tile_width {
-                    let local = (v * tile_width + u) as usize;
-                    let dst = ((row_px + v) * texture_width + col_px + u) as usize;
-                    dist_data[dst] = dist[local];
-                    mat_data[dst * 4..dst * 4 + 4].copy_from_slice(&mat[local * 4..local * 4 + 4]);
-                }
-            }
-        }
-        commands.insert_resource(ExtractedSdfAtlas {
-            dist_data,
-            mat_data,
-            changed_tiles: Vec::new(),
-            chunk_data,
-            tile_run_data,
-            tables_dirty: true,
-            texture_width,
-            texture_height,
-            realloc: true,
-            dirty: true,
-        });
-        return;
     }
 
-    // Partial upload: only the tiles the incremental bake touched.
-    let mut changed_tiles = Vec::with_capacity(atlas.changed_tiles.len());
-    // Map tile → coord once so we can pull the baked brick. (changed_tiles holds tile
-    // indices; bricks are keyed by coord.)
-    for (key, packed) in atlas.bricks.iter() {
-        let tile = atlas.tiles.tile(key).unwrap();
-        if !atlas.changed_tiles.contains(&tile) {
-            continue;
-        }
-        let (col_px, row_px) = tile_origin(tile);
-        let (dist, mat) = pack_tile_texels(packed);
-        changed_tiles.push(TileTexels {
-            atlas_base: col_px | (row_px << 16),
-            dist,
-            mat,
-        });
-    }
-
+    // The GPU bake writes all texels directly into the atlas (via the bake node's
+    // copy_buffer_to_texture). The extract only carries the texture-size decision + the chunk
+    // tables: on a grow (`realloc`) `prepare` recreates the taller texture and copies the old
+    // content in; otherwise it keeps the existing texture and the bake node patches tiles.
     commands.insert_resource(ExtractedSdfAtlas {
-        dist_data: Vec::new(),
-        mat_data: Vec::new(),
-        changed_tiles,
         chunk_data,
         tile_run_data,
         tables_dirty,
         texture_width,
         texture_height,
-        realloc: false,
+        realloc,
         dirty: true,
     });
 }
@@ -1201,9 +1204,22 @@ fn prepare_sdf_atlas_gpu(
     // last frame's buffers untouched, skipping the per-frame O(bricks) re-upload.
     if extracted.tables_dirty {
         if extracted.chunk_data.is_empty() {
-            // No resident chunks (atlas empty / fully evicted). Leave last frame's buffers;
-            // the camera uniform's chunk count (grid_dims.w) is 0 so the shader searches
-            // nothing and renders background. Avoids a zero-sized storage buffer.
+            // Atlas fully evicted. The shader bounds its binary search by
+            // `arrayLength(&chunk_buf)`, so we must NOT leave a stale non-empty buffer bound
+            // (it would search old entries → ghost geometry). Upload a single sentinel whose
+            // key (u32::MAX, u32::MAX) can never match a real chunk key, so every search misses
+            // and the scene renders empty. (A zero-length storage buffer is invalid.)
+            let mut bytes = Vec::with_capacity(20);
+            bytes.extend_from_slice(&u32::MAX.to_le_bytes()); // key_hi
+            bytes.extend_from_slice(&u32::MAX.to_le_bytes()); // key_lo
+            bytes.extend_from_slice(&0u32.to_le_bytes()); // occ_lo
+            bytes.extend_from_slice(&0u32.to_le_bytes()); // occ_hi
+            bytes.extend_from_slice(&0u32.to_le_bytes()); // tile_run_base
+            gpu_atlas.lookup_buffer = Some(device.create_buffer_with_data(&BufferInitDescriptor {
+                label: Some("sdf_chunk_lookup_buffer"),
+                contents: &bytes,
+                usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
+            }));
             return;
         }
 
@@ -1238,48 +1254,68 @@ fn prepare_sdf_atlas_gpu(
     }
 
     if extracted.realloc {
-        // Full rebuild / grow: recreate both textures sized to the new height and
-        // upload everything. Keep the Texture handles so later partial bakes can
-        // write_texture into them.
+        // Grow the atlas taller. The GPU owns the texels (the CPU has only palette-only
+        // placeholders), so create EMPTY textures and copy any prior content into the taller
+        // replacement; the bake node fills the genuinely-new tiles this same frame. On the
+        // very first bake there's no prior texture — just the empty allocation, no copy. All
+        // atlas textures carry COPY_SRC (for this grow copy) + COPY_DST (the bake node's
+        // per-tile copy_buffer_to_texture).
+        let usage = TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST | TextureUsages::COPY_SRC;
         let size = Extent3d {
             width: extracted.texture_width,
             height: extracted.texture_height,
             depth_or_array_layers: 1,
         };
-        let mut dist_bytes = Vec::with_capacity(extracted.dist_data.len() * 2);
-        for v in &extracted.dist_data {
-            dist_bytes.extend_from_slice(&v.to_le_bytes());
+        let dist_tex = device.create_texture(&TextureDescriptor {
+            label: Some("sdf_dist_atlas"),
+            size,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: TextureDimension::D2,
+            format: TextureFormat::R16Snorm,
+            usage,
+            view_formats: &[],
+        });
+        let mat_tex = device.create_texture(&TextureDescriptor {
+            label: Some("sdf_mat_atlas"),
+            size,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: TextureDimension::D2,
+            format: TextureFormat::Rgba16Snorm,
+            usage,
+            view_formats: &[],
+        });
+        // Copy prior content (full width, old height) into the new taller textures, if any.
+        if let (Some(old_dist), Some(old_mat)) = (&gpu_atlas.dist_tex, &gpu_atlas.mat_tex) {
+            let old_h = old_dist.height().min(extracted.texture_height);
+            let mut encoder = device.create_command_encoder(&CommandEncoderDescriptor {
+                label: Some("sdf_atlas_grow_copy"),
+            });
+            let copy_extent = Extent3d {
+                width: extracted.texture_width,
+                height: old_h,
+                depth_or_array_layers: 1,
+            };
+            for (src, dst) in [(old_dist, &dist_tex), (old_mat, &mat_tex)] {
+                encoder.copy_texture_to_texture(
+                    TexelCopyTextureInfo {
+                        texture: src,
+                        mip_level: 0,
+                        origin: Origin3d::ZERO,
+                        aspect: TextureAspect::All,
+                    },
+                    TexelCopyTextureInfo {
+                        texture: dst,
+                        mip_level: 0,
+                        origin: Origin3d::ZERO,
+                        aspect: TextureAspect::All,
+                    },
+                    copy_extent,
+                );
+            }
+            queue.submit([encoder.finish()]);
         }
-        let dist_tex = device.create_texture_with_data(
-            &queue,
-            &TextureDescriptor {
-                label: Some("sdf_dist_atlas"),
-                size,
-                mip_level_count: 1,
-                sample_count: 1,
-                dimension: TextureDimension::D2,
-                format: TextureFormat::R16Snorm,
-                usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST,
-                view_formats: &[],
-            },
-            TextureDataOrder::default(),
-            &dist_bytes,
-        );
-        let mat_tex = device.create_texture_with_data(
-            &queue,
-            &TextureDescriptor {
-                label: Some("sdf_mat_atlas"),
-                size,
-                mip_level_count: 1,
-                sample_count: 1,
-                dimension: TextureDimension::D2,
-                format: TextureFormat::Rgba16Snorm,
-                usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST,
-                view_formats: &[],
-            },
-            TextureDataOrder::default(),
-            &i16s_to_le_bytes(&extracted.mat_data),
-        );
 
         gpu_atlas.dist_view = Some(dist_tex.create_view(&TextureViewDescriptor::default()));
         gpu_atlas.mat_view = Some(mat_tex.create_view(&TextureViewDescriptor::default()));
@@ -1294,77 +1330,11 @@ fn prepare_sdf_atlas_gpu(
                 ..default()
             }));
         }
-        return;
     }
-
-    // Partial upload: write_texture only the changed tiles into the existing
-    // textures (64×8 sub-rects). No realloc, no view change → bind group unaffected.
-    let (Some(dist_tex), Some(mat_tex)) = (&gpu_atlas.dist_tex, &gpu_atlas.mat_tex) else {
-        return; // never reallocated yet — nothing to patch into
-    };
-    let edge = BRICK_EDGE as u32;
-    let tile_width = edge * edge; // 64
-    for t in &extracted.changed_tiles {
-        let col_px = t.atlas_base & 0xffff;
-        let row_px = t.atlas_base >> 16;
-        let tile_extent = Extent3d {
-            width: tile_width,
-            height: edge,
-            depth_or_array_layers: 1,
-        };
-        queue.write_texture(
-            TexelCopyTextureInfo {
-                texture: dist_tex,
-                mip_level: 0,
-                origin: Origin3d {
-                    x: col_px,
-                    y: row_px,
-                    z: 0,
-                },
-                aspect: TextureAspect::All,
-            },
-            &i16s_to_le_bytes(&t.dist),
-            TexelCopyBufferLayout {
-                offset: 0,
-                bytes_per_row: Some(tile_width * 2), // R16: 2 bytes/texel
-                rows_per_image: Some(edge),
-            },
-            tile_extent,
-        );
-        queue.write_texture(
-            TexelCopyTextureInfo {
-                texture: mat_tex,
-                mip_level: 0,
-                origin: Origin3d {
-                    x: col_px,
-                    y: row_px,
-                    z: 0,
-                },
-                aspect: TextureAspect::All,
-            },
-            &i16s_to_le_bytes(&t.mat),
-            TexelCopyBufferLayout {
-                offset: 0,
-                bytes_per_row: Some(tile_width * 8), // Rgba16: 8 bytes/texel
-                rows_per_image: Some(edge),
-            },
-            tile_extent,
-        );
-    }
-    debug!(
-        "SDF atlas: patched {} changed tile(s)",
-        extracted.changed_tiles.len()
-    );
+    // Non-grow frames: the existing textures are kept; the bake node patches changed tiles in
+    // place via copy_buffer_to_texture. Nothing to upload here.
 }
 
-/// Flatten an i16 slice to little-endian bytes for texture upload.
-fn i16s_to_le_bytes(data: &[i16]) -> Vec<u8> {
-    let mut bytes = Vec::with_capacity(data.len() * 2);
-    for v in data {
-        bytes.extend_from_slice(&v.to_le_bytes());
-    }
-    bytes
-}
 
 // --- Render World: Pipeline Init ---
 
@@ -1771,6 +1741,298 @@ impl ViewNode for SdfConeNode {
         pass.set_bind_group(1, &bind_group_1, &[]);
         pass.set_bind_group(2, &bind_group_2, &[]);
         pass.dispatch_workgroups(wg_x, wg_y, 1);
+
+        Ok(())
+    }
+}
+
+// --- GPU brick bake: extract / prepare / pipeline / node ---
+
+/// Extract this frame's GPU bake jobs from the main world into the render world, converting
+/// each `GpuBakeJob` into its `GpuJobHeader`. The flat `GpuEdit` list is shared by all jobs
+/// (each job's `edit_start..edit_start+edit_count` indexes it). Empty when not in GPU mode.
+fn extract_brick_bakes(
+    pending: Extract<Res<super::bake_scheduler::PendingGpuBakes>>,
+    mut commands: Commands,
+) {
+    if pending.jobs.is_empty() {
+        commands.insert_resource(ExtractedBrickBakes::default());
+        return;
+    }
+    let mut headers = Vec::with_capacity(pending.jobs.len());
+    let mut tiles = Vec::with_capacity(pending.jobs.len());
+    for j in &pending.jobs {
+        headers.push(GpuJobHeader {
+            coord: j.coord,
+            voxel_size: j.voxel_size,
+            dist_band: j.dist_band,
+            edit_start: j.edit_start,
+            edit_count: j.edit_count,
+            pal01: j.palette[0] as u32 | ((j.palette[1] as u32) << 16),
+            pal23: j.palette[2] as u32 | ((j.palette[3] as u32) << 16),
+            _pad0: 0,
+            _pad1: 0,
+            _pad2: 0,
+        });
+        tiles.push(j.tile);
+    }
+    commands.insert_resource(ExtractedBrickBakes {
+        headers,
+        edits: pending.edits.clone(),
+        tiles,
+    });
+}
+
+/// Upload this frame's bake job headers + edits into storage buffers and (re)size the
+/// dist/mat output buffers to the job count. The actual dispatch + per-tile copy into the
+/// atlas happens in `SdfBrickBakeNode`. Runs before `prepare_sdf_atlas_gpu` so a realloc that
+/// recreates the atlas texture this frame is followed by our bake filling it.
+fn prepare_brick_bake_buffers(
+    device: Res<RenderDevice>,
+    queue: Res<RenderQueue>,
+    extracted: Option<Res<ExtractedBrickBakes>>,
+    mut buffers: ResMut<SdfBakeBuffers>,
+) {
+    let Some(extracted) = extracted else { return };
+    let n = extracted.headers.len() as u32;
+    buffers.job_count = n;
+    buffers.tiles = extracted.tiles.clone();
+    if n == 0 {
+        return;
+    }
+    let _span = info_span!("sdf_prepare_bake_buffers", jobs = n).entered();
+
+    // Headers (std430, GpuJobHeader = 48 bytes).
+    let mut header_bytes: Vec<u8> = Vec::with_capacity(extracted.headers.len() * 48);
+    for h in &extracted.headers {
+        header_bytes.extend_from_slice(&h.coord.x.to_le_bytes());
+        header_bytes.extend_from_slice(&h.coord.y.to_le_bytes());
+        header_bytes.extend_from_slice(&h.coord.z.to_le_bytes());
+        header_bytes.extend_from_slice(&h.voxel_size.to_le_bytes());
+        header_bytes.extend_from_slice(&h.dist_band.to_le_bytes());
+        header_bytes.extend_from_slice(&h.edit_start.to_le_bytes());
+        header_bytes.extend_from_slice(&h.edit_count.to_le_bytes());
+        header_bytes.extend_from_slice(&h.pal01.to_le_bytes());
+        header_bytes.extend_from_slice(&h.pal23.to_le_bytes());
+        header_bytes.extend_from_slice(&0u32.to_le_bytes());
+        header_bytes.extend_from_slice(&0u32.to_le_bytes());
+        header_bytes.extend_from_slice(&0u32.to_le_bytes());
+    }
+    buffers.header_buffer = Some(device.create_buffer_with_data(&BufferInitDescriptor {
+        label: Some("sdf_bake_headers"),
+        contents: &header_bytes,
+        usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
+    }));
+
+    // Edits (std430, GpuEdit = 96 bytes: mat4 + 2×vec4 + 4×u32). Always ≥1 row so the
+    // storage binding is never zero-sized.
+    let mut edit_bytes: Vec<u8> = Vec::with_capacity(extracted.edits.len().max(1) * 96);
+    for e in &extracted.edits {
+        for col in e.inv_model.to_cols_array() {
+            edit_bytes.extend_from_slice(&col.to_le_bytes());
+        }
+        for v in [e.params.x, e.params.y, e.params.z, e.params.w] {
+            edit_bytes.extend_from_slice(&v.to_le_bytes());
+        }
+        for v in [e.params2.x, e.params2.y, e.params2.z, e.params2.w] {
+            edit_bytes.extend_from_slice(&v.to_le_bytes());
+        }
+        edit_bytes.extend_from_slice(&e.tag.to_le_bytes());
+        edit_bytes.extend_from_slice(&e.op_kind.to_le_bytes());
+        edit_bytes.extend_from_slice(&e.smoothing.to_le_bytes());
+        edit_bytes.extend_from_slice(&e.material_id.to_le_bytes());
+    }
+    if edit_bytes.is_empty() {
+        edit_bytes.resize(96, 0);
+    }
+    buffers.edit_buffer = Some(device.create_buffer_with_data(&BufferInitDescriptor {
+        label: Some("sdf_bake_edits"),
+        contents: &edit_bytes,
+        usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
+    }));
+
+    // Output buffers (STORAGE write target + COPY_SRC for the per-tile blit into the atlas).
+    let dist_size = (n * BAKE_DIST_TILE_U32) as u64 * 4;
+    let mat_size = (n * BAKE_MAT_TILE_U32) as u64 * 4;
+    let needs_dist = buffers.dist_buffer.as_ref().is_none_or(|b| b.size() < dist_size);
+    let needs_mat = buffers.mat_buffer.as_ref().is_none_or(|b| b.size() < mat_size);
+    if needs_dist {
+        buffers.dist_buffer = Some(device.create_buffer(&BufferDescriptor {
+            label: Some("sdf_bake_dist_out"),
+            size: dist_size,
+            usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        }));
+    }
+    if needs_mat {
+        buffers.mat_buffer = Some(device.create_buffer(&BufferDescriptor {
+            label: Some("sdf_bake_mat_out"),
+            size: mat_size,
+            usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        }));
+    }
+    let _ = &queue; // (kept for parity with sibling prepare systems; no immediate write here)
+}
+
+/// Queue the brick-bake compute pipeline. Standalone bind group (no camera/atlas-read): two
+/// read-only storage buffers (headers, edits) + two read-write storage buffers (dist, mat
+/// output). Runs at `RenderStartup` after `init_sdf_pipeline` (no dependency, just ordering).
+fn init_bake_pipeline(
+    mut commands: Commands,
+    pipeline_cache: Res<PipelineCache>,
+    bake_shader: Res<SdfBakeShaderHandle>,
+) {
+    let layout = BindGroupLayoutDescriptor::new(
+        "sdf_bake_bind_group",
+        &BindGroupLayoutEntries::sequential(
+            ShaderStages::COMPUTE,
+            (
+                storage_buffer_read_only::<GpuJobHeader>(false),
+                storage_buffer_read_only::<super::edits::GpuEdit>(false),
+                storage_buffer_sized(false, None),
+                storage_buffer_sized(false, None),
+            ),
+        ),
+    );
+    let pipeline_id = pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
+        label: Some("sdf_bake_pipeline".into()),
+        layout: vec![layout.clone()],
+        shader: bake_shader.0.clone(),
+        ..default()
+    });
+    commands.insert_resource(SdfBakePipeline {
+        pipeline_id,
+        layout,
+    });
+}
+
+#[derive(Debug, Hash, PartialEq, Eq, Clone, RenderLabel)]
+struct SdfBrickBakeLabel;
+
+#[derive(Default)]
+struct SdfBrickBakeNode;
+
+impl Node for SdfBrickBakeNode {
+    fn run(
+        &self,
+        _graph: &mut RenderGraphContext,
+        render_context: &mut RenderContext,
+        world: &World,
+    ) -> Result<(), NodeRunError> {
+        let buffers = world.resource::<SdfBakeBuffers>();
+        if buffers.job_count == 0 {
+            return Ok(());
+        }
+        let _span = info_span!("sdf_brick_bake_node", jobs = buffers.job_count).entered();
+        let bake = world.resource::<SdfBakePipeline>();
+        let pipeline_cache = world.resource::<PipelineCache>();
+        let Some(pipeline) = pipeline_cache.get_compute_pipeline(bake.pipeline_id) else {
+            return Ok(());
+        };
+        let (Some(header_buf), Some(edit_buf), Some(dist_buf), Some(mat_buf)) = (
+            buffers.header_buffer.as_ref(),
+            buffers.edit_buffer.as_ref(),
+            buffers.dist_buffer.as_ref(),
+            buffers.mat_buffer.as_ref(),
+        ) else {
+            return Ok(());
+        };
+        // The atlas textures must already exist (a prior bake/realloc created them). If not,
+        // there's nothing to copy into yet — skip this frame.
+        let gpu_atlas = world.resource::<SdfGpuAtlas>();
+        let (Some(dist_tex), Some(mat_tex)) = (&gpu_atlas.dist_tex, &gpu_atlas.mat_tex) else {
+            return Ok(());
+        };
+
+        let device = render_context.render_device();
+        let layout = pipeline_cache.get_bind_group_layout(&bake.layout);
+        let bind_group = device.create_bind_group(
+            "sdf_bake_bind_group",
+            &layout,
+            &BindGroupEntries::sequential((
+                header_buf.as_entire_buffer_binding(),
+                edit_buf.as_entire_buffer_binding(),
+                dist_buf.as_entire_buffer_binding(),
+                mat_buf.as_entire_buffer_binding(),
+            )),
+        );
+
+        {
+            let mut pass = render_context
+                .command_encoder()
+                .begin_compute_pass(&ComputePassDescriptor {
+                    label: Some("sdf_brick_bake"),
+                    timestamp_writes: None,
+                });
+            pass.set_pipeline(pipeline);
+            pass.set_bind_group(0, &bind_group, &[]);
+            // One workgroup per brick job, laid out in a 2D grid so the count can exceed the
+            // 65535 single-dimension dispatch limit (a large edit dirties 70k+ bricks). The
+            // shader reconstructs the linear job index from (wg.x, wg.y).
+            let wg_x = buffers.job_count.min(BAKE_DISPATCH_WIDTH);
+            let wg_y = buffers.job_count.div_ceil(BAKE_DISPATCH_WIDTH);
+            pass.dispatch_workgroups(wg_x, wg_y, 1);
+        }
+
+        // Blit each job's tile from the output buffers into the persistent atlas textures.
+        // The buffer layout matches the texture sub-rect (dist rows padded to 256 bytes,
+        // mat rows already 512). `copy_buffer_to_texture` requires bytes_per_row % 256 == 0.
+        let edge = BRICK_EDGE as u32;
+        let tile_width = edge * edge; // 64
+        let encoder = render_context.command_encoder();
+        for (i, &tile) in buffers.tiles.iter().enumerate() {
+            let (col_px, row_px) = tile_origin(tile);
+            let tile_extent = Extent3d {
+                width: tile_width,
+                height: edge,
+                depth_or_array_layers: 1,
+            };
+            let dist_offset = (i as u32 * BAKE_DIST_TILE_U32) as u64 * 4;
+            encoder.copy_buffer_to_texture(
+                TexelCopyBufferInfo {
+                    buffer: dist_buf,
+                    layout: TexelCopyBufferLayout {
+                        offset: dist_offset,
+                        bytes_per_row: Some(BAKE_DIST_ROW_U32 * 4), // 256 bytes
+                        rows_per_image: Some(edge),
+                    },
+                },
+                TexelCopyTextureInfo {
+                    texture: dist_tex,
+                    mip_level: 0,
+                    origin: Origin3d {
+                        x: col_px,
+                        y: row_px,
+                        z: 0,
+                    },
+                    aspect: TextureAspect::All,
+                },
+                tile_extent,
+            );
+            let mat_offset = (i as u32 * BAKE_MAT_TILE_U32) as u64 * 4;
+            encoder.copy_buffer_to_texture(
+                TexelCopyBufferInfo {
+                    buffer: mat_buf,
+                    layout: TexelCopyBufferLayout {
+                        offset: mat_offset,
+                        bytes_per_row: Some(BAKE_MAT_ROW_U32 * 4), // 512 bytes
+                        rows_per_image: Some(edge),
+                    },
+                },
+                TexelCopyTextureInfo {
+                    texture: mat_tex,
+                    mip_level: 0,
+                    origin: Origin3d {
+                        x: col_px,
+                        y: row_px,
+                        z: 0,
+                    },
+                    aspect: TextureAspect::All,
+                },
+                tile_extent,
+            );
+        }
 
         Ok(())
     }

@@ -10,6 +10,7 @@
 
 use bevy::math::bounding::Aabb3d;
 use bevy::prelude::*;
+use bevy::render::render_resource::ShaderType;
 
 // --- Components ---
 
@@ -533,6 +534,33 @@ pub fn fold_csg(edits: &[ResolvedEdit], pos: Vec3) -> EditSample {
     }
 }
 
+/// Signed distance of the folded CSG stack at `pos`, evaluating only the edits at
+/// `indices` (into the already-`SdfOrder`-sorted `edits`). Same fold rules as
+/// [`fold_csg`] but distance-only and allocation-free — for the narrow-band interior
+/// cull, which folds at one point per candidate brick without cloning the edit subset.
+pub fn fold_csg_dist_indexed(edits: &[ResolvedEdit], indices: &[u32], pos: Vec3) -> f32 {
+    let mut acc = f32::MAX;
+    let mut started = false;
+    for &i in indices {
+        let e = &edits[i as usize];
+        let dn = eval_world(&e.prim, &e.transform, pos);
+        let k = e.op.smoothing;
+        if !started {
+            if e.op.kind == CsgKind::Union {
+                acc = dn;
+                started = true;
+            }
+            continue;
+        }
+        match e.op.kind {
+            CsgKind::Union => acc = smin(acc, dn, k),
+            CsgKind::Subtract => acc = smax(acc, -dn, k),
+            CsgKind::Intersect => acc = smax(acc, dn, k),
+        }
+    }
+    if started { acc } else { f32::MAX }
+}
+
 /// Max distinct materials a single brick tracks. The shader argmins over exactly
 /// this many local slots per pixel — bounding per-pixel material cost to a small
 /// constant regardless of how many materials the world contains.
@@ -582,36 +610,99 @@ pub fn build_palette(edits: &[ResolvedEdit], sample_points: &[Vec3]) -> Palette 
     palette
 }
 
-/// Per-*palette-slot* surface distance field at `pos`: slot `k` holds the signed
-/// distance to the nearest matter owned by `palette[k]`, or [`MATERIAL_FAR`] if that
-/// slot is empty or no edit of that material reaches here.
-///
-/// The shader trilinearly interpolates these K slots and argmins them, so the
-/// material boundary is the exact piecewise-trilinear bisector between the two
-/// nearest materials — sub-voxel sharp, independent of smoothing `k`. Subtract edits
-/// define no material (geometry-only, handled by `fold_csg`). Because the palette is
-/// uniform across a brick, slot `k` means the same material at all 8 cell corners,
-/// keeping the interpolation valid.
-pub fn material_distances(
-    edits: &[ResolvedEdit],
-    palette: &Palette,
-    pos: Vec3,
-) -> [f32; PALETTE_K] {
-    let mut slots = [MATERIAL_FAR; PALETTE_K];
-    for e in edits {
-        if e.op.kind == CsgKind::Subtract {
-            continue;
+// --- GPU edit (flat, for the compute bake) ---
+
+/// Primitive tag in [`GpuEdit::tag`] — must match the `PRIM_*` consts in
+/// `assets/shaders/sdf_brick_bake.wgsl`.
+pub const GPU_PRIM_SPHERE: u32 = 0;
+pub const GPU_PRIM_BOX: u32 = 1;
+pub const GPU_PRIM_TORUS: u32 = 2;
+pub const GPU_PRIM_CAPSULE: u32 = 3;
+pub const GPU_PRIM_CYLINDER: u32 = 4;
+pub const GPU_PRIM_HEIGHTMAP: u32 = 5;
+
+/// CSG op tag in [`GpuEdit::op_kind`] — must match `OP_*` in the bake shader.
+pub const GPU_OP_UNION: u32 = 0;
+pub const GPU_OP_SUBTRACT: u32 = 1;
+pub const GPU_OP_INTERSECT: u32 = 2;
+
+/// Flat, GPU-friendly mirror of a [`ResolvedEdit`] for the compute bake. The
+/// model→local inverse is precomputed on the CPU (matching [`eval_world`]'s
+/// `to_matrix().inverse()`) so the shader does only a `mat * vec` — keeping the GPU
+/// result within an f32 ULP of the CPU. Primitive params are packed positionally per
+/// `tag` (see `to_gpu_edit` and the `eval_primitive` port in the bake shader). The
+/// heightmap `seed` (a u32) is bit-stored in `params2.y` and read back with
+/// `bitcast<u32>` on the GPU. 96 bytes, std140/std430-aligned via the leading Mat4.
+#[derive(ShaderType, Clone, Copy, Default, Debug)]
+pub struct GpuEdit {
+    pub inv_model: Mat4,
+    pub params: Vec4,
+    pub params2: Vec4,
+    pub tag: u32,
+    pub op_kind: u32,
+    pub smoothing: f32,
+    pub material_id: u32,
+}
+
+/// Flatten a [`ResolvedEdit`] into its [`GpuEdit`] form for the compute bake.
+pub fn to_gpu_edit(e: &ResolvedEdit) -> GpuEdit {
+    let inv_model = e.transform.to_matrix().inverse();
+    let (tag, params, params2) = match &e.prim {
+        SdfPrimitive::Sphere { radius } => {
+            (GPU_PRIM_SPHERE, Vec4::new(*radius, 0.0, 0.0, 0.0), Vec4::ZERO)
         }
-        // Map this edit's global id to its local palette slot, if present.
-        let Some(k) = palette.iter().position(|&id| id == e.material_id) else {
-            continue;
-        };
-        let d = eval_world(&e.prim, &e.transform, pos);
-        if d < slots[k] {
-            slots[k] = d;
-        }
+        SdfPrimitive::Box { half_extents } => (
+            GPU_PRIM_BOX,
+            Vec4::new(half_extents.x, half_extents.y, half_extents.z, 0.0),
+            Vec4::ZERO,
+        ),
+        SdfPrimitive::Torus { major, minor } => (
+            GPU_PRIM_TORUS,
+            Vec4::new(*major, *minor, 0.0, 0.0),
+            Vec4::ZERO,
+        ),
+        SdfPrimitive::Capsule {
+            half_height,
+            radius,
+        } => (
+            GPU_PRIM_CAPSULE,
+            Vec4::new(*half_height, *radius, 0.0, 0.0),
+            Vec4::ZERO,
+        ),
+        SdfPrimitive::Cylinder {
+            radius,
+            half_height,
+        } => (
+            GPU_PRIM_CYLINDER,
+            Vec4::new(*radius, *half_height, 0.0, 0.0),
+            Vec4::ZERO,
+        ),
+        SdfPrimitive::Heightmap {
+            half_xz,
+            max_height,
+            freq,
+            amp,
+            seed,
+        } => (
+            GPU_PRIM_HEIGHTMAP,
+            Vec4::new(half_xz.x, half_xz.y, *max_height, *freq),
+            Vec4::new(*amp, f32::from_bits(*seed), 0.0, 0.0),
+        ),
+    };
+    let op_kind = match e.op.kind {
+        CsgKind::Union => GPU_OP_UNION,
+        CsgKind::Subtract => GPU_OP_SUBTRACT,
+        CsgKind::Intersect => GPU_OP_INTERSECT,
+    };
+    GpuEdit {
+        inv_model,
+        params,
+        params2,
+        tag,
+        op_kind,
+        smoothing: e.op.smoothing,
+        material_id: e.material_id as u32,
     }
-    slots
 }
 
 #[cfg(test)]
@@ -734,5 +825,127 @@ mod tests {
         let tight = edit_world_aabb(&prim, &Transform::IDENTITY, 0.0);
         let padded = edit_world_aabb(&prim, &Transform::IDENTITY, 0.5);
         assert!(padded.max.x > tight.max.x);
+    }
+
+    /// CPU mirror of the WGSL bake shader's primitive eval: consumes a packed
+    /// [`GpuEdit`] exactly as `sdf_brick_bake.wgsl` will (inverse-transform via the
+    /// precomputed `inv_model`, then a positionally-unpacked primitive SDF). The
+    /// oracle test below asserts this reproduces [`eval_world`] for every primitive,
+    /// so the shader port has a bit-for-bit reference to match.
+    fn eval_gpu_edit_cpu(e: &GpuEdit, world_pos: Vec3) -> f32 {
+        let p = e.inv_model.transform_point3(world_pos);
+        match e.tag {
+            GPU_PRIM_SPHERE => p.length() - e.params.x,
+            GPU_PRIM_BOX => {
+                let q = p.abs() - e.params.truncate();
+                q.max(Vec3::ZERO).length() + q.max_element().min(0.0)
+            }
+            GPU_PRIM_TORUS => {
+                let q = Vec2::new(Vec2::new(p.x, p.z).length() - e.params.x, p.y);
+                q.length() - e.params.y
+            }
+            GPU_PRIM_CAPSULE => {
+                let half_height = e.params.x;
+                let radius = e.params.y;
+                let mut py = p.y;
+                py -= py.clamp(-half_height, half_height);
+                Vec3::new(p.x, py, p.z).length() - radius
+            }
+            GPU_PRIM_CYLINDER => {
+                let radius = e.params.x;
+                let half_height = e.params.y;
+                let d = Vec2::new(Vec2::new(p.x, p.z).length() - radius, p.y.abs() - half_height);
+                d.x.max(d.y).min(0.0) + d.max(Vec2::ZERO).length()
+            }
+            GPU_PRIM_HEIGHTMAP => {
+                let half_xz = Vec2::new(e.params.x, e.params.y);
+                let max_height = e.params.z;
+                let freq = e.params.w;
+                let amp = e.params2.x;
+                let seed = e.params2.y.to_bits();
+                let half = Vec3::new(half_xz.x, max_height * 0.5, half_xz.y);
+                let centered = p - Vec3::new(0.0, max_height * 0.5, 0.0);
+                let q = centered.abs() - half;
+                let box_d = q.max(Vec3::ZERO).length() + q.max_element().min(0.0);
+                let h = height_sample(Vec2::new(p.x, p.z), freq, amp, seed) + max_height * 0.5;
+                let surface_d = p.y - h;
+                box_d.max(surface_d)
+            }
+            _ => f32::MAX,
+        }
+    }
+
+    #[test]
+    fn gpu_edit_eval_matches_eval_world() {
+        // A representative transform (translate + rotate + uniform scale) and a spread
+        // of sample points. Every primitive's packed GPU eval must reproduce eval_world.
+        let transform = Transform::from_xyz(1.5, -2.0, 0.5)
+            .with_rotation(Quat::from_euler(EulerRot::XYZ, 0.3, -0.7, 1.1))
+            .with_scale(Vec3::splat(1.3));
+        let prims = [
+            SdfPrimitive::Sphere { radius: 0.7 },
+            SdfPrimitive::Box {
+                half_extents: Vec3::new(0.6, 0.4, 0.9),
+            },
+            SdfPrimitive::Torus {
+                major: 0.8,
+                minor: 0.25,
+            },
+            SdfPrimitive::Capsule {
+                half_height: 0.5,
+                radius: 0.3,
+            },
+            SdfPrimitive::Cylinder {
+                radius: 0.4,
+                half_height: 0.6,
+            },
+            SdfPrimitive::Heightmap {
+                half_xz: Vec2::new(2.0, 2.0),
+                max_height: 1.0,
+                freq: 0.5,
+                amp: 0.4,
+                seed: 1337,
+            },
+        ];
+        let samples = [
+            Vec3::new(0.0, 0.0, 0.0),
+            Vec3::new(1.0, -1.0, 0.5),
+            Vec3::new(-0.7, 0.3, 1.2),
+            Vec3::new(2.0, 1.5, -1.0),
+        ];
+        for prim in &prims {
+            let edit = ResolvedEdit {
+                prim: prim.clone(),
+                transform,
+                op: SdfOp::default(),
+                material_id: 3,
+            };
+            let gpu = to_gpu_edit(&edit);
+            assert_eq!(gpu.material_id, 3);
+            for &s in &samples {
+                let cpu = eval_world(&edit.prim, &edit.transform, s);
+                let gpu_eval = eval_gpu_edit_cpu(&gpu, s);
+                assert!(
+                    (cpu - gpu_eval).abs() < 1e-4,
+                    "{prim:?} at {s:?}: eval_world={cpu} gpu={gpu_eval}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn gpu_edit_packs_op_kind() {
+        let mk = |kind| {
+            to_gpu_edit(&ResolvedEdit {
+                prim: SdfPrimitive::Sphere { radius: 1.0 },
+                transform: Transform::IDENTITY,
+                op: SdfOp { kind, smoothing: 0.2 },
+                material_id: 0,
+            })
+        };
+        assert_eq!(mk(CsgKind::Union).op_kind, GPU_OP_UNION);
+        assert_eq!(mk(CsgKind::Subtract).op_kind, GPU_OP_SUBTRACT);
+        assert_eq!(mk(CsgKind::Intersect).op_kind, GPU_OP_INTERSECT);
+        assert_eq!(mk(CsgKind::Union).smoothing, 0.2);
     }
 }

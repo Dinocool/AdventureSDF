@@ -22,7 +22,7 @@ pub fn status_bar_ui(world: &mut World, ctx: &egui::Context) {
         .count();
     let (bricks, dirty) = world
         .get_resource::<SdfAtlas>()
-        .map(|a| (a.bricks.len(), a.rebake_all || !a.dirty_bricks.is_empty()))
+        .map(|a| (a.bricks.len(), a.rebake_all || !a.gpu_baked_tiles.is_empty()))
         .unwrap_or((0, false));
     let perf = world
         .get_resource::<ShaderProfilingData>()

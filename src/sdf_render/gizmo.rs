@@ -16,9 +16,8 @@ use bevy::prelude::*;
 
 use crate::gizmo_render::{GizmoDraw, GizmoMesh, ShapeBuilder};
 
-use super::bake_scheduler::SyncBakeRequest;
 use super::picking::{Ray, mouse_to_ray};
-use super::{SdfCamera, SdfSelection, SdfVolume};
+use super::{SdfCamera, SdfSelection};
 
 // --- Pixel constants (matched to transform-gizmo defaults) ---
 /// Axis length / outer extent, in pixels (the plugin's `gizmo_size`).
@@ -464,7 +463,6 @@ pub fn gizmo_update(
     mouse: Res<ButtonInput<MouseButton>>,
     mut state: ResMut<GizmoState>,
     selection: Res<SdfSelection>,
-    mut sync_bake: ResMut<SyncBakeRequest>,
     windows: Query<&Window>,
     cameras: Query<(&Camera, &Transform), With<SdfCamera>>,
     // Any spatial node is gizmo-movable, not just SDF volumes. The camera is excluded
@@ -474,7 +472,6 @@ pub fn gizmo_update(
     // handles sit at its real world position, not its parent-relative local one.
     globals: Query<&GlobalTransform>,
     parents: Query<&ChildOf>,
-    sdf_nodes: Query<(), With<SdfVolume>>,
 ) {
     state.claimed_click = false;
 
@@ -540,13 +537,11 @@ pub fn gizmo_update(
         if let Ok(mut t) = nodes.get_mut(entity) {
             // Mutating Transform fires `Changed<Transform>`, which `schedule_bakes`
             // uses to rebake just the affected chunks — no explicit dirty flag needed.
+            // `emit_gpu_bakes` bakes the touched chunks the same frame, so the volume
+            // tracks the cursor live with no extra signal. `local` is the world-space
+            // drag result converted back into the entity's local frame (so children
+            // under a non-identity parent move correctly).
             *t = local;
-            // Bake the touched chunks this frame so an SDF volume tracks the cursor
-            // live; the async path would otherwise lose every frame's result to the
-            // epoch race. Non-SDF nodes (e.g. the light) need no rebake.
-            if sdf_nodes.contains(entity) {
-                sync_bake.0 = true;
-            }
         }
         state.hovered = Some(drag.id);
         state.drag = Some(drag);

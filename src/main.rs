@@ -8,7 +8,38 @@ use bevy::window::WindowResolution;
 use bevy_brp_extras::BrpExtrasPlugin;
 use bevy_rapier3d::prelude::*;
 
+/// Each editor run writes a `trace-<timestamp>.json` (bevy/trace_chrome) into the CWD, and
+/// these grow to tens of GB apiece. Bevy's LogPlugin has no retention hook, so prune here —
+/// BEFORE DefaultPlugins creates this run's file — keeping the 2 newest so that, once the new
+/// trace starts, at most 3 exist. Sorted by name: the timestamp suffix is monotone, so
+/// lexical order == chronological order.
+#[cfg(feature = "editor")]
+fn prune_old_traces(keep: usize) {
+    let mut traces: Vec<std::path::PathBuf> = match std::fs::read_dir(".") {
+        Ok(rd) => rd
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with("trace-") && n.ends_with(".json"))
+            })
+            .collect(),
+        Err(_) => return,
+    };
+    if traces.len() <= keep {
+        return;
+    }
+    traces.sort();
+    for old in &traces[..traces.len() - keep] {
+        let _ = std::fs::remove_file(old);
+    }
+}
+
 fn main() {
+    #[cfg(feature = "editor")]
+    prune_old_traces(2);
+
     let mut app = App::new();
     app.add_plugins(
         DefaultPlugins

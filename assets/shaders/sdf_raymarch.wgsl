@@ -25,6 +25,7 @@
     new_chunk_cache,
     find_chunk_cached,
     resolve_march,
+    sample_level_at_or_coarser,
     dist_to_brick_exit_lod,
     dist_to_chunk_exit_lod,
     in_ring_chunk,
@@ -58,6 +59,11 @@ struct RaymarchResult {
     // Cross-fade weight at the hit (0 = pure serving LOD, 1 = fully the coarser neighbour).
     // Surfaced for the SDF_DEBUG_LOD overlay so the per-pixel blend band is visible.
     blend_w: f32,
+    // CONTINUOUS effective LOD actually RENDERED at the hit (distance-driven morph), as a
+    // float — e.g. 2.4 = level 2 morphing 40% toward level 3. This is what the surface is
+    // drawn from; `lod` above is only the finest-OCCUPIED level resolve_march found (patchy).
+    // The SDF_DEBUG_LOD overlay colours by THIS so it reflects what we actually draw.
+    eff_lod: f32,
 };
 
 // Single unified raymarch. One cached resolve per step (`resolve_march` → finest resident
@@ -80,7 +86,7 @@ struct RaymarchResult {
 fn raymarch(origin: vec3<f32>, dir: vec3<f32>, start_t: f32) -> RaymarchResult {
     var t = start_t;
     var steps = 0u;
-    var result = RaymarchResult(false, 0.0, 0u, 0u, vec3<f32>(0.0), 2u, 0u, 0u, 0.0);
+    var result = RaymarchResult(false, 0.0, 0u, 0u, vec3<f32>(0.0), 2u, 0u, 0u, 0.0, 0.0);
 
     let MAX_STEPS = max_steps();
     let MAX_DIST = max_dist();
@@ -149,44 +155,68 @@ fn raymarch(origin: vec3<f32>, dir: vec3<f32>, start_t: f32) -> RaymarchResult {
         let d = scene.dist;                          // trilinear SDF at p
         let cone = CONE * t;                         // pixel-cone half-width here
 
-        // --- LOD cross-fade: morph L → L+1, gliding PER-PIXEL with the camera ----------
-        // The serving LOD L's resident ring box is chunk-snapped (it only re-centres in
-        // discrete jumps), but the cross-fade does NOT have to follow that snapped edge: a
-        // coarser ring nests around the finer one, so wherever L is resident L+1 is too. So
-        // we place the fade at a CAMERA-RELATIVE radius that is guaranteed to sit inside L's
-        // resident window for any camera offset, and measure from the RAW camera — so the
-        // transition slides smoothly with the camera while residency snaps invisibly under it.
+        // --- LOD cross-fade: DISTANCE-driven continuous-LOD morph ----------------------
+        // We render the field at a CONTINUOUS LOD `lodc` set purely by the camera distance,
+        // NOT by which LOD `resolve_march` happened to find occupied. That decoupling is the
+        // fix for the hard blend seam: `resolve_march` serves the FINEST OCCUPIED LOD, so a
+        // finer occupancy ISLAND (grazing surface → sparse per-brick cull, lattice-phase
+        // dependent) used to show through inside a coarser region; the old weight keyed off
+        // that served LOD's ring half-extent, which DOUBLES at a served-LOD flip → the blend
+        // weight jumped → a hard step. Driving the morph from distance makes both the weight
+        // AND the two levels being mixed continuous in screen space, so the island simply
+        // renders at the LOD its distance calls for (no patch).
         //
-        // The camera sits at most `snap` chunks from the snapped window centre, so a
-        // Chebyshev ball of radius `R_safe = half_l - snap*chunk_world` around the camera is
-        // fully inside the window (resident at L, and at L+1). Complete the fade by R_safe
-        // (`end_frac` of the half-extent); start it `band` earlier. `brick_world` cancels, so
-        // end_frac is the clean constant `1 - 2*snap*CHUNK_BRICKS/ring_bricks`.
+        // `lodc = log2(cheb_cam / ref)` with `ref = end_frac · half_l_base` (the LOD-0 ring's
+        // fade-complete radius), so `lodc ≈ L` at LOD L's fade-complete distance. We sample
+        // the two BRACKETING absolute levels `k = floor(lodc)` and `k+1` (degrading to coarser
+        // only — never finer — via `sample_level_at_or_coarser`) and morph between them over
+        // the top `blend_lod` fraction of each level. CONTINUITY across a level boundary
+        // k→k+1: from below `t_in_level→1 ⇒ w→1 ⇒ d_eff→mix(lvl_k, lvl_{k+1}, 1)=lvl_{k+1}`;
+        // from above `level_lo=k+1, t_in_level→0 ⇒ w→0 ⇒ d_eff=lvl_{k+1}` — they match. Near
+        // the camera `lodc→0`, `w→0`, so `d_eff=level 0` and the analytic cubic still owns the
+        // crisp near silhouette. `half_l_base`/`cheb_cam` measured from the RAW camera so the
+        // transition glides while chunk-snapped residency moves invisibly under it.
         let band = lod_blend_band();
         var d_eff = d;
         var blending = false;
-        var blend_w = 0.0;        // exposed for the LOD debug overlay
+        var blend_w = 0.0;        // morph weight toward the coarser level (LOD debug overlay)
+        var eff_lod = f32(lod);   // continuous LOD actually rendered (for the iso-offset)
         let ring_bricks = camera.lod_params.y;
         let end_frac = 1.0 - 2.0 * f32(recenter_snap() * CHUNK_BRICKS) / max(ring_bricks, 1.0);
-        if (band > 0.0 && end_frac > 0.0 && lod + 1u < lod_count()) {
-            let half_l = 0.5 * ring_bricks * brick_world_at(lod);   // ring half-extent
+        if (band > 0.0 && end_frac > 0.0) {
+            let half_l_base = 0.5 * ring_bricks * brick_world_at(0u);   // LOD-0 ring half-extent
             let cheb_cam = max(max(abs(p.x - camera.camera_pos.x), abs(p.y - camera.camera_pos.y)), abs(p.z - camera.camera_pos.z));
-            let frac_cam = cheb_cam / max(half_l, 1e-6);
-            let w = smoothstep(end_frac - band, end_frac, frac_cam);
-            if (w > 0.0) {
-                // Probe the coarser neighbour through the per-ray chunk cache (the fine→
-                // coarse resolve already searched + cached L+1's chunk, so this is ~free).
-                let coord1 = world_to_brick_lod(p, lod + 1u);
-                let key1 = abs_chunk_key(coord1, lod + 1u);
-                let ci1 = find_chunk_cached(lod + 1u, key1.x, key1.y, &cache);
-                if (ci1 >= 0) {
-                    let loc1 = brick_in_chunk(chunk_buf[u32(ci1)], coord1);
-                    if (loc1.found) {
-                        let d_l1 = sample_brick_sdf(loc1.atlas_base, p, lod + 1u);
-                        d_eff = mix(d, d_l1, w);
+            // Reference distance where lodc crosses an integer. LOD L's USABLE ring edge is
+            // d_L = end_frac·half_l_base·2^L; the morph L→L+1 must be COMPLETE there (LOD L
+            // stops being resident beyond it), i.e. lodc(d_L) = L+1. Solving log2(d_L/ref)=L+1
+            // gives ref = 0.5·end_frac·half_l_base. (Dropping the 0.5 — the earlier bug —
+            // shifts lodc down by one whole LOD: renders a level too fine and the morph reads
+            // inverted/late.)
+            let ref_dist = 0.5 * end_frac * half_l_base;
+            let lodc = clamp(log2(max(cheb_cam / max(ref_dist, 1e-6), 1e-6)), 0.0, f32(lod_count() - 1u));
+            let level_lo = floor(lodc);
+            let t_in_level = lodc - level_lo;          // 0..1 position within the bracketing level
+            // Fade band as a fraction of ONE LOD level (log-space image of the world-space
+            // `band` fraction of a ring). Clamp to [0,1]; >0 keeps a sharp per-level core.
+            let blend_lod = clamp(log2(end_frac / max(end_frac - band, 1e-6)), 0.0, 1.0);
+            let w = smoothstep(1.0 - blend_lod, 1.0, t_in_level);   // 0 in the level core, →1 at its top
+            let k = u32(level_lo);
+            let s0 = sample_level_at_or_coarser(p, k, &cache);
+            if (s0.in_brick) {
+                if (w > 0.0 && k + 1u < lod_count()) {
+                    let s1 = sample_level_at_or_coarser(p, k + 1u, &cache);
+                    if (s1.in_brick) {
+                        d_eff = mix(s0.dist, s1.dist, w);
                         blending = true;
                         blend_w = w;
+                        eff_lod = f32(s0.lod) + w * f32(s1.lod - s0.lod);
+                    } else {
+                        d_eff = s0.dist;
+                        eff_lod = f32(s0.lod);
                     }
+                } else {
+                    d_eff = s0.dist;
+                    eff_lod = f32(s0.lod);
                 }
             }
         }
@@ -225,6 +255,7 @@ fn raymarch(origin: vec3<f32>, dir: vec3<f32>, start_t: f32) -> RaymarchResult {
                 result.fate = 0u;
                 result.lod = lod;
                 result.atlas_base = scene.atlas_base;
+                result.eff_lod = eff_lod;
                 return result;
             }
             t += advance + voxel_size * 0.001;
@@ -241,12 +272,16 @@ fn raymarch(origin: vec3<f32>, dir: vec3<f32>, start_t: f32) -> RaymarchResult {
         // (one α works across LODs); ZERO at LOD 0 so the analytic cubic's crisp near surface
         // is untouched. Lerp by `blend_w` so it stays continuous into LOD+1's (2×) offset
         // across the cross-fade. `d_iso` is the distance to this inflated surface.
-        let eps_l = select(
+        // Keyed on the CONTINUOUS rendered LOD `eff_lod` (= served `lod` when not morphing),
+        // so the inflation grows smoothly with the distance-driven morph instead of stepping
+        // at a served-LOD flip. `vs_eff = base · 2^eff_lod` is the voxel size at that LOD;
+        // QUADRATIC in it (the h² bias law). Zero at LOD 0 (cubic owns the near surface).
+        let vs_eff = camera.lod_params.z * exp2(eff_lod);
+        let eff_eps = select(
             0.0,
-            surface_bias() * voxel_size * voxel_size / camera.lod_params.z,
-            lod > 0u,
+            surface_bias() * vs_eff * vs_eff / camera.lod_params.z,
+            eff_lod > 0.0,
         );
-        let eff_eps = mix(eps_l, 2.0 * eps_l, blend_w);
         let d_iso = d_eff - eff_eps;
 
         // --- 3. Coarse LOD / far: sphere-trace the (inflated) trilinear field ---------
@@ -278,6 +313,7 @@ fn raymarch(origin: vec3<f32>, dir: vec3<f32>, start_t: f32) -> RaymarchResult {
             result.lod = lod;
             result.atlas_base = scene.atlas_base;
             result.blend_w = blend_w;     // cross-fade amount toward LOD+1 (for the debug overlay)
+            result.eff_lod = eff_lod;
             return result;
         }
 
@@ -582,9 +618,11 @@ fn main(in: FullscreenVertexOutput) -> FragmentOutput {
     // transition band reads as a colour gradient between two ring colours (not a hard
     // line) — directly visualising the blended region.
     if (rm.hit) {
-        let col_l = lod_debug_color(rm.lod);
-        let col_l1 = lod_debug_color(rm.lod + 1u);
-        let col = mix(col_l, col_l1, rm.blend_w);
+        // Colour by the CONTINUOUS effective LOD actually rendered (distance-driven morph),
+        // not the patchy finest-occupied `rm.lod` — so the overlay shows what we DRAW. A
+        // smooth spatial gradient ⇒ continuous morph; scattered patches ⇒ a real seam.
+        let lf = floor(rm.eff_lod);
+        let col = mix(lod_debug_color(u32(lf)), lod_debug_color(u32(lf) + 1u), rm.eff_lod - lf);
         let shaded_lod = mix(shaded, col, 0.65);
         return FragmentOutput(vec4<f32>(shaded_lod, 1.0), ndc_depth);
     }

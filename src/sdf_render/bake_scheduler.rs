@@ -1,8 +1,9 @@
-//! Incremental, async clipmap bake scheduling in **chunk units**.
+//! Incremental clipmap bake scheduling in **chunk units**.
 //!
-//! The main thread only does cheap integer chunk-ring window diffs (enqueue entered
-//! chunks, evict exited chunks) and applies finished task results; the actual
-//! `bake_brick` work runs on `AsyncComputeTaskPool`, so camera motion never blocks.
+//! The main thread does cheap integer chunk-ring window diffs (enqueue entered chunks,
+//! evict exited chunks) + per-brick topology (BVH cull, palette, tile alloc) and emits GPU
+//! compute bake jobs; the actual per-voxel eval runs on the GPU (`sdf_brick_bake.wgsl`), so
+//! camera motion never blocks.
 //!
 //! Eager eviction is safe because addressing is **absolute** (chunk keys, not a
 //! camera-relative ring origin — see [`super::chunk`]): a not-yet-baked chunk is simply
@@ -13,7 +14,6 @@
 use std::sync::Arc;
 
 use bevy::prelude::*;
-use bevy::tasks::{AsyncComputeTaskPool, Task, block_on, poll_once};
 
 use super::atlas::{self, SdfAtlas};
 use super::chunk;
@@ -22,18 +22,40 @@ use super::{
     edits, gather_sorted_edits,
 };
 
-/// One-frame request to bake this frame's dirty chunks **synchronously** (on the main
-/// thread, same frame) instead of deferring them to the async task pool.
-///
-/// Reusable seam for "I need this edit visible *now*": set `.0 = true` from any system
-/// that mutates an [`SdfVolume`] and wants the result on screen immediately — a live
-/// gizmo drag, an inspector slider, a programmatic edit. Without it the async path
-/// applies a frame or two later, and during a *continuous* edit (e.g. a drag) every
-/// frame bumps `edit_epoch`, so the in-flight async results are discarded as stale and
-/// nothing lands until the edit stops. `schedule_bakes` consumes (clears) the flag each
-/// frame after honoring it.
+/// One brick the GPU compute bake must fill this frame. The CPU has already done the
+/// topology work (BVH cull → `edit_indices` into the frame's flat edit list, palette,
+/// tile allocation); the compute shader runs the 512-voxel `fold_csg` eval and writes the
+/// brick's texels straight into the atlas tile at `tile`. `lod`/`coord` give the shader
+/// each voxel's world position; `dist_band` is the per-LOD snorm clamp band so the shader
+/// needs no `SdfGridConfig`.
+#[derive(Clone)]
+pub struct GpuBakeJob {
+    pub tile: u32,
+    pub lod: u32,
+    pub coord: IVec3,
+    pub voxel_size: f32,
+    pub dist_band: f32,
+    pub palette: edits::Palette,
+    /// Range into [`PendingGpuBakes::edits`] of this brick's culled candidate edits.
+    pub edit_start: u32,
+    pub edit_count: u32,
+}
+
+/// Main-world hand-off for the GPU brick bake: this frame's jobs plus the flat edit list
+/// they index. Filled by `schedule_bakes` in [`BakeBackend::Gpu`] mode and drained by the
+/// render-world extract.
 #[derive(Resource, Default)]
-pub struct SyncBakeRequest(pub bool);
+pub struct PendingGpuBakes {
+    pub jobs: Vec<GpuBakeJob>,
+    pub edits: Vec<edits::GpuEdit>,
+}
+
+impl PendingGpuBakes {
+    fn clear(&mut self) {
+        self.jobs.clear();
+        self.edits.clear();
+    }
+}
 
 /// Last frame's per-edit world AABB, keyed by entity. Lets the scheduler dirty an edit's
 /// *former* footprint (not just where it moved to) so vacated chunks get rebuilt/removed.
@@ -61,75 +83,52 @@ impl PrevEditAabbs {
     }
 }
 
-/// One in-flight async bake: a pool task baking the bricks of one or more chunks, tagged
-/// with the `edit_epoch` it was scheduled under (results baked against superseded edits
-/// are detected and requeued).
-struct BakeJob {
-    epoch: u64,
-    task: Task<Vec<(atlas::BrickKey, Option<atlas::PackedBrick>)>>,
-}
-
-/// Drives incremental, async clipmap baking in chunk units (see module docs).
+/// Drives incremental clipmap baking in chunk units (see module docs).
 #[derive(Resource)]
 pub struct BakeScheduler {
-    /// Bumped whenever the edit set changes (add/remove/move). Results carrying an
-    /// older epoch are stale and get requeued.
-    edit_epoch: u64,
-    /// Snapshot of the current edits + BVH handed to bake tasks (cheap Arc clone).
+    /// Snapshot of the current edits + BVH used to emit GPU bake jobs (cheap Arc clone).
     edits: Arc<Vec<edits::ResolvedEdit>>,
     bvh: Arc<bvh::Bvh>,
-    /// Decoded height maps for bake-time displacement, snapshotted alongside edits/BVH so
-    /// async bake tasks can sample it. Rebuilt when the material registry's displacement
-    /// columns change (see `update_height_field`).
+    /// Decoded height maps for bake-time displacement, snapshotted alongside edits/BVH.
+    /// Rebuilt when the material registry's displacement columns change (see
+    /// `update_height_field`).
     height: super::height::SharedHeightField,
     /// Per-LOD chunk-ring origin currently resident (index = lod), in chunk coords. Used
     /// to diff which chunks entered/exited as the camera moves. Empty until first run.
     ring_chunk_origin: Vec<IVec3>,
     /// Chunk keys awaiting a bake (deduped).
     pending: std::collections::HashSet<chunk::ChunkKey>,
-    /// Tasks currently baking.
-    inflight: Vec<BakeJob>,
 }
 
 impl Default for BakeScheduler {
     fn default() -> Self {
         Self {
-            edit_epoch: 0,
             edits: Arc::new(Vec::new()),
             bvh: Arc::new(bvh::Bvh::default()),
             height: Arc::new(super::height::HeightField::default()),
             ring_chunk_origin: Vec::new(),
             pending: std::collections::HashSet::new(),
-            inflight: Vec::new(),
         }
     }
 }
 
 impl BakeScheduler {
     /// Replace the height-field snapshot used by subsequent bakes (rebuilt when the material
-    /// registry's displacement columns change). Async tasks clone the `Arc`.
+    /// registry's displacement columns change).
     pub fn set_height(&mut self, height: super::height::SharedHeightField) {
         self.height = height;
     }
-
-    /// The current height-field snapshot (for the synchronous diagnostic bake, which baked
-    /// off the scheduler's edits/bvh too).
-    pub fn height_field(&self) -> &super::height::HeightField {
-        &self.height
-    }
 }
 
-/// Max chunks baked per pool task. Each chunk is up to `CHUNK_VOLUME` (64) `bake_brick`
-/// calls, so keep the per-task chunk count small to stream results back promptly.
-const BAKE_CHUNKS_PER_TASK: usize = 2;
-
-/// Per-frame schedule budget: at most this many chunks are turned into bake tasks each
-/// frame. A large camera jump (or first bake) can dirty thousands of chunks; spawning
-/// them all at once bursts the task pool and stalls the frame. Capping the drain bounds
-/// worst-case per-frame scheduling cost — leftover chunks stay in `pending` (a dedup set)
-/// and drain over the next frames, refining in. Coarser LODs already cover the not-yet-
-/// baked region, so the delay shows as coarse-correct terrain, never a hole.
-const SCHEDULE_BUDGET_CHUNKS: usize = 64;
+/// Max brick bake JOBS emitted to the GPU per frame. Each job writes its
+/// brick's texels into two storage buffers sized `jobs × tile`; the material buffer
+/// dominates at `1024 u32 × 4 B = 4096 B/job`, so the GPU's `maxStorageBufferBindingSize`
+/// (128 MB default) caps us at ~32768 jobs. 16384 leaves headroom (64 MB mat + 32 MB dist)
+/// and is a clean 256×64 dispatch grid. A single huge edit can dirty 70k+ bricks; the
+/// overflow spills back to `pending` and bakes over the next frames (coarse LOD covers the
+/// gap meanwhile — see `emit_gpu_bakes`). Without this cap a giant edit overflows the buffer
+/// binding and wgpu aborts the frame.
+const GPU_BAKE_JOB_CAP: usize = 16384;
 
 /// Any component that affects an edit's baked result. A change to one of these
 /// triggers a targeted rebake of the bricks the edit touches. Exposed as
@@ -182,56 +181,20 @@ fn ring_chunks_per_axis(config: &SdfGridConfig) -> i32 {
     (config.ring_bricks / chunk::CHUNK_BRICKS as u32) as i32
 }
 
-/// Squared world distance from the camera to a chunk's centre. Used to drain the bake
-/// queue nearest-first so the visible shell fills before far chunks.
-fn chunk_dist_sq(ck: chunk::ChunkKey, camera_pos: Vec3, config: &SdfGridConfig) -> f32 {
-    let half = chunk::chunk_world_size(ck.lod, config) * 0.5;
-    let centre = chunk::chunk_min_world(ck, config) + Vec3::splat(half);
-    (centre - camera_pos).length_squared()
-}
-
 /// Whether any edit reaches chunk `ck` (its world AABB overlaps an edit in the BVH). A
-/// chunk's world AABB is exactly the union of its `CHUNK_BRICKS³` brick AABBs (the bare
-/// brick footprint `bake_coord` queries), so a BVH miss here guarantees *every* brick in
-/// the chunk would bake to empty space. Used to skip enqueuing empty entered chunks: they
-/// would consume the per-frame budget producing nothing, starving the real geometry that
-/// enters far (coarse-LOD) rings — the cause of LOD never refreshing when flying away from
-/// the scene. Safe only for camera-*entered* chunks (no resident bricks to evict yet); the
-/// edit-dirty path must still enqueue emptied chunks so vacated bricks get removed.
+/// chunk's world AABB is exactly the union of its `CHUNK_BRICKS³` brick AABBs, so a BVH miss
+/// here guarantees *every* brick in the chunk would bake to empty space. Used to skip
+/// enqueuing empty entered chunks: they would consume budget producing nothing, starving the
+/// real geometry entering far (coarse-LOD) rings — the cause of LOD never refreshing when
+/// flying away from the scene. Safe only for camera-*entered* chunks (no resident bricks to
+/// evict yet); the edit-dirty path must still enqueue emptied chunks so vacated bricks get
+/// removed.
 fn chunk_has_geometry(ck: chunk::ChunkKey, bvh: &bvh::Bvh, config: &SdfGridConfig, scratch: &mut Vec<u32>) -> bool {
     let size = chunk::chunk_world_size(ck.lod, config);
     let min = chunk::chunk_min_world(ck, config);
     let aabb = bevy::math::bounding::Aabb3d::from_min_max(min, min + Vec3::splat(size));
     bvh.query_aabb(&aabb, scratch);
     !scratch.is_empty()
-}
-
-/// Remove and return up to `budget` chunks from `pending`, nearest-camera-first. When
-/// `pending` fits in the budget it is drained whole (cheap). Otherwise the nearest
-/// `budget` chunks are taken and the rest left for subsequent frames. Pure (no ECS), so
-/// the budgeting + ordering is unit-testable without an App or task pool.
-fn drain_budget(
-    pending: &mut std::collections::HashSet<chunk::ChunkKey>,
-    camera_pos: Vec3,
-    config: &SdfGridConfig,
-    budget: usize,
-) -> Vec<chunk::ChunkKey> {
-    if pending.len() <= budget {
-        return pending.drain().collect();
-    }
-    let mut all: Vec<chunk::ChunkKey> = pending.iter().copied().collect();
-    // Sort by squared distance of the chunk centre to the camera (finer LODs sit nearer
-    // the camera, so this also naturally prioritises high-detail chunks).
-    all.sort_by(|a, b| {
-        chunk_dist_sq(*a, camera_pos, config)
-            .partial_cmp(&chunk_dist_sq(*b, camera_pos, config))
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-    all.truncate(budget);
-    for ck in &all {
-        pending.remove(ck);
-    }
-    all
 }
 
 /// Whether chunk coord `c` is inside the `R³` chunk window with corner `origin`.
@@ -292,23 +255,27 @@ fn chunks_in_aabb(
     out
 }
 
-/// Main-thread scheduling only — no baking. Diffs the per-LOD chunk-ring window as the
-/// camera moves (enqueue entered chunks, evict exited chunks), dirties edited regions,
-/// and spawns async bake tasks. All integer window math + Arc clones — microseconds.
+/// Main-thread scheduling + GPU job emission — no per-voxel baking on the CPU. Diffs the
+/// per-LOD chunk-ring window as the camera moves (enqueue entered chunks, evict exited
+/// chunks), dirties edited regions, does per-brick topology (BVH cull, palette, tile alloc),
+/// and emits GPU compute bake jobs. The per-voxel eval runs on the GPU. All integer window
+/// math + Arc clones + a 9-point palette per dirty brick — microseconds.
 #[expect(clippy::too_many_arguments)]
 pub fn schedule_bakes(
     mut atlas: ResMut<SdfAtlas>,
     mut bvh: ResMut<bvh::Bvh>,
     mut sched: ResMut<BakeScheduler>,
     mut prev_aabbs: ResMut<PrevEditAabbs>,
-    mut sync_request: ResMut<SyncBakeRequest>,
+    mut gpu_bakes: ResMut<PendingGpuBakes>,
     config: Res<SdfGridConfig>,
     volumes: Query<VolumeQueryData, With<SdfVolume>>,
     changed: Query<Entity, (With<SdfVolume>, ChangedEdit)>,
     camera: Query<&Transform, (With<SdfCamera>, Without<SdfVolume>)>,
 ) {
-    // Consume the one-frame "bake now, synchronously" request (see SyncBakeRequest).
-    let bake_sync = std::mem::take(&mut sync_request.0);
+    // GPU bake jobs are rebuilt from scratch each frame; the render world consumed last
+    // frame's. `gpu_baked_tiles` likewise holds only THIS frame's GPU-written tiles.
+    gpu_bakes.clear();
+    atlas.gpu_baked_tiles.clear();
     let camera_pos = camera.iter().next().map(|t| t.translation).unwrap_or(Vec3::ZERO);
     let lod_count = config.lod_count;
     let r = ring_chunks_per_axis(&config);
@@ -332,7 +299,6 @@ pub fn schedule_bakes(
         *bvh = new_bvh.clone();
         sched.bvh = Arc::new(new_bvh);
         sched.edits = Arc::new(resolved);
-        sched.edit_epoch = sched.edit_epoch.wrapping_add(1);
 
         if atlas.rebake_all || set_changed {
             // Whole set changed → re-dirty every resident-window chunk at each LOD.
@@ -404,129 +370,181 @@ pub fn schedule_bakes(
         sched.ring_chunk_origin[li] = new_origin;
     }
 
-    // --- 3. Bake the dirty chunks (sync inline, or async tasks) -----------------------
-    if sched.pending.is_empty() {
-        return;
-    }
-
-    // Take only this frame's budget, nearest-camera-first, so the visible shell fills
-    // before far chunks. Leftover pending chunks persist (dedup set) for next frame.
-    let drained = drain_budget(&mut sched.pending, camera_pos, &config, SCHEDULE_BUDGET_CHUNKS);
-
-    // Sync path: bake on the main thread and apply this frame, so a live edit (gizmo
-    // drag, slider) is visible immediately. Skips the task pool entirely, so there's no
-    // epoch race to lose — what we drain, we apply now. Same per-frame budget bounds cost.
-    if bake_sync {
-        let mut applied = false;
-        for ck in &drained {
-            for key in chunk_brick_keys(*ck, &config) {
-                match SdfAtlas::bake_brick(key, &sched.edits, &sched.bvh, &config, &sched.height) {
-                    Some(brick) => {
-                        atlas.insert_brick(key, brick);
-                        applied = true;
-                    }
-                    None => applied |= atlas.remove_brick(&key),
-                }
-            }
-        }
-        if applied {
-            atlas.last_bake_was_full = false;
-            atlas.bump_generation();
-        }
-        return;
-    }
-
-    let pool = AsyncComputeTaskPool::get();
-    let epoch = sched.edit_epoch;
-
-    for group in drained.chunks(BAKE_CHUNKS_PER_TASK) {
-        // Expand the group's chunks into their brick keys for the task.
-        let mut keys: Vec<atlas::BrickKey> = Vec::new();
-        for ck in group {
-            keys.extend(chunk_brick_keys(*ck, &config));
-        }
-        let edits = Arc::clone(&sched.edits);
-        let bvh_snapshot = Arc::clone(&sched.bvh);
-        let height = Arc::clone(&sched.height);
-        let cfg = config.clone();
-        let task = pool.spawn(async move {
-            keys.into_iter()
-                .map(|key| {
-                    let baked = SdfAtlas::bake_brick(key, &edits, &bvh_snapshot, &cfg, &height);
-                    (key, baked)
-                })
-                .collect::<Vec<_>>()
-        });
-        sched.inflight.push(BakeJob { epoch, task });
-    }
+    // --- 3. Emit GPU bake jobs for the dirty chunks ----------------------------------
+    // The CPU does only topology (BVH cull + palette + tile alloc) and emits a GpuBakeJob per
+    // brick; the compute shader fills the texels.
+    emit_gpu_bakes(&mut atlas, &mut sched, &mut gpu_bakes, &config);
 }
 
-/// Main-thread, non-blocking drain of finished bake tasks. Inserts baked bricks (per-brick
-/// tiles as before) and bumps the generation so the incremental GPU upload picks up the
-/// changed tiles. Stale results (superseded edit epoch) are requeued by chunk.
-pub fn apply_bakes(
-    mut atlas: ResMut<SdfAtlas>,
-    mut sched: ResMut<BakeScheduler>,
-    config: Res<SdfGridConfig>,
-) {
-    if sched.inflight.is_empty() {
-        return;
-    }
-    let current_epoch = sched.edit_epoch;
-    let lod_count = config.lod_count;
-    let r = ring_chunks_per_axis(&config);
-    let mut applied = false;
-    let mut requeue: Vec<chunk::ChunkKey> = Vec::new();
+/// Narrow-band cull decision for one candidate brick: KEEP iff the folded isosurface can pass
+/// through it. Drops the deep INTERIOR of a solid (`|d| ≫ 0`) and the FAR-EXTERIOR corners the
+/// coarse AABB query leaves in — the r³ bulk the march never samples (rays approach from
+/// outside, read only the thin zero-band, and stop). `indices` are the brick's BVH-culled edit
+/// indices into `edits`. Pure + allocation-free; unit-tested directly.
+///
+/// SMOOTHING SAFETY: a plain center test `|fold(center)| > circumradius + band` assumes the
+/// folded field is 1-Lipschitz — true ONLY at smoothing 0. iq polynomial `smin`/`smax` have a
+/// correction term `k·h(1−h)` that peaks at `k/4`, so the smoothed field can sit up to `Σ kᵢ/4`
+/// (additive down the fold chain) NEARER the true surface than `fold_hard` — the bound that
+/// kept the cull safe. Without padding for it, a brick at a SMOOTHED subtract-carve crease whose
+/// center reads "far" but whose corner actually crosses zero gets wrongly dropped → a hole at
+/// the rim (the reported bug). We pad `reach` by `Σ kᵢ/4`, restoring the conservative bound.
+///
+/// FORCE-KEEP on sign change: as a belt-and-suspenders that can only ever KEEP (never drop, so
+/// it cannot add a hole), if the folded field changes sign across the brick's 9 palette sample
+/// points (8 corners + center) the surface provably crosses the brick → keep regardless of the
+/// center distance. This also catches an enclosed cavity whose surface the center eval misses.
+fn narrow_band_keep(
+    edits: &[edits::ResolvedEdit],
+    indices: &[u32],
+    config: &SdfGridConfig,
+    key: atlas::BrickKey,
+) -> bool {
+    let brick_world = config.brick_world_size(key.lod);
+    let center = config.brick_min_world(key.coord, key.lod) + Vec3::splat(0.5 * brick_world);
 
-    let mut i = 0;
-    while i < sched.inflight.len() {
-        let Some(results) = block_on(poll_once(&mut sched.inflight[i].task)) else {
-            i += 1;
-            continue;
-        };
-        let job_epoch = sched.inflight[i].epoch;
-        sched.inflight.swap_remove(i);
+    // Smoothing pad: additive Σ(kᵢ)/4 over the brick's smoothed candidate edits.
+    let smooth_sum: f32 = indices
+        .iter()
+        .map(|&i| edits[i as usize].op.smoothing.max(0.0))
+        .sum();
+    let reach = brick_world * (0.5 * 3.0_f32.sqrt())
+        + atlas::dist_band_world(config, key.lod)
+        + 0.25 * smooth_sum;
 
-        if job_epoch != current_epoch {
-            // Stale → requeue the affected chunks (deduped) under the current edits.
-            for (key, _) in &results {
-                requeue.push(chunk::chunk_of(*key, &config).0);
+    // Force-keep if the surface provably crosses the brick (sign change over the 9 samples).
+    // Only meaningful when smoothing inflates the gradient; the common k=0 path stays 1 eval.
+    if smooth_sum > 0.0 {
+        let voxel_size = config.voxel_size_at(key.lod);
+        let samples = atlas::SdfAtlas::brick_palette_samples(key, voxel_size);
+        let mut neg = false;
+        let mut pos = false;
+        for p in samples {
+            if edits::fold_csg_dist_indexed(edits, indices, p) <= 0.0 {
+                neg = true;
+            } else {
+                pos = true;
             }
-            continue;
+            if neg && pos {
+                return true;
+            }
         }
+    }
 
-        for (key, baked) in results {
-            // Skip a brick whose chunk left its LOD window while baking.
-            let ck = chunk::chunk_of(key, &config).0;
-            let li = ck.lod as usize;
-            if li < lod_count as usize {
-                let origin = sched.ring_chunk_origin[li];
-                if !chunk_in_window(ck.coord, origin, r) {
+    edits::fold_csg_dist_indexed(edits, indices, center).abs() <= reach
+}
+
+/// Turn this frame's dirty chunks into [`GpuBakeJob`]s: the CPU does only the topology work
+/// (BVH cull → which bricks exist + their palette + a stable tile), and the compute shader
+/// fills each brick's 512 texels straight into the atlas. No main-thread voxel loop.
+fn emit_gpu_bakes(
+    atlas: &mut SdfAtlas,
+    sched: &mut BakeScheduler,
+    gpu_bakes: &mut PendingGpuBakes,
+    config: &SdfGridConfig,
+) {
+    let _span = info_span!("sdf_emit_gpu_bakes").entered();
+    let edits_snapshot = Arc::clone(&sched.edits);
+    let bvh_snapshot = Arc::clone(&sched.bvh);
+    let mut scratch: Vec<u32> = Vec::new();
+
+    // Emit one bake job for `key` from already-culled edit indices `indices` and a known
+    // `palette`. No re-cull, no palette rebuild — the caller supplies both. `tile` must be
+    // allocated.
+    #[expect(clippy::too_many_arguments)]
+    fn push_job(
+        atlas: &mut SdfAtlas,
+        gpu_bakes: &mut PendingGpuBakes,
+        edits_snapshot: &[edits::ResolvedEdit],
+        config: &SdfGridConfig,
+        key: atlas::BrickKey,
+        tile: u32,
+        indices: &[u32],
+        palette: edits::Palette,
+    ) {
+        let edit_start = gpu_bakes.edits.len() as u32;
+        for &i in indices {
+            gpu_bakes.edits.push(edits::to_gpu_edit(&edits_snapshot[i as usize]));
+        }
+        gpu_bakes.jobs.push(GpuBakeJob {
+            tile,
+            lod: key.lod,
+            coord: key.coord,
+            voxel_size: config.voxel_size_at(key.lod),
+            dist_band: atlas::dist_band_world(config, key.lod),
+            palette,
+            edit_start,
+            edit_count: indices.len() as u32,
+        });
+        atlas.gpu_baked_tiles.insert(tile);
+    }
+
+    // Drain ALL pending each frame and EVICT empties immediately (no per-frame eviction
+    // budget). When an edit moves it dirties its old∪new footprint; the vacated chunks MUST
+    // be evicted the same frame or their stale bricks linger as a trail behind the dragged
+    // object (the "parts left behind" artifact). Eviction is CPU-only (`remove_brick`, no GPU
+    // job), so it's always cheap and always immediate.
+    //
+    // BAKE emission, by contrast, is capped: each bake job writes into GPU storage buffers
+    // sized `jobs × tile`, and a huge edit (70k+ bricks) would overflow the 128 MB buffer
+    // binding and abort the frame. So we emit at most `GPU_BAKE_JOB_CAP` jobs; the rest spill
+    // back to `pending` and bake over the next frames.
+    //
+    // Two invariants keep the cap hole-free:
+    //  1. A spilled brick is NOT inserted into the atlas (stays non-resident) — the shader's
+    //     chunk lookup misses it and falls back to the coarser LOD, which IS baked. (Inserting
+    //     it would expose a resident tile with un-baked zero texels: worse than a hole.)
+    //  2. Coarse LODs emit before fine (sort dirty chunks by DESCENDING lod). Coarse rings
+    //     have ~8× fewer bricks per level, so they always fit; if the cap is hit it only ever
+    //     spills the finest detail, whose coarse fallback is already resident this frame.
+    let mut drained: Vec<chunk::ChunkKey> = sched.pending.drain().collect();
+    drained.sort_unstable_by_key(|ck| std::cmp::Reverse(ck.lod)); // coarsest (highest lod) first
+    let mut spilled: Vec<chunk::ChunkKey> = Vec::new();
+    for ck in &drained {
+        let mut chunk_spilled = false;
+        for key in chunk_brick_keys(*ck, config) {
+            if atlas::SdfAtlas::cull_edit_indices(key, &bvh_snapshot, config, &mut scratch).is_some()
+            {
+                // Narrow-band cull: bake only the surface SHELL (see `narrow_band_keep`). Drops
+                // the r³ interior + far-exterior bulk the march never reads. A dropped brick is
+                // evicted (it reads as empty, same as genuine empty space) and costs no job.
+                if !narrow_band_keep(&edits_snapshot, &scratch, config, key) {
                     atlas.remove_brick(&key);
                     continue;
                 }
-            }
-            match baked {
-                Some(brick) => {
-                    atlas.insert_brick(key, brick);
-                    applied = true;
+
+                // Over the per-frame job cap → defer this brick's BAKE. Do NOT insert it
+                // (must stay non-resident → coarse-LOD fallback). The chunk is re-queued.
+                if gpu_bakes.jobs.len() >= GPU_BAKE_JOB_CAP {
+                    chunk_spilled = true;
+                    continue;
                 }
-                None => {
-                    if atlas.remove_brick(&key) {
-                        applied = true;
-                    }
-                }
+                let voxel_size = config.voxel_size_at(key.lod);
+                let samples = atlas::SdfAtlas::brick_palette_samples(key, voxel_size);
+                let culled: Vec<edits::ResolvedEdit> =
+                    scratch.iter().map(|&i| edits_snapshot[i as usize].clone()).collect();
+                let palette = edits::build_palette(&culled, &samples);
+                let tile = atlas.insert_gpu_brick(key, palette);
+                push_job(
+                    atlas, gpu_bakes, &edits_snapshot, config, key, tile, &scratch, palette,
+                );
+            } else {
+                // Empty space → evict immediately (no job, no trail).
+                atlas.remove_brick(&key);
             }
         }
+        if chunk_spilled {
+            spilled.push(*ck);
+        }
     }
-
-    for ck in requeue {
+    // Re-queue spilled chunks for the next frame(s). Their evictions already happened above;
+    // only their deferred bakes retry. The atlas grows naturally as the spill drains, and the
+    // render world preserves existing texels across the grow (see `prepare_sdf_atlas_gpu`), so
+    // no re-emit of the already-baked set is needed.
+    for ck in spilled {
         sched.pending.insert(ck);
     }
-    if applied {
-        atlas.last_bake_was_full = false;
-        atlas.bump_generation();
-    }
+    atlas.last_bake_was_full = false;
 }
 
 #[cfg(test)]
@@ -540,130 +558,70 @@ mod tests {
         SdfGridConfig::default()
     }
 
-    // --- Async-scheduler emulation (no task pool) -----------------------------------
+    // --- GPU recenter convergence harness -------------------------------------------
     //
-    // Reproduces exactly what `schedule_bakes` + `apply_bakes` do to the atlas, but with
-    // tasks completing **out of order and late** — the worst case for the leading-edge
-    // staleness bug (a chunk that exits and re-enters a window before its in-flight bake
-    // lands). The emulation shares the real window-diff + apply-guard helpers, so a hole
-    // here would be a hole in production.
+    // Drives the real recenter (step 2 of `schedule_bakes`) + `emit_gpu_bakes` directly on a
+    // scheduler/atlas pair, so the resident-set convergence invariants are tested against the
+    // exact production topology code (no ECS App needed). The GPU bake emits synchronously, so
+    // there's no async lag to model — what's dirtied this frame is baked this frame.
 
-    /// One emulated in-flight bake: the chunk and its per-brick bake results.
-    type EmuJob = (chunk::ChunkKey, Vec<(atlas::BrickKey, Option<atlas::PackedBrick>)>);
-
-    struct EmuSched {
-        ring_chunk_origin: Vec<IVec3>,
-        pending: HashSet<chunk::ChunkKey>,
-        /// Jobs queued but not yet applied — drained partially and out of order to model
-        /// async lag.
-        inflight: std::collections::VecDeque<EmuJob>,
-        /// Total chunk enqueues over this scheduler's life (every `pending.insert` from a
-        /// recenter). The cull bounds this by the scene's shell footprint; without it, it
-        /// grows with the empty volume the camera sweeps.
-        enqueued_total: usize,
+    /// Mirror `schedule_bakes` step 2 (camera recenter): enqueue entered geometry chunks into
+    /// `pending`, evict exited chunks eagerly. Returns the number of geometry chunks enqueued
+    /// (for the fly-away starvation bound). `ring_chunk_origin` lives on the scheduler.
+    fn recenter_step(sched: &mut BakeScheduler, atlas: &mut SdfAtlas, cfg: &SdfGridConfig, cam: Vec3) -> usize {
+        let r = ring_chunks_per_axis(cfg);
+        if sched.ring_chunk_origin.is_empty() {
+            sched.ring_chunk_origin = vec![IVec3::splat(i32::MIN); cfg.lod_count as usize];
+        }
+        let first = sched.ring_chunk_origin.iter().all(|o| *o == IVec3::splat(i32::MIN));
+        let mut scratch: Vec<u32> = Vec::new();
+        let mut enqueued = 0usize;
+        for lod in 0..cfg.lod_count {
+            let li = lod as usize;
+            let new_origin = ring_chunk_origin(cfg, cam, lod);
+            let old_origin = sched.ring_chunk_origin[li];
+            if new_origin == old_origin {
+                continue;
+            }
+            for ck in chunk_window_keys(new_origin, r, lod) {
+                let entered = first || !chunk_in_window(ck.coord, old_origin, r);
+                if entered && chunk_has_geometry(ck, &sched.bvh, cfg, &mut scratch) && sched.pending.insert(ck) {
+                    enqueued += 1;
+                }
+            }
+            if !first {
+                for ck in chunk_window_keys(old_origin, r, lod) {
+                    if !chunk_in_window(ck.coord, new_origin, r) {
+                        sched.pending.remove(&ck);
+                        for bk in chunk_brick_keys(ck, cfg) {
+                            atlas.remove_brick(&bk);
+                        }
+                    }
+                }
+            }
+            sched.ring_chunk_origin[li] = new_origin;
+        }
+        enqueued
     }
 
-    impl EmuSched {
-        fn new(lod_count: u32) -> Self {
-            Self {
-                ring_chunk_origin: vec![IVec3::splat(i32::MIN); lod_count as usize],
-                pending: HashSet::new(),
-                inflight: std::collections::VecDeque::new(),
-                enqueued_total: 0,
+    /// Recenter to `cam` and drain the GPU bake emission until idle (the cap may spill over
+    /// several frames). Returns the resident chunk set — the GPU equivalent of a fresh settle.
+    fn settle_gpu(sched: &mut BakeScheduler, atlas: &mut SdfAtlas, cfg: &SdfGridConfig, cam: Vec3) -> HashSet<chunk::ChunkKey> {
+        recenter_step(sched, atlas, cfg, cam);
+        let mut gpu = PendingGpuBakes::default();
+        let mut guard = 0;
+        loop {
+            gpu.jobs.clear();
+            gpu.edits.clear();
+            atlas.gpu_baked_tiles.clear();
+            emit_gpu_bakes(atlas, sched, &mut gpu, cfg);
+            guard += 1;
+            assert!(guard < 1000, "settle did not converge");
+            if sched.pending.is_empty() {
+                break;
             }
         }
-
-        /// Mirror `schedule_bakes` step 2 (camera recenter): enqueue entered chunks (culling
-        /// empty ones the same way the real path does), evict exited chunks eagerly.
-        fn recenter(&mut self, atlas: &mut SdfAtlas, cfg: &SdfGridConfig, bvh: &bvh::Bvh, cam: Vec3) {
-            let r = ring_chunks_per_axis(cfg);
-            let first = self.ring_chunk_origin.iter().all(|o| *o == IVec3::splat(i32::MIN));
-            let mut scratch: Vec<u32> = Vec::new();
-            for lod in 0..cfg.lod_count {
-                let li = lod as usize;
-                let new_origin = ring_chunk_origin(cfg, cam, lod);
-                let old_origin = self.ring_chunk_origin[li];
-                if new_origin == old_origin {
-                    continue;
-                }
-                for ck in chunk_window_keys(new_origin, r, lod) {
-                    let entered = first || !chunk_in_window(ck.coord, old_origin, r);
-                    if entered && chunk_has_geometry(ck, bvh, cfg, &mut scratch) && self.pending.insert(ck) {
-                        self.enqueued_total += 1;
-                    }
-                }
-                if !first {
-                    for ck in chunk_window_keys(old_origin, r, lod) {
-                        if !chunk_in_window(ck.coord, new_origin, r) {
-                            self.pending.remove(&ck);
-                            for bk in chunk_brick_keys(ck, cfg) {
-                                atlas.remove_brick(&bk);
-                            }
-                        }
-                    }
-                }
-                self.ring_chunk_origin[li] = new_origin;
-            }
-        }
-
-        /// Move up to `budget` pending chunks into the in-flight queue (baking now, but
-        /// "delivered" later via `apply`). Order is arbitrary (HashSet) — for tests that
-        /// don't exercise the nearest-first priority.
-        fn schedule(&mut self, cfg: &SdfGridConfig, edits: &[ResolvedEdit], bvh: &bvh::Bvh, budget: usize) {
-            let take: Vec<chunk::ChunkKey> = self.pending.iter().copied().take(budget).collect();
-            for ck in take {
-                self.pending.remove(&ck);
-                let results: Vec<_> = chunk_brick_keys(ck, cfg)
-                    .into_iter()
-                    .map(|bk| (bk, SdfAtlas::bake_brick(bk, edits, bvh, cfg, &super::super::height::HeightField::default())))
-                    .collect();
-                self.inflight.push_back((ck, results));
-            }
-        }
-
-        /// Like `schedule` but drains via the REAL `drain_budget` (nearest-camera-first),
-        /// so the starvation regime — empty near chunks crowding out far real geometry — is
-        /// reproduced faithfully. This is the priority the live `schedule_bakes` uses.
-        fn schedule_nearest(&mut self, cfg: &SdfGridConfig, edits: &[ResolvedEdit], bvh: &bvh::Bvh, cam: Vec3, budget: usize) {
-            let take = drain_budget(&mut self.pending, cam, cfg, budget);
-            for ck in take {
-                let results: Vec<_> = chunk_brick_keys(ck, cfg)
-                    .into_iter()
-                    .map(|bk| (bk, SdfAtlas::bake_brick(bk, edits, bvh, cfg, &super::super::height::HeightField::default())))
-                    .collect();
-                self.inflight.push_back((ck, results));
-            }
-        }
-
-        /// Mirror `apply_bakes`: apply up to `count` in-flight results, popping from the
-        /// FRONT or BACK to force out-of-order delivery, with the same window-recheck guard.
-        fn apply(&mut self, atlas: &mut SdfAtlas, cfg: &SdfGridConfig, count: usize, from_back: bool) {
-            let r = ring_chunks_per_axis(cfg);
-            for _ in 0..count {
-                let Some((ck, results)) = (if from_back { self.inflight.pop_back() } else { self.inflight.pop_front() }) else {
-                    break;
-                };
-                let li = ck.lod as usize;
-                let in_window = li < self.ring_chunk_origin.len()
-                    && chunk_in_window(ck.coord, self.ring_chunk_origin[li], r);
-                for (key, baked) in results {
-                    if !in_window {
-                        atlas.remove_brick(&key);
-                        continue;
-                    }
-                    match baked {
-                        Some(brick) => atlas.insert_brick(key, brick),
-                        None => {
-                            atlas.remove_brick(&key);
-                        }
-                    }
-                }
-            }
-        }
-
-        fn idle(&self) -> bool {
-            self.pending.is_empty() && self.inflight.is_empty()
-        }
+        atlas.bricks.keys().map(|k| chunk::chunk_of(*k, cfg).0).collect()
     }
 
     fn build_bvh(edits: &[ResolvedEdit]) -> bvh::Bvh {
@@ -683,140 +641,385 @@ mod tests {
         }
     }
 
-    /// The headline correctness guarantee for reviving the async path: drive the camera
-    /// back and forth across geometry (so chunks repeatedly exit and re-enter windows)
-    /// while applying bakes **late and out of order**, then flush. The resident set must
-    /// equal a from-scratch `full_bake` at the final camera — no stale leading edge, no
-    /// hole. This is the invariant whose absence kept the async path disabled.
+    fn sphere_edit(pos: Vec3, radius: f32, mat: u16) -> ResolvedEdit {
+        ResolvedEdit {
+            prim: SdfPrimitive::Sphere { radius },
+            transform: Transform::from_translation(pos),
+            op: SdfOp { kind: CsgKind::Union, smoothing: 0.0 },
+            material_id: mat,
+        }
+    }
+
+    fn subtract_sphere(pos: Vec3, radius: f32) -> ResolvedEdit {
+        ResolvedEdit {
+            prim: SdfPrimitive::Sphere { radius },
+            transform: Transform::from_translation(pos),
+            op: SdfOp { kind: CsgKind::Subtract, smoothing: 0.0 },
+            material_id: 0,
+        }
+    }
+
+    /// Regression guard for the narrow-band cull on a SUBTRACTED (hollow / bitten) solid: the
+    /// cull must not drop any brick the TRUE folded surface passes through, and every resident
+    /// brick's per-brick CULLED candidate set must agree in SIGN with the full edit list at the
+    /// brick corners (so the GPU bakes the carve, not solid). Covers both an enclosed cavity and
+    /// an open bite. (Proven the cull is innocent of the interior-hole artefact — that lives in
+    /// the GPU bake/march, not here.)
     #[test]
-    fn async_emulation_converges_under_out_of_order_lag() {
+    fn cull_preserves_subtracted_surface_bricks() {
+        for (r_in, off) in [(4.0_f32, 0.0_f32), (5.0, 10.0)] {
+            let cfg = SdfGridConfig { lod_count: 1, ring_bricks: 8, recenter_snap_chunks: 1, ..config() };
+            let r_out = 10.0;
+            let edits = vec![
+                sphere_edit(Vec3::ZERO, r_out, 0),
+                subtract_sphere(Vec3::new(off, 0.0, 0.0), r_in),
+            ];
+            let mut sched = primed_sched(&edits);
+            let mut atlas = SdfAtlas::default();
+            for x in -5..=5 {
+                for y in -5..=5 {
+                    for z in -5..=5 {
+                        sched.pending.insert(chunk::ChunkKey::new(0, IVec3::new(x, y, z)));
+                    }
+                }
+            }
+            let mut gpu = PendingGpuBakes::default();
+            let mut guard = 0;
+            loop {
+                gpu.clear();
+                atlas.gpu_baked_tiles.clear();
+                emit_gpu_bakes(&mut atlas, &mut sched, &mut gpu, &cfg);
+                guard += 1;
+                assert!(guard < 1000);
+                if sched.pending.is_empty() { break; }
+            }
+
+            let all_edits = sched.edits.clone();
+            let bw = cfg.brick_world_size(0);
+            let mut scratch: Vec<u32> = Vec::new();
+            let corner = |bmin: Vec3| {
+                let mut cs = [Vec3::ZERO; 8];
+                let mut i = 0;
+                for cx in [0.0, bw] {
+                    for cy in [0.0, bw] {
+                        for cz in [0.0, bw] {
+                            cs[i] = bmin + Vec3::new(cx, cy, cz);
+                            i += 1;
+                        }
+                    }
+                }
+                cs
+            };
+
+            // (1) No surface-bearing brick dropped.
+            for ck in chunk_window_keys(IVec3::splat(-5), 11, 0) {
+                for key in chunk_brick_keys(ck, &cfg) {
+                    if atlas::SdfAtlas::cull_edit_indices(key, &sched.bvh, &cfg, &mut scratch).is_none() {
+                        continue;
+                    }
+                    let cs = corner(cfg.brick_min_world(key.coord, 0));
+                    let (mut neg, mut pos) = (false, false);
+                    for p in cs {
+                        if edits::fold_csg(&all_edits, p).dist <= 0.0 { neg = true; } else { pos = true; }
+                    }
+                    if neg && pos {
+                        assert!(
+                            atlas.bricks.contains_key(&key),
+                            "r_in={r_in} off={off}: dropped a brick the surface passes through at {:?}",
+                            key.coord
+                        );
+                    }
+                }
+            }
+
+            // (2) Per-brick culled candidate set agrees in sign with the full edit list.
+            for key in atlas.bricks.keys() {
+                if atlas::SdfAtlas::cull_edit_indices(*key, &sched.bvh, &cfg, &mut scratch).is_none() {
+                    continue;
+                }
+                let culled: Vec<edits::ResolvedEdit> =
+                    scratch.iter().map(|&i| all_edits[i as usize].clone()).collect();
+                for p in corner(cfg.brick_min_world(key.coord, 0)) {
+                    let d_full = edits::fold_csg(&all_edits, p).dist;
+                    let d_cull = edits::fold_csg(&culled, p).dist;
+                    assert_eq!(
+                        d_full <= 0.0, d_cull <= 0.0,
+                        "r_in={r_in} off={off}: culled-set sign mismatch at brick {:?} (full={d_full:.3} cull={d_cull:.3})",
+                        key.coord
+                    );
+                }
+            }
+        }
+    }
+
+    /// A scheduler primed with `edits` + their BVH, as `schedule_bakes` would leave it after
+    /// the edit-change step — so `emit_gpu_bakes` can be driven directly in a test.
+    fn primed_sched(edits: &[ResolvedEdit]) -> BakeScheduler {
+        BakeScheduler {
+            edits: Arc::new(edits.to_vec()),
+            bvh: Arc::new(build_bvh(edits)),
+            ..BakeScheduler::default()
+        }
+    }
+
+    /// `emit_gpu_bakes` never emits more than `GPU_BAKE_JOB_CAP` jobs in one frame, and the
+    /// dirty chunks whose bricks didn't fit are spilled back to `pending` for the next frame.
+    #[test]
+    fn gpu_emit_caps_jobs_and_spills_overflow() {
+        let cfg = SdfGridConfig { lod_count: 1, ring_bricks: 8, recenter_snap_chunks: 1, ..config() };
+        // A big SOLID sphere. The narrow-band cull drops its deep interior, so the overflow
+        // must come from the SHELL alone — radius 22 gives a surface band of ~30k+ bricks,
+        // comfortably over the 16384 cap. (A solid box would now cull to almost nothing.)
+        let edits = vec![sphere_edit(Vec3::ZERO, 22.0, 0)];
+        let mut sched = primed_sched(&edits);
+        let mut atlas = SdfAtlas::default();
+        let mut gpu = PendingGpuBakes::default();
+
+        // Dirty a chunk cube bounding the whole sphere (chunk_world ≈ 2.8, so ±22 ⇒ chunk ±8).
+        for x in -9..=9 {
+            for y in -9..=9 {
+                for z in -9..=9 {
+                    sched.pending.insert(chunk::ChunkKey::new(0, IVec3::new(x, y, z)));
+                }
+            }
+        }
+
+        emit_gpu_bakes(&mut atlas, &mut sched, &mut gpu, &cfg);
+
+        assert!(
+            gpu.jobs.len() <= GPU_BAKE_JOB_CAP,
+            "emitted {} jobs, over the cap {}",
+            gpu.jobs.len(),
+            GPU_BAKE_JOB_CAP
+        );
+        assert!(
+            !sched.pending.is_empty(),
+            "overflow chunks must spill back to pending for the next frame"
+        );
+        // Every emitted job corresponds to a resident brick (so the shader can read it).
+        assert_eq!(
+            gpu.jobs.len(),
+            atlas.bricks.len(),
+            "resident brick count must equal the emitted job count (no half-inserted bricks)"
+        );
+    }
+
+    /// A spilled brick must NOT be inserted into the atlas — it stays non-resident so the
+    /// shader falls back to the coarser LOD. Conversely, empty bricks are evicted even on a
+    /// capped frame. Here: resident bricks == emitted jobs, and the spill is purely deferred.
+    #[test]
+    fn gpu_emit_spilled_bricks_stay_non_resident() {
+        let cfg = SdfGridConfig { lod_count: 1, ring_bricks: 8, recenter_snap_chunks: 1, ..config() };
+        // Big SOLID sphere: the cull drops its deep interior, so the >cap overflow rides on the
+        // shell + bounding-box exterior alone (~100k+ bricks). (A solid box would cull to ~0.)
+        let edits = vec![sphere_edit(Vec3::ZERO, 22.0, 0)];
+        let mut sched = primed_sched(&edits);
+        let mut atlas = SdfAtlas::default();
+        let mut gpu = PendingGpuBakes::default();
+        for x in -9..=9 {
+            for y in -9..=9 {
+                for z in -9..=9 {
+                    sched.pending.insert(chunk::ChunkKey::new(0, IVec3::new(x, y, z)));
+                }
+            }
+        }
+
+        emit_gpu_bakes(&mut atlas, &mut sched, &mut gpu, &cfg);
+
+        // No brick is resident without a corresponding job this frame: a capped (spilled)
+        // brick is never inserted, so the atlas never exposes an un-baked (zero) tile.
+        assert_eq!(atlas.bricks.len(), gpu.jobs.len());
+        assert!(atlas.bricks.len() <= GPU_BAKE_JOB_CAP);
+
+        // Draining the spill over subsequent frames eventually bakes everything (no chunk is
+        // dropped). Run until pending empties; the resident set grows monotonically.
+        let mut guard = 0;
+        let mut last = atlas.bricks.len();
+        while !sched.pending.is_empty() {
+            gpu.jobs.clear();
+            gpu.edits.clear();
+            atlas.gpu_baked_tiles.clear();
+            emit_gpu_bakes(&mut atlas, &mut sched, &mut gpu, &cfg);
+            assert!(atlas.bricks.len() >= last, "resident set must not shrink while draining spill");
+            last = atlas.bricks.len();
+            guard += 1;
+            assert!(guard < 100, "spill drain did not converge");
+        }
+        assert!(atlas.bricks.len() > GPU_BAKE_JOB_CAP, "all dirty bricks eventually resident");
+    }
+
+    /// Narrow-band interior cull: a solid object bakes only its surface SHELL, not its deep
+    /// interior. The march reads the field from OUTSIDE (rays shrink to the surface and stop),
+    /// so interior bricks are write-only waste — and for a big solid they're the r³ bulk that
+    /// drives the approach-bake hitch. Assert: (a) the brick at the centre of a large solid is
+    /// NOT resident, (b) a brick straddling the surface IS, (c) the resident count is far below
+    /// the solid's full bounding-box brick count (what the old AABB-only cull kept).
+    #[test]
+    fn gpu_emit_culls_deep_interior_of_solid() {
+        let cfg = SdfGridConfig { lod_count: 1, ring_bricks: 8, recenter_snap_chunks: 1, ..config() };
+        let radius = 10.0;
+        let edits = vec![sphere_edit(Vec3::ZERO, radius, 0)];
+        let mut sched = primed_sched(&edits);
+        let mut atlas = SdfAtlas::default();
+
+        // Dirty a chunk cube bounding the sphere (chunk_world = 2.8 ⇒ ±10 ⇒ chunk ±4).
+        for x in -5..=5 {
+            for y in -5..=5 {
+                for z in -5..=5 {
+                    sched.pending.insert(chunk::ChunkKey::new(0, IVec3::new(x, y, z)));
+                }
+            }
+        }
+        // Drain fully (cap may spill across frames) so the resident set is the final one.
+        let mut gpu = PendingGpuBakes::default();
+        let mut guard = 0;
+        loop {
+            gpu.jobs.clear();
+            gpu.edits.clear();
+            atlas.gpu_baked_tiles.clear();
+            emit_gpu_bakes(&mut atlas, &mut sched, &mut gpu, &cfg);
+            guard += 1;
+            assert!(guard < 1000, "cull-test settle did not converge");
+            if sched.pending.is_empty() {
+                break;
+            }
+        }
+
+        let brick_at = |p: Vec3| atlas::BrickKey::new(0, cfg.world_to_brick_lod(p, 0));
+        // (a) Dead centre of the solid: surface is `radius` away ≫ brick reach → culled.
+        assert!(
+            !atlas.bricks.contains_key(&brick_at(Vec3::ZERO)),
+            "deep-interior brick at the sphere centre must be culled (write-only waste)"
+        );
+        // (b) A brick straddling the surface (just inside it) must stay resident.
+        assert!(
+            atlas.bricks.contains_key(&brick_at(Vec3::new(radius - 0.05, 0.0, 0.0))),
+            "surface-shell brick must remain resident (the march reads it)"
+        );
+        // (c) Resident ≪ what the OLD (AABB-only) cull kept. That cull kept every brick whose
+        // box overlapped the sphere's bounding BOX — i.e. the full (2r)³ cube. The narrow-band
+        // cull keeps only the shell, so it must be well under half that cube.
+        let bw = cfg.brick_world_size(0);
+        let bbox_bricks = ((2.0 * radius / bw).ceil() as usize).pow(3);
+        assert!(
+            atlas.bricks.len() < bbox_bricks / 2,
+            "resident {} should be far below the AABB-cull bounding-box count {}",
+            atlas.bricks.len(),
+            bbox_bricks
+        );
+    }
+
+    /// Empty-space bricks are evicted the same frame even under the job cap (eviction is
+    /// CPU-only, never spilled) — the fix for the drag trail must survive the cap.
+    #[test]
+    fn gpu_emit_evicts_empties_under_cap() {
+        let cfg = SdfGridConfig { lod_count: 1, ring_bricks: 8, recenter_snap_chunks: 1, ..config() };
+        // Small edit at the origin; most chunks are empty space.
+        let edits = vec![box_edit(Vec3::ZERO, 0.5, 0)];
+        let mut sched = primed_sched(&edits);
+        let mut atlas = SdfAtlas::default();
+        let mut gpu = PendingGpuBakes::default();
+
+        // Pre-populate a far brick as if it were resident from a previous position, then dirty
+        // its chunk: the edit doesn't reach it, so it must be evicted this frame. Use a real
+        // brick key from the chunk's enumeration so it's stride-aligned (chunk_brick_keys must
+        // actually visit it).
+        let far_chunk = chunk::ChunkKey::new(0, IVec3::new(100, 0, 0));
+        let far = chunk_brick_keys(far_chunk, &cfg)[0];
+        atlas.insert_gpu_brick(far, [edits::PALETTE_EMPTY; edits::PALETTE_K]);
+        assert!(atlas.bricks.contains_key(&far));
+        sched.pending.insert(far_chunk);
+        sched.pending.insert(chunk::ChunkKey::new(0, IVec3::ZERO));
+
+        emit_gpu_bakes(&mut atlas, &mut sched, &mut gpu, &cfg);
+
+        assert!(
+            !atlas.bricks.contains_key(&far),
+            "a now-empty brick must be evicted, not left as a trail"
+        );
+    }
+
+    /// The headline correctness guarantee: drive the camera back and forth across geometry
+    /// (so chunks repeatedly exit and re-enter windows) via the real recenter + GPU emit, then
+    /// settle at the final camera. The resident set must equal a fresh settle there — no stale
+    /// leading edge, no missing bricks. Absolute addressing makes a brick that exits and
+    /// re-enters identical, so the walk must converge to the same set as arriving directly.
+    #[test]
+    fn recenter_walk_converges_to_fresh_settle() {
         let cfg = SdfGridConfig { lod_count: 3, ring_bricks: 8, recenter_snap_chunks: 1, ..Default::default() };
         let edits: Vec<ResolvedEdit> = (-6i32..=6).map(|i| box_edit(Vec3::new(i as f32 * 1.2, 0.0, 0.0), 0.4, (i.rem_euclid(3)) as u16)).collect();
-        let bvh = build_bvh(&edits);
 
         let mut atlas = SdfAtlas::default();
-        let mut sched = EmuSched::new(cfg.lod_count);
+        let mut sched = primed_sched(&edits);
 
-        // First fill at the origin (mirrors first_run: everything pending, then baked).
-        let cam0 = Vec3::ZERO;
-        sched.recenter(&mut atlas, &cfg, &bvh, cam0);
-        // Drain the initial fill fully so we start from a clean resident set.
-        while !sched.idle() {
-            sched.schedule(&cfg, &edits, &bvh, 3);
-            sched.apply(&mut atlas, &cfg, 2, false);
+        // Walk a winding path forward and back across several brick/chunk boundaries.
+        let path = [0.0f32, 2.0, 4.0, 1.0, -3.0, -1.0, 5.0, 0.0, 3.0, -4.0, 0.0];
+        for &x in &path {
+            settle_gpu(&mut sched, &mut atlas, &cfg, Vec3::new(x, 0.0, 0.0));
         }
-
-        // A winding path that crosses several brick/chunk boundaries forward and back.
-        let path = [2.0f32, 4.0, 1.0, -3.0, -1.0, 5.0, 0.0, 3.0, -4.0, 0.0];
-        let mut from_back = false;
-        for (i, &x) in path.iter().enumerate() {
-            let cam = Vec3::new(x, 0.0, 0.0);
-            sched.recenter(&mut atlas, &cfg, &bvh, cam);
-            // Deliberately under-drain so tasks lag across recenters, and alternate the
-            // apply order to force out-of-order delivery.
-            sched.schedule(&cfg, &edits, &bvh, 2);
-            sched.apply(&mut atlas, &cfg, 1, from_back);
-            from_back = !from_back;
-            // No per-step assert: mid-flight the atlas is legitimately incomplete (coarse
-            // LOD covers the gap). We assert only after a full flush below.
-            let _ = i;
-        }
-
-        // Flush everything at the final camera position.
         let final_cam = Vec3::new(*path.last().unwrap(), 0.0, 0.0);
-        sched.recenter(&mut atlas, &cfg, &bvh, final_cam);
-        let mut guard = 0;
-        while !sched.idle() {
-            sched.schedule(&cfg, &edits, &bvh, 8);
-            sched.apply(&mut atlas, &cfg, 8, from_back);
-            from_back = !from_back;
-            guard += 1;
-            assert!(guard < 1000, "flush did not converge");
-        }
+        let walked: HashSet<_> = atlas.bricks.keys().copied().collect();
 
-        // The payoff: byte-identical to a fresh full_bake at the final camera.
-        let mut reference = SdfAtlas::default();
-        reference.full_bake(&edits, &bvh, &cfg, &super::super::height::HeightField::default(), final_cam);
-        let inc: HashSet<_> = atlas.bricks.keys().copied().collect();
-        let refk: HashSet<_> = reference.bricks.keys().copied().collect();
-        assert_eq!(inc, refk, "async emulation diverged from full_bake (stale/missing bricks)");
-        for (key, rb) in &reference.bricks {
-            assert_eq!(atlas.bricks[key].dist, rb.dist, "dist mismatch at {key:?}");
-        }
+        // A fresh arrival at the same camera (independent scheduler/atlas).
+        let mut fresh_atlas = SdfAtlas::default();
+        let mut fresh_sched = primed_sched(&edits);
+        settle_gpu(&mut fresh_sched, &mut fresh_atlas, &cfg, final_cam);
+        let fresh: HashSet<_> = fresh_atlas.bricks.keys().copied().collect();
+
+        assert_eq!(walked, fresh, "recenter walk diverged from a fresh settle (stale/missing bricks)");
     }
 
-    /// Settle the chunk-windowed scheduler at `cam` from an empty atlas with an unlimited
-    /// budget: the canonical "correct resident set for this camera position" (no stale, no
-    /// starved). Reference oracle for the fly-in tests — apples-to-apples with the live path
-    /// (both chunk-windowed), unlike `full_bake` which uses the brick-level ring and so
-    /// differs at window boundaries.
-    fn settle_fresh(cfg: &SdfGridConfig, edits: &[ResolvedEdit], bvh: &bvh::Bvh, cam: Vec3) -> HashSet<chunk::ChunkKey> {
-        let mut atlas = SdfAtlas::default();
-        let mut sched = EmuSched::new(cfg.lod_count);
-        sched.recenter(&mut atlas, cfg, bvh, cam);
-        let mut guard = 0;
-        while !sched.idle() {
-            sched.schedule(cfg, edits, bvh, 64);
-            sched.apply(&mut atlas, cfg, 64, false);
-            guard += 1;
-            assert!(guard < 1000, "settle did not converge");
-        }
-        atlas.bricks.keys().map(|k| chunk::chunk_of(*k, cfg).0).collect()
-    }
-
-    /// Flying *away* from a localized scene under a tight per-frame budget must still
-    /// refresh the scene's bricks into their new (coarser) LOD rings — the same as flying
-    /// *toward* it. Before the empty-chunk cull, backing into empty space enqueued
-    /// near-but-empty chunks that won the nearest-first budget every frame and starved the
-    /// real geometry entering far rings, so its LOD never updated. With the cull, only
-    /// chunks that actually contain geometry consume budget, so flying in (either direction)
-    /// converges to the same resident set as a fresh settle at that position — no stale fine
-    /// bricks left behind, no coarse bricks starved.
+    /// Flying *away* from a localized scene must still refresh the scene's bricks into their
+    /// new (coarser) LOD rings — the same resident set as a fresh settle at the destination,
+    /// and the bake enqueues stay bounded by the scene's shell footprint (NOT the empty volume
+    /// swept), so flying 4× farther does not enqueue ~4× the chunks (the empty-chunk cull).
     #[test]
     fn flying_away_still_refreshes_scene_lod() {
         let cfg = SdfGridConfig { lod_count: 4, ring_bricks: 8, recenter_snap_chunks: 1, ..Default::default() };
-        // A small scene clustered near the origin (so most entered chunks are empty space).
         let edits: Vec<ResolvedEdit> =
             (-1i32..=1).map(|i| box_edit(Vec3::new(i as f32 * 0.5, 0.0, 0.0), 0.4, 0)).collect();
-        let bvh = build_bvh(&edits);
 
-        // Fly `steps` small steps away from the scene, one bounded frame each, draining
-        // NEAREST-camera-first (the live priority). Returns (resident chunk set, total
-        // chunk enqueues over the whole flight).
+        // Fly `steps` small steps away from the scene; return (resident chunk set, total
+        // geometry-chunk enqueues over the flight, excluding the initial fill).
         let run = |sign: f32, steps: i32| -> (HashSet<chunk::ChunkKey>, usize) {
             let mut atlas = SdfAtlas::default();
-            let mut sched = EmuSched::new(cfg.lod_count);
-            sched.recenter(&mut atlas, &cfg, &bvh, Vec3::ZERO);
-            while !sched.idle() {
-                sched.schedule(&cfg, &edits, &bvh, 64);
-                sched.apply(&mut atlas, &cfg, 64, false);
-            }
-            let baseline_enqueued = sched.enqueued_total; // exclude the initial fill
-            let mut from_back = false;
+            let mut sched = primed_sched(&edits);
+            settle_gpu(&mut sched, &mut atlas, &cfg, Vec3::ZERO); // initial fill
+            let mut enqueued = 0usize;
+            let mut gpu = PendingGpuBakes::default();
             for i in 1..=steps {
                 let cam = Vec3::new(sign * i as f32 * 0.4, 0.0, 0.0);
-                sched.recenter(&mut atlas, &cfg, &bvh, cam);
-                sched.schedule_nearest(&cfg, &edits, &bvh, cam, 2);
-                sched.apply(&mut atlas, &cfg, 2, from_back);
-                from_back = !from_back;
+                enqueued += recenter_step(&mut sched, &mut atlas, &cfg, cam);
+                // Drain this frame's emission (the GPU bake; spill drains over frames).
+                let mut guard = 0;
+                loop {
+                    gpu.jobs.clear();
+                    gpu.edits.clear();
+                    atlas.gpu_baked_tiles.clear();
+                    emit_gpu_bakes(&mut atlas, &mut sched, &mut gpu, &cfg);
+                    guard += 1;
+                    assert!(guard < 1000, "frame drain did not converge");
+                    if sched.pending.is_empty() { break; }
+                }
             }
             let set = atlas.bricks.keys().map(|k| chunk::chunk_of(*k, &cfg).0).collect();
-            (set, sched.enqueued_total - baseline_enqueued)
+            (set, enqueued)
         };
 
-        // 1) Symmetry + correctness: flying away in either direction leaves the same resident
-        //    set as a fresh settle at the destination (no stale fine bricks, nothing missing).
+        // 1) Symmetry + correctness: flying away either direction leaves the same resident set
+        //    as a fresh settle at the destination (no stale fine bricks, nothing missing).
         for (label, sign, steps) in [("forward", 1.0, 16), ("backward", -1.0, 16)] {
             let (flown, _) = run(sign, steps);
-            let fresh = settle_fresh(&cfg, &edits, &bvh, Vec3::new(sign * steps as f32 * 0.4, 0.0, 0.0));
+            let mut fresh_atlas = SdfAtlas::default();
+            let mut fresh_sched = primed_sched(&edits);
+            let fresh = settle_gpu(&mut fresh_sched, &mut fresh_atlas, &cfg, Vec3::new(sign * steps as f32 * 0.4, 0.0, 0.0));
             assert_eq!(flown, fresh, "{label}: flew-in resident chunks diverged from a fresh settle");
             assert!(!flown.is_empty(), "{label}: scene vanished after flying away");
         }
 
-        // 2) The cull's core guarantee: total bake enqueues while flying away are bounded by
-        //    the scene's shell footprint, NOT the empty volume swept. So flying 4× farther
-        //    must NOT enqueue ~4× the chunks. Without the cull every empty leading-edge chunk
-        //    is enqueued, the count scales with distance, and the budget starves the scene.
+        // 2) The cull's core guarantee: enqueues while flying away are bounded by the scene's
+        //    shell footprint, NOT the empty volume swept — flying 4× farther must NOT enqueue
+        //    ~4× the chunks.
         let (_, near) = run(-1.0, 8);
         let (_, far) = run(-1.0, 32); // 4× the distance
         assert!(
@@ -969,32 +1172,4 @@ mod tests {
         assert_eq!(moved.x - base.x, snap, "a full snap-cell crossing shifts the origin by snap chunks");
     }
 
-    /// The per-frame budget takes at most `budget` chunks, leaves the rest pending, and
-    /// prefers the ones nearest the camera so the visible shell fills first.
-    #[test]
-    fn drain_budget_is_bounded_and_nearest_first() {
-        let cfg = config();
-        // A line of LOD-0 chunks marching away from the camera on +X.
-        let mut pending: HashSet<chunk::ChunkKey> = HashSet::new();
-        for x in 0..100 {
-            pending.insert(chunk::ChunkKey::new(0, IVec3::new(x, 0, 0)));
-        }
-        let camera = chunk::chunk_min_world(chunk::ChunkKey::new(0, IVec3::ZERO), &cfg);
-
-        let budget = 10;
-        let taken = drain_budget(&mut pending, camera, &cfg, budget);
-        assert_eq!(taken.len(), budget, "must take exactly the budget");
-        assert_eq!(pending.len(), 90, "the rest stay pending for next frame");
-
-        // The taken chunks are the 10 nearest (x = 0..=9); none of the far ones.
-        let max_x = taken.iter().map(|c| c.coord.x).max().unwrap();
-        assert!(max_x < budget as i32, "budget drained far chunks before near ones (max_x={max_x})");
-
-        // Draining repeatedly eventually empties pending (no chunk is dropped).
-        let mut total = taken.len();
-        while !pending.is_empty() {
-            total += drain_budget(&mut pending, camera, &cfg, budget).len();
-        }
-        assert_eq!(total, 100, "every pending chunk is eventually drained");
-    }
 }

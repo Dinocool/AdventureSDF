@@ -20,10 +20,29 @@ use naga_oil::compose::{
     ComposableModuleDescriptor, Composer, NagaModuleDescriptor, ShaderLanguage,
 };
 
-use adventure::sdf_render::atlas::SdfAtlas;
+use adventure::sdf_render::atlas::{ring_window_coords, BrickKey, SdfAtlas};
 use adventure::sdf_render::bvh::Bvh;
-use adventure::sdf_render::edits::{edit_world_aabb, ResolvedEdit, SdfOp, SdfPrimitive};
+use adventure::sdf_render::edits::{
+    edit_world_aabb, ResolvedEdit, SdfOp, SdfPrimitive, PALETTE_EMPTY, PALETTE_K,
+};
 use adventure::sdf_render::SdfGridConfig;
+
+/// Populate `atlas` with the SAME resident brick set the (removed) CPU `full_bake` produced:
+/// for each LOD ring around `camera`, the BVH-non-empty bricks. The GPU rig tests only probe
+/// brick ADDRESSING / chunk-table lookup (not texel values), so palette-only placeholders via
+/// `insert_gpu_brick` are sufficient — they put the right keys + tiles in the atlas.
+fn populate_resident(atlas: &mut SdfAtlas, config: &SdfGridConfig, bvh: &Bvh, camera: Vec3) {
+    let mut scratch: Vec<u32> = Vec::new();
+    for lod in 0..config.lod_count {
+        let origin = config.ring_origin(camera, lod);
+        for coord in ring_window_coords(config, origin) {
+            let key = BrickKey::new(lod, coord);
+            if SdfAtlas::cull_edit_indices(key, bvh, config, &mut scratch).is_some() {
+                atlas.insert_gpu_brick(key, [PALETTE_EMPTY; PALETTE_K]);
+            }
+        }
+    }
+}
 
 // --- GPU device ----------------------------------------------------------------
 
@@ -356,9 +375,9 @@ fn gpu_world_to_brick_matches_cpu_for_negative_cube() {
     ];
 
     for center in centers {
-        let (edits, bvh) = single_cube(center);
+        let (_edits, bvh) = single_cube(center);
         let mut atlas = SdfAtlas::default();
-        atlas.full_bake(&edits, &bvh, &config, &adventure::sdf_render::height::HeightField::default(), center);
+        populate_resident(&mut atlas, &config, &bvh, center);
         let brick_coords: Vec<IVec3> = atlas.bricks.keys().map(|k| k.coord).collect();
         assert!(!brick_coords.is_empty(), "cube at {center:?} baked no bricks");
 
@@ -780,9 +799,9 @@ fn gpu_find_brick_lookup_matches_cpu() {
     let config = SdfGridConfig { lod_count: 1, ring_bricks: 64, ..Default::default() };
 
     let center = Vec3::new(-10.822, -0.339, -5.058);
-    let (edits, bvh) = single_cube(center);
+    let (_edits, bvh) = single_cube(center);
     let mut atlas = SdfAtlas::default();
-    atlas.full_bake(&edits, &bvh, &config, &adventure::sdf_render::height::HeightField::default(), center);
+    populate_resident(&mut atlas, &config, &bvh, center);
 
     // Deterministic atlas_base per brick so a wrong-tile resolve is detectable.
     let tables = build_chunk_tables(&atlas, &config, |key| {

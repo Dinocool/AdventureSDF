@@ -53,6 +53,12 @@ pub struct SdfAtlasTextures {
     pub height: u32,
     /// Display height (px) for each atlas row in the panel; user-adjustable zoom.
     pub view_height: f32,
+    /// The last frame the atlas panel was actually drawn (egui_dock only invokes a tab's
+    /// render closure when the tab is visible). `update_atlas_textures` rebuilds the preview
+    /// images ONLY when this is recent — rebuilding the whole-atlas RGBA previews cost ~2.8ms
+    /// EVERY atlas change (i.e. every drag frame) even with the panel closed, the single
+    /// biggest SDF frame cost in the editor. Gating it on visibility makes a closed panel free.
+    pub panel_seen_frame: u64,
 }
 
 impl Default for SdfAtlasTextures {
@@ -65,6 +71,7 @@ impl Default for SdfAtlasTextures {
             width: 0,
             height: 0,
             view_height: 64.0,
+            panel_seen_frame: 0,
         }
     }
 }
@@ -354,7 +361,7 @@ fn update_atlas_stats(mut stats: ResMut<SdfAtlasStats>, atlas: Res<SdfAtlas>) {
     let num_rows = (total as u32).div_ceil(tiles_per_row).max(1);
     stats.atlas_width = tiles_per_row * (BRICK_EDGE * BRICK_EDGE) as u32;
     stats.atlas_height = num_rows * BRICK_EDGE as u32;
-    stats.dirty = atlas.rebake_all || !atlas.dirty_bricks.is_empty();
+    stats.dirty = atlas.rebake_all || !atlas.gpu_baked_tiles.is_empty();
 }
 
 /// Human-readable byte size (B / KB / MB).
@@ -377,11 +384,24 @@ fn fmt_bytes(bytes: u64) -> String {
 /// image matches what the GPU samples.
 fn update_atlas_textures(
     atlas: Res<SdfAtlas>,
+    frames: Res<bevy::diagnostic::FrameCount>,
     mut images: ResMut<Assets<Image>>,
     mut egui_textures: ResMut<EguiUserTextures>,
     mut tex: ResMut<SdfAtlasTextures>,
 ) {
     if !atlas.is_changed() {
+        return;
+    }
+
+    // Skip the whole-atlas preview rebuild unless the SDF Atlas panel was visible within the
+    // last few frames (it stamps `panel_seen_frame` when egui_dock draws it). This is the
+    // single biggest editor frame cost during a drag (~2.8ms) and is pure waste when the
+    // panel is closed. A few frames of slack avoids a stale preview on the frame the panel
+    // reopens. Also, in GPU bake mode the CPU `packed.dist`/`mat_dist` are zero placeholders
+    // (the GPU owns those texels), so the preview would render garbage regardless — see
+    // `SdfAtlas::insert_gpu_brick`.
+    let now = frames.0 as u64;
+    if now.saturating_sub(tex.panel_seen_frame) > 3 {
         return;
     }
 
@@ -600,14 +620,6 @@ fn chunk_panel(world: &mut World, ui: &mut egui::Ui) {
         let mut state = world.resource_mut::<ChunkDebugState>();
         ui.checkbox(&mut state.visible, "Show chunk boxes");
     }
-    ui.separator();
-    {
-        // Diagnostic: bypass the async/incremental bake + partial upload, rebuilding the
-        // whole atlas synchronously each change. If a visual bug disappears here, it lives
-        // in the async path.
-        let mut sync = world.resource_mut::<super::SyncBakeMode>();
-        ui.checkbox(&mut sync.0, "Sync bake (no async)");
-    }
 }
 
 // --- Wireframe bounds ---
@@ -640,6 +652,12 @@ fn draw_bounds(
 // --- Panels ---
 
 fn atlas_panel(world: &mut World, ui: &mut egui::Ui) {
+    // Mark the panel visible this frame so `update_atlas_textures` rebuilds the preview (it
+    // skips the ~2.8ms rebuild when the panel is closed). egui_dock only calls this closure
+    // for a visible tab, so reaching here == the panel is on screen.
+    let frame = world.resource::<bevy::diagnostic::FrameCount>().0 as u64;
+    world.resource_mut::<SdfAtlasTextures>().panel_seen_frame = frame;
+
     let stats = world.resource::<SdfAtlasStats>();
     ui.label(format!("Bricks: {}", stats.total_bricks));
     ui.label(format!(

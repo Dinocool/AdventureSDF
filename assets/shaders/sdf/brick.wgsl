@@ -85,11 +85,16 @@ fn key_cmp(a_hi: u32, a_lo: u32, b_hi: u32, b_lo: u32) -> i32 {
 }
 
 // Find the chunk table index whose key matches (key_hi,key_lo), or -1 if absent.
-// `count` = camera.grid_dims.w (resident chunk count). Normally a binary search over the
-// sorted table; SDF_LINEAR_CHUNK_SEARCH forces a brute-force linear scan (diagnostic — if
-// that fixes a bug, the cause is the binary search / table sortedness / the count bound).
+// `count` = `arrayLength(&chunk_buf)`, the actual length of the bound lookup buffer — NOT
+// `camera.grid_dims.w`. The uniform bound and the lookup buffer are uploaded through separate
+// paths (per-frame uniform vs topology-gated buffer rebuild) and could land a frame apart, so
+// a topology-change frame searched a stale table with a fresh, smaller bound → indices 0..count
+// pointed at the WRONG (old) chunks → a band of geometry resolved to wrong/empty tiles (the
+// 1-frame "chunk of the object missing" flicker). Reading the buffer's own length makes the
+// bound consistent with its contents by construction. SDF_LINEAR_CHUNK_SEARCH forces a
+// brute-force linear scan (diagnostic).
 fn find_chunk(key_hi: u32, key_lo: u32) -> i32 {
-    let count = i32(camera.grid_dims.w);
+    let count = i32(arrayLength(&chunk_buf));
 #ifdef SDF_LINEAR_CHUNK_SEARCH
     for (var i: i32 = 0; i < count; i = i + 1) {
         let e = chunk_buf[u32(i)];
@@ -146,7 +151,7 @@ fn brick_in_chunk(chunk: ChunkLookup, coord: vec3<i32>) -> BrickLocation {
 // Resolve the baked brick at `coord` on LOD `lod` via its chunk: find the chunk, then test
 // the occupancy bit / index the tile run via `brick_in_chunk`.
 fn find_brick_lookup(coord: vec3<i32>, lod: u32) -> BrickLocation {
-    let count = u32(camera.grid_dims.w);
+    let count = arrayLength(&chunk_buf);   // buffer's own length, not the (possibly stale) uniform bound
     if (count == 0u) {
         return BrickLocation(0u, vec4<u32>(PALETTE_EMPTY), false);
     }
@@ -441,7 +446,7 @@ fn resolve_march(p: vec3<f32>, cache: ptr<function, ChunkCache>) -> MarchSample 
 #else
     let levels = lod_count();
 #endif
-    let count = u32(camera.grid_dims.w);
+    let count = arrayLength(&chunk_buf);   // buffer's own length, not the (possibly stale) uniform bound
     var window_lod = levels - 1u;
     var has_window = false;
 
@@ -464,6 +469,36 @@ fn resolve_march(p: vec3<f32>, cache: ptr<function, ChunkCache>) -> MarchSample 
         }
     }
     return MarchSample(1e10, false, window_lod, 0u, 0u, vec4<u32>(PALETTE_EMPTY));
+}
+
+// Sample the conservative field at an ABSOLUTE target LOD, degrading to COARSER only.
+//
+// Unlike `resolve_march` (which serves the finest occupied LOD, so a finer occupancy
+// ISLAND shows through inside a coarser region), this samples exactly `target` if it is
+// occupied, else walks COARSER (target+1, target+2, …) until an occupied brick is found.
+// It NEVER returns a finer-than-target sample. That is the whole point: the LOD cross-fade
+// drives `target` purely from camera DISTANCE (continuous in screen space), so the level
+// being sampled no longer depends on which LOD `resolve_march` happened to find occupied —
+// killing the served-LOD-flip weight discontinuity that caused the hard blend seam. `found`
+// is false only in genuine empty space (no LOD has a brick at `p`). Uses the per-ray cache.
+fn sample_level_at_or_coarser(p: vec3<f32>, target_lod: u32, cache: ptr<function, ChunkCache>) -> MarchSample {
+    let levels = lod_count();
+    if (target_lod >= levels || arrayLength(&chunk_buf) == 0u) {
+        return MarchSample(1e10, false, levels - 1u, 0u, 0u, vec4<u32>(PALETTE_EMPTY));
+    }
+    for (var lod = target_lod; lod < levels; lod = lod + 1u) {
+        let coord = world_to_brick_lod(p, lod);
+        let key = abs_chunk_key(coord, lod);
+        let ci = find_chunk_cached(lod, key.x, key.y, cache);
+        if (ci >= 0) {
+            let loc = brick_in_chunk(chunk_buf[u32(ci)], coord);
+            if (loc.found) {
+                let d = sample_brick_sdf(loc.atlas_base, p, lod);
+                return MarchSample(d, true, lod, lod, loc.atlas_base, loc.palette);
+            }
+        }
+    }
+    return MarchSample(1e10, false, levels - 1u, 0u, 0u, vec4<u32>(PALETTE_EMPTY));
 }
 
 // Distance along the ray to the far side of the brick containing `p`, at LOD `lod`.
