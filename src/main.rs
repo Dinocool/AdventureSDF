@@ -40,6 +40,7 @@ fn main() {
     .add_plugins(RemotePlugin::default())
     .add_plugins(BrpExtrasPlugin)
     .add_plugins(WireframePlugin::default())
+    .add_plugins(adventure::node::NodePlugin)
     .add_plugins(adventure::scene_manager::SceneManagerPlugin)
     .add_plugins(adventure::soul_scene::SoulScenePlugin)
     .add_plugins(adventure::assets::AssetsPlugin)

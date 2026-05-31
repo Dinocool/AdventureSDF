@@ -63,22 +63,43 @@ fn instantiate(
     let text = std::fs::read_to_string(path).map_err(|e| SceneLoadError::Io(e.to_string()))?;
     let file = SceneFile::from_ron(&text).map_err(|e| SceneLoadError::Parse(e.to_string()))?;
 
+    // First pass: spawn every record, recording its `LocalId` -> spawned entity so the
+    // second pass can resolve serialized parent ids into live `ChildOf` links.
     let mut roots = Vec::new();
+    let mut by_local: HashMap<u64, Entity> = HashMap::new();
+    let mut parent_links: Vec<(Entity, u64)> = Vec::new();
     for record in &file.records {
-        match record {
-            SceneRecord::Entity { id, components } => {
+        let entity = match record {
+            SceneRecord::Entity { id, components, .. } => {
                 let entity = world.spawn((SceneEntity, *id)).id();
                 apply_components(world, entity, components, registry);
-                roots.push(entity);
+                entity
             }
             SceneRecord::Instance {
                 id,
                 source,
                 overrides,
-            } => {
-                let root = instantiate_nested(world, id, source, overrides, registry, stack)?;
-                roots.push(root);
+                ..
+            } => instantiate_nested(world, id, source, overrides, registry, stack)?,
+        };
+        by_local.insert(record.id().0, entity);
+        if let Some(parent) = record.parent() {
+            parent_links.push((entity, parent));
+        }
+        roots.push(entity);
+    }
+
+    // Second pass: wire parent/child links. Bevy auto-builds `Children` from `ChildOf`.
+    for (child, parent_local) in parent_links {
+        match by_local.get(&parent_local) {
+            Some(&parent) => {
+                world.entity_mut(child).insert(ChildOf(parent));
             }
+            None => warn!(
+                "scene load: record references parent LocalId {parent_local} not found \
+                 in {} — leaving as root",
+                path.display()
+            ),
         }
     }
 

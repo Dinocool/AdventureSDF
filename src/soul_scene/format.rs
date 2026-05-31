@@ -31,6 +31,12 @@ pub enum SceneRecord {
     /// A locally-authored entity and its components.
     Entity {
         id: LocalId,
+        /// `LocalId` of this entity's parent node, if any. The on-disk hierarchy link
+        /// (Bevy's `ChildOf` holds a raw `Entity`, which isn't stable across re-save,
+        /// so we serialize the stable parent id instead). `#[serde(default)]` keeps
+        /// pre-hierarchy `.scene` files loadable.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        parent: Option<u64>,
         components: ComponentMap,
     },
     /// An instance of another `.scene`, with per-sub-entity component overrides.
@@ -38,6 +44,8 @@ pub enum SceneRecord {
     /// subset of components whose values differ from the source.
     Instance {
         id: LocalId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        parent: Option<u64>,
         source: PathBuf,
         overrides: BTreeMap<u64, ComponentMap>,
     },
@@ -47,6 +55,12 @@ impl SceneRecord {
     pub fn id(&self) -> LocalId {
         match self {
             SceneRecord::Entity { id, .. } | SceneRecord::Instance { id, .. } => *id,
+        }
+    }
+
+    pub fn parent(&self) -> Option<u64> {
+        match self {
+            SceneRecord::Entity { parent, .. } | SceneRecord::Instance { parent, .. } => *parent,
         }
     }
 }

@@ -873,33 +873,24 @@ fn bvh_panel(world: &mut World, ui: &mut egui::Ui) {
 /// "add a node to the scene" primitive — used by the Scene panel's `+` button.
 /// Spawning changes the edit set, so `schedule_bakes` re-dirties the affected chunks.
 pub fn spawn_default_sdf(world: &mut World) -> Entity {
+    spawn_sdf_primitive(world, SdfPrimitive::Sphere { radius: 0.5 })
+}
+
+/// Spawn an SDF volume of a specific primitive shape (Union, fresh material, scattered
+/// near the orbit target). Shared by the Scene panel's `+` button and the Create Node
+/// dialog. Returns the new entity; the caller may reparent it.
+pub fn spawn_sdf_primitive(world: &mut World, prim: SdfPrimitive) -> Entity {
     let target = world.resource::<SdfOrbitCamera>().target;
     let pos = target + random_spawn_offset();
-    let next_order = world
-        .query_filtered::<&SdfOrder, With<SdfVolume>>()
-        .iter(world)
-        .map(|o| o.0)
-        .max()
-        .map(|m| m + 1)
-        .unwrap_or(0);
-
-    // Fresh registry material with a distinct palette colour.
-    let registry_id = {
-        let mut reg = world.resource_mut::<super::edits::MaterialRegistry>();
-        let id = reg.defs.len() as u32;
-        reg.defs.push(super::edits::MaterialDef {
-            base_color: spawn_color(id as usize),
-            blend_softness: 0.0,
-            ..Default::default()
-        });
-        id
-    };
+    let next_order = next_sdf_order(world);
+    let registry_id = fresh_sdf_material(world);
+    let label = sdf_primitive_label(&prim);
 
     world
         .spawn((
-            Name::new(format!("Sphere {next_order}")),
+            Name::new(format!("{label} {next_order}")),
             Transform::from_translation(pos),
-            SdfPrimitive::Sphere { radius: 0.5 },
+            prim,
             SdfOp {
                 kind: CsgKind::Union,
                 smoothing: 0.0,
@@ -910,6 +901,76 @@ pub fn spawn_default_sdf(world: &mut World) -> Entity {
             SceneEntity,
         ))
         .id()
+}
+
+/// The next free `SdfOrder` value (max existing + 1, else 0).
+pub fn next_sdf_order(world: &mut World) -> u32 {
+    world
+        .query_filtered::<&SdfOrder, With<SdfVolume>>()
+        .iter(world)
+        .map(|o| o.0)
+        .max()
+        .map(|m| m + 1)
+        .unwrap_or(0)
+}
+
+/// Push a fresh material slot with a distinct palette colour and return its registry id.
+pub fn fresh_sdf_material(world: &mut World) -> u32 {
+    let mut reg = world.resource_mut::<super::edits::MaterialRegistry>();
+    let id = reg.defs.len() as u32;
+    reg.defs.push(super::edits::MaterialDef {
+        base_color: spawn_color(id as usize),
+        blend_softness: 0.0,
+        ..Default::default()
+    });
+    id
+}
+
+/// Spawn a directional light node near the orbit target, with its editor gizmo so it
+/// is locatable/orientable in the viewport. Returns the new entity.
+pub fn spawn_directional_light(world: &mut World) -> Entity {
+    let pos = world.resource::<SdfOrbitCamera>().target + Vec3::Y * 3.0;
+    world
+        .spawn((
+            Name::new("Directional Light"),
+            DirectionalLight {
+                illuminance: 10000.0,
+                shadows_enabled: false,
+                ..default()
+            },
+            Transform::from_translation(pos).with_rotation(Quat::from_rotation_x(-0.5)),
+            crate::node::Node3D,
+            crate::node::EditorGizmo::DirectionalLight { scale: 1.0 },
+            SceneEntity,
+        ))
+        .id()
+}
+
+/// Spawn an empty `Node3D` (a transform-only grouping/locator node) at the orbit
+/// target, with an axes gizmo so it is visible. Returns the new entity.
+pub fn spawn_empty_node(world: &mut World) -> Entity {
+    let pos = world.resource::<SdfOrbitCamera>().target;
+    world
+        .spawn((
+            Name::new("Node3D"),
+            Transform::from_translation(pos),
+            crate::node::Node3D,
+            crate::node::EditorGizmo::Axes { scale: 0.5 },
+            SceneEntity,
+        ))
+        .id()
+}
+
+/// Human-readable shape name for a primitive (used in default node names).
+fn sdf_primitive_label(prim: &SdfPrimitive) -> &'static str {
+    match prim {
+        SdfPrimitive::Sphere { .. } => "Sphere",
+        SdfPrimitive::Box { .. } => "Box",
+        SdfPrimitive::Torus { .. } => "Torus",
+        SdfPrimitive::Capsule { .. } => "Capsule",
+        SdfPrimitive::Cylinder { .. } => "Cylinder",
+        SdfPrimitive::Heightmap { .. } => "Heightmap",
+    }
 }
 
 /// A distinct spawn colour per material slot (golden-ratio hue), matching the
