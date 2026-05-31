@@ -16,6 +16,8 @@ struct SdfCameraUniform {
     debug_params: vec4<f32>,   // x = max_steps, y = max_dist, z = sdf_eps, w = recenter_snap_chunks
     march_params: vec4<f32>,   // x = pixel_cone (world radius/unit-dist/pixel), y = cubic_band, z = over_relax, w = lod_blend_band
     lod_params: vec4<f32>,     // x = lod_count, y = ring_bricks, z = base voxel_size, w = cell_stride
+    sun_dir: vec4<f32>,        // xyz = direction toward the key light; w unused
+    sun_color: vec4<f32>,      // rgb = key-light radiance; w unused
 };
 
 // One material row, indexed by global material id. Mirrors `GpuSdfMaterial`
