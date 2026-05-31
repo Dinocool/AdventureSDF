@@ -15,7 +15,7 @@ use std::sync::Arc;
 use bevy::prelude::*;
 use bevy::tasks::{AsyncComputeTaskPool, Task, block_on, poll_once};
 
-use super::atlas::{self, ATLAS_TILES_PER_ROW, SdfAtlas};
+use super::atlas::{self, SdfAtlas};
 use super::chunk;
 use super::{
     BakeBackend, SdfCamera, SdfGridConfig, SdfMaterial, SdfOp, SdfPrimitive, SdfVolume,
@@ -55,14 +55,12 @@ pub struct GpuBakeJob {
 }
 
 /// Main-world hand-off for the GPU brick bake: this frame's jobs plus the flat edit list
-/// they index. Filled by `schedule_bakes`/`apply_bakes` in [`BakeBackend::Gpu`] mode and
-/// drained by the render-world extract. `atlas_rows` is how many tile rows the atlas spans
-/// this frame so the render world can size the destination/scratch consistently.
+/// they index. Filled by `schedule_bakes` in [`BakeBackend::Gpu`] mode and drained by the
+/// render-world extract.
 #[derive(Resource, Default)]
 pub struct PendingGpuBakes {
     pub jobs: Vec<GpuBakeJob>,
     pub edits: Vec<edits::GpuEdit>,
-    pub atlas_rows: u32,
 }
 
 impl PendingGpuBakes {
@@ -126,12 +124,6 @@ pub struct BakeScheduler {
     pending: std::collections::HashSet<chunk::ChunkKey>,
     /// Tasks currently baking.
     inflight: Vec<BakeJob>,
-    /// (GPU bake mode) How many atlas tile rows the render world has committed to the GPU
-    /// atlas texture. When `high_water` pushes `required_rows` past this, the render world
-    /// reallocs (recreates + zero-fills) the texture, dropping every GPU-written tile — so
-    /// on that frame we must re-emit the WHOLE resident set as bake jobs, not just the
-    /// dirty shell. Mirrors `AtlasCapacity::rows` in render.rs from the main world.
-    gpu_atlas_rows: u32,
 }
 
 impl Default for BakeScheduler {
@@ -144,7 +136,6 @@ impl Default for BakeScheduler {
             ring_chunk_origin: Vec::new(),
             pending: std::collections::HashSet::new(),
             inflight: Vec::new(),
-            gpu_atlas_rows: 0,
         }
     }
 }
@@ -174,6 +165,16 @@ const BAKE_CHUNKS_PER_TASK: usize = 2;
 /// and drain over the next frames, refining in. Coarser LODs already cover the not-yet-
 /// baked region, so the delay shows as coarse-correct terrain, never a hole.
 const SCHEDULE_BUDGET_CHUNKS: usize = 64;
+
+/// (GPU bake mode) Max brick bake JOBS emitted to the GPU per frame. Each job writes its
+/// brick's texels into two storage buffers sized `jobs × tile`; the material buffer
+/// dominates at `1024 u32 × 4 B = 4096 B/job`, so the GPU's `maxStorageBufferBindingSize`
+/// (128 MB default) caps us at ~32768 jobs. 16384 leaves headroom (64 MB mat + 32 MB dist)
+/// and is a clean 256×64 dispatch grid. A single huge edit can dirty 70k+ bricks; the
+/// overflow spills back to `pending` and bakes over the next frames (coarse LOD covers the
+/// gap meanwhile — see `emit_gpu_bakes`). Without this cap a giant edit overflows the buffer
+/// binding and wgpu aborts the frame.
+const GPU_BAKE_JOB_CAP: usize = 16384;
 
 /// Any component that affects an edit's baked result. A change to one of these
 /// triggers a targeted rebake of the bricks the edit touches. Exposed as
@@ -572,71 +573,64 @@ fn emit_gpu_bakes(
         atlas.gpu_baked_tiles.insert(tile);
     }
 
-    // Dirty shell: cull → build palette → allocate tile → emit job, all from ONE cull. The
-    // palette uses the cheap 9-point sample (corners + centre), not all 512 voxels — that 57×
-    // cut is what keeps a drag (hundreds of dirty bricks/frame) off the CPU. Empty bricks are
-    // evicted.
+    // Drain ALL pending each frame and EVICT empties immediately (no per-frame eviction
+    // budget). When an edit moves it dirties its old∪new footprint; the vacated chunks MUST
+    // be evicted the same frame or their stale bricks linger as a trail behind the dragged
+    // object (the "parts left behind" artifact). Eviction is CPU-only (`remove_brick`, no GPU
+    // job), so it's always cheap and always immediate.
     //
-    // Drain ALL pending each frame (no per-frame budget). The budget exists for the CPU bake
-    // path to bound the main-thread voxel-loop cost, but in GPU mode the CPU only culls +
-    // builds a 9-point palette + emits a job (the GPU does the eval), so the per-chunk cost is
-    // tiny. Critically, budgeting here is also a *correctness* bug: when an edit moves it
-    // dirties its old∪new footprint, and the vacated (old) chunks MUST be evicted the same
-    // frame or their stale bricks linger as a trail behind the dragged object. The nearest-
-    // camera-first budget starved those trailing chunks whenever a drag dirtied >budget chunks
-    // — the "parts left behind" artifact. Draining everything evicts vacated bricks immediately.
-    let drained: Vec<chunk::ChunkKey> = sched.pending.drain().collect();
-    let mut dirtied: std::collections::HashSet<atlas::BrickKey> = std::collections::HashSet::new();
+    // BAKE emission, by contrast, is capped: each bake job writes into GPU storage buffers
+    // sized `jobs × tile`, and a huge edit (70k+ bricks) would overflow the 128 MB buffer
+    // binding and abort the frame. So we emit at most `GPU_BAKE_JOB_CAP` jobs; the rest spill
+    // back to `pending` and bake over the next frames.
+    //
+    // Two invariants keep the cap hole-free:
+    //  1. A spilled brick is NOT inserted into the atlas (stays non-resident) — the shader's
+    //     chunk lookup misses it and falls back to the coarser LOD, which IS baked. (Inserting
+    //     it would expose a resident tile with un-baked zero texels: worse than a hole.)
+    //  2. Coarse LODs emit before fine (sort dirty chunks by DESCENDING lod). Coarse rings
+    //     have ~8× fewer bricks per level, so they always fit; if the cap is hit it only ever
+    //     spills the finest detail, whose coarse fallback is already resident this frame.
+    let mut drained: Vec<chunk::ChunkKey> = sched.pending.drain().collect();
+    drained.sort_unstable_by_key(|ck| std::cmp::Reverse(ck.lod)); // coarsest (highest lod) first
+    let mut spilled: Vec<chunk::ChunkKey> = Vec::new();
     for ck in &drained {
+        let mut chunk_spilled = false;
         for key in chunk_brick_keys(*ck, config) {
             if atlas::SdfAtlas::cull_edit_indices(key, &bvh_snapshot, config, &mut scratch).is_some()
             {
+                // Over the per-frame job cap → defer this brick's BAKE. Do NOT insert it
+                // (must stay non-resident → coarse-LOD fallback). The chunk is re-queued.
+                if gpu_bakes.jobs.len() >= GPU_BAKE_JOB_CAP {
+                    chunk_spilled = true;
+                    continue;
+                }
                 let voxel_size = config.voxel_size_at(key.lod);
                 let samples = atlas::SdfAtlas::brick_palette_samples(key, voxel_size);
                 let culled: Vec<edits::ResolvedEdit> =
                     scratch.iter().map(|&i| edits_snapshot[i as usize].clone()).collect();
                 let palette = edits::build_palette(&culled, &samples);
                 let tile = atlas.insert_gpu_brick(key, palette);
-                dirtied.insert(key);
                 push_job(
                     atlas, gpu_bakes, &edits_snapshot, config, key, tile, &scratch, palette,
                 );
             } else {
+                // Empty space → evict immediately (no job, no trail).
                 atlas.remove_brick(&key);
             }
         }
-    }
-
-    // Did the atlas grow taller? If so the render world recreates + zero-fills the texture
-    // this frame, dropping every GPU-written tile — so we must additionally re-emit the
-    // resident bricks that AREN'T in this frame's dirty set, reusing their stored palette
-    // (no rebuild). Keyed purely on row growth (self-clearing); do NOT read back
-    // `last_bake_was_full`, which this function writes — that would latch a permanent
-    // every-frame re-emit (the constant-FPS bug).
-    let required_rows = atlas.tiles.high_water().div_ceil(ATLAS_TILES_PER_ROW).max(1);
-    let realloc = required_rows > sched.gpu_atlas_rows;
-    if realloc {
-        let resident: Vec<(atlas::BrickKey, u32, edits::Palette)> = atlas
-            .bricks
-            .iter()
-            .filter(|(k, _)| !dirtied.contains(k))
-            .filter_map(|(k, b)| atlas.tiles.tile(k).map(|t| (*k, t, b.palette)))
-            .collect();
-        for (key, tile, palette) in resident {
-            // Re-emit reuses the stored palette but still needs the culled edit list.
-            if atlas::SdfAtlas::cull_edit_indices(key, &bvh_snapshot, config, &mut scratch).is_some()
-            {
-                push_job(
-                    atlas, gpu_bakes, &edits_snapshot, config, key, tile, &scratch, palette,
-                );
-            }
+        if chunk_spilled {
+            spilled.push(*ck);
         }
-        atlas.last_bake_was_full = true; // signal the render world to recreate the texture
-        sched.gpu_atlas_rows = required_rows;
-    } else {
-        atlas.last_bake_was_full = false;
     }
-    gpu_bakes.atlas_rows = required_rows;
+    // Re-queue spilled chunks for the next frame(s). Their evictions already happened above;
+    // only their deferred bakes retry. The atlas grows naturally as the spill drains, and the
+    // render world preserves existing texels across the grow (see `prepare_sdf_atlas_gpu`), so
+    // no re-emit of the already-baked set is needed.
+    for ck in spilled {
+        sched.pending.insert(ck);
+    }
+    atlas.last_bake_was_full = false;
 }
 
 /// Main-thread, non-blocking drain of finished bake tasks. Inserts baked bricks (per-brick
@@ -859,6 +853,129 @@ mod tests {
             op: SdfOp { kind: CsgKind::Union, smoothing: 0.0 },
             material_id: mat,
         }
+    }
+
+    /// A scheduler primed with `edits` + their BVH, as `schedule_bakes` would leave it after
+    /// the edit-change step — so `emit_gpu_bakes` can be driven directly in a test.
+    fn primed_sched(edits: &[ResolvedEdit]) -> BakeScheduler {
+        BakeScheduler {
+            edits: Arc::new(edits.to_vec()),
+            bvh: Arc::new(build_bvh(edits)),
+            ..BakeScheduler::default()
+        }
+    }
+
+    /// `emit_gpu_bakes` never emits more than `GPU_BAKE_JOB_CAP` jobs in one frame, and the
+    /// dirty chunks whose bricks didn't fit are spilled back to `pending` for the next frame.
+    #[test]
+    fn gpu_emit_caps_jobs_and_spills_overflow() {
+        let cfg = SdfGridConfig { lod_count: 1, ring_bricks: 8, recenter_snap_chunks: 1, ..config() };
+        // One big edit covering a wide region so many chunks are dirty and non-empty.
+        let edits = vec![box_edit(Vec3::ZERO, 40.0, 0)];
+        let mut sched = primed_sched(&edits);
+        let mut atlas = SdfAtlas::default();
+        let mut gpu = PendingGpuBakes::default();
+
+        // Dirty far more chunks than the cap can bake in one frame: each chunk = 64 bricks,
+        // so 512 chunks ≈ 32768 candidate bricks > GPU_BAKE_JOB_CAP (16384).
+        for x in 0..8 {
+            for y in 0..8 {
+                for z in 0..8 {
+                    sched.pending.insert(chunk::ChunkKey::new(0, IVec3::new(x, y, z)));
+                }
+            }
+        }
+
+        emit_gpu_bakes(&mut atlas, &mut sched, &mut gpu, &cfg);
+
+        assert!(
+            gpu.jobs.len() <= GPU_BAKE_JOB_CAP,
+            "emitted {} jobs, over the cap {}",
+            gpu.jobs.len(),
+            GPU_BAKE_JOB_CAP
+        );
+        assert!(
+            !sched.pending.is_empty(),
+            "overflow chunks must spill back to pending for the next frame"
+        );
+        // Every emitted job corresponds to a resident brick (so the shader can read it).
+        assert_eq!(
+            gpu.jobs.len(),
+            atlas.bricks.len(),
+            "resident brick count must equal the emitted job count (no half-inserted bricks)"
+        );
+    }
+
+    /// A spilled brick must NOT be inserted into the atlas — it stays non-resident so the
+    /// shader falls back to the coarser LOD. Conversely, empty bricks are evicted even on a
+    /// capped frame. Here: resident bricks == emitted jobs, and the spill is purely deferred.
+    #[test]
+    fn gpu_emit_spilled_bricks_stay_non_resident() {
+        let cfg = SdfGridConfig { lod_count: 1, ring_bricks: 8, recenter_snap_chunks: 1, ..config() };
+        let edits = vec![box_edit(Vec3::ZERO, 40.0, 0)];
+        let mut sched = primed_sched(&edits);
+        let mut atlas = SdfAtlas::default();
+        let mut gpu = PendingGpuBakes::default();
+        for x in 0..8 {
+            for y in 0..8 {
+                for z in 0..8 {
+                    sched.pending.insert(chunk::ChunkKey::new(0, IVec3::new(x, y, z)));
+                }
+            }
+        }
+
+        emit_gpu_bakes(&mut atlas, &mut sched, &mut gpu, &cfg);
+
+        // No brick is resident without a corresponding job this frame: a capped (spilled)
+        // brick is never inserted, so the atlas never exposes an un-baked (zero) tile.
+        assert_eq!(atlas.bricks.len(), gpu.jobs.len());
+        assert!(atlas.bricks.len() <= GPU_BAKE_JOB_CAP);
+
+        // Draining the spill over subsequent frames eventually bakes everything (no chunk is
+        // dropped). Run until pending empties; the resident set grows monotonically.
+        let mut guard = 0;
+        let mut last = atlas.bricks.len();
+        while !sched.pending.is_empty() {
+            gpu.jobs.clear();
+            gpu.edits.clear();
+            atlas.gpu_baked_tiles.clear();
+            emit_gpu_bakes(&mut atlas, &mut sched, &mut gpu, &cfg);
+            assert!(atlas.bricks.len() >= last, "resident set must not shrink while draining spill");
+            last = atlas.bricks.len();
+            guard += 1;
+            assert!(guard < 100, "spill drain did not converge");
+        }
+        assert!(atlas.bricks.len() > GPU_BAKE_JOB_CAP, "all dirty bricks eventually resident");
+    }
+
+    /// Empty-space bricks are evicted the same frame even under the job cap (eviction is
+    /// CPU-only, never spilled) — the fix for the drag trail must survive the cap.
+    #[test]
+    fn gpu_emit_evicts_empties_under_cap() {
+        let cfg = SdfGridConfig { lod_count: 1, ring_bricks: 8, recenter_snap_chunks: 1, ..config() };
+        // Small edit at the origin; most chunks are empty space.
+        let edits = vec![box_edit(Vec3::ZERO, 0.5, 0)];
+        let mut sched = primed_sched(&edits);
+        let mut atlas = SdfAtlas::default();
+        let mut gpu = PendingGpuBakes::default();
+
+        // Pre-populate a far brick as if it were resident from a previous position, then dirty
+        // its chunk: the edit doesn't reach it, so it must be evicted this frame. Use a real
+        // brick key from the chunk's enumeration so it's stride-aligned (chunk_brick_keys must
+        // actually visit it).
+        let far_chunk = chunk::ChunkKey::new(0, IVec3::new(100, 0, 0));
+        let far = chunk_brick_keys(far_chunk, &cfg)[0];
+        atlas.insert_gpu_brick(far, [edits::PALETTE_EMPTY; edits::PALETTE_K]);
+        assert!(atlas.bricks.contains_key(&far));
+        sched.pending.insert(far_chunk);
+        sched.pending.insert(chunk::ChunkKey::new(0, IVec3::ZERO));
+
+        emit_gpu_bakes(&mut atlas, &mut sched, &mut gpu, &cfg);
+
+        assert!(
+            !atlas.bricks.contains_key(&far),
+            "a now-empty brick must be evicted, not left as a trail"
+        );
     }
 
     /// The headline correctness guarantee for reviving the async path: drive the camera

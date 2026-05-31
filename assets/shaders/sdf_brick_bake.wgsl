@@ -232,9 +232,14 @@ fn material_slots(h: JobHeader, pos: vec3<f32>) -> vec4<f32> {
     return slots;
 }
 
+// Width of the 2D workgroup dispatch grid. One workgroup per brick job; the dispatch is laid
+// out 2D so the job count can exceed the 65535 single-dimension limit. MUST match
+// `BAKE_DISPATCH_WIDTH` in render.rs.
+const DISPATCH_WIDTH: u32 = 256u;
+
 @compute @workgroup_size(4, 8, 1)
 fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
-    let job = wid.x;
+    let job = wid.y * DISPATCH_WIDTH + wid.x;
     if (job >= arrayLength(&headers)) { return; }
     let h = headers[job];
 

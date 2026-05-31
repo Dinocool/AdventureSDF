@@ -130,6 +130,12 @@ struct ExtractedSdfAtlas {
     /// Recreate the textures + views (full rebuild or capacity grow). When false,
     /// `prepare` keeps the existing textures and only `write_texture`s `changed_tiles`.
     realloc: bool,
+    /// Realloc sub-mode: a GPU-bake GROW (taller texture, but existing texels must survive).
+    /// `prepare` recreates the textures at the new height and `copy_texture_to_texture`s the
+    /// old content in, instead of uploading `dist_data`/`mat_data` (which are zero in GPU
+    /// mode — the GPU owns those texels). The genuinely-new tiles are filled by the bake node
+    /// this same frame. False ⇒ the realloc is a full CPU rebuild that uploads the buffers.
+    preserve_grow: bool,
     dirty: bool,
 }
 
@@ -286,6 +292,14 @@ struct SdfConeShaderHandle(Handle<Shader>);
 struct SdfBakeShaderHandle(Handle<Shader>);
 
 // --- GPU brick bake (compute) ---
+
+/// Width of the 2D bake dispatch grid in workgroups. The compute dispatch uses one workgroup
+/// per brick job; a single dimension caps at 65535 (wgpu/Vulkan limit), which a large edit can
+/// blow past (a big sphere dirties 70k+ bricks). So we lay the jobs out in a 2D grid of this
+/// width and reconstruct the linear job index in the shader as `wg.y * DISPATCH_WIDTH + wg.x`.
+/// 256² = 65536 jobs per "page"; the Y extent then carries the rest, well under the limit.
+/// Must match `DISPATCH_WIDTH` in sdf_brick_bake.wgsl.
+const BAKE_DISPATCH_WIDTH: u32 = 256;
 
 /// u32s per distance tile in the bake output buffer. Each tile is 64×8 R16 texels = 512
 /// texels = 256 u32 (two R16 packed per u32), but rows are padded to 64 u32 so each tile row
@@ -880,6 +894,7 @@ fn pack_tile_texels(packed: &super::atlas::PackedBrick) -> (Vec<i16>, Vec<i16>) 
 fn extract_sdf_atlas(
     atlas: Extract<Res<SdfAtlas>>,
     config: Extract<Res<SdfGridConfig>>,
+    backend: Extract<Res<super::BakeBackend>>,
     mut last_gen: ResMut<LastAtlasGen>,
     mut last_topology: ResMut<LastAtlasTopology>,
     mut capacity: ResMut<AtlasCapacity>,
@@ -911,7 +926,16 @@ fn extract_sdf_atlas(
 
     // Realloc when a full bake happened or the atlas must grow taller. The texture
     // never shrinks except on a full bake, so a tile origin stays valid until then.
-    let realloc = atlas.last_bake_was_full || required_rows > capacity.rows;
+    let grow = required_rows > capacity.rows;
+    let realloc = atlas.last_bake_was_full || grow;
+
+    // A GPU-bake GROW (taller, but not a full rebuild) must PRESERVE existing texels — the
+    // CPU `packed.dist`/`mat_dist` are zero placeholders in GPU mode, so re-uploading them
+    // would wipe the GPU-written atlas. `prepare` instead copies the old texture into the
+    // taller new one and lets the bake node fill the genuinely-new tiles this frame. A full
+    // rebuild (`last_bake_was_full`: F9 switch / first bake) still uploads the CPU buffers.
+    let gpu_mode = matches!(**backend, super::BakeBackend::Gpu);
+    let preserve_grow = realloc && gpu_mode && !atlas.last_bake_was_full;
 
     // The chunk lookup / tile-run tables only need rebuilding when the atlas topology
     // changed (a brick entered/exited, or a palette changed) or on a realloc. A frame
@@ -964,6 +988,26 @@ fn extract_sdf_atlas(
 
     if realloc {
         capacity.rows = required_rows;
+
+        // GPU-bake grow: don't repack CPU texels (they're zero placeholders). `prepare`
+        // copies the old texture into the taller new one; the bake node fills new tiles.
+        if preserve_grow {
+            commands.insert_resource(ExtractedSdfAtlas {
+                dist_data: Vec::new(),
+                mat_data: Vec::new(),
+                changed_tiles: Vec::new(),
+                chunk_data,
+                tile_run_data,
+                tables_dirty: true,
+                texture_width,
+                texture_height,
+                realloc: true,
+                preserve_grow: true,
+                dirty: true,
+            });
+            return;
+        }
+
         let pixels = (texture_width * texture_height) as usize;
         let mut dist_data = vec![0i16; pixels];
         let mut mat_data = vec![i16::MAX; pixels * 4]; // far sentinel loses the argmin
@@ -991,6 +1035,7 @@ fn extract_sdf_atlas(
             texture_width,
             texture_height,
             realloc: true,
+            preserve_grow: false,
             dirty: true,
         });
         return;
@@ -1024,6 +1069,7 @@ fn extract_sdf_atlas(
         texture_width,
         texture_height,
         realloc: false,
+        preserve_grow: false,
         dirty: true,
     });
 }
@@ -1322,14 +1368,82 @@ fn prepare_sdf_atlas_gpu(
     }
 
     if extracted.realloc {
-        // Full rebuild / grow: recreate both textures sized to the new height and
-        // upload everything. Keep the Texture handles so later partial bakes can
-        // write_texture into them.
+        // Full rebuild / grow: recreate both textures sized to the new height. All atlas
+        // textures carry COPY_SRC so a later GPU-bake grow can copy their content into the
+        // taller replacement (see the preserve_grow branch below). COPY_DST for both the
+        // initial upload and the bake node's per-tile copy_buffer_to_texture.
+        let usage = TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST | TextureUsages::COPY_SRC;
         let size = Extent3d {
             width: extracted.texture_width,
             height: extracted.texture_height,
             depth_or_array_layers: 1,
         };
+
+        // GPU-bake GROW: preserve existing texels. Create empty taller textures and copy the
+        // old (shorter) content in; the bake node fills the new tiles this same frame. The
+        // CPU has no texel data in GPU mode, so we must NOT zero-upload.
+        if extracted.preserve_grow {
+            let (Some(old_dist), Some(old_mat)) = (&gpu_atlas.dist_tex, &gpu_atlas.mat_tex) else {
+                // Nothing to preserve yet (no prior texture) — fall through to a plain
+                // empty allocation below by treating it as a fresh create.
+                return;
+            };
+            let old_h = old_dist.height();
+            let dist_tex = device.create_texture(&TextureDescriptor {
+                label: Some("sdf_dist_atlas"),
+                size,
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: TextureDimension::D2,
+                format: TextureFormat::R16Snorm,
+                usage,
+                view_formats: &[],
+            });
+            let mat_tex = device.create_texture(&TextureDescriptor {
+                label: Some("sdf_mat_atlas"),
+                size,
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: TextureDimension::D2,
+                format: TextureFormat::Rgba16Snorm,
+                usage,
+                view_formats: &[],
+            });
+            // Copy the old content (full width, old height) into the new taller textures.
+            let mut encoder = device.create_command_encoder(&CommandEncoderDescriptor {
+                label: Some("sdf_atlas_grow_copy"),
+            });
+            let copy_extent = Extent3d {
+                width: extracted.texture_width,
+                height: old_h,
+                depth_or_array_layers: 1,
+            };
+            for (src, dst) in [(old_dist, &dist_tex), (old_mat, &mat_tex)] {
+                encoder.copy_texture_to_texture(
+                    TexelCopyTextureInfo {
+                        texture: src,
+                        mip_level: 0,
+                        origin: Origin3d::ZERO,
+                        aspect: TextureAspect::All,
+                    },
+                    TexelCopyTextureInfo {
+                        texture: dst,
+                        mip_level: 0,
+                        origin: Origin3d::ZERO,
+                        aspect: TextureAspect::All,
+                    },
+                    copy_extent,
+                );
+            }
+            queue.submit([encoder.finish()]);
+
+            gpu_atlas.dist_view = Some(dist_tex.create_view(&TextureViewDescriptor::default()));
+            gpu_atlas.mat_view = Some(mat_tex.create_view(&TextureViewDescriptor::default()));
+            gpu_atlas.dist_tex = Some(dist_tex);
+            gpu_atlas.mat_tex = Some(mat_tex);
+            return;
+        }
+
         let mut dist_bytes = Vec::with_capacity(extracted.dist_data.len() * 2);
         for v in &extracted.dist_data {
             dist_bytes.extend_from_slice(&v.to_le_bytes());
@@ -1343,7 +1457,7 @@ fn prepare_sdf_atlas_gpu(
                 sample_count: 1,
                 dimension: TextureDimension::D2,
                 format: TextureFormat::R16Snorm,
-                usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST,
+                usage,
                 view_formats: &[],
             },
             TextureDataOrder::default(),
@@ -1358,7 +1472,7 @@ fn prepare_sdf_atlas_gpu(
                 sample_count: 1,
                 dimension: TextureDimension::D2,
                 format: TextureFormat::Rgba16Snorm,
-                usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST,
+                usage,
                 view_formats: &[],
             },
             TextureDataOrder::default(),
@@ -2081,8 +2195,12 @@ impl Node for SdfBrickBakeNode {
                 });
             pass.set_pipeline(pipeline);
             pass.set_bind_group(0, &bind_group, &[]);
-            // One workgroup per brick job.
-            pass.dispatch_workgroups(buffers.job_count, 1, 1);
+            // One workgroup per brick job, laid out in a 2D grid so the count can exceed the
+            // 65535 single-dimension dispatch limit (a large edit dirties 70k+ bricks). The
+            // shader reconstructs the linear job index from (wg.x, wg.y).
+            let wg_x = buffers.job_count.min(BAKE_DISPATCH_WIDTH);
+            let wg_y = buffers.job_count.div_ceil(BAKE_DISPATCH_WIDTH);
+            pass.dispatch_workgroups(wg_x, wg_y, 1);
         }
 
         // Blit each job's tile from the output buffers into the persistent atlas textures.
