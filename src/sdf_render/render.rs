@@ -69,6 +69,10 @@ struct SdfCameraData {
     march_params: Vec4,
     /// x = lod_count, y = ring_bricks, z = base voxel_size, w = cell_stride.
     lod_params: Vec4,
+    /// xyz = world-space direction toward the key light; w unused.
+    sun_dir: Vec4,
+    /// rgb = key-light radiance; w unused.
+    sun_color: Vec4,
 }
 
 /// GPU mirror of a [`super::edits::MaterialDef`], one per global material id, in a
@@ -649,8 +653,26 @@ fn prepare_sdf_camera_data(
     config: Res<SdfGridConfig>,
     raymarch: Res<super::SdfRaymarchParams>,
     registry: Res<super::edits::MaterialRegistry>,
+    // The active scene's key light, read directly here (this system runs in the MAIN
+    // world, so the light entity is available). Filtered to `SceneEntity` so the editor's
+    // offscreen thumbnail / preview rig lights are excluded.
+    sun_light: Query<(&GlobalTransform, &DirectionalLight), With<crate::scene_manager::SceneEntity>>,
     mut material_table: ResMut<SdfMaterialTable>,
 ) {
+    let sun = sun_light
+        .iter()
+        .next()
+        .map(|(xf, light)| {
+            let forward = xf.rotation() * Vec3::NEG_Z;
+            let c = light.color.to_linear();
+            let intensity = (light.illuminance / 10_000.0).clamp(0.0, 8.0) * 3.0;
+            (
+                (-forward).normalize_or_zero(),
+                Vec3::new(c.red, c.green, c.blue) * intensity,
+            )
+        })
+        // Default sun (matches the old hardcoded constants) when the scene has no light.
+        .unwrap_or((Vec3::new(0.5, 1.0, 0.3).normalize(), Vec3::splat(3.0)));
     // The GPU material table mirrors the global registry verbatim: row i = the
     // material with global id i. Bricks index it by their palette ids. Rebuilt only
     // when the registry changes (it is the single source of truth, not per-volume).
@@ -738,6 +760,8 @@ fn prepare_sdf_camera_data(
                 config.voxel_size,
                 config.cell_stride() as f32,
             ),
+            sun_dir: sun.0.extend(0.0),
+            sun_color: sun.1.extend(0.0),
         });
     }
 }

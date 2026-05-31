@@ -921,13 +921,24 @@ pub fn gather_sorted_edits(volumes: &Query<VolumeQueryData, With<SdfVolume>>) ->
 /// Left-click selects the SDF volume under the cursor (CPU raymarch pick). Runs
 /// after `gizmo_update` in `Last`; if the gizmo claimed the click (a handle was
 /// grabbed), it bails so grabbing a handle doesn't reselect the volume underneath.
+/// Query filter for non-SDF spatial nodes pickable by screen-proximity (lights/empties).
+type GizmoNodeFilter = (
+    With<crate::node::Node3D>,
+    Without<SdfVolume>,
+    Without<SdfCamera>,
+);
+
+#[allow(clippy::too_many_arguments)]
 fn sdf_picking(
     mouse: Res<ButtonInput<MouseButton>>,
     mut selection: ResMut<SdfSelection>,
     gizmo_state: Res<gizmo::GizmoState>,
-    cameras: Query<(&Camera, &Transform), With<SdfCamera>>,
+    cameras: Query<(&Camera, &GlobalTransform, &Transform), With<SdfCamera>>,
     windows: Query<&Window>,
     volumes: Query<VolumeQueryData, With<SdfVolume>>,
+    // Non-SDF spatial nodes (lights, cameras, empties) have no raymarchable geometry, so
+    // they're picked by proximity to their screen-projected origin instead.
+    gizmo_nodes: Query<(Entity, &GlobalTransform), GizmoNodeFilter>,
     bvh: Res<bvh::Bvh>,
 ) {
     if !mouse.just_pressed(MouseButton::Left) || gizmo_state.claimed_click {
@@ -940,15 +951,35 @@ fn sdf_picking(
     let Some(mouse_pos) = window.cursor_position() else {
         return;
     };
-    let Ok((camera, cam_transform)) = cameras.single() else {
+    let Ok((camera, cam_global, cam_transform)) = cameras.single() else {
         return;
     };
     let Some(ray) = picking::mouse_to_ray(camera, cam_transform, window, mouse_pos) else {
         return;
     };
 
+    // 1. Raymarch the SDF volumes (the geometric pick).
     let gathered = gather_sorted_edits(&volumes);
-    selection.entity = picking::pick_entity(&bvh, &ray, &gathered);
+    if let Some(hit) = picking::pick_entity(&bvh, &ray, &gathered) {
+        selection.entity = Some(hit);
+        return;
+    }
+
+    // 2. Fallback: pick a non-SDF node (light/camera/empty) whose screen-projected origin
+    //    is within a small pixel radius of the cursor. Lets the light gizmo be selected.
+    const PICK_RADIUS_PX: f32 = 22.0;
+    let mut best: Option<(f32, Entity)> = None;
+    for (entity, xf) in &gizmo_nodes {
+        if let Ok(screen) = camera.world_to_viewport(cam_global, xf.translation()) {
+            let d = screen.distance(mouse_pos);
+            if d <= PICK_RADIUS_PX && best.is_none_or(|(bd, _)| d < bd) {
+                best = Some((d, entity));
+            }
+        }
+    }
+    // A node hit selects it; a click on truly empty space deselects (matching the prior
+    // raymarch-miss behaviour).
+    selection.entity = best.map(|(_, e)| e);
 }
 
 /// Double-click (within 300ms) on the selected volume eases the orbit camera onto
