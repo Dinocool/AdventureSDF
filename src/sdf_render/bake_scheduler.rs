@@ -297,6 +297,10 @@ pub fn schedule_bakes(
         *bvh = new_bvh.clone();
         sched.bvh = Arc::new(new_bvh);
         sched.edits = Arc::new(resolved);
+        // Any edit change invalidates the per-brick bake cache: every brick baked under the
+        // old epoch folded the old edit set, so its texels may be stale. Bumping forces the
+        // re-dirtied chunks below to actually re-bake (their bricks' `baked_epoch` now lags).
+        atlas.edit_epoch = atlas.edit_epoch.wrapping_add(1);
 
         if atlas.rebake_all || set_changed {
             // Whole set changed → re-dirty every resident-window chunk at each LOD.
@@ -498,9 +502,21 @@ fn emit_gpu_bakes(
     let mut drained: Vec<chunk::ChunkKey> = sched.pending.drain().collect();
     drained.sort_unstable_by_key(|ck| std::cmp::Reverse(ck.lod)); // coarsest (highest lod) first
     let mut spilled: Vec<chunk::ChunkKey> = Vec::new();
+    let epoch = atlas.edit_epoch;
     for ck in &drained {
         let mut chunk_spilled = false;
         for key in chunk_brick_keys(*ck, config) {
+            // Skip a brick already baked under the CURRENT edit epoch: it is resident (so the
+            // GPU holds its texels and the lookup table maps it) and folded the same edits, so
+            // re-culling + re-baking it would be pure waste. This is what makes a large object's
+            // multi-frame bake cheap — each frame only processes the bricks NOT yet baked
+            // (newly entered or spilled-and-not-yet-emitted), instead of re-doing the whole
+            // resident set every frame while the job cap drains. An edit change bumps
+            // `edit_epoch`, lapsing every brick's stamp so the re-dirtied footprint re-bakes;
+            // an evicted/re-entered chunk's bricks were removed, so they re-bake fresh.
+            if atlas.bricks.get(&key).is_some_and(|b| b.baked_epoch == epoch) {
+                continue;
+            }
             if atlas::SdfAtlas::cull_edit_indices(key, &bvh_snapshot, config, &mut scratch).is_some()
             {
                 // Narrow-band cull: bake only the surface SHELL (see `narrow_band_keep`). Drops
@@ -907,6 +923,46 @@ mod tests {
         );
     }
 
+    /// Bake-cache skip: re-emitting an already-baked chunk within the SAME edit epoch produces
+    /// ZERO jobs (the bricks' `baked_epoch` matches → skipped, no re-cull/re-bake), but bumping
+    /// `edit_epoch` (as an edit change does) lapses every stamp so the next emit re-bakes them.
+    /// This is the core of the multi-frame-bake hitch fix: a spilled chunk re-queued each frame
+    /// no longer re-processes the bricks it already baked.
+    #[test]
+    fn gpu_emit_skips_already_baked_within_epoch() {
+        let cfg = SdfGridConfig { lod_count: 1, ring_bricks: 8, recenter_snap_chunks: 1, ..config() };
+        let edits = vec![sphere_edit(Vec3::ZERO, 3.0, 0)];
+        let mut sched = primed_sched(&edits);
+        let mut atlas = SdfAtlas::default();
+        let mut gpu = PendingGpuBakes::default();
+
+        let chunks: Vec<_> = (-2..=2)
+            .flat_map(|x| (-2..=2).flat_map(move |y| (-2..=2).map(move |z| chunk::ChunkKey::new(0, IVec3::new(x, y, z)))))
+            .collect();
+
+        // Frame 1: bake the sphere shell. Some bricks become resident.
+        for ck in &chunks { sched.pending.insert(*ck); }
+        emit_gpu_bakes(&mut atlas, &mut sched, &mut gpu, &cfg);
+        let baked = atlas.bricks.len();
+        assert!(baked > 0, "first emit must bake the shell");
+
+        // Frame 2: same chunks dirtied again, SAME epoch → every brick skipped, no jobs.
+        gpu.clear();
+        atlas.gpu_baked_tiles.clear();
+        for ck in &chunks { sched.pending.insert(*ck); }
+        emit_gpu_bakes(&mut atlas, &mut sched, &mut gpu, &cfg);
+        assert_eq!(gpu.jobs.len(), 0, "re-emit within the same epoch must skip all baked bricks");
+        assert_eq!(atlas.bricks.len(), baked, "resident set unchanged on a pure re-emit");
+
+        // Frame 3: an edit changed → epoch bumps → the same chunks re-bake.
+        atlas.edit_epoch = atlas.edit_epoch.wrapping_add(1);
+        gpu.clear();
+        atlas.gpu_baked_tiles.clear();
+        for ck in &chunks { sched.pending.insert(*ck); }
+        emit_gpu_bakes(&mut atlas, &mut sched, &mut gpu, &cfg);
+        assert_eq!(gpu.jobs.len(), baked, "after an epoch bump every shell brick must re-bake");
+    }
+
     /// Empty-space bricks are evicted the same frame even under the job cap (eviction is
     /// CPU-only, never spilled) — the fix for the drag trail must survive the cap.
     #[test]
@@ -926,6 +982,12 @@ mod tests {
         let far = chunk_brick_keys(far_chunk, &cfg)[0];
         atlas.insert_gpu_brick(far, [edits::PALETTE_EMPTY; edits::PALETTE_K]);
         assert!(atlas.bricks.contains_key(&far));
+        // A brick becomes stale-empty only because an edit MOVED away from it — which in
+        // `schedule_bakes` bumps `edit_epoch`. Mirror that here so the bake-cache skip (which
+        // correctly bypasses bricks already baked under the CURRENT epoch) doesn't shield this
+        // now-stale brick from the empty-space eviction. (Without the bump this is an impossible
+        // production state: a resident current-epoch brick is always still geometry-valid.)
+        atlas.edit_epoch = atlas.edit_epoch.wrapping_add(1);
         sched.pending.insert(far_chunk);
         sched.pending.insert(chunk::ChunkKey::new(0, IVec3::ZERO));
 
