@@ -75,6 +75,7 @@ pub use edits::{CsgKind, SdfMaterial, SdfOp, SdfOrder, SdfPrimitive};
 
 #[derive(Component, Reflect, Default)]
 #[reflect(Component)]
+#[require(crate::node::Node3D)]
 pub struct SdfVolume;
 
 #[derive(Component, Reflect, Default)]
@@ -469,6 +470,12 @@ impl Plugin for SdfScenePlugin {
                     .run_if(in_state(AppScene::SdfEditor))
                     .run_if(|allowed: Res<ViewportInputAllowed>| allowed.0),
             )
+            // Ungated: end any active gizmo drag on mouse release even when the pointer
+            // is over a dock panel, so a stale drag never carries into the next click.
+            .add_systems(
+                Last,
+                gizmo::clear_gizmo_drag_on_release.run_if(in_state(AppScene::SdfEditor)),
+            )
             // Bake/upload/render-toggle always run in the editor scene — property
             // edits in the inspector (and gizmo drags) must still re-bake. The async
             // scheduler pair runs unless SyncBakeMode is on (diagnostic), in which case
@@ -517,7 +524,8 @@ impl Plugin for SdfScenePlugin {
                 .add_systems(OnEnter(AppScene::SdfEditor), configure_overlay_gizmos)
                 .add_systems(
                     Update,
-                    (draw_ground_grid, gizmo::draw_gizmo).run_if(in_state(AppScene::SdfEditor)),
+                    (draw_ground_grid, draw_node_editor_gizmos, gizmo::draw_gizmo)
+                        .run_if(in_state(AppScene::SdfEditor)),
                 )
                 // LOD ring overlay: only while the toggle is on (LodRingsVisible, F8),
                 // so it doesn't clutter the normal view.
@@ -618,6 +626,8 @@ fn setup_sdf_scene(
         crate::gizmo_render::GizmoCamera,
         DepthPrepass,
         SceneEntity,
+        crate::node::Node3D,
+        Name::new("Camera"),
     ));
     commands.insert_resource(orbit);
 
@@ -716,6 +726,9 @@ fn setup_sdf_scene(
         },
         Transform::from_rotation(Quat::from_rotation_x(-0.5)),
         SceneEntity,
+        crate::node::Node3D,
+        crate::node::EditorGizmo::DirectionalLight { scale: 1.0 },
+        Name::new("Directional Light"),
     ));
 
     // Initial bake happens on the first `schedule_bakes` tick (atlas starts
@@ -926,7 +939,10 @@ pub struct GatheredEdit {
 /// without tripping the type-complexity lint.
 pub type VolumeQueryData = (
     Entity,
-    &'static Transform,
+    // World transform, so a volume parented under another node inherits its parent's
+    // motion (Bevy propagates `Transform` → `GlobalTransform`). Baking/picking operate
+    // in world space, so this is the value they need.
+    &'static GlobalTransform,
     &'static SdfPrimitive,
     &'static SdfOp,
     &'static SdfOrder,
@@ -946,7 +962,7 @@ pub fn gather_sorted_edits(volumes: &Query<VolumeQueryData, With<SdfVolume>>) ->
         SdfMaterial,
     )> = volumes
         .iter()
-        .map(|(e, t, p, op, order, m)| (*order, e, *t, p.clone(), *op, *m))
+        .map(|(e, t, p, op, order, m)| (*order, e, t.compute_transform(), p.clone(), *op, *m))
         .collect();
     rows.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.index().cmp(&b.1.index())));
 
@@ -1078,6 +1094,53 @@ fn draw_ground_grid(mut gizmos: Gizmos<SdfGridGizmos>, orbit: Res<SdfOrbitCamera
             Vec3::new(cx as f32 * step + extent, 0.0, wz),
             color,
         );
+    }
+}
+
+/// Draw editor-only gizmos for every [`Node3D`] carrying an [`EditorGizmo`]. Renders
+/// in world space from each node's `GlobalTransform`, so a gizmo tracks its parent.
+/// Strictly an editor aid (lights/cameras/empties are otherwise invisible) — never
+/// part of the runtime render.
+fn draw_node_editor_gizmos(
+    mut gizmos: Gizmos<SdfOverlayGizmos>,
+    nodes: Query<(&GlobalTransform, &crate::node::EditorGizmo)>,
+) {
+    use crate::node::EditorGizmo;
+    for (xf, gizmo) in &nodes {
+        let origin = xf.translation();
+        match *gizmo {
+            EditorGizmo::DirectionalLight { scale } => {
+                let color = Color::srgb(1.0, 0.85, 0.3);
+                // Forward (the light's travel direction) is local -Z.
+                let dir = (xf.rotation() * Vec3::NEG_Z).normalize_or_zero();
+                let right = (xf.rotation() * Vec3::X).normalize_or_zero();
+                let up = (xf.rotation() * Vec3::Y).normalize_or_zero();
+
+                // Sun disc: a small ring facing the light direction.
+                gizmos
+                    .circle(Isometry3d::new(origin, xf.rotation()), scale * 0.4, color)
+                    .resolution(24);
+                // Radiating spokes from the disc (classic sun glyph).
+                for k in 0..8 {
+                    let a = k as f32 * std::f32::consts::TAU / 8.0;
+                    let d = right * a.cos() + up * a.sin();
+                    gizmos.line(origin + d * scale * 0.4, origin + d * scale * 0.62, color);
+                }
+                // Parallel rays offset around the disc, all pointing along `dir`, with
+                // an arrowhead so the travel direction is unambiguous.
+                let len = scale * 1.6;
+                for (ox, oy) in [(0.0, 0.0), (0.55, 0.0), (-0.55, 0.0), (0.0, 0.55), (0.0, -0.55)] {
+                    let base = origin + (right * ox + up * oy) * scale;
+                    let tip = base + dir * len;
+                    gizmos.arrow(base, tip, color);
+                }
+            }
+            EditorGizmo::Axes { scale } => {
+                gizmos.line(origin, origin + xf.rotation() * Vec3::X * scale, Color::srgb(0.9, 0.2, 0.2));
+                gizmos.line(origin, origin + xf.rotation() * Vec3::Y * scale, Color::srgb(0.3, 0.9, 0.2));
+                gizmos.line(origin, origin + xf.rotation() * Vec3::Z * scale, Color::srgb(0.2, 0.4, 0.95));
+            }
+        }
     }
 }
 

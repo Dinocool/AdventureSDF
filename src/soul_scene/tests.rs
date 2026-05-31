@@ -18,6 +18,8 @@ fn test_registry() -> TypeRegistry {
     let mut r = TypeRegistry::new();
     r.register::<Transform>();
     r.register::<SceneEntity>();
+    r.register::<crate::node::SceneNode>();
+    r.register::<crate::node::Node3D>();
     r.register::<SdfVolume>();
     r.register::<SdfPrimitive>();
     r.register::<SdfOp>();
@@ -29,6 +31,8 @@ fn test_registry() -> TypeRegistry {
     r.register::<super::NonSerializable>();
     r.register::<super::SkipSerialization>();
     r.register::<super::EditorHidden>();
+    r.register::<ChildOf>();
+    r.register::<Children>();
     // Field types reached by reflection serialization.
     r.register::<Vec3>();
     r.register::<Quat>();
@@ -119,6 +123,7 @@ fn nested_instance_applies_override_and_resaves_only_diff() {
         next_id: 1,
         records: vec![SceneRecord::Instance {
             id: LocalId(0),
+            parent: None,
             source: src.clone(),
             overrides,
         }],
@@ -168,6 +173,7 @@ fn deep_nesting_composes() {
         next_id: 1,
         records: vec![SceneRecord::Instance {
             id: LocalId(0),
+            parent: None,
             source: c.clone(),
             overrides: Default::default(),
         }],
@@ -180,6 +186,7 @@ fn deep_nesting_composes() {
         next_id: 1,
         records: vec![SceneRecord::Instance {
             id: LocalId(0),
+            parent: None,
             source: b.clone(),
             overrides: Default::default(),
         }],
@@ -202,6 +209,54 @@ fn deep_nesting_composes() {
 }
 
 #[test]
+fn parent_child_hierarchy_round_trips() {
+    let registry = test_registry();
+
+    // Parent sphere (LocalId 0) with a child sphere (LocalId 1) under it.
+    let mut world = World::new();
+    let parent = spawn_sphere(&mut world, 0, 0);
+    let child = spawn_sphere(&mut world, 1, 1);
+    world.entity_mut(child).insert(ChildOf(parent));
+
+    let path = temp_scene("hierarchy");
+    std::fs::write(
+        &path,
+        save_scene_to_string(&mut world, &registry).expect("save"),
+    )
+    .unwrap();
+
+    // Load into a fresh world; the child's ChildOf must resolve to the reloaded
+    // parent (the one carrying LocalId 0).
+    let mut world2 = World::new();
+    load_scene(&mut world2, &path, &registry).expect("load");
+
+    let parent2 = world2
+        .query_filtered::<(Entity, &LocalId), ()>()
+        .iter(&world2)
+        .find(|(_, id)| id.0 == 0)
+        .map(|(e, _)| e)
+        .expect("parent reloaded");
+    let (child2, child_parent) = world2
+        .query::<(Entity, &LocalId, &ChildOf)>()
+        .iter(&world2)
+        .find(|(_, id, _)| id.0 == 1)
+        .map(|(e, _, c)| (e, c.parent()))
+        .expect("child reloaded with ChildOf");
+
+    assert_ne!(child2, parent2);
+    assert_eq!(child_parent, parent2, "child must re-link to its parent node");
+
+    // Bevy auto-builds Children on the parent.
+    let children: Vec<Entity> = world2
+        .get::<Children>(parent2)
+        .map(|c| c.iter().collect())
+        .unwrap_or_default();
+    assert_eq!(children, vec![child2], "parent must list the child");
+
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
 fn cyclic_instance_errors() {
     let registry = test_registry();
 
@@ -213,6 +268,7 @@ fn cyclic_instance_errors() {
         next_id: 1,
         records: vec![SceneRecord::Instance {
             id: LocalId(0),
+            parent: None,
             source: b.clone(),
             overrides: Default::default(),
         }],
@@ -221,6 +277,7 @@ fn cyclic_instance_errors() {
         next_id: 1,
         records: vec![SceneRecord::Instance {
             id: LocalId(0),
+            parent: None,
             source: a.clone(),
             overrides: Default::default(),
         }],
