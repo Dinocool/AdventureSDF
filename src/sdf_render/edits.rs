@@ -610,6 +610,19 @@ pub type Palette = [u16; PALETTE_K];
 /// edits contribute no material. Returned ids are sorted ascending for a stable,
 /// neighbour-agnostic slot assignment; empty slots are [`PALETTE_EMPTY`].
 pub fn build_palette(edits: &[ResolvedEdit], sample_points: &[Vec3]) -> Palette {
+    build_palette_inner(edits.iter(), sample_points)
+}
+
+/// As [`build_palette`] but over the edits at `indices` (into `edits`), avoiding a per-brick
+/// clone of the culled subset. The bake emit culls ~16k bricks/frame on a first bake; cloning
+/// each brick's candidate edits (now 100+ bytes each, carrying the cached `inv_model`) into a
+/// fresh `Vec` just to pass `build_palette` was 16k heap allocations/frame. This folds the same
+/// result straight from the index list (mirrors [`fold_csg_dist_indexed`]).
+pub fn build_palette_indexed(edits: &[ResolvedEdit], indices: &[u32], sample_points: &[Vec3]) -> Palette {
+    build_palette_inner(indices.iter().map(|&i| &edits[i as usize]), sample_points)
+}
+
+fn build_palette_inner<'a>(edits: impl Iterator<Item = &'a ResolvedEdit>, sample_points: &[Vec3]) -> Palette {
     // Nearest distance achieved by each global id over all sample points.
     let mut best: Vec<(u16, f32)> = Vec::new();
     for e in edits {
@@ -735,6 +748,24 @@ pub fn to_gpu_edit(e: &ResolvedEdit) -> GpuEdit {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn build_palette_indexed_matches_cloned() {
+        // The allocation-free indexed path must produce the same palette as cloning the culled
+        // subset and calling build_palette (the prior emit path).
+        let all = vec![
+            ResolvedEdit::new(SdfPrimitive::Sphere { radius: 1.0 }, Transform::IDENTITY, SdfOp::default(), 7),
+            ResolvedEdit::new(SdfPrimitive::Box { half_extents: Vec3::splat(0.5) }, Transform::from_xyz(2.0, 0.0, 0.0), SdfOp::default(), 3),
+            ResolvedEdit::new(SdfPrimitive::Sphere { radius: 0.5 }, Transform::from_xyz(0.3, 0.0, 0.0), SdfOp { kind: CsgKind::Subtract, smoothing: 0.0 }, 9),
+        ];
+        let indices = [0u32, 2, 1];
+        let samples = [Vec3::ZERO, Vec3::new(0.5, 0.2, -0.1), Vec3::new(1.5, 0.0, 0.0)];
+        let cloned: Vec<_> = indices.iter().map(|&i| all[i as usize].clone()).collect();
+        assert_eq!(
+            build_palette_indexed(&all, &indices, &samples),
+            build_palette(&cloned, &samples),
+        );
+    }
 
     #[test]
     fn smin_welds_below_min() {

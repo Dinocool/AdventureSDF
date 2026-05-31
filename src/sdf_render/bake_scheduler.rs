@@ -535,9 +535,7 @@ fn emit_gpu_bakes(
                 }
                 let voxel_size = config.voxel_size_at(key.lod);
                 let samples = atlas::SdfAtlas::brick_palette_samples(key, voxel_size);
-                let culled: Vec<edits::ResolvedEdit> =
-                    scratch.iter().map(|&i| edits_snapshot[i as usize].clone()).collect();
-                let palette = edits::build_palette(&culled, &samples);
+                let palette = edits::build_palette_indexed(&edits_snapshot, &scratch, &samples);
                 let tile = atlas.insert_gpu_brick(key, palette);
                 push_job(
                     atlas, gpu_bakes, &edits_snapshot, config, key, tile, &scratch, palette,
