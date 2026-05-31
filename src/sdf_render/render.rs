@@ -1379,16 +1379,12 @@ fn prepare_sdf_atlas_gpu(
             depth_or_array_layers: 1,
         };
 
-        // GPU-bake GROW: preserve existing texels. Create empty taller textures and copy the
-        // old (shorter) content in; the bake node fills the new tiles this same frame. The
-        // CPU has no texel data in GPU mode, so we must NOT zero-upload.
+        // GPU bake mode: the CPU has no texel data, so create EMPTY textures (never
+        // zero-upload-from-CPU) and let the bake node fill the tiles this same frame. If a
+        // prior atlas exists (a grow), copy its content into the taller replacement first so
+        // already-baked tiles survive; only genuinely-new tiles are re-baked. On the very
+        // first bake there's no prior texture — just the empty allocation, no copy.
         if extracted.preserve_grow {
-            let (Some(old_dist), Some(old_mat)) = (&gpu_atlas.dist_tex, &gpu_atlas.mat_tex) else {
-                // Nothing to preserve yet (no prior texture) — fall through to a plain
-                // empty allocation below by treating it as a fresh create.
-                return;
-            };
-            let old_h = old_dist.height();
             let dist_tex = device.create_texture(&TextureDescriptor {
                 label: Some("sdf_dist_atlas"),
                 size,
@@ -1409,38 +1405,50 @@ fn prepare_sdf_atlas_gpu(
                 usage,
                 view_formats: &[],
             });
-            // Copy the old content (full width, old height) into the new taller textures.
-            let mut encoder = device.create_command_encoder(&CommandEncoderDescriptor {
-                label: Some("sdf_atlas_grow_copy"),
-            });
-            let copy_extent = Extent3d {
-                width: extracted.texture_width,
-                height: old_h,
-                depth_or_array_layers: 1,
-            };
-            for (src, dst) in [(old_dist, &dist_tex), (old_mat, &mat_tex)] {
-                encoder.copy_texture_to_texture(
-                    TexelCopyTextureInfo {
-                        texture: src,
-                        mip_level: 0,
-                        origin: Origin3d::ZERO,
-                        aspect: TextureAspect::All,
-                    },
-                    TexelCopyTextureInfo {
-                        texture: dst,
-                        mip_level: 0,
-                        origin: Origin3d::ZERO,
-                        aspect: TextureAspect::All,
-                    },
-                    copy_extent,
-                );
+            // Copy prior content (full width, old height) into the new taller textures, if any.
+            if let (Some(old_dist), Some(old_mat)) = (&gpu_atlas.dist_tex, &gpu_atlas.mat_tex) {
+                let old_h = old_dist.height().min(extracted.texture_height);
+                let mut encoder = device.create_command_encoder(&CommandEncoderDescriptor {
+                    label: Some("sdf_atlas_grow_copy"),
+                });
+                let copy_extent = Extent3d {
+                    width: extracted.texture_width,
+                    height: old_h,
+                    depth_or_array_layers: 1,
+                };
+                for (src, dst) in [(old_dist, &dist_tex), (old_mat, &mat_tex)] {
+                    encoder.copy_texture_to_texture(
+                        TexelCopyTextureInfo {
+                            texture: src,
+                            mip_level: 0,
+                            origin: Origin3d::ZERO,
+                            aspect: TextureAspect::All,
+                        },
+                        TexelCopyTextureInfo {
+                            texture: dst,
+                            mip_level: 0,
+                            origin: Origin3d::ZERO,
+                            aspect: TextureAspect::All,
+                        },
+                        copy_extent,
+                    );
+                }
+                queue.submit([encoder.finish()]);
             }
-            queue.submit([encoder.finish()]);
 
             gpu_atlas.dist_view = Some(dist_tex.create_view(&TextureViewDescriptor::default()));
             gpu_atlas.mat_view = Some(mat_tex.create_view(&TextureViewDescriptor::default()));
             gpu_atlas.dist_tex = Some(dist_tex);
             gpu_atlas.mat_tex = Some(mat_tex);
+            if gpu_atlas.sampler.is_none() {
+                gpu_atlas.sampler = Some(device.create_sampler(&SamplerDescriptor {
+                    label: Some("sdf_atlas_sampler"),
+                    mag_filter: FilterMode::Nearest,
+                    min_filter: FilterMode::Nearest,
+                    mipmap_filter: FilterMode::Nearest,
+                    ..default()
+                }));
+            }
             return;
         }
 
