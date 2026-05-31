@@ -94,7 +94,7 @@ fn decode_dist(dist_u32: &[u32], x: u32, y: u32, z: u32, band: f32) -> f32 {
     let u = y * 8 + x; // 0..63
     let word = z * DIST_ROW_U32 + u / 2; // u/2 packs the x-pair
     let packed = dist_u32[word as usize];
-    let half = if u % 2 == 0 { packed & 0xffff } else { packed >> 16 };
+    let half = if u.is_multiple_of(2) { packed & 0xffff } else { packed >> 16 };
     let snorm = half as u16 as i16; // reinterpret low 16 bits as i16
     (snorm as f32 / 32767.0) * band
 }
@@ -278,7 +278,6 @@ fn gpu_bake_copy_to_atlas_texture_roundtrips() {
         required_features: wgpu::Features::TEXTURE_FORMAT_16BIT_NORM,
         ..Default::default()
     }))
-    .map(|dq| dq)
     .unwrap_or((device, queue));
 
     let cfg = SdfGridConfig::default();
@@ -408,7 +407,7 @@ fn gpu_bake_copy_to_atlas_texture_roundtrips() {
 
     // Read the tile sub-rect back out of the texture. R16Snorm = 2 bytes/texel; pad the
     // readback row to 256 bytes (copy alignment).
-    let rb_row_bytes = ((tile_w * 2 + 255) / 256) * 256; // 256 (64*2=128 → padded to 256)
+    let rb_row_bytes = (tile_w * 2).div_ceil(256) * 256; // 256 (64*2=128 → padded to 256)
     let rb_size = (rb_row_bytes * edge) as u64;
     let rb = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("tex_readback"),

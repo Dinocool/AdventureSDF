@@ -16,6 +16,8 @@ editor = [
     "bevy/trace_chrome",
 ]
 # Faster incremental compiles via dynamic linking of Bevy. Dev-only — never ship.
+# (Disable with `--no-default-features` when capturing in RenderDoc, which can't inject
+# into a dynamically-linked Bevy.)
 fast = ["bevy/dynamic_linking"]
 
 [dependencies]

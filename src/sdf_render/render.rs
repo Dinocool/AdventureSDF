@@ -62,7 +62,7 @@ struct SdfCameraData {
     camera_pos: Vec4,
     screen_params: Vec4, // xy = screen_size, z = surface_bias, w = unused
     grid_origin: Vec4,   // xyz = grid origin, w = voxel_size
-    grid_dims: Vec4, // x = grid_size, y = bricks_per_axis, z = brick_size (8.0), w = num_lookups
+    grid_dims: Vec4, // z = brick_size (8.0); x/y/w unused (chunk count = arrayLength(&chunk_buf))
     debug_params: Vec4, // x = max_steps, y = max_dist, z = sdf_eps, w = unused
     /// x = pixel_cone (world radius per unit ray distance per pixel), y = cubic_band,
     /// z = over_relax, w unused.
@@ -561,12 +561,10 @@ impl Plugin for SdfRenderPlugin {
                 prepare_sdf_camera_data
                     .run_if(in_state(crate::scene_manager::AppScene::SdfEditor))
                     .after(super::orbit_camera)
-                    // MUST run after the bake scheduling: the shader's binary-search bound
-                    // (`grid_dims.w = atlas.bricks.len()`) has to match the lookup
-                    // buffer `extract_sdf_atlas` builds from the *same* post-bake
-                    // brick set. Reading the count before the bake desyncs them while
-                    // dragging (count too high → past-end reads = phantom geometry;
-                    // too low → missed bricks = gaps).
+                    // Run after the bake scheduling so the camera uniform reflects this frame's
+                    // post-bake state. (The shader's chunk-search bound no longer comes from
+                    // this uniform — it reads `arrayLength(&chunk_buf)` — so this ordering is
+                    // for tidiness, not the old bound/table consistency requirement.)
                     .after(super::bake_scheduler::schedule_bakes),
             );
 
@@ -648,7 +646,6 @@ pub struct SdfMaterialTable {
 fn prepare_sdf_camera_data(
     mut commands: Commands,
     cameras: Query<(Entity, &Camera, &Transform), With<SdfCamera>>,
-    atlas: Res<SdfAtlas>,
     config: Res<SdfGridConfig>,
     raymarch: Res<super::SdfRaymarchParams>,
     registry: Res<super::edits::MaterialRegistry>,
@@ -680,12 +677,6 @@ fn prepare_sdf_camera_data(
         }
     }
 
-    // grid_dims.w = the shader's chunk-table binary-search bound = distinct resident
-    // chunks (NOT brick count). Must match `chunk_data.len()` extract uploads.
-    let num_chunks = super::chunk::resident_chunks(&atlas, &config).len() as u32;
-    let bpa = config.bricks_per_axis();
-    let grid_size = config.grid_size;
-
     for (entity, camera, transform) in &cameras {
         let view_from_world = transform.to_matrix().inverse();
         let clip_from_world = camera.clip_from_view() * view_from_world;
@@ -716,12 +707,11 @@ fn prepare_sdf_camera_data(
                 config.world_origin().z,
                 config.voxel_size,
             ),
-            grid_dims: Vec4::new(
-                grid_size as f32,
-                bpa as f32,
-                config.brick_size as f32,
-                num_chunks as f32,
-            ),
+            // Only `.z` (brick_size / samples-per-edge) is read by the shader. `.x`/`.y`/`.w`
+            // are unused: the chunk-search bound is now `arrayLength(&chunk_buf)` in the shader
+            // (not `.w`), which is consistent with the bound lookup buffer by construction — see
+            // `find_chunk`. Kept as a vec4 for std140 alignment of the following fields.
+            grid_dims: Vec4::new(0.0, 0.0, config.brick_size as f32, 0.0),
             // `w` carries `recenter_snap_chunks` so the shader can recompute the chunk-
             // snapped ring centre (the LOD cross-fade must key off the true resident-ring
             // boundary, which is hysteresis-snapped — see bake_scheduler::ring_chunk_origin).
@@ -862,7 +852,16 @@ fn extract_sdf_atlas(
 
     let num_bricks = atlas.bricks.len() as u32;
     if num_bricks == 0 {
-        commands.insert_resource(ExtractedSdfAtlas::default());
+        // Fully evicted (roamed into empty space). Signal a tables rebuild with EMPTY chunk
+        // data so `prepare_sdf_atlas_gpu` replaces the lookup buffer with a miss-only sentinel.
+        // The shader bounds its search by `arrayLength(&chunk_buf)`, so leaving the old buffer
+        // bound would search stale entries and render ghost geometry.
+        last_topology.0 = atlas.topology_generation;
+        commands.insert_resource(ExtractedSdfAtlas {
+            tables_dirty: true,
+            dirty: true,
+            ..Default::default()
+        });
         return;
     }
 
@@ -1207,9 +1206,22 @@ fn prepare_sdf_atlas_gpu(
     // last frame's buffers untouched, skipping the per-frame O(bricks) re-upload.
     if extracted.tables_dirty {
         if extracted.chunk_data.is_empty() {
-            // No resident chunks (atlas empty / fully evicted). Leave last frame's buffers;
-            // the camera uniform's chunk count (grid_dims.w) is 0 so the shader searches
-            // nothing and renders background. Avoids a zero-sized storage buffer.
+            // Atlas fully evicted. The shader bounds its binary search by
+            // `arrayLength(&chunk_buf)`, so we must NOT leave a stale non-empty buffer bound
+            // (it would search old entries → ghost geometry). Upload a single sentinel whose
+            // key (u32::MAX, u32::MAX) can never match a real chunk key, so every search misses
+            // and the scene renders empty. (A zero-length storage buffer is invalid.)
+            let mut bytes = Vec::with_capacity(20);
+            bytes.extend_from_slice(&u32::MAX.to_le_bytes()); // key_hi
+            bytes.extend_from_slice(&u32::MAX.to_le_bytes()); // key_lo
+            bytes.extend_from_slice(&0u32.to_le_bytes()); // occ_lo
+            bytes.extend_from_slice(&0u32.to_le_bytes()); // occ_hi
+            bytes.extend_from_slice(&0u32.to_le_bytes()); // tile_run_base
+            gpu_atlas.lookup_buffer = Some(device.create_buffer_with_data(&BufferInitDescriptor {
+                label: Some("sdf_chunk_lookup_buffer"),
+                contents: &bytes,
+                usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
+            }));
             return;
         }
 
