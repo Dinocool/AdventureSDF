@@ -135,7 +135,9 @@ const GPU_BAKE_JOB_CAP: usize = 16384;
 /// triggers a targeted rebake of the bricks the edit touches. Exposed as
 /// [`ChangedEditFilter`] so the diagnostic sync bake can reuse the same change filter.
 pub type ChangedEditFilter = Or<(
-    Changed<Transform>,
+    // `GlobalTransform` (not local `Transform`) so a volume rebakes when an ancestor
+    // moves it via hierarchy propagation, not only when its own transform is edited.
+    Changed<GlobalTransform>,
     Changed<SdfOp>,
     Changed<SdfPrimitive>,
     Changed<SdfMaterial>,

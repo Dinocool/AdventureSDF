@@ -93,33 +93,37 @@ pub fn read_manifest(slug: &str) -> Vec<LibraryVariant> {
 /// the corresponding array's layer.
 pub type VariantBc7 = [super::bc7::Bc7Array; MATERIAL_TEX_MAPS];
 
-/// Encode (or load from cache) one variant's 5 BC7 maps. The cache is a single blob
-/// per variant (`<slug>/<variant>/pbr.bc7`) holding all 5 maps' mip chains, keyed by
-/// a content hash of that variant's decoded RGBA — so editing one texture only
-/// re-encodes that one variant. Pure CPU + filesystem: safe to run on a background
-/// task pool (no GPU, no ECS access). `slug`/`dir` are owned so a task can capture
-/// them.
-pub fn encode_variant_bc7(slug: &str, dir: &str) -> VariantBc7 {
-    let var_dir = format!("{TEXTURE_ROOT}/{slug}/{dir}");
+/// Encode (or load from cache) one [`MapSet`]'s 5 BC7 maps (diffuse, normal, MRA,
+/// height, edge). Each role reads its own source file (any decodable format) via
+/// `image::open`; an absent role uses neutral fallback bytes. The cache is a single blob
+/// keyed by a content hash of the decoded RGBA — so any map change re-encodes — stored
+/// in a temp dir keyed by that hash (the map-set has no single owning directory). Pure
+/// CPU + filesystem: safe on a background task pool. The `MapSet` is owned so a task can
+/// capture it.
+pub fn encode_mapset_bc7(map_set: &crate::assets::MapSet) -> VariantBc7 {
+    use crate::assets::MapSet;
 
-    // Decode all 5 maps to RGBA8 for this one variant.
+    // Decode all 5 maps to RGBA8. Roles store paths relative to `assets/`; join the root.
+    let abs = |role: &Option<std::path::PathBuf>| MapSet::role_abs(role);
     let rgba: [Vec<u8>; MATERIAL_TEX_MAPS] = std::array::from_fn(|map| {
         let mut buf = vec![0u8; (TEXTURE_SIZE * TEXTURE_SIZE * 4) as usize];
         if map == MapArray::Mra as usize {
             write_mra_map(
-                &format!("{var_dir}/metallic.png"),
-                &format!("{var_dir}/roughness.png"),
-                &format!("{var_dir}/ao.png"),
+                abs(&map_set.metallic).as_deref(),
+                abs(&map_set.roughness).as_deref(),
+                abs(&map_set.ao).as_deref(),
                 &mut buf,
             );
         } else {
-            let file = match map {
-                x if x == MapArray::Diffuse as usize => "diffuse",
-                x if x == MapArray::Normal as usize => "normal",
-                x if x == MapArray::Height as usize => "height",
-                _ => "edge",
+            let role = match map {
+                x if x == MapArray::Diffuse as usize => &map_set.diffuse,
+                x if x == MapArray::Normal as usize => &map_set.normal,
+                x if x == MapArray::Height as usize => &map_set.height,
+                _ => &map_set.edge,
             };
-            write_rgba_map(&format!("{var_dir}/{file}.png"), &mut buf);
+            if let Some(path) = abs(role) {
+                write_rgba_map(&path, &mut buf);
+            }
         }
         buf
     });
@@ -129,8 +133,15 @@ pub fn encode_variant_bc7(slug: &str, dir: &str) -> VariantBc7 {
     for r in &rgba {
         source_key.extend_from_slice(r);
     }
+    let cache_name = {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        map_set.hash(&mut h);
+        format!("adventure_pbrtex_cache/{:016x}.bc7", h.finish())
+    };
+    let cache_path = std::env::temp_dir().join(cache_name);
 
-    super::bc7::Bc7Cache::new(format!("{var_dir}/pbr.bc7")).load_or_encode_multi(
+    super::bc7::Bc7Cache::new(cache_path.to_string_lossy().into_owned()).load_or_encode_multi(
         &source_key,
         || {
             std::array::from_fn(|map| {
@@ -140,9 +151,9 @@ pub fn encode_variant_bc7(slug: &str, dir: &str) -> VariantBc7 {
     )
 }
 
-/// Decode a PNG, resize to `TEXTURE_SIZE²`, and write RGBA8 into `dst`. On failure
+/// Decode an image, resize to `TEXTURE_SIZE²`, and write RGBA8 into `dst`. On failure
 /// leaves `dst` as-is (zeroed), logging a warning.
-fn write_rgba_map(path: &str, dst: &mut [u8]) {
+fn write_rgba_map(path: &std::path::Path, dst: &mut [u8]) {
     match image::open(path) {
         Ok(img) => {
             let rgba = img
@@ -154,14 +165,20 @@ fn write_rgba_map(path: &str, dst: &mut [u8]) {
                 .to_rgba8();
             dst.copy_from_slice(&rgba);
         }
-        Err(e) => warn!("SDF texture: cannot load {path}: {e}"),
+        Err(e) => warn!("SDF texture: cannot load {}: {e}", path.display()),
     }
 }
 
-/// Decode three single-channel maps and pack into RGBA (R=metallic, G=roughness,
-/// B=ao, A=255).
-fn write_mra_map(metallic: &str, roughness: &str, ao: &str, dst: &mut [u8]) {
-    let load_r = |path: &str| -> Option<Vec<u8>> {
+/// Decode three single-channel maps (any may be absent) and pack into RGBA
+/// (R=metallic, G=roughness, B=ao, A=255). Absent channels use neutral defaults.
+fn write_mra_map(
+    metallic: Option<&std::path::Path>,
+    roughness: Option<&std::path::Path>,
+    ao: Option<&std::path::Path>,
+    dst: &mut [u8],
+) {
+    let load_r = |path: Option<&std::path::Path>| -> Option<Vec<u8>> {
+        let path = path?;
         match image::open(path) {
             Ok(img) => Some(
                 img.resize_exact(
@@ -173,7 +190,7 @@ fn write_mra_map(metallic: &str, roughness: &str, ao: &str, dst: &mut [u8]) {
                 .into_raw(),
             ),
             Err(e) => {
-                warn!("SDF texture: cannot load {path}: {e}");
+                warn!("SDF texture: cannot load {}: {e}", path.display());
                 None
             }
         }

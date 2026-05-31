@@ -1,0 +1,9 @@
+PbrTextureAsset(
+  diffuse: Some("textures/sand/1/diffuse.png"),
+  normal: Some("textures/sand/1/normal.png"),
+  metallic: Some("textures/sand/1/metallic.png"),
+  roughness: Some("textures/sand/1/roughness.png"),
+  ao: Some("textures/sand/1/ao.png"),
+  height: Some("textures/sand/1/height.png"),
+  edge: Some("textures/sand/1/edge.png"),
+)

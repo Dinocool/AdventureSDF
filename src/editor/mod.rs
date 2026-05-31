@@ -4,17 +4,24 @@
 
 use bevy::prelude::*;
 
+pub mod asset_inspector;
+pub mod assets_browser;
 pub mod config;
 pub mod dock;
 pub mod hierarchy;
+pub mod import_settings;
 pub mod inspector;
 pub mod keybinds;
+pub mod material_editor;
+pub mod material_preview;
 pub mod menu_bar;
 pub mod panels;
 pub mod profiling;
 pub mod project_files;
 pub mod registry;
 pub mod resource_inspector;
+pub mod resource_picker;
+pub mod selection;
 pub mod status_bar;
 pub mod uniform_inspector;
 
@@ -37,6 +44,32 @@ impl Plugin for EditorPlugin {
         .init_resource::<menu_bar::CurrentScenePath>()
         .init_resource::<inspector::InspectorOverrides>();
 
+        // Assets browser: navigation state + modular thumbnail providers + the
+        // offscreen render rig that fills material/image thumbnails.
+        app.add_plugins(assets_browser::ThumbnailRenderPlugin)
+            .init_resource::<assets_browser::AssetsBrowserState>();
+        {
+            let mut registry = assets_browser::ThumbnailRegistry::default();
+            registry.register(assets_browser::ImageThumbnailProvider);
+            registry.register(assets_browser::MaterialThumbnailProvider);
+            app.insert_resource(registry);
+        }
+
+        // Unified selection: the Inspector follows whichever of {entity, asset} was
+        // selected last. `sync_selection` keeps it in step with the entity-side
+        // `SdfSelection`.
+        app.add_plugins(material_preview::MaterialPreviewPlugin)
+            .init_resource::<selection::EditorSelection>()
+            .init_resource::<asset_inspector::ImportSettingsEdits>()
+            .add_systems(Update, selection::sync_selection);
+        {
+            let mut reg = asset_inspector::AssetInspectorRegistry::default();
+            reg.register(asset_inspector::TextureAssetInspector);
+            reg.register(asset_inspector::MaterialAssetInspector);
+            reg.register(asset_inspector::PbrTextureAssetInspector);
+            app.insert_resource(reg);
+        }
+
         // Do NOT use egui's blanket input absorption: egui_dock's central Viewport
         // tab is itself an egui surface, so the absorber would clear mouse input even
         // when the cursor is over the 3D region — killing all viewport interaction.
@@ -47,15 +80,8 @@ impl Plugin for EditorPlugin {
             .resource_mut::<bevy_egui::EguiGlobalSettings>()
             .enable_absorb_bevy_input_system = false;
 
-        // Framework-level panels (registered into the dock by stable id).
-        panels::register_panel(
-            app,
-            "core/profiling",
-            "Perf",
-            DockSide::Bottom,
-            0,
-            profiling::profiling_ui,
-        );
+        // Perf (FPS / frame time) now lives in the bottom status bar alongside the bake
+        // status — see `status_bar::status_bar_ui` — so no separate dock tab.
 
         keybinds::plugin(app);
 

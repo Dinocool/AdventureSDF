@@ -4,6 +4,7 @@ pub mod combat;
 pub mod gizmo_render;
 pub mod inventory;
 pub mod networking;
+pub mod node;
 pub mod player;
 pub mod scene_manager;
 pub mod sdf_render;

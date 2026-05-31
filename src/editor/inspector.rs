@@ -6,7 +6,7 @@
 use bevy::prelude::*;
 use bevy_egui::egui;
 
-use crate::sdf_render::SdfSelection;
+use crate::editor::selection::EditorSelection;
 
 /// Renders a custom editor for one component on `entity`, replacing the generic
 /// reflection UI for that component's type. Exclusive `World` access.
@@ -39,10 +39,22 @@ pub fn register_component_editor<T: 'static>(
 /// component type with a registered override, the override draws it; otherwise the
 /// generic reflection inspector renders all remaining components.
 pub fn inspector_ui(world: &mut World, ui: &mut egui::Ui) {
-    let Some(entity) = world.resource::<SdfSelection>().entity else {
-        ui.weak("No selection. Click an entity in the viewport or Hierarchy.");
-        return;
-    };
+    // The inspector follows the unified selection: a scene entity, an asset file, or
+    // nothing.
+    match world.resource::<EditorSelection>().clone() {
+        EditorSelection::None => {
+            ui.weak("No selection. Click an entity in the viewport/Hierarchy, or an asset.");
+        }
+        EditorSelection::Asset(path) => {
+            crate::editor::asset_inspector::asset_inspector_ui(world, &path, ui);
+        }
+        EditorSelection::Entity(entity) => entity_inspector_ui(world, entity, ui),
+    }
+}
+
+/// Inspect one scene entity: its name + components (custom overrides then generic
+/// reflection).
+fn entity_inspector_ui(world: &mut World, entity: Entity, ui: &mut egui::Ui) {
     if world.get_entity(entity).is_err() {
         ui.weak("Selected entity no longer exists.");
         return;
