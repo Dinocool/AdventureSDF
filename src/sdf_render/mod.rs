@@ -75,6 +75,7 @@ pub use edits::{CsgKind, SdfMaterial, SdfOp, SdfOrder, SdfPrimitive};
 
 #[derive(Component, Reflect, Default)]
 #[reflect(Component)]
+#[require(crate::node::Node3D)]
 pub struct SdfVolume;
 
 #[derive(Component, Reflect, Default)]
@@ -458,6 +459,12 @@ impl Plugin for SdfScenePlugin {
                     .run_if(in_state(AppScene::SdfEditor))
                     .run_if(|allowed: Res<ViewportInputAllowed>| allowed.0),
             )
+            // Ungated: end any active gizmo drag on mouse release even when the pointer
+            // is over a dock panel, so a stale drag never carries into the next click.
+            .add_systems(
+                Last,
+                gizmo::clear_gizmo_drag_on_release.run_if(in_state(AppScene::SdfEditor)),
+            )
             // Bake/upload/render-toggle always run in the editor scene — property
             // edits in the inspector (and gizmo drags) must still re-bake. The GPU bake is
             // the only path: `schedule_bakes` does topology (edit detection + camera
@@ -496,7 +503,8 @@ impl Plugin for SdfScenePlugin {
                 .add_systems(OnEnter(AppScene::SdfEditor), configure_overlay_gizmos)
                 .add_systems(
                     Update,
-                    (draw_ground_grid, gizmo::draw_gizmo).run_if(in_state(AppScene::SdfEditor)),
+                    (draw_ground_grid, draw_node_editor_gizmos, gizmo::draw_gizmo)
+                        .run_if(in_state(AppScene::SdfEditor)),
                 )
                 // LOD ring overlay: only while the toggle is on (LodRingsVisible, F8),
                 // so it doesn't clutter the normal view.
@@ -518,67 +526,28 @@ impl Plugin for SdfScenePlugin {
 fn setup_sdf_scene(
     mut commands: Commands,
     asset_server: Res<AssetServer>,
-    mut material_assets: ResMut<Assets<crate::assets::MaterialAsset>>,
     mut asset_table: ResMut<crate::assets::MaterialAssetTable>,
 ) {
-    use crate::assets::{MaterialAsset, TexRef};
+    use crate::assets::MaterialAsset;
 
     asset_table.ensure_fallback();
 
-    // Demo materials. Each references a texture variant by path (slug/dir). If a
-    // matching `assets/materials/<name>.material.ron` exists on disk we load it (the
-    // authored source of truth); otherwise we synthesize one in-memory so the demo
-    // scene still renders. Either way it gets a stable registry id from the table,
-    // and `assets::compile` fills the GPU registry once the asset resolves.
-    let mut mat = |name: &str, slug: &str, dir: &str| -> u32 {
-        let path = format!("materials/{name}.material.ron");
-        let handle = if std::path::Path::new(&format!("assets/{path}")).exists() {
-            asset_server.load::<MaterialAsset>(path)
-        } else {
-            material_assets.add(MaterialAsset {
-                base_color: [1.0, 1.0, 1.0, 1.0],
-                blend_softness: 0.0,
-                // Textured material: MRA texture supplies metallic/roughness, so these
-                // scalar fallbacks are unused. Keep the prior neutral values.
-                metallic: 0.0,
-                roughness: 1.0,
-                parallax_scale: 0.15,
-                maps: std::array::from_fn(|_| {
-                    Some(TexRef {
-                        slug: slug.to_string(),
-                        dir: dir.to_string(),
-                    })
-                }),
-            })
-        };
+    // Demo materials are authored on-disk resources under `assets/materials/`
+    // (exported once via the `export_demo_materials` test). Load each by name and
+    // register it for a stable registry id; `assets::compile` fills the GPU registry
+    // once the asset resolves. If a file were missing the loader yields an unresolved
+    // handle (the fallback material renders) — but they ship with the project.
+    let mut mat = |name: &str| -> u32 {
+        let handle = asset_server.load::<MaterialAsset>(format!("materials/{name}.material.ron"));
         asset_table.register(handle)
     };
 
-    let mat_sand = mat("sand", "sand", "1");
-    let mat_cobble = mat("cobble", "cobble_stone", "1");
-    let mat_ground = mat("ground", "ground", "1");
-
-    // Textureless PBR exemplars: synthesized in-memory with NO maps, so the shader uses
-    // the scalar metallic/roughness fallbacks. These show the Stage-3 IBL clearly — a
-    // smooth metal mirrors the sky, a rough one reads as brushed/satin metal.
-    let mut exemplar = |color: [f32; 4], metallic: f32, roughness: f32| -> u32 {
-        let handle = material_assets.add(MaterialAsset {
-            base_color: color,
-            blend_softness: 0.0,
-            metallic,
-            roughness,
-            // Exemplars are textureless (no height map) so parallax is a no-op for them.
-            parallax_scale: 0.06,
-            maps: std::array::from_fn(|_| None),
-        });
-        asset_table.register(handle)
-    };
-    // Deep red, fully metallic, fairly smooth — the headline mirror-metal sphere.
-    let mat_red_metal = exemplar([0.55, 0.04, 0.03, 1.0], 1.0, 0.18);
-    // Gold-ish metal, medium roughness — satin highlight, softer sky reflection.
-    let mat_gold_rough = exemplar([0.83, 0.62, 0.18, 1.0], 1.0, 0.45);
-    // Glossy white dielectric — near-mirror clearcoat look, strong fresnel rim.
-    let mat_white_gloss = exemplar([0.9, 0.9, 0.92, 1.0], 0.0, 0.08);
+    let mat_sand = mat("sand");
+    let mat_cobble = mat("cobble");
+    let mat_ground = mat("ground");
+    let mat_red_metal = mat("red_metal");
+    let mat_gold_rough = mat("gold_rough");
+    let mat_white_gloss = mat("white_gloss");
 
     // Camera
     let orbit = SdfOrbitCamera::default();
@@ -597,6 +566,8 @@ fn setup_sdf_scene(
         crate::gizmo_render::GizmoCamera,
         DepthPrepass,
         SceneEntity,
+        crate::node::Node3D,
+        Name::new("Camera"),
     ));
     commands.insert_resource(orbit);
 
@@ -695,6 +666,9 @@ fn setup_sdf_scene(
         },
         Transform::from_rotation(Quat::from_rotation_x(-0.5)),
         SceneEntity,
+        crate::node::Node3D,
+        crate::node::EditorGizmo::DirectionalLight { scale: 1.0 },
+        Name::new("Directional Light"),
     ));
 
     // Initial bake happens on the first `schedule_bakes` tick (atlas starts
@@ -905,7 +879,10 @@ pub struct GatheredEdit {
 /// without tripping the type-complexity lint.
 pub type VolumeQueryData = (
     Entity,
-    &'static Transform,
+    // World transform, so a volume parented under another node inherits its parent's
+    // motion (Bevy propagates `Transform` → `GlobalTransform`). Baking/picking operate
+    // in world space, so this is the value they need.
+    &'static GlobalTransform,
     &'static SdfPrimitive,
     &'static SdfOp,
     &'static SdfOrder,
@@ -925,7 +902,7 @@ pub fn gather_sorted_edits(volumes: &Query<VolumeQueryData, With<SdfVolume>>) ->
         SdfMaterial,
     )> = volumes
         .iter()
-        .map(|(e, t, p, op, order, m)| (*order, e, *t, p.clone(), *op, *m))
+        .map(|(e, t, p, op, order, m)| (*order, e, t.compute_transform(), p.clone(), *op, *m))
         .collect();
     rows.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.index().cmp(&b.1.index())));
 
@@ -1052,6 +1029,53 @@ fn draw_ground_grid(mut gizmos: Gizmos<SdfGridGizmos>, orbit: Res<SdfOrbitCamera
             Vec3::new(cx as f32 * step + extent, 0.0, wz),
             color,
         );
+    }
+}
+
+/// Draw editor-only gizmos for every [`Node3D`] carrying an [`EditorGizmo`]. Renders
+/// in world space from each node's `GlobalTransform`, so a gizmo tracks its parent.
+/// Strictly an editor aid (lights/cameras/empties are otherwise invisible) — never
+/// part of the runtime render.
+fn draw_node_editor_gizmos(
+    mut gizmos: Gizmos<SdfOverlayGizmos>,
+    nodes: Query<(&GlobalTransform, &crate::node::EditorGizmo)>,
+) {
+    use crate::node::EditorGizmo;
+    for (xf, gizmo) in &nodes {
+        let origin = xf.translation();
+        match *gizmo {
+            EditorGizmo::DirectionalLight { scale } => {
+                let color = Color::srgb(1.0, 0.85, 0.3);
+                // Forward (the light's travel direction) is local -Z.
+                let dir = (xf.rotation() * Vec3::NEG_Z).normalize_or_zero();
+                let right = (xf.rotation() * Vec3::X).normalize_or_zero();
+                let up = (xf.rotation() * Vec3::Y).normalize_or_zero();
+
+                // Sun disc: a small ring facing the light direction.
+                gizmos
+                    .circle(Isometry3d::new(origin, xf.rotation()), scale * 0.4, color)
+                    .resolution(24);
+                // Radiating spokes from the disc (classic sun glyph).
+                for k in 0..8 {
+                    let a = k as f32 * std::f32::consts::TAU / 8.0;
+                    let d = right * a.cos() + up * a.sin();
+                    gizmos.line(origin + d * scale * 0.4, origin + d * scale * 0.62, color);
+                }
+                // Parallel rays offset around the disc, all pointing along `dir`, with
+                // an arrowhead so the travel direction is unambiguous.
+                let len = scale * 1.6;
+                for (ox, oy) in [(0.0, 0.0), (0.55, 0.0), (-0.55, 0.0), (0.0, 0.55), (0.0, -0.55)] {
+                    let base = origin + (right * ox + up * oy) * scale;
+                    let tip = base + dir * len;
+                    gizmos.arrow(base, tip, color);
+                }
+            }
+            EditorGizmo::Axes { scale } => {
+                gizmos.line(origin, origin + xf.rotation() * Vec3::X * scale, Color::srgb(0.9, 0.2, 0.2));
+                gizmos.line(origin, origin + xf.rotation() * Vec3::Y * scale, Color::srgb(0.3, 0.9, 0.2));
+                gizmos.line(origin, origin + xf.rotation() * Vec3::Z * scale, Color::srgb(0.2, 0.4, 0.95));
+            }
+        }
     }
 }
 

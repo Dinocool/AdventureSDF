@@ -17,7 +17,7 @@ use bevy::prelude::*;
 use crate::gizmo_render::{GizmoDraw, GizmoMesh, ShapeBuilder};
 
 use super::picking::{Ray, mouse_to_ray};
-use super::{SdfCamera, SdfSelection, SdfVolume};
+use super::{SdfCamera, SdfSelection};
 
 // --- Pixel constants (matched to transform-gizmo defaults) ---
 /// Axis length / outer extent, in pixels (the plugin's `gizmo_size`).
@@ -465,10 +465,19 @@ pub fn gizmo_update(
     selection: Res<SdfSelection>,
     windows: Query<&Window>,
     cameras: Query<(&Camera, &Transform), With<SdfCamera>>,
-    mut volumes: Query<&mut Transform, (With<SdfVolume>, Without<SdfCamera>)>,
+    // Any spatial node is gizmo-movable, not just SDF volumes. The camera is excluded
+    // (the orbit controller owns its transform).
+    mut nodes: Query<&mut Transform, (With<crate::node::Node3D>, Without<SdfCamera>)>,
+    // World transforms (any entity) so the gizmo is built in world space and a child's
+    // handles sit at its real world position, not its parent-relative local one.
+    globals: Query<&GlobalTransform>,
+    parents: Query<&ChildOf>,
 ) {
     state.claimed_click = false;
 
+    // Defensive: also clear here. The authoritative release-clear is
+    // `clear_gizmo_drag_on_release` (ungated), which fires even when the pointer is
+    // over a panel on the release frame; this one covers the in-viewport common case.
     if !mouse.pressed(MouseButton::Left) {
         state.drag = None;
     }
@@ -486,8 +495,24 @@ pub fn gizmo_update(
     let Some(ray) = mouse_to_ray(camera, cam_xf, window, cursor) else {
         return;
     };
-    let Ok(target_xf) = volumes.get(entity).copied() else {
+    let Ok(local_xf) = nodes.get(entity).copied() else {
         return;
+    };
+    // Parent world transform (None for a root), used to lift the child's local frame
+    // into world space and to map a new world transform back to local.
+    let parent_global = parents
+        .get(entity)
+        .ok()
+        .and_then(|c| globals.get(c.parent()).ok().copied());
+
+    // The gizmo operates in WORLD space. Compute the child's world transform FRESH from
+    // its own local `Transform` (which this system wrote last frame) times the parent's
+    // `GlobalTransform`. We must NOT read the child's own `GlobalTransform` here: it is
+    // only recomputed in `PostUpdate`, so in `Last` it lags a frame behind the local
+    // write and fights the drag (snapping the child to a stale pose).
+    let target_xf = match parent_global {
+        Some(pg) => pg.mul_transform(local_xf).compute_transform(),
+        None => local_xf,
     };
 
     let proj_y = camera.clip_from_view().y_axis.y;
@@ -502,12 +527,21 @@ pub fn gizmo_update(
 
     // Continue an active drag.
     if let Some(drag) = state.drag.take() {
-        if let Ok(mut t) = volumes.get_mut(entity) {
+        // Apply the drag in world space, then convert to local before writing.
+        let mut new_world = target_xf;
+        apply_drag(&drag, &ray, &mut new_world, &state);
+        let local = match parent_global {
+            Some(pg) => GlobalTransform::from(new_world).reparented_to(&pg),
+            None => new_world,
+        };
+        if let Ok(mut t) = nodes.get_mut(entity) {
             // Mutating Transform fires `Changed<Transform>`, which `schedule_bakes`
             // uses to rebake just the affected chunks — no explicit dirty flag needed.
             // `emit_gpu_bakes` bakes the touched chunks the same frame, so the volume
-            // tracks the cursor live with no extra signal.
-            apply_drag(&drag, &ray, &mut t, &state);
+            // tracks the cursor live with no extra signal. `local` is the world-space
+            // drag result converted back into the entity's local frame (so children
+            // under a non-identity parent move correctly).
+            *t = local;
         }
         state.hovered = Some(drag.id);
         state.drag = Some(drag);
@@ -550,14 +584,32 @@ pub fn gizmo_update(
     }
 }
 
+/// Clear any active gizmo drag the moment the left button is released. Runs UNGATED
+/// (not behind `ViewportInputAllowed`), so a release while the pointer is over a dock
+/// panel still ends the drag. Without this, releasing off the viewport leaves
+/// `GizmoState.drag` set; the next click resumes it with a stale `start_xf` and snaps
+/// the object. Pair with `gizmo_update`'s in-system clear for the common case.
+pub fn clear_gizmo_drag_on_release(
+    mouse: Res<ButtonInput<MouseButton>>,
+    mut state: ResMut<GizmoState>,
+) {
+    if state.drag.is_some() && !mouse.pressed(MouseButton::Left) {
+        state.drag = None;
+        state.claimed_click = false;
+    }
+}
+
 /// Tessellate the visible handles into [`GizmoDraw`] each frame.
+#[allow(clippy::too_many_arguments)]
 pub fn draw_gizmo(
     mut draw: ResMut<GizmoDraw>,
     state: Res<GizmoState>,
     selection: Res<SdfSelection>,
     windows: Query<&Window>,
     cameras: Query<(&Camera, &Transform), With<SdfCamera>>,
-    volumes: Query<&Transform, With<SdfVolume>>,
+    nodes: Query<&Transform, (With<crate::node::Node3D>, Without<SdfCamera>)>,
+    parents: Query<&ChildOf>,
+    globals: Query<&GlobalTransform>,
 ) {
     draw.0.clear();
 
@@ -567,8 +619,19 @@ pub fn draw_gizmo(
     let (Ok(window), Ok((camera, cam_xf))) = (windows.single(), cameras.single()) else {
         return;
     };
-    let Ok(target_xf) = volumes.get(entity) else {
+    let Ok(local_xf) = nodes.get(entity).copied() else {
         return;
+    };
+    // Draw from the WORLD transform. Build it from the child's own local `Transform`
+    // times the parent's `GlobalTransform` (not the child's lagging own global — see
+    // `gizmo_update`), so the handles track the live drag without a frame of delay.
+    let parent_global = parents
+        .get(entity)
+        .ok()
+        .and_then(|c| globals.get(c.parent()).ok().copied());
+    let target_xf = match parent_global {
+        Some(pg) => pg.mul_transform(local_xf).compute_transform(),
+        None => local_xf,
     };
     let active = state.drag.as_ref().map(|d| d.id).or(state.hovered);
 

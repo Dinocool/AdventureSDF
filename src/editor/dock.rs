@@ -158,8 +158,7 @@ impl TabViewer for EditorTabViewer<'_> {
                 super::project_files::project_files_ui(self.world, ui);
             }
             EditorTab::AssetsDrawer => {
-                // Stub: gains tabs (asset browser, output log, etc.) in a later pass.
-                ui.weak("Assets — coming soon.");
+                super::assets_browser::assets_browser_ui(self.world, ui);
             }
             EditorTab::Registered(id) => {
                 if let Some(render) = self.registry.panel_by_id(id).map(|p| &p.render) {
@@ -234,11 +233,13 @@ pub fn show_editor_dock(world: &mut World) {
 
     dock.viewport_rect = viewport_rect;
     // Allow viewport interaction only while the pointer is inside the viewport tab
-    // (and not dragging a dock divider). Gates the SDF orbit/pick systems so clicks
-    // on panels don't fall through to the 3D scene.
+    // AND egui doesn't want the pointer itself. The second clause matters for floating
+    // windows (e.g. the Create Node dialog) that sit *over* the viewport rect: without
+    // it, clicks on the dialog fall through to the 3D scene and pick/select nodes.
     let in_viewport = ctx
         .pointer_latest_pos()
-        .is_some_and(|p| viewport_rect.contains(p));
+        .is_some_and(|p| viewport_rect.contains(p))
+        && !ctx.wants_pointer_input();
     dock.pointer_in_viewport = in_viewport;
     world
         .resource_mut::<crate::sdf_render::ViewportInputAllowed>()

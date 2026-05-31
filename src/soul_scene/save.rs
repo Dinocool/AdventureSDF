@@ -25,6 +25,10 @@ const SKIP_TYPE_PATHS: &[&str] = &[
     "adventure::soul_scene::NonSerializable",
     "adventure::soul_scene::SkipSerialization",
     "adventure::soul_scene::EditorHidden",
+    // Hierarchy is persisted as a stable parent `LocalId` on each record (see
+    // `parent_local_id`), not as the raw `Entity` in `ChildOf`.
+    "bevy_ecs::hierarchy::ChildOf",
+    "bevy_ecs::hierarchy::Children",
 ];
 
 /// Errors raised while saving a `.scene`.
@@ -90,12 +94,15 @@ fn build_scene_file(world: &mut World, registry: &TypeRegistry) -> SceneFile {
     for (entity, id) in entity_ids {
         max_id = max_id.max(id.0);
 
+        let parent = parent_local_id(world, entity);
+
         // An instance root re-emits its ref + a freshly re-diffed override map so
         // edits made to the instanced subtree since load are captured (the plan's
         // "re-capture on save" pitfall).
         if let Some(instance) = world.get::<SceneInstance>(entity).cloned() {
             records.push(SceneRecord::Instance {
                 id,
+                parent,
                 source: instance.source.clone(),
                 overrides: rediff_overrides(world, &instance, registry),
             });
@@ -103,13 +110,25 @@ fn build_scene_file(world: &mut World, registry: &TypeRegistry) -> SceneFile {
         }
 
         let components = serialize_entity_components(world, entity, registry);
-        records.push(SceneRecord::Entity { id, components });
+        records.push(SceneRecord::Entity {
+            id,
+            parent,
+            components,
+        });
     }
 
     SceneFile {
         next_id: max_id + 1,
         records,
     }
+}
+
+/// Resolve an entity's parent (via `ChildOf`) to the parent's stable `LocalId`, if
+/// the parent is itself a saved scene entity. Returns `None` for roots or parents
+/// outside the scene set.
+fn parent_local_id(world: &World, entity: Entity) -> Option<u64> {
+    let parent = world.get::<ChildOf>(entity)?.parent();
+    world.get::<LocalId>(parent).map(|id| id.0)
 }
 
 /// Re-derive the override map for an instance by diffing each overridden

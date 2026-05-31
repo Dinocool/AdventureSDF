@@ -13,8 +13,7 @@ use std::collections::HashMap;
 
 use bevy::prelude::*;
 
-use super::MaterialAsset;
-use crate::sdf_render::textures::LibraryVariant;
+use super::{MapSet, MaterialAsset};
 
 /// Physical texture-array layer cap. Demand-driven assignment fills slots up to
 /// this; the arrays are created once at this size (no recreation). A placeholder
@@ -22,40 +21,40 @@ use crate::sdf_render::textures::LibraryVariant;
 /// page cache + indirection table.
 pub const MAX_TEXTURE_LAYERS: u32 = 64;
 
-/// The demand-driven texture library: a grow-only map from a texture variant
-/// (`slug`, `dir`) to its GPU array layer, plus the ordered variant list (index =
-/// layer) that feeds BC7 streaming.
+/// The demand-driven texture library: a grow-only map from a resolved [`MapSet`]
+/// (the override-merged role files) to its GPU array layer, plus the ordered map-set
+/// list (index = layer) that feeds BC7 streaming.
 #[derive(Resource, Default)]
 pub struct MaterialTextureLibrary {
-    layer_of: HashMap<(String, String), u32>,
+    layer_of: HashMap<MapSet, u32>,
     /// Index = layer. Cloned into the render world to drive streaming.
-    pub variants: Vec<LibraryVariant>,
+    pub variants: Vec<MapSet>,
     /// Set when a new layer is assigned, so the render world re-extracts + streams.
     pub dirty: bool,
 }
 
 impl MaterialTextureLibrary {
-    /// Resolve a texture variant to its GPU layer, assigning the next free layer on
-    /// first use. Returns `u32::MAX` if the cap is reached (renders as fallback).
-    pub fn resolve_layer(&mut self, slug: &str, dir: &str) -> u32 {
-        let key = (slug.to_string(), dir.to_string());
-        if let Some(&layer) = self.layer_of.get(&key) {
+    /// Resolve a [`MapSet`] (override-merged role files) to its GPU layer, assigning the
+    /// next free layer on first use. Empty sets and cap overflow return `u32::MAX`
+    /// (renders with the per-map fallbacks).
+    pub fn resolve_layer(&mut self, map_set: &MapSet) -> u32 {
+        if map_set.is_empty() {
+            return u32::MAX;
+        }
+        if let Some(&layer) = self.layer_of.get(map_set) {
             return layer;
         }
         let layer = self.variants.len() as u32;
         if layer >= MAX_TEXTURE_LAYERS {
             warn!(
                 "texture library at MAX_TEXTURE_LAYERS ({MAX_TEXTURE_LAYERS}); \
-                 '{slug}/{dir}' falls back"
+                 '{}' falls back",
+                map_set.label()
             );
             return u32::MAX;
         }
-        self.variants.push(LibraryVariant {
-            slug: slug.to_string(),
-            dir: dir.to_string(),
-            display_name: format!("{slug} {dir}"),
-        });
-        self.layer_of.insert(key, layer);
+        self.variants.push(map_set.clone());
+        self.layer_of.insert(map_set.clone(), layer);
         self.dirty = true;
         layer
     }

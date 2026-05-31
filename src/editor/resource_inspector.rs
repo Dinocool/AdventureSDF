@@ -13,9 +13,7 @@
 use bevy::prelude::*;
 use bevy_egui::egui;
 
-use crate::assets::{Asset, MaterialAsset, MaterialAssetTable, TexRef};
-use crate::sdf_render::edits::MATERIAL_TEX_MAPS;
-use crate::sdf_render::textures::{LibraryVariant, TEXTURE_ROOT, read_manifest};
+use crate::assets::MaterialAssetTable;
 
 /// Which inner tab the Resource Inspector shows.
 #[derive(Resource, Default, PartialEq, Eq, Clone, Copy)]
@@ -33,9 +31,6 @@ pub struct ResourceInspectorState {
     selected: Option<usize>,
     save_name: String,
 }
-
-/// Map names for the per-map texture-reference editors.
-const MAP_LABELS: [&str; MATERIAL_TEX_MAPS] = ["Diffuse", "Normal", "MRA", "Height", "Edge"];
 
 /// The panel render entry point (registered via `register_panel`).
 pub fn resource_inspector_ui(world: &mut World, ui: &mut egui::Ui) {
@@ -91,73 +86,9 @@ fn materials_tab(world: &mut World, ui: &mut egui::Ui) {
 
     ui.separator();
 
-    // Discover available (slug, dir) variants for the map pickers.
-    let variants = discover_variants();
-
-    // Edit the selected material's asset in place (fires Modified -> recompile).
+    // Shared editor: interactive preview + field editors (single source of truth).
     let handle = world.resource::<MaterialAssetTable>().handles[id].clone();
-    let mut changed = false;
-    {
-        let mut assets = world.resource_mut::<Assets<MaterialAsset>>();
-        let Some(asset) = assets.get_mut(&handle) else {
-            ui.weak("Material asset still loading…");
-            return;
-        };
-
-        let mut rgb = [
-            asset.base_color[0],
-            asset.base_color[1],
-            asset.base_color[2],
-        ];
-        if ui.color_edit_button_rgb(&mut rgb).changed() {
-            asset.base_color[0] = rgb[0];
-            asset.base_color[1] = rgb[1];
-            asset.base_color[2] = rgb[2];
-            changed = true;
-        }
-        if ui
-            .add(egui::Slider::new(&mut asset.blend_softness, 0.0..=1.0).text("Blend softness"))
-            .changed()
-        {
-            changed = true;
-        }
-
-        ui.separator();
-        ui.label("Texture maps");
-        for (m, label) in MAP_LABELS.iter().enumerate() {
-            let current = asset.maps[m]
-                .as_ref()
-                .map(|t| format!("{}/{}", t.slug, t.dir))
-                .unwrap_or_else(|| "(none)".to_string());
-            egui::ComboBox::from_label(*label)
-                .selected_text(current)
-                .show_ui(ui, |ui| {
-                    if ui
-                        .selectable_label(asset.maps[m].is_none(), "(none)")
-                        .clicked()
-                    {
-                        asset.maps[m] = None;
-                        changed = true;
-                    }
-                    for v in &variants {
-                        let sel = asset.maps[m]
-                            .as_ref()
-                            .is_some_and(|t| t.slug == v.slug && t.dir == v.dir);
-                        if ui
-                            .selectable_label(sel, format!("{}/{}", v.slug, v.dir))
-                            .clicked()
-                        {
-                            asset.maps[m] = Some(TexRef {
-                                slug: v.slug.clone(),
-                                dir: v.dir.clone(),
-                            });
-                            changed = true;
-                        }
-                    }
-                });
-        }
-    }
-    let _ = changed; // get_mut already marked the asset modified.
+    crate::editor::material_editor::material_editor_ui(world, &handle, ui);
 
     // Save controls.
     ui.separator();
@@ -170,19 +101,12 @@ fn materials_tab(world: &mut World, ui: &mut egui::Ui) {
         world.resource_mut::<ResourceInspectorState>().save_name = name.clone();
     }
     if ui.button("Save").clicked() && !name.is_empty() {
-        let path = std::path::PathBuf::from(format!("assets/materials/{name}.material.ron"));
-        let assets = world.resource::<Assets<MaterialAsset>>();
-        if let Some(asset) = assets.get(&handle) {
-            match asset.save(&path) {
-                Ok(()) => info!("saved material to {}", path.display()),
-                Err(e) => error!("material save failed: {e}"),
-            }
-        }
+        crate::editor::material_editor::save_material(world, &handle, &name);
     }
 }
 
 fn textures_tab(_world: &mut World, ui: &mut egui::Ui) {
-    let variants = discover_variants();
+    let variants = crate::editor::material_editor::discover_variants();
     ui.label(format!("{} texture variants", variants.len()));
     ui.weak("Import: 1024², BC7 (read-only)");
     ui.separator();
@@ -196,25 +120,4 @@ fn textures_tab(_world: &mut World, ui: &mut egui::Ui) {
             ui.label(format!("  {} — {}", v.dir, v.display_name));
         }
     });
-}
-
-/// Discover all texture variants by scanning `assets/textures/<slug>/material.ron`.
-/// Demand-driven loading still happens via materials; this is purely for the editor
-/// pickers/listing (what textures *could* be referenced).
-fn discover_variants() -> Vec<LibraryVariant> {
-    let mut out = Vec::new();
-    let Ok(entries) = std::fs::read_dir(TEXTURE_ROOT) else {
-        return out;
-    };
-    let mut slugs: Vec<String> = entries
-        .flatten()
-        .filter(|e| e.path().is_dir())
-        .filter(|e| e.path().join("material.ron").is_file())
-        .filter_map(|e| e.file_name().into_string().ok())
-        .collect();
-    slugs.sort();
-    for slug in slugs {
-        out.extend(read_manifest(&slug));
-    }
-    out
 }
