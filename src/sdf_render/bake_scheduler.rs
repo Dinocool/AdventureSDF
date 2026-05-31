@@ -562,11 +562,17 @@ fn emit_gpu_bakes(
         }
     }
 
-    // Will the render world recreate the atlas texture this frame? It reallocs on a full
-    // bake or when the tile high-water needs more rows than it has committed. On a realloc
-    // the texture is zero-filled, dropping every GPU-written tile — so we must re-emit all.
+    // Will the render world recreate the atlas texture this frame? Only when the tile
+    // high-water needs more rows than it has committed (a grow → recreate + zero-fill,
+    // dropping every GPU-written tile, so we must re-emit the whole resident set).
+    //
+    // Do NOT also OR in `atlas.last_bake_was_full` here: this function WRITES that flag (as
+    // the realloc signal to the render world), so reading it back would be a feedback loop —
+    // a single realloc would latch it `true` and re-emit every brick every frame forever.
+    // The grow comparison is self-clearing: once `gpu_atlas_rows == required_rows`, the next
+    // idle frame sees no grow and emits nothing.
     let required_rows = atlas.tiles.high_water().div_ceil(ATLAS_TILES_PER_ROW).max(1);
-    let realloc = atlas.last_bake_was_full || required_rows > sched.gpu_atlas_rows;
+    let realloc = required_rows > sched.gpu_atlas_rows;
 
     // Pass 2: build the jobs. On a realloc, every resident brick; otherwise the dirty shell.
     let bake_keys: Vec<atlas::BrickKey> = if realloc {
