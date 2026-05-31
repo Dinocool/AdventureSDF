@@ -3,7 +3,7 @@ use bevy::prelude::*;
 use std::collections::{HashMap, HashSet};
 
 use crate::sdf_render::bvh::Bvh;
-use crate::sdf_render::edits::{PALETTE_K, Palette};
+use crate::sdf_render::edits::Palette;
 
 /// Atlas tiles per texture row. The atlas texture is `ATLAS_TILES_PER_ROW × 64` px wide;
 /// its height grows in 8-px tile rows as `high_water().div_ceil(ATLAS_TILES_PER_ROW)`.
@@ -16,14 +16,6 @@ pub const BRICK_EDGE: usize = 8;
 /// Total voxel samples in one brick.
 pub const BRICK_VOXELS: usize = BRICK_EDGE * BRICK_EDGE * BRICK_EDGE; // 512
 
-/// Signed-distance values for one brick, stored as 16-bit snorm. 16 bits keeps
-/// the gradient (and thus shading normals) smooth — 8-bit quantization steps
-/// are large enough to produce visible normal noise on flat surfaces.
-pub type SdfBrick = [i16; BRICK_VOXELS];
-/// Per-voxel, per-palette-slot distance field for one brick: `PALETTE_K` (4)
-/// 16-bit-snorm distances per voxel, laid out voxel-major
-/// (`voxel * PALETTE_K + slot`). Slot `k` is keyed to `PackedBrick::palette[k]`.
-pub type MaterialBrick = [i16; BRICK_VOXELS * PALETTE_K];
 
 pub type BrickCoord = IVec3;
 
@@ -108,10 +100,16 @@ impl TileAllocator {
 /// `palette` maps each local slot to a global material id (`PALETTE_EMPTY` =
 /// unused). It is uniform across the brick, so slot `k` is the same material at all
 /// 8 corners of every cell — keeping the trilinear interpolation valid.
+/// CPU-side record for one resident brick. The GPU bake owns the actual voxel TEXELS (they
+/// live in the atlas textures, written by `sdf_brick_bake.wgsl` and never read back), so the
+/// CPU keeps only what it needs for topology + the bake cache: the material palette and the
+/// epoch the brick was baked under. (The 5 KB/brick `dist`+`mat_dist` snorm arrays this struct
+/// used to carry were write-only zero placeholders in the GPU path — allocated + zeroed for
+/// every brick every bake frame, never written with real data and only read by an
+/// editor-only atlas-preview that consequently showed garbage. Removed: that allocation was
+/// MBs/frame of pure waste while a large object moved.)
 #[derive(Clone)]
 pub struct PackedBrick {
-    pub dist: SdfBrick,
-    pub mat_dist: MaterialBrick,
     pub palette: Palette,
     /// The atlas `edit_epoch` this brick was baked under. The bake emit skips re-baking a
     /// resident brick whose `baked_epoch` equals the current `edit_epoch` — its GPU texels are
@@ -281,8 +279,6 @@ impl SdfAtlas {
         self.generation = self.generation.wrapping_add(1);
         let palette_changed = self.bricks.get(&key).is_some_and(|old| old.palette != palette);
         let placeholder = PackedBrick {
-            dist: [0; BRICK_VOXELS],
-            mat_dist: [0; BRICK_VOXELS * PALETTE_K],
             palette,
             baked_epoch: self.edit_epoch,
         };
@@ -399,6 +395,7 @@ pub fn bricks_in_aabb_lod(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sdf_render::edits::PALETTE_K;
     use crate::sdf_render::edits::{PALETTE_EMPTY, ResolvedEdit, SdfOp, SdfPrimitive, build_palette};
 
     fn resolved(prim: SdfPrimitive, t: Transform, id: u16) -> ResolvedEdit {

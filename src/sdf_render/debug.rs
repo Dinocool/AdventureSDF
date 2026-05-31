@@ -18,7 +18,6 @@ use crate::scene_manager::{AppScene, SceneEntity};
 
 use super::atlas::{BRICK_EDGE, BRICK_VOXELS, SdfAtlas};
 use super::bvh::Bvh;
-use super::edits::PALETTE_K;
 use super::{
     CsgKind, RayStepCapture, SdfCamera, SdfGridConfig, SdfMaterial, SdfOp, SdfOrbitCamera,
     SdfOrder, SdfOverlayGizmos, SdfPrimitive, SdfRaymarchParams, SdfVolume,
@@ -423,43 +422,30 @@ fn update_atlas_textures(
     let mut dist_rgba = vec![0u8; pixels * 4];
     let mut object_rgba = vec![0u8; pixels * 4];
 
+    // The GPU owns the per-voxel texels (the CPU `PackedBrick` no longer stores dist/mat —
+    // they were write-only zeros here), so this preview shows what the CPU DOES know: the
+    // resident-brick layout, each tile filled with its palette colour. Distance pane reuses the
+    // same colour at reduced brightness so the tile grid is still legible. (For per-voxel atlas
+    // inspection, read back the GPU dist/mat textures instead — not wired up.)
     for (i, packed) in atlas.bricks.values().enumerate() {
         let tile = i as u32;
         let col_px = (tile % tiles_per_row) * tile_width;
         let row_px = (tile / tiles_per_row) * edge;
+        let [r, gg, b] = object_color((packed.palette[0] & 0xff) as u8);
         for z in 0..edge {
             for y in 0..edge {
                 for x in 0..edge {
-                    let src = (z * edge * edge + y * edge + x) as usize;
                     let dst_u = col_px + y * edge + x;
                     let dst_v = row_px + z;
                     let dst = (dst_v * width + dst_u) as usize;
-
-                    // Distance: snorm [-1,1] -> grayscale, with the zero-crossing
-                    // at mid gray so surfaces read as a clear edge.
-                    let d = packed.dist[src] as f32 / 32767.0;
-                    let g = ((d * 0.5 + 0.5).clamp(0.0, 1.0) * 255.0) as u8;
-                    dist_rgba[dst * 4] = g;
-                    dist_rgba[dst * 4 + 1] = g;
-                    dist_rgba[dst * 4 + 2] = g;
-                    dist_rgba[dst * 4 + 3] = 255;
-
-                    // Material = argmin over the K palette-slot distances (what the
-                    // shader resolves per pixel), mapped through the brick palette to
-                    // a global id -> distinct palette color.
-                    let base = src * PALETTE_K;
-                    let mut best = 0usize;
-                    for k in 1..PALETTE_K {
-                        if packed.mat_dist[base + k] < packed.mat_dist[base + best] {
-                            best = k;
-                        }
-                    }
-                    let global_id = packed.palette[best];
-                    let [r, gg, b] = object_color((global_id & 0xff) as u8);
                     object_rgba[dst * 4] = r;
                     object_rgba[dst * 4 + 1] = gg;
                     object_rgba[dst * 4 + 2] = b;
                     object_rgba[dst * 4 + 3] = 255;
+                    dist_rgba[dst * 4] = r / 2;
+                    dist_rgba[dst * 4 + 1] = gg / 2;
+                    dist_rgba[dst * 4 + 2] = b / 2;
+                    dist_rgba[dst * 4 + 3] = 255;
                 }
             }
         }
