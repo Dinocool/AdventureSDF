@@ -460,7 +460,7 @@ pub fn schedule_bakes(
     // side (the atlas grew taller) zero-fills the texture and drops every GPU-written tile,
     // so on a grow frame we re-emit the WHOLE resident set, not just this frame's shell.
     if gpu_mode {
-        emit_gpu_bakes(&mut atlas, &mut sched, &mut gpu_bakes, &config, camera_pos);
+        emit_gpu_bakes(&mut atlas, &mut sched, &mut gpu_bakes, &config);
         return;
     }
 
@@ -535,87 +535,103 @@ fn emit_gpu_bakes(
     sched: &mut BakeScheduler,
     gpu_bakes: &mut PendingGpuBakes,
     config: &SdfGridConfig,
-    camera_pos: Vec3,
 ) {
+    let _span = info_span!("sdf_emit_gpu_bakes").entered();
     let edits_snapshot = Arc::clone(&sched.edits);
     let bvh_snapshot = Arc::clone(&sched.bvh);
     let mut scratch: Vec<u32> = Vec::new();
 
-    // Pass 1: cull + allocate the dirty shell (or drop empty bricks). Collect the live keys
-    // so pass 2 can build their jobs once the realloc decision is known.
-    let drained = drain_budget(&mut sched.pending, camera_pos, config, SCHEDULE_BUDGET_CHUNKS);
-    let mut dirty_live: Vec<atlas::BrickKey> = Vec::new();
+    // Emit one bake job for `key` from already-culled edit indices `indices` and a known
+    // `palette`. No re-cull, no palette rebuild — the caller supplies both. `tile` must be
+    // allocated.
+    #[expect(clippy::too_many_arguments)]
+    fn push_job(
+        atlas: &mut SdfAtlas,
+        gpu_bakes: &mut PendingGpuBakes,
+        edits_snapshot: &[edits::ResolvedEdit],
+        config: &SdfGridConfig,
+        key: atlas::BrickKey,
+        tile: u32,
+        indices: &[u32],
+        palette: edits::Palette,
+    ) {
+        let edit_start = gpu_bakes.edits.len() as u32;
+        for &i in indices {
+            gpu_bakes.edits.push(edits::to_gpu_edit(&edits_snapshot[i as usize]));
+        }
+        gpu_bakes.jobs.push(GpuBakeJob {
+            tile,
+            lod: key.lod,
+            coord: key.coord,
+            voxel_size: config.voxel_size_at(key.lod),
+            dist_band: atlas::dist_band_world(config, key.lod),
+            palette,
+            edit_start,
+            edit_count: indices.len() as u32,
+        });
+        atlas.gpu_baked_tiles.insert(tile);
+    }
+
+    // Dirty shell: cull → build palette → allocate tile → emit job, all from ONE cull. The
+    // palette uses the cheap 9-point sample (corners + centre), not all 512 voxels — that 57×
+    // cut is what keeps a drag (hundreds of dirty bricks/frame) off the CPU. Empty bricks are
+    // evicted.
+    //
+    // Drain ALL pending each frame (no per-frame budget). The budget exists for the CPU bake
+    // path to bound the main-thread voxel-loop cost, but in GPU mode the CPU only culls +
+    // builds a 9-point palette + emits a job (the GPU does the eval), so the per-chunk cost is
+    // tiny. Critically, budgeting here is also a *correctness* bug: when an edit moves it
+    // dirties its old∪new footprint, and the vacated (old) chunks MUST be evicted the same
+    // frame or their stale bricks linger as a trail behind the dragged object. The nearest-
+    // camera-first budget starved those trailing chunks whenever a drag dirtied >budget chunks
+    // — the "parts left behind" artifact. Draining everything evicts vacated bricks immediately.
+    let drained: Vec<chunk::ChunkKey> = sched.pending.drain().collect();
+    let mut dirtied: std::collections::HashSet<atlas::BrickKey> = std::collections::HashSet::new();
     for ck in &drained {
         for key in chunk_brick_keys(*ck, config) {
             if atlas::SdfAtlas::cull_edit_indices(key, &bvh_snapshot, config, &mut scratch).is_some()
             {
                 let voxel_size = config.voxel_size_at(key.lod);
-                let positions = atlas::SdfAtlas::brick_voxel_positions(key, voxel_size);
+                let samples = atlas::SdfAtlas::brick_palette_samples(key, voxel_size);
                 let culled: Vec<edits::ResolvedEdit> =
                     scratch.iter().map(|&i| edits_snapshot[i as usize].clone()).collect();
-                let palette = edits::build_palette(&culled, &positions);
-                atlas.insert_gpu_brick(key, palette);
-                dirty_live.push(key);
+                let palette = edits::build_palette(&culled, &samples);
+                let tile = atlas.insert_gpu_brick(key, palette);
+                dirtied.insert(key);
+                push_job(
+                    atlas, gpu_bakes, &edits_snapshot, config, key, tile, &scratch, palette,
+                );
             } else {
                 atlas.remove_brick(&key);
             }
         }
     }
 
-    // Will the render world recreate the atlas texture this frame? Only when the tile
-    // high-water needs more rows than it has committed (a grow → recreate + zero-fill,
-    // dropping every GPU-written tile, so we must re-emit the whole resident set).
-    //
-    // Do NOT also OR in `atlas.last_bake_was_full` here: this function WRITES that flag (as
-    // the realloc signal to the render world), so reading it back would be a feedback loop —
-    // a single realloc would latch it `true` and re-emit every brick every frame forever.
-    // The grow comparison is self-clearing: once `gpu_atlas_rows == required_rows`, the next
-    // idle frame sees no grow and emits nothing.
+    // Did the atlas grow taller? If so the render world recreates + zero-fills the texture
+    // this frame, dropping every GPU-written tile — so we must additionally re-emit the
+    // resident bricks that AREN'T in this frame's dirty set, reusing their stored palette
+    // (no rebuild). Keyed purely on row growth (self-clearing); do NOT read back
+    // `last_bake_was_full`, which this function writes — that would latch a permanent
+    // every-frame re-emit (the constant-FPS bug).
     let required_rows = atlas.tiles.high_water().div_ceil(ATLAS_TILES_PER_ROW).max(1);
     let realloc = required_rows > sched.gpu_atlas_rows;
-
-    // Pass 2: build the jobs. On a realloc, every resident brick; otherwise the dirty shell.
-    let bake_keys: Vec<atlas::BrickKey> = if realloc {
-        atlas.bricks.keys().copied().collect()
-    } else {
-        dirty_live
-    };
-
-    for key in bake_keys {
-        // The tile was allocated in pass 1 (dirty shell) or on a prior frame (already
-        // resident); either way it exists. Re-cull for the shader's edit list + palette.
-        let Some(tile) = atlas.tiles.tile(&key) else { continue };
-        if atlas::SdfAtlas::cull_edit_indices(key, &bvh_snapshot, config, &mut scratch).is_none() {
-            continue;
-        }
-        let voxel_size = config.voxel_size_at(key.lod);
-        let dist_band = atlas::dist_band_world(config, key.lod);
-        let positions = atlas::SdfAtlas::brick_voxel_positions(key, voxel_size);
-        let culled: Vec<edits::ResolvedEdit> =
-            scratch.iter().map(|&i| edits_snapshot[i as usize].clone()).collect();
-        let palette = edits::build_palette(&culled, &positions);
-
-        let edit_start = gpu_bakes.edits.len() as u32;
-        for e in &culled {
-            gpu_bakes.edits.push(edits::to_gpu_edit(e));
-        }
-        gpu_bakes.jobs.push(GpuBakeJob {
-            tile,
-            lod: key.lod,
-            coord: key.coord,
-            voxel_size,
-            dist_band,
-            palette,
-            edit_start,
-            edit_count: culled.len() as u32,
-        });
-        atlas.gpu_baked_tiles.insert(tile);
-    }
-
     if realloc {
-        // Tell the render world to recreate the texture (then our bake node fills it), and
-        // remember the committed height so we don't re-emit the full set every frame.
-        atlas.last_bake_was_full = true;
+        let resident: Vec<(atlas::BrickKey, u32, edits::Palette)> = atlas
+            .bricks
+            .iter()
+            .filter(|(k, _)| !dirtied.contains(k))
+            .filter_map(|(k, b)| atlas.tiles.tile(k).map(|t| (*k, t, b.palette)))
+            .collect();
+        for (key, tile, palette) in resident {
+            // Re-emit reuses the stored palette but still needs the culled edit list.
+            if atlas::SdfAtlas::cull_edit_indices(key, &bvh_snapshot, config, &mut scratch).is_some()
+            {
+                push_job(
+                    atlas, gpu_bakes, &edits_snapshot, config, key, tile, &scratch, palette,
+                );
+            }
+        }
+        atlas.last_bake_was_full = true; // signal the render world to recreate the texture
         sched.gpu_atlas_rows = required_rows;
     } else {
         atlas.last_bake_was_full = false;

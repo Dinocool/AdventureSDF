@@ -273,6 +273,22 @@ impl SdfAtlas {
         positions
     }
 
+    /// 9 sample points for a cheap palette build: the brick's 8 corners + centre. The palette
+    /// only needs the ≤K material ids *present* in the brick, and a material that owns any
+    /// voxel is essentially always nearest at a corner or the centre too — so this matches the
+    /// full 512-point [`brick_voxel_positions`] palette for any brick with ≤K materials (the
+    /// overwhelming common case), at 1/57th the `eval_world` cost. Used by the GPU bake job
+    /// emission, where the per-frame brick count makes the 512-point build the drag bottleneck.
+    pub fn brick_palette_samples(key: BrickKey, voxel_size: f32) -> [Vec3; 9] {
+        let e = BRICK_EDGE - 1;
+        let c = |x: usize, y: usize, z: usize| Self::voxel_world_pos(key.coord, x, y, z, voxel_size);
+        [
+            c(0, 0, 0), c(e, 0, 0), c(0, e, 0), c(e, e, 0),
+            c(0, 0, e), c(e, 0, e), c(0, e, e), c(e, e, e),
+            c(e / 2, e / 2, e / 2),
+        ]
+    }
+
     fn bake_single_brick(
         key: BrickKey,
         config: &super::SdfGridConfig,
