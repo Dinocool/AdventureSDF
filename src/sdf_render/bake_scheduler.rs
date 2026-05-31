@@ -14,6 +14,7 @@
 use std::sync::Arc;
 
 use bevy::prelude::*;
+use bevy::tasks::{ComputeTaskPool, ParallelSlice};
 
 use super::atlas::{self, SdfAtlas};
 use super::chunk;
@@ -448,7 +449,6 @@ fn emit_gpu_bakes(
     let _span = info_span!("sdf_emit_gpu_bakes").entered();
     let edits_snapshot = Arc::clone(&sched.edits);
     let bvh_snapshot = Arc::clone(&sched.bvh);
-    let mut scratch: Vec<u32> = Vec::new();
 
     // Emit one bake job for `key` from already-culled edit indices `indices` and a known
     // `palette`. No re-cull, no palette rebuild — the caller supplies both. `tile` must be
@@ -501,52 +501,87 @@ fn emit_gpu_bakes(
     //     spills the finest detail, whose coarse fallback is already resident this frame.
     let mut drained: Vec<chunk::ChunkKey> = sched.pending.drain().collect();
     drained.sort_unstable_by_key(|ck| std::cmp::Reverse(ck.lod)); // coarsest (highest lod) first
-    let mut spilled: Vec<chunk::ChunkKey> = Vec::new();
     let epoch = atlas.edit_epoch;
+
+    // --- Phase 1 (serial, cheap): gather candidate bricks, applying the epoch skip ----------
+    // Skip a brick already baked under the CURRENT edit epoch: it's resident (GPU holds its
+    // texels, the lookup maps it) and folded the same edits, so re-baking is pure waste — this
+    // keeps a large object's multi-frame bake cheap. The skip reads `atlas.bricks`, so it stays
+    // serial here; everything past it is read-only per brick and runs in parallel below. Each
+    // candidate carries its source ChunkKey so a job-capped (spilled) brick re-queues its chunk.
+    let mut candidates: Vec<(chunk::ChunkKey, atlas::BrickKey)> = Vec::new();
     for ck in &drained {
-        let mut chunk_spilled = false;
         for key in chunk_brick_keys(*ck, config) {
-            // Skip a brick already baked under the CURRENT edit epoch: it is resident (so the
-            // GPU holds its texels and the lookup table maps it) and folded the same edits, so
-            // re-culling + re-baking it would be pure waste. This is what makes a large object's
-            // multi-frame bake cheap — each frame only processes the bricks NOT yet baked
-            // (newly entered or spilled-and-not-yet-emitted), instead of re-doing the whole
-            // resident set every frame while the job cap drains. An edit change bumps
-            // `edit_epoch`, lapsing every brick's stamp so the re-dirtied footprint re-bakes;
-            // an evicted/re-entered chunk's bricks were removed, so they re-bake fresh.
             if atlas.bricks.get(&key).is_some_and(|b| b.baked_epoch == epoch) {
                 continue;
             }
-            if atlas::SdfAtlas::cull_edit_indices(key, &bvh_snapshot, config, &mut scratch).is_some()
-            {
-                // Narrow-band cull: bake only the surface SHELL (see `narrow_band_keep`). Drops
-                // the r³ interior + far-exterior bulk the march never reads. A dropped brick is
-                // evicted (it reads as empty, same as genuine empty space) and costs no job.
-                if !narrow_band_keep(&edits_snapshot, &scratch, config, key) {
-                    atlas.remove_brick(&key);
-                    continue;
-                }
+            candidates.push((*ck, key));
+        }
+    }
 
-                // Over the per-frame job cap → defer this brick's BAKE. Do NOT insert it
-                // (must stay non-resident → coarse-LOD fallback). The chunk is re-queued.
-                if gpu_bakes.jobs.len() >= GPU_BAKE_JOB_CAP {
-                    chunk_spilled = true;
-                    continue;
+    // --- Phase 2 (parallel, read-only): classify each candidate -----------------------------
+    // The BVH cull, narrow-band keep, and palette build only READ the edits/BVH snapshots (both
+    // Arc, Sync) — no shared mutation — so they fan out across the compute task pool. This is
+    // the bulk of a first-bake's per-brick cost (measured ~68%: keep+palette fold_csg dominate,
+    // BVH cull the rest). Each task keeps its own `scratch`. Results stay in candidate order so
+    // the serial apply below is deterministic (tile allocation order is stable across runs).
+    enum Verdict {
+        Empty,                                   // no edit reaches it → evict
+        Drop,                                    // narrow-band cull → evict
+        Keep(edits::Palette, Vec<u32>),          // bake: palette + culled edit indices
+    }
+    let classify = |_idx: usize, chunk: &[(chunk::ChunkKey, atlas::BrickKey)]| -> Vec<Verdict> {
+        let mut scratch: Vec<u32> = Vec::new();
+        chunk
+            .iter()
+            .map(|&(_ck, key)| {
+                if atlas::SdfAtlas::cull_edit_indices(key, &bvh_snapshot, config, &mut scratch)
+                    .is_none()
+                {
+                    return Verdict::Empty;
+                }
+                if !narrow_band_keep(&edits_snapshot, &scratch, config, key) {
+                    return Verdict::Drop;
                 }
                 let voxel_size = config.voxel_size_at(key.lod);
                 let samples = atlas::SdfAtlas::brick_palette_samples(key, voxel_size);
                 let palette = edits::build_palette_indexed(&edits_snapshot, &scratch, &samples);
-                let tile = atlas.insert_gpu_brick(key, palette);
-                push_job(
-                    atlas, gpu_bakes, &edits_snapshot, config, key, tile, &scratch, palette,
-                );
-            } else {
-                // Empty space → evict immediately (no job, no trail).
-                atlas.remove_brick(&key);
+                Verdict::Keep(palette, scratch.clone())
+            })
+            .collect()
+    };
+    // Chunk size balances task overhead against load balancing; ~one chunk per thread.
+    let verdicts: Vec<Verdict> = if candidates.is_empty() {
+        Vec::new()
+    } else {
+        // `get_or_init` so headless tests (which don't boot the full app that sets up the pool)
+        // still run; in production the pool already exists and the closure is never called.
+        let pool = ComputeTaskPool::get_or_init(bevy::tasks::TaskPool::default);
+        let chunk_size = candidates.len().div_ceil(pool.thread_num().max(1)).max(1);
+        candidates
+            .par_chunk_map(pool, chunk_size, classify)
+            .into_iter()
+            .flatten()
+            .collect()
+    };
+
+    // --- Phase 3 (serial): apply verdicts — evict, or insert + push job under the cap -------
+    // Mutates the atlas + job list, so it's serial. A Keep over the job cap spills its chunk
+    // back to `pending` (NOT inserted → stays non-resident → coarse-LOD fallback, hole-free).
+    let mut spilled: std::collections::HashSet<chunk::ChunkKey> = std::collections::HashSet::new();
+    for ((ck, key), verdict) in candidates.iter().zip(verdicts) {
+        match verdict {
+            Verdict::Empty | Verdict::Drop => {
+                atlas.remove_brick(key);
             }
-        }
-        if chunk_spilled {
-            spilled.push(*ck);
+            Verdict::Keep(palette, indices) => {
+                if gpu_bakes.jobs.len() >= GPU_BAKE_JOB_CAP {
+                    spilled.insert(*ck);
+                    continue;
+                }
+                let tile = atlas.insert_gpu_brick(*key, palette);
+                push_job(atlas, gpu_bakes, &edits_snapshot, config, *key, tile, &indices, palette);
+            }
         }
     }
     // Re-queue spilled chunks for the next frame(s). Their evictions already happened above;
