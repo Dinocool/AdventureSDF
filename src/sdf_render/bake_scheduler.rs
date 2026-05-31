@@ -374,6 +374,64 @@ pub fn schedule_bakes(
     emit_gpu_bakes(&mut atlas, &mut sched, &mut gpu_bakes, &config);
 }
 
+/// Narrow-band cull decision for one candidate brick: KEEP iff the folded isosurface can pass
+/// through it. Drops the deep INTERIOR of a solid (`|d| ≫ 0`) and the FAR-EXTERIOR corners the
+/// coarse AABB query leaves in — the r³ bulk the march never samples (rays approach from
+/// outside, read only the thin zero-band, and stop). `indices` are the brick's BVH-culled edit
+/// indices into `edits`. Pure + allocation-free; unit-tested directly.
+///
+/// SMOOTHING SAFETY: a plain center test `|fold(center)| > circumradius + band` assumes the
+/// folded field is 1-Lipschitz — true ONLY at smoothing 0. iq polynomial `smin`/`smax` have a
+/// correction term `k·h(1−h)` that peaks at `k/4`, so the smoothed field can sit up to `Σ kᵢ/4`
+/// (additive down the fold chain) NEARER the true surface than `fold_hard` — the bound that
+/// kept the cull safe. Without padding for it, a brick at a SMOOTHED subtract-carve crease whose
+/// center reads "far" but whose corner actually crosses zero gets wrongly dropped → a hole at
+/// the rim (the reported bug). We pad `reach` by `Σ kᵢ/4`, restoring the conservative bound.
+///
+/// FORCE-KEEP on sign change: as a belt-and-suspenders that can only ever KEEP (never drop, so
+/// it cannot add a hole), if the folded field changes sign across the brick's 9 palette sample
+/// points (8 corners + center) the surface provably crosses the brick → keep regardless of the
+/// center distance. This also catches an enclosed cavity whose surface the center eval misses.
+fn narrow_band_keep(
+    edits: &[edits::ResolvedEdit],
+    indices: &[u32],
+    config: &SdfGridConfig,
+    key: atlas::BrickKey,
+) -> bool {
+    let brick_world = config.brick_world_size(key.lod);
+    let center = config.brick_min_world(key.coord, key.lod) + Vec3::splat(0.5 * brick_world);
+
+    // Smoothing pad: additive Σ(kᵢ)/4 over the brick's smoothed candidate edits.
+    let smooth_sum: f32 = indices
+        .iter()
+        .map(|&i| edits[i as usize].op.smoothing.max(0.0))
+        .sum();
+    let reach = brick_world * (0.5 * 3.0_f32.sqrt())
+        + atlas::dist_band_world(config, key.lod)
+        + 0.25 * smooth_sum;
+
+    // Force-keep if the surface provably crosses the brick (sign change over the 9 samples).
+    // Only meaningful when smoothing inflates the gradient; the common k=0 path stays 1 eval.
+    if smooth_sum > 0.0 {
+        let voxel_size = config.voxel_size_at(key.lod);
+        let samples = atlas::SdfAtlas::brick_palette_samples(key, voxel_size);
+        let mut neg = false;
+        let mut pos = false;
+        for p in samples {
+            if edits::fold_csg_dist_indexed(edits, indices, p) <= 0.0 {
+                neg = true;
+            } else {
+                pos = true;
+            }
+            if neg && pos {
+                return true;
+            }
+        }
+    }
+
+    edits::fold_csg_dist_indexed(edits, indices, center).abs() <= reach
+}
+
 /// Turn this frame's dirty chunks into [`GpuBakeJob`]s: the CPU does only the topology work
 /// (BVH cull → which bricks exist + their palette + a stable tile), and the compute shader
 /// fills each brick's 512 texels straight into the atlas. No main-thread voxel loop.
@@ -445,39 +503,10 @@ fn emit_gpu_bakes(
         for key in chunk_brick_keys(*ck, config) {
             if atlas::SdfAtlas::cull_edit_indices(key, &bvh_snapshot, config, &mut scratch).is_some()
             {
-                // Narrow-band cull: bake only the surface SHELL, dropping bricks the isosurface
-                // cannot reach. The AABB overlap above is coarse — it keeps every brick inside a
-                // solid (DEEP INTERIOR) and, for a non-box primitive, every brick in the edit's
-                // bounding box including its FAR-EXTERIOR corners. The march reads neither: rays
-                // approach from outside through empty space (brick-DDA skips non-resident space),
-                // read the field only in the thin band where it crosses zero, accept the hit, and
-                // stop. Interior + far-exterior texels (saturated ±band) are baked, uploaded, and
-                // never sampled — and the interior is r³ vs the shell's r², the bulk that drives
-                // the approach-bake hitch on a large solid.
-                //
-                // Keep a brick iff the folded surface can reach it: |d| at the brick centre is
-                // within the brick circumradius (half the space diagonal — the farthest a corner
-                // sits from the centre) plus the snorm band the brick stores. That keeps the full
-                // shell the march samples; everything deeper-in or farther-out is dropped. A
-                // dropped brick reads as empty (non-resident → brick-DDA / coarse-LOD fallback),
-                // exactly as genuinely empty space does.
-                //
-                // KNOWN LIMITATION (interior cavities — NOT handled, by decision): a carve fully
-                // ENCLOSED inside a solid (a Subtract bubble that never breaks the outer surface)
-                // has its own surface in the brick INTERIOR. Centre-only sampling can mis-classify
-                // a brick the cavity surface merely grazes as deep-interior and drop it, leaving a
-                // hole when the camera is inside the cavity. We will carve interior cavities later;
-                // when that lands, replace this single centre eval with an 8-corner (min-over-
-                // corners of |d|) test so an enclosed cavity surface is never missed.
-                let center = config.brick_min_world(key.coord, key.lod)
-                    + Vec3::splat(0.5 * config.brick_world_size(key.lod));
-                let d_center = edits::fold_csg_dist_indexed(&edits_snapshot, &scratch, center);
-                let reach = config.brick_world_size(key.lod) * (0.5 * 3.0_f32.sqrt())
-                    + atlas::dist_band_world(config, key.lod);
-                if d_center.abs() > reach {
-                    // Surface out of reach (deep interior OR far exterior) → never sampled by the
-                    // march. Evict any stale resident brick (e.g. a shrinking/moving edit) and
-                    // skip: no insert, no job, no cap/spill cost.
+                // Narrow-band cull: bake only the surface SHELL (see `narrow_band_keep`). Drops
+                // the r³ interior + far-exterior bulk the march never reads. A dropped brick is
+                // evicted (it reads as empty, same as genuine empty space) and costs no job.
+                if !narrow_band_keep(&edits_snapshot, &scratch, config, key) {
                     atlas.remove_brick(&key);
                     continue;
                 }
@@ -616,6 +645,108 @@ mod tests {
             transform: Transform::from_translation(pos),
             op: SdfOp { kind: CsgKind::Union, smoothing: 0.0 },
             material_id: mat,
+        }
+    }
+
+    fn subtract_sphere(pos: Vec3, radius: f32) -> ResolvedEdit {
+        ResolvedEdit {
+            prim: SdfPrimitive::Sphere { radius },
+            transform: Transform::from_translation(pos),
+            op: SdfOp { kind: CsgKind::Subtract, smoothing: 0.0 },
+            material_id: 0,
+        }
+    }
+
+    /// Regression guard for the narrow-band cull on a SUBTRACTED (hollow / bitten) solid: the
+    /// cull must not drop any brick the TRUE folded surface passes through, and every resident
+    /// brick's per-brick CULLED candidate set must agree in SIGN with the full edit list at the
+    /// brick corners (so the GPU bakes the carve, not solid). Covers both an enclosed cavity and
+    /// an open bite. (Proven the cull is innocent of the interior-hole artefact — that lives in
+    /// the GPU bake/march, not here.)
+    #[test]
+    fn cull_preserves_subtracted_surface_bricks() {
+        for (r_in, off) in [(4.0_f32, 0.0_f32), (5.0, 10.0)] {
+            let cfg = SdfGridConfig { lod_count: 1, ring_bricks: 8, recenter_snap_chunks: 1, ..config() };
+            let r_out = 10.0;
+            let edits = vec![
+                sphere_edit(Vec3::ZERO, r_out, 0),
+                subtract_sphere(Vec3::new(off, 0.0, 0.0), r_in),
+            ];
+            let mut sched = primed_sched(&edits);
+            let mut atlas = SdfAtlas::default();
+            for x in -5..=5 {
+                for y in -5..=5 {
+                    for z in -5..=5 {
+                        sched.pending.insert(chunk::ChunkKey::new(0, IVec3::new(x, y, z)));
+                    }
+                }
+            }
+            let mut gpu = PendingGpuBakes::default();
+            let mut guard = 0;
+            loop {
+                gpu.clear();
+                atlas.gpu_baked_tiles.clear();
+                emit_gpu_bakes(&mut atlas, &mut sched, &mut gpu, &cfg);
+                guard += 1;
+                assert!(guard < 1000);
+                if sched.pending.is_empty() { break; }
+            }
+
+            let all_edits = sched.edits.clone();
+            let bw = cfg.brick_world_size(0);
+            let mut scratch: Vec<u32> = Vec::new();
+            let corner = |bmin: Vec3| {
+                let mut cs = [Vec3::ZERO; 8];
+                let mut i = 0;
+                for cx in [0.0, bw] {
+                    for cy in [0.0, bw] {
+                        for cz in [0.0, bw] {
+                            cs[i] = bmin + Vec3::new(cx, cy, cz);
+                            i += 1;
+                        }
+                    }
+                }
+                cs
+            };
+
+            // (1) No surface-bearing brick dropped.
+            for ck in chunk_window_keys(IVec3::splat(-5), 11, 0) {
+                for key in chunk_brick_keys(ck, &cfg) {
+                    if atlas::SdfAtlas::cull_edit_indices(key, &sched.bvh, &cfg, &mut scratch).is_none() {
+                        continue;
+                    }
+                    let cs = corner(cfg.brick_min_world(key.coord, 0));
+                    let (mut neg, mut pos) = (false, false);
+                    for p in cs {
+                        if edits::fold_csg(&all_edits, p).dist <= 0.0 { neg = true; } else { pos = true; }
+                    }
+                    if neg && pos {
+                        assert!(
+                            atlas.bricks.contains_key(&key),
+                            "r_in={r_in} off={off}: dropped a brick the surface passes through at {:?}",
+                            key.coord
+                        );
+                    }
+                }
+            }
+
+            // (2) Per-brick culled candidate set agrees in sign with the full edit list.
+            for key in atlas.bricks.keys() {
+                if atlas::SdfAtlas::cull_edit_indices(*key, &sched.bvh, &cfg, &mut scratch).is_none() {
+                    continue;
+                }
+                let culled: Vec<edits::ResolvedEdit> =
+                    scratch.iter().map(|&i| all_edits[i as usize].clone()).collect();
+                for p in corner(cfg.brick_min_world(key.coord, 0)) {
+                    let d_full = edits::fold_csg(&all_edits, p).dist;
+                    let d_cull = edits::fold_csg(&culled, p).dist;
+                    assert_eq!(
+                        d_full <= 0.0, d_cull <= 0.0,
+                        "r_in={r_in} off={off}: culled-set sign mismatch at brick {:?} (full={d_full:.3} cull={d_cull:.3})",
+                        key.coord
+                    );
+                }
+            }
         }
     }
 
