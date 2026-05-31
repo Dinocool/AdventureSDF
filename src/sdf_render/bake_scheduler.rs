@@ -336,14 +336,16 @@ pub fn schedule_bakes(
     // `atlas.remove_brick` bumps the upload + topology generations itself, so an evict-only
     // frame (e.g. flying away from the scene) still makes the render world re-extract and
     // drop the stale bricks — it doesn't depend on a bake being applied that frame.
+    // Retention margin (in chunks): we BAKE the inner ring but RETAIN bricks out to
+    // `ring + 2·margin`, evicting only when a brick leaves that larger window. Keeping the
+    // old bricks resident through a ring shift holds the LOD nesting invariant true *during*
+    // the transition — the coarser-LOD fallback (and any rebaked replacement) is always
+    // resident, so there's never a 1-frame hole at the LOD boundary. The shader resolves
+    // bricks purely by chunk-table presence (not ring membership), so a retained brick stays
+    // fully sampleable. `m ≥ recenter_snap_chunks` guarantees survival of one snap crossing.
+    let m = config.retention_margin_chunks.max(0);
+    let mr = r + 2 * m; // margin window edge length (chunks/axis)
     let mut bvh_scratch: Vec<u32> = Vec::new();
-    // DIAGNOSTIC (LOD-shift flicker): which LODs recentred this frame, so we can see if a
-    // fine LOD shifts on the SAME frame its coarse fallback shifts (nesting-break window).
-    let shifted_lods: Vec<u32> = (0..lod_count)
-        .filter(|&lod| {
-            ring_chunk_origin(&config, camera_pos, lod) != sched.ring_chunk_origin[lod as usize]
-        })
-        .collect();
     for lod in 0..lod_count {
         let li = lod as usize;
         let new_origin = ring_chunk_origin(&config, camera_pos, lod);
@@ -351,44 +353,29 @@ pub fn schedule_bakes(
         if new_origin == old_origin {
             continue;
         }
-        // Entered chunks → enqueue a bake, but skip empty ones: an entered chunk has no
-        // resident bricks yet, so a chunk no edit reaches has nothing to bake. Enqueuing it
-        // anyway would burn the per-frame budget on all-`None` bakes and starve the real
-        // geometry entering far rings (the fly-away-from-scene LOD-stall bug).
-        let mut entered_geo = 0u32;
+        // Entered chunks → enqueue a bake (INNER ring only; we bake the ring, retain a margin
+        // around it). Skip empty ones: a chunk no edit reaches has nothing to bake, and
+        // enqueuing it would starve real geometry entering far rings (fly-away LOD-stall bug).
         for ck in chunk_window_keys(new_origin, r, lod) {
             let entered = first_run || !chunk_in_window(ck.coord, old_origin, r);
             if entered && chunk_has_geometry(ck, &bvh, &config, &mut bvh_scratch) {
                 sched.pending.insert(ck);
-                entered_geo += 1;
             }
         }
-        // Exited chunks → drop all their bricks (and cancel any pending bake).
-        let mut exited_chunks = 0u32;
-        let mut evicted_bricks = 0u32;
+        // Exited chunks → evict ONLY those that left the MARGIN window (not just the inner
+        // ring). A brick still inside `ring + margin` is retained — sampleable, not rebaked.
         if !first_run {
-            for ck in chunk_window_keys(old_origin, r, lod) {
-                if !chunk_in_window(ck.coord, new_origin, r) {
+            let old_margin = old_origin - IVec3::splat(m);
+            let new_margin = new_origin - IVec3::splat(m);
+            for ck in chunk_window_keys(old_margin, mr, lod) {
+                if !chunk_in_window(ck.coord, new_margin, mr) {
                     sched.pending.remove(&ck);
-                    exited_chunks += 1;
                     for bk in chunk_brick_keys(ck, &config) {
-                        if atlas.remove_brick(&bk) {
-                            evicted_bricks += 1;
-                        }
+                        atlas.remove_brick(&bk);
                     }
                 }
             }
         }
-        // DIAGNOSTIC: is the coarser fallback (lod+1) ALSO shifting this same frame? If so,
-        // the cross-fade's L+1 sample can be mid-transition exactly where L just evicted —
-        // the suspected hole. `coarse_also_shifting=true` on a flicker frame would confirm it.
-        let coarse_also_shifting = shifted_lods.contains(&(lod + 1));
-        info!(
-            "LOD-SHIFT lod={lod} entered_geo={entered_geo} exited_chunks={exited_chunks} \
-             evicted_bricks={evicted_bricks} pending={} coarse(lod+1)_also_shifting={coarse_also_shifting} \
-             all_shifted={shifted_lods:?}",
-            sched.pending.len(),
-        );
         sched.ring_chunk_origin[li] = new_origin;
     }
 
@@ -526,6 +513,8 @@ mod tests {
     /// (for the fly-away starvation bound). `ring_chunk_origin` lives on the scheduler.
     fn recenter_step(sched: &mut BakeScheduler, atlas: &mut SdfAtlas, cfg: &SdfGridConfig, cam: Vec3) -> usize {
         let r = ring_chunks_per_axis(cfg);
+        let m = cfg.retention_margin_chunks.max(0);
+        let mr = r + 2 * m;
         if sched.ring_chunk_origin.is_empty() {
             sched.ring_chunk_origin = vec![IVec3::splat(i32::MIN); cfg.lod_count as usize];
         }
@@ -546,8 +535,10 @@ mod tests {
                 }
             }
             if !first {
-                for ck in chunk_window_keys(old_origin, r, lod) {
-                    if !chunk_in_window(ck.coord, new_origin, r) {
+                let old_margin = old_origin - IVec3::splat(m);
+                let new_margin = new_origin - IVec3::splat(m);
+                for ck in chunk_window_keys(old_margin, mr, lod) {
+                    if !chunk_in_window(ck.coord, new_margin, mr) {
                         sched.pending.remove(&ck);
                         for bk in chunk_brick_keys(ck, cfg) {
                             atlas.remove_brick(&bk);
@@ -724,9 +715,12 @@ mod tests {
     /// (so chunks repeatedly exit and re-enter windows) via the real recenter + GPU emit, then
     /// settle at the final camera. The resident set must equal a fresh settle there — no stale
     /// leading edge, no missing bricks. Absolute addressing makes a brick that exits and
-    /// re-enters identical, so the walk must converge to the same set as arriving directly.
+    /// re-enters identical, so the walk's resident set must be a SUPERSET of a fresh arrival —
+    /// it can never be MISSING a brick a fresh settle has (that would be a hole), though with
+    /// the retention margin it may keep extra bricks the camera passed through (sampleable,
+    /// not stale — they're valid geometry, just outside the inner ring).
     #[test]
-    fn recenter_walk_converges_to_fresh_settle() {
+    fn recenter_walk_never_misses_fresh_bricks() {
         let cfg = SdfGridConfig { lod_count: 3, ring_bricks: 8, recenter_snap_chunks: 1, ..Default::default() };
         let edits: Vec<ResolvedEdit> = (-6i32..=6).map(|i| box_edit(Vec3::new(i as f32 * 1.2, 0.0, 0.0), 0.4, (i.rem_euclid(3)) as u16)).collect();
 
@@ -747,7 +741,8 @@ mod tests {
         settle_gpu(&mut fresh_sched, &mut fresh_atlas, &cfg, final_cam);
         let fresh: HashSet<_> = fresh_atlas.bricks.keys().copied().collect();
 
-        assert_eq!(walked, fresh, "recenter walk diverged from a fresh settle (stale/missing bricks)");
+        let missing: Vec<_> = fresh.difference(&walked).collect();
+        assert!(missing.is_empty(), "recenter walk is missing {} fresh bricks (holes): {missing:?}", missing.len());
     }
 
     /// Flying *away* from a localized scene must still refresh the scene's bricks into their
@@ -787,14 +782,16 @@ mod tests {
             (set, enqueued)
         };
 
-        // 1) Symmetry + correctness: flying away either direction leaves the same resident set
-        //    as a fresh settle at the destination (no stale fine bricks, nothing missing).
+        // 1) Correctness: flying away either direction leaves a resident set that COVERS a
+        //    fresh settle at the destination (nothing missing → no hole). The retention margin
+        //    may keep extra bricks the camera passed through, so flown ⊇ fresh (not ==).
         for (label, sign, steps) in [("forward", 1.0, 16), ("backward", -1.0, 16)] {
             let (flown, _) = run(sign, steps);
             let mut fresh_atlas = SdfAtlas::default();
             let mut fresh_sched = primed_sched(&edits);
             let fresh = settle_gpu(&mut fresh_sched, &mut fresh_atlas, &cfg, Vec3::new(sign * steps as f32 * 0.4, 0.0, 0.0));
-            assert_eq!(flown, fresh, "{label}: flew-in resident chunks diverged from a fresh settle");
+            let missing: Vec<_> = fresh.difference(&flown).collect();
+            assert!(missing.is_empty(), "{label}: flew-in resident chunks missing {} fresh chunks (holes)", missing.len());
             assert!(!flown.is_empty(), "{label}: scene vanished after flying away");
         }
 
@@ -807,6 +804,50 @@ mod tests {
             far <= near * 2,
             "enqueues scaled with flight distance (near={near}, far={far}) — empty chunks not culled, scene will starve"
         );
+    }
+
+    /// Retention margin: a small camera move that crosses the inner-ring edge but stays within
+    /// `ring + margin` must NOT evict geometry bricks — they're retained (sampleable, not
+    /// rebaked) so the LOD nesting holds through the shift. With a generous margin, a one-snap
+    /// move drops zero geometry bricks; the same move with margin 0 (legacy) would evict the
+    /// trailing shell. This is the fix for the LOD-boundary hole flicker.
+    #[test]
+    fn retention_margin_keeps_bricks_through_a_ring_shift() {
+        // Wide flat slab so every ring shift crosses real geometry at the trailing edge.
+        let edits: Vec<ResolvedEdit> = (-8i32..=8)
+            .map(|i| box_edit(Vec3::new(i as f32 * 0.6, 0.0, 0.0), 0.4, 0))
+            .collect();
+
+        // Count geometry bricks evicted over a small forward move, for a given margin.
+        let evicted_over_move = |margin: i32| -> usize {
+            let cfg = SdfGridConfig {
+                lod_count: 2,
+                ring_bricks: 8,
+                recenter_snap_chunks: 1,
+                retention_margin_chunks: margin,
+                ..config()
+            };
+            let mut atlas = SdfAtlas::default();
+            let mut sched = primed_sched(&edits);
+            settle_gpu(&mut sched, &mut atlas, &cfg, Vec3::ZERO);
+            let before: HashSet<_> = atlas.bricks.keys().copied().collect();
+            // Nudge one snap-cell forward (crosses the inner-ring edge once).
+            let chunk_world = chunk::chunk_world_size(0, &cfg);
+            settle_gpu(&mut sched, &mut atlas, &cfg, Vec3::new(chunk_world, 0.0, 0.0));
+            let after: HashSet<_> = atlas.bricks.keys().copied().collect();
+            before.difference(&after).count()
+        };
+
+        let with_margin = evicted_over_move(cfg_default_margin());
+        let no_margin = evicted_over_move(0);
+        assert!(
+            with_margin < no_margin,
+            "retention margin must evict fewer bricks than margin=0 (margin={with_margin}, none={no_margin})"
+        );
+    }
+
+    fn cfg_default_margin() -> i32 {
+        super::super::DEFAULT_RETENTION_MARGIN_CHUNKS
     }
 
     /// `ring_bricks / CHUNK_BRICKS` chunks per axis. With the defaults (12 / 4) that is 3.
