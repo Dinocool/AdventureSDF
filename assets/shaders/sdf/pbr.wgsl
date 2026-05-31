@@ -42,14 +42,14 @@ fn fresnel_schlick_roughness(cos_theta: f32, f0: vec3<f32>, roughness: f32) -> v
     return f0 + (max(inv_rough, f0) - f0) * pow(clamp(1.0 - cos_theta, 0.0, 1.0), 5.0);
 }
 
-// Single source for the scene's key light. Hardcoded for now — the deferred lighting
-// pass rewrites ONLY these two helpers to read a light uniform, leaving the shadow /
-// reflection / ambient code (which all route through them) untouched.
+// Single source for the scene's key light, read from the camera uniform (filled from
+// the scene's `DirectionalLight` in `prepare_sdf_camera_data`). All shadow / reflection /
+// ambient code routes through these two helpers.
 fn sun_dir() -> vec3<f32> {
-    return normalize(vec3<f32>(0.5, 1.0, 0.3));
+    return normalize(camera.sun_dir.xyz);
 }
 fn sun_color() -> vec3<f32> {
-    return vec3<f32>(3.0);
+    return camera.sun_color.rgb;
 }
 
 // Evaluate Cook-Torrance for one material's resolved PBR inputs.
