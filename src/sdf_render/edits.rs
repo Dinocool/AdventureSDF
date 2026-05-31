@@ -534,6 +534,33 @@ pub fn fold_csg(edits: &[ResolvedEdit], pos: Vec3) -> EditSample {
     }
 }
 
+/// Signed distance of the folded CSG stack at `pos`, evaluating only the edits at
+/// `indices` (into the already-`SdfOrder`-sorted `edits`). Same fold rules as
+/// [`fold_csg`] but distance-only and allocation-free — for the narrow-band interior
+/// cull, which folds at one point per candidate brick without cloning the edit subset.
+pub fn fold_csg_dist_indexed(edits: &[ResolvedEdit], indices: &[u32], pos: Vec3) -> f32 {
+    let mut acc = f32::MAX;
+    let mut started = false;
+    for &i in indices {
+        let e = &edits[i as usize];
+        let dn = eval_world(&e.prim, &e.transform, pos);
+        let k = e.op.smoothing;
+        if !started {
+            if e.op.kind == CsgKind::Union {
+                acc = dn;
+                started = true;
+            }
+            continue;
+        }
+        match e.op.kind {
+            CsgKind::Union => acc = smin(acc, dn, k),
+            CsgKind::Subtract => acc = smax(acc, -dn, k),
+            CsgKind::Intersect => acc = smax(acc, dn, k),
+        }
+    }
+    if started { acc } else { f32::MAX }
+}
+
 /// Max distinct materials a single brick tracks. The shader argmins over exactly
 /// this many local slots per pixel — bounding per-pixel material cost to a small
 /// constant regardless of how many materials the world contains.
