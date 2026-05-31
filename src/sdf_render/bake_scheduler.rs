@@ -231,19 +231,32 @@ fn chunk_brick_keys(ck: chunk::ChunkKey, config: &SdfGridConfig) -> Vec<atlas::B
 }
 
 /// The chunks at `lod` whose world extent overlaps `aabb` (grown by the bake footprint
-/// pad so a moved edit re-dirties every chunk that could fold it). Computed directly in
-/// chunk-coord space — no per-brick enumeration.
-fn chunks_in_aabb(
+/// pad so a moved edit re-dirties every chunk that could fold it), **clamped to the resident
+/// ring window** `[win_origin, win_origin + r)`. Computed directly in chunk-coord space — no
+/// per-brick enumeration.
+///
+/// The clamp is essential for terrain-scale edits: a heightmap's AABB spans the whole world
+/// in XZ, so the unclamped chunk range is millions of chunks. The caller only ever keeps the
+/// in-window ones anyway, so intersecting the loop bounds with the window up front makes the
+/// work O(AABB ∩ window) ≤ r³ instead of O(AABB volume) — the fix for the multi-hundred-ms
+/// `schedule_bakes` freeze when a heightmap edit changes (it used to allocate + enumerate the
+/// entire terrain-sized chunk volume per LOD, then discard 99.99% via `chunk_in_window`).
+fn chunks_in_aabb_windowed(
     config: &SdfGridConfig,
     aabb: &bevy::math::bounding::Aabb3d,
     lod: u32,
+    win_origin: IVec3,
+    r: i32,
 ) -> Vec<chunk::ChunkKey> {
     let chunk_world = chunk::chunk_world_size(lod, config);
     let pad = Vec3::splat(atlas::SNORM_CLAMP_DIST + config.brick_world_size(lod));
     let lo = (Vec3::from(aabb.min) - pad) / chunk_world;
     let hi = (Vec3::from(aabb.max) + pad) / chunk_world;
-    let lo = IVec3::new(lo.x.floor() as i32, lo.y.floor() as i32, lo.z.floor() as i32);
-    let hi = IVec3::new(hi.x.ceil() as i32, hi.y.ceil() as i32, hi.z.ceil() as i32);
+    // Intersect the AABB chunk-range with the window box BEFORE enumerating.
+    let lo = IVec3::new(lo.x.floor() as i32, lo.y.floor() as i32, lo.z.floor() as i32)
+        .max(win_origin);
+    let hi = IVec3::new(hi.x.ceil() as i32, hi.y.ceil() as i32, hi.z.ceil() as i32)
+        .min(win_origin + IVec3::splat(r - 1));
 
     let mut out = Vec::new();
     for z in lo.z..=hi.z {
@@ -320,11 +333,13 @@ pub fn schedule_bakes(
             for entity in &changed {
                 for lod in 0..lod_count {
                     let origin = ring_chunk_origin(&config, camera_pos, lod);
+                    // `chunks_in_aabb_windowed` already clamps to the window, so no per-key
+                    // `chunk_in_window` filter is needed — and crucially it never ENUMERATES
+                    // outside the window, so a terrain-scale heightmap AABB costs O(window),
+                    // not O(world).
                     let mut dirty_one = |aabb: &bevy::math::bounding::Aabb3d| {
-                        for ck in chunks_in_aabb(&config, aabb, lod) {
-                            if chunk_in_window(ck.coord, origin, r) {
-                                sched.pending.insert(ck);
-                            }
+                        for ck in chunks_in_aabb_windowed(&config, aabb, lod, origin, r) {
+                            sched.pending.insert(ck);
                         }
                     };
                     if let Some(old) = prev_aabbs.map.get(&entity) {
@@ -1212,7 +1227,10 @@ mod tests {
     fn chunks_in_aabb_covers_origin_chunk() {
         let cfg = config();
         let aabb = Aabb3d::new(Vec3::ZERO, Vec3::splat(0.3));
-        let chunks = chunks_in_aabb(&cfg, &aabb, 0);
+        // A window comfortably containing the origin.
+        let win = IVec3::splat(-8);
+        let r = 16;
+        let chunks = chunks_in_aabb_windowed(&cfg, &aabb, 0, win, r);
         assert!(!chunks.is_empty(), "an edit must dirty at least one chunk");
         let origin_chunk = chunk::chunk_of(atlas::BrickKey::new(0, IVec3::ZERO), &cfg).0;
         assert!(
@@ -1221,6 +1239,31 @@ mod tests {
         );
         // All returned chunks are at the requested LOD.
         assert!(chunks.iter().all(|c| c.lod == 0));
+    }
+
+    /// The windowed clamp is the heightmap-freeze fix: a terrain-scale AABB (huge in XZ) must
+    /// only ever enumerate chunks INSIDE the window — never the millions of chunks its full
+    /// extent spans. Asserts the result is bounded by r³ and every chunk is in-window, even
+    /// though the AABB is vastly larger than the window.
+    #[test]
+    fn chunks_in_aabb_windowed_is_bounded_by_window() {
+        let cfg = config();
+        // A heightmap-like AABB: enormous in XZ, thin in Y.
+        let aabb = Aabb3d::new(Vec3::ZERO, Vec3::new(100_000.0, 2.0, 100_000.0));
+        let win = IVec3::splat(-8);
+        let r = 16;
+        let chunks = chunks_in_aabb_windowed(&cfg, &aabb, 0, win, r);
+        assert!(
+            chunks.len() <= (r * r * r) as usize,
+            "windowed dirty set must be bounded by r³ = {}, got {}",
+            r * r * r,
+            chunks.len()
+        );
+        assert!(
+            chunks.iter().all(|c| chunk_in_window(c.coord, win, r)),
+            "every dirtied chunk must lie inside the window"
+        );
+        assert!(!chunks.is_empty(), "the AABB overlaps the window, so some chunks dirty");
     }
 
     /// A one-chunk camera shift exposes only a thin shell: the entered chunks are a face
