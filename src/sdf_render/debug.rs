@@ -265,12 +265,6 @@ fn register_shader_modes(app: &mut App) {
         "SDF_DEBUG_CHUNK_ID",
         "Color by resolved chunk key (shade = local slot): same=one chunk, diff=cross-chunk",
     ));
-    registry.register(overlay(
-        "sdf/blend_fate",
-        "Blend fate",
-        "SDF_DEBUG_BLEND_FATE",
-        "Why the LOD cross-fade engaged: grey=core, green=blended, RED=coarse chunk absent, BLUE=coarse brick unoccupied, yellow=no coarser LOD",
-    ));
 
     // Independent toggle (not part of the overlay group): bypass the per-ray chunk
     // lookup cache, forcing a fresh binary search every probe. If enabling this fixes a

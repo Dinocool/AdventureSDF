@@ -64,10 +64,6 @@ struct RaymarchResult {
     // drawn from; `lod` above is only the finest-OCCUPIED level resolve_march found (patchy).
     // The SDF_DEBUG_LOD overlay colours by THIS so it reflects what we actually draw.
     eff_lod: f32,
-    // DIAGNOSTIC (SDF_DEBUG_BLEND_FATE): why the cross-fade did/didn't engage at the hit.
-    // 0 = none, 1 = level core (w==0), 2 = morphed OK, 4 = coarser level unoccupied,
-    // 5 = at coarsest LOD.
-    blend_fate: u32,
 };
 
 // Single unified raymarch. One cached resolve per step (`resolve_march` → finest resident
@@ -90,7 +86,7 @@ struct RaymarchResult {
 fn raymarch(origin: vec3<f32>, dir: vec3<f32>, start_t: f32) -> RaymarchResult {
     var t = start_t;
     var steps = 0u;
-    var result = RaymarchResult(false, 0.0, 0u, 0u, vec3<f32>(0.0), 2u, 0u, 0u, 0.0, 0.0, 0u);
+    var result = RaymarchResult(false, 0.0, 0u, 0u, vec3<f32>(0.0), 2u, 0u, 0u, 0.0, 0.0);
 
     let MAX_STEPS = max_steps();
     let MAX_DIST = max_dist();
@@ -185,7 +181,6 @@ fn raymarch(origin: vec3<f32>, dir: vec3<f32>, start_t: f32) -> RaymarchResult {
         var blending = false;
         var blend_w = 0.0;        // morph weight toward the coarser level (LOD debug overlay)
         var eff_lod = f32(lod);   // continuous LOD actually rendered (for the iso-offset)
-        var blend_fate = 0u;      // DIAGNOSTIC: why the fade did/didn't engage (see RaymarchResult)
         let ring_bricks = camera.lod_params.y;
         let end_frac = 1.0 - 2.0 * f32(recenter_snap() * CHUNK_BRICKS) / max(ring_bricks, 1.0);
         if (band > 0.0 && end_frac > 0.0) {
@@ -215,16 +210,13 @@ fn raymarch(origin: vec3<f32>, dir: vec3<f32>, start_t: f32) -> RaymarchResult {
                         blending = true;
                         blend_w = w;
                         eff_lod = f32(s0.lod) + w * f32(s1.lod - s0.lod);
-                        blend_fate = 2u;  // morphed OK
                     } else {
                         d_eff = s0.dist;
                         eff_lod = f32(s0.lod);
-                        blend_fate = 4u;  // coarser level unoccupied (no partner to morph to)
                     }
                 } else {
                     d_eff = s0.dist;
                     eff_lod = f32(s0.lod);
-                    blend_fate = select(1u, 5u, k + 1u >= lod_count());  // 1=core, 5=coarsest
                 }
             }
         }
@@ -264,7 +256,6 @@ fn raymarch(origin: vec3<f32>, dir: vec3<f32>, start_t: f32) -> RaymarchResult {
                 result.lod = lod;
                 result.atlas_base = scene.atlas_base;
                 result.eff_lod = eff_lod;
-                result.blend_fate = blend_fate;
                 return result;
             }
             t += advance + voxel_size * 0.001;
@@ -323,7 +314,6 @@ fn raymarch(origin: vec3<f32>, dir: vec3<f32>, start_t: f32) -> RaymarchResult {
             result.atlas_base = scene.atlas_base;
             result.blend_w = blend_w;     // cross-fade amount toward LOD+1 (for the debug overlay)
             result.eff_lod = eff_lod;
-            result.blend_fate = blend_fate;
             return result;
         }
 
@@ -635,28 +625,6 @@ fn main(in: FullscreenVertexOutput) -> FragmentOutput {
         let col = mix(lod_debug_color(u32(lf)), lod_debug_color(u32(lf) + 1u), rm.eff_lod - lf);
         let shaded_lod = mix(shaded, col, 0.65);
         return FragmentOutput(vec4<f32>(shaded_lod, 1.0), ndc_depth);
-    }
-    return FragmentOutput(vec4<f32>(bg_color * 0.3, 1.0), 1.0);
-    #endif
-
-    #ifdef SDF_DEBUG_BLEND_FATE
-    // DIAGNOSTIC: paint WHY the distance-driven LOD morph did/didn't engage at the hit.
-    //   grey   (0) = band disabled / empty
-    //   grey   (1) = inside a level's no-fade core (w==0) — correct, not the bug
-    //   green  (2) = morphed level_k → level_{k+1} OK
-    //   blue   (4) = coarser bracketing level unoccupied (rendered level_k flat — possible seam)
-    //   yellow (5) = at the coarsest LOD (no coarser level to morph to)
-    if (rm.hit) {
-        var col = vec3<f32>(0.3, 0.3, 0.3);
-        switch (rm.blend_fate) {
-            case 2u: { col = vec3<f32>(0.0, 1.0, 0.0); }
-            case 3u: { col = vec3<f32>(1.0, 0.0, 0.0); }
-            case 4u: { col = vec3<f32>(0.0, 0.3, 1.0); }
-            case 5u: { col = vec3<f32>(1.0, 1.0, 0.0); }
-            default: { col = vec3<f32>(0.3, 0.3, 0.3); }
-        }
-        let shaded_fate = mix(shaded, col, 0.75);
-        return FragmentOutput(vec4<f32>(shaded_fate, 1.0), ndc_depth);
     }
     return FragmentOutput(vec4<f32>(bg_color * 0.3, 1.0), 1.0);
     #endif
