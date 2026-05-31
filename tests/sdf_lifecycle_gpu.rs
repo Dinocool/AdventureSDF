@@ -334,7 +334,7 @@ fn lifecycle_large_sphere_lod_transition_no_hole() {
     // Defaults but a reasonable ring so the sphere spans several LODs without huge bake counts.
     let cfg = SdfGridConfig { lod_count: 5, ring_bricks: 16, recenter_snap_chunks: 1, ..Default::default() };
     let radius = 25.0f32;
-    let edit = ResolvedEdit { prim: SdfPrimitive::Sphere { radius }, transform: Transform::IDENTITY, op: SdfOp::default(), material_id: 0 };
+    let edit = ResolvedEdit::new(SdfPrimitive::Sphere { radius }, Transform::IDENTITY, SdfOp::default(), 0);
     let resolved = vec![edit.clone()];
     let aabbs = vec![edit_world_aabb(&edit.prim, &edit.transform, edit.op.smoothing)];
     let bvh = Bvh::build(&aabbs);

@@ -631,30 +631,30 @@ mod tests {
     }
 
     fn box_edit(pos: Vec3, half: f32, mat: u16) -> ResolvedEdit {
-        ResolvedEdit {
-            prim: SdfPrimitive::Box { half_extents: Vec3::splat(half) },
-            transform: Transform::from_translation(pos),
-            op: SdfOp { kind: CsgKind::Union, smoothing: 0.0 },
-            material_id: mat,
-        }
+        ResolvedEdit::new(
+            SdfPrimitive::Box { half_extents: Vec3::splat(half) },
+            Transform::from_translation(pos),
+            SdfOp { kind: CsgKind::Union, smoothing: 0.0 },
+            mat,
+        )
     }
 
     fn sphere_edit(pos: Vec3, radius: f32, mat: u16) -> ResolvedEdit {
-        ResolvedEdit {
-            prim: SdfPrimitive::Sphere { radius },
-            transform: Transform::from_translation(pos),
-            op: SdfOp { kind: CsgKind::Union, smoothing: 0.0 },
-            material_id: mat,
-        }
+        ResolvedEdit::new(
+            SdfPrimitive::Sphere { radius },
+            Transform::from_translation(pos),
+            SdfOp { kind: CsgKind::Union, smoothing: 0.0 },
+            mat,
+        )
     }
 
     fn subtract_sphere(pos: Vec3, radius: f32) -> ResolvedEdit {
-        ResolvedEdit {
-            prim: SdfPrimitive::Sphere { radius },
-            transform: Transform::from_translation(pos),
-            op: SdfOp { kind: CsgKind::Subtract, smoothing: 0.0 },
-            material_id: 0,
-        }
+        ResolvedEdit::new(
+            SdfPrimitive::Sphere { radius },
+            Transform::from_translation(pos),
+            SdfOp { kind: CsgKind::Subtract, smoothing: 0.0 },
+            0,
+        )
     }
 
     /// Regression guard for the narrow-band cull on a SUBTRACTED (hollow / bitten) solid: the

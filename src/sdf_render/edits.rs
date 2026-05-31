@@ -254,6 +254,14 @@ pub fn eval_world(prim: &SdfPrimitive, transform: &Transform, world_pos: Vec3) -
     eval_primitive(prim, local)
 }
 
+/// As [`eval_world`] but with a PRECOMPUTED model→local inverse (`ResolvedEdit::inv_model`),
+/// skipping the per-call 4×4 inversion. The hot bake fold paths use this; `inv` must equal
+/// `transform.to_matrix().inverse()` for the primitive's transform.
+#[inline]
+pub fn eval_world_inv(prim: &SdfPrimitive, inv: &Mat4, world_pos: Vec3) -> f32 {
+    eval_primitive(prim, inv.transform_point3(world_pos))
+}
+
 /// Deterministic value-noise height sample over the XZ plane. Bilinear-lerped
 /// integer-lattice hash — cheap, seeded, smooth enough for terrain testing.
 fn height_sample(xz: Vec2, freq: f32, amp: f32, seed: u32) -> f32 {
@@ -463,6 +471,14 @@ pub fn edit_world_aabb(prim: &SdfPrimitive, transform: &Transform, smoothing: f3
 
 /// A flattened, order-sorted edit ready for evaluation. Decoupled from ECS so the
 /// bake, picking, and tests can all build and fold the same data.
+///
+/// `inv_model` is the model→local inverse of `transform`, precomputed ONCE at
+/// construction. The bake's `fold_csg` evaluates each edit at ~18 sample points per brick
+/// (9 in the cull, 9 in the palette) across ~13k bricks/frame — recomputing
+/// `transform.to_matrix().inverse()` per sample (as the old `eval_world` did) was millions
+/// of 4×4 inversions/frame and the dominant bake-hitch cost. Caching it makes each eval a
+/// single `transform_point3`. Use [`ResolvedEdit::new`] so the inverse can never drift from
+/// the transform.
 #[derive(Clone, Debug)]
 pub struct ResolvedEdit {
     pub prim: SdfPrimitive,
@@ -470,6 +486,17 @@ pub struct ResolvedEdit {
     pub op: SdfOp,
     /// Global material id (index into [`MaterialRegistry::defs`]).
     pub material_id: u16,
+    /// Cached model→local inverse of `transform` (see struct docs). Always equal to
+    /// `transform.to_matrix().inverse()`; kept in sync by constructing via [`Self::new`].
+    pub inv_model: Mat4,
+}
+
+impl ResolvedEdit {
+    /// Build a `ResolvedEdit`, precomputing `inv_model` from `transform`.
+    pub fn new(prim: SdfPrimitive, transform: Transform, op: SdfOp, material_id: u16) -> Self {
+        let inv_model = transform.to_matrix().inverse();
+        Self { prim, transform, op, material_id, inv_model }
+    }
 }
 
 /// Result of folding the CSG stack at one point: the combined signed distance and
@@ -492,7 +519,7 @@ pub fn fold_csg(edits: &[ResolvedEdit], pos: Vec3) -> EditSample {
     let mut started = false;
 
     for e in edits {
-        let dn = eval_world(&e.prim, &e.transform, pos);
+        let dn = eval_world_inv(&e.prim, &e.inv_model, pos);
         let k = e.op.smoothing;
 
         // Nothing accumulated yet: only a Union can bring matter into existence.
@@ -543,7 +570,7 @@ pub fn fold_csg_dist_indexed(edits: &[ResolvedEdit], indices: &[u32], pos: Vec3)
     let mut started = false;
     for &i in indices {
         let e = &edits[i as usize];
-        let dn = eval_world(&e.prim, &e.transform, pos);
+        let dn = eval_world_inv(&e.prim, &e.inv_model, pos);
         let k = e.op.smoothing;
         if !started {
             if e.op.kind == CsgKind::Union {
@@ -591,7 +618,7 @@ pub fn build_palette(edits: &[ResolvedEdit], sample_points: &[Vec3]) -> Palette 
         }
         let mut dmin = f32::MAX;
         for &p in sample_points {
-            dmin = dmin.min(eval_world(&e.prim, &e.transform, p));
+            dmin = dmin.min(eval_world_inv(&e.prim, &e.inv_model, p));
         }
         match best.iter_mut().find(|(id, _)| *id == e.material_id) {
             Some((_, d)) => *d = d.min(dmin),
@@ -646,7 +673,7 @@ pub struct GpuEdit {
 
 /// Flatten a [`ResolvedEdit`] into its [`GpuEdit`] form for the compute bake.
 pub fn to_gpu_edit(e: &ResolvedEdit) -> GpuEdit {
-    let inv_model = e.transform.to_matrix().inverse();
+    let inv_model = e.inv_model;
     let (tag, params, params2) = match &e.prim {
         SdfPrimitive::Sphere { radius } => {
             (GPU_PRIM_SPHERE, Vec4::new(*radius, 0.0, 0.0, 0.0), Vec4::ZERO)
@@ -748,23 +775,18 @@ mod tests {
         // Body (id 1) unioned, then a subtractor (id 2) carves a corner. Any point
         // still inside the body must report material 1, never 2.
         let edits = vec![
-            ResolvedEdit {
-                prim: SdfPrimitive::Box {
-                    half_extents: Vec3::splat(1.0),
-                },
-                transform: Transform::IDENTITY,
-                op: SdfOp::default(),
-                material_id: 1,
-            },
-            ResolvedEdit {
-                prim: SdfPrimitive::Sphere { radius: 0.5 },
-                transform: Transform::from_xyz(1.0, 1.0, 1.0),
-                op: SdfOp {
-                    kind: CsgKind::Subtract,
-                    smoothing: 0.0,
-                },
-                material_id: 2,
-            },
+            ResolvedEdit::new(
+                SdfPrimitive::Box { half_extents: Vec3::splat(1.0) },
+                Transform::IDENTITY,
+                SdfOp::default(),
+                1,
+            ),
+            ResolvedEdit::new(
+                SdfPrimitive::Sphere { radius: 0.5 },
+                Transform::from_xyz(1.0, 1.0, 1.0),
+                SdfOp { kind: CsgKind::Subtract, smoothing: 0.0 },
+                2,
+            ),
         ];
         // A point deep in the body, far from the carve.
         let s = fold_csg(&edits, Vec3::new(-0.5, -0.5, -0.5));
@@ -780,21 +802,18 @@ mod tests {
         // Two overlapping spheres intersected. Inside the overlap, the material is
         // whichever surface is more constraining (larger signed distance).
         let edits = vec![
-            ResolvedEdit {
-                prim: SdfPrimitive::Sphere { radius: 1.0 },
-                transform: Transform::IDENTITY,
-                op: SdfOp::default(),
-                material_id: 1,
-            },
-            ResolvedEdit {
-                prim: SdfPrimitive::Sphere { radius: 1.0 },
-                transform: Transform::from_xyz(0.8, 0.0, 0.0),
-                op: SdfOp {
-                    kind: CsgKind::Intersect,
-                    smoothing: 0.0,
-                },
-                material_id: 2,
-            },
+            ResolvedEdit::new(
+                SdfPrimitive::Sphere { radius: 1.0 },
+                Transform::IDENTITY,
+                SdfOp::default(),
+                1,
+            ),
+            ResolvedEdit::new(
+                SdfPrimitive::Sphere { radius: 1.0 },
+                Transform::from_xyz(0.8, 0.0, 0.0),
+                SdfOp { kind: CsgKind::Intersect, smoothing: 0.0 },
+                2,
+            ),
         ];
         // Near the first sphere's right edge: sphere-2 is the looser constraint
         // there, sphere-1 the tighter — but pick a point where edit 2 dominates.
@@ -914,12 +933,7 @@ mod tests {
             Vec3::new(2.0, 1.5, -1.0),
         ];
         for prim in &prims {
-            let edit = ResolvedEdit {
-                prim: prim.clone(),
-                transform,
-                op: SdfOp::default(),
-                material_id: 3,
-            };
+            let edit = ResolvedEdit::new(prim.clone(), transform, SdfOp::default(), 3);
             let gpu = to_gpu_edit(&edit);
             assert_eq!(gpu.material_id, 3);
             for &s in &samples {
@@ -936,12 +950,12 @@ mod tests {
     #[test]
     fn gpu_edit_packs_op_kind() {
         let mk = |kind| {
-            to_gpu_edit(&ResolvedEdit {
-                prim: SdfPrimitive::Sphere { radius: 1.0 },
-                transform: Transform::IDENTITY,
-                op: SdfOp { kind, smoothing: 0.2 },
-                material_id: 0,
-            })
+            to_gpu_edit(&ResolvedEdit::new(
+                SdfPrimitive::Sphere { radius: 1.0 },
+                Transform::IDENTITY,
+                SdfOp { kind, smoothing: 0.2 },
+                0,
+            ))
         };
         assert_eq!(mk(CsgKind::Union).op_kind, GPU_OP_UNION);
         assert_eq!(mk(CsgKind::Subtract).op_kind, GPU_OP_SUBTRACT);
