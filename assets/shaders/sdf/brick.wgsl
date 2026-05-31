@@ -471,6 +471,36 @@ fn resolve_march(p: vec3<f32>, cache: ptr<function, ChunkCache>) -> MarchSample 
     return MarchSample(1e10, false, window_lod, 0u, 0u, vec4<u32>(PALETTE_EMPTY));
 }
 
+// Sample the conservative field at an ABSOLUTE target LOD, degrading to COARSER only.
+//
+// Unlike `resolve_march` (which serves the finest occupied LOD, so a finer occupancy
+// ISLAND shows through inside a coarser region), this samples exactly `target` if it is
+// occupied, else walks COARSER (target+1, target+2, …) until an occupied brick is found.
+// It NEVER returns a finer-than-target sample. That is the whole point: the LOD cross-fade
+// drives `target` purely from camera DISTANCE (continuous in screen space), so the level
+// being sampled no longer depends on which LOD `resolve_march` happened to find occupied —
+// killing the served-LOD-flip weight discontinuity that caused the hard blend seam. `found`
+// is false only in genuine empty space (no LOD has a brick at `p`). Uses the per-ray cache.
+fn sample_level_at_or_coarser(p: vec3<f32>, target_lod: u32, cache: ptr<function, ChunkCache>) -> MarchSample {
+    let levels = lod_count();
+    if (target_lod >= levels || arrayLength(&chunk_buf) == 0u) {
+        return MarchSample(1e10, false, levels - 1u, 0u, 0u, vec4<u32>(PALETTE_EMPTY));
+    }
+    for (var lod = target_lod; lod < levels; lod = lod + 1u) {
+        let coord = world_to_brick_lod(p, lod);
+        let key = abs_chunk_key(coord, lod);
+        let ci = find_chunk_cached(lod, key.x, key.y, cache);
+        if (ci >= 0) {
+            let loc = brick_in_chunk(chunk_buf[u32(ci)], coord);
+            if (loc.found) {
+                let d = sample_brick_sdf(loc.atlas_base, p, lod);
+                return MarchSample(d, true, lod, lod, loc.atlas_base, loc.palette);
+            }
+        }
+    }
+    return MarchSample(1e10, false, levels - 1u, 0u, 0u, vec4<u32>(PALETTE_EMPTY));
+}
+
 // Distance along the ray to the far side of the brick containing `p`, at LOD `lod`.
 // Used for empty-space skipping (DDA-style): when `p` is in an unbaked brick, advance
 // the ray to the next brick boundary instead of taking an infinite step. The lattice
