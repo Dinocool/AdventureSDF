@@ -269,13 +269,6 @@ pub const DEFAULT_RING_BRICKS: u32 = 64;
 /// 0 instead of every brick crossing, while still keeping the camera 6+ chunks from any
 /// window edge.
 pub const DEFAULT_RECENTER_SNAP_CHUNKS: i32 = 2;
-/// Default retention margin, in whole chunks. A brick that exits a LOD ring is kept resident
-/// until the camera moves it outside `ring + retention_margin_chunks` — so its coarser-LOD
-/// fallback (and any rebaked replacement) is always resident *through* a ring shift, never a
-/// frame where neither LOD covers the region (the LOD-boundary hole flicker). Must be ≥
-/// `recenter_snap_chunks` to survive a single snap crossing; 2× gives headroom for the cascade
-/// case where several LODs recenter on one frame. Costs a thin extra shell of resident tiles.
-pub const DEFAULT_RETENTION_MARGIN_CHUNKS: i32 = 2 * DEFAULT_RECENTER_SNAP_CHUNKS;
 
 #[derive(Resource, Clone)]
 pub struct SdfGridConfig {
@@ -293,11 +286,6 @@ pub struct SdfGridConfig {
     /// on every chunk crossing (no hysteresis). Must stay well below
     /// `ring_bricks / CHUNK_BRICKS` so the camera never leaves its own window.
     pub recenter_snap_chunks: i32,
-    /// Retention margin in whole chunks: an exited brick is kept resident until the camera
-    /// moves it outside `ring + this`. Keeps the LOD nesting invariant true through a ring
-    /// shift (no 1-frame hole at LOD boundaries) and avoids re-baking bricks that briefly exit
-    /// and re-enter. See [`DEFAULT_RETENTION_MARGIN_CHUNKS`].
-    pub retention_margin_chunks: i32,
 }
 
 impl Default for SdfGridConfig {
@@ -309,7 +297,6 @@ impl Default for SdfGridConfig {
             lod_count: DEFAULT_LOD_COUNT,
             ring_bricks: DEFAULT_RING_BRICKS,
             recenter_snap_chunks: DEFAULT_RECENTER_SNAP_CHUNKS,
-            retention_margin_chunks: DEFAULT_RETENTION_MARGIN_CHUNKS,
         }
     }
 }
