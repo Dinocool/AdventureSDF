@@ -26,7 +26,7 @@ fn mat(name: &str) -> Option<std::path::PathBuf> {
 /// each object's centre is placed so it rests on the ground plane (top face at y = 0).
 pub fn spawn_gallery(world: &mut World) {
     // (local_id, order, transform, primitive, material file name)
-    let volumes: [(u64, u32, Transform, SdfPrimitive, &str); 7] = [
+    let volumes: [(u64, u32, Transform, SdfPrimitive, &str); 10] = [
         // Ground plane: wide + thin, top face at y = 0 (centre at y = -half_y).
         (
             0,
@@ -96,6 +96,37 @@ pub fn spawn_gallery(world: &mut World) {
             SdfPrimitive::Sphere { radius: 0.45 },
             "white_gloss",
         ),
+        // Emissive orange "lamp" sphere, near the cobble box + red sphere so its warm glow
+        // bounces onto them through the radiance-cascade GI.
+        (
+            7,
+            7,
+            Transform::from_xyz(-1.8, 0.35, 0.9),
+            SdfPrimitive::Sphere { radius: 0.35 },
+            "emissive_orange",
+        ),
+        // Emissive cyan capsule standing up, lighting the gold/white exemplars from the side.
+        (
+            8,
+            8,
+            Transform::from_xyz(1.9, 0.5, -1.0),
+            SdfPrimitive::Capsule {
+                half_height: 0.3,
+                radius: 0.2,
+            },
+            "emissive_cyan",
+        ),
+        // Emissive green torus lying flat on the plane, a low ambient glow patch.
+        (
+            9,
+            9,
+            Transform::from_xyz(0.0, 0.14, 1.6),
+            SdfPrimitive::Torus {
+                major: 0.4,
+                minor: 0.14,
+            },
+            "emissive_green",
+        ),
     ];
 
     for (local, order, transform, prim, mat_name) in volumes {
@@ -120,7 +151,7 @@ pub fn spawn_gallery(world: &mut World) {
 
     // Directional light so 3D geometry (and debug wireframes) are visible.
     world.spawn((
-        LocalId(7),
+        LocalId(10),
         Name::new("Directional Light"),
         DirectionalLight {
             illuminance: 10000.0,

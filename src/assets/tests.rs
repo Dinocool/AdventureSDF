@@ -25,6 +25,8 @@ fn material_asset_round_trip_is_stable() {
         metallic: 0.8,
         roughness: 0.25,
         parallax_scale: 0.04,
+        emissive_color: [0.0, 0.0, 0.0],
+        emissive_intensity: 0.0,
         texture: Some("pbrtextures/cobble_stone_1.pbrtex.ron".into()),
         overrides: PbrTextureAsset {
             height: Some("textures/cobble_stone/2/height.png".into()),
@@ -177,6 +179,8 @@ fn export_demo_materials() {
         metallic: 0.0,
         roughness: 1.0,
         parallax_scale: 0.15,
+        emissive_color: [0.0, 0.0, 0.0],
+        emissive_intensity: 0.0,
         texture: Some(PathBuf::from(format!("pbrtextures/{slug}_1.pbrtex.ron"))),
         overrides: PbrTextureAsset::default(),
     };
@@ -186,6 +190,8 @@ fn export_demo_materials() {
         metallic,
         roughness,
         parallax_scale: 0.06,
+        emissive_color: [0.0, 0.0, 0.0],
+        emissive_intensity: 0.0,
         texture: None,
         overrides: PbrTextureAsset::default(),
     };

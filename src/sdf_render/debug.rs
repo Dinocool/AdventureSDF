@@ -151,84 +151,63 @@ fn register_shader_modes(app: &mut App) {
         description: desc.into(),
     };
 
+    // Deferred G-buffer / GI visualizers — `#ifdef`-gated early returns in the COMBINE pass
+    // (sdf_rc_combine.wgsl), which holds every G-buffer channel + the GI. Exclusive group: at
+    // most one active. The combine pipeline rebuilds on def change so these compile in/out.
     let mut registry = app.world_mut().resource_mut::<ShaderDebugRegistry>();
     registry.register(overlay(
-        "sdf/step_count",
-        "Steps",
-        "SDF_DEBUG_STEP_COUNT",
-        "Step heatmap (blue -> red)",
+        "sdf/albedo",
+        "Albedo",
+        "SDF_DEBUG_ALBEDO",
+        "G-buffer albedo (base colour)",
     ));
     registry.register(overlay(
         "sdf/normals",
         "Normals",
         "SDF_DEBUG_NORMALS",
-        "Surface normals as RGB",
+        "G-buffer world normal as RGB",
     ));
     registry.register(overlay(
-        "sdf/object_id",
-        "Obj ID",
-        "SDF_DEBUG_OBJECT_ID",
-        "Object ID as distinct colors",
+        "sdf/metallic",
+        "Metallic",
+        "SDF_DEBUG_METALLIC",
+        "G-buffer metallic (greyscale)",
     ));
     registry.register(overlay(
-        "sdf/brick_bounds",
-        "Bricks",
-        "SDF_DEBUG_BRICK_BOUNDS",
-        "Color by brick id + cell grid lines",
+        "sdf/roughness",
+        "Roughness",
+        "SDF_DEBUG_ROUGHNESS",
+        "G-buffer roughness (greyscale)",
     ));
     registry.register(overlay(
-        "sdf/bvh_steps",
-        "BVH cost",
-        "SDF_DEBUG_BVH_STEPS",
-        "Raymarch step heatmap with BVH skipping (compare vs Steps)",
+        "sdf/emissive",
+        "Emissive",
+        "SDF_DEBUG_EMISSIVE",
+        "G-buffer emissive radiance",
     ));
     registry.register(overlay(
-        "sdf/reflect_steps",
-        "Reflect cost",
-        "SDF_DEBUG_REFLECT_STEPS",
-        "Reflection-march step heatmap (black = no reflection ray traced)",
+        "sdf/gi",
+        "GI",
+        "SDF_DEBUG_GI",
+        "Radiance-cascade GI (bilateral-blurred — what the render uses)",
     ));
     registry.register(overlay(
-        "sdf/reflect_raw",
-        "Reflect raw",
-        "SDF_DEBUG_REFLECT_RAW",
-        "Raw traced reflection radiance, before the roughness IBL mix",
+        "sdf/gi_raw",
+        "GI raw",
+        "SDF_DEBUG_GI_RAW",
+        "Radiance-cascade GI before the bilateral blur (probe-grid structure visible)",
     ));
     registry.register(overlay(
-        "sdf/reflect_gate",
-        "Reflect gate",
-        "SDF_DEBUG_REFLECT_GATE",
-        "R=roughness G=metallic B=gate weight (flat ⇒ material value not reaching GPU)",
+        "sdf/sun_vis",
+        "Sun vis",
+        "SDF_DEBUG_SUN_VIS",
+        "Marched sun visibility (white = lit, black = shadowed)",
     ));
     registry.register(overlay(
-        "sdf/ray_fate",
-        "Ray fate",
-        "SDF_DEBUG_RAY_FATE",
-        "Every pixel: green=hit, red=escaped (over-skip), blue=out of steps",
-    ));
-    registry.register(overlay(
-        "sdf/lod",
-        "LOD",
-        "SDF_DEBUG_LOD",
-        "Tint hit by clipmap LOD: 0 white, 1 green, 2 blue, 3 red, 4+ yellow",
-    ));
-    registry.register(overlay(
-        "sdf/volume",
-        "Volume",
-        "SDF_DEBUG_VOLUME",
-        "Tint by 3D distance-clipmap level (0 white,1 green,2 blue,3 red); brightness = volume distance",
-    ));
-    registry.register(overlay(
-        "sdf/tile_id",
-        "Tile ID",
-        "SDF_DEBUG_TILE_ID",
-        "Color by resolved atlas tile: same color on duplicated halves = tile collision",
-    ));
-    registry.register(overlay(
-        "sdf/chunk_id",
-        "Chunk ID",
-        "SDF_DEBUG_CHUNK_ID",
-        "Color by resolved chunk key (shade = local slot): same=one chunk, diff=cross-chunk",
+        "sdf/depth",
+        "Depth",
+        "SDF_DEBUG_DEPTH",
+        "Camera distance (scaled greyscale)",
     ));
 
     // Independent toggle (not part of the overlay group): bypass the per-ray chunk
@@ -265,28 +244,13 @@ fn register_shader_modes(app: &mut App) {
 
     // PBR feature toggles (independent checkboxes, not exclusive overlays). These
     // gate real shading features behind shader-defs so their cost is opt-in/measurable.
+    // (Sun shadows are marched in the G-buffer pass and consumed by the combine pass.)
     registry.register(ShaderDebugMode {
         id: "sdf/shadows".into(),
         label: "Shadows".into(),
         shader_define: "SDF_SHADOWS".into(),
         kind: DebugModeKind::Toggle,
-        description: "SDF soft shadows (secondary ray toward the sun)".into(),
-    });
-    registry.register(ShaderDebugMode {
-        id: "sdf/reflections".into(),
-        label: "Reflections".into(),
-        shader_define: "SDF_REFLECTIONS".into(),
-        kind: DebugModeKind::Toggle,
-        description: "SDF-traced reflections on metallic/smooth surfaces (secondary ray)"
-            .into(),
-    });
-    registry.register(ShaderDebugMode {
-        id: "sdf/force_ssr".into(),
-        label: "Force SSR".into(),
-        shader_define: "SDF_FORCE_SSR".into(),
-        kind: DebugModeKind::Toggle,
-        description: "Reflections use a pure screen-space ray (no SDF march) — isolates SSR cost"
-            .into(),
+        description: "SDF soft shadows (sun-visibility ray marched into the G-buffer)".into(),
     });
     registry.register(ShaderDebugMode {
         id: "sdf/edge_wear".into(),
@@ -299,13 +263,12 @@ fn register_shader_modes(app: &mut App) {
     // Note: height-map relief is baked into the SDF field (see sdf_render::height) — no shader
     // toggle. Strength is the per-material "Relief depth" (Inspect panel).
 
-    // Default the PBR feature toggles ON so the enhanced shading shows without hunting
-    // for the checkbox. The state resource is separate from the registry; seed it after
-    // the `registry` borrow above ends (NLL drops it at last use).
+    // Default sun shadows ON so the lit render shows them without hunting for the checkbox. The
+    // state resource is separate from the registry; seed it after the `registry` borrow above
+    // ends (NLL drops it at last use).
     {
         let mut state = app.world_mut().resource_mut::<ShaderDebugState>();
         state.set("sdf/shadows", true);
-        state.set("sdf/reflections", true);
     }
 }
 
