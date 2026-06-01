@@ -45,6 +45,27 @@ impl Default for EditorGizmo {
     }
 }
 
+impl EditorGizmo {
+    /// Local-space oriented bounds of the drawn glyph as `(center, half_extents)`,
+    /// expressed in the node's own frame (so a world OBB is just this rotated/translated
+    /// by the node's transform). Tracks the geometry in `draw_node_editor_gizmos`, giving
+    /// a click target that matches what's drawn rather than a tiny point radius.
+    pub fn local_bounds(&self) -> (Vec3, Vec3) {
+        match *self {
+            // Disc (radius .4) + spokes (to .62) in the right/up plane; rays run from the
+            // origin along local -Z out to length 1.6. Box spans [-.62,.62]² × [-1.6, 0].
+            EditorGizmo::DirectionalLight { scale } => (
+                Vec3::new(0.0, 0.0, -0.8 * scale),
+                Vec3::new(0.62, 0.62, 0.8) * scale,
+            ),
+            // Three axis lines from the origin out to +scale on each axis: box [0, scale]³.
+            EditorGizmo::Axes { scale } => {
+                (Vec3::splat(0.5 * scale), Vec3::splat(0.5 * scale))
+            }
+        }
+    }
+}
+
 pub struct NodePlugin;
 
 impl Plugin for NodePlugin {

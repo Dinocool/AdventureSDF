@@ -39,11 +39,67 @@ pub struct Ray {
     pub direction: Vec3,
 }
 
+/// An oriented (not axis-aligned) bounding box: a center, the three orthonormal axes of
+/// its frame, and the half-extent along each. Used to give node gizmos (lights, empties)
+/// a click target that matches the drawn glyph's real orientation + size.
+pub struct Obb {
+    pub center: Vec3,
+    pub axes: [Vec3; 3],
+    pub half: Vec3,
+}
+
+impl Obb {
+    /// Build a world-space OBB from local `(center, half)` bounds carried by the glyph
+    /// and the node's world transform (rotation orients the box, scale grows the extents,
+    /// translation places the center).
+    pub fn from_local(center: Vec3, half: Vec3, xf: &GlobalTransform) -> Self {
+        let (scale, rot, translation) = xf.to_scale_rotation_translation();
+        Obb {
+            center: translation + rot * (center * scale),
+            axes: [rot * Vec3::X, rot * Vec3::Y, rot * Vec3::Z],
+            half: half * scale,
+        }
+    }
+
+    /// Ray/OBB intersection via the slab method in the box's local frame. Returns the
+    /// entry distance `t` along the (unit-length) ray, or `None` on a miss. A ray
+    /// starting inside the box returns `0.0`.
+    pub fn ray_hit(&self, ray: &Ray) -> Option<f32> {
+        let d = ray.origin - self.center;
+        let mut t_min = 0.0_f32;
+        let mut t_max = f32::MAX;
+        for i in 0..3 {
+            let axis = self.axes[i];
+            let h = self.half[i];
+            let e = axis.dot(d);
+            let f = axis.dot(ray.direction);
+            if f.abs() > 1e-6 {
+                let mut t1 = (-e - h) / f;
+                let mut t2 = (-e + h) / f;
+                if t1 > t2 {
+                    std::mem::swap(&mut t1, &mut t2);
+                }
+                t_min = t_min.max(t1);
+                t_max = t_max.min(t2);
+                if t_min > t_max {
+                    return None;
+                }
+            } else if -e - h > 0.0 || -e + h < 0.0 {
+                // Ray parallel to this slab and outside it → miss.
+                return None;
+            }
+        }
+        Some(t_min)
+    }
+}
+
 /// Sphere-trace the CSG scene on the CPU to find the entity owning the nearest
-/// hit surface. Edits are culled per-march-step by the BVH ray candidates, then
-/// folded via [`fold_csg`] — the same evaluation the bake uses, so picking always
-/// matches what is rendered.
-pub fn pick_entity(bvh: &Bvh, ray: &Ray, edits: &[GatheredEdit]) -> Option<Entity> {
+/// hit surface, plus the ray distance `t` to that surface. Edits are culled
+/// per-march-step by the BVH ray candidates, then folded via [`fold_csg`] — the
+/// same evaluation the bake uses, so picking always matches what is rendered.
+/// The returned `t` (world units along the unit-length ray) lets callers depth-sort
+/// the SDF hit against other pickables (e.g. light/empty gizmos in front of it).
+pub fn pick_entity(bvh: &Bvh, ray: &Ray, edits: &[GatheredEdit]) -> Option<(Entity, f32)> {
     if edits.is_empty() {
         return None;
     }
@@ -68,7 +124,7 @@ pub fn pick_entity(bvh: &Bvh, ray: &Ray, edits: &[GatheredEdit]) -> Option<Entit
         let sample = fold_csg(&resolved, pos);
         if sample.dist < 0.001 {
             // Attribute the hit to the nearest individual edit at this point.
-            return nearest_edit(edits, &candidates, pos);
+            return nearest_edit(edits, &candidates, pos).map(|e| (e, t));
         }
         t += sample.dist.max(0.001);
         if t > max_dist {

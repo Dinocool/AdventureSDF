@@ -66,6 +66,13 @@ pub struct SdfOverlayGizmos;
 #[derive(Default, Reflect, GizmoConfigGroup)]
 pub struct SdfGridGizmos;
 
+/// Gizmo config group for node editor glyphs (light suns, empty-node axes). Uses
+/// default depth (`depth_bias = 0.0`) so the SDF surface and other geometry occlude a
+/// glyph that sits behind them — unlike the always-on-top transform handles in
+/// [`SdfOverlayGizmos`].
+#[derive(Default, Reflect, GizmoConfigGroup)]
+pub struct SdfNodeGizmos;
+
 // --- Components ---
 
 // Edit primitives, CSG ops, ordering, and material live in `edits`. Re-exported
@@ -500,6 +507,7 @@ impl Plugin for SdfScenePlugin {
             }
             app.init_gizmo_group::<SdfOverlayGizmos>()
                 .init_gizmo_group::<SdfGridGizmos>()
+                .init_gizmo_group::<SdfNodeGizmos>()
                 .add_systems(OnEnter(AppScene::SdfEditor), configure_overlay_gizmos)
                 .add_systems(
                     Update,
@@ -921,12 +929,8 @@ pub fn gather_sorted_edits(volumes: &Query<VolumeQueryData, With<SdfVolume>>) ->
 /// Left-click selects the SDF volume under the cursor (CPU raymarch pick). Runs
 /// after `gizmo_update` in `Last`; if the gizmo claimed the click (a handle was
 /// grabbed), it bails so grabbing a handle doesn't reselect the volume underneath.
-/// Query filter for non-SDF spatial nodes pickable by screen-proximity (lights/empties).
-type GizmoNodeFilter = (
-    With<crate::node::Node3D>,
-    Without<SdfVolume>,
-    Without<SdfCamera>,
-);
+/// Query filter for non-SDF spatial nodes pickable via their gizmo bounds (lights/empties).
+type GizmoNodeFilter = (Without<SdfVolume>, Without<SdfCamera>);
 
 #[allow(clippy::too_many_arguments)]
 fn sdf_picking(
@@ -936,9 +940,9 @@ fn sdf_picking(
     cameras: Query<(&Camera, &GlobalTransform, &Transform), With<SdfCamera>>,
     windows: Query<&Window>,
     volumes: Query<VolumeQueryData, With<SdfVolume>>,
-    // Non-SDF spatial nodes (lights, cameras, empties) have no raymarchable geometry, so
-    // they're picked by proximity to their screen-projected origin instead.
-    gizmo_nodes: Query<(Entity, &GlobalTransform), GizmoNodeFilter>,
+    // Non-SDF spatial nodes (lights, empties) have no raymarchable geometry, so they're
+    // picked by ray-testing the oriented bounding box of their drawn editor gizmo.
+    gizmo_nodes: Query<(Entity, &GlobalTransform, &crate::node::EditorGizmo), GizmoNodeFilter>,
     bvh: Res<bvh::Bvh>,
 ) {
     if !mouse.just_pressed(MouseButton::Left) || gizmo_state.claimed_click {
@@ -951,35 +955,46 @@ fn sdf_picking(
     let Some(mouse_pos) = window.cursor_position() else {
         return;
     };
-    let Ok((camera, cam_global, cam_transform)) = cameras.single() else {
+    let Ok((camera, _cam_global, cam_transform)) = cameras.single() else {
         return;
     };
     let Some(ray) = picking::mouse_to_ray(camera, cam_transform, window, mouse_pos) else {
         return;
     };
 
-    // 1. Raymarch the SDF volumes (the geometric pick).
+    // 1. Raymarch the SDF volumes (the geometric pick), keeping the hit depth `t` so a
+    //    node gizmo in front of the surface can win the click.
     let gathered = gather_sorted_edits(&volumes);
-    if let Some(hit) = picking::pick_entity(&bvh, &ray, &gathered) {
-        selection.entity = Some(hit);
-        return;
-    }
+    let sdf_hit = picking::pick_entity(&bvh, &ray, &gathered);
 
-    // 2. Fallback: pick a non-SDF node (light/camera/empty) whose screen-projected origin
-    //    is within a small pixel radius of the cursor. Lets the light gizmo be selected.
-    const PICK_RADIUS_PX: f32 = 22.0;
-    let mut best: Option<(f32, Entity)> = None;
-    for (entity, xf) in &gizmo_nodes {
-        if let Ok(screen) = camera.world_to_viewport(cam_global, xf.translation()) {
-            let d = screen.distance(mouse_pos);
-            if d <= PICK_RADIUS_PX && best.is_none_or(|(bd, _)| d < bd) {
-                best = Some((d, entity));
-            }
+    // 2. Ray-test each node gizmo's oriented bounding box (matching the drawn glyph),
+    //    keeping the nearest entry distance — directly comparable to the SDF hit's `t`.
+    let mut best_node: Option<(f32, Entity)> = None; // (ray_depth, entity)
+    for (entity, xf, gizmo) in &gizmo_nodes {
+        let (center, half) = gizmo.local_bounds();
+        let obb = picking::Obb::from_local(center, half, xf);
+        if let Some(t) = obb.ray_hit(&ray)
+            && best_node.is_none_or(|(bt, _)| t < bt)
+        {
+            best_node = Some((t, entity));
         }
     }
-    // A node hit selects it; a click on truly empty space deselects (matching the prior
-    // raymarch-miss behaviour).
-    selection.entity = best.map(|(_, e)| e);
+
+    // 3. Depth arbitration: a node in front of the SDF surface (or when the ray missed
+    //    the SDF entirely) wins; otherwise the SDF hit wins. A click on truly empty space
+    //    deselects (matching the prior raymarch-miss behaviour).
+    selection.entity = match (sdf_hit, best_node) {
+        (Some((sdf_e, sdf_t)), Some((node_t, node_e))) => {
+            if node_t <= sdf_t {
+                Some(node_e)
+            } else {
+                Some(sdf_e)
+            }
+        }
+        (Some((sdf_e, _)), None) => Some(sdf_e),
+        (None, Some((_, node_e))) => Some(node_e),
+        (None, None) => None,
+    };
 }
 
 /// Double-click (within 300ms) on the selected volume eases the orbit camera onto
@@ -1019,6 +1034,12 @@ fn configure_overlay_gizmos(mut store: ResMut<GizmoConfigStore>) {
     let (grid, _) = store.config_mut::<SdfGridGizmos>();
     grid.depth_bias = 0.0;
     grid.line.width = 1.0;
+
+    // Node glyphs (light suns, empties) depth-test against the SDF surface: a glyph
+    // behind geometry is occluded, so it reads as being in the scene.
+    let (nodes, _) = store.config_mut::<SdfNodeGizmos>();
+    nodes.depth_bias = 0.0;
+    nodes.line.width = 2.0;
 }
 
 /// Draw a Godot-style infinite ground grid on the XZ plane: faint minor lines
@@ -1068,7 +1089,7 @@ fn draw_ground_grid(mut gizmos: Gizmos<SdfGridGizmos>, orbit: Res<SdfOrbitCamera
 /// Strictly an editor aid (lights/cameras/empties are otherwise invisible) — never
 /// part of the runtime render.
 fn draw_node_editor_gizmos(
-    mut gizmos: Gizmos<SdfOverlayGizmos>,
+    mut gizmos: Gizmos<SdfNodeGizmos>,
     nodes: Query<(&GlobalTransform, &crate::node::EditorGizmo)>,
 ) {
     use crate::node::EditorGizmo;
