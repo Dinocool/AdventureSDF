@@ -970,6 +970,31 @@ fn sdf_picking(
     };
 }
 
+/// CPU-pick the nearest SDF volume under a window-space cursor position, for callers
+/// outside the `sdf_picking` system (e.g. the dock's material drag-drop handler, which runs
+/// with `&mut World`). Returns the hit `SdfVolume` entity, or `None` on a miss. Reuses the
+/// same ray + raymarch as `sdf_picking`; only SDF volumes are considered (gizmo nodes don't
+/// accept a material).
+pub fn pick_sdf_volume(world: &mut World, cursor: Vec2) -> Option<Entity> {
+    let (camera, cam_transform) = {
+        let mut q = world.query_filtered::<(&Camera, &Transform), With<SdfCamera>>();
+        let (c, t) = q.single(world).ok()?;
+        (c.clone(), *t)
+    };
+    let window = {
+        let mut q = world.query::<&Window>();
+        q.single(world).ok()?.clone()
+    };
+    let ray = picking::mouse_to_ray(&camera, &cam_transform, &window, cursor)?;
+
+    let gathered = {
+        let mut q = world.query_filtered::<VolumeQueryData, With<SdfVolume>>();
+        gather_sorted_edits(&q.query(world))
+    };
+    let bvh = world.resource::<bvh::Bvh>();
+    picking::pick_entity(bvh, &ray, &gathered).map(|(e, _t)| e)
+}
+
 /// Double-click (within 300ms) on the selected volume eases the orbit camera onto
 /// it. Runs right after `sdf_picking` so `SdfSelection.entity` is already current;
 /// kept separate so picking stays a single-responsibility pick. Orbit-mode only —

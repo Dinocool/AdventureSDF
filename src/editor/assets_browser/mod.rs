@@ -16,12 +16,20 @@ use bevy_egui::egui;
 pub mod thumbnail;
 
 pub use thumbnail::{
-    ImageThumbnailProvider, MaterialThumbnailProvider, ThumbnailRenderPlugin,
+    ImageThumbnailProvider, MaterialThumbnailProvider, PbrTextureThumbnailProvider,
+    ThumbnailRenderPlugin,
 };
 
 /// Root the browser walks, relative to the working dir — matches how Bevy's
 /// `AssetServer` resolves `assets/`.
 pub const ASSETS_ROOT: &str = "assets";
+
+/// egui drag-and-drop payload: a material file (working-dir `.material.ron` path) dragged
+/// from the assets tray. Drop targets (viewport, inspector Material section) consume this
+/// to set an entity's material. A distinct newtype so it never collides with the
+/// hierarchy's `Entity` reparent payload.
+#[derive(Clone)]
+pub struct MaterialDrag(pub PathBuf);
 
 /// Edge length (px) of a thumbnail tile's image area.
 const TILE_PX: f32 = 72.0;
@@ -137,6 +145,47 @@ pub fn assets_browser_ui(world: &mut World, ui: &mut egui::Ui) {
                     // File click → select it in the unified inspector.
                     select_asset = Some(entry.path.clone());
                 }
+                // Material files are draggable onto scene entities / the inspector Material
+                // section to set their material (see `MaterialDrag`). Mirror the hierarchy's
+                // floating-preview drag pattern.
+                if !entry.is_dir
+                    && crate::editor::fs_util::is_material_ron(&entry.path)
+                    && resp.dragged()
+                {
+                    resp.dnd_set_drag_payload(MaterialDrag(entry.path.clone()));
+                    // Drag preview: a small floating copy of the material's thumbnail image
+                    // (falls back to a glyph if its render isn't ready), tracking the cursor.
+                    if let Some(pointer) = ui.ctx().pointer_interact_pos() {
+                        const SIZE: f32 = 48.0;
+                        let layer_id = egui::LayerId::new(
+                            egui::Order::Tooltip,
+                            resp.id.with("mat_drag_preview"),
+                        );
+                        let icon_rect =
+                            egui::Rect::from_center_size(pointer + egui::vec2(SIZE * 0.5 + 8.0, 0.0), egui::vec2(SIZE, SIZE));
+                        let painter = ui.ctx().layer_painter(layer_id);
+                        match thumbnail_for_path(world, &entry.path) {
+                            Thumbnail::Texture(tex) => {
+                                painter.image(
+                                    tex,
+                                    icon_rect,
+                                    egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                                    egui::Color32::WHITE,
+                                );
+                            }
+                            _ => {
+                                painter.text(
+                                    icon_rect.center(),
+                                    egui::Align2::CENTER_CENTER,
+                                    "◆",
+                                    egui::FontId::proportional(SIZE * 0.7),
+                                    egui::Color32::WHITE,
+                                );
+                            }
+                        }
+                    }
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+                }
             }
         });
     });
@@ -174,8 +223,8 @@ pub fn draw_tile(
         egui::vec2(TILE_W, TILE_PX + 28.0),
         egui::Layout::top_down(egui::Align::Center),
         |ui| {
-            let (rect, resp) =
-                ui.allocate_exact_size(egui::vec2(TILE_PX, TILE_PX), egui::Sense::click());
+            let (rect, resp) = ui
+                .allocate_exact_size(egui::vec2(TILE_PX, TILE_PX), egui::Sense::click_and_drag());
             let painter = ui.painter_at(rect);
             match thumb {
                 TileThumb::Icon(glyph) => draw_glyph(&painter, rect, glyph),

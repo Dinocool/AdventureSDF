@@ -5,10 +5,8 @@
 //! about the SDF pipeline — this module is purely a consumer, which is the
 //! pattern a future BVH/AABB visualizer would follow too.
 
-use bevy::asset::RenderAssetUsages;
 use bevy::prelude::*;
-use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
-use bevy_egui::{EguiTextureHandle, EguiUserTextures, egui};
+use bevy_egui::egui;
 
 use crate::editor::panels::{DockSide, register_panel};
 use crate::editor::registry::{
@@ -39,40 +37,6 @@ pub struct SdfAtlasStats {
     pub blend_bytes: u64,
     pub lookup_bytes: u64,
     pub total_bytes: u64,
-}
-
-/// Egui-displayable views of the CPU atlas, rebuilt when the atlas changes.
-#[derive(Resource)]
-pub struct SdfAtlasTextures {
-    pub dist_id: Option<egui::TextureId>,
-    pub object_id: Option<egui::TextureId>,
-    pub dist_handle: Handle<Image>,
-    pub object_handle: Handle<Image>,
-    pub width: u32,
-    pub height: u32,
-    /// Display height (px) for each atlas row in the panel; user-adjustable zoom.
-    pub view_height: f32,
-    /// The last frame the atlas panel was actually drawn (egui_dock only invokes a tab's
-    /// render closure when the tab is visible). `update_atlas_textures` rebuilds the preview
-    /// images ONLY when this is recent — rebuilding the whole-atlas RGBA previews cost ~2.8ms
-    /// EVERY atlas change (i.e. every drag frame) even with the panel closed, the single
-    /// biggest SDF frame cost in the editor. Gating it on visibility makes a closed panel free.
-    pub panel_seen_frame: u64,
-}
-
-impl Default for SdfAtlasTextures {
-    fn default() -> Self {
-        Self {
-            dist_id: None,
-            object_id: None,
-            dist_handle: Handle::default(),
-            object_handle: Handle::default(),
-            width: 0,
-            height: 0,
-            view_height: 64.0,
-            panel_seen_frame: 0,
-        }
-    }
 }
 
 /// Controls the BVH wireframe overlay (drawn via [`draw_bvh`]).
@@ -121,7 +85,6 @@ impl Plugin for SdfDebugPlugin {
         );
 
         app.init_resource::<SdfAtlasStats>()
-            .init_resource::<SdfAtlasTextures>()
             .init_resource::<BvhDebugState>()
             .init_resource::<ChunkDebugState>()
             .register_type::<SdfAtlasStats>()
@@ -130,14 +93,6 @@ impl Plugin for SdfDebugPlugin {
             .add_systems(
                 Update,
                 update_atlas_stats.run_if(in_state(AppScene::SdfEditor)),
-            )
-            // Needs EguiUserTextures (provided by EditorPlugin). Guarded so
-            // SdfScenePlugin can run standalone (e.g. in tests) without egui.
-            .add_systems(
-                Update,
-                update_atlas_textures
-                    .run_if(in_state(AppScene::SdfEditor))
-                    .run_if(resource_exists::<EguiUserTextures>),
             );
 
         // Gizmo-drawing systems need GizmoPlugin's Assets<GizmoAsset>; absent under
@@ -151,25 +106,9 @@ impl Plugin for SdfDebugPlugin {
             );
         }
 
-        // Left dock: atlas info + textures, gizmo/camera state, wireframe toggle.
-        register_panel(
-            app,
-            "sdf/atlas",
-            "SDF Atlas",
-            DockSide::Left,
-            0,
-            atlas_panel,
-        );
-        register_panel(app, "sdf/bvh", "SDF BVH", DockSide::Left, 25, bvh_panel);
-        register_panel(
-            app,
-            "sdf/chunks",
-            "SDF Chunks",
-            DockSide::Left,
-            26,
-            chunk_panel,
-        );
-        // Bottom dock: combined render tuning (overlay + raymarch), ray inspector.
+        // Left dock: BVH + chunk visualizers. (Atlas stats moved into the Performance tab;
+        // Bottom dock: combined render tuning (overlay + raymarch), ray inspector, and the
+        // BVH + chunk acceleration-structure visualizers (one combined tab).
         register_panel(
             app,
             "sdf/render",
@@ -177,6 +116,14 @@ impl Plugin for SdfDebugPlugin {
             DockSide::Bottom,
             20,
             render_panel,
+        );
+        register_panel(
+            app,
+            "sdf/accel",
+            "SDF Accel",
+            DockSide::Bottom,
+            30,
+            accel_panel,
         );
         register_panel(
             app,
@@ -401,115 +348,6 @@ fn fmt_bytes(bytes: u64) -> String {
     }
 }
 
-// --- Atlas texture viewer ---
-
-/// Rebuild the egui-displayable atlas images whenever the CPU atlas changes.
-/// Uses the same tile layout as `render::extract_sdf_atlas` so the on-screen
-/// image matches what the GPU samples.
-fn update_atlas_textures(
-    atlas: Res<SdfAtlas>,
-    frames: Res<bevy::diagnostic::FrameCount>,
-    mut images: ResMut<Assets<Image>>,
-    mut egui_textures: ResMut<EguiUserTextures>,
-    mut tex: ResMut<SdfAtlasTextures>,
-) {
-    if !atlas.is_changed() {
-        return;
-    }
-
-    // Skip the whole-atlas preview rebuild unless the SDF Atlas panel was visible within the
-    // last few frames (it stamps `panel_seen_frame` when egui_dock draws it). This is the
-    // single biggest editor frame cost during a drag (~2.8ms) and is pure waste when the
-    // panel is closed. A few frames of slack avoids a stale preview on the frame the panel
-    // reopens. Also, in GPU bake mode the CPU `packed.dist`/`mat_dist` are zero placeholders
-    // (the GPU owns those texels), so the preview would render garbage regardless — see
-    // `SdfAtlas::insert_gpu_brick`.
-    let now = frames.0 as u64;
-    if now.saturating_sub(tex.panel_seen_frame) > 3 {
-        return;
-    }
-
-    let num_bricks = atlas.bricks.len() as u32;
-    if num_bricks == 0 {
-        return;
-    }
-
-    let edge = BRICK_EDGE as u32;
-    let tile_width = edge * edge; // 64
-    // 2D-tile (wrap into rows) so the egui preview image never exceeds the GPU's
-    // max texture dimension — mirrors the render atlas packing.
-    let tiles_per_row: u32 = 256;
-    let num_rows = num_bricks.div_ceil(tiles_per_row);
-    let width = tiles_per_row * tile_width;
-    let height = num_rows * edge;
-    let pixels = (width * height) as usize;
-
-    let mut dist_rgba = vec![0u8; pixels * 4];
-    let mut object_rgba = vec![0u8; pixels * 4];
-
-    // The GPU owns the per-voxel texels (the CPU `PackedBrick` no longer stores dist/mat —
-    // they were write-only zeros here), so this preview shows what the CPU DOES know: the
-    // resident-brick layout, each tile filled with its palette colour. Distance pane reuses the
-    // same colour at reduced brightness so the tile grid is still legible. (For per-voxel atlas
-    // inspection, read back the GPU dist/mat textures instead — not wired up.)
-    for (i, packed) in atlas.bricks.values().enumerate() {
-        let tile = i as u32;
-        let col_px = (tile % tiles_per_row) * tile_width;
-        let row_px = (tile / tiles_per_row) * edge;
-        let [r, gg, b] = object_color((packed.palette[0] & 0xff) as u8);
-        for z in 0..edge {
-            for y in 0..edge {
-                for x in 0..edge {
-                    let dst_u = col_px + y * edge + x;
-                    let dst_v = row_px + z;
-                    let dst = (dst_v * width + dst_u) as usize;
-                    object_rgba[dst * 4] = r;
-                    object_rgba[dst * 4 + 1] = gg;
-                    object_rgba[dst * 4 + 2] = b;
-                    object_rgba[dst * 4 + 3] = 255;
-                    dist_rgba[dst * 4] = r / 2;
-                    dist_rgba[dst * 4 + 1] = gg / 2;
-                    dist_rgba[dst * 4 + 2] = b / 2;
-                    dist_rgba[dst * 4 + 3] = 255;
-                }
-            }
-        }
-    }
-
-    let size = Extent3d {
-        width,
-        height,
-        depth_or_array_layers: 1,
-    };
-    // Nearest sampling so the upscaled atlas shows crisp per-texel detail in the
-    // panel instead of a blurry smear.
-    let sampler = bevy::image::ImageSampler::nearest();
-    let mut dist_img = Image::new(
-        size,
-        TextureDimension::D2,
-        dist_rgba,
-        TextureFormat::Rgba8UnormSrgb,
-        RenderAssetUsages::all(),
-    );
-    dist_img.sampler = sampler.clone();
-    let mut object_img = Image::new(
-        size,
-        TextureDimension::D2,
-        object_rgba,
-        TextureFormat::Rgba8UnormSrgb,
-        RenderAssetUsages::all(),
-    );
-    object_img.sampler = sampler;
-
-    tex.dist_handle = images.add(dist_img);
-    tex.object_handle = images.add(object_img);
-    tex.dist_id = Some(egui_textures.add_image(EguiTextureHandle::Strong(tex.dist_handle.clone())));
-    tex.object_id =
-        Some(egui_textures.add_image(EguiTextureHandle::Strong(tex.object_handle.clone())));
-    tex.width = width;
-    tex.height = height;
-}
-
 /// Distinct color per object id (golden-ratio hue spacing). id 0 = dark gray.
 fn object_color(id: u8) -> [u8; 3] {
     if id == 0 {
@@ -607,7 +445,22 @@ fn draw_chunks(
 }
 
 /// Panel: resident-chunk count + the overlay toggle (mirrors `bvh_panel`).
-fn chunk_panel(world: &mut World, ui: &mut egui::Ui) {
+/// Combined acceleration-structure panel: BVH stats + visualizer toggles, then the
+/// resident-chunk stats + visualizer toggle. One bottom-dock tab for "what the bake's
+/// spatial structures look like".
+fn accel_panel(world: &mut World, ui: &mut egui::Ui) {
+    egui::ScrollArea::vertical()
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            ui.heading("BVH");
+            bvh_ui(world, ui);
+            ui.separator();
+            ui.heading("Chunks");
+            chunk_ui(world, ui);
+        });
+}
+
+fn chunk_ui(world: &mut World, ui: &mut egui::Ui) {
     let (count, by_lod) = {
         let atlas = world.resource::<SdfAtlas>();
         let config = world.resource::<SdfGridConfig>();
@@ -626,11 +479,8 @@ fn chunk_panel(world: &mut World, ui: &mut egui::Ui) {
             ui.label(format!("  LOD {lod}: {n}"));
         }
     }
-    ui.separator();
-    {
-        let mut state = world.resource_mut::<ChunkDebugState>();
-        ui.checkbox(&mut state.visible, "Show chunk boxes");
-    }
+    let mut state = world.resource_mut::<ChunkDebugState>();
+    ui.checkbox(&mut state.visible, "Show chunk boxes");
 }
 
 // --- Wireframe bounds ---
@@ -662,14 +512,10 @@ fn draw_bounds(
 
 // --- Panels ---
 
-fn atlas_panel(world: &mut World, ui: &mut egui::Ui) {
-    // Mark the panel visible this frame so `update_atlas_textures` rebuilds the preview (it
-    // skips the ~2.8ms rebuild when the panel is closed). egui_dock only calls this closure
-    // for a visible tab, so reaching here == the panel is on screen.
-    let frame = world.resource::<bevy::diagnostic::FrameCount>().0 as u64;
-    world.resource_mut::<SdfAtlasTextures>().panel_seen_frame = frame;
-
-    let stats = world.resource::<SdfAtlasStats>();
+/// Render the SDF atlas stats (brick/texel counts, dirty state, GPU-memory breakdown).
+/// Used by the Performance panel — the SDF Atlas got its own tab removed and its textured
+/// preview dropped; only these live stats remain.
+pub fn atlas_stats_ui(stats: &SdfAtlasStats, ui: &mut egui::Ui) {
     ui.label(format!("Bricks: {}", stats.total_bricks));
     ui.label(format!(
         "Texels: {}x{}",
@@ -699,47 +545,6 @@ fn atlas_panel(world: &mut World, ui: &mut egui::Ui) {
             ui.label("Lookup buffer");
             ui.label(fmt_bytes(stats.lookup_bytes));
             ui.end_row();
-        });
-
-    // Atlas images. Native layout is extreme aspect (num_bricks*64 wide x 8 tall),
-    // so display each row scaled up to a readable height inside a horizontal
-    // scroll area and let the user zoom the row height.
-    let (dist_id, object_id, tex_w, tex_h) = {
-        let tex = world.resource::<SdfAtlasTextures>();
-        (tex.dist_id, tex.object_id, tex.width, tex.height)
-    };
-    if dist_id.is_none() && object_id.is_none() {
-        return;
-    }
-
-    ui.separator();
-    let row_h = world.resource::<SdfAtlasTextures>().view_height;
-    let mut h = row_h;
-    if ui
-        .add(egui::Slider::new(&mut h, 24.0..=256.0).text("Atlas zoom (px tall)"))
-        .changed()
-    {
-        world.resource_mut::<SdfAtlasTextures>().view_height = h;
-    }
-
-    let aspect = if tex_h > 0 {
-        tex_w as f32 / tex_h as f32
-    } else {
-        1.0
-    };
-    let img_w = h * aspect;
-
-    egui::ScrollArea::horizontal()
-        .id_salt("sdf_atlas_imgs")
-        .show(ui, |ui| {
-            if let Some(id) = dist_id {
-                ui.label("Distance atlas");
-                ui.image(egui::load::SizedTexture::new(id, egui::vec2(img_w, h)));
-            }
-            if let Some(id) = object_id {
-                ui.label("Object-id atlas");
-                ui.image(egui::load::SizedTexture::new(id, egui::vec2(img_w, h)));
-            }
         });
 }
 
@@ -856,7 +661,7 @@ fn live_ray_capture(
 
 // --- BVH panel ---
 
-fn bvh_panel(world: &mut World, ui: &mut egui::Ui) {
+fn bvh_ui(world: &mut World, ui: &mut egui::Ui) {
     // Node/leaf/depth stats from the flat node array.
     const INTERNAL_FLAG: u32 = 0x8000_0000;
     let (node_count, leaf_count, max_depth, edits) = {
@@ -1077,6 +882,23 @@ fn random_spawn_offset() -> Vec3 {
 
 // --- Inspector: SdfMaterialSource editor ---
 
+/// Set `entity`'s material to the `.material.ron` at `working_path` (a working-dir path like
+/// `assets/materials/sand.material.ron`). Converts to the assets-relative form expected by
+/// [`SdfMaterialSource::asset`] and writes it if the entity accepts a material (has the
+/// component). No-op otherwise. Shared by the inspector drop, the viewport drop, and the
+/// picker — mutating the source fires `Changed` → `resolve_materials` re-derives the GPU id.
+/// Returns whether the material was set.
+pub fn set_entity_material(world: &mut World, entity: Entity, working_path: &std::path::Path) -> bool {
+    let rel = crate::editor::fs_util::relative_to_assets(working_path)
+        .unwrap_or_else(|| working_path.to_path_buf());
+    if let Some(mut source) = world.get_mut::<crate::sdf_render::SdfMaterialSource>(entity) {
+        source.asset = Some(rel);
+        true
+    } else {
+        false
+    }
+}
+
 /// Custom Inspector editor for [`SdfMaterialSource`]: pick the base material file this
 /// volume uses (or none → inline), and edit the appropriate appearance. The authored
 /// source drives the runtime `SdfMaterial` id via `resolve_materials`. Registered via
@@ -1108,6 +930,11 @@ pub fn sdf_material_editor(world: &mut World, entity: Entity, ui: &mut egui::Ui)
             thumb: crate::editor::assets_browser::TileThumb::Path(working),
         }
     });
+
+    // The ENTIRE material section is a drop target: drag a material tile from the assets tray
+    // anywhere over this section to set this volume's material. Remember where the section
+    // starts so we can interact over its full rect after the body is laid out.
+    let section_top = ui.min_rect().bottom();
 
     ui.label("Material");
     let picked = resource_picker(
@@ -1158,6 +985,31 @@ pub fn sdf_material_editor(world: &mut World, entity: Entity, ui: &mut egui::Ui)
     } else {
         // Inline material: edit the per-field overrides (stored on the volume, serialized).
         sdf_inline_material_ui(world, entity, ui);
+    }
+
+    // Section-wide material drop target: the rect from `section_top` down to the current
+    // layout bottom, spanning the editor's width. Drop a material tile anywhere in here to
+    // set this volume's material; highlight while a material drag hovers.
+    use crate::editor::assets_browser::MaterialDrag;
+    let section = egui::Rect::from_min_max(
+        egui::pos2(ui.min_rect().left(), section_top),
+        egui::pos2(ui.min_rect().right(), ui.min_rect().bottom()),
+    );
+    let drop = ui.interact(
+        section,
+        ui.make_persistent_id(("sdf_mat_drop", entity)),
+        egui::Sense::hover(),
+    );
+    if egui::DragAndDrop::payload::<MaterialDrag>(ui.ctx()).is_some() && drop.contains_pointer() {
+        ui.painter().rect_stroke(
+            section.expand(2.0),
+            3.0,
+            ui.visuals().selection.stroke,
+            egui::StrokeKind::Outside,
+        );
+    }
+    if let Some(drag) = drop.dnd_release_payload::<MaterialDrag>() {
+        set_entity_material(world, entity, &drag.0);
     }
 }
 
