@@ -168,7 +168,7 @@ impl Default for SdfRaymarchParams {
             // Raised for vast-distance marching: cone termination keeps the step count
             // bounded even though the reach is far larger than the old 100-unit cap.
             max_steps: 192,
-            max_dist: 2000.0,
+            max_dist: 5000.0,
             sdf_eps: 0.001,
             cone_scale: 1.0,
             over_relax: 1.6,

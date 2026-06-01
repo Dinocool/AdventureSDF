@@ -30,7 +30,7 @@
     dist_to_chunk_exit_lod,
     in_ring_chunk,
 }
-#import sdf::pbr::{resolve_surface, shade_surface, shade_material_env, sun_dir, PbrInputs}
+#import sdf::pbr::{resolve_surface, shade_surface, shade_material_env, sun_dir, PbrInputs, fresnel_schlick_roughness}
 #import sdf::sky::sky_color
 
 // Cone-prepass seed texture: per-8×8-tile start distance (R32Float), written by
@@ -331,7 +331,7 @@ fn raymarch(origin: vec3<f32>, dir: vec3<f32>, start_t: f32, q: MarchQuality) ->
 // near-mirror keeps a tight, longer ray. This is what keeps the secondary march affordable.
 // `out_steps` returns the reflection march's step count (for the SDF_DEBUG_REFLECT_STEPS
 // overlay); pass a throwaway when the cost isn't needed.
-fn trace_reflection(origin: vec3<f32>, refl_dir: vec3<f32>, roughness: f32, out_steps: ptr<function, u32>) -> vec3<f32> {
+fn trace_reflection(origin: vec3<f32>, refl_dir: vec3<f32>, roughness: f32, start_t: f32, out_steps: ptr<function, u32>) -> vec3<f32> {
     // Roughness-driven profile, but with a RAISED FLOOR so even a perfect mirror (r→0) can't
     // approach full primary cost — a measured low-roughness reflection was ~+10ms, doubling the
     // SDF draw. The floor: min cone ×4 (accept hits sooner), steps capped at ~1/3 the primary
@@ -345,9 +345,9 @@ fn trace_reflection(origin: vec3<f32>, refl_dir: vec3<f32>, roughness: f32, out_
         max_dist() * mix(0.4, 0.2, r),
         u32(clamp(1.0 + r * 4.0, 1.0, 4.0)),
     );
-    // Reflection rays aren't primary screen rays, so they have no cone-prepass tile seed —
-    // march from t = 0 (the caller already nudged `origin` off the surface).
-    let rm = raymarch(origin, refl_dir, 0.0, q);
+    // Reflection rays have no cone-prepass tile seed; the caller passes a cheap `start_t` to
+    // skip the near-field empty gap above the surface (the origin is already nudged off it).
+    let rm = raymarch(origin, refl_dir, start_t, q);
     *out_steps = rm.steps;
     if (!rm.hit) {
         return sky_color(refl_dir, sun_dir());
@@ -495,17 +495,28 @@ fn main(in: FullscreenVertexOutput) -> FragmentOutput {
     var env_radiance = sky_color(reflect(-normalize(camera.camera_pos.xyz - hit_pos), p.normal), sun_dir());
     var refl_steps = 0u;  // reflection-march cost for the SDF_DEBUG_REFLECT_STEPS overlay
 #ifdef SDF_REFLECTIONS
-    // Gate on ROUGHNESS only: a real reflection is perceptible only when the surface is smooth
-    // enough to mirror geometry. At high roughness the reflection blurs into the IBL sky
-    // regardless of metalness — so a rough METAL gains nothing from a traced ray (the old
-    // `metallic>0.1 || ...` wasted a march on it). Both smooth metals and smooth dielectrics
-    // (low roughness) still reflect. The march is also roughness-scaled (trace_reflection), so
-    // the surviving rays near the cutoff are already cheap.
-    if (p.roughness < 0.9) {
-        let view = normalize(camera.camera_pos.xyz - hit_pos);
+    // FRESNEL IMPORTANCE GATE. A traced reflection only matters where it's actually VISIBLE —
+    // and visibility is `env * fresnel_schlick_roughness(ndv, f0, roughness)` (the exact weight
+    // ambient_ibl applies). For a dielectric (terrain, f0≈0.04) head-on, that weight is ~0.04,
+    // so the reflection contributes a few percent and is dominated by diffuse — yet a pure
+    // roughness gate still traces a full march there. Computing the Fresnel weight FIRST and
+    // skipping when it's below a small threshold kills the camera-facing terrain pixels (the
+    // bulk of a heightmap) and keeps the grazing horizon-ward slopes where F→1 and the
+    // reflection reads. Angle- AND roughness-aware, physically the term we'd multiply anyway.
+    let view = normalize(camera.camera_pos.xyz - hit_pos);
+    let ndv = max(dot(p.normal, view), 0.0);
+    let f0 = mix(vec3<f32>(0.04), p.albedo, p.metallic);
+    let fres = fresnel_schlick_roughness(ndv, f0, p.roughness);
+    let refl_weight = max(max(fres.r, fres.g), fres.b) * (1.0 - p.roughness);
+    if (refl_weight > 0.04) {
         let refl_dir = reflect(-view, p.normal);
         let bias = voxel_size_at(rm.lod) * 2.0;
-        env_radiance = trace_reflection(hit_pos + normal * bias, refl_dir, p.roughness, &refl_steps);
+        // CHEAP START: the reflection ray has no cone-prepass seed, so from t=0 it crawls the
+        // near-field empty space above the surface. Start it a few coarse voxels out (past the
+        // self-bias shell) so it skips the guaranteed-empty gap it just left — the march's own
+        // chunk-DDA handles the rest. Conservative (small) so no real near reflection is missed.
+        let start = voxel_size_at(rm.lod) * 4.0;
+        env_radiance = trace_reflection(hit_pos + normal * bias, refl_dir, p.roughness, start, &refl_steps);
     }
 #endif
 
