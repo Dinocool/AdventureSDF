@@ -4,12 +4,17 @@ version = "0.1.0"
 edition = "2024"
 
 [features]
-default = ["fast"]
+default = []
 editor = [
     "dep:bevy-inspector-egui",
     "dep:bevy_egui",
     "dep:egui_dock",
     "dep:egui-phosphor",
+    # F5-in-editor RenderDoc capture (in-application API). `renderdoc` grabs the API
+    # handle; `libloading` preloads renderdoc.dll before wgpu creates the device so the
+    # hook installs (see `load_renderdoc` in main.rs).
+    "dep:renderdoc",
+    "dep:libloading",
     # Chrome-tracing profiler. Writes `trace-<timestamp>.json` on exit (load in Perfetto /
     # chrome://tracing, or hand the file to Claude to rank hot spans). Captures every Bevy
     # system + render-graph node span plus our own `info_span!` SDF spans.
@@ -39,6 +44,10 @@ serde = { version = "1", features = ["derive"] }
 # Offline BC7 encode of the PBR texture arrays (cached to disk; ~1/6 the VRAM).
 intel_tex_2 = "0.2"
 egui_dock = { version = "0.18", optional = true }
+# In-app RenderDoc capture, editor-only. `libloading` preloads renderdoc.dll early so the
+# graphics hook installs before the wgpu device exists.
+renderdoc = { version = "0.12", optional = true }
+libloading = { version = "0.8", optional = true }
 # Phosphor icon font for the editor toolbar (egui 0.33-compatible). Installed into the
 # egui context at startup; gives named glyph constants so toolbar buttons show real icons.
 egui-phosphor = { version = "0.11", optional = true }

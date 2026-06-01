@@ -65,6 +65,7 @@ Don't reinvent these; the detailed, code-verified guidance lives in the skills:
 | ECS design (SSOT, ordering, guards, feature-gating) | `design-ecs` |
 | Create/update a scene `.scn.ron` | `/create-scene` |
 | Debug panels / shader visualization | `debug-shader` |
+| Analyze GPU captures (.rdc) / Bevy traces for perf | `analyze-rdoc` |
 | Pre-done verification (mirrors CI) | `/verify-build` |
 | Rust language rules (179 rules, 14 categories) | `/rust-skills` |
 

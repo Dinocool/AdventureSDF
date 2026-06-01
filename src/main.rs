@@ -36,9 +36,51 @@ fn prune_old_traces(keep: usize) {
     }
 }
 
+/// Preload `renderdoc.dll` so RenderDoc's graphics hook installs BEFORE wgpu creates the
+/// device inside `DefaultPlugins`. The `renderdoc` crate only searches `$PATH`, and the
+/// installer doesn't put its dir there, so we `LoadLibrary` the dll from its standard
+/// install location explicitly. Once loaded, `RenderDoc::new()` (in the editor's capture
+/// plugin) finds the already-resident module and F5 can trigger captures with no external
+/// launcher. Leaked on purpose: the hook must live for the whole process.
+///
+/// NOTE: incompatible with `--features fast` (Bevy `dynamic_linking`) — RenderDoc can't
+/// hook a dynamically-linked Bevy, so capture with `--no-default-features --features editor`.
+#[cfg(feature = "editor")]
+fn load_renderdoc() {
+    if cfg!(feature = "fast") {
+        warn!(
+            "RenderDoc capture: `fast` (dynamic_linking) is on — captures will likely fail. \
+             Run with `--no-default-features --features editor` to capture."
+        );
+    }
+    // Standard Windows install path; the dll sits in the RenderDoc program dir.
+    const CANDIDATES: [&str; 2] = [
+        r"C:\Program Files\RenderDoc\renderdoc.dll",
+        "renderdoc.dll", // fallback: PATH / CWD
+    ];
+    for path in CANDIDATES {
+        // SAFETY: loading a known system DLL; we intentionally leak the handle so the
+        // graphics hook persists for the lifetime of the process.
+        match unsafe { libloading::Library::new(path) } {
+            Ok(lib) => {
+                std::mem::forget(lib);
+                info!("RenderDoc capture: preloaded {path} (press F5 in editor to capture)");
+                return;
+            }
+            Err(_) => continue,
+        }
+    }
+    warn!(
+        "RenderDoc capture: renderdoc.dll not found (looked in Program Files + PATH); \
+         F5 capture disabled this run."
+    );
+}
+
 fn main() {
     #[cfg(feature = "editor")]
     prune_old_traces(2);
+    #[cfg(feature = "editor")]
+    load_renderdoc();
 
     let mut app = App::new();
     app.add_plugins(
