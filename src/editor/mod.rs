@@ -21,7 +21,6 @@ pub mod profiling;
 pub mod project_files;
 pub mod registry;
 pub mod renderdoc_capture;
-pub mod resource_inspector;
 pub mod resource_picker;
 pub mod selection;
 pub mod status_bar;
@@ -64,6 +63,7 @@ impl Plugin for EditorPlugin {
             let mut registry = assets_browser::ThumbnailRegistry::default();
             registry.register(assets_browser::ImageThumbnailProvider);
             registry.register(assets_browser::MaterialThumbnailProvider);
+            registry.register(assets_browser::PbrTextureThumbnailProvider);
             app.insert_resource(registry);
         }
 
@@ -112,18 +112,6 @@ impl Plugin for EditorPlugin {
 
         // Gizmo transform tools (mode + snap) now live in the viewport toolbar
         // (see `dock::viewport_toolbar`), so there's no separate Transform panel.
-
-        // Resource Inspector (Godot-style): edit material resources + browse textures.
-        app.init_resource::<resource_inspector::ResourceInspectorState>()
-            .init_resource::<resource_inspector::TextureVariantCache>();
-        panels::register_panel(
-            app,
-            "core/resources",
-            "Resources",
-            DockSide::Left,
-            2,
-            resource_inspector::resource_inspector_ui,
-        );
 
         // Build the dock layout once, after `Startup` (so every plugin — including
         // the SDF debug plugin — has registered its panels), then render each frame.

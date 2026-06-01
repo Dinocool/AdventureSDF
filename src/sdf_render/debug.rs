@@ -5,10 +5,8 @@
 //! about the SDF pipeline — this module is purely a consumer, which is the
 //! pattern a future BVH/AABB visualizer would follow too.
 
-use bevy::asset::RenderAssetUsages;
 use bevy::prelude::*;
-use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
-use bevy_egui::{EguiTextureHandle, EguiUserTextures, egui};
+use bevy_egui::egui;
 
 use crate::editor::panels::{DockSide, register_panel};
 use crate::editor::registry::{
@@ -39,40 +37,6 @@ pub struct SdfAtlasStats {
     pub blend_bytes: u64,
     pub lookup_bytes: u64,
     pub total_bytes: u64,
-}
-
-/// Egui-displayable views of the CPU atlas, rebuilt when the atlas changes.
-#[derive(Resource)]
-pub struct SdfAtlasTextures {
-    pub dist_id: Option<egui::TextureId>,
-    pub object_id: Option<egui::TextureId>,
-    pub dist_handle: Handle<Image>,
-    pub object_handle: Handle<Image>,
-    pub width: u32,
-    pub height: u32,
-    /// Display height (px) for each atlas row in the panel; user-adjustable zoom.
-    pub view_height: f32,
-    /// The last frame the atlas panel was actually drawn (egui_dock only invokes a tab's
-    /// render closure when the tab is visible). `update_atlas_textures` rebuilds the preview
-    /// images ONLY when this is recent — rebuilding the whole-atlas RGBA previews cost ~2.8ms
-    /// EVERY atlas change (i.e. every drag frame) even with the panel closed, the single
-    /// biggest SDF frame cost in the editor. Gating it on visibility makes a closed panel free.
-    pub panel_seen_frame: u64,
-}
-
-impl Default for SdfAtlasTextures {
-    fn default() -> Self {
-        Self {
-            dist_id: None,
-            object_id: None,
-            dist_handle: Handle::default(),
-            object_handle: Handle::default(),
-            width: 0,
-            height: 0,
-            view_height: 64.0,
-            panel_seen_frame: 0,
-        }
-    }
 }
 
 /// Controls the BVH wireframe overlay (drawn via [`draw_bvh`]).
@@ -112,15 +76,15 @@ impl Plugin for SdfDebugPlugin {
     fn build(&self, app: &mut App) {
         register_shader_modes(app);
 
-        // Custom Inspector editor for SdfMaterial (registry picker + colour). The other
-        // SDF components reflect cleanly, so the generic inspector handles those.
-        crate::editor::inspector::register_component_editor::<SdfMaterial>(
+        // Custom Inspector editor for SdfMaterialSource (base-file picker + inline overrides).
+        // The other SDF components reflect cleanly, so the generic inspector handles those.
+        // SdfMaterial is the derived runtime id — hidden from the inspector below.
+        crate::editor::inspector::register_component_editor::<crate::sdf_render::SdfMaterialSource>(
             app,
             sdf_material_editor,
         );
 
         app.init_resource::<SdfAtlasStats>()
-            .init_resource::<SdfAtlasTextures>()
             .init_resource::<BvhDebugState>()
             .init_resource::<ChunkDebugState>()
             .register_type::<SdfAtlasStats>()
@@ -129,14 +93,6 @@ impl Plugin for SdfDebugPlugin {
             .add_systems(
                 Update,
                 update_atlas_stats.run_if(in_state(AppScene::SdfEditor)),
-            )
-            // Needs EguiUserTextures (provided by EditorPlugin). Guarded so
-            // SdfScenePlugin can run standalone (e.g. in tests) without egui.
-            .add_systems(
-                Update,
-                update_atlas_textures
-                    .run_if(in_state(AppScene::SdfEditor))
-                    .run_if(resource_exists::<EguiUserTextures>),
             );
 
         // Gizmo-drawing systems need GizmoPlugin's Assets<GizmoAsset>; absent under
@@ -150,25 +106,9 @@ impl Plugin for SdfDebugPlugin {
             );
         }
 
-        // Left dock: atlas info + textures, gizmo/camera state, wireframe toggle.
-        register_panel(
-            app,
-            "sdf/atlas",
-            "SDF Atlas",
-            DockSide::Left,
-            0,
-            atlas_panel,
-        );
-        register_panel(app, "sdf/bvh", "SDF BVH", DockSide::Left, 25, bvh_panel);
-        register_panel(
-            app,
-            "sdf/chunks",
-            "SDF Chunks",
-            DockSide::Left,
-            26,
-            chunk_panel,
-        );
-        // Bottom dock: combined render tuning (overlay + raymarch), ray inspector.
+        // Left dock: BVH + chunk visualizers. (Atlas stats moved into the Performance tab;
+        // Bottom dock: combined render tuning (overlay + raymarch), ray inspector, and the
+        // BVH + chunk acceleration-structure visualizers (one combined tab).
         register_panel(
             app,
             "sdf/render",
@@ -176,6 +116,14 @@ impl Plugin for SdfDebugPlugin {
             DockSide::Bottom,
             20,
             render_panel,
+        );
+        register_panel(
+            app,
+            "sdf/accel",
+            "SDF Accel",
+            DockSide::Bottom,
+            30,
+            accel_panel,
         );
         register_panel(
             app,
@@ -400,115 +348,6 @@ fn fmt_bytes(bytes: u64) -> String {
     }
 }
 
-// --- Atlas texture viewer ---
-
-/// Rebuild the egui-displayable atlas images whenever the CPU atlas changes.
-/// Uses the same tile layout as `render::extract_sdf_atlas` so the on-screen
-/// image matches what the GPU samples.
-fn update_atlas_textures(
-    atlas: Res<SdfAtlas>,
-    frames: Res<bevy::diagnostic::FrameCount>,
-    mut images: ResMut<Assets<Image>>,
-    mut egui_textures: ResMut<EguiUserTextures>,
-    mut tex: ResMut<SdfAtlasTextures>,
-) {
-    if !atlas.is_changed() {
-        return;
-    }
-
-    // Skip the whole-atlas preview rebuild unless the SDF Atlas panel was visible within the
-    // last few frames (it stamps `panel_seen_frame` when egui_dock draws it). This is the
-    // single biggest editor frame cost during a drag (~2.8ms) and is pure waste when the
-    // panel is closed. A few frames of slack avoids a stale preview on the frame the panel
-    // reopens. Also, in GPU bake mode the CPU `packed.dist`/`mat_dist` are zero placeholders
-    // (the GPU owns those texels), so the preview would render garbage regardless — see
-    // `SdfAtlas::insert_gpu_brick`.
-    let now = frames.0 as u64;
-    if now.saturating_sub(tex.panel_seen_frame) > 3 {
-        return;
-    }
-
-    let num_bricks = atlas.bricks.len() as u32;
-    if num_bricks == 0 {
-        return;
-    }
-
-    let edge = BRICK_EDGE as u32;
-    let tile_width = edge * edge; // 64
-    // 2D-tile (wrap into rows) so the egui preview image never exceeds the GPU's
-    // max texture dimension — mirrors the render atlas packing.
-    let tiles_per_row: u32 = 256;
-    let num_rows = num_bricks.div_ceil(tiles_per_row);
-    let width = tiles_per_row * tile_width;
-    let height = num_rows * edge;
-    let pixels = (width * height) as usize;
-
-    let mut dist_rgba = vec![0u8; pixels * 4];
-    let mut object_rgba = vec![0u8; pixels * 4];
-
-    // The GPU owns the per-voxel texels (the CPU `PackedBrick` no longer stores dist/mat —
-    // they were write-only zeros here), so this preview shows what the CPU DOES know: the
-    // resident-brick layout, each tile filled with its palette colour. Distance pane reuses the
-    // same colour at reduced brightness so the tile grid is still legible. (For per-voxel atlas
-    // inspection, read back the GPU dist/mat textures instead — not wired up.)
-    for (i, packed) in atlas.bricks.values().enumerate() {
-        let tile = i as u32;
-        let col_px = (tile % tiles_per_row) * tile_width;
-        let row_px = (tile / tiles_per_row) * edge;
-        let [r, gg, b] = object_color((packed.palette[0] & 0xff) as u8);
-        for z in 0..edge {
-            for y in 0..edge {
-                for x in 0..edge {
-                    let dst_u = col_px + y * edge + x;
-                    let dst_v = row_px + z;
-                    let dst = (dst_v * width + dst_u) as usize;
-                    object_rgba[dst * 4] = r;
-                    object_rgba[dst * 4 + 1] = gg;
-                    object_rgba[dst * 4 + 2] = b;
-                    object_rgba[dst * 4 + 3] = 255;
-                    dist_rgba[dst * 4] = r / 2;
-                    dist_rgba[dst * 4 + 1] = gg / 2;
-                    dist_rgba[dst * 4 + 2] = b / 2;
-                    dist_rgba[dst * 4 + 3] = 255;
-                }
-            }
-        }
-    }
-
-    let size = Extent3d {
-        width,
-        height,
-        depth_or_array_layers: 1,
-    };
-    // Nearest sampling so the upscaled atlas shows crisp per-texel detail in the
-    // panel instead of a blurry smear.
-    let sampler = bevy::image::ImageSampler::nearest();
-    let mut dist_img = Image::new(
-        size,
-        TextureDimension::D2,
-        dist_rgba,
-        TextureFormat::Rgba8UnormSrgb,
-        RenderAssetUsages::all(),
-    );
-    dist_img.sampler = sampler.clone();
-    let mut object_img = Image::new(
-        size,
-        TextureDimension::D2,
-        object_rgba,
-        TextureFormat::Rgba8UnormSrgb,
-        RenderAssetUsages::all(),
-    );
-    object_img.sampler = sampler;
-
-    tex.dist_handle = images.add(dist_img);
-    tex.object_handle = images.add(object_img);
-    tex.dist_id = Some(egui_textures.add_image(EguiTextureHandle::Strong(tex.dist_handle.clone())));
-    tex.object_id =
-        Some(egui_textures.add_image(EguiTextureHandle::Strong(tex.object_handle.clone())));
-    tex.width = width;
-    tex.height = height;
-}
-
 /// Distinct color per object id (golden-ratio hue spacing). id 0 = dark gray.
 fn object_color(id: u8) -> [u8; 3] {
     if id == 0 {
@@ -634,7 +473,22 @@ fn draw_baked_bricks(
 }
 
 /// Panel: resident-chunk count + the overlay toggle (mirrors `bvh_panel`).
-fn chunk_panel(world: &mut World, ui: &mut egui::Ui) {
+/// Combined acceleration-structure panel: BVH stats + visualizer toggles, then the
+/// resident-chunk stats + visualizer toggle. One bottom-dock tab for "what the bake's
+/// spatial structures look like".
+fn accel_panel(world: &mut World, ui: &mut egui::Ui) {
+    egui::ScrollArea::vertical()
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            ui.heading("BVH");
+            bvh_ui(world, ui);
+            ui.separator();
+            ui.heading("Chunks");
+            chunk_ui(world, ui);
+        });
+}
+
+fn chunk_ui(world: &mut World, ui: &mut egui::Ui) {
     let (count, by_lod) = {
         let atlas = world.resource::<SdfAtlas>();
         let config = world.resource::<SdfGridConfig>();
@@ -697,14 +551,10 @@ fn draw_bounds(
 
 // --- Panels ---
 
-fn atlas_panel(world: &mut World, ui: &mut egui::Ui) {
-    // Mark the panel visible this frame so `update_atlas_textures` rebuilds the preview (it
-    // skips the ~2.8ms rebuild when the panel is closed). egui_dock only calls this closure
-    // for a visible tab, so reaching here == the panel is on screen.
-    let frame = world.resource::<bevy::diagnostic::FrameCount>().0 as u64;
-    world.resource_mut::<SdfAtlasTextures>().panel_seen_frame = frame;
-
-    let stats = world.resource::<SdfAtlasStats>();
+/// Render the SDF atlas stats (brick/texel counts, dirty state, GPU-memory breakdown).
+/// Used by the Performance panel — the SDF Atlas got its own tab removed and its textured
+/// preview dropped; only these live stats remain.
+pub fn atlas_stats_ui(stats: &SdfAtlasStats, ui: &mut egui::Ui) {
     ui.label(format!("Bricks: {}", stats.total_bricks));
     ui.label(format!(
         "Texels: {}x{}",
@@ -734,47 +584,6 @@ fn atlas_panel(world: &mut World, ui: &mut egui::Ui) {
             ui.label("Lookup buffer");
             ui.label(fmt_bytes(stats.lookup_bytes));
             ui.end_row();
-        });
-
-    // Atlas images. Native layout is extreme aspect (num_bricks*64 wide x 8 tall),
-    // so display each row scaled up to a readable height inside a horizontal
-    // scroll area and let the user zoom the row height.
-    let (dist_id, object_id, tex_w, tex_h) = {
-        let tex = world.resource::<SdfAtlasTextures>();
-        (tex.dist_id, tex.object_id, tex.width, tex.height)
-    };
-    if dist_id.is_none() && object_id.is_none() {
-        return;
-    }
-
-    ui.separator();
-    let row_h = world.resource::<SdfAtlasTextures>().view_height;
-    let mut h = row_h;
-    if ui
-        .add(egui::Slider::new(&mut h, 24.0..=256.0).text("Atlas zoom (px tall)"))
-        .changed()
-    {
-        world.resource_mut::<SdfAtlasTextures>().view_height = h;
-    }
-
-    let aspect = if tex_h > 0 {
-        tex_w as f32 / tex_h as f32
-    } else {
-        1.0
-    };
-    let img_w = h * aspect;
-
-    egui::ScrollArea::horizontal()
-        .id_salt("sdf_atlas_imgs")
-        .show(ui, |ui| {
-            if let Some(id) = dist_id {
-                ui.label("Distance atlas");
-                ui.image(egui::load::SizedTexture::new(id, egui::vec2(img_w, h)));
-            }
-            if let Some(id) = object_id {
-                ui.label("Object-id atlas");
-                ui.image(egui::load::SizedTexture::new(id, egui::vec2(img_w, h)));
-            }
         });
 }
 
@@ -891,7 +700,7 @@ fn live_ray_capture(
 
 // --- BVH panel ---
 
-fn bvh_panel(world: &mut World, ui: &mut egui::Ui) {
+fn bvh_ui(world: &mut World, ui: &mut egui::Ui) {
     // Node/leaf/depth stats from the flat node array.
     const INTERNAL_FLAG: u32 = 0x8000_0000;
     let (node_count, leaf_count, max_depth, edits) = {
@@ -947,8 +756,18 @@ pub fn spawn_sdf_primitive(world: &mut World, prim: SdfPrimitive) -> Entity {
     let target = world.resource::<SdfOrbitCamera>().target;
     let pos = target + random_spawn_offset();
     let next_order = next_sdf_order(world);
-    let registry_id = fresh_sdf_material(world);
     let label = sdf_primitive_label(&prim);
+
+    // Fresh primitives get an inline (file-less) procedural material: a distinct scatter
+    // colour. `resolve_materials` derives the GPU `SdfMaterial` id from this source.
+    let color = spawn_color(next_order as usize).to_linear();
+    let source = crate::sdf_render::SdfMaterialSource {
+        asset: None,
+        overrides: crate::sdf_render::MaterialFields {
+            base_color: Some([color.red, color.green, color.blue, color.alpha]),
+            ..Default::default()
+        },
+    };
 
     world
         .spawn((
@@ -960,7 +779,7 @@ pub fn spawn_sdf_primitive(world: &mut World, prim: SdfPrimitive) -> Entity {
                 smoothing: 0.0,
             },
             SdfOrder(next_order),
-            SdfMaterial { registry_id },
+            source,
             SdfVolume,
             SceneEntity,
         ))
@@ -976,18 +795,6 @@ pub fn next_sdf_order(world: &mut World) -> u32 {
         .max()
         .map(|m| m + 1)
         .unwrap_or(0)
-}
-
-/// Push a fresh material slot with a distinct palette colour and return its registry id.
-pub fn fresh_sdf_material(world: &mut World) -> u32 {
-    let mut reg = world.resource_mut::<super::edits::MaterialRegistry>();
-    let id = reg.defs.len() as u32;
-    reg.defs.push(super::edits::MaterialDef {
-        base_color: spawn_color(id as usize),
-        blend_softness: 0.0,
-        ..Default::default()
-    });
-    id
 }
 
 /// Spawn a directional light node near the orbit target, with its editor gizmo so it
@@ -1034,6 +841,24 @@ pub fn spawn_point_light(world: &mut World) -> Entity {
             Transform::from_translation(pos),
             crate::node::Node3D,
             crate::node::EditorGizmo::PointLight { scale: 1.0 },
+            SceneEntity,
+        ))
+        .id()
+}
+
+/// Spawn a scene camera node near the orbit target, looking at it. Authored data
+/// (`SceneCamera`) + a frustum gizmo — NOT an active render camera (no `Camera3d`/
+/// `SdfCamera`), so it stays off the render path. The editor can "look through" it.
+pub fn spawn_camera(world: &mut World) -> Entity {
+    let target = world.resource::<SdfOrbitCamera>().target;
+    let pos = target + Vec3::new(2.0, 1.5, 2.0);
+    world
+        .spawn((
+            Name::new("Camera"),
+            Transform::from_translation(pos).looking_at(target, Vec3::Y),
+            crate::node::Node3D,
+            crate::node::SceneCamera::default(),
+            crate::node::EditorGizmo::Camera { scale: 1.0 },
             SceneEntity,
         ))
         .id()
@@ -1094,35 +919,61 @@ fn random_spawn_offset() -> Vec3 {
     Vec3::new(comp(1), comp(2), comp(3)) * 1.5
 }
 
-// --- Inspector: SdfMaterial editor ---
+// --- Inspector: SdfMaterialSource editor ---
 
-/// Custom Inspector editor for [`SdfMaterial`]: pick the registry material this edit
-/// references, and edit that material's shared appearance (base colour + seam blend
-/// softness). The generic reflection inspector would only show a bare `registry_id`
-/// u32, so this override gives it meaning. Registered via `register_component_editor`.
+/// Set `entity`'s material to the `.material.ron` at `working_path` (a working-dir path like
+/// `assets/materials/sand.material.ron`). Converts to the assets-relative form expected by
+/// [`SdfMaterialSource::asset`] and writes it if the entity accepts a material (has the
+/// component). No-op otherwise. Shared by the inspector drop, the viewport drop, and the
+/// picker — mutating the source fires `Changed` → `resolve_materials` re-derives the GPU id.
+/// Returns whether the material was set.
+pub fn set_entity_material(world: &mut World, entity: Entity, working_path: &std::path::Path) -> bool {
+    let rel = crate::editor::fs_util::relative_to_assets(working_path)
+        .unwrap_or_else(|| working_path.to_path_buf());
+    if let Some(mut source) = world.get_mut::<crate::sdf_render::SdfMaterialSource>(entity) {
+        source.asset = Some(rel);
+        true
+    } else {
+        false
+    }
+}
+
+/// Custom Inspector editor for [`SdfMaterialSource`]: pick the base material file this
+/// volume uses (or none → inline), and edit the appropriate appearance. The authored
+/// source drives the runtime `SdfMaterial` id via `resolve_materials`. Registered via
+/// `register_component_editor::<SdfMaterialSource>`.
 ///
-/// `SdfPrimitive`, `SdfOp`, and `SdfOrder` reflect cleanly, so the generic inspector
-/// already handles those — only the material needs a hand-built editor.
+/// - File material (`asset: Some`): the full asset editor (edits the on-disk `.material.ron`,
+///   shared by every volume using it).
+/// - Inline material (`asset: None`): edit the per-field overrides directly (base colour +
+///   scalar PBR), stored on the volume and serialized into the scene.
 pub fn sdf_material_editor(world: &mut World, entity: Entity, ui: &mut egui::Ui) {
-    let Some(mut material) = world.get::<SdfMaterial>(entity).copied() else {
+    use crate::editor::material_editor::material_picker_entries;
+    use crate::editor::resource_picker::{PickResult, PickerEntry, resource_picker};
+    use crate::sdf_render::SdfMaterialSource;
+
+    let Some(source) = world.get::<SdfMaterialSource>(entity).cloned() else {
         return;
     };
 
-    // Pick which material asset this edit uses, via the searchable resource picker
-    // (a grid of material spheres). The current selection is resolved back to its file.
-    use crate::editor::material_editor::{material_path_for_registry_id, material_picker_entries};
-    use crate::editor::resource_picker::{PickResult, PickerEntry, resource_picker};
-
-    let current_path = material_path_for_registry_id(world, material.registry_id);
-    let current_entry = current_path.as_ref().map(|p| PickerEntry {
-        key: p.to_string_lossy().into_owned(),
-        label: p
-            .file_name()
-            .and_then(|n| n.to_str())
-            .map(|n| n.trim_end_matches(".material.ron").to_string())
-            .unwrap_or_default(),
-        thumb: crate::editor::assets_browser::TileThumb::Path(p.clone()),
+    // Current base file (working-dir path) → picker entry, for the selection highlight.
+    let current_entry = source.asset.as_ref().map(|rel| {
+        let working = std::path::Path::new(crate::editor::assets_browser::ASSETS_ROOT).join(rel);
+        PickerEntry {
+            key: working.to_string_lossy().into_owned(),
+            label: rel
+                .file_name()
+                .and_then(|n| n.to_str())
+                .map(|n| n.trim_end_matches(".material.ron").to_string())
+                .unwrap_or_default(),
+            thumb: crate::editor::assets_browser::TileThumb::Path(working),
+        }
     });
+
+    // The ENTIRE material section is a drop target: drag a material tile from the assets tray
+    // anywhere over this section to set this volume's material. Remember where the section
+    // starts so we can interact over its full rect after the body is laid out.
+    let section_top = ui.min_rect().bottom();
 
     ui.label("Material");
     let picked = resource_picker(
@@ -1130,65 +981,107 @@ pub fn sdf_material_editor(world: &mut World, entity: Entity, ui: &mut egui::Ui)
         ui,
         ui.make_persistent_id(("sdf_mat_picker", entity)),
         current_entry.as_ref(),
-        false,
+        true, // allow clearing → inline material
         material_picker_entries,
     );
 
-    // On pick: load + register the chosen material file, set the edit's registry id.
-    // `get_mut` fires `Changed<SdfMaterial>` → `schedule_bakes` targeted rebake.
-    if let Some(PickResult::Key(path)) = picked {
-        let handle = world
-            .resource::<AssetServer>()
-            .load::<crate::assets::MaterialAsset>(
-                std::path::Path::new(&path)
-                    .strip_prefix(crate::editor::assets_browser::ASSETS_ROOT)
-                    .map(std::path::Path::to_path_buf)
-                    .unwrap_or_else(|_| std::path::PathBuf::from(&path)),
-            );
-        let new_id = world
-            .resource_mut::<crate::assets::MaterialAssetTable>()
-            .register(handle);
-        material.registry_id = new_id;
-        if let Some(mut m) = world.get_mut::<SdfMaterial>(entity) {
-            *m = material;
+    // On pick: set the source's base file (as an assets-relative path), or clear to inline.
+    // Mutating `SdfMaterialSource` fires `Changed` → `resolve_materials` re-derives the id.
+    match picked {
+        Some(PickResult::Key(path)) => {
+            let rel = std::path::Path::new(&path)
+                .strip_prefix(crate::editor::assets_browser::ASSETS_ROOT)
+                .map(std::path::Path::to_path_buf)
+                .unwrap_or_else(|_| std::path::PathBuf::from(&path));
+            if let Some(mut s) = world.get_mut::<SdfMaterialSource>(entity) {
+                s.asset = Some(rel);
+            }
         }
+        Some(PickResult::None) => {
+            if let Some(mut s) = world.get_mut::<SdfMaterialSource>(entity) {
+                s.asset = None;
+            }
+        }
+        None => {}
     }
 
-    // The selected material is either backed by an on-disk `MaterialAsset` or it's a
-    // registry-only material. Edit the appropriate one — never both (the asset editor
-    // and the registry sliders cover the same fields, so showing both is redundant).
-    let asset_handle = {
-        let table = world.resource::<crate::assets::MaterialAssetTable>();
-        table
-            .handles
-            .get(material.registry_id as usize)
-            .filter(|h| h.id() != Handle::<crate::assets::MaterialAsset>::default().id())
-            .cloned()
+    // Re-read after a possible pick.
+    let Some(source) = world.get::<SdfMaterialSource>(entity).cloned() else {
+        return;
     };
 
-    if let Some(handle) = asset_handle {
-        // Asset-backed: edit the source asset (the authored truth; recompiles into the
-        // registry). Full editor + interactive preview.
-        crate::editor::material_editor::material_editor_ui(world, &handle, ui);
-    } else {
-        // Registry-only material (no asset file): edit the GPU registry def directly.
-        // Shading-only → no rebake (the GPU material table re-uploads on registry change).
-        let mut reg = world.resource_mut::<super::edits::MaterialRegistry>();
-        if let Some(def) = reg.defs.get_mut(material.registry_id as usize) {
-            let lin = def.base_color.to_linear();
-            let mut rgb = [lin.red, lin.green, lin.blue];
-            if ui.color_edit_button_rgb(&mut rgb).changed() {
-                def.base_color = Color::linear_rgb(rgb[0], rgb[1], rgb[2]);
-            }
-            // Per-material colour-feather width at seams (world units). Does not affect
-            // geometry — see SdfOp::smoothing for that.
-            ui.add(egui::Slider::new(&mut def.blend_softness, 0.0..=1.0).text("Blend softness"));
-            // Scalar metallic/roughness — drive shading only when the material has no MRA
-            // texture (the textureless exemplars).
-            ui.add(egui::Slider::new(&mut def.metallic, 0.0..=1.0).text("Metallic"));
-            ui.add(egui::Slider::new(&mut def.roughness, 0.0..=1.0).text("Roughness"));
-            // Height relief displacement depth (world units). Only visible with a height map.
-            ui.add(egui::Slider::new(&mut def.parallax_scale, 0.0..=0.4).text("Relief depth"));
+    if let Some(rel) = source.asset {
+        // File-backed: edit the on-disk asset (the authored truth, shared by all users).
+        // Resolve it to a handle via the editor's path→handle helper.
+        if let Some(handle) = crate::editor::material_editor::handle_for_path(
+            world,
+            &std::path::Path::new(crate::editor::assets_browser::ASSETS_ROOT).join(&rel),
+        ) {
+            crate::editor::material_editor::material_editor_ui(world, &handle, ui);
+        } else {
+            ui.weak("Could not resolve material file.");
         }
+    } else {
+        // Inline material: edit the per-field overrides (stored on the volume, serialized).
+        sdf_inline_material_ui(world, entity, ui);
     }
+
+    // Section-wide material drop target: the rect from `section_top` down to the current
+    // layout bottom, spanning the editor's width. Drop a material tile anywhere in here to
+    // set this volume's material; highlight while a material drag hovers.
+    use crate::editor::assets_browser::MaterialDrag;
+    let section = egui::Rect::from_min_max(
+        egui::pos2(ui.min_rect().left(), section_top),
+        egui::pos2(ui.min_rect().right(), ui.min_rect().bottom()),
+    );
+    let drop = ui.interact(
+        section,
+        ui.make_persistent_id(("sdf_mat_drop", entity)),
+        egui::Sense::hover(),
+    );
+    if egui::DragAndDrop::payload::<MaterialDrag>(ui.ctx()).is_some() && drop.contains_pointer() {
+        ui.painter().rect_stroke(
+            section.expand(2.0),
+            3.0,
+            ui.visuals().selection.stroke,
+            egui::StrokeKind::Outside,
+        );
+    }
+    if let Some(drag) = drop.dnd_release_payload::<MaterialDrag>() {
+        set_entity_material(world, entity, &drag.0);
+    }
+}
+
+/// Edit an inline `SdfMaterialSource`'s overrides (base colour + scalar PBR). Each change
+/// fires `Changed<SdfMaterialSource>` → `resolve_materials` rebuilds the registry row.
+#[cfg(feature = "editor")]
+fn sdf_inline_material_ui(world: &mut World, entity: Entity, ui: &mut egui::Ui) {
+    use crate::sdf_render::SdfMaterialSource;
+
+    let Some(mut source) = world.get_mut::<SdfMaterialSource>(entity) else {
+        return;
+    };
+    let o = &mut source.overrides;
+
+    // Base colour (defaults to mid-grey when unset).
+    let mut rgb = o.base_color.map(|c| [c[0], c[1], c[2]]).unwrap_or([0.8, 0.8, 0.8]);
+    ui.horizontal(|ui| {
+        ui.label("Base color");
+        if ui.color_edit_button_rgb(&mut rgb).changed() {
+            let a = o.base_color.map(|c| c[3]).unwrap_or(1.0);
+            o.base_color = Some([rgb[0], rgb[1], rgb[2], a]);
+        }
+    });
+
+    // Scalar overrides: edit a working value, write back as `Some(..)` on change.
+    let scalar = |ui: &mut egui::Ui, label: &str, cur: &mut Option<f32>, default: f32, max: f32| {
+        let mut v = cur.unwrap_or(default);
+        if ui.add(egui::Slider::new(&mut v, 0.0..=max).text(label)).changed() {
+            *cur = Some(v);
+        }
+    };
+    scalar(ui, "Blend softness", &mut o.blend_softness, 0.0, 1.0);
+    scalar(ui, "Metallic", &mut o.metallic, 0.0, 1.0);
+    scalar(ui, "Roughness", &mut o.roughness, 1.0, 1.0);
+    scalar(ui, "Relief depth", &mut o.parallax_scale, 0.0, 0.4);
 }

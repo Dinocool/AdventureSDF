@@ -27,7 +27,8 @@ pub struct CurrentScenePath(pub PathBuf);
 
 impl Default for CurrentScenePath {
     fn default() -> Self {
-        Self(PathBuf::from("assets/scenes/untitled.scene"))
+        // The editor loads the gallery as its default scene, so File→Save targets it.
+        Self(PathBuf::from(crate::sdf_render::DEFAULT_SCENE_PATH))
     }
 }
 

@@ -179,11 +179,51 @@ impl Default for MaterialRegistry {
 }
 
 /// Per-edit material reference: an index into [`MaterialRegistry::defs`]. Appearance
-/// lives in the registry (keeps the GPU table static), not on the edit.
+/// lives in the registry (keeps the GPU table static), not on the edit. This id is
+/// **runtime-derived** by `resolve_materials` from each volume's [`SdfMaterialSource`];
+/// it is NOT serialized into a `.scene` (the source is the authored truth).
 #[derive(Component, Reflect, Clone, Copy, Debug, Default)]
 #[reflect(Component)]
+#[reflect(@crate::node::HideFromInspector)]
 pub struct SdfMaterial {
     pub registry_id: u32,
+}
+
+/// Optional per-field overrides applied on top of a base material. `None` = inherit the
+/// base value. `base_color` is linear RGBA stored as `[f32; 4]` (matching `MaterialAsset`,
+/// so RON stays stable and serde-friendly). The scalar fields mirror the editable
+/// `MaterialAsset` knobs. Texture maps are intentionally NOT overridable here yet — the
+/// texture always comes from the base file (scene-level texture override deferred).
+#[derive(Reflect, Clone, Debug, Default, PartialEq)]
+pub struct MaterialFields {
+    pub base_color: Option<[f32; 4]>,
+    pub metallic: Option<f32>,
+    pub roughness: Option<f32>,
+    pub blend_softness: Option<f32>,
+    pub parallax_scale: Option<f32>,
+}
+
+impl MaterialFields {
+    /// Whether any field is set (an actual override exists).
+    pub fn is_empty(&self) -> bool {
+        *self == MaterialFields::default()
+    }
+}
+
+/// The **authored** material of an SDF volume: a base material file and/or per-field
+/// overrides. This is the serialized source of truth (`SdfMaterial.registry_id` is derived
+/// from it by `resolve_materials`):
+/// - `asset: Some(path)`, no overrides → a plain file material.
+/// - `asset: Some(path)` + overrides → a scene-level override of that file's fields.
+/// - `asset: None` → a fully inline/procedural material defined entirely by `overrides`
+///   (e.g. a freshly-spawned primitive's scatter colour).
+#[derive(Component, Reflect, Clone, Debug, Default, PartialEq)]
+#[reflect(Component)]
+pub struct SdfMaterialSource {
+    /// Base material file, relative to `assets/` (e.g. `materials/sand.material.ron`).
+    pub asset: Option<std::path::PathBuf>,
+    /// Per-field overrides applied on top of the base (or the whole material when inline).
+    pub overrides: MaterialFields,
 }
 
 // --- Smooth min/max (iq polynomial) ---
@@ -317,70 +357,103 @@ pub fn heightmap_surface_y(
     height_sample(Vec2::new(x, z), freq, amp, seed) + max_height * 0.5 + world_y
 }
 
-/// One spawned demo edit: evaluation order, world transform, primitive, and material registry id.
-/// The runtime scene spawns these as entities; the bake regression test folds the same list into a
-/// scheduler — so both exercise byte-identical geometry.
-pub type DemoEdit = (SdfOrder, Transform, SdfPrimitive, u32);
+/// The role a tower-field edit plays — decouples geometry from material. Callers map each role to
+/// a concrete material (the runtime spawner → a `.material.ron` path; the bake test → a `u32` id).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TowerRole {
+    /// The wide procedural heightmap ground.
+    Ground,
+    /// A stacked, rotated cube in a tower.
+    Cube,
+    /// The sphere capping a tower.
+    Cap,
+}
 
-/// Build the demo gallery deterministically: a wide procedural heightmap ground plus a ring of
-/// cube-towers resting on its surface, each tower a stack of unit cubes at pseudo-random yaw/pitch
-/// and topped by a red sphere. Pure and seed-driven (no RNG state) so the runtime scene and the
-/// bake-cache regression test produce the exact same edits. `ground_mat`/`cube_mat`/`sphere_mat`
-/// are the caller's registered material ids (runtime: the loaded assets; test: arbitrary ids).
-///
-/// Heavy on edit count (towers × cubes) by design: it stresses the BVH cull + the per-edit AABB
-/// refine that keeps a moved tower from re-baking its neighbours' bricks.
-pub fn gallery_demo_edits(ground_mat: u32, cube_mat: u32, sphere_mat: u32) -> Vec<DemoEdit> {
+/// One tower-field edit: evaluation order, world transform, primitive, and its material role.
+pub type TowerEdit = (SdfOrder, Transform, SdfPrimitive, TowerRole);
+
+/// Parameters for the scattered cube-tower field — the SDF stress scene. Procedurally places a
+/// heightmap ground and a scatter of rotated-cube towers (each capped by a sphere) resting on it.
+/// Pure + seed-driven so the runtime `TowerSpawner` and the bake regression test produce identical
+/// geometry. Heavy edit count by design: stresses the BVH cull + per-edit AABB refine.
+#[derive(Clone, Copy, Debug)]
+pub struct TowerFieldParams {
+    /// Heightmap world Y offset (ground dropped below origin so towers sit above terrain).
+    pub ground_y: f32,
+    pub max_height: f32,
+    pub freq: f32,
+    pub amp: f32,
+    pub seed: u32,
+    /// Half-extent of the scatter region (world units) and rough spacing between towers.
+    pub half_extent: f32,
+    pub spacing: f32,
+    pub jitter: f32,
+    pub cubes_per_tower: u32,
+    pub cube_half: f32,
+}
+
+impl Default for TowerFieldParams {
+    fn default() -> Self {
+        Self {
+            ground_y: -30.0,
+            max_height: 20.0,
+            freq: 0.02,
+            amp: 5.0,
+            seed: 1337,
+            // ~10 m spacing over ±270 m → ~55×55 lattice ≈ 3000 towers.
+            half_extent: 270.0,
+            spacing: 10.0,
+            jitter: 0.4,
+            cubes_per_tower: 4,
+            cube_half: 0.4,
+        }
+    }
+}
+
+/// Build the scattered cube-tower field deterministically from `params`. Returns role-tagged edits
+/// (material-agnostic — see [`TowerRole`]); the first edit is always the [`TowerRole::Ground`]
+/// heightmap. Pure and allocation-bounded by the scatter lattice.
+pub fn tower_field_edits(params: &TowerFieldParams) -> Vec<TowerEdit> {
     use super::scatter::{scatter_on_surface, ScatterParams};
 
-    const GROUND_Y: f32 = -30.0;
-    const MAX_HEIGHT: f32 = 20.0;
-    const FREQ: f32 = 0.02;
-    const AMP: f32 = 5.0;
-    const SEED: u32 = 1337;
-    const CUBES_PER_TOWER: u32 = 4;
-    const CUBE_HALF: f32 = 0.4;
-    // ~10 m spacing over a ±270 m region → a ~55×55 lattice ≈ 3000 towers.
-    const SCATTER: ScatterParams = ScatterParams {
-        half_extent: 270.0,
-        spacing: 10.0,
-        jitter: 0.4,
+    let scatter = ScatterParams {
+        half_extent: params.half_extent,
+        spacing: params.spacing,
+        jitter: params.jitter,
         keep_prob: 1.0,
-        seed: SEED,
+        seed: params.seed,
     };
 
-    let mut out: Vec<DemoEdit> = Vec::new();
+    let mut out: Vec<TowerEdit> = Vec::new();
     let mut order = 0u32;
-    let mut push = |o: &mut u32, t: Transform, p: SdfPrimitive, m: u32| {
-        out.push((SdfOrder(*o), t, p, m));
+    let mut push = |o: &mut u32, t: Transform, p: SdfPrimitive, role: TowerRole| {
+        out.push((SdfOrder(*o), t, p, role));
         *o += 1;
     };
 
-    // Ground: large procedural heightmap, dropped below the origin so the towers sit above it.
+    // Ground: large procedural heightmap, dropped below the origin so towers sit above it.
     push(
         &mut order,
-        Transform::from_xyz(0.0, GROUND_Y, 0.0),
+        Transform::from_xyz(0.0, params.ground_y, 0.0),
         SdfPrimitive::Heightmap {
             half_xz: Vec2::new(1000.0, 1000.0),
-            max_height: MAX_HEIGHT,
-            freq: FREQ,
-            amp: AMP,
-            seed: SEED,
+            max_height: params.max_height,
+            freq: params.freq,
+            amp: params.amp,
+            seed: params.seed,
         },
-        ground_mat,
+        TowerRole::Ground,
     );
 
-    // Thousands of cube-towers scattered across the terrain via the reusable scatter module. Each
-    // scatter point lands a tower of rotated cubes (per-edit rotation derived from the point hash),
-    // capped by a red sphere. Heavy edit count stresses the BVH cull + per-edit AABB refine.
-    let towers = scatter_on_surface(&SCATTER, |x, z| {
-        heightmap_surface_y(x, z, MAX_HEIGHT, FREQ, AMP, SEED, GROUND_Y)
+    let cube_half = params.cube_half;
+    let towers = scatter_on_surface(&scatter, |x, z| {
+        heightmap_surface_y(x, z, params.max_height, params.freq, params.amp, params.seed, params.ground_y)
     });
     for (base, h) in towers {
         let (tx, base_y, tz) = (base.x, base.y, base.z);
-        for c in 0..CUBES_PER_TOWER {
+        for c in 0..params.cubes_per_tower {
             // Stack the cubes; first cube rests its base on the terrain (centre at +half).
-            let cy = base_y + CUBE_HALF + (c as f32) * (2.0 * CUBE_HALF);
+            let cy = base_y + cube_half + (c as f32) * (2.0 * cube_half);
             // Deterministic pseudo-random yaw/pitch from the point hash + cube index.
             let r1 = unit_from_hash(h ^ (c.wrapping_mul(0x9E37)).wrapping_add(1)) * std::f32::consts::PI;
             let r2 = unit_from_hash(h.rotate_left(7) ^ (c.wrapping_mul(0x85EB)).wrapping_add(3)) * std::f32::consts::PI;
@@ -392,18 +465,18 @@ pub fn gallery_demo_edits(ground_mat: u32, cube_mat: u32, sphere_mat: u32) -> Ve
                     rotation: rot,
                     scale: Vec3::ONE,
                 },
-                SdfPrimitive::Box { half_extents: Vec3::splat(CUBE_HALF) },
-                cube_mat,
+                SdfPrimitive::Box { half_extents: Vec3::splat(cube_half) },
+                TowerRole::Cube,
             );
         }
 
-        // Red sphere capping the tower.
-        let top_y = base_y + (CUBES_PER_TOWER as f32) * (2.0 * CUBE_HALF) + 0.45;
+        // Sphere capping the tower.
+        let top_y = base_y + (params.cubes_per_tower as f32) * (2.0 * cube_half) + 0.45;
         push(
             &mut order,
             Transform::from_xyz(tx, top_y, tz),
             SdfPrimitive::Sphere { radius: 0.45 },
-            sphere_mat,
+            TowerRole::Cap,
         );
     }
 

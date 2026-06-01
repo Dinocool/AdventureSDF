@@ -13,7 +13,7 @@ mod roles;
 
 pub use discovery::{discover_variants, material_picker_entries};
 pub use io::{
-    handle_for_path, material_path_for_registry_id, pbrtex_handle_for_path, save_material,
+    handle_for_path, pbrtex_handle_for_path, save_material,
     save_pbr_texture,
 };
 pub use roles::pbr_texture_roles_ui;

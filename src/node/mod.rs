@@ -47,6 +47,9 @@ pub enum EditorGizmo {
     /// radius itself lives on the entity's Bevy `PointLight` (`range`); this variant
     /// carries only the bulb's base size.
     PointLight { scale: f32 },
+    /// A wireframe frustum glyph pointing along the node's forward (-Z), for a scene
+    /// [`SceneCamera`] node. Sized in world units by `scale`.
+    Camera { scale: f32 },
     /// Three short colored axis lines (X red / Y green / Z blue) at the origin — a
     /// generic "empty"/locator marker for otherwise-invisible nodes.
     Axes { scale: f32 },
@@ -58,6 +61,30 @@ impl Default for EditorGizmo {
     }
 }
 
+/// A scene camera node: authored projection data (not an active render camera). Serialized
+/// into a `.scene` and shown in the hierarchy with an [`EditorGizmo::Camera`] frustum. The
+/// editor's viewport camera can "look through" it (snap the orbit pose to this node). A
+/// future runtime could promote this to a real `Camera3d`.
+#[derive(Component, Reflect, Clone, Copy, Debug, PartialEq)]
+#[reflect(Component)]
+#[require(Node3D)]
+pub struct SceneCamera {
+    /// Vertical field of view, radians.
+    pub fov_y_radians: f32,
+    pub near: f32,
+    pub far: f32,
+}
+
+impl Default for SceneCamera {
+    fn default() -> Self {
+        Self {
+            fov_y_radians: std::f32::consts::FRAC_PI_4, // 45°
+            near: 0.1,
+            far: 1000.0,
+        }
+    }
+}
+
 pub struct NodePlugin;
 
 impl Plugin for NodePlugin {
@@ -65,6 +92,7 @@ impl Plugin for NodePlugin {
         app.register_type::<SceneNode>()
             .register_type::<Node3D>()
             .register_type::<EditorGizmo>()
+            .register_type::<SceneCamera>()
             .register_type::<HideFromInspector>()
             // So the inspector can show a node's parent link; `Children` is managed
             // by Bevy and reflected by the engine.

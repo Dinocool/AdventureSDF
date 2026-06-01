@@ -66,8 +66,11 @@ impl Default for MaterialPreviewState {
         Self {
             material: None,
             shape: PreviewShape::Sphere,
-            yaw: 0.6,
-            pitch: 0.4,
+            // Straight-on, matching the assets-tray thumbnail's capture camera at
+            // (0, 0, distance): pos = d·(cos yaw·cos pitch, sin pitch, sin yaw·cos pitch),
+            // so yaw = π/2, pitch = 0 puts the camera on +Z looking at the origin.
+            yaw: std::f32::consts::FRAC_PI_2,
+            pitch: 0.0,
             distance: 3.2,
             tex_id: None,
         }
@@ -181,14 +184,17 @@ fn setup_preview_rig(
 fn drive_preview(
     rig: Option<Res<PreviewRig>>,
     state: Res<MaterialPreviewState>,
-    mut meshes: Query<(&mut Mesh3d, &mut MeshMaterial3d<StandardMaterial>), With<PreviewMesh>>,
-    mut cameras: Query<&mut Transform, With<PreviewCamera>>,
+    mut meshes: Query<
+        (&mut Mesh3d, &mut MeshMaterial3d<StandardMaterial>, &mut Transform),
+        With<PreviewMesh>,
+    >,
+    mut cameras: Query<&mut Transform, (With<PreviewCamera>, Without<PreviewMesh>)>,
 ) {
     let Some(rig) = rig else {
         return;
     };
 
-    if let Ok((mut mesh, mut mat)) = meshes.get_mut(rig.mesh_entity) {
+    if let Ok((mut mesh, mut mat, mut xf)) = meshes.get_mut(rig.mesh_entity) {
         let want = match state.shape {
             PreviewShape::Sphere => &rig.sphere,
             PreviewShape::Cube => &rig.cube,
@@ -196,6 +202,16 @@ fn drive_preview(
         };
         if mesh.0.id() != want.id() {
             mesh.0 = want.clone();
+        }
+        // Bevy's UV sphere poles sit on Z (facing the camera by default). Stand the pole UP
+        // (+Z→+Y) with a -90° X rotation, tilted back slightly — matches the tray thumbnail.
+        // The cube and torus stay upright.
+        let want_rot = match state.shape {
+            PreviewShape::Sphere => Quat::from_rotation_x(-std::f32::consts::FRAC_PI_2 + 0.35),
+            _ => Quat::IDENTITY,
+        };
+        if xf.rotation != want_rot {
+            xf.rotation = want_rot;
         }
         if let Some(material) = &state.material
             && mat.0.id() != material.id()
