@@ -712,9 +712,16 @@ fn orbit_camera(
     mut input: CameraInput,
     mut camera_query: Query<&mut Transform, (With<SdfCamera>, Without<SdfVolume>)>,
 ) {
-    // Wheel zoom (dolly toward/away from the target).
+    // Wheel zoom (dolly toward/away from the target). Hold Shift for 10x coarse zoom.
+    let zoom_step = if input.keyboard.pressed(KeyCode::ShiftLeft)
+        || input.keyboard.pressed(KeyCode::ShiftRight)
+    {
+        5.0
+    } else {
+        0.5
+    };
     for ev in input.scroll.read() {
-        orbit.distance = (orbit.distance - ev.y * 0.5).clamp(0.5, 50.0);
+        orbit.distance = (orbit.distance - ev.y * zoom_step).clamp(0.5, 50.0);
     }
 
     let orbiting = input.mouse.pressed(MouseButton::Middle);
@@ -1030,6 +1037,7 @@ fn focus_on_double_click(
     mode: Res<SdfCameraMode>,
     selection: Res<SdfSelection>,
     mut focus: ResMut<OrbitFocus>,
+    mut gizmo_state: ResMut<gizmo::GizmoState>,
     volumes: Query<&Transform, With<SdfVolume>>,
 ) {
     if !mouse.just_pressed(MouseButton::Left) {
@@ -1038,8 +1046,18 @@ fn focus_on_double_click(
     let now = time.elapsed_secs();
     let double_click = now - focus.last_click < 0.3;
     focus.last_click = now;
-    if double_click
-        && !mode.fps
+    if !double_click {
+        return;
+    }
+
+    // The first click of a double-click selects the object, which makes the transform
+    // gizmo appear centered on it — so the SECOND click lands on the view-plane translate
+    // handle and `gizmo_update` (earlier in this chain) just started a drag. Cancel it so
+    // a double-click focuses without dragging the object.
+    gizmo_state.drag = None;
+    gizmo_state.claimed_click = false;
+
+    if !mode.fps
         && let Some(entity) = selection.entity
         && let Ok(transform) = volumes.get(entity)
     {
