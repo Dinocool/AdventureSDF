@@ -112,6 +112,12 @@ fn drain_editor_scene_requests(world: &mut World) {
     }
 
     if let Some(path) = open_path {
+        // Open REPLACES the current scene: despawn the existing scene content first, else
+        // the loaded entities stack on top of whatever's already there (the default gallery
+        // plus any user edits). The viewport camera is also tagged `SceneEntity`, so spare
+        // it via `Without<SdfCamera>` — it persists across scene loads.
+        despawn_scene_content(world);
+
         let registry = registry.read();
         match load_scene(world, &path, &registry) {
             Ok(roots) => info!(
@@ -120,6 +126,24 @@ fn drain_editor_scene_requests(world: &mut World) {
                 path.display()
             ),
             Err(e) => error!("scene load failed: {e}"),
+        }
+    }
+}
+
+/// Despawn all loaded scene content (`SceneEntity`), sparing editor infrastructure
+/// (`EditorEntity` — the persistent viewport camera). Used before an Open so the new scene
+/// replaces the current one.
+#[cfg(feature = "editor")]
+fn despawn_scene_content(world: &mut World) {
+    use crate::scene_manager::{EditorEntity, SceneEntity};
+
+    let to_despawn: Vec<Entity> = world
+        .query_filtered::<Entity, (With<SceneEntity>, Without<EditorEntity>)>()
+        .iter(world)
+        .collect();
+    for entity in to_despawn {
+        if let Ok(e) = world.get_entity_mut(entity) {
+            e.despawn();
         }
     }
 }

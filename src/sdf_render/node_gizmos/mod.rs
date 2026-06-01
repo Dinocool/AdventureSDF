@@ -14,6 +14,7 @@ use crate::node::EditorGizmo;
 use crate::sdf_render::{SdfCamera, SdfNodeGizmos, SdfOverlayGizmos};
 
 pub mod axes;
+pub mod camera;
 pub mod directional_light;
 pub mod draw;
 pub mod point_light;
@@ -51,6 +52,7 @@ pub fn pick_bounds(gizmo: &EditorGizmo) -> (Vec3, Vec3) {
     match *gizmo {
         EditorGizmo::DirectionalLight { scale } => directional_light::pick_bounds(scale),
         EditorGizmo::PointLight { scale } => point_light::pick_bounds(scale),
+        EditorGizmo::Camera { scale } => camera::pick_bounds(scale),
         EditorGizmo::Axes { scale } => axes::pick_bounds(scale),
     }
 }
@@ -60,6 +62,7 @@ fn draw_one(gizmo: &EditorGizmo, ctx: &NodeGizmoCtx, painter: &mut NodeGizmoPain
     match gizmo {
         EditorGizmo::DirectionalLight { .. } => directional_light::draw(ctx, painter),
         EditorGizmo::PointLight { .. } => point_light::draw(ctx, painter),
+        EditorGizmo::Camera { .. } => camera::draw(ctx, painter),
         EditorGizmo::Axes { .. } => axes::draw(ctx, painter),
     }
 }
@@ -84,6 +87,7 @@ fn draw_node_gizmos(
         let scale = match *gizmo {
             EditorGizmo::DirectionalLight { scale }
             | EditorGizmo::PointLight { scale }
+            | EditorGizmo::Camera { scale }
             | EditorGizmo::Axes { scale } => scale,
         };
         let ctx = NodeGizmoCtx {

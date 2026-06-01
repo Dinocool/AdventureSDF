@@ -112,9 +112,10 @@ impl Plugin for SdfDebugPlugin {
     fn build(&self, app: &mut App) {
         register_shader_modes(app);
 
-        // Custom Inspector editor for SdfMaterial (registry picker + colour). The other
-        // SDF components reflect cleanly, so the generic inspector handles those.
-        crate::editor::inspector::register_component_editor::<SdfMaterial>(
+        // Custom Inspector editor for SdfMaterialSource (base-file picker + inline overrides).
+        // The other SDF components reflect cleanly, so the generic inspector handles those.
+        // SdfMaterial is the derived runtime id — hidden from the inspector below.
+        crate::editor::inspector::register_component_editor::<crate::sdf_render::SdfMaterialSource>(
             app,
             sdf_material_editor,
         );
@@ -911,8 +912,18 @@ pub fn spawn_sdf_primitive(world: &mut World, prim: SdfPrimitive) -> Entity {
     let target = world.resource::<SdfOrbitCamera>().target;
     let pos = target + random_spawn_offset();
     let next_order = next_sdf_order(world);
-    let registry_id = fresh_sdf_material(world);
     let label = sdf_primitive_label(&prim);
+
+    // Fresh primitives get an inline (file-less) procedural material: a distinct scatter
+    // colour. `resolve_materials` derives the GPU `SdfMaterial` id from this source.
+    let color = spawn_color(next_order as usize).to_linear();
+    let source = crate::sdf_render::SdfMaterialSource {
+        asset: None,
+        overrides: crate::sdf_render::MaterialFields {
+            base_color: Some([color.red, color.green, color.blue, color.alpha]),
+            ..Default::default()
+        },
+    };
 
     world
         .spawn((
@@ -924,7 +935,7 @@ pub fn spawn_sdf_primitive(world: &mut World, prim: SdfPrimitive) -> Entity {
                 smoothing: 0.0,
             },
             SdfOrder(next_order),
-            SdfMaterial { registry_id },
+            source,
             SdfVolume,
             SceneEntity,
         ))
@@ -940,18 +951,6 @@ pub fn next_sdf_order(world: &mut World) -> u32 {
         .max()
         .map(|m| m + 1)
         .unwrap_or(0)
-}
-
-/// Push a fresh material slot with a distinct palette colour and return its registry id.
-pub fn fresh_sdf_material(world: &mut World) -> u32 {
-    let mut reg = world.resource_mut::<super::edits::MaterialRegistry>();
-    let id = reg.defs.len() as u32;
-    reg.defs.push(super::edits::MaterialDef {
-        base_color: spawn_color(id as usize),
-        blend_softness: 0.0,
-        ..Default::default()
-    });
-    id
 }
 
 /// Spawn a directional light node near the orbit target, with its editor gizmo so it
@@ -998,6 +997,24 @@ pub fn spawn_point_light(world: &mut World) -> Entity {
             Transform::from_translation(pos),
             crate::node::Node3D,
             crate::node::EditorGizmo::PointLight { scale: 1.0 },
+            SceneEntity,
+        ))
+        .id()
+}
+
+/// Spawn a scene camera node near the orbit target, looking at it. Authored data
+/// (`SceneCamera`) + a frustum gizmo — NOT an active render camera (no `Camera3d`/
+/// `SdfCamera`), so it stays off the render path. The editor can "look through" it.
+pub fn spawn_camera(world: &mut World) -> Entity {
+    let target = world.resource::<SdfOrbitCamera>().target;
+    let pos = target + Vec3::new(2.0, 1.5, 2.0);
+    world
+        .spawn((
+            Name::new("Camera"),
+            Transform::from_translation(pos).looking_at(target, Vec3::Y),
+            crate::node::Node3D,
+            crate::node::SceneCamera::default(),
+            crate::node::EditorGizmo::Camera { scale: 1.0 },
             SceneEntity,
         ))
         .id()
@@ -1058,34 +1075,38 @@ fn random_spawn_offset() -> Vec3 {
     Vec3::new(comp(1), comp(2), comp(3)) * 1.5
 }
 
-// --- Inspector: SdfMaterial editor ---
+// --- Inspector: SdfMaterialSource editor ---
 
-/// Custom Inspector editor for [`SdfMaterial`]: pick the registry material this edit
-/// references, and edit that material's shared appearance (base colour + seam blend
-/// softness). The generic reflection inspector would only show a bare `registry_id`
-/// u32, so this override gives it meaning. Registered via `register_component_editor`.
+/// Custom Inspector editor for [`SdfMaterialSource`]: pick the base material file this
+/// volume uses (or none → inline), and edit the appropriate appearance. The authored
+/// source drives the runtime `SdfMaterial` id via `resolve_materials`. Registered via
+/// `register_component_editor::<SdfMaterialSource>`.
 ///
-/// `SdfPrimitive`, `SdfOp`, and `SdfOrder` reflect cleanly, so the generic inspector
-/// already handles those — only the material needs a hand-built editor.
+/// - File material (`asset: Some`): the full asset editor (edits the on-disk `.material.ron`,
+///   shared by every volume using it).
+/// - Inline material (`asset: None`): edit the per-field overrides directly (base colour +
+///   scalar PBR), stored on the volume and serialized into the scene.
 pub fn sdf_material_editor(world: &mut World, entity: Entity, ui: &mut egui::Ui) {
-    let Some(mut material) = world.get::<SdfMaterial>(entity).copied() else {
+    use crate::editor::material_editor::material_picker_entries;
+    use crate::editor::resource_picker::{PickResult, PickerEntry, resource_picker};
+    use crate::sdf_render::SdfMaterialSource;
+
+    let Some(source) = world.get::<SdfMaterialSource>(entity).cloned() else {
         return;
     };
 
-    // Pick which material asset this edit uses, via the searchable resource picker
-    // (a grid of material spheres). The current selection is resolved back to its file.
-    use crate::editor::material_editor::{material_path_for_registry_id, material_picker_entries};
-    use crate::editor::resource_picker::{PickResult, PickerEntry, resource_picker};
-
-    let current_path = material_path_for_registry_id(world, material.registry_id);
-    let current_entry = current_path.as_ref().map(|p| PickerEntry {
-        key: p.to_string_lossy().into_owned(),
-        label: p
-            .file_name()
-            .and_then(|n| n.to_str())
-            .map(|n| n.trim_end_matches(".material.ron").to_string())
-            .unwrap_or_default(),
-        thumb: crate::editor::assets_browser::TileThumb::Path(p.clone()),
+    // Current base file (working-dir path) → picker entry, for the selection highlight.
+    let current_entry = source.asset.as_ref().map(|rel| {
+        let working = std::path::Path::new(crate::editor::assets_browser::ASSETS_ROOT).join(rel);
+        PickerEntry {
+            key: working.to_string_lossy().into_owned(),
+            label: rel
+                .file_name()
+                .and_then(|n| n.to_str())
+                .map(|n| n.trim_end_matches(".material.ron").to_string())
+                .unwrap_or_default(),
+            thumb: crate::editor::assets_browser::TileThumb::Path(working),
+        }
     });
 
     ui.label("Material");
@@ -1094,65 +1115,82 @@ pub fn sdf_material_editor(world: &mut World, entity: Entity, ui: &mut egui::Ui)
         ui,
         ui.make_persistent_id(("sdf_mat_picker", entity)),
         current_entry.as_ref(),
-        false,
+        true, // allow clearing → inline material
         material_picker_entries,
     );
 
-    // On pick: load + register the chosen material file, set the edit's registry id.
-    // `get_mut` fires `Changed<SdfMaterial>` → `schedule_bakes` targeted rebake.
-    if let Some(PickResult::Key(path)) = picked {
-        let handle = world
-            .resource::<AssetServer>()
-            .load::<crate::assets::MaterialAsset>(
-                std::path::Path::new(&path)
-                    .strip_prefix(crate::editor::assets_browser::ASSETS_ROOT)
-                    .map(std::path::Path::to_path_buf)
-                    .unwrap_or_else(|_| std::path::PathBuf::from(&path)),
-            );
-        let new_id = world
-            .resource_mut::<crate::assets::MaterialAssetTable>()
-            .register(handle);
-        material.registry_id = new_id;
-        if let Some(mut m) = world.get_mut::<SdfMaterial>(entity) {
-            *m = material;
+    // On pick: set the source's base file (as an assets-relative path), or clear to inline.
+    // Mutating `SdfMaterialSource` fires `Changed` → `resolve_materials` re-derives the id.
+    match picked {
+        Some(PickResult::Key(path)) => {
+            let rel = std::path::Path::new(&path)
+                .strip_prefix(crate::editor::assets_browser::ASSETS_ROOT)
+                .map(std::path::Path::to_path_buf)
+                .unwrap_or_else(|_| std::path::PathBuf::from(&path));
+            if let Some(mut s) = world.get_mut::<SdfMaterialSource>(entity) {
+                s.asset = Some(rel);
+            }
         }
+        Some(PickResult::None) => {
+            if let Some(mut s) = world.get_mut::<SdfMaterialSource>(entity) {
+                s.asset = None;
+            }
+        }
+        None => {}
     }
 
-    // The selected material is either backed by an on-disk `MaterialAsset` or it's a
-    // registry-only material. Edit the appropriate one — never both (the asset editor
-    // and the registry sliders cover the same fields, so showing both is redundant).
-    let asset_handle = {
-        let table = world.resource::<crate::assets::MaterialAssetTable>();
-        table
-            .handles
-            .get(material.registry_id as usize)
-            .filter(|h| h.id() != Handle::<crate::assets::MaterialAsset>::default().id())
-            .cloned()
+    // Re-read after a possible pick.
+    let Some(source) = world.get::<SdfMaterialSource>(entity).cloned() else {
+        return;
     };
 
-    if let Some(handle) = asset_handle {
-        // Asset-backed: edit the source asset (the authored truth; recompiles into the
-        // registry). Full editor + interactive preview.
-        crate::editor::material_editor::material_editor_ui(world, &handle, ui);
-    } else {
-        // Registry-only material (no asset file): edit the GPU registry def directly.
-        // Shading-only → no rebake (the GPU material table re-uploads on registry change).
-        let mut reg = world.resource_mut::<super::edits::MaterialRegistry>();
-        if let Some(def) = reg.defs.get_mut(material.registry_id as usize) {
-            let lin = def.base_color.to_linear();
-            let mut rgb = [lin.red, lin.green, lin.blue];
-            if ui.color_edit_button_rgb(&mut rgb).changed() {
-                def.base_color = Color::linear_rgb(rgb[0], rgb[1], rgb[2]);
-            }
-            // Per-material colour-feather width at seams (world units). Does not affect
-            // geometry — see SdfOp::smoothing for that.
-            ui.add(egui::Slider::new(&mut def.blend_softness, 0.0..=1.0).text("Blend softness"));
-            // Scalar metallic/roughness — drive shading only when the material has no MRA
-            // texture (the textureless exemplars).
-            ui.add(egui::Slider::new(&mut def.metallic, 0.0..=1.0).text("Metallic"));
-            ui.add(egui::Slider::new(&mut def.roughness, 0.0..=1.0).text("Roughness"));
-            // Height relief displacement depth (world units). Only visible with a height map.
-            ui.add(egui::Slider::new(&mut def.parallax_scale, 0.0..=0.4).text("Relief depth"));
+    if let Some(rel) = source.asset {
+        // File-backed: edit the on-disk asset (the authored truth, shared by all users).
+        // Resolve it to a handle via the editor's path→handle helper.
+        if let Some(handle) = crate::editor::material_editor::handle_for_path(
+            world,
+            &std::path::Path::new(crate::editor::assets_browser::ASSETS_ROOT).join(&rel),
+        ) {
+            crate::editor::material_editor::material_editor_ui(world, &handle, ui);
+        } else {
+            ui.weak("Could not resolve material file.");
         }
+    } else {
+        // Inline material: edit the per-field overrides (stored on the volume, serialized).
+        sdf_inline_material_ui(world, entity, ui);
     }
+}
+
+/// Edit an inline `SdfMaterialSource`'s overrides (base colour + scalar PBR). Each change
+/// fires `Changed<SdfMaterialSource>` → `resolve_materials` rebuilds the registry row.
+#[cfg(feature = "editor")]
+fn sdf_inline_material_ui(world: &mut World, entity: Entity, ui: &mut egui::Ui) {
+    use crate::sdf_render::SdfMaterialSource;
+
+    let Some(mut source) = world.get_mut::<SdfMaterialSource>(entity) else {
+        return;
+    };
+    let o = &mut source.overrides;
+
+    // Base colour (defaults to mid-grey when unset).
+    let mut rgb = o.base_color.map(|c| [c[0], c[1], c[2]]).unwrap_or([0.8, 0.8, 0.8]);
+    ui.horizontal(|ui| {
+        ui.label("Base color");
+        if ui.color_edit_button_rgb(&mut rgb).changed() {
+            let a = o.base_color.map(|c| c[3]).unwrap_or(1.0);
+            o.base_color = Some([rgb[0], rgb[1], rgb[2], a]);
+        }
+    });
+
+    // Scalar overrides: edit a working value, write back as `Some(..)` on change.
+    let scalar = |ui: &mut egui::Ui, label: &str, cur: &mut Option<f32>, default: f32, max: f32| {
+        let mut v = cur.unwrap_or(default);
+        if ui.add(egui::Slider::new(&mut v, 0.0..=max).text(label)).changed() {
+            *cur = Some(v);
+        }
+    };
+    scalar(ui, "Blend softness", &mut o.blend_softness, 0.0, 1.0);
+    scalar(ui, "Metallic", &mut o.metallic, 0.0, 1.0);
+    scalar(ui, "Roughness", &mut o.roughness, 1.0, 1.0);
+    scalar(ui, "Relief depth", &mut o.parallax_scale, 0.0, 0.4);
 }

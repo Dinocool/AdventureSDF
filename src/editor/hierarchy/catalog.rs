@@ -6,7 +6,7 @@ use bevy::prelude::*;
 use bevy_egui::egui;
 
 use crate::sdf_render::debug::{
-    spawn_directional_light, spawn_empty_node, spawn_point_light, spawn_sdf_primitive,
+    spawn_camera, spawn_directional_light, spawn_empty_node, spawn_point_light, spawn_sdf_primitive,
 };
 use crate::sdf_render::{SdfPrimitive, SdfSelection};
 
@@ -33,12 +33,20 @@ struct NodeCategory {
 const NODE_CATALOG: &[NodeCategory] = &[
     NodeCategory {
         label: "Node3D",
-        types: &[NodeType {
-            label: "Node3D",
-            icon: "✦",
-            hint: "Empty spatial node — a transform-only group / locator.",
-            spawn: spawn_empty_node,
-        }],
+        types: &[
+            NodeType {
+                label: "Node3D",
+                icon: "✦",
+                hint: "Empty spatial node — a transform-only group / locator.",
+                spawn: spawn_empty_node,
+            },
+            NodeType {
+                label: "Camera",
+                icon: "🎥",
+                hint: "Scene camera node (serialized); the editor can look through it.",
+                spawn: spawn_camera,
+            },
+        ],
     },
     NodeCategory {
         label: "SDF Primitives",
