@@ -1375,13 +1375,15 @@ fn rebuild_pipeline_on_def_change(
     extracted: Option<Res<ExtractedShaderDefs>>,
     shader_handle: Res<SdfShaderHandle>,
     combine_shader: Res<SdfCombineShaderHandle>,
-    sdf_pipeline_layouts: Res<SdfPipeline>,
     pipeline_cache: Res<PipelineCache>,
     fullscreen_shader: Res<FullscreenShader>,
 ) {
     let Some(extracted) = extracted else { return };
     let shader_defs: Vec<_> = extracted.defs.iter().map(|s| s.as_str().into()).collect();
     let vertex_state = fullscreen_shader.to_vertex_state();
+    // The combine pipeline reuses the camera layout (group 0). Clone it up front so the combine
+    // rebuild below doesn't re-borrow `pipeline` (which is mutated by the primary rebuild).
+    let camera_layout = pipeline.layout_0.clone();
 
     // Primary (G-buffer) pipeline. Rebuild whenever the extracted defs differ from what the live
     // pipeline was built with — timing-independent, so the startup case (defs sync a frame or two
@@ -1418,7 +1420,7 @@ fn rebuild_pipeline_on_def_change(
     if extracted.defs != combine.current_defs {
         let new_id = pipeline_cache.queue_render_pipeline(RenderPipelineDescriptor {
             label: Some("sdf_combine_pipeline".into()),
-            layout: vec![sdf_pipeline_layouts.layout_0.clone(), combine.layout.clone()],
+            layout: vec![camera_layout, combine.layout.clone()],
             vertex: vertex_state,
             fragment: Some(FragmentState {
                 shader: combine_shader.0.clone(),
