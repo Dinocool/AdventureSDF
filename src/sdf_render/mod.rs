@@ -430,6 +430,7 @@ impl Plugin for SdfScenePlugin {
             .init_resource::<bake_scheduler::PrevEditAabbs>()
             .init_resource::<bake_scheduler::BakeScheduler>()
             .init_resource::<bake_scheduler::PendingGpuBakes>()
+            .init_resource::<bake_scheduler::BakeTaskState>()
             .init_resource::<LodRingsVisible>()
             .init_resource::<bvh::Bvh>()
             .init_resource::<SdfRenderEnabled>()

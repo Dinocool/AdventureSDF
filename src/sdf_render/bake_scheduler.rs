@@ -14,7 +14,7 @@
 use std::sync::Arc;
 
 use bevy::prelude::*;
-use bevy::tasks::{ComputeTaskPool, ParallelSlice};
+use bevy::tasks::{AsyncComputeTaskPool, ComputeTaskPool, ParallelSlice, Task, block_on, poll_once};
 
 use super::atlas::{self, SdfAtlas};
 use super::chunk;
@@ -102,6 +102,11 @@ pub struct BakeScheduler {
     /// Reusable emit scratch (cleared + refilled each frame) so a continuous drag does zero
     /// growth reallocation. `mem::take`n into `emit_gpu_bakes` and restored at the end.
     emit_scratch: EmitScratch,
+    /// Monotonic counter bumped whenever the edit set changes (an edit moves/adds/removes →
+    /// `edits`/`bvh` are replaced). Stamped onto an async bake task's input snapshot; when the
+    /// task lands, a mismatch means the edits changed mid-flight, so its (now stale) classify is
+    /// discarded and its chunks re-queued. See the async dispatch in [`schedule_bakes`].
+    edit_gen: u64,
 }
 
 /// Per-frame scratch buffers for `emit_gpu_bakes`, held on the scheduler so their capacity
@@ -122,9 +127,41 @@ impl Default for BakeScheduler {
             ring_chunk_origin: Vec::new(),
             pending: std::collections::HashSet::new(),
             emit_scratch: EmitScratch::default(),
+            edit_gen: 0,
         }
     }
 }
+
+/// Holds the single in-flight async bake-classify task (the offload path for large bakes). The
+/// task runs the read-only [`classify_candidates`] on snapshots; its result is applied
+/// synchronously on the main thread in [`schedule_bakes`] (atlas mutation can't be off-thread —
+/// the render-world Extract reads the atlas the same frame). Single-flight: while a task is in
+/// flight, newly dirtied chunks accumulate in `pending` and the next spawn (after this one lands)
+/// drains them. Modelled on `TextureStreamState` in render.rs.
+#[derive(Resource, Default)]
+pub struct BakeTaskState {
+    task: Option<Task<BakeTaskOutput>>,
+}
+
+/// The result a background classify task hands back to the main thread, plus the snapshot identity
+/// needed to reconcile staleness on apply.
+struct BakeTaskOutput {
+    candidates: Vec<(chunk::ChunkKey, atlas::BrickKey)>,
+    verdicts: Vec<Verdict>,
+    /// `edit_gen` the snapshot was built from — if it no longer matches the scheduler's, the edit
+    /// set changed mid-flight and every verdict is stale.
+    edit_gen: u64,
+    /// Per-LOD ring origins the snapshot was built from — a candidate whose chunk is no longer in
+    /// its LOD's current window has exited and must be dropped (already evicted by the recenter).
+    ring_origins: Vec<IVec3>,
+}
+
+/// Candidate-count threshold above which a bake is offloaded to a background task instead of run
+/// synchronously. Small bakes (dragging an object, a single-LOD nudge — a few hundred bricks) stay
+/// fully synchronous so editing feels instant; only a big shell (a coarse-LOD snap, ~10k–30k
+/// candidates) crosses this and goes async, where it costs a few frames of latency (coarse LOD
+/// covers the gap) instead of a main-thread hitch.
+const ASYNC_BAKE_THRESHOLD: usize = 4096;
 
 impl BakeScheduler {
     /// Replace the height-field snapshot used by subsequent bakes (rebuilt when the material
@@ -234,7 +271,6 @@ fn chunk_has_geometry_with(
 }
 
 /// Whether chunk coord `c` is inside the `R³` chunk window with corner `origin`.
-#[cfg(test)]
 fn chunk_in_window(c: IVec3, origin: IVec3, r: i32) -> bool {
     let rel = c - origin;
     rel.x >= 0 && rel.y >= 0 && rel.z >= 0 && rel.x < r && rel.y < r && rel.z < r
@@ -393,6 +429,7 @@ pub fn schedule_bakes(
     mut sched: ResMut<BakeScheduler>,
     mut prev_aabbs: ResMut<PrevEditAabbs>,
     mut gpu_bakes: ResMut<PendingGpuBakes>,
+    mut bake_task: ResMut<BakeTaskState>,
     config: Res<SdfGridConfig>,
     volumes: Query<VolumeQueryData, With<SdfVolume>>,
     changed: Query<Entity, (With<SdfVolume>, ChangedEdit)>,
@@ -435,6 +472,9 @@ pub fn schedule_bakes(
         *bvh = new_bvh.clone();
         sched.bvh = Arc::new(new_bvh);
         sched.edits = Arc::new(resolved);
+        // Bump the edit generation so any in-flight async classify task built from the OLD edits is
+        // recognised as stale when it lands (its verdicts are dropped + chunks re-queued).
+        sched.edit_gen = sched.edit_gen.wrapping_add(1);
         // NOTE: no global cache-invalidation here. Each brick is memoised by a CONTENT HASH of
         // the edits it folds (`PackedBrick::baked_hash`), so a re-dirtied chunk re-bakes only the
         // bricks whose folded content actually changed — moving one edit no longer invalidates
@@ -541,9 +581,11 @@ pub fn schedule_bakes(
 
     // --- 3. Emit GPU bake jobs for the dirty chunks ----------------------------------
     // The CPU does only topology (BVH cull + palette + tile alloc) and emits a GpuBakeJob per
-    // brick; the compute shader fills the texels.
-    //
-    emit_gpu_bakes(&mut atlas, &mut sched, &mut gpu_bakes, &config, camera_pos, &mut baked_dbg, now);
+    // brick; the compute shader fills the texels. Small bakes run synchronously; a large shell
+    // (coarse-LOD snap) offloads its classify to a background task (see `dispatch_bake`).
+    dispatch_bake(
+        &mut atlas, &mut sched, &mut bake_task, &mut gpu_bakes, &config, camera_pos, &mut baked_dbg, now,
+    );
 
     // DIAGNOSTIC: per-LOD baked-job histogram this frame + remaining `pending` backlog. Shows
     // whether a small edit's cost is spread across coarse LODs (each coarse chunk = 64 huge
@@ -629,6 +671,259 @@ fn narrow_band_keep(
 /// Turn this frame's dirty chunks into [`GpuBakeJob`]s: the CPU does only the topology work
 /// (BVH cull → which bricks exist + their palette + a stable tile), and the compute shader
 /// fills each brick's 512 texels straight into the atlas. No main-thread voxel loop.
+/// One candidate brick's classification, produced by [`classify_candidates`] (read-only, can run
+/// on a background task) and consumed by [`apply_verdicts`] (mutates the atlas, main thread only).
+pub(crate) enum Verdict {
+    /// No edit reaches it → evict.
+    Empty,
+    /// Narrow-band cull → evict.
+    Drop,
+    /// Resident with matching content hash → leave its texels as-is.
+    Skip,
+    /// Bake: palette + culled edit indices + content hash.
+    Keep(edits::Palette, Vec<u32>, u64),
+}
+
+/// Emit one bake job for `key` from already-culled edit indices `indices` and a known `palette`.
+/// No re-cull, no palette rebuild — the caller supplies both. `tile` must be allocated.
+fn push_bake_job(
+    gpu_bakes: &mut PendingGpuBakes,
+    edits_snapshot: &[edits::ResolvedEdit],
+    config: &SdfGridConfig,
+    key: atlas::BrickKey,
+    tile: u32,
+    indices: &[u32],
+    palette: edits::Palette,
+) {
+    let edit_start = gpu_bakes.edits.len() as u32;
+    for &i in indices {
+        gpu_bakes.edits.push(edits::to_gpu_edit(&edits_snapshot[i as usize]));
+    }
+    gpu_bakes.jobs.push(GpuBakeJob {
+        tile,
+        lod: key.lod,
+        coord: key.coord,
+        voxel_size: config.voxel_size_at(key.lod),
+        dist_band: atlas::dist_band_world(config, key.lod),
+        palette,
+        edit_start,
+        edit_count: indices.len() as u32,
+    });
+}
+
+/// Sort drained dirty chunks coarsest-LOD first, then nearest-camera first within an LOD — so the
+/// ring fills 8→0 (the cap only ever spills fine detail whose coarse fallback is already resident)
+/// and the chunks the viewer is looking at bake before distant ones.
+fn sort_drained(drained: &mut [chunk::ChunkKey], config: &SdfGridConfig, camera_pos: Vec3) {
+    drained.sort_unstable_by_key(|ck| {
+        let size = chunk::chunk_world_size(ck.lod, config);
+        let center = chunk::chunk_min_world(*ck, config) + Vec3::splat(size * 0.5);
+        let d2 = center.distance_squared(camera_pos);
+        (std::cmp::Reverse(ck.lod), d2.to_bits())
+    });
+}
+
+/// Phase 1 (serial, cheap, MAIN THREAD): gather candidate bricks from the drained chunks. A chunk
+/// no edit reaches has nothing to bake, but it may hold RESIDENT bricks that must be evicted the
+/// same frame (a moved edit's vacated chunks — the drag trail), so `evict` is invoked for every
+/// brick of an empty chunk. Non-empty chunks contribute their `CHUNK_BRICKS³` brick keys to
+/// `candidates`. The empty pre-cull is one BVH query per chunk instead of 64 per-brick queries.
+/// Eviction stays synchronous here even when the classify is offloaded, so the drag trail never
+/// lags behind the async bake.
+fn gather_candidates(
+    drained: &[chunk::ChunkKey],
+    bvh: &bvh::Bvh,
+    config: &SdfGridConfig,
+    candidates: &mut Vec<(chunk::ChunkKey, atlas::BrickKey)>,
+    mut evict: impl FnMut(atlas::BrickKey),
+) {
+    let _g = info_span!("emit_phase1_gather").entered();
+    let mut cull_stack: Vec<u32> = Vec::new();
+    for ck in drained.iter() {
+        if !chunk_has_geometry_with(*ck, bvh, config, &mut cull_stack) {
+            for_each_brick_key(*ck, config, &mut evict);
+            continue;
+        }
+        for_each_brick_key(*ck, config, |key| candidates.push((*ck, key)));
+    }
+}
+
+/// Classify ONE chunk's slice of candidate bricks into `Verdict`s (read-only). The shared core of
+/// both the parallel (sync) and serial (async task) classify paths. `scratch`/`stack`/`hash_memo`
+/// are caller-owned reusable buffers (the memo lets an edit-set folded by many bricks hash once per
+/// unique set). Reads only the edit/BVH snapshots, config, and the `hash_peek` resident-hash
+/// snapshot — no atlas borrow — so it is `Send` and safe on a background task.
+#[expect(clippy::too_many_arguments)]
+fn classify_chunk(
+    chunk: &[(chunk::ChunkKey, atlas::BrickKey)],
+    edits: &[edits::ResolvedEdit],
+    bvh: &bvh::Bvh,
+    config: &SdfGridConfig,
+    hash_peek: &std::collections::HashMap<atlas::BrickKey, u64>,
+    scratch: &mut Vec<u32>,
+    stack: &mut Vec<u32>,
+    hash_memo: &mut std::collections::HashMap<Box<[u32]>, u64>,
+    out: &mut Vec<Verdict>,
+) {
+    for &(_ck, key) in chunk {
+        if atlas::SdfAtlas::cull_edit_indices_with(key, bvh, config, scratch, stack).is_none() {
+            out.push(Verdict::Empty);
+            continue;
+        }
+        if !narrow_band_keep(edits, scratch, config, key) {
+            out.push(Verdict::Drop);
+            continue;
+        }
+        // Content hash of exactly the edits this brick folds — its bake-cache key. Memoised per
+        // unique culled index-set (the costly part is the same for identical sets).
+        let hash = *hash_memo
+            .entry(scratch.clone().into_boxed_slice())
+            .or_insert_with(|| edits::bake_content_hash(edits, scratch));
+        // HASH-PEEK EARLY-OUT: a resident brick with the same content keeps valid texels — skip
+        // BEFORE the (dominant-cost) palette build. This is what makes a sphere dragged over the
+        // heightmap cheap. The peek reads a SNAPSHOT of resident hashes (no atlas borrow); a stale
+        // snapshot is harmless — a wrong Skip re-bakes identically next frame, a wrong Keep is
+        // overwritten by `insert_gpu_brick`'s authoritative hash.
+        if hash_peek.get(&key).is_some_and(|&h| h == hash) {
+            out.push(Verdict::Skip);
+            continue;
+        }
+        let voxel_size = config.voxel_size_at(key.lod);
+        let samples = atlas::SdfAtlas::brick_palette_samples(key, voxel_size);
+        let palette = edits::build_palette_indexed(edits, scratch, &samples);
+        out.push(Verdict::Keep(palette, scratch.clone(), hash));
+    }
+}
+
+/// Phase 2 (PARALLEL, READ-ONLY): classify every candidate via `par_chunk_map` across the compute
+/// pool. The SYNCHRONOUS bake path. Reads only snapshots — see [`classify_chunk`].
+pub(crate) fn classify_candidates(
+    candidates: &[(chunk::ChunkKey, atlas::BrickKey)],
+    edits: &[edits::ResolvedEdit],
+    bvh: &bvh::Bvh,
+    config: &SdfGridConfig,
+    hash_peek: &std::collections::HashMap<atlas::BrickKey, u64>,
+) -> Vec<Verdict> {
+    if candidates.is_empty() {
+        return Vec::new();
+    }
+    let _g = info_span!("emit_phase2_classify", candidates = candidates.len()).entered();
+    let classify = |_idx: usize, chunk: &[(chunk::ChunkKey, atlas::BrickKey)]| -> Vec<Verdict> {
+        let mut scratch: Vec<u32> = Vec::new();
+        let mut stack: Vec<u32> = Vec::new();
+        let mut hash_memo: std::collections::HashMap<Box<[u32]>, u64> = std::collections::HashMap::new();
+        let mut out = Vec::with_capacity(chunk.len());
+        classify_chunk(chunk, edits, bvh, config, hash_peek, &mut scratch, &mut stack, &mut hash_memo, &mut out);
+        out
+    };
+    // `get_or_init` so headless tests (which don't boot the full app that sets up the pool) still
+    // run; in production the pool already exists.
+    let pool = ComputeTaskPool::get_or_init(bevy::tasks::TaskPool::default);
+    let chunk_size = candidates.len().div_ceil(pool.thread_num().max(1)).max(1);
+    candidates
+        .par_chunk_map(pool, chunk_size, classify)
+        .into_iter()
+        .flatten()
+        .collect()
+}
+
+/// SERIAL classify of all candidates — for the background async task, where nesting the
+/// `ComputeTaskPool` scope (as `classify_candidates` does) inside an `AsyncComputeTaskPool` task
+/// would deadlock. Single-threaded is fine off the main thread: the whole point is to not block the
+/// frame, and one background thread chewing through the shell over a few frames is exactly the goal.
+pub(crate) fn classify_candidates_serial(
+    candidates: &[(chunk::ChunkKey, atlas::BrickKey)],
+    edits: &[edits::ResolvedEdit],
+    bvh: &bvh::Bvh,
+    config: &SdfGridConfig,
+    hash_peek: &std::collections::HashMap<atlas::BrickKey, u64>,
+) -> Vec<Verdict> {
+    let mut scratch: Vec<u32> = Vec::new();
+    let mut stack: Vec<u32> = Vec::new();
+    let mut hash_memo: std::collections::HashMap<Box<[u32]>, u64> = std::collections::HashMap::new();
+    let mut out = Vec::with_capacity(candidates.len());
+    classify_chunk(candidates, edits, bvh, config, hash_peek, &mut scratch, &mut stack, &mut hash_memo, &mut out);
+    out
+}
+
+/// Phase 3 (serial, MAIN THREAD): apply each candidate's verdict — evict, skip, or insert + push a
+/// GPU bake job under the soft budget. Mutates the atlas + job list, so it must run on the main
+/// thread before the render-world Extract. A Keep over [`SOFT_BAKE_BUDGET`] spills its chunk back to
+/// `sched.pending` (NOT inserted → stays non-resident → coarse-LOD fallback, hole-free) and evicts
+/// any stale resident texels. `spilled` is a reusable set (cleared on entry).
+#[expect(clippy::too_many_arguments)]
+fn apply_verdicts(
+    atlas: &mut SdfAtlas,
+    gpu_bakes: &mut PendingGpuBakes,
+    edits_snapshot: &[edits::ResolvedEdit],
+    config: &SdfGridConfig,
+    baked_dbg: &mut super::BakedBrickDebug,
+    now_secs: f32,
+    candidates: &[(chunk::ChunkKey, atlas::BrickKey)],
+    verdicts: Vec<Verdict>,
+    spilled: &mut std::collections::HashSet<chunk::ChunkKey>,
+    job_budget: usize,
+) {
+    let _g3 = info_span!("emit_phase3_apply").entered();
+    spilled.clear();
+    for ((ck, key), verdict) in candidates.iter().zip(verdicts) {
+        match verdict {
+            Verdict::Empty | Verdict::Drop => {
+                atlas.remove_brick(key);
+            }
+            // Resident brick, content unchanged (hash matched in classify) → texels still valid,
+            // leave it as-is. This is what keeps a sphere dragged over the heightmap cheap.
+            Verdict::Skip => {}
+            Verdict::Keep(palette, indices, hash) => {
+                if gpu_bakes.jobs.len() >= job_budget {
+                    // Over this frame's job budget → defer this brick's bake to a later frame, so a
+                    // big shell spreads instead of spiking. The SYNC path uses the low SOFT budget
+                    // (the classify is on the main thread, so keep per-frame work small); the ASYNC
+                    // apply uses the full `GPU_BAKE_JOB_CAP` (its classify already ran off-thread, so
+                    // the only per-frame cost left is the cheap HashMap/Vec apply — drain faster).
+                    // Same spill mechanics either way. CRUCIAL: if the brick is currently RESIDENT
+                    // with a DIFFERENT hash it holds STALE texels (its content changed) — leaving it
+                    // resident would serve its stale shape over the freshly-baked coarse level (the
+                    // "old surface band left behind while dragging"). Evict it so the lookup misses
+                    // and falls back to the correct coarse LOD until its real bake lands.
+                    atlas.remove_brick(key);
+                    spilled.insert(*ck);
+                    continue;
+                }
+                let tile = atlas.insert_gpu_brick(*key, palette, hash);
+                push_bake_job(gpu_bakes, edits_snapshot, config, *key, tile, &indices, palette);
+                if baked_dbg.enabled {
+                    let bw = config.brick_world_size(key.lod);
+                    let center = config.brick_min_world(key.coord, key.lod) + Vec3::splat(0.5 * bw);
+                    baked_dbg.bricks.push((center, bw, now_secs));
+                }
+            }
+        }
+    }
+    atlas.last_bake_was_full = false;
+}
+
+/// Build the `hash_peek` snapshot: each candidate's resident `baked_hash` (absent → not resident).
+/// Lets [`classify_candidates`] do the content-hash skip without borrowing the atlas, so it can run
+/// on a background task.
+fn snapshot_hash_peek(
+    atlas: &SdfAtlas,
+    candidates: &[(chunk::ChunkKey, atlas::BrickKey)],
+) -> std::collections::HashMap<atlas::BrickKey, u64> {
+    let mut map = std::collections::HashMap::with_capacity(candidates.len());
+    for &(_ck, key) in candidates {
+        if let Some(b) = atlas.bricks.get(&key) {
+            map.insert(key, b.baked_hash);
+        }
+    }
+    map
+}
+
+/// Synchronous bake emit: drain `pending`, gather candidates (evicting empties), classify INLINE,
+/// and apply. The production path is [`dispatch_bake`] (sync for small bakes, async for large);
+/// this fully-synchronous variant is the deterministic test/settle harness used by the unit tests,
+/// sharing the same `gather_candidates` / `classify_candidates` / `apply_verdicts` building blocks.
+#[cfg(test)]
 fn emit_gpu_bakes(
     atlas: &mut SdfAtlas,
     sched: &mut BakeScheduler,
@@ -642,55 +937,6 @@ fn emit_gpu_bakes(
     let edits_snapshot = Arc::clone(&sched.edits);
     let bvh_snapshot = Arc::clone(&sched.bvh);
 
-    // Emit one bake job for `key` from already-culled edit indices `indices` and a known
-    // `palette`. No re-cull, no palette rebuild — the caller supplies both. `tile` must be
-    // allocated.
-    #[expect(clippy::too_many_arguments)]
-    fn push_job(
-        atlas: &mut SdfAtlas,
-        gpu_bakes: &mut PendingGpuBakes,
-        edits_snapshot: &[edits::ResolvedEdit],
-        config: &SdfGridConfig,
-        key: atlas::BrickKey,
-        tile: u32,
-        indices: &[u32],
-        palette: edits::Palette,
-    ) {
-        let edit_start = gpu_bakes.edits.len() as u32;
-        for &i in indices {
-            gpu_bakes.edits.push(edits::to_gpu_edit(&edits_snapshot[i as usize]));
-        }
-        gpu_bakes.jobs.push(GpuBakeJob {
-            tile,
-            lod: key.lod,
-            coord: key.coord,
-            voxel_size: config.voxel_size_at(key.lod),
-            dist_band: atlas::dist_band_world(config, key.lod),
-            palette,
-            edit_start,
-            edit_count: indices.len() as u32,
-        });
-        atlas.gpu_baked_tiles.insert(tile);
-    }
-
-    // Drain ALL pending each frame and EVICT empties immediately (no per-frame eviction
-    // budget). When an edit moves it dirties its old∪new footprint; the vacated chunks MUST
-    // be evicted the same frame or their stale bricks linger as a trail behind the dragged
-    // object (the "parts left behind" artifact). Eviction is CPU-only (`remove_brick`, no GPU
-    // job), so it's always cheap and always immediate.
-    //
-    // BAKE emission, by contrast, is capped: each bake job writes into GPU storage buffers
-    // sized `jobs × tile`, and a huge edit (70k+ bricks) would overflow the 128 MB buffer
-    // binding and abort the frame. So we emit at most `GPU_BAKE_JOB_CAP` jobs; the rest spill
-    // back to `pending` and bake over the next frames.
-    //
-    // Two invariants keep the cap hole-free:
-    //  1. A spilled brick is NOT inserted into the atlas (stays non-resident) — the shader's
-    //     chunk lookup misses it and falls back to the coarser LOD, which IS baked. (Inserting
-    //     it would expose a resident tile with un-baked zero texels: worse than a hole.)
-    //  2. Coarse LODs emit before fine (sort dirty chunks by DESCENDING lod). Coarse rings
-    //     have ~8× fewer bricks per level, so they always fit; if the cap is hit it only ever
-    //     spills the finest detail, whose coarse fallback is already resident this frame.
     // Take the reusable scratch out of the scheduler so `sched` is free for `pending` below;
     // restored at the end (keeps its capacity across frames → zero growth realloc while dragging).
     let mut scratch = std::mem::take(&mut sched.emit_scratch);
@@ -698,151 +944,33 @@ fn emit_gpu_bakes(
     scratch.candidates.clear();
     scratch.spilled.clear();
     scratch.drained.extend(sched.pending.drain());
-    let drained = &mut scratch.drained;
-    // Order: coarsest LOD first (so the ring fills 8→0 and the cap only ever spills fine detail
-    // whose coarse fallback is already resident), then — within an LOD — NEAREST the camera first,
-    // so the chunks the viewer is looking at bake before distant ones. Distance is a cheap squared
-    // chunk-center metric; the sort is over a few hundred chunks so it costs next to nothing.
-    drained.sort_unstable_by_key(|ck| {
-        let size = chunk::chunk_world_size(ck.lod, config);
-        let center = chunk::chunk_min_world(*ck, config) + Vec3::splat(size * 0.5);
-        let d2 = center.distance_squared(camera_pos);
-        (std::cmp::Reverse(ck.lod), d2.to_bits())
-    });
+    sort_drained(&mut scratch.drained, config, camera_pos);
 
-    // --- Phase 1 (serial, cheap): gather candidate bricks ----------------------------------
-    // The bake-cache skip is no longer here — it needs each brick's CULLED edit set to compute
-    // its content hash, which Phase 2 produces. So Phase 1 just gathers every brick of a non-empty
-    // chunk; Phase 3 skips a Keep whose content hash matches the resident brick's. Each candidate
-    // carries its source ChunkKey so a job-capped (spilled) brick re-queues its chunk.
-    let candidates = &mut scratch.candidates;
-    {
-        let _g = info_span!("emit_phase1_gather").entered();
-        let mut cull_stack: Vec<u32> = Vec::new();
-        for ck in drained.iter() {
-            // CHUNK-LEVEL EMPTY PRE-CULL: one BVH query on the whole chunk AABB instead of 64
-            // per-brick queries. If no edit reaches the chunk it has nothing to bake — skip all
-            // 64 children. A heightmap's dirtied ring is mostly empty space above/below the thin
-            // surface, so this prunes the bulk of the gather at 1/64 the BVH cost. BUT a chunk
-            // that became empty after a move may still hold RESIDENT bricks that must be evicted,
-            // so we still drop any residents before skipping (cheap: only touches resident keys).
-            if !chunk_has_geometry_with(*ck, &bvh_snapshot, config, &mut cull_stack) {
-                for_each_brick_key(*ck, config, |key| {
-                    atlas.remove_brick(&key); // no-op if not resident
-                });
-                continue;
-            }
-            for_each_brick_key(*ck, config, |key| {
-                candidates.push((*ck, key));
-            });
-        }
-    }
+    gather_candidates(
+        &scratch.drained,
+        &bvh_snapshot,
+        config,
+        &mut scratch.candidates,
+        |key| {
+            atlas.remove_brick(&key);
+        },
+    );
 
-    // --- Phase 2 (parallel, read-only): classify each candidate -----------------------------
-    // The BVH cull, narrow-band keep, and palette build only READ the edits/BVH snapshots (both
-    // Arc, Sync) — no shared mutation — so they fan out across the compute task pool. This is
-    // the bulk of a first-bake's per-brick cost (measured ~68%: keep+palette fold_csg dominate,
-    // BVH cull the rest). Each task keeps its own `scratch`. Results stay in candidate order so
-    // the serial apply below is deterministic (tile allocation order is stable across runs).
-    enum Verdict {
-        Empty,                                   // no edit reaches it → evict
-        Drop,                                    // narrow-band cull → evict
-        Skip,                                    // resident with matching content hash → leave as-is
-        Keep(edits::Palette, Vec<u32>, u64),     // bake: palette + culled edit indices + content hash
-    }
-    // Resident bricks snapshot for the content-hash peek (immutable borrow; ends before Phase 3's
-    // `&mut atlas`). `par_chunk_map` runs the closure on a shared `&` so this is safe to capture.
-    let resident = &atlas.bricks;
-    let classify = |_idx: usize, chunk: &[(chunk::ChunkKey, atlas::BrickKey)]| -> Vec<Verdict> {
-        // Per-task reusable scratch: BVH traversal stack + cull-index buffer (zero per-brick
-        // alloc), and a memo so an edit-set folded by many bricks (e.g. every heightmap brick
-        // folds `[heightmap_idx]`) hashes ONCE per unique set, not per brick.
-        let mut scratch: Vec<u32> = Vec::new();
-        let mut stack: Vec<u32> = Vec::new();
-        let mut hash_memo: std::collections::HashMap<Box<[u32]>, u64> = std::collections::HashMap::new();
-        chunk
-            .iter()
-            .map(|&(_ck, key)| {
-                if atlas::SdfAtlas::cull_edit_indices_with(key, &bvh_snapshot, config, &mut scratch, &mut stack)
-                    .is_none()
-                {
-                    return Verdict::Empty;
-                }
-                if !narrow_band_keep(&edits_snapshot, &scratch, config, key) {
-                    return Verdict::Drop;
-                }
-                // Content hash of exactly the edits this brick folds — its bake-cache key. Memoised
-                // per unique culled index-set (the costly part is the same for identical sets).
-                let hash = *hash_memo
-                    .entry(scratch.clone().into_boxed_slice())
-                    .or_insert_with(|| edits::bake_content_hash(&edits_snapshot, &scratch));
-                // HASH-PEEK EARLY-OUT: a resident brick with the same content keeps valid texels —
-                // skip BEFORE the (dominant-cost) palette build. This is what makes a sphere dragged
-                // over the heightmap cheap: the overlapping heightmap bricks short-circuit here.
-                if resident.get(&key).is_some_and(|b| b.baked_hash == hash) {
-                    return Verdict::Skip;
-                }
-                let voxel_size = config.voxel_size_at(key.lod);
-                let samples = atlas::SdfAtlas::brick_palette_samples(key, voxel_size);
-                let palette = edits::build_palette_indexed(&edits_snapshot, &scratch, &samples);
-                Verdict::Keep(palette, scratch.clone(), hash)
-            })
-            .collect()
-    };
-    // Chunk size balances task overhead against load balancing; ~one chunk per thread.
-    let verdicts: Vec<Verdict> = if candidates.is_empty() {
-        Vec::new()
-    } else {
-        let _g = info_span!("emit_phase2_classify", candidates = candidates.len()).entered();
-        // `get_or_init` so headless tests (which don't boot the full app that sets up the pool)
-        // still run; in production the pool already exists and the closure is never called.
-        let pool = ComputeTaskPool::get_or_init(bevy::tasks::TaskPool::default);
-        let chunk_size = candidates.len().div_ceil(pool.thread_num().max(1)).max(1);
-        candidates
-            .par_chunk_map(pool, chunk_size, classify)
-            .into_iter()
-            .flatten()
-            .collect()
-    };
+    let hash_peek = snapshot_hash_peek(atlas, &scratch.candidates);
+    let verdicts = classify_candidates(&scratch.candidates, &edits_snapshot, &bvh_snapshot, config, &hash_peek);
+    apply_verdicts(
+        atlas,
+        gpu_bakes,
+        &edits_snapshot,
+        config,
+        baked_dbg,
+        now_secs,
+        &scratch.candidates,
+        verdicts,
+        &mut scratch.spilled,
+        SOFT_BAKE_BUDGET,
+    );
 
-    // --- Phase 3 (serial): apply verdicts — evict, or insert + push job under the cap -------
-    // Mutates the atlas + job list, so it's serial. A Keep over the job cap spills its chunk
-    // back to `pending` (NOT inserted → stays non-resident → coarse-LOD fallback, hole-free).
-    let _g3 = info_span!("emit_phase3_apply").entered();
-    let spilled = &mut scratch.spilled;
-    for ((ck, key), verdict) in candidates.iter().zip(verdicts) {
-        match verdict {
-            Verdict::Empty | Verdict::Drop => {
-                atlas.remove_brick(key);
-            }
-            // Resident brick, content unchanged (hash matched in classify) → texels still valid,
-            // leave it as-is. This is what keeps a sphere dragged over the heightmap cheap.
-            Verdict::Skip => {}
-            Verdict::Keep(palette, indices, hash) => {
-                if gpu_bakes.jobs.len() >= SOFT_BAKE_BUDGET {
-                    // Over the per-frame SOFT budget → defer this brick's bake to a later frame, so a
-                    // big shell (coarse-LOD snap) spreads over several frames instead of spiking. The
-                    // hard `GPU_BAKE_JOB_CAP` is the GPU-buffer ceiling; this lower budget is the
-                    // smoothing knob (see its doc). Same spill mechanics either way. CRUCIAL: if the
-                    // brick is currently RESIDENT with a DIFFERENT hash it holds STALE texels (its
-                    // content changed) — leaving it resident would serve its stale shape over the
-                    // freshly-baked coarse level (the "old surface band left behind while dragging").
-                    // Evict it so the lookup misses and falls back to the correct coarse LOD until
-                    // its real bake lands.
-                    atlas.remove_brick(key);
-                    spilled.insert(*ck);
-                    continue;
-                }
-                let tile = atlas.insert_gpu_brick(*key, palette, hash);
-                push_job(atlas, gpu_bakes, &edits_snapshot, config, *key, tile, &indices, palette);
-                if baked_dbg.enabled {
-                    let bw = config.brick_world_size(key.lod);
-                    let center = config.brick_min_world(key.coord, key.lod) + Vec3::splat(0.5 * bw);
-                    baked_dbg.bricks.push((center, bw, now_secs));
-                }
-            }
-        }
-    }
     // Re-queue spilled chunks for the next frame(s). Their evictions already happened above;
     // only their deferred bakes retry. The atlas grows naturally as the spill drains, and the
     // render world preserves existing texels across the grow (see `prepare_sdf_atlas_gpu`), so
@@ -850,10 +978,168 @@ fn emit_gpu_bakes(
     for &ck in scratch.spilled.iter() {
         sched.pending.insert(ck);
     }
-    atlas.last_bake_was_full = false;
 
     // Return the scratch (with its grown capacity) to the scheduler for next frame's reuse.
     sched.emit_scratch = scratch;
+}
+
+/// Apply a classify result (from either the sync path or a landed async task) to the atlas + job
+/// list, then re-queue spilled chunks. Shared tail of both bake paths. `spilled` reuses the
+/// scheduler's scratch set.
+#[expect(clippy::too_many_arguments)]
+fn finish_bake_apply(
+    atlas: &mut SdfAtlas,
+    sched: &mut BakeScheduler,
+    gpu_bakes: &mut PendingGpuBakes,
+    config: &SdfGridConfig,
+    baked_dbg: &mut super::BakedBrickDebug,
+    now_secs: f32,
+    candidates: &[(chunk::ChunkKey, atlas::BrickKey)],
+    verdicts: Vec<Verdict>,
+) {
+    let edits_snapshot = Arc::clone(&sched.edits);
+    let mut spilled = std::mem::take(&mut sched.emit_scratch.spilled);
+    // Apply at the SOFT budget even though the classify ran off-thread. The apply itself
+    // (atlas inserts + tile alloc) AND the downstream render `extract_sdf` (rebuilds the O(bricks)
+    // chunk lookup tables on a topology change) are BOTH main-thread and scale with jobs/frame —
+    // dumping a full 8192-brick shell in one apply just moves the hitch from classify to
+    // apply+extract (measured ~14 ms apply + ~20 ms extract). The budget bounds ALL per-frame
+    // main-thread bake work; the shell still drains over a few frames (coarse LOD covers the gap).
+    apply_verdicts(
+        atlas, gpu_bakes, &edits_snapshot, config, baked_dbg, now_secs, candidates, verdicts, &mut spilled, SOFT_BAKE_BUDGET,
+    );
+    for &ck in spilled.iter() {
+        sched.pending.insert(ck);
+    }
+    sched.emit_scratch.spilled = spilled;
+}
+
+/// Reconcile a landed async classify result against the CURRENT scheduler state, dropping verdicts
+/// that went stale while the task ran, then apply the survivors. Two staleness cases:
+///   1. `out.edit_gen != sched.edit_gen` — the edit set changed mid-flight, so EVERY verdict is
+///      computed from stale geometry. Drop them all and re-queue every candidate chunk to `pending`
+///      (the next bake re-classifies against the new edits). Safe + simple; snaps rarely coincide
+///      with an edit change.
+///   2. Otherwise, per candidate: if its chunk has exited its LOD's window since the snapshot
+///      (compared against the snapshot's `ring_origins`, which still match because edits didn't
+///      change the window), the recenter already evicted it — drop its verdict, don't re-queue.
+fn apply_async_result(
+    atlas: &mut SdfAtlas,
+    sched: &mut BakeScheduler,
+    gpu_bakes: &mut PendingGpuBakes,
+    config: &SdfGridConfig,
+    baked_dbg: &mut super::BakedBrickDebug,
+    now_secs: f32,
+    out: BakeTaskOutput,
+) {
+    let r = ring_chunks_per_axis(config);
+    if out.edit_gen != sched.edit_gen {
+        // Whole result stale — re-queue every candidate's chunk (deduped) and bail.
+        for (ck, _key) in &out.candidates {
+            sched.pending.insert(*ck);
+        }
+        return;
+    }
+    // Filter candidates whose chunk has exited its LOD window since the snapshot. The verdicts
+    // vector is parallel to candidates, so filter both together.
+    let mut kept_candidates: Vec<(chunk::ChunkKey, atlas::BrickKey)> = Vec::with_capacity(out.candidates.len());
+    let mut kept_verdicts: Vec<Verdict> = Vec::with_capacity(out.verdicts.len());
+    for ((ck, key), verdict) in out.candidates.into_iter().zip(out.verdicts) {
+        let li = ck.lod as usize;
+        let origin = out.ring_origins.get(li).copied().unwrap_or(IVec3::splat(i32::MIN));
+        if chunk_in_window(ck.coord, origin, r) {
+            kept_candidates.push((ck, key));
+            kept_verdicts.push(verdict);
+        }
+        // else: chunk exited; recenter already evicted its bricks — drop, don't re-queue.
+    }
+    finish_bake_apply(atlas, sched, gpu_bakes, config, baked_dbg, now_secs, &kept_candidates, kept_verdicts);
+}
+
+/// Bake dispatch: poll any in-flight async classify (apply it if ready), then drain this frame's
+/// `pending` into candidates and EITHER classify+apply synchronously (small bake — instant) OR
+/// spawn a background classify task (large bake — offloaded so the main thread doesn't hitch).
+/// Single-flight: only one async task at a time; while it runs, new dirt accumulates in `pending`.
+#[expect(clippy::too_many_arguments)]
+fn dispatch_bake(
+    atlas: &mut SdfAtlas,
+    sched: &mut BakeScheduler,
+    bake_task: &mut BakeTaskState,
+    gpu_bakes: &mut PendingGpuBakes,
+    config: &SdfGridConfig,
+    camera_pos: Vec3,
+    baked_dbg: &mut super::BakedBrickDebug,
+    now_secs: f32,
+) {
+    // 1. Poll the in-flight task. If it finished, reconcile + apply its result this frame (before
+    //    the render-world Extract). If still running, leave it and skip spawning a new one.
+    let mut task_in_flight = false;
+    if let Some(task) = bake_task.task.as_mut() {
+        match block_on(poll_once(task)) {
+            Some(out) => {
+                bake_task.task = None;
+                apply_async_result(atlas, sched, gpu_bakes, config, baked_dbg, now_secs, out);
+            }
+            None => task_in_flight = true,
+        }
+    }
+
+    // 2. Gather this frame's candidates from pending (sync — includes the same-frame empty-chunk
+    //    eviction, which must never lag the drag). Done even while a task is in flight, so empties
+    //    still evict; but we only CLASSIFY when no task is running (single-flight).
+    let bvh_snapshot = Arc::clone(&sched.bvh);
+    let mut scratch = std::mem::take(&mut sched.emit_scratch);
+    scratch.drained.clear();
+    scratch.candidates.clear();
+    if task_in_flight {
+        // A task owns the bake this cycle. Don't drain pending (let it accumulate for the next
+        // spawn), but DO evict empties for any chunks already dirtied — no: empties only matter for
+        // chunks we'd otherwise bake. Leave pending intact; restore scratch and return.
+        sched.emit_scratch = scratch;
+        return;
+    }
+    scratch.drained.extend(sched.pending.drain());
+    sort_drained(&mut scratch.drained, config, camera_pos);
+    gather_candidates(&scratch.drained, &bvh_snapshot, config, &mut scratch.candidates, |key| {
+        atlas.remove_brick(&key);
+    });
+
+    let candidate_count = scratch.candidates.len();
+    if candidate_count <= ASYNC_BAKE_THRESHOLD {
+        // SMALL bake → classify + apply synchronously this frame (instant, snappy).
+        let edits_snapshot = Arc::clone(&sched.edits);
+        let hash_peek = snapshot_hash_peek(atlas, &scratch.candidates);
+        let verdicts = classify_candidates(&scratch.candidates, &edits_snapshot, &bvh_snapshot, config, &hash_peek);
+        let mut spilled = std::mem::take(&mut scratch.spilled);
+        spilled.clear();
+        apply_verdicts(
+            atlas, gpu_bakes, &edits_snapshot, config, baked_dbg, now_secs, &scratch.candidates, verdicts, &mut spilled, SOFT_BAKE_BUDGET,
+        );
+        for &ck in spilled.iter() {
+            sched.pending.insert(ck);
+        }
+        scratch.spilled = spilled;
+        sched.emit_scratch = scratch;
+        return;
+    }
+
+    // LARGE bake → offload the classify to a background task. Snapshot everything the read-only
+    // classify needs (Arc edits/bvh, owned candidates + hash_peek + config), stamp the snapshot's
+    // identity (edit_gen + ring origins) for staleness reconciliation, and spawn single-flight.
+    let edits_snapshot = Arc::clone(&sched.edits);
+    let hash_peek = snapshot_hash_peek(atlas, &scratch.candidates);
+    let candidates = std::mem::take(&mut scratch.candidates);
+    let config_snapshot = config.clone();
+    let edit_gen = sched.edit_gen;
+    let ring_origins = sched.ring_chunk_origin.clone();
+    sched.emit_scratch = scratch;
+
+    let pool = AsyncComputeTaskPool::get();
+    bake_task.task = Some(pool.spawn(async move {
+        // SERIAL classify — nesting the ComputeTaskPool scope inside this async task would deadlock.
+        let verdicts = classify_candidates_serial(&candidates, &edits_snapshot, &bvh_snapshot, &config_snapshot, &hash_peek);
+        BakeTaskOutput { candidates, verdicts, edit_gen, ring_origins }
+    }));
 }
 
 #[cfg(test)]
@@ -1070,6 +1356,100 @@ mod tests {
             bvh: Arc::new(build_bvh(edits)),
             ..BakeScheduler::default()
         }
+    }
+
+    /// Drive `dispatch_bake` (the production sync/async hybrid) frame-by-frame until the bake
+    /// settles: pending empty AND no task in flight. Mirrors the per-frame `schedule_bakes` call so
+    /// the async path (task spawn → poll → reconcile → apply, spread over frames) is exercised
+    /// end-to-end with a real `AsyncComputeTaskPool`. Returns the resident chunk set.
+    fn settle_dispatch(
+        sched: &mut BakeScheduler,
+        atlas: &mut SdfAtlas,
+        bake_task: &mut BakeTaskState,
+        cfg: &SdfGridConfig,
+        cam: Vec3,
+    ) -> HashSet<chunk::ChunkKey> {
+        recenter_step(sched, atlas, cfg, cam);
+        let mut gpu = PendingGpuBakes::default();
+        let mut guard = 0;
+        loop {
+            gpu.jobs.clear();
+            gpu.edits.clear();
+            atlas.gpu_baked_tiles.clear();
+            dispatch_bake(atlas, sched, bake_task, &mut gpu, cfg, cam, &mut crate::sdf_render::BakedBrickDebug::default(), 0.0);
+            // Tiny yield so the background classify thread gets CPU between polls (in the real app
+            // frames are milliseconds apart; this test loop would otherwise busy-spin the main thread
+            // and starve the pool). Not needed in production.
+            if bake_task.task.is_some() {
+                std::thread::yield_now();
+            }
+            guard += 1;
+            assert!(guard < 50000, "async dispatch settle did not converge");
+            if sched.pending.is_empty() && bake_task.task.is_none() {
+                break;
+            }
+        }
+        atlas.bricks.keys().map(|k| chunk::chunk_of(*k, cfg).0).collect()
+    }
+
+    /// The async offload must converge to the SAME resident set as the synchronous settle. Uses a
+    /// scene big enough to cross `ASYNC_BAKE_THRESHOLD` so the large-bake (task) path actually runs.
+    /// Proves the snapshot/spawn/poll/reconcile/apply round-trip drops nothing and bakes everything.
+    #[test]
+    fn async_dispatch_converges_to_sync_settle() {
+        // Headless tests don't boot TaskPoolPlugin, so init the async pool the dispatch needs.
+        AsyncComputeTaskPool::get_or_init(bevy::tasks::TaskPool::default);
+        // Ring sized so the sphere's in-window shell modestly exceeds the async threshold (4096) —
+        // enough to take the task path, small enough that the SERIAL background classify finishes
+        // quickly under the test's busy-poll loop (a huge shell would serial-classify for seconds).
+        let cfg = SdfGridConfig { lod_count: 1, ring_bricks: 24, recenter_snap_chunks: 1, ..config() };
+        let edits = vec![sphere_edit(Vec3::ZERO, 9.0, 0)];
+        let cam = Vec3::ZERO;
+
+        // Async path.
+        let mut a_atlas = SdfAtlas::default();
+        let mut a_sched = primed_sched(&edits);
+        let mut a_task = BakeTaskState::default();
+        let a_chunks = settle_dispatch(&mut a_sched, &mut a_atlas, &mut a_task, &cfg, cam);
+
+        // Synchronous reference.
+        let mut s_atlas = SdfAtlas::default();
+        let mut s_sched = primed_sched(&edits);
+        let s_chunks = settle_gpu(&mut s_sched, &mut s_atlas, &cfg, cam);
+
+        assert!(a_atlas.bricks.len() > ASYNC_BAKE_THRESHOLD, "scene must exceed the async threshold to test the task path (got {})", a_atlas.bricks.len());
+        let a_bricks: HashSet<_> = a_atlas.bricks.keys().copied().collect();
+        let s_bricks: HashSet<_> = s_atlas.bricks.keys().copied().collect();
+        assert_eq!(a_bricks, s_bricks, "async bake resident set diverged from the synchronous settle");
+        assert_eq!(a_chunks, s_chunks);
+    }
+
+    /// Staleness reconciliation: if the edit set changes (`edit_gen` bumped) while an async classify
+    /// is in flight, the landed result must be discarded wholesale and its chunks re-queued — never
+    /// applied against the new geometry.
+    #[test]
+    fn async_stale_edit_gen_requeues_all() {
+        let cfg = SdfGridConfig { lod_count: 1, ring_bricks: 8, recenter_snap_chunks: 1, ..config() };
+        let edits = vec![sphere_edit(Vec3::ZERO, 2.0, 0)];
+        let mut sched = primed_sched(&edits);
+        let mut atlas = SdfAtlas::default();
+        let mut gpu = PendingGpuBakes::default();
+
+        // Fabricate a landed task output tagged with an OLD edit_gen (current is 0, stamp 99 stale).
+        let cand = (chunk::ChunkKey::new(0, IVec3::ZERO), atlas::BrickKey::new(0, IVec3::ZERO));
+        let out = BakeTaskOutput {
+            candidates: vec![cand],
+            verdicts: vec![Verdict::Keep([edits::PALETTE_EMPTY; edits::PALETTE_K], vec![0], 1234)],
+            edit_gen: 99, // != sched.edit_gen (0)
+            ring_origins: sched.ring_chunk_origin.clone(),
+        };
+        sched.pending.clear();
+        apply_async_result(&mut atlas, &mut sched, &mut gpu, &cfg, &mut crate::sdf_render::BakedBrickDebug::default(), 0.0, out);
+
+        // Nothing baked (verdict dropped); the candidate's chunk is back in pending for re-classify.
+        assert!(gpu.jobs.is_empty(), "stale result must not bake");
+        assert!(atlas.bricks.is_empty(), "stale result must not insert bricks");
+        assert!(sched.pending.contains(&cand.0), "stale result's chunk must be re-queued");
     }
 
     /// `emit_gpu_bakes` never emits more than `GPU_BAKE_JOB_CAP` jobs in one frame, and the
