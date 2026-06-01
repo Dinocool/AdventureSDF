@@ -93,6 +93,25 @@ impl Obb {
     }
 }
 
+/// Ray hit against a thin great-circle of `radius` in the plane through `center` with the
+/// given `normal` (one of the wireframe-sphere circles). Returns the ray distance `t` to
+/// the contact if the ray crosses the plane within `tol` world units of the circle line,
+/// else `None`. Picking the drawn line (not the solid disc/sphere) so it doesn't steal
+/// clicks from geometry inside the light's range.
+pub fn ray_circle(ray: &Ray, center: Vec3, normal: Vec3, radius: f32, tol: f32) -> Option<f32> {
+    let denom = ray.direction.dot(normal);
+    if denom.abs() < 1e-6 {
+        return None; // ray parallel to the circle's plane
+    }
+    let t = (center - ray.origin).dot(normal) / denom;
+    if t < 0.0 {
+        return None; // behind the camera
+    }
+    let hit = ray.origin + ray.direction * t;
+    let r = (hit - center).length();
+    ((r - radius).abs() <= tol).then_some(t)
+}
+
 /// Sphere-trace the CSG scene on the CPU to find the entity owning the nearest
 /// hit surface, plus the ray distance `t` to that surface. Edits are culled
 /// per-march-step by the BVH ray candidates, then folded via [`fold_csg`] — the

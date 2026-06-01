@@ -24,6 +24,7 @@ pub mod resource_inspector;
 pub mod resource_picker;
 pub mod selection;
 pub mod status_bar;
+pub mod transform_editor;
 pub mod uniform_inspector;
 pub mod viewport_toolbar;
 
@@ -49,6 +50,9 @@ impl Plugin for EditorPlugin {
         .register_type::<import_settings::ColorSpace>()
         .register_type::<import_settings::WrapMode>()
         .register_type::<import_settings::TextureImportSettings>();
+
+        // Custom euler-angle Transform editor (replaces the generic Quat-xyzw UI).
+        inspector::register_component_editor::<Transform>(app, transform_editor::transform_editor);
 
         // Assets browser: navigation state + modular thumbnail providers + the
         // offscreen render rig that fills material/image thumbnails.
