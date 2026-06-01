@@ -36,6 +36,9 @@ struct SourceKey {
     /// `Some(bits)` or `None`.
     color: [Option<u32>; 4],
     scalars: [Option<u32>; 4],
+    /// Emissive override RGB bit-pattern (`Some` when set), keyed so two volumes with
+    /// different emissive overrides don't collapse to one registry row.
+    emissive: [Option<u32>; 3],
 }
 
 impl SourceKey {
@@ -44,6 +47,10 @@ impl SourceKey {
         let color = match f.base_color {
             Some(c) => [Some(c[0].to_bits()), Some(c[1].to_bits()), Some(c[2].to_bits()), Some(c[3].to_bits())],
             None => [None; 4],
+        };
+        let emissive = match f.emissive {
+            Some(e) => [Some(e[0].to_bits()), Some(e[1].to_bits()), Some(e[2].to_bits())],
+            None => [None; 3],
         };
         SourceKey {
             asset: src.asset.clone(),
@@ -54,6 +61,7 @@ impl SourceKey {
                 f.blend_softness.map(f32::to_bits),
                 f.parallax_scale.map(f32::to_bits),
             ],
+            emissive,
         }
     }
 }
@@ -162,6 +170,8 @@ fn resolve_def(
                         metallic: asset.metallic,
                         roughness: asset.roughness,
                         parallax_scale: asset.parallax_scale,
+                        // Premultiply intensity here so the shader just adds `emissive`.
+                        emissive: Vec3::from(asset.emissive_color) * asset.emissive_intensity,
                         tex_layers: [layer; MATERIAL_TEX_MAPS],
                     }
                 }
@@ -193,6 +203,9 @@ fn apply_overrides(def: &mut MaterialDef, o: &MaterialFields) {
     }
     if let Some(v) = o.parallax_scale {
         def.parallax_scale = v;
+    }
+    if let Some(e) = o.emissive {
+        def.emissive = Vec3::from(e);
     }
 }
 
@@ -228,6 +241,7 @@ fn defs_equal(a: &[MaterialDef], b: &[MaterialDef]) -> bool {
                 && x.metallic == y.metallic
                 && x.roughness == y.roughness
                 && x.parallax_scale == y.parallax_scale
+                && x.emissive == y.emissive
                 && x.tex_layers == y.tex_layers
         })
 }
