@@ -159,11 +159,51 @@ impl Default for MaterialRegistry {
 }
 
 /// Per-edit material reference: an index into [`MaterialRegistry::defs`]. Appearance
-/// lives in the registry (keeps the GPU table static), not on the edit.
+/// lives in the registry (keeps the GPU table static), not on the edit. This id is
+/// **runtime-derived** by `resolve_materials` from each volume's [`SdfMaterialSource`];
+/// it is NOT serialized into a `.scene` (the source is the authored truth).
 #[derive(Component, Reflect, Clone, Copy, Debug, Default)]
 #[reflect(Component)]
+#[reflect(@crate::node::HideFromInspector)]
 pub struct SdfMaterial {
     pub registry_id: u32,
+}
+
+/// Optional per-field overrides applied on top of a base material. `None` = inherit the
+/// base value. `base_color` is linear RGBA stored as `[f32; 4]` (matching `MaterialAsset`,
+/// so RON stays stable and serde-friendly). The scalar fields mirror the editable
+/// `MaterialAsset` knobs. Texture maps are intentionally NOT overridable here yet — the
+/// texture always comes from the base file (scene-level texture override deferred).
+#[derive(Reflect, Clone, Debug, Default, PartialEq)]
+pub struct MaterialFields {
+    pub base_color: Option<[f32; 4]>,
+    pub metallic: Option<f32>,
+    pub roughness: Option<f32>,
+    pub blend_softness: Option<f32>,
+    pub parallax_scale: Option<f32>,
+}
+
+impl MaterialFields {
+    /// Whether any field is set (an actual override exists).
+    pub fn is_empty(&self) -> bool {
+        *self == MaterialFields::default()
+    }
+}
+
+/// The **authored** material of an SDF volume: a base material file and/or per-field
+/// overrides. This is the serialized source of truth (`SdfMaterial.registry_id` is derived
+/// from it by `resolve_materials`):
+/// - `asset: Some(path)`, no overrides → a plain file material.
+/// - `asset: Some(path)` + overrides → a scene-level override of that file's fields.
+/// - `asset: None` → a fully inline/procedural material defined entirely by `overrides`
+///   (e.g. a freshly-spawned primitive's scatter colour).
+#[derive(Component, Reflect, Clone, Debug, Default, PartialEq)]
+#[reflect(Component)]
+pub struct SdfMaterialSource {
+    /// Base material file, relative to `assets/` (e.g. `materials/sand.material.ron`).
+    pub asset: Option<std::path::PathBuf>,
+    /// Per-field overrides applied on top of the base (or the whole material when inline).
+    pub overrides: MaterialFields,
 }
 
 // --- Smooth min/max (iq polynomial) ---

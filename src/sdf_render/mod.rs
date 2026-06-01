@@ -40,6 +40,7 @@ pub mod chunk;
 #[cfg(feature = "editor")]
 pub mod debug;
 pub mod edits;
+pub mod gallery;
 pub mod gizmo;
 pub mod height;
 pub mod node_gizmos;
@@ -52,7 +53,7 @@ use bevy::ecs::system::SystemParam;
 use bevy::input::mouse::{MouseMotion, MouseWheel};
 use bevy::prelude::*;
 
-use crate::scene_manager::{AppScene, SceneEntity};
+use crate::scene_manager::AppScene;
 
 /// Gizmo config group for editor overlays (transform handles, bounds). Uses
 /// `depth_bias = -1.0` so overlays always draw on top of the SDF surface — the
@@ -78,7 +79,7 @@ pub struct SdfNodeGizmos;
 // Edit primitives, CSG ops, ordering, and material live in `edits`. Re-exported
 // here so the rest of the module (and external callers) keep a stable
 // `sdf_render::` path.
-pub use edits::{CsgKind, SdfMaterial, SdfOp, SdfOrder, SdfPrimitive};
+pub use edits::{CsgKind, MaterialFields, SdfMaterial, SdfMaterialSource, SdfOp, SdfOrder, SdfPrimitive};
 
 #[derive(Component, Reflect, Default)]
 #[reflect(Component)]
@@ -424,13 +425,22 @@ impl Plugin for SdfScenePlugin {
             .register_type::<SdfOp>()
             .register_type::<SdfOrder>()
             .register_type::<SdfMaterial>()
+            .register_type::<edits::SdfMaterialSource>()
+            .register_type::<edits::MaterialFields>()
             .register_type::<CsgKind>()
             .register_type::<SdfRaymarchParams>()
             // Spawn the scene. Material ids come from the demand-driven asset table
             // (loaded MaterialAssets get stable registry ids); the compile step in
             // `assets::compile` fills the registry once assets resolve, and the GPU
             // table re-uploads via change detection.
-            .add_systems(OnEnter(AppScene::SdfEditor), setup_sdf_scene)
+            // The viewport camera persists across scene-state transitions (editor infra),
+            // spawned once at startup and activated only while in the SDF editor.
+            .add_systems(Startup, spawn_editor_camera)
+            .add_systems(Update, sync_editor_camera_active)
+            .add_systems(
+                OnEnter(AppScene::SdfEditor),
+                (setup_sdf_scene, load_default_gallery).chain(),
+            )
             // Camera control: skipped when the pointer is over a dock panel (editor
             // sets ViewportInputAllowed). Non-editor build leaves it true.
             .add_systems(
@@ -530,33 +540,31 @@ impl Plugin for SdfScenePlugin {
 
 // --- Scene Setup ---
 
-fn setup_sdf_scene(
-    mut commands: Commands,
-    asset_server: Res<AssetServer>,
-    mut asset_table: ResMut<crate::assets::MaterialAssetTable>,
-) {
-    use crate::assets::MaterialAsset;
-
+fn setup_sdf_scene(mut asset_table: ResMut<crate::assets::MaterialAssetTable>) {
     asset_table.ensure_fallback();
 
-    // Demo materials are authored on-disk resources under `assets/materials/`
-    // (exported once via the `export_demo_materials` test). Load each by name and
-    // register it for a stable registry id; `assets::compile` fills the GPU registry
-    // once the asset resolves. If a file were missing the loader yields an unresolved
-    // handle (the fallback material renders) — but they ship with the project.
-    let mut mat = |name: &str| -> u32 {
-        let handle = asset_server.load::<MaterialAsset>(format!("materials/{name}.material.ron"));
-        asset_table.register(handle)
-    };
+    // Materials are no longer hardcoded here: each volume in the loaded scene carries an
+    // `SdfMaterialSource` (a file path and/or inline overrides), and `resolve_materials`
+    // loads + derives the GPU registry dynamically from whatever the scene contains.
+    //
+    // The viewport camera is EDITOR infrastructure (see `spawn_editor_camera`), not scene
+    // content — it persists across scene loads/switches and is never serialized. The gallery
+    // geometry + light come from `assets/scenes/gallery.scene` via `load_default_gallery`.
+    //
+    // Initial bake happens on the first `schedule_bakes` tick (atlas starts dirty), once the
+    // loaded edit entities exist and the BVH can be built from them.
+}
 
-    let mat_sand = mat("sand");
-    let mat_cobble = mat("cobble");
-    let mat_ground = mat("ground");
-    let mat_red_metal = mat("red_metal");
-    let mat_gold_rough = mat("gold_rough");
-    let mat_white_gloss = mat("white_gloss");
-
-    // Camera
+/// Spawn the persistent editor viewport camera ONCE at startup. It is the single rendering
+/// [`SdfCamera`] (the whole raymarch/interaction pipeline assumes exactly one), marked
+/// [`EditorEntity`] + [`NonSerializable`] so it survives scene loads/switches and never
+/// lands in a `.scene`. It starts inactive; `sync_editor_camera_active` enables it only
+/// while in the SDF editor so it doesn't fight the AdventureGame / WireframeTest cameras.
+/// Guarded so a hot-reload / re-run can't double-spawn it.
+fn spawn_editor_camera(mut commands: Commands, existing: Query<(), With<SdfCamera>>) {
+    if !existing.is_empty() {
+        return;
+    }
     let orbit = SdfOrbitCamera::default();
     let pos = orbit.target
         + Vec3::new(
@@ -566,6 +574,12 @@ fn setup_sdf_scene(
         );
     commands.spawn((
         Camera3d::default(),
+        // Inactive until in the SDF editor scene (see `sync_editor_camera_active`), so the
+        // persistent editor camera doesn't fight other scenes' cameras.
+        Camera {
+            is_active: false,
+            ..default()
+        },
         // HDR so the view target is linear Rgba16Float and Bevy's Tonemapping pass converts
         // (linear→sRGB) for display. The SDF shader then writes LINEAR radiance, which lets the
         // SSR history buffer hold correct linear values for the reflection IBL term. In Bevy
@@ -577,114 +591,43 @@ fn setup_sdf_scene(
         // Target for the filled gizmo overlay (gizmo_render).
         crate::gizmo_render::GizmoCamera,
         DepthPrepass,
-        SceneEntity,
+        crate::scene_manager::EditorEntity,
+        crate::soul_scene::NonSerializable,
         crate::node::Node3D,
-        Name::new("Camera"),
+        Name::new("Editor Camera"),
     ));
     commands.insert_resource(orbit);
+}
 
-    // Demo gallery: a wide, flat sand "ground plane" cube with a spread of distinct
-    // primitives resting on its top surface. All plain unions (no subtracts). The
-    // plane is centred so its top face sits at y = 0; each object's centre is then
-    // placed at y = its half-height so it rests exactly on the surface.
-    // (order, transform, primitive, material)
-    const PLANE_HALF_Y: f32 = 0.15; // thin slab → reads like a plane
-    let demo: [(u32, Transform, SdfPrimitive, u32); 7] = [
-        // Ground plane: wide + thin, top face at y = 0 (centre at y = -half_y).
-        (
-            0,
-            Transform::from_xyz(0.0, -PLANE_HALF_Y, 0.0),
-            SdfPrimitive::Box {
-                half_extents: Vec3::new(4.0, PLANE_HALF_Y, 3.0),
-            },
-            mat_sand,
-        ),
-        // Box resting on the plane (half-height 0.4 → centre at y = 0.4).
-        (
-            1,
-            Transform::from_xyz(-2.4, 0.4, 0.4),
-            SdfPrimitive::Box {
-                half_extents: Vec3::splat(0.4),
-            },
-            mat_cobble,
-        ),
-        // Headline exemplar: deep-red mirror metal sphere (textureless, scalar PBR).
-        (
-            2,
-            Transform::from_xyz(-1.1, 0.55, -0.3),
-            SdfPrimitive::Sphere { radius: 0.55 },
-            mat_red_metal,
-        ),
-        // Torus lies flat: its half-thickness above centre is `minor` (0.18).
-        (
-            3,
-            Transform::from_xyz(0.2, 0.18, 0.5),
-            SdfPrimitive::Torus {
-                major: 0.5,
-                minor: 0.18,
-            },
-            mat_ground,
-        ),
-        // Rough gold metal exemplar: satin highlight, softer sky reflection.
-        (
-            4,
-            Transform::from_xyz(1.3, 0.68, -0.4),
-            SdfPrimitive::Capsule {
-                half_height: 0.4,
-                radius: 0.28,
-            },
-            mat_gold_rough,
-        ),
-        // Cylinder standing up: half-height above centre.
-        (
-            5,
-            Transform::from_xyz(2.4, 0.5, 0.3),
-            SdfPrimitive::Cylinder {
-                radius: 0.4,
-                half_height: 0.5,
-            },
-            mat_cobble,
-        ),
-        // Glossy white dielectric exemplar: near-mirror clearcoat, strong fresnel rim.
-        (
-            6,
-            Transform::from_xyz(0.6, 0.45, -1.1),
-            SdfPrimitive::Sphere { radius: 0.45 },
-            mat_white_gloss,
-        ),
-    ];
-
-    for (order, transform, prim, registry_id) in demo {
-        commands.spawn((
-            transform,
-            prim,
-            SdfOp {
-                kind: CsgKind::Union,
-                smoothing: 0.0,
-            },
-            SdfOrder(order),
-            SdfMaterial { registry_id },
-            SdfVolume,
-            SceneEntity,
-        ));
+/// Activate the editor camera only while in the SDF editor scene. Other app scenes
+/// (AdventureGame, WireframeTest) render their own cameras; deactivating ours keeps exactly
+/// one active camera per window across state transitions.
+fn sync_editor_camera_active(
+    state: Res<State<crate::scene_manager::AppScene>>,
+    mut cam: Query<&mut Camera, With<SdfCamera>>,
+) {
+    if let Ok(mut cam) = cam.single_mut() {
+        let want = *state.get() == crate::scene_manager::AppScene::SdfEditor;
+        if cam.is_active != want {
+            cam.is_active = want;
+        }
     }
+}
 
-    // Directional light so 3D geometry (and debug wireframes) are visible.
-    commands.spawn((
-        DirectionalLight {
-            illuminance: 10000.0,
-            shadows_enabled: false,
-            ..default()
-        },
-        Transform::from_rotation(Quat::from_rotation_x(-0.5)),
-        SceneEntity,
-        crate::node::Node3D,
-        crate::node::EditorGizmo::DirectionalLight { scale: 1.0 },
-        Name::new("Directional Light"),
-    ));
+/// Path to the editor's default scene (the demo gallery), relative to the working dir.
+pub const DEFAULT_SCENE_PATH: &str = "assets/scenes/gallery.scene";
 
-    // Initial bake happens on the first `schedule_bakes` tick (atlas starts
-    // dirty), once the edit entities exist and the BVH can be built from them.
+/// Load the default gallery scene into the world on editor enter. Exclusive (scene load
+/// needs `&mut World` + the type registry). Runs after `setup_sdf_scene` so the materials
+/// it registers exist before the volumes that reference them appear — though the load only
+/// needs the registry, since `registry_id`s are baked into the file.
+fn load_default_gallery(world: &mut World) {
+    let registry = world.resource::<AppTypeRegistry>().clone();
+    let path = std::path::Path::new(DEFAULT_SCENE_PATH);
+    match crate::soul_scene::load_scene(world, path, &registry.read()) {
+        Ok(roots) => info!("loaded default gallery scene ({} roots)", roots.len()),
+        Err(e) => error!("failed to load default gallery scene: {e}"),
+    }
 }
 
 // --- Orbit Camera ---
