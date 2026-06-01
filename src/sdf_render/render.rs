@@ -109,12 +109,31 @@ struct GpuSdfMaterial {
 
 #[derive(Resource, Default)]
 struct ExtractedSdfAtlas {
-    /// Sorted chunk lookup table + packed per-chunk tile runs (see `super::chunk`).
-    /// Populated only when `tables_dirty` (the atlas topology changed); empty otherwise,
-    /// so the GPU prepare keeps the existing buffers instead of rebuilding them.
+    /// FULL-rebuild payload (`full_rebuild`): the entire sorted chunk lookup table
+    /// (`chunk_data`, one row per resident chunk) + the whole packed tile-run buffer
+    /// (`tile_run_data`, capacity-sized, each chunk's 64-entry region at `slot*64`). Used the
+    /// first frame, on a capacity grow, and on the empty-atlas sentinel. See `super::chunk`.
     chunk_data: Vec<GpuChunkLookup>,
     tile_run_data: Vec<GpuBrickTile>,
-    /// Whether `chunk_data`/`tile_run_data` carry a fresh table this frame. False on a
+    /// DELTA payload (`tables_dirty && !full_rebuild`): only the chunk rows and tile-run
+    /// regions (slot → 64-entry region) that changed this frame, plus the sentinel tail to
+    /// blank for removed chunks and the new logical row length. The render world `write_buffer`s
+    /// just these instead of recreating both buffers — the whole point of the incremental path.
+    chunk_row_updates: Vec<(u32, GpuChunkLookup)>,
+    tile_run_updates: Vec<(u32, Vec<GpuBrickTile>)>,
+    /// Rows `[sentinel_tail_from..old_len)` must be overwritten with the `(MAX,MAX)` sentinel key
+    /// (a chunk was removed and the logical length shrank). `None` if no chunk was removed.
+    sentinel_tail_from: Option<u32>,
+    /// Logical chunk-row count after this frame's delta (the shader still binary-searches the full
+    /// physical buffer; sentinel rows past this length never match).
+    new_chunk_len: u32,
+    /// Buffer capacities (rows / tile-run entries) this frame's table needs. `prepare` grows the
+    /// buffers (with headroom) when these exceed the current allocation.
+    chunk_cap_needed: u32,
+    tile_cap_needed: u32,
+    /// True ⇒ upload `chunk_data`/`tile_run_data` wholesale; false ⇒ apply the delta updates.
+    full_rebuild: bool,
+    /// Whether the chunk lookup / tile-run buffers changed at all this frame. False on a
     /// texel-only re-bake — the lookup buffers are reused as-is.
     tables_dirty: bool,
     texture_width: u32,
@@ -134,14 +153,6 @@ struct ExtractedSdfAtlas {
 #[derive(Resource, Default)]
 struct LastAtlasGen(u64);
 
-/// Render-world memo of the last atlas *topology* generation whose chunk lookup / tile-run
-/// tables were uploaded. `extract_sdf_atlas` rebuilds those (O(bricks)) tables and flags
-/// them for re-upload only when this differs, so a frame that only re-baked texels in place
-/// (camera idle, an edit nudged) skips the table rebuild entirely. A realloc always rebuilds
-/// the tables (the texture and its tile layout were recreated).
-#[derive(Resource, Default)]
-struct LastAtlasTopology(u64);
-
 /// Render-world record of how many tile rows the persistent atlas texture currently
 /// spans. `extract_sdf_atlas` reads it to decide grow-vs-partial-upload; the texture
 /// only grows (never shrinks except on a full rebuild), so a tile origin assigned
@@ -149,6 +160,17 @@ struct LastAtlasTopology(u64);
 #[derive(Resource, Default)]
 struct AtlasCapacity {
     rows: u32,
+}
+
+/// Render-world record of the allocated chunk-lookup + tile-run buffer capacities (in rows /
+/// tile-run entries), so `prepare_sdf_atlas_gpu` knows when an incremental delta needs the
+/// buffer grown (recreate larger + full re-upload) versus a plain in-place `write_buffer`.
+/// Both buffers are over-sized with headroom on a rebuild so most frames stay in the cheap
+/// delta path.
+#[derive(Resource, Default)]
+struct ChunkBufCapacity {
+    chunk_rows: u32,
+    tile_slots: u32,
 }
 
 // --- GPU Atlas ---
@@ -1150,8 +1172,8 @@ impl Plugin for SdfRenderPlugin {
             .add_systems(ExtractSchedule, extract_brick_bakes)
             .init_resource::<TextureStreamState>()
             .init_resource::<LastAtlasGen>()
-            .init_resource::<LastAtlasTopology>()
             .init_resource::<AtlasCapacity>()
+            .init_resource::<ChunkBufCapacity>()
             .init_resource::<SdfBakeBuffers>()
             .add_systems(Render, prepare_brick_bake_buffers.before(prepare_sdf_atlas_gpu))
             .add_systems(Render, prepare_sdf_atlas_gpu)
@@ -1598,12 +1620,27 @@ fn tile_origin(tile: u32) -> (u32, u32) {
     (col_px, row_px)
 }
 
+/// Convert a CPU `chunk::ChunkLookup` row to its std430 GPU mirror.
+fn to_gpu_lookup(c: super::chunk::ChunkLookup) -> GpuChunkLookup {
+    GpuChunkLookup {
+        key_hi: c.key_hi,
+        key_lo: c.key_lo,
+        occ_lo: c.occ_lo,
+        occ_hi: c.occ_hi,
+        tile_run_base: c.tile_run_base,
+    }
+}
+
+/// Convert a CPU `chunk::BrickTile` to its std430 GPU mirror.
+fn to_gpu_tile(b: super::chunk::BrickTile) -> GpuBrickTile {
+    GpuBrickTile { atlas_base: b.atlas_base, pal01: b.pal01, pal23: b.pal23 }
+}
+
 fn extract_sdf_atlas(
     atlas: Extract<Res<SdfAtlas>>,
-    config: Extract<Res<SdfGridConfig>>,
     mut last_gen: ResMut<LastAtlasGen>,
-    mut last_topology: ResMut<LastAtlasTopology>,
     mut capacity: ResMut<AtlasCapacity>,
+    mut chunk_cap: ResMut<ChunkBufCapacity>,
     mut commands: Commands,
 ) {
     // Nothing changed since the last upload — skip the rebuild entirely so idle
@@ -1615,15 +1652,19 @@ fn extract_sdf_atlas(
     }
     last_gen.0 = atlas.generation;
 
+    let live = &atlas.live_chunks;
     let num_bricks = atlas.bricks.len() as u32;
     if num_bricks == 0 {
-        // Fully evicted (roamed into empty space). Signal a tables rebuild with EMPTY chunk
-        // data so `prepare_sdf_atlas_gpu` replaces the lookup buffer with a miss-only sentinel.
-        // The shader bounds its search by `arrayLength(&chunk_buf)`, so leaving the old buffer
-        // bound would search stale entries and render ghost geometry.
-        last_topology.0 = atlas.topology_generation;
+        // Fully evicted (roamed into empty space). Signal a full rebuild with EMPTY chunk data
+        // so `prepare_sdf_atlas_gpu` replaces the lookup buffer with a miss-only sentinel. The
+        // shader bounds its search by `arrayLength(&chunk_buf)`, so leaving the old buffer bound
+        // would search stale entries and render ghost geometry. Reset capacity so the next
+        // re-entry triggers a fresh full rebuild rather than a delta against a dropped buffer.
+        chunk_cap.chunk_rows = 0;
+        chunk_cap.tile_slots = 0;
         commands.insert_resource(ExtractedSdfAtlas {
             tables_dirty: true,
+            full_rebuild: true,
             dirty: true,
             ..Default::default()
         });
@@ -1639,79 +1680,70 @@ fn extract_sdf_atlas(
     let required_rows = atlas.tiles.high_water().div_ceil(ATLAS_TILES_PER_ROW).max(1);
     let texture_height = required_rows * edge;
 
-    // Realloc when the atlas must grow taller (the GPU bake never shrinks it). The texture
-    // grows by PRESERVING existing texels: the GPU owns the texels (CPU has only palette-only
-    // placeholders), so `prepare` recreates the taller texture and copies the old content in,
-    // then the bake node fills the genuinely-new tiles this frame. There is no CPU texel
-    // upload — the only realloc kind is this grow.
+    // Realloc when the atlas TEXTURE must grow taller (the GPU bake never shrinks it). This is now
+    // INDEPENDENT of the chunk table: a brick's `atlas_base` is derived from its stable tile index
+    // and is unaffected by the texture's height, so a texture grow never forces a table rebuild.
     let realloc = required_rows > capacity.rows;
-
-    // The chunk lookup / tile-run tables only need rebuilding when the atlas topology
-    // changed (a brick entered/exited, or a palette changed) or on a realloc. A frame
-    // that only re-baked texels in place reuses last frame's buffers — skipping the
-    // O(bricks) table rebuild + full lookup re-upload that ran every applied frame before.
-    let tables_dirty = realloc || atlas.topology_generation != last_topology.0;
-    last_topology.0 = atlas.topology_generation;
-
-    let (chunk_data, tile_run_data) = if tables_dirty {
-        // Build the sorted chunk lookup table + packed per-chunk brick runs from the
-        // resident bricks. Absolute chunk keys (no ring origin) → CPU/GPU agree by
-        // construction. `chunk::build_chunk_tables` owns the grouping + sort.
-        let tables = super::chunk::build_chunk_tables(&atlas, &config, |key| {
-            let tile = atlas
-                .tiles
-                .tile(key)
-                .expect("baked brick must have an allocated tile");
-            let (col_px, row_px) = tile_origin(tile);
-            let p = atlas.bricks[key].palette;
-            super::chunk::BrickTile {
-                atlas_base: col_px | (row_px << 16),
-                pal01: p[0] as u32 | ((p[1] as u32) << 16),
-                pal23: p[2] as u32 | ((p[3] as u32) << 16),
-            }
-        });
-        let chunk_data: Vec<GpuChunkLookup> = tables
-            .chunks
-            .iter()
-            .map(|c| GpuChunkLookup {
-                key_hi: c.key_hi,
-                key_lo: c.key_lo,
-                occ_lo: c.occ_lo,
-                occ_hi: c.occ_hi,
-                tile_run_base: c.tile_run_base,
-            })
-            .collect();
-        let tile_run_data: Vec<GpuBrickTile> = tables
-            .tile_run
-            .iter()
-            .map(|b| GpuBrickTile {
-                atlas_base: b.atlas_base,
-                pal01: b.pal01,
-                pal23: b.pal23,
-            })
-            .collect();
-        (chunk_data, tile_run_data)
-    } else {
-        (Vec::new(), Vec::new())
-    };
-
     if realloc {
         capacity.rows = required_rows;
     }
 
-    // The GPU bake writes all texels directly into the atlas (via the bake node's
-    // copy_buffer_to_texture). The extract only carries the texture-size decision + the chunk
-    // tables: on a grow (`realloc`) `prepare` recreates the taller texture and copies the old
-    // content in; otherwise it keeps the existing texture and the bake node patches tiles.
-    commands.insert_resource(ExtractedSdfAtlas {
-        chunk_data,
-        tile_run_data,
-        tables_dirty,
+    // Decide full rebuild vs incremental delta for the chunk tables. The render world's
+    // `ChunkBufCapacity` is a render-world resource (extract runs in the render world), so extract
+    // owns this decision: rebuild on the first upload (capacity 0) or when the table outgrows the
+    // allocated buffers; otherwise page only the rows/regions the live table marked dirty.
+    let needed_rows = live.row_count();
+    let needed_slots = live.tile_run_capacity();
+    let must_rebuild =
+        chunk_cap.chunk_rows == 0 || needed_rows > chunk_cap.chunk_rows || needed_slots > chunk_cap.tile_slots;
+
+    let mut extracted = ExtractedSdfAtlas {
         texture_width,
         texture_height,
         realloc,
         dirty: true,
-    });
+        ..Default::default()
+    };
+
+    if must_rebuild {
+        // Grow with headroom (+50%, min one chunk's worth) so a steadily-growing scene doesn't
+        // recreate the buffers every frame — most frames then stay on the cheap delta path.
+        let cap_rows = (needed_rows + needed_rows / 2).max(needed_rows + 1);
+        let cap_slots =
+            (needed_slots + needed_slots / 2).max(needed_slots + super::chunk::TILE_RUN_SLOT);
+        chunk_cap.chunk_rows = cap_rows;
+        chunk_cap.tile_slots = cap_slots;
+
+        let (chunks, tile_run) = live.full_tables();
+        extracted.chunk_data = chunks.into_iter().map(to_gpu_lookup).collect();
+        extracted.tile_run_data = tile_run.into_iter().map(to_gpu_tile).collect();
+        extracted.new_chunk_len = needed_rows;
+        extracted.chunk_cap_needed = cap_rows;
+        extracted.tile_cap_needed = cap_slots;
+        extracted.full_rebuild = true;
+        extracted.tables_dirty = true;
+    } else {
+        // Delta: only the rows + tile-run regions the live table marked dirty this frame. The
+        // dirty record is cleared on the main world next frame (`clear_chunk_table_dirty`).
+        let chunk_rows: Vec<(u32, GpuChunkLookup)> = live
+            .dirty_rows
+            .iter()
+            .map(|&r| (r, to_gpu_lookup(live.lookup_at(r))))
+            .collect();
+        let tile_runs: Vec<(u32, Vec<GpuBrickTile>)> = live
+            .dirty_slots
+            .iter()
+            .map(|&s| (s, live.tile_region(s).into_iter().map(to_gpu_tile).collect()))
+            .collect();
+        extracted.tables_dirty =
+            !chunk_rows.is_empty() || !tile_runs.is_empty() || live.sentinel_tail_from.is_some();
+        extracted.chunk_row_updates = chunk_rows;
+        extracted.tile_run_updates = tile_runs;
+        extracted.sentinel_tail_from = live.sentinel_tail_from;
+        extracted.new_chunk_len = needed_rows;
+    }
+
+    commands.insert_resource(extracted);
 }
 
 // --- Extract: Material table ---
@@ -1955,6 +1987,146 @@ fn upload_texture_layers(queue: Res<RenderQueue>, mut stream: ResMut<TextureStre
     }
 }
 
+// --- Prepare: chunk-table upload (full rebuild + incremental delta) ---
+
+/// 20-byte std430 encoding of one chunk lookup row.
+fn encode_lookup(c: &GpuChunkLookup, out: &mut Vec<u8>) {
+    out.extend_from_slice(&c.key_hi.to_le_bytes());
+    out.extend_from_slice(&c.key_lo.to_le_bytes());
+    out.extend_from_slice(&c.occ_lo.to_le_bytes());
+    out.extend_from_slice(&c.occ_hi.to_le_bytes());
+    out.extend_from_slice(&c.tile_run_base.to_le_bytes());
+}
+
+/// 12-byte std430 encoding of one tile-run brick record.
+fn encode_tile(b: &GpuBrickTile, out: &mut Vec<u8>) {
+    out.extend_from_slice(&b.atlas_base.to_le_bytes());
+    out.extend_from_slice(&b.pal01.to_le_bytes());
+    out.extend_from_slice(&b.pal23.to_le_bytes());
+}
+
+/// The 20-byte `(u32::MAX, u32::MAX, 0, 0, 0)` chunk-lookup sentinel. Its key sorts after every
+/// real chunk key, so binary search over the fixed physical buffer never matches a tail slot.
+fn sentinel_row_bytes() -> [u8; 20] {
+    let mut b = [0u8; 20];
+    b[0..4].copy_from_slice(&u32::MAX.to_le_bytes());
+    b[4..8].copy_from_slice(&u32::MAX.to_le_bytes());
+    b
+}
+
+/// Full (re)allocation + upload of both chunk-table buffers, sized to CAPACITY (with headroom)
+/// so later frames can `write_buffer` deltas in place. The chunk-lookup buffer is filled with
+/// `new_chunk_len` live rows followed by sentinel rows to capacity; the tile-run buffer is the
+/// capacity-sized `tile_run_data` (each live slot's region at `slot*64`, gaps zero). Used on the
+/// first upload, a capacity grow, and the empty-atlas case (zero live rows → all sentinel).
+fn upload_tables_full(
+    device: &RenderDevice,
+    gpu_atlas: &mut SdfGpuAtlas,
+    extracted: &ExtractedSdfAtlas,
+) {
+    // Chunk lookup buffer: live rows then sentinel tail to capacity. Capacity is always ≥1 so the
+    // storage buffer is never zero-sized (an empty atlas yields a single sentinel — the prior
+    // dedicated empty path, now folded in here).
+    let cap_rows = extracted.chunk_cap_needed.max(1);
+    let live = extracted.new_chunk_len.min(extracted.chunk_data.len() as u32);
+    let mut chunk_bytes = Vec::with_capacity(cap_rows as usize * 20);
+    for c in extracted.chunk_data.iter().take(live as usize) {
+        encode_lookup(c, &mut chunk_bytes);
+    }
+    let sentinel = sentinel_row_bytes();
+    for _ in live..cap_rows {
+        chunk_bytes.extend_from_slice(&sentinel);
+    }
+    gpu_atlas.lookup_buffer = Some(device.create_buffer_with_data(&BufferInitDescriptor {
+        label: Some("sdf_chunk_lookup_buffer"),
+        contents: &chunk_bytes,
+        usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
+    }));
+
+    // Tile-run buffer: capacity-sized (extract already laid out `tile_run_data` to the slot
+    // high-water; pad to `tile_cap_needed` so deltas into freshly-grown slots have room).
+    let cap_slots = extracted.tile_cap_needed.max(super::chunk::TILE_RUN_SLOT) as usize;
+    let mut tile_bytes = Vec::with_capacity(cap_slots * 12);
+    for b in &extracted.tile_run_data {
+        encode_tile(b, &mut tile_bytes);
+    }
+    tile_bytes.resize(cap_slots * 12, 0);
+    gpu_atlas.chunk_tile_buffer = Some(device.create_buffer_with_data(&BufferInitDescriptor {
+        label: Some("sdf_chunk_tile_buffer"),
+        contents: &tile_bytes,
+        usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
+    }));
+}
+
+/// Incremental upload: `write_buffer` only the chunk rows + tile-run regions that changed this
+/// frame, plus sentinel-blank the rows a removed chunk vacated. The buffers keep their (capacity)
+/// allocation — only the changed byte ranges are touched, so a coarse-LOD snap pages the handful
+/// of dirty chunks instead of recreating the whole ~1 MB table.
+fn upload_tables_delta(
+    queue: &RenderQueue,
+    gpu_atlas: &SdfGpuAtlas,
+    extracted: &ExtractedSdfAtlas,
+) {
+    let (Some(lookup), Some(tiles)) = (&gpu_atlas.lookup_buffer, &gpu_atlas.chunk_tile_buffer)
+    else {
+        return; // no buffers yet (shouldn't happen — first frame is a full rebuild)
+    };
+
+    // Changed chunk-lookup rows (20 B each, at row*20). A structural change marks a contiguous
+    // suffix `[R..end)` dirty (every row at/after an insert/remove shifts), so coalesce consecutive
+    // rows into one `write_buffer` to avoid a long burst of 20-byte writes on a snap frame.
+    let mut run_start: Option<u32> = None;
+    let mut run_bytes: Vec<u8> = Vec::new();
+    let flush = |start: u32, bytes: &[u8]| {
+        if !bytes.is_empty() {
+            queue.write_buffer(lookup, (start as u64) * 20, bytes);
+        }
+    };
+    for (row, c) in &extracted.chunk_row_updates {
+        match run_start {
+            Some(s) if *row == s + (run_bytes.len() as u32 / 20) => {}
+            _ => {
+                if let Some(s) = run_start {
+                    flush(s, &run_bytes);
+                }
+                run_start = Some(*row);
+                run_bytes.clear();
+            }
+        }
+        encode_lookup(c, &mut run_bytes);
+    }
+    if let Some(s) = run_start {
+        flush(s, &run_bytes);
+    }
+
+    // Sentinel-blank the rows a chunk removal vacated: [new_chunk_len .. physical capacity). We
+    // only know the new logical length; overwrite from there to the buffer's end so a shrink never
+    // leaves a stale real key in the searchable range. One coalesced write (the buffer length is
+    // fixed, so the tail span is exact).
+    if let Some(from) = extracted.sentinel_tail_from {
+        let cap_rows = (lookup.size() / 20) as u32;
+        if from < cap_rows {
+            let sentinel = sentinel_row_bytes();
+            let mut tail = Vec::with_capacity((cap_rows - from) as usize * 20);
+            for _ in from..cap_rows {
+                tail.extend_from_slice(&sentinel);
+            }
+            queue.write_buffer(lookup, (from as u64) * 20, &tail);
+        }
+    }
+
+    // Changed tile-run regions (64 entries × 12 B = 768 B each, at slot*64*12).
+    let mut region_bytes = Vec::with_capacity(super::chunk::TILE_RUN_SLOT as usize * 12);
+    for (slot, region) in &extracted.tile_run_updates {
+        region_bytes.clear();
+        for b in region {
+            encode_tile(b, &mut region_bytes);
+        }
+        let base = (*slot as u64) * super::chunk::TILE_RUN_SLOT as u64 * 12;
+        queue.write_buffer(tiles, base, &region_bytes);
+    }
+}
+
 // --- Prepare: Upload to GPU ---
 
 fn prepare_sdf_atlas_gpu(
@@ -1968,58 +2140,12 @@ fn prepare_sdf_atlas_gpu(
         return;
     }
 
-    // Rebuild the chunk lookup + tile-run buffers only when the atlas topology changed
-    // (`tables_dirty`). A texel-only frame (camera idle / an edit nudged in place) reuses
-    // last frame's buffers untouched, skipping the per-frame O(bricks) re-upload.
     if extracted.tables_dirty {
-        if extracted.chunk_data.is_empty() {
-            // Atlas fully evicted. The shader bounds its binary search by
-            // `arrayLength(&chunk_buf)`, so we must NOT leave a stale non-empty buffer bound
-            // (it would search old entries → ghost geometry). Upload a single sentinel whose
-            // key (u32::MAX, u32::MAX) can never match a real chunk key, so every search misses
-            // and the scene renders empty. (A zero-length storage buffer is invalid.)
-            let mut bytes = Vec::with_capacity(20);
-            bytes.extend_from_slice(&u32::MAX.to_le_bytes()); // key_hi
-            bytes.extend_from_slice(&u32::MAX.to_le_bytes()); // key_lo
-            bytes.extend_from_slice(&0u32.to_le_bytes()); // occ_lo
-            bytes.extend_from_slice(&0u32.to_le_bytes()); // occ_hi
-            bytes.extend_from_slice(&0u32.to_le_bytes()); // tile_run_base
-            gpu_atlas.lookup_buffer = Some(device.create_buffer_with_data(&BufferInitDescriptor {
-                label: Some("sdf_chunk_lookup_buffer"),
-                contents: &bytes,
-                usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
-            }));
-            return;
+        if extracted.full_rebuild {
+            upload_tables_full(&device, &mut gpu_atlas, &extracted);
+        } else {
+            upload_tables_delta(&queue, &gpu_atlas, &extracted);
         }
-
-        // Chunk lookup table (std430: 5 × u32 per entry), sorted by absolute key — the
-        // shader binary-searches it.
-        let mut chunk_bytes = Vec::with_capacity(extracted.chunk_data.len() * 20);
-        for c in &extracted.chunk_data {
-            chunk_bytes.extend_from_slice(&c.key_hi.to_le_bytes());
-            chunk_bytes.extend_from_slice(&c.key_lo.to_le_bytes());
-            chunk_bytes.extend_from_slice(&c.occ_lo.to_le_bytes());
-            chunk_bytes.extend_from_slice(&c.occ_hi.to_le_bytes());
-            chunk_bytes.extend_from_slice(&c.tile_run_base.to_le_bytes());
-        }
-        gpu_atlas.lookup_buffer = Some(device.create_buffer_with_data(&BufferInitDescriptor {
-            label: Some("sdf_chunk_lookup_buffer"),
-            contents: &chunk_bytes,
-            usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
-        }));
-
-        // Packed per-chunk brick tile-run buffer (std430: 3 × u32 per resident brick).
-        let mut tile_bytes = Vec::with_capacity(extracted.tile_run_data.len() * 12);
-        for b in &extracted.tile_run_data {
-            tile_bytes.extend_from_slice(&b.atlas_base.to_le_bytes());
-            tile_bytes.extend_from_slice(&b.pal01.to_le_bytes());
-            tile_bytes.extend_from_slice(&b.pal23.to_le_bytes());
-        }
-        gpu_atlas.chunk_tile_buffer = Some(device.create_buffer_with_data(&BufferInitDescriptor {
-            label: Some("sdf_chunk_tile_buffer"),
-            contents: &tile_bytes,
-            usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
-        }));
     }
 
     if extracted.realloc {

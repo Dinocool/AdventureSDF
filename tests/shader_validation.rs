@@ -191,9 +191,9 @@ fn sdf_debug_modes_validate() {
 /// remain in `pbr.wgsl`, consumed by the composite.)
 #[test]
 fn sdf_feature_defs_validate() {
-    for def in ["SDF_SHADOWS"] {
-        validate_composed_sdf_with_defs(&[def]).unwrap_or_else(|e| panic!("{e}"));
-    }
+    // Only SDF_SHADOWS remains a standalone feature def (reflections were removed); validate it
+    // composes on its own so errors inside its `#ifdef` branch are caught.
+    validate_composed_sdf_with_defs(&["SDF_SHADOWS"]).unwrap_or_else(|e| panic!("{e}"));
 }
 
 /// Compose + validate a STANDALONE entry shader that imports only the named binding-free helper
