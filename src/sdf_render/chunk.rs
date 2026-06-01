@@ -347,7 +347,7 @@ mod tests {
         use crate::sdf_render::edits::{PALETTE_EMPTY, PALETTE_K};
         PackedBrick {
             palette: [PALETTE_EMPTY; PALETTE_K],
-            baked_epoch: 0,
+            baked_hash: 0,
         }
     }
 

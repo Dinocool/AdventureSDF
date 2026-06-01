@@ -55,6 +55,26 @@ impl SdfPrimitive {
     pub fn sphere() -> Self {
         Self::Sphere { radius: 0.5 }
     }
+
+    /// Fold this primitive's shape params (quantized — see [`bake_content_hash`]) + a per-variant
+    /// discriminant into a hasher, for the per-brick bake-cache key.
+    pub fn hash_params(&self, h: &mut impl std::hash::Hasher) {
+        let f = |h: &mut dyn std::hash::Hasher, x: f32| h.write_i64(quantize(x));
+        match *self {
+            SdfPrimitive::Sphere { radius } => { h.write_u8(0); f(h, radius); }
+            SdfPrimitive::Box { half_extents } => {
+                h.write_u8(1); f(h, half_extents.x); f(h, half_extents.y); f(h, half_extents.z);
+            }
+            SdfPrimitive::Torus { major, minor } => { h.write_u8(2); f(h, major); f(h, minor); }
+            SdfPrimitive::Capsule { half_height, radius } => { h.write_u8(3); f(h, half_height); f(h, radius); }
+            SdfPrimitive::Cylinder { radius, half_height } => { h.write_u8(4); f(h, radius); f(h, half_height); }
+            SdfPrimitive::Heightmap { half_xz, max_height, freq, amp, seed } => {
+                h.write_u8(5);
+                f(h, half_xz.x); f(h, half_xz.y); f(h, max_height); f(h, freq); f(h, amp);
+                h.write_u32(seed);
+            }
+        }
+    }
 }
 
 /// CSG combination operator for an edit.
@@ -278,6 +298,121 @@ fn height_sample(xz: Vec2, freq: f32, amp: f32, seed: u32) -> f32 {
     let ab = a + (b - a) * u.x;
     let cd = c + (d - c) * u.x;
     (ab + (cd - ab) * u.y) * amp
+}
+
+/// World-space surface height of a translation-placed [`SdfPrimitive::Heightmap`] at world
+/// XZ `(x, z)`. Mirrors the field's zero-crossing in [`eval_primitive`]
+/// (`local.y == height_sample + max_height/2`), shifted by the heightmap entity's `world_y`.
+/// Lets callers rest objects exactly on the terrain. Only valid for a translation-only
+/// heightmap transform (the gallery's case), where world XZ == local XZ.
+pub fn heightmap_surface_y(
+    x: f32,
+    z: f32,
+    max_height: f32,
+    freq: f32,
+    amp: f32,
+    seed: u32,
+    world_y: f32,
+) -> f32 {
+    height_sample(Vec2::new(x, z), freq, amp, seed) + max_height * 0.5 + world_y
+}
+
+/// One spawned demo edit: evaluation order, world transform, primitive, and material registry id.
+/// The runtime scene spawns these as entities; the bake regression test folds the same list into a
+/// scheduler — so both exercise byte-identical geometry.
+pub type DemoEdit = (SdfOrder, Transform, SdfPrimitive, u32);
+
+/// Build the demo gallery deterministically: a wide procedural heightmap ground plus a ring of
+/// cube-towers resting on its surface, each tower a stack of unit cubes at pseudo-random yaw/pitch
+/// and topped by a red sphere. Pure and seed-driven (no RNG state) so the runtime scene and the
+/// bake-cache regression test produce the exact same edits. `ground_mat`/`cube_mat`/`sphere_mat`
+/// are the caller's registered material ids (runtime: the loaded assets; test: arbitrary ids).
+///
+/// Heavy on edit count (towers × cubes) by design: it stresses the BVH cull + the per-edit AABB
+/// refine that keeps a moved tower from re-baking its neighbours' bricks.
+pub fn gallery_demo_edits(ground_mat: u32, cube_mat: u32, sphere_mat: u32) -> Vec<DemoEdit> {
+    use super::scatter::{scatter_on_surface, ScatterParams};
+
+    const GROUND_Y: f32 = -30.0;
+    const MAX_HEIGHT: f32 = 20.0;
+    const FREQ: f32 = 0.02;
+    const AMP: f32 = 5.0;
+    const SEED: u32 = 1337;
+    const CUBES_PER_TOWER: u32 = 4;
+    const CUBE_HALF: f32 = 0.4;
+    // ~10 m spacing over a ±270 m region → a ~55×55 lattice ≈ 3000 towers.
+    const SCATTER: ScatterParams = ScatterParams {
+        half_extent: 270.0,
+        spacing: 10.0,
+        jitter: 0.4,
+        keep_prob: 1.0,
+        seed: SEED,
+    };
+
+    let mut out: Vec<DemoEdit> = Vec::new();
+    let mut order = 0u32;
+    let mut push = |o: &mut u32, t: Transform, p: SdfPrimitive, m: u32| {
+        out.push((SdfOrder(*o), t, p, m));
+        *o += 1;
+    };
+
+    // Ground: large procedural heightmap, dropped below the origin so the towers sit above it.
+    push(
+        &mut order,
+        Transform::from_xyz(0.0, GROUND_Y, 0.0),
+        SdfPrimitive::Heightmap {
+            half_xz: Vec2::new(1000.0, 1000.0),
+            max_height: MAX_HEIGHT,
+            freq: FREQ,
+            amp: AMP,
+            seed: SEED,
+        },
+        ground_mat,
+    );
+
+    // Thousands of cube-towers scattered across the terrain via the reusable scatter module. Each
+    // scatter point lands a tower of rotated cubes (per-edit rotation derived from the point hash),
+    // capped by a red sphere. Heavy edit count stresses the BVH cull + per-edit AABB refine.
+    let towers = scatter_on_surface(&SCATTER, |x, z| {
+        heightmap_surface_y(x, z, MAX_HEIGHT, FREQ, AMP, SEED, GROUND_Y)
+    });
+    for (base, h) in towers {
+        let (tx, base_y, tz) = (base.x, base.y, base.z);
+        for c in 0..CUBES_PER_TOWER {
+            // Stack the cubes; first cube rests its base on the terrain (centre at +half).
+            let cy = base_y + CUBE_HALF + (c as f32) * (2.0 * CUBE_HALF);
+            // Deterministic pseudo-random yaw/pitch from the point hash + cube index.
+            let r1 = unit_from_hash(h ^ (c.wrapping_mul(0x9E37)).wrapping_add(1)) * std::f32::consts::PI;
+            let r2 = unit_from_hash(h.rotate_left(7) ^ (c.wrapping_mul(0x85EB)).wrapping_add(3)) * std::f32::consts::PI;
+            let rot = Quat::from_euler(EulerRot::YXZ, r1, r2 * 0.35, 0.0);
+            push(
+                &mut order,
+                Transform {
+                    translation: Vec3::new(tx, cy, tz),
+                    rotation: rot,
+                    scale: Vec3::ONE,
+                },
+                SdfPrimitive::Box { half_extents: Vec3::splat(CUBE_HALF) },
+                cube_mat,
+            );
+        }
+
+        // Red sphere capping the tower.
+        let top_y = base_y + (CUBES_PER_TOWER as f32) * (2.0 * CUBE_HALF) + 0.45;
+        push(
+            &mut order,
+            Transform::from_xyz(tx, top_y, tz),
+            SdfPrimitive::Sphere { radius: 0.45 },
+            sphere_mat,
+        );
+    }
+
+    out
+}
+
+/// Map a 32-bit hash to `[-1, 1)` — for deriving per-edit rotation from a scatter point hash.
+fn unit_from_hash(h: u32) -> f32 {
+    (h as f32 / u32::MAX as f32) * 2.0 - 1.0
 }
 
 /// Hash an integer lattice point to [-1, 1].
@@ -563,6 +698,48 @@ pub fn fold_csg(edits: &[ResolvedEdit], pos: Vec3) -> EditSample {
 
 /// Signed distance of the folded CSG stack at `pos`, evaluating only the edits at
 /// `indices` (into the already-`SdfOrder`-sorted `edits`). Same fold rules as
+/// Content hash of the edits a brick folds — its bake-cache key. A brick re-bakes IFF this
+/// changes, so a brick whose folded edits are untouched (e.g. a heightmap brick when a distant
+/// sphere moves) keeps its cached texels even though SOME edit in the world changed. This is the
+/// general fix for "moving one edit re-bakes everything its coarse footprint overlaps": there's
+/// no global epoch — each brick is memoised by exactly the content it contains.
+///
+/// Hashes, in fold order, each edit's index + the values that affect its baked distance: the
+/// model→local inverse matrix (captures translation/rotation/scale), the op (kind + smoothing +
+/// material), and the primitive params. Order matters (CSG is non-commutative), so the index is
+/// folded in too.
+///
+/// Floats are QUANTIZED (not bit-hashed) before folding, via [`quantize`]: `GlobalTransform`
+/// recomputes `inv_model` every frame with sub-ULP jitter (a stationary edit reads e.g. 1.1 one
+/// frame and 1.1000061 the next), so bit-exact hashing would change the hash every frame and
+/// re-bake a brick that did not move — defeating the cache. Rounding to a fine grid (~0.1 mm)
+/// makes an unmoved edit hash stably while still distinguishing any real edit. (Also collapses
+/// -0.0/+0.0, which differ in bits.) The grid is far finer than a voxel, so it never merges two
+/// genuinely-different bakes.
+pub fn bake_content_hash(edits: &[ResolvedEdit], indices: &[u32]) -> u64 {
+    use std::hash::Hasher;
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    for &i in indices {
+        let e = &edits[i as usize];
+        h.write_u32(i);
+        for v in e.inv_model.to_cols_array() {
+            h.write_i64(quantize(v));
+        }
+        h.write_u32((e.op.kind as u32).rotate_left(1));
+        h.write_i64(quantize(e.op.smoothing));
+        h.write_u16(e.material_id);
+        e.prim.hash_params(&mut h);
+    }
+    h.finish()
+}
+
+/// Quantize a float to a fixed grid for stable hashing (see [`bake_content_hash`]). 1e4 = 0.1 mm
+/// world precision — finer than any voxel, coarser than `GlobalTransform`'s per-frame jitter.
+#[inline]
+pub fn quantize(v: f32) -> i64 {
+    (v as f64 * 1.0e4).round() as i64
+}
+
 /// [`fold_csg`] but distance-only and allocation-free — for the narrow-band interior
 /// cull, which folds at one point per candidate brick without cloning the edit subset.
 pub fn fold_csg_dist_indexed(edits: &[ResolvedEdit], indices: &[u32], pos: Vec3) -> f32 {

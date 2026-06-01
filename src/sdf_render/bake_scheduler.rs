@@ -99,6 +99,18 @@ pub struct BakeScheduler {
     ring_chunk_origin: Vec<IVec3>,
     /// Chunk keys awaiting a bake (deduped).
     pending: std::collections::HashSet<chunk::ChunkKey>,
+    /// Reusable emit scratch (cleared + refilled each frame) so a continuous drag does zero
+    /// growth reallocation. `mem::take`n into `emit_gpu_bakes` and restored at the end.
+    emit_scratch: EmitScratch,
+}
+
+/// Per-frame scratch buffers for `emit_gpu_bakes`, held on the scheduler so their capacity
+/// persists across frames instead of allocating from empty each emit.
+#[derive(Default)]
+struct EmitScratch {
+    drained: Vec<chunk::ChunkKey>,
+    candidates: Vec<(chunk::ChunkKey, atlas::BrickKey)>,
+    spilled: std::collections::HashSet<chunk::ChunkKey>,
 }
 
 impl Default for BakeScheduler {
@@ -109,6 +121,7 @@ impl Default for BakeScheduler {
             height: Arc::new(super::height::HeightField::default()),
             ring_chunk_origin: Vec::new(),
             pending: std::collections::HashSet::new(),
+            emit_scratch: EmitScratch::default(),
         }
     }
 }
@@ -124,12 +137,13 @@ impl BakeScheduler {
 /// Max brick bake JOBS emitted to the GPU per frame. Each job writes its
 /// brick's texels into two storage buffers sized `jobs × tile`; the material buffer
 /// dominates at `1024 u32 × 4 B = 4096 B/job`, so the GPU's `maxStorageBufferBindingSize`
-/// (128 MB default) caps us at ~32768 jobs. 16384 leaves headroom (64 MB mat + 32 MB dist)
-/// and is a clean 256×64 dispatch grid. A single huge edit can dirty 70k+ bricks; the
-/// overflow spills back to `pending` and bakes over the next frames (coarse LOD covers the
-/// gap meanwhile — see `emit_gpu_bakes`). Without this cap a giant edit overflows the buffer
-/// binding and wgpu aborts the frame.
-const GPU_BAKE_JOB_CAP: usize = 16384;
+/// (128 MB default) caps us at ~32768 jobs. 8192 sits well under that (32 MB mat + 16 MB dist)
+/// AND keeps the per-frame bake-node dispatch small enough to avoid a visible stutter when the
+/// cap is hit every frame (a continuously-dragged edit). A single huge edit can dirty 70k+
+/// bricks; the overflow spills back to `pending` and bakes over the next frames (coarse LOD
+/// covers the gap meanwhile — see `emit_gpu_bakes`). Without this cap a giant edit overflows the
+/// buffer binding and wgpu aborts the frame.
+const GPU_BAKE_JOB_CAP: usize = 8192;
 
 /// Any component that affects an edit's baked result. A change to one of these
 /// triggers a targeted rebake of the bricks the edit touches. Exposed as
@@ -204,6 +218,7 @@ fn chunk_in_window(c: IVec3, origin: IVec3, r: i32) -> bool {
     rel.x >= 0 && rel.y >= 0 && rel.z >= 0 && rel.x < r && rel.y < r && rel.z < r
 }
 
+
 /// Every chunk key in the `R³` window with corner `origin` at `lod`.
 fn chunk_window_keys(origin: IVec3, r: i32, lod: u32) -> impl Iterator<Item = chunk::ChunkKey> {
     (0..r).flat_map(move |iz| {
@@ -214,20 +229,30 @@ fn chunk_window_keys(origin: IVec3, r: i32, lod: u32) -> impl Iterator<Item = ch
 }
 
 /// All brick keys belonging to chunk `ck` (its `CHUNK_BRICKS³` local slots).
+#[cfg(test)]
 fn chunk_brick_keys(ck: chunk::ChunkKey, config: &SdfGridConfig) -> Vec<atlas::BrickKey> {
+    let mut keys = Vec::with_capacity(chunk::CHUNK_VOLUME as usize);
+    for_each_brick_key(ck, config, |k| keys.push(k));
+    keys
+}
+
+/// Allocation-free counterpart of [`chunk_brick_keys`]: invoke `f` for each of a chunk's 64
+/// brick keys without building a Vec. The bake emit's serial gather/apply loops run this over
+/// the entire dirty set (thousands of chunks on a terrain-scale heightmap move), so avoiding a
+/// per-chunk 64-element heap alloc there is a measurable win (emit phases 1+3 were ~20ms spikes).
+#[inline]
+fn for_each_brick_key(ck: chunk::ChunkKey, config: &SdfGridConfig, mut f: impl FnMut(atlas::BrickKey)) {
     let s = config.cell_stride();
     let c = chunk::CHUNK_BRICKS;
     let base = ck.coord * c; // brick-index space
-    let mut keys = Vec::with_capacity(chunk::CHUNK_VOLUME as usize);
     for lz in 0..c {
         for ly in 0..c {
             for lx in 0..c {
                 let bi = base + IVec3::new(lx, ly, lz);
-                keys.push(atlas::BrickKey::new(ck.lod, bi * s)); // back to coord space
+                f(atlas::BrickKey::new(ck.lod, bi * s)); // back to coord space
             }
         }
     }
-    keys
 }
 
 /// The chunks at `lod` whose world extent overlaps `aabb` (grown by the bake footprint
@@ -285,7 +310,17 @@ pub fn schedule_bakes(
     volumes: Query<VolumeQueryData, With<SdfVolume>>,
     changed: Query<Entity, (With<SdfVolume>, ChangedEdit)>,
     camera: Query<&Transform, (With<SdfCamera>, Without<SdfVolume>)>,
+    mut baked_dbg: ResMut<super::BakedBrickDebug>,
+    time: Res<Time>,
 ) {
+    // Diagnostic: prune baked-brick markers older than the fade window (entries ACCUMULATE across
+    // frames so they can fade out — see BakedBrickDebug); `emit_gpu_bakes` appends new ones.
+    let now = time.elapsed_secs();
+    if baked_dbg.enabled {
+        baked_dbg.bricks.retain(|&(_, _, t)| now - t < super::BAKED_BRICK_FADE_SECS);
+    } else {
+        baked_dbg.bricks.clear();
+    }
     // GPU bake jobs are rebuilt from scratch each frame; the render world consumed last
     // frame's. `gpu_baked_tiles` likewise holds only THIS frame's GPU-written tiles.
     gpu_bakes.clear();
@@ -313,10 +348,32 @@ pub fn schedule_bakes(
         *bvh = new_bvh.clone();
         sched.bvh = Arc::new(new_bvh);
         sched.edits = Arc::new(resolved);
-        // Any edit change invalidates the per-brick bake cache: every brick baked under the
-        // old epoch folded the old edit set, so its texels may be stale. Bumping forces the
-        // re-dirtied chunks below to actually re-bake (their bricks' `baked_epoch` now lags).
-        atlas.edit_epoch = atlas.edit_epoch.wrapping_add(1);
+        // NOTE: no global cache-invalidation here. Each brick is memoised by a CONTENT HASH of
+        // the edits it folds (`PackedBrick::baked_hash`), so a re-dirtied chunk re-bakes only the
+        // bricks whose folded content actually changed — moving one edit no longer invalidates
+        // every brick its coarse footprint overlaps (see the Phase-3 hash skip in emit_gpu_bakes).
+
+        // DIAGNOSTIC: log WHY a rebake fired and WHICH entities changed, so we can see if moving
+        // one small edit wrongly drags a terrain-scale edit into `changed` (→ full-ring re-dirty).
+        if baked_dbg.enabled {
+            let changed_list: Vec<(String, f32)> = changed
+                .iter()
+                .filter_map(|e| {
+                    current.get(&e).map(|aabb| {
+                        let he = Vec3::from(aabb.max) - Vec3::from(aabb.min);
+                        // a size bucket label + the AABB's largest extent
+                        let span = he.max_element();
+                        let label = if span > 100.0 { "HUGE" } else if span > 5.0 { "big" } else { "small" };
+                        (label.to_string(), span)
+                    })
+                })
+                .collect();
+            info!(
+                "rebake: rebake_all={} set_changed={} changed_n={} whole_ring={} | {:?}",
+                atlas.rebake_all, set_changed, changed.iter().count(),
+                atlas.rebake_all || set_changed, changed_list,
+            );
+        }
 
         if atlas.rebake_all || set_changed {
             // Whole set changed → re-dirty every resident-window chunk at each LOD.
@@ -328,9 +385,12 @@ pub fn schedule_bakes(
             }
             atlas.rebake_all = false;
         } else {
-            // Existing edits moved → dirty the chunks over each changed edit's old∪new
-            // footprint, clamped to the resident window for that LOD.
+            // Existing edits moved → dirty the chunks over each changed edit's old∪new footprint,
+            // clamped to the resident window for that LOD.
             for entity in &changed {
+                let old = prev_aabbs.map.get(&entity);
+                let new = current.get(&entity);
+
                 for lod in 0..lod_count {
                     let origin = ring_chunk_origin(&config, camera_pos, lod);
                     // `chunks_in_aabb_windowed` already clamps to the window, so no per-key
@@ -342,10 +402,10 @@ pub fn schedule_bakes(
                             sched.pending.insert(ck);
                         }
                     };
-                    if let Some(old) = prev_aabbs.map.get(&entity) {
+                    if let Some(old) = old {
                         dirty_one(old);
                     }
-                    if let Some(new) = current.get(&entity) {
+                    if let Some(new) = new {
                         dirty_one(new);
                     }
                 }
@@ -381,9 +441,9 @@ pub fn schedule_bakes(
             for ck in chunk_window_keys(old_origin, r, lod) {
                 if !chunk_in_window(ck.coord, new_origin, r) {
                     sched.pending.remove(&ck);
-                    for bk in chunk_brick_keys(ck, &config) {
+                    for_each_brick_key(ck, &config, |bk| {
                         atlas.remove_brick(&bk);
-                    }
+                    });
                 }
             }
         }
@@ -393,7 +453,23 @@ pub fn schedule_bakes(
     // --- 3. Emit GPU bake jobs for the dirty chunks ----------------------------------
     // The CPU does only topology (BVH cull + palette + tile alloc) and emits a GpuBakeJob per
     // brick; the compute shader fills the texels.
-    emit_gpu_bakes(&mut atlas, &mut sched, &mut gpu_bakes, &config);
+    //
+    emit_gpu_bakes(&mut atlas, &mut sched, &mut gpu_bakes, &config, camera_pos, &mut baked_dbg, now);
+
+    // DIAGNOSTIC: per-LOD baked-job histogram this frame + remaining `pending` backlog. Shows
+    // whether a small edit's cost is spread across coarse LODs (each coarse chunk = 64 huge
+    // bricks) and how much spilled. Gated on the overlay toggle so it's silent in normal use.
+    if baked_dbg.enabled && !gpu_bakes.jobs.is_empty() {
+        let mut by_lod = [0u32; 16];
+        for j in &gpu_bakes.jobs {
+            if (j.lod as usize) < by_lod.len() {
+                by_lod[j.lod as usize] += 1;
+            }
+        }
+        let nonzero: Vec<(usize, u32)> = by_lod.iter().enumerate()
+            .filter(|(_, n)| **n > 0).map(|(l, n)| (l, *n)).collect();
+        info!("  baked jobs={} pending_backlog={} by_lod={:?}", gpu_bakes.jobs.len(), sched.pending.len(), nonzero);
+    }
 }
 
 /// Narrow-band cull decision for one candidate brick: KEEP iff the folded isosurface can pass
@@ -421,13 +497,20 @@ fn narrow_band_keep(
     key: atlas::BrickKey,
 ) -> bool {
     let brick_world = config.brick_world_size(key.lod);
-    let center = config.brick_min_world(key.coord, key.lod) + Vec3::splat(0.5 * brick_world);
+    let brick_min = config.brick_min_world(key.coord, key.lod);
+    let center = brick_min + Vec3::splat(0.5 * brick_world);
 
     // Smoothing pad: additive Σ(kᵢ)/4 over the brick's smoothed candidate edits.
     let smooth_sum: f32 = indices
         .iter()
         .map(|&i| edits[i as usize].op.smoothing.max(0.0))
         .sum();
+    // CONSERVATIVE reach: circumradius + the LOD's distance band + smoothing pad. The
+    // `dist_band` term is a deliberate safety margin — it only ever makes us KEEP a brick the
+    // center test would otherwise drop, never the reverse, so it cannot introduce a hole. (It is
+    // largely subsumed by `cull_edit_indices` already culling on the raw brick AABB, but is kept
+    // because proving it strictly redundant at coarse-LOD corners is fragile and the cost is one
+    // add. The over-keep halo it allows is a one-time first-bake cost, not a per-frame drag cost.)
     let reach = brick_world * (0.5 * 3.0_f32.sqrt())
         + atlas::dist_band_world(config, key.lod)
         + 0.25 * smooth_sum;
@@ -462,6 +545,9 @@ fn emit_gpu_bakes(
     sched: &mut BakeScheduler,
     gpu_bakes: &mut PendingGpuBakes,
     config: &SdfGridConfig,
+    camera_pos: Vec3,
+    baked_dbg: &mut super::BakedBrickDebug,
+    now_secs: f32,
 ) {
     let _span = info_span!("sdf_emit_gpu_bakes").entered();
     let edits_snapshot = Arc::clone(&sched.edits);
@@ -516,23 +602,50 @@ fn emit_gpu_bakes(
     //  2. Coarse LODs emit before fine (sort dirty chunks by DESCENDING lod). Coarse rings
     //     have ~8× fewer bricks per level, so they always fit; if the cap is hit it only ever
     //     spills the finest detail, whose coarse fallback is already resident this frame.
-    let mut drained: Vec<chunk::ChunkKey> = sched.pending.drain().collect();
-    drained.sort_unstable_by_key(|ck| std::cmp::Reverse(ck.lod)); // coarsest (highest lod) first
-    let epoch = atlas.edit_epoch;
+    // Take the reusable scratch out of the scheduler so `sched` is free for `pending` below;
+    // restored at the end (keeps its capacity across frames → zero growth realloc while dragging).
+    let mut scratch = std::mem::take(&mut sched.emit_scratch);
+    scratch.drained.clear();
+    scratch.candidates.clear();
+    scratch.spilled.clear();
+    scratch.drained.extend(sched.pending.drain());
+    let drained = &mut scratch.drained;
+    // Order: coarsest LOD first (so the ring fills 8→0 and the cap only ever spills fine detail
+    // whose coarse fallback is already resident), then — within an LOD — NEAREST the camera first,
+    // so the chunks the viewer is looking at bake before distant ones. Distance is a cheap squared
+    // chunk-center metric; the sort is over a few hundred chunks so it costs next to nothing.
+    drained.sort_unstable_by_key(|ck| {
+        let size = chunk::chunk_world_size(ck.lod, config);
+        let center = chunk::chunk_min_world(*ck, config) + Vec3::splat(size * 0.5);
+        let d2 = center.distance_squared(camera_pos);
+        (std::cmp::Reverse(ck.lod), d2.to_bits())
+    });
 
-    // --- Phase 1 (serial, cheap): gather candidate bricks, applying the epoch skip ----------
-    // Skip a brick already baked under the CURRENT edit epoch: it's resident (GPU holds its
-    // texels, the lookup maps it) and folded the same edits, so re-baking is pure waste — this
-    // keeps a large object's multi-frame bake cheap. The skip reads `atlas.bricks`, so it stays
-    // serial here; everything past it is read-only per brick and runs in parallel below. Each
-    // candidate carries its source ChunkKey so a job-capped (spilled) brick re-queues its chunk.
-    let mut candidates: Vec<(chunk::ChunkKey, atlas::BrickKey)> = Vec::new();
-    for ck in &drained {
-        for key in chunk_brick_keys(*ck, config) {
-            if atlas.bricks.get(&key).is_some_and(|b| b.baked_epoch == epoch) {
+    // --- Phase 1 (serial, cheap): gather candidate bricks ----------------------------------
+    // The bake-cache skip is no longer here — it needs each brick's CULLED edit set to compute
+    // its content hash, which Phase 2 produces. So Phase 1 just gathers every brick of a non-empty
+    // chunk; Phase 3 skips a Keep whose content hash matches the resident brick's. Each candidate
+    // carries its source ChunkKey so a job-capped (spilled) brick re-queues its chunk.
+    let candidates = &mut scratch.candidates;
+    {
+        let _g = info_span!("emit_phase1_gather").entered();
+        let mut cull_scratch: Vec<u32> = Vec::new();
+        for ck in drained.iter() {
+            // CHUNK-LEVEL EMPTY PRE-CULL: one BVH query on the whole chunk AABB instead of 64
+            // per-brick queries. If no edit reaches the chunk it has nothing to bake — skip all
+            // 64 children. A heightmap's dirtied ring is mostly empty space above/below the thin
+            // surface, so this prunes the bulk of the gather at 1/64 the BVH cost. BUT a chunk
+            // that became empty after a move may still hold RESIDENT bricks that must be evicted,
+            // so we still drop any residents before skipping (cheap: only touches resident keys).
+            if !chunk_has_geometry(*ck, &bvh_snapshot, config, &mut cull_scratch) {
+                for_each_brick_key(*ck, config, |key| {
+                    atlas.remove_brick(&key); // no-op if not resident
+                });
                 continue;
             }
-            candidates.push((*ck, key));
+            for_each_brick_key(*ck, config, |key| {
+                candidates.push((*ck, key));
+            });
         }
     }
 
@@ -545,14 +658,23 @@ fn emit_gpu_bakes(
     enum Verdict {
         Empty,                                   // no edit reaches it → evict
         Drop,                                    // narrow-band cull → evict
-        Keep(edits::Palette, Vec<u32>),          // bake: palette + culled edit indices
+        Skip,                                    // resident with matching content hash → leave as-is
+        Keep(edits::Palette, Vec<u32>, u64),     // bake: palette + culled edit indices + content hash
     }
+    // Resident bricks snapshot for the content-hash peek (immutable borrow; ends before Phase 3's
+    // `&mut atlas`). `par_chunk_map` runs the closure on a shared `&` so this is safe to capture.
+    let resident = &atlas.bricks;
     let classify = |_idx: usize, chunk: &[(chunk::ChunkKey, atlas::BrickKey)]| -> Vec<Verdict> {
+        // Per-task reusable scratch: BVH traversal stack + cull-index buffer (zero per-brick
+        // alloc), and a memo so an edit-set folded by many bricks (e.g. every heightmap brick
+        // folds `[heightmap_idx]`) hashes ONCE per unique set, not per brick.
         let mut scratch: Vec<u32> = Vec::new();
+        let mut stack: Vec<u32> = Vec::new();
+        let mut hash_memo: std::collections::HashMap<Box<[u32]>, u64> = std::collections::HashMap::new();
         chunk
             .iter()
             .map(|&(_ck, key)| {
-                if atlas::SdfAtlas::cull_edit_indices(key, &bvh_snapshot, config, &mut scratch)
+                if atlas::SdfAtlas::cull_edit_indices_with(key, &bvh_snapshot, config, &mut scratch, &mut stack)
                     .is_none()
                 {
                     return Verdict::Empty;
@@ -560,10 +682,21 @@ fn emit_gpu_bakes(
                 if !narrow_band_keep(&edits_snapshot, &scratch, config, key) {
                     return Verdict::Drop;
                 }
+                // Content hash of exactly the edits this brick folds — its bake-cache key. Memoised
+                // per unique culled index-set (the costly part is the same for identical sets).
+                let hash = *hash_memo
+                    .entry(scratch.clone().into_boxed_slice())
+                    .or_insert_with(|| edits::bake_content_hash(&edits_snapshot, &scratch));
+                // HASH-PEEK EARLY-OUT: a resident brick with the same content keeps valid texels —
+                // skip BEFORE the (dominant-cost) palette build. This is what makes a sphere dragged
+                // over the heightmap cheap: the overlapping heightmap bricks short-circuit here.
+                if resident.get(&key).is_some_and(|b| b.baked_hash == hash) {
+                    return Verdict::Skip;
+                }
                 let voxel_size = config.voxel_size_at(key.lod);
                 let samples = atlas::SdfAtlas::brick_palette_samples(key, voxel_size);
                 let palette = edits::build_palette_indexed(&edits_snapshot, &scratch, &samples);
-                Verdict::Keep(palette, scratch.clone())
+                Verdict::Keep(palette, scratch.clone(), hash)
             })
             .collect()
     };
@@ -571,6 +704,7 @@ fn emit_gpu_bakes(
     let verdicts: Vec<Verdict> = if candidates.is_empty() {
         Vec::new()
     } else {
+        let _g = info_span!("emit_phase2_classify", candidates = candidates.len()).entered();
         // `get_or_init` so headless tests (which don't boot the full app that sets up the pool)
         // still run; in production the pool already exists and the closure is never called.
         let pool = ComputeTaskPool::get_or_init(bevy::tasks::TaskPool::default);
@@ -585,19 +719,35 @@ fn emit_gpu_bakes(
     // --- Phase 3 (serial): apply verdicts — evict, or insert + push job under the cap -------
     // Mutates the atlas + job list, so it's serial. A Keep over the job cap spills its chunk
     // back to `pending` (NOT inserted → stays non-resident → coarse-LOD fallback, hole-free).
-    let mut spilled: std::collections::HashSet<chunk::ChunkKey> = std::collections::HashSet::new();
+    let _g3 = info_span!("emit_phase3_apply").entered();
+    let spilled = &mut scratch.spilled;
     for ((ck, key), verdict) in candidates.iter().zip(verdicts) {
         match verdict {
             Verdict::Empty | Verdict::Drop => {
                 atlas.remove_brick(key);
             }
-            Verdict::Keep(palette, indices) => {
+            // Resident brick, content unchanged (hash matched in classify) → texels still valid,
+            // leave it as-is. This is what keeps a sphere dragged over the heightmap cheap.
+            Verdict::Skip => {}
+            Verdict::Keep(palette, indices, hash) => {
                 if gpu_bakes.jobs.len() >= GPU_BAKE_JOB_CAP {
+                    // Over the cap → defer this brick's bake to a later frame. CRUCIAL: if it's
+                    // currently RESIDENT with a DIFFERENT hash it holds STALE texels (its content
+                    // changed). Leaving it resident makes the march serve its stale shape over the
+                    // freshly-baked coarse level — the "old surface band left behind while
+                    // dragging". Evict it so the lookup misses and falls back to the correct coarse
+                    // LOD until its real bake lands.
+                    atlas.remove_brick(key);
                     spilled.insert(*ck);
                     continue;
                 }
-                let tile = atlas.insert_gpu_brick(*key, palette);
+                let tile = atlas.insert_gpu_brick(*key, palette, hash);
                 push_job(atlas, gpu_bakes, &edits_snapshot, config, *key, tile, &indices, palette);
+                if baked_dbg.enabled {
+                    let bw = config.brick_world_size(key.lod);
+                    let center = config.brick_min_world(key.coord, key.lod) + Vec3::splat(0.5 * bw);
+                    baked_dbg.bricks.push((center, bw, now_secs));
+                }
             }
         }
     }
@@ -605,10 +755,13 @@ fn emit_gpu_bakes(
     // only their deferred bakes retry. The atlas grows naturally as the spill drains, and the
     // render world preserves existing texels across the grow (see `prepare_sdf_atlas_gpu`), so
     // no re-emit of the already-baked set is needed.
-    for ck in spilled {
+    for &ck in scratch.spilled.iter() {
         sched.pending.insert(ck);
     }
     atlas.last_bake_was_full = false;
+
+    // Return the scratch (with its grown capacity) to the scheduler for next frame's reuse.
+    sched.emit_scratch = scratch;
 }
 
 #[cfg(test)]
@@ -678,7 +831,7 @@ mod tests {
             gpu.jobs.clear();
             gpu.edits.clear();
             atlas.gpu_baked_tiles.clear();
-            emit_gpu_bakes(atlas, sched, &mut gpu, cfg);
+            emit_gpu_bakes(atlas, sched, &mut gpu, cfg, cam, &mut crate::sdf_render::BakedBrickDebug::default(), 0.0);
             guard += 1;
             assert!(guard < 1000, "settle did not converge");
             if sched.pending.is_empty() {
@@ -752,7 +905,7 @@ mod tests {
             loop {
                 gpu.clear();
                 atlas.gpu_baked_tiles.clear();
-                emit_gpu_bakes(&mut atlas, &mut sched, &mut gpu, &cfg);
+                emit_gpu_bakes(&mut atlas, &mut sched, &mut gpu, &cfg, Vec3::ZERO, &mut crate::sdf_render::BakedBrickDebug::default(), 0.0);
                 guard += 1;
                 assert!(guard < 1000);
                 if sched.pending.is_empty() { break; }
@@ -848,7 +1001,7 @@ mod tests {
             }
         }
 
-        emit_gpu_bakes(&mut atlas, &mut sched, &mut gpu, &cfg);
+        emit_gpu_bakes(&mut atlas, &mut sched, &mut gpu, &cfg, Vec3::ZERO, &mut crate::sdf_render::BakedBrickDebug::default(), 0.0);
 
         assert!(
             gpu.jobs.len() <= GPU_BAKE_JOB_CAP,
@@ -888,7 +1041,7 @@ mod tests {
             }
         }
 
-        emit_gpu_bakes(&mut atlas, &mut sched, &mut gpu, &cfg);
+        emit_gpu_bakes(&mut atlas, &mut sched, &mut gpu, &cfg, Vec3::ZERO, &mut crate::sdf_render::BakedBrickDebug::default(), 0.0);
 
         // No brick is resident without a corresponding job this frame: a capped (spilled)
         // brick is never inserted, so the atlas never exposes an un-baked (zero) tile.
@@ -903,7 +1056,7 @@ mod tests {
             gpu.jobs.clear();
             gpu.edits.clear();
             atlas.gpu_baked_tiles.clear();
-            emit_gpu_bakes(&mut atlas, &mut sched, &mut gpu, &cfg);
+            emit_gpu_bakes(&mut atlas, &mut sched, &mut gpu, &cfg, Vec3::ZERO, &mut crate::sdf_render::BakedBrickDebug::default(), 0.0);
             assert!(atlas.bricks.len() >= last, "resident set must not shrink while draining spill");
             last = atlas.bricks.len();
             guard += 1;
@@ -941,7 +1094,7 @@ mod tests {
             gpu.jobs.clear();
             gpu.edits.clear();
             atlas.gpu_baked_tiles.clear();
-            emit_gpu_bakes(&mut atlas, &mut sched, &mut gpu, &cfg);
+            emit_gpu_bakes(&mut atlas, &mut sched, &mut gpu, &cfg, Vec3::ZERO, &mut crate::sdf_render::BakedBrickDebug::default(), 0.0);
             guard += 1;
             assert!(guard < 1000, "cull-test settle did not converge");
             if sched.pending.is_empty() {
@@ -992,25 +1145,138 @@ mod tests {
 
         // Frame 1: bake the sphere shell. Some bricks become resident.
         for ck in &chunks { sched.pending.insert(*ck); }
-        emit_gpu_bakes(&mut atlas, &mut sched, &mut gpu, &cfg);
+        emit_gpu_bakes(&mut atlas, &mut sched, &mut gpu, &cfg, Vec3::ZERO, &mut crate::sdf_render::BakedBrickDebug::default(), 0.0);
         let baked = atlas.bricks.len();
         assert!(baked > 0, "first emit must bake the shell");
 
-        // Frame 2: same chunks dirtied again, SAME epoch → every brick skipped, no jobs.
+        // Frame 2: same chunks dirtied again, edits UNCHANGED → every brick's content hash
+        // matches its resident hash → all skipped, no jobs.
         gpu.clear();
         atlas.gpu_baked_tiles.clear();
         for ck in &chunks { sched.pending.insert(*ck); }
-        emit_gpu_bakes(&mut atlas, &mut sched, &mut gpu, &cfg);
-        assert_eq!(gpu.jobs.len(), 0, "re-emit within the same epoch must skip all baked bricks");
+        emit_gpu_bakes(&mut atlas, &mut sched, &mut gpu, &cfg, Vec3::ZERO, &mut crate::sdf_render::BakedBrickDebug::default(), 0.0);
+        assert_eq!(gpu.jobs.len(), 0, "re-emit with unchanged edits must skip all baked bricks (content hash)");
         assert_eq!(atlas.bricks.len(), baked, "resident set unchanged on a pure re-emit");
 
-        // Frame 3: an edit changed → epoch bumps → the same chunks re-bake.
-        atlas.edit_epoch = atlas.edit_epoch.wrapping_add(1);
+        // Frame 3: the edit MOVED → the bricks it folds now hash differently → they re-bake.
+        let moved = vec![sphere_edit(Vec3::new(0.5, 0.0, 0.0), 3.0, 0)];
+        sched = primed_sched(&moved);
         gpu.clear();
         atlas.gpu_baked_tiles.clear();
         for ck in &chunks { sched.pending.insert(*ck); }
-        emit_gpu_bakes(&mut atlas, &mut sched, &mut gpu, &cfg);
-        assert_eq!(gpu.jobs.len(), baked, "after an epoch bump every shell brick must re-bake");
+        emit_gpu_bakes(&mut atlas, &mut sched, &mut gpu, &cfg, Vec3::ZERO, &mut crate::sdf_render::BakedBrickDebug::default(), 0.0);
+        assert!(!gpu.jobs.is_empty(), "after the edit moves, its bricks must re-bake (content hash changed)");
+    }
+
+    /// Fold the shared `gallery_demo_edits` list into a `(ResolvedEdit, world AABB)` pair list — the
+    /// exact geometry the runtime scene spawns, so the bake-cache test exercises the real gallery.
+    fn gallery_resolved() -> Vec<(ResolvedEdit, Aabb3d)> {
+        edits::gallery_demo_edits(0, 1, 2)
+            .into_iter()
+            .map(|(_order, transform, prim, mat)| {
+                let op = SdfOp { kind: CsgKind::Union, smoothing: 0.0 };
+                let aabb = edit_world_aabb(&prim, &transform, op.smoothing);
+                (ResolvedEdit::new(prim, transform, op, mat as u16), aabb)
+            })
+            .collect()
+    }
+
+    /// Drive the production moved-edit dirty path (step 1 of `schedule_bakes`): for the changed
+    /// edit, dirty every window chunk over its old∪new world AABB at each LOD. Mirrors the real
+    /// code exactly so the test's dirty set is the one the app would produce.
+    fn dirty_moved_edit(
+        sched: &mut BakeScheduler,
+        cfg: &SdfGridConfig,
+        cam: Vec3,
+        old_aabb: &Aabb3d,
+        new_aabb: &Aabb3d,
+    ) {
+        let r = ring_chunks_per_axis(cfg);
+        for lod in 0..cfg.lod_count {
+            let origin = ring_chunk_origin(cfg, cam, lod);
+            for ck in chunks_in_aabb_windowed(cfg, old_aabb, lod, origin, r) {
+                sched.pending.insert(ck);
+            }
+            for ck in chunks_in_aabb_windowed(cfg, new_aabb, lod, origin, r) {
+                sched.pending.insert(ck);
+            }
+        }
+    }
+
+    /// REGRESSION GUARD for the content-hash bake cache (the "moving one object re-bakes the
+    /// terrain" bug). Uses the REAL gallery — `gallery_demo_edits`: a procedural heightmap ground +
+    /// six cube-towers (rotated cubes) capped by red spheres — at the production 8-LOD config.
+    /// Procedure:
+    ///   1. Settle the full multi-LOD resident set at the gallery camera (dominated by heightmap).
+    ///   2. NUDGE one tower's red sphere a few cm and dirty exactly the chunks the production
+    ///      moved-edit path would (old∪new footprint, all LODs).
+    ///   3. Assert the re-bake job count is a small fraction of the resident set — only the moved
+    ///      sphere's own bricks re-bake; every heightmap / neighbour-tower brick its coarse
+    ///      footprint overlaps is content-hash-skipped. Before the per-edit AABB refine in
+    ///      `cull_edit_indices`, the moved sphere leaked into every brick sharing its BVH leaf,
+    ///      flipping their content hash and re-baking the whole overlapping set.
+    #[test]
+    fn moving_sphere_near_heightmap_does_not_rebake_heightmap() {
+        let cfg = SdfGridConfig { recenter_snap_chunks: 1, ..config() };
+        // Gallery camera (orbit default sits ~10 units out, looking at origin).
+        let cam = Vec3::new(0.0, 5.0, 10.0);
+
+        let pairs = gallery_resolved();
+        let edits0: Vec<ResolvedEdit> = pairs.iter().map(|(e, _)| e.clone()).collect();
+        // Move a capping red sphere from a tower NEAR the camera (so it sits in the fine LOD ring
+        // and actually re-bakes). Pick the sphere whose XZ is closest to the origin.
+        let moved_idx = edits0
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| matches!(e.prim, SdfPrimitive::Sphere { .. }))
+            .min_by(|(_, a), (_, b)| {
+                let da = a.transform.translation.xz().length_squared();
+                let db = b.transform.translation.xz().length_squared();
+                da.partial_cmp(&db).unwrap()
+            })
+            .map(|(i, _)| i)
+            .expect("gallery must contain capping spheres");
+
+        let mut sched = primed_sched(&edits0);
+        let mut atlas = SdfAtlas::default();
+
+        // 1) Settle the full resident set through the production recenter + emit path.
+        settle_gpu(&mut sched, &mut atlas, &cfg, cam);
+        let resident = atlas.bricks.len();
+        assert!(resident > 500, "gallery heightmap should make the resident set large (got {resident})");
+
+        // 2) Nudge the capping sphere a few cm; everything else UNCHANGED. Rebuild edits/BVH and
+        //    dirty exactly the production old∪new footprint chunks.
+        let old_aabb = pairs[moved_idx].1;
+        let mut new_edits = edits0.clone();
+        let moved_tf = {
+            let t = new_edits[moved_idx].transform;
+            Transform { translation: t.translation + Vec3::new(0.04, 0.0, 0.0), ..t }
+        };
+        new_edits[moved_idx] = ResolvedEdit::new(new_edits[moved_idx].prim.clone(), moved_tf, new_edits[moved_idx].op, new_edits[moved_idx].material_id);
+        let new_aabb = edit_world_aabb(&new_edits[moved_idx].prim, &moved_tf, 0.0);
+        sched.edits = Arc::new(new_edits);
+        sched.bvh = Arc::new(build_bvh(&sched.edits));
+
+        dirty_moved_edit(&mut sched, &cfg, cam, &old_aabb, &new_aabb);
+        let mut gpu = PendingGpuBakes::default();
+        atlas.gpu_baked_tiles.clear();
+        emit_gpu_bakes(&mut atlas, &mut sched, &mut gpu, &cfg, cam, &mut crate::sdf_render::BakedBrickDebug::default(), 0.0);
+
+        // 3) Only the moved sphere's own bricks re-bake — a tiny fraction of the resident set. The
+        //    scatter gallery is ~14k edits settling ~78k resident bricks; the content-hash cache
+        //    keeps the rebake to a few dozen (the moved sphere's own shell). A leak would re-bake
+        //    hundreds-to-thousands as the moved edit's coarse footprint dragged in unchanged terrain.
+        let rebaked = gpu.jobs.len();
+        assert!(
+            rebaked > 0,
+            "the moved sphere's bricks MUST re-bake (content changed)"
+        );
+        assert!(
+            rebaked < 200,
+            "moving one sphere re-baked {rebaked} of {resident} resident bricks — unchanged terrain \
+             / neighbour towers are being re-baked too (content-hash cache leak)"
+        );
     }
 
     /// Empty-space bricks are evicted the same frame even under the job cap (eviction is
@@ -1030,18 +1296,14 @@ mod tests {
         // actually visit it).
         let far_chunk = chunk::ChunkKey::new(0, IVec3::new(100, 0, 0));
         let far = chunk_brick_keys(far_chunk, &cfg)[0];
-        atlas.insert_gpu_brick(far, [edits::PALETTE_EMPTY; edits::PALETTE_K]);
+        atlas.insert_gpu_brick(far, [edits::PALETTE_EMPTY; edits::PALETTE_K], 0);
         assert!(atlas.bricks.contains_key(&far));
-        // A brick becomes stale-empty only because an edit MOVED away from it — which in
-        // `schedule_bakes` bumps `edit_epoch`. Mirror that here so the bake-cache skip (which
-        // correctly bypasses bricks already baked under the CURRENT epoch) doesn't shield this
-        // now-stale brick from the empty-space eviction. (Without the bump this is an impossible
-        // production state: a resident current-epoch brick is always still geometry-valid.)
-        atlas.edit_epoch = atlas.edit_epoch.wrapping_add(1);
+        // The edit doesn't reach this far brick, so it classifies as Empty and is evicted this
+        // frame regardless of any content hash — the content-hash skip only applies to a Keep.
         sched.pending.insert(far_chunk);
         sched.pending.insert(chunk::ChunkKey::new(0, IVec3::ZERO));
 
-        emit_gpu_bakes(&mut atlas, &mut sched, &mut gpu, &cfg);
+        emit_gpu_bakes(&mut atlas, &mut sched, &mut gpu, &cfg, Vec3::ZERO, &mut crate::sdf_render::BakedBrickDebug::default(), 0.0);
 
         assert!(
             !atlas.bricks.contains_key(&far),
@@ -1106,7 +1368,7 @@ mod tests {
                     gpu.jobs.clear();
                     gpu.edits.clear();
                     atlas.gpu_baked_tiles.clear();
-                    emit_gpu_bakes(&mut atlas, &mut sched, &mut gpu, &cfg);
+                    emit_gpu_bakes(&mut atlas, &mut sched, &mut gpu, &cfg, Vec3::ZERO, &mut crate::sdf_render::BakedBrickDebug::default(), 0.0);
                     guard += 1;
                     assert!(guard < 1000, "frame drain did not converge");
                     if sched.pending.is_empty() { break; }

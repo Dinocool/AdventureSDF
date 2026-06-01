@@ -38,7 +38,7 @@ fn populate_resident(atlas: &mut SdfAtlas, config: &SdfGridConfig, bvh: &Bvh, ca
         for coord in ring_window_coords(config, origin) {
             let key = BrickKey::new(lod, coord);
             if SdfAtlas::cull_edit_indices(key, bvh, config, &mut scratch).is_some() {
-                atlas.insert_gpu_brick(key, [PALETTE_EMPTY; PALETTE_K]);
+                atlas.insert_gpu_brick(key, [PALETTE_EMPTY; PALETTE_K], 0);
             }
         }
     }
