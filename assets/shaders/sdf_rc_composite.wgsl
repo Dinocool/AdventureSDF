@@ -13,7 +13,6 @@
 
 #import bevy_core_pipeline::fullscreen_vertex_shader::FullscreenVertexOutput
 #import sdf::oct::oct_decode
-#import sdf::brdf::frostbite_brdf
 
 // Mirror of `SdfCameraData` (render.rs). Reuses the SAME per-view uniform buffer (dynamic offset),
 // so the byte layout must match exactly even though this pass reads only a few fields.
@@ -72,21 +71,15 @@ fn bilinear_offset(i: i32) -> vec2<i32> {
 // indirect + ambient lighting (the cascade already includes the sky dome + emissive bounce with
 // occlusion). Returns the outgoing radiance contribution (BRDF already applied — NOT multiplied
 // by albedo again at the call site).
-// Cascade 0 resolves radiance over only PROBE_SPACING² = 16 directions on the sphere — a very
-// coarse angular field. A narrow specular lobe (low roughness) sampled against 16 fixed bins
-// aliases hard: the lobe lands on one bin (bright speckle) or between bins (near-zero), and which
-// bin wins flickers across pixels → scattered specular points, worst on smooth metals (no diffuse
-// to mask it). The cascade simply doesn't CONTAIN sharp-reflection detail. So the GI gather floors
-// roughness to a value whose lobe spans several bins (smooth integration); sharp glossy highlights
-// still come through the ANALYTIC sun (which isn't sampled from the cascade and keeps true
-// roughness). This trades an unrepresentable mirror-GI for a stable rough-environment GI.
-const GI_ROUGHNESS_FLOOR: f32 = 0.5;
-
+// Cascade 0 resolves radiance over only PROBE_SPACING² = 16 directions on the sphere — far too
+// coarse for any specular lobe (which would alias/flicker across the bins and, being view-
+// dependent, BOIL as the camera rotates). So the GI is DIFFUSE-ONLY: a Lambert cosine integral of
+// the cascade radiance, view-independent and stable. Specular environment response comes from the
+// analytic sun (sharp, not cascade-sampled), + a dedicated reflection path if added later.
 fn gather_gi(
-    uv: vec2<f32>, pixel_dist: f32, v: vec3<f32>, n: vec3<f32>,
-    albedo: vec3<f32>, roughness: f32, metallic: f32, f0: vec3<f32>,
+    uv: vec2<f32>, pixel_dist: f32, n: vec3<f32>,
+    albedo: vec3<f32>, metallic: f32,
 ) -> vec3<f32> {
-    let gi_rough = max(roughness, GI_ROUGHNESS_FLOOR);
     let res = vec2<i32>(camera.screen_params.xy);
     let probe_grid = (res + vec2<i32>(PROBE_SPACING - 1)) / vec2<i32>(PROBE_SPACING);
 
@@ -117,17 +110,27 @@ fn gather_gi(
         let w = bilinear[p] * depth_w;
 
         var probe_radiance = vec3<f32>(0.0);
-        // C0_RAYS_PER_DIM² direction bins (cascade 0: rays_per_dim = 1<<2 = 4).
+        // C0_RAYS_PER_DIM² direction bins (cascade 0: rays_per_dim = 1<<2 = 4). DIFFUSE-ONLY
+        // integrand: `albedo/π · cos · L`. The GI is intentionally view-INDEPENDENT — the full
+        // Frostbite BRDF's specular lobe is strongly view-dependent and, evaluated against the
+        // cascade's 16 coarse direction bins, sweeps across them as the camera ROTATES (V swings
+        // while the probe points/dirs don't) → which bins get weight flickers → the GI "boils" on
+        // rotation, coherently across the surface so no spatial blur can cancel it. A radiance
+        // cascade can't represent a specular lobe at 16 directions anyway. So GI carries only
+        // diffuse (Lambert) irradiance; metals get ~0 GI diffuse (correct — their environment
+        // response is the analytic sun's specular, + a dedicated reflection path if added later).
         for (var dy = 0; dy < C0_RAYS_PER_DIM; dy = dy + 1) {
             for (var dx = 0; dx < C0_RAYS_PER_DIM; dx = dx + 1) {
                 let dir2d = vec2<i32>(dx, dy);
                 let dir_uv = (vec2<f32>(dir2d) + 0.5) / f32(C0_RAYS_PER_DIM);
                 let l = oct_decode(dir_uv);
+                let ndl = max(dot(n, l), 0.0);
                 let interval = textureLoad(cascade0, dir2d * probe_grid + probe, 0).rgb;
-                probe_radiance += frostbite_brdf(v, n, l, albedo, gi_rough, metallic, f0) * interval;
+                probe_radiance += interval * ndl;
             }
         }
-        radiance += probe_radiance * w;
+        // Lambert diffuse albedo, non-metal fraction. (1/π is folded with the bin normalisation.)
+        radiance += probe_radiance * albedo * (1.0 - metallic) * w;
         wsum += w;
     }
     return select(vec3<f32>(0.0), radiance / wsum, wsum > 0.0);
@@ -149,17 +152,8 @@ fn main(in: FullscreenVertexOutput) -> @location(0) vec4<f32> {
     let nm = textureSampleLevel(gbuf_normal_mat, gbuf_sampler, uv, 0.0);
     let normal = oct_decode(nm.rg);
     let metallic = nm.b;
-    let roughness = nm.a;
 
-    // World position from the stored camera distance + this pixel's ray → the view vector.
-    let ndc = vec4<f32>(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, 1.0, 1.0);
-    let world_near = camera.inv_view_proj * ndc;
-    let ray_dir = normalize(world_near.xyz / world_near.w - camera.camera_pos.xyz);
-    let view = -ray_dir;
-
-    // Dielectric F0 0.04 (ior 1.5); metals take their albedo as F0.
-    let f0 = mix(vec3<f32>(0.04), albedo, metallic);
-
-    let gi = gather_gi(uv, dist, view, normal, albedo, roughness, metallic, f0);
+    // Diffuse-only GI gather — view-independent, so it can't boil on camera rotation.
+    let gi = gather_gi(uv, dist, normal, albedo, metallic);
     return vec4<f32>(gi, 1.0);
 }
