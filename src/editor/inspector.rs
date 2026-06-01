@@ -71,29 +71,30 @@ fn entity_inspector_ui(world: &mut World, entity: Entity, ui: &mut egui::Ui) {
 
     // Run any registered per-component overrides first (curated editors), taking
     // the registry out so the closures get exclusive `&mut World`.
-    let overrides = world
-        .remove_resource::<InspectorOverrides>()
-        .unwrap_or_default();
-    let mut rendered_custom = false;
-    for (type_path, editor) in overrides.editors.iter() {
-        // Only show an override if the component is actually present on the entity.
-        if entity_has_type_path(world, entity, type_path) {
-            egui::CollapsingHeader::new(short_name(type_path))
-                .default_open(true)
-                .show(ui, |ui| {
-                    editor(world, entity, ui);
-                });
-            rendered_custom = true;
-        }
-    }
-    world.insert_resource(overrides);
-
-    let mut custom_paths: Vec<String> = {
-        let overrides = world.resource::<InspectorOverrides>();
-        overrides.editors.keys().cloned().collect()
-    };
+    let (rendered_custom, mut custom_paths) = crate::editor::fs_util::with_registry(
+        world,
+        |world, overrides: &InspectorOverrides| {
+            let mut rendered = false;
+            for (type_path, editor) in overrides.editors.iter() {
+                // Only show an override if the component is actually present on the entity.
+                if entity_has_type_path(world, entity, type_path) {
+                    egui::CollapsingHeader::new(short_name(type_path))
+                        .default_open(true)
+                        .show(ui, |ui| {
+                            editor(world, entity, ui);
+                        });
+                    rendered = true;
+                }
+            }
+            let paths: Vec<String> = overrides.editors.keys().cloned().collect();
+            (rendered, paths)
+        },
+    );
     // Name is rendered by `name_field_ui` above; keep it out of the generic section.
     custom_paths.push(std::any::type_name::<Name>().to_string());
+    // GlobalTransform is derived from Transform (which has a custom euler editor); showing
+    // its raw affine matrix is noise, so hide it.
+    custom_paths.push(std::any::type_name::<GlobalTransform>().to_string());
 
     if rendered_custom {
         ui.separator();
@@ -137,6 +138,11 @@ fn generic_components_ui(
                 if is_zero_field(reg.type_info()) {
                     return None;
                 }
+                // Skip components tagged `#[reflect(@HideFromInspector)]` (editor-only
+                // markers like EditorGizmo that shouldn't be user-editable).
+                if is_hidden(reg.type_info()) {
+                    return None;
+                }
                 Some(type_path.to_string())
             })
             .collect()
@@ -164,6 +170,19 @@ fn is_zero_field(info: &bevy::reflect::TypeInfo) -> bool {
         TypeInfo::Struct(s) => s.field_len() == 0,
         TypeInfo::TupleStruct(s) => s.field_len() == 0,
         TypeInfo::Opaque(_) => false,
+        _ => false,
+    }
+}
+
+/// Whether a component is tagged `#[reflect(@HideFromInspector)]` at the container level
+/// and so should be skipped by the generic inspector.
+fn is_hidden(info: &bevy::reflect::TypeInfo) -> bool {
+    use bevy::reflect::TypeInfo;
+    use crate::node::HideFromInspector;
+    match info {
+        TypeInfo::Struct(s) => s.has_attribute::<HideFromInspector>(),
+        TypeInfo::TupleStruct(s) => s.has_attribute::<HideFromInspector>(),
+        TypeInfo::Enum(s) => s.has_attribute::<HideFromInspector>(),
         _ => false,
     }
 }

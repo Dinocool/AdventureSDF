@@ -10,10 +10,24 @@
 //! `AssetEvent::Modified` → `assets::compile` rebuilds the registry → the GPU table
 //! re-uploads via change detection. So material edits are live.
 
+use std::time::{Duration, Instant};
+
 use bevy::prelude::*;
 use bevy_egui::egui;
 
 use crate::assets::MaterialAssetTable;
+use crate::sdf_render::textures::LibraryVariant;
+
+/// Throttled cache of the on-disk texture variants. `discover_variants` walks the
+/// `assets/textures/` manifests; the Textures tab renders every frame, so without this
+/// it would re-scan the filesystem at 60fps. Refreshed at most once per [`VARIANT_TTL`].
+#[derive(Resource, Default)]
+pub struct TextureVariantCache {
+    variants: Vec<LibraryVariant>,
+    last_scan: Option<Instant>,
+}
+
+const VARIANT_TTL: Duration = Duration::from_secs(1);
 
 /// Which inner tab the Resource Inspector shows.
 #[derive(Resource, Default, PartialEq, Eq, Clone, Copy)]
@@ -105,14 +119,25 @@ fn materials_tab(world: &mut World, ui: &mut egui::Ui) {
     }
 }
 
-fn textures_tab(_world: &mut World, ui: &mut egui::Ui) {
-    let variants = crate::editor::material_editor::discover_variants();
-    ui.label(format!("{} texture variants", variants.len()));
+fn textures_tab(world: &mut World, ui: &mut egui::Ui) {
+    // Refresh the on-disk scan at most once per TTL (the tab redraws every frame).
+    let stale = world
+        .resource::<TextureVariantCache>()
+        .last_scan
+        .is_none_or(|t| t.elapsed() >= VARIANT_TTL);
+    if stale {
+        let variants = crate::editor::material_editor::discover_variants();
+        let mut cache = world.resource_mut::<TextureVariantCache>();
+        cache.variants = variants;
+        cache.last_scan = Some(Instant::now());
+    }
+    let cache = world.resource::<TextureVariantCache>();
+    ui.label(format!("{} texture variants", cache.variants.len()));
     ui.weak("Import: 1024², BC7 (read-only)");
     ui.separator();
     egui::ScrollArea::vertical().show(ui, |ui| {
         let mut last_slug = String::new();
-        for v in &variants {
+        for v in &cache.variants {
             if v.slug != last_slug {
                 ui.strong(&v.slug);
                 last_slug = v.slug.clone();

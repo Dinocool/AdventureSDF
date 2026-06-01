@@ -45,6 +45,22 @@ pub struct MaterialPreviewState {
     pub tex_id: Option<egui::TextureId>,
 }
 
+impl MaterialPreviewState {
+    /// Point the preview at `mat`, reusing the existing `StandardMaterial` handle in
+    /// place when one is already held. A bare `Assets::add` every frame (the editor UI
+    /// rebuilds the preview material each frame) would leak one asset entry per frame.
+    pub fn set_material(&mut self, materials: &mut Assets<StandardMaterial>, mat: StandardMaterial) {
+        match &self.material {
+            Some(h) if materials.get(h).is_some() => {
+                if let Some(slot) = materials.get_mut(h) {
+                    *slot = mat;
+                }
+            }
+            _ => self.material = Some(materials.add(mat)),
+        }
+    }
+}
+
 impl Default for MaterialPreviewState {
     fn default() -> Self {
         Self {

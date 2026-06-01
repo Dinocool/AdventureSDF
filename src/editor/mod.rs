@@ -8,6 +8,7 @@ pub mod asset_inspector;
 pub mod assets_browser;
 pub mod config;
 pub mod dock;
+pub mod fs_util;
 pub mod hierarchy;
 pub mod import_settings;
 pub mod inspector;
@@ -24,7 +25,9 @@ pub mod resource_inspector;
 pub mod resource_picker;
 pub mod selection;
 pub mod status_bar;
+pub mod transform_editor;
 pub mod uniform_inspector;
+pub mod viewport_toolbar;
 
 use panels::DockSide;
 
@@ -44,7 +47,14 @@ impl Plugin for EditorPlugin {
         ))
         .init_resource::<menu_bar::EditorRequests>()
         .init_resource::<menu_bar::CurrentScenePath>()
-        .init_resource::<inspector::InspectorOverrides>();
+        .init_resource::<inspector::InspectorOverrides>()
+        .register_type::<import_settings::ImageFilter>()
+        .register_type::<import_settings::ColorSpace>()
+        .register_type::<import_settings::WrapMode>()
+        .register_type::<import_settings::TextureImportSettings>();
+
+        // Custom euler-angle Transform editor (replaces the generic Quat-xyzw UI).
+        inspector::register_component_editor::<Transform>(app, transform_editor::transform_editor);
 
         // Assets browser: navigation state + modular thumbnail providers + the
         // offscreen render rig that fills material/image thumbnails.
@@ -63,7 +73,11 @@ impl Plugin for EditorPlugin {
         app.add_plugins(material_preview::MaterialPreviewPlugin)
             .init_resource::<selection::EditorSelection>()
             .init_resource::<asset_inspector::ImportSettingsEdits>()
-            .add_systems(Update, selection::sync_selection);
+            .add_systems(
+                Update,
+                selection::sync_selection
+                    .run_if(|c: Res<config::EditorConfig>| c.enabled),
+            );
         {
             let mut reg = asset_inspector::AssetInspectorRegistry::default();
             reg.register(asset_inspector::TextureAssetInspector);
@@ -100,7 +114,8 @@ impl Plugin for EditorPlugin {
         // (see `dock::viewport_toolbar`), so there's no separate Transform panel.
 
         // Resource Inspector (Godot-style): edit material resources + browse textures.
-        app.init_resource::<resource_inspector::ResourceInspectorState>();
+        app.init_resource::<resource_inspector::ResourceInspectorState>()
+            .init_resource::<resource_inspector::TextureVariantCache>();
         panels::register_panel(
             app,
             "core/resources",

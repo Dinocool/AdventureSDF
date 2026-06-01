@@ -51,7 +51,8 @@ while ($true) {
     Write-Host "Launching: cargo run --features editor" -ForegroundColor Yellow
     Write-Host "Dir: $target" -ForegroundColor Yellow
 
-    Start-Process powershell -ArgumentList "-NoExit", "-Command", "Set-Location '$target'; cargo run --features editor"
+    $inner = "Set-Location '$target'; cargo run --features editor; if (`$LASTEXITCODE -ne 0) { Write-Host ''; Write-Host 'Exited with error code '`$LASTEXITCODE -ForegroundColor Red; Read-Host 'Press Enter to close' }"
+    Start-Process powershell -ArgumentList "-NoProfile", "-Command", $inner
 
     Start-Sleep -Milliseconds 600
 }
