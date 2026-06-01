@@ -145,6 +145,18 @@ impl BakeScheduler {
 /// buffer binding and wgpu aborts the frame.
 const GPU_BAKE_JOB_CAP: usize = 8192;
 
+/// SOFT per-frame bake budget — the smoothing knob (distinct from the hard `GPU_BAKE_JOB_CAP`
+/// GPU-buffer ceiling). When the camera crosses a coarse LOD-ring snap boundary a whole shell of
+/// geometry chunks enters at once (~8k bricks in the stress scene), and baking them all on one
+/// frame is a visible hitch (~8 ms CPU emit + ~5 ms GPU dispatch). Capping emitted jobs at this
+/// lower budget spreads the shell over a few frames; the coarse LOD already covers the not-yet-
+/// baked fine shell (same fallback the hard cap relies on), so the only cost is a brief slightly-
+/// coarser band right after a snap, which the LOD blend hides. The coarse-first + nearest-first
+/// drain order means the most-visible bricks bake first. Sized so a snap spreads over ~4 frames
+/// rather than spiking one; a continuously-dragged edit also stays under it frame-to-frame.
+const SOFT_BAKE_BUDGET: usize = 2048;
+const _: () = assert!(SOFT_BAKE_BUDGET <= GPU_BAKE_JOB_CAP, "soft budget must stay under the GPU buffer ceiling");
+
 /// Any component that affects an edit's baked result. A change to one of these
 /// triggers a targeted rebake of the bricks the edit touches. Exposed as
 /// [`ChangedEditFilter`] so the diagnostic sync bake can reuse the same change filter.
@@ -204,15 +216,25 @@ fn ring_chunks_per_axis(config: &SdfGridConfig) -> i32 {
 /// flying away from the scene. Safe only for camera-*entered* chunks (no resident bricks to
 /// evict yet); the edit-dirty path must still enqueue emptied chunks so vacated bricks get
 /// removed.
-fn chunk_has_geometry(ck: chunk::ChunkKey, bvh: &bvh::Bvh, config: &SdfGridConfig, scratch: &mut Vec<u32>) -> bool {
+/// Whether any edit reaches chunk `ck`, reusing a caller-owned BVH traversal `stack` (cleared on
+/// entry) so a recenter that runs thousands of these per snap frame does zero heap allocation per
+/// query. Uses the BVH's EARLY-EXIT `any_overlap_with`: this only needs an occupancy boolean, so
+/// stopping at the first overlapping leaf (instead of collecting every edit a dense chunk overlaps —
+/// often hundreds, all discarded) roughly halves the per-query cost on tower-dense chunks.
+fn chunk_has_geometry_with(
+    ck: chunk::ChunkKey,
+    bvh: &bvh::Bvh,
+    config: &SdfGridConfig,
+    stack: &mut Vec<u32>,
+) -> bool {
     let size = chunk::chunk_world_size(ck.lod, config);
     let min = chunk::chunk_min_world(ck, config);
     let aabb = bevy::math::bounding::Aabb3d::from_min_max(min, min + Vec3::splat(size));
-    bvh.query_aabb(&aabb, scratch);
-    !scratch.is_empty()
+    bvh.any_overlap_with(&aabb, stack)
 }
 
 /// Whether chunk coord `c` is inside the `R³` chunk window with corner `origin`.
+#[cfg(test)]
 fn chunk_in_window(c: IVec3, origin: IVec3, r: i32) -> bool {
     let rel = c - origin;
     rel.x >= 0 && rel.y >= 0 && rel.z >= 0 && rel.x < r && rel.y < r && rel.z < r
@@ -226,6 +248,71 @@ fn chunk_window_keys(origin: IVec3, r: i32, lod: u32) -> impl Iterator<Item = ch
             (0..r).map(move |ix| chunk::ChunkKey::new(lod, origin + IVec3::new(ix, iy, iz)))
         })
     })
+}
+
+/// Invoke `f` only for the chunk coords in the `R³` window at `new_origin` that are NOT in the
+/// `R³` window at `old_origin` (the chunks that *entered* on a recenter). For two equal-size
+/// axis-aligned windows the difference is a thin boundary slab, so this visits only the new shell
+/// (a few hundred chunks) instead of the full `R³` interior (4096 at R=16) — the recenter only
+/// cares about entered chunks, and the overlap is unchanged. Yields nothing when the windows are
+/// identical; yields the whole new window when they don't overlap (a teleport). Each coord is
+/// visited at most once (axis-partitioned: x-slabs, then the x-overlap's y-slabs, then the xy-
+/// overlap's z-slabs), so no dedup is needed.
+fn for_each_entered_chunk(new_origin: IVec3, old_origin: IVec3, r: i32, mut f: impl FnMut(IVec3)) {
+    // Overlap box of the two windows on each axis (empty if they don't overlap). Use saturating
+    // arithmetic so a sentinel old_origin (i32::MIN on the first run) can't overflow `+ r`; it just
+    // yields an empty overlap → the whole new window is "entered", which is the correct first-run
+    // behaviour (and `for_each_exited_chunk` then evicts nothing, since the old window is degenerate).
+    let new_end = IVec3::new(
+        new_origin.x.saturating_add(r),
+        new_origin.y.saturating_add(r),
+        new_origin.z.saturating_add(r),
+    );
+    let old_end = IVec3::new(
+        old_origin.x.saturating_add(r),
+        old_origin.y.saturating_add(r),
+        old_origin.z.saturating_add(r),
+    );
+    let ov_min = new_origin.max(old_origin);
+    let ov_max = new_end.min(old_end);
+    // x in new-window but outside the x-overlap → whole yz cross-section entered.
+    let x_overlap_empty = ov_min.x >= ov_max.x;
+    for x in new_origin.x..new_end.x {
+        let x_entered = x_overlap_empty || x < ov_min.x || x >= ov_max.x;
+        if x_entered {
+            // Entire yz face at this x is new.
+            for y in new_origin.y..new_origin.y + r {
+                for z in new_origin.z..new_origin.z + r {
+                    f(IVec3::new(x, y, z));
+                }
+            }
+        } else {
+            // x is shared; partition y the same way, then z within the xy-overlap.
+            let y_overlap_empty = ov_min.y >= ov_max.y;
+            for y in new_origin.y..new_origin.y + r {
+                let y_entered = y_overlap_empty || y < ov_min.y || y >= ov_max.y;
+                if y_entered {
+                    for z in new_origin.z..new_origin.z + r {
+                        f(IVec3::new(x, y, z));
+                    }
+                } else {
+                    // x,y shared; only the z-slab outside the z-overlap entered.
+                    let z_overlap_empty = ov_min.z >= ov_max.z;
+                    for z in new_origin.z..new_origin.z + r {
+                        if z_overlap_empty || z < ov_min.z || z >= ov_max.z {
+                            f(IVec3::new(x, y, z));
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Invoke `f` for the chunk coords that *exited* on a recenter — in the OLD window but not the
+/// new. Symmetric to [`for_each_entered_chunk`] (args swapped), used to evict the trailing shell.
+fn for_each_exited_chunk(new_origin: IVec3, old_origin: IVec3, r: i32, f: impl FnMut(IVec3)) {
+    for_each_entered_chunk(old_origin, new_origin, r, f);
 }
 
 /// All brick keys belonging to chunk `ck` (its `CHUNK_BRICKS³` local slots).
@@ -418,7 +505,7 @@ pub fn schedule_bakes(
     // `atlas.remove_brick` bumps the upload + topology generations itself, so an evict-only
     // frame (e.g. flying away from the scene) still makes the render world re-extract and
     // drop the stale bricks — it doesn't depend on a bake being applied that frame.
-    let mut bvh_scratch: Vec<u32> = Vec::new();
+    let mut bvh_stack: Vec<u32> = Vec::new();
     for lod in 0..lod_count {
         let li = lod as usize;
         let new_origin = ring_chunk_origin(&config, camera_pos, lod);
@@ -430,22 +517,24 @@ pub fn schedule_bakes(
         // resident bricks yet, so a chunk no edit reaches has nothing to bake. Enqueuing it
         // anyway would burn the per-frame budget on all-`None` bakes and starve the real
         // geometry entering far rings (the fly-away-from-scene LOD-stall bug).
-        for ck in chunk_window_keys(new_origin, r, lod) {
-            let entered = first_run || !chunk_in_window(ck.coord, old_origin, r);
-            if entered && chunk_has_geometry(ck, &bvh, &config, &mut bvh_scratch) {
+        // Only the entered SHELL is visited (slab difference), not the whole R³ interior — the
+        // overlap stays resident and unchanged, so re-scanning it every snap was pure waste.
+        for_each_entered_chunk(new_origin, old_origin, r, |coord| {
+            let ck = chunk::ChunkKey::new(lod, coord);
+            if chunk_has_geometry_with(ck, &bvh, &config, &mut bvh_stack) {
                 sched.pending.insert(ck);
             }
-        }
-        // Exited chunks → drop all their bricks (and cancel any pending bake).
+        });
+        // Exited chunks → drop all their bricks (and cancel any pending bake). Skipped on the first
+        // run: there is no prior window to evict (the sentinel origin isn't a real chunk region).
         if !first_run {
-            for ck in chunk_window_keys(old_origin, r, lod) {
-                if !chunk_in_window(ck.coord, new_origin, r) {
-                    sched.pending.remove(&ck);
-                    for_each_brick_key(ck, &config, |bk| {
-                        atlas.remove_brick(&bk);
-                    });
-                }
-            }
+            for_each_exited_chunk(new_origin, old_origin, r, |coord| {
+                let ck = chunk::ChunkKey::new(lod, coord);
+                sched.pending.remove(&ck);
+                for_each_brick_key(ck, &config, |bk| {
+                    atlas.remove_brick(&bk);
+                });
+            });
         }
         sched.ring_chunk_origin[li] = new_origin;
     }
@@ -629,7 +718,7 @@ fn emit_gpu_bakes(
     let candidates = &mut scratch.candidates;
     {
         let _g = info_span!("emit_phase1_gather").entered();
-        let mut cull_scratch: Vec<u32> = Vec::new();
+        let mut cull_stack: Vec<u32> = Vec::new();
         for ck in drained.iter() {
             // CHUNK-LEVEL EMPTY PRE-CULL: one BVH query on the whole chunk AABB instead of 64
             // per-brick queries. If no edit reaches the chunk it has nothing to bake — skip all
@@ -637,7 +726,7 @@ fn emit_gpu_bakes(
             // surface, so this prunes the bulk of the gather at 1/64 the BVH cost. BUT a chunk
             // that became empty after a move may still hold RESIDENT bricks that must be evicted,
             // so we still drop any residents before skipping (cheap: only touches resident keys).
-            if !chunk_has_geometry(*ck, &bvh_snapshot, config, &mut cull_scratch) {
+            if !chunk_has_geometry_with(*ck, &bvh_snapshot, config, &mut cull_stack) {
                 for_each_brick_key(*ck, config, |key| {
                     atlas.remove_brick(&key); // no-op if not resident
                 });
@@ -730,13 +819,16 @@ fn emit_gpu_bakes(
             // leave it as-is. This is what keeps a sphere dragged over the heightmap cheap.
             Verdict::Skip => {}
             Verdict::Keep(palette, indices, hash) => {
-                if gpu_bakes.jobs.len() >= GPU_BAKE_JOB_CAP {
-                    // Over the cap → defer this brick's bake to a later frame. CRUCIAL: if it's
-                    // currently RESIDENT with a DIFFERENT hash it holds STALE texels (its content
-                    // changed). Leaving it resident makes the march serve its stale shape over the
-                    // freshly-baked coarse level — the "old surface band left behind while
-                    // dragging". Evict it so the lookup misses and falls back to the correct coarse
-                    // LOD until its real bake lands.
+                if gpu_bakes.jobs.len() >= SOFT_BAKE_BUDGET {
+                    // Over the per-frame SOFT budget → defer this brick's bake to a later frame, so a
+                    // big shell (coarse-LOD snap) spreads over several frames instead of spiking. The
+                    // hard `GPU_BAKE_JOB_CAP` is the GPU-buffer ceiling; this lower budget is the
+                    // smoothing knob (see its doc). Same spill mechanics either way. CRUCIAL: if the
+                    // brick is currently RESIDENT with a DIFFERENT hash it holds STALE texels (its
+                    // content changed) — leaving it resident would serve its stale shape over the
+                    // freshly-baked coarse level (the "old surface band left behind while dragging").
+                    // Evict it so the lookup misses and falls back to the correct coarse LOD until
+                    // its real bake lands.
                     atlas.remove_brick(key);
                     spilled.insert(*ck);
                     continue;
@@ -790,8 +882,7 @@ mod tests {
         if sched.ring_chunk_origin.is_empty() {
             sched.ring_chunk_origin = vec![IVec3::splat(i32::MIN); cfg.lod_count as usize];
         }
-        let first = sched.ring_chunk_origin.iter().all(|o| *o == IVec3::splat(i32::MIN));
-        let mut scratch: Vec<u32> = Vec::new();
+        let mut stack: Vec<u32> = Vec::new();
         let mut enqueued = 0usize;
         for lod in 0..cfg.lod_count {
             let li = lod as usize;
@@ -800,21 +891,23 @@ mod tests {
             if new_origin == old_origin {
                 continue;
             }
-            for ck in chunk_window_keys(new_origin, r, lod) {
-                let entered = first || !chunk_in_window(ck.coord, old_origin, r);
-                if entered && chunk_has_geometry(ck, &sched.bvh, cfg, &mut scratch) && sched.pending.insert(ck) {
+            let first = old_origin == IVec3::splat(i32::MIN);
+            for_each_entered_chunk(new_origin, old_origin, r, |coord| {
+                let ck = chunk::ChunkKey::new(lod, coord);
+                if chunk_has_geometry_with(ck, &sched.bvh, cfg, &mut stack)
+                    && sched.pending.insert(ck)
+                {
                     enqueued += 1;
                 }
-            }
+            });
             if !first {
-                for ck in chunk_window_keys(old_origin, r, lod) {
-                    if !chunk_in_window(ck.coord, new_origin, r) {
-                        sched.pending.remove(&ck);
-                        for bk in chunk_brick_keys(ck, cfg) {
-                            atlas.remove_brick(&bk);
-                        }
+                for_each_exited_chunk(new_origin, old_origin, r, |coord| {
+                    let ck = chunk::ChunkKey::new(lod, coord);
+                    sched.pending.remove(&ck);
+                    for bk in chunk_brick_keys(ck, cfg) {
+                        atlas.remove_brick(&bk);
                     }
-                }
+                });
             }
             sched.ring_chunk_origin[li] = new_origin;
         }
@@ -1346,6 +1439,83 @@ mod tests {
         let fresh: HashSet<_> = fresh_atlas.bricks.keys().copied().collect();
 
         assert_eq!(walked, fresh, "recenter walk diverged from a fresh settle (stale/missing bricks)");
+    }
+
+    /// PERF SIMULATION of the camera-movement hitch in the stress scene. Settles the full tower
+    /// field at the production 8-LOD config, then walks the camera in small steps (crossing several
+    /// recenter snap boundaries) and, for each step, counts the recenter's per-frame work:
+    /// `window_scans` (entered-shell chunk slots visited across all recentering LODs),
+    /// `geom_queries` (how many ran a BVH AABB query), and `enqueued` (geometry chunks newly
+    /// dirtied this frame). Printed so we can SEE the spike on the frames where coarse LODs snap.
+    /// Not an assertion-heavy test, a measurement rig (run with --ignored --nocapture).
+    #[test]
+    #[ignore = "perf measurement rig; run explicitly with --ignored --nocapture"]
+    fn lod_recenter_cost_walk() {
+        use edits::TowerRole;
+        let cfg = SdfGridConfig::default(); // production: 8 LODs, ring 64, snap 2
+        let edits: Vec<ResolvedEdit> = edits::tower_field_edits(&edits::TowerFieldParams::default())
+            .into_iter()
+            .map(|(_o, t, p, role)| {
+                let mat = match role { TowerRole::Ground => 0u16, TowerRole::Cube => 1, TowerRole::Cap => 2 };
+                ResolvedEdit::new(p, t, SdfOp { kind: CsgKind::Union, smoothing: 0.0 }, mat)
+            })
+            .collect();
+        eprintln!("LOD-WALK: {} edits, building BVH...", edits.len());
+
+        let mut atlas = SdfAtlas::default();
+        let mut sched = primed_sched(&edits);
+        // Settle at the start camera (orbit default ~10 units out).
+        let r = ring_chunks_per_axis(&cfg);
+        settle_gpu(&mut sched, &mut atlas, &cfg, Vec3::new(0.0, 5.0, 10.0));
+        eprintln!("LOD-WALK: settled, resident bricks = {}", atlas.bricks.len());
+
+        // Walk along +X in 1.5 m steps — at base voxel 0.1 / chunk_world ≈ 3.2 m, snap 2 ⇒ a LOD0
+        // recenter every ~6.4 m, coarser LODs every 2^L × that, so steps cross staggered boundaries.
+        let mut max_scans = 0usize;
+        let mut max_geom = 0usize;
+        let mut max_enq = 0usize;
+        for step in 1..=40i32 {
+            let cam = Vec3::new(step as f32 * 1.5, 5.0, 10.0);
+            // Instrumented mirror of step 2 recenter: count window scans + geometry queries + time.
+            let mut scans = 0usize;
+            let mut geom = 0usize;
+            let mut enqueued = 0usize;
+            let mut stack: Vec<u32> = Vec::new();
+            let t_recenter = std::time::Instant::now();
+            for lod in 0..cfg.lod_count {
+                let li = lod as usize;
+                let new_origin = ring_chunk_origin(&cfg, cam, lod);
+                let old_origin = sched.ring_chunk_origin[li];
+                if new_origin == old_origin { continue; }
+                for_each_entered_chunk(new_origin, old_origin, r, |coord| {
+                    scans += 1;
+                    geom += 1;
+                    let ck = chunk::ChunkKey::new(lod, coord);
+                    if chunk_has_geometry_with(ck, &sched.bvh, &cfg, &mut stack) && sched.pending.insert(ck) {
+                        enqueued += 1;
+                    }
+                });
+                for_each_exited_chunk(new_origin, old_origin, r, |coord| {
+                    let ck = chunk::ChunkKey::new(lod, coord);
+                    sched.pending.remove(&ck);
+                    for_each_brick_key(ck, &cfg, |bk| { atlas.remove_brick(&bk); });
+                });
+                sched.ring_chunk_origin[li] = new_origin;
+            }
+            let recenter_us = t_recenter.elapsed().as_micros();
+            let mut gpu = PendingGpuBakes::default();
+            let t_emit = std::time::Instant::now();
+            emit_gpu_bakes(&mut atlas, &mut sched, &mut gpu, &cfg, cam, &mut crate::sdf_render::BakedBrickDebug::default(), 0.0);
+            let emit_us = t_emit.elapsed().as_micros();
+            if scans > 0 {
+                eprintln!("step {step:2}: scans={scans:6} geom_q={geom:5} enq={enqueued:4} candidates~{:6} baked={:5} | recenter={recenter_us:5}us emit={emit_us:6}us emit_per_job={:.2}us",
+                    enqueued * 64, gpu.jobs.len(), emit_us as f64 / (gpu.jobs.len().max(1)) as f64);
+            }
+            max_scans = max_scans.max(scans);
+            max_geom = max_geom.max(geom);
+            max_enq = max_enq.max(enqueued);
+        }
+        eprintln!("LOD-WALK MAX: window_scans={max_scans} geom_queries={max_geom} enqueued={max_enq}");
     }
 
     /// Flying *away* from a localized scene must still refresh the scene's bricks into their
