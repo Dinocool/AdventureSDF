@@ -111,12 +111,13 @@ impl TileAllocator {
 #[derive(Clone)]
 pub struct PackedBrick {
     pub palette: Palette,
-    /// The atlas `edit_epoch` this brick was baked under. The bake emit skips re-baking a
-    /// resident brick whose `baked_epoch` equals the current `edit_epoch` — its GPU texels are
-    /// still valid (the edits it folded haven't changed), so a spilled chunk re-queued over
-    /// several frames doesn't re-cull / re-bake the bricks it already baked. Set in
-    /// [`SdfAtlas::insert_gpu_brick`]; compared in `emit_gpu_bakes`.
-    pub baked_epoch: u64,
+    /// CONTENT HASH of the edits this brick folded when it was baked (see
+    /// `edits::bake_content_hash`). The bake emit skips re-baking a resident brick whose stored
+    /// hash equals the hash of the edits it *now* folds — its GPU texels are still valid because
+    /// nothing it contains changed. Unlike a global epoch, this is per-brick: moving one edit
+    /// re-bakes only the bricks that fold THAT edit, leaving every other brick (e.g. a heightmap
+    /// brick the sphere's coarse footprint overlaps) cached. Set in [`SdfAtlas::insert_gpu_brick`].
+    pub baked_hash: u64,
 }
 
 /// CPU-side atlas topology: brick key (lod + origin) -> palette-only placeholder, plus the
@@ -148,12 +149,6 @@ pub struct SdfAtlas {
     /// so it knows which tiles the bake node will write; the CPU holds only a palette-only
     /// placeholder for them. Cleared each frame at the start of `schedule_bakes`.
     pub gpu_baked_tiles: HashSet<u32>,
-    /// Monotonic edit epoch: bumped whenever the edit set / BVH changes (a moved, added, or
-    /// removed edit). A brick baked under epoch E folds the edits as they were at E; if the
-    /// epoch is still E when its chunk is re-visited (e.g. a spilled chunk re-queued during a
-    /// large object's multi-frame bake), the brick's texels are still valid and the bake emit
-    /// skips it. Stored per brick as [`PackedBrick::baked_epoch`].
-    pub edit_epoch: u64,
 }
 
 impl Default for SdfAtlas {
@@ -166,7 +161,6 @@ impl Default for SdfAtlas {
             tiles: TileAllocator::default(),
             last_bake_was_full: false,
             gpu_baked_tiles: HashSet::new(),
-            edit_epoch: 0,
         }
     }
 }
@@ -250,10 +244,44 @@ impl SdfAtlas {
         config: &super::SdfGridConfig,
         out: &mut Vec<u32>,
     ) -> Option<()> {
+        let mut stack: Vec<u32> = Vec::new();
+        Self::cull_edit_indices_with(key, bvh, config, out, &mut stack)
+    }
+
+    /// As [`Self::cull_edit_indices`] but reuses a caller-owned BVH traversal `stack` (the hot
+    /// parallel classify loop keeps one per task so each brick cull allocates nothing).
+    pub fn cull_edit_indices_with(
+        key: BrickKey,
+        bvh: &Bvh,
+        config: &super::SdfGridConfig,
+        out: &mut Vec<u32>,
+        stack: &mut Vec<u32>,
+    ) -> Option<()> {
         let brick_world = config.brick_world_size(key.lod);
         let brick_min = config.brick_min_world(key.coord, key.lod);
         let brick_aabb = Aabb3d::from_min_max(brick_min, brick_min + Vec3::splat(brick_world));
-        bvh.query_aabb(&brick_aabb, out);
+        bvh.query_aabb_with(&brick_aabb, out, stack);
+        if out.is_empty() {
+            return None;
+        }
+        // The BVH over-returns: a coarse leaf bounds MANY edits, so a brick gets every edit in the
+        // leaf even if only one actually overlaps it (a small sphere sharing a leaf with a
+        // terrain-scale heightmap is returned for every brick the heightmap's leaf covers). Refine
+        // to edits whose OWN AABB overlaps the brick, so the culled set — and thus the content hash
+        // computed from it — reflects only edits that truly fold here. Without this, moving the
+        // sphere changes the hash of every distant heightmap brick that merely shared its BVH leaf,
+        // invalidating the cache for the whole scene.
+        // Pad the brick by the LOD's SNORM band: an edit whose surface lies within `dist_band` of
+        // the brick still writes (clamped) texels here, so it must survive the refine — matching the
+        // reach in `narrow_band_keep`. Without the pad this would cull band-contributing edits and
+        // leave holes at brick borders.
+        let band = dist_band_world(config, key.lod);
+        let brick_aabb_padded =
+            Aabb3d::from_min_max(brick_min - Vec3::splat(band), brick_min + Vec3::splat(brick_world + band));
+        out.retain(|&i| {
+            bvh.edit_aabb(i)
+                .is_none_or(|a| aabb_overlaps(a, &brick_aabb_padded))
+        });
         if out.is_empty() {
             return None;
         }
@@ -273,14 +301,14 @@ impl SdfAtlas {
     /// change — the chunk tables read only the palette and tile, both present here. The
     /// placeholder's `dist`/`mat_dist` are never read (the GPU owns those texels), so they
     /// stay zero-filled.
-    pub fn insert_gpu_brick(&mut self, key: BrickKey, palette: Palette) -> u32 {
+    pub fn insert_gpu_brick(&mut self, key: BrickKey, palette: Palette, baked_hash: u64) -> u32 {
         let tile = self.tiles.alloc(key);
         self.gpu_baked_tiles.insert(tile);
         self.generation = self.generation.wrapping_add(1);
         let palette_changed = self.bricks.get(&key).is_some_and(|old| old.palette != palette);
         let placeholder = PackedBrick {
             palette,
-            baked_epoch: self.edit_epoch,
+            baked_hash,
         };
         let is_new = self.bricks.insert(key, placeholder).is_none();
         if is_new || palette_changed {
@@ -354,6 +382,17 @@ pub fn ring_brick_keys(config: &super::SdfGridConfig, camera_pos: Vec3) -> Vec<B
         }
     }
     keys
+}
+
+/// Conservative AABB-vs-AABB overlap (touching faces count). Used to refine the BVH's
+/// over-returned per-brick candidate set down to edits whose own box reaches the brick.
+fn aabb_overlaps(a: &Aabb3d, b: &Aabb3d) -> bool {
+    a.min.x <= b.max.x
+        && a.max.x >= b.min.x
+        && a.min.y <= b.max.y
+        && a.max.y >= b.min.y
+        && a.min.z <= b.max.z
+        && a.max.z >= b.min.z
 }
 
 /// Brick keys (at LOD `lod`) that an edit with tight world `aabb` can affect. The AABB
@@ -476,7 +515,7 @@ mod tests {
         let key = BrickKey::new(0, IVec3::ZERO);
         let gen0 = atlas.generation;
         let topo0 = atlas.topology_generation;
-        let tile = atlas.insert_gpu_brick(key, [0; PALETTE_K]);
+        let tile = atlas.insert_gpu_brick(key, [0; PALETTE_K], 0);
         assert_eq!(atlas.tiles.tile(&key), Some(tile));
         assert!(atlas.gpu_baked_tiles.contains(&tile));
         assert!(atlas.bricks.contains_key(&key));
@@ -492,7 +531,7 @@ mod tests {
     fn eviction_bumps_generation_for_gpu_extract() {
         let mut atlas = SdfAtlas::default();
         let key = BrickKey::new(0, IVec3::ZERO);
-        atlas.insert_gpu_brick(key, [0; PALETTE_K]);
+        atlas.insert_gpu_brick(key, [0; PALETTE_K], 0);
 
         let gen_before = atlas.generation;
         let topo_before = atlas.topology_generation;

@@ -145,7 +145,7 @@ impl Plugin for SdfDebugPlugin {
         if app.world().get_resource::<Assets<GizmoAsset>>().is_some() {
             app.add_systems(
                 Update,
-                (draw_bounds, draw_bvh, draw_chunks, live_ray_capture)
+                (draw_bounds, draw_bvh, draw_chunks, draw_baked_bricks, live_ray_capture)
                     .run_if(in_state(AppScene::SdfEditor)),
             );
         }
@@ -605,6 +605,34 @@ fn draw_chunks(
     }
 }
 
+/// Diagnostic: a bright wire cube over every brick the bake EMITTED this frame (from
+/// `BakedBrickDebug`, filled in `emit_gpu_bakes` when enabled). Lets you SEE exactly which
+/// bricks an edit move dirties — e.g. confirm dragging a small object far from the heightmap
+/// doesn't re-bake terrain bricks. Toggled in the SDF Chunks panel.
+fn draw_baked_bricks(
+    mut gizmos: Gizmos<SdfOverlayGizmos>,
+    dbg: Res<super::BakedBrickDebug>,
+    time: Res<Time>,
+) {
+    if !dbg.enabled {
+        return;
+    }
+    let now = time.elapsed_secs();
+    for &(center, size, baked_at) in &dbg.bricks {
+        // Fade alpha from 1 (just baked) to 0 at the fade window's end. Newest = brightest.
+        let age = (now - baked_at).max(0.0);
+        let alpha = (1.0 - age / super::BAKED_BRICK_FADE_SECS).clamp(0.0, 1.0);
+        if alpha <= 0.0 {
+            continue;
+        }
+        gizmos.primitive_3d(
+            &Cuboid::new(size, size, size),
+            Isometry3d::from_translation(center),
+            Color::srgba(1.0, 0.2, 0.8, alpha),
+        );
+    }
+}
+
 /// Panel: resident-chunk count + the overlay toggle (mirrors `bvh_panel`).
 fn chunk_panel(world: &mut World, ui: &mut egui::Ui) {
     let (count, by_lod) = {
@@ -629,6 +657,14 @@ fn chunk_panel(world: &mut World, ui: &mut egui::Ui) {
     {
         let mut state = world.resource_mut::<ChunkDebugState>();
         ui.checkbox(&mut state.visible, "Show chunk boxes");
+    }
+    {
+        let baked_count = world.resource::<super::BakedBrickDebug>().bricks.len();
+        let mut dbg = world.resource_mut::<super::BakedBrickDebug>();
+        ui.checkbox(&mut dbg.enabled, "Show baked bricks (this frame)");
+        if dbg.enabled {
+            ui.label(format!("  baked this frame: {baked_count}"));
+        }
     }
 }
 

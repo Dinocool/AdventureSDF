@@ -45,6 +45,7 @@ pub mod height;
 pub mod node_gizmos;
 pub mod picking;
 pub mod render;
+pub mod scatter;
 pub mod textures;
 
 use bevy::core_pipeline::prepass::DepthPrepass;
@@ -99,6 +100,23 @@ pub struct WireframeBoundsVisible(pub bool);
 /// default so the overlay stays clean; see `draw_lod_rings`.
 #[derive(Resource, Default)]
 pub struct LodRingsVisible(pub bool);
+
+/// Diagnostic: world-space center + size of recently-baked bricks, each tagged with the time it
+/// was baked so the editor can FADE the wire box out over a few seconds. Lets you SEE which
+/// bricks an edit move dirties (e.g. confirm a far small object doesn't touch the heightmap) AND
+/// how rapidly — a continuous drag leaves a bright cloud, an idle frame fades to nothing.
+/// Entries accumulate across frames (NOT cleared each frame); the draw system drops expired ones.
+/// `enabled` gates collection so it costs nothing when off. Owned by the core module so the
+/// scheduler can fill it without the editor feature; the draw system is editor-gated.
+#[derive(Resource, Default)]
+pub struct BakedBrickDebug {
+    pub enabled: bool,
+    /// (center, edge_size, baked_at_secs) per recently-baked brick.
+    pub bricks: Vec<(Vec3, f32, f32)>,
+}
+
+/// How long (seconds) a baked-brick marker stays visible, fading to transparent over its life.
+pub const BAKED_BRICK_FADE_SECS: f32 = 2.0;
 
 /// Last CPU ray-step capture from the debug ray inspector. Empty until a capture
 /// is requested.
@@ -415,6 +433,7 @@ impl Plugin for SdfScenePlugin {
             .init_resource::<SdfRenderEnabled>()
             .init_resource::<SdfRaymarchParams>()
             .init_resource::<WireframeBoundsVisible>()
+            .init_resource::<BakedBrickDebug>()
             .init_resource::<RayStepCapture>()
             .init_resource::<ViewportInputAllowed>()
             .init_resource::<gizmo::GizmoState>()
@@ -583,78 +602,14 @@ fn setup_sdf_scene(
     ));
     commands.insert_resource(orbit);
 
-    // Demo gallery: a wide, flat sand "ground plane" cube with a spread of distinct
-    // primitives resting on its top surface. All plain unions (no subtracts). The
-    // plane is centred so its top face sits at y = 0; each object's centre is then
-    // placed at y = its half-height so it rests exactly on the surface.
-    // (order, transform, primitive, material)
-    const PLANE_HALF_Y: f32 = 0.15; // thin slab → reads like a plane
-    let demo: [(u32, Transform, SdfPrimitive, u32); 7] = [
-        // Ground plane: wide + thin, top face at y = 0 (centre at y = -half_y).
-        (
-            0,
-            Transform::from_xyz(0.0, -PLANE_HALF_Y, 0.0),
-            SdfPrimitive::Box {
-                half_extents: Vec3::new(4.0, PLANE_HALF_Y, 3.0),
-            },
-            mat_sand,
-        ),
-        // Box resting on the plane (half-height 0.4 → centre at y = 0.4).
-        (
-            1,
-            Transform::from_xyz(-2.4, 0.4, 0.4),
-            SdfPrimitive::Box {
-                half_extents: Vec3::splat(0.4),
-            },
-            mat_cobble,
-        ),
-        // Headline exemplar: deep-red mirror metal sphere (textureless, scalar PBR).
-        (
-            2,
-            Transform::from_xyz(-1.1, 0.55, -0.3),
-            SdfPrimitive::Sphere { radius: 0.55 },
-            mat_red_metal,
-        ),
-        // Torus lies flat: its half-thickness above centre is `minor` (0.18).
-        (
-            3,
-            Transform::from_xyz(0.2, 0.18, 0.5),
-            SdfPrimitive::Torus {
-                major: 0.5,
-                minor: 0.18,
-            },
-            mat_ground,
-        ),
-        // Rough gold metal exemplar: satin highlight, softer sky reflection.
-        (
-            4,
-            Transform::from_xyz(1.3, 0.68, -0.4),
-            SdfPrimitive::Capsule {
-                half_height: 0.4,
-                radius: 0.28,
-            },
-            mat_gold_rough,
-        ),
-        // Cylinder standing up: half-height above centre.
-        (
-            5,
-            Transform::from_xyz(2.4, 0.5, 0.3),
-            SdfPrimitive::Cylinder {
-                radius: 0.4,
-                half_height: 0.5,
-            },
-            mat_cobble,
-        ),
-        // Glossy white dielectric exemplar: near-mirror clearcoat, strong fresnel rim.
-        (
-            6,
-            Transform::from_xyz(0.6, 0.45, -1.1),
-            SdfPrimitive::Sphere { radius: 0.45 },
-            mat_white_gloss,
-        ),
-    ];
-
-    for (order, transform, prim, registry_id) in demo {
+    // Demo gallery: a wide procedural heightmap ground ringed by cube-towers — each tower a stack
+    // of rotated cobble cubes resting on the terrain surface, capped by a red-metal sphere. Built
+    // deterministically by `edits::gallery_demo_edits` so the bake-cache regression test folds the
+    // EXACT same geometry. Heavy edit count stresses the BVH cull + per-edit AABB refine.
+    let _ = (mat_ground, mat_gold_rough, mat_white_gloss); // demo palette trimmed to 3 roles
+    for (order, transform, prim, registry_id) in
+        edits::gallery_demo_edits(mat_sand, mat_cobble, mat_red_metal)
+    {
         commands.spawn((
             transform,
             prim,
@@ -662,7 +617,7 @@ fn setup_sdf_scene(
                 kind: CsgKind::Union,
                 smoothing: 0.0,
             },
-            SdfOrder(order),
+            order,
             SdfMaterial { registry_id },
             SdfVolume,
             SceneEntity,
