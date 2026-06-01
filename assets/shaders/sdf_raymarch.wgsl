@@ -332,16 +332,18 @@ fn raymarch(origin: vec3<f32>, dir: vec3<f32>, start_t: f32, q: MarchQuality) ->
 // `out_steps` returns the reflection march's step count (for the SDF_DEBUG_REFLECT_STEPS
 // overlay); pass a throwaway when the cost isn't needed.
 fn trace_reflection(origin: vec3<f32>, refl_dir: vec3<f32>, roughness: f32, out_steps: ptr<function, u32>) -> vec3<f32> {
-    // Roughness-driven profile. Smooth (r→0): cone ×2, half the primary steps, 0.6× dist.
-    // Rough (r→1): cone ×16, ~24 steps, 0.25× dist — a blurry, very cheap probe.
+    // Roughness-driven profile, but with a RAISED FLOOR so even a perfect mirror (r→0) can't
+    // approach full primary cost — a measured low-roughness reflection was ~+10ms, doubling the
+    // SDF draw. The floor: min cone ×4 (accept hits sooner), steps capped at ~1/3 the primary
+    // (not 1/2), min dist 0.4× (reflections matter most nearby), and lod_floor ≥1 ALWAYS (a
+    // mirror reads one LOD coarse — barely visible, but the coarse bricks take bigger steps).
+    // Rough end (r→1): cone ×16, ~24 steps, 0.2× dist, lod_floor 4 — a cheap blurry probe.
     let r = clamp(roughness, 0.0, 1.0);
-    // lod_floor is what actually BLURS the reflected image: 0 below r=0.2 (a near-mirror stays
-    // sharp), then ramps to a coarse level as roughness rises so geometry + material soften.
     let q = MarchQuality(
-        mix(2.0, 16.0, r),
-        u32(mix(f32(max_steps()) * 0.5, 24.0, r)),
-        max_dist() * mix(0.6, 0.25, r),
-        u32(clamp((r - 0.2) * 6.0, 0.0, 4.0)),
+        mix(4.0, 16.0, r),
+        u32(mix(f32(max_steps()) * 0.34, 24.0, r)),
+        max_dist() * mix(0.4, 0.2, r),
+        u32(clamp(1.0 + r * 4.0, 1.0, 4.0)),
     );
     // Reflection rays aren't primary screen rays, so they have no cone-prepass tile seed —
     // march from t = 0 (the caller already nudged `origin` off the surface).
