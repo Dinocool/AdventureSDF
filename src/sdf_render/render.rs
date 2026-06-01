@@ -10,7 +10,7 @@ use bevy::render::render_graph::{
 };
 use bevy::render::render_resource::binding_types::{
     sampler, storage_buffer_read_only, storage_buffer_sized, texture_2d, texture_2d_array,
-    texture_3d, texture_storage_2d, texture_storage_3d, uniform_buffer, uniform_buffer_sized,
+    texture_storage_2d, uniform_buffer, uniform_buffer_sized,
 };
 use bevy::render::render_resource::*;
 use bevy::render::renderer::{RenderContext, RenderDevice, RenderQueue};
@@ -310,41 +310,8 @@ struct SdfCombineLabel;
 #[derive(Resource)]
 struct SdfCombineShaderHandle(Handle<Shader>);
 
-/// Combine pass shader (GI cache read + analytic sun + emissive → view target).
+/// Combine pass shader (bilateral-blur GI + analytic sun + emissive → view target).
 const SDF_COMBINE_SHADER_PATH: &str = "shaders/sdf_rc_combine.wgsl";
-
-/// World-space GI irradiance cache: edge length of the camera-centred 3D clipmap (cells per axis).
-/// One cell = one LOD-0 brick. MUST match `CACHE_RES` in sdf_gi_cache_fill.wgsl / sdf_rc_combine.wgsl.
-const SDF_GI_CACHE_RES: u32 = 64;
-
-/// GI-cache fill shader (compute: re-bins cascade-0 into the world-anchored 3D cache).
-const SDF_GI_CACHE_SHADER_PATH: &str = "shaders/sdf_gi_cache_fill.wgsl";
-
-#[derive(Resource)]
-struct SdfGiCacheShaderHandle(Handle<Shader>);
-
-#[derive(Debug, Hash, PartialEq, Eq, Clone, RenderLabel)]
-struct SdfGiCacheLabel;
-
-/// The world-space GI irradiance cache: a `SDF_GI_CACHE_RES³` `Rgba16Float` 3D texture (rgb =
-/// irradiance × validity, a = validity), camera-centred and world-snapped IN-SHADER. The fill
-/// compute pass writes it (storage view); the combine pass reads it (sampled, trilinear). Size is
-/// constant (clipmap), so it's allocated once.
-#[derive(Resource, Default)]
-struct SdfGiCache {
-    tex: Option<Texture>,
-    storage_view: Option<TextureView>,
-    sampled_view: Option<TextureView>,
-    sampler: Option<Sampler>,
-}
-
-/// Compute pipeline for the GI-cache fill. Group 0 = camera (reuses `SdfPipeline::layout_0`);
-/// group 1 = G-buffer albedo + cascade-0 + the storage-write 3D cache.
-#[derive(Resource)]
-struct SdfGiCachePipeline {
-    pipeline_id: CachedComputePipelineId,
-    layout_1: BindGroupLayoutDescriptor,
-}
 
 /// Radiance-cascade trace+merge shader (one fullscreen pass per cascade level, run coarse→fine,
 /// ping-ponging two screen-sized targets). `raymarch` plays three-rc's `traceScene` role.
@@ -869,23 +836,18 @@ impl ViewNode for SdfCombineNode {
         };
 
         let gbuffer = world.resource::<SdfGBuffer>();
-        let gi_cache = world.resource::<SdfGiCache>();
         let (
             Some(albedo_view),
             Some(normal_view),
             Some(emissive_view),
             Some(sampler),
             Some(gi_view),
-            Some(cache_view),
-            Some(cache_sampler),
         ) = (
             &gbuffer.albedo_view,
             &gbuffer.normal_mat_view,
             &gbuffer.emissive_view,
             &gbuffer.sampler,
             &gbuffer.gi_view,
-            &gi_cache.sampled_view,
-            &gi_cache.sampler,
         ) else {
             return Ok(());
         };
@@ -913,8 +875,6 @@ impl ViewNode for SdfCombineNode {
                 emissive_view,
                 sampler,
                 gi_view,
-                cache_view,
-                cache_sampler,
             )),
         );
 
@@ -1154,7 +1114,6 @@ impl Plugin for SdfRenderPlugin {
         let composite_shader_handle: Handle<Shader> = asset_server.load(SDF_COMPOSITE_SHADER_PATH);
         let combine_shader_handle: Handle<Shader> = asset_server.load(SDF_COMBINE_SHADER_PATH);
         let cascade_shader_handle: Handle<Shader> = asset_server.load(SDF_CASCADE_SHADER_PATH);
-        let gi_cache_shader_handle: Handle<Shader> = asset_server.load(SDF_GI_CACHE_SHADER_PATH);
         // Load + retain the imported modules (Custom-path imports aren't auto-loaded).
         let module_handles: Vec<Handle<Shader>> = SDF_SHADER_MODULES
             .iter()
@@ -1202,10 +1161,8 @@ impl Plugin for SdfRenderPlugin {
         render_app.insert_resource(SdfCompositeShaderHandle(composite_shader_handle));
         render_app.insert_resource(SdfCombineShaderHandle(combine_shader_handle));
         render_app.insert_resource(SdfCascadeShaderHandle(cascade_shader_handle));
-        render_app.insert_resource(SdfGiCacheShaderHandle(gi_cache_shader_handle));
         render_app.init_resource::<SdfGBuffer>();
         render_app.init_resource::<SdfCascades>();
-        render_app.init_resource::<SdfGiCache>();
 
         render_app
             .add_systems(ExtractSchedule, extract_sdf_atlas)
@@ -1226,20 +1183,17 @@ impl Plugin for SdfRenderPlugin {
             .add_systems(Render, rebuild_pipeline_on_def_change)
             .add_systems(Render, prepare_sdf_gbuffer)
             .add_systems(Render, prepare_sdf_cascades)
-            .add_systems(Render, prepare_sdf_gi_cache)
             .add_systems(RenderStartup, init_sdf_pipeline)
             .add_systems(RenderStartup, init_cone_pipeline.after(init_sdf_pipeline))
             .add_systems(RenderStartup, init_bake_pipeline.after(init_sdf_pipeline))
             .add_systems(RenderStartup, init_composite_pipeline.after(init_sdf_pipeline))
             .add_systems(RenderStartup, init_combine_pipeline.after(init_sdf_pipeline))
             .add_systems(RenderStartup, init_cascade_pipeline.after(init_sdf_pipeline))
-            .add_systems(RenderStartup, init_gi_cache_pipeline.after(init_sdf_pipeline))
             .add_render_graph_node::<SdfBrickBakeNode>(Core3d, SdfBrickBakeLabel)
             .add_render_graph_node::<ViewNodeRunner<SdfConeNode>>(Core3d, SdfConeLabel)
             .add_render_graph_node::<ViewNodeRunner<SdfGBufferNode>>(Core3d, SdfGBufferLabel)
             .add_render_graph_node::<ViewNodeRunner<SdfCascadeNode>>(Core3d, SdfCascadeLabel)
             .add_render_graph_node::<ViewNodeRunner<SdfCompositeNode>>(Core3d, SdfCompositeLabel)
-            .add_render_graph_node::<ViewNodeRunner<SdfGiCacheNode>>(Core3d, SdfGiCacheLabel)
             .add_render_graph_node::<ViewNodeRunner<SdfCombineNode>>(Core3d, SdfCombineLabel)
             // The brick-bake compute pass writes the atlas BEFORE the view passes read it,
             // so it runs first (after the opaque pass, before the cone prepass + G-buffer).
@@ -1247,12 +1201,11 @@ impl Plugin for SdfRenderPlugin {
             // not per view.
             //
             // Order: opaque → bake → cone prepass → G-buffer → cascade GI → composite(GI gather) →
-            // gi-cache fill → combine(sun+emissive) → transparent. The cascade traces+merges into
-            // cascade 0; the composite gathers cascade 0 into the per-pixel GI texture (combine's
-            // fallback); the gi-cache compute pass re-bins cascade 0 into the WORLD-anchored 3D
-            // cache; the combine reads the cache (world-stable GI) + adds the analytic sun +
-            // emissive → view target. Combine (fills sky on a miss) runs BEFORE the transparent
-            // pass so gizmos (Transparent3d, negative depth_bias) draw on top.
+            // combine(blur+sun+emissive) → transparent. The cascade traces + merges coarse→fine
+            // into cascade 0; the composite gathers cascade 0 into the isolated GI texture; the
+            // combine bilateral-blurs the GI, adds the analytic sun + emissive, and writes the view
+            // target. Combine (which fills the sky on a miss) runs BEFORE the transparent pass so
+            // gizmos (Transparent3d, negative depth_bias) draw on top.
             .add_render_graph_edges(
                 Core3d,
                 (
@@ -1262,7 +1215,6 @@ impl Plugin for SdfRenderPlugin {
                     SdfGBufferLabel,
                     SdfCascadeLabel,
                     SdfCompositeLabel,
-                    SdfGiCacheLabel,
                     SdfCombineLabel,
                     Node3d::MainTransparentPass,
                 ),
@@ -1653,45 +1605,6 @@ fn prepare_sdf_cascades(
         cascades.tex[i] = Some(tex);
     }
     cascades.size = dims;
-}
-
-/// Allocate the world-space GI cache 3D texture (once — it's a fixed `SDF_GI_CACHE_RES³` clipmap,
-/// camera-centred + world-snapped in the shader, so its size never changes). `Rgba16Float`,
-/// storage-write (fill pass) + sampled (combine trilinear). Plus a LINEAR sampler with clamp
-/// addressing for the trilinear read.
-fn prepare_sdf_gi_cache(device: Res<RenderDevice>, mut cache: ResMut<SdfGiCache>) {
-    if cache.tex.is_some() {
-        return;
-    }
-    let res = SDF_GI_CACHE_RES;
-    let tex = device.create_texture(&TextureDescriptor {
-        label: Some("sdf_gi_cache"),
-        size: Extent3d {
-            width: res,
-            height: res,
-            depth_or_array_layers: res,
-        },
-        mip_level_count: 1,
-        sample_count: 1,
-        dimension: TextureDimension::D3,
-        format: GBUFFER_FORMAT,
-        usage: TextureUsages::STORAGE_BINDING | TextureUsages::TEXTURE_BINDING,
-        view_formats: &[],
-    });
-    cache.storage_view = Some(tex.create_view(&TextureViewDescriptor::default()));
-    cache.sampled_view = Some(tex.create_view(&TextureViewDescriptor::default()));
-    cache.sampler = Some(device.create_sampler(&SamplerDescriptor {
-        label: Some("sdf_gi_cache_sampler"),
-        // Linear → hardware trilinear for the validity-weighted world-cell read. Clamp so out-of-
-        // window samples read the edge cell (which has validity ~0 → falls back) rather than wrap.
-        address_mode_u: AddressMode::ClampToEdge,
-        address_mode_v: AddressMode::ClampToEdge,
-        address_mode_w: AddressMode::ClampToEdge,
-        mag_filter: FilterMode::Linear,
-        min_filter: FilterMode::Linear,
-        ..default()
-    }));
-    cache.tex = Some(tex);
 }
 
 // --- Extract: Pack Atlas for GPU ---
@@ -2604,14 +2517,10 @@ fn init_combine_pipeline(
                 texture_2d(TextureSampleType::Float { filterable: false }),
                 texture_2d(TextureSampleType::Float { filterable: false }),
                 texture_2d(TextureSampleType::Float { filterable: false }),
-                // 3: non-filtering sampler (G-buffer textureLoad/Level)
+                // 3: non-filtering sampler
                 sampler(SamplerBindingType::NonFiltering),
-                // 4: the per-pixel GI texture (cache fallback)
+                // 4: the isolated GI texture (read + bilateral-blurred)
                 texture_2d(TextureSampleType::Float { filterable: false }),
-                // 5: the world-space GI cache (3D, filterable for hardware trilinear)
-                texture_3d(TextureSampleType::Float { filterable: true }),
-                // 6: linear sampler for the cache trilinear read
-                sampler(SamplerBindingType::Filtering),
             ),
         ),
     );
@@ -2757,43 +2666,6 @@ fn init_cone_pipeline(
     });
 }
 
-/// Queue the GI-cache fill compute pipeline. Group 0 = camera (reuses `layout_0`); group 1 =
-/// G-buffer albedo + cascade-0 (both sampled) + the storage-write 3D cache. Runs after
-/// `init_sdf_pipeline` so `layout_0` exists.
-fn init_gi_cache_pipeline(
-    mut commands: Commands,
-    pipeline_cache: Res<PipelineCache>,
-    sdf_pipeline: Res<SdfPipeline>,
-    gi_cache_shader: Res<SdfGiCacheShaderHandle>,
-) {
-    let layout_1 = BindGroupLayoutDescriptor::new(
-        "sdf_gi_cache_bind_group_1",
-        &BindGroupLayoutEntries::sequential(
-            ShaderStages::COMPUTE,
-            (
-                // 0: G-buffer albedo (a = camera distance, for cell visibility/identity)
-                texture_2d(TextureSampleType::Float { filterable: false }),
-                // 1: cascade 0 (the radiance source re-binned into the cache)
-                texture_2d(TextureSampleType::Float { filterable: false }),
-                // 2: the 3D cache, storage-write
-                texture_storage_3d(GBUFFER_FORMAT, StorageTextureAccess::WriteOnly),
-            ),
-        ),
-    );
-
-    let pipeline_id = pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
-        label: Some("sdf_gi_cache_pipeline".into()),
-        layout: vec![sdf_pipeline.layout_0.clone(), layout_1.clone()],
-        shader: gi_cache_shader.0.clone(),
-        ..default()
-    });
-
-    commands.insert_resource(SdfGiCachePipeline {
-        pipeline_id,
-        layout_1,
-    });
-}
-
 // --- Render Graph: cone prepass node ---
 
 #[derive(Debug, Hash, PartialEq, Eq, Clone, RenderLabel)]
@@ -2920,96 +2792,6 @@ impl ViewNode for SdfConeNode {
         pass.set_bind_group(1, &bind_group_1, &[]);
         pass.set_bind_group(2, &bind_group_2, &[]);
         pass.dispatch_workgroups(wg_x, wg_y, 1);
-
-        Ok(())
-    }
-}
-
-/// GI-cache fill node: dispatches the compute pass that re-bins cascade-0 into the world-anchored
-/// 3D cache (one thread per cell). Runs after SdfCascade (needs cascade-0) + SdfGBuffer (needs the
-/// G-buffer), before SdfCombine (which samples the cache).
-#[derive(Default)]
-struct SdfGiCacheNode;
-
-impl ViewNode for SdfGiCacheNode {
-    type ViewQuery = ();
-
-    fn run(
-        &self,
-        graph: &mut RenderGraphContext,
-        render_context: &mut RenderContext,
-        _: QueryItem<Self::ViewQuery>,
-        world: &World,
-    ) -> Result<(), NodeRunError> {
-        let view_entity = graph.view_entity();
-        if world.get::<SdfCameraData>(view_entity).is_none() {
-            return Ok(());
-        }
-        if let Some(enabled) = world.get_resource::<SdfRenderEnabled>()
-            && !enabled.0
-        {
-            return Ok(());
-        }
-
-        let gi_cache_pipeline = world.resource::<SdfGiCachePipeline>();
-        let sdf = world.resource::<SdfPipeline>();
-        let pipeline_cache = world.resource::<PipelineCache>();
-        let device = render_context.render_device();
-
-        let Some(pipeline) = pipeline_cache.get_compute_pipeline(gi_cache_pipeline.pipeline_id)
-        else {
-            return Ok(());
-        };
-
-        let cache = world.resource::<SdfGiCache>();
-        let gbuffer = world.resource::<SdfGBuffer>();
-        let cascades = world.resource::<SdfCascades>();
-        let (Some(albedo_view), Some(cascade0_view), Some(storage_view)) = (
-            &gbuffer.albedo_view,
-            &cascades.view[0], // cascade-0 always lands in tex[0]
-            &cache.storage_view,
-        ) else {
-            return Ok(());
-        };
-
-        let Some(camera_uniforms) = world.get_resource::<ComponentUniforms<SdfCameraData>>() else {
-            return Ok(());
-        };
-        let Some(camera_binding) = camera_uniforms.binding() else {
-            return Ok(());
-        };
-        let Some(dyn_off) = world
-            .get::<bevy::render::extract_component::DynamicUniformIndex<SdfCameraData>>(view_entity)
-        else {
-            return Ok(());
-        };
-
-        let layout_0 = pipeline_cache.get_bind_group_layout(&sdf.layout_0);
-        let layout_1 = pipeline_cache.get_bind_group_layout(&gi_cache_pipeline.layout_1);
-
-        let bind_group_0 = device.create_bind_group(
-            "sdf_gi_cache_bind_group_0",
-            &layout_0,
-            &BindGroupEntries::sequential((camera_binding.clone(),)),
-        );
-        let bind_group_1 = device.create_bind_group(
-            "sdf_gi_cache_bind_group_1",
-            &layout_1,
-            &BindGroupEntries::sequential((albedo_view, cascade0_view, storage_view)),
-        );
-
-        // One thread per cell, workgroup 4³ → RES/4 groups per axis.
-        let wg = SDF_GI_CACHE_RES.div_ceil(4);
-        let mut pass = render_context
-            .command_encoder()
-            .begin_compute_pass(&ComputePassDescriptor {
-                label: Some("sdf_gi_cache_fill"),
-                timestamp_writes: None,
-            });
-        pass.set_pipeline(pipeline);
-        pass.set_bind_group(0, &bind_group_0, &[dyn_off.index()]);
-        pass.set_bind_group(1, &bind_group_1, &[]);
-        pass.dispatch_workgroups(wg, wg, wg);
 
         Ok(())
     }

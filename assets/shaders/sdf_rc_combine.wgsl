@@ -38,39 +38,9 @@ struct CombineCamera {
 @group(1) @binding(1) var gbuf_normal_mat: texture_2d<f32>; // rg = octN, b = metal, a = rough
 @group(1) @binding(2) var gbuf_emissive: texture_2d<f32>;   // rgb = emissive, a = sun visibility
 @group(1) @binding(3) var gbuf_sampler: sampler;
-@group(1) @binding(4) var gi_tex: texture_2d<f32>;          // rgb = per-pixel GI (cache fallback)
-// World-space GI irradiance cache (filled by sdf_gi_cache_fill.wgsl). rgb = irradiance×validity,
-// a = validity. Sampled trilinearly with a LINEAR sampler → validity-weighted world-cell average.
-@group(1) @binding(5) var gi_cache: texture_3d<f32>;
-@group(1) @binding(6) var gi_cache_sampler: sampler;
+@group(1) @binding(4) var gi_tex: texture_2d<f32>;          // rgb = per-pixel GI
 
 const SKY_DIST: f32 = 1e8;
-// MUST match sdf_gi_cache_fill.wgsl: the world clipmap is CACHE_RES³ cells, cell = one LOD-0 brick.
-const CACHE_RES: f32 = 64.0;
-
-// Cell edge in world units (= voxel_size · cell_stride), identical to the fill pass.
-fn cell_size() -> f32 {
-    return camera.grid_origin.w * (camera.grid_dims.z - 1.0);
-}
-
-// World-fixed clipmap corner cell — SAME formula as the fill, so cell coords agree exactly.
-fn clipmap_origin_cell(cs: f32) -> vec3<f32> {
-    return floor(camera.camera_pos.xyz / cs) - vec3<f32>(CACHE_RES * 0.5);
-}
-
-// Validity-weighted trilinear sample of the world cache at a surface world position. Returns the
-// flat (SH-L0) irradiance, and `validity` (0 = no valid cells nearby → caller falls back).
-fn sample_gi_cache(world_pos: vec3<f32>) -> vec4<f32> {
-    let cs = cell_size();
-    let origin = clipmap_origin_cell(cs);
-    // `coord = world/cs - origin` equals i+0.5 at cell i's centre (the fill wrote cell i to texel
-    // i); /RES maps that to texel i's centre (i+0.5)/RES, so trilinear interpolates between cells.
-    let uvw = (world_pos / cs - origin) / CACHE_RES;
-    let s = textureSampleLevel(gi_cache, gi_cache_sampler, uvw, 0.0);
-    let validity = s.a;
-    let irradiance = s.rgb / max(validity, 1e-4);
-    return vec4<f32>(irradiance, validity);
-}
 
 @fragment
 fn main(in: FullscreenVertexOutput) -> @location(0) vec4<f32> {
@@ -92,21 +62,9 @@ fn main(in: FullscreenVertexOutput) -> @location(0) vec4<f32> {
     let emissive = em.rgb;
     let sun_vis = em.a;
 
-    // GI from the WORLD-SPACE cache (world-anchored → stable under camera rotation). Reconstruct
-    // this surface's world position, sample the validity-weighted world-cell irradiance, multiply
-    // by albedo·(1-metallic) (SH-L0: flat, normal-independent). Where the cache has no valid cell
-    // (freshly revealed surface, off-screen neighbours), fall back to the composite's per-pixel
-    // screen-space GI so the surface isn't black — blended by cache validity.
+    // GI: the composite pass's per-pixel radiance-cascade gather (diffuse-only, view-independent).
     let centre_px = vec2<i32>(uv * camera.screen_params.xy);
-    let ndc0 = vec4<f32>(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, 1.0, 1.0);
-    let wn0 = camera.inv_view_proj * ndc0;
-    let rd0 = normalize(wn0.xyz / wn0.w - camera.camera_pos.xyz);
-    let world_pos = camera.camera_pos.xyz + rd0 * dist;
-
-    let cache = sample_gi_cache(world_pos);
-    let cache_gi = cache.rgb * albedo * (1.0 - metallic);
-    let fallback_gi = textureLoad(gi_tex, centre_px, 0).rgb;
-    let gi = mix(fallback_gi, cache_gi, clamp(cache.a, 0.0, 1.0));
+    let gi = textureLoad(gi_tex, centre_px, 0).rgb;
 
     // --- Deferred debug views ------------------------------------------------------------------
     // Each is a `#ifdef`-gated early return visualizing one G-buffer / GI channel. The defines are
