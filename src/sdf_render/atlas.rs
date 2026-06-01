@@ -149,6 +149,12 @@ pub struct SdfAtlas {
     /// so it knows which tiles the bake node will write; the CPU holds only a palette-only
     /// placeholder for them. Cleared each frame at the start of `schedule_bakes`.
     pub gpu_baked_tiles: HashSet<u32>,
+    /// Incrementally-maintained chunk lookup + tile-run table. `insert_gpu_brick` / `remove_brick`
+    /// update it inline so the render world uploads only the chunks that changed each frame
+    /// (instead of rebuilding the whole O(bricks) table on every topology change — the
+    /// `extract_sdf` drain spike). Its dirty record is cleared each frame in `First` by
+    /// `clear_chunk_table_dirty`, after the render world has extracted the delta.
+    pub live_chunks: super::chunk::LiveChunkTables,
 }
 
 impl Default for SdfAtlas {
@@ -161,6 +167,7 @@ impl Default for SdfAtlas {
             tiles: TileAllocator::default(),
             last_bake_was_full: false,
             gpu_baked_tiles: HashSet::new(),
+            live_chunks: super::chunk::LiveChunkTables::default(),
         }
     }
 }
@@ -301,7 +308,13 @@ impl SdfAtlas {
     /// change — the chunk tables read only the palette and tile, both present here. The
     /// placeholder's `dist`/`mat_dist` are never read (the GPU owns those texels), so they
     /// stay zero-filled.
-    pub fn insert_gpu_brick(&mut self, key: BrickKey, palette: Palette, baked_hash: u64) -> u32 {
+    pub fn insert_gpu_brick(
+        &mut self,
+        key: BrickKey,
+        palette: Palette,
+        baked_hash: u64,
+        config: &super::SdfGridConfig,
+    ) -> u32 {
         let tile = self.tiles.alloc(key);
         self.gpu_baked_tiles.insert(tile);
         self.generation = self.generation.wrapping_add(1);
@@ -313,6 +326,11 @@ impl SdfAtlas {
         let is_new = self.bricks.insert(key, placeholder).is_none();
         if is_new || palette_changed {
             self.topology_generation = self.topology_generation.wrapping_add(1);
+            // Feed the incremental table. A re-bake that only changed texels (same key + palette +
+            // tile) leaves the table untouched (no topology bump) — its texels upload separately.
+            let (ck, local) = super::chunk::chunk_of(key, config);
+            self.live_chunks
+                .set_brick(ck, local, super::chunk::pack_brick_tile(tile, palette));
         }
         tile
     }
@@ -320,7 +338,7 @@ impl SdfAtlas {
     /// Remove the brick at `key` (if present), freeing its tile. Returns whether a brick
     /// was actually removed. The freed tile's texels are harmless once the lookup is
     /// rebuilt (no live entry references them).
-    pub fn remove_brick(&mut self, key: &BrickKey) -> bool {
+    pub fn remove_brick(&mut self, key: &BrickKey, config: &super::SdfGridConfig) -> bool {
         if self.bricks.remove(key).is_some() {
             self.tiles.release(key);
             // Eviction changes both the resident set and the GPU chunk tables. Bump BOTH
@@ -330,6 +348,8 @@ impl SdfAtlas {
             // evicted (e.g. flying away from the scene) without applying any new bake.
             self.generation = self.generation.wrapping_add(1);
             self.topology_generation = self.topology_generation.wrapping_add(1);
+            let (ck, local) = super::chunk::chunk_of(*key, config);
+            self.live_chunks.clear_brick(ck, local);
             true
         } else {
             false
@@ -511,11 +531,12 @@ mod tests {
     /// generations so the render world re-extracts + rebuilds the chunk tables.
     #[test]
     fn insert_gpu_brick_allocates_and_bumps() {
+        let cfg = super::super::SdfGridConfig::default();
         let mut atlas = SdfAtlas::default();
         let key = BrickKey::new(0, IVec3::ZERO);
         let gen0 = atlas.generation;
         let topo0 = atlas.topology_generation;
-        let tile = atlas.insert_gpu_brick(key, [0; PALETTE_K], 0);
+        let tile = atlas.insert_gpu_brick(key, [0; PALETTE_K], 0, &cfg);
         assert_eq!(atlas.tiles.tile(&key), Some(tile));
         assert!(atlas.gpu_baked_tiles.contains(&tile));
         assert!(atlas.bricks.contains_key(&key));
@@ -529,18 +550,19 @@ mod tests {
     /// rendering just-dropped bricks. A no-op remove must NOT bump.
     #[test]
     fn eviction_bumps_generation_for_gpu_extract() {
+        let cfg = super::super::SdfGridConfig::default();
         let mut atlas = SdfAtlas::default();
         let key = BrickKey::new(0, IVec3::ZERO);
-        atlas.insert_gpu_brick(key, [0; PALETTE_K], 0);
+        atlas.insert_gpu_brick(key, [0; PALETTE_K], 0, &cfg);
 
         let gen_before = atlas.generation;
         let topo_before = atlas.topology_generation;
-        assert!(atlas.remove_brick(&key), "brick must actually be removed");
+        assert!(atlas.remove_brick(&key, &cfg), "brick must actually be removed");
         assert_ne!(atlas.generation, gen_before, "eviction must bump the upload generation");
         assert_ne!(atlas.topology_generation, topo_before, "eviction must bump the topology generation");
 
         let gen_after = atlas.generation;
-        assert!(!atlas.remove_brick(&key), "second remove is a no-op");
+        assert!(!atlas.remove_brick(&key, &cfg), "second remove is a no-op");
         assert_eq!(atlas.generation, gen_after, "no-op remove must not bump the generation");
     }
 }

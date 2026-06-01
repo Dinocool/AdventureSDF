@@ -572,7 +572,7 @@ pub fn schedule_bakes(
                 let ck = chunk::ChunkKey::new(lod, coord);
                 sched.pending.remove(&ck);
                 for_each_brick_key(ck, &config, |bk| {
-                    atlas.remove_brick(&bk);
+                    atlas.remove_brick(&bk, &config);
                 });
             });
         }
@@ -869,7 +869,7 @@ fn apply_verdicts(
     for ((ck, key), verdict) in candidates.iter().zip(verdicts) {
         match verdict {
             Verdict::Empty | Verdict::Drop => {
-                atlas.remove_brick(key);
+                atlas.remove_brick(key, config);
             }
             // Resident brick, content unchanged (hash matched in classify) → texels still valid,
             // leave it as-is. This is what keeps a sphere dragged over the heightmap cheap.
@@ -886,11 +886,11 @@ fn apply_verdicts(
                     // resident would serve its stale shape over the freshly-baked coarse level (the
                     // "old surface band left behind while dragging"). Evict it so the lookup misses
                     // and falls back to the correct coarse LOD until its real bake lands.
-                    atlas.remove_brick(key);
+                    atlas.remove_brick(key, config);
                     spilled.insert(*ck);
                     continue;
                 }
-                let tile = atlas.insert_gpu_brick(*key, palette, hash);
+                let tile = atlas.insert_gpu_brick(*key, palette, hash, config);
                 push_bake_job(gpu_bakes, edits_snapshot, config, *key, tile, &indices, palette);
                 if baked_dbg.enabled {
                     let bw = config.brick_world_size(key.lod);
@@ -952,7 +952,7 @@ fn emit_gpu_bakes(
         config,
         &mut scratch.candidates,
         |key| {
-            atlas.remove_brick(&key);
+            atlas.remove_brick(&key, config);
         },
     );
 
@@ -1101,7 +1101,7 @@ fn dispatch_bake(
     scratch.drained.extend(sched.pending.drain());
     sort_drained(&mut scratch.drained, config, camera_pos);
     gather_candidates(&scratch.drained, &bvh_snapshot, config, &mut scratch.candidates, |key| {
-        atlas.remove_brick(&key);
+        atlas.remove_brick(&key, config);
     });
 
     let candidate_count = scratch.candidates.len();
@@ -1191,7 +1191,7 @@ mod tests {
                     let ck = chunk::ChunkKey::new(lod, coord);
                     sched.pending.remove(&ck);
                     for bk in chunk_brick_keys(ck, cfg) {
-                        atlas.remove_brick(&bk);
+                        atlas.remove_brick(&bk, cfg);
                     }
                 });
             }
@@ -1776,7 +1776,7 @@ mod tests {
         // actually visit it).
         let far_chunk = chunk::ChunkKey::new(0, IVec3::new(100, 0, 0));
         let far = chunk_brick_keys(far_chunk, &cfg)[0];
-        atlas.insert_gpu_brick(far, [edits::PALETTE_EMPTY; edits::PALETTE_K], 0);
+        atlas.insert_gpu_brick(far, [edits::PALETTE_EMPTY; edits::PALETTE_K], 0, &cfg);
         assert!(atlas.bricks.contains_key(&far));
         // The edit doesn't reach this far brick, so it classifies as Empty and is evicted this
         // frame regardless of any content hash — the content-hash skip only applies to a Keep.
@@ -1878,7 +1878,7 @@ mod tests {
                 for_each_exited_chunk(new_origin, old_origin, r, |coord| {
                     let ck = chunk::ChunkKey::new(lod, coord);
                     sched.pending.remove(&ck);
-                    for_each_brick_key(ck, &cfg, |bk| { atlas.remove_brick(&bk); });
+                    for_each_brick_key(ck, &cfg, |bk| { atlas.remove_brick(&bk, &cfg); });
                 });
                 sched.ring_chunk_origin[li] = new_origin;
             }

@@ -507,6 +507,13 @@ impl Plugin for SdfScenePlugin {
             // displacement edit triggers a rebake the same frame.
             // Expand any loaded TowerSpawner node into its tower-field volumes (the stress scene).
             // Before the baker so the spawned volumes bake the same frame they appear.
+            // Clear last frame's incremental chunk-table delta record at the START of the frame —
+            // AFTER the render world extracted it (extract runs at the end of the prior frame) and
+            // BEFORE `schedule_bakes` accumulates this frame's. See `clear_chunk_table_dirty`.
+            .add_systems(
+                First,
+                clear_chunk_table_dirty.run_if(in_state(AppScene::SdfEditor)),
+            )
             .add_systems(
                 Update,
                 stress::expand_tower_spawners
@@ -1179,6 +1186,15 @@ fn draw_lod_rings(
 
 fn upload_sdf_buffers(_atlas: Res<atlas::SdfAtlas>) {
     // Render world will pick up atlas changes via extract
+}
+
+/// Clear the incremental chunk-table delta record (dirty rows/slots/sentinel) accumulated last
+/// frame. Runs in `First`, AFTER the render world extracted the delta (extract runs at the end of
+/// the previous frame) and BEFORE `schedule_bakes` accumulates this frame's changes — so each
+/// frame's `dirty_*` sets carry exactly that frame's topology mutations. `schedule_bakes` only
+/// APPENDS to these sets (never reads them), so a start-of-frame clear can't drop pending work.
+fn clear_chunk_table_dirty(mut atlas: ResMut<atlas::SdfAtlas>) {
+    atlas.live_chunks.clear_dirty();
 }
 
 /// Rebuild the bake-time height cache when the material registry's displacement columns

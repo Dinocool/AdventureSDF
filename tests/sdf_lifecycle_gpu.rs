@@ -237,12 +237,12 @@ fn emit(atlas: &mut SdfAtlas, cfg: &SdfGridConfig, bvh: &Bvh, resolved: &[Resolv
                 let samples = SdfAtlas::brick_palette_samples(key, vs);
                 let culled: Vec<ResolvedEdit> = scratch.iter().map(|&i| resolved[i as usize].clone()).collect();
                 let pal = build_palette(&culled, &samples);
-                let tile = atlas.insert_gpu_brick(key, pal, 0);
+                let tile = atlas.insert_gpu_brick(key, pal, 0, cfg);
                 let edit_start = edits.len() as u32;
                 for e in &culled { edits.push(to_gpu_edit(e)); }
                 jobs.push(Job { tile, coord: key.coord, voxel_size: vs, dist_band: dist_band_world(cfg, key.lod), pal, edit_start, edit_count: culled.len() as u32 });
             } else {
-                atlas.remove_brick(&key);
+                atlas.remove_brick(&key, cfg);
             }
         }
     }
@@ -307,7 +307,7 @@ fn recenter(ring: &mut Vec<IVec3>, atlas: &mut SdfAtlas, cfg: &SdfGridConfig, bv
         if !first {
             for ck in chunk_window_keys(old_o, r, lod) {
                 if !chunk_in_window(ck.coord, new_o, r) {
-                    for bk in chunk_brick_keys(ck, cfg) { atlas.remove_brick(&bk); }
+                    for bk in chunk_brick_keys(ck, cfg) { atlas.remove_brick(&bk, cfg); }
                 }
             }
         }
