@@ -5,7 +5,9 @@
 use bevy::prelude::*;
 use bevy_egui::egui;
 
-use crate::sdf_render::debug::{spawn_directional_light, spawn_empty_node, spawn_sdf_primitive};
+use crate::sdf_render::debug::{
+    spawn_directional_light, spawn_empty_node, spawn_point_light, spawn_sdf_primitive,
+};
 use crate::sdf_render::{SdfPrimitive, SdfSelection};
 
 use super::reparent::reparent_preserving_world;
@@ -94,12 +96,20 @@ const NODE_CATALOG: &[NodeCategory] = &[
     },
     NodeCategory {
         label: "Lights",
-        types: &[NodeType {
-            label: "Directional Light",
-            icon: "☀",
-            hint: "Sun-style directional light (editor gizmo shows its direction).",
-            spawn: spawn_directional_light,
-        }],
+        types: &[
+            NodeType {
+                label: "Directional Light",
+                icon: "☀",
+                hint: "Sun-style directional light (editor gizmo shows its direction).",
+                spawn: spawn_directional_light,
+            },
+            NodeType {
+                label: "Point Light",
+                icon: "◉",
+                hint: "Omnidirectional point light; drag the ring handle to set its radius.",
+                spawn: spawn_point_light,
+            },
+        ],
     },
 ];
 

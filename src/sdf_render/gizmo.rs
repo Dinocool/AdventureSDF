@@ -473,6 +473,16 @@ pub fn gizmo_update(
     globals: Query<&GlobalTransform>,
     parents: Query<&ChildOf>,
 ) {
+    // A node-gizmo interaction earlier in the `Last` chain (e.g. the point-light radius
+    // drag) may have already claimed this frame's click. If so, yield: don't reset the
+    // claim and don't process the transform handles, so the two never fight over a press.
+    if state.claimed_click {
+        state.hovered = None;
+        if !mouse.pressed(MouseButton::Left) {
+            state.drag = None;
+        }
+        return;
+    }
     state.claimed_click = false;
 
     // Defensive: also clear here. The authoritative release-clear is
