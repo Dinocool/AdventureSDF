@@ -960,6 +960,35 @@ pub fn spawn_directional_light(world: &mut World) -> Entity {
         .id()
 }
 
+/// Spawn a point-light node near the orbit target, with its editor gizmo (a camera-facing
+/// ring + draggable radius handle). Uses a real Bevy `PointLight` so it lights both SDF and
+/// regular meshes; `range` is the source of truth for the gizmo's ring radius. Returns the
+/// new entity.
+pub fn spawn_point_light(world: &mut World) -> Entity {
+    let pos = world.resource::<SdfOrbitCamera>().target + Vec3::Y * 2.0;
+    world
+        .spawn((
+            Name::new("Point Light"),
+            PointLight {
+                // Warm white, bright enough to clearly light nearby geometry without
+                // blowing out. `range` = falloff cutoff (outer gizmo ring); `radius` =
+                // physical light size for soft shadows (inner gizmo ring) — both editable
+                // via their handles and the inspector.
+                color: Color::srgb(1.0, 0.95, 0.85),
+                intensity: 1_000_000.0,
+                range: 5.0,
+                radius: 0.5,
+                shadows_enabled: false,
+                ..default()
+            },
+            Transform::from_translation(pos),
+            crate::node::Node3D,
+            crate::node::EditorGizmo::PointLight { scale: 1.0 },
+            SceneEntity,
+        ))
+        .id()
+}
+
 /// Spawn an empty `Node3D` (a transform-only grouping/locator node) at the orbit
 /// target, with an axes gizmo so it is visible. Returns the new entity.
 pub fn spawn_empty_node(world: &mut World) -> Entity {

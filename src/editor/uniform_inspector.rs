@@ -47,42 +47,21 @@ pub fn uniforms_ui(world: &mut World, ui: &mut bevy_egui::egui::Ui) {
         return;
     }
 
-    let labels: Vec<String> = {
-        let registry = world.resource::<UniformInspectorRegistry>();
-        registry.entries.keys().cloned().collect()
-    };
-
-    if labels.is_empty() {
-        ui.label("No uniforms registered");
-        return;
-    }
-
-    for label in &labels {
-        ui.collapsing(label.as_str(), |ui| {
-            let has_entry = {
-                let registry = world.resource::<UniformInspectorRegistry>();
-                registry.entries.contains_key(label)
-            };
-
-            if !has_entry {
-                ui.label("Entry not found");
-                return;
-            }
-
-            let data = {
-                let registry = world.resource::<UniformInspectorRegistry>();
-                let entry = registry.entries.get(label).unwrap();
-                (entry.read)(world)
-            };
-
-            let Some(mut data) = data else {
-                ui.label("No data available");
-                return;
-            };
-
-            let registry = world.resource::<UniformInspectorRegistry>();
-            let entry = registry.entries.get(label).unwrap();
-            (entry.ui)(ui, data.as_mut());
-        });
-    }
+    // Take the registry out once so each entry's `read`/`ui` callback gets exclusive
+    // `&mut World` without re-borrowing the registry per iteration.
+    crate::editor::fs_util::with_registry(world, |world, registry: &UniformInspectorRegistry| {
+        if registry.entries.is_empty() {
+            ui.label("No uniforms registered");
+            return;
+        }
+        for (label, entry) in registry.entries.iter() {
+            ui.collapsing(label.as_str(), |ui| {
+                let Some(mut data) = (entry.read)(world) else {
+                    ui.label("No data available");
+                    return;
+                };
+                (entry.ui)(ui, data.as_mut());
+            });
+        }
+    });
 }

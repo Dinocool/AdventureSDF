@@ -32,28 +32,11 @@ pub fn project_files_ui(world: &mut World, ui: &mut egui::Ui) {
 /// Recursively render a directory as collapsing headers; files as labels. A folder
 /// header's body-open click also reports its root-relative path via `nav_to`.
 fn dir_tree(ui: &mut egui::Ui, dir: &Path, nav_to: &mut Option<PathBuf>) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    // Collect + sort: directories first, then files, each alphabetically.
-    let mut dirs = Vec::new();
-    let mut files = Vec::new();
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            dirs.push(path);
-        } else {
-            files.push(path);
-        }
-    }
-    dirs.sort();
-    files.sort();
+    // Directories first, then files, each alphabetically (shared traversal).
+    let (dirs, files) = crate::editor::fs_util::read_sorted(dir);
 
     for d in dirs {
-        let name = d
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_default();
+        let name = crate::editor::fs_util::file_name_str(&d);
         let header = egui::CollapsingHeader::new(format!("\u{1F4C1} {name}"))
             .id_salt(&d)
             .show(ui, |ui| {
@@ -61,16 +44,13 @@ fn dir_tree(ui: &mut egui::Ui, dir: &Path, nav_to: &mut Option<PathBuf>) {
             });
         // Clicking the header label syncs the Assets browser to this folder.
         if header.header_response.clicked()
-            && let Ok(rel) = d.strip_prefix(ASSETS_ROOT)
+            && let Some(rel) = crate::editor::fs_util::relative_to_assets(&d)
         {
-            *nav_to = Some(rel.to_path_buf());
+            *nav_to = Some(rel);
         }
     }
     for f in files {
-        let name = f
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_default();
+        let name = crate::editor::fs_util::file_name_str(&f);
         ui.label(format!("  {name}"));
     }
 }

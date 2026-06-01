@@ -1,15 +1,9 @@
-//! Thumbnail backends for the assets browser.
-//!
-//! Two caches, both keyed by asset path and filled by Bevy systems (the panel only
-//! reads the resulting `egui::TextureId`):
-//! - [`ImageThumbnailCache`] — loads image files via the `AssetServer` and registers
-//!   them with egui once the GPU image exists.
-//! - [`MaterialThumbnailCache`] — captures a lit PBR sphere with each `*.material.ron`
-//!   applied. A shared sphere + light live on a dedicated [`RenderLayers`]; each
-//!   material gets a one-shot capture camera (fixed render target, never swapped) with
-//!   a [`Readback`] on its image. The capture is frozen exactly when the GPU returns a
-//!   non-blank readback (the authoritative "render done" signal) — no frame-count
-//!   guessing. One capture is in flight at a time.
+//! Material-sphere thumbnail backend: captures a lit PBR sphere with each `*.material.ron`
+//! applied. A shared sphere + light live on a dedicated [`RenderLayers`]; each material
+//! gets a one-shot capture camera (fixed render target, never swapped) with a [`Readback`]
+//! on its image. The capture is frozen exactly when the GPU returns a non-blank readback
+//! (the authoritative "render done" signal) — no frame-count guessing. One capture is in
+//! flight at a time. Rendered thumbnails are cached to disk so previews survive runs.
 
 use std::path::{Path, PathBuf};
 
@@ -19,16 +13,14 @@ use bevy::camera::RenderTarget;
 use bevy::image::{Image, ImageSampler};
 use bevy::prelude::*;
 use bevy::render::gpu_readback::{Readback, ReadbackComplete};
-use bevy::render::render_resource::{
-    Extent3d, TextureDimension, TextureFormat, TextureUsages,
-};
+use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat, TextureUsages};
 use bevy_egui::{EguiTextureHandle, EguiUserTextures, egui};
 
 use crate::assets::MaterialAsset;
 
-use super::{Thumbnail, ThumbnailProvider};
+use super::super::{Thumbnail, ThumbnailProvider};
 
-/// Pixel size of a rendered/loaded thumbnail texture.
+/// Pixel size of a rendered thumbnail texture.
 const THUMB_SIZE: u32 = 96;
 /// Render layer the material-sphere rig lives on, isolated from the main view.
 const THUMB_LAYER: usize = 16;
@@ -41,99 +33,6 @@ const THUMB_TARGET_USAGE: TextureUsages = TextureUsages::TEXTURE_BINDING
     .union(TextureUsages::COPY_DST)
     .union(TextureUsages::COPY_SRC)
     .union(TextureUsages::RENDER_ATTACHMENT);
-
-// === Image thumbnails ================================================================
-
-/// Cache of image-file thumbnails: handle (keeps the image resident) + egui id once
-/// the GPU image is ready.
-#[derive(Resource, Default)]
-pub struct ImageThumbnailCache {
-    entries: std::collections::HashMap<PathBuf, ImageSlot>,
-}
-
-struct ImageSlot {
-    handle: Handle<Image>,
-    tex_id: Option<egui::TextureId>,
-}
-
-/// Provider for raster image files.
-pub struct ImageThumbnailProvider;
-
-impl ThumbnailProvider for ImageThumbnailProvider {
-    fn matches(&self, path: &Path) -> bool {
-        matches!(
-            path.extension().and_then(|e| e.to_str()).map(|e| e.to_lowercase()).as_deref(),
-            Some("png" | "jpg" | "jpeg" | "bmp" | "tga")
-        )
-    }
-
-    fn thumbnail(&self, world: &mut World, path: &Path) -> Thumbnail {
-        match ensure_image_texture(world, path) {
-            ImageTexture::Ready { tex_id, .. } => Thumbnail::Texture(tex_id),
-            ImageTexture::Loading => Thumbnail::Pending,
-            ImageTexture::Invalid => Thumbnail::Icon("\u{1F5BC}"),
-        }
-    }
-}
-
-/// State of a cached image thumbnail/preview.
-pub enum ImageTexture {
-    /// Loaded + registered with egui.
-    Ready {
-        tex_id: egui::TextureId,
-        handle: Handle<Image>,
-    },
-    /// Still loading.
-    Loading,
-    /// Not an asset under `assets/` (bad path).
-    Invalid,
-}
-
-/// Ensure an image at `path` (working-dir-relative, under `assets/`) is loaded and
-/// registered with egui; cache by path. Reused by the grid provider and the asset
-/// inspector's texture preview. Idempotent.
-pub fn ensure_image_texture(world: &mut World, path: &Path) -> ImageTexture {
-    let Some(asset_path) = path
-        .strip_prefix(super::ASSETS_ROOT)
-        .ok()
-        .map(Path::to_path_buf)
-    else {
-        return ImageTexture::Invalid;
-    };
-
-    let key = path.to_path_buf();
-    if !world.resource::<ImageThumbnailCache>().entries.contains_key(&key) {
-        let handle = world.resource::<AssetServer>().load::<Image>(asset_path);
-        world
-            .resource_mut::<ImageThumbnailCache>()
-            .entries
-            .insert(key.clone(), ImageSlot { handle, tex_id: None });
-    }
-
-    let slot_handle = world.resource::<ImageThumbnailCache>().entries[&key].handle.clone();
-    if let Some(id) = world.resource::<ImageThumbnailCache>().entries[&key].tex_id {
-        return ImageTexture::Ready { tex_id: id, handle: slot_handle };
-    }
-
-    if world
-        .resource::<AssetServer>()
-        .is_loaded_with_dependencies(&slot_handle)
-    {
-        let id = world
-            .resource_mut::<EguiUserTextures>()
-            .add_image(EguiTextureHandle::Strong(slot_handle.clone()));
-        world
-            .resource_mut::<ImageThumbnailCache>()
-            .entries
-            .get_mut(&key)
-            .unwrap()
-            .tex_id = Some(id);
-        return ImageTexture::Ready { tex_id: id, handle: slot_handle };
-    }
-    ImageTexture::Loading
-}
-
-// === Material sphere thumbnails ======================================================
 
 /// One material's thumbnail capture slot.
 struct MaterialSlot {
@@ -261,15 +160,11 @@ pub struct MaterialThumbnailProvider;
 
 impl ThumbnailProvider for MaterialThumbnailProvider {
     fn matches(&self, path: &Path) -> bool {
-        path.to_string_lossy().to_lowercase().ends_with(".material.ron")
+        crate::editor::fs_util::is_material_ron(path)
     }
 
     fn thumbnail(&self, world: &mut World, path: &Path) -> Thumbnail {
-        let Some(asset_path) = path
-            .strip_prefix(super::ASSETS_ROOT)
-            .ok()
-            .map(Path::to_path_buf)
-        else {
+        let Some(asset_path) = crate::editor::fs_util::relative_to_assets(path) else {
             return Thumbnail::Icon("\u{1F535}");
         };
         let key = path.to_path_buf();
@@ -591,23 +486,17 @@ fn invalidate_on_material_change(
     }
 }
 
-/// Plugin: registers the thumbnail caches + the offscreen render rig + systems.
-/// Systems are gated on `EguiUserTextures` (present only with the editor's egui).
-pub struct ThumbnailRenderPlugin;
-
-impl Plugin for ThumbnailRenderPlugin {
-    fn build(&self, app: &mut App) {
-        app.init_resource::<ImageThumbnailCache>()
-            .init_resource::<MaterialThumbnailCache>()
-            .add_systems(
-                Update,
-                (
-                    setup_thumbnail_rig,
-                    render_material_thumbnails,
-                    invalidate_on_material_change,
-                )
-                    .chain()
-                    .run_if(resource_exists::<EguiUserTextures>),
-            );
-    }
+/// Register the material-thumbnail cache + render systems. Systems are gated on
+/// `EguiUserTextures` (present only with the editor's egui).
+pub(super) fn register(app: &mut App) {
+    app.init_resource::<MaterialThumbnailCache>().add_systems(
+        Update,
+        (
+            setup_thumbnail_rig,
+            render_material_thumbnails,
+            invalidate_on_material_change,
+        )
+            .chain()
+            .run_if(resource_exists::<EguiUserTextures>),
+    );
 }

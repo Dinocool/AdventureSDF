@@ -42,6 +42,7 @@ pub mod debug;
 pub mod edits;
 pub mod gizmo;
 pub mod height;
+pub mod node_gizmos;
 pub mod picking;
 pub mod render;
 pub mod textures;
@@ -64,6 +65,13 @@ pub struct SdfOverlayGizmos;
 /// behind them) rather than always drawing on top.
 #[derive(Default, Reflect, GizmoConfigGroup)]
 pub struct SdfGridGizmos;
+
+/// Gizmo config group for node editor glyphs (light suns, empty-node axes). Uses
+/// default depth (`depth_bias = 0.0`) so the SDF surface and other geometry occlude a
+/// glyph that sits behind them — unlike the always-on-top transform handles in
+/// [`SdfOverlayGizmos`].
+#[derive(Default, Reflect, GizmoConfigGroup)]
+pub struct SdfNodeGizmos;
 
 // --- Components ---
 
@@ -494,10 +502,11 @@ impl Plugin for SdfScenePlugin {
             }
             app.init_gizmo_group::<SdfOverlayGizmos>()
                 .init_gizmo_group::<SdfGridGizmos>()
+                .init_gizmo_group::<SdfNodeGizmos>()
                 .add_systems(OnEnter(AppScene::SdfEditor), configure_overlay_gizmos)
                 .add_systems(
                     Update,
-                    (draw_ground_grid, draw_node_editor_gizmos, gizmo::draw_gizmo)
+                    (draw_ground_grid, gizmo::draw_gizmo)
                         .run_if(in_state(AppScene::SdfEditor)),
                 )
                 // LOD ring overlay: only while the toggle is on (LodRingsVisible, F8),
@@ -508,6 +517,10 @@ impl Plugin for SdfScenePlugin {
                         .run_if(in_state(AppScene::SdfEditor))
                         .run_if(|v: Res<LodRingsVisible>| v.0),
                 );
+
+            // Per-node-type gizmos (light glyphs, point-light ring + radius drag, axes)
+            // own their draw/pick/interaction in `node_gizmos`.
+            node_gizmos::register(app);
         }
 
         #[cfg(feature = "editor")]
@@ -915,12 +928,8 @@ pub fn gather_sorted_edits(volumes: &Query<VolumeQueryData, With<SdfVolume>>) ->
 /// Left-click selects the SDF volume under the cursor (CPU raymarch pick). Runs
 /// after `gizmo_update` in `Last`; if the gizmo claimed the click (a handle was
 /// grabbed), it bails so grabbing a handle doesn't reselect the volume underneath.
-/// Query filter for non-SDF spatial nodes pickable by screen-proximity (lights/empties).
-type GizmoNodeFilter = (
-    With<crate::node::Node3D>,
-    Without<SdfVolume>,
-    Without<SdfCamera>,
-);
+/// Query filter for non-SDF spatial nodes pickable via their gizmo bounds (lights/empties).
+type GizmoNodeFilter = (Without<SdfVolume>, Without<SdfCamera>);
 
 #[allow(clippy::too_many_arguments)]
 fn sdf_picking(
@@ -930,9 +939,11 @@ fn sdf_picking(
     cameras: Query<(&Camera, &GlobalTransform, &Transform), With<SdfCamera>>,
     windows: Query<&Window>,
     volumes: Query<VolumeQueryData, With<SdfVolume>>,
-    // Non-SDF spatial nodes (lights, cameras, empties) have no raymarchable geometry, so
-    // they're picked by proximity to their screen-projected origin instead.
-    gizmo_nodes: Query<(Entity, &GlobalTransform), GizmoNodeFilter>,
+    // Non-SDF spatial nodes (lights, empties) have no raymarchable geometry, so they're
+    // picked by ray-testing the oriented bounding box of their drawn editor gizmo.
+    gizmo_nodes: Query<(Entity, &GlobalTransform, &crate::node::EditorGizmo), GizmoNodeFilter>,
+    // Point lights are also pickable by clicking their drawn range sphere (a large target).
+    point_lights: Query<&PointLight>,
     bvh: Res<bvh::Bvh>,
 ) {
     if !mouse.just_pressed(MouseButton::Left) || gizmo_state.claimed_click {
@@ -945,35 +956,63 @@ fn sdf_picking(
     let Some(mouse_pos) = window.cursor_position() else {
         return;
     };
-    let Ok((camera, cam_global, cam_transform)) = cameras.single() else {
+    let Ok((camera, _cam_global, cam_transform)) = cameras.single() else {
         return;
     };
     let Some(ray) = picking::mouse_to_ray(camera, cam_transform, window, mouse_pos) else {
         return;
     };
 
-    // 1. Raymarch the SDF volumes (the geometric pick).
+    // 1. Raymarch the SDF volumes (the geometric pick), keeping the hit depth `t` so a
+    //    node gizmo in front of the surface can win the click.
     let gathered = gather_sorted_edits(&volumes);
-    if let Some(hit) = picking::pick_entity(&bvh, &ray, &gathered) {
-        selection.entity = Some(hit);
-        return;
-    }
+    let sdf_hit = picking::pick_entity(&bvh, &ray, &gathered);
 
-    // 2. Fallback: pick a non-SDF node (light/camera/empty) whose screen-projected origin
-    //    is within a small pixel radius of the cursor. Lets the light gizmo be selected.
-    const PICK_RADIUS_PX: f32 = 22.0;
-    let mut best: Option<(f32, Entity)> = None;
-    for (entity, xf) in &gizmo_nodes {
-        if let Ok(screen) = camera.world_to_viewport(cam_global, xf.translation()) {
-            let d = screen.distance(mouse_pos);
-            if d <= PICK_RADIUS_PX && best.is_none_or(|(bd, _)| d < bd) {
-                best = Some((d, entity));
+    // 2. Ray-test each node gizmo's oriented bounding box (matching the drawn glyph),
+    //    keeping the nearest entry distance — directly comparable to the SDF hit's `t`.
+    let mut best_node: Option<(f32, Entity)> = None; // (ray_depth, entity)
+    let consider = |t: f32, e: Entity, best: &mut Option<(f32, Entity)>| {
+        if best.is_none_or(|(bt, _)| t < bt) {
+            *best = Some((t, e));
+        }
+    };
+    for (entity, xf, gizmo) in &gizmo_nodes {
+        let (center, half) = node_gizmos::pick_bounds(gizmo);
+        let obb = picking::Obb::from_local(center, half, xf);
+        if let Some(t) = obb.ray_hit(&ray) {
+            consider(t, entity, &mut best_node);
+        }
+        // A point light is also pickable by clicking its drawn range sphere (its two great
+        // circles), a much larger target than the central bulb. Tolerance scales with
+        // distance so the line stays ~8px thick on screen.
+        if let Ok(light) = point_lights.get(entity) {
+            let origin = xf.translation();
+            let tol = (8.0 * (origin - cam_transform.translation).length()
+                / camera.clip_from_view().y_axis.y)
+                / window.height();
+            for normal in node_gizmos::draw::SPHERE_CIRCLE_NORMALS {
+                if let Some(t) = picking::ray_circle(&ray, origin, normal, light.range, tol) {
+                    consider(t, entity, &mut best_node);
+                }
             }
         }
     }
-    // A node hit selects it; a click on truly empty space deselects (matching the prior
-    // raymarch-miss behaviour).
-    selection.entity = best.map(|(_, e)| e);
+
+    // 3. Depth arbitration: a node in front of the SDF surface (or when the ray missed
+    //    the SDF entirely) wins; otherwise the SDF hit wins. A click on truly empty space
+    //    deselects (matching the prior raymarch-miss behaviour).
+    selection.entity = match (sdf_hit, best_node) {
+        (Some((sdf_e, sdf_t)), Some((node_t, node_e))) => {
+            if node_t <= sdf_t {
+                Some(node_e)
+            } else {
+                Some(sdf_e)
+            }
+        }
+        (Some((sdf_e, _)), None) => Some(sdf_e),
+        (None, Some((_, node_e))) => Some(node_e),
+        (None, None) => None,
+    };
 }
 
 /// Double-click (within 300ms) on the selected volume eases the orbit camera onto
@@ -1013,6 +1052,12 @@ fn configure_overlay_gizmos(mut store: ResMut<GizmoConfigStore>) {
     let (grid, _) = store.config_mut::<SdfGridGizmos>();
     grid.depth_bias = 0.0;
     grid.line.width = 1.0;
+
+    // Node glyphs (light suns, empties) depth-test against the SDF surface: a glyph
+    // behind geometry is occluded, so it reads as being in the scene.
+    let (nodes, _) = store.config_mut::<SdfNodeGizmos>();
+    nodes.depth_bias = 0.0;
+    nodes.line.width = 2.0;
 }
 
 /// Draw a Godot-style infinite ground grid on the XZ plane: faint minor lines
@@ -1057,52 +1102,6 @@ fn draw_ground_grid(mut gizmos: Gizmos<SdfGridGizmos>, orbit: Res<SdfOrbitCamera
     }
 }
 
-/// Draw editor-only gizmos for every [`Node3D`] carrying an [`EditorGizmo`]. Renders
-/// in world space from each node's `GlobalTransform`, so a gizmo tracks its parent.
-/// Strictly an editor aid (lights/cameras/empties are otherwise invisible) — never
-/// part of the runtime render.
-fn draw_node_editor_gizmos(
-    mut gizmos: Gizmos<SdfOverlayGizmos>,
-    nodes: Query<(&GlobalTransform, &crate::node::EditorGizmo)>,
-) {
-    use crate::node::EditorGizmo;
-    for (xf, gizmo) in &nodes {
-        let origin = xf.translation();
-        match *gizmo {
-            EditorGizmo::DirectionalLight { scale } => {
-                let color = Color::srgb(1.0, 0.85, 0.3);
-                // Forward (the light's travel direction) is local -Z.
-                let dir = (xf.rotation() * Vec3::NEG_Z).normalize_or_zero();
-                let right = (xf.rotation() * Vec3::X).normalize_or_zero();
-                let up = (xf.rotation() * Vec3::Y).normalize_or_zero();
-
-                // Sun disc: a small ring facing the light direction.
-                gizmos
-                    .circle(Isometry3d::new(origin, xf.rotation()), scale * 0.4, color)
-                    .resolution(24);
-                // Radiating spokes from the disc (classic sun glyph).
-                for k in 0..8 {
-                    let a = k as f32 * std::f32::consts::TAU / 8.0;
-                    let d = right * a.cos() + up * a.sin();
-                    gizmos.line(origin + d * scale * 0.4, origin + d * scale * 0.62, color);
-                }
-                // Parallel rays offset around the disc, all pointing along `dir`, with
-                // an arrowhead so the travel direction is unambiguous.
-                let len = scale * 1.6;
-                for (ox, oy) in [(0.0, 0.0), (0.55, 0.0), (-0.55, 0.0), (0.0, 0.55), (0.0, -0.55)] {
-                    let base = origin + (right * ox + up * oy) * scale;
-                    let tip = base + dir * len;
-                    gizmos.arrow(base, tip, color);
-                }
-            }
-            EditorGizmo::Axes { scale } => {
-                gizmos.line(origin, origin + xf.rotation() * Vec3::X * scale, Color::srgb(0.9, 0.2, 0.2));
-                gizmos.line(origin, origin + xf.rotation() * Vec3::Y * scale, Color::srgb(0.3, 0.9, 0.2));
-                gizmos.line(origin, origin + xf.rotation() * Vec3::Z * scale, Color::srgb(0.2, 0.4, 0.95));
-            }
-        }
-    }
-}
 
 /// Pick a grid line's colour: the axis colour at index 0 (the origin line), else a
 /// major or minor tone depending on divisibility by `MAJOR`.
