@@ -14,7 +14,7 @@ struct SdfCameraUniform {
     grid_origin: vec4<f32>,
     grid_dims: vec4<f32>,
     debug_params: vec4<f32>,   // x = max_steps, y = max_dist, z = sdf_eps, w = recenter_snap_chunks
-    march_params: vec4<f32>,   // x = pixel_cone (world radius/unit-dist/pixel), y = cubic_band, z = over_relax, w = lod_blend_band
+    march_params: vec4<f32>,   // x = pixel_cone (world radius/unit-dist/pixel), y = reserved (was cubic_band), z = over_relax, w = lod_blend_band
     lod_params: vec4<f32>,     // x = lod_count, y = ring_bricks, z = base voxel_size, w = cell_stride
     sun_dir: vec4<f32>,        // xyz = direction toward the key light; w unused
     sun_color: vec4<f32>,      // rgb = key-light radiance; w unused
@@ -113,10 +113,8 @@ fn sdf_eps() -> f32 { return camera.debug_params.z; }
 // surface is within a pixel — so far geometry resolves at coarse LOD instead of marching
 // down to LOD 0 (the vast-distance efficiency win).
 fn pixel_cone() -> f32 { return camera.march_params.x; }
-// Distance band (world units) within which a LOD-0 sample switches to the exact analytic
-// cubic for a crisp near silhouette. Outside it (or at coarse LOD) the march sphere-traces
-// the conservative field.
-fn cubic_band() -> f32 { return camera.march_params.y; }
+// march_params.y is reserved (was the LOD-0 analytic-cubic distance band, removed — the
+// cubic solver gave no measurable quality win over plain sphere-tracing).
 // Sphere-trace over-relaxation factor (Keinert 2014): the march steps `over_relax * d`
 // instead of `d`, with a safe fallback when consecutive unbounding spheres separate.
 // 1.0 = plain sphere tracing; (1,2) accelerates convergence on grazing rays.

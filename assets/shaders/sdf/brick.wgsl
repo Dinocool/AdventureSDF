@@ -425,6 +425,51 @@ fn find_chunk_cached(lod: u32, key_hi: u32, key_lo: u32, cache: ptr<function, Ch
     return ci;
 }
 
+// Cached counterparts of find_brick_lookup / find_brick_at / sample_sdf_world. Identical
+// logic, but route the per-LOD chunk probe through `find_chunk_cached(&cache)` so a SECONDARY
+// ray (shadow, or the 4 normal taps) that re-evaluates the field every step gets the same
+// O(1)-within-a-chunk memo the primary march enjoys (the uncached versions binary-search the
+// whole chunk buffer EVERY call). The result is bit-identical — the cache is a pure memo.
+fn find_brick_lookup_cached(coord: vec3<i32>, lod: u32, cache: ptr<function, ChunkCache>) -> BrickLocation {
+    let count = arrayLength(&chunk_buf);
+    if (count == 0u) {
+        return BrickLocation(0u, vec4<u32>(PALETTE_EMPTY), false);
+    }
+    let key = abs_chunk_key(coord, lod);
+    let ci = find_chunk_cached(lod, key.x, key.y, cache);
+    if (ci < 0) {
+        return BrickLocation(0u, vec4<u32>(PALETTE_EMPTY), false);
+    }
+    return brick_in_chunk(chunk_buf[u32(ci)], coord);
+}
+
+fn find_brick_at_cached(world_pos: vec3<f32>, out_lod: ptr<function, u32>, cache: ptr<function, ChunkCache>) -> BrickLocation {
+#ifdef SDF_DISABLE_LOD
+    let levels = 1u;
+#else
+    let levels = lod_count();
+#endif
+    for (var lod = 0u; lod < levels; lod = lod + 1u) {
+        let coord = world_to_brick_lod(world_pos, lod);
+        let loc = find_brick_lookup_cached(coord, lod, cache);
+        if (loc.found) {
+            *out_lod = lod;
+            return loc;
+        }
+    }
+    *out_lod = 0u;
+    return BrickLocation(0u, vec4<u32>(PALETTE_EMPTY), false);
+}
+
+fn sample_sdf_world_cached(world_pos: vec3<f32>, cache: ptr<function, ChunkCache>) -> f32 {
+    var lod = 0u;
+    let loc = find_brick_at_cached(world_pos, &lod, cache);
+    if (!loc.found) {
+        return 1e10;
+    }
+    return sample_brick_sdf(loc.atlas_base, world_pos, lod);
+}
+
 // Everything the march loop needs from one resolve at `p`. `in_brick` false ⇒ empty space;
 // `window_lod` is then the finest LOD with a resident chunk at `p` (the DDA step scale),
 // or the coarsest LOD if none. On a hit, `lod` is the serving (finest occupied) LOD.
@@ -602,14 +647,17 @@ fn in_ring_chunk(coord: vec3<i32>, lod: u32) -> bool {
 fn calc_normal(p: vec3<f32>) -> vec3<f32> {
     // Probe offset ≈ one voxel at the LOD serving this point (coarser LODs need a
     // proportionally larger offset so the finite difference spans a real sample gap).
+    // The 5 probes (center LOD + 4 tetrahedron taps) are spatially adjacent → almost always
+    // the same chunk, so a shared per-call cache turns 5 chunk binary-searches into ~1.
+    var cache = new_chunk_cache();
     var hit_lod = 0u;
-    let loc = find_brick_at(p, &hit_lod);
+    let loc = find_brick_at_cached(p, &hit_lod, &cache);
     let h = voxel_size_at(hit_lod);
     let k = vec2<f32>(1.0, -1.0);
-    let n = k.xyy * sample_sdf_world(p + k.xyy * h)
-          + k.yyx * sample_sdf_world(p + k.yyx * h)
-          + k.yxy * sample_sdf_world(p + k.yxy * h)
-          + k.xxx * sample_sdf_world(p + k.xxx * h);
+    let n = k.xyy * sample_sdf_world_cached(p + k.xyy * h, &cache)
+          + k.yyx * sample_sdf_world_cached(p + k.yyx * h, &cache)
+          + k.yxy * sample_sdf_world_cached(p + k.yxy * h, &cache)
+          + k.xxx * sample_sdf_world_cached(p + k.xxx * h, &cache);
     if (dot(n, n) > 1e-12) {
         return normalize(n);
     }

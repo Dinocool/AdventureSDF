@@ -22,9 +22,8 @@
 //! 4. **Async incremental bake** (`bake_scheduler`). The camera-centred chunk ring recenters
 //!    as the camera moves; entered chunks bake on a task pool, exited chunks evict — never
 //!    blocking the main thread.
-//! 5. **Unified raymarch** (`sdf_raymarch.wgsl`, helpers in `brick`/`cubic`). One loop:
-//!    resolve the finest resident LOD at `p`; skip empty space by brick-DDA; at LOD 0 near
-//!    the surface solve the exact analytic **cubic** for a crisp silhouette; otherwise
+//! 5. **Unified raymarch** (`sdf_raymarch.wgsl`, helpers in `brick`). One loop:
+//!    resolve the finest resident LOD at `p`; skip empty space by brick-DDA; otherwise
 //!    sphere-trace the trilinear field and accept the hit once the surface is within the
 //!    pixel cone (screen-space termination — the vast-distance speed win). There is **no GPU
 //!    BVH** in the march; the field + brick-geometry DDA drive all skipping. The `bvh` module
@@ -138,10 +137,6 @@ pub struct SdfRaymarchParams {
     /// at coarse LOD instead of marching down to LOD 0 — the vast-distance speed win.
     /// 1.0 = exactly one pixel; larger = coarser/cheaper, smaller = sharper/costlier.
     pub cone_scale: f32,
-    /// Near-surface distance band (world units) within which a LOD-0 sample switches to
-    /// the exact analytic cubic for a crisp silhouette. Outside it (or at any coarser
-    /// LOD) the march sphere-traces the conservative field.
-    pub cubic_band: f32,
     /// Sphere-trace over-relaxation factor (Keinert 2014). The march steps `over_relax · d`
     /// with a safe fallback when consecutive unbounding spheres separate, converging on
     /// grazing rays in fewer steps. 1.0 = plain sphere tracing; (1,2) accelerates. Default
@@ -176,7 +171,6 @@ impl Default for SdfRaymarchParams {
             max_dist: 2000.0,
             sdf_eps: 0.001,
             cone_scale: 1.0,
-            cubic_band: 0.5,
             over_relax: 1.6,
             lod_blend_band: 0.2,
             surface_bias: 0.0,
