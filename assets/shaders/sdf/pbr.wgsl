@@ -134,7 +134,6 @@ fn gather_pbr(id: u32, wpos: vec3<f32>, geo_n: vec3<f32>, lod: f32) -> PbrInputs
     // moves the hit `wpos` onto the displaced surface before this is called — so the maps here
     // already sample the carved surface position. No UV-shift parallax here.
     let albedo = sample_material_map(id, 0u, wpos, geo_n, lod).rgb * mat.base_color.rgb;
-    let edge = sample_material_map(id, 4u, wpos, geo_n, lod).r;
     let nrm = triplanar_normal(id, wpos, geo_n, lod);
 
     // Metallic / roughness / AO: from the MRA texture when present, else the material's
@@ -155,10 +154,17 @@ fn gather_pbr(id: u32, wpos: vec3<f32>, geo_n: vec3<f32>, lod: f32) -> PbrInputs
     }
 
     // Edge-wear: convex edges (bright in the edge map) read as worn — lighter and
-    // rougher, a cheap stand-in for exposed/scuffed material until it's art-driven.
+    // rougher, a cheap stand-in for exposed/scuffed material until it's art-driven. Gated
+    // behind SDF_EDGE_WEAR because the edge-map sample is 2 fullscreen texture taps
+    // (biplanar) that every hit pixel pays whether or not the material has edge detail.
+    var albedo_worn = albedo;
+    var rough_worn = rough;
+#ifdef SDF_EDGE_WEAR
+    let edge = sample_material_map(id, 4u, wpos, geo_n, lod).r;
     let wear = smoothstep(0.6, 1.0, edge);
-    let albedo_worn = mix(albedo, albedo * 1.3 + vec3<f32>(0.05), wear * 0.5);
-    let rough_worn = clamp(rough + wear * 0.3, 0.04, 1.0);
+    albedo_worn = mix(albedo, albedo * 1.3 + vec3<f32>(0.05), wear * 0.5);
+    rough_worn = clamp(rough + wear * 0.3, 0.04, 1.0);
+#endif
 
     return PbrInputs(albedo_worn, nrm, metal, rough_worn, ao);
 }

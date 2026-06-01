@@ -6,7 +6,7 @@
 // far along it that miss happened). No shadow maps. Returns 1 = fully lit, 0 = occluded.
 
 #import sdf::bindings::{voxel_size_at}
-#import sdf::brick::{sample_sdf_world, calc_normal}
+#import sdf::brick::{sample_sdf_world_cached, calc_normal, ChunkCache, new_chunk_cache}
 
 // The baked distance field is snorm-clamped to ±SNORM_CLAMP_DIST world units (atlas.rs).
 // A sample at the ceiling means "nearest surface is ≥ this far" — saturated, carrying no
@@ -29,9 +29,13 @@ const SHADOW_FIELD_CEIL: f32 = 1.0;
 fn soft_shadow(origin: vec3<f32>, light_dir: vec3<f32>, mint: f32, max_t: f32, k: f32) -> f32 {
     var res = 1.0;
     var t = mint;
+    // One per-ray chunk-search memo (like the primary march): a shadow ray stays in the same
+    // chunk for many steps, so each LOD's probe is O(1) until it crosses a chunk boundary —
+    // turning the previously UNCACHED per-step binary search into a cache hit.
+    var cache = new_chunk_cache();
     for (var i = 0u; i < 64u; i = i + 1u) {
         if (t >= max_t) { break; }
-        let d = sample_sdf_world(origin + light_dir * t);
+        let d = sample_sdf_world_cached(origin + light_dir * t, &cache);
         if (d < 1e-3) {
             return 0.0;  // hit an occluder → fully shadowed
         }

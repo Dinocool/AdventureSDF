@@ -11,7 +11,7 @@
 
 #import bevy_core_pipeline::fullscreen_vertex_shader::FullscreenVertexOutput
 
-#import sdf::bindings::{camera, max_steps, max_dist, sdf_eps, pixel_cone, cubic_band, over_relax, lod_blend_band, recenter_snap, surface_bias, lod_count, brick_world_at, CHUNK_BRICKS, cell_stride, voxel_size_at, abs_chunk_key, local_brick_index, chunk_buf, ChunkLookup}
+#import sdf::bindings::{camera, max_steps, max_dist, sdf_eps, pixel_cone, over_relax, lod_blend_band, recenter_snap, surface_bias, lod_count, brick_world_at, CHUNK_BRICKS, cell_stride, voxel_size_at, abs_chunk_key, local_brick_index, chunk_buf, ChunkLookup, TEXTURE_WORLD_SCALE}
 #import sdf::brick::{
     world_to_brick_lod,
     scene_sdf,
@@ -30,7 +30,6 @@
     dist_to_chunk_exit_lod,
     in_ring_chunk,
 }
-#import sdf::cubic::{build_cell_cubic, solve_cell_cubic, dist_to_cell_exit}
 #import sdf::pbr::{resolve_surface, shade_surface, shade_material_env, sun_dir, PbrInputs}
 #import sdf::sky::sky_color
 
@@ -66,6 +65,19 @@ struct RaymarchResult {
     eff_lod: f32,
 };
 
+// Per-ray quality profile. The PRIMARY ray uses full quality (cone_scale 1, the uniform
+// step/dist caps). A SECONDARY ray (a reflection) gets a degraded profile scaled by its hit
+// roughness: a wider cone accepts hits in fewer steps and capped steps/dist bound the march —
+// invisible once the result is blurred into the IBL specular term.
+struct MarchQuality {
+    cone_k: f32,     // multiplies pixel_cone → larger = accept sooner = fewer steps
+    steps_cap: u32,  // hard iteration cap for this ray
+    dist_cap: f32,   // distance cap for this ray
+    lod_floor: u32,  // minimum LOD served: a rough reflection floors to a COARSE level so the
+                     // reflected geometry AND material read blurry (true glossy softening) and
+                     // the bigger coarse-brick steps make the march cheaper still. 0 = no floor.
+};
+
 // Single unified raymarch. One cached resolve per step (`resolve_march` → finest resident
 // LOD + trilinear distance + tile/palette, memoising the chunk search across steps via a
 // per-ray `ChunkCache`), branching three ways:
@@ -74,29 +86,23 @@ struct RaymarchResult {
 //      resident-window LOD via brick-geometry DDA (`dist_to_brick_exit_lod` — a pure lattice
 //      step, so it never skips over a baked brick). The LOD comes from the SAME resolve, so
 //      empty steps cost no second chunk search.
-//   2. LOD 0 and near the surface (`d < cubic_band`): solve the exact analytic cubic in this
-//      cell for a crisp silhouette; on a miss step to the cell exit.
-//   3. Otherwise (coarse LOD, or far): sphere-trace the trilinear field with Keinert
-//      over-relaxation (step `over_relax · d`, fall back when unbounding spheres separate),
-//      accepting a hit once the surface is within the pixel cone (`d < max(eps, cone·t)`).
+//   2. Otherwise (in a brick): sphere-trace the trilinear field with Keinert over-relaxation
+//      (step `over_relax · d`, fall back when unbounding spheres separate), accepting a hit
+//      once the surface is within the pixel cone (`d < max(eps, cone·t)`).
 //
 // The stored field is the true trilinear SDF sampled at voxel centres (atlas.rs); empty-space
 // DDA steps by brick geometry (always safe) and the in-brick sphere-trace is bounded by the
 // brick exit, so the march is robust. There is no GPU BVH in this path.
-fn raymarch(origin: vec3<f32>, dir: vec3<f32>, start_t: f32) -> RaymarchResult {
+fn raymarch(origin: vec3<f32>, dir: vec3<f32>, start_t: f32, q: MarchQuality) -> RaymarchResult {
     var t = start_t;
     var steps = 0u;
     var result = RaymarchResult(false, 0.0, 0u, 0u, vec3<f32>(0.0), 2u, 0u, 0u, 0.0, 0.0);
 
-    let MAX_STEPS = max_steps();
-    let MAX_DIST = max_dist();
+    let MAX_STEPS = q.steps_cap;
+    let MAX_DIST = q.dist_cap;
     let SDF_EPS = sdf_eps();
-    let CONE = pixel_cone();
-    let CUBIC_BAND = cubic_band();
+    let CONE = pixel_cone() * q.cone_k;
     let OMEGA = over_relax();
-
-    let edge = i32(camera.grid_dims.z);
-    let s = cell_stride();
 
     // Per-ray chunk-search memo (NanoVDB/Tree64 accessor): a marching ray stays in the same
     // chunk for many steps, so each LOD's probe is O(1) until it crosses a chunk boundary.
@@ -117,7 +123,23 @@ fn raymarch(origin: vec3<f32>, dir: vec3<f32>, start_t: f32) -> RaymarchResult {
             return result;
         }
 
-        let scene = resolve_march(p, &cache);
+        var scene = resolve_march(p, &cache);
+
+        // Quality LOD floor (secondary rays). If this ray must render no finer than
+        // `q.lod_floor` and `resolve_march` served a finer brick, re-resolve at the floor
+        // (degrading coarser-only). Rewriting `scene` here makes the WHOLE downstream path —
+        // distance, served LOD, tile/palette for the reflected material, cross-fade — use the
+        // coarse level, so a rough reflection reads blurry in both geometry and texture, and
+        // the larger coarse-brick steps make the march cheaper. Primary rays pass 0 = no-op.
+        if (q.lod_floor > 0u && scene.in_brick && scene.lod < q.lod_floor) {
+            let coarse = sample_level_at_or_coarser(p, q.lod_floor, &cache);
+            if (coarse.in_brick) {
+                scene.dist = coarse.dist;
+                scene.lod = coarse.lod;
+                scene.atlas_base = coarse.atlas_base;
+                scene.palette = coarse.palette;
+            }
+        }
 
         // --- 1. Empty space: hierarchical chunk-DDA skip -----------------------------
         //
@@ -221,49 +243,6 @@ fn raymarch(origin: vec3<f32>, dir: vec3<f32>, start_t: f32) -> RaymarchResult {
             }
         }
 
-        // --- 2. LOD 0 near the surface: exact analytic cubic -------------------------
-        // (SDF_DISABLE_CUBIC skips this branch → pure sphere-trace everywhere, for bisect.)
-        // Gated off inside the cross-fade shell (`blending`) so those near-surface hits fall
-        // through to the sphere-trace and blend, instead of snapping via the unblended cubic.
-#ifdef SDF_DISABLE_CUBIC
-        if (false) {
-#else
-        if (lod == 0u && d < CUBIC_BAND && !blending) {
-#endif
-            let ray_d_voxel = dir / voxel_size;       // voxels per world unit at LOD 0
-            let gv = p / voxel_size;                  // LOD voxel space (world-0 anchored)
-            let cell_g = floor(gv);
-            let o_local = gv - cell_g;                // entry in [0,1]^3 (small, stable)
-            let brick_origin_v = floor(gv / f32(s)) * f32(s);
-            let cell_local = clamp(
-                vec3<i32>(cell_g - brick_origin_v),
-                vec3<i32>(0),
-                vec3<i32>(edge - 2),
-            );
-            let cubic = build_cell_cubic(scene.atlas_base, cell_local, o_local, ray_d_voxel);
-            let advance = dist_to_cell_exit(p, dir, lod);
-            let cell_hit = solve_cell_cubic(cubic, 0.0, advance);
-            if (cell_hit.hit) {
-                let t_hit = t + cell_hit.t;
-                let hit_p = origin + dir * t_hit;
-                result.hit = true;
-                result.dist = t_hit;
-                result.object_id =
-                    pick_material(load_material_distances(scene.atlas_base, hit_p, lod), scene.palette).id;
-                result.steps = steps;
-                result.hit_pos = hit_p;
-                result.fate = 0u;
-                result.lod = lod;
-                result.atlas_base = scene.atlas_base;
-                result.eff_lod = eff_lod;
-                return result;
-            }
-            t += advance + voxel_size * 0.001;
-            prev_d = 0.0;
-            prev_step = 0.0;
-            continue;
-        }
-
         // --- Coarse-LOD iso-offset: re-inflate the trilinear shrink ------------------
         // Trilinear interpolation over-estimates distance on a convex surface, pulling the
         // zero-isosurface inward by ≈(h²/8)·κ — so coarse LODs render objects too thin. Take
@@ -345,10 +324,29 @@ fn raymarch(origin: vec3<f32>, dir: vec3<f32>, start_t: f32) -> RaymarchResult {
 //
 // `origin` is the primary hit nudged off its surface (caller offsets by the geometric
 // normal) so the reflection ray doesn't immediately re-hit the surface it left.
-fn trace_reflection(origin: vec3<f32>, refl_dir: vec3<f32>) -> vec3<f32> {
+//
+// `roughness` (the reflecting surface's) scales a CHEAP quality profile: the result is
+// blurred into the IBL specular term by roughness anyway, so a rough reflection can use a
+// fat cone (accept hits in far fewer steps), a low step cap, and a short distance — only a
+// near-mirror keeps a tight, longer ray. This is what keeps the secondary march affordable.
+// `out_steps` returns the reflection march's step count (for the SDF_DEBUG_REFLECT_STEPS
+// overlay); pass a throwaway when the cost isn't needed.
+fn trace_reflection(origin: vec3<f32>, refl_dir: vec3<f32>, roughness: f32, out_steps: ptr<function, u32>) -> vec3<f32> {
+    // Roughness-driven profile. Smooth (r→0): cone ×2, half the primary steps, 0.6× dist.
+    // Rough (r→1): cone ×16, ~24 steps, 0.25× dist — a blurry, very cheap probe.
+    let r = clamp(roughness, 0.0, 1.0);
+    // lod_floor is what actually BLURS the reflected image: 0 below r=0.2 (a near-mirror stays
+    // sharp), then ramps to a coarse level as roughness rises so geometry + material soften.
+    let q = MarchQuality(
+        mix(2.0, 16.0, r),
+        u32(mix(f32(max_steps()) * 0.5, 24.0, r)),
+        max_dist() * mix(0.6, 0.25, r),
+        u32(clamp((r - 0.2) * 6.0, 0.0, 4.0)),
+    );
     // Reflection rays aren't primary screen rays, so they have no cone-prepass tile seed —
-    // march from t = 0.
-    let rm = raymarch(origin, refl_dir, 0.0);
+    // march from t = 0 (the caller already nudged `origin` off the surface).
+    let rm = raymarch(origin, refl_dir, 0.0, q);
+    *out_steps = rm.steps;
     if (!rm.hit) {
         return sky_color(refl_dir, sun_dir());
     }
@@ -410,7 +408,8 @@ fn main(in: FullscreenVertexOutput) -> FragmentOutput {
     let tile = vec2<i32>(uv * camera.screen_params.xy) / CONE_TILE;
     let start_t = textureLoad(cone_seed, tile, 0).r;
 
-    let rm = raymarch(ray_origin, ray_dir, start_t);
+    // Primary ray: full quality (cone ×1, the uniform step/dist caps, no LOD floor).
+    let rm = raymarch(ray_origin, ray_dir, start_t, MarchQuality(1.0, max_steps(), max_dist(), 0u));
 
     // --- Cost / fate debug modes -------------------------------------------------
     // These are placed BEFORE the miss early-return so they paint EVERY pixel — hit
@@ -456,15 +455,22 @@ fn main(in: FullscreenVertexOutput) -> FragmentOutput {
         return FragmentOutput(vec4<f32>(bg_color, 1.0), 0.0);
     }
 
-    // Texture LOD from hit distance: farther hits cover more texels per pixel, so
-    // bias up the mip to avoid shimmer. (No screen-space derivatives in a fullscreen
-    // raymarch, so we derive LOD analytically.) Tuned constant; clamped to a sane range.
-    let lod = clamp(log2(max(rm.dist, 1.0)) - 1.0, 0.0, 8.0);
-
     // Height-map relief is baked into the SDF field (see sdf_render::height) — the hit position
     // and its gradient normal already reflect the carved surface, so shading needs no extra work.
     let hit_pos = rm.hit_pos;
     let geo_normal = calc_normal(rm.hit_pos);
+
+    // Analytic texture LOD (no screen-space derivatives in a fullscreen raymarch). Pick the
+    // mip whose texel covers ~1 pixel: the pixel's world footprint at this hit is
+    // `pixel_cone · dist`, stretched by 1/|cosθ| at grazing angles (a glancing pixel covers
+    // a much longer streak of surface). Divide by the texture's world-per-texel
+    // (TEXTURE_WORLD_SCALE) to get texels/pixel, then log2 → mip. This replaces the old
+    // `log2(dist)-1` constant, which ignored both the pixel cone and the grazing stretch and
+    // so under-mipped grazing terrain → cache thrash + shimmer.
+    let cos_graze = max(abs(dot(ray_dir, geo_normal)), 0.15);  // floor caps the stretch (~6.7×)
+    let footprint_world = pixel_cone() * max(rm.dist, 1.0) / cos_graze;
+    let texels_per_pixel = footprint_world / TEXTURE_WORLD_SCALE;
+    let lod = clamp(log2(max(texels_per_pixel, 1.0)), 0.0, 8.0);
 
     // True reverse-Z projection depth so the SDF surface shares the depth buffer with normal
     // geometry (wireframe, gizmos): project the (displaced) world hit through the forward
@@ -485,14 +491,44 @@ fn main(in: FullscreenVertexOutput) -> FragmentOutput {
     // geometry-to-geometry mirroring; rough/diffuse surfaces keep the cheap sky (the
     // gate keeps the common case at one march).
     var env_radiance = sky_color(reflect(-normalize(camera.camera_pos.xyz - hit_pos), p.normal), sun_dir());
+    var refl_steps = 0u;  // reflection-march cost for the SDF_DEBUG_REFLECT_STEPS overlay
 #ifdef SDF_REFLECTIONS
-    if (p.metallic > 0.1 || p.roughness < 0.3) {
+    // Gate on ROUGHNESS only: a real reflection is perceptible only when the surface is smooth
+    // enough to mirror geometry. At high roughness the reflection blurs into the IBL sky
+    // regardless of metalness — so a rough METAL gains nothing from a traced ray (the old
+    // `metallic>0.1 || ...` wasted a march on it). Both smooth metals and smooth dielectrics
+    // (low roughness) still reflect. The march is also roughness-scaled (trace_reflection), so
+    // the surviving rays near the cutoff are already cheap.
+    if (p.roughness < 0.9) {
         let view = normalize(camera.camera_pos.xyz - hit_pos);
         let refl_dir = reflect(-view, p.normal);
         let bias = voxel_size_at(rm.lod) * 2.0;
-        env_radiance = trace_reflection(hit_pos + normal * bias, refl_dir);
+        env_radiance = trace_reflection(hit_pos + normal * bias, refl_dir, p.roughness, &refl_steps);
     }
 #endif
+
+    // Reflection-march cost heatmap: black where no reflection ray was traced (gated out),
+    // else blue (few steps) → red (many), normalised to the primary step cap. Shows exactly
+    // which pixels pay for a secondary march and how deep it goes.
+    #ifdef SDF_DEBUG_REFLECT_STEPS
+    {
+        let c = f32(refl_steps) / f32(max_steps());
+        let heat = vec3<f32>(c, 0.3 * (1.0 - c), 1.0 - c) * step(0.5, f32(refl_steps));
+        return FragmentOutput(vec4<f32>(heat, 1.0), ndc_depth);
+    }
+    #endif
+
+    // Raw reflected radiance: `env_radiance` exactly as trace_reflection returned it (the sky
+    // on a gated-out / missed ray), BEFORE shade_surface's ambient_ibl folds it in. The
+    // shading path does `mix(env_radiance, irradiance, roughness)` (pbr.wgsl), so at high
+    // roughness a perfectly-good reflection becomes invisible there — this view bypasses that
+    // mix so you can see the traced result itself and confirm the march/roughness profile.
+    #ifdef SDF_DEBUG_REFLECT_RAW
+    {
+        let raw = pow(env_radiance / (env_radiance + vec3<f32>(1.0)), vec3<f32>(1.0 / 2.2));
+        return FragmentOutput(vec4<f32>(raw, 1.0), ndc_depth);
+    }
+    #endif
 
     // Shade to LINEAR radiance, then tonemap (Reinhard) + approximate gamma once here.
     let lit = shade_surface(p, hit_pos, normal, rm.lod, env_radiance);

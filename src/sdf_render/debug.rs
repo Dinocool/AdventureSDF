@@ -235,6 +235,18 @@ fn register_shader_modes(app: &mut App) {
         "Raymarch step heatmap with BVH skipping (compare vs Steps)",
     ));
     registry.register(overlay(
+        "sdf/reflect_steps",
+        "Reflect cost",
+        "SDF_DEBUG_REFLECT_STEPS",
+        "Reflection-march step heatmap (black = no reflection ray traced)",
+    ));
+    registry.register(overlay(
+        "sdf/reflect_raw",
+        "Reflect raw",
+        "SDF_DEBUG_REFLECT_RAW",
+        "Raw traced reflection radiance, before the roughness IBL mix",
+    ));
+    registry.register(overlay(
         "sdf/ray_fate",
         "Ray fate",
         "SDF_DEBUG_RAY_FATE",
@@ -286,16 +298,6 @@ fn register_shader_modes(app: &mut App) {
         description: "Force LOD 0 only (disable clipmap shells)".into(),
     });
 
-    // Independent toggle: skip the LOD-0 analytic cubic solver → pure sphere-trace
-    // everywhere. If enabling this fixes a visual artifact, the cubic is the cause.
-    registry.register(ShaderDebugMode {
-        id: "sdf/disable_cubic".into(),
-        label: "No cubic".into(),
-        shader_define: "SDF_DISABLE_CUBIC".into(),
-        kind: DebugModeKind::Toggle,
-        description: "Skip the LOD-0 cubic solver (pure sphere-trace)".into(),
-    });
-
     // Independent toggle: linear chunk-table scan instead of the binary search. If enabling
     // this fixes a visual artifact, the cause is the binary search / table sortedness / the
     // grid_dims.w count bound.
@@ -322,6 +324,14 @@ fn register_shader_modes(app: &mut App) {
         shader_define: "SDF_REFLECTIONS".into(),
         kind: DebugModeKind::Toggle,
         description: "SDF-traced reflections on metallic/smooth surfaces (secondary ray)"
+            .into(),
+    });
+    registry.register(ShaderDebugMode {
+        id: "sdf/edge_wear".into(),
+        label: "Edge wear".into(),
+        shader_define: "SDF_EDGE_WEAR".into(),
+        kind: DebugModeKind::Toggle,
+        description: "Convex-edge wear from the edge map (2 extra texture taps per hit pixel)"
             .into(),
     });
     // Note: height-map relief is baked into the SDF field (see sdf_render::height) — no shader

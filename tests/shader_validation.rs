@@ -28,10 +28,9 @@ struct FullscreenVertexOutput {
 
 /// The SDF module files, in dependency order (a module must be added before any
 /// module that imports it). The entry shader is composed last via `make_naga_module`.
-const SDF_MODULES: [&str; 7] = [
+const SDF_MODULES: [&str; 6] = [
     "assets/shaders/sdf/bindings.wgsl",
     "assets/shaders/sdf/brick.wgsl",
-    "assets/shaders/sdf/cubic.wgsl",
     "assets/shaders/sdf/material.wgsl",
     "assets/shaders/sdf/shadows.wgsl",
     "assets/shaders/sdf/sky.wgsl",
@@ -171,10 +170,11 @@ fn sdf_debug_modes_validate() {
         "SDF_DEBUG_OBJECT_ID",
         "SDF_DEBUG_BRICK_BOUNDS",
         "SDF_DEBUG_RAY_FATE",
+        "SDF_DEBUG_REFLECT_STEPS",
+        "SDF_DEBUG_REFLECT_RAW",
         "SDF_DEBUG_LOD",
         "SDF_DISABLE_CHUNK_CACHE",
         "SDF_DISABLE_LOD",
-        "SDF_DISABLE_CUBIC",
         "SDF_LINEAR_CHUNK_SEARCH",
         "SDF_DEBUG_TILE_ID",
         "SDF_DEBUG_CHUNK_ID",

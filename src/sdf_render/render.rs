@@ -64,8 +64,8 @@ struct SdfCameraData {
     grid_origin: Vec4,   // xyz = grid origin, w = voxel_size
     grid_dims: Vec4, // z = brick_size (8.0); x/y/w unused (chunk count = arrayLength(&chunk_buf))
     debug_params: Vec4, // x = max_steps, y = max_dist, z = sdf_eps, w = unused
-    /// x = pixel_cone (world radius per unit ray distance per pixel), y = cubic_band,
-    /// z = over_relax, w unused.
+    /// x = pixel_cone (world radius per unit ray distance per pixel), y = reserved
+    /// (was cubic_band), z = over_relax, w = lod_blend_band.
     march_params: Vec4,
     /// x = lod_count, y = ring_bricks, z = base voxel_size, w = cell_stride.
     lod_params: Vec4,
@@ -525,10 +525,9 @@ struct SdfShaderHandle(Handle<Shader>);
 struct SdfShaderModules(#[expect(dead_code)] Vec<Handle<Shader>>);
 
 /// The `#define_import_path` module files the entry shader composes.
-const SDF_SHADER_MODULES: [&str; 7] = [
+const SDF_SHADER_MODULES: [&str; 6] = [
     "shaders/sdf/bindings.wgsl",
     "shaders/sdf/brick.wgsl",
-    "shaders/sdf/cubic.wgsl",
     "shaders/sdf/material.wgsl",
     "shaders/sdf/shadows.wgsl",
     "shaders/sdf/sky.wgsl",
@@ -745,12 +744,12 @@ fn prepare_sdf_camera_data(
             ),
             // March tuning: the pixel cone half-width per unit ray distance drives the
             // screen-space termination (a surface within a pixel ends the march, so far
-            // geometry resolves at coarse LOD); `cubic_band` is the near-surface distance
-            // within which a LOD-0 sample switches to the exact analytic cubic; `w` is the
-            // LOD cross-fade band (fraction of each ring's half-extent; 0 = hard seams).
+            // geometry resolves at coarse LOD); `y` is reserved (was the removed cubic band);
+            // `w` is the LOD cross-fade band (fraction of each ring's half-extent; 0 = hard
+            // seams).
             march_params: Vec4::new(
                 pixel_cone,
-                raymarch.cubic_band,
+                0.0,
                 raymarch.over_relax,
                 raymarch.lod_blend_band,
             ),
