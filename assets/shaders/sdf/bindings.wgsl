@@ -25,7 +25,8 @@ struct SdfCameraUniform {
 
 // One material row, indexed by global material id. Mirrors `GpuSdfMaterial`
 // (render.rs): base colour + seam softness + per-map texture-array layer indices
-// (0xffffffff = no texture for that map) + scalar metallic/roughness fallbacks. 48 bytes.
+// (0xffffffff = no texture for that map) + scalar metallic/roughness fallbacks +
+// emissive. 80 bytes.
 struct SdfMaterial {
     base_color: vec4<f32>,
     blend_softness: f32,   // world-units colour-feather width at a seam
@@ -40,12 +41,14 @@ struct SdfMaterial {
     roughness: f32,
     // Parallax-occlusion relief depth (UV units) for this material's height map. 0 = flat.
     parallax_scale: f32,
-    // Three SEPARATE u32 pads — NOT vec3<u32>, which has 16-byte alignment in WGSL and would
-    // bump the struct to 80 bytes, mismatching the 64-byte Rust GpuSdfMaterial (flat u32s).
-    // Names avoid trailing digits (naga_oil writeback rejects `pad0` etc).
+    // Three SEPARATE u32 pads — NOT vec3<u32>, which has 16-byte alignment in WGSL — aligning
+    // `emissive` to its 16-byte boundary (offset 64). Names avoid trailing digits (naga_oil
+    // writeback rejects `pad0` etc).
     pad_a: u32,
     pad_b: u32,
     pad_c: u32,
+    // Emissive radiance, linear RGB in xyz (intensity premultiplied CPU-side); w spare.
+    emissive: vec4<f32>,
 };
 
 // Per-brick lookup. `key_hi`/`key_lo` are the absolute 64-bit brick key (lod + biased

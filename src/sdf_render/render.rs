@@ -10,7 +10,7 @@ use bevy::render::render_graph::{
 };
 use bevy::render::render_resource::binding_types::{
     sampler, storage_buffer_read_only, storage_buffer_sized, texture_2d, texture_2d_array,
-    texture_storage_2d, uniform_buffer,
+    texture_storage_2d, uniform_buffer, uniform_buffer_sized,
 };
 use bevy::render::render_resource::*;
 use bevy::render::renderer::{RenderContext, RenderDevice, RenderQueue};
@@ -81,7 +81,8 @@ struct SdfCameraData {
 /// GPU mirror of a [`super::edits::MaterialDef`], one per global material id, in a
 /// storage buffer indexed by id. Carries the PBR texture-array layer for each map
 /// (`u32::MAX` = none); the shader samples those layers via triplanar projection.
-/// 64 bytes, 16-byte aligned for std430 (Vec4 forces the size up to a 16-byte multiple).
+/// 80 bytes, 16-byte aligned for std430. The three `_pad*` words align `emissive` (a
+/// `vec4`) to its 16-byte boundary at offset 64.
 #[derive(ShaderType, Clone, Copy, Default)]
 struct GpuSdfMaterial {
     base_color: Vec4,
@@ -99,6 +100,9 @@ struct GpuSdfMaterial {
     _pad0: u32,
     _pad1: u32,
     _pad2: u32,
+    /// Emissive radiance, linear RGB in `xyz` (intensity premultiplied in `MaterialDef`);
+    /// `w` is spare. `vec4` so it's 16-byte aligned at offset 64 (struct = 80 bytes).
+    emissive: Vec4,
 }
 
 // --- Extracted Atlas ---
@@ -234,9 +238,6 @@ struct SdfPipeline {
     /// Cone-prepass seed texture, read (textureLoad) by the fragment march to start each
     /// pixel at its tile's seed distance instead of 0.
     layout_2: BindGroupLayoutDescriptor,
-    /// SSR previous-frame colour texture + sampler (group 3). The fragment reflection path
-    /// reprojects a reflected world point into last frame's screen and samples this.
-    layout_3: BindGroupLayoutDescriptor,
     #[expect(dead_code)]
     shader_handle: Handle<Shader>,
     /// The shader defs the current `pipeline_id` was queued with. Rebuild compares the
@@ -245,18 +246,114 @@ struct SdfPipeline {
     current_defs: Vec<String>,
 }
 
-/// SSR history: last frame's SDF colour (linear HDR, matching the HDR view target), kept so
-/// the fragment reflection path can sample an on-screen reflected point instead of marching +
-/// shading the SDF again. One texture, re-created lazily to match the viewport size; `valid`
-/// is false until it has been filled once (frame 0 → pure SDF-march fallback). A dummy 1×1 is
-/// always available so bind group 3 is valid before the first real capture.
+/// The G-buffer's three MRT colour formats (all linear HDR). Shared by the pipeline target
+/// list and the texture allocation in `prepare_sdf_gbuffer` so they can't drift.
+const GBUFFER_FORMAT: TextureFormat = TextureFormat::Rgba16Float;
+
+/// Composite (GI) pipeline: reads the G-buffer + cascade 0 (group 1) + the shared camera uniform
+/// (group 0, reusing `SdfPipeline::layout_0`) and writes the ISOLATED GI radiance into the GI
+/// texture (so the combine pass can bilateral-blur it without smearing the sharp direct light).
+#[derive(Resource)]
+struct SdfCompositePipeline {
+    pipeline_id: CachedRenderPipelineId,
+    /// G-buffer + cascade-0 read layout: 4 sampled textures + a sampler.
+    layout_gbuf: BindGroupLayoutDescriptor,
+}
+
+#[derive(Debug, Hash, PartialEq, Eq, Clone, RenderLabel)]
+struct SdfCompositeLabel;
+
+#[derive(Resource)]
+struct SdfCompositeShaderHandle(Handle<Shader>);
+
+/// GI pass shader (gathers cascade 0 into the isolated GI texture).
+const SDF_COMPOSITE_SHADER_PATH: &str = "shaders/sdf_rc_composite.wgsl";
+
+/// Combine pipeline: reads the G-buffer + the GI texture (group 1) + camera (group 0), bilateral-
+/// blurs the GI, adds the analytic sun + emissive, and writes the lit result to the HDR view
+/// target. The final deferred-lighting pass. Rebuilt on shader-def change so its `#ifdef` debug
+/// views (SDF_DEBUG_*) recompile when toggled in the editor.
+#[derive(Resource)]
+struct SdfCombinePipeline {
+    pipeline_id: CachedRenderPipelineId,
+    /// G-buffer (3 tex) + sampler + GI texture read layout.
+    layout: BindGroupLayoutDescriptor,
+    /// The shader defs the current `pipeline_id` was queued with (rebuild on mismatch).
+    current_defs: Vec<String>,
+}
+
+#[derive(Debug, Hash, PartialEq, Eq, Clone, RenderLabel)]
+struct SdfCombineLabel;
+
+#[derive(Resource)]
+struct SdfCombineShaderHandle(Handle<Shader>);
+
+/// Combine pass shader (bilateral-blur GI + analytic sun + emissive → view target).
+const SDF_COMBINE_SHADER_PATH: &str = "shaders/sdf_rc_combine.wgsl";
+
+/// Radiance-cascade trace+merge shader (one fullscreen pass per cascade level, run coarse→fine,
+/// ping-ponging two screen-sized targets). `raymarch` plays three-rc's `traceScene` role.
+const SDF_CASCADE_SHADER_PATH: &str = "shaders/sdf_rc_cascade.wgsl";
+
+/// Upper bound on cascade count. `num_cascades = ceil(log4(max(w,h)))`; for 8K that's 7, so 8
+/// caps it with headroom. Sizes the per-level uniform buffer (one aligned `vec4<u32>` per level).
+const MAX_CASCADES: u32 = 8;
+
+/// Cascade-texture size multiplier over the view: a level packs `C0_RAYS_PER_DIM × res /
+/// PROBE_SPACING` texels per axis = `4 / 2 = 2×` the screen. MUST match
+/// `C0_RAYS_PER_DIM / PROBE_SPACING` in sdf_rc_cascade.wgsl / sdf_rc_composite.wgsl.
+const CASCADE_TEX_SCALE: u32 = 2;
+
+#[derive(Resource)]
+struct SdfCascadeShaderHandle(Handle<Shader>);
+
+#[derive(Debug, Hash, PartialEq, Eq, Clone, RenderLabel)]
+struct SdfCascadeLabel;
+
+/// Cascade pipeline: camera (group 0) + atlas (group 1, for the SDF trace) + cascade resources
+/// (group 2: G-buffer albedo for probe placement, the previous cascade for the merge, a sampler,
+/// and the per-level uniform). Writes one screen-sized `Rgba16Float` cascade target.
+#[derive(Resource)]
+struct SdfCascadePipeline {
+    pipeline_id: CachedRenderPipelineId,
+    layout_2: BindGroupLayoutDescriptor,
+}
+
+/// The two ping-pong cascade textures + the per-level uniform buffer. Both textures are
+/// screen-sized `Rgba16Float`; the node reads one and writes the other each level, swapping.
+/// `level_buffer` holds `MAX_CASCADES` aligned `vec4<u32>` slots (level i in slot i), bound with
+/// a dynamic offset per pass.
 #[derive(Resource, Default)]
-struct SdfReflectHistory {
-    tex: Option<Texture>,
-    view: Option<TextureView>,
+struct SdfCascades {
+    tex: [Option<Texture>; 2],
+    view: [Option<TextureView>; 2],
+    sampler: Option<Sampler>,
+    level_buffer: Option<Buffer>,
+    /// Dynamic-offset stride between level slots (device uniform alignment, ≥16).
+    level_stride: u32,
+    size: UVec2,
+}
+
+/// Deferred G-buffer: the three per-view `Rgba16Float` targets the primary SDF pass writes
+/// (replacing the old forward-lit single colour). `albedo` carries rgb albedo + camera distance
+/// in alpha; `normal_mat` carries the octahedral world normal + metallic/roughness; `emissive`
+/// carries premultiplied emissive radiance. Re-created lazily to match the viewport size. The
+/// composite pass samples all three. The matching `sampler` is a non-filtering nearest sampler
+/// (one G-buffer texel per pixel — no interpolation wanted).
+#[derive(Resource, Default)]
+struct SdfGBuffer {
+    albedo: Option<Texture>,
+    albedo_view: Option<TextureView>,
+    normal_mat: Option<Texture>,
+    normal_mat_view: Option<TextureView>,
+    emissive: Option<Texture>,
+    emissive_view: Option<TextureView>,
+    /// Isolated GI radiance: the composite (GI) pass renders into this, the combine pass reads +
+    /// bilateral-blurs it. View-sized `Rgba16Float`, allocated alongside the G-buffer.
+    gi: Option<Texture>,
+    gi_view: Option<TextureView>,
     sampler: Option<Sampler>,
     size: UVec2,
-    valid: bool,
 }
 
 /// Compute pipeline + layouts for the cone prepass (one tile-cone march per 8×8 tile,
@@ -370,7 +467,7 @@ pub struct SdfShaderDefs {
 // --- Render Graph ---
 
 #[derive(Debug, Hash, PartialEq, Eq, Clone, RenderLabel)]
-struct SdfLabel;
+struct SdfGBufferLabel;
 
 fn create_dummy_bg0(device: &RenderDevice, layout: &BindGroupLayout) -> BindGroup {
     let camera_buf = device.create_buffer(&BufferDescriptor {
@@ -387,16 +484,16 @@ fn create_dummy_bg0(device: &RenderDevice, layout: &BindGroupLayout) -> BindGrou
 }
 
 #[derive(Default)]
-struct SdfNode;
+struct SdfGBufferNode;
 
-impl ViewNode for SdfNode {
-    type ViewQuery = (&'static ViewTarget, &'static ViewDepthTexture);
+impl ViewNode for SdfGBufferNode {
+    type ViewQuery = &'static ViewDepthTexture;
 
     fn run(
         &self,
         graph: &mut RenderGraphContext,
         render_context: &mut RenderContext,
-        (view_target, depth): QueryItem<Self::ViewQuery>,
+        depth: QueryItem<Self::ViewQuery>,
         world: &World,
     ) -> Result<(), NodeRunError> {
         // Only run on SDF cameras — skip all other views
@@ -428,10 +525,21 @@ impl ViewNode for SdfNode {
                 bevy::log::error!("SDF pipeline error: {err}");
             }
         }
+
+        // The G-buffer textures must be allocated (prepare_sdf_gbuffer runs each frame). If not
+        // yet (no view this frame), skip — the composite will also skip.
+        let gbuffer = world.resource::<SdfGBuffer>();
+        let (Some(albedo_view), Some(normal_view), Some(emissive_view)) = (
+            &gbuffer.albedo_view,
+            &gbuffer.normal_mat_view,
+            &gbuffer.emissive_view,
+        ) else {
+            return Ok(());
+        };
+
         let layout_0 = pipeline_cache.get_bind_group_layout(&pipeline_res.layout_0);
         let layout_1 = pipeline_cache.get_bind_group_layout(&pipeline_res.layout_1);
         let layout_2 = pipeline_cache.get_bind_group_layout(&pipeline_res.layout_2);
-        let layout_3 = pipeline_cache.get_bind_group_layout(&pipeline_res.layout_3);
 
         // Bind group 0: camera uniform or fallback
         let has_camera = world
@@ -503,32 +611,33 @@ impl ViewNode for SdfNode {
             &BindGroupEntries::sequential((&prepass.read_view,)),
         );
 
-        // Bind group 3: SSR previous-frame colour + sampler. `prepare_reflect_history` keeps the
-        // texture sized to the view; it exists (dummy-cleared) from frame ~1, so we can always
-        // bind it. On the first frame it samples zeros → black reflection (one-frame, harmless).
-        let history = world.resource::<SdfReflectHistory>();
-        let (Some(hist_view), Some(hist_sampler)) = (&history.view, &history.sampler) else {
-            return Ok(()); // history not allocated yet (no view this frame) — skip the SDF pass
-        };
-        let bind_group_3 = device.create_bind_group(
-            "sdf_bind_group_3",
-            &layout_3,
-            &BindGroupEntries::sequential((hist_view, hist_sampler)),
-        );
-
-        let post_process = view_target.post_process_write();
-
+        // Render into the three G-buffer MRT targets + the shared depth attachment. Clear the
+        // colour targets (a miss writes the sky sentinel anyway, but a clean clear avoids stale
+        // data leaking where the fullscreen triangle doesn't cover). Depth keeps Load so the SDF
+        // surface shares the buffer with prior opaque geometry.
+        let clear = LoadOp::Clear(LinearRgba::NONE.into());
         let mut render_pass = render_context.begin_tracked_render_pass(RenderPassDescriptor {
-            label: Some("sdf_pass"),
-            color_attachments: &[Some(RenderPassColorAttachment {
-                view: post_process.destination,
-                resolve_target: None,
-                depth_slice: None,
-                ops: Operations {
-                    load: LoadOp::Load,
-                    store: StoreOp::Store,
-                },
-            })],
+            label: Some("sdf_gbuffer_pass"),
+            color_attachments: &[
+                Some(RenderPassColorAttachment {
+                    view: albedo_view,
+                    resolve_target: None,
+                    depth_slice: None,
+                    ops: Operations { load: clear, store: StoreOp::Store },
+                }),
+                Some(RenderPassColorAttachment {
+                    view: normal_view,
+                    resolve_target: None,
+                    depth_slice: None,
+                    ops: Operations { load: clear, store: StoreOp::Store },
+                }),
+                Some(RenderPassColorAttachment {
+                    view: emissive_view,
+                    resolve_target: None,
+                    depth_slice: None,
+                    ops: Operations { load: clear, store: StoreOp::Store },
+                }),
+            ],
             depth_stencil_attachment: Some(depth.get_attachment(StoreOp::Store)),
             timestamp_writes: None,
             occlusion_query_set: None,
@@ -539,26 +648,407 @@ impl ViewNode for SdfNode {
             render_pass.set_bind_group(0, &bind_group_0, &[0]);
             render_pass.set_bind_group(1, &bind_group_1, &[]);
             render_pass.set_bind_group(2, &bind_group_2, &[]);
-            render_pass.set_bind_group(3, &bind_group_3, &[]);
             render_pass.draw(0..3, 0..1);
         }
-        // End the render pass before copying (a texture can't be a colour attachment AND a
-        // copy source in the same scope).
-        drop(render_pass);
 
-        // Capture THIS frame's SDF output into the history texture for next frame's SSR. After
-        // `post_process_write`, `main_texture()` is the texture we just drew into. Copy only when
-        // sizes agree (a mid-frame resize leaves prepare to re-size next frame).
-        if let Some(hist_tex) = &history.tex {
-            let src = view_target.main_texture();
-            let src_size = src.size();
-            if src_size.width == history.size.x && src_size.height == history.size.y {
-                render_context.command_encoder().copy_texture_to_texture(
-                    src.as_image_copy(),
-                    hist_tex.as_image_copy(),
-                    src_size,
-                );
+        Ok(())
+    }
+}
+
+/// GI pass: reads the G-buffer + cascade 0 (group 1) + the shared camera uniform (group 0),
+/// gathers the radiance-cascade indirect term, and writes it to the ISOLATED GI texture (so the
+/// combine pass can bilateral-blur it without smearing the sharp direct light).
+#[derive(Default)]
+struct SdfCompositeNode;
+
+impl ViewNode for SdfCompositeNode {
+    type ViewQuery = ();
+
+    fn run(
+        &self,
+        graph: &mut RenderGraphContext,
+        render_context: &mut RenderContext,
+        _: QueryItem<Self::ViewQuery>,
+        world: &World,
+    ) -> Result<(), NodeRunError> {
+        let view_entity = graph.view_entity();
+        if world.get::<SdfCameraData>(view_entity).is_none() {
+            return Ok(());
+        }
+        if let Some(enabled) = world.get_resource::<SdfRenderEnabled>()
+            && !enabled.0
+        {
+            return Ok(());
+        }
+
+        let composite = world.resource::<SdfCompositePipeline>();
+        let sdf = world.resource::<SdfPipeline>();
+        let pipeline_cache = world.resource::<PipelineCache>();
+        let device = render_context.render_device();
+
+        let Some(pipeline) = pipeline_cache.get_render_pipeline(composite.pipeline_id) else {
+            use std::sync::atomic::{AtomicBool, Ordering};
+            static LOGGED: AtomicBool = AtomicBool::new(false);
+            if !LOGGED.swap(true, Ordering::Relaxed)
+                && let bevy::render::render_resource::CachedPipelineState::Err(err) =
+                    pipeline_cache.get_render_pipeline_state(composite.pipeline_id)
+            {
+                bevy::log::error!("SDF composite pipeline error: {err}");
             }
+            return Ok(());
+        };
+
+        let gbuffer = world.resource::<SdfGBuffer>();
+        let cascades = world.resource::<SdfCascades>();
+        let (
+            Some(albedo_view),
+            Some(normal_view),
+            Some(emissive_view),
+            Some(sampler),
+            Some(gi_view),
+            Some(cascade0_view),
+        ) = (
+            &gbuffer.albedo_view,
+            &gbuffer.normal_mat_view,
+            &gbuffer.emissive_view,
+            &gbuffer.sampler,
+            &gbuffer.gi_view,
+            // Cascade 0 always lands in tex[0] (level 0 writes slot 0 — see SdfCascadeNode).
+            &cascades.view[0],
+        ) else {
+            return Ok(());
+        };
+
+        // Group 0: the shared camera uniform (same layout + dynamic offset as the G-buffer pass).
+        let Some(camera_uniforms) = world.get_resource::<ComponentUniforms<SdfCameraData>>() else {
+            return Ok(());
+        };
+        let Some(camera_binding) = camera_uniforms.binding() else {
+            return Ok(());
+        };
+        let layout_0 = pipeline_cache.get_bind_group_layout(&sdf.layout_0);
+        let layout_gbuf = pipeline_cache.get_bind_group_layout(&composite.layout_gbuf);
+
+        let bind_group_0 = device.create_bind_group(
+            "sdf_composite_bind_group_0",
+            &layout_0,
+            &BindGroupEntries::sequential((camera_binding.clone(),)),
+        );
+        let bind_group_gbuf = device.create_bind_group(
+            "sdf_composite_gbuffer",
+            &layout_gbuf,
+            &BindGroupEntries::sequential((
+                albedo_view,
+                normal_view,
+                emissive_view,
+                sampler,
+                cascade0_view,
+            )),
+        );
+
+        // Render the isolated GI radiance into the GI texture (the combine pass reads + blurs it).
+        let mut render_pass = render_context.begin_tracked_render_pass(RenderPassDescriptor {
+            label: Some("sdf_gi_pass"),
+            color_attachments: &[Some(RenderPassColorAttachment {
+                view: gi_view,
+                resolve_target: None,
+                depth_slice: None,
+                ops: Operations {
+                    load: LoadOp::Clear(LinearRgba::NONE.into()),
+                    store: StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+        });
+        render_pass.set_render_pipeline(pipeline);
+        render_pass.set_bind_group(0, &bind_group_0, &[0]);
+        render_pass.set_bind_group(1, &bind_group_gbuf, &[]);
+        render_pass.draw(0..3, 0..1);
+
+        Ok(())
+    }
+}
+
+/// Combine pass: bilateral-blurs the GI texture, adds the analytic sun + emissive, and writes the
+/// lit result into the HDR view target. The final deferred-lighting step.
+#[derive(Default)]
+struct SdfCombineNode;
+
+impl ViewNode for SdfCombineNode {
+    type ViewQuery = &'static ViewTarget;
+
+    fn run(
+        &self,
+        graph: &mut RenderGraphContext,
+        render_context: &mut RenderContext,
+        view_target: QueryItem<Self::ViewQuery>,
+        world: &World,
+    ) -> Result<(), NodeRunError> {
+        let view_entity = graph.view_entity();
+        if world.get::<SdfCameraData>(view_entity).is_none() {
+            return Ok(());
+        }
+        if let Some(enabled) = world.get_resource::<SdfRenderEnabled>()
+            && !enabled.0
+        {
+            return Ok(());
+        }
+
+        let combine = world.resource::<SdfCombinePipeline>();
+        let sdf = world.resource::<SdfPipeline>();
+        let pipeline_cache = world.resource::<PipelineCache>();
+        let device = render_context.render_device();
+
+        let Some(pipeline) = pipeline_cache.get_render_pipeline(combine.pipeline_id) else {
+            use std::sync::atomic::{AtomicBool, Ordering};
+            static LOGGED: AtomicBool = AtomicBool::new(false);
+            if !LOGGED.swap(true, Ordering::Relaxed)
+                && let bevy::render::render_resource::CachedPipelineState::Err(err) =
+                    pipeline_cache.get_render_pipeline_state(combine.pipeline_id)
+            {
+                bevy::log::error!("SDF combine pipeline error: {err}");
+            }
+            return Ok(());
+        };
+
+        let gbuffer = world.resource::<SdfGBuffer>();
+        let (
+            Some(albedo_view),
+            Some(normal_view),
+            Some(emissive_view),
+            Some(sampler),
+            Some(gi_view),
+        ) = (
+            &gbuffer.albedo_view,
+            &gbuffer.normal_mat_view,
+            &gbuffer.emissive_view,
+            &gbuffer.sampler,
+            &gbuffer.gi_view,
+        ) else {
+            return Ok(());
+        };
+
+        let Some(camera_uniforms) = world.get_resource::<ComponentUniforms<SdfCameraData>>() else {
+            return Ok(());
+        };
+        let Some(camera_binding) = camera_uniforms.binding() else {
+            return Ok(());
+        };
+        let layout_0 = pipeline_cache.get_bind_group_layout(&sdf.layout_0);
+        let layout = pipeline_cache.get_bind_group_layout(&combine.layout);
+
+        let bind_group_0 = device.create_bind_group(
+            "sdf_combine_bind_group_0",
+            &layout_0,
+            &BindGroupEntries::sequential((camera_binding.clone(),)),
+        );
+        let bind_group_1 = device.create_bind_group(
+            "sdf_combine_gbuffer",
+            &layout,
+            &BindGroupEntries::sequential((
+                albedo_view,
+                normal_view,
+                emissive_view,
+                sampler,
+                gi_view,
+            )),
+        );
+
+        let post_process = view_target.post_process_write();
+        let mut render_pass = render_context.begin_tracked_render_pass(RenderPassDescriptor {
+            label: Some("sdf_combine_pass"),
+            color_attachments: &[Some(RenderPassColorAttachment {
+                view: post_process.destination,
+                resolve_target: None,
+                depth_slice: None,
+                ops: Operations {
+                    load: LoadOp::Load,
+                    store: StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+        });
+        render_pass.set_render_pipeline(pipeline);
+        render_pass.set_bind_group(0, &bind_group_0, &[0]);
+        render_pass.set_bind_group(1, &bind_group_1, &[]);
+        render_pass.draw(0..3, 0..1);
+
+        Ok(())
+    }
+}
+
+/// Build the atlas bind group (group 1) from the shared `SdfGpuAtlas`. Used by every pass that
+/// runs the SDF trace (G-buffer, cone prepass, cascade) — they all read the same atlas layout.
+fn build_atlas_bind_group(
+    device: &RenderDevice,
+    layout: &BindGroupLayout,
+    gpu_atlas: &SdfGpuAtlas,
+) -> BindGroup {
+    let tex_views = gpu_atlas.tex_array_views.as_ref().unwrap();
+    device.create_bind_group(
+        "sdf_atlas_bind_group",
+        layout,
+        &BindGroupEntries::sequential((
+            gpu_atlas.dist_view.as_ref().unwrap(),
+            gpu_atlas.sampler.as_ref().unwrap(),
+            gpu_atlas.lookup_buffer.as_ref().unwrap().as_entire_buffer_binding(),
+            gpu_atlas.mat_view.as_ref().unwrap(),
+            gpu_atlas.material_buffer.as_ref().unwrap().as_entire_buffer_binding(),
+            gpu_atlas.tex_sampler.as_ref().unwrap(),
+            &tex_views[0],
+            &tex_views[1],
+            &tex_views[2],
+            &tex_views[3],
+            &tex_views[4],
+            gpu_atlas.chunk_tile_buffer.as_ref().unwrap().as_entire_buffer_binding(),
+        )),
+    )
+}
+
+/// Radiance-cascade trace+merge: N fullscreen passes (coarse→fine), ping-ponging the two cascade
+/// targets. Level L writes `tex[L % 2]` and reads `tex[(L+1) % 2]` (cascade L+1's output), so the
+/// final cascade-0 result always lands in `tex[0]` for the composite to gather.
+#[derive(Default)]
+struct SdfCascadeNode;
+
+impl ViewNode for SdfCascadeNode {
+    type ViewQuery = ();
+
+    fn run(
+        &self,
+        graph: &mut RenderGraphContext,
+        render_context: &mut RenderContext,
+        _: QueryItem<Self::ViewQuery>,
+        world: &World,
+    ) -> Result<(), NodeRunError> {
+        let view_entity = graph.view_entity();
+        if world.get::<SdfCameraData>(view_entity).is_none() {
+            return Ok(());
+        }
+        if let Some(enabled) = world.get_resource::<SdfRenderEnabled>()
+            && !enabled.0
+        {
+            return Ok(());
+        }
+
+        let cascade = world.resource::<SdfCascadePipeline>();
+        let sdf = world.resource::<SdfPipeline>();
+        let pipeline_cache = world.resource::<PipelineCache>();
+        // Owned (Arc-backed) clone so creating per-level bind groups inside the pass loop doesn't
+        // hold an immutable borrow of `render_context` across `begin_tracked_render_pass`.
+        let device = render_context.render_device().clone();
+        let device = &device;
+
+        let Some(pipeline) = pipeline_cache.get_render_pipeline(cascade.pipeline_id) else {
+            use std::sync::atomic::{AtomicBool, Ordering};
+            static LOGGED: AtomicBool = AtomicBool::new(false);
+            if !LOGGED.swap(true, Ordering::Relaxed)
+                && let bevy::render::render_resource::CachedPipelineState::Err(err) =
+                    pipeline_cache.get_render_pipeline_state(cascade.pipeline_id)
+            {
+                bevy::log::error!("SDF cascade pipeline error: {err}");
+            }
+            return Ok(());
+        };
+
+        let cascades = world.resource::<SdfCascades>();
+        let gbuffer = world.resource::<SdfGBuffer>();
+        let (
+            Some(albedo_view),
+            Some(normal_view),
+            [Some(tex0), Some(tex1)],
+            Some(sampler),
+            Some(level_buf),
+        ) = (
+            &gbuffer.albedo_view,
+            &gbuffer.normal_mat_view,
+            &cascades.view,
+            &cascades.sampler,
+            &cascades.level_buffer,
+        ) else {
+            return Ok(());
+        };
+
+        let Some(camera_uniforms) = world.get_resource::<ComponentUniforms<SdfCameraData>>() else {
+            return Ok(());
+        };
+        let Some(camera_binding) = camera_uniforms.binding() else {
+            return Ok(());
+        };
+        let gpu_atlas = world.resource::<SdfGpuAtlas>();
+
+        let layout_0 = pipeline_cache.get_bind_group_layout(&sdf.layout_0);
+        let layout_1 = pipeline_cache.get_bind_group_layout(&sdf.layout_1);
+        let layout_2 = pipeline_cache.get_bind_group_layout(&cascade.layout_2);
+
+        let bind_group_0 = device.create_bind_group(
+            "sdf_cascade_bind_group_0",
+            &layout_0,
+            &BindGroupEntries::sequential((camera_binding.clone(),)),
+        );
+        let bind_group_1 = build_atlas_bind_group(device, &layout_1, gpu_atlas);
+
+        // Number of cascades for this frame's resolution: ceil(log4(max(w,h))), clamped to the
+        // uniform buffer's slot count. Identical to the shader's `num_cascades()`.
+        let size = cascades.size;
+        let n_raw = (size.x.max(size.y).max(2) as f32).log(4.0).ceil() as u32;
+        let n = n_raw.clamp(1, MAX_CASCADES);
+
+        // Two cascade views, indexed by parity so a fixed slot can be read/written each level.
+        let views = [tex0, tex1];
+
+        // Run coarse → fine. Level L reads L+1's output (already written this frame) and writes L.
+        let mut level = n;
+        while level > 0 {
+            level -= 1;
+            let write_idx = (level % 2) as usize;
+            let read_idx = ((level + 1) % 2) as usize;
+            let level_offset = level * cascades.level_stride;
+
+            // group 2: G-buffer albedo (probe placement), the PREVIOUS cascade (read), the
+            // sampler, and the per-level uniform (dynamic offset selects this level's slot).
+            let bind_group_2 = device.create_bind_group(
+                "sdf_cascade_bind_group_2",
+                &layout_2,
+                &BindGroupEntries::sequential((
+                    albedo_view,
+                    normal_view,
+                    views[read_idx],
+                    sampler,
+                    BufferBinding {
+                        buffer: level_buf,
+                        offset: 0,
+                        size: Some(std::num::NonZeroU64::new(16).unwrap()),
+                    },
+                )),
+            );
+
+            let mut pass = render_context.begin_tracked_render_pass(RenderPassDescriptor {
+                label: Some("sdf_cascade_pass"),
+                color_attachments: &[Some(RenderPassColorAttachment {
+                    view: views[write_idx],
+                    resolve_target: None,
+                    depth_slice: None,
+                    // The top cascade has no N+1 to read; clear avoids sampling stale data. Lower
+                    // levels fully overwrite every covered pixel, so clear is harmless there too.
+                    ops: Operations {
+                        load: LoadOp::Clear(LinearRgba::NONE.into()),
+                        store: StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            pass.set_render_pipeline(pipeline);
+            pass.set_bind_group(0, &bind_group_0, &[0]);
+            pass.set_bind_group(1, &bind_group_1, &[]);
+            pass.set_bind_group(2, &bind_group_2, &[level_offset]);
+            pass.draw(0..3, 0..1);
         }
 
         Ok(())
@@ -578,13 +1068,16 @@ struct SdfShaderHandle(Handle<Shader>);
 struct SdfShaderModules(#[expect(dead_code)] Vec<Handle<Shader>>);
 
 /// The `#define_import_path` module files the entry shader composes.
-const SDF_SHADER_MODULES: [&str; 6] = [
+const SDF_SHADER_MODULES: [&str; 9] = [
     "shaders/sdf/bindings.wgsl",
     "shaders/sdf/brick.wgsl",
     "shaders/sdf/material.wgsl",
     "shaders/sdf/shadows.wgsl",
     "shaders/sdf/sky.wgsl",
     "shaders/sdf/pbr.wgsl",
+    "shaders/sdf/oct.wgsl",
+    "shaders/sdf/march.wgsl",
+    "shaders/sdf/brdf.wgsl",
 ];
 
 pub struct SdfRenderPlugin;
@@ -596,6 +1089,9 @@ impl Plugin for SdfRenderPlugin {
         let shader_handle = asset_server.load(SDF_SHADER_PATH);
         let cone_shader_handle: Handle<Shader> = asset_server.load(SDF_CONE_SHADER_PATH);
         let bake_shader_handle: Handle<Shader> = asset_server.load(SDF_BAKE_SHADER_PATH);
+        let composite_shader_handle: Handle<Shader> = asset_server.load(SDF_COMPOSITE_SHADER_PATH);
+        let combine_shader_handle: Handle<Shader> = asset_server.load(SDF_COMBINE_SHADER_PATH);
+        let cascade_shader_handle: Handle<Shader> = asset_server.load(SDF_CASCADE_SHADER_PATH);
         // Load + retain the imported modules (Custom-path imports aren't auto-loaded).
         let module_handles: Vec<Handle<Shader>> = SDF_SHADER_MODULES
             .iter()
@@ -640,6 +1136,11 @@ impl Plugin for SdfRenderPlugin {
         render_app.insert_resource(SdfShaderHandle(shader_handle));
         render_app.insert_resource(SdfConeShaderHandle(cone_shader_handle));
         render_app.insert_resource(SdfBakeShaderHandle(bake_shader_handle));
+        render_app.insert_resource(SdfCompositeShaderHandle(composite_shader_handle));
+        render_app.insert_resource(SdfCombineShaderHandle(combine_shader_handle));
+        render_app.insert_resource(SdfCascadeShaderHandle(cascade_shader_handle));
+        render_app.init_resource::<SdfGBuffer>();
+        render_app.init_resource::<SdfCascades>();
 
         render_app
             .add_systems(ExtractSchedule, extract_sdf_atlas)
@@ -658,30 +1159,41 @@ impl Plugin for SdfRenderPlugin {
             .add_systems(Render, init_texture_streaming)
             .add_systems(Render, upload_texture_layers.after(init_texture_streaming))
             .add_systems(Render, rebuild_pipeline_on_def_change)
-            .add_systems(Render, prepare_reflect_history)
+            .add_systems(Render, prepare_sdf_gbuffer)
+            .add_systems(Render, prepare_sdf_cascades)
             .add_systems(RenderStartup, init_sdf_pipeline)
             .add_systems(RenderStartup, init_cone_pipeline.after(init_sdf_pipeline))
             .add_systems(RenderStartup, init_bake_pipeline.after(init_sdf_pipeline))
+            .add_systems(RenderStartup, init_composite_pipeline.after(init_sdf_pipeline))
+            .add_systems(RenderStartup, init_combine_pipeline.after(init_sdf_pipeline))
+            .add_systems(RenderStartup, init_cascade_pipeline.after(init_sdf_pipeline))
             .add_render_graph_node::<SdfBrickBakeNode>(Core3d, SdfBrickBakeLabel)
             .add_render_graph_node::<ViewNodeRunner<SdfConeNode>>(Core3d, SdfConeLabel)
-            .add_render_graph_node::<ViewNodeRunner<SdfNode>>(Core3d, SdfLabel)
+            .add_render_graph_node::<ViewNodeRunner<SdfGBufferNode>>(Core3d, SdfGBufferLabel)
+            .add_render_graph_node::<ViewNodeRunner<SdfCascadeNode>>(Core3d, SdfCascadeLabel)
+            .add_render_graph_node::<ViewNodeRunner<SdfCompositeNode>>(Core3d, SdfCompositeLabel)
+            .add_render_graph_node::<ViewNodeRunner<SdfCombineNode>>(Core3d, SdfCombineLabel)
             // The brick-bake compute pass writes the atlas BEFORE the view passes read it,
-            // so it runs first (after the opaque pass, before the cone prepass + raymarch).
+            // so it runs first (after the opaque pass, before the cone prepass + G-buffer).
             // It's a standalone (non-view) node — it fills the shared atlas once per frame,
             // not per view.
             //
-            // Run the SDF fullscreen pass between the opaque and transparent
-            // passes. Gizmos (transform handles, bounds) draw in the Transparent3d
-            // phase, so the SDF surface must be composited *before* them — otherwise
-            // the SDF pass (which fills background on a ray miss) paints over the
-            // gizmos. Their negative depth_bias then keeps them on top.
+            // Order: opaque → bake → cone prepass → G-buffer → cascade GI → composite(GI gather) →
+            // combine(blur+sun+emissive) → transparent. The cascade traces + merges coarse→fine
+            // into cascade 0; the composite gathers cascade 0 into the isolated GI texture; the
+            // combine bilateral-blurs the GI, adds the analytic sun + emissive, and writes the view
+            // target. Combine (which fills the sky on a miss) runs BEFORE the transparent pass so
+            // gizmos (Transparent3d, negative depth_bias) draw on top.
             .add_render_graph_edges(
                 Core3d,
                 (
                     Node3d::MainOpaquePass,
                     SdfBrickBakeLabel,
                     SdfConeLabel,
-                    SdfLabel,
+                    SdfGBufferLabel,
+                    SdfCascadeLabel,
+                    SdfCompositeLabel,
+                    SdfCombineLabel,
                     Node3d::MainTransparentPass,
                 ),
             );
@@ -752,6 +1264,7 @@ fn prepare_sdf_camera_data(
                 _pad0: 0,
                 _pad1: 0,
                 _pad2: 0,
+                emissive: def.emissive.extend(0.0),
             });
         }
     }
@@ -855,69 +1368,97 @@ fn extract_shader_defs(defs: Extract<Res<SdfShaderDefs>>, mut commands: Commands
     });
 }
 
+#[allow(clippy::too_many_arguments)] // Bevy system params; rebuilds two def-gated pipelines.
 fn rebuild_pipeline_on_def_change(
     mut pipeline: ResMut<SdfPipeline>,
+    mut combine: ResMut<SdfCombinePipeline>,
     extracted: Option<Res<ExtractedShaderDefs>>,
     shader_handle: Res<SdfShaderHandle>,
+    combine_shader: Res<SdfCombineShaderHandle>,
+    sdf_pipeline_layouts: Res<SdfPipeline>,
     pipeline_cache: Res<PipelineCache>,
     fullscreen_shader: Res<FullscreenShader>,
 ) {
     let Some(extracted) = extracted else { return };
-    // Rebuild whenever the extracted defs differ from what the live pipeline was built
-    // with — timing-independent, so the startup case (defs sync in a frame or two after
-    // the pipeline was first queued with empty defs) rebuilds without a manual toggle.
-    if extracted.defs == pipeline.current_defs {
-        return;
-    }
-
     let shader_defs: Vec<_> = extracted.defs.iter().map(|s| s.as_str().into()).collect();
-    let shader = shader_handle.0.clone();
     let vertex_state = fullscreen_shader.to_vertex_state();
 
-    let new_id = pipeline_cache.queue_render_pipeline(RenderPipelineDescriptor {
-        label: Some("sdf_pipeline".into()),
-        layout: vec![
-            pipeline.layout_0.clone(),
-            pipeline.layout_1.clone(),
-            pipeline.layout_2.clone(),
-            pipeline.layout_3.clone(),
-        ],
-        vertex: vertex_state,
-        fragment: Some(FragmentState {
-            shader,
-            shader_defs,
-            targets: vec![Some(ColorTargetState {
-                format: ViewTarget::TEXTURE_FORMAT_HDR,
-                blend: None,
-                write_mask: ColorWrites::ALL,
-            })],
+    // Primary (G-buffer) pipeline. Rebuild whenever the extracted defs differ from what the live
+    // pipeline was built with — timing-independent, so the startup case (defs sync a frame or two
+    // after the pipeline was first queued with empty defs) rebuilds without a manual toggle.
+    if extracted.defs != pipeline.current_defs {
+        let new_id = pipeline_cache.queue_render_pipeline(RenderPipelineDescriptor {
+            label: Some("sdf_gbuffer_pipeline".into()),
+            layout: vec![
+                pipeline.layout_0.clone(),
+                pipeline.layout_1.clone(),
+                pipeline.layout_2.clone(),
+            ],
+            vertex: vertex_state.clone(),
+            fragment: Some(FragmentState {
+                shader: shader_handle.0.clone(),
+                shader_defs: shader_defs.clone(),
+                targets: gbuffer_targets(),
+                ..default()
+            }),
+            depth_stencil: Some(DepthStencilState {
+                format: TextureFormat::Depth32Float,
+                depth_write_enabled: true,
+                depth_compare: CompareFunction::GreaterEqual,
+                stencil: default(),
+                bias: default(),
+            }),
             ..default()
-        }),
-        depth_stencil: Some(DepthStencilState {
-            format: TextureFormat::Depth32Float,
-            depth_write_enabled: true,
-            depth_compare: CompareFunction::GreaterEqual,
-            stencil: default(),
-            bias: default(),
-        }),
-        ..default()
-    });
+        });
+        pipeline.pipeline_id = new_id;
+        pipeline.current_defs = extracted.defs.clone();
+    }
 
-    pipeline.pipeline_id = new_id;
-    pipeline.current_defs = extracted.defs.clone();
+    // Combine pipeline (carries the SDF_DEBUG_* G-buffer/GI visualizer `#ifdef` branches).
+    if extracted.defs != combine.current_defs {
+        let new_id = pipeline_cache.queue_render_pipeline(RenderPipelineDescriptor {
+            label: Some("sdf_combine_pipeline".into()),
+            layout: vec![sdf_pipeline_layouts.layout_0.clone(), combine.layout.clone()],
+            vertex: vertex_state,
+            fragment: Some(FragmentState {
+                shader: combine_shader.0.clone(),
+                shader_defs,
+                targets: vec![Some(ColorTargetState {
+                    format: ViewTarget::TEXTURE_FORMAT_HDR,
+                    blend: None,
+                    write_mask: ColorWrites::ALL,
+                })],
+                ..default()
+            }),
+            ..default()
+        });
+        combine.pipeline_id = new_id;
+        combine.current_defs = extracted.defs.clone();
+    }
 }
 
-/// (Re)allocate the SSR history texture to match the SDF view target's size + HDR format. Runs
-/// each frame; only recreates on a size change (or first run). The texture holds last frame's
-/// SDF colour — `SdfNode` copies its pass output here at the end of `run`, and the NEXT frame's
-/// reflection path samples it. `valid` stays false until the first copy, so frame 0 falls back
-/// to the SDF reflection march.
-fn prepare_reflect_history(
+/// The three G-buffer MRT colour-target states (albedo+dist, normal+material, emissive). All
+/// `GBUFFER_FORMAT`, no blend (the fullscreen pass fully overwrites each covered pixel).
+fn gbuffer_targets() -> Vec<Option<ColorTargetState>> {
+    let one = || {
+        Some(ColorTargetState {
+            format: GBUFFER_FORMAT,
+            blend: None,
+            write_mask: ColorWrites::ALL,
+        })
+    };
+    vec![one(), one(), one()]
+}
+
+/// (Re)allocate the three G-buffer textures to match the SDF view target's size. Runs each
+/// frame; only recreates on a size change (or first run). The primary SDF pass renders into
+/// these (RENDER_ATTACHMENT) and the composite samples them (TEXTURE_BINDING).
+fn prepare_sdf_gbuffer(
     device: Res<RenderDevice>,
-    mut history: ResMut<SdfReflectHistory>,
+    mut gbuffer: ResMut<SdfGBuffer>,
     views: Query<&ViewTarget, With<SdfCameraData>>,
 ) {
-    // One SDF camera; take its target size. (Multiple SDF views would need per-view history —
+    // One SDF camera; take its target size. (Multiple SDF views would need per-view G-buffers —
     // not a case this editor hits.)
     let Some(view) = views.iter().next() else {
         return;
@@ -925,35 +1466,121 @@ fn prepare_reflect_history(
     let size = view.main_texture().size();
     let dims = UVec2::new(size.width, size.height);
 
-    if history.tex.is_some() && history.size == dims {
+    if gbuffer.albedo.is_some() && gbuffer.size == dims {
         return; // already sized correctly
     }
 
-    let tex = device.create_texture(&TextureDescriptor {
-        label: Some("sdf_reflect_history"),
-        size,
-        mip_level_count: 1,
-        sample_count: 1,
-        dimension: TextureDimension::D2,
-        format: ViewTarget::TEXTURE_FORMAT_HDR,
-        // TEXTURE_BINDING: sampled by the reflection path. COPY_DST: SdfNode copies the pass
-        // output in. RENDER_ATTACHMENT is not needed (we never render INTO it directly).
-        usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST,
-        view_formats: &[],
-    });
-    let tex_view = tex.create_view(&TextureViewDescriptor::default());
-    if history.sampler.is_none() {
-        history.sampler = Some(device.create_sampler(&SamplerDescriptor {
-            label: Some("sdf_reflect_history_sampler"),
-            mag_filter: FilterMode::Linear,
-            min_filter: FilterMode::Linear,
+    let make = |label: &str| {
+        let tex = device.create_texture(&TextureDescriptor {
+            label: Some(label),
+            size,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: TextureDimension::D2,
+            format: GBUFFER_FORMAT,
+            usage: TextureUsages::RENDER_ATTACHMENT | TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let view = tex.create_view(&TextureViewDescriptor::default());
+        (tex, view)
+    };
+    let (albedo, albedo_view) = make("sdf_gbuffer_albedo");
+    let (normal_mat, normal_mat_view) = make("sdf_gbuffer_normal_mat");
+    let (emissive, emissive_view) = make("sdf_gbuffer_emissive");
+    // Isolated GI radiance target (composite renders into it; combine reads + blurs it).
+    let (gi, gi_view) = make("sdf_gi");
+
+    if gbuffer.sampler.is_none() {
+        gbuffer.sampler = Some(device.create_sampler(&SamplerDescriptor {
+            label: Some("sdf_gbuffer_sampler"),
+            // Nearest: one G-buffer texel per pixel; no interpolation of packed normals/distance.
+            mag_filter: FilterMode::Nearest,
+            min_filter: FilterMode::Nearest,
             ..default()
         }));
     }
-    history.tex = Some(tex);
-    history.view = Some(tex_view);
-    history.size = dims;
-    history.valid = false; // freshly allocated → no valid content until SdfNode copies into it
+    gbuffer.albedo = Some(albedo);
+    gbuffer.albedo_view = Some(albedo_view);
+    gbuffer.normal_mat = Some(normal_mat);
+    gbuffer.normal_mat_view = Some(normal_mat_view);
+    gbuffer.emissive = Some(emissive);
+    gbuffer.emissive_view = Some(emissive_view);
+    gbuffer.gi = Some(gi);
+    gbuffer.gi_view = Some(gi_view);
+    gbuffer.size = dims;
+}
+
+/// (Re)allocate the two ping-pong cascade textures (screen-sized `Rgba16Float`) to match the view,
+/// and one-shot-create the per-level uniform buffer (`MAX_CASCADES` dynamic-offset slots) + the
+/// non-filtering sampler. The cascade node reads one texture and writes the other each level.
+fn prepare_sdf_cascades(
+    device: Res<RenderDevice>,
+    mut cascades: ResMut<SdfCascades>,
+    views: Query<&ViewTarget, With<SdfCameraData>>,
+) {
+    let Some(view) = views.iter().next() else {
+        return;
+    };
+    let size = view.main_texture().size();
+    let dims = UVec2::new(size.width, size.height);
+
+    // One-shot: the per-level uniform buffer + sampler (size-independent).
+    if cascades.level_buffer.is_none() {
+        // Each slot is a vec4<u32> (16B), but a dynamic-offset uniform binding must be a multiple
+        // of the device's min alignment (commonly 256). Round up so each level lands on a legal
+        // offset.
+        let align = device.limits().min_uniform_buffer_offset_alignment.max(16);
+        // Smallest multiple of `align` that holds a 16-byte slot.
+        let stride = 16u32.div_ceil(align) * align;
+        cascades.level_stride = stride;
+        // Fill every slot now (level value = slot index); the data never changes.
+        let mut bytes = vec![0u8; (stride * MAX_CASCADES) as usize];
+        for level in 0..MAX_CASCADES {
+            let off = (level * stride) as usize;
+            bytes[off..off + 4].copy_from_slice(&level.to_le_bytes());
+        }
+        cascades.level_buffer = Some(device.create_buffer_with_data(&BufferInitDescriptor {
+            label: Some("sdf_cascade_levels"),
+            contents: &bytes,
+            usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
+        }));
+    }
+    if cascades.sampler.is_none() {
+        cascades.sampler = Some(device.create_sampler(&SamplerDescriptor {
+            label: Some("sdf_cascade_sampler"),
+            mag_filter: FilterMode::Nearest,
+            min_filter: FilterMode::Nearest,
+            ..default()
+        }));
+    }
+
+    if cascades.tex[0].is_some() && cascades.size == dims {
+        return; // already sized
+    }
+    // A cascade level packs `rays_per_dim × probe_grid` texels per axis = `C0_RAYS_PER_DIM ×
+    // res / PROBE_SPACING` (constant across levels). With rays_per_dim 4 and PROBE_SPACING 2 that
+    // is 2× the screen per axis, so the cascade targets are TWICE the view size each way. Must
+    // match `C0_RAYS_PER_DIM / PROBE_SPACING` in the shaders.
+    let cascade_size = Extent3d {
+        width: size.width * CASCADE_TEX_SCALE,
+        height: size.height * CASCADE_TEX_SCALE,
+        depth_or_array_layers: 1,
+    };
+    for i in 0..2 {
+        let tex = device.create_texture(&TextureDescriptor {
+            label: Some("sdf_cascade_target"),
+            size: cascade_size,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: TextureDimension::D2,
+            format: GBUFFER_FORMAT,
+            usage: TextureUsages::RENDER_ATTACHMENT | TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        cascades.view[i] = Some(tex.create_view(&TextureViewDescriptor::default()));
+        cascades.tex[i] = Some(tex);
+    }
+    cascades.size = dims;
 }
 
 // --- Extract: Pack Atlas for GPU ---
@@ -1102,8 +1729,9 @@ fn prepare_sdf_materials_gpu(
     mut gpu_atlas: ResMut<SdfGpuAtlas>,
 ) {
     let Some(extracted) = extracted else { return };
-    // std430: each GpuSdfMaterial is 64 bytes (vec4 + f32 + 5×u32 + 3×f32 + 3×u32 pad).
-    let mut bytes = Vec::with_capacity(extracted.materials.len() * 64);
+    // std430: each GpuSdfMaterial is 80 bytes (vec4 + f32 + 5×u32 + 3×f32 + 3×u32 pad +
+    // vec4 emissive). The pads align `emissive` to its 16-byte boundary at offset 64.
+    let mut bytes = Vec::with_capacity(extracted.materials.len() * 80);
     for m in &extracted.materials {
         for c in [
             m.base_color.x,
@@ -1122,9 +1750,12 @@ fn prepare_sdf_materials_gpu(
         bytes.extend_from_slice(&m.metallic.to_le_bytes());
         bytes.extend_from_slice(&m.roughness.to_le_bytes());
         bytes.extend_from_slice(&m.parallax_scale.to_le_bytes());
-        bytes.extend_from_slice(&0u32.to_le_bytes());
-        bytes.extend_from_slice(&0u32.to_le_bytes());
-        bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // _pad0
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // _pad1
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // _pad2
+        for c in [m.emissive.x, m.emissive.y, m.emissive.z, m.emissive.w] {
+            bytes.extend_from_slice(&c.to_le_bytes());
+        }
     }
     let buffer = device.create_buffer_with_data(&BufferInitDescriptor {
         label: Some("sdf_material_buffer"),
@@ -1532,38 +2163,17 @@ fn init_sdf_pipeline(
             (texture_2d(TextureSampleType::Float { filterable: false }),),
         ),
     );
-    // group 3: SSR previous-frame colour (filterable, sampled with bilinear) + its sampler.
-    let layout_3 = BindGroupLayoutDescriptor::new(
-        "sdf_bind_group_3",
-        &BindGroupLayoutEntries::sequential(
-            ShaderStages::FRAGMENT,
-            (
-                texture_2d(TextureSampleType::Float { filterable: true }),
-                sampler(SamplerBindingType::Filtering),
-            ),
-        ),
-    );
-
     let shader = shader_handle.0.clone();
     let vertex_state = fullscreen_shader.to_vertex_state();
 
     let pipeline_id = pipeline_cache.queue_render_pipeline(RenderPipelineDescriptor {
-        label: Some("sdf_pipeline".into()),
-        layout: vec![
-            layout_0.clone(),
-            layout_1.clone(),
-            layout_2.clone(),
-            layout_3.clone(),
-        ],
+        label: Some("sdf_gbuffer_pipeline".into()),
+        layout: vec![layout_0.clone(), layout_1.clone(), layout_2.clone()],
         vertex: vertex_state,
         fragment: Some(FragmentState {
             shader: shader.clone(),
             shader_defs: vec![],
-            targets: vec![Some(ColorTargetState {
-                format: ViewTarget::TEXTURE_FORMAT_HDR,
-                blend: None,
-                write_mask: ColorWrites::ALL,
-            })],
+            targets: gbuffer_targets(),
             ..default()
         }),
         depth_stencil: Some(DepthStencilState {
@@ -1615,11 +2225,11 @@ fn init_sdf_pipeline(
         contents: &[0u8; 12],
         usage: BufferUsages::STORAGE,
     });
-    // One zeroed 48-byte GpuSdfMaterial row so binding 4 meets the struct's minimum
+    // One zeroed 80-byte GpuSdfMaterial row so binding 4 meets the struct's minimum
     // size before the real table uploads.
     let dummy_material = device.create_buffer_with_data(&BufferInitDescriptor {
         label: Some("sdf_dummy_material"),
-        contents: &[0u8; 64],
+        contents: &[0u8; 80],
         usage: BufferUsages::STORAGE,
     });
     // Matching dummy material atlas (Rgba16Snorm = 8 bytes/texel) so bind group 1 is
@@ -1688,12 +2298,10 @@ fn init_sdf_pipeline(
         layout_0,
         layout_1,
         layout_2,
-        layout_3,
         shader_handle: shader,
         // Queued above with empty shader_defs; rebuild fires once the synced defs differ.
         current_defs: Vec::new(),
     });
-    commands.init_resource::<SdfReflectHistory>();
     commands.insert_resource(SdfGpuAtlas {
         dist_tex: None,
         dist_view: Some(dummy_tex.create_view(&TextureViewDescriptor::default())),
@@ -1705,6 +2313,167 @@ fn init_sdf_pipeline(
         material_buffer: Some(dummy_material),
         tex_array_views: Some(dummy_tex_views),
         tex_sampler: Some(dummy_tex_sampler),
+    });
+}
+
+/// Queue the composite (deferred lighting) render pipeline. Reuses `SdfPipeline::layout_0` for
+/// the camera uniform (group 0) and declares its own G-buffer read layout (group 1). Runs after
+/// `init_sdf_pipeline` so `layout_0` exists. One HDR target, no depth (it reads the G-buffer +
+/// reconstructs world pos from stored distance, so it needs no depth attachment).
+fn init_composite_pipeline(
+    mut commands: Commands,
+    fullscreen_shader: Res<FullscreenShader>,
+    composite_shader: Res<SdfCompositeShaderHandle>,
+    sdf_pipeline: Res<SdfPipeline>,
+    pipeline_cache: Res<PipelineCache>,
+) {
+    // group 1: the three G-buffer textures (albedo+dist, normal+material, emissive) + a
+    // non-filtering sampler. All Rgba16Float, sampled (textureSampleLevel at mip 0).
+    let layout_gbuf = BindGroupLayoutDescriptor::new(
+        "sdf_composite_gbuffer",
+        &BindGroupLayoutEntries::sequential(
+            ShaderStages::FRAGMENT,
+            (
+                // 0..2: G-buffer albedo, normal-material, emissive
+                texture_2d(TextureSampleType::Float { filterable: false }),
+                texture_2d(TextureSampleType::Float { filterable: false }),
+                texture_2d(TextureSampleType::Float { filterable: false }),
+                // 3: non-filtering sampler
+                sampler(SamplerBindingType::NonFiltering),
+                // 4: cascade 0 (the finest radiance cascade) — gathered for the GI term
+                texture_2d(TextureSampleType::Float { filterable: false }),
+            ),
+        ),
+    );
+
+    let vertex_state = fullscreen_shader.to_vertex_state();
+    let pipeline_id = pipeline_cache.queue_render_pipeline(RenderPipelineDescriptor {
+        label: Some("sdf_composite_pipeline".into()),
+        layout: vec![sdf_pipeline.layout_0.clone(), layout_gbuf.clone()],
+        vertex: vertex_state,
+        fragment: Some(FragmentState {
+            shader: composite_shader.0.clone(),
+            shader_defs: vec![],
+            targets: vec![Some(ColorTargetState {
+                format: ViewTarget::TEXTURE_FORMAT_HDR,
+                blend: None,
+                write_mask: ColorWrites::ALL,
+            })],
+            ..default()
+        }),
+        ..default()
+    });
+
+    commands.insert_resource(SdfCompositePipeline {
+        pipeline_id,
+        layout_gbuf,
+    });
+}
+
+/// Queue the combine render pipeline (final deferred-lighting pass: bilateral-blur GI + analytic
+/// sun + emissive → view target). Reuses `layout_0` (camera) + declares group 1 = 3 G-buffer
+/// textures + sampler + the GI texture. Runs after `init_sdf_pipeline`.
+fn init_combine_pipeline(
+    mut commands: Commands,
+    fullscreen_shader: Res<FullscreenShader>,
+    combine_shader: Res<SdfCombineShaderHandle>,
+    sdf_pipeline: Res<SdfPipeline>,
+    pipeline_cache: Res<PipelineCache>,
+) {
+    let layout = BindGroupLayoutDescriptor::new(
+        "sdf_combine_gbuffer",
+        &BindGroupLayoutEntries::sequential(
+            ShaderStages::FRAGMENT,
+            (
+                // 0..2: G-buffer albedo, normal-material, emissive
+                texture_2d(TextureSampleType::Float { filterable: false }),
+                texture_2d(TextureSampleType::Float { filterable: false }),
+                texture_2d(TextureSampleType::Float { filterable: false }),
+                // 3: non-filtering sampler
+                sampler(SamplerBindingType::NonFiltering),
+                // 4: the isolated GI texture (read + bilateral-blurred)
+                texture_2d(TextureSampleType::Float { filterable: false }),
+            ),
+        ),
+    );
+
+    let vertex_state = fullscreen_shader.to_vertex_state();
+    let pipeline_id = pipeline_cache.queue_render_pipeline(RenderPipelineDescriptor {
+        label: Some("sdf_combine_pipeline".into()),
+        layout: vec![sdf_pipeline.layout_0.clone(), layout.clone()],
+        vertex: vertex_state,
+        fragment: Some(FragmentState {
+            shader: combine_shader.0.clone(),
+            shader_defs: vec![],
+            targets: vec![Some(ColorTargetState {
+                format: ViewTarget::TEXTURE_FORMAT_HDR,
+                blend: None,
+                write_mask: ColorWrites::ALL,
+            })],
+            ..default()
+        }),
+        ..default()
+    });
+
+    commands.insert_resource(SdfCombinePipeline {
+        pipeline_id,
+        layout,
+        // Queued above with empty defs; rebuild fires once the synced defs differ.
+        current_defs: Vec::new(),
+    });
+}
+
+/// Queue the cascade trace+merge render pipeline. Reuses `layout_0` (camera) + `layout_1` (atlas,
+/// for the SDF trace) and declares group 2: G-buffer albedo (probe placement) + the previous
+/// cascade texture (merge source) + a non-filtering sampler + the per-level dynamic-offset
+/// uniform. One HDR target, no depth. Runs after `init_sdf_pipeline` (layouts 0/1 must exist).
+fn init_cascade_pipeline(
+    mut commands: Commands,
+    fullscreen_shader: Res<FullscreenShader>,
+    cascade_shader: Res<SdfCascadeShaderHandle>,
+    sdf_pipeline: Res<SdfPipeline>,
+    pipeline_cache: Res<PipelineCache>,
+) {
+    let layout_2 = BindGroupLayoutDescriptor::new(
+        "sdf_cascade_bind_group_2",
+        &BindGroupLayoutEntries::sequential(
+            ShaderStages::FRAGMENT,
+            (
+                // binding 0: G-buffer albedo (a = camera distance, for probe placement)
+                texture_2d(TextureSampleType::Float { filterable: false }),
+                // binding 1: G-buffer normal-material (rg = octEncode normal; self-hit bias)
+                texture_2d(TextureSampleType::Float { filterable: false }),
+                // binding 2: previous cascade (N+1) radiance, read in the merge
+                texture_2d(TextureSampleType::Float { filterable: false }),
+                // binding 3: non-filtering sampler (textureLoad only)
+                sampler(SamplerBindingType::NonFiltering),
+                // binding 4: per-level uniform (dynamic offset selects the level slot)
+                uniform_buffer_sized(true, std::num::NonZeroU64::new(16)),
+            ),
+        ),
+    );
+
+    let vertex_state = fullscreen_shader.to_vertex_state();
+    let pipeline_id = pipeline_cache.queue_render_pipeline(RenderPipelineDescriptor {
+        label: Some("sdf_cascade_pipeline".into()),
+        layout: vec![
+            sdf_pipeline.layout_0.clone(),
+            sdf_pipeline.layout_1.clone(),
+            layout_2.clone(),
+        ],
+        vertex: vertex_state,
+        fragment: Some(FragmentState {
+            shader: cascade_shader.0.clone(),
+            shader_defs: vec![],
+            targets: gbuffer_targets()[0..1].to_vec(),
+            ..default()
+        }),
+        ..default()
+    });
+
+    commands.insert_resource(SdfCascadePipeline {
+        pipeline_id,
+        layout_2,
     });
 }
 

@@ -141,6 +141,10 @@ pub struct MaterialDef {
     /// Height-map relief displacement depth (world units). 0 = flat (no displacement);
     /// ~0.15 = clearly visible, ~0.3 = strong. Only has an effect when a height map is present.
     pub parallax_scale: f32,
+    /// Emissive (self-lit) radiance, linear RGB premultiplied by intensity (so the shader
+    /// adds it directly). `Vec3::ZERO` = no emission. Emissive surfaces also feed the
+    /// radiance-cascade GI, so a glowing object lights its surroundings.
+    pub emissive: Vec3,
     /// PBR texture-array layer per map, or `u32::MAX` if absent. See [`MATERIAL_TEX_MAPS`].
     pub tex_layers: [u32; MATERIAL_TEX_MAPS],
 }
@@ -156,6 +160,7 @@ impl Default for MaterialDef {
             // Default relief — clearly visible when a height map is present (textureless
             // materials have no height map, so it's a no-op).
             parallax_scale: 0.15,
+            emissive: Vec3::ZERO,
             tex_layers: [u32::MAX; MATERIAL_TEX_MAPS],
         }
     }
@@ -201,6 +206,8 @@ pub struct MaterialFields {
     pub roughness: Option<f32>,
     pub blend_softness: Option<f32>,
     pub parallax_scale: Option<f32>,
+    /// Emissive radiance, linear RGB premultiplied by intensity. `None` = inherit base.
+    pub emissive: Option<[f32; 3]>,
 }
 
 impl MaterialFields {

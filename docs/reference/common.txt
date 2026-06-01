@@ -1,0 +1,429 @@
+//CONST
+const float ATIME = 24.;
+const float IATIME = 1./ATIME;
+const float I256 = 1./256.;
+const float I512 = 1./512.;
+const float I1024 = 1./1024.;
+
+//DEFINE
+#define RES iChannelResolution[0].xy
+#define HRES floor(iChannelResolution[0].xy*0.5)
+#define IRES 1./iChannelResolution[0].xy
+#define IHRES (1./floor(iChannelResolution[0].xy*0.5))
+#define ASPECT vec2(iChannelResolution[0].x/iChannelResolution[0].y, 1.)
+
+//STRUCT
+struct HIT { float t; vec3 n; vec3 c; };
+
+//GENERIC MATH
+vec3 FloatToVec3(float v) {
+    int VPInt = floatBitsToInt(v);
+    int VPInt1024 = VPInt % 1024;
+    int VPInt10241024 = ((VPInt - VPInt1024)/1024) % 1024;
+    return vec3(VPInt1024, VPInt10241024, ((VPInt - VPInt1024 - VPInt10241024)/1048576))*I1024;
+}
+
+float Vec3ToFloat(vec3 v) {
+    ivec3 intv = min(ivec3(floor(v*1024.)), ivec3(1023));
+    return intBitsToFloat(intv.x + intv.y*1024 + intv.z*1048576);
+}
+
+float SampleRand(vec2 uv, int frame) {
+    float framef = fract(float(frame)*1.618033);
+    return fract(sin(dot(uv, vec2(314.2434, 257.3424)))*8234.23354*framef);
+}
+
+//SDF
+float DFBox(vec2 p, vec2 b) {
+    vec2 d = abs(p - b*0.5) - b*0.5;
+    return min(max(d.x, d.y), 0.) + length(max(d, 0.));
+}
+
+float DFBox(vec3 p, vec3 b) {
+    vec3 d = abs(p - b*0.5) - b*0.5;
+    return min(max(d.x, max(d.y, d.z)), 0.) + length(max(d, 0.));
+}
+
+vec2 Rotate2(vec2 p, float ang) {
+    float c = cos(ang), s = sin(ang);
+    return vec2(p.x*c - p.y*s, p.x*s + p.y*c);
+}
+
+float smin(float a, float b, float k) {
+    //https://iquilezles.org/articles/smin
+    float h = max(k-abs(a-b),0.)/k;
+    return min(a,b)-h*h*h*k*(1.0/6.0);
+}
+
+//SCENE
+vec3 GetCameraPos(vec4 inMouse, vec2 ires) {
+    vec2 mouse = vec2(fract(inMouse.x*ires.x + 0.5), inMouse.y*ires.y);
+    vec2 a = vec2(mouse.x*3.141592653*4., 0.01 + (1. - mouse.y)*3.141592653*0.55);
+    vec3 rp = vec3(cos(a.x)*sin(a.y), cos(a.y), sin(a.x)*sin(a.y));
+    return vec3(3., 1., 3.) - rp/smin(-abs(rp.x), smin(-abs(rp.y), -abs(rp.z), 0.3), 0.3)*2.75;
+}
+
+vec3 GetCameraEye(vec4 inMouse, vec2 ires) {
+    return -normalize(GetCameraPos(inMouse, ires) - vec3(3., 1., 3.));
+}
+
+vec3 GetSkyLight(vec3 d) {
+    return mix(vec3(0.2, 0.4, 1.), vec3(0.35, 0.4, 0.5), max(0., d.y))*max(0.01, d.y*0.5 + 0.5)*0.2;
+}
+
+vec3 GetSunLight(float t, vec3 p) {
+    float nt = t*IATIME;
+    if (fract((p.x + p.z*0.9 - p.y*0.9)*0.33) > 0.6) return vec3(0.);
+    return vec3(1., 0.65, 0.3)*6.;
+}
+
+vec3 GetSunDirection(float t) {
+    float nt = t*IATIME;
+    
+    return normalize(vec3(0.5, 0.6, 0.7));
+}
+
+//RT
+vec3 AQuad(vec3 p, vec3 d, vec3 vTan, vec3 vBit, vec3 vNor, vec2 pSize) {
+    float norDot = dot(vNor, d);
+    float pDot = dot(vNor, p);
+    if (sign(norDot*pDot) < -0.5) {
+        float t = -pDot/norDot;
+        vec2 hit2 = vec2(dot(p + d*t, vTan), dot(p + d*t, vBit));
+        if (DFBox(hit2, pSize) <= 0.) return vec3(hit2, t);
+    }
+    return vec3(-1.);
+}
+
+vec2 ABox(vec3 origin, vec3 dir, vec3 bmin, vec3 bmax) {
+    vec3 tMin = (bmin - origin)*dir;
+    vec3 tMax = (bmax - origin)*dir;
+    vec3 t1 = min(tMin, tMax);
+    vec3 t2 = max(tMin, tMax);
+    return vec2(max(max(t1.x, t1.y), t1.z), min(min(t2.x, t2.y), t2.z));
+}
+
+float ABoxFar(vec2 origin, vec2 dir, vec2 bmin, vec2 bmax) {
+    vec2 tMin = (bmin - origin)*dir;
+    vec2 tMax = (bmax - origin)*dir;
+    vec2 t1 = min(tMin, tMax);
+    vec2 t2 = max(tMin, tMax);
+    return min(t2.x, t2.y);
+}
+
+vec2 ABoxNormal(vec3 origin, vec3 idir, vec3 bmin, vec3 bmax, out vec3 N) {
+    vec3 tMin = (bmin - origin)*idir;
+    vec3 tMax = (bmax - origin)*idir;
+    vec3 t1 = min(tMin, tMax);
+    vec3 t2 = max(tMin, tMax);
+    vec3 signdir = -(max(vec3(0.), sign(idir))*2. - 1.);
+    if (t1.x > max(t1.y, t1.z)) N = vec3(signdir.x, 0., 0.);
+    else if (t1.y > t1.z) N = vec3(0., signdir.y, 0.);
+    else N = vec3(0., 0., signdir.z);
+    return vec2(max(max(t1.x, t1.y), t1.z), min(min(t2.x, t2.y), t2.z));
+}
+
+float ASphere(vec3 p, vec3 d, float r) {
+    float a = dot(p, p) - r*r;
+    float b = 2.*dot(p, d);
+    float re = b*b*0.25 - a;
+    if (dot(p, d) < 0. && re > 0.) {
+        float st = -b*0.5 - sqrt(re);
+        return st;
+    }
+    return -1.;
+}
+
+vec4 AStud(vec3 p, vec3 d) {
+    vec4 info = vec4(-2., -2., -2., 100000.);
+    vec2 studNor = vec2(0.92387953242, 0.38268343256);
+    for (int i = 0; i < 8; i++) {
+        float t = -(dot(p.xz, studNor) + 0.3)/dot(d.xz, studNor);
+        if (t > 0. && t < info.w) {
+            vec3 hitp = p + d*t;
+            if (hitp.y >= 0. && hitp.y <= 0.2 && length(hitp.xz) < 0.3248) {
+                info = vec4(studNor.x, 0., studNor.y, t);
+            }
+        }
+        studNor = vec2(studNor.x - studNor.y, studNor.x + studNor.y)*0.70710678118;
+    }
+    float pt = -(p.y - 0.2)/d.y;
+    if (d.y != 0. && pt > 0. && pt < info.w) {
+        vec3 sp = p + d*pt;
+        float studAngle = (floor((atan(sp.z, sp.x)/3.141592653 + 1.)*4. + 0.) + 0.5)*0.25*3.141592653;
+        if (dot(sp.xz, vec2(-cos(studAngle), -sin(studAngle))) <= 0.3) info = vec4(0., 1., 0., pt);
+    }
+    return info;
+}
+
+vec4 ARound111(vec3 p, vec3 d) {
+    vec4 info = vec4(-2., -2., -2., 100000.);
+    vec2 studNor = vec2(0.92387953242, 0.38268343256);
+    for (int i = 0; i < 8; i++) {
+        float t = -(dot(p.xz, studNor) + 0.45)/dot(d.xz, studNor);
+        if (t > 0. && t < info.w) {
+            vec3 hitp = p + d*t;
+            if (hitp.y >= 0.2 && hitp.y <= 1.2 && length(hitp.xz) < 0.4871) {
+                info = vec4(studNor.x, 0., studNor.y, t);
+            }
+        }
+        studNor = vec2(studNor.x - studNor.y, studNor.x + studNor.y)*0.70710678118;
+    }
+    studNor = vec2(0.92387953242, 0.38268343256);
+    for (int i = 0; i < 8; i++) {
+        float t = -(dot(p.xz, studNor) + 0.35)/dot(d.xz, studNor);
+        if (t > 0. && t < info.w) {
+            vec3 hitp = p + d*t;
+            if (hitp.y >= 0. && hitp.y <= 0.25 && length(hitp.xz) < 0.379) {
+                info = vec4(studNor.x, 0., studNor.y, t);
+            }
+        }
+        studNor = vec2(studNor.x - studNor.y, studNor.x + studNor.y)*0.70710678118;
+    }
+    return info;
+}
+
+void AStudRect(vec3 p, vec3 d, vec3 id, vec2 size, inout HIT info) {
+    vec2 bb = ABox(p, id, vec3(0., 0., 0.), vec3(size.x, 0.205, size.y));
+    float dfb = DFBox(p, vec3(size.x, 0.2, size.y));
+    if (dfb < 0. || (bb.x > 0. && bb.y > bb.x && bb.x < info.t)) {
+        float st = ((dfb < 0.) ? 0. : bb.x + 0.001 );
+        float stud_maxt = min(bb.y, info.t);
+        for (int i = 0; i < 16; i++) {
+            if (st > stud_maxt) break;
+            vec3 sp = p + d*st;
+            vec2 fp = floor(sp.xz);
+            vec4 nt4 = AStud(vec3(sp.x - fp.x - 0.5, sp.y, sp.z - fp.y - 0.5), d);
+            if (nt4.x > -1.5 && st + nt4.w < info.t) {
+                info = HIT(st + nt4.w, nt4.xyz, vec3(0.95));
+                break;
+            }
+            st += ABoxFar(sp.xz, id.xz, fp, fp + 1.) + 0.001;
+        }
+    }
+}
+
+HIT TraceRay(vec3 p, vec3 d, float maxt, float time) {
+    HIT info = HIT(maxt, vec3(-20.), vec3(-1.));
+    vec3 id = 1./d;
+    vec4 nt4;
+    vec3 uvt, sp, bn;
+    vec2 bb;
+    float st, dfb;
+    
+    //Floor
+    bb = ABox(p, id, vec3(0., -0.2, 0.), vec3(6., 0.01, 6.));
+    dfb = DFBox(p - vec3(0., -0.2, 0.), vec3(6., 0.16, 6.));
+    if (dfb <= 0. || (bb.x > 0. && bb.y > bb.x && bb.x < info.t)) {
+        st = ((dfb <= 0.) ? 0. : bb.x + 0.001 );
+        vec2 fp = floor((p.xz + d.xz*st - vec2(0., 0.1))*vec2(1./6., 0.5))*vec2(6., 2.) + vec2(0., 0.1);
+        vec3 rp = vec3(p.x - fp.x, p.y, p.z - fp.y);
+        st = -rp.y/d.y;
+        vec4 plane = vec4(-2., -2., -2., 0.);
+        if (d.y < 0. && st > plane.w && rp.z + d.z*st <= 1.8) {
+            plane = vec4(0., 1., 0., st);
+        }
+        vec3 tmpn = vec3(0., 0.70710678118, 0.70710678118);
+        st = -dot(rp - vec3(0., -0.1, 1.9), tmpn)/dot(d, tmpn);
+        if (dot(d, tmpn) < 0. && st > plane.w && DFBox(rp.xz + d.xz*st - vec2(0., 1.8), vec2(6., 0.1)) <= 0.) {
+            plane = vec4(tmpn, st);
+        }
+        tmpn = vec3(0., 0.70710678118, -0.70710678118);
+        st = -dot(rp - vec3(0., -0.1, 1.9), tmpn)/dot(d, tmpn);
+        if (dot(d, tmpn) < 0. && st > plane.w && DFBox(rp.xz + d.xz*st - vec2(0., 1.9), vec2(6., 0.1)) <= 0.) {
+            plane = vec4(tmpn, st);
+        }
+        if (plane.x > -1.5 && plane.w >= bb.x && plane.w < min(bb.y, info.t)) {
+            info = HIT(plane.w, plane.xyz, vec3(0.95));
+        }
+    }
+    
+    AStudRect(p, d, id, vec2(6., 6.), info);
+    
+    //Stud wall
+    bb = ABox(p, id, vec3(-0.15, 0., 0.), vec3(0.01, 6., 6.));
+    dfb = DFBox(p - vec3(-0.15, 0., 0.), vec3(0.16, 6., 6.));
+    if (dfb <= 0. || (bb.x > 0. && bb.y > bb.x && bb.x < info.t)) {
+        st = ((dfb <= 0.) ? 0. : bb.x + 0.001 );
+        vec2 fp = floor((p.zy + d.zy*st - vec2(0., 0.1))*vec2(1./6., 0.5))*vec2(6., 2.) + vec2(0., 0.1);
+        vec3 rp = vec3(p.x, p.y - fp.y, p.z - fp.x);
+        vec4 plane = vec4(-2., -2., -2., 0.);
+        st = -rp.x/d.x;
+        if (d.x < 0. && st > plane.w && rp.y + d.y*st <= 1.8) plane = vec4(1., 0., 0., st);
+        vec3 tmpn = vec3(0.70710678118, 0.70710678118, 0.);
+        st = -dot(rp.xy - vec2(-0.1, 1.9), tmpn.xy)/dot(d, tmpn);
+        if (dot(d, tmpn) < 0. && st > plane.w && DFBox(rp.zy + d.zy*st - vec2(0., 1.8), vec2(6., 0.1)) <= 0.) plane = vec4(tmpn, st);
+        tmpn = vec3(0.70710678118, -0.70710678118, 0.);
+        st = -dot(rp.xy - vec2(-0.1, 1.9), tmpn.xy)/dot(d, tmpn);
+        if (dot(d, tmpn) < 0. && st > plane.w && DFBox(rp.zy + d.zy*st - vec2(0., 1.9), vec2(6., 0.1)) <= 0.) plane = vec4(tmpn, st);
+        st = -(rp.x + 0.1)/d.x;
+        if (d.x < 0. && st > 0. && plane.x < -1.5) plane = vec4(1., 0., 0., st);
+        if (plane.x > -1.5 && plane.w >= bb.x && plane.w < min(bb.y, info.t)) {
+            info = HIT(plane.w, plane.xyz, vec3(0.95, 0.3, 0.1));
+        }
+    }
+    st = info.t;
+    AStudRect(p.yxz, d.yxz, id.yxz, vec2(6., 6.), info);
+    if (info.t < st) {
+        info.c = vec3(0.95, 0.3, 0.1);
+        info.n = info.n.yxz;
+    }
+    
+    //Stud wall
+    bb = ABox(p, id, vec3(0., 0., -0.15), vec3(6., 6., 0.01));
+    dfb = DFBox(p - vec3(0., 0., -0.15), vec3(6., 6., 0.16));
+    if (dfb <= 0. || (bb.x > 0. && bb.y > bb.x && bb.x < info.t)) {
+        st = ((dfb <= 0.) ? 0. : bb.x + 0.001 );
+        vec2 fp = floor((p.yx + d.yx*st - vec2(0., 0.1))*vec2(1./6., 0.5))*vec2(6., 2.) + vec2(0., 0.1);
+        vec3 rp = vec3(p.x - fp.y, p.y - fp.x, p.z);
+        vec4 plane = vec4(-2., -2., -2., 0.);
+        st = -rp.z/d.z;
+        if (d.z < 0. && st > plane.w && rp.x + d.x*st <= 1.8) plane = vec4(0., 0., 1., st);
+        vec3 tmpn = vec3(0.70710678118, 0., 0.70710678118);
+        st = -dot(rp.xz - vec2(1.9, -0.1), tmpn.xz)/dot(d, tmpn);
+        if (dot(d, tmpn) < 0. && st > plane.w && DFBox(rp.yx + d.yx*st - vec2(0., 1.8), vec2(6., 0.1)) <= 0.) plane = vec4(tmpn, st);
+        tmpn = vec3(-0.70710678118, 0., 0.70710678118);
+        st = -dot(rp.xz - vec2(1.9, -0.1), tmpn.xz)/dot(d, tmpn);
+        if (dot(d, tmpn) < 0. && st > plane.w && DFBox(rp.yx + d.yx*st - vec2(0., 1.9), vec2(6., 0.1)) <= 0.) plane = vec4(tmpn, st);
+        st = -(rp.z + 0.1)/d.z;
+        if (d.z < 0. && st > 0. && plane.x < -1.5) plane = vec4(0., 0., 1., st);
+        if (plane.x > -1.5 && plane.w >= bb.x && plane.w < min(bb.y, info.t)) {
+            info = HIT(plane.w, plane.xyz, vec3(0.2, 0.95, 0.2));
+        }
+    }
+    st = info.t;
+    AStudRect(p.yzx, d.yzx, id.yzx, vec2(6., 6.), info);
+    if (info.t < st) {
+        info.c = vec3(0.2, 0.95, 0.2);
+        info.n = info.n.zxy;
+    }
+    
+    //Desk
+    bb = ABox(p, id, vec3(1., 0., 1.), vec3(5., 1.8, 3.));
+    dfb = DFBox(p - vec3(1., 0., 1.), vec3(4., 1.8, 2.));
+    if (dfb < 0. || (bb.x > 0. && bb.y > bb.x && bb.x < info.t)) {
+        nt4 = ARound111(p - vec3(1.5, 0., 1.5), d);
+        if (nt4.x > -1.5 && nt4.w < info.t) info = HIT(nt4.w, nt4.xyz, vec3(0.95));
+        nt4 = ARound111(p - vec3(1.5, 0., 2.5), d);
+        if (nt4.x > -1.5 && nt4.w < info.t) info = HIT(nt4.w, nt4.xyz, vec3(0.95));
+        nt4 = ARound111(p - vec3(4.5, 0., 1.5), d);
+        if (nt4.x > -1.5 && nt4.w < info.t) info = HIT(nt4.w, nt4.xyz, vec3(0.95));
+        bb = ABoxNormal(p, id, vec3(1., 1.2, 1.), vec3(5., 1.6, 3.), bn);
+        if (bb.x > 0. && bb.y > bb.x && bb.x < info.t) info = HIT(bb.x, bn, vec3(0.95));
+        AStudRect(p - vec3(1., 1.6, 1.), d, id, vec2(4., 2.), info);
+    }
+    
+    //Emissive
+    nt4 = ARound111(p - vec3(3., 0., 5.), d);
+    if (nt4.x > -1.5 && nt4.w < info.t) info = HIT(nt4.w, nt4.xyz, vec3(0.95, 0.3, 0.3));
+    bb = ABoxNormal(p, id, vec3(2.5, 1.2, 4.5), vec3(3.5, 1.6, 5.5), bn);
+    if (bb.x > 0. && bb.y > bb.x && bb.x < info.t) info = HIT(bb.x, bn, vec3(0.95));
+    nt4 = AStud(p - vec3(3., 1.6, 5.), d);
+    if (nt4.x > -1.5 && nt4.w < info.t) info = HIT(nt4.w, nt4.xyz, vec3(0.95));
+    
+    //Tilting block
+    vec3 rp = p - vec3(0.75, 0.2, 3.75); rp.zy = Rotate2(rp.zy, 1.08);
+    vec3 rd = vec3(d.x, Rotate2(d.zy, 1.08).yx);
+    bb = ABoxNormal(rp, 1./rd, vec3(0., 0., -2.), vec3(1., 0.4, 0.), bn);
+    if (bb.x > 0. && bb.y > bb.x && bb.x < info.t) info = HIT(bb.x, vec3(bn.x, Rotate2(bn.zy, -0.9).yx), vec3(0.2, 0.4, 0.95));
+    st = info.t;
+    AStudRect(rp - vec3(0., 0.4, -2.), rd, 1./rd, vec2(1., 2.), info);
+    if (info.t < st) {
+        info.c = vec3(0.2, 0.4, 0.95);
+        info.n = vec3(info.n.x, Rotate2(info.n.zy, -1.08).yx);
+    }
+    
+    //Return
+    if (info.n.x > -1.5) info.n *= -dot(info.n, d);
+    return info;
+}
+
+//MATH
+mat3 TBN(vec3 N) {
+    vec3 Nb, Nt;
+    if (abs(N.y) > 0.99999) {
+        Nb = vec3(1., 0., 0.);
+        Nt = vec3(0., 0., 1.);
+    } else {
+    	Nb = normalize(cross(N, vec3(0., 1., 0.)));
+    	Nt = normalize(cross(Nb, N));
+    }
+    return mat3(Nb.x, Nt.x, N.x, Nb.y, Nt.y, N.y, Nb.z, Nt.z, N.z);
+}
+
+vec3 TBN(vec3 N, out vec3 B) {
+    if (abs(N.y) > 0.99999) {
+        B = vec3(1., 0., 0.);
+        return vec3(0., 0., 1.);
+    } else {
+    	B = normalize(cross(N, vec3(0., 1., 0.)));
+    	return normalize(cross(B, N));
+    }
+}
+
+vec3 RandSampleCos(vec2 v) {
+    float theta = sqrt(v.x);
+    float phi = 2.*3.141592653*v.y;
+    float x = theta*cos(phi);
+    float z = theta*sin(phi);
+    return vec3(x, z, sqrt(max(0., 1. - v.x)));
+}
+
+vec3 BRDF_GGX(vec3 w_o, vec3 w_i, vec3 n, float alpha, vec3 F0) {
+    vec3 h = normalize(w_i + w_o);
+    float a2 = alpha*alpha;
+    float D = a2/(3.141592653*pow(pow(dot(h, n), 2.)*(a2 - 1.) + 1., 2.));
+    vec3 F = F0 + (1. - F0)*pow(1. - dot(n, w_o), 5.);
+    float k = a2*0.5;
+    float G = 1./((dot(n, w_i)*(1. - k)+k)*(dot(n, w_o)*(1. - k) + k));
+    vec3 OUT = F*(D*G*0.25);
+    return ((isnan(OUT) != bvec3(false)) ? vec3(0.) : OUT);
+}
+
+
+//MERGING
+vec2 ProbeStochOffset(float frame, float cascade, float probeSize) {
+    float rv = mod(frame + 0.5, 16.) + cascade*0.15;
+    return min(floor(fract(sin(vec2(rv*341.192, rv*517.293))*vec2(695.293, 498.283))*probeSize) + 0.5,
+               vec2(probeSize - 0.5));
+}
+
+float ProbeWSize(vec2 uv, float probeSize, float probeDist, vec2 ires, vec2 aspect) {
+    vec3 cPos = normalize(vec3((uv*ires*2. - 1.)*aspect, 1.))*probeDist;
+    vec3 xPos = normalize(vec3((vec2(uv.x + probeSize*0.5, uv.y)*ires*2. - 1.)*aspect, 1.))*probeDist;
+    vec3 yPos = normalize(vec3((vec2(uv.x, uv.y + probeSize*0.5)*ires*2. - 1.)*aspect, 1.))*probeDist;
+    return max(length(cPos - xPos), length(cPos - yPos))*8.;
+}
+
+vec3 ComputeDir(vec2 uv, float probeSize) {
+    vec2 probeRel = uv - probeSize*0.5;
+    float probeThetai = max(abs(probeRel.x), abs(probeRel.y));
+    float probeTheta = probeThetai/probeSize*3.14192653;
+    float probePhi = 0.;
+    if (probeRel.x + 0.5 > probeThetai && probeRel.y - 0.5 > -probeThetai) {
+        probePhi = probeRel.x - probeRel.y;
+    } else if (probeRel.y - 0.5 < -probeThetai && probeRel.x - 0.5 > -probeThetai) {
+        probePhi = probeThetai*2. - probeRel.y - probeRel.x;
+    } else if (probeRel.x - 0.5 < -probeThetai && probeRel.y + 0.5 < probeThetai) {
+        probePhi = probeThetai*4. - probeRel.x + probeRel.y;
+    } else if (probeRel.y + 0.5 > probeThetai && probeRel.x + 0.5 < probeThetai) {
+        probePhi = probeThetai*8. - (probeRel.y - probeRel.x);
+    }
+    probePhi = (probePhi + 0.)*3.141592653*2./(4. + 8.*floor(probeThetai));
+    return vec3(vec2(sin(probePhi), cos(probePhi))*sin(probeTheta), cos(probeTheta));
+}
+
+vec2 ProjectDir(vec3 dir, float probeSize) {
+    if (dir.z <= 0.) return vec2(-1.);
+    float thetai = min(floor((1. - acos(length(dir.xy)/length(dir))/(3.141592653*0.5))*(probeSize*0.5)), probeSize*0.5 - 1.);
+    float phiF = atan(-dir.x, -dir.y);
+    float phiI = floor((phiF/3.141592653*0.5 + 0.5)*(4. + 8.*thetai) + 0.5) + 0.5;
+    vec2 phiUV;
+    float phiLen = 2.*thetai + 1.;
+    float sideLen = phiLen + 1.;
+    if (phiI < phiLen) phiUV = vec2(sideLen - 0.5, sideLen - phiI);
+    else if (phiI < phiLen*2.) phiUV = vec2(sideLen - (phiI - phiLen), 0.5);
+    else if (phiI < phiLen*3.) phiUV = vec2(0.5, phiI - phiLen*2.);
+    else phiUV = vec2(phiI - phiLen*3., sideLen - 0.5);
+    return vec2((probeSize - sideLen)*0.5) + phiUV;
+}
