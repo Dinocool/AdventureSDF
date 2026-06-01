@@ -144,7 +144,9 @@ impl TabViewer for EditorTabViewer<'_> {
                 super::viewport_toolbar::viewport_toolbar(self.world, ui);
                 // Capture the region the 3D camera should render into. The SDF pass
                 // fills this rect; everything else here is just reserved space.
-                *self.viewport_rect = ui.clip_rect();
+                let rect = ui.clip_rect();
+                *self.viewport_rect = rect;
+                viewport_material_drop(self.world, ui, rect);
             }
             EditorTab::Hierarchy => {
                 super::hierarchy::hierarchy_ui(self.world, ui);
@@ -175,6 +177,40 @@ impl TabViewer for EditorTabViewer<'_> {
     fn clear_background(&self, tab: &Self::Tab) -> bool {
         // Don't paint over the viewport — the 3D camera renders there.
         !matches!(tab, EditorTab::Viewport)
+    }
+}
+
+/// Accept a material dropped onto the 3D viewport: ray-pick the SDF volume under the cursor
+/// and set its material. Mirrors the inspector drop, but resolves the target entity via CPU
+/// picking instead of an explicit selection.
+fn viewport_material_drop(world: &mut World, ui: &mut egui::Ui, rect: egui::Rect) {
+    use crate::editor::assets_browser::MaterialDrag;
+
+    let resp = ui.interact(
+        rect,
+        ui.id().with("viewport_material_drop"),
+        egui::Sense::hover(),
+    );
+
+    // Highlight the viewport while a material drag hovers it.
+    if egui::DragAndDrop::payload::<MaterialDrag>(ui.ctx()).is_some() && resp.contains_pointer() {
+        ui.painter().rect_stroke(
+            rect.shrink(1.0),
+            0.0,
+            ui.visuals().selection.stroke,
+            egui::StrokeKind::Inside,
+        );
+    }
+
+    if let Some(drag) = resp.dnd_release_payload::<MaterialDrag>() {
+        // Cursor in window-logical points — the SDF camera is full-window, so this matches
+        // what `sdf_picking` reads from `window.cursor_position()`.
+        if let Some(p) = ui.ctx().pointer_interact_pos() {
+            let cursor = bevy::math::Vec2::new(p.x, p.y);
+            if let Some(entity) = crate::sdf_render::pick_sdf_volume(world, cursor) {
+                crate::sdf_render::debug::set_entity_material(world, entity, &drag.0);
+            }
+        }
     }
 }
 

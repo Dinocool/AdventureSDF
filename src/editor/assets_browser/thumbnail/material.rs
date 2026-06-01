@@ -34,10 +34,27 @@ const THUMB_TARGET_USAGE: TextureUsages = TextureUsages::TEXTURE_BINDING
     .union(TextureUsages::COPY_SRC)
     .union(TextureUsages::RENDER_ATTACHMENT);
 
-/// One material's thumbnail capture slot.
+/// What a thumbnail slot renders: a `.material.ron` material or a `.pbrtex.ron` PBR-texture
+/// bundle. Both resolve to a `StandardMaterial` applied to the shared sphere.
+enum ThumbSource {
+    Material(Handle<MaterialAsset>),
+    PbrTexture(Handle<crate::assets::PbrTextureAsset>),
+}
+
+impl ThumbSource {
+    /// The source asset's id, for change-invalidation matching.
+    fn asset_id(&self) -> bevy::asset::UntypedAssetId {
+        match self {
+            ThumbSource::Material(h) => h.id().untyped(),
+            ThumbSource::PbrTexture(h) => h.id().untyped(),
+        }
+    }
+}
+
+/// One thumbnail capture slot.
 struct MaterialSlot {
     /// Loaded source asset (drives `StandardMaterial` construction + re-capture).
-    source: Handle<MaterialAsset>,
+    source: ThumbSource,
     /// Offscreen render target the sphere is captured into.
     image: Handle<Image>,
     /// Standard material applied to the sphere for this thumbnail.
@@ -167,56 +184,77 @@ impl ThumbnailProvider for MaterialThumbnailProvider {
         let Some(asset_path) = crate::editor::fs_util::relative_to_assets(path) else {
             return Thumbnail::Icon("\u{1F535}");
         };
-        let key = path.to_path_buf();
-
-        if !world.resource::<MaterialThumbnailCache>().entries.contains_key(&key) {
-            // Fast path: a disk-cached PNG from a previous render (this run or a prior
-            // one). Decode it into an Image + register with egui — skip rendering.
-            if let Some(image) = load_cached_thumb(&key, &mut world.resource_mut::<Assets<Image>>())
-            {
-                let tex_id = world
-                    .resource_mut::<EguiUserTextures>()
-                    .add_image(EguiTextureHandle::Strong(image.clone()));
-                let source = world.resource::<AssetServer>().load::<MaterialAsset>(asset_path);
-                world.resource_mut::<MaterialThumbnailCache>().entries.insert(
-                    key.clone(),
-                    MaterialSlot {
-                        source,
-                        image,
-                        material: None,
-                        deps: Vec::new(),
-                        camera: None,
-                        tex_id: Some(tex_id),
-                        captured: true,
-                    },
-                );
-            } else {
-                // Create the target image + load the source asset; the capture system fills it.
-                let image = make_target_image(&mut world.resource_mut::<Assets<Image>>());
-                let source = world.resource::<AssetServer>().load::<MaterialAsset>(asset_path);
-                world.resource_mut::<MaterialThumbnailCache>().entries.insert(
-                    key.clone(),
-                    MaterialSlot {
-                        source,
-                        image,
-                        material: None,
-                        deps: Vec::new(),
-                        camera: None,
-                        tex_id: None,
-                        captured: false,
-                    },
-                );
-            }
-        }
-
-        let slot = &world.resource::<MaterialThumbnailCache>().entries[&key];
-        if let Some(id) = slot.tex_id
-            && slot.captured
-        {
-            return Thumbnail::Texture(id);
-        }
-        Thumbnail::Pending
+        let source = ThumbSource::Material(world.resource::<AssetServer>().load(asset_path));
+        ensure_slot(world, path, source)
     }
+}
+
+/// Provider for `.pbrtex.ron` PBR-texture bundles. Renders the same lit sphere as a
+/// material, with the bundle's diffuse/normal maps applied.
+pub struct PbrTextureThumbnailProvider;
+
+impl ThumbnailProvider for PbrTextureThumbnailProvider {
+    fn matches(&self, path: &Path) -> bool {
+        path.to_string_lossy().to_lowercase().ends_with(".pbrtex.ron")
+    }
+
+    fn thumbnail(&self, world: &mut World, path: &Path) -> Thumbnail {
+        let Some(asset_path) = crate::editor::fs_util::relative_to_assets(path) else {
+            return Thumbnail::Icon("\u{1F535}");
+        };
+        let source = ThumbSource::PbrTexture(world.resource::<AssetServer>().load(asset_path));
+        ensure_slot(world, path, source)
+    }
+}
+
+/// Ensure a thumbnail slot exists for `path` (disk-cache fast path, else queue a render),
+/// and return its current [`Thumbnail`] state. Shared by all sphere-thumbnail providers.
+fn ensure_slot(world: &mut World, path: &Path, source: ThumbSource) -> Thumbnail {
+    let key = path.to_path_buf();
+
+    if !world.resource::<MaterialThumbnailCache>().entries.contains_key(&key) {
+        // Fast path: a disk-cached PNG from a previous render. Decode + register with egui.
+        if let Some(image) = load_cached_thumb(&key, &mut world.resource_mut::<Assets<Image>>()) {
+            let tex_id = world
+                .resource_mut::<EguiUserTextures>()
+                .add_image(EguiTextureHandle::Strong(image.clone()));
+            world.resource_mut::<MaterialThumbnailCache>().entries.insert(
+                key.clone(),
+                MaterialSlot {
+                    source,
+                    image,
+                    material: None,
+                    deps: Vec::new(),
+                    camera: None,
+                    tex_id: Some(tex_id),
+                    captured: true,
+                },
+            );
+        } else {
+            // Create the target image; the capture system fills it once the source loads.
+            let image = make_target_image(&mut world.resource_mut::<Assets<Image>>());
+            world.resource_mut::<MaterialThumbnailCache>().entries.insert(
+                key.clone(),
+                MaterialSlot {
+                    source,
+                    image,
+                    material: None,
+                    deps: Vec::new(),
+                    camera: None,
+                    tex_id: None,
+                    captured: false,
+                },
+            );
+        }
+    }
+
+    let slot = &world.resource::<MaterialThumbnailCache>().entries[&key];
+    if let Some(id) = slot.tex_id
+        && slot.captured
+    {
+        return Thumbnail::Texture(id);
+    }
+    Thumbnail::Pending
 }
 
 /// Build a render-target image sized for a thumbnail.
@@ -255,7 +293,10 @@ fn setup_thumbnail_rig(
     commands.spawn((
         Mesh3d(meshes.add(Sphere::new(1.0).mesh().uv(32, 18))),
         MeshMaterial3d(std_materials.add(StandardMaterial::default())),
-        Transform::from_xyz(0.0, 0.0, 0.0),
+        // Bevy's UV sphere puts its poles on the Z axis, so by default a pole points
+        // straight at the camera (on +Z). Rotate -90° about X to stand the pole UP (+Z→+Y),
+        // then tilt back slightly so the top pole + seam read nicely rather than dead-on.
+        Transform::from_rotation(Quat::from_rotation_x(-std::f32::consts::FRAC_PI_2 + 0.35)),
         layer.clone(),
         ThumbnailSphere,
     ));
@@ -294,12 +335,19 @@ fn render_material_thumbnails(
     // 1. Build StandardMaterials (+ record their texture deps) once each slot's source
     //    asset has loaded, and register any completed capture with egui.
     for slot in cache.entries.values_mut() {
-        if slot.material.is_none()
-            && let Some(asset) = material_assets.get(&slot.source)
-        {
-            let (mat, deps) = standard_from_material(asset, &asset_server, &pbr_textures);
-            slot.material = Some(std_materials.add(mat));
-            slot.deps = deps;
+        if slot.material.is_none() {
+            let built = match &slot.source {
+                ThumbSource::Material(h) => material_assets
+                    .get(h)
+                    .map(|asset| standard_from_material(asset, &asset_server, &pbr_textures)),
+                ThumbSource::PbrTexture(h) => pbr_textures
+                    .get(h)
+                    .map(|tex| standard_from_pbr_texture(tex, &asset_server)),
+            };
+            if let Some((mat, deps)) = built {
+                slot.material = Some(std_materials.add(mat));
+                slot.deps = deps;
+            }
         }
         if slot.captured && slot.tex_id.is_none() {
             slot.tex_id =
@@ -446,27 +494,58 @@ pub(crate) fn standard_from_material(
     (mat, deps)
 }
 
-/// Invalidate a material thumbnail when its source asset is edited so it re-captures.
-/// Despawns any stale capture camera and resets the slot so the picker re-runs it.
+/// Build a `StandardMaterial` for a `.pbrtex.ron` bundle thumbnail (its diffuse + normal
+/// maps on a neutral base), returning the texture handles capture must wait for.
+pub(crate) fn standard_from_pbr_texture(
+    tex: &crate::assets::PbrTextureAsset,
+    server: &AssetServer,
+) -> (StandardMaterial, Vec<Handle<Image>>) {
+    let mut deps = Vec::new();
+    let mut load = |role: &Option<std::path::PathBuf>| -> Option<Handle<Image>> {
+        role.as_ref().map(|p| {
+            let h = server.load::<Image>(p.clone());
+            deps.push(h.clone());
+            h
+        })
+    };
+    let base_color_texture = load(&tex.diffuse);
+    let normal_map_texture = load(&tex.normal);
+    let mat = StandardMaterial {
+        base_color_texture,
+        normal_map_texture,
+        perceptual_roughness: 0.8,
+        ..default()
+    };
+    (mat, deps)
+}
+
+/// Invalidate a thumbnail when its source asset (material OR PBR-texture bundle) is edited
+/// so it re-captures. Despawns any stale capture camera and resets the slot.
 fn invalidate_on_material_change(
-    mut events: MessageReader<AssetEvent<MaterialAsset>>,
+    mut mat_events: MessageReader<AssetEvent<MaterialAsset>>,
+    mut tex_events: MessageReader<AssetEvent<crate::assets::PbrTextureAsset>>,
     mut commands: Commands,
     mut cache: ResMut<MaterialThumbnailCache>,
 ) {
-    let modified: Vec<_> = events
+    use bevy::asset::UntypedAssetId;
+    let mut modified: Vec<UntypedAssetId> = mat_events
         .read()
         .filter_map(|ev| match ev {
-            AssetEvent::Modified { id } => Some(*id),
+            AssetEvent::Modified { id } => Some(id.untyped()),
             _ => None,
         })
         .collect();
+    modified.extend(tex_events.read().filter_map(|ev| match ev {
+        AssetEvent::Modified { id } => Some(id.untyped()),
+        _ => None,
+    }));
     if modified.is_empty() {
         return;
     }
 
     let mut cleared_paths = Vec::new();
     for (path, slot) in cache.entries.iter_mut() {
-        if modified.contains(&slot.source.id()) {
+        if modified.contains(&slot.source.asset_id()) {
             slot.captured = false;
             slot.material = None; // rebuild from the new asset values
             slot.deps.clear();

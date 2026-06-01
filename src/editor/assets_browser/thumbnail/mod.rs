@@ -11,7 +11,9 @@ pub mod image;
 pub mod material;
 
 pub use image::{ImageThumbnailCache, ImageThumbnailProvider, ImageTexture, ensure_image_texture};
-pub use material::{MaterialThumbnailCache, MaterialThumbnailProvider};
+pub use material::{
+    MaterialThumbnailCache, MaterialThumbnailProvider, PbrTextureThumbnailProvider,
+};
 pub(crate) use material::standard_from_material;
 
 /// Plugin: registers the thumbnail caches + the offscreen material-sphere render rig.
