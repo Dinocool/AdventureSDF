@@ -71,27 +71,25 @@ fn entity_inspector_ui(world: &mut World, entity: Entity, ui: &mut egui::Ui) {
 
     // Run any registered per-component overrides first (curated editors), taking
     // the registry out so the closures get exclusive `&mut World`.
-    let overrides = world
-        .remove_resource::<InspectorOverrides>()
-        .unwrap_or_default();
-    let mut rendered_custom = false;
-    for (type_path, editor) in overrides.editors.iter() {
-        // Only show an override if the component is actually present on the entity.
-        if entity_has_type_path(world, entity, type_path) {
-            egui::CollapsingHeader::new(short_name(type_path))
-                .default_open(true)
-                .show(ui, |ui| {
-                    editor(world, entity, ui);
-                });
-            rendered_custom = true;
-        }
-    }
-    world.insert_resource(overrides);
-
-    let mut custom_paths: Vec<String> = {
-        let overrides = world.resource::<InspectorOverrides>();
-        overrides.editors.keys().cloned().collect()
-    };
+    let (rendered_custom, mut custom_paths) = crate::editor::fs_util::with_registry(
+        world,
+        |world, overrides: &InspectorOverrides| {
+            let mut rendered = false;
+            for (type_path, editor) in overrides.editors.iter() {
+                // Only show an override if the component is actually present on the entity.
+                if entity_has_type_path(world, entity, type_path) {
+                    egui::CollapsingHeader::new(short_name(type_path))
+                        .default_open(true)
+                        .show(ui, |ui| {
+                            editor(world, entity, ui);
+                        });
+                    rendered = true;
+                }
+            }
+            let paths: Vec<String> = overrides.editors.keys().cloned().collect();
+            (rendered, paths)
+        },
+    );
     // Name is rendered by `name_field_ui` above; keep it out of the generic section.
     custom_paths.push(std::any::type_name::<Name>().to_string());
 

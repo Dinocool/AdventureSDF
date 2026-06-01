@@ -18,7 +18,7 @@ use super::pbr_texture::PbrTextureAsset;
 ///
 /// `base_color` is stored as `[f32; 4]` (linear RGBA) rather than `Color` so the RON
 /// is stable across engine versions and trivially serde-able.
-#[derive(Asset, Reflect, Serialize, Deserialize, Clone, Debug)]
+#[derive(Asset, Reflect, Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct MaterialAsset {
     /// Linear RGBA tint multiplied into the sampled diffuse.
     pub base_color: [f32; 4],

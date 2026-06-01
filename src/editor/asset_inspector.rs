@@ -41,18 +41,18 @@ pub fn asset_inspector_ui(world: &mut World, path: &Path, ui: &mut egui::Ui) {
     ui.separator();
 
     // Take the registry out so inspectors get exclusive `&mut World` (restored after).
-    let registry = world
-        .remove_resource::<AssetInspectorRegistry>()
-        .unwrap_or_default();
-    let mut handled = false;
-    for inspector in &registry.inspectors {
-        if inspector.matches(path) {
-            inspector.ui(world, path, ui);
-            handled = true;
-            break;
-        }
-    }
-    world.insert_resource(registry);
+    let handled = crate::editor::fs_util::with_registry(
+        world,
+        |world, registry: &AssetInspectorRegistry| {
+            for inspector in &registry.inspectors {
+                if inspector.matches(path) {
+                    inspector.ui(world, path, ui);
+                    return true;
+                }
+            }
+            false
+        },
+    );
 
     if !handled {
         generic_file_info(path, ui);
@@ -85,10 +85,7 @@ pub struct TextureAssetInspector;
 
 impl AssetInspector for TextureAssetInspector {
     fn matches(&self, path: &Path) -> bool {
-        matches!(
-            path.extension().and_then(|e| e.to_str()).map(|e| e.to_lowercase()).as_deref(),
-            Some("png" | "jpg" | "jpeg" | "bmp" | "tga")
-        )
+        crate::editor::fs_util::is_image_file(path)
     }
 
     fn ui(&self, world: &mut World, path: &Path, ui: &mut egui::Ui) {
@@ -125,15 +122,15 @@ impl AssetInspector for TextureAssetInspector {
         ui.strong("Import");
 
         // Load the working copy on first edit of this path (from the sidecar/defaults).
+        // Single entry lookup (no separate contains-then-index) so the read can't race a
+        // concurrent edit out from under us.
         let key = path.to_path_buf();
-        if !world.resource::<ImportSettingsEdits>().map.contains_key(&key) {
-            let loaded = TextureImportSettings::load_for(path);
-            world
-                .resource_mut::<ImportSettingsEdits>()
-                .map
-                .insert(key.clone(), loaded);
-        }
-        let mut settings = world.resource::<ImportSettingsEdits>().map[&key].clone();
+        let mut settings = world
+            .resource_mut::<ImportSettingsEdits>()
+            .map
+            .entry(key.clone())
+            .or_insert_with(|| TextureImportSettings::load_for(path))
+            .clone();
 
         egui::ComboBox::from_label("Filter")
             .selected_text(format!("{:?}", settings.filter))
@@ -178,7 +175,7 @@ pub struct MaterialAssetInspector;
 
 impl AssetInspector for MaterialAssetInspector {
     fn matches(&self, path: &Path) -> bool {
-        path.to_string_lossy().to_lowercase().ends_with(".material.ron")
+        crate::editor::fs_util::is_material_ron(path)
     }
 
     fn ui(&self, world: &mut World, path: &Path, ui: &mut egui::Ui) {
@@ -227,9 +224,9 @@ impl AssetInspector for PbrTextureAssetInspector {
 
         ui.separator();
         if ui.button("Save").clicked()
-            && let Ok(rel) = path.strip_prefix(crate::editor::assets_browser::ASSETS_ROOT)
+            && let Some(rel) = crate::editor::fs_util::relative_to_assets(path)
         {
-            material_editor::save_pbr_texture(world, &handle, rel);
+            material_editor::save_pbr_texture(world, &handle, &rel);
         }
     }
 }

@@ -1,0 +1,125 @@
+//! Action application for the hierarchy pass: rename, reparent (cycle-guarded, world-
+//! transform-preserving), focus, and selection. The egui render pass only *accumulates*
+//! [`Actions`]; they're applied to the world here afterward so we never mutate while a
+//! tree/query borrow is live.
+
+use bevy::prelude::*;
+
+use crate::sdf_render::{OrbitFocus, SdfSelection};
+
+/// In-progress inline rename, stashed in egui temp memory between frames.
+#[derive(Clone, Default)]
+pub(super) struct RenameState {
+    pub(super) entity: Option<Entity>,
+    pub(super) buf: String,
+}
+
+/// Actions accumulated during the egui pass, applied to the world afterward (so we
+/// never mutate while a query/tree borrow is live).
+#[derive(Default)]
+pub(super) struct Actions {
+    pub(super) clicked: Option<Entity>,
+    pub(super) double_clicked: Option<Entity>,
+    pub(super) start_rename: Option<(Entity, String)>,
+    /// `(child, new_parent)` — `None` parent unparents to a root.
+    pub(super) reparent: Option<(Entity, Option<Entity>)>,
+    /// Clicked empty space in the tree → clear the selection.
+    pub(super) deselect: bool,
+}
+
+/// Apply the egui pass's accumulated actions to the world.
+pub(super) fn apply_actions(
+    world: &mut World,
+    rename: &mut RenameState,
+    commit_rename: bool,
+    actions: Actions,
+) {
+    if let Some((entity, name)) = actions.start_rename {
+        rename.entity = Some(entity);
+        rename.buf = name;
+    }
+
+    if commit_rename {
+        if let Some(entity) = rename.entity {
+            let new = rename.buf.trim();
+            if !new.is_empty()
+                && let Ok(mut e) = world.get_entity_mut(entity)
+            {
+                e.insert(Name::new(new.to_string()));
+            }
+        }
+        *rename = RenameState::default();
+    }
+
+    // Reparent (cycle-guarded): never parent a node under itself or a descendant.
+    if let Some((child, new_parent)) = actions.reparent {
+        match new_parent {
+            Some(parent) if parent != child && !is_descendant(world, parent, child) => {
+                reparent_preserving_world(world, child, parent);
+            }
+            Some(_) => {} // self or cycle — ignore
+            None => {
+                // Unparented: local transform becomes the former world transform.
+                let cg = world.get::<GlobalTransform>(child).copied();
+                if let Ok(mut e) = world.get_entity_mut(child) {
+                    if let Some(cg) = cg {
+                        e.insert(cg.compute_transform());
+                    }
+                    e.remove::<ChildOf>();
+                }
+            }
+        }
+    }
+
+    // Double-click focuses the orbit camera on the node (if it has a Transform).
+    if let Some(entity) = actions.double_clicked {
+        let pos = world.get::<Transform>(entity).map(|t| t.translation);
+        if let Some(pos) = pos {
+            world.resource_mut::<OrbitFocus>().target = Some(pos);
+        }
+    }
+
+    if let Some(entity) = actions.clicked.or(actions.double_clicked) {
+        world.resource_mut::<SdfSelection>().entity = Some(entity);
+    } else if actions.deselect {
+        // Clicked empty tree space → select nothing.
+        world.resource_mut::<SdfSelection>().entity = None;
+    }
+}
+
+/// True if `candidate` is `ancestor` or appears in `ancestor`'s `Children` subtree.
+/// Used to reject reparent operations that would create a cycle.
+fn is_descendant(world: &World, candidate: Entity, ancestor: Entity) -> bool {
+    if candidate == ancestor {
+        return true;
+    }
+    let mut stack = vec![ancestor];
+    while let Some(e) = stack.pop() {
+        if let Some(children) = world.get::<Children>(e) {
+            for child in children.iter() {
+                if child == candidate {
+                    return true;
+                }
+                stack.push(child);
+            }
+        }
+    }
+    false
+}
+
+/// Parent `child` under `parent`, preserving the child's world transform. Bevy keeps
+/// the child's *local* Transform across a reparent, so under a non-identity parent the
+/// node would visually jump; recompute the local transform via `reparented_to`.
+/// Caller must have already rejected cycles (`is_descendant`).
+pub(super) fn reparent_preserving_world(world: &mut World, child: Entity, parent: Entity) {
+    let cg = world.get::<GlobalTransform>(child).copied();
+    let pg = world.get::<GlobalTransform>(parent).copied();
+    if let (Some(cg), Some(pg)) = (cg, pg) {
+        let local = cg.reparented_to(&pg);
+        if let Ok(mut e) = world.get_entity_mut(child) {
+            e.insert((ChildOf(parent), local));
+        }
+    } else if let Ok(mut e) = world.get_entity_mut(child) {
+        e.insert(ChildOf(parent));
+    }
+}
