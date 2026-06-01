@@ -228,17 +228,17 @@ pub fn draw_tile(
 /// extension. Self-contained: takes the registry out of the world for the dispatch and
 /// restores it, so callers (tray + picker) don't manage that themselves.
 pub fn thumbnail_for_path(world: &mut World, path: &Path) -> Thumbnail {
-    let registry = world
-        .remove_resource::<ThumbnailRegistry>()
-        .unwrap_or_default();
-    let mut result = None;
-    for provider in &registry.providers {
-        if provider.matches(path) {
-            result = Some(provider.thumbnail(world, path));
-            break;
-        }
-    }
-    world.insert_resource(registry);
+    let result = crate::editor::fs_util::with_registry(
+        world,
+        |world, registry: &ThumbnailRegistry| {
+            for provider in &registry.providers {
+                if provider.matches(path) {
+                    return Some(provider.thumbnail(world, path));
+                }
+            }
+            None
+        },
+    );
     result.unwrap_or_else(|| Thumbnail::Icon(icon_for(path)))
 }
 
@@ -283,10 +283,7 @@ fn read_entries(dir: &Path) -> Vec<Entry> {
         .map(|e| {
             let path = e.path();
             let is_dir = path.is_dir();
-            let name = path
-                .file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_default();
+            let name = crate::editor::fs_util::file_name_str(&path);
             Entry { path, name, is_dir }
         })
         .collect();
@@ -310,7 +307,7 @@ fn parent_of(current: &Path) -> PathBuf {
 
 /// Convert a working-dir path under `assets/` back to a root-relative path.
 fn rel_to_root(path: &Path) -> Option<PathBuf> {
-    path.strip_prefix(ASSETS_ROOT).ok().map(Path::to_path_buf)
+    crate::editor::fs_util::relative_to_assets(path)
 }
 
 /// Truncate `s` to `max` chars with an ellipsis (egui also truncates visually; this
