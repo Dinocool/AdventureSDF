@@ -280,6 +280,12 @@ fn wire_row(
             actions.start_rename = Some((row.entity, row.name.clone()));
             ui.close();
         }
+        // Snap the editor viewport to look through this node (its forward/position).
+        // Most useful on a scene Camera node, but works on any node to frame it.
+        if ui.button("Look through").clicked() {
+            actions.look_through = Some(row.entity);
+            ui.close();
+        }
     });
 
     // Drop preview: when a droppable node hovers this row, outline the prospective

@@ -10,7 +10,7 @@ use bevy::prelude::*;
 use bevy::reflect::TypeRegistry;
 use bevy::reflect::serde::ReflectSerializer;
 
-use crate::scene_manager::SceneEntity;
+use crate::scene_manager::{EditorEntity, SceneEntity};
 
 use super::format::{ComponentMap, LocalId, SceneFile, SceneRecord};
 use super::{EditorHidden, InstanceChild, NonSerializable, SceneInstance, SkipSerialization};
@@ -19,6 +19,10 @@ use super::{EditorHidden, InstanceChild, NonSerializable, SceneInstance, SkipSer
 /// that the loader re-derives or that carry no authored data.
 const SKIP_TYPE_PATHS: &[&str] = &[
     "adventure::scene_manager::SceneEntity",
+    "adventure::scene_manager::EditorEntity",
+    // Runtime-derived material id (resolved from `SdfMaterialSource` by `resolve_materials`).
+    // The source is the authored truth; serializing the id would bake a stale GPU index.
+    "adventure::sdf_render::edits::SdfMaterial",
     "adventure::soul_scene::format::LocalId",
     "adventure::soul_scene::SceneInstance",
     "adventure::soul_scene::InstanceChild",
@@ -29,6 +33,24 @@ const SKIP_TYPE_PATHS: &[&str] = &[
     // `parent_local_id`), not as the raw `Entity` in `ChildOf`.
     "bevy_ecs::hierarchy::ChildOf",
     "bevy_ecs::hierarchy::Children",
+    // Render-world sync bookkeeping. `RenderEntity` holds a render-world entity id that is
+    // only valid for the live run; serializing + restoring it makes Bevy try to sync an
+    // already-synced entity ("Attempting to synchronize an entity that has already been
+    // synchronized!"). Both are re-added automatically as required components on load.
+    "bevy_render::sync_world::RenderEntity",
+    "bevy_render::sync_world::SyncToRenderWorld",
+    // Transform-derived: `GlobalTransform` is recomputed from `Transform` by propagation,
+    // and `TransformTreeChanged` is a per-frame dirty flag. Saving them is redundant and
+    // restoring a stale `GlobalTransform` would fight propagation for a frame.
+    "bevy_transform::components::global_transform::GlobalTransform",
+    "bevy_transform::components::transform::TransformTreeChanged",
+    // Light/visibility runtime state, auto-added as required components of lights/cameras
+    // and rebuilt every frame — never authored, never restored.
+    "bevy_camera::primitives::CascadesFrusta",
+    "bevy_camera::visibility::CascadesVisibleEntities",
+    "bevy_camera::visibility::InheritedVisibility",
+    "bevy_camera::visibility::ViewVisibility",
+    "bevy_light::cascade::Cascades",
 ];
 
 /// Errors raised while saving a `.scene`.
@@ -78,6 +100,7 @@ fn build_scene_file(world: &mut World, registry: &TypeRegistry) -> SceneFile {
     let mut entity_ids: Vec<(Entity, LocalId)> = world
         .query_filtered::<(Entity, &LocalId), (
             With<SceneEntity>,
+            Without<EditorEntity>,
             Without<InstanceChild>,
             Without<NonSerializable>,
             Without<SkipSerialization>,

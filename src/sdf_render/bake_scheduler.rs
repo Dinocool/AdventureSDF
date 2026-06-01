@@ -1168,15 +1168,22 @@ mod tests {
         assert!(!gpu.jobs.is_empty(), "after the edit moves, its bricks must re-bake (content hash changed)");
     }
 
-    /// Fold the shared `gallery_demo_edits` list into a `(ResolvedEdit, world AABB)` pair list — the
-    /// exact geometry the runtime scene spawns, so the bake-cache test exercises the real gallery.
+    /// Fold the shared `tower_field_edits` list into a `(ResolvedEdit, world AABB)` pair list — the
+    /// exact geometry the runtime `TowerSpawner` produces, so the bake-cache test exercises the real
+    /// stress scene. Roles map to arbitrary distinct material ids.
     fn gallery_resolved() -> Vec<(ResolvedEdit, Aabb3d)> {
-        edits::gallery_demo_edits(0, 1, 2)
+        use edits::TowerRole;
+        edits::tower_field_edits(&edits::TowerFieldParams::default())
             .into_iter()
-            .map(|(_order, transform, prim, mat)| {
+            .map(|(_order, transform, prim, role)| {
+                let mat = match role {
+                    TowerRole::Ground => 0u16,
+                    TowerRole::Cube => 1,
+                    TowerRole::Cap => 2,
+                };
                 let op = SdfOp { kind: CsgKind::Union, smoothing: 0.0 };
                 let aabb = edit_world_aabb(&prim, &transform, op.smoothing);
-                (ResolvedEdit::new(prim, transform, op, mat as u16), aabb)
+                (ResolvedEdit::new(prim, transform, op, mat), aabb)
             })
             .collect()
     }
