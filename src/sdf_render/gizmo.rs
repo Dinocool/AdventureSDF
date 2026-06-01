@@ -36,6 +36,10 @@ const VIEW_RING_FRAC: f32 = 1.1;
 /// Axes fade out when their screen projection is within this dot-to-view band.
 const FADE_START: f32 = 0.95;
 const FADE_END: f32 = 0.99;
+/// Hover glow colour traced over the hovered handle (orange).
+const GLOW_COLOR: Color = Color::srgb(1.0, 0.6, 0.1);
+/// How far (pixels) the orange glow peeks out around the hovered handle on each side.
+const GLOW_PX: f32 = 2.0;
 
 /// World axes in index order (0=X, 1=Y, 2=Z).
 const AXES: [Vec3; 3] = [Vec3::X, Vec3::Y, Vec3::Z];
@@ -205,6 +209,11 @@ impl Handle {
     fn inner(&self) -> f32 {
         self.unit * GIZMO_SIZE_PX * INNER_FRAC
     }
+    /// Half-size of the centre view-plane (Translate/Scale) handle square. Half the inner
+    /// gap so the centre drag target is compact. Shared by draw + pick so they agree.
+    fn view_half(&self) -> f32 {
+        self.inner() * 0.5
+    }
     fn size(&self) -> f32 {
         self.unit * GIZMO_SIZE_PX
     }
@@ -285,7 +294,7 @@ impl Handle {
             }
             HandleId::TranslateView | HandleId::ScaleView => {
                 // Screen-facing square at the centre.
-                let h = self.inner();
+                let h = self.view_half();
                 let (r, u) = (self.view_right * h, self.view_up * h);
                 let o = self.origin;
                 sb.quad([o - r - u, o + r - u, o + r + u, o - r + u], color)
@@ -326,6 +335,76 @@ impl Handle {
         )
     }
 
+    /// The same handle geometry, drawn larger in `GLOW_COLOR` so when rendered BEHIND the
+    /// normal handle an orange halo of ~`STROKE_PX * 0.5` peeks out around its edge. Stroked
+    /// handles (axes / rings / the arrowhead) widen their stroke; filled handles (planes /
+    /// centre square) expand their footprint.
+    fn tessellate_glow(&self, sb: &ShapeBuilder) -> GizmoMesh {
+        // Orange peeks out this far on every side of the handle. Stroke widths are in
+        // PIXELS (see `ShapeBuilder`), so the peek is in pixels too; filled handles expand
+        // their world-space footprint, so they convert it via `self.unit` (world-per-pixel).
+        let peek_px = GLOW_PX;
+        let peek_world = self.unit * peek_px;
+        let sw = STROKE_PX;
+        let color = GLOW_COLOR;
+        match self.id {
+            HandleId::TranslateAxis(a) | HandleId::ScaleAxis(a) => {
+                let axis = self.axis(a);
+                if self.axis_fade(axis) <= 0.0 {
+                    return GizmoMesh::default();
+                }
+                let kind = self.id.kind();
+                let (s, e) = self.axis_span(kind);
+                let cap_w = 2.4 * sw;
+                let tip_len = self.unit * cap_w * if kind == Kind::Scale { 1.0 } else { 2.2 };
+                // Mirror the NORMAL handle's geometry exactly (same shaft, same junction),
+                // then outset every dimension by `peek`. The junction (`tip_start`) stays at
+                // the normal location; only the base and tip extend along the axis.
+                let end_normal = self.origin + axis * e;
+                let tip_start = end_normal - axis * tip_len;
+                let start = self.origin + axis * (s - peek_world);
+                let end = self.origin + axis * (e + peek_world);
+                // Shaft: normal half-width (sw/2) + peek on each side.
+                let mut m = sb.line(start, tip_start, sw + 2.0 * peek_px, color);
+                if kind == Kind::Scale {
+                    // Scale cap is a fat segment of width `cap_w`; outset by peek per side.
+                    m += &sb.line(tip_start, end, cap_w + 2.0 * peek_px, color);
+                } else {
+                    // Translate arrowhead: normal head base half-width is `cap_w` (= 2.4*sw),
+                    // head length ~5x the shaft half-width. Outset each by peek so the glow is
+                    // a uniform rim, not a flared/stretched head.
+                    m += &sb.arrow_ex(
+                        tip_start,
+                        end,
+                        cap_w * 0.5 + peek_px,
+                        cap_w + peek_px,
+                        cap_w * 2.5 + peek_px,
+                        color,
+                    );
+                }
+                m
+            }
+            HandleId::TranslatePlane(a, b) | HandleId::ScalePlane(a, b) => {
+                let center = self.plane_center(a, b);
+                let h = self.plane_half() + peek_world;
+                let (ua, ub) = (self.axis(a) * h, self.axis(b) * h);
+                sb.quad([center - ua - ub, center + ua - ub, center + ua + ub, center - ua + ub], color)
+            }
+            HandleId::TranslateView | HandleId::ScaleView => {
+                let h = self.view_half() + peek_world;
+                let (r, u) = (self.view_right * h, self.view_up * h);
+                let o = self.origin;
+                sb.quad([o - r - u, o + r - u, o + r + u, o - r + u], color)
+            }
+            HandleId::RotateAxis(a) => {
+                sb.ring(self.origin, self.axis(a), self.size(), sw + 2.0 * peek_px, color)
+            }
+            HandleId::RotateView => {
+                sb.ring(self.origin, self.view_fwd, self.size() * VIEW_RING_FRAC, sw + 2.0 * peek_px, color)
+            }
+        }
+    }
+
     /// Axis visibility (1 = head-on, 0 = edge-on/parallel to view), so axes nearly
     /// parallel to the camera fade out and don't steal clicks.
     fn axis_fade(&self, axis: Vec3) -> f32 {
@@ -357,7 +436,7 @@ impl Handle {
             HandleId::TranslateView | HandleId::ScaleView => {
                 let hit = ray_plane(ray, self.origin, self.view_fwd)?;
                 let d = hit.point - self.origin;
-                let h = self.inner();
+                let h = self.view_half();
                 (d.dot(self.view_right).abs() <= h && d.dot(self.view_up).abs() <= h)
                     .then_some(hit.t)
             }
@@ -680,6 +759,13 @@ pub fn draw_gizmo(
             }
         }
     } else {
+        // Orange glow for the hovered handle FIRST (a larger copy behind the handle), so
+        // the normal handle drawn on top leaves only a halo of orange peeking out around it.
+        if let Some(hovered) = state.hovered
+            && let Some(h) = handles.iter().find(|h| h.id == hovered)
+        {
+            mesh += &h.tessellate_glow(&sb);
+        }
         for h in &handles {
             mesh += &h.tessellate(&sb, handle_color(h.id, active));
         }
