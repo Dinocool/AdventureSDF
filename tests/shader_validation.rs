@@ -172,6 +172,8 @@ fn sdf_debug_modes_validate() {
         "SDF_DEBUG_RAY_FATE",
         "SDF_DEBUG_REFLECT_STEPS",
         "SDF_DEBUG_REFLECT_RAW",
+        "SDF_DEBUG_REFLECT_GATE",
+        "SDF_FORCE_SSR",
         "SDF_DEBUG_LOD",
         "SDF_DISABLE_CHUNK_CACHE",
         "SDF_DISABLE_LOD",

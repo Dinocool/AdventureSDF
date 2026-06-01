@@ -9,6 +9,9 @@
 struct SdfCameraUniform {
     inv_view_proj: mat4x4<f32>,
     clip_from_world: mat4x4<f32>,
+    // LAST frame's clip_from_world, for SSR: project a reflected world point into the previous
+    // frame's screen to sample its already-shaded colour (sdf_raymarch SSR path).
+    prev_clip_from_world: mat4x4<f32>,
     camera_pos: vec4<f32>,
     screen_params: vec4<f32>,  // xy = screen_size, z = surface_bias (coarse-LOD iso-offset α), w unused
     grid_origin: vec4<f32>,

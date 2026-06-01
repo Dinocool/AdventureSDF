@@ -30,7 +30,7 @@
     dist_to_chunk_exit_lod,
     in_ring_chunk,
 }
-#import sdf::pbr::{resolve_surface, shade_surface, shade_material_env, sun_dir, PbrInputs, fresnel_schlick_roughness}
+#import sdf::pbr::{resolve_surface, shade_surface, shade_material_env, shade_material_env_cheap, sun_dir, PbrInputs, fresnel_schlick_roughness}
 #import sdf::sky::sky_color
 
 // Cone-prepass seed texture: per-8×8-tile start distance (R32Float), written by
@@ -40,6 +40,12 @@
 // so starting from it never skips geometry. Group 2 — groups 0/1 are camera + atlas.
 @group(2) @binding(0) var cone_seed: texture_2d<f32>;
 const CONE_TILE: i32 = 8;
+
+// SSR previous-frame colour (linear HDR, the prior frame's SDF output) + sampler. A reflected
+// world point that lands on-screen is sampled from here instead of marching + shading the SDF
+// again — the big reflection-cost win. Group 3.
+@group(3) @binding(0) var prev_frame_color: texture_2d<f32>;
+@group(3) @binding(1) var prev_frame_sampler: sampler;
 
 // --- Raymarching ---
 
@@ -331,33 +337,105 @@ fn raymarch(origin: vec3<f32>, dir: vec3<f32>, start_t: f32, q: MarchQuality) ->
 // near-mirror keeps a tight, longer ray. This is what keeps the secondary march affordable.
 // `out_steps` returns the reflection march's step count (for the SDF_DEBUG_REFLECT_STEPS
 // overlay); pass a throwaway when the cost isn't needed.
-fn trace_reflection(origin: vec3<f32>, refl_dir: vec3<f32>, roughness: f32, start_t: f32, out_steps: ptr<function, u32>) -> vec3<f32> {
-    // Roughness-driven profile, but with a RAISED FLOOR so even a perfect mirror (r→0) can't
-    // approach full primary cost — a measured low-roughness reflection was ~+10ms, doubling the
-    // SDF draw. The floor: min cone ×4 (accept hits sooner), steps capped at ~1/3 the primary
-    // (not 1/2), min dist 0.4× (reflections matter most nearby), and lod_floor ≥1 ALWAYS (a
-    // mirror reads one LOD coarse — barely visible, but the coarse bricks take bigger steps).
-    // Rough end (r→1): cone ×16, ~24 steps, 0.2× dist, lod_floor 4 — a cheap blurry probe.
-    let r = clamp(roughness, 0.0, 1.0);
-    let q = MarchQuality(
-        mix(4.0, 16.0, r),
-        u32(mix(f32(max_steps()) * 0.34, 24.0, r)),
-        max_dist() * mix(0.4, 0.2, r),
-        u32(clamp(1.0 + r * 4.0, 1.0, 4.0)),
-    );
-    // Reflection rays have no cone-prepass tile seed; the caller passes a cheap `start_t` to
-    // skip the near-field empty gap above the surface (the origin is already nudged off it).
-    let rm = raymarch(origin, refl_dir, start_t, q);
-    *out_steps = rm.steps;
-    if (!rm.hit) {
-        return sky_color(refl_dir, sun_dir());
+// Pure SCREEN-SPACE reflection: march the reflected ray in WORLD space and resolve each step by
+// reprojecting into last frame's screen — NO SDF field evaluation, no chunk search, only texture
+// fetches. DEPTH-TESTED: history alpha stores each pixel's camera distance (main writes rm.dist),
+// so at each step we compare the RAY's distance-from-camera against the stored scene distance at
+// that UV and accept only a REAL crossing (ray passes from in-front to behind a stored surface,
+// within a thickness band). Without this test the march accepts the first on-screen pixel — which
+// near a curved surface is the surface's OWN footprint → "sphere within a sphere". On a miss
+// (off-screen, or no crossing in range) returns the sky.
+// Returns the reflected colour and sets `*hit` true on a real screen-space crossing, false on
+// a miss (ray left the screen / went behind camera / found no crossing in range). The caller
+// decides what a miss means: a near-mirror falls back to the accurate SDF march; a rougher
+// surface just takes the sky.
+fn trace_reflection_screenspace(origin: vec3<f32>, refl_dir: vec3<f32>, hit: ptr<function, bool>, out_steps: ptr<function, u32>) -> vec3<f32> {
+    let STEPS = 48u;
+    let cam = camera.camera_pos.xyz;
+    let cam_d0 = length(origin - cam);
+    let step_len = max(cam_d0, 1.0) * 0.04;   // scale with distance: fine near, coarse far
+    var p = origin;
+    var prev_diff = -1.0;   // ray_dist - scene_dist at the previous step (negative = in front)
+    for (var i = 0u; i < STEPS; i = i + 1u) {
+        p = p + refl_dir * step_len;
+        let pc = camera.prev_clip_from_world * vec4<f32>(p, 1.0);
+        if (pc.w <= 0.0) { break; }
+        let ndc = pc.xy / pc.w;
+        let uv = vec2<f32>(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
+        if (any(uv <= vec2<f32>(0.0)) || any(uv >= vec2<f32>(1.0))) { break; } // walked off-screen
+
+        let scene_dist = textureSampleLevel(prev_frame_color, prev_frame_sampler, uv, 0.0).a;
+        let ray_dist = length(p - cam);
+        let diff = ray_dist - scene_dist;          // >0 ⇒ ray is BEHIND the stored surface
+
+        // A REAL crossing: was in front last step (prev_diff<0), now behind (diff>=0), against a
+        // genuine surface (not sky). THICKNESS must be small RELATIVE to the scene depth there —
+        // a fixed band lets the ray "pass through" a foreground object (the smear: the object
+        // reprojects onto many steps as the ray climbs past it, each a false hit), AND that false
+        // hit wrongly reports SSR success so the near-mirror SDF fallback never fires. A relative
+        // band rejects those (the object sits much nearer than the ray by then) → correct misses.
+        if (prev_diff < 0.0 && diff >= 0.0 && scene_dist < 1e8 && diff < scene_dist * 0.05) {
+            // Binary-refine between prev_p (in front) and p (behind) so the sampled pixel is the
+            // actual intersection, not the coarse overshoot — sharpens the reflected image.
+            var a = p - refl_dir * step_len;   // previous step position (in front)
+            var b = p;                         // this step position (behind)
+            for (var k = 0u; k < 4u; k = k + 1u) {
+                let m = (a + b) * 0.5;
+                let mc = camera.prev_clip_from_world * vec4<f32>(m, 1.0);
+                let muv = vec2<f32>((mc.x / mc.w) * 0.5 + 0.5, 0.5 - (mc.y / mc.w) * 0.5);
+                let md = length(m - cam) - textureSampleLevel(prev_frame_color, prev_frame_sampler, muv, 0.0).a;
+                if (md >= 0.0) { b = m; } else { a = m; }
+            }
+            let fc = camera.prev_clip_from_world * vec4<f32>(b, 1.0);
+            let fuv = vec2<f32>((fc.x / fc.w) * 0.5 + 0.5, 0.5 - (fc.y / fc.w) * 0.5);
+            *out_steps = i + 1u;
+            *hit = true;
+            return textureSampleLevel(prev_frame_color, prev_frame_sampler, fuv, 0.0).rgb;
+        }
+        prev_diff = diff;
     }
-    let hp = rm.hit_pos;
-    let n = calc_normal(hp);
-    let lod = clamp(log2(max(rm.dist, 1.0)) - 1.0, 0.0, 8.0);
-    // One bounce: the reflected surface uses the sky as its own environment.
-    let sky_env = sky_color(reflect(refl_dir, n), sun_dir());
-    return shade_material_env(scene_sdf(hp), hp, n, lod, sky_env);
+    *out_steps = STEPS;
+    *hit = false;
+    return sky_color(refl_dir, sun_dir());
+}
+
+// Roughness below this counts as a NEAR-MIRROR: the reflection must be accurate, so it always
+// uses the real SDF reflection march — SSR isn't precise enough for a sharp mirror. At or above
+// it the surface is rough enough that the reflection blurs into the IBL, so the cheap SSR (sky
+// on miss) is fine. (Very rough surfaces never reach here; the Fresnel gate in `main` already
+// turned their reflection off.)
+const SSR_MIRROR_ROUGH: f32 = 0.30;
+
+fn trace_reflection(origin: vec3<f32>, refl_dir: vec3<f32>, roughness: f32, start_t: f32, out_steps: ptr<function, u32>) -> vec3<f32> {
+#ifndef SDF_FORCE_SSR
+    // NEAR-MIRROR: SSR isn't accurate enough for a sharp reflection, so march the SDF directly
+    // (no SSR attempt). Profile floored so even a mirror can't approach full primary cost.
+    if (roughness < SSR_MIRROR_ROUGH) {
+        let r = clamp(roughness, 0.0, 1.0);
+        let q = MarchQuality(
+            mix(4.0, 16.0, r),
+            u32(mix(f32(max_steps()) * 0.34, 24.0, r)),
+            max_dist() * mix(0.4, 0.2, r),
+            u32(clamp(1.0 + r * 4.0, 1.0, 4.0)),
+        );
+        let rm = raymarch(origin, refl_dir, start_t, q);
+        *out_steps = rm.steps;
+        if (!rm.hit) {
+            return sky_color(refl_dir, sun_dir());
+        }
+        let hp = rm.hit_pos;
+        // CHEAP shade — skips the reflected surface's own shadow march (imperceptible here).
+        let n = calc_normal(hp);
+        let lod = clamp(log2(max(rm.dist, 1.0)) - 1.0, 0.0, 8.0);
+        let sky_env = sky_color(reflect(refl_dir, n), sun_dir());
+        return shade_material_env_cheap(scene_sdf(hp), hp, n, lod, sky_env);
+    }
+#endif
+
+    // ROUGHER (or SDF_FORCE_SSR): cheap screen-space ray, sky on miss. The blur hides SSR's
+    // imperfections and the missing off-screen reflection.
+    var ssr_hit = false;
+    return trace_reflection_screenspace(origin, refl_dir, &ssr_hit, out_steps);
 }
 
 struct FragmentOutput {
@@ -400,8 +478,10 @@ fn main(in: FullscreenVertexOutput) -> FragmentOutput {
     let ray_dir = normalize(world_pos - camera.camera_pos.xyz);
     let ray_origin = camera.camera_pos.xyz;
 
-    // Background = the same analytic sky the IBL/reflections sample, so a ray miss and
-    // a metal's reflection of the horizon agree. Tonemapped to match shaded surfaces.
+    // Background = the same analytic sky the IBL/reflections sample, so a ray miss and a
+    // metal's reflection of the horizon agree. `sky` is LINEAR (the real miss outputs it as-is
+    // now that the camera is HDR + Bevy tonemaps for display). `bg_color` is the tonemapped
+    // form kept ONLY for the LDR debug overlays that paint `bg_color * 0.3` on a miss.
     let sky = sky_color(ray_dir, sun_dir());
     let bg_color = pow(sky / (sky + vec3<f32>(1.0)), vec3<f32>(1.0 / 2.2));
 
@@ -454,7 +534,8 @@ fn main(in: FullscreenVertexOutput) -> FragmentOutput {
     #endif
 
     if (!rm.hit) {
-        return FragmentOutput(vec4<f32>(bg_color, 1.0), 0.0);
+        // Sky: linear colour, alpha = far sentinel (no surface here for SSR depth tests).
+        return FragmentOutput(vec4<f32>(sky, 1e9), 0.0);
     }
 
     // Height-map relief is baked into the SDF field (see sdf_render::height) — the hit position
@@ -520,6 +601,22 @@ fn main(in: FullscreenVertexOutput) -> FragmentOutput {
     }
 #endif
 
+    // Gate diagnostic: a CONSTANT colour per gate status — GREEN where a reflection IS traced
+    // (gate passes), RED where it's skipped (rough/diffuse/head-on dielectric). If a surface you
+    // expect to reflect reads RED while you raise its smoothness/metalness, the slider value
+    // isn't reaching the GPU material — the reason roughness seems to have no effect.
+    #ifdef SDF_DEBUG_REFLECT_GATE
+    {
+        let vv = normalize(camera.camera_pos.xyz - hit_pos);
+        let nv = max(dot(p.normal, vv), 0.0);
+        let f0g = mix(vec3<f32>(0.04), p.albedo, p.metallic);
+        let fg = fresnel_schlick_roughness(nv, f0g, p.roughness);
+        let w = max(max(fg.r, fg.g), fg.b) * (1.0 - p.roughness);
+        let col = select(vec3<f32>(0.8, 0.1, 0.1), vec3<f32>(0.1, 0.8, 0.1), w > 0.04);
+        return FragmentOutput(vec4<f32>(col, 1.0), ndc_depth);
+    }
+    #endif
+
     // Reflection-march cost heatmap: black where no reflection ray was traced (gated out),
     // else blue (few steps) → red (many), normalised to the primary step cap. Shows exactly
     // which pixels pay for a secondary march and how deep it goes.
@@ -543,7 +640,10 @@ fn main(in: FullscreenVertexOutput) -> FragmentOutput {
     }
     #endif
 
-    // Shade to LINEAR radiance, then tonemap (Reinhard) + approximate gamma once here.
+    // Shade to LINEAR radiance. The camera is HDR (Rgba16Float target) and Bevy's Tonemapping
+    // pass converts to sRGB for display, so we output LINEAR here (no inline tonemap) — that
+    // also lets the SSR history hold correct linear radiance. `shaded` keeps the tonemapped
+    // form ONLY for the debug overlays below that mix against an LDR colour.
     let lit = shade_surface(p, hit_pos, normal, rm.lod, env_radiance);
     let shaded = pow(lit / (lit + vec3<f32>(1.0)), vec3<f32>(1.0 / 2.2));
 
@@ -678,5 +778,9 @@ fn main(in: FullscreenVertexOutput) -> FragmentOutput {
     return FragmentOutput(vec4<f32>(bg_color * 0.3, 1.0), 1.0);
     #endif
 
-    return FragmentOutput(vec4<f32>(shaded, 1.0), ndc_depth);
+    // Alpha carries the hit's CAMERA DISTANCE (rm.dist) so the SSR history (Rgba16Float) holds
+    // a per-pixel scene depth — the screen-space reflection march depth-tests against it to find
+    // a REAL intersection (not just the first on-screen pixel), fixing the sphere-in-sphere
+    // artifact. Display ignores alpha (opaque), and Bevy's tonemap pass preserves it.
+    return FragmentOutput(vec4<f32>(lit, rm.dist), ndc_depth);
 }

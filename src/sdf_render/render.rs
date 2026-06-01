@@ -59,6 +59,9 @@ struct SdfCameraData {
     /// the raymarch hit, so the SDF surface occludes/are-occluded-by other passes
     /// (wireframe, gizmos) through the normal depth buffer.
     clip_from_world: Mat4,
+    /// LAST frame's `clip_from_world`. Reprojects a reflected world point into the previous
+    /// frame's screen for the SSR reflection path.
+    prev_clip_from_world: Mat4,
     camera_pos: Vec4,
     screen_params: Vec4, // xy = screen_size, z = surface_bias, w = unused
     grid_origin: Vec4,   // xyz = grid origin, w = voxel_size
@@ -231,12 +234,29 @@ struct SdfPipeline {
     /// Cone-prepass seed texture, read (textureLoad) by the fragment march to start each
     /// pixel at its tile's seed distance instead of 0.
     layout_2: BindGroupLayoutDescriptor,
+    /// SSR previous-frame colour texture + sampler (group 3). The fragment reflection path
+    /// reprojects a reflected world point into last frame's screen and samples this.
+    layout_3: BindGroupLayoutDescriptor,
     #[expect(dead_code)]
     shader_handle: Handle<Shader>,
     /// The shader defs the current `pipeline_id` was queued with. Rebuild compares the
     /// extracted defs against this (not a per-frame `changed` flag, which is fragile at
     /// startup when the defs haven't synced yet) and re-queues only on a real mismatch.
     current_defs: Vec<String>,
+}
+
+/// SSR history: last frame's SDF colour (linear HDR, matching the HDR view target), kept so
+/// the fragment reflection path can sample an on-screen reflected point instead of marching +
+/// shading the SDF again. One texture, re-created lazily to match the viewport size; `valid`
+/// is false until it has been filled once (frame 0 → pure SDF-march fallback). A dummy 1×1 is
+/// always available so bind group 3 is valid before the first real capture.
+#[derive(Resource, Default)]
+struct SdfReflectHistory {
+    tex: Option<Texture>,
+    view: Option<TextureView>,
+    sampler: Option<Sampler>,
+    size: UVec2,
+    valid: bool,
 }
 
 /// Compute pipeline + layouts for the cone prepass (one tile-cone march per 8×8 tile,
@@ -411,6 +431,7 @@ impl ViewNode for SdfNode {
         let layout_0 = pipeline_cache.get_bind_group_layout(&pipeline_res.layout_0);
         let layout_1 = pipeline_cache.get_bind_group_layout(&pipeline_res.layout_1);
         let layout_2 = pipeline_cache.get_bind_group_layout(&pipeline_res.layout_2);
+        let layout_3 = pipeline_cache.get_bind_group_layout(&pipeline_res.layout_3);
 
         // Bind group 0: camera uniform or fallback
         let has_camera = world
@@ -482,6 +503,19 @@ impl ViewNode for SdfNode {
             &BindGroupEntries::sequential((&prepass.read_view,)),
         );
 
+        // Bind group 3: SSR previous-frame colour + sampler. `prepare_reflect_history` keeps the
+        // texture sized to the view; it exists (dummy-cleared) from frame ~1, so we can always
+        // bind it. On the first frame it samples zeros → black reflection (one-frame, harmless).
+        let history = world.resource::<SdfReflectHistory>();
+        let (Some(hist_view), Some(hist_sampler)) = (&history.view, &history.sampler) else {
+            return Ok(()); // history not allocated yet (no view this frame) — skip the SDF pass
+        };
+        let bind_group_3 = device.create_bind_group(
+            "sdf_bind_group_3",
+            &layout_3,
+            &BindGroupEntries::sequential((hist_view, hist_sampler)),
+        );
+
         let post_process = view_target.post_process_write();
 
         let mut render_pass = render_context.begin_tracked_render_pass(RenderPassDescriptor {
@@ -505,7 +539,26 @@ impl ViewNode for SdfNode {
             render_pass.set_bind_group(0, &bind_group_0, &[0]);
             render_pass.set_bind_group(1, &bind_group_1, &[]);
             render_pass.set_bind_group(2, &bind_group_2, &[]);
+            render_pass.set_bind_group(3, &bind_group_3, &[]);
             render_pass.draw(0..3, 0..1);
+        }
+        // End the render pass before copying (a texture can't be a colour attachment AND a
+        // copy source in the same scope).
+        drop(render_pass);
+
+        // Capture THIS frame's SDF output into the history texture for next frame's SSR. After
+        // `post_process_write`, `main_texture()` is the texture we just drew into. Copy only when
+        // sizes agree (a mid-frame resize leaves prepare to re-size next frame).
+        if let Some(hist_tex) = &history.tex {
+            let src = view_target.main_texture();
+            let src_size = src.size();
+            if src_size.width == history.size.x && src_size.height == history.size.y {
+                render_context.command_encoder().copy_texture_to_texture(
+                    src.as_image_copy(),
+                    hist_tex.as_image_copy(),
+                    src_size,
+                );
+            }
         }
 
         Ok(())
@@ -605,6 +658,7 @@ impl Plugin for SdfRenderPlugin {
             .add_systems(Render, init_texture_streaming)
             .add_systems(Render, upload_texture_layers.after(init_texture_streaming))
             .add_systems(Render, rebuild_pipeline_on_def_change)
+            .add_systems(Render, prepare_reflect_history)
             .add_systems(RenderStartup, init_sdf_pipeline)
             .add_systems(RenderStartup, init_cone_pipeline.after(init_sdf_pipeline))
             .add_systems(RenderStartup, init_bake_pipeline.after(init_sdf_pipeline))
@@ -657,6 +711,10 @@ fn prepare_sdf_camera_data(
     // offscreen thumbnail / preview rig lights are excluded.
     sun_light: Query<(&GlobalTransform, &DirectionalLight), With<crate::scene_manager::SceneEntity>>,
     mut material_table: ResMut<SdfMaterialTable>,
+    // Per-camera last-frame `clip_from_world`, for SSR reprojection. Persists across frames in
+    // the main world via Local; seeded to this frame's matrix on the first sighting (so frame 0
+    // reprojects to itself — harmless, the history buffer is also invalid that frame).
+    mut prev_clip: Local<bevy::platform::collections::HashMap<Entity, Mat4>>,
 ) {
     let sun = sun_light
         .iter()
@@ -716,9 +774,14 @@ fn prepare_sdf_camera_data(
         let tan_half_fov_y = 1.0 / proj.y_axis.y.max(1e-6);
         let pixel_cone = (tan_half_fov_y / size.y.max(1) as f32) * raymarch.cone_scale;
 
+        // Last frame's matrix (this frame's on first sighting); then stash this frame's for next.
+        let prev_clip_from_world = *prev_clip.entry(entity).or_insert(clip_from_world);
+        prev_clip.insert(entity, clip_from_world);
+
         commands.entity(entity).insert(SdfCameraData {
             inv_view_proj,
             clip_from_world,
+            prev_clip_from_world,
             camera_pos: transform.translation.extend(0.0),
             // z = surface_bias (coarse-LOD iso-offset α); w unused.
             screen_params: Vec4::new(size.x as f32, size.y as f32, raymarch.surface_bias, 0.0),
@@ -817,13 +880,14 @@ fn rebuild_pipeline_on_def_change(
             pipeline.layout_0.clone(),
             pipeline.layout_1.clone(),
             pipeline.layout_2.clone(),
+            pipeline.layout_3.clone(),
         ],
         vertex: vertex_state,
         fragment: Some(FragmentState {
             shader,
             shader_defs,
             targets: vec![Some(ColorTargetState {
-                format: TextureFormat::bevy_default(),
+                format: ViewTarget::TEXTURE_FORMAT_HDR,
                 blend: None,
                 write_mask: ColorWrites::ALL,
             })],
@@ -841,6 +905,55 @@ fn rebuild_pipeline_on_def_change(
 
     pipeline.pipeline_id = new_id;
     pipeline.current_defs = extracted.defs.clone();
+}
+
+/// (Re)allocate the SSR history texture to match the SDF view target's size + HDR format. Runs
+/// each frame; only recreates on a size change (or first run). The texture holds last frame's
+/// SDF colour — `SdfNode` copies its pass output here at the end of `run`, and the NEXT frame's
+/// reflection path samples it. `valid` stays false until the first copy, so frame 0 falls back
+/// to the SDF reflection march.
+fn prepare_reflect_history(
+    device: Res<RenderDevice>,
+    mut history: ResMut<SdfReflectHistory>,
+    views: Query<&ViewTarget, With<SdfCameraData>>,
+) {
+    // One SDF camera; take its target size. (Multiple SDF views would need per-view history —
+    // not a case this editor hits.)
+    let Some(view) = views.iter().next() else {
+        return;
+    };
+    let size = view.main_texture().size();
+    let dims = UVec2::new(size.width, size.height);
+
+    if history.tex.is_some() && history.size == dims {
+        return; // already sized correctly
+    }
+
+    let tex = device.create_texture(&TextureDescriptor {
+        label: Some("sdf_reflect_history"),
+        size,
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: TextureDimension::D2,
+        format: ViewTarget::TEXTURE_FORMAT_HDR,
+        // TEXTURE_BINDING: sampled by the reflection path. COPY_DST: SdfNode copies the pass
+        // output in. RENDER_ATTACHMENT is not needed (we never render INTO it directly).
+        usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    let tex_view = tex.create_view(&TextureViewDescriptor::default());
+    if history.sampler.is_none() {
+        history.sampler = Some(device.create_sampler(&SamplerDescriptor {
+            label: Some("sdf_reflect_history_sampler"),
+            mag_filter: FilterMode::Linear,
+            min_filter: FilterMode::Linear,
+            ..default()
+        }));
+    }
+    history.tex = Some(tex);
+    history.view = Some(tex_view);
+    history.size = dims;
+    history.valid = false; // freshly allocated → no valid content until SdfNode copies into it
 }
 
 // --- Extract: Pack Atlas for GPU ---
@@ -1419,19 +1532,35 @@ fn init_sdf_pipeline(
             (texture_2d(TextureSampleType::Float { filterable: false }),),
         ),
     );
+    // group 3: SSR previous-frame colour (filterable, sampled with bilinear) + its sampler.
+    let layout_3 = BindGroupLayoutDescriptor::new(
+        "sdf_bind_group_3",
+        &BindGroupLayoutEntries::sequential(
+            ShaderStages::FRAGMENT,
+            (
+                texture_2d(TextureSampleType::Float { filterable: true }),
+                sampler(SamplerBindingType::Filtering),
+            ),
+        ),
+    );
 
     let shader = shader_handle.0.clone();
     let vertex_state = fullscreen_shader.to_vertex_state();
 
     let pipeline_id = pipeline_cache.queue_render_pipeline(RenderPipelineDescriptor {
         label: Some("sdf_pipeline".into()),
-        layout: vec![layout_0.clone(), layout_1.clone(), layout_2.clone()],
+        layout: vec![
+            layout_0.clone(),
+            layout_1.clone(),
+            layout_2.clone(),
+            layout_3.clone(),
+        ],
         vertex: vertex_state,
         fragment: Some(FragmentState {
             shader: shader.clone(),
             shader_defs: vec![],
             targets: vec![Some(ColorTargetState {
-                format: TextureFormat::bevy_default(),
+                format: ViewTarget::TEXTURE_FORMAT_HDR,
                 blend: None,
                 write_mask: ColorWrites::ALL,
             })],
@@ -1559,10 +1688,12 @@ fn init_sdf_pipeline(
         layout_0,
         layout_1,
         layout_2,
+        layout_3,
         shader_handle: shader,
         // Queued above with empty shader_defs; rebuild fires once the synced defs differ.
         current_defs: Vec::new(),
     });
+    commands.init_resource::<SdfReflectHistory>();
     commands.insert_resource(SdfGpuAtlas {
         dist_tex: None,
         dist_view: Some(dummy_tex.create_view(&TextureViewDescriptor::default())),

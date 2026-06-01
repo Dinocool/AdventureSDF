@@ -210,13 +210,29 @@ fn shade_surface(
     res_lod: u32,
     env_radiance: vec3<f32>,
 ) -> vec3<f32> {
+    return shade_surface_opt(p, wpos, geo_n, res_lod, env_radiance, true);
+}
+
+// `trace_shadow` lets a SECONDARY hit (a reflected surface) skip the shadow march. That
+// shadow is a whole extra ray per reflecting pixel and is imperceptible inside a reflection,
+// so the reflection path passes `false` (shadow = fully lit). Primary hits pass `true`.
+fn shade_surface_opt(
+    p: PbrInputs,
+    wpos: vec3<f32>,
+    geo_n: vec3<f32>,
+    res_lod: u32,
+    env_radiance: vec3<f32>,
+    trace_shadow: bool,
+) -> vec3<f32> {
     let view_dir = normalize(camera.camera_pos.xyz - wpos);
     let light_dir = sun_dir();
     let light_color = sun_color();
 
     var shadow = 1.0;
 #ifdef SDF_SHADOWS
-    shadow = surface_shadow(wpos, geo_n, light_dir, res_lod, 256.0);
+    if (trace_shadow) {
+        shadow = surface_shadow(wpos, geo_n, light_dir, res_lod, 256.0);
+    }
 #endif
 
     let direct = shade_pbr(
@@ -231,7 +247,8 @@ fn shade_surface(
 
 // Convenience: resolve + shade with the analytic sky as the environment. Used for the
 // reflection ray's own hit (one bounce — no further reflection) and any caller that
-// doesn't trace reflections. Returns LINEAR radiance.
+// doesn't trace reflections. Returns LINEAR radiance. `trace_shadow` false skips the
+// reflected surface's own shadow march (see shade_surface_opt) — for the reflection path.
 fn shade_material_env(
     res: SceneSdfResult,
     wpos: vec3<f32>,
@@ -240,5 +257,16 @@ fn shade_material_env(
     env_radiance: vec3<f32>,
 ) -> vec3<f32> {
     let p = resolve_surface(res, wpos, geo_n, lod);
-    return shade_surface(p, wpos, geo_n, res.lod, env_radiance);
+    return shade_surface_opt(p, wpos, geo_n, res.lod, env_radiance, true);
+}
+
+fn shade_material_env_cheap(
+    res: SceneSdfResult,
+    wpos: vec3<f32>,
+    geo_n: vec3<f32>,
+    lod: f32,
+    env_radiance: vec3<f32>,
+) -> vec3<f32> {
+    let p = resolve_surface(res, wpos, geo_n, lod);
+    return shade_surface_opt(p, wpos, geo_n, res.lod, env_radiance, false);
 }
