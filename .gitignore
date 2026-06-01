@@ -17,7 +17,11 @@ assets/scenes/untitled.scene
 # Chrome tracing profiler output (editor feature)
 trace-*.json
 
-# RenderDoc captures + analysis artifacts
-rdoc/
+# RenderDoc captures + analysis artifacts: ignore the scratch dir (multi-GB .rdc captures,
+# .png/.zip dumps, *_out.txt) BUT keep the reusable analysis toolkit (rdoc/scripts/)
+# tracked. Re-include needs the parent dir un-ignored first, hence the !rdoc/scripts line.
+rdoc/*
+!rdoc/scripts/
+rdoc/scripts/**/__pycache__/
 *.cap
 *.rdc

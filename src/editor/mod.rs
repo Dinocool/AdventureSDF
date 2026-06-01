@@ -19,6 +19,7 @@ pub mod panels;
 pub mod profiling;
 pub mod project_files;
 pub mod registry;
+pub mod renderdoc_capture;
 pub mod resource_inspector;
 pub mod resource_picker;
 pub mod selection;
@@ -39,6 +40,7 @@ impl Plugin for EditorPlugin {
             registry::ShaderDebugRegistryPlugin,
             uniform_inspector::UniformInspectorPlugin,
             profiling::ProfilingPlugin,
+            renderdoc_capture::RenderDocCapturePlugin,
         ))
         .init_resource::<menu_bar::EditorRequests>()
         .init_resource::<menu_bar::CurrentScenePath>()
