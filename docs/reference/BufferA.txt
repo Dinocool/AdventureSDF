@@ -1,0 +1,86 @@
+//G-Buffer
+
+void UpdateMouseAttributes(inout vec4 info, vec4 mouse) {
+    if (mouse.z > 0.) {
+        if (info.w < 0.5) {
+            info.w = 1.;
+            info.z = iTime;
+            info.xy = mouse.zw;
+        }
+    } else {
+        info.w = 0.;
+    }
+}
+
+void UpdateMouse(inout vec4 info, vec4 mouseA, vec4 mouse) {
+    if (mouseA.w < 0.5)  {
+        info.zw = info.xy;
+    } else {
+        info.x = info.z + mouse.x - mouseA.x;
+        info.y = info.w + mouse.y - mouseA.y;
+        info.y = clamp(info.y, 0., RES.y);
+    }
+}
+
+vec2 AnimatedMouse(float t) {
+    float smooth_t = t*t*(3. - 2.*t);
+    return vec2(((1. - smooth_t) + 0.125)*HRES.x, (0.9 - sin(smooth_t*3.141592653)*0.85)*HRES.y);
+}
+
+void mainImage(out vec4 fragColor, in vec2 fragCoord) {
+    vec4 info = vec4(0.);
+    if (fragCoord.y < HRES.y) {
+        if (fragCoord.x < HRES.x) {
+            //Current frame
+            vec4 cMouse = vec4(0.);
+            if (iTime < ATIME) {
+                cMouse.xy = AnimatedMouse(iTime*IATIME);
+            } else {
+                vec4 mousea = texture(iChannel0, vec2(HRES.x + 3.5, HRES.y + 0.5)*IRES);
+                cMouse = texture(iChannel0, vec2(HRES.x + 0.5, HRES.y + 0.5)*IRES);
+                UpdateMouseAttributes(mousea, iMouse);
+                UpdateMouse(cMouse, mousea, iMouse);
+            }
+            vec3 pPos = GetCameraPos(cMouse, IRES);
+            vec3 pEye = GetCameraEye(cMouse, IRES);
+            vec3 pDir = normalize(vec3((fragCoord*IHRES*2. - 1.)*ASPECT, 1.)*TBN(pEye));
+            HIT rayHit = TraceRay(pPos, pDir, 1000000., iTime);
+            if (rayHit.n.x > -15.) {
+                info = vec4(0., Vec3ToFloat(rayHit.c*0.2), Vec3ToFloat(rayHit.n*0.5 + 0.5), rayHit.t);
+            } else {
+                info = vec4(-20.);
+            }
+        } else {
+            //Last frame
+            info = texture(iChannel0, vec2(fragCoord.x - HRES.x, fragCoord.y)*IRES);
+        }
+    } else if (fragCoord.x < HRES.x) {
+        //2nd last frame
+        info = texture(iChannel0, vec2(fragCoord.x + HRES.x, fragCoord.y - HRES.y)*IRES);
+    } else if (fragCoord.y < HRES.y + 1. && fragCoord.x < HRES.x + 4.) {
+        //Mouse position
+        if (iTime < ATIME) {
+            if (fragCoord.x > HRES.x + 3. || fragCoord.x < HRES.x + 1.) {
+                info = vec4(AnimatedMouse(iTime*IATIME), 0., 0.);
+            } else if (fragCoord.x < HRES.x + 2.) {
+                info = texture(iChannel0, vec2(fragCoord.x - 1., fragCoord.y)*IRES);
+            } else if (fragCoord.x < HRES.x + 3.) {
+                info = texture(iChannel0, vec2(fragCoord.x - 1., fragCoord.y)*IRES);
+            }
+        } else {
+            info = texture(iChannel0, fragCoord*IRES);
+            if (fragCoord.x > HRES.x + 3.) {
+                UpdateMouseAttributes(info, iMouse);
+            } else if (fragCoord.x < HRES.x + 1.) {
+                vec4 mousea = texture(iChannel0, vec2(fragCoord.x + 3., fragCoord.y)*IRES);
+                UpdateMouseAttributes(mousea, iMouse);
+                UpdateMouse(info, mousea, iMouse);
+            } else if (fragCoord.x < HRES.x + 2.) {
+                info = texture(iChannel0, vec2(fragCoord.x - 1., fragCoord.y)*IRES);
+            } else {
+                info = texture(iChannel0, vec2(fragCoord.x - 1., fragCoord.y)*IRES);
+            }
+        }
+    }
+    fragColor = info;
+}

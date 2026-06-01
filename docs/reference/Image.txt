@@ -1,0 +1,87 @@
+/*
+Radiance Cascades with screen space probes
+    Lags 1 frame behind in order to make it work in shadertoy
+    Uses 6 cascades
+    Single bounce integration
+
+Probes
+    Same ray direction layout as Radiance Cascades 3D
+    Randomly placed within its tile and oriented with the pixel normal -> better coverage
+
+Merging
+    An entire cascade projects all ray hitpoints on the next cascade
+        In practice: good candidates for every probes and bin are chosen to
+        represent all points that project into that probe & bin
+            So its gather with a 5x5 search area
+            Scatter write would be better (but slower?)
+    Visibility is determined using the traced ray in the current bin
+        Limited to only be checked inside an interval <- function of probe size and depth (and resolution, aspect, FOV)
+    Four probes from the last cascade are used and then spatially interpolated
+        Weighted by whether any hitpoint was projected
+
+Temporal accumulation in cubemap
+    16 sample accumulation
+    No spatial denoising <- would help with disocclusion artifacts
+    Some flickering is visible
+
+Improvement ideas:
+    Samples are not BRDF weighted at all (big oof, I know)
+    Visibility is pretty naive, only checks depth inside bin
+    Maybe it can be done without stochastic probes?
+        Approximate point cloud integration when merging cascades without probe interpolation, but how? >:(
+
+Feedback is welcome :)
+
+
+
+
+Controls:
+    Mouse to move the camera around (after the animation is done)
+*/
+
+
+vec4 textureCube(vec2 UV) {
+    //Samples the cubemap
+    float Sign = -mod(floor(UV.y*I1024), 2.)*2. + 1.;
+    vec3 D = vec3(vec2(UV.x, mod(UV.y, 1024.))*I512 - 1., Sign);
+    if (UV.y > 4096.) D = D.xzy;
+    else if (UV.y > 2048.) D = D.zxy;
+    return texture(iChannel3, D);
+}
+
+vec3 acesFilm(vec3 x) {
+    //Aces film curve
+    return clamp((x*(2.51*x + 0.03))/(x*(2.43*x + 0.59) + 0.14), 0., 1.);
+}
+
+void mainImage(out vec4 fragColor, in vec2 fragCoord) {
+    vec2 hUV = floor(fragCoord*0.5) + 0.5;
+    float YOffset = floor(hUV.x*I1024)*1024. + floor(hUV.y*I1024)*3072.;
+    vec3 Color = textureCube(mod(hUV, 1024.) + vec2(0., YOffset)).xyz;
+    vec3 sunDir = GetSunDirection(iTime);
+    vec4 lMouse = texture(iChannel0, vec2(HRES.x + 1.5, HRES.y + 0.5)*IRES);
+    vec3 lPos = GetCameraPos(lMouse, IRES);
+    vec3 lEye = GetCameraEye(lMouse, IRES);
+    mat3 lEyeMat = TBN(lEye);
+    vec3 lDir = normalize(vec3((hUV*IHRES*2. - 1.)*ASPECT, 1.)*lEyeMat);
+    vec4 lAttr = texture(iChannel0, vec2(hUV.x + HRES.x, hUV.y)*IRES);
+    vec3 lNor = normalize(FloatToVec3(lAttr.z)*2. - 1.);
+    vec3 lCol = FloatToVec3(lAttr.y)*5.;
+    if (lAttr.w > -0.5) {
+        if (lCol.x > 1.) {
+            Color = lCol;
+        } else {
+            vec3 lPPos = lPos + lDir*lAttr.w;
+            vec3 sunLight = GetSunLight(iTime, lPPos);
+            if (TraceRay(lPPos + lNor*0.0001, sunDir, 10000., iTime).n.x < -15.) {
+                Color += max(0., dot(lNor, sunDir))*sunLight;
+            }
+            Color *= lCol;
+        }
+    }
+    
+    //DEBUG (depth)
+    //Color = texture(iChannel0, fragCoord*0.5*IRES).www*0.2;
+    
+    fragColor = vec4(pow(acesFilm(max(vec3(0.), Color)), vec3(0.45)), 1.);
+}
