@@ -277,7 +277,11 @@ fn sdf_combine_wgsl_validates() {
 fn standalone_shaders_validate() {
     // Self-contained entry shaders that only import the Bevy fullscreen stub (the
     // `sdf/` modules are validated composed via `sdf_raymarch_wgsl_validates`).
-    let entries = ["assets/shaders/sdf_debug.wgsl"];
+    // `sdf_gi_cache_fill.wgsl` is a standalone compute shader (no imports).
+    let entries = [
+        "assets/shaders/sdf_debug.wgsl",
+        "assets/shaders/sdf_gi_cache_fill.wgsl",
+    ];
     let mut failures = Vec::new();
     for path in entries {
         let p = Path::new(path);
