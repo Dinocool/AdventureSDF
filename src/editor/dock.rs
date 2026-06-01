@@ -232,14 +232,20 @@ pub fn show_editor_dock(world: &mut World) {
     }
 
     dock.viewport_rect = viewport_rect;
-    // Allow viewport interaction only while the pointer is inside the viewport tab
-    // AND egui doesn't want the pointer itself. The second clause matters for floating
-    // windows (e.g. the Create Node dialog) that sit *over* the viewport rect: without
-    // it, clicks on the dialog fall through to the 3D scene and pick/select nodes.
+    // Allow viewport interaction only while the pointer is inside the viewport tab AND not
+    // over a *floating* egui layer (a Window/popup such as the Create Node dialog). We test
+    // the layer order rather than `wants_pointer_input()`: the dock panels live on the
+    // Background layer, so `wants_pointer_input()` is true whenever the pointer hovers the
+    // viewport tab with no button down — which dropped wheel-zoom events (orbit/pan use a
+    // held button, so they were unaffected). A floating window is Order::Middle or above.
+    let over_floating = ctx.pointer_latest_pos().is_some_and(|p| {
+        ctx.layer_id_at(p)
+            .is_some_and(|layer| layer.order > egui::Order::Background)
+    });
     let in_viewport = ctx
         .pointer_latest_pos()
         .is_some_and(|p| viewport_rect.contains(p))
-        && !ctx.wants_pointer_input();
+        && !over_floating;
     dock.pointer_in_viewport = in_viewport;
     world
         .resource_mut::<crate::sdf_render::ViewportInputAllowed>()
