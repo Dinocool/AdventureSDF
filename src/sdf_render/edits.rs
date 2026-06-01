@@ -454,10 +454,13 @@ pub fn tower_field_edits(params: &TowerFieldParams) -> Vec<TowerEdit> {
         for c in 0..params.cubes_per_tower {
             // Stack the cubes; first cube rests its base on the terrain (centre at +half).
             let cy = base_y + cube_half + (c as f32) * (2.0 * cube_half);
-            // Deterministic pseudo-random yaw/pitch from the point hash + cube index.
-            let r1 = unit_from_hash(h ^ (c.wrapping_mul(0x9E37)).wrapping_add(1)) * std::f32::consts::PI;
-            let r2 = unit_from_hash(h.rotate_left(7) ^ (c.wrapping_mul(0x85EB)).wrapping_add(3)) * std::f32::consts::PI;
-            let rot = Quat::from_euler(EulerRot::YXZ, r1, r2 * 0.35, 0.0);
+            // Deterministic FULLY-random orientation from the point hash + cube index (uniform on
+            // SO(3) via Shoemake), so each cube tilts/rolls every which way, not just yaw.
+            let rot = random_rotation(
+                h ^ (c.wrapping_mul(0x9E37)).wrapping_add(1),
+                h.rotate_left(7) ^ (c.wrapping_mul(0x85EB)).wrapping_add(3),
+                h.rotate_left(13) ^ (c.wrapping_mul(0xC2B2)).wrapping_add(5),
+            );
             push(
                 &mut order,
                 Transform {
@@ -483,9 +486,18 @@ pub fn tower_field_edits(params: &TowerFieldParams) -> Vec<TowerEdit> {
     out
 }
 
-/// Map a 32-bit hash to `[-1, 1)` — for deriving per-edit rotation from a scatter point hash.
-fn unit_from_hash(h: u32) -> f32 {
-    (h as f32 / u32::MAX as f32) * 2.0 - 1.0
+/// A uniformly-distributed random orientation on SO(3) (Shoemake 1992), built deterministically
+/// from three hashes mapped to `[0, 1)`. Gives an unbiased random cube tumble (full tilt + roll),
+/// unlike an euler-angle pick which clusters near the poles.
+fn random_rotation(h0: u32, h1: u32, h2: u32) -> Quat {
+    let u0 = (h0 as f32 / u32::MAX as f32).clamp(0.0, 1.0);
+    let u1 = (h1 as f32 / u32::MAX as f32).clamp(0.0, 1.0);
+    let u2 = (h2 as f32 / u32::MAX as f32).clamp(0.0, 1.0);
+    let tau = std::f32::consts::TAU;
+    let (s1, s2) = ((1.0 - u0).sqrt(), u0.sqrt());
+    let (t1, t2) = (tau * u1, tau * u2);
+    // Quat(x, y, z, w) — already unit length.
+    Quat::from_xyzw(s1 * t1.sin(), s1 * t1.cos(), s2 * t2.sin(), s2 * t2.cos())
 }
 
 /// Hash an integer lattice point to [-1, 1].
