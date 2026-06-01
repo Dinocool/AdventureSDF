@@ -566,6 +566,11 @@ fn setup_sdf_scene(
         );
     commands.spawn((
         Camera3d::default(),
+        // HDR so the view target is linear Rgba16Float and Bevy's Tonemapping pass converts
+        // (linear→sRGB) for display. The SDF shader then writes LINEAR radiance, which lets the
+        // SSR history buffer hold correct linear values for the reflection IBL term. In Bevy
+        // 0.18 `hdr` is the `Hdr` marker component (was `Camera.hdr`).
+        bevy::render::view::Hdr,
         Transform::from_translation(pos).looking_at(orbit.target, Vec3::Y),
         Msaa::Off,
         SdfCamera,

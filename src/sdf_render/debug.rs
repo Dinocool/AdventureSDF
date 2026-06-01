@@ -247,6 +247,12 @@ fn register_shader_modes(app: &mut App) {
         "Raw traced reflection radiance, before the roughness IBL mix",
     ));
     registry.register(overlay(
+        "sdf/reflect_gate",
+        "Reflect gate",
+        "SDF_DEBUG_REFLECT_GATE",
+        "R=roughness G=metallic B=gate weight (flat ⇒ material value not reaching GPU)",
+    ));
+    registry.register(overlay(
         "sdf/ray_fate",
         "Ray fate",
         "SDF_DEBUG_RAY_FATE",
@@ -324,6 +330,14 @@ fn register_shader_modes(app: &mut App) {
         shader_define: "SDF_REFLECTIONS".into(),
         kind: DebugModeKind::Toggle,
         description: "SDF-traced reflections on metallic/smooth surfaces (secondary ray)"
+            .into(),
+    });
+    registry.register(ShaderDebugMode {
+        id: "sdf/force_ssr".into(),
+        label: "Force SSR".into(),
+        shader_define: "SDF_FORCE_SSR".into(),
+        kind: DebugModeKind::Toggle,
+        description: "Reflections use a pure screen-space ray (no SDF march) — isolates SSR cost"
             .into(),
     });
     registry.register(ShaderDebugMode {
