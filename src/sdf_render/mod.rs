@@ -361,6 +361,26 @@ impl SdfGridConfig {
     pub fn cell_stride(&self) -> i32 {
         (self.brick_size - 1) as i32
     }
+
+    /// Ring chunks per axis: `R = ring_bricks / CHUNK_BRICKS`. The edge of each per-LOD toroidal
+    /// directory window and the SINGLE source for this derivation (CPU mirror of `ring_chunks() /
+    /// CHUNK_BRICKS` in `bindings.wgsl`). `LiveChunkTables`/`ChunkTables` cache it and `dir_index`
+    /// resolves against it, so every site MUST agree — route through here, never recompute ad hoc.
+    pub fn ring_chunks_per_axis(&self) -> i32 {
+        self.ring_bricks as i32 / chunk::CHUNK_BRICKS
+    }
+
+    /// Half the ring window in chunks (`R / 2`) — the camera-centred window's reach from its origin.
+    pub fn ring_half_chunks(&self) -> i32 {
+        self.ring_chunks_per_axis() / 2
+    }
+
+    /// Total per-LOD toroidal directory length: `R³ × lod_count` fixed `ChunkLookup` slots.
+    pub fn directory_len(&self) -> usize {
+        let r = self.ring_chunks_per_axis() as usize;
+        r * r * r * self.lod_count as usize
+    }
+
     pub fn world_extent(&self) -> f32 {
         self.grid_size as f32 * self.voxel_size
     }

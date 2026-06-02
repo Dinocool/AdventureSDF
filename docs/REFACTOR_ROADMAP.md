@@ -180,7 +180,7 @@ verified `high`). Keep the differential tests green at every step.
   allow(dead_code))]` if needed). The four copies differ in signature/return -- standardize on
   `(rows, tiles, r, ck, local) -> Option<BrickTile>`, don't force one shape blindly.
 
-### [ ] C4. Make `R = ring_bricks / CHUNK_BRICKS` a single `SdfGridConfig` method
+### [x] C4. Make `R = ring_bricks / CHUNK_BRICKS` a single `SdfGridConfig` method
 `impact: medium` * `effort: small` * `source: api-boundaries`
 
 - *Now:* The ring-chunks-per-axis derivation is recomputed at `chunk.rs:180/314/779/837/872`,
