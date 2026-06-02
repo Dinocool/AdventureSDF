@@ -16,12 +16,16 @@
 //!    cost of a clean, un-inflated field.
 //! 3. **Sparse storage + GPU lookup** (`chunk`, `render`, `bindings.wgsl`). Bricks group
 //!    into 4³=64-brick **chunks** addressed by an *absolute* world-lattice key (independent
-//!    of the camera, so CPU and GPU agree by construction). Resident chunks form a sorted
-//!    table (binary-searched on the GPU) with a 64-bit occupancy mask + popcount index into
-//!    a packed tile-run buffer. Brick texels live in a 2D-tiled atlas texture.
+//!    of the camera, so CPU and GPU agree by construction). Resident chunks live in a per-LOD
+//!    **toroidal directory** — a dense `R³` array per LOD where chunk `c` sits at the fixed slot
+//!    `c mod R`, so the GPU resolves it by a direct index + key-tag compare (no sort, no binary
+//!    search) and the CPU inserts/evicts in O(1). Each slot carries a 64-bit occupancy mask +
+//!    popcount index into a packed (sparse) tile-run buffer. Brick texels live in a 2D-tiled
+//!    atlas texture.
 //! 4. **Async incremental bake** (`bake_scheduler`). The camera-centred chunk ring recenters
-//!    as the camera moves; entered chunks bake on a task pool, exited chunks evict — never
-//!    blocking the main thread.
+//!    as the camera moves; entered chunks bake on a task pool, exited chunks evict IMMEDIATELY
+//!    (the march falls back to a coarser resident LOD during the brief handoff) — never blocking
+//!    the main thread.
 //! 5. **Unified raymarch** (`sdf_raymarch.wgsl`, helpers in `brick`). One loop:
 //!    resolve the finest resident LOD at `p`; skip empty space by brick-DDA; otherwise
 //!    sphere-trace the trilinear field and accept the hit once the surface is within the
