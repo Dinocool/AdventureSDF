@@ -28,6 +28,11 @@ use super::{SdfCamera, SdfGridConfig, SdfRenderEnabled};
 /// `super::chunk`), independent of camera so CPU and GPU agree. `occ_*` = 64-bit
 /// occupancy mask (bit i ⇒ local brick i resident); `tile_run_base` indexes the packed
 /// `chunk_tile_table` where this chunk's `popcount(occ)` brick `atlas_base`s live.
+///
+/// Exists SOLELY as the std430 `ShaderType` for the chunk-lookup storage buffer's binding layout /
+/// min-binding-size (see `init_*_pipeline`). The actual data flows as `chunk::ChunkLookup` and is
+/// serialized by [`encode_lookup`]; this mirror is kept here, not on `chunk::ChunkLookup`, to
+/// preserve `chunk.rs`'s render-free purity. Its fields MUST match `chunk::ChunkLookup` byte-for-byte.
 #[derive(ShaderType, Clone, Copy, Default)]
 struct GpuChunkLookup {
     key_hi: u32,
@@ -37,8 +42,10 @@ struct GpuChunkLookup {
     tile_run_base: u32,
 }
 
-/// One resident brick's record in the packed chunk tile-run buffer (12 bytes): atlas
-/// tile origin (`col_px | row_px<<16`) + packed 4-entry material palette.
+/// std430 `ShaderType` for the tile-run storage buffer's binding layout / min-binding-size only
+/// (12 bytes: atlas tile origin `col_px | row_px<<16` + packed 4-entry palette). Like
+/// [`GpuChunkLookup`], the data flows as `chunk::BrickTile` (serialized by [`encode_tile`]); this
+/// mirror keeps the GPU derive out of the pure `chunk.rs`. Fields MUST match `chunk::BrickTile`.
 #[derive(ShaderType, Clone, Copy, Default)]
 struct GpuBrickTile {
     atlas_base: u32,
@@ -113,13 +120,13 @@ struct ExtractedSdfAtlas {
     /// (`chunk_data`, one row per resident chunk) + the whole packed tile-run buffer
     /// (`tile_run_data`, capacity-sized, each chunk's 64-entry region at `slot*64`). Used the
     /// first frame, on a capacity grow, and on the empty-atlas sentinel. See `super::chunk`.
-    chunk_data: Vec<GpuChunkLookup>,
-    tile_run_data: Vec<GpuBrickTile>,
+    chunk_data: Vec<super::chunk::ChunkLookup>,
+    tile_run_data: Vec<super::chunk::BrickTile>,
     /// DELTA payload (`tables_dirty && !full_rebuild`): only the directory slots and tile-run
     /// regions (slot → 64-entry region) that changed this frame. The toroidal directory is fixed-
     /// position, so each is an in-place `write_buffer` — no row shift, no sentinel tail.
-    chunk_row_updates: Vec<(u32, GpuChunkLookup)>,
-    tile_run_updates: Vec<(u32, Vec<GpuBrickTile>)>,
+    chunk_row_updates: Vec<(u32, super::chunk::ChunkLookup)>,
+    tile_run_updates: Vec<(u32, Vec<super::chunk::BrickTile>)>,
     /// Directory length (= `R³ × lod_count`); the GPU direct-indexes it (no logical-count bound).
     new_chunk_len: u32,
     /// Buffer capacities (rows / tile-run entries) this frame's table needs. `prepare` grows the
@@ -1154,33 +1161,6 @@ fn prepare_sdf_gbuffer(
 
 // --- Extract: Pack Atlas for GPU ---
 
-/// Pixel origin of `tile` in the 2D-tiled atlas. Tiles wrap into rows so the width
-/// stays bounded (a single strip overflows wgpu's 32768 max once brick count passes
-/// ~512). Returns `(col_px, row_px)`; `atlas_base = col_px | row_px<<16`.
-fn tile_origin(tile: u32) -> (u32, u32) {
-    let edge = BRICK_EDGE as u32;
-    let tile_width = edge * edge; // 64
-    let col_px = (tile % ATLAS_TILES_PER_ROW) * tile_width;
-    let row_px = (tile / ATLAS_TILES_PER_ROW) * edge;
-    (col_px, row_px)
-}
-
-/// Convert a CPU `chunk::ChunkLookup` row to its std430 GPU mirror.
-fn to_gpu_lookup(c: super::chunk::ChunkLookup) -> GpuChunkLookup {
-    GpuChunkLookup {
-        key_hi: c.key_hi,
-        key_lo: c.key_lo,
-        occ_lo: c.occ_lo,
-        occ_hi: c.occ_hi,
-        tile_run_base: c.tile_run_base,
-    }
-}
-
-/// Convert a CPU `chunk::BrickTile` to its std430 GPU mirror.
-fn to_gpu_tile(b: super::chunk::BrickTile) -> GpuBrickTile {
-    GpuBrickTile { atlas_base: b.atlas_base, pal01: b.pal01, pal23: b.pal23 }
-}
-
 fn extract_sdf_atlas(
     atlas: Extract<Res<SdfAtlas>>,
     mut last_gen: ResMut<LastAtlasGen>,
@@ -1249,8 +1229,8 @@ fn extract_sdf_atlas(
         super::chunk::ChunkUpload::Full { rows, tile_run, cap_rows, cap_slots } => {
             chunk_cap.chunk_rows = cap_rows;
             chunk_cap.tile_slots = cap_slots;
-            extracted.chunk_data = rows.into_iter().map(to_gpu_lookup).collect();
-            extracted.tile_run_data = tile_run.into_iter().map(to_gpu_tile).collect();
+            extracted.chunk_data = rows;
+            extracted.tile_run_data = tile_run;
             extracted.new_chunk_len = cap_rows;
             extracted.chunk_cap_needed = cap_rows;
             extracted.tile_cap_needed = cap_slots;
@@ -1259,12 +1239,9 @@ fn extract_sdf_atlas(
         }
         super::chunk::ChunkUpload::Delta { row_updates, region_updates } => {
             // Fixed-position directory → every dirty entry is an in-place index→value write.
-            extracted.chunk_row_updates =
-                row_updates.into_iter().map(|(r, l)| (r, to_gpu_lookup(l))).collect();
-            extracted.tile_run_updates = region_updates
-                .into_iter()
-                .map(|(s, reg)| (s, reg.into_iter().map(to_gpu_tile).collect()))
-                .collect();
+            extracted.chunk_row_updates = row_updates;
+            extracted.tile_run_updates =
+                region_updates.into_iter().map(|(s, reg)| (s, reg.to_vec())).collect();
             extracted.tables_dirty =
                 !extracted.chunk_row_updates.is_empty() || !extracted.tile_run_updates.is_empty();
             extracted.new_chunk_len = live.row_count();
@@ -1518,7 +1495,7 @@ fn upload_texture_layers(queue: Res<RenderQueue>, mut stream: ResMut<TextureStre
 // --- Prepare: chunk-table upload (full rebuild + incremental delta) ---
 
 /// 20-byte std430 encoding of one chunk lookup row.
-fn encode_lookup(c: &GpuChunkLookup, out: &mut Vec<u8>) {
+fn encode_lookup(c: &super::chunk::ChunkLookup, out: &mut Vec<u8>) {
     out.extend_from_slice(&c.key_hi.to_le_bytes());
     out.extend_from_slice(&c.key_lo.to_le_bytes());
     out.extend_from_slice(&c.occ_lo.to_le_bytes());
@@ -1527,7 +1504,7 @@ fn encode_lookup(c: &GpuChunkLookup, out: &mut Vec<u8>) {
 }
 
 /// 12-byte std430 encoding of one tile-run brick record.
-fn encode_tile(b: &GpuBrickTile, out: &mut Vec<u8>) {
+fn encode_tile(b: &super::chunk::BrickTile, out: &mut Vec<u8>) {
     out.extend_from_slice(&b.atlas_base.to_le_bytes());
     out.extend_from_slice(&b.pal01.to_le_bytes());
     out.extend_from_slice(&b.pal23.to_le_bytes());
@@ -2437,7 +2414,10 @@ impl Node for SdfBrickBakeNode {
         let tile_width = edge * edge; // 64
         let encoder = render_context.command_encoder();
         for (i, &tile) in buffers.tiles.iter().enumerate() {
-            let (col_px, row_px) = tile_origin(tile);
+            // Same packing as the lookup rows (single source: `chunk::tile_atlas_base`); unpack the
+            // `col_px | row_px<<16` it returns into the sub-rect origin for the texture blit.
+            let base = super::chunk::tile_atlas_base(tile);
+            let (col_px, row_px) = (base & 0xFFFF, base >> 16);
             let tile_extent = Extent3d {
                 width: tile_width,
                 height: edge,
