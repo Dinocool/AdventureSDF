@@ -18,6 +18,7 @@
     dist_to_brick_exit_lod,
     dist_to_chunk_exit_lod,
     in_ring_chunk,
+    ChunkCache,
 }
 
 struct RaymarchResult {
@@ -56,6 +57,89 @@ struct MarchQuality {
 // discrepancy (~a coarse voxel) so the morph is always active before a hit can be accepted.
 // Raise it if LOD-seam artifacts appear; lower it for a slightly cheaper march.
 const NEAR_SURFACE_VOXELS: f32 = 3.0;
+
+// Result of the LOD cross-fade morph at a point `p`. `d_eff` is the DISTANCE the surface is
+// rendered from (the camera-distance-driven continuous-LOD blend of two bracketing levels);
+// `blending` is true when the morph actually engaged (the two-level mix ran, so the field is
+// mildly non-eikonal and the caller should disable over-relaxation); `blend_w` / `eff_lod`
+// are the morph weight and the continuous rendered LOD (for debug/material LOD).
+struct LodMorph {
+    d_eff: f32,
+    blending: bool,
+    blend_w: f32,
+    eff_lod: f32,
+};
+
+// DISTANCE-driven continuous-LOD morph, factored out so BOTH the primary raymarch and the
+// shadow march (`sdf::shadows::soft_shadow`) sample the SAME LOD-blended field. Before this
+// was extracted, the primary march rendered the occluder through this morph while the shadow
+// march sampled the RAW finest-occupied field (`resolve_march`) — so a smoothly-rendered
+// surface cast a blockier (coarser-LOD-faceted) shadow. Sharing this helper makes the shadow
+// "see" exactly the occluder the camera sees.
+//
+// Inputs: `p` the sample point; `d_raw` the field value already resolved at `p` (the finest-
+// occupied `resolve_march`/`sample_sdf_world` distance) used both as the morph's fallback and
+// for the near-surface gate; `lod` the serving LOD of that resolve; `cone` the pixel-cone
+// half-width at `p` (= CONE·t — pass 0 for an ungated, always-on morph); `cache` the per-ray
+// chunk memo. The LOD selection keys off CAMERA distance (the clipmap is camera-centred), so it
+// is correct for a shadow ray's point too. Returns the raw `d_raw` unchanged (blending=false)
+// when the band is off, the ray is outside the usable ring, or the point is too far from the
+// surface for the morph to matter (the perf gate) — behaviourally identical to the pre-refactor
+// inline block.
+fn lod_crossfade(
+    p: vec3<f32>,
+    d_raw: f32,
+    lod: u32,
+    cone: f32,
+    cache: ptr<function, ChunkCache>,
+) -> LodMorph {
+    let SDF_EPS = sdf_eps();
+    let band = lod_blend_band();
+    var out = LodMorph(d_raw, false, 0.0, f32(lod));
+
+    let ring_bricks = camera.lod_params.y;
+    let end_frac = 1.0 - 2.0 * f32(recenter_snap() * CHUNK_BRICKS) / max(ring_bricks, 1.0);
+    // PERF gate: the morph only moves the rendered iso-surface, so its 2-3 extra field samples
+    // per step only matter near the surface. Far from it the caller steps on the cheap `d_raw`,
+    // exactly as the band==0 path does; the morph re-engages within `morph_reach` of the
+    // surface, before any hit-accept test.
+    let coarse_vox = voxel_size_at(min(lod + 1u, lod_count() - 1u));
+    let morph_reach = max(SDF_EPS, cone) + coarse_vox * NEAR_SURFACE_VOXELS;
+    if (!(band > 0.0 && end_frac > 0.0 && d_raw < morph_reach)) {
+        return out;
+    }
+
+    let half_l_base = 0.5 * ring_bricks * brick_world_at(0u);   // LOD-0 ring half-extent
+    let cheb_cam = max(max(abs(p.x - camera.camera_pos.x), abs(p.y - camera.camera_pos.y)), abs(p.z - camera.camera_pos.z));
+    // Reference distance where lodc crosses an integer. Solving so the morph L→L+1 is
+    // complete at LOD L's usable ring edge gives ref = 0.5·end_frac·half_l_base.
+    let ref_dist = 0.5 * end_frac * half_l_base;
+    let lodc = clamp(log2(max(cheb_cam / max(ref_dist, 1e-6), 1e-6)), 0.0, f32(lod_count() - 1u));
+    let level_lo = floor(lodc);
+    let t_in_level = lodc - level_lo;          // 0..1 position within the bracketing level
+    let blend_lod = clamp(log2(end_frac / max(end_frac - band, 1e-6)), 0.0, 1.0);
+    let w = smoothstep(1.0 - blend_lod, 1.0, t_in_level);   // 0 in level core, →1 at its top
+    let k = u32(level_lo);
+    let s0 = sample_level_at_or_coarser(p, k, cache);
+    if (s0.in_brick) {
+        if (w > 0.0 && k + 1u < lod_count()) {
+            let s1 = sample_level_at_or_coarser(p, k + 1u, cache);
+            if (s1.in_brick) {
+                out.d_eff = mix(s0.dist, s1.dist, w);
+                out.blending = true;
+                out.blend_w = w;
+                out.eff_lod = f32(s0.lod) + w * f32(s1.lod - s0.lod);
+            } else {
+                out.d_eff = s0.dist;
+                out.eff_lod = f32(s0.lod);
+            }
+        } else {
+            out.d_eff = s0.dist;
+            out.eff_lod = f32(s0.lod);
+        }
+    }
+    return out;
+}
 
 // Single unified raymarch. One cached resolve per step (`resolve_march` → finest resident
 // LOD + trilinear distance + tile/palette, memoising the chunk search across steps via a
@@ -151,51 +235,12 @@ fn raymarch(origin: vec3<f32>, dir: vec3<f32>, start_t: f32, q: MarchQuality) ->
         // Render the field at a CONTINUOUS LOD `lodc` set purely by camera distance, NOT by
         // which LOD `resolve_march` found occupied — so a finer occupancy island doesn't show
         // through a coarser region. Sample the two bracketing levels and morph between them.
-        let band = lod_blend_band();
-        var d_eff = d;
-        var blending = false;
-        var blend_w = 0.0;        // morph weight toward the coarser level
-        var eff_lod = f32(lod);   // continuous LOD actually rendered (for debug/material LOD)
-        let ring_bricks = camera.lod_params.y;
-        let end_frac = 1.0 - 2.0 * f32(recenter_snap() * CHUNK_BRICKS) / max(ring_bricks, 1.0);
-        // PERF: gate the cross-fade's extra field samples to near-surface steps. Far from the
-        // surface `d_eff` stays the cheap `d` and we step on it with over-relaxation, exactly as
-        // the band==0 path does — the morph (which only moves the iso-surface) re-engages once
-        // we're within `morph_reach` of the surface, comfortably before the hit-accept test
-        // (`d_eff < max(eps, cone)` below), so a hit is always accepted on the morphed distance.
-        let coarse_vox = voxel_size_at(min(lod + 1u, lod_count() - 1u));
-        let morph_reach = max(SDF_EPS, cone) + coarse_vox * NEAR_SURFACE_VOXELS;
-        if (band > 0.0 && end_frac > 0.0 && d < morph_reach) {
-            let half_l_base = 0.5 * ring_bricks * brick_world_at(0u);   // LOD-0 ring half-extent
-            let cheb_cam = max(max(abs(p.x - camera.camera_pos.x), abs(p.y - camera.camera_pos.y)), abs(p.z - camera.camera_pos.z));
-            // Reference distance where lodc crosses an integer. Solving so the morph L→L+1 is
-            // complete at LOD L's usable ring edge gives ref = 0.5·end_frac·half_l_base.
-            let ref_dist = 0.5 * end_frac * half_l_base;
-            let lodc = clamp(log2(max(cheb_cam / max(ref_dist, 1e-6), 1e-6)), 0.0, f32(lod_count() - 1u));
-            let level_lo = floor(lodc);
-            let t_in_level = lodc - level_lo;          // 0..1 position within the bracketing level
-            let blend_lod = clamp(log2(end_frac / max(end_frac - band, 1e-6)), 0.0, 1.0);
-            let w = smoothstep(1.0 - blend_lod, 1.0, t_in_level);   // 0 in level core, →1 at its top
-            let k = u32(level_lo);
-            let s0 = sample_level_at_or_coarser(p, k, &cache);
-            if (s0.in_brick) {
-                if (w > 0.0 && k + 1u < lod_count()) {
-                    let s1 = sample_level_at_or_coarser(p, k + 1u, &cache);
-                    if (s1.in_brick) {
-                        d_eff = mix(s0.dist, s1.dist, w);
-                        blending = true;
-                        blend_w = w;
-                        eff_lod = f32(s0.lod) + w * f32(s1.lod - s0.lod);
-                    } else {
-                        d_eff = s0.dist;
-                        eff_lod = f32(s0.lod);
-                    }
-                } else {
-                    d_eff = s0.dist;
-                    eff_lod = f32(s0.lod);
-                }
-            }
-        }
+        // Shared with the shadow march (`soft_shadow`) so the shadow sees the SAME morphed field.
+        let morph = lod_crossfade(p, d, lod, cone, &cache);
+        let d_eff = morph.d_eff;
+        let blending = morph.blending;
+        let blend_w = morph.blend_w;       // morph weight toward the coarser level
+        let eff_lod = morph.eff_lod;       // continuous LOD actually rendered (for debug/material LOD)
 
         // --- Sphere-trace the trilinear field ----------------------------------------
         // Over-relaxation validation FIRST (Keinert 2014): the previous relaxed step was safe

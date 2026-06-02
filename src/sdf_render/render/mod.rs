@@ -515,11 +515,13 @@ pub const SDF_SHADER_MODULES: [&str; 9] = [
     "shaders/sdf/bindings.wgsl",
     "shaders/sdf/brick.wgsl",
     "shaders/sdf/material.wgsl",
+    // march must register before shadows: `soft_shadow` now imports `sdf::march::lod_crossfade`
+    // so the shadow ray samples the SAME LOD-blended field the primary march renders.
+    "shaders/sdf/march.wgsl",
     "shaders/sdf/shadows.wgsl",
     "shaders/sdf/sky.wgsl",
     "shaders/sdf/pbr.wgsl",
     "shaders/sdf/oct.wgsl",
-    "shaders/sdf/march.wgsl",
     "shaders/sdf/brdf.wgsl",
 ];
 

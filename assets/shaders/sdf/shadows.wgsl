@@ -22,6 +22,10 @@
     in_ring_chunk,
     new_chunk_cache,
 }
+// The shadow ray samples the SAME distance-driven LOD cross-fade the primary raymarch renders
+// the surface through, so a smoothly-rendered occluder casts a matching (non-blockier) shadow
+// instead of one faceted to the raw finest-occupied LOD.
+#import sdf::march::{lod_crossfade}
 
 // A sample this small means the ray entered an occluder → hard shadow.
 const SHADOW_HIT_EPS: f32 = 1e-3;
@@ -70,7 +74,10 @@ fn soft_shadow(origin: vec3<f32>, light_dir: vec3<f32>, mint: f32, max_t: f32, k
         }
 
         // --- In a brick: sphere-trace, tracking the penumbra ---
-        let d = scene.dist;
+        // Sample the field through the primary march's LOD cross-fade (not the raw finest LOD),
+        // so the shadow's occluder matches the rendered surface. `cone = 0` → the morph is gated
+        // only by the near-surface distance (it engages near the occluder, before the hit test).
+        let d = lod_crossfade(p, scene.dist, scene.lod, 0.0, &cache).d_eff;
         if (d < SHADOW_HIT_EPS) {
             return 0.0; // entered an occluder → fully shadowed
         }
