@@ -145,7 +145,7 @@ verified `high`). Keep the differential tests green at every step.
   Expose the *decision + delta data* and leave final buffer sizing to each caller. (3) Don't fold
   `to_gpu_lookup`/`to_gpu_tile` into it -- those belong to the deferred GPU write.
 
-### [ ] C2. Delete `render.rs`'s duplicate GPU record structs + collapse to one encoder
+### [x] C2. Delete `render.rs`'s duplicate GPU record structs + collapse to one encoder
 `impact: medium` * `effort: medium` * `source: api-boundaries`
 
 - *Now:* `render.rs:32-47 GpuChunkLookup`/`GpuBrickTile` are field-for-field copies of
