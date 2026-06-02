@@ -45,7 +45,10 @@ pub mod chunk;
 pub(crate) mod debug;
 pub(crate) mod editor_camera;
 pub mod edits;
-pub(crate) mod gallery;
+// The gallery is purely a scene GENERATOR (the runtime loads `assets/scenes/gallery.scene`); only
+// the regen test uses it, so the whole module is test-only.
+#[cfg(test)]
+mod gallery;
 pub mod gizmo;
 pub(crate) mod height;
 pub(crate) mod node_gizmos;

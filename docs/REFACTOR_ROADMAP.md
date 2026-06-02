@@ -466,7 +466,7 @@ The whole `editor/` tree is feature-gated -- **build `--features editor` to catc
   footer. Optionally fold both behind one `enum FileDialog { Open, SaveAs }` resource (never open
   simultaneously). Good existing test coverage (`scene_browser.rs:281-332`); UI-only.
 
-### [~] E4. Concentrate `DockState<EditorTab>` topology surgery into `dock`
+### [x] E4. Concentrate `DockState<EditorTab>` topology surgery into `dock`
 > **Deferred (risk vs. no runtime verification).** This touches the layout-restore + tab-swap paths,
 > which have subtle ordering invariants (e.g. `close_doc.rs:680-687` adds the placeholder BEFORE
 > removing the scene tab so the leaf survives) and are lightly unit-tested. Editor runtime can't be

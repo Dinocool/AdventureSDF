@@ -387,6 +387,69 @@ pub fn show_editor_dock(world: &mut World) {
     world.insert_resource(registry);
 }
 
+// --- Tab topology -----------------------------------------------------------------------
+// The single place that knows the `DockState<EditorTab>` leaf layout: which leaf is the center
+// "scene box", which leaf anchors each side, and how to splice a tab in. `scene_tabs` (document/swap)
+// and `layout` (panel show/hide + layout restore) call these instead of re-deriving leaves
+// themselves (they used to each scan `is_center_tab` / find anchors independently).
+
+/// The main-surface leaf hosting the scene tabs (or the empty-state placeholder).
+pub(crate) fn center_leaf(dock: &EditorDockState) -> Option<NodeIndex> {
+    dock.state
+        .main_surface()
+        .iter()
+        .enumerate()
+        .find_map(|(i, node)| {
+            let has_center = node
+                .tabs()
+                .is_some_and(|tabs| tabs.iter().any(is_center_tab));
+            has_center.then_some(NodeIndex(i))
+        })
+}
+
+/// Whether `tab` belongs to the center "scene box" (a scene view or the empty placeholder).
+pub(crate) fn is_center_tab(tab: &EditorTab) -> bool {
+    matches!(tab, EditorTab::Scene(_) | EditorTab::NoScene)
+}
+
+/// Leaf that anchors a given `side` (one of its shell panels), so re-shown panels group with
+/// their siblings instead of spawning a fresh region.
+pub(crate) fn side_anchor_leaf(dock: &EditorDockState, side: DockSide) -> Option<NodeIndex> {
+    let anchors: &[EditorTab] = match side {
+        DockSide::Left => &[EditorTab::Hierarchy, EditorTab::ProjectFiles],
+        DockSide::Right => &[EditorTab::Inspector],
+        DockSide::Bottom => &[EditorTab::AssetsDrawer],
+    };
+    anchors
+        .iter()
+        .find_map(|t| dock.state.find_main_surface_tab(t).map(|(n, _)| n))
+}
+
+/// Add `tab` on its home `side`: into an existing same-side leaf if one is open, else split a
+/// new region off the center scene box.
+pub(crate) fn add_panel_tab(dock: &mut EditorDockState, tab: EditorTab, side: DockSide) {
+    if let Some(node) = side_anchor_leaf(dock, side) {
+        dock.state.main_surface_mut()[node].append_tab(tab);
+        return;
+    }
+    let Some(center) = center_leaf(dock) else {
+        dock.state.push_to_first_leaf(tab);
+        return;
+    };
+    let surface = dock.state.main_surface_mut();
+    match side {
+        DockSide::Left => {
+            surface.split_left(center, 0.20, vec![tab]);
+        }
+        DockSide::Right => {
+            surface.split_right(center, 0.78, vec![tab]);
+        }
+        DockSide::Bottom => {
+            surface.split_below(center, 0.72, vec![tab]);
+        }
+    }
+}
+
 /// Wires the dock shell: the egui input-absorption poke, the Phosphor icon font, the one-shot
 /// dock-layout build, and the per-frame dock render. Was inline in `EditorPlugin::build`; added
 /// LAST (after every plugin has registered its panels, which `init_dock_state` consumes).
