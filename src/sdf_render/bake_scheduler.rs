@@ -846,11 +846,19 @@ pub(crate) fn classify_candidates_serial(
     out
 }
 
-/// Phase 3 (serial, MAIN THREAD): apply each candidate's verdict — evict, skip, or insert + push a
-/// GPU bake job under the soft budget. Mutates the atlas + job list, so it must run on the main
-/// thread before the render-world Extract. A Keep over [`SOFT_BAKE_BUDGET`] spills its chunk back to
-/// `sched.pending` (NOT inserted → stays non-resident → coarse-LOD fallback, hole-free) and evicts
-/// any stale resident texels. `spilled` is a reusable set (cleared on entry).
+/// Phase 3 (serial, MAIN THREAD): apply the verdicts — evict, skip, or insert + push a GPU bake job
+/// under the soft budget. Mutates the atlas + job list, so it must run on the main thread before the
+/// render-world Extract. `spilled` is a reusable set (cleared on entry).
+///
+/// CHUNK-ATOMIC budgeting (make-before-break): a chunk's WHOLE Keep-set bakes this frame, or the
+/// whole chunk spills to a later one — never partially. Every brick of a chunk that bakes calls
+/// `set_brick` this same frame, so the chunk appears in the GPU lookup table ATOMICALLY at the next
+/// extract; the finer LOD never shows half-baked (some bricks resident, neighbours not), which is the
+/// sub-chunk mixed-LOD "garbled ripple" seen during a LOD 4→3 handoff. While a chunk waits, the
+/// coarser LOD that covers it (resident in its larger window) keeps serving the region — hole-free.
+///
+/// `candidates` are grouped by chunk (consecutive — `gather_candidates` emits each chunk's bricks in
+/// a run, and the parallel classify preserves order), so one pass detects chunk runs by key change.
 #[expect(clippy::too_many_arguments)]
 fn apply_verdicts(
     atlas: &mut SdfAtlas,
@@ -860,45 +868,66 @@ fn apply_verdicts(
     baked_dbg: &mut super::BakedBrickDebug,
     now_secs: f32,
     candidates: &[(chunk::ChunkKey, atlas::BrickKey)],
-    verdicts: Vec<Verdict>,
+    mut verdicts: Vec<Verdict>,
     spilled: &mut std::collections::HashSet<chunk::ChunkKey>,
     job_budget: usize,
 ) {
     let _g3 = info_span!("emit_phase3_apply").entered();
     spilled.clear();
-    for ((ck, key), verdict) in candidates.iter().zip(verdicts) {
-        match verdict {
-            Verdict::Empty | Verdict::Drop => {
-                atlas.remove_brick(key, config);
+    let n = candidates.len();
+    // Latches once a chunk doesn't fit: every later (lower-priority — `sort_drained` ordered them)
+    // chunk spills too, so we never bake out of priority order to squeeze a small chunk in.
+    let mut budget_full = false;
+    let mut i = 0;
+    while i < n {
+        let ck = candidates[i].0;
+        let mut j = i;
+        let mut keep_count = 0usize;
+        while j < n && candidates[j].0 == ck {
+            if matches!(verdicts[j], Verdict::Keep(..)) {
+                keep_count += 1;
             }
-            // Resident brick, content unchanged (hash matched in classify) → texels still valid,
-            // leave it as-is. This is what keeps a sphere dragged over the heightmap cheap.
-            Verdict::Skip => {}
-            Verdict::Keep(palette, indices, hash) => {
-                if gpu_bakes.jobs.len() >= job_budget {
-                    // Over this frame's job budget → defer this brick's bake to a later frame, so a
-                    // big shell spreads instead of spiking. The SYNC path uses the low SOFT budget
-                    // (the classify is on the main thread, so keep per-frame work small); the ASYNC
-                    // apply uses the full `GPU_BAKE_JOB_CAP` (its classify already ran off-thread, so
-                    // the only per-frame cost left is the cheap HashMap/Vec apply — drain faster).
-                    // Same spill mechanics either way. CRUCIAL: if the brick is currently RESIDENT
-                    // with a DIFFERENT hash it holds STALE texels (its content changed) — leaving it
-                    // resident would serve its stale shape over the freshly-baked coarse level (the
-                    // "old surface band left behind while dragging"). Evict it so the lookup misses
-                    // and falls back to the correct coarse LOD until its real bake lands.
-                    atlas.remove_brick(key, config);
-                    spilled.insert(*ck);
-                    continue;
+            j += 1;
+        }
+        // Spill the whole chunk if its Keep-set wouldn't FULLY fit this frame's remaining budget.
+        // (A chunk holds ≤ CHUNK_VOLUME bricks ≪ the budget, so a chunk is never permanently
+        // unbakeable — it just waits for a frame with room.)
+        let spill = keep_count > 0 && (budget_full || gpu_bakes.jobs.len() + keep_count > job_budget);
+        budget_full |= spill;
+        for k in i..j {
+            let key = candidates[k].1;
+            match std::mem::replace(&mut verdicts[k], Verdict::Skip) {
+                Verdict::Empty | Verdict::Drop => {
+                    atlas.remove_brick(&key, config);
                 }
-                let tile = atlas.insert_gpu_brick(*key, palette, hash, config);
-                push_bake_job(gpu_bakes, edits_snapshot, config, *key, tile, &indices, palette);
-                if baked_dbg.enabled {
-                    let bw = config.brick_world_size(key.lod);
-                    let center = config.brick_min_world(key.coord, key.lod) + Vec3::splat(0.5 * bw);
-                    baked_dbg.bricks.push((center, bw, now_secs));
+                // Resident brick, content unchanged (hash matched in classify) → texels still valid,
+                // leave it as-is. This is what keeps a sphere dragged over the heightmap cheap.
+                Verdict::Skip => {}
+                Verdict::Keep(palette, indices, hash) => {
+                    if spill {
+                        // Deferred to a later frame. If the brick is currently RESIDENT with a stale
+                        // hash (a re-bake — its content changed) it holds STALE texels; evict it so the
+                        // lookup misses and falls back to the correct coarser LOD until its real bake
+                        // lands ("old surface band left behind while dragging"). A genuinely new brick
+                        // isn't resident, so this is a no-op — it simply never appears until its chunk
+                        // bakes whole.
+                        atlas.remove_brick(&key, config);
+                        continue;
+                    }
+                    let tile = atlas.insert_gpu_brick(key, palette, hash, config);
+                    push_bake_job(gpu_bakes, edits_snapshot, config, key, tile, &indices, palette);
+                    if baked_dbg.enabled {
+                        let bw = config.brick_world_size(key.lod);
+                        let center = config.brick_min_world(key.coord, key.lod) + Vec3::splat(0.5 * bw);
+                        baked_dbg.bricks.push((center, bw, now_secs));
+                    }
                 }
             }
         }
+        if spill {
+            spilled.insert(ck);
+        }
+        i = j;
     }
     atlas.last_bake_was_full = false;
 }
@@ -1228,6 +1257,133 @@ mod tests {
         bvh::Bvh::build(&aabbs)
     }
 
+    /// Resolve (chunk, local) through a GPU lookup-buffer pair the way the shader does
+    /// (binary-search the sorted rows, popcount-index the dense tile run).
+    fn resolve_table(
+        rows: &[chunk::ChunkLookup],
+        tiles: &[chunk::BrickTile],
+        ck: chunk::ChunkKey,
+        local: u32,
+    ) -> Option<chunk::BrickTile> {
+        let (kh, kl) = chunk::chunk_gpu_key(ck);
+        let idx = rows.binary_search_by(|c| (c.key_hi, c.key_lo).cmp(&(kh, kl))).ok()?;
+        let c = rows[idx];
+        let occ = (c.occ_lo as u64) | ((c.occ_hi as u64) << 32);
+        if (occ >> local) & 1 == 0 {
+            return None;
+        }
+        let off = (occ & ((1u64 << local) - 1)).count_ones();
+        Some(tiles[(c.tile_run_base + off) as usize])
+    }
+
+    /// Apply the live table's per-frame delta to a GPU-buffer mirror EXACTLY as `render.rs` does
+    /// (full rebuild on a capacity grow, else dirty rows + dirty tile-run slots + sentinel tail).
+    fn apply_table_delta(
+        live: &chunk::LiveChunkTables,
+        rows: &mut Vec<chunk::ChunkLookup>,
+        tiles: &mut Vec<chunk::BrickTile>,
+        cap_rows: &mut u32,
+        cap_slots: &mut u32,
+    ) {
+        let sentinel = chunk::ChunkLookup {
+            key_hi: u32::MAX,
+            key_lo: u32::MAX,
+            occ_lo: 0,
+            occ_hi: 0,
+            tile_run_base: 0,
+        };
+        let needed_rows = live.row_count();
+        let needed_slots = live.tile_run_capacity();
+        if *cap_rows == 0 || needed_rows > *cap_rows || needed_slots > *cap_slots {
+            *cap_rows = (needed_rows + needed_rows / 2).max(needed_rows + 1);
+            *cap_slots = (needed_slots + needed_slots / 2).max(needed_slots + chunk::TILE_RUN_SLOT);
+            let (r, t) = live.full_tables();
+            *rows = r;
+            rows.resize(*cap_rows as usize, sentinel);
+            *tiles = t;
+            tiles.resize(*cap_slots as usize, chunk::BrickTile::default());
+        } else {
+            for &row in &live.dirty_rows {
+                rows[row as usize] = live.lookup_at(row);
+            }
+            for &slot in &live.dirty_slots {
+                let base = (slot * chunk::TILE_RUN_SLOT) as usize;
+                tiles[base..base + chunk::TILE_RUN_SLOT as usize].copy_from_slice(&live.tile_region(slot));
+            }
+            if let Some(from) = live.sentinel_tail_from {
+                for row in from..*cap_rows {
+                    rows[row as usize] = sentinel;
+                }
+            }
+        }
+    }
+
+    /// THE garbled-LOD-transition guard: drive the REAL recenter + emit lifecycle (fly a camera out
+    /// across the clipmap LOD bands of a big sphere and back), draining the bake FRAME BY FRAME, and
+    /// after every frame assert the incrementally-maintained chunk table — BOTH `full_tables()` and
+    /// the render.rs delta-upload MIRROR — resolves every resident brick to its CORRECT atlas tile.
+    /// A desync here (brick → wrong/absent tile) is exactly the "garbled geometry during a LOD
+    /// handoff": the shader reads another brick's texels (wrong shape) or an unbaked tile.
+    #[test]
+    fn live_table_resolves_correct_tile_through_recenter_lifecycle() {
+        let cfg = SdfGridConfig { lod_count: 5, ring_bricks: 16, recenter_snap_chunks: 1, ..config() };
+        let edits = vec![sphere_edit(Vec3::ZERO, 25.0, 0)];
+        let mut sched = primed_sched(&edits);
+        let mut atlas = SdfAtlas::default();
+        let mut gpu = PendingGpuBakes::default();
+
+        let mut rows: Vec<chunk::ChunkLookup> = Vec::new();
+        let mut tiles: Vec<chunk::BrickTile> = Vec::new();
+        let mut cap_rows = 0u32;
+        let mut cap_slots = 0u32;
+
+        // Fly out (0..72) and back — several LOD bands transition each way.
+        let mut path: Vec<f32> = (0..=24).map(|i| i as f32 * 3.0).collect();
+        let back: Vec<f32> = path.iter().rev().skip(1).copied().collect();
+        path.extend(back);
+
+        let mut dbg = crate::sdf_render::BakedBrickDebug::default();
+        for (step, &x) in path.iter().enumerate() {
+            let cam = Vec3::new(x, 0.0, 0.0);
+            recenter_step(&mut sched, &mut atlas, &cfg, cam);
+            let mut guard = 0;
+            loop {
+                gpu.jobs.clear();
+                gpu.edits.clear();
+                atlas.gpu_baked_tiles.clear();
+                emit_gpu_bakes(&mut atlas, &mut sched, &mut gpu, &cfg, cam, &mut dbg, 0.0);
+
+                // Mirror the render world: apply this frame's table delta, then clear the dirty record.
+                apply_table_delta(&atlas.live_chunks, &mut rows, &mut tiles, &mut cap_rows, &mut cap_slots);
+                let (fr, ft) = atlas.live_chunks.full_tables();
+                atlas.live_chunks.clear_dirty();
+
+                // Every resident brick must resolve to its OWN tile, through both table views.
+                for key in atlas.bricks.keys() {
+                    let tile = atlas.tiles.tile(key).expect("resident brick has a tile");
+                    let want = chunk::tile_atlas_base(tile);
+                    let (ck, local) = chunk::chunk_of(*key, &cfg);
+                    assert_eq!(
+                        resolve_table(&fr, &ft, ck, local).map(|t| t.atlas_base),
+                        Some(want),
+                        "step {step}: full_tables resolves brick {key:?} to the wrong/absent tile"
+                    );
+                    assert_eq!(
+                        resolve_table(&rows, &tiles, ck, local).map(|t| t.atlas_base),
+                        Some(want),
+                        "step {step}: delta-mirror resolves brick {key:?} to the wrong/absent tile"
+                    );
+                }
+
+                guard += 1;
+                assert!(guard < 4000, "drain did not converge at step {step}");
+                if sched.pending.is_empty() {
+                    break;
+                }
+            }
+        }
+    }
+
     fn box_edit(pos: Vec3, half: f32, mat: u16) -> ResolvedEdit {
         ResolvedEdit::new(
             SdfPrimitive::Box { half_extents: Vec3::splat(half) },
@@ -1392,6 +1548,137 @@ mod tests {
         atlas.bricks.keys().map(|k| chunk::chunk_of(*k, cfg).0).collect()
     }
 
+    /// Same correct-tile guard as the sync lifecycle, but through the ASYNC dispatch with CONTINUOUS
+    /// camera motion (one step per frame) so a background classify task routinely spans camera moves
+    /// — its snapshot (candidates + window + hashes) goes stale relative to the evictions the
+    /// recenter applied meanwhile. If the stale-snapshot apply ever re-inserts a brick with a tile
+    /// that disagrees with the allocator (or leaves the table referencing a freed/reused tile), this
+    /// catches it as a brick → wrong-tile resolve — the async-only "garbled LOD handoff".
+    #[test]
+    fn live_table_correct_through_async_continuous_motion() {
+        AsyncComputeTaskPool::get_or_init(bevy::tasks::TaskPool::default);
+        let cfg = SdfGridConfig { lod_count: 3, ring_bricks: 16, recenter_snap_chunks: 1, ..config() };
+        let edits = vec![sphere_edit(Vec3::ZERO, 12.0, 0)];
+        let mut sched = primed_sched(&edits);
+        let mut atlas = SdfAtlas::default();
+        let mut task = BakeTaskState::default();
+        let mut gpu = PendingGpuBakes::default();
+        let mut dbg = crate::sdf_render::BakedBrickDebug::default();
+
+        let mut rows: Vec<chunk::ChunkLookup> = Vec::new();
+        let mut tiles: Vec<chunk::BrickTile> = Vec::new();
+        let mut cap_rows = 0u32;
+        let mut cap_slots = 0u32;
+
+        // Continuous fly out and back, one camera step per frame, then extra frames to drain.
+        let mut cams: Vec<f32> = (0..=36).map(|i| i as f32 * 2.0).collect();
+        let back: Vec<f32> = cams.iter().rev().skip(1).copied().collect();
+        cams.extend(back);
+        let end = *cams.last().unwrap();
+        for _ in 0..400 {
+            cams.push(end); // hold position so the final in-flight task drains (still checking)
+        }
+
+        for (frame, &x) in cams.iter().enumerate() {
+            let cam = Vec3::new(x, 0.0, 0.0);
+            recenter_step(&mut sched, &mut atlas, &cfg, cam);
+            gpu.jobs.clear();
+            gpu.edits.clear();
+            atlas.gpu_baked_tiles.clear();
+            dispatch_bake(&mut atlas, &mut sched, &mut task, &mut gpu, &cfg, cam, &mut dbg, 0.0);
+            if task.task.is_some() {
+                std::thread::yield_now();
+            }
+
+            apply_table_delta(&atlas.live_chunks, &mut rows, &mut tiles, &mut cap_rows, &mut cap_slots);
+            let (fr, ft) = atlas.live_chunks.full_tables();
+            atlas.live_chunks.clear_dirty();
+            for key in atlas.bricks.keys() {
+                let tile = atlas.tiles.tile(key).expect("resident brick has a tile");
+                let want = chunk::tile_atlas_base(tile);
+                let (ck, local) = chunk::chunk_of(*key, &cfg);
+                assert_eq!(
+                    resolve_table(&fr, &ft, ck, local).map(|t| t.atlas_base),
+                    Some(want),
+                    "frame {frame} (x={x}): full_tables resolves brick {key:?} to the wrong/absent tile"
+                );
+                assert_eq!(
+                    resolve_table(&rows, &tiles, ck, local).map(|t| t.atlas_base),
+                    Some(want),
+                    "frame {frame} (x={x}): delta-mirror resolves brick {key:?} to the wrong/absent tile"
+                );
+            }
+        }
+    }
+
+    /// Finest resident LOD with a baked brick at world point `p` — mirrors the shader's
+    /// `resolve_march` fine→coarse walk (chunk-table presence only). `None` = no LOD covers `p`
+    /// (the shader would march into empty space there: the visible GAP).
+    fn served_lod(atlas: &SdfAtlas, cfg: &SdfGridConfig, p: Vec3) -> Option<u32> {
+        for lod in 0..cfg.lod_count {
+            let coord = cfg.world_to_brick_lod(p, lod);
+            if atlas.bricks.contains_key(&atlas::BrickKey::new(lod, coord)) {
+                return Some(lod);
+            }
+        }
+        None
+    }
+
+    /// THE coverage-gap guard: fly the camera continuously (async dispatch) past a surface probe
+    /// that stays WITHIN clipmap reach the whole path, and assert the probe's coverage NEVER drops
+    /// once established. A drop to `None` is the "LOD-N → gap → LOD-(N-1)" the renderer shows — the
+    /// recenter evicting a region's fine chunk before its coarser replacement is resident (worst
+    /// while a multi-frame async classify is in flight and evictions keep landing). Deferred
+    /// eviction (evict only once the replacement is resident) must keep this hole-free.
+    #[test]
+    fn async_continuous_motion_keeps_probe_covered() {
+        AsyncComputeTaskPool::get_or_init(bevy::tasks::TaskPool::default);
+        let cfg = SdfGridConfig { lod_count: 4, ring_bricks: 16, recenter_snap_chunks: 1, ..config() };
+        let radius = 16.0;
+        let edits = vec![sphere_edit(Vec3::ZERO, radius, 0)];
+        let mut sched = primed_sched(&edits);
+        let mut atlas = SdfAtlas::default();
+        let mut task = BakeTaskState::default();
+        let mut gpu = PendingGpuBakes::default();
+        let mut dbg = crate::sdf_render::BakedBrickDebug::default();
+
+        // Probe on the sphere surface, lateral to the +X flight so it stays in reach across the
+        // whole path (coarsest LOD-3 window half-extent ≈ 2·chunk_world(3) ≈ 45 world units; the
+        // probe's camera distance peaks at ≈ sqrt(38² + 16²) ≈ 41 < 45 → covered throughout).
+        let probe = Vec3::new(0.0, radius, 0.3);
+        let mut served: Vec<Option<u32>> = Vec::new();
+
+        let mut cams: Vec<f32> = (0..=76).map(|i| i as f32 * 0.5).collect(); // 0..38 in 0.5 steps
+        let back: Vec<f32> = cams.iter().rev().skip(1).copied().collect();
+        cams.extend(back);
+        let end = *cams.last().unwrap();
+        for _ in 0..400 {
+            cams.push(end);
+        }
+
+        for &x in &cams {
+            let cam = Vec3::new(x, 0.0, 0.0);
+            recenter_step(&mut sched, &mut atlas, &cfg, cam);
+            gpu.jobs.clear();
+            gpu.edits.clear();
+            atlas.gpu_baked_tiles.clear();
+            dispatch_bake(&mut atlas, &mut sched, &mut task, &mut gpu, &cfg, cam, &mut dbg, 0.0);
+            if task.task.is_some() {
+                std::thread::yield_now();
+            }
+            served.push(served_lod(&atlas, &cfg, probe));
+        }
+
+        // Once covered, the probe must stay covered for the rest of the (in-reach) path.
+        let first = served.iter().position(|s| s.is_some()).expect("probe never covered — test setup");
+        for (i, s) in served.iter().enumerate().skip(first) {
+            assert!(
+                s.is_some(),
+                "frame {i}: probe LOST coverage (LOD → gap) — eviction outpaced the bake: {served:?}"
+            );
+        }
+    }
+
     /// The async offload must converge to the SAME resident set as the synchronous settle. Uses a
     /// scene big enough to cross `ASYNC_BAKE_THRESHOLD` so the large-bake (task) path actually runs.
     /// Proves the snapshot/spawn/poll/reconcile/apply round-trip drops nothing and bakes everything.
@@ -1492,6 +1779,53 @@ mod tests {
             atlas.bricks.len(),
             "resident brick count must equal the emitted job count (no half-inserted bricks)"
         );
+    }
+
+    /// CHUNK-ATOMIC budget (make-before-break): a chunk's Keep-set bakes WHOLE or spills WHOLE —
+    /// never partially. A half-baked chunk would appear in the GPU table with only some of its
+    /// bricks resident, so the finer LOD shows a sub-chunk mixed-LOD "garbled" patch during a
+    /// LOD-handoff. Drive `apply_verdicts` with a budget that fits the first chunk but not both, and
+    /// assert every chunk is all-or-nothing resident (and the over-budget one is spilled whole).
+    #[test]
+    fn apply_verdicts_bakes_or_spills_whole_chunks() {
+        let cfg = config();
+        let edits = vec![sphere_edit(Vec3::ZERO, 5.0, 0)]; // 1-elem snapshot so push_bake_job indexes [0]
+        let ck_a = chunk::ChunkKey::new(0, IVec3::new(0, 0, 0));
+        let ck_b = chunk::ChunkKey::new(0, IVec3::new(1, 0, 0));
+        let a: Vec<_> = chunk_brick_keys(ck_a, &cfg).into_iter().take(3).collect();
+        let b: Vec<_> = chunk_brick_keys(ck_b, &cfg).into_iter().take(3).collect();
+        let mut candidates = Vec::new();
+        let mut verdicts = Vec::new();
+        for (h, &k) in a.iter().enumerate() {
+            candidates.push((ck_a, k));
+            verdicts.push(Verdict::Keep([edits::PALETTE_EMPTY; edits::PALETTE_K], vec![0], h as u64));
+        }
+        for (h, &k) in b.iter().enumerate() {
+            candidates.push((ck_b, k));
+            verdicts.push(Verdict::Keep([edits::PALETTE_EMPTY; edits::PALETTE_K], vec![0], 100 + h as u64));
+        }
+
+        let mut atlas = SdfAtlas::default();
+        let mut gpu = PendingGpuBakes::default();
+        let mut spilled = HashSet::new();
+        // Budget 4: chunk A's 3 bricks fit (0+3 ≤ 4); A+B's 6 do not (3+3 > 4) → B spills whole.
+        apply_verdicts(
+            &mut atlas, &mut gpu, &edits, &cfg, &mut crate::sdf_render::BakedBrickDebug::default(),
+            0.0, &candidates, verdicts, &mut spilled, 4,
+        );
+
+        assert_eq!(gpu.jobs.len(), 3, "exactly chunk A's bricks baked");
+        assert_eq!(atlas.bricks.len(), gpu.jobs.len(), "no half-inserted bricks");
+        assert!(spilled.contains(&ck_b) && !spilled.contains(&ck_a), "the over-budget chunk B spills whole");
+        // The core invariant: each chunk is all-or-nothing resident — never a partial mix.
+        for (ck, keys) in [(ck_a, &a), (ck_b, &b)] {
+            let resident = keys.iter().filter(|k| atlas.bricks.contains_key(k)).count();
+            assert!(
+                resident == 0 || resident == keys.len(),
+                "chunk {ck:?} partially resident ({resident}/{}) — not chunk-atomic",
+                keys.len()
+            );
+        }
     }
 
     /// A spilled brick must NOT be inserted into the atlas — it stays non-resident so the
