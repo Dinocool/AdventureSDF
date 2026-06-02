@@ -386,3 +386,45 @@ pub fn show_editor_dock(world: &mut World) {
     world.insert_resource(dock);
     world.insert_resource(registry);
 }
+
+/// Wires the dock shell: the egui input-absorption poke, the Phosphor icon font, the one-shot
+/// dock-layout build, and the per-frame dock render. Was inline in `EditorPlugin::build`; added
+/// LAST (after every plugin has registered its panels, which `init_dock_state` consumes).
+pub struct DockPlugin;
+
+impl Plugin for DockPlugin {
+    fn build(&self, app: &mut App) {
+        // Do NOT use egui's blanket input absorption: egui_dock's central Viewport tab is itself an
+        // egui surface, so the absorber would clear mouse input even when the cursor is over the 3D
+        // region — killing viewport interaction. Instead the SDF orbit/pick/gizmo systems gate on
+        // `ViewportInputAllowed`, which `show_editor_dock` sets from the pointer-in-viewport test.
+        app.world_mut()
+            .resource_mut::<bevy_egui::EguiGlobalSettings>()
+            .enable_absorb_bevy_input_system = false;
+
+        // Install the Phosphor icon font once the egui context exists, build the dock layout after
+        // Startup (so every plugin's panels are registered), then render the dock each frame.
+        app.add_systems(
+            PostStartup,
+            install_phosphor_font.after(bevy_egui::EguiStartupSet::InitContexts),
+        )
+        .add_systems(PostStartup, init_dock_state)
+        .add_systems(bevy_egui::EguiPrimaryContextPass, show_editor_dock);
+    }
+}
+
+/// Merge the Phosphor icon font into the primary egui context's fonts, once at startup.
+/// `add_to_fonts` inserts it into the Proportional family alongside egui's built-ins, so
+/// icon glyphs (`egui_phosphor::regular::*`) render inline with normal toolbar text.
+fn install_phosphor_font(world: &mut World) {
+    let Ok(mut egui_ctx) = world
+        .query_filtered::<&mut bevy_egui::EguiContext, With<bevy_egui::PrimaryEguiContext>>()
+        .single_mut(world)
+    else {
+        return;
+    };
+    let ctx = egui_ctx.get_mut();
+    let mut fonts = bevy_egui::egui::FontDefinitions::default();
+    egui_phosphor::add_to_fonts(&mut fonts, egui_phosphor::Variant::Regular);
+    ctx.set_fonts(fonts);
+}
