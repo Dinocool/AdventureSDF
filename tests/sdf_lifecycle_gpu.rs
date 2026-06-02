@@ -21,7 +21,6 @@ use std::collections::HashSet;
 use bevy::math::bounding::Aabb3d;
 use bevy::math::{IVec3, Vec3};
 use bevy::prelude::Transform;
-use futures_lite::future::block_on;
 use naga_oil::compose::{Composer, NagaModuleDescriptor};
 
 use adventure::sdf_render::atlas::{BRICK_EDGE, BrickKey, SdfAtlas, dist_band_world};
@@ -38,19 +37,10 @@ const DIST_TILE_U32: u32 = DIST_ROW_U32 * 8;
 const MAT_TILE_U32: u32 = 128 * 8;
 const TEST_TILES_PER_ROW: u32 = 64; // 64*64=4096px wide, within the 8192 default limit
 
+mod common;
+
 fn gpu() -> Option<(wgpu::Device, wgpu::Queue)> {
-    let instance = wgpu::Instance::default();
-    let adapter = block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default())).ok()?;
-    if !adapter.features().contains(wgpu::Features::TEXTURE_FORMAT_16BIT_NORM) {
-        eprintln!("adapter lacks TEXTURE_FORMAT_16BIT_NORM — skipping");
-        return None;
-    }
-    block_on(adapter.request_device(&wgpu::DeviceDescriptor {
-        label: Some("sdf_lifecycle"),
-        required_features: wgpu::Features::TEXTURE_FORMAT_16BIT_NORM,
-        ..Default::default()
-    }))
-    .ok()
+    common::headless_device(wgpu::Features::TEXTURE_FORMAT_16BIT_NORM)
 }
 
 fn compose_bake() -> naga::Module {

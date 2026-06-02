@@ -10,7 +10,6 @@
 use std::borrow::Cow;
 
 use bevy::math::{IVec3, Vec3};
-use futures_lite::future::block_on;
 use naga_oil::compose::{Composer, NagaModuleDescriptor};
 
 use adventure::sdf_render::atlas::{BRICK_EDGE, dist_band_world};
@@ -19,20 +18,11 @@ use adventure::sdf_render::edits::{
 };
 use adventure::sdf_render::SdfGridConfig;
 
+mod common;
+
+// The bake compute path needs no special features.
 fn device_queue() -> Option<(wgpu::Device, wgpu::Queue)> {
-    let instance = wgpu::Instance::default();
-    let adapter = block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-        power_preference: wgpu::PowerPreference::HighPerformance,
-        force_fallback_adapter: false,
-        compatible_surface: None,
-    }))
-    .ok()?;
-    let (device, queue) = block_on(adapter.request_device(&wgpu::DeviceDescriptor {
-        label: Some("sdf_bake_gpu"),
-        ..Default::default()
-    }))
-    .ok()?;
-    Some((device, queue))
+    common::headless_device(wgpu::Features::empty())
 }
 
 fn compose_bake() -> naga::Module {
@@ -255,30 +245,14 @@ fn gpu_bake_sphere_matches_analytic_distance() {
 /// or corrupted on copy → the live "chunk goes missing" hole.
 #[test]
 fn gpu_bake_copy_to_atlas_texture_roundtrips() {
-    let Some((device, queue)) = device_queue() else {
-        eprintln!("no GPU adapter — skipping");
-        return;
-    };
     use wgpu::util::DeviceExt;
 
-    // Adapter must support R16Snorm (the atlas format). The live app requests
-    // TEXTURE_FORMAT_16BIT_NORM; if this adapter lacks it, skip rather than fail.
-    let instance = wgpu::Instance::default();
-    let adapter = block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default()))
-        .expect("adapter");
-    if !adapter
-        .features()
-        .contains(wgpu::Features::TEXTURE_FORMAT_16BIT_NORM)
-    {
+    // R16Snorm (the atlas format) needs TEXTURE_FORMAT_16BIT_NORM; skip rather than fail if absent.
+    let Some((device, queue)) = common::headless_device(wgpu::Features::TEXTURE_FORMAT_16BIT_NORM)
+    else {
         eprintln!("adapter lacks TEXTURE_FORMAT_16BIT_NORM — skipping texture roundtrip");
         return;
-    }
-    let (device, queue) = block_on(adapter.request_device(&wgpu::DeviceDescriptor {
-        label: Some("sdf_bake_tex"),
-        required_features: wgpu::Features::TEXTURE_FORMAT_16BIT_NORM,
-        ..Default::default()
-    }))
-    .unwrap_or((device, queue));
+    };
 
     let cfg = SdfGridConfig::default();
     let lod = 0u32;
