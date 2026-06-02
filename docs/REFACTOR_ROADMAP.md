@@ -252,8 +252,18 @@ genuine friction point, not speculatively. **Don't split `chunk.rs`** (X3).
   `sdf_render::render::SdfRenderPlugin` path is preserved by `render/mod.rs`; only `sync_sdf_shader_defs`
   is editor-gated and stays put.
 
-### [ ] M2. Split `bake_scheduler.rs` (2587 LoC) -- `window.rs` + `classify.rs` are the clean wins
+### [x] M2. Split `bake_scheduler.rs` (2587 LoC) -- `window.rs` + `classify.rs` are the clean wins
 `impact: medium` * `effort: large` * `source: modularization + refactor-deadcode`
+> **Done (the two clean wins).** `bake_scheduler.rs` → `bake_scheduler/mod.rs` + `window.rs` (pure
+> chunk-ring window geometry — `ring_chunk_origin`, entered/exited diffs, `chunks_in_aabb_windowed`,
+> the BVH occupancy probe) + `classify.rs` (the Send read-only core — `Verdict`, `narrow_band_keep`,
+> `classify_chunk`, `classify_candidates[_serial]`, `snapshot_hash_peek`). `mod.rs`: **2561 → 2173
+> LoC**. The apply/dispatch split + A2 (`sync_emit`/`recenter_window` test-mirror extraction) are
+> **left in `mod.rs` by design** — the verdict flagged them "murkier, optional": they reach
+> `BakeScheduler`'s private fields (`pending`, `ring_chunk_origin`, `bvh`, `emit_scratch`, …), so a
+> sibling module would just widen those to `pub(super)` for little cohesion gain. The 1400-line test
+> module stays in `mod.rs` (in-file convention; it drives the whole lifecycle). Submodules reach
+> shared types via `use super::*`; names re-imported so production + tests call them unqualified.
 
 - *Now:* 54% of the file is `mod tests` (1194-2587). Production mashes five concerns: window-diff
   geometry (207-415), `schedule_bakes` (417-620), classify (640-863), apply (703-1107), and the
