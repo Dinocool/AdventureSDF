@@ -166,7 +166,7 @@ fn compose_entry(entry_src: &str, file: &str) -> naga::Module {
 // is read from atlas_tex(g1,b0) + chunk_buf(g1,b2) + chunk_tile_buf(g1,b11) — auto layout pulls
 // in exactly the bindings soft_shadow touches.
 const SHADOW_WGSL: &str = r#"
-#import sdf::shadows::soft_shadow
+#import sdf::shadows::surface_shadow
 
 struct Pt { x: f32, y: f32, z: f32, pad: f32 };
 @group(0) @binding(1) var<storage, read> points: array<Pt>;
@@ -177,8 +177,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let i = gid.x;
     let p = vec3<f32>(points[i].x, points[i].y, points[i].z);
     let sun = normalize(vec3<f32>(0.3, 1.0, 0.2));
-    // mint, max_t, k as the live surface_shadow would pass for a ground hit.
-    vis[i] = soft_shadow(p + vec3<f32>(0.0, 1e-3, 0.0), sun, 0.05, 20.0, 8.0);
+    // Call the REAL renderer entry: it lifts the origin off the surface by geo_n*voxel (so the
+    // ground doesn't self-shadow), uses mint = vs*0.5 and k = 8. geo_n = (0,1,0) (ground top).
+    vis[i] = surface_shadow(p, vec3<f32>(0.0, 1.0, 0.0), sun, 0u, 20.0);
 }
 "#;
 
@@ -212,6 +213,10 @@ fn sdf_soft_shadow_vs_analytic_reference() {
     let config = SdfGridConfig {
         lod_count: 1,
         ring_bricks: 16,
+        // Coarse voxels: the sphere bakes blocky, so its shadow shows the brick-faceted
+        // silhouette artifact the live renderer has at coarse LOD / distant occluders — the case
+        // the fine LOD-0 default could NOT reproduce (boxiness ~0 there).
+        voxel_size: 0.2,
         ..Default::default()
     };
     let lod = 0u32;

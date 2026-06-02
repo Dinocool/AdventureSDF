@@ -119,8 +119,11 @@ fn sdf_eps() -> f32 { return camera.debug_params.z; }
 // surface is within a pixel — so far geometry resolves at coarse LOD instead of marching
 // down to LOD 0 (the vast-distance efficiency win).
 fn pixel_cone() -> f32 { return camera.march_params.x; }
-// march_params.y is reserved (was the LOD-0 analytic-cubic distance band, removed — the
-// cubic solver gave no measurable quality win over plain sphere-tracing).
+// march_params.y = soft-shadow penumbra hardness `k` (the IQ `min(k*d/t)` factor in
+// sdf::shadows). Lower = softer/wider penumbra, which blurs coarse-LOD brick faceting and
+// softens the penumbra→umbra edge. Editor "Shadow Softness" slider. 0 = unset (shader falls
+// back to the default in `surface_shadow`).
+fn shadow_softness() -> f32 { return camera.march_params.y; }
 // Sphere-trace over-relaxation factor (Keinert 2014): the march steps `over_relax * d`
 // instead of `d`, with a safe fallback when consecutive unbounding spheres separate.
 // 1.0 = plain sphere tracing; (1,2) accelerates convergence on grazing rays.

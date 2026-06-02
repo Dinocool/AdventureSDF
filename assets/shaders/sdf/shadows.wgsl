@@ -12,7 +12,7 @@
 // the empty-space DDA skip. Neither a near-surface step-floor change nor a coarse-LOD shadow floor
 // fixed them; an optimal approach is still TBD.
 
-#import sdf::bindings::{voxel_size_at, lod_count, DIST_BAND_VOXELS}
+#import sdf::bindings::{voxel_size_at, lod_count, DIST_BAND_VOXELS, shadow_softness}
 #import sdf::brick::{
     resolve_march,
     world_to_brick_lod,
@@ -99,5 +99,8 @@ fn soft_shadow(origin: vec3<f32>, light_dir: vec3<f32>, mint: f32, max_t: f32, k
 fn surface_shadow(hit_pos: vec3<f32>, geo_n: vec3<f32>, light_dir: vec3<f32>, lod: u32, max_t: f32) -> f32 {
     let vs = voxel_size_at(lod);
     let origin = hit_pos + geo_n * vs;
-    return soft_shadow(origin, light_dir, vs * 0.5, max_t, 8.0);
+    // Penumbra hardness from the editor "Shadow Softness" slider (march_params.y); fall back to
+    // 6 when the uniform is unset (0) — e.g. the shadow harness, which doesn't fill march_params.
+    let k = select(6.0, shadow_softness(), shadow_softness() > 0.0);
+    return soft_shadow(origin, light_dir, vs * 0.5, max_t, k);
 }
