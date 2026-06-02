@@ -43,42 +43,31 @@ pub mod bvh;
 pub mod chunk;
 #[cfg(feature = "editor")]
 pub mod debug;
+pub mod editor_camera;
 pub mod edits;
 pub mod gallery;
 pub mod gizmo;
 pub mod height;
 pub mod node_gizmos;
+pub mod overlays;
 pub mod picking;
 pub mod render;
 pub mod scatter;
 pub mod stress;
 pub mod textures;
+pub mod tower_field;
 
-use bevy::core_pipeline::prepass::DepthPrepass;
-use bevy::ecs::system::SystemParam;
-use bevy::input::mouse::{MouseMotion, MouseWheel};
 use bevy::prelude::*;
 
 use crate::scene_manager::AppScene;
 
-/// Gizmo config group for editor overlays (transform handles, bounds). Uses
-/// `depth_bias = -1.0` so overlays always draw on top of the SDF surface — the
-/// editor convention. Drawn via immediate-mode gizmos, not the SDF shader.
-#[derive(Default, Reflect, GizmoConfigGroup)]
-pub struct SdfOverlayGizmos;
-
-/// Gizmo config group for the editor ground grid. Separate from the overlay group
-/// so it keeps default depth (the SDF surface and geometry occlude grid lines
-/// behind them) rather than always drawing on top.
-#[derive(Default, Reflect, GizmoConfigGroup)]
-pub struct SdfGridGizmos;
-
-/// Gizmo config group for node editor glyphs (light suns, empty-node axes). Uses
-/// default depth (`depth_bias = 0.0`) so the SDF surface and other geometry occlude a
-/// glyph that sits behind them — unlike the always-on-top transform handles in
-/// [`SdfOverlayGizmos`].
-#[derive(Default, Reflect, GizmoConfigGroup)]
-pub struct SdfNodeGizmos;
+// The editor viewport cameras (orbit + free-fly) live in `editor_camera`, and the gizmo overlays in
+// `overlays`. Their public types are re-exported here so cross-module consumers keep the stable
+// `sdf_render::` path.
+pub use editor_camera::{
+    CameraInput, OrbitFocus, SdfCameraMode, SdfOrbitCamera, sync_orbit_camera_transform,
+};
+pub use overlays::{LodRingsVisible, SdfGridGizmos, SdfNodeGizmos, SdfOverlayGizmos};
 
 // --- Components ---
 
@@ -101,11 +90,6 @@ pub struct SdfCamera;
 /// without the resource type vanishing from the core build.
 #[derive(Resource, Default)]
 pub struct WireframeBoundsVisible(pub bool);
-
-/// Whether the per-LOD clipmap ring wire boxes are drawn (toggled with F8). Off by
-/// default so the overlay stays clean; see `draw_lod_rings`.
-#[derive(Resource, Default)]
-pub struct LodRingsVisible(pub bool);
 
 /// Diagnostic: world-space center + size of recently-baked bricks, each tagged with the time it
 /// was baked so the editor can FADE the wire box out over a few seconds. Lets you SEE which
@@ -208,95 +192,6 @@ impl Default for SdfRaymarchParams {
 #[derive(Resource, Default)]
 pub struct SdfSelection {
     pub entity: Option<Entity>,
-}
-
-/// Double-click-to-focus state for the orbit camera. `sdf_picking` records each
-/// left-click time to detect double-clicks; a double-click on a volume sets
-/// `target`, which `orbit_camera` eases `SdfOrbitCamera.target` toward.
-#[derive(Resource, Default)]
-pub struct OrbitFocus {
-    /// World point the orbit target is easing toward; cleared once reached.
-    pub target: Option<Vec3>,
-    /// Elapsed-seconds timestamp of the previous left-click (double-click detection).
-    last_click: f32,
-}
-
-// --- Orbit Camera ---
-
-#[derive(Resource)]
-pub struct SdfOrbitCamera {
-    pub target: Vec3,
-    pub distance: f32,
-    pub yaw: f32,
-    pub pitch: f32,
-}
-
-impl Default for SdfOrbitCamera {
-    fn default() -> Self {
-        Self {
-            target: Vec3::ZERO,
-            distance: 8.0,
-            yaw: 0.0,
-            pitch: 0.4,
-        }
-    }
-}
-
-impl SdfOrbitCamera {
-    /// Eye (camera) position for the current orbit parameters.
-    pub fn eye(&self) -> Vec3 {
-        self.target
-            + Vec3::new(
-                self.distance * self.yaw.cos() * self.pitch.cos(),
-                self.distance * self.pitch.sin(),
-                self.distance * self.yaw.sin() * self.pitch.cos(),
-            )
-    }
-
-    /// View transform (eye placed on the orbit sphere, looking at the target). Single
-    /// source for the orbit→transform mapping used by `orbit_camera`, focus easing, and
-    /// the immediate re-sync after a scene swap.
-    pub fn view_transform(&self) -> Transform {
-        Transform::from_translation(self.eye()).looking_at(self.target, Vec3::Y)
-    }
-}
-
-/// Apply the orbit resource to the SDF camera's transform right now. `orbit_camera` only
-/// runs while the pointer is in the viewport, so after a scene swap restores a per-scene
-/// camera we sync here — otherwise the view wouldn't update (it'd "jump" later, once the
-/// cursor re-enters the viewport).
-pub fn sync_orbit_camera_transform(world: &mut World) {
-    let transform = world.resource::<SdfOrbitCamera>().view_transform();
-    let mut query = world.query_filtered::<&mut Transform, With<SdfCamera>>();
-    for mut t in query.iter_mut(world) {
-        *t = transform;
-    }
-}
-
-/// SDF editor camera mode. Default is the orbit camera; the viewport toolbar toggles
-/// `fps` to switch to a free-fly (WASD + mouse-look) camera, useful for flying out
-/// across the km-scale clipmap terrain instead of orbiting a point.
-#[derive(Resource)]
-pub struct SdfCameraMode {
-    /// True = free-fly (FPS) camera; false = orbit camera.
-    pub fps: bool,
-    /// Free-fly yaw/pitch (radians). Seeded from the orbit camera on each toggle so the
-    /// view doesn't jump.
-    pub yaw: f32,
-    pub pitch: f32,
-    /// Movement speed in world units/second (adjustable with the mouse wheel in FPS).
-    pub speed: f32,
-}
-
-impl Default for SdfCameraMode {
-    fn default() -> Self {
-        Self {
-            fps: false,
-            yaw: 0.0,
-            pitch: 0.0,
-            speed: 15.0,
-        }
-    }
 }
 
 // --- Grid Config ---
@@ -491,8 +386,8 @@ impl Plugin for SdfScenePlugin {
             // table re-uploads via change detection.
             // The viewport camera persists across scene-state transitions (editor infra),
             // spawned once at startup and activated only while in the SDF editor.
-            .add_systems(Startup, spawn_editor_camera)
-            .add_systems(Update, sync_editor_camera_active)
+            .add_systems(Startup, editor_camera::spawn_editor_camera)
+            .add_systems(Update, editor_camera::sync_editor_camera_active)
             .add_systems(
                 OnEnter(AppScene::SdfEditor),
                 (setup_sdf_scene, load_default_gallery).chain(),
@@ -502,8 +397,8 @@ impl Plugin for SdfScenePlugin {
             .add_systems(
                 Update,
                 (
-                    orbit_camera.run_if(|m: Res<SdfCameraMode>| !m.fps),
-                    fps_camera.run_if(|m: Res<SdfCameraMode>| m.fps),
+                    editor_camera::orbit_camera.run_if(|m: Res<SdfCameraMode>| !m.fps),
+                    editor_camera::fps_camera.run_if(|m: Res<SdfCameraMode>| m.fps),
                 )
                     .run_if(in_state(AppScene::SdfEditor))
                     .run_if(|allowed: Res<ViewportInputAllowed>| allowed.0),
@@ -513,7 +408,7 @@ impl Plugin for SdfScenePlugin {
             // viewport. NOT gated on ViewportInputAllowed (unlike orbit_camera).
             .add_systems(
                 Update,
-                ease_orbit_focus
+                editor_camera::ease_orbit_focus
                     .run_if(in_state(AppScene::SdfEditor))
                     .run_if(|m: Res<SdfCameraMode>| !m.fps),
             )
@@ -582,17 +477,17 @@ impl Plugin for SdfScenePlugin {
             app.init_gizmo_group::<SdfOverlayGizmos>()
                 .init_gizmo_group::<SdfGridGizmos>()
                 .init_gizmo_group::<SdfNodeGizmos>()
-                .add_systems(OnEnter(AppScene::SdfEditor), configure_overlay_gizmos)
+                .add_systems(OnEnter(AppScene::SdfEditor), overlays::configure_overlay_gizmos)
                 .add_systems(
                     Update,
-                    (draw_ground_grid, gizmo::draw_gizmo)
+                    (overlays::draw_ground_grid, gizmo::draw_gizmo)
                         .run_if(in_state(AppScene::SdfEditor)),
                 )
                 // LOD ring overlay: only while the toggle is on (LodRingsVisible, F8),
                 // so it doesn't clutter the normal view.
                 .add_systems(
                     Update,
-                    draw_lod_rings
+                    overlays::draw_lod_rings
                         .run_if(in_state(AppScene::SdfEditor))
                         .run_if(|v: Res<LodRingsVisible>| v.0),
                 );
@@ -624,65 +519,6 @@ fn setup_sdf_scene(mut asset_table: ResMut<crate::assets::MaterialAssetTable>) {
     // loaded edit entities exist and the BVH can be built from them.
 }
 
-/// Spawn the persistent editor viewport camera ONCE at startup. It is the single rendering
-/// [`SdfCamera`] (the whole raymarch/interaction pipeline assumes exactly one), marked
-/// [`EditorEntity`] + [`NonSerializable`] so it survives scene loads/switches and never
-/// lands in a `.scene`. It starts inactive; `sync_editor_camera_active` enables it only
-/// while in the SDF editor so it doesn't fight the AdventureGame / WireframeTest cameras.
-/// Guarded so a hot-reload / re-run can't double-spawn it.
-fn spawn_editor_camera(mut commands: Commands, existing: Query<(), With<SdfCamera>>) {
-    if !existing.is_empty() {
-        return;
-    }
-    let orbit = SdfOrbitCamera::default();
-    let pos = orbit.target
-        + Vec3::new(
-            orbit.distance * orbit.yaw.cos() * orbit.pitch.cos(),
-            orbit.distance * orbit.pitch.sin(),
-            orbit.distance * orbit.yaw.sin() * orbit.pitch.cos(),
-        );
-    commands.spawn((
-        Camera3d::default(),
-        // Inactive until in the SDF editor scene (see `sync_editor_camera_active`), so the
-        // persistent editor camera doesn't fight other scenes' cameras.
-        Camera {
-            is_active: false,
-            ..default()
-        },
-        // HDR so the view target is linear Rgba16Float and Bevy's Tonemapping pass converts
-        // (linear→sRGB) for display. The SDF shader then writes LINEAR radiance, which lets the
-        // SSR history buffer hold correct linear values for the reflection IBL term. In Bevy
-        // 0.18 `hdr` is the `Hdr` marker component (was `Camera.hdr`).
-        bevy::render::view::Hdr,
-        Transform::from_translation(pos).looking_at(orbit.target, Vec3::Y),
-        Msaa::Off,
-        SdfCamera,
-        // Target for the filled gizmo overlay (gizmo_render).
-        crate::gizmo_render::GizmoCamera,
-        DepthPrepass,
-        crate::scene_manager::EditorEntity,
-        crate::soul_scene::NonSerializable,
-        crate::node::Node3D,
-        Name::new("Editor Camera"),
-    ));
-    commands.insert_resource(orbit);
-}
-
-/// Activate the editor camera only while in the SDF editor scene. Other app scenes
-/// (AdventureGame, WireframeTest) render their own cameras; deactivating ours keeps exactly
-/// one active camera per window across state transitions.
-fn sync_editor_camera_active(
-    state: Res<State<crate::scene_manager::AppScene>>,
-    mut cam: Query<&mut Camera, With<SdfCamera>>,
-) {
-    if let Ok(mut cam) = cam.single_mut() {
-        let want = *state.get() == crate::scene_manager::AppScene::SdfEditor;
-        if cam.is_active != want {
-            cam.is_active = want;
-        }
-    }
-}
-
 /// Path to the editor's default scene (the stress tower-field — heavy SDF load, used while
 /// profiling/optimizing the raymarch). The PBR gallery lives at `assets/scenes/gallery.scene`
 /// and can be loaded manually.
@@ -711,189 +547,6 @@ fn load_default_gallery(world: &mut World) {
         }
         sync_orbit_camera_transform(world);
     }
-}
-
-// --- Orbit Camera ---
-
-/// The raw per-frame input the editor cameras share: mouse buttons, keyboard, frame
-/// time, and the mouse-motion / scroll message readers. Bundled so both camera
-/// systems (and any future view tool) take one param instead of repeating the same
-/// five reads.
-#[derive(SystemParam)]
-pub struct CameraInput<'w, 's> {
-    pub mouse: Res<'w, ButtonInput<MouseButton>>,
-    pub keyboard: Res<'w, ButtonInput<KeyCode>>,
-    pub time: Res<'w, Time>,
-    pub motion: MessageReader<'w, 's, MouseMotion>,
-    pub scroll: MessageReader<'w, 's, MouseWheel>,
-}
-
-/// Godot-style editor camera: middle-mouse orbits, Shift+middle pans, wheel zooms.
-/// The camera transform is recomputed every frame so zoom/pan take effect
-/// immediately (the previous version only rebuilt it while orbiting, so scroll
-/// appeared to do nothing until you dragged).
-fn orbit_camera(
-    mut orbit: ResMut<SdfOrbitCamera>,
-    mut focus: ResMut<OrbitFocus>,
-    mut input: CameraInput,
-    mut camera_query: Query<&mut Transform, (With<SdfCamera>, Without<SdfVolume>)>,
-) {
-    // Wheel zoom (dolly toward/away from the target). Hold Shift for 10x coarse zoom.
-    let zoom_step = if input.keyboard.pressed(KeyCode::ShiftLeft)
-        || input.keyboard.pressed(KeyCode::ShiftRight)
-    {
-        5.0
-    } else {
-        0.5
-    };
-    for ev in input.scroll.read() {
-        orbit.distance = (orbit.distance - ev.y * zoom_step).clamp(0.5, 50.0);
-    }
-
-    let orbiting = input.mouse.pressed(MouseButton::Middle);
-    let panning = orbiting
-        && (input.keyboard.pressed(KeyCode::ShiftLeft)
-            || input.keyboard.pressed(KeyCode::ShiftRight));
-
-    if orbiting {
-        // Basis vectors of the current view for screen-space panning.
-        let dir = Vec3::new(
-            orbit.yaw.cos() * orbit.pitch.cos(),
-            orbit.pitch.sin(),
-            orbit.yaw.sin() * orbit.pitch.cos(),
-        );
-        let right = dir.cross(Vec3::Y).normalize_or_zero();
-        let up = right.cross(dir).normalize_or_zero();
-
-        for ev in input.motion.read() {
-            if panning {
-                // Shift+MMB: pan the target across the view plane (scaled by distance
-                // so the world tracks the cursor at any zoom).
-                let pan = orbit.distance * 0.0015;
-                orbit.target += -right * ev.delta.x * pan + up * ev.delta.y * pan;
-                // Manual pan overrides any in-progress double-click focus ease.
-                focus.target = None;
-            } else {
-                // MMB: orbit yaw/pitch.
-                orbit.yaw -= ev.delta.x * 0.005;
-                orbit.pitch = (orbit.pitch + ev.delta.y * 0.005).clamp(-1.4, 1.4);
-            }
-        }
-    } else {
-        input.motion.clear();
-    }
-
-    // Always recompute so zoom/pan/orbit all apply immediately.
-    let view = orbit.view_transform();
-    for mut transform in &mut camera_query {
-        *transform = view;
-    }
-}
-
-/// Ease the orbit target toward a double-click focus point and recompute the camera
-/// transform. Separate from `orbit_camera` (and NOT gated on `ViewportInputAllowed`)
-/// so a focus triggered from a dock panel — e.g. double-clicking a Hierarchy row —
-/// animates immediately, instead of stalling until the pointer re-enters the
-/// viewport. Orbit-mode only; the FPS camera ignores the orbit target.
-fn ease_orbit_focus(
-    mut orbit: ResMut<SdfOrbitCamera>,
-    mut focus: ResMut<OrbitFocus>,
-    time: Res<Time>,
-    mut camera_query: Query<&mut Transform, (With<SdfCamera>, Without<SdfVolume>)>,
-) {
-    let Some(dest) = focus.target else {
-        return;
-    };
-
-    // Exponential smoothing (frame-rate independent); snap + clear once we're close.
-    let t = 1.0 - (-12.0 * time.delta_secs()).exp();
-    orbit.target = orbit.target.lerp(dest, t);
-    if orbit.target.distance(dest) < 0.01 {
-        orbit.target = dest;
-        focus.target = None;
-    }
-
-    let view = orbit.view_transform();
-    for mut transform in &mut camera_query {
-        *transform = view;
-    }
-}
-
-/// Free-fly (FPS) camera for the SDF editor: hold right mouse to look, WASD to move,
-/// Space/Ctrl for up/down, wheel adjusts speed. Lets you fly out across the km-scale
-/// clipmap terrain. Active only when `SdfCameraMode.fps` is set (the viewport toolbar
-/// toggle); the orbit camera is disabled in that mode so they don't fight.
-fn fps_camera(
-    mut mode: ResMut<SdfCameraMode>,
-    mut orbit: ResMut<SdfOrbitCamera>,
-    mut input: CameraInput,
-    mut camera_query: Query<&mut Transform, (With<SdfCamera>, Without<SdfVolume>)>,
-) {
-    // Wheel adjusts fly speed (exponential feel), clamped to a sane range.
-    for ev in input.scroll.read() {
-        mode.speed = (mode.speed * (1.0 + ev.y * 0.1)).clamp(1.0, 500.0);
-    }
-
-    // Mouse-look only while holding right mouse (so panel clicks don't spin the view).
-    let looking = input.mouse.pressed(MouseButton::Right);
-    if looking {
-        for ev in input.motion.read() {
-            mode.yaw += ev.delta.x * 0.003;
-            mode.pitch = (mode.pitch - ev.delta.y * 0.003)
-                .clamp(-std::f32::consts::FRAC_PI_2 + 0.01, std::f32::consts::FRAC_PI_2 - 0.01);
-        }
-    } else {
-        input.motion.clear();
-    }
-
-    let forward = Vec3::new(
-        mode.yaw.cos() * mode.pitch.cos(),
-        mode.pitch.sin(),
-        mode.yaw.sin() * mode.pitch.cos(),
-    )
-    .normalize_or_zero();
-    let right = forward.cross(Vec3::Y).normalize_or_zero();
-    let up = Vec3::Y;
-
-    let mut dir = Vec3::ZERO;
-    if input.keyboard.pressed(KeyCode::KeyW) {
-        dir += forward;
-    }
-    if input.keyboard.pressed(KeyCode::KeyS) {
-        dir -= forward;
-    }
-    if input.keyboard.pressed(KeyCode::KeyD) {
-        dir += right;
-    }
-    if input.keyboard.pressed(KeyCode::KeyA) {
-        dir -= right;
-    }
-    if input.keyboard.pressed(KeyCode::Space) {
-        dir += up;
-    }
-    if input.keyboard.pressed(KeyCode::ControlLeft) || input.keyboard.pressed(KeyCode::ControlRight)
-    {
-        dir -= up;
-    }
-
-    let Some(mut transform) = camera_query.iter_mut().next() else {
-        return;
-    };
-
-    let mut pos = transform.translation;
-    if dir != Vec3::ZERO {
-        let mut speed = mode.speed;
-        if input.keyboard.pressed(KeyCode::ShiftLeft) || input.keyboard.pressed(KeyCode::ShiftRight)
-        {
-            speed *= 3.0; // sprint
-        }
-        pos += dir.normalize() * speed * input.time.delta_secs();
-    }
-    *transform = Transform::from_translation(pos).looking_at(pos + forward, Vec3::Y);
-
-    // Keep the orbit camera's target tracking in front of us, so toggling back to orbit
-    // resumes smoothly around what we're looking at rather than snapping to the origin.
-    orbit.target = pos + forward * orbit.distance;
 }
 
 // --- Picking ---
@@ -1102,119 +755,6 @@ fn focus_on_double_click(
         && let Ok(transform) = volumes.get(entity)
     {
         focus.target = Some(transform.translation);
-    }
-}
-
-/// Push the overlay gizmo group in front of everything (always-on-top handles).
-fn configure_overlay_gizmos(mut store: ResMut<GizmoConfigStore>) {
-    let (config, _) = store.config_mut::<SdfOverlayGizmos>();
-    config.depth_bias = -1.0;
-    config.line.width = 3.0;
-
-    // Grid uses default depth (occluded by geometry) and thin lines.
-    let (grid, _) = store.config_mut::<SdfGridGizmos>();
-    grid.depth_bias = 0.0;
-    grid.line.width = 1.0;
-
-    // Node glyphs (light suns, empties) depth-test against the SDF surface: a glyph
-    // behind geometry is occluded, so it reads as being in the scene.
-    let (nodes, _) = store.config_mut::<SdfNodeGizmos>();
-    nodes.depth_bias = 0.0;
-    nodes.line.width = 2.0;
-}
-
-/// Draw a Godot-style infinite ground grid on the XZ plane: faint minor lines
-/// every unit, brighter major lines every `MAJOR` units, and colored X (red) /
-/// Z (blue) axis lines through the origin. Centred on the camera target snapped to
-/// the grid so it reads as infinite as the view pans.
-fn draw_ground_grid(mut gizmos: Gizmos<SdfGridGizmos>, orbit: Res<SdfOrbitCamera>) {
-    const HALF: i32 = 50; // lines each side of centre
-    const STEP: f32 = 1.0; // grid spacing in world units (Godot-style 1m cells)
-    let step = STEP;
-
-    let minor = Color::srgba(0.35, 0.35, 0.38, 0.5);
-    let major = Color::srgba(0.55, 0.55, 0.60, 0.8);
-    let x_axis = Color::srgb(0.86, 0.24, 0.24);
-    let z_axis = Color::srgb(0.26, 0.49, 0.92);
-
-    // Snap the grid centre to the target so lines stay put as the camera orbits.
-    let cx = (orbit.target.x / step).round() as i32;
-    let cz = (orbit.target.z / step).round() as i32;
-    let extent = HALF as f32 * step;
-
-    for i in -HALF..=HALF {
-        let gx = cx + i;
-        let gz = cz + i;
-        let wx = gx as f32 * step;
-        let wz = gz as f32 * step;
-
-        // Line parallel to Z at x = wx. At gx == 0 this lies on the Z axis (blue).
-        let color = line_color(gx, z_axis, major, minor);
-        gizmos.line(
-            Vec3::new(wx, 0.0, cz as f32 * step - extent),
-            Vec3::new(wx, 0.0, cz as f32 * step + extent),
-            color,
-        );
-        // Line parallel to X at z = wz. At gz == 0 this lies on the X axis (red).
-        let color = line_color(gz, x_axis, major, minor);
-        gizmos.line(
-            Vec3::new(cx as f32 * step - extent, 0.0, wz),
-            Vec3::new(cx as f32 * step + extent, 0.0, wz),
-            color,
-        );
-    }
-}
-
-
-/// Pick a grid line's colour: the axis colour at index 0 (the origin line), else a
-/// major or minor tone depending on divisibility by `MAJOR`.
-fn line_color(index: i32, axis: Color, major: Color, minor: Color) -> Color {
-    const MAJOR: i32 = 10;
-    if index == 0 {
-        axis
-    } else if index % MAJOR == 0 {
-        major
-    } else {
-        minor
-    }
-}
-
-/// Draw each LOD clipmap ring's world-AABB as a wire box, colour-matched to the
-/// `SDF_DEBUG_LOD` shader ramp (green = fine/near, red = coarse/far). Makes the nested
-/// ring extents and their camera-centred recentering directly visible. Derives each box from
-/// `bake_scheduler::ring_chunk_origin` — the SAME snapped chunk-space origin the bake centres each
-/// ring on (with `recenter_snap_chunks` hysteresis) — so the boxes track the actual resident set.
-fn draw_lod_rings(
-    mut gizmos: Gizmos<SdfOverlayGizmos>,
-    config: Res<SdfGridConfig>,
-    camera: Query<&Transform, (With<SdfCamera>, Without<SdfVolume>)>,
-) {
-    let Some(cam) = camera.iter().next() else {
-        return;
-    };
-    let cam_pos = cam.translation;
-
-    for lod in 0..config.lod_count {
-        let origin_chunk = bake_scheduler::ring_chunk_origin(&config, cam_pos, lod);
-        let min = chunk::chunk_min_world(chunk::ChunkKey::new(lod, origin_chunk), &config);
-        // The ring spans `ring_bricks` bricks per axis at this LOD's voxel size.
-        let extent = Vec3::splat(config.brick_world_size(lod) * config.ring_bricks as f32);
-        let center = min + extent * 0.5;
-
-        // Discrete colours matching the SDF_DEBUG_LOD shader: 0 white, 1 green,
-        // 2 blue, 3 red, 4+ yellow.
-        let color = match lod {
-            0 => Color::srgb(1.0, 1.0, 1.0),
-            1 => Color::srgb(0.0, 1.0, 0.0),
-            2 => Color::srgb(0.0, 0.4, 1.0),
-            3 => Color::srgb(1.0, 0.0, 0.0),
-            _ => Color::srgb(1.0, 1.0, 0.0),
-        };
-        gizmos.primitive_3d(
-            &Cuboid::new(extent.x, extent.y, extent.z),
-            Isometry3d::from_translation(center),
-            color,
-        );
     }
 }
 

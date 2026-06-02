@@ -261,7 +261,7 @@ genuine friction point, not speculatively. **Don't split `chunk.rs`** (X3).
   production submodules (the survey misassigned them). Verify zero clippy warnings after the
   visibility widening.
 
-### [ ] M3. Extract the editor camera + gizmo overlays out of `sdf_render/mod.rs` (1264 LoC)
+### [x] M3. Extract the editor camera + gizmo overlays out of `sdf_render/mod.rs` (1264 LoC)
 `impact: medium` * `effort: medium` * `source: modularization`
 
 - *Now:* `mod.rs` is the module front door (plugin, components, `SdfGridConfig`, re-exports) but also
@@ -276,7 +276,7 @@ genuine friction point, not speculatively. **Don't split `chunk.rs`** (X3).
   (invariant #4). Picking (`sdf_picking`/`pick_sdf_volume`) is borderline -- could go to a
   `selection.rs` or stay. Combine with D4 (it touches `draw_lod_rings`).
 
-### [ ] M4. Move the tower/scatter stress-scene generator out of `edits.rs`
+### [x] M4. Move the tower/scatter stress-scene generator out of `edits.rs`
 `impact: medium` * `effort: small` * `source: modularization`
 
 - *Now:* `edits.rs:365-517` (`TowerRole`, `TowerEdit`, `TowerFieldParams`, `tower_field_edits`,
