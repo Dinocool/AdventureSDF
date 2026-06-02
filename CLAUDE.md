@@ -6,7 +6,7 @@
 - Engine: Bevy 0.18
 - Physics: bevy_rapier3d 0.34
 - BRP: bevy_brp_extras 0.18
-- Modules: `camera`, `combat`, `inventory`, `networking`, `player`, `scene_manager`, `sdf_render`, `soul_scene`, `ui`, `world` (+ `editor`, feature-gated)
+- Modules: `assets`, `camera`, `combat`, `gizmo_render`, `inventory`, `networking`, `node`, `player`, `scene_manager`, `sdf_render`, `soul_scene`, `ui`, `world` (+ `editor`, feature-gated)
 
 ## Build & Run
 
@@ -34,14 +34,19 @@ src/
   scene_manager.rs    — SceneManagerPlugin: ESC menu, scene switching
   sdf_render/mod.rs   — SdfScenePlugin: SDF voxel editor (+ GizmoEditState: gizmo mode/snap)
   sdf_render/render.rs— SdfRenderPlugin: render-graph node (registered SEPARATELY in main.rs)
+  node/mod.rs         — NodePlugin: Godot-style scene-node tree (SceneNode/Node3D/EditorGizmo)
+  gizmo_render/mod.rs — GizmoRenderPlugin: filled 2D-overlay gizmo renderer
+  assets/mod.rs       — AssetsPlugin: material / PBR asset compile pipeline
   soul_scene/         — SoulScenePlugin: custom `.scene` format (nested instances + overrides)
   editor/             — EditorPlugin: soul-engine egui_dock editor shell (feature "editor" only)
   test_utils.rs       — shared test helpers
 ```
 
-All plugins are structs implementing `Plugin`, registered in `main.rs`. Render
-sub-plugins (`SdfRenderPlugin`) and feature-gated plugins (`EditorPlugin`) are
-added in their own blocks — see `main.rs`.
+All plugins are structs implementing `Plugin`, registered in `main.rs` (incl.
+`NodePlugin`, `GizmoRenderPlugin`, `AssetsPlugin`). The render sub-plugin
+`SdfRenderPlugin` and feature-gated `EditorPlugin` are added in their own blocks
+— see `main.rs`. (Note: `GizmoRenderPlugin` is currently also lazily self-installed
+from `SdfScenePlugin` — see `docs/REFACTOR_ROADMAP.md` X2.)
 
 ---
 

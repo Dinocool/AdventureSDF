@@ -786,8 +786,6 @@ pub fn fold_csg(edits: &[ResolvedEdit], pos: Vec3) -> EditSample {
     }
 }
 
-/// Signed distance of the folded CSG stack at `pos`, evaluating only the edits at
-/// `indices` (into the already-`SdfOrder`-sorted `edits`). Same fold rules as
 /// Content hash of the edits a brick folds — its bake-cache key. A brick re-bakes IFF this
 /// changes, so a brick whose folded edits are untouched (e.g. a heightmap brick when a distant
 /// sphere moves) keeps its cached texels even though SOME edit in the world changed. This is the
@@ -830,8 +828,11 @@ pub fn quantize(v: f32) -> i64 {
     (v as f64 * 1.0e4).round() as i64
 }
 
-/// [`fold_csg`] but distance-only and allocation-free — for the narrow-band interior
-/// cull, which folds at one point per candidate brick without cloning the edit subset.
+/// [`fold_csg`] but distance-only and allocation-free, evaluating only the edits at `indices`
+/// (into the already-`SdfOrder`-sorted `edits`) — for the narrow-band interior cull, which folds at
+/// one point per candidate brick without cloning the edit subset. A deliberate mirror of
+/// [`fold_csg`]'s sign rules (Union = `smin`, Subtract = `smax(-dn)`, Intersect = `smax`); the two
+/// MUST stay in agreement — a regression test pins them, since this one drops the material branch.
 pub fn fold_csg_dist_indexed(edits: &[ResolvedEdit], indices: &[u32], pos: Vec3) -> f32 {
     let mut acc = f32::MAX;
     let mut started = false;

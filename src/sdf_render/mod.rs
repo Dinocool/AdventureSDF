@@ -361,9 +361,6 @@ impl SdfGridConfig {
     pub fn cell_stride(&self) -> i32 {
         (self.brick_size - 1) as i32
     }
-    pub fn bricks_per_axis(&self) -> u32 {
-        self.grid_size / (self.brick_size - 1)
-    }
     pub fn world_extent(&self) -> f32 {
         self.grid_size as f32 * self.voxel_size
     }
@@ -429,17 +426,6 @@ impl SdfGridConfig {
     }
 
     // Chunk addressing (absolute keys, sparse occupancy) lives in `super::chunk`.
-
-    /// Compute linear brick ID from a brick origin coordinate (single-resolution,
-    /// level-0). Kept for the non-LOD path.
-    pub fn brick_id(&self, coord: IVec3) -> u32 {
-        let bpa = self.bricks_per_axis();
-        let s = self.cell_stride();
-        let bx = (coord.x / s) as u32;
-        let by = (coord.y / s) as u32;
-        let bz = (coord.z / s) as u32;
-        bz * bpa * bpa + by * bpa + bx
-    }
 }
 
 // --- Plugin ---
@@ -560,9 +546,7 @@ impl Plugin for SdfScenePlugin {
             )
             .add_systems(
                 Update,
-                (upload_sdf_buffers, toggle_sdf_render)
-                    .chain()
-                    .run_if(in_state(AppScene::SdfEditor)),
+                toggle_sdf_render.run_if(in_state(AppScene::SdfEditor)),
             );
 
         // Overlay gizmos (ground grid + bounds) need GizmoPlugin (Assets<GizmoAsset>).
@@ -1176,8 +1160,9 @@ fn line_color(index: i32, axis: Color, major: Color, minor: Color) -> Color {
 
 /// Draw each LOD clipmap ring's world-AABB as a wire box, colour-matched to the
 /// `SDF_DEBUG_LOD` shader ramp (green = fine/near, red = coarse/far). Makes the nested
-/// ring extents and their camera-centred recentering directly visible. Uses the same
-/// `ring_origin` math the bake centres each ring on, so the boxes track the resident set.
+/// ring extents and their camera-centred recentering directly visible. Derives each box from
+/// `bake_scheduler::ring_chunk_origin` — the SAME snapped chunk-space origin the bake centres each
+/// ring on (with `recenter_snap_chunks` hysteresis) — so the boxes track the actual resident set.
 fn draw_lod_rings(
     mut gizmos: Gizmos<SdfOverlayGizmos>,
     config: Res<SdfGridConfig>,
@@ -1189,8 +1174,8 @@ fn draw_lod_rings(
     let cam_pos = cam.translation;
 
     for lod in 0..config.lod_count {
-        let origin = config.ring_origin(cam_pos, lod);
-        let min = config.brick_min_world(origin, lod);
+        let origin_chunk = bake_scheduler::ring_chunk_origin(&config, cam_pos, lod);
+        let min = chunk::chunk_min_world(chunk::ChunkKey::new(lod, origin_chunk), &config);
         // The ring spans `ring_bricks` bricks per axis at this LOD's voxel size.
         let extent = Vec3::splat(config.brick_world_size(lod) * config.ring_bricks as f32);
         let center = min + extent * 0.5;
@@ -1210,12 +1195,6 @@ fn draw_lod_rings(
             color,
         );
     }
-}
-
-// --- Upload to GPU (placeholder — render.rs handles actual upload) ---
-
-fn upload_sdf_buffers(_atlas: Res<atlas::SdfAtlas>) {
-    // Render world will pick up atlas changes via extract
 }
 
 /// Clear the incremental chunk-table delta record (dirty rows/slots/sentinel) accumulated last

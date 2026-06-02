@@ -945,7 +945,6 @@ fn apply_verdicts(
         }
         i = j;
     }
-    atlas.last_bake_was_full = false;
 }
 
 /// Build the `hash_peek` snapshot: each candidate's resident `baked_hash` (absent → not resident).

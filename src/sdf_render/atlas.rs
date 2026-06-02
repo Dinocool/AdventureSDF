@@ -142,9 +142,6 @@ pub struct SdfAtlas {
     /// texels live in the atlas texture and survives across bakes so the GPU bake node
     /// targets the right sub-rect.
     pub tiles: TileAllocator,
-    /// True when the atlas must grow this frame (the GPU bake never shrinks it). The render
-    /// world reads this as the grow signal; currently set indirectly via the tile high-water.
-    pub last_bake_was_full: bool,
     /// Tiles whose texels the GPU compute bake fills this frame. The render world reads these
     /// so it knows which tiles the bake node will write; the CPU holds only a palette-only
     /// placeholder for them. Cleared each frame at the start of `schedule_bakes`.
@@ -165,7 +162,6 @@ impl Default for SdfAtlas {
             generation: 0,
             topology_generation: 0,
             tiles: TileAllocator::default(),
-            last_bake_was_full: false,
             gpu_baked_tiles: HashSet::new(),
             live_chunks: super::chunk::LiveChunkTables::default(),
         }
@@ -389,21 +385,6 @@ pub fn coord_in_window(config: &super::SdfGridConfig, coord: IVec3, origin: IVec
         && rel.z < r * stride
 }
 
-/// All candidate brick keys across every LOD ring centred on `camera_pos`. The ring at
-/// level `L` is a `ring_bricks³` window of stride-aligned coords on that level's
-/// lattice, starting at `config.ring_origin`. These are *candidates*; the per-brick BVH
-/// cull decides which actually get baked (sparsity).
-pub fn ring_brick_keys(config: &super::SdfGridConfig, camera_pos: Vec3) -> Vec<BrickKey> {
-    let mut keys = Vec::new();
-    for lod in 0..config.lod_count {
-        let origin = config.ring_origin(camera_pos, lod);
-        for coord in ring_window_coords(config, origin) {
-            keys.push(BrickKey::new(lod, coord));
-        }
-    }
-    keys
-}
-
 /// Conservative AABB-vs-AABB overlap (touching faces count). Used to refine the BVH's
 /// over-returned per-brick candidate set down to edits whose own box reaches the brick.
 fn aabb_overlaps(a: &Aabb3d, b: &Aabb3d) -> bool {
@@ -414,42 +395,6 @@ fn aabb_overlaps(a: &Aabb3d, b: &Aabb3d) -> bool {
         && a.min.z <= b.max.z
         && a.max.z >= b.min.z
 }
-
-/// Brick keys (at LOD `lod`) that an edit with tight world `aabb` can affect. The AABB
-/// is grown by [`SNORM_CLAMP_DIST`] — the edit's true bake footprint — then padded by a
-/// brick (so an edit centred anywhere in its origin brick stays covered). Using the
-/// SAME footprint here as the bake's per-brick BVH cull is what keeps the incremental
-/// dirty set complete: a moved edit re-dirties every brick that folds it, leaving no
-/// stale texels behind. Clamped to the LOD ring so the dirty set never includes bricks
-/// outside the resident window.
-pub fn bricks_in_aabb_lod(
-    config: &super::SdfGridConfig,
-    aabb: &Aabb3d,
-    lod: u32,
-    ring_origin: IVec3,
-) -> Vec<BrickKey> {
-    let stride = config.cell_stride();
-    let r = config.ring_bricks as i32;
-    let reach = Vec3::splat(SNORM_CLAMP_DIST);
-    let lo = config.world_to_brick_lod(Vec3::from(aabb.min) - reach, lod);
-    let hi = config.world_to_brick_lod(Vec3::from(aabb.max) + reach, lod);
-
-    let ring_max = ring_origin + IVec3::splat(r * stride);
-    let min_brick = (lo - IVec3::splat(stride)).max(ring_origin);
-    let max_brick = (hi + IVec3::splat(2 * stride)).min(ring_max);
-
-    let step = stride as usize;
-    let mut keys = Vec::new();
-    for z in (min_brick.z..max_brick.z).step_by(step) {
-        for y in (min_brick.y..max_brick.y).step_by(step) {
-            for x in (min_brick.x..max_brick.x).step_by(step) {
-                keys.push(BrickKey::new(lod, IVec3::new(x, y, z)));
-            }
-        }
-    }
-    keys
-}
-
 
 #[cfg(test)]
 mod tests {

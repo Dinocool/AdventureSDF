@@ -256,9 +256,10 @@ struct ChunkEntry {
 }
 
 /// Incrementally-maintained chunk lookup + tile-run table, kept on [`SdfAtlas`]. Mirrors what
-/// [`build_chunk_tables`] produces (sorted `chunks` row order, per-chunk tile runs), but each
-/// `insert`/`remove` updates only its own chunk and records the delta in the dirty fields so the
-/// render world uploads just the changed rows/regions instead of recreating both buffers.
+/// [`build_chunk_tables`] produces (a dense per-LOD toroidal directory + per-chunk tile runs), but
+/// each `insert`/`remove` updates only its own directory slot and records the delta in the dirty
+/// fields so the render world uploads just the changed slots/regions instead of recreating both
+/// buffers.
 #[derive(Default)]
 pub struct LiveChunkTables {
     slots: ChunkSlotAllocator,
@@ -850,12 +851,13 @@ mod tests {
     }
 
     /// THE end-to-end differential guard: drive a long randomized set/clear churn through the
-    /// incremental table + its DELTA-UPLOAD protocol (mirroring `render.rs` exactly — full rebuild
-    /// on a capacity grow, else dirty-row / dirty-slot writes + sentinel tail), and after EVERY
-    /// frame resolve every resident brick through the shader's binary-search + popcount unpack. A
-    /// desync anywhere (dense packing, row shift, slot reuse, the shrink OOB, or an over-blanked
-    /// tail from an add-after-remove) maps a brick to the wrong tile or drops it — the corruption
-    /// class that revert proved was in this rework. Deterministic xorshift, no GPU needed.
+    /// incremental table + its DELTA-UPLOAD protocol (mirroring `render.rs` exactly — the
+    /// fixed-size directory is sized once, then every frame writes only the dirty directory slots +
+    /// tile-run regions in place), and after EVERY frame resolve every resident brick through the
+    /// shader's direct-index tag-check + popcount unpack. A desync anywhere (a directory slot left
+    /// pointing at a departed chunk, a stale occupancy bit, slot reuse, or a missing sentinel on an
+    /// add-after-remove in the same cycle) maps a brick to the wrong tile or drops it — the
+    /// corruption class that revert proved was in this rework. Deterministic xorshift, no GPU needed.
     #[test]
     fn live_delta_upload_matches_ground_truth_under_churn() {
         use std::collections::HashMap;
@@ -899,13 +901,13 @@ mod tests {
             Some(tiles[(c.tile_run_base + off) as usize])
         };
 
-        // Small coord space (≤128 chunks) → heavy row shifting + slot free/reuse, the camera-move
-        // stress that surfaced the bugs.
+        // Small coord space (≤128 chunks) → heavy toroidal slot reuse + tile-run free/reuse, the
+        // camera-move stress that surfaced the bugs.
         let span = 4u64;
         for frame in 0u32..4000 {
             // A real bake frame applies MANY set/clear ops before one upload (one dirty cycle), so
-            // a remove and an add routinely coexist in the same cycle — the case that would
-            // over-blank the sentinel tail if `sentinel_tail_from` tracked the wrong floor. Batch
+            // a remove and an add routinely coexist in the same cycle — the case where a slot must
+            // end carrying the LATEST occupant's record (or the sentinel), never a stale one. Batch
             // them here; bias toward `set` early so the table fills before churn dominates.
             let batch = 1 + (rng() % 24);
             for _ in 0..batch {

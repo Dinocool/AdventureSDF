@@ -323,8 +323,10 @@ mod tests {
 
     #[test]
     fn show_at_falls_back_to_scenes_root_for_non_dir() {
-        let mut d = OpenSceneDialog::default();
-        d.open = false;
+        let mut d = OpenSceneDialog {
+            open: false,
+            ..Default::default()
+        };
         d.show_at(Path::new("definitely/not/a/real/dir"));
         assert!(d.open);
         assert_eq!(d.dir, PathBuf::from(SCENES_ROOT));
