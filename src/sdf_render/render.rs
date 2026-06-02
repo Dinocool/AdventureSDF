@@ -774,7 +774,7 @@ impl Plugin for SdfRenderPlugin {
                 Update,
                 prepare_sdf_camera_data
                     .run_if(in_state(crate::scene_manager::AppScene::SdfEditor))
-                    .after(super::orbit_camera)
+                    .after(super::editor_camera::orbit_camera)
                     // Run after the bake scheduling so the camera uniform reflects this frame's
                     // post-bake state. (The shader's chunk-search bound no longer comes from
                     // this uniform — it reads `arrayLength(&chunk_buf)` — so this ordering is

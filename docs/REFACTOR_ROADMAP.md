@@ -261,7 +261,7 @@ genuine friction point, not speculatively. **Don't split `chunk.rs`** (X3).
   production submodules (the survey misassigned them). Verify zero clippy warnings after the
   visibility widening.
 
-### [ ] M3. Extract the editor camera + gizmo overlays out of `sdf_render/mod.rs` (1264 LoC)
+### [x] M3. Extract the editor camera + gizmo overlays out of `sdf_render/mod.rs` (1264 LoC)
 `impact: medium` * `effort: medium` * `source: modularization`
 
 - *Now:* `mod.rs` is the module front door (plugin, components, `SdfGridConfig`, re-exports) but also
