@@ -8,8 +8,12 @@
 
 use bevy::prelude::*;
 
-use crate::node::{EditorGizmo, Node3D};
+use crate::node::Node3D;
 use crate::scene_manager::SceneEntity;
+// `EditorGizmo` + `LocalId` are only used by the test-only `spawn_stress` scene generator below.
+#[cfg(test)]
+use crate::node::EditorGizmo;
+#[cfg(test)]
 use crate::soul_scene::LocalId;
 
 use super::edits::{MaterialFields, SdfMaterialSource, SdfOp};

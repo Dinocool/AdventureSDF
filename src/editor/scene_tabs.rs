@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 
 use bevy::prelude::*;
 use bevy_egui::egui;
-use egui_dock::{NodeIndex, SurfaceIndex};
+use egui_dock::SurfaceIndex;
 
 use crate::scene_manager::{EditorEntity, SceneEntity};
 use crate::sdf_render::{DEFAULT_SCENE_PATH, SdfOrbitCamera};
@@ -22,7 +22,7 @@ use crate::soul_scene::{
     save_scene_to_string, save_scene_to_string_with_camera,
 };
 
-use super::dock::{EditorDockState, EditorTab};
+use super::dock::{center_leaf, EditorDockState, EditorTab};
 use super::menu_bar::{CurrentScenePath, EditorRequests};
 use super::scene_browser::{SCENES_ROOT, SaveSceneDialog};
 
@@ -299,25 +299,6 @@ fn activate(world: &mut World, dock: &mut EditorDockState, registry: &AppTypeReg
     }
     set_dock_active(dock, target);
     remove_no_scene_tab(dock);
-}
-
-/// The main-surface leaf hosting the scene tabs (or the empty-state placeholder).
-pub(crate) fn center_leaf(dock: &EditorDockState) -> Option<NodeIndex> {
-    dock.state
-        .main_surface()
-        .iter()
-        .enumerate()
-        .find_map(|(i, node)| {
-            let has_center = node
-                .tabs()
-                .is_some_and(|tabs| tabs.iter().any(is_center_tab));
-            has_center.then_some(NodeIndex(i))
-        })
-}
-
-/// Whether `tab` belongs to the center "scene box" (a scene view or the empty placeholder).
-pub(crate) fn is_center_tab(tab: &EditorTab) -> bool {
-    matches!(tab, EditorTab::Scene(_) | EditorTab::NoScene)
 }
 
 /// The ids of all open scenes in dock-tab order, plus the active id (for re-injecting the
