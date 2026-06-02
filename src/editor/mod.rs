@@ -14,6 +14,7 @@ pub mod hierarchy;
 pub mod import_settings;
 pub mod inspector;
 pub mod keybinds;
+pub mod layout;
 pub mod material_editor;
 pub mod material_preview;
 pub mod menu_bar;
@@ -54,6 +55,9 @@ impl Plugin for EditorPlugin {
         .init_resource::<scene_browser::SaveSceneDialog>()
         .init_resource::<scene_tabs::OpenScenes>()
         .init_resource::<notifications::Notifications>()
+        .init_resource::<layout::LayoutsDialog>()
+        .init_resource::<layout::PanelRestore>()
+        .add_systems(Last, layout::save_layout_on_exit)
         .init_resource::<inspector::InspectorOverrides>()
         .register_type::<import_settings::ImageFilter>()
         .register_type::<import_settings::ColorSpace>()

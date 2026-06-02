@@ -19,7 +19,11 @@ use super::scene_tabs::{self, INITIAL_SCENE_ID, OpenScenes, SceneId};
 /// A tab in the editor dock. `Scene(id)` is a center 3D scene view (one per open scene,
 /// named after the file); the rest are content panels. Built-in shell tabs have their own
 /// variants; contributed debug/tool panels come through `Registered`.
-#[derive(Clone, PartialEq, Eq)]
+///
+/// Serializable so the dock layout can be saved/restored. Saved layouts collapse the scene
+/// box to a single `NoScene` placeholder (scene ids are session-specific); applying a layout
+/// re-injects the live scenes — see [`super::layout`].
+#[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum EditorTab {
     /// Center 3D scene view for the open scene `id`. Only the active scene renders; the
     /// tab's on-screen rect is fed back to the SDF camera so the raymarch only fills the
@@ -56,7 +60,8 @@ impl EditorDockState {
     /// Build the initial layout from the registered panels: Hierarchy + left-dock
     /// panels on the left, right-dock panels on the right, bottom-dock panels in a
     /// strip under the center viewport. Mirrors the Bevy Editor Figma arrangement.
-    fn build(registry: &DebugPanelRegistry) -> Self {
+    /// Reused by `layout::restore_default`, hence `pub(crate)`.
+    pub(crate) fn build(registry: &DebugPanelRegistry) -> Self {
         // Godot/jackdaw arrangement. Root holds the single Viewport tab. Each split
         // returns [old_node, new_node]; we thread those indices so the viewport stays
         // one center tab (splitting `root()` repeatedly caused the "two viewports" bug).
@@ -270,6 +275,9 @@ pub fn init_dock_state(world: &mut World) {
     let dock = EditorDockState::build(&registry);
     world.insert_resource(registry);
     world.insert_resource(dock);
+    // Restore the auto-persisted layout from the last session, if any (keeps the live scenes
+    // in the center; only the panel arrangement is restored).
+    super::layout::load_current_layout(world);
 }
 
 /// Render the editor dock each frame (menu bar + status bar + central DockArea).
@@ -290,6 +298,7 @@ pub fn show_editor_dock(world: &mut World) {
     super::scene_browser::open_scene_dialog_ui(world, &ctx);
     super::scene_browser::save_scene_dialog_ui(world, &ctx);
     super::status_bar::status_bar_ui(world, &ctx);
+    super::layout::layouts_ui(world, &ctx);
     super::notifications::notifications_ui(world, &ctx);
 
     // Take the registry and dock state out so the tab closures get exclusive
