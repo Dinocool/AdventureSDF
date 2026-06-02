@@ -40,6 +40,11 @@ pub struct Bvh {
     pub nodes: Vec<BvhNode>,
     /// Edit indices (into the caller's edit slice) grouped by leaf.
     pub edit_indices: Vec<u32>,
+    /// Per-edit world AABB, indexed by the ORIGINAL edit index (the value stored in
+    /// `edit_indices`), not by leaf order. CPU-only (never uploaded). Lets a cull refine the
+    /// over-returned leaf set down to edits whose own box overlaps the query — see
+    /// [`crate::sdf_render::atlas::SdfAtlas::cull_edit_indices_with`].
+    pub edit_aabbs: Vec<Aabb3d>,
 }
 
 struct BuildItem {
@@ -56,6 +61,7 @@ impl Bvh {
         if edit_aabbs.is_empty() {
             return bvh;
         }
+        bvh.edit_aabbs = edit_aabbs.to_vec();
 
         let mut items: Vec<BuildItem> = edit_aabbs
             .iter()
@@ -84,14 +90,56 @@ impl Bvh {
         self.nodes.is_empty()
     }
 
+    /// World AABB of edit `idx` (the original edit index stored in leaves), if recorded.
+    pub fn edit_aabb(&self, idx: u32) -> Option<&Aabb3d> {
+        self.edit_aabbs.get(idx as usize)
+    }
+
     /// Collect edit indices whose leaf AABB-subtree overlaps `query`. Iterative
-    /// stack walk (no recursion), so it mirrors the GPU traversal shape.
+    /// stack walk (no recursion), so it mirrors the GPU traversal shape. Allocates a fresh
+    /// traversal stack each call — for hot per-brick loops use [`Self::query_aabb_with`].
     pub fn query_aabb(&self, query: &Aabb3d, out: &mut Vec<u32>) {
+        let mut stack: Vec<u32> = Vec::new();
+        self.query_aabb_with(query, out, &mut stack);
+    }
+
+    /// True if ANY edit's leaf subtree overlaps `query`, stopping at the first hit. For callers
+    /// that only need an occupancy boolean (e.g. the recenter's `chunk_has_geometry` and the emit
+    /// phase-1 pre-cull), this avoids collecting every overlapping edit index into a Vec — a big
+    /// win on dense chunks that overlap hundreds of edits. Reuses a caller-owned traversal `stack`.
+    pub fn any_overlap_with(&self, query: &Aabb3d, stack: &mut Vec<u32>) -> bool {
+        stack.clear();
+        if self.nodes.is_empty() {
+            return false;
+        }
+        stack.push(0);
+        while let Some(ni) = stack.pop() {
+            let node = &self.nodes[ni as usize];
+            if !aabb_overlap(node, query) {
+                continue;
+            }
+            if is_internal(node) {
+                stack.push(node.left_or_first);
+                stack.push(node.count_or_right & !INTERNAL_FLAG);
+            } else {
+                // A leaf overlaps the query box → at least one candidate edit reaches it. (Leaf
+                // bounds are the union of its edits' AABBs; a leaf-level overlap is the same
+                // occupancy signal the full collect would yield a non-empty `out` for.)
+                return true;
+            }
+        }
+        false
+    }
+
+    /// As [`Self::query_aabb`] but reuses a caller-owned traversal `stack` (cleared on entry), so
+    /// a tight per-brick cull loop does zero heap allocation per query.
+    pub fn query_aabb_with(&self, query: &Aabb3d, out: &mut Vec<u32>, stack: &mut Vec<u32>) {
         out.clear();
+        stack.clear();
         if self.nodes.is_empty() {
             return;
         }
-        let mut stack: Vec<u32> = vec![0];
+        stack.push(0);
         while let Some(ni) = stack.pop() {
             let node = &self.nodes[ni as usize];
             if !aabb_overlap(node, query) {

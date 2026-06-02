@@ -80,6 +80,26 @@ impl ShapeBuilder {
     /// A filled arrow: a quad shaft plus a triangle head (matches the plugin's
     /// `arrow`, which is a single convex polygon from base to tip).
     pub fn arrow(&self, from: Vec3, to: Vec3, width: f32, color: Color) -> GizmoMesh {
+        // Default proportions: shaft half-width = width/2, head base half-width = width
+        // (twice the shaft, the flare), head length ~5x the shaft half-width.
+        let shaft_half = px_width(width, self.ppp) * 0.5;
+        self.arrow_ex(from, to, shaft_half, shaft_half * 2.0, shaft_half * 5.0, color)
+    }
+
+    /// Arrow with every dimension specified independently in **screen pixels**:
+    /// `shaft_half` (shaft half-width), `head_half` (head base half-width), `head_len`
+    /// (head length). Lets a caller outset the whole arrow uniformly (a hover glow) by
+    /// adding the same margin to each — `arrow`'s single `width` couples shaft and head,
+    /// so widening it flares the head twice as much as the shaft (distortion).
+    pub fn arrow_ex(
+        &self,
+        from: Vec3,
+        to: Vec3,
+        shaft_half: f32,
+        head_half: f32,
+        head_len: f32,
+        color: Color,
+    ) -> GizmoMesh {
         let (Some(start), Some(end)) = (self.world_to_screen(from), self.world_to_screen(to))
         else {
             return GizmoMesh::default();
@@ -91,20 +111,16 @@ impl ShapeBuilder {
         }
         let n = dir / len;
         let perp = Pos2::new(-n.y, n.x); // rot90
-        let half = px_width(width, self.ppp) * 0.5;
-        // Taller cone: head length ~5x the half-width (was 3x) so arrowheads read as
-        // pointed, not stout. Clamped so it never exceeds the segment.
-        let head = (half * 5.0).min(len);
+        let head = head_len.min(len);
         let shoulder = Pos2::new(end.x - n.x * head, end.y - n.y * head);
 
-        // shaft (4) + head (3) as one convex-ish polygon list → two convex polys.
         let c = to_c32(color);
         let mut mesh = self.finish(Shape::convex_polygon(
             vec![
-                offset(start, perp, half),
-                offset(start, perp, -half),
-                offset(shoulder, perp, -half),
-                offset(shoulder, perp, half),
+                offset(start, perp, shaft_half),
+                offset(start, perp, -shaft_half),
+                offset(shoulder, perp, -shaft_half),
+                offset(shoulder, perp, shaft_half),
             ],
             c,
             Stroke::NONE,
@@ -112,8 +128,8 @@ impl ShapeBuilder {
         // arrow head triangle
         mesh.append(&self.finish(Shape::convex_polygon(
             vec![
-                offset(shoulder, perp, half * 2.0),
-                offset(shoulder, perp, -half * 2.0),
+                offset(shoulder, perp, head_half),
+                offset(shoulder, perp, -head_half),
                 end,
             ],
             c,

@@ -5,7 +5,7 @@
 
 use bevy::prelude::*;
 
-use crate::sdf_render::{OrbitFocus, SdfSelection};
+use crate::sdf_render::{OrbitFocus, SdfOrbitCamera, SdfSelection};
 
 /// In-progress inline rename, stashed in egui temp memory between frames.
 #[derive(Clone, Default)]
@@ -23,6 +23,8 @@ pub(super) struct Actions {
     pub(super) start_rename: Option<(Entity, String)>,
     /// `(child, new_parent)` — `None` parent unparents to a root.
     pub(super) reparent: Option<(Entity, Option<Entity>)>,
+    /// Snap the editor viewport to look through this node (a scene camera).
+    pub(super) look_through: Option<Entity>,
     /// Clicked empty space in the tree → clear the selection.
     pub(super) deselect: bool,
 }
@@ -77,6 +79,22 @@ pub(super) fn apply_actions(
         if let Some(pos) = pos {
             world.resource_mut::<OrbitFocus>().target = Some(pos);
         }
+    }
+
+    // "Look through": snap the editor orbit camera to a node's pose. The orbit camera sits
+    // at `target - dir*distance` (dir = the orbit offset) and looks at `target`. To match
+    // the node's view (position `p`, forward `fwd`), we put `target` ahead of the node and
+    // set the orbit dir = `-fwd`, then derive yaw/pitch the same way `orbit_camera` reads them.
+    if let Some(entity) = actions.look_through
+        && let Some(gt) = world.get::<GlobalTransform>(entity).copied()
+    {
+        let (_, rot, p) = gt.to_scale_rotation_translation();
+        let fwd = (rot * Vec3::NEG_Z).normalize_or_zero();
+        let mut orbit = world.resource_mut::<SdfOrbitCamera>();
+        let dir = -fwd; // orbit offset direction (camera = target - dir*distance)
+        orbit.target = p + fwd * orbit.distance;
+        orbit.yaw = dir.z.atan2(dir.x);
+        orbit.pitch = dir.y.clamp(-1.0, 1.0).asin();
     }
 
     if let Some(entity) = actions.clicked.or(actions.double_clicked) {

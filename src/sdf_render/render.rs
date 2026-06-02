@@ -59,13 +59,16 @@ struct SdfCameraData {
     /// the raymarch hit, so the SDF surface occludes/are-occluded-by other passes
     /// (wireframe, gizmos) through the normal depth buffer.
     clip_from_world: Mat4,
+    /// LAST frame's `clip_from_world`. Reprojects a reflected world point into the previous
+    /// frame's screen for the SSR reflection path.
+    prev_clip_from_world: Mat4,
     camera_pos: Vec4,
-    screen_params: Vec4, // xy = screen_size, z = surface_bias, w = unused
+    screen_params: Vec4, // xy = screen_size; zw unused (was surface_bias — iso-offset removed)
     grid_origin: Vec4,   // xyz = grid origin, w = voxel_size
     grid_dims: Vec4, // z = brick_size (8.0); x/y/w unused (chunk count = arrayLength(&chunk_buf))
     debug_params: Vec4, // x = max_steps, y = max_dist, z = sdf_eps, w = unused
-    /// x = pixel_cone (world radius per unit ray distance per pixel), y = cubic_band,
-    /// z = over_relax, w unused.
+    /// x = pixel_cone (world radius per unit ray distance per pixel), y = reserved
+    /// (was cubic_band), z = over_relax, w = lod_blend_band.
     march_params: Vec4,
     /// x = lod_count, y = ring_bricks, z = base voxel_size, w = cell_stride.
     lod_params: Vec4,
@@ -78,7 +81,8 @@ struct SdfCameraData {
 /// GPU mirror of a [`super::edits::MaterialDef`], one per global material id, in a
 /// storage buffer indexed by id. Carries the PBR texture-array layer for each map
 /// (`u32::MAX` = none); the shader samples those layers via triplanar projection.
-/// 64 bytes, 16-byte aligned for std430 (Vec4 forces the size up to a 16-byte multiple).
+/// 80 bytes, 16-byte aligned for std430. The three `_pad*` words align `emissive` (a
+/// `vec4`) to its 16-byte boundary at offset 64.
 #[derive(ShaderType, Clone, Copy, Default)]
 struct GpuSdfMaterial {
     base_color: Vec4,
@@ -96,18 +100,35 @@ struct GpuSdfMaterial {
     _pad0: u32,
     _pad1: u32,
     _pad2: u32,
+    /// Emissive radiance, linear RGB in `xyz` (intensity premultiplied in `MaterialDef`);
+    /// `w` is spare. `vec4` so it's 16-byte aligned at offset 64 (struct = 80 bytes).
+    emissive: Vec4,
 }
 
 // --- Extracted Atlas ---
 
 #[derive(Resource, Default)]
 struct ExtractedSdfAtlas {
-    /// Sorted chunk lookup table + packed per-chunk tile runs (see `super::chunk`).
-    /// Populated only when `tables_dirty` (the atlas topology changed); empty otherwise,
-    /// so the GPU prepare keeps the existing buffers instead of rebuilding them.
+    /// FULL-rebuild payload (`full_rebuild`): the entire sorted chunk lookup table
+    /// (`chunk_data`, one row per resident chunk) + the whole packed tile-run buffer
+    /// (`tile_run_data`, capacity-sized, each chunk's 64-entry region at `slot*64`). Used the
+    /// first frame, on a capacity grow, and on the empty-atlas sentinel. See `super::chunk`.
     chunk_data: Vec<GpuChunkLookup>,
     tile_run_data: Vec<GpuBrickTile>,
-    /// Whether `chunk_data`/`tile_run_data` carry a fresh table this frame. False on a
+    /// DELTA payload (`tables_dirty && !full_rebuild`): only the directory slots and tile-run
+    /// regions (slot → 64-entry region) that changed this frame. The toroidal directory is fixed-
+    /// position, so each is an in-place `write_buffer` — no row shift, no sentinel tail.
+    chunk_row_updates: Vec<(u32, GpuChunkLookup)>,
+    tile_run_updates: Vec<(u32, Vec<GpuBrickTile>)>,
+    /// Directory length (= `R³ × lod_count`); the GPU direct-indexes it (no logical-count bound).
+    new_chunk_len: u32,
+    /// Buffer capacities (rows / tile-run entries) this frame's table needs. `prepare` grows the
+    /// buffers (with headroom) when these exceed the current allocation.
+    chunk_cap_needed: u32,
+    tile_cap_needed: u32,
+    /// True ⇒ upload `chunk_data`/`tile_run_data` wholesale; false ⇒ apply the delta updates.
+    full_rebuild: bool,
+    /// Whether the chunk lookup / tile-run buffers changed at all this frame. False on a
     /// texel-only re-bake — the lookup buffers are reused as-is.
     tables_dirty: bool,
     texture_width: u32,
@@ -127,14 +148,6 @@ struct ExtractedSdfAtlas {
 #[derive(Resource, Default)]
 struct LastAtlasGen(u64);
 
-/// Render-world memo of the last atlas *topology* generation whose chunk lookup / tile-run
-/// tables were uploaded. `extract_sdf_atlas` rebuilds those (O(bricks)) tables and flags
-/// them for re-upload only when this differs, so a frame that only re-baked texels in place
-/// (camera idle, an edit nudged) skips the table rebuild entirely. A realloc always rebuilds
-/// the tables (the texture and its tile layout were recreated).
-#[derive(Resource, Default)]
-struct LastAtlasTopology(u64);
-
 /// Render-world record of how many tile rows the persistent atlas texture currently
 /// spans. `extract_sdf_atlas` reads it to decide grow-vs-partial-upload; the texture
 /// only grows (never shrinks except on a full rebuild), so a tile origin assigned
@@ -142,6 +155,17 @@ struct LastAtlasTopology(u64);
 #[derive(Resource, Default)]
 struct AtlasCapacity {
     rows: u32,
+}
+
+/// Render-world record of the allocated chunk-lookup + tile-run buffer capacities (in rows /
+/// tile-run entries), so `prepare_sdf_atlas_gpu` knows when an incremental delta needs the
+/// buffer grown (recreate larger + full re-upload) versus a plain in-place `write_buffer`.
+/// Both buffers are over-sized with headroom on a rebuild so most frames stay in the cheap
+/// delta path.
+#[derive(Resource, Default)]
+struct ChunkBufCapacity {
+    chunk_rows: u32,
+    tile_slots: u32,
 }
 
 // --- GPU Atlas ---
@@ -237,6 +261,50 @@ struct SdfPipeline {
     /// extracted defs against this (not a per-frame `changed` flag, which is fragile at
     /// startup when the defs haven't synced yet) and re-queues only on a real mismatch.
     current_defs: Vec<String>,
+}
+
+/// The G-buffer's three MRT colour formats (all linear HDR). Shared by the pipeline target
+/// list and the texture allocation in `prepare_sdf_gbuffer` so they can't drift.
+const GBUFFER_FORMAT: TextureFormat = TextureFormat::Rgba16Float;
+
+/// Combine pipeline: the final deferred-lighting pass. Reads the G-buffer (group 1) + camera
+/// (group 0), evaluates the analytic sun + emissive, and writes the lit result to the HDR view
+/// target. Rebuilt on shader-def change so its `#ifdef` debug views (SDF_DEBUG_*) recompile when
+/// toggled in the editor.
+#[derive(Resource)]
+struct SdfCombinePipeline {
+    pipeline_id: CachedRenderPipelineId,
+    /// G-buffer (3 tex) + sampler read layout.
+    layout: BindGroupLayoutDescriptor,
+    /// The shader defs the current `pipeline_id` was queued with (rebuild on mismatch).
+    current_defs: Vec<String>,
+}
+
+#[derive(Debug, Hash, PartialEq, Eq, Clone, RenderLabel)]
+struct SdfCombineLabel;
+
+#[derive(Resource)]
+struct SdfCombineShaderHandle(Handle<Shader>);
+
+/// Deferred lit-pass shader (analytic sun + emissive → view target).
+const SDF_COMBINE_SHADER_PATH: &str = "shaders/sdf_deferred_lit.wgsl";
+
+/// Deferred G-buffer: the three per-view `Rgba16Float` targets the primary SDF pass writes
+/// (replacing the old forward-lit single colour). `albedo` carries rgb albedo + camera distance
+/// in alpha; `normal_mat` carries the octahedral world normal + metallic/roughness; `emissive`
+/// carries premultiplied emissive radiance. Re-created lazily to match the viewport size. The
+/// deferred lit pass samples all three. The matching `sampler` is a non-filtering nearest sampler
+/// (one G-buffer texel per pixel — no interpolation wanted).
+#[derive(Resource, Default)]
+struct SdfGBuffer {
+    albedo: Option<Texture>,
+    albedo_view: Option<TextureView>,
+    normal_mat: Option<Texture>,
+    normal_mat_view: Option<TextureView>,
+    emissive: Option<Texture>,
+    emissive_view: Option<TextureView>,
+    sampler: Option<Sampler>,
+    size: UVec2,
 }
 
 /// Compute pipeline + layouts for the cone prepass (one tile-cone march per 8×8 tile,
@@ -350,7 +418,7 @@ pub struct SdfShaderDefs {
 // --- Render Graph ---
 
 #[derive(Debug, Hash, PartialEq, Eq, Clone, RenderLabel)]
-struct SdfLabel;
+struct SdfGBufferLabel;
 
 fn create_dummy_bg0(device: &RenderDevice, layout: &BindGroupLayout) -> BindGroup {
     let camera_buf = device.create_buffer(&BufferDescriptor {
@@ -367,16 +435,16 @@ fn create_dummy_bg0(device: &RenderDevice, layout: &BindGroupLayout) -> BindGrou
 }
 
 #[derive(Default)]
-struct SdfNode;
+struct SdfGBufferNode;
 
-impl ViewNode for SdfNode {
-    type ViewQuery = (&'static ViewTarget, &'static ViewDepthTexture);
+impl ViewNode for SdfGBufferNode {
+    type ViewQuery = &'static ViewDepthTexture;
 
     fn run(
         &self,
         graph: &mut RenderGraphContext,
         render_context: &mut RenderContext,
-        (view_target, depth): QueryItem<Self::ViewQuery>,
+        depth: QueryItem<Self::ViewQuery>,
         world: &World,
     ) -> Result<(), NodeRunError> {
         // Only run on SDF cameras — skip all other views
@@ -408,6 +476,27 @@ impl ViewNode for SdfNode {
                 bevy::log::error!("SDF pipeline error: {err}");
             }
         }
+
+        // The G-buffer textures must be allocated (prepare_sdf_gbuffer runs each frame). If not
+        // yet (no view this frame), skip — the deferred lit pass will also skip.
+        let gbuffer = world.resource::<SdfGBuffer>();
+        let (Some(albedo_view), Some(normal_view), Some(emissive_view)) = (
+            &gbuffer.albedo_view,
+            &gbuffer.normal_mat_view,
+            &gbuffer.emissive_view,
+        ) else {
+            return Ok(());
+        };
+
+        // During a window resize the shared view-depth texture can re-size a frame before
+        // `prepare_sdf_gbuffer` re-sizes the colour targets (they're driven off different view
+        // resources). A render pass requires ALL attachments to share one size, so skip the frame on
+        // a mismatch — prepare re-sizes the G-buffer next frame and rendering resumes (invisible
+        // during a drag-resize). Without this, wgpu aborts with "Attachments have differing sizes".
+        if gbuffer.size.x != depth.texture.width() || gbuffer.size.y != depth.texture.height() {
+            return Ok(());
+        }
+
         let layout_0 = pipeline_cache.get_bind_group_layout(&pipeline_res.layout_0);
         let layout_1 = pipeline_cache.get_bind_group_layout(&pipeline_res.layout_1);
         let layout_2 = pipeline_cache.get_bind_group_layout(&pipeline_res.layout_2);
@@ -482,19 +571,33 @@ impl ViewNode for SdfNode {
             &BindGroupEntries::sequential((&prepass.read_view,)),
         );
 
-        let post_process = view_target.post_process_write();
-
+        // Render into the three G-buffer MRT targets + the shared depth attachment. Clear the
+        // colour targets (a miss writes the sky sentinel anyway, but a clean clear avoids stale
+        // data leaking where the fullscreen triangle doesn't cover). Depth keeps Load so the SDF
+        // surface shares the buffer with prior opaque geometry.
+        let clear = LoadOp::Clear(LinearRgba::NONE.into());
         let mut render_pass = render_context.begin_tracked_render_pass(RenderPassDescriptor {
-            label: Some("sdf_pass"),
-            color_attachments: &[Some(RenderPassColorAttachment {
-                view: post_process.destination,
-                resolve_target: None,
-                depth_slice: None,
-                ops: Operations {
-                    load: LoadOp::Load,
-                    store: StoreOp::Store,
-                },
-            })],
+            label: Some("sdf_gbuffer_pass"),
+            color_attachments: &[
+                Some(RenderPassColorAttachment {
+                    view: albedo_view,
+                    resolve_target: None,
+                    depth_slice: None,
+                    ops: Operations { load: clear, store: StoreOp::Store },
+                }),
+                Some(RenderPassColorAttachment {
+                    view: normal_view,
+                    resolve_target: None,
+                    depth_slice: None,
+                    ops: Operations { load: clear, store: StoreOp::Store },
+                }),
+                Some(RenderPassColorAttachment {
+                    view: emissive_view,
+                    resolve_target: None,
+                    depth_slice: None,
+                    ops: Operations { load: clear, store: StoreOp::Store },
+                }),
+            ],
             depth_stencil_attachment: Some(depth.get_attachment(StoreOp::Store)),
             timestamp_writes: None,
             occlusion_query_set: None,
@@ -507,6 +610,103 @@ impl ViewNode for SdfNode {
             render_pass.set_bind_group(2, &bind_group_2, &[]);
             render_pass.draw(0..3, 0..1);
         }
+
+        Ok(())
+    }
+}
+
+/// Combine pass: the final deferred-lighting step — evaluates the analytic sun + emissive from the
+/// G-buffer and writes the lit result into the HDR view target.
+#[derive(Default)]
+struct SdfCombineNode;
+
+impl ViewNode for SdfCombineNode {
+    type ViewQuery = &'static ViewTarget;
+
+    fn run(
+        &self,
+        graph: &mut RenderGraphContext,
+        render_context: &mut RenderContext,
+        view_target: QueryItem<Self::ViewQuery>,
+        world: &World,
+    ) -> Result<(), NodeRunError> {
+        let view_entity = graph.view_entity();
+        if world.get::<SdfCameraData>(view_entity).is_none() {
+            return Ok(());
+        }
+        if let Some(enabled) = world.get_resource::<SdfRenderEnabled>()
+            && !enabled.0
+        {
+            return Ok(());
+        }
+
+        let combine = world.resource::<SdfCombinePipeline>();
+        let sdf = world.resource::<SdfPipeline>();
+        let pipeline_cache = world.resource::<PipelineCache>();
+        let device = render_context.render_device();
+
+        let Some(pipeline) = pipeline_cache.get_render_pipeline(combine.pipeline_id) else {
+            use std::sync::atomic::{AtomicBool, Ordering};
+            static LOGGED: AtomicBool = AtomicBool::new(false);
+            if !LOGGED.swap(true, Ordering::Relaxed)
+                && let bevy::render::render_resource::CachedPipelineState::Err(err) =
+                    pipeline_cache.get_render_pipeline_state(combine.pipeline_id)
+            {
+                bevy::log::error!("SDF combine pipeline error: {err}");
+            }
+            return Ok(());
+        };
+
+        let gbuffer = world.resource::<SdfGBuffer>();
+        let (Some(albedo_view), Some(normal_view), Some(emissive_view), Some(sampler)) = (
+            &gbuffer.albedo_view,
+            &gbuffer.normal_mat_view,
+            &gbuffer.emissive_view,
+            &gbuffer.sampler,
+        ) else {
+            return Ok(());
+        };
+
+        let Some(camera_uniforms) = world.get_resource::<ComponentUniforms<SdfCameraData>>() else {
+            return Ok(());
+        };
+        let Some(camera_binding) = camera_uniforms.binding() else {
+            return Ok(());
+        };
+        let layout_0 = pipeline_cache.get_bind_group_layout(&sdf.layout_0);
+        let layout = pipeline_cache.get_bind_group_layout(&combine.layout);
+
+        let bind_group_0 = device.create_bind_group(
+            "sdf_combine_bind_group_0",
+            &layout_0,
+            &BindGroupEntries::sequential((camera_binding.clone(),)),
+        );
+        let bind_group_1 = device.create_bind_group(
+            "sdf_combine_gbuffer",
+            &layout,
+            &BindGroupEntries::sequential((albedo_view, normal_view, emissive_view, sampler)),
+        );
+
+        let post_process = view_target.post_process_write();
+        let mut render_pass = render_context.begin_tracked_render_pass(RenderPassDescriptor {
+            label: Some("sdf_combine_pass"),
+            color_attachments: &[Some(RenderPassColorAttachment {
+                view: post_process.destination,
+                resolve_target: None,
+                depth_slice: None,
+                ops: Operations {
+                    load: LoadOp::Load,
+                    store: StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+        });
+        render_pass.set_render_pipeline(pipeline);
+        render_pass.set_bind_group(0, &bind_group_0, &[0]);
+        render_pass.set_bind_group(1, &bind_group_1, &[]);
+        render_pass.draw(0..3, 0..1);
 
         Ok(())
     }
@@ -525,14 +725,16 @@ struct SdfShaderHandle(Handle<Shader>);
 struct SdfShaderModules(#[expect(dead_code)] Vec<Handle<Shader>>);
 
 /// The `#define_import_path` module files the entry shader composes.
-const SDF_SHADER_MODULES: [&str; 7] = [
+const SDF_SHADER_MODULES: [&str; 9] = [
     "shaders/sdf/bindings.wgsl",
     "shaders/sdf/brick.wgsl",
-    "shaders/sdf/cubic.wgsl",
     "shaders/sdf/material.wgsl",
     "shaders/sdf/shadows.wgsl",
     "shaders/sdf/sky.wgsl",
     "shaders/sdf/pbr.wgsl",
+    "shaders/sdf/oct.wgsl",
+    "shaders/sdf/march.wgsl",
+    "shaders/sdf/brdf.wgsl",
 ];
 
 pub struct SdfRenderPlugin;
@@ -544,6 +746,7 @@ impl Plugin for SdfRenderPlugin {
         let shader_handle = asset_server.load(SDF_SHADER_PATH);
         let cone_shader_handle: Handle<Shader> = asset_server.load(SDF_CONE_SHADER_PATH);
         let bake_shader_handle: Handle<Shader> = asset_server.load(SDF_BAKE_SHADER_PATH);
+        let combine_shader_handle: Handle<Shader> = asset_server.load(SDF_COMBINE_SHADER_PATH);
         // Load + retain the imported modules (Custom-path imports aren't auto-loaded).
         let module_handles: Vec<Handle<Shader>> = SDF_SHADER_MODULES
             .iter()
@@ -588,6 +791,8 @@ impl Plugin for SdfRenderPlugin {
         render_app.insert_resource(SdfShaderHandle(shader_handle));
         render_app.insert_resource(SdfConeShaderHandle(cone_shader_handle));
         render_app.insert_resource(SdfBakeShaderHandle(bake_shader_handle));
+        render_app.insert_resource(SdfCombineShaderHandle(combine_shader_handle));
+        render_app.init_resource::<SdfGBuffer>();
 
         render_app
             .add_systems(ExtractSchedule, extract_sdf_atlas)
@@ -597,8 +802,8 @@ impl Plugin for SdfRenderPlugin {
             .add_systems(ExtractSchedule, extract_brick_bakes)
             .init_resource::<TextureStreamState>()
             .init_resource::<LastAtlasGen>()
-            .init_resource::<LastAtlasTopology>()
             .init_resource::<AtlasCapacity>()
+            .init_resource::<ChunkBufCapacity>()
             .init_resource::<SdfBakeBuffers>()
             .add_systems(Render, prepare_brick_bake_buffers.before(prepare_sdf_atlas_gpu))
             .add_systems(Render, prepare_sdf_atlas_gpu)
@@ -606,29 +811,33 @@ impl Plugin for SdfRenderPlugin {
             .add_systems(Render, init_texture_streaming)
             .add_systems(Render, upload_texture_layers.after(init_texture_streaming))
             .add_systems(Render, rebuild_pipeline_on_def_change)
+            .add_systems(Render, prepare_sdf_gbuffer)
             .add_systems(RenderStartup, init_sdf_pipeline)
             .add_systems(RenderStartup, init_cone_pipeline.after(init_sdf_pipeline))
             .add_systems(RenderStartup, init_bake_pipeline.after(init_sdf_pipeline))
+            .add_systems(RenderStartup, init_combine_pipeline.after(init_sdf_pipeline))
             .add_render_graph_node::<SdfBrickBakeNode>(Core3d, SdfBrickBakeLabel)
             .add_render_graph_node::<ViewNodeRunner<SdfConeNode>>(Core3d, SdfConeLabel)
-            .add_render_graph_node::<ViewNodeRunner<SdfNode>>(Core3d, SdfLabel)
+            .add_render_graph_node::<ViewNodeRunner<SdfGBufferNode>>(Core3d, SdfGBufferLabel)
+            .add_render_graph_node::<ViewNodeRunner<SdfCombineNode>>(Core3d, SdfCombineLabel)
             // The brick-bake compute pass writes the atlas BEFORE the view passes read it,
-            // so it runs first (after the opaque pass, before the cone prepass + raymarch).
+            // so it runs first (after the opaque pass, before the cone prepass + G-buffer).
             // It's a standalone (non-view) node — it fills the shared atlas once per frame,
             // not per view.
             //
-            // Run the SDF fullscreen pass between the opaque and transparent
-            // passes. Gizmos (transform handles, bounds) draw in the Transparent3d
-            // phase, so the SDF surface must be composited *before* them — otherwise
-            // the SDF pass (which fills background on a ray miss) paints over the
-            // gizmos. Their negative depth_bias then keeps them on top.
+            // Order: opaque → bake → cone prepass → G-buffer → combine(sun+emissive) → transparent.
+            // The combine pass evaluates the analytic sun + emissive from the G-buffer (and fills
+            // the sky on a miss) and writes the view target. It runs BEFORE the transparent pass so
+            // gizmos (Transparent3d, negative depth_bias) draw on top. (Indirect GI is being
+            // replaced by a world-anchored probe volume — see plans/sdf-ddgi-probe-volume.md.)
             .add_render_graph_edges(
                 Core3d,
                 (
                     Node3d::MainOpaquePass,
                     SdfBrickBakeLabel,
                     SdfConeLabel,
-                    SdfLabel,
+                    SdfGBufferLabel,
+                    SdfCombineLabel,
                     Node3d::MainTransparentPass,
                 ),
             );
@@ -658,6 +867,10 @@ fn prepare_sdf_camera_data(
     // offscreen thumbnail / preview rig lights are excluded.
     sun_light: Query<(&GlobalTransform, &DirectionalLight), With<crate::scene_manager::SceneEntity>>,
     mut material_table: ResMut<SdfMaterialTable>,
+    // Per-camera last-frame `clip_from_world`, for SSR reprojection. Persists across frames in
+    // the main world via Local; seeded to this frame's matrix on the first sighting (so frame 0
+    // reprojects to itself — harmless, the history buffer is also invalid that frame).
+    mut prev_clip: Local<bevy::platform::collections::HashMap<Entity, Mat4>>,
 ) {
     let sun = sun_light
         .iter()
@@ -695,6 +908,7 @@ fn prepare_sdf_camera_data(
                 _pad0: 0,
                 _pad1: 0,
                 _pad2: 0,
+                emissive: def.emissive.extend(0.0),
             });
         }
     }
@@ -717,12 +931,17 @@ fn prepare_sdf_camera_data(
         let tan_half_fov_y = 1.0 / proj.y_axis.y.max(1e-6);
         let pixel_cone = (tan_half_fov_y / size.y.max(1) as f32) * raymarch.cone_scale;
 
+        // Last frame's matrix (this frame's on first sighting); then stash this frame's for next.
+        let prev_clip_from_world = *prev_clip.entry(entity).or_insert(clip_from_world);
+        prev_clip.insert(entity, clip_from_world);
+
         commands.entity(entity).insert(SdfCameraData {
             inv_view_proj,
             clip_from_world,
+            prev_clip_from_world,
             camera_pos: transform.translation.extend(0.0),
-            // z = surface_bias (coarse-LOD iso-offset α); w unused.
-            screen_params: Vec4::new(size.x as f32, size.y as f32, raymarch.surface_bias, 0.0),
+            // zw unused (was surface_bias — iso-offset removed).
+            screen_params: Vec4::new(size.x as f32, size.y as f32, 0.0, 0.0),
             grid_origin: Vec4::new(
                 config.world_origin().x,
                 config.world_origin().y,
@@ -745,12 +964,12 @@ fn prepare_sdf_camera_data(
             ),
             // March tuning: the pixel cone half-width per unit ray distance drives the
             // screen-space termination (a surface within a pixel ends the march, so far
-            // geometry resolves at coarse LOD); `cubic_band` is the near-surface distance
-            // within which a LOD-0 sample switches to the exact analytic cubic; `w` is the
-            // LOD cross-fade band (fraction of each ring's half-extent; 0 = hard seams).
+            // geometry resolves at coarse LOD); `y` is reserved (was the removed cubic band);
+            // `w` is the LOD cross-fade band (fraction of each ring's half-extent; 0 = hard
+            // seams).
             march_params: Vec4::new(
                 pixel_cone,
-                raymarch.cubic_band,
+                0.0,
                 raymarch.over_relax,
                 raymarch.lod_blend_band,
             ),
@@ -793,55 +1012,144 @@ fn extract_shader_defs(defs: Extract<Res<SdfShaderDefs>>, mut commands: Commands
     });
 }
 
+#[allow(clippy::too_many_arguments)] // Bevy system params; rebuilds two def-gated pipelines.
 fn rebuild_pipeline_on_def_change(
     mut pipeline: ResMut<SdfPipeline>,
+    mut combine: ResMut<SdfCombinePipeline>,
     extracted: Option<Res<ExtractedShaderDefs>>,
     shader_handle: Res<SdfShaderHandle>,
+    combine_shader: Res<SdfCombineShaderHandle>,
     pipeline_cache: Res<PipelineCache>,
     fullscreen_shader: Res<FullscreenShader>,
 ) {
     let Some(extracted) = extracted else { return };
-    // Rebuild whenever the extracted defs differ from what the live pipeline was built
-    // with — timing-independent, so the startup case (defs sync in a frame or two after
-    // the pipeline was first queued with empty defs) rebuilds without a manual toggle.
-    if extracted.defs == pipeline.current_defs {
-        return;
+    let shader_defs: Vec<_> = extracted.defs.iter().map(|s| s.as_str().into()).collect();
+    let vertex_state = fullscreen_shader.to_vertex_state();
+    // The combine pipeline reuses the camera layout (group 0). Clone it up front so the combine
+    // rebuild below doesn't re-borrow `pipeline` (which is mutated by the primary rebuild).
+    let camera_layout = pipeline.layout_0.clone();
+
+    // Primary (G-buffer) pipeline. Rebuild whenever the extracted defs differ from what the live
+    // pipeline was built with — timing-independent, so the startup case (defs sync a frame or two
+    // after the pipeline was first queued with empty defs) rebuilds without a manual toggle.
+    if extracted.defs != pipeline.current_defs {
+        let new_id = pipeline_cache.queue_render_pipeline(RenderPipelineDescriptor {
+            label: Some("sdf_gbuffer_pipeline".into()),
+            layout: vec![
+                pipeline.layout_0.clone(),
+                pipeline.layout_1.clone(),
+                pipeline.layout_2.clone(),
+            ],
+            vertex: vertex_state.clone(),
+            fragment: Some(FragmentState {
+                shader: shader_handle.0.clone(),
+                shader_defs: shader_defs.clone(),
+                targets: gbuffer_targets(),
+                ..default()
+            }),
+            depth_stencil: Some(DepthStencilState {
+                format: TextureFormat::Depth32Float,
+                depth_write_enabled: true,
+                depth_compare: CompareFunction::GreaterEqual,
+                stencil: default(),
+                bias: default(),
+            }),
+            ..default()
+        });
+        pipeline.pipeline_id = new_id;
+        pipeline.current_defs = extracted.defs.clone();
     }
 
-    let shader_defs: Vec<_> = extracted.defs.iter().map(|s| s.as_str().into()).collect();
-    let shader = shader_handle.0.clone();
-    let vertex_state = fullscreen_shader.to_vertex_state();
-
-    let new_id = pipeline_cache.queue_render_pipeline(RenderPipelineDescriptor {
-        label: Some("sdf_pipeline".into()),
-        layout: vec![
-            pipeline.layout_0.clone(),
-            pipeline.layout_1.clone(),
-            pipeline.layout_2.clone(),
-        ],
-        vertex: vertex_state,
-        fragment: Some(FragmentState {
-            shader,
-            shader_defs,
-            targets: vec![Some(ColorTargetState {
-                format: TextureFormat::bevy_default(),
-                blend: None,
-                write_mask: ColorWrites::ALL,
-            })],
+    // Combine pipeline (carries the SDF_DEBUG_* G-buffer/GI visualizer `#ifdef` branches).
+    if extracted.defs != combine.current_defs {
+        let new_id = pipeline_cache.queue_render_pipeline(RenderPipelineDescriptor {
+            label: Some("sdf_combine_pipeline".into()),
+            layout: vec![camera_layout, combine.layout.clone()],
+            vertex: vertex_state,
+            fragment: Some(FragmentState {
+                shader: combine_shader.0.clone(),
+                shader_defs,
+                targets: vec![Some(ColorTargetState {
+                    format: ViewTarget::TEXTURE_FORMAT_HDR,
+                    blend: None,
+                    write_mask: ColorWrites::ALL,
+                })],
+                ..default()
+            }),
             ..default()
-        }),
-        depth_stencil: Some(DepthStencilState {
-            format: TextureFormat::Depth32Float,
-            depth_write_enabled: true,
-            depth_compare: CompareFunction::GreaterEqual,
-            stencil: default(),
-            bias: default(),
-        }),
-        ..default()
-    });
+        });
+        combine.pipeline_id = new_id;
+        combine.current_defs = extracted.defs.clone();
+    }
+}
 
-    pipeline.pipeline_id = new_id;
-    pipeline.current_defs = extracted.defs.clone();
+/// The three G-buffer MRT colour-target states (albedo+dist, normal+material, emissive). All
+/// `GBUFFER_FORMAT`, no blend (the fullscreen pass fully overwrites each covered pixel).
+fn gbuffer_targets() -> Vec<Option<ColorTargetState>> {
+    let one = || {
+        Some(ColorTargetState {
+            format: GBUFFER_FORMAT,
+            blend: None,
+            write_mask: ColorWrites::ALL,
+        })
+    };
+    vec![one(), one(), one()]
+}
+
+/// (Re)allocate the three G-buffer textures to match the SDF view target's size. Runs each
+/// frame; only recreates on a size change (or first run). The primary SDF pass renders into
+/// these (RENDER_ATTACHMENT) and the deferred lit pass samples them (TEXTURE_BINDING).
+fn prepare_sdf_gbuffer(
+    device: Res<RenderDevice>,
+    mut gbuffer: ResMut<SdfGBuffer>,
+    views: Query<&ViewTarget, With<SdfCameraData>>,
+) {
+    // One SDF camera; take its target size. (Multiple SDF views would need per-view G-buffers —
+    // not a case this editor hits.)
+    let Some(view) = views.iter().next() else {
+        return;
+    };
+    let size = view.main_texture().size();
+    let dims = UVec2::new(size.width, size.height);
+
+    if gbuffer.albedo.is_some() && gbuffer.size == dims {
+        return; // already sized correctly
+    }
+
+    let make = |label: &str| {
+        let tex = device.create_texture(&TextureDescriptor {
+            label: Some(label),
+            size,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: TextureDimension::D2,
+            format: GBUFFER_FORMAT,
+            usage: TextureUsages::RENDER_ATTACHMENT | TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let view = tex.create_view(&TextureViewDescriptor::default());
+        (tex, view)
+    };
+    let (albedo, albedo_view) = make("sdf_gbuffer_albedo");
+    let (normal_mat, normal_mat_view) = make("sdf_gbuffer_normal_mat");
+    let (emissive, emissive_view) = make("sdf_gbuffer_emissive");
+
+    if gbuffer.sampler.is_none() {
+        gbuffer.sampler = Some(device.create_sampler(&SamplerDescriptor {
+            label: Some("sdf_gbuffer_sampler"),
+            // Nearest: one G-buffer texel per pixel; no interpolation of packed normals/distance.
+            mag_filter: FilterMode::Nearest,
+            min_filter: FilterMode::Nearest,
+            ..default()
+        }));
+    }
+    gbuffer.albedo = Some(albedo);
+    gbuffer.albedo_view = Some(albedo_view);
+    gbuffer.normal_mat = Some(normal_mat);
+    gbuffer.normal_mat_view = Some(normal_mat_view);
+    gbuffer.emissive = Some(emissive);
+    gbuffer.emissive_view = Some(emissive_view);
+    gbuffer.size = dims;
 }
 
 // --- Extract: Pack Atlas for GPU ---
@@ -857,12 +1165,27 @@ fn tile_origin(tile: u32) -> (u32, u32) {
     (col_px, row_px)
 }
 
+/// Convert a CPU `chunk::ChunkLookup` row to its std430 GPU mirror.
+fn to_gpu_lookup(c: super::chunk::ChunkLookup) -> GpuChunkLookup {
+    GpuChunkLookup {
+        key_hi: c.key_hi,
+        key_lo: c.key_lo,
+        occ_lo: c.occ_lo,
+        occ_hi: c.occ_hi,
+        tile_run_base: c.tile_run_base,
+    }
+}
+
+/// Convert a CPU `chunk::BrickTile` to its std430 GPU mirror.
+fn to_gpu_tile(b: super::chunk::BrickTile) -> GpuBrickTile {
+    GpuBrickTile { atlas_base: b.atlas_base, pal01: b.pal01, pal23: b.pal23 }
+}
+
 fn extract_sdf_atlas(
     atlas: Extract<Res<SdfAtlas>>,
-    config: Extract<Res<SdfGridConfig>>,
     mut last_gen: ResMut<LastAtlasGen>,
-    mut last_topology: ResMut<LastAtlasTopology>,
     mut capacity: ResMut<AtlasCapacity>,
+    mut chunk_cap: ResMut<ChunkBufCapacity>,
     mut commands: Commands,
 ) {
     // Nothing changed since the last upload — skip the rebuild entirely so idle
@@ -874,15 +1197,19 @@ fn extract_sdf_atlas(
     }
     last_gen.0 = atlas.generation;
 
+    let live = &atlas.live_chunks;
     let num_bricks = atlas.bricks.len() as u32;
     if num_bricks == 0 {
-        // Fully evicted (roamed into empty space). Signal a tables rebuild with EMPTY chunk
-        // data so `prepare_sdf_atlas_gpu` replaces the lookup buffer with a miss-only sentinel.
-        // The shader bounds its search by `arrayLength(&chunk_buf)`, so leaving the old buffer
-        // bound would search stale entries and render ghost geometry.
-        last_topology.0 = atlas.topology_generation;
+        // Fully evicted (roamed into empty space). Signal a full rebuild with EMPTY chunk data
+        // so `prepare_sdf_atlas_gpu` replaces the lookup buffer with a miss-only sentinel. The
+        // shader bounds its search by `arrayLength(&chunk_buf)`, so leaving the old buffer bound
+        // would search stale entries and render ghost geometry. Reset capacity so the next
+        // re-entry triggers a fresh full rebuild rather than a delta against a dropped buffer.
+        chunk_cap.chunk_rows = 0;
+        chunk_cap.tile_slots = 0;
         commands.insert_resource(ExtractedSdfAtlas {
             tables_dirty: true,
+            full_rebuild: true,
             dirty: true,
             ..Default::default()
         });
@@ -898,79 +1225,70 @@ fn extract_sdf_atlas(
     let required_rows = atlas.tiles.high_water().div_ceil(ATLAS_TILES_PER_ROW).max(1);
     let texture_height = required_rows * edge;
 
-    // Realloc when the atlas must grow taller (the GPU bake never shrinks it). The texture
-    // grows by PRESERVING existing texels: the GPU owns the texels (CPU has only palette-only
-    // placeholders), so `prepare` recreates the taller texture and copies the old content in,
-    // then the bake node fills the genuinely-new tiles this frame. There is no CPU texel
-    // upload — the only realloc kind is this grow.
+    // Realloc when the atlas TEXTURE must grow taller (the GPU bake never shrinks it). This is now
+    // INDEPENDENT of the chunk table: a brick's `atlas_base` is derived from its stable tile index
+    // and is unaffected by the texture's height, so a texture grow never forces a table rebuild.
     let realloc = required_rows > capacity.rows;
-
-    // The chunk lookup / tile-run tables only need rebuilding when the atlas topology
-    // changed (a brick entered/exited, or a palette changed) or on a realloc. A frame
-    // that only re-baked texels in place reuses last frame's buffers — skipping the
-    // O(bricks) table rebuild + full lookup re-upload that ran every applied frame before.
-    let tables_dirty = realloc || atlas.topology_generation != last_topology.0;
-    last_topology.0 = atlas.topology_generation;
-
-    let (chunk_data, tile_run_data) = if tables_dirty {
-        // Build the sorted chunk lookup table + packed per-chunk brick runs from the
-        // resident bricks. Absolute chunk keys (no ring origin) → CPU/GPU agree by
-        // construction. `chunk::build_chunk_tables` owns the grouping + sort.
-        let tables = super::chunk::build_chunk_tables(&atlas, &config, |key| {
-            let tile = atlas
-                .tiles
-                .tile(key)
-                .expect("baked brick must have an allocated tile");
-            let (col_px, row_px) = tile_origin(tile);
-            let p = atlas.bricks[key].palette;
-            super::chunk::BrickTile {
-                atlas_base: col_px | (row_px << 16),
-                pal01: p[0] as u32 | ((p[1] as u32) << 16),
-                pal23: p[2] as u32 | ((p[3] as u32) << 16),
-            }
-        });
-        let chunk_data: Vec<GpuChunkLookup> = tables
-            .chunks
-            .iter()
-            .map(|c| GpuChunkLookup {
-                key_hi: c.key_hi,
-                key_lo: c.key_lo,
-                occ_lo: c.occ_lo,
-                occ_hi: c.occ_hi,
-                tile_run_base: c.tile_run_base,
-            })
-            .collect();
-        let tile_run_data: Vec<GpuBrickTile> = tables
-            .tile_run
-            .iter()
-            .map(|b| GpuBrickTile {
-                atlas_base: b.atlas_base,
-                pal01: b.pal01,
-                pal23: b.pal23,
-            })
-            .collect();
-        (chunk_data, tile_run_data)
-    } else {
-        (Vec::new(), Vec::new())
-    };
-
     if realloc {
         capacity.rows = required_rows;
     }
 
-    // The GPU bake writes all texels directly into the atlas (via the bake node's
-    // copy_buffer_to_texture). The extract only carries the texture-size decision + the chunk
-    // tables: on a grow (`realloc`) `prepare` recreates the taller texture and copies the old
-    // content in; otherwise it keeps the existing texture and the bake node patches tiles.
-    commands.insert_resource(ExtractedSdfAtlas {
-        chunk_data,
-        tile_run_data,
-        tables_dirty,
+    // Decide full rebuild vs incremental delta for the chunk tables. The render world's
+    // `ChunkBufCapacity` is a render-world resource (extract runs in the render world), so extract
+    // owns this decision: rebuild on the first upload (capacity 0) or when the table outgrows the
+    // allocated buffers; otherwise page only the rows/regions the live table marked dirty.
+    let needed_rows = live.row_count();
+    let needed_slots = live.tile_run_capacity();
+    let must_rebuild =
+        chunk_cap.chunk_rows == 0 || needed_rows > chunk_cap.chunk_rows || needed_slots > chunk_cap.tile_slots;
+
+    let mut extracted = ExtractedSdfAtlas {
         texture_width,
         texture_height,
         realloc,
         dirty: true,
-    });
+        ..Default::default()
+    };
+
+    if must_rebuild {
+        // The chunk_buf is now the FIXED-size toroidal directory (R³·lod_count) — it never grows, so
+        // size it EXACTLY (no headroom). The tile-run buffer is still sparse and can grow, so keep
+        // headroom there (+50%) to avoid recreating it every frame.
+        let cap_rows = needed_rows;
+        let cap_slots =
+            (needed_slots + needed_slots / 2).max(needed_slots + super::chunk::TILE_RUN_SLOT);
+        chunk_cap.chunk_rows = cap_rows;
+        chunk_cap.tile_slots = cap_slots;
+
+        let (chunks, tile_run) = live.full_tables();
+        extracted.chunk_data = chunks.into_iter().map(to_gpu_lookup).collect();
+        extracted.tile_run_data = tile_run.into_iter().map(to_gpu_tile).collect();
+        extracted.new_chunk_len = needed_rows;
+        extracted.chunk_cap_needed = cap_rows;
+        extracted.tile_cap_needed = cap_slots;
+        extracted.full_rebuild = true;
+        extracted.tables_dirty = true;
+    } else {
+        // Delta: only the directory slots + tile-run regions the live table marked dirty this frame.
+        // The directory is fixed-position, so every dirty slot is an in-place write — no row shift,
+        // no sentinel tail. The dirty record is cleared on the main world next frame.
+        let chunk_rows: Vec<(u32, GpuChunkLookup)> = live
+            .dirty_rows
+            .iter()
+            .map(|&r| (r, to_gpu_lookup(live.lookup_at(r))))
+            .collect();
+        let tile_runs: Vec<(u32, Vec<GpuBrickTile>)> = live
+            .dirty_slots
+            .iter()
+            .map(|&s| (s, live.tile_region(s).into_iter().map(to_gpu_tile).collect()))
+            .collect();
+        extracted.tables_dirty = !chunk_rows.is_empty() || !tile_runs.is_empty();
+        extracted.chunk_row_updates = chunk_rows;
+        extracted.tile_run_updates = tile_runs;
+        extracted.new_chunk_len = needed_rows;
+    }
+
+    commands.insert_resource(extracted);
 }
 
 // --- Extract: Material table ---
@@ -990,8 +1308,9 @@ fn prepare_sdf_materials_gpu(
     mut gpu_atlas: ResMut<SdfGpuAtlas>,
 ) {
     let Some(extracted) = extracted else { return };
-    // std430: each GpuSdfMaterial is 64 bytes (vec4 + f32 + 5×u32 + 3×f32 + 3×u32 pad).
-    let mut bytes = Vec::with_capacity(extracted.materials.len() * 64);
+    // std430: each GpuSdfMaterial is 80 bytes (vec4 + f32 + 5×u32 + 3×f32 + 3×u32 pad +
+    // vec4 emissive). The pads align `emissive` to its 16-byte boundary at offset 64.
+    let mut bytes = Vec::with_capacity(extracted.materials.len() * 80);
     for m in &extracted.materials {
         for c in [
             m.base_color.x,
@@ -1010,9 +1329,12 @@ fn prepare_sdf_materials_gpu(
         bytes.extend_from_slice(&m.metallic.to_le_bytes());
         bytes.extend_from_slice(&m.roughness.to_le_bytes());
         bytes.extend_from_slice(&m.parallax_scale.to_le_bytes());
-        bytes.extend_from_slice(&0u32.to_le_bytes());
-        bytes.extend_from_slice(&0u32.to_le_bytes());
-        bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // _pad0
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // _pad1
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // _pad2
+        for c in [m.emissive.x, m.emissive.y, m.emissive.z, m.emissive.w] {
+            bytes.extend_from_slice(&c.to_le_bytes());
+        }
     }
     let buffer = device.create_buffer_with_data(&BufferInitDescriptor {
         label: Some("sdf_material_buffer"),
@@ -1210,6 +1532,132 @@ fn upload_texture_layers(queue: Res<RenderQueue>, mut stream: ResMut<TextureStre
     }
 }
 
+// --- Prepare: chunk-table upload (full rebuild + incremental delta) ---
+
+/// 20-byte std430 encoding of one chunk lookup row.
+fn encode_lookup(c: &GpuChunkLookup, out: &mut Vec<u8>) {
+    out.extend_from_slice(&c.key_hi.to_le_bytes());
+    out.extend_from_slice(&c.key_lo.to_le_bytes());
+    out.extend_from_slice(&c.occ_lo.to_le_bytes());
+    out.extend_from_slice(&c.occ_hi.to_le_bytes());
+    out.extend_from_slice(&c.tile_run_base.to_le_bytes());
+}
+
+/// 12-byte std430 encoding of one tile-run brick record.
+fn encode_tile(b: &GpuBrickTile, out: &mut Vec<u8>) {
+    out.extend_from_slice(&b.atlas_base.to_le_bytes());
+    out.extend_from_slice(&b.pal01.to_le_bytes());
+    out.extend_from_slice(&b.pal23.to_le_bytes());
+}
+
+/// The 20-byte `(u32::MAX, u32::MAX, 0, 0, 0)` chunk-lookup sentinel. Its key sorts after every
+/// real chunk key, so binary search over the fixed physical buffer never matches a tail slot.
+fn sentinel_row_bytes() -> [u8; 20] {
+    let mut b = [0u8; 20];
+    b[0..4].copy_from_slice(&u32::MAX.to_le_bytes());
+    b[4..8].copy_from_slice(&u32::MAX.to_le_bytes());
+    b
+}
+
+/// Full (re)allocation + upload of both chunk-table buffers, sized to CAPACITY (with headroom)
+/// so later frames can `write_buffer` deltas in place. The chunk-lookup buffer is filled with
+/// `new_chunk_len` live rows followed by sentinel rows to capacity; the tile-run buffer is the
+/// capacity-sized `tile_run_data` (each live slot's region at `slot*64`, gaps zero). Used on the
+/// first upload, a capacity grow, and the empty-atlas case (zero live rows → all sentinel).
+fn upload_tables_full(
+    device: &RenderDevice,
+    gpu_atlas: &mut SdfGpuAtlas,
+    extracted: &ExtractedSdfAtlas,
+) {
+    // Chunk lookup buffer: live rows then sentinel tail to capacity. Capacity is always ≥1 so the
+    // storage buffer is never zero-sized (an empty atlas yields a single sentinel — the prior
+    // dedicated empty path, now folded in here).
+    let cap_rows = extracted.chunk_cap_needed.max(1);
+    let live = extracted.new_chunk_len.min(extracted.chunk_data.len() as u32);
+    let mut chunk_bytes = Vec::with_capacity(cap_rows as usize * 20);
+    for c in extracted.chunk_data.iter().take(live as usize) {
+        encode_lookup(c, &mut chunk_bytes);
+    }
+    let sentinel = sentinel_row_bytes();
+    for _ in live..cap_rows {
+        chunk_bytes.extend_from_slice(&sentinel);
+    }
+    gpu_atlas.lookup_buffer = Some(device.create_buffer_with_data(&BufferInitDescriptor {
+        label: Some("sdf_chunk_lookup_buffer"),
+        contents: &chunk_bytes,
+        usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
+    }));
+
+    // Tile-run buffer: capacity-sized (extract already laid out `tile_run_data` to the slot
+    // high-water; pad to `tile_cap_needed` so deltas into freshly-grown slots have room).
+    let cap_slots = extracted.tile_cap_needed.max(super::chunk::TILE_RUN_SLOT) as usize;
+    let mut tile_bytes = Vec::with_capacity(cap_slots * 12);
+    for b in &extracted.tile_run_data {
+        encode_tile(b, &mut tile_bytes);
+    }
+    tile_bytes.resize(cap_slots * 12, 0);
+    gpu_atlas.chunk_tile_buffer = Some(device.create_buffer_with_data(&BufferInitDescriptor {
+        label: Some("sdf_chunk_tile_buffer"),
+        contents: &tile_bytes,
+        usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
+    }));
+}
+
+/// Incremental upload: `write_buffer` only the chunk rows + tile-run regions that changed this
+/// frame, plus sentinel-blank the rows a removed chunk vacated. The buffers keep their (capacity)
+/// allocation — only the changed byte ranges are touched, so a coarse-LOD snap pages the handful
+/// of dirty chunks instead of recreating the whole ~1 MB table.
+fn upload_tables_delta(
+    queue: &RenderQueue,
+    gpu_atlas: &SdfGpuAtlas,
+    extracted: &ExtractedSdfAtlas,
+) {
+    let (Some(lookup), Some(tiles)) = (&gpu_atlas.lookup_buffer, &gpu_atlas.chunk_tile_buffer)
+    else {
+        return; // no buffers yet (shouldn't happen — first frame is a full rebuild)
+    };
+
+    // Changed chunk-lookup rows (20 B each, at row*20). A structural change marks a contiguous
+    // suffix `[R..end)` dirty (every row at/after an insert/remove shifts), so coalesce consecutive
+    // rows into one `write_buffer` to avoid a long burst of 20-byte writes on a snap frame.
+    let mut run_start: Option<u32> = None;
+    let mut run_bytes: Vec<u8> = Vec::new();
+    let flush = |start: u32, bytes: &[u8]| {
+        if !bytes.is_empty() {
+            queue.write_buffer(lookup, (start as u64) * 20, bytes);
+        }
+    };
+    for (row, c) in &extracted.chunk_row_updates {
+        match run_start {
+            Some(s) if *row == s + (run_bytes.len() as u32 / 20) => {}
+            _ => {
+                if let Some(s) = run_start {
+                    flush(s, &run_bytes);
+                }
+                run_start = Some(*row);
+                run_bytes.clear();
+            }
+        }
+        encode_lookup(c, &mut run_bytes);
+    }
+    if let Some(s) = run_start {
+        flush(s, &run_bytes);
+    }
+    // No sentinel tail: the directory is fixed-size and an emptied chunk's slot was already reset to
+    // the sentinel tag in `clear_brick` (it shows up as a normal dirty-row write above).
+
+    // Changed tile-run regions (64 entries × 12 B = 768 B each, at slot*64*12).
+    let mut region_bytes = Vec::with_capacity(super::chunk::TILE_RUN_SLOT as usize * 12);
+    for (slot, region) in &extracted.tile_run_updates {
+        region_bytes.clear();
+        for b in region {
+            encode_tile(b, &mut region_bytes);
+        }
+        let base = (*slot as u64) * super::chunk::TILE_RUN_SLOT as u64 * 12;
+        queue.write_buffer(tiles, base, &region_bytes);
+    }
+}
+
 // --- Prepare: Upload to GPU ---
 
 fn prepare_sdf_atlas_gpu(
@@ -1223,58 +1671,12 @@ fn prepare_sdf_atlas_gpu(
         return;
     }
 
-    // Rebuild the chunk lookup + tile-run buffers only when the atlas topology changed
-    // (`tables_dirty`). A texel-only frame (camera idle / an edit nudged in place) reuses
-    // last frame's buffers untouched, skipping the per-frame O(bricks) re-upload.
     if extracted.tables_dirty {
-        if extracted.chunk_data.is_empty() {
-            // Atlas fully evicted. The shader bounds its binary search by
-            // `arrayLength(&chunk_buf)`, so we must NOT leave a stale non-empty buffer bound
-            // (it would search old entries → ghost geometry). Upload a single sentinel whose
-            // key (u32::MAX, u32::MAX) can never match a real chunk key, so every search misses
-            // and the scene renders empty. (A zero-length storage buffer is invalid.)
-            let mut bytes = Vec::with_capacity(20);
-            bytes.extend_from_slice(&u32::MAX.to_le_bytes()); // key_hi
-            bytes.extend_from_slice(&u32::MAX.to_le_bytes()); // key_lo
-            bytes.extend_from_slice(&0u32.to_le_bytes()); // occ_lo
-            bytes.extend_from_slice(&0u32.to_le_bytes()); // occ_hi
-            bytes.extend_from_slice(&0u32.to_le_bytes()); // tile_run_base
-            gpu_atlas.lookup_buffer = Some(device.create_buffer_with_data(&BufferInitDescriptor {
-                label: Some("sdf_chunk_lookup_buffer"),
-                contents: &bytes,
-                usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
-            }));
-            return;
+        if extracted.full_rebuild {
+            upload_tables_full(&device, &mut gpu_atlas, &extracted);
+        } else {
+            upload_tables_delta(&queue, &gpu_atlas, &extracted);
         }
-
-        // Chunk lookup table (std430: 5 × u32 per entry), sorted by absolute key — the
-        // shader binary-searches it.
-        let mut chunk_bytes = Vec::with_capacity(extracted.chunk_data.len() * 20);
-        for c in &extracted.chunk_data {
-            chunk_bytes.extend_from_slice(&c.key_hi.to_le_bytes());
-            chunk_bytes.extend_from_slice(&c.key_lo.to_le_bytes());
-            chunk_bytes.extend_from_slice(&c.occ_lo.to_le_bytes());
-            chunk_bytes.extend_from_slice(&c.occ_hi.to_le_bytes());
-            chunk_bytes.extend_from_slice(&c.tile_run_base.to_le_bytes());
-        }
-        gpu_atlas.lookup_buffer = Some(device.create_buffer_with_data(&BufferInitDescriptor {
-            label: Some("sdf_chunk_lookup_buffer"),
-            contents: &chunk_bytes,
-            usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
-        }));
-
-        // Packed per-chunk brick tile-run buffer (std430: 3 × u32 per resident brick).
-        let mut tile_bytes = Vec::with_capacity(extracted.tile_run_data.len() * 12);
-        for b in &extracted.tile_run_data {
-            tile_bytes.extend_from_slice(&b.atlas_base.to_le_bytes());
-            tile_bytes.extend_from_slice(&b.pal01.to_le_bytes());
-            tile_bytes.extend_from_slice(&b.pal23.to_le_bytes());
-        }
-        gpu_atlas.chunk_tile_buffer = Some(device.create_buffer_with_data(&BufferInitDescriptor {
-            label: Some("sdf_chunk_tile_buffer"),
-            contents: &tile_bytes,
-            usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
-        }));
     }
 
     if extracted.realloc {
@@ -1420,22 +1822,17 @@ fn init_sdf_pipeline(
             (texture_2d(TextureSampleType::Float { filterable: false }),),
         ),
     );
-
     let shader = shader_handle.0.clone();
     let vertex_state = fullscreen_shader.to_vertex_state();
 
     let pipeline_id = pipeline_cache.queue_render_pipeline(RenderPipelineDescriptor {
-        label: Some("sdf_pipeline".into()),
+        label: Some("sdf_gbuffer_pipeline".into()),
         layout: vec![layout_0.clone(), layout_1.clone(), layout_2.clone()],
         vertex: vertex_state,
         fragment: Some(FragmentState {
             shader: shader.clone(),
             shader_defs: vec![],
-            targets: vec![Some(ColorTargetState {
-                format: TextureFormat::bevy_default(),
-                blend: None,
-                write_mask: ColorWrites::ALL,
-            })],
+            targets: gbuffer_targets(),
             ..default()
         }),
         depth_stencil: Some(DepthStencilState {
@@ -1487,11 +1884,11 @@ fn init_sdf_pipeline(
         contents: &[0u8; 12],
         usage: BufferUsages::STORAGE,
     });
-    // One zeroed 48-byte GpuSdfMaterial row so binding 4 meets the struct's minimum
+    // One zeroed 80-byte GpuSdfMaterial row so binding 4 meets the struct's minimum
     // size before the real table uploads.
     let dummy_material = device.create_buffer_with_data(&BufferInitDescriptor {
         label: Some("sdf_dummy_material"),
-        contents: &[0u8; 64],
+        contents: &[0u8; 80],
         usage: BufferUsages::STORAGE,
     });
     // Matching dummy material atlas (Rgba16Snorm = 8 bytes/texel) so bind group 1 is
@@ -1575,6 +1972,57 @@ fn init_sdf_pipeline(
         material_buffer: Some(dummy_material),
         tex_array_views: Some(dummy_tex_views),
         tex_sampler: Some(dummy_tex_sampler),
+    });
+}
+
+/// Queue the combine render pipeline (final deferred-lighting pass: analytic sun + emissive →
+/// view target). Reuses `layout_0` (camera) + declares group 1 = 3 G-buffer textures + sampler.
+/// Runs after `init_sdf_pipeline`.
+fn init_combine_pipeline(
+    mut commands: Commands,
+    fullscreen_shader: Res<FullscreenShader>,
+    combine_shader: Res<SdfCombineShaderHandle>,
+    sdf_pipeline: Res<SdfPipeline>,
+    pipeline_cache: Res<PipelineCache>,
+) {
+    let layout = BindGroupLayoutDescriptor::new(
+        "sdf_combine_gbuffer",
+        &BindGroupLayoutEntries::sequential(
+            ShaderStages::FRAGMENT,
+            (
+                // 0..2: G-buffer albedo, normal-material, emissive
+                texture_2d(TextureSampleType::Float { filterable: false }),
+                texture_2d(TextureSampleType::Float { filterable: false }),
+                texture_2d(TextureSampleType::Float { filterable: false }),
+                // 3: non-filtering sampler
+                sampler(SamplerBindingType::NonFiltering),
+            ),
+        ),
+    );
+
+    let vertex_state = fullscreen_shader.to_vertex_state();
+    let pipeline_id = pipeline_cache.queue_render_pipeline(RenderPipelineDescriptor {
+        label: Some("sdf_combine_pipeline".into()),
+        layout: vec![sdf_pipeline.layout_0.clone(), layout.clone()],
+        vertex: vertex_state,
+        fragment: Some(FragmentState {
+            shader: combine_shader.0.clone(),
+            shader_defs: vec![],
+            targets: vec![Some(ColorTargetState {
+                format: ViewTarget::TEXTURE_FORMAT_HDR,
+                blend: None,
+                write_mask: ColorWrites::ALL,
+            })],
+            ..default()
+        }),
+        ..default()
+    });
+
+    commands.insert_resource(SdfCombinePipeline {
+        pipeline_id,
+        layout,
+        // Queued above with empty defs; rebuild fires once the synced defs differ.
+        current_defs: Vec::new(),
     });
 }
 

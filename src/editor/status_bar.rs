@@ -7,19 +7,44 @@ use crate::scene_manager::SceneEntity;
 use crate::sdf_render::SdfVolume;
 use crate::sdf_render::atlas::SdfAtlas;
 
+use super::config::EditorConfig;
 use super::profiling::ShaderProfilingData;
+
+/// Cached scene entity / SDF-volume counts for the status bar. Filled by [`update_scene_stats`]
+/// in `Update` (parallelizable) so the egui pass doesn't count the whole world every frame
+/// inside its exclusive-`World` critical section (perf roadmap E4).
+#[derive(Resource, Default)]
+pub struct EditorSceneStats {
+    pub scene_entities: usize,
+    pub volumes: usize,
+}
+
+/// Recount scene entities + SDF volumes into [`EditorSceneStats`]. A normal (parallel) system,
+/// not part of the serial egui pass; the status bar reads the cached resource.
+pub fn update_scene_stats(
+    scene_entities: Query<(), With<SceneEntity>>,
+    volumes: Query<(), With<SdfVolume>>,
+    mut stats: ResMut<EditorSceneStats>,
+) {
+    stats.scene_entities = scene_entities.iter().count();
+    stats.volumes = volumes.iter().count();
+}
+
+/// Register the status-bar stats resource + its updater.
+pub fn plugin(app: &mut App) {
+    app.init_resource::<EditorSceneStats>().add_systems(
+        Update,
+        update_scene_stats.run_if(|c: Res<EditorConfig>| c.enabled),
+    );
+}
 
 /// Render the bottom status strip: entity/volume counts, atlas bake state, and the perf
 /// readout (FPS / frame time).
 pub fn status_bar_ui(world: &mut World, ctx: &egui::Context) {
-    let scene_entities = world
-        .query_filtered::<(), With<SceneEntity>>()
-        .iter(world)
-        .count();
-    let volumes = world
-        .query_filtered::<(), With<SdfVolume>>()
-        .iter(world)
-        .count();
+    let (scene_entities, volumes) = world
+        .get_resource::<EditorSceneStats>()
+        .map(|s| (s.scene_entities, s.volumes))
+        .unwrap_or((0, 0));
     let (bricks, dirty) = world
         .get_resource::<SdfAtlas>()
         .map(|a| (a.bricks.len(), a.rebake_all || !a.gpu_baked_tiles.is_empty()))

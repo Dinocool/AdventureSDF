@@ -61,6 +61,40 @@ pub fn read_sorted(dir: &Path) -> (Vec<PathBuf>, Vec<PathBuf>) {
     (dirs, files)
 }
 
+/// How long a cached directory listing stays valid before [`read_sorted_cached`] re-reads.
+/// 5s is the target responsiveness for new/removed files appearing in the file panels.
+const DIR_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Per-path cache entry: when it was read, plus the sorted (dirs, files).
+type DirCacheMap =
+    std::collections::HashMap<PathBuf, (std::time::Instant, Vec<PathBuf>, Vec<PathBuf>)>;
+
+thread_local! {
+    /// Main-thread cache of [`read_sorted`] results. The editor's file panels walk the same
+    /// directories every frame; this avoids a blocking `read_dir` syscall per frame (a real
+    /// chunk of the egui-pass cost — see the perf roadmap E1).
+    static DIR_CACHE: std::cell::RefCell<DirCacheMap> =
+        std::cell::RefCell::new(DirCacheMap::new());
+}
+
+/// Like [`read_sorted`] but memoized per path for [`DIR_CACHE_TTL`] on the calling (main)
+/// thread. Returns owned clones. New/removed files appear within the TTL. Call only from the
+/// main thread (the editor egui pass) — the cache is thread-local.
+pub fn read_sorted_cached(dir: &Path) -> (Vec<PathBuf>, Vec<PathBuf>) {
+    DIR_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        let fresh = cache
+            .get(dir)
+            .is_some_and(|(read_at, ..)| read_at.elapsed() < DIR_CACHE_TTL);
+        if !fresh {
+            let (dirs, files) = read_sorted(dir);
+            cache.insert(dir.to_path_buf(), (std::time::Instant::now(), dirs, files));
+        }
+        let (_, dirs, files) = &cache[dir];
+        (dirs.clone(), files.clone())
+    })
+}
+
 /// Recursively collect every file (not directory) under `dir`.
 pub fn walk_files(dir: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();

@@ -38,7 +38,7 @@ fn populate_resident(atlas: &mut SdfAtlas, config: &SdfGridConfig, bvh: &Bvh, ca
         for coord in ring_window_coords(config, origin) {
             let key = BrickKey::new(lod, coord);
             if SdfAtlas::cull_edit_indices(key, bvh, config, &mut scratch).is_some() {
-                atlas.insert_gpu_brick(key, [PALETTE_EMPTY; PALETTE_K]);
+                atlas.insert_gpu_brick(key, [PALETTE_EMPTY; PALETTE_K], 0, config);
             }
         }
     }
@@ -72,17 +72,19 @@ fn device_queue() -> Option<(wgpu::Device, wgpu::Queue)> {
     Some((device, queue))
 }
 
-// --- SdfCameraUniform mirror (240 bytes) ---------------------------------------
-// Layout MUST match bindings.wgsl::SdfCameraUniform: 2× mat4x4 then 7× vec4.
-// We only need lod_params.z = voxel_size and lod_params.w = cell_stride filled.
+// --- SdfCameraUniform mirror (336 bytes) ---------------------------------------
+// Layout MUST match bindings.wgsl::SdfCameraUniform: 3× mat4x4 (inv_view_proj, clip_from_world,
+// prev_clip_from_world) then 9× vec4 (camera_pos, screen_params, grid_origin, grid_dims,
+// debug_params, march_params, lod_params, sun_dir, sun_color).
+// We only need lod_params filled; camera_pos stays 0 (the rig tests use a camera at the origin).
 fn camera_uniform_bytes(config: &SdfGridConfig) -> Vec<u8> {
-    let mut f = [0.0f32; 60]; // 240 bytes
-    // lod_params is the 9th field: 2 mats (32 floats) + 6 vec4 (24 floats) = 56.
+    let mut f = [0.0f32; 84]; // 336 bytes
+    // lod_params is the 10th field: 3 mats (48 floats) + 6 vec4 (24 floats) = 72.
     // lod_params = [lod_count, ring_bricks, base_voxel_size, cell_stride].
-    f[56] = config.lod_count as f32;
-    f[57] = config.ring_bricks as f32;
-    f[58] = config.voxel_size; // lod_params.z
-    f[59] = config.cell_stride() as f32; // lod_params.w
+    f[72] = config.lod_count as f32;
+    f[73] = config.ring_bricks as f32;
+    f[74] = config.voxel_size; // lod_params.z
+    f[75] = config.cell_stride() as f32; // lod_params.w
     bytemuck::cast_slice(&f).to_vec()
 }
 
@@ -172,7 +174,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 // to compare against the CPU shader_resolve. Isolates brick_in_chunk (the only chunk-path
 // piece not yet GPU-verified).
 const FULL_LOOKUP_PROBE_WGSL: &str = r#"
-#import sdf::bindings::{camera, chunk_buf, chunk_tile_buf, local_brick_index, abs_chunk_key}
+#import sdf::bindings::{camera, chunk_buf, chunk_tile_buf, local_brick_index}
 #import sdf::brick::{find_brick_lookup, find_chunk}
 
 struct CoordIn { x: i32, y: i32, z: i32, lod: u32 };
@@ -185,8 +187,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let c = vec3<i32>(coords[i].x, coords[i].y, coords[i].z);
     let loc = find_brick_lookup(c, coords[i].lod);
     let li = local_brick_index(c);
-    let key = abs_chunk_key(c, coords[i].lod);
-    let ci = find_chunk(key.x, key.y);
+    let ci = find_chunk(c, coords[i].lod);   // toroidal direct-index + tag
     outs[i] = LookupOut(loc.atlas_base, select(0u, 1u, loc.found), li, bitcast<u32>(ci));
 }
 "#;
@@ -790,7 +791,7 @@ fn brick_tile_bytes(tiles: &[adventure::sdf_render::chunk::BrickTile]) -> Vec<u8
 fn gpu_find_brick_lookup_matches_cpu() {
     use wgpu::util::DeviceExt;
     use adventure::sdf_render::atlas::BrickKey;
-    use adventure::sdf_render::chunk::{build_chunk_tables, chunk_of, chunk_gpu_key, BrickTile};
+    use adventure::sdf_render::chunk::{build_chunk_tables, chunk_of, chunk_gpu_key, dir_index, BrickTile};
 
     let Some((device, queue)) = device_queue() else {
         eprintln!("no GPU adapter — skipping");
@@ -821,12 +822,9 @@ fn gpu_find_brick_lookup_matches_cpu() {
         source: wgpu::ShaderSource::Naga(Cow::Owned(module)),
     });
 
-    // grid_dims.w = resident chunk count (find_chunk's search bound). Layout: 2 mats (32
-    // floats) + camera_pos(4) + screen_params(4) + grid_origin(4) = float 44; grid_dims.w
-    // = float 47 = byte 188.
-    let mut cam = camera_uniform_bytes(&config);
-    let n = tables.chunks.len() as f32;
-    cam[188..192].copy_from_slice(&n.to_le_bytes());
+    // The toroidal `find_chunk` direct-indexes `chunk_buf` by `dir_index` (using `ring_bricks` from
+    // lod_params, which `camera_uniform_bytes` sets) + a key-tag compare — no resident-count bound.
+    let cam = camera_uniform_bytes(&config);
 
     let camera_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("camera"), contents: &cam, usage: wgpu::BufferUsages::UNIFORM,
@@ -892,11 +890,25 @@ fn gpu_find_brick_lookup_matches_cpu() {
     drop(data);
     readback.unmap();
 
+    // CPU mirror of the GPU `find_chunk` + `brick_in_chunk`: direct-index the dense directory by
+    // `dir_index(ck, r)`, tag-check, then occupancy popcount.
+    let cpu_ci = |ck: adventure::sdf_render::chunk::ChunkKey| -> i32 {
+        let idx = dir_index(ck, tables.r);
+        if idx < tables.chunks.len()
+            && (tables.chunks[idx].key_hi, tables.chunks[idx].key_lo) == chunk_gpu_key(ck)
+        {
+            idx as i32
+        } else {
+            -1
+        }
+    };
     let cpu_resolve = |coord: IVec3| -> Option<u32> {
         let (ck, li) = chunk_of(BrickKey::new(0, coord), &config);
-        let (kh, kl) = chunk_gpu_key(ck);
-        let idx = tables.chunks.binary_search_by(|c| (c.key_hi, c.key_lo).cmp(&(kh, kl))).ok()?;
-        let chunk = tables.chunks[idx];
+        let ci = cpu_ci(ck);
+        if ci < 0 {
+            return None;
+        }
+        let chunk = tables.chunks[ci as usize];
         let occ = (chunk.occ_lo as u64) | ((chunk.occ_hi as u64) << 32);
         if (occ >> li) & 1 == 0 { return None; }
         let off = (occ & ((1u64 << li) - 1)).count_ones();
@@ -908,9 +920,7 @@ fn gpu_find_brick_lookup_matches_cpu() {
         let cpu = cpu_resolve(*c);
         let gpu = if o.found == 1 { Some(o.atlas_base) } else { None };
         let (ck, cpu_li) = chunk_of(BrickKey::new(0, *c), &config);
-        let (kh, kl) = chunk_gpu_key(ck);
-        let cpu_ci = tables.chunks.binary_search_by(|x| (x.key_hi, x.key_lo).cmp(&(kh, kl)))
-            .map(|i| i as i32).unwrap_or(-1);
+        let cpu_ci = cpu_ci(ck);
         if cpu != gpu {
             bad.push(format!(
                 "coord={c:?}: GPU base={gpu:?} li={} ci={} | CPU base={cpu:?} li={cpu_li} ci={cpu_ci}",
@@ -933,20 +943,21 @@ fn gpu_find_brick_lookup_matches_cpu() {
 // compare to the real CPU window for a batch of chunk coords across LODs.
 // =====================================================================================
 
-// Camera uniform with camera_pos (floats 32..35) + recenter_snap_chunks (debug_params.w =
-// float 51) filled, on top of the lod_params the base helper sets. `in_ring_chunk` reads
+// Camera uniform with camera_pos (floats 48..50) + recenter_snap_chunks (debug_params.w =
+// float 67) filled, on top of the lod_params the base helper sets. `in_ring_chunk` reads
 // camera_pos.xyz, ring_bricks()=lod_params.y, recenter_snap_chunks()=debug_params.w,
 // cell_stride()=lod_params.w, and voxel_size_at via lod_params.z.
+// Offsets follow the 336-byte SdfCameraUniform: 3× mat4 (48 floats) then 9× vec4.
 fn camera_uniform_bytes_full(config: &SdfGridConfig, camera_pos: Vec3) -> Vec<u8> {
-    let mut f = [0.0f32; 60];
-    f[32] = camera_pos.x; // camera_pos.xyz
-    f[33] = camera_pos.y;
-    f[34] = camera_pos.z;
-    f[51] = config.recenter_snap_chunks as f32; // debug_params.w
-    f[56] = config.lod_count as f32; // lod_params
-    f[57] = config.ring_bricks as f32;
-    f[58] = config.voxel_size;
-    f[59] = config.cell_stride() as f32;
+    let mut f = [0.0f32; 84]; // 336 bytes
+    f[48] = camera_pos.x; // camera_pos.xyz (4th field, after the 3 matrices)
+    f[49] = camera_pos.y;
+    f[50] = camera_pos.z;
+    f[67] = config.recenter_snap_chunks as f32; // debug_params.w
+    f[72] = config.lod_count as f32; // lod_params
+    f[73] = config.ring_bricks as f32;
+    f[74] = config.voxel_size;
+    f[75] = config.cell_stride() as f32;
     bytemuck::cast_slice(&f).to_vec()
 }
 

@@ -5,6 +5,7 @@
 
 use bevy::prelude::*;
 
+use crate::editor::menu_bar::EditorRequests;
 use crate::sdf_render::gizmo::{GizmoModes, GizmoState};
 use crate::sdf_render::SdfSelection;
 
@@ -12,9 +13,18 @@ use crate::sdf_render::SdfSelection;
 pub fn plugin(app: &mut App) {
     app.add_systems(
         Update,
-        (gizmo_mode_keys, delete_selection)
+        (gizmo_mode_keys, delete_selection, save_shortcut)
             .run_if(in_state(crate::scene_manager::AppScene::SdfEditor)),
     );
+}
+
+/// Ctrl+S saves the active scene (same path as File ▸ Save — the scene-tab manager drains
+/// the request, writing to the scene's path or prompting Save As if it has none).
+fn save_shortcut(keyboard: Res<ButtonInput<KeyCode>>, mut requests: ResMut<EditorRequests>) {
+    let ctrl = keyboard.pressed(KeyCode::ControlLeft) || keyboard.pressed(KeyCode::ControlRight);
+    if ctrl && keyboard.just_pressed(KeyCode::KeyS) {
+        requests.save = true;
+    }
 }
 
 /// W = translate, E = rotate, R = scale, Q = all modes. Ctrl held = snapping on.

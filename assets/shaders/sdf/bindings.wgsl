@@ -9,12 +9,15 @@
 struct SdfCameraUniform {
     inv_view_proj: mat4x4<f32>,
     clip_from_world: mat4x4<f32>,
+    // LAST frame's clip_from_world, for SSR: project a reflected world point into the previous
+    // frame's screen to sample its already-shaded colour (sdf_raymarch SSR path).
+    prev_clip_from_world: mat4x4<f32>,
     camera_pos: vec4<f32>,
-    screen_params: vec4<f32>,  // xy = screen_size, z = surface_bias (coarse-LOD iso-offset α), w unused
+    screen_params: vec4<f32>,  // xy = screen_size; zw unused (was surface_bias — iso-offset removed)
     grid_origin: vec4<f32>,
     grid_dims: vec4<f32>,
     debug_params: vec4<f32>,   // x = max_steps, y = max_dist, z = sdf_eps, w = recenter_snap_chunks
-    march_params: vec4<f32>,   // x = pixel_cone (world radius/unit-dist/pixel), y = cubic_band, z = over_relax, w = lod_blend_band
+    march_params: vec4<f32>,   // x = pixel_cone (world radius/unit-dist/pixel), y = reserved (was cubic_band), z = over_relax, w = lod_blend_band
     lod_params: vec4<f32>,     // x = lod_count, y = ring_bricks, z = base voxel_size, w = cell_stride
     sun_dir: vec4<f32>,        // xyz = direction toward the key light; w unused
     sun_color: vec4<f32>,      // rgb = key-light radiance; w unused
@@ -22,7 +25,8 @@ struct SdfCameraUniform {
 
 // One material row, indexed by global material id. Mirrors `GpuSdfMaterial`
 // (render.rs): base colour + seam softness + per-map texture-array layer indices
-// (0xffffffff = no texture for that map) + scalar metallic/roughness fallbacks. 48 bytes.
+// (0xffffffff = no texture for that map) + scalar metallic/roughness fallbacks +
+// emissive. 80 bytes.
 struct SdfMaterial {
     base_color: vec4<f32>,
     blend_softness: f32,   // world-units colour-feather width at a seam
@@ -37,12 +41,14 @@ struct SdfMaterial {
     roughness: f32,
     // Parallax-occlusion relief depth (UV units) for this material's height map. 0 = flat.
     parallax_scale: f32,
-    // Three SEPARATE u32 pads — NOT vec3<u32>, which has 16-byte alignment in WGSL and would
-    // bump the struct to 80 bytes, mismatching the 64-byte Rust GpuSdfMaterial (flat u32s).
-    // Names avoid trailing digits (naga_oil writeback rejects `pad0` etc).
+    // Three SEPARATE u32 pads — NOT vec3<u32>, which has 16-byte alignment in WGSL — aligning
+    // `emissive` to its 16-byte boundary (offset 64). Names avoid trailing digits (naga_oil
+    // writeback rejects `pad0` etc).
     pad_a: u32,
     pad_b: u32,
     pad_c: u32,
+    // Emissive radiance, linear RGB in xyz (intensity premultiplied CPU-side); w spare.
+    emissive: vec4<f32>,
 };
 
 // Per-brick lookup. `key_hi`/`key_lo` are the absolute 64-bit brick key (lod + biased
@@ -113,10 +119,8 @@ fn sdf_eps() -> f32 { return camera.debug_params.z; }
 // surface is within a pixel — so far geometry resolves at coarse LOD instead of marching
 // down to LOD 0 (the vast-distance efficiency win).
 fn pixel_cone() -> f32 { return camera.march_params.x; }
-// Distance band (world units) within which a LOD-0 sample switches to the exact analytic
-// cubic for a crisp near silhouette. Outside it (or at coarse LOD) the march sphere-traces
-// the conservative field.
-fn cubic_band() -> f32 { return camera.march_params.y; }
+// march_params.y is reserved (was the LOD-0 analytic-cubic distance band, removed — the
+// cubic solver gave no measurable quality win over plain sphere-tracing).
 // Sphere-trace over-relaxation factor (Keinert 2014): the march steps `over_relax * d`
 // instead of `d`, with a safe fallback when consecutive unbounding spheres separate.
 // 1.0 = plain sphere tracing; (1,2) accelerates convergence on grazing rays.
@@ -129,10 +133,6 @@ fn lod_blend_band() -> f32 { return camera.march_params.w; }
 // The LOD cross-fade keys off the chunk-SNAPPED ring centre, so the shader recomputes it
 // from camera_pos + this (mirrors bake_scheduler::ring_chunk_origin). >= 1.
 fn recenter_snap() -> i32 { return max(i32(camera.debug_params.w), 1); }
-// Coarse-LOD iso-offset α. The sphere-trace march renders the surface where the field
-// equals `α · voxel_size(lod)² / base` (not 0), re-inflating the trilinear shrink that
-// makes convex objects thinner at coarse LODs. 0 = off; zero at LOD 0 (cubic owns it).
-fn surface_bias() -> f32 { return camera.screen_params.z; }
 
 // --- LOD clipmap / chunk accessors ---
 
@@ -223,4 +223,33 @@ fn local_brick_index(coord: vec3<i32>) -> u32 {
     let ly = euclid_mod(floor_div(coord.y, s), c);
     let lz = euclid_mod(floor_div(coord.z, s), c);
     return u32(lz * c * c + ly * c + lx);
+}
+
+// Ring chunks per axis: R = ring_bricks / CHUNK_BRICKS. Mirrors `LiveChunkTables::r`.
+fn ring_chunks() -> i32 {
+    return ring_bricks() / CHUNK_BRICKS;
+}
+
+// The chunk coord (on the LOD's chunk lattice) containing brick `coord` — the chunk-coord step of
+// chunk::chunk_of (brick index → chunk index, Euclidean so negatives map continuously).
+fn chunk_coord_of(coord: vec3<i32>) -> vec3<i32> {
+    let s = cell_stride();
+    return vec3<i32>(
+        floor_div(floor_div(coord.x, s), CHUNK_BRICKS),
+        floor_div(floor_div(coord.y, s), CHUNK_BRICKS),
+        floor_div(floor_div(coord.z, s), CHUNK_BRICKS),
+    );
+}
+
+// Physical directory slot of the chunk containing brick `coord` at `lod`, into the dense per-LOD
+// toroidal directory `chunk_buf`: lod*R³ + flatten(euclid_mod(chunk_coord, R)). EXACT mirror of
+// chunk::dir_index — the GPU-rig parity test guards against drift. `euclid_mod` (never raw `%`) so
+// negative coords + non-power-of-two R both index correctly.
+fn dir_index(coord: vec3<i32>, lod: u32) -> u32 {
+    let r = ring_chunks();
+    let cc = chunk_coord_of(coord);
+    let mx = euclid_mod(cc.x, r);
+    let my = euclid_mod(cc.y, r);
+    let mz = euclid_mod(cc.z, r);
+    return lod * u32(r * r * r) + u32(mz * r * r + my * r + mx);
 }

@@ -8,8 +8,6 @@ use std::path::PathBuf;
 use bevy::prelude::*;
 use bevy_egui::egui;
 
-use super::config::EditorConfig;
-
 /// One-shot editor commands raised by the menu bar / keybinds, drained by the
 /// systems that own each action (scene I/O lives in `soul_scene`).
 #[derive(Resource, Default)]
@@ -27,15 +25,25 @@ pub struct CurrentScenePath(pub PathBuf);
 
 impl Default for CurrentScenePath {
     fn default() -> Self {
-        Self(PathBuf::from("assets/scenes/untitled.scene"))
+        // The editor loads the gallery as its default scene, so File→Save targets it.
+        Self(PathBuf::from(crate::sdf_render::DEFAULT_SCENE_PATH))
     }
 }
 
 pub fn menu_bar_ui(world: &mut World, ctx: &egui::Context) {
+    use super::dock::{EditorDockState, EditorTab};
+    use super::layout::{self, LayoutsDialog};
+    use super::panels::{DebugPanelRegistry, DockSide};
+    use super::scene_browser::{OpenSceneDialog, SaveSceneDialog};
+
     let current = world.resource::<CurrentScenePath>().0.clone();
     let mut req_new = false;
     let mut req_save = false;
-    let mut req_open: Option<PathBuf> = None;
+    let mut open_browser = false;
+    let mut save_as_browser = false;
+    let mut panel_toggles: Vec<(EditorTab, DockSide, bool)> = Vec::new();
+    let mut restore_default = false;
+    let mut open_layouts = false;
 
     egui::TopBottomPanel::top("editor_menu_bar").show(ctx, |ui| {
         egui::MenuBar::new().ui(ui, |ui| {
@@ -45,12 +53,16 @@ pub fn menu_bar_ui(world: &mut World, ctx: &egui::Context) {
                     ui.close();
                 }
                 if ui.button("Open…").clicked() {
-                    // Until a file dialog is wired, reopen the current path.
-                    req_open = Some(current.clone());
+                    // Open the file browser, starting in the current scene's directory.
+                    open_browser = true;
                     ui.close();
                 }
                 if ui.button("Save").clicked() {
                     req_save = true;
+                    ui.close();
+                }
+                if ui.button("Save As…").clicked() {
+                    save_as_browser = true;
                     ui.close();
                 }
                 ui.separator();
@@ -58,20 +70,56 @@ pub fn menu_bar_ui(world: &mut World, ctx: &egui::Context) {
             });
 
             ui.menu_button("View", |ui| {
-                let mut enabled = world.resource::<EditorConfig>().enabled;
-                if ui.checkbox(&mut enabled, "Editor panels").changed() {
-                    world.resource_mut::<EditorConfig>().enabled = enabled;
+                ui.label("Panels");
+                ui.separator();
+                let panels = layout::toggleable_panels(world.resource::<DebugPanelRegistry>());
+                for (tab, title, side) in panels {
+                    let mut present =
+                        layout::panel_present(world.resource::<EditorDockState>(), &tab);
+                    if ui.checkbox(&mut present, title).changed() {
+                        panel_toggles.push((tab, side, present));
+                    }
+                }
+            });
+
+            ui.menu_button("Layout", |ui| {
+                if ui.button("Restore Default Layout").clicked() {
+                    restore_default = true;
+                    ui.close();
+                }
+                ui.separator();
+                if ui.button("Manage Layouts\u{2026}").clicked() {
+                    open_layouts = true;
+                    ui.close();
                 }
             });
         });
     });
 
-    if req_new || req_save || req_open.is_some() {
+    for (tab, side, present) in panel_toggles {
+        layout::set_panel_present(world, tab, side, present);
+    }
+    if restore_default {
+        let registry = world
+            .remove_resource::<DebugPanelRegistry>()
+            .unwrap_or_default();
+        layout::restore_default(world, &registry);
+        world.insert_resource(registry);
+    }
+    if open_layouts {
+        world.resource_mut::<LayoutsDialog>().open = true;
+    }
+
+    if req_new || req_save {
         let mut requests = world.resource_mut::<EditorRequests>();
         requests.new_scene |= req_new;
         requests.save |= req_save;
-        if req_open.is_some() {
-            requests.open = req_open;
-        }
+    }
+    if open_browser {
+        let start = current.parent().map(PathBuf::from).unwrap_or_default();
+        world.resource_mut::<OpenSceneDialog>().show_at(&start);
+    }
+    if save_as_browser {
+        world.resource_mut::<SaveSceneDialog>().show_for(&current);
     }
 }
