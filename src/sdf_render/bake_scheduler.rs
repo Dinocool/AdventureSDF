@@ -1301,8 +1301,9 @@ mod tests {
         Some(tiles[(c.tile_run_base + off) as usize])
     }
 
-    /// Apply the live table's per-frame delta to a GPU-buffer mirror EXACTLY as `render.rs` does: the
-    /// directory (chunk_buf) is fixed-size so it only "grows" once; otherwise write the dirty
+    /// Apply the live table's per-frame delta to a GPU-buffer mirror EXACTLY as `render.rs` does, by
+    /// routing through the SAME [`chunk::LiveChunkTables::upload`] accessor that owns the
+    /// rebuild-vs-delta + headroom policy: a Full re-sizes the buffers once, a Delta writes the dirty
     /// directory slots + tile-run regions in place (no row shift, no sentinel tail).
     fn apply_table_delta(
         live: &chunk::LiveChunkTables,
@@ -1311,22 +1312,22 @@ mod tests {
         cap_rows: &mut u32,
         cap_slots: &mut u32,
     ) {
-        let needed_rows = live.row_count();
-        let needed_slots = live.tile_run_capacity();
-        if *cap_rows == 0 || needed_rows > *cap_rows || needed_slots > *cap_slots {
-            *cap_rows = needed_rows;
-            *cap_slots = (needed_slots + needed_slots / 2).max(needed_slots + chunk::TILE_RUN_SLOT);
-            let (rws, t) = live.full_tables();
-            *rows = rws;
-            *tiles = t;
-            tiles.resize(*cap_slots as usize, chunk::BrickTile::default());
-        } else {
-            for &row in &live.dirty_rows {
-                rows[row as usize] = live.lookup_at(row);
+        match live.upload(*cap_rows, *cap_slots) {
+            chunk::ChunkUpload::Full { rows: r, tile_run, cap_rows: cr, cap_slots: cs } => {
+                *cap_rows = cr;
+                *cap_slots = cs;
+                *rows = r;
+                *tiles = tile_run;
+                tiles.resize(*cap_slots as usize, chunk::BrickTile::default());
             }
-            for &slot in &live.dirty_slots {
-                let base = (slot * chunk::TILE_RUN_SLOT) as usize;
-                tiles[base..base + chunk::TILE_RUN_SLOT as usize].copy_from_slice(&live.tile_region(slot));
+            chunk::ChunkUpload::Delta { row_updates, region_updates } => {
+                for (row, look) in row_updates {
+                    rows[row as usize] = look;
+                }
+                for (slot, region) in region_updates {
+                    let base = (slot * chunk::TILE_RUN_SLOT) as usize;
+                    tiles[base..base + chunk::TILE_RUN_SLOT as usize].copy_from_slice(&region);
+                }
             }
         }
     }

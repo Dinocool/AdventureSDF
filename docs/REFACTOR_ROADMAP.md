@@ -125,7 +125,7 @@ hand-copied across production + tests, so a contract change must be edited in 4-
 silently stops exercising the real path. Consolidating **reduces** drift risk. Do C1 first (it's the
 verified `high`). Keep the differential tests green at every step.
 
-### [ ] C1. Collapse the triplicated upload decision behind a `LiveChunkTables::upload()` accessor
+### [x] C1. Collapse the triplicated upload decision behind a `LiveChunkTables::upload()` accessor
 `impact: high` * `effort: medium` * `source: api-boundaries`
 
 - *Now:* The full-rebuild-vs-delta decision + the `+50%` tile-run headroom formula
