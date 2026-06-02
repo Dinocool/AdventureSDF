@@ -101,10 +101,10 @@ pub struct BakeScheduler {
     pending: std::collections::HashSet<chunk::ChunkKey>,
     /// MAKE-BEFORE-BREAK eviction: chunks that exited their LOD window but whose bricks are kept
     /// resident until the region's REPLACEMENT (a coarser resident LOD covering it) is in place — so
-    /// the march never marches into a momentarily-uncovered region during a handoff. Maps each
-    /// deferred chunk to how many frames it's waited (a safety cap force-evicts a straggler whose
-    /// replacement never materialises, e.g. it left the clipmap reach entirely). See `schedule_bakes`.
-    pending_evict: std::collections::HashMap<chunk::ChunkKey, u32>,
+    /// the march never marches into a momentarily-uncovered region during a handoff. Each deferred
+    /// chunk carries an [`EvictState`] (waited-frames + the cached BVH verdict) so step 4's per-frame
+    /// readiness check is a cheap resident probe, never a BVH query. See `schedule_bakes`.
+    pending_evict: std::collections::HashMap<chunk::ChunkKey, EvictState>,
     /// Reusable emit scratch (cleared + refilled each frame) so a continuous drag does zero
     /// growth reallocation. `mem::take`n into `emit_gpu_bakes` and restored at the end.
     emit_scratch: EmitScratch,
@@ -115,6 +115,23 @@ pub struct BakeScheduler {
     edit_gen: u64,
 }
 
+/// Per-deferred-chunk eviction state. Splits make-before-break readiness into a cheap per-frame part
+/// (is a coarser brick resident yet? — a HashMap probe) and the expensive BVH part (`needs_coarser`),
+/// which is computed ONCE at defer time and cached. The BVH verdict only depends on the edit set, so
+/// it is recomputed solely when `gen` no longer matches the scheduler's `edit_gen`. This keeps step 4
+/// off the BVH on the per-frame hot path — the fly-through stutter fix — while still examining (and
+/// thus draining) the WHOLE deferred set every frame so held bricks never accumulate unbounded.
+#[derive(Clone, Copy)]
+struct EvictState {
+    /// Frames this chunk has waited; a straggler past [`EVICT_DEFER_CAP`] is force-evicted.
+    age: u32,
+    /// Cached `coarser_region_has_geometry`: some coarser LOD has geometry that will bake into the
+    /// replacement. `false` ⇒ nothing coarser will ever cover this region ⇒ safe to evict now.
+    needs_coarser: bool,
+    /// `edit_gen` the `needs_coarser` verdict was computed against; a mismatch forces a recompute.
+    verdict_gen: u64,
+}
+
 /// Per-frame scratch buffers for `emit_gpu_bakes`, held on the scheduler so their capacity
 /// persists across frames instead of allocating from empty each emit.
 #[derive(Default)]
@@ -122,6 +139,9 @@ struct EmitScratch {
     drained: Vec<chunk::ChunkKey>,
     candidates: Vec<(chunk::ChunkKey, atlas::BrickKey)>,
     spilled: std::collections::HashSet<chunk::ChunkKey>,
+    /// Reusable key snapshot for step 4's eviction scan (cleared + refilled each frame), so iterating
+    /// the deferred set while mutating it costs no per-frame allocation.
+    evict_scan: Vec<chunk::ChunkKey>,
 }
 
 impl Default for BakeScheduler {
@@ -287,6 +307,11 @@ fn chunk_has_geometry_with(
 /// True iff it's the coarsest LOD (no coarser fallback can exist), a coarser LOD already covers its
 /// region (the replacement is in place), OR no coarser geometry will ever cover it (nothing to wait
 /// for). False ⇒ a coarser chunk with geometry is still baking — hold the bricks until it lands.
+///
+/// Production no longer calls this on the hot path — it splits the BVH part (`coarser_region_has_geometry`,
+/// cached once at defer time) from the cheap residency part (`evict_ready_cached`, re-checked live).
+/// Retained as the test oracle those two are validated against (`evict_cached_verdict_matches_live`).
+#[cfg(test)]
 fn replacement_ready(
     atlas: &SdfAtlas,
     bvh: &bvh::Bvh,
@@ -297,6 +322,24 @@ fn replacement_ready(
     ck.lod + 1 >= config.lod_count
         || coarser_region_resident(atlas, config, ck)
         || !coarser_region_has_geometry(bvh, config, ck, stack)
+}
+
+/// Cheap per-frame eviction readiness, using the cached `needs_coarser` verdict (the BVH-dependent
+/// part, computed once at defer time). Equivalent to [`replacement_ready`] whenever `needs_coarser`
+/// was computed as `coarser_region_has_geometry` for the current edit set: both reduce to
+/// `coarsest-LOD || a coarser brick is resident || nothing coarser will ever cover it`. The only
+/// per-frame cost here is the live `coarser_region_resident` HashMap probe — and that is skipped
+/// entirely once `needs_coarser` is false — so step 4 can re-check (and drain) the WHOLE deferred set
+/// every frame without ever touching the BVH.
+fn evict_ready_cached(
+    atlas: &SdfAtlas,
+    config: &SdfGridConfig,
+    ck: chunk::ChunkKey,
+    needs_coarser: bool,
+) -> bool {
+    ck.lod + 1 >= config.lod_count
+        || !needs_coarser
+        || coarser_region_resident(atlas, config, ck)
 }
 
 /// Make-before-break: a COARSER LOD has a RESIDENT brick covering `ck`'s region (its center), so
@@ -524,13 +567,18 @@ pub fn schedule_bakes(
     }
 
     // --- 1. Edit changes → dirty affected chunks (within current windows) ------------
+    // `sched_gather` runs EVERY frame (change detection over all volumes) — instrumented
+    // separately from the conditional re-dirty so a trace shows the fixed per-frame floor.
+    let g_gather = info_span!("sched_gather").entered();
     let gathered = gather_sorted_edits(&volumes);
     let current: std::collections::HashMap<Entity, bevy::math::bounding::Aabb3d> =
         gathered.iter().map(|g| (g.entity, g.aabb)).collect();
     let set_changed = current.len() != prev_aabbs.map.len()
         || current.keys().any(|e| !prev_aabbs.map.contains_key(e));
     let edits_changed = atlas.rebake_all || set_changed || !changed.is_empty();
+    drop(g_gather);
 
+    let g_edit = info_span!("sched_edit_detect", changed = edits_changed).entered();
     if edits_changed {
         let resolved: Vec<edits::ResolvedEdit> = gathered.iter().map(|g| g.edit.clone()).collect();
         let aabbs: Vec<bevy::math::bounding::Aabb3d> = gathered.iter().map(|g| g.aabb).collect();
@@ -606,11 +654,16 @@ pub fn schedule_bakes(
         }
         prev_aabbs.map = current;
     }
+    drop(g_edit);
 
     // --- 2. Camera chunk-ring recenter (eager enter/evict, absolute addressing) ------
     // `atlas.remove_brick` bumps the upload + topology generations itself, so an evict-only
     // frame (e.g. flying away from the scene) still makes the render world re-extract and
     // drop the stale bricks — it doesn't depend on a bake being applied that frame.
+    // Instrumented: this is the per-recenter-snap cost (entered-shell BVH queries), the
+    // prime suspect for the fly-through stutter spikes.
+    let g_recenter = info_span!("sched_recenter").entered();
+    let edit_gen = sched.edit_gen;
     let mut bvh_stack: Vec<u32> = Vec::new();
     for lod in 0..lod_count {
         let li = lod as usize;
@@ -641,37 +694,71 @@ pub fn schedule_bakes(
             for_each_exited_chunk(new_origin, old_origin, r, |coord| {
                 let ck = chunk::ChunkKey::new(lod, coord);
                 sched.pending.remove(&ck);
-                sched.pending_evict.entry(ck).or_insert(0);
+                // Compute the BVH-dependent make-before-break verdict ONCE, here at defer time, so
+                // step 4's per-frame readiness check stays off the BVH. Only the small exited shell
+                // is visited each recenter, so this cost is naturally spread across frames (unlike a
+                // full-set BVH rescan, which was the fly-through stutter).
+                let needs_coarser = coarser_region_has_geometry(&bvh, &config, ck, &mut bvh_stack);
+                sched
+                    .pending_evict
+                    .entry(ck)
+                    .or_insert(EvictState { age: 0, needs_coarser, verdict_gen: edit_gen });
             });
         }
         sched.ring_chunk_origin[li] = new_origin;
     }
+    drop(g_recenter);
 
     // --- 3. Emit GPU bake jobs for the dirty chunks ----------------------------------
     // The CPU does only topology (BVH cull + palette + tile alloc) and emits a GpuBakeJob per
     // brick; the compute shader fills the texels. Small bakes run synchronously; a large shell
     // (coarse-LOD snap) offloads its classify to a background task (see `dispatch_bake`).
-    dispatch_bake(
-        &mut atlas, &mut sched, &mut bake_task, &mut gpu_bakes, &config, camera_pos, &mut baked_dbg, now,
-    );
+    {
+        let _g_dispatch = info_span!("sched_dispatch").entered();
+        dispatch_bake(
+            &mut atlas, &mut sched, &mut bake_task, &mut gpu_bakes, &config, camera_pos, &mut baked_dbg, now,
+        );
+    }
 
     // --- 4. Deferred (make-before-break) eviction --------------------------------------
     // Now that this frame's bakes have landed, drop each deferred chunk whose REPLACEMENT is in
     // place: a coarser LOD already covers its region (so the march falls back cleanly), it's the
     // coarsest LOD (no coarser fallback can exist), or no coarser geometry exists to wait for. A
     // straggler past the safety cap is force-dropped so its tiles aren't pinned forever.
+    //
+    // The WHOLE deferred set is examined every frame so eviction keeps pace with inflow (held bricks
+    // never accumulate unbounded). That is only affordable because the BVH-dependent verdict was
+    // cached at defer time (`EvictState.needs_coarser`): the per-frame check is a cheap resident
+    // probe via `evict_ready_cached`, never a BVH query. The cached verdict is refreshed only when
+    // the edit set changed since it was computed (`gen != edit_gen`).
     if !sched.pending_evict.is_empty() {
-        let bvh = Arc::clone(&sched.bvh);
+        let _g_evict = info_span!("sched_evict", deferred = sched.pending_evict.len()).entered();
         let mut stack: Vec<u32> = Vec::new();
+        // Reborrow the ResMut as `&mut BakeScheduler` so the disjoint field borrows below split
+        // (going through ResMut's DerefMut twice would be two whole-value borrows).
+        let s = &mut *sched;
+        // Snapshot the keys into reusable scratch so we can iterate while removing, alloc-free.
+        let mut scratch = std::mem::take(&mut s.emit_scratch.evict_scan);
+        scratch.clear();
+        scratch.extend(s.pending_evict.keys().copied());
+
         let mut evict: Vec<chunk::ChunkKey> = Vec::new();
-        for (ck, age) in sched.pending_evict.iter_mut() {
-            *age += 1;
-            if replacement_ready(&atlas, &bvh, &config, *ck, &mut stack) || *age > EVICT_DEFER_CAP {
-                evict.push(*ck);
+        for &ck in &scratch {
+            let st = s.pending_evict.get_mut(&ck).expect("snapshot key still resident");
+            st.age += 1;
+            // Refresh the cached BVH verdict only if the edit set changed since it was computed.
+            if st.verdict_gen != s.edit_gen {
+                st.needs_coarser = coarser_region_has_geometry(&bvh, &config, ck, &mut stack);
+                st.verdict_gen = s.edit_gen;
+            }
+            if evict_ready_cached(&atlas, &config, ck, st.needs_coarser) || st.age > EVICT_DEFER_CAP {
+                evict.push(ck);
             }
         }
+        s.emit_scratch.evict_scan = scratch;
+
         for ck in evict {
-            sched.pending_evict.remove(&ck);
+            s.pending_evict.remove(&ck);
             for_each_brick_key(ck, &config, |bk| {
                 atlas.remove_brick(&bk, &config);
             });
@@ -1448,6 +1535,54 @@ mod tests {
         let empty = chunk::ChunkKey::new(0, IVec3::new(10_000, 0, 0));
         assert!(!chunk_has_geometry_with(empty, &bvh, &cfg, &mut stack));
         assert!(replacement_ready(&atlas, &bvh, &cfg, empty, &mut stack));
+    }
+
+    /// Phase-2 cached eviction verdict: `evict_ready_cached` (using a `needs_coarser` computed ONCE at
+    /// defer time) must agree with the full live `replacement_ready` across a residency change -- i.e.
+    /// caching the BVH part is sound because the residency part is still checked live each frame. Also
+    /// covers the no-coarser-geometry and coarsest-LOD shortcuts that never need the residency probe.
+    #[test]
+    fn evict_cached_verdict_matches_live() {
+        let cfg = SdfGridConfig { lod_count: 3, ..config() };
+        let edits = vec![sphere_edit(Vec3::ZERO, 12.0, 0)];
+        let bvh = build_bvh(&edits);
+        let mut atlas = SdfAtlas::default();
+        let mut stack = Vec::new();
+
+        let surf = Vec3::new(12.0, 0.0, 0.0);
+        let c = chunk::chunk_of(atlas::BrickKey::new(0, cfg.world_to_brick_lod(surf, 0)), &cfg).0;
+        // Verdict cached at defer time (the only BVH query in the deferred chunk's lifetime).
+        let needs_coarser = coarser_region_has_geometry(&bvh, &cfg, c, &mut stack);
+        assert!(needs_coarser, "coarser geometry exists over the surface chunk");
+
+        // Before any coarser brick is resident: cached == live == NOT ready (defer).
+        assert_eq!(
+            evict_ready_cached(&atlas, &cfg, c, needs_coarser),
+            replacement_ready(&atlas, &bvh, &cfg, c, &mut stack)
+        );
+        assert!(!evict_ready_cached(&atlas, &cfg, c, needs_coarser));
+
+        // Bake the coarser brick: residency flips. Re-checking with the SAME cached `needs_coarser`
+        // must now agree with live == ready -- the crux that residency is live, only the BVH cached.
+        let center =
+            chunk::chunk_min_world(c, &cfg) + Vec3::splat(0.5 * chunk::chunk_world_size(c.lod, &cfg));
+        let parent = atlas::BrickKey::new(1, cfg.world_to_brick_lod(center, 1));
+        atlas.insert_gpu_brick(parent, [edits::PALETTE_EMPTY; edits::PALETTE_K], 0, &cfg);
+        assert_eq!(
+            evict_ready_cached(&atlas, &cfg, c, needs_coarser),
+            replacement_ready(&atlas, &bvh, &cfg, c, &mut stack)
+        );
+        assert!(evict_ready_cached(&atlas, &cfg, c, needs_coarser), "ready once coarser is resident");
+
+        // No coarser geometry (needs_coarser == false): ready regardless of residency (no leak).
+        let empty = chunk::ChunkKey::new(0, IVec3::new(10_000, 0, 0));
+        let empty_needs = coarser_region_has_geometry(&bvh, &cfg, empty, &mut stack);
+        assert!(!empty_needs);
+        assert!(evict_ready_cached(&atlas, &cfg, empty, empty_needs));
+
+        // Coarsest LOD: always ready (no fallback can exist), even with needs_coarser == true.
+        let coarsest = chunk::ChunkKey::new(cfg.lod_count - 1, c.coord);
+        assert!(evict_ready_cached(&atlas, &cfg, coarsest, true));
     }
 
     /// THE garbled-LOD-transition guard: drive the REAL recenter + emit lifecycle (fly a camera out
