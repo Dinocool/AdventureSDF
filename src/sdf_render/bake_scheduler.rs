@@ -1271,30 +1271,6 @@ mod tests {
         bvh::Bvh::build(&aabbs)
     }
 
-    /// Resolve (chunk, local) through a GPU lookup-buffer pair the way the shader does: direct-index
-    /// the dense directory by `dir_index(ck, r)`, tag-check, then popcount-index the dense tile run.
-    fn resolve_table(
-        rows: &[chunk::ChunkLookup],
-        tiles: &[chunk::BrickTile],
-        r: i32,
-        ck: chunk::ChunkKey,
-        local: u32,
-    ) -> Option<chunk::BrickTile> {
-        let idx = chunk::dir_index(ck, r);
-        if idx >= rows.len() {
-            return None;
-        }
-        let c = rows[idx];
-        if (c.key_hi, c.key_lo) != chunk::chunk_gpu_key(ck) {
-            return None;
-        }
-        let occ = (c.occ_lo as u64) | ((c.occ_hi as u64) << 32);
-        if (occ >> local) & 1 == 0 {
-            return None;
-        }
-        let off = (occ & ((1u64 << local) - 1)).count_ones();
-        Some(tiles[(c.tile_run_base + off) as usize])
-    }
 
     /// Apply the live table's per-frame delta to a GPU-buffer mirror EXACTLY as `render.rs` does, by
     /// routing through the SAME [`chunk::LiveChunkTables::upload`] accessor that owns the
@@ -1408,12 +1384,12 @@ mod tests {
                     let want = chunk::tile_atlas_base(tile);
                     let (ck, local) = chunk::chunk_of(*key, &cfg);
                     assert_eq!(
-                        resolve_table(&fr, &ft, cfg.ring_chunks_per_axis(), ck, local).map(|t| t.atlas_base),
+                        chunk::resolve_via_tables(&fr, &ft, cfg.ring_chunks_per_axis(), ck, local).map(|t| t.atlas_base),
                         Some(want),
                         "step {step}: full_tables resolves brick {key:?} to the wrong/absent tile"
                     );
                     assert_eq!(
-                        resolve_table(&rows, &tiles, cfg.ring_chunks_per_axis(), ck, local).map(|t| t.atlas_base),
+                        chunk::resolve_via_tables(&rows, &tiles, cfg.ring_chunks_per_axis(), ck, local).map(|t| t.atlas_base),
                         Some(want),
                         "step {step}: delta-mirror resolves brick {key:?} to the wrong/absent tile"
                     );
@@ -1642,12 +1618,12 @@ mod tests {
                 let want = chunk::tile_atlas_base(tile);
                 let (ck, local) = chunk::chunk_of(*key, &cfg);
                 assert_eq!(
-                    resolve_table(&fr, &ft, cfg.ring_chunks_per_axis(), ck, local).map(|t| t.atlas_base),
+                    chunk::resolve_via_tables(&fr, &ft, cfg.ring_chunks_per_axis(), ck, local).map(|t| t.atlas_base),
                     Some(want),
                     "frame {frame} (x={x}): full_tables resolves brick {key:?} to the wrong/absent tile"
                 );
                 assert_eq!(
-                    resolve_table(&rows, &tiles, cfg.ring_chunks_per_axis(), ck, local).map(|t| t.atlas_base),
+                    chunk::resolve_via_tables(&rows, &tiles, cfg.ring_chunks_per_axis(), ck, local).map(|t| t.atlas_base),
                     Some(want),
                     "frame {frame} (x={x}): delta-mirror resolves brick {key:?} to the wrong/absent tile"
                 );

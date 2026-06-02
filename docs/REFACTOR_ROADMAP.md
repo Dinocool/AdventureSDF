@@ -163,7 +163,7 @@ verified `high`). Keep the differential tests green at every step.
   `ShaderType` on `chunk.rs` types breaks its documented purity (constraint #2) -- prefer keeping the
   GPU derive in `render.rs` and just collapsing the converters/encoder.
 
-### [ ] C3. Extract the 4x `shader_resolve` unpack + 2x table-delta into shared test-support helpers
+### [x] C3. Extract the 4x `shader_resolve` unpack + 2x table-delta into shared test-support helpers
 `impact: medium` * `effort: medium` * `source: refactor-deadcode`
 
 - *Now:* The `dir_index → tag-check → occupancy-bit → popcount-offset` unpack is hand-rewritten at
