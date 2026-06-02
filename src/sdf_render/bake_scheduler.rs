@@ -99,6 +99,12 @@ pub struct BakeScheduler {
     ring_chunk_origin: Vec<IVec3>,
     /// Chunk keys awaiting a bake (deduped).
     pending: std::collections::HashSet<chunk::ChunkKey>,
+    /// MAKE-BEFORE-BREAK eviction: chunks that exited their LOD window but whose bricks are kept
+    /// resident until the region's REPLACEMENT (a coarser resident LOD covering it) is in place — so
+    /// the march never marches into a momentarily-uncovered region during a handoff. Maps each
+    /// deferred chunk to how many frames it's waited (a safety cap force-evicts a straggler whose
+    /// replacement never materialises, e.g. it left the clipmap reach entirely). See `schedule_bakes`.
+    pending_evict: std::collections::HashMap<chunk::ChunkKey, u32>,
     /// Reusable emit scratch (cleared + refilled each frame) so a continuous drag does zero
     /// growth reallocation. `mem::take`n into `emit_gpu_bakes` and restored at the end.
     emit_scratch: EmitScratch,
@@ -126,6 +132,7 @@ impl Default for BakeScheduler {
             height: Arc::new(super::height::HeightField::default()),
             ring_chunk_origin: Vec::new(),
             pending: std::collections::HashSet::new(),
+            pending_evict: std::collections::HashMap::new(),
             emit_scratch: EmitScratch::default(),
             edit_gen: 0,
         }
@@ -162,6 +169,12 @@ struct BakeTaskOutput {
 /// candidates) crosses this and goes async, where it costs a few frames of latency (coarse LOD
 /// covers the gap) instead of a main-thread hitch.
 const ASYNC_BAKE_THRESHOLD: usize = 4096;
+
+/// Frames a make-before-break deferred eviction waits for its replacement before being force-evicted
+/// anyway. A straggler whose coarser replacement never materialises (it left the clipmap reach, or
+/// the coarse field genuinely misses a thin feature) would otherwise pin its tiles forever; ~2 s at
+/// 60 fps is far longer than any real bake-drain, so the cap only ever fires on a true orphan.
+const EVICT_DEFER_CAP: u32 = 120;
 
 impl BakeScheduler {
     /// Replace the height-field snapshot used by subsequent bakes (rebuilt when the material
@@ -268,6 +281,59 @@ fn chunk_has_geometry_with(
     let min = chunk::chunk_min_world(ck, config);
     let aabb = bevy::math::bounding::Aabb3d::from_min_max(min, min + Vec3::splat(size));
     bvh.any_overlap_with(&aabb, stack)
+}
+
+/// Make-before-break decision: may a deferred `ck` be evicted now without leaving a coverage hole?
+/// True iff it's the coarsest LOD (no coarser fallback can exist), a coarser LOD already covers its
+/// region (the replacement is in place), OR no coarser geometry will ever cover it (nothing to wait
+/// for). False ⇒ a coarser chunk with geometry is still baking — hold the bricks until it lands.
+fn replacement_ready(
+    atlas: &SdfAtlas,
+    bvh: &bvh::Bvh,
+    config: &SdfGridConfig,
+    ck: chunk::ChunkKey,
+    stack: &mut Vec<u32>,
+) -> bool {
+    ck.lod + 1 >= config.lod_count
+        || coarser_region_resident(atlas, config, ck)
+        || !coarser_region_has_geometry(bvh, config, ck, stack)
+}
+
+/// Make-before-break: a COARSER LOD has a RESIDENT brick covering `ck`'s region (its center), so
+/// dropping `ck`'s bricks leaves no hole — the march's fine→coarse `resolve_march` falls back to
+/// that coarser brick. Scans every coarser level (the immediate parent may itself be mid-bake while
+/// a still-coarser shell already covers the point).
+fn coarser_region_resident(atlas: &SdfAtlas, config: &SdfGridConfig, ck: chunk::ChunkKey) -> bool {
+    let center = chunk::chunk_min_world(ck, config)
+        + Vec3::splat(0.5 * chunk::chunk_world_size(ck.lod, config));
+    for lod in (ck.lod + 1)..config.lod_count {
+        let coord = config.world_to_brick_lod(center, lod);
+        if atlas.bricks.contains_key(&atlas::BrickKey::new(lod, coord)) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Whether ANY coarser LOD's chunk over `ck`'s region holds geometry — i.e. there's a replacement
+/// still to come (it'll bake into the resident coarser brick we're waiting for). False ⇒ nothing
+/// coarser will ever cover this region (a thin feature the coarse field misses, or empty space), so
+/// holding `ck` would pin it forever — evict now.
+fn coarser_region_has_geometry(
+    bvh: &bvh::Bvh,
+    config: &SdfGridConfig,
+    ck: chunk::ChunkKey,
+    stack: &mut Vec<u32>,
+) -> bool {
+    let center = chunk::chunk_min_world(ck, config)
+        + Vec3::splat(0.5 * chunk::chunk_world_size(ck.lod, config));
+    for lod in (ck.lod + 1)..config.lod_count {
+        let parent = chunk::chunk_of(atlas::BrickKey::new(lod, config.world_to_brick_lod(center, lod)), config).0;
+        if chunk_has_geometry_with(parent, bvh, config, stack) {
+            return true;
+        }
+    }
+    false
 }
 
 /// Whether chunk coord `c` is inside the `R³` chunk window with corner `origin`.
@@ -561,19 +627,21 @@ pub fn schedule_bakes(
         // overlap stays resident and unchanged, so re-scanning it every snap was pure waste.
         for_each_entered_chunk(new_origin, old_origin, r, |coord| {
             let ck = chunk::ChunkKey::new(lod, coord);
+            // Re-entered before its deferred eviction landed → keep it resident, cancel the evict.
+            sched.pending_evict.remove(&ck);
             if chunk_has_geometry_with(ck, &bvh, &config, &mut bvh_stack) {
                 sched.pending.insert(ck);
             }
         });
-        // Exited chunks → drop all their bricks (and cancel any pending bake). Skipped on the first
-        // run: there is no prior window to evict (the sentinel origin isn't a real chunk region).
+        // Exited chunks → cancel any pending bake and DEFER the eviction (make-before-break): the
+        // bricks stay resident until the coarser LOD that will serve this region is in place, so the
+        // march never hits an uncovered region mid-handoff. Step 4 (below) does the actual evict.
+        // Skipped on the first run (no prior window — the sentinel origin isn't a real region).
         if !first_run {
             for_each_exited_chunk(new_origin, old_origin, r, |coord| {
                 let ck = chunk::ChunkKey::new(lod, coord);
                 sched.pending.remove(&ck);
-                for_each_brick_key(ck, &config, |bk| {
-                    atlas.remove_brick(&bk, &config);
-                });
+                sched.pending_evict.entry(ck).or_insert(0);
             });
         }
         sched.ring_chunk_origin[li] = new_origin;
@@ -586,6 +654,29 @@ pub fn schedule_bakes(
     dispatch_bake(
         &mut atlas, &mut sched, &mut bake_task, &mut gpu_bakes, &config, camera_pos, &mut baked_dbg, now,
     );
+
+    // --- 4. Deferred (make-before-break) eviction --------------------------------------
+    // Now that this frame's bakes have landed, drop each deferred chunk whose REPLACEMENT is in
+    // place: a coarser LOD already covers its region (so the march falls back cleanly), it's the
+    // coarsest LOD (no coarser fallback can exist), or no coarser geometry exists to wait for. A
+    // straggler past the safety cap is force-dropped so its tiles aren't pinned forever.
+    if !sched.pending_evict.is_empty() {
+        let bvh = Arc::clone(&sched.bvh);
+        let mut stack: Vec<u32> = Vec::new();
+        let mut evict: Vec<chunk::ChunkKey> = Vec::new();
+        for (ck, age) in sched.pending_evict.iter_mut() {
+            *age += 1;
+            if replacement_ready(&atlas, &bvh, &config, *ck, &mut stack) || *age > EVICT_DEFER_CAP {
+                evict.push(*ck);
+            }
+        }
+        for ck in evict {
+            sched.pending_evict.remove(&ck);
+            for_each_brick_key(ck, &config, |bk| {
+                atlas.remove_brick(&bk, &config);
+            });
+        }
+    }
 
     // DIAGNOSTIC: per-LOD baked-job histogram this frame + remaining `pending` backlog. Shows
     // whether a small edit's cost is spread across coarse LODs (each coarse chunk = 64 huge
@@ -1316,6 +1407,47 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Make-before-break gate: a chunk's deferred eviction waits until a coarser LOD covers its
+    /// region (resident), evicts once it does, and never pins a chunk with no coarser replacement.
+    #[test]
+    fn replacement_ready_gates_on_coarser_residency() {
+        let cfg = SdfGridConfig { lod_count: 3, ..config() };
+        let edits = vec![sphere_edit(Vec3::ZERO, 12.0, 0)];
+        let bvh = build_bvh(&edits);
+        let mut atlas = SdfAtlas::default();
+        let mut stack = Vec::new();
+
+        // A fine (LOD 0) chunk straddling the sphere surface — geometry exists at every LOD here.
+        let surf = Vec3::new(12.0, 0.0, 0.0);
+        let c = chunk::chunk_of(atlas::BrickKey::new(0, cfg.world_to_brick_lod(surf, 0)), &cfg).0;
+        assert!(chunk_has_geometry_with(c, &bvh, &cfg, &mut stack), "test chunk must straddle the surface");
+
+        // No coarser brick resident yet, but coarser geometry exists → DEFER (not ready).
+        assert!(
+            !replacement_ready(&atlas, &bvh, &cfg, c, &mut stack),
+            "eviction must defer while the coarser replacement is still baking"
+        );
+
+        // Bake the coarser brick covering c's centre → replacement in place → ready to evict.
+        let center =
+            chunk::chunk_min_world(c, &cfg) + Vec3::splat(0.5 * chunk::chunk_world_size(c.lod, &cfg));
+        let parent = atlas::BrickKey::new(1, cfg.world_to_brick_lod(center, 1));
+        atlas.insert_gpu_brick(parent, [edits::PALETTE_EMPTY; edits::PALETTE_K], 0, &cfg);
+        assert!(
+            replacement_ready(&atlas, &bvh, &cfg, c, &mut stack),
+            "once a coarser LOD covers the region, eviction is allowed"
+        );
+
+        // Coarsest LOD: no coarser fallback can exist → always ready (else it'd pin forever).
+        let coarsest = chunk::ChunkKey::new(cfg.lod_count - 1, c.coord);
+        assert!(replacement_ready(&atlas, &bvh, &cfg, coarsest, &mut stack));
+
+        // A chunk far from all geometry: nothing coarser to wait for → ready (no leak).
+        let empty = chunk::ChunkKey::new(0, IVec3::new(10_000, 0, 0));
+        assert!(!chunk_has_geometry_with(empty, &bvh, &cfg, &mut stack));
+        assert!(replacement_ready(&atlas, &bvh, &cfg, empty, &mut stack));
     }
 
     /// THE garbled-LOD-transition guard: drive the REAL recenter + emit lifecycle (fly a camera out
