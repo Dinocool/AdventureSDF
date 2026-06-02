@@ -74,8 +74,9 @@ pub fn custom_layer(app: &mut App) -> Option<BoxedLayer> {
     )
 }
 
-/// F6 → start/stop chrome capture (mirrors F5's RenderDoc capture). Global, not gated to a
-/// scene, so you can capture any frame. Logs the new state + where the trace is written.
+/// F6 → start/stop chrome capture (sibling to the F7 RenderDoc capture and the F11 Nsight
+/// GPU-Trace trigger). Global, not gated to a scene, so you can capture any frame. Logs the
+/// new state + where the trace is written.
 pub fn toggle_on_f6(keyboard: Res<ButtonInput<KeyCode>>, file: Option<Res<ChromeTraceFile>>) {
     if !keyboard.just_pressed(KeyCode::F6) {
         return;

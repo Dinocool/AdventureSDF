@@ -19,6 +19,8 @@ pub mod material_editor;
 pub mod material_preview;
 pub mod menu_bar;
 pub mod notifications;
+#[cfg(feature = "shader-debug")]
+pub mod nsight_capture;
 pub mod panels;
 pub mod profiling;
 pub mod project_files;
@@ -67,6 +69,12 @@ impl Plugin for EditorPlugin {
         // In-app RenderDoc capture (F7) only exists with the `renderdoc` feature.
         #[cfg(feature = "renderdoc")]
         app.add_plugins(renderdoc_capture::RenderDocCapturePlugin);
+
+        // F11 acknowledges an Nsight GPU-Trace capture (the trace itself is armed by
+        // `run-worktree.ps1`'s profiling launch via `--start-after-hotkey`). Only meaningful
+        // in `shader-debug` builds, which is when the editor is run under Nsight.
+        #[cfg(feature = "shader-debug")]
+        app.add_plugins(nsight_capture::NsightCapturePlugin);
 
         // Custom euler-angle Transform editor (replaces the generic Quat-xyzw UI).
         inspector::register_component_editor::<Transform>(app, transform_editor::transform_editor);

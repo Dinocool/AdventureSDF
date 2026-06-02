@@ -11,10 +11,15 @@ texture / L2 / DRAM). I can run this whole flow myself — no GUI, no out-file d
 
 | Question | Path | Who runs it |
 |---|---|---|
-| **Which pass is slow + what's it bound on?** | Nsight GPU Trace → `perf.json` | **me** (`capture.ps1` + `parse.py`) |
+| **Which pass is slow + what's it bound on?** (headless, fixed frame N) | Nsight GPU Trace → `perf.json` | **me** (`capture.ps1` + `parse.py`) |
+| Same, but **the live editor frame** the user is looking at | launch under Nsight (F11 trigger) → `perf.json` | user presses F11; **me** reads `perf.json` |
 | Per-WGSL-line cost inside a hot shader | the `.ngfx-gputrace` binary, in Nsight UI | user (UI deep-dive) |
 | Which CPU system / render-graph node costs most? | `trace-*.json` (F6) | me (`rdoc/scripts/trace/`) |
 | Inspect a single frame's textures / UBOs / disasm | `.rdc` RenderDoc capture | see `analyze-rdoc` (optional) |
+
+There are **two ways into the same `perf.json` loop**: the headless `capture.ps1` (a fresh
+instance, fixed frame, fully AI-runnable end-to-end) and the interactive F11 launch (the live
+editor frame, user-triggered). Both auto-export the same `BASE/*.xls` that `parse.py` reads.
 
 ## The Nsight loop (primary)
 
@@ -24,13 +29,15 @@ texture / L2 / DRAM). I can run this whole flow myself — no GUI, no out-file d
    default. Set once (admin): `reg add "HKLM\SOFTWARE\NVIDIA Corporation\Global\NVTweak" /v RmProfilingAdminOnly /t REG_DWORD /d 0 /f`
    (or NVIDIA Control Panel → Developer → Manage GPU Performance Counters → allow all users).
    Without this the capture fails with `TARGET ERROR: GPU Performance Counters unavailable`.
-3. Build with shader debug info so source correlation works:
-   `cargo build --features editor,shader-debug` (enables wgpu `InstanceFlags::DEBUG` → naga
-   `OpLine`). Needed for per-line; per-pass timing works without it.
+3. Build **static, with shader debug info**:
+   `cargo build --no-default-features --features editor,shader-debug`. `--no-default-features`
+   drops `fast`/dynamic_linking (Nsight's injector can't attach to a dynamically-linked Bevy —
+   see Gotchas); `shader-debug` enables wgpu `InstanceFlags::DEBUG` → naga `OpLine` (needed for
+   per-line; per-pass timing works without it).
 
 ### Capture + parse (I run these)
 ```sh
-cargo build --features editor,shader-debug
+cargo build --no-default-features --features editor,shader-debug
 powershell -ExecutionPolicy Bypass -File rdoc/scripts/ngfx/capture.ps1   # [-Frames 240] [-Out .soul/ngfx]
 python rdoc/scripts/ngfx/parse.py .soul/ngfx                            # -> .soul/ngfx/perf.json + summary
 ```
@@ -39,6 +46,18 @@ the scene settles, traces 1 frame with the SM hardware sampling profiler, auto-e
 `BASE/*.xls` TSVs, and the app self-terminates (`ADVENTURE_EXIT_AFTER_FRAMES`, set by the
 script). It forces `WGPU_BACKEND=vulkan` (SPIR-V → OpLine source mapping) and
 `BEVY_ASSET_ROOT` (the exe run directly can't find `assets/` otherwise).
+
+### Interactive capture — the live editor frame (F11)
+When you need the **exact frame the user is editing** (a specific camera/scene state), launch
+the editor *under* Nsight instead of headless: run the root `run-worktree.ps1`, press **S** to
+turn on "Nsight GPU-Trace profiling", pick the worktree, Enter. That builds
+`editor,shader-debug` and launches the exe under `ngfx --activity "GPU Trace Profiler"
+--start-after-hotkey` (Vulkan forced). In-game, **F11** triggers Nsight to capture the live
+frame and auto-export to the worktree's `.soul/ngfx`; the editor shows a toast acknowledging
+the trigger (`src/editor/nsight_capture.rs`, `shader-debug` builds only — Nsight does the
+capture out-of-process, the app just confirms it). On exit the launcher runs `parse.py`
+automatically. I then read `.soul/ngfx/perf.json` the same way. Same trace, same loop — only
+the trigger (a hotkey on the live process) and frame selection differ from `capture.ps1`.
 
 ### Reading `perf.json`
 One object per pass (`pass` = render-graph node label): `gpu_time_us`, `bottleneck`
@@ -82,6 +101,13 @@ python + `perfetto`): `hotspots.py`, `frames.py [--steady]`, `span.py <name>`,
 `stream_hotspots.py` (for multi-GB traces, no perfetto). I CAN run these myself.
 
 ## Gotchas (learned the hard way)
+- **Dynamic linking breaks injection.** A `fast`/`dynamic_linking` build fails to attach:
+  `Launch process exited. Searching for attachable child processes... Failed to connect`.
+  Build `--no-default-features` (drops `fast`) for any injected capture — both `capture.ps1`
+  and the interactive F11 launch. The `run-worktree.ps1` profiling launch already does this.
+  Worse, a failed capture leaves the **previous** `BASE/*.xls` in place, so `parse.py` happily
+  prints STALE numbers — clear `.soul/ngfx` (the launcher does) or distrust a `perf.json` whose
+  numbers didn't move after a "failed to connect".
 - **GPU counters disabled** → `TARGET ERROR`. Enable `RmProfilingAdminOnly=0` (above).
 - **`--platform "..."` collides with `ngfx`'s Qt `-platform`** → "Could not find Qt platform
   plugin". OMIT `--platform`; the default is correct.
