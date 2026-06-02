@@ -174,7 +174,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 // to compare against the CPU shader_resolve. Isolates brick_in_chunk (the only chunk-path
 // piece not yet GPU-verified).
 const FULL_LOOKUP_PROBE_WGSL: &str = r#"
-#import sdf::bindings::{camera, chunk_buf, chunk_tile_buf, local_brick_index, abs_chunk_key}
+#import sdf::bindings::{camera, chunk_buf, chunk_tile_buf, local_brick_index}
 #import sdf::brick::{find_brick_lookup, find_chunk}
 
 struct CoordIn { x: i32, y: i32, z: i32, lod: u32 };
@@ -187,8 +187,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let c = vec3<i32>(coords[i].x, coords[i].y, coords[i].z);
     let loc = find_brick_lookup(c, coords[i].lod);
     let li = local_brick_index(c);
-    let key = abs_chunk_key(c, coords[i].lod);
-    let ci = find_chunk(key.x, key.y);
+    let ci = find_chunk(c, coords[i].lod);   // toroidal direct-index + tag
     outs[i] = LookupOut(loc.atlas_base, select(0u, 1u, loc.found), li, bitcast<u32>(ci));
 }
 "#;
@@ -792,7 +791,7 @@ fn brick_tile_bytes(tiles: &[adventure::sdf_render::chunk::BrickTile]) -> Vec<u8
 fn gpu_find_brick_lookup_matches_cpu() {
     use wgpu::util::DeviceExt;
     use adventure::sdf_render::atlas::BrickKey;
-    use adventure::sdf_render::chunk::{build_chunk_tables, chunk_of, chunk_gpu_key, BrickTile};
+    use adventure::sdf_render::chunk::{build_chunk_tables, chunk_of, chunk_gpu_key, dir_index, BrickTile};
 
     let Some((device, queue)) = device_queue() else {
         eprintln!("no GPU adapter — skipping");
@@ -823,12 +822,9 @@ fn gpu_find_brick_lookup_matches_cpu() {
         source: wgpu::ShaderSource::Naga(Cow::Owned(module)),
     });
 
-    // grid_dims.w = resident chunk count (find_chunk's search bound). Layout: 2 mats (32
-    // floats) + camera_pos(4) + screen_params(4) + grid_origin(4) = float 44; grid_dims.w
-    // = float 47 = byte 188.
-    let mut cam = camera_uniform_bytes(&config);
-    let n = tables.chunks.len() as f32;
-    cam[188..192].copy_from_slice(&n.to_le_bytes());
+    // The toroidal `find_chunk` direct-indexes `chunk_buf` by `dir_index` (using `ring_bricks` from
+    // lod_params, which `camera_uniform_bytes` sets) + a key-tag compare — no resident-count bound.
+    let cam = camera_uniform_bytes(&config);
 
     let camera_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("camera"), contents: &cam, usage: wgpu::BufferUsages::UNIFORM,
@@ -894,11 +890,25 @@ fn gpu_find_brick_lookup_matches_cpu() {
     drop(data);
     readback.unmap();
 
+    // CPU mirror of the GPU `find_chunk` + `brick_in_chunk`: direct-index the dense directory by
+    // `dir_index(ck, r)`, tag-check, then occupancy popcount.
+    let cpu_ci = |ck: adventure::sdf_render::chunk::ChunkKey| -> i32 {
+        let idx = dir_index(ck, tables.r);
+        if idx < tables.chunks.len()
+            && (tables.chunks[idx].key_hi, tables.chunks[idx].key_lo) == chunk_gpu_key(ck)
+        {
+            idx as i32
+        } else {
+            -1
+        }
+    };
     let cpu_resolve = |coord: IVec3| -> Option<u32> {
         let (ck, li) = chunk_of(BrickKey::new(0, coord), &config);
-        let (kh, kl) = chunk_gpu_key(ck);
-        let idx = tables.chunks.binary_search_by(|c| (c.key_hi, c.key_lo).cmp(&(kh, kl))).ok()?;
-        let chunk = tables.chunks[idx];
+        let ci = cpu_ci(ck);
+        if ci < 0 {
+            return None;
+        }
+        let chunk = tables.chunks[ci as usize];
         let occ = (chunk.occ_lo as u64) | ((chunk.occ_hi as u64) << 32);
         if (occ >> li) & 1 == 0 { return None; }
         let off = (occ & ((1u64 << li) - 1)).count_ones();
@@ -910,9 +920,7 @@ fn gpu_find_brick_lookup_matches_cpu() {
         let cpu = cpu_resolve(*c);
         let gpu = if o.found == 1 { Some(o.atlas_base) } else { None };
         let (ck, cpu_li) = chunk_of(BrickKey::new(0, *c), &config);
-        let (kh, kl) = chunk_gpu_key(ck);
-        let cpu_ci = tables.chunks.binary_search_by(|x| (x.key_hi, x.key_lo).cmp(&(kh, kl)))
-            .map(|i| i as i32).unwrap_or(-1);
+        let cpu_ci = cpu_ci(ck);
         if cpu != gpu {
             bad.push(format!(
                 "coord={c:?}: GPU base={gpu:?} li={} ci={} | CPU base={cpu:?} li={cpu_li} ci={cpu_ci}",

@@ -389,8 +389,14 @@ fn lifecycle_large_sphere_lod_transition_no_hole() {
                 "step {step} (x={x}): served LOD-{lod} tile {tile} at probe is EMPTY — bake/atlas desync (the hole)"
             );
         }
-        // Sanity: table chunk count matches resident chunks (no stale/extra entries).
-        assert_eq!(tables.chunks.len(), chunk::resident_chunks(&atlas, &cfg).len(), "step {step}: chunk table size != resident chunks");
+        // Sanity: the directory's NON-SENTINEL slots match the resident chunks (no stale/extra
+        // entries). The directory itself is fixed-size (R³·lod_count), so count occupied slots.
+        let resident_in_dir = tables
+            .chunks
+            .iter()
+            .filter(|c| (c.key_hi, c.key_lo) != chunk::SENTINEL_KEY)
+            .count();
+        assert_eq!(resident_in_dir, chunk::resident_chunks(&atlas, &cfg).len(), "step {step}: directory resident slots != resident chunks");
 
         served_seq.push(served_lod(&atlas, &cfg, probe));
     }

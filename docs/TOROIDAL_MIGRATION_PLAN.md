@@ -1,5 +1,21 @@
 # Chunk lookup → per-LOD toroidal directory (migration plan)
 
+## Status: ✅ DONE (landed as one cohesive swap)
+
+The "CPU-only first" split didn't hold — the structure and its GPU lookup are one contract (you can't
+swap one without re-sorting to feed the other). So it landed as a single cohesive change across
+`chunk.rs` + `brick.wgsl`/`bindings.wgsl` + `render.rs` + the two consumer shaders + tests.
+
+**Result (live fly-through trace):** `sched_recenter` max **448 ms → 37 ms** (median ~0); frame-time
+max **531 ms → 86 ms**. `set_brick`/`clear_brick` are O(1); the GPU lookup is a direct index + tag
+compare. Verified by the CPU↔GPU parity rig, the GPU no-hole/no-flicker lifecycle test, the churn
+differential, and the adversarial regression tests. A latent bug was found + fixed along the way:
+`apply_async_result` filtered baked chunks against the *snapshot* window instead of the *current* one,
+which (with the directory's `c mod R` slots) could insert an out-of-window chunk and collide.
+
+The phases below are the historical plan; in practice steps 1, 3, 4 merged into the one swap. Next
+work is in `docs/PERF_ROADMAP.md` (Tier 1: gate `sched_gather` on change detection; the bake apply).
+
 ## Why
 
 The GPU chunk lookup is a **sparse sorted array** (`chunk.rs` `LiveChunkTables`: `sorted_keys` +

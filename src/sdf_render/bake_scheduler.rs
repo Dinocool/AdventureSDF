@@ -151,9 +151,6 @@ struct BakeTaskOutput {
     /// `edit_gen` the snapshot was built from — if it no longer matches the scheduler's, the edit
     /// set changed mid-flight and every verdict is stale.
     edit_gen: u64,
-    /// Per-LOD ring origins the snapshot was built from — a candidate whose chunk is no longer in
-    /// its LOD's current window has exited and must be dropped (already evicted by the recenter).
-    ring_origins: Vec<IVec3>,
 }
 
 /// Candidate-count threshold above which a bake is offloaded to a background task instead of run
@@ -433,6 +430,7 @@ pub fn schedule_bakes(
     config: Res<SdfGridConfig>,
     volumes: Query<VolumeQueryData, With<SdfVolume>>,
     changed: Query<Entity, (With<SdfVolume>, ChangedEdit)>,
+    mut removed: RemovedComponents<SdfVolume>,
     camera: Query<&Transform, (With<SdfCamera>, Without<SdfVolume>)>,
     mut baked_dbg: ResMut<super::BakedBrickDebug>,
     time: Res<Time>,
@@ -458,19 +456,20 @@ pub fn schedule_bakes(
     }
 
     // --- 1. Edit changes → dirty affected chunks (within current windows) ------------
-    // `sched_gather` runs EVERY frame (change detection over all volumes) — instrumented
-    // separately from the conditional re-dirty so a trace shows the fixed per-frame floor.
-    let g_gather = info_span!("sched_gather").entered();
-    let gathered = gather_sorted_edits(&volumes);
-    let current: std::collections::HashMap<Entity, bevy::math::bounding::Aabb3d> =
-        gathered.iter().map(|g| (g.entity, g.aabb)).collect();
-    let set_changed = current.len() != prev_aabbs.map.len()
-        || current.keys().any(|e| !prev_aabbs.map.contains_key(e));
-    let edits_changed = atlas.rebake_all || set_changed || !changed.is_empty();
-    drop(g_gather);
-
-    let g_edit = info_span!("sched_edit_detect", changed = edits_changed).entered();
-    if edits_changed {
+    // CHANGE-DETECTION GATE: `gather_sorted_edits` (collect + sort all volumes + a matrix-inverse +
+    // 8-corner AABB per edit) and the per-edit BVH rebuild are the ~3 ms every-frame floor. SKIP them
+    // on a frame where no edit changed — detected cheaply, WITHOUT touching all ~14.6k volumes, from
+    // Bevy change detection: `changed` (`Changed` covers both moves AND adds — a fresh component reads
+    // as changed) plus `RemovedComponents` for despawns. The cached `sched.edits`/`bvh` stay valid, so
+    // the recenter still resolves geometry. `read().count()` drains the events so they don't re-fire.
+    let any_removed = removed.read().count() > 0;
+    if atlas.rebake_all || !changed.is_empty() || any_removed {
+        let _g_gather = info_span!("sched_gather").entered();
+        let gathered = gather_sorted_edits(&volumes);
+        let current: std::collections::HashMap<Entity, bevy::math::bounding::Aabb3d> =
+            gathered.iter().map(|g| (g.entity, g.aabb)).collect();
+        let set_changed = current.len() != prev_aabbs.map.len()
+            || current.keys().any(|e| !prev_aabbs.map.contains_key(e));
         let resolved: Vec<edits::ResolvedEdit> = gathered.iter().map(|g| g.edit.clone()).collect();
         let aabbs: Vec<bevy::math::bounding::Aabb3d> = gathered.iter().map(|g| g.aabb).collect();
         let new_bvh = bvh::Bvh::build(&aabbs);
@@ -545,7 +544,6 @@ pub fn schedule_bakes(
         }
         prev_aabbs.map = current;
     }
-    drop(g_edit);
 
     // --- 2. Camera chunk-ring recenter (eager enter + immediate evict, absolute addressing) ----
     // Entered chunks with geometry are enqueued for a bake; EXITED chunks are evicted immediately
@@ -1067,9 +1065,10 @@ fn finish_bake_apply(
 ///      computed from stale geometry. Drop them all and re-queue every candidate chunk to `pending`
 ///      (the next bake re-classifies against the new edits). Safe + simple; snaps rarely coincide
 ///      with an edit change.
-///   2. Otherwise, per candidate: if its chunk has exited its LOD's window since the snapshot
-///      (compared against the snapshot's `ring_origins`, which still match because edits didn't
-///      change the window), the recenter already evicted it — drop its verdict, don't re-queue.
+///   2. Otherwise, per candidate: if its chunk is no longer in its LOD's CURRENT window (the camera
+///      moved between spawn and apply; the recenter already advanced the origin + evicted it), drop
+///      its verdict — inserting it would collide with the in-window chunk sharing its `c mod R`
+///      toroidal-directory slot.
 fn apply_async_result(
     atlas: &mut SdfAtlas,
     sched: &mut BakeScheduler,
@@ -1087,13 +1086,17 @@ fn apply_async_result(
         }
         return;
     }
-    // Filter candidates whose chunk has exited its LOD window since the snapshot. The verdicts
-    // vector is parallel to candidates, so filter both together.
+    // Filter candidates whose chunk is no longer in its LOD's CURRENT window — the camera may have
+    // moved between when this task was spawned and now, and the recenter (step 2, this frame) has
+    // already advanced `ring_chunk_origin` and evicted the exited chunks. Inserting an out-of-window
+    // chunk would collide with the in-window chunk that shares its toroidal-directory slot
+    // (`dir_index` is `c mod R`), so we MUST check the current origin, not the snapshot's. The
+    // verdicts vector is parallel to candidates, so filter both together.
     let mut kept_candidates: Vec<(chunk::ChunkKey, atlas::BrickKey)> = Vec::with_capacity(out.candidates.len());
     let mut kept_verdicts: Vec<Verdict> = Vec::with_capacity(out.verdicts.len());
     for ((ck, key), verdict) in out.candidates.into_iter().zip(out.verdicts) {
         let li = ck.lod as usize;
-        let origin = out.ring_origins.get(li).copied().unwrap_or(IVec3::splat(i32::MIN));
+        let origin = sched.ring_chunk_origin.get(li).copied().unwrap_or(IVec3::splat(i32::MIN));
         if chunk_in_window(ck.coord, origin, r) {
             kept_candidates.push((ck, key));
             kept_verdicts.push(verdict);
@@ -1178,14 +1181,13 @@ fn dispatch_bake(
     let candidates = std::mem::take(&mut scratch.candidates);
     let config_snapshot = config.clone();
     let edit_gen = sched.edit_gen;
-    let ring_origins = sched.ring_chunk_origin.clone();
     sched.emit_scratch = scratch;
 
     let pool = AsyncComputeTaskPool::get();
     bake_task.task = Some(pool.spawn(async move {
         // SERIAL classify — nesting the ComputeTaskPool scope inside this async task would deadlock.
         let verdicts = classify_candidates_serial(&candidates, &edits_snapshot, &bvh_snapshot, &config_snapshot, &hash_peek);
-        BakeTaskOutput { candidates, verdicts, edit_gen, ring_origins }
+        BakeTaskOutput { candidates, verdicts, edit_gen }
     }));
 }
 
@@ -1275,17 +1277,23 @@ mod tests {
         bvh::Bvh::build(&aabbs)
     }
 
-    /// Resolve (chunk, local) through a GPU lookup-buffer pair the way the shader does
-    /// (binary-search the sorted rows, popcount-index the dense tile run).
+    /// Resolve (chunk, local) through a GPU lookup-buffer pair the way the shader does: direct-index
+    /// the dense directory by `dir_index(ck, r)`, tag-check, then popcount-index the dense tile run.
     fn resolve_table(
         rows: &[chunk::ChunkLookup],
         tiles: &[chunk::BrickTile],
+        r: i32,
         ck: chunk::ChunkKey,
         local: u32,
     ) -> Option<chunk::BrickTile> {
-        let (kh, kl) = chunk::chunk_gpu_key(ck);
-        let idx = rows.binary_search_by(|c| (c.key_hi, c.key_lo).cmp(&(kh, kl))).ok()?;
+        let idx = chunk::dir_index(ck, r);
+        if idx >= rows.len() {
+            return None;
+        }
         let c = rows[idx];
+        if (c.key_hi, c.key_lo) != chunk::chunk_gpu_key(ck) {
+            return None;
+        }
         let occ = (c.occ_lo as u64) | ((c.occ_hi as u64) << 32);
         if (occ >> local) & 1 == 0 {
             return None;
@@ -1294,8 +1302,9 @@ mod tests {
         Some(tiles[(c.tile_run_base + off) as usize])
     }
 
-    /// Apply the live table's per-frame delta to a GPU-buffer mirror EXACTLY as `render.rs` does
-    /// (full rebuild on a capacity grow, else dirty rows + dirty tile-run slots + sentinel tail).
+    /// Apply the live table's per-frame delta to a GPU-buffer mirror EXACTLY as `render.rs` does: the
+    /// directory (chunk_buf) is fixed-size so it only "grows" once; otherwise write the dirty
+    /// directory slots + tile-run regions in place (no row shift, no sentinel tail).
     fn apply_table_delta(
         live: &chunk::LiveChunkTables,
         rows: &mut Vec<chunk::ChunkLookup>,
@@ -1303,21 +1312,13 @@ mod tests {
         cap_rows: &mut u32,
         cap_slots: &mut u32,
     ) {
-        let sentinel = chunk::ChunkLookup {
-            key_hi: u32::MAX,
-            key_lo: u32::MAX,
-            occ_lo: 0,
-            occ_hi: 0,
-            tile_run_base: 0,
-        };
         let needed_rows = live.row_count();
         let needed_slots = live.tile_run_capacity();
         if *cap_rows == 0 || needed_rows > *cap_rows || needed_slots > *cap_slots {
-            *cap_rows = (needed_rows + needed_rows / 2).max(needed_rows + 1);
+            *cap_rows = needed_rows;
             *cap_slots = (needed_slots + needed_slots / 2).max(needed_slots + chunk::TILE_RUN_SLOT);
-            let (r, t) = live.full_tables();
-            *rows = r;
-            rows.resize(*cap_rows as usize, sentinel);
+            let (rws, t) = live.full_tables();
+            *rows = rws;
             *tiles = t;
             tiles.resize(*cap_slots as usize, chunk::BrickTile::default());
         } else {
@@ -1327,11 +1328,6 @@ mod tests {
             for &slot in &live.dirty_slots {
                 let base = (slot * chunk::TILE_RUN_SLOT) as usize;
                 tiles[base..base + chunk::TILE_RUN_SLOT as usize].copy_from_slice(&live.tile_region(slot));
-            }
-            if let Some(from) = live.sentinel_tail_from {
-                for row in from..*cap_rows {
-                    rows[row as usize] = sentinel;
-                }
             }
         }
     }
@@ -1417,12 +1413,12 @@ mod tests {
                     let want = chunk::tile_atlas_base(tile);
                     let (ck, local) = chunk::chunk_of(*key, &cfg);
                     assert_eq!(
-                        resolve_table(&fr, &ft, ck, local).map(|t| t.atlas_base),
+                        resolve_table(&fr, &ft, cfg.ring_bricks as i32 / chunk::CHUNK_BRICKS, ck, local).map(|t| t.atlas_base),
                         Some(want),
                         "step {step}: full_tables resolves brick {key:?} to the wrong/absent tile"
                     );
                     assert_eq!(
-                        resolve_table(&rows, &tiles, ck, local).map(|t| t.atlas_base),
+                        resolve_table(&rows, &tiles, cfg.ring_bricks as i32 / chunk::CHUNK_BRICKS, ck, local).map(|t| t.atlas_base),
                         Some(want),
                         "step {step}: delta-mirror resolves brick {key:?} to the wrong/absent tile"
                     );
@@ -1651,12 +1647,12 @@ mod tests {
                 let want = chunk::tile_atlas_base(tile);
                 let (ck, local) = chunk::chunk_of(*key, &cfg);
                 assert_eq!(
-                    resolve_table(&fr, &ft, ck, local).map(|t| t.atlas_base),
+                    resolve_table(&fr, &ft, cfg.ring_bricks as i32 / chunk::CHUNK_BRICKS, ck, local).map(|t| t.atlas_base),
                     Some(want),
                     "frame {frame} (x={x}): full_tables resolves brick {key:?} to the wrong/absent tile"
                 );
                 assert_eq!(
-                    resolve_table(&rows, &tiles, ck, local).map(|t| t.atlas_base),
+                    resolve_table(&rows, &tiles, cfg.ring_bricks as i32 / chunk::CHUNK_BRICKS, ck, local).map(|t| t.atlas_base),
                     Some(want),
                     "frame {frame} (x={x}): delta-mirror resolves brick {key:?} to the wrong/absent tile"
                 );
@@ -1781,7 +1777,6 @@ mod tests {
             candidates: vec![cand],
             verdicts: vec![Verdict::Keep([edits::PALETTE_EMPTY; edits::PALETTE_K], vec![0], 1234)],
             edit_gen: 99, // != sched.edit_gen (0)
-            ring_origins: sched.ring_chunk_origin.clone(),
         };
         sched.pending.clear();
         apply_async_result(&mut atlas, &mut sched, &mut gpu, &cfg, &mut crate::sdf_render::BakedBrickDebug::default(), 0.0, out);
