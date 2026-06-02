@@ -23,6 +23,7 @@ pub mod panels;
 pub mod profiling;
 pub mod project_files;
 pub mod registry;
+#[cfg(feature = "renderdoc")]
 pub mod renderdoc_capture;
 pub mod resource_picker;
 pub mod scene_browser;
@@ -47,7 +48,6 @@ impl Plugin for EditorPlugin {
             registry::ShaderDebugRegistryPlugin,
             uniform_inspector::UniformInspectorPlugin,
             profiling::ProfilingPlugin,
-            renderdoc_capture::RenderDocCapturePlugin,
         ))
         .init_resource::<menu_bar::EditorRequests>()
         .init_resource::<menu_bar::CurrentScenePath>()
@@ -63,6 +63,10 @@ impl Plugin for EditorPlugin {
         .register_type::<import_settings::ColorSpace>()
         .register_type::<import_settings::WrapMode>()
         .register_type::<import_settings::TextureImportSettings>();
+
+        // In-app RenderDoc capture (F7) only exists with the `renderdoc` feature.
+        #[cfg(feature = "renderdoc")]
+        app.add_plugins(renderdoc_capture::RenderDocCapturePlugin);
 
         // Custom euler-angle Transform editor (replaces the generic Quat-xyzw UI).
         inspector::register_component_editor::<Transform>(app, transform_editor::transform_editor);
@@ -123,7 +127,7 @@ impl Plugin for EditorPlugin {
 
         keybinds::plugin(app);
 
-        // F6 toggles chrome-trace capture (global, like F5 for RenderDoc).
+        // F6 toggles chrome-trace capture (global; RenderDoc is F7 behind the `renderdoc` feature).
         app.add_systems(Update, chrome_trace::toggle_on_f6);
 
         // Gizmo transform tools (mode + snap) now live in the viewport toolbar

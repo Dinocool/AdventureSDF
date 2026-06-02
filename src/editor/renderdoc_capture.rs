@@ -1,6 +1,6 @@
-//! F5-in-editor RenderDoc capture. The dll is preloaded in `main::load_renderdoc` (before
+//! F7-in-editor RenderDoc capture. The dll is preloaded in `main::load_renderdoc` (before
 //! the wgpu device exists) so the graphics hook installs; here we grab the in-application
-//! API handle and trigger a single-frame capture on F5. The `.rdc` lands in the CWD next
+//! API handle and trigger a single-frame capture on F7. The `.rdc` lands in the CWD next
 //! to the exe — open it in the RenderDoc UI afterwards. No external launcher needed.
 //!
 //! The API handle holds a raw pointer (`!Send`/`!Sync`), so it lives as a `NonSend`
@@ -19,7 +19,7 @@ pub struct RenderDocCapturePlugin;
 impl Plugin for RenderDocCapturePlugin {
     fn build(&self, app: &mut App) {
         // `RenderDoc::new()` succeeds only if the dll is already resident (preloaded in
-        // main). On failure we simply don't insert the handle — F5 becomes a no-op and a
+        // main). On failure we simply don't insert the handle — F7 becomes a no-op and a
         // one-line hint is logged, rather than failing the build or the run.
         match RenderDoc::<V141>::new() {
             Ok(mut rd) => {
@@ -33,20 +33,20 @@ impl Plugin for RenderDocCapturePlugin {
                 rd.set_capture_file_path_template("rdoc/adventure");
 
                 app.insert_non_send_resource(RenderDocApi(rd));
-                app.add_systems(Update, trigger_on_f5);
-                info!("RenderDoc capture: API ready (overlay off) — F5 captures to rdoc/.");
+                app.add_systems(Update, trigger_on_f7);
+                info!("RenderDoc capture: API ready (overlay off) — F7 captures to rdoc/.");
             }
             Err(e) => {
-                info!("RenderDoc capture: API unavailable ({e}); F5 capture disabled.");
+                info!("RenderDoc capture: API unavailable ({e}); F7 capture disabled.");
             }
         }
     }
 }
 
-/// F5 → capture the next presented frame. RenderDoc names the file from the exe + frame
+/// F7 → capture the next presented frame. RenderDoc names the file from the exe + frame
 /// number and writes it to the CWD; the log line points at where to look.
-fn trigger_on_f5(keyboard: Res<ButtonInput<KeyCode>>, mut rd: NonSendMut<RenderDocApi>) {
-    if keyboard.just_pressed(KeyCode::F5) {
+fn trigger_on_f7(keyboard: Res<ButtonInput<KeyCode>>, mut rd: NonSendMut<RenderDocApi>) {
+    if keyboard.just_pressed(KeyCode::F7) {
         rd.0.trigger_capture();
         info!("RenderDoc capture: triggered — .rdc will be written to rdoc/.");
     }

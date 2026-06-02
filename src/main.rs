@@ -42,12 +42,12 @@ fn prune_old_traces(keep: usize) {
 /// device inside `DefaultPlugins`. The `renderdoc` crate only searches `$PATH`, and the
 /// installer doesn't put its dir there, so we `LoadLibrary` the dll from its standard
 /// install location explicitly. Once loaded, `RenderDoc::new()` (in the editor's capture
-/// plugin) finds the already-resident module and F5 can trigger captures with no external
+/// plugin) finds the already-resident module and F7 can trigger captures with no external
 /// launcher. Leaked on purpose: the hook must live for the whole process.
 ///
 /// NOTE: incompatible with `--features fast` (Bevy `dynamic_linking`) — RenderDoc can't
 /// hook a dynamically-linked Bevy, so capture with `--no-default-features --features editor`.
-#[cfg(feature = "editor")]
+#[cfg(feature = "renderdoc")]
 fn load_renderdoc() {
     if cfg!(feature = "fast") {
         warn!(
@@ -66,7 +66,7 @@ fn load_renderdoc() {
         match unsafe { libloading::Library::new(path) } {
             Ok(lib) => {
                 std::mem::forget(lib);
-                info!("RenderDoc capture: preloaded {path} (press F5 in editor to capture)");
+                info!("RenderDoc capture: preloaded {path} (press F7 in editor to capture)");
                 return;
             }
             Err(_) => continue,
@@ -74,14 +74,33 @@ fn load_renderdoc() {
     }
     warn!(
         "RenderDoc capture: renderdoc.dll not found (looked in Program Files + PATH); \
-         F5 capture disabled this run."
+         F7 capture disabled this run."
     );
+}
+
+/// wgpu device settings. BC7 texture compression (~1/6 the VRAM of RGBA8) + 16-bit-norm
+/// texture formats — `TEXTURE_FORMAT_16BIT_NORM` is required for the R16Snorm / Rgba16Snorm
+/// SDF distance atlases AND the 3D R16Snorm distance-clipmap volume, else those
+/// `create_texture` calls fail validation. With `shader-debug`, also turn on wgpu
+/// `InstanceFlags::DEBUG` so naga emits `OpLine`/`OpSource` and an Nsight GPU-Trace can
+/// correlate sampled cost to WGSL source lines.
+fn wgpu_settings() -> WgpuSettings {
+    let settings = WgpuSettings {
+        features: WgpuFeatures::TEXTURE_COMPRESSION_BC | WgpuFeatures::TEXTURE_FORMAT_16BIT_NORM,
+        ..default()
+    };
+    #[cfg(feature = "shader-debug")]
+    let settings = WgpuSettings {
+        instance_flags: bevy::render::settings::InstanceFlags::DEBUG,
+        ..settings
+    };
+    settings
 }
 
 fn main() {
     #[cfg(feature = "editor")]
     prune_old_traces(2);
-    #[cfg(feature = "editor")]
+    #[cfg(feature = "renderdoc")]
     load_renderdoc();
 
     let mut app = App::new();
@@ -99,15 +118,7 @@ fn main() {
         // BC7 (~⅙ the VRAM of RGBA8). Desktop Vulkan/DX12/Metal support BC
         // universally; device init fails loudly if a backend somehow lacks it.
         .set(RenderPlugin {
-            render_creation: RenderCreation::Automatic(WgpuSettings {
-                // BC7 texture compression (~1/6 the VRAM of RGBA8) + 16-bit-norm texture
-                // formats. TEXTURE_FORMAT_16BIT_NORM is required for the R16Snorm /
-                // Rgba16Snorm SDF distance atlases AND the 3D R16Snorm distance-clipmap
-                // volume — without it those `create_texture` calls fail validation.
-                features: WgpuFeatures::TEXTURE_COMPRESSION_BC
-                    | WgpuFeatures::TEXTURE_FORMAT_16BIT_NORM,
-                ..default()
-            }),
+            render_creation: RenderCreation::Automatic(wgpu_settings()),
             ..default()
         });
 
@@ -142,6 +153,23 @@ fn main() {
     #[cfg(feature = "editor")]
     {
         app.add_plugins(adventure::editor::EditorPlugin);
+    }
+
+    // Headless-capture aid: with `ADVENTURE_EXIT_AFTER_FRAMES=N` set, quit after N rendered
+    // frames so a profiler wrapper (Nsight `ngfx`) gets a deterministic, self-terminating run.
+    if let Some(limit) = std::env::var("ADVENTURE_EXIT_AFTER_FRAMES")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+    {
+        app.add_systems(
+            Update,
+            move |mut count: Local<u64>, mut exit: MessageWriter<AppExit>| {
+                *count += 1;
+                if *count >= limit {
+                    exit.write(AppExit::Success);
+                }
+            },
+        );
     }
 
     app.run();
