@@ -2065,6 +2065,79 @@ mod tests {
         );
     }
 
+    /// The heightmap is a ONE-SIDED surface (signed vertical distance to the noise height, no box
+    /// floor/walls), so everything below the surface — the deep interior AND the underside — culls
+    /// away, leaving only the walkable TOP-surface shell baked. Verifies we're not baking the solid
+    /// block of dirt (nor a closed box's bottom/walls).
+    #[test]
+    fn heightmap_culls_solid_interior_keeps_shell() {
+        let cfg = SdfGridConfig { lod_count: 1, ring_bricks: 8, recenter_snap_chunks: 1, ..config() };
+        // Box [±5 XZ, 0..14 Y] clipped to a noise surface near y≈7 → a ~7 m-thick terrain solid.
+        let half_xz = bevy::math::Vec2::new(5.0, 5.0);
+        let max_height = 14.0f32;
+        let edit = ResolvedEdit::new(
+            SdfPrimitive::Heightmap { half_xz, max_height, freq: 0.2, amp: 1.5, seed: 7 },
+            Transform::IDENTITY,
+            SdfOp { kind: CsgKind::Union, smoothing: 0.0 },
+            0,
+        );
+        let edits = vec![edit];
+        let mut sched = primed_sched(&edits);
+        let mut atlas = SdfAtlas::default();
+
+        // Dirty the chunk cube bounding the whole box (chunk_world ≈ 2.8 m).
+        for x in -2..=2 {
+            for y in 0..=5 {
+                for z in -2..=2 {
+                    sched.pending.insert(chunk::ChunkKey::new(0, IVec3::new(x, y, z)));
+                }
+            }
+        }
+        let mut gpu = PendingGpuBakes::default();
+        let mut guard = 0;
+        loop {
+            gpu.jobs.clear();
+            gpu.edits.clear();
+            atlas.gpu_baked_tiles.clear();
+            emit_gpu_bakes(&mut atlas, &mut sched, &mut gpu, &cfg, Vec3::ZERO, &mut crate::sdf_render::BakedBrickDebug::default(), 0.0);
+            guard += 1;
+            assert!(guard < 1000, "heightmap cull settle did not converge");
+            if sched.pending.is_empty() {
+                break;
+            }
+        }
+
+        let brick_at = |p: Vec3| atlas::BrickKey::new(0, cfg.world_to_brick_lod(p, 0));
+        // (a) Deep interior of the dirt (well below the ~7 m surface, above the bottom, off the
+        // walls): nearest surface ≫ a brick's reach → culled (write-only waste).
+        assert!(
+            !atlas.bricks.contains_key(&brick_at(Vec3::new(0.0, 3.5, 0.0))),
+            "deep-interior terrain brick must be culled — we should only bake the shell"
+        );
+        // (b) A brick at the walkable top surface stays resident (the march reads it).
+        assert!(
+            atlas.bricks.contains_key(&brick_at(Vec3::new(0.0, 7.0, 0.0))),
+            "top-surface shell brick must remain resident"
+        );
+        // (c) Resident ≪ the full bounding-box brick count (interior + above-surface empty culled).
+        let bw = cfg.brick_world_size(0);
+        let bbox = ((2.0 * half_xz.x / bw).ceil() as usize)
+            * ((max_height / bw).ceil() as usize)
+            * ((2.0 * half_xz.y / bw).ceil() as usize);
+        eprintln!(
+            "heightmap cull: resident={} bricks, full box={} bricks ({}% — shell only)",
+            atlas.bricks.len(),
+            bbox,
+            atlas.bricks.len() * 100 / bbox
+        );
+        assert!(
+            atlas.bricks.len() < bbox / 2,
+            "resident {} should be far below the box brick count {} (shell only, no solid fill)",
+            atlas.bricks.len(),
+            bbox
+        );
+    }
+
     /// Bake-cache skip: re-emitting an already-baked chunk within the SAME edit epoch produces
     /// ZERO jobs (the bricks' `baked_epoch` matches → skipped, no re-cull/re-bake), but bumping
     /// `edit_epoch` (as an edit change does) lapses every stamp so the next emit re-bakes them.

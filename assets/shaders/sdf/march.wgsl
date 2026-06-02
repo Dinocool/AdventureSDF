@@ -6,7 +6,7 @@
 // loop, LOD cross-fade, iso-offset, and over-relaxation logic are unchanged from when this
 // lived in the entry shader — only the module boundary is new.
 
-#import sdf::bindings::{camera, sdf_eps, pixel_cone, over_relax, lod_blend_band, recenter_snap, surface_bias, lod_count, brick_world_at, CHUNK_BRICKS, voxel_size_at, abs_chunk_key}
+#import sdf::bindings::{camera, sdf_eps, pixel_cone, over_relax, lod_blend_band, recenter_snap, lod_count, brick_world_at, CHUNK_BRICKS, voxel_size_at, abs_chunk_key}
 #import sdf::brick::{
     world_to_brick_lod,
     load_material_distances,
@@ -148,7 +148,7 @@ fn raymarch(origin: vec3<f32>, dir: vec3<f32>, start_t: f32, q: MarchQuality) ->
         var d_eff = d;
         var blending = false;
         var blend_w = 0.0;        // morph weight toward the coarser level
-        var eff_lod = f32(lod);   // continuous LOD actually rendered (for the iso-offset)
+        var eff_lod = f32(lod);   // continuous LOD actually rendered (for debug/material LOD)
         let ring_bricks = camera.lod_params.y;
         let end_frac = 1.0 - 2.0 * f32(recenter_snap() * CHUNK_BRICKS) / max(ring_bricks, 1.0);
         if (band > 0.0 && end_frac > 0.0) {
@@ -183,24 +183,11 @@ fn raymarch(origin: vec3<f32>, dir: vec3<f32>, start_t: f32, q: MarchQuality) ->
             }
         }
 
-        // --- Coarse-LOD iso-offset: re-inflate the trilinear shrink ------------------
-        // Trilinear interpolation pulls the zero-isosurface inward by ≈(h²/8)·κ on a convex
-        // surface, so coarse LODs render too thin. Take the surface where the field equals
-        // `eff_eps` (> 0) instead of 0. QUADRATIC in voxel size; ZERO at LOD 0 (cubic owns the
-        // near surface). Keyed on the CONTINUOUS rendered LOD so the inflation grows smoothly.
-        let vs_eff = camera.lod_params.z * exp2(eff_lod);
-        let eff_eps = select(
-            0.0,
-            surface_bias() * vs_eff * vs_eff / camera.lod_params.z,
-            eff_lod > 0.0,
-        );
-        let d_iso = d_eff - eff_eps;
-
-        // --- Sphere-trace the (inflated) trilinear field ------------------------------
+        // --- Sphere-trace the trilinear field ----------------------------------------
         // Over-relaxation validation FIRST (Keinert 2014): the previous relaxed step was safe
-        // only if the new unbounding sphere of radius `d_iso` still reaches back over it. If
+        // only if the new unbounding sphere of radius `d_eff` still reaches back over it. If
         // not, the relaxed step jumped PAST the surface — back up and resume plain tracing.
-        if (prev_step > 0.0 && d_iso + prev_d < prev_step) {
+        if (prev_step > 0.0 && d_eff + prev_d < prev_step) {
             t += prev_d - prev_step;                 // undo the overshoot (negative)
             prev_d = 0.0;
             prev_step = 0.0;
@@ -208,7 +195,7 @@ fn raymarch(origin: vec3<f32>, dir: vec3<f32>, start_t: f32, q: MarchQuality) ->
         }
 
         // Accept only a point reached by a validated step (never an overshoot).
-        if (d_iso < max(SDF_EPS, cone)) {
+        if (d_eff < max(SDF_EPS, cone)) {
             let hit_p = p;
             result.hit = true;
             result.dist = t;
@@ -224,14 +211,14 @@ fn raymarch(origin: vec3<f32>, dir: vec3<f32>, start_t: f32, q: MarchQuality) ->
             return result;
         }
 
-        // Step `omega * d_iso`, floored so we never stall and capped at the brick exit so we
-        // re-resolve LOD as the ray crosses bricks. Force omega = 1 whenever the cross-fade OR
-        // iso-offset is active (the effective field is then mildly non-eikonal).
+        // Step `omega * d_eff`, floored so we never stall and capped at the brick exit so we
+        // re-resolve LOD as the ray crosses bricks. Force omega = 1 while the cross-fade is active
+        // (the blended field is then mildly non-eikonal).
         let brick_exit = dist_to_brick_exit_lod(p, dir, lod);
-        let local_omega = select(OMEGA, 1.0, blending || eff_eps > 0.0);
-        let step = clamp(local_omega * d_iso, voxel_size * 0.01, brick_exit + voxel_size * 0.01);
+        let local_omega = select(OMEGA, 1.0, blending);
+        let step = clamp(local_omega * d_eff, voxel_size * 0.01, brick_exit + voxel_size * 0.01);
         t += step;
-        prev_d = d_iso;
+        prev_d = d_eff;
         prev_step = step;
     }
 
