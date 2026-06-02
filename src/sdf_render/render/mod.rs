@@ -507,8 +507,11 @@ struct SdfShaderHandle(Handle<Shader>);
 #[derive(Resource)]
 struct SdfShaderModules(#[expect(dead_code)] Vec<Handle<Shader>>);
 
-/// The `#define_import_path` module files the entry shader composes.
-const SDF_SHADER_MODULES: [&str; 9] = [
+/// The `#define_import_path` module files the entry shader composes, in dependency order. The single
+/// source of truth for the SDF import graph — `tests/shader_validation.rs` composes the SAME list
+/// (prefixing `assets/`) so a new `sdf/*.wgsl` module can't be added to the pipeline without the
+/// validation rig also seeing it. Paths are asset-server-relative (the `assets/` root is implicit).
+pub const SDF_SHADER_MODULES: [&str; 9] = [
     "shaders/sdf/bindings.wgsl",
     "shaders/sdf/brick.wgsl",
     "shaders/sdf/material.wgsl",

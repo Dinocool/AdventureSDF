@@ -38,24 +38,24 @@
 
 pub mod atlas;
 pub mod bake_scheduler;
-pub mod bc7;
+pub(crate) mod bc7;
 pub mod bvh;
 pub mod chunk;
 #[cfg(feature = "editor")]
 pub mod debug;
-pub mod editor_camera;
+pub(crate) mod editor_camera;
 pub mod edits;
 pub mod gallery;
 pub mod gizmo;
-pub mod height;
+pub(crate) mod height;
 pub mod node_gizmos;
-pub mod overlays;
-pub mod picking;
+pub(crate) mod overlays;
+pub(crate) mod picking;
 pub mod render;
-pub mod scatter;
+pub(crate) mod scatter;
 pub mod stress;
 pub mod textures;
-pub mod tower_field;
+pub(crate) mod tower_field;
 
 use bevy::prelude::*;
 
