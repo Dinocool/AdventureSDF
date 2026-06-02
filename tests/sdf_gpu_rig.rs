@@ -15,7 +15,6 @@
 use std::borrow::Cow;
 
 use bevy::math::{IVec3, Vec3};
-use futures_lite::future::block_on;
 use naga_oil::compose::{
     ComposableModuleDescriptor, Composer, NagaModuleDescriptor, ShaderLanguage,
 };
@@ -46,30 +45,11 @@ fn populate_resident(atlas: &mut SdfAtlas, config: &SdfGridConfig, bvh: &Bvh, ca
 
 // --- GPU device ----------------------------------------------------------------
 
+mod common;
+
+// R16Snorm (the brick atlas + volume distance format) needs TEXTURE_FORMAT_16BIT_NORM.
 fn device_queue() -> Option<(wgpu::Device, wgpu::Queue)> {
-    let instance = wgpu::Instance::default();
-    let adapter = block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-        power_preference: wgpu::PowerPreference::HighPerformance,
-        force_fallback_adapter: false,
-        compatible_surface: None,
-    }))
-    .ok()?;
-    let info = adapter.get_info();
-    eprintln!(
-        "GPU adapter: name={:?} backend={:?} driver={:?} driver_info={:?} device_type={:?}",
-        info.name, info.backend, info.driver, info.driver_info, info.device_type
-    );
-    // R16Snorm (the brick atlas + volume distance format) needs TEXTURE_FORMAT_16BIT_NORM;
-    // request it if the adapter supports it so the rig can create those textures.
-    let wanted = wgpu::Features::TEXTURE_FORMAT_16BIT_NORM;
-    let features = adapter.features() & wanted;
-    let (device, queue) = block_on(adapter.request_device(&wgpu::DeviceDescriptor {
-        label: Some("sdf_gpu_rig"),
-        required_features: features,
-        ..Default::default()
-    }))
-    .ok()?;
-    Some((device, queue))
+    common::headless_device(wgpu::Features::TEXTURE_FORMAT_16BIT_NORM)
 }
 
 // --- SdfCameraUniform mirror (336 bytes) ---------------------------------------
