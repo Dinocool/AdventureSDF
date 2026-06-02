@@ -109,6 +109,7 @@ dependencies = [
  "renderdoc",
  "ron",
  "serde",
+ "tracing-chrome",
  "wgpu",
 ]
 
@@ -1185,7 +1186,6 @@ dependencies = [
  "bevy_platform",
  "bevy_utils",
  "tracing",
- "tracing-chrome",
  "tracing-error",
  "tracing-log",
  "tracing-oslog",

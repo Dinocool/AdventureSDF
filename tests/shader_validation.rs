@@ -173,6 +173,7 @@ fn sdf_debug_modes_validate() {
         "SDF_DISABLE_CHUNK_CACHE",
         "SDF_DISABLE_LOD",
         "SDF_LINEAR_CHUNK_SEARCH",
+        "SDF_DEBUG_LOD",
     ] {
         validate_composed_sdf_with_defs(&[def]).unwrap_or_else(|e| panic!("{e}"));
     }

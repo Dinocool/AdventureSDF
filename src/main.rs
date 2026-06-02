@@ -1,5 +1,7 @@
 use bevy::pbr::wireframe::WireframePlugin;
 use bevy::prelude::*;
+#[cfg(feature = "editor")]
+use bevy::log::LogPlugin;
 use bevy::remote::RemotePlugin;
 use bevy::render::RenderPlugin;
 use bevy::render::render_resource::WgpuFeatures;
@@ -8,11 +10,11 @@ use bevy::window::WindowResolution;
 use bevy_brp_extras::BrpExtrasPlugin;
 use bevy_rapier3d::prelude::*;
 
-/// Each editor run writes a `trace-<timestamp>.json` (bevy/trace_chrome) into the CWD, and
-/// these grow to tens of GB apiece. Bevy's LogPlugin has no retention hook, so prune here —
-/// BEFORE DefaultPlugins creates this run's file — keeping the 2 newest so that, once the new
-/// trace starts, at most 3 exist. Sorted by name: the timestamp suffix is monotone, so
-/// lexical order == chronological order.
+/// Each editor run creates a `trace-<timestamp>.json` (our `editor::chrome_trace` layer) in
+/// the CWD; a captured one can grow to tens of GB. Our chrome layer has no retention hook, so
+/// prune here — BEFORE DefaultPlugins creates this run's file — keeping the 2 newest so that,
+/// once the new trace starts, at most 3 exist. Sorted by name: the timestamp suffix is
+/// monotone, so lexical order == chronological order.
 #[cfg(feature = "editor")]
 fn prune_old_traces(keep: usize) {
     let mut traces: Vec<std::path::PathBuf> = match std::fs::read_dir(".") {
@@ -83,32 +85,41 @@ fn main() {
     load_renderdoc();
 
     let mut app = App::new();
-    app.add_plugins(
-        DefaultPlugins
-            .set(WindowPlugin {
-                primary_window: Some(Window {
-                    title: "Adventure".into(),
-                    resolution: WindowResolution::new(1920, 1080),
-                    ..default()
-                }),
-                ..default()
-            })
-            // Enable BC texture compression so the SDF PBR atlases can upload as
-            // BC7 (~⅙ the VRAM of RGBA8). Desktop Vulkan/DX12/Metal support BC
-            // universally; device init fails loudly if a backend somehow lacks it.
-            .set(RenderPlugin {
-                render_creation: RenderCreation::Automatic(WgpuSettings {
-                    // BC7 texture compression (~1/6 the VRAM of RGBA8) + 16-bit-norm texture
-                    // formats. TEXTURE_FORMAT_16BIT_NORM is required for the R16Snorm /
-                    // Rgba16Snorm SDF distance atlases AND the 3D R16Snorm distance-clipmap
-                    // volume — without it those `create_texture` calls fail validation.
-                    features: WgpuFeatures::TEXTURE_COMPRESSION_BC
-                        | WgpuFeatures::TEXTURE_FORMAT_16BIT_NORM,
-                    ..default()
-                }),
+
+    let default_plugins = DefaultPlugins
+        .set(WindowPlugin {
+            primary_window: Some(Window {
+                title: "Adventure".into(),
+                resolution: WindowResolution::new(1920, 1080),
                 ..default()
             }),
-    )
+            ..default()
+        })
+        // Enable BC texture compression so the SDF PBR atlases can upload as
+        // BC7 (~⅙ the VRAM of RGBA8). Desktop Vulkan/DX12/Metal support BC
+        // universally; device init fails loudly if a backend somehow lacks it.
+        .set(RenderPlugin {
+            render_creation: RenderCreation::Automatic(WgpuSettings {
+                // BC7 texture compression (~1/6 the VRAM of RGBA8) + 16-bit-norm texture
+                // formats. TEXTURE_FORMAT_16BIT_NORM is required for the R16Snorm /
+                // Rgba16Snorm SDF distance atlases AND the 3D R16Snorm distance-clipmap
+                // volume — without it those `create_texture` calls fail validation.
+                features: WgpuFeatures::TEXTURE_COMPRESSION_BC
+                    | WgpuFeatures::TEXTURE_FORMAT_16BIT_NORM,
+                ..default()
+            }),
+            ..default()
+        });
+
+    // Editor builds install our runtime-toggleable chrome-trace layer (off by default) via
+    // LogPlugin's custom_layer hook. Non-editor builds leave LogPlugin at its default.
+    #[cfg(feature = "editor")]
+    let default_plugins = default_plugins.set(LogPlugin {
+        custom_layer: adventure::editor::chrome_trace::custom_layer,
+        ..default()
+    });
+
+    app.add_plugins(default_plugins)
     .add_plugins(RapierPhysicsPlugin::<NoUserData>::default())
     .add_plugins(RemotePlugin::default())
     .add_plugins(BrpExtrasPlugin)

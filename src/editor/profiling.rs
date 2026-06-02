@@ -68,6 +68,12 @@ pub fn performance_panel(world: &mut World, ui: &mut egui::Ui) {
         .show(ui, |ui| {
             perf_graph_ui(world, ui);
 
+            // Chrome-trace capture toggle (off by default). Records Bevy system /
+            // render-graph spans to a JSON file only while enabled.
+            ui.separator();
+            ui.heading("Profiling capture");
+            crate::editor::chrome_trace::capture_ui(world, ui);
+
             // GPU / SDF atlas stats, rolled in from the (now-removed) SDF Atlas tab.
             ui.separator();
             ui.heading("GPU");
