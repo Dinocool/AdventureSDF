@@ -16,11 +16,58 @@ mod tree;
 use bevy::prelude::*;
 use bevy_egui::egui;
 
-use crate::sdf_render::SdfSelection;
+use crate::node::SceneNode;
+use crate::sdf_render::{SdfPrimitive, SdfSelection};
 
 use catalog::CreateDialog;
 use reparent::{Actions, RenameState, apply_actions};
 use tree::{DragCtx, NodeRow, collect_tree, descendant_set};
+
+/// Cached scene-tree snapshot reused across frames. [`hierarchy_ui`] rebuilds it only when the
+/// hierarchy actually changes ([`mark_hierarchy_dirty`] clears `valid`) or the filter string
+/// changes — `collect_tree` is an O(all-nodes) ECS walk + per-node string allocation, so running
+/// it every frame was the panel's whole residual cost once the render was virtualized.
+#[derive(Resource, Default)]
+pub struct HierarchyCache {
+    arena: Vec<NodeRow>,
+    roots: Vec<usize>,
+    /// Filter string the cached `matches_filter` flags were computed for.
+    filter: String,
+    /// Cleared on any structural change; forces a rebuild the next time the panel draws.
+    valid: bool,
+}
+
+/// Query filter matching a scene node whose tree-relevant state changed this tick: a new node, a
+/// rename, a reparent (`ChildOf`/`Children`), or a primitive-kind change (drives the row icon).
+type HierarchyChanged = (
+    With<SceneNode>,
+    Or<(
+        Added<SceneNode>,
+        Changed<Name>,
+        Changed<ChildOf>,
+        Changed<Children>,
+        Changed<SdfPrimitive>,
+    )>,
+);
+
+/// Clear [`HierarchyCache::valid`] when the scene tree changes — spawn / despawn / reparent /
+/// rename / primitive-kind change. O(changed entities), so idle frames cost ~nothing and the
+/// hierarchy panel reuses last frame's snapshot until something actually moves.
+pub fn mark_hierarchy_dirty(
+    mut cache: ResMut<HierarchyCache>,
+    changed: Query<(), HierarchyChanged>,
+    mut removed: RemovedComponents<SceneNode>,
+) {
+    if !changed.is_empty() || removed.read().count() > 0 {
+        cache.valid = false;
+    }
+}
+
+/// Register the hierarchy snapshot cache + its change-detection invalidator.
+pub fn plugin(app: &mut App) {
+    app.init_resource::<HierarchyCache>()
+        .add_systems(Update, mark_hierarchy_dirty);
+}
 
 /// Render the scene node tree.
 pub fn hierarchy_ui(world: &mut World, ui: &mut egui::Ui) {
@@ -51,13 +98,33 @@ pub fn hierarchy_ui(world: &mut World, ui: &mut egui::Ui) {
     });
     ui.memory_mut(|m| m.data.insert_temp(filter_id, filter.clone()));
 
-    // The Create Node dialog spawns + selects a node; render it before the tree so the
-    // new node shows this frame.
+    // The Create Node dialog spawns + selects a node. With the cached tree (below) the new
+    // node appears the next frame, once `mark_hierarchy_dirty` sees the `Added<SceneNode>`.
     catalog::show_create_dialog(world, ui, &mut dialog);
     ui.memory_mut(|m| m.data.insert_temp(dialog_id, dialog));
 
     let needle = filter.trim().to_lowercase();
-    let (arena, roots) = collect_tree(world, &needle);
+
+    // Reuse last frame's snapshot unless the hierarchy changed (valid cleared) or the filter
+    // changed. Take the cached `Vec`s out so the render below owns them (no long `World` borrow,
+    // and the rest of the function is unchanged); they're stashed back at the end.
+    let rebuild = {
+        let cache = world.resource::<HierarchyCache>();
+        !cache.valid || cache.filter != needle
+    };
+    let (arena, roots) = if rebuild {
+        let built = collect_tree(world, &needle);
+        let mut cache = world.resource_mut::<HierarchyCache>();
+        cache.filter = needle.clone();
+        cache.valid = true;
+        built
+    } else {
+        let mut cache = world.resource_mut::<HierarchyCache>();
+        (
+            std::mem::take(&mut cache.arena),
+            std::mem::take(&mut cache.roots),
+        )
+    };
 
     // F2 starts renaming the current selection (if not already renaming).
     let f2 = ui.input(|i| i.key_pressed(egui::Key::F2));
@@ -83,68 +150,153 @@ pub fn hierarchy_ui(world: &mut World, ui: &mut egui::Ui) {
         .unwrap_or_default();
     let drag = DragCtx { dragged, forbidden };
 
-    egui::ScrollArea::vertical().show(ui, |ui| {
-        // Full-panel background target. Created BEFORE the rows so the rows (drawn on
-        // top) win where they are; any click/drop landing on empty space — below OR to
-        // the right of a row — falls through here. Click → deselect; drop a dragged
-        // node here → unparent it to the scene root.
-        let bg = ui.interact(
-            ui.max_rect(),
-            ui.id().with("tree_bg"),
-            egui::Sense::click_and_drag(),
-        );
-        if bg.clicked() {
-            actions.deselect = true;
-        }
-        // While dragging, hint that releasing on empty space unparents to the root.
-        if drag.dragged.is_some() && bg.contains_pointer() {
-            ui.painter().rect_stroke(
-                bg.rect.shrink(1.0),
-                3.0,
-                ui.visuals().selection.stroke,
-                egui::StrokeKind::Inside,
-            );
-        }
+    // Flatten the VISIBLE tree (filter-matching rows, descending only into expanded
+    // subtrees) to a linear list, then render ONLY the rows intersecting the viewport.
+    // This makes the panel O(visible rows) instead of O(all entities): on the stress scene
+    // (thousands of nodes) `ScrollArea::show` was laying out every row every frame even when
+    // scrolled off-screen — ~25 ms/frame. Reading per-node expand state during the flatten is
+    // a cheap memory lookup, so the flatten stays O(nodes) while the RENDER becomes O(visible).
+    let flat = flatten_visible(&arena, &roots, ui.ctx());
+    let row_h = ui.spacing().interact_size.y;
+    egui::ScrollArea::vertical()
+        .auto_shrink([false, false])
+        .show_viewport(ui, |ui, viewport| {
+            let total_h = flat.len() as f32 * row_h;
+            ui.set_min_height(total_h);
+            let origin = ui.min_rect().min;
 
-        if arena.is_empty() {
-            ui.weak("No nodes in scene");
-        }
-        for &root in &roots {
-            render_node(
-                ui,
-                &arena,
-                root,
-                selected,
-                &drag,
-                &mut rename,
-                &mut commit_rename,
-                &mut actions,
+            // Full-content background: click empty space to deselect, drop a node here to
+            // unparent it to the scene root. Interacted BEFORE the rows so the rows (added
+            // after) win where they sit; only genuine empty space falls through here.
+            let bg = ui.interact(
+                egui::Rect::from_min_size(
+                    origin,
+                    egui::vec2(ui.available_width(), total_h.max(ui.available_height())),
+                ),
+                ui.id().with("tree_bg"),
+                egui::Sense::click_and_drag(),
             );
-        }
+            if bg.clicked() {
+                actions.deselect = true;
+            }
+            if drag.dragged.is_some() && bg.contains_pointer() {
+                ui.painter().rect_stroke(
+                    bg.rect.shrink(1.0),
+                    3.0,
+                    ui.visuals().selection.stroke,
+                    egui::StrokeKind::Inside,
+                );
+            }
 
-        // Unparent drop is resolved AFTER the rows so a row drop-target consumes the
-        // payload first; the background only claims it when released over empty space.
-        // (`dnd_release_payload` *takes* the payload, so order matters.)
-        if actions.reparent.is_none()
-            && let Some(child) = bg.dnd_release_payload::<Entity>()
-        {
-            actions.reparent = Some((*child, None));
-        }
-    });
+            if flat.is_empty() {
+                let mut c = ui.new_child(egui::UiBuilder::new().max_rect(
+                    egui::Rect::from_min_size(origin, egui::vec2(ui.available_width(), row_h)),
+                ));
+                c.weak("No nodes in scene");
+            }
+
+            // Only the rows whose band [vi*row_h, (vi+1)*row_h) intersects the viewport.
+            let first = (viewport.min.y / row_h).floor().max(0.0) as usize;
+            let last = ((viewport.max.y / row_h).ceil() as usize).min(flat.len());
+            for (offset, &(idx, depth)) in flat[first..last].iter().enumerate() {
+                let vi = first + offset;
+                let row_rect = egui::Rect::from_min_size(
+                    origin + egui::vec2(0.0, vi as f32 * row_h),
+                    egui::vec2(ui.available_width(), row_h),
+                );
+                // id_salt by entity so each row's widget ids are stable + unique across the
+                // virtualized window (rows reuse source locations otherwise → id collisions).
+                let mut row_ui = ui.new_child(
+                    egui::UiBuilder::new()
+                        .max_rect(row_rect)
+                        .layout(egui::Layout::left_to_right(egui::Align::Center))
+                        .id_salt(arena[idx].entity),
+                );
+                render_flat_row(
+                    &mut row_ui,
+                    &arena,
+                    idx,
+                    depth,
+                    selected,
+                    &drag,
+                    &mut rename,
+                    &mut commit_rename,
+                    &mut actions,
+                );
+            }
+
+            // Unparent drop is resolved AFTER the rows so a row drop-target consumes the
+            // payload first; the background only claims it when released over empty space.
+            // (`dnd_release_payload` *takes* the payload, so order matters.)
+            if actions.reparent.is_none()
+                && let Some(child) = bg.dnd_release_payload::<Entity>()
+            {
+                actions.reparent = Some((*child, None));
+            }
+        });
+
+    // Stash the snapshot back into the cache for next frame's reuse.
+    {
+        let mut cache = world.resource_mut::<HierarchyCache>();
+        cache.arena = arena;
+        cache.roots = roots;
+    }
 
     apply_actions(world, &mut rename, commit_rename, actions);
     ui.memory_mut(|m| m.data.insert_temp(rename_id, rename));
 }
 
-/// Recursively draw one node and its node-children. Each row is a drag source (grab
-/// to reparent) and a drop target (release another node on it to nest it here).
-/// Parents use a `CollapsingState` so the disclosure triangle works while the header
-/// row itself stays draggable.
+/// Flatten the visible tree into `(arena_idx, depth)` rows in display order: filter-matching
+/// nodes only, descending into a node's children only while it's expanded. Reading the expand
+/// state is a cheap memory lookup, so this stays O(nodes) while the render becomes O(visible).
+fn flatten_visible(arena: &[NodeRow], roots: &[usize], ctx: &egui::Context) -> Vec<(usize, u32)> {
+    fn push(
+        arena: &[NodeRow],
+        idx: usize,
+        depth: u32,
+        ctx: &egui::Context,
+        out: &mut Vec<(usize, u32)>,
+    ) {
+        if !arena[idx].matches_filter {
+            return;
+        }
+        out.push((idx, depth));
+        let has_children = arena[idx].children.iter().any(|&c| arena[c].matches_filter);
+        if has_children && is_expanded(ctx, arena[idx].entity) {
+            for &child in &arena[idx].children {
+                push(arena, child, depth + 1, ctx, out);
+            }
+        }
+    }
+    let mut out = Vec::new();
+    for &root in roots {
+        push(arena, root, 0, ctx, &mut out);
+    }
+    out
+}
+
+/// Per-node expand state, persisted in egui memory keyed by entity (default expanded, matching
+/// the old `default_open = true`). Stored as a plain bool so the flatten can read it cheaply
+/// without instantiating a `CollapsingState` per node.
+fn expand_id(entity: Entity) -> egui::Id {
+    egui::Id::new(("hier_open", entity))
+}
+fn is_expanded(ctx: &egui::Context, entity: Entity) -> bool {
+    ctx.memory(|m| m.data.get_temp::<bool>(expand_id(entity)).unwrap_or(true))
+}
+fn set_expanded(ctx: &egui::Context, entity: Entity, open: bool) {
+    ctx.memory_mut(|m| m.data.insert_temp(expand_id(entity), open));
+}
+
+/// Draw one already-positioned (and already filter-/visibility-checked) row: indent,
+/// disclosure toggle (parents only), then the draggable label — or the inline rename field.
+/// Non-recursive: the tree shape comes from [`flatten_visible`], so off-screen rows cost nothing.
 #[allow(clippy::too_many_arguments)]
-fn render_node(
+fn render_flat_row(
     ui: &mut egui::Ui,
     arena: &[NodeRow],
     idx: usize,
+    depth: u32,
     selected: Option<Entity>,
     drag: &DragCtx,
     rename: &mut RenameState,
@@ -152,11 +304,9 @@ fn render_node(
     actions: &mut Actions,
 ) {
     let row = &arena[idx];
-    if !row.matches_filter {
-        return;
-    }
+    ui.add_space(depth as f32 * 16.0);
 
-    // Inline rename field replaces the row label while active.
+    // Inline rename field replaces the row content while active.
     if rename.entity == Some(row.entity) {
         let resp =
             ui.add(egui::TextEdit::singleline(&mut rename.buf).desired_width(f32::INFINITY));
@@ -169,44 +319,22 @@ fn render_node(
     }
 
     let has_children = row.children.iter().any(|&c| arena[c].matches_filter);
-    let state_id = ui.make_persistent_id(("node", row.entity));
-    let mut collapse = egui::collapsing_header::CollapsingState::load_with_default_open(
-        ui.ctx(),
-        state_id,
-        true,
-    );
-
-    let header_resp = ui
-        .horizontal(|ui| {
-            if has_children {
-                collapse.show_toggle_button(ui, egui::collapsing_header::paint_default_icon);
-            } else {
-                // Indent leaves to align with siblings that have a toggle.
-                ui.add_space(18.0);
-            }
-            draggable_row(ui, row, selected == Some(row.entity), actions)
-        })
-        .inner;
-
-    wire_row(ui, &header_resp, row, drag, actions);
-
     if has_children {
-        collapse.show_body_indented(&header_resp, ui, |ui| {
-            for &child in &row.children {
-                render_node(
-                    ui,
-                    arena,
-                    child,
-                    selected,
-                    drag,
-                    rename,
-                    commit_rename,
-                    actions,
-                );
-            }
-        });
+        let open = is_expanded(ui.ctx(), row.entity);
+        let icon = if open { "\u{25BE}" } else { "\u{25B8}" }; // ▾ / ▸
+        if ui
+            .add(egui::Button::new(icon).frame(false).min_size(egui::vec2(18.0, 0.0)))
+            .clicked()
+        {
+            set_expanded(ui.ctx(), row.entity, !open);
+        }
+    } else {
+        // Indent leaves to align with siblings that have a toggle.
+        ui.add_space(18.0);
     }
-    collapse.store(ui.ctx());
+
+    let resp = draggable_row(ui, row, selected == Some(row.entity), actions);
+    wire_row(ui, &resp, row, drag, actions);
 }
 
 /// Draw the node's label as a click-and-drag row and return its response. The
