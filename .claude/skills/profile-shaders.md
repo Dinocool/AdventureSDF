@@ -86,12 +86,21 @@ The SDF passes to look for: **`sdf_brick_bake`** (compute, only on frames with b
 step/inst counts per pass. `--set-gpu-clocks base` (in `capture.ps1`) locks clocks so numbers
 are comparable across runs.
 
-### Per-WGSL-line cost (deep-dive, UI for now)
-The 2.2MB `.ngfx-gputrace` binary holds the source-level shader profiler (PC sampling mapped
-to WGSL lines via the `shader-debug` OpLine info). It's not yet parsed headless — open it in
-`ngfx-ui.exe` → Shader Profiler view. If we later find a headless export of that table, add a
-parser here. Until then, `perf.json` per-pass bottleneck + the in-shader step histogram (see
-`march.wgsl` `result.steps`/`.fate`) are the closed-loop signals.
+### Per-WGSL-line cost — Nsight UI ONLY (headless ruled out 2026-06-02)
+The `.ngfx-gputrace` binary holds the source-level shader profiler (PC sampling mapped to WGSL
+lines via the `shader-debug` OpLine info), but there is **no headless path** to it (verified):
+`--auto-export` writes only the regime/frame `BASE/*.xls`; the GPU-Trace CLI has **no
+shader-source export flag**; the report is a proprietary `WRPV` binary with the source mapping
+encoded (no plain-text WGSL to scrape); side tools `ngfx-replay`/`CrashReporter` don't export it.
+So per-line is **UI-only**: open the `.ngfx-gputrace` in `ngfx-ui.exe` → **Shader Profiler /
+Shader Source** view, pick the pass's shader. To feed it back to me, **right-click the table →
+Export to CSV** (then I parse it) or screenshot the per-line column.
+
+Fully-headless alternative — **ablation A/B**: attribute cost to march REGIONS (not lines) by
+gating suspected hot blocks behind shader `#define`s (the field already has
+`SDF_DISABLE_CHUNK_CACHE` / `SDF_DISABLE_LOD`) and diffing the pass's `gpu_time_us`/`inst_executed`
+in `perf.json` across F11 captures. Coarser than per-line, but AI-runnable end-to-end. The
+in-shader step histogram (`march.wgsl` `result.steps`/`.fate`) is the other closed-loop signal.
 
 ## CPU side — chrome traces (F6)
 `cargo run --features editor` + **F6** toggles our custom chrome layer (off by default) →
