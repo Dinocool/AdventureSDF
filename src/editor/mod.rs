@@ -57,6 +57,9 @@ impl Plugin for EditorPlugin {
             assets_browser::ThumbnailRegistryPlugin,
             asset_inspector::AssetInspectorPlugin,
             selection::SelectionPlugin,
+            keybinds::KeybindsPlugin,
+            status_bar::StatusBarPlugin,
+            hierarchy::HierarchyPlugin,
             dock::DockPlugin,
         ))
         .init_resource::<menu_bar::EditorRequests>()
@@ -98,10 +101,6 @@ impl Plugin for EditorPlugin {
             0,
             profiling::performance_panel,
         );
-
-        keybinds::plugin(app);
-        status_bar::plugin(app);
-        hierarchy::plugin(app);
 
         // F6 toggles chrome-trace capture (global; RenderDoc is F7 behind the `renderdoc` feature).
         app.add_systems(Update, chrome_trace::toggle_on_f6);
