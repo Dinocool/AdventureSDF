@@ -177,7 +177,7 @@ pub fn build_chunk_tables(
     ChunkTables {
         chunks,
         tile_run,
-        r: config.ring_bricks as i32 / CHUNK_BRICKS,
+        r: config.ring_chunks_per_axis(),
     }
 }
 
@@ -338,8 +338,8 @@ impl LiveChunkTables {
     /// tile_run_base in one write) — a tag-valid slot never points at unbaked/old texels.
     pub fn set_brick(&mut self, ck: ChunkKey, local: u32, tile: BrickTile, config: &SdfGridConfig) {
         if self.dir.is_empty() {
-            self.r = config.ring_bricks as i32 / CHUNK_BRICKS;
-            let n = (self.r * self.r * self.r) as usize * config.lod_count as usize;
+            self.r = config.ring_chunks_per_axis();
+            let n = config.directory_len();
             self.dir = vec![sentinel_lookup(); n];
         }
         let idx = dir_index(ck, self.r);
@@ -827,7 +827,7 @@ mod tests {
     #[test]
     fn clear_brick_sentinels_slot_keeps_directory_size() {
         let cfg = config();
-        let r = cfg.ring_bricks as i32 / CHUNK_BRICKS;
+        let r = cfg.ring_chunks_per_axis();
         let tile = BrickTile { atlas_base: 7, pal01: 0, pal23: 0 };
         let mut live = LiveChunkTables::default();
         let a = ChunkKey::new(0, IVec3::new(0, 0, 0));
@@ -885,7 +885,7 @@ mod tests {
             live.set_brick(ck, local, tile_of(k), &cfg);
         }
         let (chunks, tile_run) = live.full_tables();
-        let tables = ChunkTables { chunks, tile_run, r: cfg.ring_bricks as i32 / CHUNK_BRICKS };
+        let tables = ChunkTables { chunks, tile_run, r: cfg.ring_chunks_per_axis() };
 
         for k in &keys {
             let got = shader_resolve(&tables, &cfg, *k)
@@ -921,7 +921,7 @@ mod tests {
         };
 
         let cfg = config();
-        let r = cfg.ring_bricks as i32 / CHUNK_BRICKS;
+        let r = cfg.ring_chunks_per_axis();
         let mut live = LiveChunkTables::default();
         let mut truth: HashMap<(ChunkKey, u32), BrickTile> = HashMap::new();
 
