@@ -220,8 +220,20 @@ wide `pub(super)`/`use super::{...}` surface. **Verification corrected all of th
 medium** -- the payoff is real but dampened by shared-state plumbing. Do them when a file becomes a
 genuine friction point, not speculatively. **Don't split `chunk.rs`** (X3).
 
-### [ ] M1. Split `render.rs` (2511 LoC) into a `render/` directory by render-pass concern
+### [x] M1. Split `render.rs` (2511 LoC) into a `render/` directory by render-pass concern
 `impact: medium` * `effort: large` * `source: modularization`
+> **Done (landed incrementally).** `render.rs` → `render/mod.rs` + four cohesive submodules:
+> `bake.rs` (GPU brick-bake compute), `pbr_textures.rs` (BC7 array streaming), `cone.rs` (cone
+> prepass), `atlas_upload.rs` (chunk-table GPU mirror + encode/upload). **C5/A4 folded in**: the
+> 12-entry atlas bind group is now one shared `atlas_bind_group_1()` helper (was copy-pasted in the
+> G-buffer + cone nodes). `render/mod.rs`: **2398 → 1259 LoC (−47%)**. The remaining core —
+> `SdfCameraData` (the camera uniform, referenced ~12× across both view nodes, pipeline init, and
+> `register_type`/`ExtractComponentPlugin`), `SdfPipeline`/`SdfGpuAtlas`, the G-buffer + combine view
+> nodes, camera/material prepare, and pipeline init — is **kept central by design**: it threads the
+> shared state across every pass, so per the verification verdict ("the state doesn't partition along
+> pass lines") splitting it would create wide `super::`/re-export plumbing for the most-shared type
+> with minimal cohesion gain. Submodules reach shared types via `use super::*`; the `sdf_render`
+> siblings via `super::super`. Each peel was its own verified commit (GPU rigs green throughout).
 
 - *Now:* One flat file mixes ~6 independent subsystems (camera prepare, atlas/chunk-table upload, PBR
   texture streaming, cone prepass, brick bake, deferred G-buffer + combine). To read the bake path you
