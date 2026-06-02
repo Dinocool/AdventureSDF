@@ -435,8 +435,14 @@ The whole `editor/` tree is feature-gated -- **build `--features editor` to catc
   the `sync_selection` run_if gate (96), `register_component_editor::<Transform>` (72), and the
   renderdoc-gated plugin add (68-69). Build BOTH configs.
 
-### [ ] E2. Generic `PathDispatchRegistry` for the 4 hand-rolled first-match-wins registries
+### [~] E2. Generic `PathDispatchRegistry` for the 4 hand-rolled first-match-wins registries
 `impact: medium` * `effort: medium` * `source: editor-structure`
+> **Skipped (verdict's "skip if more complex" condition met).** The two candidate registries have
+> *divergent* handler signatures: `ThumbnailProvider::thumbnail(&self, &mut World, &Path) -> Thumbnail`
+> vs `AssetInspector::ui(&self, &mut World, &Path, &mut egui::Ui)`. A single generic `PathMatcher`
+> trait can't express both — the inspector needs the extra `&mut Ui` context — so the generic would
+> need a context type-param, making it *more* complex than the two ~6-line first-match loops it
+> replaces. The loops already share `fs_util::with_registry`; not worth genericizing.
 
 - *Now:* `ThumbnailRegistry`, `AssetInspectorRegistry` (+ traits) are structurally identical -- a
   `Vec<Box<dyn T>>`, a `register`, and a `for p {... if p.matches(path) { return p.handle() }}` loop via
@@ -460,7 +466,13 @@ The whole `editor/` tree is feature-gated -- **build `--features editor` to catc
   footer. Optionally fold both behind one `enum FileDialog { Open, SaveAs }` resource (never open
   simultaneously). Good existing test coverage (`scene_browser.rs:281-332`); UI-only.
 
-### [ ] E4. Concentrate `DockState<EditorTab>` topology surgery into `dock`
+### [~] E4. Concentrate `DockState<EditorTab>` topology surgery into `dock`
+> **Deferred (risk vs. no runtime verification).** This touches the layout-restore + tab-swap paths,
+> which have subtle ordering invariants (e.g. `close_doc.rs:680-687` adds the placeholder BEFORE
+> removing the scene tab so the leaf survives) and are lightly unit-tested. Editor runtime can't be
+> auto-driven here (manual open/close/save-layout smoke is the real check), so a behavior-preserving
+> move of the topology helpers is too risky to land blind. Best done in a focused session with a
+> manual editor smoke pass. Pairs with M5 (`scene_tabs/` split).
 `impact: medium` * `effort: medium` * `source: editor-structure`
 
 - *Now:* Three modules reach into dock-leaf internals: `scene_tabs.rs:305-328` exports center-leaf
@@ -484,7 +496,10 @@ The whole `editor/` tree is feature-gated -- **build `--features editor` to catc
   stated architecture). Convert `keybinds`/`status_bar` `plugin(app)` to structs; this ties into E1.
   Mechanical; preserve the `EguiGlobalSettings` poke + `register_component_editor::<Transform>`.
 
-### [ ] E6. (low) `ui_temp` helper + a documented defer-apply pattern for panels
+### [~] E6. (low) `ui_temp` helper + a documented defer-apply pattern for panels
+> **Deferred (low value, do-alongside-hierarchy-work per the finding).** A convenience wrapper for
+> the `get_temp`/`insert_temp` dance; the verdict itself scoped it to "only worth doing alongside
+> other hierarchy work." Not a standalone win.
 `impact: low` * `effort: small` * `source: editor-structure`
 
 - *Now:* The egui-with-exclusive-World idiom (clone state out before the closure, collect mutations
