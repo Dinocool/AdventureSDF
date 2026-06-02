@@ -28,3 +28,6 @@ rdoc/*
 rdoc/scripts/**/__pycache__/
 *.cap
 *.rdc
+
+# Dear ImGui / Nsight overlay config dropped next to the exe during a capture.
+imgui.ini

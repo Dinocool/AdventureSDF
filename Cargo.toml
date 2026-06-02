@@ -10,11 +10,6 @@ editor = [
     "dep:bevy_egui",
     "dep:egui_dock",
     "dep:egui-phosphor",
-    # F5-in-editor RenderDoc capture (in-application API). `renderdoc` grabs the API
-    # handle; `libloading` preloads renderdoc.dll before wgpu creates the device so the
-    # hook installs (see `load_renderdoc` in main.rs).
-    "dep:renderdoc",
-    "dep:libloading",
     # Chrome-tracing profiler, RUNTIME-TOGGLEABLE from the editor (Performance panel),
     # OFF by default. We enable `bevy/trace` for the instrumentation (every Bevy system +
     # render-graph node span plus our own `info_span!` SDF spans) but NOT `bevy/trace_chrome`
@@ -25,6 +20,17 @@ editor = [
     "bevy/trace",
     "dep:tracing-chrome",
 ]
+# In-app RenderDoc capture (F5), OFF by default. Implies `editor` (the capture plugin lives
+# there). `renderdoc` grabs the in-application API handle; `libloading` preloads
+# renderdoc.dll before wgpu creates the device so the hook installs (see `load_renderdoc`).
+# Build with `--features renderdoc` (add `--no-default-features` to drop `fast`/dynamic_linking,
+# which RenderDoc can't hook).
+renderdoc = ["editor", "dep:renderdoc", "dep:libloading"]
+# Emit shader debug info (naga `OpLine`/`OpSource`) by enabling wgpu `InstanceFlags::DEBUG`,
+# so an NVIDIA Nsight Graphics GPU-Trace capture can correlate sampled GPU cost back to WGSL
+# source lines. OFF by default (debug info bloats shaders + slightly slows pipeline creation);
+# build with `--features editor,shader-debug` when profiling shaders. See `rdoc/scripts/ngfx`.
+shader-debug = []
 # Faster incremental compiles via dynamic linking of Bevy. Dev-only — never ship.
 # (Disable with `--no-default-features` when capturing in RenderDoc, which can't inject
 # into a dynamically-linked Bevy.)

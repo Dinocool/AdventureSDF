@@ -1,33 +1,33 @@
 ---
 name: analyze-rdoc
-description: Analyze RenderDoc GPU captures (.rdc) and Bevy chrome traces to find rendering performance bottlenecks. Trigger when investigating GPU/frame cost, "which draw is slow", shader perf, a .rdc capture, or a trace-*.json. Toolkit lives in rdoc/scripts/.
+description: RenderDoc single-frame GPU deep-dive (.rdc) — inspect what the GPU saw (textures, UBO decode, shader disasm) and per-draw GPU timing. OPTIONAL fallback, behind the `renderdoc` feature (F7). For the primary "which pass is slow / what's it bound on" perf loop use `profile-shaders` (Nsight, AI-runnable); for CPU/system cost use chrome traces. Toolkit in rdoc/scripts/rdoc/.
 ---
 
-# Analyzing RenderDoc captures & Bevy traces
+# RenderDoc single-frame deep-dive (optional)
 
-Two profiling data sources, two toolkits under `rdoc/scripts/`. Pick by the question:
+> **Use `profile-shaders` first.** Per-pass GPU timing + bottleneck (compute/memory bound) now
+> comes from the headless, AI-runnable Nsight loop (`rdoc/scripts/ngfx/`). RenderDoc is the
+> **optional deep-dive** for things Nsight doesn't hand you trivially: dumping the actual
+> textures/UBOs the GPU saw, and the compiled shader disasm, for ONE frame. It's behind the
+> `renderdoc` feature now, not in default editor builds.
 
-| Question | Source | Tool dir |
-|---|---|---|
-| **Which draw/dispatch is slow on the GPU?** | `.rdc` capture | `rdoc/scripts/rdoc/` |
-| Which CPU system / render-graph node costs most? | `trace-*.json` | `rdoc/scripts/trace/` |
-| What did the GPU actually see (uniforms, textures)? | `.rdc` capture | `rdoc/scripts/rdoc/` |
-
-**Critical distinction:** a Bevy chrome trace canNOT see GPU fragment cost — heavy shaders
-show only as longer `prepare_windows` / vsync wait. To attribute frame cost to a *draw* you
-MUST use the `.rdc` GPU-timing path. Conversely, CPU hitches (bake spikes, system stalls)
-only show in the trace. Use both.
+| Question | Path |
+|---|---|
+| Which pass is slow + what's it bound on? | **`profile-shaders`** (Nsight → `perf.json`) |
+| Which CPU system / render-graph node costs most? | chrome trace (F6); see `profile-shaders` |
+| What did the GPU actually SEE (uniforms, textures, disasm)? | `.rdc` capture → `rdoc/scripts/rdoc/` (here) |
+| Per-draw GPU µs (fallback if Nsight unavailable) | `.rdc` → `gpu_timings.py` (here) |
 
 ## Capturing (the user does this)
 
-Editor build has F5 RenderDoc capture (`editor/renderdoc_capture.rs`). Press F5 in the
-running editor; `.rdc` writes to `rdoc/` (older captures may be in
-`%LOCALAPPDATA%/Temp/RenderDoc/`). Overlay is disabled, captures go to `rdoc/`.
-Requires a static build — `default = []` (NOT `fast`/dynamic_linking, which RenderDoc
-can't hook). Run: `cargo run --features editor`.
+RenderDoc capture is gated behind the **`renderdoc` feature** (which implies `editor`) and now
+bound to **F7** (`editor/renderdoc_capture.rs`). Build + run:
+`cargo run --features renderdoc` (add `--no-default-features` if `fast`/dynamic_linking is on —
+RenderDoc can't hook a dynamically-linked Bevy). Press **F7** in the editor; `.rdc` writes to
+`rdoc/`. Overlay is disabled.
 
-Chrome traces: any `cargo run --features editor` writes `trace-<ts>.json` on exit
-(bevy/trace_chrome). `main::prune_old_traces` keeps the newest few.
+(Chrome traces for CPU cost: `cargo run --features editor` + **F6** → `trace-<ts>.json`; see
+`profile-shaders` for the `rdoc/scripts/trace/` tools.)
 
 ## Running the .rdc tools (IMPORTANT — read this)
 
@@ -70,9 +70,11 @@ opens, producing NO output at all:
 Any NEW `.rdc` script MUST follow both rules or it fails silently.
 
 ### .rdc tools (`rdoc/scripts/rdoc/`)
-- **`gpu_timings.py`** — THE perf tool. Every draw/dispatch/copy by GPU µs, descending.
-  Top row = bottleneck. For the SDF renderer the fullscreen `vkCmdDraw` is the raymarch;
-  if it dominates, cost is in the fragment shader (texture taps, march steps, reflections).
+- **`gpu_timings.py`** — per-draw GPU µs, descending (a *fallback* for `profile-shaders`'s
+  Nsight per-pass timing when Nsight is unavailable). Top row = bottleneck. For the SDF
+  renderer the fullscreen `vkCmdDraw` is the raymarch; if it dominates, cost is in the
+  fragment shader. Nsight tells you WHAT it's bound on (compute/memory); this only tells you
+  WHICH draw.
 - **`list_passes.py`** — frame structure: every draw/dispatch/marker with eventId. Run
   first to orient and get the eventId for other tools.
 - **`dump_camera_ubo.py`** — decodes `SdfCameraData` bound to the SDF fragment shader
@@ -142,6 +144,8 @@ to grow. `rdoc/scripts/` is git-tracked (the rest of `rdoc/` — captures, dumps
 — is gitignored).
 
 ## Related
+- **`profile-shaders`** — the PRIMARY GPU/shader-perf skill (Nsight headless per-pass timing +
+  bottleneck, AI-runnable). Use it first; come here only for `.rdc` texture/UBO/disasm dumps.
 - [[feedback-no-launch-renderdoc]] — never launch qrenderdoc myself; hand the user the cmd.
 - [[feedback-no-auto-run]] — same principle for `cargo run`.
 - `debug-shader` — in-engine shader debug overlays (the other half of GPU debugging).

@@ -1,0 +1,66 @@
+<#
+.SYNOPSIS
+  Headless NVIDIA Nsight Graphics GPU-Trace + source-level (per-WGSL-line) shader-profiler
+  capture of the adventure editor. Auto-exports a report under -Out for parsing.
+
+.DESCRIPTION
+  Runs `ngfx.exe --activity "GPU Trace Profiler"` to inject into the app, wait -Frames frames
+  (so the scene settles), trace 1 frame with the SM hardware sampling profiler on, and
+  auto-export. `--real-time-shader-profiler` collects per-source-line GPU cost; for that cost
+  to map back to WGSL lines the app MUST be built with `shader-debug` (naga OpLine) and run on
+  the Vulkan backend (SPIR-V), which this script forces via WGPU_BACKEND=vulkan.
+
+.PREREQUISITES
+  cargo build --features editor,shader-debug
+
+.USAGE
+  powershell -ExecutionPolicy Bypass -File rdoc/scripts/ngfx/capture.ps1
+  powershell -ExecutionPolicy Bypass -File rdoc/scripts/ngfx/capture.ps1 -Frames 300 -Out .soul/ngfx
+#>
+param(
+  [int]$Frames = 240,
+  [string]$Out = ".soul/ngfx",
+  [string]$Exe = "target/debug/adventure.exe"
+)
+$ErrorActionPreference = "Stop"
+
+$ngfx = Get-ChildItem "C:\Program Files\NVIDIA Corporation\Nsight Graphics*\host\windows-desktop-nomad-x64\ngfx.exe" -ErrorAction SilentlyContinue |
+        Sort-Object FullName -Descending | Select-Object -First 1
+if (-not $ngfx) { Write-Error "ngfx.exe not found - is Nsight Graphics installed?"; exit 1 }
+
+if (-not (Test-Path $Exe)) {
+  Write-Error "App exe not found at '$Exe'. Build first: cargo build --features editor,shader-debug"
+  exit 1
+}
+$exePath = (Resolve-Path $Exe).Path
+$proj    = (Get-Location).Path
+New-Item -ItemType Directory -Force $Out | Out-Null
+$outAbs  = (Resolve-Path $Out).Path
+
+Write-Host "ngfx : $($ngfx.FullName)"
+Write-Host "exe  : $exePath"
+Write-Host "out  : $outAbs"
+Write-Host "Tracing 1 frame at frame $Frames with the source shader profiler on..."
+
+# Self-terminate the app a bit after the trace point so ngfx finishes + exports hands-free.
+$exitAt = $Frames + 180
+
+# Lock GPU clocks to base for repeatable numbers; metric-set 0 = Throughput Metrics.
+& $ngfx.FullName `
+  --activity "GPU Trace Profiler" `
+  --exe $exePath `
+  --dir $proj `
+  --output-dir $outAbs `
+  --env "ADVENTURE_EXIT_AFTER_FRAMES=$exitAt; WGPU_BACKEND=vulkan; BEVY_ASSET_ROOT=$proj;" `
+  --start-after-frames $Frames `
+  --limit-to-frames 1 `
+  --auto-export `
+  --real-time-shader-profiler `
+  --set-gpu-clocks base `
+  --metric-set-id 0 `
+  --collect-screenshot 1 `
+  --no-timeout
+
+Write-Host ""
+Write-Host "Capture finished. Exported files:"
+Get-ChildItem $outAbs -Recurse | Sort-Object LastWriteTime -Descending | Select-Object -First 20 FullName, Length
