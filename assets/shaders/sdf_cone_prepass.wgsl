@@ -23,7 +23,6 @@
     pixel_cone,
     voxel_size_at,
     lod_count,
-    abs_chunk_key,
 }
 #import sdf::brick::{
     world_to_brick_lod,
@@ -95,8 +94,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             for (var L = levels; L > 0u; ) {
                 L = L - 1u;
                 let coord = world_to_brick_lod(p, L);
-                let key = abs_chunk_key(coord, L);
-                let ci = find_chunk_cached(L, key.x, key.y, &cache);
+                let ci = find_chunk_cached(coord, L, &cache);
                 if (ci < 0 && in_ring_chunk(coord, L)) {
                     adv = max(adv, dist_to_chunk_exit_lod(p, dir, L) + voxel_size_at(L) * 0.01);
                     break;

@@ -6,7 +6,7 @@
 // loop, LOD cross-fade, iso-offset, and over-relaxation logic are unchanged from when this
 // lived in the entry shader — only the module boundary is new.
 
-#import sdf::bindings::{camera, sdf_eps, pixel_cone, over_relax, lod_blend_band, recenter_snap, lod_count, brick_world_at, CHUNK_BRICKS, voxel_size_at, abs_chunk_key}
+#import sdf::bindings::{camera, sdf_eps, pixel_cone, over_relax, lod_blend_band, recenter_snap, lod_count, brick_world_at, CHUNK_BRICKS, voxel_size_at}
 #import sdf::brick::{
     world_to_brick_lod,
     load_material_distances,
@@ -122,8 +122,7 @@ fn raymarch(origin: vec3<f32>, dir: vec3<f32>, start_t: f32, q: MarchQuality) ->
             for (var L = levels; L > 0u; ) {
                 L = L - 1u;                              // coarsest first = biggest box
                 let coord = world_to_brick_lod(p, L);
-                let key = abs_chunk_key(coord, L);
-                let ci = find_chunk_cached(L, key.x, key.y, &cache);
+                let ci = find_chunk_cached(coord, L, &cache);
                 if (ci < 0 && in_ring_chunk(coord, L)) {
                     adv = max(adv, dist_to_chunk_exit_lod(p, dir, L) + voxel_size_at(L) * 0.01);
                     break;
