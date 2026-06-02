@@ -15,10 +15,12 @@ use std::path::PathBuf;
 use bevy::prelude::*;
 use serde::{Deserialize, Serialize};
 
+use super::ReflectSerializeSkip;
+
 /// Stable per-entity id within a scene file. Survives re-saves (never reindexed)
 /// and is the key override deltas target onto an instanced scene's sub-entities.
 #[derive(Component, Reflect, Clone, Copy, PartialEq, Eq, Hash, Debug, Serialize, Deserialize)]
-#[reflect(Component)]
+#[reflect(Component, SerializeSkip)]
 pub struct LocalId(pub u64);
 
 /// A component value, reflection-serialized to RON, keyed by its Bevy type path
@@ -65,6 +67,17 @@ impl SceneRecord {
     }
 }
 
+/// The editor camera pose saved alongside a scene, so reopening restores the view that was
+/// framed when it was saved. Plain data (no engine coupling); the editor maps it to/from its
+/// orbit camera. `#[serde(default)]` on the field keeps camera-less `.scene` files loadable.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq)]
+pub struct EditorCamera {
+    pub target: [f32; 3],
+    pub distance: f32,
+    pub yaw: f32,
+    pub pitch: f32,
+}
+
 /// A parsed `.scene` file: a monotonic id counter (so re-save never reuses ids)
 /// plus the records.
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
@@ -72,6 +85,9 @@ pub struct SceneFile {
     /// Next free [`LocalId`] value. Persisted so ids stay stable across re-saves.
     pub next_id: u64,
     pub records: Vec<SceneRecord>,
+    /// Editor camera pose at save time, restored on load. Absent in older files.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub editor_camera: Option<EditorCamera>,
 }
 
 impl SceneFile {

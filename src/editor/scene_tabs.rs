@@ -18,7 +18,8 @@ use egui_dock::{NodeIndex, SurfaceIndex};
 use crate::scene_manager::{EditorEntity, SceneEntity};
 use crate::sdf_render::{DEFAULT_SCENE_PATH, SdfOrbitCamera};
 use crate::soul_scene::{
-    despawn_scene_content, load_scene, load_scene_from_str, save_scene_to_string,
+    EditorCamera, LoadedEditorCamera, despawn_scene_content, load_scene, load_scene_from_str,
+    save_scene_to_string, save_scene_to_string_with_camera,
 };
 
 use super::dock::{EditorDockState, EditorTab};
@@ -57,6 +58,25 @@ impl CameraState {
         c.yaw = self.yaw;
         c.pitch = self.pitch;
     }
+
+    /// The persistable form written into a `.scene` file.
+    fn to_editor_camera(self) -> EditorCamera {
+        EditorCamera {
+            target: self.target.to_array(),
+            distance: self.distance,
+            yaw: self.yaw,
+            pitch: self.pitch,
+        }
+    }
+
+    fn from_editor_camera(e: EditorCamera) -> Self {
+        Self {
+            target: Vec3::from_array(e.target),
+            distance: e.distance,
+            yaw: e.yaw,
+            pitch: e.pitch,
+        }
+    }
 }
 
 /// One open scene document.
@@ -93,6 +113,9 @@ pub struct OpenScenes {
     pub close_request: Option<SceneId>,
     /// While `Some`, the unsaved-changes confirm dialog is showing for this (now-active) doc.
     confirm_close: Option<SceneId>,
+    /// Elapsed-seconds gate for the dirty re-check, so we don't serialize the whole scene
+    /// every frame just to refresh a cosmetic `*` marker.
+    next_dirty_check: f32,
 }
 
 impl Default for OpenScenes {
@@ -114,6 +137,7 @@ impl Default for OpenScenes {
             rendered: None,
             close_request: None,
             confirm_close: None,
+            next_dirty_check: 0.0,
         }
     }
 }
@@ -230,12 +254,22 @@ fn load_doc_into_world(world: &mut World, registry: &AppTypeRegistry, doc_index:
         }
     }
 
-    if let Some(cam) = camera {
+    // Camera to apply: the in-memory per-tab camera (set on swap-away) takes priority; on a
+    // first load from disk there's none, so fall back to the camera saved in the file.
+    let applied = camera.or_else(|| {
+        world
+            .resource::<LoadedEditorCamera>()
+            .0
+            .map(CameraState::from_editor_camera)
+    });
+    if let Some(cam) = applied {
         cam.restore(&mut world.resource_mut::<SdfOrbitCamera>());
         // Push the restored orbit state to the camera transform immediately — `orbit_camera`
         // only runs while the pointer is in the viewport, so otherwise the view wouldn't
         // update until the cursor re-entered it (a delayed "jump").
         crate::sdf_render::sync_orbit_camera_transform(world);
+        // Persist it on the doc so later tab swaps reuse it.
+        world.resource_mut::<OpenScenes>().docs[doc_index].camera = Some(cam);
     }
 
     // First time we materialize this doc, the freshly-loaded world IS the clean baseline.
@@ -309,9 +343,19 @@ fn set_dock_active(dock: &mut EditorDockState, id: SceneId) {
 
 // --- Request handling (called from show_editor_dock) -------------------------------------
 
-/// Recompute the active doc's dirty flag from the live world. Cheap-enough per frame for
-/// the small editor scenes; keeps the tab `*` marker live.
+/// Interval (seconds) between dirty re-checks. Serializing the scene every frame just to
+/// keep the tab `*` marker live is wasteful; once a second is plenty.
+const DIRTY_CHECK_INTERVAL: f32 = 1.0;
+
+/// Recompute the active doc's dirty flag from the live world, throttled to a few times a
+/// second. Keeps the tab `*` marker live without a per-frame full-scene serialize.
 pub fn refresh_active_dirty(world: &mut World, registry: &AppTypeRegistry) {
+    let now = world.resource::<Time>().elapsed_secs();
+    if now < world.resource::<OpenScenes>().next_dirty_check {
+        return;
+    }
+    world.resource_mut::<OpenScenes>().next_dirty_check = now + DIRTY_CHECK_INTERVAL;
+
     let Some(current) = serialize_world(world, registry) else {
         return;
     };
@@ -374,21 +418,33 @@ pub fn drain_requests(world: &mut World, dock: &mut EditorDockState, registry: &
     }
 }
 
-/// Serialize the active world scene, write it to `dest`, and adopt it as the doc's path +
-/// clean baseline.
+/// Serialize the active world scene, write it to `dest` (with the current editor camera
+/// embedded), and adopt it as the doc's path + clean baseline. The baseline is camera-free
+/// so that merely moving the camera doesn't flag the scene dirty.
 fn save_active_to(world: &mut World, registry: &AppTypeRegistry, dest: &Path) {
-    let Some(ron) = serialize_world(world, registry) else {
+    let camera = CameraState::capture(world.resource::<SdfOrbitCamera>()).to_editor_camera();
+    let (file_ron, baseline_ron) = {
+        let reg = registry.read();
+        (
+            save_scene_to_string_with_camera(world, &reg, Some(camera)),
+            save_scene_to_string(world, &reg),
+        )
+    };
+    let (Ok(file_ron), Ok(baseline_ron)) = (file_ron, baseline_ron) else {
         error!("scene save failed: could not serialize world");
+        notify_error(world, "Save failed: could not serialize scene");
         return;
     };
     if let Some(parent) = dest.parent()
         && let Err(e) = std::fs::create_dir_all(parent)
     {
         error!("scene save failed: {e}");
+        notify_error(world, format!("Save failed: {e}"));
         return;
     }
-    if let Err(e) = std::fs::write(dest, &ron) {
+    if let Err(e) = std::fs::write(dest, &file_ron) {
         error!("scene save failed: {e}");
+        notify_error(world, format!("Save failed: {e}"));
         return;
     }
 
@@ -400,11 +456,25 @@ fn save_active_to(world: &mut World, registry: &AppTypeRegistry, dest: &Path) {
         let doc = &mut open.docs[i];
         doc.path = Some(dest.to_path_buf());
         doc.title = stem(dest);
-        doc.baseline = Some(ron);
+        doc.baseline = Some(baseline_ron);
         doc.dirty = false;
     }
     sync_current_path(world);
+    // Capture a viewport screenshot for this scene's asset-browser thumbnail.
+    world
+        .resource_mut::<crate::editor::assets_browser::PendingSceneThumbnail>()
+        .0 = Some(dest.to_path_buf());
     info!("saved scene to {}", dest.display());
+    world
+        .resource_mut::<crate::editor::notifications::Notifications>()
+        .success(format!("Saved {}", stem(dest)));
+}
+
+/// Push an error toast (used on save failures).
+fn notify_error(world: &mut World, message: impl Into<String>) {
+    world
+        .resource_mut::<crate::editor::notifications::Notifications>()
+        .error(message);
 }
 
 /// Open `path` in a tab: focus it if already open, else create a new doc + tab and activate.
@@ -469,6 +539,12 @@ pub fn handle_close(
     ctx: &egui::Context,
 ) {
     if let Some(id) = world.resource_mut::<OpenScenes>().close_request.take() {
+        // The dirty flag is throttled, so for the active doc force a fresh check before
+        // deciding whether to prompt — otherwise a just-edited scene could close silently.
+        if world.resource::<OpenScenes>().active == Some(id) {
+            world.resource_mut::<OpenScenes>().next_dirty_check = 0.0;
+            refresh_active_dirty(world, registry);
+        }
         let dirty = world
             .resource::<OpenScenes>()
             .docs

@@ -697,6 +697,18 @@ fn load_default_gallery(world: &mut World) {
         Ok(roots) => info!("loaded default scene ({} roots)", roots.len()),
         Err(e) => error!("failed to load default scene: {e}"),
     }
+    // Restore the editor camera saved with the scene (if any), so launching frames the
+    // gallery the way it was last saved.
+    if let Some(cam) = world.resource::<crate::soul_scene::LoadedEditorCamera>().0 {
+        {
+            let mut orbit = world.resource_mut::<SdfOrbitCamera>();
+            orbit.target = Vec3::from_array(cam.target);
+            orbit.distance = cam.distance;
+            orbit.yaw = cam.yaw;
+            orbit.pitch = cam.pitch;
+        }
+        sync_orbit_camera_transform(world);
+    }
 }
 
 // --- Orbit Camera ---
