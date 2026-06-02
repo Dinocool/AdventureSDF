@@ -31,11 +31,15 @@ pub fn update_scene_stats(
 }
 
 /// Register the status-bar stats resource + its updater.
-pub fn plugin(app: &mut App) {
-    app.init_resource::<EditorSceneStats>().add_systems(
-        Update,
-        update_scene_stats.run_if(|c: Res<EditorConfig>| c.enabled),
-    );
+pub struct StatusBarPlugin;
+
+impl Plugin for StatusBarPlugin {
+    fn build(&self, app: &mut App) {
+        app.init_resource::<EditorSceneStats>().add_systems(
+            Update,
+            update_scene_stats.run_if(|c: Res<EditorConfig>| c.enabled),
+        );
+    }
 }
 
 /// Render the bottom status strip: entity/volume counts, atlas bake state, and the perf

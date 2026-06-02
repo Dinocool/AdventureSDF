@@ -474,7 +474,7 @@ The whole `editor/` tree is feature-gated -- **build `--features editor` to catc
   subtle ordering invariants (e.g. `close_doc.rs:680-687` adds the placeholder BEFORE removing the
   scene tab so the leaf survives); move methods without changing call order. Lightly unit-tested area.
 
-### [ ] E5. Adopt one editor wiring convention (`Plugin` structs everywhere)
+### [x] E5. Adopt one editor wiring convention (`Plugin` structs everywhere)
 `impact: medium` * `effort: small` * `source: editor-structure`
 
 - *Now:* Three coexisting conventions: `XPlugin` structs (config, panels, registry, ...), free
