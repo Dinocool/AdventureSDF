@@ -25,7 +25,7 @@
 // The shadow ray samples the SAME distance-driven LOD cross-fade the primary raymarch renders
 // the surface through, so a smoothly-rendered occluder casts a matching (non-blockier) shadow
 // instead of one faceted to the raw finest-occupied LOD.
-#import sdf::march::{lod_crossfade}
+#import sdf::march::{lod_crossfade, raymarch, MarchQuality}
 
 // A sample this small means the ray entered an occluder → hard shadow.
 const SHADOW_HIT_EPS: f32 = 1e-3;
@@ -110,11 +110,17 @@ fn soft_shadow(origin: vec3<f32>, light_dir: vec3<f32>, mint: f32, max_t: f32, k
 // Shadow factor at a hit toward the sun. A small normal offset moves the ray to the lit side
 // (kills self-acne); `mint` is kept sub-voxel so a near-field contact occluder still registers —
 // the normal offset (not mint) is what prevents self-intersection.
+//
+// SHARP shadow: reuse the PRIMARY raymarch (exactly as the reflection pass does) for a direct,
+// accurate occlusion test through the SAME cross-faded field the camera renders. A hit before the
+// sun-distance cap → fully shadowed; an escape → fully lit. Binary (no penumbra), so the shadow
+// silhouette is precisely the rendered occluder's — the cleanest test of whether any residual
+// faceting is the FIELD (it'll show as a crisp faceted edge) vs the soft-penumbra integration
+// (it'll be gone). `cone_k = 1` matches the primary march's screen-space hit acceptance.
 fn surface_shadow(hit_pos: vec3<f32>, geo_n: vec3<f32>, light_dir: vec3<f32>, lod: u32, max_t: f32) -> f32 {
     let vs = voxel_size_at(lod);
     let origin = hit_pos + geo_n * vs;
-    // Penumbra hardness from the editor "Shadow Softness" slider (march_params.y); fall back to
-    // 16 when the uniform is unset (0) — e.g. the shadow harness, which doesn't fill march_params.
-    let k = select(16.0, shadow_softness(), shadow_softness() > 0.0);
-    return soft_shadow(origin, light_dir, vs * 0.5, max_t, k);
+    let q = MarchQuality(1.0, SHADOW_MAX_STEPS, max_t, 0u);
+    let r = raymarch(origin, light_dir, vs * 0.5, q);
+    return select(1.0, 0.0, r.hit);
 }
