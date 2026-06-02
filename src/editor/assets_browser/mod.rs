@@ -330,27 +330,20 @@ fn draw_glyph(painter: &egui::Painter, rect: egui::Rect, glyph: &str) {
     );
 }
 
-/// Read + sort the direct children of `dir`: directories first, then files, each
-/// alphabetically (case-insensitive).
+/// Direct children of `dir`: directories first, then files, each alphabetically. Reads via
+/// `read_sorted_cached` (5s TTL) so the visible folder isn't `read_dir`'d every frame
+/// inside the egui pass (perf roadmap E1).
 fn read_entries(dir: &Path) -> Vec<Entry> {
-    let Ok(rd) = std::fs::read_dir(dir) else {
-        return Vec::new();
+    let (dirs, files) = crate::editor::fs_util::read_sorted_cached(dir);
+    let mk = |path: PathBuf, is_dir: bool| Entry {
+        name: crate::editor::fs_util::file_name_str(&path),
+        path,
+        is_dir,
     };
-    let mut entries: Vec<Entry> = rd
-        .flatten()
-        .map(|e| {
-            let path = e.path();
-            let is_dir = path.is_dir();
-            let name = crate::editor::fs_util::file_name_str(&path);
-            Entry { path, name, is_dir }
-        })
-        .collect();
-    entries.sort_by(|a, b| {
-        b.is_dir
-            .cmp(&a.is_dir)
-            .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
-    });
-    entries
+    dirs.into_iter()
+        .map(|d| mk(d, true))
+        .chain(files.into_iter().map(|f| mk(f, false)))
+        .collect()
 }
 
 /// Lowercased final extension of `path`, if any.
