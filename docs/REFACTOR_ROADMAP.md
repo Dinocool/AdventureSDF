@@ -328,8 +328,15 @@ Tighten visibility and relocate misplaced helpers. **Do A3 (the `pub` → `pub(c
 after the structural moves, so it doesn't fight them -- and so it turns the encapsulation wins above
 into compiler-enforced invariants.
 
-### [ ] A1. Relocate ring/window geometry + stateless `impl SdfAtlas` helpers into one geometry module
+### [~] A1. Relocate ring/window geometry + stateless `impl SdfAtlas` helpers into one geometry module
 `impact: medium` * `effort: medium` * `source: api-boundaries`
+> **Superseded by M2 (primary scope) + residual left optional.** The ring/window geometry the finding
+> wanted consolidated now lives in `bake_scheduler/window.rs` (chunk-space) alongside the brick-space
+> helpers in `atlas.rs` — a sensible split, so a *third* `clipmap_geometry` module would re-fragment
+> rather than clarify. The only residual is renaming the 3 stateless `SdfAtlas::cull_edit_indices*` /
+> `brick_palette_samples` static methods to free functions (so `classify` names the geometry, not the
+> storage type). That's a cosmetic naming change on the hot cull path, and a clean de-indent of the
+> ~100-line block out of `impl SdfAtlas` isn't worth the churn/risk there — left optional.
 
 - *Now:* Brick-space ring geometry lives in `atlas.rs:364-451`; the parallel chunk-space geometry lives
   in `bake_scheduler.rs:271-415` -- two coordinate conventions with no shared home, free to drift.
@@ -342,7 +349,14 @@ into compiler-enforced invariants.
   Confirm `ring_window_coords`/`ring_brick_keys` survival vs D1 (some are test-only). Mechanical moves;
   unit tests travel with the functions.
 
-### [ ] A2. Extract the production sync-emit + recenter loop so tests stop mirroring them
+### [~] A2. Extract the production sync-emit + recenter loop so tests stop mirroring them
+> **Deferred (verdict-optional, same call as the M2 apply/dispatch split).** Extracting
+> `sync_emit`/`recenter_window` means pulling logic out of the `schedule_bakes`/`dispatch_bake`
+> systems, which read `BakeScheduler`'s private fields (`pending`, `ring_chunk_origin`, `bvh`,
+> `emit_scratch`, `edit_gen`) — the verdict flagged this murky and optional. The test mirrors it
+> dedups (`emit_gpu_bakes`, `recenter_step`) are low drift-risk (the lifecycle differential catches
+> divergence), so the modest dedup isn't worth refactoring the critical bake-scheduler system. Left
+> with the apply/dispatch cluster in `mod.rs` (see M2).
 `impact: medium` * `effort: medium` * `source: refactor-deadcode`
 
 - *Now:* `#[cfg(test)] emit_gpu_bakes` (`bake_scheduler.rs:972`) re-implements the production sync path
@@ -355,7 +369,18 @@ into compiler-enforced invariants.
   ~60 lines of mirrored logic removed. *Risk:* the extracted fns take plain `&mut` refs (not ResMut);
   the lifecycle tests guard behavior. Natural follow-on to M2.
 
-### [ ] A3. Demote the `sdf_render` submodule tree + items from blanket `pub` to `pub(crate)`
+### [~] A3. Demote the `sdf_render` submodule tree + items from blanket `pub` to `pub(crate)`
+> **Module-level sweep done (7 modules); item-level + dead-code cleanup deferred.** Only 6 submodules
+> are reached externally (the `tests/` crate + the binary: `atlas`, `bake_scheduler`, `bvh`, `chunk`,
+> `edits`, `render`) — those stay `pub mod`. Demoted the 7 cleanly-internal ones to `pub(crate) mod`
+> (`bc7`, `editor_camera`, `height`, `overlays`, `picking`, `scatter`, `tower_field`), making their
+> encapsulation a compiler invariant; cascade-gated `picking::debug_capture_march` (editor-only)
+> behind `feature = "editor"`. The other 6 (`gallery`, `gizmo`, `node_gizmos`, `debug`, `stress`,
+> `textures`) ALSO demote correctly but each surfaced genuinely-dead `pub` items (`spawn_gallery`,
+> `spawn_stress`, the gizmo `TRANSLATE/ROTATE/SCALE` consts, the `textures` manifest structs, …) —
+> exactly the dead API the sweep is meant to expose. Cleaning those is a focused delete-vs-keep pass
+> (some may be intended-but-unwired API); deferred so it isn't rushed. Item-level `pub`→`pub(crate)`
+> tightening within the kept-`pub` modules is the larger remaining piece.
 `impact: medium` * `effort: small` * `source: api-boundaries`
 
 - *Now:* `mod.rs:39-55` declares every submodule `pub mod`; many items are `pub` where `pub(crate)` is
