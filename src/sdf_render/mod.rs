@@ -53,6 +53,7 @@ pub mod render;
 pub mod scatter;
 pub mod stress;
 pub mod textures;
+pub mod tower_field;
 
 use bevy::core_pipeline::prepass::DepthPrepass;
 use bevy::ecs::system::SystemParam;
