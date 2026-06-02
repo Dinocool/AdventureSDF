@@ -12,13 +12,9 @@ use adventure::world::GameWorld;
 use adventure::world::WorldPlugin;
 use bevy::prelude::*;
 
-fn integration_app() -> App {
-    let mut app = App::new();
-    app.add_plugins(MinimalPlugins);
-    app.insert_resource(ButtonInput::<KeyCode>::default());
-    app.insert_resource(ButtonInput::<MouseButton>::default());
-    app
-}
+// The headless app builder is shared with the unit tests — `test_utils` is a normal `pub mod`
+// (lib.rs), so the integration crate reaches it directly instead of re-implementing it.
+use adventure::test_utils::test_app_with_input as integration_app;
 
 fn app_with_logic_plugins() -> App {
     let mut app = integration_app();
