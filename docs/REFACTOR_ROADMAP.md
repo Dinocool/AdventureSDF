@@ -276,7 +276,7 @@ genuine friction point, not speculatively. **Don't split `chunk.rs`** (X3).
   (invariant #4). Picking (`sdf_picking`/`pick_sdf_volume`) is borderline -- could go to a
   `selection.rs` or stay. Combine with D4 (it touches `draw_lod_rings`).
 
-### [ ] M4. Move the tower/scatter stress-scene generator out of `edits.rs`
+### [x] M4. Move the tower/scatter stress-scene generator out of `edits.rs`
 `impact: medium` * `effort: small` * `source: modularization`
 
 - *Now:* `edits.rs:365-517` (`TowerRole`, `TowerEdit`, `TowerFieldParams`, `tower_field_edits`,

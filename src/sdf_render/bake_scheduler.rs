@@ -22,6 +22,9 @@ use super::{
     SdfCamera, SdfGridConfig, SdfMaterial, SdfOp, SdfPrimitive, SdfVolume, VolumeQueryData, bvh,
     edits, gather_sorted_edits,
 };
+// Stress-scene generator — only the bake-cache regression test consumes it.
+#[cfg(test)]
+use super::tower_field;
 
 /// One brick the GPU compute bake must fill this frame. The CPU has already done the
 /// topology work (BVH cull → `edit_indices` into the frame's flat edit list, palette,
@@ -2071,8 +2074,8 @@ mod tests {
     /// exact geometry the runtime `TowerSpawner` produces, so the bake-cache test exercises the real
     /// stress scene. Roles map to arbitrary distinct material ids.
     fn gallery_resolved() -> Vec<(ResolvedEdit, Aabb3d)> {
-        use edits::TowerRole;
-        edits::tower_field_edits(&edits::TowerFieldParams::default())
+        use tower_field::TowerRole;
+        tower_field::tower_field_edits(&tower_field::TowerFieldParams::default())
             .into_iter()
             .map(|(_order, transform, prim, role)| {
                 let mat = match role {
@@ -2257,9 +2260,9 @@ mod tests {
     #[test]
     #[ignore = "perf measurement rig; run explicitly with --ignored --nocapture"]
     fn lod_recenter_cost_walk() {
-        use edits::TowerRole;
+        use tower_field::TowerRole;
         let cfg = SdfGridConfig::default(); // production: 8 LODs, ring 64, snap 2
-        let edits: Vec<ResolvedEdit> = edits::tower_field_edits(&edits::TowerFieldParams::default())
+        let edits: Vec<ResolvedEdit> = tower_field::tower_field_edits(&tower_field::TowerFieldParams::default())
             .into_iter()
             .map(|(_o, t, p, role)| {
                 let mat = match role { TowerRole::Ground => 0u16, TowerRole::Cube => 1, TowerRole::Cap => 2 };
