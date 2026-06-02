@@ -330,6 +330,38 @@ pub fn dir_index(ck: ChunkKey, r: i32) -> usize {
     (ck.lod as usize) * (r * r * r) as usize + (mz * r * r + my * r + mx) as usize
 }
 
+/// Resolve `(ck, local)` through a GPU lookup-buffer pair EXACTLY as `brick.wgsl::find_chunk` +
+/// `brick_in_chunk` do: direct-index the dense directory by [`dir_index`], accept only if the stored
+/// key TAG matches (sentinel / a different wrapped chunk → miss), test the occupancy bit, then index
+/// the tile run at `tile_run_base + popcount(bits strictly below the slot)`. THE single CPU mirror of
+/// the shader's brick resolve — every differential test (the chunk churn, the bake-scheduler
+/// lifecycle, the GPU rigs) routes through this instead of hand-copying the unpack, so a change to the
+/// resolve contract lands in one place. `#[doc(hidden)] pub` so the `tests/` integration crate can
+/// reach it; it is test-support, not real API (and `pub`, so no non-test dead-code warning).
+#[doc(hidden)]
+pub fn resolve_via_tables(
+    rows: &[ChunkLookup],
+    tiles: &[BrickTile],
+    r: i32,
+    ck: ChunkKey,
+    local: u32,
+) -> Option<BrickTile> {
+    let idx = dir_index(ck, r);
+    if idx >= rows.len() {
+        return None;
+    }
+    let c = rows[idx];
+    if (c.key_hi, c.key_lo) != chunk_gpu_key(ck) {
+        return None; // sentinel slot, or a different chunk shares this `mod R` slot
+    }
+    let occ = (c.occ_lo as u64) | ((c.occ_hi as u64) << 32);
+    if (occ >> local) & 1 == 0 {
+        return None; // brick not resident in this chunk
+    }
+    let off = (occ & ((1u64 << local) - 1)).count_ones();
+    Some(tiles[(c.tile_run_base + off) as usize])
+}
+
 impl LiveChunkTables {
     /// Mark a resident brick present in its chunk (insert or palette/tile change). `local` is the
     /// brick's 0..63 slot from [`chunk_of`]; `tile` is its packed atlas origin + palette. O(1): one
@@ -649,32 +681,16 @@ mod tests {
 
     use super::super::atlas::PackedBrick;
 
-    /// Mirror EXACTLY what `brick.wgsl::find_chunk` + `brick_in_chunk` do on the GPU: index the
-    /// dense directory by `dir_index(ck, r)`, accept only if the stored key TAG matches (sentinel /
-    /// a different wrapped chunk → miss), then test the occupancy bit and index the tile run at
-    /// `tile_run_base + popcount(bits strictly below the slot)`. Keeping this in lockstep with the
-    /// shader is the point of the tests below.
+    /// Resolve a brick through a built [`ChunkTables`] the way the shader does — a thin convenience
+    /// over [`resolve_via_tables`] (the single shader mirror) that first maps the brick to its
+    /// `(chunk, local)` via [`chunk_of`].
     fn shader_resolve(
         tables: &ChunkTables,
         config: &SdfGridConfig,
         brick: BrickKey,
     ) -> Option<BrickTile> {
         let (ck, li) = chunk_of(brick, config); // li = local slot 0..63
-        let idx = dir_index(ck, tables.r);
-        if idx >= tables.chunks.len() {
-            return None;
-        }
-        let chunk = tables.chunks[idx];
-        if (chunk.key_hi, chunk.key_lo) != chunk_gpu_key(ck) {
-            return None; // sentinel slot, or a different chunk shares this `mod R` slot
-        }
-        let occ = (chunk.occ_lo as u64) | ((chunk.occ_hi as u64) << 32);
-        if (occ >> li) & 1 == 0 {
-            return None; // brick not resident in this chunk
-        }
-        let below = occ & ((1u64 << li) - 1); // bits strictly below the slot
-        let off = below.count_ones();
-        Some(tables.tile_run[(chunk.tile_run_base + off) as usize])
+        resolve_via_tables(&tables.chunks, &tables.tile_run, tables.r, ck, li)
     }
 
     fn dummy_brick() -> PackedBrick {
@@ -932,25 +948,7 @@ mod tests {
         let mut cap_rows: u32 = 0;
         let mut cap_slots: u32 = 0;
 
-        // Resolve (ck, local) the way the shader does: direct-index the directory by `dir_index`,
-        // tag-check (sentinel / wrapped-different chunk → miss), then occupancy popcount.
-        let resolve = |rows: &[ChunkLookup], tiles: &[BrickTile], ck: ChunkKey, local: u32| {
-            let idx = dir_index(ck, r);
-            if idx >= rows.len() {
-                return None;
-            }
-            let c = rows[idx];
-            if (c.key_hi, c.key_lo) != chunk_gpu_key(ck) {
-                return None;
-            }
-            let occ = (c.occ_lo as u64) | ((c.occ_hi as u64) << 32);
-            if (occ >> local) & 1 == 0 {
-                return None;
-            }
-            let off = (occ & ((1u64 << local) - 1)).count_ones();
-            Some(tiles[(c.tile_run_base + off) as usize])
-        };
-
+        // Resolve (ck, local) through `resolve_via_tables` — the single shader mirror.
         // Small coord space (≤128 chunks) → heavy toroidal slot reuse + tile-run free/reuse, the
         // camera-move stress that surfaced the bugs.
         let span = 4u64;
@@ -1011,7 +1009,7 @@ mod tests {
 
             // --- verify the mirror against ground truth ---
             for (&(ck, local), &t) in &truth {
-                match resolve(&gpu_rows, &gpu_tiles, ck, local) {
+                match resolve_via_tables(&gpu_rows, &gpu_tiles, r, ck, local) {
                     Some(got) => assert_eq!(
                         got, t,
                         "frame {frame}: brick {ck:?} local {local} resolved to the wrong tile"
@@ -1025,7 +1023,7 @@ mod tests {
             let probe_local = ((p >> 40) % CHUNK_VOLUME as u64) as u32;
             if !truth.contains_key(&(probe_ck, probe_local)) {
                 assert!(
-                    resolve(&gpu_rows, &gpu_tiles, probe_ck, probe_local).is_none(),
+                    resolve_via_tables(&gpu_rows, &gpu_tiles, r, probe_ck, probe_local).is_none(),
                     "frame {frame}: absent brick {probe_ck:?} local {probe_local} wrongly resolved"
                 );
             }
