@@ -33,10 +33,13 @@ impl Default for CurrentScenePath {
 }
 
 pub fn menu_bar_ui(world: &mut World, ctx: &egui::Context) {
+    use super::scene_browser::{OpenSceneDialog, SaveSceneDialog};
+
     let current = world.resource::<CurrentScenePath>().0.clone();
     let mut req_new = false;
     let mut req_save = false;
-    let mut req_open: Option<PathBuf> = None;
+    let mut open_browser = false;
+    let mut save_as_browser = false;
 
     egui::TopBottomPanel::top("editor_menu_bar").show(ctx, |ui| {
         egui::MenuBar::new().ui(ui, |ui| {
@@ -46,12 +49,16 @@ pub fn menu_bar_ui(world: &mut World, ctx: &egui::Context) {
                     ui.close();
                 }
                 if ui.button("Open…").clicked() {
-                    // Until a file dialog is wired, reopen the current path.
-                    req_open = Some(current.clone());
+                    // Open the file browser, starting in the current scene's directory.
+                    open_browser = true;
                     ui.close();
                 }
                 if ui.button("Save").clicked() {
                     req_save = true;
+                    ui.close();
+                }
+                if ui.button("Save As…").clicked() {
+                    save_as_browser = true;
                     ui.close();
                 }
                 ui.separator();
@@ -67,12 +74,16 @@ pub fn menu_bar_ui(world: &mut World, ctx: &egui::Context) {
         });
     });
 
-    if req_new || req_save || req_open.is_some() {
+    if req_new || req_save {
         let mut requests = world.resource_mut::<EditorRequests>();
         requests.new_scene |= req_new;
         requests.save |= req_save;
-        if req_open.is_some() {
-            requests.open = req_open;
-        }
+    }
+    if open_browser {
+        let start = current.parent().map(PathBuf::from).unwrap_or_default();
+        world.resource_mut::<OpenSceneDialog>().show_at(&start);
+    }
+    if save_as_browser {
+        world.resource_mut::<SaveSceneDialog>().show_for(&current);
     }
 }
