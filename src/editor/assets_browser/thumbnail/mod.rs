@@ -9,12 +9,14 @@ use bevy::prelude::*;
 
 pub mod image;
 pub mod material;
+pub mod scene;
 
 pub use image::{ImageThumbnailCache, ImageThumbnailProvider, ImageTexture, ensure_image_texture};
 pub use material::{
     MaterialThumbnailCache, MaterialThumbnailProvider, PbrTextureThumbnailProvider,
 };
 pub(crate) use material::standard_from_material;
+pub use scene::{PendingSceneThumbnail, SceneThumbnailProvider};
 
 /// Plugin: registers the thumbnail caches + the offscreen material-sphere render rig.
 /// Image thumbnails need no systems (loaded on demand in `ensure_image_texture`); the
@@ -25,5 +27,6 @@ impl Plugin for ThumbnailRenderPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<ImageThumbnailCache>();
         material::register(app);
+        scene::register(app);
     }
 }

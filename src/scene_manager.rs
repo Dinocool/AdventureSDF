@@ -1,6 +1,8 @@
 use bevy::pbr::wireframe::{Wireframe, WireframeColor};
 use bevy::prelude::*;
 
+use crate::soul_scene::ReflectSerializeSkip;
+
 #[derive(States, Default, Debug, Clone, PartialEq, Eq, Hash)]
 pub enum AppScene {
     #[default]
@@ -10,14 +12,14 @@ pub enum AppScene {
 }
 
 #[derive(Component, Reflect, Default)]
-#[reflect(Component)]
+#[reflect(Component, SerializeSkip)]
 pub struct SceneEntity;
 
 /// Marks EDITOR-owned infrastructure (e.g. the viewport camera) — distinct from
 /// [`SceneEntity`] scene content. Editor entities are never serialized into a `.scene` and
 /// are never despawned by scene load/clear/switch; they persist across scene transitions.
 #[derive(Component, Reflect, Default)]
-#[reflect(Component)]
+#[reflect(Component, SerializeSkip)]
 pub struct EditorEntity;
 
 #[derive(Resource, Default)]

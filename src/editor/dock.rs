@@ -290,6 +290,7 @@ pub fn show_editor_dock(world: &mut World) {
     super::scene_browser::open_scene_dialog_ui(world, &ctx);
     super::scene_browser::save_scene_dialog_ui(world, &ctx);
     super::status_bar::status_bar_ui(world, &ctx);
+    super::notifications::notifications_ui(world, &ctx);
 
     // Take the registry and dock state out so the tab closures get exclusive
     // `&mut World`. Both are restored before returning.

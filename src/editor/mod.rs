@@ -16,6 +16,7 @@ pub mod keybinds;
 pub mod material_editor;
 pub mod material_preview;
 pub mod menu_bar;
+pub mod notifications;
 pub mod panels;
 pub mod profiling;
 pub mod project_files;
@@ -51,6 +52,7 @@ impl Plugin for EditorPlugin {
         .init_resource::<scene_browser::OpenSceneDialog>()
         .init_resource::<scene_browser::SaveSceneDialog>()
         .init_resource::<scene_tabs::OpenScenes>()
+        .init_resource::<notifications::Notifications>()
         .init_resource::<inspector::InspectorOverrides>()
         .register_type::<import_settings::ImageFilter>()
         .register_type::<import_settings::ColorSpace>()
@@ -69,6 +71,7 @@ impl Plugin for EditorPlugin {
             registry.register(assets_browser::ImageThumbnailProvider);
             registry.register(assets_browser::MaterialThumbnailProvider);
             registry.register(assets_browser::PbrTextureThumbnailProvider);
+            registry.register(assets_browser::SceneThumbnailProvider);
             app.insert_resource(registry);
         }
 

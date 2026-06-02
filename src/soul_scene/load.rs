@@ -14,7 +14,7 @@ use serde::de::DeserializeSeed;
 use crate::scene_manager::SceneEntity;
 
 use super::format::{ComponentMap, LocalId, SceneFile, SceneRecord};
-use super::{InstanceChild, SceneInstance};
+use super::{InstanceChild, LoadedEditorCamera, SceneInstance};
 
 /// Errors raised while loading a `.scene`.
 #[derive(Debug)]
@@ -55,6 +55,7 @@ pub fn load_scene_from_str(
     registry: &TypeRegistry,
 ) -> Result<Vec<Entity>, SceneLoadError> {
     let file = SceneFile::from_ron(ron).map_err(|e| SceneLoadError::Parse(e.to_string()))?;
+    world.insert_resource(LoadedEditorCamera(file.editor_camera));
     let mut stack = Vec::new();
     instantiate_records(world, &file, "<snapshot>", registry, &mut stack)
 }
@@ -71,10 +72,15 @@ fn instantiate(
     if stack.contains(&canonical) {
         return Err(SceneLoadError::Cycle(canonical));
     }
+    // The outermost file owns the camera; nested instance sources don't override it.
+    let top_level = stack.is_empty();
     stack.push(canonical);
 
     let text = std::fs::read_to_string(path).map_err(|e| SceneLoadError::Io(e.to_string()))?;
     let file = SceneFile::from_ron(&text).map_err(|e| SceneLoadError::Parse(e.to_string()))?;
+    if top_level {
+        world.insert_resource(LoadedEditorCamera(file.editor_camera));
+    }
     let label = path.display().to_string();
     let result = instantiate_records(world, &file, &label, registry, stack);
     stack.pop();

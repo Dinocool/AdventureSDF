@@ -17,7 +17,7 @@ pub mod thumbnail;
 
 pub use thumbnail::{
     ImageThumbnailProvider, MaterialThumbnailProvider, PbrTextureThumbnailProvider,
-    ThumbnailRenderPlugin,
+    PendingSceneThumbnail, SceneThumbnailProvider, ThumbnailRenderPlugin,
 };
 
 /// Root the browser walks, relative to the working dir — matches how Bevy's
@@ -98,6 +98,7 @@ pub fn assets_browser_ui(world: &mut World, ui: &mut egui::Ui) {
     // --- Toolbar: up button + breadcrumb -----------------------------------------
     let mut nav_to: Option<PathBuf> = None;
     let mut select_asset: Option<PathBuf> = None;
+    let mut open_scene: Option<PathBuf> = None;
     ui.horizontal(|ui| {
         let at_root = current.as_os_str().is_empty();
         if ui
@@ -141,6 +142,9 @@ pub fn assets_browser_ui(world: &mut World, ui: &mut egui::Ui) {
                     if resp.clicked() || resp.double_clicked() {
                         nav_to = rel_to_root(&entry.path);
                     }
+                } else if is_scene_file(&entry.path) && resp.double_clicked() {
+                    // Double-click a scene → open it (handled by the multi-scene tab manager).
+                    open_scene = Some(entry.path.clone());
                 } else if resp.clicked() {
                     // File click → select it in the unified inspector.
                     select_asset = Some(entry.path.clone());
@@ -197,6 +201,11 @@ pub fn assets_browser_ui(world: &mut World, ui: &mut egui::Ui) {
         world
             .resource_mut::<crate::editor::selection::EditorSelection>()
             .select_asset(path);
+    }
+    if let Some(path) = open_scene {
+        // Routed through EditorRequests::open, drained by the scene-tab manager next frame
+        // (opens a new tab, or focuses the scene if it's already open).
+        world.resource_mut::<crate::editor::menu_bar::EditorRequests>().open = Some(path);
     }
 }
 
@@ -347,6 +356,11 @@ fn read_entries(dir: &Path) -> Vec<Entry> {
 /// Lowercased final extension of `path`, if any.
 fn ext_lower(path: &Path) -> Option<String> {
     path.extension().map(|e| e.to_string_lossy().to_lowercase())
+}
+
+/// Whether `path` is a soul `.scene` file (case-insensitive).
+fn is_scene_file(path: &Path) -> bool {
+    ext_lower(path).as_deref() == Some("scene")
 }
 
 /// Parent of a root-relative folder path (empty path = already root).

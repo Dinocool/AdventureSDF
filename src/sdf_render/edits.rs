@@ -12,6 +12,8 @@ use bevy::math::bounding::Aabb3d;
 use bevy::prelude::*;
 use bevy::render::render_resource::ShaderType;
 
+use crate::soul_scene::ReflectSerializeSkip;
+
 // --- Components ---
 
 /// A signed-distance primitive. Parameters are in the entity's local space; the
@@ -188,7 +190,7 @@ impl Default for MaterialRegistry {
 /// **runtime-derived** by `resolve_materials` from each volume's [`SdfMaterialSource`];
 /// it is NOT serialized into a `.scene` (the source is the authored truth).
 #[derive(Component, Reflect, Clone, Copy, Debug, Default)]
-#[reflect(Component)]
+#[reflect(Component, SerializeSkip)]
 #[reflect(@crate::node::HideFromInspector)]
 pub struct SdfMaterial {
     pub registry_id: u32,
