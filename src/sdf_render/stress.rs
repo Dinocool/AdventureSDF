@@ -3,7 +3,7 @@
 //! spawner carries the scatter parameters and expands into the full tower field at load time, so
 //! `assets/scenes/stress.scene` stays tiny while the runtime world holds ~3000 towers.
 //!
-//! The same [`edits::tower_field_edits`] builder feeds the bake-cache regression test, so the
+//! The same [`super::tower_field::tower_field_edits`] builder feeds the bake-cache regression test, so the
 //! stressed scene and the test exercise byte-identical geometry.
 
 use bevy::prelude::*;
@@ -12,9 +12,8 @@ use crate::node::{EditorGizmo, Node3D};
 use crate::scene_manager::SceneEntity;
 use crate::soul_scene::LocalId;
 
-use super::edits::{
-    tower_field_edits, MaterialFields, SdfMaterialSource, SdfOp, TowerFieldParams, TowerRole,
-};
+use super::edits::{MaterialFields, SdfMaterialSource, SdfOp};
+use super::tower_field::{tower_field_edits, TowerFieldParams, TowerRole};
 use super::{CsgKind, SdfVolume};
 
 /// A node that procedurally spawns a scattered cube-tower field on scene load. Holds the
