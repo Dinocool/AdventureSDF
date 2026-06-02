@@ -26,6 +26,23 @@ use super::{
 #[cfg(test)]
 use super::tower_field;
 
+// Pure chunk-ring window geometry. The names are re-imported here so production code (and the
+// in-file tests, via their `use super::*`) call them unqualified; `ring_chunk_origin` is also `pub`
+// (the GPU rig + the editor LOD-ring overlay assert/draw against this source-of-truth window).
+mod window;
+pub use window::ring_chunk_origin;
+use window::{
+    chunk_has_geometry_with, chunk_in_window, chunk_window_keys, chunks_in_aabb_windowed,
+    for_each_brick_key, for_each_entered_chunk, for_each_exited_chunk,
+};
+#[cfg(test)]
+use window::chunk_brick_keys;
+
+// The read-only classify core (Send; runs across the compute pool or on a background task). Bare
+// names re-imported so the dispatch path + the in-file tests use them unqualified.
+mod classify;
+use classify::{Verdict, classify_candidates, classify_candidates_serial, snapshot_hash_peek};
+
 /// One brick the GPU compute bake must fill this frame. The CPU has already done the
 /// topology work (BVH cull → `edit_indices` into the frame's flat edit list, palette,
 /// tile allocation); the compute shader runs the 512-voxel `fold_csg` eval and writes the
@@ -206,211 +223,6 @@ pub type ChangedEditFilter = Or<(
     Changed<SdfMaterial>,
 )>;
 type ChangedEdit = ChangedEditFilter;
-
-/// The chunk coord (per axis) of the chunk-ring window corner for `camera_pos` at `lod`:
-/// the camera's chunk minus half the ring (in chunks) on each axis, so the ring is
-/// centred on the camera. `ring_bricks / CHUNK_BRICKS` chunks per axis.
-///
-/// `pub` so the GPU rig (`tests/sdf_gpu_rig.rs`) can assert the shader's `in_ring_chunk`
-/// agrees with THIS source-of-truth window — they're hand-duplicated across Rust/WGSL, and
-/// a silent divergence would make the chunk-DDA skip step past real geometry.
-pub fn ring_chunk_origin(config: &SdfGridConfig, camera_pos: Vec3, lod: u32) -> IVec3 {
-    let s = config.cell_stride();
-    let cam_brick = config.world_to_brick_lod(camera_pos, lod);
-    let cam_brick_idx = IVec3::new(
-        cam_brick.x.div_euclid(s),
-        cam_brick.y.div_euclid(s),
-        cam_brick.z.div_euclid(s),
-    );
-    let cam_chunk = IVec3::new(
-        cam_brick_idx.x.div_euclid(chunk::CHUNK_BRICKS),
-        cam_brick_idx.y.div_euclid(chunk::CHUNK_BRICKS),
-        cam_brick_idx.z.div_euclid(chunk::CHUNK_BRICKS),
-    );
-    // Hysteresis: snap the camera chunk to the coarse `recenter_snap_chunks` lattice so
-    // the window only recenters on discrete jumps, not every chunk crossing. `div_euclid`
-    // floors toward -inf so the snapped lattice is continuous across the world origin.
-    let snap = config.recenter_snap_chunks.max(1);
-    let cam_chunk_snapped = IVec3::new(
-        cam_chunk.x.div_euclid(snap) * snap,
-        cam_chunk.y.div_euclid(snap) * snap,
-        cam_chunk.z.div_euclid(snap) * snap,
-    );
-    let half = config.ring_half_chunks();
-    cam_chunk_snapped - IVec3::splat(half)
-}
-
-/// Whether any edit reaches chunk `ck` (its world AABB overlaps an edit in the BVH). A
-/// chunk's world AABB is exactly the union of its `CHUNK_BRICKS³` brick AABBs, so a BVH miss
-/// here guarantees *every* brick in the chunk would bake to empty space. Used to skip
-/// enqueuing empty entered chunks: they would consume budget producing nothing, starving the
-/// real geometry entering far (coarse-LOD) rings — the cause of LOD never refreshing when
-/// flying away from the scene. Safe only for camera-*entered* chunks (no resident bricks to
-/// evict yet); the edit-dirty path must still enqueue emptied chunks so vacated bricks get
-/// removed.
-/// Whether any edit reaches chunk `ck`, reusing a caller-owned BVH traversal `stack` (cleared on
-/// entry) so a recenter that runs thousands of these per snap frame does zero heap allocation per
-/// query. Uses the BVH's EARLY-EXIT `any_overlap_with`: this only needs an occupancy boolean, so
-/// stopping at the first overlapping leaf (instead of collecting every edit a dense chunk overlaps —
-/// often hundreds, all discarded) roughly halves the per-query cost on tower-dense chunks.
-fn chunk_has_geometry_with(
-    ck: chunk::ChunkKey,
-    bvh: &bvh::Bvh,
-    config: &SdfGridConfig,
-    stack: &mut Vec<u32>,
-) -> bool {
-    let size = chunk::chunk_world_size(ck.lod, config);
-    let min = chunk::chunk_min_world(ck, config);
-    let aabb = bevy::math::bounding::Aabb3d::from_min_max(min, min + Vec3::splat(size));
-    bvh.any_overlap_with(&aabb, stack)
-}
-
-/// Whether chunk coord `c` is inside the `R³` chunk window with corner `origin`.
-fn chunk_in_window(c: IVec3, origin: IVec3, r: i32) -> bool {
-    let rel = c - origin;
-    rel.x >= 0 && rel.y >= 0 && rel.z >= 0 && rel.x < r && rel.y < r && rel.z < r
-}
-
-
-/// Every chunk key in the `R³` window with corner `origin` at `lod`.
-fn chunk_window_keys(origin: IVec3, r: i32, lod: u32) -> impl Iterator<Item = chunk::ChunkKey> {
-    (0..r).flat_map(move |iz| {
-        (0..r).flat_map(move |iy| {
-            (0..r).map(move |ix| chunk::ChunkKey::new(lod, origin + IVec3::new(ix, iy, iz)))
-        })
-    })
-}
-
-/// Invoke `f` only for the chunk coords in the `R³` window at `new_origin` that are NOT in the
-/// `R³` window at `old_origin` (the chunks that *entered* on a recenter). For two equal-size
-/// axis-aligned windows the difference is a thin boundary slab, so this visits only the new shell
-/// (a few hundred chunks) instead of the full `R³` interior (4096 at R=16) — the recenter only
-/// cares about entered chunks, and the overlap is unchanged. Yields nothing when the windows are
-/// identical; yields the whole new window when they don't overlap (a teleport). Each coord is
-/// visited at most once (axis-partitioned: x-slabs, then the x-overlap's y-slabs, then the xy-
-/// overlap's z-slabs), so no dedup is needed.
-fn for_each_entered_chunk(new_origin: IVec3, old_origin: IVec3, r: i32, mut f: impl FnMut(IVec3)) {
-    // Overlap box of the two windows on each axis (empty if they don't overlap). Use saturating
-    // arithmetic so a sentinel old_origin (i32::MIN on the first run) can't overflow `+ r`; it just
-    // yields an empty overlap → the whole new window is "entered", which is the correct first-run
-    // behaviour (and `for_each_exited_chunk` then evicts nothing, since the old window is degenerate).
-    let new_end = IVec3::new(
-        new_origin.x.saturating_add(r),
-        new_origin.y.saturating_add(r),
-        new_origin.z.saturating_add(r),
-    );
-    let old_end = IVec3::new(
-        old_origin.x.saturating_add(r),
-        old_origin.y.saturating_add(r),
-        old_origin.z.saturating_add(r),
-    );
-    let ov_min = new_origin.max(old_origin);
-    let ov_max = new_end.min(old_end);
-    // x in new-window but outside the x-overlap → whole yz cross-section entered.
-    let x_overlap_empty = ov_min.x >= ov_max.x;
-    for x in new_origin.x..new_end.x {
-        let x_entered = x_overlap_empty || x < ov_min.x || x >= ov_max.x;
-        if x_entered {
-            // Entire yz face at this x is new.
-            for y in new_origin.y..new_origin.y + r {
-                for z in new_origin.z..new_origin.z + r {
-                    f(IVec3::new(x, y, z));
-                }
-            }
-        } else {
-            // x is shared; partition y the same way, then z within the xy-overlap.
-            let y_overlap_empty = ov_min.y >= ov_max.y;
-            for y in new_origin.y..new_origin.y + r {
-                let y_entered = y_overlap_empty || y < ov_min.y || y >= ov_max.y;
-                if y_entered {
-                    for z in new_origin.z..new_origin.z + r {
-                        f(IVec3::new(x, y, z));
-                    }
-                } else {
-                    // x,y shared; only the z-slab outside the z-overlap entered.
-                    let z_overlap_empty = ov_min.z >= ov_max.z;
-                    for z in new_origin.z..new_origin.z + r {
-                        if z_overlap_empty || z < ov_min.z || z >= ov_max.z {
-                            f(IVec3::new(x, y, z));
-                        }
-                    }
-                }
-            }
-        }
-    }
-}
-
-/// Invoke `f` for the chunk coords that *exited* on a recenter — in the OLD window but not the
-/// new. Symmetric to [`for_each_entered_chunk`] (args swapped), used to evict the trailing shell.
-fn for_each_exited_chunk(new_origin: IVec3, old_origin: IVec3, r: i32, f: impl FnMut(IVec3)) {
-    for_each_entered_chunk(old_origin, new_origin, r, f);
-}
-
-/// All brick keys belonging to chunk `ck` (its `CHUNK_BRICKS³` local slots).
-#[cfg(test)]
-fn chunk_brick_keys(ck: chunk::ChunkKey, config: &SdfGridConfig) -> Vec<atlas::BrickKey> {
-    let mut keys = Vec::with_capacity(chunk::CHUNK_VOLUME as usize);
-    for_each_brick_key(ck, config, |k| keys.push(k));
-    keys
-}
-
-/// Allocation-free counterpart of [`chunk_brick_keys`]: invoke `f` for each of a chunk's 64
-/// brick keys without building a Vec. The bake emit's serial gather/apply loops run this over
-/// the entire dirty set (thousands of chunks on a terrain-scale heightmap move), so avoiding a
-/// per-chunk 64-element heap alloc there is a measurable win (emit phases 1+3 were ~20ms spikes).
-#[inline]
-fn for_each_brick_key(ck: chunk::ChunkKey, config: &SdfGridConfig, mut f: impl FnMut(atlas::BrickKey)) {
-    let s = config.cell_stride();
-    let c = chunk::CHUNK_BRICKS;
-    let base = ck.coord * c; // brick-index space
-    for lz in 0..c {
-        for ly in 0..c {
-            for lx in 0..c {
-                let bi = base + IVec3::new(lx, ly, lz);
-                f(atlas::BrickKey::new(ck.lod, bi * s)); // back to coord space
-            }
-        }
-    }
-}
-
-/// The chunks at `lod` whose world extent overlaps `aabb` (grown by the bake footprint
-/// pad so a moved edit re-dirties every chunk that could fold it), **clamped to the resident
-/// ring window** `[win_origin, win_origin + r)`. Computed directly in chunk-coord space — no
-/// per-brick enumeration.
-///
-/// The clamp is essential for terrain-scale edits: a heightmap's AABB spans the whole world
-/// in XZ, so the unclamped chunk range is millions of chunks. The caller only ever keeps the
-/// in-window ones anyway, so intersecting the loop bounds with the window up front makes the
-/// work O(AABB ∩ window) ≤ r³ instead of O(AABB volume) — the fix for the multi-hundred-ms
-/// `schedule_bakes` freeze when a heightmap edit changes (it used to allocate + enumerate the
-/// entire terrain-sized chunk volume per LOD, then discard 99.99% via `chunk_in_window`).
-fn chunks_in_aabb_windowed(
-    config: &SdfGridConfig,
-    aabb: &bevy::math::bounding::Aabb3d,
-    lod: u32,
-    win_origin: IVec3,
-    r: i32,
-) -> Vec<chunk::ChunkKey> {
-    let chunk_world = chunk::chunk_world_size(lod, config);
-    let pad = Vec3::splat(atlas::SNORM_CLAMP_DIST + config.brick_world_size(lod));
-    let lo = (Vec3::from(aabb.min) - pad) / chunk_world;
-    let hi = (Vec3::from(aabb.max) + pad) / chunk_world;
-    // Intersect the AABB chunk-range with the window box BEFORE enumerating.
-    let lo = IVec3::new(lo.x.floor() as i32, lo.y.floor() as i32, lo.z.floor() as i32)
-        .max(win_origin);
-    let hi = IVec3::new(hi.x.ceil() as i32, hi.y.ceil() as i32, hi.z.ceil() as i32)
-        .min(win_origin + IVec3::splat(r - 1));
-
-    let mut out = Vec::new();
-    for z in lo.z..=hi.z {
-        for y in lo.y..=hi.y {
-            for x in lo.x..=hi.x {
-                out.push(chunk::ChunkKey::new(lod, IVec3::new(x, y, z)));
-            }
-        }
-    }
-    out
-}
 
 /// Main-thread scheduling + GPU job emission — no per-voxel baking on the CPU. Diffs the
 /// per-LOD chunk-ring window as the camera moves (enqueue entered chunks, evict exited
@@ -617,87 +429,6 @@ pub fn schedule_bakes(
     }
 }
 
-/// Narrow-band cull decision for one candidate brick: KEEP iff the folded isosurface can pass
-/// through it. Drops the deep INTERIOR of a solid (`|d| ≫ 0`) and the FAR-EXTERIOR corners the
-/// coarse AABB query leaves in — the r³ bulk the march never samples (rays approach from
-/// outside, read only the thin zero-band, and stop). `indices` are the brick's BVH-culled edit
-/// indices into `edits`. Pure + allocation-free; unit-tested directly.
-///
-/// SMOOTHING SAFETY: a plain center test `|fold(center)| > circumradius + band` assumes the
-/// folded field is 1-Lipschitz — true ONLY at smoothing 0. iq polynomial `smin`/`smax` have a
-/// correction term `k·h(1−h)` that peaks at `k/4`, so the smoothed field can sit up to `Σ kᵢ/4`
-/// (additive down the fold chain) NEARER the true surface than `fold_hard` — the bound that
-/// kept the cull safe. Without padding for it, a brick at a SMOOTHED subtract-carve crease whose
-/// center reads "far" but whose corner actually crosses zero gets wrongly dropped → a hole at
-/// the rim (the reported bug). We pad `reach` by `Σ kᵢ/4`, restoring the conservative bound.
-///
-/// FORCE-KEEP on sign change: as a belt-and-suspenders that can only ever KEEP (never drop, so
-/// it cannot add a hole), if the folded field changes sign across the brick's 9 palette sample
-/// points (8 corners + center) the surface provably crosses the brick → keep regardless of the
-/// center distance. This also catches an enclosed cavity whose surface the center eval misses.
-fn narrow_band_keep(
-    edits: &[edits::ResolvedEdit],
-    indices: &[u32],
-    config: &SdfGridConfig,
-    key: atlas::BrickKey,
-) -> bool {
-    let brick_world = config.brick_world_size(key.lod);
-    let brick_min = config.brick_min_world(key.coord, key.lod);
-    let center = brick_min + Vec3::splat(0.5 * brick_world);
-
-    // Smoothing pad: additive Σ(kᵢ)/4 over the brick's smoothed candidate edits.
-    let smooth_sum: f32 = indices
-        .iter()
-        .map(|&i| edits[i as usize].op.smoothing.max(0.0))
-        .sum();
-    // CONSERVATIVE reach: circumradius + the LOD's distance band + smoothing pad. The
-    // `dist_band` term is a deliberate safety margin — it only ever makes us KEEP a brick the
-    // center test would otherwise drop, never the reverse, so it cannot introduce a hole. (It is
-    // largely subsumed by `cull_edit_indices` already culling on the raw brick AABB, but is kept
-    // because proving it strictly redundant at coarse-LOD corners is fragile and the cost is one
-    // add. The over-keep halo it allows is a one-time first-bake cost, not a per-frame drag cost.)
-    let reach = brick_world * (0.5 * 3.0_f32.sqrt())
-        + atlas::dist_band_world(config, key.lod)
-        + 0.25 * smooth_sum;
-
-    // Force-keep if the surface provably crosses the brick (sign change over the 9 samples).
-    // Only meaningful when smoothing inflates the gradient; the common k=0 path stays 1 eval.
-    if smooth_sum > 0.0 {
-        let voxel_size = config.voxel_size_at(key.lod);
-        let samples = atlas::SdfAtlas::brick_palette_samples(key, voxel_size);
-        let mut neg = false;
-        let mut pos = false;
-        for p in samples {
-            if edits::fold_csg_dist_indexed(edits, indices, p) <= 0.0 {
-                neg = true;
-            } else {
-                pos = true;
-            }
-            if neg && pos {
-                return true;
-            }
-        }
-    }
-
-    edits::fold_csg_dist_indexed(edits, indices, center).abs() <= reach
-}
-
-/// Turn this frame's dirty chunks into [`GpuBakeJob`]s: the CPU does only the topology work
-/// (BVH cull → which bricks exist + their palette + a stable tile), and the compute shader
-/// fills each brick's 512 texels straight into the atlas. No main-thread voxel loop.
-/// One candidate brick's classification, produced by [`classify_candidates`] (read-only, can run
-/// on a background task) and consumed by [`apply_verdicts`] (mutates the atlas, main thread only).
-pub(crate) enum Verdict {
-    /// No edit reaches it → evict.
-    Empty,
-    /// Narrow-band cull → evict.
-    Drop,
-    /// Resident with matching content hash → leave its texels as-is.
-    Skip,
-    /// Bake: palette + culled edit indices + content hash.
-    Keep(edits::Palette, Vec<u32>, u64),
-}
-
 /// Emit one bake job for `key` from already-culled edit indices `indices` and a known `palette`.
 /// No re-cull, no palette rebuild — the caller supplies both. `tile` must be allocated.
 fn push_bake_job(
@@ -760,104 +491,6 @@ fn gather_candidates(
         }
         for_each_brick_key(*ck, config, |key| candidates.push((*ck, key)));
     }
-}
-
-/// Classify ONE chunk's slice of candidate bricks into `Verdict`s (read-only). The shared core of
-/// both the parallel (sync) and serial (async task) classify paths. `scratch`/`stack`/`hash_memo`
-/// are caller-owned reusable buffers (the memo lets an edit-set folded by many bricks hash once per
-/// unique set). Reads only the edit/BVH snapshots, config, and the `hash_peek` resident-hash
-/// snapshot — no atlas borrow — so it is `Send` and safe on a background task.
-#[expect(clippy::too_many_arguments)]
-fn classify_chunk(
-    chunk: &[(chunk::ChunkKey, atlas::BrickKey)],
-    edits: &[edits::ResolvedEdit],
-    bvh: &bvh::Bvh,
-    config: &SdfGridConfig,
-    hash_peek: &std::collections::HashMap<atlas::BrickKey, u64>,
-    scratch: &mut Vec<u32>,
-    stack: &mut Vec<u32>,
-    hash_memo: &mut std::collections::HashMap<Box<[u32]>, u64>,
-    out: &mut Vec<Verdict>,
-) {
-    for &(_ck, key) in chunk {
-        if atlas::SdfAtlas::cull_edit_indices_with(key, bvh, config, scratch, stack).is_none() {
-            out.push(Verdict::Empty);
-            continue;
-        }
-        if !narrow_band_keep(edits, scratch, config, key) {
-            out.push(Verdict::Drop);
-            continue;
-        }
-        // Content hash of exactly the edits this brick folds — its bake-cache key. Memoised per
-        // unique culled index-set (the costly part is the same for identical sets).
-        let hash = *hash_memo
-            .entry(scratch.clone().into_boxed_slice())
-            .or_insert_with(|| edits::bake_content_hash(edits, scratch));
-        // HASH-PEEK EARLY-OUT: a resident brick with the same content keeps valid texels — skip
-        // BEFORE the (dominant-cost) palette build. This is what makes a sphere dragged over the
-        // heightmap cheap. The peek reads a SNAPSHOT of resident hashes (no atlas borrow); a stale
-        // snapshot is harmless — a wrong Skip re-bakes identically next frame, a wrong Keep is
-        // overwritten by `insert_gpu_brick`'s authoritative hash.
-        if hash_peek.get(&key).is_some_and(|&h| h == hash) {
-            out.push(Verdict::Skip);
-            continue;
-        }
-        let voxel_size = config.voxel_size_at(key.lod);
-        let samples = atlas::SdfAtlas::brick_palette_samples(key, voxel_size);
-        let palette = edits::build_palette_indexed(edits, scratch, &samples);
-        out.push(Verdict::Keep(palette, scratch.clone(), hash));
-    }
-}
-
-/// Phase 2 (PARALLEL, READ-ONLY): classify every candidate via `par_chunk_map` across the compute
-/// pool. The SYNCHRONOUS bake path. Reads only snapshots — see [`classify_chunk`].
-pub(crate) fn classify_candidates(
-    candidates: &[(chunk::ChunkKey, atlas::BrickKey)],
-    edits: &[edits::ResolvedEdit],
-    bvh: &bvh::Bvh,
-    config: &SdfGridConfig,
-    hash_peek: &std::collections::HashMap<atlas::BrickKey, u64>,
-) -> Vec<Verdict> {
-    if candidates.is_empty() {
-        return Vec::new();
-    }
-    let _g = info_span!("emit_phase2_classify", candidates = candidates.len()).entered();
-    let classify = |_idx: usize, chunk: &[(chunk::ChunkKey, atlas::BrickKey)]| -> Vec<Verdict> {
-        let mut scratch: Vec<u32> = Vec::new();
-        let mut stack: Vec<u32> = Vec::new();
-        let mut hash_memo: std::collections::HashMap<Box<[u32]>, u64> = std::collections::HashMap::new();
-        let mut out = Vec::with_capacity(chunk.len());
-        classify_chunk(chunk, edits, bvh, config, hash_peek, &mut scratch, &mut stack, &mut hash_memo, &mut out);
-        out
-    };
-    // `get_or_init` so headless tests (which don't boot the full app that sets up the pool) still
-    // run; in production the pool already exists.
-    let pool = ComputeTaskPool::get_or_init(bevy::tasks::TaskPool::default);
-    let chunk_size = candidates.len().div_ceil(pool.thread_num().max(1)).max(1);
-    candidates
-        .par_chunk_map(pool, chunk_size, classify)
-        .into_iter()
-        .flatten()
-        .collect()
-}
-
-/// SERIAL classify of all candidates — for the background async task, where nesting the
-/// `ComputeTaskPool` scope (as `classify_candidates` does) inside an `AsyncComputeTaskPool` task
-/// would deadlock. Single-threaded is fine off the main thread: the whole point is to not block the
-/// frame, and one background thread chewing through the shell over a few frames is exactly the goal.
-pub(crate) fn classify_candidates_serial(
-    candidates: &[(chunk::ChunkKey, atlas::BrickKey)],
-    edits: &[edits::ResolvedEdit],
-    bvh: &bvh::Bvh,
-    config: &SdfGridConfig,
-    hash_peek: &std::collections::HashMap<atlas::BrickKey, u64>,
-) -> Vec<Verdict> {
-    let mut scratch: Vec<u32> = Vec::new();
-    let mut stack: Vec<u32> = Vec::new();
-    let mut hash_memo: std::collections::HashMap<Box<[u32]>, u64> = std::collections::HashMap::new();
-    let mut out = Vec::with_capacity(candidates.len());
-    classify_chunk(candidates, edits, bvh, config, hash_peek, &mut scratch, &mut stack, &mut hash_memo, &mut out);
-    out
 }
 
 /// Phase 3 (serial, MAIN THREAD): apply the verdicts — evict, skip, or insert + push a GPU bake job
@@ -943,22 +576,6 @@ fn apply_verdicts(
         }
         i = j;
     }
-}
-
-/// Build the `hash_peek` snapshot: each candidate's resident `baked_hash` (absent → not resident).
-/// Lets [`classify_candidates`] do the content-hash skip without borrowing the atlas, so it can run
-/// on a background task.
-fn snapshot_hash_peek(
-    atlas: &SdfAtlas,
-    candidates: &[(chunk::ChunkKey, atlas::BrickKey)],
-) -> std::collections::HashMap<atlas::BrickKey, u64> {
-    let mut map = std::collections::HashMap::with_capacity(candidates.len());
-    for &(_ck, key) in candidates {
-        if let Some(b) = atlas.bricks.get(&key) {
-            map.insert(key, b.baked_hash);
-        }
-    }
-    map
 }
 
 /// Synchronous bake emit: drain `pending`, gather candidates (evicting empties), classify INLINE,

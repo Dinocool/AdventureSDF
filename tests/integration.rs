@@ -1,5 +1,5 @@
-use adventure::combat::{CombatPlugin, CombatState, DamageEvent, DamageType};
-use adventure::inventory::{InventoryPlugin, ItemType, LootEvent, PlayerInventory, Rarity};
+use adventure::combat::{CombatPlugin, CombatState, DamageMessage, DamageType};
+use adventure::inventory::{InventoryPlugin, ItemType, LootMessage, PlayerInventory, Rarity};
 use adventure::networking::{NetworkState, NetworkingPlugin};
 use adventure::player::Health;
 use adventure::player::Mana;
@@ -93,8 +93,8 @@ fn damage_then_loot_workflow() {
         .id();
 
     app.world_mut()
-        .resource_mut::<Messages<DamageEvent>>()
-        .write(DamageEvent {
+        .resource_mut::<Messages<DamageMessage>>()
+        .write(DamageMessage {
             target: player,
             amount: 40.0,
             damage_type: DamageType::Physical,
@@ -105,8 +105,8 @@ fn damage_then_loot_workflow() {
     assert_eq!(app.world().get::<Health>(player).unwrap().current, 60.0);
 
     app.world_mut()
-        .resource_mut::<Messages<LootEvent>>()
-        .write(LootEvent {
+        .resource_mut::<Messages<LootMessage>>()
+        .write(LootMessage {
             item: adventure::inventory::Item {
                 name: "Health Potion".into(),
                 item_type: ItemType::Consumable,
@@ -146,13 +146,13 @@ fn multiple_damage_sources_kill_player() {
         ))
         .id();
 
-    let mut msgs = app.world_mut().resource_mut::<Messages<DamageEvent>>();
-    msgs.write(DamageEvent {
+    let mut msgs = app.world_mut().resource_mut::<Messages<DamageMessage>>();
+    msgs.write(DamageMessage {
         target: player,
         amount: 30.0,
         damage_type: DamageType::Fire,
     });
-    msgs.write(DamageEvent {
+    msgs.write(DamageMessage {
         target: player,
         amount: 30.0,
         damage_type: DamageType::Magical,

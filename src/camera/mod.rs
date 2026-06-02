@@ -62,7 +62,7 @@ pub struct RightClickState {
 }
 
 #[derive(Message)]
-pub struct RightClickEvent {
+pub struct RightClickMessage {
     pub screen_position: Vec2,
 }
 
@@ -70,7 +70,7 @@ impl Plugin for CameraPlugin {
     fn build(&self, app: &mut App) {
         app.insert_resource(CameraMode::default())
             .init_resource::<RightClickState>()
-            .add_message::<RightClickEvent>()
+            .add_message::<RightClickMessage>()
             .add_systems(OnEnter(AppScene::AdventureGame), spawn_cameras)
             .add_systems(
                 Update,
@@ -118,7 +118,7 @@ fn track_right_click(
     mouse_buttons: Res<ButtonInput<MouseButton>>,
     mut motion_events: MessageReader<MouseMotion>,
     mut state: ResMut<RightClickState>,
-    mut messages: MessageWriter<RightClickEvent>,
+    mut messages: MessageWriter<RightClickMessage>,
     windows: Query<&Window>,
 ) {
     let delta: Vec2 = motion_events.read().map(|m| m.delta).sum();
@@ -135,7 +135,7 @@ fn track_right_click(
             && let Ok(window) = windows.single()
             && let Some(pos) = window.cursor_position()
         {
-            messages.write(RightClickEvent {
+            messages.write(RightClickMessage {
                 screen_position: pos,
             });
         }

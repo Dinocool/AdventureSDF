@@ -220,8 +220,20 @@ wide `pub(super)`/`use super::{...}` surface. **Verification corrected all of th
 medium** -- the payoff is real but dampened by shared-state plumbing. Do them when a file becomes a
 genuine friction point, not speculatively. **Don't split `chunk.rs`** (X3).
 
-### [ ] M1. Split `render.rs` (2511 LoC) into a `render/` directory by render-pass concern
+### [x] M1. Split `render.rs` (2511 LoC) into a `render/` directory by render-pass concern
 `impact: medium` * `effort: large` * `source: modularization`
+> **Done (landed incrementally).** `render.rs` → `render/mod.rs` + four cohesive submodules:
+> `bake.rs` (GPU brick-bake compute), `pbr_textures.rs` (BC7 array streaming), `cone.rs` (cone
+> prepass), `atlas_upload.rs` (chunk-table GPU mirror + encode/upload). **C5/A4 folded in**: the
+> 12-entry atlas bind group is now one shared `atlas_bind_group_1()` helper (was copy-pasted in the
+> G-buffer + cone nodes). `render/mod.rs`: **2398 → 1259 LoC (−47%)**. The remaining core —
+> `SdfCameraData` (the camera uniform, referenced ~12× across both view nodes, pipeline init, and
+> `register_type`/`ExtractComponentPlugin`), `SdfPipeline`/`SdfGpuAtlas`, the G-buffer + combine view
+> nodes, camera/material prepare, and pipeline init — is **kept central by design**: it threads the
+> shared state across every pass, so per the verification verdict ("the state doesn't partition along
+> pass lines") splitting it would create wide `super::`/re-export plumbing for the most-shared type
+> with minimal cohesion gain. Submodules reach shared types via `use super::*`; the `sdf_render`
+> siblings via `super::super`. Each peel was its own verified commit (GPU rigs green throughout).
 
 - *Now:* One flat file mixes ~6 independent subsystems (camera prepare, atlas/chunk-table upload, PBR
   texture streaming, cone prepass, brick bake, deferred G-buffer + combine). To read the bake path you
@@ -240,8 +252,18 @@ genuine friction point, not speculatively. **Don't split `chunk.rs`** (X3).
   `sdf_render::render::SdfRenderPlugin` path is preserved by `render/mod.rs`; only `sync_sdf_shader_defs`
   is editor-gated and stays put.
 
-### [ ] M2. Split `bake_scheduler.rs` (2587 LoC) -- `window.rs` + `classify.rs` are the clean wins
+### [x] M2. Split `bake_scheduler.rs` (2587 LoC) -- `window.rs` + `classify.rs` are the clean wins
 `impact: medium` * `effort: large` * `source: modularization + refactor-deadcode`
+> **Done (the two clean wins).** `bake_scheduler.rs` → `bake_scheduler/mod.rs` + `window.rs` (pure
+> chunk-ring window geometry — `ring_chunk_origin`, entered/exited diffs, `chunks_in_aabb_windowed`,
+> the BVH occupancy probe) + `classify.rs` (the Send read-only core — `Verdict`, `narrow_band_keep`,
+> `classify_chunk`, `classify_candidates[_serial]`, `snapshot_hash_peek`). `mod.rs`: **2561 → 2173
+> LoC**. The apply/dispatch split + A2 (`sync_emit`/`recenter_window` test-mirror extraction) are
+> **left in `mod.rs` by design** — the verdict flagged them "murkier, optional": they reach
+> `BakeScheduler`'s private fields (`pending`, `ring_chunk_origin`, `bvh`, `emit_scratch`, …), so a
+> sibling module would just widen those to `pub(super)` for little cohesion gain. The 1400-line test
+> module stays in `mod.rs` (in-file convention; it drives the whole lifecycle). Submodules reach
+> shared types via `use super::*`; names re-imported so production + tests call them unqualified.
 
 - *Now:* 54% of the file is `mod tests` (1194-2587). Production mashes five concerns: window-diff
   geometry (207-415), `schedule_bakes` (417-620), classify (640-863), apply (703-1107), and the
@@ -345,8 +367,14 @@ into compiler-enforced invariants.
   (`chunk_gpu_key`, `dir_index`, `ring_chunk_origin`, the C3 helper, ...). The compiler reports every
   site that breaks. **Do this last.**
 
-### [ ] A4. Replace the duplicated `.as_ref().unwrap()` bind-group wall with one resolver
+### [x] A4. Replace the duplicated `.as_ref().unwrap()` bind-group wall with one resolver
 `impact: medium` * `effort: medium` * `source: cross-cutting`
+> **Done (folded into M1 as C5).** The core finding — the ~11-unwrap atlas bind-group 1 wall
+> copy-pasted in `SdfGBufferNode` + `SdfConeNode` — is eliminated: both nodes now call the single
+> `render/mod.rs::atlas_bind_group_1(device, layout, gpu_atlas, label)` helper (one place, exact
+> binding order preserved, GPU lifecycle rigs green). The remaining nuance (a `views() -> Result`
+> with a descriptive message instead of `unwrap`) is minor polish on that one helper — the nodes
+> already early-out before it when resources are missing — and is left as optional.
 
 - *Now:* `render.rs:534-563` (bind_group_1 build) is duplicated near-verbatim at `render.rs:2156-2183`
   -- ~11 `gpu_atlas.dist_view.as_ref().unwrap()`-style unwraps each. A partially-initialized
@@ -495,7 +523,7 @@ Mostly test-only scaffolding (zero runtime risk) plus a couple of project-wide c
   **Update `CLAUDE.md` File Conventions** (which currently mandates inline) so the move doesn't violate
   a stated invariant. Naturally folds into M1/M2. Keep shared rig fixtures with the moved tests.
 
-### [ ] X2. Register `GizmoRenderPlugin` explicitly in `main.rs`
+### [x] X2. Register `GizmoRenderPlugin` explicitly in `main.rs`
 `impact: medium` * `effort: small` * `source: cross-cutting`
 
 - *Now:* `sdf_render/mod.rs:575-577` self-installs `GizmoRenderPlugin` as a hidden side effect behind a
@@ -505,7 +533,7 @@ Mostly test-only scaffolding (zero runtime risk) plus a couple of project-wide c
   `is_plugin_added` guard. Keep the `MinimalPlugins`/`Assets<GizmoAsset>` inner guard only around the
   gizmo *group* init that genuinely needs `GizmoPlugin` in headless tests. Pairs with D7.
 
-### [ ] N1. (low) Rename `...Event` message types to `...Message` (Bevy 0.18)
+### [x] N1. (low) Rename `...Event` message types to `...Message` (Bevy 0.18)
 `impact: low` * `effort: medium` * `source: cross-cutting`
 
 - *Now:* `combat`/`inventory`/`camera` define `#[derive(Message)] DamageEvent`/`LootEvent`/
