@@ -45,6 +45,16 @@ struct FragmentOutput {
 // lit pass's `a >= SKY_DIST` test never trips on a real surface.
 const SKY_DIST: f32 = 1e8;
 
+// Debug ramp: map the CONTINUOUS rendered LOD to a hue sweep (red = LOD 0 → blue/violet at the
+// coarsest), so a LOD cross-fade reads as a smooth gradient between two hues — the LOD-blend view.
+fn lod_ramp(eff_lod: f32) -> vec3<f32> {
+    let h = clamp(eff_lod * 0.16, 0.0, 0.83); // ~one hue step per LOD, no wrap-around
+    let r = clamp(abs(h * 6.0 - 3.0) - 1.0, 0.0, 1.0);
+    let g = clamp(2.0 - abs(h * 6.0 - 2.0), 0.0, 1.0);
+    let b = clamp(2.0 - abs(h * 6.0 - 4.0), 0.0, 1.0);
+    return vec3<f32>(r, g, b);
+}
+
 // --- Fragment shader (G-buffer export) ---
 
 @fragment
@@ -96,6 +106,17 @@ fn main(in: FullscreenVertexOutput) -> FragmentOutput {
     // geometry. Bevy clip space is z in [0,1], near = 1.
     let clip = camera.clip_from_world * vec4<f32>(hit_pos, 1.0);
     let ndc_depth = clip.z / clip.w;
+
+#ifdef SDF_DEBUG_LOD
+    // LOD-blend debug: write the eff-LOD ramp as albedo (the lit pass returns it straight through),
+    // depth kept so it occludes correctly. The blend band shows as a gradient between two LOD hues.
+    return FragmentOutput(
+        vec4<f32>(lod_ramp(rm.eff_lod), rm.dist),
+        vec4<f32>(0.0),
+        vec4<f32>(0.0),
+        ndc_depth,
+    );
+#endif
 
     // Resolve the cross-faded PBR inputs at the surface. `p.normal` is the normal-mapped
     // shading normal — the one the lit pass + GI want.

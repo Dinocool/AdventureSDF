@@ -293,24 +293,20 @@ pub fn eval_primitive(prim: &SdfPrimitive, p: Vec3) -> f32 {
             d.x.max(d.y).min(0.0) + d.max(Vec2::ZERO).length()
         }
         SdfPrimitive::Heightmap {
-            half_xz,
             max_height,
             freq,
             amp,
             seed,
+            ..
         } => {
-            // Bounded box clamped to a noise height. Vertical-distance approx:
-            // outside the XZ rect we fall back to the box SDF so the field stays
-            // finite and the BVH/march behave; inside, distance is the signed
-            // gap to the noise surface.
-            let half = Vec3::new(half_xz.x, *max_height * 0.5, half_xz.y);
-            let centered = p - Vec3::new(0.0, *max_height * 0.5, 0.0);
-            let q = centered.abs() - half;
-            let box_d = q.max(Vec3::ZERO).length() + q.max_element().min(0.0);
-
+            // ONE-SIDED terrain surface: signed VERTICAL distance to the noise height (positive
+            // above, negative below). No box floor or side walls — so the deep interior AND the
+            // underside both fall outside the narrow band and cull away, leaving only the walkable
+            // top shell baked. The XZ/Y extent is bounded by the edit's AABB (`primitive_local_aabb`),
+            // not the field. (Vertical-distance approximation: |∇| ≥ 1 on slopes, so it under-states
+            // distance there — safe for the sphere-trace, conservative for the cull.)
             let h = height_sample(Vec2::new(p.x, p.z), *freq, *amp, *seed) + *max_height * 0.5;
-            let surface_d = p.y - h;
-            box_d.max(surface_d)
+            p.y - h
         }
     }
 }
