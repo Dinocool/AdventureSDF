@@ -129,7 +129,9 @@ pub fn expand_tower_spawners(
 
 /// Spawn the stress scene (one [`TowerSpawner`] node + a directional light) into `world` with
 /// stable `LocalId`s, ready for serialization. The towers themselves are materialized at load time
-/// by [`expand_tower_spawners`], not stored here.
+/// by [`expand_tower_spawners`], not stored here. Test-only: the runtime loads the serialized
+/// `assets/scenes/stress.scene`; this builder only regenerates that file (see the test).
+#[cfg(test)]
 pub fn spawn_stress(world: &mut World) {
     world.spawn((
         LocalId(0),

@@ -697,14 +697,6 @@ fn bvh_ui(world: &mut World, ui: &mut egui::Ui) {
 
 // --- Spawn helper ---
 
-/// Spawn a new SDF volume with sensible defaults (unit sphere, Union, a fresh
-/// material), scattered near the orbit target, and return its entity. The reusable
-/// "add a node to the scene" primitive — used by the Scene panel's `+` button.
-/// Spawning changes the edit set, so `schedule_bakes` re-dirties the affected chunks.
-pub fn spawn_default_sdf(world: &mut World) -> Entity {
-    spawn_sdf_primitive(world, SdfPrimitive::Sphere { radius: 0.5 })
-}
-
 /// Spawn an SDF volume of a specific primitive shape (Union, fresh material, scattered
 /// near the orbit target). Shared by the Scene panel's `+` button and the Create Node
 /// dialog. Returns the new entity; the caller may reparent it.
