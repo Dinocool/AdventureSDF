@@ -1,9 +1,9 @@
 #define_import_path sdf::brick
 
-// Brick-atlas sampling: grid/brick coordinate math, the sorted-lookup binary
-// search + palette unpack, trilinear distance & per-palette-slot material sampling,
-// the combined `scene_sdf`, the cross-brick gradient normal, and the brick-DDA
-// empty-space fallback.
+// Brick-atlas sampling: grid/brick coordinate math, the direct toroidal-directory chunk
+// lookup (`find_chunk` = `dir_index` + key-tag compare) + palette unpack, trilinear distance
+// & per-palette-slot material sampling, the combined `scene_sdf`, the cross-brick gradient
+// normal, and the brick-DDA empty-space fallback.
 
 #import sdf::bindings::{
     camera,
@@ -19,6 +19,7 @@
     brick_world_at,
     CHUNK_BRICKS,
     abs_chunk_key,
+    dir_index,
     local_brick_index,
     euclid_mod,
     floor_div,
@@ -75,47 +76,23 @@ fn unpack_palette(lo: u32, hi: u32) -> vec4<u32> {
     );
 }
 
-// Lexicographic compare of two 64-bit keys (hi then lo): -1 a<b, 0 equal, 1 a>b.
-fn key_cmp(a_hi: u32, a_lo: u32, b_hi: u32, b_lo: u32) -> i32 {
-    if (a_hi < b_hi) { return -1; }
-    if (a_hi > b_hi) { return 1; }
-    if (a_lo < b_lo) { return -1; }
-    if (a_lo > b_lo) { return 1; }
-    return 0;
-}
-
-// Find the chunk table index whose key matches (key_hi,key_lo), or -1 if absent.
-// `count` = `arrayLength(&chunk_buf)`, the actual length of the bound lookup buffer — NOT
-// `camera.grid_dims.w`. The uniform bound and the lookup buffer are uploaded through separate
-// paths (per-frame uniform vs topology-gated buffer rebuild) and could land a frame apart, so
-// a topology-change frame searched a stale table with a fresh, smaller bound → indices 0..count
-// pointed at the WRONG (old) chunks → a band of geometry resolved to wrong/empty tiles (the
-// 1-frame "chunk of the object missing" flicker). Reading the buffer's own length makes the
-// bound consistent with its contents by construction. SDF_LINEAR_CHUNK_SEARCH forces a
-// brute-force linear scan (diagnostic).
-fn find_chunk(key_hi: u32, key_lo: u32) -> i32 {
-    let count = i32(arrayLength(&chunk_buf));
-#ifdef SDF_LINEAR_CHUNK_SEARCH
-    for (var i: i32 = 0; i < count; i = i + 1) {
-        let e = chunk_buf[u32(i)];
-        if (e.key_hi == key_hi && e.key_lo == key_lo) {
-            return i;
-        }
+// Direct toroidal chunk lookup. The `chunk_buf` is the dense per-LOD DIRECTORY (chunk.rs
+// LiveChunkTables): chunk `c` at `dir_index(c, lod)`. Index it directly and accept only if the
+// stored key TAG equals `abs_chunk_key(coord, lod)` — empty/stale slots carry a sentinel key that
+// never matches a real chunk, so a departed (cleared) or never-baked slot is a clean miss → the
+// caller falls back to a coarser LOD. Returns the directory index (for `chunk_buf[ci]`), or -1.
+// O(1) — no sort, no search. `arrayLength` is read directly so a stale-size read just misses.
+fn find_chunk(coord: vec3<i32>, lod: u32) -> i32 {
+    let idx = dir_index(coord, lod);
+    if (idx >= arrayLength(&chunk_buf)) {
+        return -1;
+    }
+    let e = chunk_buf[idx];
+    let key = abs_chunk_key(coord, lod);
+    if (e.key_hi == key.x && e.key_lo == key.y) {
+        return i32(idx);
     }
     return -1;
-#else
-    var lo: i32 = 0;
-    var hi: i32 = count - 1;
-    while (lo <= hi) {
-        let mid = (lo + hi) / 2;
-        let e = chunk_buf[u32(mid)];
-        let c = key_cmp(e.key_hi, e.key_lo, key_hi, key_lo);
-        if (c == 0) { return mid; }
-        else if (c < 0) { lo = mid + 1; }
-        else { hi = mid - 1; }
-    }
-    return -1;
-#endif
 }
 
 // Resolve the brick at `coord` WITHIN an already-found chunk: test the occupancy bit for
@@ -151,12 +128,7 @@ fn brick_in_chunk(chunk: ChunkLookup, coord: vec3<i32>) -> BrickLocation {
 // Resolve the baked brick at `coord` on LOD `lod` via its chunk: find the chunk, then test
 // the occupancy bit / index the tile run via `brick_in_chunk`.
 fn find_brick_lookup(coord: vec3<i32>, lod: u32) -> BrickLocation {
-    let count = arrayLength(&chunk_buf);   // buffer's own length, not the (possibly stale) uniform bound
-    if (count == 0u) {
-        return BrickLocation(0u, vec4<u32>(PALETTE_EMPTY), false);
-    }
-    let key = abs_chunk_key(coord, lod);
-    let ci = find_chunk(key.x, key.y);
+    let ci = find_chunk(coord, lod);
     if (ci < 0) {
         return BrickLocation(0u, vec4<u32>(PALETTE_EMPTY), false);
     }
@@ -411,16 +383,17 @@ fn new_chunk_cache() -> ChunkCache {
     return c;
 }
 
-fn find_chunk_cached(lod: u32, key_hi: u32, key_lo: u32, cache: ptr<function, ChunkCache>) -> i32 {
+fn find_chunk_cached(coord: vec3<i32>, lod: u32, cache: ptr<function, ChunkCache>) -> i32 {
+    let key = abs_chunk_key(coord, lod);   // the chunk's tag — identifies it across march steps
 #ifndef SDF_DISABLE_CHUNK_CACHE
-    if ((*cache).valid[lod] && (*cache).key_hi[lod] == key_hi && (*cache).key_lo[lod] == key_lo) {
+    if ((*cache).valid[lod] && (*cache).key_hi[lod] == key.x && (*cache).key_lo[lod] == key.y) {
         return (*cache).index[lod];
     }
 #endif
-    let ci = find_chunk(key_hi, key_lo);
+    let ci = find_chunk(coord, lod);
     (*cache).valid[lod] = true;
-    (*cache).key_hi[lod] = key_hi;
-    (*cache).key_lo[lod] = key_lo;
+    (*cache).key_hi[lod] = key.x;
+    (*cache).key_lo[lod] = key.y;
     (*cache).index[lod] = ci;
     return ci;
 }
@@ -431,12 +404,7 @@ fn find_chunk_cached(lod: u32, key_hi: u32, key_lo: u32, cache: ptr<function, Ch
 // O(1)-within-a-chunk memo the primary march enjoys (the uncached versions binary-search the
 // whole chunk buffer EVERY call). The result is bit-identical — the cache is a pure memo.
 fn find_brick_lookup_cached(coord: vec3<i32>, lod: u32, cache: ptr<function, ChunkCache>) -> BrickLocation {
-    let count = arrayLength(&chunk_buf);
-    if (count == 0u) {
-        return BrickLocation(0u, vec4<u32>(PALETTE_EMPTY), false);
-    }
-    let key = abs_chunk_key(coord, lod);
-    let ci = find_chunk_cached(lod, key.x, key.y, cache);
+    let ci = find_chunk_cached(coord, lod, cache);
     if (ci < 0) {
         return BrickLocation(0u, vec4<u32>(PALETTE_EMPTY), false);
     }
@@ -498,8 +466,7 @@ fn resolve_march(p: vec3<f32>, cache: ptr<function, ChunkCache>) -> MarchSample 
     if (count != 0u) {
         for (var lod = 0u; lod < levels; lod = lod + 1u) {
             let coord = world_to_brick_lod(p, lod);
-            let key = abs_chunk_key(coord, lod);
-            let ci = find_chunk_cached(lod, key.x, key.y, cache);
+            let ci = find_chunk_cached(coord, lod, cache);
             if (ci >= 0) {
                 if (!has_window) {
                     window_lod = lod;
@@ -533,8 +500,7 @@ fn sample_level_at_or_coarser(p: vec3<f32>, target_lod: u32, cache: ptr<function
     }
     for (var lod = target_lod; lod < levels; lod = lod + 1u) {
         let coord = world_to_brick_lod(p, lod);
-        let key = abs_chunk_key(coord, lod);
-        let ci = find_chunk_cached(lod, key.x, key.y, cache);
+        let ci = find_chunk_cached(coord, lod, cache);
         if (ci >= 0) {
             let loc = brick_in_chunk(chunk_buf[u32(ci)], coord);
             if (loc.found) {

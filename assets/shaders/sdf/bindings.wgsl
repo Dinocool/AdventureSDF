@@ -224,3 +224,32 @@ fn local_brick_index(coord: vec3<i32>) -> u32 {
     let lz = euclid_mod(floor_div(coord.z, s), c);
     return u32(lz * c * c + ly * c + lx);
 }
+
+// Ring chunks per axis: R = ring_bricks / CHUNK_BRICKS. Mirrors `LiveChunkTables::r`.
+fn ring_chunks() -> i32 {
+    return ring_bricks() / CHUNK_BRICKS;
+}
+
+// The chunk coord (on the LOD's chunk lattice) containing brick `coord` — the chunk-coord step of
+// chunk::chunk_of (brick index → chunk index, Euclidean so negatives map continuously).
+fn chunk_coord_of(coord: vec3<i32>) -> vec3<i32> {
+    let s = cell_stride();
+    return vec3<i32>(
+        floor_div(floor_div(coord.x, s), CHUNK_BRICKS),
+        floor_div(floor_div(coord.y, s), CHUNK_BRICKS),
+        floor_div(floor_div(coord.z, s), CHUNK_BRICKS),
+    );
+}
+
+// Physical directory slot of the chunk containing brick `coord` at `lod`, into the dense per-LOD
+// toroidal directory `chunk_buf`: lod*R³ + flatten(euclid_mod(chunk_coord, R)). EXACT mirror of
+// chunk::dir_index — the GPU-rig parity test guards against drift. `euclid_mod` (never raw `%`) so
+// negative coords + non-power-of-two R both index correctly.
+fn dir_index(coord: vec3<i32>, lod: u32) -> u32 {
+    let r = ring_chunks();
+    let cc = chunk_coord_of(coord);
+    let mx = euclid_mod(cc.x, r);
+    let my = euclid_mod(cc.y, r);
+    let mz = euclid_mod(cc.z, r);
+    return lod * u32(r * r * r) + u32(mz * r * r + my * r + mx);
+}

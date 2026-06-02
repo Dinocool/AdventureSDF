@@ -115,17 +115,12 @@ struct ExtractedSdfAtlas {
     /// first frame, on a capacity grow, and on the empty-atlas sentinel. See `super::chunk`.
     chunk_data: Vec<GpuChunkLookup>,
     tile_run_data: Vec<GpuBrickTile>,
-    /// DELTA payload (`tables_dirty && !full_rebuild`): only the chunk rows and tile-run
-    /// regions (slot → 64-entry region) that changed this frame, plus the sentinel tail to
-    /// blank for removed chunks and the new logical row length. The render world `write_buffer`s
-    /// just these instead of recreating both buffers — the whole point of the incremental path.
+    /// DELTA payload (`tables_dirty && !full_rebuild`): only the directory slots and tile-run
+    /// regions (slot → 64-entry region) that changed this frame. The toroidal directory is fixed-
+    /// position, so each is an in-place `write_buffer` — no row shift, no sentinel tail.
     chunk_row_updates: Vec<(u32, GpuChunkLookup)>,
     tile_run_updates: Vec<(u32, Vec<GpuBrickTile>)>,
-    /// Rows `[sentinel_tail_from..old_len)` must be overwritten with the `(MAX,MAX)` sentinel key
-    /// (a chunk was removed and the logical length shrank). `None` if no chunk was removed.
-    sentinel_tail_from: Option<u32>,
-    /// Logical chunk-row count after this frame's delta (the shader still binary-searches the full
-    /// physical buffer; sentinel rows past this length never match).
+    /// Directory length (= `R³ × lod_count`); the GPU direct-indexes it (no logical-count bound).
     new_chunk_len: u32,
     /// Buffer capacities (rows / tile-run entries) this frame's table needs. `prepare` grows the
     /// buffers (with headroom) when these exceed the current allocation.
@@ -1256,9 +1251,10 @@ fn extract_sdf_atlas(
     };
 
     if must_rebuild {
-        // Grow with headroom (+50%, min one chunk's worth) so a steadily-growing scene doesn't
-        // recreate the buffers every frame — most frames then stay on the cheap delta path.
-        let cap_rows = (needed_rows + needed_rows / 2).max(needed_rows + 1);
+        // The chunk_buf is now the FIXED-size toroidal directory (R³·lod_count) — it never grows, so
+        // size it EXACTLY (no headroom). The tile-run buffer is still sparse and can grow, so keep
+        // headroom there (+50%) to avoid recreating it every frame.
+        let cap_rows = needed_rows;
         let cap_slots =
             (needed_slots + needed_slots / 2).max(needed_slots + super::chunk::TILE_RUN_SLOT);
         chunk_cap.chunk_rows = cap_rows;
@@ -1273,8 +1269,9 @@ fn extract_sdf_atlas(
         extracted.full_rebuild = true;
         extracted.tables_dirty = true;
     } else {
-        // Delta: only the rows + tile-run regions the live table marked dirty this frame. The
-        // dirty record is cleared on the main world next frame (`clear_chunk_table_dirty`).
+        // Delta: only the directory slots + tile-run regions the live table marked dirty this frame.
+        // The directory is fixed-position, so every dirty slot is an in-place write — no row shift,
+        // no sentinel tail. The dirty record is cleared on the main world next frame.
         let chunk_rows: Vec<(u32, GpuChunkLookup)> = live
             .dirty_rows
             .iter()
@@ -1285,11 +1282,9 @@ fn extract_sdf_atlas(
             .iter()
             .map(|&s| (s, live.tile_region(s).into_iter().map(to_gpu_tile).collect()))
             .collect();
-        extracted.tables_dirty =
-            !chunk_rows.is_empty() || !tile_runs.is_empty() || live.sentinel_tail_from.is_some();
+        extracted.tables_dirty = !chunk_rows.is_empty() || !tile_runs.is_empty();
         extracted.chunk_row_updates = chunk_rows;
         extracted.tile_run_updates = tile_runs;
-        extracted.sentinel_tail_from = live.sentinel_tail_from;
         extracted.new_chunk_len = needed_rows;
     }
 
@@ -1648,22 +1643,8 @@ fn upload_tables_delta(
     if let Some(s) = run_start {
         flush(s, &run_bytes);
     }
-
-    // Sentinel-blank the rows a chunk removal vacated: [new_chunk_len .. physical capacity). We
-    // only know the new logical length; overwrite from there to the buffer's end so a shrink never
-    // leaves a stale real key in the searchable range. One coalesced write (the buffer length is
-    // fixed, so the tail span is exact).
-    if let Some(from) = extracted.sentinel_tail_from {
-        let cap_rows = (lookup.size() / 20) as u32;
-        if from < cap_rows {
-            let sentinel = sentinel_row_bytes();
-            let mut tail = Vec::with_capacity((cap_rows - from) as usize * 20);
-            for _ in from..cap_rows {
-                tail.extend_from_slice(&sentinel);
-            }
-            queue.write_buffer(lookup, (from as u64) * 20, &tail);
-        }
-    }
+    // No sentinel tail: the directory is fixed-size and an emptied chunk's slot was already reset to
+    // the sentinel tag in `clear_brick` (it shows up as a normal dirty-row write above).
 
     // Changed tile-run regions (64 entries × 12 B = 768 B each, at slot*64*12).
     let mut region_bytes = Vec::with_capacity(super::chunk::TILE_RUN_SLOT as usize * 12);
