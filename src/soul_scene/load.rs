@@ -46,6 +46,19 @@ pub fn load_scene(
     instantiate(world, path, registry, &mut stack)
 }
 
+/// Spawn scene contents from an in-memory RON string (no disk read for the root).
+/// Used by the editor to restore a scene's edited-but-unsaved snapshot when swapping
+/// between open scene tabs. Nested instances still resolve their sources from disk.
+pub fn load_scene_from_str(
+    world: &mut World,
+    ron: &str,
+    registry: &TypeRegistry,
+) -> Result<Vec<Entity>, SceneLoadError> {
+    let file = SceneFile::from_ron(ron).map_err(|e| SceneLoadError::Parse(e.to_string()))?;
+    let mut stack = Vec::new();
+    instantiate_records(world, &file, "<snapshot>", registry, &mut stack)
+}
+
 /// Recursively instantiate a scene file. `stack` carries the in-progress source
 /// paths so cycles are detected instead of looping forever.
 fn instantiate(
@@ -62,7 +75,22 @@ fn instantiate(
 
     let text = std::fs::read_to_string(path).map_err(|e| SceneLoadError::Io(e.to_string()))?;
     let file = SceneFile::from_ron(&text).map_err(|e| SceneLoadError::Parse(e.to_string()))?;
+    let label = path.display().to_string();
+    let result = instantiate_records(world, &file, &label, registry, stack);
+    stack.pop();
+    result
+}
 
+/// Spawn every record in an already-parsed [`SceneFile`] (the two-pass spawn shared by
+/// disk and in-memory loads). `label` names the source for diagnostics; `stack` carries
+/// nested-instance cycle detection. The caller owns pushing/popping its own source path.
+fn instantiate_records(
+    world: &mut World,
+    file: &SceneFile,
+    label: &str,
+    registry: &TypeRegistry,
+    stack: &mut Vec<PathBuf>,
+) -> Result<Vec<Entity>, SceneLoadError> {
     // First pass: spawn every record, recording its `LocalId` -> spawned entity so the
     // second pass can resolve serialized parent ids into live `ChildOf` links.
     let mut roots = Vec::new();
@@ -97,13 +125,11 @@ fn instantiate(
             }
             None => warn!(
                 "scene load: record references parent LocalId {parent_local} not found \
-                 in {} — leaving as root",
-                path.display()
+                 in {label} — leaving as root"
             ),
         }
     }
 
-    stack.pop();
     Ok(roots)
 }
 

@@ -9,19 +9,25 @@
 
 use bevy::prelude::*;
 use bevy_egui::egui;
+use egui_dock::tab_viewer::OnCloseResponse;
 use egui_dock::{DockArea, DockState, NodeIndex, Style, TabViewer};
 
 use super::config::EditorConfig;
 use super::panels::{DebugPanelRegistry, DockSide};
+use super::scene_tabs::{self, INITIAL_SCENE_ID, OpenScenes, SceneId};
 
-/// A tab in the editor dock. `Viewport` is the center 3D region (the SDF view);
-/// the rest are content panels. Built-in shell tabs have their own variants;
-/// contributed debug/tool panels come through `Registered`.
+/// A tab in the editor dock. `Scene(id)` is a center 3D scene view (one per open scene,
+/// named after the file); the rest are content panels. Built-in shell tabs have their own
+/// variants; contributed debug/tool panels come through `Registered`.
 #[derive(Clone, PartialEq, Eq)]
 pub enum EditorTab {
-    /// Center 3D scene view. Its on-screen rect is fed back to the SDF camera so
-    /// the raymarch only fills the viewport region, not the whole window.
-    Viewport,
+    /// Center 3D scene view for the open scene `id`. Only the active scene renders; the
+    /// tab's on-screen rect is fed back to the SDF camera so the raymarch only fills the
+    /// viewport region. Switching scene tabs swaps which scene is live in the world.
+    Scene(SceneId),
+    /// Empty-state placeholder shown in the center when every scene has been closed. Not
+    /// closeable; replaced by a `Scene` tab as soon as one is opened.
+    NoScene,
     /// Scene-tree panel. Top-left.
     Hierarchy,
     /// Selected-entity component editor (Godot-style). Right.
@@ -66,7 +72,7 @@ impl EditorDockState {
         // `[old, new]` where `old` is the inherited content (the viewport). So a 20%
         // left panel = `split_left(.., 0.20, ..)`, and we thread `old` (the viewport)
         // forward as `center`.
-        let mut state = DockState::new(vec![EditorTab::Viewport]);
+        let mut state = DockState::new(vec![EditorTab::Scene(INITIAL_SCENE_ID)]);
         let surface = state.main_surface_mut();
         let mut center = NodeIndex::root();
 
@@ -127,7 +133,9 @@ impl TabViewer for EditorTabViewer<'_> {
 
     fn title(&mut self, tab: &mut Self::Tab) -> egui::WidgetText {
         match tab {
-            EditorTab::Viewport => "Viewport".into(),
+            EditorTab::Scene(id) => self.world.resource::<OpenScenes>().tab_title(*id).into(),
+            // Blank label: the empty-state center has no real tab, just room for the prompt.
+            EditorTab::NoScene => "".into(),
             EditorTab::Hierarchy => "Scene".into(),
             EditorTab::Inspector => "Inspector".into(),
             EditorTab::ProjectFiles => "Project Files".into(),
@@ -138,7 +146,10 @@ impl TabViewer for EditorTabViewer<'_> {
 
     fn ui(&mut self, ui: &mut egui::Ui, tab: &mut Self::Tab) {
         match tab {
-            EditorTab::Viewport => {
+            EditorTab::Scene(id) => {
+                // Only the active scene tab's `ui()` runs (egui_dock renders one tab per
+                // leaf), so recording it here tells the swap logic which scene is visible.
+                self.world.resource_mut::<OpenScenes>().rendered = Some(*id);
                 // Toolbar strip across the top of the viewport tab. The remaining area
                 // below it is what the 3D camera renders into.
                 super::viewport_toolbar::viewport_toolbar(self.world, ui);
@@ -147,6 +158,12 @@ impl TabViewer for EditorTabViewer<'_> {
                 let rect = ui.clip_rect();
                 *self.viewport_rect = rect;
                 viewport_material_drop(self.world, ui, rect);
+            }
+            EditorTab::NoScene => {
+                // Empty-state center: no live viewport here, just the centered prompt. Clear
+                // the viewport rect so pointer-in-viewport (camera input) reads false.
+                *self.viewport_rect = egui::Rect::NOTHING;
+                empty_state_message(ui);
             }
             EditorTab::Hierarchy => {
                 super::hierarchy::hierarchy_ui(self.world, ui);
@@ -174,10 +191,40 @@ impl TabViewer for EditorTabViewer<'_> {
         }
     }
 
-    fn clear_background(&self, tab: &Self::Tab) -> bool {
-        // Don't paint over the viewport — the 3D camera renders there.
-        !matches!(tab, EditorTab::Viewport)
+    fn closeable(&mut self, tab: &mut Self::Tab) -> bool {
+        // The empty-state placeholder has no close button; everything else does.
+        !matches!(tab, EditorTab::NoScene)
     }
+
+    fn on_close(&mut self, tab: &mut Self::Tab) -> OnCloseResponse {
+        match tab {
+            // Route scene-tab closes through the document manager (it handles the
+            // unsaved-changes prompt and the last-scene → empty-state transition); ignore
+            // the close here, the manager removes the tab once confirmed.
+            EditorTab::Scene(id) => {
+                self.world.resource_mut::<OpenScenes>().close_request = Some(*id);
+                OnCloseResponse::Ignore
+            }
+            _ => OnCloseResponse::Close,
+        }
+    }
+
+    fn clear_background(&self, tab: &Self::Tab) -> bool {
+        // Don't paint over the active scene's region — the 3D camera renders there. The
+        // placeholder IS painted (the world is empty, so there's nothing to see through).
+        !matches!(tab, EditorTab::Scene(_))
+    }
+}
+
+/// Centered "no scene open" prompt, shown in the empty state (no tabs, no buttons).
+fn empty_state_message(ui: &mut egui::Ui) {
+    ui.centered_and_justified(|ui| {
+        ui.label(
+            egui::RichText::new("No scene open\nUse File \u{25B8} Open to load a scene")
+                .weak()
+                .size(16.0),
+        );
+    });
 }
 
 /// Accept a material dropped onto the 3D viewport: ray-pick the SDF volume under the cursor
@@ -257,6 +304,13 @@ pub fn show_editor_dock(world: &mut World) {
         }
     };
 
+    // Multi-scene tab orchestration. Drain File-menu requests (which may add/remove scene
+    // tabs) and refresh the active scene's dirty flag BEFORE rendering, so titles and the
+    // tab set are current this frame.
+    let type_registry = world.resource::<AppTypeRegistry>().clone();
+    scene_tabs::drain_requests(world, &mut dock, &type_registry);
+    scene_tabs::refresh_active_dirty(world, &type_registry);
+
     let mut viewport_rect = dock.viewport_rect;
     {
         let mut viewer = EditorTabViewer {
@@ -268,6 +322,11 @@ pub fn show_editor_dock(world: &mut World) {
             .style(Style::from_egui(ctx.style().as_ref()))
             .show(&ctx, &mut viewer);
     }
+
+    // After render: swap to a scene tab the user clicked, and process any close request
+    // (which may pop the unsaved-changes prompt).
+    scene_tabs::handle_activation(world, &mut dock, &type_registry);
+    scene_tabs::handle_close(world, &mut dock, &type_registry, &ctx);
 
     dock.viewport_rect = viewport_rect;
     // Allow viewport interaction only while the pointer is inside the viewport tab AND not
