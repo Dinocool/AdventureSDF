@@ -193,8 +193,13 @@ verified `high`). Keep the differential tests green at every step.
   config SSOT threaded everywhere. Watch the i32/u32 cast at the half-window stays floor-correct;
   covered by the `ring_chunks_per_axis` test + dir_index parity tests.
 
-### [ ] C5. Factor the std430 byte-encoders + the duplicated 12-entry atlas bind-group
+### [~] C5. Factor the std430 byte-encoders + the duplicated 12-entry atlas bind-group
 `impact: medium` * `effort: medium` * `source: refactor-deadcode + cross-cutting`
+> **Folded into M1.** The high-value part (the `atlas_bind_group_1` dedup across the two render
+> nodes) only makes sense once `render.rs` is split into `gbuffer.rs`/`cone.rs`, so it lands there.
+> The per-struct `encode()` part is not cross-struct duplication (each serializes distinct fields on
+> a load-bearing std430 layout M1 will relocate anyway), so it's done in the same pass — not as a
+> standalone churn commit.
 
 - *Now:* `render.rs` hand-rolls LE byte encoding in 4 places (`GpuSdfMaterial` 1313-1338,
   `GpuJobHeader` 2278-2292, `GpuEdit` 2301-2316, plus `encode_lookup`/`encode_tile`). The 12-binding
