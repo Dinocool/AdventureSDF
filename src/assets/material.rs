@@ -34,7 +34,7 @@ pub struct MaterialAsset {
     #[serde(default = "default_parallax")]
     pub parallax_scale: f32,
     /// Emissive (self-lit) colour, linear RGB. The material emits this × `emissive_intensity`
-    /// as radiance regardless of incident light — and it feeds the radiance-cascade GI, so a
+    /// as radiance regardless of incident light — and it feeds the GI, so a
     /// glowing object lights its surroundings. `#[serde(default)]` → black for legacy RON.
     #[serde(default)]
     pub emissive_color: [f32; 3],

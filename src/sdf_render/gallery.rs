@@ -97,7 +97,7 @@ pub fn spawn_gallery(world: &mut World) {
             "white_gloss",
         ),
         // Emissive orange "lamp" sphere, near the cobble box + red sphere so its warm glow
-        // bounces onto them through the radiance-cascade GI.
+        // bounces onto them through the GI.
         (
             7,
             7,

@@ -651,8 +651,9 @@ fn sync_editor_camera_active(
     }
 }
 
-/// Path to the editor's default scene (the SDF stress tower-field), relative to the working dir.
-pub const DEFAULT_SCENE_PATH: &str = "assets/scenes/stress.scene";
+/// Path to the editor's default scene (the PBR gallery), relative to the working dir. The stress
+/// tower-field lives at `assets/scenes/stress.scene` and can be loaded manually.
+pub const DEFAULT_SCENE_PATH: &str = "assets/scenes/gallery.scene";
 
 /// Load the default scene into the world on editor enter. Exclusive (scene load
 /// needs `&mut World` + the type registry). Runs after `setup_sdf_scene` so the materials
