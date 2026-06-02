@@ -416,7 +416,7 @@ into compiler-enforced invariants.
 Improves the editor's discoverability and wiring consistency. Independent of the SDF-core tiers.
 The whole `editor/` tree is feature-gated -- **build `--features editor` to catch breakage**.
 
-### [ ] E1. Break `EditorPlugin::build` (107-line grab-bag) into per-concern sub-plugins
+### [x] E1. Break `EditorPlugin::build` (107-line grab-bag) into per-concern sub-plugins
 `impact: medium` * `effort: medium` * `source: editor-structure`
 
 - *Now:* `editor/mod.rs:42-147` adds 7 plugins, inits ~10 resources, registers 4 Reflect types, and

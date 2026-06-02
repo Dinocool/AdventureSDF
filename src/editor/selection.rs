@@ -9,6 +9,19 @@ use bevy::prelude::*;
 
 use crate::sdf_render::SdfSelection;
 
+/// Wires the unified selection: the [`EditorSelection`] resource + the [`sync_selection`] system
+/// (gated on the editor being enabled). Was inline in `EditorPlugin::build`.
+pub struct SelectionPlugin;
+
+impl Plugin for SelectionPlugin {
+    fn build(&self, app: &mut App) {
+        app.init_resource::<EditorSelection>().add_systems(
+            Update,
+            sync_selection.run_if(|c: Res<crate::editor::config::EditorConfig>| c.enabled),
+        );
+    }
+}
+
 /// What the Inspector is currently inspecting.
 #[derive(Resource, Default, Debug, Clone, PartialEq, Eq)]
 pub enum EditorSelection {

@@ -30,6 +30,21 @@ impl AssetInspectorRegistry {
     }
 }
 
+/// Wires the asset-inspector registry (seeded with the built-in texture/material/PBR inspectors)
+/// plus the per-asset [`ImportSettingsEdits`] buffer. Was inline in `EditorPlugin::build`, seeding
+/// a registry defined here.
+pub struct AssetInspectorPlugin;
+
+impl Plugin for AssetInspectorPlugin {
+    fn build(&self, app: &mut App) {
+        let mut reg = AssetInspectorRegistry::default();
+        reg.register(TextureAssetInspector);
+        reg.register(MaterialAssetInspector);
+        reg.register(PbrTextureAssetInspector);
+        app.init_resource::<ImportSettingsEdits>().insert_resource(reg);
+    }
+}
+
 /// Render the inspector for `path`. Dispatches to the first matching [`AssetInspector`],
 /// else shows generic file metadata.
 pub fn asset_inspector_ui(world: &mut World, path: &Path, ui: &mut egui::Ui) {
