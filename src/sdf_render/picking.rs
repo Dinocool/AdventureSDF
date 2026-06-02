@@ -1,9 +1,13 @@
 use bevy::prelude::*;
 
-use crate::sdf_render::atlas::SdfAtlas;
 use crate::sdf_render::bvh::Bvh;
 use crate::sdf_render::edits::{ResolvedEdit, eval_world, fold_csg};
-use crate::sdf_render::{GatheredEdit, *};
+use crate::sdf_render::GatheredEdit;
+// `SdfAtlas` + the re-export glob are only needed by the editor-gated `debug_capture_march`.
+#[cfg(feature = "editor")]
+use crate::sdf_render::atlas::SdfAtlas;
+#[cfg(feature = "editor")]
+use crate::sdf_render::*;
 
 /// Convert mouse position to a world-space ray
 pub fn mouse_to_ray(
@@ -180,7 +184,9 @@ pub struct RayStep {
 
 /// Replay the CSG raymarch on the CPU, recording every step. Mirrors [`pick_entity`]
 /// but keeps the per-step trace so the debug inspector can show where the march
-/// advanced and which bricks it crossed. No GPU readback.
+/// advanced and which bricks it crossed. No GPU readback. Only the editor's debug ray
+/// inspector consumes it, so it's editor-gated (else it's dead in the non-editor build).
+#[cfg(feature = "editor")]
 pub fn debug_capture_march(
     atlas: &SdfAtlas,
     ray: &Ray,
