@@ -42,18 +42,18 @@ pub(crate) mod bc7;
 pub mod bvh;
 pub mod chunk;
 #[cfg(feature = "editor")]
-pub mod debug;
+pub(crate) mod debug;
 pub(crate) mod editor_camera;
 pub mod edits;
-pub mod gallery;
+pub(crate) mod gallery;
 pub mod gizmo;
 pub(crate) mod height;
-pub mod node_gizmos;
+pub(crate) mod node_gizmos;
 pub(crate) mod overlays;
 pub(crate) mod picking;
 pub mod render;
 pub(crate) mod scatter;
-pub mod stress;
+pub(crate) mod stress;
 pub mod textures;
 pub(crate) mod tower_field;
 

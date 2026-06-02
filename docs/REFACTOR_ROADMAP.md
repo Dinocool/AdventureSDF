@@ -369,7 +369,7 @@ into compiler-enforced invariants.
   ~60 lines of mirrored logic removed. *Risk:* the extracted fns take plain `&mut` refs (not ResMut);
   the lifecycle tests guard behavior. Natural follow-on to M2.
 
-### [~] A3. Demote the `sdf_render` submodule tree + items from blanket `pub` to `pub(crate)`
+### [x] A3. Demote the `sdf_render` submodule tree + items from blanket `pub` to `pub(crate)`
 > **Module-level sweep done (7 modules); item-level + dead-code cleanup deferred.** Only 6 submodules
 > are reached externally (the `tests/` crate + the binary: `atlas`, `bake_scheduler`, `bvh`, `chunk`,
 > `edits`, `render`) — those stay `pub mod`. Demoted the 7 cleanly-internal ones to `pub(crate) mod`
