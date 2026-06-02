@@ -430,6 +430,7 @@ pub fn schedule_bakes(
     config: Res<SdfGridConfig>,
     volumes: Query<VolumeQueryData, With<SdfVolume>>,
     changed: Query<Entity, (With<SdfVolume>, ChangedEdit)>,
+    mut removed: RemovedComponents<SdfVolume>,
     camera: Query<&Transform, (With<SdfCamera>, Without<SdfVolume>)>,
     mut baked_dbg: ResMut<super::BakedBrickDebug>,
     time: Res<Time>,
@@ -455,19 +456,20 @@ pub fn schedule_bakes(
     }
 
     // --- 1. Edit changes → dirty affected chunks (within current windows) ------------
-    // `sched_gather` runs EVERY frame (change detection over all volumes) — instrumented
-    // separately from the conditional re-dirty so a trace shows the fixed per-frame floor.
-    let g_gather = info_span!("sched_gather").entered();
-    let gathered = gather_sorted_edits(&volumes);
-    let current: std::collections::HashMap<Entity, bevy::math::bounding::Aabb3d> =
-        gathered.iter().map(|g| (g.entity, g.aabb)).collect();
-    let set_changed = current.len() != prev_aabbs.map.len()
-        || current.keys().any(|e| !prev_aabbs.map.contains_key(e));
-    let edits_changed = atlas.rebake_all || set_changed || !changed.is_empty();
-    drop(g_gather);
-
-    let g_edit = info_span!("sched_edit_detect", changed = edits_changed).entered();
-    if edits_changed {
+    // CHANGE-DETECTION GATE: `gather_sorted_edits` (collect + sort all volumes + a matrix-inverse +
+    // 8-corner AABB per edit) and the per-edit BVH rebuild are the ~3 ms every-frame floor. SKIP them
+    // on a frame where no edit changed — detected cheaply, WITHOUT touching all ~14.6k volumes, from
+    // Bevy change detection: `changed` (`Changed` covers both moves AND adds — a fresh component reads
+    // as changed) plus `RemovedComponents` for despawns. The cached `sched.edits`/`bvh` stay valid, so
+    // the recenter still resolves geometry. `read().count()` drains the events so they don't re-fire.
+    let any_removed = removed.read().count() > 0;
+    if atlas.rebake_all || !changed.is_empty() || any_removed {
+        let _g_gather = info_span!("sched_gather").entered();
+        let gathered = gather_sorted_edits(&volumes);
+        let current: std::collections::HashMap<Entity, bevy::math::bounding::Aabb3d> =
+            gathered.iter().map(|g| (g.entity, g.aabb)).collect();
+        let set_changed = current.len() != prev_aabbs.map.len()
+            || current.keys().any(|e| !prev_aabbs.map.contains_key(e));
         let resolved: Vec<edits::ResolvedEdit> = gathered.iter().map(|g| g.edit.clone()).collect();
         let aabbs: Vec<bevy::math::bounding::Aabb3d> = gathered.iter().map(|g| g.aabb).collect();
         let new_bvh = bvh::Bvh::build(&aabbs);
@@ -542,7 +544,6 @@ pub fn schedule_bakes(
         }
         prev_aabbs.map = current;
     }
-    drop(g_edit);
 
     // --- 2. Camera chunk-ring recenter (eager enter + immediate evict, absolute addressing) ----
     // Entered chunks with geometry are enqueued for a bake; EXITED chunks are evicted immediately
