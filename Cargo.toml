@@ -15,10 +15,15 @@ editor = [
     # hook installs (see `load_renderdoc` in main.rs).
     "dep:renderdoc",
     "dep:libloading",
-    # Chrome-tracing profiler. Writes `trace-<timestamp>.json` on exit (load in Perfetto /
-    # chrome://tracing, or hand the file to Claude to rank hot spans). Captures every Bevy
-    # system + render-graph node span plus our own `info_span!` SDF spans.
-    "bevy/trace_chrome",
+    # Chrome-tracing profiler, RUNTIME-TOGGLEABLE from the editor (Performance panel),
+    # OFF by default. We enable `bevy/trace` for the instrumentation (every Bevy system +
+    # render-graph node span plus our own `info_span!` SDF spans) but NOT `bevy/trace_chrome`
+    # — that feature installs an always-on chrome layer capturing the whole session. Instead
+    # we install our OWN chrome layer (via `LogPlugin::custom_layer`) gated behind an atomic
+    # the editor flips, so capture starts/stops live. Writes `trace-<timestamp>.json` (load
+    # in Perfetto / chrome://tracing, or hand the file to Claude to rank hot spans).
+    "bevy/trace",
+    "dep:tracing-chrome",
 ]
 # Faster incremental compiles via dynamic linking of Bevy. Dev-only — never ship.
 # (Disable with `--no-default-features` when capturing in RenderDoc, which can't inject
@@ -48,6 +53,9 @@ egui_dock = { version = "0.18", optional = true }
 # graphics hook installs before the wgpu device exists.
 renderdoc = { version = "0.12", optional = true }
 libloading = { version = "0.8", optional = true }
+# Editor-only Chrome-tracing layer, installed by us (not via `bevy/trace_chrome`) so the
+# editor can start/stop capture at runtime. See `editor::chrome_trace`.
+tracing-chrome = { version = "0.7", optional = true }
 # Phosphor icon font for the editor toolbar (egui 0.33-compatible). Installed into the
 # egui context at startup; gives named glyph constants so toolbar buttons show real icons.
 egui-phosphor = { version = "0.11", optional = true }

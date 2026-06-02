@@ -6,6 +6,7 @@ use bevy::prelude::*;
 
 pub mod asset_inspector;
 pub mod assets_browser;
+pub mod chrome_trace;
 pub mod config;
 pub mod dock;
 pub mod fs_util;
@@ -109,6 +110,9 @@ impl Plugin for EditorPlugin {
         );
 
         keybinds::plugin(app);
+
+        // F6 toggles chrome-trace capture (global, like F5 for RenderDoc).
+        app.add_systems(Update, chrome_trace::toggle_on_f6);
 
         // Gizmo transform tools (mode + snap) now live in the viewport toolbar
         // (see `dock::viewport_toolbar`), so there's no separate Transform panel.
