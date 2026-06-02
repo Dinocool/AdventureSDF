@@ -449,7 +449,7 @@ The whole `editor/` tree is feature-gated -- **build `--features editor` to catc
   generic-over-trait-object ergonomics can get fiddly; skip if the generic ends up more complex than
   the two loops it replaces.
 
-### [ ] E3. Extract a shared file-picker body from the Open/Save-As modals
+### [x] E3. Extract a shared file-picker body from the Open/Save-As modals
 `impact: medium` * `effort: medium` * `source: editor-structure`
 
 - *Now:* `scene_browser.rs:74-145` (open) vs `:173-279` (save) are ~70% the same: window scaffolding,
