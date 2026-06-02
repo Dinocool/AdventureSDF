@@ -135,9 +135,11 @@ fn brick_tile_bytes(tiles: &[BrickTile]) -> Vec<u8> {
 }
 
 // --- shader composition ----------------------------------------------------------------------
-const SDF_MODULES: [&str; 3] = [
+const SDF_MODULES: [&str; 4] = [
     "assets/shaders/sdf/bindings.wgsl",
     "assets/shaders/sdf/brick.wgsl",
+    // march before shadows: soft_shadow now imports sdf::march::lod_crossfade.
+    "assets/shaders/sdf/march.wgsl",
     "assets/shaders/sdf/shadows.wgsl",
 ];
 
