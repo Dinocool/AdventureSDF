@@ -11,7 +11,10 @@
   the Vulkan backend (SPIR-V), which this script forces via WGPU_BACKEND=vulkan.
 
 .PREREQUISITES
-  cargo build --features editor,shader-debug
+  cargo build --no-default-features --features editor,shader-debug
+  (--no-default-features drops `fast`/dynamic_linking; Nsight's injector cannot attach to a
+   dynamically-linked Bevy -- the launch fails with "process exited / searching for child
+   processes". A static build is required for any injected capture, same as RenderDoc.)
 
 .USAGE
   powershell -ExecutionPolicy Bypass -File rdoc/scripts/ngfx/capture.ps1
