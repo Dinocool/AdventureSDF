@@ -150,6 +150,18 @@ impl TabViewer for EditorTabViewer<'_> {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, tab: &mut Self::Tab) {
+        // Per-panel span so a chrome trace attributes the egui-pass cost panel-by-panel
+        // (perf roadmap E4 — measure before cutting).
+        let _span = match tab {
+            EditorTab::Scene(_) => bevy::log::info_span!("panel_viewport"),
+            EditorTab::NoScene => bevy::log::info_span!("panel_noscene"),
+            EditorTab::Hierarchy => bevy::log::info_span!("panel_hierarchy"),
+            EditorTab::Inspector => bevy::log::info_span!("panel_inspector"),
+            EditorTab::ProjectFiles => bevy::log::info_span!("panel_project_files"),
+            EditorTab::AssetsDrawer => bevy::log::info_span!("panel_assets"),
+            EditorTab::Registered(_) => bevy::log::info_span!("panel_registered"),
+        }
+        .entered();
         match tab {
             EditorTab::Scene(id) => {
                 // Only the active scene tab's `ui()` runs (egui_dock renders one tab per
@@ -294,10 +306,12 @@ pub fn show_editor_dock(world: &mut World) {
     };
     let ctx = egui_ctx.into_inner().get_mut().clone();
 
-    super::menu_bar::menu_bar_ui(world, &ctx);
+    // Section spans so a chrome trace breaks the editor egui pass into its parts.
+    bevy::log::info_span!("editor_menu_bar").in_scope(|| super::menu_bar::menu_bar_ui(world, &ctx));
     super::scene_browser::open_scene_dialog_ui(world, &ctx);
     super::scene_browser::save_scene_dialog_ui(world, &ctx);
-    super::status_bar::status_bar_ui(world, &ctx);
+    bevy::log::info_span!("editor_status_bar")
+        .in_scope(|| super::status_bar::status_bar_ui(world, &ctx));
     super::layout::layouts_ui(world, &ctx);
     super::notifications::notifications_ui(world, &ctx);
 
@@ -319,10 +333,13 @@ pub fn show_editor_dock(world: &mut World) {
     // tab set are current this frame.
     let type_registry = world.resource::<AppTypeRegistry>().clone();
     scene_tabs::drain_requests(world, &mut dock, &type_registry);
-    scene_tabs::refresh_active_dirty(world, &type_registry);
+    // Throttled, but on the frame it runs this serializes the whole scene — span it.
+    bevy::log::info_span!("editor_dirty_check")
+        .in_scope(|| scene_tabs::refresh_active_dirty(world, &type_registry));
 
     let mut viewport_rect = dock.viewport_rect;
     {
+        let _dock_span = bevy::log::info_span!("editor_dockarea").entered();
         let mut viewer = EditorTabViewer {
             world,
             registry: &registry,
