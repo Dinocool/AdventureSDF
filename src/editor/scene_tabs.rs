@@ -302,7 +302,7 @@ fn activate(world: &mut World, dock: &mut EditorDockState, registry: &AppTypeReg
 }
 
 /// The main-surface leaf hosting the scene tabs (or the empty-state placeholder).
-fn center_leaf(dock: &EditorDockState) -> Option<NodeIndex> {
+pub(crate) fn center_leaf(dock: &EditorDockState) -> Option<NodeIndex> {
     dock.state
         .main_surface()
         .iter()
@@ -315,8 +315,16 @@ fn center_leaf(dock: &EditorDockState) -> Option<NodeIndex> {
         })
 }
 
-fn is_center_tab(tab: &EditorTab) -> bool {
+/// Whether `tab` belongs to the center "scene box" (a scene view or the empty placeholder).
+pub(crate) fn is_center_tab(tab: &EditorTab) -> bool {
     matches!(tab, EditorTab::Scene(_) | EditorTab::NoScene)
+}
+
+/// The ids of all open scenes in dock-tab order, plus the active id (for re-injecting the
+/// scene box when a layout is applied). Empty list ⇒ the empty-state placeholder.
+pub fn scene_tab_ids(world: &World) -> (Vec<SceneId>, Option<SceneId>) {
+    let open = world.resource::<OpenScenes>();
+    (open.docs.iter().map(|d| d.id).collect(), open.active)
 }
 
 /// Append `tab` into the center (scene) leaf, falling back to the first leaf.

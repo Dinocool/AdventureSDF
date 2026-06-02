@@ -48,7 +48,7 @@ ron = "0.12"
 serde = { version = "1", features = ["derive"] }
 # Offline BC7 encode of the PBR texture arrays (cached to disk; ~1/6 the VRAM).
 intel_tex_2 = "0.2"
-egui_dock = { version = "0.18", optional = true }
+egui_dock = { version = "0.18", optional = true, features = ["serde"] }
 # In-app RenderDoc capture, editor-only. `libloading` preloads renderdoc.dll early so the
 # graphics hook installs before the wgpu device exists.
 renderdoc = { version = "0.12", optional = true }
