@@ -23,6 +23,7 @@ pub mod registry;
 pub mod renderdoc_capture;
 pub mod resource_picker;
 pub mod scene_browser;
+pub mod scene_tabs;
 pub mod selection;
 pub mod status_bar;
 pub mod transform_editor;
@@ -49,6 +50,7 @@ impl Plugin for EditorPlugin {
         .init_resource::<menu_bar::CurrentScenePath>()
         .init_resource::<scene_browser::OpenSceneDialog>()
         .init_resource::<scene_browser::SaveSceneDialog>()
+        .init_resource::<scene_tabs::OpenScenes>()
         .init_resource::<inspector::InspectorOverrides>()
         .register_type::<import_settings::ImageFilter>()
         .register_type::<import_settings::ColorSpace>()

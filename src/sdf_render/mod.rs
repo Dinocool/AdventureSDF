@@ -247,6 +247,37 @@ impl Default for SdfOrbitCamera {
     }
 }
 
+impl SdfOrbitCamera {
+    /// Eye (camera) position for the current orbit parameters.
+    pub fn eye(&self) -> Vec3 {
+        self.target
+            + Vec3::new(
+                self.distance * self.yaw.cos() * self.pitch.cos(),
+                self.distance * self.pitch.sin(),
+                self.distance * self.yaw.sin() * self.pitch.cos(),
+            )
+    }
+
+    /// View transform (eye placed on the orbit sphere, looking at the target). Single
+    /// source for the orbit→transform mapping used by `orbit_camera`, focus easing, and
+    /// the immediate re-sync after a scene swap.
+    pub fn view_transform(&self) -> Transform {
+        Transform::from_translation(self.eye()).looking_at(self.target, Vec3::Y)
+    }
+}
+
+/// Apply the orbit resource to the SDF camera's transform right now. `orbit_camera` only
+/// runs while the pointer is in the viewport, so after a scene swap restores a per-scene
+/// camera we sync here — otherwise the view wouldn't update (it'd "jump" later, once the
+/// cursor re-enters the viewport).
+pub fn sync_orbit_camera_transform(world: &mut World) {
+    let transform = world.resource::<SdfOrbitCamera>().view_transform();
+    let mut query = world.query_filtered::<&mut Transform, With<SdfCamera>>();
+    for mut t in query.iter_mut(world) {
+        *t = transform;
+    }
+}
+
 /// SDF editor camera mode. Default is the orbit camera; the viewport toolbar toggles
 /// `fps` to switch to a free-fly (WASD + mouse-look) camera, useful for flying out
 /// across the km-scale clipmap terrain instead of orbiting a point.
@@ -739,15 +770,9 @@ fn orbit_camera(
     }
 
     // Always recompute so zoom/pan/orbit all apply immediately.
-    let pos = orbit.target
-        + Vec3::new(
-            orbit.distance * orbit.yaw.cos() * orbit.pitch.cos(),
-            orbit.distance * orbit.pitch.sin(),
-            orbit.distance * orbit.yaw.sin() * orbit.pitch.cos(),
-        );
-
+    let view = orbit.view_transform();
     for mut transform in &mut camera_query {
-        *transform = Transform::from_translation(pos).looking_at(orbit.target, Vec3::Y);
+        *transform = view;
     }
 }
 
@@ -774,14 +799,9 @@ fn ease_orbit_focus(
         focus.target = None;
     }
 
-    let pos = orbit.target
-        + Vec3::new(
-            orbit.distance * orbit.yaw.cos() * orbit.pitch.cos(),
-            orbit.distance * orbit.pitch.sin(),
-            orbit.distance * orbit.yaw.sin() * orbit.pitch.cos(),
-        );
+    let view = orbit.view_transform();
     for mut transform in &mut camera_query {
-        *transform = Transform::from_translation(pos).looking_at(orbit.target, Vec3::Y);
+        *transform = view;
     }
 }
 
