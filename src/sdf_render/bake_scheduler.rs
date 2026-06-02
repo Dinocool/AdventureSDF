@@ -233,13 +233,8 @@ pub fn ring_chunk_origin(config: &SdfGridConfig, camera_pos: Vec3, lod: u32) -> 
         cam_chunk.y.div_euclid(snap) * snap,
         cam_chunk.z.div_euclid(snap) * snap,
     );
-    let half = (config.ring_bricks / chunk::CHUNK_BRICKS as u32 / 2) as i32;
+    let half = config.ring_half_chunks();
     cam_chunk_snapped - IVec3::splat(half)
-}
-
-/// Chunks per axis in a ring window.
-fn ring_chunks_per_axis(config: &SdfGridConfig) -> i32 {
-    (config.ring_bricks / chunk::CHUNK_BRICKS as u32) as i32
 }
 
 /// Whether any edit reaches chunk `ck` (its world AABB overlaps an edit in the BVH). A
@@ -449,7 +444,7 @@ pub fn schedule_bakes(
     atlas.gpu_baked_tiles.clear();
     let camera_pos = camera.iter().next().map(|t| t.translation).unwrap_or(Vec3::ZERO);
     let lod_count = config.lod_count;
-    let r = ring_chunks_per_axis(&config);
+    let r = config.ring_chunks_per_axis();
     let first_run = sched.ring_chunk_origin.is_empty();
     if first_run {
         sched.ring_chunk_origin = vec![IVec3::splat(i32::MIN); lod_count as usize];
@@ -945,7 +940,6 @@ fn apply_verdicts(
         }
         i = j;
     }
-    atlas.last_bake_was_full = false;
 }
 
 /// Build the `hash_peek` snapshot: each candidate's resident `baked_hash` (absent → not resident).
@@ -1078,7 +1072,7 @@ fn apply_async_result(
     now_secs: f32,
     out: BakeTaskOutput,
 ) {
-    let r = ring_chunks_per_axis(config);
+    let r = config.ring_chunks_per_axis();
     if out.edit_gen != sched.edit_gen {
         // Whole result stale — re-queue every candidate's chunk (deduped) and bail.
         for (ck, _key) in &out.candidates {
@@ -1213,7 +1207,7 @@ mod tests {
     /// `pending`, evict exited chunks eagerly. Returns the number of geometry chunks enqueued
     /// (for the fly-away starvation bound). `ring_chunk_origin` lives on the scheduler.
     fn recenter_step(sched: &mut BakeScheduler, atlas: &mut SdfAtlas, cfg: &SdfGridConfig, cam: Vec3) -> usize {
-        let r = ring_chunks_per_axis(cfg);
+        let r = cfg.ring_chunks_per_axis();
         if sched.ring_chunk_origin.is_empty() {
             sched.ring_chunk_origin = vec![IVec3::splat(i32::MIN); cfg.lod_count as usize];
         }
@@ -1277,33 +1271,10 @@ mod tests {
         bvh::Bvh::build(&aabbs)
     }
 
-    /// Resolve (chunk, local) through a GPU lookup-buffer pair the way the shader does: direct-index
-    /// the dense directory by `dir_index(ck, r)`, tag-check, then popcount-index the dense tile run.
-    fn resolve_table(
-        rows: &[chunk::ChunkLookup],
-        tiles: &[chunk::BrickTile],
-        r: i32,
-        ck: chunk::ChunkKey,
-        local: u32,
-    ) -> Option<chunk::BrickTile> {
-        let idx = chunk::dir_index(ck, r);
-        if idx >= rows.len() {
-            return None;
-        }
-        let c = rows[idx];
-        if (c.key_hi, c.key_lo) != chunk::chunk_gpu_key(ck) {
-            return None;
-        }
-        let occ = (c.occ_lo as u64) | ((c.occ_hi as u64) << 32);
-        if (occ >> local) & 1 == 0 {
-            return None;
-        }
-        let off = (occ & ((1u64 << local) - 1)).count_ones();
-        Some(tiles[(c.tile_run_base + off) as usize])
-    }
 
-    /// Apply the live table's per-frame delta to a GPU-buffer mirror EXACTLY as `render.rs` does: the
-    /// directory (chunk_buf) is fixed-size so it only "grows" once; otherwise write the dirty
+    /// Apply the live table's per-frame delta to a GPU-buffer mirror EXACTLY as `render.rs` does, by
+    /// routing through the SAME [`chunk::LiveChunkTables::upload`] accessor that owns the
+    /// rebuild-vs-delta + headroom policy: a Full re-sizes the buffers once, a Delta writes the dirty
     /// directory slots + tile-run regions in place (no row shift, no sentinel tail).
     fn apply_table_delta(
         live: &chunk::LiveChunkTables,
@@ -1312,22 +1283,22 @@ mod tests {
         cap_rows: &mut u32,
         cap_slots: &mut u32,
     ) {
-        let needed_rows = live.row_count();
-        let needed_slots = live.tile_run_capacity();
-        if *cap_rows == 0 || needed_rows > *cap_rows || needed_slots > *cap_slots {
-            *cap_rows = needed_rows;
-            *cap_slots = (needed_slots + needed_slots / 2).max(needed_slots + chunk::TILE_RUN_SLOT);
-            let (rws, t) = live.full_tables();
-            *rows = rws;
-            *tiles = t;
-            tiles.resize(*cap_slots as usize, chunk::BrickTile::default());
-        } else {
-            for &row in &live.dirty_rows {
-                rows[row as usize] = live.lookup_at(row);
+        match live.upload(*cap_rows, *cap_slots) {
+            chunk::ChunkUpload::Full { rows: r, tile_run, cap_rows: cr, cap_slots: cs } => {
+                *cap_rows = cr;
+                *cap_slots = cs;
+                *rows = r;
+                *tiles = tile_run;
+                tiles.resize(*cap_slots as usize, chunk::BrickTile::default());
             }
-            for &slot in &live.dirty_slots {
-                let base = (slot * chunk::TILE_RUN_SLOT) as usize;
-                tiles[base..base + chunk::TILE_RUN_SLOT as usize].copy_from_slice(&live.tile_region(slot));
+            chunk::ChunkUpload::Delta { row_updates, region_updates } => {
+                for (row, look) in row_updates {
+                    rows[row as usize] = look;
+                }
+                for (slot, region) in region_updates {
+                    let base = (slot * chunk::TILE_RUN_SLOT) as usize;
+                    tiles[base..base + chunk::TILE_RUN_SLOT as usize].copy_from_slice(&region);
+                }
             }
         }
     }
@@ -1413,12 +1384,12 @@ mod tests {
                     let want = chunk::tile_atlas_base(tile);
                     let (ck, local) = chunk::chunk_of(*key, &cfg);
                     assert_eq!(
-                        resolve_table(&fr, &ft, cfg.ring_bricks as i32 / chunk::CHUNK_BRICKS, ck, local).map(|t| t.atlas_base),
+                        chunk::resolve_via_tables(&fr, &ft, cfg.ring_chunks_per_axis(), ck, local).map(|t| t.atlas_base),
                         Some(want),
                         "step {step}: full_tables resolves brick {key:?} to the wrong/absent tile"
                     );
                     assert_eq!(
-                        resolve_table(&rows, &tiles, cfg.ring_bricks as i32 / chunk::CHUNK_BRICKS, ck, local).map(|t| t.atlas_base),
+                        chunk::resolve_via_tables(&rows, &tiles, cfg.ring_chunks_per_axis(), ck, local).map(|t| t.atlas_base),
                         Some(want),
                         "step {step}: delta-mirror resolves brick {key:?} to the wrong/absent tile"
                     );
@@ -1647,12 +1618,12 @@ mod tests {
                 let want = chunk::tile_atlas_base(tile);
                 let (ck, local) = chunk::chunk_of(*key, &cfg);
                 assert_eq!(
-                    resolve_table(&fr, &ft, cfg.ring_bricks as i32 / chunk::CHUNK_BRICKS, ck, local).map(|t| t.atlas_base),
+                    chunk::resolve_via_tables(&fr, &ft, cfg.ring_chunks_per_axis(), ck, local).map(|t| t.atlas_base),
                     Some(want),
                     "frame {frame} (x={x}): full_tables resolves brick {key:?} to the wrong/absent tile"
                 );
                 assert_eq!(
-                    resolve_table(&rows, &tiles, cfg.ring_bricks as i32 / chunk::CHUNK_BRICKS, ck, local).map(|t| t.atlas_base),
+                    chunk::resolve_via_tables(&rows, &tiles, cfg.ring_chunks_per_axis(), ck, local).map(|t| t.atlas_base),
                     Some(want),
                     "frame {frame} (x={x}): delta-mirror resolves brick {key:?} to the wrong/absent tile"
                 );
@@ -2126,7 +2097,7 @@ mod tests {
         old_aabb: &Aabb3d,
         new_aabb: &Aabb3d,
     ) {
-        let r = ring_chunks_per_axis(cfg);
+        let r = cfg.ring_chunks_per_axis();
         for lod in 0..cfg.lod_count {
             let origin = ring_chunk_origin(cfg, cam, lod);
             for ck in chunks_in_aabb_windowed(cfg, old_aabb, lod, origin, r) {
@@ -2300,7 +2271,7 @@ mod tests {
         let mut atlas = SdfAtlas::default();
         let mut sched = primed_sched(&edits);
         // Settle at the start camera (orbit default ~10 units out).
-        let r = ring_chunks_per_axis(&cfg);
+        let r = cfg.ring_chunks_per_axis();
         settle_gpu(&mut sched, &mut atlas, &cfg, Vec3::new(0.0, 5.0, 10.0));
         eprintln!("LOD-WALK: settled, resident bricks = {}", atlas.bricks.len());
 
@@ -2416,7 +2387,7 @@ mod tests {
     #[test]
     fn ring_window_is_chunks_per_axis() {
         let cfg = config();
-        let r = ring_chunks_per_axis(&cfg);
+        let r = cfg.ring_chunks_per_axis();
         assert_eq!(r, (cfg.ring_bricks / chunk::CHUNK_BRICKS as u32) as i32);
         assert!(r >= 1, "ring must be at least one chunk wide");
     }
@@ -2427,7 +2398,7 @@ mod tests {
     #[test]
     fn ring_origin_centres_camera_chunk() {
         let cfg = config();
-        let r = ring_chunks_per_axis(&cfg);
+        let r = cfg.ring_chunks_per_axis();
         let half = r / 2;
         for lod in 0..cfg.lod_count {
             // A few world positions, including off-origin and negative.
