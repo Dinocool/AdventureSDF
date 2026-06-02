@@ -66,6 +66,7 @@ fn camera_uniform_bytes(config: &SdfGridConfig, camera_pos: Vec3) -> Vec<u8> {
     // grid_dims is the 7th field (offset 48 + 4*3 = 60). grid_dims.z = brick_size.
     f[62] = config.brick_size as f32;
     f[67] = config.recenter_snap_chunks as f32; // debug_params.w
+    f[69] = 8.0; // march_params.y = shadow_softness k (low value to stress the band-edge onset)
     f[72] = config.lod_count as f32; // lod_params.x
     f[73] = config.ring_bricks as f32; // lod_params.y
     f[74] = config.voxel_size; // lod_params.z

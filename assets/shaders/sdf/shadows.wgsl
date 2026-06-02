@@ -81,7 +81,14 @@ fn soft_shadow(origin: vec3<f32>, light_dir: vec3<f32>, mint: f32, max_t: f32, k
         // at coarse LOD, where band ≥ the old hardcoded 1.0 ceiling, but obvious near LOD 0.)
         let valid_band = (DIST_BAND_VOXELS - PENUMBRA_BAND_MARGIN_VOXELS) * vs;
         if (d < valid_band) {
-            res = min(res, k * d / t);
+            // Fade the penumbra contribution to NOTHING as `d` approaches the band edge. The clamp
+            // band limits how far the field can SEE an occluder, so a sample near the edge is "maybe
+            // much farther" and must not darken the result. Without this fade, a low `k` makes the
+            // first in-band sample `k*d/t` < 1 right at the edge → a hard dark onset (1 → dark in one
+            // step), which is the artifact the Shadow Softness slider exposed at low values. Now the
+            // onset is smooth at every `k`; confident darkening only well inside the band.
+            let conf = smoothstep(valid_band, valid_band * 0.5, d);
+            res = min(res, mix(1.0, k * d / t, conf));
         }
         // Sphere-trace by the unbounding sphere `d`, floored so we never stall and capped at the
         // brick exit so the next `resolve_march` re-picks the LOD across bricks. A saturated `d` is
