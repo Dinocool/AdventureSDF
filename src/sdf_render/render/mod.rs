@@ -21,9 +21,11 @@ use bevy::tasks::{AsyncComputeTaskPool, Task, block_on, poll_once};
 use super::atlas::{BRICK_EDGE, SdfAtlas};
 use super::{SdfCamera, SdfGridConfig, SdfRenderEnabled};
 
-// The GPU brick-bake compute path (extract/prepare/dispatch/blit) lives in its own submodule; it
-// reaches the shared render types here via `use super::*`.
+// Concern-specific submodules of the render path (bake compute, cone prepass, PBR texture
+// streaming); each reaches the shared render types here via `use super::*`.
 mod bake;
+mod cone;
+mod pbr_textures;
 
 // --- GPU Types ---
 
@@ -209,51 +211,16 @@ struct SdfGpuAtlas {
     tex_sampler: Option<Sampler>,
 }
 
-/// One variant's encoded BC7 maps + its destination array layer, produced by a
-/// background task and consumed by the upload poll system.
-struct EncodedVariant {
-    layer: u32,
-    maps: super::textures::VariantBc7,
-}
-
-/// Render-world streaming state for the PBR texture arrays: the fallback-filled,
-/// full-size destination textures and the in-flight per-variant encode tasks. Layers
-/// are `write_texture`d in as their tasks finish, so first-run BC7 encoding never
-/// blocks the render thread — materials show the magenta fallback until their layer
-/// arrives.
-#[derive(Resource, Default)]
-struct TextureStreamState {
-    /// Destination BC7 array textures (kept alive so layer uploads stay valid).
-    textures: Vec<Texture>,
-    /// Background encode tasks, drained as they complete.
-    tasks: Vec<Task<EncodedVariant>>,
-    /// Whether the (fixed-cap) arrays were allocated (one-shot allocation guard).
-    allocated: bool,
-    /// How many variants have had an encode task spawned. Grows as the demand-driven
-    /// library appends variants; we spawn tasks for `[spawned_layers, variants.len())`.
-    spawned_layers: u32,
-}
-
 /// Material table extracted from the main world for GPU upload.
 #[derive(Resource, Default)]
 struct ExtractedSdfMaterials {
     materials: Vec<GpuSdfMaterial>,
 }
 
-/// The texture library extracted from the main world. `variants` grows on demand as
-/// materials reference new textures; index = GPU array layer. The render world
-/// streams any layers that appear beyond what it has already uploaded.
-#[derive(Resource, Default)]
-struct ExtractedTextureLibrary {
-    variants: Vec<crate::assets::MapSet>,
-}
-
 // --- Pipeline ---
 
 // BISECT: minimal shader while building features back up after the division-free fix.
 const SDF_SHADER_PATH: &str = "shaders/sdf_raymarch.wgsl";
-/// Cone-prepass compute shader (per-tile seed-distance march).
-const SDF_CONE_SHADER_PATH: &str = "shaders/sdf_cone_prepass.wgsl";
 
 #[derive(Resource)]
 struct SdfPipeline {
@@ -315,35 +282,6 @@ struct SdfGBuffer {
     size: UVec2,
 }
 
-/// Compute pipeline + layouts for the cone prepass (one tile-cone march per 8×8 tile,
-/// writing per-tile seed distances). Reuses the SDF camera (layout_0) and atlas (layout_1)
-/// bind groups; `layout_2` is the write-only storage texture.
-#[derive(Resource)]
-struct SdfConePipeline {
-    pipeline_id: CachedComputePipelineId,
-    layout_2: BindGroupLayoutDescriptor,
-}
-
-/// Per-tile seed-distance texture written by the cone prepass and read by the fragment
-/// march. R32Float, one texel per 8×8 screen tile. Sized for 4K (480×270 tiles); the
-/// compute shader and fragment both bounds-check against the actual viewport.
-#[derive(Resource)]
-struct SdfConePrepass {
-    /// Storage-write view for the compute pass.
-    storage_view: TextureView,
-    /// Sampled (textureLoad) view for the fragment pass — same texture.
-    read_view: TextureView,
-}
-
-/// Screen-tile edge in pixels. MUST match `TILE` in sdf_cone_prepass.wgsl and the divisor
-/// the fragment pass uses to index the seed texture.
-const CONE_TILE: u32 = 8;
-/// Seed-texture capacity in tiles (covers 4K: ceil(3840/8) × ceil(2160/8)).
-const CONE_TEX_TILES_X: u32 = 480;
-const CONE_TEX_TILES_Y: u32 = 270;
-
-#[derive(Resource)]
-struct SdfConeShaderHandle(Handle<Shader>);
 
 #[derive(Resource, Default)]
 pub struct SdfShaderDefs {
@@ -366,6 +304,38 @@ fn create_dummy_bg0(device: &RenderDevice, layout: &BindGroupLayout) -> BindGrou
         "sdf_bind_group_0_empty",
         layout,
         &BindGroupEntries::sequential((camera_buf.as_entire_buffer_binding(),)),
+    )
+}
+
+/// Build the 12-entry atlas bind group (group 1): dist view + sampler, chunk-lookup buffer, mat
+/// view + material buffer, the PBR texture sampler + 5 array views, and the packed chunk-tile
+/// buffer. Shared VERBATIM by the G-buffer fragment pass ([`SdfGBufferNode`]) and the cone prepass
+/// ([`cone::SdfConeNode`]) — was copy-pasted in both. Every binding is required; panics if the atlas
+/// isn't fully initialized (the nodes already early-out before this when resources are missing).
+fn atlas_bind_group_1(
+    device: &RenderDevice,
+    layout: &BindGroupLayout,
+    gpu_atlas: &SdfGpuAtlas,
+    label: &str,
+) -> BindGroup {
+    let tex_views = gpu_atlas.tex_array_views.as_ref().unwrap();
+    device.create_bind_group(
+        label,
+        layout,
+        &BindGroupEntries::sequential((
+            gpu_atlas.dist_view.as_ref().unwrap(),
+            gpu_atlas.sampler.as_ref().unwrap(),
+            gpu_atlas.lookup_buffer.as_ref().unwrap().as_entire_buffer_binding(),
+            gpu_atlas.mat_view.as_ref().unwrap(),
+            gpu_atlas.material_buffer.as_ref().unwrap().as_entire_buffer_binding(),
+            gpu_atlas.tex_sampler.as_ref().unwrap(),
+            &tex_views[0],
+            &tex_views[1],
+            &tex_views[2],
+            &tex_views[3],
+            &tex_views[4],
+            gpu_atlas.chunk_tile_buffer.as_ref().unwrap().as_entire_buffer_binding(),
+        )),
     )
 }
 
@@ -466,40 +436,10 @@ impl ViewNode for SdfGBufferNode {
 
         // Bind group 1: atlas (always available — dummy in init)
         let gpu_atlas = world.resource::<SdfGpuAtlas>();
-        let tex_views = gpu_atlas.tex_array_views.as_ref().unwrap();
-        let bind_group_1 = device.create_bind_group(
-            "sdf_bind_group_1",
-            &layout_1,
-            &BindGroupEntries::sequential((
-                gpu_atlas.dist_view.as_ref().unwrap(),
-                gpu_atlas.sampler.as_ref().unwrap(),
-                gpu_atlas
-                    .lookup_buffer
-                    .as_ref()
-                    .unwrap()
-                    .as_entire_buffer_binding(),
-                gpu_atlas.mat_view.as_ref().unwrap(),
-                gpu_atlas
-                    .material_buffer
-                    .as_ref()
-                    .unwrap()
-                    .as_entire_buffer_binding(),
-                gpu_atlas.tex_sampler.as_ref().unwrap(),
-                &tex_views[0],
-                &tex_views[1],
-                &tex_views[2],
-                &tex_views[3],
-                &tex_views[4],
-                gpu_atlas
-                    .chunk_tile_buffer
-                    .as_ref()
-                    .unwrap()
-                    .as_entire_buffer_binding(),
-            )),
-        );
+        let bind_group_1 = atlas_bind_group_1(device, &layout_1, gpu_atlas, "sdf_bind_group_1");
 
         // Bind group 2: cone-prepass seed texture (per-tile start distance).
-        let prepass = world.resource::<SdfConePrepass>();
+        let prepass = world.resource::<cone::SdfConePrepass>();
         let bind_group_2 = device.create_bind_group(
             "sdf_bind_group_2",
             &layout_2,
@@ -679,7 +619,7 @@ impl Plugin for SdfRenderPlugin {
         // Load shader asset in main world so it's available for extraction
         let asset_server = app.world().resource::<AssetServer>();
         let shader_handle = asset_server.load(SDF_SHADER_PATH);
-        let cone_shader_handle: Handle<Shader> = asset_server.load(SDF_CONE_SHADER_PATH);
+        let cone_shader_handle: Handle<Shader> = asset_server.load(cone::SDF_CONE_SHADER_PATH);
         let bake_shader_handle: Handle<Shader> = asset_server.load(bake::SDF_BAKE_SHADER_PATH);
         let combine_shader_handle: Handle<Shader> = asset_server.load(SDF_COMBINE_SHADER_PATH);
         // Load + retain the imported modules (Custom-path imports aren't auto-loaded).
@@ -724,7 +664,7 @@ impl Plugin for SdfRenderPlugin {
 
         // Pass shader handles directly to render app (RenderStartup runs before Extract)
         render_app.insert_resource(SdfShaderHandle(shader_handle));
-        render_app.insert_resource(SdfConeShaderHandle(cone_shader_handle));
+        render_app.insert_resource(cone::SdfConeShaderHandle(cone_shader_handle));
         render_app.insert_resource(bake::SdfBakeShaderHandle(bake_shader_handle));
         render_app.insert_resource(SdfCombineShaderHandle(combine_shader_handle));
         render_app.init_resource::<SdfGBuffer>();
@@ -732,10 +672,10 @@ impl Plugin for SdfRenderPlugin {
         render_app
             .add_systems(ExtractSchedule, extract_sdf_atlas)
             .add_systems(ExtractSchedule, extract_sdf_materials)
-            .add_systems(ExtractSchedule, extract_texture_library)
+            .add_systems(ExtractSchedule, pbr_textures::extract_texture_library)
             .add_systems(ExtractSchedule, extract_shader_defs)
             .add_systems(ExtractSchedule, bake::extract_brick_bakes)
-            .init_resource::<TextureStreamState>()
+            .init_resource::<pbr_textures::TextureStreamState>()
             .init_resource::<LastAtlasGen>()
             .init_resource::<AtlasCapacity>()
             .init_resource::<ChunkBufCapacity>()
@@ -743,16 +683,19 @@ impl Plugin for SdfRenderPlugin {
             .add_systems(Render, bake::prepare_brick_bake_buffers.before(prepare_sdf_atlas_gpu))
             .add_systems(Render, prepare_sdf_atlas_gpu)
             .add_systems(Render, prepare_sdf_materials_gpu)
-            .add_systems(Render, init_texture_streaming)
-            .add_systems(Render, upload_texture_layers.after(init_texture_streaming))
+            .add_systems(Render, pbr_textures::init_texture_streaming)
+            .add_systems(
+                Render,
+                pbr_textures::upload_texture_layers.after(pbr_textures::init_texture_streaming),
+            )
             .add_systems(Render, rebuild_pipeline_on_def_change)
             .add_systems(Render, prepare_sdf_gbuffer)
             .add_systems(RenderStartup, init_sdf_pipeline)
-            .add_systems(RenderStartup, init_cone_pipeline.after(init_sdf_pipeline))
+            .add_systems(RenderStartup, cone::init_cone_pipeline.after(init_sdf_pipeline))
             .add_systems(RenderStartup, bake::init_bake_pipeline.after(init_sdf_pipeline))
             .add_systems(RenderStartup, init_combine_pipeline.after(init_sdf_pipeline))
             .add_render_graph_node::<bake::SdfBrickBakeNode>(Core3d, bake::SdfBrickBakeLabel)
-            .add_render_graph_node::<ViewNodeRunner<SdfConeNode>>(Core3d, SdfConeLabel)
+            .add_render_graph_node::<ViewNodeRunner<cone::SdfConeNode>>(Core3d, cone::SdfConeLabel)
             .add_render_graph_node::<ViewNodeRunner<SdfGBufferNode>>(Core3d, SdfGBufferLabel)
             .add_render_graph_node::<ViewNodeRunner<SdfCombineNode>>(Core3d, SdfCombineLabel)
             // The brick-bake compute pass writes the atlas BEFORE the view passes read it,
@@ -770,7 +713,7 @@ impl Plugin for SdfRenderPlugin {
                 (
                     Node3d::MainOpaquePass,
                     bake::SdfBrickBakeLabel,
-                    SdfConeLabel,
+                    cone::SdfConeLabel,
                     SdfGBufferLabel,
                     SdfCombineLabel,
                     Node3d::MainTransparentPass,
@@ -1230,194 +1173,6 @@ fn prepare_sdf_materials_gpu(
         usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
     });
     gpu_atlas.material_buffer = Some(buffer);
-}
-
-// --- Extract + upload: PBR texture-array library ---
-
-fn extract_texture_library(
-    library: Extract<Res<crate::assets::MaterialTextureLibrary>>,
-    mut commands: Commands,
-) {
-    commands.insert_resource(ExtractedTextureLibrary {
-        variants: library.variants.clone(),
-    });
-}
-
-/// BC7 array formats per `MapArray`: sRGB for diffuse (0), linear for the rest.
-const PBR_ARRAY_FORMATS: [TextureFormat; super::edits::MATERIAL_TEX_MAPS] = [
-    TextureFormat::Bc7RgbaUnormSrgb,
-    TextureFormat::Bc7RgbaUnorm,
-    TextureFormat::Bc7RgbaUnorm,
-    TextureFormat::Bc7RgbaUnorm,
-    TextureFormat::Bc7RgbaUnorm,
-];
-
-/// One-shot: once the extracted library is available, create the 5 EMPTY BC7 arrays
-/// at full size, point the bind-group views at them, and spawn one background encode
-/// task per variant. No GPU upload here — layers stream in via `upload_texture_layers`
-/// as tasks finish, so the first-run BC7 encode never blocks the render thread.
-fn init_texture_streaming(
-    device: Res<RenderDevice>,
-    queue: Res<RenderQueue>,
-    extracted: Option<Res<ExtractedTextureLibrary>>,
-    mut gpu_atlas: ResMut<SdfGpuAtlas>,
-    mut stream: ResMut<TextureStreamState>,
-) {
-    use super::textures::TEXTURE_SIZE;
-    use crate::assets::MAX_TEXTURE_LAYERS;
-
-    // 1) Allocate the fixed-cap arrays once (the moment the render device is up). The
-    // arrays are sized to MAX_TEXTURE_LAYERS so the demand-driven library can append
-    // variants without ever recreating the textures or rebuilding the bind group.
-    if !stream.allocated {
-        let mips = super::bc7::mip_count(TEXTURE_SIZE);
-        let labels = [
-            "sdf_tex_diffuse",
-            "sdf_tex_normal",
-            "sdf_tex_mra",
-            "sdf_tex_height",
-            "sdf_tex_edge",
-        ];
-        // Per-map fallback fill shown until a layer streams in: magenta diffuse (an
-        // obvious "loading" colour), NEUTRAL data maps so lit surfaces still look sane
-        // (flat normal, mid-rough/unoccluded MRA, zero height, no edge wear).
-        let fallback: [[u8; 4]; super::edits::MATERIAL_TEX_MAPS] = [
-            [255, 0, 255, 255],
-            [128, 128, 255, 255],
-            [0, 255, 255, 255],
-            [0, 0, 0, 255],
-            [0, 0, 0, 255],
-        ];
-
-        let mut textures = Vec::with_capacity(super::edits::MATERIAL_TEX_MAPS);
-        let views: [TextureView; super::edits::MATERIAL_TEX_MAPS] = std::array::from_fn(|i| {
-            let fill = super::bc7::solid_fill_bc7(fallback[i], TEXTURE_SIZE, MAX_TEXTURE_LAYERS);
-            let tex = device.create_texture_with_data(
-                &queue,
-                &TextureDescriptor {
-                    label: Some(labels[i]),
-                    size: Extent3d {
-                        width: TEXTURE_SIZE,
-                        height: TEXTURE_SIZE,
-                        depth_or_array_layers: MAX_TEXTURE_LAYERS,
-                    },
-                    mip_level_count: mips,
-                    sample_count: 1,
-                    dimension: TextureDimension::D2,
-                    format: PBR_ARRAY_FORMATS[i],
-                    usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST,
-                    view_formats: &[],
-                },
-                TextureDataOrder::LayerMajor,
-                &fill.data,
-            );
-            let view = tex.create_view(&TextureViewDescriptor {
-                dimension: Some(TextureViewDimension::D2Array),
-                ..default()
-            });
-            textures.push(tex);
-            view
-        });
-
-        gpu_atlas.tex_sampler = Some(device.create_sampler(&SamplerDescriptor {
-            label: Some("sdf_tex_sampler"),
-            mag_filter: FilterMode::Linear,
-            min_filter: FilterMode::Linear,
-            mipmap_filter: FilterMode::Linear,
-            address_mode_u: AddressMode::Repeat,
-            address_mode_v: AddressMode::Repeat,
-            ..default()
-        }));
-        gpu_atlas.tex_array_views = Some(views);
-        stream.textures = textures;
-        stream.allocated = true;
-    }
-
-    // 2) Spawn encode tasks for any variants the library appended since last frame
-    // (demand-driven: a variant appears when a used material first references it).
-    let Some(extracted) = extracted else { return };
-    let want = (extracted.variants.len() as u32).min(MAX_TEXTURE_LAYERS);
-    if want <= stream.spawned_layers {
-        return;
-    }
-    let pool = AsyncComputeTaskPool::get();
-    for layer in stream.spawned_layers..want {
-        let map_set = extracted.variants[layer as usize].clone();
-        stream.tasks.push(pool.spawn(async move {
-            let maps = super::textures::encode_mapset_bc7(&map_set);
-            EncodedVariant { layer, maps }
-        }));
-    }
-    info!(
-        "SDF textures: streaming layers {}..{}",
-        stream.spawned_layers, want
-    );
-    stream.spawned_layers = want;
-}
-
-/// Each frame, drain any finished encode tasks and `write_texture` their BC7 mip
-/// chains into the destination array layer (per map, per mip). Non-blocking poll —
-/// unfinished tasks are left for next frame.
-fn upload_texture_layers(queue: Res<RenderQueue>, mut stream: ResMut<TextureStreamState>) {
-    if stream.tasks.is_empty() {
-        return;
-    }
-    use super::textures::TEXTURE_SIZE;
-
-    let mut i = 0;
-    while i < stream.tasks.len() {
-        let Some(done) = block_on(poll_once(&mut stream.tasks[i])) else {
-            i += 1;
-            continue;
-        };
-        // Upload every map's single-layer mip chain into `done.layer`. Clamp to the
-        // texture's actual mip count — a stale cache blob claiming more levels than
-        // the texture has would otherwise over-run it (wgpu fatal). The cache key's
-        // ENCODER_VERSION normally prevents this; the clamp is belt-and-suspenders.
-        let tex_mips = super::bc7::mip_count(TEXTURE_SIZE);
-        for (map, arr) in done.maps.iter().enumerate() {
-            let texture = &stream.textures[map];
-            let mut offset = 0usize;
-            let mut size = TEXTURE_SIZE;
-            for mip in 0..arr.mip_levels.min(tex_mips) {
-                let blocks_w = size.div_ceil(4);
-                let blocks_h = size.div_ceil(4);
-                let bytes_per_row = blocks_w * 16; // BC7 = 16 bytes/block
-                let level_len = (bytes_per_row * blocks_h) as usize;
-                queue.write_texture(
-                    TexelCopyTextureInfo {
-                        texture,
-                        mip_level: mip,
-                        origin: Origin3d {
-                            x: 0,
-                            y: 0,
-                            z: done.layer,
-                        },
-                        aspect: TextureAspect::All,
-                    },
-                    &arr.data[offset..offset + level_len],
-                    TexelCopyBufferLayout {
-                        offset: 0,
-                        bytes_per_row: Some(bytes_per_row),
-                        rows_per_image: Some(blocks_h),
-                    },
-                    Extent3d {
-                        width: size,
-                        height: size,
-                        depth_or_array_layers: 1,
-                    },
-                );
-                offset += level_len;
-                size = (size / 2).max(4); // BC7 mip chain stops at the 4×4 block min
-            }
-        }
-        let done_layer = done.layer;
-        // Task already produced its result via poll_once; drop the finished handle.
-        drop(stream.tasks.swap_remove(i));
-        let remaining = stream.tasks.len();
-        debug!("SDF textures: layer {done_layer} uploaded ({remaining} remaining)");
-        // don't advance `i` — swap_remove moved a new task into this slot.
-    }
 }
 
 // --- Prepare: chunk-table upload (full rebuild + incremental delta) ---
@@ -1912,196 +1667,4 @@ fn init_combine_pipeline(
         // Queued above with empty defs; rebuild fires once the synced defs differ.
         current_defs: Vec::new(),
     });
-}
-
-/// Allocate the per-tile seed texture (storage-write + sampled views) and queue the cone-
-/// prepass compute pipeline. Runs after `init_sdf_pipeline` so the shared camera/atlas
-/// layouts (layout_0/1) already exist on `SdfPipeline`.
-fn init_cone_pipeline(
-    mut commands: Commands,
-    device: Res<RenderDevice>,
-    pipeline_cache: Res<PipelineCache>,
-    sdf_pipeline: Res<SdfPipeline>,
-    cone_shader: Res<SdfConeShaderHandle>,
-) {
-    // group 2 for the COMPUTE side: write-only R32Float storage texture (one texel/tile).
-    let layout_2 = BindGroupLayoutDescriptor::new(
-        "sdf_cone_bind_group_2",
-        &BindGroupLayoutEntries::sequential(
-            ShaderStages::COMPUTE,
-            (texture_storage_2d(
-                TextureFormat::R32Float,
-                StorageTextureAccess::WriteOnly,
-            ),),
-        ),
-    );
-
-    let pipeline_id = pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
-        label: Some("sdf_cone_pipeline".into()),
-        layout: vec![
-            sdf_pipeline.layout_0.clone(),
-            sdf_pipeline.layout_1.clone(),
-            layout_2.clone(),
-        ],
-        shader: cone_shader.0.clone(),
-        ..default()
-    });
-
-    // The seed texture: STORAGE_BINDING (compute writes) + TEXTURE_BINDING (fragment reads).
-    let seed_tex = device.create_texture(&TextureDescriptor {
-        label: Some("sdf_cone_seed"),
-        size: Extent3d {
-            width: CONE_TEX_TILES_X,
-            height: CONE_TEX_TILES_Y,
-            depth_or_array_layers: 1,
-        },
-        mip_level_count: 1,
-        sample_count: 1,
-        dimension: TextureDimension::D2,
-        format: TextureFormat::R32Float,
-        usage: TextureUsages::STORAGE_BINDING | TextureUsages::TEXTURE_BINDING,
-        view_formats: &[],
-    });
-    let storage_view = seed_tex.create_view(&TextureViewDescriptor::default());
-    let read_view = seed_tex.create_view(&TextureViewDescriptor::default());
-
-    commands.insert_resource(SdfConePipeline {
-        pipeline_id,
-        layout_2,
-    });
-    commands.insert_resource(SdfConePrepass {
-        storage_view,
-        read_view,
-    });
-}
-
-// --- Render Graph: cone prepass node ---
-
-#[derive(Debug, Hash, PartialEq, Eq, Clone, RenderLabel)]
-struct SdfConeLabel;
-
-#[derive(Default)]
-struct SdfConeNode;
-
-impl ViewNode for SdfConeNode {
-    // Run on the SDF camera view; we only need to gate on the view entity (camera uniform)
-    // and read the viewport size off the camera uniform itself.
-    type ViewQuery = &'static ViewTarget;
-
-    fn run(
-        &self,
-        graph: &mut RenderGraphContext,
-        render_context: &mut RenderContext,
-        _view_target: QueryItem<Self::ViewQuery>,
-        world: &World,
-    ) -> Result<(), NodeRunError> {
-        // Only run on SDF cameras.
-        let view_entity = graph.view_entity();
-        if world.get::<SdfCameraData>(view_entity).is_none() {
-            return Ok(());
-        }
-        if let Some(enabled) = world.get_resource::<SdfRenderEnabled>()
-            && !enabled.0
-        {
-            return Ok(());
-        }
-
-        let cone = world.resource::<SdfConePipeline>();
-        let sdf = world.resource::<SdfPipeline>();
-        let pipeline_cache = world.resource::<PipelineCache>();
-        let device = render_context.render_device();
-
-        let Some(pipeline) = pipeline_cache.get_compute_pipeline(cone.pipeline_id) else {
-            return Ok(());
-        };
-
-        // The compute pass reuses the fragment camera + atlas bind groups, so it needs the
-        // same camera uniform (with dynamic offset) and the atlas bind group 1.
-        let Some(camera_uniforms) = world.get_resource::<ComponentUniforms<SdfCameraData>>()
-        else {
-            return Ok(());
-        };
-        let Some(camera_binding) = camera_uniforms.binding() else {
-            return Ok(());
-        };
-        // Dynamic offset for this view's camera uniform.
-        let Some(dyn_off) = world.get::<bevy::render::extract_component::DynamicUniformIndex<SdfCameraData>>(view_entity)
-        else {
-            return Ok(());
-        };
-
-        let layout_0 = pipeline_cache.get_bind_group_layout(&sdf.layout_0);
-        let layout_1 = pipeline_cache.get_bind_group_layout(&sdf.layout_1);
-        let layout_2 = pipeline_cache.get_bind_group_layout(&cone.layout_2);
-
-        let bind_group_0 = device.create_bind_group(
-            "sdf_cone_bind_group_0",
-            &layout_0,
-            &BindGroupEntries::sequential((camera_binding.clone(),)),
-        );
-
-        let gpu_atlas = world.resource::<SdfGpuAtlas>();
-        let tex_views = gpu_atlas.tex_array_views.as_ref().unwrap();
-        let bind_group_1 = device.create_bind_group(
-            "sdf_cone_bind_group_1",
-            &layout_1,
-            &BindGroupEntries::sequential((
-                gpu_atlas.dist_view.as_ref().unwrap(),
-                gpu_atlas.sampler.as_ref().unwrap(),
-                gpu_atlas
-                    .lookup_buffer
-                    .as_ref()
-                    .unwrap()
-                    .as_entire_buffer_binding(),
-                gpu_atlas.mat_view.as_ref().unwrap(),
-                gpu_atlas
-                    .material_buffer
-                    .as_ref()
-                    .unwrap()
-                    .as_entire_buffer_binding(),
-                gpu_atlas.tex_sampler.as_ref().unwrap(),
-                &tex_views[0],
-                &tex_views[1],
-                &tex_views[2],
-                &tex_views[3],
-                &tex_views[4],
-                gpu_atlas
-                    .chunk_tile_buffer
-                    .as_ref()
-                    .unwrap()
-                    .as_entire_buffer_binding(),
-            )),
-        );
-
-        let prepass = world.resource::<SdfConePrepass>();
-        let bind_group_2 = device.create_bind_group(
-            "sdf_cone_bind_group_2",
-            &layout_2,
-            &BindGroupEntries::sequential((&prepass.storage_view,)),
-        );
-
-        // Viewport in tiles → workgroup count (workgroup is 8×8 = one tile per invocation).
-        let size = world
-            .get::<SdfCameraData>(view_entity)
-            .map(|c| UVec2::new(c.screen_params.x as u32, c.screen_params.y as u32))
-            .unwrap_or(UVec2::new(1920, 1080));
-        let tiles_x = size.x.div_ceil(CONE_TILE);
-        let tiles_y = size.y.div_ceil(CONE_TILE);
-        let wg_x = tiles_x.div_ceil(8);
-        let wg_y = tiles_y.div_ceil(8);
-
-        let mut pass = render_context
-            .command_encoder()
-            .begin_compute_pass(&ComputePassDescriptor {
-                label: Some("sdf_cone_prepass"),
-                timestamp_writes: None,
-            });
-        pass.set_pipeline(pipeline);
-        pass.set_bind_group(0, &bind_group_0, &[dyn_off.index()]);
-        pass.set_bind_group(1, &bind_group_1, &[]);
-        pass.set_bind_group(2, &bind_group_2, &[]);
-        pass.dispatch_workgroups(wg_x, wg_y, 1);
-
-        Ok(())
-    }
 }
