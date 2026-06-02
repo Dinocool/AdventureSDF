@@ -3,7 +3,7 @@
 
 use bevy::prelude::*;
 
-use crate::assets::{MaterialAsset, MaterialAssetTable};
+use crate::assets::MaterialAsset;
 
 /// Save the material behind `handle` to `assets/materials/<name>.material.ron`. Shared
 /// by the Resources panel and the asset inspector.
@@ -30,18 +30,6 @@ pub fn handle_for_path(world: &World, path: &std::path::Path) -> Option<Handle<M
         .or_else(|| Some(server.load::<MaterialAsset>(rel)))
 }
 
-/// The working-dir material file path backing a registry id, if any. Resolves the
-/// table handle → its asset path → `assets/<...>`. Used to show the current selection
-/// in the material picker.
-pub fn material_path_for_registry_id(world: &World, registry_id: u32) -> Option<std::path::PathBuf> {
-    let table = world.resource::<MaterialAssetTable>();
-    let handle = table.handles.get(registry_id as usize)?;
-    if handle.id() == Handle::<MaterialAsset>::default().id() {
-        return None;
-    }
-    let asset_path = world.resource::<AssetServer>().get_path(handle.id())?;
-    Some(std::path::Path::new(crate::editor::assets_browser::ASSETS_ROOT).join(asset_path.path()))
-}
 
 /// Resolve a `.pbrtex.ron` path to its loaded handle (or load it). For the inspector.
 pub fn pbrtex_handle_for_path(

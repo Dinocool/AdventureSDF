@@ -1,0 +1,27 @@
+SceneFile(
+  next_id: 2,
+  records: [
+    Entity(
+      id: LocalId(0),
+      components: {
+        "adventure::node::EditorGizmo": "{\"adventure::node::EditorGizmo\":Axes(scale:1.0)}",
+        "adventure::node::Node3D": "{\"adventure::node::Node3D\":()}",
+        "adventure::node::SceneNode": "{\"adventure::node::SceneNode\":()}",
+        "adventure::sdf_render::stress::TowerSpawner": "{\"adventure::sdf_render::stress::TowerSpawner\":(ground_y:-30.0,max_height:20.0,freq:0.02,amp:5.0,seed:1337,half_extent:270.0,spacing:10.0,jitter:0.4,cubes_per_tower:4,cube_half:0.4,ground_mat:\"sand\",cube_mat:\"cobble\",cap_mat:\"red_metal\")}",
+        "bevy_ecs::name::Name": "{\"bevy_ecs::name::Name\":\"Tower Field\"}",
+        "bevy_transform::components::transform::Transform": "{\"bevy_transform::components::transform::Transform\":(translation:(0.0,0.0,0.0),rotation:(0.0,0.0,0.0,1.0),scale:(1.0,1.0,1.0))}",
+      },
+    ),
+    Entity(
+      id: LocalId(1),
+      components: {
+        "adventure::node::EditorGizmo": "{\"adventure::node::EditorGizmo\":DirectionalLight(scale:1.0)}",
+        "adventure::node::Node3D": "{\"adventure::node::Node3D\":()}",
+        "adventure::node::SceneNode": "{\"adventure::node::SceneNode\":()}",
+        "bevy_ecs::name::Name": "{\"bevy_ecs::name::Name\":\"Directional Light\"}",
+        "bevy_light::directional_light::DirectionalLight": "{\"bevy_light::directional_light::DirectionalLight\":(color:LinearRgba((red:1.0,green:1.0,blue:1.0,alpha:1.0)),illuminance:10000.0,shadows_enabled:false,affects_lightmapped_mesh_diffuse:true,shadow_depth_bias:0.02,shadow_normal_bias:1.8)}",
+        "bevy_transform::components::transform::Transform": "{\"bevy_transform::components::transform::Transform\":(translation:(0.0,0.0,0.0),rotation:(-0.24740396,0.0,0.0,0.9689124),scale:(1.0,1.0,1.0))}",
+      },
+    ),
+  ],
+)

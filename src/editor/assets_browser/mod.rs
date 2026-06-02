@@ -16,12 +16,20 @@ use bevy_egui::egui;
 pub mod thumbnail;
 
 pub use thumbnail::{
-    ImageThumbnailProvider, MaterialThumbnailProvider, ThumbnailRenderPlugin,
+    ImageThumbnailProvider, MaterialThumbnailProvider, PbrTextureThumbnailProvider,
+    PendingSceneThumbnail, SceneThumbnailProvider, ThumbnailRenderPlugin,
 };
 
 /// Root the browser walks, relative to the working dir — matches how Bevy's
 /// `AssetServer` resolves `assets/`.
 pub const ASSETS_ROOT: &str = "assets";
+
+/// egui drag-and-drop payload: a material file (working-dir `.material.ron` path) dragged
+/// from the assets tray. Drop targets (viewport, inspector Material section) consume this
+/// to set an entity's material. A distinct newtype so it never collides with the
+/// hierarchy's `Entity` reparent payload.
+#[derive(Clone)]
+pub struct MaterialDrag(pub PathBuf);
 
 /// Edge length (px) of a thumbnail tile's image area.
 const TILE_PX: f32 = 72.0;
@@ -90,6 +98,7 @@ pub fn assets_browser_ui(world: &mut World, ui: &mut egui::Ui) {
     // --- Toolbar: up button + breadcrumb -----------------------------------------
     let mut nav_to: Option<PathBuf> = None;
     let mut select_asset: Option<PathBuf> = None;
+    let mut open_scene: Option<PathBuf> = None;
     ui.horizontal(|ui| {
         let at_root = current.as_os_str().is_empty();
         if ui
@@ -133,9 +142,53 @@ pub fn assets_browser_ui(world: &mut World, ui: &mut egui::Ui) {
                     if resp.clicked() || resp.double_clicked() {
                         nav_to = rel_to_root(&entry.path);
                     }
+                } else if is_scene_file(&entry.path) && resp.double_clicked() {
+                    // Double-click a scene → open it (handled by the multi-scene tab manager).
+                    open_scene = Some(entry.path.clone());
                 } else if resp.clicked() {
                     // File click → select it in the unified inspector.
                     select_asset = Some(entry.path.clone());
+                }
+                // Material files are draggable onto scene entities / the inspector Material
+                // section to set their material (see `MaterialDrag`). Mirror the hierarchy's
+                // floating-preview drag pattern.
+                if !entry.is_dir
+                    && crate::editor::fs_util::is_material_ron(&entry.path)
+                    && resp.dragged()
+                {
+                    resp.dnd_set_drag_payload(MaterialDrag(entry.path.clone()));
+                    // Drag preview: a small floating copy of the material's thumbnail image
+                    // (falls back to a glyph if its render isn't ready), tracking the cursor.
+                    if let Some(pointer) = ui.ctx().pointer_interact_pos() {
+                        const SIZE: f32 = 48.0;
+                        let layer_id = egui::LayerId::new(
+                            egui::Order::Tooltip,
+                            resp.id.with("mat_drag_preview"),
+                        );
+                        let icon_rect =
+                            egui::Rect::from_center_size(pointer + egui::vec2(SIZE * 0.5 + 8.0, 0.0), egui::vec2(SIZE, SIZE));
+                        let painter = ui.ctx().layer_painter(layer_id);
+                        match thumbnail_for_path(world, &entry.path) {
+                            Thumbnail::Texture(tex) => {
+                                painter.image(
+                                    tex,
+                                    icon_rect,
+                                    egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                                    egui::Color32::WHITE,
+                                );
+                            }
+                            _ => {
+                                painter.text(
+                                    icon_rect.center(),
+                                    egui::Align2::CENTER_CENTER,
+                                    "◆",
+                                    egui::FontId::proportional(SIZE * 0.7),
+                                    egui::Color32::WHITE,
+                                );
+                            }
+                        }
+                    }
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
                 }
             }
         });
@@ -148,6 +201,11 @@ pub fn assets_browser_ui(world: &mut World, ui: &mut egui::Ui) {
         world
             .resource_mut::<crate::editor::selection::EditorSelection>()
             .select_asset(path);
+    }
+    if let Some(path) = open_scene {
+        // Routed through EditorRequests::open, drained by the scene-tab manager next frame
+        // (opens a new tab, or focuses the scene if it's already open).
+        world.resource_mut::<crate::editor::menu_bar::EditorRequests>().open = Some(path);
     }
 }
 
@@ -174,8 +232,8 @@ pub fn draw_tile(
         egui::vec2(TILE_W, TILE_PX + 28.0),
         egui::Layout::top_down(egui::Align::Center),
         |ui| {
-            let (rect, resp) =
-                ui.allocate_exact_size(egui::vec2(TILE_PX, TILE_PX), egui::Sense::click());
+            let (rect, resp) = ui
+                .allocate_exact_size(egui::vec2(TILE_PX, TILE_PX), egui::Sense::click_and_drag());
             let painter = ui.painter_at(rect);
             match thumb {
                 TileThumb::Icon(glyph) => draw_glyph(&painter, rect, glyph),
@@ -272,32 +330,30 @@ fn draw_glyph(painter: &egui::Painter, rect: egui::Rect, glyph: &str) {
     );
 }
 
-/// Read + sort the direct children of `dir`: directories first, then files, each
-/// alphabetically (case-insensitive).
+/// Direct children of `dir`: directories first, then files, each alphabetically. Reads via
+/// `read_sorted_cached` (5s TTL) so the visible folder isn't `read_dir`'d every frame
+/// inside the egui pass (perf roadmap E1).
 fn read_entries(dir: &Path) -> Vec<Entry> {
-    let Ok(rd) = std::fs::read_dir(dir) else {
-        return Vec::new();
+    let (dirs, files) = crate::editor::fs_util::read_sorted_cached(dir);
+    let mk = |path: PathBuf, is_dir: bool| Entry {
+        name: crate::editor::fs_util::file_name_str(&path),
+        path,
+        is_dir,
     };
-    let mut entries: Vec<Entry> = rd
-        .flatten()
-        .map(|e| {
-            let path = e.path();
-            let is_dir = path.is_dir();
-            let name = crate::editor::fs_util::file_name_str(&path);
-            Entry { path, name, is_dir }
-        })
-        .collect();
-    entries.sort_by(|a, b| {
-        b.is_dir
-            .cmp(&a.is_dir)
-            .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
-    });
-    entries
+    dirs.into_iter()
+        .map(|d| mk(d, true))
+        .chain(files.into_iter().map(|f| mk(f, false)))
+        .collect()
 }
 
 /// Lowercased final extension of `path`, if any.
 fn ext_lower(path: &Path) -> Option<String> {
     path.extension().map(|e| e.to_string_lossy().to_lowercase())
+}
+
+/// Whether `path` is a soul `.scene` file (case-insensitive).
+fn is_scene_file(path: &Path) -> bool {
+    ext_lower(path).as_deref() == Some("scene")
 }
 
 /// Parent of a root-relative folder path (empty path = already root).

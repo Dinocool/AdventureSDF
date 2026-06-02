@@ -1,6 +1,8 @@
 use bevy::pbr::wireframe::{Wireframe, WireframeColor};
 use bevy::prelude::*;
 
+use crate::soul_scene::ReflectSerializeSkip;
+
 #[derive(States, Default, Debug, Clone, PartialEq, Eq, Hash)]
 pub enum AppScene {
     #[default]
@@ -10,8 +12,15 @@ pub enum AppScene {
 }
 
 #[derive(Component, Reflect, Default)]
-#[reflect(Component)]
+#[reflect(Component, SerializeSkip)]
 pub struct SceneEntity;
+
+/// Marks EDITOR-owned infrastructure (e.g. the viewport camera) — distinct from
+/// [`SceneEntity`] scene content. Editor entities are never serialized into a `.scene` and
+/// are never despawned by scene load/clear/switch; they persist across scene transitions.
+#[derive(Component, Reflect, Default)]
+#[reflect(Component, SerializeSkip)]
+pub struct EditorEntity;
 
 #[derive(Resource, Default)]
 pub struct MenuOpen(pub bool);
@@ -35,6 +44,7 @@ impl Plugin for SceneManagerPlugin {
         app.init_state::<AppScene>()
             .init_resource::<MenuOpen>()
             .register_type::<SceneEntity>()
+            .register_type::<EditorEntity>()
             .add_systems(Update, toggle_menu)
             .add_systems(Update, handle_menu_buttons)
             .add_systems(OnEnter(AppScene::WireframeTest), setup_wireframe_test)

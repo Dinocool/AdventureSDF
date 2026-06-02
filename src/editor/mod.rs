@@ -6,6 +6,7 @@ use bevy::prelude::*;
 
 pub mod asset_inspector;
 pub mod assets_browser;
+pub mod chrome_trace;
 pub mod config;
 pub mod dock;
 pub mod fs_util;
@@ -13,17 +14,23 @@ pub mod hierarchy;
 pub mod import_settings;
 pub mod inspector;
 pub mod keybinds;
+pub mod layout;
 pub mod material_editor;
 pub mod material_preview;
 pub mod menu_bar;
+pub mod notifications;
 pub mod panels;
 pub mod profiling;
 pub mod project_files;
 pub mod registry;
-pub mod resource_inspector;
+#[cfg(feature = "renderdoc")]
+pub mod renderdoc_capture;
 pub mod resource_picker;
+pub mod scene_browser;
+pub mod scene_tabs;
 pub mod selection;
 pub mod status_bar;
+pub mod transform_editor;
 pub mod uniform_inspector;
 pub mod viewport_toolbar;
 
@@ -44,11 +51,25 @@ impl Plugin for EditorPlugin {
         ))
         .init_resource::<menu_bar::EditorRequests>()
         .init_resource::<menu_bar::CurrentScenePath>()
+        .init_resource::<scene_browser::OpenSceneDialog>()
+        .init_resource::<scene_browser::SaveSceneDialog>()
+        .init_resource::<scene_tabs::OpenScenes>()
+        .init_resource::<notifications::Notifications>()
+        .init_resource::<layout::LayoutsDialog>()
+        .init_resource::<layout::PanelRestore>()
+        .add_systems(Last, layout::save_layout_on_exit)
         .init_resource::<inspector::InspectorOverrides>()
         .register_type::<import_settings::ImageFilter>()
         .register_type::<import_settings::ColorSpace>()
         .register_type::<import_settings::WrapMode>()
         .register_type::<import_settings::TextureImportSettings>();
+
+        // In-app RenderDoc capture (F7) only exists with the `renderdoc` feature.
+        #[cfg(feature = "renderdoc")]
+        app.add_plugins(renderdoc_capture::RenderDocCapturePlugin);
+
+        // Custom euler-angle Transform editor (replaces the generic Quat-xyzw UI).
+        inspector::register_component_editor::<Transform>(app, transform_editor::transform_editor);
 
         // Assets browser: navigation state + modular thumbnail providers + the
         // offscreen render rig that fills material/image thumbnails.
@@ -58,6 +79,8 @@ impl Plugin for EditorPlugin {
             let mut registry = assets_browser::ThumbnailRegistry::default();
             registry.register(assets_browser::ImageThumbnailProvider);
             registry.register(assets_browser::MaterialThumbnailProvider);
+            registry.register(assets_browser::PbrTextureThumbnailProvider);
+            registry.register(assets_browser::SceneThumbnailProvider);
             app.insert_resource(registry);
         }
 
@@ -103,21 +126,13 @@ impl Plugin for EditorPlugin {
         );
 
         keybinds::plugin(app);
+        status_bar::plugin(app);
+
+        // F6 toggles chrome-trace capture (global; RenderDoc is F7 behind the `renderdoc` feature).
+        app.add_systems(Update, chrome_trace::toggle_on_f6);
 
         // Gizmo transform tools (mode + snap) now live in the viewport toolbar
         // (see `dock::viewport_toolbar`), so there's no separate Transform panel.
-
-        // Resource Inspector (Godot-style): edit material resources + browse textures.
-        app.init_resource::<resource_inspector::ResourceInspectorState>()
-            .init_resource::<resource_inspector::TextureVariantCache>();
-        panels::register_panel(
-            app,
-            "core/resources",
-            "Resources",
-            DockSide::Left,
-            2,
-            resource_inspector::resource_inspector_ui,
-        );
 
         // Build the dock layout once, after `Startup` (so every plugin — including
         // the SDF debug plugin — has registered its panels), then render each frame.

@@ -18,10 +18,13 @@
 //! This module owns ONLY the coordinate math + table layout (pure, unit-tested). The
 //! per-brick texel storage (`atlas::TileAllocator`) and incremental upload are unchanged.
 
+use std::collections::{BTreeSet, HashMap};
+
 use bevy::math::IVec3;
 
 use super::SdfGridConfig;
-use super::atlas::{BrickKey, SdfAtlas};
+use super::atlas::{ATLAS_TILES_PER_ROW, BRICK_EDGE, BrickKey, SdfAtlas};
+use super::edits::Palette;
 
 /// Bricks per axis in one chunk. 64 = `4³` fits a single u64 occupancy mask.
 pub const CHUNK_BRICKS: i32 = 4;
@@ -124,60 +127,338 @@ pub struct BrickTile {
     pub pal23: u32,
 }
 
-/// The two GPU buffers the shader needs to resolve a brick: the sorted chunk table and
-/// the packed per-chunk brick runs. Built from the resident brick set each upload.
+/// Pixel origin of atlas `tile` (tiles wrap into rows so the texture width stays bounded), packed
+/// as `col_px | row_px<<16`. Single source of truth for the `atlas_base` packing, shared by the
+/// render-world full rebuild and the incremental [`LiveChunkTables`] so both agree byte-for-byte.
+pub fn tile_atlas_base(tile: u32) -> u32 {
+    let edge = BRICK_EDGE as u32;
+    let tile_width = edge * edge; // 64
+    let col_px = (tile % ATLAS_TILES_PER_ROW) * tile_width;
+    let row_px = (tile / ATLAS_TILES_PER_ROW) * edge;
+    col_px | (row_px << 16)
+}
+
+/// Pack a brick's atlas tile + material palette into its GPU [`BrickTile`] record.
+pub fn pack_brick_tile(tile: u32, palette: Palette) -> BrickTile {
+    BrickTile {
+        atlas_base: tile_atlas_base(tile),
+        pal01: palette[0] as u32 | ((palette[1] as u32) << 16),
+        pal23: palette[2] as u32 | ((palette[3] as u32) << 16),
+    }
+}
+
+/// The two GPU buffers the shader needs to resolve a brick: the dense per-LOD toroidal DIRECTORY
+/// (`chunk_buf` — chunk `c` at `dir_index(c, r)`, empty slots sentinel-tagged) and the packed
+/// per-chunk brick runs, plus `r` (ring chunks/axis) for indexing. Built from the resident brick set.
 #[derive(Default)]
 pub struct ChunkTables {
     pub chunks: Vec<ChunkLookup>,
     /// Per resident brick, grouped by chunk (chunk `c` occupies
     /// `tile_run[c.tile_run_base .. + popcount(c.occ)]`), in ascending local-index order.
     pub tile_run: Vec<BrickTile>,
+    /// Ring chunks per axis (`R = ring_bricks / CHUNK_BRICKS`) used to index `chunks` via `dir_index`.
+    pub r: i32,
 }
 
-/// Group an atlas's resident bricks into the sorted chunk table + packed tile-run table.
-/// `tile_of(key)` returns the brick's [`BrickTile`] (atlas origin + packed palette).
-/// Pure aside from the closure; lives here so addressing + table layout are one unit and
-/// independently testable. Cost is O(bricks log bricks), same order as the old per-brick
-/// lookup build, just grouped.
+/// Group an atlas's resident bricks into the toroidal directory + packed tile-run table by driving
+/// the real [`LiveChunkTables`] (one `set_brick` per resident brick) — so the layout matches what
+/// the render world uploads byte-for-byte. `tile_of(key)` returns the brick's [`BrickTile`].
 pub fn build_chunk_tables(
     atlas: &SdfAtlas,
     config: &SdfGridConfig,
     mut tile_of: impl FnMut(&BrickKey) -> BrickTile,
 ) -> ChunkTables {
-    use std::collections::HashMap;
-
-    // Gather per chunk: (local_index, brick tile) for each resident brick.
-    let mut by_chunk: HashMap<ChunkKey, Vec<(u32, BrickTile)>> = HashMap::new();
+    let mut live = LiveChunkTables::default();
     for key in atlas.bricks.keys() {
         let (ck, local) = chunk_of(*key, config);
-        by_chunk.entry(ck).or_default().push((local, tile_of(key)));
+        live.set_brick(ck, local, tile_of(key), config);
+    }
+    let (chunks, tile_run) = live.full_tables();
+    ChunkTables {
+        chunks,
+        tile_run,
+        r: config.ring_bricks as i32 / CHUNK_BRICKS,
+    }
+}
+
+// --- Incremental (live) chunk table -------------------------------------------------
+//
+// `build_chunk_tables` above rebuilds the whole table from the resident brick set every
+// topology change — O(bricks log bricks). For a dense scene crossing a coarse LOD snap
+// that is ~80k bricks re-grouped every frame of the multi-frame bake drain (the ~20ms
+// `extract_sdf` spike). The structures below maintain the SAME logical table incrementally:
+// each `insert`/`remove` touches only its own chunk, recording which rows/regions changed
+// so the render world can upload just the delta.
+//
+// The key that makes this cheap: the GPU only needs each chunk's tile-run region to hold
+// `popcount(occ)` entries in ascending local order at `tile_run_base` — the regions need
+// NOT be contiguous between chunks (verified against `brick.wgsl::brick_in_chunk`). So we
+// give every resident chunk a FIXED 64-slot region (`tile_run_base = slot * TILE_RUN_SLOT`),
+// and brick churn in one chunk rewrites only that chunk's region, never shifting any other
+// chunk's base. Unoccupied slots inside a region are never indexed (popcount skips them).
+
+/// Tile-run entries reserved per resident chunk. Equals [`CHUNK_VOLUME`] (64): the max
+/// bricks a chunk can hold, so a chunk's region never overflows regardless of churn.
+pub const TILE_RUN_SLOT: u32 = CHUNK_VOLUME;
+
+/// A removed chunk's tail rows are overwritten with this sentinel key so binary search over
+/// the fixed physical buffer length still works: `u32::MAX` sorts after every real key, so
+/// the search never matches a removed/absent slot. Generalizes the single-entry empty
+/// sentinel `prepare_sdf_atlas_gpu` already uploads for a fully-evicted atlas.
+pub const SENTINEL_KEY: (u32, u32) = (u32::MAX, u32::MAX);
+
+/// Stable chunk → tile-run-region slot, with a free-list (mirrors [`super::atlas::TileAllocator`]).
+/// `tile_run_base = slot * TILE_RUN_SLOT`. Reusing a freed slot before growing `next` keeps the
+/// tile-run buffer densely packed in chunk units (bounded by peak resident chunk count).
+#[derive(Default)]
+pub struct ChunkSlotAllocator {
+    slot_of: HashMap<ChunkKey, u32>,
+    free: Vec<u32>,
+    next: u32,
+}
+
+impl ChunkSlotAllocator {
+    /// Assign (or return the existing) slot for `ck`. Reuses a freed slot first.
+    fn alloc(&mut self, ck: ChunkKey) -> u32 {
+        if let Some(&s) = self.slot_of.get(&ck) {
+            return s;
+        }
+        let s = self.free.pop().unwrap_or_else(|| {
+            let s = self.next;
+            self.next += 1;
+            s
+        });
+        self.slot_of.insert(ck, s);
+        s
     }
 
-    // Stable order: sort chunks by GPU key so the shader can binary-search.
-    let mut chunk_keys: Vec<ChunkKey> = by_chunk.keys().copied().collect();
-    chunk_keys.sort_by_key(|k| chunk_gpu_key(*k));
-
-    let mut tables = ChunkTables::default();
-    for ck in chunk_keys {
-        let mut bricks = by_chunk.remove(&ck).unwrap();
-        bricks.sort_by_key(|(local, _)| *local);
-
-        let mut occ: u64 = 0;
-        let tile_run_base = tables.tile_run.len() as u32;
-        for (local, tile) in &bricks {
-            occ |= 1u64 << *local;
-            tables.tile_run.push(*tile);
+    /// Return `ck`'s slot to the free pool (chunk emptied). Its stale tile-run entries are
+    /// harmless — no live chunk row references them once the slot is unoccupied.
+    fn release(&mut self, ck: &ChunkKey) {
+        if let Some(s) = self.slot_of.remove(ck) {
+            self.free.push(s);
         }
-        let (key_hi, key_lo) = chunk_gpu_key(ck);
-        tables.chunks.push(ChunkLookup {
-            key_hi,
-            key_lo,
+    }
+
+    /// One past the largest slot ever handed out → how many `TILE_RUN_SLOT`-sized regions the
+    /// tile-run buffer must span (`high_water() * TILE_RUN_SLOT` entries).
+    pub fn high_water(&self) -> u32 {
+        self.next
+    }
+}
+
+/// One resident chunk's live state: its tile-run slot, occupancy mask, and the 64 brick
+/// tiles (only `popcount(occ)` are live; the rest are never indexed by the shader).
+struct ChunkEntry {
+    slot: u32,
+    occ: u64,
+    tiles: [BrickTile; CHUNK_VOLUME as usize],
+}
+
+/// Incrementally-maintained chunk lookup + tile-run table, kept on [`SdfAtlas`]. Mirrors what
+/// [`build_chunk_tables`] produces (sorted `chunks` row order, per-chunk tile runs), but each
+/// `insert`/`remove` updates only its own chunk and records the delta in the dirty fields so the
+/// render world uploads just the changed rows/regions instead of recreating both buffers.
+#[derive(Default)]
+pub struct LiveChunkTables {
+    slots: ChunkSlotAllocator,
+    chunks: HashMap<ChunkKey, ChunkEntry>,
+    /// Reverse of each live chunk's tile-run slot → its key, so a dirty slot resolves to its
+    /// region in O(1) (only live chunks; a freed slot is dropped — its region is never indexed).
+    slot_to_key: HashMap<u32, ChunkKey>,
+    /// The DENSE per-LOD toroidal DIRECTORY = the GPU `chunk_buf`. `R³ × lod_count` fixed slots;
+    /// chunk `c` lives at `lod·R³ + flatten(rem_euclid(c, R))`, with empty slots carrying the
+    /// [`SENTINEL_KEY`] tag. Lazily sized on the first [`set_brick`](Self::set_brick) (when the
+    /// config-derived `R` is known). The GPU indexes it DIRECTLY and compares the key tag — no
+    /// binary search, no sort — so insert/remove/evict is an O(1) slot write. See
+    /// `brick.wgsl::find_chunk`. `tile_run_base` still points into the SPARSE tile-run buffer.
+    dir: Vec<ChunkLookup>,
+    /// Ring chunks per axis (`R = ring_bricks / CHUNK_BRICKS`), cached from config at first sizing.
+    r: i32,
+
+    /// Directory slots whose `ChunkLookup` changed this frame (GPU `chunk_buf` indices to re-upload).
+    pub dirty_rows: BTreeSet<u32>,
+    /// Tile-run slots whose 64-entry region changed this frame.
+    pub dirty_slots: BTreeSet<u32>,
+}
+
+/// An empty directory slot: the [`SENTINEL_KEY`] tag (never matches a real chunk), no occupancy.
+fn sentinel_lookup() -> ChunkLookup {
+    ChunkLookup {
+        key_hi: SENTINEL_KEY.0,
+        key_lo: SENTINEL_KEY.1,
+        occ_lo: 0,
+        occ_hi: 0,
+        tile_run_base: 0,
+    }
+}
+
+/// Physical directory slot for chunk `ck` given ring chunks/axis `r`: `lod·R³ + flatten(c mod R)`
+/// with `rem_euclid` (handles negative coords). EXACT mirror of `dir_index` in `bindings.wgsl` —
+/// the `wgsl_chunk_constants_match_rust` / GPU-rig parity tests guard against drift.
+pub fn dir_index(ck: ChunkKey, r: i32) -> usize {
+    let mx = ck.coord.x.rem_euclid(r);
+    let my = ck.coord.y.rem_euclid(r);
+    let mz = ck.coord.z.rem_euclid(r);
+    (ck.lod as usize) * (r * r * r) as usize + (mz * r * r + my * r + mx) as usize
+}
+
+impl LiveChunkTables {
+    /// Mark a resident brick present in its chunk (insert or palette/tile change). `local` is the
+    /// brick's 0..63 slot from [`chunk_of`]; `tile` is its packed atlas origin + palette. O(1): one
+    /// directory slot write + a tile-run slot. `config` supplies `R`/`lod_count` to lazily size the
+    /// directory on first use. The whole 20 B directory record is published ATOMICALLY (tag + occ +
+    /// tile_run_base in one write) — a tag-valid slot never points at unbaked/old texels.
+    pub fn set_brick(&mut self, ck: ChunkKey, local: u32, tile: BrickTile, config: &SdfGridConfig) {
+        if self.dir.is_empty() {
+            self.r = config.ring_bricks as i32 / CHUNK_BRICKS;
+            let n = (self.r * self.r * self.r) as usize * config.lod_count as usize;
+            self.dir = vec![sentinel_lookup(); n];
+        }
+        let idx = dir_index(ck, self.r);
+        let tag = chunk_gpu_key(ck);
+
+        // Free-on-overwrite belt: if a DIFFERENT chunk still occupies this physical slot (it left the
+        // window without being cleared), reclaim it before publishing the new chunk. With explicit
+        // clear-on-exit (the recenter clears exited chunks first) this won't normally fire, but it
+        // keeps the tile-run bounded against an ordering edge that leaves a stale slot.
+        let cur = self.dir[idx];
+        if (cur.key_hi, cur.key_lo) != SENTINEL_KEY && (cur.key_hi, cur.key_lo) != tag {
+            let old_slot = cur.tile_run_base / TILE_RUN_SLOT;
+            if let Some(old_ck) = self.slot_to_key.remove(&old_slot) {
+                self.chunks.remove(&old_ck);
+                self.slots.release(&old_ck);
+                self.dirty_slots.remove(&old_slot);
+            }
+        }
+
+        let slot = self.slots.alloc(ck);
+        let entry = self.chunks.entry(ck).or_insert_with(|| ChunkEntry {
+            slot,
+            occ: 0,
+            tiles: [BrickTile::default(); CHUNK_VOLUME as usize],
+        });
+        entry.occ |= 1u64 << local;
+        entry.tiles[local as usize] = tile;
+        let occ = entry.occ;
+
+        self.slot_to_key.insert(slot, ck);
+        self.dir[idx] = ChunkLookup {
+            key_hi: tag.0,
+            key_lo: tag.1,
             occ_lo: occ as u32,
             occ_hi: (occ >> 32) as u32,
-            tile_run_base,
-        });
+            tile_run_base: slot * TILE_RUN_SLOT,
+        };
+        self.dirty_rows.insert(idx as u32);
+        self.dirty_slots.insert(slot);
     }
-    tables
+
+    /// Clear a brick from its chunk. If the chunk becomes empty, free its tile-run slot and reset its
+    /// directory slot to the sentinel tag (so the GPU's tag compare misses it → coarse fallback).
+    /// O(1) — no row shift. (Departed chunks are cleared here on exit, which is the make-before-break
+    /// reclaim path that keeps the tile-run bounded; see the migration plan.)
+    pub fn clear_brick(&mut self, ck: ChunkKey, local: u32) {
+        let Some(entry) = self.chunks.get_mut(&ck) else {
+            return;
+        };
+        entry.occ &= !(1u64 << local);
+        entry.tiles[local as usize] = BrickTile::default();
+        let slot = entry.slot;
+        let occ = entry.occ;
+        let idx = dir_index(ck, self.r);
+        if occ != 0 {
+            // Still resident → just refresh the occupancy in its directory slot + re-upload its region.
+            self.dir[idx].occ_lo = occ as u32;
+            self.dir[idx].occ_hi = (occ >> 32) as u32;
+            self.dirty_rows.insert(idx as u32);
+            self.dirty_slots.insert(slot);
+            return;
+        }
+        // Chunk emptied → sentinel its directory slot, free the tile-run slot. The region is now
+        // unreferenced (the sentinel tag never resolves), so it needs no upload.
+        self.chunks.remove(&ck);
+        self.slot_to_key.remove(&slot);
+        self.slots.release(&ck);
+        self.dir[idx] = sentinel_lookup();
+        self.dirty_rows.insert(idx as u32);
+        self.dirty_slots.remove(&slot);
+    }
+
+    /// Number of directory slots (= GPU `chunk_buf` length = `R³ × lod_count`, 0 until first sized).
+    pub fn row_count(&self) -> u32 {
+        self.dir.len() as u32
+    }
+
+    /// One past the largest tile-run slot → tile-run buffer must span `tile_run_capacity()` entries.
+    pub fn tile_run_capacity(&self) -> u32 {
+        self.slots.high_water() * TILE_RUN_SLOT
+    }
+
+    /// One past the largest tile-run slot ever handed out (each slot owns a `TILE_RUN_SLOT`-sized
+    /// region). The full-rebuild path iterates `0..slot_high_water()` to lay out the tile-run buffer.
+    pub fn slot_high_water(&self) -> u32 {
+        self.slots.high_water()
+    }
+
+    /// The `ChunkLookup` at directory slot `idx` (for a delta or full upload) — a direct read of the
+    /// dense directory (empty slots return the sentinel tag).
+    pub fn lookup_at(&self, idx: u32) -> ChunkLookup {
+        debug_assert!(
+            (idx as usize) < self.dir.len(),
+            "lookup_at({idx}) past directory end (len {})",
+            self.dir.len()
+        );
+        self.dir[idx as usize]
+    }
+
+    /// Serialize one chunk's region as the shader reads it: the `popcount(occ)` live bricks packed
+    /// DENSELY from index 0 in ascending local order, the rest left default. The shader indexes a
+    /// brick at `tile_run_base + popcount(occ & below)` — i.e. by its DENSE rank, not its raw local
+    /// slot — so the region must be packed by rank here (it's stored sparse-by-local internally).
+    fn dense_region(entry: &ChunkEntry) -> [BrickTile; CHUNK_VOLUME as usize] {
+        let mut region = [BrickTile::default(); CHUNK_VOLUME as usize];
+        let mut rank = 0usize;
+        let mut bits = entry.occ;
+        while bits != 0 {
+            let local = bits.trailing_zeros() as usize; // next occupied slot, ascending
+            region[rank] = entry.tiles[local];
+            rank += 1;
+            bits &= bits - 1; // clear lowest set bit
+        }
+        region
+    }
+
+    /// The packed tile-run region for tile-run `slot` (dense, ascending-local order — see
+    /// [`dense_region`](Self::dense_region)). A freed slot (no live chunk) returns zeros, but the
+    /// dirty set never carries freed slots (`clear_brick` drops them), so this is the live path.
+    pub fn tile_region(&self, slot: u32) -> [BrickTile; CHUNK_VOLUME as usize] {
+        self.slot_to_key
+            .get(&slot)
+            .map(|ck| Self::dense_region(&self.chunks[ck]))
+            .unwrap_or([BrickTile::default(); CHUNK_VOLUME as usize])
+    }
+
+    /// Materialize the WHOLE table for a full upload: the entire dense directory (`R³ × lod_count`
+    /// slots, empty ones sentinel-tagged) and a `slot_high_water()*TILE_RUN_SLOT`-entry tile-run
+    /// buffer with each live slot's DENSELY-packed region at its `slot*TILE_RUN_SLOT` base.
+    pub fn full_tables(&self) -> (Vec<ChunkLookup>, Vec<BrickTile>) {
+        let mut tile_run =
+            vec![BrickTile::default(); (self.slot_high_water() * TILE_RUN_SLOT) as usize];
+        for (&slot, ck) in &self.slot_to_key {
+            let base = (slot * TILE_RUN_SLOT) as usize;
+            tile_run[base..base + TILE_RUN_SLOT as usize]
+                .copy_from_slice(&Self::dense_region(&self.chunks[ck]));
+        }
+        (self.dir.clone(), tile_run)
+    }
+
+    /// Clear the per-frame delta record. Called from the main world AFTER the render world has
+    /// extracted the delta (see `clear_chunk_table_dirty`), before the next frame accumulates.
+    pub fn clear_dirty(&mut self) {
+        self.dirty_rows.clear();
+        self.dirty_slots.clear();
+    }
 }
 
 /// The distinct non-empty chunks an atlas currently has resident — for the debug
@@ -317,23 +598,25 @@ mod tests {
 
     use super::super::atlas::PackedBrick;
 
-    /// Mirror EXACTLY what `brick.wgsl::find_brick_lookup` does on the GPU: binary-search
-    /// the sorted chunk table by absolute key, test the occupancy bit for the brick's
-    /// local slot, and (if set) index the tile run at `tile_run_base + popcount(bits
-    /// strictly below the slot)`. Returns the resolved `BrickTile`, or `None` if not
-    /// resident. Keeping this in lockstep with the shader is the point of the test below.
+    /// Mirror EXACTLY what `brick.wgsl::find_chunk` + `brick_in_chunk` do on the GPU: index the
+    /// dense directory by `dir_index(ck, r)`, accept only if the stored key TAG matches (sentinel /
+    /// a different wrapped chunk → miss), then test the occupancy bit and index the tile run at
+    /// `tile_run_base + popcount(bits strictly below the slot)`. Keeping this in lockstep with the
+    /// shader is the point of the tests below.
     fn shader_resolve(
         tables: &ChunkTables,
         config: &SdfGridConfig,
         brick: BrickKey,
     ) -> Option<BrickTile> {
         let (ck, li) = chunk_of(brick, config); // li = local slot 0..63
-        let (key_hi, key_lo) = chunk_gpu_key(ck);
-        let idx = tables
-            .chunks
-            .binary_search_by(|c| (c.key_hi, c.key_lo).cmp(&(key_hi, key_lo)))
-            .ok()?;
+        let idx = dir_index(ck, tables.r);
+        if idx >= tables.chunks.len() {
+            return None;
+        }
         let chunk = tables.chunks[idx];
+        if (chunk.key_hi, chunk.key_lo) != chunk_gpu_key(ck) {
+            return None; // sentinel slot, or a different chunk shares this `mod R` slot
+        }
         let occ = (chunk.occ_lo as u64) | ((chunk.occ_hi as u64) << 32);
         if (occ >> li) & 1 == 0 {
             return None; // brick not resident in this chunk
@@ -347,7 +630,7 @@ mod tests {
         use crate::sdf_render::edits::{PALETTE_EMPTY, PALETTE_K};
         PackedBrick {
             palette: [PALETTE_EMPTY; PALETTE_K],
-            baked_epoch: 0,
+            baked_hash: 0,
         }
     }
 
@@ -385,19 +668,6 @@ mod tests {
         }
 
         let tables = build_chunk_tables(&atlas, &cfg, tile_of);
-
-        assert!(
-            tables
-                .chunks
-                .windows(2)
-                .all(|w| (w[0].key_hi, w[0].key_lo) <= (w[1].key_hi, w[1].key_lo)),
-            "chunk table must be sorted by gpu key (binary-searchable)"
-        );
-        assert_eq!(
-            tables.tile_run.len(),
-            keys.len(),
-            "tile_run holds exactly one entry per resident brick"
-        );
 
         for k in &keys {
             let got = shader_resolve(&tables, &cfg, *k)
@@ -496,6 +766,218 @@ mod tests {
                         step[a]
                     );
                 }
+            }
+        }
+    }
+
+    /// Clearing a chunk's last brick reverts its directory slot to the sentinel tag — there is no row
+    /// shift (the directory is FIXED-size), so the size never changes and an untouched chunk keeps its
+    /// slot. Replaces the old sorted-array shrink/dirty-row-pruning test (that whole class is gone).
+    #[test]
+    fn clear_brick_sentinels_slot_keeps_directory_size() {
+        let cfg = config();
+        let r = cfg.ring_bricks as i32 / CHUNK_BRICKS;
+        let tile = BrickTile { atlas_base: 7, pal01: 0, pal23: 0 };
+        let mut live = LiveChunkTables::default();
+        let a = ChunkKey::new(0, IVec3::new(0, 0, 0));
+        let b = ChunkKey::new(0, IVec3::new(1, 0, 0));
+        live.set_brick(a, 0, tile, &cfg);
+        live.set_brick(b, 0, tile, &cfg);
+        let n = live.row_count();
+        assert!(n > 0, "directory sized on first set");
+        live.clear_dirty();
+
+        // Clear b's only brick → b's slot reverts to the sentinel tag; the directory size is unchanged.
+        live.clear_brick(b, 0);
+        assert_eq!(live.row_count(), n, "directory is fixed-size — clearing never shrinks it");
+        let idx_b = dir_index(b, r) as u32;
+        assert!(live.dirty_rows.contains(&idx_b), "the cleared slot is marked dirty");
+        let eb = live.lookup_at(idx_b);
+        assert_eq!((eb.key_hi, eb.key_lo), SENTINEL_KEY, "cleared slot carries the sentinel tag");
+
+        // The untouched chunk `a` still owns its directory slot.
+        let ea = live.lookup_at(dir_index(a, r) as u32);
+        assert_eq!((ea.key_hi, ea.key_lo), chunk_gpu_key(a), "untouched chunk keeps its tag");
+    }
+
+    /// The incremental [`LiveChunkTables`] must produce GPU buffers the SHADER unpacks back to the
+    /// exact tile each brick was given — same contract as `build_chunk_tables`, but via the live
+    /// path. The shader indexes a chunk's tile run densely (`tile_run_base + popcount(below)`), so a
+    /// region serialized sparse-by-local (gaps at empty slots) resolves bricks to the WRONG tile —
+    /// the "mangled world" the live rework regressed. Mirrors the ground-truth test's brick set so
+    /// the two paths are directly comparable.
+    #[test]
+    fn live_table_resolves_each_brick_to_its_tile() {
+        let cfg = config();
+        let s = cfg.cell_stride();
+        let c = CHUNK_BRICKS;
+        let tile_of = |k: &BrickKey| -> BrickTile {
+            let base = (k.lod << 28)
+                ^ ((k.coord.x as u32) << 16)
+                ^ ((k.coord.y as u32) << 8)
+                ^ (k.coord.z as u32);
+            BrickTile { atlas_base: base, pal01: base ^ 0x1111, pal23: base ^ 0x2222 }
+        };
+
+        let mut keys = Vec::new();
+        // (3,2,1) → local 27, sharing chunk (0,0,0) with locals 0 and 16 → a sparse mask whose
+        // popcount position differs from the raw local index (the densify bug's trigger).
+        for (lx, ly, lz) in [(0, 0, 0), (1, 0, 0), (3, 2, 1)] {
+            keys.push(BrickKey::new(0, IVec3::new(lx * s, ly * s, lz * s)));
+        }
+        keys.push(BrickKey::new(0, IVec3::new(c * s, 0, 0))); // neighbouring chunk
+        keys.push(BrickKey::new(1, IVec3::new(-s, -s, -s))); // lod1 negative chunk
+
+        let mut live = LiveChunkTables::default();
+        for k in &keys {
+            let (ck, local) = chunk_of(*k, &cfg);
+            live.set_brick(ck, local, tile_of(k), &cfg);
+        }
+        let (chunks, tile_run) = live.full_tables();
+        let tables = ChunkTables { chunks, tile_run, r: cfg.ring_bricks as i32 / CHUNK_BRICKS };
+
+        for k in &keys {
+            let got = shader_resolve(&tables, &cfg, *k)
+                .unwrap_or_else(|| panic!("live brick {k:?} failed to resolve"));
+            assert_eq!(got, tile_of(k), "live brick {k:?} resolved to the wrong tile");
+        }
+        // An unoccupied slot in a resident chunk must miss, not alias a packed neighbour.
+        let absent = BrickKey::new(0, IVec3::new(2 * s, 2 * s, 2 * s));
+        assert!(
+            shader_resolve(&tables, &cfg, absent).is_none(),
+            "an unoccupied slot in a resident chunk must not resolve"
+        );
+    }
+
+    /// THE end-to-end differential guard: drive a long randomized set/clear churn through the
+    /// incremental table + its DELTA-UPLOAD protocol (mirroring `render.rs` exactly — full rebuild
+    /// on a capacity grow, else dirty-row / dirty-slot writes + sentinel tail), and after EVERY
+    /// frame resolve every resident brick through the shader's binary-search + popcount unpack. A
+    /// desync anywhere (dense packing, row shift, slot reuse, the shrink OOB, or an over-blanked
+    /// tail from an add-after-remove) maps a brick to the wrong tile or drops it — the corruption
+    /// class that revert proved was in this rework. Deterministic xorshift, no GPU needed.
+    #[test]
+    fn live_delta_upload_matches_ground_truth_under_churn() {
+        use std::collections::HashMap;
+
+        let mut seed: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut rng = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+
+        let cfg = config();
+        let r = cfg.ring_bricks as i32 / CHUNK_BRICKS;
+        let mut live = LiveChunkTables::default();
+        let mut truth: HashMap<(ChunkKey, u32), BrickTile> = HashMap::new();
+
+        // GPU mirror = the dense fixed-size directory + sparse tile-run, exactly the two buffers
+        // `render.rs` maintains (empty directory slots carry the sentinel tag — no separate tail).
+        let mut gpu_rows: Vec<ChunkLookup> = Vec::new();
+        let mut gpu_tiles: Vec<BrickTile> = Vec::new();
+        let mut cap_rows: u32 = 0;
+        let mut cap_slots: u32 = 0;
+
+        // Resolve (ck, local) the way the shader does: direct-index the directory by `dir_index`,
+        // tag-check (sentinel / wrapped-different chunk → miss), then occupancy popcount.
+        let resolve = |rows: &[ChunkLookup], tiles: &[BrickTile], ck: ChunkKey, local: u32| {
+            let idx = dir_index(ck, r);
+            if idx >= rows.len() {
+                return None;
+            }
+            let c = rows[idx];
+            if (c.key_hi, c.key_lo) != chunk_gpu_key(ck) {
+                return None;
+            }
+            let occ = (c.occ_lo as u64) | ((c.occ_hi as u64) << 32);
+            if (occ >> local) & 1 == 0 {
+                return None;
+            }
+            let off = (occ & ((1u64 << local) - 1)).count_ones();
+            Some(tiles[(c.tile_run_base + off) as usize])
+        };
+
+        // Small coord space (≤128 chunks) → heavy row shifting + slot free/reuse, the camera-move
+        // stress that surfaced the bugs.
+        let span = 4u64;
+        for frame in 0u32..4000 {
+            // A real bake frame applies MANY set/clear ops before one upload (one dirty cycle), so
+            // a remove and an add routinely coexist in the same cycle — the case that would
+            // over-blank the sentinel tail if `sentinel_tail_from` tracked the wrong floor. Batch
+            // them here; bias toward `set` early so the table fills before churn dominates.
+            let batch = 1 + (rng() % 24);
+            for _ in 0..batch {
+                let r = rng();
+                let ck = ChunkKey::new(
+                    ((r >> 24) % 2) as u32,
+                    IVec3::new(
+                        (r % span) as i32,
+                        ((r >> 8) % span) as i32,
+                        ((r >> 16) % span) as i32,
+                    ),
+                );
+                let local = ((r >> 32) % CHUNK_VOLUME as u64) as u32;
+                // ~60% sets so churn reaches a populated steady state (not mostly-empty).
+                if (r >> 48) % 5 < 3 {
+                    let t = BrickTile {
+                        atlas_base: r as u32 ^ frame.wrapping_mul(2_654_435_761),
+                        pal01: r as u32 ^ 0xAAAA,
+                        pal23: (r >> 16) as u32 ^ 0x5555,
+                    };
+                    live.set_brick(ck, local, t, &cfg);
+                    truth.insert((ck, local), t);
+                } else {
+                    live.clear_brick(ck, local);
+                    truth.remove(&(ck, local));
+                }
+            }
+
+            // --- apply the upload exactly as render.rs's extract/prepare would ---
+            let needed_rows = live.row_count();
+            let needed_slots = live.tile_run_capacity();
+            // The directory (chunk_buf) is FIXED-size, so it only "grows" once (when first sized) —
+            // size it exactly. The sparse tile-run still grows; give it headroom. A delta frame writes
+            // only the dirty directory slots + tile-run regions, in place (no shift, no sentinel tail).
+            if cap_rows == 0 || needed_rows > cap_rows || needed_slots > cap_slots {
+                cap_rows = needed_rows;
+                cap_slots = (needed_slots + needed_slots / 2).max(needed_slots + TILE_RUN_SLOT);
+                let (rows, tiles) = live.full_tables();
+                gpu_rows = rows;
+                gpu_tiles = tiles;
+                gpu_tiles.resize(cap_slots as usize, BrickTile::default());
+            } else {
+                for &row in &live.dirty_rows {
+                    gpu_rows[row as usize] = live.lookup_at(row);
+                }
+                for &slot in &live.dirty_slots {
+                    let base = (slot * TILE_RUN_SLOT) as usize;
+                    gpu_tiles[base..base + TILE_RUN_SLOT as usize]
+                        .copy_from_slice(&live.tile_region(slot));
+                }
+            }
+            live.clear_dirty();
+
+            // --- verify the mirror against ground truth ---
+            for (&(ck, local), &t) in &truth {
+                match resolve(&gpu_rows, &gpu_tiles, ck, local) {
+                    Some(got) => assert_eq!(
+                        got, t,
+                        "frame {frame}: brick {ck:?} local {local} resolved to the wrong tile"
+                    ),
+                    None => panic!("frame {frame}: resident brick {ck:?} local {local} failed to resolve"),
+                }
+            }
+            // A non-resident slot in a (possibly resident) chunk must miss — never alias.
+            let p = rng();
+            let probe_ck = ChunkKey::new(0, IVec3::new((p % span) as i32, 0, 0));
+            let probe_local = ((p >> 40) % CHUNK_VOLUME as u64) as u32;
+            if !truth.contains_key(&(probe_ck, probe_local)) {
+                assert!(
+                    resolve(&gpu_rows, &gpu_tiles, probe_ck, probe_local).is_none(),
+                    "frame {frame}: absent brick {probe_ck:?} local {probe_local} wrongly resolved"
+                );
             }
         }
     }

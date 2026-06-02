@@ -28,14 +28,16 @@ struct FullscreenVertexOutput {
 
 /// The SDF module files, in dependency order (a module must be added before any
 /// module that imports it). The entry shader is composed last via `make_naga_module`.
-const SDF_MODULES: [&str; 7] = [
+const SDF_MODULES: [&str; 9] = [
     "assets/shaders/sdf/bindings.wgsl",
     "assets/shaders/sdf/brick.wgsl",
-    "assets/shaders/sdf/cubic.wgsl",
     "assets/shaders/sdf/material.wgsl",
     "assets/shaders/sdf/shadows.wgsl",
     "assets/shaders/sdf/sky.wgsl",
     "assets/shaders/sdf/pbr.wgsl",
+    "assets/shaders/sdf/oct.wgsl",
+    "assets/shaders/sdf/march.wgsl",
+    "assets/shaders/sdf/brdf.wgsl",
 ];
 
 const SDF_ENTRY: &str = "assets/shaders/sdf_raymarch.wgsl";
@@ -164,31 +166,92 @@ fn sdf_brick_bake_wgsl_validates() {
 
 #[test]
 fn sdf_debug_modes_validate() {
+    // The primary pass is now a pure G-buffer export (no inline debug overlays — those return
+    // through the composite in a later stage). Only the march-internal toggles remain
+    // meaningful here; they still gate `#ifdef` branches in the brick/march modules.
     for def in [
-        "SDF_DEBUG_STEP_COUNT",
-        "SDF_DEBUG_BVH_STEPS",
-        "SDF_DEBUG_NORMALS",
-        "SDF_DEBUG_OBJECT_ID",
-        "SDF_DEBUG_BRICK_BOUNDS",
-        "SDF_DEBUG_RAY_FATE",
-        "SDF_DEBUG_LOD",
         "SDF_DISABLE_CHUNK_CACHE",
         "SDF_DISABLE_LOD",
-        "SDF_DISABLE_CUBIC",
         "SDF_LINEAR_CHUNK_SEARCH",
-        "SDF_DEBUG_TILE_ID",
-        "SDF_DEBUG_CHUNK_ID",
+        "SDF_DEBUG_LOD",
     ] {
         validate_composed_sdf_with_defs(&[def]).unwrap_or_else(|e| panic!("{e}"));
     }
 }
 
-/// PBR feature toggles (shadows/reflections/parallax) gate `#ifdef` branches that the
-/// default compose skips — validate each so errors inside them are caught.
+/// PBR feature toggles gate `#ifdef` branches that the default compose skips — validate each
+/// so errors inside them are caught. (Reflections were removed from the primary pass; shadows
+/// remain in `pbr.wgsl`, consumed by the composite.)
 #[test]
 fn sdf_feature_defs_validate() {
-    for def in ["SDF_SHADOWS", "SDF_REFLECTIONS"] {
-        validate_composed_sdf_with_defs(&[def]).unwrap_or_else(|e| panic!("{e}"));
+    // Only SDF_SHADOWS remains a standalone feature def (reflections were removed); validate it
+    // composes on its own so errors inside its `#ifdef` branch are caught.
+    validate_composed_sdf_with_defs(&["SDF_SHADOWS"]).unwrap_or_else(|e| panic!("{e}"));
+}
+
+/// Compose + validate a STANDALONE entry shader that imports only the named binding-free helper
+/// modules (NOT the atlas-bound sdf::bindings graph) plus the fullscreen stub, with the given
+/// shader defs enabled (so `#ifdef` debug branches actually compile).
+fn validate_standalone_with_defs(entry: &str, modules: &[&str], defs: &[&str]) {
+    use naga_oil::compose::ShaderDefValue;
+    use std::collections::HashMap;
+
+    let mut composer = composer_with_stub();
+    for path in modules {
+        let source = std::fs::read_to_string(path).unwrap_or_else(|e| panic!("read {path}: {e}"));
+        composer
+            .add_composable_module(ComposableModuleDescriptor {
+                source: &source,
+                file_path: path,
+                language: ShaderLanguage::Wgsl,
+                ..Default::default()
+            })
+            .unwrap_or_else(|e| panic!("compose {path} failed: {e}"));
+    }
+    let shader_defs: HashMap<String, ShaderDefValue> = defs
+        .iter()
+        .map(|d| ((*d).to_string(), ShaderDefValue::Bool(true)))
+        .collect();
+    let entry_src = std::fs::read_to_string(entry).unwrap_or_else(|e| panic!("read {entry}: {e}"));
+    let module = composer
+        .make_naga_module(NagaModuleDescriptor {
+            source: &entry_src,
+            file_path: entry,
+            shader_defs,
+            ..Default::default()
+        })
+        .unwrap_or_else(|e| panic!("compose {entry} (defs={defs:?}) failed:\n{e}"));
+    let mut validator = naga::valid::Validator::new(
+        naga::valid::ValidationFlags::all(),
+        naga::valid::Capabilities::all(),
+    );
+    validator
+        .validate(&module)
+        .unwrap_or_else(|e| panic!("WGSL validation error in {entry} (defs={defs:?}):\n{e:?}"));
+}
+
+/// As above with no defs.
+fn validate_standalone_with_modules(entry: &str, modules: &[&str]) {
+    validate_standalone_with_defs(entry, modules, &[]);
+}
+
+#[test]
+fn sdf_deferred_lit_wgsl_validates() {
+    // The deferred lit pass imports `sdf::oct` + `sdf::brdf` (binding-free). Validate the default
+    // (lit) build AND each `#ifdef`-gated debug-view branch so errors inside them are caught.
+    let modules = ["assets/shaders/sdf/oct.wgsl", "assets/shaders/sdf/brdf.wgsl"];
+    let entry = "assets/shaders/sdf_deferred_lit.wgsl";
+    validate_standalone_with_modules(entry, &modules);
+    for def in [
+        "SDF_DEBUG_ALBEDO",
+        "SDF_DEBUG_NORMALS",
+        "SDF_DEBUG_METALLIC",
+        "SDF_DEBUG_ROUGHNESS",
+        "SDF_DEBUG_EMISSIVE",
+        "SDF_DEBUG_SUN_VIS",
+        "SDF_DEBUG_DEPTH",
+    ] {
+        validate_standalone_with_defs(entry, &modules, &[def]);
     }
 }
 

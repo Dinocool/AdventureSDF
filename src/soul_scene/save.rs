@@ -10,25 +10,43 @@ use bevy::prelude::*;
 use bevy::reflect::TypeRegistry;
 use bevy::reflect::serde::ReflectSerializer;
 
-use crate::scene_manager::SceneEntity;
+use crate::scene_manager::{EditorEntity, SceneEntity};
 
 use super::format::{ComponentMap, LocalId, SceneFile, SceneRecord};
-use super::{EditorHidden, InstanceChild, NonSerializable, SceneInstance, SkipSerialization};
+use super::{
+    EditorHidden, InstanceChild, NonSerializable, ReflectSerializeSkip, SceneInstance,
+    SkipSerialization,
+};
 
-/// Type paths never written to a `.scene`: engine/editor markers and bookkeeping
-/// that the loader re-derives or that carry no authored data.
+/// Foreign (engine) type paths never written to a `.scene`: runtime-derived/bookkeeping
+/// components on `bevy_*` crates that we can't annotate. Our *own* components opt out at
+/// their definition with `#[reflect(SerializeSkip)]` instead (see [`ReflectSerializeSkip`]).
 const SKIP_TYPE_PATHS: &[&str] = &[
-    "adventure::scene_manager::SceneEntity",
-    "adventure::soul_scene::format::LocalId",
-    "adventure::soul_scene::SceneInstance",
-    "adventure::soul_scene::InstanceChild",
-    "adventure::soul_scene::NonSerializable",
-    "adventure::soul_scene::SkipSerialization",
-    "adventure::soul_scene::EditorHidden",
     // Hierarchy is persisted as a stable parent `LocalId` on each record (see
     // `parent_local_id`), not as the raw `Entity` in `ChildOf`.
     "bevy_ecs::hierarchy::ChildOf",
     "bevy_ecs::hierarchy::Children",
+    // Render-world sync bookkeeping. `RenderEntity` holds a render-world entity id that is
+    // only valid for the live run; serializing + restoring it makes Bevy try to sync an
+    // already-synced entity ("Attempting to synchronize an entity that has already been
+    // synchronized!"). Both are re-added automatically as required components on load.
+    "bevy_render::sync_world::RenderEntity",
+    "bevy_render::sync_world::SyncToRenderWorld",
+    // Transform-derived: `GlobalTransform` is recomputed from `Transform` by propagation,
+    // and `TransformTreeChanged` is a per-frame dirty flag. Saving them is redundant and
+    // restoring a stale `GlobalTransform` would fight propagation for a frame.
+    "bevy_transform::components::global_transform::GlobalTransform",
+    "bevy_transform::components::transform::TransformTreeChanged",
+    // Light/visibility runtime state, auto-added as required components of lights/cameras
+    // and rebuilt every frame — never authored, never restored.
+    "bevy_camera::primitives::CascadesFrusta",
+    "bevy_camera::visibility::CascadesVisibleEntities",
+    "bevy_camera::visibility::InheritedVisibility",
+    "bevy_camera::visibility::ViewVisibility",
+    // Auto-added required component of `Visibility`; holds `TypeId`s, which have no
+    // `ReflectSerialize` — serializing it only spams warnings (it's never authored).
+    "bevy_camera::visibility::VisibilityClass",
+    "bevy_light::cascade::Cascades",
 ];
 
 /// Errors raised while saving a `.scene`.
@@ -47,12 +65,22 @@ impl std::fmt::Display for SceneSaveError {
     }
 }
 
-/// Serialize the world's scene entities to a `.scene` RON string.
+/// Serialize the world's scene entities to a `.scene` RON string (no camera).
 pub fn save_scene_to_string(
     world: &mut World,
     registry: &TypeRegistry,
 ) -> Result<String, SceneSaveError> {
-    let file = build_scene_file(world, registry);
+    save_scene_to_string_with_camera(world, registry, None)
+}
+
+/// Like [`save_scene_to_string`] but embeds `camera` (the editor's saved view) in the file.
+pub fn save_scene_to_string_with_camera(
+    world: &mut World,
+    registry: &TypeRegistry,
+    camera: Option<super::EditorCamera>,
+) -> Result<String, SceneSaveError> {
+    let mut file = build_scene_file(world, registry);
+    file.editor_camera = camera;
     file.to_ron()
         .map_err(|e| SceneSaveError::Serialize(e.to_string()))
 }
@@ -78,6 +106,7 @@ fn build_scene_file(world: &mut World, registry: &TypeRegistry) -> SceneFile {
     let mut entity_ids: Vec<(Entity, LocalId)> = world
         .query_filtered::<(Entity, &LocalId), (
             With<SceneEntity>,
+            Without<EditorEntity>,
             Without<InstanceChild>,
             Without<NonSerializable>,
             Without<SkipSerialization>,
@@ -120,6 +149,7 @@ fn build_scene_file(world: &mut World, registry: &TypeRegistry) -> SceneFile {
     SceneFile {
         next_id: max_id + 1,
         records,
+        editor_camera: None,
     }
 }
 
@@ -161,7 +191,11 @@ fn serialize_entity_components(
 
     for registration in registry.iter() {
         let type_path = registration.type_info().type_path();
-        if SKIP_TYPE_PATHS.contains(&type_path) {
+        // Our own components opt out via the `SerializeSkip` tag; foreign engine components
+        // (which we can't annotate) are covered by the path list.
+        if registration.data::<ReflectSerializeSkip>().is_some()
+            || SKIP_TYPE_PATHS.contains(&type_path)
+        {
             continue;
         }
         let Some(reflect_component) = registration.data::<ReflectComponent>() else {

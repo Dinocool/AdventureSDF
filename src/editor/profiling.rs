@@ -61,8 +61,29 @@ fn collect_profiling_data(
 
 /// The dedicated Performance dock panel: current readout + a shared graph plotting both
 /// the FPS history and the frame-time history (two series, independently auto-scaled, in
-/// one graph area).
+/// one graph area), followed by the SDF GPU-atlas stats. The whole panel scrolls.
 pub fn performance_panel(world: &mut World, ui: &mut egui::Ui) {
+    egui::ScrollArea::vertical()
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            perf_graph_ui(world, ui);
+
+            // Chrome-trace capture toggle (off by default). Records Bevy system /
+            // render-graph spans to a JSON file only while enabled.
+            ui.separator();
+            ui.heading("Profiling capture");
+            crate::editor::chrome_trace::capture_ui(world, ui);
+
+            // GPU / SDF atlas stats, rolled in from the (now-removed) SDF Atlas tab.
+            ui.separator();
+            ui.heading("GPU");
+            let stats = world.resource::<crate::sdf_render::debug::SdfAtlasStats>();
+            crate::sdf_render::debug::atlas_stats_ui(stats, ui);
+        });
+}
+
+/// The FPS + frame-time readout and graph.
+fn perf_graph_ui(world: &mut World, ui: &mut egui::Ui) {
     let data = world.resource::<ShaderProfilingData>();
     let fps: Vec<f32> = data.fps_history.iter().copied().collect();
     let frame_time: Vec<f32> = data.frame_time_history.iter().copied().collect();

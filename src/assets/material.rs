@@ -33,6 +33,14 @@ pub struct MaterialAsset {
     /// Parallax relief depth (UV units) for the height map.
     #[serde(default = "default_parallax")]
     pub parallax_scale: f32,
+    /// Emissive (self-lit) colour, linear RGB. The material emits this × `emissive_intensity`
+    /// as radiance regardless of incident light — and it feeds the GI, so a
+    /// glowing object lights its surroundings. `#[serde(default)]` → black for legacy RON.
+    #[serde(default)]
+    pub emissive_color: [f32; 3],
+    /// Emissive strength multiplier (0 = off). `#[serde(default)]` → 0.
+    #[serde(default)]
+    pub emissive_intensity: f32,
     /// Path (relative to `assets/`) of the `.pbrtex.ron` PBR-texture bundle this
     /// material uses. `None` = untextured. `#[serde(default)]` for back-compat.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -62,6 +70,8 @@ impl Default for MaterialAsset {
             metallic: 0.0,
             roughness: 1.0,
             parallax_scale: 0.15,
+            emissive_color: [0.0, 0.0, 0.0],
+            emissive_intensity: 0.0,
             texture: None,
             overrides: PbrTextureAsset::default(),
         }

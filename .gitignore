@@ -17,7 +17,17 @@ assets/scenes/untitled.scene
 # Chrome tracing profiler output (editor feature)
 trace-*.json
 
-# RenderDoc captures + analysis artifacts
-rdoc/
+# Editor-side context: persisted dock layout + named layouts (per-machine, never committed).
+.soul/
+
+# RenderDoc captures + analysis artifacts: ignore the scratch dir (multi-GB .rdc captures,
+# .png/.zip dumps, *_out.txt) BUT keep the reusable analysis toolkit (rdoc/scripts/)
+# tracked. Re-include needs the parent dir un-ignored first, hence the !rdoc/scripts line.
+rdoc/*
+!rdoc/scripts/
+rdoc/scripts/**/__pycache__/
 *.cap
 *.rdc
+
+# Dear ImGui / Nsight overlay config dropped next to the exe during a capture.
+imgui.ini

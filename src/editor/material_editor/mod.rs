@@ -13,7 +13,7 @@ mod roles;
 
 pub use discovery::{discover_variants, material_picker_entries};
 pub use io::{
-    handle_for_path, material_path_for_registry_id, pbrtex_handle_for_path, save_material,
+    handle_for_path, pbrtex_handle_for_path, save_material,
     save_pbr_texture,
 };
 pub use roles::pbr_texture_roles_ui;
@@ -78,6 +78,19 @@ pub fn material_editor_ui(world: &mut World, handle: &Handle<MaterialAsset>, ui:
         ui.add(egui::Slider::new(&mut edited.blend_softness, 0.0..=1.0).text("Blend softness"));
         ui.add(egui::Slider::new(&mut edited.metallic, 0.0..=1.0).text("Metallic"));
         ui.add(egui::Slider::new(&mut edited.roughness, 0.0..=1.0).text("Roughness"));
+
+        // Emissive (self-lit) colour + intensity. The shader emits `color × intensity` as
+        // radiance — this is also the GI light source, so a glowing material
+        // lights its surroundings. `color_edit_button_rgb` edits the `[f32; 3]` in place.
+        ui.horizontal(|ui| {
+            ui.label("Emissive");
+            ui.color_edit_button_rgb(&mut edited.emissive_color);
+        });
+        ui.add(
+            egui::Slider::new(&mut edited.emissive_intensity, 0.0..=1000.0)
+                .logarithmic(true)
+                .text("Emissive intensity"),
+        );
 
         ui.separator();
         ui.label("PBR Texture");

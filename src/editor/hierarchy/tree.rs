@@ -5,6 +5,7 @@
 use bevy::prelude::*;
 
 use crate::node::SceneNode;
+use crate::scene_manager::EditorEntity;
 use crate::sdf_render::SdfPrimitive;
 use crate::soul_scene::{EditorHidden, SkipSerialization};
 
@@ -102,7 +103,12 @@ pub(super) fn collect_tree(world: &mut World, needle: &str) -> (Vec<NodeRow>, Ve
             Has<DirectionalLight>,
             Has<Camera3d>,
             Has<Transform>,
-        ), (With<SceneNode>, Without<EditorHidden>, Without<SkipSerialization>)>()
+        ), (
+            With<SceneNode>,
+            Without<EditorEntity>,
+            Without<EditorHidden>,
+            Without<SkipSerialization>,
+        )>()
         .iter(world)
         .map(|(e, name, parent, children, prim, is_light, is_cam, has_xf)| {
             let kind = if prim.is_some() {

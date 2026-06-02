@@ -134,7 +134,6 @@ fn gather_pbr(id: u32, wpos: vec3<f32>, geo_n: vec3<f32>, lod: f32) -> PbrInputs
     // moves the hit `wpos` onto the displaced surface before this is called — so the maps here
     // already sample the carved surface position. No UV-shift parallax here.
     let albedo = sample_material_map(id, 0u, wpos, geo_n, lod).rgb * mat.base_color.rgb;
-    let edge = sample_material_map(id, 4u, wpos, geo_n, lod).r;
     let nrm = triplanar_normal(id, wpos, geo_n, lod);
 
     // Metallic / roughness / AO: from the MRA texture when present, else the material's
@@ -155,10 +154,17 @@ fn gather_pbr(id: u32, wpos: vec3<f32>, geo_n: vec3<f32>, lod: f32) -> PbrInputs
     }
 
     // Edge-wear: convex edges (bright in the edge map) read as worn — lighter and
-    // rougher, a cheap stand-in for exposed/scuffed material until it's art-driven.
+    // rougher, a cheap stand-in for exposed/scuffed material until it's art-driven. Gated
+    // behind SDF_EDGE_WEAR because the edge-map sample is 2 fullscreen texture taps
+    // (biplanar) that every hit pixel pays whether or not the material has edge detail.
+    var albedo_worn = albedo;
+    var rough_worn = rough;
+#ifdef SDF_EDGE_WEAR
+    let edge = sample_material_map(id, 4u, wpos, geo_n, lod).r;
     let wear = smoothstep(0.6, 1.0, edge);
-    let albedo_worn = mix(albedo, albedo * 1.3 + vec3<f32>(0.05), wear * 0.5);
-    let rough_worn = clamp(rough + wear * 0.3, 0.04, 1.0);
+    albedo_worn = mix(albedo, albedo * 1.3 + vec3<f32>(0.05), wear * 0.5);
+    rough_worn = clamp(rough + wear * 0.3, 0.04, 1.0);
+#endif
 
     return PbrInputs(albedo_worn, nrm, metal, rough_worn, ao);
 }
@@ -204,13 +210,29 @@ fn shade_surface(
     res_lod: u32,
     env_radiance: vec3<f32>,
 ) -> vec3<f32> {
+    return shade_surface_opt(p, wpos, geo_n, res_lod, env_radiance, true);
+}
+
+// `trace_shadow` lets a SECONDARY hit (a reflected surface) skip the shadow march. That
+// shadow is a whole extra ray per reflecting pixel and is imperceptible inside a reflection,
+// so the reflection path passes `false` (shadow = fully lit). Primary hits pass `true`.
+fn shade_surface_opt(
+    p: PbrInputs,
+    wpos: vec3<f32>,
+    geo_n: vec3<f32>,
+    res_lod: u32,
+    env_radiance: vec3<f32>,
+    trace_shadow: bool,
+) -> vec3<f32> {
     let view_dir = normalize(camera.camera_pos.xyz - wpos);
     let light_dir = sun_dir();
     let light_color = sun_color();
 
     var shadow = 1.0;
 #ifdef SDF_SHADOWS
-    shadow = surface_shadow(wpos, geo_n, light_dir, res_lod, 256.0);
+    if (trace_shadow) {
+        shadow = surface_shadow(wpos, geo_n, light_dir, res_lod, 256.0);
+    }
 #endif
 
     let direct = shade_pbr(
@@ -225,7 +247,8 @@ fn shade_surface(
 
 // Convenience: resolve + shade with the analytic sky as the environment. Used for the
 // reflection ray's own hit (one bounce — no further reflection) and any caller that
-// doesn't trace reflections. Returns LINEAR radiance.
+// doesn't trace reflections. Returns LINEAR radiance. `trace_shadow` false skips the
+// reflected surface's own shadow march (see shade_surface_opt) — for the reflection path.
 fn shade_material_env(
     res: SceneSdfResult,
     wpos: vec3<f32>,
@@ -234,5 +257,16 @@ fn shade_material_env(
     env_radiance: vec3<f32>,
 ) -> vec3<f32> {
     let p = resolve_surface(res, wpos, geo_n, lod);
-    return shade_surface(p, wpos, geo_n, res.lod, env_radiance);
+    return shade_surface_opt(p, wpos, geo_n, res.lod, env_radiance, true);
+}
+
+fn shade_material_env_cheap(
+    res: SceneSdfResult,
+    wpos: vec3<f32>,
+    geo_n: vec3<f32>,
+    lod: f32,
+    env_radiance: vec3<f32>,
+) -> vec3<f32> {
+    let p = resolve_surface(res, wpos, geo_n, lod);
+    return shade_surface_opt(p, wpos, geo_n, res.lod, env_radiance, false);
 }

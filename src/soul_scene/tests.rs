@@ -127,6 +127,7 @@ fn nested_instance_applies_override_and_resaves_only_diff() {
             source: src.clone(),
             overrides,
         }],
+        editor_camera: None,
     };
     let parent_path = temp_scene("nested_parent");
     std::fs::write(&parent_path, parent.to_ron().unwrap()).unwrap();
@@ -177,6 +178,7 @@ fn deep_nesting_composes() {
             source: c.clone(),
             overrides: Default::default(),
         }],
+        editor_camera: None,
     };
     std::fs::write(&b, b_file.to_ron().unwrap()).unwrap();
 
@@ -190,6 +192,7 @@ fn deep_nesting_composes() {
             source: b.clone(),
             overrides: Default::default(),
         }],
+        editor_camera: None,
     };
     std::fs::write(&a, a_file.to_ron().unwrap()).unwrap();
 
@@ -272,6 +275,7 @@ fn cyclic_instance_errors() {
             source: b.clone(),
             overrides: Default::default(),
         }],
+        editor_camera: None,
     };
     let b_file = SceneFile {
         next_id: 1,
@@ -281,6 +285,7 @@ fn cyclic_instance_errors() {
             source: a.clone(),
             overrides: Default::default(),
         }],
+        editor_camera: None,
     };
     std::fs::write(&a, a_file.to_ron().unwrap()).unwrap();
     std::fs::write(&b, b_file.to_ron().unwrap()).unwrap();
