@@ -1233,15 +1233,6 @@ fn extract_sdf_atlas(
         capacity.rows = required_rows;
     }
 
-    // Decide full rebuild vs incremental delta for the chunk tables. The render world's
-    // `ChunkBufCapacity` is a render-world resource (extract runs in the render world), so extract
-    // owns this decision: rebuild on the first upload (capacity 0) or when the table outgrows the
-    // allocated buffers; otherwise page only the rows/regions the live table marked dirty.
-    let needed_rows = live.row_count();
-    let needed_slots = live.tile_run_capacity();
-    let must_rebuild =
-        chunk_cap.chunk_rows == 0 || needed_rows > chunk_cap.chunk_rows || needed_slots > chunk_cap.tile_slots;
-
     let mut extracted = ExtractedSdfAtlas {
         texture_width,
         texture_height,
@@ -1250,42 +1241,34 @@ fn extract_sdf_atlas(
         ..Default::default()
     };
 
-    if must_rebuild {
-        // The chunk_buf is now the FIXED-size toroidal directory (R³·lod_count) — it never grows, so
-        // size it EXACTLY (no headroom). The tile-run buffer is still sparse and can grow, so keep
-        // headroom there (+50%) to avoid recreating it every frame.
-        let cap_rows = needed_rows;
-        let cap_slots =
-            (needed_slots + needed_slots / 2).max(needed_slots + super::chunk::TILE_RUN_SLOT);
-        chunk_cap.chunk_rows = cap_rows;
-        chunk_cap.tile_slots = cap_slots;
-
-        let (chunks, tile_run) = live.full_tables();
-        extracted.chunk_data = chunks.into_iter().map(to_gpu_lookup).collect();
-        extracted.tile_run_data = tile_run.into_iter().map(to_gpu_tile).collect();
-        extracted.new_chunk_len = needed_rows;
-        extracted.chunk_cap_needed = cap_rows;
-        extracted.tile_cap_needed = cap_slots;
-        extracted.full_rebuild = true;
-        extracted.tables_dirty = true;
-    } else {
-        // Delta: only the directory slots + tile-run regions the live table marked dirty this frame.
-        // The directory is fixed-position, so every dirty slot is an in-place write — no row shift,
-        // no sentinel tail. The dirty record is cleared on the main world next frame.
-        let chunk_rows: Vec<(u32, GpuChunkLookup)> = live
-            .dirty_rows
-            .iter()
-            .map(|&r| (r, to_gpu_lookup(live.lookup_at(r))))
-            .collect();
-        let tile_runs: Vec<(u32, Vec<GpuBrickTile>)> = live
-            .dirty_slots
-            .iter()
-            .map(|&s| (s, live.tile_region(s).into_iter().map(to_gpu_tile).collect()))
-            .collect();
-        extracted.tables_dirty = !chunk_rows.is_empty() || !tile_runs.is_empty();
-        extracted.chunk_row_updates = chunk_rows;
-        extracted.tile_run_updates = tile_runs;
-        extracted.new_chunk_len = needed_rows;
+    // Full-rebuild-vs-delta + the tile-run headroom policy live on `LiveChunkTables::upload` (the
+    // SINGLE source of truth, mirrored by the churn + recenter-lifecycle differential tests). Extract
+    // passes its render-world buffer capacities in and maps the returned NATIVE records onto the GPU
+    // mirror; the directory is fixed-size so a Full only happens on first upload / a tile-run grow.
+    match live.upload(chunk_cap.chunk_rows, chunk_cap.tile_slots) {
+        super::chunk::ChunkUpload::Full { rows, tile_run, cap_rows, cap_slots } => {
+            chunk_cap.chunk_rows = cap_rows;
+            chunk_cap.tile_slots = cap_slots;
+            extracted.chunk_data = rows.into_iter().map(to_gpu_lookup).collect();
+            extracted.tile_run_data = tile_run.into_iter().map(to_gpu_tile).collect();
+            extracted.new_chunk_len = cap_rows;
+            extracted.chunk_cap_needed = cap_rows;
+            extracted.tile_cap_needed = cap_slots;
+            extracted.full_rebuild = true;
+            extracted.tables_dirty = true;
+        }
+        super::chunk::ChunkUpload::Delta { row_updates, region_updates } => {
+            // Fixed-position directory → every dirty entry is an in-place index→value write.
+            extracted.chunk_row_updates =
+                row_updates.into_iter().map(|(r, l)| (r, to_gpu_lookup(l))).collect();
+            extracted.tile_run_updates = region_updates
+                .into_iter()
+                .map(|(s, reg)| (s, reg.into_iter().map(to_gpu_tile).collect()))
+                .collect();
+            extracted.tables_dirty =
+                !extracted.chunk_row_updates.is_empty() || !extracted.tile_run_updates.is_empty();
+            extracted.new_chunk_len = live.row_count();
+        }
     }
 
     commands.insert_resource(extracted);

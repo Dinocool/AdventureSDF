@@ -278,9 +278,35 @@ pub struct LiveChunkTables {
     r: i32,
 
     /// Directory slots whose `ChunkLookup` changed this frame (GPU `chunk_buf` indices to re-upload).
-    pub dirty_rows: BTreeSet<u32>,
+    /// Private: the per-frame delta is exposed only through [`LiveChunkTables::upload`], so the
+    /// full-rebuild-vs-delta policy has a single owner (was leaked + read by render.rs + two tests).
+    dirty_rows: BTreeSet<u32>,
     /// Tile-run slots whose 64-entry region changed this frame.
-    pub dirty_slots: BTreeSet<u32>,
+    dirty_slots: BTreeSet<u32>,
+}
+
+/// What the render world must write to the GPU lookup buffers this frame, produced by
+/// [`LiveChunkTables::upload`] — the SINGLE owner of the full-rebuild-vs-delta decision and the
+/// tile-run headroom policy (was hand-copied in `render.rs` extract, the churn-differential test,
+/// and the bake-scheduler lifecycle mirror). Carries NATIVE chunk records; the render world maps
+/// them onto its GPU mirror, the test mirrors apply them in place.
+pub enum ChunkUpload {
+    /// Recreate both buffers: the directory outgrew the allocated `chunk_buf`, the tile-run outgrew
+    /// its slots, or this is the first upload. `tile_run` is UNPADDED (`slot_high_water *
+    /// TILE_RUN_SLOT` entries) — the caller sizes the GPU buffer to `cap_slots` and pads the tail.
+    /// `cap_rows`/`cap_slots` are the capacities to (re)allocate to.
+    Full {
+        rows: Vec<ChunkLookup>,
+        tile_run: Vec<BrickTile>,
+        cap_rows: u32,
+        cap_slots: u32,
+    },
+    /// In-place writes: the dirty directory slots + their dense tile-run regions. The directory is
+    /// fixed-position, so every entry is an index→value write (no shift, no realloc).
+    Delta {
+        row_updates: Vec<(u32, ChunkLookup)>,
+        region_updates: Vec<(u32, [BrickTile; CHUNK_VOLUME as usize])>,
+    },
 }
 
 /// An empty directory slot: the [`SENTINEL_KEY`] tag (never matches a real chunk), no occupancy.
@@ -452,6 +478,30 @@ impl LiveChunkTables {
                 .copy_from_slice(&Self::dense_region(&self.chunks[ck]));
         }
         (self.dir.clone(), tile_run)
+    }
+
+    /// Decide and materialize this frame's GPU lookup-buffer upload against the caller's CURRENT
+    /// buffer capacities (`cap_rows` = current `chunk_buf` length, `cap_slots` = current tile-run
+    /// length). Returns [`ChunkUpload::Full`] (with the capacities to grow to) on the first upload
+    /// (`cap_rows == 0`) or when the tables outgrew the buffers, else [`ChunkUpload::Delta`] carrying
+    /// only the slots/regions marked dirty since the last [`clear_dirty`](Self::clear_dirty). The
+    /// full-rebuild predicate and the tile-run headroom (+50%, min one extra slot) live HERE and
+    /// nowhere else — every consumer (render extract + the test mirrors) routes through this.
+    pub fn upload(&self, cap_rows: u32, cap_slots: u32) -> ChunkUpload {
+        let needed_rows = self.row_count();
+        let needed_slots = self.tile_run_capacity();
+        if cap_rows == 0 || needed_rows > cap_rows || needed_slots > cap_slots {
+            // The directory (chunk_buf) is FIXED-size — size it EXACTLY (no headroom; it never
+            // grows again). The sparse tile-run can grow, so give it +50% (min one extra slot) to
+            // avoid recreating it every frame.
+            let new_cap_slots = (needed_slots + needed_slots / 2).max(needed_slots + TILE_RUN_SLOT);
+            let (rows, tile_run) = self.full_tables();
+            ChunkUpload::Full { rows, tile_run, cap_rows: needed_rows, cap_slots: new_cap_slots }
+        } else {
+            let row_updates = self.dirty_rows.iter().map(|&r| (r, self.lookup_at(r))).collect();
+            let region_updates = self.dirty_slots.iter().map(|&s| (s, self.tile_region(s))).collect();
+            ChunkUpload::Delta { row_updates, region_updates }
+        }
     }
 
     /// Clear the per-frame delta record. Called from the main world AFTER the render world has
@@ -936,27 +986,25 @@ mod tests {
                 }
             }
 
-            // --- apply the upload exactly as render.rs's extract/prepare would ---
-            let needed_rows = live.row_count();
-            let needed_slots = live.tile_run_capacity();
-            // The directory (chunk_buf) is FIXED-size, so it only "grows" once (when first sized) —
-            // size it exactly. The sparse tile-run still grows; give it headroom. A delta frame writes
-            // only the dirty directory slots + tile-run regions, in place (no shift, no sentinel tail).
-            if cap_rows == 0 || needed_rows > cap_rows || needed_slots > cap_slots {
-                cap_rows = needed_rows;
-                cap_slots = (needed_slots + needed_slots / 2).max(needed_slots + TILE_RUN_SLOT);
-                let (rows, tiles) = live.full_tables();
-                gpu_rows = rows;
-                gpu_tiles = tiles;
-                gpu_tiles.resize(cap_slots as usize, BrickTile::default());
-            } else {
-                for &row in &live.dirty_rows {
-                    gpu_rows[row as usize] = live.lookup_at(row);
+            // --- apply the upload exactly as render.rs's extract/prepare would, through the SAME
+            // `LiveChunkTables::upload` accessor that owns the rebuild-vs-delta + headroom policy. A
+            // Full sizes the buffers once; a Delta writes only the dirty slots/regions, in place. ---
+            match live.upload(cap_rows, cap_slots) {
+                ChunkUpload::Full { rows, tile_run, cap_rows: cr, cap_slots: cs } => {
+                    cap_rows = cr;
+                    cap_slots = cs;
+                    gpu_rows = rows;
+                    gpu_tiles = tile_run;
+                    gpu_tiles.resize(cap_slots as usize, BrickTile::default());
                 }
-                for &slot in &live.dirty_slots {
-                    let base = (slot * TILE_RUN_SLOT) as usize;
-                    gpu_tiles[base..base + TILE_RUN_SLOT as usize]
-                        .copy_from_slice(&live.tile_region(slot));
+                ChunkUpload::Delta { row_updates, region_updates } => {
+                    for (row, look) in row_updates {
+                        gpu_rows[row as usize] = look;
+                    }
+                    for (slot, region) in region_updates {
+                        let base = (slot * TILE_RUN_SLOT) as usize;
+                        gpu_tiles[base..base + TILE_RUN_SLOT as usize].copy_from_slice(&region);
+                    }
                 }
             }
             live.clear_dirty();
