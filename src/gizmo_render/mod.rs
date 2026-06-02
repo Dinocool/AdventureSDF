@@ -24,7 +24,7 @@ pub use shapes::ShapeBuilder;
 /// A batch of filled triangles in **normalized device coordinates** (x,y ∈ [-1,1]),
 /// with per-vertex linear-RGBA colors and triangle indices. Built by
 /// [`ShapeBuilder`] and accumulated into [`GizmoDraw`].
-#[derive(Clone, Default, Reflect)]
+#[derive(Clone, Default)]
 pub struct GizmoMesh {
     pub vertices: Vec<[f32; 2]>,
     pub colors: Vec<[f32; 4]>,

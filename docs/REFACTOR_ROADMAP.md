@@ -37,7 +37,7 @@ handles (D/C/M/A/E/T/X) for referencing an item in a future session.
 Small, isolated, near-zero-risk. Each is a few lines and unblocks nothing else -- do them whenever.
 Knocking these out first also shrinks the surface the bigger splits have to move.
 
-### [ ] D1. Delete dead atlas API + the never-read `last_bake_was_full`
+### [x] D1. Delete dead atlas API + the never-read `last_bake_was_full`
 `impact: medium` * `effort: small` * `source: refactor-deadcode + api-boundaries`
 
 - *Now:* `atlas.rs:396 ring_brick_keys` and `atlas.rs:425 bricks_in_aabb_lod` have **no callers**
@@ -53,7 +53,7 @@ Knocking these out first also shrinks the surface the bigger splits have to move
   the (rejected) larger SdfAtlas split -- see X1. `SdfAtlas` is a plain `Resource`, not Reflect, so
   no `register_type` concern.
 
-### [ ] D2. Remove the no-op `upload_sdf_buffers` system + unused single-resolution addressing
+### [x] D2. Remove the no-op `upload_sdf_buffers` system + unused single-resolution addressing
 `impact: low` * `effort: small` * `source: refactor-deadcode`
 
 - *Now:* `mod.rs:1217 upload_sdf_buffers(_atlas)` has an **empty body** but is still added to the
@@ -63,7 +63,7 @@ Knocking these out first also shrinks the surface the bigger splits have to move
 - *Approach:* Remove `upload_sdf_buffers` + its entry in the Update tuple. Remove
   `brick_id`/`bricks_per_axis` from `SdfGridConfig` (grep-confirm no `feature=editor`/test caller first).
 
-### [ ] D3. Rewrite stale toroidal-swap comments (they describe the deleted sorted array)
+### [x] D3. Rewrite stale toroidal-swap comments (they describe the deleted sorted array)
 `impact: medium` * `effort: small` * `source: refactor-deadcode`
 
 - *Now:* `chunk.rs:858-877` (churn test) comments reference "row shifting", "sentinel tail", and a
@@ -74,7 +74,7 @@ Knocking these out first also shrinks the surface the bigger splits have to move
   dirty-slot delta (no shift; sentinel is just an empty-slot tag). Fix the `LiveChunkTables` doc to
   "dense toroidal directory". Mark the migration-plan doc completed/historical. Comments only.
 
-### [ ] D4. `draw_lod_rings` debug overlay uses stale ring math (it lies about residency)
+### [x] D4. `draw_lod_rings` debug overlay uses stale ring math (it lies about residency)
 `impact: medium` * `effort: small` * `source: refactor-deadcode`
 
 - *Now:* `mod.rs:1180` claims the boxes use "the same ring_origin math the bake centres each ring
@@ -86,7 +86,7 @@ Knocking these out first also shrinks the surface the bigger splits have to move
   world via `chunk::chunk_min_world`). Update the now-correct comment. Afterwards `config.ring_origin`
   has only test callers and could move behind `#[cfg(test)]`. Debug-overlay only -- no render impact.
 
-### [ ] D5. Fix the misplaced doc fragment + cross-reference the twin CSG folds in `edits.rs`
+### [x] D5. Fix the misplaced doc fragment + cross-reference the twin CSG folds in `edits.rs`
 `impact: low` * `effort: small` * `source: refactor-deadcode`
 
 - *Now:* `edits.rs:741 fold_csg` (tracks material) and `edits.rs:835 fold_csg_dist_indexed`
@@ -97,7 +97,7 @@ Knocking these out first also shrinks the surface the bigger splits have to move
   comment pinning the two as deliberate mirrors. (Unifying into one index-iterator + optional
   material-sink core is optional and higher-churn -- the material branch must be preserved exactly.)
 
-### [ ] D6. `GizmoMesh` derives `Reflect` but is never registered
+### [x] D6. `GizmoMesh` derives `Reflect` but is never registered
 `impact: low` * `effort: small` * `source: cross-cutting`
 
 - *Now:* `gizmo_render/mod.rs:27 GizmoMesh` derives `Reflect` but is never `register_type`'d (it's a
@@ -106,7 +106,7 @@ Knocking these out first also shrinks the surface the bigger splits have to move
 - *Approach:* Decide intent -- if it's a per-frame render buffer (it is), **drop `Reflect`**. If it
   should be inspectable, `register_type` it in `GizmoRenderPlugin::build`.
 
-### [ ] D7. Update the stale `CLAUDE.md` architecture map
+### [x] D7. Update the stale `CLAUDE.md` architecture map
 `impact: low` * `effort: small` * `source: cross-cutting`
 
 - *Now:* `lib.rs:1-13` declares `pub mod assets, gizmo_render, node` but `CLAUDE.md:9`'s Modules list
