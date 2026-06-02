@@ -517,7 +517,7 @@ Mostly test-only scaffolding (zero runtime risk) plus a couple of project-wide c
   **Update `CLAUDE.md` File Conventions** (which currently mandates inline) so the move doesn't violate
   a stated invariant. Naturally folds into M1/M2. Keep shared rig fixtures with the moved tests.
 
-### [ ] X2. Register `GizmoRenderPlugin` explicitly in `main.rs`
+### [x] X2. Register `GizmoRenderPlugin` explicitly in `main.rs`
 `impact: medium` * `effort: small` * `source: cross-cutting`
 
 - *Now:* `sdf_render/mod.rs:575-577` self-installs `GizmoRenderPlugin` as a hidden side effect behind a
