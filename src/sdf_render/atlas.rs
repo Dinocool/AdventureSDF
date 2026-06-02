@@ -330,7 +330,7 @@ impl SdfAtlas {
             // tile) leaves the table untouched (no topology bump) — its texels upload separately.
             let (ck, local) = super::chunk::chunk_of(key, config);
             self.live_chunks
-                .set_brick(ck, local, super::chunk::pack_brick_tile(tile, palette));
+                .set_brick(ck, local, super::chunk::pack_brick_tile(tile, palette), config);
         }
         tile
     }
