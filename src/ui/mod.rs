@@ -3,8 +3,8 @@ use bevy::picking::prelude::*;
 use bevy::prelude::*;
 use bevy::window::{CursorIcon, SystemCursorIcon};
 
-use crate::camera::{RightClickEvent, ThirdPersonCamera};
-use crate::inventory::{LootTransferEvent, Lootable, PlayerInventory};
+use crate::camera::{RightClickMessage, ThirdPersonCamera};
+use crate::inventory::{LootTransferMessage, Lootable, PlayerInventory};
 use crate::scene_manager::AppScene;
 
 pub struct UiPlugin;
@@ -203,7 +203,7 @@ fn toggle_inventory(keyboard: Res<ButtonInput<KeyCode>>, mut state: ResMut<Inven
 }
 
 fn handle_right_click_pick(
-    mut messages: MessageReader<RightClickEvent>,
+    mut messages: MessageReader<RightClickMessage>,
     mut ray_cast: MeshRayCast,
     camera_query: Query<(&Camera, &GlobalTransform), With<ThirdPersonCamera>>,
     lootable_query: Query<(), With<Lootable>>,
@@ -660,14 +660,14 @@ fn item_rarity_label(rarity: &crate::inventory::Rarity) -> &'static str {
 // --- Loot Slot Interaction ---
 
 fn handle_loot_slot_click(
-    mut messages: MessageWriter<LootTransferEvent>,
+    mut messages: MessageWriter<LootTransferMessage>,
     mut ui_state: ResMut<InventoryUiState>,
     slot_query: Query<(&Interaction, &LootSlot), Changed<Interaction>>,
     close_query: Query<&Interaction, (With<LootWindowClose>, Changed<Interaction>)>,
 ) {
     for (interaction, slot) in &slot_query {
         if *interaction == Interaction::Pressed {
-            messages.write(LootTransferEvent {
+            messages.write(LootTransferMessage {
                 source_entity: slot.source_entity,
                 item_index: slot.item_index,
             });
@@ -687,7 +687,7 @@ fn handle_loot_slot_click(
 
 fn handle_empty_container(
     mut commands: Commands,
-    mut messages: MessageReader<crate::inventory::ContainerEmptyEvent>,
+    mut messages: MessageReader<crate::inventory::ContainerEmptyMessage>,
     mut ui_state: ResMut<InventoryUiState>,
     lootable_query: Query<(), With<Lootable>>,
 ) {

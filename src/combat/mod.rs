@@ -16,14 +16,14 @@ pub struct CombatState {
 }
 
 #[derive(Message)]
-pub struct DamageEvent {
+pub struct DamageMessage {
     pub target: Entity,
     pub amount: f32,
     pub damage_type: DamageType,
 }
 
 #[derive(Message)]
-pub struct AbilityCastEvent {
+pub struct AbilityCastMessage {
     pub caster: Entity,
     pub ability: Ability,
 }
@@ -51,8 +51,8 @@ impl Plugin for CombatPlugin {
         app.register_type::<DamageType>()
             .register_type::<Ability>()
             .insert_resource(CombatState::default())
-            .add_message::<DamageEvent>()
-            .add_message::<AbilityCastEvent>()
+            .add_message::<DamageMessage>()
+            .add_message::<AbilityCastMessage>()
             .configure_sets(Update, CombatSet)
             .add_systems(
                 Update,
@@ -64,7 +64,7 @@ impl Plugin for CombatPlugin {
 }
 
 fn handle_damage(
-    mut messages: MessageReader<DamageEvent>,
+    mut messages: MessageReader<DamageMessage>,
     mut health_query: Query<&mut Health>,
     mut npc_query: Query<&mut Npc>,
 ) {
@@ -78,7 +78,7 @@ fn handle_damage(
     }
 }
 
-fn handle_ability_cast(mut messages: MessageReader<AbilityCastEvent>) {
+fn handle_ability_cast(mut messages: MessageReader<AbilityCastMessage>) {
     for _event in messages.read() {
         // Handle ability casting
     }
@@ -92,13 +92,13 @@ mod tests {
     #[test]
     fn damage_reduces_player_health() {
         let mut app = test_app();
-        app.add_message::<DamageEvent>();
+        app.add_message::<DamageMessage>();
         let player = spawn_test_player(app.world_mut());
         app.add_systems(Update, handle_damage);
 
         app.world_mut()
-            .resource_mut::<Messages<DamageEvent>>()
-            .write(DamageEvent {
+            .resource_mut::<Messages<DamageMessage>>()
+            .write(DamageMessage {
                 target: player,
                 amount: 30.0,
                 damage_type: DamageType::Physical,
@@ -113,13 +113,13 @@ mod tests {
     #[test]
     fn damage_clamps_health_at_zero() {
         let mut app = test_app();
-        app.add_message::<DamageEvent>();
+        app.add_message::<DamageMessage>();
         let player = spawn_test_player(app.world_mut());
         app.add_systems(Update, handle_damage);
 
         app.world_mut()
-            .resource_mut::<Messages<DamageEvent>>()
-            .write(DamageEvent {
+            .resource_mut::<Messages<DamageMessage>>()
+            .write(DamageMessage {
                 target: player,
                 amount: 999.0,
                 damage_type: DamageType::Fire,
@@ -133,17 +133,17 @@ mod tests {
     #[test]
     fn multiple_damage_events_accumulate() {
         let mut app = test_app();
-        app.add_message::<DamageEvent>();
+        app.add_message::<DamageMessage>();
         let player = spawn_test_player(app.world_mut());
         app.add_systems(Update, handle_damage);
 
-        let mut msgs = app.world_mut().resource_mut::<Messages<DamageEvent>>();
-        msgs.write(DamageEvent {
+        let mut msgs = app.world_mut().resource_mut::<Messages<DamageMessage>>();
+        msgs.write(DamageMessage {
             target: player,
             amount: 20.0,
             damage_type: DamageType::Physical,
         });
-        msgs.write(DamageEvent {
+        msgs.write(DamageMessage {
             target: player,
             amount: 30.0,
             damage_type: DamageType::Magical,
@@ -157,12 +157,12 @@ mod tests {
     #[test]
     fn damage_to_nonexistent_entity_does_not_panic() {
         let mut app = test_app();
-        app.add_message::<DamageEvent>();
+        app.add_message::<DamageMessage>();
         app.add_systems(Update, handle_damage);
 
         app.world_mut()
-            .resource_mut::<Messages<DamageEvent>>()
-            .write(DamageEvent {
+            .resource_mut::<Messages<DamageMessage>>()
+            .write(DamageMessage {
                 target: Entity::from_bits(9999),
                 amount: 10.0,
                 damage_type: DamageType::Frost,

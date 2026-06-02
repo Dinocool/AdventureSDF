@@ -527,7 +527,7 @@ Mostly test-only scaffolding (zero runtime risk) plus a couple of project-wide c
   `is_plugin_added` guard. Keep the `MinimalPlugins`/`Assets<GizmoAsset>` inner guard only around the
   gizmo *group* init that genuinely needs `GizmoPlugin` in headless tests. Pairs with D7.
 
-### [ ] N1. (low) Rename `...Event` message types to `...Message` (Bevy 0.18)
+### [x] N1. (low) Rename `...Event` message types to `...Message` (Bevy 0.18)
 `impact: low` * `effort: medium` * `source: cross-cutting`
 
 - *Now:* `combat`/`inventory`/`camera` define `#[derive(Message)] DamageEvent`/`LootEvent`/
