@@ -476,7 +476,7 @@ The whole `editor/` tree is feature-gated -- **build `--features editor` to catc
 
 Mostly test-only scaffolding (zero runtime risk) plus a couple of project-wide consistency passes.
 
-### [ ] T1. Add `tests/common/` for the copy-pasted GPU device + naga_oil composer bring-up
+### [x] T1. Add `tests/common/` for the copy-pasted GPU device + naga_oil composer bring-up
 `impact: medium` * `effort: medium` * `source: cross-cutting`
 
 - *Now:* `device_queue()` is duplicated at `sdf_gpu_rig.rs:49`, `sdf_bake_gpu.rs:22` **and** an inline
@@ -491,7 +491,7 @@ Mostly test-only scaffolding (zero runtime risk) plus a couple of project-wide c
   16-bit-norm and callers decide whether to skip; preserve bake_gpu's first test deliberately needing
   no features.
 
-### [ ] T2. Single source of truth for the `SDF_MODULES` shader dependency list
+### [x] T2. Single source of truth for the `SDF_MODULES` shader dependency list
 `impact: medium` * `effort: small` * `source: cross-cutting`
 
 - *Now:* The import graph is encoded three times: `shader_validation.rs:31` (9 modules),

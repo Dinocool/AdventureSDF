@@ -26,19 +26,11 @@ struct FullscreenVertexOutput {
 };
 "#;
 
-/// The SDF module files, in dependency order (a module must be added before any
-/// module that imports it). The entry shader is composed last via `make_naga_module`.
-const SDF_MODULES: [&str; 9] = [
-    "assets/shaders/sdf/bindings.wgsl",
-    "assets/shaders/sdf/brick.wgsl",
-    "assets/shaders/sdf/material.wgsl",
-    "assets/shaders/sdf/shadows.wgsl",
-    "assets/shaders/sdf/sky.wgsl",
-    "assets/shaders/sdf/pbr.wgsl",
-    "assets/shaders/sdf/oct.wgsl",
-    "assets/shaders/sdf/march.wgsl",
-    "assets/shaders/sdf/brdf.wgsl",
-];
+/// The SDF module files, in dependency order — the SAME list the render pipeline composes (single
+/// source of truth: `sdf_render::render::SDF_SHADER_MODULES`), with the `assets/` root made explicit
+/// for the filesystem reads here. A new `sdf/*.wgsl` module added to the pipeline is validated
+/// automatically.
+use adventure::sdf_render::render::SDF_SHADER_MODULES;
 
 const SDF_ENTRY: &str = "assets/shaders/sdf_raymarch.wgsl";
 
@@ -55,13 +47,15 @@ fn validate_composed_entry(entry: &str, defs: &[&str]) -> Result<(), String> {
 
     let mut composer = composer_with_stub();
 
-    // Add each SDF module, dependencies first.
-    for path in SDF_MODULES {
-        let source = std::fs::read_to_string(path).map_err(|e| format!("read {path}: {e}"))?;
+    // Add each SDF module, dependencies first. The pipeline list is asset-server-relative; the
+    // filesystem reads here need the explicit `assets/` root.
+    for module in SDF_SHADER_MODULES {
+        let path = format!("assets/{module}");
+        let source = std::fs::read_to_string(&path).map_err(|e| format!("read {path}: {e}"))?;
         composer
             .add_composable_module(ComposableModuleDescriptor {
                 source: &source,
-                file_path: path,
+                file_path: &path,
                 language: ShaderLanguage::Wgsl,
                 ..Default::default()
             })
