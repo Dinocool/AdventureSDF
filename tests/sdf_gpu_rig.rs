@@ -791,7 +791,9 @@ fn brick_tile_bytes(tiles: &[adventure::sdf_render::chunk::BrickTile]) -> Vec<u8
 fn gpu_find_brick_lookup_matches_cpu() {
     use wgpu::util::DeviceExt;
     use adventure::sdf_render::atlas::BrickKey;
-    use adventure::sdf_render::chunk::{build_chunk_tables, chunk_of, chunk_gpu_key, dir_index, BrickTile};
+    use adventure::sdf_render::chunk::{
+        build_chunk_tables, chunk_gpu_key, chunk_of, dir_index, resolve_via_tables, BrickTile,
+    };
 
     let Some((device, queue)) = device_queue() else {
         eprintln!("no GPU adapter — skipping");
@@ -904,15 +906,7 @@ fn gpu_find_brick_lookup_matches_cpu() {
     };
     let cpu_resolve = |coord: IVec3| -> Option<u32> {
         let (ck, li) = chunk_of(BrickKey::new(0, coord), &config);
-        let ci = cpu_ci(ck);
-        if ci < 0 {
-            return None;
-        }
-        let chunk = tables.chunks[ci as usize];
-        let occ = (chunk.occ_lo as u64) | ((chunk.occ_hi as u64) << 32);
-        if (occ >> li) & 1 == 0 { return None; }
-        let off = (occ & ((1u64 << li) - 1)).count_ones();
-        Some(tables.tile_run[(chunk.tile_run_base + off) as usize].atlas_base)
+        resolve_via_tables(&tables.chunks, &tables.tile_run, tables.r, ck, li).map(|t| t.atlas_base)
     };
 
     let mut bad = Vec::new();

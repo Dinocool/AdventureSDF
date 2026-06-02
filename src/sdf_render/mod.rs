@@ -16,12 +16,16 @@
 //!    cost of a clean, un-inflated field.
 //! 3. **Sparse storage + GPU lookup** (`chunk`, `render`, `bindings.wgsl`). Bricks group
 //!    into 4³=64-brick **chunks** addressed by an *absolute* world-lattice key (independent
-//!    of the camera, so CPU and GPU agree by construction). Resident chunks form a sorted
-//!    table (binary-searched on the GPU) with a 64-bit occupancy mask + popcount index into
-//!    a packed tile-run buffer. Brick texels live in a 2D-tiled atlas texture.
+//!    of the camera, so CPU and GPU agree by construction). Resident chunks live in a per-LOD
+//!    **toroidal directory** — a dense `R³` array per LOD where chunk `c` sits at the fixed slot
+//!    `c mod R`, so the GPU resolves it by a direct index + key-tag compare (no sort, no binary
+//!    search) and the CPU inserts/evicts in O(1). Each slot carries a 64-bit occupancy mask +
+//!    popcount index into a packed (sparse) tile-run buffer. Brick texels live in a 2D-tiled
+//!    atlas texture.
 //! 4. **Async incremental bake** (`bake_scheduler`). The camera-centred chunk ring recenters
-//!    as the camera moves; entered chunks bake on a task pool, exited chunks evict — never
-//!    blocking the main thread.
+//!    as the camera moves; entered chunks bake on a task pool, exited chunks evict IMMEDIATELY
+//!    (the march falls back to a coarser resident LOD during the brief handoff) — never blocking
+//!    the main thread.
 //! 5. **Unified raymarch** (`sdf_raymarch.wgsl`, helpers in `brick`). One loop:
 //!    resolve the finest resident LOD at `p`; skip empty space by brick-DDA; otherwise
 //!    sphere-trace the trilinear field and accept the hit once the surface is within the
@@ -357,9 +361,26 @@ impl SdfGridConfig {
     pub fn cell_stride(&self) -> i32 {
         (self.brick_size - 1) as i32
     }
-    pub fn bricks_per_axis(&self) -> u32 {
-        self.grid_size / (self.brick_size - 1)
+
+    /// Ring chunks per axis: `R = ring_bricks / CHUNK_BRICKS`. The edge of each per-LOD toroidal
+    /// directory window and the SINGLE source for this derivation (CPU mirror of `ring_chunks() /
+    /// CHUNK_BRICKS` in `bindings.wgsl`). `LiveChunkTables`/`ChunkTables` cache it and `dir_index`
+    /// resolves against it, so every site MUST agree — route through here, never recompute ad hoc.
+    pub fn ring_chunks_per_axis(&self) -> i32 {
+        self.ring_bricks as i32 / chunk::CHUNK_BRICKS
     }
+
+    /// Half the ring window in chunks (`R / 2`) — the camera-centred window's reach from its origin.
+    pub fn ring_half_chunks(&self) -> i32 {
+        self.ring_chunks_per_axis() / 2
+    }
+
+    /// Total per-LOD toroidal directory length: `R³ × lod_count` fixed `ChunkLookup` slots.
+    pub fn directory_len(&self) -> usize {
+        let r = self.ring_chunks_per_axis() as usize;
+        r * r * r * self.lod_count as usize
+    }
+
     pub fn world_extent(&self) -> f32 {
         self.grid_size as f32 * self.voxel_size
     }
@@ -425,17 +446,6 @@ impl SdfGridConfig {
     }
 
     // Chunk addressing (absolute keys, sparse occupancy) lives in `super::chunk`.
-
-    /// Compute linear brick ID from a brick origin coordinate (single-resolution,
-    /// level-0). Kept for the non-LOD path.
-    pub fn brick_id(&self, coord: IVec3) -> u32 {
-        let bpa = self.bricks_per_axis();
-        let s = self.cell_stride();
-        let bx = (coord.x / s) as u32;
-        let by = (coord.y / s) as u32;
-        let bz = (coord.z / s) as u32;
-        bz * bpa * bpa + by * bpa + bx
-    }
 }
 
 // --- Plugin ---
@@ -556,9 +566,7 @@ impl Plugin for SdfScenePlugin {
             )
             .add_systems(
                 Update,
-                (upload_sdf_buffers, toggle_sdf_render)
-                    .chain()
-                    .run_if(in_state(AppScene::SdfEditor)),
+                toggle_sdf_render.run_if(in_state(AppScene::SdfEditor)),
             );
 
         // Overlay gizmos (ground grid + bounds) need GizmoPlugin (Assets<GizmoAsset>).
@@ -1172,8 +1180,9 @@ fn line_color(index: i32, axis: Color, major: Color, minor: Color) -> Color {
 
 /// Draw each LOD clipmap ring's world-AABB as a wire box, colour-matched to the
 /// `SDF_DEBUG_LOD` shader ramp (green = fine/near, red = coarse/far). Makes the nested
-/// ring extents and their camera-centred recentering directly visible. Uses the same
-/// `ring_origin` math the bake centres each ring on, so the boxes track the resident set.
+/// ring extents and their camera-centred recentering directly visible. Derives each box from
+/// `bake_scheduler::ring_chunk_origin` — the SAME snapped chunk-space origin the bake centres each
+/// ring on (with `recenter_snap_chunks` hysteresis) — so the boxes track the actual resident set.
 fn draw_lod_rings(
     mut gizmos: Gizmos<SdfOverlayGizmos>,
     config: Res<SdfGridConfig>,
@@ -1185,8 +1194,8 @@ fn draw_lod_rings(
     let cam_pos = cam.translation;
 
     for lod in 0..config.lod_count {
-        let origin = config.ring_origin(cam_pos, lod);
-        let min = config.brick_min_world(origin, lod);
+        let origin_chunk = bake_scheduler::ring_chunk_origin(&config, cam_pos, lod);
+        let min = chunk::chunk_min_world(chunk::ChunkKey::new(lod, origin_chunk), &config);
         // The ring spans `ring_bricks` bricks per axis at this LOD's voxel size.
         let extent = Vec3::splat(config.brick_world_size(lod) * config.ring_bricks as f32);
         let center = min + extent * 0.5;
@@ -1206,12 +1215,6 @@ fn draw_lod_rings(
             color,
         );
     }
-}
-
-// --- Upload to GPU (placeholder — render.rs handles actual upload) ---
-
-fn upload_sdf_buffers(_atlas: Res<atlas::SdfAtlas>) {
-    // Render world will pick up atlas changes via extract
 }
 
 /// Clear the incremental chunk-table delta record (dirty rows/slots/sentinel) accumulated last
