@@ -4,7 +4,10 @@ version = "0.1.0"
 edition = "2024"
 
 [features]
-default = []
+# Dynamic-link Bevy by default for fast incremental dev builds. Release/ship builds and
+# RenderDoc captures must drop it: `cargo build --release --no-default-features` (RenderDoc
+# can't hook a dynamically-linked Bevy — see the `renderdoc` feature).
+default = ["fast"]
 editor = [
     "dep:bevy-inspector-egui",
     "dep:bevy_egui",
@@ -37,9 +40,31 @@ shader-debug = []
 fast = ["bevy/dynamic_linking"]
 
 [dependencies]
-# `jpeg`/`bmp`/`tga` so the editor can preview PBR-texture role files in any of the
-# formats the importer accepts (png is already a Bevy default).
-bevy = { version = "0.18", features = ["bevy_remote", "jpeg", "bmp", "tga"] }
+# Pruned Bevy feature set: `default-features = false` then ONLY what this 3D + egui + BRP app
+# uses. Dropped vs Bevy's `2d`/`3d`/`ui` umbrella defaults (confirmed gone from `cargo tree`,
+# faster builds): audio (bevy_audio + rodio), glTF (bevy_gltf + the gltf parser), gamepad
+# (bevy_gilrs + gilrs), the `hdr` image loader, 2D sprite picking, and the
+# x11/wayland/webgl/android platform backends (Windows-only dev).
+# Kept: 3D PBR render + gizmos + post-process/AA, UI + text (HUD / ESC menu), scene
+# (world.scn.ron), mesh+ui picking (camera MeshRayCast), winit/window, state, remote (BRP),
+# tonemapping LUTs (the SDF HDR camera's Tonemapping pass — pulls ktx2+zstd), png/jpeg/bmp/tga.
+# (bevy_sprite + bevy_animation stay — pulled transitively by the UI/PBR features + rapier/brp.)
+bevy = { version = "0.18", default-features = false, features = [
+    # app + platform
+    "std", "multi_threaded", "async_executor", "reflect_auto_register",
+    "bevy_asset", "bevy_log", "bevy_state", "bevy_window", "bevy_winit",
+    "bevy_input_focus", "custom_cursor", "default_font", "sysinfo_plugin",
+    # 3D render
+    "3d_api", "bevy_render", "bevy_core_pipeline", "bevy_anti_alias",
+    "bevy_post_process", "bevy_pbr", "bevy_gizmos", "bevy_gizmos_render",
+    "tonemapping_luts",
+    # UI + text
+    "common_api", "bevy_ui", "bevy_ui_render", "bevy_text",
+    # scene + picking (mesh raycast for the camera; no 2D sprite picking)
+    "bevy_scene", "bevy_picking", "mesh_picking", "ui_picking",
+    # remote control + image formats
+    "bevy_remote", "png", "jpeg", "bmp", "tga",
+] }
 bevy_brp_extras = "0.18"
 bevy_rapier3d = "0.34.0"
 wgpu = "27"
@@ -85,6 +110,12 @@ futures-lite = "2"
 
 [profile.dev]
 opt-level = 1
+# Drop full debuginfo (level 2): line tables keep panic backtraces with file:line but skip the
+# heavy per-variable info, cutting compile + LLD link time and PDB size. We debug via logs /
+# BRP / Nsight, not a Rust stepper. (Shader/GPU debug info is separate — see `shader-debug`.)
+debug = "line-tables-only"
 
 [profile.dev.package."*"]
 opt-level = 3
+# Dependencies never get stepped into — no debuginfo at all. Big link-size + link-time win.
+debug = false
