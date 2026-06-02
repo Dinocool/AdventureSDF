@@ -1,58 +1,101 @@
 #define_import_path sdf::shadows
 
-// SDF soft shadows. Native to the raymarcher: march a secondary ray from the surface
-// toward the light through the same conservative field (`sample_sdf_world`), tracking
-// the IQ penumbra estimate (the closest the ray passes to an occluder, scaled by how
-// far along it that miss happened). No shadow maps. Returns 1 = fully lit, 0 = occluded.
-
-#import sdf::bindings::{voxel_size_at}
-#import sdf::brick::{sample_sdf_world_cached, calc_normal, ChunkCache, new_chunk_cache}
-
-// The baked distance field is snorm-clamped to ±SNORM_CLAMP_DIST world units (atlas.rs).
-// A sample at the ceiling means "nearest surface is ≥ this far" — saturated, carrying no
-// occluder info — so the shadow ray treats it as clear. MUST track atlas::SNORM_CLAMP_DIST.
-const SHADOW_FIELD_CEIL: f32 = 1.0;
-
-// Inigo Quilez soft shadow: along the ray to the light, `res = min(res, k*d/t)`. A miss
-// that passes close to an occluder (small d) early in the march (small t) softens most.
-// Early-out on a real hit (d < eps → hard occlusion → 0).
+// SDF soft shadows. A secondary ray marched from the surface toward the sun through the SAME
+// sparse field as the primary march — INCLUDING its empty-space skipping — so a distant occluder
+// (a tower) casts a real shadow across the gap onto the ground, not just a contact shadow where
+// objects touch. Tracks the Inigo Quilez penumbra estimate (closest approach to an occluder,
+// scaled by how far along the ray it happened) for soft edges. No shadow maps. Returns
+// 1 = fully lit, 0 = occluded.
 //
-// CRITICAL for this voxel field: the stored distance saturates at SHADOW_FIELD_CEIL, so
-// once the ray climbs ~1 unit off the surface `d` stops growing and the naive `k*d/t`
-// would decay with t — dimming every lit surface ("whole scene darker"). Outside baked
-// bricks the field also returns a huge sentinel. Both cases mean "clear from here", so we
-// STOP and return the result so far the moment `d` saturates. Soft penumbrae still form
-// within the ~1-unit band around real occluders (the contact-shadow case).
-//
-// `mint` starts the march off the originating surface so its own near-field can't
-// self-shadow. `k` is penumbra hardness. `max_t` bounds the ray.
+// KNOWN ARTIFACTS (to be solved via a dedicated harness): a hard penumbra→umbra transition and
+// brick-faceted silhouettes on distant occluders, both from the discrete/clamped voxel field and
+// the empty-space DDA skip. Neither a near-surface step-floor change nor a coarse-LOD shadow floor
+// fixed them; an optimal approach is still TBD.
+
+#import sdf::bindings::{voxel_size_at, lod_count, DIST_BAND_VOXELS}
+#import sdf::brick::{
+    resolve_march,
+    world_to_brick_lod,
+    find_chunk_cached,
+    dist_to_brick_exit_lod,
+    dist_to_chunk_exit_lod,
+    in_ring_chunk,
+    new_chunk_cache,
+}
+
+// A sample this small means the ray entered an occluder → hard shadow.
+const SHADOW_HIT_EPS: f32 = 1e-3;
+// Voxels to trim off the band edge before a sample is trusted by the penumbra. The field
+// saturates at `DIST_BAND_VOXELS · vs`; a trilinear cell spans up to ~√3 voxels, so a corner can
+// hit the clamp even when the centre `d` is up to ~2 voxels inside the band. Excluding that
+// margin keeps the boxy clamp shell entirely out of `k*d/t` (the fix that removed the boxy
+// sun-visibility artifact that was obvious near LOD 0).
+const PENUMBRA_BAND_MARGIN_VOXELS: f32 = 2.0;
+// Iteration cap. Empty space is skipped a whole chunk at a time, so this covers long shadows;
+// the cost is the in-brick steps near an occluder, which terminate fast (a hit returns 0).
+const SHADOW_MAX_STEPS: u32 = 96u;
+
+// Inigo Quilez soft shadow over the sparse field. `mint` starts the march off the originating
+// surface; `k` is penumbra hardness; `max_t` bounds the ray.
 fn soft_shadow(origin: vec3<f32>, light_dir: vec3<f32>, mint: f32, max_t: f32, k: f32) -> f32 {
     var res = 1.0;
     var t = mint;
-    // One per-ray chunk-search memo (like the primary march): a shadow ray stays in the same
-    // chunk for many steps, so each LOD's probe is O(1) until it crosses a chunk boundary —
-    // turning the previously UNCACHED per-step binary search into a cache hit.
+    // Per-ray chunk-search memo (like the primary march): the ray stays in one chunk for many
+    // steps, so each LOD probe is O(1) until it crosses a chunk boundary.
     var cache = new_chunk_cache();
-    for (var i = 0u; i < 64u; i = i + 1u) {
+
+    for (var i = 0u; i < SHADOW_MAX_STEPS; i = i + 1u) {
         if (t >= max_t) { break; }
-        let d = sample_sdf_world_cached(origin + light_dir * t, &cache);
-        if (d < 1e-3) {
-            return 0.0;  // hit an occluder → fully shadowed
+        let p = origin + light_dir * t;
+        let scene = resolve_march(p, &cache);
+
+        // --- Empty space: hierarchical chunk-DDA skip (the key difference from the old march) ---
+        // No resident brick here. Step to the far face of the LARGEST provably-empty box around
+        // `p` (a chunk absent from the table AND inside its LOD's resident ring is empty), walking
+        // coarse→fine so the biggest box wins. This is what lets the ray jump the gap between an
+        // object and the ground instead of bailing at the first saturated sample.
+        if (!scene.in_brick) {
+            let wl = scene.window_lod;
+            var adv = dist_to_brick_exit_lod(p, light_dir, wl) + voxel_size_at(wl) * 0.01;
+            for (var L = lod_count(); L > 0u; ) {
+                L = L - 1u;
+                let coord = world_to_brick_lod(p, L);
+                if (find_chunk_cached(coord, L, &cache) < 0 && in_ring_chunk(coord, L)) {
+                    adv = max(adv, dist_to_chunk_exit_lod(p, light_dir, L) + voxel_size_at(L) * 0.01);
+                    break;
+                }
+            }
+            t += adv;
+            continue;
         }
-        if (d >= SHADOW_FIELD_CEIL) {
-            break;  // field saturated / empty space → clear beyond here
+
+        // --- In a brick: sphere-trace, tracking the penumbra ---
+        let d = scene.dist;
+        if (d < SHADOW_HIT_EPS) {
+            return 0.0; // entered an occluder → fully shadowed
         }
-        res = min(res, k * d / t);
-        t += clamp(d, 1e-3, max_t);
+        let vs = voxel_size_at(scene.lod);
+        // The baked distance saturates at the PER-LOD band (`DIST_BAND_VOXELS · vs`, atlas.rs); the
+        // outer voxels of that band are the boxy snorm-clamp shell. Only feed samples comfortably
+        // inside the band to the IQ penumbra so the clamp shell never paints into `k*d/t`. (Invisible
+        // at coarse LOD, where band ≥ the old hardcoded 1.0 ceiling, but obvious near LOD 0.)
+        let valid_band = (DIST_BAND_VOXELS - PENUMBRA_BAND_MARGIN_VOXELS) * vs;
+        if (d < valid_band) {
+            res = min(res, k * d / t);
+        }
+        // Sphere-trace by the unbounding sphere `d`, floored so we never stall and capped at the
+        // brick exit so the next `resolve_march` re-picks the LOD across bricks. A saturated `d` is
+        // still a valid lower bound on the true distance, so the step stays conservative.
+        let brick_exit = dist_to_brick_exit_lod(p, light_dir, scene.lod);
+        t += clamp(d, vs * 0.5, brick_exit + vs * 0.01);
     }
+
     return clamp(res, 0.0, 1.0);
 }
 
-// Shadow factor at a hit toward the sun. A small normal offset moves the ray to the lit
-// side (kills self-acne); `mint` along the ray is kept SMALL so the march still samples
-// the near-field where another object makes contact — a large mint skips the contact
-// occluder and leaves the touch point unshadowed. The normal offset (not mint) is what
-// prevents self-intersection, so mint can be sub-voxel.
+// Shadow factor at a hit toward the sun. A small normal offset moves the ray to the lit side
+// (kills self-acne); `mint` is kept sub-voxel so a near-field contact occluder still registers —
+// the normal offset (not mint) is what prevents self-intersection.
 fn surface_shadow(hit_pos: vec3<f32>, geo_n: vec3<f32>, light_dir: vec3<f32>, lod: u32, max_t: f32) -> f32 {
     let vs = voxel_size_at(lod);
     let origin = hit_pos + geo_n * vs;
