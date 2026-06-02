@@ -45,8 +45,7 @@ src/
 All plugins are structs implementing `Plugin`, registered in `main.rs` (incl.
 `NodePlugin`, `GizmoRenderPlugin`, `AssetsPlugin`). The render sub-plugin
 `SdfRenderPlugin` and feature-gated `EditorPlugin` are added in their own blocks
-— see `main.rs`. (Note: `GizmoRenderPlugin` is currently also lazily self-installed
-from `SdfScenePlugin` — see `docs/REFACTOR_ROADMAP.md` X2.)
+— see `main.rs`.
 
 ---
 
