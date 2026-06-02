@@ -156,14 +156,6 @@ fn sdf_cone_prepass_wgsl_validates() {
 }
 
 #[test]
-fn sdf_rc_cascade_wgsl_validates() {
-    // The cascade trace pass imports the same sdf::* modules (it reuses `raymarch` as three-rc's
-    // traceScene); compose + validate the whole graph exactly as the GPU pipeline would.
-    validate_composed_entry("assets/shaders/sdf_rc_cascade.wgsl", &[])
-        .unwrap_or_else(|e| panic!("{e}"));
-}
-
-#[test]
 fn sdf_brick_bake_wgsl_validates() {
     // The brick-bake compute shader is fully self-contained (no sdf::* imports), so it
     // composes against an empty composer. Validates the ported eval_primitive/fold_csg/
@@ -243,20 +235,11 @@ fn validate_standalone_with_modules(entry: &str, modules: &[&str]) {
 }
 
 #[test]
-fn sdf_composite_wgsl_validates() {
-    // The GI pass imports the binding-free `sdf::oct` + `sdf::brdf` helpers (NOT the atlas bindings).
-    validate_standalone_with_modules(
-        "assets/shaders/sdf_rc_composite.wgsl",
-        &["assets/shaders/sdf/oct.wgsl", "assets/shaders/sdf/brdf.wgsl"],
-    );
-}
-
-#[test]
-fn sdf_combine_wgsl_validates() {
-    // The combine pass imports `sdf::oct` + `sdf::brdf` (binding-free). Validate the default
+fn sdf_deferred_lit_wgsl_validates() {
+    // The deferred lit pass imports `sdf::oct` + `sdf::brdf` (binding-free). Validate the default
     // (lit) build AND each `#ifdef`-gated debug-view branch so errors inside them are caught.
     let modules = ["assets/shaders/sdf/oct.wgsl", "assets/shaders/sdf/brdf.wgsl"];
-    let entry = "assets/shaders/sdf_rc_combine.wgsl";
+    let entry = "assets/shaders/sdf_deferred_lit.wgsl";
     validate_standalone_with_modules(entry, &modules);
     for def in [
         "SDF_DEBUG_ALBEDO",
@@ -264,8 +247,6 @@ fn sdf_combine_wgsl_validates() {
         "SDF_DEBUG_METALLIC",
         "SDF_DEBUG_ROUGHNESS",
         "SDF_DEBUG_EMISSIVE",
-        "SDF_DEBUG_GI",
-        "SDF_DEBUG_GI_RAW",
         "SDF_DEBUG_SUN_VIS",
         "SDF_DEBUG_DEPTH",
     ] {

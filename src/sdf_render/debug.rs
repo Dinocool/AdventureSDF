@@ -151,9 +151,9 @@ fn register_shader_modes(app: &mut App) {
         description: desc.into(),
     };
 
-    // Deferred G-buffer / GI visualizers — `#ifdef`-gated early returns in the COMBINE pass
-    // (sdf_rc_combine.wgsl), which holds every G-buffer channel + the GI. Exclusive group: at
-    // most one active. The combine pipeline rebuilds on def change so these compile in/out.
+    // Deferred G-buffer visualizers — `#ifdef`-gated early returns in the deferred lit pass
+    // (sdf_deferred_lit.wgsl), which holds every G-buffer channel. Exclusive group: at most one
+    // active. The lit pipeline rebuilds on def change so these compile in/out.
     let mut registry = app.world_mut().resource_mut::<ShaderDebugRegistry>();
     registry.register(overlay(
         "sdf/albedo",
@@ -184,18 +184,6 @@ fn register_shader_modes(app: &mut App) {
         "Emissive",
         "SDF_DEBUG_EMISSIVE",
         "G-buffer emissive radiance",
-    ));
-    registry.register(overlay(
-        "sdf/gi",
-        "GI",
-        "SDF_DEBUG_GI",
-        "Radiance-cascade GI (bilateral-blurred — what the render uses)",
-    ));
-    registry.register(overlay(
-        "sdf/gi_raw",
-        "GI raw",
-        "SDF_DEBUG_GI_RAW",
-        "Radiance-cascade GI before the bilateral blur (probe-grid structure visible)",
     ));
     registry.register(overlay(
         "sdf/sun_vis",

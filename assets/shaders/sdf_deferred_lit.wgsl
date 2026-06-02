@@ -1,15 +1,13 @@
-// Combine pass: the final deferred-lighting step of the radiance-cascade GI (three-rc port).
+// Deferred lit pass: the final deferred-lighting step of the SDF renderer.
 //
-// Reads the G-buffer + the GI texture (the isolated radiance-cascade indirect term from
-// sdf_rc_composite.wgsl) and produces the lit pixel:
-//   - BILATERAL BLUR of the GI: a depth/normal-aware screen-space blur. The GI is quarter-ish
-//     resolution and, being a single-frame 16-direction trace, flickers as the camera moves
-//     (angular undersampling). Blurring it spatially — but only across pixels on the SAME surface
-//     (similar depth + normal) so edges stay crisp — turns that flicker into a stable soft glow.
-//     This is why the GI lives on its own texture: we can blur it without smearing the sharp sun.
+// Reads the G-buffer and produces the lit pixel:
 //   - ANALYTIC SUN: a sharp directional key light through the Frostbite BRDF, shadowed by the
-//     sun-visibility the G-buffer pass marched into emissive.a. NOT blurred (it must stay sharp).
+//     sun-visibility the G-buffer pass marched into emissive.a.
 //   - EMISSIVE: self-lit surfaces pass their radiance through.
+//
+// Indirect GI (the radiance cascade) has been removed; a world-anchored irradiance-probe volume
+// will be added here later (see plans/sdf-ddgi-probe-volume.md) — its term will sum into `lit`
+// alongside the sun + emissive.
 //
 // Output is LINEAR HDR; Bevy's tonemapping pass converts to display.
 
@@ -17,7 +15,7 @@
 #import sdf::oct::oct_decode
 #import sdf::brdf::frostbite_brdf
 
-struct CombineCamera {
+struct LitCamera {
     inv_view_proj: mat4x4<f32>,
     clip_from_world: mat4x4<f32>,
     prev_clip_from_world: mat4x4<f32>,
@@ -32,13 +30,12 @@ struct CombineCamera {
     sun_color: vec4<f32>,
 };
 
-@group(0) @binding(0) var<uniform> camera: CombineCamera;
+@group(0) @binding(0) var<uniform> camera: LitCamera;
 
 @group(1) @binding(0) var gbuf_albedo: texture_2d<f32>;     // rgb = albedo, a = camera distance
 @group(1) @binding(1) var gbuf_normal_mat: texture_2d<f32>; // rg = octN, b = metal, a = rough
 @group(1) @binding(2) var gbuf_emissive: texture_2d<f32>;   // rgb = emissive, a = sun visibility
 @group(1) @binding(3) var gbuf_sampler: sampler;
-@group(1) @binding(4) var gi_tex: texture_2d<f32>;          // rgb = per-pixel GI
 
 const SKY_DIST: f32 = 1e8;
 
@@ -62,14 +59,10 @@ fn main(in: FullscreenVertexOutput) -> @location(0) vec4<f32> {
     let emissive = em.rgb;
     let sun_vis = em.a;
 
-    // GI: the composite pass's per-pixel radiance-cascade gather (diffuse-only, view-independent).
-    let centre_px = vec2<i32>(uv * camera.screen_params.xy);
-    let gi = textureLoad(gi_tex, centre_px, 0).rgb;
-
     // --- Deferred debug views ------------------------------------------------------------------
-    // Each is a `#ifdef`-gated early return visualizing one G-buffer / GI channel. The defines are
-    // toggled from the editor (debug.rs registers them); the combine pipeline rebuilds on def
-    // change so these branches compile in/out. Sky pixels already returned above.
+    // Each is a `#ifdef`-gated early return visualizing one G-buffer channel. The defines are
+    // toggled from the editor (debug.rs registers them); the lit pipeline rebuilds on def change
+    // so these branches compile in/out. Sky pixels already returned above.
 #ifdef SDF_DEBUG_ALBEDO
     return vec4<f32>(albedo, 1.0);
 #endif
@@ -84,14 +77,6 @@ fn main(in: FullscreenVertexOutput) -> @location(0) vec4<f32> {
 #endif
 #ifdef SDF_DEBUG_EMISSIVE
     return vec4<f32>(emissive, 1.0);
-#endif
-#ifdef SDF_DEBUG_GI_RAW
-    // The unblurred GI gather (cascade-0 → BRDF), so the probe-grid structure is visible.
-    return vec4<f32>(textureLoad(gi_tex, centre_px, 0).rgb, 1.0);
-#endif
-#ifdef SDF_DEBUG_GI
-    // The bilateral-blurred GI (what the lit result actually uses).
-    return vec4<f32>(gi, 1.0);
 #endif
 #ifdef SDF_DEBUG_SUN_VIS
     return vec4<f32>(vec3<f32>(sun_vis), 1.0);
@@ -111,6 +96,6 @@ fn main(in: FullscreenVertexOutput) -> @location(0) vec4<f32> {
     let direct = frostbite_brdf(view, normal, sun, albedo, roughness, metallic, f0)
         * camera.sun_color.rgb * sun_vis;
 
-    let lit = direct + gi + emissive;
+    let lit = direct + emissive;
     return vec4<f32>(lit, 1.0);
 }

@@ -143,7 +143,7 @@ pub struct MaterialDef {
     pub parallax_scale: f32,
     /// Emissive (self-lit) radiance, linear RGB premultiplied by intensity (so the shader
     /// adds it directly). `Vec3::ZERO` = no emission. Emissive surfaces also feed the
-    /// radiance-cascade GI, so a glowing object lights its surroundings.
+    /// GI, so a glowing object lights its surroundings.
     pub emissive: Vec3,
     /// PBR texture-array layer per map, or `u32::MAX` if absent. See [`MATERIAL_TEX_MAPS`].
     pub tex_layers: [u32; MATERIAL_TEX_MAPS],

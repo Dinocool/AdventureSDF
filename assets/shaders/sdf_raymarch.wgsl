@@ -1,8 +1,8 @@
 // SDF G-buffer Shader — primary entry point (Bevy 0.18).
 //
 // Composed from the `sdf::*` modules under shaders/sdf/ via naga_oil #import. The unified
-// raymarch now lives in `sdf::march` (shared with the radiance-cascade trace pass); this file
-// owns the cone-seeded primary ray + the fragment `main` that exports the deferred G-buffer.
+// raymarch lives in the shared `sdf::march` module; this file owns the cone-seeded primary ray
+// + the fragment `main` that exports the deferred G-buffer.
 
 #import bevy_core_pipeline::fullscreen_vertex_shader::FullscreenVertexOutput
 
@@ -23,13 +23,13 @@
 @group(2) @binding(0) var cone_seed: texture_2d<f32>;
 const CONE_TILE: i32 = 8;
 
-// Deferred G-buffer for the screen-space radiance-cascade GI (three-rc port). The primary
-// SDF march no longer shades — it exports surface attributes into three MRT targets that the
-// cascade trace + composite passes consume. Dedicated emissive channel (location 2) keeps
-// emitted radiance independent of albedo, so a surface can be both lit and glowing.
+// Deferred G-buffer. The primary SDF march no longer shades — it exports surface attributes into
+// three MRT targets that the deferred lit pass (and, later, the world-space GI probe pass)
+// consume. Dedicated emissive channel (location 2) keeps emitted radiance independent of albedo,
+// so a surface can be both lit and glowing.
 struct FragmentOutput {
     // rgb = albedo (linear); a = camera distance to the hit (>= SKY_DIST sentinel = sky/miss).
-    // The distance doubles as a coverage/validity bit AND lets the composite reconstruct the
+    // The distance doubles as a coverage/validity bit AND lets the lit pass reconstruct the
     // world position (cam + ray_dir * dist) without sampling the depth texture.
     @location(0) albedo: vec4<f32>,
     // rg = octEncode(world shading normal); b = metallic; a = roughness.
@@ -42,7 +42,7 @@ struct FragmentOutput {
 };
 
 // Camera-distance sentinel written into albedo.a for a sky/miss pixel. Large enough that the
-// composite's `a >= SKY_DIST` test never trips on a real surface.
+// lit pass's `a >= SKY_DIST` test never trips on a real surface.
 const SKY_DIST: f32 = 1e8;
 
 // --- Fragment shader (G-buffer export) ---
@@ -68,7 +68,7 @@ fn main(in: FullscreenVertexOutput) -> FragmentOutput {
     let rm = raymarch(ray_origin, ray_dir, start_t, MarchQuality(1.0, max_steps(), max_dist(), 0u));
 
     if (!rm.hit) {
-        // Sky/miss: store the analytic sky as "albedo" (the composite passes it straight
+        // Sky/miss: store the analytic sky as "albedo" (the lit pass passes it straight
         // through), distance = sentinel, no normal, no emission, depth = far (reverse-Z 0).
         let sky = sky_color(ray_dir, sun_dir());
         return FragmentOutput(
@@ -98,16 +98,16 @@ fn main(in: FullscreenVertexOutput) -> FragmentOutput {
     let ndc_depth = clip.z / clip.w;
 
     // Resolve the cross-faded PBR inputs at the surface. `p.normal` is the normal-mapped
-    // shading normal — the one the GI + composite want.
+    // shading normal — the one the lit pass + GI want.
     let scene = scene_sdf(hit_pos);
     let p: PbrInputs = resolve_surface(scene, hit_pos, geo_normal, lod);
 
     // Emissive radiance from the hit material (premultiplied by intensity CPU-side). This is the
-    // self-lit term the composite adds directly; the cascade tracer reads the SAME table.
+    // self-lit term the lit pass adds directly; the GI probe tracer will read the SAME table.
     let emissive = material_at(scene.object_id).emissive.rgb;
 
-    // Sun visibility, marched HERE (the G-buffer pass has the atlas + march; the composite is
-    // deliberately atlas-free). Stored in emissive.a so the composite can shadow the analytic sun
+    // Sun visibility, marched HERE (the G-buffer pass has the atlas + march; the lit pass is
+    // deliberately atlas-free). Stored in emissive.a so the lit pass can shadow the analytic sun
     // without re-marching. 1 = lit, 0 = shadowed. Off (1.0) when SDF_SHADOWS is disabled.
     var sun_vis = 1.0;
 #ifdef SDF_SHADOWS
