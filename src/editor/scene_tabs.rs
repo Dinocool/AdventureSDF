@@ -722,20 +722,23 @@ mod tests {
     }
 
     #[test]
-    fn default_has_one_active_gallery_doc() {
+    fn default_has_one_active_doc() {
+        // Title derives from DEFAULT_SCENE_PATH, so this tracks whatever scene is the default.
+        let expect = stem(Path::new(DEFAULT_SCENE_PATH));
         let open = OpenScenes::default();
         assert_eq!(open.docs.len(), 1);
         assert_eq!(open.active, Some(INITIAL_SCENE_ID));
         assert_eq!(open.next_id, INITIAL_SCENE_ID + 1);
-        assert_eq!(open.docs[0].title, "gallery");
+        assert_eq!(open.docs[0].title, expect);
     }
 
     #[test]
     fn tab_title_marks_dirty_and_falls_back() {
+        let expect = stem(Path::new(DEFAULT_SCENE_PATH));
         let mut open = OpenScenes::default();
-        assert_eq!(open.tab_title(INITIAL_SCENE_ID), "gallery");
+        assert_eq!(open.tab_title(INITIAL_SCENE_ID), expect);
         open.docs[0].dirty = true;
-        assert_eq!(open.tab_title(INITIAL_SCENE_ID), "gallery*");
+        assert_eq!(open.tab_title(INITIAL_SCENE_ID), format!("{expect}*"));
         assert_eq!(open.tab_title(999), "Scene");
     }
 }

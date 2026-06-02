@@ -49,6 +49,14 @@ struct MarchQuality {
     lod_floor: u32,  // minimum LOD served (0 = no floor); a coarse floor reads blurry + cheaper
 };
 
+// How close (in coarse-LOD voxels, plus the pixel cone) to the surface the LOD cross-fade
+// engages. The morph only shifts the rendered ISO-SURFACE position, so its 2-3 extra field
+// samples per step only matter near the surface; far from it we step on the single cheap
+// `resolve_march` distance. The margin must exceed the worst-case adjacent-LOD distance
+// discrepancy (~a coarse voxel) so the morph is always active before a hit can be accepted.
+// Raise it if LOD-seam artifacts appear; lower it for a slightly cheaper march.
+const NEAR_SURFACE_VOXELS: f32 = 3.0;
+
 // Single unified raymarch. One cached resolve per step (`resolve_march` → finest resident
 // LOD + trilinear distance + tile/palette, memoising the chunk search across steps via a
 // per-ray `ChunkCache`), branching three ways:
@@ -150,7 +158,14 @@ fn raymarch(origin: vec3<f32>, dir: vec3<f32>, start_t: f32, q: MarchQuality) ->
         var eff_lod = f32(lod);   // continuous LOD actually rendered (for debug/material LOD)
         let ring_bricks = camera.lod_params.y;
         let end_frac = 1.0 - 2.0 * f32(recenter_snap() * CHUNK_BRICKS) / max(ring_bricks, 1.0);
-        if (band > 0.0 && end_frac > 0.0) {
+        // PERF: gate the cross-fade's extra field samples to near-surface steps. Far from the
+        // surface `d_eff` stays the cheap `d` and we step on it with over-relaxation, exactly as
+        // the band==0 path does — the morph (which only moves the iso-surface) re-engages once
+        // we're within `morph_reach` of the surface, comfortably before the hit-accept test
+        // (`d_eff < max(eps, cone)` below), so a hit is always accepted on the morphed distance.
+        let coarse_vox = voxel_size_at(min(lod + 1u, lod_count() - 1u));
+        let morph_reach = max(SDF_EPS, cone) + coarse_vox * NEAR_SURFACE_VOXELS;
+        if (band > 0.0 && end_frac > 0.0 && d < morph_reach) {
             let half_l_base = 0.5 * ring_bricks * brick_world_at(0u);   // LOD-0 ring half-extent
             let cheb_cam = max(max(abs(p.x - camera.camera_pos.x), abs(p.y - camera.camera_pos.y)), abs(p.z - camera.camera_pos.z));
             // Reference distance where lodc crosses an integer. Solving so the morph L→L+1 is
