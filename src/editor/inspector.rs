@@ -95,6 +95,12 @@ fn entity_inspector_ui(world: &mut World, entity: Entity, ui: &mut egui::Ui) {
     // GlobalTransform is derived from Transform (which has a custom euler editor); showing
     // its raw affine matrix is noise, so hide it.
     custom_paths.push(std::any::type_name::<GlobalTransform>().to_string());
+    // The child hierarchy belongs in the Hierarchy panel, not here. Reflecting `Children`
+    // renders a row per child entity, so selecting a node with thousands of children (the
+    // stress tower-field root) cost ~200 ms/FRAME in the inspector. Skip both relationship
+    // components — they're navigation infrastructure, not editable data.
+    custom_paths.push(std::any::type_name::<Children>().to_string());
+    custom_paths.push(std::any::type_name::<ChildOf>().to_string());
 
     if rendered_custom {
         ui.separator();

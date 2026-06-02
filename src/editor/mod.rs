@@ -135,6 +135,7 @@ impl Plugin for EditorPlugin {
 
         keybinds::plugin(app);
         status_bar::plugin(app);
+        hierarchy::plugin(app);
 
         // F6 toggles chrome-trace capture (global; RenderDoc is F7 behind the `renderdoc` feature).
         app.add_systems(Update, chrome_trace::toggle_on_f6);
