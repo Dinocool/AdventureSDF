@@ -141,6 +141,7 @@ fn main() {
     .add_plugins(adventure::assets::AssetsPlugin)
     .add_plugins(adventure::sdf_render::SdfScenePlugin)
     .add_plugins(adventure::sdf_render::render::SdfRenderPlugin)
+    .add_plugins(adventure::gizmo_render::GizmoRenderPlugin)
     .add_plugins(adventure::camera::CameraPlugin)
     .add_plugins(adventure::player::PlayerPlugin)
     .add_plugins(adventure::world::WorldPlugin)

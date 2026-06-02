@@ -66,24 +66,24 @@ pub struct Lootable {
 }
 
 #[derive(Message)]
-pub struct LootEvent {
+pub struct LootMessage {
     pub item: Item,
     pub quantity: u32,
 }
 
 #[derive(Message)]
-pub struct LootTransferEvent {
+pub struct LootTransferMessage {
     pub source_entity: Entity,
     pub item_index: usize,
 }
 
 #[derive(Message)]
-pub struct ContainerEmptyEvent {
+pub struct ContainerEmptyMessage {
     pub entity: Entity,
 }
 
 #[derive(Message)]
-pub struct EquipEvent {
+pub struct EquipMessage {
     pub slot: EquipSlot,
     pub item_index: usize,
 }
@@ -109,10 +109,10 @@ impl Plugin for InventoryPlugin {
             .register_type::<EquipSlot>()
             .register_type::<Lootable>()
             .init_resource::<PlayerInventory>()
-            .add_message::<LootEvent>()
-            .add_message::<LootTransferEvent>()
-            .add_message::<ContainerEmptyEvent>()
-            .add_message::<EquipEvent>()
+            .add_message::<LootMessage>()
+            .add_message::<LootTransferMessage>()
+            .add_message::<ContainerEmptyMessage>()
+            .add_message::<EquipMessage>()
             .configure_sets(Update, InventorySet)
             .add_systems(
                 Update,
@@ -123,7 +123,7 @@ impl Plugin for InventoryPlugin {
     }
 }
 
-fn handle_loot(mut messages: MessageReader<LootEvent>, mut inventory: ResMut<PlayerInventory>) {
+fn handle_loot(mut messages: MessageReader<LootMessage>, mut inventory: ResMut<PlayerInventory>) {
     for event in messages.read() {
         if inventory.items.len() < inventory.max_slots {
             inventory.items.push((event.item.clone(), event.quantity));
@@ -132,8 +132,8 @@ fn handle_loot(mut messages: MessageReader<LootEvent>, mut inventory: ResMut<Pla
 }
 
 fn handle_loot_transfer(
-    mut messages: MessageReader<LootTransferEvent>,
-    mut empty_messages: MessageWriter<ContainerEmptyEvent>,
+    mut messages: MessageReader<LootTransferMessage>,
+    mut empty_messages: MessageWriter<ContainerEmptyMessage>,
     mut lootable_query: Query<&mut Lootable>,
     mut inventory: ResMut<PlayerInventory>,
 ) {
@@ -150,14 +150,14 @@ fn handle_loot_transfer(
         let (item, qty) = lootable.items.remove(event.item_index);
         inventory.items.push((item, qty));
         if lootable.items.is_empty() {
-            empty_messages.write(ContainerEmptyEvent {
+            empty_messages.write(ContainerEmptyMessage {
                 entity: event.source_entity,
             });
         }
     }
 }
 
-fn handle_equip(mut messages: MessageReader<EquipEvent>) {
+fn handle_equip(mut messages: MessageReader<EquipMessage>) {
     for _event in messages.read() {
         // Handle equipping items
     }
@@ -180,7 +180,7 @@ mod tests {
     #[test]
     fn loot_adds_item_to_inventory() {
         let mut app = test_app();
-        app.add_message::<LootEvent>();
+        app.add_message::<LootMessage>();
         app.insert_resource(PlayerInventory {
             max_slots: 20,
             ..default()
@@ -188,8 +188,8 @@ mod tests {
         app.add_systems(Update, handle_loot);
 
         app.world_mut()
-            .resource_mut::<Messages<LootEvent>>()
-            .write(LootEvent {
+            .resource_mut::<Messages<LootMessage>>()
+            .write(LootMessage {
                 item: test_item("Sword"),
                 quantity: 1,
             });
@@ -205,7 +205,7 @@ mod tests {
     #[test]
     fn loot_rejected_when_bag_full() {
         let mut app = test_app();
-        app.add_message::<LootEvent>();
+        app.add_message::<LootMessage>();
         app.insert_resource(PlayerInventory {
             items: (0..20)
                 .map(|i| (test_item(&format!("Item {i}")), 1))
@@ -216,8 +216,8 @@ mod tests {
         app.add_systems(Update, handle_loot);
 
         app.world_mut()
-            .resource_mut::<Messages<LootEvent>>()
-            .write(LootEvent {
+            .resource_mut::<Messages<LootMessage>>()
+            .write(LootMessage {
                 item: test_item("Overflow"),
                 quantity: 1,
             });
@@ -231,19 +231,19 @@ mod tests {
     #[test]
     fn multiple_loot_events_same_frame() {
         let mut app = test_app();
-        app.add_message::<LootEvent>();
+        app.add_message::<LootMessage>();
         app.insert_resource(PlayerInventory {
             max_slots: 20,
             ..default()
         });
         app.add_systems(Update, handle_loot);
 
-        let mut msgs = app.world_mut().resource_mut::<Messages<LootEvent>>();
-        msgs.write(LootEvent {
+        let mut msgs = app.world_mut().resource_mut::<Messages<LootMessage>>();
+        msgs.write(LootMessage {
             item: test_item("Axe"),
             quantity: 1,
         });
-        msgs.write(LootEvent {
+        msgs.write(LootMessage {
             item: test_item("Shield"),
             quantity: 2,
         });
@@ -265,8 +265,8 @@ mod tests {
     #[test]
     fn loot_transfer_moves_item_from_lootable() {
         let mut app = test_app();
-        app.add_message::<LootTransferEvent>();
-        app.add_message::<ContainerEmptyEvent>();
+        app.add_message::<LootTransferMessage>();
+        app.add_message::<ContainerEmptyMessage>();
         app.insert_resource(PlayerInventory::default());
         app.add_systems(Update, handle_loot_transfer);
 
@@ -278,8 +278,8 @@ mod tests {
             .id();
 
         app.world_mut()
-            .resource_mut::<Messages<LootTransferEvent>>()
-            .write(LootTransferEvent {
+            .resource_mut::<Messages<LootTransferMessage>>()
+            .write(LootTransferMessage {
                 source_entity: entity,
                 item_index: 0,
             });
@@ -298,8 +298,8 @@ mod tests {
     #[test]
     fn loot_transfer_rejected_when_full() {
         let mut app = test_app();
-        app.add_message::<LootTransferEvent>();
-        app.add_message::<ContainerEmptyEvent>();
+        app.add_message::<LootTransferMessage>();
+        app.add_message::<ContainerEmptyMessage>();
         app.insert_resource(PlayerInventory {
             items: (0..20)
                 .map(|i| (test_item(&format!("Item {i}")), 1))
@@ -317,8 +317,8 @@ mod tests {
             .id();
 
         app.world_mut()
-            .resource_mut::<Messages<LootTransferEvent>>()
-            .write(LootTransferEvent {
+            .resource_mut::<Messages<LootTransferMessage>>()
+            .write(LootTransferMessage {
                 source_entity: entity,
                 item_index: 0,
             });

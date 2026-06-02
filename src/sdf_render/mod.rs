@@ -470,10 +470,9 @@ impl Plugin for SdfScenePlugin {
         if app.world().is_resource_added::<Assets<GizmoAsset>>()
             || app.world().get_resource::<Assets<GizmoAsset>>().is_some()
         {
-            // The filled-overlay gizmo renderer (reusable; consumed by `draw_gizmo`).
-            if !app.is_plugin_added::<crate::gizmo_render::GizmoRenderPlugin>() {
-                app.add_plugins(crate::gizmo_render::GizmoRenderPlugin);
-            }
+            // `GizmoRenderPlugin` (the filled-overlay renderer consumed by `draw_gizmo`) is added
+            // explicitly in `main.rs`; here we only wire the gizmo groups, which need `GizmoPlugin`
+            // (`Assets<GizmoAsset>`) — present under DefaultPlugins, absent in MinimalPlugins tests.
             app.init_gizmo_group::<SdfOverlayGizmos>()
                 .init_gizmo_group::<SdfGridGizmos>()
                 .init_gizmo_group::<SdfNodeGizmos>()
