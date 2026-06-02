@@ -367,8 +367,14 @@ into compiler-enforced invariants.
   (`chunk_gpu_key`, `dir_index`, `ring_chunk_origin`, the C3 helper, ...). The compiler reports every
   site that breaks. **Do this last.**
 
-### [ ] A4. Replace the duplicated `.as_ref().unwrap()` bind-group wall with one resolver
+### [x] A4. Replace the duplicated `.as_ref().unwrap()` bind-group wall with one resolver
 `impact: medium` * `effort: medium` * `source: cross-cutting`
+> **Done (folded into M1 as C5).** The core finding — the ~11-unwrap atlas bind-group 1 wall
+> copy-pasted in `SdfGBufferNode` + `SdfConeNode` — is eliminated: both nodes now call the single
+> `render/mod.rs::atlas_bind_group_1(device, layout, gpu_atlas, label)` helper (one place, exact
+> binding order preserved, GPU lifecycle rigs green). The remaining nuance (a `views() -> Result`
+> with a descriptive message instead of `unwrap`) is minor polish on that one helper — the nodes
+> already early-out before it when resources are missing — and is left as optional.
 
 - *Now:* `render.rs:534-563` (bind_group_1 build) is duplicated near-verbatim at `render.rs:2156-2183`
   -- ~11 `gpu_atlas.dist_view.as_ref().unwrap()`-style unwraps each. A partially-initialized
