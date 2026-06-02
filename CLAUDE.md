@@ -79,6 +79,10 @@ Don't reinvent these; the detailed, code-verified guidance lives in the skills:
 - One module per directory: `src/{module}/mod.rs` (or flat `src/{module}.rs`)
 - Components, resources, messages defined at top of the module file
 - Plugin struct + `impl Plugin` in the same file
-- Tests in `#[cfg(test)] mod tests` inside each file
-- Shared test helpers in `src/test_utils.rs`
-- Cross-plugin integration tests in `tests/`
+- Tests in `#[cfg(test)] mod tests` inside each file — but once a test module dominates a file
+  (≳150 lines / >40%), split it to a sibling `mod tests;` file (`{module}/tests.rs` or
+  `{module}_tests.rs`) so production stays readable (e.g. `assets/tests.rs`,
+  `bake_scheduler/tests.rs`). Same `use super::*` access either way.
+- Shared test helpers in `src/test_utils.rs` (a normal `pub mod` — reachable from the `tests/`
+  integration crate too, which can't see `#[cfg(test)]` items)
+- Cross-plugin integration tests in `tests/`; shared GPU/test scaffolding in `tests/common/`

@@ -501,7 +501,7 @@ Mostly test-only scaffolding (zero runtime risk) plus a couple of project-wide c
   in `tests/common`). Rigs needing a subset pass an explicit slice referencing the same source. Keep the
   intentional-subset cases explicit. Pairs with T1.
 
-### [ ] T3. Promote the reusable test-app builders out of `#[cfg(test)]`
+### [x] T3. Promote the reusable test-app builders out of `#[cfg(test)]`
 `impact: medium` * `effort: medium` * `source: cross-cutting`
 
 - *Now:* `tests/integration.rs:15 integration_app()` is byte-for-byte `src/test_utils.rs:9
@@ -512,7 +512,7 @@ Mostly test-only scaffolding (zero runtime risk) plus a couple of project-wide c
   *Risk:* medium -- un-gating must avoid shipping in release (hence the `test-support` feature); touches
   `lib.rs` visibility.
 
-### [ ] T4. Standardize the inline-vs-external `mod tests` convention
+### [x] T4. Standardize the inline-vs-external `mod tests` convention
 `impact: medium` * `effort: medium` * `source: cross-cutting`
 
 - *Now:* Two conventions with no documented trigger: external `mod tests;` files (`assets/tests.rs`,
