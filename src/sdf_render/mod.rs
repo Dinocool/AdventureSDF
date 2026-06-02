@@ -180,14 +180,6 @@ pub struct SdfRaymarchParams {
     /// ring boundary instead of snapping (removes the visible LOD pop/seam). 0 = disabled
     /// (hard LOD seams, the original behaviour). Tunable live via the editor raymarch panel.
     pub lod_blend_band: f32,
-    /// Coarse-LOD iso-offset α. Convex objects render thinner at coarse LODs because
-    /// trilinear interpolation of the sampled field over-estimates distance on a convex
-    /// surface, pushing the zero-isosurface inward by ≈ `(h²/8)·κ` (h = voxel size). To
-    /// re-inflate, the sphere-trace march takes the surface where the field equals
-    /// `α · voxel_size(lod)² / base_voxel_size` (quadratic in h to match the bias law)
-    /// instead of 0. Zero at LOD 0 (the analytic cubic owns the near surface), so fine
-    /// detail is untouched; grows with the LOD. 0 = off. Tunable live in the raymarch panel.
-    pub surface_bias: f32,
 }
 
 impl Default for SdfRaymarchParams {
@@ -201,7 +193,6 @@ impl Default for SdfRaymarchParams {
             cone_scale: 1.0,
             over_relax: 1.6,
             lod_blend_band: 0.2,
-            surface_bias: 0.0,
         }
     }
 }
@@ -283,13 +274,15 @@ pub const DEFAULT_LOD_COUNT: u32 = 8;
 /// `L` covers `ring_bricks · cell_stride · voxel_size · 2^L` world units per axis, so
 /// the same count reaches twice as far each coarser level (the clipmap nesting). Must be
 /// a multiple of [`chunk::CHUNK_BRICKS`] (= 4; the ring is enumerated in whole chunks).
-/// 64 = 4·16 gives each band ~5x the world reach of the old 12 at the same voxel
-/// resolution (detail preserved; the sparse cull keeps only non-empty bricks resident).
-pub const DEFAULT_RING_BRICKS: u32 = 64;
+/// 128 = 4·32: each LOD window spans twice as many bricks per axis as before, so every level
+/// reaches 2x further at the SAME voxel resolution — distant geometry is served a finer LOD
+/// (eases the far-LOD shrink), at the cost of a larger resident shell (the sparse cull still
+/// keeps only non-empty bricks). Must be a multiple of `CHUNK_BRICKS` (= 4).
+pub const DEFAULT_RING_BRICKS: u32 = 128;
 /// Default ring-recenter hysteresis, in whole chunks (see
-/// [`SdfGridConfig::recenter_snap_chunks`]). With `CHUNK_BRICKS = 4` and a 64-brick ring
-/// (16 chunks/axis), snapping to 2 chunks means the window recenters every ~5.6 m at LOD
-/// 0 instead of every brick crossing, while still keeping the camera 6+ chunks from any
+/// [`SdfGridConfig::recenter_snap_chunks`]). With `CHUNK_BRICKS = 4` and a 128-brick ring
+/// (32 chunks/axis), snapping to 2 chunks means the window recenters every ~5.6 m at LOD
+/// 0 instead of every brick crossing, while still keeping the camera 14+ chunks from any
 /// window edge.
 pub const DEFAULT_RECENTER_SNAP_CHUNKS: i32 = 2;
 
@@ -651,8 +644,8 @@ fn sync_editor_camera_active(
     }
 }
 
-/// Path to the editor's default scene (the PBR gallery), relative to the working dir. The stress
-/// tower-field lives at `assets/scenes/stress.scene` and can be loaded manually.
+/// Path to the editor's default scene (the PBR gallery). The stress tower-field lives at
+/// `assets/scenes/stress.scene` and can be loaded manually.
 pub const DEFAULT_SCENE_PATH: &str = "assets/scenes/gallery.scene";
 
 /// Load the default scene into the world on editor enter. Exclusive (scene load

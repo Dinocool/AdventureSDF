@@ -66,6 +66,10 @@ fn main(in: FullscreenVertexOutput) -> @location(0) vec4<f32> {
 #ifdef SDF_DEBUG_ALBEDO
     return vec4<f32>(albedo, 1.0);
 #endif
+#ifdef SDF_DEBUG_LOD
+    // The primary pass wrote the eff-LOD hue ramp into albedo; pass it straight through (unlit).
+    return vec4<f32>(albedo, 1.0);
+#endif
 #ifdef SDF_DEBUG_NORMALS
     return vec4<f32>(normal * 0.5 + 0.5, 1.0);
 #endif

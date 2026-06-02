@@ -144,19 +144,15 @@ fn eval_primitive(e: GpuEdit, p: vec3<f32>) -> f32 {
             let d = vec2<f32>(length(vec2<f32>(p.x, p.z)) - radius, abs(p.y) - half_height);
             return min(max(d.x, d.y), 0.0) + length(max(d, vec2<f32>(0.0)));
         }
-        case 5u: {  // Heightmap { half_xz, max_height, freq, amp, seed }
-            let half_xz = vec2<f32>(e.params.x, e.params.y);
+        case 5u: {  // Heightmap (ONE-SIDED surface) { half_xz, max_height, freq, amp, seed }
+            // Signed VERTICAL distance to the noise surface — no box floor/walls, so only the top
+            // shell bakes (interior + underside cull away). Must match edits.rs eval_primitive.
             let max_height = e.params.z;
             let freq = e.params.w;
             let amp = e.params2.x;
             let seed = bitcast<u32>(e.params2.y);
-            let half = vec3<f32>(half_xz.x, max_height * 0.5, half_xz.y);
-            let centered = p - vec3<f32>(0.0, max_height * 0.5, 0.0);
-            let q = abs(centered) - half;
-            let box_d = length(max(q, vec3<f32>(0.0))) + min(max(q.x, max(q.y, q.z)), 0.0);
             let h = height_sample(vec2<f32>(p.x, p.z), freq, amp, seed) + max_height * 0.5;
-            let surface_d = p.y - h;
-            return max(box_d, surface_d);
+            return p.y - h;
         }
         default: {
             return 1e30;

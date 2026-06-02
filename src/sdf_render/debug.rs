@@ -197,6 +197,12 @@ fn register_shader_modes(app: &mut App) {
         "SDF_DEBUG_DEPTH",
         "Camera distance (scaled greyscale)",
     ));
+    registry.register(overlay(
+        "sdf/lod",
+        "LOD blend",
+        "SDF_DEBUG_LOD",
+        "Continuous rendered LOD as a hue ramp (red = LOD 0 → blue); the cross-fade band reads as a gradient between two LOD hues",
+    ));
 
     // Independent toggle (not part of the overlay group): bypass the per-ray chunk
     // lookup cache, forcing a fresh binary search every probe. If enabling this fixes a
@@ -550,7 +556,6 @@ fn render_panel(world: &mut World, ui: &mut egui::Ui) {
     ui.add(egui::Slider::new(&mut params.max_dist, 10.0..=5000.0).text("Max Dist"));
     ui.add(egui::Slider::new(&mut params.sdf_eps, 0.0001..=0.1).text("Epsilon"));
     ui.add(egui::Slider::new(&mut params.lod_blend_band, 0.0..=0.5).text("LOD Blend Band"));
-    ui.add(egui::Slider::new(&mut params.surface_bias, 0.0..=0.5).text("Surface Bias"));
 }
 
 fn ray_inspector_panel(world: &mut World, ui: &mut egui::Ui) {

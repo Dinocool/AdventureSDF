@@ -63,7 +63,7 @@ struct SdfCameraData {
     /// frame's screen for the SSR reflection path.
     prev_clip_from_world: Mat4,
     camera_pos: Vec4,
-    screen_params: Vec4, // xy = screen_size, z = surface_bias, w = unused
+    screen_params: Vec4, // xy = screen_size; zw unused (was surface_bias — iso-offset removed)
     grid_origin: Vec4,   // xyz = grid origin, w = voxel_size
     grid_dims: Vec4, // z = brick_size (8.0); x/y/w unused (chunk count = arrayLength(&chunk_buf))
     debug_params: Vec4, // x = max_steps, y = max_dist, z = sdf_eps, w = unused
@@ -492,6 +492,15 @@ impl ViewNode for SdfGBufferNode {
         ) else {
             return Ok(());
         };
+
+        // During a window resize the shared view-depth texture can re-size a frame before
+        // `prepare_sdf_gbuffer` re-sizes the colour targets (they're driven off different view
+        // resources). A render pass requires ALL attachments to share one size, so skip the frame on
+        // a mismatch — prepare re-sizes the G-buffer next frame and rendering resumes (invisible
+        // during a drag-resize). Without this, wgpu aborts with "Attachments have differing sizes".
+        if gbuffer.size.x != depth.texture.width() || gbuffer.size.y != depth.texture.height() {
+            return Ok(());
+        }
 
         let layout_0 = pipeline_cache.get_bind_group_layout(&pipeline_res.layout_0);
         let layout_1 = pipeline_cache.get_bind_group_layout(&pipeline_res.layout_1);
@@ -936,8 +945,8 @@ fn prepare_sdf_camera_data(
             clip_from_world,
             prev_clip_from_world,
             camera_pos: transform.translation.extend(0.0),
-            // z = surface_bias (coarse-LOD iso-offset α); w unused.
-            screen_params: Vec4::new(size.x as f32, size.y as f32, raymarch.surface_bias, 0.0),
+            // zw unused (was surface_bias — iso-offset removed).
+            screen_params: Vec4::new(size.x as f32, size.y as f32, 0.0, 0.0),
             grid_origin: Vec4::new(
                 config.world_origin().x,
                 config.world_origin().y,
