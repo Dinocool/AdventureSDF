@@ -168,6 +168,12 @@ pub struct SdfRaymarchParams {
     /// ring boundary instead of snapping (removes the visible LOD pop/seam). 0 = disabled
     /// (hard LOD seams, the original behaviour). Tunable live via the editor raymarch panel.
     pub lod_blend_band: f32,
+    /// Soft-shadow penumbra hardness `k` (the IQ `min(k·d/t)` factor in `sdf::shadows`). LOWER =
+    /// softer/wider penumbra, which blurs the coarse-LOD brick faceting AND softens the
+    /// penumbra→umbra edge (both quantified on the harness tradeoff curve in
+    /// `tests/sdf_shadow_harness`); HIGHER = sharper/tighter but boxier + harder-edged. Tunable
+    /// live via the editor raymarch panel ("Shadow Softness").
+    pub shadow_softness: f32,
 }
 
 impl Default for SdfRaymarchParams {
@@ -181,6 +187,9 @@ impl Default for SdfRaymarchParams {
             cone_scale: 1.0,
             over_relax: 1.6,
             lod_blend_band: 0.2,
+            // k=6: a balance point on the shadow-harness tradeoff curve — softer than the old
+            // hardcoded 8 (≈−28% faceting, ≈−25% edge-harshness) without going mushy.
+            shadow_softness: 6.0,
         }
     }
 }

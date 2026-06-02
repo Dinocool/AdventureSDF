@@ -756,12 +756,12 @@ fn prepare_sdf_camera_data(
             ),
             // March tuning: the pixel cone half-width per unit ray distance drives the
             // screen-space termination (a surface within a pixel ends the march, so far
-            // geometry resolves at coarse LOD); `y` is reserved (was the removed cubic band);
-            // `w` is the LOD cross-fade band (fraction of each ring's half-extent; 0 = hard
-            // seams).
+            // geometry resolves at coarse LOD); `y` is the soft-shadow penumbra hardness `k`
+            // (lower = softer; blurs coarse-LOD faceting + the penumbra→umbra edge); `w` is the
+            // LOD cross-fade band (fraction of each ring's half-extent; 0 = hard seams).
             march_params: Vec4::new(
                 pixel_cone,
-                0.0,
+                raymarch.shadow_softness,
                 raymarch.over_relax,
                 raymarch.lod_blend_band,
             ),
