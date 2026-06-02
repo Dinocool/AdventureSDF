@@ -114,7 +114,7 @@ fn surface_shadow(hit_pos: vec3<f32>, geo_n: vec3<f32>, light_dir: vec3<f32>, lo
     let vs = voxel_size_at(lod);
     let origin = hit_pos + geo_n * vs;
     // Penumbra hardness from the editor "Shadow Softness" slider (march_params.y); fall back to
-    // 6 when the uniform is unset (0) — e.g. the shadow harness, which doesn't fill march_params.
-    let k = select(6.0, shadow_softness(), shadow_softness() > 0.0);
+    // 16 when the uniform is unset (0) — e.g. the shadow harness, which doesn't fill march_params.
+    let k = select(16.0, shadow_softness(), shadow_softness() > 0.0);
     return soft_shadow(origin, light_dir, vs * 0.5, max_t, k);
 }
