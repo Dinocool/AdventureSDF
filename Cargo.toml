@@ -29,10 +29,13 @@ editor = [
 # Build with `--features renderdoc` (add `--no-default-features` to drop `fast`/dynamic_linking,
 # which RenderDoc can't hook).
 renderdoc = ["editor", "dep:renderdoc", "dep:libloading"]
-# Emit shader debug info (naga `OpLine`/`OpSource`) by enabling wgpu `InstanceFlags::DEBUG`,
-# so an NVIDIA Nsight Graphics GPU-Trace capture can correlate sampled GPU cost back to WGSL
-# source lines. OFF by default (debug info bloats shaders + slightly slows pipeline creation);
-# build with `--features editor,shader-debug` when profiling shaders. See `rdoc/scripts/ngfx`.
+# Emit shader debug info (naga `OpLine`) by enabling wgpu `InstanceFlags::DEBUG`, so an NVIDIA
+# Nsight Graphics GPU-Trace capture can map sampled GPU cost to shader line numbers + keeps the
+# regime/per-pass timing in `perf.json` source-aware. OFF by default (debug info bloats shaders +
+# slightly slows pipeline creation); build with `--features editor,shader-debug` when profiling.
+# (Per-WGSL-line *source* view in Nsight needs embedded `OpSource`, which Bevy/wgpu don't emit —
+# decoupled_naga didn't surface it either; we attribute cost by region via ablation instead. See
+# `rdoc/scripts/ngfx` + the `profile-shaders` skill.)
 shader-debug = []
 # Faster incremental compiles via dynamic linking of Bevy. Dev-only — never ship.
 # (Disable with `--no-default-features` when capturing in RenderDoc, which can't inject
