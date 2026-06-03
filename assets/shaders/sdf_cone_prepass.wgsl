@@ -24,12 +24,14 @@
     voxel_size_at,
     lod_count,
     clipmap_exit_t,
+    chunk_buf,
 }
 #import sdf::brick::{
     world_to_brick_lod,
     resolve_march,
     dist_to_brick_exit_lod,
     dist_to_chunk_exit_lod,
+    dist_over_empty_bricks,
     in_ring_chunk,
     find_chunk_cached,
     new_chunk_cache,
@@ -87,20 +89,26 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         let p = origin + dir * t;
         let scene = resolve_march(p, &cache);
 
-        // --- Empty space: hierarchical chunk-DDA skip (mirrors sdf_raymarch.wgsl) -------
-        // Provably-empty regardless of the cone, so step across the largest in-ring absent
-        // chunk box around p (coarsest first). Everything skipped stays clear, so `t` after
-        // the jump is still a valid seed.
+        // --- Empty space: occupancy-aware hierarchical skip (mirrors sdf_raymarch.wgsl) -------
+        // Provably-empty regardless of the cone, so `t` after the jump is still a valid seed. A
+        // coarse ABSENT in-ring chunk → jump its whole box; a coarse RESIDENT chunk whose brick at p
+        // is empty (air above the terrain in the chunk holding it) → occupancy-DDA across its empty
+        // bricks (`dist_over_empty_bricks`) — without this the cone march crawls the above-terrain
+        // corridor brick-by-brick and can exhaust its step budget before reaching the first surface,
+        // seeding the tile SHORT (every pixel then re-crawls). Coarsest→fine; coarse-empty ⇒ empty
+        // at all finer LODs (safe).
         if (!scene.in_brick) {
-            let wl = scene.window_lod;
-            var adv = dist_to_brick_exit_lod(p, dir, wl) + voxel_size_at(wl) * 0.01;
             let levels = lod_count();
+            var adv = dist_to_brick_exit_lod(p, dir, scene.window_lod) + voxel_size_at(scene.window_lod) * 0.01;
             for (var L = levels; L > 0u; ) {
                 L = L - 1u;
                 let coord = world_to_brick_lod(p, L);
                 let ci = find_chunk_cached(coord, L, &cache);
-                if (ci < 0 && in_ring_chunk(coord, L)) {
-                    adv = max(adv, dist_to_chunk_exit_lod(p, dir, L) + voxel_size_at(L) * 0.01);
+                if (ci >= 0) {
+                    adv = dist_over_empty_bricks(chunk_buf[u32(ci)], p, dir, L) + voxel_size_at(L) * 0.01;
+                    break;
+                } else if (in_ring_chunk(coord, L)) {
+                    adv = dist_to_chunk_exit_lod(p, dir, L) + voxel_size_at(L) * 0.01;
                     break;
                 }
             }
