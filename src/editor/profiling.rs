@@ -68,6 +68,12 @@ pub fn performance_panel(world: &mut World, ui: &mut egui::Ui) {
         .show(ui, |ui| {
             perf_graph_ui(world, ui);
 
+            // Per-pass GPU time (timestamp queries via RenderDiagnosticsPlugin). The headline
+            // number for the raymarch work — read `gbuffer_pass` while toggling march changes.
+            ui.separator();
+            ui.heading("SDF GPU passes");
+            sdf_gpu_times_ui(world, ui);
+
             // Chrome-trace capture toggle (off by default). Records Bevy system /
             // render-graph spans to a JSON file only while enabled.
             ui.separator();
@@ -79,6 +85,58 @@ pub fn performance_panel(world: &mut World, ui: &mut egui::Ui) {
             ui.heading("GPU");
             let stats = world.resource::<crate::sdf_render::debug::SdfAtlasStats>();
             crate::sdf_render::debug::atlas_stats_ui(stats, ui);
+        });
+}
+
+/// Per-pass SDF GPU timings, read straight from the [`DiagnosticsStore`] paths that
+/// `RecordDiagnostics::pass_span` writes (`render/<span>/elapsed_gpu`, in ms). One row per SDF
+/// pass plus a total. Empty until `RenderDiagnosticsPlugin` is active AND the device has
+/// `TIMESTAMP_QUERY` (editor builds request it) — and the first few frames warm up before the
+/// async timestamp readback lands. Pipeline stats (`fragment_shader_invocations`) ride the same
+/// store; the gbuffer raymarch is the one to watch when tuning the march.
+fn sdf_gpu_times_ui(world: &mut World, ui: &mut egui::Ui) {
+    let diagnostics = world.resource::<DiagnosticsStore>();
+    let mut rows: Vec<(String, f64)> = Vec::new();
+    let mut frag_invocations: Option<f64> = None;
+    for d in diagnostics.iter() {
+        let path = d.path().as_str();
+        let Some(rest) = path.strip_prefix("render/") else {
+            continue;
+        };
+        if let Some(name) = rest.strip_suffix("/elapsed_gpu")
+            && name.starts_with("sdf_")
+            && let Some(v) = d.smoothed()
+        {
+            rows.push((name.to_string(), v));
+        } else if rest == "sdf_gbuffer_pass/fragment_shader_invocations"
+            && let Some(v) = d.smoothed()
+        {
+            frag_invocations = Some(v);
+        }
+    }
+    if rows.is_empty() {
+        ui.weak("No GPU timings yet — needs an editor build (RenderDiagnosticsPlugin + TIMESTAMP_QUERY); warming up.");
+        return;
+    }
+    rows.sort_by(|a, b| a.0.cmp(&b.0));
+    let total: f64 = rows.iter().map(|(_, v)| v).sum();
+    egui::Grid::new("sdf_gpu_times")
+        .num_columns(2)
+        .striped(true)
+        .show(ui, |ui| {
+            for (name, v) in &rows {
+                ui.label(name.trim_start_matches("sdf_").trim_end_matches("_pass"));
+                ui.label(format!("{v:.3} ms"));
+                ui.end_row();
+            }
+            ui.strong("total");
+            ui.strong(format!("{total:.3} ms"));
+            ui.end_row();
+            if let Some(fi) = frag_invocations {
+                ui.label("gbuffer frag invocs");
+                ui.label(format!("{:.2} M", fi / 1.0e6));
+                ui.end_row();
+            }
         });
 }
 

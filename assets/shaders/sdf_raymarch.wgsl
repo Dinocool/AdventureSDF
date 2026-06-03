@@ -77,6 +77,27 @@ fn main(in: FullscreenVertexOutput) -> FragmentOutput {
     // Primary ray: full quality (cone ×1, the uniform step/dist caps, no LOD floor).
     let rm = raymarch(ray_origin, ray_dir, start_t, MarchQuality(1.0, max_steps(), max_dist(), 0u));
 
+#ifdef SDF_DEBUG_STEP_COUNT
+    // Step-count heatmap: blue (few) → red (at the budget). Colours EVERY pixel — hit, sky-miss,
+    // AND step-capped — by march cost, BEFORE the miss/sky branch, so a grazing crest that
+    // exhausts `max_steps` glows red instead of vanishing into the sky (which is exactly the case
+    // we want to see). Written as albedo (a < SKY_DIST on a hit so it shares depth; = SKY_DIST on a
+    // miss so the lit pass treats it as a passthrough); the lit pass returns albedo straight through.
+    let heat = clamp(f32(rm.steps) / f32(max_steps()), 0.0, 1.0);
+    let heat_rgb = vec3<f32>(heat, 0.3 * (1.0 - heat), 1.0 - heat);
+    var heat_depth = 0.0; // reverse-Z far for a miss
+    if (rm.hit) {
+        let hc = camera.clip_from_world * vec4<f32>(rm.hit_pos, 1.0);
+        heat_depth = hc.z / hc.w;
+    }
+    return FragmentOutput(
+        vec4<f32>(heat_rgb, select(SKY_DIST, rm.dist, rm.hit)),
+        vec4<f32>(0.0),
+        vec4<f32>(0.0),
+        heat_depth,
+    );
+#endif
+
     if (!rm.hit) {
         // Sky/miss: store the analytic sky as "albedo" (the lit pass passes it straight
         // through), distance = sentinel, no normal, no emission, depth = far (reverse-Z 0).

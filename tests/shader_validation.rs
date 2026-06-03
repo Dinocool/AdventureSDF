@@ -160,14 +160,17 @@ fn sdf_brick_bake_wgsl_validates() {
 
 #[test]
 fn sdf_debug_modes_validate() {
-    // The primary pass is now a pure G-buffer export (no inline debug overlays — those return
-    // through the composite in a later stage). Only the march-internal toggles remain
-    // meaningful here; they still gate `#ifdef` branches in the brick/march modules.
+    // The primary pass is mostly a pure G-buffer export, but a few debug overlays write their
+    // visualization into albedo and return early (the lit pass passes it straight through):
+    // SDF_DEBUG_LOD (eff-LOD hue ramp) and SDF_DEBUG_STEP_COUNT (march step-count heatmap). The
+    // rest are march-internal toggles gating `#ifdef` branches in the brick/march modules.
     for def in [
         "SDF_DISABLE_CHUNK_CACHE",
         "SDF_DISABLE_LOD",
         "SDF_LINEAR_CHUNK_SEARCH",
         "SDF_DEBUG_LOD",
+        "SDF_DEBUG_STEP_COUNT",
+        "SDF_SECOND_ORDER_STEP",
     ] {
         validate_composed_sdf_with_defs(&[def]).unwrap_or_else(|e| panic!("{e}"));
     }
@@ -244,6 +247,7 @@ fn sdf_deferred_lit_wgsl_validates() {
         "SDF_DEBUG_EMISSIVE",
         "SDF_DEBUG_SUN_VIS",
         "SDF_DEBUG_DEPTH",
+        "SDF_DEBUG_STEP_COUNT",
     ] {
         validate_standalone_with_defs(entry, &modules, &[def]);
     }

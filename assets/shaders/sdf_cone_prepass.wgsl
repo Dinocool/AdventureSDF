@@ -23,6 +23,7 @@
     pixel_cone,
     voxel_size_at,
     lod_count,
+    clipmap_exit_t,
 }
 #import sdf::brick::{
     world_to_brick_lod,
@@ -65,7 +66,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let dir = normalize(world_pos - origin);
 
     let MAX_STEPS = max_steps();
-    let MAX_DIST = max_dist();
+    // Bound the cone march at the resident clipmap's exit (same slab test the per-pixel march
+    // uses): a tile whose centre ray leaves the volume is clear sky beyond, so seeding at the box
+    // edge stops the prepass crawling brick-by-brick through the void for every sky tile.
+    let MAX_DIST = min(max_dist(), clipmap_exit_t(origin, dir));
     // Cone half-width per unit ray distance covering the WHOLE tile: a pixel covers
     // `pixel_cone·t`; the tile spans TILE pixels, so `pixel_cone·TILE·t` conservatively
     // encloses every pixel ray in the tile (corner included). Larger cone = stop sooner =

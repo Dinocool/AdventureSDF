@@ -203,6 +203,12 @@ fn register_shader_modes(app: &mut App) {
         "SDF_DEBUG_LOD",
         "Continuous rendered LOD as a hue ramp (red = LOD 0 → blue); the cross-fade band reads as a gradient between two LOD hues",
     ));
+    registry.register(overlay(
+        "sdf/step_count",
+        "Steps",
+        "SDF_DEBUG_STEP_COUNT",
+        "Raymarch step-count heatmap (blue = few → red = at the budget); step-capped pixels (e.g. grazing hill crests) glow red",
+    ));
 
     // Independent toggle (not part of the overlay group): bypass the per-ray chunk
     // lookup cache, forcing a fresh binary search every probe. If enabling this fixes a
@@ -213,6 +219,19 @@ fn register_shader_modes(app: &mut App) {
         shader_define: "SDF_DISABLE_CHUNK_CACHE".into(),
         kind: DebugModeKind::Toggle,
         description: "Bypass the per-ray chunk lookup cache (always binary-search)".into(),
+    });
+
+    // Independent toggle: second-order (quadratic-Taylor) grazing step (Moinet & Neyret EG2025).
+    // Speculative larger steps for tangent/grazing rays via the field's forward derivative. A/B it
+    // against the SDF GPU-passes "gbuffer" timer + the Steps heatmap. Tune SECOND_ORDER_K in
+    // march.wgsl. Watch thin objects for tunnelling. Diagnostic / experimental — leave OFF normally.
+    registry.register(ShaderDebugMode {
+        id: "sdf/second_order_step".into(),
+        label: "2nd-order step".into(),
+        shader_define: "SDF_SECOND_ORDER_STEP".into(),
+        kind: DebugModeKind::Toggle,
+        description: "Second-order quadratic-Taylor grazing step (experimental; tune 2nd-order K)"
+            .into(),
     });
 
     // Independent toggle: force LOD 0 only (no clipmap shells). If enabling this fixes a
@@ -259,10 +278,12 @@ fn register_shader_modes(app: &mut App) {
 
     // Default sun shadows ON so the lit render shows them without hunting for the checkbox. The
     // state resource is separate from the registry; seed it after the `registry` borrow above
-    // ends (NLL drops it at last use).
+    // ends (NLL drops it at last use). Second-order grazing step also ON by default — it's now a
+    // real win on the (Lipschitz-normalised) terrain; tune via the "2nd-order K" raymarch slider.
     {
         let mut state = app.world_mut().resource_mut::<ShaderDebugState>();
         state.set("sdf/shadows", true);
+        state.set("sdf/second_order_step", true);
     }
 }
 
@@ -553,7 +574,11 @@ fn render_panel(world: &mut World, ui: &mut egui::Ui) {
     ui.label("Raymarch");
     let mut params = world.resource_mut::<SdfRaymarchParams>();
     ui.add(egui::Slider::new(&mut params.max_steps, 16..=512).text("Steps"));
-    ui.add(egui::Slider::new(&mut params.max_dist, 10.0..=5000.0).text("Max Dist"));
+    ui.add(
+        egui::Slider::new(&mut params.max_dist, 10.0..=1_000_000.0)
+            .logarithmic(true)
+            .text("Max Dist"),
+    );
     ui.add(egui::Slider::new(&mut params.sdf_eps, 0.0001..=0.1).text("Epsilon"));
     ui.add(egui::Slider::new(&mut params.lod_blend_band, 0.0..=0.5).text("LOD Blend Band"));
     ui.add(
@@ -566,6 +591,13 @@ fn render_panel(world: &mut World, ui: &mut egui::Ui) {
                     format!("{v:.0} (higher = sharper)")
                 }
             }),
+    );
+    // Second-order grazing-step curvature `k` (only active with the "2nd-order step" toggle on).
+    // Lower = larger speculative steps on grazing/tangent rays (faster, more overshoot risk).
+    ui.add(
+        egui::Slider::new(&mut params.second_order_k, 0.002..=8.0)
+            .logarithmic(true)
+            .text("2nd-order K (lower = bigger steps)"),
     );
 }
 

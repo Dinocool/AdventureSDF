@@ -174,6 +174,12 @@ pub struct SdfRaymarchParams {
     /// `tests/sdf_shadow_harness`); HIGHER = sharper/tighter but boxier + harder-edged. Tunable
     /// live via the editor raymarch panel ("Shadow Softness").
     pub shadow_softness: f32,
+    /// Second-order (quadratic-Taylor) grazing-step curvature bound `L₂ = k / voxel_size`
+    /// (Moinet & Neyret EG2025), used only when the "2nd-order step" debug toggle compiles in the
+    /// `SDF_SECOND_ORDER_STEP` branch. LOWER = larger speculative steps on grazing/tangent rays
+    /// (faster, but risks overshooting a sub-voxel feature); HIGHER = smaller, safer steps. Tunable
+    /// live via the editor raymarch panel ("2nd-order K").
+    pub second_order_k: f32,
 }
 
 impl Default for SdfRaymarchParams {
@@ -192,6 +198,9 @@ impl Default for SdfRaymarchParams {
             // (less near-miss darkening). A tight default (64) stays clean; the soft end (low k)
             // re-introduces the penumbra near-miss/field artifacts.
             shadow_softness: 64.0,
+            // Second-order grazing-step curvature (ON by default via the "2nd-order step" toggle).
+            // 0.5 is the measured sweet spot on the Lipschitz-normalised terrain.
+            second_order_k: 0.5,
         }
     }
 }

@@ -136,6 +136,10 @@ fn lod_blend_band() -> f32 { return camera.march_params.w; }
 // The LOD cross-fade keys off the chunk-SNAPPED ring centre, so the shader recomputes it
 // from camera_pos + this (mirrors bake_scheduler::ring_chunk_origin). >= 1.
 fn recenter_snap() -> i32 { return max(i32(camera.debug_params.w), 1); }
+// Second-order grazing-step curvature `k` (the `L₂ = k / voxel_size` bound in sdf::march's
+// SDF_SECOND_ORDER_STEP path). Packed in the otherwise-unused `screen_params.z`. Editor slider
+// "2nd-order K"; lower = larger speculative grazing steps.
+fn second_order_k() -> f32 { return camera.screen_params.z; }
 
 // --- LOD clipmap / chunk accessors ---
 
@@ -180,6 +184,33 @@ fn ring_center_lod(cam: vec3<f32>, lod: u32) -> vec3<f32> {
     );
     let chunk_world = f32(CHUNK_BRICKS) * brick_world_at(lod);
     return vec3<f32>(snapped) * chunk_world;
+}
+
+// Forward exit distance of a ray through the resident clipmap's outer AABB — the bound that
+// makes a MISS ray terminate in O(1) instead of crawling brick-by-brick through the void.
+// Shared by the primary/shadow march (`sdf::march`) AND the cone prepass so both stop a sky ray
+// at the volume edge.
+//
+// The coarsest ring is the LARGEST clipmap shell and is centred on the camera, so it contains
+// every finer ring and therefore ALL resident geometry (geometry exists only inside resident
+// chunks, which are all inside some ring). The box is convex and the march origin (the camera,
+// or a surface point, both inside the volume) sits inside it, so the ray crosses the far face
+// exactly once and can never re-enter — the instant `t` passes this distance the ray is sky.
+//
+// Standard slab test, but we only need the FAR intersection (`t_far`): per axis the two slab
+// planes give `t1`,`t2`; the box exit is the nearest of the three per-axis maxima. `1.0/dir` is
+// ±inf on an axis-aligned ray, which the min/max collapses to the finite axes (correct slab
+// behaviour). The ring centre is keyed off `camera.camera_pos` (NOT `origin`) because the ring
+// is camera-centred — a shadow ray starting at a surface point shares the same box.
+fn clipmap_exit_t(origin: vec3<f32>, dir: vec3<f32>) -> f32 {
+    let cl = lod_count() - 1u;
+    let center = ring_center_lod(camera.camera_pos.xyz, cl);
+    let half = 0.5 * f32(ring_bricks()) * brick_world_at(cl);   // per-axis half-extent
+    let inv = 1.0 / dir;
+    let t_hi = (center + vec3<f32>(half) - origin) * inv;
+    let t_lo = (center - vec3<f32>(half) - origin) * inv;
+    let t_far = max(t_hi, t_lo);                                // per-axis exit plane
+    return min(min(t_far.x, t_far.y), t_far.z);
 }
 
 // Floored division of `a` by `b` (b > 0), rounding toward negative infinity.
