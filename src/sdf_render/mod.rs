@@ -187,11 +187,11 @@ impl Default for SdfRaymarchParams {
             cone_scale: 1.0,
             over_relax: 1.6,
             lod_blend_band: 0.2,
-            // k=16: a near-sun-realistic penumbra (a real sun ≈ k 57). Lower values are
-            // artistically softer but spread the coarse-LOD occluder's inherent faceting across a
-            // wide gray penumbra; a tighter penumbra confines that to a thin edge. 16 is the
-            // sweet spot (visually clean, still soft) — raise toward 32 for crisper.
-            shadow_softness: 16.0,
+            // Soft-shadow penumbra hardness `k` (`sdf::shadows`): 0 = HARD shadow (binary
+            // occlusion, no penumbra — artifact-free); >0 = cone-traced soft, HIGHER = tighter
+            // (less near-miss darkening). A tight default (64) stays clean; the soft end (low k)
+            // re-introduces the penumbra near-miss/field artifacts.
+            shadow_softness: 64.0,
         }
     }
 }
