@@ -1,8 +1,13 @@
 /target
 /target-alt
 .claude/worktrees/
-# Generated per-variant BC7 texture cache (regenerated from source PNGs on demand).
-assets/textures/**/pbr.bc7
+# Hidden per-asset editor sidecar/cache dirs (next to the source files). Both are
+# regenerable or per-machine, so they're never committed:
+#   .soul-import/ — per-texture import settings (filter/colorspace/wrap sidecars)
+#   .soul-cache/  — any asset-local generated cache (e.g. compiled BC7)
+# The live BC7 texture cache currently lives in the OS temp dir, not the asset tree.
+**/.soul-import/
+**/.soul-cache/
 
 # SDF diagnostic log (throwaway dev output)
 sdf_diag.log

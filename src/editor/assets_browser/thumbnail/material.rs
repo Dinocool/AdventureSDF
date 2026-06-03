@@ -483,12 +483,17 @@ pub(crate) fn standard_from_material(
     };
     let base_color_texture = load(&tex.diffuse);
     let normal_map_texture = load(&tex.normal);
+    // Emissive radiance = color × intensity (matches the SDF shader). Feed it to the
+    // preview/thumbnail StandardMaterial so a glowing material reads as glowing.
+    let [er, eg, eb] = asset.emissive_color;
+    let i = asset.emissive_intensity;
     let mat = StandardMaterial {
         base_color: asset.color(),
         base_color_texture,
         normal_map_texture,
         metallic: asset.metallic,
         perceptual_roughness: asset.roughness.max(0.05),
+        emissive: LinearRgba::rgb(er * i, eg * i, eb * i),
         ..default()
     };
     (mat, deps)

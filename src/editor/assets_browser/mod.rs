@@ -361,7 +361,18 @@ fn read_entries(dir: &Path) -> Vec<Entry> {
     dirs.into_iter()
         .map(|d| mk(d, true))
         .chain(files.into_iter().map(|f| mk(f, false)))
+        .filter(|e| !is_hidden_entry(&e.path))
         .collect()
+}
+
+/// Whether `path` should be hidden from the asset browser: any dot-prefixed entry, by
+/// convention. This covers the hidden per-asset sidecar/cache dirs (`.soul-import/`,
+/// `.soul-cache/`) and any dotfile. Applies to both files and directories — hiding a dir
+/// makes its whole subtree unreachable in the browser. Generated caches (e.g. compiled BC7)
+/// live either in the OS temp dir or in a dot-prefixed `.soul-cache/`, so they're covered
+/// here too without a per-suffix ignore list.
+fn is_hidden_entry(path: &Path) -> bool {
+    crate::editor::fs_util::file_name_str(path).starts_with('.')
 }
 
 /// Lowercased final extension of `path`, if any.
@@ -426,5 +437,18 @@ mod tests {
     fn elide_long_names() {
         assert_eq!(elide("short", 12), "short");
         assert_eq!(elide("a_very_long_filename", 6), "a_ver…");
+    }
+
+    #[test]
+    fn hidden_entries_are_filtered() {
+        // Dot-prefixed sidecar/cache dirs are hidden. The predicate matches direct children
+        // by their own name: hiding the `.soul-import` dir entry makes everything inside it
+        // unreachable in the browser, so we never enumerate its contents.
+        assert!(is_hidden_entry(Path::new("textures/g/.soul-import")));
+        assert!(is_hidden_entry(Path::new("textures/g/.soul-cache")));
+        // Real assets stay visible.
+        assert!(!is_hidden_entry(Path::new("materials/rock.material.ron")));
+        assert!(!is_hidden_entry(Path::new("textures/g/diffuse.png")));
+        assert!(!is_hidden_entry(Path::new("scenes/world.scene")));
     }
 }

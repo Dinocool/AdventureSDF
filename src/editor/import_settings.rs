@@ -1,7 +1,9 @@
-//! Per-texture import settings, persisted as a Godot-style sidecar `<file>.import.ron`
-//! next to the image. Editor-facing this pass: the settings drive how the editor loads
-//! and samples the image for preview. Wiring them into the SDF BC7 import pipeline (a
-//! fixed 1024² path) is a deliberate follow-up.
+//! Per-texture import settings, persisted as a sidecar under a hidden `.soul-import/`
+//! directory next to the image: `<dir>/.soul-import/<file>.ron`. The hidden directory keeps
+//! these authoring files out of the asset browser (which hides dot-prefixed entries) without
+//! a per-suffix ignore. Editor-facing this pass: the settings drive how the editor loads and
+//! samples the image for preview. Wiring them into the SDF BC7 import pipeline (a fixed 1024²
+//! path) is a deliberate follow-up.
 
 use std::path::{Path, PathBuf};
 
@@ -43,11 +45,26 @@ pub struct TextureImportSettings {
 }
 
 impl TextureImportSettings {
-    /// Sidecar path for an image: `<image>.import.ron`.
+    /// Hidden directory (next to an image) that holds its import sidecar.
+    pub const SIDECAR_DIR: &'static str = ".soul-import";
+
+    /// Sidecar path for an image: `<dir>/.soul-import/<filename>.ron`. The full original
+    /// filename is kept (then `.ron` appended) so `diffuse.png` and `diffuse.jpg` in the
+    /// same folder map to distinct sidecars. Falls back to a flat `<image>.ron` if `image`
+    /// has no parent/filename (shouldn't happen for real asset paths).
     pub fn sidecar_path(image: &Path) -> PathBuf {
-        let mut s = image.as_os_str().to_os_string();
-        s.push(".import.ron");
-        PathBuf::from(s)
+        let Some(file_name) = image.file_name() else {
+            let mut s = image.as_os_str().to_os_string();
+            s.push(".ron");
+            return PathBuf::from(s);
+        };
+        let mut name = file_name.to_os_string();
+        name.push(".ron");
+        image
+            .parent()
+            .unwrap_or_else(|| Path::new(""))
+            .join(Self::SIDECAR_DIR)
+            .join(name)
     }
 
     /// Load settings for `image` from its sidecar, or defaults if absent/unparseable.
@@ -96,10 +113,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn sidecar_path_appends_import_ron() {
+    fn sidecar_path_uses_hidden_dir() {
         assert_eq!(
             TextureImportSettings::sidecar_path(Path::new("assets/t/diffuse.png")),
-            PathBuf::from("assets/t/diffuse.png.import.ron")
+            PathBuf::from("assets/t/.soul-import/diffuse.png.ron")
         );
     }
 
