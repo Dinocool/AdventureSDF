@@ -11,6 +11,7 @@ pub mod config;
 pub mod dock;
 pub mod fs_util;
 pub mod hierarchy;
+pub mod history;
 pub mod import_settings;
 pub mod inspector;
 pub mod keybinds;
@@ -62,6 +63,7 @@ impl Plugin for EditorPlugin {
             hierarchy::HierarchyPlugin,
             dock::DockPlugin,
         ))
+        .add_plugins(history::EditHistoryPlugin)
         .init_resource::<menu_bar::EditorRequests>()
         .init_resource::<menu_bar::CurrentScenePath>()
         .init_resource::<scene_browser::OpenSceneDialog>()

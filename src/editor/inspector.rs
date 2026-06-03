@@ -218,6 +218,9 @@ fn edit_component(world: &mut World, entity: Entity, type_path: &str, ui: &mut e
         }
     };
 
+    // Snapshot the pre-edit value (RON) so the change is undoable.
+    let before_ron = crate::editor::history::reflect_to_ron(world, value.as_partial_reflect());
+
     let changed = bevy_inspector_egui::bevy_inspector::ui_for_value(value.as_mut(), ui, world);
 
     if changed {
@@ -228,6 +231,20 @@ fn edit_component(world: &mut World, entity: Entity, type_path: &str, ui: &mut e
             && let Ok(mut entity_mut) = world.get_entity_mut(entity)
         {
             rc.apply(&mut entity_mut, value.as_partial_reflect());
+        }
+        drop(registry);
+
+        // Record the edit (generic over component type). Coalesces during a drag.
+        let after_ron = crate::editor::history::reflect_to_ron(world, value.as_partial_reflect());
+        if let (Some(before), Some(after)) = (before_ron, after_ron) {
+            let id = crate::editor::history::ensure_id(world, entity);
+            if let Some(cmd) =
+                crate::editor::history::ComponentEdit::new(id, type_path, before, after)
+            {
+                world
+                    .resource_mut::<crate::editor::history::EditHistories>()
+                    .record(Box::new(cmd));
+            }
         }
     }
 }

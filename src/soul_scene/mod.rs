@@ -18,9 +18,10 @@ pub mod save;
 mod tests;
 
 pub use format::{EditorCamera, LocalId, SceneFile, SceneRecord};
-pub use load::{SceneLoadError, load_scene, load_scene_from_str};
+pub use load::{SceneLoadError, instantiate_scene_str, load_scene, load_scene_from_str};
 pub use save::{
     SceneSaveError, save_scene, save_scene_to_string, save_scene_to_string_with_camera,
+    save_subtree_to_string,
 };
 
 /// Editor-camera pose parsed from the most recently loaded `.scene` (or `None` if that file
