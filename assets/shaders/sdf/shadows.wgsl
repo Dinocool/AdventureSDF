@@ -22,10 +22,8 @@
     in_ring_chunk,
     new_chunk_cache,
 }
-// The shadow ray samples the SAME distance-driven LOD cross-fade the primary raymarch renders
-// the surface through, so a smoothly-rendered occluder casts a matching (non-blockier) shadow
-// instead of one faceted to the raw finest-occupied LOD.
-#import sdf::march::{lod_crossfade, raymarch, MarchQuality}
+// For the hard-shadow path (softness 0): a binary occlusion test via the primary raymarch.
+#import sdf::march::{raymarch, MarchQuality}
 
 // A sample this small means the ray entered an occluder → hard shadow.
 const SHADOW_HIT_EPS: f32 = 1e-3;
@@ -73,11 +71,11 @@ fn soft_shadow(origin: vec3<f32>, light_dir: vec3<f32>, mint: f32, max_t: f32, k
             continue;
         }
 
-        // --- In a brick: sphere-trace, tracking the penumbra ---
-        // Sample the field through the primary march's LOD cross-fade (not the raw finest LOD),
-        // so the shadow's occluder matches the rendered surface. `cone = 0` → the morph is gated
-        // only by the near-surface distance (it engages near the occluder, before the hit test).
-        let d = lod_crossfade(p, scene.dist, scene.lod, 0.0, &cache).d_eff;
+        // --- In a brick: cone-trace the penumbra ---
+        // Sample the RAW finest-resident-LOD distance (`resolve_march`) — NO LOD cross-fade blend.
+        // The cross-fade pulls in coarser neighbour levels, which still smeared the penumbra; the
+        // cone term alone provides the softening.
+        let d = scene.dist;
         if (d < SHADOW_HIT_EPS) {
             return 0.0; // entered an occluder → fully shadowed
         }
@@ -111,16 +109,20 @@ fn soft_shadow(origin: vec3<f32>, light_dir: vec3<f32>, mint: f32, max_t: f32, k
 // (kills self-acne); `mint` is kept sub-voxel so a near-field contact occluder still registers —
 // the normal offset (not mint) is what prevents self-intersection.
 //
-// SHARP shadow: reuse the PRIMARY raymarch (exactly as the reflection pass does) for a direct,
-// accurate occlusion test through the SAME cross-faded field the camera renders. A hit before the
-// sun-distance cap → fully shadowed; an escape → fully lit. Binary (no penumbra), so the shadow
-// silhouette is precisely the rendered occluder's — the cleanest test of whether any residual
-// faceting is the FIELD (it'll show as a crisp faceted edge) vs the soft-penumbra integration
-// (it'll be gone). `cone_k = 1` matches the primary march's screen-space hit acceptance.
+// Driven by the "Shadow Softness" slider `k` (= `shadow_softness()`, march_params.y):
+//   * k == 0  → a HARD shadow: a binary occlusion test through the primary `raymarch` (exactly
+//               like the reflection pass), artifact-free because it only reacts to a real surface
+//               hit, never to a near-miss off the surface.
+//   * k  > 0  → a cone-traced soft shadow: the sun subtends a cone of half-angle θ, `k = 1/θ`,
+//               and the penumbra `min(k·d/t) = min(d/(θ·t))` is the clear fraction of that cone.
+//               HIGHER k = sharper/tighter (and less near-miss darkening); lower = softer/wider.
 fn surface_shadow(hit_pos: vec3<f32>, geo_n: vec3<f32>, light_dir: vec3<f32>, lod: u32, max_t: f32) -> f32 {
     let vs = voxel_size_at(lod);
     let origin = hit_pos + geo_n * vs;
-    let q = MarchQuality(1.0, SHADOW_MAX_STEPS, max_t, 0u);
-    let r = raymarch(origin, light_dir, vs * 0.5, q);
-    return select(1.0, 0.0, r.hit);
+    let k = shadow_softness();
+    if (k <= 0.0) {
+        let q = MarchQuality(1.0, SHADOW_MAX_STEPS, max_t, 0u);
+        return select(1.0, 0.0, raymarch(origin, light_dir, vs * 0.5, q).hit);
+    }
+    return soft_shadow(origin, light_dir, vs * 0.5, max_t, k);
 }

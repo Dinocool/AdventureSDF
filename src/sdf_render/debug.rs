@@ -557,9 +557,15 @@ fn render_panel(world: &mut World, ui: &mut egui::Ui) {
     ui.add(egui::Slider::new(&mut params.sdf_eps, 0.0001..=0.1).text("Epsilon"));
     ui.add(egui::Slider::new(&mut params.lod_blend_band, 0.0..=0.5).text("LOD Blend Band"));
     ui.add(
-        egui::Slider::new(&mut params.shadow_softness, 2.0..=32.0)
+        egui::Slider::new(&mut params.shadow_softness, 0.0..=256.0)
             .text("Shadow Softness")
-            .custom_formatter(|v, _| format!("{v:.1} (lower = softer)")),
+            .custom_formatter(|v, _| {
+                if v <= 0.0 {
+                    "0 (hard)".to_string()
+                } else {
+                    format!("{v:.0} (higher = sharper)")
+                }
+            }),
     );
 }
 
