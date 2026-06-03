@@ -116,6 +116,32 @@ fn height_sample(xz: vec2<f32>, freq: f32, amp: f32, seed: u32) -> f32 {
     return (ab + (cd - ab) * u.y) * amp;
 }
 
+// Value-noise height AND its analytic XZ gradient (∂h/∂x, ∂h/∂z), as vec3(h, dh/dx, dh/dz). Same
+// smoothstep value-noise as `height_sample` (KEEP IN SYNC with edits.rs::height_sample_grad). The
+// gradient Lipschitz-normalises the heightmap field: the raw vertical gap `p.y - h` has
+// |∇| = sqrt(1 + |∇h|²) ≥ 1 on slopes, so it OVER-states the true (perpendicular) distance and the
+// sphere-trace overshoots steep crests; dividing by that factor restores a near-Euclidean field.
+fn height_sample_grad(xz: vec2<f32>, freq: f32, amp: f32, seed: u32) -> vec3<f32> {
+    let p = xz * freq;
+    let i = floor(p);
+    let f = p - i;
+    let u = f * f * (vec2<f32>(3.0) - 2.0 * f);          // smoothstep
+    let du = 6.0 * f * (vec2<f32>(1.0) - f);             // d(smoothstep)/df
+    let ix = i32(i.x);
+    let iy = i32(i.y);
+    let a = hash2(ix, iy, seed);
+    let b = hash2(ix + 1, iy, seed);
+    let c = hash2(ix, iy + 1, seed);
+    let d = hash2(ix + 1, iy + 1, seed);
+    let ab = a + (b - a) * u.x;
+    let cd = c + (d - c) * u.x;
+    let h = (ab + (cd - ab) * u.y) * amp;
+    // ∂(h/amp)/∂u.x and ∂(h/amp)/∂u.y, chained through smoothstep (du) and p = xz·freq.
+    let dh_dx = ((b - a) + ((d - c) - (b - a)) * u.y) * du.x * freq * amp;
+    let dh_dz = ((c - a) + ((d - c) - (b - a)) * u.x) * du.y * freq * amp;
+    return vec3<f32>(h, dh_dx, dh_dz);
+}
+
 // --- Primitive eval — ports edits::eval_primitive (local space) ------------------------
 
 fn eval_primitive(e: GpuEdit, p: vec3<f32>) -> f32 {
@@ -145,14 +171,37 @@ fn eval_primitive(e: GpuEdit, p: vec3<f32>) -> f32 {
             return min(max(d.x, d.y), 0.0) + length(max(d, vec2<f32>(0.0)));
         }
         case 5u: {  // Heightmap (ONE-SIDED surface) { half_xz, max_height, freq, amp, seed }
-            // Signed VERTICAL distance to the noise surface — no box floor/walls, so only the top
-            // shell bakes (interior + underside cull away). Must match edits.rs eval_primitive.
+            // Lipschitz-normalised signed distance to the noise surface — no box floor/walls, so only
+            // the top shell bakes (interior + underside cull away). The raw vertical gap `p.y - h`
+            // over-states the true (perpendicular) distance by sqrt(1+|∇h|²) on slopes, so the
+            // sphere-trace overshoots steep crests; dividing by that factor restores a near-Euclidean,
+            // march-safe field (the zero-crossing — the surface — is unchanged since the factor > 0).
             let max_height = e.params.z;
             let freq = e.params.w;
             let amp = e.params2.x;
             let seed = bitcast<u32>(e.params2.y);
-            let h = height_sample(vec2<f32>(p.x, p.z), freq, amp, seed) + max_height * 0.5;
-            return p.y - h;
+            let xz = vec2<f32>(p.x, p.z);
+            let hg = height_sample_grad(xz, freq, amp, seed);
+            let h = hg.x + max_height * 0.5;
+            // Lipschitz denominator from the NEIGHBOURHOOD-MAX slope, not the point gradient: a valid
+            // bound must hold over the region a sphere-trace step can cross. The point gradient is
+            // UNSAFE — at a convex peak the tip has |∇h|≈0 but its flanks are steep, so normalising by
+            // the tip slope over-states the distance and the tracer over-steps into blocky "flat-pixel"
+            // hits. Sample the slope half a noise cell out in ±x/±z (the feature scale is 1/freq) and
+            // keep the steepest, so the tip inherits its flanks' slope. [Stefek, "Ray Marching with
+            // Heightfields"; Bán & Valasek, Generalized Lipschitz Tracing, CGF 2025.]
+            let r = clamp(0.5 / max(freq, 1e-4), 0.0, e.params.x);
+            let gpx = height_sample_grad(xz + vec2<f32>(r, 0.0), freq, amp, seed);
+            let gnx = height_sample_grad(xz - vec2<f32>(r, 0.0), freq, amp, seed);
+            let gpz = height_sample_grad(xz + vec2<f32>(0.0, r), freq, amp, seed);
+            let gnz = height_sample_grad(xz - vec2<f32>(0.0, r), freq, amp, seed);
+            var g2 = dot(hg.yz, hg.yz);
+            g2 = max(g2, dot(gpx.yz, gpx.yz));
+            g2 = max(g2, dot(gnx.yz, gnx.yz));
+            g2 = max(g2, dot(gpz.yz, gpz.yz));
+            g2 = max(g2, dot(gnz.yz, gnz.yz));
+            let lip = sqrt(1.0 + g2);
+            return (p.y - h) / lip;
         }
         default: {
             return 1e30;

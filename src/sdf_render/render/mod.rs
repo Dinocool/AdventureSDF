@@ -2,6 +2,7 @@ use bevy::core_pipeline::FullscreenShader;
 use bevy::core_pipeline::core_3d::graph::{Core3d, Node3d};
 use bevy::ecs::query::QueryItem;
 use bevy::prelude::*;
+use bevy::render::diagnostic::RecordDiagnostics;
 use bevy::render::extract_component::{
     ComponentUniforms, ExtractComponent, ExtractComponentPlugin, UniformComponentPlugin,
 };
@@ -358,6 +359,10 @@ impl ViewNode for SdfGBufferNode {
         // colour targets (a miss writes the sky sentinel anyway, but a clean clear avoids stale
         // data leaking where the fullscreen triangle doesn't cover). Depth keeps Load so the SDF
         // surface shares the buffer with prior opaque geometry.
+        // Per-pass GPU timing (no-op unless RenderDiagnosticsPlugin is present — editor builds).
+        // Obtained before begin_tracked_render_pass (which mut-borrows render_context); the recorder
+        // is owned, so it coexists with the pass borrow below. Records render/sdf_gbuffer_pass/*.
+        let diagnostics = render_context.diagnostic_recorder();
         let clear = LoadOp::Clear(LinearRgba::NONE.into());
         let mut render_pass = render_context.begin_tracked_render_pass(RenderPassDescriptor {
             label: Some("sdf_gbuffer_pass"),
@@ -386,6 +391,7 @@ impl ViewNode for SdfGBufferNode {
             occlusion_query_set: None,
         });
 
+        let span = diagnostics.pass_span(&mut render_pass, "sdf_gbuffer_pass");
         if let Some(pipeline) = pipeline {
             render_pass.set_render_pipeline(pipeline);
             render_pass.set_bind_group(0, &bind_group_0, &[0]);
@@ -393,6 +399,7 @@ impl ViewNode for SdfGBufferNode {
             render_pass.set_bind_group(2, &bind_group_2, &[]);
             render_pass.draw(0..3, 0..1);
         }
+        span.end(&mut render_pass);
 
         Ok(())
     }
@@ -470,6 +477,7 @@ impl ViewNode for SdfCombineNode {
             &BindGroupEntries::sequential((albedo_view, normal_view, emissive_view, sampler)),
         );
 
+        let diagnostics = render_context.diagnostic_recorder();
         let post_process = view_target.post_process_write();
         let mut render_pass = render_context.begin_tracked_render_pass(RenderPassDescriptor {
             label: Some("sdf_combine_pass"),
@@ -486,10 +494,12 @@ impl ViewNode for SdfCombineNode {
             timestamp_writes: None,
             occlusion_query_set: None,
         });
+        let span = diagnostics.pass_span(&mut render_pass, "sdf_combine_pass");
         render_pass.set_render_pipeline(pipeline);
         render_pass.set_bind_group(0, &bind_group_0, &[0]);
         render_pass.set_bind_group(1, &bind_group_1, &[]);
         render_pass.draw(0..3, 0..1);
+        span.end(&mut render_pass);
 
         Ok(())
     }
@@ -734,8 +744,14 @@ fn prepare_sdf_camera_data(
             clip_from_world,
             prev_clip_from_world,
             camera_pos: transform.translation.extend(0.0),
-            // zw unused (was surface_bias — iso-offset removed).
-            screen_params: Vec4::new(size.x as f32, size.y as f32, 0.0, 0.0),
+            // z = second-order grazing-step curvature `k` (sdf::march, SDF_SECOND_ORDER_STEP);
+            // w unused (was surface_bias — iso-offset removed).
+            screen_params: Vec4::new(
+                size.x as f32,
+                size.y as f32,
+                raymarch.second_order_k,
+                0.0,
+            ),
             grid_origin: Vec4::new(
                 config.world_origin().x,
                 config.world_origin().y,

@@ -70,6 +70,11 @@ fn main(in: FullscreenVertexOutput) -> @location(0) vec4<f32> {
     // The primary pass wrote the eff-LOD hue ramp into albedo; pass it straight through (unlit).
     return vec4<f32>(albedo, 1.0);
 #endif
+#ifdef SDF_DEBUG_STEP_COUNT
+    // The primary pass wrote the march step-count heatmap into albedo; pass it straight through.
+    // (Sky/miss pixels already returned above with the same heat, since their albedo.a = SKY_DIST.)
+    return vec4<f32>(albedo, 1.0);
+#endif
 #ifdef SDF_DEBUG_NORMALS
     return vec4<f32>(normal * 0.5 + 0.5, 1.0);
 #endif

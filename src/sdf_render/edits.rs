@@ -39,10 +39,11 @@ pub enum SdfPrimitive {
         radius: f32,
         half_height: f32,
     },
-    /// Bounded noise heightmap (terrain testing). The surface is the value-noise
-    /// height over an XZ rectangle; the field is a *vertical-distance
-    /// approximation* (not a true Euclidean distance), so it is only valid when
-    /// densely sampled (see `eval_primitive`).
+    /// Bounded noise heightmap (terrain testing). The surface is the value-noise height over an XZ
+    /// rectangle. The distance field is baked on the GPU (`sdf_brick_bake.wgsl`), where the raw
+    /// vertical gap `p.y - h` is Lipschitz-normalised (divided by `sqrt(1+|∇h|²)`) into a true
+    /// Euclidean SDF so the sphere-trace doesn't overshoot steep slopes. There is no CPU distance
+    /// eval (the GPU is the source of truth); `heightmap_surface_y` gives the surface height.
     Heightmap {
         half_xz: Vec2,
         max_height: f32,
@@ -292,21 +293,13 @@ pub fn eval_primitive(prim: &SdfPrimitive, p: Vec3) -> f32 {
             );
             d.x.max(d.y).min(0.0) + d.max(Vec2::ZERO).length()
         }
-        SdfPrimitive::Heightmap {
-            max_height,
-            freq,
-            amp,
-            seed,
-            ..
-        } => {
-            // ONE-SIDED terrain surface: signed VERTICAL distance to the noise height (positive
-            // above, negative below). No box floor or side walls — so the deep interior AND the
-            // underside both fall outside the narrow band and cull away, leaving only the walkable
-            // top shell baked. The XZ/Y extent is bounded by the edit's AABB (`primitive_local_aabb`),
-            // not the field. (Vertical-distance approximation: |∇| ≥ 1 on slopes, so it under-states
-            // distance there — safe for the sphere-trace, conservative for the cull.)
-            let h = height_sample(Vec2::new(p.x, p.z), *freq, *amp, *seed) + *max_height * 0.5;
-            p.y - h
+        SdfPrimitive::Heightmap { .. } => {
+            // The heightmap distance field is BAKED ON THE GPU only (sdf_brick_bake.wgsl, where it is
+            // Lipschitz-normalised into a true Euclidean SDF). The CPU no longer evaluates it — the old
+            // CPU `p.y - h` vertical-distance port wasn't worth maintaining against the normalised GPU
+            // form. CPU SDF queries (picking's closest-distance refine) treat terrain as absent; the
+            // surface height for resting objects comes from `heightmap_surface_y` (the zero-crossing).
+            f32::MAX
         }
     }
 }
@@ -1032,20 +1025,8 @@ mod tests {
                 let d = Vec2::new(Vec2::new(p.x, p.z).length() - radius, p.y.abs() - half_height);
                 d.x.max(d.y).min(0.0) + d.max(Vec2::ZERO).length()
             }
-            GPU_PRIM_HEIGHTMAP => {
-                let half_xz = Vec2::new(e.params.x, e.params.y);
-                let max_height = e.params.z;
-                let freq = e.params.w;
-                let amp = e.params2.x;
-                let seed = e.params2.y.to_bits();
-                let half = Vec3::new(half_xz.x, max_height * 0.5, half_xz.y);
-                let centered = p - Vec3::new(0.0, max_height * 0.5, 0.0);
-                let q = centered.abs() - half;
-                let box_d = q.max(Vec3::ZERO).length() + q.max_element().min(0.0);
-                let h = height_sample(Vec2::new(p.x, p.z), freq, amp, seed) + max_height * 0.5;
-                let surface_d = p.y - h;
-                box_d.max(surface_d)
-            }
+            // Heightmap is GPU-baked only (Lipschitz-normalised, no CPU port) — excluded from this
+            // CPU parity oracle and the test below.
             _ => f32::MAX,
         }
     }
@@ -1074,13 +1055,7 @@ mod tests {
                 radius: 0.4,
                 half_height: 0.6,
             },
-            SdfPrimitive::Heightmap {
-                half_xz: Vec2::new(2.0, 2.0),
-                max_height: 1.0,
-                freq: 0.5,
-                amp: 0.4,
-                seed: 1337,
-            },
+            // Heightmap is GPU-baked only (Lipschitz-normalised); no CPU eval to oracle against.
         ];
         let samples = [
             Vec3::new(0.0, 0.0, 0.0),

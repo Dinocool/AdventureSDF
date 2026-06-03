@@ -89,6 +89,18 @@ fn wgpu_settings() -> WgpuSettings {
         features: WgpuFeatures::TEXTURE_COMPRESSION_BC | WgpuFeatures::TEXTURE_FORMAT_16BIT_NORM,
         ..default()
     };
+    // Editor builds enable GPU timestamp + pipeline-statistics queries so `RenderDiagnosticsPlugin`
+    // can measure per-pass GPU time (the Performance panel's "SDF GPU passes" table + the chrome
+    // trace). Desktop Vulkan/DX12 support these universally; device init fails loudly otherwise —
+    // trim a flag here if a dev GPU lacks one. Off in release/CI builds, so zero runtime overhead.
+    #[cfg(feature = "editor")]
+    let settings = WgpuSettings {
+        features: settings.features
+            | WgpuFeatures::TIMESTAMP_QUERY
+            | WgpuFeatures::TIMESTAMP_QUERY_INSIDE_PASSES
+            | WgpuFeatures::PIPELINE_STATISTICS_QUERY,
+        ..settings
+    };
     #[cfg(feature = "shader-debug")]
     let settings = WgpuSettings {
         instance_flags: bevy::render::settings::InstanceFlags::DEBUG,
@@ -153,6 +165,9 @@ fn main() {
 
     #[cfg(feature = "editor")]
     {
+        // Per-pass GPU timing (timestamp queries) → DiagnosticsStore, surfaced in the Performance
+        // panel and the chrome trace. Pairs with the timestamp features requested in wgpu_settings.
+        app.add_plugins(bevy::render::diagnostic::RenderDiagnosticsPlugin);
         app.add_plugins(adventure::editor::EditorPlugin);
     }
 

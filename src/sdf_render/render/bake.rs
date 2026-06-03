@@ -289,6 +289,7 @@ impl Node for SdfBrickBakeNode {
             )),
         );
 
+        let diagnostics = render_context.diagnostic_recorder();
         {
             let mut pass = render_context
                 .command_encoder()
@@ -296,6 +297,7 @@ impl Node for SdfBrickBakeNode {
                     label: Some("sdf_brick_bake"),
                     timestamp_writes: None,
                 });
+            let span = diagnostics.pass_span(&mut pass, "sdf_brick_bake");
             pass.set_pipeline(pipeline);
             pass.set_bind_group(0, &bind_group, &[]);
             // One workgroup per brick job, laid out in a 2D grid so the count can exceed the
@@ -304,6 +306,7 @@ impl Node for SdfBrickBakeNode {
             let wg_x = buffers.job_count.min(BAKE_DISPATCH_WIDTH);
             let wg_y = buffers.job_count.div_ceil(BAKE_DISPATCH_WIDTH);
             pass.dispatch_workgroups(wg_x, wg_y, 1);
+            span.end(&mut pass);
         }
 
         // Blit each job's tile from the output buffers into the persistent atlas textures.

@@ -180,17 +180,20 @@ impl ViewNode for SdfConeNode {
         let wg_x = tiles_x.div_ceil(8);
         let wg_y = tiles_y.div_ceil(8);
 
+        let diagnostics = render_context.diagnostic_recorder();
         let mut pass = render_context
             .command_encoder()
             .begin_compute_pass(&ComputePassDescriptor {
                 label: Some("sdf_cone_prepass"),
                 timestamp_writes: None,
             });
+        let span = diagnostics.pass_span(&mut pass, "sdf_cone_prepass");
         pass.set_pipeline(pipeline);
         pass.set_bind_group(0, &bind_group_0, &[dyn_off.index()]);
         pass.set_bind_group(1, &bind_group_1, &[]);
         pass.set_bind_group(2, &bind_group_2, &[]);
         pass.dispatch_workgroups(wg_x, wg_y, 1);
+        span.end(&mut pass);
 
         Ok(())
     }
