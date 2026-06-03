@@ -304,6 +304,15 @@ pub enum ChunkUpload {
         cap_rows: u32,
         cap_slots: u32,
     },
+    /// Only the TILE-RUN buffer outgrew its capacity; the fixed-size directory did NOT change size.
+    /// Rebuild the tile-run buffer (to `cap_slots`, with headroom) but keep the directory and apply
+    /// just its dirty `row_updates` in place — so a tile-run grow during a fill no longer drags a
+    /// full re-upload of the (tens-of-MB at large rings) directory. `tile_run` is UNPADDED.
+    TileGrow {
+        row_updates: Vec<(u32, ChunkLookup)>,
+        tile_run: Vec<BrickTile>,
+        cap_slots: u32,
+    },
     /// In-place writes: the dirty directory slots + their dense tile-run regions. The directory is
     /// fixed-position, so every entry is an index→value write (no shift, no realloc).
     Delta {
@@ -512,6 +521,14 @@ impl LiveChunkTables {
     /// slots, empty ones sentinel-tagged) and a `slot_high_water()*TILE_RUN_SLOT`-entry tile-run
     /// buffer with each live slot's DENSELY-packed region at its `slot*TILE_RUN_SLOT` base.
     pub fn full_tables(&self) -> (Vec<ChunkLookup>, Vec<BrickTile>) {
+        (self.dir.clone(), self.tile_run_dense())
+    }
+
+    /// The tile-run half of [`full_tables`] alone (`slot_high_water()*TILE_RUN_SLOT` entries, each
+    /// live slot's region at `slot*TILE_RUN_SLOT`). Used by [`ChunkUpload::TileGrow`] so a tile-run
+    /// capacity grow rebuilds ONLY the tile-run buffer — not the (unchanged, fixed-size, possibly
+    /// tens-of-MB) directory, which keeps deltaing in place.
+    pub fn tile_run_dense(&self) -> Vec<BrickTile> {
         let mut tile_run =
             vec![BrickTile::default(); (self.slot_high_water() * TILE_RUN_SLOT) as usize];
         for (&slot, ck) in &self.slot_to_key {
@@ -519,7 +536,7 @@ impl LiveChunkTables {
             tile_run[base..base + TILE_RUN_SLOT as usize]
                 .copy_from_slice(&Self::dense_region(&self.chunks[ck]));
         }
-        (self.dir.clone(), tile_run)
+        tile_run
     }
 
     /// Decide and materialize this frame's GPU lookup-buffer upload against the caller's CURRENT
@@ -532,13 +549,18 @@ impl LiveChunkTables {
     pub fn upload(&self, cap_rows: u32, cap_slots: u32) -> ChunkUpload {
         let needed_rows = self.row_count();
         let needed_slots = self.tile_run_capacity();
-        if cap_rows == 0 || needed_rows > cap_rows || needed_slots > cap_slots {
-            // The directory (chunk_buf) is FIXED-size — size it EXACTLY (no headroom; it never
-            // grows again). The sparse tile-run can grow, so give it +50% (min one extra slot) to
-            // avoid recreating it every frame.
-            let new_cap_slots = (needed_slots + needed_slots / 2).max(needed_slots + TILE_RUN_SLOT);
+        // Tile-run headroom (+50%, min one extra slot) so it isn't recreated every frame.
+        let new_cap_slots = (needed_slots + needed_slots / 2).max(needed_slots + TILE_RUN_SLOT);
+        if cap_rows == 0 || needed_rows > cap_rows {
+            // First upload, or the directory itself grew (only on a ring-size change — it's
+            // FIXED-size otherwise, sized EXACTLY with no headroom). Rebuild BOTH buffers.
             let (rows, tile_run) = self.full_tables();
             ChunkUpload::Full { rows, tile_run, cap_rows: needed_rows, cap_slots: new_cap_slots }
+        } else if needed_slots > cap_slots {
+            // ONLY the tile-run outgrew its buffer. The directory is the same size — delta its dirty
+            // rows in place and rebuild only the (much smaller) tile-run, NOT the whole directory.
+            let row_updates = self.dirty_rows.iter().map(|&r| (r, self.lookup_at(r))).collect();
+            ChunkUpload::TileGrow { row_updates, tile_run: self.tile_run_dense(), cap_slots: new_cap_slots }
         } else {
             let row_updates = self.dirty_rows.iter().map(|&r| (r, self.lookup_at(r))).collect();
             let region_updates = self.dirty_slots.iter().map(|&s| (s, self.tile_region(s))).collect();
@@ -1000,6 +1022,14 @@ mod tests {
                     cap_slots = cs;
                     gpu_rows = rows;
                     gpu_tiles = tile_run;
+                    gpu_tiles.resize(cap_slots as usize, BrickTile::default());
+                }
+                ChunkUpload::TileGrow { row_updates, tile_run, cap_slots: cs } => {
+                    cap_slots = cs;
+                    for (row, look) in row_updates {
+                        gpu_rows[row as usize] = look; // directory delta (size unchanged)
+                    }
+                    gpu_tiles = tile_run; // tile-run rebuild
                     gpu_tiles.resize(cap_slots as usize, BrickTile::default());
                 }
                 ChunkUpload::Delta { row_updates, region_updates } => {

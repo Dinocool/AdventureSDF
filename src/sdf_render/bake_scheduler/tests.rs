@@ -66,6 +66,14 @@ fn apply_table_delta(
             *tiles = tile_run;
             tiles.resize(*cap_slots as usize, chunk::BrickTile::default());
         }
+        chunk::ChunkUpload::TileGrow { row_updates, tile_run, cap_slots: cs } => {
+            *cap_slots = cs;
+            for (row, look) in row_updates {
+                rows[row as usize] = look; // directory delta (size unchanged)
+            }
+            *tiles = tile_run; // tile-run rebuild
+            tiles.resize(*cap_slots as usize, chunk::BrickTile::default());
+        }
         chunk::ChunkUpload::Delta { row_updates, region_updates } => {
             for (row, look) in row_updates {
                 rows[row as usize] = look;
