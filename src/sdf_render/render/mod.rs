@@ -27,10 +27,12 @@ use super::{SdfCamera, SdfGridConfig, SdfRenderEnabled};
 mod atlas_pages;
 mod atlas_upload;
 mod bake;
+mod chunk_tables;
 mod cone;
 mod pbr_textures;
 
 use atlas_pages::AtlasPages;
+use chunk_tables::ChunkTableBuffers;
 
 // --- GPU Types ---
 
@@ -104,9 +106,9 @@ struct SdfGpuAtlas {
     /// spiked VRAM ~2× and cost O(N²) during a fill.
     pages: Option<AtlasPages>,
     sampler: Option<Sampler>,
-    /// Chunk lookup table (binding 2) + packed per-chunk tile runs (binding 11).
-    lookup_buffer: Option<Buffer>,
-    chunk_tile_buffer: Option<Buffer>,
+    /// Chunk lookup directory (binding 2) + packed per-chunk tile runs (binding 11), as the shared
+    /// growable-storage-buffer pool (`ChunkTableBuffers`). `None` buffers until `init_sdf_pipeline`.
+    tables: ChunkTableBuffers,
     /// Material table (storage buffer of `GpuSdfMaterial`, indexed by material id).
     material_buffer: Option<Buffer>,
     /// PBR texture-array views (one per `MapArray`: diffuse, normal, mra, height,
@@ -238,7 +240,7 @@ fn atlas_bind_group_1(
         &BindGroupEntries::sequential((
             &dist_refs[..],
             gpu_atlas.sampler.as_ref().unwrap(),
-            gpu_atlas.lookup_buffer.as_ref().unwrap().as_entire_buffer_binding(),
+            gpu_atlas.tables.lookup_buffer().as_entire_buffer_binding(),
             &mat_refs[..],
             gpu_atlas.material_buffer.as_ref().unwrap().as_entire_buffer_binding(),
             gpu_atlas.tex_sampler.as_ref().unwrap(),
@@ -247,7 +249,7 @@ fn atlas_bind_group_1(
             &tex_views[2],
             &tex_views[3],
             &tex_views[4],
-            gpu_atlas.chunk_tile_buffer.as_ref().unwrap().as_entire_buffer_binding(),
+            gpu_atlas.tables.tile_buffer().as_entire_buffer_binding(),
         )),
     )
 }
@@ -604,7 +606,7 @@ impl Plugin for SdfRenderPlugin {
             .add_systems(ExtractSchedule, bake::extract_brick_bakes)
             .init_resource::<pbr_textures::TextureStreamState>()
             .init_resource::<atlas_upload::LastAtlasGen>()
-            .init_resource::<atlas_upload::ChunkBufCapacity>()
+            .init_resource::<chunk_tables::ChunkBufCapacity>()
             .init_resource::<bake::SdfBakeBuffers>()
             .add_systems(
                 Render,
@@ -1112,18 +1114,8 @@ fn init_sdf_pipeline(
         mipmap_filter: FilterMode::Nearest,
         ..default()
     });
-    // One zeroed 20-byte chunk lookup entry so binding 2 is valid pre-bake.
-    let dummy_lookup = device.create_buffer_with_data(&BufferInitDescriptor {
-        label: Some("sdf_dummy_chunk_lookup"),
-        contents: &[0u8; 20],
-        usage: BufferUsages::STORAGE,
-    });
-    // One zeroed 12-byte brick-tile entry so binding 12 is valid pre-bake.
-    let dummy_chunk_tile = device.create_buffer_with_data(&BufferInitDescriptor {
-        label: Some("sdf_dummy_chunk_tile"),
-        contents: &[0u8; 12],
-        usage: BufferUsages::STORAGE,
-    });
+    // The chunk directory (binding 2) + tile-run (binding 11) buffers are the ChunkTableBuffers pool
+    // (created in the resource below); its 1-record dummies keep both bindings valid pre-bake.
     // One zeroed 80-byte GpuSdfMaterial row so binding 4 meets the struct's minimum
     // size before the real table uploads.
     let dummy_material = device.create_buffer_with_data(&BufferInitDescriptor {
@@ -1183,8 +1175,8 @@ fn init_sdf_pipeline(
         // Empty page pool (its own 1×1 dummies fill the binding array until the first bake grows it).
         pages: Some(AtlasPages::new(&device)),
         sampler: Some(dummy_sampler),
-        lookup_buffer: Some(dummy_lookup),
-        chunk_tile_buffer: Some(dummy_chunk_tile),
+        // Directory + tile-run buffers with 1-record dummies until the first bake fills them.
+        tables: ChunkTableBuffers::new(&device),
         material_buffer: Some(dummy_material),
         tex_array_views: Some(dummy_tex_views),
         tex_sampler: Some(dummy_tex_sampler),

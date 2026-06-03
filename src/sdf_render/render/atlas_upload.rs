@@ -55,8 +55,16 @@ pub(super) struct ExtractedSdfAtlas {
     /// buffers (with headroom) when these exceed the current allocation.
     chunk_cap_needed: u32,
     tile_cap_needed: u32,
-    /// True ⇒ upload `chunk_data`/`tile_run_data` wholesale; false ⇒ apply the delta updates.
-    full_rebuild: bool,
+    /// Independent rebuild flags for the two buffers (decoupled so a tile-run capacity grow doesn't
+    /// drag a full re-upload of the fixed-size, tens-of-MB directory):
+    /// - `dir_full` ⇒ recreate the chunk-lookup buffer from `chunk_data`; else `write_buffer` the
+    ///   `chunk_row_updates` deltas in place.
+    /// - `tile_full` ⇒ recreate the tile-run buffer from `tile_run_data` (to `tile_cap_needed`); else
+    ///   `write_buffer` the `tile_run_updates` regions in place.
+    ///
+    /// Full upload = both true; `TileGrow` = `tile_full` only; Delta = both false.
+    dir_full: bool,
+    tile_full: bool,
     /// Whether the chunk lookup / tile-run buffers changed at all this frame. False on a
     /// texel-only re-bake — the lookup buffers are reused as-is.
     tables_dirty: bool,
@@ -76,21 +84,10 @@ pub(super) struct ExtractedSdfAtlas {
 pub(super) struct LastAtlasGen(u64);
 
 
-/// Render-world record of the allocated chunk-lookup + tile-run buffer capacities (in rows /
-/// tile-run entries), so `prepare_sdf_atlas_gpu` knows when an incremental delta needs the
-/// buffer grown (recreate larger + full re-upload) versus a plain in-place `write_buffer`.
-/// Both buffers are over-sized with headroom on a rebuild so most frames stay in the cheap
-/// delta path.
-#[derive(Resource, Default)]
-pub(super) struct ChunkBufCapacity {
-    pub(super) chunk_rows: u32,
-    pub(super) tile_slots: u32,
-}
-
 pub(super) fn extract_sdf_atlas(
     atlas: Extract<Res<SdfAtlas>>,
     mut last_gen: ResMut<LastAtlasGen>,
-    mut chunk_cap: ResMut<ChunkBufCapacity>,
+    mut chunk_cap: ResMut<super::chunk_tables::ChunkBufCapacity>,
     mut commands: Commands,
 ) {
     // Nothing changed since the last upload — skip the rebuild entirely so idle
@@ -114,7 +111,8 @@ pub(super) fn extract_sdf_atlas(
         chunk_cap.tile_slots = 0;
         commands.insert_resource(ExtractedSdfAtlas {
             tables_dirty: true,
-            full_rebuild: true,
+            dir_full: true,
+            tile_full: true,
             dirty: true,
             ..Default::default()
         });
@@ -145,8 +143,20 @@ pub(super) fn extract_sdf_atlas(
             extracted.new_chunk_len = cap_rows;
             extracted.chunk_cap_needed = cap_rows;
             extracted.tile_cap_needed = cap_slots;
-            extracted.full_rebuild = true;
+            extracted.dir_full = true;
+            extracted.tile_full = true;
             extracted.tables_dirty = true;
+        }
+        chunk::ChunkUpload::TileGrow { row_updates, tile_run, cap_slots } => {
+            // ONLY the tile-run grew — rebuild it, but the fixed-size directory just deltas in place
+            // (no wholesale directory re-upload, the former `sdf_tables_full_rebuild` hitch).
+            chunk_cap.tile_slots = cap_slots;
+            extracted.chunk_row_updates = row_updates;
+            extracted.tile_run_data = tile_run;
+            extracted.tile_cap_needed = cap_slots;
+            extracted.tile_full = true;
+            extracted.tables_dirty = true;
+            extracted.new_chunk_len = live.row_count();
         }
         chunk::ChunkUpload::Delta { row_updates, region_updates } => {
             // Fixed-position directory → every dirty entry is an in-place index→value write.
@@ -162,132 +172,6 @@ pub(super) fn extract_sdf_atlas(
     commands.insert_resource(extracted);
 }
 
-// --- chunk-table upload (full rebuild + incremental delta) ---
-
-/// 20-byte std430 encoding of one chunk lookup row.
-fn encode_lookup(c: &chunk::ChunkLookup, out: &mut Vec<u8>) {
-    out.extend_from_slice(&c.key_hi.to_le_bytes());
-    out.extend_from_slice(&c.key_lo.to_le_bytes());
-    out.extend_from_slice(&c.occ_lo.to_le_bytes());
-    out.extend_from_slice(&c.occ_hi.to_le_bytes());
-    out.extend_from_slice(&c.tile_run_base.to_le_bytes());
-}
-
-/// 12-byte std430 encoding of one tile-run brick record.
-fn encode_tile(b: &chunk::BrickTile, out: &mut Vec<u8>) {
-    out.extend_from_slice(&b.atlas_base.to_le_bytes());
-    out.extend_from_slice(&b.pal01.to_le_bytes());
-    out.extend_from_slice(&b.pal23.to_le_bytes());
-}
-
-/// The 20-byte `(u32::MAX, u32::MAX, 0, 0, 0)` chunk-lookup sentinel. Its key tag never matches a
-/// real chunk key, so a fixed directory slot that no live chunk occupies resolves to a miss.
-fn sentinel_row_bytes() -> [u8; 20] {
-    let mut b = [0u8; 20];
-    b[0..4].copy_from_slice(&u32::MAX.to_le_bytes());
-    b[4..8].copy_from_slice(&u32::MAX.to_le_bytes());
-    b
-}
-
-/// Full (re)allocation + upload of both chunk-table buffers, sized to CAPACITY (with headroom)
-/// so later frames can `write_buffer` deltas in place. The chunk-lookup buffer is filled with
-/// `new_chunk_len` live rows followed by sentinel rows to capacity; the tile-run buffer is the
-/// capacity-sized `tile_run_data` (each live slot's region at `slot*64`, gaps zero). Used on the
-/// first upload, a capacity grow, and the empty-atlas case (zero live rows → all sentinel).
-fn upload_tables_full(
-    device: &RenderDevice,
-    gpu_atlas: &mut SdfGpuAtlas,
-    extracted: &ExtractedSdfAtlas,
-) {
-    // Chunk lookup buffer: live rows then sentinel tail to capacity. Capacity is always ≥1 so the
-    // storage buffer is never zero-sized (an empty atlas yields a single sentinel — the prior
-    // dedicated empty path, now folded in here).
-    let cap_rows = extracted.chunk_cap_needed.max(1);
-    let live = extracted.new_chunk_len.min(extracted.chunk_data.len() as u32);
-    let mut chunk_bytes = Vec::with_capacity(cap_rows as usize * 20);
-    for c in extracted.chunk_data.iter().take(live as usize) {
-        encode_lookup(c, &mut chunk_bytes);
-    }
-    let sentinel = sentinel_row_bytes();
-    for _ in live..cap_rows {
-        chunk_bytes.extend_from_slice(&sentinel);
-    }
-    gpu_atlas.lookup_buffer = Some(device.create_buffer_with_data(&BufferInitDescriptor {
-        label: Some("sdf_chunk_lookup_buffer"),
-        contents: &chunk_bytes,
-        usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
-    }));
-
-    // Tile-run buffer: capacity-sized (extract already laid out `tile_run_data` to the slot
-    // high-water; pad to `tile_cap_needed` so deltas into freshly-grown slots have room).
-    let cap_slots = extracted.tile_cap_needed.max(chunk::TILE_RUN_SLOT) as usize;
-    let mut tile_bytes = Vec::with_capacity(cap_slots * 12);
-    for b in &extracted.tile_run_data {
-        encode_tile(b, &mut tile_bytes);
-    }
-    tile_bytes.resize(cap_slots * 12, 0);
-    gpu_atlas.chunk_tile_buffer = Some(device.create_buffer_with_data(&BufferInitDescriptor {
-        label: Some("sdf_chunk_tile_buffer"),
-        contents: &tile_bytes,
-        usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
-    }));
-}
-
-/// Incremental upload: `write_buffer` only the chunk rows + tile-run regions that changed this
-/// frame, plus sentinel-blank the rows a removed chunk vacated. The buffers keep their (capacity)
-/// allocation — only the changed byte ranges are touched, so a coarse-LOD snap pages the handful
-/// of dirty chunks instead of recreating the whole ~1 MB table.
-fn upload_tables_delta(
-    queue: &RenderQueue,
-    gpu_atlas: &SdfGpuAtlas,
-    extracted: &ExtractedSdfAtlas,
-) {
-    let (Some(lookup), Some(tiles)) = (&gpu_atlas.lookup_buffer, &gpu_atlas.chunk_tile_buffer)
-    else {
-        return; // no buffers yet (shouldn't happen — first frame is a full rebuild)
-    };
-
-    // Changed chunk-lookup rows (20 B each, at row*20). A structural change marks a contiguous
-    // suffix `[R..end)` dirty (every row at/after an insert/remove shifts), so coalesce consecutive
-    // rows into one `write_buffer` to avoid a long burst of 20-byte writes on a snap frame.
-    let mut run_start: Option<u32> = None;
-    let mut run_bytes: Vec<u8> = Vec::new();
-    let flush = |start: u32, bytes: &[u8]| {
-        if !bytes.is_empty() {
-            queue.write_buffer(lookup, (start as u64) * 20, bytes);
-        }
-    };
-    for (row, c) in &extracted.chunk_row_updates {
-        match run_start {
-            Some(s) if *row == s + (run_bytes.len() as u32 / 20) => {}
-            _ => {
-                if let Some(s) = run_start {
-                    flush(s, &run_bytes);
-                }
-                run_start = Some(*row);
-                run_bytes.clear();
-            }
-        }
-        encode_lookup(c, &mut run_bytes);
-    }
-    if let Some(s) = run_start {
-        flush(s, &run_bytes);
-    }
-    // No sentinel tail: the directory is fixed-size and an emptied chunk's slot was already reset to
-    // the sentinel tag in `clear_brick` (it shows up as a normal dirty-row write above).
-
-    // Changed tile-run regions (64 entries × 12 B = 768 B each, at slot*64*12).
-    let mut region_bytes = Vec::with_capacity(chunk::TILE_RUN_SLOT as usize * 12);
-    for (slot, region) in &extracted.tile_run_updates {
-        region_bytes.clear();
-        for b in region {
-            encode_tile(b, &mut region_bytes);
-        }
-        let base = (*slot as u64) * chunk::TILE_RUN_SLOT as u64 * 12;
-        queue.write_buffer(tiles, base, &region_bytes);
-    }
-}
-
 pub(super) fn prepare_sdf_atlas_gpu(
     device: Res<RenderDevice>,
     queue: Res<RenderQueue>,
@@ -300,14 +184,29 @@ pub(super) fn prepare_sdf_atlas_gpu(
     }
 
     if extracted.tables_dirty {
-        if extracted.full_rebuild {
-            // Full directory rebuild: recreate + re-upload the whole dense per-LOD chunk buffer
-            // (R³·lod_count entries). Tagged so its cost/frequency is visible in a chrome trace —
-            // at large ring_bricks this buffer is big and a Full rebuild is a heavy upload.
-            let _span = info_span!("sdf_tables_full_rebuild").entered();
-            upload_tables_full(&device, &mut gpu_atlas, &extracted);
+        // Directory + tile-run are decoupled. Rebuild the directory only on a genuine directory grow
+        // (first upload / ring-size change) — it's the fixed-size, tens-of-MB-at-large-rings buffer,
+        // so its rebuild is tagged as the heavy upload to watch; otherwise delta its dirty rows in
+        // place. A tile-run grow (Full OR TileGrow) rebuilds just the smaller tile-run.
+        if extracted.dir_full {
+            let _span = info_span!("sdf_directory_rebuild").entered();
+            gpu_atlas.tables.rebuild_directory(
+                &device,
+                &extracted.chunk_data,
+                extracted.chunk_cap_needed,
+                extracted.new_chunk_len,
+            );
         } else {
-            upload_tables_delta(&queue, &gpu_atlas, &extracted);
+            gpu_atlas.tables.directory_delta(&queue, &extracted.chunk_row_updates);
+        }
+        if extracted.tile_full {
+            gpu_atlas.tables.rebuild_tile_run(
+                &device,
+                &extracted.tile_run_data,
+                extracted.tile_cap_needed,
+            );
+        } else {
+            gpu_atlas.tables.tile_run_delta(&queue, &extracted.tile_run_updates);
         }
     }
 
