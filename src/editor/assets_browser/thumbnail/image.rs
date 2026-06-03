@@ -34,7 +34,7 @@ impl ThumbnailProvider for ImageThumbnailProvider {
         match ensure_image_texture(world, path) {
             ImageTexture::Ready { tex_id, .. } => Thumbnail::Texture(tex_id),
             ImageTexture::Loading => Thumbnail::Pending,
-            ImageTexture::Invalid => Thumbnail::Icon("\u{1F5BC}"),
+            ImageTexture::Invalid => Thumbnail::Icon(egui_phosphor::regular::IMAGE),
         }
     }
 }

@@ -325,7 +325,11 @@ fn render_flat_row(
     let has_children = row.children.iter().any(|&c| arena[c].matches_filter);
     if has_children {
         let open = is_expanded(ui.ctx(), row.entity);
-        let icon = if open { "\u{25BE}" } else { "\u{25B8}" }; // ▾ / ▸
+        let icon = if open {
+            egui_phosphor::regular::CARET_DOWN
+        } else {
+            egui_phosphor::regular::CARET_RIGHT
+        };
         if ui
             .add(egui::Button::new(icon).frame(false).min_size(egui::vec2(18.0, 0.0)))
             .clicked()

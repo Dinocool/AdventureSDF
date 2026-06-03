@@ -54,7 +54,7 @@ pub fn resource_picker(
         None => "(none)".to_string(),
     };
     if ui
-        .button(format!("{btn_label}  \u{25BE}"))
+        .button(format!("{btn_label}  {}", egui_phosphor::regular::CARET_DOWN))
         .clicked()
     {
         open = !open;
@@ -85,7 +85,7 @@ pub fn resource_picker(
                 egui::ScrollArea::vertical().show(ui, |ui| {
                     ui.horizontal_wrapped(|ui| {
                         if allow_none
-                            && draw_tile(world, ui, &TileThumb::Icon("\u{2014}"), "(none)", false)
+                            && draw_tile(world, ui, &TileThumb::Icon(egui_phosphor::regular::PROHIBIT), "(none)", false)
                                 .clicked()
                         {
                             result = Some(PickResult::None);

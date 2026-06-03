@@ -120,7 +120,7 @@ pub fn assets_browser_ui(world: &mut World, ui: &mut egui::Ui) {
     ui.horizontal(|ui| {
         let at_root = current.as_os_str().is_empty();
         if ui
-            .add_enabled(!at_root, egui::Button::new("\u{2191}"))
+            .add_enabled(!at_root, egui::Button::new(egui_phosphor::regular::ARROW_UP))
             .on_hover_text("Up one folder")
             .clicked()
         {
@@ -199,7 +199,7 @@ pub fn assets_browser_ui(world: &mut World, ui: &mut egui::Ui) {
                                 painter.text(
                                     icon_rect.center(),
                                     egui::Align2::CENTER_CENTER,
-                                    "◆",
+                                    egui_phosphor::regular::CUBE,
                                     egui::FontId::proportional(SIZE * 0.7),
                                     egui::Color32::WHITE,
                                 );
@@ -321,20 +321,21 @@ pub fn thumbnail_for_path(world: &mut World, path: &Path) -> Thumbnail {
 /// Draw one asset-tray tile (folder icon or file thumbnail) and return its response.
 fn tile_ui(world: &mut World, ui: &mut egui::Ui, entry: &Entry) -> egui::Response {
     let thumb = if entry.is_dir {
-        TileThumb::Icon("\u{1F4C1}")
+        TileThumb::Icon(egui_phosphor::regular::FOLDER)
     } else {
         TileThumb::Path(entry.path.clone())
     };
     draw_tile(world, ui, &thumb, &entry.name, false)
 }
 
-/// Generic icon glyph for a file with no provider, chosen by extension.
+/// Generic icon glyph (Phosphor) for a file with no provider, chosen by extension.
 fn icon_for(path: &Path) -> &'static str {
+    use egui_phosphor::regular as icon;
     match ext_lower(path).as_deref() {
-        Some("ron") => "\u{2699}",   // gear — data/resource
-        Some("scene") => "\u{1F3AC}", // clapperboard — scene
-        Some("wgsl") => "\u{1F4DC}", // scroll — shader
-        _ => "\u{1F4C4}",            // generic file
+        Some("ron") => icon::GEAR,         // data / resource
+        Some("scene") => icon::FILM_SLATE, // scene
+        Some("wgsl") => icon::FILE_CODE,   // shader
+        _ => icon::FILE,                   // generic file
     }
 }
 
@@ -428,9 +429,9 @@ mod tests {
 
     #[test]
     fn icon_for_known_extensions() {
-        assert_eq!(icon_for(Path::new("a.ron")), "\u{2699}");
-        assert_eq!(icon_for(Path::new("a.scene")), "\u{1F3AC}");
-        assert_eq!(icon_for(Path::new("a.unknown")), "\u{1F4C4}");
+        assert_eq!(icon_for(Path::new("a.ron")), egui_phosphor::regular::GEAR);
+        assert_eq!(icon_for(Path::new("a.scene")), egui_phosphor::regular::FILM_SLATE);
+        assert_eq!(icon_for(Path::new("a.unknown")), egui_phosphor::regular::FILE);
     }
 
     #[test]

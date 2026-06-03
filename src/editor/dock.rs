@@ -253,7 +253,10 @@ impl TabViewer for EditorTabViewer<'_> {
 fn empty_state_message(ui: &mut egui::Ui) {
     ui.centered_and_justified(|ui| {
         ui.label(
-            egui::RichText::new("No scene open\nUse File \u{25B8} Open to load a scene")
+            egui::RichText::new(format!(
+                "No scene open\nUse File {} Open to load a scene",
+                egui_phosphor::regular::CARET_RIGHT
+            ))
                 .weak()
                 .size(16.0),
         );
@@ -487,29 +490,44 @@ impl Plugin for DockPlugin {
             .resource_mut::<bevy_egui::EguiGlobalSettings>()
             .enable_absorb_bevy_input_system = false;
 
-        // Install the Phosphor icon font once the egui context exists, build the dock layout after
-        // Startup (so every plugin's panels are registered), then render the dock each frame.
+        // Install the Phosphor icon font into the primary egui context once it exists, build
+        // the dock layout after Startup (so every plugin's panels are registered), then
+        // render the dock each frame.
+        //
+        // The primary EguiContext is attached to the camera by bevy_egui's
+        // `setup_primary_egui_context_system`, which only resolves in PreUpdate's
+        // `InitContexts` of the first frame — AFTER PostStartup. Installing at PostStartup
+        // therefore found no context and silently no-op'd, leaving every icon as tofu. So we
+        // run in PreUpdate after InitContexts (and before BeginPass, so the fonts are live for
+        // that frame's pass) with a one-shot guard.
         app.add_systems(
-            PostStartup,
-            install_phosphor_font.after(bevy_egui::EguiStartupSet::InitContexts),
+            PreUpdate,
+            install_phosphor_font
+                .after(bevy_egui::EguiPreUpdateSet::InitContexts)
+                .before(bevy_egui::EguiPreUpdateSet::BeginPass),
         )
         .add_systems(PostStartup, init_dock_state)
         .add_systems(bevy_egui::EguiPrimaryContextPass, show_editor_dock);
     }
 }
 
-/// Merge the Phosphor icon font into the primary egui context's fonts, once at startup.
-/// `add_to_fonts` inserts it into the Proportional family alongside egui's built-ins, so
-/// icon glyphs (`egui_phosphor::regular::*`) render inline with normal toolbar text.
-fn install_phosphor_font(world: &mut World) {
-    let Ok(mut egui_ctx) = world
-        .query_filtered::<&mut bevy_egui::EguiContext, With<bevy_egui::PrimaryEguiContext>>()
-        .single_mut(world)
-    else {
+/// Merge the Phosphor icon font into the primary egui context's fonts, once. `add_to_fonts`
+/// inserts it into the Proportional family alongside egui's built-ins, so icon glyphs
+/// (`egui_phosphor::regular::*`) render inline with normal toolbar text. Runs every frame
+/// until the primary context exists, then no-ops via the `installed` guard.
+fn install_phosphor_font(
+    mut contexts: Query<&mut bevy_egui::EguiContext, With<bevy_egui::PrimaryEguiContext>>,
+    mut installed: Local<bool>,
+) {
+    if *installed {
         return;
+    }
+    let Ok(mut egui_ctx) = contexts.single_mut() else {
+        return; // context not created yet — retry next frame
     };
     let ctx = egui_ctx.get_mut();
-    let mut fonts = bevy_egui::egui::FontDefinitions::default();
+    let mut fonts = egui::FontDefinitions::default();
     egui_phosphor::add_to_fonts(&mut fonts, egui_phosphor::Variant::Regular);
     ctx.set_fonts(fonts);
+    *installed = true;
 }

@@ -303,7 +303,7 @@ pub fn layouts_ui(world: &mut World, ctx: &egui::Context) {
                             load = Some(n.clone());
                         }
                         if ui
-                            .small_button("\u{1F5D1}")
+                            .small_button(egui_phosphor::regular::TRASH)
                             .on_hover_text("Delete")
                             .clicked()
                         {
