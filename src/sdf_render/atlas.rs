@@ -1,6 +1,9 @@
 use bevy::math::bounding::Aabb3d;
 use bevy::prelude::*;
-use std::collections::{HashMap, HashSet};
+// FxHashMap/FxHashSet (rustc's FxHash) for the per-baked-brick hot maps — brick→tile, the resident
+// brick set, and this-frame's baked-tile set. Integer-ish keys (BrickKey, u32); std SipHash is
+// needless overhead in the bake apply loop (the trace's dominant per-brick cost).
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::sdf_render::bvh::Bvh;
 use crate::sdf_render::edits::Palette;
@@ -40,7 +43,7 @@ impl BrickKey {
 /// slot is what lets the GPU upload only the tiles that actually changed.
 #[derive(Default)]
 pub struct TileAllocator {
-    tile_of: HashMap<BrickKey, u32>,
+    tile_of: FxHashMap<BrickKey, u32>,
     /// Tiles freed by removed bricks, reused before growing `next` so the atlas
     /// stays densely packed (bounded height).
     free: Vec<u32>,
@@ -124,7 +127,7 @@ pub struct PackedBrick {
 /// dirty-tracking the GPU bake + render extract read. The texels live on the GPU.
 #[derive(Resource)]
 pub struct SdfAtlas {
-    pub bricks: HashMap<BrickKey, PackedBrick>,
+    pub bricks: FxHashMap<BrickKey, PackedBrick>,
     /// Force a re-emit of every resident brick on the next schedule (first bake, or an edit
     /// was added/removed so the whole BVH changed).
     pub rebake_all: bool,
@@ -145,7 +148,7 @@ pub struct SdfAtlas {
     /// Tiles whose texels the GPU compute bake fills this frame. The render world reads these
     /// so it knows which tiles the bake node will write; the CPU holds only a palette-only
     /// placeholder for them. Cleared each frame at the start of `schedule_bakes`.
-    pub gpu_baked_tiles: HashSet<u32>,
+    pub gpu_baked_tiles: FxHashSet<u32>,
     /// Incrementally-maintained chunk lookup + tile-run table. `insert_gpu_brick` / `remove_brick`
     /// update it inline so the render world uploads only the chunks that changed each frame
     /// (instead of rebuilding the whole O(bricks) table on every topology change — the
@@ -157,12 +160,12 @@ pub struct SdfAtlas {
 impl Default for SdfAtlas {
     fn default() -> Self {
         Self {
-            bricks: HashMap::new(),
+            bricks: FxHashMap::default(),
             rebake_all: true,
             generation: 0,
             topology_generation: 0,
             tiles: TileAllocator::default(),
-            gpu_baked_tiles: HashSet::new(),
+            gpu_baked_tiles: FxHashSet::default(),
             live_chunks: super::chunk::LiveChunkTables::default(),
         }
     }

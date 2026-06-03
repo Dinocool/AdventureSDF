@@ -108,6 +108,7 @@ dependencies = [
  "naga_oil",
  "renderdoc",
  "ron",
+ "rustc-hash 2.1.2",
  "serde",
  "tracing-chrome",
  "wgpu",
