@@ -653,6 +653,7 @@ fn sdf_picking(
     point_lights: Query<&PointLight>,
     bvh: Res<bvh::Bvh>,
 ) {
+    let _span = crate::instrument::span("picking");
     if !mouse.just_pressed(MouseButton::Left) || gizmo_state.claimed_click {
         return;
     }
@@ -805,6 +806,7 @@ fn update_height_field(
     mut atlas: ResMut<atlas::SdfAtlas>,
     mut last_fingerprint: Local<u64>,
 ) {
+    let _span = crate::instrument::span("height field");
     if let Some(rebuilt) = height::build(&registry, &library, *last_fingerprint) {
         *last_fingerprint = rebuilt.fingerprint;
         // The scheduler owns the canonical Arc snapshot (async bake tasks clone it; sync_bake

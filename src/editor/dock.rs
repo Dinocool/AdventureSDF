@@ -159,9 +159,25 @@ impl TabViewer for EditorTabViewer<'_> {
             EditorTab::Inspector => bevy::log::info_span!("panel_inspector"),
             EditorTab::ProjectFiles => bevy::log::info_span!("panel_project_files"),
             EditorTab::AssetsDrawer => bevy::log::info_span!("panel_assets"),
-            EditorTab::Registered(_) => bevy::log::info_span!("panel_registered"),
+            // Carry the panel id as a span field so a chrome trace attributes each registered
+            // panel (they otherwise share one span name and blur together).
+            EditorTab::Registered(id) => bevy::log::info_span!("panel_registered", panel = %id),
         }
         .entered();
+        // Live CPU tag mirroring the trace span, so the Performance panel's own breakdown
+        // attributes the editor-UI cost per panel instead of one opaque "editor ui" band.
+        // Only the Registered title is dynamic; intern it once for a `&'static` tag.
+        let _cpu = crate::instrument::span(match tab {
+            EditorTab::Scene(_) => "ui: viewport",
+            EditorTab::NoScene => "ui: empty",
+            EditorTab::Hierarchy => "ui: hierarchy",
+            EditorTab::Inspector => "ui: inspector",
+            EditorTab::ProjectFiles => "ui: project files",
+            EditorTab::AssetsDrawer => "ui: assets",
+            EditorTab::Registered(id) => {
+                crate::instrument::intern(&format!("ui: {}", self.registry.title_for(id)))
+            }
+        });
         match tab {
             EditorTab::Scene(id) => {
                 // Only the active scene tab's `ui()` runs (egui_dock renders one tab per
@@ -306,12 +322,18 @@ pub fn show_editor_dock(world: &mut World) {
     };
     let ctx = egui_ctx.into_inner().get_mut().clone();
 
-    // Section spans so a chrome trace breaks the editor egui pass into its parts.
-    bevy::log::info_span!("editor_menu_bar").in_scope(|| super::menu_bar::menu_bar_ui(world, &ctx));
+    // Section spans so a chrome trace breaks the editor egui pass into its parts; the
+    // `instrument::span`s mirror them into the live Performance breakdown.
+    bevy::log::info_span!("editor_menu_bar").in_scope(|| {
+        let _cpu = crate::instrument::span("ui: menu bar");
+        super::menu_bar::menu_bar_ui(world, &ctx)
+    });
     super::scene_browser::open_scene_dialog_ui(world, &ctx);
     super::scene_browser::save_scene_dialog_ui(world, &ctx);
-    bevy::log::info_span!("editor_status_bar")
-        .in_scope(|| super::status_bar::status_bar_ui(world, &ctx));
+    bevy::log::info_span!("editor_status_bar").in_scope(|| {
+        let _cpu = crate::instrument::span("ui: status bar");
+        super::status_bar::status_bar_ui(world, &ctx)
+    });
     super::layout::layouts_ui(world, &ctx);
     super::notifications::notifications_ui(world, &ctx);
 

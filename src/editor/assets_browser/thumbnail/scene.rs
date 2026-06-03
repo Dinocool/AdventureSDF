@@ -155,6 +155,7 @@ fn trigger_scene_capture(
     windows: Query<&Window, With<PrimaryWindow>>,
     mut commands: Commands,
 ) {
+    let _span = crate::instrument::span("scene thumbnail");
     if in_flight.0 {
         return;
     }
