@@ -50,6 +50,17 @@ impl Plugin for EditorPlugin {
             registry::ShaderDebugRegistryPlugin,
             uniform_inspector::UniformInspectorPlugin,
             profiling::ProfilingPlugin,
+            // Per-concern editor sub-plugins — each owns the registry/state it seeds (was inline
+            // here). Added after `EguiPlugin` so `DockPlugin` can poke `EguiGlobalSettings`; the
+            // material preview rig feeds the inspector's thumbnails.
+            material_preview::MaterialPreviewPlugin,
+            assets_browser::ThumbnailRegistryPlugin,
+            asset_inspector::AssetInspectorPlugin,
+            selection::SelectionPlugin,
+            keybinds::KeybindsPlugin,
+            status_bar::StatusBarPlugin,
+            hierarchy::HierarchyPlugin,
+            dock::DockPlugin,
         ))
         .init_resource::<menu_bar::EditorRequests>()
         .init_resource::<menu_bar::CurrentScenePath>()
@@ -79,48 +90,6 @@ impl Plugin for EditorPlugin {
         // Custom euler-angle Transform editor (replaces the generic Quat-xyzw UI).
         inspector::register_component_editor::<Transform>(app, transform_editor::transform_editor);
 
-        // Assets browser: navigation state + modular thumbnail providers + the
-        // offscreen render rig that fills material/image thumbnails.
-        app.add_plugins(assets_browser::ThumbnailRenderPlugin)
-            .init_resource::<assets_browser::AssetsBrowserState>();
-        {
-            let mut registry = assets_browser::ThumbnailRegistry::default();
-            registry.register(assets_browser::ImageThumbnailProvider);
-            registry.register(assets_browser::MaterialThumbnailProvider);
-            registry.register(assets_browser::PbrTextureThumbnailProvider);
-            registry.register(assets_browser::SceneThumbnailProvider);
-            app.insert_resource(registry);
-        }
-
-        // Unified selection: the Inspector follows whichever of {entity, asset} was
-        // selected last. `sync_selection` keeps it in step with the entity-side
-        // `SdfSelection`.
-        app.add_plugins(material_preview::MaterialPreviewPlugin)
-            .init_resource::<selection::EditorSelection>()
-            .init_resource::<asset_inspector::ImportSettingsEdits>()
-            .add_systems(
-                Update,
-                selection::sync_selection
-                    .run_if(|c: Res<config::EditorConfig>| c.enabled),
-            );
-        {
-            let mut reg = asset_inspector::AssetInspectorRegistry::default();
-            reg.register(asset_inspector::TextureAssetInspector);
-            reg.register(asset_inspector::MaterialAssetInspector);
-            reg.register(asset_inspector::PbrTextureAssetInspector);
-            app.insert_resource(reg);
-        }
-
-        // Do NOT use egui's blanket input absorption: egui_dock's central Viewport
-        // tab is itself an egui surface, so the absorber would clear mouse input even
-        // when the cursor is over the 3D region — killing all viewport interaction.
-        // Instead we gate the SDF orbit/pick/gizmo systems on `ViewportInputAllowed`,
-        // which the dock sets from the pointer-in-viewport test each frame (see
-        // `dock::show_editor_dock`). egui widgets still receive their own events.
-        app.world_mut()
-            .resource_mut::<bevy_egui::EguiGlobalSettings>()
-            .enable_absorb_bevy_input_system = false;
-
         // Compact FPS / frame-time readout lives in the bottom status bar
         // (`status_bar::status_bar_ui`); the full Performance tab (readout + shared FPS /
         // frame-time graph) is a dedicated bottom dock panel.
@@ -133,41 +102,7 @@ impl Plugin for EditorPlugin {
             profiling::performance_panel,
         );
 
-        keybinds::plugin(app);
-        status_bar::plugin(app);
-        hierarchy::plugin(app);
-
         // F6 toggles chrome-trace capture (global; RenderDoc is F7 behind the `renderdoc` feature).
         app.add_systems(Update, chrome_trace::toggle_on_f6);
-
-        // Gizmo transform tools (mode + snap) now live in the viewport toolbar
-        // (see `dock::viewport_toolbar`), so there's no separate Transform panel.
-
-        // Build the dock layout once, after `Startup` (so every plugin — including
-        // the SDF debug plugin — has registered its panels), then render each frame.
-        // Install the Phosphor icon font once, after the egui context exists, so the
-        // toolbar can use icon glyphs (see `dock::viewport_toolbar`).
-        app.add_systems(
-            PostStartup,
-            install_phosphor_font.after(bevy_egui::EguiStartupSet::InitContexts),
-        )
-        .add_systems(PostStartup, dock::init_dock_state)
-        .add_systems(bevy_egui::EguiPrimaryContextPass, dock::show_editor_dock);
     }
-}
-
-/// Merge the Phosphor icon font into the primary egui context's fonts, once at startup.
-/// `add_to_fonts` inserts it into the Proportional family alongside egui's built-ins, so
-/// icon glyphs (`egui_phosphor::regular::*`) render inline with normal toolbar text.
-fn install_phosphor_font(world: &mut World) {
-    let Ok(mut egui_ctx) = world
-        .query_filtered::<&mut bevy_egui::EguiContext, With<bevy_egui::PrimaryEguiContext>>()
-        .single_mut(world)
-    else {
-        return;
-    };
-    let ctx = egui_ctx.get_mut();
-    let mut fonts = bevy_egui::egui::FontDefinitions::default();
-    egui_phosphor::add_to_fonts(&mut fonts, egui_phosphor::Variant::Regular);
-    ctx.set_fonts(fonts);
 }

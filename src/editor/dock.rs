@@ -386,3 +386,108 @@ pub fn show_editor_dock(world: &mut World) {
     world.insert_resource(dock);
     world.insert_resource(registry);
 }
+
+// --- Tab topology -----------------------------------------------------------------------
+// The single place that knows the `DockState<EditorTab>` leaf layout: which leaf is the center
+// "scene box", which leaf anchors each side, and how to splice a tab in. `scene_tabs` (document/swap)
+// and `layout` (panel show/hide + layout restore) call these instead of re-deriving leaves
+// themselves (they used to each scan `is_center_tab` / find anchors independently).
+
+/// The main-surface leaf hosting the scene tabs (or the empty-state placeholder).
+pub(crate) fn center_leaf(dock: &EditorDockState) -> Option<NodeIndex> {
+    dock.state
+        .main_surface()
+        .iter()
+        .enumerate()
+        .find_map(|(i, node)| {
+            let has_center = node
+                .tabs()
+                .is_some_and(|tabs| tabs.iter().any(is_center_tab));
+            has_center.then_some(NodeIndex(i))
+        })
+}
+
+/// Whether `tab` belongs to the center "scene box" (a scene view or the empty placeholder).
+pub(crate) fn is_center_tab(tab: &EditorTab) -> bool {
+    matches!(tab, EditorTab::Scene(_) | EditorTab::NoScene)
+}
+
+/// Leaf that anchors a given `side` (one of its shell panels), so re-shown panels group with
+/// their siblings instead of spawning a fresh region.
+pub(crate) fn side_anchor_leaf(dock: &EditorDockState, side: DockSide) -> Option<NodeIndex> {
+    let anchors: &[EditorTab] = match side {
+        DockSide::Left => &[EditorTab::Hierarchy, EditorTab::ProjectFiles],
+        DockSide::Right => &[EditorTab::Inspector],
+        DockSide::Bottom => &[EditorTab::AssetsDrawer],
+    };
+    anchors
+        .iter()
+        .find_map(|t| dock.state.find_main_surface_tab(t).map(|(n, _)| n))
+}
+
+/// Add `tab` on its home `side`: into an existing same-side leaf if one is open, else split a
+/// new region off the center scene box.
+pub(crate) fn add_panel_tab(dock: &mut EditorDockState, tab: EditorTab, side: DockSide) {
+    if let Some(node) = side_anchor_leaf(dock, side) {
+        dock.state.main_surface_mut()[node].append_tab(tab);
+        return;
+    }
+    let Some(center) = center_leaf(dock) else {
+        dock.state.push_to_first_leaf(tab);
+        return;
+    };
+    let surface = dock.state.main_surface_mut();
+    match side {
+        DockSide::Left => {
+            surface.split_left(center, 0.20, vec![tab]);
+        }
+        DockSide::Right => {
+            surface.split_right(center, 0.78, vec![tab]);
+        }
+        DockSide::Bottom => {
+            surface.split_below(center, 0.72, vec![tab]);
+        }
+    }
+}
+
+/// Wires the dock shell: the egui input-absorption poke, the Phosphor icon font, the one-shot
+/// dock-layout build, and the per-frame dock render. Was inline in `EditorPlugin::build`; added
+/// LAST (after every plugin has registered its panels, which `init_dock_state` consumes).
+pub struct DockPlugin;
+
+impl Plugin for DockPlugin {
+    fn build(&self, app: &mut App) {
+        // Do NOT use egui's blanket input absorption: egui_dock's central Viewport tab is itself an
+        // egui surface, so the absorber would clear mouse input even when the cursor is over the 3D
+        // region — killing viewport interaction. Instead the SDF orbit/pick/gizmo systems gate on
+        // `ViewportInputAllowed`, which `show_editor_dock` sets from the pointer-in-viewport test.
+        app.world_mut()
+            .resource_mut::<bevy_egui::EguiGlobalSettings>()
+            .enable_absorb_bevy_input_system = false;
+
+        // Install the Phosphor icon font once the egui context exists, build the dock layout after
+        // Startup (so every plugin's panels are registered), then render the dock each frame.
+        app.add_systems(
+            PostStartup,
+            install_phosphor_font.after(bevy_egui::EguiStartupSet::InitContexts),
+        )
+        .add_systems(PostStartup, init_dock_state)
+        .add_systems(bevy_egui::EguiPrimaryContextPass, show_editor_dock);
+    }
+}
+
+/// Merge the Phosphor icon font into the primary egui context's fonts, once at startup.
+/// `add_to_fonts` inserts it into the Proportional family alongside egui's built-ins, so
+/// icon glyphs (`egui_phosphor::regular::*`) render inline with normal toolbar text.
+fn install_phosphor_font(world: &mut World) {
+    let Ok(mut egui_ctx) = world
+        .query_filtered::<&mut bevy_egui::EguiContext, With<bevy_egui::PrimaryEguiContext>>()
+        .single_mut(world)
+    else {
+        return;
+    };
+    let ctx = egui_ctx.get_mut();
+    let mut fonts = bevy_egui::egui::FontDefinitions::default();
+    egui_phosphor::add_to_fonts(&mut fonts, egui_phosphor::Variant::Regular);
+    ctx.set_fonts(fonts);
+}

@@ -64,9 +64,13 @@ pub fn mark_hierarchy_dirty(
 }
 
 /// Register the hierarchy snapshot cache + its change-detection invalidator.
-pub fn plugin(app: &mut App) {
-    app.init_resource::<HierarchyCache>()
-        .add_systems(Update, mark_hierarchy_dirty);
+pub struct HierarchyPlugin;
+
+impl Plugin for HierarchyPlugin {
+    fn build(&self, app: &mut App) {
+        app.init_resource::<HierarchyCache>()
+            .add_systems(Update, mark_hierarchy_dirty);
+    }
 }
 
 /// Render the scene node tree.

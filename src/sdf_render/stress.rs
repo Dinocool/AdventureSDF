@@ -8,8 +8,12 @@
 
 use bevy::prelude::*;
 
-use crate::node::{EditorGizmo, Node3D};
+use crate::node::Node3D;
 use crate::scene_manager::SceneEntity;
+// `EditorGizmo` + `LocalId` are only used by the test-only `spawn_stress` scene generator below.
+#[cfg(test)]
+use crate::node::EditorGizmo;
+#[cfg(test)]
 use crate::soul_scene::LocalId;
 
 use super::edits::{MaterialFields, SdfMaterialSource, SdfOp};
@@ -129,7 +133,9 @@ pub fn expand_tower_spawners(
 
 /// Spawn the stress scene (one [`TowerSpawner`] node + a directional light) into `world` with
 /// stable `LocalId`s, ready for serialization. The towers themselves are materialized at load time
-/// by [`expand_tower_spawners`], not stored here.
+/// by [`expand_tower_spawners`], not stored here. Test-only: the runtime loads the serialized
+/// `assets/scenes/stress.scene`; this builder only regenerates that file (see the test).
+#[cfg(test)]
 pub fn spawn_stress(world: &mut World) {
     world.spawn((
         LocalId(0),
