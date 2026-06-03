@@ -239,6 +239,45 @@ fn fold_csg(start: u32, count: u32, pos: vec3<f32>) -> f32 {
     return select(3.4e38, acc, started);
 }
 
+// --- Coarse-LOD curvature compensation -------------------------------------------------
+//
+// Trilinear reconstruction (sample_brick_sdf) of an exact Euclidean SDF systematically
+// DISPLACES the rendered iso-surface: it is C0 (exact only for planar fields), so its leading
+// error is the 2nd-order Taylor remainder ≈ (h²/8)·f″ per axis. For an SDF the surface-tangent
+// second derivative IS the curvature (the Hessian of a distance field is the shape operator,
+// trace = mean curvature), so convex features erode INWARD and concave bulge OUTWARD by
+// ≈ (h²/8)·∇²f. The error scales with voxel² ⇒ quadruples per LOD — the visible "objects shrink
+// at coarse LODs".
+//
+// Fix the DATA (not the march): pre-bias each stored sample by the INVERSE of that error so the
+// trilinear reconstruction lands back on the true surface — store f' = f − (h²/8)·∇²f. The
+// 6-point Laplacian stencil ∇²f ≈ (Σ_6neighbours − 6f)/h² cancels the h², leaving the clean
+// scale-free correction (Σ_6 − 6f)/8. It self-zeros on flats (∇²f = 0) and reverses sign on
+// concavities, so it never touches geometry that wasn't eroding.
+//
+// RELIABILITY TAPER (critical): the (h²/8)·∇²f model is only valid where the field is a SMOOTH
+// Euclidean SDF over the voxel scale. Where it is NOT — sub-voxel features (radius < voxel, which
+// dominate coarse LODs), the non-Euclidean Lipschitz heightmap, or high-curvature smin seams —
+// the discrete Laplacian returns a large, meaningless value. CLAMPING it would saturate into a
+// ~½-voxel shove that BLOOMS those into blobs (the "corruption at certain points"). Instead taper
+// the correction toward ZERO as it grows past a small fraction of a voxel: a small correction is
+// a trustworthy resolved-curvature signal; a large one means "unresolved — leave it alone". So
+// well-resolved geometry un-shrinks while terrain/sub-voxel detail is untouched (it just stays as
+// it baked, same as before this fix). Bake-time only ⇒ off the per-frame budget; fixes every
+// consumer (primary, shadows, GI, normals) at once.
+fn curvature_correct(start: u32, count: u32, p: vec3<f32>, f: f32, voxel_size: f32) -> f32 {
+    let e = voxel_size;
+    let sx = fold_csg(start, count, p + vec3<f32>(e, 0.0, 0.0)) + fold_csg(start, count, p - vec3<f32>(e, 0.0, 0.0));
+    let sy = fold_csg(start, count, p + vec3<f32>(0.0, e, 0.0)) + fold_csg(start, count, p - vec3<f32>(0.0, e, 0.0));
+    let sz = fold_csg(start, count, p + vec3<f32>(0.0, 0.0, e)) + fold_csg(start, count, p - vec3<f32>(0.0, 0.0, e));
+    let corr = (sx + sy + sz - 6.0 * f) / 8.0;         // = (h²/8)·∇²f  (the stencil's 1/h² cancels)
+    // 1 while the correction is a trustworthy small fraction of a voxel; →0 once it grows into the
+    // unreliable regime (sub-voxel / noise / smin). NOT a clamp — large corrections vanish, not
+    // saturate, so they can never shove a surface by ½ a voxel.
+    let reliab = 1.0 - smoothstep(0.15, 0.4, abs(corr) / e);
+    return f - corr * reliab;
+}
+
 // --- snorm encode — ports SdfAtlas::dist_to_snorm{,_band} (truncating `as i16`) --------
 
 fn snorm_bits(v: f32) -> u32 {
@@ -301,9 +340,20 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid
         let pe = (origin + vec3<f32>(f32(x_even), f32(y), f32(z))) * h.voxel_size;
         let po = (origin + vec3<f32>(f32(x_odd), f32(y), f32(z))) * h.voxel_size;
 
-        // Distance: per-LOD band, two adjacent-x texels packed into one u32.
-        let de = fold_csg(h.edit_start, h.edit_count, pe) / h.dist_band;
-        let do_ = fold_csg(h.edit_start, h.edit_count, po) / h.dist_band;
+        // Distance: per-LOD band, two adjacent-x texels packed into one u32. Within ~2.5 voxels of
+        // the surface (so every corner of a surface-crossing trilinear cell is covered) curvature-
+        // compensate the coarse-LOD trilinear erosion (curvature_correct); elsewhere the value is
+        // saturated/far so the 6 extra evals are skipped. The `if` is real control flow — `select`
+        // would still evaluate the correction (no short-circuit), defeating the gate.
+        let fe = fold_csg(h.edit_start, h.edit_count, pe);
+        let fo = fold_csg(h.edit_start, h.edit_count, po);
+        let gate = 2.5 * h.voxel_size;
+        var ce = fe;
+        var co = fo;
+        if (abs(fe) < gate) { ce = curvature_correct(h.edit_start, h.edit_count, pe, fe, h.voxel_size); }
+        if (abs(fo) < gate) { co = curvature_correct(h.edit_start, h.edit_count, po, fo, h.voxel_size); }
+        let de = ce / h.dist_band;
+        let do_ = co / h.dist_band;
         let row = z * DIST_ROW_U32 + (y * 4u + p);   // u/2 = (y*8 + 2p)/2 = y*4 + p
         dist_out[dist_base + row] = snorm_bits(de) | (snorm_bits(do_) << 16u);
 

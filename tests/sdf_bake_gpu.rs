@@ -89,6 +89,30 @@ fn decode_dist(dist_u32: &[u32], x: u32, y: u32, z: u32, band: f32) -> f32 {
     (snorm as f32 / 32767.0) * band
 }
 
+/// CPU mirror of the bake shader's curvature compensation (`sdf_brick_bake.wgsl`
+/// `curvature_correct` + the `|f| < 2.5·voxel` near-surface gate): near the surface the stored
+/// field is the analytic SDF pre-biased by −(h²/8)·∇²f (with a reliability taper) so trilinear
+/// reconstruction doesn't erode convex features at coarse LOD. The reference recomputes the SAME
+/// 6-tap Laplacian stencil and the SAME smoothstep taper so it stays within a few snorm LSBs of
+/// the GPU. `sdf` is the UNCLAMPED analytic field; the result is band-clamped to match the encode.
+fn corrected_ref(sdf: impl Fn(Vec3) -> f32, world: Vec3, voxel_size: f32, band: f32) -> f32 {
+    let f = sdf(world);
+    let e = voxel_size;
+    let corrected = if f.abs() < 2.5 * e {
+        let s = sdf(world + Vec3::X * e) + sdf(world - Vec3::X * e)
+            + sdf(world + Vec3::Y * e) + sdf(world - Vec3::Y * e)
+            + sdf(world + Vec3::Z * e) + sdf(world - Vec3::Z * e);
+        let corr = (s - 6.0 * f) / 8.0;
+        // smoothstep(0.15, 0.4, |corr|/e): full when small/reliable, →0 when large/unreliable.
+        let t = (((corr.abs() / e) - 0.15) / (0.4 - 0.15)).clamp(0.0, 1.0);
+        let reliab = 1.0 - t * t * (3.0 - 2.0 * t);
+        f - corr * reliab
+    } else {
+        f
+    };
+    corrected.clamp(-band, band)
+}
+
 #[test]
 fn gpu_bake_sphere_matches_analytic_distance() {
     let Some((device, queue)) = device_queue() else {
@@ -207,8 +231,10 @@ fn gpu_bake_sphere_matches_analytic_distance() {
     drop(data);
     readback.unmap();
 
-    // --- Verify: every voxel's decoded distance ≈ analytic sphere SDF (clamped to band) ---
-    let slack = band / 32767.0 * 4.0; // a few snorm LSBs
+    // --- Verify: every voxel's decoded distance ≈ curvature-compensated sphere SDF ---
+    // The bake stores f − (h²/8)∇²f (reliability-tapered) near the surface to un-shrink, so the
+    // reference is the analytic sphere run through the SAME correction, not the raw distance.
+    let slack = band / 32767.0 * 8.0; // a few snorm LSBs (+ the correction's extra arithmetic)
     let mut max_err = 0.0f32;
     let mut any_inside = false;
     let mut any_outside = false;
@@ -220,15 +246,15 @@ fn gpu_bake_sphere_matches_analytic_distance() {
                     (coord.y + y as i32) as f32,
                     (coord.z + z as i32) as f32,
                 ) * voxel_size;
-                let analytic = (world.length() - radius).clamp(-band, band);
+                let reference = corrected_ref(|p| p.length() - radius, world, voxel_size, band);
                 let baked = decode_dist(&dist_u32, x, y, z, band);
-                let err = (baked - analytic).abs();
+                let err = (baked - reference).abs();
                 max_err = max_err.max(err);
-                if analytic < 0.0 { any_inside = true; }
-                if analytic > 0.0 { any_outside = true; }
+                if reference < 0.0 { any_inside = true; }
+                if reference > 0.0 { any_outside = true; }
                 assert!(
                     err <= slack,
-                    "voxel ({x},{y},{z}) world={world:?}: baked={baked} analytic={analytic} err={err} > slack={slack}"
+                    "voxel ({x},{y},{z}) world={world:?}: baked={baked} reference={reference} err={err} > slack={slack}"
                 );
             }
         }
@@ -414,7 +440,7 @@ fn gpu_bake_copy_to_atlas_texture_roundtrips() {
     let data = slice.get_mapped_range().to_vec();
 
     // Decode: texture tile is 64px wide × 8 tall; pixel (u=y*8+x, v=z) holds the R16 snorm.
-    let slack = band / 32767.0 * 4.0;
+    let slack = band / 32767.0 * 8.0;
     let mut max_err = 0.0f32;
     for z in 0..edge {
         let row = &data[(z * rb_row_bytes) as usize..((z * rb_row_bytes) + tile_w * 2) as usize];
@@ -428,12 +454,12 @@ fn gpu_bake_copy_to_atlas_texture_roundtrips() {
                     (coord.y + y as i32) as f32,
                     (coord.z + z as i32) as f32,
                 ) * voxel_size;
-                let analytic = (world.length() - radius).clamp(-band, band);
-                let err = (baked - analytic).abs();
+                let reference = corrected_ref(|p| p.length() - radius, world, voxel_size, band);
+                let err = (baked - reference).abs();
                 max_err = max_err.max(err);
                 assert!(
                     err <= slack,
-                    "TEX voxel ({x},{y},{z}): baked={baked} analytic={analytic} err={err} > slack={slack}"
+                    "TEX voxel ({x},{y},{z}): baked={baked} reference={reference} err={err} > slack={slack}"
                 );
             }
         }
