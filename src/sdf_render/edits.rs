@@ -40,10 +40,11 @@ pub enum SdfPrimitive {
         half_height: f32,
     },
     /// Bounded noise heightmap (terrain testing). The surface is the value-noise height over an XZ
-    /// rectangle. The distance field is baked on the GPU (`sdf_brick_bake.wgsl`), where the raw
-    /// vertical gap `p.y - h` is Lipschitz-normalised (divided by `sqrt(1+|∇h|²)`) into a true
-    /// Euclidean SDF so the sphere-trace doesn't overshoot steep slopes. There is no CPU distance
-    /// eval (the GPU is the source of truth); `heightmap_surface_y` gives the surface height.
+    /// rectangle; `eval_primitive` returns the signed VERTICAL distance `p.y - h`. The GPU bake
+    /// (`sdf_brick_bake.wgsl`) additionally Lipschitz-normalises that (÷ the neighbourhood-max
+    /// `sqrt(1+|∇h|²)`) into a true Euclidean SDF so the sphere-trace doesn't overshoot steep slopes —
+    /// the normalisation keeps the same zero-crossing, so the CPU eval (picking, bake classification)
+    /// and the GPU render agree on the surface. `heightmap_surface_y` gives the surface height.
     Heightmap {
         half_xz: Vec2,
         max_height: f32,
@@ -293,13 +294,21 @@ pub fn eval_primitive(prim: &SdfPrimitive, p: Vec3) -> f32 {
             );
             d.x.max(d.y).min(0.0) + d.max(Vec2::ZERO).length()
         }
-        SdfPrimitive::Heightmap { .. } => {
-            // The heightmap distance field is BAKED ON THE GPU only (sdf_brick_bake.wgsl, where it is
-            // Lipschitz-normalised into a true Euclidean SDF). The CPU no longer evaluates it — the old
-            // CPU `p.y - h` vertical-distance port wasn't worth maintaining against the normalised GPU
-            // form. CPU SDF queries (picking's closest-distance refine) treat terrain as absent; the
-            // surface height for resting objects comes from `heightmap_surface_y` (the zero-crossing).
-            f32::MAX
+        SdfPrimitive::Heightmap {
+            max_height,
+            freq,
+            amp,
+            seed,
+            ..
+        } => {
+            // ONE-SIDED terrain surface: signed VERTICAL distance to the noise height (positive above,
+            // negative below). Coarse CPU eval for picking + bake-scheduler chunk/edit classification.
+            // The GPU bake (sdf_brick_bake.wgsl) additionally Lipschitz-normalises this into a true
+            // Euclidean SDF; that factor (> 0) doesn't move the zero-crossing, so the CPU and GPU agree
+            // on WHERE the surface is (all picking/classification needs) — only off-surface magnitudes
+            // differ, so this isn't held to bit-parity with the GPU form.
+            let h = height_sample(Vec2::new(p.x, p.z), *freq, *amp, *seed) + *max_height * 0.5;
+            p.y - h
         }
     }
 }
