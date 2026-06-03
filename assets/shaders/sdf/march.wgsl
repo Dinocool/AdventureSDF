@@ -6,7 +6,7 @@
 // loop, LOD cross-fade, iso-offset, and over-relaxation logic are unchanged from when this
 // lived in the entry shader — only the module boundary is new.
 
-#import sdf::bindings::{camera, sdf_eps, pixel_cone, over_relax, lod_blend_band, recenter_snap, lod_count, brick_world_at, CHUNK_BRICKS, voxel_size_at, clipmap_exit_t}
+#import sdf::bindings::{camera, sdf_eps, pixel_cone, over_relax, lod_blend_band, recenter_snap, lod_count, brick_world_at, CHUNK_BRICKS, voxel_size_at, clipmap_exit_t, chunk_buf}
 #import sdf::brick::{
     world_to_brick_lod,
     load_material_distances,
@@ -17,6 +17,7 @@
     sample_level_at_or_coarser,
     dist_to_brick_exit_lod,
     dist_to_chunk_exit_lod,
+    dist_over_empty_bricks,
     in_ring_chunk,
     ChunkCache,
 }
@@ -206,22 +207,30 @@ fn raymarch(origin: vec3<f32>, dir: vec3<f32>, start_t: f32, q: MarchQuality) ->
             }
         }
 
-        // --- 1. Empty space: hierarchical chunk-DDA skip -----------------------------
+        // --- 1. Empty space: hierarchical skip, coarsest→fine (biggest box wins) ------
         //
-        // Skip whole CHUNK boxes, not one brick at a time. A chunk absent from the table
-        // AND inside its LOD's resident ring is (treated as) empty — the bake cull never
-        // enqueues a chunk that has geometry — so we step to the far face of the LARGEST
-        // such box around `p`. Walk coarse→fine so the biggest provably-empty box wins.
+        // Two cases, both keyed off the chunk directory only (no field samples):
+        //  • a coarse ABSENT in-ring chunk  → jump its whole CHUNK box (provably empty: the bake cull
+        //    never enqueues a chunk that has geometry);
+        //  • a coarse RESIDENT chunk whose brick at `p` is empty — air ABOVE the terrain that shares
+        //    the chunk holding the surface below — → occupancy-DDA across its empty-brick run
+        //    (`dist_over_empty_bricks`). This is the horizon-crawl fix: instead of one brick per march
+        //    step it skips the whole empty run in one shot. Coarse bricks ⇒ big skips, and a brick
+        //    empty at a coarse LOD is empty at every finer LOD, so the skip can't pass a surface.
+        // Walking coarsest→fine takes the biggest applicable box; the finest-resident-brick fallback
+        // only fires if `p` is outside every ring (next iteration's MAX_DIST then ends the ray).
         if (!scene.in_brick) {
-            let wl = scene.window_lod;
-            var adv = dist_to_brick_exit_lod(p, dir, wl) + voxel_size_at(wl) * 0.01;
             let levels = lod_count();
+            var adv = dist_to_brick_exit_lod(p, dir, scene.window_lod) + voxel_size_at(scene.window_lod) * 0.01;
             for (var L = levels; L > 0u; ) {
-                L = L - 1u;                              // coarsest first = biggest box
+                L = L - 1u;                              // coarsest first
                 let coord = world_to_brick_lod(p, L);
                 let ci = find_chunk_cached(coord, L, &cache);
-                if (ci < 0 && in_ring_chunk(coord, L)) {
-                    adv = max(adv, dist_to_chunk_exit_lod(p, dir, L) + voxel_size_at(L) * 0.01);
+                if (ci >= 0) {
+                    adv = dist_over_empty_bricks(chunk_buf[u32(ci)], p, dir, L) + voxel_size_at(L) * 0.01;
+                    break;
+                } else if (in_ring_chunk(coord, L)) {
+                    adv = dist_to_chunk_exit_lod(p, dir, L) + voxel_size_at(L) * 0.01;
                     break;
                 }
             }
@@ -291,14 +300,16 @@ fn raymarch(origin: vec3<f32>, dir: vec3<f32>, start_t: f32, q: MarchQuality) ->
             return result;
         }
 
-        // Step `omega · d_eff`, floored so we never stall and capped at the brick exit so the next
-        // iteration re-resolves LOD across bricks. Over-relax only the pure sphere-trace step; an
-        // active cross-fade steps plain (omega = 1) — the blended field is non-eikonal.
+        // Step `omega · d_eff` (Keinert over-relaxation), floored so we never stall and capped at the
+        // brick exit so the next iteration re-resolves LOD across bricks. An active cross-fade steps
+        // plain (omega = 1) — the blended field is non-eikonal. (The empty-space horizon crawl is
+        // handled by the occupancy-aware chunk/brick DDA above; in-brick grazing acceleration —
+        // segment tracing with a local directional-Lipschitz bound — is a separate planned step.)
         let brick_exit = dist_to_brick_exit_lod(p, dir, lod);
         let local_omega = select(OMEGA, 1.0, blending);
         let step = clamp(local_omega * d_eff, voxel_size * 0.01, brick_exit + voxel_size * 0.01);
         t += step;
-        // Carry the slope memo for the Keinert overshoot-undo + the hit-refinement crossing.
+        // Carry the slope memo for the Keinert undo + the linear-crossing hit refinement.
         prev_d = d_eff;
         prev_step = step;
     }
