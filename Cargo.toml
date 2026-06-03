@@ -110,8 +110,12 @@ bytemuck = "1"
 # lowers to (OpUMod vs OpSRem) — root-cause evidence for the negative-modulo divergence.
 naga = { version = "27", features = ["spv-out", "wgsl-in"] }
 # Composes #import-based WGSL modules so the shader-validation test can resolve the
-# split sdf shader the same way Bevy's ShaderCache does at runtime.
-naga_oil = "0.20"
+# split sdf shader the same way Bevy's ShaderCache does at runtime. `default-features = false`
+# drops naga_oil's `glsl` feature: with it on, naga_oil cross-checks each composable module's
+# interface by emitting a GLSL header too, and the GLSL backend panics on `binding_array` (the
+# paged atlas pool). The runtime build never enables `glsl` (bevy pulls only `test_shader`), so
+# this just matches the test to the real compose path. We compose WGSL only.
+naga_oil = { version = "0.20", default-features = false }
 # block_on for the GPU compute rig (tests/sdf_gpu_rig.rs) — run real WGSL, read back buffers.
 futures-lite = "2"
 

@@ -269,10 +269,11 @@ impl Node for SdfBrickBakeNode {
         ) else {
             return Ok(());
         };
-        // The atlas textures must already exist (a prior bake/realloc created them). If not,
-        // there's nothing to copy into yet — skip this frame.
+        // The atlas page pool must already cover this frame's tiles (`prepare_sdf_atlas_gpu` grew it
+        // from the same high-water this frame's jobs allocated against). If no page exists yet, there
+        // is nothing to copy into — skip.
         let gpu_atlas = world.resource::<SdfGpuAtlas>();
-        let (Some(dist_tex), Some(mat_tex)) = (&gpu_atlas.dist_tex, &gpu_atlas.mat_tex) else {
+        let Some(pages) = gpu_atlas.pages.as_ref().filter(|p| !p.is_empty()) else {
             return Ok(());
         };
 
@@ -320,6 +321,9 @@ impl Node for SdfBrickBakeNode {
             // `col_px | row_px<<16` it returns into the sub-rect origin for the texture blit.
             let base = chunk::tile_atlas_base(tile);
             let (col_px, row_px) = (base & 0xFFFF, base >> 16);
+            // Route the tile into its PAGE: the global tile row splits into (page, row within page).
+            // The whole tile is one page (page height is a multiple of the 8-px tile height).
+            let (page, local_y) = super::atlas_pages::split_row(row_px);
             let tile_extent = Extent3d {
                 width: tile_width,
                 height: edge,
@@ -336,11 +340,11 @@ impl Node for SdfBrickBakeNode {
                     },
                 },
                 TexelCopyTextureInfo {
-                    texture: dist_tex,
+                    texture: pages.dist_page(page),
                     mip_level: 0,
                     origin: Origin3d {
                         x: col_px,
-                        y: row_px,
+                        y: local_y,
                         z: 0,
                     },
                     aspect: TextureAspect::All,
@@ -358,11 +362,11 @@ impl Node for SdfBrickBakeNode {
                     },
                 },
                 TexelCopyTextureInfo {
-                    texture: mat_tex,
+                    texture: pages.mat_page(page),
                     mip_level: 0,
                     origin: Origin3d {
                         x: col_px,
-                        y: row_px,
+                        y: local_y,
                         z: 0,
                     },
                     aspect: TextureAspect::All,

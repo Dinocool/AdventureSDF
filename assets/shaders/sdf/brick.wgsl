@@ -11,8 +11,9 @@
     PALETTE_EMPTY,
     chunk_buf,
     chunk_tile_buf,
-    atlas_tex,
-    mat_tex,
+    atlas_pages,
+    mat_pages,
+    ATLAS_PAGE_HEIGHT_PX,
     cell_stride,
     voxel_size_at,
     lod_count,
@@ -137,22 +138,30 @@ fn find_brick_lookup(coord: vec3<i32>, lod: u32) -> BrickLocation {
 
 // --- Sample brick SDF via trilinear interpolation ---
 
-// Pixel coordinate of brick-local voxel (lx,ly,lz) in the 2D-tiled atlas. `base`
-// packs the tile origin as col_px | row_px<<16. Within a tile, pixel =
-// (col_px + ly*EDGE + lx, row_px + lz). Tiling keeps the atlas width bounded.
-fn voxel_pixel(base: u32, lx: i32, ly: i32, lz: i32) -> vec2<i32> {
+// Atlas location of a brick-local voxel: which PAGE texture, and the pixel WITHIN that page.
+// `base` packs the tile origin as col_px | row_px<<16 (row_px is the GLOBAL tile row in pixels).
+// Within a tile, the global pixel is (col_px + ly*EDGE + lx, row_px + lz); the paged pool splits
+// the global row into page = global_y / ATLAS_PAGE_HEIGHT_PX and local_y = global_y % page_h. A
+// tile is `edge`(8) px tall and the page height is a multiple of 8, so all 8 of a tile's rows live
+// in the SAME page (the page index is constant across a tile's voxels).
+struct AtlasLoc { page: u32, px: vec2<i32> };
+
+fn voxel_loc(base: u32, lx: i32, ly: i32, lz: i32) -> AtlasLoc {
     let edge = i32(camera.grid_dims.z);  // samples per brick edge (8)
     let cx = clamp(lx, 0, edge - 1);
     let cy = clamp(ly, 0, edge - 1);
     let cz = clamp(lz, 0, edge - 1);
     let col_px = i32(base & 0xffffu);
     let row_px = i32(base >> 16u);
-    return vec2<i32>(col_px + cy * edge + cx, row_px + cz);
+    let gy = row_px + cz;
+    let page_h = ATLAS_PAGE_HEIGHT_PX;
+    return AtlasLoc(u32(gy / page_h), vec2<i32>(col_px + cy * edge + cx, gy % page_h));
 }
 
 // Fetch one distance sample. R16Snorm decodes to [-1,1] (the baked range).
 fn load_voxel(base_u: u32, lx: i32, ly: i32, lz: i32) -> f32 {
-    return textureLoad(atlas_tex, voxel_pixel(base_u, lx, ly, lz), 0).r;
+    let loc = voxel_loc(base_u, lx, ly, lz);
+    return textureLoad(atlas_pages[loc.page], loc.px, 0).r;
 }
 
 // --- Per-palette-slot material distance sampling ---
@@ -165,15 +174,20 @@ fn load_voxel(base_u: u32, lx: i32, ly: i32, lz: i32) -> f32 {
 // sub-voxel sharp, independent of geometric smoothing. Per-pixel cost is O(K),
 // independent of how many materials the world contains.
 
+fn load_mat(base_u: u32, lx: i32, ly: i32, lz: i32) -> vec4<f32> {
+    let loc = voxel_loc(base_u, lx, ly, lz);
+    return textureLoad(mat_pages[loc.page], loc.px, 0);
+}
+
 fn sample_mat_tex(base_u: u32, i0: vec3<i32>, f: vec3<f32>) -> vec4<f32> {
-    let c000 = textureLoad(mat_tex, voxel_pixel(base_u, i0.x,     i0.y,     i0.z),     0);
-    let c100 = textureLoad(mat_tex, voxel_pixel(base_u, i0.x + 1, i0.y,     i0.z),     0);
-    let c010 = textureLoad(mat_tex, voxel_pixel(base_u, i0.x,     i0.y + 1, i0.z),     0);
-    let c110 = textureLoad(mat_tex, voxel_pixel(base_u, i0.x + 1, i0.y + 1, i0.z),     0);
-    let c001 = textureLoad(mat_tex, voxel_pixel(base_u, i0.x,     i0.y,     i0.z + 1), 0);
-    let c101 = textureLoad(mat_tex, voxel_pixel(base_u, i0.x + 1, i0.y,     i0.z + 1), 0);
-    let c011 = textureLoad(mat_tex, voxel_pixel(base_u, i0.x,     i0.y + 1, i0.z + 1), 0);
-    let c111 = textureLoad(mat_tex, voxel_pixel(base_u, i0.x + 1, i0.y + 1, i0.z + 1), 0);
+    let c000 = load_mat(base_u, i0.x,     i0.y,     i0.z);
+    let c100 = load_mat(base_u, i0.x + 1, i0.y,     i0.z);
+    let c010 = load_mat(base_u, i0.x,     i0.y + 1, i0.z);
+    let c110 = load_mat(base_u, i0.x + 1, i0.y + 1, i0.z);
+    let c001 = load_mat(base_u, i0.x,     i0.y,     i0.z + 1);
+    let c101 = load_mat(base_u, i0.x + 1, i0.y,     i0.z + 1);
+    let c011 = load_mat(base_u, i0.x,     i0.y + 1, i0.z + 1);
+    let c111 = load_mat(base_u, i0.x + 1, i0.y + 1, i0.z + 1);
 
     let x00 = mix(c000, c100, f.x);
     let x10 = mix(c010, c110, f.x);
