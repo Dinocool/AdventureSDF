@@ -45,6 +45,24 @@ pub fn menu_bar_ui(world: &mut World, ctx: &egui::Context) {
     let mut restore_default = false;
     let mut open_layouts = false;
 
+    // Edit-menu state (enable/disable) + one-shot click flags, dispatched after the egui pass.
+    let (can_undo, can_redo, has_clip, has_sel) = {
+        use crate::editor::history::{EditHistories, EditorClipboard};
+        let h = world.resource::<EditHistories>();
+        (
+            h.can_undo(),
+            h.can_redo(),
+            world.resource::<EditorClipboard>().content.is_some(),
+            world.resource::<crate::sdf_render::SdfSelection>().entity.is_some(),
+        )
+    };
+    let mut e_undo = false;
+    let mut e_redo = false;
+    let mut e_copy = false;
+    let mut e_cut = false;
+    let mut e_paste = false;
+    let mut e_delete = false;
+
     egui::TopBottomPanel::top("editor_menu_bar").show(ctx, |ui| {
         egui::MenuBar::new().ui(ui, |ui| {
             ui.menu_button("File", |ui| {
@@ -67,6 +85,34 @@ pub fn menu_bar_ui(world: &mut World, ctx: &egui::Context) {
                 }
                 ui.separator();
                 ui.weak(current.display().to_string());
+            });
+
+            ui.menu_button("Edit", |ui| {
+                if ui.add_enabled(can_undo, egui::Button::new("Undo  Ctrl+Z")).clicked() {
+                    e_undo = true;
+                    ui.close();
+                }
+                if ui.add_enabled(can_redo, egui::Button::new("Redo  Ctrl+Y")).clicked() {
+                    e_redo = true;
+                    ui.close();
+                }
+                ui.separator();
+                if ui.add_enabled(has_sel, egui::Button::new("Cut  Ctrl+X")).clicked() {
+                    e_cut = true;
+                    ui.close();
+                }
+                if ui.add_enabled(has_sel, egui::Button::new("Copy  Ctrl+C")).clicked() {
+                    e_copy = true;
+                    ui.close();
+                }
+                if ui.add_enabled(has_clip, egui::Button::new("Paste  Ctrl+V")).clicked() {
+                    e_paste = true;
+                    ui.close();
+                }
+                if ui.add_enabled(has_sel, egui::Button::new("Delete  Del")).clicked() {
+                    e_delete = true;
+                    ui.close();
+                }
             });
 
             ui.menu_button("View", |ui| {
@@ -95,6 +141,26 @@ pub fn menu_bar_ui(world: &mut World, ctx: &egui::Context) {
             });
         });
     });
+
+    // Dispatch Edit-menu actions (each needs exclusive `&mut World`, so run them after the pass).
+    if e_undo {
+        crate::editor::history::undo(world);
+    }
+    if e_redo {
+        crate::editor::history::redo(world);
+    }
+    if e_copy {
+        crate::editor::history::copy(world);
+    }
+    if e_cut {
+        crate::editor::history::cut(world);
+    }
+    if e_paste {
+        crate::editor::history::paste(world);
+    }
+    if e_delete {
+        crate::editor::history::delete_selected(world);
+    }
 
     for (tab, side, present) in panel_toggles {
         layout::set_panel_present(world, tab, side, present);

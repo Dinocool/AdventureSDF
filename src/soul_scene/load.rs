@@ -60,6 +60,21 @@ pub fn load_scene_from_str(
     instantiate_records(world, &file, "<snapshot>", registry, &mut stack)
 }
 
+/// Instantiate a *subtree* from an in-memory RON string (copy/paste, undo of spawn/delete),
+/// returning the new root entities. Unlike [`load_scene_from_str`] this does NOT touch the
+/// editor-camera resource and does NOT clear existing content — it adds to the live world. The
+/// records' `LocalId`s are spawned as-is, so callers that need collision-free ids (paste of a
+/// still-present node) must remap them in the [`SceneFile`] before re-serializing.
+pub fn instantiate_scene_str(
+    world: &mut World,
+    ron: &str,
+    registry: &TypeRegistry,
+) -> Result<Vec<Entity>, SceneLoadError> {
+    let file = SceneFile::from_ron(ron).map_err(|e| SceneLoadError::Parse(e.to_string()))?;
+    let mut stack = Vec::new();
+    instantiate_records(world, &file, "<subtree>", registry, &mut stack)
+}
+
 /// Recursively instantiate a scene file. `stack` carries the in-progress source
 /// paths so cycles are detected instead of looping forever.
 fn instantiate(

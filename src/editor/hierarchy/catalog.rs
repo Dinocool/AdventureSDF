@@ -247,5 +247,24 @@ pub(super) fn show_create_dialog(world: &mut World, ui: &mut egui::Ui, dialog: &
         }
         world.resource_mut::<SdfSelection>().entity = Some(entity);
         dialog.open = false;
+
+        // Record as an undoable spawn (serialize the new subtree + its parent link).
+        let root_id = crate::editor::history::ensure_id(world, entity);
+        let registry = world.resource::<AppTypeRegistry>().clone();
+        let subtree = {
+            let reg = registry.read();
+            crate::soul_scene::save_subtree_to_string(world, &reg, entity).ok()
+        };
+        let parent_id = world
+            .get::<ChildOf>(entity)
+            .map(|c| c.parent())
+            .and_then(|p| crate::editor::history::local_id_of(world, p));
+        if let Some(subtree) = subtree {
+            world
+                .resource_mut::<crate::editor::history::EditHistories>()
+                .record(Box::new(crate::editor::history::SpawnCommand::new(
+                    root_id, subtree, parent_id,
+                )));
+        }
     }
 }

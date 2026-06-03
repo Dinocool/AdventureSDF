@@ -153,6 +153,78 @@ fn build_scene_file(world: &mut World, registry: &TypeRegistry) -> SceneFile {
     }
 }
 
+/// Serialize `root` and its descendants (via `Children`) to a `.scene` RON string — the
+/// subtree snapshot the editor uses for copy/paste and for undo of spawn/delete. The root is
+/// emitted with no parent (`parent: None`) so it re-instantiates as a standalone root that the
+/// caller reparents; descendant parent links are preserved within the subtree. Entities are
+/// expected to carry `LocalId` (the editor's `ensure_local_ids` guarantees this for live scene
+/// nodes); any without one are skipped.
+pub fn save_subtree_to_string(
+    world: &mut World,
+    registry: &TypeRegistry,
+    root: Entity,
+) -> Result<String, SceneSaveError> {
+    let mut members = Vec::new();
+    collect_subtree(world, root, &mut members);
+
+    let mut records = Vec::new();
+    let mut max_id = 0u64;
+    for entity in &members {
+        let Some(id) = world.get::<LocalId>(*entity).copied() else {
+            continue;
+        };
+        max_id = max_id.max(id.0);
+        // Root detaches from its real parent; descendants keep links inside the subtree.
+        let parent = if *entity == root {
+            None
+        } else {
+            parent_local_id(world, *entity)
+        };
+        if let Some(instance) = world.get::<SceneInstance>(*entity).cloned() {
+            records.push(SceneRecord::Instance {
+                id,
+                parent,
+                source: instance.source.clone(),
+                overrides: rediff_overrides(world, &instance, registry),
+            });
+        } else {
+            records.push(SceneRecord::Entity {
+                id,
+                parent,
+                components: serialize_entity_components(world, *entity, registry),
+            });
+        }
+    }
+
+    let file = SceneFile {
+        next_id: max_id + 1,
+        records,
+        editor_camera: None,
+    };
+    file.to_ron()
+        .map_err(|e| SceneSaveError::Serialize(e.to_string()))
+}
+
+/// Depth-first collect `root` + descendants that are serializable scene entities (same marker
+/// filters as [`build_scene_file`]). Excluded nodes (editor-only / runtime-rebuilt) are skipped
+/// but their children are still visited.
+fn collect_subtree(world: &World, entity: Entity, out: &mut Vec<Entity>) {
+    let serializable = world.get::<SceneEntity>(entity).is_some()
+        && world.get::<EditorEntity>(entity).is_none()
+        && world.get::<InstanceChild>(entity).is_none()
+        && world.get::<NonSerializable>(entity).is_none()
+        && world.get::<SkipSerialization>(entity).is_none()
+        && world.get::<EditorHidden>(entity).is_none();
+    if serializable {
+        out.push(entity);
+    }
+    if let Some(children) = world.get::<Children>(entity) {
+        for child in children.iter() {
+            collect_subtree(world, child, out);
+        }
+    }
+}
+
 /// Resolve an entity's parent (via `ChildOf`) to the parent's stable `LocalId`, if
 /// the parent is itself a saved scene entity. Returns `None` for roots or parents
 /// outside the scene set.

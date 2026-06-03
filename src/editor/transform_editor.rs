@@ -10,6 +10,7 @@
 
 use bevy::math::EulerRot;
 use bevy::prelude::*;
+use bevy::reflect::TypePath;
 use bevy_egui::egui;
 
 /// Euler order for display/edit. YXZ (yaw, pitch, roll) reads naturally for scene nodes.
@@ -29,13 +30,11 @@ struct EulerBuf {
 /// Inspector override for `Transform`. Registered via
 /// `inspector::register_component_editor::<Transform>`.
 pub fn transform_editor(world: &mut World, entity: Entity, ui: &mut egui::Ui) {
-    let Ok(mut entity_mut) = world.get_entity_mut(entity) else {
+    // Read the live transform without holding a borrow across the UI / history write below.
+    let Some(before) = world.get::<Transform>(entity).copied() else {
         return;
     };
-    let Some(mut transform) = entity_mut.get_mut::<Transform>() else {
-        return;
-    };
-    let mut t = *transform;
+    let mut t = before;
 
     let buf_id = ui.make_persistent_id(("transform_euler", entity));
     let mut buf: Option<EulerBuf> = ui.memory(|m| m.data.get_temp(buf_id));
@@ -92,7 +91,28 @@ pub fn transform_editor(world: &mut World, entity: Entity, ui: &mut egui::Ui) {
     });
 
     if changed {
-        *transform = t;
+        if let Ok(mut entity_mut) = world.get_entity_mut(entity)
+            && let Some(mut transform) = entity_mut.get_mut::<Transform>()
+        {
+            *transform = t;
+        }
+        // Record as a generic component edit (coalesced across a DragValue drag).
+        if let (Some(b_ron), Some(a_ron)) = (
+            crate::editor::history::reflect_to_ron(world, before.as_partial_reflect()),
+            crate::editor::history::reflect_to_ron(world, t.as_partial_reflect()),
+        ) {
+            let id = crate::editor::history::ensure_id(world, entity);
+            if let Some(cmd) = crate::editor::history::ComponentEdit::new(
+                id,
+                Transform::type_path(),
+                b_ron,
+                a_ron,
+            ) {
+                world
+                    .resource_mut::<crate::editor::history::EditHistories>()
+                    .record(Box::new(cmd));
+            }
+        }
     }
     ui.memory_mut(|m| m.data.insert_temp(buf_id, b));
 }

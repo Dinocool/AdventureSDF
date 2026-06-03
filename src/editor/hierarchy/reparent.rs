@@ -43,11 +43,21 @@ pub(super) fn apply_actions(
 
     if commit_rename {
         if let Some(entity) = rename.entity {
-            let new = rename.buf.trim();
-            if !new.is_empty()
-                && let Ok(mut e) = world.get_entity_mut(entity)
-            {
-                e.insert(Name::new(new.to_string()));
+            let new = rename.buf.trim().to_string();
+            let old = world
+                .get::<Name>(entity)
+                .map(|n| n.as_str().to_string())
+                .unwrap_or_default();
+            if !new.is_empty() && new != old {
+                if let Ok(mut e) = world.get_entity_mut(entity) {
+                    e.insert(Name::new(new.clone()));
+                }
+                let id = crate::editor::history::ensure_id(world, entity);
+                world
+                    .resource_mut::<crate::editor::history::EditHistories>()
+                    .record(Box::new(crate::editor::history::RenameCommand::new(
+                        id, old, new,
+                    )));
             }
         }
         *rename = RenameState::default();
@@ -55,9 +65,13 @@ pub(super) fn apply_actions(
 
     // Reparent (cycle-guarded): never parent a node under itself or a descendant.
     if let Some((child, new_parent)) = actions.reparent {
+        let old_parent = world.get::<ChildOf>(child).map(|c| c.parent());
+        let old_local = world.get::<Transform>(child).copied().unwrap_or_default();
+        let mut applied = false;
         match new_parent {
             Some(parent) if parent != child && !is_descendant(world, parent, child) => {
                 reparent_preserving_world(world, child, parent);
+                applied = true;
             }
             Some(_) => {} // self or cycle — ignore
             None => {
@@ -69,7 +83,20 @@ pub(super) fn apply_actions(
                     }
                     e.remove::<ChildOf>();
                 }
+                applied = true;
             }
+        }
+        if applied {
+            let new_parent_e = world.get::<ChildOf>(child).map(|c| c.parent());
+            let new_local = world.get::<Transform>(child).copied().unwrap_or_default();
+            let cid = crate::editor::history::ensure_id(world, child);
+            let old_pid = old_parent.and_then(|p| crate::editor::history::local_id_of(world, p));
+            let new_pid = new_parent_e.and_then(|p| crate::editor::history::local_id_of(world, p));
+            world
+                .resource_mut::<crate::editor::history::EditHistories>()
+                .record(Box::new(crate::editor::history::ReparentCommand::new(
+                    cid, old_pid, old_local, new_pid, new_local,
+                )));
         }
     }
 
