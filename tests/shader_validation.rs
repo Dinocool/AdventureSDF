@@ -97,7 +97,12 @@ fn validate_composed_sdf() -> Result<(), String> {
 
 /// Register the Bevy fullscreen stub into a fresh composer.
 fn composer_with_stub() -> Composer {
-    let mut composer = Composer::default();
+    // Validate with FULL capabilities, exactly as bevy's runtime composer does via
+    // `.with_capabilities(device_caps)` (pipeline_cache.rs). The default composer validates with
+    // EMPTY capabilities, which rejects the paged atlas's non-uniform `binding_array` index
+    // (`mat_pages[page]`) that the device + runtime accept. Without this the composer's internal
+    // header validation fails with "Function 'load_mat' is invalid".
+    let mut composer = Composer::default().with_capabilities(naga::valid::Capabilities::all());
     composer
         .add_composable_module(ComposableModuleDescriptor {
             source: FULLSCREEN_STUB,

@@ -83,10 +83,21 @@ struct BrickTile {
 // lives CPU-side only, as the bake cull.
 
 @group(0) @binding(0) var<uniform> camera: SdfCameraUniform;
-@group(1) @binding(0) var atlas_tex: texture_2d<f32>;       // R16Snorm distance field
+// Distance + material atlases as PAGED pools (bindless): each is a runtime-sized array of
+// fixed-height page textures, so growth allocates ONE new page (no realloc + full-copy of the
+// whole atlas, which spiked VRAM ~2× and cost O(N²) during a fill). A brick's global tile row
+// splits into (page = row / ATLAS_PAGE_HEIGHT_PX, local row) — see `brick::voxel_loc`. The page
+// index is data-dependent (non-uniform across fragments), so the pipeline needs the sampled-array
+// non-uniform-indexing feature. Sampled via `textureLoad` (manual trilinear), so no sampler.
+// SIZED binding_array (not the unsized `binding_array<T>` — naga_oil's composable-module name
+// mangler routes through the GLSL backend, which can't write an unsized binding array and panics;
+// Bevy's own bindless bindings are likewise sized). `ATLAS_MAX_PAGES` (= 64) is the COMPILE-TIME
+// max page count; fewer real pages are bound and the rest are dummy 1×1 fills. MUST match the Rust
+// `atlas_upload::ATLAS_MAX_PAGES`.
+@group(1) @binding(0) var atlas_pages: binding_array<texture_2d<f32>, 64>;   // R16Snorm distance pages
 @group(1) @binding(1) var atlas_sampler: sampler;
 @group(1) @binding(2) var<storage, read> chunk_buf: array<ChunkLookup>;  // sorted, binary-searched
-@group(1) @binding(3) var mat_tex: texture_2d<f32>;         // Rgba16Snorm: 4 palette-slot distances
+@group(1) @binding(3) var mat_pages: binding_array<texture_2d<f32>, 64>;     // Rgba16Snorm: 4 palette-slot dist pages
 @group(1) @binding(4) var<storage, read> materials: array<SdfMaterial>;  // material table, by global id
 // PBR texture arrays + their filtering sampler. Each is a texture_2d_array indexed
 // by a material's tex layer; sampled triplanar in `material`/`pbr`.
@@ -108,6 +119,12 @@ const PI: f32 = 3.14159265359;
 // MUST match atlas::DIST_BAND_VOXELS on the CPU. Coarse LODs get a large world band → big
 // sphere-trace steps far from the surface (the per-LOD voxel-unit clamp).
 const DIST_BAND_VOXELS: f32 = 4.0;
+
+// Height (in PIXELS) of one atlas page texture in the paged pool. A brick tile is `edge` (8) px
+// tall, so this MUST be a multiple of 8 (a tile never straddles two pages). MUST match the Rust
+// `atlas_upload::ATLAS_PAGE_HEIGHT_PX` exactly (the bake's tile→page routing and this sampler agree
+// on it). 2048 px = 256 tile-rows = 256·ATLAS_TILES_PER_ROW bricks per page.
+const ATLAS_PAGE_HEIGHT_PX: i32 = 2048;
 
 // --- Uniform accessors ---
 

@@ -24,10 +24,13 @@ use super::{SdfCamera, SdfGridConfig, SdfRenderEnabled};
 
 // Concern-specific submodules of the render path (bake compute, cone prepass, PBR texture
 // streaming); each reaches the shared render types here via `use super::*`.
+mod atlas_pages;
 mod atlas_upload;
 mod bake;
 mod cone;
 mod pbr_textures;
+
+use atlas_pages::AtlasPages;
 
 // --- GPU Types ---
 
@@ -94,15 +97,12 @@ struct GpuSdfMaterial {
 
 #[derive(Resource, Default)]
 struct SdfGpuAtlas {
-    /// Persistent distance atlas (R16Snorm). Kept (not just its view) so partial
-    /// bakes can `write_texture` only the changed tiles instead of recreating it.
-    dist_tex: Option<Texture>,
-    dist_view: Option<TextureView>,
-    /// Persistent per-palette-slot distance atlas (Rgba16Snorm, 4 channels). The
-    /// shader argmins the 4 slots for the local material index, then maps it via the
-    /// brick palette. Kept across frames for the same partial-upload reason.
-    mat_tex: Option<Texture>,
-    mat_view: Option<TextureView>,
+    /// Paged distance + material atlases (R16Snorm + Rgba16Snorm), grown one fixed-size page at a
+    /// time with NO copy (see [`AtlasPages`]). `None` until `init_sdf_pipeline` creates the pool.
+    /// The bake writes tiles straight into the live pages; the fragment shader reads them as a
+    /// `binding_array`. Replaces the old single-texture atlas whose taller-realloc + full-copy
+    /// spiked VRAM ~2× and cost O(N²) during a fill.
+    pages: Option<AtlasPages>,
     sampler: Option<Sampler>,
     /// Chunk lookup table (binding 2) + packed per-chunk tile runs (binding 11).
     lookup_buffer: Option<Buffer>,
@@ -228,14 +228,18 @@ fn atlas_bind_group_1(
     label: &str,
 ) -> BindGroup {
     let tex_views = gpu_atlas.tex_array_views.as_ref().unwrap();
+    let pages = gpu_atlas.pages.as_ref().unwrap();
+    // Live page views + dummy fill to ATLAS_MAX_PAGES, bound as the `binding_array`s at 0 and 3.
+    let dist_refs = pages.dist_refs();
+    let mat_refs = pages.mat_refs();
     device.create_bind_group(
         label,
         layout,
         &BindGroupEntries::sequential((
-            gpu_atlas.dist_view.as_ref().unwrap(),
+            &dist_refs[..],
             gpu_atlas.sampler.as_ref().unwrap(),
             gpu_atlas.lookup_buffer.as_ref().unwrap().as_entire_buffer_binding(),
-            gpu_atlas.mat_view.as_ref().unwrap(),
+            &mat_refs[..],
             gpu_atlas.material_buffer.as_ref().unwrap().as_entire_buffer_binding(),
             gpu_atlas.tex_sampler.as_ref().unwrap(),
             &tex_views[0],
@@ -600,7 +604,6 @@ impl Plugin for SdfRenderPlugin {
             .add_systems(ExtractSchedule, bake::extract_brick_bakes)
             .init_resource::<pbr_textures::TextureStreamState>()
             .init_resource::<atlas_upload::LastAtlasGen>()
-            .init_resource::<atlas_upload::AtlasCapacity>()
             .init_resource::<atlas_upload::ChunkBufCapacity>()
             .init_resource::<bake::SdfBakeBuffers>()
             .add_systems(
@@ -1043,14 +1046,16 @@ fn init_sdf_pipeline(
         &BindGroupLayoutEntries::sequential(
             vis,
             (
-                // binding 0: distance atlas (R8Snorm, filterable)
-                texture_2d(TextureSampleType::Float { filterable: true }),
+                // binding 0: distance atlas — PAGED `binding_array` (R16Snorm pages, see atlas_pages)
+                texture_2d(TextureSampleType::Float { filterable: true })
+                    .count(core::num::NonZero::new(atlas_pages::ATLAS_MAX_PAGES).unwrap()),
                 // binding 1: nearest sampler
                 sampler(SamplerBindingType::Filtering),
                 // binding 2: chunk lookup table (sorted, binary-searched)
                 storage_buffer_read_only::<atlas_upload::GpuChunkLookup>(false),
-                // binding 3: per-palette-slot distance atlas (Rgba16Snorm, 4 slots)
-                texture_2d(TextureSampleType::Float { filterable: false }),
+                // binding 3: per-palette-slot distance atlas — PAGED `binding_array` (Rgba16Snorm pages)
+                texture_2d(TextureSampleType::Float { filterable: false })
+                    .count(core::num::NonZero::new(atlas_pages::ATLAS_MAX_PAGES).unwrap()),
                 // binding 4: material table (indexed by global material id)
                 storage_buffer_read_only::<GpuSdfMaterial>(false),
                 // binding 5: PBR-array filtering+mip sampler
@@ -1098,26 +1103,8 @@ fn init_sdf_pipeline(
         ..default()
     });
 
-    // Create minimal dummy atlas so bind group 1 is always valid
-    let dummy_tex = device.create_texture_with_data(
-        &queue,
-        &TextureDescriptor {
-            label: Some("sdf_dummy_atlas"),
-            size: Extent3d {
-                width: 1,
-                height: 1,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: TextureDimension::D2,
-            format: TextureFormat::R16Snorm,
-            usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST,
-            view_formats: &[],
-        },
-        TextureDataOrder::default(),
-        &[0u8, 0u8],
-    );
+    // The distance + material atlases are the paged pool (`AtlasPages`, created in the resource
+    // below); its own 1×1 dummy pages keep the `binding_array`s valid before the first bake.
     let dummy_sampler = device.create_sampler(&SamplerDescriptor {
         label: Some("sdf_dummy_atlas_sampler"),
         mag_filter: FilterMode::Nearest,
@@ -1144,28 +1131,6 @@ fn init_sdf_pipeline(
         contents: &[0u8; 80],
         usage: BufferUsages::STORAGE,
     });
-    // Matching dummy material atlas (Rgba16Snorm = 8 bytes/texel) so bind group 1 is
-    // always valid before the first bake.
-    let dummy_mat_tex = device.create_texture_with_data(
-        &queue,
-        &TextureDescriptor {
-            label: Some("sdf_dummy_mat_atlas"),
-            size: Extent3d {
-                width: 1,
-                height: 1,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: TextureDimension::D2,
-            format: TextureFormat::Rgba16Snorm,
-            usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST,
-            view_formats: &[],
-        },
-        TextureDataOrder::default(),
-        &[0u8; 8],
-    );
-
     // Dummy 1×1×1 PBR arrays + a filtering sampler so bind group 1 is valid before
     // the texture library uploads. Each is a D2Array view of one zeroed layer.
     let dummy_tex_views: [TextureView; super::edits::MATERIAL_TEX_MAPS] =
@@ -1215,10 +1180,8 @@ fn init_sdf_pipeline(
         current_defs: Vec::new(),
     });
     commands.insert_resource(SdfGpuAtlas {
-        dist_tex: None,
-        dist_view: Some(dummy_tex.create_view(&TextureViewDescriptor::default())),
-        mat_tex: None,
-        mat_view: Some(dummy_mat_tex.create_view(&TextureViewDescriptor::default())),
+        // Empty page pool (its own 1×1 dummies fill the binding array until the first bake grows it).
+        pages: Some(AtlasPages::new(&device)),
         sampler: Some(dummy_sampler),
         lookup_buffer: Some(dummy_lookup),
         chunk_tile_buffer: Some(dummy_chunk_tile),

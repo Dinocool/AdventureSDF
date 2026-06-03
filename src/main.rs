@@ -86,7 +86,13 @@ fn load_renderdoc() {
 /// correlate sampled cost to WGSL source lines.
 fn wgpu_settings() -> WgpuSettings {
     let settings = WgpuSettings {
-        features: WgpuFeatures::TEXTURE_COMPRESSION_BC | WgpuFeatures::TEXTURE_FORMAT_16BIT_NORM,
+        features: WgpuFeatures::TEXTURE_COMPRESSION_BC
+            | WgpuFeatures::TEXTURE_FORMAT_16BIT_NORM
+            // Bindless paged SDF atlas: the dist/mat atlases are a `binding_array` of page textures
+            // (sdf_render::render::atlas_pages), indexed per-fragment by the brick's page — needs the
+            // texture binding array + non-uniform indexing features. Universal on desktop Vulkan/DX12.
+            | WgpuFeatures::TEXTURE_BINDING_ARRAY
+            | WgpuFeatures::SAMPLED_TEXTURE_AND_STORAGE_BUFFER_ARRAY_NON_UNIFORM_INDEXING,
         ..default()
     };
     // Editor builds enable GPU timestamp + pipeline-statistics queries so `RenderDiagnosticsPlugin`

@@ -60,13 +60,11 @@ pub(super) struct ExtractedSdfAtlas {
     /// Whether the chunk lookup / tile-run buffers changed at all this frame. False on a
     /// texel-only re-bake — the lookup buffers are reused as-is.
     tables_dirty: bool,
-    texture_width: u32,
-    texture_height: u32,
-    /// Grow the atlas texture taller this frame: `prepare` recreates the dist+mat textures at
-    /// the new height and `copy_texture_to_texture`s the old content in (the GPU owns the
-    /// texels — there is no CPU upload), then the bake node fills the genuinely-new tiles. When
-    /// false, `prepare` keeps the existing textures and the bake node patches tiles in place.
-    realloc: bool,
+    /// Tile-rows the atlas must span this frame (= `high_water` rows). `prepare` grows the paged
+    /// pool ([`AtlasPages::ensure`]) to cover it — one new page per block, NO copy. The pool only
+    /// grows (tile origins are stable via the allocator's free-list), so this is monotonic until a
+    /// full eviction resets the allocator.
+    rows_needed: u32,
     dirty: bool,
 }
 
@@ -77,14 +75,6 @@ pub(super) struct ExtractedSdfAtlas {
 #[derive(Resource, Default)]
 pub(super) struct LastAtlasGen(u64);
 
-/// Render-world record of how many tile rows the persistent atlas texture currently
-/// spans. `extract_sdf_atlas` reads it to decide grow-vs-partial-upload; the texture
-/// only grows (never shrinks except on a full rebuild), so a tile origin assigned
-/// once stays valid until the next full bake.
-#[derive(Resource, Default)]
-pub(super) struct AtlasCapacity {
-    rows: u32,
-}
 
 /// Render-world record of the allocated chunk-lookup + tile-run buffer capacities (in rows /
 /// tile-run entries), so `prepare_sdf_atlas_gpu` knows when an incremental delta needs the
@@ -100,7 +90,6 @@ pub(super) struct ChunkBufCapacity {
 pub(super) fn extract_sdf_atlas(
     atlas: Extract<Res<SdfAtlas>>,
     mut last_gen: ResMut<LastAtlasGen>,
-    mut capacity: ResMut<AtlasCapacity>,
     mut chunk_cap: ResMut<ChunkBufCapacity>,
     mut commands: Commands,
 ) {
@@ -132,27 +121,13 @@ pub(super) fn extract_sdf_atlas(
         return;
     }
 
-    let edge = BRICK_EDGE as u32;
-    let tile_width = edge * edge; // 64
-    let texture_width = ATLAS_TILES_PER_ROW * tile_width;
-
-    // Tile origins come from the stable allocator (its high-water mark), NOT brick
-    // iteration order — so a re-baked brick keeps its sub-rect across frames.
+    // Tile origins come from the stable allocator (its high-water mark), NOT brick iteration order
+    // — so a re-baked brick keeps its sub-rect across frames. `prepare` grows the paged pool to
+    // cover this many tile-rows (one page per block, no copy); the pool only grows.
     let required_rows = atlas.tiles.high_water().div_ceil(ATLAS_TILES_PER_ROW).max(1);
-    let texture_height = required_rows * edge;
-
-    // Realloc when the atlas TEXTURE must grow taller (the GPU bake never shrinks it). This is now
-    // INDEPENDENT of the chunk table: a brick's `atlas_base` is derived from its stable tile index
-    // and is unaffected by the texture's height, so a texture grow never forces a table rebuild.
-    let realloc = required_rows > capacity.rows;
-    if realloc {
-        capacity.rows = required_rows;
-    }
 
     let mut extracted = ExtractedSdfAtlas {
-        texture_width,
-        texture_height,
-        realloc,
+        rows_needed: required_rows,
         dirty: true,
         ..Default::default()
     };
@@ -326,90 +301,27 @@ pub(super) fn prepare_sdf_atlas_gpu(
 
     if extracted.tables_dirty {
         if extracted.full_rebuild {
+            // Full directory rebuild: recreate + re-upload the whole dense per-LOD chunk buffer
+            // (R³·lod_count entries). Tagged so its cost/frequency is visible in a chrome trace —
+            // at large ring_bricks this buffer is big and a Full rebuild is a heavy upload.
+            let _span = info_span!("sdf_tables_full_rebuild").entered();
             upload_tables_full(&device, &mut gpu_atlas, &extracted);
         } else {
             upload_tables_delta(&queue, &gpu_atlas, &extracted);
         }
     }
 
-    if extracted.realloc {
-        // Grow the atlas taller. The GPU owns the texels (the CPU has only palette-only
-        // placeholders), so create EMPTY textures and copy any prior content into the taller
-        // replacement; the bake node fills the genuinely-new tiles this same frame. On the
-        // very first bake there's no prior texture — just the empty allocation, no copy. All
-        // atlas textures carry COPY_SRC (for this grow copy) + COPY_DST (the bake node's
-        // per-tile copy_buffer_to_texture).
-        let usage = TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST | TextureUsages::COPY_SRC;
-        let size = Extent3d {
-            width: extracted.texture_width,
-            height: extracted.texture_height,
-            depth_or_array_layers: 1,
-        };
-        let dist_tex = device.create_texture(&TextureDescriptor {
-            label: Some("sdf_dist_atlas"),
-            size,
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: TextureDimension::D2,
-            format: TextureFormat::R16Snorm,
-            usage,
-            view_formats: &[],
-        });
-        let mat_tex = device.create_texture(&TextureDescriptor {
-            label: Some("sdf_mat_atlas"),
-            size,
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: TextureDimension::D2,
-            format: TextureFormat::Rgba16Snorm,
-            usage,
-            view_formats: &[],
-        });
-        // Copy prior content (full width, old height) into the new taller textures, if any.
-        if let (Some(old_dist), Some(old_mat)) = (&gpu_atlas.dist_tex, &gpu_atlas.mat_tex) {
-            let old_h = old_dist.height().min(extracted.texture_height);
-            let mut encoder = device.create_command_encoder(&CommandEncoderDescriptor {
-                label: Some("sdf_atlas_grow_copy"),
-            });
-            let copy_extent = Extent3d {
-                width: extracted.texture_width,
-                height: old_h,
-                depth_or_array_layers: 1,
-            };
-            for (src, dst) in [(old_dist, &dist_tex), (old_mat, &mat_tex)] {
-                encoder.copy_texture_to_texture(
-                    TexelCopyTextureInfo {
-                        texture: src,
-                        mip_level: 0,
-                        origin: Origin3d::ZERO,
-                        aspect: TextureAspect::All,
-                    },
-                    TexelCopyTextureInfo {
-                        texture: dst,
-                        mip_level: 0,
-                        origin: Origin3d::ZERO,
-                        aspect: TextureAspect::All,
-                    },
-                    copy_extent,
-                );
-            }
-            queue.submit([encoder.finish()]);
-        }
-
-        gpu_atlas.dist_view = Some(dist_tex.create_view(&TextureViewDescriptor::default()));
-        gpu_atlas.mat_view = Some(mat_tex.create_view(&TextureViewDescriptor::default()));
-        gpu_atlas.dist_tex = Some(dist_tex);
-        gpu_atlas.mat_tex = Some(mat_tex);
-        if gpu_atlas.sampler.is_none() {
-            gpu_atlas.sampler = Some(device.create_sampler(&SamplerDescriptor {
-                label: Some("sdf_atlas_sampler"),
-                mag_filter: FilterMode::Nearest,
-                min_filter: FilterMode::Nearest,
-                mipmap_filter: FilterMode::Nearest,
-                ..default()
-            }));
+    // Grow the paged atlas pool to cover this frame's tile-rows. Adds whole PAGES as needed and
+    // copies NOTHING — existing pages (and the bricks in them) stay put. This is the fix for the
+    // former single-texture realloc, which recreated + full-copied the entire atlas on every
+    // row-boundary crossing (old+new alive ≈ 2× the resident bricks → ~6.8 GB VRAM spike, and
+    // O(N²) copy over a fill — the `sdf_atlas_realloc` trace hotspot). The per-frame bind group
+    // (`atlas_bind_group_1`) re-reads the page list, so a new page is picked up automatically.
+    if let Some(pages) = gpu_atlas.pages.as_mut() {
+        let _span = info_span!("sdf_atlas_ensure_pages").entered();
+        let before = pages.page_count();
+        if pages.ensure(&device, extracted.rows_needed) {
+            debug!("SDF atlas grew {before} -> {} page(s) (no copy)", pages.page_count());
         }
     }
-    // Non-grow frames: the existing textures are kept; the bake node patches changed tiles in
-    // place via copy_buffer_to_texture. Nothing to upload here.
 }
