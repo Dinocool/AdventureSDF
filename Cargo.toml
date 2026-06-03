@@ -71,6 +71,10 @@ bevy = { version = "0.18", default-features = false, features = [
 bevy_brp_extras = "0.18"
 bevy_rapier3d = "0.34.0"
 wgpu = "27"
+# Fast non-cryptographic hasher (the rustc compiler's own FxHash) for the hot integer-keyed maps
+# in the SDF bake path — brick/chunk/tile lookups per baked brick. std's SipHash is ~3–5× slower
+# and pointless for these small integer keys. See `atlas.rs` / `chunk.rs` `Fx*` aliases.
+rustc-hash = "2"
 bevy-inspector-egui = { version = "0.36", optional = true }
 bevy_egui = { version = "0.39", optional = true }
 # PBR texture-library loading: decode role-map source files (image) and read material

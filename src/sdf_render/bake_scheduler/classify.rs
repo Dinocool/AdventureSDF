@@ -6,6 +6,9 @@
 //! the verdicts on the main thread. Reaches shared types via `use super::*`.
 
 use super::*;
+// FxHash for the per-candidate classify maps: the resident-hash peek (one lookup per brick) and the
+// content-hash memo (one lookup per unique culled edit-set). Integer/byte keys; std SipHash is waste.
+use rustc_hash::FxHashMap;
 
 /// One candidate brick's classification, produced by [`classify_candidates`] (read-only, can run
 /// on a background task) and consumed by [`apply_verdicts`](super) (mutates the atlas, main thread only).
@@ -83,10 +86,10 @@ fn classify_chunk(
     edits: &[edits::ResolvedEdit],
     bvh: &bvh::Bvh,
     config: &SdfGridConfig,
-    hash_peek: &std::collections::HashMap<atlas::BrickKey, u64>,
+    hash_peek: &FxHashMap<atlas::BrickKey, u64>,
     scratch: &mut Vec<u32>,
     stack: &mut Vec<u32>,
-    hash_memo: &mut std::collections::HashMap<Box<[u32]>, u64>,
+    hash_memo: &mut FxHashMap<Box<[u32]>, u64>,
     out: &mut Vec<Verdict>,
 ) {
     for &(_ck, key) in chunk {
@@ -126,7 +129,7 @@ pub(crate) fn classify_candidates(
     edits: &[edits::ResolvedEdit],
     bvh: &bvh::Bvh,
     config: &SdfGridConfig,
-    hash_peek: &std::collections::HashMap<atlas::BrickKey, u64>,
+    hash_peek: &FxHashMap<atlas::BrickKey, u64>,
 ) -> Vec<Verdict> {
     if candidates.is_empty() {
         return Vec::new();
@@ -135,7 +138,7 @@ pub(crate) fn classify_candidates(
     let classify = |_idx: usize, chunk: &[(chunk::ChunkKey, atlas::BrickKey)]| -> Vec<Verdict> {
         let mut scratch: Vec<u32> = Vec::new();
         let mut stack: Vec<u32> = Vec::new();
-        let mut hash_memo: std::collections::HashMap<Box<[u32]>, u64> = std::collections::HashMap::new();
+        let mut hash_memo: FxHashMap<Box<[u32]>, u64> = FxHashMap::default();
         let mut out = Vec::with_capacity(chunk.len());
         classify_chunk(chunk, edits, bvh, config, hash_peek, &mut scratch, &mut stack, &mut hash_memo, &mut out);
         out
@@ -151,24 +154,6 @@ pub(crate) fn classify_candidates(
         .collect()
 }
 
-/// SERIAL classify of all candidates — for the background async task, where nesting the
-/// `ComputeTaskPool` scope (as `classify_candidates` does) inside an `AsyncComputeTaskPool` task
-/// would deadlock. Single-threaded is fine off the main thread: the whole point is to not block the
-/// frame, and one background thread chewing through the shell over a few frames is exactly the goal.
-pub(crate) fn classify_candidates_serial(
-    candidates: &[(chunk::ChunkKey, atlas::BrickKey)],
-    edits: &[edits::ResolvedEdit],
-    bvh: &bvh::Bvh,
-    config: &SdfGridConfig,
-    hash_peek: &std::collections::HashMap<atlas::BrickKey, u64>,
-) -> Vec<Verdict> {
-    let mut scratch: Vec<u32> = Vec::new();
-    let mut stack: Vec<u32> = Vec::new();
-    let mut hash_memo: std::collections::HashMap<Box<[u32]>, u64> = std::collections::HashMap::new();
-    let mut out = Vec::with_capacity(candidates.len());
-    classify_chunk(candidates, edits, bvh, config, hash_peek, &mut scratch, &mut stack, &mut hash_memo, &mut out);
-    out
-}
 
 /// Build the `hash_peek` snapshot: each candidate's resident `baked_hash` (absent → not resident).
 /// Lets [`classify_candidates`] do the content-hash skip without borrowing the atlas, so it can run
@@ -176,8 +161,8 @@ pub(crate) fn classify_candidates_serial(
 pub(super) fn snapshot_hash_peek(
     atlas: &SdfAtlas,
     candidates: &[(chunk::ChunkKey, atlas::BrickKey)],
-) -> std::collections::HashMap<atlas::BrickKey, u64> {
-    let mut map = std::collections::HashMap::with_capacity(candidates.len());
+) -> FxHashMap<atlas::BrickKey, u64> {
+    let mut map = FxHashMap::with_capacity_and_hasher(candidates.len(), Default::default());
     for &(_ck, key) in candidates {
         if let Some(b) = atlas.bricks.get(&key) {
             map.insert(key, b.baked_hash);

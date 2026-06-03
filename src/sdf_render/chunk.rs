@@ -18,7 +18,10 @@
 //! This module owns ONLY the coordinate math + table layout (pure, unit-tested). The
 //! per-brick texel storage (`atlas::TileAllocator`) and incremental upload are unchanged.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::BTreeSet;
+// FxHashMap for the live chunk-table maps mutated per baked brick (chunk→slot, chunk entries,
+// slot→chunk). Integer keys; FxHash over std SipHash cuts the per-brick set_brick/clear_brick cost.
+use rustc_hash::FxHashMap;
 
 use bevy::math::IVec3;
 
@@ -212,7 +215,7 @@ pub const SENTINEL_KEY: (u32, u32) = (u32::MAX, u32::MAX);
 /// tile-run buffer densely packed in chunk units (bounded by peak resident chunk count).
 #[derive(Default)]
 pub struct ChunkSlotAllocator {
-    slot_of: HashMap<ChunkKey, u32>,
+    slot_of: FxHashMap<ChunkKey, u32>,
     free: Vec<u32>,
     next: u32,
 }
@@ -263,10 +266,10 @@ struct ChunkEntry {
 #[derive(Default)]
 pub struct LiveChunkTables {
     slots: ChunkSlotAllocator,
-    chunks: HashMap<ChunkKey, ChunkEntry>,
+    chunks: FxHashMap<ChunkKey, ChunkEntry>,
     /// Reverse of each live chunk's tile-run slot → its key, so a dirty slot resolves to its
     /// region in O(1) (only live chunks; a freed slot is dropped — its region is never indexed).
-    slot_to_key: HashMap<u32, ChunkKey>,
+    slot_to_key: FxHashMap<u32, ChunkKey>,
     /// The DENSE per-LOD toroidal DIRECTORY = the GPU `chunk_buf`. `R³ × lod_count` fixed slots;
     /// chunk `c` lives at `lod·R³ + flatten(rem_euclid(c, R))`, with empty slots carrying the
     /// [`SENTINEL_KEY`] tag. Lazily sized on the first [`set_brick`](Self::set_brick) (when the
@@ -363,6 +366,13 @@ pub fn resolve_via_tables(
 }
 
 impl LiveChunkTables {
+    /// The resident chunk keys (one per chunk holding ≥1 brick) — O(chunks), for debug
+    /// stats/overlays. This is the table's own key set, so it's FAR cheaper than re-deriving the set
+    /// by scanning every resident BRICK (~261k on the stress scene = a ~7 ms/frame debug-panel hitch).
+    pub fn resident_chunk_keys(&self) -> impl Iterator<Item = ChunkKey> + '_ {
+        self.chunks.keys().copied()
+    }
+
     /// Mark a resident brick present in its chunk (insert or palette/tile change). `local` is the
     /// brick's 0..63 slot from [`chunk_of`]; `tile` is its packed atlas origin + palette. O(1): one
     /// directory slot write + a tile-run slot. `config` supplies `R`/`lod_count` to lazily size the
@@ -546,13 +556,10 @@ impl LiveChunkTables {
 
 /// The distinct non-empty chunks an atlas currently has resident — for the debug
 /// overlay (one wireframe box per chunk).
-pub fn resident_chunks(atlas: &SdfAtlas, config: &SdfGridConfig) -> Vec<ChunkKey> {
-    use std::collections::HashSet;
-    let mut set: HashSet<ChunkKey> = HashSet::new();
-    for key in atlas.bricks.keys() {
-        set.insert(chunk_of(*key, config).0);
-    }
-    set.into_iter().collect()
+pub fn resident_chunks(atlas: &SdfAtlas, _config: &SdfGridConfig) -> Vec<ChunkKey> {
+    // The live chunk table already IS the deduped resident-chunk set (O(chunks)); deriving it by
+    // scanning every resident brick (O(bricks)) made the SDF Accel debug panel a ~7 ms/frame hitch.
+    atlas.live_chunks.resident_chunk_keys().collect()
 }
 
 #[cfg(test)]

@@ -64,7 +64,10 @@ pub(super) fn chunk_in_window(c: IVec3, origin: IVec3, r: i32) -> bool {
     rel.x >= 0 && rel.y >= 0 && rel.z >= 0 && rel.x < r && rel.y < r && rel.z < r
 }
 
-/// Every chunk key in the `R³` window with corner `origin` at `lod`.
+/// Every chunk key in the `R³` window with corner `origin` at `lod`. Production no longer dirties
+/// the whole window (it derives dirt from edit footprints — see `dirty_edit_footprints`); the
+/// settle/cull unit tests still use it to dirty a known region directly.
+#[cfg(test)]
 pub(super) fn chunk_window_keys(origin: IVec3, r: i32, lod: u32) -> impl Iterator<Item = chunk::ChunkKey> {
     (0..r).flat_map(move |iz| {
         (0..r).flat_map(move |iy| {
@@ -146,6 +149,124 @@ pub(super) fn chunk_brick_keys(ck: chunk::ChunkKey, config: &SdfGridConfig) -> V
     keys
 }
 
+/// A per-chunk dirty-brick mask with every one of the chunk's `CHUNK_VOLUME` (64) local slots set.
+/// Used when a whole chunk is dirtied (a recenter-entered chunk, or a resident chunk re-examined on a
+/// structural rebake) — equivalent to the old whole-chunk `pending` membership.
+pub(super) const FULL_CHUNK_MASK: u64 = u64::MAX;
+
+/// The local 0..63 bit index of brick local-coord `(lx,ly,lz)` within its chunk — the SAME packing
+/// `chunk::chunk_of` produces (`z·16 + y·4 + x`), so a mask bit and a `chunk_of` local slot agree.
+#[inline]
+fn local_bit(lx: i32, ly: i32, lz: i32) -> u32 {
+    (lz * chunk::CHUNK_BRICKS * chunk::CHUNK_BRICKS + ly * chunk::CHUNK_BRICKS + lx) as u32
+}
+
+/// Invoke `f` for each brick key whose local slot is set in `mask` — the brick-granular counterpart of
+/// [`for_each_brick_key`]. Iterates only the set bits (a moved edit's thin footprint touches a handful),
+/// so an almost-empty mask costs almost nothing. Bit `i` ⇒ local `(x=i&3, y=(i>>2)&3, z=(i>>4)&3)`,
+/// matching [`local_bit`]/`chunk_of`.
+#[inline]
+pub(super) fn for_each_brick_key_masked(
+    ck: chunk::ChunkKey,
+    mask: u64,
+    config: &SdfGridConfig,
+    mut f: impl FnMut(atlas::BrickKey),
+) {
+    let s = config.cell_stride();
+    let c = chunk::CHUNK_BRICKS;
+    let base = ck.coord * c; // brick-index space
+    let mut bits = mask;
+    while bits != 0 {
+        let bit = bits.trailing_zeros() as i32;
+        let lx = bit & (c - 1);
+        let ly = (bit >> 2) & (c - 1);
+        let lz = (bit >> 4) & (c - 1);
+        let bi = base + IVec3::new(lx, ly, lz);
+        f(atlas::BrickKey::new(ck.lod, bi * s)); // back to coord space
+        bits &= bits - 1; // clear lowest set bit
+    }
+}
+
+/// The 64-bit mask of every local brick in the inclusive local box `[lo, hi]` (each axis
+/// `0..CHUNK_BRICKS`), bit `z·16 + y·4 + x` — the bricks a chunk-clipped AABB covers. A full box
+/// short-circuits to [`FULL_CHUNK_MASK`] so an interior chunk costs O(1).
+fn local_box_mask(lo: IVec3, hi: IVec3) -> u64 {
+    if lo == IVec3::ZERO && hi == IVec3::splat(chunk::CHUNK_BRICKS - 1) {
+        return FULL_CHUNK_MASK;
+    }
+    let mut m = 0u64;
+    for z in lo.z..=hi.z {
+        for y in lo.y..=hi.y {
+            for x in lo.x..=hi.x {
+                m |= 1u64 << local_bit(x, y, z);
+            }
+        }
+    }
+    m
+}
+
+/// The BRICK-granular footprint of `aabb` at `lod`: for every chunk the padded AABB reaches (clamped
+/// to the ring window `[win_origin, win_origin + r)`), the `u64` mask of exactly the bricks the AABB
+/// overlaps — NOT all 64 bricks of the chunk. The brick-resolution counterpart of
+/// [`chunks_in_aabb_windowed`]: the dirty set is the same world region, but tracked per brick so a
+/// moved edit re-classifies only the bricks it actually touches instead of every brick of every
+/// straddled chunk. The pad is identical to the chunk version, so the dirtied bricks are a strict
+/// SUBSET of that version's chunks' bricks — no brick that should bake is ever dropped.
+///
+/// Iterates CHUNKS (not bricks): interior chunks get [`FULL_CHUNK_MASK`] in O(1), only the boundary
+/// shell does per-brick bit work, so it is O(chunks) — a window-spanning AABB never enumerates its
+/// millions of bricks. (Used for the structural/cold dirty; the hot MOVE path uses the surface-pruned
+/// `dirty_moving_edit`, which dirties only the moving shell, not the solid interior.)
+pub(super) fn bricks_in_aabb_windowed(
+    config: &SdfGridConfig,
+    aabb: &bevy::math::bounding::Aabb3d,
+    lod: u32,
+    win_origin: IVec3,
+    r: i32,
+) -> Vec<(chunk::ChunkKey, u64)> {
+    let brick_world = config.brick_world_size(lod);
+    let pad = Vec3::splat(atlas::SNORM_CLAMP_DIST + brick_world);
+    let lo_w = Vec3::from(aabb.min) - pad;
+    let hi_w = Vec3::from(aabb.max) + pad;
+    let c = chunk::CHUNK_BRICKS;
+    // Brick-index range (per axis: the brick containing lo through the one containing hi), clamped to
+    // the window's brick range up front so a terrain-scale AABB costs O(window), not O(AABB).
+    let win_lo = win_origin * c;
+    let win_hi = (win_origin + IVec3::splat(r)) * c - IVec3::ONE;
+    let bi_lo = ivec_floor_div(lo_w, brick_world).max(win_lo);
+    let bi_hi = ivec_floor_div(hi_w, brick_world).min(win_hi);
+    if bi_lo.x > bi_hi.x || bi_lo.y > bi_hi.y || bi_lo.z > bi_hi.z {
+        return Vec::new();
+    }
+    // Enumerate the CHUNKS the brick-range spans; clip each to the range for its mask.
+    let ci_lo = IVec3::new(bi_lo.x.div_euclid(c), bi_lo.y.div_euclid(c), bi_lo.z.div_euclid(c));
+    let ci_hi = IVec3::new(bi_hi.x.div_euclid(c), bi_hi.y.div_euclid(c), bi_hi.z.div_euclid(c));
+    let mut out: Vec<(chunk::ChunkKey, u64)> = Vec::new();
+    let last = IVec3::splat(c - 1);
+    for cz in ci_lo.z..=ci_hi.z {
+        for cy in ci_lo.y..=ci_hi.y {
+            for cx in ci_lo.x..=ci_hi.x {
+                let cc = IVec3::new(cx, cy, cz);
+                let chunk_b0 = cc * c; // this chunk's brick-(0,0,0) index
+                let llo = bi_lo.max(chunk_b0) - chunk_b0; // local box lo, 0..c-1
+                let lhi = bi_hi.min(chunk_b0 + last) - chunk_b0; // local box hi
+                out.push((chunk::ChunkKey::new(lod, cc), local_box_mask(llo, lhi)));
+            }
+        }
+    }
+    out
+}
+
+/// Per-axis `floor(v / d)` as an `IVec3` — the brick index containing each world coordinate.
+#[inline]
+pub(super) fn ivec_floor_div(v: Vec3, d: f32) -> IVec3 {
+    IVec3::new(
+        (v.x / d).floor() as i32,
+        (v.y / d).floor() as i32,
+        (v.z / d).floor() as i32,
+    )
+}
+
 /// Allocation-free counterpart of [`chunk_brick_keys`]: invoke `f` for each of a chunk's 64
 /// brick keys without building a Vec. The bake emit's serial gather/apply loops run this over
 /// the entire dirty set (thousands of chunks on a terrain-scale heightmap move), so avoiding a
@@ -176,6 +297,10 @@ pub(super) fn for_each_brick_key(ck: chunk::ChunkKey, config: &SdfGridConfig, mu
 /// work O(AABB ∩ window) ≤ r³ instead of O(AABB volume) — the fix for the multi-hundred-ms
 /// `schedule_bakes` freeze when a heightmap edit changes (it used to allocate + enumerate the
 /// entire terrain-sized chunk volume per LOD, then discard 99.99% via `chunk_in_window`).
+///
+/// Production now dirties at BRICK granularity (see [`bricks_in_aabb_windowed`]); this whole-chunk
+/// version is retained for the settle/cull unit tests + the small-edit perf scenario.
+#[cfg(test)]
 pub(super) fn chunks_in_aabb_windowed(
     config: &SdfGridConfig,
     aabb: &bevy::math::bounding::Aabb3d,
