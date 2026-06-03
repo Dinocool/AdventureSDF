@@ -575,6 +575,40 @@ fn dist_to_chunk_exit_lod(p: vec3<f32>, dir: vec3<f32>, lod: u32) -> f32 {
     return t;
 }
 
+// Occupancy-aware brick-DDA WITHIN one resident chunk. When the ray is in empty space yet inside an
+// OCCUPIED (resident) chunk — air ABOVE the terrain that lives in the same chunk as the surface
+// bricks below it — plain `dist_to_brick_exit_lod` crawls ONE brick per outer march step (the
+// "horizon crawl" that exhausts the step budget on grazing rays). This walks the ray across the run
+// of CONSECUTIVE EMPTY bricks in one shot, reading only the chunk's 64-bit occupancy mask (no field
+// samples), and returns the distance to the near face of the next OCCUPIED brick, or to the chunk
+// exit if none lie ahead on the ray (the caller re-resolves there, where the hierarchical chunk-DDA
+// can skip further). Bounded to a chunk diagonal (≤ 3·CHUNK_BRICKS bricks).
+//
+// SAFE because the caller invokes it on the COARSEST resident chunk at `p`: a brick empty at a coarse
+// LOD is empty at ALL finer LODs (the same geometry bakes at every level, so present-at-fine ⇒
+// present-at-coarse ⇒ absent-at-coarse ⇒ absent-at-fine), so skipping an empty coarse brick can never
+// step over a finer-LOD surface.
+fn dist_over_empty_bricks(chunk: ChunkLookup, p: vec3<f32>, dir: vec3<f32>, lod: u32) -> f32 {
+    let key_hi = chunk.key_hi;
+    let key_lo = chunk.key_lo;
+    let eps = voxel_size_at(lod) * 0.01;
+    var adv = 0.0;
+    let max_bricks = 3u * u32(CHUNK_BRICKS);
+    for (var i = 0u; i < max_bricks; i = i + 1u) {
+        let q = p + dir * (adv + eps);
+        let coord = world_to_brick_lod(q, lod);
+        let qkey = abs_chunk_key(coord, lod);
+        if (qkey.x != key_hi || qkey.y != key_lo) {
+            return adv;                        // left this chunk → caller re-resolves at the next one
+        }
+        if (brick_in_chunk(chunk, coord).found) {
+            return adv;                        // occupied brick ahead → caller sphere-traces it
+        }
+        adv = adv + dist_to_brick_exit_lod(q, dir, lod) + eps;   // empty brick → step over it
+    }
+    return adv;
+}
+
 // True if the chunk containing brick `coord` at `lod` is inside that LOD's resident ring
 // window. Mirrors bake_scheduler::ring_chunk_origin EXACTLY (camera chunk minus half-ring,
 // snapped to the recenter_snap_chunks lattice) — must match or the chunk-DDA skip will
