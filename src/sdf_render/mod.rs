@@ -170,6 +170,11 @@ pub struct SdfRaymarchParams {
     /// serving LOD toward its coarser neighbour, so the surface morphs smoothly across the
     /// ring boundary instead of snapping (removes the visible LOD pop/seam). 0 = disabled
     /// (hard LOD seams, the original behaviour). Tunable live via the editor raymarch panel.
+    ///
+    /// Default 0 (OFF): with bake-time curvature compensation + the 256 ring, the per-LOD surface
+    /// shrink is small enough that the morph isn't needed — and the distance-driven morph itself
+    /// coarsened the surface INSIDE a level's ring (it shrank MORE than the raw LOD). Re-enable via
+    /// the slider if a hard LOD seam shows up at a transition.
     pub lod_blend_band: f32,
     /// Soft-shadow penumbra hardness `k` (the IQ `min(k·d/t)` factor in `sdf::shadows`). LOWER =
     /// softer/wider penumbra, which blurs the coarse-LOD brick faceting AND softens the
@@ -195,7 +200,7 @@ impl Default for SdfRaymarchParams {
             sdf_eps: 0.001,
             cone_scale: 1.0,
             over_relax: 1.6,
-            lod_blend_band: 0.2,
+            lod_blend_band: 0.0, // OFF — LODs are good enough without the morph (see field doc)
             // Soft-shadow penumbra hardness `k` (`sdf::shadows`): 0 = HARD shadow (binary
             // occlusion, no penumbra — artifact-free); >0 = cone-traced soft, HIGHER = tighter
             // (less near-miss darkening). A tight default (64) stays clean; the soft end (low k)
