@@ -85,6 +85,7 @@ fn resolve_materials(
     mut library: ResMut<MaterialTextureLibrary>,
     mut registry: ResMut<MaterialRegistry>,
 ) {
+    let _span = crate::instrument::span("material compile");
     // Dirty if: any volume's source changed, a sourced volume was removed, a material/texture
     // asset event fired, or the registry is still unpopulated (first run).
     let asset_changed = mat_events.read().count() > 0 || tex_events.read().count() > 0;

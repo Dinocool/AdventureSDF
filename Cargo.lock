@@ -110,6 +110,7 @@ dependencies = [
  "ron",
  "rustc-hash 2.1.2",
  "serde",
+ "sysinfo",
  "tracing-chrome",
  "wgpu",
 ]
