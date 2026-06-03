@@ -227,15 +227,16 @@ pub const DEFAULT_LOD_COUNT: u32 = 8;
 /// `L` covers `ring_bricks · cell_stride · voxel_size · 2^L` world units per axis, so
 /// the same count reaches twice as far each coarser level (the clipmap nesting). Must be
 /// a multiple of [`chunk::CHUNK_BRICKS`] (= 4; the ring is enumerated in whole chunks).
-/// 128 = 4·32: each LOD window spans twice as many bricks per axis as before, so every level
+/// 256 = 4·64: each LOD window spans twice as many bricks per axis as before, so every level
 /// reaches 2x further at the SAME voxel resolution — distant geometry is served a finer LOD
-/// (eases the far-LOD shrink), at the cost of a larger resident shell (the sparse cull still
-/// keeps only non-empty bricks). Must be a multiple of `CHUNK_BRICKS` (= 4).
-pub const DEFAULT_RING_BRICKS: u32 = 128;
+/// (eases the far-LOD shrink), at the cost of a larger resident shell. The sparse cull still
+/// keeps only non-empty bricks, so resident bricks grow ~with surface AREA (≈4×), but the dense
+/// per-LOD chunk directory grows ~with VOLUME (≈8×). Must be a multiple of `CHUNK_BRICKS` (= 4).
+pub const DEFAULT_RING_BRICKS: u32 = 256;
 /// Default ring-recenter hysteresis, in whole chunks (see
-/// [`SdfGridConfig::recenter_snap_chunks`]). With `CHUNK_BRICKS = 4` and a 128-brick ring
-/// (32 chunks/axis), snapping to 2 chunks means the window recenters every ~5.6 m at LOD
-/// 0 instead of every brick crossing, while still keeping the camera 14+ chunks from any
+/// [`SdfGridConfig::recenter_snap_chunks`]). With `CHUNK_BRICKS = 4` and a 256-brick ring
+/// (64 chunks/axis), snapping to 2 chunks means the window recenters every ~5.6 m at LOD
+/// 0 instead of every brick crossing, while still keeping the camera 30+ chunks from any
 /// window edge.
 pub const DEFAULT_RECENTER_SNAP_CHUNKS: i32 = 2;
 
