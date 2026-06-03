@@ -36,13 +36,13 @@ const NODE_CATALOG: &[NodeCategory] = &[
         types: &[
             NodeType {
                 label: "Node3D",
-                icon: "✦",
+                icon: egui_phosphor::regular::CUBE_TRANSPARENT,
                 hint: "Empty spatial node — a transform-only group / locator.",
                 spawn: spawn_empty_node,
             },
             NodeType {
                 label: "Camera",
-                icon: "🎥",
+                icon: egui_phosphor::regular::VIDEO_CAMERA,
                 hint: "Scene camera node (serialized); the editor can look through it.",
                 spawn: spawn_camera,
             },
@@ -53,13 +53,13 @@ const NODE_CATALOG: &[NodeCategory] = &[
         types: &[
             NodeType {
                 label: "Sphere",
-                icon: "◆",
+                icon: egui_phosphor::regular::CUBE,
                 hint: "SDF sphere volume.",
                 spawn: |w| spawn_sdf_primitive(w, SdfPrimitive::Sphere { radius: 0.5 }),
             },
             NodeType {
                 label: "Box",
-                icon: "◆",
+                icon: egui_phosphor::regular::CUBE,
                 hint: "SDF box volume.",
                 spawn: |w| {
                     spawn_sdf_primitive(w, SdfPrimitive::Box {
@@ -69,7 +69,7 @@ const NODE_CATALOG: &[NodeCategory] = &[
             },
             NodeType {
                 label: "Torus",
-                icon: "◆",
+                icon: egui_phosphor::regular::CUBE,
                 hint: "SDF torus volume.",
                 spawn: |w| {
                     spawn_sdf_primitive(w, SdfPrimitive::Torus {
@@ -80,7 +80,7 @@ const NODE_CATALOG: &[NodeCategory] = &[
             },
             NodeType {
                 label: "Capsule",
-                icon: "◆",
+                icon: egui_phosphor::regular::CUBE,
                 hint: "SDF capsule volume.",
                 spawn: |w| {
                     spawn_sdf_primitive(w, SdfPrimitive::Capsule {
@@ -91,7 +91,7 @@ const NODE_CATALOG: &[NodeCategory] = &[
             },
             NodeType {
                 label: "Cylinder",
-                icon: "◆",
+                icon: egui_phosphor::regular::CUBE,
                 hint: "SDF cylinder volume.",
                 spawn: |w| {
                     spawn_sdf_primitive(w, SdfPrimitive::Cylinder {
@@ -107,13 +107,13 @@ const NODE_CATALOG: &[NodeCategory] = &[
         types: &[
             NodeType {
                 label: "Directional Light",
-                icon: "☀",
+                icon: egui_phosphor::regular::SUN,
                 hint: "Sun-style directional light (editor gizmo shows its direction).",
                 spawn: spawn_directional_light,
             },
             NodeType {
                 label: "Point Light",
-                icon: "◉",
+                icon: egui_phosphor::regular::LIGHTBULB,
                 hint: "Omnidirectional point light; drag the ring handle to set its radius.",
                 spawn: spawn_point_light,
             },

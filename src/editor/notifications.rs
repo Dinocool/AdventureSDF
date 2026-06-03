@@ -29,11 +29,12 @@ pub enum NotifyKind {
 impl NotifyKind {
     /// Leading icon glyph.
     fn icon(self) -> &'static str {
+        use egui_phosphor::regular as icon;
         match self {
-            NotifyKind::Info => "\u{2139}",    // ℹ
-            NotifyKind::Success => "\u{2714}", // ✔
-            NotifyKind::Warning => "\u{26A0}", // ⚠
-            NotifyKind::Error => "\u{2716}",   // ✖
+            NotifyKind::Info => icon::INFO,
+            NotifyKind::Success => icon::CHECK_CIRCLE,
+            NotifyKind::Warning => icon::WARNING,
+            NotifyKind::Error => icon::X_CIRCLE,
         }
     }
 
@@ -152,7 +153,7 @@ pub fn notifications_ui(world: &mut World, ctx: &egui::Context) {
                                 ui.with_layout(
                                     egui::Layout::right_to_left(egui::Align::Center),
                                     |ui| {
-                                        if ui.small_button("\u{2716}").clicked() {
+                                        if ui.small_button(egui_phosphor::regular::X).clicked() {
                                             dismiss = Some(*id);
                                         }
                                     },

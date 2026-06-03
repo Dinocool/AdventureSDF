@@ -182,7 +182,7 @@ impl ThumbnailProvider for MaterialThumbnailProvider {
 
     fn thumbnail(&self, world: &mut World, path: &Path) -> Thumbnail {
         let Some(asset_path) = crate::editor::fs_util::relative_to_assets(path) else {
-            return Thumbnail::Icon("\u{1F535}");
+            return Thumbnail::Icon(egui_phosphor::regular::CIRCLE);
         };
         let source = ThumbSource::Material(world.resource::<AssetServer>().load(asset_path));
         ensure_slot(world, path, source)
@@ -200,7 +200,7 @@ impl ThumbnailProvider for PbrTextureThumbnailProvider {
 
     fn thumbnail(&self, world: &mut World, path: &Path) -> Thumbnail {
         let Some(asset_path) = crate::editor::fs_util::relative_to_assets(path) else {
-            return Thumbnail::Icon("\u{1F535}");
+            return Thumbnail::Icon(egui_phosphor::regular::CIRCLE);
         };
         let source = ThumbSource::PbrTexture(world.resource::<AssetServer>().load(asset_path));
         ensure_slot(world, path, source)

@@ -20,10 +20,12 @@ pub(crate) fn viewport_toolbar(world: &mut World, ui: &mut egui::Ui) {
                 let fps = world.resource::<SdfCameraMode>().fps;
 
                 // Orbit / FPS segmented toggle.
-                if ui.selectable_label(!fps, "🛰 Orbit").clicked() && fps {
+                let orbit = format!("{} Orbit", egui_phosphor::regular::ARROWS_CLOCKWISE);
+                if ui.selectable_label(!fps, orbit).clicked() && fps {
                     world.resource_mut::<SdfCameraMode>().fps = false;
                 }
-                if ui.selectable_label(fps, "🎮 FPS").clicked() && !fps {
+                let fps_label = format!("{} FPS", egui_phosphor::regular::GAME_CONTROLLER);
+                if ui.selectable_label(fps, fps_label).clicked() && !fps {
                     // Seed the free-fly yaw/pitch from the orbit view so toggling in
                     // doesn't snap the camera to a new orientation.
                     // Orbit stores the target→camera offset (view looks along -dir),

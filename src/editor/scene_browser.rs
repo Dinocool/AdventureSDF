@@ -88,7 +88,7 @@ fn file_browser_body(
     let up_enabled = can_go_up(dir);
     ui.horizontal(|ui| {
         if ui
-            .add_enabled(up_enabled, egui::Button::new("\u{2B11} Up"))
+            .add_enabled(up_enabled, egui::Button::new(format!("{} Up", egui_phosphor::regular::ARROW_UP)))
             .clicked()
             && let Some(parent) = dir.parent()
         {
@@ -105,7 +105,7 @@ fn file_browser_body(
     scroll.show(ui, |ui| {
         for d in dirs {
             if ui
-                .button(format!("\u{1F4C1} {}", file_name_str(d)))
+                .button(format!("{} {}", egui_phosphor::regular::FOLDER, file_name_str(d)))
                 .clicked()
             {
                 *navigate_to = Some(d.clone());
@@ -118,7 +118,7 @@ fn file_browser_body(
             let name = file_name_str(s);
             let selected = selected_name == Some(name.as_str());
             if ui
-                .selectable_label(selected, format!("\u{1F4C4} {name}"))
+                .selectable_label(selected, format!("{} {name}", egui_phosphor::regular::FILE))
                 .clicked()
             {
                 on_scene_click(&name, s);
@@ -247,7 +247,7 @@ pub fn save_scene_dialog_ui(world: &mut World, ctx: &egui::Context) {
             });
 
             let dest = scene_dest(&dir, &filename);
-            ui.weak(format!("\u{2192} {}", dest.display()));
+            ui.weak(format!("{} {}", egui_phosphor::regular::ARROW_RIGHT, dest.display()));
             ui.separator();
             ui.horizontal(|ui| {
                 let valid = !filename.trim().is_empty();

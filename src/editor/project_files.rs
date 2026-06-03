@@ -38,7 +38,8 @@ fn dir_tree(ui: &mut egui::Ui, dir: &Path, nav_to: &mut Option<PathBuf>) {
 
     for d in dirs {
         let name = crate::editor::fs_util::file_name_str(&d);
-        let header = egui::CollapsingHeader::new(format!("\u{1F4C1} {name}"))
+        let header =
+            egui::CollapsingHeader::new(format!("{} {name}", egui_phosphor::regular::FOLDER))
             .id_salt(&d)
             .show(ui, |ui| {
                 dir_tree(ui, &d, nav_to);

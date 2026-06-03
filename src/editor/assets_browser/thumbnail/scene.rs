@@ -97,7 +97,7 @@ impl ThumbnailProvider for SceneThumbnailProvider {
             // Not captured yet: keep showing the previous image if we have one, else the icon.
             None => match world.resource::<SceneThumbnailCache>().entries.get(&key) {
                 Some(slot) => Thumbnail::Texture(slot.tex_id),
-                None => Thumbnail::Icon("\u{1F3AC}"),
+                None => Thumbnail::Icon(egui_phosphor::regular::FILM_SLATE),
             },
         }
     }

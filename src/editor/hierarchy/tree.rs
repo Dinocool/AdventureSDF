@@ -24,12 +24,13 @@ pub(super) enum NodeKind {
 
 impl NodeKind {
     pub(super) fn icon(self) -> &'static str {
+        use egui_phosphor::regular as icon;
         match self {
-            NodeKind::Sdf => "◆",
-            NodeKind::Light => "☀",
-            NodeKind::Camera => "▣",
-            NodeKind::Spatial => "✦",
-            NodeKind::Node => "•",
+            NodeKind::Sdf => icon::CUBE,
+            NodeKind::Light => icon::LIGHTBULB,
+            NodeKind::Camera => icon::VIDEO_CAMERA,
+            NodeKind::Spatial => icon::CUBE_TRANSPARENT,
+            NodeKind::Node => icon::DOT_OUTLINE,
         }
     }
 }
