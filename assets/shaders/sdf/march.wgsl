@@ -59,6 +59,13 @@ struct MarchQuality {
 // Raise it if LOD-seam artifacts appear; lower it for a slightly cheaper march.
 const NEAR_SURFACE_VOXELS: f32 = 3.0;
 
+// Ray-differential LOD floor: sample the SDF no finer than this many pixel-footprints per voxel.
+// The clipmap rings are tuned to ~1 voxel/pixel, so 1.0 would be a no-op; >1 samples COARSER than a
+// pixel on far/grazing rays, merging the distant dense object field into fewer, bigger blobs so a
+// horizon ray skims far fewer voxels (the red-band fix). Sub-pixel ⇒ ~quality-neutral; coarser ⇒
+// never overshoots (safe). Higher = cheaper but blockier far horizon. Tune with the camera FOV/res.
+const LOD_PIXEL_BIAS: f32 = 2.0;
+
 
 // Result of the LOD cross-fade morph at a point `p`. `d_eff` is the DISTANCE the surface is
 // rendered from (the camera-distance-driven continuous-LOD blend of two bracketing levels);
@@ -194,11 +201,18 @@ fn raymarch(origin: vec3<f32>, dir: vec3<f32>, start_t: f32, q: MarchQuality) ->
 
         var scene = resolve_march(p, &cache);
 
-        // Quality LOD floor (secondary rays). If this ray must render no finer than
-        // `q.lod_floor` and `resolve_march` served a finer brick, re-resolve at the floor
-        // (degrading coarser-only). Primary rays pass 0 = no-op.
-        if (q.lod_floor > 0u && scene.in_brick && scene.lod < q.lod_floor) {
-            let coarse = sample_level_at_or_coarser(p, q.lod_floor, &cache);
+        // Quality LOD floor. (a) Secondary rays clamp to `q.lod_floor`. (b) RAY-DIFFERENTIAL floor:
+        // never sample FINER than the pixel footprint — the LOD whose voxel ≈ `cone·t`. With the wide
+        // clipmap rings the finest ring reaches far, so a distant GRAZING ray would otherwise skim the
+        // horizon at the FINE-voxel scale (tiny steps → step-budget blowout — the red horizon band).
+        // Flooring the sampled LOD to ~1 voxel/pixel makes far/grazing rays take coarse-voxel-sized
+        // steps; the far geometry is sub-pixel anyway, so it's quality-neutral, and coarser sampling
+        // never overshoots (safe). Near geometry (cone·t < base voxel ⇒ cone_lod 0) is untouched/sharp.
+        let cone_t = CONE * t;
+        let cone_lod = u32(clamp(ceil(log2(max(cone_t * LOD_PIXEL_BIAS / camera.lod_params.z, 1.0))), 0.0, f32(lod_count() - 1u)));
+        let floor_lod = max(q.lod_floor, cone_lod);
+        if (floor_lod > 0u && scene.in_brick && scene.lod < floor_lod) {
+            let coarse = sample_level_at_or_coarser(p, floor_lod, &cache);
             if (coarse.in_brick) {
                 scene.dist = coarse.dist;
                 scene.lod = coarse.lod;
@@ -243,7 +257,7 @@ fn raymarch(origin: vec3<f32>, dir: vec3<f32>, start_t: f32, q: MarchQuality) ->
         let lod = scene.lod;
         let voxel_size = voxel_size_at(lod);
         let d = scene.dist;                          // trilinear SDF at p
-        let cone = CONE * t;                         // pixel-cone half-width here
+        let cone = cone_t;                           // pixel-cone half-width here (= CONE·t)
 
         // --- LOD cross-fade: DISTANCE-driven continuous-LOD morph ----------------------
         // Render the field at a CONTINUOUS LOD `lodc` set purely by camera distance, NOT by
