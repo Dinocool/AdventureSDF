@@ -313,19 +313,6 @@ fn update_atlas_stats(mut stats: ResMut<SdfAtlasStats>, atlas: Res<SdfAtlas>) {
     stats.dirty = atlas.rebake_all || !atlas.gpu_baked_tiles.is_empty();
 }
 
-/// Human-readable byte size (B / KB / MB).
-fn fmt_bytes(bytes: u64) -> String {
-    const KB: u64 = 1024;
-    const MB: u64 = 1024 * 1024;
-    if bytes >= MB {
-        format!("{:.2} MB", bytes as f64 / MB as f64)
-    } else if bytes >= KB {
-        format!("{:.1} KB", bytes as f64 / KB as f64)
-    } else {
-        format!("{bytes} B")
-    }
-}
-
 /// Distinct color per object id (golden-ratio hue spacing). id 0 = dark gray.
 fn object_color(id: u8) -> [u8; 3] {
     if id == 0 {
@@ -528,42 +515,6 @@ fn draw_bounds(
 }
 
 // --- Panels ---
-
-/// Render the SDF atlas stats (brick/texel counts, dirty state, GPU-memory breakdown).
-/// Used by the Performance panel — the SDF Atlas got its own tab removed and its textured
-/// preview dropped; only these live stats remain.
-pub fn atlas_stats_ui(stats: &SdfAtlasStats, ui: &mut egui::Ui) {
-    ui.label(format!("Bricks: {}", stats.total_bricks));
-    ui.label(format!(
-        "Texels: {}x{}",
-        stats.atlas_width, stats.atlas_height
-    ));
-    let (color, text) = if stats.dirty {
-        (egui::Color32::YELLOW, "DIRTY")
-    } else {
-        (egui::Color32::GREEN, "CLEAN")
-    };
-    ui.colored_label(color, text);
-
-    ui.separator();
-    ui.strong(format!("GPU memory: {}", fmt_bytes(stats.total_bytes)));
-    egui::Grid::new("sdf_atlas_mem")
-        .num_columns(2)
-        .show(ui, |ui| {
-            ui.label("Distance (R16)");
-            ui.label(fmt_bytes(stats.dist_bytes));
-            ui.end_row();
-            ui.label("Mat lo (Rgba16)");
-            ui.label(fmt_bytes(stats.object_bytes));
-            ui.end_row();
-            ui.label("Mat hi (Rgba16)");
-            ui.label(fmt_bytes(stats.blend_bytes));
-            ui.end_row();
-            ui.label("Lookup buffer");
-            ui.label(fmt_bytes(stats.lookup_bytes));
-            ui.end_row();
-        });
-}
 
 /// Combined render-tuning panel: debug-overlay selection (dropdowns + diagnostics)
 /// plus the raymarch quality sliders. One tab for "how the SDF is drawn".

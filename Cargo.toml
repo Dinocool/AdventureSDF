@@ -22,6 +22,7 @@ editor = [
     # in Perfetto / chrome://tracing, or hand the file to Claude to rank hot spans).
     "bevy/trace",
     "dep:tracing-chrome",
+    "dep:sysinfo",
 ]
 # In-app RenderDoc capture (F5), OFF by default. Implies `editor` (the capture plugin lives
 # there). `renderdoc` grabs the in-application API handle; `libloading` preloads
@@ -97,6 +98,10 @@ tracing-chrome = { version = "0.7", optional = true }
 # Phosphor icon font for the editor toolbar (egui 0.33-compatible). Installed into the
 # egui context at startup; gives named glyph constants so toolbar buttons show real icons.
 egui-phosphor = { version = "0.11", optional = true }
+# Host/process RAM sampling for the Performance panel's memory breakdown (editor only). We
+# query it directly rather than via Bevy's SystemInformationDiagnosticsPlugin, which only
+# exposes host memory as a percentage (no byte total) — we want a byte-level breakdown.
+sysinfo = { version = "0.37", optional = true, default-features = false, features = ["system"] }
 # egui's 2D tessellation (filled, antialiased shapes) for the in-tree gizmo overlay
 # renderer. Pinned to 0.33 to reuse the copies bevy_egui 0.39 (egui 0.33) pulls in.
 epaint = "0.33"

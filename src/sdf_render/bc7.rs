@@ -49,7 +49,7 @@ fn bc7_level_bytes(w: u32, h: u32) -> usize {
 }
 
 /// Total BC7 bytes for one layer's mip chain at square `size` (stops at 4×4).
-fn bc7_layer_bytes(size: u32) -> usize {
+pub(crate) fn bc7_layer_bytes(size: u32) -> usize {
     let mut total = 0;
     let mut s = size;
     for _ in 0..mip_count(size) {

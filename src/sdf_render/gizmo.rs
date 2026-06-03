@@ -552,6 +552,7 @@ pub fn gizmo_update(
     globals: Query<&GlobalTransform>,
     parents: Query<&ChildOf>,
 ) {
+    let _span = crate::instrument::span("gizmo");
     // A node-gizmo interaction earlier in the `Last` chain (e.g. the point-light radius
     // drag) may have already claimed this frame's click. If so, yield: don't reset the
     // claim and don't process the transform handles, so the two never fight over a press.
@@ -700,6 +701,7 @@ pub fn draw_gizmo(
     parents: Query<&ChildOf>,
     globals: Query<&GlobalTransform>,
 ) {
+    let _span = crate::instrument::span("gizmo draw");
     draw.0.clear();
 
     let Some(entity) = selection.entity else {
