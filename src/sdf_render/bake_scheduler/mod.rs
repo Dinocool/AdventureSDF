@@ -454,6 +454,7 @@ pub fn schedule_bakes(
     mut baked_dbg: ResMut<super::BakedBrickDebug>,
     time: Res<Time>,
 ) {
+    let _span = crate::instrument::span("bake schedule");
     // Diagnostic: prune baked-brick markers older than the fade window (entries ACCUMULATE across
     // frames so they can fade out — see BakedBrickDebug); `emit_gpu_bakes` appends new ones.
     let now = time.elapsed_secs();
