@@ -11,9 +11,9 @@ use std::path::PathBuf;
 
 use bevy::prelude::*;
 use bevy_egui::egui;
-use egui_dock::{DockState, NodeIndex, SurfaceIndex, TabIndex};
+use egui_dock::{DockState, SurfaceIndex, TabIndex};
 
-use super::dock::{EditorDockState, EditorTab};
+use super::dock::{add_panel_tab, is_center_tab, EditorDockState, EditorTab};
 use super::panels::{DebugPanelRegistry, DockSide};
 use super::scene_tabs;
 
@@ -63,7 +63,7 @@ pub fn apply_layout(world: &mut World, ron: &str) -> bool {
 fn set_scene_box_tabs(state: &mut DockState<EditorTab>, tabs: Vec<EditorTab>, active: usize) {
     for node in state.main_surface_mut().iter_mut() {
         if let Some(leaf) = node.get_leaf_mut()
-            && leaf.tabs.iter().any(scene_tabs::is_center_tab)
+            && leaf.tabs.iter().any(is_center_tab)
         {
             leaf.tabs = tabs.clone();
             leaf.active = TabIndex(active.min(leaf.tabs.len().saturating_sub(1)));
@@ -240,44 +240,6 @@ pub fn set_panel_present(world: &mut World, tab: EditorTab, side: DockSide, pres
         return;
     }
     add_panel_tab(&mut dock, tab, side);
-}
-
-/// Leaf that anchors a given side (one of its shell panels), so re-shown panels group with
-/// their siblings instead of spawning a fresh region.
-fn side_anchor_leaf(dock: &EditorDockState, side: DockSide) -> Option<NodeIndex> {
-    let anchors: &[EditorTab] = match side {
-        DockSide::Left => &[EditorTab::Hierarchy, EditorTab::ProjectFiles],
-        DockSide::Right => &[EditorTab::Inspector],
-        DockSide::Bottom => &[EditorTab::AssetsDrawer],
-    };
-    anchors
-        .iter()
-        .find_map(|t| dock.state.find_main_surface_tab(t).map(|(n, _)| n))
-}
-
-/// Add `tab` on its home `side`: into an existing same-side leaf if one is open, else split a
-/// new region off the center scene box.
-fn add_panel_tab(dock: &mut EditorDockState, tab: EditorTab, side: DockSide) {
-    if let Some(node) = side_anchor_leaf(dock, side) {
-        dock.state.main_surface_mut()[node].append_tab(tab);
-        return;
-    }
-    let Some(center) = scene_tabs::center_leaf(dock) else {
-        dock.state.push_to_first_leaf(tab);
-        return;
-    };
-    let surface = dock.state.main_surface_mut();
-    match side {
-        DockSide::Left => {
-            surface.split_left(center, 0.20, vec![tab]);
-        }
-        DockSide::Right => {
-            surface.split_right(center, 0.78, vec![tab]);
-        }
-        DockSide::Bottom => {
-            surface.split_below(center, 0.72, vec![tab]);
-        }
-    }
 }
 
 // --- Layouts modal -----------------------------------------------------------------------

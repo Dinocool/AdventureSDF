@@ -22,9 +22,10 @@ fn mat(name: &str) -> Option<std::path::PathBuf> {
 }
 
 /// Spawn the gallery (7 SDF volumes + a directional light) into `world` with stable
-/// `LocalId`s, ready for serialization or direct use. The volumes are all plain unions;
-/// each object's centre is placed so it rests on the ground plane (top face at y = 0).
-pub fn spawn_gallery(world: &mut World) {
+/// `LocalId`s, ready for serialization. The volumes are all plain unions; each object's centre is
+/// placed so it rests on the ground plane (top face at y = 0). The runtime loads the serialized
+/// `assets/scenes/gallery.scene`; this builder only regenerates that file (see the test).
+fn spawn_gallery(world: &mut World) {
     // (local_id, order, transform, primitive, material file name)
     let volumes: [(u64, u32, Transform, SdfPrimitive, &str); 10] = [
         // Ground plane: wide + thin, top face at y = 0 (centre at y = -half_y).

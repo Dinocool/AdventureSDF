@@ -69,6 +69,64 @@ fn scene_dest(dir: &Path, name: &str) -> PathBuf {
     p
 }
 
+/// The shared body of both scene modals: the up/breadcrumb row, the subdirectory buttons, and the
+/// scrollable `.scene` list. Sets `navigate_to` on an up/dir click; calls `on_scene_click(name, path)`
+/// when a scene row is clicked. `selected_name` highlights the matching row (Save's overwrite target;
+/// `None` for Open). `scroll_max_height` caps the list so a footer fits (Save). The two
+/// `*_dialog_ui` fns supply only the window chrome + their distinct footer.
+#[allow(clippy::too_many_arguments)]
+fn file_browser_body(
+    ui: &mut egui::Ui,
+    dir: &Path,
+    dirs: &[PathBuf],
+    scenes: &[PathBuf],
+    navigate_to: &mut Option<PathBuf>,
+    selected_name: Option<&str>,
+    scroll_max_height: Option<f32>,
+    mut on_scene_click: impl FnMut(&str, &Path),
+) {
+    let up_enabled = can_go_up(dir);
+    ui.horizontal(|ui| {
+        if ui
+            .add_enabled(up_enabled, egui::Button::new("\u{2B11} Up"))
+            .clicked()
+            && let Some(parent) = dir.parent()
+        {
+            *navigate_to = Some(parent.to_path_buf());
+        }
+        ui.weak(dir.display().to_string());
+    });
+    ui.separator();
+
+    let mut scroll = egui::ScrollArea::vertical();
+    if let Some(h) = scroll_max_height {
+        scroll = scroll.max_height(h);
+    }
+    scroll.show(ui, |ui| {
+        for d in dirs {
+            if ui
+                .button(format!("\u{1F4C1} {}", file_name_str(d)))
+                .clicked()
+            {
+                *navigate_to = Some(d.clone());
+            }
+        }
+        if scenes.is_empty() && dirs.is_empty() {
+            ui.weak("(empty)");
+        }
+        for s in scenes {
+            let name = file_name_str(s);
+            let selected = selected_name == Some(name.as_str());
+            if ui
+                .selectable_label(selected, format!("\u{1F4C4} {name}"))
+                .clicked()
+            {
+                on_scene_click(&name, s);
+            }
+        }
+    });
+}
+
 /// Render the modal scene browser when open, draining a pick into [`EditorRequests::open`].
 /// No-op while the dialog is closed. Called from the dock each frame (after the menu bar).
 pub fn open_scene_dialog_ui(world: &mut World, ctx: &egui::Context) {
@@ -80,7 +138,6 @@ pub fn open_scene_dialog_ui(world: &mut World, ctx: &egui::Context) {
     let (dirs, files) = read_sorted(&dir);
     let scenes: Vec<PathBuf> = files.into_iter().filter(|p| is_scene_file(p)).collect();
 
-    let up_enabled = can_go_up(&dir);
     let mut keep_open = true;
     let mut navigate_to: Option<PathBuf> = None;
     let mut pick: Option<PathBuf> = None;
@@ -93,38 +150,9 @@ pub fn open_scene_dialog_ui(world: &mut World, ctx: &egui::Context) {
         .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
         .open(&mut keep_open)
         .show(ctx, |ui| {
-            // Current-location breadcrumb + an "up" affordance.
-            ui.horizontal(|ui| {
-                if ui
-                    .add_enabled(up_enabled, egui::Button::new("\u{2B11} Up"))
-                    .clicked()
-                    && let Some(parent) = dir.parent()
-                {
-                    navigate_to = Some(parent.to_path_buf());
-                }
-                ui.weak(dir.display().to_string());
-            });
-            ui.separator();
-
-            egui::ScrollArea::vertical().show(ui, |ui| {
-                for d in &dirs {
-                    if ui
-                        .button(format!("\u{1F4C1} {}", file_name_str(d)))
-                        .clicked()
-                    {
-                        navigate_to = Some(d.clone());
-                    }
-                }
-                if scenes.is_empty() && dirs.is_empty() {
-                    ui.weak("(empty)");
-                }
-                for s in &scenes {
-                    let resp =
-                        ui.selectable_label(false, format!("\u{1F4C4} {}", file_name_str(s)));
-                    if resp.clicked() {
-                        pick = Some(s.clone());
-                    }
-                }
+            // Open: a scene-row click picks it (the shared body draws the listing).
+            file_browser_body(ui, &dir, &dirs, &scenes, &mut navigate_to, None, None, |_name, path| {
+                pick = Some(path.to_path_buf());
             });
         });
 
@@ -180,7 +208,6 @@ pub fn save_scene_dialog_ui(world: &mut World, ctx: &egui::Context) {
     let (dirs, files) = read_sorted(&dir);
     let scenes: Vec<PathBuf> = files.into_iter().filter(|p| is_scene_file(p)).collect();
 
-    let up_enabled = can_go_up(&dir);
     let mut keep_open = true;
     let mut navigate_to: Option<PathBuf> = None;
     let mut confirm = false;
@@ -194,43 +221,20 @@ pub fn save_scene_dialog_ui(world: &mut World, ctx: &egui::Context) {
         .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
         .open(&mut keep_open)
         .show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                if ui
-                    .add_enabled(up_enabled, egui::Button::new("\u{2B11} Up"))
-                    .clicked()
-                    && let Some(parent) = dir.parent()
-                {
-                    navigate_to = Some(parent.to_path_buf());
-                }
-                ui.weak(dir.display().to_string());
-            });
-            ui.separator();
-
-            egui::ScrollArea::vertical()
-                .max_height(280.0)
-                .show(ui, |ui| {
-                    for d in &dirs {
-                        if ui
-                            .button(format!("\u{1F4C1} {}", file_name_str(d)))
-                            .clicked()
-                        {
-                            navigate_to = Some(d.clone());
-                        }
-                    }
-                    if scenes.is_empty() && dirs.is_empty() {
-                        ui.weak("(empty)");
-                    }
-                    // Clicking an existing scene fills the name field (to overwrite it).
-                    for s in &scenes {
-                        let name = file_name_str(s);
-                        if ui
-                            .selectable_label(filename == name, format!("\u{1F4C4} {name}"))
-                            .clicked()
-                        {
-                            filename = name;
-                        }
-                    }
-                });
+            // Save: a scene-row click fills the name field (to overwrite it); the current name is
+            // highlighted. `sel` snapshots `filename` so the highlight read doesn't fight the
+            // on-click write (which the shared body's callback performs).
+            let sel = filename.clone();
+            file_browser_body(
+                ui,
+                &dir,
+                &dirs,
+                &scenes,
+                &mut navigate_to,
+                Some(&sel),
+                Some(280.0),
+                |name, _path| filename = name.to_string(),
+            );
 
             ui.separator();
             ui.horizontal(|ui| {

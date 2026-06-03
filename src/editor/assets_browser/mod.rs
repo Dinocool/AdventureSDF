@@ -70,6 +70,24 @@ impl ThumbnailRegistry {
     }
 }
 
+/// Wires the assets browser: the offscreen thumbnail-render rig ([`ThumbnailRenderPlugin`]), the
+/// navigation state ([`AssetsBrowserState`]), and the [`ThumbnailRegistry`] seeded with the four
+/// built-in providers. Was inline in `EditorPlugin::build`, seeding a registry defined here.
+pub struct ThumbnailRegistryPlugin;
+
+impl Plugin for ThumbnailRegistryPlugin {
+    fn build(&self, app: &mut App) {
+        let mut registry = ThumbnailRegistry::default();
+        registry.register(ImageThumbnailProvider);
+        registry.register(MaterialThumbnailProvider);
+        registry.register(PbrTextureThumbnailProvider);
+        registry.register(SceneThumbnailProvider);
+        app.add_plugins(ThumbnailRenderPlugin)
+            .init_resource::<AssetsBrowserState>()
+            .insert_resource(registry);
+    }
+}
+
 /// Current folder of the assets browser, relative to [`ASSETS_ROOT`] (empty = root).
 /// Also the sync target the Project Files tree writes when a folder is clicked.
 #[derive(Resource, Default)]

@@ -10,12 +10,16 @@ use crate::sdf_render::gizmo::{GizmoModes, GizmoState};
 use crate::sdf_render::SdfSelection;
 
 /// Register editor keybinds.
-pub fn plugin(app: &mut App) {
-    app.add_systems(
-        Update,
-        (gizmo_mode_keys, delete_selection, save_shortcut)
-            .run_if(in_state(crate::scene_manager::AppScene::SdfEditor)),
-    );
+pub struct KeybindsPlugin;
+
+impl Plugin for KeybindsPlugin {
+    fn build(&self, app: &mut App) {
+        app.add_systems(
+            Update,
+            (gizmo_mode_keys, delete_selection, save_shortcut)
+                .run_if(in_state(crate::scene_manager::AppScene::SdfEditor)),
+        );
+    }
 }
 
 /// Ctrl+S saves the active scene (same path as File ▸ Save — the scene-tab manager drains
