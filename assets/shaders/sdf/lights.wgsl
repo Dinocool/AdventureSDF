@@ -1,6 +1,14 @@
 #define_import_path sdf::lights
 
 #import sdf::brdf::frostbite_brdf
+#import sdf::bindings::shadow_light_cap
+#import sdf::shadows::sphere_light_shadow
+
+// Shared culling constants for the point-light loop. The G-buffer's direct pass (sdf_raymarch.wgsl)
+// AND the GI-bounce gather (sdf_probe_trace, via `point_lights_diffuse` below) both use these, so a
+// many-light tuning change lives in ONE place.
+const LIGHT_SKIP_FRACTION: f32 = 0.02;     // skip a light dimmer than 2% of the brightest reaching a point
+const SHADOW_CONTRIB_FRACTION: f32 = 0.05; // only shadow lights ≥5% of the brightest (the rest add unshadowed)
 
 // Scene point lights for the SDF G-buffer pass, with a sparse world-wide light grid.
 //
@@ -109,4 +117,48 @@ fn lights_in_cell(world_pos: vec3<f32>) -> vec2<u32> {
         }
     }
     return vec2<u32>(0u, 0u);
+}
+
+// Diffuse point-light IRRADIANCE at a surface — Σ `radiance · attenuation · N·L · vis` over the
+// lights binned into the surface point's world cell. This is the GI-BOUNCE gather (sdf_probe_trace):
+// it mirrors the G-buffer's direct point-light loop (sdf_raymarch.wgsl) EXACTLY — the same
+// `lights_in_cell` world-grid cull, the same brightest-first strength culls (`LIGHT_SKIP_FRACTION`),
+// the same `shadow_light_cap()` shadow budget gated by `SHADOW_CONTRIB_FRACTION`, and the same
+// `sphere_light_shadow` (so the LOD falloff matches: `lod` = the bounce ray's HIT lod drives the
+// shadow march's coarseness). It returns plain Lambert irradiance for a DIFFUSE bounce rather than
+// evaluating the view-dependent Frostbite BRDF the primary pass uses. `do_shadows` gates the marches.
+fn point_lights_diffuse(hit_pos: vec3<f32>, n: vec3<f32>, lod: u32, do_shadows: bool) -> vec3<f32> {
+    var acc = vec3<f32>(0.0);
+    let cell = lights_in_cell(hit_pos);   // (base, count) into light_indices
+    let cap = shadow_light_cap();
+    var shadowed = 0u;     // lights actually shadow-marched (budgeted against lights that reach here)
+    var brightest = 0.0;   // strongest per-point light strength (radiance × attenuation) seen so far
+    for (var i = 0u; i < cell.y; i = i + 1u) {
+        let pl = point_lights[light_indices[cell.x + i]];
+        let range = pl.pos_range.w;
+        if (range <= 0.0) { continue; }                  // sentinel / unused slot
+        let to_light = pl.pos_range.xyz - hit_pos;
+        let d2 = dot(to_light, to_light);
+        if (d2 >= range * range) { continue; }           // range cull (cell is coarser than range)
+        let radius = pl.color_radius.w;
+        let rad = pl.color_radius.rgb;
+        let atten = point_attenuation(d2, range, radius);
+        // Cheap strength proxy (radiance × attenuation — no BRDF yet); the run is brightest-first, so
+        // once strength drops below a fraction of the brightest light here, the rest are dimmer still.
+        let strength = max(rad.x, max(rad.y, rad.z)) * atten;
+        brightest = max(brightest, strength);
+        if (strength < brightest * LIGHT_SKIP_FRACTION) { continue; }  // negligible → skip entirely
+        let dist = sqrt(d2);
+        let l = to_light / max(dist, 1e-4);
+        let ndl = max(dot(n, l), 0.0);
+        if (ndl <= 0.0) { continue; }                    // light behind the surface
+        var vis = 1.0;
+        // Shadow the lights that matter here (skip low-contrast ones); `cap` bounds dense clusters.
+        if (do_shadows && shadowed < cap && strength >= brightest * SHADOW_CONTRIB_FRACTION) {
+            vis = sphere_light_shadow(hit_pos, n, l, lod, dist, radius);
+            shadowed = shadowed + 1u;
+        }
+        acc += rad * atten * ndl * vis;
+    }
+    return acc;
 }

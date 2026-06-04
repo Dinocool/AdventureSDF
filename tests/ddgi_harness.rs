@@ -37,7 +37,9 @@ use naga_oil::compose::{
 use adventure::sdf_render::atlas::{dist_band_world, BrickKey, SdfAtlas, BRICK_EDGE};
 use adventure::sdf_render::bvh::Bvh;
 use adventure::sdf_render::chunk;
+use adventure::sdf_render::light_grid::LightGrid;
 use adventure::sdf_render::probe::{PROBE_OCT_RES, PROBE_OCT_TEXELS};
+use adventure::sdf_render::render::GpuPointLight;
 use adventure::sdf_render::edits::{
     build_palette, edit_world_aabb, to_gpu_edit, GpuEdit, ResolvedEdit, SdfOp, SdfPrimitive,
 };
@@ -607,6 +609,16 @@ struct MiniScene {
     materials: Vec<MatDef>,
     camera: Vec3,
     samples: Vec<Sample>,
+    /// Scene point lights bounced by the probe trace (group 3). The real [`LightGrid`] bins these so
+    /// `lights_in_cell` finds them on-GPU exactly as the production pass does. Empty for the
+    /// emitter/sun-only gates (the trace's point-light loop then iterates nothing).
+    lights: Vec<GpuPointLight>,
+}
+
+/// A harness point light: physical radiance `rgb`, falloff `range`, source `radius` — mirrors
+/// `GpuPointLight` (the bounce reads `pos_range`/`color_radius` verbatim).
+fn point_light(pos: Vec3, range: f32, radiance: Vec3, radius: f32) -> GpuPointLight {
+    GpuPointLight { pos_range: pos.extend(range), color_radius: radiance.extend(radius) }
 }
 
 fn cube(half: Vec3, center: Vec3, material_id: u16) -> ResolvedEdit {
@@ -649,6 +661,7 @@ fn scene_emitter_wall() -> MiniScene {
     }];
     MiniScene {
         name: "emitter_wall",
+        lights: vec![],
         cfg: small_cfg(),
         edits,
         materials,
@@ -674,6 +687,7 @@ fn scene_thin_wall() -> MiniScene {
     }];
     MiniScene {
         name: "thin_wall",
+        lights: vec![],
         cfg: small_cfg(),
         edits,
         materials,
@@ -703,6 +717,7 @@ fn scene_crease() -> MiniScene {
     ];
     MiniScene {
         name: "crease",
+        lights: vec![],
         cfg: small_cfg(),
         edits,
         materials,
@@ -728,6 +743,7 @@ fn scene_subbrick() -> MiniScene {
     }];
     MiniScene {
         name: "subbrick",
+        lights: vec![],
         cfg: small_cfg(),
         edits,
         materials,
@@ -736,8 +752,74 @@ fn scene_subbrick() -> MiniScene {
     }
 }
 
+/// A diffuse cube in front of a wall, lit by a RED POINT LIGHT between them — the point-light
+/// colour-bounce test (the analog of `scene_emitter_wall`, but the light is a real point light in
+/// the group-3 grid, not an emissive material). The wall probe's `+x` rays hit the cube's wall-facing
+/// (`−x`) face, which the point light reddens, so the wall gathers a red bounce. The grey gate sun
+/// can't light that `−x` face (`N·L ≤ 0` for `sun_dir`), so the bounce is purely the point light.
+fn scene_point_light_wall() -> MiniScene {
+    let materials = vec![MatDef::diffuse(Vec3::new(0.8, 0.8, 0.8))]; // wall + cube both diffuse
+    let edits = vec![
+        cube(Vec3::new(0.1, 1.0, 1.0), Vec3::ZERO, 0),                 // wall at x=0 (probe here)
+        cube(Vec3::new(0.15, 0.15, 0.15), Vec3::new(0.6, 0.0, 0.0), 0), // diffuse cube in front (+x)
+    ];
+    // Red point light between the wall (x=0) and the cube's −x face (x≈0.45), so it lights that face.
+    // `radius 0.2` clamps the 1/d² singularity to a bounded radiance at this short range.
+    let lights = vec![point_light(Vec3::new(0.30, 0.0, 0.0), 3.0, Vec3::new(2.0, 0.4, 0.2), 0.2)];
+    let samples = vec![Sample {
+        pos: Vec3::new(0.12, 0.0, 0.0),
+        normal: Vec3::X, // wall face toward the point-lit cube
+        what: "wall face toward a point-lit diffuse cube (expects red bounce)",
+    }];
+    MiniScene {
+        name: "point_light_wall",
+        lights,
+        cfg: small_cfg(),
+        edits,
+        materials,
+        camera: Vec3::new(1.5, 0.0, 0.0),
+        samples,
+    }
+}
+
+/// A diffuse cube whose wall-facing (`−x`) face would be lit by a red point light BEHIND the wall —
+/// the bounce-shadow (no-leak) test. With bounce shadows ON, the wall occludes the point light from
+/// that face (the sphere-shadow march from the face toward the light hits the wall), so the wall
+/// probe gathers ~no red. Paired with `ddgi_point_light_gate` (same light, unoccluded → DOES bounce),
+/// the two together prove the point-light bounce shadow march works rather than just "light absent".
+fn scene_shadow_wall() -> MiniScene {
+    let materials = vec![MatDef::diffuse(Vec3::new(0.8, 0.8, 0.8))];
+    let edits = vec![
+        cube(Vec3::new(0.1, 1.0, 1.0), Vec3::ZERO, 0),                 // wall at x=0 (occluder + probe)
+        cube(Vec3::new(0.15, 0.15, 0.15), Vec3::new(0.6, 0.0, 0.0), 0), // diffuse cube in front (+x)
+    ];
+    // Red point light BEHIND the wall (−x): its line to the cube's −x face (x≈0.45) crosses the wall.
+    let lights = vec![point_light(Vec3::new(-0.5, 0.0, 0.0), 3.0, Vec3::new(2.0, 0.4, 0.2), 0.1)];
+    let samples = vec![Sample {
+        pos: Vec3::new(0.12, 0.0, 0.0),
+        normal: Vec3::X,
+        what: "wall face toward a cube whose lit face the wall shadows (expects ~no red leak)",
+    }];
+    MiniScene {
+        name: "shadow_wall",
+        lights,
+        cfg: small_cfg(),
+        edits,
+        materials,
+        camera: Vec3::new(1.5, 0.0, 0.0),
+        samples,
+    }
+}
+
 fn all_scenes() -> Vec<MiniScene> {
-    vec![scene_emitter_wall(), scene_thin_wall(), scene_crease(), scene_subbrick()]
+    vec![
+        scene_emitter_wall(),
+        scene_thin_wall(),
+        scene_crease(),
+        scene_subbrick(),
+        scene_point_light_wall(),
+        scene_shadow_wall(),
+    ]
 }
 
 /// A busy scene at the LIVE clipmap config (8 LODs — the default's large clipmap reach, so the probe
@@ -761,6 +843,7 @@ fn scene_perf() -> MiniScene {
     edits.push(sphere(0.25, Vec3::new(3.5, 0.5, -3.5), 2)); // blue emitter corner
     MiniScene {
         name: "perf",
+        lights: vec![],
         cfg: SdfGridConfig { lod_count: 8, ring_bricks: 64, recenter_snap_chunks: 1, ..Default::default() },
         edits,
         materials,
@@ -917,8 +1000,11 @@ fn camera_uniform_bytes(cfg: &SdfGridConfig, camera_pos: Vec3, sun_dir: Vec3, su
     // lod_params (72..76): lod_count, ring_bricks, base voxel_size, cell_stride.
     f[72] = cfg.lod_count as f32; f[73] = cfg.ring_bricks as f32;
     f[74] = cfg.voxel_size; f[75] = cfg.cell_stride() as f32;
-    // sun_dir (76..79), sun_color (80..83).
-    f[76] = sd.x; f[77] = sd.y; f[78] = sd.z;
+    // sun_dir (76..79): xyz = direction; w = shadow_light_cap (how many point lights cast SDF shadows
+    // per hit). The bounce's point-light shadow budget reads this; a nonzero cap lets the point-light
+    // shadow march actually run in the harness (the real renderer drives it from the editor slider).
+    f[76] = sd.x; f[77] = sd.y; f[78] = sd.z; f[79] = 8.0;
+    // sun_color (80..83): rgb = radiance; w = exposure (unused by the trace).
     f[80] = sun_color.x; f[81] = sun_color.y; f[82] = sun_color.z;
     bytemuck::cast_slice(&f).to_vec()
 }
@@ -1230,9 +1316,15 @@ fn trace_scene(
         label: Some("g2"),
         entries: &[storage_rw(0), uniform(1), storage_ro(2)],
     });
+    // g3 = point lights + world light grid (sdf::lights): point_lights[0], light_cells[1],
+    // light_indices[2]. Same data the G-buffer pass binds; the bounce culls + shades through it.
+    let l3 = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("g3"),
+        entries: &[storage_ro(0), storage_ro(1), storage_ro(2)],
+    });
     let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: Some("probe_trace_layout"),
-        bind_group_layouts: &[&l0, &l1, &l2],
+        bind_group_layouts: &[&l0, &l1, &l2, &l3],
         push_constant_ranges: &[],
     });
     let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
@@ -1301,9 +1393,9 @@ fn trace_scene(
         mapped_at_creation: false,
     });
     // ProbeParams { ray_count, hysteresis, intensity, frame, subdiv, update_stride, gi_range,
-    // normal_bias, view_bias, sky_intensity } — frame 0 (no history). MUST match the field order of
-    // the Rust `ProbeParams` (render/probe.rs) and the two WGSL copies (no parity test guards this).
-    // 10 scalars = 40 B, padded up to the std140 uniform size (48 B = next multiple of 16).
+    // normal_bias, view_bias, sky_intensity, bounce_shadows } — frame 0 (no history). MUST match the
+    // field order of the Rust `ProbeParams` (render/probe.rs) and the two WGSL copies (no parity test
+    // guards this). 11 scalars = 44 B, padded up to the std140 uniform size (48 B = next ×16).
     let mut params = Vec::new();
     params.extend_from_slice(&ray_count.to_le_bytes());
     params.extend_from_slice(&0.95f32.to_le_bytes()); // hysteresis → N_max≈20 (progressive average)
@@ -1318,6 +1410,9 @@ fn trace_scene(
     // now-physical analytic sky (`sdf::sky` × SKY_LUMINANCE=4000), which would otherwise flood every
     // escaped ray (~thousands of nits) and drown the emitter signal. The real renderer defaults to 1.0.
     params.extend_from_slice(&0.0f32.to_le_bytes()); // sky_intensity
+    // bounce_shadows = 1: exercise the REAL shadowed bounce (sun + point-light sphere shadows). The
+    // point-light shadow march needs a nonzero shadow_light_cap — set in `camera_uniform_bytes`.
+    params.extend_from_slice(&1.0f32.to_le_bytes()); // bounce_shadows
     params.resize(48, 0);
     let params_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("params"),
@@ -1342,6 +1437,34 @@ fn trace_scene(
         label: Some("camera"),
         layout: &l0,
         entries: &[wgpu::BindGroupEntry { binding: 0, resource: camera_buf.as_entire_binding() }],
+    });
+
+    // --- group 3: point lights + world light grid (built by the REAL LightGrid, so the GPU
+    // binary-search lookup is exercised exactly as in production) ---
+    let mut grid = LightGrid::default();
+    grid.rebuild(&scene.lights); // always ≥1 cell (sentinel when empty) so the binding is valid
+    // Storage bindings can't be zero-sized: fall back to one zeroed light / one index when there are
+    // no scene lights (range 0 → the bounce loop skips it; the sentinel cell key matches nothing).
+    let point_src: Vec<GpuPointLight> =
+        if scene.lights.is_empty() { vec![GpuPointLight::default()] } else { scene.lights.clone() };
+    let index_src: Vec<u32> = if grid.index_buf.is_empty() { vec![0u32] } else { grid.index_buf.clone() };
+    let point_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("point_lights"), contents: bytemuck::cast_slice(&point_src), usage: wgpu::BufferUsages::STORAGE,
+    });
+    let cell_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("light_cells"), contents: bytemuck::cast_slice(&grid.cells), usage: wgpu::BufferUsages::STORAGE,
+    });
+    let index_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("light_indices"), contents: bytemuck::cast_slice(&index_src), usage: wgpu::BufferUsages::STORAGE,
+    });
+    let bg3 = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("lights"),
+        layout: &l3,
+        entries: &[
+            wgpu::BindGroupEntry { binding: 0, resource: point_buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 1, resource: cell_buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 2, resource: index_buf.as_entire_binding() },
+        ],
     });
 
     // --- dispatch: one workgroup per (resident chunk × 64 local bricks), 2D-tiled, 64 threads each
@@ -1391,6 +1514,7 @@ fn trace_scene(
             pass.set_bind_group(0, &bg0, &[]);
             pass.set_bind_group(1, &bg1, &[]);
             pass.set_bind_group(2, &bg2, &[]);
+            pass.set_bind_group(3, &bg3, &[]);
             pass.dispatch_workgroups(wg_x, wg_y, 1);
         }
         if timed {
@@ -1526,6 +1650,72 @@ fn ddgi_bleed_gate() {
         gi[0] > gi_away[0] + 0.05,
         "directionality gate: octahedral GI is flat — toward-emitter red {:.3} not > away red {:.3}",
         gi[0], gi_away[0]
+    );
+}
+
+/// POINT-LIGHT GATE: a scene point light (group-3 grid, NOT an emissive material) must bounce its
+/// colour into GI. A red point light sits between the wall and a diffuse cube, reddening BOTH facing
+/// surfaces; the wall probe gathers that red bounce. Proves the trace culls the light via the real
+/// `lights_in_cell` grid lookup, applies `point_attenuation`, and shades the hit — i.e. point lights
+/// now contribute to DDGI. We assert the RED CHROMATICITY (r > g > b, matching the light's 2.0/0.4/0.2)
+/// — which proves the signal is the red point light, not the grey gate sun or the (disabled) sky.
+/// (Octahedral directionality is covered by the emissive bleed gate; here the light lights both
+/// hemispheres' facing surfaces, so a toward-vs-away comparison isn't meaningful.)
+#[test]
+fn ddgi_point_light_gate() {
+    let Some((device, queue)) = gpu_full() else {
+        eprintln!("no GPU adapter (or missing binding-array features) — skipping");
+        return;
+    };
+    let scene = scene_point_light_wall();
+    let baked = bake_scene(&device, &queue, &scene);
+    let (irr, tables, _ms) =
+        trace_scene(&device, &queue, &scene, &baked, GATE_SUN_DIR, GATE_SUN_COLOR, 32, GATE_SUBDIV, 1, 8);
+
+    let s = &scene.samples[0];
+    let gi = gi_at(&tables, &baked.cfg, &irr, s.pos, s.normal, GATE_SUBDIV)
+        .unwrap_or_else(|| panic!("no probe covers the wall sample {:?}", s.pos));
+    eprintln!("point light: wall bounce [{:.3} {:.3} {:.3}]", gi[0], gi[1], gi[2]);
+    assert!(
+        gi[0] > 0.02,
+        "point-light gate: wall probe got no red light (r={:.4}) — point light didn't bounce",
+        gi[0]
+    );
+    assert!(
+        gi[0] > gi[1] && gi[1] >= gi[2],
+        "point-light gate: bounce not red-dominant (r={:.4} g={:.4} b={:.4}) — expected the red point light's chroma",
+        gi[0], gi[1], gi[2]
+    );
+}
+
+/// BOUNCE-SHADOW GATE: with bounce shadows ON, a point light BEHIND a wall must not leak its bounce
+/// onto the far side. The red light would light the cube's wall-facing face, but the wall occludes it
+/// (the sphere-shadow march from the face toward the light hits the wall → vis≈0), so the wall probe
+/// gathers ~no red. With shadowing broken (vis always 1) the face would be lit → red → this fails.
+/// Together with `ddgi_point_light_gate` (same light unoccluded → DOES bounce) this proves the
+/// point-light bounce shadow march, including its hit-LOD falloff (it mirrors the G-buffer's pass).
+#[test]
+fn ddgi_bounce_shadow_gate() {
+    let Some((device, queue)) = gpu_full() else {
+        eprintln!("no GPU adapter (or missing binding-array features) — skipping");
+        return;
+    };
+    let scene = scene_shadow_wall();
+    let baked = bake_scene(&device, &queue, &scene);
+    let (irr, tables, _ms) =
+        trace_scene(&device, &queue, &scene, &baked, GATE_SUN_DIR, GATE_SUN_COLOR, 32, GATE_SUBDIV, 1, 8);
+
+    let s = &scene.samples[0];
+    let gi = gi_at(&tables, &baked.cfg, &irr, s.pos, s.normal, GATE_SUBDIV)
+        .unwrap_or_else(|| panic!("no probe covers the wall sample {:?}", s.pos));
+    eprintln!(
+        "bounce shadow: wall bounce [{:.3} {:.3} {:.3}] (expect ~0 red — the wall shadows the point light)",
+        gi[0], gi[1], gi[2]
+    );
+    assert!(
+        gi[0] < 0.2,
+        "bounce-shadow gate: red leaked through the wall (r={:.4}) — the point light's bounce wasn't shadowed",
+        gi[0]
     );
 }
 

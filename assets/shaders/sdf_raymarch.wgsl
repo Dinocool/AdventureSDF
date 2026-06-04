@@ -14,7 +14,7 @@
 #import sdf::oct::oct_encode
 #import sdf::sky::sky_color
 #import sdf::shadows::{surface_shadow, sphere_light_shadow}
-#import sdf::lights::{point_lights, light_indices, lights_in_cell, point_attenuation, direct_light}
+#import sdf::lights::{point_lights, light_indices, lights_in_cell, point_attenuation, direct_light, LIGHT_SKIP_FRACTION, SHADOW_CONTRIB_FRACTION}
 
 // Cone-prepass seed texture: per-8×8-tile start distance (R32Float), written by
 // sdf_cone_prepass.wgsl. The march starts each pixel at its tile's seed-t instead of 0,
@@ -23,15 +23,8 @@
 // so starting from it never skips geometry. Group 2 — groups 0/1 are camera + atlas.
 @group(2) @binding(0) var cone_seed: texture_2d<f32>;
 const CONE_TILE: i32 = 8;
-// CONTRIBUTION-based shadow cull: a light casts a shadow only when its strength AT THIS PIXEL
-// (radiance × attenuation — already distance-aware via 1/d²) is at least this fraction of the
-// brightest light at the pixel. The dominant light(s) always shadow; only low-contrast shadows
-// drop. (NOT distance-from-the-light: a light's shadow falls FAR from it, near its range edge —
-// culling by range would throw away exactly the prominent ground shadows.)
-const SHADOW_CONTRIB_FRACTION: f32 = 0.05;
-// Below this fraction of the brightest light at the pixel, a light is skipped ENTIRELY (no BRDF, no
-// shadow) — its lit contribution is imperceptible next to the dominant light.
-const LIGHT_SKIP_FRACTION: f32 = 0.02;
+// The many-light cull fractions (`SHADOW_CONTRIB_FRACTION`, `LIGHT_SKIP_FRACTION`) now live in
+// sdf::lights (imported above) so the G-buffer direct pass + the GI-bounce gather share one source.
 
 // Deferred G-buffer. The primary SDF march no longer shades — it exports surface attributes into
 // three MRT targets that the deferred lit pass (and, later, the world-space GI probe pass)
