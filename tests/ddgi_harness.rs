@@ -1301,9 +1301,9 @@ fn trace_scene(
         mapped_at_creation: false,
     });
     // ProbeParams { ray_count, hysteresis, intensity, frame, subdiv, update_stride, gi_range,
-    // normal_bias, view_bias } — frame 0 (no history). MUST match the field order of the Rust
-    // `ProbeParams` (render/probe.rs) and the two WGSL copies (no parity test guards this).
-    // 9 scalars = 36 B, padded up to the std140 uniform size (48 B = next multiple of 16).
+    // normal_bias, view_bias, sky_intensity } — frame 0 (no history). MUST match the field order of
+    // the Rust `ProbeParams` (render/probe.rs) and the two WGSL copies (no parity test guards this).
+    // 10 scalars = 40 B, padded up to the std140 uniform size (48 B = next multiple of 16).
     let mut params = Vec::new();
     params.extend_from_slice(&ray_count.to_le_bytes());
     params.extend_from_slice(&0.95f32.to_le_bytes()); // hysteresis → N_max≈20 (progressive average)
@@ -1314,6 +1314,10 @@ fn trace_scene(
     params.extend_from_slice(&24.0f32.to_le_bytes()); // gi_range (matches DdgiParams default)
     params.extend_from_slice(&0.6f32.to_le_bytes()); // normal_bias
     params.extend_from_slice(&0.1f32.to_le_bytes()); // view_bias
+    // sky_intensity = 0: these are GI-ISOLATION gates — they assert on the emitter/sun bounce, not the
+    // now-physical analytic sky (`sdf::sky` × SKY_LUMINANCE=4000), which would otherwise flood every
+    // escaped ray (~thousands of nits) and drown the emitter signal. The real renderer defaults to 1.0.
+    params.extend_from_slice(&0.0f32.to_le_bytes()); // sky_intensity
     params.resize(48, 0);
     let params_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("params"),

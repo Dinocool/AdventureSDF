@@ -5,8 +5,9 @@
 use bevy::prelude::*;
 use bevy_egui::egui;
 
+use crate::node::GizmoKind;
 use crate::sdf_render::gizmo::{GizmoModes, GizmoState};
-use crate::sdf_render::{SdfCameraMode, SdfOrbitCamera, WireframeBoundsVisible};
+use crate::sdf_render::{GizmoVisibility, SdfCameraMode, SdfOrbitCamera, WireframeBoundsVisible};
 
 /// Toolbar strip rendered across the top of the Viewport tab: camera-mode toggle
 /// (Orbit ⇄ FPS), gizmo transform tools (mode + snap), and a view-options dropdown.
@@ -108,6 +109,26 @@ pub(crate) fn viewport_toolbar(world: &mut World, ui: &mut egui::Ui) {
                             let mut wf = world.resource::<WireframeBoundsVisible>().0;
                             if ui.checkbox(&mut wf, "Bounds wireframe").changed() {
                                 world.resource_mut::<WireframeBoundsVisible>().0 = wf;
+                            }
+
+                            // Per-type gizmo visibility (+ master "All"). Driven by
+                            // `GizmoKind::ALL`, so a new gizmo type appears here automatically.
+                            ui.separator();
+                            let all_on = GizmoKind::ALL
+                                .iter()
+                                .all(|k| world.resource::<GizmoVisibility>().is_visible(*k));
+                            let mut all = all_on;
+                            if ui.checkbox(&mut all, "All gizmos").changed() {
+                                let mut vis = world.resource_mut::<GizmoVisibility>();
+                                for k in GizmoKind::ALL {
+                                    vis.0.insert(k, all);
+                                }
+                            }
+                            for kind in GizmoKind::ALL {
+                                let mut on = world.resource::<GizmoVisibility>().is_visible(kind);
+                                if ui.checkbox(&mut on, kind.label()).changed() {
+                                    world.resource_mut::<GizmoVisibility>().0.insert(kind, on);
+                                }
                             }
                         });
                 });

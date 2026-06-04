@@ -30,6 +30,7 @@ mod bake;
 mod chunk_tables;
 mod cone;
 mod gi;
+mod gpu;
 mod pbr_textures;
 mod probe;
 
@@ -66,7 +67,7 @@ struct SdfCameraData {
     lod_params: Vec4,
     /// xyz = world-space direction toward the key light; w unused.
     sun_dir: Vec4,
-    /// rgb = key-light radiance; w unused.
+    /// rgb = physical sun radiance (illuminance, lux); w = camera exposure scalar.
     sun_color: Vec4,
 }
 
@@ -75,7 +76,8 @@ struct SdfCameraData {
 /// (`u32::MAX` = none); the shader samples those layers via triplanar projection.
 /// 80 bytes, 16-byte aligned for std430. The three `_pad*` words align `emissive` (a
 /// `vec4`) to its 16-byte boundary at offset 64.
-#[derive(ShaderType, Clone, Copy, Default)]
+#[repr(C)]
+#[derive(ShaderType, Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
 struct GpuSdfMaterial {
     base_color: Vec4,
     blend_softness: f32,
@@ -96,6 +98,39 @@ struct GpuSdfMaterial {
     /// `w` is spare. `vec4` so it's 16-byte aligned at offset 64 (struct = 80 bytes).
     emissive: Vec4,
 }
+
+/// GPU mirror of a scene [`PointLight`], uploaded as a storage-buffer array the SDF G-buffer
+/// pass loops to add direct point-light radiance. 32 bytes, two `vec4`s → 16-byte aligned with
+/// no padding (unlike [`GpuSdfMaterial`]). Mirrored in `assets/shaders/sdf/lights.wgsl` as
+/// `PointLightGpu`; the WGSL field names avoid trailing digits (naga_oil writeback rule).
+#[repr(C)]
+#[derive(ShaderType, Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
+pub(crate) struct GpuPointLight {
+    /// `xyz` = world position, `w` = falloff-cutoff range (the gizmo's outer ring / `PointLight.range`).
+    pub(crate) pos_range: Vec4,
+    /// `rgb` = physical radiance (linear colour × candela = `intensity / 4π`), `w` = source radius
+    /// (`PointLight.radius`, physical light size for soft shadows).
+    pub(crate) color_radius: Vec4,
+}
+
+/// EV100 the SDF view is exposed at. The renderer is fully physical (sun in lux, point lights in
+/// candela, emissive/sky in physical luminance); the lit pass multiplies the final composite by
+/// [`sdf_exposure`] to map that to the display range. We apply this ourselves in the shader rather
+/// than via a camera `Exposure` component: Bevy's tonemapping does NOT apply `Exposure` to our
+/// directly-written ViewTarget (it's consumed by mesh/PBR shaders, which the SDF editor camera
+/// doesn't render). ~11.5 keeps a default 10000-lux sun near the old ad-hoc `*3.0` look.
+pub const SDF_EXPOSURE_EV100: f32 = 11.5;
+
+/// The exposure multiplier for [`SDF_EXPOSURE_EV100`] — the standard photographic
+/// `exp2(-ev100) / 1.2` (mirrors Bevy `Exposure::exposure()`).
+fn sdf_exposure() -> f32 {
+    (-SDF_EXPOSURE_EV100).exp2() / 1.2
+}
+
+/// Physical-luminance scale applied to authored (display-referred) material emissive at GPU
+/// upload, so emissive surfaces survive the lit pass's exposure and read ~as bright as before.
+/// Same order as `sky::SKY_LUMINANCE`; tune alongside [`SDF_EXPOSURE_EV100`].
+const EMISSIVE_NITS_SCALE: f32 = 4000.0;
 
 // --- GPU Atlas ---
 
@@ -130,6 +165,53 @@ struct ExtractedSdfMaterials {
     materials: Vec<GpuSdfMaterial>,
 }
 
+/// Upper bound on scene point lights uploaded to the GPU. The world-space light grid culls to a
+/// per-cell handful at shade time, so the per-pixel cost is bounded regardless — this just sizes
+/// the flat light array (and grid index buffer) and covers the stress scene's ~3000 per-tower
+/// lights. Excess lights past the cap are dropped (with a one-time `warn!`).
+const MAX_POINT_LIGHTS: usize = 8192;
+
+/// Scene point lights extracted from the main world for GPU upload (mirrors
+/// [`ExtractedSdfMaterials`]). Always carries ≥1 row so the storage buffer is never zero-sized.
+#[derive(Resource, Default)]
+struct ExtractedSdfPointLights {
+    lights: Vec<GpuPointLight>,
+}
+
+/// Monotonic generation of the point-light data (table + grid), bumped in
+/// [`prepare_sdf_camera_data`] ONLY when the scene's lights change (move / add / remove). The grid
+/// is world-anchored (camera-independent), so a static light set never changes — the gen lets the
+/// extract + GPU upload skip all work on unchanged frames. Starts 0 (matches the dummy buffers).
+#[derive(Resource, Default)]
+pub struct SdfLightsGen(pub u32);
+
+/// Render-world GPU resources for point lights, bound together at group 3: the `GpuPointLight`
+/// storage buffer (binding 0), the world-space light-grid cell directory (binding 1), and the flat
+/// per-cell light-index buffer (binding 2). All `None` until `init_sdf_pipeline` seeds dummies so
+/// the bind group is valid before the first upload. `uploaded_gen` is the [`SdfLightsGen`] the
+/// current buffers hold — the prepare system re-uploads only when it lags the extracted gen.
+#[derive(Resource, Default)]
+struct SdfGpuLights {
+    point_buffer: Option<Buffer>,
+    cell_buffer: Option<Buffer>,
+    index_buffer: Option<Buffer>,
+    uploaded_gen: u32,
+}
+
+/// Main-world world-space light grid (clustered culling), rebuilt in [`prepare_sdf_camera_data`]
+/// only when the lights change. Extracted + uploaded to the group-3 cell/index buffers.
+#[derive(Resource, Default)]
+pub struct SdfLightGrid(pub super::light_grid::LightGrid);
+
+/// The light grid + point lights extracted into the render world for GPU upload, tagged with the
+/// [`SdfLightsGen`] they were built at so the prepare step can skip re-upload when unchanged.
+#[derive(Resource, Default)]
+struct ExtractedSdfLightGrid {
+    cells: Vec<super::light_grid::GpuLightCell>,
+    index_buf: Vec<u32>,
+    generation: u32,
+}
+
 // --- Pipeline ---
 
 // BISECT: minimal shader while building features back up after the division-free fix.
@@ -143,6 +225,10 @@ struct SdfPipeline {
     /// Cone-prepass seed texture, read (textureLoad) by the fragment march to start each
     /// pixel at its tile's seed distance instead of 0.
     layout_2: BindGroupLayoutDescriptor,
+    /// Point lights (group 3): the `GpuPointLight` storage buffer the march loops for direct
+    /// lighting. Declared `FRAGMENT | COMPUTE` so the future DDGI probe-trace compute pass can
+    /// bind the same data. (Stage 2 adds the light-grid directory + index buffers here.)
+    layout_3: BindGroupLayoutDescriptor,
     #[expect(dead_code)]
     shader_handle: Handle<Shader>,
     /// The shader defs the current `pipeline_id` was queued with. Rebuild compares the
@@ -322,6 +408,7 @@ impl ViewNode for SdfGBufferNode {
         let layout_0 = pipeline_cache.get_bind_group_layout(&pipeline_res.layout_0);
         let layout_1 = pipeline_cache.get_bind_group_layout(&pipeline_res.layout_1);
         let layout_2 = pipeline_cache.get_bind_group_layout(&pipeline_res.layout_2);
+        let layout_3 = pipeline_cache.get_bind_group_layout(&pipeline_res.layout_3);
 
         // Bind group 0: camera uniform or fallback
         let has_camera = world
@@ -361,6 +448,18 @@ impl ViewNode for SdfGBufferNode {
             "sdf_bind_group_2",
             &layout_2,
             &BindGroupEntries::sequential((&prepass.read_view,)),
+        );
+
+        // Bind group 3: scene point lights + world-space light grid (always available — dummies in init).
+        let gpu_lights = world.resource::<SdfGpuLights>();
+        let bind_group_3 = device.create_bind_group(
+            "sdf_bind_group_3",
+            &layout_3,
+            &BindGroupEntries::sequential((
+                gpu_lights.point_buffer.as_ref().unwrap().as_entire_buffer_binding(),
+                gpu_lights.cell_buffer.as_ref().unwrap().as_entire_buffer_binding(),
+                gpu_lights.index_buffer.as_ref().unwrap().as_entire_buffer_binding(),
+            )),
         );
 
         // Render into the three G-buffer MRT targets + the shared depth attachment. Clear the
@@ -405,6 +504,7 @@ impl ViewNode for SdfGBufferNode {
             render_pass.set_bind_group(0, &bind_group_0, &[0]);
             render_pass.set_bind_group(1, &bind_group_1, &[]);
             render_pass.set_bind_group(2, &bind_group_2, &[]);
+            render_pass.set_bind_group(3, &bind_group_3, &[]);
             render_pass.draw(0..3, 0..1);
         }
         span.end(&mut render_pass);
@@ -537,7 +637,7 @@ struct SdfShaderModules(#[expect(dead_code)] Vec<Handle<Shader>>);
 /// source of truth for the SDF import graph — `tests/shader_validation.rs` composes the SAME list
 /// (prefixing `assets/`) so a new `sdf/*.wgsl` module can't be added to the pipeline without the
 /// validation rig also seeing it. Paths are asset-server-relative (the `assets/` root is implicit).
-pub const SDF_SHADER_MODULES: [&str; 10] = [
+pub const SDF_SHADER_MODULES: [&str; 11] = [
     "shaders/sdf/bindings.wgsl",
     "shaders/sdf/brick.wgsl",
     "shaders/sdf/material.wgsl",
@@ -549,8 +649,10 @@ pub const SDF_SHADER_MODULES: [&str; 10] = [
     "shaders/sdf/pbr.wgsl",
     "shaders/sdf/oct.wgsl",
     "shaders/sdf/brdf.wgsl",
-    // DDGI probe addressing (constants + world-pos), imported by the trace/blend/apply passes.
+    // DDGI probe addressing (constants + world-pos), imported by the trace/resolve passes.
     "shaders/sdf/probe.wgsl",
+    // lights last: its `direct_light` imports `sdf::brdf`, so brdf must be registered before it.
+    "shaders/sdf/lights.wgsl",
 ];
 
 pub struct SdfRenderPlugin;
@@ -577,6 +679,9 @@ impl Plugin for SdfRenderPlugin {
             .insert_resource(SdfShaderHandle(shader_handle))
             .init_resource::<SdfShaderDefs>()
             .init_resource::<SdfMaterialTable>()
+            .init_resource::<SdfPointLightTable>()
+            .init_resource::<SdfLightGrid>()
+            .init_resource::<SdfLightsGen>()
             .register_type::<SdfCameraData>()
             // These plugins must be added to the main app — they internally
             // find the render app via get_sub_app_mut(RenderApp)
@@ -622,6 +727,7 @@ impl Plugin for SdfRenderPlugin {
         render_app
             .add_systems(ExtractSchedule, atlas_upload::extract_sdf_atlas)
             .add_systems(ExtractSchedule, extract_sdf_materials)
+            .add_systems(ExtractSchedule, extract_sdf_lights)
             .add_systems(ExtractSchedule, pbr_textures::extract_texture_library)
             .add_systems(ExtractSchedule, extract_shader_defs)
             .add_systems(ExtractSchedule, bake::extract_brick_bakes)
@@ -639,6 +745,7 @@ impl Plugin for SdfRenderPlugin {
             )
             .add_systems(Render, atlas_upload::prepare_sdf_atlas_gpu)
             .add_systems(Render, prepare_sdf_materials_gpu)
+            .add_systems(Render, prepare_sdf_lights_gpu)
             .add_systems(Render, pbr_textures::init_texture_streaming)
             .add_systems(
                 Render,
@@ -701,7 +808,18 @@ pub struct SdfMaterialTable {
     materials: Vec<GpuSdfMaterial>,
 }
 
-#[allow(clippy::too_many_arguments)] // Bevy system params; splitting is artificial.
+/// Main-world point-light table, rebuilt each frame in [`prepare_sdf_camera_data`] from the
+/// scene's [`PointLight`]s (physical candela radiance). Extracted into the render world and
+/// uploaded as a storage buffer the G-buffer pass loops. The single per-frame source of truth
+/// for SDF point lighting.
+#[derive(Resource, Default)]
+pub struct SdfPointLightTable {
+    lights: Vec<GpuPointLight>,
+}
+
+// Bevy system params; splitting is artificial. `type_complexity` is the change-detection query's
+// `Or<(Changed<..>, Changed<..>)>` filter — idiomatic for Bevy, not worth a type alias.
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
 fn prepare_sdf_camera_data(
     mut commands: Commands,
     cameras: Query<(Entity, &Camera, &Transform), With<SdfCamera>>,
@@ -712,7 +830,24 @@ fn prepare_sdf_camera_data(
     // world, so the light entity is available). Filtered to `SceneEntity` so the editor's
     // offscreen thumbnail / preview rig lights are excluded.
     sun_light: Query<(&GlobalTransform, &DirectionalLight), With<crate::scene_manager::SceneEntity>>,
+    // The scene's point lights, same MAIN-world / `SceneEntity` filtering as the sun (excludes the
+    // editor thumbnail/preview rigs). Collected into `light_table` for GPU upload + SDF lighting.
+    point_lights: Query<(&GlobalTransform, &PointLight), With<crate::scene_manager::SceneEntity>>,
+    // Change detection: did any point light move / get added this frame? (Plus removals, below.)
+    // The light grid is camera-independent, so we only rebuild it + re-upload when lights change.
+    changed_lights: Query<
+        (),
+        (
+            With<crate::scene_manager::SceneEntity>,
+            With<PointLight>,
+            Or<(Changed<GlobalTransform>, Changed<PointLight>)>,
+        ),
+    >,
+    mut removed_lights: RemovedComponents<PointLight>,
     mut material_table: ResMut<SdfMaterialTable>,
+    mut light_table: ResMut<SdfPointLightTable>,
+    mut light_grid: ResMut<SdfLightGrid>,
+    mut lights_gen: ResMut<SdfLightsGen>,
     // Per-camera last-frame `clip_from_world`, for SSR reprojection. Persists across frames in
     // the main world via Local; seeded to this frame's matrix on the first sighting (so frame 0
     // reprojects to itself — harmless, the history buffer is also invalid that frame).
@@ -724,14 +859,55 @@ fn prepare_sdf_camera_data(
         .map(|(xf, light)| {
             let forward = xf.rotation() * Vec3::NEG_Z;
             let c = light.color.to_linear();
-            let intensity = (light.illuminance / 10_000.0).clamp(0.0, 8.0) * 3.0;
+            // PHYSICAL: directional radiance = illuminance (lux) × linear colour. No ad-hoc clamp
+            // — the lit pass applies the camera exposure (`sdf_exposure`) to map lux to display.
             (
                 (-forward).normalize_or_zero(),
-                Vec3::new(c.red, c.green, c.blue) * intensity,
+                Vec3::new(c.red, c.green, c.blue) * light.illuminance,
             )
         })
-        // Default sun (matches the old hardcoded constants) when the scene has no light.
-        .unwrap_or((Vec3::new(0.5, 1.0, 0.3).normalize(), Vec3::splat(3.0)));
+        // No directional light in the scene → NO directional lighting: zero radiance, so the
+        // G-buffer pass skips the sun shadow march and the lit pass adds no sun term.
+        .unwrap_or((Vec3::Y, Vec3::ZERO));
+
+    // Rebuild the point-light table + world grid ONLY when the lights actually changed (moved /
+    // added / removed) — the grid is camera-independent, so a static light set is identical every
+    // frame and rebuilding + re-uploading it would be pure waste. `removed_lights` is drained
+    // unconditionally so its events don't accumulate. The `gen` bump signals the extract + GPU
+    // upload to refresh; an unchanged frame leaves the table/grid/gen untouched and they skip.
+    let any_removed = removed_lights.read().next().is_some();
+    let lights_dirty = any_removed || !changed_lights.is_empty();
+    if lights_dirty {
+        // PHYSICAL: luminous power (lumens) → luminous intensity (candela) is `intensity / 4π`;
+        // radiance = linear colour × candela. `point_attenuation` (1/d² windowed) + camera exposure
+        // are applied GPU-side.
+        light_table.lights.clear();
+        let mut overflow = 0usize;
+        for (xf, light) in &point_lights {
+            if light_table.lights.len() >= MAX_POINT_LIGHTS {
+                overflow += 1;
+                continue;
+            }
+            let c = light.color.to_linear();
+            let candela = light.intensity / (4.0 * std::f32::consts::PI);
+            let radiance = Vec3::new(c.red, c.green, c.blue) * candela;
+            light_table.lights.push(GpuPointLight {
+                pos_range: xf.translation().extend(light.range),
+                color_radius: radiance.extend(light.radius),
+            });
+        }
+        if overflow > 0 {
+            use std::sync::atomic::{AtomicBool, Ordering};
+            static LOGGED: AtomicBool = AtomicBool::new(false);
+            if !LOGGED.swap(true, Ordering::Relaxed) {
+                warn!(
+                    "SDF point lights exceed MAX_POINT_LIGHTS ({MAX_POINT_LIGHTS}); {overflow} dropped"
+                );
+            }
+        }
+        light_grid.0.rebuild(&light_table.lights);
+        lights_gen.0 = lights_gen.0.wrapping_add(1).max(1); // never 0 (0 = "nothing uploaded yet")
+    }
     // The GPU material table mirrors the global registry verbatim: row i = the
     // material with global id i. Bricks index it by their palette ids. Rebuilt only
     // when the registry changes (it is the single source of truth, not per-volume).
@@ -754,7 +930,10 @@ fn prepare_sdf_camera_data(
                 _pad0: 0,
                 _pad1: 0,
                 _pad2: 0,
-                emissive: def.emissive.extend(0.0),
+                // PHYSICAL: authored emissive (display-referred) lifted into physical luminance so
+                // it survives the lit pass's exposure (× EMISSIVE_NITS_SCALE). Keeps emissive
+                // surfaces ~as bright as before under the calibrated ev100.
+                emissive: (def.emissive * EMISSIVE_NITS_SCALE).extend(0.0),
             });
         }
     }
@@ -781,18 +960,18 @@ fn prepare_sdf_camera_data(
         let prev_clip_from_world = *prev_clip.entry(entity).or_insert(clip_from_world);
         prev_clip.insert(entity, clip_from_world);
 
+
         commands.entity(entity).insert(SdfCameraData {
             inv_view_proj,
             clip_from_world,
             prev_clip_from_world,
             camera_pos: transform.translation.extend(0.0),
-            // z = second-order grazing-step curvature `k` (sdf::march, SDF_SECOND_ORDER_STEP);
-            // w unused (was surface_bias — iso-offset removed).
+            // z unused; w = shadow LOD floor (the "Shadow detail" slider; read as u32 by `shadow_lod_bias()`).
             screen_params: Vec4::new(
                 size.x as f32,
                 size.y as f32,
-                raymarch.second_order_k,
                 0.0,
+                raymarch.shadow_lod_bias as f32,
             ),
             grid_origin: Vec4::new(
                 config.world_origin().x,
@@ -831,8 +1010,11 @@ fn prepare_sdf_camera_data(
                 config.voxel_size,
                 config.cell_stride() as f32,
             ),
-            sun_dir: sun.0.extend(0.0),
-            sun_color: sun.1.extend(0.0),
+            // w = shadow light cap (how many point lights cast SDF shadows per pixel); read as u32.
+            sun_dir: sun.0.extend(raymarch.shadow_light_cap as f32),
+            // rgb = physical sun radiance (lux); w = the camera exposure scalar the lit pass
+            // multiplies the whole composite by (physical lux/candela → display range).
+            sun_color: sun.1.extend(sdf_exposure()),
         });
     }
 }
@@ -892,6 +1074,7 @@ fn rebuild_pipeline_on_def_change(
                 pipeline.layout_0.clone(),
                 pipeline.layout_1.clone(),
                 pipeline.layout_2.clone(),
+                pipeline.layout_3.clone(),
             ],
             vertex: vertex_state.clone(),
             fragment: Some(FragmentState {
@@ -1023,40 +1206,65 @@ fn prepare_sdf_materials_gpu(
     mut gpu_atlas: ResMut<SdfGpuAtlas>,
 ) {
     let Some(extracted) = extracted else { return };
-    // std430: each GpuSdfMaterial is 80 bytes (vec4 + f32 + 5×u32 + 3×f32 + 3×u32 pad +
-    // vec4 emissive). The pads align `emissive` to its 16-byte boundary at offset 64.
-    let mut bytes = Vec::with_capacity(extracted.materials.len() * 80);
-    for m in &extracted.materials {
-        for c in [
-            m.base_color.x,
-            m.base_color.y,
-            m.base_color.z,
-            m.base_color.w,
-        ] {
-            bytes.extend_from_slice(&c.to_le_bytes());
-        }
-        bytes.extend_from_slice(&m.blend_softness.to_le_bytes());
-        bytes.extend_from_slice(&m.tex_diffuse.to_le_bytes());
-        bytes.extend_from_slice(&m.tex_normal.to_le_bytes());
-        bytes.extend_from_slice(&m.tex_mra.to_le_bytes());
-        bytes.extend_from_slice(&m.tex_height.to_le_bytes());
-        bytes.extend_from_slice(&m.tex_edge.to_le_bytes());
-        bytes.extend_from_slice(&m.metallic.to_le_bytes());
-        bytes.extend_from_slice(&m.roughness.to_le_bytes());
-        bytes.extend_from_slice(&m.parallax_scale.to_le_bytes());
-        bytes.extend_from_slice(&0u32.to_le_bytes()); // _pad0
-        bytes.extend_from_slice(&0u32.to_le_bytes()); // _pad1
-        bytes.extend_from_slice(&0u32.to_le_bytes()); // _pad2
-        for c in [m.emissive.x, m.emissive.y, m.emissive.z, m.emissive.w] {
-            bytes.extend_from_slice(&c.to_le_bytes());
-        }
+    // GpuSdfMaterial is `#[repr(C)]` + Pod, laid out to match the 80-byte std430 SdfMaterial in
+    // bindings.wgsl (the explicit pad fields align `emissive` to offset 64), so it casts directly.
+    gpu_atlas.material_buffer = Some(gpu::storage_buffer_init(
+        &device,
+        "sdf_material_buffer",
+        &extracted.materials,
+    ));
+}
+
+/// Extract the point-light table + world grid into the render world — but ONLY when the light
+/// generation bumped (lights moved / added / removed). On an unchanged frame this is a no-op and
+/// the prior extracted resources persist, so the clone + the downstream GPU upload are both skipped.
+/// Tagged with the gen so `prepare_sdf_lights_gpu` can compare against what's already on the GPU.
+fn extract_sdf_lights(
+    generation: Extract<Res<SdfLightsGen>>,
+    table: Extract<Res<SdfPointLightTable>>,
+    grid: Extract<Res<SdfLightGrid>>,
+    mut last_gen: Local<u32>,
+    mut commands: Commands,
+) {
+    if generation.0 == *last_gen {
+        return; // unchanged since the last extract — keep the existing extracted data
     }
-    let buffer = device.create_buffer_with_data(&BufferInitDescriptor {
-        label: Some("sdf_material_buffer"),
-        contents: &bytes,
-        usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
+    *last_gen = generation.0;
+
+    // Always carry ≥1 light row — a `range = 0` sentinel the shader skips — so the storage buffer
+    // is never zero-sized in an unlit scene.
+    let mut lights = table.lights.clone();
+    if lights.is_empty() {
+        lights.push(GpuPointLight::default());
+    }
+    commands.insert_resource(ExtractedSdfPointLights { lights });
+    commands.insert_resource(ExtractedSdfLightGrid {
+        cells: grid.0.cells.clone(),
+        index_buf: grid.0.index_buf.clone(),
+        generation: generation.0,
     });
-    gpu_atlas.material_buffer = Some(buffer);
+}
+
+/// Upload the point-light buffer + light-grid cell/index buffers (group 3) — but ONLY when the
+/// extracted gen is newer than what's on the GPU. A static light set never bumps the gen, so this
+/// skips the buffer rebuild every frame; the `init_sdf_pipeline` dummies stay bound until gen ≥ 1.
+fn prepare_sdf_lights_gpu(
+    device: Res<RenderDevice>,
+    lights: Option<Res<ExtractedSdfPointLights>>,
+    grid: Option<Res<ExtractedSdfLightGrid>>,
+    mut gpu: ResMut<SdfGpuLights>,
+) {
+    let (Some(lights), Some(grid)) = (lights, grid) else {
+        return; // no lights extracted yet — dummies remain bound
+    };
+    if grid.generation == gpu.uploaded_gen {
+        return; // already uploaded this generation
+    }
+    // All `#[repr(C)]` + Pod; the helper handles the empty case so no buffer is ever zero-sized.
+    gpu.point_buffer = Some(gpu::storage_buffer_init(&device, "sdf_point_light_buffer", &lights.lights));
+    gpu.cell_buffer = Some(gpu::storage_buffer_init(&device, "sdf_light_cell_buffer", &grid.cells));
+    gpu.index_buffer = Some(gpu::storage_buffer_init(&device, "sdf_light_index_buffer", &grid.index_buf));
+    gpu.uploaded_gen = grid.generation;
 }
 
 // --- Render World: Pipeline Init ---
@@ -1121,12 +1329,29 @@ fn init_sdf_pipeline(
             (texture_2d(TextureSampleType::Float { filterable: false }),),
         ),
     );
+    // group 3: scene point lights. FRAGMENT | COMPUTE so the (future) DDGI probe-trace compute
+    // pass can bind the same `GpuPointLight` buffer. Only the gbuffer (fragment) pipeline lists
+    // this layout, so the cone-prepass compute pipeline is unaffected.
+    let layout_3 = BindGroupLayoutDescriptor::new(
+        "sdf_bind_group_3",
+        &BindGroupLayoutEntries::sequential(
+            ShaderStages::FRAGMENT | ShaderStages::COMPUTE,
+            (
+                // binding 0: point-light array
+                storage_buffer_read_only::<GpuPointLight>(false),
+                // binding 1: world-space light-grid cell directory
+                storage_buffer_read_only::<super::light_grid::GpuLightCell>(false),
+                // binding 2: flat per-cell light-index runs
+                storage_buffer_read_only::<u32>(false),
+            ),
+        ),
+    );
     let shader = shader_handle.0.clone();
     let vertex_state = fullscreen_shader.to_vertex_state();
 
     let pipeline_id = pipeline_cache.queue_render_pipeline(RenderPipelineDescriptor {
         label: Some("sdf_gbuffer_pipeline".into()),
-        layout: vec![layout_0.clone(), layout_1.clone(), layout_2.clone()],
+        layout: vec![layout_0.clone(), layout_1.clone(), layout_2.clone(), layout_3.clone()],
         vertex: vertex_state,
         fragment: Some(FragmentState {
             shader: shader.clone(),
@@ -1161,6 +1386,26 @@ fn init_sdf_pipeline(
         label: Some("sdf_dummy_material"),
         contents: &[0u8; 80],
         usage: BufferUsages::STORAGE,
+    });
+    // One zeroed 32-byte GpuPointLight (range = 0 → the shader skips it) so the group-3 binding is
+    // valid before the first point-light upload. Replaced by prepare_sdf_lights_gpu on light change.
+    let dummy_point_light = device.create_buffer_with_data(&BufferInitDescriptor {
+        label: Some("sdf_dummy_point_light"),
+        contents: &[0u8; 32],
+        usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
+    });
+    // Light-grid dummies: one sentinel cell (16 B, key = u32::MAX so the binary search never
+    // matches a real probe) + one index (4 B), so group-3 bindings 1/2 are valid before the first
+    // grid upload.
+    let dummy_light_cell = device.create_buffer_with_data(&BufferInitDescriptor {
+        label: Some("sdf_dummy_light_cell"),
+        contents: &[0xffu8; 16],
+        usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
+    });
+    let dummy_light_index = device.create_buffer_with_data(&BufferInitDescriptor {
+        label: Some("sdf_dummy_light_index"),
+        contents: &[0u8; 4],
+        usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
     });
     // Dummy 1×1×1 PBR arrays + a filtering sampler so bind group 1 is valid before
     // the texture library uploads. Each is a D2Array view of one zeroed layer.
@@ -1206,9 +1451,17 @@ fn init_sdf_pipeline(
         layout_0,
         layout_1,
         layout_2,
+        layout_3,
         shader_handle: shader,
         // Queued above with empty shader_defs; rebuild fires once the synced defs differ.
         current_defs: Vec::new(),
+    });
+    // Group-3 light buffers, seeded with dummies until the first upload.
+    commands.insert_resource(SdfGpuLights {
+        point_buffer: Some(dummy_point_light),
+        cell_buffer: Some(dummy_light_cell),
+        index_buffer: Some(dummy_light_index),
+        uploaded_gen: 0, // dummies = "nothing uploaded yet"; prepare uploads once lights gen ≥ 1
     });
     commands.insert_resource(SdfGpuAtlas {
         // Empty page pool (its own 1×1 dummies fill the binding array until the first bake grows it).

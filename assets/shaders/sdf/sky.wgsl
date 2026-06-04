@@ -19,15 +19,23 @@ fn sky_gradient(dir: vec3<f32>) -> vec3<f32> {
     return mix(horizon, ground, pow(-up, 0.5));
 }
 
+// Approximate physical luminance scale (nits) for the analytic sky. The renderer is fully
+// physical (sun in lux, point lights in candela), and the lit pass applies the camera exposure to
+// the sky too — so the artistic gradient below must be lifted into physical luminance or it would
+// crush to black after exposure. Tuned against `SDF_EXPOSURE_EV100` (~11.5) so a daytime sky reads
+// naturally; raise/lower alongside ev100.
+const SKY_LUMINANCE: f32 = 4000.0;
+
 // Full environment radiance in direction `dir` (sun direction `sun`): the gradient plus a
 // crisp sun disk and a soft halo. This is what a mirror ray sees — used as the background
-// and as the specular reflection colour.
+// and as the specular reflection colour. Returned in physical luminance (× SKY_LUMINANCE).
 fn sky_color(dir: vec3<f32>, sun: vec3<f32>) -> vec3<f32> {
     // Sun disk (crisp) + glow (soft halo) where the ray aligns with the sun.
     let sd = max(dot(dir, sun), 0.0);
     let disk = smoothstep(0.9985, 0.9996, sd);
     let glow = pow(sd, 64.0) * 0.4;
-    return sky_gradient(dir) + vec3<f32>(1.0, 0.95, 0.85) * (disk * 8.0 + glow);
+    let artistic = sky_gradient(dir) + vec3<f32>(1.0, 0.95, 0.85) * (disk * 8.0 + glow);
+    return artistic * SKY_LUMINANCE;
 }
 
 // Diffuse hemisphere irradiance for a surface normal `n`: the sky gradient WITHOUT the

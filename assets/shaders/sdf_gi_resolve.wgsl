@@ -24,6 +24,7 @@ struct ProbeParams {
     gi_range: f32,
     normal_bias: f32,
     view_bias: f32,
+    sky_intensity: f32, // unused here; kept so the layout matches the shared ProbeParams buffer
 };
 
 @group(2) @binding(0) var gbuf_albedo: texture_2d<f32>;     // a = camera distance

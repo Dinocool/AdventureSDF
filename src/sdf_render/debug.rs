@@ -231,19 +231,6 @@ fn register_shader_modes(app: &mut App) {
         description: "Bypass the per-ray chunk lookup cache (always binary-search)".into(),
     });
 
-    // Independent toggle: second-order (quadratic-Taylor) grazing step (Moinet & Neyret EG2025).
-    // Speculative larger steps for tangent/grazing rays via the field's forward derivative. A/B it
-    // against the SDF GPU-passes "gbuffer" timer + the Steps heatmap. Tune SECOND_ORDER_K in
-    // march.wgsl. Watch thin objects for tunnelling. Diagnostic / experimental — leave OFF normally.
-    registry.register(ShaderDebugMode {
-        id: "sdf/second_order_step".into(),
-        label: "2nd-order step".into(),
-        shader_define: "SDF_SECOND_ORDER_STEP".into(),
-        kind: DebugModeKind::Toggle,
-        description: "Second-order quadratic-Taylor grazing step (experimental; tune 2nd-order K)"
-            .into(),
-    });
-
     // Independent toggle: force LOD 0 only (no clipmap shells). If enabling this fixes a
     // visual artifact, the bug is LOD/shell related. Diagnostic — leave OFF normally.
     registry.register(ShaderDebugMode {
@@ -288,12 +275,10 @@ fn register_shader_modes(app: &mut App) {
 
     // Default sun shadows ON so the lit render shows them without hunting for the checkbox. The
     // state resource is separate from the registry; seed it after the `registry` borrow above
-    // ends (NLL drops it at last use). Second-order grazing step also ON by default — it's now a
-    // real win on the (Lipschitz-normalised) terrain; tune via the "2nd-order K" raymarch slider.
+    // ends (NLL drops it at last use).
     {
         let mut state = app.world_mut().resource_mut::<ShaderDebugState>();
         state.set("sdf/shadows", true);
-        state.set("sdf/second_order_step", true);
     }
 }
 
@@ -563,12 +548,15 @@ fn render_panel(world: &mut World, ui: &mut egui::Ui) {
                 }
             }),
     );
-    // Second-order grazing-step curvature `k` (only active with the "2nd-order step" toggle on).
-    // Lower = larger speculative steps on grazing/tangent rays (faster, more overshoot risk).
+    // How many point lights cast SDF shadows per pixel (brightest-first of those reaching the
+    // surface); the rest add unshadowed. Higher = more shadowed lights but costlier; 0 = none.
     ui.add(
-        egui::Slider::new(&mut params.second_order_k, 0.002..=8.0)
-            .logarithmic(true)
-            .text("2nd-order K (lower = bigger steps)"),
+        egui::Slider::new(&mut params.shadow_light_cap, 0..=32).text("Shadow lights"),
+    );
+    // Floor the shadow march LOD (sun + point shadows): higher = coarser/blobbier shadows but far
+    // fewer march steps (shadows are the gbuffer's biggest cost). 0 = finest/sharpest.
+    ui.add(
+        egui::Slider::new(&mut params.shadow_lod_bias, 0..=4).text("Shadow detail (0 = sharpest)"),
     );
 
     ui.separator();
@@ -595,6 +583,7 @@ fn render_panel(world: &mut World, ui: &mut egui::Ui) {
             .text("Accumulation (N_max = 1/(1−h))"),
     );
     ui.add(egui::Slider::new(&mut ddgi.intensity, 0.0..=8.0).text("Intensity"));
+    ui.add(egui::Slider::new(&mut ddgi.gi_sky_intensity, 0.0..=2.0).text("Sky GI intensity"));
     ui.add(egui::Slider::new(&mut ddgi.normal_bias, 0.0..=2.0).text("Normal bias (×cell)"));
     ui.add(egui::Slider::new(&mut ddgi.view_bias, 0.0..=2.0).text("View bias (×cell)"));
     ui.add(

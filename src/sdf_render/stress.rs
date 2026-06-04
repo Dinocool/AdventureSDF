@@ -109,6 +109,10 @@ pub fn expand_tower_spawners(
 ) {
     for (entity, spawner) in &spawners {
         let edits = tower_field_edits(&spawner.field_params());
+        // One point light per tower (at its cap), to stress the point-light path + the world-space
+        // light grid at scale (~3000 lights). Per-tower hue makes the per-tower pools visually
+        // distinct so the culling is easy to verify. NonSerializable, like the towers.
+        let mut cap_index: u32 = 0;
         for (order, transform, prim, role) in edits {
             let asset = Some(std::path::PathBuf::from(format!(
                 "materials/{}.material.ron",
@@ -126,8 +130,54 @@ pub fn expand_tower_spawners(
                 crate::soul_scene::NonSerializable,
                 ChildOf(entity),
             ));
+            if role == TowerRole::Cap {
+                let idx = cap_index;
+                cap_index += 1;
+                // Golden-ratio hue walk for an even rainbow spread across the field.
+                let hue = (idx as f32 * 0.618_034).fract() * 360.0;
+                // Deterministic per-tower offset: push the light off to a random side + above the
+                // cap (not straight overhead) so each tower throws a real DIRECTIONAL shadow, in a
+                // different direction per tower. Hash the cap index so it's stable across reloads.
+                let h = idx.wrapping_mul(2_654_435_761);
+                let ang = (h & 0xffff) as f32 / 65_535.0 * std::f32::consts::TAU;
+                let rad = 2.0 + ((h >> 16) & 0xff) as f32 / 255.0 * 2.5; // 2.0 .. 4.5 m to the side
+                let up = 2.5 + ((h >> 24) & 0xff) as f32 / 255.0 * 2.0; //  2.5 .. 4.5 m above the cap
+                let offset = Vec3::new(ang.cos() * rad, up, ang.sin() * rad);
+                commands.spawn((
+                    Name::new("Tower Light"),
+                    PointLight {
+                        color: Color::hsl(hue, 0.85, 0.55),
+                        // Punchy on purpose — this is a stress DEMO, so each tower should throw an
+                        // obvious coloured pool (physical lumens; candela = intensity/4π). Range
+                        // ~tower-spacing so a light reaches its tower + the ground around it.
+                        intensity: 1_000_000.0,
+                        range: 10.0,
+                        // Source SIZE (sphere): soft shadow edge + no inverse-square singularity.
+                        radius: 1.5,
+                        shadows_enabled: false,
+                        ..default()
+                    },
+                    // Offset off to a side + above the cap so the tower casts a directional shadow.
+                    Transform::from_translation(transform.translation + offset),
+                    // Full editor node: `Node3D` (→ SceneNode) puts it in the scene tree;
+                    // `EditorGizmo::PointLight` makes it viewport-pickable + draws the bulb/range
+                    // rings. The gizmo DRAW is camera-distance-culled (node_gizmos) so thousands of
+                    // these don't tank the editor; picking is click-time so far lights still select.
+                    Node3D,
+                    crate::node::EditorGizmo::PointLight { scale: 1.0 },
+                    SceneEntity,
+                    crate::soul_scene::NonSerializable,
+                    ChildOf(entity),
+                ));
+            }
         }
-        commands.entity(entity).insert(TowerSpawnerExpanded);
+        // The spawned `PointLight` children carry `InheritedVisibility` (a `PointLight` required
+        // component); Bevy's visibility propagation warns (B0004) if their parent lacks the
+        // visibility chain. Give the spawner a default `Visibility` so the parent is a valid
+        // visibility root for its light children.
+        commands
+            .entity(entity)
+            .insert((TowerSpawnerExpanded, Visibility::default()));
     }
 }
 
@@ -255,5 +305,33 @@ mod tests {
             .iter(app.world())
             .count();
         assert_eq!(volumes_after_second, expected, "expansion must be idempotent");
+    }
+
+    /// Expansion spawns exactly one `PointLight` per tower (per `TowerRole::Cap`), tagged
+    /// `SceneEntity` (so the SDF light extraction picks it up) and positioned at the cap.
+    #[test]
+    fn spawner_spawns_a_point_light_per_tower() {
+        let mut app = App::new();
+        app.add_systems(Update, expand_tower_spawners);
+
+        let small = TowerSpawner {
+            half_extent: 30.0,
+            spacing: 10.0,
+            ..default()
+        };
+        let caps = tower_field_edits(&small.field_params())
+            .iter()
+            .filter(|(_, _, _, r)| *r == TowerRole::Cap)
+            .count();
+        assert!(caps > 0, "the small field must have towers");
+        app.world_mut().spawn(small);
+        app.update();
+
+        let lights = app
+            .world_mut()
+            .query_filtered::<&PointLight, With<SceneEntity>>()
+            .iter(app.world())
+            .count();
+        assert_eq!(lights, caps, "one SceneEntity point light per tower cap");
     }
 }
