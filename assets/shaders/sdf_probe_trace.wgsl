@@ -31,6 +31,7 @@ struct ProbeParams {
     gi_range: f32,
     normal_bias: f32,
     view_bias: f32,
+    sky_intensity: f32,
 };
 
 // Single in-place octahedral irradiance buffer: probe `slot`'s OCT_RES² texels live at
@@ -258,7 +259,10 @@ fn main(
                 let mq = MarchQuality(4.0, 24u, params.gi_range, id.lod);
                 let r = raymarch(origin, dir, 0.05, mq);
                 if (r.fate == 1u) {
-                    radiance = sky_color(dir, sun);
+                    // Escaped to the sky: the analytic environment is physical (× SKY_LUMINANCE), so
+                    // scale it by `sky_intensity` — 1.0 lets the sky bounce into the scene, 0.0 isolates
+                    // GI to scene emitters + sun (interiors / the harness isolation gates).
+                    radiance = sky_color(dir, sun) * params.sky_intensity;
                 } else if (r.hit) {
                     let m = material_at(r.object_id);
                     let nrm = calc_normal(r.hit_pos);

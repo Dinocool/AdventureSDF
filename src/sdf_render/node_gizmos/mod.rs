@@ -19,6 +19,11 @@ pub mod directional_light;
 pub mod draw;
 pub mod point_light;
 
+/// Beyond this camera distance a node's gizmo is not DRAWN (it's still pickable — picking is
+/// click-time). Bounds the per-frame gizmo-tessellation cost when a scene holds thousands of
+/// node gizmos (the per-tower stress lights); the current selection always draws regardless.
+const MAX_GIZMO_DRAW_DIST: f32 = 80.0;
+
 /// Everything a kind's `draw` needs, resolved once per node by the dispatcher.
 pub struct NodeGizmoCtx<'a> {
     pub origin: Vec3,
@@ -76,14 +81,31 @@ fn draw_node_gizmos(
     cameras: Query<(&Camera, &Transform), With<SdfCamera>>,
     windows: Query<&Window>,
     selection: Res<crate::sdf_render::SdfSelection>,
+    visibility: Res<crate::sdf_render::GizmoVisibility>,
 ) {
     let camera = cameras.single().ok();
     let window_h = windows.single().map(|w| w.height()).unwrap_or(1080.0);
+    // Camera position for the draw-distance cull (below). Stress scenes can hold thousands of
+    // point-light nodes; drawing every one's rings/bulb each frame would swamp the gizmo
+    // tessellator, so only nodes within `MAX_GIZMO_DRAW_DIST` (plus the current selection) draw.
+    // Picking is click-time (sdf_picking), so far nodes still select — they just don't draw a gizmo.
+    let cam_pos = camera.map(|(_, xf)| xf.translation);
     let mut painter = NodeGizmoPainter {
         scene: &mut scene,
         overlay: &mut overlay,
     };
     for (entity, xf, gizmo, point_light) in &nodes {
+        // Per-type visibility toggle (editor "View" menu). Hidden kinds draw nothing.
+        if !visibility.is_visible(gizmo.kind()) {
+            continue;
+        }
+        let selected = selection.entity == Some(entity);
+        if !selected
+            && let Some(cam) = cam_pos
+            && xf.translation().distance_squared(cam) > MAX_GIZMO_DRAW_DIST * MAX_GIZMO_DRAW_DIST
+        {
+            continue;
+        }
         let scale = match *gizmo {
             EditorGizmo::DirectionalLight { scale }
             | EditorGizmo::PointLight { scale }
@@ -95,7 +117,7 @@ fn draw_node_gizmos(
             rotation: xf.rotation(),
             scale,
             light: point_light.map(|l| (l.range, l.radius)),
-            selected: selection.entity == Some(entity),
+            selected,
             camera,
             window_h,
         };

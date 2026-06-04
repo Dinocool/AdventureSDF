@@ -51,6 +51,7 @@ struct ProbeParams {
     gi_range: f32,
     normal_bias: f32,
     view_bias: f32,
+    sky_intensity: f32,
 }
 
 #[derive(Resource)]
@@ -212,6 +213,7 @@ pub(super) fn prepare_sdf_probe(
         gi_range: params_res.gi_range.max(1.0),
         normal_bias: params_res.normal_bias.max(0.0),
         view_bias: params_res.view_bias.max(0.0),
+        sky_intensity: params_res.gi_sky_intensity.max(0.0),
     };
     let mut ubytes = bevy::render::render_resource::encase::UniformBuffer::new(Vec::<u8>::new());
     ubytes.write(&p).unwrap();

@@ -6,14 +6,15 @@
 
 #import bevy_core_pipeline::fullscreen_vertex_shader::FullscreenVertexOutput
 
-#import sdf::bindings::{camera, max_steps, max_dist, pixel_cone, voxel_size_at, TEXTURE_WORLD_SCALE}
+#import sdf::bindings::{camera, max_steps, max_dist, pixel_cone, voxel_size_at, shadow_light_cap, TEXTURE_WORLD_SCALE}
 #import sdf::march::{raymarch, MarchQuality, RaymarchResult}
 #import sdf::brick::{scene_sdf, calc_normal}
 #import sdf::pbr::{resolve_surface, sun_dir, PbrInputs}
 #import sdf::material::material_at
 #import sdf::oct::oct_encode
 #import sdf::sky::sky_color
-#import sdf::shadows::surface_shadow
+#import sdf::shadows::{surface_shadow, sphere_light_shadow}
+#import sdf::lights::{point_lights, light_indices, lights_in_cell, point_attenuation, direct_light}
 
 // Cone-prepass seed texture: per-8×8-tile start distance (R32Float), written by
 // sdf_cone_prepass.wgsl. The march starts each pixel at its tile's seed-t instead of 0,
@@ -22,6 +23,15 @@
 // so starting from it never skips geometry. Group 2 — groups 0/1 are camera + atlas.
 @group(2) @binding(0) var cone_seed: texture_2d<f32>;
 const CONE_TILE: i32 = 8;
+// CONTRIBUTION-based shadow cull: a light casts a shadow only when its strength AT THIS PIXEL
+// (radiance × attenuation — already distance-aware via 1/d²) is at least this fraction of the
+// brightest light at the pixel. The dominant light(s) always shadow; only low-contrast shadows
+// drop. (NOT distance-from-the-light: a light's shadow falls FAR from it, near its range edge —
+// culling by range would throw away exactly the prominent ground shadows.)
+const SHADOW_CONTRIB_FRACTION: f32 = 0.05;
+// Below this fraction of the brightest light at the pixel, a light is skipped ENTIRELY (no BRDF, no
+// shadow) — its lit contribution is imperceptible next to the dominant light.
+const LIGHT_SKIP_FRACTION: f32 = 0.02;
 
 // Deferred G-buffer. The primary SDF march no longer shades — it exports surface attributes into
 // three MRT targets that the deferred lit pass (and, later, the world-space GI probe pass)
@@ -144,22 +154,92 @@ fn main(in: FullscreenVertexOutput) -> FragmentOutput {
     let scene = scene_sdf(hit_pos);
     let p: PbrInputs = resolve_surface(scene, hit_pos, geo_normal, lod);
 
-    // Emissive radiance from the hit material (premultiplied by intensity CPU-side). This is the
-    // self-lit term the lit pass adds directly; the GI probe tracer will read the SAME table.
-    let emissive = material_at(scene.object_id).emissive.rgb;
+    // Self-lit material emissive (premultiplied by intensity CPU-side). The GI probe tracer reads
+    // the SAME table. Direct lighting (sun + points) is summed into this channel below.
+    let material_emissive = material_at(scene.object_id).emissive.rgb;
 
-    // Sun visibility, marched HERE (the G-buffer pass has the atlas + march; the lit pass is
-    // deliberately atlas-free). Stored in emissive.a so the lit pass can shadow the analytic sun
-    // without re-marching. 1 = lit, 0 = shadowed. Off (1.0) when SDF_SHADOWS is disabled.
+    // Shared shading inputs for EVERY light (the sun and each point light shade identically): the
+    // view direction + Fresnel F0.
+    let view = -ray_dir;
+    let f0 = mix(vec3<f32>(0.04), p.albedo, p.metallic);
+
+    // --- Direct sun (directional — no distance falloff) ---
+    // Shaded HERE alongside the point lights, through the SAME `direct_light` path, then folded into
+    // the emissive channel (the lit pass is a pure composite + expose). Skipped — INCLUDING the
+    // 256-unit shadow march — when there's no directional light (`sun_color.rgb == 0`) OR the
+    // surface faces away from the sun (`N·L <= 0`): a back-facing surface receives zero sun light, so
+    // marching its shadow is pure waste. `sun_vis` stays 1.0 in `.a` for the SDF_DEBUG_SUN_VIS view.
+    var sun_lit = vec3<f32>(0.0);
     var sun_vis = 1.0;
+    let sun_rad = camera.sun_color.rgb;
+    let sun = sun_dir();
+    if (max(sun_rad.x, max(sun_rad.y, sun_rad.z)) > 0.0 && dot(p.normal, sun) > 0.0) {
 #ifdef SDF_SHADOWS
-    sun_vis = surface_shadow(hit_pos, geo_normal, sun_dir(), rm.lod, 256.0);
+        sun_vis = surface_shadow(hit_pos, geo_normal, sun, rm.lod, 256.0);
 #endif
+        sun_lit = direct_light(view, p.normal, sun, p.albedo, p.roughness, p.metallic, f0, sun_rad, sun_vis);
+    }
 
+    // --- Direct point lighting ---
+    // The world-space light grid culls to just the lights in this surface point's world cell
+    // (`lights_in_cell`), so the loop is a handful, not the whole array. Each shades through the
+    // same `direct_light` as the sun, with 1/d² attenuation. Shadows: a bounded sphere-light march
+    // for the lights that matter here (the cap is a safety ceiling; the contribution cull skips
+    // low-contrast ones), the rest add unshadowed. The loop is NOT gated on SDF_SHADOWS — only the
+    // shadow march is.
+    var point_lit = vec3<f32>(0.0);
+    let cell = lights_in_cell(hit_pos);   // (base, count) into light_indices
+    let cell_base = cell.x;
+    let cell_count = cell.y;
+    // Count lights actually shadow-marched (NOT the loop index): the cell run is brightest-first
+    // and includes lights that don't reach this surface (range-culled below), so gating on the raw
+    // index would let a few bright-but-distant lights burn the whole shadow budget before the loop
+    // reaches the light actually lighting this point. Budget the cap against lights that reach here.
+    var shadowed = 0u;
+    let cap = shadow_light_cap();
+    var brightest = 0.0;   // strongest per-pixel light STRENGTH (radiance × attenuation) seen
+    for (var i = 0u; i < cell_count; i = i + 1u) {
+        let pl = point_lights[light_indices[cell_base + i]];
+        let range = pl.pos_range.w;
+        if (range <= 0.0) { continue; }                    // sentinel / unused slot
+        let to_light = pl.pos_range.xyz - hit_pos;
+        let d2 = dot(to_light, to_light);
+        if (d2 >= range * range) { continue; }             // range cull (cell is coarser than range)
+        let radius = pl.color_radius.w;                    // light source size (sphere)
+        let rad = pl.color_radius.rgb;
+        let atten = point_attenuation(d2, range, radius);
+        // Cheap strength proxy (radiance × attenuation — NO BRDF / normalize yet). Drives the two
+        // culls: the run is brightest-first, so once strength drops below a fraction of the
+        // brightest light at this pixel, the rest are dimmer still.
+        let strength = max(rad.x, max(rad.y, rad.z)) * atten;
+        brightest = max(brightest, strength);
+        // Skip a negligible light ENTIRELY (no BRDF, no shadow) — invisible next to the dominant
+        // one. The dense overlapping-light stress case is mostly dim neighbours; this is the win.
+        if (strength < brightest * LIGHT_SKIP_FRACTION) { continue; }
+        let dist = sqrt(d2);
+        let l = to_light / max(dist, 1e-4);
+        // N·L cull: a light behind the surface contributes nothing (BRDF N·L = 0), so skip its
+        // BRDF AND its shadow march. In a dense field ~half the in-range lights face away.
+        if (dot(p.normal, l) <= 0.0) { continue; }
+        var vis = 1.0;
+#ifdef SDF_SHADOWS
+        // Sphere-light shadow (soft edge from the source size). Shadow the lights that actually
+        // matter here: skip the march for any whose contribution is a tiny fraction of the dominant
+        // light (its shadow would be low-contrast). `cap` is a safety ceiling on dense clusters.
+        if (shadowed < cap && strength >= brightest * SHADOW_CONTRIB_FRACTION) {
+            vis = sphere_light_shadow(hit_pos, geo_normal, l, rm.lod, dist, radius);
+            shadowed += 1u;
+        }
+#endif
+        point_lit += direct_light(view, p.normal, l, p.albedo, p.roughness, p.metallic, f0, rad * atten, vis);
+    }
+
+    // All direct lighting (sun + points) + material emissive → the emissive channel; the lit pass
+    // just composites + exposes. `.a` keeps sun visibility for the SDF_DEBUG_SUN_VIS view.
     return FragmentOutput(
         vec4<f32>(p.albedo, rm.dist),
         vec4<f32>(oct_encode(p.normal), p.metallic, p.roughness),
-        vec4<f32>(emissive, sun_vis),
+        vec4<f32>(material_emissive + sun_lit + point_lit, sun_vis),
         ndc_depth,
     );
 }

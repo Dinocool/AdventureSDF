@@ -6,7 +6,7 @@
 // loop, LOD cross-fade, iso-offset, and over-relaxation logic are unchanged from when this
 // lived in the entry shader — only the module boundary is new.
 
-#import sdf::bindings::{camera, sdf_eps, pixel_cone, over_relax, lod_blend_band, recenter_snap, lod_count, brick_world_at, CHUNK_BRICKS, voxel_size_at, clipmap_exit_t, second_order_k, DIST_BAND_VOXELS}
+#import sdf::bindings::{camera, sdf_eps, pixel_cone, over_relax, lod_blend_band, recenter_snap, lod_count, brick_world_at, CHUNK_BRICKS, voxel_size_at, clipmap_exit_t}
 #import sdf::brick::{
     world_to_brick_lod,
     load_material_distances,
@@ -180,10 +180,6 @@ fn raymarch(origin: vec3<f32>, dir: vec3<f32>, start_t: f32, q: MarchQuality) ->
     // the relaxed step overshot — undo it and re-take the safe `d` step.
     var prev_d = 0.0;
     var prev_step = 0.0;
-    // Was the previous step a speculative "boosted" step (a coarse-LOD leap or a second-order
-    // grazing step)? Such a step is NOT sphere-overlap-safe, so the Keinert undo below must skip it
-    // — but we still KEEP its (prev_d, prev_step) so the second-order step can reuse the slope.
-    var prev_boosted = false;
 
     for (var i = 0u; i < MAX_STEPS; i = i + 1u) {
         steps = i + 1u;
@@ -255,7 +251,7 @@ fn raymarch(origin: vec3<f32>, dir: vec3<f32>, start_t: f32, q: MarchQuality) ->
         // Over-relaxation validation FIRST (Keinert 2014): the previous relaxed step was safe
         // only if the new unbounding sphere of radius `d_eff` still reaches back over it. If
         // not, the relaxed step jumped PAST the surface — back up and resume plain tracing.
-        if (!prev_boosted && prev_step > 0.0 && d_eff + prev_d < prev_step) {
+        if (prev_step > 0.0 && d_eff + prev_d < prev_step) {
             t += prev_d - prev_step;                 // undo the overshoot (negative)
             prev_d = 0.0;
             prev_step = 0.0;
@@ -295,44 +291,16 @@ fn raymarch(origin: vec3<f32>, dir: vec3<f32>, start_t: f32, q: MarchQuality) ->
             return result;
         }
 
-        var march_d = d_eff;
-
-#ifdef SDF_SECOND_ORDER_STEP
-        // --- Second-order (quadratic-Taylor) grazing step [Moinet & Neyret, EG 2025] ------------
-        // A grazing/tangent ray crawls because `d_eff` is small for a long stretch — yet if the
-        // field is nearly FLAT along the ray (directional derivative f' ≈ 0, the tangent case) the
-        // surface is actually far ahead. Model the field along the ray as f(s) = f + f'·s + ½L₂·s²
-        // and step to where that quadratic first reaches the surface (= 0):
-        //     d_so = (f' + sqrt(f'² + 2·L₂·f)) / L₂        (grazing f'→0  ⇒  d_so ≈ sqrt(2f/L₂) ≫ f)
-        // f' is taken FREE from the last step's slope — `(f(p) − f(p_prev)) / step_prev` — so this
-        // adds NO field samples. L₂ = second_order_k() / voxel_size is a scale-aware curvature bound
-        // (editor "2nd-order K" slider). SPECULATIVE: L₂ is heuristic for a trilinear (only-C0) field,
-        // not a strict bound, so the Keinert sphere-overlap undo is suppressed for this step
-        // (`prev_boosted` below). Needs a valid prior slope (`prev_step > 0`); fires near the surface,
-        // below band saturation, where the grazing crawl lives.
-        if (prev_step > 0.0 && d_eff < DIST_BAND_VOXELS * voxel_size * 0.95) {
-            let fp = clamp((d_eff - prev_d) / prev_step, -1.0, 1.0);   // f' = ∇f·dir, |∇f| ≤ 1
-            let L2 = second_order_k() / voxel_size;          // curvature bound (scale-aware, uniform)
-            let d_so = (fp + sqrt(max(fp * fp + 2.0 * L2 * d_eff, 0.0))) / L2;
-            march_d = max(march_d, d_so);
-        }
-#endif
-
-        // Step `omega · march_d`, floored so we never stall and capped at the brick exit so the next
-        // iteration re-resolves LOD across bricks. Over-relax only the pure sphere-trace step; a
-        // second-order leap OR an active cross-fade steps plain (omega = 1) — the second-order step is
-        // already aggressive, and the blended field is non-eikonal.
-        let boosted = march_d > d_eff;     // the second-order step raised the step
+        // Step `omega · d_eff`, floored so we never stall and capped at the brick exit so the next
+        // iteration re-resolves LOD across bricks. Over-relax only the pure sphere-trace step; an
+        // active cross-fade steps plain (omega = 1) — the blended field is non-eikonal.
         let brick_exit = dist_to_brick_exit_lod(p, dir, lod);
-        let local_omega = select(OMEGA, 1.0, blending || boosted);
-        let step = clamp(local_omega * march_d, voxel_size * 0.01, brick_exit + voxel_size * 0.01);
+        let local_omega = select(OMEGA, 1.0, blending);
+        let step = clamp(local_omega * d_eff, voxel_size * 0.01, brick_exit + voxel_size * 0.01);
         t += step;
-        // Carry the slope memo for BOTH the Keinert undo and the next step's free derivative. A
-        // second-order leap KEEPS the memo so the derivative chains, but flags `prev_boosted` to
-        // suppress the (sphere-overlap-based) Keinert undo on the next step.
+        // Carry the slope memo for the Keinert overshoot-undo + the hit-refinement crossing.
         prev_d = d_eff;
         prev_step = step;
-        prev_boosted = boosted;
     }
 
     result.steps = MAX_STEPS;
