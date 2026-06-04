@@ -1,41 +1,31 @@
 // Deferred lit pass: the final deferred-lighting step of the SDF renderer.
 //
-// Reads the G-buffer and produces the lit pixel:
+// Reads the G-buffer (group 2) + the screen-space-denoised indirect-GI texture (group 1) and produces
+// the lit pixel:
 //   - ANALYTIC SUN: a sharp directional key light through the Frostbite BRDF, shadowed by the
 //     sun-visibility the G-buffer pass marched into emissive.a.
 //   - EMISSIVE: self-lit surfaces pass their radiance through.
-//
-// Indirect GI (the radiance cascade) has been removed; a world-anchored irradiance-probe volume
-// will be added here later (see plans/sdf-ddgi-probe-volume.md) — its term will sum into `lit`
-// alongside the sun + emissive.
+//   - INDIRECT (DDGI): the probe irradiance — resolved per pixel and edge-aware blurred in the
+//     gi_resolve / gi_blur passes (render/gi.rs), already scaled by intensity — composited as
+//     `albedo × gi`. (Moved out of this shader so the coarse probe field can be denoised in screen
+//     space; a bare probe lattice reads as blocks otherwise.)
 //
 // Output is LINEAR HDR; Bevy's tonemapping pass converts to display.
+//
+// Bind groups: 0 = camera, 1 = denoised GI texture + sampler, 2 = G-buffer.
 
 #import bevy_core_pipeline::fullscreen_vertex_shader::FullscreenVertexOutput
+#import sdf::bindings::camera
 #import sdf::oct::oct_decode
 #import sdf::brdf::frostbite_brdf
 
-struct LitCamera {
-    inv_view_proj: mat4x4<f32>,
-    clip_from_world: mat4x4<f32>,
-    prev_clip_from_world: mat4x4<f32>,
-    camera_pos: vec4<f32>,
-    screen_params: vec4<f32>,
-    grid_origin: vec4<f32>,
-    grid_dims: vec4<f32>,
-    debug_params: vec4<f32>,
-    march_params: vec4<f32>,
-    lod_params: vec4<f32>,
-    sun_dir: vec4<f32>,
-    sun_color: vec4<f32>,
-};
+@group(1) @binding(0) var gi_tex: texture_2d<f32>;   // denoised indirect irradiance (already × intensity)
+@group(1) @binding(1) var gi_sampler: sampler;
 
-@group(0) @binding(0) var<uniform> camera: LitCamera;
-
-@group(1) @binding(0) var gbuf_albedo: texture_2d<f32>;     // rgb = albedo, a = camera distance
-@group(1) @binding(1) var gbuf_normal_mat: texture_2d<f32>; // rg = octN, b = metal, a = rough
-@group(1) @binding(2) var gbuf_emissive: texture_2d<f32>;   // rgb = emissive, a = sun visibility
-@group(1) @binding(3) var gbuf_sampler: sampler;
+@group(2) @binding(0) var gbuf_albedo: texture_2d<f32>;     // rgb = albedo, a = camera distance
+@group(2) @binding(1) var gbuf_normal_mat: texture_2d<f32>; // rg = octN, b = metal, a = rough
+@group(2) @binding(2) var gbuf_emissive: texture_2d<f32>;   // rgb = emissive, a = sun visibility
+@group(2) @binding(3) var gbuf_sampler: sampler;
 
 const SKY_DIST: f32 = 1e8;
 
@@ -105,6 +95,13 @@ fn main(in: FullscreenVertexOutput) -> @location(0) vec4<f32> {
     let direct = frostbite_brdf(view, normal, sun, albedo, roughness, metallic, f0)
         * camera.sun_color.rgb * sun_vis;
 
-    let lit = direct + emissive;
+    // --- Indirect (DDGI): screen-space-denoised probe irradiance (already × intensity) ---
+    let gi = textureSampleLevel(gi_tex, gi_sampler, uv, 0.0).rgb;
+
+#ifdef SDF_DEBUG_GI
+    return vec4<f32>(albedo * gi, 1.0);
+#endif
+
+    let lit = direct + emissive + albedo * gi;
     return vec4<f32>(lit, 1.0);
 }

@@ -1,0 +1,7 @@
+MaterialAsset(
+  base_color: (0.12, 0.2, 0.85, 1.0),
+  blend_softness: 0.0,
+  metallic: 0.0,
+  roughness: 1.0,
+  parallax_scale: 0.0,
+)

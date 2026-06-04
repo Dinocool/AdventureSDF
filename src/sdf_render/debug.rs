@@ -18,7 +18,7 @@ use super::atlas::{BRICK_EDGE, BRICK_VOXELS, SdfAtlas};
 use super::bvh::Bvh;
 use super::{
     CsgKind, RayStepCapture, SdfCamera, SdfGridConfig, SdfMaterial, SdfOp, SdfOrbitCamera,
-    SdfOrder, SdfOverlayGizmos, SdfPrimitive, SdfRaymarchParams, SdfVolume,
+    DdgiParams, SdfOrder, SdfOverlayGizmos, SdfPrimitive, SdfRaymarchParams, SdfVolume,
     WireframeBoundsVisible, picking,
 };
 
@@ -37,6 +37,10 @@ pub struct SdfAtlasStats {
     pub blend_bytes: u64,
     pub lookup_bytes: u64,
     pub total_bytes: u64,
+    // DDGI probes: one block of `subdiv³` octahedral probes per resident brick (across ALL LODs —
+    // currently includes the redundant coarse-LOD overlap). `probe_bytes` is the irradiance buffer.
+    pub probe_count: u32,
+    pub probe_bytes: u64,
 }
 
 /// Controls the BVH wireframe overlay (drawn via [`draw_bvh`]).
@@ -209,6 +213,12 @@ fn register_shader_modes(app: &mut App) {
         "SDF_DEBUG_STEP_COUNT",
         "Raymarch step-count heatmap (blue = few → red = at the budget); step-capped pixels (e.g. grazing hill crests) glow red",
     ));
+    registry.register(overlay(
+        "sdf/gi",
+        "GI",
+        "SDF_DEBUG_GI",
+        "DDGI indirect irradiance term only (albedo × probe GI × intensity), no direct/emissive",
+    ));
 
     // Independent toggle (not part of the overlay group): bypass the per-ray chunk
     // lookup cache, forcing a fresh binary search every probe. If enabling this fixes a
@@ -289,7 +299,11 @@ fn register_shader_modes(app: &mut App) {
 
 // --- Atlas stats ---
 
-fn update_atlas_stats(mut stats: ResMut<SdfAtlasStats>, atlas: Res<SdfAtlas>) {
+fn update_atlas_stats(
+    mut stats: ResMut<SdfAtlasStats>,
+    atlas: Res<SdfAtlas>,
+    ddgi: Res<super::DdgiParams>,
+) {
     let total = atlas.bricks.len() as u64;
     let voxels = total * BRICK_VOXELS as u64;
 
@@ -305,6 +319,12 @@ fn update_atlas_stats(mut stats: ResMut<SdfAtlasStats>, atlas: Res<SdfAtlas>) {
         stats.dist_bytes + stats.object_bytes + stats.blend_bytes + stats.lookup_bytes;
 
     stats.total_bricks = total as u32;
+    // DDGI: subdiv³ octahedral probes per resident brick; the irradiance buffer is
+    // PROBE_OCT_TEXELS vec4<f32> (16 B) per probe.
+    let subdiv = ddgi.subdiv.clamp(1, 4) as u64;
+    let probes = total * subdiv * subdiv * subdiv;
+    stats.probe_count = probes as u32;
+    stats.probe_bytes = probes * super::probe::PROBE_OCT_TEXELS as u64 * 16;
     // 2D-tiled dims (matches the render atlas + preview): tiles wrap at 256/row.
     let tiles_per_row: u32 = 256;
     let num_rows = (total as u32).div_ceil(tiles_per_row).max(1);
@@ -549,6 +569,42 @@ fn render_panel(world: &mut World, ui: &mut egui::Ui) {
         egui::Slider::new(&mut params.second_order_k, 0.002..=8.0)
             .logarithmic(true)
             .text("2nd-order K (lower = bigger steps)"),
+    );
+
+    ui.separator();
+    ui.label("DDGI (Global Illumination)");
+    let mut ddgi = world.resource_mut::<DdgiParams>();
+    ui.checkbox(&mut ddgi.enabled, "Enable GI");
+    ui.add(
+        egui::Slider::new(&mut ddgi.subdiv, 1..=4)
+            .text("Probe subdiv (LOD0 density)")
+            .custom_formatter(|v, _| format!("{v:.0} ({:.0}³/brick)", v)),
+    );
+    ui.add(egui::Slider::new(&mut ddgi.ray_count, 8..=256).text("Rays / probe"));
+    ui.add(
+        egui::Slider::new(&mut ddgi.update_stride, 1..=16)
+            .text("Update stride (1/N probes per frame)"),
+    );
+    ui.add(
+        egui::Slider::new(&mut ddgi.gi_range, 4.0..=200.0)
+            .logarithmic(true)
+            .text("GI ray range (world units)"),
+    );
+    ui.add(
+        egui::Slider::new(&mut ddgi.hysteresis, 0.0..=0.99)
+            .text("Accumulation (N_max = 1/(1−h))"),
+    );
+    ui.add(egui::Slider::new(&mut ddgi.intensity, 0.0..=8.0).text("Intensity"));
+    ui.add(egui::Slider::new(&mut ddgi.normal_bias, 0.0..=2.0).text("Normal bias (×cell)"));
+    ui.add(egui::Slider::new(&mut ddgi.view_bias, 0.0..=2.0).text("View bias (×cell)"));
+    ui.add(
+        egui::Slider::new(&mut ddgi.gi_blur_depth_sigma, 0.01..=1.0)
+            .logarithmic(true)
+            .text("GI blur depth tol"),
+    );
+    ui.add(
+        egui::Slider::new(&mut ddgi.gi_blur_normal_power, 1.0..=64.0)
+            .text("GI blur normal stop"),
     );
 }
 

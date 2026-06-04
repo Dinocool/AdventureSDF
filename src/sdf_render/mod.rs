@@ -45,8 +45,10 @@ pub mod chunk;
 pub(crate) mod debug;
 pub(crate) mod editor_camera;
 pub mod edits;
-// The gallery is purely a scene GENERATOR (the runtime loads `assets/scenes/gallery.scene`); only
-// the regen test uses it, so the whole module is test-only.
+// The gallery + cornell modules are purely scene GENERATORS (the runtime loads the serialized
+// `assets/scenes/*.scene`); only the regen tests use them, so they're test-only.
+#[cfg(test)]
+mod cornell;
 #[cfg(test)]
 mod gallery;
 pub mod gizmo;
@@ -54,6 +56,7 @@ pub(crate) mod height;
 pub(crate) mod node_gizmos;
 pub(crate) mod overlays;
 pub(crate) mod picking;
+pub mod probe;
 pub mod render;
 pub(crate) mod scatter;
 pub(crate) mod stress;
@@ -209,6 +212,70 @@ impl Default for SdfRaymarchParams {
             // Second-order grazing-step curvature (ON by default via the "2nd-order step" toggle).
             // 0.5 is the measured sweet spot on the Lipschitz-normalised terrain.
             second_order_k: 0.5,
+        }
+    }
+}
+
+/// Live DDGI (probe-based global illumination) tuning. Extracted to the render world and packed into
+/// the probe-trace params uniform each frame; exposed as editor sliders (the knobs-as-uniforms
+/// invariant). `enabled` gates the whole trace + apply so GI can be toggled with no cost when off.
+#[derive(Resource, Reflect, Clone, bevy::render::extract_resource::ExtractResource)]
+#[reflect(Resource)]
+pub struct DdgiParams {
+    /// Whether DDGI runs at all (trace + apply). Off by default until the MVP is validated.
+    pub enabled: bool,
+    /// Rays traced per probe per frame (Fibonacci sphere). Higher = smoother irradiance, costlier.
+    pub ray_count: u32,
+    /// Caps the progressive-average sample count: `N_max = 1/(1-hysteresis)`. Higher = longer
+    /// steady-state window = more accumulated samples = smoother / less boil, but slower to react to
+    /// lighting changes (more lag). 0.95 ≈ 20 samples. Trades stability against responsiveness; the
+    /// history clamp (`change_thresh`) keeps boil bounded so this can sit lower than a plain EMA would.
+    pub hysteresis: f32,
+    /// Multiplies the gathered irradiance before it is added to the lit result.
+    pub intensity: f32,
+    /// Per-brick probe sub-lattice factor: each occupied brick emits `subdiv³` probes, so LOD-0
+    /// probe spacing is `brick_size / subdiv` (subdiv 1 = one probe/brick ≈ 0.7 m; 2 ≈ 0.35 m).
+    /// Costs `subdiv³`× probe rays + irradiance memory.
+    pub subdiv: u32,
+    /// Round-robin amortization: only `1/update_stride` of probes re-trace each frame (the rest carry
+    /// forward and converge over `update_stride` frames via temporal blend). Bounds per-frame trace
+    /// cost ~`1/update_stride`. 1 = trace every probe every frame (most expensive, no latency).
+    pub update_stride: u32,
+    /// Max distance (world units) a probe ray marches. Indirect bounce is local, so a short range
+    /// keeps per-ray cost bounded regardless of the multi-km clipmap reach (the dominant cost at high
+    /// LOD count). Geometry beyond this contributes via coarser/farther probes, not these rays.
+    pub gi_range: f32,
+    /// Apply-side surface bias along the normal, as a fraction of the probe cell: pushes the shading
+    /// point off the surface toward the lit side so trilinear favours front-facing probes (anti-leak).
+    pub normal_bias: f32,
+    /// Apply-side surface bias toward the camera, as a fraction of the probe cell: reduces self-shadow
+    /// artifacts at grazing angles (RTXGI view bias).
+    pub view_bias: f32,
+    /// Screen-space GI denoise: depth edge-stop tolerance (relative to camera distance). Lower = the
+    /// blur respects depth discontinuities more strictly (less bleed across surfaces, but can keep more
+    /// of the probe-lattice blocks); higher = wider blur across depth.
+    pub gi_blur_depth_sigma: f32,
+    /// Screen-space GI denoise: normal edge-stop sharpness. Higher = the blur stops harder at normal
+    /// discontinuities (creases, silhouettes); lower = smoother across them.
+    pub gi_blur_normal_power: f32,
+}
+
+impl Default for DdgiParams {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            ray_count: 128,
+            // Progressive-average window N_max = 1/(1-h) ≈ 20: accumulates per-frame-rotated ray sets
+            // (smoothness/low boil) while staying reasonably responsive; the history clamp bounds boil.
+            hysteresis: 0.95,
+            intensity: 1.0,
+            subdiv: 2,
+            update_stride: 4,
+            gi_range: 24.0,
+            normal_bias: 0.6,
+            view_bias: 0.1,
+            gi_blur_depth_sigma: 0.15,
+            gi_blur_normal_power: 16.0,
         }
     }
 }
@@ -392,6 +459,7 @@ impl Plugin for SdfScenePlugin {
             .init_resource::<bvh::Bvh>()
             .init_resource::<SdfRenderEnabled>()
             .init_resource::<SdfRaymarchParams>()
+            .init_resource::<DdgiParams>()
             .init_resource::<WireframeBoundsVisible>()
             .init_resource::<BakedBrickDebug>()
             .init_resource::<RayStepCapture>()
@@ -407,6 +475,7 @@ impl Plugin for SdfScenePlugin {
             .register_type::<edits::MaterialFields>()
             .register_type::<CsgKind>()
             .register_type::<SdfRaymarchParams>()
+            .register_type::<DdgiParams>()
             .register_type::<stress::TowerSpawner>()
             // Spawn the scene. Material ids come from the demand-driven asset table
             // (loaded MaterialAssets get stable registry ids); the compile step in
@@ -546,10 +615,11 @@ fn setup_sdf_scene(mut asset_table: ResMut<crate::assets::MaterialAssetTable>) {
     // loaded edit entities exist and the BVH can be built from them.
 }
 
-/// Path to the editor's default scene (the stress tower-field — heavy SDF load, used while
-/// profiling/optimizing the raymarch). The PBR gallery lives at `assets/scenes/gallery.scene`
-/// and can be loaded manually.
-pub const DEFAULT_SCENE_PATH: &str = "assets/scenes/stress.scene";
+/// Path to the editor's default scene: the Cornell GI box (white room + R/G/B objects + a white
+/// ceiling emissive — the DDGI showcase for colour bleeding / shadows / bounces). The PBR gallery
+/// (`assets/scenes/gallery.scene`) and the stress tower-field (`assets/scenes/stress.scene`, heavy
+/// SDF load for raymarch profiling) can be loaded manually via the scene browser.
+pub const DEFAULT_SCENE_PATH: &str = "assets/scenes/cornell.scene";
 
 /// Load the default scene into the world on editor enter. Exclusive (scene load
 /// needs `&mut World` + the type registry). Runs after `setup_sdf_scene` so the materials
