@@ -17,6 +17,8 @@
 #import sdf::march::{raymarch, MarchQuality}
 #import sdf::brick::{calc_normal, scene_sdf, world_to_brick_lod}
 #import sdf::material::material_at
+#import sdf::lights::point_lights_diffuse
+#import sdf::shadows::surface_shadow
 #import sdf::sky::sky_color
 #import sdf::oct::{oct_decode, oct_encode}
 #import sdf::probe::{subprobe_world_pos, probe_slot_at, decode_chunk_key, brick_coord_in_chunk, occ_bit_set, PROBE_OCT_RES, PROBE_OCT_TEXELS}
@@ -32,6 +34,7 @@ struct ProbeParams {
     normal_bias: f32,
     view_bias: f32,
     sky_intensity: f32,
+    bounce_shadows: f32, // >0.5 → shadow-march the sun + brightest point light at each bounce hit
 };
 
 // Single in-place octahedral irradiance buffer: probe `slot`'s OCT_RES² texels live at
@@ -266,11 +269,25 @@ fn main(
                 } else if (r.hit) {
                     let m = material_at(r.object_id);
                     let nrm = calc_normal(r.hit_pos);
-                    let ndl = max(dot(nrm, sun), 0.0);
-                    // emissive + albedo·(direct sun + prev-frame indirect = cheap infinite bounce).
+                    let albedo = m.base_color.rgb;
+                    let shadows = params.bounce_shadows > 0.5;
+                    // Direct lighting at the bounce, gathered as DIFFUSE-only Lambert (radiance·N·L).
+                    // DDGI caches diffuse irradiance, so the heavy view-dependent Frostbite specular the
+                    // primary pass uses would only inject firefly noise here. Sun first (directional),
+                    // shadowed by a march toward the sun — bounded to `gi_range` (GI is local) but using
+                    // the HIT's LOD (`r.lod`) for the shadow falloff, exactly like the primary pass.
+                    var direct = camera.sun_color.rgb * max(dot(nrm, sun), 0.0);
+                    if (shadows && max(direct.x, max(direct.y, direct.z)) > 0.0) {
+                        direct *= surface_shadow(r.hit_pos, nrm, sun, r.lod, params.gi_range);
+                    }
+                    // …then the point lights, via the SHARED gather in sdf::lights: the SAME world-grid
+                    // cull, brightest-first strength culls, `shadow_light_cap()` budget, and sphere-light
+                    // shadow (with the hit's LOD falloff) the G-buffer's direct pass uses — only the
+                    // final term is diffuse Lambert irradiance here instead of the Frostbite BRDF.
+                    direct += point_lights_diffuse(r.hit_pos, nrm, r.lod, shadows);
+                    // emissive + albedo·(direct + prev-frame indirect = cheap infinite bounce).
                     let indirect = sample_probe_gi(r.hit_pos, nrm);
-                    radiance = m.emissive.rgb
-                        + m.base_color.rgb * (camera.sun_color.rgb * ndl + indirect);
+                    radiance = m.emissive.rgb + albedo * (direct + indirect);
                 }
             }
             gs_rad[tid] = radiance;

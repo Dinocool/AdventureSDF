@@ -584,6 +584,7 @@ fn render_panel(world: &mut World, ui: &mut egui::Ui) {
     );
     ui.add(egui::Slider::new(&mut ddgi.intensity, 0.0..=8.0).text("Intensity"));
     ui.add(egui::Slider::new(&mut ddgi.gi_sky_intensity, 0.0..=2.0).text("Sky GI intensity"));
+    ui.checkbox(&mut ddgi.gi_bounce_shadows, "Bounce shadows (sun + points)");
     ui.add(egui::Slider::new(&mut ddgi.normal_bias, 0.0..=2.0).text("Normal bias (×cell)"));
     ui.add(egui::Slider::new(&mut ddgi.view_bias, 0.0..=2.0).text("View bias (×cell)"));
     ui.add(

@@ -105,12 +105,12 @@ struct GpuSdfMaterial {
 /// `PointLightGpu`; the WGSL field names avoid trailing digits (naga_oil writeback rule).
 #[repr(C)]
 #[derive(ShaderType, Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
-pub(crate) struct GpuPointLight {
+pub struct GpuPointLight {
     /// `xyz` = world position, `w` = falloff-cutoff range (the gizmo's outer ring / `PointLight.range`).
-    pub(crate) pos_range: Vec4,
+    pub pos_range: Vec4,
     /// `rgb` = physical radiance (linear colour × candela = `intensity / 4π`), `w` = source radius
     /// (`PointLight.radius`, physical light size for soft shadows).
-    pub(crate) color_radius: Vec4,
+    pub color_radius: Vec4,
 }
 
 /// EV100 the SDF view is exposed at. The renderer is fully physical (sun in lux, point lights in

@@ -53,7 +53,7 @@ mod cornell;
 mod gallery;
 pub mod gizmo;
 pub(crate) mod height;
-pub(crate) mod light_grid;
+pub mod light_grid;
 pub(crate) mod node_gizmos;
 pub(crate) mod overlays;
 pub(crate) mod picking;
@@ -288,6 +288,11 @@ pub struct DdgiParams {
     /// physical sky (`sdf::sky`) lights the scene indirectly; 0.0 isolates GI to scene emitters + sun
     /// only (used by the harness gates, and useful for interiors where the sky shouldn't bleed in).
     pub gi_sky_intensity: f32,
+    /// Shadow the direct lighting gathered at each probe-ray bounce hit: a secondary SDF march toward
+    /// the sun (bounded to `gi_range`) + a sphere-shadow for the brightest point light reaching the
+    /// hit. Prevents direct light leaking through walls into GI, at the cost of a shadow march per ray
+    /// hit — the dominant trace cost, so it's a toggle. Off = the bounce uses unshadowed direct light.
+    pub gi_bounce_shadows: bool,
 }
 
 impl Default for DdgiParams {
@@ -307,6 +312,7 @@ impl Default for DdgiParams {
             gi_blur_depth_sigma: 0.15,
             gi_blur_normal_power: 16.0,
             gi_sky_intensity: 1.0,
+            gi_bounce_shadows: true,
         }
     }
 }

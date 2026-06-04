@@ -52,6 +52,7 @@ struct ProbeParams {
     normal_bias: f32,
     view_bias: f32,
     sky_intensity: f32,
+    bounce_shadows: f32,
 }
 
 #[derive(Resource)]
@@ -122,7 +123,8 @@ pub(super) fn init_probe_pipeline(
         layout: vec![
             sdf_pipeline.layout_0.clone(), // camera
             sdf_pipeline.layout_1.clone(), // atlas (chunk_buf + raymarch)
-            layout_3.clone(),
+            layout_3.clone(),              // g2: irradiance + params + resident chunks
+            sdf_pipeline.layout_3.clone(), // g3: point lights + light grid (shared w/ the G-buffer pass)
         ],
         shader: probe_shader.0.clone(),
         ..default()
@@ -214,6 +216,7 @@ pub(super) fn prepare_sdf_probe(
         normal_bias: params_res.normal_bias.max(0.0),
         view_bias: params_res.view_bias.max(0.0),
         sky_intensity: params_res.gi_sky_intensity.max(0.0),
+        bounce_shadows: if params_res.gi_bounce_shadows { 1.0 } else { 0.0 },
     };
     let mut ubytes = bevy::render::render_resource::encase::UniformBuffer::new(Vec::<u8>::new());
     ubytes.write(&p).unwrap();
@@ -285,7 +288,8 @@ impl ViewNode for SdfProbeTraceNode {
 
         let layout_0 = pipeline_cache.get_bind_group_layout(&sdf.layout_0);
         let layout_1 = pipeline_cache.get_bind_group_layout(&sdf.layout_1);
-        let layout_3 = pipeline_cache.get_bind_group_layout(&probe.layout_3);
+        let layout_2 = pipeline_cache.get_bind_group_layout(&probe.layout_3);
+        let layout_lights = pipeline_cache.get_bind_group_layout(&sdf.layout_3);
 
         let bind_group_0 = device.create_bind_group(
             "sdf_probe_bind_group_0",
@@ -293,13 +297,26 @@ impl ViewNode for SdfProbeTraceNode {
             &BindGroupEntries::sequential((camera_binding.clone(),)),
         );
         let bind_group_1 = atlas_bind_group_1(device, &layout_1, gpu_atlas, "sdf_probe_bind_group_1");
-        let bind_group_3 = device.create_bind_group(
-            "sdf_probe_bind_group_3",
-            &layout_3,
+        let bind_group_2 = device.create_bind_group(
+            "sdf_probe_bind_group_2",
+            &layout_2,
             &BindGroupEntries::sequential((
                 bufs.irr.as_entire_buffer_binding(),
                 bufs.params.as_entire_buffer_binding(),
                 bufs.resident.as_entire_buffer_binding(),
+            )),
+        );
+        // Group 3: the SAME point-light + world-grid buffers the G-buffer pass binds, so the bounce
+        // shades point lights identically (the layout is declared FRAGMENT|COMPUTE for exactly this).
+        // Dummies are seeded in init, so these are Some before the first trace dispatch.
+        let gpu_lights = world.resource::<SdfGpuLights>();
+        let bind_group_lights = device.create_bind_group(
+            "sdf_probe_bind_group_lights",
+            &layout_lights,
+            &BindGroupEntries::sequential((
+                gpu_lights.point_buffer.as_ref().unwrap().as_entire_buffer_binding(),
+                gpu_lights.cell_buffer.as_ref().unwrap().as_entire_buffer_binding(),
+                gpu_lights.index_buffer.as_ref().unwrap().as_entire_buffer_binding(),
             )),
         );
 
@@ -321,7 +338,8 @@ impl ViewNode for SdfProbeTraceNode {
         pass.set_pipeline(pipeline);
         pass.set_bind_group(0, &bind_group_0, &[dyn_off.index()]);
         pass.set_bind_group(1, &bind_group_1, &[]);
-        pass.set_bind_group(2, &bind_group_3, &[]);
+        pass.set_bind_group(2, &bind_group_2, &[]);
+        pass.set_bind_group(3, &bind_group_lights, &[]);
         pass.dispatch_workgroups(wg_x, wg_y, 1);
         span.end(&mut pass);
 
