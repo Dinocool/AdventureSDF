@@ -51,6 +51,7 @@ pub mod edits;
 mod gallery;
 pub mod gizmo;
 pub(crate) mod height;
+pub(crate) mod light_grid;
 pub(crate) mod node_gizmos;
 pub(crate) mod overlays;
 pub(crate) mod picking;
@@ -93,6 +94,23 @@ pub struct SdfCamera;
 /// without the resource type vanishing from the core build.
 #[derive(Resource, Default)]
 pub struct WireframeBoundsVisible(pub bool);
+
+/// Per-[`GizmoKind`](crate::node::GizmoKind) viewport visibility. A kind absent from the map is
+/// VISIBLE (default-on); the editor's "View" toolbar writes entries to hide/show a type. Owned by
+/// the core module (not editor-gated) so the always-compiled `node_gizmos::draw_node_gizmos` can
+/// read it; the mutating UI is editor-only. Driven entirely by `GizmoKind::ALL`, so a new gizmo
+/// type gets a toggle for free.
+#[derive(Resource, Default)]
+pub struct GizmoVisibility(
+    pub bevy::platform::collections::HashMap<crate::node::GizmoKind, bool>,
+);
+
+impl GizmoVisibility {
+    /// Whether gizmos of `kind` should draw (absent ⇒ visible).
+    pub fn is_visible(&self, kind: crate::node::GizmoKind) -> bool {
+        self.0.get(&kind).copied().unwrap_or(true)
+    }
+}
 
 /// Diagnostic: world-space center + size of recently-baked bricks, each tagged with the time it
 /// was baked so the editor can FADE the wire box out over a few seconds. Lets you SEE which
@@ -182,12 +200,15 @@ pub struct SdfRaymarchParams {
     /// `tests/sdf_shadow_harness`); HIGHER = sharper/tighter but boxier + harder-edged. Tunable
     /// live via the editor raymarch panel ("Shadow Softness").
     pub shadow_softness: f32,
-    /// Second-order (quadratic-Taylor) grazing-step curvature bound `L₂ = k / voxel_size`
-    /// (Moinet & Neyret EG2025), used only when the "2nd-order step" debug toggle compiles in the
-    /// `SDF_SECOND_ORDER_STEP` branch. LOWER = larger speculative steps on grazing/tangent rays
-    /// (faster, but risks overshooting a sub-voxel feature); HIGHER = smaller, safer steps. Tunable
-    /// live via the editor raymarch panel ("2nd-order K").
-    pub second_order_k: f32,
+    /// How many point lights (brightest-first, of those reaching a surface) cast an SDF shadow per
+    /// pixel; the rest add unshadowed. Bounds the per-pixel shadow-march cost. Uploaded into the
+    /// camera uniform so it's live-tunable from the editor raymarch panel ("Shadow lights") with no
+    /// shader rebuild.
+    pub shadow_light_cap: u32,
+    /// Minimum LOD the shadow march samples in-brick (sun + point shadows). 0 = finest (sharpest,
+    /// slowest); higher = coarser/blobbier shadows but far fewer march steps — the shadows are the
+    /// G-buffer pass's biggest cost. Live "Shadow detail" slider in the editor raymarch panel.
+    pub shadow_lod_bias: u32,
 }
 
 impl Default for SdfRaymarchParams {
@@ -206,9 +227,14 @@ impl Default for SdfRaymarchParams {
             // (less near-miss darkening). A tight default (64) stays clean; the soft end (low k)
             // re-introduces the penumbra near-miss/field artifacts.
             shadow_softness: 64.0,
-            // Second-order grazing-step curvature (ON by default via the "2nd-order step" toggle).
-            // 0.5 is the measured sweet spot on the Lipschitz-normalised terrain.
-            second_order_k: 0.5,
+            // Safety ceiling on shadowed lights per pixel (live "Shadow lights" slider). The real
+            // cull is distance-based (shadows only within a fraction of each light's range), so this
+            // rarely binds — it just bounds pathological clusters. 0 = no point-light shadows.
+            shadow_light_cap: 8,
+            // Floor the shadow march at LOD 1 by default: near-camera shadows (which would march at
+            // LOD 0) drop to LOD 1 — ~2× fewer steps, imperceptible under the soft penumbra. 0 =
+            // full detail. Live "Shadow detail" slider.
+            shadow_lod_bias: 1,
         }
     }
 }
@@ -393,6 +419,7 @@ impl Plugin for SdfScenePlugin {
             .init_resource::<SdfRenderEnabled>()
             .init_resource::<SdfRaymarchParams>()
             .init_resource::<WireframeBoundsVisible>()
+            .init_resource::<GizmoVisibility>()
             .init_resource::<BakedBrickDebug>()
             .init_resource::<RayStepCapture>()
             .init_resource::<ViewportInputAllowed>()

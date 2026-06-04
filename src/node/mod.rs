@@ -61,6 +61,52 @@ impl Default for EditorGizmo {
     }
 }
 
+/// The *kind* of an [`EditorGizmo`], independent of its per-instance data — a fieldless mirror
+/// used to key per-type editor settings (e.g. viewport visibility toggles). Registering a new
+/// gizmo type is local: add an [`EditorGizmo`] variant, a `GizmoKind` variant + its [`Self::ALL`]
+/// entry + [`Self::label`], and the [`EditorGizmo::kind`] arm. Anything driven by `GizmoKind`
+/// (the visibility resource, the toolbar toggle UI) then picks it up automatically by iterating
+/// `ALL` — no further edits.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum GizmoKind {
+    PointLight,
+    DirectionalLight,
+    Camera,
+    Axes,
+}
+
+impl GizmoKind {
+    /// Every kind, in display order — the single source the UI + visibility iterate.
+    pub const ALL: [GizmoKind; 4] = [
+        GizmoKind::PointLight,
+        GizmoKind::DirectionalLight,
+        GizmoKind::Camera,
+        GizmoKind::Axes,
+    ];
+
+    /// Human-readable label for the toggle UI.
+    pub fn label(self) -> &'static str {
+        match self {
+            GizmoKind::PointLight => "Point lights",
+            GizmoKind::DirectionalLight => "Directional lights",
+            GizmoKind::Camera => "Cameras",
+            GizmoKind::Axes => "Axes / empties",
+        }
+    }
+}
+
+impl EditorGizmo {
+    /// This gizmo's [`GizmoKind`] (drops the per-instance `scale`).
+    pub fn kind(&self) -> GizmoKind {
+        match self {
+            EditorGizmo::DirectionalLight { .. } => GizmoKind::DirectionalLight,
+            EditorGizmo::PointLight { .. } => GizmoKind::PointLight,
+            EditorGizmo::Camera { .. } => GizmoKind::Camera,
+            EditorGizmo::Axes { .. } => GizmoKind::Axes,
+        }
+    }
+}
+
 /// A scene camera node: authored projection data (not an active render camera). Serialized
 /// into a `.scene` and shown in the hierarchy with an [`EditorGizmo::Camera`] frustum. The
 /// editor's viewport camera can "look through" it (snap the orbit pose to this node). A
