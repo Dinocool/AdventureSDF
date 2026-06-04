@@ -107,8 +107,10 @@ sysinfo = { version = "0.37", optional = true, default-features = false, feature
 epaint = "0.33"
 ecolor = "0.33"
 emath = "0.33"
-# Cast gizmo vertex/index Vec<[f32;N]>/Vec<u32> to &[u8] for GPU buffer upload.
-bytemuck = "1"
+# Cast gizmo vertex/index + the SDF GPU structs (point lights, materials, light-grid cells) to
+# &[u8] for buffer upload via `cast_slice`. `derive` for `#[derive(Pod, Zeroable)]` on those
+# `#[repr(C)]` structs (see `sdf_render::render::gpu`), replacing hand-rolled `to_le_bytes` packing.
+bytemuck = { version = "1", features = ["derive"] }
 
 [dev-dependencies]
 # spv-out: emit SPIR-V from naga in tests so we can inspect which opcode signed `%`

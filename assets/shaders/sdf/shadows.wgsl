@@ -12,9 +12,10 @@
 // the empty-space DDA skip. Neither a near-surface step-floor change nor a coarse-LOD shadow floor
 // fixed them; an optimal approach is still TBD.
 
-#import sdf::bindings::{voxel_size_at, lod_count, DIST_BAND_VOXELS, shadow_softness}
+#import sdf::bindings::{voxel_size_at, lod_count, DIST_BAND_VOXELS, shadow_softness, shadow_lod_bias, clipmap_exit_t}
 #import sdf::brick::{
     resolve_march,
+    sample_level_at_or_coarser,
     world_to_brick_lod,
     find_chunk_cached,
     dist_to_brick_exit_lod,
@@ -39,7 +40,7 @@ const SHADOW_MAX_STEPS: u32 = 96u;
 
 // Inigo Quilez soft shadow over the sparse field. `mint` starts the march off the originating
 // surface; `k` is penumbra hardness; `max_t` bounds the ray.
-fn soft_shadow(origin: vec3<f32>, light_dir: vec3<f32>, mint: f32, max_t: f32, k: f32) -> f32 {
+fn soft_shadow(origin: vec3<f32>, light_dir: vec3<f32>, mint: f32, max_t: f32, k: f32, lod_floor: u32) -> f32 {
     var res = 1.0;
     var t = mint;
     // Per-ray chunk-search memo (like the primary march): the ray stays in one chunk for many
@@ -49,7 +50,17 @@ fn soft_shadow(origin: vec3<f32>, light_dir: vec3<f32>, mint: f32, max_t: f32, k
     for (var i = 0u; i < SHADOW_MAX_STEPS; i = i + 1u) {
         if (t >= max_t) { break; }
         let p = origin + light_dir * t;
-        let scene = resolve_march(p, &cache);
+        var scene = resolve_march(p, &cache);
+
+        // LOD floor for the IN-BRICK sample (mirrors the primary march, march.wgsl): a coarser
+        // field gives a larger conservative distance ⇒ bigger sphere-trace steps ⇒ far fewer
+        // iterations (the shadow cost). Soft shadows hide the coarsening. The empty-space skip
+        // below still uses `resolve_march`'s finest window, so gap-jumping stays correct.
+        // `lod_floor == 0` ⇒ no floor (sample the finest, unchanged).
+        if (scene.in_brick && scene.lod < lod_floor) {
+            let coarse = sample_level_at_or_coarser(p, lod_floor, &cache);
+            if (coarse.in_brick) { scene = coarse; }
+        }
 
         // --- Empty space: hierarchical chunk-DDA skip (the key difference from the old march) ---
         // No resident brick here. Step to the far face of the LARGEST provably-empty box around
@@ -120,9 +131,33 @@ fn surface_shadow(hit_pos: vec3<f32>, geo_n: vec3<f32>, light_dir: vec3<f32>, lo
     let vs = voxel_size_at(lod);
     let origin = hit_pos + geo_n * vs;
     let k = shadow_softness();
+    let floor = shadow_lod_bias();   // editor "Shadow detail" slider: coarser = cheaper march
+    // Cap the ray at the resident clipmap boundary: past it there's no resident geometry to occlude,
+    // so a sun-lit ray would otherwise crawl brick-by-brick past the volume (the empty-space skip
+    // only jumps chunks INSIDE a ring) and burn its whole 96-step / 256-unit budget for nothing.
+    // Exact, not approximate — nothing beyond the volume can cast a shadow.
+    let reach = min(max_t, clipmap_exit_t(origin, light_dir));
     if (k <= 0.0) {
-        let q = MarchQuality(1.0, SHADOW_MAX_STEPS, max_t, 0u);
+        let q = MarchQuality(1.0, SHADOW_MAX_STEPS, reach, floor);
         return select(1.0, 0.0, raymarch(origin, light_dir, vs * 0.5, q).hit);
     }
-    return soft_shadow(origin, light_dir, vs * 0.5, max_t, k);
+    return soft_shadow(origin, light_dir, vs * 0.5, reach, k, floor);
+}
+
+// Soft shadow toward a SPHERE light of `radius` centred at distance `dist` along `light_dir` — for
+// point lights (`PointLight.radius` is the source size). The size drives two things, both physical:
+//   * A surface INSIDE the light volume (`dist <= radius`) is fully lit — so a light hovering close
+//     above its host geometry doesn't self-shadow against it.
+//   * The sphere subtends a cone of half-angle ≈ radius/dist, so the penumbra hardness is
+//     `k = dist / radius` (bigger / closer light ⇒ softer edge). `radius = 0` ⇒ a sharp point.
+// The ray marches the FULL distance to the light (`max_t = dist`); the loop breaks at `t >= max_t`
+// before ever sampling the light's own position, so there's no false self-hit. (Earlier bounds were
+// wrong: `dist - radius` clipped occluders sitting near the light, and `dist - vs` collapsed the ray
+// to nothing at coarse LOD — where `vs` is large — killing shadows at overview distance.)
+fn sphere_light_shadow(hit_pos: vec3<f32>, geo_n: vec3<f32>, light_dir: vec3<f32>, lod: u32, dist: f32, radius: f32) -> f32 {
+    if (dist <= radius) { return 1.0; }            // surface within the light volume → unshadowed
+    let vs = voxel_size_at(lod);
+    let origin = hit_pos + geo_n * vs;
+    let k = dist / max(radius, vs);                // sphere angular size → penumbra hardness
+    return soft_shadow(origin, light_dir, vs * 0.5, dist, k, shadow_lod_bias());
 }

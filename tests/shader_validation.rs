@@ -175,7 +175,6 @@ fn sdf_debug_modes_validate() {
         "SDF_LINEAR_CHUNK_SEARCH",
         "SDF_DEBUG_LOD",
         "SDF_DEBUG_STEP_COUNT",
-        "SDF_SECOND_ORDER_STEP",
     ] {
         validate_composed_sdf_with_defs(&[def]).unwrap_or_else(|e| panic!("{e}"));
     }

@@ -13,14 +13,14 @@ struct SdfCameraUniform {
     // frame's screen to sample its already-shaded colour (sdf_raymarch SSR path).
     prev_clip_from_world: mat4x4<f32>,
     camera_pos: vec4<f32>,
-    screen_params: vec4<f32>,  // xy = screen_size; zw unused (was surface_bias — iso-offset removed)
+    screen_params: vec4<f32>,  // xy = screen_size; z unused; w = shadow LOD floor (u32)
     grid_origin: vec4<f32>,
     grid_dims: vec4<f32>,
     debug_params: vec4<f32>,   // x = max_steps, y = max_dist, z = sdf_eps, w = recenter_snap_chunks
     march_params: vec4<f32>,   // x = pixel_cone (world radius/unit-dist/pixel), y = reserved (was cubic_band), z = over_relax, w = lod_blend_band
     lod_params: vec4<f32>,     // x = lod_count, y = ring_bricks, z = base voxel_size, w = cell_stride
-    sun_dir: vec4<f32>,        // xyz = direction toward the key light; w unused
-    sun_color: vec4<f32>,      // rgb = key-light radiance; w unused
+    sun_dir: vec4<f32>,        // xyz = direction toward the key light; w = shadow light cap (u32)
+    sun_color: vec4<f32>,      // rgb = physical sun radiance (illuminance, lux); w = camera exposure scalar (exp2(-ev100)/1.2)
 };
 
 // One material row, indexed by global material id. Mirrors `GpuSdfMaterial`
@@ -141,6 +141,9 @@ fn pixel_cone() -> f32 { return camera.march_params.x; }
 // softens the penumbra→umbra edge. Editor "Shadow Softness" slider. 0 = unset (shader falls
 // back to the default in `surface_shadow`).
 fn shadow_softness() -> f32 { return camera.march_params.y; }
+// How many point lights (brightest-first, of those reaching a surface) cast an SDF shadow per
+// pixel — editor "Shadow lights" slider, packed in the unused `sun_dir.w`. 0 = no point shadows.
+fn shadow_light_cap() -> u32 { return u32(camera.sun_dir.w); }
 // Sphere-trace over-relaxation factor (Keinert 2014): the march steps `over_relax * d`
 // instead of `d`, with a safe fallback when consecutive unbounding spheres separate.
 // 1.0 = plain sphere tracing; (1,2) accelerates convergence on grazing rays.
@@ -153,10 +156,9 @@ fn lod_blend_band() -> f32 { return camera.march_params.w; }
 // The LOD cross-fade keys off the chunk-SNAPPED ring centre, so the shader recomputes it
 // from camera_pos + this (mirrors bake_scheduler::ring_chunk_origin). >= 1.
 fn recenter_snap() -> i32 { return max(i32(camera.debug_params.w), 1); }
-// Second-order grazing-step curvature `k` (the `L₂ = k / voxel_size` bound in sdf::march's
-// SDF_SECOND_ORDER_STEP path). Packed in the otherwise-unused `screen_params.z`. Editor slider
-// "2nd-order K"; lower = larger speculative grazing steps.
-fn second_order_k() -> f32 { return camera.screen_params.z; }
+// Minimum LOD the shadow march samples in-brick (editor "Shadow detail" slider, in screen_params.w).
+// 0 = finest (sharpest, slowest); higher = coarser/blobbier shadows but far fewer march steps.
+fn shadow_lod_bias() -> u32 { return u32(camera.screen_params.w); }
 
 // --- LOD clipmap / chunk accessors ---
 
