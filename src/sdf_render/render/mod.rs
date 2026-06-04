@@ -29,7 +29,9 @@ mod atlas_upload;
 mod bake;
 mod chunk_tables;
 mod cone;
+mod gi;
 mod pbr_textures;
+mod probe;
 
 use atlas_pages::AtlasPages;
 use chunk_tables::ChunkTableBuffers;
@@ -469,6 +471,13 @@ impl ViewNode for SdfCombineNode {
         let Some(camera_binding) = camera_uniforms.binding() else {
             return Ok(());
         };
+
+        // GI is resolved + denoised into its own texture (render/gi.rs); combine just composites it at
+        // group 1. Skip if the GI texture isn't ready yet (first frames before prepare runs).
+        let Some(gi_bg1) = gi::gi_apply_bind_group(device, world) else {
+            return Ok(());
+        };
+
         let layout_0 = pipeline_cache.get_bind_group_layout(&sdf.layout_0);
         let layout = pipeline_cache.get_bind_group_layout(&combine.layout);
 
@@ -477,7 +486,7 @@ impl ViewNode for SdfCombineNode {
             &layout_0,
             &BindGroupEntries::sequential((camera_binding.clone(),)),
         );
-        let bind_group_1 = device.create_bind_group(
+        let bind_group_2 = device.create_bind_group(
             "sdf_combine_gbuffer",
             &layout,
             &BindGroupEntries::sequential((albedo_view, normal_view, emissive_view, sampler)),
@@ -503,7 +512,8 @@ impl ViewNode for SdfCombineNode {
         let span = diagnostics.pass_span(&mut render_pass, "sdf_combine_pass");
         render_pass.set_render_pipeline(pipeline);
         render_pass.set_bind_group(0, &bind_group_0, &[0]);
-        render_pass.set_bind_group(1, &bind_group_1, &[]);
+        render_pass.set_bind_group(1, &gi_bg1, &[]);
+        render_pass.set_bind_group(2, &bind_group_2, &[]);
         render_pass.draw(0..3, 0..1);
         span.end(&mut render_pass);
 
@@ -527,7 +537,7 @@ struct SdfShaderModules(#[expect(dead_code)] Vec<Handle<Shader>>);
 /// source of truth for the SDF import graph — `tests/shader_validation.rs` composes the SAME list
 /// (prefixing `assets/`) so a new `sdf/*.wgsl` module can't be added to the pipeline without the
 /// validation rig also seeing it. Paths are asset-server-relative (the `assets/` root is implicit).
-pub const SDF_SHADER_MODULES: [&str; 9] = [
+pub const SDF_SHADER_MODULES: [&str; 10] = [
     "shaders/sdf/bindings.wgsl",
     "shaders/sdf/brick.wgsl",
     "shaders/sdf/material.wgsl",
@@ -539,6 +549,8 @@ pub const SDF_SHADER_MODULES: [&str; 9] = [
     "shaders/sdf/pbr.wgsl",
     "shaders/sdf/oct.wgsl",
     "shaders/sdf/brdf.wgsl",
+    // DDGI probe addressing (constants + world-pos), imported by the trace/blend/apply passes.
+    "shaders/sdf/probe.wgsl",
 ];
 
 pub struct SdfRenderPlugin;
@@ -551,6 +563,11 @@ impl Plugin for SdfRenderPlugin {
         let cone_shader_handle: Handle<Shader> = asset_server.load(cone::SDF_CONE_SHADER_PATH);
         let bake_shader_handle: Handle<Shader> = asset_server.load(bake::SDF_BAKE_SHADER_PATH);
         let combine_shader_handle: Handle<Shader> = asset_server.load(SDF_COMBINE_SHADER_PATH);
+        let probe_shader_handle: Handle<Shader> =
+            asset_server.load(probe::SDF_PROBE_TRACE_SHADER_PATH);
+        let gi_resolve_shader_handle: Handle<Shader> =
+            asset_server.load(gi::SDF_GI_RESOLVE_SHADER_PATH);
+        let gi_blur_shader_handle: Handle<Shader> = asset_server.load(gi::SDF_GI_BLUR_SHADER_PATH);
         // Load + retain the imported modules (Custom-path imports aren't auto-loaded).
         let module_handles: Vec<Handle<Shader>> = SDF_SHADER_MODULES
             .iter()
@@ -566,6 +583,7 @@ impl Plugin for SdfRenderPlugin {
             .add_plugins((
                 ExtractComponentPlugin::<SdfCameraData>::default(),
                 UniformComponentPlugin::<SdfCameraData>::default(),
+                bevy::render::extract_resource::ExtractResourcePlugin::<super::DdgiParams>::default(),
             ))
             .add_systems(
                 Update,
@@ -596,6 +614,9 @@ impl Plugin for SdfRenderPlugin {
         render_app.insert_resource(cone::SdfConeShaderHandle(cone_shader_handle));
         render_app.insert_resource(bake::SdfBakeShaderHandle(bake_shader_handle));
         render_app.insert_resource(SdfCombineShaderHandle(combine_shader_handle));
+        render_app.insert_resource(probe::SdfProbeShaderHandle(probe_shader_handle));
+        render_app.insert_resource(gi::SdfGiResolveShaderHandle(gi_resolve_shader_handle));
+        render_app.insert_resource(gi::SdfGiBlurShaderHandle(gi_blur_shader_handle));
         render_app.init_resource::<SdfGBuffer>();
 
         render_app
@@ -607,6 +628,10 @@ impl Plugin for SdfRenderPlugin {
             .init_resource::<pbr_textures::TextureStreamState>()
             .init_resource::<atlas_upload::LastAtlasGen>()
             .init_resource::<chunk_tables::ChunkBufCapacity>()
+            // Default DDGI params in the render world so the probe systems never miss the resource
+            // before the first `ExtractResourcePlugin` sync (which then overwrites it with the live,
+            // editor-tunable main-world value each frame).
+            .init_resource::<super::DdgiParams>()
             .init_resource::<bake::SdfBakeBuffers>()
             .add_systems(
                 Render,
@@ -621,13 +646,22 @@ impl Plugin for SdfRenderPlugin {
             )
             .add_systems(Render, rebuild_pipeline_on_def_change)
             .add_systems(Render, prepare_sdf_gbuffer)
+            .init_resource::<probe::ExtractedResidentChunks>()
+            .add_systems(ExtractSchedule, probe::extract_resident_chunks)
+            .add_systems(Render, probe::prepare_sdf_probe)
+            .add_systems(Render, gi::prepare_sdf_gi)
             .add_systems(RenderStartup, init_sdf_pipeline)
             .add_systems(RenderStartup, cone::init_cone_pipeline.after(init_sdf_pipeline))
             .add_systems(RenderStartup, bake::init_bake_pipeline.after(init_sdf_pipeline))
             .add_systems(RenderStartup, init_combine_pipeline.after(init_sdf_pipeline))
+            .add_systems(RenderStartup, probe::init_probe_pipeline.after(init_sdf_pipeline))
+            .add_systems(RenderStartup, gi::init_gi_pipelines.after(init_combine_pipeline))
             .add_render_graph_node::<bake::SdfBrickBakeNode>(Core3d, bake::SdfBrickBakeLabel)
             .add_render_graph_node::<ViewNodeRunner<cone::SdfConeNode>>(Core3d, cone::SdfConeLabel)
             .add_render_graph_node::<ViewNodeRunner<SdfGBufferNode>>(Core3d, SdfGBufferLabel)
+            .add_render_graph_node::<ViewNodeRunner<probe::SdfProbeTraceNode>>(Core3d, probe::SdfProbeTraceLabel)
+            .add_render_graph_node::<ViewNodeRunner<gi::SdfGiResolveNode>>(Core3d, gi::SdfGiResolveLabel)
+            .add_render_graph_node::<ViewNodeRunner<gi::SdfGiBlurNode>>(Core3d, gi::SdfGiBlurLabel)
             .add_render_graph_node::<ViewNodeRunner<SdfCombineNode>>(Core3d, SdfCombineLabel)
             // The brick-bake compute pass writes the atlas BEFORE the view passes read it,
             // so it runs first (after the opaque pass, before the cone prepass + G-buffer).
@@ -646,6 +680,9 @@ impl Plugin for SdfRenderPlugin {
                     bake::SdfBrickBakeLabel,
                     cone::SdfConeLabel,
                     SdfGBufferLabel,
+                    probe::SdfProbeTraceLabel,
+                    gi::SdfGiResolveLabel,
+                    gi::SdfGiBlurLabel,
                     SdfCombineLabel,
                     Node3d::MainTransparentPass,
                 ),
@@ -840,8 +877,9 @@ fn rebuild_pipeline_on_def_change(
     let Some(extracted) = extracted else { return };
     let shader_defs: Vec<_> = extracted.defs.iter().map(|s| s.as_str().into()).collect();
     let vertex_state = fullscreen_shader.to_vertex_state();
-    // The combine pipeline reuses the camera layout (group 0). Clone it up front so the combine
-    // rebuild below doesn't re-borrow `pipeline` (which is mutated by the primary rebuild).
+    // The combine pipeline reuses the camera layout (group 0) + the atlas layout (group 1, for the
+    // DDGI probe world→slot lookup). Clone both up front so the combine rebuild below doesn't
+    // re-borrow `pipeline` (which is mutated by the primary rebuild).
     let camera_layout = pipeline.layout_0.clone();
 
     // Primary (G-buffer) pipeline. Rebuild whenever the extracted defs differ from what the live
@@ -879,7 +917,8 @@ fn rebuild_pipeline_on_def_change(
     if extracted.defs != combine.current_defs {
         let new_id = pipeline_cache.queue_render_pipeline(RenderPipelineDescriptor {
             label: Some("sdf_combine_pipeline".into()),
-            layout: vec![camera_layout, combine.layout.clone()],
+            // Must match init_combine_pipeline: 0=camera, 1=blurred GI (gi::gi_apply), 2=G-buffer.
+            layout: vec![camera_layout, gi::gi_apply_layout_desc(), combine.layout.clone()],
             vertex: vertex_state,
             fragment: Some(FragmentState {
                 shader: combine_shader.0.clone(),
@@ -1211,7 +1250,13 @@ fn init_combine_pipeline(
     let vertex_state = fullscreen_shader.to_vertex_state();
     let pipeline_id = pipeline_cache.queue_render_pipeline(RenderPipelineDescriptor {
         label: Some("sdf_combine_pipeline".into()),
-        layout: vec![sdf_pipeline.layout_0.clone(), layout.clone()],
+        // 0 = camera, 1 = blurred GI (gi::gi_apply), 2 = G-buffer. The GI is now resolved + denoised in
+        // its own passes (render/gi.rs); combine just composites it — no atlas/probe binding needed.
+        layout: vec![
+            sdf_pipeline.layout_0.clone(),
+            gi::gi_apply_layout_desc(),
+            layout.clone(),
+        ],
         vertex: vertex_state,
         fragment: Some(FragmentState {
             shader: combine_shader.0.clone(),

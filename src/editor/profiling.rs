@@ -315,8 +315,9 @@ fn gpu_memory_ui(world: &mut World, ui: &mut egui::Ui) {
     use crate::sdf_render::debug::SdfAtlasStats;
     let stats = world.resource::<SdfAtlasStats>();
     ui.weak(format!(
-        "{} bricks · {}×{} texels · {}",
+        "{} bricks · {} DDGI probes · {}×{} texels · {}",
         stats.total_bricks,
+        stats.probe_count,
         stats.atlas_width,
         stats.atlas_height,
         if stats.dirty { "dirty" } else { "clean" }
@@ -326,6 +327,7 @@ fn gpu_memory_ui(world: &mut World, ui: &mut egui::Ui) {
         MemSeg { label: "SDF material lo".into(), bytes: stats.object_bytes, color: band_color(1) },
         MemSeg { label: "SDF material hi".into(), bytes: stats.blend_bytes, color: band_color(2) },
         MemSeg { label: "SDF lookup".into(), bytes: stats.lookup_bytes, color: band_color(3) },
+        MemSeg { label: "DDGI probes".into(), bytes: stats.probe_bytes, color: band_color(5) },
         MemSeg { label: "PBR textures".into(), bytes: pbr_textures_vram_bytes(), color: band_color(4) },
     ];
     mem_breakdown_ui(ui, "gpu", segments);

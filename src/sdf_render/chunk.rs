@@ -382,6 +382,28 @@ impl LiveChunkTables {
         self.chunks.keys().copied()
     }
 
+    /// The COMPACT list of resident chunk directory rows (one [`ChunkLookup`] per non-empty chunk,
+    /// any order). The DDGI probe trace dispatches one workgroup per entry — `O(resident chunks)`
+    /// (hundreds–thousands) instead of scanning the full `R³·lod_count` toroidal directory (millions
+    /// of empty slots) every frame. Each row carries the key (→ decode to lod+coord), occupancy mask,
+    /// and `tile_run_base` (→ the probe's storage slot), so the trace needs nothing else to enumerate
+    /// every probe.
+    pub fn resident_rows(&self) -> Vec<ChunkLookup> {
+        self.chunks
+            .iter()
+            .map(|(ck, e)| {
+                let (key_hi, key_lo) = chunk_gpu_key(*ck);
+                ChunkLookup {
+                    key_hi,
+                    key_lo,
+                    occ_lo: e.occ as u32,
+                    occ_hi: (e.occ >> 32) as u32,
+                    tile_run_base: e.slot * TILE_RUN_SLOT,
+                }
+            })
+            .collect()
+    }
+
     /// Mark a resident brick present in its chunk (insert or palette/tile change). `local` is the
     /// brick's 0..63 slot from [`chunk_of`]; `tile` is its packed atlas origin + palette. O(1): one
     /// directory slot write + a tile-run slot. `config` supplies `R`/`lod_count` to lazily size the
