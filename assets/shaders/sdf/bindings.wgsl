@@ -97,7 +97,7 @@ struct BrickTile {
 @group(1) @binding(0) var atlas_pages: binding_array<texture_2d<f32>, 64>;   // R16Snorm distance pages
 @group(1) @binding(1) var atlas_sampler: sampler;
 @group(1) @binding(2) var<storage, read> chunk_buf: array<ChunkLookup>;  // sorted, binary-searched
-@group(1) @binding(3) var mat_pages: binding_array<texture_2d<f32>, 64>;     // Rgba16Snorm: 4 palette-slot dist pages
+@group(1) @binding(3) var mat_pages: binding_array<texture_2d<f32>, 64>;     // Rgba8Snorm: 4 palette-slot dist pages
 @group(1) @binding(4) var<storage, read> materials: array<SdfMaterial>;  // material table, by global id
 // PBR texture arrays + their filtering sampler. Each is a texture_2d_array indexed
 // by a material's tex layer; sampled triplanar in `material`/`pbr`.

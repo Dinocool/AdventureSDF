@@ -26,9 +26,9 @@ const BAKE_DISPATCH_WIDTH: u32 = 256;
 /// shader's `DIST_ROW_U32`/`DIST_TILE_U32`.
 const BAKE_DIST_ROW_U32: u32 = 64;
 const BAKE_DIST_TILE_U32: u32 = BAKE_DIST_ROW_U32 * 8;
-/// u32s per material tile: 64×8 Rgba16 texels, 2 u32 per texel, 128 u32/row × 8 = 1024.
-/// Row stride = 128 u32 = 512 bytes (already a multiple of 256). Matches `MAT_TILE_U32`.
-const BAKE_MAT_ROW_U32: u32 = 128;
+/// u32s per material tile: 64×8 Rgba8Snorm texels, 1 u32 per texel, 64 u32/row × 8 = 512.
+/// Row stride = 64 u32 = 256 bytes (a multiple of 256). Matches the bake shader's `MAT_TILE_U32`.
+const BAKE_MAT_ROW_U32: u32 = 64;
 const BAKE_MAT_TILE_U32: u32 = BAKE_MAT_ROW_U32 * 8;
 
 /// One brick bake job's header, std430. Mirror of the WGSL `JobHeader` in
@@ -312,7 +312,7 @@ impl Node for SdfBrickBakeNode {
 
         // Blit each job's tile from the output buffers into the persistent atlas textures.
         // The buffer layout matches the texture sub-rect (dist rows padded to 256 bytes,
-        // mat rows already 512). `copy_buffer_to_texture` requires bytes_per_row % 256 == 0.
+        // mat rows 256). `copy_buffer_to_texture` requires bytes_per_row % 256 == 0.
         let edge = BRICK_EDGE as u32;
         let tile_width = edge * edge; // 64
         let encoder = render_context.command_encoder();
@@ -357,7 +357,7 @@ impl Node for SdfBrickBakeNode {
                     buffer: mat_buf,
                     layout: TexelCopyBufferLayout {
                         offset: mat_offset,
-                        bytes_per_row: Some(BAKE_MAT_ROW_U32 * 4), // 512 bytes
+                        bytes_per_row: Some(BAKE_MAT_ROW_U32 * 4), // 256 bytes
                         rows_per_image: Some(edge),
                     },
                 },

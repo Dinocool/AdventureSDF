@@ -9,8 +9,7 @@
 #import sdf::bindings::{camera, sdf_eps, pixel_cone, over_relax, lod_blend_band, recenter_snap, lod_count, brick_world_at, CHUNK_BRICKS, voxel_size_at, clipmap_exit_t, chunk_buf}
 #import sdf::brick::{
     world_to_brick_lod,
-    load_material_distances,
-    pick_material,
+    resolve_material,
     new_chunk_cache,
     find_chunk_cached,
     resolve_march,
@@ -303,7 +302,7 @@ fn raymarch(origin: vec3<f32>, dir: vec3<f32>, start_t: f32, q: MarchQuality) ->
             result.hit = true;
             result.dist = t_hit;
             result.object_id =
-                pick_material(load_material_distances(scene.atlas_base, hit_p, lod), scene.palette).id;
+                resolve_material(scene.atlas_base, hit_p, lod, scene.palette).id;
             result.steps = steps;
             result.hit_pos = hit_p;
             result.fate = 0u;

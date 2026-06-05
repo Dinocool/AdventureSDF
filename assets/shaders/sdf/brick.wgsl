@@ -166,7 +166,7 @@ fn load_voxel(base_u: u32, lx: i32, ly: i32, lz: i32) -> f32 {
 
 // --- Per-palette-slot material distance sampling ---
 //
-// Each voxel stores K=4 signed distances in one Rgba16Snorm atlas — one per entry
+// Each voxel stores K=4 signed distances in one Rgba8Snorm atlas — one per entry
 // of the brick's material palette (NOT per global material). We trilinearly
 // interpolate the 4 at the hit point; the nearest (argmin) palette slot owns the
 // surface, mapped to a global id via the brick palette. The boundary between the
@@ -198,7 +198,7 @@ fn sample_mat_tex(base_u: u32, i0: vec3<i32>, f: vec3<f32>) -> vec4<f32> {
     return mix(y0, y1, f.z);
 }
 
-// The 4 interpolated palette-slot distances at `world_pos` (one Rgba16Snorm fetch
+// The 4 interpolated palette-slot distances at `world_pos` (one Rgba8Snorm fetch
 // set), sampling the brick at LOD `lod`. `.x..w` correspond to palette slots 0..3.
 fn load_material_distances(base_u: u32, world_pos: vec3<f32>, lod: u32) -> vec4<f32> {
     let voxel_size = voxel_size_at(lod);
@@ -245,6 +245,23 @@ fn pick_material(slots: vec4<f32>, palette: vec4<u32>) -> MaterialPick {
         }
     }
     return MaterialPick(palette[best], palette[second], second_d - best_d);
+}
+
+// Resolve the material at `world_pos` given the serving brick's `palette`. A brick whose palette
+// has only slot 0 filled (`palette[1] == PALETTE_EMPTY`) is SINGLE-MATERIAL — every voxel is
+// `palette[0]` — so we skip the 8 material-distance texture loads + the argmin entirely and return
+// it directly. Palettes are packed densely from slot 0 (edits::build_palette), so this test is
+// exact. This is the common case (most bricks touch one material) and removes the dominant per-hit
+// material cost there; multi-material bricks fall through to the per-palette-slot argmin. The
+// returned `gap` (1.0 = the material "far" band) matches what the full per-slot path yields for a
+// single-material brick (runner-up = MATERIAL_FAR), so `id_b == id` skips the blend and `fwidth(gap)`
+// stays ~0 across a uniform↔multi material-brick boundary (a larger sentinel would blow up fwidth
+// there and paint a 1px seam on the neighbouring multi-material pixel).
+fn resolve_material(base_u: u32, world_pos: vec3<f32>, lod: u32, palette: vec4<u32>) -> MaterialPick {
+    if (palette.y == PALETTE_EMPTY) {
+        return MaterialPick(palette.x, palette.x, 1.0);
+    }
+    return pick_material(load_material_distances(base_u, world_pos, lod), palette);
 }
 
 fn sample_brick_sdf(base_u: u32, world_pos: vec3<f32>, lod: u32) -> f32 {
@@ -358,9 +375,9 @@ fn scene_sdf(p: vec3<f32>) -> SceneSdfResult {
     // owns the surface (mapped to a global id); the boundary against the runner-up
     // is the bisector where their interpolated distances are equal (`gap == 0`).
     // Both distances are continuous, so that bisector is sub-voxel sharp and
-    // independent of geometric smoothing — clean even at smoothing = 0.
-    let md = load_material_distances(loc.atlas_base, p, lod);
-    let pick = pick_material(md, loc.palette);
+    // independent of geometric smoothing — clean even at smoothing = 0. Single-material
+    // bricks short-circuit the per-slot fetch (see `resolve_material`).
+    let pick = resolve_material(loc.atlas_base, p, lod, loc.palette);
 
     return SceneSdfResult(d, pick.id, pick.id_b, pick.gap, true, lod, loc.atlas_base, loc.palette);
 }
