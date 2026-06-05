@@ -132,7 +132,7 @@ impl AtlasPages {
     }
 
     /// True when the gradient atlas is populated (the feature is enabled). The bake node skips the
-    /// gradient copy when false; the reader's `SDF_GRAD_NORMALS`/`SDF_SHARP_CREASES` paths are only
+    /// gradient copy when false; the reader's `SDF_GRAD_NORMALS` path is only
     /// compiled in when enabled, so they never sample an empty grad pool.
     pub fn grad_enabled(&self) -> bool {
         !self.grad.is_empty()

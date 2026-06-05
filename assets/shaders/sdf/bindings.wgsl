@@ -13,7 +13,7 @@ struct SdfCameraUniform {
     // frame's screen to sample its already-shaded colour (sdf_raymarch SSR path).
     prev_clip_from_world: mat4x4<f32>,
     camera_pos: vec4<f32>,
-    screen_params: vec4<f32>,  // xy = screen_size; z = crease_threshold; w = shadow LOD floor (u32)
+    screen_params: vec4<f32>,  // xy = screen_size; z unused; w = shadow LOD floor (u32)
     grid_origin: vec4<f32>,
     grid_dims: vec4<f32>,
     debug_params: vec4<f32>,   // x = max_steps, y = max_dist, z = sdf_eps, w = recenter_snap_chunks
@@ -113,7 +113,7 @@ struct BrickTile {
 @group(1) @binding(11) var<storage, read> chunk_tile_buf: array<BrickTile>;  // packed per-chunk brick runs
 // Per-voxel gradient (outward unit normal) pages, Rgba8Snorm. PAGED like the distance atlas and
 // indexed by the SAME tile origin (dense — one tile per brick). Only populated when the gradient
-// feature is enabled (SDF_GRAD_NORMALS / SDF_SHARP_CREASES); a dummy 1×1 fills every slot otherwise.
+// feature is enabled (SDF_GRAD_NORMALS); a dummy 1×1 fills every slot otherwise.
 // SIZED binding_array (see the atlas_pages note above). MUST match `atlas_upload::ATLAS_MAX_PAGES`.
 @group(1) @binding(12) var grad_pages: binding_array<texture_2d<f32>, 64>;
 
@@ -171,10 +171,6 @@ fn recenter_snap() -> i32 { return max(i32(camera.debug_params.w), 1); }
 // Minimum LOD the shadow march samples in-brick (editor "Shadow detail" slider, in screen_params.w).
 // 0 = finest (sharpest, slowest); higher = coarser/blobbier shadows but far fewer march steps.
 fn shadow_lod_bias() -> u32 { return u32(camera.screen_params.w); }
-// Crease-detection threshold for SDF_SHARP_CREASES: the corner-gradient alignment (cos) below which
-// a cell is treated as containing a sharp edge. Lower = only very sharp creases reconstruct; higher
-// = more cells. Editor "Crease threshold" slider (in screen_params.z).
-fn crease_threshold() -> f32 { return camera.screen_params.z; }
 
 // --- LOD clipmap / chunk accessors ---
 

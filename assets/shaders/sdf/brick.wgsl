@@ -28,7 +28,6 @@
     floor_div,
     ring_bricks,
     recenter_snap,
-    crease_threshold,
     DIST_BAND_VOXELS,
 }
 
@@ -188,7 +187,7 @@ fn load_mat(base_u: u32, lx: i32, ly: i32, lz: i32) -> vec4<f32> {
 // The bake stores the unit SDF gradient per voxel (Rgba8Snorm, shares the DISTANCE tile origin).
 // `load_grad` fetches one corner; `sample_grad` trilerps the 8 corners and renormalizes for a
 // cheap, sharp shading normal (one fetch-set vs the tetrahedron finite-difference's 5 field
-// resolves). Only compiled into the march when SDF_GRAD_NORMALS / SDF_SHARP_CREASES is set.
+// resolves). Only compiled into the march when SDF_GRAD_NORMALS is set.
 
 fn load_grad(base_u: u32, lx: i32, ly: i32, lz: i32) -> vec3<f32> {
     let loc = voxel_loc(base_u, lx, ly, lz);
@@ -359,64 +358,10 @@ fn sample_brick_sdf(base_u: u32, world_pos: vec3<f32>, lod: u32) -> f32 {
     let x11 = mix(c011, c111, fx);
     let y0 = mix(x00, x10, fy);
     let y1 = mix(x01, x11, fy);
-    var d_snorm = mix(y0, y1, fz);
-
-#ifdef SDF_SHARP_CREASES
-    // Sharp-feature reconstruction: trilinear rounds off edges/corners. Near the surface, where the
-    // 8 corner gradients DIVERGE (a crease crosses the cell), blend in the MAX of the corner TANGENT
-    // PLANES — the SDF of the intersection of the corner half-spaces, EXACT for a convex edge (a cube
-    // edge) and conservative (march-safe) for concave. Gated to the near-surface band so far cells —
-    // and any without a baked gradient — keep the plain trilinear value.
-    if (abs(d_snorm) < 0.5) {
-        var gs = array<vec3<f32>, 8>(
-            load_grad(base_u, i0.x,     i0.y,     i0.z),
-            load_grad(base_u, i0.x + 1, i0.y,     i0.z),
-            load_grad(base_u, i0.x,     i0.y + 1, i0.z),
-            load_grad(base_u, i0.x + 1, i0.y + 1, i0.z),
-            load_grad(base_u, i0.x,     i0.y,     i0.z + 1),
-            load_grad(base_u, i0.x + 1, i0.y,     i0.z + 1),
-            load_grad(base_u, i0.x,     i0.y + 1, i0.z + 1),
-            load_grad(base_u, i0.x + 1, i0.y + 1, i0.z + 1),
-        );
-        // All corners must carry a baked (unit) gradient; a zero one ⇒ outside the bake gate ⇒ skip.
-        var min_len2 = 1.0;
-        for (var i = 0u; i < 8u; i = i + 1u) { min_len2 = min(min_len2, dot(gs[i], gs[i])); }
-        if (min_len2 > 0.5) {
-            // Crease-ness from the lowest pairwise gradient alignment (0 = 90° edge, 1 = flat).
-            var min_dot = 1.0;
-            for (var a = 0u; a < 8u; a = a + 1u) {
-                for (var b = a + 1u; b < 8u; b = b + 1u) {
-                    min_dot = min(min_dot, dot(gs[a], gs[b]));
-                }
-            }
-            let thr = crease_threshold();
-            let crease = 1.0 - smoothstep(thr - 0.15, thr + 0.15, min_dot);
-            if (crease > 0.0) {
-                var cs = array<f32, 8>(c000, c100, c010, c110, c001, c101, c011, c111);
-                var corners = array<vec3<f32>, 8>(
-                    vec3<f32>(0.0, 0.0, 0.0), vec3<f32>(1.0, 0.0, 0.0),
-                    vec3<f32>(0.0, 1.0, 0.0), vec3<f32>(1.0, 1.0, 0.0),
-                    vec3<f32>(0.0, 0.0, 1.0), vec3<f32>(1.0, 0.0, 1.0),
-                    vec3<f32>(0.0, 1.0, 1.0), vec3<f32>(1.0, 1.0, 1.0),
-                );
-                // plane_i(f) = c_i + ∇f_i·(f - corner_i) in snorm units: the world step (f-corner)·
-                // voxel_size, dotted with the unit gradient, divided by the snorm band (the voxel_size
-                // cancels) ⇒ /DIST_BAND_VOXELS.
-                var planar = -1e30;
-                for (var i = 0u; i < 8u; i = i + 1u) {
-                    let pl = cs[i] + dot(gs[i], f - corners[i]) / DIST_BAND_VOXELS;
-                    planar = max(planar, pl);
-                }
-                d_snorm = mix(d_snorm, planar, crease);
-            }
-        }
-    }
-#endif
-
     // Decode the per-LOD voxel-unit clamp: the bake stored `d / (DIST_BAND_VOXELS·voxel_size)`
     // as snorm (atlas::dist_to_snorm_band), so multiply back to recover world distance. A
     // coarse LOD's large band lets the sphere-trace take big steps far from the surface.
-    return d_snorm * (DIST_BAND_VOXELS * voxel_size);
+    return mix(y0, y1, fz) * (DIST_BAND_VOXELS * voxel_size);
 }
 
 // Find the finest LOD with a baked brick at `world_pos`. Returns the brick location plus
