@@ -209,6 +209,10 @@ pub struct SdfRaymarchParams {
     /// slowest); higher = coarser/blobbier shadows but far fewer march steps — the shadows are the
     /// G-buffer pass's biggest cost. Live "Shadow detail" slider in the editor raymarch panel.
     pub shadow_lod_bias: u32,
+    /// Corner-gradient alignment (cos) threshold below which a cell is treated as a sharp crease by
+    /// `SDF_SHARP_CREASES` (max-of-tangent-planes reconstruction). Lower = only very sharp edges
+    /// reconstruct; higher = more cells. Live "Crease threshold" slider; uploaded in `screen_params.z`.
+    pub crease_threshold: f32,
 }
 
 impl Default for SdfRaymarchParams {
@@ -235,6 +239,9 @@ impl Default for SdfRaymarchParams {
             // LOD 0) drop to LOD 1 — ~2× fewer steps, imperceptible under the soft penumbra. 0 =
             // full detail. Live "Shadow detail" slider.
             shadow_lod_bias: 1,
+            // cos(60°) = 0.5: only cells whose corner gradients diverge past ~60° (a real edge)
+            // reconstruct as sharp. Live "Crease threshold" slider (only used under SDF_SHARP_CREASES).
+            crease_threshold: 0.5,
         }
     }
 }

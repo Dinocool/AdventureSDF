@@ -272,6 +272,17 @@ fn register_shader_modes(app: &mut App) {
             so toggling triggers a one-time re-bake."
             .into(),
     });
+    registry.register(ShaderDebugMode {
+        id: "sdf/sharp_creases".into(),
+        label: "Sharp creases".into(),
+        shader_define: "SDF_SHARP_CREASES".into(),
+        kind: DebugModeKind::Toggle,
+        description: "Reconstruct sharp edges/corners the trilinear interp rounds off: where the \
+            baked corner gradients diverge, blend in the max of their tangent planes (exact convex \
+            edges). Uses the gradient atlas (triggers a re-bake to fill it). Tune with \"Crease \
+            threshold\"."
+            .into(),
+    });
     // Note: height-map relief is baked into the SDF field (see sdf_render::height) — no shader
     // toggle. Strength is the per-material "Relief depth" (Inspect panel).
 
@@ -289,7 +300,7 @@ fn register_shader_modes(app: &mut App) {
 /// every resident brick (re)fills — or stops filling — the gradient atlas. Editor-only; in a
 /// non-editor build the flag stays false and the gradient atlas costs nothing.
 fn sync_gradient_bake_flag(state: Res<ShaderDebugState>, mut atlas: ResMut<SdfAtlas>) {
-    let want = state.is_active("sdf/grad_normals");
+    let want = state.is_active("sdf/grad_normals") || state.is_active("sdf/sharp_creases");
     if atlas.bake_gradient != want {
         atlas.bake_gradient = want;
         atlas.rebake_all = true;
@@ -580,6 +591,11 @@ fn render_panel(world: &mut World, ui: &mut egui::Ui) {
     // fewer march steps (shadows are the gbuffer's biggest cost). 0 = finest/sharpest.
     ui.add(
         egui::Slider::new(&mut params.shadow_lod_bias, 0..=4).text("Shadow detail (0 = sharpest)"),
+    );
+    // Crease detection threshold (only used with the "Sharp creases" toggle): cos of the corner-
+    // gradient divergence above which a cell counts as a sharp edge. Lower = only very sharp edges.
+    ui.add(
+        egui::Slider::new(&mut params.crease_threshold, 0.0..=1.0).text("Crease threshold"),
     );
 }
 
