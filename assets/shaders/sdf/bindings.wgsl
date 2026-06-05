@@ -70,12 +70,15 @@ struct ChunkLookup {
     probe_base: u32, // DDGI probe-slot base (u32::MAX = no probes here → fall back to a coarser LOD)
 };
 
-// One resident brick's record in the packed chunk tile run: atlas tile origin + palette + DDGI probe.
+// One resident brick's record in the packed chunk tile run: distance tile origin, material tile origin
+// (or MAT_ATLAS_NONE for a single-material brick), palette, + DDGI probe slot. MUST match chunk::BrickTile
+// field order (encode_tile): atlas_base, mat_atlas_base, pal01, pal23, probe_slot (20 bytes std430).
 struct BrickTile {
-    atlas_base: u32,  // col_px | row_px<<16
-    pal_lo: u32,      // palette ids 0,1 (id0 | id1<<16)
-    pal_hi: u32,      // palette ids 2,3 (id2 | id3<<16)
-    probe_slot: u32,  // DDGI compact finest-resident probe slot (0xffffffff = none)
+    atlas_base: u32,      // distance tile origin: col_px | row_px<<16
+    mat_atlas_base: u32,  // material tile origin, or MAT_ATLAS_NONE (single-material brick)
+    pal_lo: u32,          // palette ids 0,1 (id0 | id1<<16)
+    pal_hi: u32,          // palette ids 2,3 (id2 | id3<<16)
+    probe_slot: u32,      // DDGI compact finest-resident probe slot (0xffffffff = none)
 };
 
 // NOTE: DDGI probe slots are no longer derived from the atlas tile index. They are now compact over the
@@ -115,10 +118,19 @@ struct BrickTile {
 @group(1) @binding(9) var tex_height: texture_2d_array<f32>;
 @group(1) @binding(10) var tex_edge: texture_2d_array<f32>;
 @group(1) @binding(11) var<storage, read> chunk_tile_buf: array<BrickTile>;  // packed per-chunk brick runs
+// Per-voxel gradient (outward unit normal) pages, Rgba8Snorm. PAGED like the distance atlas and
+// indexed by the SAME tile origin (dense — one tile per brick). Only populated when the gradient
+// feature is enabled (SDF_GRAD_NORMALS); a dummy 1×1 fills every slot otherwise.
+// SIZED binding_array (see the atlas_pages note above). MUST match `atlas_upload::ATLAS_MAX_PAGES`.
+@group(1) @binding(12) var grad_pages: binding_array<texture_2d<f32>, 64>;
 
 // --- Shared constants ---
 
 const PALETTE_EMPTY: u32 = 0xffffu;
+// `mat_atlas_base` sentinel for a single-material brick (owns no material tile). Mirrors
+// `chunk::MAT_ATLAS_NONE`. The reader short-circuits on `palette[1]==EMPTY` before sampling, so
+// this is never used as a real origin.
+const MAT_ATLAS_NONE: u32 = 0xffffffffu;
 const TEXTURE_WORLD_SCALE: f32 = 0.5;  // world units per texture tile = 2.0
 const PI: f32 = 3.14159265359;
 // Per-LOD distance-field clamp band in VOXELS. The geometry distance atlas stores

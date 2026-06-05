@@ -124,11 +124,12 @@ fn chunk_lookup_bytes(chunks: &[ChunkLookup]) -> Vec<u8> {
     out
 }
 
-// 16-byte BrickTile serialization (reuse of sdf_gpu_rig.rs::brick_tile_bytes).
+// 20-byte BrickTile serialization (matches chunk_tables::encode_tile / the WGSL BrickTile).
 fn brick_tile_bytes(tiles: &[BrickTile]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(tiles.len() * 16);
+    let mut out = Vec::with_capacity(tiles.len() * 20);
     for t in tiles {
         out.extend_from_slice(&t.atlas_base.to_le_bytes());
+        out.extend_from_slice(&t.mat_atlas_base.to_le_bytes());
         out.extend_from_slice(&t.pal01.to_le_bytes());
         out.extend_from_slice(&t.pal23.to_le_bytes());
         out.extend_from_slice(&t.probe_slot.to_le_bytes());
@@ -437,7 +438,7 @@ fn sdf_soft_shadow_vs_analytic_reference() {
 
     // --- 5. chunk directory -----------------------------------------------------------------
     let tables = build_chunk_tables(&atlas, &config, |key| {
-        pack_brick_tile(atlas.tiles.tile(key).unwrap(), atlas.bricks[key].palette)
+        pack_brick_tile(atlas.tiles.tile(key).unwrap(), atlas.mat_tiles.tile(key), atlas.bricks[key].palette)
     });
     let chunk_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("chunk_buf"),

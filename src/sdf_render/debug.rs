@@ -33,7 +33,9 @@ pub struct SdfAtlasStats {
     pub dirty: bool,
     // Memory breakdown, in bytes.
     pub dist_bytes: u64,
+    /// Material atlas (the single `mat_pages` texture: per-voxel palette-slot distances).
     pub object_bytes: u64,
+    /// Gradient atlas (per-voxel baked normal; 0 until the Phase-3 gradient channel lands).
     pub blend_bytes: u64,
     pub lookup_bytes: u64,
     pub total_bytes: u64,
@@ -98,7 +100,7 @@ impl Plugin for SdfDebugPlugin {
             .register_type::<ChunkDebugState>()
             .add_systems(
                 Update,
-                update_atlas_stats.run_if(in_state(AppScene::SdfEditor)),
+                (update_atlas_stats, sync_gradient_bake_flag).run_if(in_state(AppScene::SdfEditor)),
             );
 
         // Gizmo-drawing systems need GizmoPlugin's Assets<GizmoAsset>; absent under
@@ -284,6 +286,16 @@ fn register_shader_modes(app: &mut App) {
         description: "Convex-edge wear from the edge map (2 extra texture taps per hit pixel)"
             .into(),
     });
+    registry.register(ShaderDebugMode {
+        id: "sdf/grad_normals".into(),
+        label: "Gradient normals".into(),
+        shader_define: "SDF_GRAD_NORMALS".into(),
+        kind: DebugModeKind::Toggle,
+        description: "Shade normals from the baked per-voxel gradient atlas (1 fetch vs the 5-tap \
+            finite difference — sharper + cheaper). Enabling bakes the gradient atlas (extra VRAM), \
+            so toggling triggers a one-time re-bake."
+            .into(),
+    });
     // Note: height-map relief is baked into the SDF field (see sdf_render::height) — no shader
     // toggle. Strength is the per-material "Relief depth" (Inspect panel).
 
@@ -293,10 +305,50 @@ fn register_shader_modes(app: &mut App) {
     {
         let mut state = app.world_mut().resource_mut::<ShaderDebugState>();
         state.set("sdf/shadows", true);
+        // Gradient normals ON by default: the baked-gradient normal (1 fetch) is sharper + cheaper
+        // than the 5-tap finite difference. `sync_gradient_bake_flag` turns this into
+        // `bake_gradient = true`, so the gradient atlas bakes (the standing VRAM is accepted).
+        state.set("sdf/grad_normals", true);
+    }
+}
+
+/// Drive the per-voxel gradient bake from the `SDF_GRAD_NORMALS` toggle: when it flips, set
+/// `SdfAtlas::bake_gradient` and force a full re-bake so every resident brick (re)fills — or stops
+/// filling — the gradient atlas. Editor-only; in a non-editor build the flag stays false and the
+/// gradient atlas costs nothing.
+fn sync_gradient_bake_flag(state: Res<ShaderDebugState>, mut atlas: ResMut<SdfAtlas>) {
+    let want = state.is_active("sdf/grad_normals");
+    if atlas.bake_gradient != want {
+        atlas.bake_gradient = want;
+        atlas.rebake_all = true;
     }
 }
 
 // --- Atlas stats ---
+
+// Per-voxel GPU byte widths of each brick atlas channel — the SSOT for the memory panel.
+// MUST mirror the texture formats created in `render::atlas_pages`. Distance is the single
+// R16Snorm atlas (2B); material is the single Rgba16Snorm atlas (8B = 4 palette-slot distances);
+// gradient is the single Rgba8Snorm atlas (4B = xyz normal). There is no second material texture —
+// the earlier `mat_lo`+`mat_hi` split double-counted a `mat_hi` that never existed.
+const DIST_BYTES_PER_VOXEL: u64 = 2;
+const MAT_BYTES_PER_VOXEL: u64 = 8;
+const GRAD_BYTES_PER_VOXEL: u64 = 4;
+const LOOKUP_BYTES_PER_BRICK: u64 = 16;
+
+/// Pure GPU-memory breakdown as `(distance, material, gradient, lookup, total)` bytes. Distance +
+/// lookup scale with ALL resident bricks; material scales with the MULTI-material count (`mat_bricks`,
+/// single-material bricks store no material tile — the reclamation win); gradient scales with
+/// `grad_bricks` (= all bricks when the gradient feature is on, else 0 — it's gated). Extracted so
+/// the layout invariant is unit-testable without an `App`/`SdfAtlas`.
+fn atlas_byte_breakdown(bricks: u64, mat_bricks: u64, grad_bricks: u64) -> (u64, u64, u64, u64, u64) {
+    let voxels = bricks * BRICK_VOXELS as u64;
+    let dist = voxels * DIST_BYTES_PER_VOXEL;
+    let mat = mat_bricks * BRICK_VOXELS as u64 * MAT_BYTES_PER_VOXEL;
+    let grad = grad_bricks * BRICK_VOXELS as u64 * GRAD_BYTES_PER_VOXEL;
+    let lookup = bricks * LOOKUP_BYTES_PER_BRICK;
+    (dist, mat, grad, lookup, dist + mat + grad + lookup)
+}
 
 fn update_atlas_stats(
     mut stats: ResMut<SdfAtlasStats>,
@@ -304,18 +356,16 @@ fn update_atlas_stats(
     ddgi: Res<super::DdgiParams>,
 ) {
     let total = atlas.bricks.len() as u64;
-    let voxels = total * BRICK_VOXELS as u64;
+    let mat_bricks = atlas.mat_tiles.len() as u64;
+    // Gradient is dense (one tile per brick) but only baked when the feature is on.
+    let grad_bricks = if atlas.bake_gradient { total } else { 0 };
 
-    // GPU footprint per voxel: distance R16Snorm (2B) + two dense material-distance
-    // atlases, mat_lo and mat_hi, each Rgba16Snorm (8B = 4 materials × 2B). Plus the
-    // per-brick lookup entry (16B, std430). Matches the formats uploaded in render.rs.
-    // (`object_bytes`/`blend_bytes` fields are reused for mat_lo/mat_hi.)
-    stats.dist_bytes = voxels * 2;
-    stats.object_bytes = voxels * 8; // mat_lo (materials 0..3)
-    stats.blend_bytes = voxels * 8; // mat_hi (materials 4..7)
-    stats.lookup_bytes = total * 16;
-    stats.total_bytes =
-        stats.dist_bytes + stats.object_bytes + stats.blend_bytes + stats.lookup_bytes;
+    let (dist, mat, grad, lookup, total_bytes) = atlas_byte_breakdown(total, mat_bricks, grad_bricks);
+    stats.dist_bytes = dist;
+    stats.object_bytes = mat;
+    stats.blend_bytes = grad;
+    stats.lookup_bytes = lookup;
+    stats.total_bytes = total_bytes;
 
     stats.total_bricks = total as u32;
     // DDGI: subdiv³ octahedral probes per FINEST-resident brick (the compact, clipmap-bounded set);
@@ -1114,4 +1164,43 @@ fn sdf_inline_material_ui(world: &mut World, entity: Entity, ui: &mut egui::Ui) 
     scalar(ui, "Metallic", &mut o.metallic, 0.0, 1.0);
     scalar(ui, "Roughness", &mut o.roughness, 1.0, 1.0);
     scalar(ui, "Relief depth", &mut o.parallax_scale, 0.0, 0.4);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The memory panel's per-channel breakdown must sum to the reported total. Distance is ONE
+    /// R16Snorm atlas over all bricks; material is ONE Rgba16Snorm atlas (8 B/voxel) sized to the
+    /// MULTI-material count only (the reclamation win); gradient is ONE Rgba8Snorm atlas (4 B/voxel)
+    /// over all bricks but only when enabled (`grad_bricks`). Locks the decoupled+gated layout.
+    #[test]
+    fn atlas_byte_breakdown_is_consistent_and_decoupled() {
+        // (total bricks, multi-material bricks, gradient bricks)
+        for (bricks, mat_bricks, grad_bricks) in
+            [(0u64, 0u64, 0u64), (1, 0, 0), (1000, 0, 0), (1000, 250, 1000), (7, 7, 0)]
+        {
+            let (dist, mat, grad, lookup, total) =
+                atlas_byte_breakdown(bricks, mat_bricks, grad_bricks);
+            assert_eq!(dist + mat + grad + lookup, total, "breakdown must sum to total");
+
+            assert_eq!(dist, bricks * BRICK_VOXELS as u64 * 2, "distance: one R16Snorm tile per brick");
+            assert_eq!(
+                mat,
+                mat_bricks * BRICK_VOXELS as u64 * 8,
+                "material: one Rgba16Snorm tile per MULTI-material brick only"
+            );
+            assert_eq!(
+                grad,
+                grad_bricks * BRICK_VOXELS as u64 * 4,
+                "gradient: one Rgba8Snorm tile per brick, only when enabled"
+            );
+            assert_eq!(lookup, bricks * 16);
+        }
+        // Reclamation invariant: no multi-material bricks ⇒ zero material VRAM. Gating invariant:
+        // gradient off (grad_bricks=0) ⇒ zero gradient VRAM.
+        let (_, mat_none, grad_off, _, _) = atlas_byte_breakdown(1000, 0, 0);
+        assert_eq!(mat_none, 0, "single-material-only scene allocates no material atlas");
+        assert_eq!(grad_off, 0, "gradient-disabled scene allocates no gradient atlas");
+    }
 }

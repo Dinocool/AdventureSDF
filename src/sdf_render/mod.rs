@@ -654,6 +654,9 @@ impl Plugin for SdfScenePlugin {
             .init_resource::<ProbeWake>()
             .init_resource::<ProbeWakeSet>()
             .init_resource::<ProbeReset>()
+            // `evict_on_scene_switch` reads this message; register it here too (idempotent) so the SDF
+            // plugin is self-sufficient and doesn't depend on `SceneManagerPlugin` being added first.
+            .add_message::<crate::scene_manager::SceneSwitched>()
             .init_resource::<WireframeBoundsVisible>()
             .init_resource::<GizmoVisibility>()
             .init_resource::<BakedBrickDebug>()

@@ -9,10 +9,12 @@
     camera,
     ChunkLookup,
     PALETTE_EMPTY,
+    MAT_ATLAS_NONE,
     chunk_buf,
     chunk_tile_buf,
     atlas_pages,
     mat_pages,
+    grad_pages,
     ATLAS_PAGE_HEIGHT_PX,
     cell_stride,
     voxel_size_at,
@@ -63,8 +65,9 @@ fn world_to_brick_lod(world_pos: vec3<f32>, lod: u32) -> vec3<i32> {
 // --- Chunk lookup: binary search + occupancy resolve ---
 
 struct BrickLocation {
-    atlas_base: u32,     // packed tile origin (col_px | row_px<<16); see voxel_pixel
-    palette: vec4<u32>,  // 4 global material ids (PALETTE_EMPTY = unused)
+    atlas_base: u32,      // packed DISTANCE tile origin (col_px | row_px<<16); see voxel_pixel
+    mat_atlas_base: u32,  // packed MATERIAL tile origin, or MAT_ATLAS_NONE (single-material brick)
+    palette: vec4<u32>,   // 4 global material ids (PALETTE_EMPTY = unused)
     found: bool,
 };
 
@@ -108,7 +111,7 @@ fn brick_in_chunk(chunk: ChunkLookup, coord: vec3<i32>) -> BrickLocation {
     if (li < 32u) { bit = (chunk.occ_lo >> li) & 1u; }
     else { bit = (chunk.occ_hi >> (li - 32u)) & 1u; }
     if (bit == 0u) {
-        return BrickLocation(0u, vec4<u32>(PALETTE_EMPTY), false);
+        return BrickLocation(0u, MAT_ATLAS_NONE, vec4<u32>(PALETTE_EMPTY), false);
     }
 
     // Offset within the chunk's tile run = popcount of mask bits below li.
@@ -123,7 +126,7 @@ fn brick_in_chunk(chunk: ChunkLookup, coord: vec3<i32>) -> BrickLocation {
     }
     let off = countOneBits(below_lo) + countOneBits(below_hi);
     let tile = chunk_tile_buf[chunk.tile_run_base + off];
-    return BrickLocation(tile.atlas_base, unpack_palette(tile.pal_lo, tile.pal_hi), true);
+    return BrickLocation(tile.atlas_base, tile.mat_atlas_base, unpack_palette(tile.pal_lo, tile.pal_hi), true);
 }
 
 // Resolve the baked brick at `coord` on LOD `lod` via its chunk: find the chunk, then test
@@ -131,7 +134,7 @@ fn brick_in_chunk(chunk: ChunkLookup, coord: vec3<i32>) -> BrickLocation {
 fn find_brick_lookup(coord: vec3<i32>, lod: u32) -> BrickLocation {
     let ci = find_chunk(coord, lod);
     if (ci < 0) {
-        return BrickLocation(0u, vec4<u32>(PALETTE_EMPTY), false);
+        return BrickLocation(0u, MAT_ATLAS_NONE, vec4<u32>(PALETTE_EMPTY), false);
     }
     return brick_in_chunk(chunk_buf[u32(ci)], coord);
 }
@@ -177,6 +180,53 @@ fn load_voxel(base_u: u32, lx: i32, ly: i32, lz: i32) -> f32 {
 fn load_mat(base_u: u32, lx: i32, ly: i32, lz: i32) -> vec4<f32> {
     let loc = voxel_loc(base_u, lx, ly, lz);
     return textureLoad(mat_pages[loc.page], loc.px, 0);
+}
+
+// --- Per-voxel gradient (outward normal) sampling ---
+//
+// The bake stores the unit SDF gradient per voxel (Rgba8Snorm, shares the DISTANCE tile origin).
+// `load_grad` fetches one corner; `sample_grad` trilerps the 8 corners and renormalizes for a
+// cheap, sharp shading normal (one fetch-set vs the tetrahedron finite-difference's 5 field
+// resolves). Only compiled into the march when SDF_GRAD_NORMALS is set.
+
+fn load_grad(base_u: u32, lx: i32, ly: i32, lz: i32) -> vec3<f32> {
+    let loc = voxel_loc(base_u, lx, ly, lz);
+    return textureLoad(grad_pages[loc.page], loc.px, 0).xyz;
+}
+
+fn sample_grad(base_u: u32, world_pos: vec3<f32>, lod: u32) -> vec3<f32> {
+    let voxel_size = voxel_size_at(lod);
+    let s = cell_stride();
+    let voxel_f = world_pos / voxel_size;
+    let vox = vec3<i32>(floor(voxel_f));
+    let brick_origin_voxel = vec3<f32>(
+        f32(brick_snap(vox.x, s)),
+        f32(brick_snap(vox.y, s)),
+        f32(brick_snap(vox.z, s)),
+    );
+    let local_f = voxel_f - brick_origin_voxel;
+    let i0 = vec3<i32>(floor(local_f));
+    let f = local_f - floor(local_f);
+
+    let g000 = load_grad(base_u, i0.x,     i0.y,     i0.z);
+    let g100 = load_grad(base_u, i0.x + 1, i0.y,     i0.z);
+    let g010 = load_grad(base_u, i0.x,     i0.y + 1, i0.z);
+    let g110 = load_grad(base_u, i0.x + 1, i0.y + 1, i0.z);
+    let g001 = load_grad(base_u, i0.x,     i0.y,     i0.z + 1);
+    let g101 = load_grad(base_u, i0.x + 1, i0.y,     i0.z + 1);
+    let g011 = load_grad(base_u, i0.x,     i0.y + 1, i0.z + 1);
+    let g111 = load_grad(base_u, i0.x + 1, i0.y + 1, i0.z + 1);
+    let x00 = mix(g000, g100, f.x);
+    let x10 = mix(g010, g110, f.x);
+    let x01 = mix(g001, g101, f.x);
+    let x11 = mix(g011, g111, f.x);
+    let y0 = mix(x00, x10, f.y);
+    let y1 = mix(x01, x11, f.y);
+    let g = mix(y0, y1, f.z);
+    let glen = length(g);
+    // Zero when the stored gradients are absent (outside the bake's near-surface gate) so the
+    // caller can fall back to finite differences; a real gradient returns unit length.
+    return select(vec3<f32>(0.0), g / glen, glen > 1e-6);
 }
 
 fn sample_mat_tex(base_u: u32, i0: vec3<i32>, f: vec3<f32>) -> vec4<f32> {
@@ -247,6 +297,26 @@ fn pick_material(slots: vec4<f32>, palette: vec4<u32>) -> MaterialPick {
     return MaterialPick(palette[best], palette[second], second_d - best_d);
 }
 
+// Resolve the material at `world_pos` given the serving brick's `palette`. A brick whose palette
+// has only slot 0 filled (`palette[1] == PALETTE_EMPTY`) is SINGLE-MATERIAL — every voxel is
+// `palette[0]` — so we skip the 8 material-distance texture loads + the argmin entirely and return
+// it directly. Palettes are packed densely from slot 0 (edits::build_palette), so this test is
+// exact. This is the common case (most bricks touch one material) and removes the dominant per-hit
+// material cost there; multi-material bricks fall through to the per-palette-slot argmin. The
+// returned `gap` (1.0 = the material "far" band) matches what the full per-slot path yields for a
+// single-material brick (runner-up = MATERIAL_FAR), so `id_b == id` skips the blend and `fwidth(gap)`
+// stays ~0 across a uniform↔multi material-brick boundary (a larger sentinel would blow up fwidth
+// there and paint a 1px seam on the neighbouring multi-material pixel).
+// `mat_base` is the MATERIAL tile origin (loc.mat_atlas_base) — distinct from the distance tile in
+// the decoupled atlas. A single-material brick passes MAT_ATLAS_NONE here, but the `palette.y` check
+// returns before it's ever used to sample, so the sentinel is safe.
+fn resolve_material(mat_base: u32, world_pos: vec3<f32>, lod: u32, palette: vec4<u32>) -> MaterialPick {
+    if (palette.y == PALETTE_EMPTY) {
+        return MaterialPick(palette.x, palette.x, 1.0);
+    }
+    return pick_material(load_material_distances(mat_base, world_pos, lod), palette);
+}
+
 fn sample_brick_sdf(base_u: u32, world_pos: vec3<f32>, lod: u32) -> f32 {
     let voxel_size = voxel_size_at(lod);
 
@@ -312,7 +382,7 @@ fn find_brick_at(world_pos: vec3<f32>, out_lod: ptr<function, u32>) -> BrickLoca
         }
     }
     *out_lod = 0u;
-    return BrickLocation(0u, vec4<u32>(PALETTE_EMPTY), false);
+    return BrickLocation(0u, MAT_ATLAS_NONE, vec4<u32>(PALETTE_EMPTY), false);
 }
 
 // Trilinear SDF at any world position, resolving the brick by finest-LOD lookup.
@@ -358,9 +428,9 @@ fn scene_sdf(p: vec3<f32>) -> SceneSdfResult {
     // owns the surface (mapped to a global id); the boundary against the runner-up
     // is the bisector where their interpolated distances are equal (`gap == 0`).
     // Both distances are continuous, so that bisector is sub-voxel sharp and
-    // independent of geometric smoothing — clean even at smoothing = 0.
-    let md = load_material_distances(loc.atlas_base, p, lod);
-    let pick = pick_material(md, loc.palette);
+    // independent of geometric smoothing — clean even at smoothing = 0. Single-material
+    // bricks short-circuit the per-slot fetch (see `resolve_material`).
+    let pick = resolve_material(loc.mat_atlas_base, p, lod, loc.palette);
 
     return SceneSdfResult(d, pick.id, pick.id_b, pick.gap, true, lod, loc.atlas_base, loc.palette);
 }
@@ -420,7 +490,7 @@ fn find_chunk_cached(coord: vec3<i32>, lod: u32, cache: ptr<function, ChunkCache
 fn find_brick_lookup_cached(coord: vec3<i32>, lod: u32, cache: ptr<function, ChunkCache>) -> BrickLocation {
     let ci = find_chunk_cached(coord, lod, cache);
     if (ci < 0) {
-        return BrickLocation(0u, vec4<u32>(PALETTE_EMPTY), false);
+        return BrickLocation(0u, MAT_ATLAS_NONE, vec4<u32>(PALETTE_EMPTY), false);
     }
     return brick_in_chunk(chunk_buf[u32(ci)], coord);
 }
@@ -440,7 +510,7 @@ fn find_brick_at_cached(world_pos: vec3<f32>, out_lod: ptr<function, u32>, cache
         }
     }
     *out_lod = 0u;
-    return BrickLocation(0u, vec4<u32>(PALETTE_EMPTY), false);
+    return BrickLocation(0u, MAT_ATLAS_NONE, vec4<u32>(PALETTE_EMPTY), false);
 }
 
 fn sample_sdf_world_cached(world_pos: vec3<f32>, cache: ptr<function, ChunkCache>) -> f32 {
@@ -461,6 +531,7 @@ struct MarchSample {
     window_lod: u32,
     lod: u32,
     atlas_base: u32,
+    mat_atlas_base: u32,
     palette: vec4<u32>,
 };
 
@@ -489,12 +560,12 @@ fn resolve_march(p: vec3<f32>, cache: ptr<function, ChunkCache>) -> MarchSample 
                 let loc = brick_in_chunk(chunk_buf[u32(ci)], coord);
                 if (loc.found) {
                     let d = sample_brick_sdf(loc.atlas_base, p, lod);
-                    return MarchSample(d, true, window_lod, lod, loc.atlas_base, loc.palette);
+                    return MarchSample(d, true, window_lod, lod, loc.atlas_base, loc.mat_atlas_base, loc.palette);
                 }
             }
         }
     }
-    return MarchSample(1e10, false, window_lod, 0u, 0u, vec4<u32>(PALETTE_EMPTY));
+    return MarchSample(1e10, false, window_lod, 0u, 0u, MAT_ATLAS_NONE, vec4<u32>(PALETTE_EMPTY));
 }
 
 // Sample the conservative field at an ABSOLUTE target LOD, degrading to COARSER only.
@@ -510,7 +581,7 @@ fn resolve_march(p: vec3<f32>, cache: ptr<function, ChunkCache>) -> MarchSample 
 fn sample_level_at_or_coarser(p: vec3<f32>, target_lod: u32, cache: ptr<function, ChunkCache>) -> MarchSample {
     let levels = lod_count();
     if (target_lod >= levels || arrayLength(&chunk_buf) == 0u) {
-        return MarchSample(1e10, false, levels - 1u, 0u, 0u, vec4<u32>(PALETTE_EMPTY));
+        return MarchSample(1e10, false, levels - 1u, 0u, 0u, MAT_ATLAS_NONE, vec4<u32>(PALETTE_EMPTY));
     }
     for (var lod = target_lod; lod < levels; lod = lod + 1u) {
         let coord = world_to_brick_lod(p, lod);
@@ -519,11 +590,11 @@ fn sample_level_at_or_coarser(p: vec3<f32>, target_lod: u32, cache: ptr<function
             let loc = brick_in_chunk(chunk_buf[u32(ci)], coord);
             if (loc.found) {
                 let d = sample_brick_sdf(loc.atlas_base, p, lod);
-                return MarchSample(d, true, lod, lod, loc.atlas_base, loc.palette);
+                return MarchSample(d, true, lod, lod, loc.atlas_base, loc.mat_atlas_base, loc.palette);
             }
         }
     }
-    return MarchSample(1e10, false, levels - 1u, 0u, 0u, vec4<u32>(PALETTE_EMPTY));
+    return MarchSample(1e10, false, levels - 1u, 0u, 0u, MAT_ATLAS_NONE, vec4<u32>(PALETTE_EMPTY));
 }
 
 // Distance along the ray to the far side of the brick containing `p`, at LOD `lod`.
@@ -573,6 +644,40 @@ fn dist_to_chunk_exit_lod(p: vec3<f32>, dir: vec3<f32>, lod: u32) -> f32 {
         }
     }
     return t;
+}
+
+// Occupancy-aware brick-DDA WITHIN one resident chunk. When the ray is in empty space yet inside an
+// OCCUPIED (resident) chunk — air ABOVE the terrain that lives in the same chunk as the surface
+// bricks below it — plain `dist_to_brick_exit_lod` crawls ONE brick per outer march step (the
+// "horizon crawl" that exhausts the step budget on grazing rays). This walks the ray across the run
+// of CONSECUTIVE EMPTY bricks in one shot, reading only the chunk's 64-bit occupancy mask (no field
+// samples), and returns the distance to the near face of the next OCCUPIED brick, or to the chunk
+// exit if none lie ahead on the ray (the caller re-resolves there, where the hierarchical chunk-DDA
+// can skip further). Bounded to a chunk diagonal (≤ 3·CHUNK_BRICKS bricks).
+//
+// SAFE because the caller invokes it on the COARSEST resident chunk at `p`: a brick empty at a coarse
+// LOD is empty at ALL finer LODs (the same geometry bakes at every level, so present-at-fine ⇒
+// present-at-coarse ⇒ absent-at-coarse ⇒ absent-at-fine), so skipping an empty coarse brick can never
+// step over a finer-LOD surface.
+fn dist_over_empty_bricks(chunk: ChunkLookup, p: vec3<f32>, dir: vec3<f32>, lod: u32) -> f32 {
+    let key_hi = chunk.key_hi;
+    let key_lo = chunk.key_lo;
+    let eps = voxel_size_at(lod) * 0.01;
+    var adv = 0.0;
+    let max_bricks = 3u * u32(CHUNK_BRICKS);
+    for (var i = 0u; i < max_bricks; i = i + 1u) {
+        let q = p + dir * (adv + eps);
+        let coord = world_to_brick_lod(q, lod);
+        let qkey = abs_chunk_key(coord, lod);
+        if (qkey.x != key_hi || qkey.y != key_lo) {
+            return adv;                        // left this chunk → caller re-resolves at the next one
+        }
+        if (brick_in_chunk(chunk, coord).found) {
+            return adv;                        // occupied brick ahead → caller sphere-traces it
+        }
+        adv = adv + dist_to_brick_exit_lod(q, dir, lod) + eps;   // empty brick → step over it
+    }
+    return adv;
 }
 
 // True if the chunk containing brick `coord` at `lod` is inside that LOD's resident ring
@@ -625,6 +730,23 @@ fn in_ring_chunk(coord: vec3<i32>, lod: u32) -> bool {
 // The offset spans roughly one voxel so quantization in the snorm field doesn't
 // dominate the difference.
 fn calc_normal(p: vec3<f32>) -> vec3<f32> {
+#ifdef SDF_GRAD_NORMALS
+    // Baked-gradient normal: ONE trilinear gradient fetch-set instead of the 5 field resolves the
+    // tetrahedron FD below needs — sharper (it's the exact analytic gradient, not a snorm-quantized
+    // difference) and cheaper. Falls through to FD if the brick has no baked gradient here (e.g. a
+    // probe just outside the bake's near-surface gate).
+    {
+        var gcache = new_chunk_cache();
+        var glod = 0u;
+        let gloc = find_brick_at_cached(p, &glod, &gcache);
+        if (gloc.found) {
+            let g = sample_grad(gloc.atlas_base, p, glod);
+            if (dot(g, g) > 0.5) {
+                return g;
+            }
+        }
+    }
+#endif
     // Probe offset ≈ one voxel at the LOD serving this point (coarser LODs need a
     // proportionally larger offset so the finite difference spans a real sample gap).
     // The 5 probes (center LOD + 4 tetrahedron taps) are spatially adjacent → almost always

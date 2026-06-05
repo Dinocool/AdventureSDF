@@ -27,7 +27,7 @@ use bevy::math::IVec3;
 
 use super::SdfGridConfig;
 use super::atlas::{ATLAS_TILES_PER_ROW, BRICK_EDGE, BrickKey, SdfAtlas};
-use super::edits::Palette;
+use super::edits::{PALETTE_EMPTY, Palette};
 
 /// Bricks per axis in one chunk. 64 = `4³` fits a single u64 occupancy mask.
 pub const CHUNK_BRICKS: i32 = 4;
@@ -124,13 +124,20 @@ pub struct ChunkLookup {
     pub probe_base: u32,
 }
 
-/// One resident brick's GPU record inside a chunk's tile run: its atlas tile origin, its packed 4-entry
-/// material palette (`pal01 = id0|id1<<16`, `pal23 = id2|id3<<16`), and its DDGI `probe_slot` (the
-/// compact finest-resident probe slot, `u32::MAX` = no probe — non-finest or unassigned; set by
-/// `refresh_probe_bases`). 4×u32 = 16 bytes.
+/// `mat_atlas_base` sentinel for a SINGLE-material brick: it owns no material atlas tile (the
+/// material is `palette[0]` everywhere), so the reader short-circuits before ever sampling it.
+/// `u32::MAX` is not a valid `tile_atlas_base` packing (`col_px|row_px<<16`), so it can't collide.
+pub const MAT_ATLAS_NONE: u32 = u32::MAX;
+
+/// One resident brick's GPU record inside a chunk's tile run: its DISTANCE atlas tile origin, its
+/// MATERIAL atlas tile origin (or [`MAT_ATLAS_NONE`] for a single-material brick — those store no
+/// material tile), its packed 4-entry material palette (`pal01 = id0|id1<<16`, `pal23 = id2|id3<<16`),
+/// and its DDGI `probe_slot` (the compact finest-resident probe slot, `u32::MAX` = no probe; set by
+/// `refresh_probe_bases`). 5×u32 = 20 bytes. (Custom `Default` below for the `probe_slot`/`mat` sentinels.)
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BrickTile {
     pub atlas_base: u32,
+    pub mat_atlas_base: u32,
     pub pal01: u32,
     pub pal23: u32,
     pub probe_slot: u32,
@@ -138,15 +145,24 @@ pub struct BrickTile {
 
 impl Default for BrickTile {
     fn default() -> Self {
-        // `probe_slot` defaults to the no-probe sentinel (not 0, which is a valid slot) so an unassigned
-        // or non-finest brick never aliases probe slot 0.
-        Self { atlas_base: 0, pal01: 0, pal23: 0, probe_slot: u32::MAX }
+        // `probe_slot` defaults to the no-probe sentinel (not 0, which is a valid slot); `mat_atlas_base`
+        // to the single-material sentinel — so an unassigned/empty slot never aliases a real probe or
+        // material tile.
+        Self {
+            atlas_base: 0,
+            mat_atlas_base: MAT_ATLAS_NONE,
+            pal01: 0,
+            pal23: 0,
+            probe_slot: u32::MAX,
+        }
     }
 }
 
 /// Pixel origin of atlas `tile` (tiles wrap into rows so the texture width stays bounded), packed
 /// as `col_px | row_px<<16`. Single source of truth for the `atlas_base` packing, shared by the
 /// render-world full rebuild and the incremental [`LiveChunkTables`] so both agree byte-for-byte.
+/// The distance and material atlases use the SAME packing (same page width/height); a brick's
+/// distance and material tiles come from independent allocators, so the two origins differ.
 pub fn tile_atlas_base(tile: u32) -> u32 {
     let edge = BRICK_EDGE as u32;
     let tile_width = edge * edge; // 64
@@ -155,15 +171,23 @@ pub fn tile_atlas_base(tile: u32) -> u32 {
     col_px | (row_px << 16)
 }
 
-/// Pack a brick's atlas tile + material palette into its GPU [`BrickTile`] record.
-pub fn pack_brick_tile(tile: u32, palette: Palette) -> BrickTile {
+/// Pack a brick's distance tile + material tile + palette into its GPU [`BrickTile`] record.
+/// `mat_tile` is `None` for a single-material brick (→ [`MAT_ATLAS_NONE`]).
+pub fn pack_brick_tile(tile: u32, mat_tile: Option<u32>, palette: Palette) -> BrickTile {
     BrickTile {
         atlas_base: tile_atlas_base(tile),
+        mat_atlas_base: mat_tile.map_or(MAT_ATLAS_NONE, tile_atlas_base),
         pal01: palette[0] as u32 | ((palette[1] as u32) << 16),
         pal23: palette[2] as u32 | ((palette[3] as u32) << 16),
         // No probe yet — `refresh_probe_bases` assigns the finest-resident slot after the bake.
         probe_slot: u32::MAX,
     }
+}
+
+/// True when `palette` names more than one material (slot 1 occupied). Palettes fill densely from
+/// slot 0 (`edits::build_palette`), so this is exact. Single-material bricks skip material storage.
+pub fn palette_is_multi(palette: Palette) -> bool {
+    palette[1] != PALETTE_EMPTY
 }
 
 /// The two GPU buffers the shader needs to resolve a brick: the dense per-LOD toroidal DIRECTORY
@@ -953,7 +977,7 @@ mod tests {
                 ^ ((k.coord.x as u32) << 16)
                 ^ ((k.coord.y as u32) << 8)
                 ^ (k.coord.z as u32);
-            BrickTile { atlas_base: base, pal01: base ^ 0x1111, pal23: base ^ 0x2222, ..Default::default() }
+            BrickTile { atlas_base: base, mat_atlas_base: base ^ 0x3333, pal01: base ^ 0x1111, pal23: base ^ 0x2222, ..Default::default() }
         };
 
         // Bricks across: a sparse subset of slots in chunk (0,0,0), a neighbouring chunk,
@@ -1086,7 +1110,7 @@ mod tests {
     fn clear_brick_sentinels_slot_keeps_directory_size() {
         let cfg = config();
         let r = cfg.ring_chunks_per_axis();
-        let tile = BrickTile { atlas_base: 7, pal01: 0, pal23: 0, ..Default::default() };
+        let tile = BrickTile { atlas_base: 7, mat_atlas_base: 9, pal01: 0, pal23: 0, ..Default::default() };
         let mut live = LiveChunkTables::default();
         let a = ChunkKey::new(0, IVec3::new(0, 0, 0));
         let b = ChunkKey::new(0, IVec3::new(1, 0, 0));
@@ -1230,7 +1254,7 @@ mod tests {
                 ^ ((k.coord.x as u32) << 16)
                 ^ ((k.coord.y as u32) << 8)
                 ^ (k.coord.z as u32);
-            BrickTile { atlas_base: base, pal01: base ^ 0x1111, pal23: base ^ 0x2222, ..Default::default() }
+            BrickTile { atlas_base: base, mat_atlas_base: base ^ 0x3333, pal01: base ^ 0x1111, pal23: base ^ 0x2222, ..Default::default() }
         };
 
         let mut keys = Vec::new();
@@ -1320,6 +1344,7 @@ mod tests {
                 if (r >> 48) % 5 < 3 {
                     let t = BrickTile {
                         atlas_base: r as u32 ^ frame.wrapping_mul(2_654_435_761),
+                        mat_atlas_base: (r >> 8) as u32 ^ 0x7777,
                         pal01: r as u32 ^ 0xAAAA,
                         pal23: (r >> 16) as u32 ^ 0x5555,
                         ..Default::default()

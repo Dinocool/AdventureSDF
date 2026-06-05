@@ -8,6 +8,9 @@
 # The live BC7 texture cache currently lives in the OS temp dir, not the asset tree.
 **/.soul-import/
 **/.soul-cache/
+# Compiled BC7 texture blobs are a regenerable per-machine cache — never committed, even when
+# they land in the asset tree (next to their PNG sources) rather than the temp dir.
+**/pbr.bc7
 
 # SDF diagnostic log (throwaway dev output)
 sdf_diag.log

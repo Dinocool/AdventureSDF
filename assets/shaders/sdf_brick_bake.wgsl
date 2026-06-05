@@ -49,6 +49,11 @@ struct JobHeader {
 @group(0) @binding(2) var<storage, read_write> dist_out: array<u32>;
 // Material output. One Rgba16Snorm texel = 2 u32 (u32_0 = r|g<<16, u32_1 = b|a<<16).
 @group(0) @binding(3) var<storage, read_write> mat_out: array<u32>;
+// Gradient output (the per-voxel unit SDF gradient = outward normal, for sharp-feature
+// reconstruction + cheap normals). One Rgba8Snorm texel = 1 u32 (nx | ny<<8 | nz<<16; a unused).
+// Always written (the 6 taps are shared with the curvature correction); the bake node copies it
+// into the atlas only when the gradient feature is enabled (else the grad pool is empty).
+@group(0) @binding(4) var<storage, read_write> grad_out: array<u32>;
 
 const EDGE: u32 = 8u;            // voxels per brick edge
 const TILE_W: u32 = 64u;         // tile pixel width  (u = y*EDGE + x, 0..63)
@@ -57,6 +62,8 @@ const DIST_ROW_U32: u32 = 64u;   // padded to 256 bytes (32 real + 32 pad)
 const DIST_TILE_U32: u32 = DIST_ROW_U32 * TILE_H;  // 512
 const MAT_ROW_U32: u32 = TILE_W * 2u;              // 128 (no pad: 512 bytes, already aligned)
 const MAT_TILE_U32: u32 = MAT_ROW_U32 * TILE_H;    // 1024
+const GRAD_ROW_U32: u32 = TILE_W;                  // 64 u32 = 256 bytes (Rgba8Snorm, 1 u32/texel)
+const GRAD_TILE_U32: u32 = GRAD_ROW_U32 * TILE_H;  // 512
 
 const PALETTE_K: u32 = 4u;
 const PALETTE_EMPTY: u32 = 0xffffu;
@@ -265,17 +272,42 @@ fn fold_csg(start: u32, count: u32, pos: vec3<f32>) -> f32 {
 // well-resolved geometry un-shrinks while terrain/sub-voxel detail is untouched (it just stays as
 // it baked, same as before this fix). Bake-time only ⇒ off the per-frame budget; fixes every
 // consumer (primary, shadows, GI, normals) at once.
-fn curvature_correct(start: u32, count: u32, p: vec3<f32>, f: f32, voxel_size: f32) -> f32 {
+// Curvature-corrected distance AND the unit SDF gradient, both from the SAME 6 neighbour taps.
+// The 6 `fold_csg` evals dominate the cost; the Laplacian (their SUM) drives the curvature
+// correction and their pairwise DIFFERENCE is the central-difference gradient (∝ the outward
+// surface normal) — so the gradient is essentially free here. `grad` is unit length (falls back to
+// +Y if degenerate); the consumer reads it for sharp-feature reconstruction + 1-fetch normals.
+struct CorrGrad {
+    dist: f32,
+    grad: vec3<f32>,
+};
+
+fn correct_and_grad(start: u32, count: u32, p: vec3<f32>, f: f32, voxel_size: f32) -> CorrGrad {
     let e = voxel_size;
-    let sx = fold_csg(start, count, p + vec3<f32>(e, 0.0, 0.0)) + fold_csg(start, count, p - vec3<f32>(e, 0.0, 0.0));
-    let sy = fold_csg(start, count, p + vec3<f32>(0.0, e, 0.0)) + fold_csg(start, count, p - vec3<f32>(0.0, e, 0.0));
-    let sz = fold_csg(start, count, p + vec3<f32>(0.0, 0.0, e)) + fold_csg(start, count, p - vec3<f32>(0.0, 0.0, e));
-    let corr = (sx + sy + sz - 6.0 * f) / 8.0;         // = (h²/8)·∇²f  (the stencil's 1/h² cancels)
+    let fxp = fold_csg(start, count, p + vec3<f32>(e, 0.0, 0.0));
+    let fxm = fold_csg(start, count, p - vec3<f32>(e, 0.0, 0.0));
+    let fyp = fold_csg(start, count, p + vec3<f32>(0.0, e, 0.0));
+    let fym = fold_csg(start, count, p - vec3<f32>(0.0, e, 0.0));
+    let fzp = fold_csg(start, count, p + vec3<f32>(0.0, 0.0, e));
+    let fzm = fold_csg(start, count, p - vec3<f32>(0.0, 0.0, e));
+    let corr = (fxp + fxm + fyp + fym + fzp + fzm - 6.0 * f) / 8.0; // = (h²/8)·∇²f (1/h² cancels)
     // 1 while the correction is a trustworthy small fraction of a voxel; →0 once it grows into the
     // unreliable regime (sub-voxel / noise / smin). NOT a clamp — large corrections vanish, not
     // saturate, so they can never shove a surface by ½ a voxel.
     let reliab = 1.0 - smoothstep(0.15, 0.4, abs(corr) / e);
-    return f - corr * reliab;
+    let dist = f - corr * reliab;
+    let g = vec3<f32>(fxp - fxm, fyp - fym, fzp - fzm); // ∝ ∇f (the 2e and sign cancel on normalize)
+    let glen = length(g);
+    let grad = select(vec3<f32>(0.0, 1.0, 0.0), g / glen, glen > 1e-12);
+    return CorrGrad(dist, grad);
+}
+
+// Pack a unit gradient (components in [-1,1]) into one Rgba8Snorm texel: nx | ny<<8 | nz<<16.
+fn pack_grad(g: vec3<f32>) -> u32 {
+    let xi = u32(i32(clamp(g.x, -1.0, 1.0) * 127.0)) & 0xffu;
+    let yi = u32(i32(clamp(g.y, -1.0, 1.0) * 127.0)) & 0xffu;
+    let zi = u32(i32(clamp(g.z, -1.0, 1.0) * 127.0)) & 0xffu;
+    return xi | (yi << 8u) | (zi << 16u);
 }
 
 // --- snorm encode — ports SdfAtlas::dist_to_snorm{,_band} (truncating `as i16`) --------
@@ -334,7 +366,14 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid
 
     let dist_base = job * DIST_TILE_U32;
     let mat_base = job * MAT_TILE_U32;
+    let grad_base = job * GRAD_TILE_U32;
     let origin = vec3<f32>(f32(h.coord.x), f32(h.coord.y), f32(h.coord.z));
+
+    // Single-material brick: palette filled densely from slot 0, so slot 1 empty ⇒ one material.
+    // The reader (sdf::brick::resolve_material) skips the per-slot fetch for these and uses
+    // palette[0] directly, so we skip the per-voxel per-edit material_slots eval here too and
+    // write a deterministic sentinel (slot 0 owns, rest far) — the bake-compute half of the win.
+    let uniform_mat = (h.pal01 >> 16u) == PALETTE_EMPTY;
 
     for (var z = 0u; z < EDGE; z = z + 1u) {
         let pe = (origin + vec3<f32>(f32(x_even), f32(y), f32(z))) * h.voxel_size;
@@ -342,24 +381,43 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid
 
         // Distance: per-LOD band, two adjacent-x texels packed into one u32. Within ~2.5 voxels of
         // the surface (so every corner of a surface-crossing trilinear cell is covered) curvature-
-        // compensate the coarse-LOD trilinear erosion (curvature_correct); elsewhere the value is
-        // saturated/far so the 6 extra evals are skipped. The `if` is real control flow — `select`
-        // would still evaluate the correction (no short-circuit), defeating the gate.
+        // compensate the coarse-LOD trilinear erosion AND capture the unit gradient (same 6 taps,
+        // `correct_and_grad`); elsewhere the value is saturated/far so the 6 evals are skipped and
+        // the gradient stays zero. The `if` is real control flow — `select` would still evaluate the
+        // correction (no short-circuit), defeating the gate.
         let fe = fold_csg(h.edit_start, h.edit_count, pe);
         let fo = fold_csg(h.edit_start, h.edit_count, po);
         let gate = 2.5 * h.voxel_size;
         var ce = fe;
         var co = fo;
-        if (abs(fe) < gate) { ce = curvature_correct(h.edit_start, h.edit_count, pe, fe, h.voxel_size); }
-        if (abs(fo) < gate) { co = curvature_correct(h.edit_start, h.edit_count, po, fo, h.voxel_size); }
+        var ge = vec3<f32>(0.0);
+        var go = vec3<f32>(0.0);
+        if (abs(fe) < gate) {
+            let cg = correct_and_grad(h.edit_start, h.edit_count, pe, fe, h.voxel_size);
+            ce = cg.dist;
+            ge = cg.grad;
+        }
+        if (abs(fo) < gate) {
+            let cg = correct_and_grad(h.edit_start, h.edit_count, po, fo, h.voxel_size);
+            co = cg.dist;
+            go = cg.grad;
+        }
         let de = ce / h.dist_band;
         let do_ = co / h.dist_band;
         let row = z * DIST_ROW_U32 + (y * 4u + p);   // u/2 = (y*8 + 2p)/2 = y*4 + p
         dist_out[dist_base + row] = snorm_bits(de) | (snorm_bits(do_) << 16u);
 
-        // Material: one Rgba16Snorm texel (2 u32) per voxel, fixed ±1.0 band.
-        let se = material_slots(h, pe);
-        let so = material_slots(h, po);
+        // Material: one Rgba16Snorm texel (2 u32) per voxel, fixed ±1.0 band. Uniform bricks
+        // skip the per-edit eval and store the slot-0-owns sentinel (never read — see above).
+        var se: vec4<f32>;
+        var so: vec4<f32>;
+        if (uniform_mat) {
+            se = vec4<f32>(-MATERIAL_FAR, MATERIAL_FAR, MATERIAL_FAR, MATERIAL_FAR);
+            so = se;
+        } else {
+            se = material_slots(h, pe);
+            so = material_slots(h, po);
+        }
         let ue = y * EDGE + x_even;   // tile-local u for even x
         let uo = y * EDGE + x_odd;
         let mi_e = z * MAT_ROW_U32 + ue * 2u;
@@ -368,5 +426,11 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid
         mat_out[mat_base + mi_e + 1u] = snorm_bits(se.z) | (snorm_bits(se.w) << 16u);
         mat_out[mat_base + mi_o]      = snorm_bits(so.x) | (snorm_bits(so.y) << 16u);
         mat_out[mat_base + mi_o + 1u] = snorm_bits(so.z) | (snorm_bits(so.w) << 16u);
+
+        // Gradient: unit SDF normal per voxel (Rgba8Snorm, 1 u32/texel). Zero outside the near-
+        // surface gate (the reader falls back to FD there). The bake node copies it to the atlas
+        // only when the gradient feature is enabled.
+        grad_out[grad_base + z * GRAD_ROW_U32 + ue] = pack_grad(ge);
+        grad_out[grad_base + z * GRAD_ROW_U32 + uo] = pack_grad(go);
     }
 }
