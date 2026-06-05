@@ -764,6 +764,7 @@ fn brick_tile_bytes(tiles: &[adventure::sdf_render::chunk::BrickTile]) -> Vec<u8
     let mut out = Vec::with_capacity(tiles.len() * 16);
     for t in tiles {
         out.extend_from_slice(&t.atlas_base.to_le_bytes());
+        out.extend_from_slice(&t.mat_atlas_base.to_le_bytes());
         out.extend_from_slice(&t.pal01.to_le_bytes());
         out.extend_from_slice(&t.pal23.to_le_bytes());
         out.extend_from_slice(&t.probe_slot.to_le_bytes());
@@ -795,7 +796,7 @@ fn gpu_find_brick_lookup_matches_cpu() {
         let base = ((key.coord.x as u32 & 0xff) << 16)
             | ((key.coord.y as u32 & 0xff) << 8)
             | (key.coord.z as u32 & 0xff);
-        BrickTile { atlas_base: base, pal01: 0, pal23: 0, ..Default::default() }
+        BrickTile { atlas_base: base, mat_atlas_base: base, pal01: 0, pal23: 0, ..Default::default() }
     });
 
     let brick_coords: Vec<IVec3> = atlas.bricks.keys().map(|k| k.coord).collect();

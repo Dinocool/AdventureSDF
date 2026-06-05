@@ -90,6 +90,9 @@ const TILE_W: u32 = 64; // px per tile (8*8)
 const DIST_ROW_U32: u32 = 64; // padded row of distance texels (u32 view)
 const DIST_TILE_U32: u32 = DIST_ROW_U32 * 8;
 const MAT_TILE_U32: u32 = 128 * 8;
+// Gradient output tile (Rgba8Snorm, 1 u32/texel): 64×8 = 512 u32. The bake ALWAYS writes grad_out
+// (binding 4); this harness doesn't use gradient normals (no SDF_GRAD_NORMALS), so it's a write-only sink.
+const GRAD_TILE_U32: u32 = 64 * 8;
 const TEST_TILES_PER_ROW: u32 = 64; // 64*64 = 4096px wide, within the 8192 default limit
 
 fn compose_bake() -> naga::Module {
@@ -296,6 +299,13 @@ impl GpuAtlas {
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
+        // grad_out (binding 4): always written by the bake; not read back here (no gradient normals).
+        let grad_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: None,
+            size: (n * GRAD_TILE_U32 * 4) as u64,
+            usage: wgpu::BufferUsages::STORAGE,
+            mapped_at_creation: false,
+        });
         let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: None,
             layout,
@@ -304,6 +314,7 @@ impl GpuAtlas {
                 wgpu::BindGroupEntry { binding: 1, resource: edit_buf.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 2, resource: dist_buf.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 3, resource: mat_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 4, resource: grad_buf.as_entire_binding() },
             ],
         });
 
@@ -921,6 +932,7 @@ fn bake_scene(device: &wgpu::Device, queue: &wgpu::Queue, scene: &MiniScene) -> 
             storage_entry(1, true),
             storage_entry(2, false),
             storage_entry(3, false),
+            storage_entry(4, false), // grad_out (gradient atlas write target; always written by the bake)
         ],
     });
     let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -1069,9 +1081,11 @@ fn chunk_lookup_bytes(chunks: &[chunk::ChunkLookup]) -> Vec<u8> {
 }
 
 fn brick_tile_bytes(tiles: &[chunk::BrickTile]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(tiles.len() * 16);
+    let mut out = Vec::with_capacity(tiles.len() * 20);
     for t in tiles {
-        for v in [t.atlas_base, t.pal01, t.pal23, t.probe_slot] {
+        // 20-byte std430 layout, MUST match chunk_tables::encode_tile + the WGSL BrickTile:
+        // atlas_base, mat_atlas_base, pal01, pal23, probe_slot.
+        for v in [t.atlas_base, t.mat_atlas_base, t.pal01, t.pal23, t.probe_slot] {
             out.extend_from_slice(&v.to_le_bytes());
         }
     }
@@ -1085,8 +1099,19 @@ fn build_tables(baked: &Baked) -> chunk::ChunkTables {
         let tile = baked.atlas.tiles.tile(key).expect("resident brick has a tile");
         let (col, row) = tile_origin(tile);
         let pal = baked.atlas.bricks[key].palette;
+        // This harness bakes the material atlas (`mat_tex`) at the SAME tile as the distance atlas, so a
+        // MULTI-material brick's material tile origin = its distance tile origin; a single-material brick
+        // uses `MAT_ATLAS_NONE` (the shader reads `palette[0]`). Without this, every brick fell back to
+        // palette[0], so a multi-material brick (e.g. an emitter panel sharing a brick with the wall) lost
+        // its per-voxel colour → grey instead of the bleed colour.
+        let mat_atlas_base = if chunk::palette_is_multi(pal) {
+            col | (row << 16)
+        } else {
+            chunk::MAT_ATLAS_NONE
+        };
         chunk::BrickTile {
             atlas_base: col | (row << 16),
+            mat_atlas_base,
             pal01: pal[0] as u32 | ((pal[1] as u32) << 16),
             pal23: pal[2] as u32 | ((pal[3] as u32) << 16),
             ..Default::default() // probe_slot assigned by refresh_probe_bases inside build_chunk_tables

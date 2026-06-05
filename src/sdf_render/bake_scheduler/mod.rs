@@ -53,6 +53,9 @@ use classify::{Verdict, classify_candidates, snapshot_hash_peek};
 #[derive(Clone)]
 pub struct GpuBakeJob {
     pub tile: u32,
+    /// Material atlas tile for a MULTI-material brick; `None` for a single-material brick (it stores
+    /// no material texels — the bake node skips its material copy and the reader uses `palette[0]`).
+    pub mat_tile: Option<u32>,
     pub lod: u32,
     pub coord: IVec3,
     pub voxel_size: f32,
@@ -637,12 +640,14 @@ pub fn schedule_bakes(
 
 /// Emit one bake job for `key` from already-culled edit indices `indices` and a known `palette`.
 /// No re-cull, no palette rebuild — the caller supplies both. `tile` must be allocated.
+#[allow(clippy::too_many_arguments)]
 fn push_bake_job(
     gpu_bakes: &mut PendingGpuBakes,
     edits_snapshot: &[edits::ResolvedEdit],
     config: &SdfGridConfig,
     key: atlas::BrickKey,
     tile: u32,
+    mat_tile: Option<u32>,
     indices: &[u32],
     palette: edits::Palette,
 ) {
@@ -652,6 +657,7 @@ fn push_bake_job(
     }
     gpu_bakes.jobs.push(GpuBakeJob {
         tile,
+        mat_tile,
         lod: key.lod,
         coord: key.coord,
         voxel_size: config.voxel_size_at(key.lod),
@@ -767,7 +773,10 @@ fn apply_verdicts(
                         continue;
                     }
                     let tile = atlas.insert_gpu_brick(key, palette, hash, config);
-                    push_bake_job(gpu_bakes, edits_snapshot, config, key, tile, &indices, palette);
+                    let mat_tile = atlas.mat_tiles.tile(&key);
+                    push_bake_job(
+                        gpu_bakes, edits_snapshot, config, key, tile, mat_tile, &indices, palette,
+                    );
                     if baked_dbg.enabled {
                         let bw = config.brick_world_size(key.lod);
                         let center = config.brick_min_world(key.coord, key.lod) + Vec3::splat(0.5 * bw);
@@ -818,7 +827,10 @@ fn apply_ready(
     for rc in ready.drain(0..fit) {
         for (key, palette, indices, hash) in &rc.keeps {
             let tile = atlas.insert_gpu_brick(*key, *palette, *hash, config);
-            push_bake_job(gpu_bakes, edits_snapshot, config, *key, tile, indices, *palette);
+            let mat_tile = atlas.mat_tiles.tile(key);
+            push_bake_job(
+                gpu_bakes, edits_snapshot, config, *key, tile, mat_tile, indices, *palette,
+            );
             if baked_dbg.enabled {
                 let bw = config.brick_world_size(key.lod);
                 let center = config.brick_min_world(key.coord, key.lod) + Vec3::splat(0.5 * bw);

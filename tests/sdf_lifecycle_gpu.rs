@@ -35,6 +35,7 @@ const TILE_W: u32 = 64; // px per tile (8*8)
 const DIST_ROW_U32: u32 = 64; // padded
 const DIST_TILE_U32: u32 = DIST_ROW_U32 * 8;
 const MAT_TILE_U32: u32 = 128 * 8;
+const GRAD_TILE_U32: u32 = 64 * 8;
 const TEST_TILES_PER_ROW: u32 = 64; // 64*64=4096px wide, within the 8192 default limit
 
 mod common;
@@ -157,11 +158,13 @@ impl GpuAtlas {
         let n = jobs.len() as u32;
         let dist_buf = device.create_buffer(&wgpu::BufferDescriptor { label: None, size: (n * DIST_TILE_U32 * 4) as u64, usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC, mapped_at_creation: false });
         let mat_buf = device.create_buffer(&wgpu::BufferDescriptor { label: None, size: (n * MAT_TILE_U32 * 4) as u64, usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC, mapped_at_creation: false });
+        let grad_buf = device.create_buffer(&wgpu::BufferDescriptor { label: None, size: (n * GRAD_TILE_U32 * 4) as u64, usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC, mapped_at_creation: false });
         let bg = device.create_bind_group(&wgpu::BindGroupDescriptor { label: None, layout, entries: &[
             wgpu::BindGroupEntry { binding: 0, resource: header_buf.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 1, resource: edit_buf.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 2, resource: dist_buf.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 3, resource: mat_buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 4, resource: grad_buf.as_entire_binding() },
         ]});
 
         let tex = self.tex.as_ref().unwrap();
@@ -332,7 +335,7 @@ fn lifecycle_large_sphere_lod_transition_no_hole() {
     // Bake pipeline.
     let module = compose_bake();
     let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: None, source: wgpu::ShaderSource::Naga(Cow::Owned(module)) });
-    let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: None, entries: &[storage_entry(0, true), storage_entry(1, true), storage_entry(2, false), storage_entry(3, false)] });
+    let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: None, entries: &[storage_entry(0, true), storage_entry(1, true), storage_entry(2, false), storage_entry(3, false), storage_entry(4, false)] });
     let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: None, bind_group_layouts: &[&layout], push_constant_ranges: &[] });
     let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor { label: None, layout: Some(&pl), module: &shader, entry_point: Some("main"), compilation_options: Default::default(), cache: None });
 
@@ -367,7 +370,7 @@ fn lifecycle_large_sphere_lod_transition_no_hole() {
         let tables = build_chunk_tables(&atlas, &cfg, |key| {
             let tile = atlas.tiles.tile(key).expect("resident brick has a tile");
             let (col, row) = tile_origin(tile);
-            chunk::BrickTile { atlas_base: col | (row << 16), pal01: 0, pal23: 0, ..Default::default() }
+            chunk::BrickTile { atlas_base: col | (row << 16), mat_atlas_base: col | (row << 16), pal01: 0, pal23: 0, ..Default::default() }
         });
         // Sample a handful of resident tiles (checking all every step is slow); include the
         // ones nearest the surface at the probe by scanning the served-LOD brick.

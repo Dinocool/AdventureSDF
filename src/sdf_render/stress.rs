@@ -109,6 +109,15 @@ pub fn expand_tower_spawners(
 ) {
     for (entity, spawner) in &spawners {
         let edits = tower_field_edits(&spawner.field_params());
+        // Mark expanded + give the spawner its visibility chain BEFORE spawning children. The
+        // `PointLight` children carry `InheritedVisibility` (a required component); the `ChildOf`
+        // hook emits B0004 DURING command application if the parent lacks `InheritedVisibility` at
+        // that moment — so the fix must be queued ahead of the child spawns, not after them.
+        // Inserting `Visibility` pulls in `InheritedVisibility`/`ViewVisibility` (required
+        // components), making the spawner a valid visibility root for its light children.
+        commands
+            .entity(entity)
+            .insert((TowerSpawnerExpanded, Visibility::default()));
         // One point light per tower (at its cap), to stress the point-light path + the world-space
         // light grid at scale (~3000 lights). Per-tower hue makes the per-tower pools visually
         // distinct so the culling is easy to verify. NonSerializable, like the towers.
@@ -171,13 +180,6 @@ pub fn expand_tower_spawners(
                 ));
             }
         }
-        // The spawned `PointLight` children carry `InheritedVisibility` (a `PointLight` required
-        // component); Bevy's visibility propagation warns (B0004) if their parent lacks the
-        // visibility chain. Give the spawner a default `Visibility` so the parent is a valid
-        // visibility root for its light children.
-        commands
-            .entity(entity)
-            .insert((TowerSpawnerExpanded, Visibility::default()));
     }
 }
 
