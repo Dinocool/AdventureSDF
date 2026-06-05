@@ -1507,6 +1507,8 @@ fn trace_scene(
     params.extend_from_slice(&1.0f32.to_le_bytes()); // bounce_shadows
     params.extend_from_slice(&32u32.to_le_bytes()); // dormant_stride
     params.extend_from_slice(&0u32.to_le_bytes()); // classify = 0 (gates don't exercise dormancy)
+    params.extend_from_slice(&99u32.to_le_bytes()); // ray_falloff_lod = 99 (disabled → full rays at all LODs)
+    params.extend_from_slice(&32u32.to_le_bytes()); // distant_ray_count (unused when falloff disabled)
     params.resize(64, 0);
     let params_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("params"),
@@ -1836,7 +1838,7 @@ fn ddgi_buffer_bound_gate() {
             }
         }
     }
-    live.refresh_probe_bases();
+    live.refresh_probe_bases(u32::MAX);
 
     let rows = live.resident_rows();
     let chunks = rows.len();

@@ -94,6 +94,12 @@ pub(super) struct LastAtlasGen(u64);
 
 pub(super) fn extract_sdf_atlas(
     atlas: Extract<Res<SdfAtlas>>,
+    // Scene-switch counter (`SdfAtlas::reset` bumped it). When it changes, the previous scene's GPU
+    // chunk directory must be FULLY rebuilt — a delta would leave the old scene's rows in `chunk_buf`
+    // (`find_chunk` still hits them → ghost geometry). Reset the capacity memo so the next upload is a
+    // Full rebuild, not a delta against the stale buffer. Read from the MAIN world (no extract-order race).
+    reset_res: Extract<Res<crate::sdf_render::ProbeReset>>,
+    mut last_reset: Local<u32>,
     mut last_gen: ResMut<LastAtlasGen>,
     mut chunk_cap: ResMut<super::chunk_tables::ChunkBufCapacity>,
     mut commands: Commands,
@@ -106,6 +112,15 @@ pub(super) fn extract_sdf_atlas(
         return;
     }
     last_gen.0 = atlas.generation;
+
+    // On a scene switch, force the next upload to be a FULL rebuild (capacity memo → 0). Otherwise the
+    // new scene baked over the same frame does a delta, leaving the old scene's chunk rows live on the GPU.
+    if reset_res.0 != *last_reset {
+        *last_reset = reset_res.0;
+        chunk_cap.chunk_rows = 0;
+        chunk_cap.tile_slots = 0;
+        chunk_cap.probe_slots = 0;
+    }
 
     let live = &atlas.live_chunks;
     // DDGI probe buffer is sized by the FINEST-RESIDENT probe high-water (`finest_chunks · CHUNK_VOLUME`)

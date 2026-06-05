@@ -218,7 +218,7 @@ pub fn build_chunk_tables(
     }
     // Assign finest-resident probe slots (the render world does this via `refresh_probe_lod` before
     // extract; the full-rebuild path must do it too so the directory rows carry `probe_base`).
-    live.refresh_probe_bases();
+    live.refresh_probe_bases(u32::MAX);
     let (chunks, tile_run) = live.full_tables();
     ChunkTables {
         chunks,
@@ -598,11 +598,15 @@ impl LiveChunkTables {
     /// `set_brick`/`clear_brick` for the frame, whenever the chunk set changed (`topology_generation`);
     /// writes the directory row (→ `chunk_buf`, read by apply + bounce) and the entry's tiles
     /// (→ `resident_rows` / tile-run, read by the trace), marking changed rows/slots dirty for the delta.
-    pub fn refresh_probe_bases(&mut self) {
+    pub fn refresh_probe_bases(&mut self, halve_lod: u32) {
         let keys: Vec<ChunkKey> = self.chunks.keys().copied().collect();
         for ck in keys {
             let finest = self.is_finest(ck);
             let flag = if finest { 0u32 } else { u32::MAX };
+            // DENSITY HALVING: at/above `halve_lod` the distant probes are decimated to a checkerboard of
+            // bricks (~half), cutting probe count + ray work where the GI is low-frequency. The apply's
+            // coverage-weighted trilinear fills the gaps. Below `halve_lod`, every occupied brick keeps one.
+            let decimate = finest && ck.lod >= halve_lod;
             let idx = dir_index(ck, self.r);
             if self.dir[idx].probe_base != flag {
                 self.dir[idx].probe_base = flag;
@@ -616,7 +620,15 @@ impl LiveChunkTables {
             while bits != 0 {
                 let local = bits.trailing_zeros();
                 bits &= bits - 1; // clear lowest set bit
-                let want = if finest {
+                // Checkerboard on the brick's lattice coord (stable across frames → no probe churn).
+                let keep = !decimate || {
+                    let lx = (local % CHUNK_BRICKS as u32) as i32;
+                    let ly = (local / CHUNK_BRICKS as u32 % CHUNK_BRICKS as u32) as i32;
+                    let lz = (local / (CHUNK_BRICKS * CHUNK_BRICKS) as u32) as i32;
+                    let b = ck.coord * CHUNK_BRICKS + IVec3::new(lx, ly, lz);
+                    (b.x + b.y + b.z) & 1 == 0
+                };
+                let want = if finest && keep {
                     self.probe_alloc.alloc((ck, local))
                 } else {
                     self.probe_alloc.release(&(ck, local));
@@ -1158,7 +1170,7 @@ mod tests {
                 }
             }
         }
-        live.refresh_probe_bases();
+        live.refresh_probe_bases(u32::MAX);
         let probe_base = |live: &LiveChunkTables, ck: ChunkKey| live.lookup_at(dir_index(ck, r) as u32).probe_base;
 
         // LOD-1 is fully covered by its 8 finer children → owns no probes.
@@ -1170,7 +1182,7 @@ mod tests {
 
         // Evict one finer child → the LOD-1 chunk is no longer fully covered → it regains probes.
         live.clear_brick(children[0], 0);
-        live.refresh_probe_bases();
+        live.refresh_probe_bases(u32::MAX);
         assert_ne!(
             probe_base(&live, c1),
             u32::MAX,
@@ -1205,7 +1217,7 @@ mod tests {
                 }
             }
         }
-        live.refresh_probe_bases();
+        live.refresh_probe_bases(u32::MAX);
         let total = live.chunks.len();
         assert!(total > 4000, "expected a large nested scene (got {total})");
 
@@ -1218,7 +1230,7 @@ mod tests {
             }
         }
         let t = std::time::Instant::now();
-        live.refresh_probe_bases();
+        live.refresh_probe_bases(u32::MAX);
         let elapsed = t.elapsed();
         let delta = live.dirty_rows.len();
         eprintln!(

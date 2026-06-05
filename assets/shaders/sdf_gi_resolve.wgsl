@@ -28,6 +28,8 @@ struct ProbeParams {
     bounce_shadows: f32, // unused here; kept so the layout matches the shared ProbeParams buffer
     dormant_stride: u32, // unused here; layout match
     classify: u32,       // unused here; layout match
+    ray_falloff_lod: u32, // unused here; layout match
+    distant_ray_count: u32, // unused here; layout match
 };
 
 @group(2) @binding(0) var gbuf_albedo: texture_2d<f32>;     // a = camera distance
