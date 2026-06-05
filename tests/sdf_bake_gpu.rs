@@ -40,9 +40,9 @@ fn compose_bake() -> naga::Module {
 
 const DIST_ROW_U32: u32 = 64;
 const DIST_TILE_U32: u32 = DIST_ROW_U32 * 8;
-// Material tile: Rgba8Snorm, 1 u32/texel, 64 u32/row (= 256 bytes) × 8 rows. Mirrors the bake
+// Material tile: Rgba16Snorm, 2 u32/texel, 128 u32/row (= 512 bytes) × 8 rows. Mirrors the bake
 // shader's `MAT_TILE_U32` and `render::bake::BAKE_MAT_TILE_U32`.
-const MAT_ROW_U32: u32 = 64;
+const MAT_ROW_U32: u32 = 128;
 const MAT_TILE_U32: u32 = MAT_ROW_U32 * 8;
 
 // Mirror of bake_scheduler::GpuJobHeader upload order (48 bytes, 12 u32).
@@ -495,15 +495,17 @@ fn header_bytes_pal(
     b
 }
 
-/// Bake a TWO-material brick, copy the material buffer into an `Rgba8Snorm` atlas texture exactly
+/// Bake a TWO-material brick, copy the material buffer into an `Rgba16Snorm` atlas texture exactly
 /// as the live bake node does, read the texture back, and assert the per-voxel argmin material id
-/// matches the analytic nearest of the two spheres. Proves the Phase-2b 8-bit material pack
-/// (`snorm8_bits`/`pack_mat_rgba8`), the `Rgba8Snorm` 256-byte-row copy, and the per-palette-slot
-/// material path end-to-end. (The single-material sphere tests cover only the distance atlas.)
+/// matches the analytic nearest of the two spheres. Proves the material snorm pack, the
+/// `Rgba16Snorm` 256-byte-aligned-row copy, and the per-palette-slot material path end-to-end.
+/// (The single-material sphere tests cover only the distance atlas.)
 #[test]
-fn gpu_bake_material_atlas_rgba8_roundtrips() {
-    let Some((device, queue)) = device_queue() else {
-        eprintln!("no GPU adapter — skipping");
+fn gpu_bake_material_atlas_roundtrips() {
+    // Rgba16Snorm (the material atlas format) needs TEXTURE_FORMAT_16BIT_NORM; skip if absent.
+    let Some((device, queue)) = common::headless_device(wgpu::Features::TEXTURE_FORMAT_16BIT_NORM)
+    else {
+        eprintln!("adapter lacks TEXTURE_FORMAT_16BIT_NORM — skipping material roundtrip");
         return;
     };
     use wgpu::util::DeviceExt;
@@ -596,12 +598,12 @@ fn gpu_bake_material_atlas_rgba8_roundtrips() {
     let edge = BRICK_EDGE as u32; // 8
     let tile_w = edge * edge; // 64
     let mat_tex = device.create_texture(&wgpu::TextureDescriptor {
-        label: Some("atlas_rgba8snorm"),
+        label: Some("atlas_rgba16snorm"),
         size: wgpu::Extent3d { width: tile_w, height: edge, depth_or_array_layers: 1 },
         mip_level_count: 1,
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
-        format: wgpu::TextureFormat::Rgba8Snorm,
+        format: wgpu::TextureFormat::Rgba16Snorm,
         usage: wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::COPY_SRC,
         view_formats: &[],
     });
@@ -613,7 +615,7 @@ fn gpu_bake_material_atlas_rgba8_roundtrips() {
         pass.set_bind_group(0, &bg, &[]);
         pass.dispatch_workgroups(1, 1, 1);
     }
-    let row_bytes = MAT_ROW_U32 * 4; // 64 texels × 4 B = 256 (aligned)
+    let row_bytes = MAT_ROW_U32 * 4; // 64 texels × 8 B = 512 (aligned)
     enc.copy_buffer_to_texture(
         wgpu::TexelCopyBufferInfo {
             buffer: &mat_buf,
@@ -663,16 +665,16 @@ fn gpu_bake_material_atlas_rgba8_roundtrips() {
 
     let mut checked = 0u32;
     for z in 0..edge {
-        let row = &data[(z * row_bytes) as usize..((z * row_bytes) + tile_w * 4) as usize];
-        let texels: &[i8] = bytemuck::cast_slice(row);
+        let row = &data[(z * row_bytes) as usize..((z * row_bytes) + tile_w * 8) as usize];
+        let texels: &[i16] = bytemuck::cast_slice(row);
         for y in 0..edge {
             for x in 0..edge {
                 let u = (y * edge + x) as usize; // 0..63
                 let s = [
-                    texels[u * 4] as f32 / 127.0,
-                    texels[u * 4 + 1] as f32 / 127.0,
-                    texels[u * 4 + 2] as f32 / 127.0,
-                    texels[u * 4 + 3] as f32 / 127.0,
+                    texels[u * 4] as f32 / 32767.0,
+                    texels[u * 4 + 1] as f32 / 32767.0,
+                    texels[u * 4 + 2] as f32 / 32767.0,
+                    texels[u * 4 + 3] as f32 / 32767.0,
                 ];
                 let world = Vec3::new(
                     (coord.x + x as i32) as f32,
@@ -682,8 +684,8 @@ fn gpu_bake_material_atlas_rgba8_roundtrips() {
                 let da = (world - ca).length() - ra;
                 let db = (world - cb).length() - rb;
                 // Only assert where the nearest is inside the ±1 material band and the two are
-                // clearly separated (> ~2 snorm8 LSBs), avoiding boundary ties / clamped slots.
-                if da.min(db).abs() >= 0.9 || (da - db).abs() <= 3.0 / 127.0 {
+                // clearly separated (> a few snorm16 LSBs), avoiding boundary ties / clamped slots.
+                if da.min(db).abs() >= 0.9 || (da - db).abs() <= 4.0 / 32767.0 {
                     continue;
                 }
                 let mut best = 0usize;
@@ -703,7 +705,7 @@ fn gpu_bake_material_atlas_rgba8_roundtrips() {
         }
     }
     assert!(checked > 32, "too few clearly-separated voxels checked ({checked}) — geometry degenerate");
-    eprintln!("GPU material Rgba8Snorm roundtrip OK: {checked} voxels");
+    eprintln!("GPU material Rgba16Snorm roundtrip OK: {checked} voxels");
 }
 
 fn storage_entry(binding: u32, read_only: bool) -> wgpu::BindGroupLayoutEntry {

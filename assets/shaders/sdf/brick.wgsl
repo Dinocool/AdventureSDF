@@ -166,7 +166,7 @@ fn load_voxel(base_u: u32, lx: i32, ly: i32, lz: i32) -> f32 {
 
 // --- Per-palette-slot material distance sampling ---
 //
-// Each voxel stores K=4 signed distances in one Rgba8Snorm atlas — one per entry
+// Each voxel stores K=4 signed distances in one Rgba16Snorm atlas — one per entry
 // of the brick's material palette (NOT per global material). We trilinearly
 // interpolate the 4 at the hit point; the nearest (argmin) palette slot owns the
 // surface, mapped to a global id via the brick palette. The boundary between the
@@ -198,7 +198,7 @@ fn sample_mat_tex(base_u: u32, i0: vec3<i32>, f: vec3<f32>) -> vec4<f32> {
     return mix(y0, y1, f.z);
 }
 
-// The 4 interpolated palette-slot distances at `world_pos` (one Rgba8Snorm fetch
+// The 4 interpolated palette-slot distances at `world_pos` (one Rgba16Snorm fetch
 // set), sampling the brick at LOD `lod`. `.x..w` correspond to palette slots 0..3.
 fn load_material_distances(base_u: u32, world_pos: vec3<f32>, lod: u32) -> vec4<f32> {
     let voxel_size = voxel_size_at(lod);

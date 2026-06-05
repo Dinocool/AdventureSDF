@@ -278,11 +278,11 @@ fn register_shader_modes(app: &mut App) {
 
 // Per-voxel GPU byte widths of each brick atlas channel — the SSOT for the memory panel.
 // MUST mirror the texture formats created in `render::atlas_pages`. Distance is the single
-// R16Snorm atlas (2B); material is the single Rgba8Snorm atlas (4B = 4 palette-slot distances).
+// R16Snorm atlas (2B); material is the single Rgba16Snorm atlas (8B = 4 palette-slot distances).
 // There is no second material texture — the earlier `mat_lo`+`mat_hi` split double-counted a
 // `mat_hi` that never existed. `GRAD_BYTES_PER_VOXEL` is 0 until the Phase-3 gradient atlas lands.
 const DIST_BYTES_PER_VOXEL: u64 = 2;
-const MAT_BYTES_PER_VOXEL: u64 = 4;
+const MAT_BYTES_PER_VOXEL: u64 = 8;
 const GRAD_BYTES_PER_VOXEL: u64 = 0;
 const LOOKUP_BYTES_PER_BRICK: u64 = 16;
 
@@ -1040,9 +1040,8 @@ mod tests {
     use super::*;
 
     /// The memory panel's per-channel breakdown must sum to the reported total, and the material
-    /// term must equal ONE Rgba8Snorm atlas (4 B/voxel) — NOT the old `mat_lo`+`mat_hi` double
-    /// count (16 B/voxel), nor the pre-Phase-2b 16-bit width (8 B/voxel). Locks the accounting
-    /// against the real single-`mat_pages` layout.
+    /// term must equal ONE Rgba16Snorm atlas (8 B/voxel) — NOT the old `mat_lo`+`mat_hi` double
+    /// count (16 B/voxel). Locks the accounting against the real single-`mat_pages` layout.
     #[test]
     fn atlas_byte_breakdown_is_consistent_and_single_material() {
         for bricks in [0u64, 1, 7, 1000] {
@@ -1051,7 +1050,7 @@ mod tests {
 
             let voxels = bricks * BRICK_VOXELS as u64;
             assert_eq!(dist, voxels * 2, "distance is one R16Snorm atlas");
-            assert_eq!(mat, voxels * 4, "material is ONE Rgba8Snorm atlas (no phantom mat_hi)");
+            assert_eq!(mat, voxels * 8, "material is ONE Rgba16Snorm atlas (no phantom mat_hi)");
             assert_eq!(grad, 0, "no gradient atlas before Phase 3");
             assert_eq!(lookup, bricks * 16);
         }

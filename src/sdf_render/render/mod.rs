@@ -134,7 +134,7 @@ const EMISSIVE_NITS_SCALE: f32 = 4000.0;
 
 #[derive(Resource, Default)]
 struct SdfGpuAtlas {
-    /// Paged distance + material atlases (R16Snorm + Rgba8Snorm), grown one fixed-size page at a
+    /// Paged distance + material atlases (R16Snorm + Rgba16Snorm), grown one fixed-size page at a
     /// time with NO copy (see [`AtlasPages`]). `None` until `init_sdf_pipeline` creates the pool.
     /// The bake writes tiles straight into the live pages; the fragment shader reads them as a
     /// `binding_array`. Replaces the old single-texture atlas whose taller-realloc + full-copy
@@ -1263,7 +1263,7 @@ fn init_sdf_pipeline(
                 sampler(SamplerBindingType::Filtering),
                 // binding 2: chunk lookup table (sorted, binary-searched)
                 storage_buffer_read_only::<atlas_upload::GpuChunkLookup>(false),
-                // binding 3: per-palette-slot distance atlas — PAGED `binding_array` (Rgba8Snorm pages)
+                // binding 3: per-palette-slot distance atlas — PAGED `binding_array` (Rgba16Snorm pages)
                 texture_2d(TextureSampleType::Float { filterable: false })
                     .count(core::num::NonZero::new(atlas_pages::ATLAS_MAX_PAGES).unwrap()),
                 // binding 4: material table (indexed by global material id)

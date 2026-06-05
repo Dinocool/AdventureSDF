@@ -55,7 +55,7 @@ pub struct AtlasPages {
 impl AtlasPages {
     pub fn new(device: &RenderDevice) -> Self {
         let dummy_dist = make_dummy(device, TextureFormat::R16Snorm, "sdf_atlas_page_dummy_dist");
-        let dummy_mat = make_dummy(device, TextureFormat::Rgba8Snorm, "sdf_atlas_page_dummy_mat");
+        let dummy_mat = make_dummy(device, TextureFormat::Rgba16Snorm, "sdf_atlas_page_dummy_mat");
         Self {
             dist: Vec::new(),
             dist_views: Vec::new(),
@@ -84,7 +84,7 @@ impl AtlasPages {
         while (self.dist.len() as u32) < pages_needed {
             let idx = self.dist.len();
             let dist = make_page(device, TextureFormat::R16Snorm, idx, "dist");
-            let mat = make_page(device, TextureFormat::Rgba8Snorm, idx, "mat");
+            let mat = make_page(device, TextureFormat::Rgba16Snorm, idx, "mat");
             self.dist_views.push(dist.create_view(&TextureViewDescriptor::default()));
             self.mat_views.push(mat.create_view(&TextureViewDescriptor::default()));
             self.dist.push(dist);
