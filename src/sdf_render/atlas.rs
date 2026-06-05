@@ -171,6 +171,24 @@ impl Default for SdfAtlas {
     }
 }
 
+impl SdfAtlas {
+    /// Evict ALL baked data — bricks, tiles, and the chunk/tile-run tables (and thus the DDGI probe
+    /// slots those tables carry) — and force a full rebake + GPU rebuild. Used on a scene switch so the
+    /// incoming scene starts from a clean field instead of inheriting the previous scene's bricks. Pair
+    /// with [`super::bake_scheduler::BakeScheduler::reset`] so the scheduler re-bakes the window from
+    /// scratch (otherwise it thinks the window is already resident and never re-enters it). The
+    /// generations are BUMPED (not zeroed) so the render world's gen-memo sees the change and rebuilds.
+    pub fn reset(&mut self) {
+        self.bricks.clear();
+        self.tiles = TileAllocator::default();
+        self.live_chunks = super::chunk::LiveChunkTables::default();
+        self.gpu_baked_tiles.clear();
+        self.rebake_all = true;
+        self.generation = self.generation.wrapping_add(1);
+        self.topology_generation = self.topology_generation.wrapping_add(1);
+    }
+}
+
 /// Max stored signed distance (world units). `dist_to_snorm` clamps to ±this, so an
 /// edit can be the nearest surface — and thus must be folded into a brick — for any
 /// voxel within this distance of its tight AABB. The dirty/bake footprint

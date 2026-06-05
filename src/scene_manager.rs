@@ -37,12 +37,21 @@ struct AdventureGameButton;
 #[derive(Component)]
 struct WireframeTestButton;
 
+/// The single, central scene-switch signal. Fired whenever the live scene content is REPLACED — both
+/// the in-game [`AppScene`] transitions (this module) and the editor's scene-tab swap
+/// (`editor::scene_tabs`). Subsystems that cache per-scene GPU/CPU state subscribe to this to evict it
+/// and start the new scene clean (e.g. the SDF DDGI probe irradiance — see `sdf_render`). Centralizing
+/// it here means any swap path, editor or in-game, triggers the same cleanup.
+#[derive(Message, Default)]
+pub struct SceneSwitched;
+
 pub struct SceneManagerPlugin;
 
 impl Plugin for SceneManagerPlugin {
     fn build(&self, app: &mut App) {
         app.init_state::<AppScene>()
             .init_resource::<MenuOpen>()
+            .add_message::<SceneSwitched>()
             .register_type::<SceneEntity>()
             .register_type::<EditorEntity>()
             .add_systems(Update, toggle_menu)
@@ -280,8 +289,14 @@ fn close_menu(
     }
 }
 
-fn cleanup_scene_entities(mut commands: Commands, entities: Query<Entity, With<SceneEntity>>) {
+fn cleanup_scene_entities(
+    mut commands: Commands,
+    entities: Query<Entity, With<SceneEntity>>,
+    mut switched: MessageWriter<SceneSwitched>,
+) {
     for entity in &entities {
         commands.entity(entity).despawn();
     }
+    // In-game scene transition is a scene switch → let subsystems evict per-scene caches.
+    switched.write(SceneSwitched);
 }

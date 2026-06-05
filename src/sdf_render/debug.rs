@@ -37,10 +37,12 @@ pub struct SdfAtlasStats {
     pub blend_bytes: u64,
     pub lookup_bytes: u64,
     pub total_bytes: u64,
-    // DDGI probes: one block of `subdiv³` octahedral probes per resident brick (across ALL LODs —
-    // currently includes the redundant coarse-LOD overlap). `probe_bytes` is the irradiance buffer.
+    // DDGI probes: one block of `subdiv³` octahedral probes per FINEST-resident brick (the compact
+    // clipmap-bounded set). `probe_bytes` is the irradiance buffer; `probe_redundancy` = all-LOD bricks /
+    // finest probes (how much the finest-resident collapse saves vs the old all-LOD sizing).
     pub probe_count: u32,
     pub probe_bytes: u64,
+    pub probe_redundancy: f32,
 }
 
 /// Controls the BVH wireframe overlay (drawn via [`draw_bvh`]).
@@ -219,6 +221,18 @@ fn register_shader_modes(app: &mut App) {
         "SDF_DEBUG_GI",
         "DDGI indirect irradiance term only (albedo × probe GI × intensity), no direct/emissive",
     ));
+    registry.register(overlay(
+        "sdf/probe_lod",
+        "Probe LOD",
+        "SDF_DEBUG_PROBE_LOD",
+        "Finest-resident DDGI probe LOD as a hue ramp (LOD0 red → coarse blue) — the clipmap annuli of the probe allocation; black = no probe (coverage hole)",
+    ));
+    registry.register(overlay(
+        "sdf/probe_coverage",
+        "Probe coverage",
+        "SDF_DEBUG_PROBE_COVERAGE",
+        "DDGI probe coverage: green = a finest-resident probe covers the pixel, magenta = uncovered (GI hole)",
+    ));
 
     // Independent toggle (not part of the overlay group): bypass the per-ray chunk
     // lookup cache, forcing a fresh binary search every probe. If enabling this fixes a
@@ -304,12 +318,16 @@ fn update_atlas_stats(
         stats.dist_bytes + stats.object_bytes + stats.blend_bytes + stats.lookup_bytes;
 
     stats.total_bricks = total as u32;
-    // DDGI: subdiv³ octahedral probes per resident brick; the irradiance buffer is
-    // PROBE_OCT_TEXELS vec4<f32> (16 B) per probe.
+    // DDGI: subdiv³ octahedral probes per FINEST-resident brick (the compact, clipmap-bounded set);
+    // the irradiance buffer is PROBE_OCT_TEXELS vec4<f32> (16 B) per probe. Sized by the per-brick
+    // finest high-water — NOT all resident bricks (which the old scheme paid for at every LOD).
     let subdiv = ddgi.subdiv.clamp(1, 4) as u64;
-    let probes = total * subdiv * subdiv * subdiv;
+    let finest = atlas.live_chunks.probe_high_water() as u64;
+    let probes = finest * subdiv * subdiv * subdiv;
     stats.probe_count = probes as u32;
     stats.probe_bytes = probes * super::probe::PROBE_OCT_TEXELS as u64 * 16;
+    // Redundancy eliminated: all-LOD resident bricks vs the finest-resident probe set.
+    stats.probe_redundancy = total as f32 / finest.max(1) as f32;
     // 2D-tiled dims (matches the render atlas + preview): tiles wrap at 256/row.
     let tiles_per_row: u32 = 256;
     let num_rows = (total as u32).div_ceil(tiles_per_row).max(1);
@@ -560,9 +578,19 @@ fn render_panel(world: &mut World, ui: &mut egui::Ui) {
     );
 
     ui.separator();
-    ui.label("DDGI (Global Illumination)");
+    ui.label("DDGI (Global Illumination — always on)");
+    // Live probe stats (finest-resident, clipmap-bounded): probe count, irradiance-buffer size, and the
+    // redundancy the finest collapse eliminated vs the old all-LOD sizing.
+    {
+        let stats = world.resource::<SdfAtlasStats>();
+        ui.label(format!(
+            "Probes: {} finest · {:.1} MiB · {:.1}× redundancy removed",
+            stats.probe_count,
+            stats.probe_bytes as f64 / (1u64 << 20) as f64,
+            stats.probe_redundancy,
+        ));
+    }
     let mut ddgi = world.resource_mut::<DdgiParams>();
-    ui.checkbox(&mut ddgi.enabled, "Enable GI");
     ui.add(
         egui::Slider::new(&mut ddgi.subdiv, 1..=4)
             .text("Probe subdiv (LOD0 density)")
@@ -572,6 +600,11 @@ fn render_panel(world: &mut World, ui: &mut egui::Ui) {
     ui.add(
         egui::Slider::new(&mut ddgi.update_stride, 1..=16)
             .text("Update stride (1/N probes per frame)"),
+    );
+    ui.checkbox(&mut ddgi.classify_enabled, "Classify (settled probes go dormant)");
+    ui.add_enabled(
+        ddgi.classify_enabled,
+        egui::Slider::new(&mut ddgi.dormant_stride, 4..=128).text("Dormant stride (converged re-trace)"),
     );
     ui.add(
         egui::Slider::new(&mut ddgi.gi_range, 4.0..=200.0)
@@ -596,6 +629,15 @@ fn render_panel(world: &mut World, ui: &mut egui::Ui) {
         egui::Slider::new(&mut ddgi.gi_blur_normal_power, 1.0..=64.0)
             .text("GI blur normal stop"),
     );
+    // Probe buffer ceiling (MiB). The probe count is clamped to this (capped further by the device
+    // binding limit); over-budget probes go inactive. Sized in whole MiB for a readable slider.
+    let mut budget_mib = ddgi.probe_budget_bytes / (1 << 20);
+    if ui
+        .add(egui::Slider::new(&mut budget_mib, 64..=2048).text("Probe budget (MiB)"))
+        .changed()
+    {
+        ddgi.probe_budget_bytes = budget_mib.max(1) * (1 << 20);
+    }
 }
 
 fn ray_inspector_panel(world: &mut World, ui: &mut egui::Ui) {

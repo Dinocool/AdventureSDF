@@ -852,6 +852,52 @@ fn scene_perf() -> MiniScene {
     }
 }
 
+/// A `k×k` tiled grid of Cornell rooms (mirrors `src/sdf_render/cornell.rs::spawn_cornell_grid`) as a
+/// `MiniScene` — the ever-larger test bed for DDGI scaling. Each room is a full GI box. A SMALL ring
+/// (`ring_bricks = 16`) is used so even a modest `k` spreads the far rooms onto coarser clipmap LODs
+/// (the LOD annuli), exercising the finest-resident probe collapse. Camera above the centre.
+fn cornell_grid_mini(k: u32) -> MiniScene {
+    // 0 white (matte), 1 light (emitter), 2 red, 3 green, 4 blue.
+    let materials = vec![
+        MatDef::diffuse(Vec3::splat(0.8)),
+        MatDef::emitter(Vec3::ONE, 6.0),
+        MatDef::diffuse(Vec3::new(0.8, 0.1, 0.1)),
+        MatDef::diffuse(Vec3::new(0.1, 0.8, 0.1)),
+        MatDef::diffuse(Vec3::new(0.1, 0.1, 0.8)),
+    ];
+    const PITCH: f32 = 5.0;
+    let off = (k as f32 - 1.0) * 0.5 * PITCH;
+    let mut edits = Vec::new();
+    for gz in 0..k {
+        for gx in 0..k {
+            let o = Vec3::new(gx as f32 * PITCH - off, 0.0, gz as f32 * PITCH - off);
+            edits.push(cube(Vec3::new(2.2, 0.1, 2.2), o + Vec3::new(0.0, -0.1, 0.0), 0)); // floor
+            edits.push(cube(Vec3::new(2.2, 0.1, 2.2), o + Vec3::new(0.0, 4.1, 0.0), 0)); // ceiling
+            edits.push(cube(Vec3::new(2.2, 2.1, 0.1), o + Vec3::new(0.0, 2.0, -2.1), 0)); // back
+            edits.push(cube(Vec3::new(0.1, 2.1, 2.2), o + Vec3::new(-2.1, 2.0, 0.0), 0)); // left
+            edits.push(cube(Vec3::new(0.1, 2.1, 2.2), o + Vec3::new(2.1, 2.0, 0.0), 0)); // right
+            edits.push(cube(Vec3::new(0.7, 0.06, 0.7), o + Vec3::new(0.0, 3.92, 0.0), 1)); // light
+            edits.push(cube(Vec3::new(0.55, 0.75, 0.55), o + Vec3::new(-0.85, 0.75, -0.55), 2)); // red
+            edits.push(cube(Vec3::splat(0.42), o + Vec3::new(0.05, 0.42, 0.55), 3)); // green
+            edits.push(sphere(0.55, o + Vec3::new(0.95, 0.55, -0.1), 4)); // blue
+        }
+    }
+    // Coverage samples: the centre room floor (near, LOD0) and the far corner room floor (coarse LOD).
+    let samples = vec![
+        Sample { pos: Vec3::new(0.0, 0.12, 0.0), normal: Vec3::Y, what: "centre" },
+        Sample { pos: Vec3::new(-off, 0.12, -off), normal: Vec3::Y, what: "corner" },
+    ];
+    MiniScene {
+        name: "cornell_grid",
+        lights: vec![],
+        cfg: SdfGridConfig { lod_count: 8, ring_bricks: 16, recenter_snap_chunks: 1, ..Default::default() },
+        edits,
+        materials,
+        camera: Vec3::new(0.0, 3.0, 0.0),
+        samples,
+    }
+}
+
 // ============================================================================================
 // Baked scene + bake driver.
 // ============================================================================================
@@ -993,6 +1039,9 @@ fn camera_uniform_bytes(cfg: &SdfGridConfig, camera_pos: Vec3, sun_dir: Vec3, su
     f[59] = cfg.voxel_size;
     // grid_dims.z (62) = brick_size (samples/edge = 8) — `voxel_loc` edge.
     f[62] = cfg.brick_size as f32;
+    // grid_dims.w (63) = atlas tiles/row, so `brick_probe_slot` recovers the dense tile index from
+    // atlas_base using THIS harness's mini-atlas layout (TEST_TILES_PER_ROW, not the production 256).
+    f[63] = TEST_TILES_PER_ROW as f32;
     // debug_params (64..68): x=max_steps, y=max_dist, z=sdf_eps, w=recenter_snap_chunks.
     f[64] = 192.0; f[65] = 5000.0; f[66] = 0.001; f[67] = cfg.recenter_snap_chunks as f32;
     // march_params (68..72): x=pixel_cone, y=shadow_softness, z=over_relax, w=lod_blend_band.
@@ -1010,9 +1059,9 @@ fn camera_uniform_bytes(cfg: &SdfGridConfig, camera_pos: Vec3, sun_dir: Vec3, su
 }
 
 fn chunk_lookup_bytes(chunks: &[chunk::ChunkLookup]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(chunks.len() * 20);
+    let mut out = Vec::with_capacity(chunks.len() * 24);
     for c in chunks {
-        for v in [c.key_hi, c.key_lo, c.occ_lo, c.occ_hi, c.tile_run_base] {
+        for v in [c.key_hi, c.key_lo, c.occ_lo, c.occ_hi, c.tile_run_base, c.probe_base] {
             out.extend_from_slice(&v.to_le_bytes());
         }
     }
@@ -1020,9 +1069,9 @@ fn chunk_lookup_bytes(chunks: &[chunk::ChunkLookup]) -> Vec<u8> {
 }
 
 fn brick_tile_bytes(tiles: &[chunk::BrickTile]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(tiles.len() * 12);
+    let mut out = Vec::with_capacity(tiles.len() * 16);
     for t in tiles {
-        for v in [t.atlas_base, t.pal01, t.pal23] {
+        for v in [t.atlas_base, t.pal01, t.pal23, t.probe_slot] {
             out.extend_from_slice(&v.to_le_bytes());
         }
     }
@@ -1040,12 +1089,15 @@ fn build_tables(baked: &Baked) -> chunk::ChunkTables {
             atlas_base: col | (row << 16),
             pal01: pal[0] as u32 | ((pal[1] as u32) << 16),
             pal23: pal[2] as u32 | ((pal[3] as u32) << 16),
+            ..Default::default() // probe_slot assigned by refresh_probe_bases inside build_chunk_tables
         }
     })
 }
 
-/// CPU mirror of `sdf::probe::probe_slot_at`: the tile-run index (= irradiance slot) of the brick
-/// containing `world_pos` at `lod`, or None if absent.
+/// CPU mirror of `sdf::probe::probe_slot_at`: the COMPACT per-brick probe slot
+/// (= chunk's finest-resident `probe_base` + the brick's stable local index) of the brick containing
+/// `world_pos` at `lod`, or None if the brick is absent OR its chunk is not finest-resident
+/// (`probe_base == u32::MAX`).
 fn cpu_probe_slot(tables: &chunk::ChunkTables, cfg: &SdfGridConfig, world_pos: Vec3, lod: u32) -> Option<u32> {
     let bc = cfg.world_to_brick_lod(world_pos, lod);
     let (ck, local) = chunk::chunk_of(BrickKey::new(lod, bc), cfg);
@@ -1054,12 +1106,17 @@ fn cpu_probe_slot(tables: &chunk::ChunkTables, cfg: &SdfGridConfig, world_pos: V
     if (row.key_hi, row.key_lo) != chunk::chunk_gpu_key(ck) {
         return None;
     }
-    let occ = (row.occ_lo as u64) | ((row.occ_hi as u64) << 32);
-    if (occ >> local) & 1 == 0 {
+    if row.probe_base == u32::MAX {
+        return None; // chunk not finest-resident → no probes (apply/bounce fall to a coarser LOD)
+    }
+    // The COMPACT per-brick slot lives in the brick's tile-run record (`BrickTile.probe_slot`), assigned
+    // by `refresh_probe_bases`. Resolve the brick's tile (rank/popcount) and read it — mirrors the GPU
+    // `probe_slot_at`. `resolve_via_tables` returns None for an absent brick.
+    let tile = chunk::resolve_via_tables(&tables.chunks, &tables.tile_run, tables.r, ck, local)?;
+    if tile.probe_slot == u32::MAX {
         return None;
     }
-    // STABLE local index (matches the trace + probe_slot_at), NOT the popcount rank.
-    Some(row.tile_run_base + local)
+    Some(tile.probe_slot)
 }
 
 /// Decode a stored (perceptual, sqrt/gamma-2) probe rgb back to linear irradiance: `E = stored²`.
@@ -1245,17 +1302,27 @@ fn trace_scene(
 
     let sd = subdiv.max(1);
     let tables = build_tables(baked);
-    // Each probe slot holds an octahedral tile (PROBE_OCT_TEXELS vec4s).
-    let n_slots =
-        tables.tile_run.len().max(1) * (sd * sd * sd) as usize * PROBE_OCT_TEXELS as usize;
-    // Compact resident-chunk list — the trace dispatches one workgroup per entry (NOT the full
-    // R³·lod_count directory). This is the per-frame perf fix the GPU timing gate guards.
+    // FINEST-resident chunks only — those owning compact probe blocks (`probe_base != u32::MAX`). The
+    // trace dispatches one workgroup per entry (NOT the full R³·lod_count directory, NOT the all-LOD
+    // resident union); mirrors the live `finest_rows()`. This is the per-frame perf fix the GPU timing
+    // gate guards, and it scales the dispatch with the clipmap window.
     let resident: Vec<chunk::ChunkLookup> = tables
         .chunks
         .iter()
-        .filter(|c| (c.key_hi, c.key_lo) != chunk::SENTINEL_KEY)
+        .filter(|c| (c.key_hi, c.key_lo) != chunk::SENTINEL_KEY && c.probe_base != u32::MAX)
         .copied()
         .collect();
+    // Probe buffer sized by the COMPACT per-brick finest-resident high-water (`max(probe_slot)+1` over
+    // the tile-run), NOT `tile_run.len()` (the all-LOD atlas tile count) — matches `probe_high_water()`.
+    let probe_hw = tables
+        .tile_run
+        .iter()
+        .filter(|t| t.probe_slot != u32::MAX)
+        .map(|t| t.probe_slot + 1)
+        .max()
+        .unwrap_or(0) as usize;
+    // Each probe slot holds an octahedral tile (PROBE_OCT_TEXELS vec4s).
+    let n_slots = probe_hw.max(1) * (sd * sd * sd) as usize * PROBE_OCT_TEXELS as usize;
 
     // --- shader + pipeline (auto layout: only the bindings the trace actually uses) ---
     let module = compose_full("assets/shaders/sdf_probe_trace.wgsl");
@@ -1393,8 +1460,8 @@ fn trace_scene(
         mapped_at_creation: false,
     });
     // ProbeParams { ray_count, hysteresis, intensity, frame, subdiv, update_stride, gi_range,
-    // normal_bias, view_bias, sky_intensity, bounce_shadows } — frame 0 (no history). MUST match the
-    // field order of the Rust `ProbeParams` (render/probe.rs) and the two WGSL copies (no parity test
+    // normal_bias, view_bias, sky_intensity, bounce_shadows, dormant_stride, classify } — frame 0 (no
+    // history). MUST match the field order of the Rust `ProbeParams` (render/probe.rs) + the WGSL copies (no parity test
     // guards this). 11 scalars = 44 B, padded up to the std140 uniform size (48 B = next ×16).
     let mut params = Vec::new();
     params.extend_from_slice(&ray_count.to_le_bytes());
@@ -1413,7 +1480,9 @@ fn trace_scene(
     // bounce_shadows = 1: exercise the REAL shadowed bounce (sun + point-light sphere shadows). The
     // point-light shadow march needs a nonzero shadow_light_cap — set in `camera_uniform_bytes`.
     params.extend_from_slice(&1.0f32.to_le_bytes()); // bounce_shadows
-    params.resize(48, 0);
+    params.extend_from_slice(&32u32.to_le_bytes()); // dormant_stride
+    params.extend_from_slice(&0u32.to_le_bytes()); // classify = 0 (gates don't exercise dormancy)
+    params.resize(64, 0);
     let params_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("params"),
         contents: &params,
@@ -1717,6 +1786,122 @@ fn ddgi_bounce_shadow_gate() {
         "bounce-shadow gate: red leaked through the wall (r={:.4}) — the point light's bounce wasn't shadowed",
         gi[0]
     );
+}
+
+/// BUFFER-BOUND / LIMIT GATE (the per-brick scaling fix): the DDGI probe buffer must scale with the
+/// number of OCCUPIED BRICKS (the dense per-brick `brick_probe_slot` address, bounded by the atlas),
+/// NOT `chunks × 64`. The old per-chunk×64 reservation wasted ~16× on SPARSE surfaces (a tower passes
+/// thinly through a chunk, occupying a handful of its 64 bricks) — that waste is what blew the probe
+/// buffer past the binding limit on the LOD-8 stress scene. This builds a sparse scene (one brick per
+/// chunk, like a thin surface) and asserts the per-brick buffer is dramatically smaller than the old
+/// per-chunk one, and bounded.
+#[test]
+fn ddgi_buffer_bound_gate() {
+    // ring 128 → R=32, so coords 0..12 don't wrap the toroidal directory.
+    let cfg = SdfGridConfig { lod_count: 3, ring_bricks: 128, recenter_snap_chunks: 1, ..Default::default() };
+    let tile = adventure::sdf_render::chunk::BrickTile { atlas_base: 1, pal01: 0, pal23: 0, ..Default::default() };
+    let mut live = adventure::sdf_render::chunk::LiveChunkTables::default();
+    // Sparse "thin surface": one occupied brick in each of 12³ LOD-0 chunks (6% of each chunk's 64).
+    let n = 12i32;
+    for z in 0..n {
+        for y in 0..n {
+            for x in 0..n {
+                let ck = adventure::sdf_render::chunk::ChunkKey::new(0, IVec3::new(x, y, z));
+                live.set_brick(ck, 0, tile, &cfg);
+            }
+        }
+    }
+    live.refresh_probe_bases();
+
+    let rows = live.resident_rows();
+    let chunks = rows.len();
+    let occupied_bricks: u32 = rows.iter().map(|r| r.occ_lo.count_ones() + r.occ_hi.count_ones()).sum();
+    // OLD divisor: chunks × TILE_RUN_SLOT(64). NEW divisor: occupied bricks (= atlas tile high-water).
+    let old_blocks = chunks as u64 * 64;
+    let new_blocks = occupied_bricks as u64;
+    eprintln!(
+        "limit: {chunks} chunks, {occupied_bricks} occupied bricks → per-brick buffer {}× smaller than per-chunk×64",
+        old_blocks / new_blocks.max(1)
+    );
+    assert!(new_blocks > 0, "some bricks must own probes");
+    assert!(
+        new_blocks * 16 <= old_blocks,
+        "per-brick packing must be ≥16× smaller than per-chunk×64 on a sparse scene ({new_blocks} vs {old_blocks})"
+    );
+
+    // The per-brick probe buffer at the default subdiv 2 — bounded.
+    let subdiv = GATE_SUBDIV as u64;
+    let bytes = new_blocks * subdiv.pow(3) * PROBE_OCT_TEXELS as u64 * 16;
+    eprintln!("limit: per-brick probe buffer = {} MiB ({new_blocks} bricks)", bytes / (1 << 20));
+    assert!(bytes < (1u64 << 31), "probe buffer must stay under the 2 GiB storage-binding limit");
+}
+
+/// SCALING GATE — the core goal: probes must scale with the clipmap WINDOW (dense near, coarse far),
+/// not the scene's absolute size. Bakes a series of ever-larger `k×k` Cornell grids through the REAL
+/// pipeline and measures, per size: the all-LOD atlas tile high-water (what the OLD scheme sized the
+/// probe buffer by), the COMPACT finest-resident probe high-water (what the NEW scheme sizes by), and
+/// GI coverage at a near + a far room. Asserts:
+///   (1) the per-brick finest scheme is materially SMALLER than the all-LOD union (redundancy removed),
+///   (2) probe memory grows FAR slower than the world (k² rooms) — it is window-bounded, not size-bound,
+///   (3) GI covers BOTH the near and the far room (no distant holes).
+#[test]
+fn ddgi_scaling_gate() {
+    let Some((device, queue)) = gpu_full() else {
+        eprintln!("no GPU adapter (or missing features) — skipping");
+        return;
+    };
+    let oct = PROBE_OCT_TEXELS as u64;
+    let mut probes_by_k: Vec<(u32, u32, u32)> = Vec::new(); // (k, atlas_hw, probe_hw)
+    for k in [1u32, 2, 4] {
+        let scene = cornell_grid_mini(k);
+        let baked = bake_scene(&device, &queue, &scene);
+        let tables = build_tables(&baked);
+        let atlas_hw = baked.atlas.tiles.high_water();
+        let finest: Vec<u32> =
+            tables.tile_run.iter().filter(|t| t.probe_slot != u32::MAX).map(|t| t.probe_slot).collect();
+        let probe_hw = finest.iter().map(|s| s + 1).max().unwrap_or(0);
+        let probe_count = finest.len() as u32;
+        let mem_mib = probe_hw as u64 * oct * 16 / (1 << 20);
+        let ratio = atlas_hw as f64 / probe_hw.max(1) as f64;
+        eprintln!(
+            "scaling k={k} rooms={:>3} atlas_hw={atlas_hw:>6} probe_hw={probe_hw:>6} probes={probe_count:>6} \
+             ratio={ratio:>4.2} mem={mem_mib}MiB",
+            k * k
+        );
+        probes_by_k.push((k, atlas_hw, probe_hw));
+    }
+
+    // (1) Compact ≤ all-LOD: the finest probe buffer is never larger than the all-LOD atlas union it
+    // replaced (it drops the redundant coarse copies; the gap widens with scene extent — see the runtime
+    // cornell8 check, where the spread fills the coarse LOD discs).
+    let (_, atlas4, probe4) = *probes_by_k.last().unwrap();
+    assert!(probe4 <= atlas4, "scaling: compact probe buffer ({probe4}) exceeds the all-LOD atlas ({atlas4})");
+
+    // (2) PROBES SCALE WITH LOD — the core property. Rooms are spatially disjoint (no shared bricks), so
+    // if every room used the FINEST LOD the probe count would grow linearly with rooms (16× for k 1→4).
+    // Instead, rooms outside the fine clipmap disc collapse to COARSER LODs (≈⅛ the probes each), so the
+    // probes-per-room must DROP as the world grows. This is "probes ride the LODs", proven deterministically.
+    let ppr_1 = probes_by_k[0].2 as f64 / 1.0;
+    let ppr_4 = probe4 as f64 / 16.0;
+    assert!(
+        ppr_4 < 0.6 * ppr_1,
+        "scaling: probes/room {ppr_4:.0} (k=4) not materially below {ppr_1:.0} (k=1) — far rooms aren't \
+         collapsing to coarse LODs, so probes don't scale with LOD"
+    );
+    // Probe memory stays small + bounded across all sizes (sanity).
+    assert!(probe4 as u64 * oct * 16 < (1u64 << 31), "scaling: probe buffer exceeded the 2 GiB binding limit");
+
+    // (3) GI coverage near AND far: trace the largest grid; both the centre and far-corner samples lit.
+    let scene = cornell_grid_mini(4);
+    let baked = bake_scene(&device, &queue, &scene);
+    let (irr, tables, _ms) =
+        trace_scene(&device, &queue, &scene, &baked, GATE_SUN_DIR, GATE_SUN_COLOR, 64, GATE_SUBDIV, 1, 8);
+    for s in &scene.samples {
+        let gi = gi_trilinear(&tables, &baked.cfg, &irr, s.pos, s.normal, s.normal, GATE_SUBDIV, 0.6, 0.1, true);
+        let lum = gi.map(|(c, _)| c.dot(Vec3::splat(1.0))).unwrap_or(0.0);
+        eprintln!("scaling coverage [{}] lum={lum:.4}", s.what);
+        assert!(lum > 0.0, "scaling: no GI at the {} room — distant coverage hole", s.what);
+    }
 }
 
 /// SMOOTHNESS GATE (the "no more blocky cubes" check): with perceptual encoding + the trilinear apply

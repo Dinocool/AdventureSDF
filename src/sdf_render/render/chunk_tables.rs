@@ -21,6 +21,9 @@ use crate::sdf_render::chunk;
 pub(super) struct ChunkBufCapacity {
     pub(super) chunk_rows: u32,
     pub(super) tile_slots: u32,
+    /// Probe-slot high-water (brick-units) for the finest-resident probe set — sizes the DDGI probe
+    /// irradiance buffer (`probe_slots × subdiv³ × PROBE_OCT_TEXELS`), bounded ≪ `tile_slots`.
+    pub(super) probe_slots: u32,
 }
 
 /// A growable std430 storage buffer of fixed-stride records. Owns the GPU buffer lifecycle shared by
@@ -74,15 +77,15 @@ impl PackedBuf {
 /// policy on top of the shared [`PackedBuf`] lifecycle.
 #[derive(Default)]
 pub(super) struct ChunkTableBuffers {
-    directory: PackedBuf, // binding 2: dense per-LOD directory, 20-byte ChunkLookup rows
-    tiles: PackedBuf,     // binding 11: packed tile-runs, 12-byte BrickTile records
+    directory: PackedBuf, // binding 2: dense per-LOD directory, 24-byte ChunkLookup rows
+    tiles: PackedBuf,     // binding 11: packed tile-runs, 16-byte BrickTile records
 }
 
 impl ChunkTableBuffers {
     pub(super) fn new(device: &RenderDevice) -> Self {
         Self {
-            directory: PackedBuf::new_dummy(device, "sdf_chunk_lookup_buffer", 20),
-            tiles: PackedBuf::new_dummy(device, "sdf_chunk_tile_buffer", 12),
+            directory: PackedBuf::new_dummy(device, "sdf_chunk_lookup_buffer", 24),
+            tiles: PackedBuf::new_dummy(device, "sdf_chunk_tile_buffer", 16),
         }
     }
 
@@ -103,7 +106,7 @@ impl ChunkTableBuffers {
         live_len: u32,
     ) {
         let live = live_len.min(rows.len() as u32) as usize;
-        let mut bytes = Vec::with_capacity(live * 20);
+        let mut bytes = Vec::with_capacity(live * 24);
         for c in &rows[..live] {
             encode_lookup(c, &mut bytes);
         }
@@ -118,16 +121,16 @@ impl ChunkTableBuffers {
         tile_run: &[chunk::BrickTile],
         cap_slots: u32,
     ) {
-        let mut bytes = Vec::with_capacity(tile_run.len() * 12);
+        let mut bytes = Vec::with_capacity(tile_run.len() * 16);
         for b in tile_run {
             encode_tile(b, &mut bytes);
         }
         let cap = cap_slots.max(chunk::TILE_RUN_SLOT) as usize;
-        self.tiles.rebuild(device, &bytes, cap, &[0u8; 12]);
+        self.tiles.rebuild(device, &bytes, cap, &[0u8; 16]);
     }
 
     /// In-place directory row deltas. A structural change marks a contiguous suffix dirty, so
-    /// coalesce consecutive rows into one `write_buffer` (vs a burst of 20-byte writes on a snap).
+    /// coalesce consecutive rows into one `write_buffer` (vs a burst of 24-byte writes on a snap).
     pub(super) fn directory_delta(
         &self,
         queue: &RenderQueue,
@@ -137,7 +140,7 @@ impl ChunkTableBuffers {
         let mut run_bytes: Vec<u8> = Vec::new();
         for (row, c) in row_updates {
             match run_start {
-                Some(s) if *row == s + (run_bytes.len() as u32 / 20) => {}
+                Some(s) if *row == s + (run_bytes.len() as u32 / 24) => {}
                 _ => {
                     if let Some(s) = run_start {
                         self.directory.write_at(queue, s as u64, &run_bytes);
@@ -159,7 +162,7 @@ impl ChunkTableBuffers {
         queue: &RenderQueue,
         region_updates: &[(u32, Vec<chunk::BrickTile>)],
     ) {
-        let mut bytes = Vec::with_capacity(chunk::TILE_RUN_SLOT as usize * 12);
+        let mut bytes = Vec::with_capacity(chunk::TILE_RUN_SLOT as usize * 16);
         for (slot, region) in region_updates {
             bytes.clear();
             for b in region {
@@ -170,27 +173,31 @@ impl ChunkTableBuffers {
     }
 }
 
-/// 20-byte std430 encoding of one chunk lookup row.
+/// 24-byte std430 encoding of one chunk lookup row.
 fn encode_lookup(c: &chunk::ChunkLookup, out: &mut Vec<u8>) {
     out.extend_from_slice(&c.key_hi.to_le_bytes());
     out.extend_from_slice(&c.key_lo.to_le_bytes());
     out.extend_from_slice(&c.occ_lo.to_le_bytes());
     out.extend_from_slice(&c.occ_hi.to_le_bytes());
     out.extend_from_slice(&c.tile_run_base.to_le_bytes());
+    out.extend_from_slice(&c.probe_base.to_le_bytes());
 }
 
-/// 12-byte std430 encoding of one tile-run brick record.
+/// 16-byte std430 encoding of one tile-run brick record (atlas origin + palette + DDGI probe slot).
 fn encode_tile(b: &chunk::BrickTile, out: &mut Vec<u8>) {
     out.extend_from_slice(&b.atlas_base.to_le_bytes());
     out.extend_from_slice(&b.pal01.to_le_bytes());
     out.extend_from_slice(&b.pal23.to_le_bytes());
+    out.extend_from_slice(&b.probe_slot.to_le_bytes());
 }
 
-/// The 20-byte `(u32::MAX, u32::MAX, 0, 0, 0)` chunk-lookup sentinel. Its key tag never matches a
-/// real chunk key, so a fixed directory slot that no live chunk occupies resolves to a miss.
-fn sentinel_row_bytes() -> [u8; 20] {
-    let mut b = [0u8; 20];
+/// The 24-byte chunk-lookup sentinel `(u32::MAX, u32::MAX, 0, 0, 0, u32::MAX)`. Its key tag never
+/// matches a real chunk key, so a fixed directory slot that no live chunk occupies resolves to a miss;
+/// the trailing `probe_base = u32::MAX` mirrors `sentinel_lookup` (no probes — never read on a miss).
+fn sentinel_row_bytes() -> [u8; 24] {
+    let mut b = [0u8; 24];
     b[0..4].copy_from_slice(&u32::MAX.to_le_bytes());
     b[4..8].copy_from_slice(&u32::MAX.to_le_bytes());
+    b[20..24].copy_from_slice(&u32::MAX.to_le_bytes());
     b
 }
