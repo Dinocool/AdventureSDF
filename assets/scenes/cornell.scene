@@ -1,5 +1,5 @@
 SceneFile(
-  next_id: 10,
+  next_id: 18,
   records: [
     Entity(
       id: LocalId(0),
@@ -119,7 +119,7 @@ SceneFile(
       },
     ),
     Entity(
-      id: LocalId(9),
+      id: LocalId(17),
       components: {
         "adventure::node::EditorGizmo": "{\"adventure::node::EditorGizmo\":DirectionalLight(scale:1.0)}",
         "adventure::node::Node3D": "{\"adventure::node::Node3D\":()}",

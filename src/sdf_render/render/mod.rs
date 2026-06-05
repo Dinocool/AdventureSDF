@@ -58,7 +58,7 @@ struct SdfCameraData {
     camera_pos: Vec4,
     screen_params: Vec4, // xy = screen_size; zw unused (was surface_bias — iso-offset removed)
     grid_origin: Vec4,   // xyz = grid origin, w = voxel_size
-    grid_dims: Vec4, // z = brick_size (8.0); x/y/w unused (chunk count = arrayLength(&chunk_buf))
+    grid_dims: Vec4, // z = brick_size (8.0); w = atlas tiles/row (legacy; unused since probes went compact); x/y unused
     debug_params: Vec4, // x = max_steps, y = max_dist, z = sdf_eps, w = unused
     /// x = pixel_cone (world radius per unit ray distance per pixel), y = reserved
     /// (was cubic_band), z = over_relax, w = lod_blend_band.
@@ -689,6 +689,9 @@ impl Plugin for SdfRenderPlugin {
                 ExtractComponentPlugin::<SdfCameraData>::default(),
                 UniformComponentPlugin::<SdfCameraData>::default(),
                 bevy::render::extract_resource::ExtractResourcePlugin::<super::DdgiParams>::default(),
+                bevy::render::extract_resource::ExtractResourcePlugin::<super::GiSettle>::default(),
+                bevy::render::extract_resource::ExtractResourcePlugin::<super::ProbeWakeSet>::default(),
+                bevy::render::extract_resource::ExtractResourcePlugin::<super::ProbeReset>::default(),
             ))
             .add_systems(
                 Update,
@@ -983,7 +986,12 @@ fn prepare_sdf_camera_data(
             // are unused: the chunk-search bound is now `arrayLength(&chunk_buf)` in the shader
             // (not `.w`), which is consistent with the bound lookup buffer by construction — see
             // `find_chunk`. Kept as a vec4 for std140 alignment of the following fields.
-            grid_dims: Vec4::new(0.0, 0.0, config.brick_size as f32, 0.0),
+            grid_dims: Vec4::new(
+                0.0,
+                0.0,
+                config.brick_size as f32,
+                crate::sdf_render::atlas::ATLAS_TILES_PER_ROW as f32, // w = atlas tiles/row (legacy; probe path now compact)
+            ),
             // `w` carries `recenter_snap_chunks` so the shader can recompute the chunk-
             // snapped ring centre (the LOD cross-fade must key off the true resident-ring
             // boundary, which is hysteresis-snapped — see bake_scheduler::ring_chunk_origin).

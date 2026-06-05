@@ -90,6 +90,14 @@ fn main(in: FullscreenVertexOutput) -> @location(0) vec4<f32> {
 #ifdef SDF_DEBUG_GI
     return vec4<f32>(albedo * gi * camera.sun_color.w, 1.0);
 #endif
+#ifdef SDF_DEBUG_PROBE_LOD
+    // The resolve pass wrote the finest-probe-LOD hue into the GI buffer; pass it straight through.
+    return vec4<f32>(gi, 1.0);
+#endif
+#ifdef SDF_DEBUG_PROBE_COVERAGE
+    // The resolve pass wrote the probe-coverage colour (green=covered, magenta=hole) into the GI buffer.
+    return vec4<f32>(gi, 1.0);
+#endif
 
     // `emissive` already holds ALL direct lighting (sun + points) + material emissive — physical,
     // scene-referred. Add the indirect diffuse bounce (albedo × GI), then apply the camera exposure

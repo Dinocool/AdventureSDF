@@ -13,7 +13,7 @@
 // world-anchored → boil-free. Result is temporally blended in place (single buffer); round-robin
 // re-traces `1/update_stride` of probe slots per frame.
 
-#import sdf::bindings::{camera, cell_stride, voxel_size_at, lod_count, ChunkLookup}
+#import sdf::bindings::{camera, cell_stride, voxel_size_at, lod_count, chunk_tile_buf, ChunkLookup}
 #import sdf::march::{raymarch, MarchQuality}
 #import sdf::brick::{calc_normal, scene_sdf, world_to_brick_lod}
 #import sdf::material::material_at
@@ -21,7 +21,7 @@
 #import sdf::shadows::surface_shadow
 #import sdf::sky::sky_color
 #import sdf::oct::{oct_decode, oct_encode}
-#import sdf::probe::{subprobe_world_pos, probe_slot_at, decode_chunk_key, brick_coord_in_chunk, occ_bit_set, PROBE_OCT_RES, PROBE_OCT_TEXELS}
+#import sdf::probe::{subprobe_world_pos, probe_slot_at, decode_chunk_key, brick_coord_in_chunk, occ_bit_set, occ_rank_below, PROBE_OCT_RES, PROBE_OCT_TEXELS}
 
 struct ProbeParams {
     ray_count: u32,
@@ -35,6 +35,8 @@ struct ProbeParams {
     view_bias: f32,
     sky_intensity: f32,
     bounce_shadows: f32, // >0.5 → shadow-march the sun + brightest point light at each bounce hit
+    dormant_stride: u32, // re-trace rate for converged probes when classify != 0
+    classify: u32,       // 1 = converged probes go dormant (skip the ray-march); 0 = all trace at update_stride
 };
 
 // Single in-place octahedral irradiance buffer: probe `slot`'s OCT_RES² texels live at
@@ -182,21 +184,36 @@ fn main(
     }
     let tid = lii;
 
+    // Finest-resident filter: a chunk fully covered by finer-LOD resident chunks owns no probes
+    // (`probe_base == u32::MAX`) — its region is served by the finer LOD, so skip the whole workgroup
+    // (uniform: probe_base is constant across the brick). Bounds the probe buffer to the finest set.
+    if (chunk.probe_base == 0xffffffffu) {
+        return;
+    }
     let id = decode_chunk_key(chunk.key_hi, chunk.key_lo);
     let brick_coord = brick_coord_in_chunk(id.coord, local);
-    // Probe slot uses the STABLE local brick index (0..63), NOT the popcount rank: the rank shifts when
-    // a neighbour brick in the same chunk enters/exits (constant while geometry moves), which would
-    // reassign a stationary brick's probe to another brick's stale irradiance → flashing dark splotches.
-    // The atlas tile-run still packs by rank; only the probe buffer is indexed by local (same capacity).
-    let tile_run_idx = chunk.tile_run_base + local;
+    // COMPACT per-brick probe slot, read from the brick's tile-run record (`BrickTile.probe_slot`). It's
+    // a stable, free-list slot allocated only over finest-resident OCCUPIED bricks, so the probe buffer
+    // is exact + scales with the clipmap window (no intra-chunk waste, no all-LOD redundancy). The apply
+    // derives the identical slot via `probe_slot_at`. `local` is occupied here (checked above), so the
+    // dense rank `off` indexes the brick's own record.
+    let off = occ_rank_below(chunk.occ_lo, chunk.occ_hi, local);
+    let probe_idx = chunk_tile_buf[chunk.tile_run_base + off].probe_slot;
+    if (probe_idx == 0xffffffffu) {
+        return; // brick has no probe slot assigned (defensive; finest-flag already gated the workgroup)
+    }
 
     let subdiv = max(params.subdiv, 1u);
     let nsub = subdiv * subdiv * subdiv;
-    let block_base = tile_run_idx * nsub;
+    let block_base = probe_idx * nsub;
     let bw = f32(cell_stride()) * voxel_size_at(id.lod);
     let cell = bw / f32(subdiv);
     let stride = max(params.update_stride, 1u);
-    let phase = params.frame % stride;
+    // CLASSIFICATION: a converged probe (its sample count reached the cap) re-traces at the slower
+    // `dormant_stride` instead of `update_stride` — it keeps its value and skips the ray-march. The CPU
+    // only sets `classify` once the scene is settled, so a moving camera / changing light keeps every
+    // probe active (full rate) and nothing goes stale. The convergence cap mirrors the blend's `n_max`.
+    let n_cap = 1.0 / (1.0 - clamp(params.hysteresis, 0.0, 0.999));
     let n = min(max(params.ray_count, 1u), MAX_RAYS);
     let octn = min(PROBE_OCT_TEXELS, MAX_OCT_TEXELS);
     let sun = normalize(camera.sun_dir.xyz);
@@ -204,12 +221,16 @@ fn main(
 
     for (var su = 0u; su < nsub; su = su + 1u) {
         let probe_slot = block_base + su;
-        if ((probe_slot % stride) != phase) {
-            continue; // not this slot's turn — retain its in-place octahedral tile (uniform skip)
-        }
         let oct_base = probe_slot * PROBE_OCT_TEXELS;
         if (oct_base + PROBE_OCT_TEXELS > arrayLength(&irradiance)) {
             continue; // uniform
+        }
+        // Per-probe effective stride: dormant (converged + classify on) → slow rate, else active rate.
+        // `irradiance[oct_base].a` is texel 0's sample count (uniform across the workgroup's threads).
+        let converged = irradiance[oct_base].a >= n_cap - 0.5;
+        let eff_stride = select(stride, max(params.dormant_stride, 1u), params.classify != 0u && converged);
+        if ((probe_slot % eff_stride) != (params.frame % eff_stride)) {
+            continue; // not this slot's turn — retain its in-place octahedral tile (uniform skip)
         }
 
         // --- Relocation + per-probe rotation (thread 0 only; results shared) ---------------------

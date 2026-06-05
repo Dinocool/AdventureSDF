@@ -23,10 +23,11 @@ pub(super) struct GpuChunkLookup {
     occ_lo: u32,
     occ_hi: u32,
     tile_run_base: u32,
+    probe_base: u32,
 }
 
 /// std430 `ShaderType` for the tile-run storage buffer's binding layout / min-binding-size only
-/// (12 bytes: atlas tile origin `col_px | row_px<<16` + packed 4-entry palette). Like
+/// (16 bytes: atlas tile origin `col_px | row_px<<16` + packed 4-entry palette + DDGI probe slot). Like
 /// [`GpuChunkLookup`], the data flows as `chunk::BrickTile` (serialized by [`encode_tile`]); this
 /// mirror keeps the GPU derive out of the pure `chunk.rs`. Fields MUST match `chunk::BrickTile`.
 #[derive(ShaderType, Clone, Copy, Default)]
@@ -34,6 +35,7 @@ pub(super) struct GpuBrickTile {
     atlas_base: u32,
     pal01: u32,
     pal23: u32,
+    probe_slot: u32,
 }
 
 #[derive(Resource, Default)]
@@ -100,6 +102,11 @@ pub(super) fn extract_sdf_atlas(
     last_gen.0 = atlas.generation;
 
     let live = &atlas.live_chunks;
+    // DDGI probe buffer is sized by the FINEST-RESIDENT probe high-water (`finest_chunks · CHUNK_VOLUME`)
+    // — one compact probe block per finest-resident chunk. Bounded by the clipmap WINDOW, not the
+    // all-LOD atlas tile union (which carried an ~lod_count× redundant copy of every near surface). This
+    // is what makes the probe buffer scale with the clipmap instead of the scene's absolute size.
+    chunk_cap.probe_slots = live.probe_high_water();
     let num_bricks = atlas.bricks.len() as u32;
     if num_bricks == 0 {
         // Fully evicted (roamed into empty space). Signal a full rebuild with EMPTY chunk data
@@ -109,6 +116,7 @@ pub(super) fn extract_sdf_atlas(
         // re-entry triggers a fresh full rebuild rather than a delta against a dropped buffer.
         chunk_cap.chunk_rows = 0;
         chunk_cap.tile_slots = 0;
+        chunk_cap.probe_slots = 0;
         commands.insert_resource(ExtractedSdfAtlas {
             tables_dirty: true,
             dir_full: true,
@@ -176,8 +184,20 @@ pub(super) fn prepare_sdf_atlas_gpu(
     device: Res<RenderDevice>,
     queue: Res<RenderQueue>,
     extracted: Option<Res<ExtractedSdfAtlas>>,
+    // Bumped on a scene switch (`SdfAtlas::reset`). The CPU tables + GPU lookup reset, but the brick
+    // TEXEL pages otherwise persist in VRAM — so a reused tile could show the previous scene's texels
+    // (esp. if the new scene's bake hash-skips it). Reallocate the pages fresh (zeroed) on a switch.
+    reset_res: Option<Res<crate::sdf_render::ProbeReset>>,
+    mut last_reset: Local<u32>,
     mut gpu_atlas: ResMut<SdfGpuAtlas>,
 ) {
+    let reset_id = reset_res.map(|r| r.0).unwrap_or(0);
+    if reset_id != *last_reset {
+        *last_reset = reset_id;
+        // Fresh, zeroed atlas pages — the new scene's bake re-grows + writes them; no stale carry-over.
+        gpu_atlas.pages = Some(super::atlas_pages::AtlasPages::new(&device));
+    }
+
     let Some(extracted) = extracted else { return };
     if !extracted.dirty {
         return;

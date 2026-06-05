@@ -67,14 +67,21 @@ struct ChunkLookup {
     occ_lo: u32,
     occ_hi: u32,
     tile_run_base: u32,
+    probe_base: u32, // DDGI probe-slot base (u32::MAX = no probes here → fall back to a coarser LOD)
 };
 
-// One resident brick's record in the packed chunk tile run: atlas tile origin + palette.
+// One resident brick's record in the packed chunk tile run: atlas tile origin + palette + DDGI probe.
 struct BrickTile {
     atlas_base: u32,  // col_px | row_px<<16
     pal_lo: u32,      // palette ids 0,1 (id0 | id1<<16)
     pal_hi: u32,      // palette ids 2,3 (id2 | id3<<16)
+    probe_slot: u32,  // DDGI compact finest-resident probe slot (0xffffffff = none)
 };
+
+// NOTE: DDGI probe slots are no longer derived from the atlas tile index. They are now compact over the
+// FINEST-resident chunk set — `chunk.probe_base + local_brick_index(coord)` (see `sdf::probe`) — so the
+// probe buffer scales with the clipmap window, not the all-LOD atlas tile union. `grid_dims.w` (tiles-
+// per-row) is consequently unused by the probe path (kept in the uniform for layout stability).
 
 // --- Bindings ---
 //

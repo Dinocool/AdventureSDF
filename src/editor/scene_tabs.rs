@@ -241,6 +241,9 @@ fn load_doc_into_world(world: &mut World, registry: &AppTypeRegistry, doc_index:
     };
 
     despawn_scene_content(world);
+    // Central scene-switch signal: subsystems evict per-scene caches (SDF DDGI probes) so the incoming
+    // scene starts clean instead of inheriting the previous scene's converged GI.
+    world.write_message(crate::scene_manager::SceneSwitched);
 
     {
         let reg = registry.read();
@@ -678,8 +681,10 @@ fn close_doc(world: &mut World, dock: &mut EditorDockState, registry: &AppTypeRe
                 set_dock_active(dock, nid);
             }
             None => {
-                // No scenes left: blank the world and focus the placeholder.
+                // No scenes left: blank the world and focus the placeholder. Still a scene switch —
+                // evict per-scene SDF caches so the placeholder doesn't keep the closed scene's data.
                 despawn_scene_content(world);
+                world.write_message(crate::scene_manager::SceneSwitched);
                 world.resource_mut::<OpenScenes>().active = None;
                 sync_current_path(world);
                 if let Some((node, tab)) = dock.state.find_main_surface_tab(&EditorTab::NoScene)

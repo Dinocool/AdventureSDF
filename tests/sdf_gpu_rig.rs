@@ -68,16 +68,18 @@ fn camera_uniform_bytes(config: &SdfGridConfig) -> Vec<u8> {
     bytemuck::cast_slice(&f).to_vec()
 }
 
-// One ChunkLookup entry (20 bytes, 5× u32) — repurposed as a flat brick entry:
+// One ChunkLookup entry (24 bytes, 6× u32) — repurposed as a flat brick entry:
 // key_hi=coord.x, key_lo=coord.y, occ_lo=coord.z (i32 bitcast), occ_hi=atlas_base.
+// Bound as `chunk_buf` (array<ChunkLookup>), so the stride MUST match the 24-byte WGSL struct.
 fn flat_brick_bytes(coords: &[IVec3]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(coords.len() * 20);
+    let mut out = Vec::with_capacity(coords.len() * 24);
     for c in coords {
         out.extend_from_slice(&(c.x as u32).to_le_bytes());
         out.extend_from_slice(&(c.y as u32).to_le_bytes());
         out.extend_from_slice(&(c.z as u32).to_le_bytes());
         out.extend_from_slice(&0u32.to_le_bytes()); // atlas_base (unused here)
         out.extend_from_slice(&0u32.to_le_bytes()); // tile_run_base
+        out.extend_from_slice(&0u32.to_le_bytes()); // probe_base (unused here)
     }
     out
 }
@@ -746,23 +748,25 @@ fn gpu_chunk_key_matches_cpu() {
 struct LookupOut { atlas_base: u32, found: u32, local_idx: u32, ci: i32 }
 
 fn chunk_lookup_bytes(chunks: &[adventure::sdf_render::chunk::ChunkLookup]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(chunks.len() * 20);
+    let mut out = Vec::with_capacity(chunks.len() * 24);
     for c in chunks {
         out.extend_from_slice(&c.key_hi.to_le_bytes());
         out.extend_from_slice(&c.key_lo.to_le_bytes());
         out.extend_from_slice(&c.occ_lo.to_le_bytes());
         out.extend_from_slice(&c.occ_hi.to_le_bytes());
         out.extend_from_slice(&c.tile_run_base.to_le_bytes());
+        out.extend_from_slice(&c.probe_base.to_le_bytes());
     }
     out
 }
 
 fn brick_tile_bytes(tiles: &[adventure::sdf_render::chunk::BrickTile]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(tiles.len() * 12);
+    let mut out = Vec::with_capacity(tiles.len() * 16);
     for t in tiles {
         out.extend_from_slice(&t.atlas_base.to_le_bytes());
         out.extend_from_slice(&t.pal01.to_le_bytes());
         out.extend_from_slice(&t.pal23.to_le_bytes());
+        out.extend_from_slice(&t.probe_slot.to_le_bytes());
     }
     out
 }
@@ -791,7 +795,7 @@ fn gpu_find_brick_lookup_matches_cpu() {
         let base = ((key.coord.x as u32 & 0xff) << 16)
             | ((key.coord.y as u32 & 0xff) << 8)
             | (key.coord.z as u32 & 0xff);
-        BrickTile { atlas_base: base, pal01: 0, pal23: 0 }
+        BrickTile { atlas_base: base, pal01: 0, pal23: 0, ..Default::default() }
     });
 
     let brick_coords: Vec<IVec3> = atlas.bricks.keys().map(|k| k.coord).collect();

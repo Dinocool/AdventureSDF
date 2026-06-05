@@ -26,6 +26,8 @@ struct ProbeParams {
     view_bias: f32,
     sky_intensity: f32,  // unused here; kept so the layout matches the shared ProbeParams buffer
     bounce_shadows: f32, // unused here; kept so the layout matches the shared ProbeParams buffer
+    dormant_stride: u32, // unused here; layout match
+    classify: u32,       // unused here; layout match
 };
 
 @group(2) @binding(0) var gbuf_albedo: texture_2d<f32>;     // a = camera distance
@@ -128,6 +130,30 @@ fn sample_gi(world_pos: vec3<f32>, normal: vec3<f32>, view: vec3<f32>) -> vec3<f
     return vec3<f32>(0.0);
 }
 
+// DEBUG: the FINEST clipmap LOD that owns a probe at `world_pos` (or -1 if none), for the probe-LOD /
+// coverage debug views. Mirrors `sample_gi`'s LOD walk but stops at the first resident probe — so it
+// visualizes the clipmap annuli of the probe allocation (dense LOD0 near → coarse far).
+fn finest_probe_lod(world_pos: vec3<f32>, normal: vec3<f32>) -> i32 {
+    let nlods = lod_count();
+    let s = cell_stride();
+    for (var l = 0u; l < nlods; l = l + 1u) {
+        let bw = f32(s) * voxel_size_at(l);            // brick world size at this LOD
+        let bias = normal * probe_params.normal_bias * (bw / f32(max(probe_params.subdiv, 1u)));
+        let p = world_pos + bias;
+        let bc = vec3<i32>(floor(p / bw)) * s;          // stride-aligned brick voxel coord
+        if (probe_slot_at(bc, l) >= 0) {
+            return i32(l);
+        }
+    }
+    return -1;
+}
+
+// DEBUG: LOD index → hue ramp (LOD0 red → mid green → coarse blue).
+fn lod_hue(l: u32, n: u32) -> vec3<f32> {
+    let t = f32(l) / max(f32(n) - 1.0, 1.0);
+    return vec3<f32>(1.0 - t, 1.0 - abs(2.0 * t - 1.0), t);
+}
+
 @fragment
 fn main(in: FullscreenVertexOutput) -> @location(0) vec4<f32> {
     let uv = in.uv;
@@ -144,6 +170,18 @@ fn main(in: FullscreenVertexOutput) -> @location(0) vec4<f32> {
     let ray_dir = normalize(world_near.xyz / world_near.w - camera.camera_pos.xyz);
     let view = -ray_dir;
     let world_pos = camera.camera_pos.xyz + ray_dir * dist;
+
+#ifdef SDF_DEBUG_PROBE_LOD
+    // Finest-resident probe LOD as a hue ramp (clipmap annuli); black = no probe (a coverage hole).
+    let pl = finest_probe_lod(world_pos, normal);
+    let plc = select(vec3<f32>(0.0), lod_hue(u32(max(pl, 0)), lod_count()), pl >= 0);
+    return vec4<f32>(plc, dist);
+#endif
+#ifdef SDF_DEBUG_PROBE_COVERAGE
+    // Green = a finest-resident probe covers this pixel; magenta = uncovered (GI hole).
+    let covered = finest_probe_lod(world_pos, normal) >= 0;
+    return vec4<f32>(select(vec3<f32>(1.0, 0.0, 1.0), vec3<f32>(0.0, 1.0, 0.0), covered), dist);
+#endif
 
     let gi = sample_gi(world_pos, normal, view) * probe_params.intensity;
     return vec4<f32>(gi, dist);
