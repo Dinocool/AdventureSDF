@@ -9,6 +9,7 @@
     camera,
     ChunkLookup,
     PALETTE_EMPTY,
+    MAT_ATLAS_NONE,
     chunk_buf,
     chunk_tile_buf,
     atlas_pages,
@@ -63,8 +64,9 @@ fn world_to_brick_lod(world_pos: vec3<f32>, lod: u32) -> vec3<i32> {
 // --- Chunk lookup: binary search + occupancy resolve ---
 
 struct BrickLocation {
-    atlas_base: u32,     // packed tile origin (col_px | row_px<<16); see voxel_pixel
-    palette: vec4<u32>,  // 4 global material ids (PALETTE_EMPTY = unused)
+    atlas_base: u32,      // packed DISTANCE tile origin (col_px | row_px<<16); see voxel_pixel
+    mat_atlas_base: u32,  // packed MATERIAL tile origin, or MAT_ATLAS_NONE (single-material brick)
+    palette: vec4<u32>,   // 4 global material ids (PALETTE_EMPTY = unused)
     found: bool,
 };
 
@@ -108,7 +110,7 @@ fn brick_in_chunk(chunk: ChunkLookup, coord: vec3<i32>) -> BrickLocation {
     if (li < 32u) { bit = (chunk.occ_lo >> li) & 1u; }
     else { bit = (chunk.occ_hi >> (li - 32u)) & 1u; }
     if (bit == 0u) {
-        return BrickLocation(0u, vec4<u32>(PALETTE_EMPTY), false);
+        return BrickLocation(0u, MAT_ATLAS_NONE, vec4<u32>(PALETTE_EMPTY), false);
     }
 
     // Offset within the chunk's tile run = popcount of mask bits below li.
@@ -123,7 +125,7 @@ fn brick_in_chunk(chunk: ChunkLookup, coord: vec3<i32>) -> BrickLocation {
     }
     let off = countOneBits(below_lo) + countOneBits(below_hi);
     let tile = chunk_tile_buf[chunk.tile_run_base + off];
-    return BrickLocation(tile.atlas_base, unpack_palette(tile.pal_lo, tile.pal_hi), true);
+    return BrickLocation(tile.atlas_base, tile.mat_atlas_base, unpack_palette(tile.pal_lo, tile.pal_hi), true);
 }
 
 // Resolve the baked brick at `coord` on LOD `lod` via its chunk: find the chunk, then test
@@ -131,7 +133,7 @@ fn brick_in_chunk(chunk: ChunkLookup, coord: vec3<i32>) -> BrickLocation {
 fn find_brick_lookup(coord: vec3<i32>, lod: u32) -> BrickLocation {
     let ci = find_chunk(coord, lod);
     if (ci < 0) {
-        return BrickLocation(0u, vec4<u32>(PALETTE_EMPTY), false);
+        return BrickLocation(0u, MAT_ATLAS_NONE, vec4<u32>(PALETTE_EMPTY), false);
     }
     return brick_in_chunk(chunk_buf[u32(ci)], coord);
 }
@@ -257,11 +259,14 @@ fn pick_material(slots: vec4<f32>, palette: vec4<u32>) -> MaterialPick {
 // single-material brick (runner-up = MATERIAL_FAR), so `id_b == id` skips the blend and `fwidth(gap)`
 // stays ~0 across a uniform↔multi material-brick boundary (a larger sentinel would blow up fwidth
 // there and paint a 1px seam on the neighbouring multi-material pixel).
-fn resolve_material(base_u: u32, world_pos: vec3<f32>, lod: u32, palette: vec4<u32>) -> MaterialPick {
+// `mat_base` is the MATERIAL tile origin (loc.mat_atlas_base) — distinct from the distance tile in
+// the decoupled atlas. A single-material brick passes MAT_ATLAS_NONE here, but the `palette.y` check
+// returns before it's ever used to sample, so the sentinel is safe.
+fn resolve_material(mat_base: u32, world_pos: vec3<f32>, lod: u32, palette: vec4<u32>) -> MaterialPick {
     if (palette.y == PALETTE_EMPTY) {
         return MaterialPick(palette.x, palette.x, 1.0);
     }
-    return pick_material(load_material_distances(base_u, world_pos, lod), palette);
+    return pick_material(load_material_distances(mat_base, world_pos, lod), palette);
 }
 
 fn sample_brick_sdf(base_u: u32, world_pos: vec3<f32>, lod: u32) -> f32 {
@@ -329,7 +334,7 @@ fn find_brick_at(world_pos: vec3<f32>, out_lod: ptr<function, u32>) -> BrickLoca
         }
     }
     *out_lod = 0u;
-    return BrickLocation(0u, vec4<u32>(PALETTE_EMPTY), false);
+    return BrickLocation(0u, MAT_ATLAS_NONE, vec4<u32>(PALETTE_EMPTY), false);
 }
 
 // Trilinear SDF at any world position, resolving the brick by finest-LOD lookup.
@@ -377,7 +382,7 @@ fn scene_sdf(p: vec3<f32>) -> SceneSdfResult {
     // Both distances are continuous, so that bisector is sub-voxel sharp and
     // independent of geometric smoothing — clean even at smoothing = 0. Single-material
     // bricks short-circuit the per-slot fetch (see `resolve_material`).
-    let pick = resolve_material(loc.atlas_base, p, lod, loc.palette);
+    let pick = resolve_material(loc.mat_atlas_base, p, lod, loc.palette);
 
     return SceneSdfResult(d, pick.id, pick.id_b, pick.gap, true, lod, loc.atlas_base, loc.palette);
 }
@@ -437,7 +442,7 @@ fn find_chunk_cached(coord: vec3<i32>, lod: u32, cache: ptr<function, ChunkCache
 fn find_brick_lookup_cached(coord: vec3<i32>, lod: u32, cache: ptr<function, ChunkCache>) -> BrickLocation {
     let ci = find_chunk_cached(coord, lod, cache);
     if (ci < 0) {
-        return BrickLocation(0u, vec4<u32>(PALETTE_EMPTY), false);
+        return BrickLocation(0u, MAT_ATLAS_NONE, vec4<u32>(PALETTE_EMPTY), false);
     }
     return brick_in_chunk(chunk_buf[u32(ci)], coord);
 }
@@ -457,7 +462,7 @@ fn find_brick_at_cached(world_pos: vec3<f32>, out_lod: ptr<function, u32>, cache
         }
     }
     *out_lod = 0u;
-    return BrickLocation(0u, vec4<u32>(PALETTE_EMPTY), false);
+    return BrickLocation(0u, MAT_ATLAS_NONE, vec4<u32>(PALETTE_EMPTY), false);
 }
 
 fn sample_sdf_world_cached(world_pos: vec3<f32>, cache: ptr<function, ChunkCache>) -> f32 {
@@ -478,6 +483,7 @@ struct MarchSample {
     window_lod: u32,
     lod: u32,
     atlas_base: u32,
+    mat_atlas_base: u32,
     palette: vec4<u32>,
 };
 
@@ -506,12 +512,12 @@ fn resolve_march(p: vec3<f32>, cache: ptr<function, ChunkCache>) -> MarchSample 
                 let loc = brick_in_chunk(chunk_buf[u32(ci)], coord);
                 if (loc.found) {
                     let d = sample_brick_sdf(loc.atlas_base, p, lod);
-                    return MarchSample(d, true, window_lod, lod, loc.atlas_base, loc.palette);
+                    return MarchSample(d, true, window_lod, lod, loc.atlas_base, loc.mat_atlas_base, loc.palette);
                 }
             }
         }
     }
-    return MarchSample(1e10, false, window_lod, 0u, 0u, vec4<u32>(PALETTE_EMPTY));
+    return MarchSample(1e10, false, window_lod, 0u, 0u, MAT_ATLAS_NONE, vec4<u32>(PALETTE_EMPTY));
 }
 
 // Sample the conservative field at an ABSOLUTE target LOD, degrading to COARSER only.
@@ -527,7 +533,7 @@ fn resolve_march(p: vec3<f32>, cache: ptr<function, ChunkCache>) -> MarchSample 
 fn sample_level_at_or_coarser(p: vec3<f32>, target_lod: u32, cache: ptr<function, ChunkCache>) -> MarchSample {
     let levels = lod_count();
     if (target_lod >= levels || arrayLength(&chunk_buf) == 0u) {
-        return MarchSample(1e10, false, levels - 1u, 0u, 0u, vec4<u32>(PALETTE_EMPTY));
+        return MarchSample(1e10, false, levels - 1u, 0u, 0u, MAT_ATLAS_NONE, vec4<u32>(PALETTE_EMPTY));
     }
     for (var lod = target_lod; lod < levels; lod = lod + 1u) {
         let coord = world_to_brick_lod(p, lod);
@@ -536,11 +542,11 @@ fn sample_level_at_or_coarser(p: vec3<f32>, target_lod: u32, cache: ptr<function
             let loc = brick_in_chunk(chunk_buf[u32(ci)], coord);
             if (loc.found) {
                 let d = sample_brick_sdf(loc.atlas_base, p, lod);
-                return MarchSample(d, true, lod, lod, loc.atlas_base, loc.palette);
+                return MarchSample(d, true, lod, lod, loc.atlas_base, loc.mat_atlas_base, loc.palette);
             }
         }
     }
-    return MarchSample(1e10, false, levels - 1u, 0u, 0u, vec4<u32>(PALETTE_EMPTY));
+    return MarchSample(1e10, false, levels - 1u, 0u, 0u, MAT_ATLAS_NONE, vec4<u32>(PALETTE_EMPTY));
 }
 
 // Distance along the ray to the far side of the brick containing `p`, at LOD `lod`.

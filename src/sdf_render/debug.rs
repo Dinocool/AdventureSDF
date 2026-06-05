@@ -286,13 +286,14 @@ const MAT_BYTES_PER_VOXEL: u64 = 8;
 const GRAD_BYTES_PER_VOXEL: u64 = 0;
 const LOOKUP_BYTES_PER_BRICK: u64 = 16;
 
-/// Pure GPU-memory breakdown for `bricks` resident bricks, as
-/// `(distance, material, gradient, lookup, total)` bytes. Extracted so the layout invariant is
-/// unit-testable without an `App`/`SdfAtlas`.
-fn atlas_byte_breakdown(bricks: u64) -> (u64, u64, u64, u64, u64) {
+/// Pure GPU-memory breakdown as `(distance, material, gradient, lookup, total)` bytes. Distance +
+/// gradient + lookup scale with ALL resident bricks; material scales only with the MULTI-material
+/// brick count (`mat_bricks`) — single-material bricks store no material tile (the reclamation win).
+/// Extracted so the layout invariant is unit-testable without an `App`/`SdfAtlas`.
+fn atlas_byte_breakdown(bricks: u64, mat_bricks: u64) -> (u64, u64, u64, u64, u64) {
     let voxels = bricks * BRICK_VOXELS as u64;
     let dist = voxels * DIST_BYTES_PER_VOXEL;
-    let mat = voxels * MAT_BYTES_PER_VOXEL;
+    let mat = mat_bricks * BRICK_VOXELS as u64 * MAT_BYTES_PER_VOXEL;
     let grad = voxels * GRAD_BYTES_PER_VOXEL;
     let lookup = bricks * LOOKUP_BYTES_PER_BRICK;
     (dist, mat, grad, lookup, dist + mat + grad + lookup)
@@ -300,8 +301,9 @@ fn atlas_byte_breakdown(bricks: u64) -> (u64, u64, u64, u64, u64) {
 
 fn update_atlas_stats(mut stats: ResMut<SdfAtlasStats>, atlas: Res<SdfAtlas>) {
     let total = atlas.bricks.len() as u64;
+    let mat_bricks = atlas.mat_tiles.len() as u64;
 
-    let (dist, mat, grad, lookup, total_bytes) = atlas_byte_breakdown(total);
+    let (dist, mat, grad, lookup, total_bytes) = atlas_byte_breakdown(total, mat_bricks);
     stats.dist_bytes = dist;
     stats.object_bytes = mat;
     stats.blend_bytes = grad;
@@ -1039,20 +1041,28 @@ fn sdf_inline_material_ui(world: &mut World, entity: Entity, ui: &mut egui::Ui) 
 mod tests {
     use super::*;
 
-    /// The memory panel's per-channel breakdown must sum to the reported total, and the material
-    /// term must equal ONE Rgba16Snorm atlas (8 B/voxel) — NOT the old `mat_lo`+`mat_hi` double
-    /// count (16 B/voxel). Locks the accounting against the real single-`mat_pages` layout.
+    /// The memory panel's per-channel breakdown must sum to the reported total. Distance is ONE
+    /// R16Snorm atlas over all bricks; material is ONE Rgba16Snorm atlas (8 B/voxel) sized to the
+    /// MULTI-material count only (the reclamation win) — NOT the old `mat_lo`+`mat_hi` double count
+    /// and NOT every brick. Locks the accounting against the real decoupled layout.
     #[test]
-    fn atlas_byte_breakdown_is_consistent_and_single_material() {
-        for bricks in [0u64, 1, 7, 1000] {
-            let (dist, mat, grad, lookup, total) = atlas_byte_breakdown(bricks);
+    fn atlas_byte_breakdown_is_consistent_and_decoupled_material() {
+        // (total bricks, multi-material bricks)
+        for (bricks, mat_bricks) in [(0u64, 0u64), (1, 0), (1000, 0), (1000, 250), (7, 7)] {
+            let (dist, mat, grad, lookup, total) = atlas_byte_breakdown(bricks, mat_bricks);
             assert_eq!(dist + mat + grad + lookup, total, "breakdown must sum to total");
 
-            let voxels = bricks * BRICK_VOXELS as u64;
-            assert_eq!(dist, voxels * 2, "distance is one R16Snorm atlas");
-            assert_eq!(mat, voxels * 8, "material is ONE Rgba16Snorm atlas (no phantom mat_hi)");
+            assert_eq!(dist, bricks * BRICK_VOXELS as u64 * 2, "distance: one R16Snorm tile per brick");
+            assert_eq!(
+                mat,
+                mat_bricks * BRICK_VOXELS as u64 * 8,
+                "material: one Rgba16Snorm tile per MULTI-material brick only"
+            );
             assert_eq!(grad, 0, "no gradient atlas before Phase 3");
             assert_eq!(lookup, bricks * 16);
         }
+        // The reclamation invariant: with no multi-material bricks, material VRAM is ZERO.
+        let (_, mat_none, _, _, _) = atlas_byte_breakdown(1000, 0);
+        assert_eq!(mat_none, 0, "single-material-only scene allocates no material atlas");
     }
 }

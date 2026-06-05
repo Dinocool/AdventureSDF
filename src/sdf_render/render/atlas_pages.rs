@@ -41,7 +41,9 @@ pub fn split_row(global_y: u32) -> (u32, u32) {
     (global_y / ATLAS_PAGE_HEIGHT_PX, global_y % ATLAS_PAGE_HEIGHT_PX)
 }
 
-/// The two atlas formats grow in lockstep (a brick writes both), so one pool owns both.
+/// The distance + material page pools. They no longer grow in lockstep: every resident brick has a
+/// distance tile, but only MULTI-material bricks have a material tile (single-material bricks store
+/// none), so the material pool sizes to the multi-material count and is usually much smaller.
 pub struct AtlasPages {
     dist: Vec<Texture>,
     dist_views: Vec<TextureView>,
@@ -70,24 +72,29 @@ impl AtlasPages {
         self.dist.len()
     }
 
-    /// Ensure at least `rows_needed` tile-rows of capacity exist, allocating whole pages as needed.
-    /// NO copy — existing pages are untouched. Returns true if any page was added (⇒ the bind group
-    /// must be rebuilt). Panics past [`ATLAS_MAX_PAGES`] (the shader's binding-array ceiling) — a hard
-    /// cap the working set should never reach; if it does, raise both constants in lockstep.
-    pub fn ensure(&mut self, device: &RenderDevice, rows_needed: u32) -> bool {
-        let pages_needed = rows_needed.div_ceil(PAGE_ROWS).max(1);
+    /// Ensure the distance pool covers `dist_rows` tile-rows and the material pool covers `mat_rows`,
+    /// allocating whole pages as needed. NO copy — existing pages are untouched. Returns true if any
+    /// page was added to EITHER pool (⇒ the bind group must be rebuilt). Panics past
+    /// [`ATLAS_MAX_PAGES`] (the shader's binding-array ceiling) — a hard cap the working set should
+    /// never reach; if it does, raise it + the shader's `binding_array` size.
+    pub fn ensure(&mut self, device: &RenderDevice, dist_rows: u32, mat_rows: u32) -> bool {
+        let dist_pages = dist_rows.div_ceil(PAGE_ROWS).max(1);
+        let mat_pages = mat_rows.div_ceil(PAGE_ROWS).max(1);
         assert!(
-            pages_needed <= ATLAS_MAX_PAGES,
-            "SDF atlas needs {pages_needed} pages > ATLAS_MAX_PAGES ({ATLAS_MAX_PAGES}); raise it + the shader's binding_array size"
+            dist_pages <= ATLAS_MAX_PAGES && mat_pages <= ATLAS_MAX_PAGES,
+            "SDF atlas needs dist={dist_pages}/mat={mat_pages} pages > ATLAS_MAX_PAGES ({ATLAS_MAX_PAGES}); raise it + the shader's binding_array size"
         );
-        let grew = self.dist.len() < pages_needed as usize;
-        while (self.dist.len() as u32) < pages_needed {
+        let grew = self.dist.len() < dist_pages as usize || self.mat.len() < mat_pages as usize;
+        while (self.dist.len() as u32) < dist_pages {
             let idx = self.dist.len();
             let dist = make_page(device, TextureFormat::R16Snorm, idx, "dist");
-            let mat = make_page(device, TextureFormat::Rgba16Snorm, idx, "mat");
             self.dist_views.push(dist.create_view(&TextureViewDescriptor::default()));
-            self.mat_views.push(mat.create_view(&TextureViewDescriptor::default()));
             self.dist.push(dist);
+        }
+        while (self.mat.len() as u32) < mat_pages {
+            let idx = self.mat.len();
+            let mat = make_page(device, TextureFormat::Rgba16Snorm, idx, "mat");
+            self.mat_views.push(mat.create_view(&TextureViewDescriptor::default()));
             self.mat.push(mat);
         }
         grew
