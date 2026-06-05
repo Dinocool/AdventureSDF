@@ -33,7 +33,9 @@ pub struct SdfAtlasStats {
     pub dirty: bool,
     // Memory breakdown, in bytes.
     pub dist_bytes: u64,
+    /// Material atlas (the single `mat_pages` texture: per-voxel palette-slot distances).
     pub object_bytes: u64,
+    /// Gradient atlas (per-voxel baked normal; 0 until the Phase-3 gradient channel lands).
     pub blend_bytes: u64,
     pub lookup_bytes: u64,
     pub total_bytes: u64,
@@ -274,20 +276,37 @@ fn register_shader_modes(app: &mut App) {
 
 // --- Atlas stats ---
 
+// Per-voxel GPU byte widths of each brick atlas channel — the SSOT for the memory panel.
+// MUST mirror the texture formats created in `render::atlas_pages`. Distance is the single
+// R16Snorm atlas (2B); material is the single Rgba8Snorm atlas (4B = 4 palette-slot distances).
+// There is no second material texture — the earlier `mat_lo`+`mat_hi` split double-counted a
+// `mat_hi` that never existed. `GRAD_BYTES_PER_VOXEL` is 0 until the Phase-3 gradient atlas lands.
+const DIST_BYTES_PER_VOXEL: u64 = 2;
+const MAT_BYTES_PER_VOXEL: u64 = 4;
+const GRAD_BYTES_PER_VOXEL: u64 = 0;
+const LOOKUP_BYTES_PER_BRICK: u64 = 16;
+
+/// Pure GPU-memory breakdown for `bricks` resident bricks, as
+/// `(distance, material, gradient, lookup, total)` bytes. Extracted so the layout invariant is
+/// unit-testable without an `App`/`SdfAtlas`.
+fn atlas_byte_breakdown(bricks: u64) -> (u64, u64, u64, u64, u64) {
+    let voxels = bricks * BRICK_VOXELS as u64;
+    let dist = voxels * DIST_BYTES_PER_VOXEL;
+    let mat = voxels * MAT_BYTES_PER_VOXEL;
+    let grad = voxels * GRAD_BYTES_PER_VOXEL;
+    let lookup = bricks * LOOKUP_BYTES_PER_BRICK;
+    (dist, mat, grad, lookup, dist + mat + grad + lookup)
+}
+
 fn update_atlas_stats(mut stats: ResMut<SdfAtlasStats>, atlas: Res<SdfAtlas>) {
     let total = atlas.bricks.len() as u64;
-    let voxels = total * BRICK_VOXELS as u64;
 
-    // GPU footprint per voxel: distance R16Snorm (2B) + two dense material-distance
-    // atlases, mat_lo and mat_hi, each Rgba16Snorm (8B = 4 materials × 2B). Plus the
-    // per-brick lookup entry (16B, std430). Matches the formats uploaded in render.rs.
-    // (`object_bytes`/`blend_bytes` fields are reused for mat_lo/mat_hi.)
-    stats.dist_bytes = voxels * 2;
-    stats.object_bytes = voxels * 8; // mat_lo (materials 0..3)
-    stats.blend_bytes = voxels * 8; // mat_hi (materials 4..7)
-    stats.lookup_bytes = total * 16;
-    stats.total_bytes =
-        stats.dist_bytes + stats.object_bytes + stats.blend_bytes + stats.lookup_bytes;
+    let (dist, mat, grad, lookup, total_bytes) = atlas_byte_breakdown(total);
+    stats.dist_bytes = dist;
+    stats.object_bytes = mat;
+    stats.blend_bytes = grad;
+    stats.lookup_bytes = lookup;
+    stats.total_bytes = total_bytes;
 
     stats.total_bricks = total as u32;
     // 2D-tiled dims (matches the render atlas + preview): tiles wrap at 256/row.
@@ -1014,4 +1033,27 @@ fn sdf_inline_material_ui(world: &mut World, entity: Entity, ui: &mut egui::Ui) 
     scalar(ui, "Metallic", &mut o.metallic, 0.0, 1.0);
     scalar(ui, "Roughness", &mut o.roughness, 1.0, 1.0);
     scalar(ui, "Relief depth", &mut o.parallax_scale, 0.0, 0.4);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The memory panel's per-channel breakdown must sum to the reported total, and the material
+    /// term must equal ONE Rgba8Snorm atlas (4 B/voxel) — NOT the old `mat_lo`+`mat_hi` double
+    /// count (16 B/voxel), nor the pre-Phase-2b 16-bit width (8 B/voxel). Locks the accounting
+    /// against the real single-`mat_pages` layout.
+    #[test]
+    fn atlas_byte_breakdown_is_consistent_and_single_material() {
+        for bricks in [0u64, 1, 7, 1000] {
+            let (dist, mat, grad, lookup, total) = atlas_byte_breakdown(bricks);
+            assert_eq!(dist + mat + grad + lookup, total, "breakdown must sum to total");
+
+            let voxels = bricks * BRICK_VOXELS as u64;
+            assert_eq!(dist, voxels * 2, "distance is one R16Snorm atlas");
+            assert_eq!(mat, voxels * 4, "material is ONE Rgba8Snorm atlas (no phantom mat_hi)");
+            assert_eq!(grad, 0, "no gradient atlas before Phase 3");
+            assert_eq!(lookup, bricks * 16);
+        }
+    }
 }

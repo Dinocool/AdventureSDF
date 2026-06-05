@@ -323,8 +323,8 @@ fn gpu_memory_ui(world: &mut World, ui: &mut egui::Ui) {
     ));
     let segments = vec![
         MemSeg { label: "SDF distance".into(), bytes: stats.dist_bytes, color: band_color(0) },
-        MemSeg { label: "SDF material lo".into(), bytes: stats.object_bytes, color: band_color(1) },
-        MemSeg { label: "SDF material hi".into(), bytes: stats.blend_bytes, color: band_color(2) },
+        MemSeg { label: "SDF material".into(), bytes: stats.object_bytes, color: band_color(1) },
+        MemSeg { label: "SDF gradient".into(), bytes: stats.blend_bytes, color: band_color(2) },
         MemSeg { label: "SDF lookup".into(), bytes: stats.lookup_bytes, color: band_color(3) },
         MemSeg { label: "PBR textures".into(), bytes: pbr_textures_vram_bytes(), color: band_color(4) },
     ];
