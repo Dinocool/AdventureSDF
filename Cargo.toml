@@ -43,7 +43,7 @@ renderdoc = ["editor", "dep:renderdoc", "dep:libloading"]
 # `assets/shaders/**.wgsl`. Full NonSemantic step-through isn't reachable (naga emits only legacy debug
 # info). OFF by default (round-trip + debug info bloat shaders / slow pipeline creation); build with
 # `--features editor,shader-debug` when profiling. See `rdoc/scripts/ngfx` + the `profile-shaders` skill.
-shader-debug = ["dep:bevy_render", "bevy_render/decoupled_naga"]
+shader-debug = ["bevy_render/decoupled_naga"]
 # Faster incremental compiles via dynamic linking of Bevy. Dev-only — never ship.
 # (Disable with `--no-default-features` when capturing in RenderDoc, which can't inject
 # into a dynamically-linked Bevy.)
@@ -77,10 +77,13 @@ bevy = { version = "0.18", default-features = false, features = [
 ] }
 bevy_brp_extras = "0.18"
 bevy_rapier3d = "0.34.0"
-# Optional, ONLY pulled by `shader-debug`: enables `decoupled_naga` on the SAME bevy_render the `bevy`
-# umbrella already uses (Cargo unifies the feature onto it) so composed shaders round-trip to a WGSL
-# string and naga emits `OpSource`/`OpLine` for Nsight. Not referenced in code — a feature carrier only.
-bevy_render = { version = "0.18", default-features = false, optional = true }
+# Direct dep on the SAME bevy_render the `bevy` umbrella already uses (Cargo unifies it — no extra
+# build cost, no second copy) so `shader-debug` can flip its `decoupled_naga` feature (round-trips
+# composed shaders to a WGSL string → naga emits `OpSource`/`OpLine` for Nsight). MUST be non-optional:
+# declaring it makes `bevy_manifest` emit `bevy_render::` paths in the ShaderType/etc. derives, which
+# only resolve if the crate is always present — an `optional = true` dep breaks every non-shader-debug
+# build (`bevy_render` unresolved). Not referenced by name in code; a feature/path carrier only.
+bevy_render = { version = "0.18", default-features = false }
 wgpu = "27"
 # Fast non-cryptographic hasher (the rustc compiler's own FxHash) for the hot integer-keyed maps
 # in the SDF bake path — brick/chunk/tile lookups per baked brick. std's SipHash is ~3–5× slower
