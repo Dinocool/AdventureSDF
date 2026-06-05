@@ -58,6 +58,9 @@ struct ProbeParams {
     /// 1 = classification active (converged probes go dormant); 0 = every probe traces at `update_stride`.
     /// Set 0 while the scene is unsettled (recent topology/lighting change) so nothing goes stale.
     classify: u32,
+    /// LOD ≥ this → the probe traces `distant_ray_count` rays instead of `ray_count` (far field needs less).
+    ray_falloff_lod: u32,
+    distant_ray_count: u32,
 }
 
 #[derive(Resource)]
@@ -327,6 +330,8 @@ pub(super) fn prepare_sdf_probe(
         bounce_shadows: if params_res.gi_bounce_shadows { 1.0 } else { 0.0 },
         dormant_stride: 1,
         classify: 0,
+        ray_falloff_lod: params_res.ray_falloff_lod,
+        distant_ray_count: params_res.distant_ray_count.max(1),
     };
     let mut ubytes = bevy::render::render_resource::encase::UniformBuffer::new(Vec::<u8>::new());
     ubytes.write(&p).unwrap();

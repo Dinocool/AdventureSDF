@@ -656,6 +656,10 @@ fn render_panel(world: &mut World, ui: &mut egui::Ui) {
         ddgi.classify_enabled,
         egui::Slider::new(&mut ddgi.dormant_stride, 4..=128).text("Dormant stride (converged re-trace)"),
     );
+    // Distant-probe cost controls (cut the dominant trace cost in the far field).
+    ui.add(egui::Slider::new(&mut ddgi.probe_halve_lod, 1..=10).text("Halve density ≥ LOD"));
+    ui.add(egui::Slider::new(&mut ddgi.ray_falloff_lod, 1..=10).text("Distant rays ≥ LOD"));
+    ui.add(egui::Slider::new(&mut ddgi.distant_ray_count, 8..=256).text("Distant ray count"));
     ui.add(
         egui::Slider::new(&mut ddgi.gi_range, 4.0..=200.0)
             .logarithmic(true)

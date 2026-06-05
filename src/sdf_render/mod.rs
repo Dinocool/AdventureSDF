@@ -307,6 +307,16 @@ pub struct DdgiParams {
     /// Larger = bigger steady-state savings on static scenes + slower revalidation of undetected changes.
     /// Only used when `classify_enabled`. Typical 16–64.
     pub dormant_stride: u32,
+    /// LOD at/above which DISTANT probes trace fewer rays (`distant_ray_count`) — the far field needs far
+    /// less angular detail, so this cuts the dominant ray-march cost without touching near quality. Set
+    /// high (≥ lod_count) to disable.
+    pub ray_falloff_lod: u32,
+    /// Rays/probe for probes at LOD ≥ `ray_falloff_lod` (the distant field). Lower than `ray_count`.
+    pub distant_ray_count: u32,
+    /// LOD at/above which probe DENSITY is halved (a checkerboard decimation of bricks): distant probes
+    /// are sparser, cutting probe COUNT (memory + ray work) where the GI is low-frequency anyway. The
+    /// apply's coverage-weighted trilinear interpolates the gaps. Set high (≥ lod_count) to disable.
+    pub probe_halve_lod: u32,
 }
 
 impl Default for DdgiParams {
@@ -330,6 +340,12 @@ impl Default for DdgiParams {
             probe_budget_bytes: 1 << 30,
             classify_enabled: true,
             dormant_stride: 32,
+            // Distant LODs get cheaper probes by default (the user can dial these): half the rays beyond
+            // LOD 4, and half the probe density beyond LOD 5. Near LODs (the visible field) keep full
+            // quality. Raise the thresholds to lod_count to disable.
+            ray_falloff_lod: 4,
+            distant_ray_count: 32,
+            probe_halve_lod: 5,
         }
     }
 }
@@ -348,15 +364,24 @@ pub struct GiSettle {
 /// or the GI lighting knobs), else increment. Point lights are intentionally NOT hashed here (O(lights)
 /// every frame would be costly on a 1000s-of-lights scene); a moved point light is instead picked up by
 /// the dormant re-trace rate within `dormant_stride` frames — bounded, never permanently stale.
+#[allow(clippy::type_complexity)] // a Bevy change-detection query filter — alias would obscure it
 fn track_gi_settle(
     ddgi: Res<DdgiParams>,
     sun: Query<(&GlobalTransform, &DirectionalLight), With<crate::scene_manager::SceneEntity>>,
+    // Cheap O(changed) detection of a moved/edited point light (NOT O(all lights) — Bevy change ticks).
+    // A changing light must wake the probes; otherwise dormant probes update only every `dormant_stride`
+    // frames → visible STEPPING instead of a smooth blend (the static case already converges then stays).
+    lights_changed: Query<
+        (),
+        (With<PointLight>, Or<(Changed<GlobalTransform>, Changed<PointLight>)>),
+    >,
     mut settle: ResMut<GiSettle>,
     mut last: Local<u64>,
 ) {
     // NOTE: geometry/topology changes do NOT reset the global settle — they're handled by the LOCAL
     // wake set (`update_probe_wake`), so one moving cube doesn't drop the whole scene out of dormancy.
-    // Only LIGHTING changes (sun, GI knobs) globally wake every probe (they affect all of them).
+    // LIGHTING changes (sun, point lights, GI knobs) globally wake every probe (they affect all of them),
+    // so the GI re-converges at the active rate (smoothly) instead of stepping at the dormant rate.
     let mut h = 0u64;
     if let Ok((t, dl)) = sun.single() {
         let f = t.forward();
@@ -369,8 +394,9 @@ fn track_gi_settle(
         h = h.wrapping_mul(0x0100_0000_01b3).wrapping_add(v.to_bits() as u64);
     }
     h = h.wrapping_add(u64::from(ddgi.gi_bounce_shadows));
-    if *last != h {
-        *last = h;
+    let hash_changed = *last != h;
+    *last = h;
+    if hash_changed || !lights_changed.is_empty() {
         settle.frames_unchanged = 0;
     } else {
         settle.frames_unchanged = settle.frames_unchanged.saturating_add(1);
@@ -456,18 +482,23 @@ fn evict_on_scene_switch(
     mut atlas: ResMut<atlas::SdfAtlas>,
     mut sched: ResMut<bake_scheduler::BakeScheduler>,
 ) {
-    if ev.is_empty() {
+    let n = ev.read().count();
+    if n == 0 {
         return;
     }
-    ev.clear();
     // Probe state.
     settle.frames_unchanged = 0;
     wake.frames.clear();
     wake_set.slots.clear();
     reset.0 = reset.0.wrapping_add(1);
     // Chunk/atlas + scheduler state (geometry starts clean too — no stale bricks or queued bakes).
+    let bricks_before = atlas.bricks.len();
     atlas.reset();
     sched.reset();
+    info!(
+        "SDF scene switch: evicted {bricks_before} bricks + probes/atlas/scheduler (reset #{}, {n} event(s))",
+        reset.0
+    );
 }
 
 // --- Selection ---
@@ -1080,12 +1111,21 @@ fn clear_chunk_table_dirty(mut atlas: ResMut<atlas::SdfAtlas>) {
 /// end-of-frame extract, so the directory delta carries the updated rows. Gated on
 /// `topology_generation` so it scans the resident set only when the chunk set actually changed; idle
 /// frames + texel-only re-bakes are free.
-fn refresh_probe_lod(mut atlas: ResMut<atlas::SdfAtlas>, mut last_topo: Local<u64>) {
-    if atlas.topology_generation == *last_topo {
+fn refresh_probe_lod(
+    mut atlas: ResMut<atlas::SdfAtlas>,
+    ddgi: Res<DdgiParams>,
+    mut last_topo: Local<u64>,
+    mut last_halve: Local<u32>,
+) {
+    // Recompute on a chunk-set change OR when the density-halving LOD knob changed (it re-decimates the
+    // distant probe set). `u32::MAX` Local sentinel forces the first run.
+    let halve = ddgi.probe_halve_lod;
+    if atlas.topology_generation == *last_topo && *last_halve == halve {
         return;
     }
     *last_topo = atlas.topology_generation;
-    atlas.live_chunks.refresh_probe_bases();
+    *last_halve = halve;
+    atlas.live_chunks.refresh_probe_bases(halve);
     // `refresh_probe_bases` marks the changed `probe_base` directory rows dirty; the render-world
     // extract is gated on `generation`. A topology change already bumped `generation` (set/clear_brick),
     // but bump again to be certain the refreshed finest-flag rows upload this frame — otherwise a stale

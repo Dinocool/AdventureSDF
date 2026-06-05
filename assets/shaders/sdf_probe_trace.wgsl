@@ -37,6 +37,8 @@ struct ProbeParams {
     bounce_shadows: f32, // >0.5 → shadow-march the sun + brightest point light at each bounce hit
     dormant_stride: u32, // re-trace rate for converged probes when classify != 0
     classify: u32,       // 1 = converged probes go dormant (skip the ray-march); 0 = all trace at update_stride
+    ray_falloff_lod: u32, // LOD >= this → trace distant_ray_count rays (far field needs less angular detail)
+    distant_ray_count: u32,
 };
 
 // Single in-place octahedral irradiance buffer: probe `slot`'s OCT_RES² texels live at
@@ -214,7 +216,10 @@ fn main(
     // only sets `classify` once the scene is settled, so a moving camera / changing light keeps every
     // probe active (full rate) and nothing goes stale. The convergence cap mirrors the blend's `n_max`.
     let n_cap = 1.0 / (1.0 - clamp(params.hysteresis, 0.0, 0.999));
-    let n = min(max(params.ray_count, 1u), MAX_RAYS);
+    // Distant (coarse-LOD) probes trace fewer rays — the far field's GI is low-frequency, so this cuts
+    // the dominant ray-march cost without touching near quality.
+    let ray_n = select(params.ray_count, params.distant_ray_count, id.lod >= params.ray_falloff_lod);
+    let n = min(max(ray_n, 1u), MAX_RAYS);
     let octn = min(PROBE_OCT_TEXELS, MAX_OCT_TEXELS);
     let sun = normalize(camera.sun_dir.xyz);
     let my_dir = texel_dir(tid); // constant for this thread across all of the brick's sub-probes
