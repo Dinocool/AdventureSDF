@@ -77,6 +77,9 @@ pub(super) struct ExtractedSdfAtlas {
     /// material atlas sizes to the MULTI-material brick count only (its own dense allocator).
     dist_rows_needed: u32,
     mat_rows_needed: u32,
+    /// Gradient pool rows: equals `dist_rows_needed` when the gradient feature is enabled (it's
+    /// dense — one tile per brick, sharing the distance tile index), else 0 (pool stays empty).
+    grad_rows_needed: u32,
     dirty: bool,
 }
 
@@ -130,10 +133,14 @@ pub(super) fn extract_sdf_atlas(
     // single-material.
     let dist_rows_needed = atlas.tiles.high_water().div_ceil(ATLAS_TILES_PER_ROW).max(1);
     let mat_rows_needed = atlas.mat_tiles.high_water().div_ceil(ATLAS_TILES_PER_ROW).max(1);
+    // Gradient is dense (shares the distance tile index), so it needs the same rows as distance —
+    // but only when enabled; 0 keeps the pool unallocated (the reclamation-style VRAM gate).
+    let grad_rows_needed = if atlas.bake_gradient { dist_rows_needed } else { 0 };
 
     let mut extracted = ExtractedSdfAtlas {
         dist_rows_needed,
         mat_rows_needed,
+        grad_rows_needed,
         dirty: true,
         ..Default::default()
     };
@@ -227,7 +234,12 @@ pub(super) fn prepare_sdf_atlas_gpu(
     if let Some(pages) = gpu_atlas.pages.as_mut() {
         let _span = info_span!("sdf_atlas_ensure_pages").entered();
         let before = pages.page_count();
-        if pages.ensure(&device, extracted.dist_rows_needed, extracted.mat_rows_needed) {
+        if pages.ensure(
+            &device,
+            extracted.dist_rows_needed,
+            extracted.mat_rows_needed,
+            extracted.grad_rows_needed,
+        ) {
             debug!("SDF atlas grew {before} -> {} page(s) (no copy)", pages.page_count());
         }
     }

@@ -44,6 +44,8 @@ const DIST_TILE_U32: u32 = DIST_ROW_U32 * 8;
 // shader's `MAT_TILE_U32` and `render::bake::BAKE_MAT_TILE_U32`.
 const MAT_ROW_U32: u32 = 128;
 const MAT_TILE_U32: u32 = MAT_ROW_U32 * 8;
+// Gradient tile: Rgba8Snorm, 1 u32/texel, 64 u32/row x 8 = 512. Matches the bake shader.
+const GRAD_TILE_U32: u32 = 64 * 8;
 
 // Mirror of bake_scheduler::GpuJobHeader upload order (48 bytes, 12 u32).
 fn header_bytes(coord: IVec3, voxel_size: f32, dist_band: f32, edit_count: u32) -> Vec<u8> {
@@ -176,6 +178,12 @@ fn gpu_bake_sphere_matches_analytic_distance() {
         usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
         mapped_at_creation: false,
     });
+    let grad_buf = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("grad_out"),
+        size: (GRAD_TILE_U32 * 4) as u64,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        mapped_at_creation: false,
+    });
 
     let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
         label: Some("bake_bgl"),
@@ -184,6 +192,7 @@ fn gpu_bake_sphere_matches_analytic_distance() {
             storage_entry(1, true),
             storage_entry(2, false),
             storage_entry(3, false),
+            storage_entry(4, false),
         ],
     });
     let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -207,6 +216,7 @@ fn gpu_bake_sphere_matches_analytic_distance() {
             bind(1, &edit_buf),
             bind(2, &dist_buf),
             bind(3, &mat_buf),
+            bind(4, &grad_buf),
         ],
     });
 
@@ -325,6 +335,12 @@ fn gpu_bake_copy_to_atlas_texture_roundtrips() {
         usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
         mapped_at_creation: false,
     });
+    let grad_buf = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("grad_out"),
+        size: (GRAD_TILE_U32 * 4) as u64,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        mapped_at_creation: false,
+    });
     let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
         label: Some("bgl"),
         entries: &[
@@ -332,6 +348,7 @@ fn gpu_bake_copy_to_atlas_texture_roundtrips() {
             storage_entry(1, true),
             storage_entry(2, false),
             storage_entry(3, false),
+            storage_entry(4, false),
         ],
     });
     let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -355,6 +372,7 @@ fn gpu_bake_copy_to_atlas_texture_roundtrips() {
             bind(1, &edit_buf),
             bind(2, &dist_buf),
             bind(3, &mat_buf),
+            bind(4, &grad_buf),
         ],
     });
 
@@ -562,6 +580,12 @@ fn gpu_bake_material_atlas_roundtrips() {
         usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
         mapped_at_creation: false,
     });
+    let grad_buf = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("grad_out"),
+        size: (GRAD_TILE_U32 * 4) as u64,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        mapped_at_creation: false,
+    });
     let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
         label: None,
         entries: &[
@@ -569,6 +593,7 @@ fn gpu_bake_material_atlas_roundtrips() {
             storage_entry(1, true),
             storage_entry(2, false),
             storage_entry(3, false),
+            storage_entry(4, false),
         ],
     });
     let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -592,6 +617,7 @@ fn gpu_bake_material_atlas_roundtrips() {
             bind(1, &edit_buf),
             bind(2, &dist_buf),
             bind(3, &mat_buf),
+            bind(4, &grad_buf),
         ],
     });
 

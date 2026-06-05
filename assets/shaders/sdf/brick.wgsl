@@ -14,6 +14,7 @@
     chunk_tile_buf,
     atlas_pages,
     mat_pages,
+    grad_pages,
     ATLAS_PAGE_HEIGHT_PX,
     cell_stride,
     voxel_size_at,
@@ -179,6 +180,53 @@ fn load_voxel(base_u: u32, lx: i32, ly: i32, lz: i32) -> f32 {
 fn load_mat(base_u: u32, lx: i32, ly: i32, lz: i32) -> vec4<f32> {
     let loc = voxel_loc(base_u, lx, ly, lz);
     return textureLoad(mat_pages[loc.page], loc.px, 0);
+}
+
+// --- Per-voxel gradient (outward normal) sampling ---
+//
+// The bake stores the unit SDF gradient per voxel (Rgba8Snorm, shares the DISTANCE tile origin).
+// `load_grad` fetches one corner; `sample_grad` trilerps the 8 corners and renormalizes for a
+// cheap, sharp shading normal (one fetch-set vs the tetrahedron finite-difference's 5 field
+// resolves). Only compiled into the march when SDF_GRAD_NORMALS / SDF_SHARP_CREASES is set.
+
+fn load_grad(base_u: u32, lx: i32, ly: i32, lz: i32) -> vec3<f32> {
+    let loc = voxel_loc(base_u, lx, ly, lz);
+    return textureLoad(grad_pages[loc.page], loc.px, 0).xyz;
+}
+
+fn sample_grad(base_u: u32, world_pos: vec3<f32>, lod: u32) -> vec3<f32> {
+    let voxel_size = voxel_size_at(lod);
+    let s = cell_stride();
+    let voxel_f = world_pos / voxel_size;
+    let vox = vec3<i32>(floor(voxel_f));
+    let brick_origin_voxel = vec3<f32>(
+        f32(brick_snap(vox.x, s)),
+        f32(brick_snap(vox.y, s)),
+        f32(brick_snap(vox.z, s)),
+    );
+    let local_f = voxel_f - brick_origin_voxel;
+    let i0 = vec3<i32>(floor(local_f));
+    let f = local_f - floor(local_f);
+
+    let g000 = load_grad(base_u, i0.x,     i0.y,     i0.z);
+    let g100 = load_grad(base_u, i0.x + 1, i0.y,     i0.z);
+    let g010 = load_grad(base_u, i0.x,     i0.y + 1, i0.z);
+    let g110 = load_grad(base_u, i0.x + 1, i0.y + 1, i0.z);
+    let g001 = load_grad(base_u, i0.x,     i0.y,     i0.z + 1);
+    let g101 = load_grad(base_u, i0.x + 1, i0.y,     i0.z + 1);
+    let g011 = load_grad(base_u, i0.x,     i0.y + 1, i0.z + 1);
+    let g111 = load_grad(base_u, i0.x + 1, i0.y + 1, i0.z + 1);
+    let x00 = mix(g000, g100, f.x);
+    let x10 = mix(g010, g110, f.x);
+    let x01 = mix(g001, g101, f.x);
+    let x11 = mix(g011, g111, f.x);
+    let y0 = mix(x00, x10, f.y);
+    let y1 = mix(x01, x11, f.y);
+    let g = mix(y0, y1, f.z);
+    let glen = length(g);
+    // Zero when the stored gradients are absent (outside the bake's near-surface gate) so the
+    // caller can fall back to finite differences; a real gradient returns unit length.
+    return select(vec3<f32>(0.0), g / glen, glen > 1e-6);
 }
 
 fn sample_mat_tex(base_u: u32, i0: vec3<i32>, f: vec3<f32>) -> vec4<f32> {
@@ -682,6 +730,23 @@ fn in_ring_chunk(coord: vec3<i32>, lod: u32) -> bool {
 // The offset spans roughly one voxel so quantization in the snorm field doesn't
 // dominate the difference.
 fn calc_normal(p: vec3<f32>) -> vec3<f32> {
+#ifdef SDF_GRAD_NORMALS
+    // Baked-gradient normal: ONE trilinear gradient fetch-set instead of the 5 field resolves the
+    // tetrahedron FD below needs — sharper (it's the exact analytic gradient, not a snorm-quantized
+    // difference) and cheaper. Falls through to FD if the brick has no baked gradient here (e.g. a
+    // probe just outside the bake's near-surface gate).
+    {
+        var gcache = new_chunk_cache();
+        var glod = 0u;
+        let gloc = find_brick_at_cached(p, &glod, &gcache);
+        if (gloc.found) {
+            let g = sample_grad(gloc.atlas_base, p, glod);
+            if (dot(g, g) > 0.5) {
+                return g;
+            }
+        }
+    }
+#endif
     // Probe offset ≈ one voxel at the LOD serving this point (coarser LODs need a
     // proportionally larger offset so the finite difference spans a real sample gap).
     // The 5 probes (center LOD + 4 tetrahedron taps) are spatially adjacent → almost always

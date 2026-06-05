@@ -111,6 +111,11 @@ struct BrickTile {
 @group(1) @binding(9) var tex_height: texture_2d_array<f32>;
 @group(1) @binding(10) var tex_edge: texture_2d_array<f32>;
 @group(1) @binding(11) var<storage, read> chunk_tile_buf: array<BrickTile>;  // packed per-chunk brick runs
+// Per-voxel gradient (outward unit normal) pages, Rgba8Snorm. PAGED like the distance atlas and
+// indexed by the SAME tile origin (dense — one tile per brick). Only populated when the gradient
+// feature is enabled (SDF_GRAD_NORMALS / SDF_SHARP_CREASES); a dummy 1×1 fills every slot otherwise.
+// SIZED binding_array (see the atlas_pages note above). MUST match `atlas_upload::ATLAS_MAX_PAGES`.
+@group(1) @binding(12) var grad_pages: binding_array<texture_2d<f32>, 64>;
 
 // --- Shared constants ---
 
