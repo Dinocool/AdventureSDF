@@ -69,11 +69,14 @@ struct ChunkLookup {
     tile_run_base: u32,
 };
 
-// One resident brick's record in the packed chunk tile run: atlas tile origin + palette.
+// One resident brick's record in the packed chunk tile run: distance tile origin, material tile
+// origin (or MAT_ATLAS_NONE for a single-material brick), + palette. MUST match chunk::BrickTile
+// field order (encode_tile): atlas_base, mat_atlas_base, pal01, pal23 (16 bytes std430).
 struct BrickTile {
-    atlas_base: u32,  // col_px | row_px<<16
-    pal_lo: u32,      // palette ids 0,1 (id0 | id1<<16)
-    pal_hi: u32,      // palette ids 2,3 (id2 | id3<<16)
+    atlas_base: u32,      // distance tile origin: col_px | row_px<<16
+    mat_atlas_base: u32,  // material tile origin, or MAT_ATLAS_NONE (single-material brick)
+    pal_lo: u32,          // palette ids 0,1 (id0 | id1<<16)
+    pal_hi: u32,          // palette ids 2,3 (id2 | id3<<16)
 };
 
 // --- Bindings ---
@@ -112,6 +115,10 @@ struct BrickTile {
 // --- Shared constants ---
 
 const PALETTE_EMPTY: u32 = 0xffffu;
+// `mat_atlas_base` sentinel for a single-material brick (owns no material tile). Mirrors
+// `chunk::MAT_ATLAS_NONE`. The reader short-circuits on `palette[1]==EMPTY` before sampling, so
+// this is never used as a real origin.
+const MAT_ATLAS_NONE: u32 = 0xffffffffu;
 const TEXTURE_WORLD_SCALE: f32 = 0.5;  // world units per texture tile = 2.0
 const PI: f32 = 3.14159265359;
 // Per-LOD distance-field clamp band in VOXELS. The geometry distance atlas stores

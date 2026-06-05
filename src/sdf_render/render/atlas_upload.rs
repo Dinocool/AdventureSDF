@@ -26,12 +26,14 @@ pub(super) struct GpuChunkLookup {
 }
 
 /// std430 `ShaderType` for the tile-run storage buffer's binding layout / min-binding-size only
-/// (12 bytes: atlas tile origin `col_px | row_px<<16` + packed 4-entry palette). Like
-/// [`GpuChunkLookup`], the data flows as `chunk::BrickTile` (serialized by [`encode_tile`]); this
-/// mirror keeps the GPU derive out of the pure `chunk.rs`. Fields MUST match `chunk::BrickTile`.
+/// (16 bytes: distance tile origin + material tile origin, each `col_px | row_px<<16`, + packed
+/// 4-entry palette). Like [`GpuChunkLookup`], the data flows as `chunk::BrickTile` (serialized by
+/// [`encode_tile`]); this mirror keeps the GPU derive out of the pure `chunk.rs`. Fields MUST match
+/// `chunk::BrickTile`.
 #[derive(ShaderType, Clone, Copy, Default)]
 pub(super) struct GpuBrickTile {
     atlas_base: u32,
+    mat_atlas_base: u32,
     pal01: u32,
     pal23: u32,
 }
@@ -68,11 +70,13 @@ pub(super) struct ExtractedSdfAtlas {
     /// Whether the chunk lookup / tile-run buffers changed at all this frame. False on a
     /// texel-only re-bake — the lookup buffers are reused as-is.
     tables_dirty: bool,
-    /// Tile-rows the atlas must span this frame (= `high_water` rows). `prepare` grows the paged
-    /// pool ([`AtlasPages::ensure`]) to cover it — one new page per block, NO copy. The pool only
-    /// grows (tile origins are stable via the allocator's free-list), so this is monotonic until a
-    /// full eviction resets the allocator.
-    rows_needed: u32,
+    /// Tile-rows the DISTANCE and MATERIAL atlases must span this frame (= each allocator's
+    /// `high_water` rows). `prepare` grows the paged pools ([`AtlasPages::ensure`]) to cover them —
+    /// one new page per block, NO copy. The pools only grow (tile origins are stable via the
+    /// allocators' free-lists), so these are monotonic until a full eviction resets them. The
+    /// material atlas sizes to the MULTI-material brick count only (its own dense allocator).
+    dist_rows_needed: u32,
+    mat_rows_needed: u32,
     dirty: bool,
 }
 
@@ -119,13 +123,17 @@ pub(super) fn extract_sdf_atlas(
         return;
     }
 
-    // Tile origins come from the stable allocator (its high-water mark), NOT brick iteration order
-    // — so a re-baked brick keeps its sub-rect across frames. `prepare` grows the paged pool to
-    // cover this many tile-rows (one page per block, no copy); the pool only grows.
-    let required_rows = atlas.tiles.high_water().div_ceil(ATLAS_TILES_PER_ROW).max(1);
+    // Tile origins come from the stable allocators (their high-water marks), NOT brick iteration
+    // order — so a re-baked brick keeps its sub-rect across frames. `prepare` grows each paged pool
+    // to cover this many tile-rows (one page per block, no copy); the pools only grow. The material
+    // atlas tracks its OWN (multi-material-only) allocator, so it stays small when most bricks are
+    // single-material.
+    let dist_rows_needed = atlas.tiles.high_water().div_ceil(ATLAS_TILES_PER_ROW).max(1);
+    let mat_rows_needed = atlas.mat_tiles.high_water().div_ceil(ATLAS_TILES_PER_ROW).max(1);
 
     let mut extracted = ExtractedSdfAtlas {
-        rows_needed: required_rows,
+        dist_rows_needed,
+        mat_rows_needed,
         dirty: true,
         ..Default::default()
     };
@@ -219,7 +227,7 @@ pub(super) fn prepare_sdf_atlas_gpu(
     if let Some(pages) = gpu_atlas.pages.as_mut() {
         let _span = info_span!("sdf_atlas_ensure_pages").entered();
         let before = pages.page_count();
-        if pages.ensure(&device, extracted.rows_needed) {
+        if pages.ensure(&device, extracted.dist_rows_needed, extracted.mat_rows_needed) {
             debug!("SDF atlas grew {before} -> {} page(s) (no copy)", pages.page_count());
         }
     }

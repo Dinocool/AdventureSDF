@@ -31,6 +31,11 @@ const BAKE_DIST_TILE_U32: u32 = BAKE_DIST_ROW_U32 * 8;
 const BAKE_MAT_ROW_U32: u32 = 128;
 const BAKE_MAT_TILE_U32: u32 = BAKE_MAT_ROW_U32 * 8;
 
+/// Per-job material-tile sentinel: this brick is single-material and stores no material tile, so the
+/// bake node skips its material copy. Mirrors `chunk::MAT_ATLAS_NONE` (a tile-INDEX sentinel here,
+/// vs the packed-origin sentinel there).
+const MAT_TILE_NONE: u32 = u32::MAX;
+
 /// One brick bake job's header, std430. Mirror of the WGSL `JobHeader` in
 /// `sdf_brick_bake.wgsl` and built from `bake_scheduler::GpuBakeJob`.
 #[derive(ShaderType, Clone, Copy, Default)]
@@ -54,8 +59,11 @@ struct GpuJobHeader {
 pub(super) struct ExtractedBrickBakes {
     headers: Vec<GpuJobHeader>,
     edits: Vec<edits::GpuEdit>,
-    /// Destination atlas tile index per job (drives the `copy_buffer_to_texture` origin).
+    /// Destination DISTANCE atlas tile index per job (drives the `copy_buffer_to_texture` origin).
     tiles: Vec<u32>,
+    /// Destination MATERIAL atlas tile index per job, or [`MAT_TILE_NONE`] for a single-material
+    /// brick (its material copy is skipped — it stores no material texels).
+    mat_tiles: Vec<u32>,
 }
 
 /// The bake compute pipeline + the storage buffers the dispatch writes (sized to the job
@@ -75,8 +83,10 @@ pub(super) struct SdfBakeBuffers {
     mat_buffer: Option<Buffer>,
     /// Number of jobs prepared this frame (workgroup dispatch count + copy loop bound).
     job_count: u32,
-    /// Destination atlas tiles for this frame's jobs (parallels the dispatch order).
+    /// Destination DISTANCE atlas tiles for this frame's jobs (parallels the dispatch order).
     tiles: Vec<u32>,
+    /// Destination MATERIAL atlas tiles ([`MAT_TILE_NONE`] = skip), parallel to `tiles`.
+    mat_tiles: Vec<u32>,
 }
 
 /// Extract this frame's GPU bake jobs from the main world into the render world, converting
@@ -92,6 +102,7 @@ pub(super) fn extract_brick_bakes(
     }
     let mut headers = Vec::with_capacity(pending.jobs.len());
     let mut tiles = Vec::with_capacity(pending.jobs.len());
+    let mut mat_tiles = Vec::with_capacity(pending.jobs.len());
     for j in &pending.jobs {
         headers.push(GpuJobHeader {
             coord: j.coord,
@@ -106,11 +117,13 @@ pub(super) fn extract_brick_bakes(
             _pad2: 0,
         });
         tiles.push(j.tile);
+        mat_tiles.push(j.mat_tile.unwrap_or(MAT_TILE_NONE));
     }
     commands.insert_resource(ExtractedBrickBakes {
         headers,
         edits: pending.edits.clone(),
         tiles,
+        mat_tiles,
     });
 }
 
@@ -128,6 +141,7 @@ pub(super) fn prepare_brick_bake_buffers(
     let n = extracted.headers.len() as u32;
     buffers.job_count = n;
     buffers.tiles = extracted.tiles.clone();
+    buffers.mat_tiles = extracted.mat_tiles.clone();
     if n == 0 {
         return;
     }
@@ -351,28 +365,37 @@ impl Node for SdfBrickBakeNode {
                 },
                 tile_extent,
             );
-            let mat_offset = (i as u32 * BAKE_MAT_TILE_U32) as u64 * 4;
-            encoder.copy_buffer_to_texture(
-                TexelCopyBufferInfo {
-                    buffer: mat_buf,
-                    layout: TexelCopyBufferLayout {
-                        offset: mat_offset,
-                        bytes_per_row: Some(BAKE_MAT_ROW_U32 * 4), // 512 bytes
-                        rows_per_image: Some(edge),
+            // Material: only MULTI-material jobs have a material tile — and it lives at its OWN origin
+            // in the separately-packed material atlas (a different page/row than the distance tile).
+            // Single-material jobs (`MAT_TILE_NONE`) store no material texels, so skip the copy.
+            let mat_tile = buffers.mat_tiles[i];
+            if mat_tile != MAT_TILE_NONE {
+                let mbase = chunk::tile_atlas_base(mat_tile);
+                let (mcol_px, mrow_px) = (mbase & 0xFFFF, mbase >> 16);
+                let (mpage, mlocal_y) = super::atlas_pages::split_row(mrow_px);
+                let mat_offset = (i as u32 * BAKE_MAT_TILE_U32) as u64 * 4;
+                encoder.copy_buffer_to_texture(
+                    TexelCopyBufferInfo {
+                        buffer: mat_buf,
+                        layout: TexelCopyBufferLayout {
+                            offset: mat_offset,
+                            bytes_per_row: Some(BAKE_MAT_ROW_U32 * 4), // 512 bytes
+                            rows_per_image: Some(edge),
+                        },
                     },
-                },
-                TexelCopyTextureInfo {
-                    texture: pages.mat_page(page),
-                    mip_level: 0,
-                    origin: Origin3d {
-                        x: col_px,
-                        y: local_y,
-                        z: 0,
+                    TexelCopyTextureInfo {
+                        texture: pages.mat_page(mpage),
+                        mip_level: 0,
+                        origin: Origin3d {
+                            x: mcol_px,
+                            y: mlocal_y,
+                            z: 0,
+                        },
+                        aspect: TextureAspect::All,
                     },
-                    aspect: TextureAspect::All,
-                },
-                tile_extent,
-            );
+                    tile_extent,
+                );
+            }
         }
 
         Ok(())

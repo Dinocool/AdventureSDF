@@ -216,6 +216,7 @@ fn raymarch(origin: vec3<f32>, dir: vec3<f32>, start_t: f32, q: MarchQuality) ->
                 scene.dist = coarse.dist;
                 scene.lod = coarse.lod;
                 scene.atlas_base = coarse.atlas_base;
+                scene.mat_atlas_base = coarse.mat_atlas_base;
                 scene.palette = coarse.palette;
             }
         }
@@ -302,7 +303,7 @@ fn raymarch(origin: vec3<f32>, dir: vec3<f32>, start_t: f32, q: MarchQuality) ->
             result.hit = true;
             result.dist = t_hit;
             result.object_id =
-                resolve_material(scene.atlas_base, hit_p, lod, scene.palette).id;
+                resolve_material(scene.mat_atlas_base, hit_p, lod, scene.palette).id;
             result.steps = steps;
             result.hit_pos = hit_p;
             result.fate = 0u;

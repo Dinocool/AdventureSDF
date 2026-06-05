@@ -365,6 +365,21 @@ fn bake_perf_stress_scene() {
     let resident = atlas.bricks.len();
     eprintln!("BAKE-PERF: cold bake settled — {resident} resident bricks");
 
+    // Material-tile reclamation histogram: only MULTI-material bricks own a material atlas tile, so
+    // this quantifies the VRAM win (single-material bricks store 0 material bytes). dist = R16Snorm
+    // (2 B/voxel), mat = Rgba16Snorm (8 B/voxel), 512 voxels/brick.
+    let multi = atlas.mat_tiles.len();
+    let single = resident.saturating_sub(multi);
+    let voxels = 512u64;
+    let dist_mb = resident as u64 * voxels * 2 / (1 << 20);
+    let mat_now_mb = multi as u64 * voxels * 8 / (1 << 20);
+    let mat_old_mb = resident as u64 * voxels * 8 / (1 << 20); // pre-reclamation (every brick)
+    let pct = if resident > 0 { single * 100 / resident } else { 0 };
+    eprintln!(
+        "BAKE-PERF [material-reclaim]: {single}/{resident} bricks single-material ({pct}%), {multi} multi \
+         | material VRAM {mat_old_mb} MB -> {mat_now_mb} MB (dist {dist_mb} MB unchanged)"
+    );
+
     // SMALL EDIT from the settled state at cam0 — nudge a cube near the camera and re-settle.
     let move_index = edits
         .iter()

@@ -63,6 +63,17 @@ impl TileAllocator {
         self.next
     }
 
+    /// Number of tiles currently assigned (live bricks holding a tile). Unlike [`Self::high_water`]
+    /// this excludes freed-but-not-reused slots, so it's the true count of occupied tiles (used by
+    /// the memory panel to report actual atlas footprint).
+    pub fn len(&self) -> usize {
+        self.tile_of.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.tile_of.is_empty()
+    }
+
     /// Assign (or return the existing) tile for `key`. Reuses a freed slot first.
     fn alloc(&mut self, key: BrickKey) -> u32 {
         if let Some(&t) = self.tile_of.get(&key) {
@@ -145,6 +156,10 @@ pub struct SdfAtlas {
     /// texels live in the atlas texture and survives across bakes so the GPU bake node
     /// targets the right sub-rect.
     pub tiles: TileAllocator,
+    /// Stable brick→MATERIAL-tile mapping, populated only for MULTI-material bricks (a separate,
+    /// densely-packed allocator so the material atlas sizes to the multi-material count, not the
+    /// whole resident set — single-material bricks, the common case, store no material tile).
+    pub mat_tiles: TileAllocator,
     /// Tiles whose texels the GPU compute bake fills this frame. The render world reads these
     /// so it knows which tiles the bake node will write; the CPU holds only a palette-only
     /// placeholder for them. Cleared each frame at the start of `schedule_bakes`.
@@ -165,6 +180,7 @@ impl Default for SdfAtlas {
             generation: 0,
             topology_generation: 0,
             tiles: TileAllocator::default(),
+            mat_tiles: TileAllocator::default(),
             gpu_baked_tiles: FxHashSet::default(),
             live_chunks: super::chunk::LiveChunkTables::default(),
         }
@@ -325,11 +341,26 @@ impl SdfAtlas {
         let is_new = self.bricks.insert(key, placeholder).is_none();
         if is_new || palette_changed {
             self.topology_generation = self.topology_generation.wrapping_add(1);
+            // Material tile: only MULTI-material bricks own a tile in the (separate, densely-packed)
+            // material atlas — single-material bricks store none and the reader uses palette[0]. Re-
+            // (de)allocate to match the new palette so a single<->multi flip on a re-bake frees or
+            // claims a material tile. Done inside the topology-change gate (a same-palette texel-only
+            // re-bake keeps its existing mat tile, queried by the caller via `mat_tiles.tile(key)`).
+            let mat_tile = if super::chunk::palette_is_multi(palette) {
+                Some(self.mat_tiles.alloc(key))
+            } else {
+                self.mat_tiles.release(&key);
+                None
+            };
             // Feed the incremental table. A re-bake that only changed texels (same key + palette +
             // tile) leaves the table untouched (no topology bump) — its texels upload separately.
             let (ck, local) = super::chunk::chunk_of(key, config);
-            self.live_chunks
-                .set_brick(ck, local, super::chunk::pack_brick_tile(tile, palette), config);
+            self.live_chunks.set_brick(
+                ck,
+                local,
+                super::chunk::pack_brick_tile(tile, mat_tile, palette),
+                config,
+            );
         }
         tile
     }
@@ -340,6 +371,8 @@ impl SdfAtlas {
     pub fn remove_brick(&mut self, key: &BrickKey, config: &super::SdfGridConfig) -> bool {
         if self.bricks.remove(key).is_some() {
             self.tiles.release(key);
+            // Release the material tile too (no-op for a single-material brick, which had none).
+            self.mat_tiles.release(key);
             // Eviction changes both the resident set and the GPU chunk tables. Bump BOTH
             // generations so the render world re-extracts (it gates on `generation`) and
             // rebuilds the lookup tables (gated on `topology_generation`). Missing the

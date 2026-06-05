@@ -75,14 +75,14 @@ impl PackedBuf {
 #[derive(Default)]
 pub(super) struct ChunkTableBuffers {
     directory: PackedBuf, // binding 2: dense per-LOD directory, 20-byte ChunkLookup rows
-    tiles: PackedBuf,     // binding 11: packed tile-runs, 12-byte BrickTile records
+    tiles: PackedBuf,     // binding 11: packed tile-runs, 16-byte BrickTile records
 }
 
 impl ChunkTableBuffers {
     pub(super) fn new(device: &RenderDevice) -> Self {
         Self {
             directory: PackedBuf::new_dummy(device, "sdf_chunk_lookup_buffer", 20),
-            tiles: PackedBuf::new_dummy(device, "sdf_chunk_tile_buffer", 12),
+            tiles: PackedBuf::new_dummy(device, "sdf_chunk_tile_buffer", 16),
         }
     }
 
@@ -118,12 +118,12 @@ impl ChunkTableBuffers {
         tile_run: &[chunk::BrickTile],
         cap_slots: u32,
     ) {
-        let mut bytes = Vec::with_capacity(tile_run.len() * 12);
+        let mut bytes = Vec::with_capacity(tile_run.len() * 16);
         for b in tile_run {
             encode_tile(b, &mut bytes);
         }
         let cap = cap_slots.max(chunk::TILE_RUN_SLOT) as usize;
-        self.tiles.rebuild(device, &bytes, cap, &[0u8; 12]);
+        self.tiles.rebuild(device, &bytes, cap, &[0u8; 16]);
     }
 
     /// In-place directory row deltas. A structural change marks a contiguous suffix dirty, so
@@ -159,7 +159,7 @@ impl ChunkTableBuffers {
         queue: &RenderQueue,
         region_updates: &[(u32, Vec<chunk::BrickTile>)],
     ) {
-        let mut bytes = Vec::with_capacity(chunk::TILE_RUN_SLOT as usize * 12);
+        let mut bytes = Vec::with_capacity(chunk::TILE_RUN_SLOT as usize * 16);
         for (slot, region) in region_updates {
             bytes.clear();
             for b in region {
@@ -179,9 +179,10 @@ fn encode_lookup(c: &chunk::ChunkLookup, out: &mut Vec<u8>) {
     out.extend_from_slice(&c.tile_run_base.to_le_bytes());
 }
 
-/// 12-byte std430 encoding of one tile-run brick record.
+/// 16-byte std430 encoding of one tile-run brick record (dist origin, mat origin, palette).
 fn encode_tile(b: &chunk::BrickTile, out: &mut Vec<u8>) {
     out.extend_from_slice(&b.atlas_base.to_le_bytes());
+    out.extend_from_slice(&b.mat_atlas_base.to_le_bytes());
     out.extend_from_slice(&b.pal01.to_le_bytes());
     out.extend_from_slice(&b.pal23.to_le_bytes());
 }
