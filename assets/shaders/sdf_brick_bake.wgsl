@@ -5,7 +5,7 @@
 // per-voxel CSG eval — the work that tanked the framerate on the main thread — and writes
 // each brick's 512 distance + 512×4 material texels.
 //
-// It does NOT write the atlas textures directly: R16Snorm / Rgba8Snorm are not WGSL
+// It does NOT write the atlas textures directly: R16Snorm / Rgba16Snorm are not WGSL
 // storage formats. Instead it writes two storage BUFFERS in the exact byte layout the atlas
 // textures expect, and the bake node `copy_buffer_to_texture`s each tile's sub-rect into the
 // persistent atlas — leaving the fragment reader's formats and sampling path untouched.
@@ -47,7 +47,7 @@ struct JobHeader {
 // Distance output. Two R16 snorm texels per u32 (low = even x, high = odd x). Rows padded to
 // DIST_ROW_U32 (= 256-byte copy alignment); only the first 32 u32 of each row carry data.
 @group(0) @binding(2) var<storage, read_write> dist_out: array<u32>;
-// Material output. One Rgba8Snorm texel = 1 u32 (r | g<<8 | b<<16 | a<<24).
+// Material output. One Rgba16Snorm texel = 2 u32 (u32_0 = r|g<<16, u32_1 = b|a<<16).
 @group(0) @binding(3) var<storage, read_write> mat_out: array<u32>;
 
 const EDGE: u32 = 8u;            // voxels per brick edge
@@ -55,8 +55,8 @@ const TILE_W: u32 = 64u;         // tile pixel width  (u = y*EDGE + x, 0..63)
 const TILE_H: u32 = 8u;          // tile pixel height (v = z, 0..7)
 const DIST_ROW_U32: u32 = 64u;   // padded to 256 bytes (32 real + 32 pad)
 const DIST_TILE_U32: u32 = DIST_ROW_U32 * TILE_H;  // 512
-const MAT_ROW_U32: u32 = TILE_W;                   // 64 u32 = 256 bytes (Rgba8Snorm, 1 u32/texel; aligned)
-const MAT_TILE_U32: u32 = MAT_ROW_U32 * TILE_H;    // 512
+const MAT_ROW_U32: u32 = TILE_W * 2u;              // 128 (no pad: 512 bytes, already aligned)
+const MAT_TILE_U32: u32 = MAT_ROW_U32 * TILE_H;    // 1024
 
 const PALETTE_K: u32 = 4u;
 const PALETTE_EMPTY: u32 = 0xffffu;
@@ -285,15 +285,6 @@ fn snorm_bits(v: f32) -> u32 {
     return u32(q) & 0xffffu;
 }
 
-// Pack a vec4 of [-1,1] values into one Rgba8Snorm texel (r | g<<8 | b<<16 | a<<24), each i8.
-fn snorm8_bits(v: f32) -> u32 {
-    let q = i32(clamp(v, -1.0, 1.0) * 127.0);     // trunc toward 0, matches `as i8`
-    return u32(q) & 0xffu;
-}
-fn pack_mat_rgba8(v: vec4<f32>) -> u32 {
-    return snorm8_bits(v.x) | (snorm8_bits(v.y) << 8u) | (snorm8_bits(v.z) << 16u) | (snorm8_bits(v.w) << 24u);
-}
-
 fn palette_id(pal01: u32, pal23: u32, slot: u32) -> u32 {
     switch (slot) {
         case 0u: { return pal01 & 0xffffu; }
@@ -372,7 +363,7 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid
         let row = z * DIST_ROW_U32 + (y * 4u + p);   // u/2 = (y*8 + 2p)/2 = y*4 + p
         dist_out[dist_base + row] = snorm_bits(de) | (snorm_bits(do_) << 16u);
 
-        // Material: one Rgba8Snorm texel (1 u32) per voxel, fixed ±1.0 band. Uniform bricks
+        // Material: one Rgba16Snorm texel (2 u32) per voxel, fixed ±1.0 band. Uniform bricks
         // skip the per-edit eval and store the slot-0-owns sentinel (never read — see above).
         var se: vec4<f32>;
         var so: vec4<f32>;
@@ -385,7 +376,11 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid
         }
         let ue = y * EDGE + x_even;   // tile-local u for even x
         let uo = y * EDGE + x_odd;
-        mat_out[mat_base + z * MAT_ROW_U32 + ue] = pack_mat_rgba8(se);
-        mat_out[mat_base + z * MAT_ROW_U32 + uo] = pack_mat_rgba8(so);
+        let mi_e = z * MAT_ROW_U32 + ue * 2u;
+        let mi_o = z * MAT_ROW_U32 + uo * 2u;
+        mat_out[mat_base + mi_e]      = snorm_bits(se.x) | (snorm_bits(se.y) << 16u);
+        mat_out[mat_base + mi_e + 1u] = snorm_bits(se.z) | (snorm_bits(se.w) << 16u);
+        mat_out[mat_base + mi_o]      = snorm_bits(so.x) | (snorm_bits(so.y) << 16u);
+        mat_out[mat_base + mi_o + 1u] = snorm_bits(so.z) | (snorm_bits(so.w) << 16u);
     }
 }
