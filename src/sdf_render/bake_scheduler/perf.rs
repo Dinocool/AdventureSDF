@@ -374,7 +374,7 @@ fn bake_perf_stress_scene() {
     let dist_mb = resident as u64 * voxels * 2 / (1 << 20);
     let mat_now_mb = multi as u64 * voxels * 8 / (1 << 20);
     let mat_old_mb = resident as u64 * voxels * 8 / (1 << 20); // pre-reclamation (every brick)
-    let pct = if resident > 0 { single * 100 / resident } else { 0 };
+    let pct = (single * 100).checked_div(resident).unwrap_or(0);
     eprintln!(
         "BAKE-PERF [material-reclaim]: {single}/{resident} bricks single-material ({pct}%), {multi} multi \
          | material VRAM {mat_old_mb} MB -> {mat_now_mb} MB (dist {dist_mb} MB unchanged)"

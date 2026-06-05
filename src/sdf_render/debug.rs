@@ -94,7 +94,7 @@ impl Plugin for SdfDebugPlugin {
             .register_type::<ChunkDebugState>()
             .add_systems(
                 Update,
-                update_atlas_stats.run_if(in_state(AppScene::SdfEditor)),
+                (update_atlas_stats, sync_gradient_bake_flag).run_if(in_state(AppScene::SdfEditor)),
             );
 
         // Gizmo-drawing systems need GizmoPlugin's Assets<GizmoAsset>; absent under
@@ -262,6 +262,16 @@ fn register_shader_modes(app: &mut App) {
         description: "Convex-edge wear from the edge map (2 extra texture taps per hit pixel)"
             .into(),
     });
+    registry.register(ShaderDebugMode {
+        id: "sdf/grad_normals".into(),
+        label: "Gradient normals".into(),
+        shader_define: "SDF_GRAD_NORMALS".into(),
+        kind: DebugModeKind::Toggle,
+        description: "Shade normals from the baked per-voxel gradient atlas (1 fetch vs the 5-tap \
+            finite difference — sharper + cheaper). Enabling bakes the gradient atlas (extra VRAM), \
+            so toggling triggers a one-time re-bake."
+            .into(),
+    });
     // Note: height-map relief is baked into the SDF field (see sdf_render::height) — no shader
     // toggle. Strength is the per-material "Relief depth" (Inspect panel).
 
@@ -271,6 +281,18 @@ fn register_shader_modes(app: &mut App) {
     {
         let mut state = app.world_mut().resource_mut::<ShaderDebugState>();
         state.set("sdf/shadows", true);
+    }
+}
+
+/// Drive the per-voxel gradient bake from the gradient-feature toggles. When `SDF_GRAD_NORMALS`
+/// (or, later, `SDF_SHARP_CREASES`) flips, set `SdfAtlas::bake_gradient` and force a full re-bake so
+/// every resident brick (re)fills — or stops filling — the gradient atlas. Editor-only; in a
+/// non-editor build the flag stays false and the gradient atlas costs nothing.
+fn sync_gradient_bake_flag(state: Res<ShaderDebugState>, mut atlas: ResMut<SdfAtlas>) {
+    let want = state.is_active("sdf/grad_normals");
+    if atlas.bake_gradient != want {
+        atlas.bake_gradient = want;
+        atlas.rebake_all = true;
     }
 }
 

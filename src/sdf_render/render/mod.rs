@@ -317,9 +317,10 @@ fn atlas_bind_group_1(
 ) -> BindGroup {
     let tex_views = gpu_atlas.tex_array_views.as_ref().unwrap();
     let pages = gpu_atlas.pages.as_ref().unwrap();
-    // Live page views + dummy fill to ATLAS_MAX_PAGES, bound as the `binding_array`s at 0 and 3.
+    // Live page views + dummy fill to ATLAS_MAX_PAGES, bound as the `binding_array`s at 0, 3, 12.
     let dist_refs = pages.dist_refs();
     let mat_refs = pages.mat_refs();
+    let grad_refs = pages.grad_refs();
     device.create_bind_group(
         label,
         layout,
@@ -336,6 +337,7 @@ fn atlas_bind_group_1(
             &tex_views[3],
             &tex_views[4],
             gpu_atlas.tables.tile_buffer().as_entire_buffer_binding(),
+            &grad_refs[..],
         )),
     )
 }
@@ -1278,6 +1280,11 @@ fn init_sdf_pipeline(
                 texture_2d_array(TextureSampleType::Float { filterable: true }),
                 // binding 11: packed per-chunk brick tile runs
                 storage_buffer_read_only::<atlas_upload::GpuBrickTile>(false),
+                // binding 12: per-voxel gradient atlas — PAGED `binding_array` (Rgba8Snorm pages).
+                // Always present in the layout; the shader only samples it under SDF_GRAD_NORMALS /
+                // SDF_SHARP_CREASES, and the pool is dummy-filled when the feature is off.
+                texture_2d(TextureSampleType::Float { filterable: false })
+                    .count(core::num::NonZero::new(atlas_pages::ATLAS_MAX_PAGES).unwrap()),
             ),
         ),
     );
