@@ -40,7 +40,10 @@ fn compose_bake() -> naga::Module {
 
 const DIST_ROW_U32: u32 = 64;
 const DIST_TILE_U32: u32 = DIST_ROW_U32 * 8;
-const MAT_TILE_U32: u32 = 128 * 8;
+// Material tile: Rgba8Snorm, 1 u32/texel, 64 u32/row (= 256 bytes) × 8 rows. Mirrors the bake
+// shader's `MAT_TILE_U32` and `render::bake::BAKE_MAT_TILE_U32`.
+const MAT_ROW_U32: u32 = 64;
+const MAT_TILE_U32: u32 = MAT_ROW_U32 * 8;
 
 // Mirror of bake_scheduler::GpuJobHeader upload order (48 bytes, 12 u32).
 fn header_bytes(coord: IVec3, voxel_size: f32, dist_band: f32, edit_count: u32) -> Vec<u8> {
@@ -465,6 +468,242 @@ fn gpu_bake_copy_to_atlas_texture_roundtrips() {
         }
     }
     eprintln!("GPU bake→texture roundtrip OK: max_err={max_err}");
+}
+
+/// As [`header_bytes`] but with an explicit material palette (pal01/pal23), so the bake's
+/// per-palette-slot material eval can be driven with more than one material.
+fn header_bytes_pal(
+    coord: IVec3,
+    voxel_size: f32,
+    dist_band: f32,
+    edit_count: u32,
+    pal: [u16; 4],
+) -> Vec<u8> {
+    let mut b = Vec::with_capacity(48);
+    b.extend_from_slice(&coord.x.to_le_bytes());
+    b.extend_from_slice(&coord.y.to_le_bytes());
+    b.extend_from_slice(&coord.z.to_le_bytes());
+    b.extend_from_slice(&voxel_size.to_le_bytes());
+    b.extend_from_slice(&dist_band.to_le_bytes());
+    b.extend_from_slice(&0u32.to_le_bytes()); // edit_start
+    b.extend_from_slice(&edit_count.to_le_bytes());
+    b.extend_from_slice(&((pal[0] as u32) | ((pal[1] as u32) << 16)).to_le_bytes()); // pal01
+    b.extend_from_slice(&((pal[2] as u32) | ((pal[3] as u32) << 16)).to_le_bytes()); // pal23
+    b.extend_from_slice(&0u32.to_le_bytes()); // pad
+    b.extend_from_slice(&0u32.to_le_bytes());
+    b.extend_from_slice(&0u32.to_le_bytes());
+    b
+}
+
+/// Bake a TWO-material brick, copy the material buffer into an `Rgba8Snorm` atlas texture exactly
+/// as the live bake node does, read the texture back, and assert the per-voxel argmin material id
+/// matches the analytic nearest of the two spheres. Proves the Phase-2b 8-bit material pack
+/// (`snorm8_bits`/`pack_mat_rgba8`), the `Rgba8Snorm` 256-byte-row copy, and the per-palette-slot
+/// material path end-to-end. (The single-material sphere tests cover only the distance atlas.)
+#[test]
+fn gpu_bake_material_atlas_rgba8_roundtrips() {
+    let Some((device, queue)) = device_queue() else {
+        eprintln!("no GPU adapter — skipping");
+        return;
+    };
+    use wgpu::util::DeviceExt;
+
+    let cfg = SdfGridConfig::default();
+    let lod = 0u32;
+    let voxel_size = cfg.voxel_size_at(lod);
+    let band = dist_band_world(&cfg, lod);
+
+    // Two overlapping spheres with DISTINCT material ids, offset in ±x so material splits across x.
+    let (ca, ra) = (Vec3::new(-0.2, 0.0, 0.0), 0.35f32);
+    let (cb, rb) = (Vec3::new(0.2, 0.0, 0.0), 0.35f32);
+    let ea = ResolvedEdit::new(
+        SdfPrimitive::Sphere { radius: ra },
+        bevy::prelude::Transform::from_translation(ca),
+        SdfOp::default(),
+        1,
+    );
+    let eb = ResolvedEdit::new(
+        SdfPrimitive::Sphere { radius: rb },
+        bevy::prelude::Transform::from_translation(cb),
+        SdfOp::default(),
+        2,
+    );
+    let pal = [1u16, 2, 0xffff, 0xffff]; // densely filled from slot 0 (build_palette invariant)
+    let coord = cfg.world_to_brick_lod(Vec3::ZERO, lod);
+
+    let module = compose_bake();
+    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("bake"),
+        source: wgpu::ShaderSource::Naga(Cow::Owned(module)),
+    });
+    let header_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("headers"),
+        contents: &header_bytes_pal(coord, voxel_size, band, 2, pal),
+        usage: wgpu::BufferUsages::STORAGE,
+    });
+    let mut edit_data = edit_bytes(&to_gpu_edit(&ea));
+    edit_data.extend_from_slice(&edit_bytes(&to_gpu_edit(&eb)));
+    let edit_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("edits"),
+        contents: &edit_data,
+        usage: wgpu::BufferUsages::STORAGE,
+    });
+    let dist_buf = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("dist_out"),
+        size: (DIST_TILE_U32 * 4) as u64,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        mapped_at_creation: false,
+    });
+    let mat_buf = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("mat_out"),
+        size: (MAT_TILE_U32 * 4) as u64,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        mapped_at_creation: false,
+    });
+    let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: None,
+        entries: &[
+            storage_entry(0, true),
+            storage_entry(1, true),
+            storage_entry(2, false),
+            storage_entry(3, false),
+        ],
+    });
+    let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: None,
+        bind_group_layouts: &[&layout],
+        push_constant_ranges: &[],
+    });
+    let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+        label: None,
+        layout: Some(&pl),
+        module: &shader,
+        entry_point: Some("main"),
+        compilation_options: Default::default(),
+        cache: None,
+    });
+    let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: None,
+        layout: &layout,
+        entries: &[
+            bind(0, &header_buf),
+            bind(1, &edit_buf),
+            bind(2, &dist_buf),
+            bind(3, &mat_buf),
+        ],
+    });
+
+    let edge = BRICK_EDGE as u32; // 8
+    let tile_w = edge * edge; // 64
+    let mat_tex = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("atlas_rgba8snorm"),
+        size: wgpu::Extent3d { width: tile_w, height: edge, depth_or_array_layers: 1 },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8Snorm,
+        usage: wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::COPY_SRC,
+        view_formats: &[],
+    });
+
+    let mut enc = device.create_command_encoder(&Default::default());
+    {
+        let mut pass = enc.begin_compute_pass(&Default::default());
+        pass.set_pipeline(&pipeline);
+        pass.set_bind_group(0, &bg, &[]);
+        pass.dispatch_workgroups(1, 1, 1);
+    }
+    let row_bytes = MAT_ROW_U32 * 4; // 64 texels × 4 B = 256 (aligned)
+    enc.copy_buffer_to_texture(
+        wgpu::TexelCopyBufferInfo {
+            buffer: &mat_buf,
+            layout: wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(row_bytes),
+                rows_per_image: Some(edge),
+            },
+        },
+        wgpu::TexelCopyTextureInfo {
+            texture: &mat_tex,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        wgpu::Extent3d { width: tile_w, height: edge, depth_or_array_layers: 1 },
+    );
+    let rb_buf = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("mat_readback"),
+        size: (row_bytes * edge) as u64,
+        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    enc.copy_texture_to_buffer(
+        wgpu::TexelCopyTextureInfo {
+            texture: &mat_tex,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        wgpu::TexelCopyBufferInfo {
+            buffer: &rb_buf,
+            layout: wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(row_bytes),
+                rows_per_image: Some(edge),
+            },
+        },
+        wgpu::Extent3d { width: tile_w, height: edge, depth_or_array_layers: 1 },
+    );
+    queue.submit([enc.finish()]);
+
+    let slice = rb_buf.slice(..);
+    slice.map_async(wgpu::MapMode::Read, |_| {});
+    device.poll(wgpu::PollType::wait_indefinitely()).ok();
+    let data = slice.get_mapped_range().to_vec();
+
+    let mut checked = 0u32;
+    for z in 0..edge {
+        let row = &data[(z * row_bytes) as usize..((z * row_bytes) + tile_w * 4) as usize];
+        let texels: &[i8] = bytemuck::cast_slice(row);
+        for y in 0..edge {
+            for x in 0..edge {
+                let u = (y * edge + x) as usize; // 0..63
+                let s = [
+                    texels[u * 4] as f32 / 127.0,
+                    texels[u * 4 + 1] as f32 / 127.0,
+                    texels[u * 4 + 2] as f32 / 127.0,
+                    texels[u * 4 + 3] as f32 / 127.0,
+                ];
+                let world = Vec3::new(
+                    (coord.x + x as i32) as f32,
+                    (coord.y + y as i32) as f32,
+                    (coord.z + z as i32) as f32,
+                ) * voxel_size;
+                let da = (world - ca).length() - ra;
+                let db = (world - cb).length() - rb;
+                // Only assert where the nearest is inside the ±1 material band and the two are
+                // clearly separated (> ~2 snorm8 LSBs), avoiding boundary ties / clamped slots.
+                if da.min(db).abs() >= 0.9 || (da - db).abs() <= 3.0 / 127.0 {
+                    continue;
+                }
+                let mut best = 0usize;
+                for k in 1..4 {
+                    if s[k] < s[best] {
+                        best = k;
+                    }
+                }
+                let gpu_id = pal[best];
+                let expected = if da <= db { 1u16 } else { 2u16 };
+                assert_eq!(
+                    gpu_id, expected,
+                    "voxel ({x},{y},{z}) world={world:?}: da={da} db={db} slots={s:?} gpu_id={gpu_id} expected={expected}"
+                );
+                checked += 1;
+            }
+        }
+    }
+    assert!(checked > 32, "too few clearly-separated voxels checked ({checked}) — geometry degenerate");
+    eprintln!("GPU material Rgba8Snorm roundtrip OK: {checked} voxels");
 }
 
 fn storage_entry(binding: u32, read_only: bool) -> wgpu::BindGroupLayoutEntry {
