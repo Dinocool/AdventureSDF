@@ -32,8 +32,12 @@ editor frame, user-triggered). Both auto-export the same `BASE/*.xls` that `pars
 3. Build **static, with shader debug info**:
    `cargo build --no-default-features --features editor,shader-debug`. `--no-default-features`
    drops `fast`/dynamic_linking (Nsight's injector can't attach to a dynamically-linked Bevy —
-   see Gotchas); `shader-debug` enables wgpu `InstanceFlags::DEBUG` → naga `OpLine` (needed for
-   per-line; per-pass timing works without it).
+   see Gotchas); `shader-debug` enables wgpu `InstanceFlags::DEBUG` **AND** pulls
+   `bevy_render/decoupled_naga` (both needed) → naga emits SPIR-V `OpSource` (embedded composed
+   WGSL) + `OpLine` (line mapping). Per-pass timing works without it; per-WGSL-line **source**
+   needs it. (Before decoupled_naga, Bevy handed wgpu a bare `Naga` module with an empty source
+   string, so naga emitted *neither* OpSource nor OpLine regardless of the DEBUG flag — wgpu
+   Discussion #7761. That's why earlier `shader-debug` captures had no source mapping.)
 
 ### Capture + parse (I run these)
 ```sh
@@ -70,6 +74,25 @@ The SDF passes to look for: **`sdf_brick_bake`** (compute, only on frames with b
 **`sdf_combine_pass`** (deferred lit). Shader sources: `assets/shaders/sdf_raymarch.wgsl` →
 `sdf/march.wgsl` (the loop) + `sdf/brick.wgsl` (field eval) for the gbuffer pass.
 
+### Richer per-marker metrics — the vendored analyzer
+`parse.py` gives the per-pass table; for a **per-marker bottleneck verdict + 120+ metrics** use the
+vendored [`nsight-graphics-analyzer`](rdoc/scripts/ngfx/analyzer/VENDORED.md) (MIT, stdlib-only).
+It reads the **same `BASE/*.xls` bundle** `capture.ps1` already exported (it can't parse the
+`.ngfx-gputrace` binary — NVIDIA dropped the offline parser in 2026.1), so no re-capture needed:
+```sh
+NS=rdoc/scripts/ngfx/analyzer/nsight.py ; TR=.soul/ngfx/<capture>.ngfx-gputrace
+python $NS gputrace              "$TR"                                 # summary/stages/actions JSON
+python $NS gputrace-shader-bound "$TR" --in-marker sdf_probe_trace     # SM/occupancy diagnosis, scoped
+python $NS gputrace-metric       "$TR" --name <regex> --in-marker <pass>  # drill ANY metric, per-marker
+```
+The decisive occupancy signals it surfaces (per marker): **`cs_warps_active`** (compute warp
+occupancy as % of peak — single digits = severe register starvation), `sm_throughput`,
+`warps_inactive_sm_active`, the ALU/FMA/XU pipe mix, and `texin_cycles_stalled_on_tsl1_miss`
+(texture-cache stalls). Example verdict that settled an occupancy-vs-split debate: the probe trace
+at `cs_warps_active 1.98%`, all pipes <5%, texture stall 0.06% → purely **occupancy-starved**
+(register-limited), not memory- or pipe-bound. (`gputrace-stalls` is frame-level idle; it reports
+0% coverage here because our markers are D3DPERF spans, not NVTX ranges.)
+
 ### Interpreting bottlenecks
 - `bottleneck=SM` **with low `sm_throughput_pct`** (e.g. 20%) → **occupancy / latency bound**,
   NOT ALU-throughput bound. The SMs are stalling (memory latency, warp divergence in the
@@ -86,15 +109,21 @@ The SDF passes to look for: **`sdf_brick_bake`** (compute, only on frames with b
 step/inst counts per pass. `--set-gpu-clocks base` (in `capture.ps1`) locks clocks so numbers
 are comparable across runs.
 
-### Per-WGSL-line cost — Nsight UI ONLY (headless ruled out 2026-06-02)
-The `.ngfx-gputrace` binary holds the source-level shader profiler (PC sampling mapped to WGSL
-lines via the `shader-debug` OpLine info), but there is **no headless path** to it (verified):
-`--auto-export` writes only the regime/frame `BASE/*.xls`; the GPU-Trace CLI has **no
-shader-source export flag**; the report is a proprietary `WRPV` binary with the source mapping
-encoded (no plain-text WGSL to scrape); side tools `ngfx-replay`/`CrashReporter` don't export it.
-So per-line is **UI-only**: open the `.ngfx-gputrace` in `ngfx-ui.exe` → **Shader Profiler /
-Shader Source** view, pick the pass's shader. To feed it back to me, **right-click the table →
-Export to CSV** (then I parse it) or screenshot the per-line column.
+### Per-WGSL-line cost — source mapping WORKS (with decoupled_naga); export is one GUI click
+With the `shader-debug` build (now incl. `decoupled_naga`, see prereq 3) the `.ngfx-gputrace`
+embeds the composed WGSL (`OpSource`) + line mapping (`OpLine`), so Nsight's Shader Profiler shows
+real per-line WGSL cost — **registers, samples, and stall reasons per line** (this is what was
+broken before: no decoupled_naga → no OpSource/OpLine at all). The **capture** is headless; only
+the per-line **export** is a GUI click — there's no CLI shader-source export flag (verified;
+`--auto-export` writes only the per-pass `BASE/*.xls`, the report is a proprietary `WRPV` binary).
+
+Workflow: open the `.ngfx-gputrace` in `ngfx-ui.exe` → **Shader Profiler / Shader Source** for the
+hot pass → **right-click the table → Export to CSV** → hand me the CSV. I parse it with
+`python rdoc/scripts/ngfx/shader_lines.py <export>.csv`, which reconstructs the embedded WGSL,
+maps each SPIR-V instruction back to its `OpLine` WGSL line, and ranks lines by **GPU samples**
+(time) and **peak Live Registers** (the occupancy limiter). Note: `Samples` is 0 on a settled/idle
+frame (e.g. a dormant probe pass) — capture an **actively-converging** frame (low `-Frames`, e.g.
+90) for time; `Live Registers` is present regardless and pinpoints what's pinning occupancy.
 
 Fully-headless alternative — **ablation A/B**: attribute cost to march REGIONS (not lines) by
 gating suspected hot blocks behind shader `#define`s (the field already has
@@ -137,5 +166,13 @@ python + `perfetto`): `hotspots.py`, `frames.py [--steady]`, `span.py <name>`,
 
 ## Keeping this current
 The toolkit lives in `rdoc/scripts/ngfx/` (git-tracked); captures land in `.soul/ngfx/`
-(gitignored). When a new ngfx flag, export field, or interpretation recipe is learned, ADD it
-here and extend `parse.py`.
+(gitignored):
+- `capture.ps1` — headless GPU-Trace capture + auto-export.
+- `parse.py` — quick per-pass table → `perf.json`.
+- `analyzer/` — vendored `nsight-graphics-analyzer` (per-marker metrics + bottleneck verdicts;
+  update per `analyzer/VENDORED.md`, don't edit the vendored files).
+- `shader_lines.py` — parse a GUI-exported Shader-Profiler CSV → hot WGSL lines (samples + live
+  registers).
+
+When a new ngfx flag, export field, or interpretation recipe is learned, ADD it here and extend
+`parse.py`.

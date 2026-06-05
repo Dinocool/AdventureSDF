@@ -82,8 +82,9 @@ fn load_renderdoc() {
 /// texture formats — `TEXTURE_FORMAT_16BIT_NORM` is required for the R16Snorm / Rgba16Snorm
 /// SDF distance atlases AND the 3D R16Snorm distance-clipmap volume, else those
 /// `create_texture` calls fail validation. With `shader-debug`, also turn on wgpu
-/// `InstanceFlags::DEBUG` so naga emits `OpLine`/`OpSource` and an Nsight GPU-Trace can
-/// correlate sampled cost to WGSL source lines.
+/// `InstanceFlags::DEBUG` so naga emits `OpLine` (SPIR-V line-number debug info) and an Nsight
+/// GPU-Trace can correlate sampled cost to WGSL line NUMBERS. (Bevy/wgpu do NOT emit `OpSource`,
+/// so there's no inline source view — map the line numbers to the `.wgsl` by hand. See Cargo.toml.)
 fn wgpu_settings() -> WgpuSettings {
     let settings = WgpuSettings {
         features: WgpuFeatures::TEXTURE_COMPRESSION_BC
