@@ -176,7 +176,6 @@ fn sdf_debug_modes_validate() {
         "SDF_DEBUG_LOD",
         "SDF_DEBUG_STEP_COUNT",
         "SDF_GRAD_NORMALS",
-        "SDF_SHARP_CREASES",
     ] {
         validate_composed_sdf_with_defs(&[def]).unwrap_or_else(|e| panic!("{e}"));
     }

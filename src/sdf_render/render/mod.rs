@@ -54,7 +54,7 @@ struct SdfCameraData {
     /// frame's screen for the SSR reflection path.
     prev_clip_from_world: Mat4,
     camera_pos: Vec4,
-    screen_params: Vec4, // xy = screen_size; z = crease_threshold; w = shadow LOD floor (u32)
+    screen_params: Vec4, // xy = screen_size; zw unused (was surface_bias — iso-offset removed)
     grid_origin: Vec4,   // xyz = grid origin, w = voxel_size
     grid_dims: Vec4, // z = brick_size (8.0); x/y/w unused (chunk count = arrayLength(&chunk_buf))
     debug_params: Vec4, // x = max_steps, y = max_dist, z = sdf_eps, w = unused
@@ -931,12 +931,11 @@ fn prepare_sdf_camera_data(
             clip_from_world,
             prev_clip_from_world,
             camera_pos: transform.translation.extend(0.0),
-            // z = crease threshold (SDF_SHARP_CREASES); w = shadow LOD floor (the "Shadow detail"
-            // slider; read as u32 by `shadow_lod_bias()`).
+            // z unused; w = shadow LOD floor (the "Shadow detail" slider; read as u32 by `shadow_lod_bias()`).
             screen_params: Vec4::new(
                 size.x as f32,
                 size.y as f32,
-                raymarch.crease_threshold,
+                0.0,
                 raymarch.shadow_lod_bias as f32,
             ),
             grid_origin: Vec4::new(
@@ -1282,8 +1281,8 @@ fn init_sdf_pipeline(
                 // binding 11: packed per-chunk brick tile runs
                 storage_buffer_read_only::<atlas_upload::GpuBrickTile>(false),
                 // binding 12: per-voxel gradient atlas — PAGED `binding_array` (Rgba8Snorm pages).
-                // Always present in the layout; the shader only samples it under SDF_GRAD_NORMALS /
-                // SDF_SHARP_CREASES, and the pool is dummy-filled when the feature is off.
+                // Always present in the layout; the shader only samples it under SDF_GRAD_NORMALS,
+                // and the pool is dummy-filled when the feature is off.
                 texture_2d(TextureSampleType::Float { filterable: false })
                     .count(core::num::NonZero::new(atlas_pages::ATLAS_MAX_PAGES).unwrap()),
             ),

@@ -164,11 +164,11 @@ pub struct SdfAtlas {
     /// so it knows which tiles the bake node will write; the CPU holds only a palette-only
     /// placeholder for them. Cleared each frame at the start of `schedule_bakes`.
     pub gpu_baked_tiles: FxHashSet<u32>,
-    /// Whether the per-voxel gradient atlas is baked (the sharp-crease / 1-fetch-normal feature is
-    /// enabled). Gated to avoid the standing VRAM cost when off. The editor sets it from the
-    /// `SDF_GRAD_NORMALS`/`SDF_SHARP_CREASES` toggles and forces `rebake_all` on a change so every
-    /// resident brick (re)fills (or stops filling) the gradient atlas. Read by the render extract to
-    /// size the gradient page pool (0 rows when off).
+    /// Whether the per-voxel gradient atlas is baked (the gradient-normals feature is enabled).
+    /// Gated to avoid the standing VRAM cost when off. The editor sets it from the `SDF_GRAD_NORMALS`
+    /// toggle and forces `rebake_all` on a change so every resident brick (re)fills (or stops
+    /// filling) the gradient atlas. Read by the render extract to size the gradient page pool (0 rows
+    /// when off).
     pub bake_gradient: bool,
     /// Incrementally-maintained chunk lookup + tile-run table. `insert_gpu_brick` / `remove_brick`
     /// update it inline so the render world uploads only the chunks that changed each frame
