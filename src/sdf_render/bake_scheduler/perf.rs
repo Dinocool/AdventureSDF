@@ -380,6 +380,32 @@ fn bake_perf_stress_scene() {
          | material VRAM {mat_old_mb} MB -> {mat_now_mb} MB (dist {dist_mb} MB unchanged)"
     );
 
+    // LOD-RESIDENCY DEPTH: how many LODs cover each resident brick's region — the "redundant stack"
+    // indicator the `{native, native+1}` shell targets. Pre-shell, a near surface was resident at up
+    // to `lod_count` LODs (the full stack); the shell drops that to ~2 (+1 boundary slack), so ~8×
+    // fewer redundant bakes per near surface. Sampled — the stress atlas is huge.
+    {
+        let sample: Vec<atlas::BrickKey> = atlas.bricks.keys().take(20_000).copied().collect();
+        let (mut sum, mut max) = (0u64, 0u32);
+        for key in &sample {
+            let bw = cfg.brick_world_size(key.lod);
+            let center = cfg.brick_min_world(key.coord, key.lod) + Vec3::splat(0.5 * bw);
+            let n = (0..cfg.lod_count)
+                .filter(|&l| atlas.bricks.contains_key(&atlas::BrickKey::new(l, cfg.world_to_brick_lod(center, l))))
+                .count() as u32;
+            sum += u64::from(n);
+            max = max.max(n);
+        }
+        let mean = if sample.is_empty() { 0.0 } else { sum as f64 / sample.len() as f64 };
+        eprintln!(
+            "BAKE-PERF [lod-residency]: resident LODs/region mean={mean:.2} max={max} over {} sampled bricks \
+             (shell target ~{}; full stack would be lod_count={})",
+            sample.len(),
+            cfg.overlap_depth + 1,
+            cfg.lod_count
+        );
+    }
+
     // SMALL EDIT from the settled state at cam0 — nudge a cube near the camera and re-settle.
     let move_index = edits
         .iter()

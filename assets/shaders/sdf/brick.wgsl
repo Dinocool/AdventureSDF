@@ -129,6 +129,18 @@ fn brick_in_chunk(chunk: ChunkLookup, coord: vec3<i32>) -> BrickLocation {
     return BrickLocation(tile.atlas_base, tile.mat_atlas_base, unpack_palette(tile.pal_lo, tile.pal_hi), true);
 }
 
+// Is brick `coord` CONSERVATIVELY occupied (the geometry BVH overlaps it)? Tests ONLY the cons_occ
+// mask — no tile lookup. The empty-space DDA uses this (full clipmap ring, every LOD; coarse-empty ⇒
+// fine-empty by construction), NOT the baked `occ_*` mask, which is shelled for residency and can
+// read empty where a finer LOD still has a thin feature (LOD shrinkage) — skipping past real geometry.
+fn brick_cons_occupied(chunk: ChunkLookup, coord: vec3<i32>) -> bool {
+    let li = local_brick_index(coord);   // 0..63
+    if (li < 32u) {
+        return ((chunk.cons_occ_lo >> li) & 1u) != 0u;
+    }
+    return ((chunk.cons_occ_hi >> (li - 32u)) & 1u) != 0u;
+}
+
 // Resolve the baked brick at `coord` on LOD `lod` via its chunk: find the chunk, then test
 // the occupancy bit / index the tile run via `brick_in_chunk`.
 fn find_brick_lookup(coord: vec3<i32>, lod: u32) -> BrickLocation {
@@ -685,19 +697,20 @@ fn dist_to_chunk_exit_lod(p: vec3<f32>, dir: vec3<f32>, lod: u32) -> f32 {
     return t;
 }
 
-// Occupancy-aware brick-DDA WITHIN one resident chunk. When the ray is in empty space yet inside an
-// OCCUPIED (resident) chunk — air ABOVE the terrain that lives in the same chunk as the surface
-// bricks below it — plain `dist_to_brick_exit_lod` crawls ONE brick per outer march step (the
-// "horizon crawl" that exhausts the step budget on grazing rays). This walks the ray across the run
-// of CONSECUTIVE EMPTY bricks in one shot, reading only the chunk's 64-bit occupancy mask (no field
-// samples), and returns the distance to the near face of the next OCCUPIED brick, or to the chunk
-// exit if none lie ahead on the ray (the caller re-resolves there, where the hierarchical chunk-DDA
-// can skip further). Bounded to a chunk diagonal (≤ 3·CHUNK_BRICKS bricks).
+// Occupancy-aware brick-DDA WITHIN one chunk, reading the CONSERVATIVE `cons_occ` mask. When the ray
+// is in empty space yet inside a geometry-bearing chunk — air ABOVE the terrain that lives in the same
+// chunk as the surface bricks below it — plain `dist_to_brick_exit_lod` crawls ONE brick per outer
+// march step (the "horizon crawl" that exhausts the step budget on grazing rays). This walks the ray
+// across the run of CONSECUTIVE EMPTY bricks in one shot, reading only the chunk's 64-bit conservative
+// occupancy mask (no field samples), and returns the distance to the near face of the next occupied
+// brick, or to the chunk exit if none lie ahead (the caller re-resolves there). Bounded to a chunk
+// diagonal (≤ 3·CHUNK_BRICKS bricks).
 //
-// SAFE because the caller invokes it on the COARSEST resident chunk at `p`: a brick empty at a coarse
-// LOD is empty at ALL finer LODs (the same geometry bakes at every level, so present-at-fine ⇒
-// present-at-coarse ⇒ absent-at-coarse ⇒ absent-at-fine), so skipping an empty coarse brick can never
-// step over a finer-LOD surface.
+// SAFE by construction: `cons_occ` is the geometry BVH's overlap per brick, maintained for the FULL
+// ring at every LOD. A coarse brick's world AABB CONTAINS the finer bricks' AABBs, so a
+// conservatively-empty coarse brick is empty at every finer LOD too — skipping it can never step over
+// a finer-LOD surface (unlike the BAKED mask, which can be empty under LOD shrinkage where a finer LOD
+// still has a thin feature).
 fn dist_over_empty_bricks(chunk: ChunkLookup, p: vec3<f32>, dir: vec3<f32>, lod: u32) -> f32 {
     let key_hi = chunk.key_hi;
     let key_lo = chunk.key_lo;
@@ -711,8 +724,8 @@ fn dist_over_empty_bricks(chunk: ChunkLookup, p: vec3<f32>, dir: vec3<f32>, lod:
         if (qkey.x != key_hi || qkey.y != key_lo) {
             return adv;                        // left this chunk → caller re-resolves at the next one
         }
-        if (brick_in_chunk(chunk, coord).found) {
-            return adv;                        // occupied brick ahead → caller sphere-traces it
+        if (brick_cons_occupied(chunk, coord)) {
+            return adv;                        // geometry ahead (conservative) → caller resolves it
         }
         adv = adv + dist_to_brick_exit_lod(q, dir, lod) + eps;   // empty brick → step over it
     }
@@ -725,8 +738,12 @@ fn dist_over_empty_bricks(chunk: ChunkLookup, p: vec3<f32>, dir: vec3<f32>, lod:
 // mis-classify chunks near the ring edge. All integer math via floor_div (never raw `%`/`/`,
 // the GPU signed-op hazard — see bindings.wgsl floor_div).
 //
-// Distinguishes "empty-culled" (in-ring + absent ⇒ provably empty ⇒ safe to skip) from
-// "unbaked" (out-of-ring ⇒ unknown ⇒ a coarser LOD's ring covers it; not skipped here).
+// FULL ring (no inner hole). The empty-space DDA's box-jump fires for an absent-IN-RING chunk only when
+// the CONSERVATIVE directory has no entry for it — i.e. the geometry BVH overlaps nothing there — so the
+// jump is provably empty regardless of which LODs are baked. (The earlier `overlap_depth` hole was a
+// workaround for the conservative occupancy not existing; now that `cons_occ` is maintained full-ring,
+// a coarse chunk that holds finer-LOD geometry has a directory entry and takes the occupancy-DDA path,
+// never this box-jump — so the hole is no longer needed and would only re-slow the march.)
 fn in_ring_chunk(coord: vec3<i32>, lod: u32) -> bool {
     let s = cell_stride();
     let c = CHUNK_BRICKS;

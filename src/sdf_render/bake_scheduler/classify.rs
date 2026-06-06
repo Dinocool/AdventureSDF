@@ -28,7 +28,12 @@ pub(crate) enum Verdict {
 /// smoothing inflates the gradient — if the surface provably crosses the 9 palette sample points
 /// (8 corners + center). The `dist_band` term only ever makes us KEEP, never drop, so it can't
 /// introduce a hole; it also catches an enclosed cavity the center eval would miss.
-fn narrow_band_keep(
+///
+/// `pub(super)` so the conservative-occupancy mask (`window::chunk_conservative_mask`) reuses the EXACT
+/// same surface test the bake's classify uses — guaranteeing the empty-space DDA's `cons_occ` is a
+/// superset of the baked occupancy (never skips a sampled surface) and is surface-following, not
+/// AABB-over-inclusive (which made tall/large edit AABBs — e.g. the heightmap — stop sky rays).
+pub(super) fn narrow_band_keep(
     edits: &[edits::ResolvedEdit],
     indices: &[u32],
     config: &SdfGridConfig,

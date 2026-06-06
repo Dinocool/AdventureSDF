@@ -413,6 +413,24 @@ impl SdfAtlas {
         }
     }
 
+    /// Set chunk `ck`'s CONSERVATIVE per-brick occupancy (the geometry BVH overlap, maintained for the
+    /// FULL clipmap ring) — the empty-space DDA's traversal grid, decoupled from baked tiles. A holed
+    /// chunk (geometry present, tiles shelled out) keeps a traversal entry with no tiles; `0` with no
+    /// tiles drops it. Bumps both generations (only when the mask actually changes) so the render world
+    /// re-extracts (`generation`) and rebuilds the directory (`topology_generation`).
+    pub fn set_conservative_chunk(
+        &mut self,
+        ck: super::chunk::ChunkKey,
+        cons_mask: u64,
+        config: &super::SdfGridConfig,
+    ) {
+        if self.live_chunks.conservative_mask(ck) == cons_mask {
+            return; // unchanged directory → no upload churn
+        }
+        self.live_chunks.set_conservative(ck, cons_mask, config);
+        self.generation = self.generation.wrapping_add(1);
+        self.topology_generation = self.topology_generation.wrapping_add(1);
+    }
 }
 
 /// The stride-aligned brick coords of one LOD ring window whose corner is `origin`:

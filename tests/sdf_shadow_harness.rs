@@ -110,14 +110,16 @@ fn edit_bytes(e: &GpuEdit) -> Vec<u8> {
     b
 }
 
-// 24-byte ChunkLookup serialization (reuse of sdf_gpu_rig.rs::chunk_lookup_bytes).
+// 32-byte ChunkLookup serialization (reuse of sdf_gpu_rig.rs::chunk_lookup_bytes).
 fn chunk_lookup_bytes(chunks: &[ChunkLookup]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(chunks.len() * 24);
+    let mut out = Vec::with_capacity(chunks.len() * 32);
     for c in chunks {
         out.extend_from_slice(&c.key_hi.to_le_bytes());
         out.extend_from_slice(&c.key_lo.to_le_bytes());
         out.extend_from_slice(&c.occ_lo.to_le_bytes());
         out.extend_from_slice(&c.occ_hi.to_le_bytes());
+        out.extend_from_slice(&c.cons_occ_lo.to_le_bytes());
+        out.extend_from_slice(&c.cons_occ_hi.to_le_bytes());
         out.extend_from_slice(&c.tile_run_base.to_le_bytes());
         out.extend_from_slice(&c.probe_base.to_le_bytes());
     }
