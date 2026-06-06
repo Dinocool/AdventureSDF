@@ -13,7 +13,7 @@ struct SdfCameraUniform {
     // frame's screen to sample its already-shaded colour (sdf_raymarch SSR path).
     prev_clip_from_world: mat4x4<f32>,
     camera_pos: vec4<f32>,
-    screen_params: vec4<f32>,  // xy = screen_size; z unused; w = shadow LOD floor (u32)
+    screen_params: vec4<f32>,  // xy = screen_size; z = overlap_depth (u32); w = shadow LOD floor (u32)
     grid_origin: vec4<f32>,
     grid_dims: vec4<f32>,
     debug_params: vec4<f32>,   // x = max_steps, y = max_dist, z = sdf_eps, w = recenter_snap_chunks
@@ -57,15 +57,19 @@ struct SdfMaterial {
 // material palette: pal01 = id0 | id1<<16, pal23 = id2 | id3<<16. Slot k of the
 // per-voxel distance atlas is keyed to palette entry k; PALETTE_EMPTY (0xffff) unused.
 
-// One entry in the sorted chunk lookup table (binary-searched by absolute key). `key_*`
-// is the camera-independent chunk key (see chunk.rs); `occ_*` is the 64-bit occupancy
-// mask (bit i ⇒ local brick i resident); `tile_run_base` indexes `chunk_tile_buf` where
-// this chunk's popcount(occ) resident bricks live in ascending local order.
+// One entry in the per-LOD chunk directory (indexed by `dir_index`, tag-compared). `key_*` is the
+// camera-independent chunk key (see chunk.rs). TWO occupancy masks: `occ_*` = BAKED (a tile is
+// resident — for SAMPLING, honours shells); `cons_occ_*` = CONSERVATIVE (the geometry BVH overlaps
+// the brick — for the empty-space DDA, full ring, coarse-empty⇒fine-empty by construction).
+// `tile_run_base` indexes `chunk_tile_buf` where this chunk's popcount(occ) baked bricks live.
+// Field order MUST match chunk::ChunkLookup + encode_lookup (chunk_tables.rs).
 struct ChunkLookup {
     key_hi: u32,
     key_lo: u32,
     occ_lo: u32,
     occ_hi: u32,
+    cons_occ_lo: u32,
+    cons_occ_hi: u32,
     tile_run_base: u32,
 };
 
@@ -168,6 +172,10 @@ fn lod_blend_band() -> f32 { return camera.march_params.w; }
 // The LOD cross-fade keys off the chunk-SNAPPED ring centre, so the shader recomputes it
 // from camera_pos + this (mirrors bake_scheduler::ring_chunk_origin). >= 1.
 fn recenter_snap() -> i32 { return max(i32(camera.debug_params.w), 1); }
+// How many COARSER LODs each region keeps resident beyond its native LOD ({native..native+overlap}).
+// Drives the inner-hole size in `in_ring_chunk` — MUST mirror CPU `SdfGridConfig::overlap_depth` /
+// `inner_hole_half_chunks` exactly, or the empty-space DDA skip and the resident set diverge (gaps).
+fn overlap_depth() -> u32 { return u32(camera.screen_params.z); }
 // Minimum LOD the shadow march samples in-brick (editor "Shadow detail" slider, in screen_params.w).
 // 0 = finest (sharpest, slowest); higher = coarser/blobbier shadows but far fewer march steps.
 fn shadow_lod_bias() -> u32 { return u32(camera.screen_params.w); }

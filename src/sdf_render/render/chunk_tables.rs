@@ -74,14 +74,14 @@ impl PackedBuf {
 /// policy on top of the shared [`PackedBuf`] lifecycle.
 #[derive(Default)]
 pub(super) struct ChunkTableBuffers {
-    directory: PackedBuf, // binding 2: dense per-LOD directory, 20-byte ChunkLookup rows
+    directory: PackedBuf, // binding 2: dense per-LOD directory, 28-byte ChunkLookup rows
     tiles: PackedBuf,     // binding 11: packed tile-runs, 16-byte BrickTile records
 }
 
 impl ChunkTableBuffers {
     pub(super) fn new(device: &RenderDevice) -> Self {
         Self {
-            directory: PackedBuf::new_dummy(device, "sdf_chunk_lookup_buffer", 20),
+            directory: PackedBuf::new_dummy(device, "sdf_chunk_lookup_buffer", 28),
             tiles: PackedBuf::new_dummy(device, "sdf_chunk_tile_buffer", 16),
         }
     }
@@ -103,7 +103,7 @@ impl ChunkTableBuffers {
         live_len: u32,
     ) {
         let live = live_len.min(rows.len() as u32) as usize;
-        let mut bytes = Vec::with_capacity(live * 20);
+        let mut bytes = Vec::with_capacity(live * 28);
         for c in &rows[..live] {
             encode_lookup(c, &mut bytes);
         }
@@ -137,7 +137,7 @@ impl ChunkTableBuffers {
         let mut run_bytes: Vec<u8> = Vec::new();
         for (row, c) in row_updates {
             match run_start {
-                Some(s) if *row == s + (run_bytes.len() as u32 / 20) => {}
+                Some(s) if *row == s + (run_bytes.len() as u32 / 28) => {}
                 _ => {
                     if let Some(s) = run_start {
                         self.directory.write_at(queue, s as u64, &run_bytes);
@@ -170,12 +170,15 @@ impl ChunkTableBuffers {
     }
 }
 
-/// 20-byte std430 encoding of one chunk lookup row.
+/// 28-byte std430 encoding of one chunk lookup row. Field order MUST match the WGSL `ChunkLookup`
+/// struct (`bindings.wgsl`) and the Rust `chunk::ChunkLookup` exactly.
 fn encode_lookup(c: &chunk::ChunkLookup, out: &mut Vec<u8>) {
     out.extend_from_slice(&c.key_hi.to_le_bytes());
     out.extend_from_slice(&c.key_lo.to_le_bytes());
     out.extend_from_slice(&c.occ_lo.to_le_bytes());
     out.extend_from_slice(&c.occ_hi.to_le_bytes());
+    out.extend_from_slice(&c.cons_occ_lo.to_le_bytes());
+    out.extend_from_slice(&c.cons_occ_hi.to_le_bytes());
     out.extend_from_slice(&c.tile_run_base.to_le_bytes());
 }
 
@@ -187,10 +190,10 @@ fn encode_tile(b: &chunk::BrickTile, out: &mut Vec<u8>) {
     out.extend_from_slice(&b.pal23.to_le_bytes());
 }
 
-/// The 20-byte `(u32::MAX, u32::MAX, 0, 0, 0)` chunk-lookup sentinel. Its key tag never matches a
-/// real chunk key, so a fixed directory slot that no live chunk occupies resolves to a miss.
-fn sentinel_row_bytes() -> [u8; 20] {
-    let mut b = [0u8; 20];
+/// The 28-byte `(u32::MAX, u32::MAX, 0, 0, 0, 0, 0)` chunk-lookup sentinel. Its key tag never
+/// matches a real chunk key, so a fixed directory slot that no live chunk occupies resolves to a miss.
+fn sentinel_row_bytes() -> [u8; 28] {
+    let mut b = [0u8; 28];
     b[0..4].copy_from_slice(&u32::MAX.to_le_bytes());
     b[4..8].copy_from_slice(&u32::MAX.to_le_bytes());
     b

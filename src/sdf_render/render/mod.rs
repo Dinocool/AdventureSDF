@@ -54,7 +54,7 @@ struct SdfCameraData {
     /// frame's screen for the SSR reflection path.
     prev_clip_from_world: Mat4,
     camera_pos: Vec4,
-    screen_params: Vec4, // xy = screen_size; zw unused (was surface_bias — iso-offset removed)
+    screen_params: Vec4, // xy = screen_size; z = overlap_depth (u32); w = shadow LOD floor (u32)
     grid_origin: Vec4,   // xyz = grid origin, w = voxel_size
     grid_dims: Vec4, // z = brick_size (8.0); x/y/w unused (chunk count = arrayLength(&chunk_buf))
     debug_params: Vec4, // x = max_steps, y = max_dist, z = sdf_eps, w = unused
@@ -931,11 +931,13 @@ fn prepare_sdf_camera_data(
             clip_from_world,
             prev_clip_from_world,
             camera_pos: transform.translation.extend(0.0),
-            // z unused; w = shadow LOD floor (the "Shadow detail" slider; read as u32 by `shadow_lod_bias()`).
+            // z = overlap_depth (coarser LODs kept resident beyond native — drives the shader's
+            // `in_ring_chunk` inner-hole so the empty-space DDA skip matches the `{native..native+overlap}`
+            // resident set); w = shadow LOD floor ("Shadow detail" slider; read as u32 by `shadow_lod_bias()`).
             screen_params: Vec4::new(
                 size.x as f32,
                 size.y as f32,
-                0.0,
+                config.overlap_depth as f32,
                 raymarch.shadow_lod_bias as f32,
             ),
             grid_origin: Vec4::new(

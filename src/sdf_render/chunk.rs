@@ -106,17 +106,26 @@ pub fn chunk_world_size(lod: u32, config: &SdfGridConfig) -> f32 {
     config.cell_stride() as f32 * config.voxel_size_at(lod) * CHUNK_BRICKS as f32
 }
 
-/// One entry in the GPU chunk lookup table (sorted by `(key_hi, key_lo)`, binary-
-/// searched by the shader). 5×u32 = 20 bytes. `occ_lo|occ_hi` is the 64-bit occupancy
-/// mask (bit `i` set ⇒ local brick `i` is resident); `tile_run_base` indexes the packed
-/// `tile_run` table where this chunk's `popcount(mask)` brick `atlas_base`s live in
-/// ascending local-index order.
+/// One entry in the GPU chunk lookup table (indexed directly via `dir_index`, tag-compared by the
+/// shader). 7×u32 = 28 bytes. TWO occupancy masks, decoupled:
+/// - `occ_lo|occ_hi` — the BAKED (display) mask: bit `i` ⇒ local brick `i` has a resident atlas
+///   TILE. Used by `resolve_march` for SAMPLING; honours the `{native,native+1}` shell residency.
+/// - `cons_occ_lo|cons_occ_hi` — the CONSERVATIVE (traversal) mask: bit `i` ⇒ the geometry BVH
+///   overlaps local brick `i`. Populated for the FULL clipmap ring at every LOD (no shell holes),
+///   conservative by construction (a coarse brick's AABB contains the finer bricks', so
+///   coarse-empty ⇒ fine-empty). Used by the empty-space DDA for SKIPPING — independent of
+///   residency and of LOD-shrinkage, fixing both the perf regression and the skip-past bug.
+///
+/// `tile_run_base` indexes the packed `tile_run` where this chunk's `popcount(occ)` baked bricks
+/// live in ascending local order.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ChunkLookup {
     pub key_hi: u32,
     pub key_lo: u32,
     pub occ_lo: u32,
     pub occ_hi: u32,
+    pub cons_occ_lo: u32,
+    pub cons_occ_hi: u32,
     pub tile_run_base: u32,
 }
 
@@ -267,11 +276,15 @@ impl ChunkSlotAllocator {
     }
 }
 
-/// One resident chunk's live state: its tile-run slot, occupancy mask, and the 64 brick
-/// tiles (only `popcount(occ)` are live; the rest are never indexed by the shader).
+/// One resident chunk's live state: its tile-run slot, the BAKED occupancy mask + 64 brick tiles
+/// (only `popcount(occ)` are live), and the CONSERVATIVE (BVH) occupancy mask used by the
+/// empty-space DDA. A chunk stays in the directory while EITHER mask is non-zero (`occ` for
+/// sampling, `cons_occ` for traversal) — so a hole chunk with geometry keeps a traversal entry
+/// without baked tiles.
 struct ChunkEntry {
     slot: u32,
     occ: u64,
+    cons_occ: u64,
     tiles: [BrickTile; CHUNK_VOLUME as usize],
 }
 
@@ -345,6 +358,8 @@ fn sentinel_lookup() -> ChunkLookup {
         key_lo: SENTINEL_KEY.1,
         occ_lo: 0,
         occ_hi: 0,
+        cons_occ_lo: 0,
+        cons_occ_hi: 0,
         tile_run_base: 0,
     }
 }
@@ -431,11 +446,16 @@ impl LiveChunkTables {
         let entry = self.chunks.entry(ck).or_insert_with(|| ChunkEntry {
             slot,
             occ: 0,
+            cons_occ: 0,
             tiles: [BrickTile::default(); CHUNK_VOLUME as usize],
         });
         entry.occ |= 1u64 << local;
         entry.tiles[local as usize] = tile;
         let occ = entry.occ;
+        // Publish cons ⊇ occ (a baked brick always has geometry, so the DDA must see it) WITHOUT
+        // widening the owned `entry.cons_occ` — that mask belongs to `set_conservative`, so a chunk
+        // baked-then-cleared with no conservative entry is still removed by `clear_brick`.
+        let cons = entry.cons_occ | occ;
 
         self.slot_to_key.insert(slot, ck);
         self.dir[idx] = ChunkLookup {
@@ -443,6 +463,71 @@ impl LiveChunkTables {
             key_lo: tag.1,
             occ_lo: occ as u32,
             occ_hi: (occ >> 32) as u32,
+            cons_occ_lo: cons as u32,
+            cons_occ_hi: (cons >> 32) as u32,
+            tile_run_base: slot * TILE_RUN_SLOT,
+        };
+        self.dirty_rows.insert(idx as u32);
+        self.dirty_slots.insert(slot);
+    }
+
+    /// Set chunk `ck`'s CONSERVATIVE per-brick occupancy mask — the geometry BVH's overlap, maintained
+    /// for the FULL clipmap ring at every LOD, independent of which bricks are baked. Bit `i` ⇒ local
+    /// brick `i` may contain geometry. Used ONLY by the empty-space DDA, never for sampling. A chunk's
+    /// directory entry survives while EITHER `cons_occ` OR the baked `occ` is non-zero, so a holed
+    /// chunk (geometry present, tiles shelled out) keeps a traversal entry with no tiles. A
+    /// `cons_mask` of 0 with no baked tiles drops the entry. O(1): one directory-slot write.
+    pub fn set_conservative(&mut self, ck: ChunkKey, cons_mask: u64, config: &SdfGridConfig) {
+        if self.dir.is_empty() {
+            self.r = config.ring_chunks_per_axis();
+            let n = config.directory_len();
+            self.dir = vec![sentinel_lookup(); n];
+        }
+        let idx = dir_index(ck, self.r);
+        // A baked brick always has geometry, so cons ⊇ occ (keeps the masks consistent regardless of
+        // the order set_brick / set_conservative run this frame).
+        let existing_occ = self.chunks.get(&ck).map_or(0, |e| e.occ);
+        let cons = cons_mask | existing_occ;
+        if cons == 0 {
+            // No geometry and no baked tiles → drop the entry (sentinel the slot, free the tile run).
+            if let Some(entry) = self.chunks.remove(&ck) {
+                self.slot_to_key.remove(&entry.slot);
+                self.slots.release(&ck);
+                self.dir[idx] = sentinel_lookup();
+                self.dirty_rows.insert(idx as u32);
+                self.dirty_slots.remove(&entry.slot);
+            }
+            return;
+        }
+        let tag = chunk_gpu_key(ck);
+        // Free-on-overwrite belt (mirrors set_brick): a different chunk still holding this physical
+        // slot (left the window uncleared) is reclaimed before publishing.
+        let cur = self.dir[idx];
+        if (cur.key_hi, cur.key_lo) != SENTINEL_KEY && (cur.key_hi, cur.key_lo) != tag {
+            let old_slot = cur.tile_run_base / TILE_RUN_SLOT;
+            if let Some(old_ck) = self.slot_to_key.remove(&old_slot) {
+                self.chunks.remove(&old_ck);
+                self.slots.release(&old_ck);
+                self.dirty_slots.remove(&old_slot);
+            }
+        }
+        let slot = self.slots.alloc(ck);
+        let entry = self.chunks.entry(ck).or_insert_with(|| ChunkEntry {
+            slot,
+            occ: 0,
+            cons_occ: 0,
+            tiles: [BrickTile::default(); CHUNK_VOLUME as usize],
+        });
+        entry.cons_occ = cons;
+        let occ = entry.occ;
+        self.slot_to_key.insert(slot, ck);
+        self.dir[idx] = ChunkLookup {
+            key_hi: tag.0,
+            key_lo: tag.1,
+            occ_lo: occ as u32,
+            occ_hi: (occ >> 32) as u32,
+            cons_occ_lo: cons as u32,
+            cons_occ_hi: (cons >> 32) as u32,
             tile_run_base: slot * TILE_RUN_SLOT,
         };
         self.dirty_rows.insert(idx as u32);
@@ -457,15 +542,24 @@ impl LiveChunkTables {
         let Some(entry) = self.chunks.get_mut(&ck) else {
             return;
         };
+        // Clears only the BAKED bit (a tile was evicted). `cons_occ` is owned by `set_conservative`
+        // (the geometry may still overlap this brick — e.g. it's holed by the shell — so the
+        // empty-space DDA must keep seeing it). The chunk's directory entry survives while EITHER mask
+        // is non-zero.
         entry.occ &= !(1u64 << local);
         entry.tiles[local as usize] = BrickTile::default();
         let slot = entry.slot;
         let occ = entry.occ;
+        // Stay while baked OR conservatively-occupied; publish cons ⊇ occ. `entry.cons_occ` (owned by
+        // set_conservative) drives whether a tile-emptied chunk survives.
+        let cons = entry.cons_occ | occ;
         let idx = dir_index(ck, self.r);
-        if occ != 0 {
-            // Still resident → just refresh the occupancy in its directory slot + re-upload its region.
+        if occ != 0 || cons != 0 {
+            // Still resident (baked OR conservatively-occupied) → refresh both masks + re-upload.
             self.dir[idx].occ_lo = occ as u32;
             self.dir[idx].occ_hi = (occ >> 32) as u32;
+            self.dir[idx].cons_occ_lo = cons as u32;
+            self.dir[idx].cons_occ_hi = (cons >> 32) as u32;
             self.dirty_rows.insert(idx as u32);
             self.dirty_slots.insert(slot);
             return;
@@ -478,6 +572,12 @@ impl LiveChunkTables {
         self.dir[idx] = sentinel_lookup();
         self.dirty_rows.insert(idx as u32);
         self.dirty_slots.remove(&slot);
+    }
+
+    /// The chunk's current CONSERVATIVE occupancy mask (0 if not resident). Lets the scheduler skip the
+    /// directory churn when a recompute yields the same mask (a stationary chunk re-examined on an edit).
+    pub fn conservative_mask(&self, ck: ChunkKey) -> u64 {
+        self.chunks.get(&ck).map_or(0, |e| e.cons_occ)
     }
 
     /// Number of directory slots (= GPU `chunk_buf` length = `R³ × lod_count`, 0 until first sized).

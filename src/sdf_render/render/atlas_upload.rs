@@ -22,6 +22,8 @@ pub(super) struct GpuChunkLookup {
     key_lo: u32,
     occ_lo: u32,
     occ_hi: u32,
+    cons_occ_lo: u32,
+    cons_occ_hi: u32,
     tile_run_base: u32,
 }
 

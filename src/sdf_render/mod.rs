@@ -270,6 +270,18 @@ pub const DEFAULT_RING_BRICKS: u32 = 256;
 /// 0 instead of every brick crossing, while still keeping the camera 30+ chunks from any
 /// window edge.
 pub const DEFAULT_RECENTER_SNAP_CHUNKS: i32 = 2;
+/// How many COARSER LOD levels each region keeps resident beyond its native (finest-covering) LOD —
+/// the `+N` in "hold `{native .. native+N}`". `1` (the default) holds the native LOD plus one coarser
+/// fallback (the cone-LOD floor / secondary-ray coarsening read it, and it gives a hole-free streaming
+/// handoff), and drops LOD `native+2..` which the renderer never samples there — so a near surface
+/// triggers ~2 LOD bakes instead of the full ~8-deep stack. Larger keeps more of the stack resident
+/// (more redundant bake work); `0` would keep only the native level but loses the fallback the LOD
+/// floor relies on. NOT a shader uniform — it only changes which bricks are resident.
+pub const DEFAULT_OVERLAP_DEPTH: u32 = 1;
+/// Frustum bake-PRIORITY margin in world units: chunks within this slack of the view frustum still
+/// rank as "in view" (so they bake a touch earlier), smoothing pop-in when the camera turns. Priority
+/// only — it never changes residency (off-screen geometry stays resident for shadows/GI).
+pub const DEFAULT_FRUSTUM_PRIORITY_MARGIN: f32 = 4.0;
 
 #[derive(Resource, Clone)]
 pub struct SdfGridConfig {
@@ -287,6 +299,11 @@ pub struct SdfGridConfig {
     /// on every chunk crossing (no hysteresis). Must stay well below
     /// `ring_bricks / CHUNK_BRICKS` so the camera never leaves its own window.
     pub recenter_snap_chunks: i32,
+    /// Coarser LOD levels kept resident beyond each region's native LOD — `{native .. native+N}`
+    /// residency (the hollow-shell clipmap). See [`DEFAULT_OVERLAP_DEPTH`].
+    pub overlap_depth: u32,
+    /// World-space slack for the in-frustum bake-priority test. See [`DEFAULT_FRUSTUM_PRIORITY_MARGIN`].
+    pub frustum_priority_margin: f32,
 }
 
 impl Default for SdfGridConfig {
@@ -298,6 +315,8 @@ impl Default for SdfGridConfig {
             lod_count: DEFAULT_LOD_COUNT,
             ring_bricks: DEFAULT_RING_BRICKS,
             recenter_snap_chunks: DEFAULT_RECENTER_SNAP_CHUNKS,
+            overlap_depth: DEFAULT_OVERLAP_DEPTH,
+            frustum_priority_margin: DEFAULT_FRUSTUM_PRIORITY_MARGIN,
         }
     }
 }
