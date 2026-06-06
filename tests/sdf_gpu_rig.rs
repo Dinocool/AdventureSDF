@@ -68,16 +68,18 @@ fn camera_uniform_bytes(config: &SdfGridConfig) -> Vec<u8> {
     bytemuck::cast_slice(&f).to_vec()
 }
 
-// One ChunkLookup entry (24 bytes, 6× u32) — repurposed as a flat brick entry:
-// key_hi=coord.x, key_lo=coord.y, occ_lo=coord.z (i32 bitcast), occ_hi=atlas_base.
-// Bound as `chunk_buf` (array<ChunkLookup>), so the stride MUST match the 24-byte WGSL struct.
+// One ChunkLookup entry (32 bytes, 8× u32) — repurposed as a flat brick entry:
+// key_hi=coord.x, key_lo=coord.y, occ_lo=coord.z (i32 bitcast), occ_hi=atlas_base; the rest zero.
+// Bound as `chunk_buf` (array<ChunkLookup>), so the stride MUST match the 32-byte WGSL struct.
 fn flat_brick_bytes(coords: &[IVec3]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(coords.len() * 24);
+    let mut out = Vec::with_capacity(coords.len() * 32);
     for c in coords {
-        out.extend_from_slice(&(c.x as u32).to_le_bytes());
-        out.extend_from_slice(&(c.y as u32).to_le_bytes());
-        out.extend_from_slice(&(c.z as u32).to_le_bytes());
-        out.extend_from_slice(&0u32.to_le_bytes()); // atlas_base (unused here)
+        out.extend_from_slice(&(c.x as u32).to_le_bytes()); // key_hi
+        out.extend_from_slice(&(c.y as u32).to_le_bytes()); // key_lo
+        out.extend_from_slice(&(c.z as u32).to_le_bytes()); // occ_lo
+        out.extend_from_slice(&0u32.to_le_bytes()); // occ_hi
+        out.extend_from_slice(&0u32.to_le_bytes()); // cons_occ_lo
+        out.extend_from_slice(&0u32.to_le_bytes()); // cons_occ_hi
         out.extend_from_slice(&0u32.to_le_bytes()); // tile_run_base
         out.extend_from_slice(&0u32.to_le_bytes()); // probe_base (unused here)
     }
@@ -748,12 +750,14 @@ fn gpu_chunk_key_matches_cpu() {
 struct LookupOut { atlas_base: u32, found: u32, local_idx: u32, ci: i32 }
 
 fn chunk_lookup_bytes(chunks: &[adventure::sdf_render::chunk::ChunkLookup]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(chunks.len() * 24);
+    let mut out = Vec::with_capacity(chunks.len() * 32);
     for c in chunks {
         out.extend_from_slice(&c.key_hi.to_le_bytes());
         out.extend_from_slice(&c.key_lo.to_le_bytes());
         out.extend_from_slice(&c.occ_lo.to_le_bytes());
         out.extend_from_slice(&c.occ_hi.to_le_bytes());
+        out.extend_from_slice(&c.cons_occ_lo.to_le_bytes());
+        out.extend_from_slice(&c.cons_occ_hi.to_le_bytes());
         out.extend_from_slice(&c.tile_run_base.to_le_bytes());
         out.extend_from_slice(&c.probe_base.to_le_bytes());
     }
@@ -916,10 +920,11 @@ fn gpu_find_brick_lookup_matches_cpu() {
 
 // =====================================================================================
 // IN-RING PARITY: the chunk-DDA empty-space skip's `in_ring_chunk` (brick.wgsl) must compute
-// the SAME resident-ring window as bake_scheduler::ring_chunk_origin (the source of truth).
-// They're hand-duplicated across WGSL/Rust; a silent divergence makes the skip step past
-// real geometry (permanent holes) or never fire (lost perf). Run the real WGSL on-device and
-// compare to the real CPU window for a batch of chunk coords across LODs.
+// the SAME resident SHELL (ring minus the `{native..native+overlap}` inner hole) as the CPU
+// scheduler (ring_chunk_origin + inner_hole_half_chunks). They're hand-duplicated across WGSL/Rust;
+// a silent divergence makes the skip step past real geometry (permanent holes — exactly the bug the
+// hole exclusion fixes) or never fire (lost perf). Run the real WGSL on-device and compare to the
+// CPU shell for a batch of chunk coords across LODs (incl. coords inside the hole at coarse LODs).
 // =====================================================================================
 
 // Camera uniform with camera_pos (floats 48..50) + recenter_snap_chunks (debug_params.w =
@@ -932,6 +937,7 @@ fn camera_uniform_bytes_full(config: &SdfGridConfig, camera_pos: Vec3) -> Vec<u8
     f[48] = camera_pos.x; // camera_pos.xyz (4th field, after the 3 matrices)
     f[49] = camera_pos.y;
     f[50] = camera_pos.z;
+    f[54] = config.overlap_depth as f32; // screen_params.z (inner-hole depth for in_ring_chunk)
     f[67] = config.recenter_snap_chunks as f32; // debug_params.w
     f[72] = config.lod_count as f32; // lod_params
     f[73] = config.ring_bricks as f32;
@@ -1052,6 +1058,8 @@ fn gpu_in_ring_chunk_matches_cpu() {
         let origin = ring_chunk_origin(&config, camera_pos, *lod);
         let (ck, _) = adventure::sdf_render::chunk::chunk_of(BrickKey::new(*lod, *coord), &config);
         let rel = ck.coord - origin;
+        // FULL ring (no inner hole — the conservative directory, not a hole, now distinguishes empty
+        // from finer-covered; see brick.wgsl in_ring_chunk).
         let cpu = rel.x >= 0 && rel.y >= 0 && rel.z >= 0 && rel.x < r && rel.y < r && rel.z < r;
         if (g == 1) != cpu {
             diffs.push(format!("coord={coord:?} lod={lod}: gpu={} cpu={cpu}", g == 1));

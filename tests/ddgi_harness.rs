@@ -1071,9 +1071,13 @@ fn camera_uniform_bytes(cfg: &SdfGridConfig, camera_pos: Vec3, sun_dir: Vec3, su
 }
 
 fn chunk_lookup_bytes(chunks: &[chunk::ChunkLookup]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(chunks.len() * 24);
+    let mut out = Vec::with_capacity(chunks.len() * 32);
     for c in chunks {
-        for v in [c.key_hi, c.key_lo, c.occ_lo, c.occ_hi, c.tile_run_base, c.probe_base] {
+        // 8×u32 = 32 B, matching the merged WGSL `ChunkLookup` (cons_occ from master + DDGI probe_base).
+        for v in [
+            c.key_hi, c.key_lo, c.occ_lo, c.occ_hi, c.cons_occ_lo, c.cons_occ_hi, c.tile_run_base,
+            c.probe_base,
+        ] {
             out.extend_from_slice(&v.to_le_bytes());
         }
     }

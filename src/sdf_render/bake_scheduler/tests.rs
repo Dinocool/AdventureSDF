@@ -1470,3 +1470,217 @@ fn snap_holds_origin_within_a_snap_cell() {
     assert_eq!(moved.x - base.x, snap, "a full snap-cell crossing shifts the origin by snap chunks");
 }
 
+// --- Hollow-shell `{native .. native+overlap}` residency -----------------------------------------
+
+/// The chunk coord containing world point `p` at `lod` — the same path the bake/lookup use
+/// (`world_to_brick_lod` → `chunk_of`), so the test's notion of "which chunk" matches production.
+fn chunk_coord_at(cfg: &SdfGridConfig, p: Vec3, lod: u32) -> IVec3 {
+    chunk::chunk_of(atlas::BrickKey::new(lod, cfg.world_to_brick_lod(p, lod)), cfg).0.coord
+}
+
+/// THE residency invariant (pure shell geometry). The resident shells at any point form a CONTIGUOUS
+/// run starting at `native` (the finest LOD whose outer ring contains it):
+/// - **NO GAP** — `native` is ALWAYS resident (never dropped into its own hole). This is the safety
+///   property the renderer's fine→coarse `resolve_march` depends on; asserted exactly.
+/// - **NO FULL STACK** — the run is short: `{native, native+1}` in the interior, with at most one extra
+///   coarse level near a LOD/snap boundary (each LOD snaps its ring centre to its OWN chunk grid, so the
+///   per-LOD holes aren't perfectly concentric and a point can sit just outside a coarse hole). Bounded
+///   by `native + overlap_depth + 1` — vastly less than the old `lod_count`-deep stack.
+#[test]
+fn shell_residency_is_contiguous_from_native_no_gap() {
+    let cfg = SdfGridConfig { lod_count: 6, ring_bricks: 128, recenter_snap_chunks: 1, ..config() };
+    let r = cfg.ring_chunks_per_axis();
+    let overlap = cfg.overlap_depth;
+    let cams = [Vec3::ZERO, Vec3::new(13.0, 0.0, 0.0), Vec3::new(-7.0, 5.0, 21.0)];
+    let dirs = [Vec3::X, Vec3::new(1.0, 1.0, 0.0).normalize(), Vec3::new(1.0, 1.0, 1.0).normalize()];
+    let cw0 = chunk::chunk_world_size(0, &cfg);
+    for cam in cams {
+        for dir in dirs {
+            for step in 0..440 {
+                let d = step as f32 * 0.5 * cw0;
+                let p = cam + dir * d;
+                let in_outer = |lod: u32| chunk_in_window(chunk_coord_at(&cfg, p, lod), ring_chunk_origin(&cfg, cam, lod), r);
+                let in_shell = |lod: u32| chunk_in_shell(&cfg, lod, chunk_coord_at(&cfg, p, lod), ring_chunk_origin(&cfg, cam, lod));
+                let resident: Vec<u32> = (0..cfg.lod_count).filter(|&l| in_shell(l)).collect();
+                let Some(native) = (0..cfg.lod_count).find(|&l| in_outer(l)) else {
+                    // Beyond every ring → outside the clipmap: nothing resident.
+                    assert!(resident.is_empty(), "cam={cam:?} p={p:?} outside all rings but resident at {resident:?}");
+                    continue;
+                };
+                // No gap: native resident.
+                assert!(resident.contains(&native), "cam={cam:?} p={p:?}: native LOD {native} NOT resident (GAP) — resident={resident:?}");
+                // Contiguous run starting at native (no interior hole, never finer than native).
+                let top = *resident.last().unwrap();
+                assert_eq!(
+                    resident, (native..=top).collect::<Vec<_>>(),
+                    "cam={cam:?} p={p:?}: residency {resident:?} is not the contiguous run {native}..={top}"
+                );
+                // Bounded depth — no full stack. Interior is {native,native+1}; +1 slack at boundaries.
+                assert!(
+                    top <= native + overlap + 1,
+                    "cam={cam:?} p={p:?}: resident up to LOD {top} > native+overlap+1 ({}) — stack too deep ({resident:?})",
+                    native + overlap + 1
+                );
+            }
+        }
+    }
+}
+
+/// The SAME on the REAL baked atlas: after a full settle, no world region is resident at more than
+/// `overlap_depth + 2` LODs — the redundant coarse stack a near surface used to carry (up to
+/// `lod_count` ≈ 6 levels) is gone, down to ~2 (+1 boundary slack). Fails loudly if the shell cull is
+/// ever dropped (a near surface would light up at every LOD again).
+#[test]
+fn settled_atlas_holds_no_redundant_lod_stack() {
+    let cfg = SdfGridConfig { lod_count: 6, ring_bricks: 128, recenter_snap_chunks: 1, ..config() };
+    // A big sphere + a camera outside it, so its surface spans many LOD distance bands (near side
+    // ~LOD0, far side coarse) — the case where the old full-stack residency was worst.
+    let edits = vec![sphere_edit(Vec3::ZERO, 50.0, 0)];
+    let mut sched = primed_sched(&edits);
+    let mut atlas = SdfAtlas::default();
+    settle_gpu(&mut sched, &mut atlas, &cfg, Vec3::new(60.0, 0.0, 0.0));
+    assert!(!atlas.bricks.is_empty(), "setup: sphere should bake some bricks");
+
+    let max_lods = cfg.overlap_depth + 2;
+    for key in atlas.bricks.keys() {
+        let bw = cfg.brick_world_size(key.lod);
+        let center = cfg.brick_min_world(key.coord, key.lod) + Vec3::splat(0.5 * bw);
+        let n = (0..cfg.lod_count)
+            .filter(|&l| atlas.bricks.contains_key(&atlas::BrickKey::new(l, cfg.world_to_brick_lod(center, l))))
+            .count() as u32;
+        assert!(
+            n <= max_lods,
+            "region of brick {key:?} is resident at {n} LODs > native+overlap+1 ({max_lods}) — \
+             the redundant LOD stack is NOT being culled"
+        );
+    }
+}
+
+/// Approaching the surface makes a region's coarse LOD redundant (a finer LOD now covers it) — and the
+/// recenter must EVICT it, not leave the full stack behind. Settle far (region served coarse), then
+/// settle near (region served fine) and assert the once-resident coarse brick is gone.
+#[test]
+fn approaching_evicts_now_redundant_coarse_lod() {
+    let cfg = SdfGridConfig { lod_count: 6, ring_bricks: 64, recenter_snap_chunks: 1, ..config() };
+    let edits = vec![sphere_edit(Vec3::ZERO, 50.0, 0)];
+    let mut sched = primed_sched(&edits);
+    let mut atlas = SdfAtlas::default();
+
+    // Surface probe on the +X cap. Far camera ⇒ it's served by a coarse LOD; close camera ⇒ fine.
+    let probe = Vec3::new(50.0, 0.0, 0.0);
+    settle_gpu(&mut sched, &mut atlas, &cfg, Vec3::new(300.0, 0.0, 0.0));
+    let far_lod = served_lod(&atlas, &cfg, probe).expect("probe covered when far");
+
+    settle_gpu(&mut sched, &mut atlas, &cfg, Vec3::new(54.0, 0.0, 0.0));
+    let near_lod = served_lod(&atlas, &cfg, probe).expect("probe still covered when near");
+    assert!(near_lod < far_lod, "approaching should serve a FINER LOD (far={far_lod} near={near_lod})");
+
+    // The region must now hold at most {native, native+1} — the old far coarse LOD is evicted unless
+    // it happens to be within one level of the new native.
+    let resident: Vec<u32> = (0..cfg.lod_count)
+        .filter(|&l| atlas.bricks.contains_key(&atlas::BrickKey::new(l, cfg.world_to_brick_lod(probe, l))))
+        .collect();
+    assert!(
+        resident.len() as u32 <= cfg.overlap_depth + 1,
+        "after approach the probe is resident at {resident:?} ({} LODs) — redundant coarse LOD not evicted",
+        resident.len()
+    );
+    assert!(
+        far_lod > near_lod + cfg.overlap_depth,
+        "test too weak: far/near LODs ({far_lod}/{near_lod}) within the overlap band — pick a bigger move"
+    );
+    assert!(
+        !resident.contains(&far_lod),
+        "the now-redundant far LOD {far_lod} is still resident at the probe — not evicted"
+    );
+}
+
+// --- Frustum / proximity bake priority -----------------------------------------------------------
+
+/// A frustum whose only restrictive plane is "z ≥ 0" (the other five always pass), so `out_rank`
+/// flags a chunk as out-of-view exactly when its bounding sphere is fully behind the camera.
+fn forward_z_frustum() -> FrustumPlanes {
+    let pass = Vec4::new(0.0, 0.0, 0.0, 1.0e9); // dot(p,1) = 1e9 > 0 ⇒ always inside
+    FrustumPlanes([Vec4::new(0.0, 0.0, 1.0, 0.0), pass, pass, pass, pass, pass])
+}
+
+/// The frustum FLIPS the in-LOD order: a FARTHER but in-view chunk beats a NEARER off-screen one. But
+/// coarse-LOD-first is NEVER overridden by the frustum (the hole-free fallback ordering the
+/// chunk-atomic bake relies on). Without a frustum it's pure distance (nearest first).
+#[test]
+fn priority_is_coarse_then_in_view_then_near() {
+    let cfg = config();
+    let view = BakeView { pos: Vec3::ZERO, fwd: Vec3::Z, frustum: Some(forward_z_frustum()), margin: 0.0 };
+
+    // Front: far (+Z, in view). Back: near (−Z, off screen). Same LOD.
+    let front = chunk::ChunkKey::new(0, IVec3::new(0, 0, 10));
+    let back = chunk::ChunkKey::new(0, IVec3::new(0, 0, -4));
+    assert!(
+        chunk_priority_key(front, &cfg, &view) < chunk_priority_key(back, &cfg, &view),
+        "with a frustum, a farther IN-VIEW chunk must outrank a nearer OFF-SCREEN one at the same LOD"
+    );
+    // Without a frustum, the same pair orders by distance — the nearer (back) wins.
+    let nofrustum = BakeView::pos_only(Vec3::ZERO);
+    assert!(
+        chunk_priority_key(back, &cfg, &nofrustum) < chunk_priority_key(front, &cfg, &nofrustum),
+        "without a frustum, ordering is distance-only — the nearer chunk sorts first"
+    );
+
+    // Coarse out-of-view vs fine in-view: coarse must STILL sort first (frustum never outranks LOD).
+    let coarse_back = chunk::ChunkKey::new(2, IVec3::new(0, 0, -8));
+    let fine_front = chunk::ChunkKey::new(0, IVec3::new(0, 0, 8));
+    assert!(
+        chunk_priority_key(coarse_back, &cfg, &view) < chunk_priority_key(fine_front, &cfg, &view),
+        "coarse LOD must outrank a finer LOD regardless of frustum (fallback-coverage ordering)"
+    );
+}
+
+// --- Conservative empty-space occupancy (no skip-past) -------------------------------------------
+
+/// THE no-skip-past guarantee: the empty-space DDA reads `cons_occ`, so if it is a SUPERSET of the
+/// baked `occ`, the DDA can never step over a SAMPLED surface. Settle a multi-LOD sphere and assert
+/// every resident (baked) brick's bit is set in its chunk's conservative mask.
+#[test]
+fn conservative_mask_covers_every_baked_brick() {
+    let cfg = SdfGridConfig { lod_count: 6, ring_bricks: 128, recenter_snap_chunks: 1, ..config() };
+    let edits = vec![sphere_edit(Vec3::ZERO, 50.0, 0)];
+    let mut sched = primed_sched(&edits);
+    let mut atlas = SdfAtlas::default();
+    settle_gpu(&mut sched, &mut atlas, &cfg, Vec3::new(60.0, 0.0, 0.0));
+    assert!(!atlas.bricks.is_empty(), "setup: sphere should bake bricks");
+    for key in atlas.bricks.keys() {
+        let (ck, local) = chunk::chunk_of(*key, &cfg);
+        let cons = atlas.live_chunks.conservative_mask(ck);
+        assert!(
+            cons & (1u64 << local) != 0,
+            "baked brick {key:?} (chunk {ck:?} local {local}) NOT in conservative mask {cons:#018x} — \
+             the DDA could skip past a sampled surface"
+        );
+    }
+}
+
+/// A feature THINNER than a coarse voxel: the baked coarse occupancy can read empty (LOD shrinkage
+/// erodes it away), but the conservative mask is built from the geometry's AABB via the BVH, so it
+/// MUST still catch it — otherwise the empty-space DDA skips straight past the thin feature (the
+/// "coarse-empty ≠ fine-empty" bug). Assert a sub-voxel sphere lights ≥1 conservative bit at a coarse LOD.
+#[test]
+fn conservative_mask_catches_sub_voxel_feature() {
+    let cfg = SdfGridConfig { lod_count: 6, ring_bricks: 128, recenter_snap_chunks: 1, ..config() };
+    let tiny = sphere_edit(Vec3::new(0.0, 3.3, 0.0), 0.05, 0); // r=0.05 ≪ a LOD-4 voxel (≈1.6)
+    let bvh = build_bvh(std::slice::from_ref(&tiny));
+    let aabb = edit_world_aabb(&tiny.prim, &tiny.transform, 0.0);
+    let lod = 4u32;
+    let origin = ring_chunk_origin(&cfg, Vec3::ZERO, lod);
+    let r = cfg.ring_chunks_per_axis();
+    let edits = std::slice::from_ref(&tiny);
+    let mut scratch: Vec<u32> = Vec::new();
+    let mut stack: Vec<u32> = Vec::new();
+    let any = bricks_in_aabb_windowed(&cfg, &aabb, lod, origin, r)
+        .into_iter()
+        .any(|(ck, _)| chunk_conservative_mask(ck, edits, &bvh, &cfg, &mut scratch, &mut stack) != 0);
+    assert!(
+        any,
+        "coarse-LOD conservative mask missed a sub-voxel feature — the empty-space DDA would skip past it"
+    );
+}
+
