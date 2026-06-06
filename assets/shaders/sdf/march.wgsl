@@ -177,16 +177,21 @@ fn raymarch(origin: vec3<f32>, dir: vec3<f32>, start_t: f32, q: MarchQuality) ->
     let MAX_DIST = min(q.dist_cap, clipmap_exit_t(origin, dir));
     let SDF_EPS = sdf_eps();
     let CONE = pixel_cone() * q.cone_k;
+#ifndef SDF_GI_MARCH
     let OMEGA = over_relax();
+#endif
 
     // Per-ray chunk-search memo (NanoVDB/Tree64 accessor): a marching ray stays in the same
     // chunk for many steps, so each LOD's probe is O(1) until it crosses a chunk boundary.
     var cache = new_chunk_cache();
+#ifndef SDF_GI_MARCH
     // Previous unbounding-sphere radius + the step actually taken, for over-relaxation
     // fallback (Keinert 2014): if the new sphere doesn't reach back to the previous one,
-    // the relaxed step overshot — undo it and re-take the safe `d` step.
+    // the relaxed step overshot — undo it and re-take the safe `d` step. (Compiled out for the
+    // GI march — `SDF_GI_MARCH` — so these don't pin a live register across the loop.)
     var prev_d = 0.0;
     var prev_step = 0.0;
+#endif
 
     for (var i = 0u; i < MAX_STEPS; i = i + 1u) {
         steps = i + 1u;
@@ -249,8 +254,10 @@ fn raymarch(origin: vec3<f32>, dir: vec3<f32>, start_t: f32, q: MarchQuality) ->
                 }
             }
             t += adv;
+#ifndef SDF_GI_MARCH
             prev_d = 0.0;
             prev_step = 0.0;
+#endif
             continue;
         }
 
@@ -259,6 +266,16 @@ fn raymarch(origin: vec3<f32>, dir: vec3<f32>, start_t: f32, q: MarchQuality) ->
         let d = scene.dist;                          // trilinear SDF at p
         let cone = cone_t;                           // pixel-cone half-width here (= CONE·t)
 
+#ifdef SDF_GI_MARCH
+        // GI rays are low-frequency and tolerate a fuzzy hit, so the probe trace compiles a SLIM
+        // march: skip the LOD-crossfade morph (its extra field samples + 3 live floats), the Keinert
+        // over-relaxation memo, and the sub-step hit refinement. Fewer live registers across the loop
+        // = higher occupancy on this register-bound kernel; quality loss is invisible after the probe
+        // integration + temporal average.
+        let d_eff = d;
+        let blend_w = 0.0;
+        let eff_lod = f32(lod);
+#else
         // --- LOD cross-fade: DISTANCE-driven continuous-LOD morph ----------------------
         // Render the field at a CONTINUOUS LOD `lodc` set purely by camera distance, NOT by
         // which LOD `resolve_march` found occupied — so a finer occupancy island doesn't show
@@ -280,6 +297,7 @@ fn raymarch(origin: vec3<f32>, dir: vec3<f32>, start_t: f32, q: MarchQuality) ->
             prev_step = 0.0;
             continue;
         }
+#endif
 
         // Accept only a point reached by a validated step (never an overshoot).
         if (d_eff < max(SDF_EPS, cone)) {
@@ -293,12 +311,14 @@ fn raymarch(origin: vec3<f32>, dir: vec3<f32>, start_t: f32, q: MarchQuality) ->
             // Clamped to ±one step so a near-tangent slope can't fling the hit; falls back to `t` when
             // there's no usable prior sample (prev_step == 0) or the slope is ~flat.
             var t_hit = t;
+#ifndef SDF_GI_MARCH
             if (prev_step > 0.0) {
                 let denom = prev_d - d_eff;
                 if (denom > 1e-5) {
                     t_hit = clamp(t + d_eff * prev_step / denom, t - prev_step, t + prev_step);
                 }
             }
+#endif
             let hit_p = origin + dir * t_hit;
             result.hit = true;
             result.dist = t_hit;
@@ -320,12 +340,18 @@ fn raymarch(origin: vec3<f32>, dir: vec3<f32>, start_t: f32, q: MarchQuality) ->
         // handled by the occupancy-aware chunk/brick DDA above; in-brick grazing acceleration —
         // segment tracing with a local directional-Lipschitz bound — is a separate planned step.)
         let brick_exit = dist_to_brick_exit_lod(p, dir, lod);
+#ifdef SDF_GI_MARCH
+        // Plain sphere-trace step (omega = 1): the GI march skips over-relaxation, so no slope memo.
+        let step = clamp(d_eff, voxel_size * 0.01, brick_exit + voxel_size * 0.01);
+        t += step;
+#else
         let local_omega = select(OMEGA, 1.0, blending);
         let step = clamp(local_omega * d_eff, voxel_size * 0.01, brick_exit + voxel_size * 0.01);
         t += step;
         // Carry the slope memo for the Keinert undo + the linear-crossing hit refinement.
         prev_d = d_eff;
         prev_step = step;
+#endif
     }
 
     result.steps = MAX_STEPS;

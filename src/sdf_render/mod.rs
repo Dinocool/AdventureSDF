@@ -317,6 +317,34 @@ pub struct DdgiParams {
     /// are sparser, cutting probe COUNT (memory + ray work) where the GI is low-frequency anyway. The
     /// apply's coverage-weighted trilinear interpolates the gaps. Set high (≥ lod_count) to disable.
     pub probe_halve_lod: u32,
+    /// Sphere-trace step budget per GI ray (the slim GI march's `MAX_STEPS`). GI is low-frequency and the
+    /// temporal average hides the rare under-converged ray, so this can sit well below the primary pass's
+    /// budget. Lower = cheaper per ray (the dominant trace cost) but blockier far hits. Clamped 1..=64.
+    pub gi_march_steps: u32,
+    /// RELEVANCE CULL: finest probes whose chunk is outside the view cone AND beyond `cull_near_radius`
+    /// re-trace only `1/cull_off_stride` of the time (they keep their irradiance) — a moving camera then
+    /// spends its probe budget on what's on-screen instead of fully converging probes behind it. Off =
+    /// every finest probe traces at the normal (active/dormant) rate regardless of view.
+    pub relevance_cull: bool,
+    /// Re-trace rate for off-screen (culled) probes: `1/cull_off_stride` per frame. Larger = bigger
+    /// moving-camera savings + slower catch-up when the camera turns toward a culled region (the wake
+    /// system also re-activates edited regions). Only used when `relevance_cull`.
+    pub cull_off_stride: u32,
+    /// Probes within this world-space radius of the camera are ALWAYS relevant (never culled), regardless
+    /// of view direction — nearby surfaces behind/beside the camera can still bounce light onto on-screen
+    /// geometry, so a generous near shell avoids darkening contact GI when the camera turns.
+    pub cull_near_radius: f32,
+    /// View-cone cull threshold: a chunk is relevant if `dot(dir_to_chunk, camera_forward) > this`. −1 =
+    /// never cull (whole sphere relevant); 0 = cull the rear hemisphere; −0.2 ≈ keep a ~101° half-cone
+    /// (FOV + margin). Lower (toward −1) = more conservative (fewer culled); higher = more aggressive.
+    pub cull_cone_dot: f32,
+    /// PER-FRAME DISPATCH CAP: at most this many finest probe-chunks trace per frame (0 = unlimited).
+    /// On a scene load / fast camera, far more chunks become turn-eligible at once than a frame can
+    /// afford — that flood is the scene-start GPU dip. The cap bounds it, and the eligible chunks are
+    /// dispatched NEAREST-TO-CAMERA first, so visible GI converges first and the rest fill in over the
+    /// next frames. At steady state (few eligible) the cap never binds. Tune up for faster whole-scene
+    /// convergence, down for a smoother load.
+    pub max_probe_chunks_per_frame: u32,
 }
 
 impl Default for DdgiParams {
@@ -346,6 +374,19 @@ impl Default for DdgiParams {
             ray_falloff_lod: 4,
             distant_ray_count: 32,
             probe_halve_lod: 5,
+            // GI rays take a short step budget (the slim march): far cheaper than the primary pass, and
+            // the temporal average hides the occasional under-converged ray.
+            gi_march_steps: 16,
+            // Relevance cull ON by default: off-screen finest probes throttle to 1/64. Generous near shell
+            // (6 m) + a ~101° half-cone keep contact GI correct when the camera turns.
+            relevance_cull: true,
+            cull_off_stride: 64,
+            cull_near_radius: 6.0,
+            cull_cone_dot: -0.2,
+            // Cap the per-frame probe-chunk dispatch so a scene load / fast camera spreads convergence
+            // over frames (nearest-first) instead of one huge stall. 256 chunks × up to CHUNK_VOLUME
+            // bricks is ample for fast convergence yet tames the 1024-room flood; never binds on small scenes.
+            max_probe_chunks_per_frame: 256,
         }
     }
 }
@@ -451,6 +492,62 @@ fn update_probe_wake(
     }
     set.slots.clear();
     set.slots.extend(wake.frames.keys().copied());
+}
+
+/// The finest probe chunk-SLOTS currently CULLED by the relevance test — off-screen (outside the view
+/// cone) AND beyond the near shell. The render world's `prepare_sdf_probe` re-traces these only
+/// `1/cull_off_stride` of the time, so a moving camera spends its probe budget on what's visible. Built
+/// by [`update_probe_relevance`] (main world, where the camera lives) + extracted. `culled`/`total` ride
+/// along for the DDGI debug panel.
+#[derive(Resource, Clone, Default, bevy::render::extract_resource::ExtractResource)]
+pub struct ProbeRelevanceSet {
+    pub culled_slots: Vec<u32>,
+    pub culled: u32,
+    pub total: u32,
+    /// Finest chunk SLOT → squared distance from its world center to the camera. Filled for EVERY finest
+    /// chunk (independent of the cull toggle) so the render world's per-frame probe-dispatch CAP can
+    /// prioritise the nearest chunks (visible GI converges first during a load/fast-camera flood).
+    pub dist2_by_slot: std::collections::HashMap<u32, f32>,
+}
+
+/// Maintain the DDGI relevance-cull set: a finest-resident chunk whose world center is outside the
+/// camera's view cone (`dot(dir_to_chunk, forward) <= cull_cone_dot`) AND beyond `cull_near_radius` is
+/// CULLED — the render world throttles its probes to `1/cull_off_stride`. Cheap: O(finest chunks), one
+/// normalize + dot each. Disabled (or no SDF camera) → empty set (nothing culled). The wake set still
+/// overrides this in the render world, so an edited off-screen region re-converges promptly.
+fn update_probe_relevance(
+    atlas: Res<atlas::SdfAtlas>,
+    ddgi: Res<DdgiParams>,
+    config: Res<SdfGridConfig>,
+    cameras: Query<&GlobalTransform, With<SdfCamera>>,
+    mut set: ResMut<ProbeRelevanceSet>,
+) {
+    set.culled_slots.clear();
+    set.culled = 0;
+    set.total = 0;
+    set.dist2_by_slot.clear();
+    let Some(cam) = cameras.iter().next() else {
+        return; // no camera (headless / test) → nothing culled, no distances
+    };
+    let cam_pos = cam.translation();
+    let fwd = cam.forward().as_vec3();
+    let near2 = ddgi.cull_near_radius * ddgi.cull_near_radius;
+    for (ck, slot) in atlas.live_chunks.finest_slots_keyed() {
+        set.total += 1;
+        let center = chunk::chunk_min_world(ck, &config)
+            + Vec3::splat(0.5 * chunk::chunk_world_size(ck.lod, &config));
+        let to = center - cam_pos;
+        let d2 = to.length_squared();
+        // Distance is recorded for EVERY finest chunk (the dispatch cap uses it even with the cull off).
+        set.dist2_by_slot.insert(slot, d2);
+        if ddgi.relevance_cull {
+            let relevant = d2 <= near2 || to.normalize_or_zero().dot(fwd) > ddgi.cull_cone_dot;
+            if !relevant {
+                set.culled_slots.push(slot);
+                set.culled += 1;
+            }
+        }
+    }
 }
 
 /// Monotonic counter bumped on every scene switch ([`SceneSwitched`]) — the render-world SDF cache-reset
@@ -684,6 +781,7 @@ impl Plugin for SdfScenePlugin {
             .init_resource::<GiSettle>()
             .init_resource::<ProbeWake>()
             .init_resource::<ProbeWakeSet>()
+            .init_resource::<ProbeRelevanceSet>()
             .init_resource::<ProbeReset>()
             // `evict_on_scene_switch` reads this message; register it here too (idempotent) so the SDF
             // plugin is self-sufficient and doesn't depend on `SceneManagerPlugin` being added first.
@@ -793,6 +891,7 @@ impl Plugin for SdfScenePlugin {
             )
             .add_systems(Update, track_gi_settle.after(refresh_probe_lod))
             .add_systems(Update, update_probe_wake.after(track_gi_settle))
+            .add_systems(Update, update_probe_relevance.after(track_gi_settle))
             // Ungated: a scene switch fires as the state leaves the editor, so probe eviction must run
             // regardless of the current `AppScene`.
             .add_systems(Update, evict_on_scene_switch)
@@ -867,10 +966,15 @@ pub const DEFAULT_SCENE_PATH: &str = "assets/scenes/cornell.scene";
 /// needs the registry, since `registry_id`s are baked into the file.
 fn load_default_gallery(world: &mut World) {
     let registry = world.resource::<AppTypeRegistry>().clone();
-    let path = std::path::Path::new(DEFAULT_SCENE_PATH);
+    // Profiling/headless-capture aid: `ADVENTURE_STARTUP_SCENE=<path>` (project-root-relative) loads
+    // that scene instead of the default, so a Nsight capture can target a specific scene (e.g.
+    // `assets/scenes/cornell8.scene`) without any editor interaction. Mirrors `ADVENTURE_EXIT_AFTER_FRAMES`.
+    let startup = std::env::var("ADVENTURE_STARTUP_SCENE").ok();
+    let path_str = startup.as_deref().unwrap_or(DEFAULT_SCENE_PATH);
+    let path = std::path::Path::new(path_str);
     match crate::soul_scene::load_scene(world, path, &registry.read()) {
-        Ok(roots) => info!("loaded default scene ({} roots)", roots.len()),
-        Err(e) => error!("failed to load default scene: {e}"),
+        Ok(roots) => info!("loaded scene '{path_str}' ({} roots)", roots.len()),
+        Err(e) => error!("failed to load scene '{path_str}': {e}"),
     }
     // Restore the editor camera saved with the scene (if any), so launching frames the
     // gallery the way it was last saved.

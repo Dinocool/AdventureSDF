@@ -188,14 +188,14 @@ mod tests {
         println!("wrote assets/scenes/cornell.scene:\n{ron}");
     }
 
-    /// Generate the Cornell SCALING grid scenes (`cornell{k}.scene` for k = 2, 4, 8) — each a `k×k`
-    /// tiling of the room, used as the ever-larger test bed for DDGI scaling. Run with:
+    /// Generate the Cornell SCALING grid scenes (`cornell{k}.scene` for k = 2, 4, 8, 16, 32) — each a
+    /// `k×k` tiling of the room (k=32 ⇒ 1024 rooms), the ever-larger test bed for DDGI scaling. Run with:
     /// `cargo test -- generate_cornell_grid_scenes --nocapture`
     #[test]
     fn generate_cornell_grid_scenes() {
         let registry = cornell_registry();
         std::fs::create_dir_all("assets/scenes").expect("create assets/scenes");
-        for k in [2u32, 4, 8] {
+        for k in [2u32, 4, 8, 16, 32] {
             let mut world = World::new();
             spawn_cornell_grid(&mut world, k);
             let ron = crate::soul_scene::save_scene_to_string(&mut world, &registry)

@@ -15,7 +15,7 @@ use bevy::prelude::*;
 use bevy_egui::egui;
 use egui_dock::SurfaceIndex;
 
-use crate::scene_manager::{EditorEntity, SceneEntity};
+use crate::scene_manager::SceneEntity;
 use crate::sdf_render::{DEFAULT_SCENE_PATH, SdfOrbitCamera};
 use crate::soul_scene::{
     EditorCamera, LoadedEditorCamera, despawn_scene_content, load_scene, load_scene_from_str,
@@ -89,12 +89,11 @@ pub struct SceneDoc {
     /// Serialized contents for an *inactive* doc (carries unsaved edits across a swap). The
     /// active doc's truth is the world, so its snapshot is stale until it's swapped out.
     snapshot: Option<String>,
-    /// Contents as last saved/loaded — the clean baseline that dirty-detection compares
-    /// against. `None` until first captured (right after a load).
-    baseline: Option<String>,
     /// This scene's saved camera view, restored on activate.
     camera: Option<CameraState>,
-    /// Cached "has unsaved edits" flag (drives the tab's `*` marker and the close prompt).
+    /// "Has unsaved edits since the last save/load" — set by `mark_scene_dirty` from Bevy
+    /// change-detection (never from a full-scene serialize), cleared on load/save. Drives the
+    /// tab's `*` marker and the close prompt.
     pub dirty: bool,
 }
 
@@ -113,9 +112,10 @@ pub struct OpenScenes {
     pub close_request: Option<SceneId>,
     /// While `Some`, the unsaved-changes confirm dialog is showing for this (now-active) doc.
     confirm_close: Option<SceneId>,
-    /// Elapsed-seconds gate for the dirty re-check, so we don't serialize the whole scene
-    /// every frame just to refresh a cosmetic `*` marker.
-    next_dirty_check: f32,
+    /// Frames to suppress dirty-marking after a load/swap. The act of loading spawns scene
+    /// entities, which `mark_scene_dirty` would otherwise read as edits and flag the
+    /// freshly-loaded scene dirty. Set to 2 on every load/save; counts down in the system.
+    pub dirty_grace: u32,
 }
 
 impl Default for OpenScenes {
@@ -128,7 +128,6 @@ impl Default for OpenScenes {
                 path: Some(path),
                 title,
                 snapshot: None,
-                baseline: None,
                 camera: None,
                 dirty: false,
             }],
@@ -137,7 +136,7 @@ impl Default for OpenScenes {
             rendered: None,
             close_request: None,
             confirm_close: None,
-            next_dirty_check: 0.0,
+            dirty_grace: 0,
         }
     }
 }
@@ -149,6 +148,14 @@ impl OpenScenes {
 
     fn active_index(&self) -> Option<usize> {
         self.active.and_then(|a| self.index_of(a))
+    }
+
+    /// Flag the active doc as having unsaved edits. Called by [`mark_scene_dirty`] when
+    /// change-detection sees a scene edit; a no-op when no scene is open.
+    pub fn mark_active_dirty(&mut self) {
+        if let Some(i) = self.active_index() {
+            self.docs[i].dirty = true;
+        }
     }
 
     /// Title for the tab labelled `id` (with a `*` when dirty), or a fallback.
@@ -172,16 +179,6 @@ fn stem(path: &Path) -> String {
 fn serialize_world(world: &mut World, registry: &AppTypeRegistry) -> Option<String> {
     let reg = registry.read();
     save_scene_to_string(world, &reg).ok()
-}
-
-/// Whether the world currently holds any loaded scene content (excludes editor infra like
-/// the persistent camera). Used to avoid baselining a path-backed scene before it's loaded.
-fn scene_has_content(world: &mut World) -> bool {
-    world
-        .query_filtered::<(), (With<SceneEntity>, Without<EditorEntity>)>()
-        .iter(world)
-        .next()
-        .is_some()
 }
 
 /// Allocate a fresh scene id.
@@ -210,8 +207,9 @@ fn sync_current_path(world: &mut World) {
 
 // --- Swap primitives ---------------------------------------------------------------------
 
-/// Serialize the current active scene into its own doc (snapshot + camera + dirty), so a
-/// later activate can restore it exactly, edits and view included.
+/// Serialize the current active scene into its own doc (snapshot + camera), so a later
+/// activate can restore it exactly, edits and view included. The `dirty` flag is NOT touched
+/// here — it's owned by change-detection ([`mark_scene_dirty`]) and persists across the swap.
 fn snapshot_active(world: &mut World, registry: &AppTypeRegistry) {
     if world.resource::<OpenScenes>().active.is_none() {
         return; // nothing live to snapshot
@@ -224,20 +222,19 @@ fn snapshot_active(world: &mut World, registry: &AppTypeRegistry) {
     };
     let doc = &mut open.docs[i];
     if let Some(ron) = ron {
-        doc.dirty = doc.baseline.as_ref().is_none_or(|b| *b != ron);
         doc.snapshot = Some(ron);
     }
     doc.camera = Some(cam);
 }
 
 /// Replace the world's scene content with document `doc_index`'s: despawn the current scene,
-/// spawn from snapshot (preferred, carries edits) or disk path, restore its camera, and
-/// capture a clean baseline on first load.
+/// spawn from snapshot (preferred, carries edits) or disk path, restore its camera, and mark
+/// the freshly-loaded doc clean.
 fn load_doc_into_world(world: &mut World, registry: &AppTypeRegistry, doc_index: usize) {
-    let (snapshot, path, camera, has_baseline) = {
+    let (snapshot, path, camera) = {
         let open = world.resource::<OpenScenes>();
         let d = &open.docs[doc_index];
-        (d.snapshot.clone(), d.path.clone(), d.camera, d.baseline.is_some())
+        (d.snapshot.clone(), d.path.clone(), d.camera)
     };
 
     despawn_scene_content(world);
@@ -275,15 +272,13 @@ fn load_doc_into_world(world: &mut World, registry: &AppTypeRegistry, doc_index:
         world.resource_mut::<OpenScenes>().docs[doc_index].camera = Some(cam);
     }
 
-    // First time we materialize this doc, the freshly-loaded world IS the clean baseline.
-    // (Comparing serialize-of-loaded against serialize-of-current is like-for-like, so no
-    // spurious dirty from RON formatting differences.)
-    if !has_baseline
-        && let Some(base) = serialize_world(world, registry)
+    // The freshly-loaded world is the clean state, so the doc is no longer dirty. Suppress
+    // dirty-marking for the next couple of frames: this load just spawned all of the scene's
+    // entities, and `mark_scene_dirty` would otherwise read those spawns as edits.
     {
         let mut open = world.resource_mut::<OpenScenes>();
-        open.docs[doc_index].baseline = Some(base);
         open.docs[doc_index].dirty = false;
+        open.dirty_grace = 2;
     }
 }
 
@@ -335,40 +330,43 @@ fn set_dock_active(dock: &mut EditorDockState, id: SceneId) {
 
 // --- Request handling (called from show_editor_dock) -------------------------------------
 
-/// Interval (seconds) between dirty re-checks. Serializing the scene every frame just to
-/// keep the tab `*` marker live is wasteful; once a second is plenty.
-const DIRTY_CHECK_INTERVAL: f32 = 1.0;
+/// Flag the active scene dirty when change-detection sees a scene edit this frame. This is
+/// the whole of the `*`-marker logic: pure change-ticks, never a full-scene serialize.
+///
+/// The queries are evaluated EVERY frame even inside the grace window — querying advances the
+/// change-tick baseline (so next frame only sees genuinely new edits) and draining `removed`
+/// stops despawn events from piling up. We just skip the actual marking while `dirty_grace`
+/// is counting down, so a load's own spawns don't flag the freshly-loaded scene.
+#[allow(clippy::type_complexity)]
+pub fn mark_scene_dirty(
+    changed: Query<
+        (),
+        (
+            With<SceneEntity>,
+            Or<(
+                Changed<Transform>,
+                Changed<crate::sdf_render::SdfVolume>,
+                Changed<crate::sdf_render::SdfPrimitive>,
+                Changed<crate::sdf_render::SdfOp>,
+                Changed<crate::sdf_render::SdfOrder>,
+                Changed<crate::sdf_render::SdfMaterial>,
+                Changed<Name>,
+            )>,
+        ),
+    >,
+    spawned: Query<(), (With<SceneEntity>, Added<crate::sdf_render::SdfVolume>)>,
+    mut removed: RemovedComponents<crate::sdf_render::SdfVolume>,
+    mut scenes: ResMut<OpenScenes>,
+) {
+    // Drain/advance every query this frame (must happen before the grace early-out).
+    let any = !changed.is_empty() || !spawned.is_empty() || removed.read().count() > 0;
 
-/// Recompute the active doc's dirty flag from the live world, throttled to a few times a
-/// second. Keeps the tab `*` marker live without a per-frame full-scene serialize.
-pub fn refresh_active_dirty(world: &mut World, registry: &AppTypeRegistry) {
-    let now = world.resource::<Time>().elapsed_secs();
-    if now < world.resource::<OpenScenes>().next_dirty_check {
+    if scenes.dirty_grace > 0 {
+        scenes.dirty_grace -= 1;
         return;
     }
-    world.resource_mut::<OpenScenes>().next_dirty_check = now + DIRTY_CHECK_INTERVAL;
-
-    let Some(current) = serialize_world(world, registry) else {
-        return;
-    };
-    let loaded = scene_has_content(world);
-    let mut open = world.resource_mut::<OpenScenes>();
-    let Some(i) = open.active_index() else {
-        return; // no scene open
-    };
-    let doc = &mut open.docs[i];
-    match &doc.baseline {
-        // First sight of the startup scene (loaded by sdf_render, never through us): adopt
-        // the current serialization as the clean baseline — but not before a path-backed
-        // scene has actually loaded, else its first frame would look spuriously dirty.
-        None => {
-            if doc.path.is_some() && !loaded {
-                return;
-            }
-            doc.baseline = Some(current);
-            doc.dirty = false;
-        }
-        Some(base) => doc.dirty = *base != current,
+    if any {
+        scenes.mark_active_dirty();
     }
 }
 
@@ -411,18 +409,14 @@ pub fn drain_requests(world: &mut World, dock: &mut EditorDockState, registry: &
 }
 
 /// Serialize the active world scene, write it to `dest` (with the current editor camera
-/// embedded), and adopt it as the doc's path + clean baseline. The baseline is camera-free
-/// so that merely moving the camera doesn't flag the scene dirty.
+/// embedded), adopt it as the doc's path, and mark the doc clean (this IS the saved state).
 fn save_active_to(world: &mut World, registry: &AppTypeRegistry, dest: &Path) {
     let camera = CameraState::capture(world.resource::<SdfOrbitCamera>()).to_editor_camera();
-    let (file_ron, baseline_ron) = {
+    let file_ron = {
         let reg = registry.read();
-        (
-            save_scene_to_string_with_camera(world, &reg, Some(camera)),
-            save_scene_to_string(world, &reg),
-        )
+        save_scene_to_string_with_camera(world, &reg, Some(camera))
     };
-    let (Ok(file_ron), Ok(baseline_ron)) = (file_ron, baseline_ron) else {
+    let Ok(file_ron) = file_ron else {
         error!("scene save failed: could not serialize world");
         notify_error(world, "Save failed: could not serialize scene");
         return;
@@ -448,7 +442,6 @@ fn save_active_to(world: &mut World, registry: &AppTypeRegistry, dest: &Path) {
         let doc = &mut open.docs[i];
         doc.path = Some(dest.to_path_buf());
         doc.title = stem(dest);
-        doc.baseline = Some(baseline_ron);
         doc.dirty = false;
     }
     sync_current_path(world);
@@ -488,7 +481,6 @@ fn open_path_as_tab(world: &mut World, dock: &mut EditorDockState, registry: &Ap
         path: Some(path.to_path_buf()),
         title: stem(path),
         snapshot: None,
-        baseline: None,
         camera: None,
         dirty: false,
     });
@@ -504,7 +496,6 @@ fn new_scene_tab(world: &mut World, dock: &mut EditorDockState, registry: &AppTy
         path: None,
         title: format!("untitled-{id}"),
         snapshot: None, // no snapshot + no path ⇒ loads as an empty world
-        baseline: None,
         camera: None,
         dirty: false,
     });
@@ -531,12 +522,8 @@ pub fn handle_close(
     ctx: &egui::Context,
 ) {
     if let Some(id) = world.resource_mut::<OpenScenes>().close_request.take() {
-        // The dirty flag is throttled, so for the active doc force a fresh check before
-        // deciding whether to prompt — otherwise a just-edited scene could close silently.
-        if world.resource::<OpenScenes>().active == Some(id) {
-            world.resource_mut::<OpenScenes>().next_dirty_check = 0.0;
-            refresh_active_dirty(world, registry);
-        }
+        // `dirty` is kept live every frame by `mark_scene_dirty`, so it's already accurate
+        // here — no recompute needed before deciding whether to prompt.
         let dirty = world
             .resource::<OpenScenes>()
             .docs

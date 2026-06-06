@@ -1485,9 +1485,9 @@ fn trace_scene(
         mapped_at_creation: false,
     });
     // ProbeParams { ray_count, hysteresis, intensity, frame, subdiv, update_stride, gi_range,
-    // normal_bias, view_bias, sky_intensity, bounce_shadows, dormant_stride, classify } — frame 0 (no
-    // history). MUST match the field order of the Rust `ProbeParams` (render/probe.rs) + the WGSL copies (no parity test
-    // guards this). 11 scalars = 44 B, padded up to the std140 uniform size (48 B = next ×16).
+    // normal_bias, view_bias, sky_intensity, bounce_shadows, dormant_stride, classify, ray_falloff_lod,
+    // distant_ray_count, gi_steps } — frame 0 (no history). MUST match the field order of the Rust
+    // `ProbeParams` (render/probe.rs) + the WGSL copies (no parity test guards this). 16 scalars = 64 B.
     let mut params = Vec::new();
     params.extend_from_slice(&ray_count.to_le_bytes());
     params.extend_from_slice(&0.95f32.to_le_bytes()); // hysteresis → N_max≈20 (progressive average)
@@ -1509,6 +1509,7 @@ fn trace_scene(
     params.extend_from_slice(&0u32.to_le_bytes()); // classify = 0 (gates don't exercise dormancy)
     params.extend_from_slice(&99u32.to_le_bytes()); // ray_falloff_lod = 99 (disabled → full rays at all LODs)
     params.extend_from_slice(&32u32.to_le_bytes()); // distant_ray_count (unused when falloff disabled)
+    params.extend_from_slice(&24u32.to_le_bytes()); // gi_steps (prior hardcoded march budget — keeps gates stable)
     params.resize(64, 0);
     let params_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("params"),

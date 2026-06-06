@@ -61,6 +61,8 @@ struct ProbeParams {
     /// LOD ≥ this → the probe traces `distant_ray_count` rays instead of `ray_count` (far field needs less).
     ray_falloff_lod: u32,
     distant_ray_count: u32,
+    /// Sphere-trace step budget per GI ray (the slim march's `MAX_STEPS`).
+    gi_steps: u32,
 }
 
 #[derive(Resource)]
@@ -78,6 +80,7 @@ pub(super) struct ExtractedResidentChunks {
 /// rows and early-outing on the GPU — bounds the workgroup count to the clipmap window, not the
 /// all-LOD union (the perf half of the scaling fix).
 pub(super) fn extract_resident_chunks(atlas: Extract<Res<SdfAtlas>>, mut commands: Commands) {
+    let _span = info_span!("extract_resident_chunks").entered();
     commands.insert_resource(ExtractedResidentChunks { rows: atlas.live_chunks.finest_rows() });
 }
 
@@ -146,6 +149,10 @@ pub(super) fn init_probe_pipeline(
             sdf_pipeline.layout_3.clone(), // g3: point lights + light grid (shared w/ the G-buffer pass)
         ],
         shader: probe_shader.0.clone(),
+        // GI rays use a SLIM raymarch variant: this def compiles `sdf::march` (and the bounce-shadow
+        // march it shares) without the LOD-crossfade morph, over-relaxation and sub-step hit refinement
+        // — fewer live registers in the hot loop → higher occupancy on this register-bound kernel.
+        shader_defs: vec!["SDF_GI_MARCH".into()],
         ..default()
     });
 
@@ -207,9 +214,13 @@ pub(super) fn prepare_sdf_probe(
     // Bumped on a scene switch → recreate (zero) the irradiance buffer so the new scene never inherits
     // the previous scene's GI. Optional: absent before the first extract.
     reset_res: Option<Res<crate::sdf_render::ProbeReset>>,
+    // Finest chunk slots culled by the view-relevance test (off-screen + beyond the near shell) — they
+    // re-trace only `1/cull_off_stride`. Optional: absent before the first extract.
+    relevance: Option<Res<crate::sdf_render::ProbeRelevanceSet>>,
     resident: Res<ExtractedResidentChunks>,
     mut bufs: ResMut<SdfProbeBuffers>,
 ) {
+    let _span = info_span!("prepare_sdf_probe").entered();
     // Probes may go dormant only once the scene has been SETTLED (no topology/lighting change) for at
     // least the convergence window — long enough for every probe to reach its sample cap at the active
     // re-trace rate. While unsettled, classification is off (full re-trace), so a change re-converges
@@ -261,7 +272,22 @@ pub(super) fn prepare_sdf_probe(
     // to the budget) so growth happens in a handful of steps, never shrinking — UNLESS a scene switch
     // asked for a clean zeroed buffer.
     if need > bufs.capacity || subdiv != bufs.subdiv || reset_changed {
-        let new_cap = (need as u64 + need as u64 / 4).min(cap_slots).max(need as u64) as u32;
+        // INSTRUMENTED: recreating this (hundreds-of-MB) buffer is a ~200 ms hitch on a huge scene AND
+        // drops all converged GI. It was uninstrumented — an editing hitch showed only as an anonymous
+        // gap in the render schedule. Span + log it, and GROW BY DOUBLING (was +25%) so a resident-set
+        // grow during editing rarely outruns the slack. (A subdiv flip still forces a recreate — logged
+        // so a near-budget scene flickering subdiv is visible; the complete fix is a grow-with-GPU-copy.)
+        let _span = info_span!("sdf_probe_irr_recreate").entered();
+        let new_cap = (need as u64).saturating_mul(2).min(cap_slots).max(need as u64) as u32;
+        debug!(
+            "probe irradiance recreate ({:.0} MB): need={} cap={} subdiv {}→{} reset={}",
+            new_cap as f64 * 16.0 / (1u64 << 20) as f64,
+            need,
+            bufs.capacity,
+            bufs.subdiv,
+            subdiv,
+            reset_changed,
+        );
         // Fresh (zeroed) buffer — history starts empty, so frame 0 takes the traced value directly.
         bufs.irr = device.create_buffer(&BufferDescriptor {
             label: Some("sdf_probe_irr"),
@@ -290,15 +316,55 @@ pub(super) fn prepare_sdf_probe(
     // a big static scene stays cheap — localized wake, no global FPS cliff.
     let wake: std::collections::HashSet<u32> =
         wake_set.map(|w| w.slots.iter().copied().collect()).unwrap_or_default();
+    // View-relevance cull: off-screen finest chunks re-trace at the (large) `cull_off_stride`, so a moving
+    // camera doesn't fully converge probes behind it. Wake overrides cull (an edited region updates even
+    // off-screen); cull never traces MORE often than dormant.
+    let cull: std::collections::HashSet<u32> =
+        relevance.as_ref().map(|r| r.culled_slots.iter().copied().collect()).unwrap_or_default();
+    let cull_stride = params_res.cull_off_stride.max(1).max(dormant_stride);
     let frame = bufs.frame;
-    let mut bytes = Vec::with_capacity(resident.rows.len() / dormant_stride as usize * 24 + 24);
-    let mut dispatched = 0u32;
+
+    // Collect the finest chunks whose round-robin turn is THIS frame (wake = active rate, cull = slow,
+    // else dormant). The actual dispatch is then bounded by the cap below.
+    let mut eligible: Vec<&ChunkLookup> = Vec::new();
     for c in &resident.rows {
         let slot = c.tile_run_base / TILE_RUN_SLOT;
-        let s = if wake.contains(&slot) { active_stride } else { dormant_stride };
+        let s = if wake.contains(&slot) {
+            active_stride
+        } else if cull.contains(&slot) {
+            cull_stride
+        } else {
+            dormant_stride
+        };
         if slot % s != frame % s {
             continue; // not this chunk's turn — it keeps its in-place irradiance (covered another frame)
         }
+        eligible.push(c);
+    }
+    // PER-FRAME CAP + NEAREST-FIRST PRIORITY: on a scene load / fast camera, far more chunks become
+    // turn-eligible than a frame can afford (the scene-start GPU dip). Dispatch only the nearest `cap`
+    // this frame (visible GI converges first); the rest get their next turn. `dist2_by_slot` comes from
+    // `update_probe_relevance` (camera distance per finest chunk). At steady state the cap never binds.
+    let cap = params_res.max_probe_chunks_per_frame as usize;
+    if cap > 0 && eligible.len() > cap {
+        let dist = relevance.as_ref().map(|r| &r.dist2_by_slot);
+        eligible.sort_by(|a, b| {
+            let da = dist
+                .and_then(|m| m.get(&(a.tile_run_base / TILE_RUN_SLOT)))
+                .copied()
+                .unwrap_or(f32::MAX);
+            let db = dist
+                .and_then(|m| m.get(&(b.tile_run_base / TILE_RUN_SLOT)))
+                .copied()
+                .unwrap_or(f32::MAX);
+            da.total_cmp(&db)
+        });
+        eligible.truncate(cap);
+    }
+
+    let mut bytes = Vec::with_capacity(eligible.len() * 24 + 24);
+    let mut dispatched = 0u32;
+    for c in &eligible {
         for v in [c.key_hi, c.key_lo, c.occ_lo, c.occ_hi, c.tile_run_base, c.probe_base] {
             bytes.extend_from_slice(&v.to_le_bytes());
         }
@@ -332,6 +398,7 @@ pub(super) fn prepare_sdf_probe(
         classify: 0,
         ray_falloff_lod: params_res.ray_falloff_lod,
         distant_ray_count: params_res.distant_ray_count.max(1),
+        gi_steps: params_res.gi_march_steps.clamp(1, 64),
     };
     let mut ubytes = bevy::render::render_resource::encase::UniformBuffer::new(Vec::<u8>::new());
     ubytes.write(&p).unwrap();

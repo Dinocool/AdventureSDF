@@ -30,14 +30,20 @@ editor = [
 # Build with `--features renderdoc` (add `--no-default-features` to drop `fast`/dynamic_linking,
 # which RenderDoc can't hook).
 renderdoc = ["editor", "dep:renderdoc", "dep:libloading"]
-# Emit shader debug info (naga `OpLine`) by enabling wgpu `InstanceFlags::DEBUG`, so an NVIDIA
-# Nsight Graphics GPU-Trace capture can map sampled GPU cost to shader line numbers + keeps the
-# regime/per-pass timing in `perf.json` source-aware. OFF by default (debug info bloats shaders +
-# slightly slows pipeline creation); build with `--features editor,shader-debug` when profiling.
-# (Per-WGSL-line *source* view in Nsight needs embedded `OpSource`, which Bevy/wgpu don't emit —
-# decoupled_naga didn't surface it either; we attribute cost by region via ablation instead. See
-# `rdoc/scripts/ngfx` + the `profile-shaders` skill.)
-shader-debug = []
+# Emit shader debug info for an NVIDIA Nsight Graphics GPU-Trace, so sampled GPU cost maps to WGSL
+# SOURCE + line numbers (not just per-pass). Two halves, both needed:
+#   1. `InstanceFlags::DEBUG` (set in `main.rs::wgpu_settings` under this cfg) → naga's SPIR-V backend
+#      turns on `WriterFlags::DEBUG` (emits `OpSource`/`OpLine`).
+#   2. `bevy_render/decoupled_naga` → Bevy re-serializes the composed naga module back to a WGSL STRING
+#      (`bevy_shader::shader_cache`) and hands wgpu `ShaderSource::Wgsl`. Without it Bevy hands wgpu a
+#      bare `ShaderSource::Naga` whose source string is empty, so wgpu-core sets `debug_source = None`
+#      and naga emits NO `OpSource`/`OpLine` regardless of the DEBUG flag (wgpu Discussion #7761).
+# The embedded source is the COMPOSED/round-tripped WGSL (one synthetic file per pipeline), so Nsight
+# shows real shader text per line, but line numbers map to that composed blob, not the original
+# `assets/shaders/**.wgsl`. Full NonSemantic step-through isn't reachable (naga emits only legacy debug
+# info). OFF by default (round-trip + debug info bloat shaders / slow pipeline creation); build with
+# `--features editor,shader-debug` when profiling. See `rdoc/scripts/ngfx` + the `profile-shaders` skill.
+shader-debug = ["bevy_render/decoupled_naga"]
 # Faster incremental compiles via dynamic linking of Bevy. Dev-only — never ship.
 # (Disable with `--no-default-features` when capturing in RenderDoc, which can't inject
 # into a dynamically-linked Bevy.)
@@ -71,6 +77,13 @@ bevy = { version = "0.18", default-features = false, features = [
 ] }
 bevy_brp_extras = "0.18"
 bevy_rapier3d = "0.34.0"
+# Direct dep on the SAME bevy_render the `bevy` umbrella already uses (Cargo unifies it — no extra
+# build cost, no second copy) so `shader-debug` can flip its `decoupled_naga` feature (round-trips
+# composed shaders to a WGSL string → naga emits `OpSource`/`OpLine` for Nsight). MUST be non-optional:
+# declaring it makes `bevy_manifest` emit `bevy_render::` paths in the ShaderType/etc. derives, which
+# only resolve if the crate is always present — an `optional = true` dep breaks every non-shader-debug
+# build (`bevy_render` unresolved). Not referenced by name in code; a feature/path carrier only.
+bevy_render = { version = "0.18", default-features = false }
 wgpu = "27"
 # Fast non-cryptographic hasher (the rustc compiler's own FxHash) for the hot integer-keyed maps
 # in the SDF bake path — brick/chunk/tile lookups per baked brick. std's SipHash is ~3–5× slower
