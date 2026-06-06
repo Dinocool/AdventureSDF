@@ -14,6 +14,7 @@
 use std::sync::Arc;
 
 use bevy::prelude::*;
+use bevy::camera::primitives::Frustum;
 use bevy::tasks::{ComputeTaskPool, ParallelSlice};
 
 use super::atlas::{self, SdfAtlas};
@@ -32,17 +33,20 @@ use super::tower_field;
 mod window;
 pub use window::ring_chunk_origin;
 use window::{
-    FULL_CHUNK_MASK, bricks_in_aabb_windowed, chunk_has_geometry_with, chunk_in_window,
-    for_each_brick_key, for_each_brick_key_masked, for_each_entered_chunk, for_each_exited_chunk,
+    FULL_CHUNK_MASK, bricks_in_aabb_windowed, chunk_conservative_mask, chunk_has_geometry_with,
+    chunk_in_inner_hole, chunk_in_shell, for_each_brick_key, for_each_brick_key_masked,
+    for_each_entered_chunk, for_each_entered_shell, for_each_exited_chunk, for_each_exited_shell,
     ivec_floor_div,
 };
+#[cfg(test)]
+use window::chunk_in_window;
 #[cfg(test)]
 use window::{chunk_brick_keys, chunk_window_keys, chunks_in_aabb_windowed};
 
 // The read-only classify core (Send; runs in parallel across the compute pool). Bare names
 // re-imported so the bake path + the in-file tests use them unqualified.
 mod classify;
-use classify::{Verdict, classify_candidates, snapshot_hash_peek};
+use classify::{Verdict, classify_candidates, narrow_band_keep, snapshot_hash_peek};
 
 /// One brick the GPU compute bake must fill this frame. The CPU has already done the
 /// topology work (BVH cull → `edit_indices` into the frame's flat edit list, palette,
@@ -156,6 +160,10 @@ pub struct BakeScheduler {
     /// and priority only change when the camera moves, so `refresh_ready` skips that O(ready) pass
     /// while the camera is stationary (a cold bake) — the only time `ready` is large.
     ready_maint_cam: Vec3,
+    /// Camera FORWARD direction `ready` was last priority-sorted at. A rotation-only move (same
+    /// position, new look direction) changes the in-frustum priority bucket without moving the camera,
+    /// so `refresh_ready` re-sorts when EITHER position OR forward changed. Sentinel until first sort.
+    ready_maint_fwd: Vec3,
 }
 
 /// Per-frame scratch buffers for `emit_gpu_bakes`, held on the scheduler so their capacity
@@ -215,6 +223,7 @@ impl Default for BakeScheduler {
             // Sentinel ≠ any real camera so the first `refresh_ready` with a non-empty ready runs
             // the window-filter/sort once.
             ready_maint_cam: Vec3::splat(f32::INFINITY),
+            ready_maint_fwd: Vec3::ZERO,
         }
     }
 }
@@ -267,6 +276,56 @@ const _: () = assert!(SOFT_BAKE_BUDGET <= GPU_BAKE_JOB_CAP, "soft budget must st
 /// and flythrough MAX vs 128). Stays above `ASYNC_BAKE_THRESHOLD` so a full batch still goes off-thread.
 const CLASSIFY_REFILL_CHUNKS: usize = 128;
 
+/// √3, the chunk bounding-sphere radius factor: a cube of edge `s` has half-diagonal `s·√3/2`.
+const SQRT_3: f32 = 1.732_050_8;
+
+/// A camera frustum reduced to its 6 inward half-spaces (`normal·p + d ≥ 0` inside), copied from Bevy's
+/// `Frustum` so the scheduler holds no ECS borrow. Used ONLY for bake PRIORITY (in-view bakes first),
+/// never for residency (off-screen geometry stays resident for shadows/GI).
+#[derive(Clone, Copy)]
+struct FrustumPlanes([Vec4; 6]);
+
+impl FrustumPlanes {
+    /// Conservative in-view test for a bounding sphere: 1 (out of view ⇒ sorts later) when the sphere
+    /// lies fully OUTSIDE any plane within `margin` slack; 0 (in view / straddling) otherwise.
+    fn out_rank(&self, center: Vec3, radius: f32, margin: f32) -> u32 {
+        let p = center.extend(1.0);
+        for plane in self.0 {
+            if plane.dot(p) < -(radius + margin) {
+                return 1;
+            }
+        }
+        0
+    }
+}
+
+/// Camera state threaded into the bake-PRIORITY path: position (proximity), look direction (so a
+/// rotation-only move still re-sorts the carry queue), and the optional frustum (in-view first). A
+/// `None` frustum degrades to distance-only ordering (camera without a `Frustum` component, or a
+/// headless settle/perf driver).
+#[derive(Clone, Copy)]
+struct BakeView {
+    pos: Vec3,
+    fwd: Vec3,
+    frustum: Option<FrustumPlanes>,
+    margin: f32,
+}
+
+impl BakeView {
+    /// Distance-only view (no frustum) — the graceful fallback and the headless drive helpers.
+    fn pos_only(pos: Vec3) -> Self {
+        Self { pos, fwd: Vec3::ZERO, frustum: None, margin: 0.0 }
+    }
+}
+
+/// So the headless settle/perf drivers (and any caller without a frustum) can pass a bare camera
+/// position where a [`BakeView`] is expected — distance-only ordering.
+impl From<Vec3> for BakeView {
+    fn from(pos: Vec3) -> Self {
+        Self::pos_only(pos)
+    }
+}
+
 /// Take the `max_chunks` highest-priority (coarse-LOD/nearest-camera first) chunks from `pending` into
 /// `out`, leaving the rest IN `pending` for a later frame. Bounds the per-frame classify batch.
 ///
@@ -278,7 +337,7 @@ fn drain_priority_batch(
     pending: &mut rustc_hash::FxHashMap<chunk::ChunkKey, u64>,
     out: &mut Vec<(chunk::ChunkKey, u64)>,
     config: &SdfGridConfig,
-    camera_pos: Vec3,
+    view: &BakeView,
     max_chunks: usize,
 ) {
     out.clear();
@@ -286,9 +345,9 @@ fn drain_priority_batch(
         return;
     }
     // Each taken chunk carries its dirty-brick mask forward so gather/classify touch only those bricks.
-    let mut keyed: Vec<(u64, chunk::ChunkKey, u64)> = pending
+    let mut keyed: Vec<(u128, chunk::ChunkKey, u64)> = pending
         .iter()
-        .map(|(&ck, &mask)| (chunk_priority_key(ck, config, camera_pos), ck, mask))
+        .map(|(&ck, &mask)| (chunk_priority_key(ck, config, view), ck, mask))
         .collect();
     let k = max_chunks.min(keyed.len());
     if keyed.len() > k {
@@ -303,15 +362,26 @@ fn drain_priority_batch(
     }
 }
 
-/// Packed bake-drain priority for a chunk: coarse-LOD-first (the coarse ring fills before fine, so a
-/// cap only ever spills fine detail whose coarse fallback is resident), then nearest-camera-first
-/// within an LOD. Higher LOD ⇒ smaller key; nearer ⇒ smaller key. Matches `sort_drained`'s order but
-/// as one `u64` so it sorts/partitions with cheap integer comparisons (the key math runs once each).
-fn chunk_priority_key(ck: chunk::ChunkKey, config: &SdfGridConfig, camera_pos: Vec3) -> u64 {
+/// Packed bake-drain priority for a chunk, ordered coarsest → in-view → nearest (smaller = bakes
+/// first):
+/// 1. **Coarse LOD first** (`u32::MAX - lod`) — UNCHANGED and kept the most-significant field: the
+///    coarse ring fills before fine, so a budget cap only ever spills fine detail whose coarser
+///    fallback is already resident (the hole-free coverage invariant the chunk-atomic make-before-break
+///    relies on). Frustum must NOT outrank this.
+/// 2. **In view** (`frustum_rank`: 0 in/straddling, 1 out) — within an LOD, what the camera is looking
+///    at bakes before off-screen regions. Distance-only (rank 0 everywhere) when no frustum.
+/// 3. **Nearest camera** (`d2`) — finest tiebreak.
+///
+/// Packed into a `u128` so it sorts/partitions with cheap integer comparisons (key math runs once each).
+fn chunk_priority_key(ck: chunk::ChunkKey, config: &SdfGridConfig, view: &BakeView) -> u128 {
     let size = chunk::chunk_world_size(ck.lod, config);
     let center = chunk::chunk_min_world(ck, config) + Vec3::splat(size * 0.5);
-    let d2 = camera_pos.distance_squared(center);
-    (u64::from(u32::MAX - ck.lod) << 32) | u64::from(d2.to_bits())
+    let d2 = view.pos.distance_squared(center);
+    let frustum_rank = match &view.frustum {
+        Some(planes) => planes.out_rank(center, size * 0.5 * SQRT_3, view.margin),
+        None => 0,
+    };
+    (u128::from(u32::MAX - ck.lod) << 33) | (u128::from(frustum_rank) << 32) | u128::from(d2.to_bits())
 }
 
 /// GEOMETRY-DRIVEN bake dirtying: enqueue every chunk each AABB's footprint reaches, at every LOD,
@@ -332,7 +402,41 @@ fn dirty_edit_footprints(
         let origin = ring_chunk_origin(config, camera_pos, lod);
         for aabb in aabbs {
             for (ck, mask) in bricks_in_aabb_windowed(config, aabb, lod, origin, r) {
+                // Skip chunks inside this LOD's inner hole — a finer LOD already covers them, so baking
+                // them here is the redundant-stack work we're eliminating ({native..native+overlap}).
+                if chunk_in_inner_hole(config, camera_pos, ck) {
+                    continue;
+                }
                 dirty_mask(pending, ck, mask);
+            }
+        }
+    }
+}
+
+/// Recompute the CONSERVATIVE occupancy (the empty-space DDA's traversal grid) for every FULL-RING
+/// chunk the edits' footprints touch — the edit-side counterpart of the recenter's cons pass. The
+/// recenter only fires on camera motion, so an add/remove/move with a stationary camera must refresh
+/// cons here or a moved object's new (coarse-LOD) position would keep stale `cons_occ`. No shell hole
+/// (full ring); reads the post-refit BVH. Pass the changed edits' old∪new AABBs (incremental) or all
+/// gathered AABBs (full re-gather).
+#[expect(clippy::too_many_arguments)]
+fn refresh_conservative_footprints(
+    atlas: &mut SdfAtlas,
+    aabbs: &[bevy::math::bounding::Aabb3d],
+    edits: &[edits::ResolvedEdit],
+    bvh: &bvh::Bvh,
+    config: &SdfGridConfig,
+    camera_pos: Vec3,
+    scratch: &mut Vec<u32>,
+    stack: &mut Vec<u32>,
+) {
+    let r = config.ring_chunks_per_axis();
+    for lod in 0..config.lod_count {
+        let origin = ring_chunk_origin(config, camera_pos, lod);
+        for aabb in aabbs {
+            for (ck, _mask) in bricks_in_aabb_windowed(config, aabb, lod, origin, r) {
+                let mask = chunk_conservative_mask(ck, edits, bvh, config, scratch, stack);
+                atlas.set_conservative_chunk(ck, mask, config);
             }
         }
     }
@@ -398,7 +502,11 @@ fn dirty_moving_edit(
             }
             if lo == hi {
                 let (ck, local) = chunk::chunk_of(atlas::BrickKey::new(lod, lo * s), config);
-                dirty_mask(pending, ck, 1u64 << local);
+                // Skip the inner hole (finer LOD covers it) — keeps a near edit's coarse LODs out of
+                // the redundant stack.
+                if !chunk_in_inner_hole(config, camera_pos, ck) {
+                    dirty_mask(pending, ck, 1u64 << local);
+                }
                 continue;
             }
             // Split the LONGEST axis at its midpoint (binary BSP — interior prunes in O(surface)).
@@ -442,7 +550,7 @@ type ChangedEdit = ChangedEditFilter;
 /// chunks), dirties edited regions, does per-brick topology (BVH cull, palette, tile alloc),
 /// and emits GPU compute bake jobs. The per-voxel eval runs on the GPU. All integer window
 /// math + Arc clones + a 9-point palette per dirty brick — microseconds.
-#[expect(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments, clippy::type_complexity)]
 pub fn schedule_bakes(
     mut atlas: ResMut<SdfAtlas>,
     mut bvh: ResMut<bvh::Bvh>,
@@ -453,7 +561,7 @@ pub fn schedule_bakes(
     volumes: Query<VolumeQueryData, With<SdfVolume>>,
     changed: Query<Entity, (With<SdfVolume>, ChangedEdit)>,
     mut removed: RemovedComponents<SdfVolume>,
-    camera: Query<&Transform, (With<SdfCamera>, Without<SdfVolume>)>,
+    camera: Query<(&Transform, Option<&Frustum>), (With<SdfCamera>, Without<SdfVolume>)>,
     mut baked_dbg: ResMut<super::BakedBrickDebug>,
     time: Res<Time>,
 ) {
@@ -470,9 +578,22 @@ pub fn schedule_bakes(
     // frame's. `gpu_baked_tiles` likewise holds only THIS frame's GPU-written tiles.
     gpu_bakes.clear();
     atlas.gpu_baked_tiles.clear();
-    let camera_pos = camera.iter().next().map(|t| t.translation).unwrap_or(Vec3::ZERO);
+    let cam = camera.iter().next();
+    let camera_pos = cam.map(|(t, _)| t.translation).unwrap_or(Vec3::ZERO);
+    // Bake-priority view: position (proximity) + optional frustum (in-view first). The frustum is a
+    // PRIORITY hint only — residency stays view-independent. `update_frusta` runs each frame, so a
+    // one-frame-stale frustum is fine for ordering.
+    let bake_view: BakeView = match cam {
+        Some((t, Some(frustum))) => BakeView {
+            pos: t.translation,
+            fwd: *t.forward(),
+            frustum: Some(FrustumPlanes(frustum.half_spaces.map(|hs| hs.normal_d()))),
+            margin: config.frustum_priority_margin,
+        },
+        Some((t, None)) => BakeView::pos_only(t.translation),
+        None => BakeView::pos_only(Vec3::ZERO),
+    };
     let lod_count = config.lod_count;
-    let r = config.ring_chunks_per_axis();
     let first_run = sched.ring_chunk_origin.is_empty();
     if first_run {
         sched.ring_chunk_origin = vec![IVec3::splat(i32::MIN); lod_count as usize];
@@ -522,6 +643,17 @@ pub fn schedule_bakes(
                 dirty_mask(&mut sched.pending, ck, FULL_CHUNK_MASK);
             }
             atlas.rebake_all = false;
+            // Edit-side CONSERVATIVE refresh for the changed geometry (add/remove/scene change with a
+            // stationary camera — the recenter won't fire). On the FIRST run the recenter's
+            // sentinel→entered pass populates the whole ring, so skip the redundant footprint sweep.
+            if !first_run {
+                let redits = Arc::clone(&sched.edits);
+                let mut cscratch: Vec<u32> = Vec::new();
+                let mut cstack: Vec<u32> = Vec::new();
+                refresh_conservative_footprints(
+                    &mut atlas, &aabbs, &redits, &bvh, &config, camera_pos, &mut cscratch, &mut cstack,
+                );
+            }
             invalidate_ready_on_edit_change(&mut sched, &config, true);
             prev_aabbs.map = current;
         } else {
@@ -531,6 +663,8 @@ pub fn schedule_bakes(
             // Arcs have refcount 1 (the per-frame `Arc::clone` in `emit_gpu_bakes` is already dropped).
             let _g = info_span!("sched_refit_incremental").entered();
             sched.edit_gen = sched.edit_gen.wrapping_add(1);
+            let mut move_cstack: Vec<u32> = Vec::new();
+            let mut move_cscratch: Vec<u32> = Vec::new();
             for entity in &changed {
                 let Some(&idx) = sched.entity_index.get(&entity) else { continue };
                 let Ok((_, t, p, op, _order, m)) = volumes.get(entity) else { continue };
@@ -545,6 +679,24 @@ pub fn schedule_bakes(
                 Arc::make_mut(&mut sched.edits)[idx as usize] = resolved;
                 Arc::make_mut(&mut sched.bvh).refit_edit(idx, new_aabb);
                 bvh.refit_edit(idx, new_aabb);
+                // Refresh cons over the moved edit's old∪new footprint (post-refit BVH) so the DDA sees
+                // it at its new coarse-LOD position and drops it at the old one.
+                let old_aabb = edits::edit_world_aabb(
+                    &old_resolved.prim,
+                    &old_resolved.transform,
+                    old_resolved.op.smoothing,
+                );
+                let medits = Arc::clone(&sched.edits);
+                refresh_conservative_footprints(
+                    &mut atlas,
+                    &[old_aabb, new_aabb],
+                    &medits,
+                    &bvh,
+                    &config,
+                    camera_pos,
+                    &mut move_cscratch,
+                    &mut move_cstack,
+                );
                 prev_aabbs.map.insert(entity, new_aabb);
             }
             // Indices stable → keep the far carry backlog, drop only the re-dirtied footprint.
@@ -559,7 +711,10 @@ pub fn schedule_bakes(
     // makes the render world re-extract and drop the stale bricks — it doesn't depend on a bake
     // being applied that frame.
     let g_recenter = info_span!("sched_recenter").entered();
+    let r = config.ring_chunks_per_axis();
     let mut bvh_stack: Vec<u32> = Vec::new();
+    let mut cons_scratch: Vec<u32> = Vec::new();
+    let cons_edits = Arc::clone(&sched.edits);
     for lod in 0..lod_count {
         let li = lod as usize;
         let new_origin = ring_chunk_origin(&config, camera_pos, lod);
@@ -567,33 +722,55 @@ pub fn schedule_bakes(
         if new_origin == old_origin {
             continue;
         }
-        // Entered chunks → enqueue a bake, but skip empty ones: an entered chunk has no
+        // Entered SHELL chunks → enqueue a bake, but skip empty ones: an entered chunk has no
         // resident bricks yet, so a chunk no edit reaches has nothing to bake. Enqueuing it
         // anyway would burn the per-frame budget on all-`None` bakes and starve the real
         // geometry entering far rings (the fly-away-from-scene LOD-stall bug).
-        // Only the entered SHELL is visited (slab difference), not the whole R³ interior — the
-        // overlap stays resident and unchanged, so re-scanning it every snap was pure waste.
-        for_each_entered_chunk(new_origin, old_origin, r, |coord| {
+        // The resident region is a hollow SHELL (outer ring minus the finer-covered inner hole), so
+        // "entered" = the gained outer rim ∪ the hole boundary the receding hole uncovered — two thin
+        // slabs, never the R³ interior. This is what keeps each region to `{native..native+overlap}`
+        // instead of the whole LOD stack: a near surface's coarse LODs sit inside their holes and are
+        // never enqueued.
+        let first = old_origin == IVec3::splat(i32::MIN);
+        for_each_entered_shell(&config, lod, new_origin, old_origin, first, |coord| {
             let ck = chunk::ChunkKey::new(lod, coord);
             if chunk_has_geometry_with(ck, &bvh, &config, &mut bvh_stack) {
                 // A freshly-entered chunk has no resident bricks yet → bake all 64.
                 dirty_mask(&mut sched.pending, ck, FULL_CHUNK_MASK);
             }
         });
-        // Exited chunks → cancel any pending bake and EVICT IMMEDIATELY (no deferral). `resolve_march`
-        // serves the finest RESIDENT LOD, so once these fine bricks are gone the region just renders at
-        // the next resident coarser LOD — a brief LOD pop during the handoff, never a hole, because a
-        // coarser ring is larger and bakes first so a coarser level is already resident. Evicting inline
-        // here also spreads the cost over the small per-frame exited shell instead of letting a held set
-        // accumulate and drain in O(N)-sized bursts.
-        // Skipped on the first run (no prior window — the sentinel origin isn't a real region).
-        if !first_run {
-            for_each_exited_chunk(new_origin, old_origin, r, |coord| {
+        // Entered FULL-RING chunks → set their CONSERVATIVE occupancy (the empty-space DDA's traversal
+        // grid). NO shell holes: a near surface's coarse LODs keep a traversal entry even though their
+        // tiles are shelled out, so the DDA's coarse jumps survive (this is what fixes the 2.5× march
+        // regression). One early-exit BVH probe pre-filters empties before the 64-brick mask.
+        for_each_entered_chunk(new_origin, old_origin, r, |coord| {
+            let ck = chunk::ChunkKey::new(lod, coord);
+            let mask = if chunk_has_geometry_with(ck, &bvh, &config, &mut bvh_stack) {
+                chunk_conservative_mask(ck, &cons_edits, &bvh, &config, &mut cons_scratch, &mut bvh_stack)
+            } else {
+                0
+            };
+            atlas.set_conservative_chunk(ck, mask, &config);
+        });
+        // Exited SHELL chunks → cancel any pending bake and EVICT IMMEDIATELY (no deferral). Two cases,
+        // both safe: a chunk that left the OUTER edge renders at the next resident coarser LOD
+        // (`resolve_march` serves the finest RESIDENT level — a brief LOD pop during handoff, never a
+        // hole, since the coarser ring is larger and bakes first); a chunk the INNER hole newly covers
+        // became redundant — two finer levels are already resident there, so dropping it is hole-free by
+        // construction (no make-before-break needed). Evicting inline spreads the cost over the small
+        // per-frame exited slab. Skipped on the first run (the sentinel origin isn't a real region).
+        if !first {
+            for_each_exited_shell(&config, lod, new_origin, old_origin, |coord| {
                 let ck = chunk::ChunkKey::new(lod, coord);
                 sched.pending.remove(&ck);
                 for_each_brick_key(ck, &config, |bk| {
                     atlas.remove_brick(&bk, &config);
                 });
+            });
+            // Exited FULL-RING chunks → drop their conservative occupancy (removes the directory entry
+            // if no tiles remain). Mirrors the shell eviction but over the whole ring.
+            for_each_exited_chunk(new_origin, old_origin, r, |coord| {
+                atlas.set_conservative_chunk(chunk::ChunkKey::new(lod, coord), 0, &config);
             });
         }
         sched.ring_chunk_origin[li] = new_origin;
@@ -606,7 +783,7 @@ pub fn schedule_bakes(
     // shell bakes a slice every frame (no off-thread single-flight wait), settling in ~bricks/budget.
     {
         let _g_dispatch = info_span!("sched_dispatch").entered();
-        emit_gpu_bakes(&mut atlas, &mut sched, &mut gpu_bakes, &config, camera_pos, &mut baked_dbg, now);
+        emit_gpu_bakes(&mut atlas, &mut sched, &mut gpu_bakes, &config, bake_view, &mut baked_dbg, now);
     }
 
     // DIAGNOSTIC: per-LOD baked-job histogram this frame + remaining `pending` backlog. Shows
@@ -886,31 +1063,35 @@ fn invalidate_ready_on_edit_change(sched: &mut BakeScheduler, config: &SdfGridCo
     sched.ready_edit_gen = sched.edit_gen;
 }
 
-fn refresh_ready(sched: &mut BakeScheduler, config: &SdfGridConfig, camera_pos: Vec3) {
+fn refresh_ready(sched: &mut BakeScheduler, config: &SdfGridConfig, view: &BakeView) {
     if sched.ready_edit_gen != sched.edit_gen {
         for rc in std::mem::take(&mut sched.ready) {
             dirty_mask(&mut sched.pending, rc.ck, rc.carried_mask(config));
         }
         sched.ready_edit_gen = sched.edit_gen;
     }
-    if sched.ready.is_empty() || camera_pos == sched.ready_maint_cam {
+    // Window/shell membership AND priority only change when the camera MOVES or TURNS, so skip the
+    // O(ready) pass while both are unchanged (a stationary cold bake — the only time `ready` is large).
+    if sched.ready.is_empty() || (view.pos == sched.ready_maint_cam && view.fwd == sched.ready_maint_fwd) {
         return;
     }
-    sched.ready_maint_cam = camera_pos;
+    sched.ready_maint_cam = view.pos;
+    sched.ready_maint_fwd = view.fwd;
     // Window-filter only once a window exists (the recenter has populated `ring_chunk_origin`). With
     // no window, no chunk can have exited, so there is nothing to drop — and a missing origin would
     // wrongly reject everything. (The direct-dirty unit tests drive emit without a recenter.)
     if !sched.ring_chunk_origin.is_empty() {
-        let r = config.ring_chunks_per_axis();
         let origins = &sched.ring_chunk_origin;
+        // Drop carried chunks that left the resident SHELL — either past the outer edge OR newly
+        // covered by a finer LOD (now in the inner hole, so redundant).
         sched.ready.retain(|rc| {
             let origin = origins.get(rc.ck.lod as usize).copied().unwrap_or(IVec3::splat(i32::MIN));
-            chunk_in_window(rc.ck.coord, origin, r)
+            chunk_in_shell(config, rc.ck.lod, rc.ck.coord, origin)
         });
     }
     // `by_cached_key` computes the (non-trivial) priority key ONCE per entry, not once per
     // comparison — important when a moving camera re-sorts a large `ready` mid-cold-bake.
-    sched.ready.sort_by_cached_key(|rc| chunk_priority_key(rc.ck, config, camera_pos));
+    sched.ready.sort_by_cached_key(|rc| chunk_priority_key(rc.ck, config, view));
 }
 
 /// THE per-frame bake: bake carried (already-classified) work first, then — if the budget has room —
@@ -924,17 +1105,18 @@ fn emit_gpu_bakes(
     sched: &mut BakeScheduler,
     gpu_bakes: &mut PendingGpuBakes,
     config: &SdfGridConfig,
-    camera_pos: Vec3,
+    view: impl Into<BakeView>,
     baked_dbg: &mut super::BakedBrickDebug,
     now_secs: f32,
 ) {
     let _span = info_span!("sdf_emit_gpu_bakes").entered();
+    let view = view.into();
     let edits_snapshot = Arc::clone(&sched.edits);
     let bvh_snapshot = Arc::clone(&sched.bvh);
 
-    // 1. Maintain the carry queue (stale-flush, window-filter, re-sort), then bake carried work
+    // 1. Maintain the carry queue (stale-flush, shell-filter, re-sort), then bake carried work
     //    FIRST — it's already classified, and draining it before new work honors priority.
-    refresh_ready(sched, config, camera_pos);
+    refresh_ready(sched, config, &view);
     apply_ready(atlas, gpu_bakes, &edits_snapshot, config, baked_dbg, now_secs, &mut sched.ready, SOFT_BAKE_BUDGET);
 
     // 2. Classify fresh `pending` ONLY if this frame's budget isn't already spent by carried work.
@@ -944,7 +1126,7 @@ fn emit_gpu_bakes(
     if gpu_bakes.jobs.len() < SOFT_BAKE_BUDGET && !sched.pending.is_empty() {
         let mut scratch = std::mem::take(&mut sched.emit_scratch);
         scratch.candidates.clear();
-        drain_priority_batch(&mut sched.pending, &mut scratch.drained, config, camera_pos, CLASSIFY_REFILL_CHUNKS);
+        drain_priority_batch(&mut sched.pending, &mut scratch.drained, config, &view, CLASSIFY_REFILL_CHUNKS);
         gather_candidates(&scratch.drained, &bvh_snapshot, config, &mut scratch.candidates, |key| {
             atlas.remove_brick(&key, config);
         });
@@ -970,11 +1152,13 @@ fn emit_gpu_bakes(
 /// (for the fly-away starvation bound). `ring_chunk_origin` lives on the scheduler.
 #[cfg(test)]
 fn recenter_step(sched: &mut BakeScheduler, atlas: &mut SdfAtlas, cfg: &SdfGridConfig, cam: Vec3) -> usize {
-    let r = cfg.ring_chunks_per_axis();
     if sched.ring_chunk_origin.is_empty() {
         sched.ring_chunk_origin = vec![IVec3::splat(i32::MIN); cfg.lod_count as usize];
     }
+    let r = cfg.ring_chunks_per_axis();
     let mut stack: Vec<u32> = Vec::new();
+    let mut cscratch: Vec<u32> = Vec::new();
+    let cons_edits = Arc::clone(&sched.edits);
     let mut enqueued = 0usize;
     for lod in 0..cfg.lod_count {
         let li = lod as usize;
@@ -984,7 +1168,7 @@ fn recenter_step(sched: &mut BakeScheduler, atlas: &mut SdfAtlas, cfg: &SdfGridC
             continue;
         }
         let first = old_origin == IVec3::splat(i32::MIN);
-        for_each_entered_chunk(new_origin, old_origin, r, |coord| {
+        for_each_entered_shell(cfg, lod, new_origin, old_origin, first, |coord| {
             let ck = chunk::ChunkKey::new(lod, coord);
             if chunk_has_geometry_with(ck, &sched.bvh, cfg, &mut stack) {
                 if !sched.pending.contains_key(&ck) {
@@ -993,13 +1177,26 @@ fn recenter_step(sched: &mut BakeScheduler, atlas: &mut SdfAtlas, cfg: &SdfGridC
                 dirty_mask(&mut sched.pending, ck, FULL_CHUNK_MASK);
             }
         });
+        // Mirror production: full-ring CONSERVATIVE occupancy (the empty-space DDA's traversal grid).
+        for_each_entered_chunk(new_origin, old_origin, r, |coord| {
+            let ck = chunk::ChunkKey::new(lod, coord);
+            let mask = if chunk_has_geometry_with(ck, &sched.bvh, cfg, &mut stack) {
+                chunk_conservative_mask(ck, &cons_edits, &sched.bvh, cfg, &mut cscratch, &mut stack)
+            } else {
+                0
+            };
+            atlas.set_conservative_chunk(ck, mask, cfg);
+        });
         if !first {
-            for_each_exited_chunk(new_origin, old_origin, r, |coord| {
+            for_each_exited_shell(cfg, lod, new_origin, old_origin, |coord| {
                 let ck = chunk::ChunkKey::new(lod, coord);
                 sched.pending.remove(&ck);
                 for bk in chunk_brick_keys(ck, cfg) {
                     atlas.remove_brick(&bk, cfg);
                 }
+            });
+            for_each_exited_chunk(new_origin, old_origin, r, |coord| {
+                atlas.set_conservative_chunk(chunk::ChunkKey::new(lod, coord), 0, cfg);
             });
         }
         sched.ring_chunk_origin[li] = new_origin;

@@ -94,6 +94,7 @@ dependencies = [
  "bevy_brp_extras",
  "bevy_egui",
  "bevy_rapier3d",
+ "bevy_render",
  "bytemuck",
  "ecolor",
  "egui-phosphor",

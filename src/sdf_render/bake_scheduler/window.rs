@@ -58,6 +58,48 @@ pub(super) fn chunk_has_geometry_with(
     bvh.any_overlap_with(&aabb, stack)
 }
 
+/// The conservative 64-bit per-brick occupancy mask for chunk `ck`: bit `local` set iff the geometry's
+/// SURFACE plausibly crosses local brick `local`. This is the empty-space DDA's traversal grid —
+/// maintained for the FULL clipmap ring at every LOD, decoupled from baked residency.
+///
+/// Uses the EXACT same test as the bake's classify (`cull_edit_indices` → [`narrow_band_keep`]), NOT a
+/// raw AABB overlap: a brick is occupied only if the folded analytic distance places the surface within
+/// it (+ a conservative band), so the mask FOLLOWS the surface instead of filling a geometry's whole
+/// bounding box. (An AABB test marked tall/large edits' empty box interior — e.g. the heightmap's
+/// AABB far above its terrain — as occupied, stalling sky rays brick-by-brick.) Because it reuses the
+/// bake's keep test, `cons_occ ⊇ baked occ` (the DDA never skips a sampled surface), and because it uses
+/// the analytic field it has no trilinear-shrinkage gap, so coarse-empty ⇒ fine-empty. `scratch`/`stack`
+/// are caller-owned reusable buffers (zero per-call alloc).
+pub(super) fn chunk_conservative_mask(
+    ck: chunk::ChunkKey,
+    edits: &[edits::ResolvedEdit],
+    bvh: &bvh::Bvh,
+    config: &SdfGridConfig,
+    scratch: &mut Vec<u32>,
+    stack: &mut Vec<u32>,
+) -> u64 {
+    let c = chunk::CHUNK_BRICKS;
+    let s = config.cell_stride();
+    let base = ck.coord * c; // the chunk's brick-(0,0,0) in brick-index space
+    let mut mask = 0u64;
+    for lz in 0..c {
+        for ly in 0..c {
+            for lx in 0..c {
+                let bi = base + IVec3::new(lx, ly, lz);
+                let key = atlas::BrickKey::new(ck.lod, bi * s);
+                // Cull edits to this brick via the BVH (fills `scratch`); None ⇒ no geometry reaches it.
+                if atlas::SdfAtlas::cull_edit_indices_with(key, bvh, config, scratch, stack).is_none() {
+                    continue;
+                }
+                if narrow_band_keep(edits, scratch, config, key) {
+                    mask |= 1u64 << local_bit(lx, ly, lz);
+                }
+            }
+        }
+    }
+    mask
+}
+
 /// Whether chunk coord `c` is inside the `R³` chunk window with corner `origin`.
 pub(super) fn chunk_in_window(c: IVec3, origin: IVec3, r: i32) -> bool {
     let rel = c - origin;
@@ -139,6 +181,134 @@ pub(super) fn for_each_entered_chunk(new_origin: IVec3, old_origin: IVec3, r: i3
 /// new. Symmetric to [`for_each_entered_chunk`] (args swapped), used to evict the trailing shell.
 pub(super) fn for_each_exited_chunk(new_origin: IVec3, old_origin: IVec3, r: i32, f: impl FnMut(IVec3)) {
     for_each_entered_chunk(old_origin, new_origin, r, f);
+}
+
+// --- Hollow-shell clipmap residency ({native .. native+overlap_depth}) ----------------------------
+//
+// Each LOD's resident region is its outer ring box MINUS a central inner hole that two-or-more FINER
+// LODs already cover, so every world point is resident at exactly its native LOD plus `overlap_depth`
+// coarser levels — not the full LOD stack. The hole shares the ring's (snapped) camera centre and
+// tracks it on recenter, so the per-frame entered/exited sets stay thin slabs (reusing the box-diff
+// `for_each_entered_chunk` twice: outer rim + hole boundary).
+
+/// Inner-hole half-extent (in chunks) for LOD `lod`: the central region a level `lod-overlap_depth-1`
+/// (the coarsest level still finer than the kept `{native..native+overlap_depth}` set) already covers,
+/// so LOD `lod` need not be resident there. Returns 0 for the finest `overlap_depth + 1` levels — they
+/// stay solid boxes (LOD 0 keeps its ENTIRE ring), there being no finer level to defer to.
+///
+/// Derivation: that finer level's ring half-extent, expressed in LOD-`lod` chunks, is
+/// `ring_half_chunks >> (overlap_depth + 1)` — each coarser level halves the chunk count for a fixed
+/// world extent. The hole sits well inside LOD `lod-1`'s coverage (the `+overlap_depth` fallback), with
+/// a margin far larger than the `recenter_snap_chunks` hysteresis, so the composed shells leave NO gap.
+pub(super) fn inner_hole_half_chunks(config: &SdfGridConfig, lod: u32) -> i32 {
+    if lod < config.overlap_depth + 1 {
+        0
+    } else {
+        config.ring_half_chunks() >> (config.overlap_depth + 1)
+    }
+}
+
+/// The corner of LOD `lod`'s inner hole, given its outer ring corner `outer_origin`. The hole is the
+/// `2·hole_half` box concentric with the ring; degenerate (`hole_half == 0`) for the finest levels.
+#[inline]
+fn inner_hole_origin(config: &SdfGridConfig, lod: u32, outer_origin: IVec3) -> IVec3 {
+    outer_origin + IVec3::splat(config.ring_half_chunks() - inner_hole_half_chunks(config, lod))
+}
+
+/// Whether chunk `ck` lies in its LOD's inner hole (covered by finer LODs ⇒ NOT resident). Used to keep
+/// hole chunks out of the dirty/bake sets and the carry queue.
+pub(super) fn chunk_in_inner_hole(config: &SdfGridConfig, camera_pos: Vec3, ck: chunk::ChunkKey) -> bool {
+    let hole = inner_hole_half_chunks(config, ck.lod);
+    if hole == 0 {
+        return false;
+    }
+    let outer = ring_chunk_origin(config, camera_pos, ck.lod);
+    chunk_in_window(ck.coord, inner_hole_origin(config, ck.lod, outer), 2 * hole)
+}
+
+/// Whether chunk coord `c` is in LOD `lod`'s resident SHELL = outer ring box `[outer_origin, +r)` MINUS
+/// the inner hole. (With `hole_half == 0` the hole is empty and the shell is the full box.)
+#[inline]
+pub(super) fn chunk_in_shell(config: &SdfGridConfig, lod: u32, c: IVec3, outer_origin: IVec3) -> bool {
+    let r = config.ring_chunks_per_axis();
+    if !chunk_in_window(c, outer_origin, r) {
+        return false;
+    }
+    let hole = inner_hole_half_chunks(config, lod);
+    hole == 0 || !chunk_in_window(c, inner_hole_origin(config, lod, outer_origin), 2 * hole)
+}
+
+/// Invoke `f` for the chunks that ENTERED LOD `lod`'s resident SHELL when its window moved
+/// `old_outer → new_outer` (the hole tracks the same centre). Entered = chunks the OUTER box gained
+/// ∪ chunks the receding INNER hole uncovered — two disjoint slabs (outer rim vs. centre), each a
+/// same-size box difference reusing [`for_each_entered_chunk`]. On `first_run` the whole new shell is
+/// entered (sentinel `old_outer` has no meaningful hole).
+pub(super) fn for_each_entered_shell(
+    config: &SdfGridConfig,
+    lod: u32,
+    new_outer: IVec3,
+    old_outer: IVec3,
+    first_run: bool,
+    mut f: impl FnMut(IVec3),
+) {
+    let r = config.ring_chunks_per_axis();
+    let hole = inner_hole_half_chunks(config, lod);
+    if hole == 0 {
+        // Solid box (finest levels) — exactly the pre-shell behaviour (handles the first-run sentinel).
+        for_each_entered_chunk(new_outer, old_outer, r, f);
+        return;
+    }
+    let hsize = 2 * hole;
+    let new_hole = inner_hole_origin(config, lod, new_outer);
+    if first_run {
+        for_each_shell_chunk(new_outer, r, new_hole, hsize, f);
+        return;
+    }
+    let old_hole = inner_hole_origin(config, lod, old_outer);
+    // Outer box gained — at the outer rim, never inside the small central hole.
+    for_each_entered_chunk(new_outer, old_outer, r, &mut f);
+    // Hole uncovered — in the OLD hole but not the NEW one ⇒ now back in the shell.
+    for_each_entered_chunk(old_hole, new_hole, hsize, &mut f);
+}
+
+/// Invoke `f` for the chunks that EXITED LOD `lod`'s resident SHELL on `old_outer → new_outer`: chunks
+/// the OUTER box lost ∪ chunks the advancing INNER hole newly covers (now redundant → evict). Symmetric
+/// to [`for_each_entered_shell`]; never called on the first run (nothing was resident yet).
+pub(super) fn for_each_exited_shell(
+    config: &SdfGridConfig,
+    lod: u32,
+    new_outer: IVec3,
+    old_outer: IVec3,
+    mut f: impl FnMut(IVec3),
+) {
+    let r = config.ring_chunks_per_axis();
+    let hole = inner_hole_half_chunks(config, lod);
+    if hole == 0 {
+        for_each_exited_chunk(new_outer, old_outer, r, f);
+        return;
+    }
+    let hsize = 2 * hole;
+    let new_hole = inner_hole_origin(config, lod, new_outer);
+    let old_hole = inner_hole_origin(config, lod, old_outer);
+    // Outer box lost.
+    for_each_exited_chunk(new_outer, old_outer, r, &mut f);
+    // Hole newly covered — in the NEW hole but not the OLD one ⇒ left the shell (redundant now).
+    for_each_entered_chunk(new_hole, old_hole, hsize, &mut f);
+}
+
+/// Invoke `f` for every chunk in the shell `[outer_origin, +r)` minus the `[hole_origin, +hsize)` hole.
+/// O(r³) — used only on the one-time first-run fill; the incremental recenter uses the slab diffs above.
+fn for_each_shell_chunk(outer_origin: IVec3, r: i32, hole_origin: IVec3, hsize: i32, mut f: impl FnMut(IVec3)) {
+    for iz in 0..r {
+        for iy in 0..r {
+            for ix in 0..r {
+                let c = outer_origin + IVec3::new(ix, iy, iz);
+                if hsize == 0 || !chunk_in_window(c, hole_origin, hsize) {
+                    f(c);
+                }
+            }
+        }
+    }
 }
 
 /// All brick keys belonging to chunk `ck` (its `CHUNK_BRICKS³` local slots).
