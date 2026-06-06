@@ -30,6 +30,7 @@ struct ProbeParams {
     classify: u32,       // unused here; layout match
     ray_falloff_lod: u32, // unused here; layout match
     distant_ray_count: u32, // unused here; layout match
+    gi_steps: u32,        // unused here; layout match
 };
 
 @group(2) @binding(0) var gbuf_albedo: texture_2d<f32>;     // a = camera distance

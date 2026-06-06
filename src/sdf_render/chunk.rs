@@ -672,6 +672,17 @@ impl LiveChunkTables {
         self.resident_rows().into_iter().filter(|c| c.probe_base != u32::MAX).collect()
     }
 
+    /// `(ChunkKey, tile-run slot)` for every FINEST-resident chunk (those owning probe blocks). The
+    /// render-world relevance cull needs each finest chunk's world position (decode the key via
+    /// [`chunk_min_world`]) plus the `slot` the dispatch rotation keys on (= `tile_run_base / TILE_RUN_SLOT`).
+    pub fn finest_slots_keyed(&self) -> Vec<(ChunkKey, u32)> {
+        self.chunks
+            .iter()
+            .filter(|(_, e)| e.probe_base != u32::MAX)
+            .map(|(ck, e)| (*ck, e.slot))
+            .collect()
+    }
+
     /// Take + clear the set of chunks whose geometry changed since the last call (the DDGI wake set).
     /// The render world expands these to a 1-chunk neighbourhood and re-converges only those probes at
     /// the active rate (localized wake — no global re-trace cliff on a single edit).
@@ -791,8 +802,13 @@ impl LiveChunkTables {
     pub fn upload(&self, cap_rows: u32, cap_slots: u32) -> ChunkUpload {
         let needed_rows = self.row_count();
         let needed_slots = self.tile_run_capacity();
-        // Tile-run headroom (+50%, min one extra slot) so it isn't recreated every frame.
-        let new_cap_slots = (needed_slots + needed_slots / 2).max(needed_slots + TILE_RUN_SLOT);
+        // Tile-run headroom: GROW BY DOUBLING (amortized). A `TileGrow`/`Full` rebuilds the WHOLE tile-run
+        // (`tile_run_dense()` — O(all resident bricks), tens of MB on a huge scene = a ~200 ms hitch), so
+        // it must be RARE. With doubling, growth costs O(log n) total rebuilds; once a scene's resident set
+        // settles, the slack absorbs object-edit churn (a moved object frees one chunk slot + takes another
+        // — the free-list keeps high-water stable) so edits stay cheap in-place Deltas, not grows. The
+        // wasted VRAM is bounded by the clipmap window (×2 of tens of MB), well under the probe budget.
+        let new_cap_slots = needed_slots.saturating_mul(2).max(needed_slots + TILE_RUN_SLOT);
         if cap_rows == 0 || needed_rows > cap_rows {
             // First upload, or the directory itself grew (only on a ring-size change — it's
             // FIXED-size otherwise, sized EXACTLY with no headroom). Rebuild BOTH buffers.

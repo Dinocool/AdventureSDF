@@ -112,6 +112,9 @@ pub(super) fn extract_sdf_atlas(
         return;
     }
     last_gen.0 = atlas.generation;
+    // Runs only on a topology change (a move) — instrumented so its CPU `upload()` cost (delta vs the
+    // tile-run dense rebuild) is named in the trace rather than an anonymous render-schedule gap.
+    let _span = info_span!("extract_sdf_atlas").entered();
 
     // On a scene switch, force the next upload to be a FULL rebuild (capacity memo → 0). Otherwise the
     // new scene baked over the same frame does a delta, leaving the old scene's chunk rows live on the GPU.
@@ -249,6 +252,17 @@ pub(super) fn prepare_sdf_atlas_gpu(
             gpu_atlas.tables.directory_delta(&queue, &extracted.chunk_row_updates);
         }
         if extracted.tile_full {
+            // The tile-run grow rebuilds the WHOLE tile-run (O(all resident bricks)). It was previously
+            // UN-instrumented — the ~200 ms hitch on editing a large scene (a new resident chunk grew the
+            // tile-run past its slack) showed only as an anonymous gap in the render schedule. Span +
+            // log it so the cost is visible; the doubling headroom in `LiveChunkTables::upload` keeps it
+            // rare (a settled scene's edit churn stays within slack → cheap in-place deltas instead).
+            let _span = info_span!("sdf_tile_run_rebuild").entered();
+            debug!(
+                "sdf tile-run rebuild: {} slots ({:.1} MB) — a resident-chunk grow outran the buffer slack",
+                extracted.tile_cap_needed,
+                extracted.tile_cap_needed as f64 * 20.0 / (1 << 20) as f64,
+            );
             gpu_atlas.tables.rebuild_tile_run(
                 &device,
                 &extracted.tile_run_data,

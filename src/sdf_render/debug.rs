@@ -639,6 +639,15 @@ fn render_panel(world: &mut World, ui: &mut egui::Ui) {
             stats.probe_bytes as f64 / (1u64 << 20) as f64,
             stats.probe_redundancy,
         ));
+        let rel = world.resource::<super::ProbeRelevanceSet>();
+        if rel.total > 0 {
+            ui.label(format!(
+                "Relevance cull: {} / {} finest chunks off-screen ({:.0}% throttled)",
+                rel.culled,
+                rel.total,
+                100.0 * rel.culled as f32 / rel.total as f32,
+            ));
+        }
     }
     let mut ddgi = world.resource_mut::<DdgiParams>();
     ui.add(
@@ -651,6 +660,10 @@ fn render_panel(world: &mut World, ui: &mut egui::Ui) {
         egui::Slider::new(&mut ddgi.update_stride, 1..=16)
             .text("Update stride (1/N probes per frame)"),
     );
+    ui.add(
+        egui::Slider::new(&mut ddgi.max_probe_chunks_per_frame, 0..=4096)
+            .text("Max probe-chunks / frame (0 = ∞, nearest-first)"),
+    );
     ui.checkbox(&mut ddgi.classify_enabled, "Classify (settled probes go dormant)");
     ui.add_enabled(
         ddgi.classify_enabled,
@@ -660,6 +673,23 @@ fn render_panel(world: &mut World, ui: &mut egui::Ui) {
     ui.add(egui::Slider::new(&mut ddgi.probe_halve_lod, 1..=10).text("Halve density ≥ LOD"));
     ui.add(egui::Slider::new(&mut ddgi.ray_falloff_lod, 1..=10).text("Distant rays ≥ LOD"));
     ui.add(egui::Slider::new(&mut ddgi.distant_ray_count, 8..=256).text("Distant ray count"));
+    ui.add(egui::Slider::new(&mut ddgi.gi_march_steps, 4..=48).text("GI march steps / ray"));
+    // View-relevance cull: throttle finest probes that are off-screen (the moving-camera saving).
+    ui.checkbox(&mut ddgi.relevance_cull, "Relevance cull (throttle off-screen probes)");
+    ui.add_enabled_ui(ddgi.relevance_cull, |ui| {
+        ui.add(
+            egui::Slider::new(&mut ddgi.cull_off_stride, 8..=256)
+                .text("Off-screen stride (1/N re-trace)"),
+        );
+        ui.add(
+            egui::Slider::new(&mut ddgi.cull_near_radius, 0.0..=64.0)
+                .text("Always-relevant near radius (m)"),
+        );
+        ui.add(
+            egui::Slider::new(&mut ddgi.cull_cone_dot, -1.0..=0.5)
+                .text("View-cone cull (−1 off … 0 rear)"),
+        );
+    });
     ui.add(
         egui::Slider::new(&mut ddgi.gi_range, 4.0..=200.0)
             .logarithmic(true)

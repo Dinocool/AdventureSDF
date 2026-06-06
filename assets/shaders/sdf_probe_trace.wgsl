@@ -39,6 +39,7 @@ struct ProbeParams {
     classify: u32,       // 1 = converged probes go dormant (skip the ray-march); 0 = all trace at update_stride
     ray_falloff_lod: u32, // LOD >= this → trace distant_ray_count rays (far field needs less angular detail)
     distant_ray_count: u32,
+    gi_steps: u32,        // sphere-trace step budget per GI ray (the slim march's MAX_STEPS)
 };
 
 // Single in-place octahedral irradiance buffer: probe `slot`'s OCT_RES² texels live at
@@ -60,6 +61,12 @@ const MAX_RAYS: u32 = 256u;
 // (traced cooperatively, folded into each thread's texel accumulator), the relocated ray origin, and a
 // buried/deactivated flag — origin/flag/quat computed once by thread 0 to avoid 64× redundant work.
 var<workgroup> gs_rad: array<vec3<f32>, 64>;
+// The batch's UN-rotated Fibonacci directions, written once by the trace threads and read by the
+// integrate fold — so `fib_dir` (sqrt+sin+cos) runs ONCE per ray instead of being re-evaluated 64×
+// (once per texel) in the fold. On this XU/occupancy-bound kernel that removes ~4032 transcendental
+// triples per sub-probe, trading them for cheap LDS reads (the 7% XU cost). The weight stays a plain
+// dot against the un-rotated dir (the texel dir is inverse-rotated into `my_dir_local`).
+var<workgroup> gs_dir: array<vec3<f32>, 64>;
 var<workgroup> gs_origin: vec3<f32>;
 var<workgroup> gs_skip: u32;
 var<workgroup> gs_quat: vec4<f32>; // per-probe ray-rotation quaternion (computed once by thread 0)
@@ -283,9 +290,11 @@ fn main(
             // Cooperative trace: thread `tid` marches ray (base_ray + tid) of this batch.
             let ri = base_ray + tid;
             var radiance = vec3<f32>(0.0);
+            var fdir = vec3<f32>(0.0);
             if (ri < n) {
-                let dir = quat_rot(gs_quat, fib_dir(ri, n));
-                let mq = MarchQuality(4.0, 24u, params.gi_range, id.lod);
+                fdir = fib_dir(ri, n); // un-rotated; cached in gs_dir for the fold to reuse
+                let dir = quat_rot(gs_quat, fdir);
+                let mq = MarchQuality(4.0, clamp(params.gi_steps, 1u, 64u), params.gi_range, id.lod);
                 let r = raymarch(origin, dir, 0.05, mq);
                 if (r.fate == 1u) {
                     // Escaped to the sky: the analytic environment is physical (× SKY_LUMINANCE), so
@@ -316,14 +325,16 @@ fn main(
                     radiance = m.emissive.rgb + albedo * (direct + indirect);
                 }
             }
+            gs_dir[tid] = fdir; // un-rotated dir for ray (base_ray + tid); read back in the fold
             gs_rad[tid] = radiance;
             workgroupBarrier();
 
             // Fold this batch's rays into the per-texel accumulator (cosine-weighted by texel dir).
+            // Directions come from `gs_dir` (computed once in the trace above) — no `fib_dir` recompute.
             if (tid < octn) {
                 let bn = min(64u, n - base_ray);
                 for (var j = 0u; j < bn; j = j + 1u) {
-                    let w = max(dot(my_dir_local, fib_dir(base_ray + j, n)), 0.0);
+                    let w = max(dot(my_dir_local, gs_dir[j]), 0.0);
                     acc += w * gs_rad[j];
                     accw += w;
                 }

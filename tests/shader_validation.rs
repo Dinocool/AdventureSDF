@@ -219,16 +219,26 @@ fn sdf_probe_trace_wgsl_validates() {
     // The probe-trace compute shader imports the full sdf::* graph (raymarch, material, sky,
     // shadows, probe) plus its own group(3) probe buffers. Compose + validate exactly as the GPU
     // pipeline will — catches every type / binding / call error before any render wiring exists.
+    // Validate BOTH the bare graph AND the `SDF_GI_MARCH` variant the real pipeline compiles (it
+    // gates the slim GI raymarch in sdf::march), so errors in either arm are caught.
     validate_composed_entry("assets/shaders/sdf_probe_trace.wgsl", &[])
+        .unwrap_or_else(|e| panic!("{e}"));
+    validate_composed_entry("assets/shaders/sdf_probe_trace.wgsl", &["SDF_GI_MARCH"])
         .unwrap_or_else(|e| panic!("{e}"));
 }
 
 #[test]
 fn sdf_gi_resolve_wgsl_validates() {
     // The GI-resolve fragment shader imports the sdf::* probe-addressing graph (bindings, oct, probe)
-    // and evaluates sample_gi into a texture. Compose + validate as the pipeline will.
+    // and evaluates sample_gi into a texture. Compose + validate as the pipeline will — the bare build
+    // AND each probe-state debug overlay (the resolve writes the LOD / coverage hue under these defines,
+    // now that the resolve pipeline rebuilds with the active debug set).
     validate_composed_entry("assets/shaders/sdf_gi_resolve.wgsl", &[])
         .unwrap_or_else(|e| panic!("{e}"));
+    for def in ["SDF_DEBUG_PROBE_LOD", "SDF_DEBUG_PROBE_COVERAGE"] {
+        validate_composed_entry("assets/shaders/sdf_gi_resolve.wgsl", &[def])
+            .unwrap_or_else(|e| panic!("{e}"));
+    }
 }
 
 #[test]

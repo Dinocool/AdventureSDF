@@ -354,13 +354,10 @@ pub fn show_editor_dock(world: &mut World) {
     };
 
     // Multi-scene tab orchestration. Drain File-menu requests (which may add/remove scene
-    // tabs) and refresh the active scene's dirty flag BEFORE rendering, so titles and the
-    // tab set are current this frame.
+    // tabs) BEFORE rendering, so the tab set is current this frame. The active scene's dirty
+    // flag is kept live by the `mark_scene_dirty` system (pure change-detection, no serialize).
     let type_registry = world.resource::<AppTypeRegistry>().clone();
     scene_tabs::drain_requests(world, &mut dock, &type_registry);
-    // Throttled, but on the frame it runs this serializes the whole scene — span it.
-    bevy::log::info_span!("editor_dirty_check")
-        .in_scope(|| scene_tabs::refresh_active_dirty(world, &type_registry));
 
     let mut viewport_rect = dock.viewport_rect;
     {

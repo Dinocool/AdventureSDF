@@ -16,7 +16,7 @@ use bevy::render::render_resource::encase::UniformBuffer as EncaseUniformBuffer;
 pub(super) const SDF_GI_RESOLVE_SHADER_PATH: &str = "shaders/sdf_gi_resolve.wgsl";
 pub(super) const SDF_GI_BLUR_SHADER_PATH: &str = "shaders/sdf_gi_blur.wgsl";
 
-const GI_FORMAT: TextureFormat = TextureFormat::Rgba16Float;
+pub(super) const GI_FORMAT: TextureFormat = TextureFormat::Rgba16Float;
 /// À-trous iterations. Steps double each pass (1,2,4,8,16 px) → ~31 px effective radius, enough to
 /// dissolve the probe-lattice blocks without smearing across edges.
 const BLUR_PASSES: usize = 5;
@@ -63,11 +63,55 @@ pub(super) fn gi_apply_layout_desc() -> BindGroupLayoutDescriptor {
 }
 
 #[derive(Resource)]
-struct SdfGiPipelines {
-    resolve_id: CachedRenderPipelineId,
+pub(super) struct SdfGiPipelines {
+    pub(super) resolve_id: CachedRenderPipelineId,
     blur_id: CachedRenderPipelineId,
     /// Blur group: gi_in tex + gbuffer normal tex + sampler + params uniform.
     blur_layout: BindGroupLayoutDescriptor,
+    /// Shader defs the live `resolve_id` was built with — the resolve carries the
+    /// `SDF_DEBUG_PROBE_LOD` / `SDF_DEBUG_PROBE_COVERAGE` `#ifdef` branches, so it must rebuild when
+    /// the active debug set changes (mirrors the primary/combine rebuild). Empty at first queue.
+    pub(super) resolve_defs: Vec<String>,
+}
+
+/// Queue the GI-resolve render pipeline with the given shader defs. Shared by the initial queue and the
+/// def-change rebuild so the descriptor (layout/targets) is defined once. The resolve binds 0 = camera,
+/// 1 = atlas (probe lookup), 2 = G-buffer (combine's layout), 3 = probe irradiance.
+pub(super) fn queue_resolve_pipeline(
+    pipeline_cache: &PipelineCache,
+    sdf_pipeline: &SdfPipeline,
+    combine: &SdfCombinePipeline,
+    resolve_shader: &SdfGiResolveShaderHandle,
+    fullscreen_shader: &FullscreenShader,
+    shader_defs: Vec<bevy::shader::ShaderDefVal>,
+) -> CachedRenderPipelineId {
+    pipeline_cache.queue_render_pipeline(RenderPipelineDescriptor {
+        label: Some("sdf_gi_resolve_pipeline".into()),
+        layout: vec![
+            sdf_pipeline.layout_0.clone(),
+            sdf_pipeline.layout_1.clone(),
+            combine.layout.clone(),
+            probe::probe_apply_layout_desc(),
+        ],
+        vertex: fullscreen_shader.to_vertex_state(),
+        fragment: Some(FragmentState {
+            shader: resolve_shader.0.clone(),
+            shader_defs,
+            targets: vec![Some(ColorTargetState {
+                format: GI_FORMAT,
+                blend: None,
+                write_mask: ColorWrites::ALL,
+            })],
+            ..default()
+        }),
+        ..default()
+    })
+}
+
+/// Whether a probe-state debug overlay (LOD / coverage) is active — these are computed in the resolve
+/// pass and must reach the screen UNBLURRED, so the combine binds the pre-blur `gi_a` for them.
+pub(super) fn probe_debug_active(defs: &[String]) -> bool {
+    defs.iter().any(|d| d == "SDF_DEBUG_PROBE_LOD" || d == "SDF_DEBUG_PROBE_COVERAGE")
 }
 
 #[derive(Debug, Hash, PartialEq, Eq, Clone, RenderLabel)]
@@ -85,32 +129,17 @@ pub(super) fn init_gi_pipelines(
     combine: Res<SdfCombinePipeline>,
     pipeline_cache: Res<PipelineCache>,
 ) {
-    let gi_target = || {
-        Some(FragmentState {
-            shader: resolve_shader.0.clone(),
-            shader_defs: vec![],
-            targets: vec![Some(ColorTargetState {
-                format: GI_FORMAT,
-                blend: None,
-                write_mask: ColorWrites::ALL,
-            })],
-            ..default()
-        })
-    };
-
     // Resolve: 0 = camera, 1 = atlas (probe lookup), 2 = G-buffer (reuse combine's), 3 = probe.
-    let resolve_id = pipeline_cache.queue_render_pipeline(RenderPipelineDescriptor {
-        label: Some("sdf_gi_resolve_pipeline".into()),
-        layout: vec![
-            sdf_pipeline.layout_0.clone(),
-            sdf_pipeline.layout_1.clone(),
-            combine.layout.clone(),
-            probe::probe_apply_layout_desc(),
-        ],
-        vertex: fullscreen_shader.to_vertex_state(),
-        fragment: gi_target(),
-        ..default()
-    });
+    // Queued with empty defs; `rebuild_pipeline_on_def_change` re-queues it with the active debug set
+    // (so the SDF_DEBUG_PROBE_LOD / _COVERAGE `#ifdef` branches in the resolve actually compile in).
+    let resolve_id = queue_resolve_pipeline(
+        &pipeline_cache,
+        &sdf_pipeline,
+        &combine,
+        &resolve_shader,
+        &fullscreen_shader,
+        vec![],
+    );
 
     let blur_layout = BindGroupLayoutDescriptor::new(
         "sdf_gi_blur",
@@ -141,7 +170,12 @@ pub(super) fn init_gi_pipelines(
         ..default()
     });
 
-    commands.insert_resource(SdfGiPipelines { resolve_id, blur_id, blur_layout });
+    commands.insert_resource(SdfGiPipelines {
+        resolve_id,
+        blur_id,
+        blur_layout,
+        resolve_defs: vec![],
+    });
     commands.insert_resource(SdfGiTextures::default());
 }
 
@@ -399,11 +433,18 @@ impl ViewNode for SdfGiBlurNode {
 pub(super) fn gi_apply_bind_group(device: &RenderDevice, world: &World) -> Option<BindGroup> {
     let gi = world.get_resource::<SdfGiTextures>()?;
     let pipeline_cache = world.resource::<PipelineCache>();
-    let (out, samp) = (gi.out.as_ref()?, gi.sampler.as_ref()?);
+    // A probe-state overlay (LOD / coverage) is written by the resolve into `gi_a`; bind that PRE-blur
+    // so the lit pass shows it crisp (the à-trous blur would smear the hue / coverage edges). Normal GI
+    // binds the blurred `gi_out`.
+    let debug_probe = world
+        .get_resource::<super::ExtractedShaderDefs>()
+        .is_some_and(|d| probe_debug_active(&d.defs));
+    let tex = if debug_probe { gi.a.as_ref()? } else { gi.out.as_ref()? };
+    let samp = gi.sampler.as_ref()?;
     let layout = pipeline_cache.get_bind_group_layout(&gi_apply_layout_desc());
     Some(device.create_bind_group(
         "sdf_combine_gi",
         &layout,
-        &BindGroupEntries::sequential((out, samp)),
+        &BindGroupEntries::sequential((tex, samp)),
     ))
 }

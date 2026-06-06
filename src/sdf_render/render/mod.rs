@@ -693,6 +693,7 @@ impl Plugin for SdfRenderPlugin {
                 bevy::render::extract_resource::ExtractResourcePlugin::<super::DdgiParams>::default(),
                 bevy::render::extract_resource::ExtractResourcePlugin::<super::GiSettle>::default(),
                 bevy::render::extract_resource::ExtractResourcePlugin::<super::ProbeWakeSet>::default(),
+                bevy::render::extract_resource::ExtractResourcePlugin::<super::ProbeRelevanceSet>::default(),
                 bevy::render::extract_resource::ExtractResourcePlugin::<super::ProbeReset>::default(),
             ))
             .add_systems(
@@ -858,6 +859,7 @@ fn prepare_sdf_camera_data(
     // reprojects to itself — harmless, the history buffer is also invalid that frame).
     mut prev_clip: Local<bevy::platform::collections::HashMap<Entity, Mat4>>,
 ) {
+    let _span = info_span!("prepare_sdf_camera_data").entered();
     let sun = sun_light
         .iter()
         .next()
@@ -883,6 +885,10 @@ fn prepare_sdf_camera_data(
     let any_removed = removed_lights.read().next().is_some();
     let lights_dirty = any_removed || !changed_lights.is_empty();
     if lights_dirty {
+        // INSTRUMENTED: rebuilds the WHOLE point-light table + world grid. On a scene with many emitters
+        // (e.g. cornell32's 1024 ceiling lights) moving one light re-bins all of them — a suspect for the
+        // edit-time hitch, named here instead of an anonymous render-schedule gap.
+        let _ls = info_span!("sdf_light_grid_rebuild").entered();
         // PHYSICAL: luminous power (lumens) → luminous intensity (candela) is `intensity / 4π`;
         // radiance = linear colour × candela. `point_attenuation` (1/d² windowed) + camera exposure
         // are applied GPU-side.
@@ -1060,9 +1066,11 @@ fn extract_shader_defs(defs: Extract<Res<SdfShaderDefs>>, mut commands: Commands
 fn rebuild_pipeline_on_def_change(
     mut pipeline: ResMut<SdfPipeline>,
     mut combine: ResMut<SdfCombinePipeline>,
+    mut gi_pipelines: ResMut<gi::SdfGiPipelines>,
     extracted: Option<Res<ExtractedShaderDefs>>,
     shader_handle: Res<SdfShaderHandle>,
     combine_shader: Res<SdfCombineShaderHandle>,
+    resolve_shader: Res<gi::SdfGiResolveShaderHandle>,
     pipeline_cache: Res<PipelineCache>,
     fullscreen_shader: Res<FullscreenShader>,
 ) {
@@ -1127,6 +1135,22 @@ fn rebuild_pipeline_on_def_change(
         });
         combine.pipeline_id = new_id;
         combine.current_defs = extracted.defs.clone();
+    }
+
+    // GI-resolve pipeline (carries the SDF_DEBUG_PROBE_LOD / _COVERAGE `#ifdef` branches — without this
+    // rebuild the resolve stays at its empty-def build and the probe overlays never engage).
+    if extracted.defs != gi_pipelines.resolve_defs {
+        let resolve_defs: Vec<_> = extracted.defs.iter().map(|s| s.as_str().into()).collect();
+        let new_id = gi::queue_resolve_pipeline(
+            &pipeline_cache,
+            &pipeline,
+            &combine,
+            &resolve_shader,
+            &fullscreen_shader,
+            resolve_defs,
+        );
+        gi_pipelines.resolve_id = new_id;
+        gi_pipelines.resolve_defs = extracted.defs.clone();
     }
 }
 
