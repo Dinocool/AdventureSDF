@@ -51,6 +51,13 @@ pub mod edits;
 mod cornell;
 #[cfg(test)]
 mod gallery;
+// Mesh-bake migration test scene (sharp cube / sphere / smooth blend / subtraction) — see
+// `mesh_test.rs`. Test-only generator like `gallery`; runtime loads the serialized `.scene`.
+#[cfg(test)]
+mod mesh_test;
+/// Phase-0 SDF→mesh bake spike (Surface Nets via `fast_surface_nets`). Added as `MeshBakePlugin` in
+/// `main.rs`; see `docs/MESH_BAKE_PLAN.md`.
+pub mod mesh_bake;
 pub mod gizmo;
 pub(crate) mod height;
 pub mod light_grid;
@@ -139,8 +146,10 @@ pub struct RayStepCapture {
     pub steps: Vec<picking::RayStep>,
 }
 
-/// Toggle for the SDF fullscreen raymarch pass. F1 flips this.
-#[derive(Resource)]
+/// Toggle for the SDF fullscreen raymarch pass. F1 flips this. Must be `ExtractResource` (synced to
+/// the render world) — the render nodes read it there to short-circuit; without the sync F1 has no
+/// effect (the render world would never see the flipped value).
+#[derive(Resource, Clone, bevy::render::extract_resource::ExtractResource)]
 pub struct SdfRenderEnabled(pub bool);
 
 impl Default for SdfRenderEnabled {
@@ -346,7 +355,12 @@ impl Default for DdgiParams {
             // Progressive-average window N_max = 1/(1-h) ≈ 20: accumulates per-frame-rotated ray sets
             // (smoothness/low boil) while staying reasonably responsive; the history clamp bounds boil.
             hysteresis: 0.95,
-            intensity: 1.0,
+            // DDGI DISABLED for the mesh-bake pivot — Bevy Solari (mesh-native raytraced GI) will
+            // replace our custom DDGI/RC/surfel stack once meshes land. 0 = no GI contribution (the
+            // lit pass adds `albedo × probe_irradiance × intensity`). NOTE: this only zeroes the
+            // OUTPUT — the probe-trace/resolve/blur passes still run; fully removing them is a plan
+            // step (see docs/MESH_BAKE_PLAN.md). Re-enable by restoring intensity to 1.0.
+            intensity: 0.0,
             subdiv: 2,
             update_stride: 4,
             gi_range: 24.0,
@@ -965,11 +979,12 @@ fn setup_sdf_scene(mut asset_table: ResMut<crate::assets::MaterialAssetTable>) {
     // loaded edit entities exist and the BVH can be built from them.
 }
 
-/// Path to the editor's default scene: the Cornell GI box (white room + R/G/B objects + a white
-/// ceiling emissive — the DDGI showcase for colour bleeding / shadows / bounces). The PBR gallery
-/// (`assets/scenes/gallery.scene`) and the stress tower-field (`assets/scenes/stress.scene`, heavy
-/// SDF load for raymarch profiling) can be loaded manually via the scene browser.
-pub const DEFAULT_SCENE_PATH: &str = "assets/scenes/cornell.scene";
+/// Path to the editor's default scene: the **mesh-bake test scene** (`mesh_test.rs`) — a small,
+/// legible CSG set (sharp cube / sphere / smooth blend / subtraction) for evaluating Surface Nets
+/// meshing during the SDF→mesh migration. The PBR gallery (`assets/scenes/gallery.scene`), the
+/// Cornell GI box (`assets/scenes/cornell.scene`), and the stress tower-field
+/// (`assets/scenes/stress.scene`) remain loadable via the scene browser.
+pub const DEFAULT_SCENE_PATH: &str = "assets/scenes/mesh_test.scene";
 
 /// Load the default scene into the world on editor enter. Exclusive (scene load
 /// needs `&mut World` + the type registry). Runs after `setup_sdf_scene` so the materials

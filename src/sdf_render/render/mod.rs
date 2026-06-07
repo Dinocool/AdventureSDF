@@ -690,6 +690,7 @@ impl Plugin for SdfRenderPlugin {
             .add_plugins((
                 ExtractComponentPlugin::<SdfCameraData>::default(),
                 UniformComponentPlugin::<SdfCameraData>::default(),
+                bevy::render::extract_resource::ExtractResourcePlugin::<super::SdfRenderEnabled>::default(),
                 bevy::render::extract_resource::ExtractResourcePlugin::<super::DdgiParams>::default(),
                 bevy::render::extract_resource::ExtractResourcePlugin::<super::GiSettle>::default(),
                 bevy::render::extract_resource::ExtractResourcePlugin::<super::ProbeWakeSet>::default(),

@@ -5,7 +5,6 @@
 - Package: `adventure` (Rust, edition 2024)
 - Engine: Bevy 0.18
 - Physics: bevy_rapier3d 0.34
-- BRP: bevy_brp_extras 0.18
 - Modules: `assets`, `camera`, `combat`, `gizmo_render`, `inventory`, `networking`, `node`, `player`, `scene_manager`, `sdf_render`, `soul_scene`, `ui`, `world` (+ `editor`, feature-gated)
 
 ## Build & Run
