@@ -285,9 +285,9 @@ impl ChunkStructure for SortedArray {
         let sorted = self.sorted_keys.capacity() * std::mem::size_of::<ChunkKey>();
         let k2r = self.key_to_row.capacity() * (std::mem::size_of::<ChunkKey>() + 4);
         let s2k = self.slot_to_key.capacity() * (4 + std::mem::size_of::<ChunkKey>());
-        // GPU-side buffers the structure forces: chunk_buf (rows × 28B) + tile_run
-        // (high_water × TILE_RUN_SLOT × 12B).
-        let gpu_chunk_buf = n * 28;
+        // GPU-side buffers the structure forces: chunk_buf (rows × 32B) + tile_run
+        // (high_water × TILE_RUN_SLOT × 20B).
+        let gpu_chunk_buf = n * 32;
         let gpu_tile_run = self.slots.high_water() as usize * TILE_RUN_SLOT as usize * 12;
         entry_bytes + sorted + k2r + s2k + gpu_chunk_buf + gpu_tile_run
     }
@@ -563,7 +563,7 @@ impl ChunkStructure for ToroidalHybrid {
     fn memory_bytes(&self) -> usize {
         // Directory (compact 20B-equivalent entries) + sparse tile-run buffer (high water).
         let dir = self.dir.len() * std::mem::size_of::<DirEntry>();
-        let gpu_dir = self.dir.len() * 28; // 28B ChunkLookup on the GPU
+        let gpu_dir = self.dir.len() * 32; // 32B ChunkLookup on the GPU
         let gpu_tile_run = self.run_high_water as usize * TILE_RUN_SLOT as usize * 12;
         dir.max(gpu_dir) + gpu_tile_run
     }

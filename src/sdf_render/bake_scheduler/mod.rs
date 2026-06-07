@@ -234,6 +234,19 @@ impl BakeScheduler {
     pub fn set_height(&mut self, height: super::height::SharedHeightField) {
         self.height = height;
     }
+
+    /// Drop all queued + carried bake state so the next frame re-bakes the window from scratch. Used on
+    /// a scene switch (pair with [`super::atlas::SdfAtlas::reset`]). Clearing `ring_chunk_origin` forces
+    /// a full window re-enter (otherwise the diff sees no movement against the now-empty atlas and never
+    /// re-enqueues); bumping `edit_gen` discards any async bake task still in flight for the old scene
+    /// when it lands. Edits/BVH are left as-is — they re-snapshot on the next gather from the new scene.
+    pub fn reset(&mut self) {
+        self.pending.clear();
+        self.ready.clear();
+        self.ring_chunk_origin.clear();
+        self.edit_gen = self.edit_gen.wrapping_add(1);
+        self.ready_edit_gen = self.edit_gen;
+    }
 }
 
 /// Max brick bake JOBS emitted to the GPU per frame. Each job writes its

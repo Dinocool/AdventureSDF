@@ -69,6 +69,9 @@ impl Plugin for EditorPlugin {
         .init_resource::<scene_browser::OpenSceneDialog>()
         .init_resource::<scene_browser::SaveSceneDialog>()
         .init_resource::<scene_tabs::OpenScenes>()
+        // Keep the active tab's unsaved-changes `*` marker live via Bevy change-detection —
+        // never a periodic full-scene serialize (that stuttered ~380ms on large scenes).
+        .add_systems(Update, scene_tabs::mark_scene_dirty)
         .init_resource::<notifications::Notifications>()
         .init_resource::<layout::LayoutsDialog>()
         .init_resource::<layout::PanelRestore>()

@@ -753,3 +753,147 @@ fn bind(binding: u32, buf: &wgpu::Buffer) -> wgpu::BindGroupEntry<'_> {
         resource: buf.as_entire_binding(),
     }
 }
+
+/// PERF rig (ignored): GPU brick-bake dispatch time, A/B'ing the 6-tap curvature-correction cost
+/// (`correct_and_grad`) against a variant where its near-surface gate never fires. Confirms +
+/// quantifies the bake regression headlessly — no editor, no Nsight, no scene.
+/// `cargo test --release --test sdf_bake_gpu -- --ignored --nocapture bake_perf`
+#[test]
+#[ignore = "perf rig — run with --ignored --nocapture; needs a real GPU"]
+fn bake_perf_curvature_ab() {
+    let Some((device, queue)) = device_queue() else {
+        eprintln!("no GPU adapter — skipping");
+        return;
+    };
+    use wgpu::util::DeviceExt;
+
+    let cfg = SdfGridConfig::default();
+    let lod = 0u32;
+    let voxel_size = cfg.voxel_size_at(lod);
+    let band = dist_band_world(&cfg, lod);
+
+    // Representative near-surface brick: several overlapping spheres so `edit_count > 1` (the
+    // per-voxel `fold_csg` cost the curvature taps multiply). The brick at world 0 straddles them.
+    for n_edits in [8u32, 32, 128, 512, 2048] {
+    let mut edits = Vec::new();
+    for i in 0..n_edits {
+        let off = i as f32 * 0.015;
+        let e = ResolvedEdit::new(
+            SdfPrimitive::Sphere { radius: 0.30 + off },
+            bevy::prelude::Transform::from_xyz(off, 0.0, 0.0),
+            SdfOp::default(),
+            i as u16,
+        );
+        edits.extend_from_slice(&edit_bytes(&to_gpu_edit(&e)));
+    }
+    let coord = cfg.world_to_brick_lod(Vec3::ZERO, lod);
+
+    // Replicate the worst-case near-surface brick across many jobs (fills the GPU like a real batch).
+    let n_jobs = 4096u32;
+    let mut headers = Vec::with_capacity((n_jobs * 48) as usize);
+    for _ in 0..n_jobs {
+        headers.extend_from_slice(&header_bytes(coord, voxel_size, band, n_edits));
+    }
+
+    let real_src = std::fs::read_to_string("assets/shaders/sdf_brick_bake.wgsl").unwrap();
+    // Make the curvature gate `abs(f) < gate` never fire → the 6-tap `correct_and_grad` is skipped.
+    let nocurv_src = real_src.replace("let gate = 2.5 * h.voxel_size;", "let gate = -1.0;");
+    assert_ne!(real_src, nocurv_src, "curvature-gate string must match the shader");
+
+    let run = |src: &str| -> u128 {
+        let module = Composer::default()
+            .make_naga_module(NagaModuleDescriptor {
+                source: src,
+                file_path: "sdf_brick_bake.wgsl",
+                ..Default::default()
+            })
+            .expect("compose bake");
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("bake"),
+            source: wgpu::ShaderSource::Naga(Cow::Owned(module)),
+        });
+        let header_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("headers"),
+            contents: &headers,
+            usage: wgpu::BufferUsages::STORAGE,
+        });
+        let edit_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("edits"),
+            contents: &edits,
+            usage: wgpu::BufferUsages::STORAGE,
+        });
+        let out = |n: u32, l: &'static str| {
+            device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(l),
+                size: (n * 4 * n_jobs) as u64,
+                usage: wgpu::BufferUsages::STORAGE,
+                mapped_at_creation: false,
+            })
+        };
+        let dist_buf = out(DIST_TILE_U32, "dist");
+        let mat_buf = out(MAT_TILE_U32, "mat");
+        let grad_buf = out(GRAD_TILE_U32, "grad");
+        let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("bgl"),
+            entries: &[
+                storage_entry(0, true),
+                storage_entry(1, true),
+                storage_entry(2, false),
+                storage_entry(3, false),
+                storage_entry(4, false),
+            ],
+        });
+        let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("pl"),
+            bind_group_layouts: &[&layout],
+            push_constant_ranges: &[],
+        });
+        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("bake"),
+            layout: Some(&pl),
+            module: &shader,
+            entry_point: Some("main"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("bg"),
+            layout: &layout,
+            entries: &[
+                bind(0, &header_buf),
+                bind(1, &edit_buf),
+                bind(2, &dist_buf),
+                bind(3, &mat_buf),
+                bind(4, &grad_buf),
+            ],
+        });
+        let mut best = u128::MAX;
+        for _ in 0..10 {
+            let mut enc = device.create_command_encoder(&Default::default());
+            {
+                let mut pass = enc.begin_compute_pass(&Default::default());
+                pass.set_pipeline(&pipeline);
+                pass.set_bind_group(0, &bind_group, &[]);
+                pass.dispatch_workgroups(n_jobs.min(256), n_jobs.div_ceil(256), 1);
+            }
+            let t = std::time::Instant::now();
+            queue.submit([enc.finish()]);
+            device.poll(wgpu::PollType::wait_indefinitely()).ok();
+            best = best.min(t.elapsed().as_micros());
+        }
+        best
+    };
+
+    let real_us = run(&real_src);
+    let nocurv_us = run(&nocurv_src);
+    println!(
+        "bake_perf: {} jobs × {} edits | real={}us nocurv={}us | curvature={}us ({:.2}x slower)",
+        n_jobs,
+        n_edits,
+        real_us,
+        nocurv_us,
+        real_us.saturating_sub(nocurv_us),
+        real_us as f64 / nocurv_us.max(1) as f64,
+        );
+    }
+}

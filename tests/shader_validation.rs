@@ -191,59 +191,14 @@ fn sdf_feature_defs_validate() {
     validate_composed_sdf_with_defs(&["SDF_SHADOWS"]).unwrap_or_else(|e| panic!("{e}"));
 }
 
-/// Compose + validate a STANDALONE entry shader that imports only the named binding-free helper
-/// modules (NOT the atlas-bound sdf::bindings graph) plus the fullscreen stub, with the given
-/// shader defs enabled (so `#ifdef` debug branches actually compile).
-fn validate_standalone_with_defs(entry: &str, modules: &[&str], defs: &[&str]) {
-    use naga_oil::compose::ShaderDefValue;
-    use std::collections::HashMap;
-
-    let mut composer = composer_with_stub();
-    for path in modules {
-        let source = std::fs::read_to_string(path).unwrap_or_else(|e| panic!("read {path}: {e}"));
-        composer
-            .add_composable_module(ComposableModuleDescriptor {
-                source: &source,
-                file_path: path,
-                language: ShaderLanguage::Wgsl,
-                ..Default::default()
-            })
-            .unwrap_or_else(|e| panic!("compose {path} failed: {e}"));
-    }
-    let shader_defs: HashMap<String, ShaderDefValue> = defs
-        .iter()
-        .map(|d| ((*d).to_string(), ShaderDefValue::Bool(true)))
-        .collect();
-    let entry_src = std::fs::read_to_string(entry).unwrap_or_else(|e| panic!("read {entry}: {e}"));
-    let module = composer
-        .make_naga_module(NagaModuleDescriptor {
-            source: &entry_src,
-            file_path: entry,
-            shader_defs,
-            ..Default::default()
-        })
-        .unwrap_or_else(|e| panic!("compose {entry} (defs={defs:?}) failed:\n{e}"));
-    let mut validator = naga::valid::Validator::new(
-        naga::valid::ValidationFlags::all(),
-        naga::valid::Capabilities::all(),
-    );
-    validator
-        .validate(&module)
-        .unwrap_or_else(|e| panic!("WGSL validation error in {entry} (defs={defs:?}):\n{e:?}"));
-}
-
-/// As above with no defs.
-fn validate_standalone_with_modules(entry: &str, modules: &[&str]) {
-    validate_standalone_with_defs(entry, modules, &[]);
-}
-
 #[test]
 fn sdf_deferred_lit_wgsl_validates() {
-    // The deferred lit pass imports `sdf::oct` + `sdf::brdf` (binding-free). Validate the default
-    // (lit) build AND each `#ifdef`-gated debug-view branch so errors inside them are caught.
-    let modules = ["assets/shaders/sdf/oct.wgsl", "assets/shaders/sdf/brdf.wgsl"];
+    // The deferred lit pass now imports the full sdf::* graph (bindings + brick + probe for the
+    // DDGI apply, plus oct + brdf). Compose the whole graph + validate the default (lit) build AND
+    // each `#ifdef`-gated debug-view branch (incl. the new SDF_DEBUG_GI) so errors inside them are
+    // caught exactly as the GPU pipeline would compile them.
     let entry = "assets/shaders/sdf_deferred_lit.wgsl";
-    validate_standalone_with_modules(entry, &modules);
+    validate_composed_entry(entry, &[]).unwrap_or_else(|e| panic!("{e}"));
     for def in [
         "SDF_DEBUG_ALBEDO",
         "SDF_DEBUG_NORMALS",
@@ -253,9 +208,91 @@ fn sdf_deferred_lit_wgsl_validates() {
         "SDF_DEBUG_SUN_VIS",
         "SDF_DEBUG_DEPTH",
         "SDF_DEBUG_STEP_COUNT",
+        "SDF_DEBUG_GI",
     ] {
-        validate_standalone_with_defs(entry, &modules, &[def]);
+        validate_composed_entry(entry, &[def]).unwrap_or_else(|e| panic!("{e}"));
     }
+}
+
+#[test]
+fn sdf_probe_trace_wgsl_validates() {
+    // The probe-trace compute shader imports the full sdf::* graph (raymarch, material, sky,
+    // shadows, probe) plus its own group(3) probe buffers. Compose + validate exactly as the GPU
+    // pipeline will — catches every type / binding / call error before any render wiring exists.
+    // Validate BOTH the bare graph AND the `SDF_GI_MARCH` variant the real pipeline compiles (it
+    // gates the slim GI raymarch in sdf::march), so errors in either arm are caught.
+    validate_composed_entry("assets/shaders/sdf_probe_trace.wgsl", &[])
+        .unwrap_or_else(|e| panic!("{e}"));
+    validate_composed_entry("assets/shaders/sdf_probe_trace.wgsl", &["SDF_GI_MARCH"])
+        .unwrap_or_else(|e| panic!("{e}"));
+}
+
+#[test]
+fn sdf_gi_resolve_wgsl_validates() {
+    // The GI-resolve fragment shader imports the sdf::* probe-addressing graph (bindings, oct, probe)
+    // and evaluates sample_gi into a texture. Compose + validate as the pipeline will — the bare build
+    // AND each probe-state debug overlay (the resolve writes the LOD / coverage hue under these defines,
+    // now that the resolve pipeline rebuilds with the active debug set).
+    validate_composed_entry("assets/shaders/sdf_gi_resolve.wgsl", &[])
+        .unwrap_or_else(|e| panic!("{e}"));
+    for def in ["SDF_DEBUG_PROBE_LOD", "SDF_DEBUG_PROBE_COVERAGE"] {
+        validate_composed_entry("assets/shaders/sdf_gi_resolve.wgsl", &[def])
+            .unwrap_or_else(|e| panic!("{e}"));
+    }
+}
+
+#[test]
+fn sdf_gi_blur_wgsl_validates() {
+    // The edge-aware à-trous GI blur (imports sdf::oct only).
+    validate_composed_entry("assets/shaders/sdf_gi_blur.wgsl", &[])
+        .unwrap_or_else(|e| panic!("{e}"));
+}
+
+#[test]
+fn sdf_probe_module_validates() {
+    // `sdf/probe.wgsl` (DDGI probe addressing) imports `sdf::bindings` + `sdf::brick`. Compose the
+    // full sdf graph + a tiny entry that actually CALLS its functions (incl. probe_slot_at, which
+    // reaches the chunk directory), so the function bodies are validated (adding a composable module
+    // alone doesn't validate bodies that nothing instantiates).
+    let mut composer = composer_with_stub();
+    for module in SDF_SHADER_MODULES {
+        let path = format!("assets/{module}");
+        let src = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {path}: {e}"));
+        composer
+            .add_composable_module(ComposableModuleDescriptor {
+                source: &src,
+                file_path: &path,
+                language: ShaderLanguage::Wgsl,
+                ..Default::default()
+            })
+            .unwrap_or_else(|e| panic!("compose {path} failed: {e}"));
+    }
+    let entry = r#"
+#import sdf::probe::{probe_world_pos, subprobe_world_pos, probe_slot_at, decode_chunk_key, brick_coord_in_chunk}
+@compute @workgroup_size(1)
+fn main() {
+    let a = probe_world_pos(vec3<i32>(0, 0, 0), 0u);
+    let b = subprobe_world_pos(vec3<i32>(1, 2, 3), 1u, vec3<i32>(0, 0, 0), 2u);
+    let id = decode_chunk_key(0u, 0u);
+    let bc = brick_coord_in_chunk(id.coord, 5u);
+    let s = probe_slot_at(bc, id.lod);
+    _ = a.x + b.y + f32(s);
+}
+"#;
+    let module = composer
+        .make_naga_module(NagaModuleDescriptor {
+            source: entry,
+            file_path: "probe_validate.wgsl",
+            ..Default::default()
+        })
+        .unwrap_or_else(|e| panic!("compose probe entry failed:\n{e}"));
+    let mut validator = naga::valid::Validator::new(
+        naga::valid::ValidationFlags::all(),
+        naga::valid::Capabilities::all(),
+    );
+    validator
+        .validate(&module)
+        .unwrap_or_else(|e| panic!("WGSL validation error in sdf::probe:\n{e:?}"));
 }
 
 #[test]

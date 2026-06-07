@@ -21,7 +21,7 @@
 use std::collections::BTreeSet;
 // FxHashMap for the live chunk-table maps mutated per baked brick (chunk→slot, chunk entries,
 // slot→chunk). Integer keys; FxHash over std SipHash cuts the per-brick set_brick/clear_brick cost.
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use bevy::math::IVec3;
 
@@ -107,7 +107,7 @@ pub fn chunk_world_size(lod: u32, config: &SdfGridConfig) -> f32 {
 }
 
 /// One entry in the GPU chunk lookup table (indexed directly via `dir_index`, tag-compared by the
-/// shader). 7×u32 = 28 bytes. TWO occupancy masks, decoupled:
+/// shader). 8×u32 = 32 bytes. TWO occupancy masks, decoupled:
 /// - `occ_lo|occ_hi` — the BAKED (display) mask: bit `i` ⇒ local brick `i` has a resident atlas
 ///   TILE. Used by `resolve_march` for SAMPLING; honours the `{native,native+1}` shell residency.
 /// - `cons_occ_lo|cons_occ_hi` — the CONSERVATIVE (traversal) mask: bit `i` ⇒ the geometry BVH
@@ -117,7 +117,10 @@ pub fn chunk_world_size(lod: u32, config: &SdfGridConfig) -> f32 {
 ///   residency and of LOD-shrinkage, fixing both the perf regression and the skip-past bug.
 ///
 /// `tile_run_base` indexes the packed `tile_run` where this chunk's `popcount(occ)` baked bricks
-/// live in ascending local order.
+/// live in ascending local order. `probe_base` is the DDGI finest-resident FLAG: `0` = this chunk's
+/// occupied bricks own probes (each brick's compact slot is in its [`BrickTile::probe_slot`]);
+/// `u32::MAX` = covered by a finer LOD (bricks own NO probes → apply/bounce fall to the finer LOD).
+/// See `refresh_probe_bases`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ChunkLookup {
     pub key_hi: u32,
@@ -127,6 +130,7 @@ pub struct ChunkLookup {
     pub cons_occ_lo: u32,
     pub cons_occ_hi: u32,
     pub tile_run_base: u32,
+    pub probe_base: u32,
 }
 
 /// `mat_atlas_base` sentinel for a SINGLE-material brick: it owns no material atlas tile (the
@@ -136,14 +140,31 @@ pub const MAT_ATLAS_NONE: u32 = u32::MAX;
 
 /// One resident brick's GPU record inside a chunk's tile run: its DISTANCE atlas tile origin, its
 /// MATERIAL atlas tile origin (or [`MAT_ATLAS_NONE`] for a single-material brick — those store no
-/// material tile), plus its packed 4-entry material palette (`pal01 = id0|id1<<16`,
-/// `pal23 = id2|id3<<16`). 4×u32 = 16 bytes.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+/// material tile), its packed 4-entry material palette (`pal01 = id0|id1<<16`, `pal23 = id2|id3<<16`),
+/// and its DDGI `probe_slot` (the compact finest-resident probe slot, `u32::MAX` = no probe; set by
+/// `refresh_probe_bases`). 5×u32 = 20 bytes. (Custom `Default` below for the `probe_slot`/`mat` sentinels.)
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BrickTile {
     pub atlas_base: u32,
     pub mat_atlas_base: u32,
     pub pal01: u32,
     pub pal23: u32,
+    pub probe_slot: u32,
+}
+
+impl Default for BrickTile {
+    fn default() -> Self {
+        // `probe_slot` defaults to the no-probe sentinel (not 0, which is a valid slot); `mat_atlas_base`
+        // to the single-material sentinel — so an unassigned/empty slot never aliases a real probe or
+        // material tile.
+        Self {
+            atlas_base: 0,
+            mat_atlas_base: MAT_ATLAS_NONE,
+            pal01: 0,
+            pal23: 0,
+            probe_slot: u32::MAX,
+        }
+    }
 }
 
 /// Pixel origin of atlas `tile` (tiles wrap into rows so the texture width stays bounded), packed
@@ -167,6 +188,8 @@ pub fn pack_brick_tile(tile: u32, mat_tile: Option<u32>, palette: Palette) -> Br
         mat_atlas_base: mat_tile.map_or(MAT_ATLAS_NONE, tile_atlas_base),
         pal01: palette[0] as u32 | ((palette[1] as u32) << 16),
         pal23: palette[2] as u32 | ((palette[3] as u32) << 16),
+        // No probe yet — `refresh_probe_bases` assigns the finest-resident slot after the bake.
+        probe_slot: u32::MAX,
     }
 }
 
@@ -202,6 +225,9 @@ pub fn build_chunk_tables(
         let (ck, local) = chunk_of(*key, config);
         live.set_brick(ck, local, tile_of(key), config);
     }
+    // Assign finest-resident probe slots (the render world does this via `refresh_probe_lod` before
+    // extract; the full-rebuild path must do it too so the directory rows carry `probe_base`).
+    live.refresh_probe_bases(u32::MAX);
     let (chunks, tile_run) = live.full_tables();
     ChunkTables {
         chunks,
@@ -236,20 +262,27 @@ pub const TILE_RUN_SLOT: u32 = CHUNK_VOLUME;
 /// sentinel `prepare_sdf_atlas_gpu` already uploads for a fully-evicted atlas.
 pub const SENTINEL_KEY: (u32, u32) = (u32::MAX, u32::MAX);
 
-/// Stable chunk → tile-run-region slot, with a free-list (mirrors [`super::atlas::TileAllocator`]).
-/// `tile_run_base = slot * TILE_RUN_SLOT`. Reusing a freed slot before growing `next` keeps the
-/// tile-run buffer densely packed in chunk units (bounded by peak resident chunk count).
-#[derive(Default)]
-pub struct ChunkSlotAllocator {
-    slot_of: FxHashMap<ChunkKey, u32>,
+/// Stable key → dense slot allocator with a free-list (mirrors [`super::atlas::TileAllocator`]).
+/// Reusing a freed slot before growing `next` keeps the slot space densely packed (bounded by the peak
+/// live key count). Idempotent `alloc` → a key present across frames keeps the SAME slot. Used for both
+/// the chunk → tile-run-region slot ([`ChunkSlotAllocator`]) and the per-brick DDGI probe slot
+/// (keyed by `(ChunkKey, local)`).
+pub struct SlotAllocator<K: std::hash::Hash + Eq> {
+    slot_of: FxHashMap<K, u32>,
     free: Vec<u32>,
     next: u32,
 }
 
-impl ChunkSlotAllocator {
-    /// Assign (or return the existing) slot for `ck`. Reuses a freed slot first.
-    fn alloc(&mut self, ck: ChunkKey) -> u32 {
-        if let Some(&s) = self.slot_of.get(&ck) {
+impl<K: std::hash::Hash + Eq> Default for SlotAllocator<K> {
+    fn default() -> Self {
+        Self { slot_of: FxHashMap::default(), free: Vec::new(), next: 0 }
+    }
+}
+
+impl<K: std::hash::Hash + Eq + Copy> SlotAllocator<K> {
+    /// Assign (or return the existing) slot for `k`. Reuses a freed slot first.
+    fn alloc(&mut self, k: K) -> u32 {
+        if let Some(&s) = self.slot_of.get(&k) {
             return s;
         }
         let s = self.free.pop().unwrap_or_else(|| {
@@ -257,24 +290,32 @@ impl ChunkSlotAllocator {
             self.next += 1;
             s
         });
-        self.slot_of.insert(ck, s);
+        self.slot_of.insert(k, s);
         s
     }
 
-    /// Return `ck`'s slot to the free pool (chunk emptied). Its stale tile-run entries are
-    /// harmless — no live chunk row references them once the slot is unoccupied.
-    fn release(&mut self, ck: &ChunkKey) {
-        if let Some(s) = self.slot_of.remove(ck) {
+    /// Return `k`'s slot to the free pool (key gone). Its stale data is harmless — nothing live
+    /// references the slot once freed. No-op if `k` isn't allocated (so release is idempotent).
+    fn release(&mut self, k: &K) {
+        if let Some(s) = self.slot_of.remove(k) {
             self.free.push(s);
         }
     }
 
-    /// One past the largest slot ever handed out → how many `TILE_RUN_SLOT`-sized regions the
-    /// tile-run buffer must span (`high_water() * TILE_RUN_SLOT` entries).
+    /// One past the largest slot ever handed out → how many slots the backing buffer must span.
     pub fn high_water(&self) -> u32 {
         self.next
     }
+
+    /// Number of slots currently assigned (live keys) — distinct from `high_water` (which includes
+    /// freed-but-not-reused slots).
+    pub fn live_count(&self) -> usize {
+        self.slot_of.len()
+    }
 }
+
+/// Chunk → tile-run-region slot (`tile_run_base = slot * TILE_RUN_SLOT`).
+pub type ChunkSlotAllocator = SlotAllocator<ChunkKey>;
 
 /// One resident chunk's live state: its tile-run slot, the BAKED occupancy mask + 64 brick tiles
 /// (only `popcount(occ)` are live), and the CONSERVATIVE (BVH) occupancy mask used by the
@@ -283,6 +324,11 @@ impl ChunkSlotAllocator {
 /// without baked tiles.
 struct ChunkEntry {
     slot: u32,
+    /// DDGI finest-resident FLAG: `0` = this chunk's occupied bricks own probes (their per-brick slot is
+    /// in [`BrickTile::probe_slot`]); `u32::MAX` = covered by a finer LOD (skip; apply/bounce use the
+    /// finer LOD). A cheap whole-chunk gate; the actual slot is per-brick. Set by `refresh_probe_bases`;
+    /// mirrored into the directory row + resident-row list.
+    probe_base: u32,
     occ: u64,
     cons_occ: u64,
     tiles: [BrickTile; CHUNK_VOLUME as usize],
@@ -296,6 +342,12 @@ struct ChunkEntry {
 #[derive(Default)]
 pub struct LiveChunkTables {
     slots: ChunkSlotAllocator,
+    /// DDGI probe-slot allocator, keyed PER BRICK by `(ChunkKey, local)`, populated ONLY for the
+    /// occupied bricks of **finest-resident** chunks (`refresh_probe_bases`). One compact, stable slot
+    /// per finest-resident brick — EXACT (no intra-chunk waste, no all-LOD redundancy), so the probe
+    /// buffer it sizes (`probe_high_water`) scales with the clipmap window, not the scene's absolute
+    /// size. Each brick stores its slot in its [`BrickTile::probe_slot`].
+    probe_alloc: SlotAllocator<(ChunkKey, u32)>,
     chunks: FxHashMap<ChunkKey, ChunkEntry>,
     /// Reverse of each live chunk's tile-run slot → its key, so a dirty slot resolves to its
     /// region in O(1) (only live chunks; a freed slot is dropped — its region is never indexed).
@@ -316,6 +368,10 @@ pub struct LiveChunkTables {
     dirty_rows: BTreeSet<u32>,
     /// Tile-run slots whose 64-entry region changed this frame.
     dirty_slots: BTreeSet<u32>,
+    /// Chunks whose geometry changed since the last [`drain_wake_keys`](Self::drain_wake_keys) — the
+    /// DDGI "wake" set. A change here (or in a neighbour) re-converges only those probes at the active
+    /// rate while the rest of a settled scene stays dormant (localized wake, no global FPS cliff on edits).
+    wake_keys: FxHashSet<ChunkKey>,
 }
 
 /// What the render world must write to the GPU lookup buffers this frame, produced by
@@ -361,6 +417,7 @@ fn sentinel_lookup() -> ChunkLookup {
         cons_occ_lo: 0,
         cons_occ_hi: 0,
         tile_run_base: 0,
+        probe_base: u32::MAX, // empty slot → never has probes (never read; key tag misses anyway)
     }
 }
 
@@ -414,6 +471,32 @@ impl LiveChunkTables {
         self.chunks.keys().copied()
     }
 
+    /// The COMPACT list of resident chunk directory rows (one [`ChunkLookup`] per non-empty chunk,
+    /// any order). The DDGI probe trace dispatches one workgroup per entry — `O(resident chunks)`
+    /// (hundreds–thousands) instead of scanning the full `R³·lod_count` toroidal directory (millions
+    /// of empty slots) every frame. Each row carries the key (→ decode to lod+coord), occupancy mask,
+    /// and `tile_run_base` (→ the probe's storage slot), so the trace needs nothing else to enumerate
+    /// every probe.
+    pub fn resident_rows(&self) -> Vec<ChunkLookup> {
+        self.chunks
+            .iter()
+            .map(|(ck, e)| {
+                let (key_hi, key_lo) = chunk_gpu_key(*ck);
+                ChunkLookup {
+                    key_hi,
+                    key_lo,
+                    occ_lo: e.occ as u32,
+                    occ_hi: (e.occ >> 32) as u32,
+                    cons_occ_lo: e.cons_occ as u32,
+                    cons_occ_hi: (e.cons_occ >> 32) as u32,
+                    tile_run_base: e.slot * TILE_RUN_SLOT,
+                    // Finest-resident probe slot (or u32::MAX), assigned by `refresh_probe_bases`.
+                    probe_base: e.probe_base,
+                }
+            })
+            .collect()
+    }
+
     /// Mark a resident brick present in its chunk (insert or palette/tile change). `local` is the
     /// brick's 0..63 slot from [`chunk_of`]; `tile` is its packed atlas origin + palette. O(1): one
     /// directory slot write + a tile-run slot. `config` supplies `R`/`lod_count` to lazily size the
@@ -436,7 +519,17 @@ impl LiveChunkTables {
         if (cur.key_hi, cur.key_lo) != SENTINEL_KEY && (cur.key_hi, cur.key_lo) != tag {
             let old_slot = cur.tile_run_base / TILE_RUN_SLOT;
             if let Some(old_ck) = self.slot_to_key.remove(&old_slot) {
-                self.chunks.remove(&old_ck);
+                // Free the evicted chunk's per-brick probe slots before dropping it (idempotent if it
+                // owned none — non-finest). The chunk left the window without an explicit clear, so this
+                // is the only place its probe slots get reclaimed.
+                if let Some(old) = self.chunks.remove(&old_ck) {
+                    let mut bits = old.occ;
+                    while bits != 0 {
+                        let l = bits.trailing_zeros();
+                        bits &= bits - 1;
+                        self.probe_alloc.release(&(old_ck, l));
+                    }
+                }
                 self.slots.release(&old_ck);
                 self.dirty_slots.remove(&old_slot);
             }
@@ -445,6 +538,7 @@ impl LiveChunkTables {
         let slot = self.slots.alloc(ck);
         let entry = self.chunks.entry(ck).or_insert_with(|| ChunkEntry {
             slot,
+            probe_base: u32::MAX, // assigned by refresh_probe_bases (runs the same frame)
             occ: 0,
             cons_occ: 0,
             tiles: [BrickTile::default(); CHUNK_VOLUME as usize],
@@ -466,6 +560,7 @@ impl LiveChunkTables {
             cons_occ_lo: cons as u32,
             cons_occ_hi: (cons >> 32) as u32,
             tile_run_base: slot * TILE_RUN_SLOT,
+            probe_base: entry.probe_base, // preserve the DDGI finest-resident flag
         };
         self.dirty_rows.insert(idx as u32);
         self.dirty_slots.insert(slot);
@@ -514,6 +609,7 @@ impl LiveChunkTables {
         let slot = self.slots.alloc(ck);
         let entry = self.chunks.entry(ck).or_insert_with(|| ChunkEntry {
             slot,
+            probe_base: u32::MAX, // conservative-only chunk owns no probes until refresh_probe_bases
             occ: 0,
             cons_occ: 0,
             tiles: [BrickTile::default(); CHUNK_VOLUME as usize],
@@ -529,9 +625,14 @@ impl LiveChunkTables {
             cons_occ_lo: cons as u32,
             cons_occ_hi: (cons >> 32) as u32,
             tile_run_base: slot * TILE_RUN_SLOT,
+            // u32::MAX until `refresh_probe_bases` (runs the same frame, after all set/clear_brick)
+            // assigns the finest-resident probe slot. Safe default: u32::MAX = no probes (apply/bounce
+            // fall to a coarser LOD) rather than a wrong slot, if refresh somehow didn't run.
+            probe_base: u32::MAX,
         };
         self.dirty_rows.insert(idx as u32);
         self.dirty_slots.insert(slot);
+        self.wake_keys.insert(ck); // geometry changed here → re-converge this region's probes
     }
 
     /// Clear a brick from its chunk. If the chunk becomes empty, free its tile-run slot and reset its
@@ -546,8 +647,12 @@ impl LiveChunkTables {
         // (the geometry may still overlap this brick — e.g. it's holed by the shell — so the
         // empty-space DDA must keep seeing it). The chunk's directory entry survives while EITHER mask
         // is non-zero.
+        self.wake_keys.insert(ck); // geometry changed here → re-converge this region's probes
         entry.occ &= !(1u64 << local);
         entry.tiles[local as usize] = BrickTile::default();
+        // Free this brick's DDGI probe slot (the brick is gone; idempotent if it owned none). Disjoint
+        // field borrow: `entry` borrows `self.chunks`, `self.probe_alloc` is a separate field.
+        self.probe_alloc.release(&(ck, local));
         let slot = entry.slot;
         let occ = entry.occ;
         // Stay while baked OR conservatively-occupied; publish cons ⊇ occ. `entry.cons_occ` (owned by
@@ -566,6 +671,7 @@ impl LiveChunkTables {
         }
         // Chunk emptied → sentinel its directory slot, free the tile-run slot. The region is now
         // unreferenced (the sentinel tag never resolves), so it needs no upload.
+        // The just-cleared brick's probe slot was already freed above; an empty chunk owns no others.
         self.chunks.remove(&ck);
         self.slot_to_key.remove(&slot);
         self.slots.release(&ck);
@@ -583,6 +689,140 @@ impl LiveChunkTables {
     /// Number of directory slots (= GPU `chunk_buf` length = `R³ × lod_count`, 0 until first sized).
     pub fn row_count(&self) -> u32 {
         self.dir.len() as u32
+    }
+
+    /// Recompute the DDGI finest-resident probe assignment. For each resident chunk: if it is the FINEST
+    /// resident LOD over its region, set its flag (`probe_base = 0`) and assign each occupied brick a
+    /// COMPACT, stable per-brick probe slot (`BrickTile::probe_slot`) from the dedicated per-brick
+    /// allocator — idempotent, so a brick that stays finest keeps the SAME slot across frames (its
+    /// temporal probe history stays aligned → boil-free). Non-finest chunks flag `u32::MAX` and release
+    /// their bricks' slots (their region is served by a finer LOD). Because slots are allocated only over
+    /// finest-resident OCCUPIED bricks, the probe buffer they size is EXACT (no intra-chunk waste, no
+    /// all-LOD redundancy) and scales with the clipmap window. Call in the MAIN world after all
+    /// `set_brick`/`clear_brick` for the frame, whenever the chunk set changed (`topology_generation`);
+    /// writes the directory row (→ `chunk_buf`, read by apply + bounce) and the entry's tiles
+    /// (→ `resident_rows` / tile-run, read by the trace), marking changed rows/slots dirty for the delta.
+    pub fn refresh_probe_bases(&mut self, halve_lod: u32) {
+        let keys: Vec<ChunkKey> = self.chunks.keys().copied().collect();
+        for ck in keys {
+            let finest = self.is_finest(ck);
+            let flag = if finest { 0u32 } else { u32::MAX };
+            // DENSITY HALVING: at/above `halve_lod` the distant probes are decimated to a checkerboard of
+            // bricks (~half), cutting probe count + ray work where the GI is low-frequency. The apply's
+            // coverage-weighted trilinear fills the gaps. Below `halve_lod`, every occupied brick keeps one.
+            let decimate = finest && ck.lod >= halve_lod;
+            let idx = dir_index(ck, self.r);
+            if self.dir[idx].probe_base != flag {
+                self.dir[idx].probe_base = flag;
+                self.dirty_rows.insert(idx as u32);
+            }
+            // Disjoint field borrows: `e` borrows `self.chunks`, `self.probe_alloc` is a separate field.
+            let Some(e) = self.chunks.get_mut(&ck) else { continue };
+            e.probe_base = flag;
+            let mut bits = e.occ;
+            let mut tiles_changed = false;
+            while bits != 0 {
+                let local = bits.trailing_zeros();
+                bits &= bits - 1; // clear lowest set bit
+                // Checkerboard on the brick's lattice coord (stable across frames → no probe churn).
+                let keep = !decimate || {
+                    let lx = (local % CHUNK_BRICKS as u32) as i32;
+                    let ly = (local / CHUNK_BRICKS as u32 % CHUNK_BRICKS as u32) as i32;
+                    let lz = (local / (CHUNK_BRICKS * CHUNK_BRICKS) as u32) as i32;
+                    let b = ck.coord * CHUNK_BRICKS + IVec3::new(lx, ly, lz);
+                    (b.x + b.y + b.z) & 1 == 0
+                };
+                let want = if finest && keep {
+                    self.probe_alloc.alloc((ck, local))
+                } else {
+                    self.probe_alloc.release(&(ck, local));
+                    u32::MAX
+                };
+                if e.tiles[local as usize].probe_slot != want {
+                    e.tiles[local as usize].probe_slot = want;
+                    tiles_changed = true;
+                }
+            }
+            if tiles_changed {
+                // `probe_slot` lives in the tile-run record → re-upload this chunk's region.
+                self.dirty_slots.insert(e.slot);
+            }
+        }
+    }
+
+    /// One past the largest DDGI probe slot → the probe irradiance buffer must span `probe_high_water`
+    /// per-brick probe slots (each then `× subdiv³ × PROBE_OCT_TEXELS` vec4s). Bounded by the count of
+    /// finest-resident OCCUPIED bricks, so it scales with the clipmap WINDOW, not the all-LOD atlas tile
+    /// union. The render world sizes the probe buffer from this (replacing `atlas.tiles.high_water()`).
+    pub fn probe_high_water(&self) -> u32 {
+        self.probe_alloc.high_water()
+    }
+
+    /// Count of finest-resident probes (= finest-resident occupied bricks) — for debug stats + the
+    /// scaling harness.
+    pub fn probe_count(&self) -> usize {
+        self.probe_alloc.live_count()
+    }
+
+    /// Count of finest-resident chunks (flag `probe_base == 0`) — for debug stats.
+    pub fn finest_chunk_count(&self) -> usize {
+        self.chunks.values().filter(|e| e.probe_base != u32::MAX).count()
+    }
+
+    /// The finest-resident subset of [`resident_rows`](Self::resident_rows) — chunks owning probe blocks
+    /// (`probe_base != u32::MAX`). The DDGI trace dispatches over THESE only, so its workgroup count is
+    /// bounded by the finest-resident set (the clipmap window), not the all-LOD resident union.
+    pub fn finest_rows(&self) -> Vec<ChunkLookup> {
+        self.resident_rows().into_iter().filter(|c| c.probe_base != u32::MAX).collect()
+    }
+
+    /// `(ChunkKey, tile-run slot)` for every FINEST-resident chunk (those owning probe blocks). The
+    /// render-world relevance cull needs each finest chunk's world position (decode the key via
+    /// [`chunk_min_world`]) plus the `slot` the dispatch rotation keys on (= `tile_run_base / TILE_RUN_SLOT`).
+    pub fn finest_slots_keyed(&self) -> Vec<(ChunkKey, u32)> {
+        self.chunks
+            .iter()
+            .filter(|(_, e)| e.probe_base != u32::MAX)
+            .map(|(ck, e)| (*ck, e.slot))
+            .collect()
+    }
+
+    /// Take + clear the set of chunks whose geometry changed since the last call (the DDGI wake set).
+    /// The render world expands these to a 1-chunk neighbourhood and re-converges only those probes at
+    /// the active rate (localized wake — no global re-trace cliff on a single edit).
+    pub fn drain_wake_keys(&mut self) -> Vec<ChunkKey> {
+        self.wake_keys.drain().collect()
+    }
+
+    /// The tile-run slot of resident chunk `ck` (its stable per-chunk index), or None if not resident.
+    /// Used to map a wake neighbourhood (chunk keys) to the slots the render-world dispatch rotates on.
+    pub fn slot_of(&self, ck: ChunkKey) -> Option<u32> {
+        self.chunks.get(&ck).map(|e| e.slot)
+    }
+
+    /// Whether `ck` is the FINEST resident LOD covering its region — some sub-region of it is NOT
+    /// covered by a resident finer (LOD−1) chunk, so it must own probes there (else the recursive
+    /// bounce, which returns the first resident probe LOD-0→coarse, would find none → black). LOD 0 is
+    /// always finest. A LOD-L chunk spans a 2×2×2 block of LOD-(L−1) chunks (the clipmap's 2× per-LOD
+    /// doubling), so it is fully covered iff all 8 finer children are resident.
+    fn is_finest(&self, ck: ChunkKey) -> bool {
+        if ck.lod == 0 {
+            return true; // no finer LOD exists → always finest
+        }
+        // The 8 LOD-(L−1) children tiling this chunk's footprint (2× per-LOD doubling). If ANY child
+        // is not resident, part of this chunk's region has no finer probe → keep this LOD's probes.
+        let base = ck.coord * 2;
+        for dz in 0..2 {
+            for dy in 0..2 {
+                for dx in 0..2 {
+                    let child = ChunkKey::new(ck.lod - 1, base + IVec3::new(dx, dy, dz));
+                    if !self.chunks.contains_key(&child) {
+                        return true;
+                    }
+                }
+            }
+        }
+        false // fully covered by finer-resident chunks → no probes here (finer LOD serves the region)
     }
 
     /// One past the largest tile-run slot → tile-run buffer must span `tile_run_capacity()` entries.
@@ -666,8 +906,13 @@ impl LiveChunkTables {
     pub fn upload(&self, cap_rows: u32, cap_slots: u32) -> ChunkUpload {
         let needed_rows = self.row_count();
         let needed_slots = self.tile_run_capacity();
-        // Tile-run headroom (+50%, min one extra slot) so it isn't recreated every frame.
-        let new_cap_slots = (needed_slots + needed_slots / 2).max(needed_slots + TILE_RUN_SLOT);
+        // Tile-run headroom: GROW BY DOUBLING (amortized). A `TileGrow`/`Full` rebuilds the WHOLE tile-run
+        // (`tile_run_dense()` — O(all resident bricks), tens of MB on a huge scene = a ~200 ms hitch), so
+        // it must be RARE. With doubling, growth costs O(log n) total rebuilds; once a scene's resident set
+        // settles, the slack absorbs object-edit churn (a moved object frees one chunk slot + takes another
+        // — the free-list keeps high-water stable) so edits stay cheap in-place Deltas, not grows. The
+        // wasted VRAM is bounded by the clipmap window (×2 of tens of MB), well under the probe budget.
+        let new_cap_slots = needed_slots.saturating_mul(2).max(needed_slots + TILE_RUN_SLOT);
         if cap_rows == 0 || needed_rows > cap_rows {
             // First upload, or the directory itself grew (only on a ring-size change — it's
             // FIXED-size otherwise, sized EXACTLY with no headroom). Rebuild BOTH buffers.
@@ -864,7 +1109,7 @@ mod tests {
                 ^ ((k.coord.x as u32) << 16)
                 ^ ((k.coord.y as u32) << 8)
                 ^ (k.coord.z as u32);
-            BrickTile { atlas_base: base, mat_atlas_base: base ^ 0x3333, pal01: base ^ 0x1111, pal23: base ^ 0x2222 }
+            BrickTile { atlas_base: base, mat_atlas_base: base ^ 0x3333, pal01: base ^ 0x1111, pal23: base ^ 0x2222, ..Default::default() }
         };
 
         // Bricks across: a sparse subset of slots in chunk (0,0,0), a neighbouring chunk,
@@ -885,7 +1130,14 @@ mod tests {
         for k in &keys {
             let got = shader_resolve(&tables, &cfg, *k)
                 .unwrap_or_else(|| panic!("brick {k:?} failed to resolve"));
-            assert_eq!(got, tile_of(k), "brick {k:?} resolved to the wrong tile");
+            // Compare the tile-resolution fields only; `probe_slot` is assigned by `refresh_probe_bases`
+            // (not by `tile_of`), so the full-struct equality would spuriously differ.
+            let want = tile_of(k);
+            assert_eq!(
+                (got.atlas_base, got.pal01, got.pal23),
+                (want.atlas_base, want.pal01, want.pal23),
+                "brick {k:?} resolved to the wrong tile"
+            );
         }
 
         // Unoccupied slot in a resident chunk must miss (not alias a neighbour's tile).
@@ -990,7 +1242,7 @@ mod tests {
     fn clear_brick_sentinels_slot_keeps_directory_size() {
         let cfg = config();
         let r = cfg.ring_chunks_per_axis();
-        let tile = BrickTile { atlas_base: 7, mat_atlas_base: 9, pal01: 0, pal23: 0 };
+        let tile = BrickTile { atlas_base: 7, mat_atlas_base: 9, pal01: 0, pal23: 0, ..Default::default() };
         let mut live = LiveChunkTables::default();
         let a = ChunkKey::new(0, IVec3::new(0, 0, 0));
         let b = ChunkKey::new(0, IVec3::new(1, 0, 0));
@@ -1013,6 +1265,111 @@ mod tests {
         assert_eq!((ea.key_hi, ea.key_lo), chunk_gpu_key(a), "untouched chunk keeps its tag");
     }
 
+    /// finest-resident probe filter (the LOD-aware allocation): a coarse chunk whose 8 finer (LOD−1)
+    /// children are ALL resident owns NO probes (`probe_base = u32::MAX`) — the finer LOD serves its
+    /// region; a chunk missing any finer child keeps its probes (else the recursive bounce finds none
+    /// → black, the dark-hole class); LOD 0 is always finest; evicting a finer child restores the
+    /// coarse chunk's probes. This is the cheapest guard on the finest semantics, before any GPU gate.
+    #[test]
+    fn finest_resident_probe_assignment() {
+        let cfg = config();
+        let r = cfg.ring_chunks_per_axis();
+        let tile = BrickTile { atlas_base: 1, pal01: 0, pal23: 0, ..Default::default() };
+        let mut live = LiveChunkTables::default();
+
+        // A LOD-1 chunk and ALL 8 of its LOD-0 children (coords 2·coord + {0,1}³).
+        let c1 = ChunkKey::new(1, IVec3::new(0, 0, 0));
+        live.set_brick(c1, 0, tile, &cfg);
+        let mut children = Vec::new();
+        for dz in 0..2 {
+            for dy in 0..2 {
+                for dx in 0..2 {
+                    let child = ChunkKey::new(0, IVec3::new(dx, dy, dz));
+                    live.set_brick(child, 0, tile, &cfg);
+                    children.push(child);
+                }
+            }
+        }
+        live.refresh_probe_bases(u32::MAX);
+        let probe_base = |live: &LiveChunkTables, ck: ChunkKey| live.lookup_at(dir_index(ck, r) as u32).probe_base;
+
+        // LOD-1 is fully covered by its 8 finer children → owns no probes.
+        assert_eq!(probe_base(&live, c1), u32::MAX, "fully-covered coarse chunk must own no probes");
+        // Each LOD-0 child is finest (no finer LOD) → owns probes.
+        for &child in &children {
+            assert_ne!(probe_base(&live, child), u32::MAX, "a LOD-0 chunk is always finest");
+        }
+
+        // Evict one finer child → the LOD-1 chunk is no longer fully covered → it regains probes.
+        live.clear_brick(children[0], 0);
+        live.refresh_probe_bases(u32::MAX);
+        assert_ne!(
+            probe_base(&live, c1),
+            u32::MAX,
+            "coarse chunk must regain probes when a finer child leaves (no dark hole)"
+        );
+    }
+
+    /// RAPID-EDIT PERF: the STABLE probe-slot allocator must keep `refresh_probe_bases`'s per-edit
+    /// directory delta proportional to the EDIT footprint — NOT the whole world — so rapid large edits
+    /// don't trigger a full directory re-upload (the perf concern). Build a large nested multi-LOD
+    /// scene, evict a slab, and assert the resulting dirty-row delta is ≪ the total chunk count and the
+    /// scan stays well-bounded. (A naive index-compaction would renumber every chunk → delta == total.)
+    #[test]
+    fn rapid_edit_keeps_probe_delta_proportional() {
+        // ring 128 → R=32 chunks/axis, so coords 0..16 don't wrap the toroidal directory.
+        let cfg = SdfGridConfig {
+            lod_count: 5,
+            ring_bricks: 128,
+            recenter_snap_chunks: 1,
+            ..Default::default()
+        };
+        let tile = BrickTile { atlas_base: 1, pal01: 0, pal23: 0, ..Default::default() };
+        let mut live = LiveChunkTables::default();
+        let n = 16i32; // 16³ LOD-0 + 8³+4³+2³+1³ ancestors ≈ 4681 chunks
+        for lod in 0..cfg.lod_count {
+            let m = n >> lod;
+            for z in 0..m {
+                for y in 0..m {
+                    for x in 0..m {
+                        live.set_brick(ChunkKey::new(lod, IVec3::new(x, y, z)), 0, tile, &cfg);
+                    }
+                }
+            }
+        }
+        live.refresh_probe_bases(u32::MAX);
+        let total = live.chunks.len();
+        assert!(total > 4000, "expected a large nested scene (got {total})");
+
+        // Rapid large edit: evict the x=0 LOD-0 slab (n² = 256 chunks). Their LOD-1 parents lose a
+        // child → flip to finest → re-allocated. Delta = evicted rows + flipped parents (∝ the edit).
+        live.clear_dirty();
+        for z in 0..n {
+            for y in 0..n {
+                live.clear_brick(ChunkKey::new(0, IVec3::new(0, y, z)), 0);
+            }
+        }
+        let t = std::time::Instant::now();
+        live.refresh_probe_bases(u32::MAX);
+        let elapsed = t.elapsed();
+        let delta = live.dirty_rows.len();
+        eprintln!(
+            "rapid-edit: {total} chunks, evicted {} → refresh {elapsed:?}, delta {delta} rows",
+            n * n
+        );
+
+        // The delta tracks the EDIT (evicted slab + flipped parents), not the world → small upload.
+        assert!(
+            delta < total / 4,
+            "probe delta ({delta}) must be ≪ total chunks ({total}) — a small edit must not re-upload the world"
+        );
+        // Bounded scan even at scale (generous ceiling — catastrophic-regression guard, not micro-perf).
+        assert!(
+            elapsed.as_millis() < 100,
+            "refresh after a large edit must stay well-bounded (was {elapsed:?})"
+        );
+    }
+
     /// The incremental [`LiveChunkTables`] must produce GPU buffers the SHADER unpacks back to the
     /// exact tile each brick was given — same contract as `build_chunk_tables`, but via the live
     /// path. The shader indexes a chunk's tile run densely (`tile_run_base + popcount(below)`), so a
@@ -1029,7 +1386,7 @@ mod tests {
                 ^ ((k.coord.x as u32) << 16)
                 ^ ((k.coord.y as u32) << 8)
                 ^ (k.coord.z as u32);
-            BrickTile { atlas_base: base, mat_atlas_base: base ^ 0x3333, pal01: base ^ 0x1111, pal23: base ^ 0x2222 }
+            BrickTile { atlas_base: base, mat_atlas_base: base ^ 0x3333, pal01: base ^ 0x1111, pal23: base ^ 0x2222, ..Default::default() }
         };
 
         let mut keys = Vec::new();
@@ -1122,6 +1479,7 @@ mod tests {
                         mat_atlas_base: (r >> 8) as u32 ^ 0x7777,
                         pal01: r as u32 ^ 0xAAAA,
                         pal23: (r >> 16) as u32 ^ 0x5555,
+                        ..Default::default()
                     };
                     live.set_brick(ck, local, t, &cfg);
                     truth.insert((ck, local), t);

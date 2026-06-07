@@ -1,38 +1,28 @@
 // Deferred lit pass: the final compositing step of the SDF renderer.
 //
-// ALL direct lighting is now done in the G-buffer pass (`sdf_raymarch.wgsl`): the directional sun
-// and every point light shade through the shared `sdf::lights::direct_light` and sum into the
-// emissive channel. So this pass just:
-//   - composites that pre-lit emissive radiance and applies the camera exposure, and
+// ALL direct lighting (the directional sun + every point light) is done in the G-buffer pass
+// (`sdf_raymarch.wgsl`) via the shared `sdf::lights::direct_light` and summed into the emissive
+// channel (physical, scene-referred). So this pass just:
+//   - composites that pre-lit emissive radiance PLUS the indirect DDGI bounce — `albedo ×` the
+//     screen-space-denoised probe irradiance resolved in the gi_resolve / gi_blur passes
+//     (render/gi.rs), already scaled by intensity — and applies the camera exposure, and
 //   - passes the analytic sky through (exposed) on a ray miss.
-// (A future world-anchored irradiance-probe / GI term would sum in here too.)
 //
 // Output is LINEAR HDR; Bevy's tonemapping pass converts to display.
+//
+// Bind groups: 0 = camera, 1 = denoised GI texture + sampler, 2 = G-buffer.
 
 #import bevy_core_pipeline::fullscreen_vertex_shader::FullscreenVertexOutput
+#import sdf::bindings::camera
 #import sdf::oct::oct_decode
 
-struct LitCamera {
-    inv_view_proj: mat4x4<f32>,
-    clip_from_world: mat4x4<f32>,
-    prev_clip_from_world: mat4x4<f32>,
-    camera_pos: vec4<f32>,
-    screen_params: vec4<f32>,
-    grid_origin: vec4<f32>,
-    grid_dims: vec4<f32>,
-    debug_params: vec4<f32>,
-    march_params: vec4<f32>,
-    lod_params: vec4<f32>,
-    sun_dir: vec4<f32>,
-    sun_color: vec4<f32>,   // rgb = physical sun radiance (lux); w = camera exposure scalar
-};
+@group(1) @binding(0) var gi_tex: texture_2d<f32>;   // denoised indirect irradiance (already × intensity)
+@group(1) @binding(1) var gi_sampler: sampler;
 
-@group(0) @binding(0) var<uniform> camera: LitCamera;
-
-@group(1) @binding(0) var gbuf_albedo: texture_2d<f32>;     // rgb = albedo, a = camera distance
-@group(1) @binding(1) var gbuf_normal_mat: texture_2d<f32>; // rg = octN, b = metal, a = rough
-@group(1) @binding(2) var gbuf_emissive: texture_2d<f32>;   // rgb = emissive + point-light direct, a = sun visibility
-@group(1) @binding(3) var gbuf_sampler: sampler;
+@group(2) @binding(0) var gbuf_albedo: texture_2d<f32>;     // rgb = albedo, a = camera distance
+@group(2) @binding(1) var gbuf_normal_mat: texture_2d<f32>; // rg = octN, b = metal, a = rough
+@group(2) @binding(2) var gbuf_emissive: texture_2d<f32>;   // rgb = emissive + ALL direct (sun+points), a = sun vis
+@group(2) @binding(3) var gbuf_sampler: sampler;
 
 const SKY_DIST: f32 = 1e8;
 
@@ -42,8 +32,8 @@ fn main(in: FullscreenVertexOutput) -> @location(0) vec4<f32> {
     let albedo_d = textureSampleLevel(gbuf_albedo, gbuf_sampler, uv, 0.0);
     let dist = albedo_d.a;
 
-    // Sky / miss: the G-buffer holds the analytic sky (physical luminance) in rgb. Apply the
-    // camera exposure (sun_color.w) so the sky maps to display alongside the exposed surfaces.
+    // Sky / miss: the G-buffer holds the analytic sky (physical luminance) in rgb. Apply the camera
+    // exposure (sun_color.w) so the sky maps to display alongside the exposed surfaces.
     if (dist >= SKY_DIST) {
         return vec4<f32>(albedo_d.rgb * camera.sun_color.w, 1.0);
     }
@@ -83,8 +73,7 @@ fn main(in: FullscreenVertexOutput) -> @location(0) vec4<f32> {
     return vec4<f32>(vec3<f32>(roughness), 1.0);
 #endif
 #ifdef SDF_DEBUG_EMISSIVE
-    // NOTE: this channel now carries material emissive + the G-buffer pass's point-light direct
-    // (the deferred shadowed point lighting is accumulated here), so this view shows both.
+    // NOTE: this channel now carries material emissive + the G-buffer pass's sun + point-light direct.
     return vec4<f32>(emissive, 1.0);
 #endif
 #ifdef SDF_DEBUG_SUN_VIS
@@ -95,9 +84,24 @@ fn main(in: FullscreenVertexOutput) -> @location(0) vec4<f32> {
     return vec4<f32>(vec3<f32>(dist / (dist + 8.0)), 1.0);
 #endif
 
-    // `emissive` already holds ALL direct lighting (sun + points) + material emissive, summed in
-    // the G-buffer pass — all physical, scene-referred. Apply the camera exposure (sun_color.w =
-    // exp2(-ev100)/1.2) to map to the display range before tonemapping.
-    let lit = emissive * camera.sun_color.w;
+    // --- Indirect (DDGI): screen-space-denoised probe irradiance (already × intensity) ---
+    let gi = textureSampleLevel(gi_tex, gi_sampler, uv, 0.0).rgb;
+
+#ifdef SDF_DEBUG_GI
+    return vec4<f32>(albedo * gi * camera.sun_color.w, 1.0);
+#endif
+#ifdef SDF_DEBUG_PROBE_LOD
+    // The resolve pass wrote the finest-probe-LOD hue into the GI buffer; pass it straight through.
+    return vec4<f32>(gi, 1.0);
+#endif
+#ifdef SDF_DEBUG_PROBE_COVERAGE
+    // The resolve pass wrote the probe-coverage colour (green=covered, magenta=hole) into the GI buffer.
+    return vec4<f32>(gi, 1.0);
+#endif
+
+    // `emissive` already holds ALL direct lighting (sun + points) + material emissive — physical,
+    // scene-referred. Add the indirect diffuse bounce (albedo × GI), then apply the camera exposure
+    // (sun_color.w = exp2(-ev100)/1.2) to map to the display range before tonemapping.
+    let lit = (emissive + albedo * gi) * camera.sun_color.w;
     return vec4<f32>(lit, 1.0);
 }

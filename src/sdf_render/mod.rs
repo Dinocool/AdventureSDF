@@ -45,16 +45,19 @@ pub mod chunk;
 pub(crate) mod debug;
 pub(crate) mod editor_camera;
 pub mod edits;
-// The gallery is purely a scene GENERATOR (the runtime loads `assets/scenes/gallery.scene`); only
-// the regen test uses it, so the whole module is test-only.
+// The gallery + cornell modules are purely scene GENERATORS (the runtime loads the serialized
+// `assets/scenes/*.scene`); only the regen tests use them, so they're test-only.
+#[cfg(test)]
+mod cornell;
 #[cfg(test)]
 mod gallery;
 pub mod gizmo;
 pub(crate) mod height;
-pub(crate) mod light_grid;
+pub mod light_grid;
 pub(crate) mod node_gizmos;
 pub(crate) mod overlays;
 pub(crate) mod picking;
+pub mod probe;
 pub mod render;
 pub(crate) mod scatter;
 pub(crate) mod stress;
@@ -237,6 +240,362 @@ impl Default for SdfRaymarchParams {
             shadow_lod_bias: 1,
         }
     }
+}
+
+/// Live DDGI (probe-based global illumination) tuning. Extracted to the render world and packed into
+/// the probe-trace params uniform each frame; exposed as editor sliders (the knobs-as-uniforms
+/// invariant). `enabled` gates the whole trace + apply so GI can be toggled with no cost when off.
+#[derive(Resource, Reflect, Clone, bevy::render::extract_resource::ExtractResource)]
+#[reflect(Resource)]
+pub struct DdgiParams {
+    /// Rays traced per probe per frame (Fibonacci sphere). Higher = smoother irradiance, costlier.
+    pub ray_count: u32,
+    /// Caps the progressive-average sample count: `N_max = 1/(1-hysteresis)`. Higher = longer
+    /// steady-state window = more accumulated samples = smoother / less boil, but slower to react to
+    /// lighting changes (more lag). 0.95 ≈ 20 samples. Trades stability against responsiveness; the
+    /// history clamp (`change_thresh`) keeps boil bounded so this can sit lower than a plain EMA would.
+    pub hysteresis: f32,
+    /// Multiplies the gathered irradiance before it is added to the lit result.
+    pub intensity: f32,
+    /// Per-brick probe sub-lattice factor: each occupied brick emits `subdiv³` probes, so LOD-0
+    /// probe spacing is `brick_size / subdiv` (subdiv 1 = one probe/brick ≈ 0.7 m; 2 ≈ 0.35 m).
+    /// Costs `subdiv³`× probe rays + irradiance memory.
+    pub subdiv: u32,
+    /// Round-robin amortization: only `1/update_stride` of probes re-trace each frame (the rest carry
+    /// forward and converge over `update_stride` frames via temporal blend). Bounds per-frame trace
+    /// cost ~`1/update_stride`. 1 = trace every probe every frame (most expensive, no latency).
+    pub update_stride: u32,
+    /// Max distance (world units) a probe ray marches. Indirect bounce is local, so a short range
+    /// keeps per-ray cost bounded regardless of the multi-km clipmap reach (the dominant cost at high
+    /// LOD count). Geometry beyond this contributes via coarser/farther probes, not these rays.
+    pub gi_range: f32,
+    /// Apply-side surface bias along the normal, as a fraction of the probe cell: pushes the shading
+    /// point off the surface toward the lit side so trilinear favours front-facing probes (anti-leak).
+    pub normal_bias: f32,
+    /// Apply-side surface bias toward the camera, as a fraction of the probe cell: reduces self-shadow
+    /// artifacts at grazing angles (RTXGI view bias).
+    pub view_bias: f32,
+    /// Screen-space GI denoise: depth edge-stop tolerance (relative to camera distance). Lower = the
+    /// blur respects depth discontinuities more strictly (less bleed across surfaces, but can keep more
+    /// of the probe-lattice blocks); higher = wider blur across depth.
+    pub gi_blur_depth_sigma: f32,
+    /// Screen-space GI denoise: normal edge-stop sharpness. Higher = the blur stops harder at normal
+    /// discontinuities (creases, silhouettes); lower = smoother across them.
+    pub gi_blur_normal_power: f32,
+    /// Scales the analytic sky's contribution to the GI bounce (escaped probe rays). 1.0 = the full
+    /// physical sky (`sdf::sky`) lights the scene indirectly; 0.0 isolates GI to scene emitters + sun
+    /// only (used by the harness gates, and useful for interiors where the sky shouldn't bleed in).
+    pub gi_sky_intensity: f32,
+    /// Shadow the direct lighting gathered at each probe-ray bounce hit: a secondary SDF march toward
+    /// the sun (bounded to `gi_range`) + a sphere-shadow for the brightest point light reaching the
+    /// hit. Prevents direct light leaking through walls into GI, at the cost of a shadow march per ray
+    /// hit — the dominant trace cost, so it's a toggle. Off = the bounce uses unshadowed direct light.
+    pub gi_bounce_shadows: bool,
+    /// Hard ceiling (bytes) on the probe irradiance buffer — a safety net so a large scene can't size
+    /// it past `max_storage_buffer_binding_size` (the wgpu binding limit). When the LOD-aware probe
+    /// count still exceeds this, the buffer is clamped and the over-budget probe slots go inactive
+    /// (the trace/apply already bounds-check `arrayLength`), with a one-shot warning. The effective cap
+    /// is `min(this, device max_storage_buffer_binding_size)`.
+    pub probe_budget_bytes: u32,
+    /// Probe CLASSIFICATION: once a probe has converged (and nothing nearby changed), drop it to a much
+    /// lower re-trace rate (`dormant_stride`) instead of the active `update_stride` — it keeps its value
+    /// and skips the expensive ray-march. A global `gi_epoch` (bumped on topology / lighting change)
+    /// wakes all probes for a fast re-converge; the dormant re-trace rate also bounds staleness from any
+    /// change the epoch didn't catch. Off = every finest probe traces at `update_stride` (no pruning).
+    pub classify_enabled: bool,
+    /// Re-trace rate for DORMANT (converged + unchanged) probes: `1/dormant_stride` of them per frame.
+    /// Larger = bigger steady-state savings on static scenes + slower revalidation of undetected changes.
+    /// Only used when `classify_enabled`. Typical 16–64.
+    pub dormant_stride: u32,
+    /// LOD at/above which DISTANT probes trace fewer rays (`distant_ray_count`) — the far field needs far
+    /// less angular detail, so this cuts the dominant ray-march cost without touching near quality. Set
+    /// high (≥ lod_count) to disable.
+    pub ray_falloff_lod: u32,
+    /// Rays/probe for probes at LOD ≥ `ray_falloff_lod` (the distant field). Lower than `ray_count`.
+    pub distant_ray_count: u32,
+    /// LOD at/above which probe DENSITY is halved (a checkerboard decimation of bricks): distant probes
+    /// are sparser, cutting probe COUNT (memory + ray work) where the GI is low-frequency anyway. The
+    /// apply's coverage-weighted trilinear interpolates the gaps. Set high (≥ lod_count) to disable.
+    pub probe_halve_lod: u32,
+    /// Sphere-trace step budget per GI ray (the slim GI march's `MAX_STEPS`). GI is low-frequency and the
+    /// temporal average hides the rare under-converged ray, so this can sit well below the primary pass's
+    /// budget. Lower = cheaper per ray (the dominant trace cost) but blockier far hits. Clamped 1..=64.
+    pub gi_march_steps: u32,
+    /// RELEVANCE CULL: finest probes whose chunk is outside the view cone AND beyond `cull_near_radius`
+    /// re-trace only `1/cull_off_stride` of the time (they keep their irradiance) — a moving camera then
+    /// spends its probe budget on what's on-screen instead of fully converging probes behind it. Off =
+    /// every finest probe traces at the normal (active/dormant) rate regardless of view.
+    pub relevance_cull: bool,
+    /// Re-trace rate for off-screen (culled) probes: `1/cull_off_stride` per frame. Larger = bigger
+    /// moving-camera savings + slower catch-up when the camera turns toward a culled region (the wake
+    /// system also re-activates edited regions). Only used when `relevance_cull`.
+    pub cull_off_stride: u32,
+    /// Probes within this world-space radius of the camera are ALWAYS relevant (never culled), regardless
+    /// of view direction — nearby surfaces behind/beside the camera can still bounce light onto on-screen
+    /// geometry, so a generous near shell avoids darkening contact GI when the camera turns.
+    pub cull_near_radius: f32,
+    /// View-cone cull threshold: a chunk is relevant if `dot(dir_to_chunk, camera_forward) > this`. −1 =
+    /// never cull (whole sphere relevant); 0 = cull the rear hemisphere; −0.2 ≈ keep a ~101° half-cone
+    /// (FOV + margin). Lower (toward −1) = more conservative (fewer culled); higher = more aggressive.
+    pub cull_cone_dot: f32,
+    /// PER-FRAME DISPATCH CAP: at most this many finest probe-chunks trace per frame (0 = unlimited).
+    /// On a scene load / fast camera, far more chunks become turn-eligible at once than a frame can
+    /// afford — that flood is the scene-start GPU dip. The cap bounds it, and the eligible chunks are
+    /// dispatched NEAREST-TO-CAMERA first, so visible GI converges first and the rest fill in over the
+    /// next frames. At steady state (few eligible) the cap never binds. Tune up for faster whole-scene
+    /// convergence, down for a smoother load.
+    pub max_probe_chunks_per_frame: u32,
+}
+
+impl Default for DdgiParams {
+    fn default() -> Self {
+        Self {
+            ray_count: 128,
+            // Progressive-average window N_max = 1/(1-h) ≈ 20: accumulates per-frame-rotated ray sets
+            // (smoothness/low boil) while staying reasonably responsive; the history clamp bounds boil.
+            hysteresis: 0.95,
+            intensity: 1.0,
+            subdiv: 2,
+            update_stride: 4,
+            gi_range: 24.0,
+            normal_bias: 0.6,
+            view_bias: 0.1,
+            gi_blur_depth_sigma: 0.15,
+            gi_blur_normal_power: 16.0,
+            gi_sky_intensity: 1.0,
+            gi_bounce_shadows: true,
+            // 1 GiB — comfortably below the common 2 GiB binding limit, headroom for a big scene.
+            probe_budget_bytes: 1 << 30,
+            classify_enabled: true,
+            dormant_stride: 32,
+            // Distant LODs get cheaper probes by default (the user can dial these): half the rays beyond
+            // LOD 4, and half the probe density beyond LOD 5. Near LODs (the visible field) keep full
+            // quality. Raise the thresholds to lod_count to disable.
+            ray_falloff_lod: 4,
+            distant_ray_count: 32,
+            probe_halve_lod: 5,
+            // GI rays take a short step budget (the slim march): far cheaper than the primary pass, and
+            // the temporal average hides the occasional under-converged ray.
+            gi_march_steps: 16,
+            // Relevance cull ON by default: off-screen finest probes throttle to 1/64. Generous near shell
+            // (6 m) + a ~101° half-cone keep contact GI correct when the camera turns.
+            relevance_cull: true,
+            cull_off_stride: 64,
+            cull_near_radius: 6.0,
+            cull_cone_dot: -0.2,
+            // Cap the per-frame probe-chunk dispatch so a scene load / fast camera spreads convergence
+            // over frames (nearest-first) instead of one huge stall. 256 chunks × up to CHUNK_VOLUME
+            // bricks is ample for fast convergence yet tames the 1024-room flood; never binds on small scenes.
+            max_probe_chunks_per_frame: 256,
+        }
+    }
+}
+
+/// How many consecutive frames the GI inputs (geometry topology, sun, GI lighting knobs) have been
+/// UNCHANGED. Probe classification only lets probes go dormant once this exceeds the convergence window
+/// — so a moving camera / changing light keeps every finest probe at full re-trace rate (no dormancy, no
+/// stale GI, and slot-churn re-converges immediately), and only a genuinely settled scene saves ray
+/// work. Maintained by [`track_gi_settle`], extracted to the render world for `prepare_sdf_probe`.
+#[derive(Resource, Clone, Copy, Default, bevy::render::extract_resource::ExtractResource)]
+pub struct GiSettle {
+    pub frames_unchanged: u32,
+}
+
+/// Reset [`GiSettle`] to 0 whenever the GI inputs change (topology generation, sun direction/illuminance,
+/// or the GI lighting knobs), else increment. Point lights are intentionally NOT hashed here (O(lights)
+/// every frame would be costly on a 1000s-of-lights scene); a moved point light is instead picked up by
+/// the dormant re-trace rate within `dormant_stride` frames — bounded, never permanently stale.
+#[allow(clippy::type_complexity)] // a Bevy change-detection query filter — alias would obscure it
+fn track_gi_settle(
+    ddgi: Res<DdgiParams>,
+    sun: Query<(&GlobalTransform, &DirectionalLight), With<crate::scene_manager::SceneEntity>>,
+    // Cheap O(changed) detection of a moved/edited point light (NOT O(all lights) — Bevy change ticks).
+    // A changing light must wake the probes; otherwise dormant probes update only every `dormant_stride`
+    // frames → visible STEPPING instead of a smooth blend (the static case already converges then stays).
+    lights_changed: Query<
+        (),
+        (With<PointLight>, Or<(Changed<GlobalTransform>, Changed<PointLight>)>),
+    >,
+    mut settle: ResMut<GiSettle>,
+    mut last: Local<u64>,
+) {
+    // NOTE: geometry/topology changes do NOT reset the global settle — they're handled by the LOCAL
+    // wake set (`update_probe_wake`), so one moving cube doesn't drop the whole scene out of dormancy.
+    // LIGHTING changes (sun, point lights, GI knobs) globally wake every probe (they affect all of them),
+    // so the GI re-converges at the active rate (smoothly) instead of stepping at the dormant rate.
+    let mut h = 0u64;
+    if let Ok((t, dl)) = sun.single() {
+        let f = t.forward();
+        h ^= (f.x.to_bits() as u64)
+            ^ ((f.y.to_bits() as u64) << 1)
+            ^ ((f.z.to_bits() as u64) << 2)
+            ^ ((dl.illuminance.to_bits() as u64) << 3);
+    }
+    for v in [ddgi.intensity, ddgi.gi_sky_intensity, ddgi.gi_range] {
+        h = h.wrapping_mul(0x0100_0000_01b3).wrapping_add(v.to_bits() as u64);
+    }
+    h = h.wrapping_add(u64::from(ddgi.gi_bounce_shadows));
+    let hash_changed = *last != h;
+    *last = h;
+    if hash_changed || !lights_changed.is_empty() {
+        settle.frames_unchanged = 0;
+    } else {
+        settle.frames_unchanged = settle.frames_unchanged.saturating_add(1);
+    }
+}
+
+/// The set of DDGI probe chunk-SLOTS currently "awake" — recently changed (or adjacent to a change), so
+/// they re-converge at the ACTIVE re-trace rate while the rest of a settled scene stays dormant. Built
+/// by [`update_probe_wake`], extracted to the render world's `prepare_sdf_probe` (localized edit wake —
+/// no global FPS cliff when one cube moves).
+#[derive(Resource, Clone, Default, bevy::render::extract_resource::ExtractResource)]
+pub struct ProbeWakeSet {
+    pub slots: Vec<u32>,
+}
+
+/// Internal main-world bookkeeping: chunk slot → frames remaining awake.
+#[derive(Resource, Default)]
+struct ProbeWake {
+    frames: std::collections::HashMap<u32, u32>,
+}
+
+/// Frames a changed region stays at the active re-trace rate before returning to dormant — long enough
+/// to re-converge the temporal blend (≈ `n_max` traces at the active stride).
+const PROBE_WAKE_FRAMES: u32 = 90;
+
+/// Maintain the DDGI wake set: each changed chunk (+ its 3×3×3 same-LOD neighbourhood, so contact
+/// shadows / colour bleed on adjacent surfaces re-converge too) is woken for [`PROBE_WAKE_FRAMES`];
+/// expired entries age out. Cheap when nothing changed (the common case drains an empty set).
+fn update_probe_wake(
+    mut atlas: ResMut<atlas::SdfAtlas>,
+    mut wake: ResMut<ProbeWake>,
+    mut set: ResMut<ProbeWakeSet>,
+) {
+    let changed = atlas.live_chunks.drain_wake_keys();
+    for ck in changed {
+        for dz in -1..=1 {
+            for dy in -1..=1 {
+                for dx in -1..=1 {
+                    let nb = chunk::ChunkKey::new(ck.lod, ck.coord + IVec3::new(dx, dy, dz));
+                    if let Some(slot) = atlas.live_chunks.slot_of(nb) {
+                        wake.frames.insert(slot, PROBE_WAKE_FRAMES);
+                    }
+                }
+            }
+        }
+    }
+    if !wake.frames.is_empty() {
+        wake.frames.retain(|_, f| {
+            *f = f.saturating_sub(1);
+            *f > 0
+        });
+    }
+    set.slots.clear();
+    set.slots.extend(wake.frames.keys().copied());
+}
+
+/// The finest probe chunk-SLOTS currently CULLED by the relevance test — off-screen (outside the view
+/// cone) AND beyond the near shell. The render world's `prepare_sdf_probe` re-traces these only
+/// `1/cull_off_stride` of the time, so a moving camera spends its probe budget on what's visible. Built
+/// by [`update_probe_relevance`] (main world, where the camera lives) + extracted. `culled`/`total` ride
+/// along for the DDGI debug panel.
+#[derive(Resource, Clone, Default, bevy::render::extract_resource::ExtractResource)]
+pub struct ProbeRelevanceSet {
+    pub culled_slots: Vec<u32>,
+    pub culled: u32,
+    pub total: u32,
+    /// Finest chunk SLOT → squared distance from its world center to the camera. Filled for EVERY finest
+    /// chunk (independent of the cull toggle) so the render world's per-frame probe-dispatch CAP can
+    /// prioritise the nearest chunks (visible GI converges first during a load/fast-camera flood).
+    pub dist2_by_slot: std::collections::HashMap<u32, f32>,
+}
+
+/// Maintain the DDGI relevance-cull set: a finest-resident chunk whose world center is outside the
+/// camera's view cone (`dot(dir_to_chunk, forward) <= cull_cone_dot`) AND beyond `cull_near_radius` is
+/// CULLED — the render world throttles its probes to `1/cull_off_stride`. Cheap: O(finest chunks), one
+/// normalize + dot each. Disabled (or no SDF camera) → empty set (nothing culled). The wake set still
+/// overrides this in the render world, so an edited off-screen region re-converges promptly.
+fn update_probe_relevance(
+    atlas: Res<atlas::SdfAtlas>,
+    ddgi: Res<DdgiParams>,
+    config: Res<SdfGridConfig>,
+    cameras: Query<&GlobalTransform, With<SdfCamera>>,
+    mut set: ResMut<ProbeRelevanceSet>,
+) {
+    set.culled_slots.clear();
+    set.culled = 0;
+    set.total = 0;
+    set.dist2_by_slot.clear();
+    let Some(cam) = cameras.iter().next() else {
+        return; // no camera (headless / test) → nothing culled, no distances
+    };
+    let cam_pos = cam.translation();
+    let fwd = cam.forward().as_vec3();
+    let near2 = ddgi.cull_near_radius * ddgi.cull_near_radius;
+    for (ck, slot) in atlas.live_chunks.finest_slots_keyed() {
+        set.total += 1;
+        let center = chunk::chunk_min_world(ck, &config)
+            + Vec3::splat(0.5 * chunk::chunk_world_size(ck.lod, &config));
+        let to = center - cam_pos;
+        let d2 = to.length_squared();
+        // Distance is recorded for EVERY finest chunk (the dispatch cap uses it even with the cull off).
+        set.dist2_by_slot.insert(slot, d2);
+        if ddgi.relevance_cull {
+            let relevant = d2 <= near2 || to.normalize_or_zero().dot(fwd) > ddgi.cull_cone_dot;
+            if !relevant {
+                set.culled_slots.push(slot);
+                set.culled += 1;
+            }
+        }
+    }
+}
+
+/// Monotonic counter bumped on every scene switch ([`SceneSwitched`]) — the render-world SDF cache-reset
+/// signal. The render world compares it to detect a switch and start the new scene clean: `prepare_sdf_
+/// probe` ZEROES the probe irradiance buffer (the grow-with-headroom buffer otherwise reuses old slots'
+/// converged GI), and `prepare_sdf_atlas_gpu` reallocates fresh (zeroed) brick atlas PAGES (the texel
+/// pages otherwise persist in VRAM, so a reused tile could show the previous scene's geometry).
+/// Extracted to the render world.
+#[derive(Resource, Clone, Copy, Default, bevy::render::extract_resource::ExtractResource)]
+pub struct ProbeReset(pub u32);
+
+/// On a [`SceneSwitched`], EVICT all per-scene SDF state so the new scene starts from a clean slate:
+///  - DDGI probes: bump [`ProbeReset`] (→ the render world zeroes the irradiance buffer), reset the
+///    settle counter + wake set;
+///  - chunk/atlas data: [`SdfAtlas::reset`](atlas::SdfAtlas::reset) clears bricks/tiles/chunk tables
+///    (and thus the probe slot allocator) + forces a full rebuild;
+///  - bake scheduler: [`BakeScheduler::reset`](bake_scheduler::BakeScheduler::reset) drops queued/
+///    in-flight work so the window re-bakes from scratch.
+///
+/// Central — fires for both editor tab swaps and in-game scene transitions (both routed through
+/// `scene_manager::SceneSwitched`). Not state-gated: a switch fires as the state leaves the editor, so
+/// this must run regardless of the current `AppScene`.
+fn evict_on_scene_switch(
+    mut ev: MessageReader<crate::scene_manager::SceneSwitched>,
+    mut settle: ResMut<GiSettle>,
+    mut wake: ResMut<ProbeWake>,
+    mut wake_set: ResMut<ProbeWakeSet>,
+    mut reset: ResMut<ProbeReset>,
+    mut atlas: ResMut<atlas::SdfAtlas>,
+    mut sched: ResMut<bake_scheduler::BakeScheduler>,
+) {
+    let n = ev.read().count();
+    if n == 0 {
+        return;
+    }
+    // Probe state.
+    settle.frames_unchanged = 0;
+    wake.frames.clear();
+    wake_set.slots.clear();
+    reset.0 = reset.0.wrapping_add(1);
+    // Chunk/atlas + scheduler state (geometry starts clean too — no stale bricks or queued bakes).
+    let bricks_before = atlas.bricks.len();
+    atlas.reset();
+    sched.reset();
+    info!(
+        "SDF scene switch: evicted {bricks_before} bricks + probes/atlas/scheduler (reset #{}, {n} event(s))",
+        reset.0
+    );
 }
 
 // --- Selection ---
@@ -437,6 +796,15 @@ impl Plugin for SdfScenePlugin {
             .init_resource::<bvh::Bvh>()
             .init_resource::<SdfRenderEnabled>()
             .init_resource::<SdfRaymarchParams>()
+            .init_resource::<DdgiParams>()
+            .init_resource::<GiSettle>()
+            .init_resource::<ProbeWake>()
+            .init_resource::<ProbeWakeSet>()
+            .init_resource::<ProbeRelevanceSet>()
+            .init_resource::<ProbeReset>()
+            // `evict_on_scene_switch` reads this message; register it here too (idempotent) so the SDF
+            // plugin is self-sufficient and doesn't depend on `SceneManagerPlugin` being added first.
+            .add_message::<crate::scene_manager::SceneSwitched>()
             .init_resource::<WireframeBoundsVisible>()
             .init_resource::<GizmoVisibility>()
             .init_resource::<BakedBrickDebug>()
@@ -453,6 +821,7 @@ impl Plugin for SdfScenePlugin {
             .register_type::<edits::MaterialFields>()
             .register_type::<CsgKind>()
             .register_type::<SdfRaymarchParams>()
+            .register_type::<DdgiParams>()
             .register_type::<stress::TowerSpawner>()
             // Spawn the scene. Material ids come from the demand-driven asset table
             // (loaded MaterialAssets get stable registry ids); the compile step in
@@ -535,6 +904,18 @@ impl Plugin for SdfScenePlugin {
             )
             .add_systems(
                 Update,
+                refresh_probe_lod
+                    .run_if(in_state(AppScene::SdfEditor))
+                    .after(bake_scheduler::schedule_bakes),
+            )
+            .add_systems(Update, track_gi_settle.after(refresh_probe_lod))
+            .add_systems(Update, update_probe_wake.after(track_gi_settle))
+            .add_systems(Update, update_probe_relevance.after(track_gi_settle))
+            // Ungated: a scene switch fires as the state leaves the editor, so probe eviction must run
+            // regardless of the current `AppScene`.
+            .add_systems(Update, evict_on_scene_switch)
+            .add_systems(
+                Update,
                 toggle_sdf_render.run_if(in_state(AppScene::SdfEditor)),
             );
 
@@ -592,10 +973,11 @@ fn setup_sdf_scene(mut asset_table: ResMut<crate::assets::MaterialAssetTable>) {
     // loaded edit entities exist and the BVH can be built from them.
 }
 
-/// Path to the editor's default scene (the stress tower-field — heavy SDF load, used while
-/// profiling/optimizing the raymarch). The PBR gallery lives at `assets/scenes/gallery.scene`
-/// and can be loaded manually.
-pub const DEFAULT_SCENE_PATH: &str = "assets/scenes/stress.scene";
+/// Path to the editor's default scene: the Cornell GI box (white room + R/G/B objects + a white
+/// ceiling emissive — the DDGI showcase for colour bleeding / shadows / bounces). The PBR gallery
+/// (`assets/scenes/gallery.scene`) and the stress tower-field (`assets/scenes/stress.scene`, heavy
+/// SDF load for raymarch profiling) can be loaded manually via the scene browser.
+pub const DEFAULT_SCENE_PATH: &str = "assets/scenes/cornell.scene";
 
 /// Load the default scene into the world on editor enter. Exclusive (scene load
 /// needs `&mut World` + the type registry). Runs after `setup_sdf_scene` so the materials
@@ -603,10 +985,15 @@ pub const DEFAULT_SCENE_PATH: &str = "assets/scenes/stress.scene";
 /// needs the registry, since `registry_id`s are baked into the file.
 fn load_default_gallery(world: &mut World) {
     let registry = world.resource::<AppTypeRegistry>().clone();
-    let path = std::path::Path::new(DEFAULT_SCENE_PATH);
+    // Profiling/headless-capture aid: `ADVENTURE_STARTUP_SCENE=<path>` (project-root-relative) loads
+    // that scene instead of the default, so a Nsight capture can target a specific scene (e.g.
+    // `assets/scenes/cornell8.scene`) without any editor interaction. Mirrors `ADVENTURE_EXIT_AFTER_FRAMES`.
+    let startup = std::env::var("ADVENTURE_STARTUP_SCENE").ok();
+    let path_str = startup.as_deref().unwrap_or(DEFAULT_SCENE_PATH);
+    let path = std::path::Path::new(path_str);
     match crate::soul_scene::load_scene(world, path, &registry.read()) {
-        Ok(roots) => info!("loaded default scene ({} roots)", roots.len()),
-        Err(e) => error!("failed to load default scene: {e}"),
+        Ok(roots) => info!("loaded scene '{path_str}' ({} roots)", roots.len()),
+        Err(e) => error!("failed to load scene '{path_str}': {e}"),
     }
     // Restore the editor camera saved with the scene (if any), so launching frames the
     // gallery the way it was last saved.
@@ -839,6 +1226,34 @@ fn focus_on_double_click(
 /// APPENDS to these sets (never reads them), so a start-of-frame clear can't drop pending work.
 fn clear_chunk_table_dirty(mut atlas: ResMut<atlas::SdfAtlas>) {
     atlas.live_chunks.clear_dirty();
+}
+
+/// Recompute the finest-resident DDGI probe FLAGS (`probe_base` 0/`u32::MAX`) when the chunk set
+/// changed (a finer chunk entering/leaving flips its coarse parent's finest status, which is non-local,
+/// so the recompute scans the resident set — O(resident)). Runs after `schedule_bakes`, before the
+/// end-of-frame extract, so the directory delta carries the updated rows. Gated on
+/// `topology_generation` so it scans the resident set only when the chunk set actually changed; idle
+/// frames + texel-only re-bakes are free.
+fn refresh_probe_lod(
+    mut atlas: ResMut<atlas::SdfAtlas>,
+    ddgi: Res<DdgiParams>,
+    mut last_topo: Local<u64>,
+    mut last_halve: Local<u32>,
+) {
+    // Recompute on a chunk-set change OR when the density-halving LOD knob changed (it re-decimates the
+    // distant probe set). `u32::MAX` Local sentinel forces the first run.
+    let halve = ddgi.probe_halve_lod;
+    if atlas.topology_generation == *last_topo && *last_halve == halve {
+        return;
+    }
+    *last_topo = atlas.topology_generation;
+    *last_halve = halve;
+    atlas.live_chunks.refresh_probe_bases(halve);
+    // `refresh_probe_bases` marks the changed `probe_base` directory rows dirty; the render-world
+    // extract is gated on `generation`. A topology change already bumped `generation` (set/clear_brick),
+    // but bump again to be certain the refreshed finest-flag rows upload this frame — otherwise a stale
+    // `u32::MAX` placeholder on the GPU makes `probe_slot_at` return -1 and GI renders as zero there.
+    atlas.generation = atlas.generation.wrapping_add(1);
 }
 
 /// Rebuild the bake-time height cache when the material registry's displacement columns
