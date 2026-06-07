@@ -110,9 +110,9 @@ fn edit_bytes(e: &GpuEdit) -> Vec<u8> {
     b
 }
 
-// 28-byte ChunkLookup serialization (reuse of sdf_gpu_rig.rs::chunk_lookup_bytes).
+// 32-byte ChunkLookup serialization (reuse of sdf_gpu_rig.rs::chunk_lookup_bytes).
 fn chunk_lookup_bytes(chunks: &[ChunkLookup]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(chunks.len() * 28);
+    let mut out = Vec::with_capacity(chunks.len() * 32);
     for c in chunks {
         out.extend_from_slice(&c.key_hi.to_le_bytes());
         out.extend_from_slice(&c.key_lo.to_le_bytes());
@@ -121,18 +121,20 @@ fn chunk_lookup_bytes(chunks: &[ChunkLookup]) -> Vec<u8> {
         out.extend_from_slice(&c.cons_occ_lo.to_le_bytes());
         out.extend_from_slice(&c.cons_occ_hi.to_le_bytes());
         out.extend_from_slice(&c.tile_run_base.to_le_bytes());
+        out.extend_from_slice(&c.probe_base.to_le_bytes());
     }
     out
 }
 
-// 16-byte BrickTile serialization (matches chunk_tables::encode_tile / the WGSL BrickTile).
+// 20-byte BrickTile serialization (matches chunk_tables::encode_tile / the WGSL BrickTile).
 fn brick_tile_bytes(tiles: &[BrickTile]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(tiles.len() * 16);
+    let mut out = Vec::with_capacity(tiles.len() * 20);
     for t in tiles {
         out.extend_from_slice(&t.atlas_base.to_le_bytes());
         out.extend_from_slice(&t.mat_atlas_base.to_le_bytes());
         out.extend_from_slice(&t.pal01.to_le_bytes());
         out.extend_from_slice(&t.pal23.to_le_bytes());
+        out.extend_from_slice(&t.probe_slot.to_le_bytes());
     }
     out
 }

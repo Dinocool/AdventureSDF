@@ -464,6 +464,44 @@ fn scene_sdf(p: vec3<f32>) -> SceneSdfResult {
 // chunk boundary. `MAX_LODS` bounds the array; lod_count() <= this (DEFAULT_LOD_COUNT = 8).
 const MAX_LODS: u32 = 8u;
 
+#ifdef SDF_GI_MARCH
+// GI MARCH cache: a SINGLE LOD-tagged memo, not the per-LOD array. GI rays are short (`gi_range`) and
+// cross few LODs, so one rolling entry keeps most of the within-chunk hit-rate (a marching ray re-hits
+// the same (lod, chunk) for many consecutive steps) at ~5 registers instead of the per-LOD array's
+// ~4×MAX_LODS — the occupancy lever for the register-bound probe trace (dynamically-indexed local
+// arrays pin/spill registers). The coarse→fine empty-space DDA re-searches when it walks LODs within
+// one step, but those are cheap `chunk_buf` binary searches vs. the occupancy we buy.
+struct ChunkCache {
+    lod: u32,
+    key_hi: u32,
+    key_lo: u32,
+    index: i32,
+    valid: u32, // 0/1 (a bool field would still cost a register; the u32 keeps it explicit)
+};
+
+fn new_chunk_cache() -> ChunkCache {
+    var c: ChunkCache;
+    c.valid = 0u;
+    return c;
+}
+
+fn find_chunk_cached(coord: vec3<i32>, lod: u32, cache: ptr<function, ChunkCache>) -> i32 {
+    let key = abs_chunk_key(coord, lod);   // the chunk's tag — identifies it across march steps
+#ifndef SDF_DISABLE_CHUNK_CACHE
+    if ((*cache).valid == 1u && (*cache).lod == lod
+        && (*cache).key_hi == key.x && (*cache).key_lo == key.y) {
+        return (*cache).index;
+    }
+#endif
+    let ci = find_chunk(coord, lod);
+    (*cache).valid = 1u;
+    (*cache).lod = lod;
+    (*cache).key_hi = key.x;
+    (*cache).key_lo = key.y;
+    (*cache).index = ci;
+    return ci;
+}
+#else
 struct ChunkCache {
     key_hi: array<u32, MAX_LODS>,
     key_lo: array<u32, MAX_LODS>,
@@ -493,6 +531,7 @@ fn find_chunk_cached(coord: vec3<i32>, lod: u32, cache: ptr<function, ChunkCache
     (*cache).index[lod] = ci;
     return ci;
 }
+#endif
 
 // Cached counterparts of find_brick_lookup / find_brick_at / sample_sdf_world. Identical
 // logic, but route the per-LOD chunk probe through `find_chunk_cached(&cache)` so a SECONDARY

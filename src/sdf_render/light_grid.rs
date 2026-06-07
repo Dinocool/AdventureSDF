@@ -115,7 +115,7 @@ impl LightGrid {
     /// over the OCCUPIED cell set: discover cells + per-cell counts, sort the occupied keys,
     /// prefix-sum into a key-sorted directory, scatter light indices, then importance-sort each run
     /// (brightest first, so the shader can shadow just the brightest few).
-    pub(crate) fn rebuild(&mut self, lights: &[GpuPointLight]) {
+    pub fn rebuild(&mut self, lights: &[GpuPointLight]) {
         self.cells.clear();
         self.index_buf.clear();
         self.key_to_slot.clear();

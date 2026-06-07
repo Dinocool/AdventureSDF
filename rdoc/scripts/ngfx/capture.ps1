@@ -23,7 +23,10 @@
 param(
   [int]$Frames = 240,
   [string]$Out = ".soul/ngfx",
-  [string]$Exe = "target/debug/adventure.exe"
+  [string]$Exe = "target/debug/adventure.exe",
+  # Optional: load a specific scene at startup instead of the default (project-root-relative path,
+  # e.g. "assets/scenes/cornell8.scene"). Sets ADVENTURE_STARTUP_SCENE for the captured run.
+  [string]$Scene = ""
 )
 $ErrorActionPreference = "Stop"
 
@@ -48,13 +51,17 @@ Write-Host "Tracing 1 frame at frame $Frames with the source shader profiler on.
 # Self-terminate the app a bit after the trace point so ngfx finishes + exports hands-free.
 $exitAt = $Frames + 180
 
+# App env passed through the injector. Optional ADVENTURE_STARTUP_SCENE picks the scene to capture.
+$envStr = "ADVENTURE_EXIT_AFTER_FRAMES=$exitAt; WGPU_BACKEND=vulkan; BEVY_ASSET_ROOT=$proj;"
+if ($Scene) { $envStr += " ADVENTURE_STARTUP_SCENE=$Scene;"; Write-Host "scene: $Scene" }
+
 # Lock GPU clocks to base for repeatable numbers; metric-set 0 = Throughput Metrics.
 & $ngfx.FullName `
   --activity "GPU Trace Profiler" `
   --exe $exePath `
   --dir $proj `
   --output-dir $outAbs `
-  --env "ADVENTURE_EXIT_AFTER_FRAMES=$exitAt; WGPU_BACKEND=vulkan; BEVY_ASSET_ROOT=$proj;" `
+  --env $envStr `
   --start-after-frames $Frames `
   --limit-to-frames 1 `
   --auto-export `

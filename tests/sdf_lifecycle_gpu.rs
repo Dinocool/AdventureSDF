@@ -370,7 +370,7 @@ fn lifecycle_large_sphere_lod_transition_no_hole() {
         let tables = build_chunk_tables(&atlas, &cfg, |key| {
             let tile = atlas.tiles.tile(key).expect("resident brick has a tile");
             let (col, row) = tile_origin(tile);
-            chunk::BrickTile { atlas_base: col | (row << 16), mat_atlas_base: col | (row << 16), pal01: 0, pal23: 0 }
+            chunk::BrickTile { atlas_base: col | (row << 16), mat_atlas_base: col | (row << 16), pal01: 0, pal23: 0, ..Default::default() }
         });
         // Sample a handful of resident tiles (checking all every step is slow); include the
         // ones nearest the surface at the probe by scanning the served-LOD brick.
