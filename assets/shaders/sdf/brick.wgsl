@@ -738,6 +738,34 @@ fn in_ring_chunk(coord: vec3<i32>, lod: u32) -> bool {
     return rx >= 0 && ry >= 0 && rz >= 0 && rx < r && ry < r && rz < r;
 }
 
+// THE shared empty-space advance: given a point `p` in empty space (no resident brick) heading along
+// `dir`, return how far the ray can skip in one shot. Walks coarsest→finest and takes the biggest box:
+//   • a RESIDENT chunk skips its run of conservatively-empty bricks (`dist_over_empty_bricks` — the air
+//     above terrain that shares a chunk with the surface below),
+//   • an ABSENT in-ring chunk jumps its whole box (provably empty — the BVH reaches no brick there),
+//   • else (outside every ring) the finest-resident-brick fallback (`window_lod`); the caller's MAX_DIST
+//     then ends the ray next iteration.
+// Both occupancy reads go through the CONSERVATIVE `cons_occ` mask, so the skip can never pass a surface.
+// Used by ALL three marches (primary `march`, `shadows`, cone prepass) so the empty-space accelerator
+// has ONE definition — a change here applies everywhere (this is what was hand-duplicated before).
+fn empty_space_advance(p: vec3<f32>, dir: vec3<f32>, window_lod: u32, cache: ptr<function, ChunkCache>) -> f32 {
+    let levels = lod_count();
+    var adv = dist_to_brick_exit_lod(p, dir, window_lod) + voxel_size_at(window_lod) * 0.01;
+    for (var L = levels; L > 0u; ) {
+        L = L - 1u;                              // coarsest first → biggest applicable box wins
+        let coord = world_to_brick_lod(p, L);
+        let ci = find_chunk_cached(coord, L, cache);
+        if (ci >= 0) {
+            adv = dist_over_empty_bricks(chunk_buf[u32(ci)], p, dir, L) + voxel_size_at(L) * 0.01;
+            break;
+        } else if (in_ring_chunk(coord, L)) {
+            adv = dist_to_chunk_exit_lod(p, dir, L) + voxel_size_at(L) * 0.01;
+            break;
+        }
+    }
+    return adv;
+}
+
 // --- Surface normal from the trilinear gradient ---
 
 // Surface normal via the tetrahedron finite-difference technique, sampling the
