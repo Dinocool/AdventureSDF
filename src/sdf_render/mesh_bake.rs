@@ -59,6 +59,8 @@ struct ChunkMeshData {
     normals: Vec<[f32; 3]>,
     colors: Vec<[f32; 4]>,
     indices: Vec<u32>,
+    /// Dominant material id (at the surface centroid) — selects the chunk's `StandardMaterial` PBR params.
+    material: u16,
 }
 
 /// A completed bake for a chunk's round target, held until the coherent COMMIT (`None` = empty chunk).
@@ -66,16 +68,20 @@ struct StagedBake {
     data: Option<ChunkMeshData>,
 }
 
-/// Resolved appearance of a material id, snapshotted from `MaterialRegistry` for the off-thread bake:
-/// linear base colour + emissive radiance. Indexed by `EditSample::material_id`.
+/// Resolved appearance of a material id, snapshotted from `MaterialRegistry` for the bake: linear base
+/// colour + emissive radiance + PBR scalars. Indexed by `EditSample::material_id`. Base goes on the
+/// vertex COLOUR (per-vertex); metallic/roughness/emissive go on the chunk's `StandardMaterial`.
 #[derive(Clone, Copy)]
 struct MatAppearance {
     base: [f32; 3],
     emissive: [f32; 3],
+    metallic: f32,
+    roughness: f32,
 }
 
-/// Fallback when a vertex's material id isn't in the registry snapshot (neutral grey, no emission).
-const DEFAULT_APPEARANCE: MatAppearance = MatAppearance { base: [0.6, 0.6, 0.6], emissive: [0.0; 3] };
+/// Fallback when a material id isn't in the registry snapshot (neutral dielectric grey, no emission).
+const DEFAULT_APPEARANCE: MatAppearance =
+    MatAppearance { base: [0.6, 0.6, 0.6], emissive: [0.0; 3], metallic: 0.0, roughness: 1.0 };
 
 /// The frozen snapshot a bake round is meshing against. `edits = Some` ⇒ a round is in progress; all of
 /// that round's bakes use THESE edits/AABBs, so they are mutually coherent regardless of how the live
@@ -269,29 +275,28 @@ fn mesh_chunk(
     }
     let positions: Vec<[f32; 3]> =
         buffer.positions.iter().map(|p| [p[0] * vs, p[1] * vs, p[2] * vs]).collect();
-    // Per-vertex material colour (Phase 2): the resolved material at each vertex → its registry colour,
-    // shaded by a cheap fixed-direction hemispheric term so form reads (the mesh is unlit), plus emissive
-    // added so glowing materials are bright. (Multi-material triplanar splat + true PBR lighting later.)
-    let light = Vec3::new(0.4, 0.9, 0.3).normalize();
+    // Per-vertex base COLOUR = the resolved material's LINEAR base colour. Real PBR lighting shades it
+    // (the chunk's StandardMaterial carries the dominant material's metallic/roughness/emissive); the
+    // per-vertex base still varies for the rare mixed-material chunk.
     let colors: Vec<[f32; 4]> = buffer
         .positions
         .iter()
-        .zip(buffer.normals.iter())
-        .map(|(p, n)| {
+        .map(|p| {
             let world = grid_origin + Vec3::new(p[0], p[1], p[2]) * vs;
             let mid = edits::fold_csg(edits, world).material_id as usize;
-            let app = appearances.get(mid).copied().unwrap_or(DEFAULT_APPEARANCE);
-            let nl = Vec3::from(*n).normalize_or_zero().dot(light).max(0.0);
-            let shade = 0.35 + 0.65 * nl;
-            [
-                app.base[0] * shade + app.emissive[0],
-                app.base[1] * shade + app.emissive[1],
-                app.base[2] * shade + app.emissive[2],
-                1.0,
-            ]
+            let a = appearances.get(mid).copied().unwrap_or(DEFAULT_APPEARANCE);
+            [a.base[0], a.base[1], a.base[2], 1.0]
         })
         .collect();
-    Some(ChunkMeshData { positions, normals: buffer.normals, colors, indices: buffer.indices })
+    // Dominant material (at the surface centroid) → the chunk's StandardMaterial PBR params. Off-the-shelf
+    // StandardMaterial is per-mesh, so metallic/roughness/emissive use the dominant material.
+    let mut centroid = Vec3::ZERO;
+    for p in &buffer.positions {
+        centroid += Vec3::new(p[0], p[1], p[2]);
+    }
+    centroid = grid_origin + (centroid / buffer.positions.len().max(1) as f32) * vs;
+    let material = edits::fold_csg(edits, centroid).material_id;
+    Some(ChunkMeshData { positions, normals: buffer.normals, colors, indices: buffer.indices, material })
 }
 
 /// Cheap narrow-band test: could the chunk's sampled region contain a surface crossing? Mirrors the GPU
@@ -359,7 +364,9 @@ fn mesh_resident_chunks(
     mut stats: ResMut<MeshBakeStats>,
     mut mesh_assets: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
-    mut material: Local<Option<Handle<StandardMaterial>>>,
+    // Lit `StandardMaterial` per material id (base WHITE — per-vertex base comes from the vertex COLOUR —
+    // plus the material's metallic/roughness/emissive). Cleared + rebuilt when material appearances change.
+    mut mat_cache: Local<HashMap<u16, Handle<StandardMaterial>>>,
     // "Rebake all" epoch: bumped on the panel button, mixed into every hash to force one full re-bake.
     mut epoch: Local<u64>,
     // Last frame's chunk size, to detect a live K change (which changes the whole key set / stride).
@@ -421,27 +428,35 @@ fn mesh_resident_chunks(
             .iter()
             .map(|d| {
                 let l = d.base_color.to_linear();
-                MatAppearance { base: [l.red, l.green, l.blue], emissive: d.emissive.to_array() }
+                MatAppearance {
+                    base: [l.red, l.green, l.blue],
+                    emissive: d.emissive.to_array(),
+                    metallic: d.metallic,
+                    roughness: d.roughness,
+                }
             })
             .collect(),
     );
-    // Vertex colours read material COLOUR, but the per-chunk content hash keys on material *id* — so a
-    // material colour edit wouldn't otherwise re-bake. Hash the appearance set (quantized; authored
-    // values don't jitter) and bump the rebake epoch when it changes so colours refresh.
+    // Vertex colours + the chunk material read material APPEARANCE, but the per-chunk content hash keys on
+    // material *id* — so a material colour/PBR edit wouldn't otherwise re-bake. Hash the appearance set
+    // (quantized; authored values don't jitter) and re-bake + rebuild the StandardMaterials when it changes.
     let mat_hash = {
         let mut h = DefaultHasher::new();
         for a in appearances.iter() {
-            for v in a.base.iter().chain(a.emissive.iter()) {
+            for v in a.base.iter().chain(a.emissive.iter()).chain([&a.metallic, &a.roughness]) {
                 h.write_i64((*v as f64 * 1.0e4) as i64);
             }
         }
         h.finish()
     };
-
-    // "Rebake all" (button) OR a material-colour change bumps a global epoch mixed into every chunk hash
-    // → every hash changes once → full re-bake.
-    if std::mem::replace(&mut rebuild.0, false) || (*prev_mat_hash != 0 && *prev_mat_hash != mat_hash) {
+    let mat_changed = *prev_mat_hash != 0 && *prev_mat_hash != mat_hash;
+    // "Rebake all" (button) OR a material-appearance change bumps a global epoch mixed into every chunk
+    // hash → every hash changes once → full re-bake.
+    if std::mem::replace(&mut rebuild.0, false) || mat_changed {
         *epoch = epoch.wrapping_add(1);
+    }
+    if mat_changed {
+        mat_cache.clear(); // rebuild StandardMaterials with the new params
     }
     *prev_mat_hash = mat_hash;
     let epoch_mix = epoch.wrapping_mul(EPOCH_MIX);
@@ -476,13 +491,6 @@ fn mesh_resident_chunks(
     }
     stats.edits = n_edits;
     stats.resident = resident.len();
-
-    let material_handle = material
-        .get_or_insert_with(|| {
-            // Unlit, normal-as-colour: visible without scene lights; edges read as a colour gradient.
-            materials.add(StandardMaterial { base_color: Color::WHITE, unlit: true, ..default() })
-        })
-        .clone();
 
     // 1. RECEIVE: poll in-flight bakes; on completion STAGE the result (held until the round COMMIT).
     for (_key, st) in states.0.iter_mut() {
@@ -525,6 +533,24 @@ fn mesh_resident_chunks(
                 commands.entity(old).despawn();
             }
             st.entity = sb.data.map(|data| {
+                // Lit StandardMaterial for this chunk's dominant material (cached by id). base WHITE so
+                // the per-vertex base COLOUR rules; metallic/roughness/emissive from the registry.
+                let mat = mat_cache
+                    .entry(data.material)
+                    .or_insert_with(|| {
+                        let a = appearances
+                            .get(data.material as usize)
+                            .copied()
+                            .unwrap_or(DEFAULT_APPEARANCE);
+                        materials.add(StandardMaterial {
+                            base_color: Color::WHITE,
+                            metallic: a.metallic,
+                            perceptual_roughness: a.roughness.max(0.045),
+                            emissive: LinearRgba::rgb(a.emissive[0], a.emissive[1], a.emissive[2]),
+                            ..default()
+                        })
+                    })
+                    .clone();
                 let mesh = Mesh::new(PrimitiveTopology::TriangleList, RenderAssetUsages::default())
                     .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, data.positions)
                     .with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, data.normals)
@@ -536,7 +562,7 @@ fn mesh_resident_chunks(
                 commands
                     .spawn((
                         Mesh3d(mesh_assets.add(mesh)),
-                        MeshMaterial3d(material_handle.clone()),
+                        MeshMaterial3d(mat),
                         Transform::from_translation(origin),
                         ChunkMesh(*key),
                         Name::new("SDF Chunk Mesh"),
