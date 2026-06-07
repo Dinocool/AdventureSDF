@@ -905,8 +905,20 @@ impl Plugin for SdfScenePlugin {
                     .before(bake_scheduler::schedule_bakes),
             )
             .add_systems(
+                First,
+                // Re-enabling the raymarch after editing in mesh-only mode rebuilds the GPU atlas from
+                // scratch (it wasn't maintained while `schedule_bakes` was gated off, below).
+                rebake_on_sdf_render_enable.run_if(in_state(AppScene::SdfEditor)),
+            )
+            .add_systems(
                 Update,
-                bake_scheduler::schedule_bakes.run_if(in_state(AppScene::SdfEditor)),
+                // GATED on SdfRenderEnabled: when viewing baked MESHES (raymarch off) the GPU SDF atlas
+                // bake + BVH refit (`sched_refit_incremental` et al. — the dominant editing cost) is pure
+                // dead weight, since the mesh path reads volumes directly. Skip it; the rebake-on-enable
+                // system above restores a clean atlas when the raymarch is turned back on.
+                bake_scheduler::schedule_bakes
+                    .run_if(in_state(AppScene::SdfEditor))
+                    .run_if(|r: Res<SdfRenderEnabled>| r.0),
             )
             .add_systems(
                 Update,
@@ -1298,4 +1310,22 @@ fn toggle_sdf_render(
         lod_rings.0 = !lod_rings.0;
         info!("LOD ring overlay: {}", if lod_rings.0 { "ON" } else { "OFF" });
     }
+}
+
+/// When the SDF raymarch render is turned back ON after being off (F1 or the Mesh Bake panel checkbox),
+/// rebuild the GPU atlas from scratch — `schedule_bakes` is gated on `SdfRenderEnabled`, so the atlas
+/// wasn't maintained while the raymarch was off and any edits made meanwhile aren't reflected in it.
+/// Mirrors the scene-switch reset (`SdfAtlas::reset` + `BakeScheduler::reset`).
+fn rebake_on_sdf_render_enable(
+    enabled: Res<SdfRenderEnabled>,
+    mut atlas: ResMut<atlas::SdfAtlas>,
+    mut sched: ResMut<bake_scheduler::BakeScheduler>,
+    mut was_enabled: Local<bool>,
+) {
+    let now = enabled.0;
+    if now && !*was_enabled {
+        atlas.reset();
+        sched.reset();
+    }
+    *was_enabled = now;
 }

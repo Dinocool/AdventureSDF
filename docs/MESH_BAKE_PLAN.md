@@ -99,14 +99,25 @@ mesh path wins.
   terrain gated off.
 - ✅ **Phase 0 spike** — validated Surface Nets quality as "almost perfect" on our CSG content; the only
   artifact (a grid-aligned sphere pinhole) was fixed with a sub-voxel iso-shift.
-- ✅ **Phase 1 COMPLETE** — `src/sdf_render/mesh_bake.rs`: residency-driven per-finest-brick Surface
-  Nets bake, **async** on `AsyncComputeTaskPool` (sample+mesh off-thread, build `Mesh` on the main
-  thread), **incremental** (edits re-mesh only the bricks in the changed edit's *current ∪ previous*
-  footprint — moves leave no ghost), bricks spawn/despawn as the clipmap window moves. Controls in the
-  **"Mesh Bake"** bottom editor panel (SDF-render toggle, wireframe, brick/in-flight counts, Rebake).
-  View: `cargo run --features editor`, uncheck "SDF raymarch render".
-- ☐ Phase 2 — real materials (palette → triplanar). ☐ Phase 3 — cross-LOD rings + skirts. ☐ Phase 4 —
-  make meshes primary, retire raymarch/DDGI, adopt Solari.
+- ✅ **Phase 1 COMPLETE** — `src/sdf_render/mesh_bake.rs`: residency-driven Surface Nets bake, **async**
+  on `AsyncComputeTaskPool` (sample+mesh off-thread, build `Mesh` on the main thread). Staleness is a
+  **per-unit content hash** (`edits::bake_content_hash` of the overlapping edits — the SAME key the GPU
+  bake scheduler uses): a unit re-bakes iff its current hash ≠ the displayed mesh's. Residency and
+  staleness derive from ONE overlap test, so they can't diverge → stale/ghost geometry is structurally
+  impossible (a key-stamped `ChunkMesh` reaper is the closed loop on residency departure). This replaced
+  the earlier dirty-region/gen-stamp scheme that leaked move-remnants.
+- ✅ **Configurable chunk unit (landed before Phase 2)** — the bake/render unit is a runtime-tunable
+  **`K×K×K`-brick chunk** (`MeshBakeConfig::chunk_bricks`, default 2, slider 1..=8; `K=1` = per-brick).
+  One contiguous mesh per chunk → atomic coherent swaps (no per-brick fragmentation during drags), far
+  fewer draw calls/entities, and contiguous geometry for later weld/decimate/LOD. Grid edge =
+  `K·cell_stride + 2` via `ndshape::RuntimeShape`; same 1-voxel apron keeps chunk seams crack-free. The
+  whole content-hash design is `K`-parameterized (this was a coarsening, not a new aggregation layer).
+  NOTE: this `chunk_bricks` is the mesh-bake unit, distinct from `chunk::CHUNK_BRICKS` (GPU-atlas residency).
+- Controls in the **"Mesh Bake"** bottom editor panel: SDF-render toggle, wireframe, **Chunk bricks (K)**
+  slider, chunk/in-flight counts, Rebake, Capture diagnostics. View: `cargo run --features editor`,
+  uncheck "SDF raymarch render".
+- ☐ Phase 2 — real materials (palette → triplanar), built on the chunk mesh. ☐ Phase 3 — cross-LOD rings
+  + skirts. ☐ Phase 4 — make meshes primary, retire raymarch/DDGI, adopt Solari.
 
 **Latent `main` bugs fixed here (port to main):** probe-trace `ChunkLookup` 24-vs-32 hand-pack crash;
 `SdfRenderEnabled` not `ExtractResource` (F1 no-op).
