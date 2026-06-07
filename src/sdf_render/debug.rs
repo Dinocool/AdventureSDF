@@ -621,12 +621,6 @@ fn render_panel(world: &mut World, ui: &mut egui::Ui) {
     ui.add(
         egui::Slider::new(&mut params.shadow_light_cap, 0..=32).text("Shadow lights"),
     );
-    // Floor the shadow march LOD (sun + point shadows): higher = coarser/blobbier shadows but far
-    // fewer march steps (shadows are the gbuffer's biggest cost). 0 = finest/sharpest.
-    ui.add(
-        egui::Slider::new(&mut params.shadow_lod_bias, 0..=4).text("Shadow detail (0 = sharpest)"),
-    );
-
     ui.separator();
     ui.label("DDGI (Global Illumination — always on)");
     // Live probe stats (finest-resident, clipmap-bounded): probe count, irradiance-buffer size, and the
