@@ -59,10 +59,18 @@ mesh path wins.
 - **Done when:** gallery renders as meshes, edits re-mesh interactively, zero warnings, both build configs.
 
 ## Phase 2 — Material & shading fidelity
-- Carry our 4-id palette + per-corner material weights onto vertices (sample `fold_csg`/`build_palette`),
-  L1-normalize, triplanar-splat in the shader (bonsairobo "Smooth Voxel Mapping" approach).
-- Honor PBR/emissive materials from `MaterialAssetTable`. **Off-the-shelf first:** try a
-  `MaterialExtension` over `StandardMaterial` before a fully custom material/pipeline.
+- **v1 DONE (2026-06-08):** per-vertex material COLOUR — `mesh_chunk` resolves the material at each
+  vertex (`edits::fold_csg(...).material_id`), looks it up in a `MaterialRegistry` snapshot
+  (linear base + emissive, passed into the off-thread bake), writes it to the vertex COLOUR shaded by a
+  cheap fixed-direction hemispheric term (form reads while the mesh stays unlit) + emissive added so
+  glowing materials are bright. A material-COLOUR edit re-bakes (the per-chunk content hash keys on
+  material *id*, so an appearance-hash check bumps the rebake epoch). `mesh_test.scene` gains a floating
+  `emissive_orange` orb to exercise it; the row already uses sand/cobble/red_metal/white_gloss.
+- **Deferred to Phase 2b (needs a custom shader — held until meshes are primary so it's verified live):**
+  carry the 4-id palette + per-corner material *weights* onto vertices, L1-normalize, **triplanar-splat**
+  the PBR maps in a `MaterialExtension` over `StandardMaterial` (bonsairobo "Smooth Voxel Mapping"), and
+  true PBR lighting (metallic/roughness response). v1 shows one dominant material per vertex (no
+  multi-material blend within a chunk) and bakes a fixed shade instead of real lights.
 
 ## Phase 3 — Cross-LOD (clipmap rings) + skirts  *(satisfies the locked crack-free requirement)*
 - Mesh **all** resident LOD rings, not just finest.
@@ -116,8 +124,9 @@ mesh path wins.
 - Controls in the **"Mesh Bake"** bottom editor panel: SDF-render toggle, wireframe, **Chunk bricks (K)**
   slider, chunk/in-flight counts, Rebake, Capture diagnostics. View: `cargo run --features editor`,
   uncheck "SDF raymarch render".
-- ☐ Phase 2 — real materials (palette → triplanar), built on the chunk mesh. ☐ Phase 3 — cross-LOD rings
-  + skirts. ☐ Phase 4 — make meshes primary, retire raymarch/DDGI, adopt Solari.
+- ◑ Phase 2 — material colours (per-vertex base + emissive, shaded) DONE; triplanar multi-material splat
+  + PBR lighting deferred to 2b (needs a custom shader, verified once meshes are primary). ☐ Phase 3 —
+  cross-LOD rings + skirts. ☐ Phase 4 — make meshes primary, retire raymarch/DDGI, adopt Solari.
 
 **Latent `main` bugs fixed here (port to main):** probe-trace `ChunkLookup` 24-vs-32 hand-pack crash;
 `SdfRenderEnabled` not `ExtractResource` (F1 no-op).

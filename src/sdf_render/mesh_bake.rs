@@ -28,7 +28,9 @@
 //! VIEWING: use the **Mesh Bake** editor panel ([`mesh_bake_panel`]) to toggle the SDF render off and
 //! reveal these meshes (+ wireframe / chunk-size slider / rebake / counts).
 
+use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet};
+use std::hash::Hasher;
 use std::sync::Arc;
 
 use bevy::asset::RenderAssetUsages;
@@ -63,6 +65,17 @@ struct ChunkMeshData {
 struct StagedBake {
     data: Option<ChunkMeshData>,
 }
+
+/// Resolved appearance of a material id, snapshotted from `MaterialRegistry` for the off-thread bake:
+/// linear base colour + emissive radiance. Indexed by `EditSample::material_id`.
+#[derive(Clone, Copy)]
+struct MatAppearance {
+    base: [f32; 3],
+    emissive: [f32; 3],
+}
+
+/// Fallback when a vertex's material id isn't in the registry snapshot (neutral grey, no emission).
+const DEFAULT_APPEARANCE: MatAppearance = MatAppearance { base: [0.6, 0.6, 0.6], emissive: [0.0; 3] };
 
 /// The frozen snapshot a bake round is meshing against. `edits = Some` ⇒ a round is in progress; all of
 /// that round's bakes use THESE edits/AABBs, so they are mutually coherent regardless of how the live
@@ -226,6 +239,7 @@ fn chunks_in_aabb(aabb: &Aabb3d, config: &SdfGridConfig, k: u32, out: &mut HashS
 fn mesh_chunk(
     edits: &[edits::ResolvedEdit],
     indices: &[u32],
+    appearances: &[MatAppearance],
     grid_origin: Vec3,
     vs: f32,
     edge: u32,
@@ -253,11 +267,29 @@ fn mesh_chunk(
     if buffer.positions.is_empty() {
         return None;
     }
-    let positions = buffer.positions.iter().map(|p| [p[0] * vs, p[1] * vs, p[2] * vs]).collect();
-    let colors = buffer
-        .normals
+    let positions: Vec<[f32; 3]> =
+        buffer.positions.iter().map(|p| [p[0] * vs, p[1] * vs, p[2] * vs]).collect();
+    // Per-vertex material colour (Phase 2): the resolved material at each vertex → its registry colour,
+    // shaded by a cheap fixed-direction hemispheric term so form reads (the mesh is unlit), plus emissive
+    // added so glowing materials are bright. (Multi-material triplanar splat + true PBR lighting later.)
+    let light = Vec3::new(0.4, 0.9, 0.3).normalize();
+    let colors: Vec<[f32; 4]> = buffer
+        .positions
         .iter()
-        .map(|n| [n[0] * 0.5 + 0.5, n[1] * 0.5 + 0.5, n[2] * 0.5 + 0.5, 1.0])
+        .zip(buffer.normals.iter())
+        .map(|(p, n)| {
+            let world = grid_origin + Vec3::new(p[0], p[1], p[2]) * vs;
+            let mid = edits::fold_csg(edits, world).material_id as usize;
+            let app = appearances.get(mid).copied().unwrap_or(DEFAULT_APPEARANCE);
+            let nl = Vec3::from(*n).normalize_or_zero().dot(light).max(0.0);
+            let shade = 0.35 + 0.65 * nl;
+            [
+                app.base[0] * shade + app.emissive[0],
+                app.base[1] * shade + app.emissive[1],
+                app.base[2] * shade + app.emissive[2],
+                1.0,
+            ]
+        })
         .collect();
     Some(ChunkMeshData { positions, normals: buffer.normals, colors, indices: buffer.indices })
 }
@@ -320,6 +352,7 @@ fn mesh_resident_chunks(
     volumes: Query<VolumeQueryData, With<SdfVolume>>,
     config: Res<SdfGridConfig>,
     mesh_cfg: Res<MeshBakeConfig>,
+    mat_reg: Res<edits::MaterialRegistry>,
     chunk_meshes: Query<(Entity, &ChunkMesh)>,
     mut states: ResMut<ChunkStates>,
     mut rebuild: ResMut<MeshBakeRebuild>,
@@ -331,6 +364,9 @@ fn mesh_resident_chunks(
     mut epoch: Local<u64>,
     // Last frame's chunk size, to detect a live K change (which changes the whole key set / stride).
     mut prev_k: Local<u32>,
+    // Last frame's material-appearance hash, to detect a material COLOUR edit (which the per-chunk
+    // content hash — keyed on material *id* — wouldn't otherwise catch).
+    mut prev_mat_hash: Local<u64>,
     // The in-progress bake round's frozen edit snapshot.
     mut round: Local<BakeRound>,
 ) {
@@ -377,10 +413,37 @@ fn mesh_resident_chunks(
     }
     let edits_arc = Arc::new(edit_vec);
 
-    // "Rebake all" mixes a bumped epoch into every chunk hash → every hash changes once → full re-bake.
-    if std::mem::replace(&mut rebuild.0, false) {
+    // Material appearance snapshot (linear base + emissive) for the off-thread bake, indexed by material
+    // id. Cheap (a handful of materials); cloned into each bake task.
+    let appearances: Arc<Vec<MatAppearance>> = Arc::new(
+        mat_reg
+            .defs
+            .iter()
+            .map(|d| {
+                let l = d.base_color.to_linear();
+                MatAppearance { base: [l.red, l.green, l.blue], emissive: d.emissive.to_array() }
+            })
+            .collect(),
+    );
+    // Vertex colours read material COLOUR, but the per-chunk content hash keys on material *id* — so a
+    // material colour edit wouldn't otherwise re-bake. Hash the appearance set (quantized; authored
+    // values don't jitter) and bump the rebake epoch when it changes so colours refresh.
+    let mat_hash = {
+        let mut h = DefaultHasher::new();
+        for a in appearances.iter() {
+            for v in a.base.iter().chain(a.emissive.iter()) {
+                h.write_i64((*v as f64 * 1.0e4) as i64);
+            }
+        }
+        h.finish()
+    };
+
+    // "Rebake all" (button) OR a material-colour change bumps a global epoch mixed into every chunk hash
+    // → every hash changes once → full re-bake.
+    if std::mem::replace(&mut rebuild.0, false) || (*prev_mat_hash != 0 && *prev_mat_hash != mat_hash) {
         *epoch = epoch.wrapping_add(1);
     }
+    *prev_mat_hash = mat_hash;
     let epoch_mix = epoch.wrapping_mul(EPOCH_MIX);
 
     let vs = config.voxel_size_at(0); // finest (LOD-0) voxel size
@@ -575,7 +638,10 @@ fn mesh_resident_chunks(
             let grid_origin = config.brick_min_world(key.coord, 0) - Vec3::splat(vs);
             let edits = round_edits.clone();
             let indices = idx.clone();
-            st.task = Some(pool.spawn(async move { mesh_chunk(&edits, &indices, grid_origin, vs, edge) }));
+            let apps = appearances.clone();
+            st.task = Some(
+                pool.spawn(async move { mesh_chunk(&edits, &indices, &apps, grid_origin, vs, edge) }),
+            );
             budget -= 1;
         }
     }
