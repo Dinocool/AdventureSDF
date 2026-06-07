@@ -1,5 +1,5 @@
 SceneFile(
-  next_id: 8,
+  next_id: 9,
   records: [
     Entity(
       id: LocalId(0),
@@ -94,6 +94,19 @@ SceneFile(
     ),
     Entity(
       id: LocalId(7),
+      components: {
+        "adventure::node::Node3D": "{\"adventure::node::Node3D\":()}",
+        "adventure::node::SceneNode": "{\"adventure::node::SceneNode\":()}",
+        "adventure::sdf_render::SdfVolume": "{\"adventure::sdf_render::SdfVolume\":()}",
+        "adventure::sdf_render::edits::SdfMaterialSource": "{\"adventure::sdf_render::edits::SdfMaterialSource\":(asset:Some(\"materials/emissive_orange.material.ron\"),overrides:(base_color:None,metallic:None,roughness:None,blend_softness:None,parallax_scale:None,emissive:None))}",
+        "adventure::sdf_render::edits::SdfOp": "{\"adventure::sdf_render::edits::SdfOp\":(kind:Union,smoothing:0.0)}",
+        "adventure::sdf_render::edits::SdfOrder": "{\"adventure::sdf_render::edits::SdfOrder\":(7)}",
+        "adventure::sdf_render::edits::SdfPrimitive": "{\"adventure::sdf_render::edits::SdfPrimitive\":Sphere(radius:0.35)}",
+        "bevy_transform::components::transform::Transform": "{\"bevy_transform::components::transform::Transform\":(translation:(0.0,1.7,0.0),rotation:(0.0,0.0,0.0,1.0),scale:(1.0,1.0,1.0))}",
+      },
+    ),
+    Entity(
+      id: LocalId(8),
       components: {
         "adventure::node::EditorGizmo": "{\"adventure::node::EditorGizmo\":DirectionalLight(scale:1.0)}",
         "adventure::node::Node3D": "{\"adventure::node::Node3D\":()}",

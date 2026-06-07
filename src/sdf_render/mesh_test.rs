@@ -33,7 +33,7 @@ fn mat(name: &str) -> Option<std::path::PathBuf> {
 /// after the box it carves; each carve/blend is positioned to only overlap its intended neighbour.
 fn spawn_mesh_test(world: &mut World) {
     // (local_id, order, transform, primitive, op, material file name)
-    let volumes: [(u64, u32, Transform, SdfPrimitive, SdfOp, &str); 7] = [
+    let volumes: [(u64, u32, Transform, SdfPrimitive, SdfOp, &str); 8] = [
         // Ground plane: wide + thin, top face at y = 0 (centre at y = -half_y).
         (
             0,
@@ -124,6 +124,19 @@ fn spawn_mesh_test(world: &mut World) {
             },
             "cobble",
         ),
+        // Floating emissive orb — demonstrates the Phase-2 emissive material path (self-lit, glows
+        // even unlit). Sits above the row so it reads as a separate light source.
+        (
+            7,
+            7,
+            Transform::from_xyz(0.0, 1.7, 0.0),
+            SdfPrimitive::Sphere { radius: 0.35 },
+            SdfOp {
+                kind: CsgKind::Union,
+                smoothing: 0.0,
+            },
+            "emissive_orange",
+        ),
     ];
 
     for (local, order, transform, prim, op, mat_name) in volumes {
@@ -145,7 +158,7 @@ fn spawn_mesh_test(world: &mut World) {
 
     // Directional light so the geometry (and debug wireframes) are visible.
     world.spawn((
-        LocalId(7),
+        LocalId(8),
         Name::new("Directional Light"),
         DirectionalLight {
             illuminance: 10000.0,
