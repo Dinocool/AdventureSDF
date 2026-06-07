@@ -15,9 +15,7 @@
     resolve_march,
     sample_level_at_or_coarser,
     dist_to_brick_exit_lod,
-    dist_to_chunk_exit_lod,
-    dist_over_empty_bricks,
-    in_ring_chunk,
+    empty_space_advance,
     ChunkCache,
 }
 
@@ -226,34 +224,9 @@ fn raymarch(origin: vec3<f32>, dir: vec3<f32>, start_t: f32, q: MarchQuality) ->
             }
         }
 
-        // --- 1. Empty space: hierarchical skip, coarsest→fine (biggest box wins) ------
-        //
-        // Two cases, both keyed off the chunk directory only (no field samples):
-        //  • a coarse ABSENT in-ring chunk  → jump its whole CHUNK box (provably empty: the bake cull
-        //    never enqueues a chunk that has geometry);
-        //  • a coarse RESIDENT chunk whose brick at `p` is empty — air ABOVE the terrain that shares
-        //    the chunk holding the surface below — → occupancy-DDA across its empty-brick run
-        //    (`dist_over_empty_bricks`). This is the horizon-crawl fix: instead of one brick per march
-        //    step it skips the whole empty run in one shot. Coarse bricks ⇒ big skips, and a brick
-        //    empty at a coarse LOD is empty at every finer LOD, so the skip can't pass a surface.
-        // Walking coarsest→fine takes the biggest applicable box; the finest-resident-brick fallback
-        // only fires if `p` is outside every ring (next iteration's MAX_DIST then ends the ray).
+        // --- 1. Empty space: hierarchical skip (the shared accelerator, see brick::empty_space_advance) --
         if (!scene.in_brick) {
-            let levels = lod_count();
-            var adv = dist_to_brick_exit_lod(p, dir, scene.window_lod) + voxel_size_at(scene.window_lod) * 0.01;
-            for (var L = levels; L > 0u; ) {
-                L = L - 1u;                              // coarsest first
-                let coord = world_to_brick_lod(p, L);
-                let ci = find_chunk_cached(coord, L, &cache);
-                if (ci >= 0) {
-                    adv = dist_over_empty_bricks(chunk_buf[u32(ci)], p, dir, L) + voxel_size_at(L) * 0.01;
-                    break;
-                } else if (in_ring_chunk(coord, L)) {
-                    adv = dist_to_chunk_exit_lod(p, dir, L) + voxel_size_at(L) * 0.01;
-                    break;
-                }
-            }
-            t += adv;
+            t += empty_space_advance(p, dir, scene.window_lod, &cache);
 #ifndef SDF_GI_MARCH
             prev_d = 0.0;
             prev_step = 0.0;

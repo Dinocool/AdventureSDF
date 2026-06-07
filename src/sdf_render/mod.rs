@@ -208,10 +208,6 @@ pub struct SdfRaymarchParams {
     /// camera uniform so it's live-tunable from the editor raymarch panel ("Shadow lights") with no
     /// shader rebuild.
     pub shadow_light_cap: u32,
-    /// Minimum LOD the shadow march samples in-brick (sun + point shadows). 0 = finest (sharpest,
-    /// slowest); higher = coarser/blobbier shadows but far fewer march steps — the shadows are the
-    /// G-buffer pass's biggest cost. Live "Shadow detail" slider in the editor raymarch panel.
-    pub shadow_lod_bias: u32,
 }
 
 impl Default for SdfRaymarchParams {
@@ -234,10 +230,6 @@ impl Default for SdfRaymarchParams {
             // cull is distance-based (shadows only within a fraction of each light's range), so this
             // rarely binds — it just bounds pathological clusters. 0 = no point-light shadows.
             shadow_light_cap: 8,
-            // Floor the shadow march at LOD 1 by default: near-camera shadows (which would march at
-            // LOD 0) drop to LOD 1 — ~2× fewer steps, imperceptible under the soft penumbra. 0 =
-            // full detail. Live "Shadow detail" slider.
-            shadow_lod_bias: 1,
         }
     }
 }
