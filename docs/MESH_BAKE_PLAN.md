@@ -58,19 +58,28 @@ mesh path wins.
 - Material v1: a single `StandardMaterial` (or vertex color) — defer real material mapping to Phase 2.
 - **Done when:** gallery renders as meshes, edits re-mesh interactively, zero warnings, both build configs.
 
-## Phase 2 — Material & shading fidelity
-- **v1 DONE (2026-06-08):** per-vertex material COLOUR — `mesh_chunk` resolves the material at each
-  vertex (`edits::fold_csg(...).material_id`), looks it up in a `MaterialRegistry` snapshot
-  (linear base + emissive, passed into the off-thread bake), writes it to the vertex COLOUR shaded by a
-  cheap fixed-direction hemispheric term (form reads while the mesh stays unlit) + emissive added so
-  glowing materials are bright. A material-COLOUR edit re-bakes (the per-chunk content hash keys on
-  material *id*, so an appearance-hash check bumps the rebake epoch). `mesh_test.scene` gains a floating
-  `emissive_orange` orb to exercise it; the row already uses sand/cobble/red_metal/white_gloss.
-- **Deferred to Phase 2b (needs a custom shader — held until meshes are primary so it's verified live):**
-  carry the 4-id palette + per-corner material *weights* onto vertices, L1-normalize, **triplanar-splat**
-  the PBR maps in a `MaterialExtension` over `StandardMaterial` (bonsairobo "Smooth Voxel Mapping"), and
-  true PBR lighting (metallic/roughness response). v1 shows one dominant material per vertex (no
-  multi-material blend within a chunk) and bakes a fixed shade instead of real lights.
+## Phase 2 — Material & shading fidelity  ✅ DONE (off-the-shelf PBR, 2026-06-08)
+Off-the-shelf path per the decision ("try StandardMaterial before a custom material/pipeline"):
+- **Per-vertex base colour** — `mesh_chunk` resolves the material at each vertex
+  (`edits::fold_csg(...).material_id`) and writes its LINEAR base colour to the vertex COLOUR.
+- **Real PBR lighting + per-material PBR params** — each chunk takes a lit `StandardMaterial` (cached by
+  its DOMINANT material id, sampled at the surface centroid): `base_color = WHITE` (so the per-vertex
+  COLOUR rules the albedo) + `metallic`/`perceptual_roughness`/`emissive` from the `MaterialRegistry`.
+  So red_metal is a shiny metal, white_gloss is glossy, the `emissive_orange` orb self-glows, etc.,
+  lit by the scene's directional light. (No `AmbientLight` — it's a per-camera component in 0.18; the
+  bright scene directional suffices. Add one on the camera later if shadowed faces read too dark.)
+- A material **appearance edit** (colour/metallic/roughness/emissive) re-bakes + rebuilds the cached
+  `StandardMaterial`s (the per-chunk content hash keys on material *id*, so an appearance-hash check
+  bumps the rebake epoch and clears `mat_cache`). `mesh_test.scene` gained a floating `emissive_orange`
+  orb to exercise emissive; the row uses sand/cobble/red_metal/white_gloss.
+
+**Known limitation (the genuinely-custom-render part the decision deprioritised):** the PBR *texture*
+maps (sand/cobble are textured `pbrtex` sets) are NOT triplanar-splatted onto the meshes — their texels
+live in the SDF render world as `D2Array` `TextureView`s (`render/pbr_textures.rs`), not main-world
+`Handle<Image>`s, so a clean `MaterialExtension` can't bind them. Triplanar texture detail + 4-material
+per-corner-weight blending therefore need the **fully custom mesh material/pipeline** — appropriate to do
+once meshes are primary (Phase 4) and can be verified live. Until then textured materials render as their
+flat base colour under PBR (sand/cobble base_color is white → light), while solid-PBR materials are exact.
 
 ## Phase 3 — Cross-LOD (clipmap rings) + skirts  *(satisfies the locked crack-free requirement)*
 - Mesh **all** resident LOD rings, not just finest.
@@ -124,9 +133,10 @@ mesh path wins.
 - Controls in the **"Mesh Bake"** bottom editor panel: SDF-render toggle, wireframe, **Chunk bricks (K)**
   slider, chunk/in-flight counts, Rebake, Capture diagnostics. View: `cargo run --features editor`,
   uncheck "SDF raymarch render".
-- ◑ Phase 2 — material colours (per-vertex base + emissive, shaded) DONE; triplanar multi-material splat
-  + PBR lighting deferred to 2b (needs a custom shader, verified once meshes are primary). ☐ Phase 3 —
-  cross-LOD rings + skirts. ☐ Phase 4 — make meshes primary, retire raymarch/DDGI, adopt Solari.
+- ✅ Phase 2 — off-the-shelf PBR: per-vertex base colour + lit per-material StandardMaterial
+  (metallic/roughness/emissive). Triplanar TEXTURE detail needs the custom render path (render-world
+  texture arrays) → folded into Phase 4 when meshes are primary + verifiable live. ☐ Phase 3 — cross-LOD
+  rings + skirts. ☐ Phase 4 — make meshes primary, retire raymarch/DDGI, adopt Solari (+ triplanar textures).
 
 **Latent `main` bugs fixed here (port to main):** probe-trace `ChunkLookup` 24-vs-32 hand-pack crash;
 `SdfRenderEnabled` not `ExtractResource` (F1 no-op).
