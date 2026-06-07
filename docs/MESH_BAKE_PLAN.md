@@ -73,13 +73,25 @@ Off-the-shelf path per the decision ("try StandardMaterial before a custom mater
   bumps the rebake epoch and clears `mat_cache`). `mesh_test.scene` gained a floating `emissive_orange`
   orb to exercise emissive; the row uses sand/cobble/red_metal/white_gloss.
 
-**Known limitation (the genuinely-custom-render part the decision deprioritised):** the PBR *texture*
-maps (sand/cobble are textured `pbrtex` sets) are NOT triplanar-splatted onto the meshes — their texels
-live in the SDF render world as `D2Array` `TextureView`s (`render/pbr_textures.rs`), not main-world
-`Handle<Image>`s, so a clean `MaterialExtension` can't bind them. Triplanar texture detail + 4-material
-per-corner-weight blending therefore need the **fully custom mesh material/pipeline** — appropriate to do
-once meshes are primary (Phase 4) and can be verified live. Until then textured materials render as their
-flat base colour under PBR (sand/cobble base_color is white → light), while solid-PBR materials are exact.
+**Known limitations → the Phase-4 CUSTOM MESH MATERIAL (one shader does all three).** The off-the-shelf
+StandardMaterial path is per-mesh and untextured, so it can't do the three things the full vision needs;
+they are NOT separate efforts — one custom mesh material/pipeline, fed by richer vertex data, carries all:
+1. **Per-vertex PBR params** — metallic/roughness/emissive as vertex attributes (not one dominant material
+   per chunk). Fixes the "metallic/roughness uniform per chunk" issue; does NOT need the render-world
+   textures, so it's the tractable, verifiable first step.
+2. **Multi-material (≤`PALETTE_K`=4) weighted BLEND** — per vertex sample `edits::build_palette_indexed`
+   → the ≤4 nearest material ids + their **L1-normalized weights** (from the per-material sub-voxel
+   distance fields, feathered by `MaterialDef::blend_softness`); carry ids+weights as vertex attributes;
+   blend the 4 materials' PBR by weight in the fragment shader (bonsairobo "Smooth Voxel Mapping"). This
+   is what gives a feathered seam between two materials (e.g. cube-on-sand) instead of the current hard
+   dominant-material edge. The raymarch already does this per-pixel — reuse its blend logic.
+3. **Triplanar PBR textures** — sand/cobble etc. The texels live in the SDF render world as `D2Array`
+   `TextureView`s (`render/pbr_textures.rs`), NOT main-world `Handle<Image>`s, so they can't bind to an
+   off-the-shelf StandardMaterial; this is the part that forces a custom pipeline (the decision
+   deprioritised it). Metals ALSO need an `EnvironmentMapLight`/IBL to read as metal (a lighting-setup
+   fix, not the shader). Best done once meshes are primary (Phase 4) and verifiable live.
+Until then: one dominant material per chunk, no blend, textured materials render flat base colour
+(sand/cobble base_color = white → light); solid-PBR materials are exact (modulo metals needing IBL).
 
 ## Phase 3 — Cross-LOD (clipmap rings) + skirts  *(satisfies the locked crack-free requirement)*
 - Mesh **all** resident LOD rings, not just finest.
