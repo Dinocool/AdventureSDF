@@ -27,13 +27,9 @@
     chunk_buf,
 }
 #import sdf::brick::{
-    world_to_brick_lod,
     resolve_march,
     dist_to_brick_exit_lod,
-    dist_to_chunk_exit_lod,
-    dist_over_empty_bricks,
-    in_ring_chunk,
-    find_chunk_cached,
+    empty_space_advance,
     new_chunk_cache,
 }
 
@@ -98,21 +94,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         // seeding the tile SHORT (every pixel then re-crawls). Coarsest→fine; coarse-empty ⇒ empty
         // at all finer LODs (safe).
         if (!scene.in_brick) {
-            let levels = lod_count();
-            var adv = dist_to_brick_exit_lod(p, dir, scene.window_lod) + voxel_size_at(scene.window_lod) * 0.01;
-            for (var L = levels; L > 0u; ) {
-                L = L - 1u;
-                let coord = world_to_brick_lod(p, L);
-                let ci = find_chunk_cached(coord, L, &cache);
-                if (ci >= 0) {
-                    adv = dist_over_empty_bricks(chunk_buf[u32(ci)], p, dir, L) + voxel_size_at(L) * 0.01;
-                    break;
-                } else if (in_ring_chunk(coord, L)) {
-                    adv = dist_to_chunk_exit_lod(p, dir, L) + voxel_size_at(L) * 0.01;
-                    break;
-                }
-            }
-            t += adv;
+            t += empty_space_advance(p, dir, scene.window_lod, &cache); // shared (brick::empty_space_advance)
             continue;
         }
 

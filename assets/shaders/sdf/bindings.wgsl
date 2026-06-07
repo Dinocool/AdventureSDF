@@ -13,7 +13,7 @@ struct SdfCameraUniform {
     // frame's screen to sample its already-shaded colour (sdf_raymarch SSR path).
     prev_clip_from_world: mat4x4<f32>,
     camera_pos: vec4<f32>,
-    screen_params: vec4<f32>,  // xy = screen_size; z = overlap_depth (u32); w = shadow LOD floor (u32)
+    screen_params: vec4<f32>,  // xy = screen_size; z = overlap_depth (u32); w = unused
     grid_origin: vec4<f32>,
     grid_dims: vec4<f32>,
     debug_params: vec4<f32>,   // x = max_steps, y = max_dist, z = sdf_eps, w = recenter_snap_chunks
@@ -176,9 +176,6 @@ fn recenter_snap() -> i32 { return max(i32(camera.debug_params.w), 1); }
 // Drives the inner-hole size in `in_ring_chunk` — MUST mirror CPU `SdfGridConfig::overlap_depth` /
 // `inner_hole_half_chunks` exactly, or the empty-space DDA skip and the resident set diverge (gaps).
 fn overlap_depth() -> u32 { return u32(camera.screen_params.z); }
-// Minimum LOD the shadow march samples in-brick (editor "Shadow detail" slider, in screen_params.w).
-// 0 = finest (sharpest, slowest); higher = coarser/blobbier shadows but far fewer march steps.
-fn shadow_lod_bias() -> u32 { return u32(camera.screen_params.w); }
 
 // --- LOD clipmap / chunk accessors ---
 

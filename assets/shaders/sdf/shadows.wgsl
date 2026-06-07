@@ -12,15 +12,11 @@
 // the empty-space DDA skip. Neither a near-surface step-floor change nor a coarse-LOD shadow floor
 // fixed them; an optimal approach is still TBD.
 
-#import sdf::bindings::{voxel_size_at, lod_count, DIST_BAND_VOXELS, shadow_softness, shadow_lod_bias, clipmap_exit_t}
+#import sdf::bindings::{voxel_size_at, lod_count, DIST_BAND_VOXELS, shadow_softness, clipmap_exit_t}
 #import sdf::brick::{
     resolve_march,
-    sample_level_at_or_coarser,
-    world_to_brick_lod,
-    find_chunk_cached,
     dist_to_brick_exit_lod,
-    dist_to_chunk_exit_lod,
-    in_ring_chunk,
+    empty_space_advance,
     new_chunk_cache,
 }
 // For the hard-shadow path (softness 0): a binary occlusion test via the primary raymarch.
@@ -40,7 +36,7 @@ const SHADOW_MAX_STEPS: u32 = 96u;
 
 // Inigo Quilez soft shadow over the sparse field. `mint` starts the march off the originating
 // surface; `k` is penumbra hardness; `max_t` bounds the ray.
-fn soft_shadow(origin: vec3<f32>, light_dir: vec3<f32>, mint: f32, max_t: f32, k: f32, lod_floor: u32) -> f32 {
+fn soft_shadow(origin: vec3<f32>, light_dir: vec3<f32>, mint: f32, max_t: f32, k: f32) -> f32 {
     var res = 1.0;
     var t = mint;
     // Per-ray chunk-search memo (like the primary march): the ray stays in one chunk for many
@@ -50,35 +46,14 @@ fn soft_shadow(origin: vec3<f32>, light_dir: vec3<f32>, mint: f32, max_t: f32, k
     for (var i = 0u; i < SHADOW_MAX_STEPS; i = i + 1u) {
         if (t >= max_t) { break; }
         let p = origin + light_dir * t;
-        var scene = resolve_march(p, &cache);
+        let scene = resolve_march(p, &cache);
 
-        // LOD floor for the IN-BRICK sample (mirrors the primary march, march.wgsl): a coarser
-        // field gives a larger conservative distance ⇒ bigger sphere-trace steps ⇒ far fewer
-        // iterations (the shadow cost). Soft shadows hide the coarsening. The empty-space skip
-        // below still uses `resolve_march`'s finest window, so gap-jumping stays correct.
-        // `lod_floor == 0` ⇒ no floor (sample the finest, unchanged).
-        if (scene.in_brick && scene.lod < lod_floor) {
-            let coarse = sample_level_at_or_coarser(p, lod_floor, &cache);
-            if (coarse.in_brick) { scene = coarse; }
-        }
-
-        // --- Empty space: hierarchical chunk-DDA skip (the key difference from the old march) ---
-        // No resident brick here. Step to the far face of the LARGEST provably-empty box around
-        // `p` (a chunk absent from the table AND inside its LOD's resident ring is empty), walking
-        // coarse→fine so the biggest box wins. This is what lets the ray jump the gap between an
-        // object and the ground instead of bailing at the first saturated sample.
+        // --- Empty space: the SHARED hierarchical skip (brick::empty_space_advance) ---
+        // Previously the shadow march had its own skip that lacked the resident-chunk occupancy-DDA, so
+        // grazing sun-shadow rays crawled brick-by-brick (the "horizon crawl"). It now uses the same
+        // accelerator as the primary march — one definition, applies everywhere.
         if (!scene.in_brick) {
-            let wl = scene.window_lod;
-            var adv = dist_to_brick_exit_lod(p, light_dir, wl) + voxel_size_at(wl) * 0.01;
-            for (var L = lod_count(); L > 0u; ) {
-                L = L - 1u;
-                let coord = world_to_brick_lod(p, L);
-                if (find_chunk_cached(coord, L, &cache) < 0 && in_ring_chunk(coord, L)) {
-                    adv = max(adv, dist_to_chunk_exit_lod(p, light_dir, L) + voxel_size_at(L) * 0.01);
-                    break;
-                }
-            }
-            t += adv;
+            t += empty_space_advance(p, light_dir, scene.window_lod, &cache);
             continue;
         }
 
@@ -131,17 +106,18 @@ fn surface_shadow(hit_pos: vec3<f32>, geo_n: vec3<f32>, light_dir: vec3<f32>, lo
     let vs = voxel_size_at(lod);
     let origin = hit_pos + geo_n * vs;
     let k = shadow_softness();
-    let floor = shadow_lod_bias();   // editor "Shadow detail" slider: coarser = cheaper march
     // Cap the ray at the resident clipmap boundary: past it there's no resident geometry to occlude,
     // so a sun-lit ray would otherwise crawl brick-by-brick past the volume (the empty-space skip
     // only jumps chunks INSIDE a ring) and burn its whole 96-step / 256-unit budget for nothing.
     // Exact, not approximate — nothing beyond the volume can cast a shadow.
     let reach = min(max_t, clipmap_exit_t(origin, light_dir));
     if (k <= 0.0) {
-        let q = MarchQuality(1.0, SHADOW_MAX_STEPS, reach, floor);
+        // Hard shadow: a binary occlusion test through the primary march. lod_floor 0 (the shared
+        // empty-space accelerator makes the coarse shadow-LOD floor unnecessary for perf).
+        let q = MarchQuality(1.0, SHADOW_MAX_STEPS, reach, 0u);
         return select(1.0, 0.0, raymarch(origin, light_dir, vs * 0.5, q).hit);
     }
-    return soft_shadow(origin, light_dir, vs * 0.5, reach, k, floor);
+    return soft_shadow(origin, light_dir, vs * 0.5, reach, k);
 }
 
 // Soft shadow toward a SPHERE light of `radius` centred at distance `dist` along `light_dir` — for
@@ -159,5 +135,5 @@ fn sphere_light_shadow(hit_pos: vec3<f32>, geo_n: vec3<f32>, light_dir: vec3<f32
     let vs = voxel_size_at(lod);
     let origin = hit_pos + geo_n * vs;
     let k = dist / max(radius, vs);                // sphere angular size → penumbra hardness
-    return soft_shadow(origin, light_dir, vs * 0.5, dist, k, shadow_lod_bias());
+    return soft_shadow(origin, light_dir, vs * 0.5, dist, k);
 }
