@@ -42,7 +42,11 @@ impl Plugin for WorldPlugin {
         .add_systems(
             OnEnter(AppScene::AdventureGame),
             (
-                spawn_terrain,
+                // TEMP: world terrain disabled during the mesh-bake migration to keep focus on the
+                // gallery scene. (Terrain only spawns in the AdventureGame scene anyway, not the SDF
+                // gallery; gated here so it's an obvious, reversible one-line toggle.) Re-enable by
+                // removing `.run_if(|| false)`.
+                spawn_terrain.run_if(|| false),
                 spawn_lights,
                 spawn_npc_scene,
                 spawn_test_chests,

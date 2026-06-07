@@ -362,16 +362,30 @@ pub(super) fn prepare_sdf_probe(
         eligible.truncate(cap);
     }
 
-    let mut bytes = Vec::with_capacity(eligible.len() * 24 + 24);
+    // MUST pack ALL 8 `ChunkLookup` fields (32 bytes) in the SAME ORDER as the WGSL struct in
+    // `sdf/bindings.wgsl` — including `cons_occ_lo/hi` (the conservative-occupancy words). Omitting
+    // them bakes a 24-byte stride against the 32-byte shader struct → a dispatch validation error
+    // ("buffer bound with size 24 where the shader expects 32"). (The cons_occ fields were added by
+    // the bake branch after this hand-packing was written; the merge didn't reconcile them.)
+    let mut bytes = Vec::with_capacity(eligible.len() * 32 + 32);
     let mut dispatched = 0u32;
     for c in &eligible {
-        for v in [c.key_hi, c.key_lo, c.occ_lo, c.occ_hi, c.tile_run_base, c.probe_base] {
+        for v in [
+            c.key_hi,
+            c.key_lo,
+            c.occ_lo,
+            c.occ_hi,
+            c.cons_occ_lo,
+            c.cons_occ_hi,
+            c.tile_run_base,
+            c.probe_base,
+        ] {
             bytes.extend_from_slice(&v.to_le_bytes());
         }
         dispatched += 1;
     }
     if bytes.is_empty() {
-        bytes.resize(24, 0xff); // a sentinel-keyed row (never matches) so the trace finds no probes
+        bytes.resize(32, 0xff); // one sentinel-keyed row (never matches) so the trace finds no probes
     }
     bufs.resident = device.create_buffer_with_data(&BufferInitDescriptor {
         label: Some("sdf_probe_resident"),
