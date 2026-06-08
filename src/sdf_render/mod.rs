@@ -75,6 +75,7 @@ pub(crate) mod scatter;
 pub(crate) mod stress;
 pub mod textures;
 pub(crate) mod tower_field;
+pub mod worldgen;
 
 use bevy::prelude::*;
 
@@ -442,7 +443,15 @@ impl Plugin for SdfScenePlugin {
             .add_systems(Update, editor_camera::sync_editor_camera_active)
             .add_systems(
                 OnEnter(AppScene::SdfEditor),
-                (setup_sdf_scene, load_default_gallery).chain(),
+                // The default gallery is the wrong backdrop for the worldgen slice — skip it when
+                // worldgen drives the scene (WorldGenPlugin spawns its own sun + terrain volume).
+                // `setup_sdf_scene` (material fallback table) always runs.
+                (
+                    setup_sdf_scene,
+                    load_default_gallery
+                        .run_if(|w: Option<Res<worldgen::WorldGenEnabled>>| w.is_none_or(|w| !w.0)),
+                )
+                    .chain(),
             )
             // Camera control: skipped when the pointer is over a dock panel (editor
             // sets ViewportInputAllowed). Non-editor build leaves it true.
@@ -523,7 +532,12 @@ impl Plugin for SdfScenePlugin {
             )
             // Ungated: a scene switch fires as the state leaves the editor, so scene eviction must run
             // regardless of the current `AppScene`.
-            .add_systems(Update, evict_on_scene_switch);
+            .add_systems(Update, evict_on_scene_switch)
+            // Procedural worldgen: owns the LayerManager, rolls the streamed CPU height ring around
+            // the camera, and spawns the world-spanning Terrain volume the MESH bake picks up via
+            // `gather_sorted_edits` (the Terrain `eval_primitive` samples the CPU height ring — no GPU
+            // ring needed; the GPU brick-bake's Terrain case stays the gated-off cloud foundation).
+            .add_plugins(worldgen::WorldGenPlugin);
 
         // Overlay gizmos (ground grid + bounds) need GizmoPlugin (Assets<GizmoAsset>).
         // Present in the real app (DefaultPlugins) but not in MinimalPlugins test

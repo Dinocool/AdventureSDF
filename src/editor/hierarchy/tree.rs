@@ -209,5 +209,6 @@ fn primitive_label(prim: &SdfPrimitive) -> &'static str {
         SdfPrimitive::Capsule { .. } => "Capsule",
         SdfPrimitive::Cylinder { .. } => "Cylinder",
         SdfPrimitive::Heightmap { .. } => "Heightmap",
+        SdfPrimitive::Terrain { .. } => "Terrain",
     }
 }
