@@ -852,7 +852,7 @@ fn zipper(
         let lo = g[i - 1];
         let mut best = lo;
         let mut bd = f[i].pos.distance_squared(cv(lo).pos);
-        for k in (lo + 1)..=(lo + 4).min(coarse_end) {
+        for k in (lo + 1)..=(lo + 8).min(coarse_end) {
             let d = f[i].pos.distance_squared(cv(k).pos);
             if d < bd {
                 bd = d;
@@ -872,22 +872,39 @@ fn zipper(
             [v.base[0], v.base[1], v.base[2], 1.0]
         }
     };
+    // Emit a triangle, FLIPPING its winding so the face normal agrees with the analytic vertex normals →
+    // every seam triangle faces outward (the strip's lacing winding alternates otherwise → half render dark
+    // under the double-sided material).
     let mut emit = |a: BoundaryVert, b: BoundaryVert, d: BoundaryVert| {
+        let face_n = (b.pos - a.pos).cross(d.pos - a.pos);
+        let tri = if face_n.dot(a.normal + b.normal + d.normal) < 0.0 { [a, d, b] } else { [a, b, d] };
         let i0 = positions.len() as u32;
-        for v in [a, b, d] {
+        for v in tri {
             positions.push([v.pos.x, v.pos.y, v.pos.z]);
             normals.push([v.normal.x, v.normal.y, v.normal.z]);
             colors.push(col(&v));
         }
         indices.extend_from_slice(&[i0, i0 + 1, i0 + 2]);
     };
-    let mut k = g[0];
+    // CHAIN ends: the coarse curve usually extends past where the fine curve's nearest match starts/ends
+    // (most visibly at chunk corners). Fan the unmatched coarse head [0,g[0]) and tail to the first/last fine
+    // vertex so every coarse edge is covered → no chain-end holes. (Loops already wrap fully.)
+    let mut k = if is_loop { g[0] } else { 0 };
+    while k < g[0] {
+        emit(f[0], cv(k), cv(k + 1));
+        k += 1;
+    }
     for i in 0..nf - 1 {
         emit(f[i], f[i + 1], cv(k)); // fine edge → its current coarse vertex
         while k < g[i + 1] {
             emit(f[i + 1], cv(k), cv(k + 1)); // each coarse edge fine passed → triangle to the fine vertex
             k += 1;
         }
+    }
+    let tail = if is_loop { g[nf - 1] } else { nc - 1 };
+    while k < tail {
+        emit(f[nf - 1], cv(k), cv(k + 1));
+        k += 1;
     }
 }
 
