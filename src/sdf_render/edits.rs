@@ -777,6 +777,38 @@ fn build_palette_inner<'a>(edits: impl Iterator<Item = &'a ResolvedEdit>, sample
     palette
 }
 
+/// Top-TWO material ids at `pos` (over the edits at `indices`) plus their distance GAP — the per-vertex
+/// input the baked-mesh material uses to cross-fade two materials at a CSG boundary (mirrors the raymarch's
+/// per-voxel palette argmin). `a` = nearest material, `b` = runner-up, `gap = d_b − d_a ≥ 0`. A large/`MAX`
+/// gap (or a single material) ⇒ pure `a`; a small gap ⇒ blend a↔b over the material's `blend_softness` band.
+/// Subtract edits carry no material (they only carve), so they never contribute a candidate.
+pub fn fold_csg_top2(edits: &[ResolvedEdit], indices: &[u32], pos: Vec3) -> (u16, u16, f32) {
+    // Nearest signed distance achieved by each material id at `pos`.
+    let mut best: Vec<(u16, f32)> = Vec::new();
+    for &i in indices {
+        let e = &edits[i as usize];
+        if e.op.kind == CsgKind::Subtract {
+            continue;
+        }
+        let dn = eval_world_inv(&e.prim, &e.inv_model, pos);
+        match best.iter_mut().find(|(id, _)| *id == e.material_id) {
+            Some((_, d)) => *d = d.min(dn),
+            None => best.push((e.material_id, dn)),
+        }
+    }
+    if best.is_empty() {
+        return (0, 0, f32::MAX);
+    }
+    // Two smallest distances → (nearest a, runner-up b, gap). Partial-select the two minima.
+    best.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+    let a = best[0].0;
+    if best.len() >= 2 {
+        (a, best[1].0, best[1].1 - best[0].1)
+    } else {
+        (a, a, f32::MAX)
+    }
+}
+
 // --- GPU edit (flat, for the compute bake) ---
 
 /// Primitive tag in [`GpuEdit::tag`] — must match the `PRIM_*` consts in
@@ -980,6 +1012,39 @@ mod tests {
         // Material is one of the two participating ids (sanity; exact pick depends
         // on geometry). The key invariant: intersect never yields id 0.
         assert!(s.material_id == 1 || s.material_id == 2);
+    }
+
+    #[test]
+    fn fold_csg_top2_nearest_then_runner_up() {
+        // Two unioned spheres (ids 1 and 2), centres apart. fold_csg_top2 returns the nearest material
+        // first, the runner-up second, and a non-negative gap that vanishes on the midline.
+        let edits = vec![
+            ResolvedEdit::new(
+                SdfPrimitive::Sphere { radius: 1.0 },
+                Transform::from_xyz(-0.6, 0.0, 0.0),
+                SdfOp::default(),
+                1,
+            ),
+            ResolvedEdit::new(
+                SdfPrimitive::Sphere { radius: 1.0 },
+                Transform::from_xyz(0.6, 0.0, 0.0),
+                SdfOp { kind: CsgKind::Union, smoothing: 0.0 },
+                2,
+            ),
+        ];
+        let idx = [0u32, 1];
+        // At sphere 1's centre → a = 1, b = 2, clear gap.
+        let (a, b, gap) = fold_csg_top2(&edits, &idx, Vec3::new(-0.6, 0.0, 0.0));
+        assert_eq!(a, 1, "nearest material at sphere 1's centre");
+        assert_eq!(b, 2, "runner-up is the other sphere");
+        assert!(gap > 0.0, "a clear gap to sphere 2: {gap}");
+        // On the midline both are equidistant → gap ≈ 0 (the materials tie → full blend).
+        let (_, _, gmid) = fold_csg_top2(&edits, &idx, Vec3::ZERO);
+        assert!(gmid.abs() < 1e-5, "midline gap should be ~0: {gmid}");
+        // Only one material in the index set → b == a, gap == MAX (pure a, no blend).
+        let (sa, sb, sg) = fold_csg_top2(&edits, &[0], Vec3::new(-0.6, 0.0, 0.0));
+        assert_eq!((sa, sb), (1, 1));
+        assert_eq!(sg, f32::MAX);
     }
 
     #[test]
