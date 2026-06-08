@@ -843,13 +843,16 @@ fn build_seam_into(
         indices.extend_from_slice(&[i0, i0 + 1, i0 + 2]);
     };
     let across = |c: IVec2| IVec2::new(c.x.div_euclid(2), c.y.div_euclid(2));
-    // The coarse vertex for a fine vertex: the one in its across-cell, else the nearest in the 3×3 cell
-    // neighbourhood (the fine and coarse boundaries cross slightly different cells where they diverge, so the
-    // exact cell can be empty by one — search a ring rather than leave a hole). `None` ⇒ no coarse counterpart.
+    // The coarse vertex for a fine vertex: the one NEAREST (by world position) in a small cell neighbourhood
+    // of the across-cell. Where the terrain is rough the coarse boundary undersamples it and crosses cells up
+    // to ~2 away from the fine across-cell (measured), so a ±SEAM_SEARCH window is needed — picking the
+    // nearest by position keeps the connection correct (it's the local coarse curve). `None` ⇒ truly no coarse
+    // counterpart nearby (e.g. a 3-LOD corner, where the coarse vertex is in an adjacent face's neighbour).
+    const SEAM_SEARCH: i32 = 3;
     let coarse_at = |cell: IVec2, p: Vec3| -> Option<BoundaryVert> {
         let mut best: Option<(f32, BoundaryVert)> = None;
-        for dy in -1..=1 {
-            for dx in -1..=1 {
+        for dy in -SEAM_SEARCH..=SEAM_SEARCH {
+            for dx in -SEAM_SEARCH..=SEAM_SEARCH {
                 if let Some(v) = cmap.get(&(cell + IVec2::new(dx, dy))) {
                     let d = v.pos.distance_squared(p);
                     if best.is_none_or(|(bd, _)| d < bd) {
@@ -1836,6 +1839,58 @@ mod tests {
         let mut all = bare;
         all.extend(seam);
         assert_eq!(open_edge_count(&all), 0, "fine + coarse + seam must be watertight");
+    }
+
+    #[test]
+    fn seam_terrain_chain_has_no_gaps() {
+        // A heightmap (terrain) crossing a fine|coarse 2:1 boundary produces CHAIN boundaries. Every fine
+        // boundary edge must find a coarse counterpart across the boundary, or the seam has a mid-band gap
+        // (the artifact seen on the lod_test terrain). Reproduces it deterministically + diagnoses where.
+        let edit = edits::ResolvedEdit::new(
+            crate::sdf_render::SdfPrimitive::Heightmap {
+                half_xz: Vec2::new(400.0, 400.0),
+                max_height: 30.0,
+                freq: 0.35,
+                amp: 11.0,
+                seed: 7,
+            },
+            Transform::IDENTITY,
+            crate::sdf_render::SdfOp { kind: crate::sdf_render::CsgKind::Union, smoothing: 0.0 },
+            0,
+        );
+        let edits = [edit];
+        let idx = [0u32];
+        let (vsf, vsc, edge) = (1.0f32, 2.0f32, 30u32);
+        // Fine on +X (its −X face borders coarse); coarse on −X, abutting at X=0. Both grid origins anchored
+        // so the LOD grids are 2:1-nested (gov = grid_origin/vs is integral). Y,Z span the terrain (~Y 15).
+        let of = Vec3::new(-vsf, -vsf, -vsf); // fine brick_min (0,0,0); covers ~[-1,28]^3
+        // coarse brick_max.x = 0 (abuts fine); Y,Z anchored so gov (=origin/vs) matches fine's → grids nested.
+        let oc = Vec3::new(-56.0 - vsc, -vsc, -vsc);
+        let fine = mesh_chunk(&edits, &idx, &[], of, vsf, edge, 0, 0.0, 0, 0, false).expect("fine meshes");
+        let coarse = mesh_chunk(&edits, &idx, &[], oc, vsc, edge, 0, 0.0, 1, 0, false).expect("coarse meshes");
+
+        // Replicate the seam's coarse lookup and count fine boundary edges with no coarse counterpart.
+        let mut cmap: HashMap<IVec2, BoundaryVert> = HashMap::new();
+        for l in &coarse.boundary[1] {
+            for v in &l.verts {
+                cmap.insert(v.cell, *v);
+            }
+        }
+        let across = |c: IVec2| IVec2::new(c.x.div_euclid(2), c.y.div_euclid(2));
+        let found = |c: IVec2| {
+            (-3..=3).any(|dy| (-3..=3).any(|dx| cmap.contains_key(&(c + IVec2::new(dx, dy)))))
+        };
+        let (mut total, mut miss) = (0usize, 0usize);
+        for l in &fine.boundary[0] {
+            for v in &l.verts {
+                total += 1;
+                if !found(across(v.cell)) {
+                    miss += 1;
+                }
+            }
+        }
+        // (At ±1 this config gives miss=8 — the rough coarse boundary diverges by ~2 cells; ±3 closes it.)
+        assert_eq!(miss, 0, "{miss}/{total} fine boundary verts have no coarse cell → seam gap");
     }
 
     #[test]
