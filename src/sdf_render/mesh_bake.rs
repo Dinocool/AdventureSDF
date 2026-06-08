@@ -812,11 +812,18 @@ fn build_seam_into(
     if fine.is_empty() || coarse.is_empty() {
         return;
     }
-    // Coarse boundary vertices keyed by world-aligned cell coord (coarse LOD units) for O(1) lookup.
+    // Boundary vertices keyed by world-aligned cell coord (each side in its own LOD voxel units) for O(1)
+    // lookup. cmap = coarse (for the fine→coarse pass); fmap = fine (for the coarse→fine pass).
     let mut cmap: HashMap<IVec2, BoundaryVert> = HashMap::new();
     for cl in coarse {
         for v in &cl.verts {
             cmap.insert(v.cell, *v);
+        }
+    }
+    let mut fmap: HashMap<IVec2, BoundaryVert> = HashMap::new();
+    for fl in fine {
+        for v in &fl.verts {
+            fmap.insert(v.cell, *v);
         }
     }
     let col = |v: &BoundaryVert| {
@@ -842,18 +849,18 @@ fn build_seam_into(
         }
         indices.extend_from_slice(&[i0, i0 + 1, i0 + 2]);
     };
-    let across = |c: IVec2| IVec2::new(c.x.div_euclid(2), c.y.div_euclid(2));
-    // The coarse vertex for a fine vertex: the one NEAREST (by world position) in a small cell neighbourhood
-    // of the across-cell. Where the terrain is rough the coarse boundary undersamples it and crosses cells up
-    // to ~2 away from the fine across-cell (measured), so a ±SEAM_SEARCH window is needed — picking the
-    // nearest by position keeps the connection correct (it's the local coarse curve). `None` ⇒ truly no coarse
-    // counterpart nearby (e.g. a 3-LOD corner, where the coarse vertex is in an adjacent face's neighbour).
+    let across = |c: IVec2| IVec2::new(c.x.div_euclid(2), c.y.div_euclid(2)); // fine cell → coarse cell
+    let refine = |c: IVec2| c * 2; // coarse cell → its low fine sub-cell
+    // Nearest boundary vertex (by world position) within a ±SEAM_SEARCH cell window of `cell`. Where the
+    // terrain is rough the two LODs' boundaries cross cells up to ~2 apart (measured), so a window is needed;
+    // nearest-by-position keeps the link on the local curve. `None` ⇒ no counterpart nearby (e.g. a 3-LOD
+    // corner, where the counterpart lives in an adjacent face's neighbour this lookup doesn't include).
     const SEAM_SEARCH: i32 = 3;
-    let coarse_at = |cell: IVec2, p: Vec3| -> Option<BoundaryVert> {
+    let nearest = |map: &HashMap<IVec2, BoundaryVert>, cell: IVec2, p: Vec3| -> Option<BoundaryVert> {
         let mut best: Option<(f32, BoundaryVert)> = None;
         for dy in -SEAM_SEARCH..=SEAM_SEARCH {
             for dx in -SEAM_SEARCH..=SEAM_SEARCH {
-                if let Some(v) = cmap.get(&(cell + IVec2::new(dx, dy))) {
+                if let Some(v) = map.get(&(cell + IVec2::new(dx, dy))) {
                     let d = v.pos.distance_squared(p);
                     if best.is_none_or(|(bd, _)| d < bd) {
                         best = Some((d, *v));
@@ -863,6 +870,11 @@ fn build_seam_into(
         }
         best.map(|(_, v)| v)
     };
+    // Sorted cell-pair key so a coarse edge already covered by the fine pass isn't re-covered by the coarse one.
+    let ekey = |a: IVec2, b: IVec2| if (a.x, a.y) <= (b.x, b.y) { (a, b) } else { (b, a) };
+
+    // FINE→COARSE: one quad per fine boundary edge (covers every fine edge + the coarse edge it spans).
+    let mut covered: HashSet<(IVec2, IVec2)> = HashSet::new();
     for fl in fine {
         let n = fl.verts.len();
         if n < 2 {
@@ -870,14 +882,39 @@ fn build_seam_into(
         }
         let edges = if fl.is_loop { n } else { n - 1 };
         for i in 0..edges {
-            let a = fl.verts[i];
-            let b = fl.verts[(i + 1) % n];
-            let (Some(ca), Some(cb)) = (coarse_at(across(a.cell), a.pos), coarse_at(across(b.cell), b.pos))
+            let (a, b) = (fl.verts[i], fl.verts[(i + 1) % n]);
+            let (Some(ca), Some(cb)) =
+                (nearest(&cmap, across(a.cell), a.pos), nearest(&cmap, across(b.cell), b.pos))
             else {
-                continue; // fine edge with no coarse counterpart across the boundary (e.g. 3-LOD corner)
+                continue;
             };
             emit(a, b, cb);
             emit(a, cb, ca);
+            if ca.cell != cb.cell {
+                covered.insert(ekey(ca.cell, cb.cell));
+            }
+        }
+    }
+    // COARSE→FINE: cover any coarse boundary edge the fine pass missed (the inverse divergence — the coarse
+    // boundary crosses a cell the fine doesn't), connecting it to the nearest fine vertex.
+    for cl in coarse {
+        let n = cl.verts.len();
+        if n < 2 {
+            continue;
+        }
+        let edges = if cl.is_loop { n } else { n - 1 };
+        for i in 0..edges {
+            let (ca, cb) = (cl.verts[i], cl.verts[(i + 1) % n]);
+            if covered.contains(&ekey(ca.cell, cb.cell)) {
+                continue;
+            }
+            let (Some(fa), Some(fb)) =
+                (nearest(&fmap, refine(ca.cell), ca.pos), nearest(&fmap, refine(cb.cell), cb.pos))
+            else {
+                continue;
+            };
+            emit(ca, cb, fb);
+            emit(ca, fb, fa);
         }
     }
 }
@@ -1876,21 +1913,45 @@ mod tests {
                 cmap.insert(v.cell, *v);
             }
         }
-        let across = |c: IVec2| IVec2::new(c.x.div_euclid(2), c.y.div_euclid(2));
-        let found = |c: IVec2| {
-            (-3..=3).any(|dy| (-3..=3).any(|dx| cmap.contains_key(&(c + IVec2::new(dx, dy)))))
-        };
-        let (mut total, mut miss) = (0usize, 0usize);
+        let mut fmap: HashMap<IVec2, BoundaryVert> = HashMap::new();
         for l in &fine.boundary[0] {
             for v in &l.verts {
-                total += 1;
-                if !found(across(v.cell)) {
-                    miss += 1;
-                }
+                fmap.insert(v.cell, *v);
             }
         }
-        // (At ±1 this config gives miss=8 — the rough coarse boundary diverges by ~2 cells; ±3 closes it.)
-        assert_eq!(miss, 0, "{miss}/{total} fine boundary verts have no coarse cell → seam gap");
+        let found = |map: &HashMap<IVec2, BoundaryVert>, c: IVec2| {
+            (-3..=3).any(|dy| (-3..=3).any(|dx| map.contains_key(&(c + IVec2::new(dx, dy)))))
+        };
+        // FINE→COARSE coverage: every fine boundary vert must reach a coarse cell. (At ±1 this rough config
+        // gives 8 misses — the coarse boundary diverges by ~2 cells; ±3 closes it.)
+        let (mut ft, mut fm) = (0usize, 0usize);
+        for v in fmap.values() {
+            ft += 1;
+            if !found(&cmap, IVec2::new(v.cell.x.div_euclid(2), v.cell.y.div_euclid(2))) {
+                fm += 1;
+            }
+        }
+        assert_eq!(fm, 0, "{fm}/{ft} fine boundary verts have no coarse cell → fine-side gap");
+        // COARSE→FINE coverage: a coarse boundary vert WITHIN this fine chunk's extent must reach a fine cell
+        // (the inverse divergence that left the coarse-side gaps). Coarse verts outside the fine extent belong
+        // to the adjacent fine chunk (the coarse face is 2× a fine face), so they're excluded.
+        let (mut fmin, mut fmax) = (IVec2::splat(i32::MAX), IVec2::splat(i32::MIN));
+        for v in fmap.values() {
+            fmin = fmin.min(v.cell);
+            fmax = fmax.max(v.cell);
+        }
+        let (mut ct, mut cm) = (0usize, 0usize);
+        for v in cmap.values() {
+            let f = v.cell * 2;
+            if f.x < fmin.x || f.x > fmax.x || f.y < fmin.y || f.y > fmax.y {
+                continue; // belongs to the adjacent fine chunk
+            }
+            ct += 1;
+            if !found(&fmap, f) {
+                cm += 1;
+            }
+        }
+        assert_eq!(cm, 0, "{cm}/{ct} coarse boundary verts have no fine cell → coarse-side gap");
     }
 
     #[test]
