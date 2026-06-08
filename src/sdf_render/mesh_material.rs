@@ -56,6 +56,12 @@ impl MaterialExtension for MeshTriplanarExt {
     fn fragment_shader() -> ShaderRef {
         "shaders/mesh_pbr.wgsl".into()
     }
+    // The fragment is FORWARD-only (no `PREPASS_PIPELINE` branch), so keep it out of the depth/normal prepass
+    // pipeline. These chunked meshes don't need to write the prepass yet (no SSAO/TAA dependency); shadows use
+    // the separate shadow pass and still work. Re-enable + add the prepass branch when a prepass effect needs it.
+    fn enable_prepass() -> bool {
+        false
+    }
 }
 
 /// Cache of one `MeshMaterial` handle per material id (its dominant-material handle), rebuilt when the
