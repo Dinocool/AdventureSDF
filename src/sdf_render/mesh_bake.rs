@@ -1058,14 +1058,19 @@ fn mesh_bake_panel(world: &mut World, ui: &mut bevy_egui::egui::Ui) {
     use bevy::pbr::wireframe::WireframeConfig;
     use crate::sdf_render::SdfRenderEnabled;
 
-    ui.label("Transvoxel chunk bake (async). Uncheck the SDF render to view the meshes.");
+    ui.label("Transvoxel chunk bake (async). Baked meshes are the renderer.");
     ui.separator();
 
-    // Toggle the SDF raymarch render off so the baked meshes are visible (its combine pass otherwise
-    // paints over them).
-    let mut sdf_on = world.resource::<SdfRenderEnabled>().0;
-    if ui.checkbox(&mut sdf_on, "SDF raymarch render").changed() {
-        world.resource_mut::<SdfRenderEnabled>().0 = sdf_on;
+    // The SDF raymarch render is gone (meshes render the scene now). This flag now only gates the GPU
+    // SDF-volume brick bake, kept off by default as a future volumetric-cloud foundation — enable it
+    // only when working on that (it has no on-screen output on its own and costs bake time).
+    let mut bake_on = world.resource::<SdfRenderEnabled>().0;
+    if ui
+        .checkbox(&mut bake_on, "GPU SDF volume bake (clouds; off)")
+        .on_hover_text("Runs the GPU brick bake into the SDF atlas — scaffolding for a future cloud raymarcher. No visible output yet.")
+        .changed()
+    {
+        world.resource_mut::<SdfRenderEnabled>().0 = bake_on;
     }
 
     // Wireframe overlay (black, so it reads over the light normal-coloured fill).
