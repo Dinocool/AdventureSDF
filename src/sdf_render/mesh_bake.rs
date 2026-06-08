@@ -155,20 +155,23 @@ struct MeshBakeConfig {
 
 impl Default for MeshBakeConfig {
     fn default() -> Self {
-        // K=4 → 64 bricks/chunk. lod0_radius small so the tiny test scene exercises LOD when the camera
-        // flies out; skirt_cells ~2 per godot_voxel guidance. All tunable via the panel.
-        Self { chunk_bricks: 4, lod0_radius: 6.0, lod_count: 4, skirt_cells: 2.0, debug_lod_colour: false }
+        // K=4 → 64 bricks/chunk. lod0_radius small so geometry just past it drops to coarser LODs;
+        // lod_count 9 spans LOD 0..=8 (the lod_test showcase scene); skirt_cells ~2. All tunable.
+        Self { chunk_bricks: 4, lod0_radius: 5.0, lod_count: 9, skirt_cells: 2.0, debug_lod_colour: false }
     }
 }
 
-/// Distinct unlit debug tint per LOD level (cycled) for the "Colour by LOD" view.
-const LOD_DEBUG_PALETTE: [[f32; 3]; 6] = [
-    [0.85, 0.2, 0.2],  // LOD0 red
-    [0.2, 0.8, 0.3],   // LOD1 green
-    [0.25, 0.45, 0.95],// LOD2 blue
-    [0.9, 0.8, 0.2],   // LOD3 yellow
-    [0.8, 0.3, 0.85],  // LOD4 magenta
-    [0.2, 0.8, 0.85],  // LOD5 cyan
+/// Distinct unlit debug tint per LOD level for the "Colour by LOD" view (LODs 0..=8).
+const LOD_DEBUG_PALETTE: [[f32; 3]; 9] = [
+    [0.85, 0.20, 0.20], // LOD0 red
+    [0.95, 0.55, 0.15], // LOD1 orange
+    [0.90, 0.85, 0.20], // LOD2 yellow
+    [0.30, 0.80, 0.25], // LOD3 green
+    [0.20, 0.80, 0.80], // LOD4 cyan
+    [0.25, 0.45, 0.95], // LOD5 blue
+    [0.55, 0.30, 0.90], // LOD6 violet
+    [0.90, 0.35, 0.85], // LOD7 magenta
+    [0.75, 0.75, 0.80], // LOD8 grey
 ];
 /// Skirt debug tint (bright white) so the crack-filling curtains stand out in the "Colour by LOD" view.
 const SKIRT_DEBUG_COLOUR: [f32; 4] = [1.0, 1.0, 1.0, 1.0];
@@ -276,12 +279,13 @@ fn lod0_half_chunks(config: &SdfGridConfig, mesh_cfg: &MeshBakeConfig, k: u32) -
     (h + 1) & !1 // next even, ≥ 2
 }
 
-/// Effective LOD count: `mesh_cfg.lod_count` clamped to the grid + palette, or 1 with no camera.
-fn effective_lod_count(config: &SdfGridConfig, mesh_cfg: &MeshBakeConfig, has_cam: bool) -> u32 {
+/// Effective LOD count: `mesh_cfg.lod_count` clamped to the debug palette (the mesh path's LODs are
+/// independent of the GPU atlas `lod_count` — `voxel_size_at(lod)` is just `·2^lod`), or 1 with no camera.
+fn effective_lod_count(_config: &SdfGridConfig, mesh_cfg: &MeshBakeConfig, has_cam: bool) -> u32 {
     if !has_cam {
         1
     } else {
-        mesh_cfg.lod_count.clamp(1, config.lod_count.max(1)).min(LOD_DEBUG_PALETTE.len() as u32)
+        mesh_cfg.lod_count.clamp(1, LOD_DEBUG_PALETTE.len() as u32)
     }
 }
 
@@ -712,13 +716,33 @@ fn mesh_resident_chunks(
 
     // RESIDENCY: per LOD, the chunks within reach of the CURRENT edits AND inside that LOD's 2:1 clipmap
     // shell (disjoint — each region meshed at exactly one LOD). NO dependency on the GPU SDF atlas.
+    let cw0 = k as f32 * config.brick_world_size(0);
     let mut resident: HashSet<BrickKey> = HashSet::new();
     {
         let mut cand: HashSet<BrickKey> = HashSet::new();
         for lod in 0..lod_count {
             cand.clear();
+            // Outer cube world bounds of this LOD's shell — clip the enumeration to it so a HUGE far
+            // object doesn't enumerate (and trip the 200k guard on) millions of fine-LOD chunks it can
+            // never be resident at. The precise hollow-shell test stays `mesh_chunk_in_shell`.
+            let shell_cube = cam.map(|c| {
+                let centre = lod_centre(&config, k, c, lod).as_vec3() * cw0;
+                let half = (half0 << lod) as f32 * cw0;
+                (centre - Vec3::splat(half), centre + Vec3::splat(half))
+            });
             for a in &edit_aabbs {
-                chunks_in_aabb(a, &config, k, lod, &mut cand);
+                let clipped = match shell_cube {
+                    Some((smin, smax)) => {
+                        let mn = Vec3::from(a.min).max(smin);
+                        let mx = Vec3::from(a.max).min(smax);
+                        if mn.cmpgt(mx).any() {
+                            continue; // edit doesn't reach this LOD's shell
+                        }
+                        Aabb3d::from_min_max(mn, mx)
+                    }
+                    None => *a,
+                };
+                chunks_in_aabb(&clipped, &config, k, lod, &mut cand);
             }
             for &key in &cand {
                 if mesh_chunk_in_shell(key, &config, k, cam, half0) {
@@ -1008,7 +1032,7 @@ fn mesh_bake_panel(world: &mut World, ui: &mut bevy_egui::egui::Ui) {
         world.resource_mut::<MeshBakeConfig>().lod0_radius = radius;
     }
     let mut lods = world.resource::<MeshBakeConfig>().lod_count;
-    if ui.add(bevy_egui::egui::Slider::new(&mut lods, 1..=6).text("LOD levels")).changed() {
+    if ui.add(bevy_egui::egui::Slider::new(&mut lods, 1..=9).text("LOD levels")).changed() {
         world.resource_mut::<MeshBakeConfig>().lod_count = lods;
     }
     let mut skirt = world.resource::<MeshBakeConfig>().skirt_cells;
