@@ -458,26 +458,29 @@ fn mesh_chunk(
 
 /// `MeshBuilder` that turns Transvoxel's per-edge vertices into our `ChunkMeshData`: chunk-LOCAL positions,
 /// EXACT analytic normals (from the CSG gradient, not Marching-Cubes' estimate), and the per-vertex
-/// multi-material blend data — the top-2 CSG material ids (in `uvs`) and a blend weight (in `colors.a`) that
-/// the shared mesh material biplanar-samples and cross-fades. In debug ("Colour by LOD") the per-LOD tint is
-/// written into `colors.rgb` instead and the shader renders it unlit.
+/// multi-material blend data. It first accumulates the indexed Transvoxel output (one entry per unique edge
+/// vertex: position, analytic normal, NEAREST material id), then `finish` UN-INDEXES it one triangle at a
+/// time so each triangle's three vertices carry the SAME `(mat_a, mat_b)` pair — material ids can't be
+/// interpolated (rounding an interpolated id passes through phantom intermediate materials → colour bands),
+/// so they must be constant across a triangle. The pair is `(matA = the surface material, matB = the nearby
+/// competing material)` — taken from the corners' nearest AND runner-up so a triangle sitting ENTIRELY on one
+/// surface still blends toward a nearby second surface (a WIDE feather, not just the one-triangle seam strip).
+/// Each corner's blend coordinate is a SIGNED gap `d(matB) − d(matA)` against that fixed pair (sign consistent
+/// across the triangle); the shader feathers it by `blend_softness`. Where matB is irrelevant (deep interior),
+/// the gap is huge ⇒ weight pins to pure A ⇒ matB is never sampled (no spurious blend, no phantom). In debug
+/// ("Colour by LOD") the per-LOD tint is written into `colors.rgb` and the shader renders it unlit.
 struct ChunkMeshBuilder<'a> {
     edits: &'a [edits::ResolvedEdit],
     indices: &'a [u32],
     origin: Vec3,
     eps: f32,
-    /// Blend band (world units): half-width over which two materials cross-fade at a CSG seam. A couple of
-    /// voxels feathers the seam without bleeding material across the surface.
-    band: f32,
     lod: u32,
     debug: bool,
     positions: Vec<[f32; 3]>,
     normals: Vec<[f32; 3]>,
-    /// Per-vertex `(mat_a, mat_b)` ids as floats (constant across a single-material triangle, so the shader
-    /// recovers exact ids by rounding).
-    uvs: Vec<[f32; 2]>,
-    /// `rgb` = debug per-LOD tint (debug only); `a` = blend weight (1 = pure A, 0.5 = even A/B split).
-    colors: Vec<[f32; 4]>,
+    /// Per unique vertex: `(nearest, runner-up)` CSG material ids (the top-2 argmin). The triangle pair folds
+    /// from the three corners' values; `runner-up == nearest` when only one material is present at the vertex.
+    vmat: Vec<(u16, u16)>,
     tris: Vec<u32>,
 }
 
@@ -495,13 +498,11 @@ impl<'a> ChunkMeshBuilder<'a> {
             indices,
             origin,
             eps: vs * 0.01,
-            band: vs * 2.0,
             lod,
             debug,
             positions: Vec::new(),
             normals: Vec::new(),
-            uvs: Vec::new(),
-            colors: Vec::new(),
+            vmat: Vec::new(),
             tris: Vec::new(),
         }
     }
@@ -510,13 +511,60 @@ impl<'a> ChunkMeshBuilder<'a> {
         if self.positions.is_empty() || self.tris.is_empty() {
             return None;
         }
-        Some(ChunkMeshData {
-            positions: self.positions,
-            normals: self.normals,
-            uvs: self.uvs,
-            colors: self.colors,
-            indices: self.tris,
-        })
+        let cap = self.tris.len();
+        let mut positions = Vec::with_capacity(cap);
+        let mut normals = Vec::with_capacity(cap);
+        let mut uvs = Vec::with_capacity(cap);
+        let mut colors = Vec::with_capacity(cap);
+        let mut indices = Vec::with_capacity(cap);
+        let tint = LOD_DEBUG_PALETTE[(self.lod as usize).min(LOD_DEBUG_PALETTE.len() - 1)];
+
+        for t in self.tris.chunks_exact(3) {
+            let v = [t[0] as usize, t[1] as usize, t[2] as usize];
+            // The triangle's fixed pair: matA = majority NEAREST (the surface), matB = majority RUNNER-UP (the
+            // nearby competitor). Majority (tie → min id) is a deterministic function of the corners, so
+            // edge-adjacent triangles agree on a shared edge. matB == matA ⇒ single material (no blend).
+            let near = [self.vmat[v[0]].0, self.vmat[v[1]].0, self.vmat[v[2]].0];
+            let runner = [self.vmat[v[0]].1, self.vmat[v[1]].1, self.vmat[v[2]].1];
+            let mat_a = majority(near);
+            let mat_b = majority(runner);
+            for &vi in &v {
+                let n = positions.len() as u32;
+                positions.push(self.positions[vi]);
+                normals.push(self.normals[vi]);
+                uvs.push([mat_a as f32, mat_b as f32]);
+                let col = if self.debug {
+                    [tint[0], tint[1], tint[2], 1.0]
+                } else {
+                    // SIGNED gap against the triangle's fixed pair: >0 ⇒ nearer mat_a, <0 ⇒ nearer mat_b. The
+                    // shader maps it through `blend_softness` to the A↔B cross-fade. Single-material triangle
+                    // (mat_a == mat_b) ⇒ gap 0 (the shader's pair-equal guard then keeps it pure A).
+                    let gap = if mat_a == mat_b {
+                        0.0
+                    } else {
+                        let world = Vec3::from(self.positions[vi]) + self.origin;
+                        edits::material_dist(self.edits, self.indices, world, mat_b)
+                            - edits::material_dist(self.edits, self.indices, world, mat_a)
+                    };
+                    [1.0, 1.0, 1.0, gap]
+                };
+                colors.push(col);
+                indices.push(n);
+            }
+        }
+        Some(ChunkMeshData { positions, normals, uvs, colors, indices })
+    }
+}
+
+/// Majority of three ids — the value present ≥2×, else (all distinct) the min id. Deterministic in the id
+/// SET (order-independent), so two triangles sharing an edge fold the same pair from their shared corners.
+fn majority(x: [u16; 3]) -> u16 {
+    if x[0] == x[1] || x[0] == x[2] {
+        x[0]
+    } else if x[1] == x[2] {
+        x[1]
+    } else {
+        x[0].min(x[1]).min(x[2])
     }
 }
 
@@ -534,20 +582,10 @@ impl MeshBuilder<f32, f32> for ChunkMeshBuilder<'_> {
         // Exact outward normal = ∇(CSG distance) (points toward increasing distance = outside the solid).
         let n = field_gradient(self.edits, self.indices, world, self.eps).normalize_or_zero();
         self.normals.push([n.x, n.y, n.z]);
-        // Per-vertex top-2 CSG materials + their signed-distance gap, for the shader's A/B cross-fade. `gap`
-        // is `d_b − d_a ≥ 0`; a small gap (a genuine CSG seam) feathers, a large gap pins to A.
-        let (mat_a, mat_b, gap) = edits::fold_csg_top2(self.edits, self.indices, world);
-        self.uvs.push([mat_a as f32, mat_b as f32]);
-        let weight = (0.5 + 0.5 * gap / self.band).clamp(0.5, 1.0);
-        // Vertex COLOUR: debug = per-LOD tint (rendered unlit); else rgb is unused (white) and `a` carries the
-        // blend weight — the shared mesh material is the single albedo source (table base × triplanar texture).
-        let col = if self.debug {
-            let tint = LOD_DEBUG_PALETTE[(self.lod as usize).min(LOD_DEBUG_PALETTE.len() - 1)];
-            [tint[0], tint[1], tint[2], 1.0]
-        } else {
-            [1.0, 1.0, 1.0, weight]
-        };
-        self.colors.push(col);
+        // (nearest, runner-up) materials at this vertex; `finish` folds the per-triangle pair from the three
+        // corners and computes each corner's signed gap against it.
+        let (near, runner, _) = edits::fold_csg_top2(self.edits, self.indices, world);
+        self.vmat.push((near, runner));
         VertexIndex(self.positions.len() - 1)
     }
 

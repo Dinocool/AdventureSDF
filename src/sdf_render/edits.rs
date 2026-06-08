@@ -820,6 +820,23 @@ pub fn fold_csg_top2(edits: &[ResolvedEdit], indices: &[u32], pos: Vec3) -> (u16
     }
 }
 
+/// Signed distance at `pos` to the NEAREST non-subtract edit carrying material `mat` (over the edits at
+/// `indices`), or [`f32::MAX`] if none. Mirrors how [`fold_csg_top2`] assigns materials (per-material argmin;
+/// subtract edits only carve, so they contribute no material). The baked-mesh mesher uses this to compute a
+/// per-vertex SIGNED blend coordinate against a triangle's fixed `(mat_a, mat_b)` pair, so the A↔B cross-fade
+/// is sign-consistent across the whole triangle (the per-vertex nearest material flips across a seam).
+pub fn material_dist(edits: &[ResolvedEdit], indices: &[u32], pos: Vec3, mat: u16) -> f32 {
+    let mut d = f32::MAX;
+    for &i in indices {
+        let e = &edits[i as usize];
+        if e.op.kind == CsgKind::Subtract || e.material_id != mat {
+            continue;
+        }
+        d = d.min(eval_world_inv(&e.prim, &e.inv_model, pos));
+    }
+    d
+}
+
 // --- GPU edit (flat, for the compute bake) ---
 
 /// Primitive tag in [`GpuEdit::tag`] — must match the `PRIM_*` consts in
@@ -1056,6 +1073,34 @@ mod tests {
         let (sa, sb, sg) = fold_csg_top2(&edits, &[0], Vec3::new(-0.6, 0.0, 0.0));
         assert_eq!((sa, sb), (1, 1));
         assert_eq!(sg, f32::MAX);
+    }
+
+    #[test]
+    fn material_dist_signed_gap_flips_across_seam() {
+        // Two unioned spheres (ids 1, 2). The signed gap `d(2) - d(1)` is the mesher's per-vertex blend
+        // coordinate against a fixed (1, 2) pair — it must be POSITIVE near sphere 1, NEGATIVE near sphere 2,
+        // and ~0 on the midline, regardless of which sphere a vertex's own nearest material happens to be.
+        let edits = vec![
+            ResolvedEdit::new(
+                SdfPrimitive::Sphere { radius: 1.0 },
+                Transform::from_xyz(-0.6, 0.0, 0.0),
+                SdfOp::default(),
+                1,
+            ),
+            ResolvedEdit::new(
+                SdfPrimitive::Sphere { radius: 1.0 },
+                Transform::from_xyz(0.6, 0.0, 0.0),
+                SdfOp { kind: CsgKind::Union, smoothing: 0.0 },
+                2,
+            ),
+        ];
+        let idx = [0u32, 1];
+        let gap = |p: Vec3| material_dist(&edits, &idx, p, 2) - material_dist(&edits, &idx, p, 1);
+        assert!(gap(Vec3::new(-0.6, 0.0, 0.0)) > 0.0, "nearer mat 1 ⇒ gap > 0");
+        assert!(gap(Vec3::new(0.6, 0.0, 0.0)) < 0.0, "nearer mat 2 ⇒ gap < 0");
+        assert!(gap(Vec3::ZERO).abs() < 1e-5, "midline ⇒ gap ~ 0");
+        // A material absent from the index set ⇒ MAX (no edit carries it).
+        assert_eq!(material_dist(&edits, &idx, Vec3::ZERO, 7), f32::MAX);
     }
 
     #[test]

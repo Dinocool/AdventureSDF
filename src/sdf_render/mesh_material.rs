@@ -371,7 +371,9 @@ fn registry_hash(reg: &MaterialRegistry, debug: bool, arrays_ready: bool) -> u64
     h.write_usize(reg.defs.len());
     for d in &reg.defs {
         let l = d.base_color.to_linear();
-        for v in [l.red, l.green, l.blue, d.metallic, d.roughness, d.texture_scale, d.emissive.x] {
+        for v in
+            [l.red, l.green, l.blue, d.metallic, d.roughness, d.texture_scale, d.blend_softness, d.emissive.x]
+        {
             h.write_i64((v as f64 * 1.0e4) as i64);
         }
         h.write_u32(d.tex_layers[0]);
@@ -449,5 +451,13 @@ pub(crate) fn rebuild_mesh_material(
             table: table_buf,
         },
     };
-    cache.handle = mats.add(material);
+    // MUTATE the existing asset in place behind a STABLE handle. Every chunk mesh clones `cache.handle` at
+    // commit; replacing it with a fresh `add()` would orphan all already-spawned meshes on the OLD asset, so
+    // material-property edits (colour, metallic, blend_softness, …) would never show. `get_mut` keeps the
+    // handle stable so the live edit reaches every chunk; only the first build allocates.
+    if let Some(existing) = mats.get_mut(&cache.handle) {
+        *existing = material;
+    } else {
+        cache.handle = mats.add(material);
+    }
 }
