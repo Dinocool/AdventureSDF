@@ -53,6 +53,34 @@ const MAX_NEW_TASKS_PER_FRAME: usize = 256;
 /// Hash-mix multiplier for folding the "Rebake all" epoch into a chunk's content hash.
 const EPOCH_MIX: u64 = 0x9E37_79B9_7F4A_7C15;
 
+/// The 6 chunk faces: `(bit, axis, is_high_face, the two in-face tangent axes)`. Bit order matches
+/// `chunk_face_flags` (−X,+X,−Y,+Y,−Z,+Z). Apron-aware boundary cell: −face = cell `1`, +face = `edge-2`
+/// (cell 0 / edge-1 are the apron). Shared by `append_skirts`, boundary-vertex extraction, and the seam pass.
+const FACES: [(u8, usize, bool, [usize; 2]); 6] = [
+    (0, 0, false, [1, 2]),
+    (1, 0, true, [1, 2]),
+    (2, 1, false, [0, 2]),
+    (3, 1, true, [0, 2]),
+    (4, 2, false, [0, 1]),
+    (5, 2, true, [0, 1]),
+];
+
+/// A meshed surface vertex on a chunk FACE, cached for the seam pass: reprojected WORLD position + analytic
+/// normal, shared verbatim by the seam so it welds with no T-junctions.
+#[derive(Clone, Copy)]
+struct BoundaryVert {
+    pos: Vec3,
+    normal: Vec3,
+}
+
+/// One ordered boundary component on a chunk face: its vertices in curve order (following the mesh's actual
+/// OPEN boundary edges, so the seam ribbon's edges pair exactly with the chunk's open edges → watertight),
+/// and whether the curve is a closed LOOP.
+struct BoundaryLoop {
+    verts: Vec<BoundaryVert>,
+    is_loop: bool,
+}
+
 /// Raw mesh data produced off-thread by a meshing task (turned into a `Mesh` asset on the main thread).
 struct ChunkMeshData {
     positions: Vec<[f32; 3]>,
@@ -61,6 +89,8 @@ struct ChunkMeshData {
     indices: Vec<u32>,
     /// Dominant material id (at the surface centroid) — selects the chunk's `StandardMaterial` PBR params.
     material: u16,
+    /// Ordered boundary loops on each of the 6 faces (indexed by face bit), for the cross-LOD seam pass.
+    boundary: [Vec<BoundaryLoop>; 6],
 }
 
 /// A completed bake for a chunk's round target, held until the coherent COMMIT (`None` = empty chunk).
@@ -115,6 +145,11 @@ struct MeshBakeScalars {
 #[derive(Component)]
 struct ChunkMesh(BrickKey);
 
+/// Marks a cross-LOD seam-strip mesh. The seam pass rebuilds ALL of them every commit (cheap, and a commit
+/// only happens on change), so they're reaped by query — no per-seam key needed.
+#[derive(Component)]
+struct SeamMesh;
+
 /// Per-chunk bake state.
 #[derive(Default)]
 struct ChunkState {
@@ -130,6 +165,9 @@ struct ChunkState {
     task: Option<Task<Option<ChunkMeshData>>>,
     /// Completed bake of `target_hash`, awaiting the round COMMIT.
     staged: Option<StagedBake>,
+    /// Per-face boundary loops of the DISPLAYED mesh, copied at COMMIT — read by the seam pass to stitch
+    /// this chunk to its differently-LOD'd neighbours.
+    boundary: [Vec<BoundaryLoop>; 6],
 }
 
 /// Per-resident-chunk bake state.
@@ -151,14 +189,24 @@ struct MeshBakeConfig {
     skirt_cells: f32,
     /// Debug: tint each chunk mesh by its LOD level (+ skirts a contrasting colour), rendered unlit.
     debug_lod_colour: bool,
+    /// Cross-LOD SEAM strips (stitch fine↔coarse boundaries crack-free). When on, skirts are suppressed
+    /// (the strip replaces them); when off, falls back to skirts. The structurally-correct crack fix.
+    seams_enabled: bool,
 }
 
 impl Default for MeshBakeConfig {
     fn default() -> Self {
         // K=4 → 64 bricks/chunk. lod0_radius 10 keeps the finest LOD out to a comfortable distance (push
         // it down to shrink the LOD-0 cube); lod_count 9 spans LOD 0..=8 (the lod_test showcase scene);
-        // skirt_cells 3 (≈1.5 coarse voxels) plugs the cross-LOD seams. All tunable in the panel.
-        Self { chunk_bricks: 4, lod0_radius: 10.0, lod_count: 9, skirt_cells: 3.0, debug_lod_colour: false }
+        // seams on (transition strips) — the real crack fix; skirts are the fallback when off.
+        Self {
+            chunk_bricks: 4,
+            lod0_radius: 10.0,
+            lod_count: 9,
+            skirt_cells: 3.0,
+            debug_lod_colour: false,
+            seams_enabled: true,
+        }
     }
 }
 
@@ -176,6 +224,9 @@ const LOD_DEBUG_PALETTE: [[f32; 3]; 9] = [
 ];
 /// Skirt debug tint (bright white) so the crack-filling curtains stand out in the "Colour by LOD" view.
 const SKIRT_DEBUG_COLOUR: [f32; 4] = [1.0, 1.0, 1.0, 1.0];
+
+/// Cross-LOD seam-strip debug tint (magenta) — distinct from skirts + the LOD palette in "Colour by LOD".
+const SEAM_DEBUG_COLOUR: [f32; 4] = [1.0, 0.0, 1.0, 1.0];
 
 /// Set by the editor panel's "Rebake all" button to force a full re-mesh.
 #[derive(Resource, Default)]
@@ -554,7 +605,218 @@ fn mesh_chunk(
     }
     centroid = grid_origin + (centroid / buffer.positions.len().max(1) as f32) * vs;
     let material = edits::fold_csg(edits, centroid).material_id;
-    Some(ChunkMeshData { positions, normals, colors, indices, material })
+    let boundary = extract_boundary(&buffer, &positions, &normals, grid_origin, edge);
+    Some(ChunkMeshData { positions, normals, colors, indices, material, boundary })
+}
+
+/// Bucket the surface vertices lying on each chunk FACE (apron-aware boundary cell) into per-face lists,
+/// `positions` are chunk-LOCAL, so `grid_origin` is added back for cached WORLD positions. Iterates the
+/// original Surface-Nets mesh (`buffer.indices`, before skirts): an edge in exactly ONE triangle is a mesh
+/// boundary edge; those whose endpoints both sit on a face's boundary cell, linked into ordered loops, are
+/// that face's seam input. Walking the actual open edges (not cell adjacency) guarantees the seam ribbon's
+/// edges coincide with the chunk's open edges, which is what makes the stitch watertight.
+fn extract_boundary(
+    buffer: &SurfaceNetsBuffer,
+    positions: &[[f32; 3]],
+    normals: &[[f32; 3]],
+    grid_origin: Vec3,
+    edge: u32,
+) -> [Vec<BoundaryLoop>; 6] {
+    // Open edges of the surface mesh (appear in exactly one triangle).
+    let mut ecount: HashMap<(u32, u32), u32> = HashMap::new();
+    for t in buffer.indices.chunks_exact(3) {
+        for (a, b) in [(t[0], t[1]), (t[1], t[2]), (t[2], t[0])] {
+            *ecount.entry(if a < b { (a, b) } else { (b, a) }).or_insert(0) += 1;
+        }
+    }
+    let open: Vec<(u32, u32)> = ecount.iter().filter(|(_, c)| **c == 1).map(|(e, _)| *e).collect();
+    let bv = |i: u32| BoundaryVert {
+        pos: grid_origin + Vec3::from(positions[i as usize]),
+        normal: Vec3::from(normals[i as usize]),
+    };
+
+    let mut out: [Vec<BoundaryLoop>; 6] = std::array::from_fn(|_| Vec::new());
+    for (bit, axis, is_high, _tan) in FACES {
+        // The crate meshes cells [0, edge-1): it INCLUDES the low apron (cell 0) but EXCLUDES the high one,
+        // so the mesh's open boundary sits at cell 0 on a low face and cell edge-2 on a high face.
+        let bcell = if is_high { edge - 2 } else { 0 };
+        let on_face = |i: u32| buffer.surface_points[i as usize][axis] == bcell;
+        // Adjacency among on-face boundary verts via the open edges that lie on this face.
+        let mut adj: HashMap<u32, Vec<u32>> = HashMap::new();
+        for &(a, b) in &open {
+            if on_face(a) && on_face(b) {
+                adj.entry(a).or_default().push(b);
+                adj.entry(b).or_default().push(a);
+            }
+        }
+        let nodes: Vec<u32> = adj.keys().copied().collect();
+        let mut visited: HashSet<u32> = HashSet::new();
+        let to_loop = |comp: Vec<u32>, is_loop: bool| BoundaryLoop {
+            verts: comp.into_iter().map(bv).collect(),
+            is_loop,
+        };
+        // Chains first (start at a degree-1 endpoint); any remaining cycles are closed loops.
+        for &s in &nodes {
+            if !visited.contains(&s) && adj[&s].len() == 1 {
+                out[bit as usize].push(to_loop(walk_open_edges(&adj, &mut visited, s), false));
+            }
+        }
+        for &s in &nodes {
+            if !visited.contains(&s) {
+                out[bit as usize].push(to_loop(walk_open_edges(&adj, &mut visited, s), true));
+            }
+        }
+    }
+    out
+}
+
+// ─────────────────────────── Cross-LOD seam stitching ───────────────────────────
+// A fine chunk's face that borders a coarser LOD leaves a crack: the fine boundary curve (dense) and the
+// coarse boundary curve (sparse) don't meet. We stitch them with a triangle RIBBON that reuses both chunks'
+// actual boundary vertices (no T-junctions). This is the dual-method seam (a 2:1 specialisation of the
+// Gildea seam octree — no octree needed since our grids are regular and exactly 2:1; see memory).
+
+/// Outward unit direction of face `bit` (FACES order: −X,+X,−Y,+Y,−Z,+Z).
+fn face_dir(bit: u8) -> IVec3 {
+    match bit {
+        0 => IVec3::NEG_X,
+        1 => IVec3::X,
+        2 => IVec3::NEG_Y,
+        3 => IVec3::Y,
+        4 => IVec3::NEG_Z,
+        _ => IVec3::Z,
+    }
+}
+
+/// The opposite face bit (−X↔+X, −Y↔+Y, −Z↔+Z): faces are axis-paired (0/1, 2/3, 4/5).
+#[inline]
+fn opposite_face(bit: u8) -> u8 {
+    bit ^ 1
+}
+
+/// Key of the LOD-(L+1) chunk on the far side of a fine chunk's `dir` face. `step = K·cell_stride`. The
+/// same-LOD neighbour min is `coord + dir·step` (LOD-L voxel units); halve to LOD-(L+1) units, then snap to
+/// the coarse chunk lattice.
+fn coarse_neighbour_key(fine: BrickKey, dir: IVec3, step: i32) -> BrickKey {
+    let n = fine.coord + dir * step;
+    let half = IVec3::new(n.x.div_euclid(2), n.y.div_euclid(2), n.z.div_euclid(2));
+    let snap = |c: i32| c.div_euclid(step) * step;
+    BrickKey::new(fine.lod + 1, IVec3::new(snap(half.x), snap(half.y), snap(half.z)))
+}
+
+/// Mean world position of a boundary loop.
+fn loop_centroid(l: &BoundaryLoop) -> Vec3 {
+    let sum: Vec3 = l.verts.iter().map(|v| v.pos).sum();
+    sum / l.verts.len().max(1) as f32
+}
+
+/// Walk one connected component of the open-edge adjacency graph from `start`, in curve order.
+fn walk_open_edges(adj: &HashMap<u32, Vec<u32>>, visited: &mut HashSet<u32>, start: u32) -> Vec<u32> {
+    let mut comp = Vec::new();
+    let (mut prev, mut cur) = (u32::MAX, start);
+    loop {
+        comp.push(cur);
+        visited.insert(cur);
+        match adj[&cur].iter().copied().find(|&x| x != prev && !visited.contains(&x)) {
+            Some(nx) => {
+                prev = cur;
+                cur = nx;
+            }
+            None => break,
+        }
+    }
+    comp
+}
+
+/// Stitch one fine boundary loop to its matching coarse loop with a shortest-diagonal triangle ribbon,
+/// emitting world-space verts (the chunks' ACTUAL boundary positions/normals → welds with no T-junctions).
+/// Loops are closed; chains are oriented start-to-start.
+#[allow(clippy::too_many_arguments)]
+fn zipper(
+    fl: &BoundaryLoop,
+    cl: &BoundaryLoop,
+    debug: bool,
+    positions: &mut Vec<[f32; 3]>,
+    normals: &mut Vec<[f32; 3]>,
+    colors: &mut Vec<[f32; 4]>,
+    indices: &mut Vec<u32>,
+) {
+    let mut fp: Vec<(Vec3, Vec3)> = fl.verts.iter().map(|v| (v.pos, v.normal)).collect();
+    let mut cp: Vec<(Vec3, Vec3)> = cl.verts.iter().map(|v| (v.pos, v.normal)).collect();
+    if fp.len() < 2 || cp.len() < 2 {
+        return;
+    }
+    let is_loop = fl.is_loop && cl.is_loop;
+    if is_loop {
+        // Align loop starts (rotate coarse so cp[0] ≈ fp[0]), match direction, then close both.
+        let f0 = fp[0].0;
+        let rot = (0..cp.len())
+            .min_by(|&a, &b| cp[a].0.distance_squared(f0).total_cmp(&cp[b].0.distance_squared(f0)))
+            .unwrap_or(0);
+        cp.rotate_left(rot);
+        if cp[1].0.distance_squared(fp[1].0) > cp[cp.len() - 1].0.distance_squared(fp[1].0) {
+            cp[1..].reverse();
+        }
+        fp.push(fp[0]);
+        cp.push(cp[0]);
+    } else if cp[0].0.distance_squared(fp[0].0) > cp[cp.len() - 1].0.distance_squared(fp[0].0) {
+        cp.reverse();
+    }
+    let col = if debug { SEAM_DEBUG_COLOUR } else { [1.0, 1.0, 1.0, 1.0] };
+    let mut emit = |a: (Vec3, Vec3), b: (Vec3, Vec3), c: (Vec3, Vec3)| {
+        let base = positions.len() as u32;
+        for (p, nrm) in [a, b, c] {
+            positions.push([p.x, p.y, p.z]);
+            normals.push([nrm.x, nrm.y, nrm.z]);
+            colors.push(col);
+        }
+        indices.extend_from_slice(&[base, base + 1, base + 2]);
+    };
+    let (mut i, mut j) = (0usize, 0usize);
+    while i + 1 < fp.len() || j + 1 < cp.len() {
+        // Advance whichever side keeps the new diagonal shortest (the classic ribbon triangulation).
+        let advance_fine = if i + 1 >= fp.len() {
+            false
+        } else if j + 1 >= cp.len() {
+            true
+        } else {
+            fp[i + 1].0.distance_squared(cp[j].0) <= fp[i].0.distance_squared(cp[j + 1].0)
+        };
+        if advance_fine {
+            emit(fp[i], cp[j], fp[i + 1]);
+            i += 1;
+        } else {
+            emit(fp[i], cp[j], cp[j + 1]);
+            j += 1;
+        }
+    }
+}
+
+/// Build the seam ribbon between a fine chunk's boundary loops and its coarser neighbour's boundary loops
+/// (already the matching opposite faces). Each fine loop is matched to the nearest coarse loop (by centroid)
+/// and zipped. Appends world-space geometry.
+fn build_seam_into(
+    fine: &[BoundaryLoop],
+    coarse: &[BoundaryLoop],
+    debug: bool,
+    positions: &mut Vec<[f32; 3]>,
+    normals: &mut Vec<[f32; 3]>,
+    colors: &mut Vec<[f32; 4]>,
+    indices: &mut Vec<u32>,
+) {
+    if fine.is_empty() || coarse.is_empty() {
+        return;
+    }
+    for fl in fine {
+        let fcen = loop_centroid(fl);
+        let cl = coarse
+            .iter()
+            .min_by(|a, b| {
+                loop_centroid(a).distance_squared(fcen).total_cmp(&loop_centroid(b).distance_squared(fcen))
+            })
+            .unwrap();
+        zipper(fl, cl, debug, positions, normals, colors, indices);
+    }
 }
 
 /// Append skirt curtains for the coarser-neighbour faces (`face_flags`). Variant A′: a boundary vertex's
@@ -578,21 +840,11 @@ fn append_skirts(
     indices: &mut Vec<u32>,
 ) {
     let lin = [1u32, edge, edge * edge]; // SDF/array linear strides (match the fill order + RuntimeShape)
-    let low = 1u32;
-    let high = edge - 2;
-    // (bit, face axis, boundary cell, the two in-face tangent axes)
-    let faces: [(u8, usize, u32, [usize; 2]); 6] = [
-        (0, 0, low, [1, 2]),
-        (1, 0, high, [1, 2]),
-        (2, 1, low, [0, 2]),
-        (3, 1, high, [0, 2]),
-        (4, 2, low, [0, 1]),
-        (5, 2, high, [0, 1]),
-    ];
-    for (bit, axis, bcell, tan) in faces {
+    for (bit, axis, is_high, tan) in FACES {
         if face_flags & (1 << bit) == 0 {
             continue;
         }
+        let bcell = if is_high { edge - 2 } else { 1 };
         for i in 0..buffer.positions.len() {
             if buffer.surface_points[i][axis] != bcell {
                 continue;
@@ -698,6 +950,7 @@ fn mesh_resident_chunks(
     // everything at LOD 0 — the original scene/camera-independent behaviour for gameplay scenes).
     cameras: Query<&GlobalTransform, (With<SdfCamera>, Without<SdfVolume>)>,
     chunk_meshes: Query<(Entity, &ChunkMesh)>,
+    seam_meshes: Query<(Entity, &SeamMesh)>,
     mut states: ResMut<ChunkStates>,
     mut rebuild: ResMut<MeshBakeRebuild>,
     mut stats: ResMut<MeshBakeStats>,
@@ -722,6 +975,9 @@ fn mesh_resident_chunks(
             for (e, _) in &chunk_meshes {
                 commands.entity(e).despawn();
             }
+            for (e, _) in &seam_meshes {
+                commands.entity(e).despawn();
+            }
             states.0.clear();
         }
         round.edits = None;
@@ -734,6 +990,9 @@ fn mesh_resident_chunks(
     // is stale. Despawn all + clear state + abort any round for a clean swap.
     if scal.prev_k != 0 && scal.prev_k != k {
         for (e, _) in &chunk_meshes {
+            commands.entity(e).despawn();
+        }
+        for (e, _) in &seam_meshes {
             commands.entity(e).despawn();
         }
         states.0.clear();
@@ -921,62 +1180,70 @@ fn mesh_resident_chunks(
             if let Some(old) = st.entity.take() {
                 commands.entity(old).despawn();
             }
-            st.entity = sb.data.map(|data| {
-                // Debug "Colour by LOD": one shared UNLIT white material (the LOD/skirt tint lives in the
-                // vertex COLOUR). Normal: a lit StandardMaterial per dominant material id (cached) — base
-                // WHITE so the per-vertex base COLOUR rules; metallic/roughness/emissive from the registry.
-                let mat = if mesh_cfg.debug_lod_colour {
-                    mat_cache
-                        .entry(u16::MAX)
-                        .or_insert_with(|| {
-                            materials.add(StandardMaterial {
-                                base_color: Color::WHITE,
-                                unlit: true,
-                                double_sided: true,
-                                cull_mode: None,
-                                ..default()
+            match sb.data {
+                // Empty chunk: no mesh, and clear any stale boundary cache.
+                None => st.boundary = std::array::from_fn(|_| Vec::new()),
+                Some(data) => {
+                    // Cache the boundary verts for the seam pass (partial move — distinct field from the rest).
+                    st.boundary = data.boundary;
+                    // Debug "Colour by LOD": one shared UNLIT white material (the LOD/skirt tint lives in the
+                    // vertex COLOUR). Normal: a lit StandardMaterial per dominant material id (cached) — base
+                    // WHITE so the per-vertex base COLOUR rules; metallic/roughness/emissive from the registry.
+                    let mat = if mesh_cfg.debug_lod_colour {
+                        mat_cache
+                            .entry(u16::MAX)
+                            .or_insert_with(|| {
+                                materials.add(StandardMaterial {
+                                    base_color: Color::WHITE,
+                                    unlit: true,
+                                    double_sided: true,
+                                    cull_mode: None,
+                                    ..default()
+                                })
                             })
-                        })
-                        .clone()
-                } else {
-                    mat_cache
-                        .entry(data.material)
-                        .or_insert_with(|| {
-                            let a = appearances
-                                .get(data.material as usize)
-                                .copied()
-                                .unwrap_or(DEFAULT_APPEARANCE);
-                            materials.add(StandardMaterial {
-                                base_color: Color::WHITE,
-                                metallic: a.metallic,
-                                perceptual_roughness: a.roughness.max(0.045),
-                                emissive: LinearRgba::rgb(a.emissive[0], a.emissive[1], a.emissive[2]),
-                                double_sided: true,
-                                cull_mode: None,
-                                ..default()
+                            .clone()
+                    } else {
+                        mat_cache
+                            .entry(data.material)
+                            .or_insert_with(|| {
+                                let a = appearances
+                                    .get(data.material as usize)
+                                    .copied()
+                                    .unwrap_or(DEFAULT_APPEARANCE);
+                                materials.add(StandardMaterial {
+                                    base_color: Color::WHITE,
+                                    metallic: a.metallic,
+                                    perceptual_roughness: a.roughness.max(0.045),
+                                    emissive: LinearRgba::rgb(a.emissive[0], a.emissive[1], a.emissive[2]),
+                                    double_sided: true,
+                                    cull_mode: None,
+                                    ..default()
+                                })
                             })
-                        })
-                        .clone()
-                };
-                let mesh = Mesh::new(PrimitiveTopology::TriangleList, RenderAssetUsages::default())
-                    .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, data.positions)
-                    .with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, data.normals)
-                    .with_inserted_attribute(Mesh::ATTRIBUTE_COLOR, data.colors)
-                    .with_inserted_indices(Indices::U32(data.indices));
-                // Apron offset: SN sample 0 is one voxel BEFORE the chunk min — MUST stay exactly
-                // `brick_min_world(coord,lod) - vs(lod)`, or the chunk shifts a voxel and every seam cracks.
-                let vs_l = config.voxel_size_at(key.lod);
-                let origin = config.brick_min_world(key.coord, key.lod) - Vec3::splat(vs_l);
-                commands
-                    .spawn((
-                        Mesh3d(mesh_assets.add(mesh)),
-                        MeshMaterial3d(mat),
-                        Transform::from_translation(origin),
-                        ChunkMesh(*key),
-                        Name::new("SDF Chunk Mesh"),
-                    ))
-                    .id()
-            });
+                            .clone()
+                    };
+                    let mesh = Mesh::new(PrimitiveTopology::TriangleList, RenderAssetUsages::default())
+                        .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, data.positions)
+                        .with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, data.normals)
+                        .with_inserted_attribute(Mesh::ATTRIBUTE_COLOR, data.colors)
+                        .with_inserted_indices(Indices::U32(data.indices));
+                    // Apron offset: SN sample 0 is one voxel BEFORE the chunk min — MUST stay exactly
+                    // `brick_min_world(coord,lod) - vs(lod)`, or the chunk shifts a voxel and every seam cracks.
+                    let vs_l = config.voxel_size_at(key.lod);
+                    let origin = config.brick_min_world(key.coord, key.lod) - Vec3::splat(vs_l);
+                    st.entity = Some(
+                        commands
+                            .spawn((
+                                Mesh3d(mesh_assets.add(mesh)),
+                                MeshMaterial3d(mat),
+                                Transform::from_translation(origin),
+                                ChunkMesh(*key),
+                                Name::new("SDF Chunk Mesh"),
+                            ))
+                            .id(),
+                    );
+                }
+            }
             st.displayed_hash = st.target_hash;
         }
         // Reap departed meshes (query-based — catches every non-resident `ChunkMesh` regardless of state).
@@ -988,6 +1255,74 @@ fn mesh_resident_chunks(
         }
         states.0.retain(|key, _| resident.contains(key));
         stats.reaped = reaped;
+
+        // SEAM PASS: stitch each fine chunk to its coarser neighbours with a transition strip, crack-free.
+        // Rebuild ALL seams every commit (a commit only happens on change; strips are O(boundary) — cheap),
+        // using the round's FROZEN camera so the boundary flags match the committed meshes. Always despawn the
+        // previous strips; rebuild only when seams are enabled (else skirts, baked into the chunk meshes).
+        for (e, _) in &seam_meshes {
+            commands.entity(e).despawn();
+        }
+        if mesh_cfg.seams_enabled {
+            let step = k as i32 * config.cell_stride();
+            // Seam material: unlit white in the debug LOD view (vertex tint rules), else a neutral lit white.
+            let seam_mat = mat_cache
+                .entry(if mesh_cfg.debug_lod_colour { u16::MAX } else { u16::MAX - 1 })
+                .or_insert_with(|| {
+                    materials.add(StandardMaterial {
+                        base_color: Color::WHITE,
+                        unlit: mesh_cfg.debug_lod_colour,
+                        perceptual_roughness: 0.8,
+                        double_sided: true,
+                        cull_mode: None,
+                        ..default()
+                    })
+                })
+                .clone();
+            for (&fkey, fst) in states.0.iter() {
+                let flags = chunk_face_flags(fkey, &config, k, round.cam, round.half0);
+                if flags == 0 {
+                    continue;
+                }
+                let (mut positions, mut normals, mut colors, mut indices) =
+                    (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+                for (bit, _axis, is_high, _tan) in FACES {
+                    // Only LOW faces gap at a cross-LOD boundary (the crate's apron asymmetry); HIGH faces
+                    // overlap instead (z-fight, no crack) so they need no strip. Skip non-coarser faces too.
+                    if is_high || flags & (1 << bit) == 0 {
+                        continue;
+                    }
+                    let ckey = coarse_neighbour_key(fkey, face_dir(bit), step);
+                    let Some(cst) = states.0.get(&ckey) else {
+                        continue; // coarse neighbour not resident (outer ring edge) → no strip there
+                    };
+                    build_seam_into(
+                        &fst.boundary[bit as usize],
+                        &cst.boundary[opposite_face(bit) as usize],
+                        mesh_cfg.debug_lod_colour,
+                        &mut positions,
+                        &mut normals,
+                        &mut colors,
+                        &mut indices,
+                    );
+                }
+                if indices.is_empty() {
+                    continue;
+                }
+                let mesh = Mesh::new(PrimitiveTopology::TriangleList, RenderAssetUsages::default())
+                    .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, positions)
+                    .with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, normals)
+                    .with_inserted_attribute(Mesh::ATTRIBUTE_COLOR, colors)
+                    .with_inserted_indices(Indices::U32(indices));
+                commands.spawn((
+                    Mesh3d(mesh_assets.add(mesh)),
+                    MeshMaterial3d(seam_mat.clone()),
+                    Transform::IDENTITY, // seam geometry is already in world space
+                    SeamMesh,
+                    Name::new("SDF Seam Mesh"),
+                ));
+            }
+        }
         // The round is finished — allow a new snapshot (below) to start the next one THIS frame.
         round.edits = None;
         round.aabbs.clear();
@@ -1053,7 +1388,9 @@ fn mesh_resident_chunks(
         let mut budget = MAX_NEW_TASKS_PER_FRAME;
         let mut idx: Vec<u32> = Vec::new();
         let debug = mesh_cfg.debug_lod_colour;
-        let skirt_cells = mesh_cfg.skirt_cells;
+        // Seams and skirts are mutually exclusive: when the seam pass is on it fills the cracks, so suppress
+        // skirts (skirt_len 0); otherwise skirts are the fallback.
+        let skirt_cells = if mesh_cfg.seams_enabled { 0.0 } else { mesh_cfg.skirt_cells };
         for &key in &resident {
             let st = states.0.entry(key).or_default();
             if st.task.is_some() || st.staged.is_some() {
@@ -1156,6 +1493,19 @@ fn mesh_bake_panel(world: &mut World, ui: &mut bevy_egui::egui::Ui) {
         .changed()
     {
         world.resource_mut::<MeshBakeConfig>().skirt_cells = skirt;
+    }
+    let mut seams = world.resource::<MeshBakeConfig>().seams_enabled;
+    if ui
+        .checkbox(&mut seams, "Cross-LOD seams")
+        .on_hover_text(
+            "Stitch fine↔coarse boundaries with a transition strip (crack-free). Off → skirts fallback. \
+             Toggle bumps a rebake.",
+        )
+        .changed()
+    {
+        world.resource_mut::<MeshBakeConfig>().seams_enabled = seams;
+        // Re-mesh so chunks pick up / drop their skirts (seams replace them); the seam pass also rebuilds.
+        world.resource_mut::<MeshBakeRebuild>().0 = true;
     }
     let mut dbg = world.resource::<MeshBakeConfig>().debug_lod_colour;
     if ui.checkbox(&mut dbg, "Colour by LOD (debug)").changed() {
@@ -1291,6 +1641,92 @@ mod tests {
             crate::sdf_render::SdfOp { kind: crate::sdf_render::CsgKind::Union, smoothing: 0.0 },
             0,
         )
+    }
+
+    /// World-space triangle triples of a baked chunk (positions are chunk-local → add `origin`).
+    fn chunk_tris(data: &ChunkMeshData, origin: Vec3) -> Vec<(Vec3, Vec3, Vec3)> {
+        data.indices
+            .chunks_exact(3)
+            .map(|t| {
+                let v = |i: u32| origin + Vec3::from(data.positions[i as usize]);
+                (v(t[0]), v(t[1]), v(t[2]))
+            })
+            .collect()
+    }
+
+    /// Count mesh edges NOT shared by exactly 2 triangles, after welding vertices by quantized WORLD
+    /// position (0.1 mm). 0 ⇒ closed 2-manifold = watertight. Position-welding lets it span SEPARATE meshes
+    /// (chunk meshes + the seam strip), so it is the seam pass's correctness gate.
+    fn open_edge_count(tris: &[(Vec3, Vec3, Vec3)]) -> usize {
+        let q = |p: Vec3| {
+            [
+                (p.x as f64 * 1e4).round() as i64,
+                (p.y as f64 * 1e4).round() as i64,
+                (p.z as f64 * 1e4).round() as i64,
+            ]
+        };
+        let mut edges: HashMap<([i64; 3], [i64; 3]), u32> = HashMap::new();
+        for (a, b, c) in tris {
+            for (u, v) in [(a, b), (b, c), (c, a)] {
+                let (mut ka, mut kb) = (q(*u), q(*v));
+                if ka > kb {
+                    std::mem::swap(&mut ka, &mut kb);
+                }
+                *edges.entry((ka, kb)).or_insert(0) += 1;
+            }
+        }
+        edges.values().filter(|&&n| n != 2).count()
+    }
+
+    #[test]
+    fn single_chunk_closed_surface_is_watertight() {
+        // Validates the watertightness checker + that the boundary-cache path doesn't disturb meshing: a
+        // sphere fully inside one chunk (touching no face) must mesh as a closed 2-manifold.
+        let edits = [sphere_edit(Vec3::ZERO, 1.0)];
+        let (vs, edge) = (0.1f32, 30u32); // chunk real span ≈ 2.8 > sphere Ø 2.0 → clears all faces
+        let origin = Vec3::splat(-1.5);
+        let data = mesh_chunk(&edits, &[0], &[], origin, vs, edge, 0, 0.0, 0, false)
+            .expect("sphere meshes");
+        assert_eq!(open_edge_count(&chunk_tris(&data, origin)), 0, "closed sphere must be watertight");
+    }
+
+    #[test]
+    fn seam_makes_2to1_boundary_watertight() {
+        // A sphere straddling a forced fine|coarse 2:1 boundary at x = 0: the FINE chunk (vs 0.1) meshes the
+        // +X side (its −X face borders coarse — the GAP orientation), the COARSE chunk (vs 0.2) meshes the −X
+        // side, each ending in a boundary circle with a one-fine-voxel gap between them. The seam strip
+        // bridges them. Fine + coarse + seam must be a closed 2-manifold (no open edges).
+        let edits = [sphere_edit(Vec3::ZERO, 1.0)];
+        let idx = [0u32];
+        let (vsf, vsc, edge) = (0.1f32, 0.2f32, 30u32);
+        // grid_origin = brick_min − vs. Fine real x∈[0,2.8] (Y,Z ±1.4) → −X boundary circle at x ≈ −0.1.
+        // Coarse real x∈[−5.6,0] (Y,Z ±2.8) → +X boundary circle at x ≈ −0.2. The sphere (Ø2) clears every
+        // other face.
+        let of = Vec3::new(-vsf, -1.4 - vsf, -1.4 - vsf);
+        let oc = Vec3::new(-5.6 - vsc, -2.8 - vsc, -2.8 - vsc);
+        let fine = mesh_chunk(&edits, &idx, &[], of, vsf, edge, 0, 0.0, 0, false).expect("fine meshes");
+        let coarse = mesh_chunk(&edits, &idx, &[], oc, vsc, edge, 0, 0.0, 1, false).expect("coarse meshes");
+
+        // Bare chunks ARE cracked (two open boundary circles) — proves the seam is what closes it.
+        let mut bare = chunk_tris(&fine, of);
+        bare.extend(chunk_tris(&coarse, oc));
+        assert!(open_edge_count(&bare) > 0, "bare 2-LOD sphere must be cracked without a seam");
+
+        // Seam: fine −X (bit 0) ↔ coarse +X (bit 1). Vertices are already world-space.
+        let (mut p, mut n, mut c, mut i) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        build_seam_into(&fine.boundary[0], &coarse.boundary[1], false, &mut p, &mut n, &mut c, &mut i);
+        assert!(!i.is_empty(), "seam produced no triangles");
+        let seam: Vec<_> = i
+            .chunks_exact(3)
+            .map(|t| {
+                let v = |k: u32| Vec3::from(p[k as usize]);
+                (v(t[0]), v(t[1]), v(t[2]))
+            })
+            .collect();
+
+        let mut all = bare;
+        all.extend(seam);
+        assert_eq!(open_edge_count(&all), 0, "fine + coarse + seam must be watertight");
     }
 
     #[test]
