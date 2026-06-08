@@ -507,10 +507,7 @@ impl<'a> ChunkMeshBuilder<'a> {
             indices,
             all: (0..edits.len() as u32).collect(),
             origin,
-            // Gradient-normal half-step. A wider sample (~10% of a cell, not 1%) gives a stable bisector
-            // at creases instead of collapsing to ~0 (degenerate → black triangle), at a negligible cost in
-            // sharpness at the voxel scale; `finish` still has a mean-normal fallback for any residual zeros.
-            eps: vs * 0.1,
+            eps: vs * 0.01,
             lod,
             debug,
             positions: Vec::new(),
@@ -545,29 +542,10 @@ impl<'a> ChunkMeshBuilder<'a> {
             let m0 = majority(near);
             let m1 = majority(runner);
             let (mat_a, mat_b) = (m0.min(m1), m0.max(m1));
-            // Fallback for a DEGENERATE analytic vertex normal: the CSG-gradient normal collapses to ~0 at a
-            // crease/saddle (central differences straddle the kink and cancel), and `normalize_or_zero` then
-            // yields a zero normal → a black triangle. Prefer the triangle's other VALID normals (their mean —
-            // smooth, matches neighbours) over the flat geometric face normal (which would read as a facet);
-            // fall back to the face normal only if every corner is degenerate.
-            let p = |i: usize| Vec3::from(self.positions[i]);
-            let an_sum = Vec3::from(self.normals[v[0]])
-                + Vec3::from(self.normals[v[1]])
-                + Vec3::from(self.normals[v[2]]);
-            let face = (p(v[1]) - p(v[0])).cross(p(v[2]) - p(v[0]));
-            let fallback = if an_sum.length_squared() > 1e-6 {
-                an_sum.normalize()
-            } else if face.length_squared() > 1e-20 {
-                face.normalize()
-            } else {
-                Vec3::Y
-            };
             for &vi in &v {
                 let n = positions.len() as u32;
                 positions.push(self.positions[vi]);
-                let an = Vec3::from(self.normals[vi]);
-                let nrm = if an.length_squared() < 0.25 { fallback } else { an };
-                normals.push([nrm.x, nrm.y, nrm.z]);
+                normals.push(self.normals[vi]);
                 uvs.push([mat_a as f32, mat_b as f32]);
                 let col = if self.debug {
                     [tint[0], tint[1], tint[2], 1.0]
@@ -1434,10 +1412,11 @@ mod tests {
         // genuine transition between. (The earlier raw-gap version compressed to a muddy ~50% everywhere on
         // these unit-scale objects — the "won't blend from full red to white" bug.)
         let (data, _) = merged_sphere_cube(2, 5, 0.3);
-        let band = 0.5f32;
+        // Mirror the shader's directional ramp with both softness = 0.25 (denom 0.5).
+        let (da, db) = (0.25f32, 0.25f32);
         let (mut pure_a, mut pure_b, mut mid) = (0u32, 0u32, 0u32);
         for c in &data.colors {
-            let w = (0.5 + 0.5 * c[3] / band).clamp(0.0, 1.0);
+            let w = ((c[3] + da) / (da + db)).clamp(0.0, 1.0);
             if w > 0.9 {
                 pure_a += 1;
             } else if w < 0.1 {
