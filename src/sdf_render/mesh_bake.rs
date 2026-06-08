@@ -418,6 +418,28 @@ fn mesh_chunk(
             }
         }
     }
+    // COARSE-LOD SHRINKAGE COMPENSATION (see sdf-lod-shrinkage): Surface Nets erodes high-curvature
+    // surfaces inward by ~h²·curvature, so coarse-LOD meshes shrink AND cross-LOD seams widen (the
+    // coarser neighbour insets from the fine one). Add back the discrete Laplacian term (clamped to a
+    // voxel) so the surface keeps its size: f' = f − (Σ₆ − 6f)/8. Convex (sphere) → moves the surface
+    // outward, exactly counteracting the erosion. Apply on interior samples (apron supplies neighbours).
+    {
+        let e = edge as usize;
+        let (sx, sy, sz) = (1usize, e, e * e);
+        let src = sdf.clone();
+        for z in 1..e - 1 {
+            for y in 1..e - 1 {
+                for x in 1..e - 1 {
+                    let i = x * sx + y * sy + z * sz;
+                    let lap = src[i - sx] + src[i + sx] + src[i - sy] + src[i + sy] + src[i - sz]
+                        + src[i + sz]
+                        - 6.0 * src[i];
+                    let delta = (-lap / 8.0).clamp(-vs, vs);
+                    sdf[i] = (src[i] + delta).clamp(-band, band);
+                }
+            }
+        }
+    }
     let shape = RuntimeShape::<u32, 3>::new([edge, edge, edge]);
     let mut buffer = SurfaceNetsBuffer::default();
     // TODO(perf): pool the sample buffer + SurfaceNetsBuffer per `edge` to avoid per-task allocation.
