@@ -106,7 +106,7 @@ impl Default for SdfOp {
     fn default() -> Self {
         Self {
             kind: CsgKind::Union,
-            smoothing: 0.0,
+            smoothing: 0.4,
         }
     }
 }

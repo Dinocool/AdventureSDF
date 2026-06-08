@@ -884,7 +884,7 @@ pub fn spawn_sdf_primitive(world: &mut World, prim: SdfPrimitive) -> Entity {
             prim,
             SdfOp {
                 kind: CsgKind::Union,
-                smoothing: 0.0,
+                smoothing: 0.4,
             },
             SdfOrder(next_order),
             source,
