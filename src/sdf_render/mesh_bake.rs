@@ -93,10 +93,15 @@ struct BakeRound {
     edits: Option<Arc<Vec<edits::ResolvedEdit>>>,
     aabbs: Vec<Aabb3d>,
     /// Frozen camera world position for this round (`None` = no camera, single-LOD fallback). Frozen with
-    /// the edits so the round's per-face skirt flags are self-consistent even if the camera moves mid-round.
+    /// the edits so the round's per-face transition flags are self-consistent even if the camera moves mid-round.
     cam: Option<Vec3>,
     /// Frozen LOD-0 cube half-extent in LOD-0 chunks (even, so shells tile cleanly).
     half0: i32,
+    /// Frozen RESIDENT chunk set for this round. The round bakes, commits, and reaps against THIS set — never
+    /// the live (current-camera) set — so the displayed geometry only ever swaps as a complete coherent round.
+    /// That makes a LOD swap atomic: the old meshes are held until every chunk of the new residency is baked,
+    /// then old-out/new-in happen in the same commit (no 1-frame hole). The live set seeds the NEXT snapshot.
+    resident: HashSet<BrickKey>,
 }
 
 /// Per-system scalar `Local` state, bundled (Bevy systems cap at 16 params).
@@ -831,26 +836,29 @@ fn mesh_resident_chunks(
         st.staged = Some(StagedBake { data: result });
     }
 
-    // Departed chunks won't be part of any commit — free pending work; their displayed entity is HELD
-    // (still on screen) until the next COMMIT reaps it, so old geometry clears as the new appears.
+    // Free pending work for chunks OUTSIDE the round's FROZEN residency (a chunk that left the round's set —
+    // e.g. the live camera moved on). Their displayed entity is HELD until the round COMMIT reaps it, so old
+    // geometry only clears as the new round appears.
     for (key, st) in states.0.iter_mut() {
-        if !resident.contains(key) {
+        if !round.resident.contains(key) {
             st.staged = None;
             st.task = None;
         }
     }
 
-    // 2. COMMIT the round when every resident chunk is settled — no chunk still baking, and each is
-    // either already displaying its target or holding a staged bake of it. Swap them ALL in one frame
-    // (and reap departed meshes the same frame) so the whole edit pops together.
-    let round_done = resident.iter().all(|key| match states.0.get(key) {
+    // 2. COMMIT the round when every chunk of its FROZEN residency is settled — none still baking, and each
+    // either already displays its target or holds a staged bake of it. Swap them ALL in one frame (and reap
+    // every mesh outside the frozen set the same frame) so a whole edit — or a whole LOD shift — pops together
+    // with no 1-frame hole. We commit against `round.resident`, NOT the live set, so the round only ever
+    // displays a coherent residency it actually finished baking.
+    let round_done = round.resident.iter().all(|key| match states.0.get(key) {
         Some(st) => st.task.is_none() && (st.displayed_hash == st.target_hash || st.staged.is_some()),
-        None => true, // not yet tracked → nothing to wait on (it joins the next round)
+        None => true, // not tracked yet → nothing to wait on (a frozen-set chunk always has a state)
     });
     let has_staged = states.0.values().any(|s| s.staged.is_some());
-    let has_departed = chunk_meshes.iter().any(|(_, cm)| !resident.contains(&cm.0));
+    let has_departed = chunk_meshes.iter().any(|(_, cm)| !round.resident.contains(&cm.0));
     stats.reaped = 0;
-    if round_done && (has_staged || has_departed) {
+    if round.edits.is_some() && round_done && (has_staged || has_departed) {
         let mut reaped = 0usize;
         // Build + spawn each committing chunk's staged mesh in one pass (Transvoxel welds neighbouring LODs by
         // construction, so there is no cross-chunk seam step). Debug "Colour by LOD": one shared UNLIT white
@@ -921,44 +929,17 @@ fn mesh_resident_chunks(
             );
         }
 
-        // Reap orphaned/departed meshes (query-based, so it catches every stray `ChunkMesh`). A departed chunk
-        // is HELD on screen until its region is RESOLVED by the resident set — i.e. a resident chunk whose AABB
-        // contains the departed chunk's CENTRE has finished baking (meshed OR meshed-empty). That way a LOD
-        // swap never flashes a 1-frame hole: the old mesh stays until its coarser parent / finer children are
-        // ready (they commit in the SAME frame they finish, so there is no visible overlap either). A chunk
-        // whose region has left the resident set entirely (overlaps no resident chunk) is reaped at once, and a
-        // stale duplicate (key still resident but not the current entity) is reaped immediately.
-        let resident_aabbs: Vec<Aabb3d> = resident.iter().map(|key| chunk_aabb(*key, &config, k)).collect();
-        let resolved: Vec<Aabb3d> = states
-            .0
-            .iter()
-            .filter(|(key, st)| {
-                resident.contains(*key) && st.task.is_none() && st.displayed_hash == st.target_hash
-            })
-            .map(|(key, _)| chunk_aabb(*key, &config, k))
-            .collect();
+        // Reap every mesh OUTSIDE the frozen round set (query-based, so it also catches orphans). The new set
+        // was fully spawned above, so this is the atomic old-out half of the swap — there is no hole because
+        // the new geometry is already on screen this same frame. A re-baked resident chunk's OLD entity was
+        // already despawned in the spawn loop (its key stays in the set), so it is not double-despawned here.
         for (e, cm) in &chunk_meshes {
-            let resident_key = resident.contains(&cm.0);
-            if resident_key && states.0.get(&cm.0).is_some_and(|st| st.entity == Some(e)) {
-                continue; // the live displayed mesh for a resident chunk
-            }
-            let reap = if resident_key {
-                true // stale duplicate of a resident chunk — its current mesh is a different entity
-            } else {
-                let a = chunk_aabb(cm.0, &config, k);
-                let centre = (Vec3::from(a.min) + Vec3::from(a.max)) * 0.5;
-                let covered = resolved
-                    .iter()
-                    .any(|d| centre.cmpge(Vec3::from(d.min)).all() && centre.cmple(Vec3::from(d.max)).all());
-                let overlaps_resident = resident_aabbs.iter().any(|r| aabb_overlap(r, &a));
-                covered || !overlaps_resident
-            };
-            if reap {
+            if !round.resident.contains(&cm.0) {
                 commands.entity(e).despawn();
                 reaped += 1;
             }
         }
-        states.0.retain(|key, _| resident.contains(key));
+        states.0.retain(|key, _| round.resident.contains(key));
         stats.reaped = reaped;
 
         // The round is finished — allow a new snapshot (below) to start the next one THIS frame.
@@ -977,8 +958,9 @@ fn mesh_resident_chunks(
         if stale {
             round.edits = Some(edits_arc.clone());
             round.aabbs = edit_aabbs.clone();
-            round.cam = cam; // freeze the camera so the round's skirt flags are self-consistent
+            round.cam = cam; // freeze the camera so the round's transition flags are self-consistent
             round.half0 = half0;
+            round.resident = resident.clone(); // FREEZE the residency — the round bakes/commits/reaps this set
             for &key in &resident {
                 states.0.entry(key).or_default().target_hash = current_hashes[&key];
             }
@@ -1026,7 +1008,8 @@ fn mesh_resident_chunks(
         let mut budget = MAX_NEW_TASKS_PER_FRAME;
         let mut idx: Vec<u32> = Vec::new();
         let debug = mesh_cfg.debug_lod_colour;
-        for &key in &resident {
+        // Bake the round's FROZEN residency (not the live set), so the bake, commit, and reap all agree.
+        for &key in &round.resident {
             let st = states.0.entry(key).or_default();
             if st.task.is_some() || st.staged.is_some() {
                 continue; // already baking / baked this round
