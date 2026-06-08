@@ -147,7 +147,7 @@ fn fragment(in: VertexOutput, @builtin(front_facing) is_front: bool) -> Fragment
     pbr_input.material.perceptual_roughness = max(s.roughness, 0.045);
     pbr_input.material.emissive = vec4<f32>(s.emissive, 1.0);
     pbr_input.N = s.normal;
-    pbr_input.occlusion = vec3<f32>(s.ao);
+    pbr_input.diffuse_occlusion = vec3<f32>(s.ao);
 
     var out: FragmentOutput;
     out.color = apply_pbr_lighting(pbr_input);
