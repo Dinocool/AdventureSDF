@@ -720,25 +720,6 @@ fn coarse_neighbour_key(fine: BrickKey, dir: IVec3, step: i32) -> BrickKey {
     BrickKey::new(fine.lod + 1, IVec3::new(snap(half.x), snap(half.y), snap(half.z)))
 }
 
-/// Normalized cumulative arc-length parameter (`0..=1`) of each vertex along a polyline. Used to zip two
-/// boundary curves PROPORTIONALLY (a dense fine curve advances ~2× per coarse step) instead of greedily by
-/// distance, which fans degenerate triangles when the curves are offset or differently sized.
-fn arc_params(pts: &[(Vec3, Vec3, [f32; 3])]) -> Vec<f32> {
-    let mut t = Vec::with_capacity(pts.len());
-    let mut acc = 0.0f32;
-    t.push(0.0);
-    for w in pts.windows(2) {
-        acc += w[0].0.distance(w[1].0);
-        t.push(acc);
-    }
-    if acc > 1e-6 {
-        for x in &mut t {
-            *x /= acc;
-        }
-    }
-    t
-}
-
 /// Squared distance between the two CLOSEST vertices of two boundary loops. Used to match a fine loop to its
 /// coarse counterpart: the same surface curve at two resolutions has near-touching boundaries (≈ a voxel
 /// apart), whereas unrelated curves (e.g. a floating sphere vs the terrain below) are far — so a threshold
@@ -771,10 +752,12 @@ fn walk_open_edges(adj: &HashMap<u32, Vec<u32>>, visited: &mut HashSet<u32>, sta
     comp
 }
 
-/// Stitch one fine boundary loop to its matching coarse loop with a shortest-diagonal triangle ribbon,
-/// emitting world-space verts (the chunks' ACTUAL boundary positions/normals → welds with no T-junctions).
-/// Loops are closed; chains are oriented start-to-start.
-#[allow(clippy::too_many_arguments)]
+/// Stitch one fine boundary curve to its matching coarse curve, emitting the chunks' ACTUAL boundary verts
+/// (welds with no T-junctions). Correspondence is the MONOTONE NEAREST coarse vertex — each fine vertex maps
+/// to the spatially-closest coarse vertex at-or-after the previous one. Spatial ⇒ no twist (unlike
+/// arc-length); coarse advances only as fine passes it ⇒ ≈2:1 triangles, never a global fan (the failure
+/// mode of shortest-diagonal / arc-length lacing). Every fine edge and every coarse edge is used once →
+/// watertight. Loops close on themselves; chains leave their ends open (met by the adjacent face's seam).
 fn zipper(
     fl: &BoundaryLoop,
     cl: &BoundaryLoop,
@@ -784,65 +767,83 @@ fn zipper(
     colors: &mut Vec<[f32; 4]>,
     indices: &mut Vec<u32>,
 ) {
-    let mut fp: Vec<(Vec3, Vec3, [f32; 3])> =
-        fl.verts.iter().map(|v| (v.pos, v.normal, v.base)).collect();
-    let mut cp: Vec<(Vec3, Vec3, [f32; 3])> =
-        cl.verts.iter().map(|v| (v.pos, v.normal, v.base)).collect();
-    if fp.len() < 2 || cp.len() < 2 {
+    let mut f: Vec<BoundaryVert> = fl.verts.clone();
+    let mut c: Vec<BoundaryVert> = cl.verts.clone();
+    if f.len() < 2 || c.len() < 2 {
         return;
     }
     let is_loop = fl.is_loop && cl.is_loop;
+    // Orient coarse to run the SAME direction along the shared curve as fine.
     if is_loop {
-        // Align loop starts (rotate coarse so cp[0] ≈ fp[0]), match direction, then close both.
-        let f0 = fp[0].0;
-        let rot = (0..cp.len())
-            .min_by(|&a, &b| cp[a].0.distance_squared(f0).total_cmp(&cp[b].0.distance_squared(f0)))
+        let f0 = f[0].pos;
+        let rot = (0..c.len())
+            .min_by(|&a, &b| f0.distance_squared(c[a].pos).total_cmp(&f0.distance_squared(c[b].pos)))
             .unwrap_or(0);
-        cp.rotate_left(rot);
-        if cp[1].0.distance_squared(fp[1].0) > cp[cp.len() - 1].0.distance_squared(fp[1].0) {
-            cp[1..].reverse();
+        c.rotate_left(rot);
+        if c.len() > 2 && f[1].pos.distance_squared(c[1].pos) > f[1].pos.distance_squared(c[c.len() - 1].pos)
+        {
+            c[1..].reverse();
         }
-        fp.push(fp[0]);
-        cp.push(cp[0]);
     } else {
-        // Chain: orient coarse to match fine by whichever direction brings BOTH endpoints closer (using one
-        // endpoint can twist the ribbon when the curves are offset).
-        let (fa, fb) = (fp[0].0, fp[fp.len() - 1].0);
-        let keep = fa.distance(cp[0].0) + fb.distance(cp[cp.len() - 1].0);
-        let flip = fa.distance(cp[cp.len() - 1].0) + fb.distance(cp[0].0);
+        let (fa, fb) = (f[0].pos, f[f.len() - 1].pos);
+        let keep = fa.distance(c[0].pos) + fb.distance(c[c.len() - 1].pos);
+        let flip = fa.distance(c[c.len() - 1].pos) + fb.distance(c[0].pos);
         if flip < keep {
-            cp.reverse();
+            c.reverse();
         }
     }
-    let mut emit = |a: (Vec3, Vec3, [f32; 3]), b: (Vec3, Vec3, [f32; 3]), c: (Vec3, Vec3, [f32; 3])| {
-        let idx0 = positions.len() as u32;
-        for (p, nrm, base) in [a, b, c] {
-            positions.push([p.x, p.y, p.z]);
-            normals.push([nrm.x, nrm.y, nrm.z]);
-            // Debug: magenta seam tint; normal: the surface's material base colour (per-vertex, blends
-            // fine↔coarse) — vertex colour rules the lit StandardMaterial's albedo, matching the chunks.
-            colors.push(if debug { SEAM_DEBUG_COLOUR } else { [base[0], base[1], base[2], 1.0] });
+    let nc = c.len();
+    if is_loop {
+        f.push(f[0]); // close the fine loop; coarse wraps via `% nc`
+    }
+    let nf = f.len();
+    let cv = |k: usize| c[k % nc];
+
+    // Monotone nearest-coarse index per fine vertex (scan a small forward window so it can't jump or backtrack).
+    let start = (0..nc)
+        .min_by(|&a, &b| f[0].pos.distance_squared(c[a].pos).total_cmp(&f[0].pos.distance_squared(c[b].pos)))
+        .unwrap();
+    let coarse_end = if is_loop { start + nc } else { nc - 1 };
+    let mut g = vec![start; nf];
+    for i in 1..nf {
+        let lo = g[i - 1];
+        let mut best = lo;
+        let mut bd = f[i].pos.distance_squared(cv(lo).pos);
+        for k in (lo + 1)..=(lo + 4).min(coarse_end) {
+            let d = f[i].pos.distance_squared(cv(k).pos);
+            if d < bd {
+                bd = d;
+                best = k;
+            }
         }
-        indices.extend_from_slice(&[idx0, idx0 + 1, idx0 + 2]);
+        g[i] = best;
+    }
+    if is_loop {
+        g[nf - 1] = coarse_end; // close the coarse loop fully
+    }
+
+    let col = |v: &BoundaryVert| {
+        if debug {
+            SEAM_DEBUG_COLOUR
+        } else {
+            [v.base[0], v.base[1], v.base[2], 1.0]
+        }
     };
-    // Walk both curves by normalized arc-length: always advance the side whose NEXT vertex has the smaller
-    // parameter, so dense and sparse curves progress in lockstep (≈2:1 even triangles, no fans).
-    let (tf, tc) = (arc_params(&fp), arc_params(&cp));
-    let (mut i, mut j) = (0usize, 0usize);
-    while i + 1 < fp.len() || j + 1 < cp.len() {
-        let advance_fine = if i + 1 >= fp.len() {
-            false
-        } else if j + 1 >= cp.len() {
-            true
-        } else {
-            tf[i + 1] <= tc[j + 1]
-        };
-        if advance_fine {
-            emit(fp[i], cp[j], fp[i + 1]);
-            i += 1;
-        } else {
-            emit(fp[i], cp[j], cp[j + 1]);
-            j += 1;
+    let mut emit = |a: BoundaryVert, b: BoundaryVert, d: BoundaryVert| {
+        let i0 = positions.len() as u32;
+        for v in [a, b, d] {
+            positions.push([v.pos.x, v.pos.y, v.pos.z]);
+            normals.push([v.normal.x, v.normal.y, v.normal.z]);
+            colors.push(col(&v));
+        }
+        indices.extend_from_slice(&[i0, i0 + 1, i0 + 2]);
+    };
+    let mut k = g[0];
+    for i in 0..nf - 1 {
+        emit(f[i], f[i + 1], cv(k)); // fine edge → its current coarse vertex
+        while k < g[i + 1] {
+            emit(f[i + 1], cv(k), cv(k + 1)); // each coarse edge fine passed → triangle to the fine vertex
+            k += 1;
         }
     }
 }
