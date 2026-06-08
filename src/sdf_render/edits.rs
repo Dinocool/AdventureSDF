@@ -52,6 +52,19 @@ pub enum SdfPrimitive {
         amp: f32,
         seed: u32,
     },
+    /// Procedural-worldgen terrain surface. Unlike [`Heightmap`](Self::Heightmap) (a self-contained
+    /// analytic-noise field whose params live ON the edit), `Terrain` samples the GLOBAL worldgen
+    /// height ring — the world-anchored toroidal clipmap the `LayerManager` streams (see
+    /// `worldgen::upload`). One world-spanning `Terrain` volume is spawned when worldgen is enabled;
+    /// the CPU `eval_primitive` samples the process-global `worldgen::upload::cpu_height_ring`
+    /// snapshot, which is exactly what the MESH bake folds (`fold_csg`) to mesh the terrain surface.
+    /// `half_xz` is the world half-extent the volume spans (≈ the clipmap reach); `[min_height,
+    /// max_height]` is the vertical AABB band the terrain occupies (drives the bake bounds).
+    Terrain {
+        half_xz: Vec2,
+        min_height: f32,
+        max_height: f32,
+    },
 }
 
 impl SdfPrimitive {
@@ -76,6 +89,10 @@ impl SdfPrimitive {
                 h.write_u8(5);
                 f(h, half_xz.x); f(h, half_xz.y); f(h, max_height); f(h, freq); f(h, amp);
                 h.write_u32(seed);
+            }
+            SdfPrimitive::Terrain { half_xz, min_height, max_height } => {
+                h.write_u8(6);
+                f(h, half_xz.x); f(h, half_xz.y); f(h, min_height); f(h, max_height);
             }
         }
     }
@@ -321,6 +338,37 @@ pub fn eval_primitive(prim: &SdfPrimitive, p: Vec3) -> f32 {
             let h = height_sample(Vec2::new(p.x, p.z), *freq, *amp, *seed) + *max_height * 0.5;
             p.y - h
         }
+        SdfPrimitive::Terrain {
+            min_height,
+            max_height,
+            ..
+        } => {
+            // Worldgen terrain surface (CPU side: picking + bake-scheduler classification + the MESH
+            // bake's `fold_csg`). Sample the GLOBAL height-ring snapshot the worldgen plugin publishes
+            // (`cpu_height_ring`) — the world-anchored toroidal clipmap the `LayerManager` streams. The
+            // signed VERTICAL gap `p.y - h` (one-sided, like Heightmap).
+            //
+            // The Terrain volume FOLLOWS the camera (its transform translates on chunk crossings — see
+            // `worldgen::roll_worldgen`), so this LOCAL `p` is NOT the world position. The height ring
+            // is world-anchored, so convert local XZ → WORLD XZ by adding the volume's current world-XZ
+            // offset (`cpu_terrain_offset`, kept in sync by the follow system) before sampling.
+            // ASSUMPTION: the volume is translation-only with `translation.y == 0`, so
+            // `local.xz + offset == world.xz` and `local.y == world.y`. A miss (no ring built yet /
+            // outside the resident clipmap) falls back to the flat mid-band plane so the field stays
+            // finite (valid AABB).
+            let offset = crate::sdf_render::worldgen::upload::cpu_terrain_offset();
+            let world_xz =
+                bevy::math::DVec2::new((p.x + offset.x) as f64, (p.z + offset.y) as f64);
+            match crate::sdf_render::worldgen::upload::cpu_height_ring() {
+                Some(ring) => {
+                    match crate::sdf_render::worldgen::upload::sample_ring(&ring, world_xz) {
+                        Some(node) => p.y - node.height,
+                        None => p.y - (min_height + max_height) * 0.5,
+                    }
+                }
+                None => p.y - (min_height + max_height) * 0.5,
+            }
+        }
     }
 }
 
@@ -407,6 +455,9 @@ pub fn primitive_local_aabb(prim: &SdfPrimitive) -> Aabb3d {
             max_height,
             ..
         } => Vec3::new(half_xz.x, *max_height, half_xz.y),
+        // Terrain's vertical extent is the explicit `[min_height, max_height]` band (handled by the
+        // special-case below); the XZ half-extent is its world reach. `he.y` is unused for Terrain.
+        SdfPrimitive::Terrain { half_xz, .. } => Vec3::new(half_xz.x, 0.0, half_xz.y),
     };
     // Heightmap spans y in [0, max_height]; everything else is centered. Encode
     // both by offsetting the heightmap so its min.y == 0.
@@ -414,6 +465,17 @@ pub fn primitive_local_aabb(prim: &SdfPrimitive) -> Aabb3d {
         SdfPrimitive::Heightmap { max_height, .. } => {
             let half = Vec3::new(he.x, *max_height * 0.5, he.z);
             let center = Vec3::new(0.0, *max_height * 0.5, 0.0);
+            Aabb3d::new(center, half)
+        }
+        // Terrain spans y ∈ [min_height, max_height] (an arbitrary world band, not anchored at 0):
+        // centre + half from the explicit band so the bake bounds the whole vertical extent.
+        SdfPrimitive::Terrain {
+            half_xz,
+            min_height,
+            max_height,
+        } => {
+            let half = Vec3::new(half_xz.x, (max_height - min_height) * 0.5, half_xz.y);
+            let center = Vec3::new(0.0, (min_height + max_height) * 0.5, 0.0);
             Aabb3d::new(center, half)
         }
         _ => Aabb3d::new(Vec3::ZERO, he),
@@ -525,6 +587,31 @@ impl SdfPrimitive {
                     ]
                 };
                 for yy in [0.0, h] {
+                    let cs = corners(yy);
+                    for i in 0..4 {
+                        let a = iso * cs[i];
+                        let b = iso * cs[(i + 1) % 4];
+                        gizmos.line(a, b, color);
+                    }
+                }
+            }
+            SdfPrimitive::Terrain {
+                half_xz,
+                min_height,
+                max_height,
+            } => {
+                // Bounding band footprint: a rectangle at min_height and one at max_height (the
+                // surface itself comes from the worldgen ring, not drawable as a static wire).
+                let (hx, hz) = (half_xz.x * scale.x, half_xz.y * scale.z);
+                let corners = |yy: f32| {
+                    [
+                        Vec3::new(-hx, yy, -hz),
+                        Vec3::new(hx, yy, -hz),
+                        Vec3::new(hx, yy, hz),
+                        Vec3::new(-hx, yy, hz),
+                    ]
+                };
+                for yy in [*min_height * scale.y, *max_height * scale.y] {
                     let cs = corners(yy);
                     for i in 0..4 {
                         let a = iso * cs[i];
@@ -847,6 +934,11 @@ pub const GPU_PRIM_TORUS: u32 = 2;
 pub const GPU_PRIM_CAPSULE: u32 = 3;
 pub const GPU_PRIM_CYLINDER: u32 = 4;
 pub const GPU_PRIM_HEIGHTMAP: u32 = 5;
+/// Worldgen terrain tag. The MESH renderer does NOT use the GPU brick-bake for terrain — the Terrain
+/// surface is meshed from the CPU `eval_primitive` (which samples the worldgen height ring). This tag
+/// only keeps the gated-off GPU brick-bake's `to_gpu_edit` match exhaustive; the GPU shader has no
+/// Terrain case (it falls through), which is fine because that bake is the gated-off cloud foundation.
+pub const GPU_PRIM_TERRAIN: u32 = 6;
 
 /// CSG op tag in [`GpuEdit::op_kind`] — must match `OP_*` in the bake shader.
 pub const GPU_OP_UNION: u32 = 0;
@@ -914,6 +1006,18 @@ pub fn to_gpu_edit(e: &ResolvedEdit) -> GpuEdit {
             GPU_PRIM_HEIGHTMAP,
             Vec4::new(half_xz.x, half_xz.y, *max_height, *freq),
             Vec4::new(*amp, f32::from_bits(*seed), 0.0, 0.0),
+        ),
+        SdfPrimitive::Terrain {
+            half_xz,
+            min_height,
+            max_height,
+        } => (
+            // DEFERRED GPU path: the mesh renderer meshes terrain from the CPU eval (no GPU ring).
+            // This arm only keeps the match exhaustive for the gated-off GPU brick-bake; carry the
+            // band/extent for reference (the GPU shader has no Terrain case and falls through).
+            GPU_PRIM_TERRAIN,
+            Vec4::new(half_xz.x, half_xz.y, *min_height, *max_height),
+            Vec4::ZERO,
         ),
     };
     let op_kind = match e.op.kind {
@@ -1223,4 +1327,119 @@ mod tests {
         assert_eq!(mk(CsgKind::Intersect).op_kind, GPU_OP_INTERSECT);
         assert_eq!(mk(CsgKind::Union).smoothing, 0.2);
     }
+
+    /// Terrain's local AABB spans the explicit `[min_height, max_height]` band (not anchored at 0,
+    /// unlike Heightmap) and the world-reach footprint — the bounds the bake uses for the
+    /// world-spanning terrain volume.
+    #[test]
+    fn terrain_local_aabb_spans_band() {
+        let prim = SdfPrimitive::Terrain {
+            half_xz: Vec2::new(500.0, 500.0),
+            min_height: -20.0,
+            max_height: 80.0,
+        };
+        let aabb = primitive_local_aabb(&prim);
+        assert!((aabb.min.y - (-20.0)).abs() < 1e-4, "min.y = {}", aabb.min.y);
+        assert!((aabb.max.y - 80.0).abs() < 1e-4, "max.y = {}", aabb.max.y);
+        assert!((aabb.max.x - 500.0).abs() < 1e-4);
+        assert!((aabb.min.x - (-500.0)).abs() < 1e-4);
+    }
+
+    /// Terrain `to_gpu_edit` packs the worldgen tag + the band/extent reference params (the gated-off
+    /// GPU brick-bake's exhaustive-match stub; the mesh renderer uses the CPU eval, not this).
+    #[test]
+    fn terrain_gpu_edit_tagged() {
+        let edit = ResolvedEdit::new(
+            SdfPrimitive::Terrain { half_xz: Vec2::new(512.0, 512.0), min_height: -10.0, max_height: 60.0 },
+            Transform::IDENTITY,
+            SdfOp::default(),
+            2,
+        );
+        let g = to_gpu_edit(&edit);
+        assert_eq!(g.tag, GPU_PRIM_TERRAIN);
+        assert_eq!(g.params, Vec4::new(512.0, 512.0, -10.0, 60.0));
+        assert_eq!(g.material_id, 2);
+    }
+
+    /// With no ring published, Terrain falls back to the flat mid-band plane (a finite field, valid
+    /// AABB band) — the worldgen-disabled / not-yet-built path.
+    #[test]
+    fn terrain_eval_flat_fallback_without_ring() {
+        crate::sdf_render::worldgen::upload::set_cpu_height_ring(None);
+        let prim = SdfPrimitive::Terrain { half_xz: Vec2::splat(100.0), min_height: 0.0, max_height: 40.0 };
+        // Mid-band is y = 20; a point at y = 25 is 5 above the fallback plane.
+        let d = eval_primitive(&prim, Vec3::new(3.0, 25.0, -7.0));
+        assert!((d - 5.0).abs() < 1e-4, "flat-fallback vertical gap = {d}");
+    }
+
+    /// The world-anchored CPU Terrain eval samples the ring at WORLD XZ (= local + the volume's
+    /// current world-XZ offset), so a translated volume picks up the correct world height — this is
+    /// exactly the surface the MESH bake folds. We build a ring with a known resident chunk, set an
+    /// offset that lands a LOCAL point inside it, and assert the eval samples the same height the ring
+    /// reports at that WORLD XZ.
+    #[test]
+    fn terrain_eval_samples_ring_at_world_xz_with_offset() {
+        use crate::sdf_render::worldgen::artifact::ScalarField2D;
+        use crate::sdf_render::worldgen::coord::{ChunkCoord, ChunkSize, LayerId};
+        use crate::sdf_render::worldgen::layers::height::{
+            HEIGHT_CHUNK_CELLS, HEIGHT_FIELD_RES, HeightLayer, HeightParams,
+        };
+        use crate::sdf_render::worldgen::store::ArtifactStore;
+        use crate::sdf_render::worldgen::upload::{
+            build_height_ring, cpu_terrain_offset, sample_ring, set_cpu_height_ring,
+            set_cpu_terrain_offset,
+        };
+        use std::sync::Arc;
+
+        // A resident chunk at (3, 2) — its world XZ is well away from the origin, so sampling there
+        // requires the offset (a local point near the origin must be shifted into the chunk).
+        let (cx, cz) = (3i32, 2i32);
+        let layer = HeightLayer::new(LayerId(0), HeightParams::default());
+        let size = ChunkSize::new(HEIGHT_CHUNK_CELLS);
+        let coord = ChunkCoord::new(LayerId(0), IVec3::new(cx, 0, cz));
+        let mut field = ScalarField2D::zeroed(coord, size, HEIGHT_FIELD_RES);
+        for j in 0..=HEIGHT_FIELD_RES {
+            for i in 0..=HEIGHT_FIELD_RES {
+                let wp = field.node_world_xz(i, j);
+                field.set(i, j, layer.sample_world(wp.x, wp.y, 999));
+            }
+        }
+        let mut store = ArtifactStore::new();
+        store.insert(coord, Arc::new(field));
+        let ring = build_height_ring(&store);
+        set_cpu_height_ring(Some(Arc::new(ring.clone())));
+
+        // Volume translated so a LOCAL XZ near the origin maps into chunk (3,2). The offset IS the
+        // volume's world-XZ translation; a local point `lp` then samples the ring at `lp + offset`.
+        let s = HEIGHT_CHUNK_CELLS as f32;
+        let offset = Vec2::new((cx as f32 + 0.4) * s, (cz as f32 + 0.6) * s);
+        set_cpu_terrain_offset(offset);
+        assert_eq!(cpu_terrain_offset(), offset);
+
+        let prim = SdfPrimitive::Terrain {
+            half_xz: Vec2::splat(WORLDGEN_TERRAIN_HALF_XZ_FOR_TEST),
+            min_height: -96.0,
+            max_height: 96.0,
+        };
+        // A local sample point; its WORLD XZ = local.xz + offset lands inside chunk (3,2).
+        let local = Vec3::new(5.0, 12.0, -3.0);
+        let world_xz =
+            bevy::math::DVec2::new((local.x + offset.x) as f64, (local.z + offset.y) as f64);
+        let expected_h = sample_ring(&ring, world_xz).expect("world XZ resolves to resident chunk").height;
+        let d = eval_primitive(&prim, local);
+        // The eval returns the signed vertical gap `local.y - height_at_world_xz`.
+        assert!(
+            (d - (local.y - expected_h)).abs() < 1e-4,
+            "world-anchored eval: got {d}, expected {} (h={expected_h})",
+            local.y - expected_h
+        );
+
+        // Reset globals so other tests aren't affected.
+        set_cpu_terrain_offset(Vec2::ZERO);
+        set_cpu_height_ring(None);
+    }
+
+    // Mirror of `worldgen::WORLDGEN_TERRAIN_HALF_XZ` (384) for the test prim's footprint; kept local
+    // to avoid a dependency cycle on the worldgen module's const from this test.
+    const WORLDGEN_TERRAIN_HALF_XZ_FOR_TEST: f32 = 384.0;
 }

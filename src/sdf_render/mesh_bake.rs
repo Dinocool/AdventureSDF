@@ -183,9 +183,12 @@ const LOD_DEBUG_PALETTE: [[f32; 3]; 9] = [
     [0.75, 0.75, 0.80], // LOD8 grey
 ];
 
-/// Set by the editor panel's "Rebake all" button to force a full re-mesh.
+/// Set by the editor panel's "Rebake all" button to force a full re-mesh. Also pulsed by
+/// `worldgen::roll_worldgen` when the height ring regenerates without the Terrain volume moving (a
+/// param edit / streaming delta in fixed mode): the Terrain content hash is unchanged by a ring swap,
+/// so the mesh-bake needs an explicit nudge to re-mesh the affected chunks.
 #[derive(Resource, Default)]
-struct MeshBakeRebuild(bool);
+pub(crate) struct MeshBakeRebuild(pub bool);
 
 /// Live diagnostics for the editor panel.
 #[derive(Resource, Default)]
