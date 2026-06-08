@@ -6,7 +6,7 @@
 
 use bevy::prelude::*;
 
-use super::{SdfCamera, SdfGridConfig, SdfOrbitCamera, SdfVolume};
+use super::{SdfCamera, SdfGridConfig, SdfVolume};
 use super::{bake_scheduler, chunk};
 
 /// Gizmo config group for editor overlays (transform handles, bounds). Uses
@@ -53,9 +53,15 @@ pub fn configure_overlay_gizmos(mut store: ResMut<GizmoConfigStore>) {
 
 /// Draw a Godot-style infinite ground grid on the XZ plane: faint minor lines
 /// every unit, brighter major lines every `MAJOR` units, and colored X (red) /
-/// Z (blue) axis lines through the origin. Centred on the camera target snapped to
-/// the grid so it reads as infinite as the view pans.
-pub fn draw_ground_grid(mut gizmos: Gizmos<SdfGridGizmos>, orbit: Res<SdfOrbitCamera>) {
+/// Z (blue) axis lines through the world origin. Centred on the camera EYE snapped to
+/// the grid so it reads as infinite as the view pans — including FPS/free-fly mode,
+/// where the orbit target is stale (mirrors `draw_lod_rings`, which also follows the
+/// camera eye). The axis lines stay at the world origin (keyed on the absolute grid
+/// index), so the origin axes remain meaningful while the grid extent follows the camera.
+pub fn draw_ground_grid(
+    mut gizmos: Gizmos<SdfGridGizmos>,
+    camera: Query<&Transform, (With<SdfCamera>, Without<SdfVolume>)>,
+) {
     const HALF: i32 = 50; // lines each side of centre
     const STEP: f32 = 1.0; // grid spacing in world units (Godot-style 1m cells)
     let step = STEP;
@@ -65,9 +71,10 @@ pub fn draw_ground_grid(mut gizmos: Gizmos<SdfGridGizmos>, orbit: Res<SdfOrbitCa
     let x_axis = Color::srgb(0.86, 0.24, 0.24);
     let z_axis = Color::srgb(0.26, 0.49, 0.92);
 
-    // Snap the grid centre to the target so lines stay put as the camera orbits.
-    let cx = (orbit.target.x / step).round() as i32;
-    let cz = (orbit.target.z / step).round() as i32;
+    // Snap the grid centre to the camera eye so lines stay put as the camera moves (orbit OR FPS).
+    let cam_pos = camera.iter().next().map(|t| t.translation).unwrap_or(Vec3::ZERO);
+    let cx = (cam_pos.x / step).round() as i32;
+    let cz = (cam_pos.z / step).round() as i32;
     let extent = HALF as f32 * step;
 
     for i in -HALF..=HALF {
