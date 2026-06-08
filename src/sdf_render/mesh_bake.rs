@@ -396,6 +396,61 @@ fn chunks_in_aabb(aabb: &Aabb3d, config: &SdfGridConfig, k: u32, lod: u32, out: 
     }
 }
 
+/// Sample the curvature-compensated SDF for one chunk: an `edge³` grid (linear `x + y·edge + z·edge²`) at
+/// world points `grid_origin + (x,y,z)·vs`.
+///
+/// COARSE-LOD SHRINKAGE COMPENSATION (see sdf-lod-shrinkage): Surface Nets erodes high-curvature surfaces
+/// inward by ~h²·curvature, so coarse-LOD meshes shrink (and the coarser side insets from the fine one,
+/// widening cross-LOD seams). Add back the discrete Laplacian term `f' = f − (Σ₆ − 6f)/8` (clamped to a
+/// voxel); a convex (sphere) surface moves outward, counteracting the erosion.
+///
+/// CRACK-FREE WELDING — the invariant this function guarantees: a chunk's 1-voxel apron samples are its
+/// NEIGHBOUR's real samples at the same world points, so the field MUST be a pure function of world
+/// position or the shared boundary splits (seams at every LOD + holes at coarse LODs). The compensation
+/// needs neighbours, so we sample the raw field on a grid extended by one extra ring (`raw`, edge+2) and
+/// compensate EVERY sample of the `edge³` grid — apron included — each now has all 6 neighbours present.
+/// Two chunks therefore agree exactly on the samples they share. (`compensated_field_welds` locks this.)
+fn sample_compensated_field(
+    edits: &[edits::ResolvedEdit],
+    indices: &[u32],
+    grid_origin: Vec3,
+    vs: f32,
+    edge: u32,
+) -> Vec<f32> {
+    let band = 4.0 * vs;
+    let e = edge as usize;
+    let ee = e + 2;
+    let mut raw = vec![0.0f32; ee * ee * ee];
+    let mut ri = 0usize;
+    for z in 0..ee {
+        for y in 0..ee {
+            for x in 0..ee {
+                // The extra ring sits one voxel BEFORE the edge grid (E-index j → edge-index j-1).
+                let off = Vec3::new(x as f32 - 1.0, y as f32 - 1.0, z as f32 - 1.0);
+                let p = grid_origin + off * vs;
+                // Sub-voxel iso-shift so no sample lands exactly on dist == 0 (Surface Nets treats 0 as
+                // "outside", dropping a cell — a pinhole at grid-aligned features).
+                raw[ri] = (edits::fold_csg_dist_indexed(edits, indices, p) - 1e-3).clamp(-band, band);
+                ri += 1;
+            }
+        }
+    }
+    let mut sdf = vec![0.0f32; e * e * e];
+    let (rx, ry, rz) = (1usize, ee, ee * ee);
+    for z in 0..e {
+        for y in 0..e {
+            for x in 0..e {
+                let j = (x + 1) * rx + (y + 1) * ry + (z + 1) * rz; // matching sample in the extended grid
+                let lap = raw[j - rx] + raw[j + rx] + raw[j - ry] + raw[j + ry] + raw[j - rz] + raw[j + rz]
+                    - 6.0 * raw[j];
+                let delta = (-lap / 8.0).clamp(-vs, vs);
+                sdf[x + y * e + z * e * e] = (raw[j] + delta).clamp(-band, band);
+            }
+        }
+    }
+    sdf
+}
+
 /// Sample + Surface-Nets one chunk (runs off-thread on the task pool). Returns `None` for an empty chunk
 /// (no surface crossing). `indices` are the edits (into the CSG-sorted list) that overlap this chunk —
 /// exactly the set the chunk's content hash was taken over, so geometry and hash always agree. `edge` is
@@ -417,44 +472,7 @@ fn mesh_chunk(
     // Debug: vertex COLOUR = per-LOD tint (+ skirts a contrasting tint) instead of material base colour.
     debug: bool,
 ) -> Option<ChunkMeshData> {
-    let band = 4.0 * vs;
-    let mut sdf = vec![0.0f32; (edge * edge * edge) as usize];
-    // Fill in the shape's linear order (i = x + y·edge + z·edge²) with x innermost, incrementing `i` —
-    // avoids a per-voxel `RuntimeShape::delinearize` (runtime strides can't strength-reduce the div/mod).
-    let mut i = 0usize;
-    for z in 0..edge {
-        for y in 0..edge {
-            for x in 0..edge {
-                let p = grid_origin + Vec3::new(x as f32, y as f32, z as f32) * vs;
-                // Sub-voxel iso-shift so no sample lands exactly on dist == 0 (Surface Nets treats 0 as
-                // "outside", dropping a cell — a pinhole at grid-aligned features).
-                sdf[i] = (edits::fold_csg_dist_indexed(edits, indices, p) - 1e-3).clamp(-band, band);
-                i += 1;
-            }
-        }
-    }
-    // COARSE-LOD SHRINKAGE COMPENSATION (see sdf-lod-shrinkage): Surface Nets erodes high-curvature
-    // surfaces inward by ~h²·curvature, so coarse-LOD meshes shrink AND cross-LOD seams widen (the
-    // coarser neighbour insets from the fine one). Add back the discrete Laplacian term (clamped to a
-    // voxel) so the surface keeps its size: f' = f − (Σ₆ − 6f)/8. Convex (sphere) → moves the surface
-    // outward, exactly counteracting the erosion. Apply on interior samples (apron supplies neighbours).
-    {
-        let e = edge as usize;
-        let (sx, sy, sz) = (1usize, e, e * e);
-        let src = sdf.clone();
-        for z in 1..e - 1 {
-            for y in 1..e - 1 {
-                for x in 1..e - 1 {
-                    let i = x * sx + y * sy + z * sz;
-                    let lap = src[i - sx] + src[i + sx] + src[i - sy] + src[i + sy] + src[i - sz]
-                        + src[i + sz]
-                        - 6.0 * src[i];
-                    let delta = (-lap / 8.0).clamp(-vs, vs);
-                    sdf[i] = (src[i] + delta).clamp(-band, band);
-                }
-            }
-        }
-    }
+    let sdf = sample_compensated_field(edits, indices, grid_origin, vs, edge);
     let shape = RuntimeShape::<u32, 3>::new([edge, edge, edge]);
     let mut buffer = SurfaceNetsBuffer::default();
     // TODO(perf): pool the sample buffer + SurfaceNetsBuffer per `edge` to avoid per-task allocation.
@@ -1224,6 +1242,43 @@ mod tests {
         let f = chunk_face_flags(chunk(&cfg, k, 0, half0 - 1), &cfg, k, cam, half0);
         assert_eq!(f & (1 << 1), 1 << 1, "+X face should border a coarser LOD");
         assert_eq!(f & (1 << 0), 0, "−X face should not (neighbour still inside cube(0))");
+    }
+
+    #[test]
+    fn compensated_field_welds() {
+        // The crack-free invariant: the compensated field is a pure function of WORLD position, so two
+        // chunks whose sample lattices overlap agree exactly on the shared samples (one chunk's apron is
+        // the other's interior). A regression guard for the bug where compensating only interior samples
+        // left the apron raw → seams at every LOD + holes at coarse LODs.
+        let edit = edits::ResolvedEdit::new(
+            crate::sdf_render::SdfPrimitive::Sphere { radius: 1.3 },
+            Transform::IDENTITY,
+            crate::sdf_render::SdfOp { kind: crate::sdf_render::CsgKind::Union, smoothing: 0.0 },
+            0,
+        );
+        let edits = [edit];
+        let idx = [0u32];
+        let (vs, edge, shift) = (0.1f32, 12u32, 4u32); // B shifted +shift voxels along X
+        let o_a = Vec3::splat(-0.6);
+        let o_b = o_a + Vec3::X * (shift as f32 * vs);
+        let fa = sample_compensated_field(&edits, &idx, o_a, vs, edge);
+        let fb = sample_compensated_field(&edits, &idx, o_b, vs, edge);
+        let at = |f: &[f32], x: u32, y: u32, z: u32| f[(x + y * edge + z * edge * edge) as usize];
+        // A-sample (x,y,z) and B-sample (x−shift,y,z) are the same world point → must agree (up to float
+        // rounding of the two origins' arithmetic — ~1e-7). The OLD bug (apron left raw) differed by a full
+        // compensation delta (~0.01·vs and up), so 1e-4 cleanly separates "welds" from "cracks". Spans A's
+        // high apron (x=edge−1 ↔ B interior) and B's low apron (x=shift ↔ A interior).
+        for z in 0..edge {
+            for y in 0..edge {
+                for x in shift..edge {
+                    let (a, b) = (at(&fa, x, y, z), at(&fb, x - shift, y, z));
+                    assert!(
+                        (a - b).abs() < 1e-4,
+                        "field not world-consistent at A({x},{y},{z}): {a} vs {b} → seam/hole"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
