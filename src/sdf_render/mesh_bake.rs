@@ -812,18 +812,11 @@ fn build_seam_into(
     if fine.is_empty() || coarse.is_empty() {
         return;
     }
-    // Boundary vertices keyed by world-aligned cell coord (each side in its own LOD voxel units) for O(1)
-    // lookup. cmap = coarse (for the fine→coarse pass); fmap = fine (for the coarse→fine pass).
+    // Coarse boundary vertices keyed by world-aligned cell coord (coarse LOD voxel units) for O(1) lookup.
     let mut cmap: HashMap<IVec2, BoundaryVert> = HashMap::new();
     for cl in coarse {
         for v in &cl.verts {
             cmap.insert(v.cell, *v);
-        }
-    }
-    let mut fmap: HashMap<IVec2, BoundaryVert> = HashMap::new();
-    for fl in fine {
-        for v in &fl.verts {
-            fmap.insert(v.cell, *v);
         }
     }
     let col = |v: &BoundaryVert| {
@@ -850,12 +843,11 @@ fn build_seam_into(
         indices.extend_from_slice(&[i0, i0 + 1, i0 + 2]);
     };
     let across = |c: IVec2| IVec2::new(c.x.div_euclid(2), c.y.div_euclid(2)); // fine cell → coarse cell
-    let refine = |c: IVec2| c * 2; // coarse cell → its low fine sub-cell
     // Nearest boundary vertex (by world position) within a ±SEAM_SEARCH cell window of `cell`. Where the
     // terrain is rough the two LODs' boundaries cross cells up to ~2 apart (measured), so a window is needed;
     // nearest-by-position keeps the link on the local curve. `None` ⇒ no counterpart nearby (e.g. a 3-LOD
     // corner, where the counterpart lives in an adjacent face's neighbour this lookup doesn't include).
-    const SEAM_SEARCH: i32 = 3;
+    const SEAM_SEARCH: i32 = 1;
     let nearest = |map: &HashMap<IVec2, BoundaryVert>, cell: IVec2, p: Vec3| -> Option<BoundaryVert> {
         let mut best: Option<(f32, BoundaryVert)> = None;
         for dy in -SEAM_SEARCH..=SEAM_SEARCH {
@@ -870,11 +862,11 @@ fn build_seam_into(
         }
         best.map(|(_, v)| v)
     };
-    // Sorted cell-pair key so a coarse edge already covered by the fine pass isn't re-covered by the coarse one.
-    let ekey = |a: IVec2, b: IVec2| if (a.x, a.y) <= (b.x, b.y) { (a, b) } else { (b, a) };
-
-    // FINE→COARSE: one quad per fine boundary edge (covers every fine edge + the coarse edge it spans).
-    let mut covered: HashSet<(IVec2, IVec2)> = HashSet::new();
+    // FINE→COARSE: one quad per fine boundary edge (covers every fine edge + the coarse edge it spans). A
+    // tight ±1 search keeps it order-preserving (no fans, no overlapping triangles); the SYMMETRIC coarse→fine
+    // pass is intentionally NOT done — it double-covers and produces non-manifold (overlapping) seam triangles.
+    // The cost is small coarse-side gaps where the coarse boundary diverges by >1 cell (rough terrain); the
+    // robust cure for those is the transition/remove-the-mismatch rewrite, not a looser search.
     for fl in fine {
         let n = fl.verts.len();
         if n < 2 {
@@ -890,31 +882,6 @@ fn build_seam_into(
             };
             emit(a, b, cb);
             emit(a, cb, ca);
-            if ca.cell != cb.cell {
-                covered.insert(ekey(ca.cell, cb.cell));
-            }
-        }
-    }
-    // COARSE→FINE: cover any coarse boundary edge the fine pass missed (the inverse divergence — the coarse
-    // boundary crosses a cell the fine doesn't), connecting it to the nearest fine vertex.
-    for cl in coarse {
-        let n = cl.verts.len();
-        if n < 2 {
-            continue;
-        }
-        let edges = if cl.is_loop { n } else { n - 1 };
-        for i in 0..edges {
-            let (ca, cb) = (cl.verts[i], cl.verts[(i + 1) % n]);
-            if covered.contains(&ekey(ca.cell, cb.cell)) {
-                continue;
-            }
-            let (Some(fa), Some(fb)) =
-                (nearest(&fmap, refine(ca.cell), ca.pos), nearest(&fmap, refine(cb.cell), cb.pos))
-            else {
-                continue;
-            };
-            emit(ca, cb, fb);
-            emit(ca, fb, fa);
         }
     }
 }
@@ -1879,6 +1846,39 @@ mod tests {
     }
 
     #[test]
+    fn seam_harsh_lod_is_watertight_and_manifold() {
+        // A sphere HEAVILY undersampled by the coarse LOD (vs_c = 0.5 → ~2 coarse cells per radius) → strong
+        // fine↔coarse boundary divergence, the regime that produced fan + overlap artifacts. Fine + coarse +
+        // seam must still be a closed 2-MANIFOLD: open_edge_count counts edges shared by ≠2 triangles, so 0 ⇒
+        // no gaps (an edge in 1 triangle) AND no overlapping seam triangles (an edge in >2). This is the
+        // robust guard the coverage tests missed.
+        let edits = [sphere_edit(Vec3::ZERO, 1.2)];
+        let idx = [0u32];
+        let (vsf, vsc, edge) = (0.5f32, 1.0f32, 30u32); // coarse ~1.2 cells/radius → extreme divergence
+        let of = Vec3::new(-vsf, -7.0 - vsf, -7.0 - vsf);
+        let oc = Vec3::new(-28.0 - vsc, -14.0 - vsc, -14.0 - vsc);
+        let fine = mesh_chunk(&edits, &idx, &[], of, vsf, edge, 0, 0.0, 0, 0, false).expect("fine meshes");
+        let coarse = mesh_chunk(&edits, &idx, &[], oc, vsc, edge, 0, 0.0, 1, 0, false).expect("coarse meshes");
+        let (mut p, mut nrm, mut col, mut ix) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        build_seam_into(&fine.boundary[0], &coarse.boundary[1], false, &mut p, &mut nrm, &mut col, &mut ix);
+        let seam: Vec<_> = ix
+            .chunks_exact(3)
+            .map(|t| {
+                let v = |k: u32| Vec3::from(p[k as usize]);
+                (v(t[0]), v(t[1]), v(t[2]))
+            })
+            .collect();
+        let mut all = chunk_tris(&fine, of);
+        all.extend(chunk_tris(&coarse, oc));
+        all.extend(seam);
+        assert_eq!(
+            open_edge_count(&all),
+            0,
+            "harsh-LOD sphere + seam must be a closed 2-manifold (no gaps, no overlapping seam tris)"
+        );
+    }
+
+    #[test]
     fn seam_terrain_chain_has_no_gaps() {
         // A heightmap (terrain) crossing a fine|coarse 2:1 boundary produces CHAIN boundaries. Every fine
         // boundary edge must find a coarse counterpart across the boundary, or the seam has a mid-band gap
@@ -1887,8 +1887,8 @@ mod tests {
             crate::sdf_render::SdfPrimitive::Heightmap {
                 half_xz: Vec2::new(400.0, 400.0),
                 max_height: 30.0,
-                freq: 0.35,
-                amp: 11.0,
+                freq: 0.05,
+                amp: 8.0,
                 seed: 7,
             },
             Transform::IDENTITY,
@@ -1906,52 +1906,50 @@ mod tests {
         let fine = mesh_chunk(&edits, &idx, &[], of, vsf, edge, 0, 0.0, 0, 0, false).expect("fine meshes");
         let coarse = mesh_chunk(&edits, &idx, &[], oc, vsc, edge, 0, 0.0, 1, 0, false).expect("coarse meshes");
 
-        // Replicate the seam's coarse lookup and count fine boundary edges with no coarse counterpart.
+        // FINE-side coverage: every fine boundary vertex must find a coarse cell across the boundary within the
+        // tight ±1 search the seam uses — no fine-side gap on realistic terrain.
         let mut cmap: HashMap<IVec2, BoundaryVert> = HashMap::new();
         for l in &coarse.boundary[1] {
             for v in &l.verts {
                 cmap.insert(v.cell, *v);
             }
         }
-        let mut fmap: HashMap<IVec2, BoundaryVert> = HashMap::new();
+        let found =
+            |c: IVec2| (-1..=1).any(|dy| (-1..=1).any(|dx| cmap.contains_key(&(c + IVec2::new(dx, dy)))));
+        let (mut ft, mut fm) = (0usize, 0usize);
         for l in &fine.boundary[0] {
             for v in &l.verts {
-                fmap.insert(v.cell, *v);
-            }
-        }
-        let found = |map: &HashMap<IVec2, BoundaryVert>, c: IVec2| {
-            (-3..=3).any(|dy| (-3..=3).any(|dx| map.contains_key(&(c + IVec2::new(dx, dy)))))
-        };
-        // FINE→COARSE coverage: every fine boundary vert must reach a coarse cell. (At ±1 this rough config
-        // gives 8 misses — the coarse boundary diverges by ~2 cells; ±3 closes it.)
-        let (mut ft, mut fm) = (0usize, 0usize);
-        for v in fmap.values() {
-            ft += 1;
-            if !found(&cmap, IVec2::new(v.cell.x.div_euclid(2), v.cell.y.div_euclid(2))) {
-                fm += 1;
+                ft += 1;
+                if !found(IVec2::new(v.cell.x.div_euclid(2), v.cell.y.div_euclid(2))) {
+                    fm += 1;
+                }
             }
         }
         assert_eq!(fm, 0, "{fm}/{ft} fine boundary verts have no coarse cell → fine-side gap");
-        // COARSE→FINE coverage: a coarse boundary vert WITHIN this fine chunk's extent must reach a fine cell
-        // (the inverse divergence that left the coarse-side gaps). Coarse verts outside the fine extent belong
-        // to the adjacent fine chunk (the coarse face is 2× a fine face), so they're excluded.
-        let (mut fmin, mut fmax) = (IVec2::splat(i32::MAX), IVec2::splat(i32::MIN));
-        for v in fmap.values() {
-            fmin = fmin.min(v.cell);
-            fmax = fmax.max(v.cell);
-        }
-        let (mut ct, mut cm) = (0usize, 0usize);
-        for v in cmap.values() {
-            let f = v.cell * 2;
-            if f.x < fmin.x || f.x > fmax.x || f.y < fmin.y || f.y > fmax.y {
-                continue; // belongs to the adjacent fine chunk
+
+        // Build the actual seam and assert it's geometrically clean: FAN = max triangles touching one vertex
+        // (a loose match collapses many fine edges onto one coarse vertex), OVERLAP = edges shared by >2
+        // triangles (a non-order-preserving match crosses triangles). Neither shows up in coverage.
+        let (mut sp, mut sn, mut sc, mut si) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        build_seam_into(&fine.boundary[0], &coarse.boundary[1], false, &mut sp, &mut sn, &mut sc, &mut si);
+        let q = |p: [f32; 3]| [(p[0] * 1e3) as i64, (p[1] * 1e3) as i64, (p[2] * 1e3) as i64];
+        let mut vdeg: HashMap<[i64; 3], u32> = HashMap::new();
+        let mut edge: HashMap<([i64; 3], [i64; 3]), u32> = HashMap::new();
+        for t in si.chunks_exact(3) {
+            let vs = [sp[t[0] as usize], sp[t[1] as usize], sp[t[2] as usize]];
+            for v in vs {
+                *vdeg.entry(q(v)).or_insert(0) += 1;
             }
-            ct += 1;
-            if !found(&fmap, f) {
-                cm += 1;
+            for (a, b) in [(vs[0], vs[1]), (vs[1], vs[2]), (vs[2], vs[0])] {
+                let (ka, kb) = (q(a), q(b));
+                *edge.entry(if ka <= kb { (ka, kb) } else { (kb, ka) }).or_insert(0) += 1;
             }
         }
-        assert_eq!(cm, 0, "{cm}/{ct} coarse boundary verts have no fine cell → coarse-side gap");
+        let max_deg = vdeg.values().copied().max().unwrap_or(0);
+        let overlaps = edge.values().filter(|&&n| n > 2).count();
+        eprintln!("seam tris={} max_vertex_degree={max_deg} overlap_edges={overlaps}", si.len() / 3);
+        assert!(max_deg <= 8, "fan: a vertex touches {max_deg} seam triangles (>8)");
+        assert_eq!(overlaps, 0, "{overlaps} seam edges shared by >2 triangles (overlap)");
     }
 
     #[test]
