@@ -133,10 +133,14 @@ fn fragment(in: VertexOutput, @builtin(front_facing) is_front: bool) -> Fragment
     // Material-seam cross-fade (ported from the retired raymarch `resolve_surface`): COLOUR.a carries the
     // per-vertex SIGNED gap `d(mat_b) - d(mat_a)` against this triangle's fixed pair (a geometry quantity —
     // so `blend_softness` stays a LIVE control, no re-bake). The seam is where the pair is equidistant
-    // (gap == 0). Feather half-width = the larger of `fwidth(gap)` (≥1px, anti-aliased) and the pair's
-    // `blend_softness` (world units, artist control). `fwidth` is safe here — `fragment` is uniform flow.
+    // (gap == 0); gap > 0 is A's side, gap < 0 is B's.
+    //
+    // `blend_softness` is DIRECTIONAL: a material's softness is how far IT spreads into the OTHER's region. So
+    // on B's side (gap < 0) the band is A's softness (A bleeding into B); on A's side (gap > 0) it's B's. If
+    // one side's softness is 0 that material doesn't bleed in (hard cut, modulo a 1px `fwidth` AA floor); if
+    // both are set their magnitudes set the split. `fwidth` is safe — `fragment` is uniform control flow.
     let gap = in.color.a;
-    let soft = max(material_at(mat_a).blend_softness, material_at(mat_b).blend_softness);
+    let soft = select(material_at(mat_b).blend_softness, material_at(mat_a).blend_softness, gap < 0.0);
     let band = max(max(fwidth(gap), soft), 1e-5);
     let weight = clamp(0.5 + 0.5 * gap / band, 0.0, 1.0); // 1 = pure A, 0 = pure B, 0.5 = seam
 
