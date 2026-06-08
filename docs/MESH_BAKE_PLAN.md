@@ -147,8 +147,19 @@ Until then: one dominant material per chunk, no blend, textured materials render
   uncheck "SDF raymarch render".
 - ✅ Phase 2 — off-the-shelf PBR: per-vertex base colour + lit per-material StandardMaterial
   (metallic/roughness/emissive). Triplanar TEXTURE detail needs the custom render path (render-world
-  texture arrays) → folded into Phase 4 when meshes are primary + verifiable live. ☐ Phase 3 — cross-LOD
-  rings + skirts. ☐ Phase 4 — make meshes primary, retire raymarch/DDGI, adopt Solari (+ triplanar textures).
+  texture arrays) → folded into Phase 4 when meshes are primary + verifiable live.
+- ✅ Phase 3 (2026-06-08, code complete; skirt visuals pending live tuning) — camera-driven 2:1 clipmap:
+  per-LOD disjoint shells ∩ geometry (round-to-nearest per-LOD centres so the camera stays in the fine
+  cube; even `half0` + per-LOD chunk-aligned boundaries → clean partition, no z-fight/gap). `BrickKey{lod}`
+  generalised; lod + per-face coarser-neighbour flags folded into the content hash (camera move re-bakes
+  only boundary chunks); shell frozen per round. **Skirts** (Variant A′): boundary verts via
+  `SurfaceNetsBuffer::surface_points`, tangent neighbours via `stride_to_index`, extruded `−normal·skirt_len`
+  into the solid on coarser-neighbour faces; materials double-sided. **Debug "Colour by LOD"** panel toggle
+  (per-LOD tint + white skirts, unlit) + `lod0_radius`/`LOD levels`/`Skirt cells` sliders + per-LOD counts.
+  Pure shell/flag fns unit-tested (2:1 nesting, disjoint shells, hysteresis, face flags, no-camera). Verify
+  live on `mesh_test` (small `lod0_radius`, fly camera) + `stress.scene` (3-LOD T-junctions); tune skirt
+  length/boundary-cell via the debug view if seams leak (then upgrade leaky corners to Variant B).
+- ☐ Phase 4 — make meshes primary, retire raymarch/DDGI, adopt Solari (+ triplanar textures + multi-material blend).
 
 **Latent `main` bugs fixed here (port to main):** probe-trace `ChunkLookup` 24-vs-32 hand-pack crash;
 `SdfRenderEnabled` not `ExtractResource` (F1 no-op).
