@@ -843,6 +843,23 @@ fn build_seam_into(
         indices.extend_from_slice(&[i0, i0 + 1, i0 + 2]);
     };
     let across = |c: IVec2| IVec2::new(c.x.div_euclid(2), c.y.div_euclid(2));
+    // The coarse vertex for a fine vertex: the one in its across-cell, else the nearest in the 3×3 cell
+    // neighbourhood (the fine and coarse boundaries cross slightly different cells where they diverge, so the
+    // exact cell can be empty by one — search a ring rather than leave a hole). `None` ⇒ no coarse counterpart.
+    let coarse_at = |cell: IVec2, p: Vec3| -> Option<BoundaryVert> {
+        let mut best: Option<(f32, BoundaryVert)> = None;
+        for dy in -1..=1 {
+            for dx in -1..=1 {
+                if let Some(v) = cmap.get(&(cell + IVec2::new(dx, dy))) {
+                    let d = v.pos.distance_squared(p);
+                    if best.is_none_or(|(bd, _)| d < bd) {
+                        best = Some((d, *v));
+                    }
+                }
+            }
+        }
+        best.map(|(_, v)| v)
+    };
     for fl in fine {
         let n = fl.verts.len();
         if n < 2 {
@@ -852,8 +869,9 @@ fn build_seam_into(
         for i in 0..edges {
             let a = fl.verts[i];
             let b = fl.verts[(i + 1) % n];
-            let (Some(&ca), Some(&cb)) = (cmap.get(&across(a.cell)), cmap.get(&across(b.cell))) else {
-                continue; // fine edge with no coarse counterpart across the boundary (e.g. corner / vanished)
+            let (Some(ca), Some(cb)) = (coarse_at(across(a.cell), a.pos), coarse_at(across(b.cell), b.pos))
+            else {
+                continue; // fine edge with no coarse counterpart across the boundary (e.g. 3-LOD corner)
             };
             emit(a, b, cb);
             emit(a, cb, ca);
