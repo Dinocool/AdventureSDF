@@ -472,6 +472,11 @@ fn mesh_chunk(
 struct ChunkMeshBuilder<'a> {
     edits: &'a [edits::ResolvedEdit],
     indices: &'a [u32],
+    /// Full edit index range `0..edits.len()`. Materials (the per-vertex `(nearest, runner-up)` + the signed
+    /// gaps) are evaluated over ALL edits, NOT the chunk-culled `indices` — otherwise a competing material
+    /// present in one chunk's cull but absent in its neighbour's makes the gap JUMP at the shared boundary
+    /// (a hard line in the blend). Geometry still uses `indices` (culling far edits can't move the surface).
+    all: Vec<u32>,
     origin: Vec3,
     eps: f32,
     lod: u32,
@@ -496,8 +501,12 @@ impl<'a> ChunkMeshBuilder<'a> {
         Self {
             edits,
             indices,
+            all: (0..edits.len() as u32).collect(),
             origin,
-            eps: vs * 0.01,
+            // Gradient-normal half-step. A wider sample (~10% of a cell, not 1%) gives a stable bisector
+            // at creases instead of collapsing to ~0 (degenerate → black triangle), at a negligible cost in
+            // sharpness at the voxel scale; `finish` still has a mean-normal fallback for any residual zeros.
+            eps: vs * 0.1,
             lod,
             debug,
             positions: Vec::new(),
@@ -521,17 +530,40 @@ impl<'a> ChunkMeshBuilder<'a> {
 
         for t in self.tris.chunks_exact(3) {
             let v = [t[0] as usize, t[1] as usize, t[2] as usize];
-            // The triangle's fixed pair: matA = majority NEAREST (the surface), matB = majority RUNNER-UP (the
-            // nearby competitor). Majority (tie → min id) is a deterministic function of the corners, so
-            // edge-adjacent triangles agree on a shared edge. matB == matA ⇒ single material (no blend).
+            // The triangle's two materials: the majority NEAREST (the surface) and the majority RUNNER-UP (the
+            // nearby competitor), then ORDERED BY ID into (mat_a, mat_b). Ordering is critical: the surface
+            // material flips from one to the other ACROSS a seam, so if `mat_a` tracked "which is the surface"
+            // it would swap A↔B at the seam and `weight` (= fraction of A) would jump. Sorting by id makes the
+            // pair identical on both sides, so the signed gap drives a CONTINUOUS pure-A → 0.5 → pure-B fade.
+            // m0 == m1 ⇒ single material (no blend).
             let near = [self.vmat[v[0]].0, self.vmat[v[1]].0, self.vmat[v[2]].0];
             let runner = [self.vmat[v[0]].1, self.vmat[v[1]].1, self.vmat[v[2]].1];
-            let mat_a = majority(near);
-            let mat_b = majority(runner);
+            let m0 = majority(near);
+            let m1 = majority(runner);
+            let (mat_a, mat_b) = (m0.min(m1), m0.max(m1));
+            // Fallback for a DEGENERATE analytic vertex normal: the CSG-gradient normal collapses to ~0 at a
+            // crease/saddle (central differences straddle the kink and cancel), and `normalize_or_zero` then
+            // yields a zero normal → a black triangle. Prefer the triangle's other VALID normals (their mean —
+            // smooth, matches neighbours) over the flat geometric face normal (which would read as a facet);
+            // fall back to the face normal only if every corner is degenerate.
+            let p = |i: usize| Vec3::from(self.positions[i]);
+            let an_sum = Vec3::from(self.normals[v[0]])
+                + Vec3::from(self.normals[v[1]])
+                + Vec3::from(self.normals[v[2]]);
+            let face = (p(v[1]) - p(v[0])).cross(p(v[2]) - p(v[0]));
+            let fallback = if an_sum.length_squared() > 1e-6 {
+                an_sum.normalize()
+            } else if face.length_squared() > 1e-20 {
+                face.normalize()
+            } else {
+                Vec3::Y
+            };
             for &vi in &v {
                 let n = positions.len() as u32;
                 positions.push(self.positions[vi]);
-                normals.push(self.normals[vi]);
+                let an = Vec3::from(self.normals[vi]);
+                let nrm = if an.length_squared() < 0.25 { fallback } else { an };
+                normals.push([nrm.x, nrm.y, nrm.z]);
                 uvs.push([mat_a as f32, mat_b as f32]);
                 let col = if self.debug {
                     [tint[0], tint[1], tint[2], 1.0]
@@ -543,8 +575,8 @@ impl<'a> ChunkMeshBuilder<'a> {
                         0.0
                     } else {
                         let world = Vec3::from(self.positions[vi]) + self.origin;
-                        edits::material_dist(self.edits, self.indices, world, mat_b)
-                            - edits::material_dist(self.edits, self.indices, world, mat_a)
+                        edits::material_dist(self.edits, &self.all, world, mat_b)
+                            - edits::material_dist(self.edits, &self.all, world, mat_a)
                     };
                     [1.0, 1.0, 1.0, gap]
                 };
@@ -582,9 +614,9 @@ impl MeshBuilder<f32, f32> for ChunkMeshBuilder<'_> {
         // Exact outward normal = ∇(CSG distance) (points toward increasing distance = outside the solid).
         let n = field_gradient(self.edits, self.indices, world, self.eps).normalize_or_zero();
         self.normals.push([n.x, n.y, n.z]);
-        // (nearest, runner-up) materials at this vertex; `finish` folds the per-triangle pair from the three
-        // corners and computes each corner's signed gap against it.
-        let (near, runner, _) = edits::fold_csg_top2(self.edits, self.indices, world);
+        // (nearest, runner-up) materials at this vertex, over ALL edits (see `all`) so the choice is
+        // chunk-independent; `finish` folds the per-triangle pair from the three corners' values.
+        let (near, runner, _) = edits::fold_csg_top2(self.edits, &self.all, world);
         self.vmat.push((near, runner));
         VertexIndex(self.positions.len() - 1)
     }
@@ -1282,6 +1314,118 @@ mod tests {
             0,
             "coarse (with transition face) + fine must weld watertight by construction"
         );
+    }
+
+    /// Bake a sphere ∪ cube (both centred at origin, so the solid is star-shaped about origin) in one chunk.
+    /// `mat_s`/`mat_c` are the sphere/cube material ids. Returns the baked mesh + its world origin.
+    fn merged_sphere_cube(mat_s: u16, mat_c: u16, smoothing: f32) -> (ChunkMeshData, Vec3) {
+        use crate::sdf_render::{CsgKind, SdfOp, SdfPrimitive};
+        let edits = [
+            edits::ResolvedEdit::new(
+                SdfPrimitive::Sphere { radius: 1.0 },
+                Transform::from_translation(Vec3::ZERO),
+                SdfOp { kind: CsgKind::Union, smoothing: 0.0 },
+                mat_s,
+            ),
+            edits::ResolvedEdit::new(
+                SdfPrimitive::Box { half_extents: Vec3::splat(0.8) },
+                Transform::from_translation(Vec3::ZERO),
+                SdfOp { kind: CsgKind::Union, smoothing },
+                mat_c,
+            ),
+        ];
+        let (vs, sub) = (0.1f32, 32u32); // span 3.2 > shape Ø (cube corner ≈ 1.39) → closed in one chunk
+        let origin = Vec3::splat(-1.6);
+        let data = mesh_chunk(&edits, &[0, 1], origin, vs, sub, 0, 0, false).expect("merged shape meshes");
+        (data, origin)
+    }
+
+    #[test]
+    fn merged_sphere_cube_normals_point_outward() {
+        // The solid is star-shaped about origin, so EVERY outward surface normal `n` must satisfy
+        // dot(n, pos) > 0. A normal pointing inward (the dark-triangle bug) shows up as dot < 0.
+        let (data, origin) = merged_sphere_cube(1, 2, 0.0);
+        let (mut worst, mut inward, mut degenerate, mut oblique) = (1.0f32, 0, 0, 0);
+        for i in 0..data.positions.len() {
+            let pos = Vec3::from(data.positions[i]) + origin;
+            let n = Vec3::from(data.normals[i]);
+            if n.length() < 0.5 {
+                degenerate += 1;
+                continue;
+            }
+            let d = n.normalize().dot(pos.normalize_or_zero());
+            worst = worst.min(d);
+            if d < -0.05 {
+                inward += 1;
+            } else if d < 0.5 {
+                oblique += 1; // >60° off outward — would shade noticeably dark vs neighbours
+            }
+        }
+        println!(
+            "verts={} degenerate={degenerate} inward={inward} oblique={oblique} worst_dot={worst:.3}",
+            data.positions.len()
+        );
+        assert_eq!(degenerate, 0, "no degenerate (black) normals");
+        assert_eq!(inward, 0, "no inward-pointing normals (dark triangles); worst dot {worst:.3}");
+    }
+
+    #[test]
+    fn coarse_transition_normals_point_outward() {
+        // The dark patches were on the coarse-LOD / transition side. Bake the COARSE block of a 2:1 boundary
+        // (with a +X TRANSITION face) — its transition cells are the suspect geometry. A sphere centred at
+        // (0.4,0,0) crosses the block's +X face (x=0); every normal must point outward from the sphere centre.
+        let edits = [sphere_edit(Vec3::new(0.4, 0.0, 0.0), 1.0)];
+        let oc = Vec3::new(-5.6, -2.8, -2.8);
+        let coarse = mesh_chunk(&edits, &[0], oc, 0.2, 28, 1 << 1, 1, false).expect("coarse+transition meshes");
+        let center = Vec3::new(0.4, 0.0, 0.0);
+        let (mut worst, mut inward, mut degenerate) = (1.0f32, 0, 0);
+        for i in 0..coarse.positions.len() {
+            let pos = Vec3::from(coarse.positions[i]) + oc;
+            let n = Vec3::from(coarse.normals[i]);
+            if n.length() < 0.5 {
+                degenerate += 1;
+                continue;
+            }
+            let d = n.normalize().dot((pos - center).normalize_or_zero());
+            worst = worst.min(d);
+            if d < -0.05 {
+                inward += 1;
+            }
+        }
+        println!(
+            "coarse+transition verts={} degenerate={degenerate} inward={inward} worst_dot={worst:.3}",
+            coarse.positions.len()
+        );
+        assert_eq!(degenerate, 0, "no degenerate (black) normals on the transition mesh");
+        assert_eq!(inward, 0, "transition-cell normals must point outward; worst dot {worst:.3}");
+    }
+
+    #[test]
+    fn merged_sphere_cube_blend_has_no_phantom_materials() {
+        // Sphere (id 1) ∪ cube (id 7). Every emitted vertex must reference ONLY {1, 7} (no phantom
+        // intermediate id), the pair must be id-ordered + CONSTANT within each triangle (so smooth UV
+        // interpolation can't sweep through other ids), and the signed gap must change sign across the
+        // merge (a real blend region exists).
+        let (data, _) = merged_sphere_cube(1, 7, 0.3);
+        for uv in &data.uvs {
+            let (a, b) = (uv[0] as u16, uv[1] as u16);
+            assert!(a == 1 || a == 7, "matA {a} is a phantom material");
+            assert!(b == 1 || b == 7, "matB {b} is a phantom material");
+            assert!(a <= b, "pair must be id-ordered, got ({a},{b})");
+        }
+        for t in data.indices.chunks_exact(3) {
+            let uvs: Vec<_> = t.iter().map(|&i| data.uvs[i as usize]).collect();
+            assert!(uvs[0] == uvs[1] && uvs[1] == uvs[2], "material pair must be constant within a triangle");
+        }
+        let (mut pos_gap, mut neg_gap) = (false, false);
+        for c in &data.colors {
+            if c[3] > 0.05 {
+                pos_gap = true;
+            } else if c[3] < -0.05 {
+                neg_gap = true;
+            }
+        }
+        assert!(pos_gap && neg_gap, "signed gap must straddle 0 → a real A↔B blend region exists");
     }
 
     #[test]
