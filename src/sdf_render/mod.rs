@@ -14,7 +14,7 @@
 //!    place at every LOD (no inter-LOD seam). Trade-off: a feature thinner than a voxel can
 //!    be missed at coarse LOD (its zero-crossing falls between samples) — accepted as the
 //!    cost of a clean, un-inflated field.
-//! 3. **Sparse storage + GPU lookup** (`chunk`, `render`, `bindings.wgsl`). Bricks group
+//! 3. **Sparse storage + GPU lookup** (`chunk`, `render`). Bricks group
 //!    into 4³=64-brick **chunks** addressed by an *absolute* world-lattice key (independent
 //!    of the camera, so CPU and GPU agree by construction). Resident chunks live in a per-LOD
 //!    **toroidal directory** — a dense `R³` array per LOD where chunk `c` sits at the fixed slot
@@ -26,12 +26,12 @@
 //!    as the camera moves; entered chunks bake on a task pool, exited chunks evict IMMEDIATELY
 //!    (the march falls back to a coarser resident LOD during the brief handoff) — never blocking
 //!    the main thread.
-//! 5. **Unified raymarch** (`sdf_raymarch.wgsl`, helpers in `brick`). One loop:
-//!    resolve the finest resident LOD at `p`; skip empty space by brick-DDA; otherwise
-//!    sphere-trace the trilinear field and accept the hit once the surface is within the
-//!    pixel cone (screen-space termination — the vast-distance speed win). There is **no GPU
-//!    BVH** in the march; the field + brick-geometry DDA drive all skipping. The `bvh` module
-//!    is CPU-only, used solely as the bake's edit-culling acceleration structure.
+//!
+//! The on-screen SDF *surface* raymarch was removed in the mesh-bake pivot — the baked meshes
+//! (`mesh_bake`) render the surfaces now. The GPU brick-bake + atlas (steps 2–4) are retained as a
+//! compilable, gated-off foundation for a FUTURE volumetric-cloud raymarcher (gated by
+//! [`SdfRenderEnabled`], default off). The `bvh` module is CPU-only, used as the bake's
+//! edit-culling acceleration structure (and by CPU picking).
 //!
 //! Editor-only pieces (`debug`, `gizmo`, `picking`, overlays) sit alongside but are not on
 //! the render hot path.
@@ -65,7 +65,6 @@ pub mod mesh_bake;
 pub mod mesh_material;
 pub mod gizmo;
 pub(crate) mod height;
-pub mod light_grid;
 pub(crate) mod node_gizmos;
 pub(crate) mod overlays;
 pub(crate) mod picking;
@@ -150,17 +149,15 @@ pub struct RayStepCapture {
     pub steps: Vec<picking::RayStep>,
 }
 
-/// Toggle for the SDF fullscreen raymarch pass. F1 flips this. Must be `ExtractResource` (synced to
-/// the render world) — the render nodes read it there to short-circuit; without the sync F1 has no
-/// effect (the render world would never see the flipped value).
-#[derive(Resource, Clone, bevy::render::extract_resource::ExtractResource)]
+/// Gates the GPU SDF-volume bake (`bake_scheduler::schedule_bakes`). The on-screen surface
+/// raymarch was removed in the mesh-bake pivot — baked meshes render the surfaces now — so this
+/// no longer toggles any visible pass. It now only controls whether the GPU brick-bake keeps the
+/// SDF distance atlas resident (the gated-off foundation for a future volumetric-cloud raymarch).
+/// Default OFF: the volume bake costs nothing during normal mesh editing. The Mesh Bake panel
+/// checkbox (and F1) flip it. Must be `ExtractResource` so the render world sees the value.
+/// `Default` = `false` (bool default) — the bake is off until something turns it on.
+#[derive(Resource, Clone, Default, bevy::render::extract_resource::ExtractResource)]
 pub struct SdfRenderEnabled(pub bool);
-
-impl Default for SdfRenderEnabled {
-    fn default() -> Self {
-        Self(true)
-    }
-}
 
 /// Whether viewport input (orbit/pick/gizmo-drag) is allowed this frame. The
 /// editor sets this from the pointer-in-viewport test so clicks on dock panels
@@ -172,78 +169,6 @@ pub struct ViewportInputAllowed(pub bool);
 impl Default for ViewportInputAllowed {
     fn default() -> Self {
         Self(true)
-    }
-}
-
-/// Live raymarch tuning, fed to the shader each frame via the camera uniform's
-/// `debug_params`. Always present (defaults match the historical shader constants)
-/// so the render path never depends on the debug toolkit feature.
-#[derive(Resource, Reflect)]
-#[reflect(Resource)]
-pub struct SdfRaymarchParams {
-    pub max_steps: u32,
-    pub max_dist: f32,
-    pub sdf_eps: f32,
-    /// Multiplier on the per-pixel cone half-width used for screen-space march
-    /// termination. The march stops when the conservative field drops below
-    /// `pixel_cone · t` (surface within ~`cone_scale` pixels), so far geometry resolves
-    /// at coarse LOD instead of marching down to LOD 0 — the vast-distance speed win.
-    /// 1.0 = exactly one pixel; larger = coarser/cheaper, smaller = sharper/costlier.
-    pub cone_scale: f32,
-    /// Sphere-trace over-relaxation factor (Keinert 2014). The march steps `over_relax · d`
-    /// with a safe fallback when consecutive unbounding spheres separate, converging on
-    /// grazing rays in fewer steps. 1.0 = plain sphere tracing; (1,2) accelerates. Default
-    /// 1.6: measured (tests/sdf_march_sim.rs) big step cut on grazing-MISS rays (the slow
-    /// tangent-band crawl) with zero hit↔miss flips — the fallback undoes any overshoot on
-    /// hits, and the cross-fade shell forces ω=1 where the blended field is non-eikonal.
-    /// (1.8 cut more in the sim but showed visual artifacts on the real scene, so backed off
-    /// to 1.6 for margin below the ω<2 overlapping-sphere safety ceiling.)
-    pub over_relax: f32,
-    /// LOD cross-fade band width, as a fraction of each clipmap ring's half-extent. In the
-    /// outer `lod_blend_band` shell of a ring the marched field is `mix`-faded from the
-    /// serving LOD toward its coarser neighbour, so the surface morphs smoothly across the
-    /// ring boundary instead of snapping (removes the visible LOD pop/seam). 0 = disabled
-    /// (hard LOD seams, the original behaviour). Tunable live via the editor raymarch panel.
-    ///
-    /// Default 0 (OFF): with bake-time curvature compensation + the 256 ring, the per-LOD surface
-    /// shrink is small enough that the morph isn't needed — and the distance-driven morph itself
-    /// coarsened the surface INSIDE a level's ring (it shrank MORE than the raw LOD). Re-enable via
-    /// the slider if a hard LOD seam shows up at a transition.
-    pub lod_blend_band: f32,
-    /// Soft-shadow penumbra hardness `k` (the IQ `min(k·d/t)` factor in `sdf::shadows`). LOWER =
-    /// softer/wider penumbra, which blurs the coarse-LOD brick faceting AND softens the
-    /// penumbra→umbra edge (both quantified on the harness tradeoff curve in
-    /// `tests/sdf_shadow_harness`); HIGHER = sharper/tighter but boxier + harder-edged. Tunable
-    /// live via the editor raymarch panel ("Shadow Softness").
-    pub shadow_softness: f32,
-    /// How many point lights (brightest-first, of those reaching a surface) cast an SDF shadow per
-    /// pixel; the rest add unshadowed. Bounds the per-pixel shadow-march cost. Uploaded into the
-    /// camera uniform so it's live-tunable from the editor raymarch panel ("Shadow lights") with no
-    /// shader rebuild.
-    pub shadow_light_cap: u32,
-}
-
-impl Default for SdfRaymarchParams {
-    fn default() -> Self {
-        Self {
-            // Raised for vast-distance marching: cone termination keeps the step count
-            // bounded even though the reach is far larger than the old 100-unit cap.
-            max_steps: 192,
-            max_dist: 5000.0,
-            sdf_eps: 0.001,
-            cone_scale: 1.0,
-            over_relax: 1.6,
-            lod_blend_band: 0.0, // OFF — LODs are good enough without the morph (see field doc)
-            // Soft-shadow penumbra hardness `k` (`sdf::shadows`): 0 = HARD shadow (binary
-            // occlusion, no penumbra — artifact-free); >0 = cone-traced soft, HIGHER = tighter
-            // (less near-miss darkening). A tight default (64) stays clean; the soft end (low k)
-            // re-introduces the penumbra near-miss/field artifacts.
-            shadow_softness: 64.0,
-            // Safety ceiling on shadowed lights per pixel (live "Shadow lights" slider). The real
-            // cull is distance-based (shadows only within a fraction of each light's range), so this
-            // rarely binds — it just bounds pathological clusters. 0 = no point-light shadows.
-            shadow_light_cap: 8,
-        }
     }
 }
 
@@ -485,7 +410,6 @@ impl Plugin for SdfScenePlugin {
             .init_resource::<LodRingsVisible>()
             .init_resource::<bvh::Bvh>()
             .init_resource::<SdfRenderEnabled>()
-            .init_resource::<SdfRaymarchParams>()
             .init_resource::<ProbeReset>()
             // `evict_on_scene_switch` reads this message; register it here too (idempotent) so the SDF
             // plugin is self-sufficient and doesn't depend on `SceneManagerPlugin` being added first.
@@ -505,7 +429,6 @@ impl Plugin for SdfScenePlugin {
             .register_type::<edits::SdfMaterialSource>()
             .register_type::<edits::MaterialFields>()
             .register_type::<CsgKind>()
-            .register_type::<SdfRaymarchParams>()
             .register_type::<stress::TowerSpawner>()
             // Spawn the scene. Material ids come from the demand-driven asset table
             // (loaded MaterialAssets get stable registry ids); the compile step in
@@ -572,6 +495,10 @@ impl Plugin for SdfScenePlugin {
             )
             .add_systems(
                 Update,
+                toggle_lod_rings.run_if(in_state(AppScene::SdfEditor)),
+            )
+            .add_systems(
+                Update,
                 stress::expand_tower_spawners
                     .run_if(in_state(AppScene::SdfEditor))
                     .before(bake_scheduler::schedule_bakes),
@@ -583,28 +510,18 @@ impl Plugin for SdfScenePlugin {
                     .before(bake_scheduler::schedule_bakes),
             )
             .add_systems(
-                First,
-                // Re-enabling the raymarch after editing in mesh-only mode rebuilds the GPU atlas from
-                // scratch (it wasn't maintained while `schedule_bakes` was gated off, below).
-                rebake_on_sdf_render_enable.run_if(in_state(AppScene::SdfEditor)),
-            )
-            .add_systems(
                 Update,
-                // GATED on SdfRenderEnabled: when viewing baked MESHES (raymarch off) the GPU SDF atlas
-                // bake + BVH refit (`sched_refit_incremental` et al. — the dominant editing cost) is pure
-                // dead weight, since the mesh path reads volumes directly. Skip it; the rebake-on-enable
-                // system above restores a clean atlas when the raymarch is turned back on.
+                // GATED on SdfRenderEnabled (default OFF): the on-screen SDF surface pass was removed
+                // (baked meshes render the surfaces now), so the GPU brick-bake atlas only feeds the
+                // gated-off cloud-raymarch foundation. With the toggle off this skips entirely, so the
+                // SDF atlas bake + BVH refit cost nothing during normal mesh editing.
                 bake_scheduler::schedule_bakes
                     .run_if(in_state(AppScene::SdfEditor))
                     .run_if(|r: Res<SdfRenderEnabled>| r.0),
             )
             // Ungated: a scene switch fires as the state leaves the editor, so scene eviction must run
             // regardless of the current `AppScene`.
-            .add_systems(Update, evict_on_scene_switch)
-            .add_systems(
-                Update,
-                toggle_sdf_render.run_if(in_state(AppScene::SdfEditor)),
-            );
+            .add_systems(Update, evict_on_scene_switch);
 
         // Overlay gizmos (ground grid + bounds) need GizmoPlugin (Assets<GizmoAsset>).
         // Present in the real app (DefaultPlugins) but not in MinimalPlugins test
@@ -938,35 +855,15 @@ fn update_height_field(
     }
 }
 
-fn toggle_sdf_render(
+/// F8 toggles the LOD-ring overlay (the clipmap ring wireframe), so it doesn't clutter the
+/// normal view. Independent of the bake toggle (the surface raymarch + its F1 toggle were
+/// removed in the mesh-bake pivot).
+fn toggle_lod_rings(
     keyboard: Res<ButtonInput<KeyCode>>,
-    mut enabled: ResMut<SdfRenderEnabled>,
     mut lod_rings: ResMut<LodRingsVisible>,
 ) {
-    if keyboard.just_pressed(KeyCode::F1) {
-        enabled.0 = !enabled.0;
-        info!("SDF render pass: {}", if enabled.0 { "ON" } else { "OFF" });
-    }
     if keyboard.just_pressed(KeyCode::F8) {
         lod_rings.0 = !lod_rings.0;
         info!("LOD ring overlay: {}", if lod_rings.0 { "ON" } else { "OFF" });
     }
-}
-
-/// When the SDF raymarch render is turned back ON after being off (F1 or the Mesh Bake panel checkbox),
-/// rebuild the GPU atlas from scratch — `schedule_bakes` is gated on `SdfRenderEnabled`, so the atlas
-/// wasn't maintained while the raymarch was off and any edits made meanwhile aren't reflected in it.
-/// Mirrors the scene-switch reset (`SdfAtlas::reset` + `BakeScheduler::reset`).
-fn rebake_on_sdf_render_enable(
-    enabled: Res<SdfRenderEnabled>,
-    mut atlas: ResMut<atlas::SdfAtlas>,
-    mut sched: ResMut<bake_scheduler::BakeScheduler>,
-    mut was_enabled: Local<bool>,
-) {
-    let now = enabled.0;
-    if now && !*was_enabled {
-        atlas.reset();
-        sched.reset();
-    }
-    *was_enabled = now;
 }
