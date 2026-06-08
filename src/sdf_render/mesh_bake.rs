@@ -65,26 +65,26 @@ const FACES: [(u8, usize, bool, [usize; 2]); 6] = [
     (5, 2, true, [0, 1]),
 ];
 
-/// A meshed surface vertex on a chunk FACE, cached for the cell-adjacency seam pass: reprojected WORLD
-/// position + analytic normal (shared verbatim by the seam → no T-junctions) + material linear base colour
-/// (so the strip's albedo matches) + `cell` = the vertex's WORLD-ALIGNED in-face cell coord, in THIS chunk's
-/// LOD voxel units. The seam connects a fine boundary edge to the coarse cell ACROSS the boundary by mapping
-/// the fine cell coord to the coarse one (`cell.div_euclid(2)` at 2:1) — correspondence by grid position, not
-/// by silhouette matching, so it can't fan/twist.
+/// A meshed surface vertex on a chunk FACE, cached for the cross-LOD GEOMORPH. Holds the reprojected WORLD
+/// position and analytic normal (a conforming fine vertex adopts the coarse vertex's pos AND normal, for
+/// continuous shading); `cell`, the vertex's WORLD-ALIGNED in-face cell coord in THIS chunk's LOD voxel units
+/// (a fine cell maps to its coarse cell by `cell.div_euclid(2)` at 2:1, to window the snap search); and `idx`,
+/// the vertex's index in the chunk's mesh arrays (so the fine side can be mutated in place).
 #[derive(Clone, Copy)]
 struct BoundaryVert {
     pos: Vec3,
     normal: Vec3,
-    base: [f32; 3],
     cell: IVec2,
+    /// Index of this vertex in the chunk's `positions`/`normals` arrays — lets the geomorph MUTATE the fine
+    /// mesh in place (snap its boundary onto the coarse neighbour). The coarse side only reads `pos`/`normal`.
+    idx: u32,
 }
 
 /// One ordered boundary component on a chunk face: its vertices in curve order (following the mesh's actual
-/// OPEN boundary edges, so the seam ribbon's edges pair exactly with the chunk's open edges → watertight),
-/// and whether the curve is a closed LOOP.
+/// OPEN boundary edges).
+#[derive(Clone)]
 struct BoundaryLoop {
     verts: Vec<BoundaryVert>,
-    is_loop: bool,
 }
 
 /// Raw mesh data produced off-thread by a meshing task (turned into a `Mesh` asset on the main thread).
@@ -153,11 +153,6 @@ struct MeshBakeScalars {
 #[derive(Component)]
 struct ChunkMesh(BrickKey);
 
-/// Marks a cross-LOD seam-strip mesh. The seam pass rebuilds ALL of them every commit (cheap, and a commit
-/// only happens on change), so they're reaped by query — no per-seam key needed.
-#[derive(Component)]
-struct SeamMesh;
-
 /// Per-chunk bake state.
 #[derive(Default)]
 struct ChunkState {
@@ -173,11 +168,10 @@ struct ChunkState {
     task: Option<Task<Option<ChunkMeshData>>>,
     /// Completed bake of `target_hash`, awaiting the round COMMIT.
     staged: Option<StagedBake>,
-    /// Per-face boundary loops of the DISPLAYED mesh, copied at COMMIT — read by the seam pass to stitch
-    /// this chunk to its differently-LOD'd neighbours.
+    /// Per-face boundary loops of the DISPLAYED mesh, copied at COMMIT — read by the geomorph so a finer
+    /// neighbour can snap (conform) its boundary onto THIS chunk's when it borders this coarser LOD.
     boundary: [Vec<BoundaryLoop>; 6],
-    /// Dominant material id of the DISPLAYED mesh — the seam strip takes the fine chunk's, so it uses the
-    /// same lit `StandardMaterial` as the surfaces it bridges.
+    /// Dominant material id of the DISPLAYED mesh — selects this chunk's lit `StandardMaterial`.
     material: u16,
 }
 
@@ -239,9 +233,6 @@ const LOD_DEBUG_PALETTE: [[f32; 3]; 9] = [
 ];
 /// Skirt debug tint (bright white) so the crack-filling curtains stand out in the "Colour by LOD" view.
 const SKIRT_DEBUG_COLOUR: [f32; 4] = [1.0, 1.0, 1.0, 1.0];
-
-/// Cross-LOD seam-strip debug tint (magenta) — distinct from skirts + the LOD palette in "Colour by LOD".
-const SEAM_DEBUG_COLOUR: [f32; 4] = [1.0, 0.0, 1.0, 1.0];
 
 /// Set by the editor panel's "Rebake all" button to force a full re-mesh.
 #[derive(Resource, Default)]
@@ -656,7 +647,7 @@ fn mesh_chunk(
     }
     centroid = grid_origin + (centroid / buffer.positions.len().max(1) as f32) * vs;
     let material = edits::fold_csg(edits, centroid).material_id;
-    let boundary = extract_boundary(&buffer, &positions, &normals, &colors, grid_origin, vs, edge, trim_low);
+    let boundary = extract_boundary(&buffer, &positions, &normals, grid_origin, vs, edge, trim_low);
     Some(ChunkMeshData { positions, normals, colors, indices, material, boundary })
 }
 
@@ -670,7 +661,6 @@ fn extract_boundary(
     buffer: &SurfaceNetsBuffer,
     positions: &[[f32; 3]],
     normals: &[[f32; 3]],
-    colors: &[[f32; 4]],
     grid_origin: Vec3,
     vs: f32,
     edge: u32,
@@ -713,38 +703,35 @@ fn extract_boundary(
         let mut visited: HashSet<u32> = HashSet::new();
         let bv = |i: u32| {
             let sp = buffer.surface_points[i as usize];
-            let c = colors[i as usize];
             BoundaryVert {
                 pos: grid_origin + Vec3::from(positions[i as usize]),
                 normal: Vec3::from(normals[i as usize]),
-                base: [c[0], c[1], c[2]],
                 cell: IVec2::new(gov[tan[0]] + sp[tan[0]] as i32, gov[tan[1]] + sp[tan[1]] as i32),
+                idx: i,
             }
         };
-        let to_loop = |comp: Vec<u32>, is_loop: bool| BoundaryLoop {
-            verts: comp.into_iter().map(bv).collect(),
-            is_loop,
-        };
+        let to_loop = |comp: Vec<u32>| BoundaryLoop { verts: comp.into_iter().map(bv).collect() };
         // Chains first (start at a degree-1 endpoint); any remaining cycles are closed loops.
         for &s in &nodes {
             if !visited.contains(&s) && adj[&s].len() == 1 {
-                out[bit as usize].push(to_loop(walk_open_edges(&adj, &mut visited, s), false));
+                out[bit as usize].push(to_loop(walk_open_edges(&adj, &mut visited, s)));
             }
         }
         for &s in &nodes {
             if !visited.contains(&s) {
-                out[bit as usize].push(to_loop(walk_open_edges(&adj, &mut visited, s), true));
+                out[bit as usize].push(to_loop(walk_open_edges(&adj, &mut visited, s)));
             }
         }
     }
     out
 }
 
-// ─────────────────────────── Cross-LOD seam stitching ───────────────────────────
+// ─────────────────────────── Cross-LOD boundary geomorph ───────────────────────────
 // A fine chunk's face that borders a coarser LOD leaves a crack: the fine boundary curve (dense) and the
-// coarse boundary curve (sparse) don't meet. We stitch them with a triangle RIBBON that reuses both chunks'
-// actual boundary vertices (no T-junctions). This is the dual-method seam (a 2:1 specialisation of the
-// Gildea seam octree — no octree needed since our grids are regular and exactly 2:1; see memory).
+// coarse boundary curve (sparse) are meshed independently and don't coincide. We REMOVE the mismatch — the
+// coarse chunk OWNS the shared boundary, the fine chunk CONFORMS to it (snaps its boundary verts onto the
+// coarse ones) — so the two meshes share vertices and weld directly, with no seam strip and no T-junctions.
+// Conforming is transitive (fine→medium→coarse), so it also closes 3-LOD corners. (See memory.)
 
 /// Outward unit direction of face `bit` (FACES order: −X,+X,−Y,+Y,−Z,+Z).
 fn face_dir(bit: u8) -> IVec3 {
@@ -792,98 +779,85 @@ fn walk_open_edges(adj: &HashMap<u32, Vec<u32>>, visited: &mut HashSet<u32>, sta
     comp
 }
 
-/// Build the cross-LOD seam for one face by CELL ADJACENCY — the canonical dual-method approach (Gildea's
-/// `ContourProcessEdge`, specialised to a regular 2:1 grid). For each FINE boundary edge (two consecutive
-/// boundary verts = one Surface-Nets open edge), look up the COARSE cell ACROSS the boundary from each
-/// endpoint by mapping the fine cell coord to the coarse one (`div_euclid(2)` at 2:1), and emit the quad
-/// `fine_a → fine_b → coarse_b → coarse_a` (which collapses to ONE triangle when both fine cells map to the
-/// same coarse cell). Properties: one quad per fine edge → BOUNDED, no fans; correspondence by grid position
-/// → no twists; corners are just more edges → no corner gaps; winding from the vertex normals → no dark
-/// faces. A fine edge whose coarse cell has no vertex (feature absent at the coarse LOD) is simply skipped.
-fn build_seam_into(
-    fine: &[BoundaryLoop],
-    coarse: &[BoundaryLoop],
-    debug: bool,
-    positions: &mut Vec<[f32; 3]>,
-    normals: &mut Vec<[f32; 3]>,
-    colors: &mut Vec<[f32; 4]>,
-    indices: &mut Vec<u32>,
-) {
-    if fine.is_empty() || coarse.is_empty() {
+/// GEOMORPH the fine chunk's boundary onto its coarser neighbours — the "remove the mismatch" cross-LOD fix.
+/// The coarse chunk OWNS the shared boundary; this fine chunk CONFORMS: every fine boundary vertex on a
+/// coarser-bordering face is snapped onto the nearest coarse boundary vertex (taking its position AND its
+/// normal), so the fine boundary collapses to a refinement of the coarse one and the two meshes share
+/// vertices → they weld watertight, with no separate seam strip and no T-junctions. Triangles that collapse
+/// to a degenerate sliver (two corners landing on one coarse vertex) are dropped. Conforming is TRANSITIVE —
+/// a fine→medium→coarse chain closes 3-LOD corners by construction, which the per-face strip never could.
+///
+/// `neighbours` pairs each coarser-bordering fine face `bit` with THAT neighbour's opposite-face boundary
+/// loops (same tangent frame, so fine cells map to coarse cells by `div_euclid(2)`). A vertex shared by two
+/// faces (a chunk-edge corner) is snapped ONCE, to the globally nearest candidate across its faces. `origin`
+/// is the fine chunk's grid origin (the same one `extract_boundary` used), to map a coarse world target back
+/// to chunk-local mesh space.
+fn conform_boundary(data: &mut ChunkMeshData, origin: Vec3, neighbours: &[(u8, &[BoundaryLoop])]) {
+    if neighbours.is_empty() {
         return;
     }
-    // Coarse boundary vertices keyed by world-aligned cell coord (coarse LOD voxel units) for O(1) lookup.
-    let mut cmap: HashMap<IVec2, BoundaryVert> = HashMap::new();
-    for cl in coarse {
-        for v in &cl.verts {
-            cmap.insert(v.cell, *v);
+    const WINDOW: i32 = 1; // search ±1 coarse cell around the fine vert's mapped cell (keeps it curve-local)
+    // Nearest coarse target (dist², world pos, world normal) per fine vertex INDEX, taking the global minimum
+    // across every coarser-bordering face the vertex lies on (so corners resolve consistently).
+    let mut snap: HashMap<u32, (f32, Vec3, Vec3)> = HashMap::new();
+    for &(bit, coarse) in neighbours {
+        if coarse.is_empty() {
+            continue;
         }
-    }
-    let col = |v: &BoundaryVert| {
-        if debug {
-            SEAM_DEBUG_COLOUR
-        } else {
-            [v.base[0], v.base[1], v.base[2], 1.0]
+        // Coarse boundary verts bucketed by world-aligned cell (coarse LOD units) for a local window search.
+        let mut cmap: HashMap<IVec2, Vec<BoundaryVert>> = HashMap::new();
+        for cl in coarse {
+            for v in &cl.verts {
+                cmap.entry(v.cell).or_default().push(*v);
+            }
         }
-    };
-    // One triangle, flipped to face OUTWARD (winding agrees with the analytic vertex normals); coincident-
-    // vertex (degenerate) triangles are dropped.
-    let mut emit = |a: BoundaryVert, b: BoundaryVert, d: BoundaryVert| {
-        if a.pos == b.pos || b.pos == d.pos || a.pos == d.pos {
-            return;
-        }
-        let face_n = (b.pos - a.pos).cross(d.pos - a.pos);
-        let tri = if face_n.dot(a.normal + b.normal + d.normal) < 0.0 { [a, d, b] } else { [a, b, d] };
-        let i0 = positions.len() as u32;
-        for v in tri {
-            positions.push([v.pos.x, v.pos.y, v.pos.z]);
-            normals.push([v.normal.x, v.normal.y, v.normal.z]);
-            colors.push(col(&v));
-        }
-        indices.extend_from_slice(&[i0, i0 + 1, i0 + 2]);
-    };
-    let across = |c: IVec2| IVec2::new(c.x.div_euclid(2), c.y.div_euclid(2)); // fine cell → coarse cell
-    // Nearest boundary vertex (by world position) within a ±SEAM_SEARCH cell window of `cell`. Where the
-    // terrain is rough the two LODs' boundaries cross cells up to ~2 apart (measured), so a window is needed;
-    // nearest-by-position keeps the link on the local curve. `None` ⇒ no counterpart nearby (e.g. a 3-LOD
-    // corner, where the counterpart lives in an adjacent face's neighbour this lookup doesn't include).
-    const SEAM_SEARCH: i32 = 1;
-    let nearest = |map: &HashMap<IVec2, BoundaryVert>, cell: IVec2, p: Vec3| -> Option<BoundaryVert> {
-        let mut best: Option<(f32, BoundaryVert)> = None;
-        for dy in -SEAM_SEARCH..=SEAM_SEARCH {
-            for dx in -SEAM_SEARCH..=SEAM_SEARCH {
-                if let Some(v) = map.get(&(cell + IVec2::new(dx, dy))) {
-                    let d = v.pos.distance_squared(p);
-                    if best.is_none_or(|(bd, _)| d < bd) {
-                        best = Some((d, *v));
+        for fl in &data.boundary[bit as usize] {
+            for fv in &fl.verts {
+                let base = IVec2::new(fv.cell.x.div_euclid(2), fv.cell.y.div_euclid(2));
+                let mut best: Option<(f32, Vec3, Vec3)> = None;
+                for dy in -WINDOW..=WINDOW {
+                    for dx in -WINDOW..=WINDOW {
+                        let Some(vs) = cmap.get(&(base + IVec2::new(dx, dy))) else {
+                            continue;
+                        };
+                        for cv in vs {
+                            let d = cv.pos.distance_squared(fv.pos);
+                            if best.is_none_or(|(bd, ..)| d < bd) {
+                                best = Some((d, cv.pos, cv.normal));
+                            }
+                        }
+                    }
+                }
+                if let Some((d, p, nrm)) = best {
+                    let e = snap.entry(fv.idx).or_insert((f32::INFINITY, Vec3::ZERO, Vec3::ZERO));
+                    if d < e.0 {
+                        *e = (d, p, nrm);
                     }
                 }
             }
         }
-        best.map(|(_, v)| v)
-    };
-    // FINE→COARSE: one quad per fine boundary edge (covers every fine edge + the coarse edge it spans). A
-    // tight ±1 search keeps it order-preserving (no fans, no overlapping triangles); the SYMMETRIC coarse→fine
-    // pass is intentionally NOT done — it double-covers and produces non-manifold (overlapping) seam triangles.
-    // The cost is small coarse-side gaps where the coarse boundary diverges by >1 cell (rough terrain); the
-    // robust cure for those is the transition/remove-the-mismatch rewrite, not a looser search.
-    for fl in fine {
-        let n = fl.verts.len();
-        if n < 2 {
-            continue;
-        }
-        let edges = if fl.is_loop { n } else { n - 1 };
-        for i in 0..edges {
-            let (a, b) = (fl.verts[i], fl.verts[(i + 1) % n]);
-            let (Some(ca), Some(cb)) =
-                (nearest(&cmap, across(a.cell), a.pos), nearest(&cmap, across(b.cell), b.pos))
-            else {
-                continue;
-            };
-            emit(a, b, cb);
-            emit(a, cb, ca);
+    }
+    if snap.is_empty() {
+        return;
+    }
+    // Move each snapped fine vertex onto its coarse target (world → chunk-local), adopting the coarse normal
+    // so shading is continuous across the weld.
+    for (&idx, &(_, p, nrm)) in &snap {
+        let local = p - origin;
+        data.positions[idx as usize] = [local.x, local.y, local.z];
+        data.normals[idx as usize] = [nrm.x, nrm.y, nrm.z];
+    }
+    // Drop triangles that became degenerate (two corners snapped onto the same coarse vertex). Positions were
+    // set EXACTLY equal above, so a collapsed boundary edge is caught by exact `==`.
+    let old = std::mem::take(&mut data.indices);
+    let same = |a: u32, b: u32| data.positions[a as usize] == data.positions[b as usize];
+    let mut kept = Vec::with_capacity(old.len());
+    for t in old.chunks_exact(3) {
+        if !same(t[0], t[1]) && !same(t[1], t[2]) && !same(t[2], t[0]) {
+            kept.extend_from_slice(t);
         }
     }
+    data.indices = kept;
 }
 
 /// Append skirt curtains for the coarser-neighbour faces (`face_flags`). Variant A′: a boundary vertex's
@@ -1017,7 +991,6 @@ fn mesh_resident_chunks(
     // everything at LOD 0 — the original scene/camera-independent behaviour for gameplay scenes).
     cameras: Query<&GlobalTransform, (With<SdfCamera>, Without<SdfVolume>)>,
     chunk_meshes: Query<(Entity, &ChunkMesh)>,
-    seam_meshes: Query<(Entity, &SeamMesh)>,
     mut states: ResMut<ChunkStates>,
     mut rebuild: ResMut<MeshBakeRebuild>,
     mut stats: ResMut<MeshBakeStats>,
@@ -1042,9 +1015,6 @@ fn mesh_resident_chunks(
             for (e, _) in &chunk_meshes {
                 commands.entity(e).despawn();
             }
-            for (e, _) in &seam_meshes {
-                commands.entity(e).despawn();
-            }
             states.0.clear();
         }
         round.edits = None;
@@ -1057,9 +1027,6 @@ fn mesh_resident_chunks(
     // is stale. Despawn all + clear state + abort any round for a clean swap.
     if scal.prev_k != 0 && scal.prev_k != k {
         for (e, _) in &chunk_meshes {
-            commands.entity(e).despawn();
-        }
-        for (e, _) in &seam_meshes {
             commands.entity(e).despawn();
         }
         states.0.clear();
@@ -1200,6 +1167,8 @@ fn mesh_resident_chunks(
     let mut by_lod = [0usize; 8];
     {
         let mut idx: Vec<u32> = Vec::new();
+        // Pass 1 — each chunk's OWN content hash (edits ∩ chunk + lod + face flags + trim).
+        let mut own: HashMap<BrickKey, (u64, u8)> = HashMap::with_capacity(resident.len());
         for &key in &resident {
             by_lod[(key.lod as usize).min(7)] += 1;
             cull_into(&edit_aabbs, &chunk_sampled(key), &mut idx);
@@ -1213,7 +1182,26 @@ fn mesh_resident_chunks(
             let lf = (key.lod as u64).wrapping_mul(0xA24B_AED4_963E_E407)
                 ^ (flags as u64).wrapping_mul(EPOCH_MIX)
                 ^ (trim as u64).wrapping_mul(0xC2B2_AE3D_27D4_EB4F);
-            current_hashes.insert(key, (base ^ epoch_mix).wrapping_add(lf));
+            own.insert(key, ((base ^ epoch_mix).wrapping_add(lf), flags));
+        }
+        // Pass 2 — fold each coarser-bordering neighbour's OWN hash into this chunk's hash. The geomorph snaps
+        // this chunk's boundary onto that neighbour, so a change in the neighbour's geometry must re-stale
+        // (hence re-bake + re-conform) this chunk: robust-by-construction invalidation, no extra scheduling.
+        // (Only the neighbour's OWN hash is folded — its boundary toward THIS chunk is the neighbour's own
+        // meshed face, unaffected by the neighbour conforming its OTHER, coarser faces.)
+        let k_step = k as i32 * config.cell_stride();
+        for (&key, &(own_h, flags)) in &own {
+            let mut h = own_h;
+            for (bit, _axis, _is_high, _tan) in FACES {
+                if flags & (1 << bit) == 0 {
+                    continue;
+                }
+                let ckey = coarse_neighbour_key(key, face_dir(bit), k_step);
+                if let Some(&(ch, _)) = own.get(&ckey) {
+                    h ^= ch.rotate_left(17).wrapping_add(0x9E37_79B9_7F4A_7C15);
+                }
+            }
+            current_hashes.insert(key, h);
         }
     }
     stats.edits = n_edits;
@@ -1253,6 +1241,10 @@ fn mesh_resident_chunks(
     stats.reaped = 0;
     if round_done && (has_staged || has_departed) {
         let mut reaped = 0usize;
+        // PHASE A — cache every committing chunk's boundary + material and TAKE its staged mesh into
+        // `pending`, retiring its old entity. All boundary caches must be fresh before any fine chunk
+        // conforms (it reads its coarse neighbours' caches), so meshes are NOT built until phase B.
+        let mut pending: Vec<(BrickKey, ChunkMeshData)> = Vec::new();
         for (key, st) in states.0.iter_mut() {
             let Some(sb) = st.staged.take() else {
                 continue;
@@ -1260,73 +1252,106 @@ fn mesh_resident_chunks(
             if let Some(old) = st.entity.take() {
                 commands.entity(old).despawn();
             }
+            st.displayed_hash = st.target_hash;
             match sb.data {
                 // Empty chunk: no mesh, and clear any stale boundary cache.
                 None => st.boundary = std::array::from_fn(|_| Vec::new()),
                 Some(data) => {
-                    // Cache the boundary verts + dominant material for the seam pass (partial moves).
-                    st.boundary = data.boundary;
+                    // Cache a COPY of the boundary verts + dominant material; the staged data keeps its own
+                    // boundary so the geomorph can read this chunk's fine boundary in phase B.
+                    st.boundary = data.boundary.clone();
                     st.material = data.material;
-                    // Debug "Colour by LOD": one shared UNLIT white material (the LOD/skirt tint lives in the
-                    // vertex COLOUR). Normal: a lit StandardMaterial per dominant material id (cached) — base
-                    // WHITE so the per-vertex base COLOUR rules; metallic/roughness/emissive from the registry.
-                    let mat = if mesh_cfg.debug_lod_colour {
-                        mat_cache
-                            .entry(u16::MAX)
-                            .or_insert_with(|| {
-                                materials.add(StandardMaterial {
-                                    base_color: Color::WHITE,
-                                    unlit: true,
-                                    double_sided: true,
-                                    cull_mode: None,
-                                    ..default()
-                                })
-                            })
-                            .clone()
-                    } else {
-                        mat_cache
-                            .entry(data.material)
-                            .or_insert_with(|| {
-                                let a = appearances
-                                    .get(data.material as usize)
-                                    .copied()
-                                    .unwrap_or(DEFAULT_APPEARANCE);
-                                materials.add(StandardMaterial {
-                                    base_color: Color::WHITE,
-                                    metallic: a.metallic,
-                                    perceptual_roughness: a.roughness.max(0.045),
-                                    emissive: LinearRgba::rgb(a.emissive[0], a.emissive[1], a.emissive[2]),
-                                    double_sided: true,
-                                    cull_mode: None,
-                                    ..default()
-                                })
-                            })
-                            .clone()
-                    };
-                    let mesh = Mesh::new(PrimitiveTopology::TriangleList, RenderAssetUsages::default())
-                        .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, data.positions)
-                        .with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, data.normals)
-                        .with_inserted_attribute(Mesh::ATTRIBUTE_COLOR, data.colors)
-                        .with_inserted_indices(Indices::U32(data.indices));
-                    // Apron offset: SN sample 0 is one voxel BEFORE the chunk min — MUST stay exactly
-                    // `brick_min_world(coord,lod) - vs(lod)`, or the chunk shifts a voxel and every seam cracks.
-                    let vs_l = config.voxel_size_at(key.lod);
-                    let origin = config.brick_min_world(key.coord, key.lod) - Vec3::splat(vs_l);
-                    st.entity = Some(
-                        commands
-                            .spawn((
-                                Mesh3d(mesh_assets.add(mesh)),
-                                MeshMaterial3d(mat),
-                                Transform::from_translation(origin),
-                                ChunkMesh(*key),
-                                Name::new("SDF Chunk Mesh"),
-                            ))
-                            .id(),
-                    );
+                    pending.push((*key, data));
                 }
             }
-            st.displayed_hash = st.target_hash;
         }
+
+        // PHASE B-1 — GEOMORPH: each fine chunk bordering a coarser LOD conforms its boundary onto those
+        // neighbours' cached boundaries (now all fresh), so the meshes weld with no seam strip. Skipped when
+        // seams are disabled — skirts (already baked into the chunk meshes) are the fallback then.
+        if mesh_cfg.seams_enabled {
+            let k_step = k as i32 * config.cell_stride();
+            for (fkey, data) in pending.iter_mut() {
+                let flags = chunk_face_flags(*fkey, &config, k, round.cam, round.half0);
+                if flags == 0 {
+                    continue;
+                }
+                let mut neighbours: Vec<(u8, &[BoundaryLoop])> = Vec::new();
+                for (bit, _axis, _is_high, _tan) in FACES {
+                    if flags & (1 << bit) == 0 {
+                        continue; // face doesn't border a coarser LOD
+                    }
+                    let ckey = coarse_neighbour_key(*fkey, face_dir(bit), k_step);
+                    if let Some(cst) = states.0.get(&ckey) {
+                        neighbours.push((bit, cst.boundary[opposite_face(bit) as usize].as_slice()));
+                    }
+                }
+                let vs_l = config.voxel_size_at(fkey.lod);
+                let origin = config.brick_min_world(fkey.coord, fkey.lod) - Vec3::splat(vs_l);
+                conform_boundary(data, origin, &neighbours);
+            }
+        }
+
+        // PHASE B-2 — build + spawn each committed (now conformed) chunk mesh. Debug "Colour by LOD": one
+        // shared UNLIT white material (the LOD/skirt tint lives in the vertex COLOUR). Normal: a lit
+        // StandardMaterial per dominant material id (cached) — base WHITE so the per-vertex base COLOUR rules.
+        for (key, data) in pending {
+            let mat = if mesh_cfg.debug_lod_colour {
+                mat_cache
+                    .entry(u16::MAX)
+                    .or_insert_with(|| {
+                        materials.add(StandardMaterial {
+                            base_color: Color::WHITE,
+                            unlit: true,
+                            double_sided: true,
+                            cull_mode: None,
+                            ..default()
+                        })
+                    })
+                    .clone()
+            } else {
+                mat_cache
+                    .entry(data.material)
+                    .or_insert_with(|| {
+                        let a = appearances
+                            .get(data.material as usize)
+                            .copied()
+                            .unwrap_or(DEFAULT_APPEARANCE);
+                        materials.add(StandardMaterial {
+                            base_color: Color::WHITE,
+                            metallic: a.metallic,
+                            perceptual_roughness: a.roughness.max(0.045),
+                            emissive: LinearRgba::rgb(a.emissive[0], a.emissive[1], a.emissive[2]),
+                            double_sided: true,
+                            cull_mode: None,
+                            ..default()
+                        })
+                    })
+                    .clone()
+            };
+            let mesh = Mesh::new(PrimitiveTopology::TriangleList, RenderAssetUsages::default())
+                .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, data.positions)
+                .with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, data.normals)
+                .with_inserted_attribute(Mesh::ATTRIBUTE_COLOR, data.colors)
+                .with_inserted_indices(Indices::U32(data.indices));
+            // Apron offset: SN sample 0 is one voxel BEFORE the chunk min — MUST stay exactly
+            // `brick_min_world(coord,lod) - vs(lod)`, or the chunk shifts a voxel and every weld cracks.
+            let vs_l = config.voxel_size_at(key.lod);
+            let origin = config.brick_min_world(key.coord, key.lod) - Vec3::splat(vs_l);
+            let entity = commands
+                .spawn((
+                    Mesh3d(mesh_assets.add(mesh)),
+                    MeshMaterial3d(mat),
+                    Transform::from_translation(origin),
+                    ChunkMesh(key),
+                    Name::new("SDF Chunk Mesh"),
+                ))
+                .id();
+            if let Some(st) = states.0.get_mut(&key) {
+                st.entity = Some(entity);
+            }
+        }
+
         // Reap departed meshes (query-based — catches every non-resident `ChunkMesh` regardless of state).
         for (e, cm) in &chunk_meshes {
             if !resident.contains(&cm.0) {
@@ -1337,95 +1362,6 @@ fn mesh_resident_chunks(
         states.0.retain(|key, _| resident.contains(key));
         stats.reaped = reaped;
 
-        // SEAM PASS: stitch each fine chunk to its coarser neighbours with a transition strip, crack-free.
-        // Rebuild ALL seams every commit (a commit only happens on change; strips are O(boundary) — cheap),
-        // using the round's FROZEN camera so the boundary flags match the committed meshes. Always despawn the
-        // previous strips; rebuild only when seams are enabled (else skirts, baked into the chunk meshes).
-        for (e, _) in &seam_meshes {
-            commands.entity(e).despawn();
-        }
-        if mesh_cfg.seams_enabled {
-            let step = k as i32 * config.cell_stride();
-            for (&fkey, fst) in states.0.iter() {
-                let flags = chunk_face_flags(fkey, &config, k, round.cam, round.half0);
-                if flags == 0 {
-                    continue;
-                }
-                let (mut positions, mut normals, mut colors, mut indices) =
-                    (Vec::new(), Vec::new(), Vec::new(), Vec::new());
-                for (bit, _axis, _is_high, _tan) in FACES {
-                    if flags & (1 << bit) == 0 {
-                        continue; // face doesn't border a coarser LOD
-                    }
-                    // Every coarser-bordering face has open boundary edges to close (the crate suppresses the
-                    // +boundary quads). LOW faces leave a gap; HIGH faces leave a ~½-coarse-voxel overlap the
-                    // strip ramps in front of — stitch both so the boundary is seamed in all directions.
-                    let ckey = coarse_neighbour_key(fkey, face_dir(bit), step);
-                    let Some(cst) = states.0.get(&ckey) else {
-                        continue; // coarse neighbour not resident (outer ring edge) → no strip there
-                    };
-                    build_seam_into(
-                        &fst.boundary[bit as usize],
-                        &cst.boundary[opposite_face(bit) as usize],
-                        mesh_cfg.debug_lod_colour,
-                        &mut positions,
-                        &mut normals,
-                        &mut colors,
-                        &mut indices,
-                    );
-                }
-                if indices.is_empty() {
-                    continue;
-                }
-                // Same material the chunks use: debug → shared unlit white (vertex tint rules); else the FINE
-                // chunk's dominant lit StandardMaterial (per-vertex base colour blends fine↔coarse on top).
-                let seam_mat = if mesh_cfg.debug_lod_colour {
-                    mat_cache
-                        .entry(u16::MAX)
-                        .or_insert_with(|| {
-                            materials.add(StandardMaterial {
-                                base_color: Color::WHITE,
-                                unlit: true,
-                                double_sided: true,
-                                cull_mode: None,
-                                ..default()
-                            })
-                        })
-                        .clone()
-                } else {
-                    mat_cache
-                        .entry(fst.material)
-                        .or_insert_with(|| {
-                            let a = appearances
-                                .get(fst.material as usize)
-                                .copied()
-                                .unwrap_or(DEFAULT_APPEARANCE);
-                            materials.add(StandardMaterial {
-                                base_color: Color::WHITE,
-                                metallic: a.metallic,
-                                perceptual_roughness: a.roughness.max(0.045),
-                                emissive: LinearRgba::rgb(a.emissive[0], a.emissive[1], a.emissive[2]),
-                                double_sided: true,
-                                cull_mode: None,
-                                ..default()
-                            })
-                        })
-                        .clone()
-                };
-                let mesh = Mesh::new(PrimitiveTopology::TriangleList, RenderAssetUsages::default())
-                    .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, positions)
-                    .with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, normals)
-                    .with_inserted_attribute(Mesh::ATTRIBUTE_COLOR, colors)
-                    .with_inserted_indices(Indices::U32(indices));
-                commands.spawn((
-                    Mesh3d(mesh_assets.add(mesh)),
-                    MeshMaterial3d(seam_mat),
-                    Transform::IDENTITY, // seam geometry is already in world space
-                    SeamMesh,
-                    Name::new("SDF Seam Mesh"),
-                ));
-            }
-        }
         // The round is finished — allow a new snapshot (below) to start the next one THIS frame.
         round.edits = None;
         round.aabbs.clear();
@@ -1770,8 +1706,9 @@ mod tests {
     }
 
     /// Count mesh edges NOT shared by exactly 2 triangles, after welding vertices by quantized WORLD
-    /// position (0.1 mm). 0 ⇒ closed 2-manifold = watertight. Position-welding lets it span SEPARATE meshes
-    /// (chunk meshes + the seam strip), so it is the seam pass's correctness gate.
+    /// position (0.1 mm). 0 ⇒ closed 2-manifold = watertight. Position-welding lets it span SEPARATE chunk
+    /// meshes (fine + coarse), so it is the geomorph's correctness gate: after the fine conforms, the two
+    /// must weld with no open edge (gap) and no edge in >2 triangles (overlap).
     fn open_edge_count(tris: &[(Vec3, Vec3, Vec3)]) -> usize {
         let q = |p: Vec3| {
             [
@@ -1805,84 +1742,68 @@ mod tests {
         assert_eq!(open_edge_count(&chunk_tris(&data, origin)), 0, "closed sphere must be watertight");
     }
 
+    /// Count fine boundary verts on `face` that did NOT land exactly on a coarse boundary vertex after a
+    /// conform (within `tol` world units). 0 ⇒ the fine boundary is a subset of the coarse boundary
+    /// (no T-junctions). Coarse verts are taken from `coarse.boundary[opp]` (already world-space).
+    fn unwelded_boundary_verts(
+        fine: &ChunkMeshData,
+        origin: Vec3,
+        face: usize,
+        coarse: &ChunkMeshData,
+        opp: usize,
+        tol: f32,
+    ) -> usize {
+        let cverts: Vec<Vec3> = coarse.boundary[opp].iter().flat_map(|l| l.verts.iter().map(|v| v.pos)).collect();
+        let mut miss = 0;
+        for l in &fine.boundary[face] {
+            for v in &l.verts {
+                let w = origin + Vec3::from(fine.positions[v.idx as usize]);
+                if !cverts.iter().any(|c| c.distance(w) <= tol) {
+                    miss += 1;
+                }
+            }
+        }
+        miss
+    }
+
     #[test]
-    fn seam_makes_2to1_boundary_watertight() {
+    fn geomorph_welds_2to1_sphere_watertight() {
         // A sphere straddling a forced fine|coarse 2:1 boundary at x = 0: the FINE chunk (vs 0.1) meshes the
-        // +X side (its −X face borders coarse — the GAP orientation), the COARSE chunk (vs 0.2) meshes the −X
-        // side, each ending in a boundary circle with a one-fine-voxel gap between them. The seam strip
-        // bridges them. Fine + coarse + seam must be a closed 2-manifold (no open edges).
+        // +X side (its −X face borders coarse), the COARSE chunk (vs 0.2) the −X side, each ending in a
+        // boundary circle one fine-voxel apart. The geomorph snaps the FINE boundary onto the coarse one; the
+        // two then weld with no seam strip. Bare = cracked; after conform fine+coarse is a closed 2-manifold.
         let edits = [sphere_edit(Vec3::ZERO, 1.0)];
         let idx = [0u32];
         let (vsf, vsc, edge) = (0.1f32, 0.2f32, 30u32);
-        // grid_origin = brick_min − vs. Fine real x∈[0,2.8] (Y,Z ±1.4) → −X boundary circle at x ≈ −0.1.
-        // Coarse real x∈[−5.6,0] (Y,Z ±2.8) → +X boundary circle at x ≈ −0.2. The sphere (Ø2) clears every
-        // other face.
         let of = Vec3::new(-vsf, -1.4 - vsf, -1.4 - vsf);
         let oc = Vec3::new(-5.6 - vsc, -2.8 - vsc, -2.8 - vsc);
-        let fine = mesh_chunk(&edits, &idx, &[], of, vsf, edge, 0, 0.0, 0, 0, false).expect("fine meshes");
+        let mut fine = mesh_chunk(&edits, &idx, &[], of, vsf, edge, 0, 0.0, 0, 0, false).expect("fine meshes");
         let coarse =
             mesh_chunk(&edits, &idx, &[], oc, vsc, edge, 0, 0.0, 1, 0, false).expect("coarse meshes");
 
-        // Bare chunks ARE cracked (two open boundary circles) — proves the seam is what closes it.
+        // Bare chunks ARE cracked (two open boundary circles) — proves the geomorph is what closes it.
         let mut bare = chunk_tris(&fine, of);
         bare.extend(chunk_tris(&coarse, oc));
-        assert!(open_edge_count(&bare) > 0, "bare 2-LOD sphere must be cracked without a seam");
+        assert!(open_edge_count(&bare) > 0, "bare 2-LOD sphere must be cracked before conforming");
 
-        // Seam: fine −X (bit 0) ↔ coarse +X (bit 1). Vertices are already world-space.
-        let (mut p, mut n, mut c, mut i) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
-        build_seam_into(&fine.boundary[0], &coarse.boundary[1], false, &mut p, &mut n, &mut c, &mut i);
-        assert!(!i.is_empty(), "seam produced no triangles");
-        let seam: Vec<_> = i
-            .chunks_exact(3)
-            .map(|t| {
-                let v = |k: u32| Vec3::from(p[k as usize]);
-                (v(t[0]), v(t[1]), v(t[2]))
-            })
-            .collect();
-
-        let mut all = bare;
-        all.extend(seam);
-        assert_eq!(open_edge_count(&all), 0, "fine + coarse + seam must be watertight");
-    }
-
-    #[test]
-    fn seam_harsh_lod_is_watertight_and_manifold() {
-        // A sphere HEAVILY undersampled by the coarse LOD (vs_c = 0.5 → ~2 coarse cells per radius) → strong
-        // fine↔coarse boundary divergence, the regime that produced fan + overlap artifacts. Fine + coarse +
-        // seam must still be a closed 2-MANIFOLD: open_edge_count counts edges shared by ≠2 triangles, so 0 ⇒
-        // no gaps (an edge in 1 triangle) AND no overlapping seam triangles (an edge in >2). This is the
-        // robust guard the coverage tests missed.
-        let edits = [sphere_edit(Vec3::ZERO, 1.2)];
-        let idx = [0u32];
-        let (vsf, vsc, edge) = (0.5f32, 1.0f32, 30u32); // coarse ~1.2 cells/radius → extreme divergence
-        let of = Vec3::new(-vsf, -7.0 - vsf, -7.0 - vsf);
-        let oc = Vec3::new(-28.0 - vsc, -14.0 - vsc, -14.0 - vsc);
-        let fine = mesh_chunk(&edits, &idx, &[], of, vsf, edge, 0, 0.0, 0, 0, false).expect("fine meshes");
-        let coarse = mesh_chunk(&edits, &idx, &[], oc, vsc, edge, 0, 0.0, 1, 0, false).expect("coarse meshes");
-        let (mut p, mut nrm, mut col, mut ix) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
-        build_seam_into(&fine.boundary[0], &coarse.boundary[1], false, &mut p, &mut nrm, &mut col, &mut ix);
-        let seam: Vec<_> = ix
-            .chunks_exact(3)
-            .map(|t| {
-                let v = |k: u32| Vec3::from(p[k as usize]);
-                (v(t[0]), v(t[1]), v(t[2]))
-            })
-            .collect();
+        // Fine −X (bit 0) conforms onto coarse +X (bit 1).
+        conform_boundary(&mut fine, of, &[(0, &coarse.boundary[1])]);
+        assert_eq!(
+            unwelded_boundary_verts(&fine, of, 0, &coarse, 1, 1e-4),
+            0,
+            "every conformed fine boundary vert must land on a coarse vert (no T-junction)"
+        );
         let mut all = chunk_tris(&fine, of);
         all.extend(chunk_tris(&coarse, oc));
-        all.extend(seam);
-        assert_eq!(
-            open_edge_count(&all),
-            0,
-            "harsh-LOD sphere + seam must be a closed 2-manifold (no gaps, no overlapping seam tris)"
-        );
+        assert_eq!(open_edge_count(&all), 0, "fine conformed to coarse must be watertight");
     }
 
     #[test]
-    fn seam_terrain_chain_has_no_gaps() {
-        // A heightmap (terrain) crossing a fine|coarse 2:1 boundary produces CHAIN boundaries. Every fine
-        // boundary edge must find a coarse counterpart across the boundary, or the seam has a mid-band gap
-        // (the artifact seen on the lod_test terrain). Reproduces it deterministically + diagnoses where.
+    fn geomorph_terrain_welds_no_tjunction() {
+        // A heightmap crossing a fine|coarse 2:1 boundary → CHAIN boundaries (the lod_test terrain regime).
+        // After the fine conforms, EVERY fine boundary vertex must coincide with a coarse boundary vertex
+        // (so the fine boundary is a refinement of the coarse one → no T-junctions / no fine-side gap), and
+        // no degenerate (zero-area) triangle may survive the conform.
         let edit = edits::ResolvedEdit::new(
             crate::sdf_render::SdfPrimitive::Heightmap {
                 half_xz: Vec2::new(400.0, 400.0),
@@ -1898,58 +1819,86 @@ mod tests {
         let edits = [edit];
         let idx = [0u32];
         let (vsf, vsc, edge) = (1.0f32, 2.0f32, 30u32);
-        // Fine on +X (its −X face borders coarse); coarse on −X, abutting at X=0. Both grid origins anchored
-        // so the LOD grids are 2:1-nested (gov = grid_origin/vs is integral). Y,Z span the terrain (~Y 15).
-        let of = Vec3::new(-vsf, -vsf, -vsf); // fine brick_min (0,0,0); covers ~[-1,28]^3
-        // coarse brick_max.x = 0 (abuts fine); Y,Z anchored so gov (=origin/vs) matches fine's → grids nested.
+        let of = Vec3::new(-vsf, -vsf, -vsf);
         let oc = Vec3::new(-56.0 - vsc, -vsc, -vsc);
-        let fine = mesh_chunk(&edits, &idx, &[], of, vsf, edge, 0, 0.0, 0, 0, false).expect("fine meshes");
+        let mut fine = mesh_chunk(&edits, &idx, &[], of, vsf, edge, 0, 0.0, 0, 0, false).expect("fine meshes");
         let coarse = mesh_chunk(&edits, &idx, &[], oc, vsc, edge, 0, 0.0, 1, 0, false).expect("coarse meshes");
 
-        // FINE-side coverage: every fine boundary vertex must find a coarse cell across the boundary within the
-        // tight ±1 search the seam uses — no fine-side gap on realistic terrain.
-        let mut cmap: HashMap<IVec2, BoundaryVert> = HashMap::new();
-        for l in &coarse.boundary[1] {
-            for v in &l.verts {
-                cmap.insert(v.cell, *v);
-            }
-        }
-        let found =
-            |c: IVec2| (-1..=1).any(|dy| (-1..=1).any(|dx| cmap.contains_key(&(c + IVec2::new(dx, dy)))));
-        let (mut ft, mut fm) = (0usize, 0usize);
-        for l in &fine.boundary[0] {
-            for v in &l.verts {
-                ft += 1;
-                if !found(IVec2::new(v.cell.x.div_euclid(2), v.cell.y.div_euclid(2))) {
-                    fm += 1;
-                }
-            }
-        }
-        assert_eq!(fm, 0, "{fm}/{ft} fine boundary verts have no coarse cell → fine-side gap");
+        conform_boundary(&mut fine, of, &[(0, &coarse.boundary[1])]);
 
-        // Build the actual seam and assert it's geometrically clean: FAN = max triangles touching one vertex
-        // (a loose match collapses many fine edges onto one coarse vertex), OVERLAP = edges shared by >2
-        // triangles (a non-order-preserving match crosses triangles). Neither shows up in coverage.
-        let (mut sp, mut sn, mut sc, mut si) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
-        build_seam_into(&fine.boundary[0], &coarse.boundary[1], false, &mut sp, &mut sn, &mut sc, &mut si);
-        let q = |p: [f32; 3]| [(p[0] * 1e3) as i64, (p[1] * 1e3) as i64, (p[2] * 1e3) as i64];
-        let mut vdeg: HashMap<[i64; 3], u32> = HashMap::new();
-        let mut edge: HashMap<([i64; 3], [i64; 3]), u32> = HashMap::new();
-        for t in si.chunks_exact(3) {
-            let vs = [sp[t[0] as usize], sp[t[1] as usize], sp[t[2] as usize]];
-            for v in vs {
-                *vdeg.entry(q(v)).or_insert(0) += 1;
-            }
-            for (a, b) in [(vs[0], vs[1]), (vs[1], vs[2]), (vs[2], vs[0])] {
-                let (ka, kb) = (q(a), q(b));
-                *edge.entry(if ka <= kb { (ka, kb) } else { (kb, ka) }).or_insert(0) += 1;
-            }
-        }
-        let max_deg = vdeg.values().copied().max().unwrap_or(0);
-        let overlaps = edge.values().filter(|&&n| n > 2).count();
-        eprintln!("seam tris={} max_vertex_degree={max_deg} overlap_edges={overlaps}", si.len() / 3);
-        assert!(max_deg <= 8, "fan: a vertex touches {max_deg} seam triangles (>8)");
-        assert_eq!(overlaps, 0, "{overlaps} seam edges shared by >2 triangles (overlap)");
+        let miss = unwelded_boundary_verts(&fine, of, 0, &coarse, 1, 1e-4);
+        assert_eq!(miss, 0, "{miss} fine boundary verts did not weld onto a coarse vert → T-junction/gap");
+
+        // No surviving degenerate triangles (two corners on the same position).
+        let degen = fine
+            .indices
+            .chunks_exact(3)
+            .filter(|t| {
+                let p = |i: u32| fine.positions[i as usize];
+                p(t[0]) == p(t[1]) || p(t[1]) == p(t[2]) || p(t[2]) == p(t[0])
+            })
+            .count();
+        assert_eq!(degen, 0, "{degen} degenerate triangles survived the conform");
+    }
+
+    #[test]
+    fn geomorph_corner_snaps_consistently() {
+        // A fine chunk bordering a coarser LOD on TWO faces (−X and −Z) — the chunk-edge corner. Snapping
+        // against the UNION of both neighbours must move each fine boundary vert onto a coarse vert on every
+        // face it lies on, so the corner has no leftover T-junction. A sphere centred at the −X/−Z corner.
+        let edits = [sphere_edit(Vec3::ZERO, 1.0)];
+        let idx = [0u32];
+        let (vsf, vsc, edge) = (0.1f32, 0.2f32, 30u32);
+        // Fine occupies +X,+Z (its −X and −Z faces border coarse). Two coarse neighbours: one across −X, one
+        // across −Z. All anchored so grids are 2:1-nested.
+        let of = Vec3::new(-vsf, -1.4 - vsf, -vsf);
+        let ox = Vec3::new(-5.6 - vsc, -2.8 - vsc, -2.8 - vsc); // coarse across −X
+        let oz = Vec3::new(-2.8 - vsc, -2.8 - vsc, -5.6 - vsc); // coarse across −Z
+        let mut fine = mesh_chunk(&edits, &idx, &[], of, vsf, edge, 0, 0.0, 0, 0, false).expect("fine meshes");
+        let cx = mesh_chunk(&edits, &idx, &[], ox, vsc, edge, 0, 0.0, 1, 0, false).expect("coarse X meshes");
+        let cz = mesh_chunk(&edits, &idx, &[], oz, vsc, edge, 0, 0.0, 1, 0, false).expect("coarse Z meshes");
+
+        // Conform against BOTH neighbours at once (the union — corner verts resolve to one global nearest).
+        conform_boundary(&mut fine, of, &[(0, &cx.boundary[1]), (4, &cz.boundary[5])]);
+
+        // The −X fine boundary must weld onto the X-neighbour; the −Z fine boundary onto the Z-neighbour.
+        assert_eq!(unwelded_boundary_verts(&fine, of, 0, &cx, 1, 1e-4), 0, "−X boundary unwelded at corner");
+        assert_eq!(unwelded_boundary_verts(&fine, of, 4, &cz, 5, 1e-4), 0, "−Z boundary unwelded at corner");
+    }
+
+    #[test]
+    fn conform_snaps_to_nearest_and_drops_degenerate() {
+        // Pure-fn check: two fine boundary verts that map into one coarse cell both snap onto that coarse
+        // vertex (exact pos + normal), and the fine triangle spanning them collapses to a degenerate that is
+        // dropped. A synthetic fine chunk: two boundary verts on the −X face (bit 0) sharing a triangle.
+        let cpos = Vec3::new(0.0, 0.5, 0.5);
+        let cnrm = Vec3::new(-1.0, 0.0, 0.0);
+        let coarse = vec![BoundaryLoop {
+            verts: vec![BoundaryVert { pos: cpos, normal: cnrm, cell: IVec2::new(0, 0), idx: 0 }],
+        }];
+        // Fine: 3 verts (idx 0,1 boundary near cpos; idx 2 interior), one triangle (0,1,2).
+        let origin = Vec3::ZERO;
+        let mut data = ChunkMeshData {
+            positions: vec![[0.0, 0.4, 0.5], [0.0, 0.6, 0.5], [0.5, 0.5, 0.5]],
+            normals: vec![[-0.9, 0.1, 0.0], [-0.9, -0.1, 0.0], [1.0, 0.0, 0.0]],
+            colors: vec![[1.0; 4]; 3],
+            indices: vec![0, 1, 2],
+            material: 0,
+            boundary: std::array::from_fn(|_| Vec::new()),
+        };
+        // Both fine boundary verts map to coarse cell (0,0) (their cell ÷2 = 0).
+        data.boundary[0] = vec![BoundaryLoop {
+            verts: vec![
+                BoundaryVert { pos: Vec3::new(0.0, 0.4, 0.5), normal: Vec3::ZERO, cell: IVec2::new(0, 0), idx: 0 },
+                BoundaryVert { pos: Vec3::new(0.0, 0.6, 0.5), normal: Vec3::ZERO, cell: IVec2::new(1, 0), idx: 1 },
+            ],
+        }];
+        conform_boundary(&mut data, origin, &[(0, &coarse)]);
+
+        assert_eq!(data.positions[0], [cpos.x, cpos.y, cpos.z], "vert 0 snapped to coarse pos");
+        assert_eq!(data.positions[1], [cpos.x, cpos.y, cpos.z], "vert 1 snapped to coarse pos");
+        assert_eq!(data.normals[0], [cnrm.x, cnrm.y, cnrm.z], "vert 0 adopted coarse normal");
+        assert!(data.indices.is_empty(), "the collapsed triangle (two corners on one coarse vert) is dropped");
     }
 
     #[test]
