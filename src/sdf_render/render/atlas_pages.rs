@@ -54,9 +54,14 @@ pub struct AtlasPages {
     /// enabled; otherwise empty (zero VRAM). See [`Self::grad_enabled`].
     grad: Vec<Texture>,
     grad_views: Vec<TextureView>,
-    /// 1×1 fills for the unused binding-array slots (one per format).
+    // 1×1 fills for the unused binding-array slots (one per format). Read only by the
+    // `*_refs` binding-array builders below, which the removed surface pass consumed — retained
+    // (with the dummies) as the foundation for a future cloud-raymarch atlas bind group.
+    #[allow(dead_code)]
     dummy_dist_view: TextureView,
+    #[allow(dead_code)]
     dummy_mat_view: TextureView,
+    #[allow(dead_code)]
     dummy_grad_view: TextureView,
 }
 
@@ -148,17 +153,24 @@ impl AtlasPages {
     /// fixed count. Returns RAW `wgpu::TextureView` refs — that's what `BindingResource::
     /// TextureViewArray` / `IntoBinding for &[&wgpu::TextureView]` takes (the single-view `IntoBinding`
     /// takes bevy's wrapper, but the array impl takes wgpu's; bevy's `TextureView` derefs to it).
+    ///
+    /// Unused since the surface pass was removed (it built the atlas bind group from these). Retained
+    /// wired for a future cloud-raymarch pass that would sample the same paged distance field.
+    #[allow(dead_code)]
     pub fn dist_refs(&self) -> Vec<&wgpu::TextureView> {
         fill_refs(&self.dist_views, &self.dummy_dist_view)
     }
+    #[allow(dead_code)]
     pub fn mat_refs(&self) -> Vec<&wgpu::TextureView> {
         fill_refs(&self.mat_views, &self.dummy_mat_view)
     }
+    #[allow(dead_code)]
     pub fn grad_refs(&self) -> Vec<&wgpu::TextureView> {
         fill_refs(&self.grad_views, &self.dummy_grad_view)
     }
 }
 
+#[allow(dead_code)] // see `*_refs` above — binding-array builder for the future cloud pass.
 fn fill_refs<'a>(views: &'a [TextureView], dummy: &'a TextureView) -> Vec<&'a wgpu::TextureView> {
     let mut refs: Vec<&wgpu::TextureView> = Vec::with_capacity(ATLAS_MAX_PAGES as usize);
     refs.extend(views.iter().map(|v| &**v));

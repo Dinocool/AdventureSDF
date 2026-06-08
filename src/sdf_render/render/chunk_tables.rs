@@ -68,8 +68,11 @@ impl PackedBuf {
         }
     }
 
+    // Only reached via the `ChunkTableBuffers` accessors below, which the removed surface bind
+    // group consumed. Retained for the future cloud-raymarch atlas bind group.
+    #[allow(dead_code)]
     fn buffer(&self) -> &Buffer {
-        self.buf.as_ref().expect("table buffer initialized in init_sdf_pipeline")
+        self.buf.as_ref().expect("table buffer initialized in init_sdf_atlas")
     }
 }
 
@@ -89,9 +92,13 @@ impl ChunkTableBuffers {
         }
     }
 
+    // Bind-group accessors for the directory + tile-run buffers. Unused since the surface pass
+    // (the only reader) was removed; retained wired for a future cloud-raymarch atlas bind group.
+    #[allow(dead_code)]
     pub(super) fn lookup_buffer(&self) -> &Buffer {
         self.directory.buffer()
     }
+    #[allow(dead_code)]
     pub(super) fn tile_buffer(&self) -> &Buffer {
         self.tiles.buffer()
     }
