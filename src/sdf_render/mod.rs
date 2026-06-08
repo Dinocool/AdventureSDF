@@ -55,6 +55,9 @@ mod gallery;
 // `mesh_test.rs`. Test-only generator like `gallery`; runtime loads the serialized `.scene`.
 #[cfg(test)]
 mod mesh_test;
+// LOD showcase scene (spiral of objects across LOD 0..=8) for the clipmap — see `lod_test.rs`.
+#[cfg(test)]
+mod lod_test;
 /// Phase-0 SDF→mesh bake spike (Surface Nets via `fast_surface_nets`). Added as `MeshBakePlugin` in
 /// `main.rs`; see `docs/MESH_BAKE_PLAN.md`.
 pub mod mesh_bake;
@@ -991,12 +994,12 @@ fn setup_sdf_scene(mut asset_table: ResMut<crate::assets::MaterialAssetTable>) {
     // loaded edit entities exist and the BVH can be built from them.
 }
 
-/// Path to the editor's default scene: the **mesh-bake test scene** (`mesh_test.rs`) — a small,
-/// legible CSG set (sharp cube / sphere / smooth blend / subtraction) for evaluating Surface Nets
-/// meshing during the SDF→mesh migration. The PBR gallery (`assets/scenes/gallery.scene`), the
-/// Cornell GI box (`assets/scenes/cornell.scene`), and the stress tower-field
-/// (`assets/scenes/stress.scene`) remain loadable via the scene browser.
-pub const DEFAULT_SCENE_PATH: &str = "assets/scenes/mesh_test.scene";
+/// Path to the editor's default scene: the **LOD showcase** (`lod_test.rs`) — a golden-angle spiral of
+/// varied primitives at exponentially increasing distance + size (small/detailed near → huge/coarse far),
+/// to exercise the Phase-3 clipmap (LOD 0..=8) + skirts via the Mesh Bake panel's "Colour by LOD". The
+/// small material/coherence scene (`assets/scenes/mesh_test.scene`), the PBR gallery, the Cornell GI box,
+/// and the stress tower-field remain loadable via the scene browser.
+pub const DEFAULT_SCENE_PATH: &str = "assets/scenes/lod_test.scene";
 
 /// Load the default scene into the world on editor enter. Exclusive (scene load
 /// needs `&mut World` + the type registry). Runs after `setup_sdf_scene` so the materials
