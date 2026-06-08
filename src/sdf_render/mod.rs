@@ -1,8 +1,10 @@
-//! # SDF clipmap renderer
+//! # SDF clipmap scene
 //!
-//! Renders an editable signed-distance-field world by raymarching a sparse brick atlas,
-//! with camera-centred LOD shells so it can reach vast distances. The data flow, in order,
-//! and where each stage lives:
+//! An editable signed-distance-field world with camera-centred LOD shells. It is now RENDERED
+//! by baked chunked meshes (`mesh_bake` + `mesh_material`); the on-screen surface raymarch was
+//! removed in the mesh-bake pivot (the sparse brick atlas + bake below remain as a gated-off
+//! foundation for a future volumetric-cloud raymarcher). The data flow, in order, and where
+//! each stage lives:
 //!
 //! 1. **Edits → analytic CSG field** (`edits`). Each [`SdfVolume`] is a primitive + CSG op
 //!    (`fold_csg`). This field is *resolution-independent*: callable at any point and any
