@@ -58,9 +58,11 @@ mod mesh_test;
 // LOD showcase scene (spiral of objects across LOD 0..=8) for the clipmap — see `lod_test.rs`.
 #[cfg(test)]
 mod lod_test;
-/// Phase-0 SDF→mesh bake spike (Surface Nets via `fast_surface_nets`). Added as `MeshBakePlugin` in
-/// `main.rs`; see `docs/MESH_BAKE_PLAN.md`.
+/// SDF→mesh bake (Transvoxel chunked clipmap). Added as `MeshBakePlugin` in `main.rs`; see
+/// `docs/MESH_BAKE_PLAN.md`.
 pub mod mesh_bake;
+/// Custom triplanar-PBR material for the baked meshes (`ExtendedMaterial<StandardMaterial, _>`).
+pub mod mesh_material;
 pub mod gizmo;
 pub(crate) mod height;
 pub mod light_grid;
