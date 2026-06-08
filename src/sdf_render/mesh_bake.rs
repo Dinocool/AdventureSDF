@@ -67,24 +67,23 @@ const FACES: [(u8, usize, bool, [usize; 2]); 6] = [
 
 /// A meshed surface vertex on a chunk FACE, cached for the cross-LOD GEOMORPH. Holds the reprojected WORLD
 /// position and analytic normal (a conforming fine vertex adopts the coarse vertex's pos AND normal, for
-/// continuous shading); `cell`, the vertex's WORLD-ALIGNED in-face cell coord in THIS chunk's LOD voxel units
-/// (a fine cell maps to its coarse cell by `cell.div_euclid(2)` at 2:1, to window the snap search); and `idx`,
-/// the vertex's index in the chunk's mesh arrays (so the fine side can be mutated in place).
+/// continuous shading), and `idx`, the vertex's index in the chunk's mesh arrays (so the fine side can be
+/// mutated in place). Ordering along the boundary curve (the `BoundaryLoop`) is what the geomorph merge uses;
+/// the coarse side only reads `pos`/`normal`.
 #[derive(Clone, Copy)]
 struct BoundaryVert {
     pos: Vec3,
     normal: Vec3,
-    cell: IVec2,
-    /// Index of this vertex in the chunk's `positions`/`normals` arrays — lets the geomorph MUTATE the fine
-    /// mesh in place (snap its boundary onto the coarse neighbour). The coarse side only reads `pos`/`normal`.
     idx: u32,
 }
 
 /// One ordered boundary component on a chunk face: its vertices in curve order (following the mesh's actual
-/// OPEN boundary edges).
+/// OPEN boundary edges), and whether it CLOSES (a cycle) vs is an open chain (ends at the face's edges). The
+/// geomorph's monotone merge needs this: a loop's first/last verts wrap, a chain's are fixed endpoints.
 #[derive(Clone)]
 struct BoundaryLoop {
     verts: Vec<BoundaryVert>,
+    is_loop: bool,
 }
 
 /// Raw mesh data produced off-thread by a meshing task (turned into a `Mesh` asset on the main thread).
@@ -647,7 +646,7 @@ fn mesh_chunk(
     }
     centroid = grid_origin + (centroid / buffer.positions.len().max(1) as f32) * vs;
     let material = edits::fold_csg(edits, centroid).material_id;
-    let boundary = extract_boundary(&buffer, &positions, &normals, grid_origin, vs, edge, trim_low);
+    let boundary = extract_boundary(&buffer, &positions, &normals, grid_origin, edge, trim_low);
     Some(ChunkMeshData { positions, normals, colors, indices, material, boundary })
 }
 
@@ -655,14 +654,12 @@ fn mesh_chunk(
 /// `positions` are chunk-LOCAL, so `grid_origin` is added back for cached WORLD positions. Iterates the
 /// original Surface-Nets mesh (`buffer.indices`, before skirts): an edge in exactly ONE triangle is a mesh
 /// boundary edge; those whose endpoints both sit on a face's boundary cell, linked into ordered loops, are
-/// that face's seam input. Each boundary vert also carries its world-aligned cell coord for the seam.
-#[allow(clippy::too_many_arguments)]
+/// that face's geomorph input (the fine side conforms a loop onto the matching coarse loop in curve order).
 fn extract_boundary(
     buffer: &SurfaceNetsBuffer,
     positions: &[[f32; 3]],
     normals: &[[f32; 3]],
     grid_origin: Vec3,
-    vs: f32,
     edge: u32,
     trim_low: u8,
 ) -> [Vec<BoundaryLoop>; 6] {
@@ -674,13 +671,9 @@ fn extract_boundary(
         }
     }
     let open: Vec<(u32, u32)> = ecount.iter().filter(|(_, c)| **c == 1).map(|(e, _)| *e).collect();
-    // Grid origin in this chunk's LOD voxel units (anchored at world 0), so `gov + surface_point` is a
-    // WORLD-ALIGNED cell coord that the seam can match across LODs by `div_euclid(2)`.
-    let go = grid_origin / vs;
-    let gov = [go.x.round() as i32, go.y.round() as i32, go.z.round() as i32];
 
     let mut out: [Vec<BoundaryLoop>; 6] = std::array::from_fn(|_| Vec::new());
-    for (bit, axis, is_high, tan) in FACES {
+    for (bit, axis, is_high, _tan) in FACES {
         // The crate meshes cells [smin, edge-1): a HIGH boundary sits at cell edge-2; a LOW boundary at cell 0
         // normally, but at cell 1 when the face was INSET (`trim_low`) to skip the over-reaching apron.
         let bcell = if is_high {
@@ -701,25 +694,22 @@ fn extract_boundary(
         }
         let nodes: Vec<u32> = adj.keys().copied().collect();
         let mut visited: HashSet<u32> = HashSet::new();
-        let bv = |i: u32| {
-            let sp = buffer.surface_points[i as usize];
-            BoundaryVert {
-                pos: grid_origin + Vec3::from(positions[i as usize]),
-                normal: Vec3::from(normals[i as usize]),
-                cell: IVec2::new(gov[tan[0]] + sp[tan[0]] as i32, gov[tan[1]] + sp[tan[1]] as i32),
-                idx: i,
-            }
+        let bv = |i: u32| BoundaryVert {
+            pos: grid_origin + Vec3::from(positions[i as usize]),
+            normal: Vec3::from(normals[i as usize]),
+            idx: i,
         };
-        let to_loop = |comp: Vec<u32>| BoundaryLoop { verts: comp.into_iter().map(bv).collect() };
+        let to_loop =
+            |comp: Vec<u32>, is_loop: bool| BoundaryLoop { verts: comp.into_iter().map(bv).collect(), is_loop };
         // Chains first (start at a degree-1 endpoint); any remaining cycles are closed loops.
         for &s in &nodes {
             if !visited.contains(&s) && adj[&s].len() == 1 {
-                out[bit as usize].push(to_loop(walk_open_edges(&adj, &mut visited, s)));
+                out[bit as usize].push(to_loop(walk_open_edges(&adj, &mut visited, s), false));
             }
         }
         for &s in &nodes {
             if !visited.contains(&s) {
-                out[bit as usize].push(to_loop(walk_open_edges(&adj, &mut visited, s)));
+                out[bit as usize].push(to_loop(walk_open_edges(&adj, &mut visited, s), true));
             }
         }
     }
@@ -796,45 +786,32 @@ fn conform_boundary(data: &mut ChunkMeshData, origin: Vec3, neighbours: &[(u8, &
     if neighbours.is_empty() {
         return;
     }
-    const WINDOW: i32 = 1; // search ±1 coarse cell around the fine vert's mapped cell (keeps it curve-local)
-    // Nearest coarse target (dist², world pos, world normal) per fine vertex INDEX, taking the global minimum
-    // across every coarser-bordering face the vertex lies on (so corners resolve consistently).
+    // Chosen coarse target (dist², world pos, world normal) per fine vertex INDEX — global min across the faces
+    // a vertex lies on (so a chunk-edge corner resolves consistently).
     let mut snap: HashMap<u32, (f32, Vec3, Vec3)> = HashMap::new();
     for &(bit, coarse) in neighbours {
         if coarse.is_empty() {
             continue;
         }
-        // Coarse boundary verts bucketed by world-aligned cell (coarse LOD units) for a local window search.
-        let mut cmap: HashMap<IVec2, Vec<BoundaryVert>> = HashMap::new();
-        for cl in coarse {
-            for v in &cl.verts {
-                cmap.entry(v.cell).or_default().push(*v);
-            }
-        }
         for fl in &data.boundary[bit as usize] {
-            for fv in &fl.verts {
-                let base = IVec2::new(fv.cell.x.div_euclid(2), fv.cell.y.div_euclid(2));
-                let mut best: Option<(f32, Vec3, Vec3)> = None;
-                for dy in -WINDOW..=WINDOW {
-                    for dx in -WINDOW..=WINDOW {
-                        let Some(vs) = cmap.get(&(base + IVec2::new(dx, dy))) else {
-                            continue;
-                        };
-                        for cv in vs {
-                            let d = cv.pos.distance_squared(fv.pos);
-                            if best.is_none_or(|(bd, ..)| d < bd) {
-                                best = Some((d, cv.pos, cv.normal));
-                            }
-                        }
-                    }
-                }
-                if let Some((d, p, nrm)) = best {
-                    let e = snap.entry(fv.idx).or_insert((f32::INFINITY, Vec3::ZERO, Vec3::ZERO));
-                    if d < e.0 {
-                        *e = (d, p, nrm);
-                    }
-                }
+            if fl.verts.is_empty() {
+                continue;
             }
+            // Match this fine boundary component to the coarse component tracing the same curve (nearest
+            // centroid), then assign fine→coarse by a monotone, surjective arc-length merge.
+            let fc = loop_centroid(&fl.verts);
+            let Some(cl) = coarse
+                .iter()
+                .filter(|c| !c.verts.is_empty())
+                .min_by(|a, b| {
+                    loop_centroid(&a.verts)
+                        .distance_squared(fc)
+                        .total_cmp(&loop_centroid(&b.verts).distance_squared(fc))
+                })
+            else {
+                continue;
+            };
+            assign_monotone(fl, cl, &mut snap);
         }
     }
     if snap.is_empty() {
@@ -858,6 +835,99 @@ fn conform_boundary(data: &mut ChunkMeshData, origin: Vec3, neighbours: &[(u8, &
         }
     }
     data.indices = kept;
+}
+
+/// Mean position of a boundary component's vertices (to match a fine component to its coarse counterpart).
+fn loop_centroid(verts: &[BoundaryVert]) -> Vec3 {
+    let s: Vec3 = verts.iter().map(|v| v.pos).sum();
+    s / verts.len().max(1) as f32
+}
+
+/// Normalised cumulative arc-length (chord) parameter in `[0,1)` for each vertex along a polyline; a LOOP
+/// includes the closing edge in the total so the parameterisation is uniform around the cycle.
+fn arclen_params(pos: &[Vec3], is_loop: bool) -> Vec<f32> {
+    let n = pos.len();
+    let mut cum = vec![0.0f32; n];
+    for i in 1..n {
+        cum[i] = cum[i - 1] + pos[i].distance(pos[i - 1]);
+    }
+    let total = if is_loop && n > 1 { cum[n - 1] + pos[0].distance(pos[n - 1]) } else { cum[n - 1] };
+    let total = if total > 1e-12 { total } else { 1.0 };
+    cum.iter().map(|c| c / total).collect()
+}
+
+/// Monotone, SURJECTIVE merge of `tf.len()` fine params onto `tc.len()` coarse params (both sorted in `[0,1)`):
+/// returns, per fine index, the coarse index it maps to. The mapping never decreases (so fine boundary edges
+/// reproduce coarse edges → no skip/cross), and `must_advance` forces the coarse pointer to reach the last
+/// vertex by the last fine vertex (so every coarse vertex is hit → no gap), provided fine is at least as dense.
+fn merge_assign(tf: &[f32], tc: &[f32]) -> Vec<usize> {
+    let (n, m) = (tf.len(), tc.len());
+    let mut out = vec![0usize; n];
+    let mut j = 0usize;
+    for (i, out_i) in out.iter_mut().enumerate() {
+        *out_i = j;
+        if j + 1 < m {
+            let must = (n - 1 - i) <= (m - 1 - j); // reserve enough fine verts to cover the remaining coarse
+            let want = tf[i] >= 0.5 * (tc[j] + tc[j + 1]); // past the midpoint toward the next coarse vert
+            if must || want {
+                j += 1;
+            }
+        }
+    }
+    out
+}
+
+/// Assign every vertex of fine boundary loop `fl` onto a vertex of the matching coarse loop `cl` by a monotone
+/// arc-length merge, writing the nearest-wins target into `snap`. Tries both orientations (and, for a loop,
+/// every rotational offset) and keeps the alignment with the least total snap distance — so the fine boundary
+/// collapses onto the coarse one in curve order, welding watertight with no edge skips.
+fn assign_monotone(fl: &BoundaryLoop, cl: &BoundaryLoop, snap: &mut HashMap<u32, (f32, Vec3, Vec3)>) {
+    let (f, c) = (&fl.verts, &cl.verts);
+    let (n, m) = (f.len(), c.len());
+    if n == 0 || m == 0 {
+        return;
+    }
+    let mut consider = |idx: u32, fp: Vec3, cp: Vec3, cn: Vec3| {
+        let d = fp.distance_squared(cp);
+        let e = snap.entry(idx).or_insert((f32::INFINITY, Vec3::ZERO, Vec3::ZERO));
+        if d < e.0 {
+            *e = (d, cp, cn);
+        }
+    };
+    if m == 1 {
+        for fv in f {
+            consider(fv.idx, fv.pos, c[0].pos, c[0].normal);
+        }
+        return;
+    }
+    let fpos: Vec<Vec3> = f.iter().map(|v| v.pos).collect();
+    let tf = arclen_params(&fpos, fl.is_loop);
+    // Candidate coarse orderings: a loop can start at any vertex and run either way; a chain only forward/reversed.
+    let mut cands: Vec<Vec<usize>> = Vec::new();
+    if fl.is_loop {
+        for r in 0..m {
+            cands.push((0..m).map(|k| (r + k) % m).collect());
+            cands.push((0..m).map(|k| (r + m - k) % m).collect());
+        }
+    } else {
+        cands.push((0..m).collect());
+        cands.push((0..m).rev().collect());
+    }
+    let mut best: Option<(f32, Vec<usize>, Vec<usize>)> = None; // (cost, coarse ordering, fine→ordering-pos)
+    for cseq in cands {
+        let cpos: Vec<Vec3> = cseq.iter().map(|&j| c[j].pos).collect();
+        let tc = arclen_params(&cpos, cl.is_loop);
+        let assign = merge_assign(&tf, &tc);
+        let cost: f32 = (0..n).map(|i| fpos[i].distance_squared(cpos[assign[i]])).sum();
+        if best.as_ref().is_none_or(|(bc, ..)| cost < *bc) {
+            best = Some((cost, cseq, assign));
+        }
+    }
+    let (_, cseq, assign) = best.unwrap();
+    for i in 0..n {
+        let cv = &c[cseq[assign[i]]];
+        consider(f[i].idx, f[i].pos, cv.pos, cv.normal);
+    }
 }
 
 /// Append skirt curtains for the coarser-neighbour faces (`face_flags`). Variant A′: a boundary vertex's
@@ -1767,6 +1837,33 @@ mod tests {
     }
 
     #[test]
+    fn geomorph_harsh_undersampling_stays_bounded() {
+        // EXTREME 2:1+ undersampling (vs_c = 1.0 vs vs_f = 0.5, sphere R = 1.2 → only ~4 coarse boundary verts
+        // for ~20 fine). The monotone arc-length merge can't fully weld when the coarse boundary is THIS sparse
+        // (a coarse vertex can have no fine vertex closest to it), but it must stay BOUNDED — strictly better
+        // than the pre-merge independent snap (which left 8 open edges here) — not explode. Realistic 2:1 still
+        // welds to 0 (see `geomorph_welds_2to1_sphere_watertight`). This guards the merge against regressing.
+        let edits = [sphere_edit(Vec3::ZERO, 1.2)];
+        let idx = [0u32];
+        let (vsf, vsc, edge) = (0.5f32, 1.0f32, 30u32);
+        let of = Vec3::new(-vsf, -7.0 - vsf, -7.0 - vsf);
+        let oc = Vec3::new(-28.0 - vsc, -14.0 - vsc, -14.0 - vsc);
+        let mut fine = mesh_chunk(&edits, &idx, &[], of, vsf, edge, 0, 0.0, 0, 0, false).expect("fine");
+        let coarse = mesh_chunk(&edits, &idx, &[], oc, vsc, edge, 0, 0.0, 1, 0, false).expect("coarse");
+        let bare = {
+            let mut t = chunk_tris(&fine, of);
+            t.extend(chunk_tris(&coarse, oc));
+            open_edge_count(&t)
+        };
+        conform_boundary(&mut fine, of, &[(0, &coarse.boundary[1])]);
+        let mut all = chunk_tris(&fine, of);
+        all.extend(chunk_tris(&coarse, oc));
+        let open = open_edge_count(&all);
+        assert!(open < bare, "merge must reduce open edges ({open} vs bare {bare})");
+        assert!(open <= 6, "even at extreme undersampling the weld must stay bounded, got {open} open edges");
+    }
+
+    #[test]
     fn geomorph_welds_2to1_sphere_watertight() {
         // A sphere straddling a forced fine|coarse 2:1 boundary at x = 0: the FINE chunk (vs 0.1) meshes the
         // +X side (its −X face borders coarse), the COARSE chunk (vs 0.2) the −X side, each ending in a
@@ -1861,9 +1958,43 @@ mod tests {
         // Conform against BOTH neighbours at once (the union — corner verts resolve to one global nearest).
         conform_boundary(&mut fine, of, &[(0, &cx.boundary[1]), (4, &cz.boundary[5])]);
 
-        // The −X fine boundary must weld onto the X-neighbour; the −Z fine boundary onto the Z-neighbour.
-        assert_eq!(unwelded_boundary_verts(&fine, of, 0, &cx, 1, 1e-4), 0, "−X boundary unwelded at corner");
-        assert_eq!(unwelded_boundary_verts(&fine, of, 4, &cz, 5, 1e-4), 0, "−Z boundary unwelded at corner");
+        // Every fine boundary vert on either coarser-bordering face must land on a coarse vert of the UNION
+        // (cx ∪ cz). A corner vertex correctly welds to whichever neighbour is nearer — not necessarily both —
+        // so the check is against the union, not per-face.
+        let union: Vec<Vec3> = cx.boundary[1]
+            .iter()
+            .chain(cz.boundary[5].iter())
+            .flat_map(|l| l.verts.iter().map(|v| v.pos))
+            .collect();
+        let mut miss = 0;
+        for face in [0usize, 4] {
+            for l in &fine.boundary[face] {
+                for v in &l.verts {
+                    let w = of + Vec3::from(fine.positions[v.idx as usize]);
+                    if !union.iter().any(|c| c.distance(w) <= 1e-4) {
+                        miss += 1;
+                    }
+                }
+            }
+        }
+        assert_eq!(miss, 0, "{miss} fine corner boundary verts did not weld onto any coarse vert");
+    }
+
+    #[test]
+    fn merge_assign_is_monotone_and_surjective() {
+        // THE watertightness guarantee, isolated: mapping a denser fine boundary onto a sparser coarse one
+        // must be MONOTONE (so fine boundary edges never skip/cross coarse edges → the live terrain gaps) and
+        // SURJECTIVE (every coarse vertex hit → no coarse-side gap), with the ends pinned. Holds for any curve.
+        let tc: Vec<f32> = (0..5).map(|j| j as f32 / 5.0).collect();
+        let tf: Vec<f32> = (0..23).map(|i| i as f32 / 23.0).collect();
+        let a = merge_assign(&tf, &tc);
+        for w in a.windows(2) {
+            assert!(w[1] >= w[0], "assignment must be non-decreasing (monotone)");
+        }
+        let hit: std::collections::HashSet<_> = a.iter().copied().collect();
+        assert_eq!(hit.len(), tc.len(), "every coarse vertex must be covered (surjective)");
+        assert_eq!(a[0], 0, "first fine maps to first coarse");
+        assert_eq!(*a.last().unwrap(), tc.len() - 1, "last fine maps to last coarse");
     }
 
     #[test]
@@ -1874,7 +2005,8 @@ mod tests {
         let cpos = Vec3::new(0.0, 0.5, 0.5);
         let cnrm = Vec3::new(-1.0, 0.0, 0.0);
         let coarse = vec![BoundaryLoop {
-            verts: vec![BoundaryVert { pos: cpos, normal: cnrm, cell: IVec2::new(0, 0), idx: 0 }],
+            verts: vec![BoundaryVert { pos: cpos, normal: cnrm, idx: 0 }],
+            is_loop: false,
         }];
         // Fine: 3 verts (idx 0,1 boundary near cpos; idx 2 interior), one triangle (0,1,2).
         let origin = Vec3::ZERO;
@@ -1886,12 +2018,13 @@ mod tests {
             material: 0,
             boundary: std::array::from_fn(|_| Vec::new()),
         };
-        // Both fine boundary verts map to coarse cell (0,0) (their cell ÷2 = 0).
+        // Both fine boundary verts map to the single coarse vert (m==1 branch).
         data.boundary[0] = vec![BoundaryLoop {
             verts: vec![
-                BoundaryVert { pos: Vec3::new(0.0, 0.4, 0.5), normal: Vec3::ZERO, cell: IVec2::new(0, 0), idx: 0 },
-                BoundaryVert { pos: Vec3::new(0.0, 0.6, 0.5), normal: Vec3::ZERO, cell: IVec2::new(1, 0), idx: 1 },
+                BoundaryVert { pos: Vec3::new(0.0, 0.4, 0.5), normal: Vec3::ZERO, idx: 0 },
+                BoundaryVert { pos: Vec3::new(0.0, 0.6, 0.5), normal: Vec3::ZERO, idx: 1 },
             ],
+            is_loop: false,
         }];
         conform_boundary(&mut data, origin, &[(0, &coarse)]);
 
