@@ -66,11 +66,13 @@ const FACES: [(u8, usize, bool, [usize; 2]); 6] = [
 ];
 
 /// A meshed surface vertex on a chunk FACE, cached for the seam pass: reprojected WORLD position + analytic
-/// normal, shared verbatim by the seam so it welds with no T-junctions.
+/// normal (shared verbatim by the seam so it welds with no T-junctions) + the material's linear base colour
+/// (so the seam strip's albedo matches the surfaces it bridges).
 #[derive(Clone, Copy)]
 struct BoundaryVert {
     pos: Vec3,
     normal: Vec3,
+    base: [f32; 3],
 }
 
 /// One ordered boundary component on a chunk face: its vertices in curve order (following the mesh's actual
@@ -168,6 +170,9 @@ struct ChunkState {
     /// Per-face boundary loops of the DISPLAYED mesh, copied at COMMIT — read by the seam pass to stitch
     /// this chunk to its differently-LOD'd neighbours.
     boundary: [Vec<BoundaryLoop>; 6],
+    /// Dominant material id of the DISPLAYED mesh — the seam strip takes the fine chunk's, so it uses the
+    /// same lit `StandardMaterial` as the surfaces it bridges.
+    material: u16,
 }
 
 /// Per-resident-chunk bake state.
@@ -605,7 +610,7 @@ fn mesh_chunk(
     }
     centroid = grid_origin + (centroid / buffer.positions.len().max(1) as f32) * vs;
     let material = edits::fold_csg(edits, centroid).material_id;
-    let boundary = extract_boundary(&buffer, &positions, &normals, grid_origin, edge);
+    let boundary = extract_boundary(&buffer, &positions, &normals, &colors, grid_origin, edge);
     Some(ChunkMeshData { positions, normals, colors, indices, material, boundary })
 }
 
@@ -619,6 +624,7 @@ fn extract_boundary(
     buffer: &SurfaceNetsBuffer,
     positions: &[[f32; 3]],
     normals: &[[f32; 3]],
+    colors: &[[f32; 4]],
     grid_origin: Vec3,
     edge: u32,
 ) -> [Vec<BoundaryLoop>; 6] {
@@ -630,9 +636,13 @@ fn extract_boundary(
         }
     }
     let open: Vec<(u32, u32)> = ecount.iter().filter(|(_, c)| **c == 1).map(|(e, _)| *e).collect();
-    let bv = |i: u32| BoundaryVert {
-        pos: grid_origin + Vec3::from(positions[i as usize]),
-        normal: Vec3::from(normals[i as usize]),
+    let bv = |i: u32| {
+        let c = colors[i as usize];
+        BoundaryVert {
+            pos: grid_origin + Vec3::from(positions[i as usize]),
+            normal: Vec3::from(normals[i as usize]),
+            base: [c[0], c[1], c[2]],
+        }
     };
 
     let mut out: [Vec<BoundaryLoop>; 6] = std::array::from_fn(|_| Vec::new());
@@ -704,10 +714,18 @@ fn coarse_neighbour_key(fine: BrickKey, dir: IVec3, step: i32) -> BrickKey {
     BrickKey::new(fine.lod + 1, IVec3::new(snap(half.x), snap(half.y), snap(half.z)))
 }
 
-/// Mean world position of a boundary loop.
-fn loop_centroid(l: &BoundaryLoop) -> Vec3 {
-    let sum: Vec3 = l.verts.iter().map(|v| v.pos).sum();
-    sum / l.verts.len().max(1) as f32
+/// Squared distance between the two CLOSEST vertices of two boundary loops. Used to match a fine loop to its
+/// coarse counterpart: the same surface curve at two resolutions has near-touching boundaries (≈ a voxel
+/// apart), whereas unrelated curves (e.g. a floating sphere vs the terrain below) are far — so a threshold
+/// on this cleanly rejects wrong matches.
+fn loop_min_dist_sq(a: &BoundaryLoop, b: &BoundaryLoop) -> f32 {
+    let mut best = f32::INFINITY;
+    for va in &a.verts {
+        for vb in &b.verts {
+            best = best.min(va.pos.distance_squared(vb.pos));
+        }
+    }
+    best
 }
 
 /// Walk one connected component of the open-edge adjacency graph from `start`, in curve order.
@@ -741,8 +759,10 @@ fn zipper(
     colors: &mut Vec<[f32; 4]>,
     indices: &mut Vec<u32>,
 ) {
-    let mut fp: Vec<(Vec3, Vec3)> = fl.verts.iter().map(|v| (v.pos, v.normal)).collect();
-    let mut cp: Vec<(Vec3, Vec3)> = cl.verts.iter().map(|v| (v.pos, v.normal)).collect();
+    let mut fp: Vec<(Vec3, Vec3, [f32; 3])> =
+        fl.verts.iter().map(|v| (v.pos, v.normal, v.base)).collect();
+    let mut cp: Vec<(Vec3, Vec3, [f32; 3])> =
+        cl.verts.iter().map(|v| (v.pos, v.normal, v.base)).collect();
     if fp.len() < 2 || cp.len() < 2 {
         return;
     }
@@ -762,15 +782,16 @@ fn zipper(
     } else if cp[0].0.distance_squared(fp[0].0) > cp[cp.len() - 1].0.distance_squared(fp[0].0) {
         cp.reverse();
     }
-    let col = if debug { SEAM_DEBUG_COLOUR } else { [1.0, 1.0, 1.0, 1.0] };
-    let mut emit = |a: (Vec3, Vec3), b: (Vec3, Vec3), c: (Vec3, Vec3)| {
-        let base = positions.len() as u32;
-        for (p, nrm) in [a, b, c] {
+    let mut emit = |a: (Vec3, Vec3, [f32; 3]), b: (Vec3, Vec3, [f32; 3]), c: (Vec3, Vec3, [f32; 3])| {
+        let idx0 = positions.len() as u32;
+        for (p, nrm, base) in [a, b, c] {
             positions.push([p.x, p.y, p.z]);
             normals.push([nrm.x, nrm.y, nrm.z]);
-            colors.push(col);
+            // Debug: magenta seam tint; normal: the surface's material base colour (per-vertex, blends
+            // fine↔coarse) — vertex colour rules the lit StandardMaterial's albedo, matching the chunks.
+            colors.push(if debug { SEAM_DEBUG_COLOUR } else { [base[0], base[1], base[2], 1.0] });
         }
-        indices.extend_from_slice(&[base, base + 1, base + 2]);
+        indices.extend_from_slice(&[idx0, idx0 + 1, idx0 + 2]);
     };
     let (mut i, mut j) = (0usize, 0usize);
     while i + 1 < fp.len() || j + 1 < cp.len() {
@@ -793,11 +814,15 @@ fn zipper(
 }
 
 /// Build the seam ribbon between a fine chunk's boundary loops and its coarser neighbour's boundary loops
-/// (already the matching opposite faces). Each fine loop is matched to the nearest coarse loop (by centroid)
-/// and zipped. Appends world-space geometry.
+/// (already the matching opposite faces). Each fine loop is matched to the coarse loop whose nearest vertex
+/// is closest, and zipped — but ONLY if that nearest vertex is within `max_dist` (else the fine loop is a
+/// feature with no coarse counterpart, e.g. a small object that vanished at the coarse LOD, and must not be
+/// bridged to an unrelated surface). Appends world-space geometry.
+#[allow(clippy::too_many_arguments)]
 fn build_seam_into(
     fine: &[BoundaryLoop],
     coarse: &[BoundaryLoop],
+    max_dist: f32,
     debug: bool,
     positions: &mut Vec<[f32; 3]>,
     normals: &mut Vec<[f32; 3]>,
@@ -808,13 +833,16 @@ fn build_seam_into(
         return;
     }
     for fl in fine {
-        let fcen = loop_centroid(fl);
-        let cl = coarse
+        let Some((d2, cl)) = coarse
             .iter()
-            .min_by(|a, b| {
-                loop_centroid(a).distance_squared(fcen).total_cmp(&loop_centroid(b).distance_squared(fcen))
-            })
-            .unwrap();
+            .map(|cl| (loop_min_dist_sq(fl, cl), cl))
+            .min_by(|a, b| a.0.total_cmp(&b.0))
+        else {
+            continue;
+        };
+        if d2 > max_dist * max_dist {
+            continue; // no coarse counterpart near this fine loop → leave it (don't bridge to a stranger)
+        }
         zipper(fl, cl, debug, positions, normals, colors, indices);
     }
 }
@@ -1184,8 +1212,9 @@ fn mesh_resident_chunks(
                 // Empty chunk: no mesh, and clear any stale boundary cache.
                 None => st.boundary = std::array::from_fn(|_| Vec::new()),
                 Some(data) => {
-                    // Cache the boundary verts for the seam pass (partial move — distinct field from the rest).
+                    // Cache the boundary verts + dominant material for the seam pass (partial moves).
                     st.boundary = data.boundary;
+                    st.material = data.material;
                     // Debug "Colour by LOD": one shared UNLIT white material (the LOD/skirt tint lives in the
                     // vertex COLOUR). Normal: a lit StandardMaterial per dominant material id (cached) — base
                     // WHITE so the per-vertex base COLOUR rules; metallic/roughness/emissive from the registry.
@@ -1265,20 +1294,6 @@ fn mesh_resident_chunks(
         }
         if mesh_cfg.seams_enabled {
             let step = k as i32 * config.cell_stride();
-            // Seam material: unlit white in the debug LOD view (vertex tint rules), else a neutral lit white.
-            let seam_mat = mat_cache
-                .entry(if mesh_cfg.debug_lod_colour { u16::MAX } else { u16::MAX - 1 })
-                .or_insert_with(|| {
-                    materials.add(StandardMaterial {
-                        base_color: Color::WHITE,
-                        unlit: mesh_cfg.debug_lod_colour,
-                        perceptual_roughness: 0.8,
-                        double_sided: true,
-                        cull_mode: None,
-                        ..default()
-                    })
-                })
-                .clone();
             for (&fkey, fst) in states.0.iter() {
                 let flags = chunk_face_flags(fkey, &config, k, round.cam, round.half0);
                 if flags == 0 {
@@ -1296,9 +1311,13 @@ fn mesh_resident_chunks(
                     let Some(cst) = states.0.get(&ckey) else {
                         continue; // coarse neighbour not resident (outer ring edge) → no strip there
                     };
+                    // Match-distance cap: the same curve at the two LODs touches within ~a coarse voxel, so a
+                    // few coarse voxels cleanly accepts real counterparts and rejects unrelated loops.
+                    let max_dist = 4.0 * config.voxel_size_at(fkey.lod + 1);
                     build_seam_into(
                         &fst.boundary[bit as usize],
                         &cst.boundary[opposite_face(bit) as usize],
+                        max_dist,
                         mesh_cfg.debug_lod_colour,
                         &mut positions,
                         &mut normals,
@@ -1309,6 +1328,41 @@ fn mesh_resident_chunks(
                 if indices.is_empty() {
                     continue;
                 }
+                // Same material the chunks use: debug → shared unlit white (vertex tint rules); else the FINE
+                // chunk's dominant lit StandardMaterial (per-vertex base colour blends fine↔coarse on top).
+                let seam_mat = if mesh_cfg.debug_lod_colour {
+                    mat_cache
+                        .entry(u16::MAX)
+                        .or_insert_with(|| {
+                            materials.add(StandardMaterial {
+                                base_color: Color::WHITE,
+                                unlit: true,
+                                double_sided: true,
+                                cull_mode: None,
+                                ..default()
+                            })
+                        })
+                        .clone()
+                } else {
+                    mat_cache
+                        .entry(fst.material)
+                        .or_insert_with(|| {
+                            let a = appearances
+                                .get(fst.material as usize)
+                                .copied()
+                                .unwrap_or(DEFAULT_APPEARANCE);
+                            materials.add(StandardMaterial {
+                                base_color: Color::WHITE,
+                                metallic: a.metallic,
+                                perceptual_roughness: a.roughness.max(0.045),
+                                emissive: LinearRgba::rgb(a.emissive[0], a.emissive[1], a.emissive[2]),
+                                double_sided: true,
+                                cull_mode: None,
+                                ..default()
+                            })
+                        })
+                        .clone()
+                };
                 let mesh = Mesh::new(PrimitiveTopology::TriangleList, RenderAssetUsages::default())
                     .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, positions)
                     .with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, normals)
@@ -1316,7 +1370,7 @@ fn mesh_resident_chunks(
                     .with_inserted_indices(Indices::U32(indices));
                 commands.spawn((
                     Mesh3d(mesh_assets.add(mesh)),
-                    MeshMaterial3d(seam_mat.clone()),
+                    MeshMaterial3d(seam_mat),
                     Transform::IDENTITY, // seam geometry is already in world space
                     SeamMesh,
                     Name::new("SDF Seam Mesh"),
@@ -1714,7 +1768,7 @@ mod tests {
 
         // Seam: fine −X (bit 0) ↔ coarse +X (bit 1). Vertices are already world-space.
         let (mut p, mut n, mut c, mut i) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
-        build_seam_into(&fine.boundary[0], &coarse.boundary[1], false, &mut p, &mut n, &mut c, &mut i);
+        build_seam_into(&fine.boundary[0], &coarse.boundary[1], 10.0, false, &mut p, &mut n, &mut c, &mut i);
         assert!(!i.is_empty(), "seam produced no triangles");
         let seam: Vec<_> = i
             .chunks_exact(3)
