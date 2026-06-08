@@ -218,7 +218,8 @@ pub struct MeshBakePlugin;
 
 impl Plugin for MeshBakePlugin {
     fn build(&self, app: &mut App) {
-        app.init_resource::<ChunkStates>()
+        app.add_plugins(super::mesh_material::MeshMaterialPlugin)
+            .init_resource::<ChunkStates>()
             .init_resource::<MeshBakeConfig>()
             .init_resource::<MeshBakeRebuild>()
             .init_resource::<MeshBakeStats>()
@@ -226,7 +227,10 @@ impl Plugin for MeshBakePlugin {
             // gameplay too. It self-determines which chunks to mesh from the SDF edits (no dependency
             // on the editor-scene-gated GPU SDF atlas) and no-ops when no SDF volumes exist — which
             // also clears the meshes when an SDF scene is left.
-            .add_systems(Update, mesh_resident_chunks);
+            .add_systems(
+                Update,
+                mesh_resident_chunks.after(super::mesh_material::rebuild_mesh_materials),
+            );
         // Editor-only: a dedicated bottom dock panel for the mesh-bake controls (a debug overlay; the
         // bake above does not depend on it).
         #[cfg(feature = "editor")]
@@ -633,10 +637,9 @@ fn mesh_resident_chunks(
     mut rebuild: ResMut<MeshBakeRebuild>,
     mut stats: ResMut<MeshBakeStats>,
     mut mesh_assets: ResMut<Assets<Mesh>>,
-    mut materials: ResMut<Assets<StandardMaterial>>,
-    // Lit `StandardMaterial` per material id (base WHITE — per-vertex base comes from the vertex COLOUR —
-    // plus the material's metallic/roughness/emissive). Cleared + rebuilt when material appearances change.
-    mut mat_cache: Local<HashMap<u16, Handle<StandardMaterial>>>,
+    // Per-material triplanar `MeshMaterial` handles (built by `mesh_material::rebuild_mesh_materials`); the
+    // chunk picks its dominant material's handle, or the shared unlit debug handle in Colour-by-LOD.
+    mesh_mats: Res<super::mesh_material::MeshMaterials>,
     // Bundled scalar Locals: rebake epoch, prev K, prev material-appearance hash.
     mut scal: Local<MeshBakeScalars>,
     // The in-progress bake round's frozen edit + clipmap snapshot.
@@ -723,9 +726,7 @@ fn mesh_resident_chunks(
     if std::mem::replace(&mut rebuild.0, false) || mat_changed {
         scal.epoch = scal.epoch.wrapping_add(1);
     }
-    if mat_changed {
-        mat_cache.clear(); // rebuild StandardMaterials with the new params
-    }
+    // (The triplanar `MeshMaterials` cache rebuilds itself when the registry changes — no clear needed here.)
     scal.prev_mat_hash = mat_hash;
     // Fold the debug-colour flag into the epoch so toggling "Colour by LOD" re-bakes (vertex colours change).
     let epoch_mix = scal.epoch.wrapping_mul(EPOCH_MIX)
@@ -875,38 +876,16 @@ fn mesh_resident_chunks(
             let Some(data) = sb.data else {
                 continue; // empty chunk: no mesh
             };
+            // Pick the chunk's triplanar material: the dominant material's handle (or the shared unlit debug
+            // handle in Colour-by-LOD). Falls back to the debug handle if the cache isn't built yet.
             let mat = if mesh_cfg.debug_lod_colour {
-                mat_cache
-                    .entry(u16::MAX)
-                    .or_insert_with(|| {
-                        materials.add(StandardMaterial {
-                            base_color: Color::WHITE,
-                            unlit: true,
-                            double_sided: true,
-                            cull_mode: None,
-                            ..default()
-                        })
-                    })
-                    .clone()
+                mesh_mats.debug.clone()
             } else {
-                mat_cache
-                    .entry(data.material)
-                    .or_insert_with(|| {
-                        let a = appearances
-                            .get(data.material as usize)
-                            .copied()
-                            .unwrap_or(DEFAULT_APPEARANCE);
-                        materials.add(StandardMaterial {
-                            base_color: Color::WHITE,
-                            metallic: a.metallic,
-                            perceptual_roughness: a.roughness.max(0.045),
-                            emissive: LinearRgba::rgb(a.emissive[0], a.emissive[1], a.emissive[2]),
-                            double_sided: true,
-                            cull_mode: None,
-                            ..default()
-                        })
-                    })
-                    .clone()
+                mesh_mats
+                    .by_id
+                    .get(data.material as usize)
+                    .cloned()
+                    .unwrap_or_else(|| mesh_mats.debug.clone())
             };
             let mesh = Mesh::new(PrimitiveTopology::TriangleList, RenderAssetUsages::default())
                 .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, data.positions)
