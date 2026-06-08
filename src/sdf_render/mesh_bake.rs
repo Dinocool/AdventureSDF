@@ -141,6 +141,9 @@ pub(crate) struct MeshBakeConfig {
     lod_count: u32,
     /// Debug: tint each chunk mesh by its LOD level, rendered unlit ("Colour by LOD").
     pub(crate) debug_lod_colour: bool,
+    /// Debug: render the mesh world-normal as RGB (`n*0.5+0.5`), unlit ("View normals") — for inspecting
+    /// the baked geometry normals directly.
+    pub(crate) debug_normals: bool,
     /// Debug: FREEZE the clipmap centre at the camera's current position so the LOD structure stops
     /// following the camera — fly through and inspect a fixed LOD boundary up close.
     freeze_lod: bool,
@@ -156,6 +159,7 @@ impl Default for MeshBakeConfig {
             lod0_radius: 16.0,
             lod_count: 9,
             debug_lod_colour: false,
+            debug_normals: false,
             freeze_lod: false,
         }
     }
@@ -568,17 +572,32 @@ impl<'a> ChunkMeshBuilder<'a> {
                 let col = if self.debug {
                     [tint[0], tint[1], tint[2], 1.0]
                 } else {
-                    // SIGNED gap against the triangle's fixed pair: >0 ⇒ nearer mat_a, <0 ⇒ nearer mat_b. The
-                    // shader maps it through `blend_softness` to the A↔B cross-fade. Single-material triangle
-                    // (mat_a == mat_b) ⇒ gap 0 (the shader's pair-equal guard then keeps it pure A).
-                    let gap = if mat_a == mat_b {
+                    // SIGNED WORLD-DISTANCE to the material seam against the triangle's fixed pair: >0 ⇒
+                    // nearer mat_a, <0 ⇒ nearer mat_b. The raw gap `d(matB)−d(matA)` is a distance DIFFERENCE
+                    // whose magnitude compresses where the two surfaces are near-parallel (so a fixed world
+                    // `blend_softness` band could never reach pure colours). Dividing by |∇gap| linearises it
+                    // to the actual world distance to the gap==0 isosurface (the seam): the blend then
+                    // localises to where the surfaces truly cross at an angle, and reaches pure A / pure B
+                    // away from it, with `blend_softness` a real world half-width. Single-material triangle
+                    // (mat_a == mat_b) ⇒ 0 (the shader's pair-equal guard then keeps it pure A).
+                    let seam = if mat_a == mat_b {
                         0.0
                     } else {
                         let world = Vec3::from(self.positions[vi]) + self.origin;
-                        edits::material_dist(self.edits, &self.all, world, mat_b)
-                            - edits::material_dist(self.edits, &self.all, world, mat_a)
+                        let gap = |w: Vec3| {
+                            edits::material_dist(self.edits, &self.all, w, mat_b)
+                                - edits::material_dist(self.edits, &self.all, w, mat_a)
+                        };
+                        let g = gap(world);
+                        let e = self.eps;
+                        let grad = Vec3::new(
+                            gap(world + Vec3::X * e) - gap(world - Vec3::X * e),
+                            gap(world + Vec3::Y * e) - gap(world - Vec3::Y * e),
+                            gap(world + Vec3::Z * e) - gap(world - Vec3::Z * e),
+                        ) / (2.0 * e);
+                        g / grad.length().max(1e-3)
                     };
-                    [1.0, 1.0, 1.0, gap]
+                    [1.0, 1.0, 1.0, seam]
                 };
                 colors.push(col);
                 indices.push(n);
@@ -1102,6 +1121,14 @@ fn mesh_bake_panel(world: &mut World, ui: &mut bevy_egui::egui::Ui) {
     if ui.checkbox(&mut dbg, "Colour by LOD (debug)").changed() {
         world.resource_mut::<MeshBakeConfig>().debug_lod_colour = dbg;
     }
+    let mut dbg_n = world.resource::<MeshBakeConfig>().debug_normals;
+    if ui
+        .checkbox(&mut dbg_n, "View normals (debug)")
+        .on_hover_text("Render the mesh world-normal as RGB (unlit) to inspect the baked geometry normals.")
+        .changed()
+    {
+        world.resource_mut::<MeshBakeConfig>().debug_normals = dbg_n;
+    }
     let mut freeze = world.resource::<MeshBakeConfig>().freeze_lod;
     if ui
         .checkbox(&mut freeze, "Freeze LOD (debug)")
@@ -1398,6 +1425,30 @@ mod tests {
         );
         assert_eq!(degenerate, 0, "no degenerate (black) normals on the transition mesh");
         assert_eq!(inward, 0, "transition-cell normals must point outward; worst dot {worst:.3}");
+    }
+
+    #[test]
+    fn blend_reaches_pure_colours_and_blends() {
+        // The baked COLOUR.a is the signed WORLD-DISTANCE to the seam, so a world-unit `blend_softness` band
+        // must yield the FULL range: pure A (weight→1) and pure B (weight→0) away from the seam, plus a
+        // genuine transition between. (The earlier raw-gap version compressed to a muddy ~50% everywhere on
+        // these unit-scale objects — the "won't blend from full red to white" bug.)
+        let (data, _) = merged_sphere_cube(2, 5, 0.3);
+        let band = 0.5f32;
+        let (mut pure_a, mut pure_b, mut mid) = (0u32, 0u32, 0u32);
+        for c in &data.colors {
+            let w = (0.5 + 0.5 * c[3] / band).clamp(0.0, 1.0);
+            if w > 0.9 {
+                pure_a += 1;
+            } else if w < 0.1 {
+                pure_b += 1;
+            } else if (0.3..=0.7).contains(&w) {
+                mid += 1;
+            }
+        }
+        assert!(pure_a > 0, "blend must reach pure A (weight→1) away from the seam");
+        assert!(pure_b > 0, "blend must reach pure B (weight→0) away from the seam");
+        assert!(mid > 0, "blend must have a genuine transition region (not a hard cut)");
     }
 
     #[test]
