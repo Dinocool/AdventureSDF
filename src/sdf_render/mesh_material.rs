@@ -172,8 +172,9 @@ pub(crate) fn rebuild_mesh_materials(
         let normal = map_set.and_then(|m| m.normal.as_ref()).map(|p| load_tiling(&assets, p));
 
         let base = StandardMaterial {
-            // White when textured (the texture supplies colour); else the authored tint.
-            base_color: if diffuse.is_some() { Color::WHITE } else { def.base_color },
+            // Base WHITE: the material's base colour rides on the mesh's per-vertex COLOUR (the single colour
+            // source), and the triplanar diffuse texture multiplies on top — so no double application.
+            base_color: Color::WHITE,
             metallic: def.metallic,
             perceptual_roughness: def.roughness.max(0.045),
             emissive: LinearRgba::rgb(def.emissive.x, def.emissive.y, def.emissive.z),
