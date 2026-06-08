@@ -421,6 +421,32 @@ fn chunk_face_flags(
     flags
 }
 
+/// Bitmask of a chunk's LOW faces (bits 0,2,4 = −X,−Y,−Z) that border a FINER LOD (the neighbour region is
+/// inside the finer `cube(lod-1)`). The crate meshes the low apron (cell 0), so on these faces the mesh
+/// over-reaches ~1 voxel INTO the finer region — an intrusion into the seam band. The bake INSETS them (skips
+/// cell 0 → boundary at the nominal plane) to give a hard boundary + clean gap for the seam. HIGH faces end
+/// at the real boundary (no over-reach), so they are never trimmed.
+fn chunk_finer_low_faces(key: BrickKey, config: &SdfGridConfig, k: u32, cam: Option<Vec3>, half0: i32) -> u8 {
+    let Some(cam) = cam else {
+        return 0;
+    };
+    if key.lod == 0 {
+        return 0; // nothing finer than LOD 0
+    }
+    let centre = lod_centre(config, k, cam, key.lod - 1); // finer cube centre
+    let hole = half0 * (1i32 << (key.lod - 1)); // finer cube half-extent (LOD-0 chunks)
+    let step = k as i32 * config.cell_stride();
+    let mut mask = 0u8;
+    for &(bit, d) in &[(0u8, IVec3::NEG_X), (2u8, IVec3::NEG_Y), (4u8, IVec3::NEG_Z)] {
+        let nbr = BrickKey::new(key.lod, key.coord + d * step);
+        let (lo, hi) = chunk_lod0_range(nbr, config, k);
+        if range_in_cube(lo, hi, centre, hole) {
+            mask |= 1 << bit;
+        }
+    }
+    mask
+}
+
 /// The edits (into `aabbs`) overlapping `sampled` — the set folded for this chunk. Same test drives
 /// residency AND the content hash, so they can't diverge.
 fn cull_into(aabbs: &[Aabb3d], sampled: &Aabb3d, out: &mut Vec<u32>) {
@@ -560,14 +586,24 @@ fn mesh_chunk(
     skirt_len: f32,
     // This chunk's LOD level (for the debug colour-by-LOD view).
     lod: u32,
+    // Bits 0,2,4 (−X,−Y,−Z): LOW faces bordering a FINER LOD → INSET (skip the over-reaching apron cell) so
+    // the boundary sits at the nominal plane, leaving a clean gap for the seam instead of intruding into it.
+    trim_low: u8,
     // Debug: vertex COLOUR = per-LOD tint (+ skirts a contrasting tint) instead of material base colour.
     debug: bool,
 ) -> Option<ChunkMeshData> {
     let sdf = sample_field(edits, indices, grid_origin, vs, edge);
     let shape = RuntimeShape::<u32, 3>::new([edge, edge, edge]);
     let mut buffer = SurfaceNetsBuffer::default();
+    // Inset the over-reaching low apron on finer-bordering faces (mesh from cell 1, not 0, on that axis).
+    let mut smin = [0u32; 3];
+    for (bit, axis, is_high, _t) in FACES {
+        if !is_high && trim_low & (1 << bit) != 0 {
+            smin[axis] = 1;
+        }
+    }
     // TODO(perf): pool the sample buffer + SurfaceNetsBuffer per `edge` to avoid per-task allocation.
-    surface_nets(&sdf, &shape, [0, 0, 0], [edge - 1, edge - 1, edge - 1], &mut buffer);
+    surface_nets(&sdf, &shape, smin, [edge - 1, edge - 1, edge - 1], &mut buffer);
     if buffer.positions.is_empty() {
         return None;
     }
@@ -616,7 +652,7 @@ fn mesh_chunk(
     }
     centroid = grid_origin + (centroid / buffer.positions.len().max(1) as f32) * vs;
     let material = edits::fold_csg(edits, centroid).material_id;
-    let boundary = extract_boundary(&buffer, &positions, &normals, &colors, grid_origin, edge);
+    let boundary = extract_boundary(&buffer, &positions, &normals, &colors, grid_origin, edge, trim_low);
     Some(ChunkMeshData { positions, normals, colors, indices, material, boundary })
 }
 
@@ -633,6 +669,7 @@ fn extract_boundary(
     colors: &[[f32; 4]],
     grid_origin: Vec3,
     edge: u32,
+    trim_low: u8,
 ) -> [Vec<BoundaryLoop>; 6] {
     // Open edges of the surface mesh (appear in exactly one triangle).
     let mut ecount: HashMap<(u32, u32), u32> = HashMap::new();
@@ -653,9 +690,15 @@ fn extract_boundary(
 
     let mut out: [Vec<BoundaryLoop>; 6] = std::array::from_fn(|_| Vec::new());
     for (bit, axis, is_high, _tan) in FACES {
-        // The crate meshes cells [0, edge-1): it INCLUDES the low apron (cell 0) but EXCLUDES the high one,
-        // so the mesh's open boundary sits at cell 0 on a low face and cell edge-2 on a high face.
-        let bcell = if is_high { edge - 2 } else { 0 };
+        // The crate meshes cells [smin, edge-1): a HIGH boundary sits at cell edge-2; a LOW boundary at cell 0
+        // normally, but at cell 1 when the face was INSET (`trim_low`) to skip the over-reaching apron.
+        let bcell = if is_high {
+            edge - 2
+        } else if trim_low & (1 << bit) != 0 {
+            1
+        } else {
+            0
+        };
         let on_face = |i: u32| buffer.surface_points[i as usize][axis] == bcell;
         // Adjacency among on-face boundary verts via the open edges that lie on this face.
         let mut adj: HashMap<u32, Vec<u32>> = HashMap::new();
@@ -1205,8 +1248,10 @@ fn mesh_resident_chunks(
             idx.retain(|&i| edit_resolvable_at(edit_extent[i as usize], &config, key.lod));
             let base = if idx.is_empty() { 0 } else { edits::bake_content_hash(&edits_arc, &idx) };
             let flags = chunk_face_flags(key, &config, k, cam, half0);
+            let trim = chunk_finer_low_faces(key, &config, k, cam, half0);
             let lf = (key.lod as u64).wrapping_mul(0xA24B_AED4_963E_E407)
-                ^ (flags as u64).wrapping_mul(EPOCH_MIX);
+                ^ (flags as u64).wrapping_mul(EPOCH_MIX)
+                ^ (trim as u64).wrapping_mul(0xC2B2_AE3D_27D4_EB4F);
             current_hashes.insert(key, (base ^ epoch_mix).wrapping_add(lf));
         }
     }
@@ -1347,12 +1392,13 @@ fn mesh_resident_chunks(
                 }
                 let (mut positions, mut normals, mut colors, mut indices) =
                     (Vec::new(), Vec::new(), Vec::new(), Vec::new());
-                for (bit, _axis, is_high, _tan) in FACES {
-                    // Only LOW faces gap at a cross-LOD boundary (the crate's apron asymmetry); HIGH faces
-                    // overlap instead (z-fight, no crack) so they need no strip. Skip non-coarser faces too.
-                    if is_high || flags & (1 << bit) == 0 {
-                        continue;
+                for (bit, _axis, _is_high, _tan) in FACES {
+                    if flags & (1 << bit) == 0 {
+                        continue; // face doesn't border a coarser LOD
                     }
+                    // Every coarser-bordering face has open boundary edges to close (the crate suppresses the
+                    // +boundary quads). LOW faces leave a gap; HIGH faces leave a ~½-coarse-voxel overlap the
+                    // strip ramps in front of — stitch both so the boundary is seamed in all directions.
                     let ckey = coarse_neighbour_key(fkey, face_dir(bit), step);
                     let Some(cst) = states.0.get(&ckey) else {
                         continue; // coarse neighbour not resident (outer ring edge) → no strip there
@@ -1518,15 +1564,18 @@ fn mesh_resident_chunks(
                 continue;
             }
             let grid_origin = config.brick_min_world(key.coord, key.lod) - Vec3::splat(vs_l);
-            // Skirt faces from the FROZEN shell (so all of a round's chunks agree on the boundary).
+            // Skirt faces + apron inset from the FROZEN shell (so all of a round's chunks agree on the boundary).
             let flags = chunk_face_flags(key, &config, k, round.cam, round.half0);
+            let trim_low = chunk_finer_low_faces(key, &config, k, round.cam, round.half0);
             let skirt_len = skirt_cells * vs_l;
             let lod = key.lod;
             let edits = round_edits.clone();
             let indices = idx.clone();
             let apps = appearances.clone();
             st.task = Some(pool.spawn(async move {
-                mesh_chunk(&edits, &indices, &apps, grid_origin, vs_l, edge, flags, skirt_len, lod, debug)
+                mesh_chunk(
+                    &edits, &indices, &apps, grid_origin, vs_l, edge, flags, skirt_len, lod, trim_low, debug,
+                )
             }));
             budget -= 1;
         }
@@ -1794,7 +1843,7 @@ mod tests {
         let edits = [sphere_edit(Vec3::ZERO, 1.0)];
         let (vs, edge) = (0.1f32, 30u32); // chunk real span ≈ 2.8 > sphere Ø 2.0 → clears all faces
         let origin = Vec3::splat(-1.5);
-        let data = mesh_chunk(&edits, &[0], &[], origin, vs, edge, 0, 0.0, 0, false)
+        let data = mesh_chunk(&edits, &[0], &[], origin, vs, edge, 0, 0.0, 0, 0, false)
             .expect("sphere meshes");
         assert_eq!(open_edge_count(&chunk_tris(&data, origin)), 0, "closed sphere must be watertight");
     }
@@ -1813,8 +1862,9 @@ mod tests {
         // other face.
         let of = Vec3::new(-vsf, -1.4 - vsf, -1.4 - vsf);
         let oc = Vec3::new(-5.6 - vsc, -2.8 - vsc, -2.8 - vsc);
-        let fine = mesh_chunk(&edits, &idx, &[], of, vsf, edge, 0, 0.0, 0, false).expect("fine meshes");
-        let coarse = mesh_chunk(&edits, &idx, &[], oc, vsc, edge, 0, 0.0, 1, false).expect("coarse meshes");
+        let fine = mesh_chunk(&edits, &idx, &[], of, vsf, edge, 0, 0.0, 0, 0, false).expect("fine meshes");
+        let coarse =
+            mesh_chunk(&edits, &idx, &[], oc, vsc, edge, 0, 0.0, 1, 0, false).expect("coarse meshes");
 
         // Bare chunks ARE cracked (two open boundary circles) — proves the seam is what closes it.
         let mut bare = chunk_tris(&fine, of);
