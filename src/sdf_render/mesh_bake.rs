@@ -160,12 +160,12 @@ struct MeshBakeConfig {
 
 impl Default for MeshBakeConfig {
     fn default() -> Self {
-        // K=4 → 64 bricks/chunk. lod0_radius 10 keeps the finest LOD out to a comfortable distance (push
+        // K=4 → 64 bricks/chunk. lod0_radius 16 keeps the finest LOD out to a comfortable distance (push
         // it down to shrink the LOD-0 cube); lod_count 9 spans LOD 0..=8 (the lod_test showcase scene).
         // Cross-LOD seams are crack-free BY CONSTRUCTION (Transvoxel transition cells) — no toggle needed.
         Self {
             chunk_bricks: 4,
-            lod0_radius: 10.0,
+            lod0_radius: 16.0,
             lod_count: 9,
             debug_lod_colour: false,
             freeze_lod: false,
@@ -921,9 +921,39 @@ fn mesh_resident_chunks(
             );
         }
 
-        // Reap departed meshes (query-based — catches every non-resident `ChunkMesh` regardless of state).
+        // Reap orphaned/departed meshes (query-based, so it catches every stray `ChunkMesh`). A departed chunk
+        // is HELD on screen until its region is RESOLVED by the resident set — i.e. a resident chunk whose AABB
+        // contains the departed chunk's CENTRE has finished baking (meshed OR meshed-empty). That way a LOD
+        // swap never flashes a 1-frame hole: the old mesh stays until its coarser parent / finer children are
+        // ready (they commit in the SAME frame they finish, so there is no visible overlap either). A chunk
+        // whose region has left the resident set entirely (overlaps no resident chunk) is reaped at once, and a
+        // stale duplicate (key still resident but not the current entity) is reaped immediately.
+        let resident_aabbs: Vec<Aabb3d> = resident.iter().map(|key| chunk_aabb(*key, &config, k)).collect();
+        let resolved: Vec<Aabb3d> = states
+            .0
+            .iter()
+            .filter(|(key, st)| {
+                resident.contains(*key) && st.task.is_none() && st.displayed_hash == st.target_hash
+            })
+            .map(|(key, _)| chunk_aabb(*key, &config, k))
+            .collect();
         for (e, cm) in &chunk_meshes {
-            if !resident.contains(&cm.0) {
+            let resident_key = resident.contains(&cm.0);
+            if resident_key && states.0.get(&cm.0).is_some_and(|st| st.entity == Some(e)) {
+                continue; // the live displayed mesh for a resident chunk
+            }
+            let reap = if resident_key {
+                true // stale duplicate of a resident chunk — its current mesh is a different entity
+            } else {
+                let a = chunk_aabb(cm.0, &config, k);
+                let centre = (Vec3::from(a.min) + Vec3::from(a.max)) * 0.5;
+                let covered = resolved
+                    .iter()
+                    .any(|d| centre.cmpge(Vec3::from(d.min)).all() && centre.cmple(Vec3::from(d.max)).all());
+                let overlaps_resident = resident_aabbs.iter().any(|r| aabb_overlap(r, &a));
+                covered || !overlaps_resident
+            };
+            if reap {
                 commands.entity(e).despawn();
                 reaped += 1;
             }
