@@ -396,21 +396,14 @@ fn chunks_in_aabb(aabb: &Aabb3d, config: &SdfGridConfig, k: u32, lod: u32, out: 
     }
 }
 
-/// Sample the curvature-compensated SDF for one chunk: an `edge³` grid (linear `x + y·edge + z·edge²`) at
-/// world points `grid_origin + (x,y,z)·vs`.
-///
-/// COARSE-LOD SHRINKAGE COMPENSATION (see sdf-lod-shrinkage): Surface Nets erodes high-curvature surfaces
-/// inward by ~h²·curvature, so coarse-LOD meshes shrink (and the coarser side insets from the fine one,
-/// widening cross-LOD seams). Add back the discrete Laplacian term `f' = f − (Σ₆ − 6f)/8` (clamped to a
-/// voxel); a convex (sphere) surface moves outward, counteracting the erosion.
-///
-/// CRACK-FREE WELDING — the invariant this function guarantees: a chunk's 1-voxel apron samples are its
-/// NEIGHBOUR's real samples at the same world points, so the field MUST be a pure function of world
-/// position or the shared boundary splits (seams at every LOD + holes at coarse LODs). The compensation
-/// needs neighbours, so we sample the raw field on a grid extended by one extra ring (`raw`, edge+2) and
-/// compensate EVERY sample of the `edge³` grid — apron included — each now has all 6 neighbours present.
-/// Two chunks therefore agree exactly on the samples they share. (`compensated_field_welds` locks this.)
-fn sample_compensated_field(
+/// Sample the (pseudo-)SDF for one chunk: an `edge³` grid (linear `x + y·edge + z·edge²`) at world points
+/// `grid_origin + (x,y,z)·vs`. Point-sampling the EXACT analytic CSG field is the correct coarse
+/// representation for an analytic SDF (there's no fine grid to mip-reduce, so no averaging distortion). The
+/// 1-voxel apron makes neighbouring chunks share identical boundary samples, so Surface Nets welds them
+/// crack-free by construction. Coarse-LOD shrinkage is fixed by RE-PROJECTING the meshed vertices onto the
+/// true surface (`reproject_to_surface`), NOT by sharpening this field — an unsharp/Laplacian filter rings
+/// and punches holes (researched 2026-06-08; see [[render-pivot-mesh-baking]]).
+fn sample_field(
     edits: &[edits::ResolvedEdit],
     indices: &[u32],
     grid_origin: Vec3,
@@ -418,37 +411,73 @@ fn sample_compensated_field(
     edge: u32,
 ) -> Vec<f32> {
     let band = 4.0 * vs;
-    let e = edge as usize;
-    let ee = e + 2;
-    let mut raw = vec![0.0f32; ee * ee * ee];
-    let mut ri = 0usize;
-    for z in 0..ee {
-        for y in 0..ee {
-            for x in 0..ee {
-                // The extra ring sits one voxel BEFORE the edge grid (E-index j → edge-index j-1).
-                let off = Vec3::new(x as f32 - 1.0, y as f32 - 1.0, z as f32 - 1.0);
-                let p = grid_origin + off * vs;
+    let mut sdf = vec![0.0f32; (edge * edge * edge) as usize];
+    let mut i = 0usize;
+    for z in 0..edge {
+        for y in 0..edge {
+            for x in 0..edge {
+                let p = grid_origin + Vec3::new(x as f32, y as f32, z as f32) * vs;
                 // Sub-voxel iso-shift so no sample lands exactly on dist == 0 (Surface Nets treats 0 as
                 // "outside", dropping a cell — a pinhole at grid-aligned features).
-                raw[ri] = (edits::fold_csg_dist_indexed(edits, indices, p) - 1e-3).clamp(-band, band);
-                ri += 1;
-            }
-        }
-    }
-    let mut sdf = vec![0.0f32; e * e * e];
-    let (rx, ry, rz) = (1usize, ee, ee * ee);
-    for z in 0..e {
-        for y in 0..e {
-            for x in 0..e {
-                let j = (x + 1) * rx + (y + 1) * ry + (z + 1) * rz; // matching sample in the extended grid
-                let lap = raw[j - rx] + raw[j + rx] + raw[j - ry] + raw[j + ry] + raw[j - rz] + raw[j + rz]
-                    - 6.0 * raw[j];
-                let delta = (-lap / 8.0).clamp(-vs, vs);
-                sdf[x + y * e + z * e * e] = (raw[j] + delta).clamp(-band, band);
+                sdf[i] = (edits::fold_csg_dist_indexed(edits, indices, p) - 1e-3).clamp(-band, band);
+                i += 1;
             }
         }
     }
     sdf
+}
+
+/// Central-difference gradient of the CSG field at `p` (the outward surface direction). `eps` should be a
+/// small fraction of a voxel.
+fn field_gradient(edits: &[edits::ResolvedEdit], indices: &[u32], p: Vec3, eps: f32) -> Vec3 {
+    let d = |o: Vec3| edits::fold_csg_dist_indexed(edits, indices, p + o);
+    Vec3::new(
+        d(Vec3::X * eps) - d(Vec3::X * -eps),
+        d(Vec3::Y * eps) - d(Vec3::Y * -eps),
+        d(Vec3::Z * eps) - d(Vec3::Z * -eps),
+    )
+}
+
+/// Push a meshed vertex onto the true analytic iso-surface (`fold_csg_dist == 0`) with a few DAMPED Newton
+/// steps `p −= t·f(p)·∇̂f(p)`, returning the projected world point and its unit (analytic) normal.
+///
+/// WHY: Naive Surface Nets places each vertex at the centroid of its edge crossings, which sits INSIDE a
+/// convex surface by ~h²·curvature — the coarse-LOD shrinkage. Re-projecting onto the exact field removes
+/// that bias at its SOURCE (the geometry), with no field sharpening (which rings → holes), and the gradient
+/// is the exact surface normal — sharper than the discrete one. `smin` blends are pseudo-SDF (‖∇f‖ < 1), so
+/// the step is damped to avoid overshoot.
+///
+/// CRACK-FREE WELDING: this is a PURE function of world position + the global field, so two chunks that
+/// share a boundary vertex (same Surface-Nets position via the apron) re-project it identically → same-LOD
+/// welds are preserved. The cumulative displacement is clamped to ~one voxel so a vertex can never jump to a
+/// neighbouring feature (fold-over) near the medial axis. (`reproject_lands_on_surface` locks the contract.)
+fn reproject_to_surface(
+    edits: &[edits::ResolvedEdit],
+    indices: &[u32],
+    start: Vec3,
+    vs: f32,
+) -> (Vec3, Vec3) {
+    let eps = vs * 0.01;
+    let mut p = start;
+    let mut grad = Vec3::Y; // overwritten on the first iteration (used as the returned normal)
+    for _ in 0..4 {
+        let d = edits::fold_csg_dist_indexed(edits, indices, p);
+        grad = field_gradient(edits, indices, p, eps);
+        let dir = grad.normalize_or_zero();
+        if dir == Vec3::ZERO {
+            break;
+        }
+        p += dir * (-0.8 * d);
+        // Never move a vertex more than ~one voxel from where Surface Nets put it.
+        let disp = p - start;
+        if disp.length() > vs {
+            p = start + disp.normalize() * vs;
+        }
+        if d.abs() < eps {
+            break;
+        }
+    }
+    (p, grad.normalize_or_zero())
 }
 
 /// Sample + Surface-Nets one chunk (runs off-thread on the task pool). Returns `None` for an empty chunk
@@ -472,7 +501,7 @@ fn mesh_chunk(
     // Debug: vertex COLOUR = per-LOD tint (+ skirts a contrasting tint) instead of material base colour.
     debug: bool,
 ) -> Option<ChunkMeshData> {
-    let sdf = sample_compensated_field(edits, indices, grid_origin, vs, edge);
+    let sdf = sample_field(edits, indices, grid_origin, vs, edge);
     let shape = RuntimeShape::<u32, 3>::new([edge, edge, edge]);
     let mut buffer = SurfaceNetsBuffer::default();
     // TODO(perf): pool the sample buffer + SurfaceNetsBuffer per `edge` to avoid per-task allocation.
@@ -480,8 +509,18 @@ fn mesh_chunk(
     if buffer.positions.is_empty() {
         return None;
     }
-    let mut positions: Vec<[f32; 3]> =
-        buffer.positions.iter().map(|p| [p[0] * vs, p[1] * vs, p[2] * vs]).collect();
+    // Re-project each Surface-Nets vertex onto the exact iso-surface (removes coarse-LOD shrinkage at its
+    // source; yields exact analytic normals). SN positions are in cell units → world = grid_origin + cell·vs;
+    // meshes store chunk-LOCAL positions (the entity Transform is grid_origin), so subtract it back off.
+    let mut positions: Vec<[f32; 3]> = Vec::with_capacity(buffer.positions.len());
+    let mut normals: Vec<[f32; 3]> = Vec::with_capacity(buffer.positions.len());
+    for p in &buffer.positions {
+        let world = grid_origin + Vec3::new(p[0], p[1], p[2]) * vs;
+        let (proj, n) = reproject_to_surface(edits, indices, world, vs);
+        let local = proj - grid_origin;
+        positions.push([local.x, local.y, local.z]);
+        normals.push([n.x, n.y, n.z]);
+    }
     // Per-vertex COLOUR: debug = a per-LOD tint; normal = the resolved material's LINEAR base colour (real
     // PBR lighting shades it; the chunk's StandardMaterial carries the dominant material's PBR scalars).
     let lod_tint = LOD_DEBUG_PALETTE[(lod as usize).min(LOD_DEBUG_PALETTE.len() - 1)];
@@ -498,7 +537,6 @@ fn mesh_chunk(
             [a.base[0], a.base[1], a.base[2], 1.0]
         })
         .collect();
-    let mut normals = buffer.normals.clone();
     let mut indices = buffer.indices.clone();
     // SKIRTS: a curtain hanging from each coarser-neighbour boundary edge into the solid, hiding the
     // fine↔coarse crack. Appends to the mesh buffers (see `append_skirts`).
@@ -577,15 +615,17 @@ fn append_skirts(
                     [p[0] - n.x * skirt_len, p[1] - n.y * skirt_len, p[2] - n.z * skirt_len]
                 };
                 let (v0, v1) = (i as u32, ni as u32);
-                let (e0, c0) = (extrude(positions[i], buffer.normals[i]), colors[i]);
-                let (e1, c1) = (extrude(positions[ni], buffer.normals[ni]), colors[ni]);
+                // Use the reprojected ANALYTIC normals (`normals[i]`), not the crate's discrete ones.
+                let (n0, n1) = (normals[i], normals[ni]);
+                let (e0, c0) = (extrude(positions[i], n0), colors[i]);
+                let (e1, c1) = (extrude(positions[ni], n1), colors[ni]);
                 let s0 = positions.len() as u32;
                 positions.push(e0);
-                normals.push(buffer.normals[i]);
+                normals.push(n0);
                 colors.push(if debug { SKIRT_DEBUG_COLOUR } else { c0 });
                 let s1 = positions.len() as u32;
                 positions.push(e1);
-                normals.push(buffer.normals[ni]);
+                normals.push(n1);
                 colors.push(if debug { SKIRT_DEBUG_COLOUR } else { c1 });
                 // Curtain quad (boundary edge v0-v1 → extruded edge s0-s1). The chunk material is
                 // double-sided, so winding doesn't matter for visibility.
@@ -1244,41 +1284,43 @@ mod tests {
         assert_eq!(f & (1 << 0), 0, "−X face should not (neighbour still inside cube(0))");
     }
 
-    #[test]
-    fn compensated_field_welds() {
-        // The crack-free invariant: the compensated field is a pure function of WORLD position, so two
-        // chunks whose sample lattices overlap agree exactly on the shared samples (one chunk's apron is
-        // the other's interior). A regression guard for the bug where compensating only interior samples
-        // left the apron raw → seams at every LOD + holes at coarse LODs.
-        let edit = edits::ResolvedEdit::new(
-            crate::sdf_render::SdfPrimitive::Sphere { radius: 1.3 },
-            Transform::IDENTITY,
+    fn sphere_edit(centre: Vec3, radius: f32) -> edits::ResolvedEdit {
+        edits::ResolvedEdit::new(
+            crate::sdf_render::SdfPrimitive::Sphere { radius },
+            Transform::from_translation(centre),
             crate::sdf_render::SdfOp { kind: crate::sdf_render::CsgKind::Union, smoothing: 0.0 },
             0,
-        );
-        let edits = [edit];
+        )
+    }
+
+    #[test]
+    fn reproject_lands_on_surface() {
+        // A vertex sitting INSIDE the true surface (mimicking Surface Nets' h²·curvature shrinkage) must
+        // re-project back ONTO the iso-surface (|f| ≈ 0) — this is the shrinkage fix. The analytic normal
+        // is radially outward on a sphere.
+        let edits = [sphere_edit(Vec3::ZERO, 1.5)];
         let idx = [0u32];
-        let (vs, edge, shift) = (0.1f32, 12u32, 4u32); // B shifted +shift voxels along X
-        let o_a = Vec3::splat(-0.6);
-        let o_b = o_a + Vec3::X * (shift as f32 * vs);
-        let fa = sample_compensated_field(&edits, &idx, o_a, vs, edge);
-        let fb = sample_compensated_field(&edits, &idx, o_b, vs, edge);
-        let at = |f: &[f32], x: u32, y: u32, z: u32| f[(x + y * edge + z * edge * edge) as usize];
-        // A-sample (x,y,z) and B-sample (x−shift,y,z) are the same world point → must agree (up to float
-        // rounding of the two origins' arithmetic — ~1e-7). The OLD bug (apron left raw) differed by a full
-        // compensation delta (~0.01·vs and up), so 1e-4 cleanly separates "welds" from "cracks". Spans A's
-        // high apron (x=edge−1 ↔ B interior) and B's low apron (x=shift ↔ A interior).
-        for z in 0..edge {
-            for y in 0..edge {
-                for x in shift..edge {
-                    let (a, b) = (at(&fa, x, y, z), at(&fb, x - shift, y, z));
-                    assert!(
-                        (a - b).abs() < 1e-4,
-                        "field not world-consistent at A({x},{y},{z}): {a} vs {b} → seam/hole"
-                    );
-                }
-            }
-        }
+        let start = Vec3::new(1.5 - 0.06, 0.0, 0.0); // ~0.06 inside the +X pole
+        let (p, n) = reproject_to_surface(&edits, &idx, start, 0.2);
+        let d = edits::fold_csg_dist_indexed(&edits, &idx, p);
+        assert!(d.abs() < 1e-3, "vertex not on surface after reprojection: f={d}");
+        assert!(n.dot(Vec3::X) > 0.99, "normal not radially outward: {n:?}");
+    }
+
+    #[test]
+    fn reproject_welds_across_index_supersets() {
+        // WELDING contract: re-projection is a pure function of world position + the RELEVANT field. A chunk
+        // that folds an extra distant edit must land its shared boundary vertex at the same place as a
+        // neighbour that doesn't — else cross-chunk seams. A far second sphere must not perturb a projection
+        // on the first sphere's surface.
+        let edits = [sphere_edit(Vec3::ZERO, 1.5), sphere_edit(Vec3::new(100.0, 0.0, 0.0), 1.5)];
+        let start = Vec3::new(1.45, 0.0, 0.0);
+        let (p_all, _) = reproject_to_surface(&edits, &[0, 1], start, 0.2);
+        let (p_one, _) = reproject_to_surface(&edits, &[0], start, 0.2);
+        assert!(
+            (p_all - p_one).length() < 1e-5,
+            "distant edit perturbed the projection ({p_all:?} vs {p_one:?}) → cross-chunk seam"
+        );
     }
 
     #[test]
