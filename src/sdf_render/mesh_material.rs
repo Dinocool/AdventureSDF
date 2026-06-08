@@ -183,7 +183,7 @@ pub(crate) fn rebuild_mesh_materials(
         };
         let ext = MeshTriplanarExt {
             params: MeshExtParams {
-                world_scale: TEXTURE_WORLD_SCALE,
+                world_scale: def.texture_scale,
                 has_diffuse: diffuse.is_some() as u32,
                 has_normal: normal.is_some() as u32,
                 _pad: 0,
