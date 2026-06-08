@@ -369,6 +369,43 @@ pub fn cpu_terrain_offset() -> bevy::math::Vec2 {
     *CPU_TERRAIN_OFFSET.read().expect("CPU_TERRAIN_OFFSET poisoned")
 }
 
+/// Process-global snapshot of the live height-layer fBm parameters (+ its `sea_level` reference
+/// plane), the sibling of [`CPU_HEIGHT_RING`] / [`CPU_TERRAIN_OFFSET`] that lets the CPU
+/// `eval_primitive` `Terrain` branch sample the height field DIRECTLY by analytic fBm
+/// (`fbm_height_grad(world_xz) + sea_level`) instead of the BOUNDED resident ring.
+///
+/// Why this exists: the height layer is a pure analytic `f(world_xz, seed)` — the ring is just a
+/// resident, band-limited *cache* of that function over a small window (~1024 m). Sampling the fBm
+/// directly makes the Terrain surface INFINITE and world-anchored, so a single large static volume
+/// fills the mesh-bake clipmap everywhere the camera roams (no per-move ring miss / flat fallback at
+/// the far LODs). This is the SAME fBm the ring bakes at mip 0, so the analytic path and the ring's
+/// mip-0 surface agree by construction (CPU↔mesh-bake parity preserved); only the ring's coarser
+/// mips band-limit it for far bricks (a known coarse-LOD aliasing follow-up — see WORLD_GEN notes).
+///
+/// `(FbmParams, sea_level)`: `fbm_height_grad` returns the raw fBm; the height layer adds `sea_level`
+/// (`HeightLayer::sample_world`), so the snapshot carries BOTH to reproduce the exact ring height.
+/// `None` until the worldgen plugin first publishes (Terrain then keeps its flat mid-band fallback).
+static CPU_FBM_PARAMS: RwLock<Option<(super::noise::FbmParams, f32)>> = RwLock::new(None);
+
+/// Publish the live fBm params + `sea_level` so the CPU Terrain eval can sample the height field
+/// directly (see [`CPU_FBM_PARAMS`]). Called by the `WorldGenPlugin` whenever params/seed are known.
+pub fn set_cpu_fbm_params(params: super::noise::FbmParams, sea_level: f32) {
+    *CPU_FBM_PARAMS.write().expect("CPU_FBM_PARAMS poisoned") = Some((params, sea_level));
+}
+
+/// Current published `(FbmParams, sea_level)` snapshot, or `None` if worldgen hasn't published yet
+/// (see [`CPU_FBM_PARAMS`]). The Terrain `eval_primitive` branch reads this to evaluate the analytic
+/// fBm height; on `None` the caller uses the flat mid-band fallback.
+pub fn cpu_fbm_params() -> Option<(super::noise::FbmParams, f32)> {
+    *CPU_FBM_PARAMS.read().expect("CPU_FBM_PARAMS poisoned")
+}
+
+/// Clear the published fBm snapshot back to `None` (see [`CPU_FBM_PARAMS`]). Used by tests that
+/// exercise the flat-fallback path to reset the process-global after publishing.
+pub fn clear_cpu_fbm_params() {
+    *CPU_FBM_PARAMS.write().expect("CPU_FBM_PARAMS poisoned") = None;
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::coord::{ChunkCoord, LayerId};

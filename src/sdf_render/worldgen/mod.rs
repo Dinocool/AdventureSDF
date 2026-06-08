@@ -34,9 +34,12 @@ use crate::sdf_render::edits::{
 };
 use crate::sdf_render::{SdfCamera, SdfOrbitCamera, SdfVolume};
 
-use layers::height::{HEIGHT_CHUNK_CELLS, HeightParams};
+use layers::height::{HEIGHT_CHUNK_CELLS, HeightLayer, HeightParams};
 use manager::LayerManager;
-use upload::{HeightRingCpu, build_height_ring, set_cpu_height_ring, set_cpu_terrain_offset};
+use upload::{
+    HeightRingCpu, build_height_ring, set_cpu_fbm_params, set_cpu_height_ring,
+    set_cpu_terrain_offset,
+};
 
 /// Master switch for the procedural worldgen vertical slice. Default ON so the terrain shows when
 /// the editor scene loads; flip off to fall back to a plain authored scene with no streamed terrain.
@@ -67,9 +70,16 @@ pub const WORLDGEN_SLICE_SEED: u64 = 0xA15E_C0DE_2026;
 /// 8·128 = 1024`, so no two resident chunks alias one ring slot (`slice_radius_respects_ring_invariant`).
 pub const WORLDGEN_SLICE_RADIUS: f64 = HEIGHT_CHUNK_CELLS as f64 * 3.75;
 
-/// World half-extent of the single global `Terrain` volume. Strictly LESS than the generation radius
-/// (see above) so the whole volume is backed by generated height with a coarse-brick margin.
-pub const WORLDGEN_TERRAIN_HALF_XZ: f32 = HEIGHT_CHUNK_CELLS as f32 * 3.0;
+/// World half-extent of the single global `Terrain` volume. Sized to cover the mesh-bake clipmap's
+/// FAR LOD so terrain fills the screen everywhere the camera roams within range. The clipmap reaches
+/// `lod0_radius · 2^(lod_count-1)` ≈ 16 · 2^8 = 4096 m (`MeshBakeConfig` defaults), so a half-extent
+/// of ~4096 m spans it. The Terrain CPU eval now samples the height field DIRECTLY by analytic fBm
+/// (world-anchored, infinite — see `edits::eval_primitive`), so this large volume is kept STATIC at
+/// the origin: every brick inside it samples real height regardless of the bounded resident ring, and
+/// a static volume avoids the full-volume re-mesh a moving large volume would trigger on every chunk
+/// crossing. True infinite-follow beyond this radius (a tiered clipmap-of-rings of terrain volumes)
+/// is a later task.
+pub const WORLDGEN_TERRAIN_HALF_XZ: f32 = 4096.0;
 
 /// Vertical AABB band the global terrain volume occupies. Tightened to bound the height layer's full
 /// fBm swing (default ≈ Σ octave amplitudes ≈ 70 m) with margin — NOT the old ±256 m. The bake's
@@ -229,6 +239,14 @@ fn roll_worldgen(
 ) {
     let _span = crate::instrument::span("worldgen roll");
     let cam_pos = camera.single().map(|t| t.translation).unwrap_or(Vec3::ZERO);
+
+    // Publish the live fBm params + sea_level so the CPU Terrain `eval_primitive` can sample the
+    // height field DIRECTLY by analytic fBm (infinite, world-anchored) — the SAME fBm the ring bakes
+    // at mip 0, keeping CPU↔mesh-bake parity. Cheap (a const fold of the params), so publish every
+    // frame; the eval reads it via `cpu_fbm_params`. Uses `manager.seed()` so the published seed
+    // stays in lock-step with the resident store's generation seed.
+    let height_layer = HeightLayer::new(coord::LayerId(0), *params);
+    set_cpu_fbm_params(height_layer.fbm_params(manager.seed()), params.sea_level);
 
     // Follow mode (toggle, default OFF): the generation window + the Terrain volume track the camera
     // eye XZ, so terrain streams around wherever the camera is. OFF: both stay fixed at the world

@@ -344,27 +344,27 @@ pub fn eval_primitive(prim: &SdfPrimitive, p: Vec3) -> f32 {
             ..
         } => {
             // Worldgen terrain surface (CPU side: picking + bake-scheduler classification + the MESH
-            // bake's `fold_csg`). Sample the GLOBAL height-ring snapshot the worldgen plugin publishes
-            // (`cpu_height_ring`) — the world-anchored toroidal clipmap the `LayerManager` streams. The
-            // signed VERTICAL gap `p.y - h` (one-sided, like Heightmap).
+            // bake's `fold_csg`). Sample the height field DIRECTLY by analytic fBm — the height layer
+            // is a pure `f(world_xz, seed)` (`fbm_height_grad`), so this is INFINITE and world-anchored
+            // (no bounded resident-ring window). One large static volume thus fills the whole mesh-bake
+            // clipmap everywhere the camera roams. This is the SAME fBm the ring bakes at mip 0, so the
+            // analytic path and the ring's mip-0 surface agree by construction (CPU↔mesh-bake parity).
+            // The signed VERTICAL gap `p.y - h` (one-sided, like Heightmap).
             //
-            // The Terrain volume FOLLOWS the camera (its transform translates on chunk crossings — see
-            // `worldgen::roll_worldgen`), so this LOCAL `p` is NOT the world position. The height ring
-            // is world-anchored, so convert local XZ → WORLD XZ by adding the volume's current world-XZ
-            // offset (`cpu_terrain_offset`, kept in sync by the follow system) before sampling.
-            // ASSUMPTION: the volume is translation-only with `translation.y == 0`, so
-            // `local.xz + offset == world.xz` and `local.y == world.y`. A miss (no ring built yet /
-            // outside the resident clipmap) falls back to the flat mid-band plane so the field stays
-            // finite (valid AABB).
+            // The Terrain volume MAY translate (its transform; with follow OFF it stays at the origin →
+            // offset 0), so this LOCAL `p` is converted to WORLD XZ by adding the volume's current
+            // world-XZ offset (`cpu_terrain_offset`). ASSUMPTION: translation-only with
+            // `translation.y == 0`, so `local.xz + offset == world.xz` and `local.y == world.y`.
+            // Before worldgen publishes its params (`cpu_fbm_params` == None — worldgen disabled / not
+            // yet rolled) we fall back to the flat mid-band plane so the field stays finite (valid AABB).
             let offset = crate::sdf_render::worldgen::upload::cpu_terrain_offset();
-            let world_xz =
-                bevy::math::DVec2::new((p.x + offset.x) as f64, (p.z + offset.y) as f64);
-            match crate::sdf_render::worldgen::upload::cpu_height_ring() {
-                Some(ring) => {
-                    match crate::sdf_render::worldgen::upload::sample_ring(&ring, world_xz) {
-                        Some(node) => p.y - node.height,
-                        None => p.y - (min_height + max_height) * 0.5,
-                    }
+            match crate::sdf_render::worldgen::upload::cpu_fbm_params() {
+                Some((params, sea_level)) => {
+                    let wx = (p.x + offset.x) as f64;
+                    let wz = (p.z + offset.y) as f64;
+                    let h = crate::sdf_render::worldgen::noise::fbm_height_grad(wx, wz, &params).0
+                        + sea_level as f64;
+                    p.y - h as f32
                 }
                 None => p.y - (min_height + max_height) * 0.5,
             }
@@ -1361,58 +1361,43 @@ mod tests {
         assert_eq!(g.material_id, 2);
     }
 
-    /// With no ring published, Terrain falls back to the flat mid-band plane (a finite field, valid
-    /// AABB band) — the worldgen-disabled / not-yet-built path.
+    /// With no fBm params published, Terrain falls back to the flat mid-band plane (a finite field,
+    /// valid AABB band) — the worldgen-disabled / not-yet-rolled path.
     #[test]
-    fn terrain_eval_flat_fallback_without_ring() {
-        crate::sdf_render::worldgen::upload::set_cpu_height_ring(None);
+    fn terrain_eval_flat_fallback_without_params() {
+        crate::sdf_render::worldgen::upload::clear_cpu_fbm_params();
+        crate::sdf_render::worldgen::upload::set_cpu_terrain_offset(Vec2::ZERO);
         let prim = SdfPrimitive::Terrain { half_xz: Vec2::splat(100.0), min_height: 0.0, max_height: 40.0 };
         // Mid-band is y = 20; a point at y = 25 is 5 above the fallback plane.
         let d = eval_primitive(&prim, Vec3::new(3.0, 25.0, -7.0));
         assert!((d - 5.0).abs() < 1e-4, "flat-fallback vertical gap = {d}");
     }
 
-    /// The world-anchored CPU Terrain eval samples the ring at WORLD XZ (= local + the volume's
-    /// current world-XZ offset), so a translated volume picks up the correct world height — this is
-    /// exactly the surface the MESH bake folds. We build a ring with a known resident chunk, set an
-    /// offset that lands a LOCAL point inside it, and assert the eval samples the same height the ring
-    /// reports at that WORLD XZ.
+    /// The world-anchored CPU Terrain eval samples the height field DIRECTLY by analytic fBm at WORLD
+    /// XZ (= local + the volume's current world-XZ offset), so a translated volume picks up the
+    /// correct world height — and that height matches `HeightLayer::sample_world`, the SSOT the ring's
+    /// mip-0 also bakes from (CPU↔mesh-bake parity). We publish the live fBm params, set an offset, and
+    /// assert the eval reproduces the SSOT surface height at the resolved world XZ.
     #[test]
-    fn terrain_eval_samples_ring_at_world_xz_with_offset() {
-        use crate::sdf_render::worldgen::artifact::ScalarField2D;
-        use crate::sdf_render::worldgen::coord::{ChunkCoord, ChunkSize, LayerId};
-        use crate::sdf_render::worldgen::layers::height::{
-            HEIGHT_CHUNK_CELLS, HEIGHT_FIELD_RES, HeightLayer, HeightParams,
-        };
-        use crate::sdf_render::worldgen::store::ArtifactStore;
+    fn terrain_eval_samples_analytic_fbm_at_world_xz_with_offset() {
+        use crate::sdf_render::worldgen::coord::LayerId;
+        use crate::sdf_render::worldgen::layers::height::{HEIGHT_CHUNK_CELLS, HeightLayer, HeightParams};
         use crate::sdf_render::worldgen::upload::{
-            build_height_ring, cpu_terrain_offset, sample_ring, set_cpu_height_ring,
-            set_cpu_terrain_offset,
+            cpu_terrain_offset, set_cpu_fbm_params, set_cpu_height_ring, set_cpu_terrain_offset,
         };
-        use std::sync::Arc;
 
-        // A resident chunk at (3, 2) — its world XZ is well away from the origin, so sampling there
-        // requires the offset (a local point near the origin must be shifted into the chunk).
-        let (cx, cz) = (3i32, 2i32);
-        let layer = HeightLayer::new(LayerId(0), HeightParams::default());
-        let size = ChunkSize::new(HEIGHT_CHUNK_CELLS);
-        let coord = ChunkCoord::new(LayerId(0), IVec3::new(cx, 0, cz));
-        let mut field = ScalarField2D::zeroed(coord, size, HEIGHT_FIELD_RES);
-        for j in 0..=HEIGHT_FIELD_RES {
-            for i in 0..=HEIGHT_FIELD_RES {
-                let wp = field.node_world_xz(i, j);
-                field.set(i, j, layer.sample_world(wp.x, wp.y, 999));
-            }
-        }
-        let mut store = ArtifactStore::new();
-        store.insert(coord, Arc::new(field));
-        let ring = build_height_ring(&store);
-        set_cpu_height_ring(Some(Arc::new(ring.clone())));
+        // The published fBm comes from the live height layer's params + the world seed.
+        let seed = 999u64;
+        let params = HeightParams::default();
+        let layer = HeightLayer::new(LayerId(0), params);
+        set_cpu_fbm_params(layer.fbm_params(seed), params.sea_level);
+        // Ring left unpublished on purpose — the analytic path doesn't read it.
+        set_cpu_height_ring(None);
 
-        // Volume translated so a LOCAL XZ near the origin maps into chunk (3,2). The offset IS the
-        // volume's world-XZ translation; a local point `lp` then samples the ring at `lp + offset`.
+        // Volume translated well away from the origin; a LOCAL XZ near the origin maps to that world
+        // XZ via the offset. The offset IS the volume's world-XZ translation.
         let s = HEIGHT_CHUNK_CELLS as f32;
-        let offset = Vec2::new((cx as f32 + 0.4) * s, (cz as f32 + 0.6) * s);
+        let offset = Vec2::new(3.4 * s, 2.6 * s);
         set_cpu_terrain_offset(offset);
         assert_eq!(cpu_terrain_offset(), offset);
 
@@ -1421,25 +1406,27 @@ mod tests {
             min_height: -96.0,
             max_height: 96.0,
         };
-        // A local sample point; its WORLD XZ = local.xz + offset lands inside chunk (3,2).
+        // A local sample point; its WORLD XZ = local.xz + offset.
         let local = Vec3::new(5.0, 12.0, -3.0);
-        let world_xz =
-            bevy::math::DVec2::new((local.x + offset.x) as f64, (local.z + offset.y) as f64);
-        let expected_h = sample_ring(&ring, world_xz).expect("world XZ resolves to resident chunk").height;
+        // The SSOT surface height at that exact world XZ (= what the ring bakes at mip 0).
+        let expected_h = layer
+            .sample_world((local.x + offset.x) as f64, (local.z + offset.y) as f64, seed)
+            .height;
         let d = eval_primitive(&prim, local);
         // The eval returns the signed vertical gap `local.y - height_at_world_xz`.
         assert!(
-            (d - (local.y - expected_h)).abs() < 1e-4,
-            "world-anchored eval: got {d}, expected {} (h={expected_h})",
+            (d - (local.y - expected_h)).abs() < 1e-3,
+            "world-anchored analytic eval: got {d}, expected {} (h={expected_h})",
             local.y - expected_h
         );
 
-        // Reset globals so other tests aren't affected.
+        // Reset globals so other tests aren't affected (the flat-fallback test needs params == None).
         set_cpu_terrain_offset(Vec2::ZERO);
-        set_cpu_height_ring(None);
+        crate::sdf_render::worldgen::upload::clear_cpu_fbm_params();
     }
 
-    // Mirror of `worldgen::WORLDGEN_TERRAIN_HALF_XZ` (384) for the test prim's footprint; kept local
-    // to avoid a dependency cycle on the worldgen module's const from this test.
-    const WORLDGEN_TERRAIN_HALF_XZ_FOR_TEST: f32 = 384.0;
+    // Mirror of `worldgen::WORLDGEN_TERRAIN_HALF_XZ` for the test prim's footprint; kept local to
+    // avoid a dependency cycle on the worldgen module's const from this test. (Value irrelevant to the
+    // analytic eval, which ignores `half_xz`.)
+    const WORLDGEN_TERRAIN_HALF_XZ_FOR_TEST: f32 = 4096.0;
 }
