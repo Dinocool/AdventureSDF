@@ -1,8 +1,8 @@
-// Triplanar PBR fragment for baked Transvoxel meshes (no UVs). An ExtendedMaterial<StandardMaterial, _>:
-// sample diffuse + normal by projecting the world position on the 3 axis planes (blended by the surface
-// normal), write them into the StandardMaterial PbrInput, then run Bevy's PBR lighting. Ported from the
-// retired raymarch `sdf::material` shader. FULL triplanar (3 taps, no branches) so auto-mip derivatives stay
-// valid in mesh fragments.
+// Per-vertex multi-material triplanar PBR for baked Transvoxel meshes (no UVs). An
+// ExtendedMaterial<StandardMaterial, _>: each vertex carries its top-2 material ids in UV_0 and a blend weight
+// in the COLOUR alpha; sample BOTH materials' diffuse/normal/MRA from shared texture ARRAYS triplanar, cross-
+// fade, write into the StandardMaterial PbrInput, then run Bevy PBR lighting. Ported from the retired raymarch
+// sdf::material/pbr shaders. FULL triplanar (3 taps, no branch) keeps auto-mip derivatives valid.
 
 #import bevy_pbr::{
     pbr_fragment::pbr_input_from_standard_material,
@@ -10,65 +10,144 @@
     forward_io::{VertexOutput, FragmentOutput},
 }
 
-struct MeshExtParams {
-    world_scale: f32,
+struct MeshMat {
+    base_color: vec4<f32>,
+    emissive: vec4<f32>,
+    layer: u32,
     has_diffuse: u32,
     has_normal: u32,
-    _pad: u32,
+    has_mra: u32,
+    metallic: f32,
+    roughness: f32,
+    texture_scale: f32,
+    blend_softness: f32,
 };
 
-// `#{MATERIAL_BIND_GROUP}` is the material bind-group index (NOT always 2 — varies by pipeline); hardcoding
-// `@group(2)` makes the binding land in the wrong group → "binding 100 missing from pipeline layout".
-@group(#{MATERIAL_BIND_GROUP}) @binding(100) var<uniform> ext: MeshExtParams;
-@group(#{MATERIAL_BIND_GROUP}) @binding(101) var diffuse_tex: texture_2d<f32>;
-@group(#{MATERIAL_BIND_GROUP}) @binding(102) var diffuse_s: sampler;
-@group(#{MATERIAL_BIND_GROUP}) @binding(103) var normal_tex: texture_2d<f32>;
-@group(#{MATERIAL_BIND_GROUP}) @binding(104) var normal_s: sampler;
+struct BlendParams {
+    debug_lod: u32,
+    _pad: vec3<u32>,
+};
 
-// Triplanar blend weights: emphasise the dominant axis (so a +X-facing surface samples mostly the YZ plane).
-fn triplanar_weights(n: vec3<f32>) -> vec3<f32> {
+@group(#{MATERIAL_BIND_GROUP}) @binding(100) var<uniform> params: BlendParams;
+@group(#{MATERIAL_BIND_GROUP}) @binding(101) var diffuse_arr: texture_2d_array<f32>;
+@group(#{MATERIAL_BIND_GROUP}) @binding(102) var arr_sampler: sampler;
+@group(#{MATERIAL_BIND_GROUP}) @binding(103) var normal_arr: texture_2d_array<f32>;
+@group(#{MATERIAL_BIND_GROUP}) @binding(104) var mra_arr: texture_2d_array<f32>;
+@group(#{MATERIAL_BIND_GROUP}) @binding(105) var<storage, read> table: array<MeshMat>;
+
+fn material_at(id: u32) -> MeshMat {
+    let n = arrayLength(&table);
+    if (n == 0u) {
+        var m: MeshMat;
+        m.base_color = vec4<f32>(1.0);
+        m.roughness = 1.0;
+        return m;
+    }
+    return table[min(id, n - 1u)];
+}
+
+// Triplanar blend weights: emphasise the dominant axis (a +X-facing surface samples mostly the YZ plane).
+fn tri_weights(n: vec3<f32>) -> vec3<f32> {
     var w = pow(abs(n), vec3<f32>(4.0));
     return w / max(w.x + w.y + w.z, 1e-5);
 }
 
-// Accumulate all 3 axis projections (no branch → screen-space derivatives valid → auto mipmapping).
-fn sample_triplanar(t: texture_2d<f32>, s: sampler, wpos: vec3<f32>, w: vec3<f32>, scale: f32) -> vec4<f32> {
-    return textureSample(t, s, wpos.zy * scale) * w.x
-        + textureSample(t, s, wpos.xz * scale) * w.y
-        + textureSample(t, s, wpos.xy * scale) * w.z;
+// Full triplanar sample of one array layer (3 taps, no branch → derivatives valid → auto mipmapping).
+fn tri_arr(t: texture_2d_array<f32>, wpos: vec3<f32>, w: vec3<f32>, layer: u32, scale: f32) -> vec4<f32> {
+    let li = i32(layer);
+    return textureSample(t, arr_sampler, wpos.zy * scale, li) * w.x
+        + textureSample(t, arr_sampler, wpos.xz * scale, li) * w.y
+        + textureSample(t, arr_sampler, wpos.xy * scale, li) * w.z;
 }
 
-// Triplanar normal mapping (Ben Golus "whiteout" blend): perturb the world axes by each plane's tangent xy,
-// flipped by the geometric normal's sign so concavity matches. No per-plane TBN needed.
-fn triplanar_normal(wpos: vec3<f32>, n: vec3<f32>, w: vec3<f32>, scale: f32) -> vec3<f32> {
+// Whiteout-blend triplanar normal (Ben Golus): perturb world axes by each plane's tangent xy, flipped by the
+// geometric normal's sign. No mesh tangents needed.
+fn tri_normal(wpos: vec3<f32>, n: vec3<f32>, w: vec3<f32>, layer: u32, scale: f32) -> vec3<f32> {
     let sn = sign(n);
-    let tnx = textureSample(normal_tex, normal_s, wpos.zy * scale).xyz * 2.0 - 1.0;
-    let tny = textureSample(normal_tex, normal_s, wpos.xz * scale).xyz * 2.0 - 1.0;
-    let tnz = textureSample(normal_tex, normal_s, wpos.xy * scale).xyz * 2.0 - 1.0;
-    let nx = vec3<f32>(n.x + tnx.z * sn.x, n.y + tnx.y, n.z + tnx.x);
-    let ny = vec3<f32>(n.x + tny.x, n.y + tny.z * sn.y, n.z + tny.y);
-    let nz = vec3<f32>(n.x + tnz.x, n.y + tnz.y, n.z + tnz.z * sn.z);
+    let tx = tri_tap(normal_arr, wpos.zy * scale, layer);
+    let ty = tri_tap(normal_arr, wpos.xz * scale, layer);
+    let tz = tri_tap(normal_arr, wpos.xy * scale, layer);
+    let nx = vec3<f32>(n.x + tx.z * sn.x, n.y + tx.y, n.z + tx.x);
+    let ny = vec3<f32>(n.x + ty.x, n.y + ty.z * sn.y, n.z + ty.y);
+    let nz = vec3<f32>(n.x + tz.x, n.y + tz.y, n.z + tz.z * sn.z);
     return normalize(nx * w.x + ny * w.y + nz * w.z);
+}
+
+fn tri_tap(t: texture_2d_array<f32>, uv: vec2<f32>, layer: u32) -> vec3<f32> {
+    return textureSample(t, arr_sampler, uv, i32(layer)).xyz * 2.0 - 1.0;
+}
+
+struct Surf {
+    albedo: vec3<f32>,
+    normal: vec3<f32>,
+    metallic: f32,
+    roughness: f32,
+    ao: f32,
+    emissive: vec3<f32>,
+};
+
+// Gather one material's surface at the world point (triplanar textures where present, else the scalars).
+fn gather(id: u32, wpos: vec3<f32>, n: vec3<f32>, w: vec3<f32>) -> Surf {
+    let m = material_at(id);
+    var s: Surf;
+    s.albedo = m.base_color.rgb;
+    if (m.has_diffuse != 0u) {
+        s.albedo *= tri_arr(diffuse_arr, wpos, w, m.layer, m.texture_scale).rgb;
+    }
+    s.metallic = m.metallic;
+    s.roughness = m.roughness;
+    s.ao = 1.0;
+    if (m.has_mra != 0u) {
+        let mra = tri_arr(mra_arr, wpos, w, m.layer, m.texture_scale);
+        s.metallic = mra.r;
+        s.roughness = mra.g;
+        s.ao = mra.b;
+    }
+    if (m.has_normal != 0u) {
+        s.normal = tri_normal(wpos, n, w, m.layer, m.texture_scale);
+    } else {
+        s.normal = n;
+    }
+    s.emissive = m.emissive.rgb;
+    return s;
 }
 
 @fragment
 fn fragment(in: VertexOutput, @builtin(front_facing) is_front: bool) -> FragmentOutput {
     var pbr_input = pbr_input_from_standard_material(in, is_front);
 
+    // Per-vertex: UV_0 = (matA, matB) ids (rounded — interpolation is constant within a single-material
+    // triangle), COLOUR.a = blend weight (1 = pure A). Debug "Colour by LOD" = unlit vertex-colour tint.
+    if (params.debug_lod != 0u) {
+        var out: FragmentOutput;
+        out.color = vec4<f32>(in.color.rgb, 1.0);
+        return out;
+    }
+
     let wpos = in.world_position.xyz;
     let n = normalize(in.world_normal);
-    let w = triplanar_weights(n);
+    let w = tri_weights(n);
+    let mat_a = u32(round(in.uv.x));
+    let mat_b = u32(round(in.uv.y));
+    let weight = clamp(in.color.a, 0.0, 1.0);
 
-    if (ext.has_diffuse != 0u) {
-        let d = sample_triplanar(diffuse_tex, diffuse_s, wpos, w, ext.world_scale);
-        pbr_input.material.base_color = vec4<f32>(
-            pbr_input.material.base_color.rgb * d.rgb,
-            pbr_input.material.base_color.a,
-        );
+    var s = gather(mat_a, wpos, n, w);
+    if (weight < 0.999 && mat_b != mat_a) {
+        let sb = gather(mat_b, wpos, n, w);
+        s.albedo = mix(sb.albedo, s.albedo, weight);
+        s.normal = normalize(mix(sb.normal, s.normal, weight));
+        s.metallic = mix(sb.metallic, s.metallic, weight);
+        s.roughness = mix(sb.roughness, s.roughness, weight);
+        s.ao = mix(sb.ao, s.ao, weight);
+        s.emissive = mix(sb.emissive, s.emissive, weight);
     }
-    if (ext.has_normal != 0u) {
-        pbr_input.N = triplanar_normal(wpos, n, w, ext.world_scale);
-    }
+
+    pbr_input.material.base_color = vec4<f32>(s.albedo, 1.0);
+    pbr_input.material.metallic = s.metallic;
+    pbr_input.material.perceptual_roughness = max(s.roughness, 0.045);
+    pbr_input.material.emissive = vec4<f32>(s.emissive, 1.0);
+    pbr_input.N = s.normal;
+    pbr_input.occlusion = vec3<f32>(s.ao);
 
     var out: FragmentOutput;
     out.color = apply_pbr_lighting(pbr_input);
