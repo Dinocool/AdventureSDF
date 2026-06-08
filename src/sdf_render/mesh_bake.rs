@@ -65,14 +65,18 @@ const FACES: [(u8, usize, bool, [usize; 2]); 6] = [
     (5, 2, true, [0, 1]),
 ];
 
-/// A meshed surface vertex on a chunk FACE, cached for the seam pass: reprojected WORLD position + analytic
-/// normal (shared verbatim by the seam so it welds with no T-junctions) + the material's linear base colour
-/// (so the seam strip's albedo matches the surfaces it bridges).
+/// A meshed surface vertex on a chunk FACE, cached for the cell-adjacency seam pass: reprojected WORLD
+/// position + analytic normal (shared verbatim by the seam → no T-junctions) + material linear base colour
+/// (so the strip's albedo matches) + `cell` = the vertex's WORLD-ALIGNED in-face cell coord, in THIS chunk's
+/// LOD voxel units. The seam connects a fine boundary edge to the coarse cell ACROSS the boundary by mapping
+/// the fine cell coord to the coarse one (`cell.div_euclid(2)` at 2:1) — correspondence by grid position, not
+/// by silhouette matching, so it can't fan/twist.
 #[derive(Clone, Copy)]
 struct BoundaryVert {
     pos: Vec3,
     normal: Vec3,
     base: [f32; 3],
+    cell: IVec2,
 }
 
 /// One ordered boundary component on a chunk face: its vertices in curve order (following the mesh's actual
@@ -652,7 +656,7 @@ fn mesh_chunk(
     }
     centroid = grid_origin + (centroid / buffer.positions.len().max(1) as f32) * vs;
     let material = edits::fold_csg(edits, centroid).material_id;
-    let boundary = extract_boundary(&buffer, &positions, &normals, &colors, grid_origin, edge, trim_low);
+    let boundary = extract_boundary(&buffer, &positions, &normals, &colors, grid_origin, vs, edge, trim_low);
     Some(ChunkMeshData { positions, normals, colors, indices, material, boundary })
 }
 
@@ -660,14 +664,15 @@ fn mesh_chunk(
 /// `positions` are chunk-LOCAL, so `grid_origin` is added back for cached WORLD positions. Iterates the
 /// original Surface-Nets mesh (`buffer.indices`, before skirts): an edge in exactly ONE triangle is a mesh
 /// boundary edge; those whose endpoints both sit on a face's boundary cell, linked into ordered loops, are
-/// that face's seam input. Walking the actual open edges (not cell adjacency) guarantees the seam ribbon's
-/// edges coincide with the chunk's open edges, which is what makes the stitch watertight.
+/// that face's seam input. Each boundary vert also carries its world-aligned cell coord for the seam.
+#[allow(clippy::too_many_arguments)]
 fn extract_boundary(
     buffer: &SurfaceNetsBuffer,
     positions: &[[f32; 3]],
     normals: &[[f32; 3]],
     colors: &[[f32; 4]],
     grid_origin: Vec3,
+    vs: f32,
     edge: u32,
     trim_low: u8,
 ) -> [Vec<BoundaryLoop>; 6] {
@@ -679,17 +684,13 @@ fn extract_boundary(
         }
     }
     let open: Vec<(u32, u32)> = ecount.iter().filter(|(_, c)| **c == 1).map(|(e, _)| *e).collect();
-    let bv = |i: u32| {
-        let c = colors[i as usize];
-        BoundaryVert {
-            pos: grid_origin + Vec3::from(positions[i as usize]),
-            normal: Vec3::from(normals[i as usize]),
-            base: [c[0], c[1], c[2]],
-        }
-    };
+    // Grid origin in this chunk's LOD voxel units (anchored at world 0), so `gov + surface_point` is a
+    // WORLD-ALIGNED cell coord that the seam can match across LODs by `div_euclid(2)`.
+    let go = grid_origin / vs;
+    let gov = [go.x.round() as i32, go.y.round() as i32, go.z.round() as i32];
 
     let mut out: [Vec<BoundaryLoop>; 6] = std::array::from_fn(|_| Vec::new());
-    for (bit, axis, is_high, _tan) in FACES {
+    for (bit, axis, is_high, tan) in FACES {
         // The crate meshes cells [smin, edge-1): a HIGH boundary sits at cell edge-2; a LOW boundary at cell 0
         // normally, but at cell 1 when the face was INSET (`trim_low`) to skip the over-reaching apron.
         let bcell = if is_high {
@@ -710,6 +711,16 @@ fn extract_boundary(
         }
         let nodes: Vec<u32> = adj.keys().copied().collect();
         let mut visited: HashSet<u32> = HashSet::new();
+        let bv = |i: u32| {
+            let sp = buffer.surface_points[i as usize];
+            let c = colors[i as usize];
+            BoundaryVert {
+                pos: grid_origin + Vec3::from(positions[i as usize]),
+                normal: Vec3::from(normals[i as usize]),
+                base: [c[0], c[1], c[2]],
+                cell: IVec2::new(gov[tan[0]] + sp[tan[0]] as i32, gov[tan[1]] + sp[tan[1]] as i32),
+            }
+        };
         let to_loop = |comp: Vec<u32>, is_loop: bool| BoundaryLoop {
             verts: comp.into_iter().map(bv).collect(),
             is_loop,
@@ -763,20 +774,6 @@ fn coarse_neighbour_key(fine: BrickKey, dir: IVec3, step: i32) -> BrickKey {
     BrickKey::new(fine.lod + 1, IVec3::new(snap(half.x), snap(half.y), snap(half.z)))
 }
 
-/// Squared distance between the two CLOSEST vertices of two boundary loops. Used to match a fine loop to its
-/// coarse counterpart: the same surface curve at two resolutions has near-touching boundaries (≈ a voxel
-/// apart), whereas unrelated curves (e.g. a floating sphere vs the terrain below) are far — so a threshold
-/// on this cleanly rejects wrong matches.
-fn loop_min_dist_sq(a: &BoundaryLoop, b: &BoundaryLoop) -> f32 {
-    let mut best = f32::INFINITY;
-    for va in &a.verts {
-        for vb in &b.verts {
-            best = best.min(va.pos.distance_squared(vb.pos));
-        }
-    }
-    best
-}
-
 /// Walk one connected component of the open-edge adjacency graph from `start`, in curve order.
 fn walk_open_edges(adj: &HashMap<u32, Vec<u32>>, visited: &mut HashSet<u32>, start: u32) -> Vec<u32> {
     let mut comp = Vec::new();
@@ -795,76 +792,33 @@ fn walk_open_edges(adj: &HashMap<u32, Vec<u32>>, visited: &mut HashSet<u32>, sta
     comp
 }
 
-/// Stitch one fine boundary curve to its matching coarse curve, emitting the chunks' ACTUAL boundary verts
-/// (welds with no T-junctions). Correspondence is the MONOTONE NEAREST coarse vertex — each fine vertex maps
-/// to the spatially-closest coarse vertex at-or-after the previous one. Spatial ⇒ no twist (unlike
-/// arc-length); coarse advances only as fine passes it ⇒ ≈2:1 triangles, never a global fan (the failure
-/// mode of shortest-diagonal / arc-length lacing). Every fine edge and every coarse edge is used once →
-/// watertight. Loops close on themselves; chains leave their ends open (met by the adjacent face's seam).
-fn zipper(
-    fl: &BoundaryLoop,
-    cl: &BoundaryLoop,
+/// Build the cross-LOD seam for one face by CELL ADJACENCY — the canonical dual-method approach (Gildea's
+/// `ContourProcessEdge`, specialised to a regular 2:1 grid). For each FINE boundary edge (two consecutive
+/// boundary verts = one Surface-Nets open edge), look up the COARSE cell ACROSS the boundary from each
+/// endpoint by mapping the fine cell coord to the coarse one (`div_euclid(2)` at 2:1), and emit the quad
+/// `fine_a → fine_b → coarse_b → coarse_a` (which collapses to ONE triangle when both fine cells map to the
+/// same coarse cell). Properties: one quad per fine edge → BOUNDED, no fans; correspondence by grid position
+/// → no twists; corners are just more edges → no corner gaps; winding from the vertex normals → no dark
+/// faces. A fine edge whose coarse cell has no vertex (feature absent at the coarse LOD) is simply skipped.
+fn build_seam_into(
+    fine: &[BoundaryLoop],
+    coarse: &[BoundaryLoop],
     debug: bool,
     positions: &mut Vec<[f32; 3]>,
     normals: &mut Vec<[f32; 3]>,
     colors: &mut Vec<[f32; 4]>,
     indices: &mut Vec<u32>,
 ) {
-    let mut f: Vec<BoundaryVert> = fl.verts.clone();
-    let mut c: Vec<BoundaryVert> = cl.verts.clone();
-    if f.len() < 2 || c.len() < 2 {
+    if fine.is_empty() || coarse.is_empty() {
         return;
     }
-    let is_loop = fl.is_loop && cl.is_loop;
-    // Orient coarse to run the SAME direction along the shared curve as fine.
-    if is_loop {
-        let f0 = f[0].pos;
-        let rot = (0..c.len())
-            .min_by(|&a, &b| f0.distance_squared(c[a].pos).total_cmp(&f0.distance_squared(c[b].pos)))
-            .unwrap_or(0);
-        c.rotate_left(rot);
-        if c.len() > 2 && f[1].pos.distance_squared(c[1].pos) > f[1].pos.distance_squared(c[c.len() - 1].pos)
-        {
-            c[1..].reverse();
-        }
-    } else {
-        let (fa, fb) = (f[0].pos, f[f.len() - 1].pos);
-        let keep = fa.distance(c[0].pos) + fb.distance(c[c.len() - 1].pos);
-        let flip = fa.distance(c[c.len() - 1].pos) + fb.distance(c[0].pos);
-        if flip < keep {
-            c.reverse();
+    // Coarse boundary vertices keyed by world-aligned cell coord (coarse LOD units) for O(1) lookup.
+    let mut cmap: HashMap<IVec2, BoundaryVert> = HashMap::new();
+    for cl in coarse {
+        for v in &cl.verts {
+            cmap.insert(v.cell, *v);
         }
     }
-    let nc = c.len();
-    if is_loop {
-        f.push(f[0]); // close the fine loop; coarse wraps via `% nc`
-    }
-    let nf = f.len();
-    let cv = |k: usize| c[k % nc];
-
-    // Monotone nearest-coarse index per fine vertex (scan a small forward window so it can't jump or backtrack).
-    let start = (0..nc)
-        .min_by(|&a, &b| f[0].pos.distance_squared(c[a].pos).total_cmp(&f[0].pos.distance_squared(c[b].pos)))
-        .unwrap();
-    let coarse_end = if is_loop { start + nc } else { nc - 1 };
-    let mut g = vec![start; nf];
-    for i in 1..nf {
-        let lo = g[i - 1];
-        let mut best = lo;
-        let mut bd = f[i].pos.distance_squared(cv(lo).pos);
-        for k in (lo + 1)..=(lo + 8).min(coarse_end) {
-            let d = f[i].pos.distance_squared(cv(k).pos);
-            if d < bd {
-                bd = d;
-                best = k;
-            }
-        }
-        g[i] = best;
-    }
-    if is_loop {
-        g[nf - 1] = coarse_end; // close the coarse loop fully
-    }
-
     let col = |v: &BoundaryVert| {
         if debug {
             SEAM_DEBUG_COLOUR
@@ -872,10 +826,12 @@ fn zipper(
             [v.base[0], v.base[1], v.base[2], 1.0]
         }
     };
-    // Emit a triangle, FLIPPING its winding so the face normal agrees with the analytic vertex normals →
-    // every seam triangle faces outward (the strip's lacing winding alternates otherwise → half render dark
-    // under the double-sided material).
+    // One triangle, flipped to face OUTWARD (winding agrees with the analytic vertex normals); coincident-
+    // vertex (degenerate) triangles are dropped.
     let mut emit = |a: BoundaryVert, b: BoundaryVert, d: BoundaryVert| {
+        if a.pos == b.pos || b.pos == d.pos || a.pos == d.pos {
+            return;
+        }
         let face_n = (b.pos - a.pos).cross(d.pos - a.pos);
         let tri = if face_n.dot(a.normal + b.normal + d.normal) < 0.0 { [a, d, b] } else { [a, b, d] };
         let i0 = positions.len() as u32;
@@ -886,59 +842,22 @@ fn zipper(
         }
         indices.extend_from_slice(&[i0, i0 + 1, i0 + 2]);
     };
-    // CHAIN ends: the coarse curve usually extends past where the fine curve's nearest match starts/ends
-    // (most visibly at chunk corners). Fan the unmatched coarse head [0,g[0]) and tail to the first/last fine
-    // vertex so every coarse edge is covered → no chain-end holes. (Loops already wrap fully.)
-    let mut k = if is_loop { g[0] } else { 0 };
-    while k < g[0] {
-        emit(f[0], cv(k), cv(k + 1));
-        k += 1;
-    }
-    for i in 0..nf - 1 {
-        emit(f[i], f[i + 1], cv(k)); // fine edge → its current coarse vertex
-        while k < g[i + 1] {
-            emit(f[i + 1], cv(k), cv(k + 1)); // each coarse edge fine passed → triangle to the fine vertex
-            k += 1;
-        }
-    }
-    let tail = if is_loop { g[nf - 1] } else { nc - 1 };
-    while k < tail {
-        emit(f[nf - 1], cv(k), cv(k + 1));
-        k += 1;
-    }
-}
-
-/// Build the seam ribbon between a fine chunk's boundary loops and its coarser neighbour's boundary loops
-/// (already the matching opposite faces). Each fine loop is matched to the coarse loop whose nearest vertex
-/// is closest, and zipped — but ONLY if that nearest vertex is within `max_dist` (else the fine loop is a
-/// feature with no coarse counterpart, e.g. a small object that vanished at the coarse LOD, and must not be
-/// bridged to an unrelated surface). Appends world-space geometry.
-#[allow(clippy::too_many_arguments)]
-fn build_seam_into(
-    fine: &[BoundaryLoop],
-    coarse: &[BoundaryLoop],
-    max_dist: f32,
-    debug: bool,
-    positions: &mut Vec<[f32; 3]>,
-    normals: &mut Vec<[f32; 3]>,
-    colors: &mut Vec<[f32; 4]>,
-    indices: &mut Vec<u32>,
-) {
-    if fine.is_empty() || coarse.is_empty() {
-        return;
-    }
+    let across = |c: IVec2| IVec2::new(c.x.div_euclid(2), c.y.div_euclid(2));
     for fl in fine {
-        let Some((d2, cl)) = coarse
-            .iter()
-            .map(|cl| (loop_min_dist_sq(fl, cl), cl))
-            .min_by(|a, b| a.0.total_cmp(&b.0))
-        else {
+        let n = fl.verts.len();
+        if n < 2 {
             continue;
-        };
-        if d2 > max_dist * max_dist {
-            continue; // no coarse counterpart near this fine loop → leave it (don't bridge to a stranger)
         }
-        zipper(fl, cl, debug, positions, normals, colors, indices);
+        let edges = if fl.is_loop { n } else { n - 1 };
+        for i in 0..edges {
+            let a = fl.verts[i];
+            let b = fl.verts[(i + 1) % n];
+            let (Some(&ca), Some(&cb)) = (cmap.get(&across(a.cell)), cmap.get(&across(b.cell))) else {
+                continue; // fine edge with no coarse counterpart across the boundary (e.g. corner / vanished)
+            };
+            emit(a, b, cb);
+            emit(a, cb, ca);
+        }
     }
 }
 
@@ -1420,13 +1339,9 @@ fn mesh_resident_chunks(
                     let Some(cst) = states.0.get(&ckey) else {
                         continue; // coarse neighbour not resident (outer ring edge) → no strip there
                     };
-                    // Match-distance cap: the same curve at the two LODs touches within ~a coarse voxel, so a
-                    // few coarse voxels cleanly accepts real counterparts and rejects unrelated loops.
-                    let max_dist = 4.0 * config.voxel_size_at(fkey.lod + 1);
                     build_seam_into(
                         &fst.boundary[bit as usize],
                         &cst.boundary[opposite_face(bit) as usize],
-                        max_dist,
                         mesh_cfg.debug_lod_colour,
                         &mut positions,
                         &mut normals,
@@ -1890,7 +1805,7 @@ mod tests {
 
         // Seam: fine −X (bit 0) ↔ coarse +X (bit 1). Vertices are already world-space.
         let (mut p, mut n, mut c, mut i) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
-        build_seam_into(&fine.boundary[0], &coarse.boundary[1], 10.0, false, &mut p, &mut n, &mut c, &mut i);
+        build_seam_into(&fine.boundary[0], &coarse.boundary[1], false, &mut p, &mut n, &mut c, &mut i);
         assert!(!i.is_empty(), "seam produced no triangles");
         let seam: Vec<_> = i
             .chunks_exact(3)
