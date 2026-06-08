@@ -714,6 +714,25 @@ fn coarse_neighbour_key(fine: BrickKey, dir: IVec3, step: i32) -> BrickKey {
     BrickKey::new(fine.lod + 1, IVec3::new(snap(half.x), snap(half.y), snap(half.z)))
 }
 
+/// Normalized cumulative arc-length parameter (`0..=1`) of each vertex along a polyline. Used to zip two
+/// boundary curves PROPORTIONALLY (a dense fine curve advances ~2× per coarse step) instead of greedily by
+/// distance, which fans degenerate triangles when the curves are offset or differently sized.
+fn arc_params(pts: &[(Vec3, Vec3, [f32; 3])]) -> Vec<f32> {
+    let mut t = Vec::with_capacity(pts.len());
+    let mut acc = 0.0f32;
+    t.push(0.0);
+    for w in pts.windows(2) {
+        acc += w[0].0.distance(w[1].0);
+        t.push(acc);
+    }
+    if acc > 1e-6 {
+        for x in &mut t {
+            *x /= acc;
+        }
+    }
+    t
+}
+
 /// Squared distance between the two CLOSEST vertices of two boundary loops. Used to match a fine loop to its
 /// coarse counterpart: the same surface curve at two resolutions has near-touching boundaries (≈ a voxel
 /// apart), whereas unrelated curves (e.g. a floating sphere vs the terrain below) are far — so a threshold
@@ -779,8 +798,15 @@ fn zipper(
         }
         fp.push(fp[0]);
         cp.push(cp[0]);
-    } else if cp[0].0.distance_squared(fp[0].0) > cp[cp.len() - 1].0.distance_squared(fp[0].0) {
-        cp.reverse();
+    } else {
+        // Chain: orient coarse to match fine by whichever direction brings BOTH endpoints closer (using one
+        // endpoint can twist the ribbon when the curves are offset).
+        let (fa, fb) = (fp[0].0, fp[fp.len() - 1].0);
+        let keep = fa.distance(cp[0].0) + fb.distance(cp[cp.len() - 1].0);
+        let flip = fa.distance(cp[cp.len() - 1].0) + fb.distance(cp[0].0);
+        if flip < keep {
+            cp.reverse();
+        }
     }
     let mut emit = |a: (Vec3, Vec3, [f32; 3]), b: (Vec3, Vec3, [f32; 3]), c: (Vec3, Vec3, [f32; 3])| {
         let idx0 = positions.len() as u32;
@@ -793,15 +819,17 @@ fn zipper(
         }
         indices.extend_from_slice(&[idx0, idx0 + 1, idx0 + 2]);
     };
+    // Walk both curves by normalized arc-length: always advance the side whose NEXT vertex has the smaller
+    // parameter, so dense and sparse curves progress in lockstep (≈2:1 even triangles, no fans).
+    let (tf, tc) = (arc_params(&fp), arc_params(&cp));
     let (mut i, mut j) = (0usize, 0usize);
     while i + 1 < fp.len() || j + 1 < cp.len() {
-        // Advance whichever side keeps the new diagonal shortest (the classic ribbon triangulation).
         let advance_fine = if i + 1 >= fp.len() {
             false
         } else if j + 1 >= cp.len() {
             true
         } else {
-            fp[i + 1].0.distance_squared(cp[j].0) <= fp[i].0.distance_squared(cp[j + 1].0)
+            tf[i + 1] <= tc[j + 1]
         };
         if advance_fine {
             emit(fp[i], cp[j], fp[i + 1]);
