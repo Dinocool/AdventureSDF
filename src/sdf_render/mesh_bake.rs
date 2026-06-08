@@ -28,9 +28,7 @@
 //! VIEWING: use the **Mesh Bake** editor panel ([`mesh_bake_panel`]) to toggle the SDF render off and
 //! reveal these meshes (+ wireframe / chunk-size slider / rebake / counts).
 
-use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet};
-use std::hash::Hasher;
 use std::sync::Arc;
 
 use bevy::asset::RenderAssetUsages;
@@ -55,43 +53,22 @@ const MAX_NEW_TASKS_PER_FRAME: usize = 256;
 /// Hash-mix multiplier for folding the "Rebake all" epoch into a chunk's content hash.
 const EPOCH_MIX: u64 = 0x9E37_79B9_7F4A_7C15;
 
-/// One material's sub-mesh within a chunk (chunk-LOCAL positions). A chunk is split into ONE of these per
-/// material it contains, so co-located surfaces of different materials — e.g. terrain under a floating object
-/// in the same chunk — each render with their OWN material instead of the chunk's single dominant one.
-struct SubMesh {
-    /// Material id → selects this sub-mesh's `MeshMaterial` handle.
-    material: u16,
+/// Raw mesh data produced off-thread by a meshing task (chunk-LOCAL positions; one mesh per chunk). Every
+/// chunk uses the SINGLE shared per-vertex-blend `MeshMaterial`: `uvs` carry each vertex's top-2 material ids
+/// `(matA, matB)` and `colors.a` the blend weight (`colors.rgb` = the per-LOD debug tint when colour-by-LOD).
+struct ChunkMeshData {
     positions: Vec<[f32; 3]>,
     normals: Vec<[f32; 3]>,
+    /// `(matA as f32, matB as f32)` per vertex (read in the shader as the two materials to cross-fade).
+    uvs: Vec<[f32; 2]>,
     colors: Vec<[f32; 4]>,
     indices: Vec<u32>,
-}
-
-/// Raw mesh data produced off-thread by a meshing task — one [`SubMesh`] per material in the chunk (turned
-/// into per-material `Mesh` assets + entities on the main thread).
-struct ChunkMeshData {
-    subs: Vec<SubMesh>,
 }
 
 /// A completed bake for a chunk's round target, held until the coherent COMMIT (`None` = empty chunk).
 struct StagedBake {
     data: Option<ChunkMeshData>,
 }
-
-/// Resolved appearance of a material id, snapshotted from `MaterialRegistry` for the bake: linear base
-/// colour + emissive radiance + PBR scalars. Indexed by `EditSample::material_id`. Base goes on the
-/// vertex COLOUR (per-vertex); metallic/roughness/emissive go on the chunk's `StandardMaterial`.
-#[derive(Clone, Copy)]
-struct MatAppearance {
-    base: [f32; 3],
-    emissive: [f32; 3],
-    metallic: f32,
-    roughness: f32,
-}
-
-/// Fallback when a material id isn't in the registry snapshot (neutral dielectric grey, no emission).
-const DEFAULT_APPEARANCE: MatAppearance =
-    MatAppearance { base: [0.6, 0.6, 0.6], emissive: [0.0; 3], metallic: 0.0, roughness: 1.0 };
 
 /// The frozen snapshot a bake round is meshing against. `edits = Some` ⇒ a round is in progress; all of
 /// that round's bakes use THESE edits/AABBs, so they are mutually coherent regardless of how the live
@@ -115,12 +92,10 @@ struct BakeRound {
 /// Per-system scalar `Local` state, bundled (Bevy systems cap at 16 params).
 #[derive(Default)]
 struct MeshBakeScalars {
-    /// "Rebake all" / appearance / debug epoch, mixed into every content hash.
+    /// "Rebake all" / debug epoch, mixed into every content hash.
     epoch: u64,
     /// Last frame's chunk size K — detects a live K change.
     prev_k: u32,
-    /// Last frame's material-appearance hash — detects a colour/PBR edit.
-    prev_mat_hash: u64,
     /// Held clipmap centre while "Freeze LOD" is on (captured on the rising edge; cleared on release).
     frozen_cam: Option<Vec3>,
 }
@@ -157,7 +132,7 @@ struct ChunkStates(HashMap<BrickKey, ChunkState>);
 /// bricks; the editor panel exposes it as a slider (1..=8). NOTE: this is the mesh-bake aggregation
 /// unit, NOT `chunk::CHUNK_BRICKS` (the GPU-atlas residency chunk — a different concept).
 #[derive(Resource)]
-struct MeshBakeConfig {
+pub(crate) struct MeshBakeConfig {
     chunk_bricks: u32,
     /// World half-extent of the LOD-0 (finest) cube around the camera. Geometry within this radius meshes
     /// at LOD 0; each coarser LOD doubles the radius (2:1 clipmap). Larger = more fine geometry (slower).
@@ -165,7 +140,7 @@ struct MeshBakeConfig {
     /// How many LOD levels the mesh bake uses (clamped to `SdfGridConfig::lod_count`). 1 = single-LOD.
     lod_count: u32,
     /// Debug: tint each chunk mesh by its LOD level, rendered unlit ("Colour by LOD").
-    debug_lod_colour: bool,
+    pub(crate) debug_lod_colour: bool,
     /// Debug: FREEZE the clipmap centre at the camera's current position so the LOD structure stops
     /// following the camera — fly through and inspect a fixed LOD boundary up close.
     freeze_lod: bool,
@@ -237,7 +212,7 @@ impl Plugin for MeshBakePlugin {
             // also clears the meshes when an SDF scene is left.
             .add_systems(
                 Update,
-                mesh_resident_chunks.after(super::mesh_material::rebuild_mesh_materials),
+                mesh_resident_chunks.after(super::mesh_material::rebuild_mesh_material),
             );
         // Editor-only: a dedicated bottom dock panel for the mesh-bake controls (a debug overlay; the
         // bake above does not depend on it).
@@ -442,7 +417,6 @@ fn field_gradient(edits: &[edits::ResolvedEdit], indices: &[u32], p: Vec3, eps: 
 fn mesh_chunk(
     edits: &[edits::ResolvedEdit],
     indices: &[u32],
-    appearances: &[MatAppearance],
     grid_origin: Vec3,
     vs: f32,
     subdivisions: u32,
@@ -474,7 +448,7 @@ fn mesh_chunk(
             sides |= s;
         }
     }
-    let builder = ChunkMeshBuilder::new(edits, indices, appearances, grid_origin, vs, lod, debug);
+    let builder = ChunkMeshBuilder::new(edits, indices, grid_origin, vs, lod, debug);
     // MUST be CacheNothing: `CacheCentralBlockOnly` caches the central block at THIS chunk's (coarse)
     // resolution, which then serves the transition cell's FINE-resolution face samples too — collapsing the
     // transition so the cross-LOD weld fails. The analytic CSG field is cheap to re-evaluate, so just query it.
@@ -483,32 +457,34 @@ fn mesh_chunk(
 }
 
 /// `MeshBuilder` that turns Transvoxel's per-edge vertices into our `ChunkMeshData`: chunk-LOCAL positions,
-/// EXACT analytic normals (from the CSG gradient, not Marching-Cubes' estimate), per-vertex material base
-/// colour (or the per-LOD debug tint), and the dominant material id (at the surface centroid) for the
-/// chunk's `StandardMaterial`.
+/// EXACT analytic normals (from the CSG gradient, not Marching-Cubes' estimate), and the per-vertex
+/// multi-material blend data — the top-2 CSG material ids (in `uvs`) and a blend weight (in `colors.a`) that
+/// the shared mesh material biplanar-samples and cross-fades. In debug ("Colour by LOD") the per-LOD tint is
+/// written into `colors.rgb` instead and the shader renders it unlit.
 struct ChunkMeshBuilder<'a> {
     edits: &'a [edits::ResolvedEdit],
     indices: &'a [u32],
-    appearances: &'a [MatAppearance],
     origin: Vec3,
     eps: f32,
+    /// Blend band (world units): half-width over which two materials cross-fade at a CSG seam. A couple of
+    /// voxels feathers the seam without bleeding material across the surface.
+    band: f32,
     lod: u32,
     debug: bool,
     positions: Vec<[f32; 3]>,
     normals: Vec<[f32; 3]>,
+    /// Per-vertex `(mat_a, mat_b)` ids as floats (constant across a single-material triangle, so the shader
+    /// recovers exact ids by rounding).
+    uvs: Vec<[f32; 2]>,
+    /// `rgb` = debug per-LOD tint (debug only); `a` = blend weight (1 = pure A, 0.5 = even A/B split).
     colors: Vec<[f32; 4]>,
-    /// Per-vertex material id (the CSG material at the vertex), used to split the chunk into per-material
-    /// sub-meshes so co-located surfaces of different materials don't all take the chunk's dominant one.
-    vmat: Vec<u16>,
     tris: Vec<u32>,
 }
 
 impl<'a> ChunkMeshBuilder<'a> {
-    #[allow(clippy::too_many_arguments)]
     fn new(
         edits: &'a [edits::ResolvedEdit],
         indices: &'a [u32],
-        appearances: &'a [MatAppearance],
         origin: Vec3,
         vs: f32,
         lod: u32,
@@ -517,15 +493,15 @@ impl<'a> ChunkMeshBuilder<'a> {
         Self {
             edits,
             indices,
-            appearances,
             origin,
             eps: vs * 0.01,
+            band: vs * 2.0,
             lod,
             debug,
             positions: Vec::new(),
             normals: Vec::new(),
+            uvs: Vec::new(),
             colors: Vec::new(),
-            vmat: Vec::new(),
             tris: Vec::new(),
         }
     }
@@ -534,41 +510,13 @@ impl<'a> ChunkMeshBuilder<'a> {
         if self.positions.is_empty() || self.tris.is_empty() {
             return None;
         }
-        // SPLIT BY MATERIAL: bucket triangles by their per-triangle material (the majority of their 3 vertices
-        // — for a surface entirely in one material, all 3 agree), then compact each bucket into its own
-        // sub-mesh. Co-located surfaces of different materials (terrain vs a floating object in one chunk) thus
-        // get separate meshes + their own material, instead of the whole chunk taking one dominant material.
-        let mut buckets: HashMap<u16, Vec<u32>> = HashMap::new();
-        for t in self.tris.chunks_exact(3) {
-            let (a, b, c) = (self.vmat[t[0] as usize], self.vmat[t[1] as usize], self.vmat[t[2] as usize]);
-            let mat = if a == b || a == c {
-                a
-            } else if b == c {
-                b
-            } else {
-                a
-            };
-            buckets.entry(mat).or_default().extend_from_slice(t);
-        }
-        // Compact each bucket to its own vertex list (only the vertices it references), remapping indices.
-        let mut subs = Vec::with_capacity(buckets.len());
-        for (material, tri_idx) in buckets {
-            let mut remap: HashMap<u32, u32> = HashMap::new();
-            let (mut positions, mut normals, mut colors, mut indices) =
-                (Vec::new(), Vec::new(), Vec::new(), Vec::new());
-            for &i in &tri_idx {
-                let ni = *remap.entry(i).or_insert_with(|| {
-                    let n = positions.len() as u32;
-                    positions.push(self.positions[i as usize]);
-                    normals.push(self.normals[i as usize]);
-                    colors.push(self.colors[i as usize]);
-                    n
-                });
-                indices.push(ni);
-            }
-            subs.push(SubMesh { material, positions, normals, colors, indices });
-        }
-        Some(ChunkMeshData { subs })
+        Some(ChunkMeshData {
+            positions: self.positions,
+            normals: self.normals,
+            uvs: self.uvs,
+            colors: self.colors,
+            indices: self.tris,
+        })
     }
 }
 
@@ -586,17 +534,18 @@ impl MeshBuilder<f32, f32> for ChunkMeshBuilder<'_> {
         // Exact outward normal = ∇(CSG distance) (points toward increasing distance = outside the solid).
         let n = field_gradient(self.edits, self.indices, world, self.eps).normalize_or_zero();
         self.normals.push([n.x, n.y, n.z]);
-        // Per-vertex CSG material → drives the sub-mesh split (see `finish`).
-        let mid = edits::fold_csg(self.edits, world).material_id;
-        self.vmat.push(mid);
-        // Vertex COLOUR: debug = per-LOD tint; normal = the material's linear base colour (the per-material
-        // `StandardMaterial` base is WHITE, so this is the single colour source — texture multiplies on top).
+        // Per-vertex top-2 CSG materials + their signed-distance gap, for the shader's A/B cross-fade. `gap`
+        // is `d_b − d_a ≥ 0`; a small gap (a genuine CSG seam) feathers, a large gap pins to A.
+        let (mat_a, mat_b, gap) = edits::fold_csg_top2(self.edits, self.indices, world);
+        self.uvs.push([mat_a as f32, mat_b as f32]);
+        let weight = (0.5 + 0.5 * gap / self.band).clamp(0.5, 1.0);
+        // Vertex COLOUR: debug = per-LOD tint (rendered unlit); else rgb is unused (white) and `a` carries the
+        // blend weight — the shared mesh material is the single albedo source (table base × triplanar texture).
         let col = if self.debug {
             let tint = LOD_DEBUG_PALETTE[(self.lod as usize).min(LOD_DEBUG_PALETTE.len() - 1)];
             [tint[0], tint[1], tint[2], 1.0]
         } else {
-            let ap = self.appearances.get(mid as usize).copied().unwrap_or(DEFAULT_APPEARANCE);
-            [ap.base[0], ap.base[1], ap.base[2], 1.0]
+            [1.0, 1.0, 1.0, weight]
         };
         self.colors.push(col);
         VertexIndex(self.positions.len() - 1)
@@ -666,7 +615,6 @@ fn mesh_resident_chunks(
     volumes: Query<VolumeQueryData, With<SdfVolume>>,
     config: Res<SdfGridConfig>,
     mesh_cfg: Res<MeshBakeConfig>,
-    mat_reg: Res<edits::MaterialRegistry>,
     // Drives the clipmap LOD (finer near the camera). No `SdfCamera` ⇒ single-LOD fallback (mesh
     // everything at LOD 0 — the original scene/camera-independent behaviour for gameplay scenes).
     cameras: Query<&GlobalTransform, (With<SdfCamera>, Without<SdfVolume>)>,
@@ -675,10 +623,10 @@ fn mesh_resident_chunks(
     mut rebuild: ResMut<MeshBakeRebuild>,
     mut stats: ResMut<MeshBakeStats>,
     mut mesh_assets: ResMut<Assets<Mesh>>,
-    // Per-material triplanar `MeshMaterial` handles (built by `mesh_material::rebuild_mesh_materials`); the
-    // chunk picks its dominant material's handle, or the shared unlit debug handle in Colour-by-LOD.
+    // The single shared triplanar `MeshMaterial` handle (built by `mesh_material::rebuild_mesh_material`);
+    // EVERY chunk mesh uses it — the per-vertex ids + blend weight select/cross-fade materials in-shader.
     mesh_mats: Res<super::mesh_material::MeshMaterials>,
-    // Bundled scalar Locals: rebake epoch, prev K, prev material-appearance hash.
+    // Bundled scalar Locals: rebake epoch, prev K.
     mut scal: Local<MeshBakeScalars>,
     // The in-progress bake round's frozen edit + clipmap snapshot.
     mut round: Local<BakeRound>,
@@ -729,43 +677,13 @@ fn mesh_resident_chunks(
     let edit_extent: Vec<f32> =
         edit_aabbs.iter().map(|a| (Vec3::from(a.max) - Vec3::from(a.min)).max_element()).collect();
 
-    // Material appearance snapshot (linear base + emissive) for the off-thread bake, indexed by material
-    // id. Cheap (a handful of materials); cloned into each bake task.
-    let appearances: Arc<Vec<MatAppearance>> = Arc::new(
-        mat_reg
-            .defs
-            .iter()
-            .map(|d| {
-                let l = d.base_color.to_linear();
-                MatAppearance {
-                    base: [l.red, l.green, l.blue],
-                    emissive: d.emissive.to_array(),
-                    metallic: d.metallic,
-                    roughness: d.roughness,
-                }
-            })
-            .collect(),
-    );
-    // Vertex colours + the chunk material read material APPEARANCE, but the per-chunk content hash keys on
-    // material *id* — so a material colour/PBR edit wouldn't otherwise re-bake. Hash the appearance set
-    // (quantized; authored values don't jitter) and re-bake + rebuild the StandardMaterials when it changes.
-    let mat_hash = {
-        let mut h = DefaultHasher::new();
-        for a in appearances.iter() {
-            for v in a.base.iter().chain(a.emissive.iter()).chain([&a.metallic, &a.roughness]) {
-                h.write_i64((*v as f64 * 1.0e4) as i64);
-            }
-        }
-        h.finish()
-    };
-    let mat_changed = scal.prev_mat_hash != 0 && scal.prev_mat_hash != mat_hash;
-    // "Rebake all" (button) OR a material-appearance change bumps a global epoch mixed into every chunk
-    // hash → every hash changes once → full re-bake.
-    if std::mem::replace(&mut rebuild.0, false) || mat_changed {
+    // The baked mesh is appearance-INDEPENDENT: vertices carry only geometry + top-2 material *ids* + a blend
+    // weight, never colours/PBR scalars. A material colour/PBR edit therefore needs no re-bake — the shared
+    // `MeshMaterials` table + texture arrays rebuild themselves on `MaterialRegistry` change (see
+    // `mesh_material.rs`). So only "Rebake all" (button) bumps the global epoch → full re-bake.
+    if std::mem::replace(&mut rebuild.0, false) {
         scal.epoch = scal.epoch.wrapping_add(1);
     }
-    // (The triplanar `MeshMaterials` cache rebuilds itself when the registry changes — no clear needed here.)
-    scal.prev_mat_hash = mat_hash;
     // Fold the debug-colour flag into the epoch so toggling "Colour by LOD" re-bakes (vertex colours change).
     let epoch_mix = scal.epoch.wrapping_mul(EPOCH_MIX)
         ^ if mesh_cfg.debug_lod_colour { 0xDEB0_C010_0000_0000 } else { 0 };
@@ -900,9 +818,9 @@ fn mesh_resident_chunks(
     if round.edits.is_some() && round_done && (has_staged || has_departed) {
         let mut reaped = 0usize;
         // Build + spawn each committing chunk's staged mesh in one pass (Transvoxel welds neighbouring LODs by
-        // construction — no cross-chunk seam step). A chunk is split into one SUB-MESH per material; each gets
-        // its own entity stamped `ChunkMesh(key)` (so the reaper still tracks them by key) with that material's
-        // triplanar `MeshMaterial` handle (or the shared unlit debug handle in Colour-by-LOD).
+        // construction — no cross-chunk seam step). ONE mesh + ONE entity per chunk, all sharing the single
+        // triplanar `MeshMaterial` handle: per-vertex top-2 material ids (UV_0) + blend weight (COLOR.a) drive
+        // the in-shader material select / cross-fade, so co-located materials no longer fight over a dominant.
         for (key, st) in states.0.iter_mut() {
             let Some(sb) = st.staged.take() else {
                 continue;
@@ -917,32 +835,22 @@ fn mesh_resident_chunks(
             // Transvoxel positions are chunk-LOCAL relative to the chunk's world MIN corner (NO apron), so the
             // entity Transform is exactly `brick_min_world(coord, lod)`.
             let origin = config.brick_min_world(key.coord, key.lod);
-            for sub in data.subs {
-                let mat = if mesh_cfg.debug_lod_colour {
-                    mesh_mats.debug.clone()
-                } else {
-                    mesh_mats
-                        .by_id
-                        .get(sub.material as usize)
-                        .cloned()
-                        .unwrap_or_else(|| mesh_mats.debug.clone())
-                };
-                let mesh = Mesh::new(PrimitiveTopology::TriangleList, RenderAssetUsages::default())
-                    .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, sub.positions)
-                    .with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, sub.normals)
-                    .with_inserted_attribute(Mesh::ATTRIBUTE_COLOR, sub.colors)
-                    .with_inserted_indices(Indices::U32(sub.indices));
-                let e = commands
-                    .spawn((
-                        Mesh3d(mesh_assets.add(mesh)),
-                        MeshMaterial3d(mat),
-                        Transform::from_translation(origin),
-                        ChunkMesh(*key),
-                        Name::new("SDF Chunk Mesh"),
-                    ))
-                    .id();
-                st.entities.push(e);
-            }
+            let mesh = Mesh::new(PrimitiveTopology::TriangleList, RenderAssetUsages::default())
+                .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, data.positions)
+                .with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, data.normals)
+                .with_inserted_attribute(Mesh::ATTRIBUTE_UV_0, data.uvs)
+                .with_inserted_attribute(Mesh::ATTRIBUTE_COLOR, data.colors)
+                .with_inserted_indices(Indices::U32(data.indices));
+            let e = commands
+                .spawn((
+                    Mesh3d(mesh_assets.add(mesh)),
+                    MeshMaterial3d(mesh_mats.handle.clone()),
+                    Transform::from_translation(origin),
+                    ChunkMesh(*key),
+                    Name::new("SDF Chunk Mesh"),
+                ))
+                .id();
+            st.entities.push(e);
         }
 
         // Reap every mesh OUTSIDE the frozen round set (query-based, so it also catches orphans). The new set
@@ -1059,9 +967,8 @@ fn mesh_resident_chunks(
             let lod = key.lod;
             let edits = round_edits.clone();
             let indices = idx.clone();
-            let apps = appearances.clone();
             st.task = Some(pool.spawn(async move {
-                mesh_chunk(&edits, &indices, &apps, grid_origin, vs_l, k * cs, flags, lod, debug)
+                mesh_chunk(&edits, &indices, grid_origin, vs_l, k * cs, flags, lod, debug)
             }));
             budget -= 1;
         }
@@ -1267,15 +1174,12 @@ mod tests {
         )
     }
 
-    /// World-space triangle triples of a baked chunk (positions are chunk-local → add `origin`), across ALL
-    /// per-material sub-meshes.
+    /// World-space triangle triples of a baked chunk (positions are chunk-local → add `origin`).
     fn chunk_tris(data: &ChunkMeshData, origin: Vec3) -> Vec<(Vec3, Vec3, Vec3)> {
         let mut tris = Vec::new();
-        for sub in &data.subs {
-            for t in sub.indices.chunks_exact(3) {
-                let v = |i: u32| origin + Vec3::from(sub.positions[i as usize]);
-                tris.push((v(t[0]), v(t[1]), v(t[2])));
-            }
+        for t in data.indices.chunks_exact(3) {
+            let v = |i: u32| origin + Vec3::from(data.positions[i as usize]);
+            tris.push((v(t[0]), v(t[1]), v(t[2])));
         }
         tris
     }
@@ -1311,7 +1215,7 @@ mod tests {
         let edits = [sphere_edit(Vec3::ZERO, 1.0)];
         let (vs, sub) = (0.1f32, 28u32); // block span = 28·0.1 = 2.8 > sphere Ø 2.0 → clears all faces
         let origin = Vec3::splat(-1.4);
-        let data = mesh_chunk(&edits, &[0], &[], origin, vs, sub, 0, 0, false).expect("sphere meshes");
+        let data = mesh_chunk(&edits, &[0], origin, vs, sub, 0, 0, false).expect("sphere meshes");
         assert_eq!(open_edge_count(&chunk_tris(&data, origin)), 0, "closed sphere must be watertight");
     }
 
@@ -1331,8 +1235,8 @@ mod tests {
         let (vsf, vsc, sub) = (0.1f32, 0.2f32, 28u32);
         let of = Vec3::new(0.0, -1.4, -1.4); // fine x∈[0,2.8]; −X face at x=0 (regular, high-res)
         let oc = Vec3::new(-5.6, -2.8, -2.8); // coarse x∈[−5.6,0]; +X face at x=0 is the transition side
-        let fine = mesh_chunk(&edits, &idx, &[], of, vsf, sub, 0, 0, false).expect("fine meshes");
-        let coarse = mesh_chunk(&edits, &idx, &[], oc, vsc, sub, 1 << 1, 1, false).expect("coarse meshes");
+        let fine = mesh_chunk(&edits, &idx, of, vsf, sub, 0, 0, false).expect("fine meshes");
+        let coarse = mesh_chunk(&edits, &idx, oc, vsc, sub, 1 << 1, 1, false).expect("coarse meshes");
         let mut all = chunk_tris(&fine, of);
         all.extend(chunk_tris(&coarse, oc));
         assert_eq!(
