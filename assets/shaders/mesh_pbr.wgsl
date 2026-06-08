@@ -25,7 +25,8 @@ struct MeshMat {
 
 struct BlendParams {
     debug_lod: u32,
-    _pad: vec3<u32>,
+    debug_normals: u32,
+    _pad: vec2<u32>,
 };
 
 @group(#{MATERIAL_BIND_GROUP}) @binding(100) var<uniform> params: BlendParams;
@@ -123,6 +124,12 @@ fn fragment(in: VertexOutput, @builtin(front_facing) is_front: bool) -> Fragment
         out.color = vec4<f32>(in.color.rgb, 1.0);
         return out;
     }
+    // "View normals" debug: the mesh world-normal as RGB (unlit), for inspecting the baked geometry normals.
+    if (params.debug_normals != 0u) {
+        var out: FragmentOutput;
+        out.color = vec4<f32>(normalize(in.world_normal) * 0.5 + 0.5, 1.0);
+        return out;
+    }
 
     let wpos = in.world_position.xyz;
     let n = normalize(in.world_normal);
@@ -131,9 +138,10 @@ fn fragment(in: VertexOutput, @builtin(front_facing) is_front: bool) -> Fragment
     let mat_b = u32(round(in.uv.y));
 
     // Material-seam cross-fade (ported from the retired raymarch `resolve_surface`): COLOUR.a carries the
-    // per-vertex SIGNED gap `d(mat_b) - d(mat_a)` against this triangle's fixed pair (a geometry quantity —
-    // so `blend_softness` stays a LIVE control, no re-bake). The seam is where the pair is equidistant
-    // (gap == 0); gap > 0 is A's side, gap < 0 is B's.
+    // per-vertex SIGNED WORLD-DISTANCE to the seam against this triangle's fixed pair (baked: the raw gap
+    // `d(mat_b)-d(mat_a)` divided by |∇gap|, so it's a true world distance — a geometry quantity, so
+    // `blend_softness` stays a LIVE control with no re-bake). The seam is at distance 0; > 0 is A's side,
+    // < 0 is B's. `blend_softness` is then a real world half-width (in the same units as the scene).
     //
     // `blend_softness` is DIRECTIONAL: a material's softness is how far IT spreads into the OTHER's region. So
     // on B's side (gap < 0) the band is A's softness (A bleeding into B); on A's side (gap > 0) it's B's. If

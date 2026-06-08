@@ -61,9 +61,11 @@ pub struct MeshMatGpu {
 pub struct BlendParams {
     /// 1 = "Colour by LOD" debug (unlit, vertex-colour tint); 0 = lit PBR.
     debug_lod: u32,
-    /// Pad to 16 B (uniform min binding). A `vec3<u32>` (NOT `[u32; 3]`) — a uniform array element's stride
-    /// must be 16-aligned, which a `u32` array can't satisfy (encase panics); `UVec3` is one 16-aligned vec.
-    _pad: UVec3,
+    /// 1 = "View normals" debug (unlit, world-normal as RGB); 0 = lit PBR.
+    debug_normals: u32,
+    /// Pad to 16 B (uniform min binding). A `vec2<u32>` (NOT `[u32; 2]`) — a uniform array element's stride
+    /// must be 16-aligned, which a `u32` array can't satisfy (encase panics); `UVec2` is one aligned vec.
+    _pad: UVec2,
 }
 
 /// The blend extension: the three shared texture arrays + sampler + the per-material table + a debug flag.
@@ -364,9 +366,10 @@ fn build_texture_arrays(
 
 // ─────────────────────────── shared material + table ───────────────────────────
 
-fn registry_hash(reg: &MaterialRegistry, debug: bool, arrays_ready: bool) -> u64 {
+fn registry_hash(reg: &MaterialRegistry, debug_lod: bool, debug_normals: bool, arrays_ready: bool) -> u64 {
     let mut h = std::collections::hash_map::DefaultHasher::new();
-    h.write_u8(debug as u8);
+    h.write_u8(debug_lod as u8);
+    h.write_u8(debug_normals as u8);
     h.write_u8(arrays_ready as u8);
     h.write_usize(reg.defs.len());
     for d in &reg.defs {
@@ -397,7 +400,7 @@ pub(crate) fn rebuild_mesh_material(
     if arrays.diffuse == Handle::default() {
         return;
     }
-    let hash = registry_hash(&reg, cfg.debug_lod_colour, arrays.ready);
+    let hash = registry_hash(&reg, cfg.debug_lod_colour, cfg.debug_normals, arrays.ready);
     if cache.handle != Handle::default() && cache.table_hash == hash {
         return;
     }
@@ -444,7 +447,11 @@ pub(crate) fn rebuild_mesh_material(
             ..default()
         },
         extension: MeshBlendExt {
-            params: BlendParams { debug_lod: cfg.debug_lod_colour as u32, _pad: UVec3::ZERO },
+            params: BlendParams {
+                debug_lod: cfg.debug_lod_colour as u32,
+                debug_normals: cfg.debug_normals as u32,
+                _pad: UVec2::ZERO,
+            },
             diffuse: arrays.diffuse.clone(),
             normal: arrays.normal.clone(),
             mra: arrays.mra.clone(),
