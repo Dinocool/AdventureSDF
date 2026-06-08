@@ -20,7 +20,8 @@ use bevy::image::{
 use bevy::pbr::{ExtendedMaterial, MaterialExtension, MaterialPlugin};
 use bevy::prelude::*;
 use bevy::render::render_resource::{
-    AsBindGroup, Extent3d, ShaderType, TextureDimension, TextureFormat,
+    AsBindGroup, Extent3d, ShaderType, TextureDimension, TextureFormat, TextureViewDescriptor,
+    TextureViewDimension,
 };
 use bevy::render::storage::ShaderStorageBuffer;
 use bevy::shader::ShaderRef;
@@ -60,7 +61,9 @@ pub struct MeshMatGpu {
 pub struct BlendParams {
     /// 1 = "Colour by LOD" debug (unlit, vertex-colour tint); 0 = lit PBR.
     debug_lod: u32,
-    _pad: [u32; 3],
+    /// Pad to 16 B (uniform min binding). A `vec3<u32>` (NOT `[u32; 3]`) — a uniform array element's stride
+    /// must be 16-aligned, which a `u32` array can't satisfy (encase panics); `UVec3` is one 16-aligned vec.
+    _pad: UVec3,
 }
 
 /// The blend extension: the three shared texture arrays + sampler + the per-material table + a debug flag.
@@ -133,7 +136,14 @@ impl Plugin for MeshMaterialPlugin {
             .init_resource::<MeshTextureArrays>()
             .add_systems(
                 Update,
-                (build_texture_arrays, rebuild_mesh_material, ensure_camera_ambient),
+                (
+                    // ORDER MATTERS: `build_texture_arrays` seeds the `D2Array` fallback array images; if
+                    // `rebuild_mesh_material` ran first it would bind `Handle::default()` (Bevy's builtin D2
+                    // white image) into the `2d_array` slots → a wgpu D2-vs-D2Array validation panic.
+                    build_texture_arrays,
+                    rebuild_mesh_material.after(build_texture_arrays),
+                    ensure_camera_ambient,
+                ),
             );
     }
 }
@@ -148,6 +158,15 @@ fn ensure_camera_ambient(mut commands: Commands, cams: Query<Entity, (With<Camer
 
 // ─────────────────────────── texture-array assembly ───────────────────────────
 
+/// Force an `Image`'s GPU view to be `2d_array` — a 2D texture (even with >1 layer) otherwise defaults to a
+/// plain `D2` view, which mismatches the `texture_2d_array` binding (a wgpu validation panic).
+fn as_d2_array_view(img: &mut Image) {
+    img.texture_view_descriptor = Some(TextureViewDescriptor {
+        dimension: Some(TextureViewDimension::D2Array),
+        ..default()
+    });
+}
+
 /// A 1×1 layer-0 fallback array image (so the material is bindable before the real arrays finish loading).
 fn fallback_array(images: &mut Assets<Image>, fill: [u8; 4], srgb: bool) -> Handle<Image> {
     let fmt = if srgb { TextureFormat::Rgba8UnormSrgb } else { TextureFormat::Rgba8Unorm };
@@ -159,6 +178,7 @@ fn fallback_array(images: &mut Assets<Image>, fill: [u8; 4], srgb: bool) -> Hand
         RenderAssetUsages::RENDER_WORLD,
     );
     img.sampler = tiling_sampler();
+    as_d2_array_view(&mut img);
     images.add(img)
 }
 
@@ -259,16 +279,19 @@ fn array_image(images: &mut Assets<Image>, layers: &[Vec<u8>], size: u32, srgb: 
         }
     }
     let fmt = if srgb { TextureFormat::Rgba8UnormSrgb } else { TextureFormat::Rgba8Unorm };
-    let mut img = Image::new(
+    // `Image::new` debug-asserts data == ONE mip level's size; ours is the full mip chain, so build uninit
+    // (no validation) and assign the mip-chained data + level count directly.
+    let mut img = Image::new_uninit(
         Extent3d { width: size, height: size, depth_or_array_layers: layers.len() as u32 },
         TextureDimension::D2,
-        data,
         fmt,
         RenderAssetUsages::RENDER_WORLD,
     );
+    img.data = Some(data);
     img.texture_descriptor.mip_level_count = mips;
     img.data_order = bevy::render::render_resource::TextureDataOrder::LayerMajor;
     img.sampler = tiling_sampler();
+    as_d2_array_view(&mut img);
     images.add(img)
 }
 
@@ -367,6 +390,11 @@ pub(crate) fn rebuild_mesh_material(
     mut buffers: ResMut<Assets<ShaderStorageBuffer>>,
     mut cache: ResMut<MeshMaterials>,
 ) {
+    // Wait until `build_texture_arrays` has seeded the `D2Array` fallback arrays — never bind a default
+    // (D2) image into the `2d_array` slots (a wgpu validation panic). Belt-and-braces with the `.after`.
+    if arrays.diffuse == Handle::default() {
+        return;
+    }
     let hash = registry_hash(&reg, cfg.debug_lod_colour, arrays.ready);
     if cache.handle != Handle::default() && cache.table_hash == hash {
         return;
@@ -398,6 +426,12 @@ pub(crate) fn rebuild_mesh_material(
 
     // The table is a storage buffer asset (Bevy 0.18 `#[storage]` binds a `Handle<ShaderStorageBuffer>`);
     // `ShaderStorageBuffer::from` encase-encodes the `Vec<MeshMatGpu>` as a runtime-sized `array<MeshMat>`.
+    // encase can't encode a ZERO-length runtime array, and the registry is momentarily empty before the
+    // first material resolve — so guarantee at least one (fallback) row. The shader clamps ids into range.
+    let mut table = table;
+    if table.is_empty() {
+        table.push(MeshMatGpu::default());
+    }
     let table_buf = buffers.add(ShaderStorageBuffer::from(table));
 
     let material = MeshMaterial {
@@ -408,7 +442,7 @@ pub(crate) fn rebuild_mesh_material(
             ..default()
         },
         extension: MeshBlendExt {
-            params: BlendParams { debug_lod: cfg.debug_lod_colour as u32, _pad: [0; 3] },
+            params: BlendParams { debug_lod: cfg.debug_lod_colour as u32, _pad: UVec3::ZERO },
             diffuse: arrays.diffuse.clone(),
             normal: arrays.normal.clone(),
             mra: arrays.mra.clone(),
