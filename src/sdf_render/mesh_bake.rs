@@ -138,6 +138,8 @@ struct MeshBakeScalars {
     prev_k: u32,
     /// Last frame's material-appearance hash — detects a colour/PBR edit.
     prev_mat_hash: u64,
+    /// Held clipmap centre while "Freeze LOD" is on (captured on the rising edge; cleared on release).
+    frozen_cam: Option<Vec3>,
 }
 
 /// Marks a baked chunk mesh entity AND stamps it with its chunk key (a `BrickKey` whose coord is the
@@ -197,6 +199,9 @@ struct MeshBakeConfig {
     /// Cross-LOD SEAM strips (stitch fine↔coarse boundaries crack-free). When on, skirts are suppressed
     /// (the strip replaces them); when off, falls back to skirts. The structurally-correct crack fix.
     seams_enabled: bool,
+    /// Debug: FREEZE the clipmap centre at the camera's current position so the LOD structure stops
+    /// following the camera — fly through and inspect a fixed LOD boundary / its seams up close.
+    freeze_lod: bool,
 }
 
 impl Default for MeshBakeConfig {
@@ -211,6 +216,7 @@ impl Default for MeshBakeConfig {
             skirt_cells: 3.0,
             debug_lod_colour: false,
             seams_enabled: true,
+            freeze_lod: false,
         }
     }
 }
@@ -1117,7 +1123,18 @@ fn mesh_resident_chunks(
         ^ if mesh_cfg.debug_lod_colour { 0xDEB0_C010_0000_0000 } else { 0 };
 
     // CLIPMAP: camera position + LOD count (camera-driven; no camera ⇒ LOD-0 everywhere).
-    let cam = cameras.iter().next().map(|t| t.translation());
+    let live_cam = cameras.iter().next().map(|t| t.translation());
+    // Debug "Freeze LOD": hold the clipmap centre at the position captured when freeze turned on, so the LOD
+    // structure stays put while the camera flies through it. Capture on the rising edge; clear on release.
+    let cam = if mesh_cfg.freeze_lod {
+        if scal.frozen_cam.is_none() {
+            scal.frozen_cam = live_cam;
+        }
+        scal.frozen_cam
+    } else {
+        scal.frozen_cam = None;
+        live_cam
+    };
     let half0 = lod0_half_chunks(&config, &mesh_cfg, k);
     let lod_count = effective_lod_count(&config, &mesh_cfg, cam.is_some());
 
@@ -1592,6 +1609,15 @@ fn mesh_bake_panel(world: &mut World, ui: &mut bevy_egui::egui::Ui) {
     let mut dbg = world.resource::<MeshBakeConfig>().debug_lod_colour;
     if ui.checkbox(&mut dbg, "Colour by LOD (debug)").changed() {
         world.resource_mut::<MeshBakeConfig>().debug_lod_colour = dbg;
+    }
+    let mut freeze = world.resource::<MeshBakeConfig>().freeze_lod;
+    if ui
+        .checkbox(&mut freeze, "Freeze LOD (debug)")
+        .on_hover_text("Hold the clipmap centre at the camera's current spot so the LOD stops following — \
+                        fly through to inspect a fixed LOD boundary + its seams up close.")
+        .changed()
+    {
+        world.resource_mut::<MeshBakeConfig>().freeze_lod = freeze;
     }
 
     // Stats. `staged`/`meshing` are transiently non-zero while a round bakes; they drop to 0 once an edit
