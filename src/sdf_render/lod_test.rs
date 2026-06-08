@@ -28,8 +28,33 @@ fn mat(name: &str) -> Option<std::path::PathBuf> {
     Some(std::path::PathBuf::from(format!("materials/{name}.material.ron")))
 }
 
-/// Spawn the LOD showcase (one object per LOD ring + a directional light) with stable `LocalId`s.
+/// Spawn the LOD showcase (a baseline heightmap + one object per LOD ring + a directional light) with
+/// stable `LocalId`s.
 fn spawn_lod_test(world: &mut World) {
+    // Baseline terrain: a large procedural heightmap spanning every LOD ring — a single CONTINUOUS surface
+    // crossing all fine↔coarse boundaries, so it's the strongest cross-LOD seam stress-test (far better than
+    // the isolated spiral objects). `SdfPrimitive::Heightmap` evaluates through the CPU `fold_csg` path the
+    // mesh bake uses (see `tower_field.rs`). half_xz covers d≈1024 + r≈256; amp ≤ max_height/2 keeps the
+    // surface inside the primitive's [0,max_height] AABB.
+    world.spawn((
+        LocalId(0),
+        Name::new("Terrain"),
+        Transform::from_xyz(0.0, -20.0, 0.0),
+        SdfPrimitive::Heightmap {
+            half_xz: Vec2::new(1300.0, 1300.0),
+            max_height: 40.0,
+            freq: 0.01,
+            amp: 15.0,
+            seed: 1337,
+        },
+        SdfOp { kind: CsgKind::Union, smoothing: 0.0 },
+        SdfOrder(0),
+        SdfMaterialSource { asset: mat("sand"), ..default() },
+        SdfVolume,
+        Node3D,
+        SceneEntity,
+    ));
+
     // Per-level material (cycled), chosen for visible PBR variety: metal / gloss / gold / textured / emissive.
     let mats = [
         "red_metal",
@@ -59,12 +84,13 @@ fn spawn_lod_test(world: &mut World) {
             _ => SdfPrimitive::Capsule { half_height: r, radius: r * 0.5 },
         };
 
+        // ids 1..=LEVELS (terrain took id 0); ordered after the terrain so objects union on top of it.
         world.spawn((
-            LocalId(l as u64),
+            LocalId(l as u64 + 1),
             Transform::from_translation(pos),
             prim,
             SdfOp { kind: CsgKind::Union, smoothing: 0.0 },
-            SdfOrder(l),
+            SdfOrder(l + 1),
             SdfMaterialSource { asset: mat(mats[l as usize]), ..default() },
             SdfVolume,
             Node3D,
@@ -74,7 +100,7 @@ fn spawn_lod_test(world: &mut World) {
 
     // Directional light so the lit PBR meshes (and debug wireframes) read.
     world.spawn((
-        LocalId(LEVELS as u64),
+        LocalId(LEVELS as u64 + 1),
         Name::new("Directional Light"),
         DirectionalLight { illuminance: 10000.0, shadows_enabled: false, ..default() },
         Transform::from_rotation(Quat::from_euler(EulerRot::XYZ, -0.6, 0.5, 0.0)),
@@ -114,6 +140,7 @@ mod tests {
         r.register::<crate::soul_scene::EditorHidden>();
         r.register::<ChildOf>();
         r.register::<Children>();
+        r.register::<Vec2>();
         r.register::<Vec3>();
         r.register::<Quat>();
         r.register::<Color>();
