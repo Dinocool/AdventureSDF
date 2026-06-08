@@ -155,9 +155,10 @@ struct MeshBakeConfig {
 
 impl Default for MeshBakeConfig {
     fn default() -> Self {
-        // K=4 → 64 bricks/chunk. lod0_radius small so geometry just past it drops to coarser LODs;
-        // lod_count 9 spans LOD 0..=8 (the lod_test showcase scene); skirt_cells ~2. All tunable.
-        Self { chunk_bricks: 4, lod0_radius: 5.0, lod_count: 9, skirt_cells: 2.0, debug_lod_colour: false }
+        // K=4 → 64 bricks/chunk. lod0_radius 10 keeps the finest LOD out to a comfortable distance (push
+        // it down to shrink the LOD-0 cube); lod_count 9 spans LOD 0..=8 (the lod_test showcase scene);
+        // skirt_cells 3 (≈1.5 coarse voxels) plugs the cross-LOD seams. All tunable in the panel.
+        Self { chunk_bricks: 4, lod0_radius: 10.0, lod_count: 9, skirt_cells: 3.0, debug_lod_colour: false }
     }
 }
 
@@ -287,6 +288,20 @@ fn effective_lod_count(_config: &SdfGridConfig, mesh_cfg: &MeshBakeConfig, has_c
     } else {
         mesh_cfg.lod_count.clamp(1, LOD_DEBUG_PALETTE.len() as u32)
     }
+}
+
+/// Minimum size (in voxels of the chunk's own LOD) an edit's LARGEST dimension must span to be meshable
+/// there. Below this an object is only a cell or two across, so Surface Nets degenerates into a glitchy
+/// sliver ("goes inverse"). Such an edit is dropped from that LOD's residency AND its fold, so it cleanly
+/// VANISHES (it's sub-pixel at that distance anyway) instead of flickering.
+const SUBVOXEL_MIN_VOXELS: f32 = 2.5;
+
+/// Is an edit resolvable at `lod`? `max_extent` is the edit's largest world dimension. Keyed on the
+/// LARGEST (not smallest) extent so a thin SHEET — big in two dims, meshed fine as a ~1-voxel slab — is
+/// never culled; only objects small in ALL dimensions (true sub-voxel blobs) are. SSOT for the sub-voxel
+/// cull: used identically by residency enumeration and the per-chunk fold so the two never disagree.
+fn edit_resolvable_at(max_extent: f32, config: &SdfGridConfig, lod: u32) -> bool {
+    max_extent >= SUBVOXEL_MIN_VOXELS * config.voxel_size_at(lod)
 }
 
 /// Is a LOD-`key.lod` chunk resident in its 2:1 clipmap shell? Resident ⟺ inside `cube(L)` (centred on the
@@ -680,6 +695,10 @@ fn mesh_resident_chunks(
         edit_vec.push(g.edit.clone());
     }
     let edits_arc = Arc::new(edit_vec);
+    // Each edit's largest world dimension — the sub-voxel-cull SSOT (`edit_resolvable_at`); indexed like
+    // `edit_aabbs`. (Includes the smoothing margin, which only makes the cull MORE conservative.)
+    let edit_extent: Vec<f32> =
+        edit_aabbs.iter().map(|a| (Vec3::from(a.max) - Vec3::from(a.min)).max_element()).collect();
 
     // Material appearance snapshot (linear base + emissive) for the off-thread bake, indexed by material
     // id. Cheap (a handful of materials); cloned into each bake task.
@@ -752,7 +771,12 @@ fn mesh_resident_chunks(
                 let half = (half0 << lod) as f32 * cw0;
                 (centre - Vec3::splat(half), centre + Vec3::splat(half))
             });
-            for a in &edit_aabbs {
+            for (ei, a) in edit_aabbs.iter().enumerate() {
+                // Sub-voxel cull: an object too small to mesh at this LOD never becomes resident here, so
+                // it vanishes cleanly rather than degenerating (see `edit_resolvable_at`).
+                if !edit_resolvable_at(edit_extent[ei], &config, lod) {
+                    continue;
+                }
                 let clipped = match shell_cube {
                     Some((smin, smax)) => {
                         let mn = Vec3::from(a.min).max(smin);
@@ -784,6 +808,10 @@ fn mesh_resident_chunks(
         for &key in &resident {
             by_lod[(key.lod as usize).min(7)] += 1;
             cull_into(&edit_aabbs, &chunk_sampled(key), &mut idx);
+            // Drop edits that are sub-voxel at this chunk's LOD so a tiny object can't contaminate a chunk
+            // resident for a larger one (the residency cull already keeps lone sub-voxel objects out). Same
+            // predicate as the bake fold below → hash and geometry always agree.
+            idx.retain(|&i| edit_resolvable_at(edit_extent[i as usize], &config, key.lod));
             let base = if idx.is_empty() { 0 } else { edits::bake_content_hash(&edits_arc, &idx) };
             let flags = chunk_face_flags(key, &config, k, cam, half0);
             let lf = (key.lod as u64).wrapping_mul(0xA24B_AED4_963E_E407)
@@ -981,6 +1009,12 @@ fn mesh_resident_chunks(
             }
             let vs_l = config.voxel_size_at(key.lod);
             cull_into(&round.aabbs, &chunk_sampled(key), &mut idx);
+            // Sub-voxel cull (same predicate as the hash fold): exclude edits too small to mesh at this LOD
+            // from the field so they can't bake a degenerate sliver into a chunk resident for a larger edit.
+            idx.retain(|&i| {
+                let a = round.aabbs[i as usize];
+                edit_resolvable_at((Vec3::from(a.max) - Vec3::from(a.min)).max_element(), &config, key.lod)
+            });
             // NARROW-BAND CULL: skip chunks with no surface crossing (interior/exterior of a solid) for a
             // single SDF eval instead of a full edge³ bake — the big win for large objects. Commit them
             // empty (no task, no budget) so the round still settles.
@@ -1163,7 +1197,7 @@ mod tests {
         let (cfg, mc) = cfgs();
         let k = 4;
         let cam = Some(Vec3::ZERO); // centre at chunk (0,0,0) for every LOD
-        let half0 = lod0_half_chunks(&cfg, &mc, k); // 2 with defaults (radius 6, chunk_world0 2.8)
+        let half0 = lod0_half_chunks(&cfg, &mc, k); // 4 with defaults (radius 10, chunk_world0 2.8)
         let r = |key: BrickKey| mesh_chunk_in_shell(key, &cfg, k, cam, half0);
 
         // LOD 0 fills cube(0) = [-half0, half0] chunks; chunk index `half0` is just outside.
@@ -1190,6 +1224,21 @@ mod tests {
         let f = chunk_face_flags(chunk(&cfg, k, 0, half0 - 1), &cfg, k, cam, half0);
         assert_eq!(f & (1 << 1), 1 << 1, "+X face should border a coarser LOD");
         assert_eq!(f & (1 << 0), 0, "−X face should not (neighbour still inside cube(0))");
+    }
+
+    #[test]
+    fn subvoxel_cull_drops_small_blobs_keeps_sheets() {
+        let cfg = SdfGridConfig::default();
+        let vs0 = cfg.voxel_size_at(0); // 0.1 with defaults
+        // A small blob ~3 voxels across at LOD 0: resolvable fine, but sub-voxel by a few coarser LODs.
+        let blob = 3.0 * vs0;
+        assert!(edit_resolvable_at(blob, &cfg, 0), "3-voxel blob meshes at LOD 0");
+        assert!(!edit_resolvable_at(blob, &cfg, 2), "same blob is sub-voxel at LOD 2 → culled");
+        // A thin SHEET: tiny thickness but a huge footprint → max-extent keyed, so never culled.
+        let sheet = 1000.0 * vs0;
+        for lod in 0..9 {
+            assert!(edit_resolvable_at(sheet, &cfg, lod), "thin sheet kept at every LOD (lod={lod})");
+        }
     }
 
     #[test]
