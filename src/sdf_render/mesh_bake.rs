@@ -53,6 +53,11 @@ const MAX_NEW_TASKS_PER_FRAME: usize = 256;
 /// Hash-mix multiplier for folding the "Rebake all" epoch into a chunk's content hash.
 const EPOCH_MIX: u64 = 0x9E37_79B9_7F4A_7C15;
 
+/// Max world-units a material's blend can reach beyond its surface (= the `blend_softness` slider max). The
+/// chunk edit-cull AABBs are padded by this so a chunk a neighbour's blend touches lists that edit in its
+/// content hash → moving the edit re-bakes the chunk (no stale blended remnant). Keep ≥ the slider max.
+const BLEND_REACH: f32 = 1.0;
+
 /// Raw mesh data produced off-thread by a meshing task (chunk-LOCAL positions; one mesh per chunk). Every
 /// chunk uses the SINGLE shared per-vertex-blend `MeshMaterial`: `uvs` carry each vertex's top-2 material ids
 /// `(matA, matB)` and `colors.a` the blend weight (`colors.rgb` = the per-LOD debug tint when colour-by-LOD).
@@ -475,12 +480,11 @@ fn mesh_chunk(
 /// ("Colour by LOD") the per-LOD tint is written into `colors.rgb` and the shader renders it unlit.
 struct ChunkMeshBuilder<'a> {
     edits: &'a [edits::ResolvedEdit],
+    /// The chunk's candidate edits. Culled with AABBs PADDED by `BLEND_REACH` (see `mesh_resident_chunks`),
+    /// so it lists not just the edits whose surface enters the chunk but every edit whose MATERIAL blend
+    /// could reach it. That makes the material pair/gap consistent across chunk borders AND folds those
+    /// edits into the content hash (so moving a blend-contributing edit re-bakes the chunk — no remnant).
     indices: &'a [u32],
-    /// Full edit index range `0..edits.len()`. Materials (the per-vertex `(nearest, runner-up)` + the signed
-    /// gaps) are evaluated over ALL edits, NOT the chunk-culled `indices` — otherwise a competing material
-    /// present in one chunk's cull but absent in its neighbour's makes the gap JUMP at the shared boundary
-    /// (a hard line in the blend). Geometry still uses `indices` (culling far edits can't move the surface).
-    all: Vec<u32>,
     origin: Vec3,
     eps: f32,
     lod: u32,
@@ -505,7 +509,6 @@ impl<'a> ChunkMeshBuilder<'a> {
         Self {
             edits,
             indices,
-            all: (0..edits.len() as u32).collect(),
             origin,
             eps: vs * 0.01,
             lod,
@@ -563,8 +566,8 @@ impl<'a> ChunkMeshBuilder<'a> {
                     } else {
                         let world = Vec3::from(self.positions[vi]) + self.origin;
                         let gap = |w: Vec3| {
-                            edits::material_dist(self.edits, &self.all, w, mat_b)
-                                - edits::material_dist(self.edits, &self.all, w, mat_a)
+                            edits::material_dist(self.edits, self.indices, w, mat_b)
+                                - edits::material_dist(self.edits, self.indices, w, mat_a)
                         };
                         let g = gap(world);
                         let e = self.eps;
@@ -611,9 +614,9 @@ impl MeshBuilder<f32, f32> for ChunkMeshBuilder<'_> {
         // Exact outward normal = ∇(CSG distance) (points toward increasing distance = outside the solid).
         let n = field_gradient(self.edits, self.indices, world, self.eps).normalize_or_zero();
         self.normals.push([n.x, n.y, n.z]);
-        // (nearest, runner-up) materials at this vertex, over ALL edits (see `all`) so the choice is
-        // chunk-independent; `finish` folds the per-triangle pair from the three corners' values.
-        let (near, runner, _) = edits::fold_csg_top2(self.edits, &self.all, world);
+        // (nearest, runner-up) materials at this vertex over the blend-padded chunk set; `finish` folds the
+        // per-triangle pair from the three corners' values.
+        let (near, runner, _) = edits::fold_csg_top2(self.edits, self.indices, world);
         self.vmat.push((near, runner));
         VertexIndex(self.positions.len() - 1)
     }
@@ -734,15 +737,21 @@ fn mesh_resident_chunks(
     let n_edits = gathered.len();
     let mut edit_aabbs: Vec<Aabb3d> = Vec::with_capacity(n_edits);
     let mut edit_vec: Vec<edits::ResolvedEdit> = Vec::with_capacity(n_edits);
+    // Sub-voxel-cull SSOT (`edit_resolvable_at`): each edit's GEOMETRY extent (unpadded — resolvability is a
+    // property of the surface size, not the blend reach). Indexed like `edit_aabbs`.
+    let mut edit_extent: Vec<f32> = Vec::with_capacity(n_edits);
     for g in &gathered {
-        edit_aabbs.push(g.aabb);
+        edit_extent.push((Vec3::from(g.aabb.max) - Vec3::from(g.aabb.min)).max_element());
+        // PAD the cull/hash AABB by the max material-blend reach: a material's cross-fade bleeds up to
+        // `blend_softness` (≤ `BLEND_REACH`) world units beyond its surface onto a NEIGHBOUR, so a chunk
+        // within that range must list this edit in its `idx` — otherwise its content hash omits the edit and
+        // MOVING the edit leaves a stale blended remnant on the neighbour (it never re-bakes). A fixed pad
+        // (not per-material) keeps the baked seam-distance blend-softness-INDEPENDENT, so softness stays live.
+        let pad = bevy::math::Vec3A::splat(BLEND_REACH);
+        edit_aabbs.push(Aabb3d { min: g.aabb.min - pad, max: g.aabb.max + pad });
         edit_vec.push(g.edit.clone());
     }
     let edits_arc = Arc::new(edit_vec);
-    // Each edit's largest world dimension — the sub-voxel-cull SSOT (`edit_resolvable_at`); indexed like
-    // `edit_aabbs`. (Includes the smoothing margin, which only makes the cull MORE conservative.)
-    let edit_extent: Vec<f32> =
-        edit_aabbs.iter().map(|a| (Vec3::from(a.max) - Vec3::from(a.min)).max_element()).collect();
 
     // The baked mesh is appearance-INDEPENDENT: vertices carry only geometry + top-2 material *ids* + a blend
     // weight, never colours/PBR scalars. A material colour/PBR edit therefore needs no re-bake — the shared
