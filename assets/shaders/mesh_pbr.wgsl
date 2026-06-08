@@ -17,11 +17,13 @@ struct MeshExtParams {
     _pad: u32,
 };
 
-@group(2) @binding(100) var<uniform> ext: MeshExtParams;
-@group(2) @binding(101) var diffuse_tex: texture_2d<f32>;
-@group(2) @binding(102) var diffuse_s: sampler;
-@group(2) @binding(103) var normal_tex: texture_2d<f32>;
-@group(2) @binding(104) var normal_s: sampler;
+// `#{MATERIAL_BIND_GROUP}` is the material bind-group index (NOT always 2 — varies by pipeline); hardcoding
+// `@group(2)` makes the binding land in the wrong group → "binding 100 missing from pipeline layout".
+@group(#{MATERIAL_BIND_GROUP}) @binding(100) var<uniform> ext: MeshExtParams;
+@group(#{MATERIAL_BIND_GROUP}) @binding(101) var diffuse_tex: texture_2d<f32>;
+@group(#{MATERIAL_BIND_GROUP}) @binding(102) var diffuse_s: sampler;
+@group(#{MATERIAL_BIND_GROUP}) @binding(103) var normal_tex: texture_2d<f32>;
+@group(#{MATERIAL_BIND_GROUP}) @binding(104) var normal_s: sampler;
 
 // Triplanar blend weights: emphasise the dominant axis (so a +X-facing surface samples mostly the YZ plane).
 fn triplanar_weights(n: vec3<f32>) -> vec3<f32> {
