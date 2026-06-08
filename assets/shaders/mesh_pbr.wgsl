@@ -137,20 +137,20 @@ fn fragment(in: VertexOutput, @builtin(front_facing) is_front: bool) -> Fragment
     let mat_a = u32(round(in.uv.x));
     let mat_b = u32(round(in.uv.y));
 
-    // Material-seam cross-fade (ported from the retired raymarch `resolve_surface`): COLOUR.a carries the
-    // per-vertex SIGNED WORLD-DISTANCE to the seam against this triangle's fixed pair (baked: the raw gap
-    // `d(mat_b)-d(mat_a)` divided by |∇gap|, so it's a true world distance — a geometry quantity, so
-    // `blend_softness` stays a LIVE control with no re-bake). The seam is at distance 0; > 0 is A's side,
-    // < 0 is B's. `blend_softness` is then a real world half-width (in the same units as the scene).
+    // Material-seam cross-fade. COLOUR.a is the per-vertex SIGNED WORLD-DISTANCE to the seam against this
+    // triangle's fixed pair (baked: raw gap `d(mat_b)-d(mat_a)` / |∇gap| → a true world distance; a geometry
+    // quantity, so `blend_softness` stays a LIVE control, no re-bake). `seam` > 0 is mat_a's side, < 0 is mat_b's.
     //
-    // `blend_softness` is DIRECTIONAL: a material's softness is how far IT spreads into the OTHER's region. So
-    // on B's side (gap < 0) the band is A's softness (A bleeding into B); on A's side (gap > 0) it's B's. If
-    // one side's softness is 0 that material doesn't bleed in (hard cut, modulo a 1px `fwidth` AA floor); if
-    // both are set their magnitudes set the split. `fwidth` is safe — `fragment` is uniform control flow.
-    let gap = in.color.a;
-    let soft = select(material_at(mat_b).blend_softness, material_at(mat_a).blend_softness, gap < 0.0);
-    let band = max(max(fwidth(gap), soft), 1e-5);
-    let weight = clamp(0.5 + 0.5 * gap / band, 0.0, 1.0); // 1 = pure A, 0 = pure B, 0.5 = seam
+    // `blend_softness` is DIRECTIONAL: each material's value is how far IT spreads into the OTHER's region. The
+    // weight ramps LINEARLY from pure mat_b at `seam = -da` to pure mat_a at `seam = +db`. So a material with
+    // softness 0 simply doesn't bleed past the seam — a clean edge on ITS side, NOT a 50% step at the seam
+    // (the old `0.5 + gap/band` pinned the seam to 0.5 → a hard line + faint blend). Two non-zero softnesses
+    // split the seam by their ratio; both 0 ⇒ a crisp 1px (fwidth) AA edge. `fwidth` is safe (uniform flow).
+    let seam = in.color.a;
+    let da = material_at(mat_a).blend_softness; // how far mat_a spreads into mat_b's region (seam < 0)
+    let db = material_at(mat_b).blend_softness; // how far mat_b spreads into mat_a's region (seam > 0)
+    let denom = max(da + db, max(fwidth(seam), 1e-4));
+    let weight = clamp((seam + da) / denom, 0.0, 1.0); // 1 = pure mat_a, 0 = pure mat_b
 
     var s = gather(mat_a, wpos, n, w);
     if (weight < 0.999 && mat_b != mat_a) {
