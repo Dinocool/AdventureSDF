@@ -1,5 +1,5 @@
 //! SDF→mesh bake (see `docs/MESH_BAKE_PLAN.md`): a residency-driven, **async**, content-hash-driven
-//! Surface Nets bake. The bake/render UNIT is a configurable **chunk** of `K×K×K` finest bricks
+//! Transvoxel bake. The bake/render UNIT is a configurable **chunk** of `K×K×K` finest bricks
 //! (`MeshBakeConfig::chunk_bricks`, runtime-tunable). `K = 1` is one mesh per finest brick; larger `K`
 //! aggregates more bricks into one contiguous mesh — fewer draw calls/entities, coherent atomic swaps,
 //! and contiguous geometry for later decimation/LOD.
@@ -38,8 +38,10 @@ use bevy::math::bounding::Aabb3d;
 use bevy::mesh::{Indices, PrimitiveTopology};
 use bevy::prelude::*;
 use bevy::tasks::{block_on, poll_once, AsyncComputeTaskPool, Task};
-use fast_surface_nets::{surface_nets, SurfaceNetsBuffer};
-use ndshape::RuntimeShape;
+use transvoxel::prelude::*;
+use transvoxel::structs::grid_point::GridPoint;
+use transvoxel::structs::vertex_index::VertexIndex;
+use transvoxel::traits::mesh_builder::MeshBuilder;
 
 use crate::sdf_render::atlas::BrickKey;
 use crate::sdf_render::{
@@ -53,40 +55,6 @@ const MAX_NEW_TASKS_PER_FRAME: usize = 256;
 /// Hash-mix multiplier for folding the "Rebake all" epoch into a chunk's content hash.
 const EPOCH_MIX: u64 = 0x9E37_79B9_7F4A_7C15;
 
-/// The 6 chunk faces: `(bit, axis, is_high_face, the two in-face tangent axes)`. Bit order matches
-/// `chunk_face_flags` (−X,+X,−Y,+Y,−Z,+Z). Apron-aware boundary cell: −face = cell `1`, +face = `edge-2`
-/// (cell 0 / edge-1 are the apron). Shared by `append_skirts`, boundary-vertex extraction, and the seam pass.
-const FACES: [(u8, usize, bool, [usize; 2]); 6] = [
-    (0, 0, false, [1, 2]),
-    (1, 0, true, [1, 2]),
-    (2, 1, false, [0, 2]),
-    (3, 1, true, [0, 2]),
-    (4, 2, false, [0, 1]),
-    (5, 2, true, [0, 1]),
-];
-
-/// A meshed surface vertex on a chunk FACE, cached for the cross-LOD GEOMORPH. Holds the reprojected WORLD
-/// position and analytic normal (a conforming fine vertex adopts the coarse vertex's pos AND normal, for
-/// continuous shading); `cell`, the vertex's WORLD-ALIGNED in-face cell coord in THIS chunk's LOD voxel units
-/// (a fine cell maps to its coarse cell by `cell.div_euclid(2)` at 2:1, to window the snap search); and `idx`,
-/// the vertex's index in the chunk's mesh arrays (so the fine side can be mutated in place).
-#[derive(Clone, Copy)]
-struct BoundaryVert {
-    pos: Vec3,
-    normal: Vec3,
-    cell: IVec2,
-    /// Index of this vertex in the chunk's `positions`/`normals` arrays — lets the geomorph MUTATE the fine
-    /// mesh in place (snap its boundary onto the coarse neighbour). The coarse side only reads `pos`/`normal`.
-    idx: u32,
-}
-
-/// One ordered boundary component on a chunk face: its vertices in curve order (following the mesh's actual
-/// OPEN boundary edges).
-#[derive(Clone)]
-struct BoundaryLoop {
-    verts: Vec<BoundaryVert>,
-}
-
 /// Raw mesh data produced off-thread by a meshing task (turned into a `Mesh` asset on the main thread).
 struct ChunkMeshData {
     positions: Vec<[f32; 3]>,
@@ -95,8 +63,6 @@ struct ChunkMeshData {
     indices: Vec<u32>,
     /// Dominant material id (at the surface centroid) — selects the chunk's `StandardMaterial` PBR params.
     material: u16,
-    /// Ordered boundary loops on each of the 6 faces (indexed by face bit), for the cross-LOD seam pass.
-    boundary: [Vec<BoundaryLoop>; 6],
 }
 
 /// A completed bake for a chunk's round target, held until the coherent COMMIT (`None` = empty chunk).
@@ -168,11 +134,6 @@ struct ChunkState {
     task: Option<Task<Option<ChunkMeshData>>>,
     /// Completed bake of `target_hash`, awaiting the round COMMIT.
     staged: Option<StagedBake>,
-    /// Per-face boundary loops of the DISPLAYED mesh, copied at COMMIT — read by the geomorph so a finer
-    /// neighbour can snap (conform) its boundary onto THIS chunk's when it borders this coarser LOD.
-    boundary: [Vec<BoundaryLoop>; 6],
-    /// Dominant material id of the DISPLAYED mesh — selects this chunk's lit `StandardMaterial`.
-    material: u16,
 }
 
 /// Per-resident-chunk bake state.
@@ -190,30 +151,23 @@ struct MeshBakeConfig {
     lod0_radius: f32,
     /// How many LOD levels the mesh bake uses (clamped to `SdfGridConfig::lod_count`). 1 = single-LOD.
     lod_count: u32,
-    /// Skirt length in LOD-L voxels (the curtain that hides cross-LOD cracks). 0 = no skirts.
-    skirt_cells: f32,
-    /// Debug: tint each chunk mesh by its LOD level (+ skirts a contrasting colour), rendered unlit.
+    /// Debug: tint each chunk mesh by its LOD level, rendered unlit ("Colour by LOD").
     debug_lod_colour: bool,
-    /// Cross-LOD SEAM strips (stitch fine↔coarse boundaries crack-free). When on, skirts are suppressed
-    /// (the strip replaces them); when off, falls back to skirts. The structurally-correct crack fix.
-    seams_enabled: bool,
     /// Debug: FREEZE the clipmap centre at the camera's current position so the LOD structure stops
-    /// following the camera — fly through and inspect a fixed LOD boundary / its seams up close.
+    /// following the camera — fly through and inspect a fixed LOD boundary up close.
     freeze_lod: bool,
 }
 
 impl Default for MeshBakeConfig {
     fn default() -> Self {
         // K=4 → 64 bricks/chunk. lod0_radius 10 keeps the finest LOD out to a comfortable distance (push
-        // it down to shrink the LOD-0 cube); lod_count 9 spans LOD 0..=8 (the lod_test showcase scene);
-        // seams on (transition strips) — the real crack fix; skirts are the fallback when off.
+        // it down to shrink the LOD-0 cube); lod_count 9 spans LOD 0..=8 (the lod_test showcase scene).
+        // Cross-LOD seams are crack-free BY CONSTRUCTION (Transvoxel transition cells) — no toggle needed.
         Self {
             chunk_bricks: 4,
             lod0_radius: 10.0,
             lod_count: 9,
-            skirt_cells: 3.0,
             debug_lod_colour: false,
-            seams_enabled: true,
             freeze_lod: false,
         }
     }
@@ -231,8 +185,6 @@ const LOD_DEBUG_PALETTE: [[f32; 3]; 9] = [
     [0.90, 0.35, 0.85], // LOD7 magenta
     [0.75, 0.75, 0.80], // LOD8 grey
 ];
-/// Skirt debug tint (bright white) so the crack-filling curtains stand out in the "Colour by LOD" view.
-const SKIRT_DEBUG_COLOUR: [f32; 4] = [1.0, 1.0, 1.0, 1.0];
 
 /// Set by the editor panel's "Rebake all" button to force a full re-mesh.
 #[derive(Resource, Default)]
@@ -348,7 +300,7 @@ fn effective_lod_count(_config: &SdfGridConfig, mesh_cfg: &MeshBakeConfig, has_c
 }
 
 /// Minimum size (in voxels of the chunk's own LOD) an edit's LARGEST dimension must span to be meshable
-/// there. Below this an object is only a cell or two across, so Surface Nets degenerates into a glitchy
+/// there. Below this an object is only a cell or two across, so Transvoxel degenerates into a glitchy
 /// sliver ("goes inverse"). Such an edit is dropped from that LOD's residency AND its fold, so it cleanly
 /// VANISHES (it's sub-pixel at that distance anyway) instead of flickering.
 const SUBVOXEL_MIN_VOXELS: f32 = 2.5;
@@ -387,59 +339,32 @@ fn mesh_chunk_in_shell(
     !range_in_cube(lo, hi, lod_centre(config, k, cam, key.lod - 1), hole)
 }
 
-/// Per-face "borders a COARSER LOD" flags (bit 0..5 = −X,+X,−Y,+Y,−Z,+Z) for a resident chunk — the faces
-/// that need a skirt. A face borders coarser ⟺ the adjacent LOD-L chunk across it is NOT inside `cube(L)`
-/// (so that region is served by LOD L+1). Folded into the content hash so a chunk re-bakes (with the right
-/// skirts) exactly when the camera moves a shell line.
-fn chunk_face_flags(
-    key: BrickKey,
-    config: &SdfGridConfig,
-    k: u32,
-    cam: Option<Vec3>,
-    half0: i32,
-) -> u8 {
-    let Some(cam) = cam else {
-        return 0;
-    };
-    let centre = lod_centre(config, k, cam, key.lod);
-    let step = k as i32 * config.cell_stride(); // LOD-L voxel stride to the adjacent chunk
-    let outer = half0 * (1i32 << key.lod);
-    let dirs = [IVec3::NEG_X, IVec3::X, IVec3::NEG_Y, IVec3::Y, IVec3::NEG_Z, IVec3::Z];
-    let mut flags = 0u8;
-    for (bit, d) in dirs.iter().enumerate() {
-        let nbr = BrickKey::new(key.lod, key.coord + *d * step);
-        let (lo, hi) = chunk_lod0_range(nbr, config, k);
-        if !range_in_cube(lo, hi, centre, outer) {
-            flags |= 1 << bit;
-        }
-    }
-    flags
-}
-
-/// Bitmask of a chunk's LOW faces (bits 0,2,4 = −X,−Y,−Z) that border a FINER LOD (the neighbour region is
-/// inside the finer `cube(lod-1)`). The crate meshes the low apron (cell 0), so on these faces the mesh
-/// over-reaches ~1 voxel INTO the finer region — an intrusion into the seam band. The bake INSETS them (skips
-/// cell 0 → boundary at the nominal plane) to give a hard boundary + clean gap for the seam. HIGH faces end
-/// at the real boundary (no over-reach), so they are never trimmed.
-fn chunk_finer_low_faces(key: BrickKey, config: &SdfGridConfig, k: u32, cam: Option<Vec3>, half0: i32) -> u8 {
+/// Per-face "borders a FINER LOD" flags (bit 0..5 = −X,+X,−Y,+Y,−Z,+Z) for a resident chunk — the
+/// TRANSVOXEL TRANSITION faces. Transvoxel puts the transition cell on the LOW-resolution (this, coarser)
+/// block, on the face toward the HIGHER-resolution neighbour, so it matches the finer mesh by construction.
+/// A face borders finer ⟺ the adjacent LOD-L chunk across it lies inside the finer `cube(L-1)` (that region
+/// is served by LOD L-1). LOD 0 (the finest) has none. Folded into the content hash so a chunk re-bakes with
+/// the right transition faces exactly when the camera moves a shell line.
+fn chunk_finer_faces(key: BrickKey, config: &SdfGridConfig, k: u32, cam: Option<Vec3>, half0: i32) -> u8 {
     let Some(cam) = cam else {
         return 0;
     };
     if key.lod == 0 {
         return 0; // nothing finer than LOD 0
     }
-    let centre = lod_centre(config, k, cam, key.lod - 1); // finer cube centre
-    let hole = half0 * (1i32 << (key.lod - 1)); // finer cube half-extent (LOD-0 chunks)
-    let step = k as i32 * config.cell_stride();
-    let mut mask = 0u8;
-    for &(bit, d) in &[(0u8, IVec3::NEG_X), (2u8, IVec3::NEG_Y), (4u8, IVec3::NEG_Z)] {
-        let nbr = BrickKey::new(key.lod, key.coord + d * step);
+    let centre = lod_centre(config, k, cam, key.lod - 1); // the finer cube's centre
+    let hole = half0 * (1i32 << (key.lod - 1)); // the finer cube's half-extent (LOD-0 chunks)
+    let step = k as i32 * config.cell_stride(); // LOD-L voxel stride to the adjacent chunk
+    let dirs = [IVec3::NEG_X, IVec3::X, IVec3::NEG_Y, IVec3::Y, IVec3::NEG_Z, IVec3::Z];
+    let mut flags = 0u8;
+    for (bit, d) in dirs.iter().enumerate() {
+        let nbr = BrickKey::new(key.lod, key.coord + *d * step);
         let (lo, hi) = chunk_lod0_range(nbr, config, k);
         if range_in_cube(lo, hi, centre, hole) {
-            mask |= 1 << bit;
+            flags |= 1 << bit;
         }
     }
-    mask
+    flags
 }
 
 /// The edits (into `aabbs`) overlapping `sampled` — the set folded for this chunk. Same test drives
@@ -479,37 +404,6 @@ fn chunks_in_aabb(aabb: &Aabb3d, config: &SdfGridConfig, k: u32, lod: u32, out: 
     }
 }
 
-/// Sample the (pseudo-)SDF for one chunk: an `edge³` grid (linear `x + y·edge + z·edge²`) at world points
-/// `grid_origin + (x,y,z)·vs`. Point-sampling the EXACT analytic CSG field is the correct coarse
-/// representation for an analytic SDF (there's no fine grid to mip-reduce, so no averaging distortion). The
-/// 1-voxel apron makes neighbouring chunks share identical boundary samples, so Surface Nets welds them
-/// crack-free by construction. Coarse-LOD shrinkage is fixed by RE-PROJECTING the meshed vertices onto the
-/// true surface (`reproject_to_surface`), NOT by sharpening this field — an unsharp/Laplacian filter rings
-/// and punches holes (researched 2026-06-08; see [[render-pivot-mesh-baking]]).
-fn sample_field(
-    edits: &[edits::ResolvedEdit],
-    indices: &[u32],
-    grid_origin: Vec3,
-    vs: f32,
-    edge: u32,
-) -> Vec<f32> {
-    let band = 4.0 * vs;
-    let mut sdf = vec![0.0f32; (edge * edge * edge) as usize];
-    let mut i = 0usize;
-    for z in 0..edge {
-        for y in 0..edge {
-            for x in 0..edge {
-                let p = grid_origin + Vec3::new(x as f32, y as f32, z as f32) * vs;
-                // Sub-voxel iso-shift so no sample lands exactly on dist == 0 (Surface Nets treats 0 as
-                // "outside", dropping a cell — a pinhole at grid-aligned features).
-                sdf[i] = (edits::fold_csg_dist_indexed(edits, indices, p) - 1e-3).clamp(-band, band);
-                i += 1;
-            }
-        }
-    }
-    sdf
-}
-
 /// Central-difference gradient of the CSG field at `p` (the outward surface direction). `eps` should be a
 /// small fraction of a voxel.
 fn field_gradient(edits: &[edits::ResolvedEdit], indices: &[u32], p: Vec3, eps: f32) -> Vec3 {
@@ -521,52 +415,12 @@ fn field_gradient(edits: &[edits::ResolvedEdit], indices: &[u32], p: Vec3, eps: 
     )
 }
 
-/// Push a meshed vertex onto the true analytic iso-surface (`fold_csg_dist == 0`) with a few DAMPED Newton
-/// steps `p −= t·f(p)·∇̂f(p)`, returning the projected world point and its unit (analytic) normal.
-///
-/// WHY: Naive Surface Nets places each vertex at the centroid of its edge crossings, which sits INSIDE a
-/// convex surface by ~h²·curvature — the coarse-LOD shrinkage. Re-projecting onto the exact field removes
-/// that bias at its SOURCE (the geometry), with no field sharpening (which rings → holes), and the gradient
-/// is the exact surface normal — sharper than the discrete one. `smin` blends are pseudo-SDF (‖∇f‖ < 1), so
-/// the step is damped to avoid overshoot.
-///
-/// CRACK-FREE WELDING: this is a PURE function of world position + the global field, so two chunks that
-/// share a boundary vertex (same Surface-Nets position via the apron) re-project it identically → same-LOD
-/// welds are preserved. The cumulative displacement is clamped to ~one voxel so a vertex can never jump to a
-/// neighbouring feature (fold-over) near the medial axis. (`reproject_lands_on_surface` locks the contract.)
-fn reproject_to_surface(
-    edits: &[edits::ResolvedEdit],
-    indices: &[u32],
-    start: Vec3,
-    vs: f32,
-) -> (Vec3, Vec3) {
-    let eps = vs * 0.01;
-    let mut p = start;
-    let mut grad = Vec3::Y; // overwritten on the first iteration (used as the returned normal)
-    for _ in 0..4 {
-        let d = edits::fold_csg_dist_indexed(edits, indices, p);
-        grad = field_gradient(edits, indices, p, eps);
-        let dir = grad.normalize_or_zero();
-        if dir == Vec3::ZERO {
-            break;
-        }
-        p += dir * (-0.8 * d);
-        // Never move a vertex more than ~one voxel from where Surface Nets put it.
-        let disp = p - start;
-        if disp.length() > vs {
-            p = start + disp.normalize() * vs;
-        }
-        if d.abs() < eps {
-            break;
-        }
-    }
-    (p, grad.normalize_or_zero())
-}
-
-/// Sample + Surface-Nets one chunk (runs off-thread on the task pool). Returns `None` for an empty chunk
-/// (no surface crossing). `indices` are the edits (into the CSG-sorted list) that overlap this chunk —
-/// exactly the set the chunk's content hash was taken over, so geometry and hash always agree. `edge` is
-/// the padded grid edge in samples (`K·cell_stride + 2`).
+/// Mesh one chunk with the TRANSVOXEL algorithm (runs off-thread on the task pool). Returns `None` for an
+/// empty chunk (no surface). `indices` are the edits overlapping this chunk (the set its content hash was
+/// taken over). `subdivisions` is the chunk's cell count per axis (`K·cell_stride`); `grid_origin` is the
+/// chunk's world MIN corner — NO apron (Transvoxel samples the field on the block boundary, not beyond).
+/// `flags` (faces bordering a FINER LOD) become Transvoxel TRANSITION sides — placed on the coarse side of
+/// each 2:1 boundary — so neighbouring LODs weld crack-free BY CONSTRUCTION (no seam pass needed).
 #[allow(clippy::too_many_arguments)]
 fn mesh_chunk(
     edits: &[edits::ResolvedEdit],
@@ -574,364 +428,143 @@ fn mesh_chunk(
     appearances: &[MatAppearance],
     grid_origin: Vec3,
     vs: f32,
-    edge: u32,
-    // Bits 0..5 (−X,+X,−Y,+Y,−Z,+Z): faces that border a COARSER LOD → emit a skirt.
-    face_flags: u8,
-    // Skirt curtain length (world units); 0 = none.
-    skirt_len: f32,
-    // This chunk's LOD level (for the debug colour-by-LOD view).
+    subdivisions: u32,
+    flags: u8,
     lod: u32,
-    // Bits 0,2,4 (−X,−Y,−Z): LOW faces bordering a FINER LOD → INSET (skip the over-reaching apron cell) so
-    // the boundary sits at the nominal plane, leaving a clean gap for the seam instead of intruding into it.
-    trim_low: u8,
-    // Debug: vertex COLOUR = per-LOD tint (+ skirts a contrasting tint) instead of material base colour.
     debug: bool,
 ) -> Option<ChunkMeshData> {
-    let sdf = sample_field(edits, indices, grid_origin, vs, edge);
-    let shape = RuntimeShape::<u32, 3>::new([edge, edge, edge]);
-    let mut buffer = SurfaceNetsBuffer::default();
-    // Inset the over-reaching low apron on finer-bordering faces (mesh from cell 1, not 0, on that axis).
-    let mut smin = [0u32; 3];
-    for (bit, axis, is_high, _t) in FACES {
-        if !is_high && trim_low & (1 << bit) != 0 {
-            smin[axis] = 1;
+    // Transvoxel treats density > threshold as INSIDE; our CSG distance is NEGATIVE inside → negate it. The
+    // tiny iso-shift keeps no sample landing EXACTLY on 0 (density > 0 is strict, so a 0 sample reads
+    // "outside" — a pinhole at grid-aligned features like a sphere pole on a grid corner).
+    let field = |x: f32, y: f32, z: f32| 1e-3 - edits::fold_csg_dist_indexed(edits, indices, Vec3::new(x, y, z));
+    let block = Block::new(
+        [grid_origin.x, grid_origin.y, grid_origin.z],
+        subdivisions as f32 * vs,
+        subdivisions as usize,
+    );
+    // Faces bordering a coarser LOD → transition (high-res) sides. Bit order matches `TransitionSide`.
+    const SIDES: [TransitionSide; 6] = [
+        TransitionSide::LowX,
+        TransitionSide::HighX,
+        TransitionSide::LowY,
+        TransitionSide::HighY,
+        TransitionSide::LowZ,
+        TransitionSide::HighZ,
+    ];
+    let mut sides = TransitionSide::none();
+    for (i, &s) in SIDES.iter().enumerate() {
+        if flags & (1 << i) != 0 {
+            sides |= s;
         }
     }
-    // TODO(perf): pool the sample buffer + SurfaceNetsBuffer per `edge` to avoid per-task allocation.
-    surface_nets(&sdf, &shape, smin, [edge - 1, edge - 1, edge - 1], &mut buffer);
-    if buffer.positions.is_empty() {
-        return None;
-    }
-    // Re-project each Surface-Nets vertex onto the exact iso-surface (removes coarse-LOD shrinkage at its
-    // source; yields exact analytic normals). SN positions are in cell units → world = grid_origin + cell·vs;
-    // meshes store chunk-LOCAL positions (the entity Transform is grid_origin), so subtract it back off.
-    let mut positions: Vec<[f32; 3]> = Vec::with_capacity(buffer.positions.len());
-    let mut normals: Vec<[f32; 3]> = Vec::with_capacity(buffer.positions.len());
-    for p in &buffer.positions {
-        let world = grid_origin + Vec3::new(p[0], p[1], p[2]) * vs;
-        let (proj, n) = reproject_to_surface(edits, indices, world, vs);
-        let local = proj - grid_origin;
-        positions.push([local.x, local.y, local.z]);
-        normals.push([n.x, n.y, n.z]);
-    }
-    // Per-vertex COLOUR: debug = a per-LOD tint; normal = the resolved material's LINEAR base colour (real
-    // PBR lighting shades it; the chunk's StandardMaterial carries the dominant material's PBR scalars).
-    let lod_tint = LOD_DEBUG_PALETTE[(lod as usize).min(LOD_DEBUG_PALETTE.len() - 1)];
-    let mut colors: Vec<[f32; 4]> = buffer
-        .positions
-        .iter()
-        .map(|p| {
-            if debug {
-                return [lod_tint[0], lod_tint[1], lod_tint[2], 1.0];
-            }
-            let world = grid_origin + Vec3::new(p[0], p[1], p[2]) * vs;
-            let mid = edits::fold_csg(edits, world).material_id as usize;
-            let a = appearances.get(mid).copied().unwrap_or(DEFAULT_APPEARANCE);
-            [a.base[0], a.base[1], a.base[2], 1.0]
-        })
-        .collect();
-    let mut indices = buffer.indices.clone();
-    // SKIRTS: a curtain hanging from each coarser-neighbour boundary edge into the solid, hiding the
-    // fine↔coarse crack. Appends to the mesh buffers (see `append_skirts`).
-    if skirt_len > 0.0 && face_flags != 0 {
-        append_skirts(
-            &buffer, face_flags, edge, vs, skirt_len, debug, &mut positions, &mut normals, &mut colors,
-            &mut indices,
-        );
-    }
-    // Dominant material (at the surface centroid) → the chunk's StandardMaterial PBR params. Off-the-shelf
-    // StandardMaterial is per-mesh, so metallic/roughness/emissive use the dominant material.
-    let mut centroid = Vec3::ZERO;
-    for p in &buffer.positions {
-        centroid += Vec3::new(p[0], p[1], p[2]);
-    }
-    centroid = grid_origin + (centroid / buffer.positions.len().max(1) as f32) * vs;
-    let material = edits::fold_csg(edits, centroid).material_id;
-    let boundary = extract_boundary(&buffer, &positions, &normals, grid_origin, vs, edge, trim_low);
-    Some(ChunkMeshData { positions, normals, colors, indices, material, boundary })
+    let builder = ChunkMeshBuilder::new(edits, indices, appearances, grid_origin, vs, lod, debug);
+    // MUST be CacheNothing: `CacheCentralBlockOnly` caches the central block at THIS chunk's (coarse)
+    // resolution, which then serves the transition cell's FINE-resolution face samples too — collapsing the
+    // transition so the cross-LOD weld fails. The analytic CSG field is cheap to re-evaluate, so just query it.
+    let builder = extract_from_field(&field, FieldCaching::CacheNothing, block, sides, 0.0, builder);
+    builder.finish()
 }
 
-/// Bucket the surface vertices lying on each chunk FACE (apron-aware boundary cell) into per-face lists,
-/// `positions` are chunk-LOCAL, so `grid_origin` is added back for cached WORLD positions. Iterates the
-/// original Surface-Nets mesh (`buffer.indices`, before skirts): an edge in exactly ONE triangle is a mesh
-/// boundary edge; those whose endpoints both sit on a face's boundary cell, linked into ordered loops, are
-/// that face's seam input. Each boundary vert also carries its world-aligned cell coord for the seam.
-#[allow(clippy::too_many_arguments)]
-fn extract_boundary(
-    buffer: &SurfaceNetsBuffer,
-    positions: &[[f32; 3]],
-    normals: &[[f32; 3]],
-    grid_origin: Vec3,
-    vs: f32,
-    edge: u32,
-    trim_low: u8,
-) -> [Vec<BoundaryLoop>; 6] {
-    // Open edges of the surface mesh (appear in exactly one triangle).
-    let mut ecount: HashMap<(u32, u32), u32> = HashMap::new();
-    for t in buffer.indices.chunks_exact(3) {
-        for (a, b) in [(t[0], t[1]), (t[1], t[2]), (t[2], t[0])] {
-            *ecount.entry(if a < b { (a, b) } else { (b, a) }).or_insert(0) += 1;
-        }
-    }
-    let open: Vec<(u32, u32)> = ecount.iter().filter(|(_, c)| **c == 1).map(|(e, _)| *e).collect();
-    // Grid origin in this chunk's LOD voxel units (anchored at world 0), so `gov + surface_point` is a
-    // WORLD-ALIGNED cell coord that the seam can match across LODs by `div_euclid(2)`.
-    let go = grid_origin / vs;
-    let gov = [go.x.round() as i32, go.y.round() as i32, go.z.round() as i32];
-
-    let mut out: [Vec<BoundaryLoop>; 6] = std::array::from_fn(|_| Vec::new());
-    for (bit, axis, is_high, tan) in FACES {
-        // The crate meshes cells [smin, edge-1): a HIGH boundary sits at cell edge-2; a LOW boundary at cell 0
-        // normally, but at cell 1 when the face was INSET (`trim_low`) to skip the over-reaching apron.
-        let bcell = if is_high {
-            edge - 2
-        } else if trim_low & (1 << bit) != 0 {
-            1
-        } else {
-            0
-        };
-        let on_face = |i: u32| buffer.surface_points[i as usize][axis] == bcell;
-        // Adjacency among on-face boundary verts via the open edges that lie on this face.
-        let mut adj: HashMap<u32, Vec<u32>> = HashMap::new();
-        for &(a, b) in &open {
-            if on_face(a) && on_face(b) {
-                adj.entry(a).or_default().push(b);
-                adj.entry(b).or_default().push(a);
-            }
-        }
-        let nodes: Vec<u32> = adj.keys().copied().collect();
-        let mut visited: HashSet<u32> = HashSet::new();
-        let bv = |i: u32| {
-            let sp = buffer.surface_points[i as usize];
-            BoundaryVert {
-                pos: grid_origin + Vec3::from(positions[i as usize]),
-                normal: Vec3::from(normals[i as usize]),
-                cell: IVec2::new(gov[tan[0]] + sp[tan[0]] as i32, gov[tan[1]] + sp[tan[1]] as i32),
-                idx: i,
-            }
-        };
-        let to_loop = |comp: Vec<u32>| BoundaryLoop { verts: comp.into_iter().map(bv).collect() };
-        // Chains first (start at a degree-1 endpoint); any remaining cycles are closed loops.
-        for &s in &nodes {
-            if !visited.contains(&s) && adj[&s].len() == 1 {
-                out[bit as usize].push(to_loop(walk_open_edges(&adj, &mut visited, s)));
-            }
-        }
-        for &s in &nodes {
-            if !visited.contains(&s) {
-                out[bit as usize].push(to_loop(walk_open_edges(&adj, &mut visited, s)));
-            }
-        }
-    }
-    out
-}
-
-// ─────────────────────────── Cross-LOD boundary geomorph ───────────────────────────
-// A fine chunk's face that borders a coarser LOD leaves a crack: the fine boundary curve (dense) and the
-// coarse boundary curve (sparse) are meshed independently and don't coincide. We REMOVE the mismatch — the
-// coarse chunk OWNS the shared boundary, the fine chunk CONFORMS to it (snaps its boundary verts onto the
-// coarse ones) — so the two meshes share vertices and weld directly, with no seam strip and no T-junctions.
-// Conforming is transitive (fine→medium→coarse), so it also closes 3-LOD corners. (See memory.)
-
-/// Outward unit direction of face `bit` (FACES order: −X,+X,−Y,+Y,−Z,+Z).
-fn face_dir(bit: u8) -> IVec3 {
-    match bit {
-        0 => IVec3::NEG_X,
-        1 => IVec3::X,
-        2 => IVec3::NEG_Y,
-        3 => IVec3::Y,
-        4 => IVec3::NEG_Z,
-        _ => IVec3::Z,
-    }
-}
-
-/// The opposite face bit (−X↔+X, −Y↔+Y, −Z↔+Z): faces are axis-paired (0/1, 2/3, 4/5).
-#[inline]
-fn opposite_face(bit: u8) -> u8 {
-    bit ^ 1
-}
-
-/// Key of the LOD-(L+1) chunk on the far side of a fine chunk's `dir` face. `step = K·cell_stride`. The
-/// same-LOD neighbour min is `coord + dir·step` (LOD-L voxel units); halve to LOD-(L+1) units, then snap to
-/// the coarse chunk lattice.
-fn coarse_neighbour_key(fine: BrickKey, dir: IVec3, step: i32) -> BrickKey {
-    let n = fine.coord + dir * step;
-    let half = IVec3::new(n.x.div_euclid(2), n.y.div_euclid(2), n.z.div_euclid(2));
-    let snap = |c: i32| c.div_euclid(step) * step;
-    BrickKey::new(fine.lod + 1, IVec3::new(snap(half.x), snap(half.y), snap(half.z)))
-}
-
-/// Walk one connected component of the open-edge adjacency graph from `start`, in curve order.
-fn walk_open_edges(adj: &HashMap<u32, Vec<u32>>, visited: &mut HashSet<u32>, start: u32) -> Vec<u32> {
-    let mut comp = Vec::new();
-    let (mut prev, mut cur) = (u32::MAX, start);
-    loop {
-        comp.push(cur);
-        visited.insert(cur);
-        match adj[&cur].iter().copied().find(|&x| x != prev && !visited.contains(&x)) {
-            Some(nx) => {
-                prev = cur;
-                cur = nx;
-            }
-            None => break,
-        }
-    }
-    comp
-}
-
-/// GEOMORPH the fine chunk's boundary onto its coarser neighbours — the "remove the mismatch" cross-LOD fix.
-/// The coarse chunk OWNS the shared boundary; this fine chunk CONFORMS: every fine boundary vertex on a
-/// coarser-bordering face is snapped onto the nearest coarse boundary vertex (taking its position AND its
-/// normal), so the fine boundary collapses to a refinement of the coarse one and the two meshes share
-/// vertices → they weld watertight, with no separate seam strip and no T-junctions. Triangles that collapse
-/// to a degenerate sliver (two corners landing on one coarse vertex) are dropped. Conforming is TRANSITIVE —
-/// a fine→medium→coarse chain closes 3-LOD corners by construction, which the per-face strip never could.
-///
-/// `neighbours` pairs each coarser-bordering fine face `bit` with THAT neighbour's opposite-face boundary
-/// loops (same tangent frame, so fine cells map to coarse cells by `div_euclid(2)`). A vertex shared by two
-/// faces (a chunk-edge corner) is snapped ONCE, to the globally nearest candidate across its faces. `origin`
-/// is the fine chunk's grid origin (the same one `extract_boundary` used), to map a coarse world target back
-/// to chunk-local mesh space.
-fn conform_boundary(data: &mut ChunkMeshData, origin: Vec3, neighbours: &[(u8, &[BoundaryLoop])]) {
-    if neighbours.is_empty() {
-        return;
-    }
-    const WINDOW: i32 = 1; // search ±1 coarse cell around the fine vert's mapped cell (keeps it curve-local)
-    // Nearest coarse target (dist², world pos, world normal) per fine vertex INDEX, taking the global minimum
-    // across every coarser-bordering face the vertex lies on (so corners resolve consistently).
-    let mut snap: HashMap<u32, (f32, Vec3, Vec3)> = HashMap::new();
-    for &(bit, coarse) in neighbours {
-        if coarse.is_empty() {
-            continue;
-        }
-        // Coarse boundary verts bucketed by world-aligned cell (coarse LOD units) for a local window search.
-        let mut cmap: HashMap<IVec2, Vec<BoundaryVert>> = HashMap::new();
-        for cl in coarse {
-            for v in &cl.verts {
-                cmap.entry(v.cell).or_default().push(*v);
-            }
-        }
-        for fl in &data.boundary[bit as usize] {
-            for fv in &fl.verts {
-                let base = IVec2::new(fv.cell.x.div_euclid(2), fv.cell.y.div_euclid(2));
-                let mut best: Option<(f32, Vec3, Vec3)> = None;
-                for dy in -WINDOW..=WINDOW {
-                    for dx in -WINDOW..=WINDOW {
-                        let Some(vs) = cmap.get(&(base + IVec2::new(dx, dy))) else {
-                            continue;
-                        };
-                        for cv in vs {
-                            let d = cv.pos.distance_squared(fv.pos);
-                            if best.is_none_or(|(bd, ..)| d < bd) {
-                                best = Some((d, cv.pos, cv.normal));
-                            }
-                        }
-                    }
-                }
-                if let Some((d, p, nrm)) = best {
-                    let e = snap.entry(fv.idx).or_insert((f32::INFINITY, Vec3::ZERO, Vec3::ZERO));
-                    if d < e.0 {
-                        *e = (d, p, nrm);
-                    }
-                }
-            }
-        }
-    }
-    if snap.is_empty() {
-        return;
-    }
-    // Move each snapped fine vertex onto its coarse target (world → chunk-local), adopting the coarse normal
-    // so shading is continuous across the weld.
-    for (&idx, &(_, p, nrm)) in &snap {
-        let local = p - origin;
-        data.positions[idx as usize] = [local.x, local.y, local.z];
-        data.normals[idx as usize] = [nrm.x, nrm.y, nrm.z];
-    }
-    // Drop triangles that became degenerate (two corners snapped onto the same coarse vertex). Positions were
-    // set EXACTLY equal above, so a collapsed boundary edge is caught by exact `==`.
-    let old = std::mem::take(&mut data.indices);
-    let same = |a: u32, b: u32| data.positions[a as usize] == data.positions[b as usize];
-    let mut kept = Vec::with_capacity(old.len());
-    for t in old.chunks_exact(3) {
-        if !same(t[0], t[1]) && !same(t[1], t[2]) && !same(t[2], t[0]) {
-            kept.extend_from_slice(t);
-        }
-    }
-    data.indices = kept;
-}
-
-/// Append skirt curtains for the coarser-neighbour faces (`face_flags`). Variant A′: a boundary vertex's
-/// in-face tangent neighbours are found via the crate's `surface_strides`/`stride_to_index` map (the SDF
-/// array linearises as `x + y·edge + z·edge²`, so the tangent strides are `[1, edge, edge²]`), and each
-/// boundary edge is extruded by `skirt_len` along `−normal` (into the solid — hidden from outside, plugs
-/// the seam). Boundary cells are apron-aware: the chunk's real cells are `1..=edge-2` (cell 0 is the low
-/// apron), so the −face boundary is cell `1` and the +face boundary is cell `edge-2`. (Skirt length /
-/// boundary-cell are visually tunable via the panel + the Colour-by-LOD debug view.)
-#[allow(clippy::too_many_arguments)]
-fn append_skirts(
-    buffer: &SurfaceNetsBuffer,
-    face_flags: u8,
-    edge: u32,
-    _vs: f32,
-    skirt_len: f32,
+/// `MeshBuilder` that turns Transvoxel's per-edge vertices into our `ChunkMeshData`: chunk-LOCAL positions,
+/// EXACT analytic normals (from the CSG gradient, not Marching-Cubes' estimate), per-vertex material base
+/// colour (or the per-LOD debug tint), and the dominant material id (at the surface centroid) for the
+/// chunk's `StandardMaterial`.
+struct ChunkMeshBuilder<'a> {
+    edits: &'a [edits::ResolvedEdit],
+    indices: &'a [u32],
+    appearances: &'a [MatAppearance],
+    origin: Vec3,
+    eps: f32,
+    lod: u32,
     debug: bool,
-    positions: &mut Vec<[f32; 3]>,
-    normals: &mut Vec<[f32; 3]>,
-    colors: &mut Vec<[f32; 4]>,
-    indices: &mut Vec<u32>,
-) {
-    let lin = [1u32, edge, edge * edge]; // SDF/array linear strides (match the fill order + RuntimeShape)
-    for (bit, axis, is_high, tan) in FACES {
-        if face_flags & (1 << bit) == 0 {
-            continue;
+    positions: Vec<[f32; 3]>,
+    normals: Vec<[f32; 3]>,
+    colors: Vec<[f32; 4]>,
+    tris: Vec<u32>,
+    sum: Vec3,
+}
+
+impl<'a> ChunkMeshBuilder<'a> {
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        edits: &'a [edits::ResolvedEdit],
+        indices: &'a [u32],
+        appearances: &'a [MatAppearance],
+        origin: Vec3,
+        vs: f32,
+        lod: u32,
+        debug: bool,
+    ) -> Self {
+        Self {
+            edits,
+            indices,
+            appearances,
+            origin,
+            eps: vs * 0.01,
+            lod,
+            debug,
+            positions: Vec::new(),
+            normals: Vec::new(),
+            colors: Vec::new(),
+            tris: Vec::new(),
+            sum: Vec3::ZERO,
         }
-        let bcell = if is_high { edge - 2 } else { 1 };
-        for i in 0..buffer.positions.len() {
-            if buffer.surface_points[i][axis] != bcell {
-                continue;
-            }
-            for &t in &tan {
-                // The boundary vertex in the next cell along this tangent (one direction only → each edge once).
-                let ns = buffer.surface_strides[i] + lin[t];
-                let Some(nidx) = buffer.stride_to_index.get(ns as usize).copied() else { continue };
-                if nidx == u32::MAX {
-                    continue;
-                }
-                let ni = nidx as usize;
-                if buffer.surface_points[ni][axis] != bcell {
-                    continue; // neighbour is not on this boundary face → no boundary edge here
-                }
-                // Extrude both endpoints into the solid (−normalize(normal) · skirt_len) → a curtain quad.
-                // Read positions/colours BEFORE pushing (Copy values) to avoid aliasing the Vec.
-                let extrude = |p: [f32; 3], n: [f32; 3]| -> [f32; 3] {
-                    let n = Vec3::from(n).normalize_or_zero();
-                    [p[0] - n.x * skirt_len, p[1] - n.y * skirt_len, p[2] - n.z * skirt_len]
-                };
-                let (v0, v1) = (i as u32, ni as u32);
-                // Use the reprojected ANALYTIC normals (`normals[i]`), not the crate's discrete ones.
-                let (n0, n1) = (normals[i], normals[ni]);
-                let (e0, c0) = (extrude(positions[i], n0), colors[i]);
-                let (e1, c1) = (extrude(positions[ni], n1), colors[ni]);
-                let s0 = positions.len() as u32;
-                positions.push(e0);
-                normals.push(n0);
-                colors.push(if debug { SKIRT_DEBUG_COLOUR } else { c0 });
-                let s1 = positions.len() as u32;
-                positions.push(e1);
-                normals.push(n1);
-                colors.push(if debug { SKIRT_DEBUG_COLOUR } else { c1 });
-                // Curtain quad (boundary edge v0-v1 → extruded edge s0-s1). The chunk material is
-                // double-sided, so winding doesn't matter for visibility.
-                indices.extend_from_slice(&[v0, v1, s1, v0, s1, s0]);
-            }
+    }
+
+    fn finish(self) -> Option<ChunkMeshData> {
+        if self.positions.is_empty() {
+            return None;
         }
+        // Dominant material at the surface centroid → the chunk's StandardMaterial PBR scalars.
+        let centroid = self.sum / self.positions.len() as f32;
+        let material = edits::fold_csg(self.edits, centroid).material_id;
+        Some(ChunkMeshData {
+            positions: self.positions,
+            normals: self.normals,
+            colors: self.colors,
+            indices: self.tris,
+            material,
+        })
+    }
+}
+
+impl MeshBuilder<f32, f32> for ChunkMeshBuilder<'_> {
+    fn add_vertex_between(
+        &mut self,
+        a: GridPoint<f32, f32>,
+        b: GridPoint<f32, f32>,
+        t: f32,
+    ) -> VertexIndex {
+        let p = a.position.interpolate_toward(&b.position, t);
+        let world = Vec3::new(p.x, p.y, p.z);
+        self.sum += world;
+        let local = world - self.origin;
+        self.positions.push([local.x, local.y, local.z]);
+        // Exact outward normal = ∇(CSG distance) (points toward increasing distance = outside the solid).
+        let n = field_gradient(self.edits, self.indices, world, self.eps).normalize_or_zero();
+        self.normals.push([n.x, n.y, n.z]);
+        let col = if self.debug {
+            let tint = LOD_DEBUG_PALETTE[(self.lod as usize).min(LOD_DEBUG_PALETTE.len() - 1)];
+            [tint[0], tint[1], tint[2], 1.0]
+        } else {
+            let mid = edits::fold_csg(self.edits, world).material_id as usize;
+            let ap = self.appearances.get(mid).copied().unwrap_or(DEFAULT_APPEARANCE);
+            [ap.base[0], ap.base[1], ap.base[2], 1.0]
+        };
+        self.colors.push(col);
+        VertexIndex(self.positions.len() - 1)
+    }
+
+    fn add_triangle(&mut self, v1: VertexIndex, v2: VertexIndex, v3: VertexIndex) {
+        // Material is double-sided (cull_mode None) and normals are analytic, so winding is irrelevant.
+        self.tris.extend_from_slice(&[v1.0 as u32, v2.0 as u32, v3.0 as u32]);
     }
 }
 
 /// Cheap narrow-band test: could the chunk's sampled region contain a surface crossing? Mirrors the GPU
 /// scheduler's `narrow_band_keep`. For a LARGE solid most resident chunks are fully INTERIOR (they
 /// overlap the edit AABB but the surface is nowhere near) — baking them is a wasted `edge³` sample +
-/// Surface Nets that returns empty. Folding ONCE at the chunk centre and comparing `|dist|` to the
+/// Transvoxel that returns empty. Folding ONCE at the chunk centre and comparing `|dist|` to the
 /// chunk's circumradius (+ apron + a smoothing margin) drops them for ~one SDF eval instead of a full
 /// bake, turning the bake from O(volume) into O(surface-area). CONSERVATIVE: `reach` is an over-estimate
 /// and a smoothed chunk force-keeps on a corner sign change, so it can only ever drop a chunk with no
@@ -978,7 +611,7 @@ fn chunk_has_surface(
     edits::fold_csg_dist_indexed(edits, indices, center).abs() <= reach
 }
 
-/// Content-hash-driven, async, generational-coherent Surface Nets bake (see the module doc). The unit is
+/// Content-hash-driven, async, generational-coherent Transvoxel bake (see the module doc). The unit is
 /// a configurable `K×K×K`-brick chunk; whole edits commit uniformly via frozen bake rounds.
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
 fn mesh_resident_chunks(
@@ -1035,8 +668,7 @@ fn mesh_resident_chunks(
     }
     scal.prev_k = k;
 
-    let cs = config.cell_stride() as u32;
-    let edge = k * cs + 2; // padded grid edge in samples (1-voxel apron each side)
+    let cs = config.cell_stride() as u32; // cells per brick (chunk subdivisions = k·cs)
 
     let n_edits = gathered.len();
     let mut edit_aabbs: Vec<Aabb3d> = Vec::with_capacity(n_edits);
@@ -1160,15 +792,15 @@ fn mesh_resident_chunks(
         }
     }
 
-    // Current content hash for every resident chunk (over the LIVE edits + lod + per-face coarser-neighbour
-    // flags) — drives "is the displayed mesh out of date" (a NEW round needed). The lod+flags mix makes a
-    // chunk re-bake (with the right skirts) exactly when the camera moves a shell line.
+    // Current content hash for every resident chunk (over the LIVE edits + lod + per-face transition flags) —
+    // drives "is the displayed mesh out of date" (a NEW round needed). The lod+flags mix makes a chunk re-bake
+    // (with the right Transvoxel transition sides) exactly when the camera moves a shell line. Transvoxel needs
+    // only the per-face LOD RELATIONSHIP (already in `flags`), NOT the neighbour's geometry — so no cross-chunk
+    // hash folding is required (the transition cell samples the field itself and welds by construction).
     let mut current_hashes: HashMap<BrickKey, u64> = HashMap::with_capacity(resident.len());
     let mut by_lod = [0usize; 8];
     {
         let mut idx: Vec<u32> = Vec::new();
-        // Pass 1 — each chunk's OWN content hash (edits ∩ chunk + lod + face flags + trim).
-        let mut own: HashMap<BrickKey, (u64, u8)> = HashMap::with_capacity(resident.len());
         for &key in &resident {
             by_lod[(key.lod as usize).min(7)] += 1;
             cull_into(&edit_aabbs, &chunk_sampled(key), &mut idx);
@@ -1177,31 +809,10 @@ fn mesh_resident_chunks(
             // predicate as the bake fold below → hash and geometry always agree.
             idx.retain(|&i| edit_resolvable_at(edit_extent[i as usize], &config, key.lod));
             let base = if idx.is_empty() { 0 } else { edits::bake_content_hash(&edits_arc, &idx) };
-            let flags = chunk_face_flags(key, &config, k, cam, half0);
-            let trim = chunk_finer_low_faces(key, &config, k, cam, half0);
+            let flags = chunk_finer_faces(key, &config, k, cam, half0);
             let lf = (key.lod as u64).wrapping_mul(0xA24B_AED4_963E_E407)
-                ^ (flags as u64).wrapping_mul(EPOCH_MIX)
-                ^ (trim as u64).wrapping_mul(0xC2B2_AE3D_27D4_EB4F);
-            own.insert(key, ((base ^ epoch_mix).wrapping_add(lf), flags));
-        }
-        // Pass 2 — fold each coarser-bordering neighbour's OWN hash into this chunk's hash. The geomorph snaps
-        // this chunk's boundary onto that neighbour, so a change in the neighbour's geometry must re-stale
-        // (hence re-bake + re-conform) this chunk: robust-by-construction invalidation, no extra scheduling.
-        // (Only the neighbour's OWN hash is folded — its boundary toward THIS chunk is the neighbour's own
-        // meshed face, unaffected by the neighbour conforming its OTHER, coarser faces.)
-        let k_step = k as i32 * config.cell_stride();
-        for (&key, &(own_h, flags)) in &own {
-            let mut h = own_h;
-            for (bit, _axis, _is_high, _tan) in FACES {
-                if flags & (1 << bit) == 0 {
-                    continue;
-                }
-                let ckey = coarse_neighbour_key(key, face_dir(bit), k_step);
-                if let Some(&(ch, _)) = own.get(&ckey) {
-                    h ^= ch.rotate_left(17).wrapping_add(0x9E37_79B9_7F4A_7C15);
-                }
-            }
-            current_hashes.insert(key, h);
+                ^ (flags as u64).wrapping_mul(EPOCH_MIX);
+            current_hashes.insert(key, (base ^ epoch_mix).wrapping_add(lf));
         }
     }
     stats.edits = n_edits;
@@ -1241,10 +852,10 @@ fn mesh_resident_chunks(
     stats.reaped = 0;
     if round_done && (has_staged || has_departed) {
         let mut reaped = 0usize;
-        // PHASE A — cache every committing chunk's boundary + material and TAKE its staged mesh into
-        // `pending`, retiring its old entity. All boundary caches must be fresh before any fine chunk
-        // conforms (it reads its coarse neighbours' caches), so meshes are NOT built until phase B.
-        let mut pending: Vec<(BrickKey, ChunkMeshData)> = Vec::new();
+        // Build + spawn each committing chunk's staged mesh in one pass (Transvoxel welds neighbouring LODs by
+        // construction, so there is no cross-chunk seam step). Debug "Colour by LOD": one shared UNLIT white
+        // material (the LOD tint lives in the vertex COLOUR). Normal: a lit StandardMaterial per dominant
+        // material id (cached) — base WHITE so the per-vertex base COLOUR rules; PBR scalars from the registry.
         for (key, st) in states.0.iter_mut() {
             let Some(sb) = st.staged.take() else {
                 continue;
@@ -1253,49 +864,9 @@ fn mesh_resident_chunks(
                 commands.entity(old).despawn();
             }
             st.displayed_hash = st.target_hash;
-            match sb.data {
-                // Empty chunk: no mesh, and clear any stale boundary cache.
-                None => st.boundary = std::array::from_fn(|_| Vec::new()),
-                Some(data) => {
-                    // Cache a COPY of the boundary verts + dominant material; the staged data keeps its own
-                    // boundary so the geomorph can read this chunk's fine boundary in phase B.
-                    st.boundary = data.boundary.clone();
-                    st.material = data.material;
-                    pending.push((*key, data));
-                }
-            }
-        }
-
-        // PHASE B-1 — GEOMORPH: each fine chunk bordering a coarser LOD conforms its boundary onto those
-        // neighbours' cached boundaries (now all fresh), so the meshes weld with no seam strip. Skipped when
-        // seams are disabled — skirts (already baked into the chunk meshes) are the fallback then.
-        if mesh_cfg.seams_enabled {
-            let k_step = k as i32 * config.cell_stride();
-            for (fkey, data) in pending.iter_mut() {
-                let flags = chunk_face_flags(*fkey, &config, k, round.cam, round.half0);
-                if flags == 0 {
-                    continue;
-                }
-                let mut neighbours: Vec<(u8, &[BoundaryLoop])> = Vec::new();
-                for (bit, _axis, _is_high, _tan) in FACES {
-                    if flags & (1 << bit) == 0 {
-                        continue; // face doesn't border a coarser LOD
-                    }
-                    let ckey = coarse_neighbour_key(*fkey, face_dir(bit), k_step);
-                    if let Some(cst) = states.0.get(&ckey) {
-                        neighbours.push((bit, cst.boundary[opposite_face(bit) as usize].as_slice()));
-                    }
-                }
-                let vs_l = config.voxel_size_at(fkey.lod);
-                let origin = config.brick_min_world(fkey.coord, fkey.lod) - Vec3::splat(vs_l);
-                conform_boundary(data, origin, &neighbours);
-            }
-        }
-
-        // PHASE B-2 — build + spawn each committed (now conformed) chunk mesh. Debug "Colour by LOD": one
-        // shared UNLIT white material (the LOD/skirt tint lives in the vertex COLOUR). Normal: a lit
-        // StandardMaterial per dominant material id (cached) — base WHITE so the per-vertex base COLOUR rules.
-        for (key, data) in pending {
+            let Some(data) = sb.data else {
+                continue; // empty chunk: no mesh
+            };
             let mat = if mesh_cfg.debug_lod_colour {
                 mat_cache
                     .entry(u16::MAX)
@@ -1334,22 +905,20 @@ fn mesh_resident_chunks(
                 .with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, data.normals)
                 .with_inserted_attribute(Mesh::ATTRIBUTE_COLOR, data.colors)
                 .with_inserted_indices(Indices::U32(data.indices));
-            // Apron offset: SN sample 0 is one voxel BEFORE the chunk min — MUST stay exactly
-            // `brick_min_world(coord,lod) - vs(lod)`, or the chunk shifts a voxel and every weld cracks.
-            let vs_l = config.voxel_size_at(key.lod);
-            let origin = config.brick_min_world(key.coord, key.lod) - Vec3::splat(vs_l);
-            let entity = commands
-                .spawn((
-                    Mesh3d(mesh_assets.add(mesh)),
-                    MeshMaterial3d(mat),
-                    Transform::from_translation(origin),
-                    ChunkMesh(key),
-                    Name::new("SDF Chunk Mesh"),
-                ))
-                .id();
-            if let Some(st) = states.0.get_mut(&key) {
-                st.entity = Some(entity);
-            }
+            // Transvoxel positions are chunk-LOCAL relative to the chunk's world MIN corner (NO apron), so the
+            // entity Transform is exactly `brick_min_world(coord, lod)`.
+            let origin = config.brick_min_world(key.coord, key.lod);
+            st.entity = Some(
+                commands
+                    .spawn((
+                        Mesh3d(mesh_assets.add(mesh)),
+                        MeshMaterial3d(mat),
+                        Transform::from_translation(origin),
+                        ChunkMesh(*key),
+                        Name::new("SDF Chunk Mesh"),
+                    ))
+                    .id(),
+            );
         }
 
         // Reap departed meshes (query-based — catches every non-resident `ChunkMesh` regardless of state).
@@ -1427,9 +996,6 @@ fn mesh_resident_chunks(
         let mut budget = MAX_NEW_TASKS_PER_FRAME;
         let mut idx: Vec<u32> = Vec::new();
         let debug = mesh_cfg.debug_lod_colour;
-        // Seams and skirts are mutually exclusive: when the seam pass is on it fills the cracks, so suppress
-        // skirts (skirt_len 0); otherwise skirts are the fallback.
-        let skirt_cells = if mesh_cfg.seams_enabled { 0.0 } else { mesh_cfg.skirt_cells };
         for &key in &resident {
             let st = states.0.entry(key).or_default();
             if st.task.is_some() || st.staged.is_some() {
@@ -1456,19 +1022,17 @@ fn mesh_resident_chunks(
                 st.staged = Some(StagedBake { data: None });
                 continue;
             }
-            let grid_origin = config.brick_min_world(key.coord, key.lod) - Vec3::splat(vs_l);
-            // Skirt faces + apron inset from the FROZEN shell (so all of a round's chunks agree on the boundary).
-            let flags = chunk_face_flags(key, &config, k, round.cam, round.half0);
-            let trim_low = chunk_finer_low_faces(key, &config, k, round.cam, round.half0);
-            let skirt_len = skirt_cells * vs_l;
+            // Transvoxel block = the chunk's exact world extent (NO apron); its origin is the chunk MIN corner.
+            let grid_origin = config.brick_min_world(key.coord, key.lod);
+            // Transvoxel transition faces — those bordering a FINER LOD — from the FROZEN shell, so all of a
+            // round's chunks agree on the boundary. Folded into the content hash → re-bakes on a shell move.
+            let flags = chunk_finer_faces(key, &config, k, round.cam, round.half0);
             let lod = key.lod;
             let edits = round_edits.clone();
             let indices = idx.clone();
             let apps = appearances.clone();
             st.task = Some(pool.spawn(async move {
-                mesh_chunk(
-                    &edits, &indices, &apps, grid_origin, vs_l, edge, flags, skirt_len, lod, trim_low, debug,
-                )
+                mesh_chunk(&edits, &indices, &apps, grid_origin, vs_l, k * cs, flags, lod, debug)
             }));
             budget -= 1;
         }
@@ -1476,13 +1040,13 @@ fn mesh_resident_chunks(
 }
 
 /// Dedicated "Mesh Bake" bottom dock panel (editor builds): the controls for viewing/inspecting the
-/// Surface Nets bake.
+/// Transvoxel bake.
 #[cfg(feature = "editor")]
 fn mesh_bake_panel(world: &mut World, ui: &mut bevy_egui::egui::Ui) {
     use bevy::pbr::wireframe::WireframeConfig;
     use crate::sdf_render::SdfRenderEnabled;
 
-    ui.label("Surface Nets chunk bake (async). Uncheck the SDF render to view the meshes.");
+    ui.label("Transvoxel chunk bake (async). Uncheck the SDF render to view the meshes.");
     ui.separator();
 
     // Toggle the SDF raymarch render off so the baked meshes are visible (its combine pass otherwise
@@ -1527,27 +1091,6 @@ fn mesh_bake_panel(world: &mut World, ui: &mut bevy_egui::egui::Ui) {
     let mut lods = world.resource::<MeshBakeConfig>().lod_count;
     if ui.add(bevy_egui::egui::Slider::new(&mut lods, 1..=9).text("LOD levels")).changed() {
         world.resource_mut::<MeshBakeConfig>().lod_count = lods;
-    }
-    let mut skirt = world.resource::<MeshBakeConfig>().skirt_cells;
-    if ui
-        .add(bevy_egui::egui::Slider::new(&mut skirt, 0.0..=6.0).text("Skirt cells"))
-        .on_hover_text("Cross-LOD crack-filling curtain length, in voxels. Too short leaks; too long shows a lip.")
-        .changed()
-    {
-        world.resource_mut::<MeshBakeConfig>().skirt_cells = skirt;
-    }
-    let mut seams = world.resource::<MeshBakeConfig>().seams_enabled;
-    if ui
-        .checkbox(&mut seams, "Cross-LOD seams")
-        .on_hover_text(
-            "Stitch fine↔coarse boundaries with a transition strip (crack-free). Off → skirts fallback. \
-             Toggle bumps a rebake.",
-        )
-        .changed()
-    {
-        world.resource_mut::<MeshBakeConfig>().seams_enabled = seams;
-        // Re-mesh so chunks pick up / drop their skirts (seams replace them); the seam pass also rebuilds.
-        world.resource_mut::<MeshBakeRebuild>().0 = true;
     }
     let mut dbg = world.resource::<MeshBakeConfig>().debug_lod_colour;
     if ui.checkbox(&mut dbg, "Colour by LOD (debug)").changed() {
@@ -1672,17 +1215,18 @@ mod tests {
     }
 
     #[test]
-    fn face_flags_mark_outer_rim_coarser() {
+    fn finer_faces_mark_inner_rim_transitions() {
         let (cfg, mc) = cfgs();
         let k = 4;
         let cam = Some(Vec3::ZERO);
         let half0 = lod0_half_chunks(&cfg, &mc, k);
-        // Centre chunk: all neighbours inside cube(0) → no coarser faces.
-        assert_eq!(chunk_face_flags(chunk(&cfg, k, 0, 0), &cfg, k, cam, half0), 0);
-        // Chunk on the +X rim (index half0-1): its +X neighbour (index half0) is outside cube(0) → bit1.
-        let f = chunk_face_flags(chunk(&cfg, k, 0, half0 - 1), &cfg, k, cam, half0);
-        assert_eq!(f & (1 << 1), 1 << 1, "+X face should border a coarser LOD");
-        assert_eq!(f & (1 << 0), 0, "−X face should not (neighbour still inside cube(0))");
+        // LOD 0 (finest) never has transition faces.
+        assert_eq!(chunk_finer_faces(chunk(&cfg, k, 0, 0), &cfg, k, cam, half0), 0, "LOD 0 has no finer faces");
+        // A LOD-1 chunk on the INNER rim of its shell: index half0/2 occupies LOD-0 [half0, half0+2); its −X
+        // neighbour occupies [half0-2, half0), fully inside the finer LOD-0 cube [−half0, half0] → its −X face
+        // is a transition (it borders the finer LOD).
+        let f = chunk_finer_faces(chunk(&cfg, k, 1, half0 / 2), &cfg, k, cam, half0);
+        assert_eq!(f & (1 << 0), 1 << 0, "−X face should border the finer LOD-0 cube (a transition face)");
     }
 
     fn sphere_edit(centre: Vec3, radius: f32) -> edits::ResolvedEdit {
@@ -1707,8 +1251,8 @@ mod tests {
 
     /// Count mesh edges NOT shared by exactly 2 triangles, after welding vertices by quantized WORLD
     /// position (0.1 mm). 0 ⇒ closed 2-manifold = watertight. Position-welding lets it span SEPARATE chunk
-    /// meshes (fine + coarse), so it is the geomorph's correctness gate: after the fine conforms, the two
-    /// must weld with no open edge (gap) and no edge in >2 triangles (overlap).
+    /// meshes (fine + coarse), so it is the cross-LOD correctness gate: the Transvoxel transition face must
+    /// weld the two with no open edge (gap) and no edge in >2 triangles (overlap).
     fn open_edge_count(tris: &[(Vec3, Vec3, Vec3)]) -> usize {
         let q = |p: Vec3| {
             [
@@ -1732,202 +1276,38 @@ mod tests {
 
     #[test]
     fn single_chunk_closed_surface_is_watertight() {
-        // Validates the watertightness checker + that the boundary-cache path doesn't disturb meshing: a
-        // sphere fully inside one chunk (touching no face) must mesh as a closed 2-manifold.
+        // A sphere fully inside one chunk (touching no face) must mesh as a closed 2-manifold.
         let edits = [sphere_edit(Vec3::ZERO, 1.0)];
-        let (vs, edge) = (0.1f32, 30u32); // chunk real span ≈ 2.8 > sphere Ø 2.0 → clears all faces
-        let origin = Vec3::splat(-1.5);
-        let data = mesh_chunk(&edits, &[0], &[], origin, vs, edge, 0, 0.0, 0, 0, false)
-            .expect("sphere meshes");
+        let (vs, sub) = (0.1f32, 28u32); // block span = 28·0.1 = 2.8 > sphere Ø 2.0 → clears all faces
+        let origin = Vec3::splat(-1.4);
+        let data = mesh_chunk(&edits, &[0], &[], origin, vs, sub, 0, 0, false).expect("sphere meshes");
         assert_eq!(open_edge_count(&chunk_tris(&data, origin)), 0, "closed sphere must be watertight");
     }
 
-    /// Count fine boundary verts on `face` that did NOT land exactly on a coarse boundary vertex after a
-    /// conform (within `tol` world units). 0 ⇒ the fine boundary is a subset of the coarse boundary
-    /// (no T-junctions). Coarse verts are taken from `coarse.boundary[opp]` (already world-space).
-    fn unwelded_boundary_verts(
-        fine: &ChunkMeshData,
-        origin: Vec3,
-        face: usize,
-        coarse: &ChunkMeshData,
-        opp: usize,
-        tol: f32,
-    ) -> usize {
-        let cverts: Vec<Vec3> = coarse.boundary[opp].iter().flat_map(|l| l.verts.iter().map(|v| v.pos)).collect();
-        let mut miss = 0;
-        for l in &fine.boundary[face] {
-            for v in &l.verts {
-                let w = origin + Vec3::from(fine.positions[v.idx as usize]);
-                if !cverts.iter().any(|c| c.distance(w) <= tol) {
-                    miss += 1;
-                }
-            }
-        }
-        miss
-    }
-
     #[test]
-    fn geomorph_welds_2to1_sphere_watertight() {
-        // A sphere straddling a forced fine|coarse 2:1 boundary at x = 0: the FINE chunk (vs 0.1) meshes the
-        // +X side (its −X face borders coarse), the COARSE chunk (vs 0.2) the −X side, each ending in a
-        // boundary circle one fine-voxel apart. The geomorph snaps the FINE boundary onto the coarse one; the
-        // two then weld with no seam strip. Bare = cracked; after conform fine+coarse is a closed 2-manifold.
-        let edits = [sphere_edit(Vec3::ZERO, 1.0)];
+    fn transvoxel_2to1_boundary_is_watertight() {
+        // THE crack-free guarantee, by construction: the COARSE block whose +X face is a TRANSITION (toward
+        // the higher-res neighbour) welds to its abutting FINE block with NO post-hoc stitching. Transvoxel
+        // puts the transition cell on the LOW-res block facing the high-res one. A sphere straddles the forced
+        // 2:1 boundary at x = 0: the fine block (vs 0.1) meshes x∈[0,2.8] REGULAR; the coarse block (vs 0.2)
+        // meshes x∈[−5.6,0] with +X (bit 1 = HighX) transition. Origins sit on the world-0 coarse lattice
+        // (Y/Z origins are integer multiples of vsc), so the transition face samples coincide with the fine
+        // face. Fine + coarse must be a closed 2-manifold (no gap, no overlap) at the shared plane.
+        // Sphere offset off the boundary so x=0 cuts it TRANSVERSALLY (the equator-on-the-plane case is
+        // tangent — degenerate for a transition cell).
+        let edits = [sphere_edit(Vec3::new(0.4, 0.0, 0.0), 1.0)];
         let idx = [0u32];
-        let (vsf, vsc, edge) = (0.1f32, 0.2f32, 30u32);
-        let of = Vec3::new(-vsf, -1.4 - vsf, -1.4 - vsf);
-        let oc = Vec3::new(-5.6 - vsc, -2.8 - vsc, -2.8 - vsc);
-        let mut fine = mesh_chunk(&edits, &idx, &[], of, vsf, edge, 0, 0.0, 0, 0, false).expect("fine meshes");
-        let coarse =
-            mesh_chunk(&edits, &idx, &[], oc, vsc, edge, 0, 0.0, 1, 0, false).expect("coarse meshes");
-
-        // Bare chunks ARE cracked (two open boundary circles) — proves the geomorph is what closes it.
-        let mut bare = chunk_tris(&fine, of);
-        bare.extend(chunk_tris(&coarse, oc));
-        assert!(open_edge_count(&bare) > 0, "bare 2-LOD sphere must be cracked before conforming");
-
-        // Fine −X (bit 0) conforms onto coarse +X (bit 1).
-        conform_boundary(&mut fine, of, &[(0, &coarse.boundary[1])]);
-        assert_eq!(
-            unwelded_boundary_verts(&fine, of, 0, &coarse, 1, 1e-4),
-            0,
-            "every conformed fine boundary vert must land on a coarse vert (no T-junction)"
-        );
+        let (vsf, vsc, sub) = (0.1f32, 0.2f32, 28u32);
+        let of = Vec3::new(0.0, -1.4, -1.4); // fine x∈[0,2.8]; −X face at x=0 (regular, high-res)
+        let oc = Vec3::new(-5.6, -2.8, -2.8); // coarse x∈[−5.6,0]; +X face at x=0 is the transition side
+        let fine = mesh_chunk(&edits, &idx, &[], of, vsf, sub, 0, 0, false).expect("fine meshes");
+        let coarse = mesh_chunk(&edits, &idx, &[], oc, vsc, sub, 1 << 1, 1, false).expect("coarse meshes");
         let mut all = chunk_tris(&fine, of);
         all.extend(chunk_tris(&coarse, oc));
-        assert_eq!(open_edge_count(&all), 0, "fine conformed to coarse must be watertight");
-    }
-
-    #[test]
-    fn geomorph_terrain_welds_no_tjunction() {
-        // A heightmap crossing a fine|coarse 2:1 boundary → CHAIN boundaries (the lod_test terrain regime).
-        // After the fine conforms, EVERY fine boundary vertex must coincide with a coarse boundary vertex
-        // (so the fine boundary is a refinement of the coarse one → no T-junctions / no fine-side gap), and
-        // no degenerate (zero-area) triangle may survive the conform.
-        let edit = edits::ResolvedEdit::new(
-            crate::sdf_render::SdfPrimitive::Heightmap {
-                half_xz: Vec2::new(400.0, 400.0),
-                max_height: 30.0,
-                freq: 0.05,
-                amp: 8.0,
-                seed: 7,
-            },
-            Transform::IDENTITY,
-            crate::sdf_render::SdfOp { kind: crate::sdf_render::CsgKind::Union, smoothing: 0.0 },
+        assert_eq!(
+            open_edge_count(&all),
             0,
-        );
-        let edits = [edit];
-        let idx = [0u32];
-        let (vsf, vsc, edge) = (1.0f32, 2.0f32, 30u32);
-        let of = Vec3::new(-vsf, -vsf, -vsf);
-        let oc = Vec3::new(-56.0 - vsc, -vsc, -vsc);
-        let mut fine = mesh_chunk(&edits, &idx, &[], of, vsf, edge, 0, 0.0, 0, 0, false).expect("fine meshes");
-        let coarse = mesh_chunk(&edits, &idx, &[], oc, vsc, edge, 0, 0.0, 1, 0, false).expect("coarse meshes");
-
-        conform_boundary(&mut fine, of, &[(0, &coarse.boundary[1])]);
-
-        let miss = unwelded_boundary_verts(&fine, of, 0, &coarse, 1, 1e-4);
-        assert_eq!(miss, 0, "{miss} fine boundary verts did not weld onto a coarse vert → T-junction/gap");
-
-        // No surviving degenerate triangles (two corners on the same position).
-        let degen = fine
-            .indices
-            .chunks_exact(3)
-            .filter(|t| {
-                let p = |i: u32| fine.positions[i as usize];
-                p(t[0]) == p(t[1]) || p(t[1]) == p(t[2]) || p(t[2]) == p(t[0])
-            })
-            .count();
-        assert_eq!(degen, 0, "{degen} degenerate triangles survived the conform");
-    }
-
-    #[test]
-    fn geomorph_corner_snaps_consistently() {
-        // A fine chunk bordering a coarser LOD on TWO faces (−X and −Z) — the chunk-edge corner. Snapping
-        // against the UNION of both neighbours must move each fine boundary vert onto a coarse vert on every
-        // face it lies on, so the corner has no leftover T-junction. A sphere centred at the −X/−Z corner.
-        let edits = [sphere_edit(Vec3::ZERO, 1.0)];
-        let idx = [0u32];
-        let (vsf, vsc, edge) = (0.1f32, 0.2f32, 30u32);
-        // Fine occupies +X,+Z (its −X and −Z faces border coarse). Two coarse neighbours: one across −X, one
-        // across −Z. All anchored so grids are 2:1-nested.
-        let of = Vec3::new(-vsf, -1.4 - vsf, -vsf);
-        let ox = Vec3::new(-5.6 - vsc, -2.8 - vsc, -2.8 - vsc); // coarse across −X
-        let oz = Vec3::new(-2.8 - vsc, -2.8 - vsc, -5.6 - vsc); // coarse across −Z
-        let mut fine = mesh_chunk(&edits, &idx, &[], of, vsf, edge, 0, 0.0, 0, 0, false).expect("fine meshes");
-        let cx = mesh_chunk(&edits, &idx, &[], ox, vsc, edge, 0, 0.0, 1, 0, false).expect("coarse X meshes");
-        let cz = mesh_chunk(&edits, &idx, &[], oz, vsc, edge, 0, 0.0, 1, 0, false).expect("coarse Z meshes");
-
-        // Conform against BOTH neighbours at once (the union — corner verts resolve to one global nearest).
-        conform_boundary(&mut fine, of, &[(0, &cx.boundary[1]), (4, &cz.boundary[5])]);
-
-        // The −X fine boundary must weld onto the X-neighbour; the −Z fine boundary onto the Z-neighbour.
-        assert_eq!(unwelded_boundary_verts(&fine, of, 0, &cx, 1, 1e-4), 0, "−X boundary unwelded at corner");
-        assert_eq!(unwelded_boundary_verts(&fine, of, 4, &cz, 5, 1e-4), 0, "−Z boundary unwelded at corner");
-    }
-
-    #[test]
-    fn conform_snaps_to_nearest_and_drops_degenerate() {
-        // Pure-fn check: two fine boundary verts that map into one coarse cell both snap onto that coarse
-        // vertex (exact pos + normal), and the fine triangle spanning them collapses to a degenerate that is
-        // dropped. A synthetic fine chunk: two boundary verts on the −X face (bit 0) sharing a triangle.
-        let cpos = Vec3::new(0.0, 0.5, 0.5);
-        let cnrm = Vec3::new(-1.0, 0.0, 0.0);
-        let coarse = vec![BoundaryLoop {
-            verts: vec![BoundaryVert { pos: cpos, normal: cnrm, cell: IVec2::new(0, 0), idx: 0 }],
-        }];
-        // Fine: 3 verts (idx 0,1 boundary near cpos; idx 2 interior), one triangle (0,1,2).
-        let origin = Vec3::ZERO;
-        let mut data = ChunkMeshData {
-            positions: vec![[0.0, 0.4, 0.5], [0.0, 0.6, 0.5], [0.5, 0.5, 0.5]],
-            normals: vec![[-0.9, 0.1, 0.0], [-0.9, -0.1, 0.0], [1.0, 0.0, 0.0]],
-            colors: vec![[1.0; 4]; 3],
-            indices: vec![0, 1, 2],
-            material: 0,
-            boundary: std::array::from_fn(|_| Vec::new()),
-        };
-        // Both fine boundary verts map to coarse cell (0,0) (their cell ÷2 = 0).
-        data.boundary[0] = vec![BoundaryLoop {
-            verts: vec![
-                BoundaryVert { pos: Vec3::new(0.0, 0.4, 0.5), normal: Vec3::ZERO, cell: IVec2::new(0, 0), idx: 0 },
-                BoundaryVert { pos: Vec3::new(0.0, 0.6, 0.5), normal: Vec3::ZERO, cell: IVec2::new(1, 0), idx: 1 },
-            ],
-        }];
-        conform_boundary(&mut data, origin, &[(0, &coarse)]);
-
-        assert_eq!(data.positions[0], [cpos.x, cpos.y, cpos.z], "vert 0 snapped to coarse pos");
-        assert_eq!(data.positions[1], [cpos.x, cpos.y, cpos.z], "vert 1 snapped to coarse pos");
-        assert_eq!(data.normals[0], [cnrm.x, cnrm.y, cnrm.z], "vert 0 adopted coarse normal");
-        assert!(data.indices.is_empty(), "the collapsed triangle (two corners on one coarse vert) is dropped");
-    }
-
-    #[test]
-    fn reproject_lands_on_surface() {
-        // A vertex sitting INSIDE the true surface (mimicking Surface Nets' h²·curvature shrinkage) must
-        // re-project back ONTO the iso-surface (|f| ≈ 0) — this is the shrinkage fix. The analytic normal
-        // is radially outward on a sphere.
-        let edits = [sphere_edit(Vec3::ZERO, 1.5)];
-        let idx = [0u32];
-        let start = Vec3::new(1.5 - 0.06, 0.0, 0.0); // ~0.06 inside the +X pole
-        let (p, n) = reproject_to_surface(&edits, &idx, start, 0.2);
-        let d = edits::fold_csg_dist_indexed(&edits, &idx, p);
-        assert!(d.abs() < 1e-3, "vertex not on surface after reprojection: f={d}");
-        assert!(n.dot(Vec3::X) > 0.99, "normal not radially outward: {n:?}");
-    }
-
-    #[test]
-    fn reproject_welds_across_index_supersets() {
-        // WELDING contract: re-projection is a pure function of world position + the RELEVANT field. A chunk
-        // that folds an extra distant edit must land its shared boundary vertex at the same place as a
-        // neighbour that doesn't — else cross-chunk seams. A far second sphere must not perturb a projection
-        // on the first sphere's surface.
-        let edits = [sphere_edit(Vec3::ZERO, 1.5), sphere_edit(Vec3::new(100.0, 0.0, 0.0), 1.5)];
-        let start = Vec3::new(1.45, 0.0, 0.0);
-        let (p_all, _) = reproject_to_surface(&edits, &[0, 1], start, 0.2);
-        let (p_one, _) = reproject_to_surface(&edits, &[0], start, 0.2);
-        assert!(
-            (p_all - p_one).length() < 1e-5,
-            "distant edit perturbed the projection ({p_all:?} vs {p_one:?}) → cross-chunk seam"
+            "coarse (with transition face) + fine must weld watertight by construction"
         );
     }
 
@@ -1947,12 +1327,16 @@ mod tests {
     }
 
     #[test]
-    fn no_camera_is_lod0_everywhere_no_skirts() {
+    fn no_camera_is_lod0_everywhere_no_transition_faces() {
         let (cfg, mc) = cfgs();
         let k = 4;
         let half0 = lod0_half_chunks(&cfg, &mc, k);
         assert!(mesh_chunk_in_shell(chunk(&cfg, k, 0, 9), &cfg, k, None, half0), "LOD 0 everywhere");
         assert!(!mesh_chunk_in_shell(chunk(&cfg, k, 1, 9), &cfg, k, None, half0), "no LOD>0 w/o camera");
-        assert_eq!(chunk_face_flags(chunk(&cfg, k, 0, 3), &cfg, k, None, half0), 0, "no skirts w/o camera");
+        assert_eq!(
+            chunk_finer_faces(chunk(&cfg, k, 0, 3), &cfg, k, None, half0),
+            0,
+            "no transition faces w/o camera"
+        );
     }
 }

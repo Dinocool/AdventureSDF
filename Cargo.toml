@@ -123,12 +123,7 @@ emath = "0.33"
 # &[u8] for buffer upload via `cast_slice`. `derive` for `#[derive(Pod, Zeroable)]` on those
 # `#[repr(C)]` structs (see `sdf_render::render::gpu`), replacing hand-rolled `to_le_bytes` packing.
 bytemuck = { version = "1", features = ["derive"] }
-# CPU Surface Nets meshing of the SDF brick field — the SDF→mesh bake migration (see
-# docs/MESH_BAKE_PLAN.md / MESH_BAKE_RESEARCH.md). Off-the-shelf (bonsairobo); `ndshape` provides the
-# const grid shape. We sample our OWN CPU SDF (`edits::fold_csg`) into the grid, so there's no GPU
-# readback. (`bevy-sculpter` is the Bevy 0.18 SN integration reference but is early/breaking — not a dep.)
-fast-surface-nets = "0.2"
-ndshape = "0.3"
+transvoxel = "2.0.0"
 
 [dev-dependencies]
 # spv-out: emit SPIR-V from naga in tests so we can inspect which opcode signed `%`
