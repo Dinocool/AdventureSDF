@@ -35,9 +35,9 @@ pub const CHUNK_BRICKS: i32 = 4;
 pub const CHUNK_VOLUME: u32 = (CHUNK_BRICKS * CHUNK_BRICKS * CHUNK_BRICKS) as u32; // 64
 /// Bias added to each signed chunk-axis index so it fits an unsigned 16-bit key field.
 /// ±32768 chunks/axis — at LOD0 (chunk ≈ 2.8 m) that's ±90 km, ample for a several-km
-/// world; coarser LODs reach exponentially further. Mirrored verbatim in
-/// `bindings.wgsl::abs_chunk_key`; the `wgsl_chunk_constants_match_rust` test guards
-/// against silent drift (a mismatch reintroduces the camera-shift / blank-world bug).
+/// world; coarser LODs reach exponentially further. (Was mirrored in the surface shader's
+/// `bindings.wgsl::abs_chunk_key`, removed in the mesh-bake pivot; the chunk directory is now
+/// CPU-only, so there is no GPU duplication to guard.)
 pub const KEY_BIAS: i32 = 1 << 15;
 
 /// Absolute chunk identity: LOD level + chunk coord on that level's chunk lattice
@@ -1022,51 +1022,11 @@ mod tests {
         }
     }
 
-    /// The chunk-addressing constants are hand-duplicated in `bindings.wgsl`
-    /// (`abs_chunk_key` / `local_brick_index`) because WGSL can't import Rust consts.
-    /// A silent mismatch there makes the GPU search a different key than the CPU stored
-    /// → the camera-shift / blank-world bug class this clipmap rework fixed. This test
-    /// parses the shader and pins both constants to the Rust source of truth, so any
-    /// future edit to one side without the other fails CI instead of shipping a
-    /// hard-to-trace visual corruption.
-    #[test]
-    fn wgsl_chunk_constants_match_rust() {
-        let src = std::fs::read_to_string(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/assets/shaders/sdf/bindings.wgsl"
-        ))
-        .expect("read bindings.wgsl");
-
-        // Helper: find `pat` and parse the integer literal that follows it.
-        let int_after = |pat: &str| -> i64 {
-            let i = src
-                .find(pat)
-                .unwrap_or_else(|| panic!("bindings.wgsl missing `{pat}`"));
-            let tail = &src[i + pat.len()..];
-            let digits: String = tail
-                .trim_start()
-                .chars()
-                .take_while(|c| c.is_ascii_digit())
-                .collect();
-            digits
-                .parse()
-                .unwrap_or_else(|_| panic!("no integer after `{pat}` in bindings.wgsl"))
-        };
-
-        // `const CHUNK_BRICKS: i32 = 4;`
-        let wgsl_chunk_bricks = int_after("const CHUNK_BRICKS: i32 =");
-        assert_eq!(
-            wgsl_chunk_bricks, CHUNK_BRICKS as i64,
-            "WGSL CHUNK_BRICKS ({wgsl_chunk_bricks}) != Rust chunk::CHUNK_BRICKS ({CHUNK_BRICKS})"
-        );
-
-        // `let bias = 32768;` inside abs_chunk_key — must equal Rust KEY_BIAS.
-        let wgsl_bias = int_after("let bias =");
-        assert_eq!(
-            wgsl_bias, KEY_BIAS as i64,
-            "WGSL chunk key bias ({wgsl_bias}) != Rust chunk::KEY_BIAS ({KEY_BIAS})"
-        );
-    }
+    // (Removed `wgsl_chunk_constants_match_rust`: it pinned the chunk-addressing constants against
+    // their duplication in the surface shader's `bindings.wgsl`, which was deleted in the mesh-bake
+    // pivot. No GPU shader mirrors these constants anymore — the chunk directory is CPU-only now —
+    // so there is nothing left to guard. Re-add this guard if a future cloud-raymarch shader
+    // re-introduces a GPU-side chunk-key duplication.)
 
     // --- Chunk-table build ↔ shader-resolve round-trip ------------------------------
 

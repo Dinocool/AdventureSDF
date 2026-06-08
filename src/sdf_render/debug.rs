@@ -18,8 +18,7 @@ use super::atlas::{BRICK_EDGE, BRICK_VOXELS, SdfAtlas};
 use super::bvh::Bvh;
 use super::{
     CsgKind, RayStepCapture, SdfCamera, SdfGridConfig, SdfMaterial, SdfOp, SdfOrbitCamera,
-    DdgiParams, SdfOrder, SdfOverlayGizmos, SdfPrimitive, SdfRaymarchParams, SdfVolume,
-    WireframeBoundsVisible, picking,
+    SdfOrder, SdfOverlayGizmos, SdfPrimitive, SdfVolume, WireframeBoundsVisible, picking,
 };
 
 // --- Resources ---
@@ -39,12 +38,6 @@ pub struct SdfAtlasStats {
     pub blend_bytes: u64,
     pub lookup_bytes: u64,
     pub total_bytes: u64,
-    // DDGI probes: one block of `subdiv³` octahedral probes per FINEST-resident brick (the compact
-    // clipmap-bounded set). `probe_bytes` is the irradiance buffer; `probe_redundancy` = all-LOD bricks /
-    // finest probes (how much the finest-resident collapse saves vs the old all-LOD sizing).
-    pub probe_count: u32,
-    pub probe_bytes: u64,
-    pub probe_redundancy: f32,
 }
 
 /// Controls the BVH wireframe overlay (drawn via [`draw_bvh`]).
@@ -149,165 +142,25 @@ fn register_shader_modes(app: &mut App) {
     app.init_resource::<ShaderDebugRegistry>();
     app.init_resource::<ShaderDebugState>();
 
-    let overlay = |id: &str, label: &str, define: &str, desc: &str| ShaderDebugMode {
-        id: id.into(),
-        label: label.into(),
-        shader_define: define.into(),
-        kind: DebugModeKind::Exclusive {
-            group: "sdf_overlay".into(),
-        },
-        description: desc.into(),
-    };
-
-    // Deferred G-buffer visualizers — `#ifdef`-gated early returns in the deferred lit pass
-    // (sdf_deferred_lit.wgsl), which holds every G-buffer channel. Exclusive group: at most one
-    // active. The lit pipeline rebuilds on def change so these compile in/out.
+    // The on-screen SDF surface raymarch (and its deferred-lit G-buffer visualizers + march
+    // feature toggles) was removed in the mesh-bake pivot, so those shader-debug modes are gone.
+    // The only surviving mode drives a BAKE feature, not a render pass: `sdf/grad_normals` toggles
+    // whether the GPU brick-bake fills the per-voxel gradient atlas (`sync_gradient_bake_flag`).
     let mut registry = app.world_mut().resource_mut::<ShaderDebugRegistry>();
-    registry.register(overlay(
-        "sdf/albedo",
-        "Albedo",
-        "SDF_DEBUG_ALBEDO",
-        "G-buffer albedo (base colour)",
-    ));
-    registry.register(overlay(
-        "sdf/normals",
-        "Normals",
-        "SDF_DEBUG_NORMALS",
-        "G-buffer world normal as RGB",
-    ));
-    registry.register(overlay(
-        "sdf/metallic",
-        "Metallic",
-        "SDF_DEBUG_METALLIC",
-        "G-buffer metallic (greyscale)",
-    ));
-    registry.register(overlay(
-        "sdf/roughness",
-        "Roughness",
-        "SDF_DEBUG_ROUGHNESS",
-        "G-buffer roughness (greyscale)",
-    ));
-    registry.register(overlay(
-        "sdf/emissive",
-        "Emissive",
-        "SDF_DEBUG_EMISSIVE",
-        "G-buffer emissive radiance",
-    ));
-    registry.register(overlay(
-        "sdf/sun_vis",
-        "Sun vis",
-        "SDF_DEBUG_SUN_VIS",
-        "Marched sun visibility (white = lit, black = shadowed)",
-    ));
-    registry.register(overlay(
-        "sdf/depth",
-        "Depth",
-        "SDF_DEBUG_DEPTH",
-        "Camera distance (scaled greyscale)",
-    ));
-    registry.register(overlay(
-        "sdf/lod",
-        "LOD blend",
-        "SDF_DEBUG_LOD",
-        "Continuous rendered LOD as a hue ramp (red = LOD 0 → blue); the cross-fade band reads as a gradient between two LOD hues",
-    ));
-    registry.register(overlay(
-        "sdf/step_count",
-        "Steps",
-        "SDF_DEBUG_STEP_COUNT",
-        "Raymarch step-count heatmap (blue = few → red = at the budget); step-capped pixels (e.g. grazing hill crests) glow red",
-    ));
-    registry.register(overlay(
-        "sdf/gi",
-        "GI",
-        "SDF_DEBUG_GI",
-        "DDGI indirect irradiance term only (albedo × probe GI × intensity), no direct/emissive",
-    ));
-    registry.register(overlay(
-        "sdf/probe_lod",
-        "Probe LOD",
-        "SDF_DEBUG_PROBE_LOD",
-        "Finest-resident DDGI probe LOD as a hue ramp (LOD0 red → coarse blue) — the clipmap annuli of the probe allocation; black = no probe (coverage hole)",
-    ));
-    registry.register(overlay(
-        "sdf/probe_coverage",
-        "Probe coverage",
-        "SDF_DEBUG_PROBE_COVERAGE",
-        "DDGI probe coverage: green = a finest-resident probe covers the pixel, magenta = uncovered (GI hole)",
-    ));
-
-    // Independent toggle (not part of the overlay group): bypass the per-ray chunk
-    // lookup cache, forcing a fresh binary search every probe. If enabling this fixes a
-    // visual artifact, the cache is the cause. Diagnostic — leave OFF normally.
-    registry.register(ShaderDebugMode {
-        id: "sdf/no_chunk_cache".into(),
-        label: "No chunk cache".into(),
-        shader_define: "SDF_DISABLE_CHUNK_CACHE".into(),
-        kind: DebugModeKind::Toggle,
-        description: "Bypass the per-ray chunk lookup cache (always binary-search)".into(),
-    });
-
-    // Independent toggle: force LOD 0 only (no clipmap shells). If enabling this fixes a
-    // visual artifact, the bug is LOD/shell related. Diagnostic — leave OFF normally.
-    registry.register(ShaderDebugMode {
-        id: "sdf/disable_lod".into(),
-        label: "LOD 0 only".into(),
-        shader_define: "SDF_DISABLE_LOD".into(),
-        kind: DebugModeKind::Toggle,
-        description: "Force LOD 0 only (disable clipmap shells)".into(),
-    });
-
-    // Independent toggle: linear chunk-table scan instead of the binary search. If enabling
-    // this fixes a visual artifact, the cause is the binary search / table sortedness / the
-    // grid_dims.w count bound.
-    registry.register(ShaderDebugMode {
-        id: "sdf/linear_chunk_search".into(),
-        label: "Linear chunk search".into(),
-        shader_define: "SDF_LINEAR_CHUNK_SEARCH".into(),
-        kind: DebugModeKind::Toggle,
-        description: "Brute-force linear chunk lookup (bypass binary search)".into(),
-    });
-
-    // PBR feature toggles (independent checkboxes, not exclusive overlays). These
-    // gate real shading features behind shader-defs so their cost is opt-in/measurable.
-    // (Sun shadows are marched in the G-buffer pass and consumed by the combine pass.)
-    registry.register(ShaderDebugMode {
-        id: "sdf/shadows".into(),
-        label: "Shadows".into(),
-        shader_define: "SDF_SHADOWS".into(),
-        kind: DebugModeKind::Toggle,
-        description: "SDF soft shadows (sun-visibility ray marched into the G-buffer)".into(),
-    });
-    registry.register(ShaderDebugMode {
-        id: "sdf/edge_wear".into(),
-        label: "Edge wear".into(),
-        shader_define: "SDF_EDGE_WEAR".into(),
-        kind: DebugModeKind::Toggle,
-        description: "Convex-edge wear from the edge map (2 extra texture taps per hit pixel)"
-            .into(),
-    });
     registry.register(ShaderDebugMode {
         id: "sdf/grad_normals".into(),
         label: "Gradient normals".into(),
         shader_define: "SDF_GRAD_NORMALS".into(),
         kind: DebugModeKind::Toggle,
-        description: "Shade normals from the baked per-voxel gradient atlas (1 fetch vs the 5-tap \
-            finite difference — sharper + cheaper). Enabling bakes the gradient atlas (extra VRAM), \
-            so toggling triggers a one-time re-bake."
+        description: "Bake the per-voxel gradient atlas (extra VRAM). Drives the bake only; \
+            toggling triggers a one-time re-bake."
             .into(),
     });
-    // Note: height-map relief is baked into the SDF field (see sdf_render::height) — no shader
-    // toggle. Strength is the per-material "Relief depth" (Inspect panel).
 
-    // Default sun shadows ON so the lit render shows them without hunting for the checkbox. The
-    // state resource is separate from the registry; seed it after the `registry` borrow above
-    // ends (NLL drops it at last use).
+    // Gradient normals ON by default. `sync_gradient_bake_flag` turns this into
+    // `bake_gradient = true`, so the gradient atlas bakes (the standing VRAM is accepted).
     {
         let mut state = app.world_mut().resource_mut::<ShaderDebugState>();
-        state.set("sdf/shadows", true);
-        // Gradient normals ON by default: the baked-gradient normal (1 fetch) is sharper + cheaper
-        // than the 5-tap finite difference. `sync_gradient_bake_flag` turns this into
-        // `bake_gradient = true`, so the gradient atlas bakes (the standing VRAM is accepted).
         state.set("sdf/grad_normals", true);
     }
 }
@@ -350,11 +203,7 @@ fn atlas_byte_breakdown(bricks: u64, mat_bricks: u64, grad_bricks: u64) -> (u64,
     (dist, mat, grad, lookup, dist + mat + grad + lookup)
 }
 
-fn update_atlas_stats(
-    mut stats: ResMut<SdfAtlasStats>,
-    atlas: Res<SdfAtlas>,
-    ddgi: Res<super::DdgiParams>,
-) {
+fn update_atlas_stats(mut stats: ResMut<SdfAtlasStats>, atlas: Res<SdfAtlas>) {
     let total = atlas.bricks.len() as u64;
     let mat_bricks = atlas.mat_tiles.len() as u64;
     // Gradient is dense (one tile per brick) but only baked when the feature is on.
@@ -368,16 +217,6 @@ fn update_atlas_stats(
     stats.total_bytes = total_bytes;
 
     stats.total_bricks = total as u32;
-    // DDGI: subdiv³ octahedral probes per FINEST-resident brick (the compact, clipmap-bounded set);
-    // the irradiance buffer is PROBE_OCT_TEXELS vec4<f32> (16 B) per probe. Sized by the per-brick
-    // finest high-water — NOT all resident bricks (which the old scheme paid for at every LOD).
-    let subdiv = ddgi.subdiv.clamp(1, 4) as u64;
-    let finest = atlas.live_chunks.probe_high_water() as u64;
-    let probes = finest * subdiv * subdiv * subdiv;
-    stats.probe_count = probes as u32;
-    stats.probe_bytes = probes * super::probe::PROBE_OCT_TEXELS as u64 * 16;
-    // Redundancy eliminated: all-LOD resident bricks vs the finest-resident probe set.
-    stats.probe_redundancy = total as f32 / finest.max(1) as f32;
     // 2D-tiled dims (matches the render atlas + preview): tiles wrap at 256/row.
     let tiles_per_row: u32 = 256;
     let num_rows = (total as u32).div_ceil(tiles_per_row).max(1);
@@ -589,133 +428,10 @@ fn draw_bounds(
 
 // --- Panels ---
 
-/// Combined render-tuning panel: debug-overlay selection (dropdowns + diagnostics)
-/// plus the raymarch quality sliders. One tab for "how the SDF is drawn".
+/// SDF bake-feature toggles. The surface raymarch (and its quality sliders) was removed in the
+/// mesh-bake pivot; what remains is the gradient-bake toggle (`debug_modes_ui` renders it).
 fn render_panel(world: &mut World, ui: &mut egui::Ui) {
     debug_modes_ui(world, ui);
-
-    ui.separator();
-    ui.label("Raymarch");
-    let mut params = world.resource_mut::<SdfRaymarchParams>();
-    ui.add(egui::Slider::new(&mut params.max_steps, 16..=512).text("Steps"));
-    ui.add(
-        egui::Slider::new(&mut params.max_dist, 10.0..=1_000_000.0)
-            .logarithmic(true)
-            .text("Max Dist"),
-    );
-    ui.add(egui::Slider::new(&mut params.sdf_eps, 0.0001..=0.1).text("Epsilon"));
-    ui.add(egui::Slider::new(&mut params.lod_blend_band, 0.0..=0.5).text("LOD Blend Band"));
-    ui.add(
-        egui::Slider::new(&mut params.shadow_softness, 0.0..=256.0)
-            .text("Shadow Softness")
-            .custom_formatter(|v, _| {
-                if v <= 0.0 {
-                    "0 (hard)".to_string()
-                } else {
-                    format!("{v:.0} (higher = sharper)")
-                }
-            }),
-    );
-    // How many point lights cast SDF shadows per pixel (brightest-first of those reaching the
-    // surface); the rest add unshadowed. Higher = more shadowed lights but costlier; 0 = none.
-    ui.add(
-        egui::Slider::new(&mut params.shadow_light_cap, 0..=32).text("Shadow lights"),
-    );
-    ui.separator();
-    ui.label("DDGI (Global Illumination — always on)");
-    // Live probe stats (finest-resident, clipmap-bounded): probe count, irradiance-buffer size, and the
-    // redundancy the finest collapse eliminated vs the old all-LOD sizing.
-    {
-        let stats = world.resource::<SdfAtlasStats>();
-        ui.label(format!(
-            "Probes: {} finest · {:.1} MiB · {:.1}× redundancy removed",
-            stats.probe_count,
-            stats.probe_bytes as f64 / (1u64 << 20) as f64,
-            stats.probe_redundancy,
-        ));
-        let rel = world.resource::<super::ProbeRelevanceSet>();
-        if rel.total > 0 {
-            ui.label(format!(
-                "Relevance cull: {} / {} finest chunks off-screen ({:.0}% throttled)",
-                rel.culled,
-                rel.total,
-                100.0 * rel.culled as f32 / rel.total as f32,
-            ));
-        }
-    }
-    let mut ddgi = world.resource_mut::<DdgiParams>();
-    ui.add(
-        egui::Slider::new(&mut ddgi.subdiv, 1..=4)
-            .text("Probe subdiv (LOD0 density)")
-            .custom_formatter(|v, _| format!("{v:.0} ({:.0}³/brick)", v)),
-    );
-    ui.add(egui::Slider::new(&mut ddgi.ray_count, 8..=256).text("Rays / probe"));
-    ui.add(
-        egui::Slider::new(&mut ddgi.update_stride, 1..=16)
-            .text("Update stride (1/N probes per frame)"),
-    );
-    ui.add(
-        egui::Slider::new(&mut ddgi.max_probe_chunks_per_frame, 0..=4096)
-            .text("Max probe-chunks / frame (0 = ∞, nearest-first)"),
-    );
-    ui.checkbox(&mut ddgi.classify_enabled, "Classify (settled probes go dormant)");
-    ui.add_enabled(
-        ddgi.classify_enabled,
-        egui::Slider::new(&mut ddgi.dormant_stride, 4..=128).text("Dormant stride (converged re-trace)"),
-    );
-    // Distant-probe cost controls (cut the dominant trace cost in the far field).
-    ui.add(egui::Slider::new(&mut ddgi.probe_halve_lod, 1..=10).text("Halve density ≥ LOD"));
-    ui.add(egui::Slider::new(&mut ddgi.ray_falloff_lod, 1..=10).text("Distant rays ≥ LOD"));
-    ui.add(egui::Slider::new(&mut ddgi.distant_ray_count, 8..=256).text("Distant ray count"));
-    ui.add(egui::Slider::new(&mut ddgi.gi_march_steps, 4..=48).text("GI march steps / ray"));
-    // View-relevance cull: throttle finest probes that are off-screen (the moving-camera saving).
-    ui.checkbox(&mut ddgi.relevance_cull, "Relevance cull (throttle off-screen probes)");
-    ui.add_enabled_ui(ddgi.relevance_cull, |ui| {
-        ui.add(
-            egui::Slider::new(&mut ddgi.cull_off_stride, 8..=256)
-                .text("Off-screen stride (1/N re-trace)"),
-        );
-        ui.add(
-            egui::Slider::new(&mut ddgi.cull_near_radius, 0.0..=64.0)
-                .text("Always-relevant near radius (m)"),
-        );
-        ui.add(
-            egui::Slider::new(&mut ddgi.cull_cone_dot, -1.0..=0.5)
-                .text("View-cone cull (−1 off … 0 rear)"),
-        );
-    });
-    ui.add(
-        egui::Slider::new(&mut ddgi.gi_range, 4.0..=200.0)
-            .logarithmic(true)
-            .text("GI ray range (world units)"),
-    );
-    ui.add(
-        egui::Slider::new(&mut ddgi.hysteresis, 0.0..=0.99)
-            .text("Accumulation (N_max = 1/(1−h))"),
-    );
-    ui.add(egui::Slider::new(&mut ddgi.intensity, 0.0..=8.0).text("Intensity"));
-    ui.add(egui::Slider::new(&mut ddgi.gi_sky_intensity, 0.0..=2.0).text("Sky GI intensity"));
-    ui.checkbox(&mut ddgi.gi_bounce_shadows, "Bounce shadows (sun + points)");
-    ui.add(egui::Slider::new(&mut ddgi.normal_bias, 0.0..=2.0).text("Normal bias (×cell)"));
-    ui.add(egui::Slider::new(&mut ddgi.view_bias, 0.0..=2.0).text("View bias (×cell)"));
-    ui.add(
-        egui::Slider::new(&mut ddgi.gi_blur_depth_sigma, 0.01..=1.0)
-            .logarithmic(true)
-            .text("GI blur depth tol"),
-    );
-    ui.add(
-        egui::Slider::new(&mut ddgi.gi_blur_normal_power, 1.0..=64.0)
-            .text("GI blur normal stop"),
-    );
-    // Probe buffer ceiling (MiB). The probe count is clamped to this (capped further by the device
-    // binding limit); over-budget probes go inactive. Sized in whole MiB for a readable slider.
-    let mut budget_mib = ddgi.probe_budget_bytes / (1 << 20);
-    if ui
-        .add(egui::Slider::new(&mut budget_mib, 64..=2048).text("Probe budget (MiB)"))
-        .changed()
-    {
-        ddgi.probe_budget_bytes = budget_mib.max(1) * (1 << 20);
-    }
 }
 
 fn ray_inspector_panel(world: &mut World, ui: &mut egui::Ui) {
@@ -884,7 +600,7 @@ pub fn spawn_sdf_primitive(world: &mut World, prim: SdfPrimitive) -> Entity {
             prim,
             SdfOp {
                 kind: CsgKind::Union,
-                smoothing: 0.0,
+                smoothing: 0.4,
             },
             SdfOrder(next_order),
             source,

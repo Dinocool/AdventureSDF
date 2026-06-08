@@ -33,6 +33,10 @@ pub struct MaterialAsset {
     /// Parallax relief depth (UV units) for the height map.
     #[serde(default = "default_parallax")]
     pub parallax_scale: f32,
+    /// Triplanar TILE density on the baked meshes: UV = world_pos × this. Larger = more tiles (denser);
+    /// e.g. 0.5 ≈ one tile per 2 world units. `#[serde(default)]` → `default_texture_scale` for legacy RON.
+    #[serde(default = "default_texture_scale")]
+    pub texture_scale: f32,
     /// Emissive (self-lit) colour, linear RGB. The material emits this × `emissive_intensity`
     /// as radiance regardless of incident light — and it feeds the GI, so a
     /// glowing object lights its surroundings. `#[serde(default)]` → black for legacy RON.
@@ -62,6 +66,11 @@ fn default_parallax() -> f32 {
     0.15
 }
 
+/// serde default for `texture_scale` (matches `MaterialDef::default`): 1 tile per 2 world units.
+fn default_texture_scale() -> f32 {
+    0.5
+}
+
 impl Default for MaterialAsset {
     fn default() -> Self {
         Self {
@@ -70,6 +79,7 @@ impl Default for MaterialAsset {
             metallic: 0.0,
             roughness: 1.0,
             parallax_scale: 0.15,
+            texture_scale: 0.5,
             emissive_color: [0.0, 0.0, 0.0],
             emissive_intensity: 0.0,
             texture: None,

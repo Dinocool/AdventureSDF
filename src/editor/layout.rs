@@ -146,6 +146,46 @@ pub fn load_current_layout(world: &mut World) {
     if let Ok(ron) = std::fs::read_to_string(current_layout_path()) {
         apply_layout(world, &ron);
     }
+    inject_new_panels(world);
+}
+
+/// Path to the persisted set of registered-panel ids we've shown before.
+fn known_panels_path() -> PathBuf {
+    editor_dir().join("known_panels.ron")
+}
+
+/// Surface registered panels that are GENUINELY NEW — added in a newer build and never shown before —
+/// so they appear once even behind a stale persisted layout, WITHOUT re-opening panels the user has
+/// deliberately closed (those stay in the known set). Seeds the known set on a fresh install. Called
+/// once at startup after the default dock build / persisted-layout apply.
+fn inject_new_panels(world: &mut World) {
+    let known: std::collections::HashSet<String> = std::fs::read_to_string(known_panels_path())
+        .ok()
+        .and_then(|s| ron::from_str(&s).ok())
+        .unwrap_or_default();
+    let (all_ids, new_panels): (Vec<String>, Vec<(EditorTab, DockSide)>) = {
+        let registry = world.resource::<DebugPanelRegistry>();
+        let mut all_ids = Vec::new();
+        let mut new_panels = Vec::new();
+        for side in [DockSide::Left, DockSide::Right, DockSide::Bottom] {
+            for p in registry.panels_for(side) {
+                all_ids.push(p.id.clone());
+                if !known.contains(&p.id) {
+                    new_panels.push((EditorTab::Registered(p.id.clone()), side));
+                }
+            }
+        }
+        (all_ids, new_panels)
+    };
+    for (tab, side) in new_panels {
+        if !panel_present(world.resource::<EditorDockState>(), &tab) {
+            set_panel_present(world, tab, side, true);
+        }
+    }
+    let _ = std::fs::create_dir_all(editor_dir());
+    if let Ok(s) = ron::to_string(&all_ids) {
+        let _ = std::fs::write(known_panels_path(), s);
+    }
 }
 
 /// System: persist the live layout when the app is exiting.

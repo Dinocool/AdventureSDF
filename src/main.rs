@@ -2,12 +2,10 @@ use bevy::pbr::wireframe::WireframePlugin;
 use bevy::prelude::*;
 #[cfg(feature = "editor")]
 use bevy::log::LogPlugin;
-use bevy::remote::RemotePlugin;
 use bevy::render::RenderPlugin;
 use bevy::render::render_resource::WgpuFeatures;
 use bevy::render::settings::{RenderCreation, WgpuSettings};
 use bevy::window::WindowResolution;
-use bevy_brp_extras::BrpExtrasPlugin;
 use bevy_rapier3d::prelude::*;
 
 /// Each editor run creates a `trace-<timestamp>.json` (our `editor::chrome_trace` layer) in
@@ -151,8 +149,6 @@ fn main() {
 
     app.add_plugins(default_plugins)
     .add_plugins(RapierPhysicsPlugin::<NoUserData>::default())
-    .add_plugins(RemotePlugin::default())
-    .add_plugins(BrpExtrasPlugin)
     .add_plugins(WireframePlugin::default())
     .add_plugins(adventure::node::NodePlugin)
     .add_plugins(adventure::scene_manager::SceneManagerPlugin)
@@ -160,6 +156,8 @@ fn main() {
     .add_plugins(adventure::assets::AssetsPlugin)
     .add_plugins(adventure::sdf_render::SdfScenePlugin)
     .add_plugins(adventure::sdf_render::render::SdfRenderPlugin)
+    // Phase-0 SDF→mesh bake spike (Surface Nets). Meshes the loaded scene; press F1 to view.
+    .add_plugins(adventure::sdf_render::mesh_bake::MeshBakePlugin)
     .add_plugins(adventure::gizmo_render::GizmoRenderPlugin)
     .add_plugins(adventure::camera::CameraPlugin)
     .add_plugins(adventure::player::PlayerPlugin)
@@ -172,6 +170,10 @@ fn main() {
 
     #[cfg(feature = "editor")]
     {
+        // FPS / frame-time diagnostics → DiagnosticsStore, read by the status-bar FPS counter +
+        // Performance panel. (Previously supplied transitively by the now-removed BRP plugin; not part
+        // of DefaultPlugins, so add it explicitly or the FPS counter reads nothing.)
+        app.add_plugins(bevy::diagnostic::FrameTimeDiagnosticsPlugin::default());
         // Per-pass GPU timing (timestamp queries) → DiagnosticsStore, surfaced in the Performance
         // panel and the chrome trace. Pairs with the timestamp features requested in wgpu_settings.
         app.add_plugins(bevy::render::diagnostic::RenderDiagnosticsPlugin);
