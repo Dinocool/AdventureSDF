@@ -118,6 +118,25 @@ fn registry_hash(reg: &MaterialRegistry) -> u64 {
 /// (Re)build the per-material `MeshMaterial` handles when the registry changes. Loads each material's source
 /// diffuse/normal PNGs (resolved via `MaterialTextureLibrary.variants[layer]`) as Bevy Images; an absent map
 /// uses a 1×1 fallback gated off by `has_*`.
+/// Load a texture with a TILING (Repeat) linear sampler — triplanar samples at `world_pos·scale`, far outside
+/// `[0,1]`, so the maps must wrap; the default ClampToEdge sampler stretches one edge texel across the surface.
+fn load_tiling(assets: &AssetServer, path: &std::path::Path) -> Handle<Image> {
+    use bevy::image::{
+        ImageAddressMode, ImageFilterMode, ImageLoaderSettings, ImageSampler, ImageSamplerDescriptor,
+    };
+    assets.load_with_settings(path.to_path_buf(), |s: &mut ImageLoaderSettings| {
+        s.sampler = ImageSampler::Descriptor(ImageSamplerDescriptor {
+            address_mode_u: ImageAddressMode::Repeat,
+            address_mode_v: ImageAddressMode::Repeat,
+            address_mode_w: ImageAddressMode::Repeat,
+            mag_filter: ImageFilterMode::Linear,
+            min_filter: ImageFilterMode::Linear,
+            mipmap_filter: ImageFilterMode::Linear,
+            ..default()
+        });
+    })
+}
+
 pub(crate) fn rebuild_mesh_materials(
     reg: Res<MaterialRegistry>,
     library: Res<MaterialTextureLibrary>,
@@ -147,8 +166,10 @@ pub(crate) fn rebuild_mesh_materials(
         let map_set = (def.tex_layers[0] != u32::MAX)
             .then(|| library.variants.get(def.tex_layers[0] as usize))
             .flatten();
-        let diffuse = map_set.and_then(|m| m.diffuse.as_ref()).map(|p| assets.load(p.clone()));
-        let normal = map_set.and_then(|m| m.normal.as_ref()).map(|p| assets.load(p.clone()));
+        // Load with a REPEAT sampler — triplanar UVs are `world_pos·scale` (far outside [0,1]), so the
+        // textures must tile; the default ClampToEdge sampler would stretch one texel across the surface.
+        let diffuse = map_set.and_then(|m| m.diffuse.as_ref()).map(|p| load_tiling(&assets, p));
+        let normal = map_set.and_then(|m| m.normal.as_ref()).map(|p| load_tiling(&assets, p));
 
         let base = StandardMaterial {
             // White when textured (the texture supplies colour); else the authored tint.
