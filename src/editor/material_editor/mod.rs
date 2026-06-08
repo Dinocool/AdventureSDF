@@ -75,6 +75,8 @@ pub fn material_editor_ui(world: &mut World, handle: &Handle<MaterialAsset>, ui:
                 edited.base_color[2] = rgb[2];
             }
         });
+        // World-units feather half-width at a CSG seam. Kept tight (≤1) on purpose: a wide band bleeds a
+        // second material across AIR GAPS between separate objects, not just at true contact seams.
         ui.add(egui::Slider::new(&mut edited.blend_softness, 0.0..=1.0).text("Blend softness"));
         ui.add(egui::Slider::new(&mut edited.metallic, 0.0..=1.0).text("Metallic"));
         ui.add(egui::Slider::new(&mut edited.roughness, 0.0..=1.0).text("Roughness"));

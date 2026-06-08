@@ -50,15 +50,15 @@ shader-debug = ["bevy_render/decoupled_naga"]
 fast = ["bevy/dynamic_linking"]
 
 [dependencies]
-# Pruned Bevy feature set: `default-features = false` then ONLY what this 3D + egui + BRP app
+# Pruned Bevy feature set: `default-features = false` then ONLY what this 3D + egui app
 # uses. Dropped vs Bevy's `2d`/`3d`/`ui` umbrella defaults (confirmed gone from `cargo tree`,
 # faster builds): audio (bevy_audio + rodio), glTF (bevy_gltf + the gltf parser), gamepad
 # (bevy_gilrs + gilrs), the `hdr` image loader, 2D sprite picking, and the
 # x11/wayland/webgl/android platform backends (Windows-only dev).
 # Kept: 3D PBR render + gizmos + post-process/AA, UI + text (HUD / ESC menu), scene
-# (world.scn.ron), mesh+ui picking (camera MeshRayCast), winit/window, state, remote (BRP),
+# (world.scn.ron), mesh+ui picking (camera MeshRayCast), winit/window, state,
 # tonemapping LUTs (the SDF HDR camera's Tonemapping pass — pulls ktx2+zstd), png/jpeg/bmp/tga.
-# (bevy_sprite + bevy_animation stay — pulled transitively by the UI/PBR features + rapier/brp.)
+# (bevy_sprite + bevy_animation stay — pulled transitively by the UI/PBR features + rapier.)
 bevy = { version = "0.18", default-features = false, features = [
     # app + platform
     "std", "multi_threaded", "async_executor", "reflect_auto_register",
@@ -72,10 +72,9 @@ bevy = { version = "0.18", default-features = false, features = [
     "common_api", "bevy_ui", "bevy_ui_render", "bevy_text",
     # scene + picking (mesh raycast for the camera; no 2D sprite picking)
     "bevy_scene", "bevy_picking", "mesh_picking", "ui_picking",
-    # remote control + image formats
-    "bevy_remote", "png", "jpeg", "bmp", "tga",
+    # image formats
+    "png", "jpeg", "bmp", "tga",
 ] }
-bevy_brp_extras = "0.18"
 bevy_rapier3d = "0.34.0"
 # Direct dep on the SAME bevy_render the `bevy` umbrella already uses (Cargo unifies it — no extra
 # build cost, no second copy) so `shader-debug` can flip its `decoupled_naga` feature (round-trips
@@ -124,6 +123,7 @@ emath = "0.33"
 # &[u8] for buffer upload via `cast_slice`. `derive` for `#[derive(Pod, Zeroable)]` on those
 # `#[repr(C)]` structs (see `sdf_render::render::gpu`), replacing hand-rolled `to_le_bytes` packing.
 bytemuck = { version = "1", features = ["derive"] }
+transvoxel = "2.0.0"
 
 [dev-dependencies]
 # spv-out: emit SPIR-V from naga in tests so we can inspect which opcode signed `%`
@@ -143,7 +143,7 @@ futures-lite = "2"
 opt-level = 1
 # Drop full debuginfo (level 2): line tables keep panic backtraces with file:line but skip the
 # heavy per-variable info, cutting compile + LLD link time and PDB size. We debug via logs /
-# BRP / Nsight, not a Rust stepper. (Shader/GPU debug info is separate — see `shader-debug`.)
+# Nsight, not a Rust stepper. (Shader/GPU debug info is separate — see `shader-debug`.)
 debug = "line-tables-only"
 
 [profile.dev.package."*"]

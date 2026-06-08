@@ -16,6 +16,10 @@ use super::*;
 /// min-binding-size (see `init_*_pipeline`). The actual data flows as `chunk::ChunkLookup` and is
 /// serialized by [`encode_lookup`]; this mirror is kept here, not on `chunk::ChunkLookup`, to
 /// preserve `chunk.rs`'s render-free purity. Its fields MUST match `chunk::ChunkLookup` byte-for-byte.
+///
+/// Only used as the `storage_buffer_read_only::<GpuChunkLookup>` min-binding-size marker in the
+/// removed surface bind-group layout; retained for the future cloud-raymarch atlas layout.
+#[allow(dead_code)]
 #[derive(ShaderType, Clone, Copy, Default)]
 pub(super) struct GpuChunkLookup {
     key_hi: u32,
@@ -31,7 +35,9 @@ pub(super) struct GpuChunkLookup {
 /// (20 bytes: distance tile origin + material tile origin, each `col_px | row_px<<16`, + packed
 /// 4-entry palette + DDGI probe slot). Like [`GpuChunkLookup`], the data flows as `chunk::BrickTile`
 /// (serialized by [`encode_tile`]); this mirror keeps the GPU derive out of the pure `chunk.rs`. Fields
-/// MUST match `chunk::BrickTile`.
+/// MUST match `chunk::BrickTile`. Like [`GpuChunkLookup`], only a layout marker for the removed
+/// surface bind group; retained for the future cloud-raymarch atlas layout.
+#[allow(dead_code)]
 #[derive(ShaderType, Clone, Copy, Default)]
 pub(super) struct GpuBrickTile {
     atlas_base: u32,

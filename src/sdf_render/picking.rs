@@ -134,7 +134,11 @@ pub fn pick_entity(bvh: &Bvh, ray: &Ray, edits: &[GatheredEdit]) -> Option<(Enti
     let mut candidates: Vec<u32> = Vec::new();
     bvh.raycast_candidates(ray.origin, ray.direction, max_dist, &mut candidates);
     if candidates.is_empty() {
-        return None;
+        // The BVH is an acceleration structure maintained by the GPU brick bake, which is now gated off
+        // by default (it's kept only as a future volumetric-cloud foundation). When it isn't built, fall
+        // back to testing EVERY edit so editor picking keeps working — picks are rare and edit counts are
+        // small. (A genuine ray miss also lands here and still returns `None` after the march below.)
+        candidates = (0..edits.len() as u32).collect();
     }
     let resolved: Vec<ResolvedEdit> = candidates
         .iter()

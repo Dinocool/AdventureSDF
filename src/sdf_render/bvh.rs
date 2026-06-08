@@ -1,9 +1,10 @@
 //! Flat, GPU-upload-ready bounding-volume hierarchy over per-edit influence AABBs.
 //!
-//! Used CPU-side to cull candidate edits per brick during baking and to accelerate
-//! picking/raycasting, and uploaded to the GPU (as raw [`GpuBvhNode`] bytes) to
-//! speed empty-space skipping in the raymarch. The node array is a flat `Vec`
-//! (no pointers) so the same layout serves both CPU traversal and std430 upload.
+//! Used CPU-side to cull candidate edits per chunk during the GPU brick bake and to
+//! accelerate editor picking/raycasting, and uploaded to the GPU (as raw [`GpuBvhNode`]
+//! bytes) for the bake's empty-space skipping. (The on-screen surface raymarch that also
+//! read it was removed in the mesh-bake pivot.) The node array is a flat `Vec` (no
+//! pointers) so the same layout serves both CPU traversal and std430 upload.
 
 use bevy::math::bounding::{Aabb3d, BoundingVolume};
 use bevy::prelude::*;
