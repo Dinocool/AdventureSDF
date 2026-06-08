@@ -208,6 +208,9 @@ pub struct SdfMaterial {
 /// `MaterialAsset` knobs. Texture maps are intentionally NOT overridable here yet — the
 /// texture always comes from the base file (scene-level texture override deferred).
 #[derive(Reflect, Clone, Debug, Default, PartialEq)]
+// `Default` so a scene serialized before a field was added (e.g. `texture_scale`) still FromReflects —
+// the omitted field fills from `Default` instead of failing the whole struct.
+#[reflect(Default)]
 pub struct MaterialFields {
     pub base_color: Option<[f32; 4]>,
     pub metallic: Option<f32>,
@@ -235,7 +238,9 @@ impl MaterialFields {
 /// - `asset: None` → a fully inline/procedural material defined entirely by `overrides`
 ///   (e.g. a freshly-spawned primitive's scatter colour).
 #[derive(Component, Reflect, Clone, Debug, Default, PartialEq)]
-#[reflect(Component)]
+// `Default` so the reflect scene-loader can fill fields OMITTED by an older serialized scene (e.g. a new
+// override field) from `Default` instead of failing FromReflect on the partial struct.
+#[reflect(Component, Default)]
 pub struct SdfMaterialSource {
     /// Base material file, relative to `assets/` (e.g. `materials/sand.material.ron`).
     pub asset: Option<std::path::PathBuf>,
