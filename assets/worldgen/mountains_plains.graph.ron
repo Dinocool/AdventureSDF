@@ -1,0 +1,77 @@
+(
+    graph: (
+        nodes: [
+            (
+                kind: Fbm((
+                    octaves: 3,
+                    base_freq: 0.0001220703125,
+                    lacunarity: 2.0,
+                    gain: 0.5,
+                    amplitude: 1.0,
+                    seed_salt: 12582913,
+                )),
+                inputs: (0, 0, 0),
+            ),
+            (
+                kind: Curve((
+                    points: [
+                        (-1.0, -1.0),
+                        (0.1, -0.6),
+                        (0.5, 0.4),
+                        (1.0, 1.0),
+                    ],
+                )),
+                inputs: (0, 0, 0),
+            ),
+            (
+                kind: Smoothstep(
+                    edge0: 0.1,
+                    edge1: 0.7,
+                ),
+                inputs: (1, 0, 0),
+            ),
+            (
+                kind: Fbm((
+                    octaves: 4,
+                    base_freq: 0.0013020833333333333,
+                    lacunarity: 2.0,
+                    gain: 0.5,
+                    amplitude: 8.0,
+                    seed_salt: 11599874,
+                )),
+                inputs: (0, 0, 0),
+            ),
+            (
+                kind: Offset(4.0),
+                inputs: (3, 0, 0),
+            ),
+            (
+                kind: Fbm((
+                    octaves: 6,
+                    base_freq: 0.0006510416666666666,
+                    lacunarity: 2.0,
+                    gain: 0.5,
+                    amplitude: 280.0,
+                    seed_salt: 11665411,
+                )),
+                inputs: (0, 0, 0),
+            ),
+            (
+                kind: Ridge(
+                    ridge: 0.85,
+                    amp_sum: 551.25,
+                ),
+                inputs: (5, 0, 0),
+            ),
+            (
+                kind: Offset(60.0),
+                inputs: (6, 0, 0),
+            ),
+            (
+                kind: Mix,
+                inputs: (4, 7, 2),
+            ),
+        ],
+        output: 8,
+    ),
+)

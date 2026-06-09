@@ -169,6 +169,10 @@ impl Plugin for WorldGenPlugin {
             .init_resource::<HeightParams>()
             .init_resource::<ErosionParams>()
             .init_resource::<WorldGenGpuRing>()
+            // Biome terrain graphs follow the same resource pipeline as materials (load/hot-reload/save).
+            .init_asset::<graph::GraphAsset>()
+            .register_asset_loader(graph::GraphAssetLoader)
+            .register_type::<graph::GraphAsset>()
             .insert_resource(LayerManager::new_clipmap(
                 WORLDGEN_SLICE_SEED,
                 HeightParams::default(),

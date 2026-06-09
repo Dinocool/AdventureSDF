@@ -7,8 +7,11 @@
 //! Bit-portable + deterministic like [`super::noise`] (f64 basic ops only). The engine is built up in
 //! staged increments: [`field`] (the dual-number value) first; nodes / graph eval / RON next.
 
+pub mod asset;
 pub mod field;
 pub mod node;
+pub mod preset;
 
+pub use asset::{GraphAsset, GraphAssetLoader};
 pub use field::Field;
 pub use node::{FbmAxis, Graph, GraphError, Node, NodeKind};

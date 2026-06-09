@@ -22,6 +22,10 @@ pub struct Field {
     pub dz: f64,
 }
 
+// `add`/`sub`/`mul`/`neg` here are the AUTODIFF field ops (e.g. `mul` is the product rule, NOT scalar
+// multiplication), deliberately named for readability at call sites rather than the `std::ops` traits —
+// implementing those would hide the dual-number semantics and invite accidental operator use.
+#[allow(clippy::should_implement_trait)]
 impl Field {
     /// A spatially-constant field (gradient zero).
     #[inline]
