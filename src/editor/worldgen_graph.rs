@@ -20,6 +20,7 @@ use crate::sdf_render::worldgen::graph::GraphAsset;
 use crate::sdf_render::worldgen::graph::node::{FbmAxis, Graph, Node, NodeKind};
 use crate::sdf_render::worldgen::graph::preset::MAX_GRAPH_NODES;
 use crate::sdf_render::worldgen::spline::Spline;
+use super::worldgen_gpu_preview::{GpuPreviewRequest, GpuPreviewRequests, GpuPreviewTextures};
 
 /// Default on-disk path the editor saves/loads the active biome graph to (the production graph the
 /// worldgen loads — see `WorldGenPlugin`'s asset hot-reload). Relative to the app's `assets/` root.
@@ -90,14 +91,21 @@ pub struct WorldGraphEditor {
     popped: Vec<PoppedPreview>,
     /// Set by the Viewer when the user clicks a node's pop-out button; the panel snapshots it after show.
     pop_request: Option<NodeId>,
+    /// Monotonic id source for popped windows (their stable GPU pool key).
+    next_pop_id: u64,
 }
 
 /// A node preview detached into its own floating window — carries its own nav path, view state, and
 /// texture so it stays live across navigation independently of the in-graph preview.
 struct PoppedPreview {
+    /// Stable id (the GPU pool slot key for this window — unchanged across rotate/zoom/nav).
+    id: u64,
     nav: Vec<NodeId>,
     node: NodeId,
     half: f64,
+    /// World-XZ pan centre (offset X/Y).
+    cx: f64,
+    cz: f64,
     size: f32,
     is3d: bool,
     cam: (f32, f32),
@@ -125,6 +133,7 @@ impl Default for WorldGraphEditor {
             enter: None,
             popped: Vec::new(),
             pop_request: None,
+            next_pop_id: 1,
         }
     }
 }
@@ -1392,25 +1401,59 @@ fn graph_panel(world: &mut World, ui: &mut egui::Ui) {
             let cam = editor.cam.get(&node).copied().unwrap_or(CAM_DEFAULT);
             let size = editor.disp_px.get(&node).copied().unwrap_or(DEFAULT_PREVIEW_PX).max(260.0);
             let nav = editor.nav.clone();
-            editor.popped.push(PoppedPreview { nav, node, half, size, is3d, cam, tex: None, key: 0, open: true });
+            let id = editor.next_pop_id;
+            editor.next_pop_id += 1;
+            editor.popped.push(PoppedPreview {
+                id,
+                nav,
+                node,
+                half,
+                cx: 0.0,
+                cz: 0.0,
+                size,
+                is3d,
+                cam,
+                tex: None,
+                key: 0,
+                open: true,
+            });
         }
         // Render the popped-out preview windows (float above everything; drag anywhere incl. top panel).
-        let WorldGraphEditor { snarl, popped, .. } = &mut *editor;
-        for (i, p) in popped.iter_mut().enumerate() {
-            popped_preview_window(ui, i, p, snarl);
+        // 3D pop-outs render on the GPU: they READ last frame's GPU textures + PUSH this frame's requests
+        // into the shared pool (the inline previews stay on the cached CPU path).
+        let gpu_tex = world.get_resource::<GpuPreviewTextures>().map(|t| t.0.clone()).unwrap_or_default();
+        let mut gpu_reqs: Vec<GpuPreviewRequest> = Vec::new();
+        {
+            let WorldGraphEditor { snarl, popped, .. } = &mut *editor;
+            for p in popped.iter_mut() {
+                popped_preview_window(ui, p, snarl, &gpu_tex, &mut gpu_reqs);
+            }
+            popped.retain(|p| p.open);
         }
-        popped.retain(|p| p.open);
+        if !gpu_reqs.is_empty()
+            && let Some(mut reqs) = world.get_resource_mut::<GpuPreviewRequests>()
+        {
+            reqs.0.append(&mut gpu_reqs);
+        }
     });
 }
 
-/// Draw one popped-out preview as a floating, resizable `egui::Window`.
-fn popped_preview_window(ui: &egui::Ui, idx: usize, p: &mut PoppedPreview, root: &Snarl<EdNode>) {
+/// Draw one popped-out preview as a floating, resizable `egui::Window`. In **3D** it renders on the GPU
+/// (pushes a request into the shared pool, draws last frame's GPU texture, falls back to the CPU raymarch
+/// until the GPU texture is ready); in **2D** it's the CPU heatmap. `gpu_tex` is last frame's pool output.
+fn popped_preview_window(
+    ui: &egui::Ui,
+    p: &mut PoppedPreview,
+    root: &Snarl<EdNode>,
+    gpu_tex: &std::collections::HashMap<u64, egui::TextureId>,
+    gpu_reqs: &mut Vec<GpuPreviewRequest>,
+) {
     let mut open = p.open;
-    egui::Window::new(format!("Preview {}", idx + 1))
-        .id(egui::Id::new(("wg-pop", idx, p.node)))
+    egui::Window::new(format!("Preview {}", p.id))
+        .id(egui::Id::new(("wg-pop", p.id)))
         .open(&mut open)
         .resizable(true)
-        .default_size([p.size + 80.0, p.size + 40.0])
+        .default_size([p.size + 80.0, p.size + 60.0])
         .show(ui.ctx(), |ui| {
             let g = match resolve_snarl(root, &p.nav).map(|s| graph_rooted_at(s, p.node)) {
                 Some(Ok(g)) => g,
@@ -1420,7 +1463,7 @@ fn popped_preview_window(ui: &egui::Ui, idx: usize, p: &mut PoppedPreview, root:
                 }
             };
             ui.horizontal(|ui| {
-                if ui.selectable_label(p.is3d, "3D").on_hover_text("3D surface (drag to orbit)").clicked() {
+                if ui.selectable_label(p.is3d, "3D").on_hover_text("GPU 3D surface (drag to orbit)").clicked() {
                     p.is3d = !p.is3d;
                 }
                 let mut km = p.half * 2.0 / 1000.0;
@@ -1429,10 +1472,41 @@ fn popped_preview_window(ui: &egui::Ui, idx: usize, p: &mut PoppedPreview, root:
                 }
                 ui.add(egui::DragValue::new(&mut p.size).speed(2.0).range(96.0..=2048.0).suffix(" px"));
             });
+            if p.is3d {
+                ui.horizontal(|ui| {
+                    ui.label("offset");
+                    ui.add(egui::DragValue::new(&mut p.cx).speed(10.0).prefix("X ").suffix(" m"));
+                    ui.add(egui::DragValue::new(&mut p.cz).speed(10.0).prefix("Y ").suffix(" m"));
+                    if ui.button("center").clicked() {
+                        p.cx = 0.0;
+                        p.cz = 0.0;
+                    }
+                });
+            }
+
             let ppp = ui.ctx().pixels_per_point();
             let res = ((p.size * ppp).round() as usize).max(32);
-            let name = format!("wg-pop-tex-{idx}");
-            let tex = ensure_preview_texture(ui.ctx(), name, &g, p.half, res, p.is3d, p.cam, &mut p.tex, &mut p.key);
+            let tex = if p.is3d {
+                // GPU path: request a render for next frame; show last frame's (or CPU-raymarch fallback).
+                gpu_reqs.push(GpuPreviewRequest {
+                    key: p.id,
+                    graph: g.clone(),
+                    half: p.half,
+                    center: (p.cx, p.cz),
+                    yaw: p.cam.0,
+                    pitch: p.cam.1,
+                });
+                match gpu_tex.get(&p.id) {
+                    Some(&t) => t,
+                    None => {
+                        let name = format!("wg-pop-tex-{}", p.id);
+                        ensure_preview_texture(ui.ctx(), name, &g, p.half, res.min(160), true, p.cam, &mut p.tex, &mut p.key)
+                    }
+                }
+            } else {
+                let name = format!("wg-pop-tex-{}", p.id);
+                ensure_preview_texture(ui.ctx(), name, &g, p.half, res, false, p.cam, &mut p.tex, &mut p.key)
+            };
             let resp = ui.add(
                 egui::Image::new(egui::load::SizedTexture::new(tex, egui::vec2(p.size, p.size)))
                     .sense(egui::Sense::drag()),
