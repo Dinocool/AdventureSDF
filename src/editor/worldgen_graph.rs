@@ -41,11 +41,23 @@ pub struct WorldGraphEditor {
     path: String,
     /// Last save/load status message (shown in the toolbar).
     status: String,
+    /// Per-node 2D preview textures, recomputed each frame a node's preview is expanded (so param
+    /// edits are reflected live) and dropped when collapsed. Keyed by the Snarl node id.
+    previews: std::collections::HashMap<NodeId, egui::TextureHandle>,
+    /// Which nodes currently have their 2D preview expanded.
+    expanded: std::collections::HashSet<NodeId>,
 }
 
 impl Default for WorldGraphEditor {
     fn default() -> Self {
-        Self { snarl: Snarl::new(), seeded: false, path: DEFAULT_GRAPH_PATH.to_string(), status: String::new() }
+        Self {
+            snarl: Snarl::new(),
+            seeded: false,
+            path: DEFAULT_GRAPH_PATH.to_string(),
+            status: String::new(),
+            previews: std::collections::HashMap::new(),
+            expanded: std::collections::HashSet::new(),
+        }
     }
 }
 
@@ -118,6 +130,20 @@ pub fn snarl_to_graph(snarl: &Snarl<EdNode>) -> Result<Graph, String> {
     }
     let output_sink = output_sink.ok_or("graph has no Output node")?;
     let root = *src.get(&(output_sink, 0)).ok_or("the Output node has no input wired")?;
+    graph_rooted_at(snarl, root)
+}
+
+/// Convert the sub-graph feeding `root` (which must be an Op node) into an engine [`Graph`] whose output
+/// is that node. Shared by [`snarl_to_graph`] (root = the node wired to `Output`) and the per-node 2D
+/// preview (root = the previewed node). Errors on a cycle, an unconnected input, or too many nodes.
+pub fn graph_rooted_at(snarl: &Snarl<EdNode>, root: NodeId) -> Result<Graph, String> {
+    use std::collections::HashMap;
+
+    // Source feeding (node, input slot) → the upstream node id (every node has one output, pin 0).
+    let mut src: HashMap<(NodeId, usize), NodeId> = HashMap::new();
+    for (out, inp) in snarl.wires() {
+        src.insert((inp.node, inp.input), out.node);
+    }
 
     // Post-order DFS from the root over input edges → topological order; detect cycles.
     let mut order: Vec<NodeId> = Vec::new();
@@ -180,9 +206,14 @@ pub fn snarl_to_graph(snarl: &Snarl<EdNode>) -> Result<Graph, String> {
 // SnarlViewer — the node UI
 // ===================================================================================================
 
-struct Viewer;
+/// The Snarl UI viewer. Borrows the editor's per-node preview caches for the frame so each node can
+/// draw an expandable 2D heatmap of its own sub-graph output (see [`Viewer::show_body`]).
+struct Viewer<'a> {
+    previews: &'a mut std::collections::HashMap<NodeId, egui::TextureHandle>,
+    expanded: &'a mut std::collections::HashSet<NodeId>,
+}
 
-impl SnarlViewer<EdNode> for Viewer {
+impl SnarlViewer<EdNode> for Viewer<'_> {
     fn title(&mut self, node: &EdNode) -> String {
         match node {
             EdNode::Output => "Output".into(),
@@ -201,6 +232,51 @@ impl SnarlViewer<EdNode> for Viewer {
         match node {
             EdNode::Output => 0,
             EdNode::Op(_) => 1,
+        }
+    }
+
+    // Every Op node gets an expandable 2D preview in its body.
+    fn has_body(&mut self, node: &EdNode) -> bool {
+        matches!(node, EdNode::Op(_))
+    }
+
+    fn show_body(
+        &mut self,
+        node: NodeId,
+        _inputs: &[InPin],
+        _outputs: &[OutPin],
+        ui: &mut egui::Ui,
+        snarl: &mut Snarl<EdNode>,
+    ) {
+        let open = self.expanded.contains(&node);
+        let toggle = ui
+            .small_button(if open { "▾ Preview" } else { "▸ Preview" })
+            .on_hover_text("Expand a 2D top-down heatmap of THIS node's output over a ±2 km world window — updates live as you edit params upstream.");
+        if toggle.clicked() {
+            if open {
+                self.expanded.remove(&node);
+            } else {
+                self.expanded.insert(node);
+            }
+        }
+        if !self.expanded.contains(&node) {
+            self.previews.remove(&node); // free the GPU texture while collapsed
+            return;
+        }
+        // Re-evaluate the sub-graph rooted at this node over a grid → heatmap → texture (every frame so
+        // edits show immediately). An unconnected input just shows a hint instead of a preview.
+        match graph_rooted_at(snarl, node) {
+            Ok(g) => {
+                let img = render_field_preview(&g);
+                let handle =
+                    ui.ctx().load_texture(format!("wg-preview-{node:?}"), img, egui::TextureOptions::LINEAR);
+                ui.image(egui::load::SizedTexture::new(handle.id(), egui::vec2(128.0, 128.0)));
+                self.previews.insert(node, handle); // keep alive past paint; drops the prior frame's texture
+            }
+            Err(e) => {
+                self.previews.remove(&node);
+                ui.colored_label(egui::Color32::from_rgb(200, 150, 120), format!("connect inputs ({e})"));
+            }
         }
     }
 
@@ -334,6 +410,65 @@ fn node_kind_name(k: &NodeKind) -> &'static str {
 use egui_snarl::ui::SnarlPin;
 
 // ===================================================================================================
+// Per-node 2D preview
+// ===================================================================================================
+
+/// Heatmap resolution (px per side) of a node preview — small + recomputed every frame, so keep modest.
+const PREVIEW_RES: usize = 48;
+/// Half-extent (metres) of the world window each preview samples, centred on the origin.
+const PREVIEW_HALF_M: f64 = 2048.0;
+/// Seed used for previews (matches the default world seed so the heatmap mirrors the live terrain).
+const PREVIEW_SEED: u64 = 7;
+
+/// Evaluate a node's sub-[`Graph`] over a top-down grid, normalise to its own min/max, and colour-map
+/// it into an [`egui::ColorImage`] (terrain ramp: low = blue/green → high = white).
+fn render_field_preview(g: &Graph) -> egui::ColorImage {
+    let n = PREVIEW_RES;
+    let mut vals = vec![0.0f64; n * n];
+    let span_m = 2.0 * PREVIEW_HALF_M;
+    for j in 0..n {
+        for i in 0..n {
+            let wx = -PREVIEW_HALF_M + (i as f64 + 0.5) / n as f64 * span_m;
+            let wz = -PREVIEW_HALF_M + (j as f64 + 0.5) / n as f64 * span_m;
+            vals[j * n + i] = g.eval(wx, wz, PREVIEW_SEED).v;
+        }
+    }
+    let (mut lo, mut hi) = (f64::INFINITY, f64::NEG_INFINITY);
+    for &v in &vals {
+        if v.is_finite() {
+            lo = lo.min(v);
+            hi = hi.max(v);
+        }
+    }
+    let span = if hi > lo { hi - lo } else { 1.0 };
+    let pixels: Vec<egui::Color32> =
+        vals.iter().map(|&v| terrain_ramp((((v - lo) / span).clamp(0.0, 1.0)) as f32)).collect();
+    egui::ColorImage::new([n, n], pixels)
+}
+
+/// Map a normalised height `t∈[0,1]` to a terrain colour ramp (deep → grass → rock → snow).
+fn terrain_ramp(t: f32) -> egui::Color32 {
+    const STOPS: [(f32, [f32; 3]); 5] = [
+        (0.0, [0.12, 0.24, 0.47]),
+        (0.35, [0.24, 0.55, 0.35]),
+        (0.6, [0.47, 0.59, 0.27]),
+        (0.8, [0.55, 0.47, 0.35]),
+        (1.0, [0.94, 0.94, 0.96]),
+    ];
+    let mut c = STOPS[STOPS.len() - 1].1;
+    for w in STOPS.windows(2) {
+        let (t0, c0) = w[0];
+        let (t1, c1) = w[1];
+        if t <= t1 {
+            let f = if t1 > t0 { (t - t0) / (t1 - t0) } else { 0.0 };
+            c = [c0[0] + (c1[0] - c0[0]) * f, c0[1] + (c1[1] - c0[1]) * f, c0[2] + (c1[2] - c0[2]) * f];
+            break;
+        }
+    }
+    egui::Color32::from_rgb((c[0] * 255.0) as u8, (c[1] * 255.0) as u8, (c[2] * 255.0) as u8)
+}
+
+// ===================================================================================================
 // Panel
 // ===================================================================================================
 
@@ -405,10 +540,14 @@ fn graph_panel(world: &mut World, ui: &mut egui::Ui) {
             }
         });
 
+        // Disjoint borrows of the editor's fields: the snarl is the working graph; previews/expanded are
+        // the per-node preview caches the Viewer drives.
+        let WorldGraphEditor { snarl, previews, expanded, .. } = &mut *editor;
+        let mut viewer = Viewer { previews, expanded };
         SnarlWidget::new()
             .id(egui::Id::new("worldgen-biome-graph"))
             .style(SnarlStyle::new())
-            .show(&mut editor.snarl, &mut Viewer, ui);
+            .show(snarl, &mut viewer, ui);
     });
 }
 
