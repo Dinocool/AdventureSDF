@@ -383,36 +383,12 @@ pub fn eval_primitive(prim: &SdfPrimitive, p: Vec3, voxel_size: f32) -> f32 {
             //   EMPTY SPACE (a large POSITIVE distance), NOT a mid-band plane. This is NOT a
             //   corruption-hiding fallback — for a non-rendering query, unloaded ground correctly means
             //   "no surface here"; only the RENDERED path is strict.
-            let offset = crate::sdf_render::worldgen::upload::cpu_terrain_offset();
-            let world_xz =
-                bevy::math::DVec2::new((p.x + offset.x) as f64, (p.z + offset.y) as f64);
-            if voxel_size > 0.0 {
-                // RENDERING bake: strict — the coverage gate guarantees a covering tier here. Sample the
-                // tiered CLIPMAP (finest covering tier per voxel: fine near, coarse far out to the full
-                // mesh-bake reach), which PANICS on a miss (a rendered miss is a coverage-gate bug).
-                let clipmap = crate::sdf_render::worldgen::upload::cpu_height_clipmap().unwrap_or_else(|| {
-                    panic!(
-                        "terrain sampled outside loaded coverage — a rendering bake (voxel_size={voxel_size}) \
-                         ran before any height clipmap was built; the residency coverage gate should have \
-                         prevented this. world_xz={world_xz:?}"
-                    )
-                });
-                let node = crate::sdf_render::worldgen::upload::sample_clipmap_lod(
-                    &clipmap, world_xz, voxel_size,
-                );
-                p.y - node.height
-            } else {
-                // NON-RENDERING query: a miss is legitimately empty space → large POSITIVE distance.
-                match crate::sdf_render::worldgen::upload::cpu_height_clipmap() {
-                    Some(clipmap) => match crate::sdf_render::worldgen::upload::try_sample_clipmap_lod(
-                        &clipmap, world_xz, voxel_size,
-                    ) {
-                        Some(node) => p.y - node.height,
-                        None => *max_height - p.y + 1.0e4,
-                    },
-                    None => *max_height - p.y + 1.0e4,
-                }
-            }
+            // The whole sample (offset → world XZ → strict/try clipmap select → signed field) lives in
+            // `upload::terrain_sdf`, which reads a PER-BAKE THREAD-LOCAL clipmap snapshot on the hot
+            // mesh-bake path (no process-global RwLock + Arc-clone per field sample — that per-sample
+            // lock/atomic, hammered across the async pool, was the dominant mesh-bake cost) and falls
+            // back to the global for non-rendering callers (picking/classification/tests).
+            crate::sdf_render::worldgen::upload::terrain_sdf(p, voxel_size, *max_height)
         }
     }
 }

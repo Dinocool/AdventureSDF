@@ -491,6 +491,14 @@ fn mesh_chunk(
     lod: u32,
     debug: bool,
 ) -> Option<ChunkMeshData> {
+    // Install this chunk's Terrain clipmap snapshot ONCE on this bake thread (held for the whole bake),
+    // so each of the chunk's hundreds-of-thousands of field samples reads it via a thread-local borrow
+    // instead of a process-global RwLock + Arc-clone — the per-sample lock/atomic, contended across the
+    // async pool, was the dominant bake cost. Also pins the bake to ONE stable clipmap (no mid-bake roll).
+    let _bake_terrain = crate::sdf_render::worldgen::upload::set_bake_terrain(
+        crate::sdf_render::worldgen::upload::cpu_height_clipmap(),
+        crate::sdf_render::worldgen::upload::cpu_terrain_offset(),
+    );
     // Transvoxel treats density > threshold as INSIDE; our CSG distance is NEGATIVE inside → negate it. The
     // tiny iso-shift keeps no sample landing EXACTLY on 0 (density > 0 is strict, so a 0 sample reads
     // "outside" — a pinhole at grid-aligned features like a sphere pole on a grid corner).

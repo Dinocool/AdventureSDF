@@ -558,6 +558,88 @@ pub fn cpu_height_clipmap() -> Option<Arc<HeightClipmap>> {
     CPU_HEIGHT_CLIPMAP.read().expect("CPU_HEIGHT_CLIPMAP poisoned").clone()
 }
 
+thread_local! {
+    /// Per-bake-thread Terrain snapshot — the clipmap `Arc` + world-XZ offset captured ONCE at the top
+    /// of `mesh_chunk` (via [`set_bake_terrain`]). [`terrain_sdf`] reads this with a thread-local
+    /// `RefCell` borrow (no atomics, no cross-core sharing) instead of the process-global `RwLock` +
+    /// `Arc::clone` on EVERY field sample — the bake samples the field hundreds of thousands of times
+    /// per chunk, and across the async pool that per-sample lock/refcount was cache-line-contended (the
+    /// dominant mesh-bake cost). It also makes a chunk's whole bake sample ONE stable clipmap (no
+    /// mid-bake ring roll). `None` ⇒ no bake snapshot installed (picking/classification/tests) → fall
+    /// back to the process-global.
+    static BAKE_TERRAIN: std::cell::RefCell<Option<(Arc<HeightClipmap>, bevy::math::Vec2)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// RAII guard installing a per-bake Terrain snapshot on THIS thread (see [`BAKE_TERRAIN`]); clears it on
+/// drop. Capture once at the top of `mesh_chunk`: `let _g = set_bake_terrain(cpu_height_clipmap(), …);`.
+/// A `None` clipmap installs nothing (the rendering path then panics via the global fallback — a bug, as
+/// the coverage gate only admits covered chunks).
+#[must_use = "the snapshot is cleared when the guard drops; bind it for the bake's duration"]
+pub struct BakeTerrainGuard(());
+
+impl Drop for BakeTerrainGuard {
+    fn drop(&mut self) {
+        BAKE_TERRAIN.with(|tl| *tl.borrow_mut() = None);
+    }
+}
+
+/// Install a per-bake-thread Terrain snapshot (see [`BAKE_TERRAIN`]) for the lifetime of the returned guard.
+pub fn set_bake_terrain(clipmap: Option<Arc<HeightClipmap>>, offset: bevy::math::Vec2) -> BakeTerrainGuard {
+    BAKE_TERRAIN.with(|tl| *tl.borrow_mut() = clipmap.map(|c| (c, offset)));
+    BakeTerrainGuard(())
+}
+
+/// The Terrain primitive's signed field at local point `p`, sampling the rolling height clipmap — the
+/// single SSOT for the `edits::eval_primitive` `Terrain` branch. Reads the per-bake thread-local snapshot
+/// ([`BAKE_TERRAIN`]) when one is installed (the hot mesh-bake path: no per-sample global lock), else the
+/// process-global ([`cpu_height_clipmap`]) for non-rendering callers. `world_xz = p.xz + offset`.
+///
+/// STRICT vs TRY, gated by `voxel_size` (Step-1 contract): `voxel_size > 0.0` (a RENDERING bake — the
+/// mesh bake always passes the chunk's real voxel size) ⇒ strict [`sample_clipmap_lod`], which PANICS on
+/// a miss (a rendered miss is a coverage-gate bug, never a silent flat fallback). `voxel_size == 0.0` (the
+/// NON-RENDERING sentinel: picking/classification/tests) ⇒ [`try_sample_clipmap_lod`]; a miss reads as
+/// EMPTY SPACE (large POSITIVE distance), not a mid-band plane.
+pub fn terrain_sdf(p: bevy::math::Vec3, voxel_size: f32, max_height: f32) -> f32 {
+    BAKE_TERRAIN.with(|tl| {
+        if let Some((clipmap, offset)) = tl.borrow().as_ref() {
+            let world_xz = DVec2::new((p.x + offset.x) as f64, (p.z + offset.y) as f64);
+            return terrain_height_to_sdf(clipmap, p.y, world_xz, voxel_size, max_height);
+        }
+        // No per-bake snapshot installed (picking/classification/tests) → read the process-global.
+        let offset = cpu_terrain_offset();
+        let world_xz = DVec2::new((p.x + offset.x) as f64, (p.z + offset.y) as f64);
+        match cpu_height_clipmap() {
+            Some(clipmap) => terrain_height_to_sdf(&clipmap, p.y, world_xz, voxel_size, max_height),
+            None if voxel_size > 0.0 => panic!(
+                "terrain sampled outside loaded coverage — a rendering bake (voxel_size={voxel_size}) ran \
+                 before any height clipmap was built; the coverage gate should have prevented this. \
+                 world_xz={world_xz:?}"
+            ),
+            None => max_height - p.y + 1.0e4, // non-rendering miss ⇒ empty space (no flat fallback)
+        }
+    })
+}
+
+/// Strict/try clipmap sample → signed Terrain field (`p.y − height`); a non-rendering miss is empty space.
+#[inline]
+fn terrain_height_to_sdf(
+    clipmap: &HeightClipmap,
+    p_y: f32,
+    world_xz: DVec2,
+    voxel_size: f32,
+    max_height: f32,
+) -> f32 {
+    if voxel_size > 0.0 {
+        p_y - sample_clipmap_lod(clipmap, world_xz, voxel_size).height // strict: panics on a miss
+    } else {
+        match try_sample_clipmap_lod(clipmap, world_xz, voxel_size) {
+            Some(node) => p_y - node.height,
+            None => max_height - p_y + 1.0e4,
+        }
+    }
+}
+
 /// Process-global world-XZ offset of the streaming `Terrain` volume's transform — the sibling of
 /// [`CPU_HEIGHT_RING`] that lets the CPU `eval_primitive` `Terrain` branch convert its LOCAL sample
 /// point back to WORLD XZ before sampling the (world-anchored) ring.
