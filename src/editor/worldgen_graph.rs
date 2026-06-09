@@ -53,6 +53,12 @@ pub struct WorldGraphEditor {
     surface: std::collections::HashSet<NodeId>,
     /// Per-node 3D-preview orbit camera (yaw, pitch) in radians. Absence ⇒ default angle.
     cam: std::collections::HashMap<NodeId, (f32, f32)>,
+    /// Last-frame body content size per node (egui can't expose the node rect), used by `auto_arrange`
+    /// to pack columns/rows by real size instead of a fixed grid.
+    body_size: std::collections::HashMap<NodeId, egui::Vec2>,
+    /// Last-frame on-screen preview square side (points) per node, used to pick the render resolution so
+    /// previews stay crisp as the node is resized.
+    disp_px: std::collections::HashMap<NodeId, f32>,
 }
 
 impl Default for WorldGraphEditor {
@@ -67,6 +73,8 @@ impl Default for WorldGraphEditor {
             zoom_half_m: std::collections::HashMap::new(),
             surface: std::collections::HashSet::new(),
             cam: std::collections::HashMap::new(),
+            body_size: std::collections::HashMap::new(),
+            disp_px: std::collections::HashMap::new(),
         }
     }
 }
@@ -228,6 +236,8 @@ struct Viewer<'a> {
     zoom_half_m: &'a mut std::collections::HashMap<NodeId, f64>,
     surface: &'a mut std::collections::HashSet<NodeId>,
     cam: &'a mut std::collections::HashMap<NodeId, (f32, f32)>,
+    body_size: &'a mut std::collections::HashMap<NodeId, egui::Vec2>,
+    disp_px: &'a mut std::collections::HashMap<NodeId, f32>,
 }
 
 impl SnarlViewer<EdNode> for Viewer<'_> {
@@ -265,6 +275,11 @@ impl SnarlViewer<EdNode> for Viewer<'_> {
         ui: &mut egui::Ui,
         snarl: &mut Snarl<EdNode>,
     ) {
+        ui.set_max_width(NODE_BODY_MAX_W);
+        // Node params, stacked VERTICALLY at the top of the body (keeps nodes narrow); preview below.
+        if let EdNode::Op(kind) = &mut snarl[node] {
+            node_params_ui(ui, kind);
+        }
         // Toggle row (sits ABOVE the preview): collapse/expand + zoom. Previews are on by default.
         let open = !self.collapsed.contains(&node);
         ui.horizontal(|ui| {
@@ -306,18 +321,26 @@ impl SnarlViewer<EdNode> for Viewer<'_> {
         });
         if !open {
             self.previews.remove(&node); // free the GPU texture while collapsed
+            self.body_size.insert(node, ui.min_rect().size());
             return;
         }
+        // Render resolution tracks the displayed (physical-pixel) size from last frame, so the preview
+        // gains real detail as the node is resized — capped per mode (3D raymarch is far costlier).
+        let is3d = self.surface.contains(&node);
+        let disp = self.disp_px.get(&node).copied().unwrap_or(130.0);
+        let ppp = ui.ctx().pixels_per_point();
+        let res = ((disp * ppp).round() as usize).clamp(32, if is3d { SURFACE_RES_MAX } else { PREVIEW_RES_MAX });
+
         // Re-evaluate the sub-graph rooted at this node every frame (so edits show immediately) → texture.
         // An unconnected input just shows a hint instead of a preview.
         let half = *self.zoom_half_m.get(&node).unwrap_or(&PREVIEW_HALF_M);
         match graph_rooted_at(snarl, node) {
             Ok(g) => {
-                let img = if self.surface.contains(&node) {
+                let img = if is3d {
                     let (yaw, pitch) = *self.cam.get(&node).unwrap_or(&CAM_DEFAULT);
-                    render_surface_preview(&g, half, yaw, pitch)
+                    render_surface_preview(&g, half, yaw, pitch, res)
                 } else {
-                    render_field_preview(&g, half)
+                    render_field_preview(&g, half, res)
                 };
                 let handle =
                     ui.ctx().load_texture(format!("wg-preview-{node:?}"), img, egui::TextureOptions::LINEAR);
@@ -329,15 +352,18 @@ impl SnarlViewer<EdNode> for Viewer<'_> {
                     .show(ui, |ui| {
                         let s = ui.available_size();
                         let d = s.x.min(s.y).max(48.0);
-                        ui.image(egui::load::SizedTexture::new(handle.id(), egui::vec2(d, d)))
+                        let r = ui.image(egui::load::SizedTexture::new(handle.id(), egui::vec2(d, d)));
+                        (r, d)
                     });
+                let (resp, d) = resp;
+                self.disp_px.insert(node, d); // feeds next frame's render resolution
                 // 3D camera interaction: drag to orbit, scroll-over to zoom (scale the framed window).
-                if self.surface.contains(&node) {
+                if is3d {
                     let cam = self.cam.entry(node).or_insert(CAM_DEFAULT);
                     if resp.dragged() {
-                        let d = resp.drag_delta();
-                        cam.0 += d.x * 0.01;
-                        cam.1 = (cam.1 - d.y * 0.01).clamp(0.05, 1.5);
+                        let dd = resp.drag_delta();
+                        cam.0 += dd.x * 0.01;
+                        cam.1 = (cam.1 - dd.y * 0.01).clamp(0.05, 1.5);
                     }
                     if resp.hovered() {
                         let scroll = ui.input(|i| i.raw_scroll_delta.y);
@@ -354,6 +380,7 @@ impl SnarlViewer<EdNode> for Viewer<'_> {
                 ui.colored_label(egui::Color32::from_rgb(200, 150, 120), format!("connect inputs ({e})"));
             }
         }
+        self.body_size.insert(node, ui.min_rect().size());
     }
 
     fn show_input(&mut self, pin: &InPin, ui: &mut egui::Ui, snarl: &mut Snarl<EdNode>) -> impl SnarlPin + 'static {
@@ -361,11 +388,8 @@ impl SnarlViewer<EdNode> for Viewer<'_> {
         PinInfo::circle().with_fill(egui::Color32::from_rgb(120, 160, 220))
     }
 
-    fn show_output(&mut self, pin: &OutPin, ui: &mut egui::Ui, snarl: &mut Snarl<EdNode>) -> impl SnarlPin + 'static {
-        // Edit the node's params on its (single) output row, then label the output pin.
-        if let EdNode::Op(kind) = &mut snarl[pin.id.node] {
-            node_params_ui(ui, kind);
-        }
+    fn show_output(&mut self, _pin: &OutPin, ui: &mut egui::Ui, _snarl: &mut Snarl<EdNode>) -> impl SnarlPin + 'static {
+        // Params now live in the body (stacked vertically) to keep nodes narrow; the pin just gets a label.
         ui.label("out");
         PinInfo::circle().with_fill(egui::Color32::from_rgb(160, 210, 140))
     }
@@ -492,11 +516,16 @@ use egui_snarl::ui::SnarlPin;
 // ===================================================================================================
 
 /// Lay the graph out left→right by dependency depth: each node's column = the longest input-chain to a
-/// leaf, rows stack within a column. Pure function of the wiring, so the layout is stable + readable.
-fn auto_arrange(snarl: &mut Snarl<EdNode>) {
+/// leaf, rows stack within a column. Columns are spaced by their widest node and rows by each node's real
+/// height (measured last frame in `body_size`), so preview-laden nodes don't overlap. Pure function of
+/// the wiring + measured sizes ⇒ stable + readable.
+fn auto_arrange(snarl: &mut Snarl<EdNode>, body_size: &std::collections::HashMap<NodeId, egui::Vec2>) {
     use std::collections::{HashMap, HashSet};
-    const COL: f32 = 280.0;
-    const ROW: f32 = 300.0;
+    const GAP_X: f32 = 64.0;
+    const GAP_Y: f32 = 34.0;
+    const HEADER: f32 = 30.0; // header bar
+    const PIN_ROW: f32 = 24.0; // per input/output pin row
+    const FRAME: f32 = 22.0; // node frame padding
 
     // Upstream nodes feeding each node (over all input slots).
     let mut up: HashMap<NodeId, Vec<NodeId>> = HashMap::new();
@@ -531,14 +560,55 @@ fn auto_arrange(snarl: &mut Snarl<EdNode>) {
     ids.sort(); // stable order within a column
     let mut memo = HashMap::new();
     let mut on_stack = HashSet::new();
-    let mut row_in_col: HashMap<i32, f32> = HashMap::new();
-    for id in ids {
+
+    // Depth + estimated full node size per node (body measured last frame + header/pin/frame allowance).
+    let mut depth_of: HashMap<NodeId, i32> = HashMap::new();
+    let mut size_of: HashMap<NodeId, (f32, f32)> = HashMap::new();
+    let mut max_depth = 0i32;
+    for &id in &ids {
         let d = depth(id, &up, &mut memo, &mut on_stack);
-        let row = row_in_col.entry(d).or_insert(0.0);
-        if let Some(node) = snarl.get_node_info_mut(id) {
-            node.pos = egui::pos2(d as f32 * COL, *row * ROW);
+        depth_of.insert(id, d);
+        max_depth = max_depth.max(d);
+        let arity = snarl
+            .get_node(id)
+            .map(|n| match n {
+                EdNode::Output => 1,
+                EdNode::Op(k) => k.arity().max(1),
+            })
+            .unwrap_or(1);
+        let body = body_size.get(&id).copied().unwrap_or(egui::vec2(120.0, 56.0));
+        let w = body.x.max(120.0) + FRAME;
+        let h = HEADER + arity as f32 * PIN_ROW + body.y + FRAME;
+        size_of.insert(id, (w, h));
+    }
+
+    // Column x = prefix sum of each column's widest node + gap.
+    let cols = (max_depth + 1) as usize;
+    let mut col_w = vec![0.0f32; cols];
+    for &id in &ids {
+        let w = size_of[&id].0;
+        let c = depth_of[&id] as usize;
+        if w > col_w[c] {
+            col_w[c] = w;
         }
-        *row += 1.0;
+    }
+    let mut col_x = vec![0.0f32; cols];
+    let mut acc = 0.0;
+    for c in 0..cols {
+        col_x[c] = acc;
+        acc += col_w[c] + GAP_X;
+    }
+
+    // Stack rows within each column by real height.
+    let mut col_y: HashMap<i32, f32> = HashMap::new();
+    for &id in &ids {
+        let d = depth_of[&id];
+        let h = size_of[&id].1;
+        let y = col_y.entry(d).or_insert(0.0);
+        if let Some(node) = snarl.get_node_info_mut(id) {
+            node.pos = egui::pos2(col_x[d as usize], *y);
+        }
+        *y += h + GAP_Y;
     }
 }
 
@@ -546,8 +616,12 @@ fn auto_arrange(snarl: &mut Snarl<EdNode>) {
 // Per-node 2D preview
 // ===================================================================================================
 
-/// Heatmap resolution (px per side) of a node preview — small + recomputed every frame, so keep modest.
-const PREVIEW_RES: usize = 48;
+/// Max heatmap resolution (px per side) of a 2D node preview — actual res tracks the displayed size.
+const PREVIEW_RES_MAX: usize = 256;
+/// Max render resolution (px per side) of a 3D surface preview (raymarch is far costlier than the heatmap).
+const SURFACE_RES_MAX: usize = 160;
+/// Max width (points) of a node body — keeps nodes narrow regardless of param/preview content.
+const NODE_BODY_MAX_W: f32 = 168.0;
 /// Default half-extent (metres) of the world window a preview samples, centred on the origin.
 const PREVIEW_HALF_M: f64 = 2048.0;
 /// Seed used for previews (matches the default world seed so the heatmap mirrors the live terrain).
@@ -581,8 +655,8 @@ fn input_label(node: &EdNode, slot: usize) -> &'static str {
 
 /// Evaluate a node's sub-[`Graph`] over a top-down grid spanning ±`half_m` metres, normalise to its own
 /// min/max, and colour-map it into an [`egui::ColorImage`] (terrain ramp: low = blue/green → high = white).
-fn render_field_preview(g: &Graph, half_m: f64) -> egui::ColorImage {
-    let n = PREVIEW_RES;
+fn render_field_preview(g: &Graph, half_m: f64, res: usize) -> egui::ColorImage {
+    let n = res.max(2);
     let mut vals = vec![0.0f64; n * n];
     let span_m = 2.0 * half_m;
     for j in 0..n {
@@ -637,17 +711,15 @@ fn terrain_ramp(t: f32) -> egui::Color32 {
 // 3D SDF-raymarched surface preview
 // ===================================================================================================
 
-/// Surface-preview render resolution (px per side) — opt-in per node, so a touch sharper than the 2D map.
-const SURFACE_RES: usize = 64;
 /// Max march steps per ray through the surface's bounding box.
 const SURFACE_STEPS: usize = 80;
 
 /// Render the node's height field as a 3D **SDF-raymarched** surface (heightfield ray–surface
 /// intersection) into an [`egui::ColorImage`]. The camera orbits the ±`half_m` window at (`yaw`,`pitch`),
 /// framing the field's own height range; shading uses the analytic gradient normal + a terrain ramp.
-fn render_surface_preview(g: &Graph, half_m: f64, yaw: f32, pitch: f32) -> egui::ColorImage {
+fn render_surface_preview(g: &Graph, half_m: f64, yaw: f32, pitch: f32, res: usize) -> egui::ColorImage {
     use bevy::math::Vec3;
-    let res = SURFACE_RES;
+    let res = res.max(2);
 
     // Coarse pass: the field's height range over the window (for camera framing + colour normalisation).
     let (mut hmin, mut hmax) = (f64::INFINITY, f64::NEG_INFINITY);
@@ -833,7 +905,8 @@ fn graph_panel(world: &mut World, ui: &mut egui::Ui) {
                 editor.status = "reset to default".into();
             }
             if ui.button("Auto-arrange").on_hover_text("Lay nodes out left→right by dependency depth").clicked() {
-                auto_arrange(&mut editor.snarl);
+                let WorldGraphEditor { snarl, body_size, .. } = &mut *editor;
+                auto_arrange(snarl, body_size);
                 editor.status = "arranged".into();
             }
         });
@@ -856,8 +929,10 @@ fn graph_panel(world: &mut World, ui: &mut egui::Ui) {
 
         // Disjoint borrows of the editor's fields: the snarl is the working graph; the rest are the
         // per-node preview caches the Viewer drives.
-        let WorldGraphEditor { snarl, previews, collapsed, zoom_half_m, surface, cam, .. } = &mut *editor;
-        let mut viewer = Viewer { previews, collapsed, zoom_half_m, surface, cam };
+        let WorldGraphEditor { snarl, previews, collapsed, zoom_half_m, surface, cam, body_size, disp_px, .. } =
+            &mut *editor;
+        let mut viewer =
+            Viewer { previews, collapsed, zoom_half_m, surface, cam, body_size, disp_px };
         SnarlWidget::new()
             .id(egui::Id::new("worldgen-biome-graph"))
             .style(SnarlStyle::new())
