@@ -316,6 +316,33 @@ pub fn sample_ring_mip(ring: &HeightRingCpu, world_xz: DVec2, mip: u32) -> Optio
     })
 }
 
+/// Select the band-limited mip whose node spacing best matches a bake `voxel_size`, then sample the
+/// ring at `world_xz` through that mip — the CPU mirror of the (deleted) GPU bake's `voxel → mip`
+/// anti-alias rule. Picking the mip whose spacing ≥ `voxel_size` (rounding UP, never finer than the
+/// voxel) guarantees the sampled surface is already low-passed below the voxel's Nyquist, so a coarse
+/// LOD brick can't alias a sub-voxel zero-crossing into a black hole at the far extents.
+///
+/// Rule: the FINEST mip `m` with `node_spacing · 2^m ≥ voxel_size`, clamped to `[0, MAX_HEIGHT_MIP]`.
+/// `voxel_size == 0.0` is the documented sentinel for "finest / no band-limit" ⇒ mip 0 (identical to
+/// [`sample_ring`]) — used by non-LOD callers (picking, classification, tests). `None` on a ring miss.
+pub fn sample_ring_lod(ring: &HeightRingCpu, world_xz: DVec2, voxel_size: f32) -> Option<HeightNode> {
+    let mip = select_height_mip(ring.node_spacing, voxel_size);
+    sample_ring_mip(ring, world_xz, mip)
+}
+
+/// The finest mip level whose node spacing (`base · 2^m`) is still ≥ `voxel_size` — the "round the mip
+/// UP to the voxel" anti-alias select (see [`sample_ring_lod`]). `voxel_size <= base` (incl. the `0.0`
+/// sentinel) ⇒ mip 0; coarser voxels step up one mip per spacing doubling, clamped to `MAX_HEIGHT_MIP`.
+#[inline]
+pub fn select_height_mip(base_spacing: f32, voxel_size: f32) -> u32 {
+    if voxel_size.is_nan() || voxel_size <= base_spacing {
+        return 0; // sentinel 0.0, NaN, or a voxel finer than the base node spacing → full detail
+    }
+    // Smallest m with base·2^m ≥ voxel ⇒ m = ceil(log2(voxel / base)).
+    let ratio = (voxel_size / base_spacing) as f64;
+    (ratio.log2().ceil() as i64).clamp(0, MAX_HEIGHT_MIP as i64) as u32
+}
+
 /// Process-global snapshot of the most-recently-built height ring, shared with the CPU
 /// `edits::eval_primitive` `Terrain` branch so picking/classification samples the SAME surface the
 /// GPU bake renders (CPU↔GPU parity). The `WorldGenPlugin` swaps a fresh `Arc` in on every ring
@@ -367,43 +394,6 @@ pub fn set_cpu_terrain_offset(offset: bevy::math::Vec2) {
 /// Current CPU Terrain world-XZ offset (see [`CPU_TERRAIN_OFFSET`]).
 pub fn cpu_terrain_offset() -> bevy::math::Vec2 {
     *CPU_TERRAIN_OFFSET.read().expect("CPU_TERRAIN_OFFSET poisoned")
-}
-
-/// Process-global snapshot of the live height-layer fBm parameters (+ its `sea_level` reference
-/// plane), the sibling of [`CPU_HEIGHT_RING`] / [`CPU_TERRAIN_OFFSET`] that lets the CPU
-/// `eval_primitive` `Terrain` branch sample the height field DIRECTLY by analytic fBm
-/// (`fbm_height_grad(world_xz) + sea_level`) instead of the BOUNDED resident ring.
-///
-/// Why this exists: the height layer is a pure analytic `f(world_xz, seed)` — the ring is just a
-/// resident, band-limited *cache* of that function over a small window (~1024 m). Sampling the fBm
-/// directly makes the Terrain surface INFINITE and world-anchored, so a single large static volume
-/// fills the mesh-bake clipmap everywhere the camera roams (no per-move ring miss / flat fallback at
-/// the far LODs). This is the SAME fBm the ring bakes at mip 0, so the analytic path and the ring's
-/// mip-0 surface agree by construction (CPU↔mesh-bake parity preserved); only the ring's coarser
-/// mips band-limit it for far bricks (a known coarse-LOD aliasing follow-up — see WORLD_GEN notes).
-///
-/// `(FbmParams, sea_level)`: `fbm_height_grad` returns the raw fBm; the height layer adds `sea_level`
-/// (`HeightLayer::sample_world`), so the snapshot carries BOTH to reproduce the exact ring height.
-/// `None` until the worldgen plugin first publishes (Terrain then keeps its flat mid-band fallback).
-static CPU_FBM_PARAMS: RwLock<Option<(super::noise::FbmParams, f32)>> = RwLock::new(None);
-
-/// Publish the live fBm params + `sea_level` so the CPU Terrain eval can sample the height field
-/// directly (see [`CPU_FBM_PARAMS`]). Called by the `WorldGenPlugin` whenever params/seed are known.
-pub fn set_cpu_fbm_params(params: super::noise::FbmParams, sea_level: f32) {
-    *CPU_FBM_PARAMS.write().expect("CPU_FBM_PARAMS poisoned") = Some((params, sea_level));
-}
-
-/// Current published `(FbmParams, sea_level)` snapshot, or `None` if worldgen hasn't published yet
-/// (see [`CPU_FBM_PARAMS`]). The Terrain `eval_primitive` branch reads this to evaluate the analytic
-/// fBm height; on `None` the caller uses the flat mid-band fallback.
-pub fn cpu_fbm_params() -> Option<(super::noise::FbmParams, f32)> {
-    *CPU_FBM_PARAMS.read().expect("CPU_FBM_PARAMS poisoned")
-}
-
-/// Clear the published fBm snapshot back to `None` (see [`CPU_FBM_PARAMS`]). Used by tests that
-/// exercise the flat-fallback path to reset the process-global after publishing.
-pub fn clear_cpu_fbm_params() {
-    *CPU_FBM_PARAMS.write().expect("CPU_FBM_PARAMS poisoned") = None;
 }
 
 #[cfg(test)]
@@ -588,6 +578,43 @@ mod tests {
         let a0 = sample_ring(&ring, wp).unwrap();
         let b0 = sample_ring_mip(&ring, wp, 0).unwrap();
         assert_eq!(a0.height.to_bits(), b0.height.to_bits());
+    }
+
+    /// The voxel→mip select rounds UP to the finest mip whose node spacing ≥ the voxel: the `0.0`
+    /// sentinel and any voxel ≤ the base spacing give mip 0; each spacing-doubling steps up one mip;
+    /// and it clamps to `MAX_HEIGHT_MIP`. Base node spacing here is `128/64 = 2 m`.
+    #[test]
+    fn mip_select_rounds_up_to_voxel() {
+        let base = HEIGHT_CHUNK_CELLS as f32 / HEIGHT_FIELD_RES as f32; // 2 m
+        assert_eq!(select_height_mip(base, 0.0), 0, "sentinel ⇒ finest");
+        assert_eq!(select_height_mip(base, base), 0, "voxel == base ⇒ mip 0");
+        assert_eq!(select_height_mip(base, base * 0.5), 0, "voxel finer than base ⇒ mip 0");
+        // spacing(m) = base·2^m: 2,4,8,16,... A voxel just above spacing(m) needs mip m+1.
+        assert_eq!(select_height_mip(base, base * 2.0), 1, "exactly one doubling ⇒ mip 1");
+        assert_eq!(select_height_mip(base, base * 2.0 + 0.01), 2, "just over ⇒ rounds up to mip 2");
+        assert_eq!(select_height_mip(base, base * 4.0), 2);
+        // Beyond the pyramid clamps to the coarsest mip.
+        assert_eq!(select_height_mip(base, base * 100_000.0), MAX_HEIGHT_MIP);
+    }
+
+    /// `sample_ring_lod` with `voxel_size == 0.0` is identical to `sample_ring` (mip 0), and a coarse
+    /// voxel routes through the matching coarse mip (`sample_ring_mip`) — the band-limited LOD path the
+    /// Terrain eval uses.
+    #[test]
+    fn sample_ring_lod_selects_mip() {
+        let store = store_with(&[(0, 0)], 11);
+        let ring = build_height_ring(&store);
+        let base = ring.node_spacing;
+        let s = HEIGHT_CHUNK_CELLS as f64;
+        let wp = DVec2::new(0.4 * s, 0.6 * s);
+        // 0.0 sentinel ⇒ mip 0 ⇒ exactly sample_ring.
+        let lod0 = sample_ring_lod(&ring, wp, 0.0).unwrap();
+        let mip0 = sample_ring(&ring, wp).unwrap();
+        assert_eq!(lod0.height.to_bits(), mip0.height.to_bits());
+        // A voxel 4× the base spacing selects mip 2 — matches sample_ring_mip(.., 2).
+        let lod = sample_ring_lod(&ring, wp, base * 4.0).unwrap();
+        let mip = sample_ring_mip(&ring, wp, 2).unwrap();
+        assert_eq!(lod.height.to_bits(), mip.height.to_bits());
     }
 
     /// Negative-coord chunks resolve correctly (the rem_euclid slot + key-tag path).

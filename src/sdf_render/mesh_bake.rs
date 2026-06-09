@@ -410,8 +410,8 @@ fn chunks_in_aabb(aabb: &Aabb3d, config: &SdfGridConfig, k: u32, lod: u32, out: 
 
 /// Central-difference gradient of the CSG field at `p` (the outward surface direction). `eps` should be a
 /// small fraction of a voxel.
-fn field_gradient(edits: &[edits::ResolvedEdit], indices: &[u32], p: Vec3, eps: f32) -> Vec3 {
-    let d = |o: Vec3| edits::fold_csg_dist_indexed(edits, indices, p + o);
+fn field_gradient(edits: &[edits::ResolvedEdit], indices: &[u32], p: Vec3, eps: f32, vs: f32) -> Vec3 {
+    let d = |o: Vec3| edits::fold_csg_dist_indexed(edits, indices, p + o, vs);
     Vec3::new(
         d(Vec3::X * eps) - d(Vec3::X * -eps),
         d(Vec3::Y * eps) - d(Vec3::Y * -eps),
@@ -439,7 +439,7 @@ fn mesh_chunk(
     // Transvoxel treats density > threshold as INSIDE; our CSG distance is NEGATIVE inside → negate it. The
     // tiny iso-shift keeps no sample landing EXACTLY on 0 (density > 0 is strict, so a 0 sample reads
     // "outside" — a pinhole at grid-aligned features like a sphere pole on a grid corner).
-    let field = |x: f32, y: f32, z: f32| 1e-3 - edits::fold_csg_dist_indexed(edits, indices, Vec3::new(x, y, z));
+    let field = |x: f32, y: f32, z: f32| 1e-3 - edits::fold_csg_dist_indexed(edits, indices, Vec3::new(x, y, z), vs);
     let block = Block::new(
         [grid_origin.x, grid_origin.y, grid_origin.z],
         subdivisions as f32 * vs,
@@ -490,6 +490,9 @@ struct ChunkMeshBuilder<'a> {
     indices: &'a [u32],
     origin: Vec3,
     eps: f32,
+    /// This chunk's voxel size (world metres/voxel) — the LOD context forwarded to every CSG eval so
+    /// the Terrain sample picks the band-limited height mip for this LOD (see `edits::eval_primitive`).
+    vs: f32,
     lod: u32,
     debug: bool,
     positions: Vec<[f32; 3]>,
@@ -514,6 +517,7 @@ impl<'a> ChunkMeshBuilder<'a> {
             indices,
             origin,
             eps: vs * 0.01,
+            vs,
             lod,
             debug,
             positions: Vec::new(),
@@ -569,8 +573,8 @@ impl<'a> ChunkMeshBuilder<'a> {
                     } else {
                         let world = Vec3::from(self.positions[vi]) + self.origin;
                         let gap = |w: Vec3| {
-                            edits::material_dist(self.edits, self.indices, w, mat_b)
-                                - edits::material_dist(self.edits, self.indices, w, mat_a)
+                            edits::material_dist(self.edits, self.indices, w, mat_b, self.vs)
+                                - edits::material_dist(self.edits, self.indices, w, mat_a, self.vs)
                         };
                         let g = gap(world);
                         let e = self.eps;
@@ -615,11 +619,11 @@ impl MeshBuilder<f32, f32> for ChunkMeshBuilder<'_> {
         let local = world - self.origin;
         self.positions.push([local.x, local.y, local.z]);
         // Exact outward normal = ∇(CSG distance) (points toward increasing distance = outside the solid).
-        let n = field_gradient(self.edits, self.indices, world, self.eps).normalize_or_zero();
+        let n = field_gradient(self.edits, self.indices, world, self.eps, self.vs).normalize_or_zero();
         self.normals.push([n.x, n.y, n.z]);
         // (nearest, runner-up) materials at this vertex over the blend-padded chunk set; `finish` folds the
         // per-triangle pair from the three corners' values.
-        let (near, runner, _) = edits::fold_csg_top2(self.edits, self.indices, world);
+        let (near, runner, _) = edits::fold_csg_top2(self.edits, self.indices, world, self.vs);
         self.vmat.push((near, runner));
         VertexIndex(self.positions.len() - 1)
     }
@@ -662,7 +666,7 @@ fn chunk_has_surface(
         for dx in [0.0, cw] {
             for dy in [0.0, cw] {
                 for dz in [0.0, cw] {
-                    let d = edits::fold_csg_dist_indexed(edits, indices, min + Vec3::new(dx, dy, dz));
+                    let d = edits::fold_csg_dist_indexed(edits, indices, min + Vec3::new(dx, dy, dz), vs);
                     if d <= 0.0 {
                         neg = true;
                     } else {
@@ -677,7 +681,7 @@ fn chunk_has_surface(
     }
     // circumradius (½·√3·side) + apron/iso-shift slack + smoothing inflation margin.
     let reach = cw * 0.866_025_4 + 2.0 * vs + 0.5 * smooth_sum;
-    edits::fold_csg_dist_indexed(edits, indices, center).abs() <= reach
+    edits::fold_csg_dist_indexed(edits, indices, center, vs).abs() <= reach
 }
 
 /// Content-hash-driven, async, generational-coherent Transvoxel bake (see the module doc). The unit is

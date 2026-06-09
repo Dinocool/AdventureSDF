@@ -148,7 +148,7 @@ pub fn pick_entity(bvh: &Bvh, ray: &Ray, edits: &[GatheredEdit]) -> Option<(Enti
     let mut t = 0.0_f32;
     for _ in 0..256 {
         let pos = ray.origin + ray.direction * t;
-        let sample = fold_csg(&resolved, pos);
+        let sample = fold_csg(&resolved, pos, 0.0);
         if sample.dist < 0.001 {
             // Attribute the hit to the nearest individual edit at this point.
             return nearest_edit(edits, &candidates, pos).map(|e| (e, t));
@@ -167,7 +167,7 @@ fn nearest_edit(edits: &[GatheredEdit], candidates: &[u32], pos: Vec3) -> Option
     let mut best = None;
     for &i in candidates {
         let g = &edits[i as usize];
-        let d = eval_world(&g.edit.prim, &g.edit.transform, pos).abs();
+        let d = eval_world(&g.edit.prim, &g.edit.transform, pos, 0.0).abs();
         if d < best_d {
             best_d = d;
             best = Some(g.entity);
@@ -203,7 +203,7 @@ pub fn debug_capture_march(
 
     for _ in 0..256 {
         let pos = ray.origin + ray.direction * t;
-        let closest_dist = fold_csg(edits, pos).dist;
+        let closest_dist = fold_csg(edits, pos, 0.0).dist;
 
         // Informational only (debug ray inspector): does a level-0 brick exist here?
         let brick = config.world_to_brick_lod(pos, 0);

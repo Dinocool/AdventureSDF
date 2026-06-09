@@ -66,7 +66,7 @@ pub(super) fn narrow_band_keep(
         let mut neg = false;
         let mut pos = false;
         for p in samples {
-            if edits::fold_csg_dist_indexed(edits, indices, p) <= 0.0 {
+            if edits::fold_csg_dist_indexed(edits, indices, p, 0.0) <= 0.0 {
                 neg = true;
             } else {
                 pos = true;
@@ -77,7 +77,7 @@ pub(super) fn narrow_band_keep(
         }
     }
 
-    edits::fold_csg_dist_indexed(edits, indices, center).abs() <= reach
+    edits::fold_csg_dist_indexed(edits, indices, center, 0.0).abs() <= reach
 }
 
 /// Classify ONE chunk's slice of candidate bricks into `Verdict`s (read-only). The shared core of
@@ -122,7 +122,7 @@ fn classify_chunk(
         }
         let voxel_size = config.voxel_size_at(key.lod);
         let samples = atlas::SdfAtlas::brick_palette_samples(key, voxel_size);
-        let palette = edits::build_palette_indexed(edits, scratch, &samples);
+        let palette = edits::build_palette_indexed(edits, scratch, &samples, 0.0);
         out.push(Verdict::Keep(palette, scratch.clone(), hash));
     }
 }

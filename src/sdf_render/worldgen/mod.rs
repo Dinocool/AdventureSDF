@@ -34,12 +34,9 @@ use crate::sdf_render::edits::{
 };
 use crate::sdf_render::{SdfCamera, SdfOrbitCamera, SdfVolume};
 
-use layers::height::{HEIGHT_CHUNK_CELLS, HeightLayer, HeightParams};
+use layers::height::{HEIGHT_CHUNK_CELLS, HeightParams};
 use manager::LayerManager;
-use upload::{
-    HeightRingCpu, build_height_ring, set_cpu_fbm_params, set_cpu_height_ring,
-    set_cpu_terrain_offset,
-};
+use upload::{HeightRingCpu, build_height_ring, set_cpu_height_ring, set_cpu_terrain_offset};
 
 /// Master switch for the procedural worldgen vertical slice. Default ON so the terrain shows when
 /// the editor scene loads; flip off to fall back to a plain authored scene with no streamed terrain.
@@ -52,11 +49,20 @@ impl Default for WorldGenEnabled {
     }
 }
 
-/// Whether the terrain STREAMS with the camera (volume + generation focus follow the camera eye) or
-/// stays a FIXED region anchored at the world origin. Default OFF — a stable, reproducible island at
-/// the origin (handy for authoring/testing). Toggle ON for free exploration (terrain follows you).
-#[derive(Resource, Clone, Copy, Default)]
+/// Whether the render VOLUME streams with the camera (its transform follows the camera eye, snapped to
+/// the chunk grid) or stays a FIXED region anchored at the world origin. Default ON: the bounded
+/// terrain volume rides the rolling height ring so the BOUNDED footprint always sits over generated
+/// height as the camera explores (Phase A). The LayerManager's generation focus ALWAYS follows the
+/// camera regardless (see `roll_worldgen`); this toggle only governs the render volume's placement.
+/// Toggle OFF to pin the volume at the origin (a stable, reproducible island for authoring/testing).
+#[derive(Resource, Clone, Copy)]
 pub struct WorldGenFollowCamera(pub bool);
+
+impl Default for WorldGenFollowCamera {
+    fn default() -> Self {
+        Self(true)
+    }
+}
 
 /// World-anchored fixed seed for the slice. A real game would source this from the save/session;
 /// the slice pins it so the streamed terrain is reproducible across runs.
@@ -70,18 +76,15 @@ pub const WORLDGEN_SLICE_SEED: u64 = 0xA15E_C0DE_2026;
 /// 8·128 = 1024`, so no two resident chunks alias one ring slot (`slice_radius_respects_ring_invariant`).
 pub const WORLDGEN_SLICE_RADIUS: f64 = HEIGHT_CHUNK_CELLS as f64 * 3.75;
 
-/// World half-extent of the single global `Terrain` volume. EFFECTIVELY INFINITE (f32-safe): the
-/// mesh-bake clipmap reaches `lod0_radius · 2^(lod_count-1)` ≈ 4096 m around the CAMERA, not the origin
-/// — so to fill the screen everywhere the camera roams, the volume must cover (camera ± clipmap reach)
-/// for ANY camera position, i.e. be unbounded. A finite half-extent (the earlier 4096) only worked near
-/// the origin: flying past it left the terrain behind (it stops at the volume edge). Since the Terrain
-/// CPU eval samples the height field DIRECTLY by analytic fBm (world-anchored — see
-/// `edits::eval_primitive`), one STATIC, effectively-infinite volume lets the clipmap residency stream
-/// terrain around the camera EVERYWHERE with NO per-move re-bake (the volume never translates, so chunk
-/// content hashes are stable; only genuinely-new clipmap chunks bake). 131072 m (128 km) keeps world
-/// coords inside the f32-precision-safe range (ulp ≈ 16 mm); truly unbounded play needs camera-relative
-/// rebasing + tiered rings (WORLD_GEN_PLAN §2.9, a later task).
-pub const WORLDGEN_TERRAIN_HALF_XZ: f32 = 131072.0;
+/// World half-extent of the single global `Terrain` volume. BOUNDED to fit WITHIN the rolling height
+/// ring's covered radius (`WORLDGEN_SLICE_RADIUS` = 480): the Terrain CPU eval now samples the resident
+/// ring ARTIFACT (not an infinite analytic fBm), so a footprint reaching past the resident region would
+/// sample the miss fallback (a flat plane) at the far extents. Keeping the half-extent (384) below the
+/// slice radius (480) leaves a margin so the WHOLE volume sits over generated height. The volume FOLLOWS
+/// the camera (`WorldGenFollowCamera` default ON, snapped to the chunk grid), so this bounded footprint
+/// rides the ring everywhere the camera roams. Phase B extends this to the full clipmap (tiered rings +
+/// camera-relative rebasing, WORLD_GEN_PLAN §2.9).
+pub const WORLDGEN_TERRAIN_HALF_XZ: f32 = HEIGHT_CHUNK_CELLS as f32 * 3.0;
 
 /// Vertical AABB band the global terrain volume occupies. Tightened to bound the height layer's full
 /// fBm swing (default ≈ Σ octave amplitudes ≈ 70 m) with margin — NOT the old ±256 m. The bake's
@@ -242,14 +245,6 @@ fn roll_worldgen(
     let _span = crate::instrument::span("worldgen roll");
     let cam_pos = camera.single().map(|t| t.translation).unwrap_or(Vec3::ZERO);
 
-    // Publish the live fBm params + sea_level so the CPU Terrain `eval_primitive` can sample the
-    // height field DIRECTLY by analytic fBm (infinite, world-anchored) — the SAME fBm the ring bakes
-    // at mip 0, keeping CPU↔mesh-bake parity. Cheap (a const fold of the params), so publish every
-    // frame; the eval reads it via `cpu_fbm_params`. Uses `manager.seed()` so the published seed
-    // stays in lock-step with the resident store's generation seed.
-    let height_layer = HeightLayer::new(coord::LayerId(0), *params);
-    set_cpu_fbm_params(height_layer.fbm_params(manager.seed()), params.sea_level);
-
     // The LayerManager's generation window ALWAYS follows the camera (the LayerProcGen GenerationSource):
     // each layer maintains its rolling region around the focus, evicting what leaves it and generating
     // what enters (WORLD_GEN_PLAN §2.7). This is DECOUPLED from `follow` below — the layer must roll with
@@ -257,11 +252,11 @@ fn roll_worldgen(
     // which read the precomputed artifact + neighbour padding) and the GPU upload get the right region.
     let focus = DVec2::new(cam_pos.x as f64, cam_pos.z as f64);
 
-    // `follow` (toggle, default OFF) controls ONLY whether the render VOLUME translates with the camera.
-    // OFF (default): the volume is the static, effectively-infinite box (`WORLDGEN_TERRAIN_HALF_XZ`) whose
-    // CPU eval samples analytic world-anchored fBm directly — so it needn't move and never re-bakes on
-    // motion. ON: the volume tracks the camera (snapped to the chunk grid) — for a future bounded
-    // artifact-sampling render where the volume rides the rolling ring.
+    // `follow` (toggle, default ON) controls ONLY whether the render VOLUME translates with the camera.
+    // ON (default): the BOUNDED volume (`WORLDGEN_TERRAIN_HALF_XZ`) tracks the camera (snapped to the
+    // chunk grid) so its footprint always rides the resident rolling ring — the Terrain CPU eval samples
+    // that ARTIFACT, so the volume must follow to stay over generated height as the camera explores.
+    // OFF: the volume pins at the origin (a stable, reproducible island for authoring/testing).
     let following = follow.0;
     let target_xz = if following {
         // Snap to the chunk grid so the volume only moves on chunk crossings (no per-frame jitter / rebake).
