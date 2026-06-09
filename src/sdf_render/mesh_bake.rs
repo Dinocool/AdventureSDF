@@ -475,6 +475,27 @@ fn field_gradient(edits: &[edits::ResolvedEdit], indices: &[u32], p: Vec3, eps: 
     )
 }
 
+/// The voxel size to use for a Terrain HEIGHT sample at `p` so a coarse chunk's TRANSITION faces match its
+/// FINER neighbour exactly (watertight cross-LOD). A sample lying ON a face that borders a finer LOD (a set
+/// `flags` bit — bit order = the `SIDES`/`TransitionSide` order LowX,HighX,LowY,HighY,LowZ,HighZ) samples at
+/// the finer neighbour's voxel size (`vs·0.5`), so BOTH sides pick the same height tier/mip and agree to the
+/// bit; interior samples keep the chunk's own `vs`. Only the Terrain eval reads `vs` (for its band-limited
+/// mip select), so this is a no-op for object chunks. The shared boundary vertices sit exactly on the face
+/// plane, so a thin on-plane test catches them; `vs` doubles per LOD so the finer neighbour is always `vs·0.5`.
+fn transition_sample_vs(p: Vec3, cmin: Vec3, cmax: Vec3, vs: f32, flags: u8) -> f32 {
+    if flags == 0 {
+        return vs; // no transition faces (interior of a uniform-LOD region) — common fast path
+    }
+    let e = vs * 1.0e-3;
+    let on_finer_face = (flags & 0b00_0001 != 0 && (p.x - cmin.x).abs() <= e)
+        || (flags & 0b00_0010 != 0 && (p.x - cmax.x).abs() <= e)
+        || (flags & 0b00_0100 != 0 && (p.y - cmin.y).abs() <= e)
+        || (flags & 0b00_1000 != 0 && (p.y - cmax.y).abs() <= e)
+        || (flags & 0b01_0000 != 0 && (p.z - cmin.z).abs() <= e)
+        || (flags & 0b10_0000 != 0 && (p.z - cmax.z).abs() <= e);
+    if on_finer_face { vs * 0.5 } else { vs }
+}
+
 /// Mesh one chunk with the TRANSVOXEL algorithm (runs off-thread on the task pool). Returns `None` for an
 /// empty chunk (no surface). `indices` are the edits overlapping this chunk (the set its content hash was
 /// taken over). `subdivisions` is the chunk's cell count per axis (`K·cell_stride`); `grid_origin` is the
@@ -502,8 +523,17 @@ fn mesh_chunk(
     );
     // Transvoxel treats density > threshold as INSIDE; our CSG distance is NEGATIVE inside → negate it. The
     // tiny iso-shift keeps no sample landing EXACTLY on 0 (density > 0 is strict, so a 0 sample reads
-    // "outside" — a pinhole at grid-aligned features like a sphere pole on a grid corner).
-    let field = |x: f32, y: f32, z: f32| 1e-3 - edits::fold_csg_dist_indexed(edits, indices, Vec3::new(x, y, z), vs);
+    // "outside" — a pinhole at grid-aligned features like a sphere pole on a grid corner). Samples ON a
+    // TRANSITION face (bordering a finer LOD) use the FINER neighbour's voxel size for the Terrain height
+    // mip (`transition_sample_vs`), so the coarse transition vertices match the fine neighbour bit-for-bit
+    // → watertight cross-LOD (no tiny height seam).
+    let cmin = grid_origin;
+    let cmax = grid_origin + Vec3::splat(subdivisions as f32 * vs);
+    let field = |x: f32, y: f32, z: f32| {
+        let p = Vec3::new(x, y, z);
+        let vs_eff = transition_sample_vs(p, cmin, cmax, vs, flags);
+        1e-3 - edits::fold_csg_dist_indexed(edits, indices, p, vs_eff)
+    };
     let block = Block::new(
         [grid_origin.x, grid_origin.y, grid_origin.z],
         subdivisions as f32 * vs,
@@ -524,7 +554,7 @@ fn mesh_chunk(
             sides |= s;
         }
     }
-    let builder = ChunkMeshBuilder::new(edits, indices, grid_origin, vs, lod, debug);
+    let builder = ChunkMeshBuilder::new(edits, indices, grid_origin, vs, lod, debug, cmin, cmax, flags);
     // MUST be CacheNothing: `CacheCentralBlockOnly` caches the central block at THIS chunk's (coarse)
     // resolution, which then serves the transition cell's FINE-resolution face samples too — collapsing the
     // transition so the cross-LOD weld fails. The analytic CSG field is cheap to re-evaluate, so just query it.
@@ -559,6 +589,12 @@ struct ChunkMeshBuilder<'a> {
     vs: f32,
     lod: u32,
     debug: bool,
+    /// Chunk world min/max corner + transition-face flags — so a boundary vertex ON a face bordering a finer
+    /// LOD samples its normal + material at the FINER neighbour's voxel size (`transition_sample_vs`), matching
+    /// the density closure so position, normal AND material all agree across the cross-LOD seam.
+    cmin: Vec3,
+    cmax: Vec3,
+    flags: u8,
     positions: Vec<[f32; 3]>,
     normals: Vec<[f32; 3]>,
     /// Per unique vertex: `(nearest, runner-up)` CSG material ids (the top-2 argmin). The triangle pair folds
@@ -568,6 +604,7 @@ struct ChunkMeshBuilder<'a> {
 }
 
 impl<'a> ChunkMeshBuilder<'a> {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         edits: &'a [edits::ResolvedEdit],
         indices: &'a [u32],
@@ -575,6 +612,9 @@ impl<'a> ChunkMeshBuilder<'a> {
         vs: f32,
         lod: u32,
         debug: bool,
+        cmin: Vec3,
+        cmax: Vec3,
+        flags: u8,
     ) -> Self {
         Self {
             edits,
@@ -584,6 +624,9 @@ impl<'a> ChunkMeshBuilder<'a> {
             vs,
             lod,
             debug,
+            cmin,
+            cmax,
+            flags,
             positions: Vec::new(),
             normals: Vec::new(),
             vmat: Vec::new(),
@@ -682,12 +725,16 @@ impl MeshBuilder<f32, f32> for ChunkMeshBuilder<'_> {
         let world = Vec3::new(p.x, p.y, p.z);
         let local = world - self.origin;
         self.positions.push([local.x, local.y, local.z]);
+        // A boundary vertex ON a transition face samples its height at the FINER neighbour's voxel size (same
+        // rule as the density closure), so its normal + material match the fine neighbour bit-for-bit — no
+        // shading/material seam across the cross-LOD weld. Interior vertices use the chunk's own `vs`.
+        let vs_eff = transition_sample_vs(world, self.cmin, self.cmax, self.vs, self.flags);
         // Exact outward normal = ∇(CSG distance) (points toward increasing distance = outside the solid).
-        let n = field_gradient(self.edits, self.indices, world, self.eps, self.vs).normalize_or_zero();
+        let n = field_gradient(self.edits, self.indices, world, vs_eff * 0.01, vs_eff).normalize_or_zero();
         self.normals.push([n.x, n.y, n.z]);
         // (nearest, runner-up) materials at this vertex over the blend-padded chunk set; `finish` folds the
         // per-triangle pair from the three corners' values.
-        let (near, runner, _) = edits::fold_csg_top2(self.edits, self.indices, world, self.vs);
+        let (near, runner, _) = edits::fold_csg_top2(self.edits, self.indices, world, vs_eff);
         self.vmat.push((near, runner));
         VertexIndex(self.positions.len() - 1)
     }
