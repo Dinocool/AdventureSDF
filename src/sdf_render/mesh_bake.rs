@@ -1287,6 +1287,13 @@ fn mesh_bake_panel(world: &mut World, ui: &mut bevy_egui::egui::Ui) {
     }
 }
 
+// Performance / benchmark rig for the full LOD-8 terrain mesh-bake. Declared `#[path]`-inline so it gets
+// `super::*` (full private access to the residency helpers it faithfully replicates). Run command in its
+// module doc. It MEASURES only — drives the real `mesh_chunk` + the production residency/cull formulas.
+#[cfg(test)]
+#[path = "mesh_bake_perf.rs"]
+mod perf;
+
 #[cfg(test)]
 mod tests {
     use super::*;
