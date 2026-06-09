@@ -514,8 +514,7 @@ impl SnarlViewer<EdNode> for Viewer<'_> {
         ui: &mut egui::Ui,
         snarl: &mut Snarl<EdNode>,
     ) {
-        ui.set_max_width(NODE_BODY_MAX_W);
-        // Node params, stacked VERTICALLY at the top of the body (keeps nodes narrow); preview below.
+        // Node params / biome header, stacked vertically at the top of the body.
         match &mut snarl[node] {
             EdNode::Op(kind) => node_params_ui(ui, kind),
             EdNode::Biome { name, .. } => {
@@ -528,62 +527,28 @@ impl SnarlViewer<EdNode> for Viewer<'_> {
         {
             *self.enter = Some(node);
         }
-        // Divider between the node params (above) and the preview section (options row + preview below).
+        // Divider between the node params (above) and the preview section (below).
         ui.separator();
-        // Preview-options row (sits ABOVE the preview): collapse/expand + zoom + 2D/3D. Previews on by default.
-        let open = !self.collapsed.contains(&node);
-        ui.horizontal(|ui| {
-            if ui
-                .small_button(if open { "▾ Preview" } else { "▸ Preview" })
-                .on_hover_text("2D top-down heatmap of THIS node's output — drag the ⤢ corner to resize, set the zoom, updates live.")
-                .clicked()
-            {
-                if open {
-                    self.collapsed.insert(node);
-                } else {
-                    self.collapsed.remove(&node);
-                }
+
+        // Collapsed: just an expand toggle.
+        if self.collapsed.contains(&node) {
+            if ui.small_button("▸ Preview").on_hover_text("Show this node's 2D/3D preview").clicked() {
+                self.collapsed.remove(&node);
             }
-            if open {
-                let half = self.zoom_half_m.entry(node).or_insert(PREVIEW_HALF_M);
-                let mut km = *half * 2.0 / 1000.0; // window width in km
-                if ui
-                    .add(egui::DragValue::new(&mut km).speed(0.25).range(0.25..=128.0).suffix(" km"))
-                    .on_hover_text("Zoom: width of the sampled world window (smaller = zoomed in)")
-                    .changed()
-                {
-                    *half = (km * 1000.0 / 2.0).max(1.0);
-                }
-                // 2D heatmap ⇆ 3D SDF-raymarched surface.
-                let is3d = self.surface.contains(&node);
-                if ui
-                    .selectable_label(is3d, "3D")
-                    .on_hover_text("Toggle a 3D SDF-raymarched surface — drag to orbit, scroll or the km field to zoom/scale")
-                    .clicked()
-                {
-                    if is3d {
-                        self.surface.remove(&node);
-                    } else {
-                        self.surface.insert(node);
-                    }
-                }
-            }
-        });
-        if !open {
             self.previews.remove(&node); // free the GPU texture while collapsed
             self.body_size.insert(node, ui.min_rect().size());
             return;
         }
-        // Render resolution tracks the displayed (physical-pixel) size from last frame, so the preview
-        // gains real detail as the node is resized — capped per mode (3D raymarch is far costlier).
-        let is3d = self.surface.contains(&node);
-        let disp = self.disp_px.get(&node).copied().unwrap_or(130.0);
-        let ppp = ui.ctx().pixels_per_point();
-        let res = ((disp * ppp).round() as usize).clamp(32, if is3d { SURFACE_RES_MAX } else { PREVIEW_RES_MAX });
 
-        // Re-evaluate the sub-graph rooted at this node every frame (so edits show immediately) → texture.
-        // An unconnected input just shows a hint instead of a preview.
+        // Open: the preview IMAGE on the LEFT, its controls in a column on the RIGHT (no overlap).
+        let is3d = self.surface.contains(&node);
+        let size = self.disp_px.get(&node).copied().unwrap_or(DEFAULT_PREVIEW_PX);
+        // Render at the displayed size in physical pixels so the raymarch/heatmap detail matches the
+        // on-screen size (capped per mode — 3D raymarch is far costlier than the 2D heatmap).
+        let ppp = ui.ctx().pixels_per_point();
+        let res = ((size * ppp).round() as usize).clamp(32, if is3d { SURFACE_RES_MAX } else { PREVIEW_RES_MAX });
         let half = *self.zoom_half_m.get(&node).unwrap_or(&PREVIEW_HALF_M);
+
         match graph_rooted_at(snarl, node) {
             Ok(g) => {
                 let img = if is3d {
@@ -594,35 +559,49 @@ impl SnarlViewer<EdNode> for Viewer<'_> {
                 };
                 let handle =
                     ui.ctx().load_texture(format!("wg-preview-{node:?}"), img, egui::TextureOptions::LINEAR);
-                // Resizable region → dragging its corner grows the node. Image fills it (kept square).
-                let resp = egui::Resize::default()
-                    .id_salt(("wg-prev", node))
-                    .default_size([130.0, 130.0])
-                    .min_size([64.0, 64.0])
-                    .show(ui, |ui| {
-                        let s = ui.available_size();
-                        let d = s.x.min(s.y).max(48.0);
-                        let r = ui.image(egui::load::SizedTexture::new(handle.id(), egui::vec2(d, d)));
-                        (r, d)
-                    });
-                let (resp, d) = resp;
-                self.disp_px.insert(node, d); // feeds next frame's render resolution
-                // 3D camera interaction: drag to orbit, scroll-over to zoom (scale the framed window).
-                if is3d {
-                    let cam = self.cam.entry(node).or_insert(CAM_DEFAULT);
-                    if resp.dragged() {
-                        let dd = resp.drag_delta();
+                ui.horizontal_top(|ui| {
+                    // LEFT — the preview image (draggable to orbit in 3D).
+                    let img_resp = ui.add(
+                        egui::Image::new(egui::load::SizedTexture::new(handle.id(), egui::vec2(size, size)))
+                            .sense(egui::Sense::drag()),
+                    );
+                    if is3d && img_resp.dragged() {
+                        let dd = img_resp.drag_delta();
+                        let cam = self.cam.entry(node).or_insert(CAM_DEFAULT);
                         cam.0 += dd.x * 0.01;
                         cam.1 = (cam.1 - dd.y * 0.01).clamp(0.05, 1.5);
                     }
-                    if resp.hovered() {
-                        let scroll = ui.input(|i| i.raw_scroll_delta.y);
-                        if scroll != 0.0 {
-                            let h = self.zoom_half_m.entry(node).or_insert(PREVIEW_HALF_M);
-                            *h = (*h * (1.0 - scroll as f64 * 0.0015)).clamp(64.0, 200_000.0);
+                    // RIGHT — controls column (collapse, zoom, 2D/3D, size). Zoom via the km field (no
+                    // scroll-zoom, which would also scroll the graph area).
+                    ui.vertical(|ui| {
+                        if ui.small_button("▾").on_hover_text("Collapse preview").clicked() {
+                            self.collapsed.insert(node);
                         }
-                    }
-                }
+                        let h = self.zoom_half_m.entry(node).or_insert(PREVIEW_HALF_M);
+                        let mut km = *h * 2.0 / 1000.0;
+                        if ui
+                            .add(egui::DragValue::new(&mut km).speed(0.25).range(0.25..=128.0).suffix(" km"))
+                            .on_hover_text("Zoom: width of the sampled world window")
+                            .changed()
+                        {
+                            *h = (km * 1000.0 / 2.0).max(1.0);
+                        }
+                        if ui
+                            .selectable_label(is3d, "3D")
+                            .on_hover_text("3D SDF-raymarched surface (drag the image to orbit)")
+                            .clicked()
+                        {
+                            if is3d {
+                                self.surface.remove(&node);
+                            } else {
+                                self.surface.insert(node);
+                            }
+                        }
+                        let sz = self.disp_px.entry(node).or_insert(DEFAULT_PREVIEW_PX);
+                        ui.add(egui::DragValue::new(sz).speed(2.0).range(64.0..=400.0).suffix(" px"))
+                            .on_hover_text("Preview size");
+                    });
+                });
                 self.previews.insert(node, handle); // keep alive past paint; drops the prior frame's texture
             }
             Err(e) => {
@@ -885,12 +864,18 @@ fn auto_arrange(snarl: &mut Snarl<EdNode>, body_size: &std::collections::HashMap
 const PREVIEW_RES_MAX: usize = 256;
 /// Max render resolution (px per side) of a 3D surface preview (raymarch is far costlier than the heatmap).
 const SURFACE_RES_MAX: usize = 160;
-/// Max width (points) of a node body — keeps nodes narrow regardless of param/preview content.
-const NODE_BODY_MAX_W: f32 = 168.0;
+/// Default on-screen size (points) of a node preview; adjustable per node via the size control.
+const DEFAULT_PREVIEW_PX: f32 = 120.0;
 /// Default half-extent (metres) of the world window a preview samples, centred on the origin.
 const PREVIEW_HALF_M: f64 = 2048.0;
 /// Seed used for previews (matches the default world seed so the heatmap mirrors the live terrain).
 const PREVIEW_SEED: u64 = 7;
+/// Absolute world height (m) of sea level — values below render as water in every preview.
+const PREVIEW_SEA_LEVEL: f64 = 0.0;
+/// Absolute world height (m) that maps to the top (snow) of the land ramp.
+const PREVIEW_SNOW_LEVEL: f64 = 1000.0;
+/// Depth (m) below sea level that maps to the deepest water colour.
+const PREVIEW_WATER_DEPTH: f64 = 400.0;
 
 /// Human label for a node's input pin `slot` (shown beside the pin).
 fn input_label(node: &EdNode, slot: usize) -> &'static str {
@@ -920,43 +905,28 @@ fn input_label(node: &EdNode, slot: usize) -> &'static str {
     }
 }
 
-/// Evaluate a node's sub-[`Graph`] over a top-down grid spanning ±`half_m` metres, normalise to its own
-/// min/max, and colour-map it into an [`egui::ColorImage`] (terrain ramp: low = blue/green → high = white).
+/// Evaluate a node's sub-[`Graph`] over a top-down grid spanning ±`half_m` metres and colour each sample
+/// by its ABSOLUTE world height + sea level (not a per-preview local range), so the same colour means the
+/// same elevation across every node and zoom level. Below [`PREVIEW_SEA_LEVEL`] reads as water.
 fn render_field_preview(g: &Graph, half_m: f64, res: usize) -> egui::ColorImage {
     let n = res.max(2);
-    let mut vals = vec![0.0f64; n * n];
     let span_m = 2.0 * half_m;
+    let mut pixels = Vec::with_capacity(n * n);
     for j in 0..n {
         for i in 0..n {
             let wx = -half_m + (i as f64 + 0.5) / n as f64 * span_m;
             let wz = -half_m + (j as f64 + 0.5) / n as f64 * span_m;
-            vals[j * n + i] = g.eval(wx, wz, PREVIEW_SEED).v;
+            let c = height_color_rgb(g.eval(wx, wz, PREVIEW_SEED).v);
+            pixels.push(egui::Color32::from_rgb((c[0] * 255.0) as u8, (c[1] * 255.0) as u8, (c[2] * 255.0) as u8));
         }
     }
-    let (mut lo, mut hi) = (f64::INFINITY, f64::NEG_INFINITY);
-    for &v in &vals {
-        if v.is_finite() {
-            lo = lo.min(v);
-            hi = hi.max(v);
-        }
-    }
-    let span = if hi > lo { hi - lo } else { 1.0 };
-    let pixels: Vec<egui::Color32> =
-        vals.iter().map(|&v| terrain_ramp((((v - lo) / span).clamp(0.0, 1.0)) as f32)).collect();
     egui::ColorImage::new([n, n], pixels)
 }
 
-/// Map a normalised height `t∈[0,1]` to a terrain colour ramp (deep → grass → rock → snow) as linear rgb.
-fn ramp_rgb(t: f32) -> [f32; 3] {
-    const STOPS: [(f32, [f32; 3]); 5] = [
-        (0.0, [0.12, 0.24, 0.47]),
-        (0.35, [0.24, 0.55, 0.35]),
-        (0.6, [0.47, 0.59, 0.27]),
-        (0.8, [0.55, 0.47, 0.35]),
-        (1.0, [0.94, 0.94, 0.96]),
-    ];
-    let mut c = STOPS[STOPS.len() - 1].1;
-    for w in STOPS.windows(2) {
+/// Linear-interpolate an rgb colour ramp at `t∈[0,1]`.
+fn lerp_stops(t: f32, stops: &[(f32, [f32; 3])]) -> [f32; 3] {
+    let mut c = stops[stops.len() - 1].1;
+    for w in stops.windows(2) {
         let (t0, c0) = w[0];
         let (t1, c1) = w[1];
         if t <= t1 {
@@ -968,10 +938,24 @@ fn ramp_rgb(t: f32) -> [f32; 3] {
     c
 }
 
-/// Map a normalised height `t∈[0,1]` to a terrain ramp colour.
-fn terrain_ramp(t: f32) -> egui::Color32 {
-    let c = ramp_rgb(t);
-    egui::Color32::from_rgb((c[0] * 255.0) as u8, (c[1] * 255.0) as u8, (c[2] * 255.0) as u8)
+/// Colour an ABSOLUTE world height (m): water below sea level (shore → deep), then a land ramp from sea
+/// level (beach) up to the snow line. Shared by the 2D heatmap and the 3D surface so they agree.
+fn height_color_rgb(v: f64) -> [f32; 3] {
+    const WATER: [(f32, [f32; 3]); 2] = [(0.0, [0.30, 0.52, 0.68]), (1.0, [0.05, 0.12, 0.32])];
+    const LAND: [(f32, [f32; 3]); 5] = [
+        (0.0, [0.76, 0.70, 0.50]),  // beach / sand
+        (0.12, [0.24, 0.55, 0.35]), // grass
+        (0.45, [0.36, 0.45, 0.26]), // forest / hill
+        (0.72, [0.48, 0.42, 0.36]), // rock
+        (1.0, [0.95, 0.95, 0.97]),  // snow
+    ];
+    if v < PREVIEW_SEA_LEVEL {
+        let t = ((PREVIEW_SEA_LEVEL - v) / PREVIEW_WATER_DEPTH).clamp(0.0, 1.0) as f32;
+        lerp_stops(t, &WATER)
+    } else {
+        let t = ((v - PREVIEW_SEA_LEVEL) / (PREVIEW_SNOW_LEVEL - PREVIEW_SEA_LEVEL)).clamp(0.0, 1.0) as f32;
+        lerp_stops(t, &LAND)
+    }
 }
 
 // ===================================================================================================
@@ -1032,7 +1016,7 @@ fn render_surface_preview(g: &Graph, half_m: f64, yaw: f32, pitch: f32, res: usi
             let ndcy = 1.0 - (py as f32 + 0.5) / res as f32 * 2.0;
             let dir = (fwd + right * (ndcx * tan) + up * (ndcy * tan)).normalize();
             let col = match ray_box(eye, dir, bmin, bmax) {
-                Some((t0, t1)) => march_surface(g, eye, dir, t0.max(0.0), t1, hmin, span, light, ndcy),
+                Some((t0, t1)) => march_surface(g, eye, dir, t0.max(0.0), t1, light, ndcy),
                 None => sky(ndcy),
             };
             pixels.push(col);
@@ -1052,16 +1036,13 @@ fn ray_box(o: bevy::math::Vec3, d: bevy::math::Vec3, bmin: bevy::math::Vec3, bma
 }
 
 /// March a ray through the heightfield between `t0..t1`; on the first downward crossing shade with the
-/// analytic-gradient normal + terrain ramp, else return sky.
-#[allow(clippy::too_many_arguments)]
+/// analytic-gradient normal + ABSOLUTE-height terrain colour, else return sky.
 fn march_surface(
     g: &Graph,
     eye: bevy::math::Vec3,
     dir: bevy::math::Vec3,
     t0: f32,
     t1: f32,
-    hmin: f64,
-    span: f64,
     light: bevy::math::Vec3,
     ndcy: f32,
 ) -> egui::Color32 {
@@ -1094,7 +1075,7 @@ fn march_surface(
             let f = g.eval(pm.x as f64, pm.z as f64, PREVIEW_SEED);
             let n = Vec3::new(-f.dx as f32, 1.0, -f.dz as f32).normalize();
             let lamb = n.dot(light).clamp(0.0, 1.0);
-            let base = ramp_rgb((((f.v - hmin) / span).clamp(0.0, 1.0)) as f32);
+            let base = height_color_rgb(f.v);
             let lit = 0.28 + 0.72 * lamb;
             return egui::Color32::from_rgb(
                 (base[0] * lit * 255.0) as u8,
