@@ -55,7 +55,8 @@ const MAX_NEW_TASKS_PER_FRAME: usize = 256;
 /// Hard ceiling on the mesh-bake LOD count (`lod_count` slider max). LODs `0..=MAX_MESH_LODS-1`. The
 /// worldgen height clipmap derives its tier count from the live `lod_count`, so this also bounds the
 /// sample-area window. Stats arrays + the debug tint cover this whole range so nothing clips at runtime.
-pub(crate) const MAX_MESH_LODS: u32 = 17;
+/// (Kept ≤ 32 so the `[usize; MAX_MESH_LODS]` stat arrays still derive `Default`.)
+pub(crate) const MAX_MESH_LODS: u32 = 32;
 
 /// Hash-mix multiplier for folding the "Rebake all" epoch into a chunk's content hash.
 const EPOCH_MIX: u64 = 0x9E37_79B9_7F4A_7C15;
@@ -170,12 +171,13 @@ pub(crate) struct MeshBakeConfig {
 impl Default for MeshBakeConfig {
     fn default() -> Self {
         // K=4 → 64 bricks/chunk. lod0_radius 16 keeps the finest LOD out to a comfortable distance (push
-        // it down to shrink the LOD-0 cube); lod_count 9 spans LOD 0..=8 (the lod_test showcase scene).
-        // Cross-LOD seams are crack-free BY CONSTRUCTION (Transvoxel transition cells) — no toggle needed.
+        // it down to shrink the LOD-0 cube); lod_count 16 spans LOD 0..=15 (far worldgen horizon — the
+        // height-clipmap window auto-grows to match). Cross-LOD seams are crack-free BY CONSTRUCTION
+        // (Transvoxel transition cells) — no toggle needed.
         Self {
             chunk_bricks: 4,
             lod0_radius: 16.0,
-            lod_count: 9,
+            lod_count: 16,
             debug_lod_colour: false,
             debug_normals: false,
             freeze_lod: false,
