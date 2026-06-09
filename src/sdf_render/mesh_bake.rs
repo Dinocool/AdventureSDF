@@ -2301,8 +2301,12 @@ mod tests {
             ..Default::default()
         };
         let off = ErosionParams { enabled: false, ..Default::default() };
-        let (raw_crest, raw_worst) = report("dense-ridge RAW (bl=0)", dense(0.0), off);
-        let (bl_crest, bl_worst) = report("dense-ridge BAND-LIMIT (bl=2)", dense(2.0), off);
+        // RADIUS SWEEP — does crest serration keep dropping with the band-limit radius (→ a tuning/default
+        // issue, crank the slider) or plateau (→ structural: bilinear-grid interp or inherent apex)?
+        let (raw_crest, raw_worst) = report("dense-ridge bl=0", dense(0.0), off);
+        report("dense-ridge bl=2", dense(2.0), off);
+        report("dense-ridge bl=4", dense(4.0), off);
+        let (bl_crest, bl_worst) = report("dense-ridge bl=8", dense(8.0), off);
         // REGRESSION GUARD: the band-limit finalize stage must measurably reduce crest serration (both the
         // mean crest normal-spread and the worst single-triangle spread). If a future change breaks the
         // band-limit (or reverts it), these fail.

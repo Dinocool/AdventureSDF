@@ -16,7 +16,7 @@ use super::erosion::{ErosionParams, erode_with_grad};
 /// Bump when the height layer's *output* intentionally changes (algorithm/constants). It keys the
 /// disk cache (WORLD_GEN_PLAN §2.3) and the parity reference vectors — a change here forces
 /// regenerating reference values, making "I meant to change the terrain" explicit and review-visible.
-pub const HEIGHT_GEN_VERSION: u32 = 5;
+pub const HEIGHT_GEN_VERSION: u32 = 6;
 
 /// Chunk edge in base cells (= metres) for the height layer's tier.
 pub const HEIGHT_CHUNK_CELLS: u32 = 128;
@@ -75,8 +75,11 @@ impl Default for HeightParams {
             sea_level: 0.0,
             ridge: 0.5,
             // Round sharp crests over ~3 nodes (≈6 m at tier 0) so the Transvoxel grid meshes them with
-            // well-formed triangles and continuous normals. Tunable live via the World Gen panel.
-            band_limit: 1.5,
+            // well-formed triangles and continuous normals. The radius is the lever: the triangle-quality
+            // harness sweep shows worst crest normal-spread falling monotonically with it (dense ridge:
+            // 143°→91°→59°→30° at radius 0→2→4→8). A bigger radius cleans crests but also softens fine
+            // detail (it's a global low-pass) — tune live via the World Gen panel's "Crest band-limit".
+            band_limit: 3.0,
             seed_salt: 0,
         }
     }
