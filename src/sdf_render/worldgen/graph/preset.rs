@@ -12,6 +12,11 @@ use super::node::{FbmAxis, Graph, Node, NodeKind};
 /// the bake hot path). Phase-1 presets are well under this.
 pub const MAX_GRAPH_NODES: usize = 64;
 
+/// Mountain carrier amplitude for the shipped `mountains_plains` graph / `WorldGraph` default — high
+/// (tall + steep peaks over the ~1.5 km mountain wavelength). One source of truth shared by the
+/// production default, the shipped `.ron`, and its guard test.
+pub const MOUNTAINS_PLAINS_AMPLITUDE: f64 = 700.0;
+
 /// The legacy-equivalent surface: carrier fBm → ridge fold → sea-level offset. Reproduces the pre-graph
 /// `HeightLayer` surface (minus the separate erosion stage) — VALUE bit-for-bit (same op order via
 /// commutativity), gradient to f64 round-off (autodiff vs the hand-derived `k`-scaling). Used as the
@@ -46,10 +51,10 @@ pub fn mountains_plains_graph(seed_amplitude: f64) -> Graph {
         // Plains surface (gentle), low base elevation.
         Node::source(NodeKind::Fbm(plains)),                                                     // 3
         Node::unary(NodeKind::Offset(4.0), 3),                                                   // 4 plains
-        // Mountain surface: ridged carrier, high base elevation.
+        // Mountain surface: ridged carrier (sharp crests), high base elevation.
         Node::source(NodeKind::Fbm(mtn)),                                                        // 5
-        Node::unary(NodeKind::Ridge { ridge: 0.85, amp_sum: mtn_amp_sum }, 5),                   // 6
-        Node::unary(NodeKind::Offset(60.0), 6),                                                  // 7 mountains
+        Node::unary(NodeKind::Ridge { ridge: 0.92, amp_sum: mtn_amp_sum }, 5),                   // 6
+        Node::unary(NodeKind::Offset(120.0), 6),                                                 // 7 mountains
         // Placement: blend plains→mountains by the continentalness gate.
         Node::ternary(NodeKind::Mix, 4, 7, 2),                                                   // 8 output
     ];

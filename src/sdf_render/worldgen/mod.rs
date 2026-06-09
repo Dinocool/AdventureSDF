@@ -135,7 +135,7 @@ pub struct WorldGraph(pub Arc<graph::Graph>);
 
 impl Default for WorldGraph {
     fn default() -> Self {
-        Self(Arc::new(graph::preset::mountains_plains_graph(280.0)))
+        Self(Arc::new(graph::preset::mountains_plains_graph(graph::preset::MOUNTAINS_PLAINS_AMPLITUDE)))
     }
 }
 
