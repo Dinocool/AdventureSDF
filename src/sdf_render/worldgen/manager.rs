@@ -94,17 +94,37 @@ impl LayerManager {
     }
 
     /// Reconfigure the clipmap to `tiers` tiers — the dynamic "window matches the LOD slider" hook: when
-    /// the mesh-bake `lod_count` changes, the loaded sample-area window must grow/shrink to cover the new
-    /// reach. No-op (returns `false`) if already `tiers`. Otherwise rebuilds the tier layers/metas for the
-    /// new count with `params` and CLEARS residency, so the new tier set streams in from scratch (a coarse
-    /// tier added → its far coverage fills in via the budget; tiers removed → that residency just drops).
-    /// Preserves the seed (deterministic). Cheap to call every frame; only the actual count change rebuilds.
+    /// the mesh-bake `lod_count` changes, the loaded sample-area window grows/shrinks to cover the new
+    /// reach. No-op (returns `false`) if already `tiers`. GROW = APPEND the new coarse tiers and KEEP the
+    /// existing tiers' layers + residency (same chunk sizes/params), so growing the window never
+    /// regenerates — or flickers — the already-loaded terrain (the new far coverage just streams in via the
+    /// budget). SHRINK = drop the coarsest tiers + their residency; the finer tiers stay loaded. Appended
+    /// tiers use `params` (the current height params); a same-frame PARAM edit is handled separately by
+    /// `set_height_params`, which rebuilds ALL tiers. Clamped to ≥ 1 tier.
     pub fn set_tier_count(&mut self, tiers: u32, params: HeightParams) -> bool {
         let tiers = tiers.max(1);
-        if tiers == self.tier_count() {
+        let cur = self.tier_count();
+        if tiers == cur {
             return false;
         }
-        *self = Self::new_clipmap(self.seed, params, tiers);
+        if tiers > cur {
+            for t in cur..tiers {
+                let chunk_cells = HEIGHT_CHUNK_CELLS << t; // HEIGHT_CHUNK_CELLS · 2^t
+                let layer = HeightLayer::new_tier(LayerId(t), params, chunk_cells);
+                let radius = HEIGHT_CHUNK_CELLS as f64 * 3.75 * (1u32 << t) as f64;
+                self.metas.push(LayerMeta {
+                    id: layer.id(),
+                    size: layer.chunk_size(),
+                    deps: layer.dependencies().to_vec(),
+                    direct_radius: Some(radius),
+                });
+                self.layers.push(Box::new(layer));
+            }
+        } else {
+            self.layers.truncate(tiers as usize);
+            self.metas.truncate(tiers as usize);
+            self.height.retain(|c| c.layer.0 < tiers); // drop the removed tiers' residency
+        }
         true
     }
 
@@ -297,16 +317,22 @@ mod tests {
         m.update(DVec2::ZERO);
         assert_eq!(m.tier_count(), 3);
         assert!(!m.height_store().is_empty());
-        // No-op when the count is unchanged (must NOT clear residency).
+        // No-op when the count is unchanged (must NOT touch residency).
         assert!(!m.set_tier_count(3, HeightParams::default()));
         assert!(!m.height_store().is_empty(), "unchanged tier count keeps residency");
-        // Grow → rebuild + clear; the new tier set streams in on the next update.
+        // Grow → APPEND tiers, KEEP existing residency (no flicker); the new tiers stream in later.
+        let before = m.height_store().len();
         assert!(m.set_tier_count(5, HeightParams::default()));
         assert_eq!(m.tier_count(), 5);
-        assert!(m.height_store().is_empty(), "a tier-count change clears residency");
-        // Shrink, and the floor is 1 tier.
+        assert_eq!(m.height_store().len(), before, "growing the window keeps the loaded terrain");
+        // Shrink to 1 (0 clamps to ≥ 1): drops the dropped tiers' residency. Tier 0 was resident, so the
+        // store keeps its tier-0 chunks (here all residency was tier 0..2, so 1 tier remains populated).
         assert!(m.set_tier_count(0, HeightParams::default()));
         assert_eq!(m.tier_count(), 1, "clamped to ≥ 1 tier");
+        assert!(
+            m.height_store().resident_coords().all(|c| c.layer == LayerId(0)),
+            "shrink drops the removed tiers' chunks"
+        );
     }
 
     /// A clipmap manager builds one layer per tier with chunk size `HEIGHT_CHUNK_CELLS·2^t`.

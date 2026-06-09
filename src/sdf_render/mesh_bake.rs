@@ -43,6 +43,7 @@ use transvoxel::structs::vertex_index::VertexIndex;
 use transvoxel::traits::mesh_builder::MeshBuilder;
 
 use crate::sdf_render::atlas::BrickKey;
+use crate::sdf_render::worldgen::upload::HeightClipmap;
 use crate::sdf_render::{
     edits, gather_sorted_edits, SdfCamera, SdfGridConfig, SdfVolume, VolumeQueryData,
 };
@@ -98,6 +99,12 @@ struct BakeRound {
     /// That makes a LOD swap atomic: the old meshes are held until every chunk of the new residency is baked,
     /// then old-out/new-in happen in the same commit (no 1-frame hole). The live set seeds the NEXT snapshot.
     resident: HashSet<BrickKey>,
+    /// Frozen height-clipmap snapshot for this round — the EXACT clipmap whose coverage gate admitted this
+    /// round's residency. Each bake samples THIS snapshot (not the live global), so a clipmap that changes
+    /// mid-round — a camera roll evicting a tier, or a `lod_count` slider growing/shrinking the window
+    /// (which rebuilds + may clear the store) — can never make an in-flight bake sample uncovered ground
+    /// and trip the strict sampler. `None` = no terrain (only object edits) → the bake reads the global.
+    clipmap: Option<Arc<HeightClipmap>>,
 }
 
 /// Per-system scalar `Local` state, bundled (Bevy systems cap at 16 params).
@@ -544,13 +551,17 @@ fn mesh_chunk(
     flags: u8,
     lod: u32,
     debug: bool,
+    terrain: Option<Arc<HeightClipmap>>,
 ) -> Option<ChunkMeshData> {
-    // Install this chunk's Terrain clipmap snapshot ONCE on this bake thread (held for the whole bake),
-    // so each of the chunk's hundreds-of-thousands of field samples reads it via a thread-local borrow
-    // instead of a process-global RwLock + Arc-clone — the per-sample lock/atomic, contended across the
-    // async pool, was the dominant bake cost. Also pins the bake to ONE stable clipmap (no mid-bake roll).
+    // Install THIS ROUND'S frozen Terrain clipmap snapshot ONCE on the bake thread (held for the whole
+    // bake), so every field sample reads it via a thread-local borrow instead of a process-global RwLock +
+    // Arc-clone (the per-sample lock/atomic, contended across the async pool, was the dominant bake cost).
+    // Crucially the snapshot is the one whose coverage gate ADMITTED this chunk (see `BakeRound::clipmap`),
+    // so a clipmap that changes mid-bake (camera roll / `lod_count` slider rebuild) can't make this bake
+    // sample uncovered ground and trip the strict sampler. `None` (object-only round) ⇒ falls back to the
+    // global (the eval then panics only on a genuine rendering miss, which the gate still prevents).
     let _bake_terrain = crate::sdf_render::worldgen::upload::set_bake_terrain(
-        crate::sdf_render::worldgen::upload::cpu_height_clipmap(),
+        terrain,
         crate::sdf_render::worldgen::upload::cpu_terrain_offset(),
     );
     // Transvoxel treats density > threshold as INSIDE; our CSG distance is NEGATIVE inside → negate it. The
@@ -1230,6 +1241,7 @@ fn mesh_resident_chunks(
             round.cam = cam; // freeze the camera so the round's transition flags are self-consistent
             round.half0 = half0;
             round.resident = resident.clone(); // FREEZE the residency — the round bakes/commits/reaps this set
+            round.clipmap = height_clipmap.clone(); // FREEZE the clipmap that admitted this residency (bake snapshot)
             for &key in &resident {
                 states.0.entry(key).or_default().target_hash = current_hashes[&key];
             }
@@ -1320,8 +1332,11 @@ fn mesh_resident_chunks(
             let lod = key.lod;
             let edits = round_edits.clone();
             let indices = idx.clone();
+            // The round's FROZEN clipmap snapshot — the bake samples THIS, not the live global, so a
+            // mid-bake clipmap change (camera roll / lod_count rebuild) can't make it sample uncovered ground.
+            let terrain = round.clipmap.clone();
             st.task = Some(pool.spawn(async move {
-                mesh_chunk(&edits, &indices, grid_origin, vs_l, k * cs, flags, lod, debug)
+                mesh_chunk(&edits, &indices, grid_origin, vs_l, k * cs, flags, lod, debug, terrain)
             }));
             budget -= 1;
         }
@@ -1670,7 +1685,7 @@ mod tests {
         let edits = [sphere_edit(Vec3::ZERO, 1.0)];
         let (vs, sub) = (0.1f32, 28u32); // block span = 28·0.1 = 2.8 > sphere Ø 2.0 → clears all faces
         let origin = Vec3::splat(-1.4);
-        let data = mesh_chunk(&edits, &[0], origin, vs, sub, 0, 0, false).expect("sphere meshes");
+        let data = mesh_chunk(&edits, &[0], origin, vs, sub, 0, 0, false, None).expect("sphere meshes");
         assert_eq!(open_edge_count(&chunk_tris(&data, origin)), 0, "closed sphere must be watertight");
     }
 
@@ -1690,8 +1705,8 @@ mod tests {
         let (vsf, vsc, sub) = (0.1f32, 0.2f32, 28u32);
         let of = Vec3::new(0.0, -1.4, -1.4); // fine x∈[0,2.8]; −X face at x=0 (regular, high-res)
         let oc = Vec3::new(-5.6, -2.8, -2.8); // coarse x∈[−5.6,0]; +X face at x=0 is the transition side
-        let fine = mesh_chunk(&edits, &idx, of, vsf, sub, 0, 0, false).expect("fine meshes");
-        let coarse = mesh_chunk(&edits, &idx, oc, vsc, sub, 1 << 1, 1, false).expect("coarse meshes");
+        let fine = mesh_chunk(&edits, &idx, of, vsf, sub, 0, 0, false, None).expect("fine meshes");
+        let coarse = mesh_chunk(&edits, &idx, oc, vsc, sub, 1 << 1, 1, false, None).expect("coarse meshes");
         let mut all = chunk_tris(&fine, of);
         all.extend(chunk_tris(&coarse, oc));
         assert_eq!(
@@ -1721,7 +1736,7 @@ mod tests {
         ];
         let (vs, sub) = (0.1f32, 32u32); // span 3.2 > shape Ø (cube corner ≈ 1.39) → closed in one chunk
         let origin = Vec3::splat(-1.6);
-        let data = mesh_chunk(&edits, &[0, 1], origin, vs, sub, 0, 0, false).expect("merged shape meshes");
+        let data = mesh_chunk(&edits, &[0, 1], origin, vs, sub, 0, 0, false, None).expect("merged shape meshes");
         (data, origin)
     }
 
@@ -1761,7 +1776,7 @@ mod tests {
         // (0.4,0,0) crosses the block's +X face (x=0); every normal must point outward from the sphere centre.
         let edits = [sphere_edit(Vec3::new(0.4, 0.0, 0.0), 1.0)];
         let oc = Vec3::new(-5.6, -2.8, -2.8);
-        let coarse = mesh_chunk(&edits, &[0], oc, 0.2, 28, 1 << 1, 1, false).expect("coarse+transition meshes");
+        let coarse = mesh_chunk(&edits, &[0], oc, 0.2, 28, 1 << 1, 1, false, None).expect("coarse+transition meshes");
         let center = Vec3::new(0.4, 0.0, 0.0);
         let (mut worst, mut inward, mut degenerate) = (1.0f32, 0, 0);
         for i in 0..coarse.positions.len() {

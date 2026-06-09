@@ -277,18 +277,17 @@ fn roll_worldgen(
 
     // DYNAMIC WINDOW: the height-clipmap tier count tracks the live mesh-bake `lod_count` (the LOD slider),
     // so the loaded sample-area window always covers the configured LOD reach. Recompute the needed tiers
-    // from the mesh-bake clipmap each frame; `set_tier_count` only rebuilds the stack on an actual change
-    // (rebuilding with the current params + clearing residency, so the new tier set streams in).
+    // from the mesh-bake clipmap each frame; `set_tier_count` only changes the stack on an actual change —
+    // GROW appends coarse tiers (keeps loaded terrain, no flicker), SHRINK drops the coarsest tiers.
     let reach = crate::sdf_render::mesh_bake::coarsest_lod_outer_reach(&grid_cfg, &mesh_cfg) as f64;
     let tiers_changed = manager.set_tier_count(height_clipmap_tiers(reach), *params);
 
-    // Editor param tweak → evict residency so `update` regenerates from the new params. Track the
-    // last-applied params so an unchanged frame doesn't needlessly clear (mirrors the fingerprint gate in
-    // `update_height_field`). A param edit is an EXPLICIT full regen — the one case that pulses the
-    // mesh-bake full-rebake below. Skip the explicit clear when a tier change already rebuilt (which
-    // applied the current params + cleared residency).
+    // Editor param tweak → rebuild ALL tiers from the new params + evict residency so `update` regenerates.
+    // Tracked so an unchanged frame doesn't needlessly clear. A param edit is an EXPLICIT full regen — the
+    // one case that pulses the mesh-bake full-rebake. (A pure tier change keeps the existing fBm params, so
+    // it needs no rebuild — `set_height_params` is only for an actual param edit.)
     let params_changed = *last_params != Some(*params);
-    if params_changed && !tiers_changed {
+    if params_changed {
         manager.set_height_params(*params);
     }
     if params_changed || tiers_changed {
