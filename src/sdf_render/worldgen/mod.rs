@@ -455,7 +455,7 @@ fn worldgen_panel(world: &mut World, ui: &mut bevy_egui::egui::Ui) {
         }
         let mut band_limit = p.band_limit;
         if ui
-            .add(Slider::new(&mut band_limit, 0.0..=4.0).text("Crest band-limit (node radii)"))
+            .add(Slider::new(&mut band_limit, 0.0..=8.0).text("Crest band-limit (node radii)"))
             .changed()
         {
             world.resource_mut::<HeightParams>().band_limit = band_limit;
