@@ -290,7 +290,14 @@ pub fn smax(a: f32, b: f32, k: f32) -> f32 {
 
 /// Evaluate a primitive's signed distance at a point already in the primitive's
 /// local space. This is the single source of truth for primitive SDFs.
-pub fn eval_primitive(prim: &SdfPrimitive, p: Vec3) -> f32 {
+///
+/// `voxel_size` is the LOD context (world metres per bake voxel) of the caller sampling this field:
+/// only the [`Terrain`](SdfPrimitive::Terrain) arm uses it, to pick the band-limited height mip (the
+/// finest mip whose node spacing ≥ `voxel_size`) so a coarse-LOD brick samples a surface it can
+/// actually resolve (no sub-voxel aliasing → no far-extent holes). All other primitives ignore it.
+/// `voxel_size == 0.0` is the documented sentinel for "finest / no band-limit" — pass it from
+/// non-LOD callers (picking, classification, tests).
+pub fn eval_primitive(prim: &SdfPrimitive, p: Vec3, voxel_size: f32) -> f32 {
     match prim {
         SdfPrimitive::Sphere { radius } => p.length() - *radius,
         SdfPrimitive::Box { half_extents } => {
@@ -344,27 +351,35 @@ pub fn eval_primitive(prim: &SdfPrimitive, p: Vec3) -> f32 {
             ..
         } => {
             // Worldgen terrain surface (CPU side: picking + bake-scheduler classification + the MESH
-            // bake's `fold_csg`). Sample the height field DIRECTLY by analytic fBm — the height layer
-            // is a pure `f(world_xz, seed)` (`fbm_height_grad`), so this is INFINITE and world-anchored
-            // (no bounded resident-ring window). One large static volume thus fills the whole mesh-bake
-            // clipmap everywhere the camera roams. This is the SAME fBm the ring bakes at mip 0, so the
-            // analytic path and the ring's mip-0 surface agree by construction (CPU↔mesh-bake parity).
-            // The signed VERTICAL gap `p.y - h` (one-sided, like Heightmap).
+            // bake's `fold_csg`). Sample the GLOBAL height-ring snapshot the worldgen plugin publishes
+            // (`cpu_height_ring`) — the world-anchored toroidal clipmap the `LayerManager` streams (the
+            // LayerProcGen rolling artifact), exactly what the MESH bake folds. The signed VERTICAL gap
+            // `p.y - h` (one-sided, like Heightmap).
             //
-            // The Terrain volume MAY translate (its transform; with follow OFF it stays at the origin →
-            // offset 0), so this LOCAL `p` is converted to WORLD XZ by adding the volume's current
-            // world-XZ offset (`cpu_terrain_offset`). ASSUMPTION: translation-only with
-            // `translation.y == 0`, so `local.xz + offset == world.xz` and `local.y == world.y`.
-            // Before worldgen publishes its params (`cpu_fbm_params` == None — worldgen disabled / not
-            // yet rolled) we fall back to the flat mid-band plane so the field stays finite (valid AABB).
+            // LOD: sample the band-limited mip whose node spacing ≥ `voxel_size` (`sample_ring_lod`),
+            // so a coarse-LOD brick reads a surface low-passed below its Nyquist — no sub-voxel aliasing
+            // at the far extents. `voxel_size == 0.0` (non-LOD callers: picking/classification/tests) ⇒
+            // mip 0 (full detail).
+            //
+            // The Terrain volume FOLLOWS the camera (its transform translates on chunk crossings — see
+            // `worldgen::roll_worldgen`), so this LOCAL `p` is NOT the world position. The height ring
+            // is world-anchored, so convert local XZ → WORLD XZ by adding the volume's current world-XZ
+            // offset (`cpu_terrain_offset`, kept in sync by the follow system) before sampling.
+            // ASSUMPTION: the volume is translation-only with `translation.y == 0`, so
+            // `local.xz + offset == world.xz` and `local.y == world.y`. A miss (no ring built yet /
+            // outside the resident clipmap) falls back to the flat mid-band plane so the field stays
+            // finite (valid AABB).
             let offset = crate::sdf_render::worldgen::upload::cpu_terrain_offset();
-            match crate::sdf_render::worldgen::upload::cpu_fbm_params() {
-                Some((params, sea_level)) => {
-                    let wx = (p.x + offset.x) as f64;
-                    let wz = (p.z + offset.y) as f64;
-                    let h = crate::sdf_render::worldgen::noise::fbm_height_grad(wx, wz, &params).0
-                        + sea_level as f64;
-                    p.y - h as f32
+            let world_xz =
+                bevy::math::DVec2::new((p.x + offset.x) as f64, (p.z + offset.y) as f64);
+            match crate::sdf_render::worldgen::upload::cpu_height_ring() {
+                Some(ring) => {
+                    match crate::sdf_render::worldgen::upload::sample_ring_lod(
+                        &ring, world_xz, voxel_size,
+                    ) {
+                        Some(node) => p.y - node.height,
+                        None => p.y - (min_height + max_height) * 0.5,
+                    }
                 }
                 None => p.y - (min_height + max_height) * 0.5,
             }
@@ -375,17 +390,17 @@ pub fn eval_primitive(prim: &SdfPrimitive, p: Vec3) -> f32 {
 /// Evaluate a primitive at a world position by inverse-transforming into local
 /// space. Scale is applied uniformly via the matrix; non-uniform scale will skew
 /// the field (acceptable for the editor, documented limitation).
-pub fn eval_world(prim: &SdfPrimitive, transform: &Transform, world_pos: Vec3) -> f32 {
+pub fn eval_world(prim: &SdfPrimitive, transform: &Transform, world_pos: Vec3, voxel_size: f32) -> f32 {
     let local = transform.to_matrix().inverse().transform_point3(world_pos);
-    eval_primitive(prim, local)
+    eval_primitive(prim, local, voxel_size)
 }
 
 /// As [`eval_world`] but with a PRECOMPUTED model→local inverse (`ResolvedEdit::inv_model`),
 /// skipping the per-call 4×4 inversion. The hot bake fold paths use this; `inv` must equal
 /// `transform.to_matrix().inverse()` for the primitive's transform.
 #[inline]
-pub fn eval_world_inv(prim: &SdfPrimitive, inv: &Mat4, world_pos: Vec3) -> f32 {
-    eval_primitive(prim, inv.transform_point3(world_pos))
+pub fn eval_world_inv(prim: &SdfPrimitive, inv: &Mat4, world_pos: Vec3, voxel_size: f32) -> f32 {
+    eval_primitive(prim, inv.transform_point3(world_pos), voxel_size)
 }
 
 /// Deterministic value-noise height sample over the XZ plane. Bilinear-lerped
@@ -691,17 +706,18 @@ pub struct EditSample {
 
 /// Fold an ordered edit list into a single signed distance + material id at `pos`.
 ///
-/// `edits` must already be sorted by [`SdfOrder`]. Material rules:
+/// `edits` must already be sorted by [`SdfOrder`]. `voxel_size` is the LOD context forwarded to
+/// [`eval_primitive`] (only Terrain reads it; `0.0` = finest). Material rules:
 /// - Union: the nearer surface owns the material.
 /// - Subtract: the carving edit contributes no material (accumulator keeps its id).
 /// - Intersect: the more-constraining (larger-distance) surface owns the material.
-pub fn fold_csg(edits: &[ResolvedEdit], pos: Vec3) -> EditSample {
+pub fn fold_csg(edits: &[ResolvedEdit], pos: Vec3, voxel_size: f32) -> EditSample {
     let mut acc = f32::MAX;
     let mut mat: u16 = 0;
     let mut started = false;
 
     for e in edits {
-        let dn = eval_world_inv(&e.prim, &e.inv_model, pos);
+        let dn = eval_world_inv(&e.prim, &e.inv_model, pos, voxel_size);
         let k = e.op.smoothing;
 
         // Nothing accumulated yet: only a Union can bring matter into existence.
@@ -790,12 +806,12 @@ pub fn quantize(v: f32) -> i64 {
 /// one point per candidate brick without cloning the edit subset. A deliberate mirror of
 /// [`fold_csg`]'s sign rules (Union = `smin`, Subtract = `smax(-dn)`, Intersect = `smax`); the two
 /// MUST stay in agreement — a regression test pins them, since this one drops the material branch.
-pub fn fold_csg_dist_indexed(edits: &[ResolvedEdit], indices: &[u32], pos: Vec3) -> f32 {
+pub fn fold_csg_dist_indexed(edits: &[ResolvedEdit], indices: &[u32], pos: Vec3, voxel_size: f32) -> f32 {
     let mut acc = f32::MAX;
     let mut started = false;
     for &i in indices {
         let e = &edits[i as usize];
-        let dn = eval_world_inv(&e.prim, &e.inv_model, pos);
+        let dn = eval_world_inv(&e.prim, &e.inv_model, pos, voxel_size);
         let k = e.op.smoothing;
         if !started {
             if e.op.kind == CsgKind::Union {
@@ -834,8 +850,8 @@ pub type Palette = [u16; PALETTE_K];
 /// voxel corners), so a material that wins anywhere in the brick is kept. Subtract
 /// edits contribute no material. Returned ids are sorted ascending for a stable,
 /// neighbour-agnostic slot assignment; empty slots are [`PALETTE_EMPTY`].
-pub fn build_palette(edits: &[ResolvedEdit], sample_points: &[Vec3]) -> Palette {
-    build_palette_inner(edits.iter(), sample_points)
+pub fn build_palette(edits: &[ResolvedEdit], sample_points: &[Vec3], voxel_size: f32) -> Palette {
+    build_palette_inner(edits.iter(), sample_points, voxel_size)
 }
 
 /// As [`build_palette`] but over the edits at `indices` (into `edits`), avoiding a per-brick
@@ -843,11 +859,11 @@ pub fn build_palette(edits: &[ResolvedEdit], sample_points: &[Vec3]) -> Palette 
 /// each brick's candidate edits (now 100+ bytes each, carrying the cached `inv_model`) into a
 /// fresh `Vec` just to pass `build_palette` was 16k heap allocations/frame. This folds the same
 /// result straight from the index list (mirrors [`fold_csg_dist_indexed`]).
-pub fn build_palette_indexed(edits: &[ResolvedEdit], indices: &[u32], sample_points: &[Vec3]) -> Palette {
-    build_palette_inner(indices.iter().map(|&i| &edits[i as usize]), sample_points)
+pub fn build_palette_indexed(edits: &[ResolvedEdit], indices: &[u32], sample_points: &[Vec3], voxel_size: f32) -> Palette {
+    build_palette_inner(indices.iter().map(|&i| &edits[i as usize]), sample_points, voxel_size)
 }
 
-fn build_palette_inner<'a>(edits: impl Iterator<Item = &'a ResolvedEdit>, sample_points: &[Vec3]) -> Palette {
+fn build_palette_inner<'a>(edits: impl Iterator<Item = &'a ResolvedEdit>, sample_points: &[Vec3], voxel_size: f32) -> Palette {
     // Nearest distance achieved by each global id over all sample points.
     let mut best: Vec<(u16, f32)> = Vec::new();
     for e in edits {
@@ -856,7 +872,7 @@ fn build_palette_inner<'a>(edits: impl Iterator<Item = &'a ResolvedEdit>, sample
         }
         let mut dmin = f32::MAX;
         for &p in sample_points {
-            dmin = dmin.min(eval_world_inv(&e.prim, &e.inv_model, p));
+            dmin = dmin.min(eval_world_inv(&e.prim, &e.inv_model, p, voxel_size));
         }
         match best.iter_mut().find(|(id, _)| *id == e.material_id) {
             Some((_, d)) => *d = d.min(dmin),
@@ -880,7 +896,7 @@ fn build_palette_inner<'a>(edits: impl Iterator<Item = &'a ResolvedEdit>, sample
 /// per-voxel palette argmin). `a` = nearest material, `b` = runner-up, `gap = d_b − d_a ≥ 0`. A large/`MAX`
 /// gap (or a single material) ⇒ pure `a`; a small gap ⇒ blend a↔b over the material's `blend_softness` band.
 /// Subtract edits carry no material (they only carve), so they never contribute a candidate.
-pub fn fold_csg_top2(edits: &[ResolvedEdit], indices: &[u32], pos: Vec3) -> (u16, u16, f32) {
+pub fn fold_csg_top2(edits: &[ResolvedEdit], indices: &[u32], pos: Vec3, voxel_size: f32) -> (u16, u16, f32) {
     // Nearest signed distance achieved by each material id at `pos`.
     let mut best: Vec<(u16, f32)> = Vec::new();
     for &i in indices {
@@ -888,7 +904,7 @@ pub fn fold_csg_top2(edits: &[ResolvedEdit], indices: &[u32], pos: Vec3) -> (u16
         if e.op.kind == CsgKind::Subtract {
             continue;
         }
-        let dn = eval_world_inv(&e.prim, &e.inv_model, pos);
+        let dn = eval_world_inv(&e.prim, &e.inv_model, pos, voxel_size);
         match best.iter_mut().find(|(id, _)| *id == e.material_id) {
             Some((_, d)) => *d = d.min(dn),
             None => best.push((e.material_id, dn)),
@@ -912,14 +928,14 @@ pub fn fold_csg_top2(edits: &[ResolvedEdit], indices: &[u32], pos: Vec3) -> (u16
 /// subtract edits only carve, so they contribute no material). The baked-mesh mesher uses this to compute a
 /// per-vertex SIGNED blend coordinate against a triangle's fixed `(mat_a, mat_b)` pair, so the A↔B cross-fade
 /// is sign-consistent across the whole triangle (the per-vertex nearest material flips across a seam).
-pub fn material_dist(edits: &[ResolvedEdit], indices: &[u32], pos: Vec3, mat: u16) -> f32 {
+pub fn material_dist(edits: &[ResolvedEdit], indices: &[u32], pos: Vec3, mat: u16, voxel_size: f32) -> f32 {
     let mut d = f32::MAX;
     for &i in indices {
         let e = &edits[i as usize];
         if e.op.kind == CsgKind::Subtract || e.material_id != mat {
             continue;
         }
-        d = d.min(eval_world_inv(&e.prim, &e.inv_model, pos));
+        d = d.min(eval_world_inv(&e.prim, &e.inv_model, pos, voxel_size));
     }
     d
 }
@@ -1053,8 +1069,8 @@ mod tests {
         let samples = [Vec3::ZERO, Vec3::new(0.5, 0.2, -0.1), Vec3::new(1.5, 0.0, 0.0)];
         let cloned: Vec<_> = indices.iter().map(|&i| all[i as usize].clone()).collect();
         assert_eq!(
-            build_palette_indexed(&all, &indices, &samples),
-            build_palette(&cloned, &samples),
+            build_palette_indexed(&all, &indices, &samples, 0.0),
+            build_palette(&cloned, &samples, 0.0),
         );
     }
 
@@ -1078,8 +1094,8 @@ mod tests {
     #[test]
     fn sphere_sdf_zero_on_surface() {
         let p = SdfPrimitive::Sphere { radius: 1.0 };
-        assert!((eval_primitive(&p, Vec3::new(1.0, 0.0, 0.0))).abs() < 1e-6);
-        assert!(eval_primitive(&p, Vec3::ZERO) < 0.0);
+        assert!((eval_primitive(&p, Vec3::new(1.0, 0.0, 0.0), 0.0)).abs() < 1e-6);
+        assert!(eval_primitive(&p, Vec3::ZERO, 0.0) < 0.0);
     }
 
     #[test]
@@ -1087,9 +1103,9 @@ mod tests {
         let p = SdfPrimitive::Box {
             half_extents: Vec3::splat(1.0),
         };
-        assert!(eval_primitive(&p, Vec3::ZERO) < 0.0);
-        assert!((eval_primitive(&p, Vec3::new(1.0, 0.0, 0.0))).abs() < 1e-6);
-        assert!((eval_primitive(&p, Vec3::new(2.0, 0.0, 0.0)) - 1.0).abs() < 1e-6);
+        assert!(eval_primitive(&p, Vec3::ZERO, 0.0) < 0.0);
+        assert!((eval_primitive(&p, Vec3::new(1.0, 0.0, 0.0), 0.0)).abs() < 1e-6);
+        assert!((eval_primitive(&p, Vec3::new(2.0, 0.0, 0.0), 0.0) - 1.0).abs() < 1e-6);
     }
 
     #[test]
@@ -1111,7 +1127,7 @@ mod tests {
             ),
         ];
         // A point deep in the body, far from the carve.
-        let s = fold_csg(&edits, Vec3::new(-0.5, -0.5, -0.5));
+        let s = fold_csg(&edits, Vec3::new(-0.5, -0.5, -0.5), 0.0);
         assert!(s.dist < 0.0);
         assert_eq!(
             s.material_id, 1,
@@ -1139,7 +1155,7 @@ mod tests {
         ];
         // Near the first sphere's right edge: sphere-2 is the looser constraint
         // there, sphere-1 the tighter — but pick a point where edit 2 dominates.
-        let s = fold_csg(&edits, Vec3::new(-0.1, 0.0, 0.0));
+        let s = fold_csg(&edits, Vec3::new(-0.1, 0.0, 0.0), 0.0);
         assert!(s.dist <= 0.0 || s.dist.is_finite());
         // Material is one of the two participating ids (sanity; exact pick depends
         // on geometry). The key invariant: intersect never yields id 0.
@@ -1166,15 +1182,15 @@ mod tests {
         ];
         let idx = [0u32, 1];
         // At sphere 1's centre → a = 1, b = 2, clear gap.
-        let (a, b, gap) = fold_csg_top2(&edits, &idx, Vec3::new(-0.6, 0.0, 0.0));
+        let (a, b, gap) = fold_csg_top2(&edits, &idx, Vec3::new(-0.6, 0.0, 0.0), 0.0);
         assert_eq!(a, 1, "nearest material at sphere 1's centre");
         assert_eq!(b, 2, "runner-up is the other sphere");
         assert!(gap > 0.0, "a clear gap to sphere 2: {gap}");
         // On the midline both are equidistant → gap ≈ 0 (the materials tie → full blend).
-        let (_, _, gmid) = fold_csg_top2(&edits, &idx, Vec3::ZERO);
+        let (_, _, gmid) = fold_csg_top2(&edits, &idx, Vec3::ZERO, 0.0);
         assert!(gmid.abs() < 1e-5, "midline gap should be ~0: {gmid}");
         // Only one material in the index set → b == a, gap == MAX (pure a, no blend).
-        let (sa, sb, sg) = fold_csg_top2(&edits, &[0], Vec3::new(-0.6, 0.0, 0.0));
+        let (sa, sb, sg) = fold_csg_top2(&edits, &[0], Vec3::new(-0.6, 0.0, 0.0), 0.0);
         assert_eq!((sa, sb), (1, 1));
         assert_eq!(sg, f32::MAX);
     }
@@ -1199,17 +1215,17 @@ mod tests {
             ),
         ];
         let idx = [0u32, 1];
-        let gap = |p: Vec3| material_dist(&edits, &idx, p, 2) - material_dist(&edits, &idx, p, 1);
+        let gap = |p: Vec3| material_dist(&edits, &idx, p, 2, 0.0) - material_dist(&edits, &idx, p, 1, 0.0);
         assert!(gap(Vec3::new(-0.6, 0.0, 0.0)) > 0.0, "nearer mat 1 ⇒ gap > 0");
         assert!(gap(Vec3::new(0.6, 0.0, 0.0)) < 0.0, "nearer mat 2 ⇒ gap < 0");
         assert!(gap(Vec3::ZERO).abs() < 1e-5, "midline ⇒ gap ~ 0");
         // A material absent from the index set ⇒ MAX (no edit carries it).
-        assert_eq!(material_dist(&edits, &idx, Vec3::ZERO, 7), f32::MAX);
+        assert_eq!(material_dist(&edits, &idx, Vec3::ZERO, 7, 0.0), f32::MAX);
     }
 
     #[test]
     fn empty_edits_report_far() {
-        let s = fold_csg(&[], Vec3::ZERO);
+        let s = fold_csg(&[], Vec3::ZERO, 0.0);
         assert_eq!(s.dist, f32::MAX);
         assert_eq!(s.material_id, 0);
     }
@@ -1302,7 +1318,7 @@ mod tests {
             let gpu = to_gpu_edit(&edit);
             assert_eq!(gpu.material_id, 3);
             for &s in &samples {
-                let cpu = eval_world(&edit.prim, &edit.transform, s);
+                let cpu = eval_world(&edit.prim, &edit.transform, s, 0.0);
                 let gpu_eval = eval_gpu_edit_cpu(&gpu, s);
                 assert!(
                     (cpu - gpu_eval).abs() < 1e-4,
@@ -1361,43 +1377,58 @@ mod tests {
         assert_eq!(g.material_id, 2);
     }
 
-    /// With no fBm params published, Terrain falls back to the flat mid-band plane (a finite field,
-    /// valid AABB band) — the worldgen-disabled / not-yet-rolled path.
+    /// With no ring published, Terrain falls back to the flat mid-band plane (a finite field, valid
+    /// AABB band) — the worldgen-disabled / not-yet-built path.
     #[test]
-    fn terrain_eval_flat_fallback_without_params() {
-        crate::sdf_render::worldgen::upload::clear_cpu_fbm_params();
-        crate::sdf_render::worldgen::upload::set_cpu_terrain_offset(Vec2::ZERO);
+    fn terrain_eval_flat_fallback_without_ring() {
+        crate::sdf_render::worldgen::upload::set_cpu_height_ring(None);
         let prim = SdfPrimitive::Terrain { half_xz: Vec2::splat(100.0), min_height: 0.0, max_height: 40.0 };
         // Mid-band is y = 20; a point at y = 25 is 5 above the fallback plane.
-        let d = eval_primitive(&prim, Vec3::new(3.0, 25.0, -7.0));
+        let d = eval_primitive(&prim, Vec3::new(3.0, 25.0, -7.0), 0.0);
         assert!((d - 5.0).abs() < 1e-4, "flat-fallback vertical gap = {d}");
     }
 
-    /// The world-anchored CPU Terrain eval samples the height field DIRECTLY by analytic fBm at WORLD
-    /// XZ (= local + the volume's current world-XZ offset), so a translated volume picks up the
-    /// correct world height — and that height matches `HeightLayer::sample_world`, the SSOT the ring's
-    /// mip-0 also bakes from (CPU↔mesh-bake parity). We publish the live fBm params, set an offset, and
-    /// assert the eval reproduces the SSOT surface height at the resolved world XZ.
+    /// The world-anchored CPU Terrain eval samples the ring at WORLD XZ (= local + the volume's
+    /// current world-XZ offset), so a translated volume picks up the correct world height — this is
+    /// exactly the surface the MESH bake folds. We build a ring with a known resident chunk, set an
+    /// offset that lands a LOCAL point inside it, and assert the eval samples the same height the ring
+    /// reports at that WORLD XZ.
     #[test]
-    fn terrain_eval_samples_analytic_fbm_at_world_xz_with_offset() {
-        use crate::sdf_render::worldgen::coord::LayerId;
-        use crate::sdf_render::worldgen::layers::height::{HEIGHT_CHUNK_CELLS, HeightLayer, HeightParams};
-        use crate::sdf_render::worldgen::upload::{
-            cpu_terrain_offset, set_cpu_fbm_params, set_cpu_height_ring, set_cpu_terrain_offset,
+    fn terrain_eval_samples_ring_at_world_xz_with_offset() {
+        use crate::sdf_render::worldgen::artifact::ScalarField2D;
+        use crate::sdf_render::worldgen::coord::{ChunkCoord, ChunkSize, LayerId};
+        use crate::sdf_render::worldgen::layers::height::{
+            HEIGHT_CHUNK_CELLS, HEIGHT_FIELD_RES, HeightLayer, HeightParams,
         };
+        use crate::sdf_render::worldgen::store::ArtifactStore;
+        use crate::sdf_render::worldgen::upload::{
+            build_height_ring, cpu_terrain_offset, sample_ring, set_cpu_height_ring,
+            set_cpu_terrain_offset,
+        };
+        use std::sync::Arc;
 
-        // The published fBm comes from the live height layer's params + the world seed.
-        let seed = 999u64;
-        let params = HeightParams::default();
-        let layer = HeightLayer::new(LayerId(0), params);
-        set_cpu_fbm_params(layer.fbm_params(seed), params.sea_level);
-        // Ring left unpublished on purpose — the analytic path doesn't read it.
-        set_cpu_height_ring(None);
+        // A resident chunk at (3, 2) — its world XZ is well away from the origin, so sampling there
+        // requires the offset (a local point near the origin must be shifted into the chunk).
+        let (cx, cz) = (3i32, 2i32);
+        let layer = HeightLayer::new(LayerId(0), HeightParams::default());
+        let size = ChunkSize::new(HEIGHT_CHUNK_CELLS);
+        let coord = ChunkCoord::new(LayerId(0), IVec3::new(cx, 0, cz));
+        let mut field = ScalarField2D::zeroed(coord, size, HEIGHT_FIELD_RES);
+        for j in 0..=HEIGHT_FIELD_RES {
+            for i in 0..=HEIGHT_FIELD_RES {
+                let wp = field.node_world_xz(i, j);
+                field.set(i, j, layer.sample_world(wp.x, wp.y, 999));
+            }
+        }
+        let mut store = ArtifactStore::new();
+        store.insert(coord, Arc::new(field));
+        let ring = build_height_ring(&store);
+        set_cpu_height_ring(Some(Arc::new(ring.clone())));
 
-        // Volume translated well away from the origin; a LOCAL XZ near the origin maps to that world
-        // XZ via the offset. The offset IS the volume's world-XZ translation.
+        // Volume translated so a LOCAL XZ near the origin maps into chunk (3,2). The offset IS the
+        // volume's world-XZ translation; a local point `lp` then samples the ring at `lp + offset`.
         let s = HEIGHT_CHUNK_CELLS as f32;
-        let offset = Vec2::new(3.4 * s, 2.6 * s);
+        let offset = Vec2::new((cx as f32 + 0.4) * s, (cz as f32 + 0.6) * s);
         set_cpu_terrain_offset(offset);
         assert_eq!(cpu_terrain_offset(), offset);
 
@@ -1406,27 +1437,27 @@ mod tests {
             min_height: -96.0,
             max_height: 96.0,
         };
-        // A local sample point; its WORLD XZ = local.xz + offset.
+        // A local sample point; its WORLD XZ = local.xz + offset lands inside chunk (3,2).
         let local = Vec3::new(5.0, 12.0, -3.0);
-        // The SSOT surface height at that exact world XZ (= what the ring bakes at mip 0).
-        let expected_h = layer
-            .sample_world((local.x + offset.x) as f64, (local.z + offset.y) as f64, seed)
-            .height;
-        let d = eval_primitive(&prim, local);
+        let world_xz =
+            bevy::math::DVec2::new((local.x + offset.x) as f64, (local.z + offset.y) as f64);
+        let expected_h = sample_ring(&ring, world_xz).expect("world XZ resolves to resident chunk").height;
+        // `voxel_size == 0.0` ⇒ mip 0, which is identical to `sample_ring` — so the eval reproduces the
+        // ring's full-detail height here.
+        let d = eval_primitive(&prim, local, 0.0);
         // The eval returns the signed vertical gap `local.y - height_at_world_xz`.
         assert!(
-            (d - (local.y - expected_h)).abs() < 1e-3,
-            "world-anchored analytic eval: got {d}, expected {} (h={expected_h})",
+            (d - (local.y - expected_h)).abs() < 1e-4,
+            "world-anchored eval: got {d}, expected {} (h={expected_h})",
             local.y - expected_h
         );
 
-        // Reset globals so other tests aren't affected (the flat-fallback test needs params == None).
+        // Reset globals so other tests aren't affected.
         set_cpu_terrain_offset(Vec2::ZERO);
-        crate::sdf_render::worldgen::upload::clear_cpu_fbm_params();
+        set_cpu_height_ring(None);
     }
 
-    // Mirror of `worldgen::WORLDGEN_TERRAIN_HALF_XZ` for the test prim's footprint; kept local to
-    // avoid a dependency cycle on the worldgen module's const from this test. (Value irrelevant to the
-    // analytic eval, which ignores `half_xz`.)
-    const WORLDGEN_TERRAIN_HALF_XZ_FOR_TEST: f32 = 4096.0;
+    // Mirror of `worldgen::WORLDGEN_TERRAIN_HALF_XZ` (384) for the test prim's footprint; kept local
+    // to avoid a dependency cycle on the worldgen module's const from this test.
+    const WORLDGEN_TERRAIN_HALF_XZ_FOR_TEST: f32 = 384.0;
 }

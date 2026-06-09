@@ -275,7 +275,7 @@ fn cull_preserves_subtracted_surface_bricks() {
                 let cs = corner(cfg.brick_min_world(key.coord, 0));
                 let (mut neg, mut pos) = (false, false);
                 for p in cs {
-                    if edits::fold_csg(&all_edits, p).dist <= 0.0 { neg = true; } else { pos = true; }
+                    if edits::fold_csg(&all_edits, p, 0.0).dist <= 0.0 { neg = true; } else { pos = true; }
                 }
                 if neg && pos {
                     assert!(
@@ -295,8 +295,8 @@ fn cull_preserves_subtracted_surface_bricks() {
             let culled: Vec<edits::ResolvedEdit> =
                 scratch.iter().map(|&i| all_edits[i as usize].clone()).collect();
             for p in corner(cfg.brick_min_world(key.coord, 0)) {
-                let d_full = edits::fold_csg(&all_edits, p).dist;
-                let d_cull = edits::fold_csg(&culled, p).dist;
+                let d_full = edits::fold_csg(&all_edits, p, 0.0).dist;
+                let d_cull = edits::fold_csg(&culled, p, 0.0).dist;
                 assert_eq!(
                     d_full <= 0.0, d_cull <= 0.0,
                     "r_in={r_in} off={off}: culled-set sign mismatch at brick {:?} (full={d_full:.3} cull={d_cull:.3})",

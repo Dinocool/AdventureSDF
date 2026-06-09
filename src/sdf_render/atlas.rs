@@ -534,7 +534,7 @@ mod tests {
         let edits: Vec<ResolvedEdit> = (0..(PALETTE_K as u16 + 1))
             .map(|i| resolved(SdfPrimitive::Sphere { radius: 0.2 }, Transform::from_xyz(i as f32 * 0.15, 0.0, 0.0), i))
             .collect();
-        let palette = build_palette(&edits, &[Vec3::ZERO]);
+        let palette = build_palette(&edits, &[Vec3::ZERO], 0.0);
         let filled = palette.iter().filter(|&&id| id != PALETTE_EMPTY).count();
         assert_eq!(filled, PALETTE_K, "palette must cap at K filled slots");
     }
@@ -546,7 +546,7 @@ mod tests {
             resolved(SdfPrimitive::Sphere { radius: 0.3 }, Transform::IDENTITY, 5),
             resolved(SdfPrimitive::Sphere { radius: 0.3 }, Transform::from_xyz(0.5, 0.0, 0.0), 2),
         ];
-        let palette = build_palette(&edits, &[Vec3::ZERO, Vec3::new(0.5, 0.0, 0.0)]);
+        let palette = build_palette(&edits, &[Vec3::ZERO, Vec3::new(0.5, 0.0, 0.0)], 0.0);
         assert_eq!(palette[0], 2);
         assert_eq!(palette[1], 5);
     }

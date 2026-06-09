@@ -229,7 +229,7 @@ fn emit(atlas: &mut SdfAtlas, cfg: &SdfGridConfig, bvh: &Bvh, resolved: &[Resolv
                 let vs = cfg.voxel_size_at(key.lod);
                 let samples = SdfAtlas::brick_palette_samples(key, vs);
                 let culled: Vec<ResolvedEdit> = scratch.iter().map(|&i| resolved[i as usize].clone()).collect();
-                let pal = build_palette(&culled, &samples);
+                let pal = build_palette(&culled, &samples, 0.0);
                 let tile = atlas.insert_gpu_brick(key, pal, 0, cfg);
                 let edit_start = edits.len() as u32;
                 for e in &culled { edits.push(to_gpu_edit(e)); }

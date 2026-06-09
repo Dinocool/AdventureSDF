@@ -508,8 +508,8 @@ fn dirty_moving_edit(
             let center = (lo + hi + IVec3::ONE).as_vec3() * (0.5 * brick_world);
             let half = (hi - lo + IVec3::ONE).as_vec3() * (0.5 * brick_world);
             let margin = half.length() + band;
-            let d_old = edits::eval_world_inv(&old.prim, &old.inv_model, center);
-            let d_new = edits::eval_world_inv(&new.prim, &new.inv_model, center);
+            let d_old = edits::eval_world_inv(&old.prim, &old.inv_model, center, 0.0);
+            let d_new = edits::eval_world_inv(&new.prim, &new.inv_model, center, 0.0);
             if d_old.abs() > margin && d_new.abs() > margin && (d_old > 0.0) == (d_new > 0.0) {
                 continue; // saturated, same sign at both positions → nothing here can change
             }
