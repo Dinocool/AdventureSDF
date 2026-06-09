@@ -552,6 +552,10 @@ fn mesh_chunk(
     lod: u32,
     debug: bool,
     terrain: Option<Arc<HeightClipmap>>,
+    // Terrain-only chunk ⇒ take the surface NORMAL from the clipmap's smooth stored gradient (no
+    // central-difference faceting at coarse LODs / cross-LOD borders). Mixed/object chunks keep the
+    // CSG central-difference normal.
+    terrain_only: bool,
 ) -> Option<ChunkMeshData> {
     // Install THIS ROUND'S frozen Terrain clipmap snapshot ONCE on the bake thread (held for the whole
     // bake), so every field sample reads it via a thread-local borrow instead of a process-global RwLock +
@@ -597,7 +601,8 @@ fn mesh_chunk(
             sides |= s;
         }
     }
-    let builder = ChunkMeshBuilder::new(edits, indices, grid_origin, vs, lod, debug, cmin, cmax, flags);
+    let builder =
+        ChunkMeshBuilder::new(edits, indices, grid_origin, vs, lod, debug, cmin, cmax, flags, terrain_only);
     // MUST be CacheNothing: `CacheCentralBlockOnly` caches the central block at THIS chunk's (coarse)
     // resolution, which then serves the transition cell's FINE-resolution face samples too — collapsing the
     // transition so the cross-LOD weld fails. The analytic CSG field is cheap to re-evaluate, so just query it.
@@ -638,6 +643,8 @@ struct ChunkMeshBuilder<'a> {
     cmin: Vec3,
     cmax: Vec3,
     flags: u8,
+    /// Terrain-only chunk ⇒ analytic stored-gradient normals (smooth, no central-diff faceting).
+    terrain_only: bool,
     positions: Vec<[f32; 3]>,
     normals: Vec<[f32; 3]>,
     /// Per unique vertex: `(nearest, runner-up)` CSG material ids (the top-2 argmin). The triangle pair folds
@@ -658,6 +665,7 @@ impl<'a> ChunkMeshBuilder<'a> {
         cmin: Vec3,
         cmax: Vec3,
         flags: u8,
+        terrain_only: bool,
     ) -> Self {
         Self {
             edits,
@@ -670,6 +678,7 @@ impl<'a> ChunkMeshBuilder<'a> {
             cmin,
             cmax,
             flags,
+            terrain_only,
             positions: Vec::new(),
             normals: Vec::new(),
             vmat: Vec::new(),
@@ -772,8 +781,16 @@ impl MeshBuilder<f32, f32> for ChunkMeshBuilder<'_> {
         // rule as the density closure), so its normal + material match the fine neighbour bit-for-bit — no
         // shading/material seam across the cross-LOD weld. Interior vertices use the chunk's own `vs`.
         let vs_eff = transition_sample_vs(world, self.cmin, self.cmax, self.vs, self.flags);
-        // Exact outward normal = ∇(CSG distance) (points toward increasing distance = outside the solid).
-        let n = field_gradient(self.edits, self.indices, world, vs_eff * 0.01, vs_eff).normalize_or_zero();
+        // Outward normal. For a terrain-only chunk, take it from the clipmap's SMOOTH stored gradient (no
+        // central-difference faceting at coarse LODs / cross-LOD borders) — falling back to the CSG gradient
+        // on a clipmap miss. Mixed/object chunks use the exact ∇(CSG distance) (toward increasing distance).
+        let csg_normal =
+            || field_gradient(self.edits, self.indices, world, vs_eff * 0.01, vs_eff).normalize_or_zero();
+        let n = if self.terrain_only {
+            crate::sdf_render::worldgen::upload::terrain_normal(world, vs_eff).unwrap_or_else(csg_normal)
+        } else {
+            csg_normal()
+        };
         self.normals.push([n.x, n.y, n.z]);
         // (nearest, runner-up) materials at this vertex over the blend-padded chunk set; `finish` folds the
         // per-triangle pair from the three corners' values.
@@ -1335,8 +1352,9 @@ fn mesh_resident_chunks(
             // The round's FROZEN clipmap snapshot — the bake samples THIS, not the live global, so a
             // mid-bake clipmap change (camera roll / lod_count rebuild) can't make it sample uncovered ground.
             let terrain = round.clipmap.clone();
+            let is_terrain = terrain_only.contains(&key); // analytic stored-gradient normals for terrain
             st.task = Some(pool.spawn(async move {
-                mesh_chunk(&edits, &indices, grid_origin, vs_l, k * cs, flags, lod, debug, terrain)
+                mesh_chunk(&edits, &indices, grid_origin, vs_l, k * cs, flags, lod, debug, terrain, is_terrain)
             }));
             budget -= 1;
         }
@@ -1685,7 +1703,7 @@ mod tests {
         let edits = [sphere_edit(Vec3::ZERO, 1.0)];
         let (vs, sub) = (0.1f32, 28u32); // block span = 28·0.1 = 2.8 > sphere Ø 2.0 → clears all faces
         let origin = Vec3::splat(-1.4);
-        let data = mesh_chunk(&edits, &[0], origin, vs, sub, 0, 0, false, None).expect("sphere meshes");
+        let data = mesh_chunk(&edits, &[0], origin, vs, sub, 0, 0, false, None, false).expect("sphere meshes");
         assert_eq!(open_edge_count(&chunk_tris(&data, origin)), 0, "closed sphere must be watertight");
     }
 
@@ -1705,8 +1723,8 @@ mod tests {
         let (vsf, vsc, sub) = (0.1f32, 0.2f32, 28u32);
         let of = Vec3::new(0.0, -1.4, -1.4); // fine x∈[0,2.8]; −X face at x=0 (regular, high-res)
         let oc = Vec3::new(-5.6, -2.8, -2.8); // coarse x∈[−5.6,0]; +X face at x=0 is the transition side
-        let fine = mesh_chunk(&edits, &idx, of, vsf, sub, 0, 0, false, None).expect("fine meshes");
-        let coarse = mesh_chunk(&edits, &idx, oc, vsc, sub, 1 << 1, 1, false, None).expect("coarse meshes");
+        let fine = mesh_chunk(&edits, &idx, of, vsf, sub, 0, 0, false, None, false).expect("fine meshes");
+        let coarse = mesh_chunk(&edits, &idx, oc, vsc, sub, 1 << 1, 1, false, None, false).expect("coarse meshes");
         let mut all = chunk_tris(&fine, of);
         all.extend(chunk_tris(&coarse, oc));
         assert_eq!(
@@ -1736,7 +1754,7 @@ mod tests {
         ];
         let (vs, sub) = (0.1f32, 32u32); // span 3.2 > shape Ø (cube corner ≈ 1.39) → closed in one chunk
         let origin = Vec3::splat(-1.6);
-        let data = mesh_chunk(&edits, &[0, 1], origin, vs, sub, 0, 0, false, None).expect("merged shape meshes");
+        let data = mesh_chunk(&edits, &[0, 1], origin, vs, sub, 0, 0, false, None, false).expect("merged shape meshes");
         (data, origin)
     }
 
@@ -1776,7 +1794,7 @@ mod tests {
         // (0.4,0,0) crosses the block's +X face (x=0); every normal must point outward from the sphere centre.
         let edits = [sphere_edit(Vec3::new(0.4, 0.0, 0.0), 1.0)];
         let oc = Vec3::new(-5.6, -2.8, -2.8);
-        let coarse = mesh_chunk(&edits, &[0], oc, 0.2, 28, 1 << 1, 1, false, None).expect("coarse+transition meshes");
+        let coarse = mesh_chunk(&edits, &[0], oc, 0.2, 28, 1 << 1, 1, false, None, false).expect("coarse+transition meshes");
         let center = Vec3::new(0.4, 0.0, 0.0);
         let (mut worst, mut inward, mut degenerate) = (1.0f32, 0, 0);
         for i in 0..coarse.positions.len() {

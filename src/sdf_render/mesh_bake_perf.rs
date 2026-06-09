@@ -273,8 +273,9 @@ fn time_one_chunk(
     let flags = chunk_finer_faces(key, config, k, Some(cam), half0);
     let vs_l = config.voxel_size_at(key.lod);
     let t = std::time::Instant::now();
-    // `None` ⇒ the bake reads the process-global clipmap the rig published (set_cpu_height_clipmap).
-    let out = mesh_chunk(edits, &idx, grid_origin, vs_l, k * cs, flags, key.lod, false, None);
+    // `None` ⇒ the bake reads the process-global clipmap the rig published (set_cpu_height_clipmap); the
+    // terrain perf scene is terrain-only, so `terrain_only = true` (analytic stored-gradient normals).
+    let out = mesh_chunk(edits, &idx, grid_origin, vs_l, k * cs, flags, key.lod, false, None, true);
     let us = t.elapsed().as_micros();
     let (verts, tris) = out.map_or((0, 0), |d| (d.positions.len(), d.indices.len() / 3));
     (us, verts, tris)

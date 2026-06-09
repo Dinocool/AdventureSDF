@@ -621,6 +621,28 @@ pub fn terrain_sdf(p: bevy::math::Vec3, voxel_size: f32, max_height: f32) -> f32
     })
 }
 
+/// The Terrain surface NORMAL at local `p`, from the clipmap's STORED analytic gradient (`dh/dx, dh/dz`):
+/// `normalize(-dh/dx, 1, -dh/dz)`. This is the SMOOTH (C0) gradient of the height field — unlike a central
+/// difference of the bilinear height, whose gradient JUMPS at every node-cell boundary (the bilinear field
+/// is C0 but not C1), giving faceting that worsens at coarse LODs. It also matches across an LOD boundary
+/// (both sides sample the same mip via the transition rule) and costs ONE clipmap sample vs the 6-tap
+/// central difference. Reads the per-bake snapshot ([`BAKE_TERRAIN`]) else the global. `None` on a miss
+/// (the mesh builder then falls back to the CSG central-difference gradient). `voxel_size` picks the mip,
+/// same as [`terrain_sdf`], so the normal's band-limit matches the height's.
+pub fn terrain_normal(p: bevy::math::Vec3, voxel_size: f32) -> Option<bevy::math::Vec3> {
+    let node = BAKE_TERRAIN.with(|tl| {
+        if let Some((clipmap, offset)) = tl.borrow().as_ref() {
+            let world_xz = DVec2::new((p.x + offset.x) as f64, (p.z + offset.y) as f64);
+            try_sample_clipmap_lod(clipmap, world_xz, voxel_size)
+        } else {
+            let offset = cpu_terrain_offset();
+            let world_xz = DVec2::new((p.x + offset.x) as f64, (p.z + offset.y) as f64);
+            cpu_height_clipmap().and_then(|cm| try_sample_clipmap_lod(&cm, world_xz, voxel_size))
+        }
+    })?;
+    Some(bevy::math::Vec3::new(-node.dh_dx, 1.0, -node.dh_dz).normalize_or_zero())
+}
+
 /// Strict/try clipmap sample → signed Terrain field (`p.y − height`); a non-rendering miss is empty space.
 #[inline]
 fn terrain_height_to_sdf(
