@@ -116,6 +116,11 @@ impl EditorDockState {
         );
         surface.split_below(center, 0.72, bottom_tabs);
 
+        // Center-dock panels become tabs in the viewport leaf, next to the Scene view.
+        for id in registry.ids_for(DockSide::Center) {
+            surface[center].append_tab(EditorTab::Registered(id));
+        }
+
         Self {
             state,
             viewport_rect: egui::Rect::NOTHING,
@@ -441,6 +446,7 @@ pub(crate) fn side_anchor_leaf(dock: &EditorDockState, side: DockSide) -> Option
         DockSide::Left => &[EditorTab::Hierarchy, EditorTab::ProjectFiles],
         DockSide::Right => &[EditorTab::Inspector],
         DockSide::Bottom => &[EditorTab::AssetsDrawer],
+        DockSide::Center => return center_leaf(dock),
     };
     anchors
         .iter()
@@ -468,6 +474,9 @@ pub(crate) fn add_panel_tab(dock: &mut EditorDockState, tab: EditorTab, side: Do
         }
         DockSide::Bottom => {
             surface.split_below(center, 0.72, vec![tab]);
+        }
+        DockSide::Center => {
+            surface[center].append_tab(tab);
         }
     }
 }
