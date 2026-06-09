@@ -97,6 +97,7 @@ dependencies = [
  "bytemuck",
  "ecolor",
  "egui-phosphor",
+ "egui-snarl",
  "egui_dock",
  "emath",
  "epaint",
@@ -2219,6 +2220,28 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e3b2838620355debaeb7fa3cc331a1d8ab77e6387d40e65686fa468c229dbf63"
 dependencies = [
  "egui",
+]
+
+[[package]]
+name = "egui-scale"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b7964ad2697e2b2df7157e5a0104c812c3773172c2a7b7dea95b57d9b5fd285f"
+dependencies = [
+ "egui",
+]
+
+[[package]]
+name = "egui-snarl"
+version = "0.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c6358986338c35fe268c0647b410725babd5de772010e8e739e88cb11f5665da"
+dependencies = [
+ "egui",
+ "egui-scale",
+ "serde",
+ "slab",
+ "smallvec",
 ]
 
 [[package]]
@@ -4829,6 +4852,9 @@ name = "slab"
 version = "0.4.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0c790de23124f9ab44544d7ac05d60440adc586479ce501c1d6d7da3cd8c9cf5"
+dependencies = [
+ "serde",
+]
 
 [[package]]
 name = "slotmap"
