@@ -46,8 +46,13 @@ pub struct WorldGraphEditor {
     previews: std::collections::HashMap<NodeId, egui::TextureHandle>,
     /// Which nodes have their preview COLLAPSED. Previews are on by default, so absence ⇒ open.
     collapsed: std::collections::HashSet<NodeId>,
-    /// Per-node 2D-preview zoom: half-extent (metres) of the sampled world window. Absence ⇒ default.
+    /// Per-node preview zoom: half-extent (metres) of the sampled world window. Absence ⇒ default. Shared
+    /// by the 2D heatmap (grid extent) and the 3D surface (camera framing).
     zoom_half_m: std::collections::HashMap<NodeId, f64>,
+    /// Which nodes show the 3D SDF-raymarched surface instead of the 2D heatmap. Absence ⇒ 2D.
+    surface: std::collections::HashSet<NodeId>,
+    /// Per-node 3D-preview orbit camera (yaw, pitch) in radians. Absence ⇒ default angle.
+    cam: std::collections::HashMap<NodeId, (f32, f32)>,
 }
 
 impl Default for WorldGraphEditor {
@@ -60,9 +65,14 @@ impl Default for WorldGraphEditor {
             previews: std::collections::HashMap::new(),
             collapsed: std::collections::HashSet::new(),
             zoom_half_m: std::collections::HashMap::new(),
+            surface: std::collections::HashSet::new(),
+            cam: std::collections::HashMap::new(),
         }
     }
 }
+
+/// Default 3D orbit camera (yaw, pitch) in radians.
+const CAM_DEFAULT: (f32, f32) = (0.7, 0.6);
 
 /// Plugin: registers the editor state + the dockable "Biome Graph" panel.
 pub struct WorldgenGraphEditorPlugin;
@@ -216,6 +226,8 @@ struct Viewer<'a> {
     previews: &'a mut std::collections::HashMap<NodeId, egui::TextureHandle>,
     collapsed: &'a mut std::collections::HashSet<NodeId>,
     zoom_half_m: &'a mut std::collections::HashMap<NodeId, f64>,
+    surface: &'a mut std::collections::HashSet<NodeId>,
+    cam: &'a mut std::collections::HashMap<NodeId, (f32, f32)>,
 }
 
 impl SnarlViewer<EdNode> for Viewer<'_> {
@@ -277,30 +289,64 @@ impl SnarlViewer<EdNode> for Viewer<'_> {
                 {
                     *half = (km * 1000.0 / 2.0).max(1.0);
                 }
+                // 2D heatmap ⇆ 3D SDF-raymarched surface.
+                let is3d = self.surface.contains(&node);
+                if ui
+                    .selectable_label(is3d, "3D")
+                    .on_hover_text("Toggle a 3D SDF-raymarched surface — drag to orbit, scroll or the km field to zoom/scale")
+                    .clicked()
+                {
+                    if is3d {
+                        self.surface.remove(&node);
+                    } else {
+                        self.surface.insert(node);
+                    }
+                }
             }
         });
         if !open {
             self.previews.remove(&node); // free the GPU texture while collapsed
             return;
         }
-        // Re-evaluate the sub-graph rooted at this node over a grid → heatmap → texture (every frame so
-        // edits show immediately). An unconnected input just shows a hint instead of a preview.
+        // Re-evaluate the sub-graph rooted at this node every frame (so edits show immediately) → texture.
+        // An unconnected input just shows a hint instead of a preview.
         let half = *self.zoom_half_m.get(&node).unwrap_or(&PREVIEW_HALF_M);
         match graph_rooted_at(snarl, node) {
             Ok(g) => {
-                let img = render_field_preview(&g, half);
+                let img = if self.surface.contains(&node) {
+                    let (yaw, pitch) = *self.cam.get(&node).unwrap_or(&CAM_DEFAULT);
+                    render_surface_preview(&g, half, yaw, pitch)
+                } else {
+                    render_field_preview(&g, half)
+                };
                 let handle =
                     ui.ctx().load_texture(format!("wg-preview-{node:?}"), img, egui::TextureOptions::LINEAR);
                 // Resizable region → dragging its corner grows the node. Image fills it (kept square).
-                egui::Resize::default()
+                let resp = egui::Resize::default()
                     .id_salt(("wg-prev", node))
                     .default_size([130.0, 130.0])
                     .min_size([64.0, 64.0])
                     .show(ui, |ui| {
                         let s = ui.available_size();
                         let d = s.x.min(s.y).max(48.0);
-                        ui.image(egui::load::SizedTexture::new(handle.id(), egui::vec2(d, d)));
+                        ui.image(egui::load::SizedTexture::new(handle.id(), egui::vec2(d, d)))
                     });
+                // 3D camera interaction: drag to orbit, scroll-over to zoom (scale the framed window).
+                if self.surface.contains(&node) {
+                    let cam = self.cam.entry(node).or_insert(CAM_DEFAULT);
+                    if resp.dragged() {
+                        let d = resp.drag_delta();
+                        cam.0 += d.x * 0.01;
+                        cam.1 = (cam.1 - d.y * 0.01).clamp(0.05, 1.5);
+                    }
+                    if resp.hovered() {
+                        let scroll = ui.input(|i| i.raw_scroll_delta.y);
+                        if scroll != 0.0 {
+                            let h = self.zoom_half_m.entry(node).or_insert(PREVIEW_HALF_M);
+                            *h = (*h * (1.0 - scroll as f64 * 0.0015)).clamp(64.0, 200_000.0);
+                        }
+                    }
+                }
                 self.previews.insert(node, handle); // keep alive past paint; drops the prior frame's texture
             }
             Err(e) => {
@@ -559,8 +605,8 @@ fn render_field_preview(g: &Graph, half_m: f64) -> egui::ColorImage {
     egui::ColorImage::new([n, n], pixels)
 }
 
-/// Map a normalised height `t∈[0,1]` to a terrain colour ramp (deep → grass → rock → snow).
-fn terrain_ramp(t: f32) -> egui::Color32 {
+/// Map a normalised height `t∈[0,1]` to a terrain colour ramp (deep → grass → rock → snow) as linear rgb.
+fn ramp_rgb(t: f32) -> [f32; 3] {
     const STOPS: [(f32, [f32; 3]); 5] = [
         (0.0, [0.12, 0.24, 0.47]),
         (0.35, [0.24, 0.55, 0.35]),
@@ -578,7 +624,158 @@ fn terrain_ramp(t: f32) -> egui::Color32 {
             break;
         }
     }
+    c
+}
+
+/// Map a normalised height `t∈[0,1]` to a terrain ramp colour.
+fn terrain_ramp(t: f32) -> egui::Color32 {
+    let c = ramp_rgb(t);
     egui::Color32::from_rgb((c[0] * 255.0) as u8, (c[1] * 255.0) as u8, (c[2] * 255.0) as u8)
+}
+
+// ===================================================================================================
+// 3D SDF-raymarched surface preview
+// ===================================================================================================
+
+/// Surface-preview render resolution (px per side) — opt-in per node, so a touch sharper than the 2D map.
+const SURFACE_RES: usize = 64;
+/// Max march steps per ray through the surface's bounding box.
+const SURFACE_STEPS: usize = 80;
+
+/// Render the node's height field as a 3D **SDF-raymarched** surface (heightfield ray–surface
+/// intersection) into an [`egui::ColorImage`]. The camera orbits the ±`half_m` window at (`yaw`,`pitch`),
+/// framing the field's own height range; shading uses the analytic gradient normal + a terrain ramp.
+fn render_surface_preview(g: &Graph, half_m: f64, yaw: f32, pitch: f32) -> egui::ColorImage {
+    use bevy::math::Vec3;
+    let res = SURFACE_RES;
+
+    // Coarse pass: the field's height range over the window (for camera framing + colour normalisation).
+    let (mut hmin, mut hmax) = (f64::INFINITY, f64::NEG_INFINITY);
+    let cg = 16usize;
+    for j in 0..cg {
+        for i in 0..cg {
+            let wx = -half_m + (i as f64 + 0.5) / cg as f64 * 2.0 * half_m;
+            let wz = -half_m + (j as f64 + 0.5) / cg as f64 * 2.0 * half_m;
+            let v = g.eval(wx, wz, PREVIEW_SEED).v;
+            if v.is_finite() {
+                hmin = hmin.min(v);
+                hmax = hmax.max(v);
+            }
+        }
+    }
+    if !hmin.is_finite() {
+        hmin = 0.0;
+        hmax = 1.0;
+    }
+    let span = (hmax - hmin).max(1.0);
+
+    let half = half_m as f32;
+    let (ymin, ymax) = (hmin as f32, hmax as f32);
+    let pad = span as f32 * 0.08 + 1.0;
+    let (bmin, bmax) = (Vec3::new(-half, ymin - pad, -half), Vec3::new(half, ymax + pad, half));
+
+    // Orbit camera framing the box centre.
+    let centre = Vec3::new(0.0, (ymin + ymax) * 0.5, 0.0);
+    let dist = half * 2.4 + span as f32;
+    let (sp, cp) = (pitch.sin(), pitch.cos());
+    let (sy, cyaw) = (yaw.sin(), yaw.cos());
+    let eye = centre + Vec3::new(cp * cyaw, sp, cp * sy) * dist;
+    let fwd = (centre - eye).normalize();
+    let right = fwd.cross(Vec3::Y).normalize_or_zero();
+    let up = right.cross(fwd);
+    let tan = (0.6f32 * 0.5).tan() * 2.0; // ~ vertical half-extent at the image plane
+    let light = Vec3::new(0.4, 0.85, 0.3).normalize();
+
+    let mut pixels = Vec::with_capacity(res * res);
+    for py in 0..res {
+        for px in 0..res {
+            let ndcx = (px as f32 + 0.5) / res as f32 * 2.0 - 1.0;
+            let ndcy = 1.0 - (py as f32 + 0.5) / res as f32 * 2.0;
+            let dir = (fwd + right * (ndcx * tan) + up * (ndcy * tan)).normalize();
+            let col = match ray_box(eye, dir, bmin, bmax) {
+                Some((t0, t1)) => march_surface(g, eye, dir, t0.max(0.0), t1, hmin, span, light, ndcy),
+                None => sky(ndcy),
+            };
+            pixels.push(col);
+        }
+    }
+    egui::ColorImage::new([res, res], pixels)
+}
+
+/// Slab ray–AABB intersection → entry/exit `t` (or `None`).
+fn ray_box(o: bevy::math::Vec3, d: bevy::math::Vec3, bmin: bevy::math::Vec3, bmax: bevy::math::Vec3) -> Option<(f32, f32)> {
+    let inv = bevy::math::Vec3::ONE / d;
+    let t1 = (bmin - o) * inv;
+    let t2 = (bmax - o) * inv;
+    let tmin = t1.min(t2).max_element();
+    let tmax = t1.max(t2).min_element();
+    if tmax >= tmin.max(0.0) { Some((tmin, tmax)) } else { None }
+}
+
+/// March a ray through the heightfield between `t0..t1`; on the first downward crossing shade with the
+/// analytic-gradient normal + terrain ramp, else return sky.
+#[allow(clippy::too_many_arguments)]
+fn march_surface(
+    g: &Graph,
+    eye: bevy::math::Vec3,
+    dir: bevy::math::Vec3,
+    t0: f32,
+    t1: f32,
+    hmin: f64,
+    span: f64,
+    light: bevy::math::Vec3,
+    ndcy: f32,
+) -> egui::Color32 {
+    use bevy::math::Vec3;
+    let diff = |t: f32| -> f64 {
+        let p = eye + dir * t;
+        p.y as f64 - g.eval(p.x as f64, p.z as f64, PREVIEW_SEED).v
+    };
+    let dt = (t1 - t0) / SURFACE_STEPS as f32;
+    if dt <= 0.0 {
+        return sky(ndcy);
+    }
+    let mut t = t0;
+    let mut prev = diff(t);
+    for _ in 0..SURFACE_STEPS {
+        let tn = t + dt;
+        let cur = diff(tn);
+        if cur <= 0.0 && prev > 0.0 {
+            // Bisect the crossing for a crisp silhouette.
+            let (mut a, mut b) = (t, tn);
+            for _ in 0..6 {
+                let m = (a + b) * 0.5;
+                if diff(m) > 0.0 {
+                    a = m;
+                } else {
+                    b = m;
+                }
+            }
+            let pm = eye + dir * ((a + b) * 0.5);
+            let f = g.eval(pm.x as f64, pm.z as f64, PREVIEW_SEED);
+            let n = Vec3::new(-f.dx as f32, 1.0, -f.dz as f32).normalize();
+            let lamb = n.dot(light).clamp(0.0, 1.0);
+            let base = ramp_rgb((((f.v - hmin) / span).clamp(0.0, 1.0)) as f32);
+            let lit = 0.28 + 0.72 * lamb;
+            return egui::Color32::from_rgb(
+                (base[0] * lit * 255.0) as u8,
+                (base[1] * lit * 255.0) as u8,
+                (base[2] * lit * 255.0) as u8,
+            );
+        }
+        prev = cur;
+        t = tn;
+    }
+    sky(ndcy)
+}
+
+/// Background sky gradient for ray misses (darker low, lighter high).
+fn sky(ndcy: f32) -> egui::Color32 {
+    let t = (ndcy * 0.5 + 0.5).clamp(0.0, 1.0);
+    let r = (30.0 + 40.0 * t) as u8;
+    let g = (38.0 + 55.0 * t) as u8;
+    let b = (55.0 + 75.0 * t) as u8;
+    egui::Color32::from_rgb(r, g, b)
 }
 
 // ===================================================================================================
@@ -659,8 +856,8 @@ fn graph_panel(world: &mut World, ui: &mut egui::Ui) {
 
         // Disjoint borrows of the editor's fields: the snarl is the working graph; the rest are the
         // per-node preview caches the Viewer drives.
-        let WorldGraphEditor { snarl, previews, collapsed, zoom_half_m, .. } = &mut *editor;
-        let mut viewer = Viewer { previews, collapsed, zoom_half_m };
+        let WorldGraphEditor { snarl, previews, collapsed, zoom_half_m, surface, cam, .. } = &mut *editor;
+        let mut viewer = Viewer { previews, collapsed, zoom_half_m, surface, cam };
         SnarlWidget::new()
             .id(egui::Id::new("worldgen-biome-graph"))
             .style(SnarlStyle::new())
