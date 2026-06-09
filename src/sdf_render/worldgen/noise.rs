@@ -70,6 +70,14 @@ fn fade_deriv(t: f64) -> f64 {
     30.0 * t * t * (t * (t - 2.0) + 1.0)
 }
 
+/// Second derivative of [`fade`] = `d/dt[30t²(t−1)²]` = `60t(t−1)(2t−1)` = `60(2t³ − 3t² + t)`. The
+/// quintic fade is C², so this is the EXACT, portable (basic-ops-only) curvature of the interpolant —
+/// the ingredient the analytic erosion gradient needs (the noise Hessian). Horner form.
+#[inline]
+fn fade_deriv2(t: f64) -> f64 {
+    60.0 * t * (t * (2.0 * t - 3.0) + 1.0)
+}
+
 /// One octave of bilinear **value noise** with its analytic gradient, evaluated at the (already
 /// frequency-scaled) coordinate `(x, z)`. Returns `(value, ∂value/∂x, ∂value/∂z)` where the value is
 /// in roughly `[-1, 1]` and the gradient is in value-per-unit of the scaled coordinate.
@@ -109,6 +117,52 @@ pub fn value_noise_grad(x: f64, z: f64, seed: u32) -> (f64, f64, f64) {
     let dval_dz = (b - a) * dv;
 
     (value, dval_dx, dval_dz)
+}
+
+/// One octave of value noise with its analytic gradient AND Hessian at (already frequency-scaled)
+/// `(x, z)`. Returns `(v, ∂v/∂x, ∂v/∂z, ∂²v/∂x², ∂²v/∂x∂z, ∂²v/∂z²)` in the scaled coordinate. The
+/// fade is C² so the Hessian is EXACT (and portable — basic `f64` ops only). Superset of
+/// [`value_noise_grad`]: the `(v, ∂v/∂x, ∂v/∂z)` lanes are bit-identical to it.
+#[inline]
+pub fn value_noise_grad_hess(x: f64, z: f64, seed: u32) -> (f64, f64, f64, f64, f64, f64) {
+    let xi = x.floor();
+    let zi = z.floor();
+    let ix = xi as i32;
+    let iz = zi as i32;
+    let fx = x - xi;
+    let fz = z - zi;
+
+    let v00 = value_at_lattice(ix, iz, seed);
+    let v10 = value_at_lattice(ix + 1, iz, seed);
+    let v01 = value_at_lattice(ix, iz + 1, seed);
+    let v11 = value_at_lattice(ix + 1, iz + 1, seed);
+
+    let u = fade(fx);
+    let vv = fade(fz);
+    let du = fade_deriv(fx);
+    let dv = fade_deriv(fz);
+    let ddu = fade_deriv2(fx);
+    let ddv = fade_deriv2(fz);
+
+    // x-edge lerps (z = iz and z = iz+1) and their x-derivatives.
+    let a = v00 + (v10 - v00) * u;
+    let b = v01 + (v11 - v01) * u;
+    let value = a + (b - a) * vv;
+
+    let da_dx = (v10 - v00) * du;
+    let db_dx = (v11 - v01) * du;
+    let dval_dx = da_dx + (db_dx - da_dx) * vv;
+    let dval_dz = (b - a) * dv;
+
+    // Second derivatives (see height.rs/erosion.rs analytic-gradient derivation):
+    //  ∂²/∂x² : ddu · [ (v10−v00) + ((v11−v01)−(v10−v00))·vv ]
+    //  ∂²/∂x∂z: du · dv · [ (v11−v01) − (v10−v00) ]
+    //  ∂²/∂z² : (b − a) · ddv
+    let dxx = ddu * ((v10 - v00) + ((v11 - v01) - (v10 - v00)) * vv);
+    let dxz = du * dv * ((v11 - v01) - (v10 - v00));
+    let dzz = (b - a) * ddv;
+
+    (value, dval_dx, dval_dz, dxx, dxz, dzz)
 }
 
 /// Fractal-Brownian-motion parameters for a height field. Plain data (no Bevy types) so this module
@@ -169,10 +223,43 @@ pub fn fbm_height_grad(wx: f64, wz: f64, p: &FbmParams) -> (f64, f64, f64) {
     (h, dh_dx, dh_dz)
 }
 
+/// fBm height + analytic world-space XZ gradient AND Hessian at world `(wx, wz)`. Returns
+/// `(h, ∂h/∂wx, ∂h/∂wz, ∂²h/∂wx², ∂²h/∂wx∂wz, ∂²h/∂wz²)`. Each octave's value/grad/Hessian is evaluated
+/// at the frequency-scaled coord; the chain rule scales the gradient by `freq` and the Hessian by
+/// `freq²` (and amplitude scales the contribution). EXACT + portable (basic ops + the portable noise
+/// basis). The `(h, ∂x, ∂z)` lanes are bit-identical to [`fbm_height_grad`]. The erosion filter's
+/// analytic gradient needs the Hessian (the slope-damp term differentiates through `∇h`).
+#[inline]
+pub fn fbm_height_grad_hess(wx: f64, wz: f64, p: &FbmParams) -> (f64, f64, f64, f64, f64, f64) {
+    let mut freq = p.base_freq;
+    let mut amp = p.amplitude;
+    let mut h = 0.0;
+    let mut dh_dx = 0.0;
+    let mut dh_dz = 0.0;
+    let mut hxx = 0.0;
+    let mut hxz = 0.0;
+    let mut hzz = 0.0;
+    for o in 0..p.octaves {
+        let oseed = p.seed.wrapping_add(o.wrapping_mul(0x9E37_79B9));
+        let (v, gx, gz, dxx, dxz, dzz) = value_noise_grad_hess(wx * freq, wz * freq, oseed);
+        h += v * amp;
+        dh_dx += gx * amp * freq;
+        dh_dz += gz * amp * freq;
+        // d²/dwx² of v(wx·freq, ·) = (∂²v/∂x²)·freq²; amplitude scales the contribution.
+        let f2 = freq * freq;
+        hxx += dxx * amp * f2;
+        hxz += dxz * amp * f2;
+        hzz += dzz * amp * f2;
+        freq *= p.lacunarity;
+        amp *= p.gain;
+    }
+    (h, dh_dx, dh_dz, hxx, hxz, hzz)
+}
+
 /// fBm height (value only) at world `(wx, wz)` — the same octave sum as [`fbm_height_grad`] without the
-/// gradient accumulation. Used by the height layer's ridge fold + central-difference erosion gradient,
-/// which differentiate the scalar field numerically (so the per-tap closed-form gradient is wasted
-/// work). Identical bit pattern to `fbm_height_grad(...).0`. Deterministic & bit-portable.
+/// gradient accumulation. Kept as a value-only reference (and the parity anchor for `fbm_height_grad`'s
+/// value lane); the height layer now takes the carved gradient CLOSED-FORM via [`fbm_height_grad_hess`],
+/// so it no longer needs this. Identical bit pattern to `fbm_height_grad(...).0`. Deterministic & portable.
 #[inline]
 pub fn fbm_height(wx: f64, wz: f64, p: &FbmParams) -> f64 {
     let mut freq = p.base_freq;
@@ -286,6 +373,60 @@ mod tests {
         }
     }
 
+    /// `value_noise_grad_hess` agrees with `value_noise_grad` on the shared lanes, and its Hessian
+    /// matches a central finite difference of the gradient (the exact-curvature property the analytic
+    /// erosion gradient relies on).
+    #[test]
+    fn value_noise_hessian_matches_finite_difference() {
+        let seed = 0x1234_5678;
+        let h = 1e-4;
+        for &(x, z) in &[(0.31, 0.62), (1.5, -2.25), (-3.7, 4.1), (10.05, -10.95)] {
+            let (v, gx, gz, hxx, hxz, hzz) = value_noise_grad_hess(x, z, seed);
+            // Shared lanes identical to value_noise_grad.
+            let (v2, gx2, gz2) = value_noise_grad(x, z, seed);
+            assert_eq!(v.to_bits(), v2.to_bits());
+            assert_eq!(gx.to_bits(), gx2.to_bits());
+            assert_eq!(gz.to_bits(), gz2.to_bits());
+            // Hessian via central difference of the gradient.
+            let (_, gxp, gzp) = value_noise_grad(x + h, z, seed);
+            let (_, gxm, gzm) = value_noise_grad(x - h, z, seed);
+            let (_, _gxzp, gzzp) = value_noise_grad(x, z + h, seed);
+            let (_, _gxzm, gzzm) = value_noise_grad(x, z - h, seed);
+            let fd_xx = (gxp - gxm) / (2.0 * h);
+            let fd_xz = (gzp - gzm) / (2.0 * h); // ∂(∂v/∂z)/∂x = mixed partial (symmetric)
+            let fd_zz = (gzzp - gzzm) / (2.0 * h);
+            assert!((hxx - fd_xx).abs() < 1e-2, "∂xx at ({x},{z}): {hxx} vs {fd_xx}");
+            assert!((hxz - fd_xz).abs() < 1e-2, "∂xz at ({x},{z}): {hxz} vs {fd_xz}");
+            assert!((hzz - fd_zz).abs() < 1e-2, "∂zz at ({x},{z}): {hzz} vs {fd_zz}");
+        }
+    }
+
+    /// fBm Hessian matches a central finite difference of the fBm gradient (octave accumulation +
+    /// frequency² chain-rule), and the shared lanes are bit-identical to `fbm_height_grad`.
+    #[test]
+    fn fbm_hessian_matches_finite_difference() {
+        let p = FbmParams { octaves: 4, base_freq: 0.05, lacunarity: 2.0, gain: 0.5, amplitude: 30.0, seed: 9 };
+        let h = 1e-3;
+        for &(wx, wz) in &[(12.0, -7.0), (0.0, 0.0), (-130.0, 88.0), (1000.5, -500.25)] {
+            let (hv, gx, gz, hxx, hxz, hzz) = fbm_height_grad_hess(wx, wz, &p);
+            let (hv2, gx2, gz2) = fbm_height_grad(wx, wz, &p);
+            assert_eq!(hv.to_bits(), hv2.to_bits());
+            assert_eq!(gx.to_bits(), gx2.to_bits());
+            assert_eq!(gz.to_bits(), gz2.to_bits());
+            // ∂xx from ∂x's x-difference; ∂xz from ∂x's z-difference; ∂zz from ∂z's z-difference.
+            let (_, gxxp, _) = fbm_height_grad(wx + h, wz, &p);
+            let (_, gxxm, _) = fbm_height_grad(wx - h, wz, &p);
+            let (_, gxzp, gzzp) = fbm_height_grad(wx, wz + h, &p);
+            let (_, gxzm, gzzm) = fbm_height_grad(wx, wz - h, &p);
+            let fd_xx = (gxxp - gxxm) / (2.0 * h);
+            let fd_xz = (gxzp - gxzm) / (2.0 * h);
+            let fd_zz = (gzzp - gzzm) / (2.0 * h);
+            assert!((hxx - fd_xx).abs() < 1e-2, "fBm ∂xx at ({wx},{wz}): {hxx} vs {fd_xx}");
+            assert!((hxz - fd_xz).abs() < 1e-2, "fBm ∂xz at ({wx},{wz}): {hxz} vs {fd_xz}");
+            assert!((hzz - fd_zz).abs() < 1e-2, "fBm ∂zz at ({wx},{wz}): {hzz} vs {fd_zz}");
+        }
+    }
+
     /// fBm gradient also matches finite differences (octave accumulation + frequency chain-rule).
     #[test]
     fn fbm_gradient_matches_finite_difference() {
@@ -304,8 +445,8 @@ mod tests {
         }
     }
 
-    /// `fbm_height` (value-only) is bit-identical to `fbm_height_grad(...).0` — the height layer's
-    /// central-difference erosion gradient relies on this equivalence (it differentiates `fbm_height`).
+    /// `fbm_height` (value-only) is bit-identical to `fbm_height_grad(...).0` — both share the exact
+    /// octave-sum value path, so either can serve as the value reference.
     #[test]
     fn fbm_height_matches_grad_value() {
         let p = FbmParams { octaves: 5, base_freq: 1.0 / 300.0, lacunarity: 2.0, gain: 0.5, amplitude: 60.0, seed: 17 };

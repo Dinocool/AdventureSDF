@@ -10,17 +10,13 @@ use bevy::prelude::*;
 use super::super::artifact::{ArtifactKind, HeightNode, ScalarField2D};
 use super::super::coord::{Authority, ChunkSize, Dim, LayerId};
 use super::super::layer::{ArtifactDecl, GenCtx, GenOutput, Layer};
-use super::super::noise::{FbmParams, fbm_height, fbm_height_grad};
-use super::erosion::{ErosionParams, erode_height};
+use super::super::noise::{FbmParams, fbm_height_grad, fbm_height_grad_hess};
+use super::erosion::{ErosionParams, erode_with_grad};
 
 /// Bump when the height layer's *output* intentionally changes (algorithm/constants). It keys the
 /// disk cache (WORLD_GEN_PLAN §2.3) and the parity reference vectors — a change here forces
 /// regenerating reference values, making "I meant to change the terrain" explicit and review-visible.
-pub const HEIGHT_GEN_VERSION: u32 = 3;
-
-/// Central-difference step (world metres) for the eroded/ridged gradient in [`HeightLayer::sample_world`].
-/// Small enough to resolve the finest erosion feature, large enough to stay well clear of `f64` noise.
-pub const EROSION_GRAD_EPS: f64 = 0.5;
+pub const HEIGHT_GEN_VERSION: u32 = 4;
 
 /// Chunk edge in base cells (= metres) for the height layer's tier.
 pub const HEIGHT_CHUNK_CELLS: u32 = 128;
@@ -47,7 +43,8 @@ pub struct HeightParams {
     pub sea_level: f32,
     /// Ridged-multifractal blend in `[0, 1]`: `0` = plain fBm, `1` = fully ridged (the fBm octave sum
     /// folded toward `1 - |fbm|`-style sharp peaks). Folds the SAME octave sum, so the field stays
-    /// band-limited; the (now non-analytic) gradient is taken by central difference in `sample_world`.
+    /// band-limited; the fold's gradient is taken CLOSED-FORM (value-noise gradient + base Hessian) in
+    /// `sample_world` / `carved_grad` — no central difference.
     pub ridge: f32,
     /// Per-layer salt mixed with the world seed so this layer has an independent stream.
     pub seed_salt: u32,
@@ -151,47 +148,53 @@ impl HeightLayer {
         }
     }
 
-    /// Full carved SCALAR surface height at world `(wx, wz)`: fBm, optionally folded toward a ridged
-    /// multifractal by `params.ridge`, plus sea level, then carved by the erosion filter. Pure /
-    /// deterministic / bit-portable (basic `f64` ops + the portable noise basis). This is the function
-    /// the central difference in [`sample_world`](Self::sample_world) differentiates for the gradient.
+    /// Full carved surface at world `(wx, wz)`: fBm, optionally folded toward a ridged multifractal by
+    /// `params.ridge`, plus sea level, then carved by the erosion filter — returning the height AND its
+    /// CLOSED-FORM XZ gradient `(H, ∂H/∂wx, ∂H/∂wz)`. Pure / deterministic / bit-portable (basic `f64`
+    /// ops + the portable noise basis + Hessian). ONE eval/node — replaces the old 5-tap central
+    /// difference (the gen-perf + FD-smoothing regression).
+    ///
+    /// The gradient is exact: the fBm carries an analytic gradient+Hessian; the ridge fold `1−|fbm|`
+    /// differentiates with the value-noise gradient (its piecewise-constant `sign` is measure-zero, as
+    /// for the FD it replaces); and [`erode_with_grad`] differentiates the erosion carve using the base
+    /// Hessian (the slope-damp term needs `d(∇h)`). The erosion's slope-damp is now seeded with the TRUE
+    /// (ridge-folded) surface gradient — so the carved surface VALUE differs slightly from the old
+    /// smooth-fBm-seeded form (re-pinned parity, `HEIGHT_GEN_VERSION` 3 → 4).
     #[inline]
-    fn height_world(&self, wx: f64, wz: f64, fbm: &FbmParams, world_seed: u64) -> f64 {
+    fn carved_grad(&self, wx: f64, wz: f64, fbm: &FbmParams, world_seed: u64) -> (f64, f64, f64) {
+        // Base fBm value + analytic gradient + Hessian (one eval).
+        let (h, gx, gz, hxx, hxz, hzz) = fbm_height_grad_hess(wx, wz, fbm);
+
         let ridge = self.params.ridge as f64;
-        let h_base = if ridge == 0.0 {
-            // Plain fBm value (value-only variant — no gradient needed here).
-            fbm_height(wx, wz, fbm)
+        let (h_base, gx_b, gz_b, hxx_b, hxz_b, hzz_b) = if ridge == 0.0 {
+            (h, gx, gz, hxx, hxz, hzz) // plain fBm — exact analytic, no fold.
         } else {
-            // Ridged fold of the SAME octave sum: blend `h` toward `amplitude_sum·(1 - |fbm|/amp_sum)`,
-            // i.e. fold the signed fBm to its ridged form scaled to the same swing. Keeps it band-limited
-            // (same octaves) and parameter-driven (no magic constants).
-            let h = fbm_height(wx, wz, fbm);
+            // Ridged fold of the SAME octave sum (band-limited, parameter-driven):
+            //   h_base = h + ridge·((amp_sum − 2|h|) − h) = h·(1−ridge) + ridge·amp_sum − 2·ridge·|h|.
+            // ⇒ ∂h_base = ∂h·[(1−ridge) − 2·ridge·sign(h)] and the Hessian scales by the SAME factor `k`
+            //   (sign(h)'s jump at h=0 is measure-zero — matches the FD this replaces).
             let amp_sum = self.params.amplitude_sum();
-            // `1 - |h|/amp_sum ∈ [0, 1]`; rescale to the fBm swing and recentre so ridge=1 still spans a
-            // comparable band. `ridged = amp_sum·(1 - 2·|h|/amp_sum) = amp_sum - 2·|h|` (mapped to
-            // roughly `[-amp_sum, amp_sum]`, peaks where the fBm crosses zero → sharp ridgelines).
             let ah = if h < 0.0 { -h } else { h };
             let ridged = amp_sum - 2.0 * ah;
-            h + ridge * (ridged - h)
+            let h_base = h + ridge * (ridged - h);
+            let sgn = if h < 0.0 { -1.0 } else { 1.0 };
+            let k = (1.0 - ridge) - 2.0 * ridge * sgn;
+            (h_base, gx * k, gz * k, hxx * k, hxz * k, hzz * k)
         };
         let h_sea = h_base + self.params.sea_level as f64;
-        // Carve. `erode_height` needs the base XZ gradient to seed its slope-damp feedback; recompute it
-        // analytically from the fBm (the ridge fold's own derivative is folded in by the central
-        // difference in `sample_world`, so the seed gradient here is the smooth fBm slope — fine).
-        let (_, gx, gz) = fbm_height_grad(wx, wz, fbm);
-        erode_height(h_sea, gx, gz, wx, wz, world_seed, &self.erosion)
+        // Carve: analytic eroded height + gradient, seeded by the TRUE (ridge-folded) base gradient +
+        // Hessian. `enabled = false` ⇒ exact identity `(h_sea, gx_b, gz_b)`.
+        erode_with_grad(h_sea, gx_b, gz_b, hxx_b, hxz_b, hzz_b, wx, wz, world_seed, &self.erosion)
     }
 
-    /// Authoritative carved surface height + XZ gradient at world `(wx, wz)`. Single source of truth
-    /// for "the terrain surface here", shared by chunk generation, the parity harness, and the CPU
+    /// Authoritative carved surface height + analytic XZ gradient at world `(wx, wz)`. Single source of
+    /// truth for "the terrain surface here", shared by chunk generation, the parity harness, and the CPU
     /// `eval_primitive` picking path. Deterministic & bit-portable.
     ///
     /// FAST PATH — plain fBm (`ridge == 0` AND erosion disabled): the closed-form `fbm_height_grad`
-    /// gradient (exact, cheap). OTHERWISE the ridge fold (`1 - |fbm|`) and the erosion carve are not
-    /// closed-form differentiable through this layer (they'd need the noise Hessian), so the gradient is
-    /// taken by a CENTRAL DIFFERENCE of [`height_world`](Self::height_world) at `±EROSION_GRAD_EPS` in
-    /// wx and wz — 5 height evals/node, fine for per-chunk (infrequent) generation; the bake reads the
-    /// stored gradient. Still a pure deterministic `f(wx, wz, seed)`.
+    /// (exact, cheap, bit-for-bit unchanged from the pre-erosion behaviour). OTHERWISE the ridge fold +
+    /// erosion carve are differentiated CLOSED-FORM via [`carved_grad`](Self::carved_grad) (one eval, the
+    /// noise Hessian) — no central-difference taps. Still a pure deterministic `f(wx, wz, seed)`.
     #[inline]
     pub fn sample_world(&self, wx: f64, wz: f64, world_seed: u64) -> HeightNode {
         let fbm = self.fbm_params(world_seed);
@@ -206,18 +209,8 @@ impl HeightLayer {
             };
         }
 
-        let e = EROSION_GRAD_EPS;
-        let h = self.height_world(wx, wz, &fbm, world_seed);
-        let hxp = self.height_world(wx + e, wz, &fbm, world_seed);
-        let hxm = self.height_world(wx - e, wz, &fbm, world_seed);
-        let hzp = self.height_world(wx, wz + e, &fbm, world_seed);
-        let hzm = self.height_world(wx, wz - e, &fbm, world_seed);
-        let inv2e = 1.0 / (2.0 * e);
-        HeightNode {
-            height: h as f32,
-            dh_dx: ((hxp - hxm) * inv2e) as f32,
-            dh_dz: ((hzp - hzm) * inv2e) as f32,
-        }
+        let (h, gx, gz) = self.carved_grad(wx, wz, &fbm, world_seed);
+        HeightNode { height: h as f32, dh_dx: gx as f32, dh_dz: gz as f32 }
     }
 }
 
@@ -326,30 +319,97 @@ mod tests {
         assert_ne!(a.height.to_bits(), b.height.to_bits());
     }
 
-    /// The stored gradient (from the `EROSION_GRAD_EPS` central difference) is finite and approximately
-    /// matches a FINER-eps central difference of the carved height — guards the terrain normals the bake
-    /// reconstructs from this gradient.
+    /// The CLOSED-FORM carved gradient (now stored by `sample_world`) matches a central difference of the
+    /// carved height — the correctness guard for the analytic erosion/ridge gradient (it replaced the FD
+    /// taps). The carved height value is `carved_grad(...).0` (its value lane is bit-identical to the old
+    /// `erode_height` path). Tolerance ~1e-2 (the FD's own truncation error at this eps).
     #[test]
-    fn stored_gradient_matches_finer_central_difference() {
+    fn analytic_gradient_matches_central_difference() {
         let l = layer();
         let seed = 4242u64;
+        let fbm = l.fbm_params(seed);
         // Sloped, mid-altitude points where erosion + ridge bite.
+        for &(wx, wz) in &[(321.0, -123.0), (-560.0, 880.0), (1500.5, 700.25)] {
+            let (_, gx, gz) = l.carved_grad(wx, wz, &fbm, seed);
+            assert!(gx.is_finite() && gz.is_finite(), "gradient not finite at ({wx},{wz})");
+            // Reference: a central difference of the full carved height (value lane of carved_grad).
+            let e = 0.01f64;
+            let hxp = l.carved_grad(wx + e, wz, &fbm, seed).0;
+            let hxm = l.carved_grad(wx - e, wz, &fbm, seed).0;
+            let hzp = l.carved_grad(wx, wz + e, &fbm, seed).0;
+            let hzm = l.carved_grad(wx, wz - e, &fbm, seed).0;
+            let fd_x = (hxp - hxm) / (2.0 * e);
+            let fd_z = (hzp - hzm) / (2.0 * e);
+            assert!((gx - fd_x).abs() < 1e-2, "∂x at ({wx},{wz}): analytic {gx} vs FD {fd_x}");
+            assert!((gz - fd_z).abs() < 1e-2, "∂z at ({wx},{wz}): analytic {gz} vs FD {fd_z}");
+        }
+    }
+
+    /// `sample_world`'s stored gradient (the analytic carved gradient narrowed to f32) is finite and
+    /// matches `carved_grad` — guards the terrain normals the bake reconstructs from this gradient.
+    #[test]
+    fn sample_world_stores_analytic_gradient() {
+        let l = layer();
+        let seed = 4242u64;
+        let fbm = l.fbm_params(seed);
         for &(wx, wz) in &[(321.0, -123.0), (-560.0, 880.0), (1500.5, 700.25)] {
             let n = l.sample_world(wx, wz, seed);
             assert!(n.dh_dx.is_finite() && n.dh_dz.is_finite(), "gradient not finite at ({wx},{wz})");
-            // Reference: a finer central difference of the full carved height.
-            let fbm = l.fbm_params(seed);
-            let e = 0.05f64;
-            let hxp = l.height_world(wx + e, wz, &fbm, seed);
-            let hxm = l.height_world(wx - e, wz, &fbm, seed);
-            let hzp = l.height_world(wx, wz + e, &fbm, seed);
-            let hzm = l.height_world(wx, wz - e, &fbm, seed);
-            let fd_x = (hxp - hxm) / (2.0 * e);
-            let fd_z = (hzp - hzm) / (2.0 * e);
-            // Generous tol: the two epsilons see slightly different band-limits of the same field.
-            assert!((n.dh_dx as f64 - fd_x).abs() < 1.0, "∂x at ({wx},{wz}): {} vs {fd_x}", n.dh_dx);
-            assert!((n.dh_dz as f64 - fd_z).abs() < 1.0, "∂z at ({wx},{wz}): {} vs {fd_z}", n.dh_dz);
+            let (h, gx, gz) = l.carved_grad(wx, wz, &fbm, seed);
+            assert_eq!(n.height.to_bits(), (h as f32).to_bits());
+            assert_eq!(n.dh_dx.to_bits(), (gx as f32).to_bits());
+            assert_eq!(n.dh_dz.to_bits(), (gz as f32).to_bits());
         }
+    }
+
+    /// Terrain-GEN microbench: the analytic gradient path (`sample_world`, ONE carved eval/node) vs the
+    /// old 5-tap central-difference path (one carved eval + 4 offset taps/node). `#[ignore]` — run with
+    /// `--release --ignored --nocapture`. Reports the per-node gen time + the speedup, the direct measure
+    /// of the gen-perf regression the analytic path recovers.
+    #[test]
+    #[ignore = "gen-perf microbench; run with --release --ignored --nocapture"]
+    fn bench_analytic_vs_fd_gradient() {
+        let l = layer();
+        let seed = 4242u64;
+        let fbm = l.fbm_params(seed);
+        // A grid of distinct world points (HEIGHT_FIELD_RES² ≈ one chunk's worth, several chunks over).
+        let n = 256usize;
+        let mut pts = Vec::with_capacity(n * n);
+        for j in 0..n {
+            for i in 0..n {
+                pts.push((i as f64 * 2.0 - 256.0, j as f64 * 2.0 + 100.0));
+            }
+        }
+        let e = 0.5f64; // the old EROSION_GRAD_EPS
+
+        // Analytic: 1 carved eval/node (value + gradient together).
+        let t0 = std::time::Instant::now();
+        let mut acc = 0.0f64;
+        for &(wx, wz) in &pts {
+            let (h, gx, gz) = l.carved_grad(wx, wz, &fbm, seed);
+            acc += h + gx + gz;
+        }
+        let analytic_ns = t0.elapsed().as_nanos() as f64 / pts.len() as f64;
+
+        // Old FD: 1 value eval + 4 offset value taps/node (the regression this replaced).
+        let t1 = std::time::Instant::now();
+        let mut acc2 = 0.0f64;
+        for &(wx, wz) in &pts {
+            let h = l.carved_grad(wx, wz, &fbm, seed).0;
+            let hxp = l.carved_grad(wx + e, wz, &fbm, seed).0;
+            let hxm = l.carved_grad(wx - e, wz, &fbm, seed).0;
+            let hzp = l.carved_grad(wx, wz + e, &fbm, seed).0;
+            let hzm = l.carved_grad(wx, wz - e, &fbm, seed).0;
+            acc2 += h + (hxp - hxm) / (2.0 * e) + (hzp - hzm) / (2.0 * e);
+        }
+        let fd_ns = t1.elapsed().as_nanos() as f64 / pts.len() as f64;
+
+        eprintln!(
+            "TERRAIN-GEN-BENCH: analytic {analytic_ns:.1} ns/node | 5-tap FD {fd_ns:.1} ns/node | \
+             speedup {:.2}x  (sink {acc:.3}/{acc2:.3})",
+            fd_ns / analytic_ns
+        );
+        assert!(analytic_ns < fd_ns, "analytic must be faster than the 5-tap FD");
     }
 
     /// With erosion disabled AND `ridge == 0`, `sample_world` takes the exact analytic fBm path — its

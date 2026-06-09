@@ -19,14 +19,17 @@
 //! peak/valley fade preserves the base height's sharp extremes. Output = `h_base - strength·fade·detail`.
 //!
 //! # Gradient
-//! `erode_height` returns only the carved scalar height — its analytic derivative would need the noise
-//! *Hessian* (which `value_noise_grad` does not expose, since the ridge fold `1-|v|` and the slope-damp
-//! both differentiate through `dv`). So the eroded gradient is taken by CENTRAL DIFFERENCE of the full
-//! (fBm + ridge + erosion) height in [`super::height::HeightLayer::sample_world`] — see that function.
+//! [`erode_with_grad`] returns the carved height AND its CLOSED-FORM XZ gradient (one eval/node). The
+//! erosion derivative needs the noise *Hessian* — the slope-damp `1/(1+gully·|∇h|²)` differentiates
+//! through the running slope's derivative `d(∇h)` — so it consumes the base Hessian from
+//! [`super::super::noise::value_noise_grad_hess`] / [`super::super::noise::fbm_height_grad_hess`] and
+//! accumulates it through the octaves alongside the gradient. This REPLACED the old 5-tap central
+//! difference in [`super::height::HeightLayer::sample_world`] (5× the eval cost + a smoothed FD normal).
+//! [`erode_height`] (value-only) is kept as the parity reference its value lane is pinned to.
 
 use bevy::prelude::*;
 
-use super::super::noise::value_noise_grad;
+use super::super::noise::{value_noise_grad, value_noise_grad_hess};
 
 /// Editor-tweakable erosion-layer parameters (reflected resource, mirrors [`super::height::HeightParams`]).
 /// A change dirties the layer → full regen (handled by the manager, same path as a height-param edit).
@@ -100,6 +103,15 @@ fn smooth_bump(t: f64) -> f64 {
     let tc = t.clamp(-1.0, 1.0);
     let b = 1.0 - tc * tc;
     if b < 0.0 { 0.0 } else { b }
+}
+
+/// Derivative of [`smooth_bump`] w.r.t. its argument `t`: `d/dt[1 − clamp(t)²]`. Inside `(−1, 1)` this is
+/// `−2t`; outside (where `clamp` pins `t`) it is `0` (the bump is flat). The single non-smooth points
+/// `t = ±1` are measure-zero for the analytic gradient (the FD it replaces equally couldn't see them).
+/// Basic ops only.
+#[inline]
+fn smooth_bump_deriv(t: f64) -> f64 {
+    if t > -1.0 && t < 1.0 { -2.0 * t } else { 0.0 }
 }
 
 /// Carve the base height with the portable ridged-erosion filter. Returns the eroded SCALAR height in
@@ -176,6 +188,145 @@ pub fn erode_height(
     h_base - p.strength as f64 * fade * detail
 }
 
+/// Carve the base height AND return the carved surface's ANALYTIC XZ gradient — the closed-form
+/// replacement for the central-difference taps the height layer used to take (5× the eval cost + a
+/// smoothed FD normal). Returns `(eroded_height, ∂H/∂wx, ∂H/∂wz)`.
+///
+/// - `h_base`            — base surface height (incl. sea level + ridge fold), metres.
+/// - `gx_base/gz_base`   — base surface XZ GRADIENT (∂h_base/∂wx, ∂h_base/∂wz). Seeds both the slope-damp
+///   feedback (as before) AND the carved gradient (the `h_base −` term + the fade's chain rule).
+/// - `hxx/hxz/hzz`       — base surface HESSIAN (∂²h_base). Seeds the running-slope DERIVATIVE the
+///   slope-damp term differentiates through (its whole reason for existing — see the derivation inline).
+/// - `wx/wz`, `world_seed`, `p` — as [`erode_height`].
+///
+/// The VALUE lane is bit-identical to [`erode_height`] (same op order), so this can replace the value
+/// path with no parity drift. `enabled = false` ⇒ EXACT identity: `(h_base, gx_base, gz_base)`.
+///
+/// DERIVATION (matches `erode_height` term by term):
+/// `H = h_base − strength·fade·detail`, so `∂H = gx_base − strength·(∂fade·detail + fade·∂detail)`.
+/// - `fade = 1 − pvf·bump(h_norm)`, `h_norm = h_base/(strength+1)` ⇒ `∂fade = −pvf·bump'(h_norm)·∂h_norm`,
+///   `∂h_norm = gx_base/(strength+1)`.
+/// - `detail = (Σ amp·r·damp)/norm`. Per octave `o`:
+///   - `r = (1−|v|)²·(1+gully)`, `v = value(wx·freq, ·)` ⇒ `∂r = (1+gully)·2·(1−|v|)·(−sign(v)·∂v)`,
+///     `∂v/∂wx = dvx·freq` (chain rule).
+///   - `damp = 1/(1+gully·slope²)`, `slope² = gx²+gz²` (the RUNNING slope) ⇒
+///     `∂damp = −gully·∂(slope²)·damp²`, `∂(slope²)/∂wx = 2gx·∂gx/∂wx + 2gz·∂gz/∂wx`.
+///     The running slope's derivative `∂gx/∂wx = Gxx` accumulates the noise HESSIAN through the octaves
+///     (seeded by the base Hessian) exactly as `gx` accumulates the gradient — THIS is why the Hessian
+///     is required.
+#[inline]
+#[allow(clippy::too_many_arguments)]
+pub fn erode_with_grad(
+    h_base: f64,
+    gx_base: f64,
+    gz_base: f64,
+    hxx: f64,
+    hxz: f64,
+    hzz: f64,
+    wx: f64,
+    wz: f64,
+    world_seed: u64,
+    p: &ErosionParams,
+) -> (f64, f64, f64) {
+    if !p.enabled {
+        return (h_base, gx_base, gz_base); // exact identity — no carving, no rounding.
+    }
+    let seed = erosion_seed(world_seed, p);
+    let base_cell = p.base_cell_size as f64;
+    let inv_cell = if base_cell > 1e-6 { 1.0 / base_cell } else { 1.0 };
+
+    let lacunarity = p.lacunarity as f64;
+    let gain = p.gain as f64;
+    let gully = p.gully_weight as f64;
+
+    let mut freq = inv_cell;
+    let mut amp = 1.0;
+    // Running slope (gradient) AND its derivative (the accumulated Hessian), seeded by the base values.
+    let mut gx = gx_base;
+    let mut gz = gz_base;
+    let mut g_xx = hxx; // ∂gx/∂wx
+    let mut g_xz = hxz; // ∂gx/∂wz = ∂gz/∂wx (mixed)
+    let mut g_zz = hzz; // ∂gz/∂wz
+    let mut detail = 0.0;
+    let mut ddetail_dx = 0.0;
+    let mut ddetail_dz = 0.0;
+    let mut norm = 0.0;
+
+    for o in 0..p.octaves {
+        let (v, dvx, dvz, dxx, dxz, dzz) = value_noise_grad_hess(wx * freq, wz * freq, seed ^ octave_salt(o));
+        // --- value path (bit-identical to erode_height) ---
+        let av = if v < 0.0 { -v } else { v };
+        let mut r = 1.0 - av;
+        r = r * r * (1.0 + gully);
+        let slope2 = gx * gx + gz * gz;
+        let damp = 1.0 / (1.0 + gully * slope2);
+        detail += amp * r * damp;
+        norm += amp;
+
+        // --- gradient path ---
+        // ∂v/∂w (world): chain rule from the scaled coord.
+        let dv_dx = dvx * freq;
+        let dv_dz = dvz * freq;
+        // sign(v) (0 at v==0 — measure-zero, FD couldn't see it either).
+        let sgn = if v < 0.0 { -1.0 } else { 1.0 };
+        // r = (1+gully)·(1-|v|)² ⇒ ∂r = (1+gully)·2·(1-|v|)·(-sgn·∂v).
+        let one_minus_av = 1.0 - av;
+        let coef = (1.0 + gully) * 2.0 * one_minus_av;
+        let dr_dx = coef * (-sgn * dv_dx);
+        let dr_dz = coef * (-sgn * dv_dz);
+        // ∂(slope²) = 2gx·∂gx + 2gz·∂gz, using the RUNNING slope's derivative (accumulated Hessian).
+        let dslope2_dx = 2.0 * gx * g_xx + 2.0 * gz * g_xz;
+        let dslope2_dz = 2.0 * gx * g_xz + 2.0 * gz * g_zz;
+        // ∂damp = -gully·∂(slope²)·damp².
+        let damp2 = damp * damp;
+        let ddamp_dx = -gully * dslope2_dx * damp2;
+        let ddamp_dz = -gully * dslope2_dz * damp2;
+        // ∂(amp·r·damp) = amp·(∂r·damp + r·∂damp).
+        ddetail_dx += amp * (dr_dx * damp + r * ddamp_dx);
+        ddetail_dz += amp * (dr_dz * damp + r * ddamp_dz);
+
+        // Feed this octave's gradient into the running slope, and its Hessian into the running slope's
+        // derivative — MIRRORS the value path's `gx += dvx*freq*amp` (so the next octave's damp/∂damp see
+        // the warped surface). ∂(dvx·freq·amp)/∂wx = dxx·freq²·amp, etc.
+        let f2 = freq * freq;
+        gx += dvx * freq * amp;
+        gz += dvz * freq * amp;
+        g_xx += dxx * f2 * amp;
+        g_xz += dxz * f2 * amp;
+        g_zz += dzz * f2 * amp;
+
+        freq *= lacunarity;
+        amp *= gain;
+    }
+
+    // VALUE-LANE PARITY: use the EXACT same ops as `erode_height` (`detail / norm.max`, `h_base / (s+1)`)
+    // so `h` is bit-identical. The gradient lanes apply the SAME `1/norm` and `1/(s+1)` factors (as
+    // multiplies — the gradient isn't parity-pinned to the FD it replaces, only ≈, so a reciprocal there
+    // is fine).
+    let norm_clamped = norm.max(1e-6);
+    let detail = detail / norm_clamped;
+    let inv_norm = 1.0 / norm_clamped;
+    let ddetail_dx = ddetail_dx * inv_norm;
+    let ddetail_dz = ddetail_dz * inv_norm;
+
+    let str1 = p.strength as f64 + 1.0;
+    let h_norm = h_base / str1;
+    let pvf = p.peak_valley_fade as f64;
+    let bump = smooth_bump(h_norm);
+    let fade = 1.0 - pvf * bump;
+    // ∂fade = -pvf·bump'(h_norm)·∂h_norm, ∂h_norm = ∂h_base/(s+1).
+    let bump_d = smooth_bump_deriv(h_norm);
+    let dfade_dx = -pvf * bump_d * gx_base / str1;
+    let dfade_dz = -pvf * bump_d * gz_base / str1;
+
+    let strength = p.strength as f64;
+    // H = h_base - strength·fade·detail ⇒ ∂H = ∂h_base - strength·(∂fade·detail + fade·∂detail).
+    let h = h_base - strength * fade * detail;
+    let dh_dx = gx_base - strength * (dfade_dx * detail + fade * ddetail_dx);
+    let dh_dz = gz_base - strength * (dfade_dz * detail + fade * ddetail_dz);
+    (h, dh_dx, dh_dz)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -198,6 +349,78 @@ mod tests {
         for &h in &[0.0, 12.5, -33.0, 250.0, -1.0e-9] {
             let out = erode_height(h, 0.7, -0.4, 123.0, -456.0, 7, &p);
             assert_eq!(out.to_bits(), h.to_bits(), "disabled erosion must be exact identity for h={h}");
+        }
+    }
+
+    /// `erode_with_grad`'s VALUE lane is BIT-IDENTICAL to `erode_height` (so swapping the height layer onto
+    /// the analytic path doesn't drift the carved surface VALUE — only the gradient is new). Same op order.
+    #[test]
+    fn with_grad_value_matches_erode_height_bitwise() {
+        let p = ErosionParams::default();
+        for &(h, gx, gz, wx, wz, s) in &[
+            (50.0, 0.3, -0.2, 12.0, -7.0, 42u64),
+            (40.0, 0.8, 0.5, 321.0, -123.0, 9),
+            (200.0, -1.2, 0.9, 1000.5, -500.25, 7),
+            (-30.0, 0.1, -0.05, -130.0, 88.0, 1),
+        ] {
+            let v_only = erode_height(h, gx, gz, wx, wz, s, &p);
+            // Seed the Hessian with arbitrary finite values: it must NOT affect the value lane.
+            let (v, _, _) = erode_with_grad(h, gx, gz, 0.01, -0.02, 0.03, wx, wz, s, &p);
+            assert_eq!(v.to_bits(), v_only.to_bits(), "value lane drifted at ({wx},{wz})");
+        }
+    }
+
+    /// `enabled = false` ⇒ `erode_with_grad` is the EXACT identity in ALL three lanes.
+    #[test]
+    fn with_grad_disabled_is_exact_identity() {
+        let p = ErosionParams { enabled: false, ..Default::default() };
+        for &(h, gx, gz) in &[(0.0, 0.7, -0.4), (250.0, -1.0, 0.5), (-33.0, 0.0, 0.0)] {
+            let (v, dx, dz) = erode_with_grad(h, gx, gz, 9.0, -9.0, 9.0, 123.0, -456.0, 7, &p);
+            assert_eq!(v.to_bits(), h.to_bits());
+            assert_eq!(dx.to_bits(), gx.to_bits());
+            assert_eq!(dz.to_bits(), gz.to_bits());
+        }
+    }
+
+    /// `erode_with_grad` is deterministic (bit-identical on recompute) in all three lanes.
+    #[test]
+    fn with_grad_is_deterministic() {
+        let p = ErosionParams::default();
+        for &(wx, wz) in &[(12.0, -7.0), (1000.5, -500.25), (-130.0, 88.0)] {
+            let a = erode_with_grad(50.0, 0.3, -0.2, 0.01, 0.0, -0.01, wx, wz, 42, &p);
+            let b = erode_with_grad(50.0, 0.3, -0.2, 0.01, 0.0, -0.01, wx, wz, 42, &p);
+            assert_eq!(a.0.to_bits(), b.0.to_bits());
+            assert_eq!(a.1.to_bits(), b.1.to_bits());
+            assert_eq!(a.2.to_bits(), b.2.to_bits());
+        }
+    }
+
+    /// The ANALYTIC eroded gradient matches a central difference of the eroded height — the correctness
+    /// guard for the closed-form differentiation of the erosion formula. The FD must use the SAME base
+    /// height/gradient/Hessian field, i.e. a consistent quadratic local model of `h_base`, so the FD of
+    /// the eroded value is meaningful. We model `h_base(wx,wz)` as the 2nd-order Taylor expansion about
+    /// the eval point from `(h, gx, gz, hxx, hxz, hzz)` and feed that to `erode_with_grad` at the offsets.
+    #[test]
+    fn analytic_gradient_matches_central_difference() {
+        let p = ErosionParams::default();
+        // A representative base surface sample (height, gradient, Hessian) — sloped, mid-altitude.
+        let (h0, gx0, gz0) = (60.0f64, 0.6f64, -0.4f64);
+        let (hxx, hxz, hzz) = (0.002f64, -0.001f64, 0.0015f64);
+        for &(wx, wz, seed) in &[(321.0, -123.0, 1u64), (-560.0, 880.0, 1), (1500.5, 700.25, 1)] {
+            let (_, dax, daz) = erode_with_grad(h0, gx0, gz0, hxx, hxz, hzz, wx, wz, seed, &p);
+            // Locally-consistent base field: h_base(wx+dx, wz+dz) = h0 + g·d + ½ dᵀH d, with gradient
+            // g + H·d (so the seed gradient/Hessian handed to erode_with_grad match the FD'd field).
+            let e = 0.01f64;
+            let base = |dx: f64, dz: f64| -> f64 {
+                let h = h0 + gx0 * dx + gz0 * dz + 0.5 * (hxx * dx * dx + 2.0 * hxz * dx * dz + hzz * dz * dz);
+                let gx = gx0 + hxx * dx + hxz * dz;
+                let gz = gz0 + hxz * dx + hzz * dz;
+                erode_with_grad(h, gx, gz, hxx, hxz, hzz, wx + dx, wz + dz, seed, &p).0
+            };
+            let fd_x = (base(e, 0.0) - base(-e, 0.0)) / (2.0 * e);
+            let fd_z = (base(0.0, e) - base(0.0, -e)) / (2.0 * e);
+            assert!((dax - fd_x).abs() < 1e-2, "∂x at ({wx},{wz}): analytic {dax} vs FD {fd_x}");
+            assert!((daz - fd_z).abs() < 1e-2, "∂z at ({wx},{wz}): analytic {daz} vs FD {fd_z}");
         }
     }
 
