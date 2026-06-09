@@ -110,14 +110,13 @@ pub struct WorldgenPreviewPanel {
     cam: (f32, f32),
     pan: (f64, f64),
     is3d: bool,
-    size: f32,
     tex: Option<egui::TextureHandle>,
     key: u64,
 }
 
 impl Default for WorldgenPreviewPanel {
     fn default() -> Self {
-        Self { target: None, half: PREVIEW_HALF_M, cam: CAM_DEFAULT, pan: (0.0, 0.0), is3d: true, size: 480.0, tex: None, key: 0 }
+        Self { target: None, half: PREVIEW_HALF_M, cam: CAM_DEFAULT, pan: (0.0, 0.0), is3d: true, tex: None, key: 0 }
     }
 }
 
@@ -183,6 +182,12 @@ impl WorldGraphEditor {
         self.disp_px.clear();
         self.prev_key.clear();
         self.pan.clear();
+    }
+
+    /// Auto-arrange the top-level snarl (plain `&mut self` so the disjoint snarl/body_size borrows don't
+    /// alias through `Mut`'s deref).
+    fn rearrange(&mut self) {
+        auto_arrange(&mut self.snarl, &self.body_size);
     }
 }
 
@@ -675,6 +680,7 @@ impl SnarlViewer<EdNode> for Viewer<'_> {
                         center: (cx, cz),
                         yaw,
                         pitch,
+                        res: res as u32,
                     });
                     match self.gpu_tex.get(&gkey) {
                         Some(&t) => t,
@@ -1432,6 +1438,7 @@ fn graph_panel(world: &mut World, ui: &mut egui::Ui) {
                             editor.snarl = snarl;
                             editor.nav.clear();
                             editor.clear_node_caches();
+                            editor.rearrange();
                             format!("loaded {wg}")
                         }
                         Err(e) => format!("hierarchy parse failed: {e}"),
@@ -1442,6 +1449,7 @@ fn graph_panel(world: &mut World, ui: &mut egui::Ui) {
                                 editor.snarl = graph_to_snarl(&asset.graph);
                                 editor.nav.clear();
                                 editor.clear_node_caches();
+                                editor.rearrange();
                                 format!("loaded {} (flat)", editor.path)
                             }
                             Err(e) => format!("parse failed: {e}"),
@@ -1663,13 +1671,15 @@ fn preview_panel(world: &mut World, ui: &mut egui::Ui) {
             if ui.add(egui::DragValue::new(&mut km).speed(0.5).range(0.05..=512.0).suffix(" km")).changed() {
                 panel.half = (km * 1000.0 / 2.0).max(1.0);
             }
-            ui.add(egui::DragValue::new(&mut panel.size).speed(4.0).range(128.0..=4096.0).suffix(" px"));
             ui.add(egui::DragValue::new(&mut panel.pan.0).speed(10.0).prefix("X ").suffix(" m"));
             ui.add(egui::DragValue::new(&mut panel.pan.1).speed(10.0).prefix("Y ").suffix(" m"));
             ui.label("· drag orbit · right-drag pan · scroll zoom");
         });
         let ppp = ui.ctx().pixels_per_point();
-        let res = ((panel.size * ppp).round() as usize).max(32);
+        // Fill the panel (drag the dock edge to resize); render res tracks the on-screen size.
+        let avail = ui.available_size();
+        let side = avail.x.min(avail.y).max(64.0);
+        let res = ((side * ppp).round() as usize).max(32);
         let tex = if panel.is3d {
             world.resource_mut::<GpuPreviewRequests>().0.push(GpuPreviewRequest {
                 key: PANEL_GPU_KEY,
@@ -1678,6 +1688,7 @@ fn preview_panel(world: &mut World, ui: &mut egui::Ui) {
                 center: panel.pan,
                 yaw: panel.cam.0,
                 pitch: panel.cam.1,
+                res: res as u32,
             });
             world.resource::<GpuPreviewTextures>().0.get(&PANEL_GPU_KEY).copied()
         } else {
@@ -1691,12 +1702,12 @@ fn preview_panel(world: &mut World, ui: &mut egui::Ui) {
             }
         };
         let resp = ui.add(
-            egui::Image::new(egui::load::SizedTexture::new(tid, egui::vec2(panel.size, panel.size)))
+            egui::Image::new(egui::load::SizedTexture::new(tid, egui::vec2(side, side)))
                 .sense(egui::Sense::click_and_drag()),
         );
         scroll_zoom_consume(ui, &resp, &mut panel.half);
-        let WorldgenPreviewPanel { half, pan, cam, is3d, size, .. } = &mut *panel;
-        handle_preview_gestures(ui, &resp, *is3d, *size, half, &mut pan.0, &mut pan.1, &mut cam.0, &mut cam.1);
+        let WorldgenPreviewPanel { half, pan, cam, is3d, .. } = &mut *panel;
+        handle_preview_gestures(ui, &resp, *is3d, side, half, &mut pan.0, &mut pan.1, &mut cam.0, &mut cam.1);
     });
 }
 
@@ -1732,7 +1743,6 @@ fn popped_preview_window(
                 if ui.add(egui::DragValue::new(&mut km).speed(0.25).range(0.05..=512.0).suffix(" km")).changed() {
                     p.half = (km * 1000.0 / 2.0).max(1.0);
                 }
-                ui.add(egui::DragValue::new(&mut p.size).speed(2.0).range(96.0..=2048.0).suffix(" px"));
             });
             if p.is3d {
                 ui.horizontal(|ui| {
@@ -1747,7 +1757,10 @@ fn popped_preview_window(
             }
 
             let ppp = ui.ctx().pixels_per_point();
-            let res = ((p.size * ppp).round() as usize).max(32);
+            // Fill the window (drag its edge to resize); render res tracks the on-screen size.
+            let avail = ui.available_size();
+            let side = avail.x.min(avail.y).max(64.0);
+            let res = ((side * ppp).round() as usize).max(32);
             let tex = if p.is3d {
                 // GPU path: request a render for next frame; show last frame's (or CPU-raymarch fallback).
                 gpu_reqs.push(GpuPreviewRequest {
@@ -1757,6 +1770,7 @@ fn popped_preview_window(
                     center: (p.cx, p.cz),
                     yaw: p.cam.0,
                     pitch: p.cam.1,
+                    res: res as u32,
                 });
                 match gpu_tex.get(&p.id) {
                     Some(&t) => t,
@@ -1770,11 +1784,11 @@ fn popped_preview_window(
                 ensure_preview_texture(ui.ctx(), name, &g, p.half, res, false, p.cam, (p.cx, p.cz), &mut p.tex, &mut p.key)
             };
             let resp = ui.add(
-                egui::Image::new(egui::load::SizedTexture::new(tex, egui::vec2(p.size, p.size)))
+                egui::Image::new(egui::load::SizedTexture::new(tex, egui::vec2(side, side)))
                     .sense(egui::Sense::click_and_drag()),
             );
             scroll_zoom_consume(ui, &resp, &mut p.half);
-            handle_preview_gestures(ui, &resp, p.is3d, p.size, &mut p.half, &mut p.cx, &mut p.cz, &mut p.cam.0, &mut p.cam.1);
+            handle_preview_gestures(ui, &resp, p.is3d, side, &mut p.half, &mut p.cx, &mut p.cz, &mut p.cam.0, &mut p.cam.1);
         });
     p.open = open;
 }
