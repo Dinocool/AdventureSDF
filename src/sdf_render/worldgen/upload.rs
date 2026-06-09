@@ -494,68 +494,21 @@ pub fn sample_clipmap_lod(clipmap: &HeightClipmap, world_xz: DVec2, voxel_size: 
     );
 }
 
-thread_local! {
-    /// Per-thread HINT for [`finest_covering_tier`]: the tier index the LAST clipmap query landed on.
-    /// The mesh-bake marches the sampler over a chunk in spatial order, so consecutive samples almost
-    /// always resolve to the SAME finest-covering tier (or an immediate neighbour) — seeding the search
-    /// from this hint turns the O(T) finest→coarsest coverage walk into ~1 coverage check amortized,
-    /// WITHOUT changing which tier is returned (the search below always lands on the true finest covering
-    /// tier; the hint only changes where it STARTS looking). Starts at 0 (finest), the plain walk's seed.
-    static COVERING_TIER_HINT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-}
-
-/// The index of the FINEST clipmap tier that COVERS `world_xz`, or `None` if no tier covers — returns
-/// the SAME index as the plain `clipmap.iter().position(|r| ring_covers(r, world_xz))` finest→coarsest
-/// walk, but O(1) amortized via the per-thread [`COVERING_TIER_HINT`].
+/// The index of the FINEST clipmap tier that COVERS `world_xz` (finest→coarsest, first hit), or `None`
+/// if no tier covers. PLAIN walk — checks every tier from finest up to the first covering one.
 ///
-/// CORRECTNESS RESTS ON ONE PROPERTY: the set of tiers covering a fixed point is a CONTIGUOUS SUFFIX
-/// `[c, T-1]` (`c` = the finest covering tier). It holds because the clipmap's tiers are concentric
-/// residency windows on the SAME rolling focus, tier `t`'s direct_radius = `HEIGHT_CHUNK_CELLS·3.75·2^t`
-/// — strictly increasing in `t` — so a point inside tier `t`'s window is inside every coarser tier's
-/// (larger) window: once a tier covers, all coarser ones cover. Hence "covers" is a monotone step in `t`,
-/// and the finest covering tier is the smallest `t` with `ring_covers`. (The `terrain_optimized_sampler_*`
-/// test asserts bit-identity vs the plain walk over a real multi-tier clipmap incl. boundary points, so if
-/// chunk-rounding/toroidal-wrap ever broke this contiguity the guard would catch it.)
-///
-/// Given the contiguous suffix, seed at the hint and scan contiguously to `c`:
-///   - if the hint COVERS, walk DOWN (finer) while the next-finer tier still covers — stops at `c`;
-///   - if the hint MISSES, it's in the non-covering prefix `[0, c)`, so walk UP (coarser) until covered.
-///
-/// Either way it returns the smallest covering index, then updates the hint to it — ~1 `ring_covers`
-/// check amortized (a few on a tier change) vs up to `T`. `None` ⇒ no tier covers.
+/// This is deliberately CONTIGUITY-FREE. A prior optimization assumed "the covering tiers are a
+/// contiguous suffix `[c, T-1]`" and hint-seeded the search — but that's FALSE DURING STREAMING: a
+/// coarser tier can be only PARTIALLY resident (still filling in) while a finer tier is fully resident
+/// and covers, so a point can be covered by tier `c` but NOT by `c+1`. A hint that skips tiers then
+/// misses the true finest covering and trips `sample_clipmap_lod`'s strict panic (the cull's gate uses a
+/// full `any-tier` check, so the gate and a hint-skipping sampler disagree → crash). The plain
+/// finest-first scan always lands on the smallest covering index regardless of contiguity, matching the
+/// gate. (A correct distance-bounded fast path can be reintroduced later — it needs the rolling focus to
+/// lower-bound the search by which tier's ring can even REACH the point.)
 #[inline]
 fn finest_covering_tier(clipmap: &HeightClipmap, world_xz: DVec2) -> Option<usize> {
-    let t = clipmap.len();
-    if t == 0 {
-        return None;
-    }
-    COVERING_TIER_HINT.with(|hint| {
-        let start = hint.get().min(t - 1);
-        let found = if ring_covers(&clipmap[start], world_xz) {
-            // Hint covers — walk DOWN to the finest tier that still covers.
-            let mut i = start;
-            while i > 0 && ring_covers(&clipmap[i - 1], world_xz) {
-                i -= 1;
-            }
-            Some(i)
-        } else {
-            // Hint misses — walk UP (coarser) until one covers; the first hit is the finest covering.
-            let mut i = start + 1;
-            loop {
-                if i >= t {
-                    break None;
-                }
-                if ring_covers(&clipmap[i], world_xz) {
-                    break Some(i);
-                }
-                i += 1;
-            }
-        };
-        if let Some(i) = found {
-            hint.set(i);
-        }
-        found
-    })
+    clipmap.iter().position(|ring| ring_covers(ring, world_xz))
 }
 
 /// OPTION-RETURNING clipmap sampler for NON-RENDERING queries (picking/classification/tests) AND the hot
@@ -563,10 +516,8 @@ fn finest_covering_tier(clipmap: &HeightClipmap, world_xz: DVec2) -> Option<usiz
 /// select uses that tier's own `node_spacing`), or `None` if NO tier covers (legitimately "no surface
 /// loaded here" for a non-rendering query). The NON-STRICT sibling of [`sample_clipmap_lod`].
 ///
-/// The finest covering tier is found in O(1) amortized via [`finest_covering_tier`] (a hint-seeded
-/// contiguous coverage scan) instead of the old O(T) finest→coarsest walk — but the RESULT is byte-for-byte
-/// identical to that walk (same tier, same mip, same height+gradient): the cross-LOD seam fix and the
-/// geomorph both depend on finest-covering being selected PER SAMPLE, and it still is.
+/// The finest covering tier is found by [`finest_covering_tier`] (a plain, contiguity-free finest→coarsest
+/// scan). Finest-covering is selected PER SAMPLE, which the cross-LOD seam fix + the geomorph depend on.
 pub fn try_sample_clipmap_lod(clipmap: &HeightClipmap, world_xz: DVec2, voxel_size: f32) -> Option<HeightNode> {
     let t = finest_covering_tier(clipmap, world_xz)?;
     // The covering check above proves this tier resolves; sample it at the band-limited mip for `voxel_size`.
@@ -1285,9 +1236,48 @@ mod tests {
         }
     }
 
-    /// The covering set of every probe point is a CONTIGUOUS SUFFIX `[c, T-1]` — the monotonicity the
-    /// optimized search depends on. If chunk-rounding or toroidal wrap ever punched a hole (a covered tier
-    /// finer than an uncovered one), this fails and the optimized sampler's contiguous scan would be unsafe.
+    /// REGRESSION (the streaming crash): during streaming a coarser tier can be only PARTIALLY resident
+    /// (still filling) while a FINER tier is fully resident and covers — so a point's covering set is
+    /// NON-CONTIGUOUS (covered at tier `c`, NOT at `c+1`). `finest_covering_tier` MUST still return the
+    /// covered finer tier regardless of query order; a tier-select that assumed a contiguous suffix and
+    /// seeded from a prior high-tier query skipped the finer covering tier → returned `None` →
+    /// `sample_clipmap_lod`'s strict panic (the cull's full `any-tier` gate had already admitted the chunk).
+    #[test]
+    fn sampler_handles_non_contiguous_streaming_coverage() {
+        let mut store = ArtifactStore::new();
+        let cells = [HEIGHT_CHUNK_CELLS, HEIGHT_CHUNK_CELLS << 1, HEIGHT_CHUNK_CELLS << 2]; // 128 / 256 / 512
+        insert_tier(&mut store, 0, cells[0], &[(0, 0), (0, 1), (1, 0), (1, 1)], 7); // tier 0: near origin only
+        insert_tier(&mut store, 1, cells[1], &[(0, 0), (0, 1), (1, 0), (1, 1), (-1, -1), (-1, 0)], 7); // tier 1
+        insert_tier(&mut store, 2, cells[2], &[(-1, -1)], 7); // tier 2 PARTIAL — a far chunk only, not at wp
+        let clip = build_height_clipmap(&store, &cells);
+
+        // wp: tier-0 chunk (2,0) ✗, tier-1 chunk (1,0) ✓, tier-2 chunk (0,0) ✗ ⇒ covered set = {1} (non-contiguous).
+        let wp = DVec2::new(300.0, 100.0);
+        assert!(!ring_covers(&clip[0], wp), "tier 0 doesn't reach wp");
+        assert!(ring_covers(&clip[1], wp), "tier 1 covers wp");
+        assert!(!ring_covers(&clip[2], wp), "tier 2 partial — doesn't cover wp");
+        assert_eq!(finest_covering_tier(&clip, wp), Some(1), "must find the covered FINER tier 1, not None");
+
+        // `far`: covered ONLY by tier 2 (the coarse chunk (-1,-1)). Query it FIRST, then wp — a hint-based
+        // optimizer would carry tier 2 into the wp query and wrongly skip tier 1. The sampler must match the
+        // plain finest-covering walk for EVERY query regardless of order.
+        let far = DVec2::new(-300.0, -300.0);
+        assert_eq!(finest_covering_tier(&clip, far), Some(2), "far covered only by tier 2");
+        for &p in &[far, wp, far, wp] {
+            for &vs in &[0.0f32, clip[0].node_spacing, clip[0].node_spacing * 4.0] {
+                assert_eq!(
+                    try_sample_clipmap_lod(&clip, p, vs).map(|n| n.height.to_bits()),
+                    ref_sample_clipmap_lod(&clip, p, vs).map(|n| n.height.to_bits()),
+                    "non-contiguous sampler must match the plain walk @ {p:?} vs={vs}"
+                );
+            }
+        }
+    }
+
+    /// In the STEADY STATE (every tier fully resident) the covering set of a point is a contiguous suffix
+    /// `[c, T-1]` — concentric windows, so once a tier covers, all coarser ones do. NOTE: the sampler does
+    /// NOT rely on this (it handles the non-contiguous streaming case above); this just documents the
+    /// steady-state geometry. A finer covering tier under an uncovered coarser one only arises mid-stream.
     #[test]
     fn clipmap_coverage_is_a_contiguous_suffix() {
         let clip = concentric_clipmap(4, 99);
