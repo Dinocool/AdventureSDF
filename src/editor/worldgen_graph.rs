@@ -10,6 +10,7 @@ use std::sync::Arc;
 
 use bevy::prelude::*;
 use bevy_egui::egui;
+use egui_phosphor::regular as icon;
 use egui_snarl::ui::{PinInfo, SnarlStyle, SnarlViewer, SnarlWidget};
 use egui_snarl::{InPin, InPinId, NodeId, OutPin, OutPinId, Snarl};
 
@@ -17,12 +18,12 @@ use crate::assets::Asset as _;
 use crate::sdf_render::worldgen::WorldGraph;
 use crate::sdf_render::worldgen::graph::GraphAsset;
 use crate::sdf_render::worldgen::graph::node::{FbmAxis, Graph, Node, NodeKind};
-use crate::sdf_render::worldgen::graph::preset::{MAX_GRAPH_NODES, mountains_plains_graph};
+use crate::sdf_render::worldgen::graph::preset::MAX_GRAPH_NODES;
 use crate::sdf_render::worldgen::spline::Spline;
 
 /// Default on-disk path the editor saves/loads the active biome graph to (the production graph the
 /// worldgen loads — see `WorldGenPlugin`'s asset hot-reload). Relative to the app's `assets/` root.
-const DEFAULT_GRAPH_PATH: &str = "assets/worldgen/mountains_plains.graph.ron";
+const DEFAULT_GRAPH_PATH: &str = "assets/worldgen/world.graph.ron";
 
 /// The climate axes a biome can read from its parent (its input pins, in order). Expandable: add an
 /// axis here and biomes gain a pin for it. The parent graph drives these (low-freq Fbm / derived math)
@@ -76,6 +77,9 @@ pub struct WorldGraphEditor {
     /// Last-frame on-screen preview square side (points) per node, used to pick the render resolution so
     /// previews stay crisp as the node is resized.
     disp_px: std::collections::HashMap<NodeId, f32>,
+    /// Fingerprint of the last rendered preview per node (graph + zoom + size + mode + camera); the
+    /// preview is only re-rendered when this changes (so an idle 3D raymarch costs nothing).
+    prev_key: std::collections::HashMap<NodeId, u64>,
     /// Navigation stack of biome nodes we've descended into (empty ⇒ the top "World" graph). The shown
     /// snarl is `snarl` walked through each biome's sub-graph. (Distinct from `path`, the save file path.)
     nav: Vec<NodeId>,
@@ -97,6 +101,7 @@ impl Default for WorldGraphEditor {
             cam: std::collections::HashMap::new(),
             body_size: std::collections::HashMap::new(),
             disp_px: std::collections::HashMap::new(),
+            prev_key: std::collections::HashMap::new(),
             nav: Vec::new(),
             enter: None,
         }
@@ -114,6 +119,7 @@ impl WorldGraphEditor {
         self.cam.clear();
         self.body_size.clear();
         self.disp_px.clear();
+        self.prev_key.clear();
     }
 }
 
@@ -471,6 +477,7 @@ struct Viewer<'a> {
     cam: &'a mut std::collections::HashMap<NodeId, (f32, f32)>,
     body_size: &'a mut std::collections::HashMap<NodeId, egui::Vec2>,
     disp_px: &'a mut std::collections::HashMap<NodeId, f32>,
+    prev_key: &'a mut std::collections::HashMap<NodeId, u64>,
     /// Set to a biome node id when the user clicks its "Open" — the panel descends after the show.
     enter: &'a mut Option<NodeId>,
 }
@@ -480,8 +487,8 @@ impl SnarlViewer<EdNode> for Viewer<'_> {
         match node {
             EdNode::Output => "Output".into(),
             EdNode::Op(k) => node_kind_name(k).into(),
-            EdNode::Biome { name, .. } => format!("🌱 {name}"),
-            EdNode::Input(k) => format!("⮡ {}", climate_name(*k)),
+            EdNode::Biome { name, .. } => format!("{} {name}", icon::PLANT),
+            EdNode::Input(k) => format!("{} {}", icon::ARROW_ELBOW_DOWN_RIGHT, climate_name(*k)),
         }
     }
 
@@ -523,7 +530,7 @@ impl SnarlViewer<EdNode> for Viewer<'_> {
             _ => {}
         }
         if matches!(snarl.get_node(node), Some(EdNode::Biome { .. }))
-            && ui.button("Open ▸").on_hover_text("Edit this biome's sub-graph").clicked()
+            && ui.button(format!("{} Open", icon::CARET_RIGHT)).on_hover_text("Edit this biome's sub-graph").clicked()
         {
             *self.enter = Some(node);
         }
@@ -532,10 +539,15 @@ impl SnarlViewer<EdNode> for Viewer<'_> {
 
         // Collapsed: just an expand toggle.
         if self.collapsed.contains(&node) {
-            if ui.small_button("▸ Preview").on_hover_text("Show this node's 2D/3D preview").clicked() {
+            if ui
+                .small_button(format!("{} Preview", icon::CARET_RIGHT))
+                .on_hover_text("Show this node's 2D/3D preview")
+                .clicked()
+            {
                 self.collapsed.remove(&node);
             }
             self.previews.remove(&node); // free the GPU texture while collapsed
+            self.prev_key.remove(&node);
             self.body_size.insert(node, ui.min_rect().size());
             return;
         }
@@ -543,26 +555,33 @@ impl SnarlViewer<EdNode> for Viewer<'_> {
         // Open: the preview IMAGE on the LEFT, its controls in a column on the RIGHT (no overlap).
         let is3d = self.surface.contains(&node);
         let size = self.disp_px.get(&node).copied().unwrap_or(DEFAULT_PREVIEW_PX);
-        // Render at the displayed size in physical pixels so the raymarch/heatmap detail matches the
-        // on-screen size (capped per mode — 3D raymarch is far costlier than the 2D heatmap).
+        // Render at the displayed size in physical pixels (no cap) so the preview is always crisp.
         let ppp = ui.ctx().pixels_per_point();
-        let res = ((size * ppp).round() as usize).clamp(32, if is3d { SURFACE_RES_MAX } else { PREVIEW_RES_MAX });
+        let res = ((size * ppp).round() as usize).max(32);
         let half = *self.zoom_half_m.get(&node).unwrap_or(&PREVIEW_HALF_M);
 
         match graph_rooted_at(snarl, node) {
             Ok(g) => {
-                let img = if is3d {
-                    let (yaw, pitch) = *self.cam.get(&node).unwrap_or(&CAM_DEFAULT);
-                    render_surface_preview(&g, half, yaw, pitch, res)
-                } else {
-                    render_field_preview(&g, half, res)
-                };
-                let handle =
-                    ui.ctx().load_texture(format!("wg-preview-{node:?}"), img, egui::TextureOptions::LINEAR);
+                // Re-render only when something the preview depends on changed (graph, zoom, size, mode,
+                // camera) — an idle 3D raymarch then costs nothing.
+                let (yaw, pitch) = *self.cam.get(&node).unwrap_or(&CAM_DEFAULT);
+                let key = preview_key(&g, half, res, is3d, yaw, pitch);
+                if self.prev_key.get(&node) != Some(&key) || !self.previews.contains_key(&node) {
+                    let img = if is3d {
+                        render_surface_preview(&g, half, yaw, pitch, res)
+                    } else {
+                        render_field_preview(&g, half, res)
+                    };
+                    let handle =
+                        ui.ctx().load_texture(format!("wg-preview-{node:?}"), img, egui::TextureOptions::LINEAR);
+                    self.previews.insert(node, handle);
+                    self.prev_key.insert(node, key);
+                }
+                let tex = self.previews[&node].id();
                 ui.horizontal_top(|ui| {
                     // LEFT — the preview image (draggable to orbit in 3D).
                     let img_resp = ui.add(
-                        egui::Image::new(egui::load::SizedTexture::new(handle.id(), egui::vec2(size, size)))
+                        egui::Image::new(egui::load::SizedTexture::new(tex, egui::vec2(size, size)))
                             .sense(egui::Sense::drag()),
                     );
                     if is3d && img_resp.dragged() {
@@ -574,13 +593,13 @@ impl SnarlViewer<EdNode> for Viewer<'_> {
                     // RIGHT — controls column (collapse, zoom, 2D/3D, size). Zoom via the km field (no
                     // scroll-zoom, which would also scroll the graph area).
                     ui.vertical(|ui| {
-                        if ui.small_button("▾").on_hover_text("Collapse preview").clicked() {
+                        if ui.small_button(icon::CARET_DOWN).on_hover_text("Collapse preview").clicked() {
                             self.collapsed.insert(node);
                         }
                         let h = self.zoom_half_m.entry(node).or_insert(PREVIEW_HALF_M);
                         let mut km = *h * 2.0 / 1000.0;
                         if ui
-                            .add(egui::DragValue::new(&mut km).speed(0.25).range(0.25..=128.0).suffix(" km"))
+                            .add(egui::DragValue::new(&mut km).speed(0.25).range(0.05..=512.0).suffix(" km"))
                             .on_hover_text("Zoom: width of the sampled world window")
                             .changed()
                         {
@@ -598,14 +617,14 @@ impl SnarlViewer<EdNode> for Viewer<'_> {
                             }
                         }
                         let sz = self.disp_px.entry(node).or_insert(DEFAULT_PREVIEW_PX);
-                        ui.add(egui::DragValue::new(sz).speed(2.0).range(64.0..=400.0).suffix(" px"))
+                        ui.add(egui::DragValue::new(sz).speed(2.0).range(64.0..=1024.0).suffix(" px"))
                             .on_hover_text("Preview size");
                     });
                 });
-                self.previews.insert(node, handle); // keep alive past paint; drops the prior frame's texture
             }
             Err(e) => {
                 self.previews.remove(&node);
+                self.prev_key.remove(&node);
                 ui.colored_label(egui::Color32::from_rgb(200, 150, 120), format!("connect inputs ({e})"));
             }
         }
@@ -642,7 +661,7 @@ impl SnarlViewer<EdNode> for Viewer<'_> {
             }
         }
         ui.separator();
-        if ui.button("🌱 Biome").on_hover_text("A nested biome sub-graph (climate in, height out)").clicked() {
+        if ui.button(format!("{} Biome", icon::PLANT)).on_hover_text("A nested biome sub-graph (climate in, height out)").clicked() {
             snarl.insert_node(pos, EdNode::Biome { name: "biome".into(), graph: Box::new(new_biome_subgraph()) });
             ui.close();
         }
@@ -860,10 +879,6 @@ fn auto_arrange(snarl: &mut Snarl<EdNode>, body_size: &std::collections::HashMap
 // Per-node 2D preview
 // ===================================================================================================
 
-/// Max heatmap resolution (px per side) of a 2D node preview — actual res tracks the displayed size.
-const PREVIEW_RES_MAX: usize = 256;
-/// Max render resolution (px per side) of a 3D surface preview (raymarch is far costlier than the heatmap).
-const SURFACE_RES_MAX: usize = 160;
 /// Default on-screen size (points) of a node preview; adjustable per node via the size control.
 const DEFAULT_PREVIEW_PX: f32 = 120.0;
 /// Default half-extent (metres) of the world window a preview samples, centred on the origin.
@@ -903,6 +918,21 @@ fn input_label(node: &EdNode, slot: usize) -> &'static str {
             _ => "in",
         },
     }
+}
+
+/// Fingerprint everything a preview render depends on, so it's only recomputed on change.
+fn preview_key(g: &Graph, half: f64, res: usize, is3d: bool, yaw: f32, pitch: f32) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    ron::to_string(g).unwrap_or_default().hash(&mut h);
+    half.to_bits().hash(&mut h);
+    (res as u64).hash(&mut h);
+    is3d.hash(&mut h);
+    if is3d {
+        yaw.to_bits().hash(&mut h);
+        pitch.to_bits().hash(&mut h);
+    }
+    h.finish()
 }
 
 /// Evaluate a node's sub-[`Graph`] over a top-down grid spanning ±`half_m` metres and colour each sample
@@ -962,8 +992,8 @@ fn height_color_rgb(v: f64) -> [f32; 3] {
 // 3D SDF-raymarched surface preview
 // ===================================================================================================
 
-/// Max march steps per ray through the surface's bounding box.
-const SURFACE_STEPS: usize = 80;
+/// Safety cap on adaptive march iterations per ray (the step is adaptive, so this is rarely hit).
+const SURFACE_MAX_ITERS: usize = 192;
 
 /// Render the node's height field as a 3D **SDF-raymarched** surface (heightfield ray–surface
 /// intersection) into an [`egui::ColorImage`]. The camera orbits the ±`half_m` window at (`yaw`,`pitch`),
@@ -1035,8 +1065,10 @@ fn ray_box(o: bevy::math::Vec3, d: bevy::math::Vec3, bmin: bevy::math::Vec3, bma
     if tmax >= tmin.max(0.0) { Some((tmin, tmax)) } else { None }
 }
 
-/// March a ray through the heightfield between `t0..t1`; on the first downward crossing shade with the
-/// analytic-gradient normal + ABSOLUTE-height terrain colour, else return sky.
+/// March a ray through the heightfield between `t0..t1` with ADAPTIVE (sphere-trace-like) steps — big
+/// strides through empty air above the terrain, shrinking near the surface — so cost tracks the surface,
+/// not a fixed step count. On the first downward crossing shade with the analytic-gradient normal +
+/// ABSOLUTE-height terrain colour, else sky.
 fn march_surface(
     g: &Graph,
     eye: bevy::math::Vec3,
@@ -1047,31 +1079,39 @@ fn march_surface(
     ndcy: f32,
 ) -> egui::Color32 {
     use bevy::math::Vec3;
-    let diff = |t: f32| -> f64 {
+    // Vertical gap above the heightfield at ray distance `t` (negative ⇒ below the surface).
+    let above = |t: f32| -> f64 {
         let p = eye + dir * t;
         p.y as f64 - g.eval(p.x as f64, p.z as f64, PREVIEW_SEED).v
     };
-    let dt = (t1 - t0) / SURFACE_STEPS as f32;
-    if dt <= 0.0 {
+    if t1 <= t0 {
         return sky(ndcy);
     }
+    // Conservative step: the vertical gap divided by the ray's downward component is a safe-ish advance
+    // (scaled <1 for sloped terrain); floored so the march always progresses + terminates.
+    let descent = (-dir.y as f64).max(0.05);
+    let min_step = ((t1 - t0) / 4096.0).max(1e-4);
     let mut t = t0;
-    let mut prev = diff(t);
-    for _ in 0..SURFACE_STEPS {
-        let tn = t + dt;
-        let cur = diff(tn);
-        if cur <= 0.0 && prev > 0.0 {
+    let mut a_prev = above(t);
+    for _ in 0..SURFACE_MAX_ITERS {
+        if t >= t1 {
+            break;
+        }
+        let step = ((a_prev.max(0.0) / descent) * 0.5).max(min_step as f64) as f32;
+        let tn = (t + step).min(t1);
+        let a_n = above(tn);
+        if a_n <= 0.0 && a_prev > 0.0 {
             // Bisect the crossing for a crisp silhouette.
-            let (mut a, mut b) = (t, tn);
-            for _ in 0..6 {
-                let m = (a + b) * 0.5;
-                if diff(m) > 0.0 {
-                    a = m;
+            let (mut lo, mut hi) = (t, tn);
+            for _ in 0..16 {
+                let m = (lo + hi) * 0.5;
+                if above(m) > 0.0 {
+                    lo = m;
                 } else {
-                    b = m;
+                    hi = m;
                 }
             }
-            let pm = eye + dir * ((a + b) * 0.5);
+            let pm = eye + dir * ((lo + hi) * 0.5);
             let f = g.eval(pm.x as f64, pm.z as f64, PREVIEW_SEED);
             let n = Vec3::new(-f.dx as f32, 1.0, -f.dz as f32).normalize();
             let lamb = n.dot(light).clamp(0.0, 1.0);
@@ -1083,7 +1123,7 @@ fn march_surface(
                 (base[2] * lit * 255.0) as u8,
             );
         }
-        prev = cur;
+        a_prev = a_n;
         t = tn;
     }
     sky(ndcy)
@@ -1103,12 +1143,15 @@ fn sky(ndcy: f32) -> egui::Color32 {
 // ===================================================================================================
 
 fn graph_panel(world: &mut World, ui: &mut egui::Ui) {
-    // Seed the editor graph from the live WorldGraph once.
+    // Seed the editor with the default multi-biome WORLD graph once (it IS the default — no button), and
+    // drive the live terrain from it immediately so the editor opens on the biome world.
     world.resource_scope::<WorldGraphEditor, ()>(|world, mut editor| {
         if !editor.seeded {
-            let g = world.resource::<WorldGraph>().0.clone();
-            editor.snarl = graph_to_snarl(&g);
+            editor.snarl = world_biome_snarl();
             editor.seeded = true;
+            if let Ok(g) = snarl_to_graph(&editor.snarl) {
+                world.resource_mut::<WorldGraph>().0 = Arc::new(g);
+            }
         }
 
         ui.horizontal(|ui| {
@@ -1168,24 +1211,18 @@ fn graph_panel(world: &mut World, ui: &mut egui::Ui) {
                     },
                 };
             }
-            if ui.button("Reset").on_hover_text("Restore the built-in mountains/plains graph").clicked() {
-                let g = mountains_plains_graph(
-                    crate::sdf_render::worldgen::graph::preset::MOUNTAINS_PLAINS_AMPLITUDE,
-                );
-                editor.snarl = graph_to_snarl(&g);
-                editor.nav.clear();
-                editor.clear_node_caches();
-                editor.status = "reset to default".into();
-            }
-            if ui.button("🌱 Biome World").on_hover_text("Load the default multi-biome graph (climate places Plains/Mountains)").clicked() {
+            if ui.button("Reset").on_hover_text("Restore the default multi-biome world graph").clicked() {
                 editor.snarl = world_biome_snarl();
                 editor.nav.clear();
                 editor.clear_node_caches();
-                editor.status = "loaded biome world".into();
+                editor.status = "reset to biome world".into();
             }
             if ui.button("Auto-arrange").on_hover_text("Lay nodes out left→right by dependency depth").clicked() {
-                let WorldGraphEditor { snarl, body_size, .. } = &mut *editor;
-                auto_arrange(snarl, body_size);
+                // Arrange the CURRENTLY shown level (inside a biome, not the top graph).
+                let WorldGraphEditor { snarl, nav, body_size, .. } = &mut *editor;
+                let vd = valid_depth(snarl, nav);
+                nav.truncate(vd);
+                auto_arrange(current_snarl_mut(snarl, nav), body_size);
                 editor.status = "arranged".into();
             }
         });
@@ -1215,12 +1252,12 @@ fn graph_panel(world: &mut World, ui: &mut egui::Ui) {
         let mut nav_to: Option<usize> = None;
         let crumbs = breadcrumb_names(&editor.snarl, &editor.nav);
         ui.horizontal(|ui| {
-            if ui.selectable_label(editor.nav.is_empty(), "🌍 World").clicked() {
+            if ui.selectable_label(editor.nav.is_empty(), format!("{} World", icon::GLOBE)).clicked() {
                 nav_to = Some(0);
             }
             for (i, name) in crumbs.iter().enumerate() {
-                ui.label("›");
-                if ui.selectable_label(i + 1 == editor.nav.len(), format!("🌱 {name}")).clicked() {
+                ui.label(icon::CARET_RIGHT);
+                if ui.selectable_label(i + 1 == editor.nav.len(), format!("{} {name}", icon::PLANT)).clicked() {
                     nav_to = Some(i + 1);
                 }
             }
@@ -1236,11 +1273,11 @@ fn graph_panel(world: &mut World, ui: &mut egui::Ui) {
         editor.enter = None;
         {
             let WorldGraphEditor {
-                snarl, nav, previews, collapsed, zoom_half_m, surface, cam, body_size, disp_px, enter, ..
+                snarl, nav, previews, collapsed, zoom_half_m, surface, cam, body_size, disp_px, prev_key, enter, ..
             } = &mut *editor;
             let current = current_snarl_mut(snarl, nav);
             let mut viewer = Viewer {
-                previews, collapsed, zoom_half_m, surface, cam, body_size, disp_px, enter,
+                previews, collapsed, zoom_half_m, surface, cam, body_size, disp_px, prev_key, enter,
             };
             SnarlWidget::new()
                 .id(egui::Id::new("worldgen-biome-graph"))
@@ -1415,5 +1452,35 @@ mod tests {
         let o = top.insert_node(p(), EdNode::Output);
         top.connect(out(b), inn(o, 0)); // continentalness pin left unconnected
         assert!(snarl_to_graph(&top).is_err());
+    }
+
+    /// Regenerate the shipped default world assets from `world_biome_snarl` (run on purpose):
+    /// `cargo test --features editor write_world_biome_assets -- --ignored`.
+    #[test]
+    #[ignore]
+    fn write_world_biome_assets() {
+        let snarl = world_biome_snarl();
+        let g = snarl_to_graph(&snarl).expect("compile");
+        (GraphAsset { graph: g })
+            .save(std::path::Path::new("assets/worldgen/world.graph.ron"))
+            .expect("save flat");
+        let s = ron::ser::to_string_pretty(&snarl, ron::ser::PrettyConfig::default()).expect("ser hierarchy");
+        std::fs::write("assets/worldgen/world.worldgraph.ron", s).expect("write hierarchy");
+    }
+
+    /// The shipped `world.graph.ron` must match the compiled `world_biome_snarl` (catches drift after the
+    /// default graph changes — re-run `write_world_biome_assets`).
+    #[test]
+    fn shipped_world_graph_matches_snarl() {
+        let s = std::fs::read_to_string("assets/worldgen/world.graph.ron").expect("read shipped world graph");
+        let shipped: GraphAsset = ron::de::from_str(&s).expect("parse shipped");
+        let built = snarl_to_graph(&world_biome_snarl()).unwrap();
+        for &(x, z) in &[(0.0, 0.0), (1234.0, -987.0), (5000.0, 5000.0)] {
+            assert_eq!(
+                shipped.graph.eval(x, z, 7).v.to_bits(),
+                built.eval(x, z, 7).v.to_bits(),
+                "shipped world.graph.ron is stale — re-run write_world_biome_assets"
+            );
+        }
     }
 }

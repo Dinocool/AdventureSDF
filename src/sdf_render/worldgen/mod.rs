@@ -427,8 +427,8 @@ fn roll_worldgen(
 #[derive(Resource)]
 pub struct ActiveGraphHandle(pub Handle<graph::GraphAsset>);
 
-/// The on-disk graph the world loads by default (relative to `assets/`).
-const ACTIVE_GRAPH_ASSET: &str = "worldgen/mountains_plains.graph.ron";
+/// The on-disk graph the world loads by default (relative to `assets/`) — the multi-biome world graph.
+const ACTIVE_GRAPH_ASSET: &str = "worldgen/world.graph.ron";
 
 /// Kick off loading the active graph asset at startup (async; the preset default drives the world until
 /// it lands, then [`apply_active_graph`] swaps it in).
