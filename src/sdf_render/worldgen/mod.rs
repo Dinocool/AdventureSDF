@@ -250,15 +250,19 @@ fn roll_worldgen(
     let height_layer = HeightLayer::new(coord::LayerId(0), *params);
     set_cpu_fbm_params(height_layer.fbm_params(manager.seed()), params.sea_level);
 
-    // Follow mode (toggle, default OFF): the generation window + the Terrain volume track the camera
-    // eye XZ, so terrain streams around wherever the camera is. OFF: both stay fixed at the world
-    // origin — a stable bounded island (the volume sits at origin, focus = origin).
+    // The LayerManager's generation window ALWAYS follows the camera (the LayerProcGen GenerationSource):
+    // each layer maintains its rolling region around the focus, evicting what leaves it and generating
+    // what enters (WORLD_GEN_PLAN §2.7). This is DECOUPLED from `follow` below — the layer must roll with
+    // the viewer regardless of how the render volume is positioned, so contextual layers (erosion/biome,
+    // which read the precomputed artifact + neighbour padding) and the GPU upload get the right region.
+    let focus = DVec2::new(cam_pos.x as f64, cam_pos.z as f64);
+
+    // `follow` (toggle, default OFF) controls ONLY whether the render VOLUME translates with the camera.
+    // OFF (default): the volume is the static, effectively-infinite box (`WORLDGEN_TERRAIN_HALF_XZ`) whose
+    // CPU eval samples analytic world-anchored fBm directly — so it needn't move and never re-bakes on
+    // motion. ON: the volume tracks the camera (snapped to the chunk grid) — for a future bounded
+    // artifact-sampling render where the volume rides the rolling ring.
     let following = follow.0;
-    let focus = if following {
-        DVec2::new(cam_pos.x as f64, cam_pos.z as f64)
-    } else {
-        DVec2::ZERO
-    };
     let target_xz = if following {
         // Snap to the chunk grid so the volume only moves on chunk crossings (no per-frame jitter / rebake).
         snap_to_chunk_grid(Vec2::new(cam_pos.x, cam_pos.z))
