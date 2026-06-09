@@ -16,7 +16,7 @@ use super::erosion::{ErosionParams, erode_with_grad};
 /// Bump when the height layer's *output* intentionally changes (algorithm/constants). It keys the
 /// disk cache (WORLD_GEN_PLAN §2.3) and the parity reference vectors — a change here forces
 /// regenerating reference values, making "I meant to change the terrain" explicit and review-visible.
-pub const HEIGHT_GEN_VERSION: u32 = 6;
+pub const HEIGHT_GEN_VERSION: u32 = 7;
 
 /// Chunk edge in base cells (= metres) for the height layer's tier.
 pub const HEIGHT_CHUNK_CELLS: u32 = 128;
@@ -253,12 +253,27 @@ impl Layer for HeightLayer {
 
         // SURFACE BAND-LIMIT — the single finalize stage over the WHOLE composed surface. A sharp ridge
         // crest / erosion crease is sub-voxel-sharp: point-sampling it at the node grid ALIASES it into
-        // degenerate mesh triangles AND a discontinuous (serrated) gradient. A separable TENT low-pass of
-        // radius `band_limit` nodes rounds it so it's grid-representable with continuous normals. Disabled
-        // (`band_limit == 0`) OR a smooth field (plain fBm, no ridge/erosion) ⇒ the single-tap fast path.
+        // degenerate mesh triangles AND a discontinuous (serrated) gradient. A separable TENT low-pass
+        // rounds it so it's grid-representable with continuous normals.
+        //
+        // CROSS-TIER CONSISTENCY (FOOLPROOF, no LOD seam by construction): the kernel is sampled at a FIXED
+        // 2 m world tap step (the tier-0 node spacing) at EVERY tier, with the SAME world half-width
+        // (`band_limit` × 2 m). So every clipmap tier evaluates the IDENTICAL band-limited world function
+        // `f_bl(x,z)` at its nodes — and at any node two tiers SHARE they agree bit-for-bit (same world taps
+        // ⇒ same f64 convolution ⇒ same value). That restores the pre-band-limit invariant ("all tiers
+        // sample one world function") that the seam-free design rests on. `kf` is the half-width in 2 m
+        // taps, CONSTANT across tiers.
+        //
+        // BOUNDED COST: applied only where the band-limit is meaningful — a tier whose node spacing already
+        // exceeds `2·width` smooths ≥ the band-limit by its own (coarse) sampling, so `f_bl ≈ raw` there →
+        // point-sample. This caps the fixed-2 m grid to the near tiers (it would explode on the huge far
+        // chunks otherwise). Plain fBm (no ridge/erosion) also point-samples.
         let sharp = self.params.ridge != 0.0 || self.erosion.enabled;
         let radius = if sharp { self.params.band_limit.max(0.0) } else { 0.0 };
-        if radius <= 0.0 {
+        let tap = HEIGHT_CHUNK_CELLS as f64 / HEIGHT_FIELD_RES as f64; // FIXED 2 m tap step (tier-0 spacing)
+        let kf = if radius > 0.0 { radius.round() as i32 } else { 0 };
+        let world_w = kf as f64 * tap;
+        if kf < 1 || field.node_spacing >= 2.0 * world_w {
             for j in 0..=res {
                 for i in 0..=res {
                     let wp = field.node_world_xz(i, j);
@@ -268,88 +283,86 @@ impl Layer for HeightLayer {
             out.produce(Self::OUTPUT, field);
             return;
         }
-        self.generate_band_limited(ctx, &mut field, radius);
+        self.generate_band_limited(ctx, &mut field, kf);
         out.produce(Self::OUTPUT, field);
     }
 }
 
 impl HeightLayer {
-    /// Apply the separable TENT band-limit (radius in node spacings) over the chunk's node grid, writing
-    /// the low-passed `(h, dh/dx, dh/dz)` into `field`. The KEY properties:
+    /// Apply the separable TENT band-limit at a FIXED 2 m world tap step over `±kf` taps, writing the
+    /// low-passed `(h, dh/dx, dh/dz)` into `field`. `kf` (half-width in 2 m taps) is CONSTANT across tiers,
+    /// so every tier evaluates the identical band-limited world function (see `generate`). KEY properties:
     ///
-    /// - **Seam-free**: it resamples the world-anchored, continuous [`sample_world`] on a FINE grid that
-    ///   extends an APRON of `⌈radius⌉` nodes past every chunk edge, with a symmetric kernel — so a chunk's
-    ///   boundary node convolves the identical world samples as the neighbour's, bit-for-bit (the §10
-    ///   padding-correctness property, asserted by `adjacent_chunks_agree_on_shared_boundary`).
+    /// - **Seam-free, ALL boundaries**: the kernel samples the world-anchored, continuous [`sample_world`]
+    ///   at fixed 2 m world positions with a symmetric kernel. A node shared by two CHUNKS (same tier) OR
+    ///   two TIERS (a coarse tier's node coincides with a finer tier's) lands on the SAME world taps ⇒ the
+    ///   SAME f64 convolution ⇒ bit-for-bit equal — no within-tier seam AND no cross-tier LOD seam.
     /// - **Gradient-consistent**: height AND gradient are filtered by the SAME kernel; since convolution
     ///   commutes with differentiation (`∇(K∗h) = K∗∇h`), the stored gradient stays the exact gradient of
-    ///   the band-limited height — so the terrain normals the bake reconstructs from it match the meshed
-    ///   surface (no shading/geometry mismatch).
-    /// - **Bit-portable**: the tent weights are rationals (`(K+1−|t|)/(K+1)²`) and the accumulation order
-    ///   is fixed — no transcendentals, no fast-math — so shared-seed clients agree (the parity contract).
-    /// - **Cheap**: `sample_world` is evaluated once per apron-padded NODE (`(res+2·apron+1)²` ≈ the plain
-    ///   point-sample count, NOT a multiple of it — the analytic field needs no supersampling), with
-    ///   precomputed tent weights and a separable two-pass convolution. Far below the old 9× box supersample.
-    fn generate_band_limited(&self, ctx: &GenCtx, field: &mut ScalarField2D, radius: f32) {
-        // Sample at NODE resolution (no sub-node supersampling): `sample_world` returns ANALYTIC values +
-        // gradients, so there's no finite-difference aliasing to supersample away — a tent average of the
-        // analytic field over `±kf` nodes IS the band-limit. This keeps the `sample_world` count at
-        // `~(res+2·apron)²` (≈ the plain point-sample count), not a multiple of it.
+    ///   the band-limited height — so the terrain normals the bake reconstructs from it match the surface.
+    /// - **Bit-portable**: tent weights are rationals (`(K+1−|t|)/(K+1)²`), fixed accumulation order — no
+    ///   transcendentals/fast-math — so shared-seed clients agree (the parity contract).
+    /// - **Bounded cost**: a fine 2 m grid over the chunk + `kf`-tap apron, separable two-pass convolution,
+    ///   then the tier's nodes (each a multiple of 2 m) read straight off it. The caller only invokes this
+    ///   where the band-limit is meaningful (node spacing < 2·width), so the 2 m grid stays small (≤ tier 2
+    ///   for the default radius); coarser tiers point-sample.
+    fn generate_band_limited(&self, ctx: &GenCtx, field: &mut ScalarField2D, kf: i32) {
         let res = HEIGHT_FIELD_RES as i32;
-        let spacing = field.node_spacing; // already f64
-        let kf = radius.ceil() as i32; // tent half-width, in nodes
-        let ap = kf; // apron = kernel support (seam-free: a boundary node reads only genuine apron samples)
+        let tap = HEIGHT_CHUNK_CELLS as f64 / HEIGHT_FIELD_RES as f64; // FIXED 2 m tap step (tier-0 spacing)
+        let step = (field.node_spacing / tap).round() as i32; // fine 2 m samples per node = 2^tier (≥ 1)
+        let ap = kf; // apron in FINE (2 m) taps — exactly the kernel support ⇒ node results never clamp
 
         // PRECOMPUTED tent weights `(K+1−|t|)/(K+1)²` over `t ∈ [−kf, kf]` — bit-portable rationals summing
-        // to 1, computed ONCE (not a division per tap, which dominated the old cost).
+        // to 1, computed ONCE (not a division per tap).
         let denom = ((kf + 1) * (kf + 1)) as f64;
         let w: Vec<f64> = (-kf..=kf).map(|t| (((kf + 1) - t.abs()) as f64) / denom).collect();
 
-        let npa = (res + 2 * ap + 1) as usize; // node samples per axis incl. apron
-        let n00 = field.node_world_xz(0, 0); // chunk's mip-0 node (0,0) world XZ
-        let ox = n00.x - ap as f64 * spacing;
-        let oz = n00.y - ap as f64 * spacing;
+        let npa = (res * step + 2 * ap + 1) as usize; // FINE (2 m) samples per axis over chunk + apron
+        let n00 = field.node_world_xz(0, 0); // chunk's node (0,0) world XZ
+        let ox = n00.x - ap as f64 * tap;
+        let oz = n00.y - ap as f64 * tap;
 
-        // Sample the composed surface at every (apron-padded) node position — packed `[h, gx, gz]`.
+        // Sample the composed surface on the fixed 2 m world grid — packed `[h, gx, gz]`.
         let count = npa * npa;
         let mut grid = vec![[0.0f64; 3]; count];
-        for gz in 0..npa {
-            let wz = oz + gz as f64 * spacing;
-            for gx in 0..npa {
-                let n = self.sample_world(ox + gx as f64 * spacing, wz, ctx.seed);
-                grid[gz * npa + gx] = [n.height as f64, n.dh_dx as f64, n.dh_dz as f64];
+        for fz in 0..npa {
+            let wz = oz + fz as f64 * tap;
+            for fx in 0..npa {
+                let n = self.sample_world(ox + fx as f64 * tap, wz, ctx.seed);
+                grid[fz * npa + fx] = [n.height as f64, n.dh_dx as f64, n.dh_dz as f64];
             }
         }
 
         // Separable pass 1 — convolve along X into a temporary (edges clamp but are never read by node
-        // positions, which sit `ap = kf` samples in from each edge ⇒ node results only ever read genuine
-        // apron samples, never a clamped value ⇒ seam-free).
+        // positions, which sit `ap = kf` taps in from each edge ⇒ node results only ever read genuine apron
+        // samples ⇒ seam-free).
         let mut tx = vec![[0.0f64; 3]; count];
-        for gz in 0..npa {
-            let row = gz * npa;
-            for gx in 0..npa {
+        for fz in 0..npa {
+            let row = fz * npa;
+            for fx in 0..npa {
                 let mut acc = [0.0f64; 3];
                 for (wi, t) in (-kf..=kf).enumerate() {
-                    let sx = (gx as i32 + t).clamp(0, npa as i32 - 1) as usize;
+                    let sx = (fx as i32 + t).clamp(0, npa as i32 - 1) as usize;
                     let s = grid[row + sx];
                     let ww = w[wi];
                     acc[0] += s[0] * ww;
                     acc[1] += s[1] * ww;
                     acc[2] += s[2] * ww;
                 }
-                tx[row + gx] = acc;
+                tx[row + fx] = acc;
             }
         }
 
-        // Separable pass 2 — convolve along Z, evaluated ONLY at node positions. Node (i,j) ↔ grid (i+ap, j+ap).
+        // Separable pass 2 — convolve along Z, evaluated ONLY at node positions. Node (i,j) ↔ fine sample
+        // (i·step + ap, j·step + ap) (the node lands exactly on a 2 m tap since node spacing is a multiple).
         for j in 0..=HEIGHT_FIELD_RES {
-            let gz0 = j as i32 + ap;
+            let fz0 = j as i32 * step + ap;
             for i in 0..=HEIGHT_FIELD_RES {
-                let gx = (i as i32 + ap) as usize;
+                let fx = (i as i32 * step + ap) as usize;
                 let mut acc = [0.0f64; 3];
                 for (wi, t) in (-kf..=kf).enumerate() {
-                    let sz = (gz0 + t).clamp(0, npa as i32 - 1) as usize;
-                    let s = tx[sz * npa + gx];
+                    let sz = (fz0 + t).clamp(0, npa as i32 - 1) as usize;
+                    let s = tx[sz * npa + fx];
                     let ww = w[wi];
                     acc[0] += s[0] * ww;
                     acc[1] += s[1] * ww;
@@ -370,6 +383,64 @@ mod tests {
 
     fn layer() -> HeightLayer {
         HeightLayer::new(LayerId(0), HeightParams::default(), ErosionParams::default())
+    }
+
+    /// CROSS-TIER CONSISTENCY GUARD — the band-limit must NOT introduce an LOD seam. Adjacent clipmap
+    /// tiers (tier 0 @ 2 m nodes, tier 1 @ 4 m nodes) must agree on the band-limited surface at the world
+    /// nodes they SHARE (multiples of 4 m), or a tier-coverage boundary shows a crack + shading kink. This
+    /// is the guard for the fixed-WORLD band-limit width (a node-relative width — the seam bug — would make
+    /// tier 1 smooth ~2× wider than tier 0, blowing up the mismatch here). Uses dense sharp ridges (worst
+    /// case). The existing `terrain_2to1_*` harness only tests cross-MIP within ONE tier, so it missed this.
+    #[test]
+    fn tiers_agree_on_shared_nodes_after_band_limit() {
+        use bevy::math::Vec3;
+        let params = HeightParams {
+            ridge: 1.0,
+            base_freq: 1.0 / 256.0,
+            amplitude: 100.0,
+            octaves: 4,
+            band_limit: 3.0,
+            ..Default::default()
+        };
+        let erosion = ErosionParams { enabled: false, ..Default::default() };
+        let seed = 7u64;
+        let t0 = HeightLayer::new_tier(LayerId(0), params, erosion, HEIGHT_CHUNK_CELLS);
+        let t1 = HeightLayer::new_tier(LayerId(0), params, erosion, HEIGHT_CHUNK_CELLS * 2);
+        let gen_chunk0 = |l: &HeightLayer| {
+            let mut o = GenOutput::default();
+            l.generate(&GenCtx { coord: ChunkCoord::new(l.id(), IVec3::ZERO), seed, size: l.chunk_size() }, &mut o);
+            o.take::<ScalarField2D>(HeightLayer::OUTPUT).unwrap()
+        };
+        let (f0, f1) = (gen_chunk0(&t0), gen_chunk0(&t1));
+        // Shared world nodes: tier 0 chunk spans [0,128] (nodes every 2 m), tier 1 spans [0,256] (every
+        // 4 m). A world coord that is a multiple of 4 m in [4,124] is a node in BOTH (skip the very edge so
+        // both have the band-limit apron). tier-0 node index = w/2, tier-1 = w/4.
+        let amp = (params.amplitude_sum()) as f32;
+        let (mut worst_h, mut worst_dot) = (0.0f32, 1.0f32);
+        for kz in 1..=30 {
+            for kx in 1..=30 {
+                let (wx, wz) = (4 * kx, 4 * kz);
+                let n0 = f0.node((wx / 2) as u32, (wz / 2) as u32);
+                let n1 = f1.node((wx / 4) as u32, (wz / 4) as u32);
+                worst_h = worst_h.max((n0.height - n1.height).abs());
+                let g0 = Vec3::new(-n0.dh_dx, 1.0, -n0.dh_dz).normalize();
+                let g1 = Vec3::new(-n1.dh_dx, 1.0, -n1.dh_dz).normalize();
+                worst_dot = worst_dot.min(g0.dot(g1));
+            }
+        }
+        println!(
+            "CROSS-TIER: worst |Δh|={worst_h:.3}m ({:.2}% of amp {amp:.0}m), worst normal dot={worst_dot:.4} \
+             ({:.1}deg)",
+            100.0 * worst_h / amp,
+            worst_dot.clamp(-1.0, 1.0).acos().to_degrees(),
+        );
+        // FIXED 2 m world taps at every tier ⇒ tier 0 and tier 1 evaluate the IDENTICAL band-limited world
+        // function at the nodes they share ⇒ they agree to f32 round-off (NOT just "closely"). This is the
+        // foolproof no-seam guarantee; a node-relative or per-tier-tap band-limit would smash both
+        // (Δh ~ metres+, dot well below 1). Tolerances are f32-epsilon-tight.
+        assert!(worst_h < 0.05, "cross-tier height seam: |Δh|={worst_h:.4}m (tiers must agree at shared nodes)");
+        assert!(worst_dot > 0.9999, "cross-tier normal seam: worst dot {worst_dot:.5} (tiers must agree)");
+        let _ = amp;
     }
 
     /// A PLAIN-fBm layer (no ridge, no erosion) — `generate` takes the point-sample fast path
