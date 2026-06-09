@@ -24,11 +24,28 @@ use crate::sdf_render::worldgen::spline::Spline;
 /// worldgen loads — see `WorldGenPlugin`'s asset hot-reload). Relative to the app's `assets/` root.
 const DEFAULT_GRAPH_PATH: &str = "assets/worldgen/mountains_plains.graph.ron";
 
-/// A node in the editor graph: an engine operation, or the single graph OUTPUT sink (1 input, 0
-/// outputs) that designates which node's value is the terrain height.
+/// The climate axes a biome can read from its parent (its input pins, in order). Expandable: add an
+/// axis here and biomes gain a pin for it. The parent graph drives these (low-freq Fbm / derived math)
+/// and they place + shape biomes.
+pub const CLIMATE_INPUTS: [&str; 4] = ["continentalness", "temperature", "humidity", "weirdness"];
+
+/// Name of climate input `k` (falls back gracefully past the vocabulary).
+fn climate_name(k: usize) -> &'static str {
+    CLIMATE_INPUTS.get(k).copied().unwrap_or("input")
+}
+
+/// A node in the editor graph. Biomes are a purely **editor-side** grouping: a biome owns its own
+/// sub-graph and is *inlined* into the flat engine [`Graph`] at compile time (climate input pins → the
+/// parent edges feeding them; one height out), so the engine, determinism, and parity are unchanged.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub enum EdNode {
     Op(NodeKind),
+    /// A biome group node: climate inputs in ([`CLIMATE_INPUTS`]), one height out; its `graph` is the
+    /// biome's terrain shape, inlined at compile.
+    Biome { name: String, graph: Box<Snarl<EdNode>> },
+    /// Inside a biome's sub-graph: the Nth climate input piped down from the parent biome node's pins.
+    Input(usize),
+    /// The single graph OUTPUT sink (1 input, 0 outputs) — its input is the terrain height.
     Output,
 }
 
@@ -127,100 +144,134 @@ pub fn graph_to_snarl(graph: &Graph) -> Snarl<EdNode> {
     snarl
 }
 
-/// Convert the editor Snarl back to an engine [`Graph`]: topologically order the Op nodes feeding the
-/// `Output` sink, map Snarl ids → engine indices, resolve each node's inputs from the wires. Errors on a
-/// missing/duplicate Output, a cycle, an unconnected required input, or >[`MAX_GRAPH_NODES`] nodes.
-pub fn snarl_to_graph(snarl: &Snarl<EdNode>) -> Result<Graph, String> {
-    use std::collections::HashMap;
-
-    // Source feeding (node, input slot) → the upstream node id (every node has one output, pin 0).
-    let mut src: HashMap<(NodeId, usize), NodeId> = HashMap::new();
-    for (out, inp) in snarl.wires() {
-        src.insert((inp.node, inp.input), out.node);
-    }
-
-    // Find the single Output sink.
-    let mut output_sink = None;
+/// Find the node whose output feeds the single `Output` sink of `snarl` (the (sub)graph's root).
+fn output_root(snarl: &Snarl<EdNode>) -> Result<NodeId, String> {
+    let mut sink = None;
     for (id, node) in snarl.node_ids() {
         if matches!(node, EdNode::Output) {
-            if output_sink.is_some() {
+            if sink.is_some() {
                 return Err("graph has more than one Output node".into());
             }
-            output_sink = Some(id);
+            sink = Some(id);
         }
     }
-    let output_sink = output_sink.ok_or("graph has no Output node")?;
-    let root = *src.get(&(output_sink, 0)).ok_or("the Output node has no input wired")?;
-    graph_rooted_at(snarl, root)
+    let sink = sink.ok_or("graph has no Output node")?;
+    for (out, inp) in snarl.wires() {
+        if inp.node == sink && inp.input == 0 {
+            return Ok(out.node);
+        }
+    }
+    Err("the Output node has no input wired".into())
 }
 
-/// Convert the sub-graph feeding `root` (which must be an Op node) into an engine [`Graph`] whose output
-/// is that node. Shared by [`snarl_to_graph`] (root = the node wired to `Output`) and the per-node 2D
-/// preview (root = the previewed node). Errors on a cycle, an unconnected input, or too many nodes.
+/// Convert the editor Snarl (possibly nested with biomes) to a flat engine [`Graph`] by **inlining**:
+/// each biome's sub-graph is spliced in with its climate-`Input` sentinels rewired to the parent edges
+/// feeding that biome's pins. Errors on missing/duplicate Output, a cycle, an unconnected required
+/// input, or >[`MAX_GRAPH_NODES`] nodes.
+pub fn snarl_to_graph(snarl: &Snarl<EdNode>) -> Result<Graph, String> {
+    let root = output_root(snarl)?;
+    let mut out = Vec::new();
+    let output = compile_subgraph(snarl, root, &[], &mut out, false)?;
+    finish_graph(out, output)
+}
+
+/// Compile the sub-graph feeding `root` into a flat engine [`Graph`] rooted at that node — used by the
+/// per-node 2D/3D preview. Tolerant of unbound climate `Input`s (treats them as 0) so a node inside a
+/// biome still previews in isolation.
 pub fn graph_rooted_at(snarl: &Snarl<EdNode>, root: NodeId) -> Result<Graph, String> {
-    use std::collections::HashMap;
+    let mut out = Vec::new();
+    let output = compile_subgraph(snarl, root, &[], &mut out, true)?;
+    finish_graph(out, output)
+}
 
-    // Source feeding (node, input slot) → the upstream node id (every node has one output, pin 0).
-    let mut src: HashMap<(NodeId, usize), NodeId> = HashMap::new();
-    for (out, inp) in snarl.wires() {
-        src.insert((inp.node, inp.input), out.node);
+fn finish_graph(nodes: Vec<Node>, output: u32) -> Result<Graph, String> {
+    if nodes.len() > MAX_GRAPH_NODES {
+        return Err(format!("graph has {} nodes (max {MAX_GRAPH_NODES})", nodes.len()));
     }
-
-    // Post-order DFS from the root over input edges → topological order; detect cycles.
-    let mut order: Vec<NodeId> = Vec::new();
-    let mut index: HashMap<NodeId, u32> = HashMap::new();
-    let mut on_stack: std::collections::HashSet<NodeId> = std::collections::HashSet::new();
-    fn visit(
-        id: NodeId,
-        snarl: &Snarl<EdNode>,
-        src: &std::collections::HashMap<(NodeId, usize), NodeId>,
-        order: &mut Vec<NodeId>,
-        index: &mut std::collections::HashMap<NodeId, u32>,
-        on_stack: &mut std::collections::HashSet<NodeId>,
-    ) -> Result<(), String> {
-        if index.contains_key(&id) {
-            return Ok(());
-        }
-        if !on_stack.insert(id) {
-            return Err("graph has a cycle".into());
-        }
-        let kind = match snarl.get_node(id) {
-            Some(EdNode::Op(k)) => *k,
-            _ => return Err("Output node cannot be an input".into()),
-        };
-        for slot in 0..kind.arity() {
-            let up = *src
-                .get(&(id, slot))
-                .ok_or_else(|| format!("node input {slot} is not connected"))?;
-            visit(up, snarl, src, order, index, on_stack)?;
-        }
-        on_stack.remove(&id);
-        index.insert(id, order.len() as u32);
-        order.push(id);
-        Ok(())
-    }
-    visit(root, snarl, &src, &mut order, &mut index, &mut on_stack)?;
-
-    if order.len() > MAX_GRAPH_NODES {
-        return Err(format!("graph has {} nodes (max {MAX_GRAPH_NODES})", order.len()));
-    }
-
-    // Emit engine nodes in topological order; inputs reference the (earlier) engine indices.
-    let mut nodes = Vec::with_capacity(order.len());
-    for &id in &order {
-        let kind = match snarl.get_node(id) {
-            Some(EdNode::Op(k)) => *k,
-            _ => unreachable!(),
-        };
-        let mut inputs = [0u32; 3];
-        for (slot, inp) in inputs.iter_mut().enumerate().take(kind.arity()) {
-            *inp = index[&src[&(id, slot)]];
-        }
-        nodes.push(Node { kind, inputs });
-    }
-    let graph = Graph { nodes, output: index[&root] };
+    let graph = Graph { nodes, output };
     graph.validate().map_err(|e| format!("{e:?}"))?;
     Ok(graph)
+}
+
+/// Compile one (sub)snarl rooted at `root`, appending engine nodes to `out` and returning `root`'s engine
+/// index. `binds[k]` is the engine index a climate `Input(k)` resolves to (the parent edge feeding pin
+/// `k`); `input_fallback` substitutes 0 for an unbound-but-used input (preview only).
+fn compile_subgraph(
+    snarl: &Snarl<EdNode>,
+    root: NodeId,
+    binds: &[Option<u32>],
+    out: &mut Vec<Node>,
+    input_fallback: bool,
+) -> Result<u32, String> {
+    use std::collections::{HashMap, HashSet};
+    let mut src: HashMap<(NodeId, usize), NodeId> = HashMap::new();
+    for (o, i) in snarl.wires() {
+        src.insert((i.node, i.input), o.node);
+    }
+    let mut memo: HashMap<NodeId, u32> = HashMap::new();
+    let mut on_stack: HashSet<NodeId> = HashSet::new();
+    compile_node(root, snarl, &src, binds, out, &mut memo, &mut on_stack, input_fallback)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn compile_node(
+    id: NodeId,
+    snarl: &Snarl<EdNode>,
+    src: &std::collections::HashMap<(NodeId, usize), NodeId>,
+    binds: &[Option<u32>],
+    out: &mut Vec<Node>,
+    memo: &mut std::collections::HashMap<NodeId, u32>,
+    on_stack: &mut std::collections::HashSet<NodeId>,
+    input_fallback: bool,
+) -> Result<u32, String> {
+    if let Some(&i) = memo.get(&id) {
+        return Ok(i);
+    }
+    if !on_stack.insert(id) {
+        return Err("graph has a cycle".into());
+    }
+    let res = (|| match snarl.get_node(id) {
+        Some(EdNode::Op(kind)) => {
+            let kind = *kind;
+            let mut inputs = [0u32; 3];
+            for (slot, inp) in inputs.iter_mut().enumerate().take(kind.arity()) {
+                let up = *src
+                    .get(&(id, slot))
+                    .ok_or_else(|| format!("node input {slot} is not connected"))?;
+                *inp = compile_node(up, snarl, src, binds, out, memo, on_stack, input_fallback)?;
+            }
+            out.push(Node { kind, inputs });
+            Ok((out.len() - 1) as u32)
+        }
+        Some(EdNode::Input(k)) => match binds.get(*k).copied().flatten() {
+            Some(i) => Ok(i),
+            None if input_fallback => {
+                out.push(Node { kind: NodeKind::Const(0.0), inputs: [0; 3] });
+                Ok((out.len() - 1) as u32)
+            }
+            None => Err(format!("biome input '{}' is not connected", climate_name(*k))),
+        },
+        Some(EdNode::Biome { graph, .. }) => {
+            // Resolve the parent edges feeding this biome's climate pins, then inline its sub-graph.
+            let mut sub_binds: Vec<Option<u32>> = Vec::with_capacity(CLIMATE_INPUTS.len());
+            for slot in 0..CLIMATE_INPUTS.len() {
+                match src.get(&(id, slot)) {
+                    Some(&up) => sub_binds
+                        .push(Some(compile_node(up, snarl, src, binds, out, memo, on_stack, input_fallback)?)),
+                    None => sub_binds.push(None),
+                }
+            }
+            let sub_root = output_root(graph)?;
+            compile_subgraph(graph, sub_root, &sub_binds, out, input_fallback)
+        }
+        Some(EdNode::Output) => Err("the Output node cannot be used as an input".into()),
+        None => Err("dangling node reference".into()),
+    })();
+    on_stack.remove(&id);
+    if let Ok(i) = res {
+        memo.insert(id, i);
+    }
+    res
 }
 
 // ===================================================================================================
@@ -245,6 +296,8 @@ impl SnarlViewer<EdNode> for Viewer<'_> {
         match node {
             EdNode::Output => "Output".into(),
             EdNode::Op(k) => node_kind_name(k).into(),
+            EdNode::Biome { name, .. } => format!("🌱 {name}"),
+            EdNode::Input(k) => format!("⮡ {}", climate_name(*k)),
         }
     }
 
@@ -252,19 +305,21 @@ impl SnarlViewer<EdNode> for Viewer<'_> {
         match node {
             EdNode::Output => 1,
             EdNode::Op(k) => k.arity(),
+            EdNode::Biome { .. } => CLIMATE_INPUTS.len(),
+            EdNode::Input(_) => 0,
         }
     }
 
     fn outputs(&mut self, node: &EdNode) -> usize {
         match node {
             EdNode::Output => 0,
-            EdNode::Op(_) => 1,
+            EdNode::Op(_) | EdNode::Biome { .. } | EdNode::Input(_) => 1,
         }
     }
 
-    // Every Op node gets a (default-on) collapsible 2D preview in its body.
+    // Op + Biome nodes get a body (preview / biome controls); Input + Output don't.
     fn has_body(&mut self, node: &EdNode) -> bool {
-        matches!(node, EdNode::Op(_))
+        matches!(node, EdNode::Op(_) | EdNode::Biome { .. })
     }
 
     fn show_body(
@@ -574,6 +629,8 @@ fn auto_arrange(snarl: &mut Snarl<EdNode>, body_size: &std::collections::HashMap
             .map(|n| match n {
                 EdNode::Output => 1,
                 EdNode::Op(k) => k.arity().max(1),
+                EdNode::Biome { .. } => CLIMATE_INPUTS.len(),
+                EdNode::Input(_) => 1,
             })
             .unwrap_or(1);
         let body = body_size.get(&id).copied().unwrap_or(egui::vec2(120.0, 56.0));
@@ -631,6 +688,8 @@ const PREVIEW_SEED: u64 = 7;
 fn input_label(node: &EdNode, slot: usize) -> &'static str {
     match node {
         EdNode::Output => "height",
+        EdNode::Input(_) => "",
+        EdNode::Biome { .. } => climate_name(slot),
         EdNode::Op(k) => match k {
             NodeKind::Add | NodeKind::Sub | NodeKind::Mul | NodeKind::Min | NodeKind::Max => {
                 if slot == 0 { "a" } else { "b" }
@@ -975,5 +1034,83 @@ mod tests {
         let mut snarl = Snarl::new();
         snarl.insert_node(egui::pos2(0.0, 0.0), EdNode::Op(NodeKind::Const(1.0)));
         assert!(snarl_to_graph(&snarl).is_err());
+    }
+
+    // -- biome (nested sub-graph) inlining ----------------------------------------------------------
+    fn p() -> egui::Pos2 {
+        egui::pos2(0.0, 0.0)
+    }
+    fn out(n: NodeId) -> OutPinId {
+        OutPinId { node: n, output: 0 }
+    }
+    fn inn(n: NodeId, i: usize) -> InPinId {
+        InPinId { node: n, input: i }
+    }
+
+    /// A biome wrapping a sub-graph must inline to a graph that evaluates bit-for-bit like the same
+    /// sub-graph placed flat (no biome) — biomes are pure authoring grouping.
+    #[test]
+    fn biome_inlines_to_flat_equivalent() {
+        let axis = FbmAxis { octaves: 3, base_freq: 1.0 / 512.0, lacunarity: 2.0, gain: 0.5, amplitude: 100.0, seed_salt: 2 };
+
+        let mut flat = Snarl::new();
+        let f = flat.insert_node(p(), EdNode::Op(NodeKind::Fbm(axis)));
+        let o = flat.insert_node(p(), EdNode::Output);
+        flat.connect(out(f), inn(o, 0));
+        let flat = snarl_to_graph(&flat).expect("flat");
+
+        let mut sub = Snarl::new();
+        let sf = sub.insert_node(p(), EdNode::Op(NodeKind::Fbm(axis)));
+        let so = sub.insert_node(p(), EdNode::Output);
+        sub.connect(out(sf), inn(so, 0));
+        let mut top = Snarl::new();
+        let b = top.insert_node(p(), EdNode::Biome { name: "Mountains".into(), graph: Box::new(sub) });
+        let o = top.insert_node(p(), EdNode::Output);
+        top.connect(out(b), inn(o, 0));
+        let nested = snarl_to_graph(&top).expect("nested");
+
+        for &(x, z) in &[(0.0, 0.0), (123.0, -456.0), (2000.0, 1000.0)] {
+            let (a, c) = (flat.eval(x, z, 7), nested.eval(x, z, 7));
+            assert_eq!(a.v.to_bits(), c.v.to_bits(), "value at ({x},{z})");
+            assert_eq!(a.dx.to_bits(), c.dx.to_bits(), "∂x at ({x},{z})");
+            assert_eq!(a.dz.to_bits(), c.dz.to_bits(), "∂z at ({x},{z})");
+        }
+    }
+
+    /// A climate value wired into a biome pin must reach the biome's `Input` sentinel through inlining.
+    #[test]
+    fn biome_climate_input_is_piped() {
+        let mut sub = Snarl::new();
+        let inp = sub.insert_node(p(), EdNode::Input(0)); // continentalness
+        let c5 = sub.insert_node(p(), EdNode::Op(NodeKind::Const(5.0)));
+        let add = sub.insert_node(p(), EdNode::Op(NodeKind::Add));
+        sub.connect(out(inp), inn(add, 0));
+        sub.connect(out(c5), inn(add, 1));
+        let so = sub.insert_node(p(), EdNode::Output);
+        sub.connect(out(add), inn(so, 0));
+
+        let mut top = Snarl::new();
+        let c10 = top.insert_node(p(), EdNode::Op(NodeKind::Const(10.0)));
+        let b = top.insert_node(p(), EdNode::Biome { name: "B".into(), graph: Box::new(sub) });
+        top.connect(out(c10), inn(b, 0)); // feed continentalness pin
+        let o = top.insert_node(p(), EdNode::Output);
+        top.connect(out(b), inn(o, 0));
+
+        let g = snarl_to_graph(&top).expect("piped");
+        assert_eq!(g.eval(0.0, 0.0, 7).v, 15.0); // Input(0)=10 + Const 5
+    }
+
+    /// A biome `Input` that is used but its parent pin is unconnected is a hard error (no silent 0).
+    #[test]
+    fn unconnected_used_biome_input_errors() {
+        let mut sub = Snarl::new();
+        let inp = sub.insert_node(p(), EdNode::Input(0));
+        let so = sub.insert_node(p(), EdNode::Output);
+        sub.connect(out(inp), inn(so, 0));
+        let mut top = Snarl::new();
+        let b = top.insert_node(p(), EdNode::Biome { name: "B".into(), graph: Box::new(sub) });
+        let o = top.insert_node(p(), EdNode::Output);
+        top.connect(out(b), inn(o, 0)); // continentalness pin left unconnected
+        assert!(snarl_to_graph(&top).is_err());
     }
 }
