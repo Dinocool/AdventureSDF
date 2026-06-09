@@ -1415,6 +1415,7 @@ mod tests {
     fn terrain_eval_samples_ring_at_world_xz_with_offset() {
         use crate::sdf_render::worldgen::artifact::ScalarField2D;
         use crate::sdf_render::worldgen::coord::{ChunkCoord, ChunkSize, LayerId};
+        use crate::sdf_render::worldgen::layers::erosion::ErosionParams;
         use crate::sdf_render::worldgen::layers::height::{
             HEIGHT_CHUNK_CELLS, HEIGHT_FIELD_RES, HeightLayer, HeightParams,
         };
@@ -1428,7 +1429,7 @@ mod tests {
         // A resident chunk at (3, 2) — its world XZ is well away from the origin, so sampling there
         // requires the offset (a local point near the origin must be shifted into the chunk).
         let (cx, cz) = (3i32, 2i32);
-        let layer = HeightLayer::new(LayerId(0), HeightParams::default());
+        let layer = HeightLayer::new(LayerId(0), HeightParams::default(), ErosionParams::default());
         let size = ChunkSize::new(HEIGHT_CHUNK_CELLS);
         let coord = ChunkCoord::new(LayerId(0), IVec3::new(cx, 0, cz));
         let mut field = ScalarField2D::zeroed(coord, size, HEIGHT_FIELD_RES);

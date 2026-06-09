@@ -169,6 +169,25 @@ pub fn fbm_height_grad(wx: f64, wz: f64, p: &FbmParams) -> (f64, f64, f64) {
     (h, dh_dx, dh_dz)
 }
 
+/// fBm height (value only) at world `(wx, wz)` — the same octave sum as [`fbm_height_grad`] without the
+/// gradient accumulation. Used by the height layer's ridge fold + central-difference erosion gradient,
+/// which differentiate the scalar field numerically (so the per-tap closed-form gradient is wasted
+/// work). Identical bit pattern to `fbm_height_grad(...).0`. Deterministic & bit-portable.
+#[inline]
+pub fn fbm_height(wx: f64, wz: f64, p: &FbmParams) -> f64 {
+    let mut freq = p.base_freq;
+    let mut amp = p.amplitude;
+    let mut h = 0.0;
+    for o in 0..p.octaves {
+        let oseed = p.seed.wrapping_add(o.wrapping_mul(0x9E37_79B9));
+        let (v, _, _) = value_noise_grad(wx * freq, wz * freq, oseed);
+        h += v * amp;
+        freq *= p.lacunarity;
+        amp *= p.gain;
+    }
+    h
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -282,6 +301,18 @@ mod tests {
             let fd_z = (hzp - hzm) / (2.0 * h);
             assert!((gx - fd_x).abs() < 1e-2, "fBm ∂x at ({wx},{wz}): {gx} vs {fd_x}");
             assert!((gz - fd_z).abs() < 1e-2, "fBm ∂z at ({wx},{wz}): {gz} vs {fd_z}");
+        }
+    }
+
+    /// `fbm_height` (value-only) is bit-identical to `fbm_height_grad(...).0` — the height layer's
+    /// central-difference erosion gradient relies on this equivalence (it differentiates `fbm_height`).
+    #[test]
+    fn fbm_height_matches_grad_value() {
+        let p = FbmParams { octaves: 5, base_freq: 1.0 / 300.0, lacunarity: 2.0, gain: 0.5, amplitude: 60.0, seed: 17 };
+        for &(wx, wz) in &[(0.0, 0.0), (123.5, -456.25), (-789.0, 1011.0), (1_000_000.5, -2_000_000.25)] {
+            let v = fbm_height(wx, wz, &p);
+            let (g, _, _) = fbm_height_grad(wx, wz, &p);
+            assert_eq!(v.to_bits(), g.to_bits(), "fbm_height != fbm_height_grad().0 at ({wx},{wz})");
         }
     }
 

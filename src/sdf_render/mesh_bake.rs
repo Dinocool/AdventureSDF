@@ -1543,6 +1543,7 @@ mod tests {
     fn coverage_gate_excludes_uncovered_terrain_chunk() {
         use crate::sdf_render::worldgen::artifact::ScalarField2D;
         use crate::sdf_render::worldgen::coord::{ChunkCoord, ChunkSize, LayerId};
+        use crate::sdf_render::worldgen::layers::erosion::ErosionParams;
         use crate::sdf_render::worldgen::layers::height::{
             HEIGHT_CHUNK_CELLS, HEIGHT_FIELD_RES, HeightLayer, HeightParams,
         };
@@ -1552,7 +1553,7 @@ mod tests {
 
         // Build a resident ring covering height chunks (-3..5, -3..5) around the origin — a generous
         // loaded block so a chunk near the origin clears the gate's `2·HEIGHT_CHUNK_CELLS` apron margin.
-        let layer = HeightLayer::new(LayerId(0), HeightParams::default());
+        let layer = HeightLayer::new(LayerId(0), HeightParams::default(), ErosionParams::default());
         let size = ChunkSize::new(HEIGHT_CHUNK_CELLS);
         let mut store = ArtifactStore::new();
         for cz in -3..5 {

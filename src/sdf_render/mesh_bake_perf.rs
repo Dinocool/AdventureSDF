@@ -32,14 +32,14 @@
 
 use super::*;
 use crate::sdf_render::edits::{CsgKind, ResolvedEdit, SdfOp, SdfPrimitive};
+use crate::sdf_render::worldgen::layers::erosion::ErosionParams;
 use crate::sdf_render::worldgen::layers::height::{HEIGHT_CHUNK_CELLS, HeightParams};
 use crate::sdf_render::worldgen::manager::LayerManager;
 use crate::sdf_render::worldgen::upload::{
     HeightClipmap, build_height_clipmap, set_cpu_height_clipmap,
 };
 use crate::sdf_render::worldgen::{
-    WORLDGEN_SLICE_SEED, WORLDGEN_TERRAIN_HALF_XZ, WORLDGEN_TERRAIN_MAX_Y, WORLDGEN_TERRAIN_MIN_Y,
-    height_clipmap_tiers,
+    WORLDGEN_SLICE_SEED, WORLDGEN_TERRAIN_HALF_XZ, height_clipmap_tiers, terrain_band,
 };
 // NB: `coarsest_lod_outer_reach`, `BLEND_REACH`, `MAX_NEW_TASKS_PER_FRAME`, `MeshBakeConfig`, and every
 // private residency helper (`lod0_half_chunks`, `lod_centre`, `chunk_aabb`, `chunks_in_aabb`,
@@ -54,11 +54,12 @@ use std::sync::Arc;
 /// the `SdfPrimitive::Terrain` at IDENTITY, material 0, plain Union, no smoothing. So the topology baked
 /// here is the real worldgen terrain's.
 fn terrain_edit() -> ResolvedEdit {
+    let (min_y, max_y) = terrain_band(&HeightParams::default(), &ErosionParams::default());
     ResolvedEdit::new(
         SdfPrimitive::Terrain {
             half_xz: Vec2::splat(WORLDGEN_TERRAIN_HALF_XZ),
-            min_height: WORLDGEN_TERRAIN_MIN_Y,
-            max_height: WORLDGEN_TERRAIN_MAX_Y,
+            min_height: min_y,
+            max_height: max_y,
         },
         Transform::IDENTITY,
         SdfOp { kind: CsgKind::Union, smoothing: 0.0 },
@@ -74,7 +75,8 @@ fn terrain_edit() -> ResolvedEdit {
 fn build_and_publish_clipmap(cfg: &SdfGridConfig, mesh_cfg: &MeshBakeConfig, focus: DVec2) -> Arc<HeightClipmap> {
     let reach = coarsest_lod_outer_reach(cfg, mesh_cfg) as f64;
     let tiers = height_clipmap_tiers(reach);
-    let mut manager = LayerManager::new_clipmap(WORLDGEN_SLICE_SEED, HeightParams::default(), tiers);
+    let mut manager =
+        LayerManager::new_clipmap(WORLDGEN_SLICE_SEED, HeightParams::default(), ErosionParams::default(), tiers);
     manager.budget = 1_000_000; // fill the whole window per update (we want a settled cold clipmap)
 
     // Settle the rolling window at `focus` (a handful of high-budget updates; guard against non-convergence).

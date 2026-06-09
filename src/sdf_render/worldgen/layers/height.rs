@@ -10,12 +10,17 @@ use bevy::prelude::*;
 use super::super::artifact::{ArtifactKind, HeightNode, ScalarField2D};
 use super::super::coord::{Authority, ChunkSize, Dim, LayerId};
 use super::super::layer::{ArtifactDecl, GenCtx, GenOutput, Layer};
-use super::super::noise::{FbmParams, fbm_height_grad};
+use super::super::noise::{FbmParams, fbm_height, fbm_height_grad};
+use super::erosion::{ErosionParams, erode_height};
 
 /// Bump when the height layer's *output* intentionally changes (algorithm/constants). It keys the
 /// disk cache (WORLD_GEN_PLAN §2.3) and the parity reference vectors — a change here forces
 /// regenerating reference values, making "I meant to change the terrain" explicit and review-visible.
-pub const HEIGHT_GEN_VERSION: u32 = 2;
+pub const HEIGHT_GEN_VERSION: u32 = 3;
+
+/// Central-difference step (world metres) for the eroded/ridged gradient in [`HeightLayer::sample_world`].
+/// Small enough to resolve the finest erosion feature, large enough to stay well clear of `f64` noise.
+pub const EROSION_GRAD_EPS: f64 = 0.5;
 
 /// Chunk edge in base cells (= metres) for the height layer's tier.
 pub const HEIGHT_CHUNK_CELLS: u32 = 128;
@@ -40,24 +45,45 @@ pub struct HeightParams {
     pub amplitude: f32,
     /// Reference plane added to the noise (sea level / base elevation), world metres.
     pub sea_level: f32,
+    /// Ridged-multifractal blend in `[0, 1]`: `0` = plain fBm, `1` = fully ridged (the fBm octave sum
+    /// folded toward `1 - |fbm|`-style sharp peaks). Folds the SAME octave sum, so the field stays
+    /// band-limited; the (now non-analytic) gradient is taken by central difference in `sample_world`.
+    pub ridge: f32,
     /// Per-layer salt mixed with the world seed so this layer has an independent stream.
     pub seed_salt: u32,
 }
 
 impl Default for HeightParams {
     fn default() -> Self {
-        // Tuned GENTLE: large-wavelength, few octaves, fast amplitude falloff. High-frequency octaves
-        // create near-sub-voxel cliffs that distant (coarse-LOD) bricks can't resolve → empty bricks
-        // → holes. Keeping the relief broad makes the surface marchable at every clipmap LOD.
+        // Tuned DRAMATIC: wide mountains (low base_freq), more octaves for branching detail, and a
+        // large octave-0 amplitude for hundreds-of-metres relief. A partial `ridge` fold sharpens the
+        // peaks into ridgelines; the erosion layer then carves gullies into the slopes. The relief is
+        // kept broad enough (octave-0 wavelength = 1536 m) that every clipmap LOD can still march it.
         Self {
-            octaves: 4,
-            base_freq: 1.0 / 512.0,
+            octaves: 6,
+            base_freq: 1.0 / 1536.0,
             lacunarity: 2.0,
-            gain: 0.45,
-            amplitude: 40.0,
+            gain: 0.5,
+            amplitude: 280.0,
             sea_level: 0.0,
+            ridge: 0.5,
             seed_salt: 0,
         }
+    }
+}
+
+impl HeightParams {
+    /// Geometric sum of the per-octave amplitudes (`amplitude·Σ gain^o`) — the maximum fBm swing
+    /// magnitude (value noise ∈ [-1, 1] per octave). The vertical-band derivation and the parity tests
+    /// both use it to bound the surface. Pure basic ops.
+    pub fn amplitude_sum(&self) -> f64 {
+        let mut amp = self.amplitude as f64;
+        let mut sum = 0.0;
+        for _ in 0..self.octaves {
+            sum += amp;
+            amp *= self.gain as f64;
+        }
+        sum
     }
 }
 
@@ -75,6 +101,8 @@ impl Default for HeightParams {
 pub struct HeightLayer {
     pub id: LayerId,
     pub params: HeightParams,
+    /// The erosion-filter params applied on top of the base height (Layer #2; see [`super::erosion`]).
+    pub erosion: ErosionParams,
     /// Chunk edge in base cells for THIS tier (`HEIGHT_CHUNK_CELLS·2^t`). Tier 0 = `HEIGHT_CHUNK_CELLS`.
     chunk_cells: u32,
     decls: [ArtifactDecl; 1],
@@ -83,17 +111,18 @@ pub struct HeightLayer {
 impl HeightLayer {
     /// Tier-0 layer (`chunk_cells = HEIGHT_CHUNK_CELLS`). Convenience for the single-tier callers /
     /// tests; multi-tier clipmap construction uses [`new_tier`](Self::new_tier).
-    pub fn new(id: LayerId, params: HeightParams) -> Self {
-        Self::new_tier(id, params, HEIGHT_CHUNK_CELLS)
+    pub fn new(id: LayerId, params: HeightParams, erosion: ErosionParams) -> Self {
+        Self::new_tier(id, params, erosion, HEIGHT_CHUNK_CELLS)
     }
 
     /// A layer for an arbitrary clipmap tier: `chunk_cells` = the tier's chunk edge in base cells
     /// (`HEIGHT_CHUNK_CELLS·2^t`). `HEIGHT_FIELD_RES` nodes per chunk regardless of tier (so the node
-    /// spacing scales with the tier). The fBm (`sample_world`) is identical across tiers.
-    pub fn new_tier(id: LayerId, params: HeightParams, chunk_cells: u32) -> Self {
+    /// spacing scales with the tier). The carved surface (`sample_world`) is identical across tiers.
+    pub fn new_tier(id: LayerId, params: HeightParams, erosion: ErosionParams, chunk_cells: u32) -> Self {
         Self {
             id,
             params,
+            erosion,
             chunk_cells,
             decls: [ArtifactDecl { name: Self::OUTPUT, kind: ArtifactKind::ScalarField2D }],
         }
@@ -122,17 +151,72 @@ impl HeightLayer {
         }
     }
 
-    /// Authoritative surface height + analytic XZ gradient at world `(wx, wz)`. Single source of
-    /// truth for "the terrain surface here", shared by chunk generation, the parity harness, and
-    /// (later) the CPU `eval_primitive` picking path. Deterministic & bit-portable.
+    /// Full carved SCALAR surface height at world `(wx, wz)`: fBm, optionally folded toward a ridged
+    /// multifractal by `params.ridge`, plus sea level, then carved by the erosion filter. Pure /
+    /// deterministic / bit-portable (basic `f64` ops + the portable noise basis). This is the function
+    /// the central difference in [`sample_world`](Self::sample_world) differentiates for the gradient.
+    #[inline]
+    fn height_world(&self, wx: f64, wz: f64, fbm: &FbmParams, world_seed: u64) -> f64 {
+        let ridge = self.params.ridge as f64;
+        let h_base = if ridge == 0.0 {
+            // Plain fBm value (value-only variant — no gradient needed here).
+            fbm_height(wx, wz, fbm)
+        } else {
+            // Ridged fold of the SAME octave sum: blend `h` toward `amplitude_sum·(1 - |fbm|/amp_sum)`,
+            // i.e. fold the signed fBm to its ridged form scaled to the same swing. Keeps it band-limited
+            // (same octaves) and parameter-driven (no magic constants).
+            let h = fbm_height(wx, wz, fbm);
+            let amp_sum = self.params.amplitude_sum();
+            // `1 - |h|/amp_sum ∈ [0, 1]`; rescale to the fBm swing and recentre so ridge=1 still spans a
+            // comparable band. `ridged = amp_sum·(1 - 2·|h|/amp_sum) = amp_sum - 2·|h|` (mapped to
+            // roughly `[-amp_sum, amp_sum]`, peaks where the fBm crosses zero → sharp ridgelines).
+            let ah = if h < 0.0 { -h } else { h };
+            let ridged = amp_sum - 2.0 * ah;
+            h + ridge * (ridged - h)
+        };
+        let h_sea = h_base + self.params.sea_level as f64;
+        // Carve. `erode_height` needs the base XZ gradient to seed its slope-damp feedback; recompute it
+        // analytically from the fBm (the ridge fold's own derivative is folded in by the central
+        // difference in `sample_world`, so the seed gradient here is the smooth fBm slope — fine).
+        let (_, gx, gz) = fbm_height_grad(wx, wz, fbm);
+        erode_height(h_sea, gx, gz, wx, wz, world_seed, &self.erosion)
+    }
+
+    /// Authoritative carved surface height + XZ gradient at world `(wx, wz)`. Single source of truth
+    /// for "the terrain surface here", shared by chunk generation, the parity harness, and the CPU
+    /// `eval_primitive` picking path. Deterministic & bit-portable.
+    ///
+    /// FAST PATH — plain fBm (`ridge == 0` AND erosion disabled): the closed-form `fbm_height_grad`
+    /// gradient (exact, cheap). OTHERWISE the ridge fold (`1 - |fbm|`) and the erosion carve are not
+    /// closed-form differentiable through this layer (they'd need the noise Hessian), so the gradient is
+    /// taken by a CENTRAL DIFFERENCE of [`height_world`](Self::height_world) at `±EROSION_GRAD_EPS` in
+    /// wx and wz — 5 height evals/node, fine for per-chunk (infrequent) generation; the bake reads the
+    /// stored gradient. Still a pure deterministic `f(wx, wz, seed)`.
     #[inline]
     pub fn sample_world(&self, wx: f64, wz: f64, world_seed: u64) -> HeightNode {
         let fbm = self.fbm_params(world_seed);
-        let (h, gx, gz) = fbm_height_grad(wx, wz, &fbm);
+
+        if self.params.ridge == 0.0 && !self.erosion.enabled {
+            // Exact analytic path (unchanged behaviour for plain-fBm configs).
+            let (h, gx, gz) = fbm_height_grad(wx, wz, &fbm);
+            return HeightNode {
+                height: (h + self.params.sea_level as f64) as f32,
+                dh_dx: gx as f32,
+                dh_dz: gz as f32,
+            };
+        }
+
+        let e = EROSION_GRAD_EPS;
+        let h = self.height_world(wx, wz, &fbm, world_seed);
+        let hxp = self.height_world(wx + e, wz, &fbm, world_seed);
+        let hxm = self.height_world(wx - e, wz, &fbm, world_seed);
+        let hzp = self.height_world(wx, wz + e, &fbm, world_seed);
+        let hzm = self.height_world(wx, wz - e, &fbm, world_seed);
+        let inv2e = 1.0 / (2.0 * e);
         HeightNode {
-            height: (h + self.params.sea_level as f64) as f32,
-            dh_dx: gx as f32,
-            dh_dz: gz as f32,
+            height: h as f32,
+            dh_dx: ((hxp - hxm) * inv2e) as f32,
+            dh_dz: ((hzp - hzm) * inv2e) as f32,
         }
     }
 }
@@ -177,7 +261,7 @@ mod tests {
     use bevy::math::{DVec2, IVec3};
 
     fn layer() -> HeightLayer {
-        HeightLayer::new(LayerId(0), HeightParams::default())
+        HeightLayer::new(LayerId(0), HeightParams::default(), ErosionParams::default())
     }
 
     /// `generate` produces a height field of the right shape, sampled consistently with the public
@@ -240,5 +324,49 @@ mod tests {
         let a = l.sample_world(12.0, 34.0, 1);
         let b = l.sample_world(12.0, 34.0, 2);
         assert_ne!(a.height.to_bits(), b.height.to_bits());
+    }
+
+    /// The stored gradient (from the `EROSION_GRAD_EPS` central difference) is finite and approximately
+    /// matches a FINER-eps central difference of the carved height — guards the terrain normals the bake
+    /// reconstructs from this gradient.
+    #[test]
+    fn stored_gradient_matches_finer_central_difference() {
+        let l = layer();
+        let seed = 4242u64;
+        // Sloped, mid-altitude points where erosion + ridge bite.
+        for &(wx, wz) in &[(321.0, -123.0), (-560.0, 880.0), (1500.5, 700.25)] {
+            let n = l.sample_world(wx, wz, seed);
+            assert!(n.dh_dx.is_finite() && n.dh_dz.is_finite(), "gradient not finite at ({wx},{wz})");
+            // Reference: a finer central difference of the full carved height.
+            let fbm = l.fbm_params(seed);
+            let e = 0.05f64;
+            let hxp = l.height_world(wx + e, wz, &fbm, seed);
+            let hxm = l.height_world(wx - e, wz, &fbm, seed);
+            let hzp = l.height_world(wx, wz + e, &fbm, seed);
+            let hzm = l.height_world(wx, wz - e, &fbm, seed);
+            let fd_x = (hxp - hxm) / (2.0 * e);
+            let fd_z = (hzp - hzm) / (2.0 * e);
+            // Generous tol: the two epsilons see slightly different band-limits of the same field.
+            assert!((n.dh_dx as f64 - fd_x).abs() < 1.0, "∂x at ({wx},{wz}): {} vs {fd_x}", n.dh_dx);
+            assert!((n.dh_dz as f64 - fd_z).abs() < 1.0, "∂z at ({wx},{wz}): {} vs {fd_z}", n.dh_dz);
+        }
+    }
+
+    /// With erosion disabled AND `ridge == 0`, `sample_world` takes the exact analytic fBm path — its
+    /// gradient equals `fbm_height_grad` exactly (bit-for-bit), unchanged from the pre-erosion behaviour.
+    #[test]
+    fn plain_fbm_path_is_exact_analytic() {
+        let params = HeightParams { ridge: 0.0, ..Default::default() };
+        let erosion = ErosionParams { enabled: false, ..Default::default() };
+        let l = HeightLayer::new(LayerId(0), params, erosion);
+        let seed = 7u64;
+        let fbm = l.fbm_params(seed);
+        for &(wx, wz) in &[(0.0, 0.0), (123.5, -456.25), (-789.0, 1011.0)] {
+            let n = l.sample_world(wx, wz, seed);
+            let (h, gx, gz) = fbm_height_grad(wx, wz, &fbm);
+            assert_eq!(n.height.to_bits(), ((h + params.sea_level as f64) as f32).to_bits());
+            assert_eq!(n.dh_dx.to_bits(), (gx as f32).to_bits());
+            assert_eq!(n.dh_dz.to_bits(), (gz as f32).to_bits());
+        }
     }
 }

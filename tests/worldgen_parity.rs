@@ -20,6 +20,7 @@
 //! Paste the printed literals over the tables below and bump `HEIGHT_GEN_VERSION`. The generator only
 //! *prints* (never writes a file), so the change is explicit and review-visible — never auto-healed.
 
+use adventure::sdf_render::worldgen::layers::erosion::ErosionParams;
 use adventure::sdf_render::worldgen::layers::height::{HEIGHT_GEN_VERSION, HeightLayer, HeightParams};
 use adventure::sdf_render::worldgen::{coord::LayerId, noise};
 
@@ -46,6 +47,11 @@ const HEIGHT_POINTS: &[(f64, f64, u64)] = &[
     (-0.001, -0.001, 1),
     (12.0, 34.0, 2),
     (12.0, 34.0, 999_999),
+    // Erosion-biting points: sloped, mid-altitude spots where the ridge fold + erosion carve (so the
+    // pinned vectors guard the new carved-surface math, not just the base fBm).
+    (321.0, -123.0, 1),
+    (-560.0, 880.0, 1),
+    (1500.5, 700.25, 1),
 ];
 
 /// Pinned `hash2` outputs for `HASH_POINTS`, in order. (Filled from the generator.)
@@ -56,18 +62,21 @@ const HASH_REFERENCE: &[u32] =
 /// `HeightParams::default()`. (Filled from the generator.) Changing the default params changes these
 /// — bump `HEIGHT_GEN_VERSION`.
 const HEIGHT_REFERENCE: &[(u32, u32, u32)] = &[
-    (1091346484, 0, 0),
-    (1107985926, 3173698594, 3181065001),
-    (3249860909, 1049238806, 3172095744),
-    (1082975066, 1028616013, 1009231171),
-    (1100516248, 1024126484, 0),
-    (1091346484, 2954790304, 2943086156),
-    (1091368145, 982344722, 1027223944),
-    (3251513402, 986105929, 3185347093),
+    (1130409224, 932683162, 3084332753),
+    (1128958415, 3166006437, 3201705018),
+    (1116346992, 1011663455, 3184499989),
+    (1130989868, 1042210162, 1044336231),
+    (1130630920, 3197466413, 2994596096),
+    (1130409224, 932367314, 3084552446),
+    (1131319923, 3167433592, 3206954370),
+    (3244611972, 1015227872, 1016098856),
+    (1126354229, 1050933151, 1050389096),
+    (1109801079, 1060548102, 3199025869),
+    (1123825041, 3201396003, 1069271810),
 ];
 
 fn default_layer() -> HeightLayer {
-    HeightLayer::new(LayerId(0), HeightParams::default())
+    HeightLayer::new(LayerId(0), HeightParams::default(), ErosionParams::default())
 }
 
 /// THE gate: the integer hash basis must reproduce its pinned bit values exactly.

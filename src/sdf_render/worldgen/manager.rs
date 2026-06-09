@@ -20,6 +20,7 @@ use bevy::prelude::Resource;
 use super::artifact::ScalarField2D;
 use super::coord::{ChunkCoord, LayerId};
 use super::layer::{GenCtx, GenOutput, Layer};
+use super::layers::erosion::ErosionParams;
 use super::layers::height::{HEIGHT_CHUNK_CELLS, HeightLayer, HeightParams};
 use super::plan::{GenerationPlan, LayerMeta};
 use super::store::ArtifactStore;
@@ -48,8 +49,8 @@ impl LayerManager {
     /// Build the Phase-1 slice stack: a single height layer required within `radius` metres of the
     /// focus. Equivalent to a 1-tier clipmap; kept for the unit tests that want a single predictable
     /// ring window. Production uses [`new_clipmap`](Self::new_clipmap).
-    pub fn new_slice(seed: u64, params: HeightParams, radius: f64) -> Self {
-        let layer = HeightLayer::new(LayerId(0), params);
+    pub fn new_slice(seed: u64, params: HeightParams, erosion: ErosionParams, radius: f64) -> Self {
+        let layer = HeightLayer::new(LayerId(0), params, erosion);
         let metas = vec![LayerMeta {
             id: layer.id(),
             size: layer.chunk_size(),
@@ -69,13 +70,13 @@ impl LayerManager {
     ///
     /// All tiers share ONE [`ArtifactStore`] keyed by `ChunkCoord{layer, xyz}` (the `LayerId` already
     /// namespaces tiers, so a tier-`t` chunk and a tier-`t'` chunk at the same `xyz` never collide).
-    pub fn new_clipmap(seed: u64, params: HeightParams, tiers: u32) -> Self {
+    pub fn new_clipmap(seed: u64, params: HeightParams, erosion: ErosionParams, tiers: u32) -> Self {
         assert!(tiers >= 1, "clipmap needs ≥ 1 tier");
         let mut layers: Vec<Box<dyn Layer>> = Vec::with_capacity(tiers as usize);
         let mut metas = Vec::with_capacity(tiers as usize);
         for t in 0..tiers {
             let chunk_cells = HEIGHT_CHUNK_CELLS << t; // HEIGHT_CHUNK_CELLS · 2^t
-            let layer = HeightLayer::new_tier(LayerId(t), params, chunk_cells);
+            let layer = HeightLayer::new_tier(LayerId(t), params, erosion, chunk_cells);
             let radius = HEIGHT_CHUNK_CELLS as f64 * 3.75 * (1u32 << t) as f64;
             metas.push(LayerMeta {
                 id: layer.id(),
@@ -99,9 +100,9 @@ impl LayerManager {
     /// existing tiers' layers + residency (same chunk sizes/params), so growing the window never
     /// regenerates — or flickers — the already-loaded terrain (the new far coverage just streams in via the
     /// budget). SHRINK = drop the coarsest tiers + their residency; the finer tiers stay loaded. Appended
-    /// tiers use `params` (the current height params); a same-frame PARAM edit is handled separately by
-    /// `set_height_params`, which rebuilds ALL tiers. Clamped to ≥ 1 tier.
-    pub fn set_tier_count(&mut self, tiers: u32, params: HeightParams) -> bool {
+    /// tiers use `params`/`erosion` (the current params); a same-frame PARAM edit is handled separately by
+    /// [`set_params`](Self::set_params), which rebuilds ALL tiers. Clamped to ≥ 1 tier.
+    pub fn set_tier_count(&mut self, tiers: u32, params: HeightParams, erosion: ErosionParams) -> bool {
         let tiers = tiers.max(1);
         let cur = self.tier_count();
         if tiers == cur {
@@ -110,7 +111,7 @@ impl LayerManager {
         if tiers > cur {
             for t in cur..tiers {
                 let chunk_cells = HEIGHT_CHUNK_CELLS << t; // HEIGHT_CHUNK_CELLS · 2^t
-                let layer = HeightLayer::new_tier(LayerId(t), params, chunk_cells);
+                let layer = HeightLayer::new_tier(LayerId(t), params, erosion, chunk_cells);
                 let radius = HEIGHT_CHUNK_CELLS as f64 * 3.75 * (1u32 << t) as f64;
                 self.metas.push(LayerMeta {
                     id: layer.id(),
@@ -149,15 +150,15 @@ impl LayerManager {
         plan.iter().all(|c| self.height.contains(c))
     }
 
-    /// Replace EVERY tier's height params (editor tweak) and clear residency so the world regenerates
-    /// with the new params. Each tier is rebuilt preserving its id + chunk size (only the params change),
-    /// then the whole shared store is evicted. Returns the dropped count (for logging).
-    pub fn set_height_params(&mut self, params: HeightParams) -> usize {
+    /// Replace EVERY tier's height + erosion params (editor tweak) and clear residency so the world
+    /// regenerates with the new params. Each tier is rebuilt preserving its id + chunk size (only the
+    /// params change), then the whole shared store is evicted. Returns the dropped count (for logging).
+    pub fn set_params(&mut self, params: HeightParams, erosion: ErosionParams) -> usize {
         for (layer, meta) in self.layers.iter_mut().zip(self.metas.iter()) {
             // Preserve this tier's id + chunk size (cells); only the params change.
             let id = layer.id();
             let chunk_cells = meta.size.cells;
-            *layer = Box::new(HeightLayer::new_tier(id, params, chunk_cells));
+            *layer = Box::new(HeightLayer::new_tier(id, params, erosion, chunk_cells));
         }
         // Evict everything across ALL tiers → next update regenerates from the new params (queues drops).
         self.height.retain(|_| false)
@@ -222,7 +223,7 @@ mod tests {
     fn mgr() -> LayerManager {
         // Radius ≈ 1.5 chunks so the focus pulls a small, predictable window.
         let r = HEIGHT_CHUNK_CELLS as f64 * 1.5;
-        let mut m = LayerManager::new_slice(123, HeightParams::default(), r);
+        let mut m = LayerManager::new_slice(123, HeightParams::default(), ErosionParams::default(), r);
         m.budget = 1000; // generate all required per update in tests
         m
     }
@@ -258,7 +259,7 @@ mod tests {
     #[test]
     fn budget_limits_generation_per_update() {
         let r = HEIGHT_CHUNK_CELLS as f64 * 3.0;
-        let mut m = LayerManager::new_slice(1, HeightParams::default(), r);
+        let mut m = LayerManager::new_slice(1, HeightParams::default(), ErosionParams::default(), r);
         m.budget = 2;
         m.update(DVec2::ZERO);
         // Only `budget` chunks generated in the first tick.
@@ -283,8 +284,8 @@ mod tests {
         // Drain the delta so we can observe the regen cleanly.
         m.height_store_mut().drain_dirty();
 
-        let p = HeightParams { amplitude: 200.0, ..Default::default() }; // very different terrain
-        let dropped = m.set_height_params(p);
+        let p = HeightParams { amplitude: 600.0, ..Default::default() }; // very different terrain
+        let dropped = m.set_params(p, ErosionParams::default());
         assert!(dropped > 0, "changing params evicts the old residency");
         assert!(m.height_store().is_empty());
 
@@ -312,22 +313,22 @@ mod tests {
     /// rebuilding + clearing residency on an actual change and no-opping when unchanged.
     #[test]
     fn set_tier_count_tracks_the_window() {
-        let mut m = LayerManager::new_clipmap(7, HeightParams::default(), 3);
+        let mut m = LayerManager::new_clipmap(7, HeightParams::default(), ErosionParams::default(), 3);
         m.budget = 1000;
         m.update(DVec2::ZERO);
         assert_eq!(m.tier_count(), 3);
         assert!(!m.height_store().is_empty());
         // No-op when the count is unchanged (must NOT touch residency).
-        assert!(!m.set_tier_count(3, HeightParams::default()));
+        assert!(!m.set_tier_count(3, HeightParams::default(), ErosionParams::default()));
         assert!(!m.height_store().is_empty(), "unchanged tier count keeps residency");
         // Grow → APPEND tiers, KEEP existing residency (no flicker); the new tiers stream in later.
         let before = m.height_store().len();
-        assert!(m.set_tier_count(5, HeightParams::default()));
+        assert!(m.set_tier_count(5, HeightParams::default(), ErosionParams::default()));
         assert_eq!(m.tier_count(), 5);
         assert_eq!(m.height_store().len(), before, "growing the window keeps the loaded terrain");
         // Shrink to 1 (0 clamps to ≥ 1): drops the dropped tiers' residency. Tier 0 was resident, so the
         // store keeps its tier-0 chunks (here all residency was tier 0..2, so 1 tier remains populated).
-        assert!(m.set_tier_count(0, HeightParams::default()));
+        assert!(m.set_tier_count(0, HeightParams::default(), ErosionParams::default()));
         assert_eq!(m.tier_count(), 1, "clamped to ≥ 1 tier");
         assert!(
             m.height_store().resident_coords().all(|c| c.layer == LayerId(0)),
@@ -338,7 +339,7 @@ mod tests {
     /// A clipmap manager builds one layer per tier with chunk size `HEIGHT_CHUNK_CELLS·2^t`.
     #[test]
     fn clipmap_builds_one_layer_per_tier() {
-        let m = LayerManager::new_clipmap(7, HeightParams::default(), 5);
+        let m = LayerManager::new_clipmap(7, HeightParams::default(), ErosionParams::default(), 5);
         assert_eq!(m.tier_count(), 5);
         for t in 0..5u32 {
             let meta = m.metas.iter().find(|mm| mm.id == LayerId(t)).expect("tier present");
@@ -351,7 +352,7 @@ mod tests {
     #[test]
     fn clipmap_all_tiers_resident_then_roll() {
         let tiers = 4u32;
-        let mut m = LayerManager::new_clipmap(99, HeightParams::default(), tiers);
+        let mut m = LayerManager::new_clipmap(99, HeightParams::default(), ErosionParams::default(), tiers);
         m.budget = 100_000; // generate everything required per update
         assert!(!m.is_settled(DVec2::ZERO));
         let delta = m.update(DVec2::ZERO);

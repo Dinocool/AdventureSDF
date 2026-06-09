@@ -15,6 +15,7 @@ use bevy::math::{DVec2, IVec3};
 
 use adventure::sdf_render::worldgen::coord::{ChunkCoord, LayerId};
 use adventure::sdf_render::worldgen::layer::{GenCtx, GenOutput, Layer};
+use adventure::sdf_render::worldgen::layers::erosion::ErosionParams;
 use adventure::sdf_render::worldgen::layers::height::{HEIGHT_CHUNK_CELLS, HeightLayer, HeightParams};
 use adventure::sdf_render::worldgen::manager::LayerManager;
 
@@ -29,7 +30,8 @@ const SLICE_SEED: u64 = 0xA15E_C0DE_2026;
 #[test]
 #[ignore = "timing harness; run with --ignored --nocapture"]
 fn bench_layer_manager_cold_fill() {
-    let mut mgr = LayerManager::new_slice(SLICE_SEED, HeightParams::default(), SLICE_RADIUS);
+    let mut mgr =
+        LayerManager::new_slice(SLICE_SEED, HeightParams::default(), ErosionParams::default(), SLICE_RADIUS);
     mgr.budget = 100_000; // no throttle — measure the raw fill cost
 
     let focus = DVec2::ZERO;
@@ -61,7 +63,8 @@ fn bench_layer_manager_cold_fill() {
 #[test]
 #[ignore = "timing harness; run with --ignored --nocapture"]
 fn bench_build_height_ring() {
-    let mut mgr = LayerManager::new_slice(SLICE_SEED, HeightParams::default(), SLICE_RADIUS);
+    let mut mgr =
+        LayerManager::new_slice(SLICE_SEED, HeightParams::default(), ErosionParams::default(), SLICE_RADIUS);
     mgr.budget = 100_000;
     // Fill the window (not timed).
     for _ in 0..32 {
@@ -97,7 +100,7 @@ fn bench_build_height_ring() {
 #[test]
 #[ignore = "timing harness; run with --ignored --nocapture"]
 fn bench_height_layer_generate_per_chunk() {
-    let layer = HeightLayer::new(LayerId(0), HeightParams::default());
+    let layer = HeightLayer::new(LayerId(0), HeightParams::default(), ErosionParams::default());
     let size = layer.chunk_size();
 
     const ITERS: u32 = 64;
