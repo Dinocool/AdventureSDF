@@ -61,18 +61,40 @@ impl Default for HeightParams {
     }
 }
 
-/// The base-height layer. Holds its params + cached (empty) deps and (single) output decl.
+/// The base-height layer. Holds its params + per-tier chunk size + cached (empty) deps and (single)
+/// output decl.
+///
+/// CLIPMAP TIERS — the same layer serves every clipmap tier. Tier `t` is just a `HeightLayer` whose
+/// `chunk_cells = HEIGHT_CHUNK_CELLS · 2^t` (so a coarser node grid: `HEIGHT_FIELD_RES` nodes still,
+/// but spread over a bigger chunk). CRUCIALLY, `sample_world` is UNCHANGED across tiers — every tier
+/// evaluates the SAME continuous, world-anchored fBm `f(world_xz)`, only on a coarser grid. The fBm is
+/// already band-limited (gentle params: ~64 m finest feature), so coarse tiers DON'T alias, and because
+/// all tiers represent the SAME surface, cross-tier height values agree → per-voxel tier selection
+/// produces NO seams and NO cross-LOD cracks. A `HeightLayer` is therefore a pure `f(world_xz)`; tier
+/// `t`'s layer just samples it on a `HEIGHT_CHUNK_CELLS·2^t` chunk grid.
 pub struct HeightLayer {
     pub id: LayerId,
     pub params: HeightParams,
+    /// Chunk edge in base cells for THIS tier (`HEIGHT_CHUNK_CELLS·2^t`). Tier 0 = `HEIGHT_CHUNK_CELLS`.
+    chunk_cells: u32,
     decls: [ArtifactDecl; 1],
 }
 
 impl HeightLayer {
+    /// Tier-0 layer (`chunk_cells = HEIGHT_CHUNK_CELLS`). Convenience for the single-tier callers /
+    /// tests; multi-tier clipmap construction uses [`new_tier`](Self::new_tier).
     pub fn new(id: LayerId, params: HeightParams) -> Self {
+        Self::new_tier(id, params, HEIGHT_CHUNK_CELLS)
+    }
+
+    /// A layer for an arbitrary clipmap tier: `chunk_cells` = the tier's chunk edge in base cells
+    /// (`HEIGHT_CHUNK_CELLS·2^t`). `HEIGHT_FIELD_RES` nodes per chunk regardless of tier (so the node
+    /// spacing scales with the tier). The fBm (`sample_world`) is identical across tiers.
+    pub fn new_tier(id: LayerId, params: HeightParams, chunk_cells: u32) -> Self {
         Self {
             id,
             params,
+            chunk_cells,
             decls: [ArtifactDecl { name: Self::OUTPUT, kind: ArtifactKind::ScalarField2D }],
         }
     }
@@ -80,9 +102,9 @@ impl HeightLayer {
     /// The name of this layer's single produced artifact.
     pub const OUTPUT: &'static str = "height";
 
-    /// The chunk size for this layer's tier (a free fn so callers needn't construct the layer).
-    pub fn chunk_size() -> ChunkSize {
-        ChunkSize::new(HEIGHT_CHUNK_CELLS)
+    /// This tier's chunk size (`chunk_cells` base cells).
+    pub fn chunk_size(&self) -> ChunkSize {
+        ChunkSize::new(self.chunk_cells)
     }
 
     /// Fold the world seed with this layer's salt into the fBm parameter block. Pure / deterministic.
@@ -120,7 +142,7 @@ impl Layer for HeightLayer {
         self.id
     }
     fn chunk_size(&self) -> ChunkSize {
-        Self::chunk_size()
+        HeightLayer::chunk_size(self)
     }
     fn dimensionality(&self) -> Dim {
         Dim::D2
