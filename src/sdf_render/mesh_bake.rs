@@ -2090,6 +2090,232 @@ mod tests {
         crate::sdf_render::worldgen::upload::set_cpu_height_clipmap(None);
     }
 
+    /// Build + publish a tier-0 terrain clipmap whose nodes come from the layer's `generate` — the
+    /// PRODUCTION path, including the band-limit finalize stage — NOT raw `sample_world` point samples
+    /// (which is what `publish_eroded_terrain_clipmap` does). The triangle-quality harness below uses this
+    /// so it measures the surface the renderer ACTUALLY meshes (the regression harnesses point-sample, so
+    /// they never exercised the finalize filter — the gap this measures).
+    fn publish_generated_terrain_clipmap(
+        xrange: std::ops::RangeInclusive<i32>,
+        zrange: std::ops::RangeInclusive<i32>,
+        seed: u64,
+        params: crate::sdf_render::worldgen::layers::height::HeightParams,
+        erosion: crate::sdf_render::worldgen::layers::erosion::ErosionParams,
+    ) -> Arc<HeightClipmap> {
+        use crate::sdf_render::worldgen::artifact::ScalarField2D;
+        use crate::sdf_render::worldgen::coord::{ChunkCoord, ChunkSize, LayerId};
+        use crate::sdf_render::worldgen::layer::{GenCtx, GenOutput, Layer};
+        use crate::sdf_render::worldgen::layers::height::{HEIGHT_CHUNK_CELLS, HeightLayer};
+        use crate::sdf_render::worldgen::store::ArtifactStore;
+        use crate::sdf_render::worldgen::upload::{
+            build_height_clipmap, set_cpu_height_clipmap, set_cpu_terrain_offset,
+        };
+        let layer = HeightLayer::new(LayerId(0), params, erosion);
+        let size = ChunkSize::new(HEIGHT_CHUNK_CELLS);
+        let mut store = ArtifactStore::new();
+        for cz in zrange.clone() {
+            for cx in xrange.clone() {
+                let coord = ChunkCoord::new(LayerId(0), IVec3::new(cx, 0, cz));
+                let ctx = GenCtx { coord, seed, size };
+                let mut out = GenOutput::default();
+                layer.generate(&ctx, &mut out);
+                let field = out.take::<ScalarField2D>(HeightLayer::OUTPUT).unwrap();
+                store.insert(coord, field);
+            }
+        }
+        let clip = Arc::new(build_height_clipmap(&store, &[HEIGHT_CHUNK_CELLS]));
+        set_cpu_height_clipmap(Some(clip.clone()));
+        set_cpu_terrain_offset(Vec2::ZERO);
+        clip
+    }
+
+    /// Smallest interior angle (degrees) of a triangle — 0 for a sliver/degenerate. Law of cosines on the
+    /// three edge lengths.
+    fn tri_min_angle_deg(a: Vec3, b: Vec3, c: Vec3) -> f32 {
+        let ab = (b - a).length();
+        let bc = (c - b).length();
+        let ca = (a - c).length();
+        let ang = |opp: f32, x: f32, y: f32| -> f32 {
+            if x < 1e-9 || y < 1e-9 {
+                return 0.0;
+            }
+            (((x * x + y * y - opp * opp) / (2.0 * x * y)).clamp(-1.0, 1.0)).acos().to_degrees()
+        };
+        ang(bc, ab, ca).min(ang(ca, ab, bc)).min(ang(ab, bc, ca))
+    }
+
+    /// TRIANGLE-QUALITY ROOT-CAUSE HARNESS. Bakes a grid of LOD-0 terrain chunks off the PRODUCTION
+    /// (`generate`-filtered) surface and reports the min-interior-angle distribution + degenerate-triangle
+    /// fraction, correlated with the local surface slope `|∇h|` at each sliver. This answers the open
+    /// question driving the finalize-stage design: are the degenerate "spiky" ridges caused by SHARP
+    /// CREASES (high-frequency, fixed by band-limiting) or by STEEP FLANKS (low-frequency steepness, which
+    /// band-limiting can't fix)? It prints, for the ridge+erosion default AND a plain-fBm control, the
+    /// sliver count and the mean `|∇h|` of slivers vs the mesh overall. `#[ignore]` — measurement; run with
+    /// `--release --ignored --nocapture`.
+    #[test]
+    #[ignore = "triangle-quality measurement; run with --release --ignored --nocapture"]
+    fn terrain_triangle_quality_report() {
+        use crate::sdf_render::worldgen::layers::erosion::ErosionParams;
+        use crate::sdf_render::worldgen::layers::height::HeightParams;
+        use crate::sdf_render::worldgen::upload::{sample_clipmap_lod, set_cpu_height_clipmap};
+        use bevy::math::DVec2;
+
+        let seed = 7u64;
+        // Bake a grid of LOD-0 chunks. Span a WIDE region (≥ the fBm base wavelength) so it contains real
+        // ridge CRESTS (the ridge fold peaks where the base fBm crosses 0), not just one gentle hillside.
+        let (vs, sub) = (1.0f32, 32u32);
+        let span = sub as f32 * vs; // 32 m per chunk
+        // 26·32 = 832 m of baked terrain (> the 1536 m base wavelength's half-period, so it spans a ridge
+        // crest). Stays inside the published 8×8 height-chunk ring (−1..=6 = world [−128, 896) with margin
+        // on BOTH sides for the bake's ~1 m apron) — the ring is toroidal with `HEIGHT_RING_CHUNKS=8`, so
+        // chunk 7 would alias slot −1; the block must be ≤ 8 chunks per axis.
+        let chunks = 26i32;
+
+        // Curvature (Laplacian) of the height field at world (x,z) via central differences — the CREST
+        // detector: |∇²h| is large at a sharp ridge crest, ~0 on a smooth slope. Uses the same band-limited
+        // clipmap the bake reads, so it measures the crest the MESHER actually sees.
+        let curvature = |clip: &HeightClipmap, x: f32, z: f32| -> f32 {
+            use crate::sdf_render::worldgen::upload::sample_clipmap_lod;
+            let e = 2.0f32;
+            let h = |dx: f32, dz: f32| {
+                sample_clipmap_lod(clip, DVec2::new((x + dx) as f64, (z + dz) as f64), vs).height
+            };
+            ((h(e, 0.0) + h(-e, 0.0) + h(0.0, e) + h(0.0, -e) - 4.0 * h(0.0, 0.0)) / (e * e)).abs()
+        };
+
+        let report = |label: &str, params: HeightParams, erosion: ErosionParams| {
+            let clip = publish_generated_terrain_clipmap(-1..=6, -1..=6, seed, params, erosion);
+            let edit = terrain_edit_for_band(-2000.0, 2000.0);
+            let edits_v = [edit];
+            let idx = [0u32];
+
+            let mut angles: Vec<f32> = Vec::new();
+            // Per-triangle (min_angle°, normal_spread°, |∇²h|): min_angle = sliver test; normal_spread =
+            // max pairwise angle between the triangle's 3 vertex normals (the SHADING-discontinuity metric —
+            // a serrated crest has wildly disagreeing vertex normals); |∇²h| = crest-vs-slope classifier.
+            let mut tri_data: Vec<(f32, f32, f32)> = Vec::new();
+            // SPIKE metric: max per-vertex |vertex.y − true_surface_h(vertex.xz)| — distinguishes flat
+            // slivers (on the surface, ~0 dev) from actual displaced/spiked vertices (large dev).
+            let mut max_dev = 0.0f32;
+            for cz in 0..chunks {
+                for cx in 0..chunks {
+                    let ox = cx as f32 * span;
+                    let oz = cz as f32 * span;
+                    // Centre the Y window on the local surface so it crosses the chunk.
+                    let h_mid = sample_clipmap_lod(
+                        &clip,
+                        DVec2::new((ox + span * 0.5) as f64, (oz + span * 0.5) as f64),
+                        vs,
+                    )
+                    .height;
+                    let y_min = ((h_mid - span * 0.5) / vs).floor() * vs;
+                    let origin = Vec3::new(ox, y_min, oz);
+                    let Some(data) = mesh_chunk(&edits_v, &idx, origin, vs, sub, 0, 0, false, Some(clip.clone()), true)
+                    else {
+                        continue;
+                    };
+                    for &p in &data.positions {
+                        let w = Vec3::from(p) + origin;
+                        let h = sample_clipmap_lod(&clip, DVec2::new(w.x as f64, w.z as f64), vs).height;
+                        max_dev = max_dev.max((w.y - h).abs());
+                    }
+                    for t in data.indices.chunks_exact(3) {
+                        let vi = [t[0] as usize, t[1] as usize, t[2] as usize];
+                        let pos = |k: usize| Vec3::from(data.positions[vi[k]]) + origin;
+                        let (a, b, c) = (pos(0), pos(1), pos(2));
+                        let ang = tri_min_angle_deg(a, b, c);
+                        angles.push(ang);
+                        // Max pairwise angle between the 3 vertex normals (degrees) = shading discontinuity.
+                        let nrm = |k: usize| Vec3::from(data.normals[vi[k]]).normalize_or_zero();
+                        let (n0, n1, n2) = (nrm(0), nrm(1), nrm(2));
+                        let ang2 = |x: Vec3, y: Vec3| x.dot(y).clamp(-1.0, 1.0).acos().to_degrees();
+                        let nspread = ang2(n0, n1).max(ang2(n1, n2)).max(ang2(n2, n0));
+                        let cen = (a + b + c) / 3.0;
+                        tri_data.push((ang, nspread, curvature(&clip, cen.x, cen.z)));
+                    }
+                }
+            }
+            set_cpu_height_clipmap(None);
+
+            let n = angles.len().max(1);
+            let lt5 = angles.iter().filter(|&&a| a < 5.0).count();
+            // CREST vs SLOPE split: a triangle is "crest" if its centroid curvature is in the top quartile.
+            // Report BOTH sliver% (geometry) AND mean normal-spread° (shading) in each bin. The user's
+            // complaint is shading: normal-spread should be MUCH higher on crests, and the band-limit must
+            // bring it down.
+            let mut curvs: Vec<f32> = tri_data.iter().map(|&(_, _, c)| c).collect();
+            curvs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let q75 = curvs.get(curvs.len() * 3 / 4).copied().unwrap_or(0.0);
+            let (mut crest_n, mut crest_sliver, mut crest_nsp) = (0usize, 0usize, 0.0f64);
+            let (mut slope_n, mut slope_sliver, mut slope_nsp) = (0usize, 0usize, 0.0f64);
+            let mut worst_nsp = 0.0f32;
+            for &(ang, nsp, c) in &tri_data {
+                worst_nsp = worst_nsp.max(nsp);
+                if c >= q75 {
+                    crest_n += 1;
+                    crest_nsp += nsp as f64;
+                    if ang < 5.0 {
+                        crest_sliver += 1;
+                    }
+                } else {
+                    slope_n += 1;
+                    slope_nsp += nsp as f64;
+                    if ang < 5.0 {
+                        slope_sliver += 1;
+                    }
+                }
+            }
+            let pct = |a: usize, b: usize| 100.0 * a as f32 / b.max(1) as f32;
+            let mean = |s: f64, c: usize| s / c.max(1) as f64;
+            let crest_mean = mean(crest_nsp, crest_n);
+            println!(
+                "TRI-QUALITY [{label}]: tris={n} slivers<5°={:.2}% | \
+                 CREST(top-25%-curv): sliver%={:.2} normal_spread={crest_mean:.1}° | \
+                 SLOPE: sliver%={:.2} normal_spread={:.1}° | worst_normal_spread={worst_nsp:.1}° \
+                 (q75|∇²h|={q75:.3}) | max_surface_dev={max_dev:.3}m",
+                pct(lt5, n),
+                pct(crest_sliver, crest_n),
+                pct(slope_sliver, slope_n),
+                mean(slope_nsp, slope_n),
+            );
+            (crest_mean, worst_nsp) // (mean crest normal spread°, worst triangle normal spread°)
+        };
+
+        // Default (ridge + erosion ON) vs plain fBm control (no ridge, no erosion).
+        report("ridge+erosion", HeightParams::default(), ErosionParams::default());
+        report(
+            "plain-fbm",
+            HeightParams { ridge: 0.0, ..Default::default() },
+            ErosionParams { enabled: false, ..Default::default() },
+        );
+        // DENSE SHARP RIDGES: full ridge fold at a short wavelength (≈256 m) GUARANTEES several sharp crests
+        // inside the 832 m window — the crest path the default-seed region happened to miss. Compare the
+        // RAW crest (band_limit=0) against the band-limited finalize stage: the crest `normal_spread°` (the
+        // serrated-shading metric) must drop sharply, proving the fix.
+        let dense = |bl: f32| HeightParams {
+            ridge: 1.0,
+            base_freq: 1.0 / 256.0,
+            amplitude: 100.0,
+            octaves: 4,
+            band_limit: bl,
+            ..Default::default()
+        };
+        let off = ErosionParams { enabled: false, ..Default::default() };
+        let (raw_crest, raw_worst) = report("dense-ridge RAW (bl=0)", dense(0.0), off);
+        let (bl_crest, bl_worst) = report("dense-ridge BAND-LIMIT (bl=2)", dense(2.0), off);
+        // REGRESSION GUARD: the band-limit finalize stage must measurably reduce crest serration (both the
+        // mean crest normal-spread and the worst single-triangle spread). If a future change breaks the
+        // band-limit (or reverts it), these fail.
+        assert!(
+            bl_crest < raw_crest * 0.95,
+            "band-limit must reduce mean crest normal-spread: bl={bl_crest:.2}° vs raw={raw_crest:.2}°"
+        );
+        assert!(
+            bl_worst < raw_worst,
+            "band-limit must reduce worst crest normal-spread: bl={bl_worst:.1}° vs raw={raw_worst:.1}°"
+        );
+    }
+
     /// Bake a sphere ∪ cube (both centred at origin, so the solid is star-shaped about origin) in one chunk.
     /// `mat_s`/`mat_c` are the sphere/cube material ids. Returns the baked mesh + its world origin.
     fn merged_sphere_cube(mat_s: u16, mat_c: u16, smoothing: f32) -> (ChunkMeshData, Vec3) {

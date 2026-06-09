@@ -453,6 +453,13 @@ fn worldgen_panel(world: &mut World, ui: &mut bevy_egui::egui::Ui) {
         if ui.add(Slider::new(&mut sea_level, -200.0..=200.0).text("Sea level (m)")).changed() {
             world.resource_mut::<HeightParams>().sea_level = sea_level;
         }
+        let mut band_limit = p.band_limit;
+        if ui
+            .add(Slider::new(&mut band_limit, 0.0..=4.0).text("Crest band-limit (node radii)"))
+            .changed()
+        {
+            world.resource_mut::<HeightParams>().band_limit = band_limit;
+        }
     });
 
     // ---- Erosion group ----

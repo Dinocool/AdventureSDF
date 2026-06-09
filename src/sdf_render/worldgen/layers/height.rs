@@ -16,22 +16,13 @@ use super::erosion::{ErosionParams, erode_with_grad};
 /// Bump when the height layer's *output* intentionally changes (algorithm/constants). It keys the
 /// disk cache (WORLD_GEN_PLAN §2.3) and the parity reference vectors — a change here forces
 /// regenerating reference values, making "I meant to change the terrain" explicit and review-visible.
-pub const HEIGHT_GEN_VERSION: u32 = 4;
+pub const HEIGHT_GEN_VERSION: u32 = 5;
 
 /// Chunk edge in base cells (= metres) for the height layer's tier.
 pub const HEIGHT_CHUNK_CELLS: u32 = 128;
 /// Cells per axis the height field is sampled at within a chunk (nodes = res + 1). `128 / 64 = 2 m`
 /// node spacing — the authoritative base resolution; the GPU adds finer cosmetic detail on top.
 pub const HEIGHT_FIELD_RES: u32 = 64;
-
-/// ANTI-ALIAS supersample factor per axis used by [`HeightLayer::generate`] when sharp features are
-/// present (ridge fold / erosion). The ridge fold `1−|fbm|` and erosion creases are INFINITELY sharp
-/// (sub-node), so POINT-sampling them at the node grid ALIASES the crest — captured only where a node
-/// lands on it → the mesh renders degenerate SPIKES. Box-filtering each node over its cell with an
-/// `N×N` grid band-limits those creases to the node Nyquist, so the mesh sees a clean representable
-/// ridge. The `N²` cost is paid ONCE per node into the CACHED artifact (reused by every bake sample —
-/// generation is separate from sampling), so it's fully amortised. Plain fBm (smooth) skips this.
-pub const HEIGHT_GEN_SUPERSAMPLE: u32 = 3;
 
 /// Editor-tweakable height-layer parameters (mirrors the `SdfRaymarchParams` reflected-resource
 /// idiom). A change dirties the layer → regen cascade (handled by the manager).
@@ -55,6 +46,16 @@ pub struct HeightParams {
     /// band-limited; the fold's gradient is taken CLOSED-FORM (value-noise gradient + base Hessian) in
     /// `sample_world` / `carved_grad` — no central difference.
     pub ridge: f32,
+    /// SURFACE BAND-LIMIT radius, in node spacings — the single finalize stage applied over the WHOLE
+    /// composed surface (fBm + ridge + erosion + any future layer) in [`HeightLayer::generate`]. A sharp
+    /// ridge crest is a sub-voxel-sharp convex crease that the regular Transvoxel grid can't represent
+    /// (→ torn/degenerate triangles) and whose gradient flips at the crest (→ serrated normals). A
+    /// separable TENT low-pass of this radius rounds the crest over `~2·radius` nodes so it becomes
+    /// grid-representable AND its gradient transition smooths — fixing both the shapes and the shading at
+    /// once. Filters height AND gradient with the SAME kernel, so the stored gradient stays the exact
+    /// gradient of the band-limited height (`∇(K∗h) = K∗∇h`). `0` = no band-limit (point sample); higher
+    /// = rounder crests (the editor slider). Bit-portable (rational tent weights, no transcendentals).
+    pub band_limit: f32,
     /// Per-layer salt mixed with the world seed so this layer has an independent stream.
     pub seed_salt: u32,
 }
@@ -73,6 +74,9 @@ impl Default for HeightParams {
             amplitude: 280.0,
             sea_level: 0.0,
             ridge: 0.5,
+            // Round sharp crests over ~3 nodes (≈6 m at tier 0) so the Transvoxel grid meshes them with
+            // well-formed triangles and continuous normals. Tunable live via the World Gen panel.
+            band_limit: 1.5,
             seed_salt: 0,
         }
     }
@@ -243,43 +247,114 @@ impl Layer for HeightLayer {
     fn generate(&self, ctx: &GenCtx, out: &mut GenOutput) {
         let res = HEIGHT_FIELD_RES;
         let mut field = ScalarField2D::zeroed(ctx.coord, ctx.size, res);
-        // ANTI-ALIAS: with the ridge fold / erosion the surface has infinitely-sharp creases — point
-        // sampling them at the node grid ALIASES the crest into degenerate mesh spikes. Box-filter each
-        // node over its own cell (an `N×N` grid centred on the node, ±½ spacing) to band-limit those
-        // creases to the node Nyquist. The filter is a pure function of (world position, spacing), centred
-        // and symmetric, so a chunk's far-edge APRON node box-filters the SAME world point as the
-        // neighbour's near node ⇒ still seam-free. Plain fBm (smooth, no ridge/erosion) needs no AA → the
-        // single-sample fast path. The `N²` cost is paid ONCE per node into the CACHED artifact (reused by
-        // every bake sample), so it never touches the per-sample hot path.
-        let aa = if self.params.ridge != 0.0 || self.erosion.enabled { HEIGHT_GEN_SUPERSAMPLE.max(1) } else { 1 };
-        let spacing = field.node_spacing;
-        for j in 0..=res {
-            for i in 0..=res {
-                let wp = field.node_world_xz(i, j); // DVec2(world_x, world_z)
-                if aa == 1 {
+
+        // SURFACE BAND-LIMIT — the single finalize stage over the WHOLE composed surface. A sharp ridge
+        // crest / erosion crease is sub-voxel-sharp: point-sampling it at the node grid ALIASES it into
+        // degenerate mesh triangles AND a discontinuous (serrated) gradient. A separable TENT low-pass of
+        // radius `band_limit` nodes rounds it so it's grid-representable with continuous normals. Disabled
+        // (`band_limit == 0`) OR a smooth field (plain fBm, no ridge/erosion) ⇒ the single-tap fast path.
+        let sharp = self.params.ridge != 0.0 || self.erosion.enabled;
+        let radius = if sharp { self.params.band_limit.max(0.0) } else { 0.0 };
+        if radius <= 0.0 {
+            for j in 0..=res {
+                for i in 0..=res {
+                    let wp = field.node_world_xz(i, j);
                     field.set(i, j, self.sample_world(wp.x, wp.y, ctx.seed));
-                    continue;
                 }
-                let (mut h, mut gx, mut gz) = (0.0f64, 0.0f64, 0.0f64);
-                for sj in 0..aa {
-                    for si in 0..aa {
-                        let ox = ((si as f64 + 0.5) / aa as f64 - 0.5) * spacing;
-                        let oz = ((sj as f64 + 0.5) / aa as f64 - 0.5) * spacing;
-                        let n = self.sample_world(wp.x + ox, wp.y + oz, ctx.seed);
-                        h += n.height as f64;
-                        gx += n.dh_dx as f64;
-                        gz += n.dh_dz as f64;
-                    }
-                }
-                let inv = 1.0 / (aa * aa) as f64;
-                field.set(i, j, HeightNode {
-                    height: (h * inv) as f32,
-                    dh_dx: (gx * inv) as f32,
-                    dh_dz: (gz * inv) as f32,
-                });
+            }
+            out.produce(Self::OUTPUT, field);
+            return;
+        }
+        self.generate_band_limited(ctx, &mut field, radius);
+        out.produce(Self::OUTPUT, field);
+    }
+}
+
+impl HeightLayer {
+    /// Apply the separable TENT band-limit (radius in node spacings) over the chunk's node grid, writing
+    /// the low-passed `(h, dh/dx, dh/dz)` into `field`. The KEY properties:
+    ///
+    /// - **Seam-free**: it resamples the world-anchored, continuous [`sample_world`] on a FINE grid that
+    ///   extends an APRON of `⌈radius⌉` nodes past every chunk edge, with a symmetric kernel — so a chunk's
+    ///   boundary node convolves the identical world samples as the neighbour's, bit-for-bit (the §10
+    ///   padding-correctness property, asserted by `adjacent_chunks_agree_on_shared_boundary`).
+    /// - **Gradient-consistent**: height AND gradient are filtered by the SAME kernel; since convolution
+    ///   commutes with differentiation (`∇(K∗h) = K∗∇h`), the stored gradient stays the exact gradient of
+    ///   the band-limited height — so the terrain normals the bake reconstructs from it match the meshed
+    ///   surface (no shading/geometry mismatch).
+    /// - **Bit-portable**: the tent weights are rationals (`(K+1−|t|)/(K+1)²`) and the accumulation order
+    ///   is fixed — no transcendentals, no fast-math — so shared-seed clients agree (the parity contract).
+    /// - **Cheap**: `sample_world` is evaluated once per apron-padded NODE (`(res+2·apron+1)²` ≈ the plain
+    ///   point-sample count, NOT a multiple of it — the analytic field needs no supersampling), with
+    ///   precomputed tent weights and a separable two-pass convolution. Far below the old 9× box supersample.
+    fn generate_band_limited(&self, ctx: &GenCtx, field: &mut ScalarField2D, radius: f32) {
+        // Sample at NODE resolution (no sub-node supersampling): `sample_world` returns ANALYTIC values +
+        // gradients, so there's no finite-difference aliasing to supersample away — a tent average of the
+        // analytic field over `±kf` nodes IS the band-limit. This keeps the `sample_world` count at
+        // `~(res+2·apron)²` (≈ the plain point-sample count), not a multiple of it.
+        let res = HEIGHT_FIELD_RES as i32;
+        let spacing = field.node_spacing; // already f64
+        let kf = radius.ceil() as i32; // tent half-width, in nodes
+        let ap = kf; // apron = kernel support (seam-free: a boundary node reads only genuine apron samples)
+
+        // PRECOMPUTED tent weights `(K+1−|t|)/(K+1)²` over `t ∈ [−kf, kf]` — bit-portable rationals summing
+        // to 1, computed ONCE (not a division per tap, which dominated the old cost).
+        let denom = ((kf + 1) * (kf + 1)) as f64;
+        let w: Vec<f64> = (-kf..=kf).map(|t| (((kf + 1) - t.abs()) as f64) / denom).collect();
+
+        let npa = (res + 2 * ap + 1) as usize; // node samples per axis incl. apron
+        let n00 = field.node_world_xz(0, 0); // chunk's mip-0 node (0,0) world XZ
+        let ox = n00.x - ap as f64 * spacing;
+        let oz = n00.y - ap as f64 * spacing;
+
+        // Sample the composed surface at every (apron-padded) node position — packed `[h, gx, gz]`.
+        let count = npa * npa;
+        let mut grid = vec![[0.0f64; 3]; count];
+        for gz in 0..npa {
+            let wz = oz + gz as f64 * spacing;
+            for gx in 0..npa {
+                let n = self.sample_world(ox + gx as f64 * spacing, wz, ctx.seed);
+                grid[gz * npa + gx] = [n.height as f64, n.dh_dx as f64, n.dh_dz as f64];
             }
         }
-        out.produce(Self::OUTPUT, field);
+
+        // Separable pass 1 — convolve along X into a temporary (edges clamp but are never read by node
+        // positions, which sit `ap = kf` samples in from each edge ⇒ node results only ever read genuine
+        // apron samples, never a clamped value ⇒ seam-free).
+        let mut tx = vec![[0.0f64; 3]; count];
+        for gz in 0..npa {
+            let row = gz * npa;
+            for gx in 0..npa {
+                let mut acc = [0.0f64; 3];
+                for (wi, t) in (-kf..=kf).enumerate() {
+                    let sx = (gx as i32 + t).clamp(0, npa as i32 - 1) as usize;
+                    let s = grid[row + sx];
+                    let ww = w[wi];
+                    acc[0] += s[0] * ww;
+                    acc[1] += s[1] * ww;
+                    acc[2] += s[2] * ww;
+                }
+                tx[row + gx] = acc;
+            }
+        }
+
+        // Separable pass 2 — convolve along Z, evaluated ONLY at node positions. Node (i,j) ↔ grid (i+ap, j+ap).
+        for j in 0..=HEIGHT_FIELD_RES {
+            let gz0 = j as i32 + ap;
+            for i in 0..=HEIGHT_FIELD_RES {
+                let gx = (i as i32 + ap) as usize;
+                let mut acc = [0.0f64; 3];
+                for (wi, t) in (-kf..=kf).enumerate() {
+                    let sz = (gz0 + t).clamp(0, npa as i32 - 1) as usize;
+                    let s = tx[sz * npa + gx];
+                    let ww = w[wi];
+                    acc[0] += s[0] * ww;
+                    acc[1] += s[1] * ww;
+                    acc[2] += s[2] * ww;
+                }
+                field.set(i, j, HeightNode { height: acc[0] as f32, dh_dx: acc[1] as f32, dh_dz: acc[2] as f32 });
+            }
+        }
     }
 }
 
@@ -323,13 +398,16 @@ mod tests {
         }
     }
 
-    /// With ridge/erosion on, `generate` ANTI-ALIASES: each node is the `N×N` box-filter average over its
-    /// cell (band-limiting the sharp crest), NOT the raw point sample — and it stays a seam-free pure
-    /// function of world position (asserted by `adjacent_chunks_agree_on_shared_boundary` below, which
-    /// uses the AA `layer()`).
+    /// With ridge/erosion on, `generate` BAND-LIMITS the composed surface (the finalize tent low-pass): a
+    /// node is a CONVEX COMBINATION (weighted average) of `sample_world` over its kernel neighbourhood, so
+    /// it (a) differs from the raw point sample (the low-pass is doing something) and (b) lies within the
+    /// local [min, max] of the surface (a low-pass can never overshoot — the property that rounds the sharp
+    /// crest instead of spiking it). Seam-freeness is asserted separately by
+    /// `adjacent_chunks_agree_on_shared_boundary` (which uses this same `layer()`).
     #[test]
-    fn generate_anti_aliases_sharp_features() {
-        let l = layer(); // default: ridge + erosion ⇒ aa > 1
+    fn generate_band_limits_sharp_features() {
+        let l = layer(); // default: ridge + erosion + band_limit > 0
+        assert!(l.params.band_limit > 0.0, "default layer must band-limit");
         let coord = ChunkCoord::new(l.id(), IVec3::new(1, 0, -2));
         let ctx = GenCtx { coord, seed: 7, size: l.chunk_size() };
         let mut out = GenOutput::default();
@@ -337,27 +415,28 @@ mod tests {
         let field = out.take::<ScalarField2D>(HeightLayer::OUTPUT).unwrap();
         let (i, j) = (10u32, 20u32);
         let wp = field.node_world_xz(i, j);
-        // Recompute the expected box-filter average independently.
-        let aa = HEIGHT_GEN_SUPERSAMPLE;
-        let spacing = field.node_spacing;
-        let (mut h, mut gx, mut gz) = (0.0f64, 0.0f64, 0.0f64);
-        for sj in 0..aa {
-            for si in 0..aa {
-                let ox = ((si as f64 + 0.5) / aa as f64 - 0.5) * spacing;
-                let oz = ((sj as f64 + 0.5) / aa as f64 - 0.5) * spacing;
-                let n = l.sample_world(wp.x + ox, wp.y + oz, ctx.seed);
-                h += n.height as f64;
-                gx += n.dh_dx as f64;
-                gz += n.dh_dz as f64;
+        let node = field.node(i, j);
+        assert!(node.height.is_finite() && node.dh_dx.is_finite() && node.dh_dz.is_finite());
+
+        // Bound the band-limited node by the local surface range over the kernel footprint (±radius nodes).
+        let spacing = field.node_spacing; // already f64
+        let r = l.params.band_limit.ceil() as i32;
+        let (mut lo, mut hi) = (f32::INFINITY, f32::NEG_INFINITY);
+        for sj in -r..=r {
+            for si in -r..=r {
+                let s = l.sample_world(wp.x + si as f64 * spacing, wp.y + sj as f64 * spacing, ctx.seed);
+                lo = lo.min(s.height);
+                hi = hi.max(s.height);
             }
         }
-        let inv = 1.0 / (aa * aa) as f64;
-        let node = field.node(i, j);
-        assert!((node.height - (h * inv) as f32).abs() < 1e-3, "node is the box-filter average");
-        assert!((node.dh_dx - (gx * inv) as f32).abs() < 1e-3);
-        // And it actually differs from the raw point sample (AA is doing something).
+        assert!(
+            node.height >= lo - 1e-2 && node.height <= hi + 1e-2,
+            "band-limited node {} must lie within local surface range [{lo}, {hi}] (a low-pass can't overshoot)",
+            node.height,
+        );
+        // And it actually differs from the raw point sample (the band-limit is active).
         let point = l.sample_world(wp.x, wp.y, ctx.seed);
-        assert_ne!(node.height.to_bits(), point.height.to_bits(), "AA node differs from the point sample");
+        assert_ne!(node.height.to_bits(), point.height.to_bits(), "band-limited node differs from point sample");
     }
 
     /// Seam-free across a chunk boundary: the far apron node of chunk C equals the near node of chunk
@@ -493,6 +572,45 @@ mod tests {
             fd_ns / analytic_ns
         );
         assert!(analytic_ns < fd_ns, "analytic must be faster than the 5-tap FD");
+    }
+
+    /// GEN-PERF: full-chunk [`HeightLayer::generate`] cost — the band-limit finalize stage vs the plain
+    /// point-sample fast path — plus the `sample_world` call count each makes. `#[ignore]` — run with
+    /// `--release --ignored --nocapture`. Confirms the separable band-limit is NOT a gen-perf regression:
+    /// it evaluates `sample_world` once per FINE sample (`((res+2·apron)·D+1)²`, independent of kernel
+    /// radius), which for the default radius is COMPARABLE to (and below the old 9× box supersample's)
+    /// `9·(res+1)²` — the convolution itself is cheap float work on the cached grid.
+    #[test]
+    #[ignore = "gen-perf bench; run with --release --ignored --nocapture"]
+    fn bench_generate_chunk() {
+        let coord = ChunkCoord::new(LayerId(0), IVec3::new(3, 0, -5));
+        let seed = 4242u64;
+        let nodes = ((HEIGHT_FIELD_RES + 1) * (HEIGHT_FIELD_RES + 1)) as f64;
+
+        let run = |label: &str, l: &HeightLayer| {
+            let size = l.chunk_size();
+            // Warm + timed runs (generate allocates the fine grid; amortise the allocator).
+            for _ in 0..2 {
+                let mut o = GenOutput::default();
+                l.generate(&GenCtx { coord, seed, size }, &mut o);
+            }
+            let reps = 8;
+            let t = std::time::Instant::now();
+            for _ in 0..reps {
+                let mut o = GenOutput::default();
+                l.generate(&GenCtx { coord, seed, size }, &mut o);
+            }
+            let us = t.elapsed().as_micros() as f64 / reps as f64;
+            eprintln!("GEN-PERF [{label}]: {us:.0} µs/chunk ({:.1} ns/node)", us * 1000.0 / nodes);
+            us
+        };
+
+        let band = run("band-limit (default)", &layer());
+        let plain = run("plain point-sample", &plain_layer());
+        // The old box supersample evaluated `sample_world` 9× per node; the band-limit's fine grid is fewer
+        // evals than that, so the band-limit must stay within a small multiple of the plain path (NOT the
+        // ~9× the old supersample cost). Generous bound — this is a regression tripwire, not a tight gate.
+        assert!(band < plain * 6.0, "band-limit gen {band:.0}µs must stay well under 9× plain {plain:.0}µs");
     }
 
     /// With erosion disabled AND `ridge == 0`, `sample_world` takes the exact analytic fBm path — its

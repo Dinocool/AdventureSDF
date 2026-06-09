@@ -737,6 +737,7 @@ pub fn terrain_normal(p: bevy::math::Vec3, voxel_size: f32) -> Option<bevy::math
 ///   over-estimates the true distance on a steep slope (Lipschitz `√(1+|∇h|²)≫1`), which makes the
 ///   narrow-band cull (`mesh_bake::chunk_has_surface`) false-drop steep chunks → HOLES. The normalised
 ///   form is a first-order TRUE distance (Lipschitz ≤ 1) so the cull's `|dist| ≤ circumradius` is accurate.
+///
 /// The bake and the cull are different phases (the bake installs a per-bake snapshot, the cull/picking
 /// don't — see `terrain_sdf`), so each gets the form it needs without affecting the other.
 #[inline]
