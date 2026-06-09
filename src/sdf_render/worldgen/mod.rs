@@ -13,11 +13,13 @@
 
 pub mod artifact;
 pub mod coord;
+pub mod graph;
 pub mod layer;
 pub mod layers;
 pub mod manager;
 pub mod noise;
 pub mod plan;
+pub mod spline;
 pub mod store;
 pub mod upload;
 
