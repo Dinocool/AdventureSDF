@@ -1,0 +1,115 @@
+GraphAsset(
+  graph: Graph(
+    nodes: [
+      Node(
+        kind: Fbm(FbmAxis(
+          octaves: 2,
+          base_freq: 0.000125,
+          lacunarity: 2.0,
+          gain: 0.5,
+          amplitude: 1.0,
+          seed_salt: 5,
+        )),
+        inputs: (0, 0, 0),
+      ),
+      Node(
+        kind: Fbm(FbmAxis(
+          octaves: 2,
+          base_freq: 0.00014285714285714287,
+          lacunarity: 2.0,
+          gain: 0.5,
+          amplitude: 1.0,
+          seed_salt: 6,
+        )),
+        inputs: (0, 0, 0),
+      ),
+      Node(
+        kind: Fbm(FbmAxis(
+          octaves: 2,
+          base_freq: 0.00015384615384615385,
+          lacunarity: 2.0,
+          gain: 0.5,
+          amplitude: 1.0,
+          seed_salt: 7,
+        )),
+        inputs: (0, 0, 0),
+      ),
+      Node(
+        kind: Fbm(FbmAxis(
+          octaves: 2,
+          base_freq: 0.0002,
+          lacunarity: 2.0,
+          gain: 0.5,
+          amplitude: 1.0,
+          seed_salt: 8,
+        )),
+        inputs: (0, 0, 0),
+      ),
+      Node(
+        kind: Fbm(FbmAxis(
+          octaves: 4,
+          base_freq: 0.002,
+          lacunarity: 2.0,
+          gain: 0.5,
+          amplitude: 30.0,
+          seed_salt: 11,
+        )),
+        inputs: (0, 0, 0),
+      ),
+      Node(
+        kind: Scale(25.0),
+        inputs: (0, 0, 0),
+      ),
+      Node(
+        kind: Add,
+        inputs: (4, 5, 0),
+      ),
+      Node(
+        kind: Fbm(FbmAxis(
+          octaves: 5,
+          base_freq: 0.0007692307692307692,
+          lacunarity: 2.0,
+          gain: 0.5,
+          amplitude: 1.0,
+          seed_salt: 12,
+        )),
+        inputs: (0, 0, 0),
+      ),
+      Node(
+        kind: Ridge(
+          ridge: 0.9,
+          amp_sum: 2.0,
+        ),
+        inputs: (7, 0, 0),
+      ),
+      Node(
+        kind: Scale(620.0),
+        inputs: (8, 0, 0),
+      ),
+      Node(
+        kind: Scale(220.0),
+        inputs: (0, 0, 0),
+      ),
+      Node(
+        kind: Add,
+        inputs: (9, 10, 0),
+      ),
+      Node(
+        kind: Offset(80.0),
+        inputs: (11, 0, 0),
+      ),
+      Node(
+        kind: Smoothstep(
+          edge0: 0.0,
+          edge1: 0.5,
+        ),
+        inputs: (0, 0, 0),
+      ),
+      Node(
+        kind: Mix,
+        inputs: (6, 12, 13),
+      ),
+    ],
+    output: 14,
+  ),
+)
