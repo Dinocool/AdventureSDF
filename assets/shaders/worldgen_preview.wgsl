@@ -1,18 +1,142 @@
-// Worldgen node-preview GPU raymarch — STAGE 1 placeholder.
-// Renders a UV gradient to prove the custom-material → offscreen → egui pipeline works end to end.
-// Stage 3 replaces the body with a heightfield raymarch (sampling a CPU-baked height+normal texture).
+// Worldgen node-preview GPU raymarch (stages 2-3).
+//
+// The CPU bakes the graph's height + analytic normal into `height_tex` (R = height m, GBA = normal),
+// the single Graph::eval source of truth — NO noise is re-implemented here. This shader only raymarches
+// that heightfield with the orbit camera in `params`, so rotating is pure-GPU (rebake only on edit/zoom).
 
 #import bevy_pbr::forward_io::VertexOutput
 
 struct PreviewParams {
-    // Stage 1: only `tint` is used (a constant blue channel). Stage 3 adds camera/zoom/levels.
-    tint: vec4<f32>,
+    eye: vec4<f32>,    // xyz = camera eye,  w = image-plane tan
+    fwd: vec4<f32>,    // xyz = forward,     w = world half-extent (m)
+    right: vec4<f32>,  // xyz = right,       w = height min (m)
+    up: vec4<f32>,     // xyz = up,          w = height max (m)
+    levels: vec4<f32>, // sea, snow, water-depth, res(px)
 };
 
 @group(#{MATERIAL_BIND_GROUP}) @binding(0) var<uniform> params: PreviewParams;
+@group(#{MATERIAL_BIND_GROUP}) @binding(1) var height_tex: texture_2d<f32>;
+
+// Manual bilinear fetch (textureLoad needs no filterable format → portable for Rgba32Float).
+fn sample_hf(uv: vec2<f32>) -> vec4<f32> {
+    let res = params.levels.w;
+    let p = clamp(uv, vec2<f32>(0.0), vec2<f32>(1.0)) * (res - 1.0);
+    let i0 = floor(p);
+    let f = p - i0;
+    let x0 = i32(i0.x);
+    let y0 = i32(i0.y);
+    let x1 = min(x0 + 1, i32(res) - 1);
+    let y1 = min(y0 + 1, i32(res) - 1);
+    let a = textureLoad(height_tex, vec2<i32>(x0, y0), 0);
+    let b = textureLoad(height_tex, vec2<i32>(x1, y0), 0);
+    let c = textureLoad(height_tex, vec2<i32>(x0, y1), 0);
+    let d = textureLoad(height_tex, vec2<i32>(x1, y1), 0);
+    return mix(mix(a, b, f.x), mix(c, d, f.x), f.y);
+}
+
+// Height + normal at a world XZ position (within the baked ±half window).
+fn hf_at(world_xz: vec2<f32>) -> vec4<f32> {
+    let half = params.fwd.w;
+    let uv = (world_xz + vec2<f32>(half)) / (2.0 * half);
+    return sample_hf(uv);
+}
+
+// Slab ray–AABB → (tmin, tmax); .z < 0 means miss.
+fn ray_box(o: vec3<f32>, d: vec3<f32>, bmin: vec3<f32>, bmax: vec3<f32>) -> vec3<f32> {
+    let inv = 1.0 / d;
+    let t1 = (bmin - o) * inv;
+    let t2 = (bmax - o) * inv;
+    let tmn = max(max(min(t1.x, t2.x), min(t1.y, t2.y)), min(t1.z, t2.z));
+    let tmx = min(min(max(t1.x, t2.x), max(t1.y, t2.y)), max(t1.z, t2.z));
+    if (tmx >= max(tmn, 0.0)) { return vec3<f32>(tmn, tmx, 1.0); }
+    return vec3<f32>(0.0, 0.0, -1.0);
+}
+
+// Absolute-height + sea-level colour ramp (mirrors the CPU height_color_rgb).
+fn land_ramp(t: f32) -> vec3<f32> {
+    let beach = vec3<f32>(0.76, 0.70, 0.50);
+    let grass = vec3<f32>(0.24, 0.55, 0.35);
+    let hill = vec3<f32>(0.36, 0.45, 0.26);
+    let rock = vec3<f32>(0.48, 0.42, 0.36);
+    let snow = vec3<f32>(0.95, 0.95, 0.97);
+    if (t < 0.12) { return mix(beach, grass, t / 0.12); }
+    if (t < 0.45) { return mix(grass, hill, (t - 0.12) / 0.33); }
+    if (t < 0.72) { return mix(hill, rock, (t - 0.45) / 0.27); }
+    return mix(rock, snow, clamp((t - 0.72) / 0.28, 0.0, 1.0));
+}
+
+fn height_colour(h: f32) -> vec3<f32> {
+    let sea = params.levels.x;
+    let snow = params.levels.y;
+    let depth = params.levels.z;
+    if (h < sea) {
+        let t = clamp((sea - h) / depth, 0.0, 1.0);
+        return mix(vec3<f32>(0.30, 0.52, 0.68), vec3<f32>(0.05, 0.12, 0.32), t);
+    }
+    return land_ramp(clamp((h - sea) / (snow - sea), 0.0, 1.0));
+}
+
+fn sky(ndcy: f32) -> vec3<f32> {
+    let t = clamp(ndcy * 0.5 + 0.5, 0.0, 1.0);
+    return mix(vec3<f32>(0.12, 0.15, 0.22), vec3<f32>(0.27, 0.36, 0.52), t);
+}
 
 @fragment
 fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
-    // UV gradient: red across, green up, blue from the uniform — a recognisable checkpoint pattern.
-    return vec4<f32>(in.uv.x, in.uv.y, params.tint.b, 1.0);
+    let ndcx = in.uv.x * 2.0 - 1.0;
+    let ndcy = 1.0 - in.uv.y * 2.0; // uv.y grows downward → flip so +y is up
+    let tan = params.eye.w;
+    let eye = params.eye.xyz;
+    let dir = normalize(params.fwd.xyz + params.right.xyz * (ndcx * tan) + params.up.xyz * (ndcy * tan));
+
+    let half = params.fwd.w;
+    let ymin = params.right.w;
+    let ymax = params.up.w;
+    let span = max(ymax - ymin, 1.0);
+    let pad = span * 0.08 + 1.0;
+    let bmin = vec3<f32>(-half, ymin - pad, -half);
+    let bmax = vec3<f32>(half, ymax + pad, half);
+
+    let hit = ray_box(eye, dir, bmin, bmax);
+    if (hit.z < 0.0) {
+        return vec4<f32>(sky(ndcy), 1.0);
+    }
+
+    // Adaptive (sphere-trace-like) heightfield march between the box entry/exit.
+    let t0 = max(hit.x, 0.0);
+    let t1 = hit.y;
+    let descent = max(-dir.y, 0.05);
+    let min_step = max((t1 - t0) / 4096.0, 0.05);
+    var t = t0;
+    var p = eye + dir * t;
+    var a_prev = p.y - hf_at(p.xz).x;
+    let light = normalize(vec3<f32>(0.4, 0.85, 0.3));
+
+    for (var i = 0; i < 256; i = i + 1) {
+        if (t >= t1) { break; }
+        let step = max((max(a_prev, 0.0) / descent) * 0.5, min_step);
+        let tn = min(t + step, t1);
+        let pn = eye + dir * tn;
+        let a_n = pn.y - hf_at(pn.xz).x;
+        if (a_n <= 0.0 && a_prev > 0.0) {
+            // Bisect the crossing.
+            var lo = t;
+            var hi = tn;
+            for (var k = 0; k < 16; k = k + 1) {
+                let m = (lo + hi) * 0.5;
+                let pm = eye + dir * m;
+                if (pm.y - hf_at(pm.xz).x > 0.0) { lo = m; } else { hi = m; }
+            }
+            let pm = eye + dir * ((lo + hi) * 0.5);
+            let s = hf_at(pm.xz);
+            let n = normalize(s.yzw);
+            let lamb = clamp(dot(n, light), 0.0, 1.0);
+            let col = height_colour(s.x) * (0.28 + 0.72 * lamb);
+            return vec4<f32>(col, 1.0);
+        }
+        a_prev = a_n;
+        t = tn;
+        p = pn;
+    }
+    return vec4<f32>(sky(ndcy), 1.0);
 }
