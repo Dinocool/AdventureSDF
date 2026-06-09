@@ -729,14 +729,19 @@ pub fn set_bake_terrain(clipmap: Option<Arc<HeightClipmap>>, offset: bevy::math:
 pub fn terrain_sdf(p: bevy::math::Vec3, voxel_size: f32, max_height: f32) -> f32 {
     BAKE_TERRAIN.with(|tl| {
         if let Some((clipmap, offset)) = tl.borrow().as_ref() {
+            // A per-bake snapshot is installed ⇒ this is the MESH BAKE marching the field → RAW `p.y − h`
+            // (stable Transvoxel crossing solve; the Lipschitz form goes near-zero on a sharp ridge → spiky
+            // sliver triangles). `normalize = false`.
             let world_xz = DVec2::new((p.x + offset.x) as f64, (p.z + offset.y) as f64);
-            return terrain_height_to_sdf(clipmap, p.y, world_xz, voxel_size, max_height);
+            return terrain_height_to_sdf(clipmap, p.y, world_xz, voxel_size, max_height, false);
         }
-        // No per-bake snapshot installed (picking/classification/tests) → read the process-global.
+        // No per-bake snapshot installed (the narrow-band CULL / picking / classification / tests) → read
+        // the process-global and use the LIPSCHITZ-NORMALISED true distance (`normalize = true`) so the
+        // cull's `|dist| ≤ circumradius` doesn't false-drop steep chunks → no holes.
         let offset = cpu_terrain_offset();
         let world_xz = DVec2::new((p.x + offset.x) as f64, (p.z + offset.y) as f64);
         match cpu_height_clipmap() {
-            Some(clipmap) => terrain_height_to_sdf(&clipmap, p.y, world_xz, voxel_size, max_height),
+            Some(clipmap) => terrain_height_to_sdf(&clipmap, p.y, world_xz, voxel_size, max_height, true),
             None if voxel_size > 0.0 => panic!(
                 "terrain sampled outside loaded coverage — a rendering bake (voxel_size={voxel_size}) ran \
                  before any height clipmap was built; the coverage gate should have prevented this. \
@@ -771,14 +776,18 @@ pub fn terrain_normal(p: bevy::math::Vec3, voxel_size: f32) -> Option<bevy::math
 
 /// Strict/try clipmap sample → signed Terrain field; a non-rendering miss is empty space.
 ///
-/// LIPSCHITZ-NORMALISED: the raw vertical gap `p.y − h` has Lipschitz constant `√(1+|∇h|²)` — on a steep
-/// slope (the eroded gullies/ridges) it badly OVER-estimates the true distance to the surface. The
-/// mesh-bake's narrow-band cull (`mesh_bake::chunk_has_surface`) compares `|dist|` to a chunk's
-/// circumradius to decide whether to bake; an over-estimated distance makes it false-drop chunks the
-/// steep surface actually crosses → HOLES in the terrain. Dividing by `√(1 + dh/dx² + dh/dz²)` (the
-/// gradient the node already carries) makes it a first-order TRUE distance (Lipschitz ≤ 1), so the cull
-/// is accurate again — and the zero-crossing (the surface itself) is UNCHANGED (a positive scale). This
-/// mirrors the GPU bake's `p.y − h` Lipschitz normalisation.
+/// `normalize` selects between two forms of the SAME zero-crossing (the surface is identical either way):
+/// - `false` (the MESH BAKE path): the RAW vertical gap `p.y − h`. The bake MARCHES this — and raw is the
+///   STABLE field for the Transvoxel edge-crossing solve. On an extremely sharp ridge `|∇h|` spikes, so the
+///   normalised form below goes near-zero over a band around the crest, making the crossing solve
+///   `t = fₐ/(fₐ−f_b)` ill-conditioned → vertices land erratically → degenerate SPIKY/sliver triangles. Raw
+///   `p.y − h` (smooth at the band-limited node scale) marches the sharp ridge cleanly, preserving it.
+/// - `true` (the CULL / picking path): LIPSCHITZ-NORMALISED `(p.y − h) / √(1+|∇h|²)`. Raw `p.y − h`
+///   over-estimates the true distance on a steep slope (Lipschitz `√(1+|∇h|²)≫1`), which makes the
+///   narrow-band cull (`mesh_bake::chunk_has_surface`) false-drop steep chunks → HOLES. The normalised
+///   form is a first-order TRUE distance (Lipschitz ≤ 1) so the cull's `|dist| ≤ circumradius` is accurate.
+/// The bake and the cull are different phases (the bake installs a per-bake snapshot, the cull/picking
+/// don't — see `terrain_sdf`), so each gets the form it needs without affecting the other.
 #[inline]
 fn terrain_height_to_sdf(
     clipmap: &HeightClipmap,
@@ -786,16 +795,22 @@ fn terrain_height_to_sdf(
     world_xz: DVec2,
     voxel_size: f32,
     max_height: f32,
+    normalize: bool,
 ) -> f32 {
-    let normalised = |node: HeightNode| -> f32 {
-        let lip = (1.0 + node.dh_dx * node.dh_dx + node.dh_dz * node.dh_dz).sqrt();
-        (p_y - node.height) / lip
+    let to_sdf = |node: HeightNode| -> f32 {
+        let raw = p_y - node.height;
+        if normalize {
+            let lip = (1.0 + node.dh_dx * node.dh_dx + node.dh_dz * node.dh_dz).sqrt();
+            raw / lip
+        } else {
+            raw
+        }
     };
     if voxel_size > 0.0 {
-        normalised(sample_clipmap_lod(clipmap, world_xz, voxel_size)) // strict: panics on a miss
+        to_sdf(sample_clipmap_lod(clipmap, world_xz, voxel_size)) // strict: panics on a miss
     } else {
         match try_sample_clipmap_lod(clipmap, world_xz, voxel_size) {
-            Some(node) => normalised(node),
+            Some(node) => to_sdf(node),
             None => max_height - p_y + 1.0e4,
         }
     }
