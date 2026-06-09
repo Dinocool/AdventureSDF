@@ -32,6 +32,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use bevy::asset::RenderAssetUsages;
+use bevy::camera::primitives::Frustum;
 use bevy::math::bounding::Aabb3d;
 use bevy::mesh::{Indices, PrimitiveTopology};
 use bevy::prelude::*;
@@ -747,6 +748,83 @@ fn chunk_has_surface(
     edits::fold_csg_dist_indexed(edits, indices, center, vs).abs() <= reach
 }
 
+/// Spawn one chunk-mesh entity from baked data — the single SSOT used by BOTH the immediate terrain
+/// commit and the round commit. Transvoxel positions are chunk-LOCAL relative to the chunk's world MIN
+/// corner (no apron), so the entity `Transform` is exactly `brick_min_world`; one entity per chunk, all
+/// sharing the single triplanar `MeshMaterial` (per-vertex ids + blend weight select/cross-fade in-shader).
+fn spawn_chunk_mesh(
+    commands: &mut Commands,
+    mesh_assets: &mut Assets<Mesh>,
+    mesh_mats: &super::mesh_material::MeshMaterials,
+    config: &SdfGridConfig,
+    key: BrickKey,
+    data: ChunkMeshData,
+) -> Entity {
+    let origin = config.brick_min_world(key.coord, key.lod);
+    let mesh = Mesh::new(PrimitiveTopology::TriangleList, RenderAssetUsages::default())
+        .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, data.positions)
+        .with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, data.normals)
+        .with_inserted_attribute(Mesh::ATTRIBUTE_UV_0, data.uvs)
+        .with_inserted_attribute(Mesh::ATTRIBUTE_COLOR, data.colors)
+        .with_inserted_indices(Indices::U32(data.indices));
+    commands
+        .spawn((
+            Mesh3d(mesh_assets.add(mesh)),
+            MeshMaterial3d(mesh_mats.handle.clone()),
+            Transform::from_translation(origin),
+            ChunkMesh(key),
+            Name::new("SDF Chunk Mesh"),
+        ))
+        .id()
+}
+
+/// True iff the chunk's world AABB is ENTIRELY outside the frustum (behind some plane) — for bake
+/// PRIORITY only (in-view bakes before off-screen), never correctness. `planes[i] = (normal, d)` with
+/// inside = `normal·p + d ≥ 0` (Bevy's `HalfSpace`). Tests the AABB's farthest-positive corner per plane.
+fn aabb_outside_frustum(planes: &[Vec4; 6], min: Vec3, max: Vec3) -> bool {
+    planes.iter().any(|p| {
+        let n = p.truncate();
+        let far = Vec3::new(
+            if n.x >= 0.0 { max.x } else { min.x },
+            if n.y >= 0.0 { max.y } else { min.y },
+            if n.z >= 0.0 { max.z } else { min.z },
+        );
+        n.dot(far) + p.w < 0.0 // fully behind this plane ⇒ outside the frustum
+    })
+}
+
+/// The finest LOD levels that ALWAYS bake first, in every direction, BEFORE the frustum split — so there
+/// is always nearby baked terrain all around the camera (incl. behind it), not just in view.
+const ALWAYS_NEAR_LOD_MAX: u32 = 1;
+
+/// Bake-scheduling priority key for a stale chunk (LOWER = baked first). Order:
+/// (1) the always-near rings (LOD ≤ [`ALWAYS_NEAR_LOD_MAX`]) bake first OMNIDIRECTIONALLY — nearby terrain
+///     exists in every direction regardless of view;
+/// (2) then IN-VIEW before off-screen — the entire visible set before any off-screen chunk (frustum);
+/// (3) within a bucket, LOD ascending — finest/nearest ring first, building outward from the camera;
+/// (4) nearest first within a LOD (distance²).
+/// A `None` frustum degrades to near-then-LOD-then-distance. Packed
+/// `near_rank<<37 | frustum_rank<<36 | lod<<32 | dist²bits` (dist² ≥ 0 ⇒ its f32 bits sort monotonically).
+fn bake_priority(key: BrickKey, config: &SdfGridConfig, k: u32, cam: Vec3, frustum: Option<&[Vec4; 6]>) -> u64 {
+    let b = chunk_aabb(key, config, k);
+    let min = Vec3::from(b.min);
+    let max = Vec3::from(b.max);
+    let d2 = ((min + max) * 0.5).distance_squared(cam);
+    let near = key.lod <= ALWAYS_NEAR_LOD_MAX;
+    let near_rank: u64 = if near { 0 } else { 1 };
+    // The near rings are view-independent (frustum_rank forced 0) so they never split by view; only the
+    // coarser rings are frustum-ordered (in-view first).
+    let frustum_rank: u64 = if near {
+        0
+    } else {
+        match frustum {
+            Some(planes) if aabb_outside_frustum(planes, min, max) => 1,
+            _ => 0,
+        }
+    };
+    (near_rank << 37) | (frustum_rank << 36) | ((key.lod as u64) << 32) | (d2.to_bits() as u64)
+}
+
 /// Content-hash-driven, async, generational-coherent Transvoxel bake (see the module doc). The unit is
 /// a configurable `K×K×K`-brick chunk; whole edits commit uniformly via frozen bake rounds.
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
@@ -756,8 +834,9 @@ fn mesh_resident_chunks(
     config: Res<SdfGridConfig>,
     mesh_cfg: Res<MeshBakeConfig>,
     // Drives the clipmap LOD (finer near the camera). No `SdfCamera` ⇒ single-LOD fallback (mesh
-    // everything at LOD 0 — the original scene/camera-independent behaviour for gameplay scenes).
-    cameras: Query<&GlobalTransform, (With<SdfCamera>, Without<SdfVolume>)>,
+    // everything at LOD 0 — the original scene/camera-independent behaviour for gameplay scenes). The
+    // optional `Frustum` drives BAKE PRIORITY (in-view first); absent ⇒ LOD-then-distance ordering.
+    cameras: Query<(&GlobalTransform, Option<&Frustum>), (With<SdfCamera>, Without<SdfVolume>)>,
     chunk_meshes: Query<(Entity, &ChunkMesh)>,
     mut states: ResMut<ChunkStates>,
     mut rebuild: ResMut<MeshBakeRebuild>,
@@ -838,6 +917,13 @@ fn mesh_resident_chunks(
             )
         })
         .collect();
+    // Per-edit "is this the Terrain primitive" (indexed like `edits_arc`) — a chunk whose candidate edits
+    // are ALL terrain is "terrain-only": independent streamed surface with no atomic-edit grouping, so it
+    // commits the instant it bakes (no round barrier — see the immediate-commit pass below).
+    let is_terrain_edit: Vec<bool> = gathered
+        .iter()
+        .map(|g| matches!(g.edit.prim, edits::SdfPrimitive::Terrain { .. }))
+        .collect();
     let height_clipmap = crate::sdf_render::worldgen::upload::cpu_height_clipmap();
 
     // The baked mesh is appearance-INDEPENDENT: vertices carry only geometry + top-2 material *ids* + a blend
@@ -851,8 +937,13 @@ fn mesh_resident_chunks(
     let epoch_mix = scal.epoch.wrapping_mul(EPOCH_MIX)
         ^ if mesh_cfg.debug_lod_colour { 0xDEB0_C010_0000_0000 } else { 0 };
 
-    // CLIPMAP: camera position + LOD count (camera-driven; no camera ⇒ LOD-0 everywhere).
-    let live_cam = cameras.iter().next().map(|t| t.translation());
+    // CLIPMAP: camera position + LOD count (camera-driven; no camera ⇒ LOD-0 everywhere). Capture the
+    // frustum's 6 inward half-spaces (normal, d) for bake priority (in-view first) — a one-frame-stale
+    // copy is fine for ordering, and it lets the bake hold no ECS borrow into the REQUEST loop.
+    let cam_view = cameras.iter().next();
+    let live_cam = cam_view.map(|(t, _)| t.translation());
+    let cam_frustum: Option<[Vec4; 6]> =
+        cam_view.and_then(|(_, f)| f.map(|fr| fr.half_spaces.map(|hs| hs.normal_d())));
     // Debug "Freeze LOD": hold the clipmap centre at the position captured when freeze turned on, so the LOD
     // structure stays put while the camera flies through it. Capture on the rising edge; clear on release.
     let cam = if mesh_cfg.freeze_lod {
@@ -934,6 +1025,9 @@ fn mesh_resident_chunks(
     // only the per-face LOD RELATIONSHIP (already in `flags`), NOT the neighbour's geometry — so no cross-chunk
     // hash folding is required (the transition cell samples the field itself and welds by construction).
     let mut current_hashes: HashMap<BrickKey, u64> = HashMap::with_capacity(resident.len());
+    // Chunks whose candidate edits are ALL the Terrain primitive — they commit per-chunk immediately
+    // (no atomic-edit round barrier). Recomputed every frame over the live residency.
+    let mut terrain_only: HashSet<BrickKey> = HashSet::new();
     let mut by_lod = [0usize; 8];
     {
         let mut idx: Vec<u32> = Vec::new();
@@ -944,6 +1038,9 @@ fn mesh_resident_chunks(
             // resident for a larger one (the residency cull already keeps lone sub-voxel objects out). Same
             // predicate as the bake fold below → hash and geometry always agree.
             idx.retain(|&i| edit_resolvable_at(edit_extent[i as usize], &config, key.lod));
+            if !idx.is_empty() && idx.iter().all(|&i| is_terrain_edit[i as usize]) {
+                terrain_only.insert(key);
+            }
             let base = if idx.is_empty() { 0 } else { edits::bake_content_hash(&edits_arc, &idx) };
             let flags = chunk_finer_faces(key, &config, k, cam, half0);
             let lf = (key.lod as u64).wrapping_mul(0xA24B_AED4_963E_E407)
@@ -977,24 +1074,41 @@ fn mesh_resident_chunks(
         }
     }
 
+    // 1b. IMMEDIATE TERRAIN COMMIT: a terrain-only chunk is an independent world-anchored surface with NO
+    // atomic-edit grouping, so DISPLAY its staged bake the instant it's ready — don't hold it for the whole
+    // frozen round to settle. Terrain then streams in per-chunk (nearest/finest first, per the bake order)
+    // instead of popping all at once. Object/mixed chunks still commit atomically in the round below so an
+    // edit/move stays visually coherent. A committed terrain chunk satisfies `round_done` (displayed==target,
+    // staged taken), so it never gates the round. `terrain_only` membership ⇒ the chunk is live-resident.
+    for (key, st) in states.0.iter_mut() {
+        if st.staged.is_none() || !terrain_only.contains(key) {
+            continue;
+        }
+        let sb = st.staged.take().expect("staged checked just above");
+        for old in st.entities.drain(..) {
+            commands.entity(old).despawn();
+        }
+        st.displayed_hash = st.target_hash;
+        if let Some(data) = sb.data {
+            let e = spawn_chunk_mesh(&mut commands, &mut mesh_assets, &mesh_mats, &config, *key, data);
+            st.entities.push(e);
+        }
+    }
+
     // 2. COMMIT the round when every chunk of its FROZEN residency is settled — none still baking, and each
-    // either already displays its target or holds a staged bake of it. Swap them ALL in one frame (and reap
-    // every mesh outside the frozen set the same frame) so a whole edit — or a whole LOD shift — pops together
-    // with no 1-frame hole. We commit against `round.resident`, NOT the live set, so the round only ever
-    // displays a coherent residency it actually finished baking.
+    // either already displays its target or holds a staged bake of it. The REMAINING staged bakes (object/
+    // mixed chunks; terrain already committed above) swap in one frame, and every mesh outside the frozen set
+    // is reaped the same frame, so a whole edit / LOD shift pops together with no 1-frame hole. We commit
+    // against `round.resident`, NOT the live set, so the round only ever displays a residency it finished.
     let round_done = round.resident.iter().all(|key| match states.0.get(key) {
         Some(st) => st.task.is_none() && (st.displayed_hash == st.target_hash || st.staged.is_some()),
         None => true, // not tracked yet → nothing to wait on (a frozen-set chunk always has a state)
     });
-    let has_staged = states.0.values().any(|s| s.staged.is_some());
-    let has_departed = chunk_meshes.iter().any(|(_, cm)| !round.resident.contains(&cm.0));
     stats.reaped = 0;
-    if round.edits.is_some() && round_done && (has_staged || has_departed) {
+    // ALWAYS release the round once done — even if immediate terrain commits already consumed every staged
+    // bake (nothing left to swap) — so the next snapshot can start; otherwise the round would never release.
+    if round.edits.is_some() && round_done {
         let mut reaped = 0usize;
-        // Build + spawn each committing chunk's staged mesh in one pass (Transvoxel welds neighbouring LODs by
-        // construction — no cross-chunk seam step). ONE mesh + ONE entity per chunk, all sharing the single
-        // triplanar `MeshMaterial` handle: per-vertex top-2 material ids (UV_0) + blend weight (COLOR.a) drive
-        // the in-shader material select / cross-fade, so co-located materials no longer fight over a dominant.
         for (key, st) in states.0.iter_mut() {
             let Some(sb) = st.staged.take() else {
                 continue;
@@ -1003,34 +1117,14 @@ fn mesh_resident_chunks(
                 commands.entity(old).despawn();
             }
             st.displayed_hash = st.target_hash;
-            let Some(data) = sb.data else {
-                continue; // empty chunk: no mesh
-            };
-            // Transvoxel positions are chunk-LOCAL relative to the chunk's world MIN corner (NO apron), so the
-            // entity Transform is exactly `brick_min_world(coord, lod)`.
-            let origin = config.brick_min_world(key.coord, key.lod);
-            let mesh = Mesh::new(PrimitiveTopology::TriangleList, RenderAssetUsages::default())
-                .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, data.positions)
-                .with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, data.normals)
-                .with_inserted_attribute(Mesh::ATTRIBUTE_UV_0, data.uvs)
-                .with_inserted_attribute(Mesh::ATTRIBUTE_COLOR, data.colors)
-                .with_inserted_indices(Indices::U32(data.indices));
-            let e = commands
-                .spawn((
-                    Mesh3d(mesh_assets.add(mesh)),
-                    MeshMaterial3d(mesh_mats.handle.clone()),
-                    Transform::from_translation(origin),
-                    ChunkMesh(*key),
-                    Name::new("SDF Chunk Mesh"),
-                ))
-                .id();
-            st.entities.push(e);
+            if let Some(data) = sb.data {
+                let e = spawn_chunk_mesh(&mut commands, &mut mesh_assets, &mesh_mats, &config, *key, data);
+                st.entities.push(e);
+            }
         }
-
-        // Reap every mesh OUTSIDE the frozen round set (query-based, so it also catches orphans). The new set
-        // was fully spawned above, so this is the atomic old-out half of the swap — there is no hole because
-        // the new geometry is already on screen this same frame. A re-baked resident chunk's OLD entity was
-        // already despawned in the spawn loop (its key stays in the set), so it is not double-despawned here.
+        // Reap every mesh OUTSIDE the frozen round set (query-based, so it also catches orphans). A re-baked
+        // resident chunk's OLD entity was already despawned above (its key stays in the set), so it is not
+        // double-despawned here.
         for (e, cm) in &chunk_meshes {
             if !round.resident.contains(&cm.0) {
                 commands.entity(e).despawn();
@@ -1039,8 +1133,6 @@ fn mesh_resident_chunks(
         }
         states.0.retain(|key, _| round.resident.contains(key));
         stats.reaped = reaped;
-
-        // The round is finished — allow a new snapshot (below) to start the next one THIS frame.
         round.edits = None;
         round.aabbs.clear();
     }
@@ -1099,25 +1191,33 @@ fn mesh_resident_chunks(
     }
 
     // 4. REQUEST: bake every stale chunk toward its FROZEN round target, against the round's frozen edit
-    // snapshot (so all of a round's bakes are coherent). One pending bake per chunk; never supersede an
-    // in-flight or staged bake — it is always displayed (committed) before the next round is snapshotted.
+    // snapshot (so all of a round's bakes are coherent). Spawn in PRIORITY order (`bake_priority`: the
+    // always-near LOD-0/1 rings omnidirectionally first, then in-view, then LOD/distance) so the nearby +
+    // visible world builds first; the per-frame budget caps task spawns. One pending bake per chunk; never
+    // supersede an in-flight/staged bake — it is always displayed before the next round is snapshotted.
     if let Some(round_edits) = round.edits.clone() {
         let pool = AsyncComputeTaskPool::get();
         let mut budget = MAX_NEW_TASKS_PER_FRAME;
         let mut idx: Vec<u32> = Vec::new();
         let debug = mesh_cfg.debug_lod_colour;
-        // Bake the round's FROZEN residency (not the live set), so the bake, commit, and reap all agree.
-        for &key in &round.resident {
-            let st = states.0.entry(key).or_default();
-            if st.task.is_some() || st.staged.is_some() {
-                continue; // already baking / baked this round
-            }
-            if st.displayed_hash == st.target_hash {
-                continue; // already showing the round target
-            }
+        // Still-stale chunks of the FROZEN residency (need a bake), ordered by bake priority against the LIVE
+        // camera (where the viewer is). Bake/commit/reap all agree on the frozen set; only the ORDER is live.
+        let prio_cam = live_cam.or(round.cam).unwrap_or(Vec3::ZERO);
+        let mut pending: Vec<BrickKey> = round
+            .resident
+            .iter()
+            .copied()
+            .filter(|key| match states.0.get(key) {
+                Some(st) => st.task.is_none() && st.staged.is_none() && st.displayed_hash != st.target_hash,
+                None => true,
+            })
+            .collect();
+        pending.sort_unstable_by_key(|&key| bake_priority(key, &config, k, prio_cam, cam_frustum.as_ref()));
+        for key in pending {
             if budget == 0 {
-                continue; // re-detected next frame; the round target stays frozen
+                break; // remaining (lower-priority) chunks re-detected next frame; the round stays frozen
             }
+            let st = states.0.entry(key).or_default();
             let vs_l = config.voxel_size_at(key.lod);
             cull_into(&round.aabbs, &chunk_sampled(key), &mut idx);
             // Sub-voxel cull (same predicate as the hash fold): exclude edits too small to mesh at this LOD
