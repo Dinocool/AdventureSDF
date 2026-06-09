@@ -356,8 +356,8 @@ pub fn sample_ring_mip(ring: &HeightRingCpu, world_xz: DVec2, mip: u32) -> Optio
 /// [`sample_ring_lod`], which PANICS on a miss (a rendered miss is a coverage bug the residency gate
 /// should have prevented). Don't reach for this one from a rendering bake.
 pub fn try_sample_ring_lod(ring: &HeightRingCpu, world_xz: DVec2, voxel_size: f32) -> Option<HeightNode> {
-    let mip = select_height_mip(ring.node_spacing, voxel_size);
-    sample_ring_mip(ring, world_xz, mip)
+    let mip = continuous_height_mip(ring.node_spacing, voxel_size);
+    sample_ring_mip_frac(ring, world_xz, mip)
 }
 
 /// STRICT mip-aware ring sampler for the RENDERED bake path. Like [`try_sample_ring_lod`] but PANICS
@@ -500,9 +500,53 @@ pub fn clipmap_covers_aabb(clipmap: &HeightClipmap, min_xz: bevy::math::Vec2, ma
     clipmap.iter().any(|ring| ring_covers_aabb(ring, min_xz, max_xz))
 }
 
+/// The CONTINUOUS (fractional) mip for a bake `voxel_size`: `clamp(log2(voxel/base), 0, MAX_HEIGHT_MIP)`,
+/// NOT rounded. The whole-number part picks the bracketing integer mips; the fraction blends between them
+/// (see [`sample_ring_mip_frac`]). `voxel_size ≤ base` (incl. the `0.0`/NaN sentinels) ⇒ `0.0` (full
+/// detail, single tap). This is the GEOMORPH lever: a voxel whose effective size ramps from `vs` (coarse
+/// interior) to `vs·0.5` (transition face) ramps its sampled mip continuously, so the coarse surface
+/// morphs into the finer mip across the transition band instead of stepping at the integer mip boundary.
+/// Monotone non-decreasing in `voxel_size`; equals `select_height_mip` at exact spacing doublings (the
+/// `ceil` and the `floor`-of-an-integer agree there) but interpolates between.
+#[inline]
+pub fn continuous_height_mip(base_spacing: f32, voxel_size: f32) -> f32 {
+    if voxel_size.is_nan() || voxel_size <= base_spacing {
+        return 0.0; // sentinel 0.0, NaN, or a voxel finer than the base node spacing → full detail
+    }
+    let ratio = (voxel_size / base_spacing) as f64;
+    (ratio.log2() as f32).clamp(0.0, MAX_HEIGHT_MIP as f32)
+}
+
+/// FRACTIONAL-mip ring sampler: like [`sample_ring_mip`] but `mip` is continuous — it samples the two
+/// bracketing integer mips `⌊mip⌋` and `⌈mip⌉` and LERPs BOTH `height` and `dh_dx`/`dh_dz` by
+/// `frac = mip − ⌊mip⌋`. `frac == 0` (an integer mip, incl. the common `0.0` interior case) takes the
+/// FAST PATH — one [`sample_ring_mip`] tap, no second sample — so the extra cost is bounded to the
+/// transition band where the geomorph ramp puts a non-integer mip. `None` on a ring miss (either tap a
+/// miss ⇒ miss, but both resolve the same chunk so they agree). This trilinear blend also smooths the
+/// LOD-shell mip pop for free (a coarse voxel crossing a spacing-doubling no longer jumps a whole mip).
+pub fn sample_ring_mip_frac(ring: &HeightRingCpu, world_xz: DVec2, mip: f32) -> Option<HeightNode> {
+    let mip = mip.clamp(0.0, MAX_HEIGHT_MIP as f32);
+    let lo = mip.floor();
+    let frac = mip - lo;
+    let lo_u = lo as u32;
+    let lo_node = sample_ring_mip(ring, world_xz, lo_u)?;
+    if frac == 0.0 {
+        return Some(lo_node); // integer mip → single tap (fast path)
+    }
+    let hi_node = sample_ring_mip(ring, world_xz, lo_u + 1)?;
+    let lerp = |a: f32, b: f32| a + (b - a) * frac;
+    Some(HeightNode {
+        height: lerp(lo_node.height, hi_node.height),
+        dh_dx: lerp(lo_node.dh_dx, hi_node.dh_dx),
+        dh_dz: lerp(lo_node.dh_dz, hi_node.dh_dz),
+    })
+}
+
 /// The finest mip level whose node spacing (`base · 2^m`) is still ≥ `voxel_size` — the "round the mip
 /// UP to the voxel" anti-alias select (see [`sample_ring_lod`]). `voxel_size <= base` (incl. the `0.0`
 /// sentinel) ⇒ mip 0; coarser voxels step up one mip per spacing doubling, clamped to `MAX_HEIGHT_MIP`.
+/// The INTEGER select, kept for non-blended callers/tests; the blended LOD path uses
+/// [`continuous_height_mip`] + [`sample_ring_mip_frac`] instead.
 #[inline]
 pub fn select_height_mip(base_spacing: f32, voxel_size: f32) -> u32 {
     if voxel_size.is_nan() || voxel_size <= base_spacing {
@@ -1085,6 +1129,64 @@ mod tests {
         let s0 = HEIGHT_CHUNK_CELLS as f64;
         // Far outside every tier's loaded region.
         let _ = sample_clipmap_lod(&clip, DVec2::new(100.0 * s0, 100.0 * s0), 1.0);
+    }
+
+    /// `continuous_height_mip` is the fractional sibling of `select_height_mip`: the `0.0`/NaN sentinels and
+    /// any voxel ≤ base give 0.0; it is monotone non-decreasing in voxel size; it returns the exact
+    /// `log2(ratio)` (so a spacing-doubling is mip 1.0, a √2 voxel is mip 0.5); and it clamps to
+    /// `MAX_HEIGHT_MIP`. At exact doublings it agrees with the integer `select_height_mip`.
+    #[test]
+    fn continuous_height_mip_monotone_and_clamped() {
+        let base = HEIGHT_CHUNK_CELLS as f32 / HEIGHT_FIELD_RES as f32; // 2 m
+        assert_eq!(continuous_height_mip(base, 0.0), 0.0, "sentinel ⇒ 0");
+        assert_eq!(continuous_height_mip(base, f32::NAN), 0.0, "NaN ⇒ 0");
+        assert_eq!(continuous_height_mip(base, base), 0.0, "voxel == base ⇒ 0");
+        assert_eq!(continuous_height_mip(base, base * 0.5), 0.0, "voxel finer than base ⇒ 0");
+        assert!((continuous_height_mip(base, base * 2.0) - 1.0).abs() < 1e-5, "one doubling ⇒ 1.0");
+        assert!((continuous_height_mip(base, base * 4.0) - 2.0).abs() < 1e-5, "two doublings ⇒ 2.0");
+        // √2 voxel ⇒ exactly halfway between mip 0 and mip 1.
+        assert!((continuous_height_mip(base, base * 2.0f32.sqrt()) - 0.5).abs() < 1e-5, "√2 ⇒ 0.5");
+        // Monotone non-decreasing.
+        let mut prev = -1.0;
+        for k in 0..200 {
+            let v = base * (1.0 + k as f32 * 0.5);
+            let m = continuous_height_mip(base, v);
+            assert!(m >= prev - 1e-6, "monotone: {m} < {prev}");
+            prev = m;
+        }
+        // Clamps to MAX_HEIGHT_MIP and agrees with the integer select at exact doublings.
+        assert_eq!(continuous_height_mip(base, base * 100_000.0), MAX_HEIGHT_MIP as f32);
+        for m in 0..=MAX_HEIGHT_MIP {
+            let v = base * (1u32 << m) as f32;
+            assert_eq!(continuous_height_mip(base, v) as u32, select_height_mip(base, v), "doubling {m}");
+        }
+    }
+
+    /// `sample_ring_mip_frac` with `frac == 0` is BIT-identical to the integer `sample_ring_mip` (the fast
+    /// path), and `frac == 0.5` is the exact LERP midpoint of the two bracketing mips — for height AND both
+    /// gradient lanes. This is the trilinear-mip blend the geomorph ramp drives.
+    #[test]
+    fn sample_ring_mip_frac_blends_bracketing_mips() {
+        let store = store_with(&[(0, 0)], 21);
+        let ring = build_height_ring(&store);
+        let s = HEIGHT_CHUNK_CELLS as f64;
+        let wp = DVec2::new(0.37 * s, 0.61 * s);
+        // frac == 0 ⇒ identical to the integer mip (fast path), for several mips.
+        for m in 0..=MAX_HEIGHT_MIP {
+            let frac = sample_ring_mip_frac(&ring, wp, m as f32).unwrap();
+            let intg = sample_ring_mip(&ring, wp, m).unwrap();
+            assert_eq!(frac.height.to_bits(), intg.height.to_bits(), "frac==0 mip {m} height");
+            assert_eq!(frac.dh_dx.to_bits(), intg.dh_dx.to_bits(), "frac==0 mip {m} dh_dx");
+            assert_eq!(frac.dh_dz.to_bits(), intg.dh_dz.to_bits(), "frac==0 mip {m} dh_dz");
+        }
+        // frac == 0.5 between mip 1 and mip 2 ⇒ the LERP midpoint of the two integer samples.
+        let m1 = sample_ring_mip(&ring, wp, 1).unwrap();
+        let m2 = sample_ring_mip(&ring, wp, 2).unwrap();
+        let mid = sample_ring_mip_frac(&ring, wp, 1.5).unwrap();
+        let want = |a: f32, b: f32| 0.5 * (a + b);
+        assert!((mid.height - want(m1.height, m2.height)).abs() < 1e-5, "midpoint height");
+        assert!((mid.dh_dx - want(m1.dh_dx, m2.dh_dx)).abs() < 1e-5, "midpoint dh_dx");
+        assert!((mid.dh_dz - want(m1.dh_dz, m2.dh_dz)).abs() < 1e-5, "midpoint dh_dz");
     }
 
     /// The CPU clipmap global round-trips a published clipmap and clears back to `None`.

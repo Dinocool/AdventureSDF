@@ -516,25 +516,51 @@ fn field_gradient(edits: &[edits::ResolvedEdit], indices: &[u32], p: Vec3, eps: 
     )
 }
 
-/// The voxel size to use for a Terrain HEIGHT sample at `p` so a coarse chunk's TRANSITION faces match its
-/// FINER neighbour exactly (watertight cross-LOD). A sample lying ON a face that borders a finer LOD (a set
-/// `flags` bit — bit order = the `SIDES`/`TransitionSide` order LowX,HighX,LowY,HighY,LowZ,HighZ) samples at
-/// the finer neighbour's voxel size (`vs·0.5`), so BOTH sides pick the same height tier/mip and agree to the
-/// bit; interior samples keep the chunk's own `vs`. Only the Terrain eval reads `vs` (for its band-limited
-/// mip select), so this is a no-op for object chunks. The shared boundary vertices sit exactly on the face
-/// plane, so a thin on-plane test catches them; `vs` doubles per LOD so the finer neighbour is always `vs·0.5`.
+/// The voxel size to use for a Terrain HEIGHT sample at `p` so a coarse chunk's surface MORPHS smoothly from
+/// its own (coarse) height mip in the interior to its FINER neighbour's mip at a TRANSITION face — GEOMORPH,
+/// the structural cure for the cross-LOD "mip-step" kink. A face borders a finer LOD when its `flags` bit is
+/// set (bit order = the `SIDES`/`TransitionSide` order LowX,HighX,LowY,HighY,LowZ,HighZ).
+///
+/// Instead of a hard switch (interior `vs` / on-face `vs·0.5`), the effective voxel size RAMPS over a band one
+/// coarse voxel deep (`band = vs`): let `d` be the sample's MINIMUM inward distance from any set transition
+/// face, `w = smoothstep(clamp(d/band, 0, 1))` (a portable cubic `3t²−2t³`, no transcendentals), and
+/// `vs_eff = vs·0.5 + (vs − vs·0.5)·w`. At a face (`d=0 ⇒ w=0`) this is `vs·0.5` EXACTLY — so the coarse
+/// transition vertices still bit-match the finer neighbour (the continuous-mip sampler picks the SAME mip on
+/// both sides) and the cross-LOD weld stays watertight. At/beyond the band (`d≥band ⇒ w=1`) it is the coarse
+/// `vs` (interior). In between, the fractional voxel size feeds `continuous_height_mip`, so the sampled height
+/// mip slides continuously and the coarse surface morphs into the fine surface across the band instead of
+/// stepping. The SAME function feeds the density field AND the builder normals, so geometry + shading morph
+/// together. Only the Terrain eval reads `vs` (for its band-limited mip select), so this is a no-op for object
+/// chunks. `flags == 0` ⇒ `vs` (interior of a uniform-LOD region — common fast path).
 fn transition_sample_vs(p: Vec3, cmin: Vec3, cmax: Vec3, vs: f32, flags: u8) -> f32 {
     if flags == 0 {
         return vs; // no transition faces (interior of a uniform-LOD region) — common fast path
     }
-    let e = vs * 1.0e-3;
-    let on_finer_face = (flags & 0b00_0001 != 0 && (p.x - cmin.x).abs() <= e)
-        || (flags & 0b00_0010 != 0 && (p.x - cmax.x).abs() <= e)
-        || (flags & 0b00_0100 != 0 && (p.y - cmin.y).abs() <= e)
-        || (flags & 0b00_1000 != 0 && (p.y - cmax.y).abs() <= e)
-        || (flags & 0b01_0000 != 0 && (p.z - cmin.z).abs() <= e)
-        || (flags & 0b10_0000 != 0 && (p.z - cmax.z).abs() <= e);
-    if on_finer_face { vs * 0.5 } else { vs }
+    // Inward distance from each SET transition face plane; take the MIN (nearest face governs the ramp).
+    let mut d = f32::INFINITY;
+    if flags & 0b00_0001 != 0 {
+        d = d.min(p.x - cmin.x); // LowX
+    }
+    if flags & 0b00_0010 != 0 {
+        d = d.min(cmax.x - p.x); // HighX
+    }
+    if flags & 0b00_0100 != 0 {
+        d = d.min(p.y - cmin.y); // LowY
+    }
+    if flags & 0b00_1000 != 0 {
+        d = d.min(cmax.y - p.y); // HighY
+    }
+    if flags & 0b01_0000 != 0 {
+        d = d.min(p.z - cmin.z); // LowZ
+    }
+    if flags & 0b10_0000 != 0 {
+        d = d.min(cmax.z - p.z); // HighZ
+    }
+    let band = vs; // one coarse voxel deep
+    let t = (d / band).clamp(0.0, 1.0);
+    let w = t * t * (3.0 - 2.0 * t); // smoothstep — C1 at both ends (zero slope ⇒ no kink re-introduced)
+    let fine = vs * 0.5;
+    fine + (vs - fine) * w
 }
 
 /// Mesh one chunk with the TRANSVOXEL algorithm (runs off-thread on the task pool). Returns `None` for an
@@ -1970,6 +1996,97 @@ mod tests {
         );
 
         // Clean up the process-global so other tests aren't perturbed.
+        crate::sdf_render::worldgen::upload::set_cpu_height_clipmap(None);
+    }
+
+    #[test]
+    fn terrain_geomorph_band_has_no_mip_step_kink() {
+        // GEOMORPH SMOOTHNESS GUARD. Bake the COARSE chunk of the same 2:1 boundary and walk its baked
+        // surface INWARD from the +X transition face across the transition band (one coarse voxel deep). The
+        // hard-switch `transition_sample_vs` produced an abrupt mip STEP exactly one voxel in from the face
+        // (the surface jumped from the fine mip to the coarse mip in a single cell) — the faint LOD-ring kink.
+        // The smoothstep ramp morphs the effective voxel size continuously across the band, so consecutive
+        // surface normals along the walk must stay nearly parallel: no abrupt step. We bin surface vertices by
+        // their inward X distance from the face into thin slabs, average each slab's normal, and assert every
+        // consecutive slab-to-slab normal dot stays above a tolerance — pinning the kink gone.
+        use crate::sdf_render::worldgen::layers::erosion::ErosionParams;
+        use crate::sdf_render::worldgen::layers::height::{HeightLayer, HeightParams};
+        use crate::sdf_render::worldgen::coord::LayerId;
+
+        let seed = 7u64;
+        let clip = publish_eroded_terrain_clipmap(-2..=2, -2..=2, seed);
+        let (vsc, sub) = (2.0f32, 32u32);
+        let span = sub as f32 * vsc; // 64 m
+
+        let layer = HeightLayer::new(LayerId(0), HeightParams::default(), ErosionParams::default());
+        let h_mid = layer.sample_world(0.0, (span as f64) * 0.5, seed).height;
+        let y_min = ((h_mid - span * 0.5) / vsc).floor() * vsc;
+        let oc = Vec3::new(-span, y_min, 0.0); // coarse: x∈[-64,0]; +X (bit 1 = HighX) = transition face at x=0
+        let edit = terrain_edit_for_band(h_mid - 4.0 * span, h_mid + 4.0 * span);
+        let edits_v = [edit];
+        let idx = [0u32];
+
+        // Bake the coarse chunk WITH the +X transition (matching the watertight harness). terrain_only ⇒
+        // analytic stored-gradient normals (the smooth normal the surface morph is judged on).
+        let coarse = mesh_chunk(&edits_v, &idx, oc, vsc, sub, 1 << 1, 1, false, Some(clip.clone()), true)
+            .expect("coarse terrain chunk meshes");
+
+        // Bin coarse-surface vertices by inward distance from the +X face (d = cmax.x − world.x = −world.x,
+        // since cmax.x = 0) into half-voxel slabs across the band [0, 2·vsc] (band itself = vsc; sample a bit
+        // past it so the step that USED to appear at d≈vsc is inside the walk). Average each slab's normal.
+        let cmax_x = oc.x + span; // 0.0
+        let slab = vsc * 0.5; // 1 m slabs
+        let n_slabs = 4usize; // covers d ∈ [0, 2·vsc] = [0, 4 m]
+        let mut acc = vec![Vec3::ZERO; n_slabs];
+        let mut cnt = vec![0u32; n_slabs];
+        for i in 0..coarse.positions.len() {
+            let world = Vec3::from(coarse.positions[i]) + oc;
+            let d = cmax_x - world.x; // inward distance from the +X transition face
+            if d < 0.0 {
+                continue;
+            }
+            let b = (d / slab) as usize;
+            if b >= n_slabs {
+                continue;
+            }
+            let n = Vec3::from(coarse.normals[i]);
+            if n.length() < 0.5 {
+                continue;
+            }
+            acc[b] += n.normalize();
+            cnt[b] += 1;
+        }
+        // Consecutive non-empty slabs' average normals must stay nearly parallel (no abrupt step). The hard
+        // switch made a step at the d≈vsc slab boundary; the ramp keeps every consecutive dot high. Tolerance
+        // is what the smoothstep geomorph achieves on this real eroded surface (measured worst ≈ 0.999+); it
+        // BOUNDS the kink and fails CI if a future change re-introduces the mip step.
+        const GEOMORPH_STEP_DOT_MIN: f32 = 0.995;
+        let avg: Vec<Option<Vec3>> = acc
+            .iter()
+            .zip(&cnt)
+            .map(|(a, &c)| if c > 0 { Some((*a / c as f32).normalize_or_zero()) } else { None })
+            .collect();
+        let mut worst = 1.0f32;
+        let mut steps = 0u32;
+        let mut prev: Option<Vec3> = None;
+        for slab_n in avg.iter().flatten() {
+            if let Some(p) = prev
+                && p.length() > 0.5
+                && slab_n.length() > 0.5
+            {
+                worst = worst.min(p.dot(*slab_n));
+                steps += 1;
+            }
+            prev = Some(*slab_n);
+        }
+        println!("terrain geomorph band: worst consecutive-slab normal dot {worst:.5} over {steps} steps");
+        assert!(steps >= 2, "expected several populated slabs across the band, got {steps}");
+        assert!(
+            worst >= GEOMORPH_STEP_DOT_MIN,
+            "geomorph mip-step kink: worst consecutive-slab normal dot {worst:.4} < {GEOMORPH_STEP_DOT_MIN} \
+             over {steps} steps (the LOD-ring kink regressed — `transition_sample_vs` ramp broke)"
+        );
+
         crate::sdf_render::worldgen::upload::set_cpu_height_clipmap(None);
     }
 
