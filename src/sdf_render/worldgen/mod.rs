@@ -203,6 +203,10 @@ impl Plugin for WorldGenPlugin {
             ))
             .register_type::<HeightParams>()
             .register_type::<ErosionParams>()
+            // Load the active biome graph from its .ron at startup + hot-reload it into `WorldGraph`
+            // (the authored graph "plugs into" the live world; editor Save → .ron → re-mesh).
+            .add_systems(Startup, load_active_graph)
+            .add_systems(Update, apply_active_graph)
             .add_systems(
                 OnEnter(AppScene::SdfEditor),
                 spawn_terrain_volume.run_if(|e: Res<WorldGenEnabled>| e.0),
@@ -414,6 +418,40 @@ fn roll_worldgen(
     if params_changed || graph_changed {
         atlas.rebake_all = true;
         mesh_rebuild.0 = true;
+    }
+}
+
+/// Handle to the active biome terrain graph asset — the production graph the world loads from
+/// `assets/worldgen/*.graph.ron` (the editor's Save target). Loading/hot-reloading it republishes into
+/// [`WorldGraph`], which `roll_worldgen` re-meshes. This is how the authored graph "plugs into" the world.
+#[derive(Resource)]
+pub struct ActiveGraphHandle(pub Handle<graph::GraphAsset>);
+
+/// The on-disk graph the world loads by default (relative to `assets/`).
+const ACTIVE_GRAPH_ASSET: &str = "worldgen/mountains_plains.graph.ron";
+
+/// Kick off loading the active graph asset at startup (async; the preset default drives the world until
+/// it lands, then [`apply_active_graph`] swaps it in).
+fn load_active_graph(mut commands: Commands, assets: Res<AssetServer>) {
+    commands.insert_resource(ActiveGraphHandle(assets.load(ACTIVE_GRAPH_ASSET)));
+}
+
+/// On load / hot-reload of the active graph asset, republish it into [`WorldGraph`] (→ `roll_worldgen`
+/// re-meshes). So editing + saving the `.graph.ron` (in the node editor or on disk) updates the live
+/// world; this is the proper resource-pipeline plug-in (same as material hot-reload).
+fn apply_active_graph(
+    mut events: MessageReader<AssetEvent<graph::GraphAsset>>,
+    assets: Res<Assets<graph::GraphAsset>>,
+    active: Option<Res<ActiveGraphHandle>>,
+    mut world_graph: ResMut<WorldGraph>,
+) {
+    let Some(active) = active else { return };
+    for ev in events.read() {
+        let changed = matches!(ev, AssetEvent::Added { id } | AssetEvent::Modified { id } if *id == active.0.id());
+        if changed && let Some(asset) = assets.get(&active.0) {
+            world_graph.0 = std::sync::Arc::new(asset.graph.clone());
+            info!("worldgen: active biome graph loaded ({} nodes)", asset.graph.nodes.len());
+        }
     }
 }
 
