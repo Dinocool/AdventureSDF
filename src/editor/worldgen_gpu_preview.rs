@@ -27,11 +27,10 @@ use bevy::render::render_resource::{
 use bevy::shader::ShaderRef;
 use bevy_egui::{EguiTextureHandle, EguiUserTextures, egui};
 
-use crate::sdf_render::worldgen::WorldGraph;
 use crate::sdf_render::worldgen::graph::node::Graph;
 
 /// Number of pre-allocated GPU preview targets (cap on simultaneous GPU-backed previews).
-const POOL_SIZE: usize = 6;
+const POOL_SIZE: usize = 12;
 /// First render layer the pool uses (each target gets its own to isolate its quad from the others +
 /// the main scene; the editor's other rigs use 16/17).
 const POOL_LAYER_BASE: usize = 20;
@@ -317,74 +316,8 @@ fn process_gpu_previews(world: &mut World) {
     });
 }
 
-/// Debug panel: a standalone GPU view of the live world graph (drag to orbit, km to zoom). Pushes one
-/// request (key 1) into the shared pool like any other consumer.
-fn gpu_preview_panel(world: &mut World, ui: &mut egui::Ui) {
-    const DEBUG_KEY: u64 = 1;
-    let tex = world.resource::<GpuPreviewTextures>().0.get(&DEBUG_KEY).copied();
-    world.resource_scope::<DebugPreviewView, ()>(|world, mut view| {
-        ui.horizontal(|ui| {
-            let mut km = view.half * 2.0 / 1000.0;
-            if ui.add(egui::DragValue::new(&mut km).speed(0.5).range(0.1..=512.0).suffix(" km")).changed() {
-                view.half = (km * 1000.0 / 2.0).max(1.0);
-            }
-            ui.label("· drag to orbit");
-        });
-        ui.horizontal(|ui| {
-            ui.label("offset");
-            ui.add(egui::DragValue::new(&mut view.cx).speed(10.0).prefix("X ").suffix(" m"));
-            ui.add(egui::DragValue::new(&mut view.cz).speed(10.0).prefix("Y ").suffix(" m"));
-            if ui.button("center").on_hover_text("Reset the offset to the world origin").clicked() {
-                view.cx = 0.0;
-                view.cz = 0.0;
-            }
-        });
-        if let Some(graph) = world.get_resource::<WorldGraph>().map(|wg| (*wg.0).clone()) {
-            world.resource_mut::<GpuPreviewRequests>().0.push(GpuPreviewRequest {
-                key: DEBUG_KEY,
-                graph,
-                half: view.half,
-                center: (view.cx, view.cz),
-                yaw: view.yaw,
-                pitch: view.pitch,
-            });
-        }
-        match tex {
-            Some(t) => {
-                let resp = ui.add(
-                    egui::Image::new(egui::load::SizedTexture::new(t, egui::vec2(384.0, 384.0)))
-                        .sense(egui::Sense::drag()),
-                );
-                if resp.dragged() {
-                    let d = resp.drag_delta();
-                    view.yaw += d.x * 0.01;
-                    view.pitch = (view.pitch - d.y * 0.01).clamp(0.05, 1.5);
-                }
-            }
-            None => {
-                ui.label("GPU preview warming up…");
-            }
-        }
-    });
-}
-
-/// Orbit + pan state for the debug panel.
-#[derive(Resource)]
-struct DebugPreviewView {
-    yaw: f32,
-    pitch: f32,
-    half: f64,
-    cx: f64,
-    cz: f64,
-}
-
-impl Default for DebugPreviewView {
-    fn default() -> Self {
-        Self { yaw: 0.7, pitch: 0.6, half: 2048.0, cx: 0.0, cz: 0.0 }
-    }
-}
-
-/// Plugin: the custom material pipeline + the pool + the request processor + the debug panel.
+/// Plugin: the custom material pipeline + the pool + the request processor. Consumers (the node-graph
+/// panel's inline previews + pop-out windows) push/read the request/texture resources.
 pub struct WorldgenGpuPreviewPlugin;
 
 impl Plugin for WorldgenGpuPreviewPlugin {
@@ -392,18 +325,9 @@ impl Plugin for WorldgenGpuPreviewPlugin {
         app.add_plugins(MaterialPlugin::<HeightPreviewMaterial>::default());
         app.init_resource::<GpuPreviewRequests>();
         app.init_resource::<GpuPreviewTextures>();
-        app.init_resource::<DebugPreviewView>();
         app.add_systems(
             Update,
             (setup_gpu_pool, process_gpu_previews).chain().run_if(resource_exists::<EguiUserTextures>),
-        );
-        super::panels::register_panel(
-            app,
-            "worldgen/gpu-preview",
-            "GPU Preview",
-            super::panels::DockSide::Right,
-            31,
-            gpu_preview_panel,
         );
     }
 }
