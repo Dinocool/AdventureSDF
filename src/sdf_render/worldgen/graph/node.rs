@@ -15,7 +15,7 @@ use super::Field;
 /// A low-frequency fBm "climate axis" source (continentalness/temperature/humidity/… ) OR the
 /// high-frequency carrier detail — the only difference is the params. Samples [`fbm_height_grad`] at
 /// the eval point; the world seed is folded with `seed_salt` so each instance is an independent stream.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize, bevy::reflect::Reflect)]
 pub struct FbmAxis {
     pub octaves: u32,
     pub base_freq: f64,
@@ -43,7 +43,7 @@ impl FbmAxis {
 /// What a node computes. Source kinds (`WorldX/Z`, `Const`, `Fbm`) take 0 inputs; the rest take 1, 2,
 /// or 3 (see [`NodeKind::arity`]). Most are thin wrappers over [`Field`] ops, so their gradient comes
 /// from the autodiff for free; `Fbm`/`Curve`/`Ridge` are the load-bearing ones.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize, bevy::reflect::Reflect)]
 pub enum NodeKind {
     // --- sources (arity 0) ---
     WorldX,
@@ -93,7 +93,7 @@ impl NodeKind {
 
 /// One node: its kind + the indices of its input nodes (each strictly less than this node's index —
 /// topological order). Unused input slots are ignored per [`NodeKind::arity`].
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize, bevy::reflect::Reflect)]
 pub struct Node {
     pub kind: NodeKind,
     pub inputs: [u32; 3],
@@ -116,7 +116,7 @@ impl Node {
 
 /// A field node-graph: topologically-ordered nodes + the index of the output node. Evaluated per world
 /// point to a [`Field`].
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize, bevy::reflect::Reflect)]
 pub struct Graph {
     pub nodes: Vec<Node>,
     pub output: u32,

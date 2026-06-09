@@ -13,12 +13,32 @@
 pub const SPLINE_MAX_POINTS: usize = 8;
 
 /// A monotone cubic Hermite spline over up to [`SPLINE_MAX_POINTS`] control points, sorted ascending in
-/// x. `Copy`/alloc-free so it lives in `Copy` params and the compiled graph.
-#[derive(Clone, Copy, Debug, PartialEq)]
+/// x. `Copy`/alloc-free so it lives in `Copy` params and the compiled graph. Serializes to RON as a
+/// flat point list (`points`) — compact + editor-friendly — reconstructed via [`Spline::new`].
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize, bevy::reflect::Reflect)]
+#[serde(from = "SplineRon", into = "SplineRon")]
 pub struct Spline {
     xs: [f64; SPLINE_MAX_POINTS],
     ys: [f64; SPLINE_MAX_POINTS],
     len: usize,
+}
+
+/// RON form of [`Spline`]: just the active `(x, y)` points (no fixed-array padding in the file).
+#[derive(serde::Serialize, serde::Deserialize)]
+struct SplineRon {
+    points: Vec<(f64, f64)>,
+}
+
+impl From<SplineRon> for Spline {
+    fn from(r: SplineRon) -> Self {
+        Spline::new(&r.points)
+    }
+}
+
+impl From<Spline> for SplineRon {
+    fn from(s: Spline) -> Self {
+        SplineRon { points: (0..s.len).map(|i| (s.xs[i], s.ys[i])).collect() }
+    }
 }
 
 impl Spline {

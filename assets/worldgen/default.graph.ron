@@ -1,0 +1,29 @@
+(
+    graph: (
+        nodes: [
+            (
+                kind: Fbm((
+                    octaves: 6,
+                    base_freq: 0.0006510416666666666,
+                    lacunarity: 2.0,
+                    gain: 0.5,
+                    amplitude: 280.0,
+                    seed_salt: 0,
+                )),
+                inputs: (0, 0, 0),
+            ),
+            (
+                kind: Ridge(
+                    ridge: 0.5,
+                    amp_sum: 551.25,
+                ),
+                inputs: (0, 0, 0),
+            ),
+            (
+                kind: Offset(0.0),
+                inputs: (1, 0, 0),
+            ),
+        ],
+        output: 2,
+    ),
+)
