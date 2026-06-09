@@ -104,28 +104,52 @@ pub fn ring_slot(chunk_xz: IVec2) -> usize {
     (mz * r + mx) as usize
 }
 
-/// Assemble the resident height fields into a fresh ring (full rebuild — invoked only when the store
-/// has a delta, i.e. terrain streamed or regenerated, not every frame). Delta-uploading only changed
-/// slots is a later optimization; the ring is small (~few MB).
+/// Assemble the resident TIER-0 height fields into a fresh ring (full rebuild — invoked only when the
+/// store has a delta, i.e. terrain streamed or regenerated, not every frame). Delta-uploading only
+/// changed slots is a later optimization; the ring is small (~few MB).
+///
+/// Tier 0 only: filters the store to `LayerId(0)`, the finest tier (chunk edge `HEIGHT_CHUNK_CELLS`).
+/// The multi-tier clipmap is assembled by [`build_height_clipmap`], which calls
+/// [`build_height_ring_for_tier`] once per tier.
 pub fn build_height_ring(store: &ArtifactStore<ScalarField2D>) -> HeightRingCpu {
+    build_height_ring_for_tier(store, super::coord::LayerId(0), HEIGHT_CHUNK_CELLS)
+}
+
+/// Assemble the resident height fields of ONE clipmap tier into a fresh ring. `layer` selects the
+/// tier's chunks in the shared store; `chunk_cells` is that tier's chunk edge in base cells
+/// (`HEIGHT_CHUNK_CELLS·2^t`). The tier's `chunk_world_size`/`node_spacing` are derived from
+/// `chunk_cells` (every tier keeps `HEIGHT_FIELD_RES` nodes per chunk, so node spacing scales with the
+/// tier). The per-chunk mip pyramid build is identical to tier 0.
+pub fn build_height_ring_for_tier(
+    store: &ArtifactStore<ScalarField2D>,
+    layer: super::coord::LayerId,
+    chunk_cells: u32,
+) -> HeightRingCpu {
     let npc_mip = NODES_PER_CHUNK_MIPPED as usize;
     let mut directory = vec![GpuHeightCell::sentinel(); HEIGHT_RING_SLOTS as usize];
     let mut nodes = vec![[0.0f32; 4]; HEIGHT_RING_SLOTS as usize * npc_mip];
 
-    let chunk_size = ChunkSize::new(HEIGHT_CHUNK_CELLS);
-    let mut node_spacing = chunk_size.world_size() as f32 / HEIGHT_FIELD_RES as f32;
+    let chunk_size = ChunkSize::new(chunk_cells);
+    let node_spacing = chunk_size.world_size() as f32 / HEIGHT_FIELD_RES as f32;
 
     for c in store.resident_coords() {
+        if c.layer != layer {
+            continue; // a different tier's chunk — skip (this ring is one tier only)
+        }
         let Some(field) = store.get(c) else { continue };
         let slot = ring_slot(IVec2::new(c.xyz.x, c.xyz.z));
         let base = slot * npc_mip;
         let (key_hi, key_lo) = chunk_gpu_key(c.xyz);
         directory[slot] = GpuHeightCell { key_hi, key_lo, node_base: base as u32, _pad: 0 };
-        node_spacing = field.node_spacing as f32; // all chunks share the tier spacing
         debug_assert_eq!(
             field.nodes.len(),
             HEIGHT_NODES_PER_CHUNK as usize,
             "field resolution must match the ring's mip-0 node count"
+        );
+        debug_assert!(
+            (field.node_spacing as f32 - node_spacing).abs() < 1e-3,
+            "tier chunk spacing mismatch: field {} vs derived {node_spacing}",
+            field.node_spacing
         );
         build_chunk_mips(&field.nodes, &mut nodes[base..base + npc_mip]);
     }
@@ -401,6 +425,81 @@ pub fn ring_resident_bounds(ring: &HeightRingCpu) -> Option<(IVec2, IVec2)> {
     bounds
 }
 
+// =====================================================================================================
+// TIERED HEIGHT CLIPMAP — `T` nested rings (finest tier 0 → coarsest tier T-1), thin wrappers over the
+// per-ring functions above.
+//
+// WHY TIERS ARE SEAMLESS: every tier's ring is built from chunks evaluated against the SAME continuous,
+// world-anchored fBm — only the grid spacing differs (tier `t` samples on a `HEIGHT_CHUNK_CELLS·2^t`
+// chunk grid). The fBm is already band-limited (gentle params, ~64 m finest feature), so a coarse tier
+// doesn't alias, and since all tiers represent the SAME surface their height values AGREE wherever they
+// overlap. So picking the finest covering tier per voxel (fine near, coarse far) introduces NO seam and
+// NO cross-LOD crack: the value is the same surface either way, just band-limited to the voxel's Nyquist.
+// =====================================================================================================
+
+/// A built tiered clipmap: `clipmap[t]` is tier `t`'s ring (tier 0 = finest, chunk edge
+/// `HEIGHT_CHUNK_CELLS`; tier `t` = `HEIGHT_CHUNK_CELLS·2^t`). Coarser tiers cover larger footprints.
+pub type HeightClipmap = Vec<HeightRingCpu>;
+
+/// Build the full tiered clipmap from the shared store: one ring per tier. `tier_cells[t]` is tier
+/// `t`'s chunk edge in base cells; tier `t`'s chunks live under `LayerId(t)` in the store. The result
+/// is finest→coarsest (`tier_cells` must be ascending: `HEIGHT_CHUNK_CELLS·2^t`).
+pub fn build_height_clipmap(store: &ArtifactStore<ScalarField2D>, tier_cells: &[u32]) -> HeightClipmap {
+    tier_cells
+        .iter()
+        .enumerate()
+        .map(|(t, &cells)| build_height_ring_for_tier(store, super::coord::LayerId(t as u32), cells))
+        .collect()
+}
+
+/// STRICT clipmap sampler for the RENDERED bake path. Walk tiers FINEST→coarsest; sample the FIRST tier
+/// that COVERS `world_xz` (its directory slot key-tag matches) at the band-limited mip for `voxel_size`.
+/// The finest covering tier = fine near the focus, coarse far — automatically, with no seam (all tiers
+/// are the same fBm surface). PANICS if NO tier covers (a rendered miss is a coverage-gate bug, never a
+/// silent fallback — same contract as [`sample_ring_lod`]), reporting per-tier coverage diagnostics.
+pub fn sample_clipmap_lod(clipmap: &HeightClipmap, world_xz: DVec2, voxel_size: f32) -> HeightNode {
+    if let Some(node) = try_sample_clipmap_lod(clipmap, world_xz, voxel_size) {
+        return node;
+    }
+    // Build a per-tier diagnostic line: covered? / node_spacing / resident bounds.
+    let mut diag = String::new();
+    for (t, ring) in clipmap.iter().enumerate() {
+        let covered = try_sample_ring_lod(ring, world_xz, voxel_size).is_some();
+        let bounds = ring_resident_bounds(ring);
+        diag.push_str(&format!(
+            "\n  tier {t}: covered={covered}, chunk_world_size={}, node_spacing={}, resident_bounds={bounds:?}",
+            ring.chunk_world_size, ring.node_spacing,
+        ));
+    }
+    panic!(
+        "terrain sampled outside loaded clipmap coverage — the residency coverage gate should have \
+         prevented this. world_xz={world_xz:?}, voxel_size={voxel_size}, tiers={}{diag}",
+        clipmap.len(),
+    );
+}
+
+/// OPTION-RETURNING clipmap sampler for NON-RENDERING queries (picking/classification/tests). Walk tiers
+/// FINEST→coarsest; return the first tier that covers `world_xz` (via [`try_sample_ring_lod`], so the
+/// within-tier mip select uses that tier's own `node_spacing`). `None` if NO tier covers (legitimately
+/// "no surface loaded here" for a non-rendering query). The NON-STRICT sibling of [`sample_clipmap_lod`].
+pub fn try_sample_clipmap_lod(clipmap: &HeightClipmap, world_xz: DVec2, voxel_size: f32) -> Option<HeightNode> {
+    for ring in clipmap.iter() {
+        if let Some(node) = try_sample_ring_lod(ring, world_xz, voxel_size) {
+            return Some(node); // finest covering tier wins
+        }
+    }
+    None
+}
+
+/// True iff SOME tier fully covers the world-XZ footprint `[min_xz, max_xz]` — `(0..T).any(t ⇒
+/// ring_covers_aabb(tier t, …))`. Coarser tiers cover larger footprints, so a far chunk is admitted once
+/// its coarse tier is resident (the distance then fills in). Consistent with [`sample_clipmap_lod`]: if
+/// the coarsest covering tier covers the whole footprint, every point inside has a finest-covering tier,
+/// so the strict per-voxel sampler can't miss inside a chunk this gate admitted.
+pub fn clipmap_covers_aabb(clipmap: &HeightClipmap, min_xz: bevy::math::Vec2, max_xz: bevy::math::Vec2) -> bool {
+    clipmap.iter().any(|ring| ring_covers_aabb(ring, min_xz, max_xz))
+}
+
 /// The finest mip level whose node spacing (`base · 2^m`) is still ≥ `voxel_size` — the "round the mip
 /// UP to the voxel" anti-alias select (see [`sample_ring_lod`]). `voxel_size <= base` (incl. the `0.0`
 /// sentinel) ⇒ mip 0; coarser voxels step up one mip per spacing doubling, clamped to `MAX_HEIGHT_MIP`.
@@ -438,6 +537,25 @@ pub fn set_cpu_height_ring(ring: Option<Arc<HeightRingCpu>>) {
 /// GPU render; on `None` (worldgen disabled / not yet built) the caller uses the flat fallback.
 pub fn cpu_height_ring() -> Option<Arc<HeightRingCpu>> {
     CPU_HEIGHT_RING.read().expect("CPU_HEIGHT_RING poisoned").clone()
+}
+
+/// Process-global snapshot of the most-recently-built tiered height CLIPMAP — the multi-tier sibling of
+/// [`CPU_HEIGHT_RING`]. THIS is what the `edits::eval_primitive` `Terrain` branch and the mesh-bake
+/// coverage gate read now (fine-near/coarse-far terrain out to the full mesh-bake reach). `CPU_HEIGHT_RING`
+/// is kept in lockstep, pointed at tier 0, for the gated single-ring GPU bake + the per-ring parity tests.
+/// `None` until the first clipmap is built. `Arc<Vec<…>>` so reads are a cheap handle clone.
+static CPU_HEIGHT_CLIPMAP: RwLock<Option<Arc<HeightClipmap>>> = RwLock::new(None);
+
+/// Publish a freshly-built clipmap as the CPU snapshot (see [`CPU_HEIGHT_CLIPMAP`]). Replaces the prior
+/// snapshot wholesale. Called by the `WorldGenPlugin` after each `build_height_clipmap`.
+pub fn set_cpu_height_clipmap(clipmap: Option<Arc<HeightClipmap>>) {
+    *CPU_HEIGHT_CLIPMAP.write().expect("CPU_HEIGHT_CLIPMAP poisoned") = clipmap;
+}
+
+/// Current CPU clipmap snapshot (a cheap `Arc` clone), or `None` if none built yet. The `Terrain`
+/// `eval_primitive` branch + the mesh-bake coverage gate read this.
+pub fn cpu_height_clipmap() -> Option<Arc<HeightClipmap>> {
+    CPU_HEIGHT_CLIPMAP.read().expect("CPU_HEIGHT_CLIPMAP poisoned").clone()
 }
 
 /// Process-global world-XZ offset of the streaming `Terrain` volume's transform — the sibling of
@@ -490,6 +608,24 @@ mod tests {
             store.insert(coord, Arc::new(field));
         }
         store
+    }
+
+    /// Build chunks for a SPECIFIC tier into a store: `LayerId(tier)`, chunk edge `cells`, sampled from
+    /// the same world-anchored fBm (so cross-tier values agree). Lets one store hold several tiers.
+    fn insert_tier(store: &mut ArtifactStore<ScalarField2D>, tier: u32, cells: u32, coords: &[(i32, i32)], seed: u64) {
+        let layer = HeightLayer::new_tier(LayerId(tier), HeightParams::default(), cells);
+        let size = ChunkSize::new(cells);
+        for &(x, z) in coords {
+            let coord = ChunkCoord::new(LayerId(tier), IVec3::new(x, 0, z));
+            let mut field = ScalarField2D::zeroed(coord, size, HEIGHT_FIELD_RES);
+            for j in 0..=HEIGHT_FIELD_RES {
+                for i in 0..=HEIGHT_FIELD_RES {
+                    let wp = field.node_world_xz(i, j);
+                    field.set(i, j, layer.sample_world(wp.x, wp.y, seed));
+                }
+            }
+            store.insert(coord, Arc::new(field));
+        }
     }
 
     #[test]
@@ -748,5 +884,99 @@ mod tests {
         let s = HEIGHT_CHUNK_CELLS as f64;
         let wp = DVec2::new((-3.0 + 0.5) * s, (-5.0 + 0.5) * s);
         assert!(sample_ring(&ring, wp).is_some(), "negative-coord chunk must resolve");
+    }
+
+    // --- Tiered clipmap tests ---
+
+    /// Build a 2-tier clipmap: tier 0 (fine, edge `HEIGHT_CHUNK_CELLS`) resident only near the origin,
+    /// tier 1 (coarse, edge `2·HEIGHT_CHUNK_CELLS`) resident over a wider region. A NEAR point is covered
+    /// by both → finest (tier 0) serves it; a FAR point is covered only by tier 1 → tier 1 serves it.
+    fn two_tier_clipmap(seed: u64) -> HeightClipmap {
+        let c0 = HEIGHT_CHUNK_CELLS;
+        let c1 = HEIGHT_CHUNK_CELLS * 2;
+        let mut store = ArtifactStore::new();
+        // Tier 0: a 2×2 fine block around the origin (covers chunks {0,1}²).
+        insert_tier(&mut store, 0, c0, &[(0, 0), (1, 0), (0, 1), (1, 1)], seed);
+        // Tier 1: a 3×3 coarse block (covers chunks {0,1,2}² → world out to 6·HEIGHT_CHUNK_CELLS).
+        insert_tier(&mut store, 1, c1, &[(0, 0), (1, 0), (2, 0), (0, 1), (1, 1), (2, 1), (0, 2), (1, 2), (2, 2)], seed);
+        build_height_clipmap(&store, &[c0, c1])
+    }
+
+    /// `build_height_ring_for_tier` builds a coarse tier with the right chunk size + node spacing, and
+    /// it ignores chunks belonging to other tiers in the shared store.
+    #[test]
+    fn build_tier_ring_uses_tier_chunk_size_and_filters_layer() {
+        let c0 = HEIGHT_CHUNK_CELLS;
+        let c1 = HEIGHT_CHUNK_CELLS * 2;
+        let mut store = ArtifactStore::new();
+        insert_tier(&mut store, 0, c0, &[(0, 0)], 1);
+        insert_tier(&mut store, 1, c1, &[(0, 0)], 1);
+        let ring1 = build_height_ring_for_tier(&store, LayerId(1), c1);
+        assert_eq!(ring1.chunk_world_size, c1 as f32);
+        assert_eq!(ring1.node_spacing, c1 as f32 / HEIGHT_FIELD_RES as f32);
+        // Only tier-1's chunk (0,0) is resident in this ring; tier-0's chunk didn't leak in.
+        assert_eq!(ring_resident_bounds(&ring1), Some((IVec2::ZERO, IVec2::ZERO)));
+    }
+
+    /// The clipmap sampler picks the FINEST covering tier: a near point in tier 0 is served by tier 0;
+    /// a far point covered only by tier 1 is served by tier 1. We distinguish which tier served by the
+    /// node spacing the sample interpolated over (tier 0 = 2 m, tier 1 = 4 m) — sampling at a point
+    /// off-node in tier 0 but on a tier-1 node should match tier 1 exactly only when tier 1 serves it.
+    #[test]
+    fn clipmap_samples_finest_covering_tier() {
+        let clip = two_tier_clipmap(123);
+        let s0 = HEIGHT_CHUNK_CELLS as f64;
+        // NEAR point inside tier-0's loaded block (chunk (0,0)) → tier 0 serves it. Matches tier 0's ring.
+        let near = DVec2::new(0.5 * s0, 0.5 * s0);
+        let got_near = try_sample_clipmap_lod(&clip, near, 0.0).expect("near covered");
+        let tier0 = sample_ring(&clip[0], near).expect("tier0 covers near");
+        assert_eq!(got_near.height.to_bits(), tier0.height.to_bits(), "near point served by finest tier 0");
+        // FAR point beyond tier-0's block (chunk (2,2) in fine units) but inside tier-1 → tier 1 serves.
+        let far = DVec2::new(2.5 * s0, 2.5 * s0);
+        assert!(sample_ring(&clip[0], far).is_none(), "tier 0 does NOT cover the far point");
+        let got_far = try_sample_clipmap_lod(&clip, far, 0.0).expect("far covered by coarse tier");
+        let tier1 = sample_ring(&clip[1], far).expect("tier1 covers far");
+        assert_eq!(got_far.height.to_bits(), tier1.height.to_bits(), "far point served by coarse tier 1");
+    }
+
+    /// `clipmap_covers_aabb` is true for a far footprint once its COARSE tier is resident (even though
+    /// the fine tier doesn't reach), and false when NO tier covers it.
+    #[test]
+    fn clipmap_covers_far_via_coarse_tier() {
+        let clip = two_tier_clipmap(7);
+        let s0 = HEIGHT_CHUNK_CELLS as f32;
+        // A far footprint the FINE tier can't reach but the COARSE tier (3×3 of 2·cell chunks) covers.
+        let far_min = bevy::math::Vec2::new(2.1 * s0, 2.1 * s0);
+        let far_max = bevy::math::Vec2::new(3.9 * s0, 3.9 * s0); // within coarse chunks {1,2}² (world [2·c0, 6·c0])
+        assert!(!ring_covers_aabb(&clip[0], far_min, far_max), "fine tier does not reach the far footprint");
+        assert!(clipmap_covers_aabb(&clip, far_min, far_max), "coarse tier admits the far footprint");
+        // Wholly outside every tier → not covered.
+        let out_min = bevy::math::Vec2::new(50.0 * s0, 50.0 * s0);
+        let out_max = bevy::math::Vec2::new(50.5 * s0, 50.5 * s0);
+        assert!(!clipmap_covers_aabb(&clip, out_min, out_max), "no tier covers a far-far footprint");
+        // Empty clipmap covers nothing.
+        let empty: HeightClipmap = Vec::new();
+        assert!(!clipmap_covers_aabb(&empty, far_min, far_max));
+    }
+
+    /// The STRICT clipmap sampler PANICS when no tier covers — a rendered miss is a coverage-gate bug.
+    #[test]
+    #[should_panic(expected = "outside loaded clipmap coverage")]
+    fn strict_clipmap_sampler_panics_on_miss() {
+        let clip = two_tier_clipmap(2);
+        let s0 = HEIGHT_CHUNK_CELLS as f64;
+        // Far outside every tier's loaded region.
+        let _ = sample_clipmap_lod(&clip, DVec2::new(100.0 * s0, 100.0 * s0), 1.0);
+    }
+
+    /// The CPU clipmap global round-trips a published clipmap and clears back to `None`.
+    #[test]
+    fn cpu_height_clipmap_global_roundtrips() {
+        let clip = Arc::new(two_tier_clipmap(5));
+        set_cpu_height_clipmap(Some(clip.clone()));
+        let got = cpu_height_clipmap().expect("clipmap published");
+        assert!(Arc::ptr_eq(&got, &clip));
+        set_cpu_height_clipmap(None);
+        assert!(cpu_height_clipmap().is_none());
     }
 }

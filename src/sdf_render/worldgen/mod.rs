@@ -36,7 +36,10 @@ use crate::sdf_render::{SdfCamera, SdfOrbitCamera, SdfVolume};
 
 use layers::height::{HEIGHT_CHUNK_CELLS, HeightParams};
 use manager::LayerManager;
-use upload::{HeightRingCpu, build_height_ring, set_cpu_height_ring, set_cpu_terrain_offset};
+use upload::{
+    HeightRingCpu, build_height_clipmap, build_height_ring, set_cpu_height_clipmap,
+    set_cpu_height_ring, set_cpu_terrain_offset,
+};
 
 /// Master switch for the procedural worldgen vertical slice. Default ON so the terrain shows when
 /// the editor scene loads; flip off to fall back to a plain authored scene with no streamed terrain.
@@ -53,15 +56,37 @@ impl Default for WorldGenEnabled {
 /// the slice pins it so the streamed terrain is reproducible across runs.
 pub const WORLDGEN_SLICE_SEED: u64 = 0xA15E_C0DE_2026;
 
-/// Generation radius (world metres) the manager keeps resident around the focus — the rolling region
-/// the `LayerManager` keeps generated as the camera explores. The render volume no longer needs to fit
-/// inside this radius: the volume is world-anchored and effectively infinite (`WORLDGEN_TERRAIN_HALF_XZ`
-/// below), and the residency COVERAGE GATE (`mesh_bake::mesh_resident_chunks` + `upload::ring_covers_aabb`)
-/// is what now guarantees no chunk meshes ground the ring hasn't loaded — so the old "radius > volume
-/// half-extent margin" rationale is gone (the gate, not a margin, is the guarantee). Invariant retained:
-/// `2·radius = 960 < RING·chunk = 8·128 = 1024`, so no two resident chunks alias one ring slot
+/// Tier-0 generation radius (world metres) the manager keeps resident around the focus — the finest
+/// clipmap tier's rolling ring window. Each coarser tier `t` uses `WORLDGEN_SLICE_RADIUS·2^t` (handled
+/// in [`LayerManager::new_clipmap`]). The render volume no longer needs to fit inside this radius: the
+/// volume is world-anchored and effectively infinite (`WORLDGEN_TERRAIN_HALF_XZ` below), and the
+/// residency COVERAGE GATE (`mesh_bake::mesh_resident_chunks` + `upload::clipmap_covers_aabb`) is what
+/// now guarantees no chunk meshes ground the clipmap hasn't loaded — so the old "radius > volume
+/// half-extent margin" rationale is gone (the gate, not a margin, is the guarantee). Per-tier invariant
+/// retained: `2·radius = 960 < RING·chunk = 8·128 = 1024` (and it scales with the tier, since both the
+/// radius and the chunk size double per tier), so no two resident chunks alias one ring slot
 /// (`slice_radius_respects_ring_invariant`).
 pub const WORLDGEN_SLICE_RADIUS: f64 = HEIGHT_CHUNK_CELLS as f64 * 3.75;
+
+/// World reach (±metres from the focus) tier `t` of the height clipmap covers:
+/// `(HEIGHT_RING_CHUNKS/2)·HEIGHT_CHUNK_CELLS·2^t = 512·2^t` with the defaults. The coarsest tier
+/// (`T-1`) must reach the mesh-bake clipmap's coarsest-LOD outer reach so terrain extends to the full
+/// LOD-`(lod_count-1)` extent.
+pub fn height_tier_reach(tier: u32) -> f64 {
+    (upload::HEIGHT_RING_CHUNKS as f64 / 2.0) * HEIGHT_CHUNK_CELLS as f64 * (1u64 << tier) as f64
+}
+
+/// SSOT for the height-clipmap TIER COUNT `T`, derived from the mesh-bake clipmap so terrain auto-extends
+/// to the full LOD-`(lod_count-1)` reach (and auto-grows if the default `lod_count` changes). Choose the
+/// smallest `T` whose COARSEST tier's covered radius (`512·2^(T-1)`) ≥ `reach` (the coarsest-LOD outer
+/// half-extent from `mesh_bake::coarsest_lod_outer_reach`). `T ≥ 1` always.
+pub fn height_clipmap_tiers(reach: f64) -> u32 {
+    let mut t = 1u32;
+    while height_tier_reach(t - 1) < reach {
+        t += 1;
+    }
+    t
+}
 
 /// World half-extent of the single global `Terrain` volume. Now a LARGE, effectively-infinite extent so
 /// the ONE world-anchored volume spans the whole explorable area. World-anchored ⇒ its `inv_model` never
@@ -106,13 +131,27 @@ pub struct WorldGenPlugin;
 
 impl Plugin for WorldGenPlugin {
     fn build(&self, app: &mut App) {
+        // Derive the height-clipmap tier count `T` from the mesh-bake clipmap (SSOT): `T` tiers must
+        // cover the coarsest-LOD outer reach so terrain extends to the full LOD-`(lod_count-1)` extent.
+        let grid = crate::sdf_render::SdfGridConfig::default();
+        let mesh_cfg = crate::sdf_render::mesh_bake::MeshBakeConfig::default();
+        let reach = crate::sdf_render::mesh_bake::coarsest_lod_outer_reach(&grid, &mesh_cfg) as f64;
+        let tiers = height_clipmap_tiers(reach);
+        info!(
+            "worldgen height clipmap: {tiers} tiers (tier 0 = ±{} m, coarsest tier {} = ±{} m) covering \
+             mesh-bake coarsest-LOD reach ±{reach:.0} m",
+            height_tier_reach(0),
+            tiers - 1,
+            height_tier_reach(tiers - 1),
+        );
+
         app.init_resource::<WorldGenEnabled>()
             .init_resource::<HeightParams>()
             .init_resource::<WorldGenGpuRing>()
-            .insert_resource(LayerManager::new_slice(
+            .insert_resource(LayerManager::new_clipmap(
                 WORLDGEN_SLICE_SEED,
                 HeightParams::default(),
-                WORLDGEN_SLICE_RADIUS,
+                tiers,
             ))
             .register_type::<HeightParams>()
             .add_systems(
@@ -249,8 +288,17 @@ fn roll_worldgen(
         return; // nothing streamed and no param edit → ring unchanged, nothing to publish.
     }
 
-    // Rebuild the ring from the resident store, publish to the GPU + CPU consumers. Build once and
-    // share via clone (the CPU snapshot + the GPU payload) rather than running the fBm twice.
+    // Rebuild the tiered CLIPMAP from the resident store and publish it as the CPU snapshot the Terrain
+    // eval + coverage gate read (fine-near/coarse-far terrain to the full mesh-bake reach). One ring per
+    // tier; tier `t`'s chunk edge is `HEIGHT_CHUNK_CELLS·2^t`.
+    let tier_cells: Vec<u32> =
+        (0..manager.tier_count()).map(|t| HEIGHT_CHUNK_CELLS << t).collect();
+    let clipmap = build_height_clipmap(manager.height_store(), &tier_cells);
+    set_cpu_height_clipmap(Some(Arc::new(clipmap)));
+
+    // ALSO keep the single tier-0 ring published for the gated GPU bake (which binds ONE ring) + the
+    // per-ring parity tests. The GPU path is NOT extended to multiple tiers here (out of scope) — it
+    // simply renders tier 0 where present; the on-screen MESH path uses the full clipmap above.
     let ring = build_height_ring(manager.height_store());
     set_cpu_height_ring(Some(Arc::new(ring.clone())));
     gpu_ring.ring = Some(ring);
@@ -304,7 +352,8 @@ mod plugin_tests {
     use super::*;
 
     /// The slice invariants hold: `2·radius < RING·chunk_size` (no ring-slot aliasing), and the
-    /// terrain band brackets the default height amplitude.
+    /// terrain band brackets the default height amplitude. Both the radius and the chunk size double per
+    /// tier, so the tier-0 check implies it for every tier.
     #[test]
     fn slice_radius_respects_ring_invariant() {
         let ring_span = upload::HEIGHT_RING_CHUNKS as f64 * HEIGHT_CHUNK_CELLS as f64;
@@ -313,6 +362,33 @@ mod plugin_tests {
             "2·radius ({}) must be < RING·chunk ({ring_span})",
             2.0 * WORLDGEN_SLICE_RADIUS
         );
+    }
+
+    /// The derived tier count `T` covers the mesh-bake coarsest-LOD reach for the DEFAULT configs — so
+    /// "terrain to the full LOD-8 reach" is guaranteed, and `T` auto-extends if the default `lod_count`
+    /// changes. Asserts `512·2^(T-1) ≥ reach` and that `T-1` is the SMALLEST such tier (no over-build).
+    #[test]
+    fn clipmap_tiers_cover_mesh_bake_reach() {
+        let grid = crate::sdf_render::SdfGridConfig::default();
+        let mesh_cfg = crate::sdf_render::mesh_bake::MeshBakeConfig::default();
+        let reach = crate::sdf_render::mesh_bake::coarsest_lod_outer_reach(&grid, &mesh_cfg) as f64;
+        let t = height_clipmap_tiers(reach);
+        assert!(t >= 1);
+        assert!(
+            height_tier_reach(t - 1) >= reach,
+            "coarsest tier {} covers ±{} m but reach is ±{reach} m",
+            t - 1,
+            height_tier_reach(t - 1),
+        );
+        // Minimal: one fewer tier would NOT cover (unless T==1, i.e. tier 0 already covers).
+        if t > 1 {
+            assert!(
+                height_tier_reach(t - 2) < reach,
+                "T is not minimal: tier {} already covers ±{} m ≥ reach ±{reach} m",
+                t - 2,
+                height_tier_reach(t - 2),
+            );
+        }
     }
 
     #[test]

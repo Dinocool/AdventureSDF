@@ -387,23 +387,25 @@ pub fn eval_primitive(prim: &SdfPrimitive, p: Vec3, voxel_size: f32) -> f32 {
             let world_xz =
                 bevy::math::DVec2::new((p.x + offset.x) as f64, (p.z + offset.y) as f64);
             if voxel_size > 0.0 {
-                // RENDERING bake: strict — the coverage gate guarantees a covered ring here.
-                let ring = crate::sdf_render::worldgen::upload::cpu_height_ring().unwrap_or_else(|| {
+                // RENDERING bake: strict — the coverage gate guarantees a covering tier here. Sample the
+                // tiered CLIPMAP (finest covering tier per voxel: fine near, coarse far out to the full
+                // mesh-bake reach), which PANICS on a miss (a rendered miss is a coverage-gate bug).
+                let clipmap = crate::sdf_render::worldgen::upload::cpu_height_clipmap().unwrap_or_else(|| {
                     panic!(
                         "terrain sampled outside loaded coverage — a rendering bake (voxel_size={voxel_size}) \
-                         ran before any height ring was built; the residency coverage gate should have \
+                         ran before any height clipmap was built; the residency coverage gate should have \
                          prevented this. world_xz={world_xz:?}"
                     )
                 });
-                let node = crate::sdf_render::worldgen::upload::sample_ring_lod(
-                    &ring, world_xz, voxel_size,
+                let node = crate::sdf_render::worldgen::upload::sample_clipmap_lod(
+                    &clipmap, world_xz, voxel_size,
                 );
                 p.y - node.height
             } else {
                 // NON-RENDERING query: a miss is legitimately empty space → large POSITIVE distance.
-                match crate::sdf_render::worldgen::upload::cpu_height_ring() {
-                    Some(ring) => match crate::sdf_render::worldgen::upload::try_sample_ring_lod(
-                        &ring, world_xz, voxel_size,
+                match crate::sdf_render::worldgen::upload::cpu_height_clipmap() {
+                    Some(clipmap) => match crate::sdf_render::worldgen::upload::try_sample_clipmap_lod(
+                        &clipmap, world_xz, voxel_size,
                     ) {
                         Some(node) => p.y - node.height,
                         None => *max_height - p.y + 1.0e4,
@@ -1405,25 +1407,25 @@ mod tests {
         assert_eq!(g.material_id, 2);
     }
 
-    /// With no ring published, a NON-RENDERING Terrain query (`voxel_size == 0.0`) reads as EMPTY
+    /// With no clipmap published, a NON-RENDERING Terrain query (`voxel_size == 0.0`) reads as EMPTY
     /// SPACE — a large POSITIVE distance (outside), NOT a corruption-hiding mid-band plane. This is the
     /// worldgen-disabled / not-yet-built / unloaded-ground path for picking/classification/tests.
     #[test]
     fn terrain_eval_empty_space_without_ring_nonrendering() {
-        crate::sdf_render::worldgen::upload::set_cpu_height_ring(None);
+        crate::sdf_render::worldgen::upload::set_cpu_height_clipmap(None);
         let prim = SdfPrimitive::Terrain { half_xz: Vec2::splat(100.0), min_height: 0.0, max_height: 40.0 };
-        // No ring + non-rendering query ⇒ empty: `max_height - p.y + 1e4` = 40 - 25 + 10000.
+        // No clipmap + non-rendering query ⇒ empty: `max_height - p.y + 1e4` = 40 - 25 + 10000.
         let d = eval_primitive(&prim, Vec3::new(3.0, 25.0, -7.0), 0.0);
         assert!(d > 1.0e3, "unloaded ground reads as empty (large positive), got {d}");
         assert!((d - (40.0 - 25.0 + 1.0e4)).abs() < 1e-1, "empty-space distance = {d}");
     }
 
-    /// A RENDERING Terrain bake (`voxel_size > 0.0`) with no ring built PANICS — a rendered miss is a
+    /// A RENDERING Terrain bake (`voxel_size > 0.0`) with no clipmap built PANICS — a rendered miss is a
     /// coverage-gate bug, never a silent fallback.
     #[test]
     #[should_panic(expected = "outside loaded coverage")]
     fn terrain_eval_rendering_panics_without_ring() {
-        crate::sdf_render::worldgen::upload::set_cpu_height_ring(None);
+        crate::sdf_render::worldgen::upload::set_cpu_height_clipmap(None);
         let prim = SdfPrimitive::Terrain { half_xz: Vec2::splat(100.0), min_height: 0.0, max_height: 40.0 };
         let _ = eval_primitive(&prim, Vec3::new(3.0, 25.0, -7.0), 2.0);
     }
@@ -1442,7 +1444,7 @@ mod tests {
         };
         use crate::sdf_render::worldgen::store::ArtifactStore;
         use crate::sdf_render::worldgen::upload::{
-            build_height_ring, cpu_terrain_offset, sample_ring, set_cpu_height_ring,
+            build_height_ring, cpu_terrain_offset, sample_ring, set_cpu_height_clipmap,
             set_cpu_terrain_offset,
         };
         use std::sync::Arc;
@@ -1463,7 +1465,8 @@ mod tests {
         let mut store = ArtifactStore::new();
         store.insert(coord, Arc::new(field));
         let ring = build_height_ring(&store);
-        set_cpu_height_ring(Some(Arc::new(ring.clone())));
+        // Publish a single-tier clipmap (tier 0) — the Terrain eval reads the clipmap snapshot now.
+        set_cpu_height_clipmap(Some(Arc::new(vec![ring.clone()])));
 
         // Volume translated so a LOCAL XZ near the origin maps into chunk (3,2). The offset IS the
         // volume's world-XZ translation; a local point `lp` then samples the ring at `lp + offset`.
@@ -1494,7 +1497,7 @@ mod tests {
 
         // Reset globals so other tests aren't affected.
         set_cpu_terrain_offset(Vec2::ZERO);
-        set_cpu_height_ring(None);
+        set_cpu_height_clipmap(None);
     }
 
     // Mirror of `worldgen::WORLDGEN_TERRAIN_HALF_XZ` (384) for the test prim's footprint; kept local

@@ -270,7 +270,7 @@ fn terrain_chunk_covered(
     config: &SdfGridConfig,
     k: u32,
     terrain_xz_aabbs: &[(Vec2, Vec2)],
-    ring: Option<&crate::sdf_render::worldgen::upload::HeightRingCpu>,
+    clipmap: Option<&crate::sdf_render::worldgen::upload::HeightClipmap>,
 ) -> bool {
     let b = chunk_aabb(key, config, k);
     let cmin = Vec2::new(b.min.x, b.min.z);
@@ -282,13 +282,17 @@ fn terrain_chunk_covered(
     if !touches_terrain {
         return true; // no terrain sampled here → gate doesn't apply.
     }
-    let Some(ring) = ring else {
+    let Some(clipmap) = clipmap else {
         return false; // touches terrain but nothing loaded → not generatable yet.
     };
     let margin = config.voxel_size_at(key.lod)
         + 2.0 * crate::sdf_render::worldgen::layers::height::HEIGHT_CHUNK_CELLS as f32;
     let m = Vec2::splat(margin);
-    crate::sdf_render::worldgen::upload::ring_covers_aabb(ring, cmin - m, cmax + m)
+    // SOME tier must fully cover the footprint. A km-wide far-LOD chunk is admitted once its COARSE
+    // tier is resident (coarser tiers cover larger footprints) → the distance fills in to the full
+    // mesh-bake reach. The clipmap sampler picks the finest covering tier per voxel, so a chunk this
+    // gate admits can never miss the strict `eval_primitive` Terrain sampler.
+    crate::sdf_render::worldgen::upload::clipmap_covers_aabb(clipmap, cmin - m, cmax + m)
 }
 
 /// LOD-0-chunk index RANGE `[lo, hi)` (per axis) occupied by a LOD-`key.lod` chunk. A LOD-L chunk spans
@@ -317,6 +321,20 @@ fn lod_centre(config: &SdfGridConfig, k: u32, cam: Vec3, lod: u32) -> IVec3 {
     let align = 1i32 << (lod + 1); // 2 LOD-`lod` chunks, in LOD-0 chunk units
     let snap = |c: f32| ((c / cw0 / align as f32).round() as i32) * align;
     IVec3::new(snap(cam.x), snap(cam.y), snap(cam.z))
+}
+
+/// The mesh-bake clipmap's COARSEST-LOD outer reach (world metres from the focus): the half-extent of
+/// the LOD-`(lod_count-1)` shell cube, mirroring the `shell_cube` formula in the residency loop —
+/// `half = (half0 << lod) · cw0`, where `cw0 = k · brick_world_size(0)`, `half0 = lod0_half_chunks`,
+/// `lod = lod_count - 1`. SSOT for the worldgen height-clipmap tier count: the coarsest height tier must
+/// cover at least this reach so terrain extends to the full mesh-bake extent. Pure function of the two
+/// configs (uses the SAME `k` clamp the bake uses), so it auto-tracks any default `lod_count` change.
+pub(crate) fn coarsest_lod_outer_reach(config: &SdfGridConfig, mesh_cfg: &MeshBakeConfig) -> f32 {
+    let k = mesh_cfg.chunk_bricks.clamp(1, 8);
+    let cw0 = k as f32 * config.brick_world_size(0);
+    let half0 = lod0_half_chunks(config, mesh_cfg, k);
+    let lod = effective_lod_count(config, mesh_cfg, true).saturating_sub(1); // coarsest LOD index
+    (half0 << lod) as f32 * cw0
 }
 
 /// LOD-0 cube half-extent in LOD-0 chunks — rounded to an EVEN number so the finer cube (half this) stays
@@ -809,7 +827,7 @@ fn mesh_resident_chunks(
             )
         })
         .collect();
-    let height_ring = crate::sdf_render::worldgen::upload::cpu_height_ring();
+    let height_clipmap = crate::sdf_render::worldgen::upload::cpu_height_clipmap();
 
     // The baked mesh is appearance-INDEPENDENT: vertices carry only geometry + top-2 material *ids* + a blend
     // weight, never colours/PBR scalars. A material colour/PBR edit therefore needs no re-bake — the shared
@@ -890,7 +908,7 @@ fn mesh_resident_chunks(
                 // ±radius ring fails this → it stops at the coverage edge (the corrupt far slab is gone);
                 // as the ring rolls, newly-covered chunks enter resident per-chunk, evicted ones leave.
                 if !terrain_xz_aabbs.is_empty() && !terrain_chunk_covered(
-                    key, &config, k, &terrain_xz_aabbs, height_ring.as_deref(),
+                    key, &config, k, &terrain_xz_aabbs, height_clipmap.as_deref(),
                 ) {
                     continue;
                 }
@@ -1303,7 +1321,8 @@ mod tests {
                 store.insert(coord, Arc::new(field));
             }
         }
-        let ring = Arc::new(build_height_ring(&store));
+        // Wrap the single ring as a 1-tier clipmap (the gate samples a clipmap now).
+        let clipmap = vec![build_height_ring(&store)];
 
         let (cfg, _mc) = cfgs();
         let k = 4u32;
@@ -1314,24 +1333,24 @@ mod tests {
         // A fine LOD-0 chunk at the origin → deep inside the loaded block → covered → gate passes.
         let inside_coord = chunk(&cfg, k, 0, 0);
         assert!(
-            terrain_chunk_covered(inside_coord, &cfg, k, &terrain, Some(&ring)),
+            terrain_chunk_covered(inside_coord, &cfg, k, &terrain, Some(&clipmap)),
             "a fine chunk inside the loaded block must pass the coverage gate"
         );
 
         // A HUGE far chunk: a coarse LOD that spans kilometres reaches far outside the ±loaded ring.
         let far = chunk(&cfg, k, 7, 64);
         assert!(
-            !terrain_chunk_covered(far, &cfg, k, &terrain, Some(&ring)),
+            !terrain_chunk_covered(far, &cfg, k, &terrain, Some(&clipmap)),
             "an oversized far chunk must be excluded (outside loaded coverage)"
         );
 
-        // No ring loaded yet ⇒ any terrain-touching chunk is excluded.
+        // No clipmap loaded yet ⇒ any terrain-touching chunk is excluded.
         assert!(
             !terrain_chunk_covered(inside_coord, &cfg, k, &terrain, None),
-            "with no ring loaded, a terrain chunk must not be resident"
+            "with no clipmap loaded, a terrain chunk must not be resident"
         );
 
-        // A chunk that touches NO terrain edit is unaffected by the gate (passes regardless of ring).
+        // A chunk that touches NO terrain edit is unaffected by the gate (passes regardless of clipmap).
         let no_terrain: Vec<(Vec2, Vec2)> = Vec::new();
         assert!(terrain_chunk_covered(far, &cfg, k, &no_terrain, None));
     }
