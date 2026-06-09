@@ -1739,6 +1739,240 @@ mod tests {
         );
     }
 
+    // =================================================================================================
+    // TERRAIN CROSS-LOD REGRESSION HARNESS (Step 1) — the structural guard against LOD seams on the REAL
+    // eroded terrain (sphere/cube watertight tests never exercised the height-field path). Bakes a fine
+    // chunk (LOD L-1) and an abutting coarse chunk (LOD L) across a forced 2:1 boundary on the actual
+    // eroded `HeightLayer::sample_world` surface, then asserts (a) geometric watertightness and (b)
+    // normal continuity across the shared boundary — the latter is what catches the visible shading KINK.
+    // =================================================================================================
+
+    /// Build + publish a single-tier (tier 0) eroded-terrain height clipmap covering height chunks
+    /// `(cx, cz)` over `xrange × zrange`, with `set_cpu_terrain_offset(ZERO)`. Returns the published
+    /// `Arc<HeightClipmap>` (also installed in the process-global so the bake/coverage gate read it).
+    /// Mirrors the `terrain_eval_*` publish pattern in `edits.rs`.
+    fn publish_eroded_terrain_clipmap(
+        xrange: std::ops::RangeInclusive<i32>,
+        zrange: std::ops::RangeInclusive<i32>,
+        seed: u64,
+    ) -> Arc<HeightClipmap> {
+        use crate::sdf_render::worldgen::artifact::ScalarField2D;
+        use crate::sdf_render::worldgen::coord::{ChunkCoord, ChunkSize, LayerId};
+        use crate::sdf_render::worldgen::layers::erosion::ErosionParams;
+        use crate::sdf_render::worldgen::layers::height::{
+            HEIGHT_CHUNK_CELLS, HEIGHT_FIELD_RES, HeightLayer, HeightParams,
+        };
+        use crate::sdf_render::worldgen::store::ArtifactStore;
+        use crate::sdf_render::worldgen::upload::{
+            build_height_clipmap, set_cpu_height_clipmap, set_cpu_terrain_offset,
+        };
+
+        // The REAL eroded terrain layer (default params ⇒ ridge fold + erosion carve ON).
+        let layer = HeightLayer::new(LayerId(0), HeightParams::default(), ErosionParams::default());
+        let size = ChunkSize::new(HEIGHT_CHUNK_CELLS);
+        let mut store = ArtifactStore::new();
+        for cz in zrange.clone() {
+            for cx in xrange.clone() {
+                let coord = ChunkCoord::new(LayerId(0), IVec3::new(cx, 0, cz));
+                let mut field = ScalarField2D::zeroed(coord, size, HEIGHT_FIELD_RES);
+                for j in 0..=HEIGHT_FIELD_RES {
+                    for i in 0..=HEIGHT_FIELD_RES {
+                        let wp = field.node_world_xz(i, j);
+                        field.set(i, j, layer.sample_world(wp.x, wp.y, seed));
+                    }
+                }
+                store.insert(coord, Arc::new(field));
+            }
+        }
+        // Single tier 0 (chunk edge = HEIGHT_CHUNK_CELLS), as Step 1 specifies.
+        let clip = Arc::new(build_height_clipmap(&store, &[HEIGHT_CHUNK_CELLS]));
+        set_cpu_height_clipmap(Some(clip.clone()));
+        set_cpu_terrain_offset(Vec2::ZERO);
+        clip
+    }
+
+    /// The world-anchored Terrain edit spanning the whole test region (IDENTITY transform, material 0,
+    /// plain Union) — its vertical band brackets the eroded surface so both chunks' Y windows cross it.
+    fn terrain_edit_for_band(min_h: f32, max_h: f32) -> edits::ResolvedEdit {
+        edits::ResolvedEdit::new(
+            crate::sdf_render::SdfPrimitive::Terrain {
+                half_xz: Vec2::splat(1.0e5),
+                min_height: min_h,
+                max_height: max_h,
+            },
+            Transform::IDENTITY,
+            crate::sdf_render::SdfOp { kind: crate::sdf_render::CsgKind::Union, smoothing: 0.0 },
+            0,
+        )
+    }
+
+    /// Count open mesh edges (not shared by exactly 2 triangles) whose midpoint is INTERIOR to the
+    /// combined bounding box `[bmin, bmax]` — i.e. NOT on any of its 6 outer faces. For an OPEN surface
+    /// patch (terrain), the outer perimeter is legitimately open (the surface exits the box there); a real
+    /// crack at the 2:1 seam shows up as an INTERIOR open edge (on the x=0 plane between the two chunks).
+    /// So this isolates the cross-LOD weld correctness from the patch's outer boundary. Welds vertices by
+    /// quantised world position (0.1 mm), exactly like [`open_edge_count`].
+    fn interior_open_edge_count(tris: &[(Vec3, Vec3, Vec3)], bmin: Vec3, bmax: Vec3) -> usize {
+        let q = |p: Vec3| {
+            [
+                (p.x as f64 * 1e4).round() as i64,
+                (p.y as f64 * 1e4).round() as i64,
+                (p.z as f64 * 1e4).round() as i64,
+            ]
+        };
+        // Key edges by their quantised endpoints (welds across the two chunk meshes); count incidences.
+        let mut edges: HashMap<([i64; 3], [i64; 3]), u32> = HashMap::new();
+        for (a, b, c) in tris {
+            for (u, v) in [(a, b), (b, c), (c, a)] {
+                let (mut ka, mut kb) = (q(*u), q(*v));
+                if ka > kb {
+                    std::mem::swap(&mut ka, &mut kb);
+                }
+                *edges.entry((ka, kb)).or_insert(0) += 1;
+            }
+        }
+        // Recover a world point from a quantised key (inverse of `q`).
+        let unq = |k: [i64; 3]| Vec3::new(k[0] as f32 * 1e-4, k[1] as f32 * 1e-4, k[2] as f32 * 1e-4);
+        // A point lies "on an outer face" if it is within tol of any of the box's 6 outer planes. An edge
+        // that TOUCHES the outer perimeter (either endpoint on an outer face) sits on the boundary of the
+        // open patch and is legitimately open — only edges with BOTH endpoints strictly interior count as a
+        // real cross-LOD crack. (Tol is generous to absorb the surface exiting near a corner.)
+        let tol = 1.0e-2;
+        let on_outer = |p: Vec3| {
+            (p.x - bmin.x).abs() <= tol
+                || (p.x - bmax.x).abs() <= tol
+                || (p.y - bmin.y).abs() <= tol
+                || (p.y - bmax.y).abs() <= tol
+                || (p.z - bmin.z).abs() <= tol
+                || (p.z - bmax.z).abs() <= tol
+        };
+        edges
+            .iter()
+            .filter(|(k, n)| **n != 2 && !on_outer(unq(k.0)) && !on_outer(unq(k.1)))
+            .count()
+    }
+
+    /// Pair boundary vertices of two meshes by quantised WORLD position (0.1 mm, same key as
+    /// `open_edge_count`) and return the WORST (smallest) normal dot over the shared vertices, plus the
+    /// count of shared vertices. A small dot ⇒ a shading KINK at the LOD seam (the visible artifact). The
+    /// worst dot over ALL shared positions bounds the seam; `None` if the meshes share no boundary vertex.
+    fn worst_boundary_normal_dot(
+        a: &ChunkMeshData,
+        a_origin: Vec3,
+        b: &ChunkMeshData,
+        b_origin: Vec3,
+    ) -> Option<(f32, usize)> {
+        let q = |p: Vec3| {
+            [
+                (p.x as f64 * 1e4).round() as i64,
+                (p.y as f64 * 1e4).round() as i64,
+                (p.z as f64 * 1e4).round() as i64,
+            ]
+        };
+        // World position → normalized normal for mesh A (first occurrence wins; co-located verts of one
+        // mesh carry the same analytic normal, so any is representative).
+        let mut a_norm: HashMap<[i64; 3], Vec3> = HashMap::new();
+        for (p, n) in a.positions.iter().zip(&a.normals) {
+            let world = Vec3::from(*p) + a_origin;
+            a_norm.entry(q(world)).or_insert_with(|| Vec3::from(*n).normalize_or_zero());
+        }
+        let mut worst = 1.0f32;
+        let mut shared = 0usize;
+        for (p, n) in b.positions.iter().zip(&b.normals) {
+            let world = Vec3::from(*p) + b_origin;
+            if let Some(na) = a_norm.get(&q(world)) {
+                let nb = Vec3::from(*n).normalize_or_zero();
+                if na.length() < 0.5 || nb.length() < 0.5 {
+                    continue; // skip degenerate normals (not a shading-continuity signal)
+                }
+                worst = worst.min(na.dot(nb));
+                shared += 1;
+            }
+        }
+        if shared == 0 { None } else { Some((worst, shared)) }
+    }
+
+    #[test]
+    fn terrain_2to1_boundary_is_watertight_and_normal_continuous() {
+        use crate::sdf_render::worldgen::layers::erosion::ErosionParams;
+        use crate::sdf_render::worldgen::layers::height::{HeightLayer, HeightParams};
+        use crate::sdf_render::worldgen::coord::LayerId;
+
+        let seed = 7u64;
+        // Resident height block around the origin (chunks (-2..2)² of HEIGHT_CHUNK_CELLS=128 m each) → the
+        // ±64 m chunk footprints below are deep inside loaded coverage (the strict sampler can't miss).
+        let clip = publish_eroded_terrain_clipmap(-2..=2, -2..=2, seed);
+
+        // 2:1 boundary on the world-0 coarse lattice, plane x = 0. The FINE chunk (+X side) and the COARSE
+        // chunk (−X side) span the SAME world size in EVERY axis (so the coarse +X transition face is FULLY
+        // tiled by the fine −X face — no dangling open boundary, only the genuine seam to test). The coarse
+        // chunk uses `sub` cells of `vsc`; the fine uses `2·sub` cells of `vsf = vsc/2`. The coarse +X face
+        // (bit 1 = HighX) is the transition (toward the finer neighbour). All origins sit on the coarse
+        // lattice so the transition-face samples coincide with the fine face (watertight by construction).
+        let (vsf, vsc, sub) = (1.0f32, 2.0f32, 32u32);
+        let span = sub as f32 * vsc; // 64 m — the common world edge of BOTH chunks
+        let sub_f = sub * 2; // fine cells per axis (same world span at half the voxel)
+
+        // Bracket the local eroded surface in Y so it crosses BOTH chunks. Sample the surface at the shared
+        // face's centre and centre the (tall enough) Y window on it.
+        let layer = HeightLayer::new(LayerId(0), HeightParams::default(), ErosionParams::default());
+        let h_mid = layer.sample_world(0.0, (span as f64) * 0.5, seed).height;
+        // Snap the chunk Y min to the coarse lattice so transition faces stay watertight, and make the Y
+        // window tall enough to contain the surface's variation across the footprint.
+        let y_min = ((h_mid - span * 0.5) / vsc).floor() * vsc;
+        let of = Vec3::new(0.0, y_min, 0.0); // fine: x∈[0, 64], y∈[y_min, y_min+64], z∈[0, 64]
+        let oc = Vec3::new(-span, y_min, 0.0); // coarse: x∈[-64, 0], same y/z span; +X (bit 1) = transition
+
+        // The vertical band only matters for the non-rendering miss fallback / band; size it generously.
+        let edit = terrain_edit_for_band(h_mid - 4.0 * span, h_mid + 4.0 * span);
+        let edits_v = [edit];
+        let idx = [0u32];
+
+        // Bake: fine = LOD 0, regular; coarse = LOD 1 with +X (HighX = bit 1) transition. `terrain_only =
+        // true` ⇒ analytic stored-gradient normals (the smooth normal the LOD seam is judged on). Pass the
+        // published clipmap as `mesh_chunk`'s `terrain` param (installed as the per-bake thread-local).
+        let fine = mesh_chunk(&edits_v, &idx, of, vsf, sub_f, 0, 0, false, Some(clip.clone()), true)
+            .expect("fine terrain chunk meshes");
+        let coarse = mesh_chunk(&edits_v, &idx, oc, vsc, sub, 1 << 1, 1, false, Some(clip.clone()), true)
+            .expect("coarse terrain chunk meshes");
+
+        // (a) GEOMETRIC: fine ∪ coarse must weld watertight across the shared x=0 seam — no gap / overlap.
+        // The terrain is an OPEN patch, so the combined box's OUTER perimeter is legitimately open (the
+        // surface exits there); only an INTERIOR open edge (on the x=0 seam) is a real cross-LOD crack.
+        let mut all = chunk_tris(&fine, of);
+        all.extend(chunk_tris(&coarse, oc));
+        let bmin = Vec3::new(oc.x, y_min, 0.0); // combined box min: x=-64, y=y_min, z=0
+        let bmax = Vec3::new(of.x + span, y_min + span, span); // x=+64, y=y_min+64, z=64
+        let open = interior_open_edge_count(&all, bmin, bmax);
+        assert_eq!(open, 0, "eroded terrain fine ∪ coarse must weld watertight across the 2:1 boundary");
+
+        // (b) NORMAL CONTINUITY across the boundary: shared boundary vertices' baked normals must agree.
+        // This catches the visible LOD seam (a shading kink, not a gap). The achieved tolerance below is
+        // what the analytic gradient (Step 2) + the transition-cell mip widening (Step 3) reach on the real
+        // eroded surface; it BOUNDS the seam and fails CI on regression.
+        let (worst, shared) = worst_boundary_normal_dot(&fine, of, &coarse, oc)
+            .expect("fine and coarse must share boundary vertices on the x=0 face");
+        assert!(shared >= 4, "expected several shared boundary verts on the seam, got {shared}");
+        println!("terrain 2:1 LOD seam: worst boundary normal dot {worst:.5} over {shared} shared verts");
+        // ACHIEVED tolerance on the eroded terrain across the 2:1 LOD boundary. The SHARED-FACE normals
+        // come from the clipmap's analytic STORED gradient (terrain_only ⇒ `terrain_normal`), and the
+        // Transvoxel transition rule (`transition_sample_vs`) makes the coarse transition FACE sample the
+        // SAME (finer) height mip as the abutting fine face — so both sides read the identical stored
+        // gradient and the shared-boundary normals match to ~1.0 (measured worst dot 1.00000). With the
+        // analytic gradient (Step 2) this is exact-by-construction at the seam; the gate is pinned just
+        // below 1.0 to absorb mip-downsample float noise and catch any regression that re-introduces a
+        // shared-face kink (e.g. a divergent mip select, or reverting terrain normals to a per-chunk FD).
+        const TERRAIN_LOD_NORMAL_DOT_MIN: f32 = 0.999;
+        assert!(
+            worst >= TERRAIN_LOD_NORMAL_DOT_MIN,
+            "LOD-boundary normal kink: worst shared-vertex normal dot {worst:.4} < tolerance \
+             {TERRAIN_LOD_NORMAL_DOT_MIN} over {shared} shared verts (a visible shading seam regressed)"
+        );
+
+        // Clean up the process-global so other tests aren't perturbed.
+        crate::sdf_render::worldgen::upload::set_cpu_height_clipmap(None);
+    }
+
     /// Bake a sphere ∪ cube (both centred at origin, so the solid is star-shaped about origin) in one chunk.
     /// `mat_s`/`mat_c` are the sphere/cube material ids. Returns the baked mesh + its world origin.
     fn merged_sphere_cube(mat_s: u16, mat_c: u16, smoothing: f32) -> (ChunkMeshData, Vec3) {
