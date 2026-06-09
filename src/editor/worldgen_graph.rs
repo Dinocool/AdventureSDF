@@ -96,9 +96,33 @@ pub struct WorldGraphEditor {
     popped: Vec<PoppedPreview>,
     /// Set by the Viewer when the user clicks a node's pop-out button; the panel snapshots it after show.
     pop_request: Option<NodeId>,
+    /// Set by the Viewer when the user clicks "→ panel"; the panel retargets the dockable preview panel.
+    to_panel: Option<NodeId>,
     /// Monotonic id source for popped windows (their stable GPU pool key).
     next_pop_id: u64,
 }
+
+/// The dockable, viewport-located preview panel's state: which node it shows + its own view.
+#[derive(Resource)]
+pub struct WorldgenPreviewPanel {
+    target: Option<(Vec<NodeId>, NodeId)>,
+    half: f64,
+    cam: (f32, f32),
+    pan: (f64, f64),
+    is3d: bool,
+    size: f32,
+    tex: Option<egui::TextureHandle>,
+    key: u64,
+}
+
+impl Default for WorldgenPreviewPanel {
+    fn default() -> Self {
+        Self { target: None, half: PREVIEW_HALF_M, cam: CAM_DEFAULT, pan: (0.0, 0.0), is3d: true, size: 480.0, tex: None, key: 0 }
+    }
+}
+
+/// Fixed GPU pool key for the dockable preview panel (distinct from inline high-bit keys + pop-out ids).
+const PANEL_GPU_KEY: u64 = 7;
 
 /// A node preview detached into its own floating window — carries its own nav path, view state, and
 /// texture so it stays live across navigation independently of the in-graph preview.
@@ -140,6 +164,7 @@ impl Default for WorldGraphEditor {
             enter: None,
             popped: Vec::new(),
             pop_request: None,
+            to_panel: None,
             next_pop_id: 1000,
         }
     }
@@ -170,6 +195,7 @@ pub struct WorldgenGraphEditorPlugin;
 impl Plugin for WorldgenGraphEditorPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<WorldGraphEditor>();
+        app.init_resource::<WorldgenPreviewPanel>();
         super::panels::register_panel(
             app,
             "worldgen/graph",
@@ -177,6 +203,15 @@ impl Plugin for WorldgenGraphEditorPlugin {
             super::panels::DockSide::Right,
             30,
             graph_panel,
+        );
+        // A viewport-located preview panel; "→ panel" on a node targets it.
+        super::panels::register_panel(
+            app,
+            "worldgen/node-preview",
+            "Node Preview",
+            super::panels::DockSide::Center,
+            10,
+            preview_panel,
         );
     }
 }
@@ -533,6 +568,8 @@ struct Viewer<'a> {
     enter: &'a mut Option<NodeId>,
     /// Set to a node id when the user clicks its pop-out button — the panel opens a window after the show.
     pop_request: &'a mut Option<NodeId>,
+    /// Set to a node id when the user clicks "→ panel" — retargets the dockable preview panel.
+    to_panel: &'a mut Option<NodeId>,
     /// Last frame's GPU preview textures (key → egui id) read by 3D inline previews.
     gpu_tex: &'a std::collections::HashMap<u64, egui::TextureId>,
     /// This frame's GPU preview requests, pushed by 3D inline previews; drained by the panel.
@@ -688,6 +725,9 @@ impl SnarlViewer<EdNode> for Viewer<'_> {
                             }
                             if ui.small_button(icon::ARROWS_OUT).on_hover_text("Pop out into a movable window").clicked() {
                                 *self.pop_request = Some(node);
+                            }
+                            if ui.small_button(icon::PICTURE_IN_PICTURE).on_hover_text("Show in the dockable preview panel (by the viewport)").clicked() {
+                                *self.to_panel = Some(node);
                             }
                         });
                         let h = self.zoom_half_m.entry(node).or_insert(PREVIEW_HALF_M);
@@ -1492,6 +1532,7 @@ fn graph_panel(world: &mut World, ui: &mut egui::Ui) {
         // the rest are the per-node preview caches the Viewer drives.
         editor.enter = None;
         editor.pop_request = None;
+        editor.to_panel = None;
         {
             let WorldGraphEditor {
                 snarl,
@@ -1508,6 +1549,7 @@ fn graph_panel(world: &mut World, ui: &mut egui::Ui) {
                 hovered_preview,
                 enter,
                 pop_request,
+                to_panel,
                 ..
             } = &mut *editor;
             let current = current_snarl_mut(snarl, nav);
@@ -1522,6 +1564,7 @@ fn graph_panel(world: &mut World, ui: &mut egui::Ui) {
                 prev_key,
                 enter,
                 pop_request,
+                to_panel,
                 gpu_tex: &gpu_tex,
                 gpu_reqs: &mut gpu_reqs,
                 pan,
@@ -1537,6 +1580,21 @@ fn graph_panel(world: &mut World, ui: &mut egui::Ui) {
         if let Some(id) = editor.enter.take() {
             editor.nav.push(id);
             editor.clear_node_caches();
+        }
+        // Retarget the dockable preview panel (snapshotting the node's nav + view state).
+        if let Some(node) = editor.to_panel.take() {
+            let nav = editor.nav.clone();
+            let half = editor.zoom_half_m.get(&node).copied().unwrap_or(PREVIEW_HALF_M);
+            let cam = editor.cam.get(&node).copied().unwrap_or(CAM_DEFAULT);
+            let pan = editor.pan.get(&node).copied().unwrap_or((0.0, 0.0));
+            let is3d = editor.surface.contains(&node);
+            if let Some(mut panel) = world.get_resource_mut::<WorldgenPreviewPanel>() {
+                panel.target = Some((nav, node));
+                panel.half = half;
+                panel.cam = cam;
+                panel.pan = pan;
+                panel.is3d = is3d;
+            }
         }
         // Pop a node's preview out into a movable window (snapshotting its current view state + nav path).
         if let Some(node) = editor.pop_request.take() {
@@ -1576,6 +1634,69 @@ fn graph_panel(world: &mut World, ui: &mut egui::Ui) {
         {
             reqs.0.append(&mut gpu_reqs);
         }
+    });
+}
+
+/// The dockable, viewport-located **Node Preview** panel — shows whichever node was sent via "→ panel",
+/// large, with its own 2D/3D + zoom/pan/orbit (GPU 3D via the shared pool, CPU 2D).
+fn preview_panel(world: &mut World, ui: &mut egui::Ui) {
+    let Some((nav, node)) = world.resource::<WorldgenPreviewPanel>().target.clone() else {
+        ui.label("No preview targeted. In the Biome Graph, click a node preview's ▢ button to show it here.");
+        return;
+    };
+    // Compile the targeted node's sub-graph from the editor snarl.
+    let g = world.resource_scope::<WorldGraphEditor, Option<Graph>>(|_w, ed| {
+        resolve_snarl(&ed.snarl, &nav).and_then(|s| graph_rooted_at(s, node).ok())
+    });
+    let Some(g) = g else {
+        ui.label("the targeted node no longer exists");
+        return;
+    };
+
+    world.resource_scope::<WorldgenPreviewPanel, ()>(|world, mut panel| {
+        let panel = &mut *panel; // reborrow once so disjoint field borrows don't alias through Mut's deref
+        ui.horizontal(|ui| {
+            if ui.selectable_label(panel.is3d, "3D").on_hover_text("GPU 3D surface").clicked() {
+                panel.is3d = !panel.is3d;
+            }
+            let mut km = panel.half * 2.0 / 1000.0;
+            if ui.add(egui::DragValue::new(&mut km).speed(0.5).range(0.05..=512.0).suffix(" km")).changed() {
+                panel.half = (km * 1000.0 / 2.0).max(1.0);
+            }
+            ui.add(egui::DragValue::new(&mut panel.size).speed(4.0).range(128.0..=4096.0).suffix(" px"));
+            ui.add(egui::DragValue::new(&mut panel.pan.0).speed(10.0).prefix("X ").suffix(" m"));
+            ui.add(egui::DragValue::new(&mut panel.pan.1).speed(10.0).prefix("Y ").suffix(" m"));
+            ui.label("· drag orbit · right-drag pan · scroll zoom");
+        });
+        let ppp = ui.ctx().pixels_per_point();
+        let res = ((panel.size * ppp).round() as usize).max(32);
+        let tex = if panel.is3d {
+            world.resource_mut::<GpuPreviewRequests>().0.push(GpuPreviewRequest {
+                key: PANEL_GPU_KEY,
+                graph: g.clone(),
+                half: panel.half,
+                center: panel.pan,
+                yaw: panel.cam.0,
+                pitch: panel.cam.1,
+            });
+            world.resource::<GpuPreviewTextures>().0.get(&PANEL_GPU_KEY).copied()
+        } else {
+            None
+        };
+        let tid = match tex {
+            Some(t) => t,
+            None => {
+                let r = if panel.is3d { res.min(160) } else { res };
+                ensure_preview_texture(ui.ctx(), "wg-panel-tex".into(), &g, panel.half, r, panel.is3d, panel.cam, panel.pan, &mut panel.tex, &mut panel.key)
+            }
+        };
+        let resp = ui.add(
+            egui::Image::new(egui::load::SizedTexture::new(tid, egui::vec2(panel.size, panel.size)))
+                .sense(egui::Sense::click_and_drag()),
+        );
+        scroll_zoom_consume(ui, &resp, &mut panel.half);
+        let WorldgenPreviewPanel { half, pan, cam, is3d, size, .. } = &mut *panel;
+        handle_preview_gestures(ui, &resp, *is3d, *size, half, &mut pan.0, &mut pan.1, &mut cam.0, &mut cam.1);
     });
 }
 

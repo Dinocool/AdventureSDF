@@ -6,6 +6,8 @@ pub enum DockSide {
     Left,
     Right,
     Bottom,
+    /// A tab in the CENTRE viewport leaf, next to the 3D scene view.
+    Center,
 }
 
 /// A panel's render callback: exclusive `World` access + the egui `Ui` to draw into.
