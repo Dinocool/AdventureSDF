@@ -83,6 +83,9 @@ pub struct WorldGraphEditor {
     prev_key: std::collections::HashMap<NodeId, u64>,
     /// Per-node pan: world-XZ centre offset of the sampled window (drag-pan / scroll over the preview).
     pan: std::collections::HashMap<NodeId, (f64, f64)>,
+    /// Which inline preview image the pointer was over last frame — so `graph_panel` can intercept the
+    /// scroll-zoom for it BEFORE egui-snarl applies its own (graph) zoom.
+    hovered_preview: Option<NodeId>,
     /// Navigation stack of biome nodes we've descended into (empty ⇒ the top "World" graph). The shown
     /// snarl is `snarl` walked through each biome's sub-graph. (Distinct from `path`, the save file path.)
     nav: Vec<NodeId>,
@@ -132,6 +135,7 @@ impl Default for WorldGraphEditor {
             disp_px: std::collections::HashMap::new(),
             prev_key: std::collections::HashMap::new(),
             pan: std::collections::HashMap::new(),
+            hovered_preview: None,
             nav: Vec::new(),
             enter: None,
             popped: Vec::new(),
@@ -535,6 +539,8 @@ struct Viewer<'a> {
     gpu_reqs: &'a mut Vec<GpuPreviewRequest>,
     /// Per-node pan (world-XZ centre offset).
     pan: &'a mut std::collections::HashMap<NodeId, (f64, f64)>,
+    /// Set to the node whose preview image the pointer is over (for next-frame scroll interception).
+    hovered_preview: &'a mut Option<NodeId>,
     /// Hash of the current nav path — combined with the node id into a stable GPU pool key per preview.
     level_salt: u64,
 }
@@ -636,7 +642,7 @@ impl SnarlViewer<EdNode> for Viewer<'_> {
                     match self.gpu_tex.get(&gkey) {
                         Some(&t) => t,
                         None => {
-                            let pk = preview_key(&g, half, res.min(160), true, yaw, pitch);
+                            let pk = preview_key(&g, half, res.min(160), true, yaw, pitch, (cx, cz));
                             if self.prev_key.get(&node) != Some(&pk) || !self.previews.contains_key(&node) {
                                 let img = render_surface_preview(&g, half, yaw, pitch, res.min(160));
                                 let h = ui.ctx().load_texture(format!("wg-preview-{node:?}"), img, egui::TextureOptions::LINEAR);
@@ -647,9 +653,9 @@ impl SnarlViewer<EdNode> for Viewer<'_> {
                         }
                     }
                 } else {
-                    let pk = preview_key(&g, half, res, false, 0.0, 0.0);
+                    let pk = preview_key(&g, half, res, false, 0.0, 0.0, (cx, cz));
                     if self.prev_key.get(&node) != Some(&pk) || !self.previews.contains_key(&node) {
-                        let img = render_field_preview(&g, half, res);
+                        let img = render_field_preview(&g, half, res, (cx, cz));
                         let h = ui.ctx().load_texture(format!("wg-preview-{node:?}"), img, egui::TextureOptions::LINEAR);
                         self.previews.insert(node, h);
                         self.prev_key.insert(node, pk);
@@ -668,6 +674,11 @@ impl SnarlViewer<EdNode> for Viewer<'_> {
                         let cam = self.cam.entry(node).or_insert(CAM_DEFAULT);
                         let pan = self.pan.entry(node).or_insert((0.0, 0.0));
                         handle_preview_gestures(ui, &img_resp, is3d, size, h, &mut pan.0, &mut pan.1, &mut cam.0, &mut cam.1);
+                    }
+                    // Record hover so the panel can intercept this preview's scroll-zoom next frame
+                    // (before egui-snarl applies its own graph zoom).
+                    if img_resp.hovered() {
+                        *self.hovered_preview = Some(node);
                     }
                     // RIGHT — controls column (collapse, pop-out, zoom, 2D/3D, size).
                     ui.vertical(|ui| {
@@ -982,8 +993,25 @@ fn nav_hash(nav: &[NodeId]) -> u64 {
     h.finish()
 }
 
-/// On-image preview gestures: scroll = zoom (consumed so the surrounding panel doesn't also scroll),
-/// left-drag = orbit (3D) / pan (2D), right-drag = pan (3D). `size` is the on-screen image side (px).
+/// Apply (and CONSUME) scroll-zoom over a hovered preview image: zooms `half`, zeroes the ctx scroll so
+/// the surrounding window/panel doesn't also scroll. (Inline snarl previews intercept scroll BEFORE the
+/// snarl reads it — see `graph_panel` — because egui-snarl applies its own zoom before drawing nodes.)
+fn scroll_zoom_consume(ui: &egui::Ui, resp: &egui::Response, half: &mut f64) {
+    if !resp.hovered() {
+        return;
+    }
+    let scroll = ui.input(|i| i.smooth_scroll_delta.y);
+    if scroll != 0.0 {
+        ui.ctx().input_mut(|i| {
+            i.smooth_scroll_delta = egui::Vec2::ZERO;
+            i.raw_scroll_delta = egui::Vec2::ZERO;
+        });
+        *half = (*half * (1.0 - scroll as f64 * 0.0015)).clamp(20.0, 1_000_000.0);
+    }
+}
+
+/// On-image drag gestures: left-drag = orbit (3D) / pan (2D), right-drag = pan (3D). `size` is the
+/// on-screen image side (px). (Scroll-zoom is handled separately — see [`scroll_zoom_consume`].)
 #[allow(clippy::too_many_arguments)]
 fn handle_preview_gestures(
     ui: &egui::Ui,
@@ -996,16 +1024,7 @@ fn handle_preview_gestures(
     yaw: &mut f32,
     pitch: &mut f32,
 ) {
-    if resp.hovered() {
-        let scroll = ui.input_mut(|i| {
-            let s = i.smooth_scroll_delta.y;
-            i.smooth_scroll_delta.y = 0.0;
-            s
-        });
-        if scroll != 0.0 {
-            *half = (*half * (1.0 - scroll as f64 * 0.0015)).clamp(20.0, 1_000_000.0);
-        }
-    }
+    let _ = ui;
     let wpp = (2.0 * *half) / size.max(1.0) as f64; // world units per display pixel
     if is3d {
         if resp.dragged_by(egui::PointerButton::Primary) {
@@ -1081,15 +1100,16 @@ fn ensure_preview_texture(
     res: usize,
     is3d: bool,
     cam: (f32, f32),
+    center: (f64, f64),
     tex: &mut Option<egui::TextureHandle>,
     key: &mut u64,
 ) -> egui::TextureId {
-    let k = preview_key(g, half, res, is3d, cam.0, cam.1);
+    let k = preview_key(g, half, res, is3d, cam.0, cam.1, center);
     if tex.is_none() || *key != k {
         let img = if is3d {
             render_surface_preview(g, half, cam.0, cam.1, res)
         } else {
-            render_field_preview(g, half, res)
+            render_field_preview(g, half, res, center)
         };
         *tex = Some(ctx.load_texture(name, img, egui::TextureOptions::LINEAR));
         *key = k;
@@ -1098,13 +1118,15 @@ fn ensure_preview_texture(
 }
 
 /// Fingerprint everything a preview render depends on, so it's only recomputed on change.
-fn preview_key(g: &Graph, half: f64, res: usize, is3d: bool, yaw: f32, pitch: f32) -> u64 {
+fn preview_key(g: &Graph, half: f64, res: usize, is3d: bool, yaw: f32, pitch: f32, center: (f64, f64)) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
     ron::to_string(g).unwrap_or_default().hash(&mut h);
     half.to_bits().hash(&mut h);
     (res as u64).hash(&mut h);
     is3d.hash(&mut h);
+    center.0.to_bits().hash(&mut h);
+    center.1.to_bits().hash(&mut h);
     if is3d {
         yaw.to_bits().hash(&mut h);
         pitch.to_bits().hash(&mut h);
@@ -1115,14 +1137,14 @@ fn preview_key(g: &Graph, half: f64, res: usize, is3d: bool, yaw: f32, pitch: f3
 /// Evaluate a node's sub-[`Graph`] over a top-down grid spanning ±`half_m` metres and colour each sample
 /// by its ABSOLUTE world height + sea level (not a per-preview local range), so the same colour means the
 /// same elevation across every node and zoom level. Below [`PREVIEW_SEA_LEVEL`] reads as water.
-fn render_field_preview(g: &Graph, half_m: f64, res: usize) -> egui::ColorImage {
+fn render_field_preview(g: &Graph, half_m: f64, res: usize, center: (f64, f64)) -> egui::ColorImage {
     let n = res.max(2);
     let span_m = 2.0 * half_m;
     let mut pixels = Vec::with_capacity(n * n);
     for j in 0..n {
         for i in 0..n {
-            let wx = -half_m + (i as f64 + 0.5) / n as f64 * span_m;
-            let wz = -half_m + (j as f64 + 0.5) / n as f64 * span_m;
+            let wx = center.0 - half_m + (i as f64 + 0.5) / n as f64 * span_m;
+            let wz = center.1 - half_m + (j as f64 + 0.5) / n as f64 * span_m;
             let c = height_color_rgb(g.eval(wx, wz, PREVIEW_SEED).v);
             pixels.push(egui::Color32::from_rgb((c[0] * 255.0) as u8, (c[1] * 255.0) as u8, (c[2] * 255.0) as u8));
         }
@@ -1445,6 +1467,21 @@ fn graph_panel(world: &mut World, ui: &mut egui::Ui) {
         }
         ui.separator();
 
+        // Intercept scroll-zoom for the inline preview hovered last frame — egui-snarl applies its own
+        // graph zoom BEFORE drawing nodes, so consume the scroll here (before the show) and route it to
+        // the preview instead.
+        if let Some(node) = editor.hovered_preview.take() {
+            let scroll = ui.input(|i| i.smooth_scroll_delta.y);
+            if scroll != 0.0 {
+                ui.ctx().input_mut(|i| {
+                    i.smooth_scroll_delta = egui::Vec2::ZERO;
+                    i.raw_scroll_delta = egui::Vec2::ZERO;
+                });
+                let h = editor.zoom_half_m.entry(node).or_insert(PREVIEW_HALF_M);
+                *h = (*h * (1.0 - scroll as f64 * 0.0015)).clamp(20.0, 1_000_000.0);
+            }
+        }
+
         // GPU preview plumbing: read last frame's textures + gather this frame's requests (shared by the
         // inline 3D previews below + the pop-out windows).
         let gpu_tex = world.get_resource::<GpuPreviewTextures>().map(|t| t.0.clone()).unwrap_or_default();
@@ -1468,6 +1505,7 @@ fn graph_panel(world: &mut World, ui: &mut egui::Ui) {
                 disp_px,
                 prev_key,
                 pan,
+                hovered_preview,
                 enter,
                 pop_request,
                 ..
@@ -1487,6 +1525,7 @@ fn graph_panel(world: &mut World, ui: &mut egui::Ui) {
                 gpu_tex: &gpu_tex,
                 gpu_reqs: &mut gpu_reqs,
                 pan,
+                hovered_preview,
                 level_salt,
             };
             SnarlWidget::new()
@@ -1602,17 +1641,18 @@ fn popped_preview_window(
                     Some(&t) => t,
                     None => {
                         let name = format!("wg-pop-tex-{}", p.id);
-                        ensure_preview_texture(ui.ctx(), name, &g, p.half, res.min(160), true, p.cam, &mut p.tex, &mut p.key)
+                        ensure_preview_texture(ui.ctx(), name, &g, p.half, res.min(160), true, p.cam, (p.cx, p.cz), &mut p.tex, &mut p.key)
                     }
                 }
             } else {
                 let name = format!("wg-pop-tex-{}", p.id);
-                ensure_preview_texture(ui.ctx(), name, &g, p.half, res, false, p.cam, &mut p.tex, &mut p.key)
+                ensure_preview_texture(ui.ctx(), name, &g, p.half, res, false, p.cam, (p.cx, p.cz), &mut p.tex, &mut p.key)
             };
             let resp = ui.add(
                 egui::Image::new(egui::load::SizedTexture::new(tex, egui::vec2(p.size, p.size)))
                     .sense(egui::Sense::click_and_drag()),
             );
+            scroll_zoom_consume(ui, &resp, &mut p.half);
             handle_preview_gestures(ui, &resp, p.is3d, p.size, &mut p.half, &mut p.cx, &mut p.cz, &mut p.cam.0, &mut p.cam.1);
         });
     p.open = open;
