@@ -126,6 +126,27 @@ pub fn terrain_band(height: &HeightParams, erosion: &ErosionParams) -> (f32, f32
     (height.sea_level - half, height.sea_level + half)
 }
 
+/// The active biome terrain node-graph (the surface the bake samples). A `Resource` so the editor /
+/// asset hot-reload can swap it live; the `LayerManager` republishes it into every tier on change
+/// (`roll_worldgen` → `set_graph`). Defaults to the "mountains placed in plains" preset (the peaks+plains
+/// look); the editor + the shipped `assets/worldgen/*.graph.ron` can replace it.
+#[derive(Resource, Clone)]
+pub struct WorldGraph(pub Arc<graph::Graph>);
+
+impl Default for WorldGraph {
+    fn default() -> Self {
+        Self(Arc::new(graph::preset::mountains_plains_graph(280.0)))
+    }
+}
+
+/// Vertical AABB band `[min_y, max_y]` for a terrain GRAPH — derived from the graph's conservative
+/// output bound (the tallest peak it can produce) × the safety margin, symmetric about 0 (the graph's
+/// node offsets already encode base elevation). Keeps towering graph peaks inside the volume AABB.
+pub fn terrain_band_graph(g: &graph::Graph) -> (f32, f32) {
+    let half = (g.value_bound() as f32) * WORLDGEN_TERRAIN_BAND_MARGIN;
+    (-half, half)
+}
+
 /// The built GPU height ring, handed from the main world to the render world's bake extract. Bumps
 /// `generation` on every rebuild so the render world re-uploads only on a change (it caches the last
 /// uploaded gen). `ring = None` until the first chunk streams in (the bake then binds a dummy).
@@ -169,6 +190,7 @@ impl Plugin for WorldGenPlugin {
             .init_resource::<HeightParams>()
             .init_resource::<ErosionParams>()
             .init_resource::<WorldGenGpuRing>()
+            .init_resource::<WorldGraph>()
             // Biome terrain graphs follow the same resource pipeline as materials (load/hot-reload/save).
             .init_asset::<graph::GraphAsset>()
             .register_asset_loader(graph::GraphAssetLoader)
@@ -227,16 +249,15 @@ impl Plugin for WorldGenPlugin {
 fn spawn_terrain_volume(
     mut commands: Commands,
     existing: Query<(), With<WorldGenTerrainVolume>>,
-    height: Res<HeightParams>,
-    erosion: Res<ErosionParams>,
+    world_graph: Res<WorldGraph>,
 ) {
     if !existing.is_empty() {
         return; // already spawned (re-entering the editor scene)
     }
 
-    // DERIVE the vertical band from the live params so the volume's AABB tracks the height/erosion
-    // sliders (tall mountains ⇒ tall band). The narrow-band cull still bakes only the thin shell.
-    let (min_y, max_y) = terrain_band(&height, &erosion);
+    // DERIVE the vertical band from the active terrain GRAPH's conservative peak bound so the volume's
+    // AABB covers the tallest peaks it can produce. The narrow-band cull still bakes only the thin shell.
+    let (min_y, max_y) = terrain_band_graph(&world_graph.0);
 
     // World-anchored volume ⇒ local space == world space ⇒ the CPU Terrain eval's world-XZ offset is
     // ZERO. Publish it once (the static defaults to ZERO already; this makes the invariant explicit and
@@ -302,6 +323,7 @@ fn roll_worldgen(
     mut manager: ResMut<LayerManager>,
     params: Res<HeightParams>,
     erosion: Res<ErosionParams>,
+    world_graph: Res<WorldGraph>,
     // The mesh-bake clipmap config (the LOD slider) — the height-clipmap window tracks its `lod_count`.
     grid_cfg: Res<crate::sdf_render::SdfGridConfig>,
     mesh_cfg: Res<crate::sdf_render::mesh_bake::MeshBakeConfig>,
@@ -314,9 +336,20 @@ fn roll_worldgen(
     camera: Query<&Transform, (With<SdfCamera>, Without<SdfVolume>)>,
     mut last_params: Local<Option<HeightParams>>,
     mut last_erosion: Local<Option<ErosionParams>>,
+    mut last_graph: Local<Option<Arc<graph::Graph>>>,
 ) {
     let _span = crate::instrument::span("worldgen roll");
     let cam_pos = camera.single().map(|t| t.translation).unwrap_or(Vec3::ZERO);
+
+    // Apply the active biome terrain graph to EVERY tier, republishing on change (editor edit / asset
+    // hot-reload / first run). `set_graph` rebuilds all tiers + evicts residency → a full regen, so it
+    // runs BEFORE the tier-count/param steps (so appended/rebuilt tiers carry the graph). Cheap when
+    // unchanged (a single `Arc` pointer compare).
+    let graph_changed = last_graph.as_ref().is_none_or(|g| !Arc::ptr_eq(g, &world_graph.0));
+    if graph_changed {
+        manager.set_graph(Some(world_graph.0.clone()));
+        *last_graph = Some(world_graph.0.clone());
+    }
 
     // The LayerManager's generation window ALWAYS follows the camera (the LayerProcGen GenerationSource):
     // each layer maintains its rolling region around the focus, evicting what leaves it and generating
@@ -378,7 +411,7 @@ fn roll_worldgen(
     // newly-loaded chunks per-chunk and reaps evicted ones on its own (no whole-band re-mesh). On a
     // param edit, every loaded chunk's surface changed, so force a full rebake (atlas lever = gated-off
     // cloud foundation; `mesh_rebuild` = the real on-screen path).
-    if params_changed {
+    if params_changed || graph_changed {
         atlas.rebake_all = true;
         mesh_rebuild.0 = true;
     }

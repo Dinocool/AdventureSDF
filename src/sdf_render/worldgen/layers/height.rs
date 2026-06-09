@@ -7,8 +7,12 @@
 
 use bevy::prelude::*;
 
+use std::sync::Arc;
+
 use super::super::artifact::{ArtifactKind, HeightNode, ScalarField2D};
 use super::super::coord::{Authority, ChunkSize, Dim, LayerId};
+use super::super::graph::preset::MAX_GRAPH_NODES;
+use super::super::graph::{Field, Graph};
 use super::super::layer::{ArtifactDecl, GenCtx, GenOutput, Layer};
 use super::super::noise::{FbmParams, fbm_height_grad, fbm_height_grad_hess};
 use super::erosion::{ErosionParams, erode_with_grad};
@@ -16,7 +20,7 @@ use super::erosion::{ErosionParams, erode_with_grad};
 /// Bump when the height layer's *output* intentionally changes (algorithm/constants). It keys the
 /// disk cache (WORLD_GEN_PLAN §2.3) and the parity reference vectors — a change here forces
 /// regenerating reference values, making "I meant to change the terrain" explicit and review-visible.
-pub const HEIGHT_GEN_VERSION: u32 = 7;
+pub const HEIGHT_GEN_VERSION: u32 = 8;
 
 /// Chunk edge in base cells (= metres) for the height layer's tier.
 pub const HEIGHT_CHUNK_CELLS: u32 = 128;
@@ -118,6 +122,11 @@ pub struct HeightLayer {
     pub erosion: ErosionParams,
     /// Chunk edge in base cells for THIS tier (`HEIGHT_CHUNK_CELLS·2^t`). Tier 0 = `HEIGHT_CHUNK_CELLS`.
     chunk_cells: u32,
+    /// The active biome terrain node-graph. When `Some`, [`sample_world`](Self::sample_world) evaluates
+    /// it (the new biome-driven surface) instead of the legacy fBm+ridge+erosion path. Shared `Arc` so
+    /// every tier samples the SAME graph (the cross-tier-agreement invariant). `None` ⇒ legacy path
+    /// (tests / pre-graph fallback). Set by the `LayerManager` from the `WorldGraph` resource.
+    graph: Option<Arc<Graph>>,
     decls: [ArtifactDecl; 1],
 }
 
@@ -137,8 +146,17 @@ impl HeightLayer {
             params,
             erosion,
             chunk_cells,
+            graph: None,
             decls: [ArtifactDecl { name: Self::OUTPUT, kind: ArtifactKind::ScalarField2D }],
         }
+    }
+
+    /// Attach (or clear) the biome terrain graph this tier samples (builder style; see the `graph`
+    /// field). A graph with more than [`MAX_GRAPH_NODES`] nodes is rejected (kept `None`) since the
+    /// per-sample evaluator uses a fixed stack scratch — callers validate/size-check before this.
+    pub fn with_graph(mut self, graph: Option<Arc<Graph>>) -> Self {
+        self.graph = graph.filter(|g| g.nodes.len() <= MAX_GRAPH_NODES);
+        self
     }
 
     /// The name of this layer's single produced artifact.
@@ -213,6 +231,17 @@ impl HeightLayer {
     /// noise Hessian) — no central-difference taps. Still a pure deterministic `f(wx, wz, seed)`.
     #[inline]
     pub fn sample_world(&self, wx: f64, wz: f64, world_seed: u64) -> HeightNode {
+        // GRAPH PATH: when a biome terrain graph is attached, it IS the surface — evaluate it with
+        // forward-mode autodiff (the output `Field` is `(height, dh_dx, dh_dz)` directly). Pure +
+        // bit-portable; a fixed stack scratch keeps the bake hot path alloc-free.
+        if let Some(g) = &self.graph {
+            let n = g.nodes.len();
+            debug_assert!(n <= MAX_GRAPH_NODES);
+            let mut scratch = [Field::constant(0.0); MAX_GRAPH_NODES];
+            let f = g.eval_into(wx, wz, world_seed, &mut scratch[..n]);
+            return HeightNode { height: f.v as f32, dh_dx: f.dx as f32, dh_dz: f.dz as f32 };
+        }
+
         let fbm = self.fbm_params(world_seed);
 
         if self.params.ridge == 0.0 && !self.erosion.enabled {

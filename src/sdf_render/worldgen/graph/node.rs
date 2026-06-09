@@ -151,6 +151,52 @@ impl Graph {
         Ok(())
     }
 
+    /// CONSERVATIVE bound on `|output value|` via interval propagation over the (topological) nodes —
+    /// each node's output magnitude is bounded from its inputs' bounds. Used to size the terrain vertical
+    /// AABB band so the tallest peaks the graph can produce don't clip (an over-estimate is safe: the
+    /// narrow-band cull still bakes only the thin surface shell, the band just bounds the BVH).
+    pub fn value_bound(&self) -> f64 {
+        let mut b = vec![0.0f64; self.nodes.len()];
+        for (i, node) in self.nodes.iter().enumerate() {
+            let a = [
+                b[node.inputs[0] as usize],
+                b[node.inputs[1] as usize],
+                b[node.inputs[2] as usize],
+            ];
+            b[i] = match node.kind {
+                // Raw/scaled coordinates are unbounded; sane terrain graphs gate them through a Curve/
+                // Smoothstep/Clamp (all bounded below) before the output, so this only matters if a graph
+                // outputs a coord directly — give a large finite bound rather than ∞.
+                NodeKind::WorldX | NodeKind::WorldZ => 1.0e6,
+                NodeKind::Const(c) => c.abs(),
+                NodeKind::Fbm(ax) => {
+                    let mut amp = ax.amplitude.abs();
+                    let mut sum = 0.0;
+                    for _ in 0..ax.octaves {
+                        sum += amp;
+                        amp *= ax.gain.abs();
+                    }
+                    sum
+                }
+                NodeKind::Curve(s) => s.max_abs_y(),
+                NodeKind::Ridge { ridge, amp_sum } => {
+                    // |in + ridge·((amp_sum − 2|in|) − in)| ≤ |in|(1+3|ridge|) + |ridge|·|amp_sum|.
+                    a[0] * (1.0 + 3.0 * ridge.abs()) + ridge.abs() * amp_sum.abs()
+                }
+                NodeKind::Clamp { lo, hi } => lo.abs().max(hi.abs()),
+                NodeKind::Smoothstep { .. } => 1.0,
+                NodeKind::Scale(k) => a[0] * k.abs(),
+                NodeKind::Offset(k) => a[0] + k.abs(),
+                NodeKind::Abs | NodeKind::Neg => a[0],
+                NodeKind::Add | NodeKind::Sub => a[0] + a[1],
+                NodeKind::Mul => a[0] * a[1],
+                NodeKind::Min | NodeKind::Max => a[0].max(a[1]),
+                NodeKind::Mix => a[0].max(a[1]), // mix(a,b,t) with a gate t∈[0,1] stays within [a,b]
+            };
+        }
+        b[self.output as usize]
+    }
+
     /// Evaluate the graph at world `(wx, wz)` for `world_seed`, returning the output node's [`Field`].
     /// Assumes [`validate`](Self::validate) passed (topological order); `scratch` is a reusable buffer
     /// of length `nodes.len()` to avoid per-sample allocation in the hot path.

@@ -19,6 +19,7 @@ use bevy::prelude::Resource;
 
 use super::artifact::ScalarField2D;
 use super::coord::{ChunkCoord, LayerId};
+use super::graph::Graph;
 use super::layer::{GenCtx, GenOutput, Layer};
 use super::layers::erosion::ErosionParams;
 use super::layers::height::{HEIGHT_CHUNK_CELLS, HeightLayer, HeightParams};
@@ -41,6 +42,14 @@ pub struct LayerManager {
     /// The height-field store (slice's only artifact kind). Future kinds get sibling stores.
     height: ArtifactStore<ScalarField2D>,
     seed: u64,
+    /// Current height/erosion params — stored so a tier rebuild (params edit, tier-count change, graph
+    /// swap) reconstructs every `HeightLayer` from one source of truth.
+    params: HeightParams,
+    erosion: ErosionParams,
+    /// The active biome terrain graph applied to EVERY tier's `HeightLayer` (the cross-tier-agreement
+    /// invariant — all tiers sample one graph). `None` ⇒ tiers use the legacy fBm+ridge+erosion path.
+    /// Set via [`set_graph`](Self::set_graph) from the `WorldGraph` resource.
+    graph: Option<Arc<Graph>>,
     /// Newly-required chunks generated per update.
     pub budget: usize,
 }
@@ -57,7 +66,7 @@ impl LayerManager {
             deps: layer.dependencies().to_vec(),
             direct_radius: Some(radius),
         }];
-        Self { layers: vec![Box::new(layer)], metas, height: ArtifactStore::new(), seed, budget: DEFAULT_GEN_BUDGET }
+        Self { layers: vec![Box::new(layer)], metas, height: ArtifactStore::new(), seed, params, erosion, graph: None, budget: DEFAULT_GEN_BUDGET }
     }
 
     /// Build the TIERED HEIGHT CLIPMAP stack: `tiers` nested toroidal rings around the focus, tier `t`
@@ -86,7 +95,13 @@ impl LayerManager {
             });
             layers.push(Box::new(layer));
         }
-        Self { layers, metas, height: ArtifactStore::new(), seed, budget: DEFAULT_GEN_BUDGET }
+        Self { layers, metas, height: ArtifactStore::new(), seed, params, erosion, graph: None, budget: DEFAULT_GEN_BUDGET }
+    }
+
+    /// Build a tier's `HeightLayer` from the manager's current params + active graph (one rebuild source
+    /// of truth for `set_params`/`set_tier_count`/`set_graph`).
+    fn make_tier(&self, id: LayerId, chunk_cells: u32) -> HeightLayer {
+        HeightLayer::new_tier(id, self.params, self.erosion, chunk_cells).with_graph(self.graph.clone())
     }
 
     /// Number of clipmap tiers (layers) in the stack.
@@ -104,6 +119,8 @@ impl LayerManager {
     /// [`set_params`](Self::set_params), which rebuilds ALL tiers. Clamped to ≥ 1 tier.
     pub fn set_tier_count(&mut self, tiers: u32, params: HeightParams, erosion: ErosionParams) -> bool {
         let tiers = tiers.max(1);
+        self.params = params;
+        self.erosion = erosion;
         let cur = self.tier_count();
         if tiers == cur {
             return false;
@@ -111,7 +128,7 @@ impl LayerManager {
         if tiers > cur {
             for t in cur..tiers {
                 let chunk_cells = HEIGHT_CHUNK_CELLS << t; // HEIGHT_CHUNK_CELLS · 2^t
-                let layer = HeightLayer::new_tier(LayerId(t), params, erosion, chunk_cells);
+                let layer = self.make_tier(LayerId(t), chunk_cells);
                 let radius = HEIGHT_CHUNK_CELLS as f64 * 3.75 * (1u32 << t) as f64;
                 self.metas.push(LayerMeta {
                     id: layer.id(),
@@ -154,13 +171,31 @@ impl LayerManager {
     /// regenerates with the new params. Each tier is rebuilt preserving its id + chunk size (only the
     /// params change), then the whole shared store is evicted. Returns the dropped count (for logging).
     pub fn set_params(&mut self, params: HeightParams, erosion: ErosionParams) -> usize {
-        for (layer, meta) in self.layers.iter_mut().zip(self.metas.iter()) {
-            // Preserve this tier's id + chunk size (cells); only the params change.
-            let id = layer.id();
-            let chunk_cells = meta.size.cells;
-            *layer = Box::new(HeightLayer::new_tier(id, params, erosion, chunk_cells));
-        }
+        self.params = params;
+        self.erosion = erosion;
+        self.rebuild_all_tiers();
         // Evict everything across ALL tiers → next update regenerates from the new params (queues drops).
+        self.height.retain(|_| false)
+    }
+
+    /// Rebuild every tier's `HeightLayer` from the manager's current params + graph (preserving each
+    /// tier's id + chunk size). Shared by `set_params`/`set_graph`.
+    fn rebuild_all_tiers(&mut self) {
+        let n = self.layers.len();
+        for i in 0..n {
+            let id = self.layers[i].id();
+            let chunk_cells = self.metas[i].size.cells;
+            self.layers[i] = Box::new(self.make_tier(id, chunk_cells));
+        }
+    }
+
+    /// Set (or clear) the active biome terrain graph on EVERY tier and evict residency so the world
+    /// regenerates from the graph — the graph equivalent of [`set_params`](Self::set_params), called
+    /// when the `WorldGraph` resource changes (editor edit / asset hot-reload). Rebuilds each tier
+    /// preserving its id + chunk size + current params, attaching `graph`. Returns the dropped count.
+    pub fn set_graph(&mut self, graph: Option<Arc<Graph>>) -> usize {
+        self.graph = graph;
+        self.rebuild_all_tiers();
         self.height.retain(|_| false)
     }
 
