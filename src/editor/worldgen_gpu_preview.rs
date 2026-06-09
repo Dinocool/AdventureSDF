@@ -83,6 +83,9 @@ pub struct GpuPreviewRequest {
     /// Orbit camera.
     pub yaw: f32,
     pub pitch: f32,
+    /// Desired output resolution (px per side) — the pool resizes the slot's image to match the on-screen
+    /// size (quantised), so the render isn't capped at a fixed texture size.
+    pub res: u32,
 }
 
 /// Inbox: preview consumers push requests here each frame; [`process_gpu_previews`] drains it.
@@ -98,6 +101,9 @@ struct GpuTarget {
     camera: Entity,
     material: Handle<HeightPreviewMaterial>,
     height: Handle<Image>,
+    /// The offscreen output image (resized to track the requested on-screen size).
+    output: Handle<Image>,
+    out_res: u32,
     tex_id: egui::TextureId,
     /// Preview key currently assigned to this slot (0 = free).
     key: u64,
@@ -107,14 +113,19 @@ struct GpuTarget {
     ymax: f32,
 }
 
+/// Quantise a desired output resolution to bound how often the slot image is recreated.
+fn quantize_res(res: u32) -> u32 {
+    (res.clamp(128, 2048) / 128).max(1) * 128
+}
+
 #[derive(Resource, Default)]
 struct GpuPreviewPool {
     targets: Vec<GpuTarget>,
 }
 
-/// Offscreen render-attachment image (the raymarch output egui samples).
-fn make_output_image(images: &mut Assets<Image>) -> Handle<Image> {
-    let size = Extent3d { width: PREVIEW_SIZE, height: PREVIEW_SIZE, depth_or_array_layers: 1 };
+/// Offscreen render-attachment image (the raymarch output egui samples) at `res`×`res`.
+fn make_output_image(images: &mut Assets<Image>, res: u32) -> Handle<Image> {
+    let size = Extent3d { width: res, height: res, depth_or_array_layers: 1 };
     let mut image =
         Image::new_fill(size, TextureDimension::D2, &[0, 0, 0, 0], TextureFormat::Rgba8UnormSrgb, RenderAssetUsages::all());
     image.texture_descriptor.usage =
@@ -219,7 +230,7 @@ fn setup_gpu_pool(
     for slot in 0..POOL_SIZE {
         let layer = RenderLayers::layer(POOL_LAYER_BASE + slot);
         let height = make_height_image(&mut images);
-        let output = make_output_image(&mut images);
+        let output = make_output_image(&mut images, PREVIEW_SIZE);
         let material = materials.add(HeightPreviewMaterial { params: PreviewParams::default(), height: height.clone() });
         let quad = meshes.add(Rectangle::new(2.0, 2.0));
         commands.spawn((Mesh3d(quad), MeshMaterial3d(material.clone()), Transform::IDENTITY, layer.clone()));
@@ -241,8 +252,19 @@ fn setup_gpu_pool(
                 layer,
             ))
             .id();
-        let tex_id = egui_textures.add_image(EguiTextureHandle::Strong(output));
-        targets.push(GpuTarget { camera, material, height, tex_id, key: 0, baked_key: 0, ymin: 0.0, ymax: 1.0 });
+        let tex_id = egui_textures.add_image(EguiTextureHandle::Strong(output.clone()));
+        targets.push(GpuTarget {
+            camera,
+            material,
+            height,
+            output,
+            out_res: PREVIEW_SIZE,
+            tex_id,
+            key: 0,
+            baked_key: 0,
+            ymin: 0.0,
+            ymax: 1.0,
+        });
     }
     commands.insert_resource(GpuPreviewPool { targets });
 }
@@ -280,6 +302,22 @@ fn process_gpu_previews(world: &mut World) {
         for (ri, slot) in assign.iter().enumerate() {
             let Some(si) = *slot else { continue };
             let r = &requests[ri];
+            // Resize the slot's output image to the requested on-screen size (quantised), so the render
+            // isn't capped — recreate the image + re-point the camera + re-register the egui texture.
+            let want_res = quantize_res(r.res);
+            if pool.targets[si].out_res != want_res {
+                let new_out = make_output_image(&mut world.resource_mut::<Assets<Image>>(), want_res);
+                let old = pool.targets[si].output.clone();
+                {
+                    let mut et = world.resource_mut::<EguiUserTextures>();
+                    et.remove_image(old.id());
+                    pool.targets[si].tex_id = et.add_image(EguiTextureHandle::Strong(new_out.clone()));
+                }
+                let cam_e = pool.targets[si].camera;
+                world.entity_mut(cam_e).insert(RenderTarget::Image(new_out.clone().into()));
+                pool.targets[si].output = new_out;
+                pool.targets[si].out_res = want_res;
+            }
             let bk = bake_key(&r.graph, r.half, r.center);
             if pool.targets[si].key != r.key || pool.targets[si].baked_key != bk {
                 let h = pool.targets[si].height.clone();

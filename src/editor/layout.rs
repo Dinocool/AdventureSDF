@@ -54,6 +54,15 @@ pub fn apply_layout(world: &mut World, ron: &str) -> bool {
         warn!("layout: failed to parse");
         return false;
     };
+    // Drop tabs whose panel is no longer registered (e.g. a removed debug panel left in a stale layout),
+    // so it doesn't render as "(panel … not registered)".
+    {
+        let registry = world.resource::<DebugPanelRegistry>();
+        state.retain_tabs(|tab| match tab {
+            EditorTab::Registered(id) => registry.panel_by_id(id.as_str()).is_some(),
+            _ => true,
+        });
+    }
     inject_live_scenes(world, &mut state);
     world.resource_mut::<EditorDockState>().state = state;
     true
@@ -167,7 +176,7 @@ fn inject_new_panels(world: &mut World) {
         let registry = world.resource::<DebugPanelRegistry>();
         let mut all_ids = Vec::new();
         let mut new_panels = Vec::new();
-        for side in [DockSide::Left, DockSide::Right, DockSide::Bottom] {
+        for side in [DockSide::Left, DockSide::Right, DockSide::Bottom, DockSide::Center] {
             for p in registry.panels_for(side) {
                 all_ids.push(p.id.clone());
                 if !known.contains(&p.id) {
