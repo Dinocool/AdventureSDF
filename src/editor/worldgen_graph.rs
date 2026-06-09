@@ -242,6 +242,110 @@ fn new_biome_subgraph() -> Snarl<EdNode> {
     s
 }
 
+/// Sibling path the editor saves the **hierarchical** snarl (with biomes) to, alongside the flat engine
+/// `.graph.ron` the worldgen loads. e.g. `…/mountains_plains.graph.ron` → `…/mountains_plains.worldgraph.ron`.
+fn worldgraph_path(graph_path: &str) -> String {
+    let stem = graph_path.strip_suffix(".graph.ron").or_else(|| graph_path.strip_suffix(".ron"));
+    match stem {
+        Some(stem) => format!("{stem}.worldgraph.ron"),
+        None => format!("{graph_path}.worldgraph.ron"),
+    }
+}
+
+// Pin-id shorthands (every node has one output, pin 0).
+fn opin(n: NodeId) -> OutPinId {
+    OutPinId { node: n, output: 0 }
+}
+fn ipin(n: NodeId, i: usize) -> InPinId {
+    InPinId { node: n, input: i }
+}
+
+// ===================================================================================================
+// Default multi-biome "World" graph (the Phase-2 classifier example)
+// ===================================================================================================
+
+/// Build the default **multi-biome** world graph: low-frequency climate axes place + shape two biomes
+/// (Plains in low continentalness, Mountains in high) blended by a continentalness gate — the Phase-2
+/// architecture end-to-end (classifier on top, biomes own their shape, climate piped into each).
+fn world_biome_snarl() -> Snarl<EdNode> {
+    fn climate(salt: u32, wavelength: f64) -> EdNode {
+        EdNode::Op(NodeKind::Fbm(FbmAxis {
+            octaves: 2,
+            base_freq: 1.0 / wavelength,
+            lacunarity: 2.0,
+            gain: 0.5,
+            amplitude: 1.0,
+            seed_salt: salt,
+        }))
+    }
+
+    // Plains biome: gentle rolling hills, nudged up a little by continentalness.
+    let plains = {
+        let mut s = Snarl::new();
+        let cont = s.insert_node(egui::pos2(0.0, 0.0), EdNode::Input(0));
+        let lift = s.insert_node(egui::pos2(220.0, 0.0), EdNode::Op(NodeKind::Scale(25.0)));
+        s.connect(opin(cont), ipin(lift, 0));
+        let hills = s.insert_node(
+            egui::pos2(0.0, 140.0),
+            EdNode::Op(NodeKind::Fbm(FbmAxis { octaves: 4, base_freq: 1.0 / 500.0, lacunarity: 2.0, gain: 0.5, amplitude: 30.0, seed_salt: 11 })),
+        );
+        let add = s.insert_node(egui::pos2(440.0, 0.0), EdNode::Op(NodeKind::Add));
+        s.connect(opin(hills), ipin(add, 0));
+        s.connect(opin(lift), ipin(add, 1));
+        let o = s.insert_node(egui::pos2(660.0, 0.0), EdNode::Output);
+        s.connect(opin(add), ipin(o, 0));
+        s
+    };
+
+    // Mountains biome: ridged peaks on a continentalness-raised base.
+    let mountains = {
+        let mut s = Snarl::new();
+        let cont = s.insert_node(egui::pos2(0.0, 0.0), EdNode::Input(0));
+        let base = s.insert_node(egui::pos2(220.0, 0.0), EdNode::Op(NodeKind::Scale(220.0)));
+        s.connect(opin(cont), ipin(base, 0));
+        let fbm = s.insert_node(
+            egui::pos2(0.0, 140.0),
+            EdNode::Op(NodeKind::Fbm(FbmAxis { octaves: 5, base_freq: 1.0 / 1300.0, lacunarity: 2.0, gain: 0.5, amplitude: 1.0, seed_salt: 12 })),
+        );
+        let ridge = s.insert_node(egui::pos2(220.0, 140.0), EdNode::Op(NodeKind::Ridge { ridge: 0.9, amp_sum: 2.0 }));
+        s.connect(opin(fbm), ipin(ridge, 0));
+        let peaks = s.insert_node(egui::pos2(440.0, 140.0), EdNode::Op(NodeKind::Scale(620.0)));
+        s.connect(opin(ridge), ipin(peaks, 0));
+        let add = s.insert_node(egui::pos2(660.0, 0.0), EdNode::Op(NodeKind::Add));
+        s.connect(opin(peaks), ipin(add, 0));
+        s.connect(opin(base), ipin(add, 1));
+        let off = s.insert_node(egui::pos2(880.0, 0.0), EdNode::Op(NodeKind::Offset(80.0)));
+        s.connect(opin(add), ipin(off, 0));
+        let o = s.insert_node(egui::pos2(1100.0, 0.0), EdNode::Output);
+        s.connect(opin(off), ipin(o, 0));
+        s
+    };
+
+    let mut s = Snarl::new();
+    let cont = s.insert_node(egui::pos2(0.0, 0.0), climate(5, 8000.0));
+    let temp = s.insert_node(egui::pos2(0.0, 150.0), climate(6, 7000.0));
+    let humid = s.insert_node(egui::pos2(0.0, 300.0), climate(7, 6500.0));
+    let weird = s.insert_node(egui::pos2(0.0, 450.0), climate(8, 5000.0));
+    let bp = s.insert_node(egui::pos2(340.0, 0.0), EdNode::Biome { name: "Plains".into(), graph: Box::new(plains) });
+    let bm = s.insert_node(egui::pos2(340.0, 320.0), EdNode::Biome { name: "Mountains".into(), graph: Box::new(mountains) });
+    for b in [bp, bm] {
+        s.connect(opin(cont), ipin(b, 0));
+        s.connect(opin(temp), ipin(b, 1));
+        s.connect(opin(humid), ipin(b, 2));
+        s.connect(opin(weird), ipin(b, 3));
+    }
+    // Classifier: blend plains↔mountains by a continentalness gate (low ⇒ plains, high ⇒ mountains).
+    let gate = s.insert_node(egui::pos2(340.0, 620.0), EdNode::Op(NodeKind::Smoothstep { edge0: 0.0, edge1: 0.5 }));
+    s.connect(opin(cont), ipin(gate, 0));
+    let mix = s.insert_node(egui::pos2(700.0, 160.0), EdNode::Op(NodeKind::Mix));
+    s.connect(opin(bp), ipin(mix, 0)); // a = plains
+    s.connect(opin(bm), ipin(mix, 1)); // b = mountains
+    s.connect(opin(gate), ipin(mix, 2)); // t = gate
+    let o = s.insert_node(egui::pos2(980.0, 160.0), EdNode::Output);
+    s.connect(opin(mix), ipin(o, 0));
+    s
+}
+
 /// Convert the editor Snarl (possibly nested with biomes) to a flat engine [`Graph`] by **inlining**:
 /// each biome's sub-graph is spliced in with its climate-`Input` sentinels rewired to the parent edges
 /// feeding that biome's pins. Errors on missing/duplicate Output, a cycle, an unconnected required
@@ -1037,29 +1141,50 @@ fn graph_panel(world: &mut World, ui: &mut egui::Ui) {
                     Err(e) => editor.status = format!("invalid: {e}"),
                 }
             }
-            // SAVE — write the graph to its .ron (the production graph the worldgen hot-reloads).
-            if ui.button("Save").on_hover_text("Write to the .ron asset (the world hot-reloads it)").clicked() {
+            // SAVE — write BOTH the compiled flat engine graph (.graph.ron, the world hot-reloads it) AND
+            // the hierarchical editor snarl with biomes (.worldgraph.ron, so the hierarchy survives reload).
+            if ui.button("Save").on_hover_text("Write the flat .graph.ron (world reloads it) + the .worldgraph.ron hierarchy").clicked() {
                 editor.status = match snarl_to_graph(&editor.snarl) {
-                    Ok(g) => match (GraphAsset { graph: g }).save(std::path::Path::new(&editor.path)) {
-                        Ok(()) => format!("saved {}", editor.path),
-                        Err(e) => format!("save failed: {e}"),
-                    },
+                    Ok(g) => {
+                        let flat = (GraphAsset { graph: g }).save(std::path::Path::new(&editor.path));
+                        let wg = worldgraph_path(&editor.path);
+                        let hier = ron::ser::to_string_pretty(&editor.snarl, ron::ser::PrettyConfig::default())
+                            .map_err(|e| e.to_string())
+                            .and_then(|s| std::fs::write(&wg, s).map_err(|e| e.to_string()));
+                        match (flat, hier) {
+                            (Ok(()), Ok(())) => format!("saved {} (+hierarchy)", editor.path),
+                            (Err(e), _) => format!("save failed: {e}"),
+                            (_, Err(e)) => format!("flat saved; hierarchy failed: {e}"),
+                        }
+                    }
                     Err(e) => format!("invalid: {e}"),
                 };
             }
-            // LOAD — read the .ron back into the editor.
+            // LOAD — prefer the hierarchical .worldgraph.ron (restores biomes); else the flat .graph.ron.
             if ui.button("Load").clicked() {
-                editor.status = match std::fs::read_to_string(&editor.path) {
-                    Ok(s) => match ron::de::from_str::<GraphAsset>(&s) {
-                        Ok(asset) => {
-                            editor.snarl = graph_to_snarl(&asset.graph);
+                let wg = worldgraph_path(&editor.path);
+                editor.status = match std::fs::read_to_string(&wg) {
+                    Ok(s) => match ron::de::from_str::<Snarl<EdNode>>(&s) {
+                        Ok(snarl) => {
+                            editor.snarl = snarl;
                             editor.nav.clear();
                             editor.clear_node_caches();
-                            format!("loaded {}", editor.path)
+                            format!("loaded {wg}")
                         }
-                        Err(e) => format!("parse failed: {e}"),
+                        Err(e) => format!("hierarchy parse failed: {e}"),
                     },
-                    Err(e) => format!("read failed: {e}"),
+                    Err(_) => match std::fs::read_to_string(&editor.path) {
+                        Ok(s) => match ron::de::from_str::<GraphAsset>(&s) {
+                            Ok(asset) => {
+                                editor.snarl = graph_to_snarl(&asset.graph);
+                                editor.nav.clear();
+                                editor.clear_node_caches();
+                                format!("loaded {} (flat)", editor.path)
+                            }
+                            Err(e) => format!("parse failed: {e}"),
+                        },
+                        Err(e) => format!("read failed: {e}"),
+                    },
                 };
             }
             if ui.button("Reset").on_hover_text("Restore the built-in mountains/plains graph").clicked() {
@@ -1070,6 +1195,12 @@ fn graph_panel(world: &mut World, ui: &mut egui::Ui) {
                 editor.nav.clear();
                 editor.clear_node_caches();
                 editor.status = "reset to default".into();
+            }
+            if ui.button("🌱 Biome World").on_hover_text("Load the default multi-biome graph (climate places Plains/Mountains)").clicked() {
+                editor.snarl = world_biome_snarl();
+                editor.nav.clear();
+                editor.clear_node_caches();
+                editor.status = "loaded biome world".into();
             }
             if ui.button("Auto-arrange").on_hover_text("Lay nodes out left→right by dependency depth").clicked() {
                 let WorldGraphEditor { snarl, body_size, .. } = &mut *editor;
@@ -1242,6 +1373,53 @@ mod tests {
 
         let g = snarl_to_graph(&top).expect("piped");
         assert_eq!(g.eval(0.0, 0.0, 7).v, 15.0); // Input(0)=10 + Const 5
+    }
+
+    /// A hierarchical snarl (with a biome) must survive a RON round-trip and compile identically — this
+    /// is what persists the biome hierarchy across save/reload (`.worldgraph.ron`).
+    #[test]
+    fn biome_hierarchy_ron_round_trips() {
+        let mut sub = Snarl::new();
+        let inp = sub.insert_node(p(), EdNode::Input(0));
+        let c = sub.insert_node(p(), EdNode::Op(NodeKind::Const(3.0)));
+        let add = sub.insert_node(p(), EdNode::Op(NodeKind::Add));
+        sub.connect(out(inp), inn(add, 0));
+        sub.connect(out(c), inn(add, 1));
+        let so = sub.insert_node(p(), EdNode::Output);
+        sub.connect(out(add), inn(so, 0));
+        let mut top = Snarl::new();
+        let c10 = top.insert_node(p(), EdNode::Op(NodeKind::Const(10.0)));
+        let b = top.insert_node(p(), EdNode::Biome { name: "Hills".into(), graph: Box::new(sub) });
+        top.connect(out(c10), inn(b, 0));
+        let o = top.insert_node(p(), EdNode::Output);
+        top.connect(out(b), inn(o, 0));
+
+        let s = ron::ser::to_string(&top).expect("serialize");
+        let back: Snarl<EdNode> = ron::de::from_str(&s).expect("deserialize");
+        let (g1, g2) = (snarl_to_graph(&top).unwrap(), snarl_to_graph(&back).unwrap());
+        for &(x, z) in &[(0.0, 0.0), (123.0, -456.0)] {
+            assert_eq!(g1.eval(x, z, 7).v.to_bits(), g2.eval(x, z, 7).v.to_bits());
+        }
+        assert_eq!(g2.eval(0.0, 0.0, 7).v, 13.0); // Input(0)=10 + Const 3
+    }
+
+    /// The default multi-biome world graph compiles, evaluates finite, and shows BOTH gentle (plains) and
+    /// tall (mountains) terrain over a region — the climate classifier actually places both biomes.
+    #[test]
+    fn biome_world_has_plains_and_mountains() {
+        let g = snarl_to_graph(&world_biome_snarl()).expect("compile biome world");
+        let (mut lo, mut hi) = (f64::INFINITY, f64::NEG_INFINITY);
+        for i in 0..40 {
+            for j in 0..40 {
+                let x = i as f64 * 450.0 - 9000.0;
+                let z = j as f64 * 450.0 - 9000.0;
+                let v = g.eval(x, z, 7).v;
+                assert!(v.is_finite(), "non-finite at ({x},{z})");
+                lo = lo.min(v);
+                hi = hi.max(v);
+            }
+        }
+        assert!(hi - lo > 300.0, "expected plains+mountains spread, got {lo}..{hi}");
     }
 
     /// A biome `Input` that is used but its parent pin is unconnected is a hard error (no silent 0).
