@@ -70,16 +70,18 @@ pub const WORLDGEN_SLICE_SEED: u64 = 0xA15E_C0DE_2026;
 /// 8·128 = 1024`, so no two resident chunks alias one ring slot (`slice_radius_respects_ring_invariant`).
 pub const WORLDGEN_SLICE_RADIUS: f64 = HEIGHT_CHUNK_CELLS as f64 * 3.75;
 
-/// World half-extent of the single global `Terrain` volume. Sized to cover the mesh-bake clipmap's
-/// FAR LOD so terrain fills the screen everywhere the camera roams within range. The clipmap reaches
-/// `lod0_radius · 2^(lod_count-1)` ≈ 16 · 2^8 = 4096 m (`MeshBakeConfig` defaults), so a half-extent
-/// of ~4096 m spans it. The Terrain CPU eval now samples the height field DIRECTLY by analytic fBm
-/// (world-anchored, infinite — see `edits::eval_primitive`), so this large volume is kept STATIC at
-/// the origin: every brick inside it samples real height regardless of the bounded resident ring, and
-/// a static volume avoids the full-volume re-mesh a moving large volume would trigger on every chunk
-/// crossing. True infinite-follow beyond this radius (a tiered clipmap-of-rings of terrain volumes)
-/// is a later task.
-pub const WORLDGEN_TERRAIN_HALF_XZ: f32 = 4096.0;
+/// World half-extent of the single global `Terrain` volume. EFFECTIVELY INFINITE (f32-safe): the
+/// mesh-bake clipmap reaches `lod0_radius · 2^(lod_count-1)` ≈ 4096 m around the CAMERA, not the origin
+/// — so to fill the screen everywhere the camera roams, the volume must cover (camera ± clipmap reach)
+/// for ANY camera position, i.e. be unbounded. A finite half-extent (the earlier 4096) only worked near
+/// the origin: flying past it left the terrain behind (it stops at the volume edge). Since the Terrain
+/// CPU eval samples the height field DIRECTLY by analytic fBm (world-anchored — see
+/// `edits::eval_primitive`), one STATIC, effectively-infinite volume lets the clipmap residency stream
+/// terrain around the camera EVERYWHERE with NO per-move re-bake (the volume never translates, so chunk
+/// content hashes are stable; only genuinely-new clipmap chunks bake). 131072 m (128 km) keeps world
+/// coords inside the f32-precision-safe range (ulp ≈ 16 mm); truly unbounded play needs camera-relative
+/// rebasing + tiered rings (WORLD_GEN_PLAN §2.9, a later task).
+pub const WORLDGEN_TERRAIN_HALF_XZ: f32 = 131072.0;
 
 /// Vertical AABB band the global terrain volume occupies. Tightened to bound the height layer's full
 /// fBm swing (default ≈ Σ octave amplitudes ≈ 70 m) with margin — NOT the old ±256 m. The bake's
