@@ -643,7 +643,16 @@ pub fn terrain_normal(p: bevy::math::Vec3, voxel_size: f32) -> Option<bevy::math
     Some(bevy::math::Vec3::new(-node.dh_dx, 1.0, -node.dh_dz).normalize_or_zero())
 }
 
-/// Strict/try clipmap sample → signed Terrain field (`p.y − height`); a non-rendering miss is empty space.
+/// Strict/try clipmap sample → signed Terrain field; a non-rendering miss is empty space.
+///
+/// LIPSCHITZ-NORMALISED: the raw vertical gap `p.y − h` has Lipschitz constant `√(1+|∇h|²)` — on a steep
+/// slope (the eroded gullies/ridges) it badly OVER-estimates the true distance to the surface. The
+/// mesh-bake's narrow-band cull (`mesh_bake::chunk_has_surface`) compares `|dist|` to a chunk's
+/// circumradius to decide whether to bake; an over-estimated distance makes it false-drop chunks the
+/// steep surface actually crosses → HOLES in the terrain. Dividing by `√(1 + dh/dx² + dh/dz²)` (the
+/// gradient the node already carries) makes it a first-order TRUE distance (Lipschitz ≤ 1), so the cull
+/// is accurate again — and the zero-crossing (the surface itself) is UNCHANGED (a positive scale). This
+/// mirrors the GPU bake's `p.y − h` Lipschitz normalisation.
 #[inline]
 fn terrain_height_to_sdf(
     clipmap: &HeightClipmap,
@@ -652,11 +661,15 @@ fn terrain_height_to_sdf(
     voxel_size: f32,
     max_height: f32,
 ) -> f32 {
+    let normalised = |node: HeightNode| -> f32 {
+        let lip = (1.0 + node.dh_dx * node.dh_dx + node.dh_dz * node.dh_dz).sqrt();
+        (p_y - node.height) / lip
+    };
     if voxel_size > 0.0 {
-        p_y - sample_clipmap_lod(clipmap, world_xz, voxel_size).height // strict: panics on a miss
+        normalised(sample_clipmap_lod(clipmap, world_xz, voxel_size)) // strict: panics on a miss
     } else {
         match try_sample_clipmap_lod(clipmap, world_xz, voxel_size) {
-            Some(node) => p_y - node.height,
+            Some(node) => normalised(node),
             None => max_height - p_y + 1.0e4,
         }
     }

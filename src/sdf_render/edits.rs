@@ -1461,15 +1461,18 @@ mod tests {
         let local = Vec3::new(5.0, 12.0, -3.0);
         let world_xz =
             bevy::math::DVec2::new((local.x + offset.x) as f64, (local.z + offset.y) as f64);
-        let expected_h = sample_ring(&ring, world_xz).expect("world XZ resolves to resident chunk").height;
+        let node = sample_ring(&ring, world_xz).expect("world XZ resolves to resident chunk");
         // `voxel_size == 0.0` ⇒ mip 0, which is identical to `sample_ring` — so the eval reproduces the
         // ring's full-detail height here.
         let d = eval_primitive(&prim, local, 0.0);
-        // The eval returns the signed vertical gap `local.y - height_at_world_xz`.
+        // The eval returns the LIPSCHITZ-NORMALISED vertical gap `(local.y − h) / √(1+|∇h|²)` (so the
+        // narrow-band cull sees a true distance on steep terrain — see `upload::terrain_height_to_sdf`).
+        let lip = (1.0 + node.dh_dx * node.dh_dx + node.dh_dz * node.dh_dz).sqrt();
+        let expected = (local.y - node.height) / lip;
         assert!(
-            (d - (local.y - expected_h)).abs() < 1e-4,
-            "world-anchored eval: got {d}, expected {} (h={expected_h})",
-            local.y - expected_h
+            (d - expected).abs() < 1e-4,
+            "world-anchored eval: got {d}, expected {expected} (h={}, lip={lip})",
+            node.height
         );
 
         // Reset globals so other tests aren't affected.
