@@ -81,6 +81,15 @@ fn sky(ndcy: f32) -> vec3<f32> {
     return mix(vec3<f32>(0.12, 0.15, 0.22), vec3<f32>(0.27, 0.36, 0.52), t);
 }
 
+// Earth cross-section: the absolute-height ramp banded into horizontal strata, so a box wall (where the
+// solid terrain is sliced by the window edge) reads as layered ground rather than a hole.
+fn strata(y: f32) -> vec3<f32> {
+    let base = height_colour(y);
+    let f = fract(y / 60.0);
+    let line = (1.0 - smoothstep(0.0, 0.06, f)) + smoothstep(0.94, 1.0, f);
+    return base * (1.0 - 0.4 * clamp(line, 0.0, 1.0));
+}
+
 @fragment
 fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
     let ndcx = in.uv.x * 2.0 - 1.0;
@@ -101,28 +110,40 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
     if (hit.z < 0.0) {
         return vec4<f32>(sky(ndcy), 1.0);
     }
-
-    // Adaptive (sphere-trace-like) heightfield march between the box entry/exit.
     let t0 = max(hit.x, 0.0);
     let t1 = hit.y;
-    let descent = max(-dir.y, 0.05);
-    let min_step = max((t1 - t0) / 4096.0, 0.05);
-    var t = t0;
-    var p = eye + dir * t;
-    var a_prev = p.y - hf_at(p.xz).x;
     let light = normalize(vec3<f32>(0.4, 0.85, 0.3));
 
-    for (var i = 0; i < 256; i = i + 1) {
+    // Solid earth: if the ray ENTERS the box already at/below the surface, it pierced a side/bottom wall
+    // → shade the earth cross-section (strata) instead of marching into a hole.
+    let pe = eye + dir * t0;
+    if (pe.y - hf_at(pe.xz).x <= 0.0) {
+        return vec4<f32>(strata(pe.y), 1.0);
+    }
+
+    // Adaptive march, but cap each step to ~2 texels HORIZONTALLY so thin ridges aren't tunnelled through
+    // when viewed from the side (the classic heightfield-undersampling artefact).
+    let res = params.levels.w;
+    let texel = (2.0 * half) / res;
+    let hspeed = max(length(dir.xz), 1e-4);
+    let max_h = 2.0 * texel / hspeed;
+    let descent = max(-dir.y, 0.02);
+    let min_step = max((t1 - t0) / 8192.0, 0.02);
+    var t = t0;
+    var a_prev = pe.y - hf_at(pe.xz).x;
+
+    for (var i = 0; i < 512; i = i + 1) {
         if (t >= t1) { break; }
-        let step = max((max(a_prev, 0.0) / descent) * 0.5, min_step);
+        var step = max((max(a_prev, 0.0) / descent) * 0.45, min_step);
+        step = min(step, max_h);
         let tn = min(t + step, t1);
         let pn = eye + dir * tn;
         let a_n = pn.y - hf_at(pn.xz).x;
-        if (a_n <= 0.0 && a_prev > 0.0) {
+        if (a_n <= 0.0) {
             // Bisect the crossing.
             var lo = t;
             var hi = tn;
-            for (var k = 0; k < 16; k = k + 1) {
+            for (var k = 0; k < 20; k = k + 1) {
                 let m = (lo + hi) * 0.5;
                 let pm = eye + dir * m;
                 if (pm.y - hf_at(pm.xz).x > 0.0) { lo = m; } else { hi = m; }
@@ -136,7 +157,6 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
         }
         a_prev = a_n;
         t = tn;
-        p = pn;
     }
     return vec4<f32>(sky(ndcy), 1.0);
 }
