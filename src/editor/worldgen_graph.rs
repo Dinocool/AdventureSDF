@@ -13,10 +13,16 @@ use bevy_egui::egui;
 use egui_snarl::ui::{PinInfo, SnarlStyle, SnarlViewer, SnarlWidget};
 use egui_snarl::{InPin, InPinId, NodeId, OutPin, OutPinId, Snarl};
 
+use crate::assets::Asset as _;
 use crate::sdf_render::worldgen::WorldGraph;
+use crate::sdf_render::worldgen::graph::GraphAsset;
 use crate::sdf_render::worldgen::graph::node::{FbmAxis, Graph, Node, NodeKind};
 use crate::sdf_render::worldgen::graph::preset::{MAX_GRAPH_NODES, mountains_plains_graph};
 use crate::sdf_render::worldgen::spline::Spline;
+
+/// Default on-disk path the editor saves/loads the active biome graph to (the production graph the
+/// worldgen loads — see `WorldGenPlugin`'s asset hot-reload). Relative to the app's `assets/` root.
+const DEFAULT_GRAPH_PATH: &str = "assets/worldgen/mountains_plains.graph.ron";
 
 /// A node in the editor graph: an engine operation, or the single graph OUTPUT sink (1 input, 0
 /// outputs) that designates which node's value is the terrain height.
@@ -26,11 +32,21 @@ pub enum EdNode {
     Output,
 }
 
-/// Editor state: the working Snarl graph + whether it's been seeded from the live `WorldGraph` yet.
-#[derive(Resource, Default)]
+/// Editor state: the working Snarl graph, whether it's been seeded from the live `WorldGraph` yet, and
+/// the RON save/load path.
+#[derive(Resource)]
 pub struct WorldGraphEditor {
     snarl: Snarl<EdNode>,
     seeded: bool,
+    path: String,
+    /// Last save/load status message (shown in the toolbar).
+    status: String,
+}
+
+impl Default for WorldGraphEditor {
+    fn default() -> Self {
+        Self { snarl: Snarl::new(), seeded: false, path: DEFAULT_GRAPH_PATH.to_string(), status: String::new() }
+    }
 }
 
 /// Plugin: registers the editor state + the dockable "Biome Graph" panel.
@@ -231,8 +247,10 @@ fn node_params_ui(ui: &mut egui::Ui, kind: &mut NodeKind) {
             ui.add(egui::DragValue::new(k).speed(1.0));
         }
         NodeKind::Ridge { ridge, amp_sum } => {
-            ui.add(egui::DragValue::new(ridge).speed(0.01).range(0.0..=1.0).prefix("ridge "));
-            ui.add(egui::DragValue::new(amp_sum).speed(1.0).prefix("amp_sum "));
+            ui.add(egui::DragValue::new(ridge).speed(0.01).range(0.0..=1.0).prefix("ridge "))
+                .on_hover_text("Ridge fold strength: 0 = smooth fBm, 1 = sharp ridged peaks (folds toward 1−|n|). Lower this to calm over-prominent ridgelines.");
+            ui.add(egui::DragValue::new(amp_sum).speed(1.0).prefix("amp_sum "))
+                .on_hover_text("Expected swing of the input (the fBm's amplitude·Σgain^o). Sets where the fold reflects.");
         }
         NodeKind::Smoothstep { edge0, edge1 } => {
             ui.add(egui::DragValue::new(edge0).speed(0.01).prefix("e0 "));
@@ -243,12 +261,19 @@ fn node_params_ui(ui: &mut egui::Ui, kind: &mut NodeKind) {
             ui.add(egui::DragValue::new(hi).speed(1.0).prefix("hi "));
         }
         NodeKind::Fbm(ax) => {
-            ui.add(egui::DragValue::new(&mut ax.amplitude).speed(1.0).prefix("amp "));
+            ui.add(egui::DragValue::new(&mut ax.amplitude).speed(1.0).prefix("amp "))
+                .on_hover_text("Height of the biggest (octave-0) wave, in metres — the overall vertical scale.");
             let mut wavelength = if ax.base_freq != 0.0 { 1.0 / ax.base_freq } else { 0.0 };
-            if ui.add(egui::DragValue::new(&mut wavelength).speed(8.0).prefix("λ ")).changed() && wavelength > 0.0 {
+            if ui
+                .add(egui::DragValue::new(&mut wavelength).speed(8.0).prefix("λ "))
+                .on_hover_text("Wavelength (m) of the biggest feature: larger = broader, gentler shapes.")
+                .changed()
+                && wavelength > 0.0
+            {
                 ax.base_freq = 1.0 / wavelength;
             }
-            ui.add(egui::DragValue::new(&mut ax.octaves).range(1..=8).prefix("oct "));
+            ui.add(egui::DragValue::new(&mut ax.octaves).range(1..=8).prefix("oct "))
+                .on_hover_text("How many noise layers to sum — more octaves = finer detail (each half as tall, twice as fine).");
         }
         NodeKind::Curve(_) => {
             ui.label("curve");
@@ -322,27 +347,62 @@ fn graph_panel(world: &mut World, ui: &mut egui::Ui) {
         }
 
         ui.horizontal(|ui| {
-            if ui.button("Apply").clicked() {
+            // APPLY — rebuild the engine graph + push it live into the world (roll_worldgen re-meshes).
+            if ui.button("Apply").on_hover_text("Rebuild + drive the live world terrain from this graph").clicked() {
                 match snarl_to_graph(&editor.snarl) {
                     Ok(g) => {
                         world.resource_mut::<WorldGraph>().0 = Arc::new(g);
+                        editor.status = "applied to world".into();
                     }
-                    Err(e) => {
-                        warn!("biome graph invalid: {e}");
-                    }
+                    Err(e) => editor.status = format!("invalid: {e}"),
                 }
             }
-            if ui.button("Reset to mountains/plains").clicked() {
+            // SAVE — write the graph to its .ron (the production graph the worldgen hot-reloads).
+            if ui.button("Save").on_hover_text("Write to the .ron asset (the world hot-reloads it)").clicked() {
+                editor.status = match snarl_to_graph(&editor.snarl) {
+                    Ok(g) => match (GraphAsset { graph: g }).save(std::path::Path::new(&editor.path)) {
+                        Ok(()) => format!("saved {}", editor.path),
+                        Err(e) => format!("save failed: {e}"),
+                    },
+                    Err(e) => format!("invalid: {e}"),
+                };
+            }
+            // LOAD — read the .ron back into the editor.
+            if ui.button("Load").clicked() {
+                editor.status = match std::fs::read_to_string(&editor.path) {
+                    Ok(s) => match ron::de::from_str::<GraphAsset>(&s) {
+                        Ok(asset) => {
+                            editor.snarl = graph_to_snarl(&asset.graph);
+                            format!("loaded {}", editor.path)
+                        }
+                        Err(e) => format!("parse failed: {e}"),
+                    },
+                    Err(e) => format!("read failed: {e}"),
+                };
+            }
+            if ui.button("Reset").on_hover_text("Restore the built-in mountains/plains graph").clicked() {
                 let g = mountains_plains_graph(
                     crate::sdf_render::worldgen::graph::preset::MOUNTAINS_PLAINS_AMPLITUDE,
                 );
                 editor.snarl = graph_to_snarl(&g);
+                editor.status = "reset to default".into();
             }
-            // Live validity hint.
+        });
+        ui.horizontal(|ui| {
+            ui.label("Path:");
+            // Borrow path mutably without conflicting with the snarl borrow below.
+            let path = &mut editor.path;
+            ui.add(egui::TextEdit::singleline(path).desired_width(360.0));
+        });
+        // Live validity hint + last status.
+        ui.horizontal(|ui| {
             match snarl_to_graph(&editor.snarl) {
-                Ok(g) => ui.label(format!("{} nodes ✓", g.nodes.len())),
+                Ok(g) => ui.colored_label(egui::Color32::from_rgb(140, 200, 140), format!("{} nodes ✓", g.nodes.len())),
                 Err(e) => ui.colored_label(egui::Color32::from_rgb(220, 120, 120), e),
             };
+            if !editor.status.is_empty() {
+                ui.label(format!("· {}", editor.status));
+            }
         });
 
         SnarlWidget::new()
