@@ -76,6 +76,11 @@ pub struct WorldGraphEditor {
     /// Last-frame on-screen preview square side (points) per node, used to pick the render resolution so
     /// previews stay crisp as the node is resized.
     disp_px: std::collections::HashMap<NodeId, f32>,
+    /// Navigation stack of biome nodes we've descended into (empty ⇒ the top "World" graph). The shown
+    /// snarl is `snarl` walked through each biome's sub-graph. (Distinct from `path`, the save file path.)
+    nav: Vec<NodeId>,
+    /// Set by the Viewer when the user clicks a biome's "Open"; the panel descends into it after the show.
+    enter: Option<NodeId>,
 }
 
 impl Default for WorldGraphEditor {
@@ -92,7 +97,23 @@ impl Default for WorldGraphEditor {
             cam: std::collections::HashMap::new(),
             body_size: std::collections::HashMap::new(),
             disp_px: std::collections::HashMap::new(),
+            nav: Vec::new(),
+            enter: None,
         }
+    }
+}
+
+impl WorldGraphEditor {
+    /// Drop all per-node UI caches — called on navigation, since `NodeId`s are per-snarl-level (a fresh
+    /// id namespace each level) so caches must not bleed between levels.
+    fn clear_node_caches(&mut self) {
+        self.previews.clear();
+        self.collapsed.clear();
+        self.zoom_half_m.clear();
+        self.surface.clear();
+        self.cam.clear();
+        self.body_size.clear();
+        self.disp_px.clear();
     }
 }
 
@@ -162,6 +183,63 @@ fn output_root(snarl: &Snarl<EdNode>) -> Result<NodeId, String> {
         }
     }
     Err("the Output node has no input wired".into())
+}
+
+// ===================================================================================================
+// Biome navigation (drill into a biome's sub-graph; breadcrumb back out)
+// ===================================================================================================
+
+/// How many leading `path` entries still resolve to live biome nodes (trailing stale ids dropped).
+fn valid_depth(root: &Snarl<EdNode>, path: &[NodeId]) -> usize {
+    let mut s = root;
+    for (i, &id) in path.iter().enumerate() {
+        match s.get_node(id) {
+            Some(EdNode::Biome { graph, .. }) => s = graph,
+            _ => return i,
+        }
+    }
+    path.len()
+}
+
+/// Biome names along `path` (for the breadcrumb).
+fn breadcrumb_names(root: &Snarl<EdNode>, path: &[NodeId]) -> Vec<String> {
+    let mut names = Vec::with_capacity(path.len());
+    let mut s = root;
+    for &id in path {
+        match s.get_node(id) {
+            Some(EdNode::Biome { name, graph }) => {
+                names.push(name.clone());
+                s = graph;
+            }
+            _ => break,
+        }
+    }
+    names
+}
+
+/// The snarl shown at the current `path` (mutable). `path` must be valid (see [`valid_depth`]).
+fn current_snarl_mut<'a>(root: &'a mut Snarl<EdNode>, path: &[NodeId]) -> &'a mut Snarl<EdNode> {
+    let mut s = root;
+    for &id in path {
+        s = match &mut s[id] {
+            EdNode::Biome { graph, .. } => graph.as_mut(),
+            _ => unreachable!("path is validated to biome nodes before use"),
+        };
+    }
+    s
+}
+
+/// A fresh biome sub-graph: the four climate `Input` sentinels (available to wire) + a `Const(0)` wired
+/// to an `Output`, so a new biome is valid (flat height 0) until the user shapes it.
+fn new_biome_subgraph() -> Snarl<EdNode> {
+    let mut s = Snarl::new();
+    for k in 0..CLIMATE_INPUTS.len() {
+        s.insert_node(egui::pos2(0.0, 60.0 * k as f32), EdNode::Input(k));
+    }
+    let c = s.insert_node(egui::pos2(260.0, 0.0), EdNode::Op(NodeKind::Const(0.0)));
+    let o = s.insert_node(egui::pos2(520.0, 0.0), EdNode::Output);
+    s.connect(OutPinId { node: c, output: 0 }, InPinId { node: o, input: 0 });
+    s
 }
 
 /// Convert the editor Snarl (possibly nested with biomes) to a flat engine [`Graph`] by **inlining**:
@@ -289,6 +367,8 @@ struct Viewer<'a> {
     cam: &'a mut std::collections::HashMap<NodeId, (f32, f32)>,
     body_size: &'a mut std::collections::HashMap<NodeId, egui::Vec2>,
     disp_px: &'a mut std::collections::HashMap<NodeId, f32>,
+    /// Set to a biome node id when the user clicks its "Open" — the panel descends after the show.
+    enter: &'a mut Option<NodeId>,
 }
 
 impl SnarlViewer<EdNode> for Viewer<'_> {
@@ -332,10 +412,21 @@ impl SnarlViewer<EdNode> for Viewer<'_> {
     ) {
         ui.set_max_width(NODE_BODY_MAX_W);
         // Node params, stacked VERTICALLY at the top of the body (keeps nodes narrow); preview below.
-        if let EdNode::Op(kind) = &mut snarl[node] {
-            node_params_ui(ui, kind);
+        match &mut snarl[node] {
+            EdNode::Op(kind) => node_params_ui(ui, kind),
+            EdNode::Biome { name, .. } => {
+                ui.add(egui::TextEdit::singleline(name).desired_width(120.0).hint_text("biome name"));
+            }
+            _ => {}
         }
-        // Toggle row (sits ABOVE the preview): collapse/expand + zoom. Previews are on by default.
+        if matches!(snarl.get_node(node), Some(EdNode::Biome { .. }))
+            && ui.button("Open ▸").on_hover_text("Edit this biome's sub-graph").clicked()
+        {
+            *self.enter = Some(node);
+        }
+        // Divider between the node params (above) and the preview section (options row + preview below).
+        ui.separator();
+        // Preview-options row (sits ABOVE the preview): collapse/expand + zoom + 2D/3D. Previews on by default.
         let open = !self.collapsed.contains(&node);
         ui.horizontal(|ui| {
             if ui
@@ -467,6 +558,19 @@ impl SnarlViewer<EdNode> for Viewer<'_> {
                 ui.close();
             }
         }
+        ui.separator();
+        if ui.button("🌱 Biome").on_hover_text("A nested biome sub-graph (climate in, height out)").clicked() {
+            snarl.insert_node(pos, EdNode::Biome { name: "biome".into(), graph: Box::new(new_biome_subgraph()) });
+            ui.close();
+        }
+        ui.menu_button("Climate input", |ui| {
+            for (k, name) in CLIMATE_INPUTS.iter().enumerate() {
+                if ui.button(*name).on_hover_text("A climate value piped in from the parent biome").clicked() {
+                    snarl.insert_node(pos, EdNode::Input(k));
+                    ui.close();
+                }
+            }
+        });
     }
 }
 
@@ -949,6 +1053,8 @@ fn graph_panel(world: &mut World, ui: &mut egui::Ui) {
                     Ok(s) => match ron::de::from_str::<GraphAsset>(&s) {
                         Ok(asset) => {
                             editor.snarl = graph_to_snarl(&asset.graph);
+                            editor.nav.clear();
+                            editor.clear_node_caches();
                             format!("loaded {}", editor.path)
                         }
                         Err(e) => format!("parse failed: {e}"),
@@ -961,6 +1067,8 @@ fn graph_panel(world: &mut World, ui: &mut egui::Ui) {
                     crate::sdf_render::worldgen::graph::preset::MOUNTAINS_PLAINS_AMPLITUDE,
                 );
                 editor.snarl = graph_to_snarl(&g);
+                editor.nav.clear();
+                editor.clear_node_caches();
                 editor.status = "reset to default".into();
             }
             if ui.button("Auto-arrange").on_hover_text("Lay nodes out left→right by dependency depth").clicked() {
@@ -986,16 +1094,52 @@ fn graph_panel(world: &mut World, ui: &mut egui::Ui) {
             }
         });
 
-        // Disjoint borrows of the editor's fields: the snarl is the working graph; the rest are the
-        // per-node preview caches the Viewer drives.
-        let WorldGraphEditor { snarl, previews, collapsed, zoom_half_m, surface, cam, body_size, disp_px, .. } =
-            &mut *editor;
-        let mut viewer =
-            Viewer { previews, collapsed, zoom_half_m, surface, cam, body_size, disp_px };
-        SnarlWidget::new()
-            .id(egui::Id::new("worldgen-biome-graph"))
-            .style(SnarlStyle::new())
-            .show(snarl, &mut viewer, ui);
+        // Drop any stale tail of the nav path (e.g. a biome was deleted), then a breadcrumb to walk out.
+        let valid = valid_depth(&editor.snarl, &editor.nav);
+        if valid != editor.nav.len() {
+            editor.nav.truncate(valid);
+            editor.clear_node_caches();
+        }
+        let mut nav_to: Option<usize> = None;
+        let crumbs = breadcrumb_names(&editor.snarl, &editor.nav);
+        ui.horizontal(|ui| {
+            if ui.selectable_label(editor.nav.is_empty(), "🌍 World").clicked() {
+                nav_to = Some(0);
+            }
+            for (i, name) in crumbs.iter().enumerate() {
+                ui.label("›");
+                if ui.selectable_label(i + 1 == editor.nav.len(), format!("🌱 {name}")).clicked() {
+                    nav_to = Some(i + 1);
+                }
+            }
+        });
+        if let Some(d) = nav_to.filter(|&d| d != editor.nav.len()) {
+            editor.nav.truncate(d);
+            editor.clear_node_caches();
+        }
+        ui.separator();
+
+        // Show the snarl at the current nav depth. Disjoint borrows: `snarl`+`nav` resolve the level;
+        // the rest are the per-node preview caches the Viewer drives.
+        editor.enter = None;
+        {
+            let WorldGraphEditor {
+                snarl, nav, previews, collapsed, zoom_half_m, surface, cam, body_size, disp_px, enter, ..
+            } = &mut *editor;
+            let current = current_snarl_mut(snarl, nav);
+            let mut viewer = Viewer {
+                previews, collapsed, zoom_half_m, surface, cam, body_size, disp_px, enter,
+            };
+            SnarlWidget::new()
+                .id(egui::Id::new("worldgen-biome-graph"))
+                .style(SnarlStyle::new())
+                .show(current, &mut viewer, ui);
+        }
+        // Descend into a biome the user opened this frame.
+        if let Some(id) = editor.enter.take() {
+            editor.nav.push(id);
+            editor.clear_node_caches();
+        }
     });
 }
 
