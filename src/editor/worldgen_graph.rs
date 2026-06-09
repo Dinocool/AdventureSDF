@@ -85,6 +85,25 @@ pub struct WorldGraphEditor {
     nav: Vec<NodeId>,
     /// Set by the Viewer when the user clicks a biome's "Open"; the panel descends into it after the show.
     enter: Option<NodeId>,
+    /// Previews "popped out" into floating windows (drag anywhere, incl. over the top panel). Each is
+    /// self-contained so it survives navigation and doesn't clash with the in-graph preview caches.
+    popped: Vec<PoppedPreview>,
+    /// Set by the Viewer when the user clicks a node's pop-out button; the panel snapshots it after show.
+    pop_request: Option<NodeId>,
+}
+
+/// A node preview detached into its own floating window — carries its own nav path, view state, and
+/// texture so it stays live across navigation independently of the in-graph preview.
+struct PoppedPreview {
+    nav: Vec<NodeId>,
+    node: NodeId,
+    half: f64,
+    size: f32,
+    is3d: bool,
+    cam: (f32, f32),
+    tex: Option<egui::TextureHandle>,
+    key: u64,
+    open: bool,
 }
 
 impl Default for WorldGraphEditor {
@@ -104,6 +123,8 @@ impl Default for WorldGraphEditor {
             prev_key: std::collections::HashMap::new(),
             nav: Vec::new(),
             enter: None,
+            popped: Vec::new(),
+            pop_request: None,
         }
     }
 }
@@ -221,6 +242,19 @@ fn breadcrumb_names(root: &Snarl<EdNode>, path: &[NodeId]) -> Vec<String> {
         }
     }
     names
+}
+
+/// Resolve the snarl at `nav` (read-only), or `None` if any step no longer points to a biome (e.g. a
+/// popped-out preview whose biome was deleted).
+fn resolve_snarl<'a>(root: &'a Snarl<EdNode>, nav: &[NodeId]) -> Option<&'a Snarl<EdNode>> {
+    let mut s = root;
+    for &id in nav {
+        match s.get_node(id) {
+            Some(EdNode::Biome { graph, .. }) => s = graph,
+            _ => return None,
+        }
+    }
+    Some(s)
 }
 
 /// The snarl shown at the current `path` (mutable). `path` must be valid (see [`valid_depth`]).
@@ -480,6 +514,8 @@ struct Viewer<'a> {
     prev_key: &'a mut std::collections::HashMap<NodeId, u64>,
     /// Set to a biome node id when the user clicks its "Open" — the panel descends after the show.
     enter: &'a mut Option<NodeId>,
+    /// Set to a node id when the user clicks its pop-out button — the panel opens a window after the show.
+    pop_request: &'a mut Option<NodeId>,
 }
 
 impl SnarlViewer<EdNode> for Viewer<'_> {
@@ -593,9 +629,14 @@ impl SnarlViewer<EdNode> for Viewer<'_> {
                     // RIGHT — controls column (collapse, zoom, 2D/3D, size). Zoom via the km field (no
                     // scroll-zoom, which would also scroll the graph area).
                     ui.vertical(|ui| {
-                        if ui.small_button(icon::CARET_DOWN).on_hover_text("Collapse preview").clicked() {
-                            self.collapsed.insert(node);
-                        }
+                        ui.horizontal(|ui| {
+                            if ui.small_button(icon::CARET_DOWN).on_hover_text("Collapse preview").clicked() {
+                                self.collapsed.insert(node);
+                            }
+                            if ui.small_button(icon::ARROWS_OUT).on_hover_text("Pop out into a movable window").clicked() {
+                                *self.pop_request = Some(node);
+                            }
+                        });
                         let h = self.zoom_half_m.entry(node).or_insert(PREVIEW_HALF_M);
                         let mut km = *h * 2.0 / 1000.0;
                         if ui
@@ -918,6 +959,33 @@ fn input_label(node: &EdNode, slot: usize) -> &'static str {
             _ => "in",
         },
     }
+}
+
+/// Render (or reuse) a preview texture into `tex`/`key`, re-rendering only when the inputs change. Used
+/// by the popped-out preview windows (the in-graph body has its own HashMap-keyed cache).
+#[allow(clippy::too_many_arguments)]
+fn ensure_preview_texture(
+    ctx: &egui::Context,
+    name: String,
+    g: &Graph,
+    half: f64,
+    res: usize,
+    is3d: bool,
+    cam: (f32, f32),
+    tex: &mut Option<egui::TextureHandle>,
+    key: &mut u64,
+) -> egui::TextureId {
+    let k = preview_key(g, half, res, is3d, cam.0, cam.1);
+    if tex.is_none() || *key != k {
+        let img = if is3d {
+            render_surface_preview(g, half, cam.0, cam.1, res)
+        } else {
+            render_field_preview(g, half, res)
+        };
+        *tex = Some(ctx.load_texture(name, img, egui::TextureOptions::LINEAR));
+        *key = k;
+    }
+    tex.as_ref().unwrap().id()
 }
 
 /// Fingerprint everything a preview render depends on, so it's only recomputed on change.
@@ -1271,13 +1339,35 @@ fn graph_panel(world: &mut World, ui: &mut egui::Ui) {
         // Show the snarl at the current nav depth. Disjoint borrows: `snarl`+`nav` resolve the level;
         // the rest are the per-node preview caches the Viewer drives.
         editor.enter = None;
+        editor.pop_request = None;
         {
             let WorldGraphEditor {
-                snarl, nav, previews, collapsed, zoom_half_m, surface, cam, body_size, disp_px, prev_key, enter, ..
+                snarl,
+                nav,
+                previews,
+                collapsed,
+                zoom_half_m,
+                surface,
+                cam,
+                body_size,
+                disp_px,
+                prev_key,
+                enter,
+                pop_request,
+                ..
             } = &mut *editor;
             let current = current_snarl_mut(snarl, nav);
             let mut viewer = Viewer {
-                previews, collapsed, zoom_half_m, surface, cam, body_size, disp_px, prev_key, enter,
+                previews,
+                collapsed,
+                zoom_half_m,
+                surface,
+                cam,
+                body_size,
+                disp_px,
+                prev_key,
+                enter,
+                pop_request,
             };
             SnarlWidget::new()
                 .id(egui::Id::new("worldgen-biome-graph"))
@@ -1289,7 +1379,65 @@ fn graph_panel(world: &mut World, ui: &mut egui::Ui) {
             editor.nav.push(id);
             editor.clear_node_caches();
         }
+        // Pop a node's preview out into a movable window (snapshotting its current view state + nav path).
+        if let Some(node) = editor.pop_request.take() {
+            let half = editor.zoom_half_m.get(&node).copied().unwrap_or(PREVIEW_HALF_M);
+            let is3d = editor.surface.contains(&node);
+            let cam = editor.cam.get(&node).copied().unwrap_or(CAM_DEFAULT);
+            let size = editor.disp_px.get(&node).copied().unwrap_or(DEFAULT_PREVIEW_PX).max(260.0);
+            let nav = editor.nav.clone();
+            editor.popped.push(PoppedPreview { nav, node, half, size, is3d, cam, tex: None, key: 0, open: true });
+        }
+        // Render the popped-out preview windows (float above everything; drag anywhere incl. top panel).
+        let WorldGraphEditor { snarl, popped, .. } = &mut *editor;
+        for (i, p) in popped.iter_mut().enumerate() {
+            popped_preview_window(ui, i, p, snarl);
+        }
+        popped.retain(|p| p.open);
     });
+}
+
+/// Draw one popped-out preview as a floating, resizable `egui::Window`.
+fn popped_preview_window(ui: &egui::Ui, idx: usize, p: &mut PoppedPreview, root: &Snarl<EdNode>) {
+    let mut open = p.open;
+    egui::Window::new(format!("Preview {}", idx + 1))
+        .id(egui::Id::new(("wg-pop", idx, p.node)))
+        .open(&mut open)
+        .resizable(true)
+        .default_size([p.size + 80.0, p.size + 40.0])
+        .show(ui.ctx(), |ui| {
+            let g = match resolve_snarl(root, &p.nav).map(|s| graph_rooted_at(s, p.node)) {
+                Some(Ok(g)) => g,
+                _ => {
+                    ui.colored_label(egui::Color32::from_rgb(200, 150, 120), "node no longer exists");
+                    return;
+                }
+            };
+            ui.horizontal(|ui| {
+                if ui.selectable_label(p.is3d, "3D").on_hover_text("3D surface (drag to orbit)").clicked() {
+                    p.is3d = !p.is3d;
+                }
+                let mut km = p.half * 2.0 / 1000.0;
+                if ui.add(egui::DragValue::new(&mut km).speed(0.25).range(0.05..=512.0).suffix(" km")).changed() {
+                    p.half = (km * 1000.0 / 2.0).max(1.0);
+                }
+                ui.add(egui::DragValue::new(&mut p.size).speed(2.0).range(96.0..=2048.0).suffix(" px"));
+            });
+            let ppp = ui.ctx().pixels_per_point();
+            let res = ((p.size * ppp).round() as usize).max(32);
+            let name = format!("wg-pop-tex-{idx}");
+            let tex = ensure_preview_texture(ui.ctx(), name, &g, p.half, res, p.is3d, p.cam, &mut p.tex, &mut p.key);
+            let resp = ui.add(
+                egui::Image::new(egui::load::SizedTexture::new(tex, egui::vec2(p.size, p.size)))
+                    .sense(egui::Sense::drag()),
+            );
+            if p.is3d && resp.dragged() {
+                let dd = resp.drag_delta();
+                p.cam.0 += dd.x * 0.01;
+                p.cam.1 = (p.cam.1 - dd.y * 0.01).clamp(0.05, 1.5);
+            }
+        });
+    p.open = open;
 }
 
 #[cfg(test)]
