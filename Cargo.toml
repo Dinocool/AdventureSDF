@@ -13,6 +13,7 @@ editor = [
     "dep:bevy_egui",
     "dep:egui_dock",
     "dep:egui-phosphor",
+    "dep:egui-snarl",
     # Chrome-tracing profiler, RUNTIME-TOGGLEABLE from the editor (Performance panel),
     # OFF by default. We enable `bevy/trace` for the instrumentation (every Bevy system +
     # render-graph node span plus our own `info_span!` SDF spans) but NOT `bevy/trace_chrome`
@@ -110,6 +111,9 @@ tracing-chrome = { version = "0.7", optional = true }
 # Phosphor icon font for the editor toolbar (egui 0.33-compatible). Installed into the
 # egui context at startup; gives named glyph constants so toolbar buttons show real icons.
 egui-phosphor = { version = "0.11", optional = true }
+# Off-the-shelf egui node-graph editor (egui 0.33) for the worldgen biome node editor. `serde` for
+# saving the editor's Snarl graph; the engine `Graph` (sdf_render::worldgen::graph) is converted to/from it.
+egui-snarl = { version = "0.9", optional = true, features = ["serde"] }
 # Host/process RAM sampling for the Performance panel's memory breakdown (editor only). We
 # query it directly rather than via Bevy's SystemInformationDiagnosticsPlugin, which only
 # exposes host memory as a percentage (no byte total) — we want a byte-level breakdown.
