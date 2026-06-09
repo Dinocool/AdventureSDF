@@ -257,6 +257,40 @@ fn chunk_aabb(key: BrickKey, config: &SdfGridConfig, k: u32) -> Aabb3d {
     Aabb3d::from_min_max(min, min + Vec3::splat(cw))
 }
 
+/// COVERAGE GATE predicate: is this chunk allowed to mesh against the worldgen `Terrain`? True iff
+/// EITHER the chunk's world-XZ footprint doesn't touch any `Terrain` edit (so it samples no terrain —
+/// nothing to gate), OR the loaded height `ring` fully covers that footprint EXPANDED by an apron
+/// margin. The margin = the chunk's voxel size + `2·HEIGHT_CHUNK_CELLS` slack so the gate stays ahead
+/// of bilinear/gradient taps that reach a node past the chunk edge AND the async lag between a camera
+/// roll and the next ring rebuild. A `None` ring (nothing loaded yet) ⇒ never covered ⇒ not resident.
+/// This is what makes the strict `eval_primitive` Terrain sampler safe: a resident terrain chunk is
+/// always backed by loaded height, so the strict sampler can panic on a miss with no false positives.
+fn terrain_chunk_covered(
+    key: BrickKey,
+    config: &SdfGridConfig,
+    k: u32,
+    terrain_xz_aabbs: &[(Vec2, Vec2)],
+    ring: Option<&crate::sdf_render::worldgen::upload::HeightRingCpu>,
+) -> bool {
+    let b = chunk_aabb(key, config, k);
+    let cmin = Vec2::new(b.min.x, b.min.z);
+    let cmax = Vec2::new(b.max.x, b.max.z);
+    // Does this chunk sample any Terrain edit? (XZ-overlap test.)
+    let touches_terrain = terrain_xz_aabbs.iter().any(|(tmin, tmax)| {
+        cmax.x >= tmin.x && cmin.x <= tmax.x && cmax.y >= tmin.y && cmin.y <= tmax.y
+    });
+    if !touches_terrain {
+        return true; // no terrain sampled here → gate doesn't apply.
+    }
+    let Some(ring) = ring else {
+        return false; // touches terrain but nothing loaded → not generatable yet.
+    };
+    let margin = config.voxel_size_at(key.lod)
+        + 2.0 * crate::sdf_render::worldgen::layers::height::HEIGHT_CHUNK_CELLS as f32;
+    let m = Vec2::splat(margin);
+    crate::sdf_render::worldgen::upload::ring_covers_aabb(ring, cmin - m, cmax + m)
+}
+
 /// LOD-0-chunk index RANGE `[lo, hi)` (per axis) occupied by a LOD-`key.lod` chunk. A LOD-L chunk spans
 /// `2^L` LOD-0 chunks per axis (its world size is `2^L×` a LOD-0 chunk), so all per-LOD shells can be
 /// compared on the common LOD-0 chunk lattice. `key.coord` is a multiple of `K·cell_stride` in LOD-L
@@ -760,6 +794,23 @@ fn mesh_resident_chunks(
     }
     let edits_arc = Arc::new(edit_vec);
 
+    // COVERAGE GATE inputs: the world-XZ AABBs of every `Terrain` edit, and a snapshot of the loaded
+    // height ring. A chunk that samples a `Terrain` primitive must NOT become resident until its full XZ
+    // footprint is backed by LOADED height — otherwise an oversized far-LOD chunk would sample OUTSIDE
+    // the ±radius ring and (now strictly) panic, instead of silently rendering a corrupt flat slab. The
+    // ring is the world-anchored toroidal clipmap the worldgen plugin rolls (`worldgen::upload`).
+    let terrain_xz_aabbs: Vec<(Vec2, Vec2)> = gathered
+        .iter()
+        .filter(|g| matches!(g.edit.prim, edits::SdfPrimitive::Terrain { .. }))
+        .map(|g| {
+            (
+                Vec2::new(g.aabb.min.x, g.aabb.min.z),
+                Vec2::new(g.aabb.max.x, g.aabb.max.z),
+            )
+        })
+        .collect();
+    let height_ring = crate::sdf_render::worldgen::upload::cpu_height_ring();
+
     // The baked mesh is appearance-INDEPENDENT: vertices carry only geometry + top-2 material *ids* + a blend
     // weight, never colours/PBR scalars. A material colour/PBR edit therefore needs no re-bake — the shared
     // `MeshMaterials` table + texture arrays rebuild themselves on `MaterialRegistry` change (see
@@ -830,9 +881,20 @@ fn mesh_resident_chunks(
                 chunks_in_aabb(&clipped, &config, k, lod, &mut cand);
             }
             for &key in &cand {
-                if mesh_chunk_in_shell(key, &config, k, cam, half0) {
-                    resident.insert(key);
+                if !mesh_chunk_in_shell(key, &config, k, cam, half0) {
+                    continue;
                 }
+                // COVERAGE GATE: if this chunk's world-XZ footprint touches any `Terrain` edit, it must
+                // be fully backed by loaded height before it can mesh — never mesh ground the artifact
+                // hasn't loaded (no silent flat-plane fallback). A km-wide far-LOD chunk against the
+                // ±radius ring fails this → it stops at the coverage edge (the corrupt far slab is gone);
+                // as the ring rolls, newly-covered chunks enter resident per-chunk, evicted ones leave.
+                if !terrain_xz_aabbs.is_empty() && !terrain_chunk_covered(
+                    key, &config, k, &terrain_xz_aabbs, height_ring.as_deref(),
+                ) {
+                    continue;
+                }
+                resident.insert(key);
             }
         }
     }
@@ -1206,6 +1268,72 @@ mod tests {
     fn chunk(cfg: &SdfGridConfig, k: u32, lod: u32, j: i32) -> BrickKey {
         let stride = k as i32 * cfg.cell_stride();
         BrickKey::new(lod, IVec3::new(j, 0, 0) * stride)
+    }
+
+    /// The COVERAGE GATE excludes a terrain chunk whose XZ footprint reaches OUTSIDE the loaded height
+    /// ring, and admits one fully inside it. Build a small resident ring (a 4×4 chunk block at the
+    /// origin), then check a fine LOD-0 chunk well inside is covered while a HUGE far chunk (and any
+    /// chunk against a `None` ring) is not — exactly the gate that kills the corrupt oversized far slab.
+    #[test]
+    fn coverage_gate_excludes_uncovered_terrain_chunk() {
+        use crate::sdf_render::worldgen::artifact::ScalarField2D;
+        use crate::sdf_render::worldgen::coord::{ChunkCoord, ChunkSize, LayerId};
+        use crate::sdf_render::worldgen::layers::height::{
+            HEIGHT_CHUNK_CELLS, HEIGHT_FIELD_RES, HeightLayer, HeightParams,
+        };
+        use crate::sdf_render::worldgen::store::ArtifactStore;
+        use crate::sdf_render::worldgen::upload::build_height_ring;
+        use std::sync::Arc;
+
+        // Build a resident ring covering height chunks (-3..5, -3..5) around the origin — a generous
+        // loaded block so a chunk near the origin clears the gate's `2·HEIGHT_CHUNK_CELLS` apron margin.
+        let layer = HeightLayer::new(LayerId(0), HeightParams::default());
+        let size = ChunkSize::new(HEIGHT_CHUNK_CELLS);
+        let mut store = ArtifactStore::new();
+        for cz in -3..5 {
+            for cx in -3..5 {
+                let coord = ChunkCoord::new(LayerId(0), IVec3::new(cx, 0, cz));
+                let mut field = ScalarField2D::zeroed(coord, size, HEIGHT_FIELD_RES);
+                for j in 0..=HEIGHT_FIELD_RES {
+                    for i in 0..=HEIGHT_FIELD_RES {
+                        let wp = field.node_world_xz(i, j);
+                        field.set(i, j, layer.sample_world(wp.x, wp.y, 1));
+                    }
+                }
+                store.insert(coord, Arc::new(field));
+            }
+        }
+        let ring = Arc::new(build_height_ring(&store));
+
+        let (cfg, _mc) = cfgs();
+        let k = 4u32;
+        // One global terrain edit whose XZ footprint spans everything (effectively infinite, as in prod).
+        let big = 131072.0f32;
+        let terrain = vec![(Vec2::splat(-big), Vec2::splat(big))];
+
+        // A fine LOD-0 chunk at the origin → deep inside the loaded block → covered → gate passes.
+        let inside_coord = chunk(&cfg, k, 0, 0);
+        assert!(
+            terrain_chunk_covered(inside_coord, &cfg, k, &terrain, Some(&ring)),
+            "a fine chunk inside the loaded block must pass the coverage gate"
+        );
+
+        // A HUGE far chunk: a coarse LOD that spans kilometres reaches far outside the ±loaded ring.
+        let far = chunk(&cfg, k, 7, 64);
+        assert!(
+            !terrain_chunk_covered(far, &cfg, k, &terrain, Some(&ring)),
+            "an oversized far chunk must be excluded (outside loaded coverage)"
+        );
+
+        // No ring loaded yet ⇒ any terrain-touching chunk is excluded.
+        assert!(
+            !terrain_chunk_covered(inside_coord, &cfg, k, &terrain, None),
+            "with no ring loaded, a terrain chunk must not be resident"
+        );
+
+        // A chunk that touches NO terrain edit is unaffected by the gate (passes regardless of ring).
+        let no_terrain: Vec<(Vec2, Vec2)> = Vec::new();
+        assert!(terrain_chunk_covered(far, &cfg, k, &no_terrain, None));
     }
 
     #[test]

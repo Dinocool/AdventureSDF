@@ -14,7 +14,7 @@ use bevy::math::{DVec2, IVec2, IVec3};
 use bytemuck::{Pod, Zeroable};
 
 use super::artifact::{HeightNode, ScalarField2D};
-use super::coord::{ChunkSize, chunk_gpu_key};
+use super::coord::{ChunkSize, chunk_coord_from_gpu_key, chunk_gpu_key};
 use super::layers::height::{HEIGHT_CHUNK_CELLS, HEIGHT_FIELD_RES};
 use super::store::ArtifactStore;
 
@@ -325,9 +325,80 @@ pub fn sample_ring_mip(ring: &HeightRingCpu, world_xz: DVec2, mip: u32) -> Optio
 /// Rule: the FINEST mip `m` with `node_spacing · 2^m ≥ voxel_size`, clamped to `[0, MAX_HEIGHT_MIP]`.
 /// `voxel_size == 0.0` is the documented sentinel for "finest / no band-limit" ⇒ mip 0 (identical to
 /// [`sample_ring`]) — used by non-LOD callers (picking, classification, tests). `None` on a ring miss.
-pub fn sample_ring_lod(ring: &HeightRingCpu, world_xz: DVec2, voxel_size: f32) -> Option<HeightNode> {
+///
+/// OPTION-RETURNING. This is the NON-STRICT sampler for genuinely-optional NON-RENDERING queries
+/// (picking, classification, tests) where unloaded ground LEGITIMATELY means "no surface here" and the
+/// caller wants to handle the miss itself. The RENDERED bake path must use the strict
+/// [`sample_ring_lod`], which PANICS on a miss (a rendered miss is a coverage bug the residency gate
+/// should have prevented). Don't reach for this one from a rendering bake.
+pub fn try_sample_ring_lod(ring: &HeightRingCpu, world_xz: DVec2, voxel_size: f32) -> Option<HeightNode> {
     let mip = select_height_mip(ring.node_spacing, voxel_size);
     sample_ring_mip(ring, world_xz, mip)
+}
+
+/// STRICT mip-aware ring sampler for the RENDERED bake path. Like [`try_sample_ring_lod`] but PANICS
+/// on a miss instead of returning `None`: a rendered terrain bake samples only chunks the residency
+/// coverage gate (`mesh_bake::mesh_resident_chunks`) already proved are fully backed by loaded height,
+/// so a miss here is a COVERAGE BUG (the gate let an uncovered chunk become resident), not an expected
+/// "no surface" — papering it over with a fallback would re-introduce the corrupt-slab artifact this
+/// gate exists to kill. The panic reports the accessed `world_xz`, the `voxel_size`, the selected mip,
+/// the ring's `chunk_world_size`/`node_spacing`, and the ring's resident bounds so the offending chunk
+/// is identifiable.
+pub fn sample_ring_lod(ring: &HeightRingCpu, world_xz: DVec2, voxel_size: f32) -> HeightNode {
+    if let Some(node) = try_sample_ring_lod(ring, world_xz, voxel_size) {
+        return node;
+    }
+    let mip = select_height_mip(ring.node_spacing, voxel_size);
+    let bounds = ring_resident_bounds(ring);
+    let resident = ring.directory.iter().filter(|c| c.key_hi != HEIGHT_SENTINEL_KEY.0).count();
+    panic!(
+        "terrain sampled outside loaded coverage — the residency coverage gate should have prevented \
+         this. world_xz={world_xz:?}, voxel_size={voxel_size}, selected mip={mip}, \
+         chunk_world_size={}, node_spacing={}, resident_bounds={bounds:?}, resident_slots={resident}",
+        ring.chunk_world_size, ring.node_spacing,
+    );
+}
+
+/// True iff EVERY ring-chunk overlapping the world-XZ rectangle `[min_xz, max_xz]` is resident (its
+/// directory slot's key-tag matches the chunk it should hold). The residency coverage gate uses this
+/// to forbid a terrain chunk from becoming resident until its full XZ footprint is backed by loaded
+/// height — so the strict [`sample_ring_lod`] can never miss inside a rendered bake. A `false` here
+/// means at least one overlapped chunk hasn't streamed in yet (or a different wrapped chunk aliases
+/// its slot). Allocation-free.
+pub fn ring_covers_aabb(ring: &HeightRingCpu, min_xz: bevy::math::Vec2, max_xz: bevy::math::Vec2) -> bool {
+    let s = ring.chunk_world_size as f64;
+    let cx0 = (min_xz.x as f64 / s).floor() as i32;
+    let cx1 = (max_xz.x as f64 / s).floor() as i32;
+    let cz0 = (min_xz.y as f64 / s).floor() as i32;
+    let cz1 = (max_xz.y as f64 / s).floor() as i32;
+    for cz in cz0..=cz1 {
+        for cx in cx0..=cx1 {
+            let rec = ring.directory[ring_slot(IVec2::new(cx, cz))];
+            if (rec.key_hi, rec.key_lo) != chunk_gpu_key(IVec3::new(cx, 0, cz)) {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// The min/max chunk-XZ index over the ring directory's NON-sentinel slots (decoded back from each
+/// resident cell's key-tag via [`chunk_coord_from_gpu_key`]), or `None` if the ring is empty. Cheap,
+/// allocation-free — used only by the strict sampler's panic diagnostics to report the loaded region.
+pub fn ring_resident_bounds(ring: &HeightRingCpu) -> Option<(IVec2, IVec2)> {
+    let mut bounds: Option<(IVec2, IVec2)> = None;
+    for cell in &ring.directory {
+        if cell.key_hi == HEIGHT_SENTINEL_KEY.0 && cell.key_lo == HEIGHT_SENTINEL_KEY.1 {
+            continue;
+        }
+        let c = chunk_coord_from_gpu_key(cell.key_hi, cell.key_lo);
+        let xz = IVec2::new(c.x, c.z);
+        bounds = Some(match bounds {
+            None => (xz, xz),
+            Some((mn, mx)) => (mn.min(xz), mx.max(xz)),
+        });
+    }
+    bounds
 }
 
 /// The finest mip level whose node spacing (`base · 2^m`) is still ≥ `voxel_size` — the "round the mip
@@ -597,9 +668,9 @@ mod tests {
         assert_eq!(select_height_mip(base, base * 100_000.0), MAX_HEIGHT_MIP);
     }
 
-    /// `sample_ring_lod` with `voxel_size == 0.0` is identical to `sample_ring` (mip 0), and a coarse
-    /// voxel routes through the matching coarse mip (`sample_ring_mip`) — the band-limited LOD path the
-    /// Terrain eval uses.
+    /// `try_sample_ring_lod` with `voxel_size == 0.0` is identical to `sample_ring` (mip 0), and a
+    /// coarse voxel routes through the matching coarse mip (`sample_ring_mip`) — the band-limited LOD
+    /// path the Terrain eval uses (the non-strict, NON-RENDERING variant).
     #[test]
     fn sample_ring_lod_selects_mip() {
         let store = store_with(&[(0, 0)], 11);
@@ -608,13 +679,65 @@ mod tests {
         let s = HEIGHT_CHUNK_CELLS as f64;
         let wp = DVec2::new(0.4 * s, 0.6 * s);
         // 0.0 sentinel ⇒ mip 0 ⇒ exactly sample_ring.
-        let lod0 = sample_ring_lod(&ring, wp, 0.0).unwrap();
+        let lod0 = try_sample_ring_lod(&ring, wp, 0.0).unwrap();
         let mip0 = sample_ring(&ring, wp).unwrap();
         assert_eq!(lod0.height.to_bits(), mip0.height.to_bits());
         // A voxel 4× the base spacing selects mip 2 — matches sample_ring_mip(.., 2).
-        let lod = sample_ring_lod(&ring, wp, base * 4.0).unwrap();
+        let lod = try_sample_ring_lod(&ring, wp, base * 4.0).unwrap();
         let mip = sample_ring_mip(&ring, wp, 2).unwrap();
         assert_eq!(lod.height.to_bits(), mip.height.to_bits());
+    }
+
+    /// `ring_covers_aabb` is true for an AABB wholly inside a built ring's resident region and false
+    /// for one straddling into an unloaded chunk — the predicate the residency coverage gate uses to
+    /// forbid meshing ground the artifact hasn't loaded.
+    #[test]
+    fn ring_covers_aabb_inside_and_outside() {
+        // Resident chunks (0,0),(1,0),(0,1),(1,1) — a 2×2 loaded block.
+        let store = store_with(&[(0, 0), (1, 0), (0, 1), (1, 1)], 3);
+        let ring = build_height_ring(&store);
+        let s = HEIGHT_CHUNK_CELLS as f32;
+        // Fully inside the loaded block.
+        assert!(ring_covers_aabb(
+            &ring,
+            bevy::math::Vec2::new(0.25 * s, 0.25 * s),
+            bevy::math::Vec2::new(1.75 * s, 1.75 * s),
+        ));
+        // Straddles into chunk (2,0), which is NOT resident.
+        assert!(!ring_covers_aabb(
+            &ring,
+            bevy::math::Vec2::new(1.5 * s, 0.5 * s),
+            bevy::math::Vec2::new(2.5 * s, 0.5 * s),
+        ));
+        // Wholly outside the loaded region.
+        assert!(!ring_covers_aabb(
+            &ring,
+            bevy::math::Vec2::new(5.0 * s, 5.0 * s),
+            bevy::math::Vec2::new(5.5 * s, 5.5 * s),
+        ));
+    }
+
+    /// `ring_resident_bounds` reports the min/max chunk-XZ over the loaded slots (decoded from the
+    /// directory key-tags), or `None` for an empty ring.
+    #[test]
+    fn ring_resident_bounds_spans_loaded_chunks() {
+        let store = store_with(&[(-2, 1), (3, -4), (0, 0)], 7);
+        let ring = build_height_ring(&store);
+        assert_eq!(ring_resident_bounds(&ring), Some((IVec2::new(-2, -4), IVec2::new(3, 1))));
+        let empty = build_height_ring(&ArtifactStore::new());
+        assert_eq!(ring_resident_bounds(&empty), None);
+    }
+
+    /// The STRICT `sample_ring_lod` PANICS on a miss — a rendered bake sampling outside loaded
+    /// coverage is a coverage-gate bug, never a silent fallback.
+    #[test]
+    #[should_panic(expected = "outside loaded coverage")]
+    fn strict_sample_ring_lod_panics_on_miss() {
+        let store = store_with(&[(0, 0)], 2);
+        let ring = build_height_ring(&store);
+        let s = HEIGHT_CHUNK_CELLS as f64;
+        // Chunk (5,5) is not resident → strict sampler must panic.
+        let _ = sample_ring_lod(&ring, DVec2::new(5.5 * s, 5.5 * s), 0.0);
     }
 
     /// Negative-coord chunks resolve correctly (the rem_euclid slot + key-tag path).
