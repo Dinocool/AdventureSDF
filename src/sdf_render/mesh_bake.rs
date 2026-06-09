@@ -830,24 +830,26 @@ fn chunk_has_surface(
     let min = config.brick_min_world(key.coord, key.lod);
     let center = min + Vec3::splat(0.5 * cw);
     let smooth_sum: f32 = indices.iter().map(|&i| edits[i as usize].op.smoothing.max(0.0)).sum();
-    // Force-keep on a sign change across the chunk corners — covers a smoothed surface the centre test
-    // could miss when smoothing inflates the gradient. The common hard-CSG path (smooth_sum == 0) skips
-    // this and pays a single eval below.
-    if smooth_sum > 0.0 {
-        let mut neg = false;
-        let mut pos = false;
-        for dx in [0.0, cw] {
-            for dy in [0.0, cw] {
-                for dz in [0.0, cw] {
-                    let d = edits::fold_csg_dist_indexed(edits, indices, min + Vec3::new(dx, dy, dz), vs);
-                    if d <= 0.0 {
-                        neg = true;
-                    } else {
-                        pos = true;
-                    }
-                    if neg && pos {
-                        return true;
-                    }
+    // Force-keep on a sign change across the chunk corners — the ROBUST test: if any pair of corners
+    // straddles the surface the chunk certainly crosses it, regardless of how badly the field's distance
+    // is estimated. Covers BOTH a smoothed surface (smoothing inflates the gradient) AND a steep TERRAIN
+    // surface (the eroded `p.y−h` field, even Lipschitz-normalised, can over/under-estimate enough that
+    // the single centre test below would false-drop a steep chunk → holes). 8 cheap evals; can only ever
+    // KEEP, never drop — so it can't punch a hole. The centre test below is the cheap early-out for the
+    // interior of large solids (all corners same sign).
+    let mut neg = false;
+    let mut pos = false;
+    for dx in [0.0, cw] {
+        for dy in [0.0, cw] {
+            for dz in [0.0, cw] {
+                let d = edits::fold_csg_dist_indexed(edits, indices, min + Vec3::new(dx, dy, dz), vs);
+                if d <= 0.0 {
+                    neg = true;
+                } else {
+                    pos = true;
+                }
+                if neg && pos {
+                    return true;
                 }
             }
         }
