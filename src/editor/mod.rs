@@ -36,6 +36,7 @@ pub mod status_bar;
 pub mod transform_editor;
 pub mod uniform_inspector;
 pub mod viewport_toolbar;
+pub mod worldgen_gpu_preview;
 pub mod worldgen_graph;
 
 use panels::DockSide;
@@ -66,6 +67,7 @@ impl Plugin for EditorPlugin {
         ))
         .add_plugins(history::EditHistoryPlugin)
         .add_plugins(worldgen_graph::WorldgenGraphEditorPlugin)
+        .add_plugins(worldgen_gpu_preview::WorldgenGpuPreviewPlugin)
         .init_resource::<menu_bar::EditorRequests>()
         .init_resource::<menu_bar::CurrentScenePath>()
         .init_resource::<scene_browser::OpenSceneDialog>()
