@@ -296,7 +296,11 @@ pub fn smax(a: f32, b: f32, k: f32) -> f32 {
 /// finest mip whose node spacing ≥ `voxel_size`) so a coarse-LOD brick samples a surface it can
 /// actually resolve (no sub-voxel aliasing → no far-extent holes). All other primitives ignore it.
 /// `voxel_size == 0.0` is the documented sentinel for "finest / no band-limit" — pass it from
-/// non-LOD callers (picking, classification, tests).
+/// non-LOD callers (picking, classification, tests). For [`Terrain`](SdfPrimitive::Terrain) the `0.0`
+/// sentinel ALSO selects NON-STRICT sampling: a height-ring miss reads as empty space rather than
+/// panicking (a legitimately-optional query). A `voxel_size > 0.0` (a RENDERING bake) uses the STRICT
+/// sampler, which PANICS on a miss (a rendered miss is a residency-coverage bug, never a silent
+/// fallback).
 pub fn eval_primitive(prim: &SdfPrimitive, p: Vec3, voxel_size: f32) -> f32 {
     match prim {
         SdfPrimitive::Sphere { radius } => p.length() - *radius,
@@ -346,7 +350,6 @@ pub fn eval_primitive(prim: &SdfPrimitive, p: Vec3, voxel_size: f32) -> f32 {
             p.y - h
         }
         SdfPrimitive::Terrain {
-            min_height,
             max_height,
             ..
         } => {
@@ -361,27 +364,52 @@ pub fn eval_primitive(prim: &SdfPrimitive, p: Vec3, voxel_size: f32) -> f32 {
             // at the far extents. `voxel_size == 0.0` (non-LOD callers: picking/classification/tests) ⇒
             // mip 0 (full detail).
             //
-            // The Terrain volume FOLLOWS the camera (its transform translates on chunk crossings — see
-            // `worldgen::roll_worldgen`), so this LOCAL `p` is NOT the world position. The height ring
-            // is world-anchored, so convert local XZ → WORLD XZ by adding the volume's current world-XZ
-            // offset (`cpu_terrain_offset`, kept in sync by the follow system) before sampling.
+            // The Terrain volume is now WORLD-ANCHORED (`Transform::IDENTITY`, a large fixed extent — see
+            // `worldgen::spawn_terrain_volume`), so this LOCAL `p` IS the world position. The CPU terrain
+            // offset is published once as ZERO; we still add it (a no-op) so the world-XZ derivation has a
+            // single SSOT with the (historical) follow seam.
             // ASSUMPTION: the volume is translation-only with `translation.y == 0`, so
-            // `local.xz + offset == world.xz` and `local.y == world.y`. A miss (no ring built yet /
-            // outside the resident clipmap) falls back to the flat mid-band plane so the field stays
-            // finite (valid AABB).
+            // `local.xz + offset == world.xz` and `local.y == world.y`.
+            //
+            // STRICT vs TRY split, gated by `voxel_size`:
+            // - `voxel_size > 0.0` (a RENDERING bake — the mesh-bake always passes the chunk's real
+            //   voxel size): the ring MUST be present AND cover this point. The residency coverage gate
+            //   (`mesh_bake::mesh_resident_chunks`) guarantees a terrain chunk is resident only when its
+            //   full XZ footprint is loaded, so a miss here is a COVERAGE BUG — use the strict
+            //   `sample_ring_lod`, which PANICS (no flat-plane fallback that would re-create the corrupt
+            //   far slab). A `None` ring during a rendering bake is likewise a bug → panic.
+            // - `voxel_size == 0.0` (the documented sentinel for NON-RENDERING queries:
+            //   picking/classification/tests): use the non-strict `try_sample_ring_lod`; a miss reads as
+            //   EMPTY SPACE (a large POSITIVE distance), NOT a mid-band plane. This is NOT a
+            //   corruption-hiding fallback — for a non-rendering query, unloaded ground correctly means
+            //   "no surface here"; only the RENDERED path is strict.
             let offset = crate::sdf_render::worldgen::upload::cpu_terrain_offset();
             let world_xz =
                 bevy::math::DVec2::new((p.x + offset.x) as f64, (p.z + offset.y) as f64);
-            match crate::sdf_render::worldgen::upload::cpu_height_ring() {
-                Some(ring) => {
-                    match crate::sdf_render::worldgen::upload::sample_ring_lod(
+            if voxel_size > 0.0 {
+                // RENDERING bake: strict — the coverage gate guarantees a covered ring here.
+                let ring = crate::sdf_render::worldgen::upload::cpu_height_ring().unwrap_or_else(|| {
+                    panic!(
+                        "terrain sampled outside loaded coverage — a rendering bake (voxel_size={voxel_size}) \
+                         ran before any height ring was built; the residency coverage gate should have \
+                         prevented this. world_xz={world_xz:?}"
+                    )
+                });
+                let node = crate::sdf_render::worldgen::upload::sample_ring_lod(
+                    &ring, world_xz, voxel_size,
+                );
+                p.y - node.height
+            } else {
+                // NON-RENDERING query: a miss is legitimately empty space → large POSITIVE distance.
+                match crate::sdf_render::worldgen::upload::cpu_height_ring() {
+                    Some(ring) => match crate::sdf_render::worldgen::upload::try_sample_ring_lod(
                         &ring, world_xz, voxel_size,
                     ) {
                         Some(node) => p.y - node.height,
-                        None => p.y - (min_height + max_height) * 0.5,
-                    }
+                        None => *max_height - p.y + 1.0e4,
+                    },
+                    None => *max_height - p.y + 1.0e4,
                 }
-                None => p.y - (min_height + max_height) * 0.5,
             }
         }
     }
@@ -1377,15 +1405,27 @@ mod tests {
         assert_eq!(g.material_id, 2);
     }
 
-    /// With no ring published, Terrain falls back to the flat mid-band plane (a finite field, valid
-    /// AABB band) — the worldgen-disabled / not-yet-built path.
+    /// With no ring published, a NON-RENDERING Terrain query (`voxel_size == 0.0`) reads as EMPTY
+    /// SPACE — a large POSITIVE distance (outside), NOT a corruption-hiding mid-band plane. This is the
+    /// worldgen-disabled / not-yet-built / unloaded-ground path for picking/classification/tests.
     #[test]
-    fn terrain_eval_flat_fallback_without_ring() {
+    fn terrain_eval_empty_space_without_ring_nonrendering() {
         crate::sdf_render::worldgen::upload::set_cpu_height_ring(None);
         let prim = SdfPrimitive::Terrain { half_xz: Vec2::splat(100.0), min_height: 0.0, max_height: 40.0 };
-        // Mid-band is y = 20; a point at y = 25 is 5 above the fallback plane.
+        // No ring + non-rendering query ⇒ empty: `max_height - p.y + 1e4` = 40 - 25 + 10000.
         let d = eval_primitive(&prim, Vec3::new(3.0, 25.0, -7.0), 0.0);
-        assert!((d - 5.0).abs() < 1e-4, "flat-fallback vertical gap = {d}");
+        assert!(d > 1.0e3, "unloaded ground reads as empty (large positive), got {d}");
+        assert!((d - (40.0 - 25.0 + 1.0e4)).abs() < 1e-1, "empty-space distance = {d}");
+    }
+
+    /// A RENDERING Terrain bake (`voxel_size > 0.0`) with no ring built PANICS — a rendered miss is a
+    /// coverage-gate bug, never a silent fallback.
+    #[test]
+    #[should_panic(expected = "outside loaded coverage")]
+    fn terrain_eval_rendering_panics_without_ring() {
+        crate::sdf_render::worldgen::upload::set_cpu_height_ring(None);
+        let prim = SdfPrimitive::Terrain { half_xz: Vec2::splat(100.0), min_height: 0.0, max_height: 40.0 };
+        let _ = eval_primitive(&prim, Vec3::new(3.0, 25.0, -7.0), 2.0);
     }
 
     /// The world-anchored CPU Terrain eval samples the ring at WORLD XZ (= local + the volume's

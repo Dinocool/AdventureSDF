@@ -49,42 +49,30 @@ impl Default for WorldGenEnabled {
     }
 }
 
-/// Whether the render VOLUME streams with the camera (its transform follows the camera eye, snapped to
-/// the chunk grid) or stays a FIXED region anchored at the world origin. Default ON: the bounded
-/// terrain volume rides the rolling height ring so the BOUNDED footprint always sits over generated
-/// height as the camera explores (Phase A). The LayerManager's generation focus ALWAYS follows the
-/// camera regardless (see `roll_worldgen`); this toggle only governs the render volume's placement.
-/// Toggle OFF to pin the volume at the origin (a stable, reproducible island for authoring/testing).
-#[derive(Resource, Clone, Copy)]
-pub struct WorldGenFollowCamera(pub bool);
-
-impl Default for WorldGenFollowCamera {
-    fn default() -> Self {
-        Self(true)
-    }
-}
-
 /// World-anchored fixed seed for the slice. A real game would source this from the save/session;
 /// the slice pins it so the streamed terrain is reproducible across runs.
 pub const WORLDGEN_SLICE_SEED: u64 = 0xA15E_C0DE_2026;
 
-/// Generation radius (world metres) the manager keeps resident around the focus. Deliberately LARGER
-/// than the terrain volume's half-extent below (480 vs 384, a 96 m margin), so EVERY brick inside the
-/// volume samples real generated height. A brick straddling the generated/ungenerated boundary would
-/// sample a mix of real height and the miss fallback → a torn/"corrupted" surface at the far extents;
-/// the margin keeps the whole volume clear of that boundary. Invariant: `2·radius = 960 < RING·chunk =
-/// 8·128 = 1024`, so no two resident chunks alias one ring slot (`slice_radius_respects_ring_invariant`).
+/// Generation radius (world metres) the manager keeps resident around the focus — the rolling region
+/// the `LayerManager` keeps generated as the camera explores. The render volume no longer needs to fit
+/// inside this radius: the volume is world-anchored and effectively infinite (`WORLDGEN_TERRAIN_HALF_XZ`
+/// below), and the residency COVERAGE GATE (`mesh_bake::mesh_resident_chunks` + `upload::ring_covers_aabb`)
+/// is what now guarantees no chunk meshes ground the ring hasn't loaded — so the old "radius > volume
+/// half-extent margin" rationale is gone (the gate, not a margin, is the guarantee). Invariant retained:
+/// `2·radius = 960 < RING·chunk = 8·128 = 1024`, so no two resident chunks alias one ring slot
+/// (`slice_radius_respects_ring_invariant`).
 pub const WORLDGEN_SLICE_RADIUS: f64 = HEIGHT_CHUNK_CELLS as f64 * 3.75;
 
-/// World half-extent of the single global `Terrain` volume. BOUNDED to fit WITHIN the rolling height
-/// ring's covered radius (`WORLDGEN_SLICE_RADIUS` = 480): the Terrain CPU eval now samples the resident
-/// ring ARTIFACT (not an infinite analytic fBm), so a footprint reaching past the resident region would
-/// sample the miss fallback (a flat plane) at the far extents. Keeping the half-extent (384) below the
-/// slice radius (480) leaves a margin so the WHOLE volume sits over generated height. The volume FOLLOWS
-/// the camera (`WorldGenFollowCamera` default ON, snapped to the chunk grid), so this bounded footprint
-/// rides the ring everywhere the camera roams. Phase B extends this to the full clipmap (tiered rings +
-/// camera-relative rebasing, WORLD_GEN_PLAN §2.9).
-pub const WORLDGEN_TERRAIN_HALF_XZ: f32 = HEIGHT_CHUNK_CELLS as f32 * 3.0;
+/// World half-extent of the single global `Terrain` volume. Now a LARGE, effectively-infinite extent so
+/// the ONE world-anchored volume spans the whole explorable area. World-anchored ⇒ its `inv_model` never
+/// changes ⇒ its content hash is stable ⇒ terrain stages PER-CHUNK by construction (no whole-band
+/// re-mesh on a camera roll — the old camera-following volume changed `inv_model` every chunk crossing,
+/// re-hashing every chunk). What actually meshes is restricted by two camera-driven mechanisms, not by
+/// this extent: the mesh-bake CLIPMAP (only chunks near the camera) and the residency COVERAGE GATE
+/// (`mesh_bake::mesh_resident_chunks` — a terrain chunk is resident only when its full XZ footprint is
+/// covered by loaded height, so an oversized far-LOD chunk can't sample outside the ±radius ring and
+/// render a corrupt slab). Phase B Step 2 extends loaded coverage outward (tiered rings).
+pub const WORLDGEN_TERRAIN_HALF_XZ: f32 = 131072.0;
 
 /// Vertical AABB band the global terrain volume occupies. Tightened to bound the height layer's full
 /// fBm swing (default ≈ Σ octave amplitudes ≈ 70 m) with margin — NOT the old ±256 m. The bake's
@@ -119,7 +107,6 @@ pub struct WorldGenPlugin;
 impl Plugin for WorldGenPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<WorldGenEnabled>()
-            .init_resource::<WorldGenFollowCamera>()
             .init_resource::<HeightParams>()
             .init_resource::<WorldGenGpuRing>()
             .insert_resource(LayerManager::new_slice(
@@ -151,13 +138,24 @@ impl Plugin for WorldGenPlugin {
 /// Spawn the single world-spanning `Terrain` volume when worldgen is enabled. A low [`SdfOrder`] (0)
 /// so authored edits (higher orders) compose OVER the terrain; a plain Union with a default inline
 /// material. Mirrors the gallery's volume-spawn shape (`SdfPrimitive` + `SdfOp` + `SdfOrder` +
-/// `SdfMaterialSource` + `SdfVolume`). Spawned at IDENTITY; `roll_worldgen` then snaps its translation
-/// to follow the camera each chunk crossing (the Terrain sampler is world-anchored, so the moved
-/// footprint samples the correct world height via the CPU offset / GPU world-XZ — see `roll_worldgen`).
+/// `SdfMaterialSource` + `SdfVolume`).
+///
+/// Spawned at `Transform::IDENTITY` and STATIC/WORLD-ANCHORED — it NEVER moves (the old camera-follow
+/// is gone). World-anchored ⇒ a stable `inv_model` ⇒ a stable content hash ⇒ per-chunk staging by
+/// construction (a camera roll no longer re-hashes the whole terrain band). The `half_xz` is a large,
+/// effectively-infinite extent (`WORLDGEN_TERRAIN_HALF_XZ`) spanning the whole explorable area; the
+/// mesh-bake clipmap (camera-driven) and the residency COVERAGE GATE restrict what actually meshes to
+/// the rolling loaded region. Because the volume sits at the origin, local space IS world space, so the
+/// CPU terrain offset is ZERO (published once below); `local.xz == world.xz` for the ring sampler.
 fn spawn_terrain_volume(mut commands: Commands, existing: Query<(), With<WorldGenTerrainVolume>>) {
     if !existing.is_empty() {
         return; // already spawned (re-entering the editor scene)
     }
+
+    // World-anchored volume ⇒ local space == world space ⇒ the CPU Terrain eval's world-XZ offset is
+    // ZERO. Publish it once (the static defaults to ZERO already; this makes the invariant explicit and
+    // resets it if a prior session left a stale follow offset).
+    set_cpu_terrain_offset(Vec2::ZERO);
 
     // The slice's own sun (tagged `SceneEntity` so the SDF lit pass's sun query picks it up — see
     // `render::prepare_sdf_camera`). Without this the terrain renders BLACK when no scene file
@@ -199,47 +197,30 @@ fn spawn_terrain_volume(mut commands: Commands, existing: Query<(), With<WorldGe
     ));
 }
 
-/// Snap a world-XZ position to the `HEIGHT_CHUNK_CELLS` grid (the streamed-chunk lattice). The
-/// terrain volume's translation only moves on chunk crossings, so it stays put within a chunk (no
-/// per-frame transform jitter → no constant re-bakes), yet always re-centres near the camera.
-fn snap_to_chunk_grid(xz: Vec2) -> Vec2 {
-    let cell = HEIGHT_CHUNK_CELLS as f32;
-    (xz / cell).round() * cell
-}
-
-/// Roll worldgen WITH the camera each frame: stream the rolling window around the camera eye, move
-/// the `Terrain` volume to follow the camera (snapped to the chunk grid), and rebake when either the
-/// terrain streamed/regenerated OR the volume moved.
+/// Roll worldgen each frame: stream the rolling generation window around the camera and rebuild the
+/// GPU + CPU height ring on a store delta. The render `Terrain` volume is now WORLD-ANCHORED and never
+/// moves (the camera-follow machinery is gone), so this system no longer touches the volume transform.
 ///
 /// Streaming: feed the camera XZ to the [`LayerManager`]; when it reports a store delta (chunks
-/// streamed/dropped) OR the [`HeightParams`] changed (editor tweak ⇒ full regen), rebuild + publish
-/// the GPU + CPU height ring and force a rebake (THE mirror of `update_height_field`).
+/// streamed/dropped) OR the [`HeightParams`] changed (editor tweak ⇒ full regen), rebuild + publish the
+/// GPU + CPU height ring (the eval needs the fresh data). THE mirror of `update_height_field`.
 ///
-/// Following: the `Terrain` volume used to sit at IDENTITY (a fixed ±384 m island at the origin),
-/// so its extents never generated as the camera explored past them. Now its `Transform.translation`
-/// is set to the camera XZ snapped to the chunk grid (y = 0); the world-anchored ring/CPU-offset make
-/// the moved footprint sample the correct world height. The generation radius
-/// (`WORLDGEN_SLICE_RADIUS` = 480) stays LARGER than the volume half-extent
-/// (`WORLDGEN_TERRAIN_HALF_XZ` = 384), so the WHOLE footprint is backed by generated height (no torn
-/// boundary bricks). On a move we publish the new CPU offset and force a rebake (the moved bricks must
-/// re-evaluate the ring at their new world XZ).
-#[expect(clippy::too_many_arguments, reason = "Bevy system: one param per resource/query it touches")]
+/// Re-mesh pulse: the mesh-bake re-meshes streaming terrain PER-CHUNK by construction now — the
+/// world-anchored volume keeps a stable content hash, and the residency COVERAGE GATE
+/// (`mesh_bake::mesh_resident_chunks`) enters newly-loaded chunks / reaps evicted ones automatically as
+/// the ring rolls. So a plain streaming `delta` does NOT pulse `MeshBakeRebuild`. ONLY an explicit
+/// editor terrain-PARAM edit (`params_changed`, a full regen — rare) pulses `mesh_rebuild`/`rebake_all`
+/// to re-mesh the whole loaded region against the new params.
 fn roll_worldgen(
     mut manager: ResMut<LayerManager>,
     params: Res<HeightParams>,
     mut gpu_ring: ResMut<WorldGenGpuRing>,
     mut atlas: ResMut<SdfAtlas>,
-    // The MESH renderer's full-rebake nudge. A ring rebuild (param edit / streaming delta) doesn't
-    // change the Terrain volume's content hash (its params are fixed; the ring is a process-global the
-    // hash can't see), so the mesh-bake needs an explicit pulse to re-mesh the new surface. (The GPU
-    // atlas `rebake_all` below is the gated-off cloud foundation — this is the real on-screen path.)
+    // The MESH renderer's full-rebake nudge. Pulsed ONLY on an explicit terrain-param edit (full regen);
+    // streaming deltas re-mesh per-chunk via the residency coverage gate, no global pulse needed.
     mut mesh_rebuild: ResMut<crate::sdf_render::mesh_bake::MeshBakeRebuild>,
-    // Read-only camera transform: the generation focus + volume follow target is the camera EYE.
-    // (`reframe_worldgen_camera` queries `&mut Transform` With<SdfCamera> in a DIFFERENT system; a
-    // second read-only query here is fine — Bevy serializes the conflicting access.)
+    // Read-only camera transform: the generation focus is the camera EYE.
     camera: Query<&Transform, (With<SdfCamera>, Without<SdfVolume>)>,
-    mut volume: Query<&mut Transform, (With<WorldGenTerrainVolume>, Without<SdfCamera>)>,
-    follow: Res<WorldGenFollowCamera>,
     mut last_params: Local<Option<HeightParams>>,
 ) {
     let _span = crate::instrument::span("worldgen roll");
@@ -247,40 +228,14 @@ fn roll_worldgen(
 
     // The LayerManager's generation window ALWAYS follows the camera (the LayerProcGen GenerationSource):
     // each layer maintains its rolling region around the focus, evicting what leaves it and generating
-    // what enters (WORLD_GEN_PLAN §2.7). This is DECOUPLED from `follow` below — the layer must roll with
-    // the viewer regardless of how the render volume is positioned, so contextual layers (erosion/biome,
-    // which read the precomputed artifact + neighbour padding) and the GPU upload get the right region.
+    // what enters (WORLD_GEN_PLAN §2.7). The render VOLUME no longer follows — it's world-anchored — but
+    // the generation focus must still track the viewer so the right region streams in/out.
     let focus = DVec2::new(cam_pos.x as f64, cam_pos.z as f64);
-
-    // `follow` (toggle, default ON) controls ONLY whether the render VOLUME translates with the camera.
-    // ON (default): the BOUNDED volume (`WORLDGEN_TERRAIN_HALF_XZ`) tracks the camera (snapped to the
-    // chunk grid) so its footprint always rides the resident rolling ring — the Terrain CPU eval samples
-    // that ARTIFACT, so the volume must follow to stay over generated height as the camera explores.
-    // OFF: the volume pins at the origin (a stable, reproducible island for authoring/testing).
-    let following = follow.0;
-    let target_xz = if following {
-        // Snap to the chunk grid so the volume only moves on chunk crossings (no per-frame jitter / rebake).
-        snap_to_chunk_grid(Vec2::new(cam_pos.x, cam_pos.z))
-    } else {
-        Vec2::ZERO
-    };
-
-    // Move the Terrain volume to `target_xz`. On a move (incl. toggling follow off → snap back to
-    // origin), publish the CPU world-XZ offset (so the CPU Terrain eval samples the ring at world XZ)
-    // and force a rebake of the moved footprint.
-    let mut volume_moved = false;
-    if let Ok(mut tf) = volume.single_mut() {
-        let want = Vec3::new(target_xz.x, 0.0, target_xz.y);
-        if tf.translation != want {
-            tf.translation = want;
-            set_cpu_terrain_offset(target_xz);
-            volume_moved = true;
-        }
-    }
 
     // Editor param tweak → evict residency so `update` regenerates from the new params. Track the
     // last-applied params so an unchanged frame doesn't needlessly clear (mirrors the fingerprint
-    // gate in `update_height_field`).
+    // gate in `update_height_field`). A param edit is an EXPLICIT full regen — the one case that
+    // pulses the mesh-bake full-rebake below.
     let params_changed = *last_params != Some(*params);
     if params_changed {
         manager.set_height_params(*params);
@@ -291,17 +246,7 @@ fn roll_worldgen(
     // the store has a pending delta (chunks generated or dropped) — exactly when the ring changed.
     let delta = manager.update(focus);
     if !delta {
-        // No terrain change. But if the volume moved this frame (camera crossed a chunk boundary
-        // without streaming new chunks — e.g. inside the resident window), the moved footprint must
-        // STILL rebake to re-sample the ring at its new world XZ.
-        if volume_moved {
-            atlas.rebake_all = true;
-            // The moved volume's content hash changes (translation ⇒ new `inv_model`), so the mesh
-            // bake re-meshes the affected chunks on its own; pulse anyway so the behaviour matches the
-            // ring-rebuild path below regardless of where the surface change came from.
-            mesh_rebuild.0 = true;
-        }
-        return;
+        return; // nothing streamed and no param edit → ring unchanged, nothing to publish.
     }
 
     // Rebuild the ring from the resident store, publish to the GPU + CPU consumers. Build once and
@@ -312,18 +257,20 @@ fn roll_worldgen(
     gpu_ring.generation = gpu_ring.generation.wrapping_add(1);
 
     // The ring now reflects the full resident store, so clear the store delta. Otherwise `has_delta()`
-    // stays true forever and we'd rebuild the ring + force a full rebake EVERY frame (the window never
-    // "settles"). Draining resets the delta so `update` only reports it again when chunks actually
-    // stream in or evict (camera move / param change).
+    // stays true forever and we'd rebuild the ring EVERY frame (the window never "settles"). Draining
+    // resets the delta so `update` only reports it again when chunks actually stream in or evict.
     manager.height_store_mut().drain_dirty();
     manager.height_store_mut().drain_dropped();
 
-    // Force a rebake so the regenerated surface is folded into the field. The GPU atlas lever
-    // (gated-off cloud foundation) AND the MESH renderer's full-rebake pulse: the Terrain content hash
-    // is blind to the ring swap (its params are unchanged), so without this nudge the mesh-bake would
-    // keep the stale surface. This is what actually re-meshes the regenerated terrain on screen.
-    atlas.rebake_all = true;
-    mesh_rebuild.0 = true;
+    // Re-mesh pulse ONLY on an explicit param edit (a full regen). A plain streaming delta needs NO
+    // pulse: the world-anchored volume's content hash is stable, so the residency coverage gate meshes
+    // newly-loaded chunks per-chunk and reaps evicted ones on its own (no whole-band re-mesh). On a
+    // param edit, every loaded chunk's surface changed, so force a full rebake (atlas lever = gated-off
+    // cloud foundation; `mesh_rebuild` = the real on-screen path).
+    if params_changed {
+        atlas.rebake_all = true;
+        mesh_rebuild.0 = true;
+    }
 }
 
 /// Reframe the orbit camera above the terrain, ONCE, after the camera entity exists.
@@ -374,26 +321,11 @@ mod plugin_tests {
         assert!(WORLDGEN_TERRAIN_MAX_Y > amp && WORLDGEN_TERRAIN_MIN_Y < -amp);
     }
 
-    /// The follow-snap quantizes the camera XZ to the `HEIGHT_CHUNK_CELLS` grid: the volume only
-    /// translates on chunk crossings (so it doesn't re-bake every frame), and a camera within a
-    /// chunk maps to the same snapped translation.
+    /// The world-anchored terrain volume's half-extent is large enough to span the whole explorable
+    /// area (effectively infinite vs the ±radius loaded ring): the coverage gate, not this extent,
+    /// bounds what meshes — so the volume can sit static at the origin without re-hashing on a roll.
     #[test]
-    fn follow_snap_quantizes_to_chunk_grid() {
-        let cell = HEIGHT_CHUNK_CELLS as f32;
-        // Near origin → snaps to 0.
-        assert_eq!(snap_to_chunk_grid(Vec2::new(10.0, -20.0)), Vec2::ZERO);
-        // Just past half a chunk → snaps to one chunk.
-        let half = cell * 0.5 + 1.0;
-        assert_eq!(snap_to_chunk_grid(Vec2::new(half, half)), Vec2::splat(cell));
-        // Exactly on a chunk multiple stays put; small wander within the same chunk maps to the
-        // SAME snapped value (no jitter → no per-frame re-bake).
-        let on_grid = Vec2::new(3.0 * cell, -2.0 * cell);
-        assert_eq!(snap_to_chunk_grid(on_grid), on_grid);
-        assert_eq!(
-            snap_to_chunk_grid(on_grid + Vec2::new(cell * 0.2, -cell * 0.3)),
-            on_grid
-        );
-        // Negative coords snap symmetrically (round-half away maps -0.6·cell → -cell).
-        assert_eq!(snap_to_chunk_grid(Vec2::splat(-0.6 * cell)), Vec2::splat(-cell));
+    fn terrain_volume_is_effectively_infinite() {
+        assert!(WORLDGEN_TERRAIN_HALF_XZ > WORLDGEN_SLICE_RADIUS as f32 * 100.0);
     }
 }

@@ -137,6 +137,18 @@ pub fn chunk_gpu_key(xyz: IVec3) -> (u32, u32) {
     (key_hi, key_lo)
 }
 
+/// Inverse of [`chunk_gpu_key`]: decode a packed `(key_hi, key_lo)` back to its chunk XYZ coord. The
+/// 16-bit fields are biased by `WG_KEY_BIAS`; sign-extend by subtracting the bias. Used by the height
+/// ring's residency-bounds report (`upload::ring_resident_bounds`) to turn directory key-tags back
+/// into chunk coords for the fail-loud sampler's diagnostics.
+#[inline]
+pub fn chunk_coord_from_gpu_key(key_hi: u32, key_lo: u32) -> IVec3 {
+    let cx = ((key_hi >> 16) & 0xffff) as i32 - WG_KEY_BIAS;
+    let cy = (key_hi & 0xffff) as i32 - WG_KEY_BIAS;
+    let cz = ((key_lo >> 16) & 0xffff) as i32 - WG_KEY_BIAS;
+    IVec3::new(cx, cy, cz)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
