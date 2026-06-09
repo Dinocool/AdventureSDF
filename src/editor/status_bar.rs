@@ -6,6 +6,7 @@ use bevy_egui::egui;
 use crate::scene_manager::SceneEntity;
 use crate::sdf_render::SdfVolume;
 use crate::sdf_render::atlas::SdfAtlas;
+use crate::sdf_render::mesh_bake::MeshBakeStats;
 
 use super::config::EditorConfig;
 use super::profiling::ShaderProfilingData;
@@ -49,10 +50,11 @@ pub fn status_bar_ui(world: &mut World, ctx: &egui::Context) {
         .get_resource::<EditorSceneStats>()
         .map(|s| (s.scene_entities, s.volumes))
         .unwrap_or((0, 0));
-    let (bricks, dirty) = world
-        .get_resource::<SdfAtlas>()
-        .map(|a| (a.bricks.len(), a.rebake_all || !a.gpu_baked_tiles.is_empty()))
-        .unwrap_or((0, false));
+    let bricks = world.get_resource::<SdfAtlas>().map(|a| a.bricks.len()).unwrap_or(0);
+    // The mesh bake is the renderer; the editor "BAKING" light reflects ITS pending work, not the
+    // gated-off GPU SDF atlas (whose dirty flags stay set when the GPU bake never runs).
+    let pending = world.get_resource::<MeshBakeStats>().map(|s| s.pending).unwrap_or(0);
+    let dirty = pending > 0;
     let perf = world
         .get_resource::<ShaderProfilingData>()
         .map(|p| (p.fps_smoothed, p.frame_time_ms))
@@ -67,9 +69,9 @@ pub fn status_bar_ui(world: &mut World, ctx: &egui::Context) {
             ui.label(format!("Bricks: {bricks}"));
             ui.separator();
             let (color, text) = if dirty {
-                (egui::Color32::YELLOW, "BAKING")
+                (egui::Color32::YELLOW, format!("BAKING ({pending})"))
             } else {
-                (egui::Color32::GREEN, "BAKED")
+                (egui::Color32::GREEN, "BAKED".to_string())
             };
             ui.colored_label(color, text);
 

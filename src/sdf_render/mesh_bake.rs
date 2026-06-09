@@ -192,11 +192,14 @@ pub(crate) struct MeshBakeRebuild(pub bool);
 
 /// Live diagnostics for the editor panel.
 #[derive(Resource, Default)]
-struct MeshBakeStats {
+pub(crate) struct MeshBakeStats {
     /// Number of SDF volumes (edits) gathered this frame.
     edits: usize,
     /// Resident chunks the edits currently occupy.
     resident: usize,
+    /// Resident chunks not yet displaying their current target (in-flight, staged, or not-yet-started) —
+    /// the honest "mesh bake still working" signal for the editor status bar. 0 ⇒ everything is baked.
+    pub(crate) pending: usize,
     /// Chunk-mesh entities despawned by the most recent COMMIT.
     reaped: usize,
     /// Resident chunk count per LOD level (index = lod), for the panel readout.
@@ -1136,6 +1139,16 @@ fn mesh_resident_chunks(
             budget -= 1;
         }
     }
+
+    // "Still baking" signal for the editor status bar: resident chunks not yet showing their target —
+    // in-flight, staged, or not-yet-started (budget-limited / just entered residency). 0 ⇒ all baked.
+    stats.pending = resident
+        .iter()
+        .filter(|k| match states.0.get(k) {
+            Some(st) => st.task.is_some() || st.staged.is_some() || st.displayed_hash != st.target_hash,
+            None => true,
+        })
+        .count();
 }
 
 /// Dedicated "Mesh Bake" bottom dock panel (editor builds): the controls for viewing/inspecting the
