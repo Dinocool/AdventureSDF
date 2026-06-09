@@ -51,20 +51,20 @@
                     base_freq: 0.0006510416666666666,
                     lacunarity: 2.0,
                     gain: 0.5,
-                    amplitude: 280.0,
+                    amplitude: 700.0,
                     seed_salt: 11665411,
                 )),
                 inputs: (0, 0, 0),
             ),
             (
                 kind: Ridge(
-                    ridge: 0.85,
-                    amp_sum: 551.25,
+                    ridge: 0.92,
+                    amp_sum: 1378.125,
                 ),
                 inputs: (5, 0, 0),
             ),
             (
-                kind: Offset(60.0),
+                kind: Offset(120.0),
                 inputs: (6, 0, 0),
             ),
             (

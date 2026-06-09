@@ -102,7 +102,11 @@ mod tests {
 
         let mtn_ron = include_str!("../../../../assets/worldgen/mountains_plains.graph.ron");
         let mtn: GraphAsset = ron::de::from_str(mtn_ron).expect("parse mountains_plains.graph.ron");
-        assert_eq!(mtn.graph, mountains_plains_graph(280.0), "mountains_plains.graph.ron drifted from preset");
+        assert_eq!(
+            mtn.graph,
+            mountains_plains_graph(super::super::preset::MOUNTAINS_PLAINS_AMPLITUDE),
+            "mountains_plains.graph.ron drifted from preset"
+        );
         mtn.graph.validate().expect("shipped graph valid");
     }
 
@@ -124,7 +128,7 @@ mod tests {
         let pretty = ron::ser::PrettyConfig::new();
         let carrier = FbmAxis { octaves: 6, base_freq: 1.0 / 1536.0, lacunarity: 2.0, gain: 0.5, amplitude: 280.0, seed_salt: 0 };
         let default = GraphAsset { graph: default_terrain_graph(carrier, 0.5, 280.0 * 1.96875, 0.0) };
-        let mtn = GraphAsset { graph: mountains_plains_graph(280.0) };
+        let mtn = GraphAsset { graph: mountains_plains_graph(super::super::preset::MOUNTAINS_PLAINS_AMPLITUDE) };
         eprintln!("// === default.graph.ron ===\n{}", ron::ser::to_string_pretty(&default, pretty.clone()).unwrap());
         eprintln!("// === mountains_plains.graph.ron ===\n{}", ron::ser::to_string_pretty(&mtn, pretty).unwrap());
     }
