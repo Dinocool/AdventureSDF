@@ -34,6 +34,7 @@ use crate::sdf_render::edits::{
 };
 use crate::sdf_render::{SdfCamera, SdfOrbitCamera, SdfVolume};
 
+use layers::erosion::ErosionParams;
 use layers::height::{HEIGHT_CHUNK_CELLS, HeightParams};
 use manager::LayerManager;
 use upload::{
@@ -99,12 +100,29 @@ pub fn height_clipmap_tiers(reach: f64) -> u32 {
 /// render a corrupt slab). Phase B Step 2 extends loaded coverage outward (tiered rings).
 pub const WORLDGEN_TERRAIN_HALF_XZ: f32 = 131072.0;
 
-/// Vertical AABB band the global terrain volume occupies. Tightened to bound the height layer's full
-/// fBm swing (default ≈ Σ octave amplitudes ≈ 70 m) with margin — NOT the old ±256 m. The bake's
-/// dist-band cull only bakes the thin surface shell regardless, but a tight AABB keeps the BVH/brick
-/// classification focused on where the surface actually is, cutting wasted far/empty bricks.
-pub const WORLDGEN_TERRAIN_MIN_Y: f32 = -96.0;
-pub const WORLDGEN_TERRAIN_MAX_Y: f32 = 96.0;
+/// Safety margin applied to the derived vertical band (covers the ridge fold + central-difference
+/// gradient slop + a little headroom). The dist-band cull only bakes the thin surface shell regardless,
+/// so a slightly generous AABB costs nothing but keeps the surface comfortably inside the band.
+pub const WORLDGEN_TERRAIN_BAND_MARGIN: f32 = 1.2;
+
+/// DERIVE the vertical AABB half-band the global terrain volume occupies from the LIVE height + erosion
+/// params, so it tracks the editor sliders (taller mountains ⇒ taller band). The carved surface lives in
+/// `sea_level ± swing`, where `swing = amplitude_sum·(1 + ridge) + erosion_strength`, all × the margin.
+/// `(1 + ridge)` covers the ridge fold's extra reach (the fold can push toward `amplitude_sum`); erosion
+/// only carves DOWN but we pad symmetrically for simplicity. Pure function of the two param resources.
+pub fn terrain_band_half(height: &HeightParams, erosion: &ErosionParams) -> f32 {
+    let amp_sum = height.amplitude_sum() as f32;
+    let ridge_factor = 1.0 + height.ridge.max(0.0);
+    let erosion_swing = if erosion.enabled { erosion.strength.max(0.0) } else { 0.0 };
+    (amp_sum * ridge_factor + erosion_swing) * WORLDGEN_TERRAIN_BAND_MARGIN
+}
+
+/// The terrain volume's vertical band `[min_y, max_y]` derived from the live params (see
+/// [`terrain_band_half`]): `sea_level ± terrain_band_half`.
+pub fn terrain_band(height: &HeightParams, erosion: &ErosionParams) -> (f32, f32) {
+    let half = terrain_band_half(height, erosion);
+    (height.sea_level - half, height.sea_level + half)
+}
 
 /// The built GPU height ring, handed from the main world to the render world's bake extract. Bumps
 /// `generation` on every rebuild so the render world re-uploads only on a change (it caches the last
@@ -147,13 +165,16 @@ impl Plugin for WorldGenPlugin {
 
         app.init_resource::<WorldGenEnabled>()
             .init_resource::<HeightParams>()
+            .init_resource::<ErosionParams>()
             .init_resource::<WorldGenGpuRing>()
             .insert_resource(LayerManager::new_clipmap(
                 WORLDGEN_SLICE_SEED,
                 HeightParams::default(),
+                ErosionParams::default(),
                 tiers,
             ))
             .register_type::<HeightParams>()
+            .register_type::<ErosionParams>()
             .add_systems(
                 OnEnter(AppScene::SdfEditor),
                 spawn_terrain_volume.run_if(|e: Res<WorldGenEnabled>| e.0),
@@ -171,6 +192,17 @@ impl Plugin for WorldGenPlugin {
                     .run_if(in_state(AppScene::SdfEditor))
                     .run_if(|e: Res<WorldGenEnabled>| e.0),
             );
+
+        // Editor-only: the "World Gen" dock panel — Height + Erosion sliders, live re-gen.
+        #[cfg(feature = "editor")]
+        crate::editor::panels::register_panel(
+            app,
+            "sdf/worldgen",
+            "World Gen",
+            crate::editor::panels::DockSide::Right,
+            12,
+            worldgen_panel,
+        );
     }
 }
 
@@ -186,10 +218,19 @@ impl Plugin for WorldGenPlugin {
 /// mesh-bake clipmap (camera-driven) and the residency COVERAGE GATE restrict what actually meshes to
 /// the rolling loaded region. Because the volume sits at the origin, local space IS world space, so the
 /// CPU terrain offset is ZERO (published once below); `local.xz == world.xz` for the ring sampler.
-fn spawn_terrain_volume(mut commands: Commands, existing: Query<(), With<WorldGenTerrainVolume>>) {
+fn spawn_terrain_volume(
+    mut commands: Commands,
+    existing: Query<(), With<WorldGenTerrainVolume>>,
+    height: Res<HeightParams>,
+    erosion: Res<ErosionParams>,
+) {
     if !existing.is_empty() {
         return; // already spawned (re-entering the editor scene)
     }
+
+    // DERIVE the vertical band from the live params so the volume's AABB tracks the height/erosion
+    // sliders (tall mountains ⇒ tall band). The narrow-band cull still bakes only the thin shell.
+    let (min_y, max_y) = terrain_band(&height, &erosion);
 
     // World-anchored volume ⇒ local space == world space ⇒ the CPU Terrain eval's world-XZ offset is
     // ZERO. Publish it once (the static defaults to ZERO already; this makes the invariant explicit and
@@ -213,8 +254,8 @@ fn spawn_terrain_volume(mut commands: Commands, existing: Query<(), With<WorldGe
         Transform::IDENTITY,
         SdfPrimitive::Terrain {
             half_xz: Vec2::splat(WORLDGEN_TERRAIN_HALF_XZ),
-            min_height: WORLDGEN_TERRAIN_MIN_Y,
-            max_height: WORLDGEN_TERRAIN_MAX_Y,
+            min_height: min_y,
+            max_height: max_y,
         },
         SdfOp { kind: CsgKind::Union, smoothing: 0.0 },
         SdfOrder(0),
@@ -254,6 +295,7 @@ fn spawn_terrain_volume(mut commands: Commands, existing: Query<(), With<WorldGe
 fn roll_worldgen(
     mut manager: ResMut<LayerManager>,
     params: Res<HeightParams>,
+    erosion: Res<ErosionParams>,
     // The mesh-bake clipmap config (the LOD slider) — the height-clipmap window tracks its `lod_count`.
     grid_cfg: Res<crate::sdf_render::SdfGridConfig>,
     mesh_cfg: Res<crate::sdf_render::mesh_bake::MeshBakeConfig>,
@@ -265,6 +307,7 @@ fn roll_worldgen(
     // Read-only camera transform: the generation focus is the camera EYE.
     camera: Query<&Transform, (With<SdfCamera>, Without<SdfVolume>)>,
     mut last_params: Local<Option<HeightParams>>,
+    mut last_erosion: Local<Option<ErosionParams>>,
 ) {
     let _span = crate::instrument::span("worldgen roll");
     let cam_pos = camera.single().map(|t| t.translation).unwrap_or(Vec3::ZERO);
@@ -280,18 +323,19 @@ fn roll_worldgen(
     // from the mesh-bake clipmap each frame; `set_tier_count` only changes the stack on an actual change —
     // GROW appends coarse tiers (keeps loaded terrain, no flicker), SHRINK drops the coarsest tiers.
     let reach = crate::sdf_render::mesh_bake::coarsest_lod_outer_reach(&grid_cfg, &mesh_cfg) as f64;
-    let tiers_changed = manager.set_tier_count(height_clipmap_tiers(reach), *params);
+    let tiers_changed = manager.set_tier_count(height_clipmap_tiers(reach), *params, *erosion);
 
-    // Editor param tweak → rebuild ALL tiers from the new params + evict residency so `update` regenerates.
-    // Tracked so an unchanged frame doesn't needlessly clear. A param edit is an EXPLICIT full regen — the
-    // one case that pulses the mesh-bake full-rebake. (A pure tier change keeps the existing fBm params, so
-    // it needs no rebuild — `set_height_params` is only for an actual param edit.)
-    let params_changed = *last_params != Some(*params);
+    // Editor param tweak (height OR erosion) → rebuild ALL tiers from the new params + evict residency so
+    // `update` regenerates. Tracked so an unchanged frame doesn't needlessly clear. A param edit is an
+    // EXPLICIT full regen — the one case that pulses the mesh-bake full-rebake. (A pure tier change keeps
+    // the existing params, so it needs no rebuild — `set_params` is only for an actual param edit.)
+    let params_changed = *last_params != Some(*params) || *last_erosion != Some(*erosion);
     if params_changed {
-        manager.set_height_params(*params);
+        manager.set_params(*params, *erosion);
     }
     if params_changed || tiers_changed {
         *last_params = Some(*params);
+        *last_erosion = Some(*erosion);
     }
 
     // Stream the rolling window (and regenerate if params just changed). `update` returns true iff
@@ -360,6 +404,103 @@ fn reframe_worldgen_camera(
     *done = true;
 }
 
+/// The "World Gen" editor dock panel: live sliders for the height + erosion params. An edit mutates the
+/// reflected resource → `roll_worldgen`'s `params_changed` gate rebuilds all tiers + re-meshes the loaded
+/// terrain that frame (see [`roll_worldgen`]). Two groups: Height and Erosion.
+#[cfg(feature = "editor")]
+fn worldgen_panel(world: &mut World, ui: &mut bevy_egui::egui::Ui) {
+    use bevy_egui::egui::{DragValue, Slider};
+
+    ui.label("Procedural terrain — edits re-mesh the loaded region live.");
+    ui.separator();
+
+    // ---- Height group ----
+    ui.collapsing("Height", |ui| {
+        let p = *world.resource::<HeightParams>();
+
+        let mut octaves = p.octaves;
+        if ui.add(Slider::new(&mut octaves, 1..=8).text("Octaves")).changed() {
+            world.resource_mut::<HeightParams>().octaves = octaves;
+        }
+        // base_freq is tiny; expose it as a wavelength (metres) for an intuitive slider.
+        let mut wavelength = if p.base_freq > 0.0 { 1.0 / p.base_freq } else { 1536.0 };
+        if ui
+            .add(Slider::new(&mut wavelength, 256.0..=4096.0).text("Mountain wavelength (m)"))
+            .changed()
+        {
+            world.resource_mut::<HeightParams>().base_freq = 1.0 / wavelength.max(1.0);
+        }
+        let mut lacunarity = p.lacunarity;
+        if ui.add(Slider::new(&mut lacunarity, 1.5..=3.0).text("Lacunarity")).changed() {
+            world.resource_mut::<HeightParams>().lacunarity = lacunarity;
+        }
+        let mut gain = p.gain;
+        if ui.add(Slider::new(&mut gain, 0.2..=0.7).text("Gain")).changed() {
+            world.resource_mut::<HeightParams>().gain = gain;
+        }
+        let mut amplitude = p.amplitude;
+        if ui.add(Slider::new(&mut amplitude, 10.0..=800.0).text("Amplitude (m)")).changed() {
+            world.resource_mut::<HeightParams>().amplitude = amplitude;
+        }
+        let mut ridge = p.ridge;
+        if ui
+            .add(Slider::new(&mut ridge, 0.0..=1.0).text("Ridge (0=fBm, 1=sharp peaks)"))
+            .changed()
+        {
+            world.resource_mut::<HeightParams>().ridge = ridge;
+        }
+        let mut sea_level = p.sea_level;
+        if ui.add(Slider::new(&mut sea_level, -200.0..=200.0).text("Sea level (m)")).changed() {
+            world.resource_mut::<HeightParams>().sea_level = sea_level;
+        }
+    });
+
+    // ---- Erosion group ----
+    ui.collapsing("Erosion", |ui| {
+        let e = *world.resource::<ErosionParams>();
+
+        let mut enabled = e.enabled;
+        if ui.checkbox(&mut enabled, "Enabled").changed() {
+            world.resource_mut::<ErosionParams>().enabled = enabled;
+        }
+        let mut strength = e.strength;
+        if ui.add(Slider::new(&mut strength, 0.0..=200.0).text("Strength / carve depth (m)")).changed() {
+            world.resource_mut::<ErosionParams>().strength = strength;
+        }
+        let mut octaves = e.octaves;
+        if ui.add(Slider::new(&mut octaves, 1..=8).text("Octaves")).changed() {
+            world.resource_mut::<ErosionParams>().octaves = octaves;
+        }
+        let mut base_cell = e.base_cell_size;
+        if ui
+            .add(Slider::new(&mut base_cell, 64.0..=2048.0).text("Base cell size (m)"))
+            .changed()
+        {
+            world.resource_mut::<ErosionParams>().base_cell_size = base_cell;
+        }
+        let mut lacunarity = e.lacunarity;
+        if ui.add(Slider::new(&mut lacunarity, 1.5..=3.0).text("Lacunarity")).changed() {
+            world.resource_mut::<ErosionParams>().lacunarity = lacunarity;
+        }
+        let mut gain = e.gain;
+        if ui.add(Slider::new(&mut gain, 0.2..=0.7).text("Gain")).changed() {
+            world.resource_mut::<ErosionParams>().gain = gain;
+        }
+        let mut gully = e.gully_weight;
+        if ui.add(Slider::new(&mut gully, 0.0..=2.0).text("Gully weight")).changed() {
+            world.resource_mut::<ErosionParams>().gully_weight = gully;
+        }
+        let mut fade = e.peak_valley_fade;
+        if ui.add(Slider::new(&mut fade, 0.0..=1.0).text("Peak/valley fade")).changed() {
+            world.resource_mut::<ErosionParams>().peak_valley_fade = fade;
+        }
+        let mut salt = e.seed_salt;
+        if ui.add(DragValue::new(&mut salt).prefix("Seed salt: ")).changed() {
+            world.resource_mut::<ErosionParams>().seed_salt = salt;
+        }
+    });
+}
+
 #[cfg(test)]
 mod plugin_tests {
     use super::*;
@@ -404,10 +545,19 @@ mod plugin_tests {
         }
     }
 
+    /// The DERIVED terrain band brackets the full default surface swing (fBm amplitude sum × the ridge
+    /// fold + erosion strength, with margin) — so the volume AABB always contains the carved surface.
     #[test]
-    fn terrain_band_brackets_default_amplitude() {
-        let amp = HeightParams::default().amplitude;
-        assert!(WORLDGEN_TERRAIN_MAX_Y > amp && WORLDGEN_TERRAIN_MIN_Y < -amp);
+    fn terrain_band_brackets_default_surface_swing() {
+        let h = HeightParams::default();
+        let e = ErosionParams::default();
+        let (min_y, max_y) = terrain_band(&h, &e);
+        // Bare amplitude-sum swing (no ridge/erosion/margin) must be comfortably inside the band.
+        let amp_sum = h.amplitude_sum() as f32;
+        assert!(max_y > amp_sum && min_y < -amp_sum, "band [{min_y},{max_y}] must bracket ±{amp_sum}");
+        // And the band grows with erosion strength.
+        let stronger = ErosionParams { strength: e.strength + 100.0, ..e };
+        assert!(terrain_band_half(&h, &stronger) > terrain_band_half(&h, &e));
     }
 
     /// The world-anchored terrain volume's half-extent is large enough to span the whole explorable

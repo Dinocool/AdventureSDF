@@ -692,12 +692,13 @@ pub fn cpu_terrain_offset() -> bevy::math::Vec2 {
 #[cfg(test)]
 mod tests {
     use super::super::coord::{ChunkCoord, LayerId};
+    use super::super::layers::erosion::ErosionParams;
     use super::super::layers::height::{HeightLayer, HeightParams};
     use super::*;
     use std::sync::Arc;
 
     fn store_with(coords: &[(i32, i32)], seed: u64) -> ArtifactStore<ScalarField2D> {
-        let layer = HeightLayer::new(LayerId(0), HeightParams::default());
+        let layer = HeightLayer::new(LayerId(0), HeightParams::default(), ErosionParams::default());
         let size = ChunkSize::new(HEIGHT_CHUNK_CELLS);
         let mut store = ArtifactStore::new();
         for &(x, z) in coords {
@@ -717,7 +718,7 @@ mod tests {
     /// Build chunks for a SPECIFIC tier into a store: `LayerId(tier)`, chunk edge `cells`, sampled from
     /// the same world-anchored fBm (so cross-tier values agree). Lets one store hold several tiers.
     fn insert_tier(store: &mut ArtifactStore<ScalarField2D>, tier: u32, cells: u32, coords: &[(i32, i32)], seed: u64) {
-        let layer = HeightLayer::new_tier(LayerId(tier), HeightParams::default(), cells);
+        let layer = HeightLayer::new_tier(LayerId(tier), HeightParams::default(), ErosionParams::default(), cells);
         let size = ChunkSize::new(cells);
         for &(x, z) in coords {
             let coord = ChunkCoord::new(LayerId(tier), IVec3::new(x, 0, z));
