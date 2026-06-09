@@ -51,6 +51,11 @@ use crate::sdf_render::{
 /// burst when a large region enters at once).
 const MAX_NEW_TASKS_PER_FRAME: usize = 256;
 
+/// Hard ceiling on the mesh-bake LOD count (`lod_count` slider max). LODs `0..=MAX_MESH_LODS-1`. The
+/// worldgen height clipmap derives its tier count from the live `lod_count`, so this also bounds the
+/// sample-area window. Stats arrays + the debug tint cover this whole range so nothing clips at runtime.
+pub(crate) const MAX_MESH_LODS: u32 = 17;
+
 /// Hash-mix multiplier for folding the "Rebake all" epoch into a chunk's content hash.
 const EPOCH_MIX: u64 = 0x9E37_79B9_7F4A_7C15;
 
@@ -171,7 +176,9 @@ impl Default for MeshBakeConfig {
     }
 }
 
-/// Distinct unlit debug tint per LOD level for the "Colour by LOD" view (LODs 0..=8).
+/// Hand-picked distinct unlit debug tints for the first LODs of the "Colour by LOD" view; LODs beyond
+/// this are tinted procedurally (golden-ratio hue) by [`lod_debug_tint`], so the view stays distinct for
+/// any `lod_count` up to [`MAX_MESH_LODS`].
 const LOD_DEBUG_PALETTE: [[f32; 3]; 9] = [
     [0.85, 0.20, 0.20], // LOD0 red
     [0.95, 0.55, 0.15], // LOD1 orange
@@ -183,6 +190,29 @@ const LOD_DEBUG_PALETTE: [[f32; 3]; 9] = [
     [0.90, 0.35, 0.85], // LOD7 magenta
     [0.75, 0.75, 0.80], // LOD8 grey
 ];
+
+/// Unlit debug tint for a LOD level ("Colour by LOD"). Uses the hand-picked [`LOD_DEBUG_PALETTE`] for the
+/// first levels, then a golden-ratio hue for any higher LOD (well-separated colours for any count) so the
+/// debug view matches the dynamic `lod_count` instead of clamping every coarse LOD to one colour.
+fn lod_debug_tint(lod: u32) -> [f32; 3] {
+    if (lod as usize) < LOD_DEBUG_PALETTE.len() {
+        return LOD_DEBUG_PALETTE[lod as usize];
+    }
+    // HSV → RGB at a golden-ratio-spaced hue, fixed saturation/value.
+    let h = (lod as f32 * 0.618_034).fract() * 6.0;
+    let c = 0.7_f32;
+    let x = c * (1.0 - (h % 2.0 - 1.0).abs());
+    let (r, g, b) = match h as u32 {
+        0 => (c, x, 0.0),
+        1 => (x, c, 0.0),
+        2 => (0.0, c, x),
+        3 => (0.0, x, c),
+        4 => (x, 0.0, c),
+        _ => (c, 0.0, x),
+    };
+    let m = 0.9 - c;
+    [r + m, g + m, b + m]
+}
 
 /// Set by the editor panel's "Rebake all" button to force a full re-mesh. Also pulsed by
 /// `worldgen::roll_worldgen` when the height ring regenerates without the Terrain volume moving (a
@@ -204,7 +234,7 @@ pub(crate) struct MeshBakeStats {
     /// Chunk-mesh entities despawned by the most recent COMMIT.
     reaped: usize,
     /// Resident chunk count per LOD level (index = lod), for the panel readout.
-    resident_by_lod: [usize; 8],
+    resident_by_lod: [usize; MAX_MESH_LODS as usize],
     /// Set by the panel's "Capture diagnostics" button; consumed by the system, which fills `dump`.
     capture: bool,
     /// Copy-paste-able diagnostic dump — filled when `capture` is requested.
@@ -349,13 +379,15 @@ fn lod0_half_chunks(config: &SdfGridConfig, mesh_cfg: &MeshBakeConfig, k: u32) -
     (h + 1) & !1 // next even, ≥ 2
 }
 
-/// Effective LOD count: `mesh_cfg.lod_count` clamped to the debug palette (the mesh path's LODs are
-/// independent of the GPU atlas `lod_count` — `voxel_size_at(lod)` is just `·2^lod`), or 1 with no camera.
+/// Effective LOD count: the live `mesh_cfg.lod_count` clamped to `[1, MAX_MESH_LODS]` (the mesh path's
+/// LODs are independent of the GPU atlas `lod_count` — `voxel_size_at(lod)` is just `·2^lod`), or 1 with
+/// no camera. This is the SSOT the worldgen height-clipmap tier count tracks, so the loaded sample-area
+/// window always matches the configured LOD reach.
 fn effective_lod_count(_config: &SdfGridConfig, mesh_cfg: &MeshBakeConfig, has_cam: bool) -> u32 {
     if !has_cam {
         1
     } else {
-        mesh_cfg.lod_count.clamp(1, LOD_DEBUG_PALETTE.len() as u32)
+        mesh_cfg.lod_count.clamp(1, MAX_MESH_LODS)
     }
 }
 
@@ -644,7 +676,7 @@ impl<'a> ChunkMeshBuilder<'a> {
         let mut uvs = Vec::with_capacity(cap);
         let mut colors = Vec::with_capacity(cap);
         let mut indices = Vec::with_capacity(cap);
-        let tint = LOD_DEBUG_PALETTE[(self.lod as usize).min(LOD_DEBUG_PALETTE.len() - 1)];
+        let tint = lod_debug_tint(self.lod);
 
         for t in self.tris.chunks_exact(3) {
             let v = [t[0] as usize, t[1] as usize, t[2] as usize];
@@ -1075,11 +1107,11 @@ fn mesh_resident_chunks(
     // Chunks whose candidate edits are ALL the Terrain primitive — they commit per-chunk immediately
     // (no atomic-edit round barrier). Recomputed every frame over the live residency.
     let mut terrain_only: HashSet<BrickKey> = HashSet::new();
-    let mut by_lod = [0usize; 8];
+    let mut by_lod = [0usize; MAX_MESH_LODS as usize];
     {
         let mut idx: Vec<u32> = Vec::new();
         for &key in &resident {
-            by_lod[(key.lod as usize).min(7)] += 1;
+            by_lod[(key.lod as usize).min(MAX_MESH_LODS as usize - 1)] += 1;
             cull_into(&edit_aabbs, &chunk_sampled(key), &mut idx);
             // Drop edits that are sub-voxel at this chunk's LOD so a tiny object can't contaminate a chunk
             // resident for a larger one (the residency cull already keeps lone sub-voxel objects out). Same
@@ -1361,7 +1393,12 @@ fn mesh_bake_panel(world: &mut World, ui: &mut bevy_egui::egui::Ui) {
         world.resource_mut::<MeshBakeConfig>().lod0_radius = radius;
     }
     let mut lods = world.resource::<MeshBakeConfig>().lod_count;
-    if ui.add(bevy_egui::egui::Slider::new(&mut lods, 1..=9).text("LOD levels")).changed() {
+    if ui
+        .add(bevy_egui::egui::Slider::new(&mut lods, 1..=MAX_MESH_LODS).text("LOD levels"))
+        .on_hover_text("Mesh-bake LOD ring count. The worldgen height-clipmap window grows to match, so \
+                        terrain extends to the configured LOD reach (coarser = much farther, much more to bake).")
+        .changed()
+    {
         world.resource_mut::<MeshBakeConfig>().lod_count = lods;
     }
     let mut dbg = world.resource::<MeshBakeConfig>().debug_lod_colour;

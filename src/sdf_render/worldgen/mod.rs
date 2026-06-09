@@ -250,9 +250,13 @@ fn spawn_terrain_volume(mut commands: Commands, existing: Query<(), With<WorldGe
 /// the ring rolls. So a plain streaming `delta` does NOT pulse `MeshBakeRebuild`. ONLY an explicit
 /// editor terrain-PARAM edit (`params_changed`, a full regen — rare) pulses `mesh_rebuild`/`rebake_all`
 /// to re-mesh the whole loaded region against the new params.
+#[expect(clippy::too_many_arguments, reason = "Bevy system: one param per resource/query it touches")]
 fn roll_worldgen(
     mut manager: ResMut<LayerManager>,
     params: Res<HeightParams>,
+    // The mesh-bake clipmap config (the LOD slider) — the height-clipmap window tracks its `lod_count`.
+    grid_cfg: Res<crate::sdf_render::SdfGridConfig>,
+    mesh_cfg: Res<crate::sdf_render::mesh_bake::MeshBakeConfig>,
     mut gpu_ring: ResMut<WorldGenGpuRing>,
     mut atlas: ResMut<SdfAtlas>,
     // The MESH renderer's full-rebake nudge. Pulsed ONLY on an explicit terrain-param edit (full regen);
@@ -271,13 +275,23 @@ fn roll_worldgen(
     // the generation focus must still track the viewer so the right region streams in/out.
     let focus = DVec2::new(cam_pos.x as f64, cam_pos.z as f64);
 
+    // DYNAMIC WINDOW: the height-clipmap tier count tracks the live mesh-bake `lod_count` (the LOD slider),
+    // so the loaded sample-area window always covers the configured LOD reach. Recompute the needed tiers
+    // from the mesh-bake clipmap each frame; `set_tier_count` only rebuilds the stack on an actual change
+    // (rebuilding with the current params + clearing residency, so the new tier set streams in).
+    let reach = crate::sdf_render::mesh_bake::coarsest_lod_outer_reach(&grid_cfg, &mesh_cfg) as f64;
+    let tiers_changed = manager.set_tier_count(height_clipmap_tiers(reach), *params);
+
     // Editor param tweak → evict residency so `update` regenerates from the new params. Track the
-    // last-applied params so an unchanged frame doesn't needlessly clear (mirrors the fingerprint
-    // gate in `update_height_field`). A param edit is an EXPLICIT full regen — the one case that
-    // pulses the mesh-bake full-rebake below.
+    // last-applied params so an unchanged frame doesn't needlessly clear (mirrors the fingerprint gate in
+    // `update_height_field`). A param edit is an EXPLICIT full regen — the one case that pulses the
+    // mesh-bake full-rebake below. Skip the explicit clear when a tier change already rebuilt (which
+    // applied the current params + cleared residency).
     let params_changed = *last_params != Some(*params);
-    if params_changed {
+    if params_changed && !tiers_changed {
         manager.set_height_params(*params);
+    }
+    if params_changed || tiers_changed {
         *last_params = Some(*params);
     }
 

@@ -93,6 +93,21 @@ impl LayerManager {
         self.layers.len() as u32
     }
 
+    /// Reconfigure the clipmap to `tiers` tiers — the dynamic "window matches the LOD slider" hook: when
+    /// the mesh-bake `lod_count` changes, the loaded sample-area window must grow/shrink to cover the new
+    /// reach. No-op (returns `false`) if already `tiers`. Otherwise rebuilds the tier layers/metas for the
+    /// new count with `params` and CLEARS residency, so the new tier set streams in from scratch (a coarse
+    /// tier added → its far coverage fills in via the budget; tiers removed → that residency just drops).
+    /// Preserves the seed (deterministic). Cheap to call every frame; only the actual count change rebuilds.
+    pub fn set_tier_count(&mut self, tiers: u32, params: HeightParams) -> bool {
+        let tiers = tiers.max(1);
+        if tiers == self.tier_count() {
+            return false;
+        }
+        *self = Self::new_clipmap(self.seed, params, tiers);
+        true
+    }
+
     pub fn seed(&self) -> u64 {
         self.seed
     }
@@ -271,6 +286,27 @@ mod tests {
         for (na, nb) in fa.nodes.iter().zip(fb.nodes.iter()) {
             assert_eq!(na.height.to_bits(), nb.height.to_bits());
         }
+    }
+
+    /// `set_tier_count` (the dynamic-window hook) grows/shrinks the tier stack to match the LOD slider,
+    /// rebuilding + clearing residency on an actual change and no-opping when unchanged.
+    #[test]
+    fn set_tier_count_tracks_the_window() {
+        let mut m = LayerManager::new_clipmap(7, HeightParams::default(), 3);
+        m.budget = 1000;
+        m.update(DVec2::ZERO);
+        assert_eq!(m.tier_count(), 3);
+        assert!(!m.height_store().is_empty());
+        // No-op when the count is unchanged (must NOT clear residency).
+        assert!(!m.set_tier_count(3, HeightParams::default()));
+        assert!(!m.height_store().is_empty(), "unchanged tier count keeps residency");
+        // Grow → rebuild + clear; the new tier set streams in on the next update.
+        assert!(m.set_tier_count(5, HeightParams::default()));
+        assert_eq!(m.tier_count(), 5);
+        assert!(m.height_store().is_empty(), "a tier-count change clears residency");
+        // Shrink, and the floor is 1 tier.
+        assert!(m.set_tier_count(0, HeightParams::default()));
+        assert_eq!(m.tier_count(), 1, "clamped to ≥ 1 tier");
     }
 
     /// A clipmap manager builds one layer per tier with chunk size `HEIGHT_CHUNK_CELLS·2^t`.
