@@ -406,6 +406,22 @@ pub fn ring_covers_aabb(ring: &HeightRingCpu, min_xz: bevy::math::Vec2, max_xz: 
     true
 }
 
+/// True iff this ring COVERS the single world point `world_xz` — i.e. the directory slot `world_xz`
+/// resolves to holds the chunk it should (key-tag match). The coverage-ONLY predicate (no node
+/// sample): exactly the gate [`sample_ring`]/[`try_sample_ring_lod`] apply before sampling, factored
+/// out so the clipmap's tier search can probe coverage WITHOUT paying for the bilinear+mip sample on
+/// every tier it rejects. `try_sample_ring_lod(ring, world_xz, vs).is_some() == ring_covers(ring,
+/// world_xz)` for any `vs` (the mip select never changes which chunk/slot a point lands in, only how
+/// it's interpolated). Allocation-free, a single slot read + key compare.
+#[inline]
+pub fn ring_covers(ring: &HeightRingCpu, world_xz: DVec2) -> bool {
+    let s = ring.chunk_world_size as f64;
+    let cx = (world_xz.x / s).floor() as i32;
+    let cz = (world_xz.y / s).floor() as i32;
+    let rec = ring.directory[ring_slot(IVec2::new(cx, cz))];
+    (rec.key_hi, rec.key_lo) == chunk_gpu_key(IVec3::new(cx, 0, cz))
+}
+
 /// The min/max chunk-XZ index over the ring directory's NON-sentinel slots (decoded back from each
 /// resident cell's key-tag via [`chunk_coord_from_gpu_key`]), or `None` if the ring is empty. Cheap,
 /// allocation-free — used only by the strict sampler's panic diagnostics to report the loaded region.
@@ -478,17 +494,83 @@ pub fn sample_clipmap_lod(clipmap: &HeightClipmap, world_xz: DVec2, voxel_size: 
     );
 }
 
-/// OPTION-RETURNING clipmap sampler for NON-RENDERING queries (picking/classification/tests). Walk tiers
-/// FINEST→coarsest; return the first tier that covers `world_xz` (via [`try_sample_ring_lod`], so the
-/// within-tier mip select uses that tier's own `node_spacing`). `None` if NO tier covers (legitimately
-/// "no surface loaded here" for a non-rendering query). The NON-STRICT sibling of [`sample_clipmap_lod`].
-pub fn try_sample_clipmap_lod(clipmap: &HeightClipmap, world_xz: DVec2, voxel_size: f32) -> Option<HeightNode> {
-    for ring in clipmap.iter() {
-        if let Some(node) = try_sample_ring_lod(ring, world_xz, voxel_size) {
-            return Some(node); // finest covering tier wins
-        }
+thread_local! {
+    /// Per-thread HINT for [`finest_covering_tier`]: the tier index the LAST clipmap query landed on.
+    /// The mesh-bake marches the sampler over a chunk in spatial order, so consecutive samples almost
+    /// always resolve to the SAME finest-covering tier (or an immediate neighbour) — seeding the search
+    /// from this hint turns the O(T) finest→coarsest coverage walk into ~1 coverage check amortized,
+    /// WITHOUT changing which tier is returned (the search below always lands on the true finest covering
+    /// tier; the hint only changes where it STARTS looking). Starts at 0 (finest), the plain walk's seed.
+    static COVERING_TIER_HINT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// The index of the FINEST clipmap tier that COVERS `world_xz`, or `None` if no tier covers — returns
+/// the SAME index as the plain `clipmap.iter().position(|r| ring_covers(r, world_xz))` finest→coarsest
+/// walk, but O(1) amortized via the per-thread [`COVERING_TIER_HINT`].
+///
+/// CORRECTNESS RESTS ON ONE PROPERTY: the set of tiers covering a fixed point is a CONTIGUOUS SUFFIX
+/// `[c, T-1]` (`c` = the finest covering tier). It holds because the clipmap's tiers are concentric
+/// residency windows on the SAME rolling focus, tier `t`'s direct_radius = `HEIGHT_CHUNK_CELLS·3.75·2^t`
+/// — strictly increasing in `t` — so a point inside tier `t`'s window is inside every coarser tier's
+/// (larger) window: once a tier covers, all coarser ones cover. Hence "covers" is a monotone step in `t`,
+/// and the finest covering tier is the smallest `t` with `ring_covers`. (The `terrain_optimized_sampler_*`
+/// test asserts bit-identity vs the plain walk over a real multi-tier clipmap incl. boundary points, so if
+/// chunk-rounding/toroidal-wrap ever broke this contiguity the guard would catch it.)
+///
+/// Given the contiguous suffix, seed at the hint and scan contiguously to `c`:
+///   - if the hint COVERS, walk DOWN (finer) while the next-finer tier still covers — stops at `c`;
+///   - if the hint MISSES, it's in the non-covering prefix `[0, c)`, so walk UP (coarser) until covered.
+///
+/// Either way it returns the smallest covering index, then updates the hint to it — ~1 `ring_covers`
+/// check amortized (a few on a tier change) vs up to `T`. `None` ⇒ no tier covers.
+#[inline]
+fn finest_covering_tier(clipmap: &HeightClipmap, world_xz: DVec2) -> Option<usize> {
+    let t = clipmap.len();
+    if t == 0 {
+        return None;
     }
-    None
+    COVERING_TIER_HINT.with(|hint| {
+        let start = hint.get().min(t - 1);
+        let found = if ring_covers(&clipmap[start], world_xz) {
+            // Hint covers — walk DOWN to the finest tier that still covers.
+            let mut i = start;
+            while i > 0 && ring_covers(&clipmap[i - 1], world_xz) {
+                i -= 1;
+            }
+            Some(i)
+        } else {
+            // Hint misses — walk UP (coarser) until one covers; the first hit is the finest covering.
+            let mut i = start + 1;
+            loop {
+                if i >= t {
+                    break None;
+                }
+                if ring_covers(&clipmap[i], world_xz) {
+                    break Some(i);
+                }
+                i += 1;
+            }
+        };
+        if let Some(i) = found {
+            hint.set(i);
+        }
+        found
+    })
+}
+
+/// OPTION-RETURNING clipmap sampler for NON-RENDERING queries (picking/classification/tests) AND the hot
+/// mesh-bake path. Returns the sample from the FINEST tier that covers `world_xz` (its within-tier mip
+/// select uses that tier's own `node_spacing`), or `None` if NO tier covers (legitimately "no surface
+/// loaded here" for a non-rendering query). The NON-STRICT sibling of [`sample_clipmap_lod`].
+///
+/// The finest covering tier is found in O(1) amortized via [`finest_covering_tier`] (a hint-seeded
+/// contiguous coverage scan) instead of the old O(T) finest→coarsest walk — but the RESULT is byte-for-byte
+/// identical to that walk (same tier, same mip, same height+gradient): the cross-LOD seam fix and the
+/// geomorph both depend on finest-covering being selected PER SAMPLE, and it still is.
+pub fn try_sample_clipmap_lod(clipmap: &HeightClipmap, world_xz: DVec2, voxel_size: f32) -> Option<HeightNode> {
+    let t = finest_covering_tier(clipmap, world_xz)?;
+    // The covering check above proves this tier resolves; sample it at the band-limited mip for `voxel_size`.
+    try_sample_ring_lod(&clipmap[t], world_xz, voxel_size)
 }
 
 /// True iff SOME tier fully covers the world-XZ footprint `[min_xz, max_xz]` — `(0..T).any(t ⇒
@@ -1099,6 +1181,116 @@ mod tests {
         let got_far = try_sample_clipmap_lod(&clip, far, 0.0).expect("far covered by coarse tier");
         let tier1 = sample_ring(&clip[1], far).expect("tier1 covers far");
         assert_eq!(got_far.height.to_bits(), tier1.height.to_bits(), "far point served by coarse tier 1");
+    }
+
+    /// Build a 4-tier concentric clipmap mirroring production residency: every tier resident as a
+    /// `radius`-disc of chunks around the origin focus, `radius_t = HEIGHT_CHUNK_CELLS·3.75·2^t` (the
+    /// `new_clipmap` window). So a point's covering set is the contiguous suffix the optimized sampler
+    /// relies on: near = all tiers, far = only the coarse ones.
+    fn concentric_clipmap(tiers: u32, seed: u64) -> HeightClipmap {
+        let mut store = ArtifactStore::new();
+        let mut cells_per_tier = Vec::new();
+        for t in 0..tiers {
+            let cells = HEIGHT_CHUNK_CELLS << t;
+            cells_per_tier.push(cells);
+            // Chunks within this tier's window radius (in this tier's chunk units), centred on origin.
+            let radius_m = HEIGHT_CHUNK_CELLS as f64 * 3.75 * (1u32 << t) as f64;
+            let cw = cells as f64;
+            let r_chunks = (radius_m / cw).ceil() as i32;
+            let mut coords = Vec::new();
+            for cz in -r_chunks..=r_chunks {
+                for cx in -r_chunks..=r_chunks {
+                    coords.push((cx, cz));
+                }
+            }
+            insert_tier(&mut store, t, cells, &coords, seed);
+        }
+        build_height_clipmap(&store, &cells_per_tier)
+    }
+
+    /// Plain finest→coarsest reference walk (the pre-optimization sampler): the first tier that covers
+    /// `world_xz` serves it. The optimized `try_sample_clipmap_lod` MUST match this bit-for-bit.
+    fn ref_sample_clipmap_lod(clipmap: &HeightClipmap, world_xz: DVec2, voxel_size: f32) -> Option<HeightNode> {
+        for ring in clipmap.iter() {
+            if let Some(node) = try_sample_ring_lod(ring, world_xz, voxel_size) {
+                return Some(node);
+            }
+        }
+        None
+    }
+
+    /// THE INVARIANT GUARD: the hint-seeded `try_sample_clipmap_lod` returns BIT-IDENTICAL
+    /// `(height, dh_dx, dh_dz)` to the plain finest-covering walk for every `(world_xz, voxel_size)` across
+    /// a grid spanning multiple tiers — including near (all tiers cover), far (only coarse cover), the exact
+    /// tier-boundary radii, and beyond-coverage misses (both must be `None`). The marching order varies (the
+    /// thread-local hint must not corrupt a later query), so we sweep forward, backward, and a jumpy order.
+    #[test]
+    fn terrain_optimized_sampler_matches_plain_finest_covering_walk() {
+        let clip = concentric_clipmap(4, 4242);
+        let c0 = HEIGHT_CHUNK_CELLS as f64;
+
+        // A grid of probe points from the origin out past the finest tier's reach into coarse-only land,
+        // and a few beyond every tier (misses). Off-node fractions exercise the bilinear+mip blend.
+        let mut probes: Vec<DVec2> = Vec::new();
+        let mut t = -40.0;
+        while t <= 40.0 {
+            for &frac in &[0.0, 0.13, 0.5, 0.87] {
+                probes.push(DVec2::new((t + frac) * c0, (t * 0.5 - frac) * c0));
+            }
+            t += 0.37;
+        }
+        // Voxel sizes spanning several mips (incl. the 0.0 sentinel and coarse voxels).
+        let base = clip[0].node_spacing;
+        let voxels = [0.0, base * 0.5, base, base * 2.0, base * 3.3, base * 8.0, base * 64.0];
+
+        // Sweep forward, backward, and interleaved — the hint persists across calls, so all orders must agree.
+        let mut order: Vec<usize> = (0..probes.len()).collect();
+        let forward = order.clone();
+        let mut backward = order.clone();
+        backward.reverse();
+        // Jumpy: even indices ascending then odd indices descending.
+        order.sort_by_key(|&i| (i % 2, if i % 2 == 0 { i } else { probes.len() - i }));
+        for sweep in [&forward, &backward, &order] {
+            for &pi in sweep.iter() {
+                let wp = probes[pi];
+                for &vs in &voxels {
+                    let got = try_sample_clipmap_lod(&clip, wp, vs);
+                    let want = ref_sample_clipmap_lod(&clip, wp, vs);
+                    match (got, want) {
+                        (Some(g), Some(w)) => {
+                            assert_eq!(g.height.to_bits(), w.height.to_bits(), "height @ {wp:?} vs={vs}");
+                            assert_eq!(g.dh_dx.to_bits(), w.dh_dx.to_bits(), "dh_dx @ {wp:?} vs={vs}");
+                            assert_eq!(g.dh_dz.to_bits(), w.dh_dz.to_bits(), "dh_dz @ {wp:?} vs={vs}");
+                        }
+                        (None, None) => {}
+                        (g, w) => panic!("coverage mismatch @ {wp:?} vs={vs}: optimized={:?} plain={:?}", g.is_some(), w.is_some()),
+                    }
+                }
+            }
+        }
+    }
+
+    /// The covering set of every probe point is a CONTIGUOUS SUFFIX `[c, T-1]` — the monotonicity the
+    /// optimized search depends on. If chunk-rounding or toroidal wrap ever punched a hole (a covered tier
+    /// finer than an uncovered one), this fails and the optimized sampler's contiguous scan would be unsafe.
+    #[test]
+    fn clipmap_coverage_is_a_contiguous_suffix() {
+        let clip = concentric_clipmap(4, 99);
+        let c0 = HEIGHT_CHUNK_CELLS as f64;
+        let mut t = -40.0;
+        while t <= 40.0 {
+            for &frac in &[0.0, 0.5, 0.91] {
+                let wp = DVec2::new((t + frac) * c0, (t * 0.6 - frac) * c0);
+                // Index of the first covering tier (plain walk), then assert ALL coarser tiers also cover.
+                let first = clip.iter().position(|r| ring_covers(r, wp));
+                if let Some(c) = first {
+                    for (ti, r) in clip.iter().enumerate().skip(c) {
+                        assert!(ring_covers(r, wp), "tier {ti} must cover once tier {c} does, @ {wp:?}");
+                    }
+                }
+            }
+            t += 0.41;
+        }
     }
 
     /// `clipmap_covers_aabb` is true for a far footprint once its COARSE tier is resident (even though
