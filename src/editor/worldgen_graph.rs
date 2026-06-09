@@ -677,9 +677,9 @@ impl SnarlViewer<EdNode> for Viewer<'_> {
         PinInfo::circle().with_fill(egui::Color32::from_rgb(120, 160, 220))
     }
 
-    fn show_output(&mut self, _pin: &OutPin, ui: &mut egui::Ui, _snarl: &mut Snarl<EdNode>) -> impl SnarlPin + 'static {
-        // Params now live in the body (stacked vertically) to keep nodes narrow; the pin just gets a label.
-        ui.label("out");
+    fn show_output(&mut self, _pin: &OutPin, _ui: &mut egui::Ui, _snarl: &mut Snarl<EdNode>) -> impl SnarlPin + 'static {
+        // Single output pin — self-evident, and an "out" label here overlaps the pin (bad right margin).
+        // Params live in the body (stacked vertically) to keep nodes narrow.
         PinInfo::circle().with_fill(egui::Color32::from_rgb(160, 210, 140))
     }
 
@@ -823,11 +823,11 @@ use egui_snarl::ui::SnarlPin;
 /// the wiring + measured sizes ⇒ stable + readable.
 fn auto_arrange(snarl: &mut Snarl<EdNode>, body_size: &std::collections::HashMap<NodeId, egui::Vec2>) {
     use std::collections::{HashMap, HashSet};
-    const GAP_X: f32 = 64.0;
-    const GAP_Y: f32 = 34.0;
-    const HEADER: f32 = 30.0; // header bar
-    const PIN_ROW: f32 = 24.0; // per input/output pin row
-    const FRAME: f32 = 22.0; // node frame padding
+    const GAP_X: f32 = 90.0;
+    const GAP_Y: f32 = 56.0;
+    const HEADER: f32 = 40.0; // title bar
+    const PIN_ROW: f32 = 26.0; // per input/output pin row
+    const FRAME: f32 = 34.0; // node frame margins (top+bottom / left+right)
 
     // Upstream nodes feeding each node (over all input slots).
     let mut up: HashMap<NodeId, Vec<NodeId>> = HashMap::new();
@@ -871,8 +871,8 @@ fn auto_arrange(snarl: &mut Snarl<EdNode>, body_size: &std::collections::HashMap
         let d = depth(id, &up, &mut memo, &mut on_stack);
         depth_of.insert(id, d);
         max_depth = max_depth.max(d);
-        let arity = snarl
-            .get_node(id)
+        let node = snarl.get_node(id);
+        let arity = node
             .map(|n| match n {
                 EdNode::Output => 1,
                 EdNode::Op(k) => k.arity().max(1),
@@ -880,8 +880,14 @@ fn auto_arrange(snarl: &mut Snarl<EdNode>, body_size: &std::collections::HashMap
                 EdNode::Input(_) => 1,
             })
             .unwrap_or(1);
-        let body = body_size.get(&id).copied().unwrap_or(egui::vec2(120.0, 56.0));
-        let w = body.x.max(120.0) + FRAME;
+        // Op + Biome nodes carry a (default-on) preview, so they're tall; Input/Output are tiny. Use a
+        // realistic per-kind default for any node not yet measured this session (e.g. off-screen at load),
+        // so a single Auto-arrange already clears them instead of collapsing to a tiny default.
+        let has_preview = matches!(node, Some(EdNode::Op(_)) | Some(EdNode::Biome { .. }));
+        let default_body =
+            if has_preview { egui::vec2(210.0, DEFAULT_PREVIEW_PX + 96.0) } else { egui::vec2(70.0, 6.0) };
+        let body = body_size.get(&id).copied().unwrap_or(default_body);
+        let w = body.x.max(96.0) + FRAME;
         let h = HEADER + arity as f32 * PIN_ROW + body.y + FRAME;
         size_of.insert(id, (w, h));
     }
