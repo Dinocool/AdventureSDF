@@ -106,7 +106,8 @@ impl EditorDockState {
         let [new_center, _right] = surface.split_right(center, 0.78, right_tabs);
         center = new_center;
 
-        // Center-bottom: Assets drawer (+ Bottom-dock panels); viewport keeps the top 72%.
+        // Center-bottom: Assets drawer (+ Bottom-dock panels); viewport keeps the top 72%. `split_below`
+        // turns `center` into a parent split, so the viewport LEAF is the returned `[top, _]`.
         let mut bottom_tabs = vec![EditorTab::AssetsDrawer];
         bottom_tabs.extend(
             registry
@@ -114,11 +115,11 @@ impl EditorDockState {
                 .into_iter()
                 .map(EditorTab::Registered),
         );
-        surface.split_below(center, 0.72, bottom_tabs);
+        let [viewport_leaf, _bottom] = surface.split_below(center, 0.72, bottom_tabs);
 
         // Center-dock panels become tabs in the viewport leaf, next to the Scene view.
         for id in registry.ids_for(DockSide::Center) {
-            surface[center].append_tab(EditorTab::Registered(id));
+            surface[viewport_leaf].append_tab(EditorTab::Registered(id));
         }
 
         Self {
