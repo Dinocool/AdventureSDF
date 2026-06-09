@@ -24,6 +24,15 @@ pub const HEIGHT_CHUNK_CELLS: u32 = 128;
 /// node spacing — the authoritative base resolution; the GPU adds finer cosmetic detail on top.
 pub const HEIGHT_FIELD_RES: u32 = 64;
 
+/// ANTI-ALIAS supersample factor per axis used by [`HeightLayer::generate`] when sharp features are
+/// present (ridge fold / erosion). The ridge fold `1−|fbm|` and erosion creases are INFINITELY sharp
+/// (sub-node), so POINT-sampling them at the node grid ALIASES the crest — captured only where a node
+/// lands on it → the mesh renders degenerate SPIKES. Box-filtering each node over its cell with an
+/// `N×N` grid band-limits those creases to the node Nyquist, so the mesh sees a clean representable
+/// ridge. The `N²` cost is paid ONCE per node into the CACHED artifact (reused by every bake sample —
+/// generation is separate from sampling), so it's fully amortised. Plain fBm (smooth) skips this.
+pub const HEIGHT_GEN_SUPERSAMPLE: u32 = 3;
+
 /// Editor-tweakable height-layer parameters (mirrors the `SdfRaymarchParams` reflected-resource
 /// idiom). A change dirties the layer → regen cascade (handled by the manager).
 #[derive(Resource, Reflect, Clone, Copy, Debug, PartialEq)]
@@ -234,12 +243,40 @@ impl Layer for HeightLayer {
     fn generate(&self, ctx: &GenCtx, out: &mut GenOutput) {
         let res = HEIGHT_FIELD_RES;
         let mut field = ScalarField2D::zeroed(ctx.coord, ctx.size, res);
-        // Sample every node (incl. the high-edge apron) at its exact f64 world coord — no camera
-        // rebase, so two chunks sharing a boundary node compute the identical value (seam-free).
+        // ANTI-ALIAS: with the ridge fold / erosion the surface has infinitely-sharp creases — point
+        // sampling them at the node grid ALIASES the crest into degenerate mesh spikes. Box-filter each
+        // node over its own cell (an `N×N` grid centred on the node, ±½ spacing) to band-limit those
+        // creases to the node Nyquist. The filter is a pure function of (world position, spacing), centred
+        // and symmetric, so a chunk's far-edge APRON node box-filters the SAME world point as the
+        // neighbour's near node ⇒ still seam-free. Plain fBm (smooth, no ridge/erosion) needs no AA → the
+        // single-sample fast path. The `N²` cost is paid ONCE per node into the CACHED artifact (reused by
+        // every bake sample), so it never touches the per-sample hot path.
+        let aa = if self.params.ridge != 0.0 || self.erosion.enabled { HEIGHT_GEN_SUPERSAMPLE.max(1) } else { 1 };
+        let spacing = field.node_spacing;
         for j in 0..=res {
             for i in 0..=res {
                 let wp = field.node_world_xz(i, j); // DVec2(world_x, world_z)
-                field.set(i, j, self.sample_world(wp.x, wp.y, ctx.seed));
+                if aa == 1 {
+                    field.set(i, j, self.sample_world(wp.x, wp.y, ctx.seed));
+                    continue;
+                }
+                let (mut h, mut gx, mut gz) = (0.0f64, 0.0f64, 0.0f64);
+                for sj in 0..aa {
+                    for si in 0..aa {
+                        let ox = ((si as f64 + 0.5) / aa as f64 - 0.5) * spacing;
+                        let oz = ((sj as f64 + 0.5) / aa as f64 - 0.5) * spacing;
+                        let n = self.sample_world(wp.x + ox, wp.y + oz, ctx.seed);
+                        h += n.height as f64;
+                        gx += n.dh_dx as f64;
+                        gz += n.dh_dz as f64;
+                    }
+                }
+                let inv = 1.0 / (aa * aa) as f64;
+                field.set(i, j, HeightNode {
+                    height: (h * inv) as f32,
+                    dh_dx: (gx * inv) as f32,
+                    dh_dz: (gz * inv) as f32,
+                });
             }
         }
         out.produce(Self::OUTPUT, field);
@@ -257,11 +294,21 @@ mod tests {
         HeightLayer::new(LayerId(0), HeightParams::default(), ErosionParams::default())
     }
 
-    /// `generate` produces a height field of the right shape, sampled consistently with the public
-    /// `sample_world` (the single surface-truth function).
+    /// A PLAIN-fBm layer (no ridge, no erosion) — `generate` takes the point-sample fast path
+    /// (`aa == 1`), so its nodes equal `sample_world` exactly.
+    fn plain_layer() -> HeightLayer {
+        HeightLayer::new(
+            LayerId(0),
+            HeightParams { ridge: 0.0, ..Default::default() },
+            ErosionParams { enabled: false, ..Default::default() },
+        )
+    }
+
+    /// For a PLAIN layer (no sharp features ⇒ no AA), `generate` produces a height field of the right
+    /// shape, every node equal to `sample_world` (the single surface-truth function) at its world coord.
     #[test]
     fn generate_fills_field_matching_sample_world() {
-        let l = layer();
+        let l = plain_layer();
         let coord = ChunkCoord::new(l.id(), IVec3::new(1, 0, -2));
         let ctx = GenCtx { coord, seed: 7, size: l.chunk_size() };
         let mut out = GenOutput::default();
@@ -269,12 +316,48 @@ mod tests {
         let field = out.take::<ScalarField2D>(HeightLayer::OUTPUT).unwrap();
         assert_eq!(field.res, HEIGHT_FIELD_RES);
         assert_eq!(field.nodes.len(), ((HEIGHT_FIELD_RES + 1) * (HEIGHT_FIELD_RES + 1)) as usize);
-        // Every node equals sample_world at its world coord (no rebase / per-node drift).
         for &(i, j) in &[(0u32, 0u32), (10, 20), (HEIGHT_FIELD_RES, HEIGHT_FIELD_RES)] {
             let wp = field.node_world_xz(i, j);
             let expect = l.sample_world(wp.x, wp.y, ctx.seed);
             assert_eq!(field.node(i, j), expect);
         }
+    }
+
+    /// With ridge/erosion on, `generate` ANTI-ALIASES: each node is the `N×N` box-filter average over its
+    /// cell (band-limiting the sharp crest), NOT the raw point sample — and it stays a seam-free pure
+    /// function of world position (asserted by `adjacent_chunks_agree_on_shared_boundary` below, which
+    /// uses the AA `layer()`).
+    #[test]
+    fn generate_anti_aliases_sharp_features() {
+        let l = layer(); // default: ridge + erosion ⇒ aa > 1
+        let coord = ChunkCoord::new(l.id(), IVec3::new(1, 0, -2));
+        let ctx = GenCtx { coord, seed: 7, size: l.chunk_size() };
+        let mut out = GenOutput::default();
+        l.generate(&ctx, &mut out);
+        let field = out.take::<ScalarField2D>(HeightLayer::OUTPUT).unwrap();
+        let (i, j) = (10u32, 20u32);
+        let wp = field.node_world_xz(i, j);
+        // Recompute the expected box-filter average independently.
+        let aa = HEIGHT_GEN_SUPERSAMPLE;
+        let spacing = field.node_spacing;
+        let (mut h, mut gx, mut gz) = (0.0f64, 0.0f64, 0.0f64);
+        for sj in 0..aa {
+            for si in 0..aa {
+                let ox = ((si as f64 + 0.5) / aa as f64 - 0.5) * spacing;
+                let oz = ((sj as f64 + 0.5) / aa as f64 - 0.5) * spacing;
+                let n = l.sample_world(wp.x + ox, wp.y + oz, ctx.seed);
+                h += n.height as f64;
+                gx += n.dh_dx as f64;
+                gz += n.dh_dz as f64;
+            }
+        }
+        let inv = 1.0 / (aa * aa) as f64;
+        let node = field.node(i, j);
+        assert!((node.height - (h * inv) as f32).abs() < 1e-3, "node is the box-filter average");
+        assert!((node.dh_dx - (gx * inv) as f32).abs() < 1e-3);
+        // And it actually differs from the raw point sample (AA is doing something).
+        let point = l.sample_world(wp.x, wp.y, ctx.seed);
+        assert_ne!(node.height.to_bits(), point.height.to_bits(), "AA node differs from the point sample");
     }
 
     /// Seam-free across a chunk boundary: the far apron node of chunk C equals the near node of chunk
