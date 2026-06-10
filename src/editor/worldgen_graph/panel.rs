@@ -20,8 +20,7 @@ use super::convert::{
     worldgraph_path,
 };
 use super::preview::{
-    CAM_DEFAULT, DEFAULT_PREVIEW_PX, PREVIEW_HALF_M, PoppedPreview, WorldgenPreviewPanel, apply_scroll_zoom,
-    nav_hash, popped_preview_window,
+    PoppedPreview, WorldgenPreviewPanel, apply_scroll_zoom, nav_hash, popped_preview_window,
 };
 use super::viewer::Viewer;
 use super::{EdNode, ViewerSignals, WorldGraphEditor, auto_arrange, snarl_to_graph};
@@ -161,7 +160,7 @@ pub(super) fn graph_panel(world: &mut World, ui: &mut egui::Ui) {
         if let Some(node) = editor.hovered_preview.take() {
             let scroll = ui.input(|i| i.smooth_scroll_delta.y);
             if scroll != 0.0 {
-                let h = editor.caches.zoom_half_m.entry(node).or_insert(PREVIEW_HALF_M);
+                let h = &mut editor.caches.views.entry(node).or_default().zoom_half_m;
                 apply_scroll_zoom(ui, scroll, h);
             }
         }
@@ -208,16 +207,13 @@ pub(super) fn graph_panel(world: &mut World, ui: &mut egui::Ui) {
         // Retarget the dockable preview panel (snapshotting the node's nav + view state).
         if let Some(node) = editor.signals.to_panel.take() {
             let nav = editor.nav.clone();
-            let half = editor.caches.zoom_half_m.get(&node).copied().unwrap_or(PREVIEW_HALF_M);
-            let cam = editor.caches.cam.get(&node).copied().unwrap_or(CAM_DEFAULT);
-            let pan = editor.caches.pan.get(&node).copied().unwrap_or((0.0, 0.0));
-            let is3d = editor.caches.surface.contains(&node);
+            let v = editor.caches.views.get(&node).copied().unwrap_or_default();
             if let Some(mut panel) = world.get_resource_mut::<WorldgenPreviewPanel>() {
                 panel.target = Some((nav, node));
-                panel.half = half;
-                panel.cam = cam;
-                panel.pan = pan;
-                panel.is3d = is3d;
+                panel.half = v.zoom_half_m;
+                panel.cam = v.cam;
+                panel.pan = v.pan;
+                panel.is3d = v.surface;
                 // Ensure/focus the dock tab — but only OUTSIDE the dock render (the dock state isn't in
                 // the World here). `open_preview_panel` handles it next frame.
                 panel.pending_open = true;
@@ -225,10 +221,7 @@ pub(super) fn graph_panel(world: &mut World, ui: &mut egui::Ui) {
         }
         // Pop a node's preview out into a movable window (snapshotting its current view state + nav path).
         if let Some(node) = editor.signals.pop_request.take() {
-            let half = editor.caches.zoom_half_m.get(&node).copied().unwrap_or(PREVIEW_HALF_M);
-            let is3d = editor.caches.surface.contains(&node);
-            let cam = editor.caches.cam.get(&node).copied().unwrap_or(CAM_DEFAULT);
-            let size = editor.caches.disp_px.get(&node).copied().unwrap_or(DEFAULT_PREVIEW_PX).max(260.0);
+            let v = editor.caches.views.get(&node).copied().unwrap_or_default();
             let nav = editor.nav.clone();
             let id = editor.next_pop_id;
             editor.next_pop_id += 1;
@@ -236,12 +229,12 @@ pub(super) fn graph_panel(world: &mut World, ui: &mut egui::Ui) {
                 id,
                 nav,
                 node,
-                half,
+                half: v.zoom_half_m,
                 cx: 0.0,
                 cz: 0.0,
-                size,
-                is3d,
-                cam,
+                size: v.disp_px.max(260.0),
+                is3d: v.surface,
+                cam: v.cam,
                 open: true,
             });
         }

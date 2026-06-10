@@ -184,6 +184,29 @@ pub(super) fn handle_preview_gestures(resp: &egui::Response, is3d: bool, size: f
     }
 }
 
+/// Paint a small **scale label** — the visible world width (`2 * half_m`) — in the bottom-left corner
+/// of `rect`, with a semi-opaque rounded backing for legibility. A reusable preview OVERLAY: one
+/// helper, called at every preview draw site (inline node body, the dockable panel, pop-out windows),
+/// so a future overlay (grid, compass, crosshair) plugs in the exact same way. Pure painting — no
+/// state, no input.
+pub(super) fn paint_scale_label(ui: &egui::Ui, rect: egui::Rect, half_m: f64) {
+    let width_m = 2.0 * half_m;
+    let text = if width_m >= 1000.0 {
+        format!("{:.1} km", width_m / 1000.0)
+    } else {
+        format!("{width_m:.0} m")
+    };
+    let painter = ui.painter();
+    let font = egui::FontId::proportional(11.0);
+    // Lay the text out so the backing rect hugs it exactly (bottom-left corner, small inset).
+    let galley = painter.layout_no_wrap(text, font, egui::Color32::from_gray(235));
+    let pad = egui::vec2(4.0, 2.0);
+    let pos = egui::pos2(rect.left() + 4.0, rect.bottom() - 4.0 - galley.size().y - pad.y * 2.0);
+    let bg = egui::Rect::from_min_size(pos, galley.size() + pad * 2.0);
+    painter.rect_filled(bg, 3.0, egui::Color32::from_black_alpha(150));
+    painter.galley(pos + pad, galley, egui::Color32::from_gray(235));
+}
+
 /// Draw a preview image at `size`, or a flat "baking…" placeholder for the ~1 frame before the GPU pool
 /// texture is ready. Returns the (click-and-drag-sensing) response so on-image gestures work either way.
 pub(super) fn preview_image(ui: &mut egui::Ui, tex: Option<egui::TextureId>, size: egui::Vec2) -> egui::Response {
@@ -245,6 +268,7 @@ pub(super) fn preview_panel(world: &mut World, ui: &mut egui::Ui) {
         let tex = world.resource::<GpuPreviewTextures>().0.get(&PANEL_GPU_KEY).copied();
         ui.vertical_centered(|ui| {
             let resp = preview_image(ui, tex, egui::vec2(side, side));
+            paint_scale_label(ui, resp.rect, panel.half);
             scroll_zoom_consume(ui, &resp, &mut panel.half);
             let mut view = panel.view();
             handle_preview_gestures(&resp, panel.is3d, side, &mut view);
@@ -326,6 +350,7 @@ pub(super) fn popped_preview_window(
             let tex = gpu_tex.get(&p.id).copied();
             ui.vertical_centered(|ui| {
                 let resp = preview_image(ui, tex, egui::vec2(side, side));
+                paint_scale_label(ui, resp.rect, p.half);
                 scroll_zoom_consume(ui, &resp, &mut p.half);
                 let mut view = p.view();
                 handle_preview_gestures(&resp, p.is3d, side, &mut view);

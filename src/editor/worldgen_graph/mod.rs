@@ -28,7 +28,10 @@ pub use convert::graph_to_snarl;
 // Re-exported so child modules can reach them as `super::…` (viewer/preview/tests).
 use convert::{climate_name, resolve_snarl};
 use panel::graph_panel;
-use preview::{PoppedPreview, WorldgenPreviewPanel, open_preview_panel, preview_panel};
+use preview::{
+    CAM_DEFAULT, DEFAULT_PREVIEW_PX, PREVIEW_HALF_M, PoppedPreview, WorldgenPreviewPanel, open_preview_panel,
+    preview_panel,
+};
 
 /// Default on-disk path the editor saves/loads the active biome graph to (the production graph the
 /// worldgen loads — see `WorldGenPlugin`'s asset hot-reload). Relative to the app's `assets/` root.
@@ -54,28 +57,56 @@ pub enum EdNode {
     Output,
 }
 
+/// A node's persisted preview view-state — ONE struct per node (the single source of truth for every
+/// per-node preview setting). This consolidation is the extensibility win: a new per-node preview
+/// setting is one new field here (give it a `Default`), and it persists + resumes for free.
+///
+/// `#[serde(default)]` so an older `.worldgraph.ron` missing a field still loads (the field defaults).
+/// All fields default to the "fresh node" semantics: preview OPEN (`collapsed = false`), 2D
+/// (`surface = false`), default zoom/camera/pan/size.
+#[derive(Clone, Copy, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub(super) struct NodeView {
+    /// Preview COLLAPSED (default `false` = open). Previews are on by default.
+    pub collapsed: bool,
+    /// Show the 3D SDF-raymarched surface (`true`) instead of the 2D heatmap (`false`, the default).
+    pub surface: bool,
+    /// Preview zoom: half-extent (metres) of the sampled world window. Shared by the 2D heatmap (grid
+    /// extent) and the 3D surface (camera framing).
+    pub zoom_half_m: f64,
+    /// 3D-preview orbit camera (yaw, pitch) in radians.
+    pub cam: (f32, f32),
+    /// Pan: world-XZ centre offset of the sampled window (drag-pan / scroll over the preview).
+    pub pan: (f64, f64),
+    /// On-screen preview square side (points), used to pick the render resolution so previews stay
+    /// crisp as the node is resized.
+    pub disp_px: f32,
+}
+
+impl Default for NodeView {
+    fn default() -> Self {
+        Self {
+            collapsed: false,
+            surface: false,
+            zoom_half_m: PREVIEW_HALF_M,
+            cam: CAM_DEFAULT,
+            pan: (0.0, 0.0),
+            disp_px: DEFAULT_PREVIEW_PX,
+        }
+    }
+}
+
 /// Per-node UI caches the Viewer drives, keyed by `NodeId`. `NodeId`s are per-snarl-level (a fresh id
 /// namespace each level), so the whole set is cleared on navigation — see [`WorldGraphEditor::
 /// clear_node_caches`] (one assignment, can't miss a map).
 #[derive(Default)]
 struct NodeCaches {
-    /// Which nodes have their preview COLLAPSED. Previews are on by default, so absence ⇒ open.
-    collapsed: std::collections::HashSet<NodeId>,
-    /// Per-node preview zoom: half-extent (metres) of the sampled world window. Absence ⇒ default. Shared
-    /// by the 2D heatmap (grid extent) and the 3D surface (camera framing).
-    zoom_half_m: std::collections::HashMap<NodeId, f64>,
-    /// Which nodes show the 3D SDF-raymarched surface instead of the 2D heatmap. Absence ⇒ 2D.
-    surface: std::collections::HashSet<NodeId>,
-    /// Per-node 3D-preview orbit camera (yaw, pitch) in radians. Absence ⇒ default angle.
-    cam: std::collections::HashMap<NodeId, (f32, f32)>,
+    /// Persisted per-node preview settings (collapsed/surface/zoom/cam/pan/size). Absence ⇒ defaults
+    /// (see [`NodeView::default`]). This is what `gather_view`/`apply_view` snapshot + restore.
+    views: std::collections::HashMap<NodeId, NodeView>,
     /// Last-frame body content size per node (egui can't expose the node rect), used by `auto_arrange`
-    /// to pack columns/rows by real size instead of a fixed grid.
+    /// to pack columns/rows by real size instead of a fixed grid. TRANSIENT — never persisted.
     body_size: std::collections::HashMap<NodeId, egui::Vec2>,
-    /// Last-frame on-screen preview square side (points) per node, used to pick the render resolution so
-    /// previews stay crisp as the node is resized.
-    disp_px: std::collections::HashMap<NodeId, f32>,
-    /// Per-node pan: world-XZ centre offset of the sampled window (drag-pan / scroll over the preview).
-    pan: std::collections::HashMap<NodeId, (f64, f64)>,
 }
 
 /// One-shot signals the Viewer raises during a graph show, drained by `graph_panel` right after (each is
@@ -99,7 +130,8 @@ pub struct WorldGraphEditor {
     path: String,
     /// Last save/load status message (shown in the toolbar).
     status: String,
-    /// Per-node UI caches (collapsed/zoom/surface/cam/body_size/disp_px/pan), all cleared on navigation.
+    /// Per-node UI caches (the persisted [`NodeView`] settings + the transient body_size), all cleared
+    /// on navigation.
     caches: NodeCaches,
     /// Which inline preview image the pointer was over last frame — so `graph_panel` can intercept the
     /// scroll-zoom for it BEFORE egui-snarl applies its own (graph) zoom.

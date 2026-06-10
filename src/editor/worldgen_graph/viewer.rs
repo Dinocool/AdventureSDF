@@ -11,8 +11,7 @@ use crate::editor::worldgen_gpu_preview::GpuPreviewRequest;
 use super::convert::new_biome_subgraph;
 use super::node::{input_label, node_catalog, node_kind_name, node_params_ui};
 use super::preview::{
-    CAM_DEFAULT, DEFAULT_PREVIEW_PX, PREVIEW_HALF_M, PreviewView, gpu_inline_key, handle_preview_gestures,
-    preview_image,
+    PreviewView, gpu_inline_key, handle_preview_gestures, paint_scale_label, preview_image,
 };
 use super::{CLIMATE_INPUTS, EdNode, NodeCaches, ViewerSignals, climate_name, graph_rooted_at};
 
@@ -20,7 +19,7 @@ use super::{CLIMATE_INPUTS, EdNode, NodeCaches, ViewerSignals, climate_name, gra
 /// draw a (default-on, collapsible, resizable, zoomable) 2D heatmap of its sub-graph (see
 /// [`Viewer::show_body`]).
 pub(super) struct Viewer<'a> {
-    /// The per-node UI caches (collapsed/zoom/surface/cam/body_size/disp_px/pan).
+    /// The per-node UI caches (the persisted [`NodeView`] settings + the transient body_size).
     pub(super) caches: &'a mut NodeCaches,
     /// One-shot Viewer→panel signals (Open / pop-out / → panel), raised here, drained by the panel.
     pub(super) signals: &'a mut ViewerSignals,
@@ -90,27 +89,28 @@ impl SnarlViewer<EdNode> for Viewer<'_> {
         ui.separator();
 
         // Collapsed: just an expand toggle.
-        if self.caches.collapsed.contains(&node) {
+        if self.caches.views.entry(node).or_default().collapsed {
             if ui
                 .small_button(format!("{} Preview", icon::CARET_RIGHT))
                 .on_hover_text("Show this node's 2D/3D preview")
                 .clicked()
             {
-                self.caches.collapsed.remove(&node);
+                self.caches.views.entry(node).or_default().collapsed = false;
             }
             self.caches.body_size.insert(node, ui.min_rect().size());
             return;
         }
 
         // Open: the preview IMAGE on the LEFT, its controls in a column on the RIGHT (no overlap).
-        let is3d = self.caches.surface.contains(&node);
-        let size = self.caches.disp_px.get(&node).copied().unwrap_or(DEFAULT_PREVIEW_PX);
+        let view = *self.caches.views.entry(node).or_default();
+        let is3d = view.surface;
+        let size = view.disp_px;
         // Render at the displayed size in physical pixels (no cap) so the preview is always crisp.
         let ppp = ui.ctx().pixels_per_point();
         let res = ((size * ppp).round() as usize).max(32);
-        let half = *self.caches.zoom_half_m.get(&node).unwrap_or(&PREVIEW_HALF_M);
-        let (yaw, pitch) = *self.caches.cam.get(&node).unwrap_or(&CAM_DEFAULT);
-        let (cx, cz) = *self.caches.pan.get(&node).unwrap_or(&(0.0, 0.0));
+        let half = view.zoom_half_m;
+        let (yaw, pitch) = view.cam;
+        let (cx, cz) = view.pan;
 
         match graph_rooted_at(snarl, node) {
             Ok(g) => {
@@ -125,13 +125,16 @@ impl SnarlViewer<EdNode> for Viewer<'_> {
                     // warms up) with on-image gestures: scroll = zoom, drag = orbit (3D) / pan (2D),
                     // right-drag = pan (3D). The scroll is consumed so the graph doesn't also zoom.
                     let img_resp = preview_image(ui, tex, egui::vec2(size, size));
+                    // Scale-label overlay: the visible world width, in a corner of the preview.
+                    paint_scale_label(ui, img_resp.rect, half);
                     {
-                        // Read the per-node entries into one PreviewView, apply gestures, write back.
+                        // Read the node's view into one PreviewView, apply gestures, write back.
                         let mut v = PreviewView { half, cx, cz, yaw, pitch };
                         handle_preview_gestures(&img_resp, is3d, size, &mut v);
-                        *self.caches.zoom_half_m.entry(node).or_insert(PREVIEW_HALF_M) = v.half;
-                        *self.caches.cam.entry(node).or_insert(CAM_DEFAULT) = (v.yaw, v.pitch);
-                        *self.caches.pan.entry(node).or_insert((0.0, 0.0)) = (v.cx, v.cz);
+                        let nv = self.caches.views.entry(node).or_default();
+                        nv.zoom_half_m = v.half;
+                        nv.cam = (v.yaw, v.pitch);
+                        nv.pan = (v.cx, v.cz);
                     }
                     // Record hover so the panel can intercept this preview's scroll-zoom next frame
                     // (before egui-snarl applies its own graph zoom).
@@ -142,7 +145,7 @@ impl SnarlViewer<EdNode> for Viewer<'_> {
                     ui.vertical(|ui| {
                         ui.horizontal(|ui| {
                             if ui.small_button(icon::CARET_DOWN).on_hover_text("Collapse preview").clicked() {
-                                self.caches.collapsed.insert(node);
+                                self.caches.views.entry(node).or_default().collapsed = true;
                             }
                             if ui.small_button(icon::ARROWS_OUT).on_hover_text("Pop out into a movable window").clicked() {
                                 self.signals.pop_request = Some(node);
@@ -151,7 +154,7 @@ impl SnarlViewer<EdNode> for Viewer<'_> {
                                 self.signals.to_panel = Some(node);
                             }
                         });
-                        let h = self.caches.zoom_half_m.entry(node).or_insert(PREVIEW_HALF_M);
+                        let h = &mut self.caches.views.entry(node).or_default().zoom_half_m;
                         let mut km = *h * 2.0 / 1000.0;
                         if ui
                             .add(egui::DragValue::new(&mut km).speed(0.25).range(0.05..=512.0).suffix(" km"))
@@ -165,13 +168,9 @@ impl SnarlViewer<EdNode> for Viewer<'_> {
                             .on_hover_text("3D SDF-raymarched surface (drag the image to orbit)")
                             .clicked()
                         {
-                            if is3d {
-                                self.caches.surface.remove(&node);
-                            } else {
-                                self.caches.surface.insert(node);
-                            }
+                            self.caches.views.entry(node).or_default().surface = !is3d;
                         }
-                        let sz = self.caches.disp_px.entry(node).or_insert(DEFAULT_PREVIEW_PX);
+                        let sz = &mut self.caches.views.entry(node).or_default().disp_px;
                         ui.add(egui::DragValue::new(sz).speed(2.0).range(64.0..=1024.0).suffix(" px"))
                             .on_hover_text("Preview size");
                     });
