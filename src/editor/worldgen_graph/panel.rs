@@ -15,7 +15,7 @@ use crate::sdf_render::worldgen::WorldGraph;
 use crate::sdf_render::worldgen::graph::GraphAsset;
 
 use super::convert::{breadcrumb_names, current_snarl_mut, valid_depth, world_biome_snarl};
-use super::persist::{apply_view, load_editor_doc, save_editor_doc};
+use super::persist::{apply_view, load_editor_doc, load_session, save_editor_doc};
 use super::preview::{
     PoppedPreview, WorldgenPreviewPanel, apply_scroll_zoom, nav_hash, popped_preview_window,
 };
@@ -27,9 +27,10 @@ pub(super) fn graph_panel(world: &mut World, ui: &mut egui::Ui) {
     // back to the built-in default), and drive the live terrain from it.
     world.resource_scope::<WorldGraphEditor, ()>(|world, mut editor| {
         if !editor.seeded {
-            // Seed by LOADING the persisted document (snarl + resumable view-state) from disk, then
-            // restore the view (per-node settings, nav, panel target, pop-outs) and drive the world.
-            let (snarl, view) = load_editor_doc(&editor.path);
+            // Seed by LOADING state, then restore the view (per-node settings, nav, panel target, pop-outs)
+            // and drive the world. PREFER the auto-persisted session (resumes the last session exactly,
+            // even without an explicit Save) and fall back to the on-disk asset document.
+            let (snarl, view) = load_session().unwrap_or_else(|| load_editor_doc(&editor.path));
             editor.snarl = snarl;
             editor.seeded = true;
             editor.needs_arrange = true;

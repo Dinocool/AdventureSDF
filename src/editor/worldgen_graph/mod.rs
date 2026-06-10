@@ -192,6 +192,9 @@ impl Plugin for WorldgenGraphEditorPlugin {
         app.init_resource::<WorldgenPreviewPanel>();
         // Deferred dock manipulation (the dock state is removed from the World during its own render).
         app.add_systems(Update, open_preview_panel);
+        // Auto-persist the editor session on exit so reopening resumes it WITHOUT an explicit Save — same
+        // `Last`-schedule pattern as the dock layout's auto-persist.
+        app.add_systems(Last, save_worldgen_session_on_exit);
         super::panels::register_panel(
             app,
             "worldgen/graph",
@@ -209,5 +212,21 @@ impl Plugin for WorldgenGraphEditorPlugin {
             10,
             preview_panel,
         );
+    }
+}
+
+/// On app exit, snapshot the live editor session (graph + preview view-state) to the auto-persist file so
+/// the next launch resumes it — see [`persist::save_session`]. Resources are `Option` so a headless run
+/// without the editor resources is a no-op.
+fn save_worldgen_session_on_exit(
+    mut exit: MessageReader<AppExit>,
+    editor: Option<Res<WorldGraphEditor>>,
+    panel: Option<Res<WorldgenPreviewPanel>>,
+) {
+    if exit.read().next().is_none() {
+        return;
+    }
+    if let (Some(editor), Some(panel)) = (editor, panel) {
+        persist::save_session(&editor, &panel);
     }
 }

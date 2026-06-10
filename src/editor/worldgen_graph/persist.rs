@@ -168,3 +168,37 @@ pub(super) fn save_editor_doc(editor: &WorldGraphEditor, panel: &WorldgenPreview
     let s = ron::ser::to_string_pretty(&doc, ron::ser::PrettyConfig::default()).map_err(|e| e.to_string())?;
     std::fs::write(worldgraph_path(&editor.path), s).map_err(|e| e.to_string())
 }
+
+// --- Auto-persisted session (resume on reopen, no explicit Save) --------------------------------------
+
+/// Auto-persisted session file, under the editor's gitignored `.soul` dir beside the dock `layout.ron`.
+/// It holds the LIVE editor doc (snarl + view), written on app exit and PREFERRED by the startup seed —
+/// so closing and reopening the editor resumes exactly where you left off WITHOUT an explicit Save (Save
+/// stays reserved for committing to the asset `.worldgraph.ron` / `.graph.ron`). Mirrors how the dock
+/// layout auto-persists, the same robust pattern for "editor session UI state".
+fn session_path() -> std::path::PathBuf {
+    std::path::Path::new(".soul").join("worldgraph_session.ron")
+}
+
+/// Write the live editor doc to the session file (called on app exit). Best-effort: a write failure just
+/// means the next launch falls back to the on-disk asset.
+pub(super) fn save_session(editor: &WorldGraphEditor, panel: &WorldgenPreviewPanel) {
+    let doc = WorldGraphDoc { version: doc_version(), snarl: editor.snarl.clone(), view: gather_view(editor, panel) };
+    if let Ok(s) = ron::ser::to_string_pretty(&doc, ron::ser::PrettyConfig::default()) {
+        let _ = std::fs::create_dir_all(std::path::Path::new(".soul"));
+        let _ = std::fs::write(session_path(), s);
+    }
+}
+
+/// Load the auto-persisted session doc (snarl + view), if present and valid — preferred over the on-disk
+/// asset by the startup seed. A corrupt session is `warn!`ed and ignored (falls back to the asset).
+pub(super) fn load_session() -> Option<(Snarl<EdNode>, EditorView)> {
+    let s = std::fs::read_to_string(session_path()).ok()?;
+    match ron::de::from_str::<WorldGraphDoc>(&s) {
+        Ok(doc) => Some((doc.snarl, doc.view)),
+        Err(e) => {
+            warn!("worldgen: session '{}' is corrupt ({e}); ignoring", session_path().display());
+            None
+        }
+    }
+}
