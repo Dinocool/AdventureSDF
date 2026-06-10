@@ -65,6 +65,23 @@ impl SnarlViewer<EdNode> for Viewer<'_> {
         matches!(node, EdNode::Op(_) | EdNode::Biome { .. })
     }
 
+    /// Header: the node title + (for nodes that own a preview — Op/Biome) an **eye checkbox** that
+    /// shows/hides the inline preview. Keeping the toggle here means a preview-OFF node collapses to JUST
+    /// its params — no body divider, no empty space (unlike an in-body collapse button).
+    fn show_header(&mut self, node: NodeId, _inputs: &[InPin], _outputs: &[OutPin], ui: &mut egui::Ui, snarl: &mut Snarl<EdNode>) {
+        ui.horizontal(|ui| {
+            ui.label(self.title(&snarl[node]));
+            if matches!(snarl.get_node(node), Some(EdNode::Op(_) | EdNode::Biome { .. })) {
+                let nv = self.caches.views.entry(node).or_default();
+                let mut shown = !nv.collapsed;
+                if ui.checkbox(&mut shown, icon::EYE).on_hover_text("Show this node's 2D/3D preview").changed() {
+                    nv.collapsed = !shown;
+                    self.signals.needs_arrange = true;
+                }
+            }
+        });
+    }
+
     fn show_body(
         &mut self,
         node: NodeId,
@@ -86,22 +103,15 @@ impl SnarlViewer<EdNode> for Viewer<'_> {
         {
             self.signals.enter = Some(node);
         }
-        // Divider between the node params (above) and the preview section (below).
-        ui.separator();
 
-        // Collapsed: just an expand toggle.
+        // Preview hidden (the header eye is unchecked) ⇒ the body is just the params above — no divider,
+        // no preview, no wasted space. The node stays compact.
         if self.caches.views.entry(node).or_default().collapsed {
-            if ui
-                .small_button(format!("{} Preview", icon::CARET_RIGHT))
-                .on_hover_text("Show this node's 2D/3D preview")
-                .clicked()
-            {
-                self.caches.views.entry(node).or_default().collapsed = false;
-                self.signals.needs_arrange = true;
-            }
             self.caches.body_size.insert(node, ui.min_rect().size());
             return;
         }
+        // Divider between the node params (above) and the preview section (below).
+        ui.separator();
 
         // Open: the preview IMAGE on the LEFT, its controls in a column on the RIGHT (no overlap).
         let view = *self.caches.views.entry(node).or_default();
@@ -150,13 +160,9 @@ impl SnarlViewer<EdNode> for Viewer<'_> {
                         let sz = &mut self.caches.views.entry(node).or_default().disp_px;
                         *sz = (*sz + delta).clamp(64.0, 1024.0);
                     }
-                    // RIGHT — controls column (collapse, pop-out, zoom, 2D/3D).
+                    // RIGHT — controls column (pop-out, → panel, zoom, 2D/3D). Show/hide is the header eye.
                     ui.vertical(|ui| {
                         ui.horizontal(|ui| {
-                            if ui.small_button(icon::CARET_DOWN).on_hover_text("Collapse preview").clicked() {
-                                self.caches.views.entry(node).or_default().collapsed = true;
-                                self.signals.needs_arrange = true;
-                            }
                             if ui.small_button(icon::ARROWS_OUT).on_hover_text("Pop out into a movable window").clicked() {
                                 self.signals.pop_request = Some(node);
                             }

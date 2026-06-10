@@ -179,7 +179,11 @@ pub(super) fn graph_panel(world: &mut World, ui: &mut egui::Ui) {
             // Keep nodes readable on load: egui-snarl's initial view auto-fits the graph clamped to
             // [min_scale, max_scale], so the floor doubles as the default zoom — 0.75 keeps a freshly-loaded
             // graph legible (the compact auto-arrange usually fits above this). Allow zooming in to 3×.
-            let style = SnarlStyle { min_scale: Some(0.75), max_scale: Some(3.0), ..SnarlStyle::new() };
+            // `collapsible: false` — disable egui-snarl's OWN header-triangle node collapse: the preview is
+            // shown/hidden by our header eye toggle (one collapse mechanism, not two), and egui-snarl's
+            // openness animation on its built-in collapse was stretching a re-expanded node's height.
+            let style =
+                SnarlStyle { min_scale: Some(0.75), max_scale: Some(3.0), collapsible: Some(false), ..SnarlStyle::new() };
             SnarlWidget::new()
                 .id(egui::Id::new(("worldgen-biome-graph", level_salt)))
                 .style(style)
