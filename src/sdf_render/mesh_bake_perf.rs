@@ -143,7 +143,7 @@ fn build_and_publish_clipmap(
     mesh_cfg: &MeshBakeConfig,
     focus: DVec2,
     graph: Option<&Arc<Graph>>,
-    mut gen_stats: Option<&mut GenStats>,
+    gen_stats: Option<&mut GenStats>,
 ) -> Arc<HeightClipmap> {
     let reach = coarsest_lod_outer_reach(cfg, mesh_cfg) as f64;
     let tiers = height_clipmap_tiers(reach);
@@ -167,7 +167,7 @@ fn build_and_publish_clipmap(
         guard += 1;
         assert!(guard < 1000, "clipmap did not settle around focus {focus:?}");
     }
-    if let Some(stats) = gen_stats.as_deref_mut() {
+    if let Some(stats) = gen_stats {
         stats.settle_ms = t_gen.elapsed().as_secs_f64() * 1000.0;
         stats.updates = guard;
         let store = manager.height_store();
