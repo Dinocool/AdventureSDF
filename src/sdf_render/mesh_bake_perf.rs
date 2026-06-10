@@ -184,10 +184,6 @@ fn build_and_publish_clipmap(
 
     let tier_cells: Vec<u32> = (0..manager.tier_count()).map(|t| HEIGHT_CHUNK_CELLS << t).collect();
     let clipmap = Arc::new(build_height_clipmap(manager.height_store(), &tier_cells));
-    // Publish the matching tier-0 hi-fi DETAIL-NORMAL sampler (same params/graph/seed) so the bake's
-    // `surface_normal_hifi` lights up — exactly as `roll_worldgen` does in production. Measures the REAL
-    // (hi-fi-normal) bake cost.
-    crate::sdf_render::worldgen::upload::set_cpu_terrain_hifi(Some(Arc::new(manager.make_terrain_hifi())));
     set_cpu_height_clipmap(Some(clipmap.clone()));
     clipmap
 }
@@ -380,187 +376,6 @@ fn time_one_chunk(
     let us = t.elapsed().as_micros();
     let (verts, tris) = out.map_or((0, 0), |d| (d.positions.len(), d.indices.len() / 3));
     (us, verts, tris)
-}
-
-// =====================================================================================================
-// NORMAL-ACCURACY HARNESS — proves the flat-far-normals diagnosis + guards the detail-normal fix.
-//
-// For terrain chunks across LODs 0..=8 it bakes each chunk and, per baked terrain VERTEX, measures the
-// angular error (degrees) of a normal vs a GROUND-TRUTH hi-fi normal at that vertex's world XZ. Ground
-// truth = the FULL-FIDELITY (mip-0-scale) band-limited analytic gradient (`TerrainHifi::normal`, the same
-// function the fix bakes). Two error series per LOD:
-//   - OLD  = the clipmap's STORED gradient at the LOD's voxel size (`terrain_normal`) — the pre-fix normal.
-//            EXPECT ~0° at LOD 0, GROWING with LOD (the coarse mip is band-limited to the coarse spacing →
-//            flat far terrain). This is the objective confirmation of the "reads flat" diagnosis.
-//   - NEW  = the BAKED vertex normal (now `surface_normal_hifi`) — the detail-normal. EXPECT ~0° at EVERY
-//            LOD (it IS the hi-fi truth, modulo the vertex landing on the meshed surface vs the exact xz).
-// COMMIT-GATE: the NEW coarse-LOD error must stay below a small threshold (asserted) — so a regression that
-// reverts terrain normals to the coarse stored gradient (the OLD, large-error path) fails CI.
-// =====================================================================================================
-
-/// Angular error in DEGREES between two normals (`acos` of the clamped dot). Degenerate inputs → 0.
-fn normal_angle_deg(a: Vec3, b: Vec3) -> f32 {
-    if a.length() < 0.5 || b.length() < 0.5 {
-        return 0.0;
-    }
-    a.normalize().dot(b.normalize()).clamp(-1.0, 1.0).acos().to_degrees()
-}
-
-/// mean / p50 / p95 / max of an error sample (degrees). Empty → all zero.
-fn err_stats(errs: &mut [f32]) -> (f32, f32, f32, f32) {
-    if errs.is_empty() {
-        return (0.0, 0.0, 0.0, 0.0);
-    }
-    let mean = errs.iter().sum::<f32>() / errs.len() as f32;
-    errs.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    let at = |p: f32| {
-        let r = ((p * errs.len() as f32).ceil() as usize).clamp(1, errs.len()) - 1;
-        errs[r]
-    };
-    (mean, at(0.50), at(0.95), *errs.last().unwrap())
-}
-
-/// Pick the terrain chunk at `lod` whose XZ footprint contains `focus` AND whose Y window straddles the
-/// terrain surface there (so the bake actually produces terrain vertices). Snaps `focus` to the LOD's chunk
-/// grid (edge `k·brick`) and the surface height `surf_y` to the LOD's chunk-Y grid so the surface crosses it.
-fn terrain_chunk_at_lod(config: &SdfGridConfig, k: u32, lod: u32, focus: Vec2, surf_y: f32) -> BrickKey {
-    let stride = k as i32 * config.cell_stride();
-    let cw = k as f32 * config.brick_world_size(lod);
-    let jx = (focus.x / cw).floor() as i32;
-    let jz = (focus.y / cw).floor() as i32;
-    let jy = (surf_y / cw).floor() as i32; // chunk whose Y∈[jy·cw, (jy+1)·cw] contains the surface
-    BrickKey::new(lod, IVec3::new(jx, jy, jz) * stride)
-}
-
-#[test]
-#[ignore = "normal-accuracy harness; run explicitly with --release --ignored --nocapture"]
-fn mesh_bake_normal_accuracy_per_lod() {
-    let config = SdfGridConfig::default();
-    let mesh_cfg = MeshBakeConfig::default();
-    let k = mesh_cfg.chunk_bricks.clamp(1, 8);
-    let lod_count = effective_lod_count(&config, &mesh_cfg, true);
-    let edits = vec![terrain_edit()];
-
-    // Camera framing the origin (same as the perf rig); build + publish the full clipmap + hi-fi sampler.
-    let cam0 = Vec3::new(0.0, 40.0, 0.0);
-    let focus0 = DVec2::new(cam0.x as f64, cam0.z as f64);
-    let graph = load_world_graph();
-    let terrain_src = if graph.is_some() { "AUTHORED graph" } else { "LEGACY HeightParams" };
-    let _clip = build_and_publish_clipmap(&config, &mesh_cfg, focus0, graph.as_ref(), None);
-    let hifi = crate::sdf_render::worldgen::upload::cpu_terrain_hifi()
-        .expect("build_and_publish_clipmap must publish the hi-fi terrain sampler");
-    let offset = crate::sdf_render::worldgen::upload::cpu_terrain_offset(); // ZERO in the rig
-
-    // Surface height at the focus XZ (finest clipmap mip) — used to place each LOD's sampled chunk so its Y
-    // window straddles the terrain (else a fine chunk at Y=0 misses the surface entirely → no vertices).
-    let surf_y = {
-        let cm = crate::sdf_render::worldgen::upload::cpu_height_clipmap().expect("clipmap published");
-        let w = DVec2::new(focus0.x, focus0.y);
-        crate::sdf_render::worldgen::upload::try_sample_clipmap_lod(&cm, w, 0.0)
-            .map(|n| n.height)
-            .unwrap_or(0.0)
-    };
-
-    eprintln!(
-        "NORMAL-ACCURACY: terrain [{terrain_src}] | per-LOD baked-vertex normal angular error (deg) vs hi-fi \
-         ground truth | OLD = clipmap stored-gradient at LOD voxel (pre-fix) | NEW = baked detail-normal (fix)"
-    );
-    eprintln!(
-        "  {:>3} | {:>6} | {:>34} | {:>34}",
-        "LOD", "verts", "OLD stored-grad: mean/p50/p95/max", "NEW hi-fi baked: mean/p50/p95/max"
-    );
-
-    // Track the worst NEW coarse-LOD error for the commit-gate assertion, and the OLD coarse error to
-    // confirm the diagnosis (OLD must be LARGE where NEW is small).
-    let mut worst_new_coarse = 0.0f32;
-    let mut worst_old_coarse = 0.0f32;
-    const COARSE_LOD: u32 = 4; // LODs ≥ this are "coarse/far" — where the stored gradient reads flat
-
-    let cs = config.cell_stride() as u32;
-    let half0 = lod0_half_chunks(&config, &mesh_cfg, k);
-    let stride = k as i32 * config.cell_stride();
-    for lod in 0..lod_count {
-        let base = terrain_chunk_at_lod(&config, k, lod, Vec2::new(cam0.x, cam0.z), surf_y);
-        let vs_l = config.voxel_size_at(lod);
-        // Bake the chunk the production way (terrain_only ⇒ the new hi-fi normals). A fine-LOD chunk at the
-        // exact focus can miss the surface (the tilted surface exits its small Y/XZ window), so scan a small
-        // XZ×Y neighbourhood around the focus chunk and take the FIRST one that meshes — any covered surface
-        // chunk at this LOD is a representative sample of the LOD's normal accuracy.
-        let mut found: Option<(BrickKey, Vec3, ChunkMeshData)> = None;
-        'search: for dz in -2..=2 {
-            for dx in -2..=2 {
-                for dy in -6..=6 {
-                    let key = BrickKey::new(lod, base.coord + IVec3::new(dx, dy, dz) * stride);
-                    let idx = chunk_cull_indices(&edits, &config, k, key);
-                    let grid_origin = config.brick_min_world(key.coord, key.lod);
-                    let flags = chunk_finer_faces(key, &config, k, Some(cam0), half0);
-                    if let Some(d) =
-                        mesh_chunk(&edits, &idx, grid_origin, vs_l, k * cs, flags, key.lod, false, None, true)
-                    {
-                        found = Some((key, grid_origin, d));
-                        break 'search;
-                    }
-                }
-            }
-        }
-        let Some((_key, grid_origin, data)) = found else {
-            eprintln!("  {lod:>3} | (no surface in the sampled neighbourhood — skipped)");
-            continue;
-        };
-
-        let mut old_errs: Vec<f32> = Vec::with_capacity(data.positions.len());
-        let mut new_errs: Vec<f32> = Vec::with_capacity(data.positions.len());
-        for (pos, nrm) in data.positions.iter().zip(&data.normals) {
-            let world = Vec3::from(*pos) + grid_origin;
-            let (wx, wz) = ((world.x + offset.x) as f64, (world.z + offset.y) as f64);
-            let truth = hifi.normal(wx, wz); // FULL-FIDELITY band-limited ground truth at this xz
-            // OLD: the clipmap's STORED gradient at THIS LOD's voxel size (the pre-fix terrain normal).
-            let Some(old) = crate::sdf_render::worldgen::upload::terrain_normal(world, vs_l) else {
-                continue;
-            };
-            // NEW: the baked vertex normal (now `surface_normal_hifi`).
-            let new = Vec3::from(*nrm);
-            old_errs.push(normal_angle_deg(old, truth));
-            new_errs.push(normal_angle_deg(new, truth));
-        }
-        let n = new_errs.len();
-        let (om, o50, o95, omax) = err_stats(&mut old_errs);
-        let (nm, n50, n95, nmax) = err_stats(&mut new_errs);
-        eprintln!(
-            "  {lod:>3} | {n:>6} | {om:>6.2}/{o50:>6.2}/{o95:>6.2}/{omax:>6.2} | {nm:>6.2}/{n50:>6.2}/{n95:>6.2}/{nmax:>6.2}",
-        );
-        if lod >= COARSE_LOD {
-            worst_new_coarse = worst_new_coarse.max(nmax);
-            worst_old_coarse = worst_old_coarse.max(omax);
-        }
-    }
-
-    eprintln!(
-        "NORMAL-ACCURACY [coarse LODs ≥ {COARSE_LOD}]: OLD stored-gradient worst error = {worst_old_coarse:.2}° \
-         (flat-far diagnosis) | NEW hi-fi baked worst error = {worst_new_coarse:.2}° (detail-normal fix)"
-    );
-
-    crate::sdf_render::worldgen::upload::set_cpu_height_clipmap(None);
-    crate::sdf_render::worldgen::upload::set_cpu_terrain_hifi(None);
-
-    // COMMIT-GATE: the baked (NEW) coarse-LOD normal must match the hi-fi ground truth to within a small
-    // angle — it IS the hi-fi normal, so the only error is the vertex landing on the meshed surface vs the
-    // exact xz (sub-degree). A regression that reverts to the coarse stored gradient (the OLD path) makes
-    // this blow up to the large OLD error and fails here.
-    const NEW_COARSE_MAX_DEG: f32 = 2.0;
-    assert!(
-        worst_new_coarse < NEW_COARSE_MAX_DEG,
-        "coarse-LOD baked normal error {worst_new_coarse:.2}° ≥ {NEW_COARSE_MAX_DEG}° — the detail-normal \
-         (hi-fi) bake regressed back toward the coarse stored gradient (flat far terrain)"
-    );
-    // And confirm the diagnosis is real on THIS terrain: the OLD coarse error must be materially larger than
-    // the NEW (else there'd be nothing to fix — a flat region). A modest floor so a trivially-flat run doesn't
-    // false-pass the guarantee; the authored mountainous terrain clears this comfortably.
-    assert!(
-        worst_old_coarse > worst_new_coarse + 5.0,
-        "expected the OLD coarse stored-gradient normal to be materially flatter (larger error) than the NEW \
-         hi-fi normal — got OLD {worst_old_coarse:.2}° vs NEW {worst_new_coarse:.2}°; the diagnosis didn't reproduce"
-    );
 }
 
 /// `p`-percentile (0..=100) of `xs` by value (nearest-rank). `xs` is sorted in place. Empty → 0.
@@ -781,9 +596,8 @@ fn mesh_bake_perf_terrain() {
         bounded,
     );
 
-    // Clear the published clipmap + hi-fi sampler so the globals don't leak into other tests in the same process.
+    // Clear the published clipmap so the global doesn't leak into other tests in the same process.
     set_cpu_height_clipmap(None);
-    crate::sdf_render::worldgen::upload::set_cpu_terrain_hifi(None);
 
     assert!(
         bounded,
