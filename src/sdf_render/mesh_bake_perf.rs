@@ -32,8 +32,11 @@
 
 use super::*;
 use crate::sdf_render::edits::{CsgKind, ResolvedEdit, SdfOp, SdfPrimitive};
+use crate::sdf_render::worldgen::graph::{Graph, GraphAsset};
 use crate::sdf_render::worldgen::layers::erosion::ErosionParams;
-use crate::sdf_render::worldgen::layers::height::{HEIGHT_CHUNK_CELLS, HeightParams};
+use crate::sdf_render::worldgen::layers::height::{
+    HEIGHT_CHUNK_CELLS, HEIGHT_FIELD_RES, HeightParams,
+};
 use crate::sdf_render::worldgen::manager::LayerManager;
 use crate::sdf_render::worldgen::upload::{
     HeightClipmap, build_height_clipmap, set_cpu_height_clipmap,
@@ -67,24 +70,116 @@ fn terrain_edit() -> ResolvedEdit {
     )
 }
 
+/// Load the REAL authored terrain graph from `assets/worldgen/world.graph.ron` so the rig measures the
+/// production terrain (the one the editor authors + ships), NOT the legacy `HeightParams` fBm path. The
+/// graph drives EVERY clipmap tier (the cross-tier-agreement invariant) via `LayerManager::set_graph`.
+///
+/// `None` (file missing / unparseable) ⇒ the caller falls back to the legacy default path with a noted
+/// `eprintln!`, so the rig still runs (e.g. on a checkout without the authored asset). Mirrors
+/// `roll_worldgen`'s `set_graph(world_graph.0.clone())` drive.
+fn load_world_graph() -> Option<Arc<Graph>> {
+    const PATH: &str = "assets/worldgen/world.graph.ron";
+    match std::fs::read_to_string(PATH) {
+        Ok(src) => match ron::de::from_str::<GraphAsset>(&src) {
+            Ok(asset) => Some(Arc::new(asset.graph)),
+            Err(e) => {
+                eprintln!(
+                    "MESH-BAKE-PERF: could not parse {PATH} ({e}); falling back to the LEGACY HeightParams terrain"
+                );
+                None
+            }
+        },
+        Err(e) => {
+            eprintln!(
+                "MESH-BAKE-PERF: could not read {PATH} ({e}); falling back to the LEGACY HeightParams terrain"
+            );
+            None
+        }
+    }
+}
+
+/// Cold-generation timing of the settled window (Task 2 baseline / optimization target). Captured by
+/// `build_and_publish_clipmap` when a `&mut GenStats` is passed (the cold focus-0 build only — the
+/// streaming steps don't time gen). All fields are the cold fill of the WHOLE settled clipmap window.
+#[derive(Default, Clone)]
+struct GenStats {
+    /// Wall-clock ms of the whole `update(focus)` settle loop (cold generation of every required chunk).
+    settle_ms: f64,
+    /// Total height chunks generated to settle the window (= final resident count, cold from empty).
+    chunks: usize,
+    /// Per-tier generated chunk counts (index = tier / `LayerId`).
+    chunks_by_tier: Vec<usize>,
+    /// `update(focus)` calls it took to settle (budget-bounded, so ≥ ceil(chunks / budget)).
+    updates: u32,
+}
+
+impl GenStats {
+    /// Graph evals per chunk = field nodes `(HEIGHT_FIELD_RES + 1)²` (tier-independent — every tier
+    /// samples `HEIGHT_FIELD_RES` cells per axis). This is the true per-chunk graph-eval count.
+    fn samples_per_chunk() -> usize {
+        let n = (HEIGHT_FIELD_RES + 1) as usize;
+        n * n
+    }
+    fn total_samples(&self) -> usize {
+        self.chunks * Self::samples_per_chunk()
+    }
+    fn us_per_chunk(&self) -> f64 {
+        if self.chunks == 0 { 0.0 } else { self.settle_ms * 1000.0 / self.chunks as f64 }
+    }
+    fn chunks_per_sec(&self) -> f64 {
+        if self.settle_ms <= 0.0 { 0.0 } else { self.chunks as f64 / (self.settle_ms / 1000.0) }
+    }
+}
+
 /// Build + publish the full tiered height clipmap settled around `focus` (camera XZ), mirroring
-/// `worldgen::roll_worldgen`: derive the tier count from the mesh-bake coarsest-LOD reach, drive
-/// `LayerManager::update(focus)` with a high budget until `is_settled`, build the clipmap, and publish it
-/// via `set_cpu_height_clipmap` (the Terrain eval + coverage gate read this process-global — the strict
-/// sampler panics if it's missing). Returns the built clipmap (also left published).
-fn build_and_publish_clipmap(cfg: &SdfGridConfig, mesh_cfg: &MeshBakeConfig, focus: DVec2) -> Arc<HeightClipmap> {
+/// `worldgen::roll_worldgen`: derive the tier count from the mesh-bake coarsest-LOD reach, apply the
+/// authored `graph` to every tier (`set_graph`), drive `LayerManager::update(focus)` with a high budget
+/// until `is_settled`, build the clipmap, and publish it via `set_cpu_height_clipmap` (the Terrain eval +
+/// coverage gate read this process-global — the strict sampler panics if it's missing). Returns the built
+/// clipmap (also left published). When `gen_stats` is `Some`, the cold `update` settle loop is timed into
+/// it (Task 2 — used only for the cold focus-0 build, not the streaming steps).
+fn build_and_publish_clipmap(
+    cfg: &SdfGridConfig,
+    mesh_cfg: &MeshBakeConfig,
+    focus: DVec2,
+    graph: Option<&Arc<Graph>>,
+    mut gen_stats: Option<&mut GenStats>,
+) -> Arc<HeightClipmap> {
     let reach = coarsest_lod_outer_reach(cfg, mesh_cfg) as f64;
     let tiers = height_clipmap_tiers(reach);
     let mut manager =
         LayerManager::new_clipmap(WORLDGEN_SLICE_SEED, HeightParams::default(), ErosionParams::default(), tiers);
+    // Drive generation from the REAL authored graph (every tier) — exactly as `roll_worldgen` does — so
+    // the clipmap (and thus everything the rig measures) is the production terrain. Done BEFORE the settle
+    // loop so the cold gen we time is the graph path. `None` ⇒ legacy `HeightParams` (already on the layers).
+    if let Some(g) = graph {
+        manager.set_graph(Some(g.clone()));
+    }
     manager.budget = 1_000_000; // fill the whole window per update (we want a settled cold clipmap)
 
     // Settle the rolling window at `focus` (a handful of high-budget updates; guard against non-convergence).
+    // Time the WHOLE settle loop when capturing gen stats: this is the cold generation of every required
+    // height chunk (each = `HeightLayer::generate` evaluating the graph over the field grid).
+    let t_gen = std::time::Instant::now();
     let mut guard = 0u32;
     while !manager.is_settled(focus) {
         manager.update(focus);
         guard += 1;
         assert!(guard < 1000, "clipmap did not settle around focus {focus:?}");
+    }
+    if let Some(stats) = gen_stats.as_deref_mut() {
+        stats.settle_ms = t_gen.elapsed().as_secs_f64() * 1000.0;
+        stats.updates = guard;
+        let store = manager.height_store();
+        stats.chunks = store.len();
+        let mut by_tier = vec![0usize; manager.tier_count() as usize];
+        for c in store.resident_coords() {
+            let t = c.layer.0 as usize;
+            if t < by_tier.len() {
+                by_tier[t] += 1;
+            }
+        }
+        stats.chunks_by_tier = by_tier;
     }
 
     let tier_cells: Vec<u32> = (0..manager.tier_count()).map(|t| HEIGHT_CHUNK_CELLS << t).collect();
@@ -322,17 +417,45 @@ fn mesh_bake_perf_terrain() {
     let cam0 = Vec3::new(0.0, 40.0, 0.0);
     let focus0 = DVec2::new(cam0.x as f64, cam0.z as f64);
 
+    // Load the REAL authored terrain graph (falls back to legacy with a note if missing/unparseable).
+    let graph = load_world_graph();
+    let terrain_src = if graph.is_some() { "AUTHORED graph (assets/worldgen/world.graph.ron)" } else { "LEGACY HeightParams" };
+
     // Build + publish the full tiered clipmap settled around the camera (required before any bake — the
-    // strict Terrain sampler panics on a coverage miss).
-    let clipmap = build_and_publish_clipmap(&config, &mesh_cfg, focus0);
+    // strict Terrain sampler panics on a coverage miss). Time the cold generation of the settled window.
+    let mut gen_st = GenStats::default();
+    let clipmap = build_and_publish_clipmap(&config, &mesh_cfg, focus0, graph.as_ref(), Some(&mut gen_st));
 
     eprintln!(
-        "MESH-BAKE-PERF: terrain = {} edit(s) | mesh-bake clipmap: LODs 0..={} (K={k}, lod0_radius={}, half0={half0} chunks, cw0={cw0:.2} m, coarsest reach=±{reach:.0} m) | height clipmap: {} tiers | MAX_NEW_TASKS_PER_FRAME={MAX_NEW_TASKS_PER_FRAME}",
+        "MESH-BAKE-PERF: terrain = {} edit(s) [{terrain_src}] | mesh-bake clipmap: LODs 0..={} (K={k}, lod0_radius={}, half0={half0} chunks, cw0={cw0:.2} m, coarsest reach=±{reach:.0} m) | height clipmap: {} tiers | MAX_NEW_TASKS_PER_FRAME={MAX_NEW_TASKS_PER_FRAME}",
         edits.len(),
         lod_count - 1,
         mesh_cfg.lod0_radius,
         clipmap.len(),
     );
+
+    // ================= [gen] — cold height-chunk GENERATION of the settled window =================
+    // The COLD generation cost (the optimization target): how long to generate every height chunk of the
+    // settled clipmap window from empty. Each chunk = `HeightLayer::generate` evaluating the terrain graph
+    // over `(HEIGHT_FIELD_RES+1)²` field nodes. This is the SERIAL baseline before parallelization.
+    eprintln!(
+        "MESH-BAKE-PERF [gen]: COLD generate {} height chunks in {:.2}ms ({} update(s), budget=1M) | {} samples ({}² nodes/chunk × {} chunks) | {:.1} us/chunk | {:.0} chunks/sec",
+        gen_st.chunks,
+        gen_st.settle_ms,
+        gen_st.updates,
+        gen_st.total_samples(),
+        HEIGHT_FIELD_RES + 1,
+        gen_st.chunks,
+        gen_st.us_per_chunk(),
+        gen_st.chunks_per_sec(),
+    );
+    eprintln!("MESH-BAKE-PERF [gen] chunks by tier:");
+    for (t, &n) in gen_st.chunks_by_tier.iter().enumerate() {
+        if n == 0 {
+            continue;
+        }
+        eprintln!("    tier {t}: {n} chunks");
+    }
 
     // ================= SCENARIO A — cold full-LOD-8 fill =================
     let (surface0, counts0) = surface_chunks(&edits, &config, &mesh_cfg, cam0, &clipmap);
@@ -406,7 +529,7 @@ fn mesh_bake_perf_terrain() {
     for s in 1..=steps {
         let cam = cam0 + Vec3::new(s as f32 * cw0, 0.0, 0.0);
         let focus = DVec2::new(cam.x as f64, cam.z as f64);
-        let clip = build_and_publish_clipmap(&config, &mesh_cfg, focus);
+        let clip = build_and_publish_clipmap(&config, &mesh_cfg, focus, graph.as_ref(), None);
         let (surf, counts) = surface_chunks(&edits, &config, &mesh_cfg, cam, &clip);
 
         let entering: Vec<BrickKey> = surf.difference(&prev_surface).copied().collect();
@@ -454,6 +577,7 @@ fn mesh_bake_perf_terrain() {
         &config,
         &mesh_cfg,
         lod_count,
+        &gen_st,
         &counts0,
         cold_total_ms,
         worst_us,
@@ -490,6 +614,7 @@ fn write_json(
     config: &SdfGridConfig,
     mesh_cfg: &MeshBakeConfig,
     lod_count: u32,
+    gen_st: &GenStats,
     counts: &ResidencyCounts,
     cold_total_ms: f64,
     worst_us: u128,
@@ -519,8 +644,11 @@ fn write_json(
     let surface_total = counts.surface_total();
     let overall_ratio = if resident_total == 0 { 0.0 } else { surface_total as f64 / resident_total as f64 };
     let k = mesh_cfg.chunk_bricks.clamp(1, 8);
+    let gen_by_tier: Vec<String> = gen_st.chunks_by_tier.iter().map(|n| n.to_string()).collect();
     let body = format!(
         "{{\"config\":{{\"lod_count\":{lod_count},\"chunk_bricks\":{k},\"lod0_radius\":{},\"voxel_size\":{}}},\
+         \"gen\":{{\"settle_ms\":{:.3},\"chunks\":{},\"updates\":{},\"samples\":{},\"samples_per_chunk\":{},\
+         \"us_per_chunk\":{:.2},\"chunks_per_sec\":{:.1},\"chunks_by_tier\":[{}]}},\
          \"cold_fill\":{{\"resident_total\":{resident_total},\"surface_total\":{surface_total},\"culled_total\":{},\
          \"overall_cull_ratio\":{overall_ratio:.4},\"per_lod\":[{}],\
          \"mesh_chunk_cpu_total_ms\":{cold_total_ms:.3},\"per_chunk_us\":{{\"mean\":{mean_us},\"p50\":{p50_us},\"p99\":{p99_us},\"worst\":{worst_us}}},\
@@ -529,6 +657,14 @@ fn write_json(
          \"per_step_bake_max_us\":{stream_bake_max_us},\"steady_resident\":{steady_resident},\"bounded\":{bounded}}}}}\n",
         mesh_cfg.lod0_radius,
         config.voxel_size,
+        gen_st.settle_ms,
+        gen_st.chunks,
+        gen_st.updates,
+        gen_st.total_samples(),
+        GenStats::samples_per_chunk(),
+        gen_st.us_per_chunk(),
+        gen_st.chunks_per_sec(),
+        gen_by_tier.join(","),
         resident_total - surface_total,
         per_lod.join(","),
     );
@@ -572,8 +708,9 @@ fn sync_cull_uses_frozen_clipmap_not_rolled_global() {
     let edits = vec![terrain_edit()];
     let idx = vec![0u32]; // the single Terrain edit overlaps every chunk
 
-    // The round's FROZEN snapshot: a fully-settled clipmap around the origin (all tiers present).
-    let frozen = build_and_publish_clipmap(&config, &mesh_cfg, DVec2::ZERO);
+    // The round's FROZEN snapshot: a fully-settled clipmap around the origin (all tiers present). Legacy
+    // path (graph=None) — this regression test is about clipmap coverage desync, not the terrain source.
+    let frozen = build_and_publish_clipmap(&config, &mesh_cfg, DVec2::ZERO, None, None);
 
     // A far, coarse chunk like the production panic (`world_xz≈(-17203,-2867)`, a coarse tier). Build its
     // gate footprint (chunk AABB ± the gate margin) and find the FINEST clipmap tier that covers it.
