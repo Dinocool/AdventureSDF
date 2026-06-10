@@ -100,6 +100,8 @@ pub struct WorldGraphEditor {
     to_panel: Option<NodeId>,
     /// Monotonic id source for popped windows (their stable GPU pool key).
     next_pop_id: u64,
+    /// Set after a graph is seeded/loaded; the panel auto-arranges once the nodes have been measured.
+    needs_arrange: bool,
 }
 
 /// The dockable, viewport-located preview panel's state: which node it shows + its own view.
@@ -165,6 +167,7 @@ impl Default for WorldGraphEditor {
             pop_request: None,
             to_panel: None,
             next_pop_id: 1000,
+            needs_arrange: true,
         }
     }
 }
@@ -1438,7 +1441,7 @@ fn graph_panel(world: &mut World, ui: &mut egui::Ui) {
                             editor.snarl = snarl;
                             editor.nav.clear();
                             editor.clear_node_caches();
-                            editor.rearrange();
+                            editor.needs_arrange = true;
                             format!("loaded {wg}")
                         }
                         Err(e) => format!("hierarchy parse failed: {e}"),
@@ -1449,7 +1452,7 @@ fn graph_panel(world: &mut World, ui: &mut egui::Ui) {
                                 editor.snarl = graph_to_snarl(&asset.graph);
                                 editor.nav.clear();
                                 editor.clear_node_caches();
-                                editor.rearrange();
+                                editor.needs_arrange = true;
                                 format!("loaded {} (flat)", editor.path)
                             }
                             Err(e) => format!("parse failed: {e}"),
@@ -1462,6 +1465,7 @@ fn graph_panel(world: &mut World, ui: &mut egui::Ui) {
                 editor.snarl = world_biome_snarl();
                 editor.nav.clear();
                 editor.clear_node_caches();
+                editor.needs_arrange = true;
                 editor.status = "reset to biome world".into();
             }
             if ui.button("Auto-arrange").on_hover_text("Lay nodes out left→right by dependency depth").clicked() {
@@ -1579,10 +1583,18 @@ fn graph_panel(world: &mut World, ui: &mut egui::Ui) {
                 hovered_preview,
                 level_salt,
             };
+            // Keep nodes readable: don't let the auto-fit zoom out below ~0.6 (default min is 0.2, which
+            // makes a freshly-arranged graph tiny), allow zooming in to 3×.
+            let style = SnarlStyle { min_scale: Some(0.6), max_scale: Some(3.0), ..SnarlStyle::new() };
             SnarlWidget::new()
                 .id(egui::Id::new("worldgen-biome-graph"))
-                .style(SnarlStyle::new())
+                .style(style)
                 .show(current, &mut viewer, ui);
+        }
+        // After a seed/load, auto-arrange once the nodes have been measured this frame (so the layout uses
+        // real sizes). Applies on the next frame.
+        if std::mem::take(&mut editor.needs_arrange) {
+            editor.rearrange();
         }
         // Descend into a biome the user opened this frame.
         if let Some(id) = editor.enter.take() {
