@@ -6,16 +6,20 @@
 //! and the store's prior residency, so it unit-tests without a Bevy app; the thin `WorldGenPlugin`
 //! systems just feed it the camera focus and forward the store delta to the GPU upload.
 //!
-//! Generation runs sequentially here — each chunk is cheap (fBm over a 65² grid) and the per-update
-//! budget bounds the cost. Because layers are *pure* `f(coord, seed)`, parallelizing a batch over
-//! `ComputeTaskPool` later is a drop-in change (no ordering/determinism impact); the slice keeps it
-//! sequential for testability and simplicity.
+//! The per-update batch of newly-required chunks is generated in PARALLEL across the `ComputeTaskPool`
+//! (`update` collects the missing chunks in dependency order up to `budget`, `par_chunk_map`s
+//! `generate_height_chunk` over them, then inserts the results). Because layers are *pure*
+//! `f(coord, seed)` with no inter-chunk dependency or order/clock/global state (the [`Layer::generate`]
+//! contract), the field produced for a coord is independent of how the batch is partitioned — so the
+//! result is bit-for-bit identical to a serial loop and the determinism / `worldgen_parity` invariants
+//! hold. The `budget` still bounds which chunks are generated per update (unchanged).
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use bevy::math::DVec2;
 use bevy::prelude::Resource;
+use bevy::tasks::{ComputeTaskPool, ParallelSlice};
 
 use super::artifact::ScalarField2D;
 use super::coord::{ChunkCoord, LayerId};
@@ -215,21 +219,48 @@ impl LayerManager {
             .collect();
         self.height.retain(|c| required.contains(&c));
 
-        // Generate missing chunks in dependency order, up to budget.
-        let mut made = 0usize;
+        // Collect the missing chunks to generate THIS update — in the same dependency order and bounded by
+        // the same `budget` as the serial loop, so the SET of chunks generated per update is byte-identical
+        // to before (only the order of WORK changes, never which chunks).
+        let mut todo: Vec<ChunkCoord> = Vec::new();
         'outer: for (layer_id, coords) in &plan.required {
             for &c in coords {
-                if made >= self.budget {
+                if todo.len() >= self.budget {
                     break 'outer;
                 }
                 if self.store_contains(*layer_id, c) {
                     continue;
                 }
-                if let Some(field) = self.generate_height_chunk(c) {
-                    self.height.insert(c, Arc::new(field));
-                    made += 1;
-                }
+                todo.push(c);
             }
+        }
+
+        // Generate the batch in PARALLEL across the compute pool. Each chunk is a pure `f(coord, seed)`
+        // (no inter-chunk dependency, no order/clock/global state — `Layer::generate`'s contract), so the
+        // produced field for a given coord is independent of how the batch is partitioned across threads;
+        // parallelizing is bit-for-bit identical to the serial loop. `generate_height_chunk` is `&self`
+        // (read-only over the layer stack + graph, which are `Send + Sync`), so the closure captures `self`
+        // immutably with no per-chunk cloning. `get_or_init` so the headless perf rig (no Bevy app) runs.
+        let made: Vec<(ChunkCoord, ScalarField2D)> = if todo.is_empty() {
+            Vec::new()
+        } else {
+            let pool = ComputeTaskPool::get_or_init(bevy::tasks::TaskPool::default);
+            let chunk_size = todo.len().div_ceil(pool.thread_num().max(1)).max(1);
+            todo.par_chunk_map(pool, chunk_size, |_i, batch| {
+                batch
+                    .iter()
+                    .filter_map(|&c| self.generate_height_chunk(c).map(|f| (c, f)))
+                    .collect::<Vec<_>>()
+            })
+            .into_iter()
+            .flatten()
+            .collect()
+        };
+
+        // Insert the generated fields. Chunks are independent, so insertion ORDER is irrelevant to the
+        // stored data (determinism preserved); the store keys each by its `ChunkCoord`.
+        for (c, field) in made {
+            self.height.insert(c, Arc::new(field));
         }
         self.height.has_delta()
     }
