@@ -7,7 +7,7 @@ use egui_snarl::{InPinId, NodeId, OutPinId, Snarl};
 
 use crate::sdf_render::worldgen::graph::node::{FbmAxis, Graph, NodeKind};
 
-use super::{CLIMATE_INPUTS, EdNode};
+use super::{CLIMATE_INPUTS, ClipNode, EdNode};
 
 /// Name of climate input `k` (falls back gracefully past the vocabulary).
 pub(super) fn climate_name(k: usize) -> &'static str {
@@ -40,6 +40,50 @@ pub fn graph_to_snarl(graph: &Graph) -> Snarl<EdNode> {
     let out = snarl.insert_node(egui::pos2(220.0 * 4.0, 0.0), EdNode::Output);
     snarl.connect(OutPinId { node: ids[graph.output as usize], output: 0 }, InPinId { node: out, input: 0 });
     snarl
+}
+
+// ===================================================================================================
+// Clipboard: copy / paste a node selection (pure snarl manipulation)
+// ===================================================================================================
+
+/// Snapshot a `selection` of nodes from `snarl` into clipboard entries: each node's kind + position +
+/// the subset of its input wires whose SOURCE is also in the selection (recorded by clipboard-local
+/// index, so paste can rewire the copied subgraph). Wires to outside the selection are intentionally
+/// dropped — a paste reproduces the selected nodes + their INTERNAL edges, nothing dangling. Pure.
+pub(super) fn copy_selection(snarl: &Snarl<EdNode>, selection: &[NodeId]) -> Vec<ClipNode> {
+    // Clipboard-local index of each selected node (selection order), for rewiring.
+    let index: std::collections::HashMap<NodeId, usize> =
+        selection.iter().enumerate().map(|(i, &id)| (id, i)).collect();
+    selection
+        .iter()
+        .filter_map(|&id| {
+            let kind = snarl.get_node(id)?.clone();
+            let pos = snarl.get_node_info(id).map(|n| n.pos).unwrap_or(egui::Pos2::ZERO);
+            // Internal input wires (source also selected), as (src_clip_index, src_out_pin, this_in_pin).
+            let wires_in = snarl
+                .wires()
+                .filter(|(_, to)| to.node == id)
+                .filter_map(|(from, to)| index.get(&from.node).map(|&si| (si, from.output, to.input)))
+                .collect();
+            Some(ClipNode { kind, pos, wires_in })
+        })
+        .collect()
+}
+
+/// Paste `clip` entries into `snarl` at a small `offset` (so they don't sit exactly on the originals):
+/// insert each node fresh (mapping clip-index → new `NodeId`), then reconnect the recorded internal
+/// wires. Returns the new node ids (selection order). Pure — the testable core of paste.
+pub(super) fn paste_clipboard(snarl: &mut Snarl<EdNode>, clip: &[ClipNode], offset: egui::Vec2) -> Vec<NodeId> {
+    let new_ids: Vec<NodeId> =
+        clip.iter().map(|c| snarl.insert_node(c.pos + offset, c.kind.clone())).collect();
+    for (dst_idx, c) in clip.iter().enumerate() {
+        for &(src_idx, out_pin, in_pin) in &c.wires_in {
+            if let (Some(&src), Some(&dst)) = (new_ids.get(src_idx), new_ids.get(dst_idx)) {
+                snarl.connect(OutPinId { node: src, output: out_pin }, InPinId { node: dst, input: in_pin });
+            }
+        }
+    }
+    new_ids
 }
 
 // ===================================================================================================

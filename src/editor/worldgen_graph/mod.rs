@@ -30,8 +30,8 @@ pub use convert::graph_to_snarl;
 use convert::{climate_name, resolve_snarl};
 use panel::graph_panel;
 use preview::{
-    CAM_DEFAULT, DEFAULT_PREVIEW_PX, PREVIEW_HALF_M, PoppedPreview, WorldgenPreviewPanel, open_preview_panel,
-    preview_panel,
+    CAM_DEFAULT, DEFAULT_PREVIEW_PX, PREVIEW_HALF_M, PoppedPreview, WorldgenPreviewPanels, open_preview_panel,
+    preview_panel_0, preview_panel_1, preview_panel_2, preview_panel_3,
 };
 
 /// Default on-disk path the editor saves/loads the active biome graph to (the production graph the
@@ -56,6 +56,17 @@ pub enum EdNode {
     Input(usize),
     /// The single graph OUTPUT sink (1 input, 0 outputs) — its input is the terrain height.
     Output,
+}
+
+/// One clipboard entry: a copied node's kind + canvas position + the internal wires (among the copied
+/// set) that feed it. `wires_in` is `(src_clip_index, src_out_pin, this_in_pin)` — by clipboard-LOCAL
+/// index, so paste can re-wire the copied subgraph after inserting fresh nodes (mapping clip-index → new
+/// `NodeId`). Transient (never persisted). See [`copy_selection`]/[`paste_clipboard`].
+#[derive(Clone)]
+pub(super) struct ClipNode {
+    pub(super) kind: EdNode,
+    pub(super) pos: egui::Pos2,
+    pub(super) wires_in: Vec<(usize, usize, usize)>,
 }
 
 /// A node's persisted preview view-state — ONE struct per node (the single source of truth for every
@@ -120,6 +131,9 @@ struct ViewerSignals {
     pop_request: Option<NodeId>,
     /// Set to a node id when the user clicks "→ panel" — the panel retargets the dockable preview panel.
     to_panel: Option<NodeId>,
+    /// Raised when a node's `collapsed` flag is toggled this frame — the panel ORs it into
+    /// `needs_arrange` so the layout re-packs (collapsed nodes shrink, so the columns tighten up).
+    needs_arrange: bool,
 }
 
 /// Editor state: the working Snarl graph, whether it's been seeded from the live `WorldGraph` yet, and
@@ -149,6 +163,9 @@ pub struct WorldGraphEditor {
     next_pop_id: u64,
     /// Set after a graph is seeded/loaded; the panel auto-arranges once the nodes have been measured.
     needs_arrange: bool,
+    /// Cut/copy clipboard for node select+copy+paste (transient; not part of the persist doc). Holds the
+    /// last copied selection (kinds + positions + internal wires) so paste reproduces the subgraph.
+    clipboard: Vec<ClipNode>,
 }
 
 impl Default for WorldGraphEditor {
@@ -165,6 +182,7 @@ impl Default for WorldGraphEditor {
             popped: Vec::new(),
             next_pop_id: 1000,
             needs_arrange: true,
+            clipboard: Vec::new(),
         }
     }
 }
@@ -176,10 +194,14 @@ impl WorldGraphEditor {
         self.caches = NodeCaches::default();
     }
 
-    /// Auto-arrange the top-level snarl (plain `&mut self` so the disjoint snarl/body_size borrows don't
-    /// alias through `Mut`'s deref).
+    /// Auto-arrange the CURRENTLY-NAVIGATED level's snarl (plain `&mut self` so the disjoint
+    /// snarl/nav/body_size borrows don't alias through `Mut`'s deref). Truncates a stale nav tail first
+    /// so `current_snarl_mut` only ever walks live biome nodes.
     fn rearrange(&mut self) {
-        auto_arrange(&mut self.snarl, &self.caches.body_size);
+        let WorldGraphEditor { snarl, nav, caches, .. } = self;
+        let vd = convert::valid_depth(snarl, nav);
+        nav.truncate(vd);
+        auto_arrange(convert::current_snarl_mut(snarl, nav), &caches.body_size);
     }
 }
 
@@ -189,7 +211,7 @@ pub struct WorldgenGraphEditorPlugin;
 impl Plugin for WorldgenGraphEditorPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<WorldGraphEditor>();
-        app.init_resource::<WorldgenPreviewPanel>();
+        app.init_resource::<WorldgenPreviewPanels>();
         // Deferred dock manipulation (the dock state is removed from the World during its own render).
         app.add_systems(Update, open_preview_panel);
         // Auto-persist the editor session on exit so reopening resumes it WITHOUT an explicit Save — same
@@ -203,15 +225,15 @@ impl Plugin for WorldgenGraphEditorPlugin {
             30,
             graph_panel,
         );
-        // A viewport-located preview panel; "→ panel" on a node targets it.
-        super::panels::register_panel(
-            app,
-            "worldgen/node-preview",
-            "Node Preview",
-            super::panels::DockSide::Center,
-            10,
-            preview_panel,
-        );
+        // A POOL of viewport-located preview panels; "→ panel" on a node fills the first free slot. Each
+        // gets its own dock tab + GPU key, so several nodes can be previewed side-by-side.
+        let preview_fns: [fn(&mut World, &mut bevy_egui::egui::Ui); 4] =
+            [preview_panel_0, preview_panel_1, preview_panel_2, preview_panel_3];
+        for (idx, render) in preview_fns.into_iter().enumerate() {
+            let id = preview::preview_panel_tab_id(idx);
+            let title = if idx == 0 { "Node Preview".to_string() } else { format!("Node Preview {}", idx + 1) };
+            super::panels::register_panel(app, id, title, super::panels::DockSide::Center, 10, render);
+        }
     }
 }
 
@@ -221,12 +243,12 @@ impl Plugin for WorldgenGraphEditorPlugin {
 fn save_worldgen_session_on_exit(
     mut exit: MessageReader<AppExit>,
     editor: Option<Res<WorldGraphEditor>>,
-    panel: Option<Res<WorldgenPreviewPanel>>,
+    panels: Option<Res<WorldgenPreviewPanels>>,
 ) {
     if exit.read().next().is_none() {
         return;
     }
-    if let (Some(editor), Some(panel)) = (editor, panel) {
-        persist::save_session(&editor, &panel);
+    if let (Some(editor), Some(panels)) = (editor, panels) {
+        persist::save_session(&editor, &panels);
     }
 }

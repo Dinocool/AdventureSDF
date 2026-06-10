@@ -1,12 +1,15 @@
 use super::arrange::auto_arrange;
 use super::compile::output_root;
 use super::convert::{
-    breadcrumb_names, new_biome_subgraph, resolve_snarl, valid_depth, world_biome_snarl, worldgraph_path,
+    breadcrumb_names, copy_selection, new_biome_subgraph, paste_clipboard, resolve_snarl, valid_depth,
+    world_biome_snarl, worldgraph_path,
 };
 use super::persist::{
     EditorView, PanelView, PoppedView, WorldGraphDoc, apply_view, gather_view, load_editor_doc,
 };
-use super::preview::{PANEL_GPU_KEY, PreviewView, WorldgenPreviewPanel, gpu_inline_key, scale_label_text};
+use super::preview::{
+    PANEL_GPU_KEY, PreviewView, WorldgenPreviewPanel, WorldgenPreviewPanels, gpu_inline_key, scale_label_text,
+};
 use super::*;
 use egui::pos2;
 use egui_snarl::{InPinId, OutPinId};
@@ -282,7 +285,7 @@ fn load_editor_doc_reads_bare_snarl_for_backward_compat() {
     std::fs::write(f.wg(), s).expect("write bare snarl");
     let (snarl, view) = load_editor_doc(&f.str());
     assert!(snarl.node_ids().any(|(_, n)| matches!(n, EdNode::Biome { .. })), "bare snarl loaded");
-    assert!(view.nav.is_empty() && view.panel.is_none() && view.popped.is_empty(), "view defaulted");
+    assert!(view.nav.is_empty() && view.panels.is_empty() && view.popped.is_empty(), "view defaulted");
 }
 
 #[test]
@@ -427,6 +430,42 @@ fn auto_arrange_tolerates_a_cycle() {
     assert_eq!(s.node_ids().count(), 2);
 }
 
+// -- clipboard copy/paste ------------------------------------------------------------------------
+
+/// Copying a 2-node wired selection then pasting into a fresh snarl reproduces both nodes AND the
+/// internal wire (rewired by clipboard-local index). Pure — no egui context.
+#[test]
+fn copy_paste_reproduces_nodes_and_internal_wire() {
+    // Source: Const → Scale (an internal wire), plus an Output we DON'T select (its wire must drop).
+    let mut src = Snarl::new();
+    let c = src.insert_node(pos2(10.0, 20.0), EdNode::Op(NodeKind::Const(1.0)));
+    let sc = src.insert_node(pos2(230.0, 20.0), EdNode::Op(NodeKind::Scale(2.0)));
+    src.connect(out(c), inn(sc, 0));
+    let o = src.insert_node(pos2(450.0, 20.0), EdNode::Output);
+    src.connect(out(sc), inn(o, 0));
+
+    // Copy just {Const, Scale} — the internal Const→Scale wire is captured; the Scale→Output wire (to an
+    // unselected node) is dropped.
+    let clip = copy_selection(&src, &[c, sc]);
+    assert_eq!(clip.len(), 2);
+    assert!(clip[0].wires_in.is_empty(), "Const has no incoming internal wire");
+    assert_eq!(clip[1].wires_in, vec![(0, 0, 0)], "Scale's input 0 ← clip node 0 (Const) output 0");
+
+    // Paste into a FRESH snarl with an offset.
+    let mut dst = Snarl::new();
+    let ids = paste_clipboard(&mut dst, &clip, egui::vec2(24.0, 24.0));
+    assert_eq!(ids.len(), 2);
+    // Two nodes of the right kinds appear.
+    assert!(matches!(dst.get_node(ids[0]), Some(EdNode::Op(NodeKind::Const(_)))));
+    assert!(matches!(dst.get_node(ids[1]), Some(EdNode::Op(NodeKind::Scale(_)))));
+    // Positions are offset from the originals.
+    assert_eq!(dst.get_node_info(ids[0]).unwrap().pos, pos2(34.0, 44.0));
+    // The internal wire was reproduced: exactly Const.out0 → Scale.in0.
+    let wires: Vec<_> = dst.wires().collect();
+    assert_eq!(wires.len(), 1, "exactly one internal wire");
+    assert_eq!(wires[0], (out(ids[0]), inn(ids[1], 0)));
+}
+
 // -- gpu_inline_key ------------------------------------------------------------------------------
 
 #[test]
@@ -514,7 +553,8 @@ fn world_graph_doc_round_trips_view_state() {
     let view = EditorView {
         nodes,
         nav: vec![b],
-        panel: Some(PanelView { nav: vec![b], node: o, is3d: true, view: sample_preview_view() }),
+        panels: vec![PanelView { nav: vec![b], node: o, is3d: true, view: sample_preview_view() }],
+        panel: None,
         popped: vec![PoppedView { nav: vec![], node: b, is3d: false, size: 300.0, view: sample_preview_view() }],
     };
     let doc = WorldGraphDoc { version: 1, snarl: top, view };
@@ -533,13 +573,38 @@ fn world_graph_doc_round_trips_view_state() {
     assert_eq!(nv.cam, want.cam);
     assert_eq!(nv.pan, want.pan);
     assert_eq!(nv.disp_px, want.disp_px);
-    // nav / panel / popped survive.
+    // nav / panels / popped survive.
     assert_eq!(back.view.nav, vec![b]);
-    let pv = back.view.panel.expect("panel survived");
+    assert_eq!(back.view.panels.len(), 1, "the one occupied panel survived");
+    let pv = &back.view.panels[0];
     assert_eq!((pv.node, pv.is3d), (o, true));
     assert_eq!(pv.view.half, sample_preview_view().half);
     assert_eq!(back.view.popped.len(), 1);
     assert_eq!(back.view.popped[0].node, b);
+}
+
+/// Backward-compat: an old `EditorView` carrying the deprecated single `panel` field (pre-pool saves)
+/// must restore into the FIRST pool slot via `apply_view` (folded in front of `panels`).
+#[test]
+fn apply_view_folds_legacy_single_panel_into_pool() {
+    let (top, b) = top_with_biome("Hills");
+    let o = {
+        // Need a second node id to target; reuse the biome's own output sink id from a fresh insert.
+        let mut t = top.clone();
+        t.insert_node(p(), EdNode::Output)
+    };
+    let mut dst = WorldGraphEditor { snarl: top, ..Default::default() };
+    let mut panels = WorldgenPreviewPanels::default();
+    // Legacy field set, new `panels` empty — must land in slot 0.
+    let view = EditorView {
+        panel: Some(PanelView { nav: vec![], node: o, is3d: true, view: sample_preview_view() }),
+        nav: vec![b],
+        ..EditorView::default()
+    };
+    apply_view(view, &mut dst, &mut panels);
+    assert_eq!(panels.0[0].target, Some((vec![], o)), "legacy panel restored into slot 0");
+    assert!(panels.0[0].pending_open);
+    assert!(panels.0[1].target.is_none(), "other slots untouched");
 }
 
 /// `apply_view` must CLAMP a stale nav (pointing at a now-deleted biome) without panicking — it falls
@@ -549,11 +614,11 @@ fn apply_view_clamps_stale_nav_without_panicking() {
     let mut snarl = Snarl::new();
     let lone = snarl.insert_node(p(), EdNode::Op(NodeKind::Const(0.0)));
     let mut editor = WorldGraphEditor { snarl, ..Default::default() };
-    let mut panel = WorldgenPreviewPanel::default();
+    let mut panels = WorldgenPreviewPanels::default();
 
     // nav references a node that is NOT a biome (and a wholly bogus id) — must clamp to depth 0.
     let view = EditorView { nav: vec![lone], ..EditorView::default() };
-    apply_view(view, &mut editor, &mut panel);
+    apply_view(view, &mut editor, &mut panels);
     assert!(editor.nav.is_empty(), "stale nav clamped to the root");
 }
 
@@ -577,15 +642,18 @@ fn gather_then_apply_round_trips_view_state() {
         cam: (0.3, 0.7),
         open: true,
     });
-    let mut src_panel = WorldgenPreviewPanel { target: Some((vec![], b)), is3d: false, ..Default::default() };
-    src_panel.set_view(sample_preview_view());
+    // A pool with one occupied slot (slot 0) — the rest empty.
+    let mut src_panels = WorldgenPreviewPanels::default();
+    src_panels.0[0] = WorldgenPreviewPanel { target: Some((vec![], b)), is3d: false, ..Default::default() };
+    src_panels.0[0].set_view(sample_preview_view());
 
-    let snapshot = gather_view(&src, &src_panel);
+    let snapshot = gather_view(&src, &src_panels);
+    assert_eq!(snapshot.panels.len(), 1, "only the occupied slot is snapshotted");
 
     // Destination editor: same graph, blank state → apply the snapshot.
     let mut dst = WorldGraphEditor { snarl: top, ..Default::default() };
-    let mut dst_panel = WorldgenPreviewPanel::default();
-    apply_view(snapshot, &mut dst, &mut dst_panel);
+    let mut dst_panels = WorldgenPreviewPanels::default();
+    apply_view(snapshot, &mut dst, &mut dst_panels);
 
     // Per-node settings restored.
     let nv = dst.caches.views.get(&b).copied().expect("node view restored");
@@ -593,7 +661,8 @@ fn gather_then_apply_round_trips_view_state() {
     assert_eq!(nv.surface, sample_node_view().surface);
     // nav restored (valid biome ⇒ kept).
     assert_eq!(dst.nav, vec![b]);
-    // Panel target + view restored, and re-shown.
+    // Panel target + view restored into the first slot, and re-shown.
+    let dst_panel = &dst_panels.0[0];
     assert_eq!(dst_panel.target, Some((vec![], b)));
     assert!(!dst_panel.is3d);
     assert_eq!(dst_panel.half, sample_preview_view().half);
