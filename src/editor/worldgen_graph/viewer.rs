@@ -11,7 +11,8 @@ use crate::editor::worldgen_gpu_preview::GpuPreviewRequest;
 use super::convert::new_biome_subgraph;
 use super::node::{input_label, node_catalog, node_kind_name, node_params_ui};
 use super::preview::{
-    CAM_DEFAULT, DEFAULT_PREVIEW_PX, PREVIEW_HALF_M, gpu_inline_key, handle_preview_gestures, preview_image,
+    CAM_DEFAULT, DEFAULT_PREVIEW_PX, PREVIEW_HALF_M, PreviewView, gpu_inline_key, handle_preview_gestures,
+    preview_image,
 };
 use super::{CLIMATE_INPUTS, EdNode, NodeCaches, ViewerSignals, climate_name, graph_rooted_at};
 
@@ -116,17 +117,8 @@ impl SnarlViewer<EdNode> for Viewer<'_> {
                 // Both 2D and 3D render on the GPU pool (one shader, one `height_colour` SSOT). Push a
                 // request and draw last frame's pool texture.
                 let gkey = gpu_inline_key(self.level_salt, node);
-                self.gpu_reqs.push(GpuPreviewRequest {
-                    key: gkey,
-                    graph: g,
-                    half,
-                    center: (cx, cz),
-                    is3d,
-                    yaw,
-                    pitch,
-                    res_w: res as u32,
-                    res_h: res as u32,
-                });
+                let view = PreviewView { half, cx, cz, yaw, pitch };
+                self.gpu_reqs.push(view.to_request(gkey, g, is3d, res as u32));
                 let tex = self.gpu_tex.get(&gkey).copied();
                 ui.horizontal_top(|ui| {
                     // LEFT — the preview image (a flat placeholder for the ~1 frame before the GPU texture
@@ -134,10 +126,12 @@ impl SnarlViewer<EdNode> for Viewer<'_> {
                     // right-drag = pan (3D). The scroll is consumed so the graph doesn't also zoom.
                     let img_resp = preview_image(ui, tex, egui::vec2(size, size));
                     {
-                        let h = self.caches.zoom_half_m.entry(node).or_insert(PREVIEW_HALF_M);
-                        let cam = self.caches.cam.entry(node).or_insert(CAM_DEFAULT);
-                        let pan = self.caches.pan.entry(node).or_insert((0.0, 0.0));
-                        handle_preview_gestures(ui, &img_resp, is3d, size, h, &mut pan.0, &mut pan.1, &mut cam.0, &mut cam.1);
+                        // Read the per-node entries into one PreviewView, apply gestures, write back.
+                        let mut v = PreviewView { half, cx, cz, yaw, pitch };
+                        handle_preview_gestures(&img_resp, is3d, size, &mut v);
+                        *self.caches.zoom_half_m.entry(node).or_insert(PREVIEW_HALF_M) = v.half;
+                        *self.caches.cam.entry(node).or_insert(CAM_DEFAULT) = (v.yaw, v.pitch);
+                        *self.caches.pan.entry(node).or_insert((0.0, 0.0)) = (v.cx, v.cz);
                     }
                     // Record hover so the panel can intercept this preview's scroll-zoom next frame
                     // (before egui-snarl applies its own graph zoom).
