@@ -67,7 +67,7 @@ pub(super) fn auto_arrange(snarl: &mut Snarl<EdNode>, body_size: &std::collectio
         let arity = node
             .map(|n| match n {
                 EdNode::Output => 1,
-                EdNode::Op(k) => k.arity().max(1),
+                EdNode::Op { kind, .. } => kind.arity().max(1),
                 EdNode::Biome { .. } => CLIMATE_INPUTS.len(),
                 EdNode::Input(_) => 1,
             })
@@ -75,7 +75,7 @@ pub(super) fn auto_arrange(snarl: &mut Snarl<EdNode>, body_size: &std::collectio
         // Op + Biome nodes carry a (default-on) preview, so they're tall; Input/Output are tiny. Use a
         // realistic per-kind default for any node not yet measured this session (e.g. off-screen at load),
         // so a single Auto-arrange already clears them instead of collapsing to a tiny default.
-        let has_preview = matches!(node, Some(EdNode::Op(_)) | Some(EdNode::Biome { .. }));
+        let has_preview = matches!(node, Some(EdNode::Op { .. }) | Some(EdNode::Biome { .. }));
         let default_body =
             if has_preview { egui::vec2(210.0, DEFAULT_PREVIEW_PX + 96.0) } else { egui::vec2(70.0, 6.0) };
         let body = body_size.get(&id).copied().unwrap_or(default_body);

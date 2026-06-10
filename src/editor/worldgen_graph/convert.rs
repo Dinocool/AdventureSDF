@@ -25,7 +25,7 @@ pub fn graph_to_snarl(graph: &Graph) -> Snarl<EdNode> {
     let mut ids: Vec<NodeId> = Vec::with_capacity(graph.nodes.len());
     for (i, node) in graph.nodes.iter().enumerate() {
         let pos = egui::pos2(220.0 * (i % 4) as f32, 140.0 * (i / 4) as f32);
-        ids.push(snarl.insert_node(pos, EdNode::Op(node.kind)));
+        ids.push(snarl.insert_node(pos, EdNode::op(node.kind)));
     }
     // Wire inputs (skip self-referential placeholder slots beyond each node's arity).
     for (i, node) in graph.nodes.iter().enumerate() {
@@ -150,7 +150,7 @@ pub(super) fn new_biome_subgraph() -> Snarl<EdNode> {
     for k in 0..CLIMATE_INPUTS.len() {
         s.insert_node(egui::pos2(0.0, 60.0 * k as f32), EdNode::Input(k));
     }
-    let c = s.insert_node(egui::pos2(260.0, 0.0), EdNode::Op(NodeKind::Const(0.0)));
+    let c = s.insert_node(egui::pos2(260.0, 0.0), EdNode::op(NodeKind::Const(0.0)));
     let o = s.insert_node(egui::pos2(520.0, 0.0), EdNode::Output);
     s.connect(OutPinId { node: c, output: 0 }, InPinId { node: o, input: 0 });
     s
@@ -183,7 +183,7 @@ fn ipin(n: NodeId, i: usize) -> InPinId {
 /// architecture end-to-end (classifier on top, biomes own their shape, climate piped into each).
 pub(super) fn world_biome_snarl() -> Snarl<EdNode> {
     fn climate(salt: u32, wavelength: f64) -> EdNode {
-        EdNode::Op(NodeKind::Fbm(FbmAxis {
+        EdNode::op(NodeKind::Fbm(FbmAxis {
             octaves: 2,
             base_freq: 1.0 / wavelength,
             lacunarity: 2.0,
@@ -197,13 +197,13 @@ pub(super) fn world_biome_snarl() -> Snarl<EdNode> {
     let plains = {
         let mut s = Snarl::new();
         let cont = s.insert_node(egui::pos2(0.0, 0.0), EdNode::Input(0));
-        let lift = s.insert_node(egui::pos2(220.0, 0.0), EdNode::Op(NodeKind::Scale(25.0)));
+        let lift = s.insert_node(egui::pos2(220.0, 0.0), EdNode::op(NodeKind::Scale(25.0)));
         s.connect(opin(cont), ipin(lift, 0));
         let hills = s.insert_node(
             egui::pos2(0.0, 140.0),
-            EdNode::Op(NodeKind::Fbm(FbmAxis { octaves: 4, base_freq: 1.0 / 500.0, lacunarity: 2.0, gain: 0.5, amplitude: 30.0, seed_salt: 11 })),
+            EdNode::op(NodeKind::Fbm(FbmAxis { octaves: 4, base_freq: 1.0 / 500.0, lacunarity: 2.0, gain: 0.5, amplitude: 30.0, seed_salt: 11 })),
         );
-        let add = s.insert_node(egui::pos2(440.0, 0.0), EdNode::Op(NodeKind::Add));
+        let add = s.insert_node(egui::pos2(440.0, 0.0), EdNode::op(NodeKind::Add));
         s.connect(opin(hills), ipin(add, 0));
         s.connect(opin(lift), ipin(add, 1));
         let o = s.insert_node(egui::pos2(660.0, 0.0), EdNode::Output);
@@ -215,20 +215,20 @@ pub(super) fn world_biome_snarl() -> Snarl<EdNode> {
     let mountains = {
         let mut s = Snarl::new();
         let cont = s.insert_node(egui::pos2(0.0, 0.0), EdNode::Input(0));
-        let base = s.insert_node(egui::pos2(220.0, 0.0), EdNode::Op(NodeKind::Scale(220.0)));
+        let base = s.insert_node(egui::pos2(220.0, 0.0), EdNode::op(NodeKind::Scale(220.0)));
         s.connect(opin(cont), ipin(base, 0));
         let fbm = s.insert_node(
             egui::pos2(0.0, 140.0),
-            EdNode::Op(NodeKind::Fbm(FbmAxis { octaves: 5, base_freq: 1.0 / 1300.0, lacunarity: 2.0, gain: 0.5, amplitude: 1.0, seed_salt: 12 })),
+            EdNode::op(NodeKind::Fbm(FbmAxis { octaves: 5, base_freq: 1.0 / 1300.0, lacunarity: 2.0, gain: 0.5, amplitude: 1.0, seed_salt: 12 })),
         );
-        let ridge = s.insert_node(egui::pos2(220.0, 140.0), EdNode::Op(NodeKind::Ridge { ridge: 0.9, amp_sum: 2.0 }));
+        let ridge = s.insert_node(egui::pos2(220.0, 140.0), EdNode::op(NodeKind::Ridge { ridge: 0.9, amp_sum: 2.0 }));
         s.connect(opin(fbm), ipin(ridge, 0));
-        let peaks = s.insert_node(egui::pos2(440.0, 140.0), EdNode::Op(NodeKind::Scale(620.0)));
+        let peaks = s.insert_node(egui::pos2(440.0, 140.0), EdNode::op(NodeKind::Scale(620.0)));
         s.connect(opin(ridge), ipin(peaks, 0));
-        let add = s.insert_node(egui::pos2(660.0, 0.0), EdNode::Op(NodeKind::Add));
+        let add = s.insert_node(egui::pos2(660.0, 0.0), EdNode::op(NodeKind::Add));
         s.connect(opin(peaks), ipin(add, 0));
         s.connect(opin(base), ipin(add, 1));
-        let off = s.insert_node(egui::pos2(880.0, 0.0), EdNode::Op(NodeKind::Offset(80.0)));
+        let off = s.insert_node(egui::pos2(880.0, 0.0), EdNode::op(NodeKind::Offset(80.0)));
         s.connect(opin(add), ipin(off, 0));
         let o = s.insert_node(egui::pos2(1100.0, 0.0), EdNode::Output);
         s.connect(opin(off), ipin(o, 0));
@@ -249,9 +249,9 @@ pub(super) fn world_biome_snarl() -> Snarl<EdNode> {
         s.connect(opin(weird), ipin(b, 3));
     }
     // Classifier: blend plains↔mountains by a continentalness gate (low ⇒ plains, high ⇒ mountains).
-    let gate = s.insert_node(egui::pos2(340.0, 620.0), EdNode::Op(NodeKind::Smoothstep { edge0: 0.0, edge1: 0.5 }));
+    let gate = s.insert_node(egui::pos2(340.0, 620.0), EdNode::op(NodeKind::Smoothstep { edge0: 0.0, edge1: 0.5 }));
     s.connect(opin(cont), ipin(gate, 0));
-    let mix = s.insert_node(egui::pos2(700.0, 160.0), EdNode::Op(NodeKind::Mix));
+    let mix = s.insert_node(egui::pos2(700.0, 160.0), EdNode::op(NodeKind::Mix));
     s.connect(opin(bp), ipin(mix, 0)); // a = plains
     s.connect(opin(bm), ipin(mix, 1)); // b = mountains
     s.connect(opin(gate), ipin(mix, 2)); // t = gate

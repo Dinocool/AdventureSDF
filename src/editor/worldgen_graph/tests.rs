@@ -47,7 +47,7 @@ fn graph_snarl_round_trip() {
 #[test]
 fn missing_output_is_an_error() {
     let mut snarl = Snarl::new();
-    snarl.insert_node(egui::pos2(0.0, 0.0), EdNode::Op(NodeKind::Const(1.0)));
+    snarl.insert_node(egui::pos2(0.0, 0.0), EdNode::op(NodeKind::Const(1.0)));
     assert!(snarl_to_graph(&snarl).is_err());
 }
 
@@ -69,13 +69,13 @@ fn biome_inlines_to_flat_equivalent() {
     let axis = FbmAxis { octaves: 3, base_freq: 1.0 / 512.0, lacunarity: 2.0, gain: 0.5, amplitude: 100.0, seed_salt: 2 };
 
     let mut flat = Snarl::new();
-    let f = flat.insert_node(p(), EdNode::Op(NodeKind::Fbm(axis)));
+    let f = flat.insert_node(p(), EdNode::op(NodeKind::Fbm(axis)));
     let o = flat.insert_node(p(), EdNode::Output);
     flat.connect(out(f), inn(o, 0));
     let flat = snarl_to_graph(&flat).expect("flat");
 
     let mut sub = Snarl::new();
-    let sf = sub.insert_node(p(), EdNode::Op(NodeKind::Fbm(axis)));
+    let sf = sub.insert_node(p(), EdNode::op(NodeKind::Fbm(axis)));
     let so = sub.insert_node(p(), EdNode::Output);
     sub.connect(out(sf), inn(so, 0));
     let mut top = Snarl::new();
@@ -97,15 +97,15 @@ fn biome_inlines_to_flat_equivalent() {
 fn biome_climate_input_is_piped() {
     let mut sub = Snarl::new();
     let inp = sub.insert_node(p(), EdNode::Input(0)); // continentalness
-    let c5 = sub.insert_node(p(), EdNode::Op(NodeKind::Const(5.0)));
-    let add = sub.insert_node(p(), EdNode::Op(NodeKind::Add));
+    let c5 = sub.insert_node(p(), EdNode::op(NodeKind::Const(5.0)));
+    let add = sub.insert_node(p(), EdNode::op(NodeKind::Add));
     sub.connect(out(inp), inn(add, 0));
     sub.connect(out(c5), inn(add, 1));
     let so = sub.insert_node(p(), EdNode::Output);
     sub.connect(out(add), inn(so, 0));
 
     let mut top = Snarl::new();
-    let c10 = top.insert_node(p(), EdNode::Op(NodeKind::Const(10.0)));
+    let c10 = top.insert_node(p(), EdNode::op(NodeKind::Const(10.0)));
     let b = top.insert_node(p(), EdNode::Biome { name: "B".into(), graph: Box::new(sub) });
     top.connect(out(c10), inn(b, 0)); // feed continentalness pin
     let o = top.insert_node(p(), EdNode::Output);
@@ -121,14 +121,14 @@ fn biome_climate_input_is_piped() {
 fn biome_hierarchy_ron_round_trips() {
     let mut sub = Snarl::new();
     let inp = sub.insert_node(p(), EdNode::Input(0));
-    let c = sub.insert_node(p(), EdNode::Op(NodeKind::Const(3.0)));
-    let add = sub.insert_node(p(), EdNode::Op(NodeKind::Add));
+    let c = sub.insert_node(p(), EdNode::op(NodeKind::Const(3.0)));
+    let add = sub.insert_node(p(), EdNode::op(NodeKind::Add));
     sub.connect(out(inp), inn(add, 0));
     sub.connect(out(c), inn(add, 1));
     let so = sub.insert_node(p(), EdNode::Output);
     sub.connect(out(add), inn(so, 0));
     let mut top = Snarl::new();
-    let c10 = top.insert_node(p(), EdNode::Op(NodeKind::Const(10.0)));
+    let c10 = top.insert_node(p(), EdNode::op(NodeKind::Const(10.0)));
     let b = top.insert_node(p(), EdNode::Biome { name: "Hills".into(), graph: Box::new(sub) });
     top.connect(out(c10), inn(b, 0));
     let o = top.insert_node(p(), EdNode::Output);
@@ -141,6 +141,60 @@ fn biome_hierarchy_ron_round_trips() {
         assert_eq!(g1.eval(x, z, 7).v.to_bits(), g2.eval(x, z, 7).v.to_bits());
     }
     assert_eq!(g2.eval(0.0, 0.0, 7).v, 13.0); // Input(0)=10 + Const 3
+}
+
+/// A user-set node ALIAS must (a) survive a `WorldGraphDoc` RON round-trip at EVERY nav level (top +
+/// inside a biome), and (b) drive the display label as `Alias (Kind)` when set / plain `Kind` when empty.
+/// The alias is editor-only, so the compiled engine graph is unaffected (covered by the parity tests).
+#[test]
+fn node_alias_round_trips_and_labels() {
+    const FBM_AXIS: FbmAxis =
+        FbmAxis { octaves: 3, base_freq: 1.0 / 512.0, lacunarity: 2.0, gain: 0.5, amplitude: 100.0, seed_salt: 1 };
+    // Display label SSOT: empty ⇒ kind name, set ⇒ "Alias (Kind)".
+    assert_eq!(EdNode::op_label(&NodeKind::Fbm(FBM_AXIS), ""), node::node_kind_name(&NodeKind::Fbm(FBM_AXIS)));
+    assert_eq!(EdNode::op_label(&NodeKind::Fbm(FBM_AXIS), "Continentalness"), "Continentalness (Fbm)");
+
+    // Build a top graph with an aliased Op AND an aliased Op inside a biome sub-graph.
+    let mut sub = Snarl::new();
+    let sf = sub.insert_node(p(), EdNode::Op { kind: NodeKind::Add, alias: "Combine".into() });
+    let so = sub.insert_node(p(), EdNode::Output);
+    sub.connect(out(sf), inn(so, 0));
+
+    let mut top = Snarl::new();
+    let fbm = top.insert_node(p(), EdNode::Op { kind: NodeKind::Fbm(FBM_AXIS), alias: "Continentalness".into() });
+    let b = top.insert_node(p(), EdNode::Biome { name: "Hills".into(), graph: Box::new(sub) });
+    let o = top.insert_node(p(), EdNode::Output);
+    top.connect(out(fbm), inn(b, 0));
+    top.connect(out(b), inn(o, 0));
+
+    let doc = WorldGraphDoc { version: 1, snarl: top, view: EditorView::default() };
+    let s = ron::ser::to_string(&doc).expect("serialize doc");
+    let back: WorldGraphDoc = ron::de::from_str(&s).expect("deserialize doc");
+
+    // Top-level alias preserved + labelled.
+    let top_node = back.snarl.get_node(fbm).expect("fbm survives");
+    assert_eq!(ed_node_label(top_node), "Continentalness (Fbm)");
+    // Biome-level (nested) alias preserved + labelled.
+    let EdNode::Biome { graph, .. } = back.snarl.get_node(b).expect("biome survives") else {
+        panic!("expected biome");
+    };
+    let nested = graph.get_node(sf).expect("nested op survives");
+    assert_eq!(ed_node_label(nested), "Combine (Add)");
+    match nested {
+        EdNode::Op { alias, .. } => assert_eq!(alias, "Combine"),
+        _ => panic!("expected op"),
+    }
+}
+
+/// An old-format `.worldgraph.ron` (or any snarl) where an `Op` node has NO alias field must still load
+/// — `#[serde(default)]` fills an empty alias, and the display label degrades to the plain kind name.
+#[test]
+fn node_without_alias_defaults_empty() {
+    let mut top = Snarl::new();
+    let n = top.insert_node(p(), EdNode::op(NodeKind::Const(1.0)));
+    let s = ron::ser::to_string(&top).expect("ser");
+    let back: Snarl<EdNode> = ron::de::from_str(&s).expect("de");
+    assert_eq!(ed_node_label(back.get_node(n).unwrap()), "Const");
 }
 
 /// The default multi-biome world graph compiles, evaluates finite, and shows BOTH gentle (plains) and
@@ -340,7 +394,7 @@ fn valid_depth_truncates_stale_and_non_biome_paths() {
     // A path through the real biome is valid to depth 1.
     assert_eq!(valid_depth(&top, &[b]), 1);
     // A stale id (never in the snarl) resolves to depth 0.
-    let stale = top.insert_node(pos2(0.0, 0.0), EdNode::Op(NodeKind::Const(0.0)));
+    let stale = top.insert_node(pos2(0.0, 0.0), EdNode::op(NodeKind::Const(0.0)));
     assert_eq!(valid_depth(&top, &[stale]), 0, "a non-biome node isn't a navigable level");
     // A valid biome followed by a stale tail truncates after the biome.
     assert_eq!(valid_depth(&top, &[b, stale]), 1);
@@ -351,7 +405,7 @@ fn resolve_snarl_none_on_stale_or_non_biome() {
     let (mut top, b) = top_with_biome("B");
     assert!(resolve_snarl(&top, &[]).is_some(), "empty nav resolves to the root");
     assert!(resolve_snarl(&top, &[b]).is_some(), "into the biome resolves");
-    let other = top.insert_node(pos2(0.0, 0.0), EdNode::Op(NodeKind::Const(0.0)));
+    let other = top.insert_node(pos2(0.0, 0.0), EdNode::op(NodeKind::Const(0.0)));
     assert!(resolve_snarl(&top, &[other]).is_none(), "non-biome node → None");
     assert!(resolve_snarl(&top, &[b, other]).is_none(), "stale tail → None");
 }
@@ -374,12 +428,12 @@ fn breadcrumb_names_reflects_rename() {
 /// A small chain `Const → Scale → Output` plus a stray `WorldX`, to exercise depth columns.
 fn chain_snarl() -> Snarl<EdNode> {
     let mut s = Snarl::new();
-    let c = s.insert_node(pos2(0.0, 0.0), EdNode::Op(NodeKind::Const(1.0)));
-    let sc = s.insert_node(pos2(0.0, 0.0), EdNode::Op(NodeKind::Scale(2.0)));
+    let c = s.insert_node(pos2(0.0, 0.0), EdNode::op(NodeKind::Const(1.0)));
+    let sc = s.insert_node(pos2(0.0, 0.0), EdNode::op(NodeKind::Scale(2.0)));
     s.connect(out(c), inn(sc, 0));
     let o = s.insert_node(pos2(0.0, 0.0), EdNode::Output);
     s.connect(out(sc), inn(o, 0));
-    s.insert_node(pos2(0.0, 0.0), EdNode::Op(NodeKind::WorldX)); // a leaf at depth 0
+    s.insert_node(pos2(0.0, 0.0), EdNode::op(NodeKind::WorldX)); // a leaf at depth 0
     s
 }
 
@@ -422,8 +476,8 @@ fn auto_arrange_tolerates_a_cycle() {
     // A 2-node cycle (A→B→A) must not hang the depth recursion (the cycle guard returns 0).
     let body = std::collections::HashMap::new();
     let mut s = Snarl::new();
-    let a = s.insert_node(pos2(0.0, 0.0), EdNode::Op(NodeKind::Abs));
-    let b = s.insert_node(pos2(0.0, 0.0), EdNode::Op(NodeKind::Neg));
+    let a = s.insert_node(pos2(0.0, 0.0), EdNode::op(NodeKind::Abs));
+    let b = s.insert_node(pos2(0.0, 0.0), EdNode::op(NodeKind::Neg));
     s.connect(out(a), inn(b, 0));
     s.connect(out(b), inn(a, 0));
     auto_arrange(&mut s, &body); // must return (no infinite loop)
@@ -438,8 +492,8 @@ fn auto_arrange_tolerates_a_cycle() {
 fn copy_paste_reproduces_nodes_and_internal_wire() {
     // Source: Const → Scale (an internal wire), plus an Output we DON'T select (its wire must drop).
     let mut src = Snarl::new();
-    let c = src.insert_node(pos2(10.0, 20.0), EdNode::Op(NodeKind::Const(1.0)));
-    let sc = src.insert_node(pos2(230.0, 20.0), EdNode::Op(NodeKind::Scale(2.0)));
+    let c = src.insert_node(pos2(10.0, 20.0), EdNode::op(NodeKind::Const(1.0)));
+    let sc = src.insert_node(pos2(230.0, 20.0), EdNode::op(NodeKind::Scale(2.0)));
     src.connect(out(c), inn(sc, 0));
     let o = src.insert_node(pos2(450.0, 20.0), EdNode::Output);
     src.connect(out(sc), inn(o, 0));
@@ -456,8 +510,8 @@ fn copy_paste_reproduces_nodes_and_internal_wire() {
     let ids = paste_clipboard(&mut dst, &clip, egui::vec2(24.0, 24.0));
     assert_eq!(ids.len(), 2);
     // Two nodes of the right kinds appear.
-    assert!(matches!(dst.get_node(ids[0]), Some(EdNode::Op(NodeKind::Const(_)))));
-    assert!(matches!(dst.get_node(ids[1]), Some(EdNode::Op(NodeKind::Scale(_)))));
+    assert!(matches!(dst.get_node(ids[0]), Some(EdNode::Op { kind: NodeKind::Const(_), .. })));
+    assert!(matches!(dst.get_node(ids[1]), Some(EdNode::Op { kind: NodeKind::Scale(_), .. })));
     // Positions are offset from the originals.
     assert_eq!(dst.get_node_info(ids[0]).unwrap().pos, pos2(34.0, 44.0));
     // The internal wire was reproduced: exactly Const.out0 → Scale.in0.
@@ -471,7 +525,7 @@ fn copy_paste_reproduces_nodes_and_internal_wire() {
 #[test]
 fn gpu_inline_key_is_stable_and_non_colliding() {
     let mut s = Snarl::new();
-    let n = s.insert_node(pos2(0.0, 0.0), EdNode::Op(NodeKind::Const(0.0)));
+    let n = s.insert_node(pos2(0.0, 0.0), EdNode::op(NodeKind::Const(0.0)));
     // Stable for the same (salt, node).
     assert_eq!(gpu_inline_key(42, n), gpu_inline_key(42, n));
     // The top bit is set on every inline key.
@@ -507,7 +561,7 @@ fn output_root_distinguishes_duplicate_and_unwired() {
 
     // No Output at all → yet another distinct error.
     let mut none = Snarl::new();
-    none.insert_node(p(), EdNode::Op(NodeKind::Const(0.0)));
+    none.insert_node(p(), EdNode::op(NodeKind::Const(0.0)));
     let e = output_root(&none).expect_err("missing Output is an error");
     assert!(e.contains("no Output node"), "got: {e}");
 }
@@ -615,7 +669,7 @@ fn apply_view_folds_legacy_single_panel_into_pool() {
 #[test]
 fn apply_view_clamps_stale_nav_without_panicking() {
     let mut snarl = Snarl::new();
-    let lone = snarl.insert_node(p(), EdNode::Op(NodeKind::Const(0.0)));
+    let lone = snarl.insert_node(p(), EdNode::op(NodeKind::Const(0.0)));
     let mut editor = WorldGraphEditor { snarl, ..Default::default() };
     let mut panels = WorldgenPreviewPanels::default();
 

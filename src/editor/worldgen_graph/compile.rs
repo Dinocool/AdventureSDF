@@ -116,7 +116,7 @@ impl<'a> CompileCtx<'a> {
 
     fn compile_node_inner(&mut self, id: NodeId) -> Result<u32, String> {
         match self.snarl.get_node(id) {
-            Some(EdNode::Op(kind)) => {
+            Some(EdNode::Op { kind, .. }) => {
                 let kind = *kind;
                 let mut inputs = [0u32; 3];
                 for (slot, inp) in inputs.iter_mut().enumerate().take(kind.arity()) {
