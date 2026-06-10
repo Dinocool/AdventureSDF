@@ -107,7 +107,7 @@ pub(super) fn input_label(node: &EdNode, slot: usize) -> &'static str {
         EdNode::Output => "height",
         EdNode::Input(_) => "",
         EdNode::Biome { .. } => climate_name(slot),
-        EdNode::Op(k) => match k {
+        EdNode::Op { kind: k, .. } => match k {
             NodeKind::Add | NodeKind::Sub | NodeKind::Mul | NodeKind::Min | NodeKind::Max => {
                 if slot == 0 { "a" } else { "b" }
             }

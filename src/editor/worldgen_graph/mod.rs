@@ -72,7 +72,7 @@ pub(crate) fn preview_tab_title(world: &World, id: u64) -> String {
 /// A node's plain (icon-free) display label, for tab titles.
 fn ed_node_label(n: &EdNode) -> String {
     match n {
-        EdNode::Op(k) => node::node_kind_name(k).to_string(),
+        EdNode::Op { kind, alias } => EdNode::op_label(kind, alias),
         EdNode::Biome { name, .. } => name.clone(),
         EdNode::Input(k) => climate_name(*k).to_string(),
         EdNode::Output => "Output".to_string(),
@@ -93,7 +93,14 @@ pub const CLIMATE_INPUTS: [&str; 4] = ["continentalness", "temperature", "humidi
 /// parent edges feeding them; one height out), so the engine, determinism, and parity are unchanged.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub enum EdNode {
-    Op(NodeKind),
+    /// An engine [`NodeKind`] op. `alias` is an editor-only, user-renamable display name that travels
+    /// with the node through serde at every nav level; empty ⇒ show just the kind name. The compile path
+    /// ignores it (the engine [`Graph`] is unchanged), so it's purely cosmetic.
+    Op {
+        kind: NodeKind,
+        #[serde(default)]
+        alias: String,
+    },
     /// A biome group node: climate inputs in ([`CLIMATE_INPUTS`]), one height out; its `graph` is the
     /// biome's terrain shape, inlined at compile.
     Biome { name: String, graph: Box<Snarl<EdNode>> },
@@ -101,6 +108,23 @@ pub enum EdNode {
     Input(usize),
     /// The single graph OUTPUT sink (1 input, 0 outputs) — its input is the terrain height.
     Output,
+}
+
+impl EdNode {
+    /// Construct an `Op` node with no alias (the common case). The alias is set later by the rename UI.
+    pub(super) fn op(kind: NodeKind) -> Self {
+        Self::Op { kind, alias: String::new() }
+    }
+
+    /// The alias-aware display label for an `Op` node's kind: `Alias (Kind)` when an alias is set, else
+    /// just `Kind`. Single source of truth shared by `Viewer::title` and `ed_node_label` (tab titles).
+    pub(super) fn op_label(kind: &NodeKind, alias: &str) -> String {
+        if alias.is_empty() {
+            node::node_kind_name(kind).to_string()
+        } else {
+            format!("{alias} ({})", node::node_kind_name(kind))
+        }
+    }
 }
 
 /// One clipboard entry: a copied node's kind + canvas position + the internal wires (among the copied

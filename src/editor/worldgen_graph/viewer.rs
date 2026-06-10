@@ -38,7 +38,7 @@ impl SnarlViewer<EdNode> for Viewer<'_> {
     fn title(&mut self, node: &EdNode) -> String {
         match node {
             EdNode::Output => "Output".into(),
-            EdNode::Op(k) => node_kind_name(k).into(),
+            EdNode::Op { kind, alias } => EdNode::op_label(kind, alias),
             EdNode::Biome { name, .. } => format!("{} {name}", icon::PLANT),
             EdNode::Input(k) => format!("{} {}", icon::ARROW_ELBOW_DOWN_RIGHT, climate_name(*k)),
         }
@@ -47,7 +47,7 @@ impl SnarlViewer<EdNode> for Viewer<'_> {
     fn inputs(&mut self, node: &EdNode) -> usize {
         match node {
             EdNode::Output => 1,
-            EdNode::Op(k) => k.arity(),
+            EdNode::Op { kind, .. } => kind.arity(),
             EdNode::Biome { .. } => CLIMATE_INPUTS.len(),
             EdNode::Input(_) => 0,
         }
@@ -56,13 +56,13 @@ impl SnarlViewer<EdNode> for Viewer<'_> {
     fn outputs(&mut self, node: &EdNode) -> usize {
         match node {
             EdNode::Output => 0,
-            EdNode::Op(_) | EdNode::Biome { .. } | EdNode::Input(_) => 1,
+            EdNode::Op { .. } | EdNode::Biome { .. } | EdNode::Input(_) => 1,
         }
     }
 
     // Op + Biome nodes get a body (preview / biome controls); Input + Output don't.
     fn has_body(&mut self, node: &EdNode) -> bool {
-        matches!(node, EdNode::Op(_) | EdNode::Biome { .. })
+        matches!(node, EdNode::Op { .. } | EdNode::Biome { .. })
     }
 
     /// Header: the node title + (for nodes that own a preview — Op/Biome) an **eye checkbox** that
@@ -70,7 +70,7 @@ impl SnarlViewer<EdNode> for Viewer<'_> {
     /// its params — no body divider, no empty space (unlike an in-body collapse button).
     fn show_header(&mut self, node: NodeId, _inputs: &[InPin], _outputs: &[OutPin], ui: &mut egui::Ui, snarl: &mut Snarl<EdNode>) {
         let title = self.title(&snarl[node]);
-        let has_preview = matches!(snarl.get_node(node), Some(EdNode::Op(_) | EdNode::Biome { .. }));
+        let has_preview = matches!(snarl.get_node(node), Some(EdNode::Op { .. } | EdNode::Biome { .. }));
         // Right-align the eye to the node's right edge. This is safe ONLY because the body is now strictly
         // CONTENT-sized, so `body_size.x` is stable — span the header to it and the eye sits at the right.
         // (When the body had a full-width widget, `body_size.x` tracked `available_width` and this fed back
@@ -108,7 +108,17 @@ impl SnarlViewer<EdNode> for Viewer<'_> {
         ui.vertical(|ui| {
             // Node params / biome header at the top.
             match &mut snarl[node] {
-                EdNode::Op(kind) => node_params_ui(ui, kind),
+                EdNode::Op { kind, alias } => {
+                    // A user-renamable ALIAS, shown in the title as `Alias (Kind)`. FIXED width (never
+                    // fill/available_width) so the body stays content-sized — a full-width widget here
+                    // reintroduces the rightward-growth runaway (see `tests::node_width_does_not_run_away`).
+                    ui.add(
+                        egui::TextEdit::singleline(alias)
+                            .desired_width(120.0)
+                            .hint_text(node_kind_name(kind)),
+                    );
+                    node_params_ui(ui, kind);
+                }
                 EdNode::Biome { name, .. } => {
                     ui.add(egui::TextEdit::singleline(name).desired_width(120.0).hint_text("biome name"));
                 }
@@ -244,7 +254,7 @@ impl SnarlViewer<EdNode> for Viewer<'_> {
         ui.label("Add node");
         for kind in node_catalog() {
             if ui.button(node_kind_name(&kind)).clicked() {
-                self.signals.added.push(snarl.insert_node(pos, EdNode::Op(kind)));
+                self.signals.added.push(snarl.insert_node(pos, EdNode::op(kind)));
                 ui.close();
             }
         }
@@ -326,7 +336,7 @@ mod tests {
         // An Fbm source node (arity 0) — `graph_rooted_at` compiles it directly, so the preview path runs.
         let node = snarl.insert_node(
             egui::pos2(0.0, 0.0),
-            EdNode::Op(NodeKind::Fbm(FbmAxis { octaves: 3, base_freq: 1.0 / 512.0, lacunarity: 2.0, gain: 0.5, amplitude: 100.0, seed_salt: 1 })),
+            EdNode::op(NodeKind::Fbm(FbmAxis { octaves: 3, base_freq: 1.0 / 512.0, lacunarity: 2.0, gain: 0.5, amplitude: 100.0, seed_salt: 1 })),
         );
         let widths = node_frame_widths(&mut snarl, node, 24);
         assert!(widths.len() >= 4, "node frame never rendered: {widths:?}");

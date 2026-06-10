@@ -3,14 +3,17 @@
     snarl: (
         nodes: {
             0: (
-                value: Op(Fbm((
-                    octaves: 2,
-                    base_freq: 0.000125,
-                    lacunarity: 2.0,
-                    gain: 0.5,
-                    amplitude: 1.0,
-                    seed_salt: 5,
-                ))),
+                value: Op(
+                    kind: Fbm((
+                        octaves: 2,
+                        base_freq: 0.000125,
+                        lacunarity: 2.0,
+                        gain: 0.5,
+                        amplitude: 1.0,
+                        seed_salt: 5,
+                    )),
+                    alias: "",
+                ),
                 pos: (
                     x: 0.0,
                     y: 0.0,
@@ -18,14 +21,17 @@
                 open: true,
             ),
             1: (
-                value: Op(Fbm((
-                    octaves: 2,
-                    base_freq: 0.00014285714285714287,
-                    lacunarity: 2.0,
-                    gain: 0.5,
-                    amplitude: 1.0,
-                    seed_salt: 6,
-                ))),
+                value: Op(
+                    kind: Fbm((
+                        octaves: 2,
+                        base_freq: 0.00014285714285714287,
+                        lacunarity: 2.0,
+                        gain: 0.5,
+                        amplitude: 1.0,
+                        seed_salt: 6,
+                    )),
+                    alias: "",
+                ),
                 pos: (
                     x: 0.0,
                     y: 150.0,
@@ -33,14 +39,17 @@
                 open: true,
             ),
             2: (
-                value: Op(Fbm((
-                    octaves: 2,
-                    base_freq: 0.00015384615384615385,
-                    lacunarity: 2.0,
-                    gain: 0.5,
-                    amplitude: 1.0,
-                    seed_salt: 7,
-                ))),
+                value: Op(
+                    kind: Fbm((
+                        octaves: 2,
+                        base_freq: 0.00015384615384615385,
+                        lacunarity: 2.0,
+                        gain: 0.5,
+                        amplitude: 1.0,
+                        seed_salt: 7,
+                    )),
+                    alias: "",
+                ),
                 pos: (
                     x: 0.0,
                     y: 300.0,
@@ -48,14 +57,17 @@
                 open: true,
             ),
             3: (
-                value: Op(Fbm((
-                    octaves: 2,
-                    base_freq: 0.0002,
-                    lacunarity: 2.0,
-                    gain: 0.5,
-                    amplitude: 1.0,
-                    seed_salt: 8,
-                ))),
+                value: Op(
+                    kind: Fbm((
+                        octaves: 2,
+                        base_freq: 0.0002,
+                        lacunarity: 2.0,
+                        gain: 0.5,
+                        amplitude: 1.0,
+                        seed_salt: 8,
+                    )),
+                    alias: "",
+                ),
                 pos: (
                     x: 0.0,
                     y: 450.0,
@@ -76,7 +88,10 @@
                                 open: true,
                             ),
                             1: (
-                                value: Op(Scale(25.0)),
+                                value: Op(
+                                    kind: Scale(25.0),
+                                    alias: "",
+                                ),
                                 pos: (
                                     x: 220.0,
                                     y: 0.0,
@@ -84,14 +99,17 @@
                                 open: true,
                             ),
                             2: (
-                                value: Op(Fbm((
-                                    octaves: 4,
-                                    base_freq: 0.002,
-                                    lacunarity: 2.0,
-                                    gain: 0.5,
-                                    amplitude: 30.0,
-                                    seed_salt: 11,
-                                ))),
+                                value: Op(
+                                    kind: Fbm((
+                                        octaves: 4,
+                                        base_freq: 0.002,
+                                        lacunarity: 2.0,
+                                        gain: 0.5,
+                                        amplitude: 30.0,
+                                        seed_salt: 11,
+                                    )),
+                                    alias: "",
+                                ),
                                 pos: (
                                     x: 0.0,
                                     y: 140.0,
@@ -99,7 +117,10 @@
                                 open: true,
                             ),
                             3: (
-                                value: Op(Add),
+                                value: Op(
+                                    kind: Add,
+                                    alias: "",
+                                ),
                                 pos: (
                                     x: 440.0,
                                     y: 0.0,
@@ -118,21 +139,11 @@
                         wires: [
                             (
                                 out_pin: (
-                                    node: 1,
+                                    node: 2,
                                     output: 0,
                                 ),
                                 in_pin: (
                                     node: 3,
-                                    input: 1,
-                                ),
-                            ),
-                            (
-                                out_pin: (
-                                    node: 3,
-                                    output: 0,
-                                ),
-                                in_pin: (
-                                    node: 4,
                                     input: 0,
                                 ),
                             ),
@@ -148,11 +159,21 @@
                             ),
                             (
                                 out_pin: (
-                                    node: 2,
+                                    node: 1,
                                     output: 0,
                                 ),
                                 in_pin: (
                                     node: 3,
+                                    input: 1,
+                                ),
+                            ),
+                            (
+                                out_pin: (
+                                    node: 3,
+                                    output: 0,
+                                ),
+                                in_pin: (
+                                    node: 4,
                                     input: 0,
                                 ),
                             ),
@@ -179,7 +200,10 @@
                                 open: true,
                             ),
                             1: (
-                                value: Op(Scale(220.0)),
+                                value: Op(
+                                    kind: Scale(220.0),
+                                    alias: "",
+                                ),
                                 pos: (
                                     x: 220.0,
                                     y: 0.0,
@@ -187,14 +211,17 @@
                                 open: true,
                             ),
                             2: (
-                                value: Op(Fbm((
-                                    octaves: 5,
-                                    base_freq: 0.0007692307692307692,
-                                    lacunarity: 2.0,
-                                    gain: 0.5,
-                                    amplitude: 1.0,
-                                    seed_salt: 12,
-                                ))),
+                                value: Op(
+                                    kind: Fbm((
+                                        octaves: 5,
+                                        base_freq: 0.0007692307692307692,
+                                        lacunarity: 2.0,
+                                        gain: 0.5,
+                                        amplitude: 1.0,
+                                        seed_salt: 12,
+                                    )),
+                                    alias: "",
+                                ),
                                 pos: (
                                     x: 0.0,
                                     y: 140.0,
@@ -202,10 +229,13 @@
                                 open: true,
                             ),
                             3: (
-                                value: Op(Ridge(
-                                    ridge: 0.9,
-                                    amp_sum: 2.0,
-                                )),
+                                value: Op(
+                                    kind: Ridge(
+                                        ridge: 0.9,
+                                        amp_sum: 2.0,
+                                    ),
+                                    alias: "",
+                                ),
                                 pos: (
                                     x: 220.0,
                                     y: 140.0,
@@ -213,7 +243,10 @@
                                 open: true,
                             ),
                             4: (
-                                value: Op(Scale(620.0)),
+                                value: Op(
+                                    kind: Scale(620.0),
+                                    alias: "",
+                                ),
                                 pos: (
                                     x: 440.0,
                                     y: 140.0,
@@ -221,7 +254,10 @@
                                 open: true,
                             ),
                             5: (
-                                value: Op(Add),
+                                value: Op(
+                                    kind: Add,
+                                    alias: "",
+                                ),
                                 pos: (
                                     x: 660.0,
                                     y: 0.0,
@@ -229,7 +265,10 @@
                                 open: true,
                             ),
                             6: (
-                                value: Op(Offset(80.0)),
+                                value: Op(
+                                    kind: Offset(80.0),
+                                    alias: "",
+                                ),
                                 pos: (
                                     x: 880.0,
                                     y: 0.0,
@@ -246,26 +285,6 @@
                             ),
                         },
                         wires: [
-                            (
-                                out_pin: (
-                                    node: 0,
-                                    output: 0,
-                                ),
-                                in_pin: (
-                                    node: 1,
-                                    input: 0,
-                                ),
-                            ),
-                            (
-                                out_pin: (
-                                    node: 2,
-                                    output: 0,
-                                ),
-                                in_pin: (
-                                    node: 3,
-                                    input: 0,
-                                ),
-                            ),
                             (
                                 out_pin: (
                                     node: 4,
@@ -298,22 +317,42 @@
                             ),
                             (
                                 out_pin: (
-                                    node: 3,
-                                    output: 0,
-                                ),
-                                in_pin: (
-                                    node: 4,
-                                    input: 0,
-                                ),
-                            ),
-                            (
-                                out_pin: (
                                     node: 1,
                                     output: 0,
                                 ),
                                 in_pin: (
                                     node: 5,
                                     input: 1,
+                                ),
+                            ),
+                            (
+                                out_pin: (
+                                    node: 0,
+                                    output: 0,
+                                ),
+                                in_pin: (
+                                    node: 1,
+                                    input: 0,
+                                ),
+                            ),
+                            (
+                                out_pin: (
+                                    node: 2,
+                                    output: 0,
+                                ),
+                                in_pin: (
+                                    node: 3,
+                                    input: 0,
+                                ),
+                            ),
+                            (
+                                out_pin: (
+                                    node: 3,
+                                    output: 0,
+                                ),
+                                in_pin: (
+                                    node: 4,
+                                    input: 0,
                                 ),
                             ),
                         ],
@@ -326,10 +365,13 @@
                 open: true,
             ),
             6: (
-                value: Op(Smoothstep(
-                    edge0: 0.0,
-                    edge1: 0.5,
-                )),
+                value: Op(
+                    kind: Smoothstep(
+                        edge0: 0.0,
+                        edge1: 0.5,
+                    ),
+                    alias: "",
+                ),
                 pos: (
                     x: 340.0,
                     y: 620.0,
@@ -337,7 +379,10 @@
                 open: true,
             ),
             7: (
-                value: Op(Mix),
+                value: Op(
+                    kind: Mix,
+                    alias: "",
+                ),
                 pos: (
                     x: 700.0,
                     y: 160.0,
@@ -360,7 +405,7 @@
                     output: 0,
                 ),
                 in_pin: (
-                    node: 4,
+                    node: 5,
                     input: 2,
                 ),
             ),
@@ -370,58 +415,8 @@
                     output: 0,
                 ),
                 in_pin: (
-                    node: 5,
-                    input: 0,
-                ),
-            ),
-            (
-                out_pin: (
-                    node: 6,
-                    output: 0,
-                ),
-                in_pin: (
-                    node: 7,
-                    input: 2,
-                ),
-            ),
-            (
-                out_pin: (
-                    node: 3,
-                    output: 0,
-                ),
-                in_pin: (
-                    node: 5,
-                    input: 3,
-                ),
-            ),
-            (
-                out_pin: (
-                    node: 5,
-                    output: 0,
-                ),
-                in_pin: (
-                    node: 7,
-                    input: 1,
-                ),
-            ),
-            (
-                out_pin: (
-                    node: 3,
-                    output: 0,
-                ),
-                in_pin: (
                     node: 4,
-                    input: 3,
-                ),
-            ),
-            (
-                out_pin: (
-                    node: 1,
-                    output: 0,
-                ),
-                in_pin: (
-                    node: 5,
-                    input: 1,
+                    input: 0,
                 ),
             ),
             (
@@ -430,28 +425,8 @@
                     output: 0,
                 ),
                 in_pin: (
-                    node: 5,
-                    input: 2,
-                ),
-            ),
-            (
-                out_pin: (
-                    node: 0,
-                    output: 0,
-                ),
-                in_pin: (
-                    node: 6,
-                    input: 0,
-                ),
-            ),
-            (
-                out_pin: (
                     node: 4,
-                    output: 0,
-                ),
-                in_pin: (
-                    node: 7,
-                    input: 0,
+                    input: 2,
                 ),
             ),
             (
@@ -466,12 +441,12 @@
             ),
             (
                 out_pin: (
-                    node: 0,
+                    node: 1,
                     output: 0,
                 ),
                 in_pin: (
-                    node: 4,
-                    input: 0,
+                    node: 5,
+                    input: 1,
                 ),
             ),
             (
@@ -484,12 +459,82 @@
                     input: 1,
                 ),
             ),
+            (
+                out_pin: (
+                    node: 0,
+                    output: 0,
+                ),
+                in_pin: (
+                    node: 5,
+                    input: 0,
+                ),
+            ),
+            (
+                out_pin: (
+                    node: 3,
+                    output: 0,
+                ),
+                in_pin: (
+                    node: 5,
+                    input: 3,
+                ),
+            ),
+            (
+                out_pin: (
+                    node: 4,
+                    output: 0,
+                ),
+                in_pin: (
+                    node: 7,
+                    input: 0,
+                ),
+            ),
+            (
+                out_pin: (
+                    node: 5,
+                    output: 0,
+                ),
+                in_pin: (
+                    node: 7,
+                    input: 1,
+                ),
+            ),
+            (
+                out_pin: (
+                    node: 6,
+                    output: 0,
+                ),
+                in_pin: (
+                    node: 7,
+                    input: 2,
+                ),
+            ),
+            (
+                out_pin: (
+                    node: 0,
+                    output: 0,
+                ),
+                in_pin: (
+                    node: 6,
+                    input: 0,
+                ),
+            ),
+            (
+                out_pin: (
+                    node: 3,
+                    output: 0,
+                ),
+                in_pin: (
+                    node: 4,
+                    input: 3,
+                ),
+            ),
         ],
     ),
     view: (
         nodes: {},
         nav: [],
-        panel: None,
+        panels: [],
         popped: [],
     ),
 )
