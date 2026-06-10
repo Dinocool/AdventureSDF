@@ -18,8 +18,11 @@ struct PreviewParams {
 @group(#{MATERIAL_BIND_GROUP}) @binding(1) var height_tex: texture_2d<f32>;
 
 // Manual bilinear fetch (textureLoad needs no filterable format → portable for Rgba32Float).
+// Baked heightfield texture resolution — MUST match HEIGHTFIELD_RES in worldgen_gpu_preview.rs.
+const HF_TEX_RES: f32 = 256.0;
+
 fn sample_hf(uv: vec2<f32>) -> vec4<f32> {
-    let res = params.levels.w;
+    let res = HF_TEX_RES;
     let p = clamp(uv, vec2<f32>(0.0), vec2<f32>(1.0)) * (res - 1.0);
     let i0 = floor(p);
     let f = p - i0;
@@ -95,8 +98,9 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
     let ndcx = in.uv.x * 2.0 - 1.0;
     let ndcy = 1.0 - in.uv.y * 2.0; // uv.y grows downward → flip so +y is up
     let tan = params.eye.w;
+    let aspect = params.levels.w; // width/height — widen the horizontal fov so a non-square panel fills
     let eye = params.eye.xyz;
-    let dir = normalize(params.fwd.xyz + params.right.xyz * (ndcx * tan) + params.up.xyz * (ndcy * tan));
+    let dir = normalize(params.fwd.xyz + params.right.xyz * (ndcx * tan * aspect) + params.up.xyz * (ndcy * tan));
 
     let half = params.fwd.w;
     let ymin = params.right.w;
