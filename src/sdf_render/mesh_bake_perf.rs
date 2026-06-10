@@ -538,3 +538,98 @@ fn write_json(
         eprintln!("MESH-BAKE-PERF: wrote .soul/mesh_bake_perf.json");
     }
 }
+
+/// REGRESSION (the FAR-camera "Apply" panic): the SYNCHRONOUS narrow-band cull `chunk_has_surface` — run
+/// inside `mesh_resident_chunks`' REQUEST loop — must sample the ROUND's FROZEN clipmap snapshot (the SAME
+/// one whose coverage gate admitted the chunk), NOT the live process-global `cpu_height_clipmap()`.
+///
+/// THE BUG: a bake round freezes its residency + `round.clipmap` together (mutually consistent — the gate
+/// admitted the residency against that very clipmap). But `chunk_has_surface` installed NO `BAKE_TERRAIN`
+/// snapshot, so `terrain_sdf` fell through to the GLOBAL. When `roll_worldgen` rebuilt/rolled that global
+/// to DIFFERENT (sparser) coverage after the round froze — clicking "Apply" republishes the graph →
+/// `set_graph` evicts residency → the rebuilt clipmap transiently has its COARSE tiers empty/un-restreamed,
+/// or a camera roll/`lod_count` rebuild drops a tier — a far, coarse chunk the gate had admitted (against
+/// the full frozen clipmap) tripped the strict `sample_clipmap_lod` panic in the cull (against the now-
+/// uncovered live global). That is the reported panic at `upload.rs:490` inside `mesh_resident_chunks`.
+///
+/// THE FIX installs the round's frozen snapshot for the whole REQUEST loop, so gate + sync cull + async
+/// bake share ONE clipmap SSOT and a gate-admitted chunk can NEVER sample uncovered ground.
+///
+/// This test forges that exact desync WITHOUT an App: a fully-settled clipmap (`frozen`) covers a far,
+/// coarse chunk via a coarse tier; the live global is that clipmap with its covering coarse tiers DROPPED
+/// (the post-"Apply" transient where coarse tiers haven't re-streamed). With the frozen snapshot installed,
+/// the cull resolves cleanly; with only the truncated global (the OLD behaviour), the same cull panics in
+/// the strict sampler — proving the discrepancy is real and that the frozen-snapshot SSOT closes it.
+#[test]
+fn sync_cull_uses_frozen_clipmap_not_rolled_global() {
+    use crate::sdf_render::worldgen::upload::{
+        clipmap_covers_aabb, cpu_terrain_offset, set_bake_terrain,
+    };
+
+    let config = SdfGridConfig::default();
+    let mesh_cfg = MeshBakeConfig::default();
+    let k = mesh_cfg.chunk_bricks.clamp(1, 8);
+    let edits = vec![terrain_edit()];
+    let idx = vec![0u32]; // the single Terrain edit overlaps every chunk
+
+    // The round's FROZEN snapshot: a fully-settled clipmap around the origin (all tiers present).
+    let frozen = build_and_publish_clipmap(&config, &mesh_cfg, DVec2::ZERO);
+
+    // A far, coarse chunk like the production panic (`world_xz≈(-17203,-2867)`, a coarse tier). Build its
+    // gate footprint (chunk AABB ± the gate margin) and find the FINEST clipmap tier that covers it.
+    let far_xz = Vec2::new(-17203.0, -2867.0);
+    // Choose a coarse LOD whose chunk world-size is comparable to the panic's voxel_size·subdivisions.
+    let lod = (effective_lod_count(&config, &mesh_cfg, true) - 1).min(7);
+    let stride = k as i32 * config.cell_stride();
+    let cw = k as f32 * config.brick_world_size(lod);
+    let jx = (far_xz.x / cw).floor() as i32;
+    let jz = (far_xz.y / cw).floor() as i32;
+    let victim = BrickKey::new(lod, IVec3::new(jx, 0, jz) * stride);
+    let vs = config.voxel_size_at(lod);
+    let b = chunk_aabb(victim, &config, k);
+    let m = Vec2::splat(vs + 2.0 * HEIGHT_CHUNK_CELLS as f32); // mirror of `terrain_chunk_covered`
+    let cmin = Vec2::new(b.min.x, b.min.z) - m;
+    let cmax = Vec2::new(b.max.x, b.max.z) + m;
+
+    // The full frozen clipmap must cover the far footprint (some coarse tier reaches it) — that's WHY the
+    // gate admitted the chunk into the round.
+    assert!(
+        clipmap_covers_aabb(&frozen, cmin, cmax),
+        "the fully-settled frozen clipmap must cover the far chunk (the gate admitted it on this basis)"
+    );
+    // Find the finest covering tier, then forge a "rolled global" = the frozen clipmap with EVERY tier from
+    // that one up DROPPED (the post-Apply transient: coarse tiers evicted / not yet re-streamed). The far
+    // footprint is then UNCOVERED by the global but still covered by the full frozen snapshot.
+    let cover_tier = frozen
+        .iter()
+        .position(|r| {
+            crate::sdf_render::worldgen::upload::ring_covers_aabb(r, cmin, cmax)
+        })
+        .expect("a covering tier exists (asserted above)");
+    let rolled_global: Arc<HeightClipmap> = Arc::new(frozen[..cover_tier].to_vec());
+    assert!(
+        !clipmap_covers_aabb(&rolled_global, cmin, cmax),
+        "the rolled global (covering coarse tiers dropped) must NOT cover the far chunk — the desync"
+    );
+
+    // Publish the rolled (uncovered-far) global as the live process-global (what Apply left behind).
+    set_cpu_height_clipmap(Some(rolled_global.clone()));
+
+    // WITH the frozen snapshot installed (the FIX): the sync cull samples `frozen` → resolves, no panic.
+    {
+        let _g = set_bake_terrain(Some(frozen.clone()), cpu_terrain_offset());
+        let _ = chunk_has_surface(&edits, &idx, &config, k, victim, vs); // must not panic
+    }
+
+    // WITHOUT the snapshot (the OLD behaviour): the sync cull reads the rolled global → strict panic. Catch
+    // it to prove the discrepancy is real (and to leave no installed snapshot behind for sibling tests).
+    let bug = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = chunk_has_surface(&edits, &idx, &config, k, victim, vs);
+    }));
+    assert!(
+        bug.is_err(),
+        "expected the rolled-global cull to panic on the uncovered far chunk (the bug the frozen snapshot fixes)"
+    );
+
+    set_cpu_height_clipmap(None); // clean up the global for sibling tests
+}
