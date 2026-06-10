@@ -8,35 +8,25 @@ use egui_snarl::{InPin, NodeId, OutPin, Snarl};
 
 use crate::editor::worldgen_gpu_preview::GpuPreviewRequest;
 
+use super::convert::new_biome_subgraph;
 use super::node::{input_label, node_catalog, node_kind_name, node_params_ui};
 use super::preview::{
     CAM_DEFAULT, DEFAULT_PREVIEW_PX, PREVIEW_HALF_M, gpu_inline_key, handle_preview_gestures, preview_image,
 };
-use super::convert::new_biome_subgraph;
-use super::{CLIMATE_INPUTS, EdNode, climate_name, graph_rooted_at};
+use super::{CLIMATE_INPUTS, EdNode, NodeCaches, ViewerSignals, climate_name, graph_rooted_at};
 
 /// The Snarl UI viewer. Borrows the editor's per-node preview caches for the frame so each node can
 /// draw a (default-on, collapsible, resizable, zoomable) 2D heatmap of its sub-graph (see
 /// [`Viewer::show_body`]).
 pub(super) struct Viewer<'a> {
-    pub(super) collapsed: &'a mut std::collections::HashSet<NodeId>,
-    pub(super) zoom_half_m: &'a mut std::collections::HashMap<NodeId, f64>,
-    pub(super) surface: &'a mut std::collections::HashSet<NodeId>,
-    pub(super) cam: &'a mut std::collections::HashMap<NodeId, (f32, f32)>,
-    pub(super) body_size: &'a mut std::collections::HashMap<NodeId, egui::Vec2>,
-    pub(super) disp_px: &'a mut std::collections::HashMap<NodeId, f32>,
-    /// Set to a biome node id when the user clicks its "Open" — the panel descends after the show.
-    pub(super) enter: &'a mut Option<NodeId>,
-    /// Set to a node id when the user clicks its pop-out button — the panel opens a window after the show.
-    pub(super) pop_request: &'a mut Option<NodeId>,
-    /// Set to a node id when the user clicks "→ panel" — retargets the dockable preview panel.
-    pub(super) to_panel: &'a mut Option<NodeId>,
+    /// The per-node UI caches (collapsed/zoom/surface/cam/body_size/disp_px/pan).
+    pub(super) caches: &'a mut NodeCaches,
+    /// One-shot Viewer→panel signals (Open / pop-out / → panel), raised here, drained by the panel.
+    pub(super) signals: &'a mut ViewerSignals,
     /// Last frame's GPU preview textures (key → egui id) read by 3D inline previews.
     pub(super) gpu_tex: &'a std::collections::HashMap<u64, egui::TextureId>,
     /// This frame's GPU preview requests, pushed by 3D inline previews; drained by the panel.
     pub(super) gpu_reqs: &'a mut Vec<GpuPreviewRequest>,
-    /// Per-node pan (world-XZ centre offset).
-    pub(super) pan: &'a mut std::collections::HashMap<NodeId, (f64, f64)>,
     /// Set to the node whose preview image the pointer is over (for next-frame scroll interception).
     pub(super) hovered_preview: &'a mut Option<NodeId>,
     /// Hash of the current nav path — combined with the node id into a stable GPU pool key per preview.
@@ -93,33 +83,33 @@ impl SnarlViewer<EdNode> for Viewer<'_> {
         if matches!(snarl.get_node(node), Some(EdNode::Biome { .. }))
             && ui.button(format!("{} Open", icon::CARET_RIGHT)).on_hover_text("Edit this biome's sub-graph").clicked()
         {
-            *self.enter = Some(node);
+            self.signals.enter = Some(node);
         }
         // Divider between the node params (above) and the preview section (below).
         ui.separator();
 
         // Collapsed: just an expand toggle.
-        if self.collapsed.contains(&node) {
+        if self.caches.collapsed.contains(&node) {
             if ui
                 .small_button(format!("{} Preview", icon::CARET_RIGHT))
                 .on_hover_text("Show this node's 2D/3D preview")
                 .clicked()
             {
-                self.collapsed.remove(&node);
+                self.caches.collapsed.remove(&node);
             }
-            self.body_size.insert(node, ui.min_rect().size());
+            self.caches.body_size.insert(node, ui.min_rect().size());
             return;
         }
 
         // Open: the preview IMAGE on the LEFT, its controls in a column on the RIGHT (no overlap).
-        let is3d = self.surface.contains(&node);
-        let size = self.disp_px.get(&node).copied().unwrap_or(DEFAULT_PREVIEW_PX);
+        let is3d = self.caches.surface.contains(&node);
+        let size = self.caches.disp_px.get(&node).copied().unwrap_or(DEFAULT_PREVIEW_PX);
         // Render at the displayed size in physical pixels (no cap) so the preview is always crisp.
         let ppp = ui.ctx().pixels_per_point();
         let res = ((size * ppp).round() as usize).max(32);
-        let half = *self.zoom_half_m.get(&node).unwrap_or(&PREVIEW_HALF_M);
-        let (yaw, pitch) = *self.cam.get(&node).unwrap_or(&CAM_DEFAULT);
-        let (cx, cz) = *self.pan.get(&node).unwrap_or(&(0.0, 0.0));
+        let half = *self.caches.zoom_half_m.get(&node).unwrap_or(&PREVIEW_HALF_M);
+        let (yaw, pitch) = *self.caches.cam.get(&node).unwrap_or(&CAM_DEFAULT);
+        let (cx, cz) = *self.caches.pan.get(&node).unwrap_or(&(0.0, 0.0));
 
         match graph_rooted_at(snarl, node) {
             Ok(g) => {
@@ -144,9 +134,9 @@ impl SnarlViewer<EdNode> for Viewer<'_> {
                     // right-drag = pan (3D). The scroll is consumed so the graph doesn't also zoom.
                     let img_resp = preview_image(ui, tex, egui::vec2(size, size));
                     {
-                        let h = self.zoom_half_m.entry(node).or_insert(PREVIEW_HALF_M);
-                        let cam = self.cam.entry(node).or_insert(CAM_DEFAULT);
-                        let pan = self.pan.entry(node).or_insert((0.0, 0.0));
+                        let h = self.caches.zoom_half_m.entry(node).or_insert(PREVIEW_HALF_M);
+                        let cam = self.caches.cam.entry(node).or_insert(CAM_DEFAULT);
+                        let pan = self.caches.pan.entry(node).or_insert((0.0, 0.0));
                         handle_preview_gestures(ui, &img_resp, is3d, size, h, &mut pan.0, &mut pan.1, &mut cam.0, &mut cam.1);
                     }
                     // Record hover so the panel can intercept this preview's scroll-zoom next frame
@@ -158,16 +148,16 @@ impl SnarlViewer<EdNode> for Viewer<'_> {
                     ui.vertical(|ui| {
                         ui.horizontal(|ui| {
                             if ui.small_button(icon::CARET_DOWN).on_hover_text("Collapse preview").clicked() {
-                                self.collapsed.insert(node);
+                                self.caches.collapsed.insert(node);
                             }
                             if ui.small_button(icon::ARROWS_OUT).on_hover_text("Pop out into a movable window").clicked() {
-                                *self.pop_request = Some(node);
+                                self.signals.pop_request = Some(node);
                             }
                             if ui.small_button(icon::PICTURE_IN_PICTURE).on_hover_text("Show in the dockable preview panel (by the viewport)").clicked() {
-                                *self.to_panel = Some(node);
+                                self.signals.to_panel = Some(node);
                             }
                         });
-                        let h = self.zoom_half_m.entry(node).or_insert(PREVIEW_HALF_M);
+                        let h = self.caches.zoom_half_m.entry(node).or_insert(PREVIEW_HALF_M);
                         let mut km = *h * 2.0 / 1000.0;
                         if ui
                             .add(egui::DragValue::new(&mut km).speed(0.25).range(0.05..=512.0).suffix(" km"))
@@ -182,12 +172,12 @@ impl SnarlViewer<EdNode> for Viewer<'_> {
                             .clicked()
                         {
                             if is3d {
-                                self.surface.remove(&node);
+                                self.caches.surface.remove(&node);
                             } else {
-                                self.surface.insert(node);
+                                self.caches.surface.insert(node);
                             }
                         }
-                        let sz = self.disp_px.entry(node).or_insert(DEFAULT_PREVIEW_PX);
+                        let sz = self.caches.disp_px.entry(node).or_insert(DEFAULT_PREVIEW_PX);
                         ui.add(egui::DragValue::new(sz).speed(2.0).range(64.0..=1024.0).suffix(" px"))
                             .on_hover_text("Preview size");
                     });
@@ -197,7 +187,7 @@ impl SnarlViewer<EdNode> for Viewer<'_> {
                 ui.colored_label(egui::Color32::from_rgb(200, 150, 120), format!("connect inputs ({e})"));
             }
         }
-        self.body_size.insert(node, ui.min_rect().size());
+        self.caches.body_size.insert(node, ui.min_rect().size());
     }
 
     fn show_input(&mut self, pin: &InPin, ui: &mut egui::Ui, snarl: &mut Snarl<EdNode>) -> impl SnarlPin + 'static {
