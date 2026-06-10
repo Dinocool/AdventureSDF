@@ -8,10 +8,11 @@
 
 struct PreviewParams {
     eye: vec4<f32>,    // xyz = camera eye,  w = image-plane tan
-    fwd: vec4<f32>,    // xyz = forward,     w = world half-extent (m)
+    fwd: vec4<f32>,    // xyz = forward,     w = world half-extent Z (m)
     right: vec4<f32>,  // xyz = right,       w = height min (m)
     up: vec4<f32>,     // xyz = up,          w = height max (m)
     levels: vec4<f32>, // sea, snow, water-depth, res(px)
+    flags: vec4<f32>,  // x = mode (0 = 3D orbit, 1 = 2D top-down ortho), y = halfX (m), z = halfZ (m)
 };
 
 @group(#{MATERIAL_BIND_GROUP}) @binding(0) var<uniform> params: PreviewParams;
@@ -37,10 +38,10 @@ fn sample_hf(uv: vec2<f32>) -> vec4<f32> {
     return mix(mix(a, b, f.x), mix(c, d, f.x), f.y);
 }
 
-// Height + normal at a world XZ position (within the baked ±half window).
+// Height + normal at a world XZ position (within the baked ±halfX × ±halfZ window).
 fn hf_at(world_xz: vec2<f32>) -> vec4<f32> {
-    let half = params.fwd.w;
-    let uv = (world_xz + vec2<f32>(half)) / (2.0 * half);
+    let half_xz = vec2<f32>(params.flags.y, params.flags.z);
+    let uv = (world_xz + half_xz) / (2.0 * half_xz);
     return sample_hf(uv);
 }
 
@@ -95,20 +96,30 @@ fn strata(y: f32) -> vec3<f32> {
 
 @fragment
 fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
-    let ndcx = in.uv.x * 2.0 - 1.0;
-    let ndcy = 1.0 - in.uv.y * 2.0; // uv.y grows downward → flip so +y is up
-    let tan = params.eye.w;
-    let aspect = params.levels.w; // width/height — widen the horizontal fov so a non-square panel fills
-    let eye = params.eye.xyz;
-    let dir = normalize(params.fwd.xyz + params.right.xyz * (ndcx * tan * aspect) + params.up.xyz * (ndcy * tan));
-
-    let half = params.fwd.w;
+    let halfx = params.flags.y;
+    let halfz = params.flags.z;
     let ymin = params.right.w;
     let ymax = params.up.w;
+    let light = normalize(vec3<f32>(0.4, 0.85, 0.3));
+
+    // 2D top-down orthographic field map: flat absolute-height colour (reads as a placement/climate map;
+    // left = −X, top = −Z, matching the bake). Same `height_colour` SSOT as the 3D path.
+    if (params.flags.x >= 0.5) {
+        let wx = (in.uv.x * 2.0 - 1.0) * halfx;
+        let wz = (in.uv.y * 2.0 - 1.0) * halfz;
+        return vec4<f32>(height_colour(hf_at(vec2<f32>(wx, wz)).x), 1.0);
+    }
+
+    let ndcx = in.uv.x * 2.0 - 1.0;
+    let ndcy = 1.0 - in.uv.y * 2.0; // uv.y grows downward → flip so +y is up
+    let tan = params.eye.w;          // square fov (the preview is drawn square)
+    let eye = params.eye.xyz;
+    let dir = normalize(params.fwd.xyz + params.right.xyz * (ndcx * tan) + params.up.xyz * (ndcy * tan));
+
     let span = max(ymax - ymin, 1.0);
     let pad = span * 0.08 + 1.0;
-    let bmin = vec3<f32>(-half, ymin - pad, -half);
-    let bmax = vec3<f32>(half, ymax + pad, half);
+    let bmin = vec3<f32>(-halfx, ymin - pad, -halfz);
+    let bmax = vec3<f32>(halfx, ymax + pad, halfz);
 
     let hit = ray_box(eye, dir, bmin, bmax);
     if (hit.z < 0.0) {
@@ -116,7 +127,6 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
     }
     let t0 = max(hit.x, 0.0);
     let t1 = hit.y;
-    let light = normalize(vec3<f32>(0.4, 0.85, 0.3));
 
     // Solid earth: if the ray ENTERS the box already at/below the surface, it pierced a side/bottom wall
     // → shade the earth cross-section (strata) instead of marching into a hole.
@@ -127,8 +137,7 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
 
     // Adaptive march, but cap each step to ~2 texels HORIZONTALLY so thin ridges aren't tunnelled through
     // when viewed from the side (the classic heightfield-undersampling artefact).
-    let res = params.levels.w;
-    let texel = (2.0 * half) / res;
+    let texel = (2.0 * min(halfx, halfz)) / HF_TEX_RES;
     let hspeed = max(length(dir.xz), 1e-4);
     let max_h = 2.0 * texel / hspeed;
     let descent = max(-dir.y, 0.02);
