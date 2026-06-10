@@ -60,6 +60,9 @@ pub fn apply_layout(world: &mut World, ron: &str) -> bool {
         let registry = world.resource::<DebugPanelRegistry>();
         state.retain_tabs(|tab| match tab {
             EditorTab::Registered(id) => registry.panel_by_id(id.as_str()).is_some(),
+            // WorldgenPreview tabs are session-only (recreated by `apply_view` → `open_preview_panel`),
+            // never layout-persisted — drop any stray one from an old/foreign layout so it can't dup.
+            EditorTab::WorldgenPreview(_) => false,
             _ => true,
         });
     }
@@ -77,8 +80,15 @@ fn set_scene_box_tabs(state: &mut DockState<EditorTab>, tabs: Vec<EditorTab>, ac
         if let Some(leaf) = node.get_leaf_mut()
             && leaf.tabs.iter().any(is_center_tab)
         {
-            // Keep the docked panels (anything that isn't a scene tab); only the scene set is swapped.
-            let panels: Vec<EditorTab> = leaf.tabs.iter().filter(|t| !is_center_tab(t)).cloned().collect();
+            // Keep the docked panels (anything that isn't a scene tab) EXCEPT dynamic WorldgenPreview
+            // tabs — those are session-only (recreated via `apply_view`), so persisting them would
+            // duplicate on reload. Treat them like scenes: not layout-persisted.
+            let panels: Vec<EditorTab> = leaf
+                .tabs
+                .iter()
+                .filter(|t| !is_center_tab(t) && !matches!(t, EditorTab::WorldgenPreview(_)))
+                .cloned()
+                .collect();
             leaf.active = TabIndex(active.min(tabs.len().saturating_sub(1)));
             leaf.tabs = tabs.iter().cloned().chain(panels).collect();
         }

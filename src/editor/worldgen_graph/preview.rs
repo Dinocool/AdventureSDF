@@ -17,47 +17,51 @@ pub(super) const DEFAULT_PREVIEW_PX: f32 = 120.0;
 pub(super) const PREVIEW_HALF_M: f64 = 2048.0;
 /// Default 3D orbit camera (yaw, pitch) in radians.
 pub(super) const CAM_DEFAULT: (f32, f32) = (0.7, 0.6);
-/// Number of independent dockable Node Preview panels in the pool (bounded so the GPU pool keys + dock
-/// tabs stay fixed). Each panel `idx` gets GPU key `PANEL_GPU_KEY + idx` (7..=10).
-pub(super) const PREVIEW_PANELS: usize = 4;
-/// Base GPU pool key for the dockable preview panels; panel `idx` uses `PANEL_GPU_KEY + idx` (distinct
-/// from inline high-bit keys + pop-out ids ≥ 1000).
-pub(super) const PANEL_GPU_KEY: u64 = 7;
 
-/// The registered dock tab id for preview panel `idx` — `worldgen/node-preview` for 0, then `-2/-3/-4`.
-/// SSOT for the per-panel tab id (used by registration AND `open_preview_panel`'s focus).
-pub(super) fn preview_panel_tab_id(idx: usize) -> String {
-    if idx == 0 {
-        "worldgen/node-preview".to_string()
-    } else {
-        format!("worldgen/node-preview-{}", idx + 1)
-    }
+/// GPU pool key for the dockable preview instance `id`. Bit 62 is set so the keys can never collide with
+/// the inline high-bit keys (bit 63) or the small pop-out ids (≥ 1000) — see [`gpu_inline_key`].
+pub(super) fn preview_gpu_key(id: u64) -> u64 {
+    (1u64 << 62) | id
 }
 
-/// The bounded POOL of independent dockable Node Preview panels (one per dock tab). "→ panel" fills the
-/// first free slot; each renders into its own GPU key + dock tab. A `Vec` of fixed length
-/// [`PREVIEW_PANELS`] (defaulted to that many default panels), so adding a panel is just bumping the
-/// constant + registering its tab.
-#[derive(Resource)]
-pub(super) struct WorldgenPreviewPanels(pub(super) Vec<WorldgenPreviewPanel>);
+/// The dynamic, id-keyed SET of independent dockable Node Preview panels (one per dock tab). "→ panel"
+/// allocates a fresh id + tab every click ([`WorldgenPreviewPanels::open`]), so the count is unbounded;
+/// closing a tab removes its entry (see the dock `on_close`). Each instance renders into its own GPU key
+/// ([`preview_gpu_key`]) + dock tab `EditorTab::WorldgenPreview(id)`.
+#[derive(Resource, Default)]
+pub(super) struct WorldgenPreviewPanels {
+    /// Live preview instances keyed by their unique id.
+    pub(super) map: std::collections::HashMap<u64, WorldgenPreviewPanel>,
+    /// Monotonic id source (never reused, so a closed tab's id can't alias a new one).
+    pub(super) next_id: u64,
+    /// Ids whose dock tab still needs creating — drained by [`open_preview_panel`] outside the dock
+    /// render (the dock state is taken OUT of the World while the dock renders, so a panel callback can't
+    /// touch it).
+    pub(super) to_open: Vec<u64>,
+}
 
-impl Default for WorldgenPreviewPanels {
-    fn default() -> Self {
-        Self((0..PREVIEW_PANELS).map(|_| WorldgenPreviewPanel::default()).collect())
+impl WorldgenPreviewPanels {
+    /// Spawn a NEW preview instance targeting `target` with `view`/`is3d`, queue its dock tab for
+    /// creation, and return its fresh id. Each "→ panel" click (or restored `PanelView`) calls this.
+    pub(super) fn open(&mut self, target: (Vec<NodeId>, NodeId), view: PreviewView, is3d: bool) -> u64 {
+        let id = self.next_id;
+        self.next_id += 1;
+        let mut panel = WorldgenPreviewPanel { target: Some(target), is3d, ..Default::default() };
+        panel.set_view(view);
+        self.map.insert(id, panel);
+        self.to_open.push(id);
+        id
     }
 }
 
 /// The dockable, viewport-located preview panel's state: which node it shows + its own view. One per
-/// pool slot in [`WorldgenPreviewPanels`].
+/// entry in [`WorldgenPreviewPanels::map`].
 pub(super) struct WorldgenPreviewPanel {
     pub(super) target: Option<(Vec<NodeId>, NodeId)>,
     pub(super) half: f64,
     pub(super) cam: (f32, f32),
     pub(super) pan: (f64, f64),
     pub(super) is3d: bool,
-    /// Set by "→ panel"; a system outside the dock render ensures + focuses the tab (the dock state is
-    /// taken OUT of the World while the dock renders, so it can't be touched from a panel callback).
-    pub(super) pending_open: bool,
 }
 
 impl Default for WorldgenPreviewPanel {
@@ -68,7 +72,6 @@ impl Default for WorldgenPreviewPanel {
             cam: CAM_DEFAULT,
             pan: (0.0, 0.0),
             is3d: true,
-            pending_open: false,
         }
     }
 }
@@ -294,30 +297,16 @@ pub(super) fn preview_image(ui: &mut egui::Ui, tex: Option<egui::TextureId>, siz
     }
 }
 
-// One thin render fn per pool slot — `register_panel` takes a plain `fn` pointer, so each panel needs a
-// distinct entry point that forwards to the shared `preview_panel_impl` with its index.
-pub(super) fn preview_panel_0(world: &mut World, ui: &mut egui::Ui) {
-    preview_panel_impl(world, ui, 0);
-}
-pub(super) fn preview_panel_1(world: &mut World, ui: &mut egui::Ui) {
-    preview_panel_impl(world, ui, 1);
-}
-pub(super) fn preview_panel_2(world: &mut World, ui: &mut egui::Ui) {
-    preview_panel_impl(world, ui, 2);
-}
-pub(super) fn preview_panel_3(world: &mut World, ui: &mut egui::Ui) {
-    preview_panel_impl(world, ui, 3);
-}
-
-/// The dockable, viewport-located **Node Preview** panel `idx` — shows whichever node was sent to it via
-/// "→ panel", large, with its own 2D/3D + zoom/pan/orbit (both rendered on the shared GPU pool, into the
-/// panel's own key `PANEL_GPU_KEY + idx`).
-fn preview_panel_impl(world: &mut World, ui: &mut egui::Ui, idx: usize) {
-    let gpu_key = PANEL_GPU_KEY + idx as u64;
-    let Some((nav, node)) = world.resource::<WorldgenPreviewPanels>().0[idx].target.clone() else {
+/// The dockable, viewport-located **Node Preview** panel for instance `id` — shows whichever node was
+/// sent to it via "→ panel", large, with its own 2D/3D + zoom/pan/orbit (both rendered on the shared GPU
+/// pool, into the instance's own key [`preview_gpu_key`]). A closed/missing instance degrades to a hint.
+pub(super) fn preview_panel_impl(world: &mut World, ui: &mut egui::Ui, id: u64) {
+    let gpu_key = preview_gpu_key(id);
+    let Some(target) = world.resource::<WorldgenPreviewPanels>().map.get(&id).and_then(|p| p.target.clone()) else {
         ui.label("No preview targeted. In the Biome Graph, click a node preview's ▢ button to show it here.");
         return;
     };
+    let (nav, node) = target;
     // Compile the targeted node's sub-graph from the editor snarl.
     let g = world.resource_scope::<WorldGraphEditor, Option<Graph>>(|_w, ed| {
         resolve_snarl(&ed.snarl, &nav).and_then(|s| graph_rooted_at(s, node).ok())
@@ -328,7 +317,7 @@ fn preview_panel_impl(world: &mut World, ui: &mut egui::Ui, idx: usize) {
     };
 
     world.resource_scope::<WorldgenPreviewPanels, ()>(|world, mut panels| {
-        let panel = &mut panels.0[idx]; // reborrow once so disjoint field borrows don't alias through Mut's deref
+        let Some(panel) = panels.map.get_mut(&id) else { return };
         ui.horizontal(|ui| {
             if ui.selectable_label(panel.is3d, "3D").on_hover_text("GPU 3D surface").clicked() {
                 panel.is3d = !panel.is3d;
@@ -360,28 +349,25 @@ fn preview_panel_impl(world: &mut World, ui: &mut egui::Ui, idx: usize) {
     });
 }
 
-/// Outside the dock render (when `EditorDockState` is back in the World), ensure + focus EACH dockable
-/// Node Preview tab whose panel has `pending_open` set (one per pool slot). Clears the flag per slot.
+/// Outside the dock render (when `EditorDockState` is back in the World), CREATE + focus a dock tab for
+/// each id queued in [`WorldgenPreviewPanels::to_open`] (drained here). The dock state is taken OUT of
+/// the World during its own render, so tab creation can't happen from a panel callback — this deferred
+/// system is the safe point. Mirrors how scenes add center tabs.
 pub(super) fn open_preview_panel(world: &mut World) {
-    // Collect the slots that asked to open this frame, clearing their flags.
-    let pending: Vec<usize> = {
-        let mut panels = world.resource_mut::<WorldgenPreviewPanels>();
-        (0..PREVIEW_PANELS)
-            .filter(|&i| {
-                let p = &mut panels.0[i];
-                std::mem::take(&mut p.pending_open)
-            })
-            .collect()
-    };
-    if pending.is_empty() || !world.contains_resource::<crate::editor::dock::EditorDockState>() {
+    // Drain the queue. If the dock state isn't present yet (pre-`init_dock_state`), keep the ids queued
+    // so they open once it exists.
+    if !world.contains_resource::<crate::editor::dock::EditorDockState>() {
         return;
     }
-    for idx in pending {
-        let tab = crate::editor::dock::EditorTab::Registered(preview_panel_tab_id(idx));
-        crate::editor::layout::set_panel_present(world, tab.clone(), crate::editor::panels::DockSide::Center, true);
-        if let Some(mut dock) = world.get_resource_mut::<crate::editor::dock::EditorDockState>()
-            && let Some((n, t)) = dock.state.find_main_surface_tab(&tab)
-        {
+    let to_open: Vec<u64> = std::mem::take(&mut world.resource_mut::<WorldgenPreviewPanels>().to_open);
+    if to_open.is_empty() {
+        return;
+    }
+    let mut dock = world.resource_mut::<crate::editor::dock::EditorDockState>();
+    for id in to_open {
+        let tab = crate::editor::dock::EditorTab::WorldgenPreview(id);
+        crate::editor::scene_tabs::add_center_tab(&mut dock, tab.clone());
+        if let Some((n, t)) = dock.state.find_main_surface_tab(&tab) {
             dock.state.set_active_tab((egui_dock::SurfaceIndex::main(), n, t));
         }
     }

@@ -19,7 +19,7 @@ use super::convert::{
 };
 use super::persist::{apply_view, load_editor_doc, load_session, save_editor_doc};
 use super::preview::{
-    PoppedPreview, WorldgenPreviewPanels, apply_scroll_zoom, nav_hash, popped_preview_window,
+    PoppedPreview, PreviewView, WorldgenPreviewPanels, apply_scroll_zoom, nav_hash, popped_preview_window,
 };
 use super::viewer::Viewer;
 use super::{ViewerSignals, WorldGraphEditor, auto_arrange, snarl_to_graph};
@@ -236,22 +236,21 @@ pub(super) fn graph_panel(world: &mut World, ui: &mut egui::Ui) {
             editor.clear_node_caches();
             editor.needs_arrange = true;
         }
-        // Retarget a dockable preview panel (snapshotting the node's nav + view state) — the FIRST free
-        // slot, or slot 0 if all four are occupied.
+        // Spawn a NEW dockable preview instance + tab (unbounded — every click opens another), snapshotting
+        // the node's nav + view state. `open` queues the tab; `open_preview_panel` creates + focuses it
+        // OUTSIDE the dock render (the dock state isn't in the World here).
         if let Some(node) = editor.signals.to_panel.take() {
             let nav = editor.nav.clone();
             let v = editor.caches.views.get(&node).copied().unwrap_or_default();
             if let Some(mut panels) = world.get_resource_mut::<WorldgenPreviewPanels>() {
-                let slot = panels.0.iter().position(|p| p.target.is_none()).unwrap_or(0);
-                let panel = &mut panels.0[slot];
-                panel.target = Some((nav, node));
-                panel.half = v.zoom_half_m;
-                panel.cam = v.cam;
-                panel.pan = v.pan;
-                panel.is3d = v.surface;
-                // Ensure/focus the dock tab — but only OUTSIDE the dock render (the dock state isn't in
-                // the World here). `open_preview_panel` handles it next frame.
-                panel.pending_open = true;
+                let view = PreviewView {
+                    half: v.zoom_half_m,
+                    cx: v.pan.0,
+                    cz: v.pan.1,
+                    yaw: v.cam.0,
+                    pitch: v.cam.1,
+                };
+                panels.open((nav, node), view, v.surface);
             }
         }
         // Pop a node's preview out into a movable window (snapshotting its current view state + nav path).

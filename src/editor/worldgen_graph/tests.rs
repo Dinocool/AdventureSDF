@@ -8,7 +8,7 @@ use super::persist::{
     EditorView, PanelView, PoppedView, WorldGraphDoc, apply_view, gather_view, load_editor_doc,
 };
 use super::preview::{
-    PANEL_GPU_KEY, PreviewView, WorldgenPreviewPanel, WorldgenPreviewPanels, gpu_inline_key, scale_label_text,
+    PreviewView, WorldgenPreviewPanel, WorldgenPreviewPanels, gpu_inline_key, preview_gpu_key, scale_label_text,
 };
 use super::*;
 use egui::pos2;
@@ -477,9 +477,11 @@ fn gpu_inline_key_is_stable_and_non_colliding() {
     // The top bit is set on every inline key.
     let k = gpu_inline_key(42, n);
     assert!(k & (1u64 << 63) != 0, "inline keys have the high bit set");
-    // …so they can never collide with the small pop-out ids (start at 1000) or the PANEL key (7).
+    // …so they can never collide with the small pop-out ids (start at 1000) or the per-instance panel
+    // keys (bit 62 set, bit 63 clear).
     assert!(k > 1000);
-    assert_ne!(k, PANEL_GPU_KEY);
+    assert_ne!(k, preview_gpu_key(0));
+    assert_eq!(preview_gpu_key(0) & (1u64 << 63), 0, "panel keys don't set the inline bit");
     assert_ne!(k & (1u64 << 63), 0);
     // Different salt (nav level) ⇒ (almost surely) different key — and certainly not equal here.
     assert_ne!(gpu_inline_key(42, n), gpu_inline_key(43, n));
@@ -584,7 +586,7 @@ fn world_graph_doc_round_trips_view_state() {
 }
 
 /// Backward-compat: an old `EditorView` carrying the deprecated single `panel` field (pre-pool saves)
-/// must restore into the FIRST pool slot via `apply_view` (folded in front of `panels`).
+/// must spawn a fresh preview instance + queued tab via `apply_view` (folded in front of `panels`).
 #[test]
 fn apply_view_folds_legacy_single_panel_into_pool() {
     let (top, b) = top_with_biome("Hills");
@@ -595,16 +597,17 @@ fn apply_view_folds_legacy_single_panel_into_pool() {
     };
     let mut dst = WorldGraphEditor { snarl: top, ..Default::default() };
     let mut panels = WorldgenPreviewPanels::default();
-    // Legacy field set, new `panels` empty — must land in slot 0.
+    // Legacy field set, new `panels` empty — must produce exactly one instance, queued to open.
     let view = EditorView {
         panel: Some(PanelView { nav: vec![], node: o, is3d: true, view: sample_preview_view() }),
         nav: vec![b],
         ..EditorView::default()
     };
     apply_view(view, &mut dst, &mut panels);
-    assert_eq!(panels.0[0].target, Some((vec![], o)), "legacy panel restored into slot 0");
-    assert!(panels.0[0].pending_open);
-    assert!(panels.0[1].target.is_none(), "other slots untouched");
+    assert_eq!(panels.map.len(), 1, "legacy panel spawned one instance");
+    assert_eq!(panels.to_open.len(), 1, "and queued its tab to open");
+    let id = panels.to_open[0];
+    assert_eq!(panels.map[&id].target, Some((vec![], o)), "instance targets the legacy node");
 }
 
 /// `apply_view` must CLAMP a stale nav (pointing at a now-deleted biome) without panicking — it falls
@@ -642,13 +645,16 @@ fn gather_then_apply_round_trips_view_state() {
         cam: (0.3, 0.7),
         open: true,
     });
-    // A pool with one occupied slot (slot 0) — the rest empty.
+    // A set with one live instance.
     let mut src_panels = WorldgenPreviewPanels::default();
-    src_panels.0[0] = WorldgenPreviewPanel { target: Some((vec![], b)), is3d: false, ..Default::default() };
-    src_panels.0[0].set_view(sample_preview_view());
+    {
+        let mut panel = WorldgenPreviewPanel { target: Some((vec![], b)), is3d: false, ..Default::default() };
+        panel.set_view(sample_preview_view());
+        src_panels.map.insert(0, panel);
+    }
 
     let snapshot = gather_view(&src, &src_panels);
-    assert_eq!(snapshot.panels.len(), 1, "only the occupied slot is snapshotted");
+    assert_eq!(snapshot.panels.len(), 1, "the one live instance is snapshotted");
 
     // Destination editor: same graph, blank state → apply the snapshot.
     let mut dst = WorldGraphEditor { snarl: top, ..Default::default() };
@@ -661,12 +667,14 @@ fn gather_then_apply_round_trips_view_state() {
     assert_eq!(nv.surface, sample_node_view().surface);
     // nav restored (valid biome ⇒ kept).
     assert_eq!(dst.nav, vec![b]);
-    // Panel target + view restored into the first slot, and re-shown.
-    let dst_panel = &dst_panels.0[0];
+    // Panel target + view restored into a fresh instance, and queued to re-open.
+    assert_eq!(dst_panels.map.len(), 1, "one instance restored");
+    assert_eq!(dst_panels.to_open.len(), 1, "queued to re-open its tab");
+    let id = dst_panels.to_open[0];
+    let dst_panel = &dst_panels.map[&id];
     assert_eq!(dst_panel.target, Some((vec![], b)));
     assert!(!dst_panel.is3d);
     assert_eq!(dst_panel.half, sample_preview_view().half);
-    assert!(dst_panel.pending_open, "a restored panel target re-opens its tab");
     // Pop-out restored (one window, same target + view).
     assert_eq!(dst.popped.len(), 1);
     assert_eq!(dst.popped[0].node, b);
