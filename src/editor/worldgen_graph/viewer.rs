@@ -112,11 +112,15 @@ impl SnarlViewer<EdNode> for Viewer<'_> {
                 self.signals.enter = Some(node);
             }
 
-            // Preview hidden (header eye unchecked) ⇒ body is just the params above — compact, no divider.
+            // Preview hidden (header eye unchecked) ⇒ body is just the params above — compact.
             if self.caches.views.entry(node).or_default().collapsed {
                 return;
             }
-            ui.separator();
+            // A fixed GAP, not `ui.separator()`: in this vertical layout a separator is a full-WIDTH line that
+            // spans `available_width`, and egui-snarl feeds the node's own (growing) width back as that
+            // available width — so a full-width widget makes the node expand rightward every frame. Keeping the
+            // body strictly content-sized (gap, fixed/looped widgets only) is what stops the runaway.
+            ui.add_space(6.0);
 
             let view = *self.caches.views.entry(node).or_default();
             let is3d = view.surface;
@@ -250,5 +254,77 @@ impl SnarlViewer<EdNode> for Viewer<'_> {
                 }
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sdf_render::worldgen::graph::node::{FbmAxis, NodeKind};
+    use egui_snarl::Snarl;
+    use egui_snarl::ui::{SnarlStyle, SnarlWidget};
+
+    /// Drive the REAL `SnarlWidget` (with our `Viewer`) over `frames` headless egui frames and return the
+    /// rendered NODE-FRAME width on each frame. This exercises egui-snarl's actual node sizing + its
+    /// content↔available-width feedback across frames (the thing that made nodes "expand to the right") —
+    /// not a hand-rolled simulation. Scale is pinned to 1.0 so a graph-space growth shows in the measured
+    /// rect instead of being hidden by auto-fit zoom.
+    fn node_frame_widths(snarl: &mut Snarl<EdNode>, node: NodeId, frames: usize) -> Vec<f32> {
+        let ctx = egui::Context::default();
+        let mut caches = NodeCaches::default();
+        let mut signals = ViewerSignals::default();
+        let gpu_tex = std::collections::HashMap::new();
+        let mut gpu_reqs = Vec::new();
+        let mut hovered = None;
+        let snarl_id = egui::Id::new("harness-snarl");
+        // egui-snarl interacts each node's frame at this id (snarl id ⊕ node ⊕ "frame").
+        let node_frame_id = snarl_id.with(("snarl-node", node)).with("frame");
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200.0, 900.0))),
+            ..Default::default()
+        };
+        let style = SnarlStyle { min_scale: Some(1.0), max_scale: Some(1.0), ..SnarlStyle::new() };
+        let mut widths = Vec::with_capacity(frames);
+        for _ in 0..frames {
+            let _ = ctx.run(input.clone(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let mut viewer = Viewer {
+                        caches: &mut caches,
+                        signals: &mut signals,
+                        gpu_tex: &gpu_tex,
+                        gpu_reqs: &mut gpu_reqs,
+                        hovered_preview: &mut hovered,
+                        level_salt: 0,
+                    };
+                    SnarlWidget::new().id(snarl_id).style(style).show(snarl, &mut viewer, ui);
+                });
+            });
+            if let Some(r) = ctx.read_response(node_frame_id) {
+                widths.push(r.rect.width());
+            }
+            gpu_reqs.clear();
+        }
+        widths
+    }
+
+    /// Regression: a node must NOT grow every frame. egui-snarl feeds a node's measured width back as the
+    /// body's available width, so any body widget that spans `available_width` (e.g. a horizontal
+    /// `ui.separator()` in our vertical body) makes the node expand rightward without bound. Assert the
+    /// rendered node width CONVERGES (stable across the last frames). With the `ui.separator()` this fails;
+    /// with the fixed `ui.add_space` it passes.
+    #[test]
+    fn node_width_does_not_run_away() {
+        let mut snarl: Snarl<EdNode> = Snarl::new();
+        // An Fbm source node (arity 0) — `graph_rooted_at` compiles it directly, so the preview path runs.
+        let node = snarl.insert_node(
+            egui::pos2(0.0, 0.0),
+            EdNode::Op(NodeKind::Fbm(FbmAxis { octaves: 3, base_freq: 1.0 / 512.0, lacunarity: 2.0, gain: 0.5, amplitude: 100.0, seed_salt: 1 })),
+        );
+        let widths = node_frame_widths(&mut snarl, node, 24);
+        assert!(widths.len() >= 4, "node frame never rendered: {widths:?}");
+        let n = widths.len();
+        // A runaway grows by a fixed margin each frame; require the last three frames to be stable (≤1px).
+        let stable = (widths[n - 1] - widths[n - 2]).abs() < 1.0 && (widths[n - 2] - widths[n - 3]).abs() < 1.0;
+        assert!(stable, "node width runs away (grows each frame): {widths:?}");
     }
 }
