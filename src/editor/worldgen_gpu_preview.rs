@@ -48,10 +48,11 @@ const WATER_DEPTH: f32 = 400.0;
 #[derive(ShaderType, Clone, Copy, Default)]
 struct PreviewParams {
     eye: Vec4,    // xyz eye, w = image-plane tan
-    fwd: Vec4,    // xyz forward, w = world half-extent
+    fwd: Vec4,    // xyz forward, w = world half-extent Z
     right: Vec4,  // xyz right, w = height min
     up: Vec4,     // xyz up, w = height max
-    levels: Vec4, // sea, snow, water-depth, heightfield res
+    levels: Vec4, // sea, snow, water-depth, (unused)
+    flags: Vec4,  // x = mode (0 = 3D orbit, 1 = 2D top-down), y = halfX, z = halfZ
 }
 
 /// Custom fullscreen-quad material: the camera uniform + the CPU-baked height/normal texture.
@@ -76,11 +77,13 @@ pub struct GpuPreviewRequest {
     pub key: u64,
     /// The compiled sub-graph to preview (owned snapshot).
     pub graph: Graph,
-    /// World half-extent (m) of the sampled window.
+    /// World half-extent (m) of the sampled window (the VERTICAL/Z half; X widens by the display aspect).
     pub half: f64,
     /// World-XZ centre the window is panned to (offset X/Y).
     pub center: (f64, f64),
-    /// Orbit camera.
+    /// `true` = 3D orbit raymarch; `false` = 2D top-down orthographic field map.
+    pub is3d: bool,
+    /// Orbit camera (3D only).
     pub yaw: f32,
     pub pitch: f32,
     /// Desired output resolution (px) — the pool resizes the slot's image to this (quantised) so the render
@@ -152,8 +155,9 @@ fn make_height_image(images: &mut Assets<Image>) -> Handle<Image> {
     images.add(image)
 }
 
-/// Evaluate the graph over the ±`half` window into `image` (height + analytic normal); returns the height
-/// range (for camera framing). The single `Graph::eval` — no GPU noise.
+/// Evaluate the graph over the square ±`half` window into `image` (height + analytic world normal); returns
+/// the height range (for camera framing). The single `Graph::eval` — no GPU noise. The window is square and
+/// axis-aligned (world x/z); the shader orbits it on the GPU, so rotating costs no re-bake.
 fn bake_height(image: &mut Image, g: &Graph, half: f64, center: (f64, f64)) -> (f32, f32) {
     let n = HEIGHTFIELD_RES;
     let mut data = vec![0f32; n * n * 4];
@@ -184,7 +188,8 @@ fn bake_height(image: &mut Image, g: &Graph, half: f64, center: (f64, f64)) -> (
     (ymin, ymax)
 }
 
-/// Fingerprint the bake inputs (graph + zoom) so the heightfield is only re-baked on change.
+/// Fingerprint the bake inputs (graph + window) so the heightfield is only re-baked on change. Orbit
+/// (yaw/pitch) is NOT included — rotation is a pure GPU-shader operation on the baked square.
 fn bake_key(g: &Graph, half: f64, center: (f64, f64)) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
@@ -195,24 +200,39 @@ fn bake_key(g: &Graph, half: f64, center: (f64, f64)) -> u64 {
     h.finish()
 }
 
-/// Orbit camera + framing → the shader uniform (`aspect` = output width/height, to fill a non-square view).
-fn build_params(yaw: f32, pitch: f32, half: f32, ymin: f32, ymax: f32, aspect: f32) -> PreviewParams {
+/// Orbit camera + framing → the shader uniform. The window is **square** (±`half`); the camera distance is
+/// fit so the terrain AABB just fills the (square) frustum at this orbit angle — a tight margin, every
+/// corner in frame, no fixed slack.
+fn build_params(yaw: f32, pitch: f32, half: f32, ymin: f32, ymax: f32, is3d: bool) -> PreviewParams {
     let span = (ymax - ymin).max(1.0);
+    let pad = span * 0.02 + 1.0; // minimal vertical breathing room (was 0.08)
     let centre = Vec3::new(0.0, (ymin + ymax) * 0.5, 0.0);
-    let dist = half * 2.4 + span;
     let (sp, cp) = pitch.sin_cos();
     let (sy, cyaw) = yaw.sin_cos();
-    let eye = centre + Vec3::new(cp * cyaw, sp, cp * sy) * dist;
-    let fwd = (centre - eye).normalize();
+    let fwd = -Vec3::new(cp * cyaw, sp, cp * sy); // points from eye toward centre
     let right = fwd.cross(Vec3::Y).normalize_or_zero();
     let up = right.cross(fwd);
-    let tan = (0.6f32 * 0.5).tan() * 2.0;
+    let tan = (0.6f32 * 0.5).tan() * 2.0; // half-fov tan (square → same horizontal + vertical)
+    // Smallest forward distance d so every AABB corner projects within [-1,1] in both axes.
+    let (bmin, bmax) = (Vec3::new(-half, ymin - pad, -half), Vec3::new(half, ymax + pad, half));
+    let mut d = 1.0f32;
+    for cx in [bmin.x, bmax.x] {
+        for cy in [bmin.y, bmax.y] {
+            for cz in [bmin.z, bmax.z] {
+                let rel = Vec3::new(cx, cy, cz) - centre;
+                let f = rel.dot(fwd);
+                d = d.max(rel.dot(right).abs() / tan - f).max(rel.dot(up).abs() / tan - f);
+            }
+        }
+    }
+    let eye = centre - fwd * (d * 1.015); // tight margin so corners aren't pixel-clipped (was 1.06)
     PreviewParams {
         eye: eye.extend(tan),
         fwd: fwd.extend(half),
         right: right.extend(ymin),
         up: up.extend(ymax),
-        levels: Vec4::new(SEA_LEVEL, SNOW_LEVEL, WATER_DEPTH, aspect),
+        levels: Vec4::new(SEA_LEVEL, SNOW_LEVEL, WATER_DEPTH, 0.0),
+        flags: Vec4::new(if is3d { 0.0 } else { 1.0 }, half, half, 0.0),
     }
 }
 
@@ -323,6 +343,8 @@ fn process_gpu_previews(world: &mut World) {
                 pool.targets[si].out_w = want_w;
                 pool.targets[si].out_h = want_h;
             }
+            // Square world window (the previews are drawn square). The heightfield is baked once per
+            // graph/zoom/pan; orbiting (yaw/pitch) is a pure GPU operation, so no re-bake on rotate.
             let bk = bake_key(&r.graph, r.half, r.center);
             if pool.targets[si].key != r.key || pool.targets[si].baked_key != bk {
                 let h = pool.targets[si].height.clone();
@@ -335,8 +357,8 @@ fn process_gpu_previews(world: &mut World) {
                 pool.targets[si].key = r.key;
                 pool.targets[si].baked_key = bk;
             }
-            let aspect = pool.targets[si].out_w as f32 / pool.targets[si].out_h.max(1) as f32;
-            let params = build_params(r.yaw, r.pitch, r.half as f32, pool.targets[si].ymin, pool.targets[si].ymax, aspect);
+            let params =
+                build_params(r.yaw, r.pitch, r.half as f32, pool.targets[si].ymin, pool.targets[si].ymax, r.is3d);
             let mat_h = pool.targets[si].material.clone();
             if let Some(mat) = world.resource_mut::<Assets<HeightPreviewMaterial>>().get_mut(&mat_h) {
                 mat.params = params;

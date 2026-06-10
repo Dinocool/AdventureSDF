@@ -60,9 +60,6 @@ pub struct WorldGraphEditor {
     path: String,
     /// Last save/load status message (shown in the toolbar).
     status: String,
-    /// Per-node preview textures, recomputed each frame a node's preview is open (so param edits are
-    /// reflected live) and dropped when collapsed. Keyed by the Snarl node id.
-    previews: std::collections::HashMap<NodeId, egui::TextureHandle>,
     /// Which nodes have their preview COLLAPSED. Previews are on by default, so absence ⇒ open.
     collapsed: std::collections::HashSet<NodeId>,
     /// Per-node preview zoom: half-extent (metres) of the sampled world window. Absence ⇒ default. Shared
@@ -78,9 +75,6 @@ pub struct WorldGraphEditor {
     /// Last-frame on-screen preview square side (points) per node, used to pick the render resolution so
     /// previews stay crisp as the node is resized.
     disp_px: std::collections::HashMap<NodeId, f32>,
-    /// Fingerprint of the last rendered preview per node (graph + zoom + size + mode + camera); the
-    /// preview is only re-rendered when this changes (so an idle 3D raymarch costs nothing).
-    prev_key: std::collections::HashMap<NodeId, u64>,
     /// Per-node pan: world-XZ centre offset of the sampled window (drag-pan / scroll over the preview).
     pan: std::collections::HashMap<NodeId, (f64, f64)>,
     /// Which inline preview image the pointer was over last frame — so `graph_panel` can intercept the
@@ -112,8 +106,6 @@ pub struct WorldgenPreviewPanel {
     cam: (f32, f32),
     pan: (f64, f64),
     is3d: bool,
-    tex: Option<egui::TextureHandle>,
-    key: u64,
     /// Set by "→ panel"; a system outside the dock render ensures + focuses the tab (the dock state is
     /// taken OUT of the World while the dock renders, so it can't be touched from a panel callback).
     pending_open: bool,
@@ -127,8 +119,6 @@ impl Default for WorldgenPreviewPanel {
             cam: CAM_DEFAULT,
             pan: (0.0, 0.0),
             is3d: true,
-            tex: None,
-            key: 0,
             pending_open: false,
         }
     }
@@ -151,8 +141,6 @@ struct PoppedPreview {
     size: f32,
     is3d: bool,
     cam: (f32, f32),
-    tex: Option<egui::TextureHandle>,
-    key: u64,
     open: bool,
 }
 
@@ -163,14 +151,12 @@ impl Default for WorldGraphEditor {
             seeded: false,
             path: DEFAULT_GRAPH_PATH.to_string(),
             status: String::new(),
-            previews: std::collections::HashMap::new(),
             collapsed: std::collections::HashSet::new(),
             zoom_half_m: std::collections::HashMap::new(),
             surface: std::collections::HashSet::new(),
             cam: std::collections::HashMap::new(),
             body_size: std::collections::HashMap::new(),
             disp_px: std::collections::HashMap::new(),
-            prev_key: std::collections::HashMap::new(),
             pan: std::collections::HashMap::new(),
             hovered_preview: None,
             nav: Vec::new(),
@@ -188,14 +174,12 @@ impl WorldGraphEditor {
     /// Drop all per-node UI caches — called on navigation, since `NodeId`s are per-snarl-level (a fresh
     /// id namespace each level) so caches must not bleed between levels.
     fn clear_node_caches(&mut self) {
-        self.previews.clear();
         self.collapsed.clear();
         self.zoom_half_m.clear();
         self.surface.clear();
         self.cam.clear();
         self.body_size.clear();
         self.disp_px.clear();
-        self.prev_key.clear();
         self.pan.clear();
     }
 
@@ -364,6 +348,24 @@ fn worldgraph_path(graph_path: &str) -> String {
         Some(stem) => format!("{stem}.worldgraph.ron"),
         None => format!("{graph_path}.worldgraph.ron"),
     }
+}
+
+/// Load the editor graph for `graph_path`: prefer the hierarchical `.worldgraph.ron` (keeps biomes), then
+/// the flat `.graph.ron`, then the built-in default. Used by the startup seed + the Load button so the
+/// editor reflects what's actually on disk rather than a hard-coded graph.
+fn load_editor_snarl(graph_path: &str) -> Snarl<EdNode> {
+    let wg = worldgraph_path(graph_path);
+    if let Ok(s) = std::fs::read_to_string(&wg)
+        && let Ok(snarl) = ron::de::from_str::<Snarl<EdNode>>(&s)
+    {
+        return snarl;
+    }
+    if let Ok(s) = std::fs::read_to_string(graph_path)
+        && let Ok(asset) = ron::de::from_str::<GraphAsset>(&s)
+    {
+        return graph_to_snarl(&asset.graph);
+    }
+    world_biome_snarl()
 }
 
 // Pin-id shorthands (every node has one output, pin 0).
@@ -578,14 +580,12 @@ fn compile_node(
 /// draw a (default-on, collapsible, resizable, zoomable) 2D heatmap of its sub-graph (see
 /// [`Viewer::show_body`]).
 struct Viewer<'a> {
-    previews: &'a mut std::collections::HashMap<NodeId, egui::TextureHandle>,
     collapsed: &'a mut std::collections::HashSet<NodeId>,
     zoom_half_m: &'a mut std::collections::HashMap<NodeId, f64>,
     surface: &'a mut std::collections::HashSet<NodeId>,
     cam: &'a mut std::collections::HashMap<NodeId, (f32, f32)>,
     body_size: &'a mut std::collections::HashMap<NodeId, egui::Vec2>,
     disp_px: &'a mut std::collections::HashMap<NodeId, f32>,
-    prev_key: &'a mut std::collections::HashMap<NodeId, u64>,
     /// Set to a biome node id when the user clicks its "Open" — the panel descends after the show.
     enter: &'a mut Option<NodeId>,
     /// Set to a node id when the user clicks its pop-out button — the panel opens a window after the show.
@@ -668,8 +668,6 @@ impl SnarlViewer<EdNode> for Viewer<'_> {
             {
                 self.collapsed.remove(&node);
             }
-            self.previews.remove(&node); // free the GPU texture while collapsed
-            self.prev_key.remove(&node);
             self.body_size.insert(node, ui.min_rect().size());
             return;
         }
@@ -686,50 +684,26 @@ impl SnarlViewer<EdNode> for Viewer<'_> {
 
         match graph_rooted_at(snarl, node) {
             Ok(g) => {
-                // 3D → the GPU pool (push a request, draw last frame's texture, CPU-raymarch fallback while
-                // it warms up). 2D → the cached CPU heatmap.
-                let tex = if is3d {
-                    let gkey = gpu_inline_key(self.level_salt, node);
-                    self.gpu_reqs.push(GpuPreviewRequest {
-                        key: gkey,
-                        graph: g.clone(),
-                        half,
-                        center: (cx, cz),
-                        yaw,
-                        pitch,
-                        res_w: res as u32,
-                        res_h: res as u32,
-                    });
-                    match self.gpu_tex.get(&gkey) {
-                        Some(&t) => t,
-                        None => {
-                            let pk = preview_key(&g, half, res.min(160), res.min(160), true, yaw, pitch, (cx, cz));
-                            if self.prev_key.get(&node) != Some(&pk) || !self.previews.contains_key(&node) {
-                                let img = render_surface_preview(&g, half, yaw, pitch, res.min(160));
-                                let h = ui.ctx().load_texture(format!("wg-preview-{node:?}"), img, egui::TextureOptions::LINEAR);
-                                self.previews.insert(node, h);
-                                self.prev_key.insert(node, pk);
-                            }
-                            self.previews[&node].id()
-                        }
-                    }
-                } else {
-                    let pk = preview_key(&g, half, res, res, false, 0.0, 0.0, (cx, cz));
-                    if self.prev_key.get(&node) != Some(&pk) || !self.previews.contains_key(&node) {
-                        let img = render_field_preview(&g, half, res, res, (cx, cz));
-                        let h = ui.ctx().load_texture(format!("wg-preview-{node:?}"), img, egui::TextureOptions::LINEAR);
-                        self.previews.insert(node, h);
-                        self.prev_key.insert(node, pk);
-                    }
-                    self.previews[&node].id()
-                };
+                // Both 2D and 3D render on the GPU pool (one shader, one `height_colour` SSOT). Push a
+                // request and draw last frame's pool texture.
+                let gkey = gpu_inline_key(self.level_salt, node);
+                self.gpu_reqs.push(GpuPreviewRequest {
+                    key: gkey,
+                    graph: g,
+                    half,
+                    center: (cx, cz),
+                    is3d,
+                    yaw,
+                    pitch,
+                    res_w: res as u32,
+                    res_h: res as u32,
+                });
+                let tex = self.gpu_tex.get(&gkey).copied();
                 ui.horizontal_top(|ui| {
-                    // LEFT — the preview image with on-image gestures: scroll = zoom, drag = orbit (3D) /
-                    // pan (2D), right-drag = pan (3D). The scroll is consumed so the graph doesn't also zoom.
-                    let img_resp = ui.add(
-                        egui::Image::new(egui::load::SizedTexture::new(tex, egui::vec2(size, size)))
-                            .sense(egui::Sense::click_and_drag()),
-                    );
+                    // LEFT — the preview image (a flat placeholder for the ~1 frame before the GPU texture
+                    // warms up) with on-image gestures: scroll = zoom, drag = orbit (3D) / pan (2D),
+                    // right-drag = pan (3D). The scroll is consumed so the graph doesn't also zoom.
+                    let img_resp = preview_image(ui, tex, egui::vec2(size, size));
                     {
                         let h = self.zoom_half_m.entry(node).or_insert(PREVIEW_HALF_M);
                         let cam = self.cam.entry(node).or_insert(CAM_DEFAULT);
@@ -781,8 +755,6 @@ impl SnarlViewer<EdNode> for Viewer<'_> {
                 });
             }
             Err(e) => {
-                self.previews.remove(&node);
-                self.prev_key.remove(&node);
                 ui.colored_label(egui::Color32::from_rgb(200, 150, 120), format!("connect inputs ({e})"));
             }
         }
@@ -940,11 +912,12 @@ use egui_snarl::ui::SnarlPin;
 /// the wiring + measured sizes ⇒ stable + readable.
 fn auto_arrange(snarl: &mut Snarl<EdNode>, body_size: &std::collections::HashMap<NodeId, egui::Vec2>) {
     use std::collections::{HashMap, HashSet};
-    const GAP_X: f32 = 90.0;
-    const GAP_Y: f32 = 56.0;
+    const GAP_X: f32 = 80.0;
+    const GAP_Y: f32 = 44.0;
     const HEADER: f32 = 40.0; // title bar
     const PIN_ROW: f32 = 26.0; // per input/output pin row
     const FRAME: f32 = 34.0; // node frame margins (top+bottom / left+right)
+    const OUT_PIN: f32 = 18.0; // output-pin column on the right
 
     // Upstream nodes feeding each node (over all input slots).
     let mut up: HashMap<NodeId, Vec<NodeId>> = HashMap::new();
@@ -1004,8 +977,14 @@ fn auto_arrange(snarl: &mut Snarl<EdNode>, body_size: &std::collections::HashMap
         let default_body =
             if has_preview { egui::vec2(210.0, DEFAULT_PREVIEW_PX + 96.0) } else { egui::vec2(70.0, 6.0) };
         let body = body_size.get(&id).copied().unwrap_or(default_body);
-        let w = body.x.max(96.0) + FRAME;
-        let h = HEADER + arity as f32 * PIN_ROW + body.y + FRAME;
+        // Input pins flank the body on the LEFT (header on top, output pin on the right), so the node's
+        // height is `header + max(body, pin-rows)` — NOT the sum — and its width includes the input-label
+        // column (biome climate labels are long) + the output pin. Summing body+pins over-estimated height,
+        // spreading nodes (and shrinking the fit-to-view zoom).
+        let max_label = node.map(|n| (0..arity).map(|s| input_label(n, s).len()).max().unwrap_or(0)).unwrap_or(0);
+        let in_col = if max_label > 0 { 20.0 + max_label as f32 * 7.0 } else { 14.0 };
+        let w = in_col + body.x.max(96.0) + OUT_PIN + FRAME;
+        let h = HEADER + body.y.max(arity as f32 * PIN_ROW) + FRAME;
         size_of.insert(id, (w, h));
     }
 
@@ -1116,14 +1095,6 @@ fn handle_preview_gestures(
 const DEFAULT_PREVIEW_PX: f32 = 120.0;
 /// Default half-extent (metres) of the world window a preview samples, centred on the origin.
 const PREVIEW_HALF_M: f64 = 2048.0;
-/// Seed used for previews (matches the default world seed so the heatmap mirrors the live terrain).
-const PREVIEW_SEED: u64 = 7;
-/// Absolute world height (m) of sea level — values below render as water in every preview.
-const PREVIEW_SEA_LEVEL: f64 = 0.0;
-/// Absolute world height (m) that maps to the top (snow) of the land ramp.
-const PREVIEW_SNOW_LEVEL: f64 = 1000.0;
-/// Depth (m) below sea level that maps to the deepest water colour.
-const PREVIEW_WATER_DEPTH: f64 = 400.0;
 
 /// Human label for a node's input pin `slot` (shown beside the pin).
 fn input_label(node: &EdNode, slot: usize) -> &'static str {
@@ -1153,258 +1124,24 @@ fn input_label(node: &EdNode, slot: usize) -> &'static str {
     }
 }
 
-/// Render (or reuse) a preview texture into `tex`/`key`, re-rendering only when the inputs change. Used
-/// by the popped-out preview windows (the in-graph body has its own HashMap-keyed cache).
-#[allow(clippy::too_many_arguments)]
-fn ensure_preview_texture(
-    ctx: &egui::Context,
-    name: String,
-    g: &Graph,
-    half: f64,
-    res_w: usize,
-    res_h: usize,
-    is3d: bool,
-    cam: (f32, f32),
-    center: (f64, f64),
-    tex: &mut Option<egui::TextureHandle>,
-    key: &mut u64,
-) -> egui::TextureId {
-    let k = preview_key(g, half, res_w, res_h, is3d, cam.0, cam.1, center);
-    if tex.is_none() || *key != k {
-        let img = if is3d {
-            // CPU 3D fallback stays square (the GPU path is the aspect-correct one).
-            render_surface_preview(g, half, cam.0, cam.1, res_h)
-        } else {
-            render_field_preview(g, half, res_w, res_h, center)
-        };
-        *tex = Some(ctx.load_texture(name, img, egui::TextureOptions::LINEAR));
-        *key = k;
-    }
-    tex.as_ref().unwrap().id()
-}
-
-/// Fingerprint everything a preview render depends on, so it's only recomputed on change.
-#[allow(clippy::too_many_arguments)]
-fn preview_key(g: &Graph, half: f64, res_w: usize, res_h: usize, is3d: bool, yaw: f32, pitch: f32, center: (f64, f64)) -> u64 {
-    use std::hash::{Hash, Hasher};
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    ron::to_string(g).unwrap_or_default().hash(&mut h);
-    half.to_bits().hash(&mut h);
-    (res_w as u64).hash(&mut h);
-    (res_h as u64).hash(&mut h);
-    is3d.hash(&mut h);
-    center.0.to_bits().hash(&mut h);
-    center.1.to_bits().hash(&mut h);
-    if is3d {
-        yaw.to_bits().hash(&mut h);
-        pitch.to_bits().hash(&mut h);
-    }
-    h.finish()
-}
-
-/// Evaluate a node's sub-[`Graph`] over a top-down grid spanning ±`half_m` metres and colour each sample
-/// by its ABSOLUTE world height + sea level (not a per-preview local range), so the same colour means the
-/// same elevation across every node and zoom level. Below [`PREVIEW_SEA_LEVEL`] reads as water.
-fn render_field_preview(g: &Graph, half_m: f64, res_w: usize, res_h: usize, center: (f64, f64)) -> egui::ColorImage {
-    let nx = res_w.max(2);
-    let ny = res_h.max(2);
-    // Non-square: widen the world window horizontally by the aspect so the image fills without stretching.
-    let half_x = half_m * nx as f64 / ny as f64;
-    let mut pixels = Vec::with_capacity(nx * ny);
-    for j in 0..ny {
-        for i in 0..nx {
-            let wx = center.0 - half_x + (i as f64 + 0.5) / nx as f64 * 2.0 * half_x;
-            let wz = center.1 - half_m + (j as f64 + 0.5) / ny as f64 * 2.0 * half_m;
-            let c = height_color_rgb(g.eval(wx, wz, PREVIEW_SEED).v);
-            pixels.push(egui::Color32::from_rgb((c[0] * 255.0) as u8, (c[1] * 255.0) as u8, (c[2] * 255.0) as u8));
-        }
-    }
-    egui::ColorImage::new([nx, ny], pixels)
-}
-
-/// Linear-interpolate an rgb colour ramp at `t∈[0,1]`.
-fn lerp_stops(t: f32, stops: &[(f32, [f32; 3])]) -> [f32; 3] {
-    let mut c = stops[stops.len() - 1].1;
-    for w in stops.windows(2) {
-        let (t0, c0) = w[0];
-        let (t1, c1) = w[1];
-        if t <= t1 {
-            let f = if t1 > t0 { (t - t0) / (t1 - t0) } else { 0.0 };
-            c = [c0[0] + (c1[0] - c0[0]) * f, c0[1] + (c1[1] - c0[1]) * f, c0[2] + (c1[2] - c0[2]) * f];
-            break;
-        }
-    }
-    c
-}
-
-/// Colour an ABSOLUTE world height (m): water below sea level (shore → deep), then a land ramp from sea
-/// level (beach) up to the snow line. Shared by the 2D heatmap and the 3D surface so they agree.
-fn height_color_rgb(v: f64) -> [f32; 3] {
-    const WATER: [(f32, [f32; 3]); 2] = [(0.0, [0.30, 0.52, 0.68]), (1.0, [0.05, 0.12, 0.32])];
-    const LAND: [(f32, [f32; 3]); 5] = [
-        (0.0, [0.76, 0.70, 0.50]),  // beach / sand
-        (0.12, [0.24, 0.55, 0.35]), // grass
-        (0.45, [0.36, 0.45, 0.26]), // forest / hill
-        (0.72, [0.48, 0.42, 0.36]), // rock
-        (1.0, [0.95, 0.95, 0.97]),  // snow
-    ];
-    if v < PREVIEW_SEA_LEVEL {
-        let t = ((PREVIEW_SEA_LEVEL - v) / PREVIEW_WATER_DEPTH).clamp(0.0, 1.0) as f32;
-        lerp_stops(t, &WATER)
-    } else {
-        let t = ((v - PREVIEW_SEA_LEVEL) / (PREVIEW_SNOW_LEVEL - PREVIEW_SEA_LEVEL)).clamp(0.0, 1.0) as f32;
-        lerp_stops(t, &LAND)
-    }
-}
-
-// ===================================================================================================
-// 3D SDF-raymarched surface preview
-// ===================================================================================================
-
-/// Safety cap on adaptive march iterations per ray (the step is adaptive, so this is rarely hit).
-const SURFACE_MAX_ITERS: usize = 192;
-
-/// Render the node's height field as a 3D **SDF-raymarched** surface (heightfield ray–surface
-/// intersection) into an [`egui::ColorImage`]. The camera orbits the ±`half_m` window at (`yaw`,`pitch`),
-/// framing the field's own height range; shading uses the analytic gradient normal + a terrain ramp.
-fn render_surface_preview(g: &Graph, half_m: f64, yaw: f32, pitch: f32, res: usize) -> egui::ColorImage {
-    use bevy::math::Vec3;
-    let res = res.max(2);
-
-    // Coarse pass: the field's height range over the window (for camera framing + colour normalisation).
-    let (mut hmin, mut hmax) = (f64::INFINITY, f64::NEG_INFINITY);
-    let cg = 16usize;
-    for j in 0..cg {
-        for i in 0..cg {
-            let wx = -half_m + (i as f64 + 0.5) / cg as f64 * 2.0 * half_m;
-            let wz = -half_m + (j as f64 + 0.5) / cg as f64 * 2.0 * half_m;
-            let v = g.eval(wx, wz, PREVIEW_SEED).v;
-            if v.is_finite() {
-                hmin = hmin.min(v);
-                hmax = hmax.max(v);
-            }
-        }
-    }
-    if !hmin.is_finite() {
-        hmin = 0.0;
-        hmax = 1.0;
-    }
-    let span = (hmax - hmin).max(1.0);
-
-    let half = half_m as f32;
-    let (ymin, ymax) = (hmin as f32, hmax as f32);
-    let pad = span as f32 * 0.08 + 1.0;
-    let (bmin, bmax) = (Vec3::new(-half, ymin - pad, -half), Vec3::new(half, ymax + pad, half));
-
-    // Orbit camera framing the box centre.
-    let centre = Vec3::new(0.0, (ymin + ymax) * 0.5, 0.0);
-    let dist = half * 2.4 + span as f32;
-    let (sp, cp) = (pitch.sin(), pitch.cos());
-    let (sy, cyaw) = (yaw.sin(), yaw.cos());
-    let eye = centre + Vec3::new(cp * cyaw, sp, cp * sy) * dist;
-    let fwd = (centre - eye).normalize();
-    let right = fwd.cross(Vec3::Y).normalize_or_zero();
-    let up = right.cross(fwd);
-    let tan = (0.6f32 * 0.5).tan() * 2.0; // ~ vertical half-extent at the image plane
-    let light = Vec3::new(0.4, 0.85, 0.3).normalize();
-
-    let mut pixels = Vec::with_capacity(res * res);
-    for py in 0..res {
-        for px in 0..res {
-            let ndcx = (px as f32 + 0.5) / res as f32 * 2.0 - 1.0;
-            let ndcy = 1.0 - (py as f32 + 0.5) / res as f32 * 2.0;
-            let dir = (fwd + right * (ndcx * tan) + up * (ndcy * tan)).normalize();
-            let col = match ray_box(eye, dir, bmin, bmax) {
-                Some((t0, t1)) => march_surface(g, eye, dir, t0.max(0.0), t1, light, ndcy),
-                None => sky(ndcy),
-            };
-            pixels.push(col);
-        }
-    }
-    egui::ColorImage::new([res, res], pixels)
-}
-
-/// Slab ray–AABB intersection → entry/exit `t` (or `None`).
-fn ray_box(o: bevy::math::Vec3, d: bevy::math::Vec3, bmin: bevy::math::Vec3, bmax: bevy::math::Vec3) -> Option<(f32, f32)> {
-    let inv = bevy::math::Vec3::ONE / d;
-    let t1 = (bmin - o) * inv;
-    let t2 = (bmax - o) * inv;
-    let tmin = t1.min(t2).max_element();
-    let tmax = t1.max(t2).min_element();
-    if tmax >= tmin.max(0.0) { Some((tmin, tmax)) } else { None }
-}
-
-/// March a ray through the heightfield between `t0..t1` with ADAPTIVE (sphere-trace-like) steps — big
-/// strides through empty air above the terrain, shrinking near the surface — so cost tracks the surface,
-/// not a fixed step count. On the first downward crossing shade with the analytic-gradient normal +
-/// ABSOLUTE-height terrain colour, else sky.
-fn march_surface(
-    g: &Graph,
-    eye: bevy::math::Vec3,
-    dir: bevy::math::Vec3,
-    t0: f32,
-    t1: f32,
-    light: bevy::math::Vec3,
-    ndcy: f32,
-) -> egui::Color32 {
-    use bevy::math::Vec3;
-    // Vertical gap above the heightfield at ray distance `t` (negative ⇒ below the surface).
-    let above = |t: f32| -> f64 {
-        let p = eye + dir * t;
-        p.y as f64 - g.eval(p.x as f64, p.z as f64, PREVIEW_SEED).v
-    };
-    if t1 <= t0 {
-        return sky(ndcy);
-    }
-    // Conservative step: the vertical gap divided by the ray's downward component is a safe-ish advance
-    // (scaled <1 for sloped terrain); floored so the march always progresses + terminates.
-    let descent = (-dir.y as f64).max(0.05);
-    let min_step = ((t1 - t0) / 4096.0).max(1e-4);
-    let mut t = t0;
-    let mut a_prev = above(t);
-    for _ in 0..SURFACE_MAX_ITERS {
-        if t >= t1 {
-            break;
-        }
-        let step = ((a_prev.max(0.0) / descent) * 0.5).max(min_step as f64) as f32;
-        let tn = (t + step).min(t1);
-        let a_n = above(tn);
-        if a_n <= 0.0 && a_prev > 0.0 {
-            // Bisect the crossing for a crisp silhouette.
-            let (mut lo, mut hi) = (t, tn);
-            for _ in 0..16 {
-                let m = (lo + hi) * 0.5;
-                if above(m) > 0.0 {
-                    lo = m;
-                } else {
-                    hi = m;
-                }
-            }
-            let pm = eye + dir * ((lo + hi) * 0.5);
-            let f = g.eval(pm.x as f64, pm.z as f64, PREVIEW_SEED);
-            let n = Vec3::new(-f.dx as f32, 1.0, -f.dz as f32).normalize();
-            let lamb = n.dot(light).clamp(0.0, 1.0);
-            let base = height_color_rgb(f.v);
-            let lit = 0.28 + 0.72 * lamb;
-            return egui::Color32::from_rgb(
-                (base[0] * lit * 255.0) as u8,
-                (base[1] * lit * 255.0) as u8,
-                (base[2] * lit * 255.0) as u8,
+/// Draw a preview image at `size`, or a flat "baking…" placeholder for the ~1 frame before the GPU pool
+/// texture is ready. Returns the (click-and-drag-sensing) response so on-image gestures work either way.
+fn preview_image(ui: &mut egui::Ui, tex: Option<egui::TextureId>, size: egui::Vec2) -> egui::Response {
+    match tex {
+        Some(t) => ui.add(egui::Image::new(egui::load::SizedTexture::new(t, size)).sense(egui::Sense::click_and_drag())),
+        None => {
+            let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::click_and_drag());
+            ui.painter().rect_filled(rect, 4.0, egui::Color32::from_gray(20));
+            ui.painter().text(
+                rect.center(),
+                egui::Align2::CENTER_CENTER,
+                "baking…",
+                egui::FontId::proportional(12.0),
+                egui::Color32::from_gray(90),
             );
+            resp
         }
-        a_prev = a_n;
-        t = tn;
     }
-    sky(ndcy)
-}
-
-/// Background sky gradient for ray misses (darker low, lighter high).
-fn sky(ndcy: f32) -> egui::Color32 {
-    let t = (ndcy * 0.5 + 0.5).clamp(0.0, 1.0);
-    let r = (30.0 + 40.0 * t) as u8;
-    let g = (38.0 + 55.0 * t) as u8;
-    let b = (55.0 + 75.0 * t) as u8;
-    egui::Color32::from_rgb(r, g, b)
 }
 
 // ===================================================================================================
@@ -1412,11 +1149,11 @@ fn sky(ndcy: f32) -> egui::Color32 {
 // ===================================================================================================
 
 fn graph_panel(world: &mut World, ui: &mut egui::Ui) {
-    // Seed the editor with the default multi-biome WORLD graph once (it IS the default — no button), and
-    // drive the live terrain from it immediately so the editor opens on the biome world.
+    // Seed the editor once by LOADING the graph from disk (the saved .worldgraph.ron / .graph.ron, falling
+    // back to the built-in default), and drive the live terrain from it.
     world.resource_scope::<WorldGraphEditor, ()>(|world, mut editor| {
         if !editor.seeded {
-            editor.snarl = world_biome_snarl();
+            editor.snarl = load_editor_snarl(&editor.path);
             editor.seeded = true;
             if let Ok(g) = snarl_to_graph(&editor.snarl) {
                 world.resource_mut::<WorldGraph>().0 = Arc::new(g);
@@ -1570,14 +1307,12 @@ fn graph_panel(world: &mut World, ui: &mut egui::Ui) {
             let WorldGraphEditor {
                 snarl,
                 nav,
-                previews,
                 collapsed,
                 zoom_half_m,
                 surface,
                 cam,
                 body_size,
                 disp_px,
-                prev_key,
                 pan,
                 hovered_preview,
                 enter,
@@ -1587,14 +1322,12 @@ fn graph_panel(world: &mut World, ui: &mut egui::Ui) {
             } = &mut *editor;
             let current = current_snarl_mut(snarl, nav);
             let mut viewer = Viewer {
-                previews,
                 collapsed,
                 zoom_half_m,
                 surface,
                 cam,
                 body_size,
                 disp_px,
-                prev_key,
                 enter,
                 pop_request,
                 to_panel,
@@ -1604,9 +1337,10 @@ fn graph_panel(world: &mut World, ui: &mut egui::Ui) {
                 hovered_preview,
                 level_salt,
             };
-            // Keep nodes readable: don't let the auto-fit zoom out below ~0.6 (default min is 0.2, which
-            // makes a freshly-arranged graph tiny), allow zooming in to 3×.
-            let style = SnarlStyle { min_scale: Some(0.6), max_scale: Some(3.0), ..SnarlStyle::new() };
+            // Keep nodes readable on load: egui-snarl's initial view auto-fits the graph clamped to
+            // [min_scale, max_scale], so the floor doubles as the default zoom — 0.75 keeps a freshly-loaded
+            // graph legible (the compact auto-arrange usually fits above this). Allow zooming in to 3×.
+            let style = SnarlStyle { min_scale: Some(0.75), max_scale: Some(3.0), ..SnarlStyle::new() };
             SnarlWidget::new()
                 .id(egui::Id::new("worldgen-biome-graph"))
                 .style(style)
@@ -1659,8 +1393,6 @@ fn graph_panel(world: &mut World, ui: &mut egui::Ui) {
                 size,
                 is3d,
                 cam,
-                tex: None,
-                key: 0,
                 open: true,
             });
         }
@@ -1682,7 +1414,7 @@ fn graph_panel(world: &mut World, ui: &mut egui::Ui) {
 }
 
 /// The dockable, viewport-located **Node Preview** panel — shows whichever node was sent via "→ panel",
-/// large, with its own 2D/3D + zoom/pan/orbit (GPU 3D via the shared pool, CPU 2D).
+/// large, with its own 2D/3D + zoom/pan/orbit (both rendered on the shared GPU pool).
 fn preview_panel(world: &mut World, ui: &mut egui::Ui) {
     let Some((nav, node)) = world.resource::<WorldgenPreviewPanel>().target.clone() else {
         ui.label("No preview targeted. In the Biome Graph, click a node preview's ▢ button to show it here.");
@@ -1713,40 +1445,28 @@ fn preview_panel(world: &mut World, ui: &mut egui::Ui) {
         });
         let ppp = ui.ctx().pixels_per_point();
         // Fill the panel non-square (drag the dock edge to resize); render res tracks the on-screen size.
+        // Square preview sized to fit the panel (drag the dock edge to resize), centred in the leftover space.
         let avail = ui.available_size();
-        let (w, h) = (avail.x.max(64.0), avail.y.max(64.0));
-        let res_w = ((w * ppp).round() as usize).max(32);
-        let res_h = ((h * ppp).round() as usize).max(32);
-        let tex = if panel.is3d {
-            world.resource_mut::<GpuPreviewRequests>().0.push(GpuPreviewRequest {
-                key: PANEL_GPU_KEY,
-                graph: g.clone(),
-                half: panel.half,
-                center: panel.pan,
-                yaw: panel.cam.0,
-                pitch: panel.cam.1,
-                res_w: res_w as u32,
-                res_h: res_h as u32,
-            });
-            world.resource::<GpuPreviewTextures>().0.get(&PANEL_GPU_KEY).copied()
-        } else {
-            None
-        };
-        let tid = match tex {
-            Some(t) => t,
-            None => {
-                let (rw, rh) = if panel.is3d { (res_w.min(160), res_h.min(160)) } else { (res_w, res_h) };
-                ensure_preview_texture(ui.ctx(), "wg-panel-tex".into(), &g, panel.half, rw, rh, panel.is3d, panel.cam, panel.pan, &mut panel.tex, &mut panel.key)
-            }
-        };
-        let resp = ui.add(
-            egui::Image::new(egui::load::SizedTexture::new(tid, egui::vec2(w, h)))
-                .sense(egui::Sense::click_and_drag()),
-        );
-        scroll_zoom_consume(ui, &resp, &mut panel.half);
-        // size = height → uniform world-per-pixel for pan (the camera frames `half` vertically).
-        let WorldgenPreviewPanel { half, pan, cam, is3d, .. } = &mut *panel;
-        handle_preview_gestures(ui, &resp, *is3d, h, half, &mut pan.0, &mut pan.1, &mut cam.0, &mut cam.1);
+        let side = avail.x.min(avail.y).max(64.0);
+        let res = ((side * ppp).round() as usize).max(32);
+        world.resource_mut::<GpuPreviewRequests>().0.push(GpuPreviewRequest {
+            key: PANEL_GPU_KEY,
+            graph: g,
+            half: panel.half,
+            center: panel.pan,
+            is3d: panel.is3d,
+            yaw: panel.cam.0,
+            pitch: panel.cam.1,
+            res_w: res as u32,
+            res_h: res as u32,
+        });
+        let tex = world.resource::<GpuPreviewTextures>().0.get(&PANEL_GPU_KEY).copied();
+        ui.vertical_centered(|ui| {
+            let resp = preview_image(ui, tex, egui::vec2(side, side));
+            scroll_zoom_consume(ui, &resp, &mut panel.half);
+            let WorldgenPreviewPanel { half, pan, cam, is3d, .. } = &mut *panel;
+            handle_preview_gestures(ui, &resp, *is3d, side, half, &mut pan.0, &mut pan.1, &mut cam.0, &mut cam.1);
+        });
     });
 }
 
@@ -1769,9 +1489,8 @@ fn open_preview_panel(world: &mut World) {
     }
 }
 
-/// Draw one popped-out preview as a floating, resizable `egui::Window`. In **3D** it renders on the GPU
-/// (pushes a request into the shared pool, draws last frame's GPU texture, falls back to the CPU raymarch
-/// until the GPU texture is ready); in **2D** it's the CPU heatmap. `gpu_tex` is last frame's pool output.
+/// Draw one popped-out preview as a floating, resizable `egui::Window`. Both 2D and 3D render on the
+/// shared GPU pool (push a request, draw last frame's texture). `gpu_tex` is last frame's pool output.
 fn popped_preview_window(
     ui: &egui::Ui,
     p: &mut PoppedPreview,
@@ -1815,40 +1534,28 @@ fn popped_preview_window(
             }
 
             let ppp = ui.ctx().pixels_per_point();
-            // Fill the window non-square (drag its edge to resize); render res tracks the on-screen size.
+            // Square preview sized to fit the window (drag its edge to resize), centred in the leftover space.
             let avail = ui.available_size();
-            let (w, h) = (avail.x.max(64.0), avail.y.max(64.0));
-            let res_w = ((w * ppp).round() as usize).max(32);
-            let res_h = ((h * ppp).round() as usize).max(32);
-            let tex = if p.is3d {
-                // GPU path: request a render for next frame; show last frame's (or CPU-raymarch fallback).
-                gpu_reqs.push(GpuPreviewRequest {
-                    key: p.id,
-                    graph: g.clone(),
-                    half: p.half,
-                    center: (p.cx, p.cz),
-                    yaw: p.cam.0,
-                    pitch: p.cam.1,
-                    res_w: res_w as u32,
-                    res_h: res_h as u32,
-                });
-                match gpu_tex.get(&p.id) {
-                    Some(&t) => t,
-                    None => {
-                        let name = format!("wg-pop-tex-{}", p.id);
-                        ensure_preview_texture(ui.ctx(), name, &g, p.half, res_w.min(160), res_h.min(160), true, p.cam, (p.cx, p.cz), &mut p.tex, &mut p.key)
-                    }
-                }
-            } else {
-                let name = format!("wg-pop-tex-{}", p.id);
-                ensure_preview_texture(ui.ctx(), name, &g, p.half, res_w, res_h, false, p.cam, (p.cx, p.cz), &mut p.tex, &mut p.key)
-            };
-            let resp = ui.add(
-                egui::Image::new(egui::load::SizedTexture::new(tex, egui::vec2(w, h)))
-                    .sense(egui::Sense::click_and_drag()),
-            );
-            scroll_zoom_consume(ui, &resp, &mut p.half);
-            handle_preview_gestures(ui, &resp, p.is3d, h, &mut p.half, &mut p.cx, &mut p.cz, &mut p.cam.0, &mut p.cam.1);
+            let side = avail.x.min(avail.y).max(64.0);
+            let res = ((side * ppp).round() as usize).max(32);
+            // GPU path (2D + 3D): request a render for next frame; draw last frame's pool texture.
+            gpu_reqs.push(GpuPreviewRequest {
+                key: p.id,
+                graph: g,
+                half: p.half,
+                center: (p.cx, p.cz),
+                is3d: p.is3d,
+                yaw: p.cam.0,
+                pitch: p.cam.1,
+                res_w: res as u32,
+                res_h: res as u32,
+            });
+            let tex = gpu_tex.get(&p.id).copied();
+            ui.vertical_centered(|ui| {
+                let resp = preview_image(ui, tex, egui::vec2(side, side));
+                scroll_zoom_consume(ui, &resp, &mut p.half);
+                handle_preview_gestures(ui, &resp, p.is3d, side, &mut p.half, &mut p.cx, &mut p.cz, &mut p.cam.0, &mut p.cam.1);
+            });
         });
     p.open = open;
 }
