@@ -68,14 +68,19 @@ pub fn apply_layout(world: &mut World, ron: &str) -> bool {
     true
 }
 
-/// Replace whichever main-surface leaf holds the scene box with `tabs` (active = `active`).
+/// Replace the SCENE tabs of whichever main-surface leaf holds the scene box with `tabs` (active =
+/// `active`), **preserving any `Registered` panels docked into that same leaf** (e.g. a `DockSide::Center`
+/// panel like the worldgen Node Preview). Without this, collapsing/swapping the scene box would silently
+/// drop center-docked panels — including from the auto-persisted layout, so they'd never return on reload.
 fn set_scene_box_tabs(state: &mut DockState<EditorTab>, tabs: Vec<EditorTab>, active: usize) {
     for node in state.main_surface_mut().iter_mut() {
         if let Some(leaf) = node.get_leaf_mut()
             && leaf.tabs.iter().any(is_center_tab)
         {
-            leaf.tabs = tabs.clone();
-            leaf.active = TabIndex(active.min(leaf.tabs.len().saturating_sub(1)));
+            // Keep the docked panels (anything that isn't a scene tab); only the scene set is swapped.
+            let panels: Vec<EditorTab> = leaf.tabs.iter().filter(|t| !is_center_tab(t)).cloned().collect();
+            leaf.active = TabIndex(active.min(tabs.len().saturating_sub(1)));
+            leaf.tabs = tabs.iter().cloned().chain(panels).collect();
         }
     }
 }
@@ -392,5 +397,23 @@ pub fn layouts_ui(world: &mut World, ctx: &egui::Context) {
     dialog.name_input = name;
     if !keep_open {
         dialog.open = false;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Collapsing/swapping the scene box must KEEP center-docked registered panels in the same leaf — the
+    /// worldgen Node Preview bug: it's a `DockSide::Center` tab in the scene-box leaf, and `serialize_layout`
+    /// (via `set_scene_box_tabs`) used to overwrite the leaf with just `[NoScene]`, so the panel vanished
+    /// from the auto-persisted layout and never returned on reload.
+    #[test]
+    fn set_scene_box_tabs_preserves_registered_center_panels() {
+        let panel = EditorTab::Registered("worldgen/node-preview".to_string());
+        let mut state = DockState::new(vec![EditorTab::NoScene, panel.clone()]);
+        set_scene_box_tabs(&mut state, vec![EditorTab::NoScene], 0);
+        let leaf = state.main_surface().iter().find_map(|n| n.get_leaf()).expect("a leaf");
+        assert!(leaf.tabs.contains(&panel), "registered center panel must survive scene-box collapse");
     }
 }
