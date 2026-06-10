@@ -8,7 +8,7 @@
 //! order. Sources (`WorldX/Z`, `Const`, `Fbm`) ignore their inputs; `Fbm` reads the eval point + folds
 //! the world seed with its salt (the exact idiom in `layers::height::fbm_params`).
 
-use super::super::noise::{FbmParams, fbm_height_grad};
+use super::super::noise::{FbmParams, fbm_height_grad, fbm_height_grad_x4};
 use super::super::spline::Spline;
 use super::Field;
 
@@ -286,8 +286,26 @@ impl Graph {
                     }
                 }
                 NodeKind::Fbm(axis) => {
+                    // The gen hot path: ~13 octaves of value-noise per grid point. Process the grid 4
+                    // points at a time with the bit-identical SIMD octave sum (`fbm_height_grad_x4`),
+                    // then the `npts % 4` tail with the scalar `fbm_height_grad`. The x4 path is pinned
+                    // `to_bits()`-equal to the scalar one (noise.rs `x4_matches_scalar`), so this stays
+                    // bit-for-bit identical to the per-point `eval_into` (the determinism contract).
                     let params = axis.params(world_seed);
-                    for p in 0..npts {
+                    let chunks = npts / 4;
+                    for c in 0..chunks {
+                        let p = c * 4;
+                        let wx = wide::f64x4::new([xs[p], xs[p + 1], xs[p + 2], xs[p + 3]]);
+                        let wz = wide::f64x4::new([zs[p], zs[p + 1], zs[p + 2], zs[p + 3]]);
+                        let (h, gx, gz) = fbm_height_grad_x4(wx, wz, &params);
+                        let ha = h.to_array();
+                        let gxa = gx.to_array();
+                        let gza = gz.to_array();
+                        for l in 0..4 {
+                            scratch[base + p + l] = Field::new(ha[l], gxa[l], gza[l]);
+                        }
+                    }
+                    for p in (chunks * 4)..npts {
                         let (h, gx, gz) = fbm_height_grad(xs[p], zs[p], &params);
                         scratch[base + p] = Field::new(h, gx, gz);
                     }

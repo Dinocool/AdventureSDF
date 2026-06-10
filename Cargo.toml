@@ -128,6 +128,12 @@ emath = "0.33"
 # `#[repr(C)]` structs (see `sdf_render::render::gpu`), replacing hand-rolled `to_le_bytes` packing.
 bytemuck = { version = "1", features = ["derive"] }
 transvoxel = "2.0.0"
+# Portable 4-wide SIMD (`f64x4`/`i32x4`/`u32x4`) for the columnar worldgen height eval: the value-noise
+# octave sum is the gen hot path, processed 4 grid points at a time. `wide` falls back to scalar lanes on
+# non-SIMD targets, and its integer ops (xor/wrapping-mul/shift) + `f64` basic ops (`+ - *`, `floor`,
+# `i32→f64`) are bit-identical to the scalar `noise.rs` primitives — preserving the bit-portable
+# determinism invariant (no FMA/reassociation). Already in the tree transitively via rapier (no new fetch).
+wide = "0.7.33"
 
 [dev-dependencies]
 # spv-out: emit SPIR-V from naga in tests so we can inspect which opcode signed `%`

@@ -115,6 +115,7 @@ dependencies = [
  "tracing-chrome",
  "transvoxel",
  "wgpu",
+ "wide",
 ]
 
 [[package]]
