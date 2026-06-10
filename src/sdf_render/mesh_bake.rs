@@ -809,13 +809,27 @@ impl MeshBuilder<f32, f32> for ChunkMeshBuilder<'_> {
         // rule as the density closure), so its normal + material match the fine neighbour bit-for-bit — no
         // shading/material seam across the cross-LOD weld. Interior vertices use the chunk's own `vs`.
         let vs_eff = transition_sample_vs(world, self.cmin, self.cmax, self.vs, self.flags);
-        // Outward normal. For a terrain-only chunk, take it from the clipmap's SMOOTH stored gradient (no
-        // central-difference faceting at coarse LODs / cross-LOD borders) — falling back to the CSG gradient
-        // on a clipmap miss. Mixed/object chunks use the exact ∇(CSG distance) (toward increasing distance).
+        // Outward normal. For a terrain-only chunk, bake the FULL-FIDELITY (mip-0-scale) band-limited
+        // surface normal (`surface_normal_hifi`) — so a COARSE-LOD mesh, whose averaged geometry has lost
+        // the fine relief (reads flat), still shades with that detail ("detail-normal baking from a
+        // higher-fidelity LOD"). Hi-fi normals at ALL LODs (one SSOT, no LOD branch): at a fine LOD the
+        // clipmap's mip-0 stored gradient already carries the same detail, so this changes nothing visible
+        // there; the cost is bounded by gating the hi-fi convolution to coarse LODs (see below) if needed.
+        // Falls back to the clipmap's STORED gradient (`terrain_normal`, smooth, no central-diff faceting),
+        // then the CSG gradient, on a miss. Mixed/object chunks use the exact ∇(CSG distance).
         let csg_normal =
             || field_gradient(self.edits, self.indices, world, vs_eff * 0.01, vs_eff).normalize_or_zero();
         let n = if self.terrain_only {
-            crate::sdf_render::worldgen::upload::terrain_normal(world, vs_eff).unwrap_or_else(csg_normal)
+            // DETAIL-NORMAL: at a COARSE LOD (`vs_eff` > the clipmap's finest node spacing) the stored
+            // gradient is band-limited to the coarse mip → reads FLAT, so bake the FULL-FIDELITY band-limited
+            // normal (`surface_normal_hifi`). At a FINE LOD the clipmap's mip-0 stored gradient ALREADY
+            // carries that detail (the accuracy harness measures < ~1° there), so `surface_normal_hifi`
+            // SELF-GATES to `None` and we use the cheap `terrain_normal` — no per-vertex band-limit
+            // convolution on the many-vertex near chunks (the cost the mesh-bake rig flagged). One SSOT, the
+            // gate lives with the clipmap data in `upload`; falls back to the CSG gradient on a clipmap miss.
+            crate::sdf_render::worldgen::upload::surface_normal_hifi(world, vs_eff)
+                .or_else(|| crate::sdf_render::worldgen::upload::terrain_normal(world, vs_eff))
+                .unwrap_or_else(csg_normal)
         } else {
             csg_normal()
         };
@@ -1824,6 +1838,12 @@ mod tests {
         }
         // Single tier 0 (chunk edge = HEIGHT_CHUNK_CELLS), as Step 1 specifies.
         let clip = Arc::new(build_height_clipmap(&store, &[HEIGHT_CHUNK_CELLS]));
+        // Publish the matching tier-0 hi-fi DETAIL-NORMAL sampler (same layer + seed) so the bake's
+        // `surface_normal_hifi` lights up (set_bake_terrain captures it). The terrain normals the LOD-seam /
+        // accuracy harnesses judge then come from the hi-fi gradient, mirroring production.
+        crate::sdf_render::worldgen::upload::set_cpu_terrain_hifi(Some(Arc::new(
+            crate::sdf_render::worldgen::upload::TerrainHifi { layer, world_seed: seed },
+        )));
         set_cpu_height_clipmap(Some(clip.clone()));
         set_cpu_terrain_offset(Vec2::ZERO);
         clip
@@ -2009,6 +2029,7 @@ mod tests {
 
         // Clean up the process-global so other tests aren't perturbed.
         crate::sdf_render::worldgen::upload::set_cpu_height_clipmap(None);
+        crate::sdf_render::worldgen::upload::set_cpu_terrain_hifi(None);
     }
 
     #[test]
@@ -2100,6 +2121,7 @@ mod tests {
         );
 
         crate::sdf_render::worldgen::upload::set_cpu_height_clipmap(None);
+        crate::sdf_render::worldgen::upload::set_cpu_terrain_hifi(None);
     }
 
     /// Build + publish a tier-0 terrain clipmap whose nodes come from the layer's `generate` — the

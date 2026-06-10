@@ -29,6 +29,23 @@ pub const HEIGHT_CHUNK_CELLS: u32 = 128;
 /// node spacing — the authoritative base resolution; the GPU adds finer cosmetic detail on top.
 pub const HEIGHT_FIELD_RES: u32 = 64;
 
+/// FIXED world tap step of the surface band-limit (= the tier-0 node spacing, `128 / 64 = 2 m`). The
+/// band-limit kernel samples [`HeightLayer::sample_world`] at multiples of THIS step at EVERY tier and
+/// in the point-evaluable hi-fi normal — so all of them evaluate the IDENTICAL band-limited world
+/// function (the cross-tier no-seam invariant; see [`HeightLayer::generate`]). Single source of truth.
+pub const HEIGHT_BAND_LIMIT_TAP: f64 = HEIGHT_CHUNK_CELLS as f64 / HEIGHT_FIELD_RES as f64;
+
+/// The separable TENT kernel weights `(K+1−|t|)/(K+1)²` over `t ∈ [−kf, kf]` — bit-portable rationals
+/// summing to 1, in FIXED `t = −kf..=kf` order. THE single source of truth for the band-limit kernel:
+/// [`HeightLayer::generate_band_limited`] (the chunk-grid finalize) and
+/// [`HeightLayer::band_limited_grad`] (the point-evaluable hi-fi gradient) BOTH build the kernel here,
+/// so they can never drift. Deterministic / bit-portable (rational weights, fixed order, no transcendentals).
+#[inline]
+pub fn band_limit_weights(kf: i32) -> Vec<f64> {
+    let denom = ((kf + 1) * (kf + 1)) as f64;
+    (-kf..=kf).map(|t| (((kf + 1) - t.abs()) as f64) / denom).collect()
+}
+
 /// Editor-tweakable height-layer parameters (mirrors the `SdfRaymarchParams` reflected-resource
 /// idiom). A change dirties the layer → regen cascade (handled by the manager).
 #[derive(Resource, Reflect, Clone, Copy, Debug, PartialEq)]
@@ -327,10 +344,8 @@ impl Layer for HeightLayer {
         // exceeds `2·width` smooths ≥ the band-limit by its own (coarse) sampling, so `f_bl ≈ raw` there →
         // point-sample. This caps the fixed-2 m grid to the near tiers (it would explode on the huge far
         // chunks otherwise). Plain fBm (no ridge/erosion) also point-samples.
-        let sharp = self.params.ridge != 0.0 || self.erosion.enabled;
-        let radius = if sharp { self.params.band_limit.max(0.0) } else { 0.0 };
-        let tap = HEIGHT_CHUNK_CELLS as f64 / HEIGHT_FIELD_RES as f64; // FIXED 2 m tap step (tier-0 spacing)
-        let kf = if radius > 0.0 { radius.round() as i32 } else { 0 };
+        let tap = HEIGHT_BAND_LIMIT_TAP; // FIXED 2 m tap step (tier-0 spacing) — the shared SSOT
+        let kf = self.band_limit_kf(); // SHARED `sharp`/`radius` gate (also used by the hi-fi gradient)
         let world_w = kf as f64 * tap;
         if kf < 1 || field.node_spacing >= 2.0 * world_w {
             // Build the (res+1)² node coordinate columns, batch-evaluate the surface once, write back.
@@ -362,6 +377,77 @@ impl Layer for HeightLayer {
 }
 
 impl HeightLayer {
+    /// The half-width of the surface band-limit in FIXED 2 m taps (`kf`), or `0` when the surface has no
+    /// sharp features (plain fBm, no ridge/erosion ⇒ no band-limit) — exactly the `sharp`/`radius` gate
+    /// [`generate`](Self::generate) applies. THE single decision of "does this surface band-limit, and how
+    /// wide", shared by `generate` and the hi-fi gradient so the rendered normal matches the meshed height.
+    #[inline]
+    fn band_limit_kf(&self) -> i32 {
+        let sharp = self.params.ridge != 0.0 || self.erosion.enabled;
+        let radius = if sharp { self.params.band_limit.max(0.0) } else { 0.0 };
+        if radius > 0.0 { radius.round() as i32 } else { 0 }
+    }
+
+    /// FULL-FIDELITY (mip-0-scale) band-limited analytic surface gradient at ANY world `(wx, wz)` —
+    /// available EVERYWHERE (not clipmap-bound). Returns `(h, dh_dx, dh_dz)` of the SAME band-limited
+    /// world function the chunk-grid finalize ([`generate_band_limited`](Self::generate_band_limited))
+    /// produces at mip 0: a separable TENT convolution of [`sample_world`](Self::sample_world) at FIXED
+    /// 2 m taps over `±kf`. When the surface has no sharp features (`kf == 0`) this is exactly the raw
+    /// `sample_world` gradient (matching the clipmap's plain-fBm fast path).
+    ///
+    /// SHARED KERNEL (SSOT — robust by construction): the tent weights come from [`band_limit_weights`]
+    /// (the SAME function `generate_band_limited` calls) and the separable accumulation order is the
+    /// IDENTICAL X-inner / Z-outer nesting — so this point evaluation is bit-for-bit equal to the
+    /// chunk-grid finalize at any node position (interior of the chunk, where neither clamps an apron
+    /// edge). A test (`hifi_grad_matches_generate_band_limit`) pins that equality so the two can't drift.
+    ///
+    /// Deterministic & bit-portable (`f64`, rational weights, fixed accumulation order, no transcendentals).
+    /// It is a DERIVED RENDER attribute of the height — NOT part of `HEIGHT_GEN_VERSION` (the height itself
+    /// is unchanged; this only re-derives the surface NORMAL at full fidelity).
+    pub fn band_limited_grad(&self, wx: f64, wz: f64, world_seed: u64) -> (f64, f64, f64) {
+        let kf = self.band_limit_kf();
+        if kf <= 0 {
+            // No band-limit (plain fBm, no ridge/erosion) ⇒ the raw analytic gradient, matching the clipmap's
+            // plain-fBm fast path (which also point-samples `sample_world`).
+            let n = self.sample_world(wx, wz, world_seed);
+            return (n.height as f64, n.dh_dx as f64, n.dh_dz as f64);
+        }
+        let tap = HEIGHT_BAND_LIMIT_TAP; // FIXED 2 m taps (shared SSOT)
+        let w = band_limit_weights(kf); // SHARED kernel — identical to generate_band_limited's
+        // Separable convolution at the point, in the SAME X-inner / Z-outer order the grid finalize uses:
+        //   acc = Σ_tz w[tz] · ( Σ_tx w[tx] · sample_world(wx + tx·tap, wz + tz·tap) ).
+        // Each lane (h, dh/dx, dh/dz) is filtered by the SAME kernel ⇒ the stored gradient stays the exact
+        // gradient of the band-limited height (∇(K∗h) = K∗∇h). Fixed accumulation order ⇒ bit-portable.
+        let mut acc = [0.0f64; 3];
+        for (zi, tz) in (-kf..=kf).enumerate() {
+            let wz_t = wz + tz as f64 * tap;
+            // Inner X sum first (matches generate_band_limited's pass 1), then weight by w[tz] (pass 2).
+            let mut row = [0.0f64; 3];
+            for (xi, tx) in (-kf..=kf).enumerate() {
+                let s = self.sample_world(wx + tx as f64 * tap, wz_t, world_seed);
+                let ww = w[xi];
+                row[0] += s.height as f64 * ww;
+                row[1] += s.dh_dx as f64 * ww;
+                row[2] += s.dh_dz as f64 * ww;
+            }
+            let ww = w[zi];
+            acc[0] += row[0] * ww;
+            acc[1] += row[1] * ww;
+            acc[2] += row[2] * ww;
+        }
+        (acc[0], acc[1], acc[2])
+    }
+
+    /// FULL-FIDELITY band-limited surface NORMAL at any world `(wx, wz)`: `normalize(-dh_dx, 1, -dh_dz)`
+    /// from [`band_limited_grad`](Self::band_limited_grad). This is the DETAIL-NORMAL source the mesh bake
+    /// uses for terrain vertices — at a COARSE LOD the meshed geometry is band-limited to the coarse node
+    /// spacing (it reads flat), but this normal carries the FINE (mip-0-scale) surface relief, so the
+    /// coarse mesh shades with the detail its averaged geometry lacks. Deterministic & bit-portable.
+    pub fn surface_normal_hifi(&self, wx: f64, wz: f64, world_seed: u64) -> Vec3 {
+        let (_, gx, gz) = self.band_limited_grad(wx, wz, world_seed);
+        Vec3::new(-gx as f32, 1.0, -gz as f32).normalize_or_zero()
+    }
+
     /// Apply the separable TENT band-limit at a FIXED 2 m world tap step over `±kf` taps, writing the
     /// low-passed `(h, dh/dx, dh/dz)` into `field`. `kf` (half-width in 2 m taps) is CONSTANT across tiers,
     /// so every tier evaluates the identical band-limited world function (see `generate`). KEY properties:
@@ -381,14 +467,13 @@ impl HeightLayer {
     ///   for the default radius); coarser tiers point-sample.
     fn generate_band_limited(&self, ctx: &GenCtx, field: &mut ScalarField2D, kf: i32) {
         let res = HEIGHT_FIELD_RES as i32;
-        let tap = HEIGHT_CHUNK_CELLS as f64 / HEIGHT_FIELD_RES as f64; // FIXED 2 m tap step (tier-0 spacing)
+        let tap = HEIGHT_BAND_LIMIT_TAP; // FIXED 2 m tap step (tier-0 spacing) — the shared SSOT
         let step = (field.node_spacing / tap).round() as i32; // fine 2 m samples per node = 2^tier (≥ 1)
         let ap = kf; // apron in FINE (2 m) taps — exactly the kernel support ⇒ node results never clamp
 
-        // PRECOMPUTED tent weights `(K+1−|t|)/(K+1)²` over `t ∈ [−kf, kf]` — bit-portable rationals summing
-        // to 1, computed ONCE (not a division per tap).
-        let denom = ((kf + 1) * (kf + 1)) as f64;
-        let w: Vec<f64> = (-kf..=kf).map(|t| (((kf + 1) - t.abs()) as f64) / denom).collect();
+        // PRECOMPUTED tent weights — built by the SHARED [`band_limit_weights`] (the same kernel the
+        // point-evaluable hi-fi gradient uses, so they can never drift). Bit-portable rationals summing to 1.
+        let w: Vec<f64> = band_limit_weights(kf);
 
         let npa = (res * step + 2 * ap + 1) as usize; // FINE (2 m) samples per axis over chunk + apron
         let n00 = field.node_world_xz(0, 0); // chunk's node (0,0) world XZ
@@ -593,6 +678,51 @@ mod tests {
         // And it actually differs from the raw point sample (the band-limit is active).
         let point = l.sample_world(wp.x, wp.y, ctx.seed);
         assert_ne!(node.height.to_bits(), point.height.to_bits(), "band-limited node differs from point sample");
+    }
+
+    /// SSOT / NO-DRIFT GUARD: the point-evaluable hi-fi gradient ([`HeightLayer::band_limited_grad`]) must
+    /// equal the chunk-grid band-limit finalize ([`generate_band_limited`]) BIT-FOR-BIT at every interior
+    /// node — they share the tent-weight kernel ([`band_limit_weights`]) and the identical X-inner/Z-outer
+    /// separable accumulation order, so the same world taps ⇒ the same f64 convolution ⇒ the same bits. This
+    /// is what lets the bake derive the surface NORMAL from the point function while staying consistent with
+    /// the meshed HEIGHT (built from the grid finalize). Pins them together so they can never silently drift.
+    #[test]
+    fn hifi_grad_matches_generate_band_limit() {
+        let l = layer(); // default: ridge + erosion + band_limit > 0 ⇒ kf > 0 (the band-limited path)
+        assert!(l.band_limit_kf() > 0, "default layer must band-limit (kf > 0)");
+        let coord = ChunkCoord::new(l.id(), IVec3::new(1, 0, -2));
+        let ctx = GenCtx { coord, seed: 7, size: l.chunk_size() };
+        let mut out = GenOutput::default();
+        l.generate(&ctx, &mut out);
+        let field = out.take::<ScalarField2D>(HeightLayer::OUTPUT).unwrap();
+        // INTERIOR nodes only (≥ kf in from each edge): there the grid finalize reads genuine world taps (no
+        // apron clamp), so the point convolution lands on the IDENTICAL taps and must match bit-for-bit.
+        let kf = l.band_limit_kf() as u32;
+        for &(i, j) in &[(kf, kf), (10, 20), (HEIGHT_FIELD_RES - kf, HEIGHT_FIELD_RES - kf), (32, 40)] {
+            let wp = field.node_world_xz(i, j);
+            let node = field.node(i, j); // the meshed height's stored (h, dh/dx, dh/dz)
+            let (h, gx, gz) = l.band_limited_grad(wp.x, wp.y, ctx.seed);
+            assert_eq!((h as f32).to_bits(), node.height.to_bits(), "hifi height ≠ grid finalize at ({i},{j})");
+            assert_eq!((gx as f32).to_bits(), node.dh_dx.to_bits(), "hifi ∂x ≠ grid finalize at ({i},{j})");
+            assert_eq!((gz as f32).to_bits(), node.dh_dz.to_bits(), "hifi ∂z ≠ grid finalize at ({i},{j})");
+        }
+    }
+
+    /// The PLAIN-fBm path (no ridge/erosion ⇒ `kf == 0`, no band-limit): the hi-fi gradient is exactly the
+    /// raw `sample_world` gradient — matching the clipmap's plain-fBm fast path (so near terrain stays
+    /// visually consistent where mip 0 is resident). Bit-for-bit.
+    #[test]
+    fn hifi_grad_plain_fbm_is_raw_sample_world() {
+        let l = plain_layer();
+        assert_eq!(l.band_limit_kf(), 0, "plain layer must not band-limit");
+        let seed = 7u64;
+        for &(wx, wz) in &[(0.0, 0.0), (123.5, -456.25), (-789.0, 1011.0)] {
+            let n = l.sample_world(wx, wz, seed);
+            let (h, gx, gz) = l.band_limited_grad(wx, wz, seed);
+            assert_eq!((h as f32).to_bits(), n.height.to_bits());
+            assert_eq!((gx as f32).to_bits(), n.dh_dx.to_bits());
+            assert_eq!((gz as f32).to_bits(), n.dh_dz.to_bits());
+        }
     }
 
     /// Seam-free across a chunk boundary: the far apron node of chunk C equals the near node of chunk
