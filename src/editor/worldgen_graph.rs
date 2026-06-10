@@ -114,11 +114,23 @@ pub struct WorldgenPreviewPanel {
     is3d: bool,
     tex: Option<egui::TextureHandle>,
     key: u64,
+    /// Set by "→ panel"; a system outside the dock render ensures + focuses the tab (the dock state is
+    /// taken OUT of the World while the dock renders, so it can't be touched from a panel callback).
+    pending_open: bool,
 }
 
 impl Default for WorldgenPreviewPanel {
     fn default() -> Self {
-        Self { target: None, half: PREVIEW_HALF_M, cam: CAM_DEFAULT, pan: (0.0, 0.0), is3d: true, tex: None, key: 0 }
+        Self {
+            target: None,
+            half: PREVIEW_HALF_M,
+            cam: CAM_DEFAULT,
+            pan: (0.0, 0.0),
+            is3d: true,
+            tex: None,
+            key: 0,
+            pending_open: false,
+        }
     }
 }
 
@@ -204,6 +216,8 @@ impl Plugin for WorldgenGraphEditorPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<WorldGraphEditor>();
         app.init_resource::<WorldgenPreviewPanel>();
+        // Deferred dock manipulation (the dock state is removed from the World during its own render).
+        app.add_systems(Update, open_preview_panel);
         super::panels::register_panel(
             app,
             "worldgen/graph",
@@ -1621,15 +1635,9 @@ fn graph_panel(world: &mut World, ui: &mut egui::Ui) {
                 panel.cam = cam;
                 panel.pan = pan;
                 panel.is3d = is3d;
-            }
-            // Robust against a stale/closed layout: ensure the "Node Preview" tab exists (by the viewport)
-            // and focus it, so the button always works regardless of the persisted dock state.
-            let tab = super::dock::EditorTab::Registered("worldgen/node-preview".into());
-            super::layout::set_panel_present(world, tab.clone(), super::panels::DockSide::Center, true);
-            if let Some(mut dock) = world.get_resource_mut::<super::dock::EditorDockState>()
-                && let Some((n, t)) = dock.state.find_main_surface_tab(&tab)
-            {
-                dock.state.set_active_tab((egui_dock::SurfaceIndex::main(), n, t));
+                // Ensure/focus the dock tab — but only OUTSIDE the dock render (the dock state isn't in
+                // the World here). `open_preview_panel` handles it next frame.
+                panel.pending_open = true;
             }
         }
         // Pop a node's preview out into a movable window (snapshotting its current view state + nav path).
@@ -1740,6 +1748,25 @@ fn preview_panel(world: &mut World, ui: &mut egui::Ui) {
         let WorldgenPreviewPanel { half, pan, cam, is3d, .. } = &mut *panel;
         handle_preview_gestures(ui, &resp, *is3d, h, half, &mut pan.0, &mut pan.1, &mut cam.0, &mut cam.1);
     });
+}
+
+/// Outside the dock render (when `EditorDockState` is back in the World), ensure + focus the dockable
+/// Node Preview tab if "→ panel" was requested this/last frame.
+fn open_preview_panel(world: &mut World) {
+    if !world.resource::<WorldgenPreviewPanel>().pending_open {
+        return;
+    }
+    world.resource_mut::<WorldgenPreviewPanel>().pending_open = false;
+    if !world.contains_resource::<super::dock::EditorDockState>() {
+        return;
+    }
+    let tab = super::dock::EditorTab::Registered("worldgen/node-preview".into());
+    super::layout::set_panel_present(world, tab.clone(), super::panels::DockSide::Center, true);
+    if let Some(mut dock) = world.get_resource_mut::<super::dock::EditorDockState>()
+        && let Some((n, t)) = dock.state.find_main_surface_tab(&tab)
+    {
+        dock.state.set_active_tab((egui_dock::SurfaceIndex::main(), n, t));
+    }
 }
 
 /// Draw one popped-out preview as a floating, resizable `egui::Window`. In **3D** it renders on the GPU
