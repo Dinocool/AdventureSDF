@@ -15,7 +15,7 @@ use bytemuck::{Pod, Zeroable};
 
 use super::artifact::{HeightNode, ScalarField2D};
 use super::coord::{ChunkSize, chunk_coord_from_gpu_key, chunk_gpu_key};
-use super::layers::height::{HEIGHT_CHUNK_CELLS, HEIGHT_FIELD_RES, HeightLayer};
+use super::layers::height::{HEIGHT_CHUNK_CELLS, HEIGHT_FIELD_RES};
 use super::store::ArtifactStore;
 
 /// Toroidal ring width in chunks per axis. Covers `RING × HEIGHT_CHUNK_CELLS` metres; the manager's
@@ -635,64 +635,17 @@ pub fn cpu_height_clipmap() -> Option<Arc<HeightClipmap>> {
     CPU_HEIGHT_CLIPMAP.read().expect("CPU_HEIGHT_CLIPMAP poisoned").clone()
 }
 
-/// The pure, FULL-FIDELITY terrain surface source for DETAIL-NORMAL baking: the tier-0 [`HeightLayer`]
-/// (its `sample_world` is tier-independent, so tier 0 evaluates the same world surface every tier samples)
-/// plus the `world_seed`. [`surface_normal_hifi`] uses it to bake the mip-0-scale band-limited surface
-/// NORMAL onto a coarse-LOD mesh whose averaged geometry has lost that detail. Published alongside the
-/// clipmap by `roll_worldgen` ([`set_cpu_terrain_hifi`]) and captured per-bake ([`set_bake_terrain`]).
-/// It is a DERIVED RENDER attribute — NOT keyed by `HEIGHT_GEN_VERSION` (the height itself is unchanged).
-pub struct TerrainHifi {
-    /// Tier-0 layer whose `sample_world`/`band_limited_grad` is the pure surface function (incl. the active
-    /// biome graph when one is attached — the same graph every clipmap tier samples).
-    pub layer: HeightLayer,
-    /// The world seed the surface was generated with (folded into the noise / graph stream).
-    pub world_seed: u64,
-}
-
-impl TerrainHifi {
-    /// The full-fidelity band-limited surface normal at world `(wx, wz)` — `normalize(-dh_dx, 1, -dh_dz)`
-    /// of the mip-0-scale band-limited analytic gradient. Pure / deterministic / bit-portable.
-    #[inline]
-    pub fn normal(&self, wx: f64, wz: f64) -> bevy::math::Vec3 {
-        self.layer.surface_normal_hifi(wx, wz, self.world_seed)
-    }
-}
-
-/// Process-global snapshot of the tier-0 terrain hi-fi sampler — the sibling of [`CPU_HEIGHT_CLIPMAP`]
-/// for DETAIL-NORMAL baking. `roll_worldgen` republishes it (via [`set_cpu_terrain_hifi`]) whenever it
-/// rebuilds the clipmap, so the hi-fi normal source stays in lockstep with the meshed height. `None`
-/// until the first publish (the bake then falls back to the clipmap's stored gradient normal).
-static CPU_TERRAIN_HIFI: RwLock<Option<Arc<TerrainHifi>>> = RwLock::new(None);
-
-/// Publish the tier-0 terrain hi-fi sampler (see [`CPU_TERRAIN_HIFI`]). Replaces the prior snapshot.
-pub fn set_cpu_terrain_hifi(hifi: Option<Arc<TerrainHifi>>) {
-    *CPU_TERRAIN_HIFI.write().expect("CPU_TERRAIN_HIFI poisoned") = hifi;
-}
-
-/// Current tier-0 terrain hi-fi snapshot (a cheap `Arc` clone), or `None` if none published yet.
-pub fn cpu_terrain_hifi() -> Option<Arc<TerrainHifi>> {
-    CPU_TERRAIN_HIFI.read().expect("CPU_TERRAIN_HIFI poisoned").clone()
-}
-
 thread_local! {
-    /// Per-bake-thread Terrain snapshot — the clipmap `Arc`, world-XZ offset, and the hi-fi normal sampler
-    /// captured ONCE at the top of `mesh_chunk` (via [`set_bake_terrain`]). [`terrain_sdf`] /
-    /// [`terrain_normal`] / [`surface_normal_hifi`] read this with a thread-local `RefCell` borrow (no
-    /// atomics, no cross-core sharing) instead of the process-global `RwLock` + `Arc::clone` on EVERY field
-    /// sample — the bake samples the field hundreds of thousands of times per chunk, and across the async
-    /// pool that per-sample lock/refcount was cache-line-contended (the dominant mesh-bake cost). It also
-    /// makes a chunk's whole bake sample ONE stable clipmap + hi-fi source (no mid-bake roll). `None` ⇒ no
-    /// bake snapshot installed (picking/classification/tests) → fall back to the process-global.
-    static BAKE_TERRAIN: std::cell::RefCell<Option<BakeTerrainSnapshot>> =
+    /// Per-bake-thread Terrain snapshot — the clipmap `Arc` + world-XZ offset captured ONCE at the top
+    /// of `mesh_chunk` (via [`set_bake_terrain`]). [`terrain_sdf`] reads this with a thread-local
+    /// `RefCell` borrow (no atomics, no cross-core sharing) instead of the process-global `RwLock` +
+    /// `Arc::clone` on EVERY field sample — the bake samples the field hundreds of thousands of times
+    /// per chunk, and across the async pool that per-sample lock/refcount was cache-line-contended (the
+    /// dominant mesh-bake cost). It also makes a chunk's whole bake sample ONE stable clipmap (no
+    /// mid-bake ring roll). `None` ⇒ no bake snapshot installed (picking/classification/tests) → fall
+    /// back to the process-global.
+    static BAKE_TERRAIN: std::cell::RefCell<Option<(Arc<HeightClipmap>, bevy::math::Vec2)>> =
         const { std::cell::RefCell::new(None) };
-}
-
-/// The per-bake Terrain snapshot held in [`BAKE_TERRAIN`]: the frozen clipmap + its world-XZ offset, plus
-/// the optional hi-fi normal sampler (the SAME terrain the clipmap was built from, kept in lockstep).
-struct BakeTerrainSnapshot {
-    clipmap: Arc<HeightClipmap>,
-    offset: bevy::math::Vec2,
-    hifi: Option<Arc<TerrainHifi>>,
 }
 
 /// RAII guard installing a per-bake Terrain snapshot on THIS thread (see [`BAKE_TERRAIN`]); clears it on
@@ -709,13 +662,8 @@ impl Drop for BakeTerrainGuard {
 }
 
 /// Install a per-bake-thread Terrain snapshot (see [`BAKE_TERRAIN`]) for the lifetime of the returned guard.
-/// The hi-fi normal sampler is captured from the process-global ([`cpu_terrain_hifi`]) so it stays in
-/// lockstep with the clipmap the same `mesh_chunk` installs (one frozen terrain SSOT for the whole bake).
 pub fn set_bake_terrain(clipmap: Option<Arc<HeightClipmap>>, offset: bevy::math::Vec2) -> BakeTerrainGuard {
-    let hifi = cpu_terrain_hifi();
-    BAKE_TERRAIN.with(|tl| {
-        *tl.borrow_mut() = clipmap.map(|c| BakeTerrainSnapshot { clipmap: c, offset, hifi });
-    });
+    BAKE_TERRAIN.with(|tl| *tl.borrow_mut() = clipmap.map(|c| (c, offset)));
     BakeTerrainGuard(())
 }
 
@@ -731,12 +679,12 @@ pub fn set_bake_terrain(clipmap: Option<Arc<HeightClipmap>>, offset: bevy::math:
 /// EMPTY SPACE (large POSITIVE distance), not a mid-band plane.
 pub fn terrain_sdf(p: bevy::math::Vec3, voxel_size: f32, max_height: f32) -> f32 {
     BAKE_TERRAIN.with(|tl| {
-        if let Some(snap) = tl.borrow().as_ref() {
+        if let Some((clipmap, offset)) = tl.borrow().as_ref() {
             // A per-bake snapshot is installed ⇒ this is the MESH BAKE marching the field → RAW `p.y − h`
             // (stable Transvoxel crossing solve; the Lipschitz form goes near-zero on a sharp ridge → spiky
             // sliver triangles). `normalize = false`.
-            let world_xz = DVec2::new((p.x + snap.offset.x) as f64, (p.z + snap.offset.y) as f64);
-            return terrain_height_to_sdf(&snap.clipmap, p.y, world_xz, voxel_size, max_height, false);
+            let world_xz = DVec2::new((p.x + offset.x) as f64, (p.z + offset.y) as f64);
+            return terrain_height_to_sdf(clipmap, p.y, world_xz, voxel_size, max_height, false);
         }
         // No per-bake snapshot installed (the narrow-band CULL / picking / classification / tests) → read
         // the process-global and use the LIPSCHITZ-NORMALISED true distance (`normalize = true`) so the
@@ -765,9 +713,9 @@ pub fn terrain_sdf(p: bevy::math::Vec3, voxel_size: f32, max_height: f32) -> f32
 /// same as [`terrain_sdf`], so the normal's band-limit matches the height's.
 pub fn terrain_normal(p: bevy::math::Vec3, voxel_size: f32) -> Option<bevy::math::Vec3> {
     let node = BAKE_TERRAIN.with(|tl| {
-        if let Some(snap) = tl.borrow().as_ref() {
-            let world_xz = DVec2::new((p.x + snap.offset.x) as f64, (p.z + snap.offset.y) as f64);
-            try_sample_clipmap_lod(&snap.clipmap, world_xz, voxel_size)
+        if let Some((clipmap, offset)) = tl.borrow().as_ref() {
+            let world_xz = DVec2::new((p.x + offset.x) as f64, (p.z + offset.y) as f64);
+            try_sample_clipmap_lod(clipmap, world_xz, voxel_size)
         } else {
             let offset = cpu_terrain_offset();
             let world_xz = DVec2::new((p.x + offset.x) as f64, (p.z + offset.y) as f64);
@@ -776,70 +724,6 @@ pub fn terrain_normal(p: bevy::math::Vec3, voxel_size: f32) -> Option<bevy::math
     })?;
     Some(bevy::math::Vec3::new(-node.dh_dx, 1.0, -node.dh_dz).normalize_or_zero())
 }
-
-/// The FULL-FIDELITY (mip-0-scale) band-limited Terrain surface NORMAL at local `p` — the DETAIL-NORMAL
-/// the mesh bake bakes onto COARSE-LOD terrain vertices. Unlike [`terrain_normal`] (the clipmap's STORED
-/// gradient, band-limited to the sampled mip's COARSE spacing at a far LOD ⇒ reads FLAT), this evaluates the
-/// pure terrain surface gradient directly from the tier-0 [`HeightLayer`] band-limited at the FIXED 2 m
-/// scale, so a coarse mesh shades with the fine relief its averaged geometry lacks ("detail-normal baking
-/// from a higher-fidelity LOD"). It is INDEPENDENT of `voxel_size`/mip — always mip-0 detail.
-///
-/// LOD GATE (cost-bounded): the per-vertex band-limit convolution is `(2·kf+1)²` `sample_world` evals, which
-/// the mesh-bake rig showed is a real blowup on the near (many-vertex) fine chunks. At a FINE LOD —
-/// `voxel_size` at/below the clipmap's finest node spacing (`clipmap[0].node_spacing`, the 2 m tier-0
-/// grid) — the clipmap's mip-0 STORED gradient ALREADY carries the full detail (the normal-accuracy harness
-/// measures < ~1° there), so this returns `None` and the caller uses the cheap [`terrain_normal`]. Hi-fi is
-/// spent ONLY where the stored gradient is genuinely downsampled (coarse LODs) — the region that reads flat.
-/// The gate is logged ONCE per process (`HIFI_GATE_LOGGED`) so the LOD cap is never silent.
-///
-/// Reads the per-bake snapshot's hi-fi sampler ([`BAKE_TERRAIN`]) when one is installed (the hot bake
-/// path), else the process-global ([`cpu_terrain_hifi`]) for non-bake callers. `None` when no hi-fi source
-/// is published OR the LOD is fine enough to gate (the bake then falls back to the clipmap's stored-gradient
-/// [`terrain_normal`]). `world_xz = p.xz + offset` — the SAME world mapping `terrain_sdf`/`terrain_normal`
-/// use. Deterministic & bit-portable (pure `f64` band-limit convolution).
-pub fn surface_normal_hifi(p: bevy::math::Vec3, voxel_size: f32) -> Option<bevy::math::Vec3> {
-    BAKE_TERRAIN.with(|tl| {
-        if let Some(snap) = tl.borrow().as_ref() {
-            let hifi = snap.hifi.as_ref()?;
-            // Finest tier's node spacing = the scale at which the stored gradient is full-detail. A FINE LOD
-            // (voxel ≤ that) gets mip-0 detail from `terrain_normal` already ⇒ gate (skip the convolution).
-            let finest_spacing = snap.clipmap.first().map(|r| r.node_spacing).unwrap_or(0.0);
-            if hifi_lod_gated(voxel_size, finest_spacing) {
-                return None;
-            }
-            let (wx, wz) = ((p.x + snap.offset.x) as f64, (p.z + snap.offset.y) as f64);
-            Some(hifi.normal(wx, wz))
-        } else {
-            let finest_spacing =
-                cpu_height_clipmap().and_then(|cm| cm.first().map(|r| r.node_spacing)).unwrap_or(0.0);
-            if hifi_lod_gated(voxel_size, finest_spacing) {
-                return None;
-            }
-            let offset = cpu_terrain_offset();
-            let (wx, wz) = ((p.x + offset.x) as f64, (p.z + offset.y) as f64);
-            cpu_terrain_hifi().map(|hifi| hifi.normal(wx, wz))
-        }
-    })
-}
-
-/// Whether the hi-fi DETAIL-NORMAL is GATED OFF at this `voxel_size` (a fine LOD whose voxel is at/below
-/// the clipmap's finest node spacing — the stored mip-0 gradient already has full detail there). Logs the
-/// gate ONCE per process so the LOD cap is visible, never silent. `finest_spacing <= 0` (no clipmap) ⇒ not
-/// gated (use hi-fi if a source exists).
-fn hifi_lod_gated(voxel_size: f32, finest_spacing: f32) -> bool {
-    let gated = finest_spacing > 0.0 && voxel_size <= finest_spacing;
-    if gated && !HIFI_GATE_LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
-        bevy::log::info!(
-            "worldgen detail-normal: hi-fi surface normals GATED to coarse LODs (voxel_size > finest node \
-             spacing {finest_spacing} m); fine LODs use the clipmap's mip-0 stored gradient (already full \
-             detail) — bounds the per-vertex band-limit cost on near chunks."
-        );
-    }
-    gated
-}
-
-/// One-shot latch so the hi-fi LOD-gate log line ([`hifi_lod_gated`]) prints only on the first gated vertex.
-static HIFI_GATE_LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Strict/try clipmap sample → signed Terrain field; a non-rendering miss is empty space.
 ///

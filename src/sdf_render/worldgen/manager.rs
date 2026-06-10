@@ -108,18 +108,6 @@ impl LayerManager {
         HeightLayer::new_tier(id, self.params, self.erosion, chunk_cells).with_graph(self.graph.clone())
     }
 
-    /// Build the tier-0 [`TerrainHifi`](super::upload::TerrainHifi) detail-normal sampler from the
-    /// manager's CURRENT params + erosion + active graph + seed — the SAME surface every clipmap tier is
-    /// generated against (`sample_world` is tier-independent). `roll_worldgen` publishes this alongside the
-    /// clipmap so the baked hi-fi terrain normal stays in lockstep with the meshed height. Cheap (one
-    /// tier-0 `HeightLayer` + an `Arc` graph clone); rebuild + republish whenever the clipmap is rebuilt.
-    pub fn make_terrain_hifi(&self) -> super::upload::TerrainHifi {
-        super::upload::TerrainHifi {
-            layer: self.make_tier(LayerId(0), HEIGHT_CHUNK_CELLS),
-            world_seed: self.seed,
-        }
-    }
-
     /// Number of clipmap tiers (layers) in the stack.
     pub fn tier_count(&self) -> u32 {
         self.layers.len() as u32
