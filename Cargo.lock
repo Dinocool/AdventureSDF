@@ -102,6 +102,7 @@ dependencies = [
  "emath",
  "epaint",
  "futures-lite",
+ "half",
  "image",
  "intel_tex_2",
  "libloading",

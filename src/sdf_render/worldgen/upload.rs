@@ -15,7 +15,7 @@ use bytemuck::{Pod, Zeroable};
 
 use super::artifact::{HeightNode, ScalarField2D};
 use super::coord::{ChunkSize, chunk_coord_from_gpu_key, chunk_gpu_key};
-use super::layers::height::{HEIGHT_CHUNK_CELLS, HEIGHT_FIELD_RES};
+use super::layers::height::{HEIGHT_CHUNK_CELLS, HEIGHT_FIELD_RES, HeightLayer};
 use super::store::ArtifactStore;
 
 /// Toroidal ring width in chunks per axis. Covers `RING × HEIGHT_CHUNK_CELLS` metres; the manager's
@@ -635,17 +635,68 @@ pub fn cpu_height_clipmap() -> Option<Arc<HeightClipmap>> {
     CPU_HEIGHT_CLIPMAP.read().expect("CPU_HEIGHT_CLIPMAP poisoned").clone()
 }
 
+/// The pure, FULL-FIDELITY terrain surface source for DETAIL-NORMAL baking: the tier-0 [`HeightLayer`]
+/// (its `sample_world` is tier-independent, so tier 0 evaluates the same world surface every tier samples)
+/// plus the `world_seed`. The detail-normal texture bake samples its [`band_limited_grad`] at texel
+/// centres to write the mip-0-scale fine surface slope onto a coarse-LOD chunk's normal map. Published
+/// alongside the clipmap by `roll_worldgen` ([`set_cpu_terrain_hifi`]) and captured per-bake in
+/// [`BAKE_TERRAIN`]. It is a DERIVED RENDER attribute — NOT keyed by `HEIGHT_GEN_VERSION` (the height
+/// itself is unchanged).
+pub struct TerrainHifi {
+    /// Tier-0 layer whose `sample_world`/`band_limited_grad` is the pure surface function (incl. the active
+    /// biome graph when one is attached — the same graph every clipmap tier samples).
+    pub layer: HeightLayer,
+    /// The world seed the surface was generated with (folded into the noise / graph stream).
+    pub world_seed: u64,
+}
+
+impl TerrainHifi {
+    /// The full-fidelity band-limited surface SLOPE `(dh/dx, dh/dz)` at world `(wx, wz)` — the mip-0-scale
+    /// band-limited analytic gradient. The detail-normal bake stores these two lanes per texel; the shader
+    /// reconstructs `N = normalize(-dh/dx, 1, -dh/dz)`. Pure / deterministic / bit-portable.
+    #[inline]
+    pub fn slope(&self, wx: f64, wz: f64) -> (f32, f32) {
+        let (_, gx, gz) = self.layer.band_limited_grad(wx, wz, self.world_seed);
+        (gx as f32, gz as f32)
+    }
+}
+
+/// Process-global snapshot of the tier-0 terrain hi-fi sampler — the sibling of [`CPU_HEIGHT_CLIPMAP`]
+/// for DETAIL-NORMAL baking. `roll_worldgen` republishes it (via [`set_cpu_terrain_hifi`]) whenever it
+/// rebuilds the clipmap, so the hi-fi normal source stays in lockstep with the meshed height. `None`
+/// until the first publish (the bake then bakes no detail map and uses the cheap stored gradient).
+static CPU_TERRAIN_HIFI: RwLock<Option<Arc<TerrainHifi>>> = RwLock::new(None);
+
+/// Publish the tier-0 terrain hi-fi sampler (see [`CPU_TERRAIN_HIFI`]). Replaces the prior snapshot.
+pub fn set_cpu_terrain_hifi(hifi: Option<Arc<TerrainHifi>>) {
+    *CPU_TERRAIN_HIFI.write().expect("CPU_TERRAIN_HIFI poisoned") = hifi;
+}
+
+/// Current tier-0 terrain hi-fi snapshot (a cheap `Arc` clone), or `None` if none published yet.
+pub fn cpu_terrain_hifi() -> Option<Arc<TerrainHifi>> {
+    CPU_TERRAIN_HIFI.read().expect("CPU_TERRAIN_HIFI poisoned").clone()
+}
+
 thread_local! {
-    /// Per-bake-thread Terrain snapshot — the clipmap `Arc` + world-XZ offset captured ONCE at the top
-    /// of `mesh_chunk` (via [`set_bake_terrain`]). [`terrain_sdf`] reads this with a thread-local
-    /// `RefCell` borrow (no atomics, no cross-core sharing) instead of the process-global `RwLock` +
-    /// `Arc::clone` on EVERY field sample — the bake samples the field hundreds of thousands of times
-    /// per chunk, and across the async pool that per-sample lock/refcount was cache-line-contended (the
-    /// dominant mesh-bake cost). It also makes a chunk's whole bake sample ONE stable clipmap (no
-    /// mid-bake ring roll). `None` ⇒ no bake snapshot installed (picking/classification/tests) → fall
-    /// back to the process-global.
-    static BAKE_TERRAIN: std::cell::RefCell<Option<(Arc<HeightClipmap>, bevy::math::Vec2)>> =
+    /// Per-bake-thread Terrain snapshot — the clipmap `Arc`, world-XZ offset, and the hi-fi normal sampler
+    /// captured ONCE at the top of `mesh_chunk` (via [`set_bake_terrain`]). [`terrain_sdf`] /
+    /// [`terrain_normal`] read this with a thread-local `RefCell` borrow (no atomics, no cross-core sharing)
+    /// instead of the process-global `RwLock` + `Arc::clone` on EVERY field sample — the bake samples the
+    /// field hundreds of thousands of times per chunk, and across the async pool that per-sample
+    /// lock/refcount was cache-line-contended (the dominant mesh-bake cost). It also makes a chunk's whole
+    /// bake sample ONE stable clipmap + hi-fi source (no mid-bake ring roll). `None` ⇒ no bake snapshot
+    /// installed (picking/classification/tests) → fall back to the process-global.
+    static BAKE_TERRAIN: std::cell::RefCell<Option<BakeTerrainSnapshot>> =
         const { std::cell::RefCell::new(None) };
+}
+
+/// The per-bake Terrain snapshot held in [`BAKE_TERRAIN`]: the frozen clipmap + its world-XZ offset, plus
+/// the optional hi-fi normal sampler (the SAME terrain the clipmap was built from, kept in lockstep). The
+/// detail-normal texture bake reads `hifi` + `offset` via [`bake_terrain_hifi`] to sample texel slopes.
+struct BakeTerrainSnapshot {
+    clipmap: Arc<HeightClipmap>,
+    offset: bevy::math::Vec2,
+    hifi: Option<Arc<TerrainHifi>>,
 }
 
 /// RAII guard installing a per-bake Terrain snapshot on THIS thread (see [`BAKE_TERRAIN`]); clears it on
@@ -662,9 +713,25 @@ impl Drop for BakeTerrainGuard {
 }
 
 /// Install a per-bake-thread Terrain snapshot (see [`BAKE_TERRAIN`]) for the lifetime of the returned guard.
+/// The hi-fi normal sampler is captured from the process-global ([`cpu_terrain_hifi`]) so it stays in
+/// lockstep with the clipmap the same `mesh_chunk` installs (one frozen terrain SSOT for the whole bake).
 pub fn set_bake_terrain(clipmap: Option<Arc<HeightClipmap>>, offset: bevy::math::Vec2) -> BakeTerrainGuard {
-    BAKE_TERRAIN.with(|tl| *tl.borrow_mut() = clipmap.map(|c| (c, offset)));
+    let hifi = cpu_terrain_hifi();
+    BAKE_TERRAIN.with(|tl| {
+        *tl.borrow_mut() = clipmap.map(|c| BakeTerrainSnapshot { clipmap: c, offset, hifi });
+    });
     BakeTerrainGuard(())
+}
+
+/// The per-bake hi-fi terrain sampler + world-XZ offset, for the DETAIL-NORMAL texture bake. Returns the
+/// frozen [`TerrainHifi`] snapshot installed by [`set_bake_terrain`] (in lockstep with the clipmap the
+/// chunk meshes against) and the chunk's world-XZ offset (`world_xz = local.xz + offset`), or `None` when
+/// no bake snapshot or no hi-fi source is installed (then no detail map is baked). Read once per chunk bake
+/// — NOT in the hot per-sample march path.
+pub fn bake_terrain_hifi() -> Option<(Arc<TerrainHifi>, bevy::math::Vec2)> {
+    BAKE_TERRAIN.with(|tl| {
+        tl.borrow().as_ref().and_then(|snap| snap.hifi.clone().map(|h| (h, snap.offset)))
+    })
 }
 
 /// The Terrain primitive's signed field at local point `p`, sampling the rolling height clipmap — the
@@ -679,12 +746,12 @@ pub fn set_bake_terrain(clipmap: Option<Arc<HeightClipmap>>, offset: bevy::math:
 /// EMPTY SPACE (large POSITIVE distance), not a mid-band plane.
 pub fn terrain_sdf(p: bevy::math::Vec3, voxel_size: f32, max_height: f32) -> f32 {
     BAKE_TERRAIN.with(|tl| {
-        if let Some((clipmap, offset)) = tl.borrow().as_ref() {
+        if let Some(snap) = tl.borrow().as_ref() {
             // A per-bake snapshot is installed ⇒ this is the MESH BAKE marching the field → RAW `p.y − h`
             // (stable Transvoxel crossing solve; the Lipschitz form goes near-zero on a sharp ridge → spiky
             // sliver triangles). `normalize = false`.
-            let world_xz = DVec2::new((p.x + offset.x) as f64, (p.z + offset.y) as f64);
-            return terrain_height_to_sdf(clipmap, p.y, world_xz, voxel_size, max_height, false);
+            let world_xz = DVec2::new((p.x + snap.offset.x) as f64, (p.z + snap.offset.y) as f64);
+            return terrain_height_to_sdf(&snap.clipmap, p.y, world_xz, voxel_size, max_height, false);
         }
         // No per-bake snapshot installed (the narrow-band CULL / picking / classification / tests) → read
         // the process-global and use the LIPSCHITZ-NORMALISED true distance (`normalize = true`) so the
@@ -713,9 +780,9 @@ pub fn terrain_sdf(p: bevy::math::Vec3, voxel_size: f32, max_height: f32) -> f32
 /// same as [`terrain_sdf`], so the normal's band-limit matches the height's.
 pub fn terrain_normal(p: bevy::math::Vec3, voxel_size: f32) -> Option<bevy::math::Vec3> {
     let node = BAKE_TERRAIN.with(|tl| {
-        if let Some((clipmap, offset)) = tl.borrow().as_ref() {
-            let world_xz = DVec2::new((p.x + offset.x) as f64, (p.z + offset.y) as f64);
-            try_sample_clipmap_lod(clipmap, world_xz, voxel_size)
+        if let Some(snap) = tl.borrow().as_ref() {
+            let world_xz = DVec2::new((p.x + snap.offset.x) as f64, (p.z + snap.offset.y) as f64);
+            try_sample_clipmap_lod(&snap.clipmap, world_xz, voxel_size)
         } else {
             let offset = cpu_terrain_offset();
             let world_xz = DVec2::new((p.x + offset.x) as f64, (p.z + offset.y) as f64);
