@@ -42,6 +42,10 @@ pub enum EditorTab {
     AssetsDrawer,
     /// A panel from [`DebugPanelRegistry`], keyed by its stable id.
     Registered(String),
+    /// A dynamic worldgen **Node Preview** center tab, keyed by its unique preview-instance id. Spawned
+    /// by the Biome Graph's "→ panel" (unbounded — one per click); state lives in
+    /// `WorldgenPreviewPanels::map`. Like `Scene`, these are session-only and NOT layout-persisted.
+    WorldgenPreview(u64),
 }
 
 /// Editor dock state + the viewport rect/pointer feedback the camera system reads.
@@ -152,6 +156,7 @@ impl TabViewer for EditorTabViewer<'_> {
             EditorTab::ProjectFiles => "Project Files".into(),
             EditorTab::AssetsDrawer => "Assets".into(),
             EditorTab::Registered(id) => self.registry.title_for(id).into(),
+            EditorTab::WorldgenPreview(_) => "Node Preview".into(),
         }
     }
 
@@ -168,6 +173,7 @@ impl TabViewer for EditorTabViewer<'_> {
             // Carry the panel id as a span field so a chrome trace attributes each registered
             // panel (they otherwise share one span name and blur together).
             EditorTab::Registered(id) => bevy::log::info_span!("panel_registered", panel = %id),
+            EditorTab::WorldgenPreview(_) => bevy::log::info_span!("panel_worldgen_preview"),
         }
         .entered();
         // Live CPU tag mirroring the trace span, so the Performance panel's own breakdown
@@ -183,6 +189,7 @@ impl TabViewer for EditorTabViewer<'_> {
             EditorTab::Registered(id) => {
                 crate::instrument::intern(&format!("ui: {}", self.registry.title_for(id)))
             }
+            EditorTab::WorldgenPreview(_) => "ui: node preview",
         });
         match tab {
             EditorTab::Scene(id) => {
@@ -227,6 +234,11 @@ impl TabViewer for EditorTabViewer<'_> {
                     ui.weak(format!("(panel '{id}' not registered)"));
                 }
             }
+            EditorTab::WorldgenPreview(id) => {
+                egui::ScrollArea::both().show(ui, |ui| {
+                    crate::editor::worldgen_graph::preview_panel_for(self.world, ui, *id);
+                });
+            }
         }
     }
 
@@ -243,6 +255,11 @@ impl TabViewer for EditorTabViewer<'_> {
             EditorTab::Scene(id) => {
                 self.world.resource_mut::<OpenScenes>().close_request = Some(*id);
                 OnCloseResponse::Ignore
+            }
+            // Closing a preview tab drops its instance state (so it doesn't leak / reopen).
+            EditorTab::WorldgenPreview(id) => {
+                crate::editor::worldgen_graph::close_preview(self.world, *id);
+                OnCloseResponse::Close
             }
             _ => OnCloseResponse::Close,
         }

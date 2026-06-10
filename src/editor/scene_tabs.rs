@@ -306,8 +306,9 @@ pub fn scene_tab_ids(world: &World) -> (Vec<SceneId>, Option<SceneId>) {
     (open.docs.iter().map(|d| d.id).collect(), open.active)
 }
 
-/// Append `tab` into the center (scene) leaf, falling back to the first leaf.
-fn add_center_tab(dock: &mut EditorDockState, tab: EditorTab) {
+/// Append `tab` into the center (scene) leaf, falling back to the first leaf. `pub(crate)` so the
+/// worldgen preview can add its dynamic `WorldgenPreview` tabs to the same viewport leaf as scenes.
+pub(crate) fn add_center_tab(dock: &mut EditorDockState, tab: EditorTab) {
     match center_leaf(dock) {
         Some(node) => dock.state.main_surface_mut()[node].append_tab(tab),
         None => dock.state.push_to_first_leaf(tab),

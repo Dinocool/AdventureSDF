@@ -31,8 +31,21 @@ use convert::{climate_name, resolve_snarl};
 use panel::graph_panel;
 use preview::{
     CAM_DEFAULT, DEFAULT_PREVIEW_PX, PREVIEW_HALF_M, PoppedPreview, WorldgenPreviewPanels, open_preview_panel,
-    preview_panel_0, preview_panel_1, preview_panel_2, preview_panel_3,
 };
+
+/// Render the dynamic Node Preview tab for instance `id` (the dock `EditorTab::WorldgenPreview` arm calls
+/// this). Thin crate-visible wrapper over the module-private `preview::preview_panel_impl`.
+pub(crate) fn preview_panel_for(world: &mut World, ui: &mut bevy_egui::egui::Ui, id: u64) {
+    preview::preview_panel_impl(world, ui, id);
+}
+
+/// Drop the closed preview instance `id`'s state (the dock `on_close` arm calls this), so a closed tab
+/// doesn't leak or reopen.
+pub(crate) fn close_preview(world: &mut World, id: u64) {
+    if let Some(mut panels) = world.get_resource_mut::<WorldgenPreviewPanels>() {
+        panels.map.remove(&id);
+    }
+}
 
 /// Default on-disk path the editor saves/loads the active biome graph to (the production graph the
 /// worldgen loads — see `WorldGenPlugin`'s asset hot-reload). Relative to the app's `assets/` root.
@@ -225,15 +238,9 @@ impl Plugin for WorldgenGraphEditorPlugin {
             30,
             graph_panel,
         );
-        // A POOL of viewport-located preview panels; "→ panel" on a node fills the first free slot. Each
-        // gets its own dock tab + GPU key, so several nodes can be previewed side-by-side.
-        let preview_fns: [fn(&mut World, &mut bevy_egui::egui::Ui); 4] =
-            [preview_panel_0, preview_panel_1, preview_panel_2, preview_panel_3];
-        for (idx, render) in preview_fns.into_iter().enumerate() {
-            let id = preview::preview_panel_tab_id(idx);
-            let title = if idx == 0 { "Node Preview".to_string() } else { format!("Node Preview {}", idx + 1) };
-            super::panels::register_panel(app, id, title, super::panels::DockSide::Center, 10, render);
-        }
+        // The viewport-located Node Preview tabs are DYNAMIC center tabs (`EditorTab::WorldgenPreview`),
+        // not registered panels: "→ panel" spawns a fresh one per click (unbounded), `open_preview_panel`
+        // creates its dock tab, and closing the tab drops its state. So nothing is registered here.
     }
 }
 

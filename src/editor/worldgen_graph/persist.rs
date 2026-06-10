@@ -78,14 +78,14 @@ pub(super) struct PoppedView {
     pub view: PreviewView,
 }
 
-/// Snapshot the editor + preview panel POOL into an [`EditorView`] (the resumable state half of the doc).
+/// Snapshot the editor + preview panel SET into an [`EditorView`] (the resumable state half of the doc).
 /// Only TOP-LEVEL node settings are captured — `caches.views` holds the current nav level's nodes,
-/// which at save time (the toolbar is on the top graph) is the root. Each OCCUPIED pool slot becomes one
-/// `panels` entry.
+/// which at save time (the toolbar is on the top graph) is the root. Each live preview instance with a
+/// target becomes one `panels` entry.
 pub(super) fn gather_view(editor: &WorldGraphEditor, panels: &WorldgenPreviewPanels) -> EditorView {
     let panels = panels
-        .0
-        .iter()
+        .map
+        .values()
         .filter_map(|p| {
             p.target.as_ref().map(|(nav, node)| PanelView {
                 nav: nav.clone(),
@@ -103,10 +103,10 @@ pub(super) fn gather_view(editor: &WorldGraphEditor, panels: &WorldgenPreviewPan
     EditorView { nodes: editor.caches.views.clone(), nav: editor.nav.clone(), panels, panel: None, popped }
 }
 
-/// Restore an [`EditorView`] into the editor + preview panel POOL: per-node settings, nav (clamped so a
-/// stale path can't panic), each dockable panel (re-targeted into a pool slot + `pending_open` so its tab
-/// reopens populated), and the pop-out windows. A legacy single `panel` field (old files) is folded in
-/// front of `panels`.
+/// Restore an [`EditorView`] into the editor + preview panel SET: per-node settings, nav (clamped so a
+/// stale path can't panic), each dockable panel (spawned as a fresh instance + queued tab via
+/// [`WorldgenPreviewPanels::open`] so its tab reopens populated), and the pop-out windows. A legacy single
+/// `panel` field (old files) is folded in front of `panels`.
 pub(super) fn apply_view(view: EditorView, editor: &mut WorldGraphEditor, panels: &mut WorldgenPreviewPanels) {
     editor.caches.views = view.nodes;
     // Clamp the saved nav to the live biome chain so a deleted/renamed biome can't desync or panic.
@@ -114,15 +114,10 @@ pub(super) fn apply_view(view: EditorView, editor: &mut WorldGraphEditor, panels
     editor.nav = view.nav;
     editor.nav.truncate(depth);
 
-    // Fold the deprecated single `panel` field (old saves) in front of the `panels` list, then restore
-    // each into successive pool slots (bounded by the pool size).
-    let restored = view.panel.into_iter().chain(view.panels);
-    for (slot, p) in panels.0.iter_mut().zip(restored) {
-        slot.target = Some((p.nav, p.node));
-        slot.is3d = p.is3d;
-        slot.set_view(p.view);
-        // Re-show the dock tab populated (only if a target exists — a bare panel stays as the hint).
-        slot.pending_open = true;
+    // Fold the deprecated single `panel` field (old saves) in front of the `panels` list, then spawn a
+    // fresh preview instance + tab for each (allocates an id, queues `to_open`).
+    for p in view.panel.into_iter().chain(view.panels) {
+        panels.open((p.nav, p.node), p.view, p.is3d);
     }
 
     editor.popped = view
