@@ -683,12 +683,13 @@ impl SnarlViewer<EdNode> for Viewer<'_> {
                         center: (cx, cz),
                         yaw,
                         pitch,
-                        res: res as u32,
+                        res_w: res as u32,
+                        res_h: res as u32,
                     });
                     match self.gpu_tex.get(&gkey) {
                         Some(&t) => t,
                         None => {
-                            let pk = preview_key(&g, half, res.min(160), true, yaw, pitch, (cx, cz));
+                            let pk = preview_key(&g, half, res.min(160), res.min(160), true, yaw, pitch, (cx, cz));
                             if self.prev_key.get(&node) != Some(&pk) || !self.previews.contains_key(&node) {
                                 let img = render_surface_preview(&g, half, yaw, pitch, res.min(160));
                                 let h = ui.ctx().load_texture(format!("wg-preview-{node:?}"), img, egui::TextureOptions::LINEAR);
@@ -699,9 +700,9 @@ impl SnarlViewer<EdNode> for Viewer<'_> {
                         }
                     }
                 } else {
-                    let pk = preview_key(&g, half, res, false, 0.0, 0.0, (cx, cz));
+                    let pk = preview_key(&g, half, res, res, false, 0.0, 0.0, (cx, cz));
                     if self.prev_key.get(&node) != Some(&pk) || !self.previews.contains_key(&node) {
-                        let img = render_field_preview(&g, half, res, (cx, cz));
+                        let img = render_field_preview(&g, half, res, res, (cx, cz));
                         let h = ui.ctx().load_texture(format!("wg-preview-{node:?}"), img, egui::TextureOptions::LINEAR);
                         self.previews.insert(node, h);
                         self.prev_key.insert(node, pk);
@@ -1146,19 +1147,21 @@ fn ensure_preview_texture(
     name: String,
     g: &Graph,
     half: f64,
-    res: usize,
+    res_w: usize,
+    res_h: usize,
     is3d: bool,
     cam: (f32, f32),
     center: (f64, f64),
     tex: &mut Option<egui::TextureHandle>,
     key: &mut u64,
 ) -> egui::TextureId {
-    let k = preview_key(g, half, res, is3d, cam.0, cam.1, center);
+    let k = preview_key(g, half, res_w, res_h, is3d, cam.0, cam.1, center);
     if tex.is_none() || *key != k {
         let img = if is3d {
-            render_surface_preview(g, half, cam.0, cam.1, res)
+            // CPU 3D fallback stays square (the GPU path is the aspect-correct one).
+            render_surface_preview(g, half, cam.0, cam.1, res_h)
         } else {
-            render_field_preview(g, half, res, center)
+            render_field_preview(g, half, res_w, res_h, center)
         };
         *tex = Some(ctx.load_texture(name, img, egui::TextureOptions::LINEAR));
         *key = k;
@@ -1167,12 +1170,14 @@ fn ensure_preview_texture(
 }
 
 /// Fingerprint everything a preview render depends on, so it's only recomputed on change.
-fn preview_key(g: &Graph, half: f64, res: usize, is3d: bool, yaw: f32, pitch: f32, center: (f64, f64)) -> u64 {
+#[allow(clippy::too_many_arguments)]
+fn preview_key(g: &Graph, half: f64, res_w: usize, res_h: usize, is3d: bool, yaw: f32, pitch: f32, center: (f64, f64)) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
     ron::to_string(g).unwrap_or_default().hash(&mut h);
     half.to_bits().hash(&mut h);
-    (res as u64).hash(&mut h);
+    (res_w as u64).hash(&mut h);
+    (res_h as u64).hash(&mut h);
     is3d.hash(&mut h);
     center.0.to_bits().hash(&mut h);
     center.1.to_bits().hash(&mut h);
@@ -1186,19 +1191,21 @@ fn preview_key(g: &Graph, half: f64, res: usize, is3d: bool, yaw: f32, pitch: f3
 /// Evaluate a node's sub-[`Graph`] over a top-down grid spanning ±`half_m` metres and colour each sample
 /// by its ABSOLUTE world height + sea level (not a per-preview local range), so the same colour means the
 /// same elevation across every node and zoom level. Below [`PREVIEW_SEA_LEVEL`] reads as water.
-fn render_field_preview(g: &Graph, half_m: f64, res: usize, center: (f64, f64)) -> egui::ColorImage {
-    let n = res.max(2);
-    let span_m = 2.0 * half_m;
-    let mut pixels = Vec::with_capacity(n * n);
-    for j in 0..n {
-        for i in 0..n {
-            let wx = center.0 - half_m + (i as f64 + 0.5) / n as f64 * span_m;
-            let wz = center.1 - half_m + (j as f64 + 0.5) / n as f64 * span_m;
+fn render_field_preview(g: &Graph, half_m: f64, res_w: usize, res_h: usize, center: (f64, f64)) -> egui::ColorImage {
+    let nx = res_w.max(2);
+    let ny = res_h.max(2);
+    // Non-square: widen the world window horizontally by the aspect so the image fills without stretching.
+    let half_x = half_m * nx as f64 / ny as f64;
+    let mut pixels = Vec::with_capacity(nx * ny);
+    for j in 0..ny {
+        for i in 0..nx {
+            let wx = center.0 - half_x + (i as f64 + 0.5) / nx as f64 * 2.0 * half_x;
+            let wz = center.1 - half_m + (j as f64 + 0.5) / ny as f64 * 2.0 * half_m;
             let c = height_color_rgb(g.eval(wx, wz, PREVIEW_SEED).v);
             pixels.push(egui::Color32::from_rgb((c[0] * 255.0) as u8, (c[1] * 255.0) as u8, (c[2] * 255.0) as u8));
         }
     }
-    egui::ColorImage::new([n, n], pixels)
+    egui::ColorImage::new([nx, ny], pixels)
 }
 
 /// Linear-interpolate an rgb colour ramp at `t∈[0,1]`.
@@ -1688,10 +1695,11 @@ fn preview_panel(world: &mut World, ui: &mut egui::Ui) {
             ui.label("· drag orbit · right-drag pan · scroll zoom");
         });
         let ppp = ui.ctx().pixels_per_point();
-        // Fill the panel (drag the dock edge to resize); render res tracks the on-screen size.
+        // Fill the panel non-square (drag the dock edge to resize); render res tracks the on-screen size.
         let avail = ui.available_size();
-        let side = avail.x.min(avail.y).max(64.0);
-        let res = ((side * ppp).round() as usize).max(32);
+        let (w, h) = (avail.x.max(64.0), avail.y.max(64.0));
+        let res_w = ((w * ppp).round() as usize).max(32);
+        let res_h = ((h * ppp).round() as usize).max(32);
         let tex = if panel.is3d {
             world.resource_mut::<GpuPreviewRequests>().0.push(GpuPreviewRequest {
                 key: PANEL_GPU_KEY,
@@ -1700,7 +1708,8 @@ fn preview_panel(world: &mut World, ui: &mut egui::Ui) {
                 center: panel.pan,
                 yaw: panel.cam.0,
                 pitch: panel.cam.1,
-                res: res as u32,
+                res_w: res_w as u32,
+                res_h: res_h as u32,
             });
             world.resource::<GpuPreviewTextures>().0.get(&PANEL_GPU_KEY).copied()
         } else {
@@ -1709,17 +1718,18 @@ fn preview_panel(world: &mut World, ui: &mut egui::Ui) {
         let tid = match tex {
             Some(t) => t,
             None => {
-                let r = if panel.is3d { res.min(160) } else { res };
-                ensure_preview_texture(ui.ctx(), "wg-panel-tex".into(), &g, panel.half, r, panel.is3d, panel.cam, panel.pan, &mut panel.tex, &mut panel.key)
+                let (rw, rh) = if panel.is3d { (res_w.min(160), res_h.min(160)) } else { (res_w, res_h) };
+                ensure_preview_texture(ui.ctx(), "wg-panel-tex".into(), &g, panel.half, rw, rh, panel.is3d, panel.cam, panel.pan, &mut panel.tex, &mut panel.key)
             }
         };
         let resp = ui.add(
-            egui::Image::new(egui::load::SizedTexture::new(tid, egui::vec2(side, side)))
+            egui::Image::new(egui::load::SizedTexture::new(tid, egui::vec2(w, h)))
                 .sense(egui::Sense::click_and_drag()),
         );
         scroll_zoom_consume(ui, &resp, &mut panel.half);
+        // size = height → uniform world-per-pixel for pan (the camera frames `half` vertically).
         let WorldgenPreviewPanel { half, pan, cam, is3d, .. } = &mut *panel;
-        handle_preview_gestures(ui, &resp, *is3d, side, half, &mut pan.0, &mut pan.1, &mut cam.0, &mut cam.1);
+        handle_preview_gestures(ui, &resp, *is3d, h, half, &mut pan.0, &mut pan.1, &mut cam.0, &mut cam.1);
     });
 }
 
@@ -1769,10 +1779,11 @@ fn popped_preview_window(
             }
 
             let ppp = ui.ctx().pixels_per_point();
-            // Fill the window (drag its edge to resize); render res tracks the on-screen size.
+            // Fill the window non-square (drag its edge to resize); render res tracks the on-screen size.
             let avail = ui.available_size();
-            let side = avail.x.min(avail.y).max(64.0);
-            let res = ((side * ppp).round() as usize).max(32);
+            let (w, h) = (avail.x.max(64.0), avail.y.max(64.0));
+            let res_w = ((w * ppp).round() as usize).max(32);
+            let res_h = ((h * ppp).round() as usize).max(32);
             let tex = if p.is3d {
                 // GPU path: request a render for next frame; show last frame's (or CPU-raymarch fallback).
                 gpu_reqs.push(GpuPreviewRequest {
@@ -1782,25 +1793,26 @@ fn popped_preview_window(
                     center: (p.cx, p.cz),
                     yaw: p.cam.0,
                     pitch: p.cam.1,
-                    res: res as u32,
+                    res_w: res_w as u32,
+                    res_h: res_h as u32,
                 });
                 match gpu_tex.get(&p.id) {
                     Some(&t) => t,
                     None => {
                         let name = format!("wg-pop-tex-{}", p.id);
-                        ensure_preview_texture(ui.ctx(), name, &g, p.half, res.min(160), true, p.cam, (p.cx, p.cz), &mut p.tex, &mut p.key)
+                        ensure_preview_texture(ui.ctx(), name, &g, p.half, res_w.min(160), res_h.min(160), true, p.cam, (p.cx, p.cz), &mut p.tex, &mut p.key)
                     }
                 }
             } else {
                 let name = format!("wg-pop-tex-{}", p.id);
-                ensure_preview_texture(ui.ctx(), name, &g, p.half, res, false, p.cam, (p.cx, p.cz), &mut p.tex, &mut p.key)
+                ensure_preview_texture(ui.ctx(), name, &g, p.half, res_w, res_h, false, p.cam, (p.cx, p.cz), &mut p.tex, &mut p.key)
             };
             let resp = ui.add(
-                egui::Image::new(egui::load::SizedTexture::new(tex, egui::vec2(side, side)))
+                egui::Image::new(egui::load::SizedTexture::new(tex, egui::vec2(w, h)))
                     .sense(egui::Sense::click_and_drag()),
             );
             scroll_zoom_consume(ui, &resp, &mut p.half);
-            handle_preview_gestures(ui, &resp, p.is3d, side, &mut p.half, &mut p.cx, &mut p.cz, &mut p.cam.0, &mut p.cam.1);
+            handle_preview_gestures(ui, &resp, p.is3d, h, &mut p.half, &mut p.cx, &mut p.cz, &mut p.cam.0, &mut p.cam.1);
         });
     p.open = open;
 }

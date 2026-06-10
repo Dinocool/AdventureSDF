@@ -83,9 +83,10 @@ pub struct GpuPreviewRequest {
     /// Orbit camera.
     pub yaw: f32,
     pub pitch: f32,
-    /// Desired output resolution (px per side) — the pool resizes the slot's image to match the on-screen
-    /// size (quantised), so the render isn't capped at a fixed texture size.
-    pub res: u32,
+    /// Desired output resolution (px) — the pool resizes the slot's image to this (quantised) so the render
+    /// tracks the on-screen size AND fills a non-square window (the camera fov widens by `res_w/res_h`).
+    pub res_w: u32,
+    pub res_h: u32,
 }
 
 /// Inbox: preview consumers push requests here each frame; [`process_gpu_previews`] drains it.
@@ -103,7 +104,8 @@ struct GpuTarget {
     height: Handle<Image>,
     /// The offscreen output image (resized to track the requested on-screen size).
     output: Handle<Image>,
-    out_res: u32,
+    out_w: u32,
+    out_h: u32,
     tex_id: egui::TextureId,
     /// Preview key currently assigned to this slot (0 = free).
     key: u64,
@@ -123,9 +125,9 @@ struct GpuPreviewPool {
     targets: Vec<GpuTarget>,
 }
 
-/// Offscreen render-attachment image (the raymarch output egui samples) at `res`×`res`.
-fn make_output_image(images: &mut Assets<Image>, res: u32) -> Handle<Image> {
-    let size = Extent3d { width: res, height: res, depth_or_array_layers: 1 };
+/// Offscreen render-attachment image (the raymarch output egui samples) at `w`×`h`.
+fn make_output_image(images: &mut Assets<Image>, w: u32, h: u32) -> Handle<Image> {
+    let size = Extent3d { width: w, height: h, depth_or_array_layers: 1 };
     let mut image =
         Image::new_fill(size, TextureDimension::D2, &[0, 0, 0, 0], TextureFormat::Rgba8UnormSrgb, RenderAssetUsages::all());
     image.texture_descriptor.usage =
@@ -193,8 +195,8 @@ fn bake_key(g: &Graph, half: f64, center: (f64, f64)) -> u64 {
     h.finish()
 }
 
-/// Orbit camera + framing → the shader uniform.
-fn build_params(yaw: f32, pitch: f32, half: f32, ymin: f32, ymax: f32) -> PreviewParams {
+/// Orbit camera + framing → the shader uniform (`aspect` = output width/height, to fill a non-square view).
+fn build_params(yaw: f32, pitch: f32, half: f32, ymin: f32, ymax: f32, aspect: f32) -> PreviewParams {
     let span = (ymax - ymin).max(1.0);
     let centre = Vec3::new(0.0, (ymin + ymax) * 0.5, 0.0);
     let dist = half * 2.4 + span;
@@ -210,7 +212,7 @@ fn build_params(yaw: f32, pitch: f32, half: f32, ymin: f32, ymax: f32) -> Previe
         fwd: fwd.extend(half),
         right: right.extend(ymin),
         up: up.extend(ymax),
-        levels: Vec4::new(SEA_LEVEL, SNOW_LEVEL, WATER_DEPTH, HEIGHTFIELD_RES as f32),
+        levels: Vec4::new(SEA_LEVEL, SNOW_LEVEL, WATER_DEPTH, aspect),
     }
 }
 
@@ -230,7 +232,7 @@ fn setup_gpu_pool(
     for slot in 0..POOL_SIZE {
         let layer = RenderLayers::layer(POOL_LAYER_BASE + slot);
         let height = make_height_image(&mut images);
-        let output = make_output_image(&mut images, PREVIEW_SIZE);
+        let output = make_output_image(&mut images, PREVIEW_SIZE, PREVIEW_SIZE);
         let material = materials.add(HeightPreviewMaterial { params: PreviewParams::default(), height: height.clone() });
         let quad = meshes.add(Rectangle::new(2.0, 2.0));
         commands.spawn((Mesh3d(quad), MeshMaterial3d(material.clone()), Transform::IDENTITY, layer.clone()));
@@ -258,7 +260,8 @@ fn setup_gpu_pool(
             material,
             height,
             output,
-            out_res: PREVIEW_SIZE,
+            out_w: PREVIEW_SIZE,
+            out_h: PREVIEW_SIZE,
             tex_id,
             key: 0,
             baked_key: 0,
@@ -302,11 +305,12 @@ fn process_gpu_previews(world: &mut World) {
         for (ri, slot) in assign.iter().enumerate() {
             let Some(si) = *slot else { continue };
             let r = &requests[ri];
-            // Resize the slot's output image to the requested on-screen size (quantised), so the render
-            // isn't capped — recreate the image + re-point the camera + re-register the egui texture.
-            let want_res = quantize_res(r.res);
-            if pool.targets[si].out_res != want_res {
-                let new_out = make_output_image(&mut world.resource_mut::<Assets<Image>>(), want_res);
+            // Resize the slot's output image to the requested on-screen size (quantised, possibly
+            // non-square to fill the window) — recreate the image + re-point the camera + re-register the
+            // egui texture.
+            let (want_w, want_h) = (quantize_res(r.res_w), quantize_res(r.res_h));
+            if pool.targets[si].out_w != want_w || pool.targets[si].out_h != want_h {
+                let new_out = make_output_image(&mut world.resource_mut::<Assets<Image>>(), want_w, want_h);
                 let old = pool.targets[si].output.clone();
                 {
                     let mut et = world.resource_mut::<EguiUserTextures>();
@@ -316,7 +320,8 @@ fn process_gpu_previews(world: &mut World) {
                 let cam_e = pool.targets[si].camera;
                 world.entity_mut(cam_e).insert(RenderTarget::Image(new_out.clone().into()));
                 pool.targets[si].output = new_out;
-                pool.targets[si].out_res = want_res;
+                pool.targets[si].out_w = want_w;
+                pool.targets[si].out_h = want_h;
             }
             let bk = bake_key(&r.graph, r.half, r.center);
             if pool.targets[si].key != r.key || pool.targets[si].baked_key != bk {
@@ -330,7 +335,8 @@ fn process_gpu_previews(world: &mut World) {
                 pool.targets[si].key = r.key;
                 pool.targets[si].baked_key = bk;
             }
-            let params = build_params(r.yaw, r.pitch, r.half as f32, pool.targets[si].ymin, pool.targets[si].ymax);
+            let aspect = pool.targets[si].out_w as f32 / pool.targets[si].out_h.max(1) as f32;
+            let params = build_params(r.yaw, r.pitch, r.half as f32, pool.targets[si].ymin, pool.targets[si].ymax, aspect);
             let mat_h = pool.targets[si].material.clone();
             if let Some(mat) = world.resource_mut::<Assets<HeightPreviewMaterial>>().get_mut(&mat_h) {
                 mat.params = params;
