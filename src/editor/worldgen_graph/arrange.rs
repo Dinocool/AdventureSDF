@@ -5,7 +5,8 @@ use bevy_egui::egui;
 use egui_snarl::{NodeId, Snarl};
 
 use super::node::input_label;
-use super::{CLIMATE_INPUTS, DEFAULT_PREVIEW_PX, EdNode};
+use super::preview::DEFAULT_PREVIEW_PX;
+use super::{CLIMATE_INPUTS, EdNode};
 
 /// Lay the graph out left→right by dependency depth: each node's column = the longest input-chain to a
 /// leaf, rows stack within a column. Columns are spaced by their widest node and rows by each node's real
