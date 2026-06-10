@@ -17,11 +17,38 @@ pub(super) const DEFAULT_PREVIEW_PX: f32 = 120.0;
 pub(super) const PREVIEW_HALF_M: f64 = 2048.0;
 /// Default 3D orbit camera (yaw, pitch) in radians.
 pub(super) const CAM_DEFAULT: (f32, f32) = (0.7, 0.6);
-/// Fixed GPU pool key for the dockable preview panel (distinct from inline high-bit keys + pop-out ids).
+/// Number of independent dockable Node Preview panels in the pool (bounded so the GPU pool keys + dock
+/// tabs stay fixed). Each panel `idx` gets GPU key `PANEL_GPU_KEY + idx` (7..=10).
+pub(super) const PREVIEW_PANELS: usize = 4;
+/// Base GPU pool key for the dockable preview panels; panel `idx` uses `PANEL_GPU_KEY + idx` (distinct
+/// from inline high-bit keys + pop-out ids ≥ 1000).
 pub(super) const PANEL_GPU_KEY: u64 = 7;
 
-/// The dockable, viewport-located preview panel's state: which node it shows + its own view.
+/// The registered dock tab id for preview panel `idx` — `worldgen/node-preview` for 0, then `-2/-3/-4`.
+/// SSOT for the per-panel tab id (used by registration AND `open_preview_panel`'s focus).
+pub(super) fn preview_panel_tab_id(idx: usize) -> String {
+    if idx == 0 {
+        "worldgen/node-preview".to_string()
+    } else {
+        format!("worldgen/node-preview-{}", idx + 1)
+    }
+}
+
+/// The bounded POOL of independent dockable Node Preview panels (one per dock tab). "→ panel" fills the
+/// first free slot; each renders into its own GPU key + dock tab. A `Vec` of fixed length
+/// [`PREVIEW_PANELS`] (defaulted to that many default panels), so adding a panel is just bumping the
+/// constant + registering its tab.
 #[derive(Resource)]
+pub(super) struct WorldgenPreviewPanels(pub(super) Vec<WorldgenPreviewPanel>);
+
+impl Default for WorldgenPreviewPanels {
+    fn default() -> Self {
+        Self((0..PREVIEW_PANELS).map(|_| WorldgenPreviewPanel::default()).collect())
+    }
+}
+
+/// The dockable, viewport-located preview panel's state: which node it shows + its own view. One per
+/// pool slot in [`WorldgenPreviewPanels`].
 pub(super) struct WorldgenPreviewPanel {
     pub(super) target: Option<(Vec<NodeId>, NodeId)>,
     pub(super) half: f64,
@@ -204,7 +231,9 @@ pub(super) fn scale_label_text(half_m: f64) -> String {
 pub(super) fn paint_scale_label(ui: &egui::Ui, rect: egui::Rect, half_m: f64) {
     let text = scale_label_text(half_m);
     let painter = ui.painter();
-    let font = egui::FontId::proportional(11.0);
+    // Scale the label with the preview: small inline previews get ~13px, large panel/pop-out up to 22px.
+    let fs = (rect.width() * 0.055).clamp(13.0, 22.0);
+    let font = egui::FontId::proportional(fs);
     // Lay the text out so the backing rect hugs it exactly (bottom-left corner, small inset).
     let galley = painter.layout_no_wrap(text, font, egui::Color32::from_gray(235));
     let pad = egui::vec2(4.0, 2.0);
@@ -212,6 +241,37 @@ pub(super) fn paint_scale_label(ui: &egui::Ui, rect: egui::Rect, half_m: f64) {
     let bg = egui::Rect::from_min_size(pos, galley.size() + pad * 2.0);
     painter.rect_filled(bg, 3.0, egui::Color32::from_black_alpha(150));
     painter.galley(pos + pad, galley, egui::Color32::from_gray(235));
+}
+
+/// A small **drag-resize grip** at the bottom-right corner of a preview `rect`: a ~14px square,
+/// `Sense::drag()`, painted as two short diagonal lines. Returns the resize delta (px, the larger of the
+/// drag's x/y components) while dragged, else `None` — the caller adds it to the preview's display size
+/// (clamped). A reusable preview overlay (one helper, like [`paint_scale_label`]) so every preview can
+/// gain a corner-resize handle the same way. The grip is its own widget rect, so its drag never triggers
+/// the underlying image's orbit/pan gesture.
+pub(super) fn preview_resize_grip(ui: &mut egui::Ui, rect: egui::Rect) -> Option<f32> {
+    const GRIP: f32 = 14.0;
+    let grip_rect = egui::Rect::from_min_max(rect.max - egui::vec2(GRIP, GRIP), rect.max);
+    let resp = ui.interact(grip_rect, ui.id().with(("preview-resize-grip", rect.left_top().x as i32, rect.left_top().y as i32)), egui::Sense::drag());
+    // Paint two short diagonal lines (the conventional resize grip), brightening on hover/drag.
+    let bright = resp.hovered() || resp.dragged();
+    let col = if bright { egui::Color32::from_gray(220) } else { egui::Color32::from_gray(150) };
+    let stroke = egui::Stroke::new(1.5, col);
+    let p = ui.painter();
+    let br = grip_rect.right_bottom();
+    for off in [4.0_f32, 9.0] {
+        p.line_segment([egui::pos2(br.x - off, br.y - 2.0), egui::pos2(br.x - 2.0, br.y - off)], stroke);
+    }
+    if resp.hovered() || resp.dragged() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeNwSe);
+    }
+    if resp.dragged() {
+        let d = resp.drag_delta();
+        // Use the larger-magnitude axis so dragging in either direction feels natural.
+        Some(if d.x.abs() >= d.y.abs() { d.x } else { d.y })
+    } else {
+        None
+    }
 }
 
 /// Draw a preview image at `size`, or a flat "baking…" placeholder for the ~1 frame before the GPU pool
@@ -234,10 +294,27 @@ pub(super) fn preview_image(ui: &mut egui::Ui, tex: Option<egui::TextureId>, siz
     }
 }
 
-/// The dockable, viewport-located **Node Preview** panel — shows whichever node was sent via "→ panel",
-/// large, with its own 2D/3D + zoom/pan/orbit (both rendered on the shared GPU pool).
-pub(super) fn preview_panel(world: &mut World, ui: &mut egui::Ui) {
-    let Some((nav, node)) = world.resource::<WorldgenPreviewPanel>().target.clone() else {
+// One thin render fn per pool slot — `register_panel` takes a plain `fn` pointer, so each panel needs a
+// distinct entry point that forwards to the shared `preview_panel_impl` with its index.
+pub(super) fn preview_panel_0(world: &mut World, ui: &mut egui::Ui) {
+    preview_panel_impl(world, ui, 0);
+}
+pub(super) fn preview_panel_1(world: &mut World, ui: &mut egui::Ui) {
+    preview_panel_impl(world, ui, 1);
+}
+pub(super) fn preview_panel_2(world: &mut World, ui: &mut egui::Ui) {
+    preview_panel_impl(world, ui, 2);
+}
+pub(super) fn preview_panel_3(world: &mut World, ui: &mut egui::Ui) {
+    preview_panel_impl(world, ui, 3);
+}
+
+/// The dockable, viewport-located **Node Preview** panel `idx` — shows whichever node was sent to it via
+/// "→ panel", large, with its own 2D/3D + zoom/pan/orbit (both rendered on the shared GPU pool, into the
+/// panel's own key `PANEL_GPU_KEY + idx`).
+fn preview_panel_impl(world: &mut World, ui: &mut egui::Ui, idx: usize) {
+    let gpu_key = PANEL_GPU_KEY + idx as u64;
+    let Some((nav, node)) = world.resource::<WorldgenPreviewPanels>().0[idx].target.clone() else {
         ui.label("No preview targeted. In the Biome Graph, click a node preview's ▢ button to show it here.");
         return;
     };
@@ -250,8 +327,8 @@ pub(super) fn preview_panel(world: &mut World, ui: &mut egui::Ui) {
         return;
     };
 
-    world.resource_scope::<WorldgenPreviewPanel, ()>(|world, mut panel| {
-        let panel = &mut *panel; // reborrow once so disjoint field borrows don't alias through Mut's deref
+    world.resource_scope::<WorldgenPreviewPanels, ()>(|world, mut panels| {
+        let panel = &mut panels.0[idx]; // reborrow once so disjoint field borrows don't alias through Mut's deref
         ui.horizontal(|ui| {
             if ui.selectable_label(panel.is3d, "3D").on_hover_text("GPU 3D surface").clicked() {
                 panel.is3d = !panel.is3d;
@@ -265,14 +342,13 @@ pub(super) fn preview_panel(world: &mut World, ui: &mut egui::Ui) {
             ui.label("· drag orbit · right-drag pan · scroll zoom");
         });
         let ppp = ui.ctx().pixels_per_point();
-        // Fill the panel non-square (drag the dock edge to resize); render res tracks the on-screen size.
         // Square preview sized to fit the panel (drag the dock edge to resize), centred in the leftover space.
         let avail = ui.available_size();
         let side = avail.x.min(avail.y).max(64.0);
         let res = ((side * ppp).round() as usize).max(32);
         let view = panel.view();
-        world.resource_mut::<GpuPreviewRequests>().0.push(view.to_request(PANEL_GPU_KEY, g, panel.is3d, res as u32));
-        let tex = world.resource::<GpuPreviewTextures>().0.get(&PANEL_GPU_KEY).copied();
+        world.resource_mut::<GpuPreviewRequests>().0.push(view.to_request(gpu_key, g, panel.is3d, res as u32));
+        let tex = world.resource::<GpuPreviewTextures>().0.get(&gpu_key).copied();
         ui.vertical_centered(|ui| {
             let resp = preview_image(ui, tex, egui::vec2(side, side));
             paint_scale_label(ui, resp.rect, panel.half);
@@ -284,22 +360,30 @@ pub(super) fn preview_panel(world: &mut World, ui: &mut egui::Ui) {
     });
 }
 
-/// Outside the dock render (when `EditorDockState` is back in the World), ensure + focus the dockable
-/// Node Preview tab if "→ panel" was requested this/last frame.
+/// Outside the dock render (when `EditorDockState` is back in the World), ensure + focus EACH dockable
+/// Node Preview tab whose panel has `pending_open` set (one per pool slot). Clears the flag per slot.
 pub(super) fn open_preview_panel(world: &mut World) {
-    if !world.resource::<WorldgenPreviewPanel>().pending_open {
+    // Collect the slots that asked to open this frame, clearing their flags.
+    let pending: Vec<usize> = {
+        let mut panels = world.resource_mut::<WorldgenPreviewPanels>();
+        (0..PREVIEW_PANELS)
+            .filter(|&i| {
+                let p = &mut panels.0[i];
+                std::mem::take(&mut p.pending_open)
+            })
+            .collect()
+    };
+    if pending.is_empty() || !world.contains_resource::<crate::editor::dock::EditorDockState>() {
         return;
     }
-    world.resource_mut::<WorldgenPreviewPanel>().pending_open = false;
-    if !world.contains_resource::<crate::editor::dock::EditorDockState>() {
-        return;
-    }
-    let tab = crate::editor::dock::EditorTab::Registered("worldgen/node-preview".into());
-    crate::editor::layout::set_panel_present(world, tab.clone(), crate::editor::panels::DockSide::Center, true);
-    if let Some(mut dock) = world.get_resource_mut::<crate::editor::dock::EditorDockState>()
-        && let Some((n, t)) = dock.state.find_main_surface_tab(&tab)
-    {
-        dock.state.set_active_tab((egui_dock::SurfaceIndex::main(), n, t));
+    for idx in pending {
+        let tab = crate::editor::dock::EditorTab::Registered(preview_panel_tab_id(idx));
+        crate::editor::layout::set_panel_present(world, tab.clone(), crate::editor::panels::DockSide::Center, true);
+        if let Some(mut dock) = world.get_resource_mut::<crate::editor::dock::EditorDockState>()
+            && let Some((n, t)) = dock.state.find_main_surface_tab(&tab)
+        {
+            dock.state.set_active_tab((egui_dock::SurfaceIndex::main(), n, t));
+        }
     }
 }
 

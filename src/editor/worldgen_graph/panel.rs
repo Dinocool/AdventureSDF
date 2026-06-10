@@ -14,10 +14,12 @@ use crate::editor::worldgen_gpu_preview::{GpuPreviewRequest, GpuPreviewRequests,
 use crate::sdf_render::worldgen::WorldGraph;
 use crate::sdf_render::worldgen::graph::GraphAsset;
 
-use super::convert::{breadcrumb_names, current_snarl_mut, valid_depth, world_biome_snarl};
+use super::convert::{
+    breadcrumb_names, copy_selection, current_snarl_mut, paste_clipboard, valid_depth, world_biome_snarl,
+};
 use super::persist::{apply_view, load_editor_doc, load_session, save_editor_doc};
 use super::preview::{
-    PoppedPreview, WorldgenPreviewPanel, apply_scroll_zoom, nav_hash, popped_preview_window,
+    PoppedPreview, WorldgenPreviewPanels, apply_scroll_zoom, nav_hash, popped_preview_window,
 };
 use super::viewer::Viewer;
 use super::{ViewerSignals, WorldGraphEditor, auto_arrange, snarl_to_graph};
@@ -37,8 +39,8 @@ pub(super) fn graph_panel(world: &mut World, ui: &mut egui::Ui) {
             if let Ok(g) = snarl_to_graph(&editor.snarl) {
                 world.resource_mut::<WorldGraph>().0 = Arc::new(g);
             }
-            world.resource_scope::<WorldgenPreviewPanel, ()>(|_w, mut panel| {
-                apply_view(view, &mut editor, &mut panel);
+            world.resource_scope::<WorldgenPreviewPanels, ()>(|_w, mut panels| {
+                apply_view(view, &mut editor, &mut panels);
             });
         }
 
@@ -61,7 +63,7 @@ pub(super) fn graph_panel(world: &mut World, ui: &mut egui::Ui) {
                     Ok(g) => {
                         let flat = (GraphAsset { graph: g }).save(std::path::Path::new(&editor.path));
                         let doc = world
-                            .resource_scope::<WorldgenPreviewPanel, _>(|_w, panel| save_editor_doc(&editor, &panel));
+                            .resource_scope::<WorldgenPreviewPanels, _>(|_w, panels| save_editor_doc(&editor, &panels));
                         match (flat, doc) {
                             (Ok(()), Ok(())) => format!("saved {} (+document)", editor.path),
                             (Err(e), _) => format!("save failed: {e}"),
@@ -79,8 +81,8 @@ pub(super) fn graph_panel(world: &mut World, ui: &mut egui::Ui) {
                 editor.nav.clear();
                 editor.clear_node_caches();
                 editor.needs_arrange = true;
-                world.resource_scope::<WorldgenPreviewPanel, ()>(|_w, mut panel| {
-                    apply_view(view, &mut editor, &mut panel);
+                world.resource_scope::<WorldgenPreviewPanels, ()>(|_w, mut panels| {
+                    apply_view(view, &mut editor, &mut panels);
                 });
                 editor.status = format!("loaded {}", editor.path);
             }
@@ -139,6 +141,7 @@ pub(super) fn graph_panel(world: &mut World, ui: &mut egui::Ui) {
         if let Some(d) = nav_to.filter(|&d| d != editor.nav.len()) {
             editor.nav.truncate(d);
             editor.clear_node_caches();
+            editor.needs_arrange = true;
         }
         ui.separator();
 
@@ -178,12 +181,52 @@ pub(super) fn graph_panel(world: &mut World, ui: &mut egui::Ui) {
             // graph legible (the compact auto-arrange usually fits above this). Allow zooming in to 3×.
             let style = SnarlStyle { min_scale: Some(0.75), max_scale: Some(3.0), ..SnarlStyle::new() };
             SnarlWidget::new()
-                .id(egui::Id::new("worldgen-biome-graph"))
+                .id(egui::Id::new(("worldgen-biome-graph", level_salt)))
                 .style(style)
                 .show(current, &mut viewer, ui);
         }
-        // After a seed/load, auto-arrange once the nodes have been measured this frame (so the layout uses
-        // real sizes). Applies on the next frame.
+
+        // Node clipboard + keyboard: select (built-in shift/cmd-click) → delete / copy / cut / paste, on
+        // the CURRENT nav level's snarl. Resolved AFTER the show (so we don't hold `current` across it)
+        // and keyed by the per-level snarl id (matches `get_selected_nodes`'s selection store).
+        {
+            let snarl_id = egui::Id::new(("worldgen-biome-graph", level_salt));
+            let selected = egui_snarl::ui::get_selected_nodes(snarl_id, ui.ctx());
+            let (delete, copy, cut, paste) = ui.input(|i| {
+                let cmd = i.modifiers.command;
+                (
+                    i.key_pressed(egui::Key::Delete) || i.key_pressed(egui::Key::Backspace),
+                    cmd && i.key_pressed(egui::Key::C),
+                    cmd && i.key_pressed(egui::Key::X),
+                    cmd && i.key_pressed(egui::Key::V),
+                )
+            });
+            if delete || copy || cut || paste {
+                let WorldGraphEditor { snarl, nav, clipboard, .. } = &mut *editor;
+                let current = current_snarl_mut(snarl, nav);
+                if copy || cut {
+                    *clipboard = copy_selection(current, &selected);
+                }
+                if (delete || cut) && !selected.is_empty() {
+                    for id in &selected {
+                        if current.get_node(*id).is_some() {
+                            current.remove_node(*id);
+                        }
+                    }
+                }
+                let pasted = paste && !clipboard.is_empty();
+                if pasted {
+                    paste_clipboard(current, clipboard, egui::vec2(24.0, 24.0));
+                }
+                // (drop `current`/`clipboard` borrows here before touching another `editor` field)
+                editor.needs_arrange |= pasted;
+            }
+        }
+
+        // A node's preview was collapsed/expanded this frame → re-pack so the layout tightens.
+        editor.needs_arrange |= editor.signals.needs_arrange;
+        // After a seed/load (or a collapse-toggle), auto-arrange once the nodes have been measured this
+        // frame (so the layout uses real sizes). Applies on the next frame.
         if std::mem::take(&mut editor.needs_arrange) {
             editor.rearrange();
         }
@@ -191,12 +234,16 @@ pub(super) fn graph_panel(world: &mut World, ui: &mut egui::Ui) {
         if let Some(id) = editor.signals.enter.take() {
             editor.nav.push(id);
             editor.clear_node_caches();
+            editor.needs_arrange = true;
         }
-        // Retarget the dockable preview panel (snapshotting the node's nav + view state).
+        // Retarget a dockable preview panel (snapshotting the node's nav + view state) — the FIRST free
+        // slot, or slot 0 if all four are occupied.
         if let Some(node) = editor.signals.to_panel.take() {
             let nav = editor.nav.clone();
             let v = editor.caches.views.get(&node).copied().unwrap_or_default();
-            if let Some(mut panel) = world.get_resource_mut::<WorldgenPreviewPanel>() {
+            if let Some(mut panels) = world.get_resource_mut::<WorldgenPreviewPanels>() {
+                let slot = panels.0.iter().position(|p| p.target.is_none()).unwrap_or(0);
+                let panel = &mut panels.0[slot];
                 panel.target = Some((nav, node));
                 panel.half = v.zoom_half_m;
                 panel.cam = v.cam;

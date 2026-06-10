@@ -14,7 +14,7 @@ use egui_snarl::{NodeId, Snarl};
 use crate::sdf_render::worldgen::graph::GraphAsset;
 
 use super::convert::{graph_to_snarl, valid_depth, world_biome_snarl, worldgraph_path};
-use super::preview::{PoppedPreview, PreviewView, WorldgenPreviewPanel};
+use super::preview::{PoppedPreview, PreviewView, WorldgenPreviewPanels};
 use super::{EdNode, NodeView, WorldGraphEditor};
 
 /// Current persistence-document schema version. Bump when the doc shape changes incompatibly; a
@@ -48,7 +48,12 @@ pub(super) struct EditorView {
     pub nodes: HashMap<NodeId, NodeView>,
     /// Which biome the user was navigated into (restored on load, clamped to live biomes).
     pub nav: Vec<NodeId>,
-    /// The dockable Node Preview panel's target + view (if it was showing a node).
+    /// The dockable Node Preview panels' targets + views — one entry per OCCUPIED pool slot (empty slots
+    /// aren't persisted). Restored into the first free slots on load.
+    pub panels: Vec<PanelView>,
+    /// DEPRECATED backward-compat alias: the single pre-pool panel field. Older `.worldgraph.ron` files
+    /// wrote `panel: Some(..)`; on load `apply_view` folds it into `panels`. Never written anymore.
+    #[serde(skip_serializing)]
     pub panel: Option<PanelView>,
     /// Floating pop-out preview windows to re-open.
     pub popped: Vec<PoppedView>,
@@ -73,40 +78,51 @@ pub(super) struct PoppedView {
     pub view: PreviewView,
 }
 
-/// Snapshot the editor + preview panel into an [`EditorView`] (the resumable state half of the doc).
+/// Snapshot the editor + preview panel POOL into an [`EditorView`] (the resumable state half of the doc).
 /// Only TOP-LEVEL node settings are captured — `caches.views` holds the current nav level's nodes,
-/// which at save time (the toolbar is on the top graph) is the root.
-pub(super) fn gather_view(editor: &WorldGraphEditor, panel: &WorldgenPreviewPanel) -> EditorView {
-    let panel = panel.target.as_ref().map(|(nav, node)| PanelView {
-        nav: nav.clone(),
-        node: *node,
-        is3d: panel.is3d,
-        view: panel.view(),
-    });
+/// which at save time (the toolbar is on the top graph) is the root. Each OCCUPIED pool slot becomes one
+/// `panels` entry.
+pub(super) fn gather_view(editor: &WorldGraphEditor, panels: &WorldgenPreviewPanels) -> EditorView {
+    let panels = panels
+        .0
+        .iter()
+        .filter_map(|p| {
+            p.target.as_ref().map(|(nav, node)| PanelView {
+                nav: nav.clone(),
+                node: *node,
+                is3d: p.is3d,
+                view: p.view(),
+            })
+        })
+        .collect();
     let popped = editor
         .popped
         .iter()
         .map(|p| PoppedView { nav: p.nav.clone(), node: p.node, is3d: p.is3d, size: p.size, view: p.view() })
         .collect();
-    EditorView { nodes: editor.caches.views.clone(), nav: editor.nav.clone(), panel, popped }
+    EditorView { nodes: editor.caches.views.clone(), nav: editor.nav.clone(), panels, panel: None, popped }
 }
 
-/// Restore an [`EditorView`] into the editor + preview panel: per-node settings, nav (clamped so a
-/// stale path can't panic), the dockable panel (re-targeted + `pending_open` so its tab reopens
-/// populated), and the pop-out windows.
-pub(super) fn apply_view(view: EditorView, editor: &mut WorldGraphEditor, panel: &mut WorldgenPreviewPanel) {
+/// Restore an [`EditorView`] into the editor + preview panel POOL: per-node settings, nav (clamped so a
+/// stale path can't panic), each dockable panel (re-targeted into a pool slot + `pending_open` so its tab
+/// reopens populated), and the pop-out windows. A legacy single `panel` field (old files) is folded in
+/// front of `panels`.
+pub(super) fn apply_view(view: EditorView, editor: &mut WorldGraphEditor, panels: &mut WorldgenPreviewPanels) {
     editor.caches.views = view.nodes;
     // Clamp the saved nav to the live biome chain so a deleted/renamed biome can't desync or panic.
     let depth = valid_depth(&editor.snarl, &view.nav);
     editor.nav = view.nav;
     editor.nav.truncate(depth);
 
-    if let Some(p) = view.panel {
-        panel.target = Some((p.nav, p.node));
-        panel.is3d = p.is3d;
-        panel.set_view(p.view);
+    // Fold the deprecated single `panel` field (old saves) in front of the `panels` list, then restore
+    // each into successive pool slots (bounded by the pool size).
+    let restored = view.panel.into_iter().chain(view.panels);
+    for (slot, p) in panels.0.iter_mut().zip(restored) {
+        slot.target = Some((p.nav, p.node));
+        slot.is3d = p.is3d;
+        slot.set_view(p.view);
         // Re-show the dock tab populated (only if a target exists — a bare panel stays as the hint).
-        panel.pending_open = true;
+        slot.pending_open = true;
     }
 
     editor.popped = view
@@ -163,8 +179,8 @@ pub(super) fn load_editor_doc(graph_path: &str) -> (Snarl<EdNode>, EditorView) {
 /// Write the hierarchical editor document (versioned snarl + gathered view-state) to the
 /// `.worldgraph.ron` sibling of `editor.path`. The flat `.graph.ron` is written separately by the Save
 /// button (the engine asset the world hot-reloads).
-pub(super) fn save_editor_doc(editor: &WorldGraphEditor, panel: &WorldgenPreviewPanel) -> Result<(), String> {
-    let doc = WorldGraphDoc { version: doc_version(), snarl: editor.snarl.clone(), view: gather_view(editor, panel) };
+pub(super) fn save_editor_doc(editor: &WorldGraphEditor, panels: &WorldgenPreviewPanels) -> Result<(), String> {
+    let doc = WorldGraphDoc { version: doc_version(), snarl: editor.snarl.clone(), view: gather_view(editor, panels) };
     let s = ron::ser::to_string_pretty(&doc, ron::ser::PrettyConfig::default()).map_err(|e| e.to_string())?;
     std::fs::write(worldgraph_path(&editor.path), s).map_err(|e| e.to_string())
 }
@@ -182,8 +198,8 @@ fn session_path() -> std::path::PathBuf {
 
 /// Write the live editor doc to the session file (called on app exit). Best-effort: a write failure just
 /// means the next launch falls back to the on-disk asset.
-pub(super) fn save_session(editor: &WorldGraphEditor, panel: &WorldgenPreviewPanel) {
-    let doc = WorldGraphDoc { version: doc_version(), snarl: editor.snarl.clone(), view: gather_view(editor, panel) };
+pub(super) fn save_session(editor: &WorldGraphEditor, panels: &WorldgenPreviewPanels) {
+    let doc = WorldGraphDoc { version: doc_version(), snarl: editor.snarl.clone(), view: gather_view(editor, panels) };
     if let Ok(s) = ron::ser::to_string_pretty(&doc, ron::ser::PrettyConfig::default()) {
         let _ = std::fs::create_dir_all(std::path::Path::new(".soul"));
         let _ = std::fs::write(session_path(), s);

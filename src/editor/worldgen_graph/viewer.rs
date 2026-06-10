@@ -12,6 +12,7 @@ use super::convert::new_biome_subgraph;
 use super::node::{input_label, node_catalog, node_kind_name, node_params_ui};
 use super::preview::{
     PreviewView, gpu_inline_key, handle_preview_gestures, paint_scale_label, preview_image,
+    preview_resize_grip,
 };
 use super::{CLIMATE_INPUTS, EdNode, NodeCaches, ViewerSignals, climate_name, graph_rooted_at};
 
@@ -96,6 +97,7 @@ impl SnarlViewer<EdNode> for Viewer<'_> {
                 .clicked()
             {
                 self.caches.views.entry(node).or_default().collapsed = false;
+                self.signals.needs_arrange = true;
             }
             self.caches.body_size.insert(node, ui.min_rect().size());
             return;
@@ -141,11 +143,19 @@ impl SnarlViewer<EdNode> for Viewer<'_> {
                     if img_resp.hovered() {
                         *self.hovered_preview = Some(node);
                     }
-                    // RIGHT — controls column (collapse, pop-out, zoom, 2D/3D, size).
+                    // Drag-resize grip at the image's BOTTOM-RIGHT corner — added AFTER (and over) the
+                    // image as its own widget rect, so its drag is separate from the image's orbit/pan
+                    // gesture. Dragging it grows/shrinks `disp_px` (the preview side), clamped 64..=1024.
+                    if let Some(delta) = preview_resize_grip(ui, img_resp.rect) {
+                        let sz = &mut self.caches.views.entry(node).or_default().disp_px;
+                        *sz = (*sz + delta).clamp(64.0, 1024.0);
+                    }
+                    // RIGHT — controls column (collapse, pop-out, zoom, 2D/3D).
                     ui.vertical(|ui| {
                         ui.horizontal(|ui| {
                             if ui.small_button(icon::CARET_DOWN).on_hover_text("Collapse preview").clicked() {
                                 self.caches.views.entry(node).or_default().collapsed = true;
+                                self.signals.needs_arrange = true;
                             }
                             if ui.small_button(icon::ARROWS_OUT).on_hover_text("Pop out into a movable window").clicked() {
                                 self.signals.pop_request = Some(node);
@@ -170,9 +180,6 @@ impl SnarlViewer<EdNode> for Viewer<'_> {
                         {
                             self.caches.views.entry(node).or_default().surface = !is3d;
                         }
-                        let sz = &mut self.caches.views.entry(node).or_default().disp_px;
-                        ui.add(egui::DragValue::new(sz).speed(2.0).range(64.0..=1024.0).suffix(" px"))
-                            .on_hover_text("Preview size");
                     });
                 });
             }
@@ -198,6 +205,35 @@ impl SnarlViewer<EdNode> for Viewer<'_> {
         // An input takes a single wire: replace any existing connection on the target pin.
         snarl.drop_inputs(to.id);
         snarl.connect(from.id, to.id);
+    }
+
+    fn has_node_menu(&mut self, _node: &EdNode) -> bool {
+        true
+    }
+
+    fn show_node_menu(
+        &mut self,
+        node: NodeId,
+        _inputs: &[InPin],
+        _outputs: &[OutPin],
+        ui: &mut egui::Ui,
+        snarl: &mut Snarl<EdNode>,
+    ) {
+        // Delete — `remove_node` drops the node AND its dangling wires (in + out). Deleting Output/Input
+        // just makes the graph invalid, which the existing validity hint surfaces — kept uniform/simple.
+        if ui.button(format!("{} Delete", icon::TRASH)).clicked() {
+            snarl.remove_node(node);
+            ui.close();
+            return;
+        }
+        // Duplicate — drop a clone of this node's EdNode just down-right of it (no wires).
+        if ui.button(format!("{} Duplicate", icon::COPY)).clicked() {
+            if let Some(kind) = snarl.get_node(node).cloned() {
+                let pos = snarl.get_node_info(node).map(|n| n.pos).unwrap_or(egui::Pos2::ZERO);
+                snarl.insert_node(pos + egui::vec2(30.0, 30.0), kind);
+            }
+            ui.close();
+        }
     }
 
     fn has_graph_menu(&mut self, _pos: egui::Pos2, _snarl: &mut Snarl<EdNode>) -> bool {
