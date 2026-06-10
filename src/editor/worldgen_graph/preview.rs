@@ -184,18 +184,25 @@ pub(super) fn handle_preview_gestures(resp: &egui::Response, is3d: bool, size: f
     }
 }
 
+/// Format the visible world width (`2 * half_m`, metres) as a scale-label string: `">= 1000 m"` reads
+/// as kilometres (`"{:.1} km"`), below that as metres (`"{:.0} m"`). Pure — the testable core of
+/// [`paint_scale_label`].
+pub(super) fn scale_label_text(half_m: f64) -> String {
+    let width_m = 2.0 * half_m;
+    if width_m >= 1000.0 {
+        format!("{:.1} km", width_m / 1000.0)
+    } else {
+        format!("{width_m:.0} m")
+    }
+}
+
 /// Paint a small **scale label** — the visible world width (`2 * half_m`) — in the bottom-left corner
 /// of `rect`, with a semi-opaque rounded backing for legibility. A reusable preview OVERLAY: one
 /// helper, called at every preview draw site (inline node body, the dockable panel, pop-out windows),
 /// so a future overlay (grid, compass, crosshair) plugs in the exact same way. Pure painting — no
 /// state, no input.
 pub(super) fn paint_scale_label(ui: &egui::Ui, rect: egui::Rect, half_m: f64) {
-    let width_m = 2.0 * half_m;
-    let text = if width_m >= 1000.0 {
-        format!("{:.1} km", width_m / 1000.0)
-    } else {
-        format!("{width_m:.0} m")
-    };
+    let text = scale_label_text(half_m);
     let painter = ui.painter();
     let font = egui::FontId::proportional(11.0);
     // Lay the text out so the backing rect hugs it exactly (bottom-left corner, small inset).

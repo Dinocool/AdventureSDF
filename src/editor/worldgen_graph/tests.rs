@@ -3,8 +3,10 @@ use super::compile::output_root;
 use super::convert::{
     breadcrumb_names, new_biome_subgraph, resolve_snarl, valid_depth, world_biome_snarl, worldgraph_path,
 };
-use super::persist::{EditorView, WorldGraphDoc, load_editor_doc};
-use super::preview::{PANEL_GPU_KEY, gpu_inline_key};
+use super::persist::{
+    EditorView, PanelView, PoppedView, WorldGraphDoc, apply_view, gather_view, load_editor_doc,
+};
+use super::preview::{PANEL_GPU_KEY, PreviewView, WorldgenPreviewPanel, gpu_inline_key, scale_label_text};
 use super::*;
 use egui::pos2;
 use egui_snarl::{InPinId, OutPinId};
@@ -467,4 +469,138 @@ fn output_root_distinguishes_duplicate_and_unwired() {
     none.insert_node(p(), EdNode::Op(NodeKind::Const(0.0)));
     let e = output_root(&none).expect_err("missing Output is an error");
     assert!(e.contains("no Output node"), "got: {e}");
+}
+
+// -- scale-label overlay -------------------------------------------------------------------------
+
+#[test]
+fn scale_label_text_formats_metres_and_kilometres() {
+    // half_m is the HALF-extent; the label shows the full visible width = 2 * half_m.
+    assert_eq!(scale_label_text(100.0), "200 m"); // 200 m < 1000 ⇒ metres, no decimals
+    assert_eq!(scale_label_text(250.0), "500 m");
+    assert_eq!(scale_label_text(500.0), "1.0 km"); // 1000 m ⇒ kilometres (the boundary)
+    assert_eq!(scale_label_text(2048.0), "4.1 km"); // 4096 m ⇒ 4.1 km
+    assert_eq!(scale_label_text(1000.0), "2.0 km");
+}
+
+// -- persistence document (WorldGraphDoc / EditorView) -------------------------------------------
+
+/// A non-default `NodeView` to prove every field survives serialization.
+fn sample_node_view() -> NodeView {
+    NodeView {
+        collapsed: true,
+        surface: true,
+        zoom_half_m: 333.5,
+        cam: (0.25, 1.1),
+        pan: (12.0, -34.0),
+        disp_px: 256.0,
+    }
+}
+
+fn sample_preview_view() -> PreviewView {
+    PreviewView { half: 777.0, cx: 4.0, cz: -8.0, yaw: 0.9, pitch: 0.4 }
+}
+
+/// A `WorldGraphDoc` (snarl + a fully-populated `EditorView`) must RON round-trip with every field —
+/// the NodeView settings, nav, the panel target+view, and a pop-out — surviving intact.
+#[test]
+fn world_graph_doc_round_trips_view_state() {
+    let (mut top, b) = top_with_biome("Hills");
+    let o = top.insert_node(p(), EdNode::Output);
+    top.connect(out(b), inn(o, 0));
+
+    let mut nodes = std::collections::HashMap::new();
+    nodes.insert(b, sample_node_view());
+    let view = EditorView {
+        nodes,
+        nav: vec![b],
+        panel: Some(PanelView { nav: vec![b], node: o, is3d: true, view: sample_preview_view() }),
+        popped: vec![PoppedView { nav: vec![], node: b, is3d: false, size: 300.0, view: sample_preview_view() }],
+    };
+    let doc = WorldGraphDoc { version: 1, snarl: top, view };
+
+    let s = ron::ser::to_string(&doc).expect("serialize doc");
+    let back: WorldGraphDoc = ron::de::from_str(&s).expect("deserialize doc");
+
+    assert_eq!(back.version, 1);
+    assert!(back.snarl.node_ids().any(|(_, n)| matches!(n, EdNode::Biome { .. })), "snarl survived");
+    // NodeView fields all survive.
+    let nv = back.view.nodes.get(&b).copied().expect("node view present");
+    let want = sample_node_view();
+    assert_eq!(nv.collapsed, want.collapsed);
+    assert_eq!(nv.surface, want.surface);
+    assert_eq!(nv.zoom_half_m, want.zoom_half_m);
+    assert_eq!(nv.cam, want.cam);
+    assert_eq!(nv.pan, want.pan);
+    assert_eq!(nv.disp_px, want.disp_px);
+    // nav / panel / popped survive.
+    assert_eq!(back.view.nav, vec![b]);
+    let pv = back.view.panel.expect("panel survived");
+    assert_eq!((pv.node, pv.is3d), (o, true));
+    assert_eq!(pv.view.half, sample_preview_view().half);
+    assert_eq!(back.view.popped.len(), 1);
+    assert_eq!(back.view.popped[0].node, b);
+}
+
+/// `apply_view` must CLAMP a stale nav (pointing at a now-deleted biome) without panicking — it falls
+/// back to the deepest still-valid prefix (here: the root).
+#[test]
+fn apply_view_clamps_stale_nav_without_panicking() {
+    let mut snarl = Snarl::new();
+    let lone = snarl.insert_node(p(), EdNode::Op(NodeKind::Const(0.0)));
+    let mut editor = WorldGraphEditor { snarl, ..Default::default() };
+    let mut panel = WorldgenPreviewPanel::default();
+
+    // nav references a node that is NOT a biome (and a wholly bogus id) — must clamp to depth 0.
+    let view = EditorView { nav: vec![lone], ..EditorView::default() };
+    apply_view(view, &mut editor, &mut panel);
+    assert!(editor.nav.is_empty(), "stale nav clamped to the root");
+}
+
+/// `gather_view` → `apply_view` must round-trip the editor's view-state: per-node settings, nav, the
+/// panel target, and the pop-out windows all come back equivalent.
+#[test]
+fn gather_then_apply_round_trips_view_state() {
+    // Source editor: a biome to navigate into + a per-node setting + a panel target + a pop-out.
+    let (top, b) = top_with_biome("Hills");
+    let mut src = WorldGraphEditor { snarl: top.clone(), nav: vec![b], ..Default::default() };
+    src.caches.views.insert(b, sample_node_view());
+    src.popped.push(super::preview::PoppedPreview {
+        id: 1234,
+        nav: vec![],
+        node: b,
+        half: 555.0,
+        cx: 1.0,
+        cz: 2.0,
+        size: 280.0,
+        is3d: true,
+        cam: (0.3, 0.7),
+        open: true,
+    });
+    let mut src_panel = WorldgenPreviewPanel { target: Some((vec![], b)), is3d: false, ..Default::default() };
+    src_panel.set_view(sample_preview_view());
+
+    let snapshot = gather_view(&src, &src_panel);
+
+    // Destination editor: same graph, blank state → apply the snapshot.
+    let mut dst = WorldGraphEditor { snarl: top, ..Default::default() };
+    let mut dst_panel = WorldgenPreviewPanel::default();
+    apply_view(snapshot, &mut dst, &mut dst_panel);
+
+    // Per-node settings restored.
+    let nv = dst.caches.views.get(&b).copied().expect("node view restored");
+    assert_eq!(nv.zoom_half_m, sample_node_view().zoom_half_m);
+    assert_eq!(nv.surface, sample_node_view().surface);
+    // nav restored (valid biome ⇒ kept).
+    assert_eq!(dst.nav, vec![b]);
+    // Panel target + view restored, and re-shown.
+    assert_eq!(dst_panel.target, Some((vec![], b)));
+    assert!(!dst_panel.is3d);
+    assert_eq!(dst_panel.half, sample_preview_view().half);
+    assert!(dst_panel.pending_open, "a restored panel target re-opens its tab");
+    // Pop-out restored (one window, same target + view).
+    assert_eq!(dst.popped.len(), 1);
+    assert_eq!(dst.popped[0].node, b);
+    assert_eq!(dst.popped[0].half, 555.0);
+    assert!(dst.popped[0].open);
 }
