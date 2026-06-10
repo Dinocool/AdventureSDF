@@ -114,6 +114,19 @@ impl Node {
     }
 }
 
+/// The three parallel output columns the columnar [`Graph::eval_grid`] writes — the output node's
+/// value + its world-XZ gradient, one entry per input point. Bundled so the batched evaluator stays a
+/// readable call (and under the arg-count lint). All three slices must be the same length as the input
+/// coordinate columns.
+pub struct GridOut<'a> {
+    /// Output node value per point.
+    pub v: &'a mut [f64],
+    /// ∂value/∂(world x) per point.
+    pub dx: &'a mut [f64],
+    /// ∂value/∂(world z) per point.
+    pub dz: &'a mut [f64],
+}
+
 /// A field node-graph: topologically-ordered nodes + the index of the output node. Evaluated per world
 /// point to a [`Field`].
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize, bevy::reflect::Reflect)]
@@ -216,6 +229,154 @@ impl Graph {
         let mut scratch = vec![Field::constant(0.0); self.nodes.len()];
         self.eval_into(wx, wz, world_seed, &mut scratch)
     }
+
+    /// COLUMNAR batched evaluator: evaluate the graph ONCE over a whole column of points
+    /// `(xs[p], zs[p])`, writing the OUTPUT node's `(v, dx, dz)` into `out_v/out_dx/out_dz`.
+    ///
+    /// This is the gen hot path: instead of walking all `n` nodes per point (re-matching every
+    /// `NodeKind` and re-touching the per-point scratch for each point), we walk the nodes ONCE,
+    /// matching each `NodeKind` a single time, then run a tight per-point loop that computes that
+    /// node's `Field` for every point. The match + node-walk overhead is amortized over the column.
+    ///
+    /// **Bit-for-bit identical to per-point [`eval_into`]** (the determinism contract): every node's
+    /// per-point arithmetic dispatches to the SAME [`Field`] ops as the scalar [`eval_node`] — the
+    /// `Field` methods are the single source of truth for the math, this just hoists the *dispatch*
+    /// (the `match`) out of the per-point loop. No reassociation, no FMA, no f32 accumulation.
+    ///
+    /// `scratch` is a reusable column buffer of length `nodes.len() * xs.len()` laid out node-major
+    /// (`scratch[node * npts + p]`), so a node reads its inputs' already-computed columns. All output
+    /// slices and `zs` must have the same length as `xs`.
+    pub fn eval_grid(&self, xs: &[f64], zs: &[f64], world_seed: u64, scratch: &mut [Field], out: GridOut<'_>) {
+        let npts = xs.len();
+        debug_assert_eq!(zs.len(), npts);
+        debug_assert_eq!(out.v.len(), npts);
+        debug_assert_eq!(out.dx.len(), npts);
+        debug_assert_eq!(out.dz.len(), npts);
+        debug_assert_eq!(scratch.len(), self.nodes.len() * npts);
+        if npts == 0 {
+            return;
+        }
+
+        for (i, node) in self.nodes.iter().enumerate() {
+            // Input column base offsets (sources ignore them per arity, but indexing is harmless since
+            // all inputs are strictly-earlier valid node indices once `validate` passed).
+            let ia = node.inputs[0] as usize * npts;
+            let ib = node.inputs[1] as usize * npts;
+            let ic = node.inputs[2] as usize * npts;
+            let base = i * npts;
+
+            // Match the kind ONCE, then a tight per-point loop. Each arm calls the SAME `Field` op (or
+            // the same source/closed-form) the scalar `eval_node` calls — that's the SSOT for the math.
+            // Sources read xs/zs/seed; the rest read their input columns.
+            match node.kind {
+                NodeKind::WorldX => {
+                    for p in 0..npts {
+                        scratch[base + p] = Field::world_x(xs[p]);
+                    }
+                }
+                NodeKind::WorldZ => {
+                    for p in 0..npts {
+                        scratch[base + p] = Field::world_z(zs[p]);
+                    }
+                }
+                NodeKind::Const(v) => {
+                    let f = Field::constant(v);
+                    for p in 0..npts {
+                        scratch[base + p] = f;
+                    }
+                }
+                NodeKind::Fbm(axis) => {
+                    let params = axis.params(world_seed);
+                    for p in 0..npts {
+                        let (h, gx, gz) = fbm_height_grad(xs[p], zs[p], &params);
+                        scratch[base + p] = Field::new(h, gx, gz);
+                    }
+                }
+                NodeKind::Curve(spline) => {
+                    for p in 0..npts {
+                        let a = scratch[ia + p];
+                        let (y, dy) = spline.eval(a.v);
+                        scratch[base + p] = Field::new(y, dy * a.dx, dy * a.dz);
+                    }
+                }
+                NodeKind::Ridge { ridge, amp_sum } => {
+                    for p in 0..npts {
+                        let a = scratch[ia + p];
+                        let ridged = Field::constant(amp_sum).sub(a.abs().scale(2.0));
+                        scratch[base + p] = a.add(ridged.sub(a).scale(ridge));
+                    }
+                }
+                NodeKind::Clamp { lo, hi } => {
+                    for p in 0..npts {
+                        scratch[base + p] = scratch[ia + p].clamp(lo, hi);
+                    }
+                }
+                NodeKind::Smoothstep { edge0, edge1 } => {
+                    for p in 0..npts {
+                        scratch[base + p] = scratch[ia + p].smoothstep(edge0, edge1);
+                    }
+                }
+                NodeKind::Scale(k) => {
+                    for p in 0..npts {
+                        scratch[base + p] = scratch[ia + p].scale(k);
+                    }
+                }
+                NodeKind::Offset(k) => {
+                    for p in 0..npts {
+                        scratch[base + p] = scratch[ia + p].offset(k);
+                    }
+                }
+                NodeKind::Abs => {
+                    for p in 0..npts {
+                        scratch[base + p] = scratch[ia + p].abs();
+                    }
+                }
+                NodeKind::Neg => {
+                    for p in 0..npts {
+                        scratch[base + p] = scratch[ia + p].neg();
+                    }
+                }
+                NodeKind::Add => {
+                    for p in 0..npts {
+                        scratch[base + p] = scratch[ia + p].add(scratch[ib + p]);
+                    }
+                }
+                NodeKind::Sub => {
+                    for p in 0..npts {
+                        scratch[base + p] = scratch[ia + p].sub(scratch[ib + p]);
+                    }
+                }
+                NodeKind::Mul => {
+                    for p in 0..npts {
+                        scratch[base + p] = scratch[ia + p].mul(scratch[ib + p]);
+                    }
+                }
+                NodeKind::Min => {
+                    for p in 0..npts {
+                        scratch[base + p] = scratch[ia + p].min(scratch[ib + p]);
+                    }
+                }
+                NodeKind::Max => {
+                    for p in 0..npts {
+                        scratch[base + p] = scratch[ia + p].max(scratch[ib + p]);
+                    }
+                }
+                NodeKind::Mix => {
+                    for p in 0..npts {
+                        scratch[base + p] = scratch[ia + p].mix(scratch[ib + p], scratch[ic + p]);
+                    }
+                }
+            }
+        }
+
+        let out_base = self.output as usize * npts;
+        for p in 0..npts {
+            let f = scratch[out_base + p];
+            out.v[p] = f.v;
+            out.dx[p] = f.dx;
+            out.dz[p] = f.dz;
+        }
+    }
 }
 
 /// Evaluate a single node from its (already-computed) input fields.
@@ -317,6 +478,80 @@ mod tests {
         let c = g.eval_into(12.5, -7.25, 9, &mut scratch);
         assert_eq!(a.v.to_bits(), c.v.to_bits());
         assert_eq!(a.dx.to_bits(), c.dx.to_bits());
+    }
+
+    /// SSOT GUARD for the columnar path: [`Graph::eval_grid`] must produce `to_bits()`-IDENTICAL
+    /// `(v, dx, dz)` to the per-point [`Graph::eval`]/[`Graph::eval_into`] for a representative
+    /// multi-node graph (the shipped mountains+plains biome graph — Fbm/Curve/Smoothstep/Ridge/
+    /// Offset/Mix, the full op set) over a set of points. This is the bit-for-bit determinism contract
+    /// for the batched evaluator; any drift between the scalar dispatch and the columnar dispatch fails.
+    #[test]
+    fn eval_grid_is_bit_identical_to_per_point_eval() {
+        use super::super::preset::mountains_plains_graph;
+        let g = mountains_plains_graph(700.0);
+        g.validate().expect("valid graph");
+        let seed = 1234u64;
+
+        // A column of varied points (incl. negatives, sub-metre fractions, large coords).
+        let pts: &[(f64, f64)] = &[
+            (0.0, 0.0),
+            (10.0, -20.0),
+            (123.5, 456.25),
+            (-300.0, 50.75),
+            (1000.0, -700.0),
+            (-2500.5, 3000.0),
+            (4096.0, 4096.0),
+            (-1.25, 0.5),
+        ];
+        let xs: Vec<f64> = pts.iter().map(|&(x, _)| x).collect();
+        let zs: Vec<f64> = pts.iter().map(|&(_, z)| z).collect();
+        let npts = pts.len();
+
+        let n = g.nodes.len();
+        let mut scratch = vec![Field::constant(0.0); n * npts];
+        let mut v = vec![0.0f64; npts];
+        let mut dx = vec![0.0f64; npts];
+        let mut dz = vec![0.0f64; npts];
+        g.eval_grid(&xs, &zs, seed, &mut scratch, GridOut { v: &mut v, dx: &mut dx, dz: &mut dz });
+
+        for (p, &(wx, wz)) in pts.iter().enumerate() {
+            let f = g.eval(wx, wz, seed);
+            assert_eq!(v[p].to_bits(), f.v.to_bits(), "v mismatch at ({wx},{wz})");
+            assert_eq!(dx[p].to_bits(), f.dx.to_bits(), "dx mismatch at ({wx},{wz})");
+            assert_eq!(dz[p].to_bits(), f.dz.to_bits(), "dz mismatch at ({wx},{wz})");
+        }
+    }
+
+    /// Also guard the smaller realistic graph from `ridge_curve_mix_graph_grad` (different topology /
+    /// output index) so a node-walk/output-indexing bug in the columnar path can't hide.
+    #[test]
+    fn eval_grid_bit_identical_mini_graph() {
+        let carrier = fbm(1, 1.0 / 512.0, 120.0);
+        let climate = fbm(2, 1.0 / 4096.0, 1.0);
+        let nodes = vec![
+            Node::source(carrier),
+            Node::unary(NodeKind::Ridge { ridge: 0.7, amp_sum: 200.0 }, 0),
+            Node::source(climate),
+            Node::unary(NodeKind::Curve(Spline::new(&[(-1.0, 0.0), (0.0, 0.3), (1.0, 1.0)])), 2),
+            Node::unary(NodeKind::Smoothstep { edge0: 0.2, edge1: 0.8 }, 3),
+            Node::source(NodeKind::Const(5.0)),
+            Node::ternary(NodeKind::Mix, 5, 1, 4),
+        ];
+        let g = Graph { nodes, output: 6 };
+        g.validate().expect("valid graph");
+        let seed = 42u64;
+        let xs: Vec<f64> = PTS.iter().map(|&(x, _)| x).collect();
+        let zs: Vec<f64> = PTS.iter().map(|&(_, z)| z).collect();
+        let npts = PTS.len();
+        let mut scratch = vec![Field::constant(0.0); g.nodes.len() * npts];
+        let (mut v, mut dx, mut dz) = (vec![0.0; npts], vec![0.0; npts], vec![0.0; npts]);
+        g.eval_grid(&xs, &zs, seed, &mut scratch, GridOut { v: &mut v, dx: &mut dx, dz: &mut dz });
+        for (p, &(wx, wz)) in PTS.iter().enumerate() {
+            let f = g.eval(wx, wz, seed);
+            assert_eq!(v[p].to_bits(), f.v.to_bits());
+            assert_eq!(dx[p].to_bits(), f.dx.to_bits());
+            assert_eq!(dz[p].to_bits(), f.dz.to_bits());
+        }
     }
 
     #[test]

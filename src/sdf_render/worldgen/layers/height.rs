@@ -12,6 +12,7 @@ use std::sync::Arc;
 use super::super::artifact::{ArtifactKind, HeightNode, ScalarField2D};
 use super::super::coord::{Authority, ChunkSize, Dim, LayerId};
 use super::super::graph::preset::MAX_GRAPH_NODES;
+use super::super::graph::node::GridOut;
 use super::super::graph::{Field, Graph};
 use super::super::layer::{ArtifactDecl, GenCtx, GenOutput, Layer};
 use super::super::noise::{FbmParams, fbm_height_grad, fbm_height_grad_hess};
@@ -257,6 +258,35 @@ impl HeightLayer {
         let (h, gx, gz) = self.carved_grad(wx, wz, &fbm, world_seed);
         HeightNode { height: h as f32, dh_dx: gx as f32, dh_dz: gz as f32 }
     }
+
+    /// Batch-evaluate the surface over the world coordinate columns `xs`/`zs` into `out` (parallel
+    /// slices, all the same length). When a biome graph is attached this uses the COLUMNAR
+    /// [`Graph::eval_grid`] (the gen hot path — match the node kinds once, loop per point), which is
+    /// **bit-for-bit identical** to calling [`sample_world`](Self::sample_world) per point (the graph
+    /// branch of `sample_world` is exactly `Field` → f32). Without a graph it falls back to the
+    /// per-point `sample_world` (the legacy fBm/erosion path stays scalar — it's not the production
+    /// path and the per-point closed-form already amortizes well).
+    fn sample_world_grid(&self, xs: &[f64], zs: &[f64], world_seed: u64, out: &mut [HeightNode]) {
+        debug_assert_eq!(xs.len(), zs.len());
+        debug_assert_eq!(xs.len(), out.len());
+        if let Some(g) = &self.graph {
+            let n = g.nodes.len();
+            let npts = xs.len();
+            // Node-major column scratch (reused for the whole grid; one alloc per chunk).
+            let mut scratch = vec![Field::constant(0.0); n * npts];
+            let mut v = vec![0.0f64; npts];
+            let mut dx = vec![0.0f64; npts];
+            let mut dz = vec![0.0f64; npts];
+            g.eval_grid(xs, zs, world_seed, &mut scratch, GridOut { v: &mut v, dx: &mut dx, dz: &mut dz });
+            for p in 0..npts {
+                out[p] = HeightNode { height: v[p] as f32, dh_dx: dx[p] as f32, dh_dz: dz[p] as f32 };
+            }
+            return;
+        }
+        for p in 0..xs.len() {
+            out[p] = self.sample_world(xs[p], zs[p], world_seed);
+        }
+    }
 }
 
 impl Layer for HeightLayer {
@@ -303,10 +333,24 @@ impl Layer for HeightLayer {
         let kf = if radius > 0.0 { radius.round() as i32 } else { 0 };
         let world_w = kf as f64 * tap;
         if kf < 1 || field.node_spacing >= 2.0 * world_w {
+            // Build the (res+1)² node coordinate columns, batch-evaluate the surface once, write back.
+            let side = (res + 1) as usize;
+            let count = side * side;
+            let mut xs = vec![0.0f64; count];
+            let mut zs = vec![0.0f64; count];
             for j in 0..=res {
                 for i in 0..=res {
                     let wp = field.node_world_xz(i, j);
-                    field.set(i, j, self.sample_world(wp.x, wp.y, ctx.seed));
+                    let idx = j as usize * side + i as usize;
+                    xs[idx] = wp.x;
+                    zs[idx] = wp.y;
+                }
+            }
+            let mut nodes = vec![HeightNode::default(); count];
+            self.sample_world_grid(&xs, &zs, ctx.seed, &mut nodes);
+            for j in 0..=res {
+                for i in 0..=res {
+                    field.set(i, j, nodes[j as usize * side + i as usize]);
                 }
             }
             out.produce(Self::OUTPUT, field);
@@ -351,15 +395,24 @@ impl HeightLayer {
         let ox = n00.x - ap as f64 * tap;
         let oz = n00.y - ap as f64 * tap;
 
-        // Sample the composed surface on the fixed 2 m world grid — packed `[h, gx, gz]`.
+        // Sample the composed surface on the fixed 2 m world grid — packed `[h, gx, gz]`. Build the
+        // fine-grid coordinate columns once and batch-evaluate the surface (columnar graph eval).
         let count = npa * npa;
-        let mut grid = vec![[0.0f64; 3]; count];
+        let mut xs = vec![0.0f64; count];
+        let mut zs = vec![0.0f64; count];
         for fz in 0..npa {
             let wz = oz + fz as f64 * tap;
             for fx in 0..npa {
-                let n = self.sample_world(ox + fx as f64 * tap, wz, ctx.seed);
-                grid[fz * npa + fx] = [n.height as f64, n.dh_dx as f64, n.dh_dz as f64];
+                let idx = fz * npa + fx;
+                xs[idx] = ox + fx as f64 * tap;
+                zs[idx] = wz;
             }
+        }
+        let mut nodes = vec![HeightNode::default(); count];
+        self.sample_world_grid(&xs, &zs, ctx.seed, &mut nodes);
+        let mut grid = vec![[0.0f64; 3]; count];
+        for (g, n) in grid.iter_mut().zip(nodes.iter()) {
+            *g = [n.height as f64, n.dh_dx as f64, n.dh_dz as f64];
         }
 
         // Separable pass 1 — convolve along X into a temporary (edges clamp but are never read by node
