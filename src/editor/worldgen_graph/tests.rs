@@ -1,5 +1,12 @@
-use super::convert::world_biome_snarl;
+use super::arrange::auto_arrange;
+use super::compile::output_root;
+use super::convert::{
+    breadcrumb_names, load_editor_snarl, new_biome_subgraph, resolve_snarl, valid_depth, world_biome_snarl,
+    worldgraph_path,
+};
+use super::preview::{PANEL_GPU_KEY, gpu_inline_key};
 use super::*;
+use egui::pos2;
 use egui_snarl::{InPinId, OutPinId};
 
 use crate::assets::Asset as _;
@@ -192,4 +199,250 @@ fn shipped_world_graph_matches_snarl() {
             "shipped world.graph.ron is stale — re-run write_world_biome_assets"
         );
     }
+}
+
+// -- worldgraph_path -----------------------------------------------------------------------------
+
+#[test]
+fn worldgraph_path_strips_known_suffixes() {
+    // `.graph.ron` stripped (the common case).
+    assert_eq!(worldgraph_path("a/b/world.graph.ron"), "a/b/world.worldgraph.ron");
+    // Plain `.ron` stripped.
+    assert_eq!(worldgraph_path("a/b/world.ron"), "a/b/world.worldgraph.ron");
+    // Neither suffix → appended whole.
+    assert_eq!(worldgraph_path("a/b/world"), "a/b/world.worldgraph.ron");
+    // `.graph.ron` takes precedence over the bare `.ron` (no double-strip).
+    assert_eq!(worldgraph_path("x.graph.ron"), "x.worldgraph.ron");
+}
+
+// -- load_editor_snarl fallback chain ------------------------------------------------------------
+
+/// A unique temp path under the test temp dir (TMP/TEMP), removed on drop, for the file-based tests.
+struct TmpFile(std::path::PathBuf);
+impl TmpFile {
+    fn new(tag: &str) -> Self {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        let pid = std::process::id();
+        let n = N.fetch_add(1, Ordering::Relaxed);
+        Self(std::env::temp_dir().join(format!("wg_test_{tag}_{pid}_{n}")))
+    }
+    fn path(&self) -> &std::path::Path {
+        &self.0
+    }
+    fn str(&self) -> String {
+        self.0.to_string_lossy().into_owned()
+    }
+    fn write(&self, contents: &str) {
+        std::fs::write(&self.0, contents).expect("write temp file");
+    }
+    fn wg(&self) -> std::path::PathBuf {
+        std::path::PathBuf::from(worldgraph_path(&self.str()))
+    }
+}
+impl Drop for TmpFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+        let _ = std::fs::remove_file(self.wg());
+    }
+}
+
+#[test]
+fn load_editor_snarl_prefers_hierarchical() {
+    // A valid hierarchical `.worldgraph.ron` (with a biome) is loaded in preference to the flat graph.
+    let f = TmpFile::new("hier");
+    let mut top = Snarl::new();
+    let b = top.insert_node(p(), EdNode::Biome { name: "Hills".into(), graph: Box::new(new_biome_subgraph()) });
+    let o = top.insert_node(p(), EdNode::Output);
+    top.connect(out(b), inn(o, 0));
+    let s = ron::ser::to_string(&top).unwrap();
+    std::fs::write(f.wg(), s).expect("write hierarchical");
+    let loaded = load_editor_snarl(&f.str());
+    assert!(loaded.node_ids().any(|(_, n)| matches!(n, EdNode::Biome { .. })), "kept the biome hierarchy");
+}
+
+#[test]
+fn load_editor_snarl_falls_back_to_flat() {
+    // No `.worldgraph.ron`, but a valid flat `.graph.ron` → loaded (and re-snarled, so no biomes).
+    let f = TmpFile::new("flat");
+    let g = mountains_plains_graph(700.0);
+    (GraphAsset { graph: g }).save(f.path()).expect("save flat");
+    let loaded = load_editor_snarl(&f.str());
+    // Round-trips to a compilable graph and has no biomes (flat).
+    assert!(snarl_to_graph(&loaded).is_ok());
+    assert!(!loaded.node_ids().any(|(_, n)| matches!(n, EdNode::Biome { .. })));
+}
+
+#[test]
+fn load_editor_snarl_corrupt_falls_through_to_default() {
+    // Both files present but CORRUPT → falls through to the built-in default world (which has biomes).
+    let f = TmpFile::new("corrupt");
+    std::fs::write(f.wg(), "this is not valid ron {{{").expect("write corrupt hier");
+    f.write("also not ron )))");
+    let loaded = load_editor_snarl(&f.str());
+    let default = world_biome_snarl();
+    // Same structure as the default: identical node count + both biomes present.
+    assert_eq!(loaded.node_ids().count(), default.node_ids().count());
+    assert_eq!(loaded.node_ids().filter(|(_, n)| matches!(n, EdNode::Biome { .. })).count(), 2);
+}
+
+#[test]
+fn load_editor_snarl_missing_uses_default() {
+    // Neither file exists → the built-in default world.
+    let f = TmpFile::new("missing");
+    let loaded = load_editor_snarl(&f.str());
+    assert_eq!(loaded.node_ids().count(), world_biome_snarl().node_ids().count());
+}
+
+// -- nav helpers (valid_depth / resolve_snarl / breadcrumb_names) --------------------------------
+
+/// A top snarl with one biome named `name`; returns (snarl, biome id).
+fn top_with_biome(name: &str) -> (Snarl<EdNode>, NodeId) {
+    let mut top = Snarl::new();
+    let b = top.insert_node(p(), EdNode::Biome { name: name.into(), graph: Box::new(new_biome_subgraph()) });
+    let o = top.insert_node(p(), EdNode::Output);
+    top.connect(out(b), inn(o, 0));
+    (top, b)
+}
+
+#[test]
+fn valid_depth_truncates_stale_and_non_biome_paths() {
+    let (mut top, b) = top_with_biome("B");
+    // Empty path is always fully valid.
+    assert_eq!(valid_depth(&top, &[]), 0);
+    // A path through the real biome is valid to depth 1.
+    assert_eq!(valid_depth(&top, &[b]), 1);
+    // A stale id (never in the snarl) resolves to depth 0.
+    let stale = top.insert_node(pos2(0.0, 0.0), EdNode::Op(NodeKind::Const(0.0)));
+    assert_eq!(valid_depth(&top, &[stale]), 0, "a non-biome node isn't a navigable level");
+    // A valid biome followed by a stale tail truncates after the biome.
+    assert_eq!(valid_depth(&top, &[b, stale]), 1);
+}
+
+#[test]
+fn resolve_snarl_none_on_stale_or_non_biome() {
+    let (mut top, b) = top_with_biome("B");
+    assert!(resolve_snarl(&top, &[]).is_some(), "empty nav resolves to the root");
+    assert!(resolve_snarl(&top, &[b]).is_some(), "into the biome resolves");
+    let other = top.insert_node(pos2(0.0, 0.0), EdNode::Op(NodeKind::Const(0.0)));
+    assert!(resolve_snarl(&top, &[other]).is_none(), "non-biome node → None");
+    assert!(resolve_snarl(&top, &[b, other]).is_none(), "stale tail → None");
+}
+
+#[test]
+fn breadcrumb_names_reflects_rename() {
+    let (mut top, b) = top_with_biome("Old");
+    assert_eq!(breadcrumb_names(&top, &[b]), vec!["Old".to_string()]);
+    // Rename the biome → the breadcrumb tracks it.
+    if let EdNode::Biome { name, .. } = &mut top[b] {
+        *name = "New".into();
+    }
+    assert_eq!(breadcrumb_names(&top, &[b]), vec!["New".to_string()]);
+    // A non-biome / stale step stops the breadcrumb.
+    assert!(breadcrumb_names(&top, &[]).is_empty());
+}
+
+// -- auto_arrange --------------------------------------------------------------------------------
+
+/// A small chain `Const → Scale → Output` plus a stray `WorldX`, to exercise depth columns.
+fn chain_snarl() -> Snarl<EdNode> {
+    let mut s = Snarl::new();
+    let c = s.insert_node(pos2(0.0, 0.0), EdNode::Op(NodeKind::Const(1.0)));
+    let sc = s.insert_node(pos2(0.0, 0.0), EdNode::Op(NodeKind::Scale(2.0)));
+    s.connect(out(c), inn(sc, 0));
+    let o = s.insert_node(pos2(0.0, 0.0), EdNode::Output);
+    s.connect(out(sc), inn(o, 0));
+    s.insert_node(pos2(0.0, 0.0), EdNode::Op(NodeKind::WorldX)); // a leaf at depth 0
+    s
+}
+
+fn positions(s: &Snarl<EdNode>) -> Vec<(NodeId, egui::Pos2)> {
+    let mut v: Vec<_> = s.node_ids().map(|(id, _)| (id, s.get_node_info(id).unwrap().pos)).collect();
+    v.sort_by_key(|(id, _)| *id);
+    v
+}
+
+#[test]
+fn auto_arrange_is_deterministic() {
+    let body = std::collections::HashMap::new();
+    let mut a = chain_snarl();
+    let mut b = chain_snarl();
+    auto_arrange(&mut a, &body);
+    auto_arrange(&mut b, &body);
+    assert_eq!(positions(&a), positions(&b), "same wiring + sizes ⇒ identical layout");
+    // Idempotent: a second arrange doesn't move anything.
+    let once = positions(&a);
+    auto_arrange(&mut a, &body);
+    assert_eq!(once, positions(&a));
+}
+
+#[test]
+fn auto_arrange_columns_increase_with_depth() {
+    let body = std::collections::HashMap::new();
+    let mut s = chain_snarl();
+    // Capture ids in chain order.
+    let ids: Vec<NodeId> = s.node_ids().map(|(id, _)| id).collect();
+    auto_arrange(&mut s, &body);
+    let x = |id: NodeId| s.get_node_info(id).unwrap().pos.x;
+    // ids[0]=Const(d0), ids[1]=Scale(d1), ids[2]=Output(d2), ids[3]=WorldX(d0).
+    assert!(x(ids[0]) < x(ids[1]), "Scale is a column right of Const");
+    assert!(x(ids[1]) < x(ids[2]), "Output is a column right of Scale");
+    assert_eq!(x(ids[0]), x(ids[3]), "two depth-0 leaves share a column x");
+}
+
+#[test]
+fn auto_arrange_tolerates_a_cycle() {
+    // A 2-node cycle (A→B→A) must not hang the depth recursion (the cycle guard returns 0).
+    let body = std::collections::HashMap::new();
+    let mut s = Snarl::new();
+    let a = s.insert_node(pos2(0.0, 0.0), EdNode::Op(NodeKind::Abs));
+    let b = s.insert_node(pos2(0.0, 0.0), EdNode::Op(NodeKind::Neg));
+    s.connect(out(a), inn(b, 0));
+    s.connect(out(b), inn(a, 0));
+    auto_arrange(&mut s, &body); // must return (no infinite loop)
+    assert_eq!(s.node_ids().count(), 2);
+}
+
+// -- gpu_inline_key ------------------------------------------------------------------------------
+
+#[test]
+fn gpu_inline_key_is_stable_and_non_colliding() {
+    let mut s = Snarl::new();
+    let n = s.insert_node(pos2(0.0, 0.0), EdNode::Op(NodeKind::Const(0.0)));
+    // Stable for the same (salt, node).
+    assert_eq!(gpu_inline_key(42, n), gpu_inline_key(42, n));
+    // The top bit is set on every inline key.
+    let k = gpu_inline_key(42, n);
+    assert!(k & (1u64 << 63) != 0, "inline keys have the high bit set");
+    // …so they can never collide with the small pop-out ids (start at 1000) or the PANEL key (7).
+    assert!(k > 1000);
+    assert_ne!(k, PANEL_GPU_KEY);
+    assert_ne!(k & (1u64 << 63), 0);
+    // Different salt (nav level) ⇒ (almost surely) different key — and certainly not equal here.
+    assert_ne!(gpu_inline_key(42, n), gpu_inline_key(43, n));
+}
+
+// -- output_root errors --------------------------------------------------------------------------
+
+#[test]
+fn output_root_distinguishes_duplicate_and_unwired() {
+    // Duplicate Output → a specific "more than one Output" error.
+    let mut dup = Snarl::new();
+    dup.insert_node(p(), EdNode::Output);
+    dup.insert_node(p(), EdNode::Output);
+    let e = output_root(&dup).expect_err("duplicate Output is an error");
+    assert!(e.contains("more than one Output"), "got: {e}");
+
+    // Single Output but nothing wired into it → a distinct "no input wired" error.
+    let mut unwired = Snarl::new();
+    unwired.insert_node(p(), EdNode::Output);
+    let e = output_root(&unwired).expect_err("unwired Output is an error");
+    assert!(e.contains("no input wired"), "got: {e}");
+    assert!(!e.contains("more than one"), "distinct from the duplicate error");
+
+    // No Output at all → yet another distinct error.
+    let mut none = Snarl::new();
+    none.insert_node(p(), EdNode::Op(NodeKind::Const(0.0)));
+    let e = output_root(&none).expect_err("missing Output is an error");
+    assert!(e.contains("no Output node"), "got: {e}");
 }
