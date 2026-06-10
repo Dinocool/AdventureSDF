@@ -1,4 +1,7 @@
 use super::*;
+use egui_snarl::{InPinId, OutPinId};
+
+use crate::sdf_render::worldgen::graph::node::FbmAxis;
 use crate::sdf_render::worldgen::graph::preset::{default_terrain_graph, mountains_plains_graph};
 
 /// engine Graph → Snarl → engine Graph must round-trip to an EVALUATION-equivalent graph. (Not
