@@ -199,11 +199,11 @@ impl Default for MeshBakeConfig {
             debug_lod_colour: false,
             debug_normals: false,
             freeze_lod: false,
-            // 128×128 per-chunk detail map: now affordable because the slope source is the RAW
-            // `sample_world` analytic gradient (ONE eval/texel, no 2 m separable-tent convolution) instead of
-            // the band-limited grad — so the dense map costs ~the old res-32 band-limited bake while carrying
-            // far finer relief. Tune via the editor slider when iterating on the look.
-            detail_normal_res: 128,
+            // 256×256 per-chunk detail map: the slope source is the RAW `sample_world` analytic gradient
+            // (ONE eval/texel, no 2 m convolution). At 256 a far LOD-8 chunk (~2.9 km footprint) resolves
+            // ~11 m/texel; cost is N² (~4× the map portion of the bake vs 128, 256 KB Rg16Float per chunk).
+            // Tune via the editor slider (down for cheaper, up to 512 for finer) when iterating on the look.
+            detail_normal_res: 256,
             detail_normal_strength: 1.0,
         }
     }

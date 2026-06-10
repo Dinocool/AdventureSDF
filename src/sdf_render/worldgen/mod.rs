@@ -26,6 +26,7 @@ pub mod upload;
 use std::sync::Arc;
 
 use bevy::math::DVec2;
+use bevy::light::CascadeShadowConfigBuilder;
 use bevy::prelude::*;
 
 use crate::node::Node3D;
@@ -273,7 +274,16 @@ fn spawn_terrain_volume(
     // supplies a `DirectionalLight`. ~10000 lux matches the renderer's exposure (SDF_EXPOSURE_EV100).
     commands.spawn((
         Name::new("Worldgen Sun"),
-        DirectionalLight { illuminance: 10000.0, shadows_enabled: false, ..default() },
+        DirectionalLight { illuminance: 10000.0, shadows_enabled: true, ..default() },
+        // Terrain spans km, so the default (small-scene) cascade range would shadow only a tiny bubble.
+        // Four cascades out to 2 km cover the near+mid terrain the camera actually reads; the baked terrain
+        // meshes render through Bevy PBR so directional shadows + cascades work natively.
+        CascadeShadowConfigBuilder {
+            num_cascades: 4,
+            maximum_distance: 2000.0,
+            ..default()
+        }
+        .build(),
         Transform::from_rotation(Quat::from_euler(EulerRot::XYZ, -0.9, 0.6, 0.0)),
         Node3D,
         SceneEntity,
