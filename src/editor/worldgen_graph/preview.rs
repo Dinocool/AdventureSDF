@@ -46,6 +46,48 @@ impl Default for WorldgenPreviewPanel {
     }
 }
 
+impl WorldgenPreviewPanel {
+    /// The panel's view params (half/pan/cam) as a [`PreviewView`].
+    fn view(&self) -> PreviewView {
+        PreviewView { half: self.half, cx: self.pan.0, cz: self.pan.1, yaw: self.cam.0, pitch: self.cam.1 }
+    }
+    /// Write a [`PreviewView`] back into the panel's half/pan/cam fields.
+    fn set_view(&mut self, v: PreviewView) {
+        self.half = v.half;
+        self.pan = (v.cx, v.cz);
+        self.cam = (v.yaw, v.pitch);
+    }
+}
+
+/// A preview's view parameters: the sampled world window (half-extent + XZ centre) and the 3D orbit
+/// camera (yaw/pitch). The single carrier for on-image gestures ([`handle_preview_gestures`]) and for
+/// building a [`GpuPreviewRequest`] ([`PreviewView::to_request`]).
+#[derive(Clone, Copy)]
+pub(super) struct PreviewView {
+    pub(super) half: f64,
+    pub(super) cx: f64,
+    pub(super) cz: f64,
+    pub(super) yaw: f32,
+    pub(super) pitch: f32,
+}
+
+impl PreviewView {
+    /// Build a GPU preview request for this view (the pool renders it next frame into key `key`).
+    pub(super) fn to_request(self, key: u64, graph: Graph, is3d: bool, res: u32) -> GpuPreviewRequest {
+        GpuPreviewRequest {
+            key,
+            graph,
+            half: self.half,
+            center: (self.cx, self.cz),
+            is3d,
+            yaw: self.yaw,
+            pitch: self.pitch,
+            res_w: res,
+            res_h: res,
+        }
+    }
+}
+
 /// A node preview detached into its own floating window — carries its own nav path, view state, and
 /// texture so it stays live across navigation independently of the in-graph preview.
 pub(super) struct PoppedPreview {
@@ -61,6 +103,20 @@ pub(super) struct PoppedPreview {
     pub(super) is3d: bool,
     pub(super) cam: (f32, f32),
     pub(super) open: bool,
+}
+
+impl PoppedPreview {
+    /// This window's view params (half/cx/cz/cam) as a [`PreviewView`].
+    fn view(&self) -> PreviewView {
+        PreviewView { half: self.half, cx: self.cx, cz: self.cz, yaw: self.cam.0, pitch: self.cam.1 }
+    }
+    /// Write a [`PreviewView`] back into this window's half/cx/cz/cam fields.
+    fn set_view(&mut self, v: PreviewView) {
+        self.half = v.half;
+        self.cx = v.cx;
+        self.cz = v.cz;
+        self.cam = (v.yaw, v.pitch);
+    }
 }
 
 /// Stable GPU pool key for an inline preview = nav-level salt ⊕ node id, with the top bit set so it can
@@ -108,35 +164,23 @@ pub(super) fn apply_scroll_zoom(ui: &egui::Ui, scroll: f32, half: &mut f64) {
 
 /// On-image drag gestures: left-drag = orbit (3D) / pan (2D), right-drag = pan (3D). `size` is the
 /// on-screen image side (px). (Scroll-zoom is handled separately — see [`scroll_zoom_consume`].)
-#[allow(clippy::too_many_arguments)]
-pub(super) fn handle_preview_gestures(
-    ui: &egui::Ui,
-    resp: &egui::Response,
-    is3d: bool,
-    size: f32,
-    half: &mut f64,
-    cx: &mut f64,
-    cz: &mut f64,
-    yaw: &mut f32,
-    pitch: &mut f32,
-) {
-    let _ = ui;
-    let wpp = (2.0 * *half) / size.max(1.0) as f64; // world units per display pixel
+pub(super) fn handle_preview_gestures(resp: &egui::Response, is3d: bool, size: f32, view: &mut PreviewView) {
+    let wpp = (2.0 * view.half) / size.max(1.0) as f64; // world units per display pixel
     if is3d {
         if resp.dragged_by(egui::PointerButton::Primary) {
             let d = resp.drag_delta();
-            *yaw += d.x * 0.01;
-            *pitch = (*pitch - d.y * 0.01).clamp(0.05, 1.5);
+            view.yaw += d.x * 0.01;
+            view.pitch = (view.pitch - d.y * 0.01).clamp(0.05, 1.5);
         }
         if resp.dragged_by(egui::PointerButton::Secondary) {
             let d = resp.drag_delta();
-            *cx -= d.x as f64 * wpp;
-            *cz -= d.y as f64 * wpp;
+            view.cx -= d.x as f64 * wpp;
+            view.cz -= d.y as f64 * wpp;
         }
     } else if resp.dragged_by(egui::PointerButton::Primary) {
         let d = resp.drag_delta();
-        *cx -= d.x as f64 * wpp;
-        *cz -= d.y as f64 * wpp;
+        view.cx -= d.x as f64 * wpp;
+        view.cz -= d.y as f64 * wpp;
     }
 }
 
@@ -196,23 +240,15 @@ pub(super) fn preview_panel(world: &mut World, ui: &mut egui::Ui) {
         let avail = ui.available_size();
         let side = avail.x.min(avail.y).max(64.0);
         let res = ((side * ppp).round() as usize).max(32);
-        world.resource_mut::<GpuPreviewRequests>().0.push(GpuPreviewRequest {
-            key: PANEL_GPU_KEY,
-            graph: g,
-            half: panel.half,
-            center: panel.pan,
-            is3d: panel.is3d,
-            yaw: panel.cam.0,
-            pitch: panel.cam.1,
-            res_w: res as u32,
-            res_h: res as u32,
-        });
+        let view = panel.view();
+        world.resource_mut::<GpuPreviewRequests>().0.push(view.to_request(PANEL_GPU_KEY, g, panel.is3d, res as u32));
         let tex = world.resource::<GpuPreviewTextures>().0.get(&PANEL_GPU_KEY).copied();
         ui.vertical_centered(|ui| {
             let resp = preview_image(ui, tex, egui::vec2(side, side));
             scroll_zoom_consume(ui, &resp, &mut panel.half);
-            let WorldgenPreviewPanel { half, pan, cam, is3d, .. } = &mut *panel;
-            handle_preview_gestures(ui, &resp, *is3d, side, half, &mut pan.0, &mut pan.1, &mut cam.0, &mut cam.1);
+            let mut view = panel.view();
+            handle_preview_gestures(&resp, panel.is3d, side, &mut view);
+            panel.set_view(view);
         });
     });
 }
@@ -286,22 +322,14 @@ pub(super) fn popped_preview_window(
             let side = avail.x.min(avail.y).max(64.0);
             let res = ((side * ppp).round() as usize).max(32);
             // GPU path (2D + 3D): request a render for next frame; draw last frame's pool texture.
-            gpu_reqs.push(GpuPreviewRequest {
-                key: p.id,
-                graph: g,
-                half: p.half,
-                center: (p.cx, p.cz),
-                is3d: p.is3d,
-                yaw: p.cam.0,
-                pitch: p.cam.1,
-                res_w: res as u32,
-                res_h: res as u32,
-            });
+            gpu_reqs.push(p.view().to_request(p.id, g, p.is3d, res as u32));
             let tex = gpu_tex.get(&p.id).copied();
             ui.vertical_centered(|ui| {
                 let resp = preview_image(ui, tex, egui::vec2(side, side));
                 scroll_zoom_consume(ui, &resp, &mut p.half);
-                handle_preview_gestures(ui, &resp, p.is3d, side, &mut p.half, &mut p.cx, &mut p.cz, &mut p.cam.0, &mut p.cam.1);
+                let mut view = p.view();
+                handle_preview_gestures(&resp, p.is3d, side, &mut view);
+                p.set_view(view);
             });
         });
     p.open = open;
