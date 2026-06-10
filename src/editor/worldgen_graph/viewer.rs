@@ -69,15 +69,24 @@ impl SnarlViewer<EdNode> for Viewer<'_> {
     /// shows/hides the inline preview. Keeping the toggle here means a preview-OFF node collapses to JUST
     /// its params — no body divider, no empty space (unlike an in-body collapse button).
     fn show_header(&mut self, node: NodeId, _inputs: &[InPin], _outputs: &[OutPin], ui: &mut egui::Ui, snarl: &mut Snarl<EdNode>) {
+        let title = self.title(&snarl[node]);
+        let has_preview = matches!(snarl.get_node(node), Some(EdNode::Op(_) | EdNode::Biome { .. }));
+        // Span the body width (measured last frame) so the eye sits at the RIGHT edge, past the title.
+        let want_w = self.caches.body_size.get(&node).map_or(0.0, |s| s.x);
         ui.horizontal(|ui| {
-            ui.label(self.title(&snarl[node]));
-            if matches!(snarl.get_node(node), Some(EdNode::Op(_) | EdNode::Biome { .. })) {
-                let nv = self.caches.views.entry(node).or_default();
-                let mut shown = !nv.collapsed;
-                if ui.checkbox(&mut shown, icon::EYE).on_hover_text("Show this node's 2D/3D preview").changed() {
-                    nv.collapsed = !shown;
-                    self.signals.needs_arrange = true;
-                }
+            ui.set_min_width(want_w);
+            ui.label(title);
+            if has_preview {
+                // Right-aligned eye checkbox: lay out from the right edge.
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let nv = self.caches.views.entry(node).or_default();
+                    let mut shown = !nv.collapsed;
+                    if ui.checkbox(&mut shown, icon::EYE).on_hover_text("Show this node's 2D/3D preview").changed() {
+                        // Toggling shows/hides the preview; the node resizes IN PLACE — do NOT re-arrange the
+                        // graph (that would shift every other node, which is jarring).
+                        nv.collapsed = !shown;
+                    }
+                });
             }
         });
     }
@@ -113,7 +122,7 @@ impl SnarlViewer<EdNode> for Viewer<'_> {
         // Divider between the node params (above) and the preview section (below).
         ui.separator();
 
-        // Open: the preview IMAGE on the LEFT, its controls in a column on the RIGHT (no overlap).
+        // Open: the preview IMAGE, then a compact controls row BELOW it (so the node height tracks the size).
         let view = *self.caches.views.entry(node).or_default();
         let is3d = view.surface;
         let size = view.disp_px;
@@ -132,61 +141,52 @@ impl SnarlViewer<EdNode> for Viewer<'_> {
                 let view = PreviewView { half, cx, cz, yaw, pitch };
                 self.gpu_reqs.push(view.to_request(gkey, g, is3d, res as u32));
                 let tex = self.gpu_tex.get(&gkey).copied();
-                ui.horizontal_top(|ui| {
-                    // LEFT — the preview image (a flat placeholder for the ~1 frame before the GPU texture
-                    // warms up) with on-image gestures: scroll = zoom, drag = orbit (3D) / pan (2D),
-                    // right-drag = pan (3D). The scroll is consumed so the graph doesn't also zoom.
-                    let img_resp = preview_image(ui, tex, egui::vec2(size, size));
-                    // Scale-label overlay: the visible world width, in a corner of the preview.
-                    paint_scale_label(ui, img_resp.rect, half);
+                // The preview image (a flat placeholder for the ~1 frame before the GPU texture warms up)
+                // with on-image gestures: scroll = zoom, drag = orbit (3D) / pan (2D), right-drag = pan (3D).
+                let img_resp = preview_image(ui, tex, egui::vec2(size, size));
+                // Scale-label overlay: the visible world width, in a corner of the preview.
+                paint_scale_label(ui, img_resp.rect, half);
+                {
+                    // Read the node's view into one PreviewView, apply gestures, write back.
+                    let mut v = PreviewView { half, cx, cz, yaw, pitch };
+                    handle_preview_gestures(&img_resp, is3d, size, &mut v);
+                    let nv = self.caches.views.entry(node).or_default();
+                    nv.zoom_half_m = v.half;
+                    nv.cam = (v.yaw, v.pitch);
+                    nv.pan = (v.cx, v.cz);
+                }
+                // Record hover so the panel can intercept this preview's scroll-zoom next frame (before
+                // egui-snarl applies its own graph zoom).
+                if img_resp.hovered() {
+                    *self.hovered_preview = Some(node);
+                }
+                // Drag-resize grip at the image's bottom-right corner (its own widget rect, so its drag is
+                // separate from the image's orbit/pan gesture); grows/shrinks `disp_px`, clamped 64..=1024.
+                if let Some(delta) = preview_resize_grip(ui, img_resp.rect) {
+                    let sz = &mut self.caches.views.entry(node).or_default().disp_px;
+                    *sz = (*sz + delta).clamp(64.0, 1024.0);
+                }
+                // Compact controls in ONE row BELOW the image, so the node height tracks the preview size (a
+                // tall side column would pin the height and stop the node shrinking when you resize down).
+                ui.horizontal(|ui| {
+                    if ui.small_button(icon::ARROWS_OUT).on_hover_text("Pop out into a movable window").clicked() {
+                        self.signals.pop_request = Some(node);
+                    }
+                    if ui.small_button(icon::PICTURE_IN_PICTURE).on_hover_text("Show in a dockable preview panel").clicked() {
+                        self.signals.to_panel = Some(node);
+                    }
+                    if ui.selectable_label(is3d, "3D").on_hover_text("3D surface (drag the image to orbit)").clicked() {
+                        self.caches.views.entry(node).or_default().surface = !is3d;
+                    }
+                    let h = &mut self.caches.views.entry(node).or_default().zoom_half_m;
+                    let mut km = *h * 2.0 / 1000.0;
+                    if ui
+                        .add(egui::DragValue::new(&mut km).speed(0.25).range(0.05..=512.0).suffix(" km"))
+                        .on_hover_text("Zoom: width of the sampled world window")
+                        .changed()
                     {
-                        // Read the node's view into one PreviewView, apply gestures, write back.
-                        let mut v = PreviewView { half, cx, cz, yaw, pitch };
-                        handle_preview_gestures(&img_resp, is3d, size, &mut v);
-                        let nv = self.caches.views.entry(node).or_default();
-                        nv.zoom_half_m = v.half;
-                        nv.cam = (v.yaw, v.pitch);
-                        nv.pan = (v.cx, v.cz);
+                        *h = (km * 1000.0 / 2.0).max(1.0);
                     }
-                    // Record hover so the panel can intercept this preview's scroll-zoom next frame
-                    // (before egui-snarl applies its own graph zoom).
-                    if img_resp.hovered() {
-                        *self.hovered_preview = Some(node);
-                    }
-                    // Drag-resize grip at the image's BOTTOM-RIGHT corner — added AFTER (and over) the
-                    // image as its own widget rect, so its drag is separate from the image's orbit/pan
-                    // gesture. Dragging it grows/shrinks `disp_px` (the preview side), clamped 64..=1024.
-                    if let Some(delta) = preview_resize_grip(ui, img_resp.rect) {
-                        let sz = &mut self.caches.views.entry(node).or_default().disp_px;
-                        *sz = (*sz + delta).clamp(64.0, 1024.0);
-                    }
-                    // RIGHT — controls column (pop-out, → panel, zoom, 2D/3D). Show/hide is the header eye.
-                    ui.vertical(|ui| {
-                        ui.horizontal(|ui| {
-                            if ui.small_button(icon::ARROWS_OUT).on_hover_text("Pop out into a movable window").clicked() {
-                                self.signals.pop_request = Some(node);
-                            }
-                            if ui.small_button(icon::PICTURE_IN_PICTURE).on_hover_text("Show in the dockable preview panel (by the viewport)").clicked() {
-                                self.signals.to_panel = Some(node);
-                            }
-                        });
-                        let h = &mut self.caches.views.entry(node).or_default().zoom_half_m;
-                        let mut km = *h * 2.0 / 1000.0;
-                        if ui
-                            .add(egui::DragValue::new(&mut km).speed(0.25).range(0.05..=512.0).suffix(" km"))
-                            .on_hover_text("Zoom: width of the sampled world window")
-                            .changed()
-                        {
-                            *h = (km * 1000.0 / 2.0).max(1.0);
-                        }
-                        if ui
-                            .selectable_label(is3d, "3D")
-                            .on_hover_text("3D SDF-raymarched surface (drag the image to orbit)")
-                            .clicked()
-                        {
-                            self.caches.views.entry(node).or_default().surface = !is3d;
-                        }
-                    });
                 });
             }
             Err(e) => {
