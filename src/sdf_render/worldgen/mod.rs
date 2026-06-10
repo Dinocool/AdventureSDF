@@ -395,7 +395,7 @@ fn roll_worldgen(
         (0..manager.tier_count()).map(|t| HEIGHT_CHUNK_CELLS << t).collect();
     let clipmap = build_height_clipmap(manager.height_store(), &tier_cells);
     // Publish the tier-0 hi-fi DETAIL-NORMAL sampler FIRST (before the clipmap), so any bake that grabs the
-    // new clipmap also sees the matching hi-fi terrain source (`band_limited_grad`) — the two stay in
+    // new clipmap also sees the matching hi-fi terrain source (raw `sample_world` slope) — the two stay in
     // lockstep (same params/erosion/graph/seed the clipmap was built from). A derived render attribute; the
     // height itself is unchanged (no `HEIGHT_GEN_VERSION` bump).
     upload::set_cpu_terrain_hifi(Some(Arc::new(manager.make_terrain_hifi())));

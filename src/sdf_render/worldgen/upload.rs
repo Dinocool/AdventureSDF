@@ -637,27 +637,29 @@ pub fn cpu_height_clipmap() -> Option<Arc<HeightClipmap>> {
 
 /// The pure, FULL-FIDELITY terrain surface source for DETAIL-NORMAL baking: the tier-0 [`HeightLayer`]
 /// (its `sample_world` is tier-independent, so tier 0 evaluates the same world surface every tier samples)
-/// plus the `world_seed`. The detail-normal texture bake samples its [`band_limited_grad`] at texel
+/// plus the `world_seed`. The detail-normal texture bake samples its RAW `sample_world` slope at texel
 /// centres to write the mip-0-scale fine surface slope onto a coarse-LOD chunk's normal map. Published
 /// alongside the clipmap by `roll_worldgen` ([`set_cpu_terrain_hifi`]) and captured per-bake in
 /// [`BAKE_TERRAIN`]. It is a DERIVED RENDER attribute — NOT keyed by `HEIGHT_GEN_VERSION` (the height
 /// itself is unchanged).
 pub struct TerrainHifi {
-    /// Tier-0 layer whose `sample_world`/`band_limited_grad` is the pure surface function (incl. the active
-    /// biome graph when one is attached — the same graph every clipmap tier samples).
+    /// Tier-0 layer whose `sample_world` is the pure surface function (incl. the active biome graph when one
+    /// is attached — the same graph every clipmap tier samples).
     pub layer: HeightLayer,
     /// The world seed the surface was generated with (folded into the noise / graph stream).
     pub world_seed: u64,
 }
 
 impl TerrainHifi {
-    /// The full-fidelity band-limited surface SLOPE `(dh/dx, dh/dz)` at world `(wx, wz)` — the mip-0-scale
-    /// band-limited analytic gradient. The detail-normal bake stores these two lanes per texel; the shader
-    /// reconstructs `N = normalize(-dh/dx, 1, -dh/dz)`. Pure / deterministic / bit-portable.
+    /// The full-fidelity surface SLOPE `(dh/dx, dh/dz)` at world `(wx, wz)` — the RAW analytic
+    /// [`HeightLayer::sample_world`] gradient (ONE eval/texel, NO band-limit convolution). The detail-normal
+    /// bake stores these two lanes per texel; the shader reconstructs `N = normalize(-dh/dx, 1, -dh/dz)`. The
+    /// texel density (and future mips) handle anti-aliasing — the terrain's finest feature is coarse enough
+    /// that the new texel resolution samples the raw slope well. Pure / deterministic / bit-portable.
     #[inline]
     pub fn slope(&self, wx: f64, wz: f64) -> (f32, f32) {
-        let (_, gx, gz) = self.layer.band_limited_grad(wx, wz, self.world_seed);
-        (gx as f32, gz as f32)
+        let n = self.layer.sample_world(wx, wz, self.world_seed);
+        (n.dh_dx, n.dh_dz)
     }
 }
 

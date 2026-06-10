@@ -199,10 +199,11 @@ impl Default for MeshBakeConfig {
             debug_lod_colour: false,
             debug_normals: false,
             freeze_lod: false,
-            // 32×32 per-chunk detail map: still far denser than a coarse chunk's vertices, while the N²
-            // band-limited gradient bake stays bounded (cold-fill ≈1.8× vs no map, streaming BOUNDED; res 128
-            // blew cold-fill up ~14×). Tune higher via the editor slider when iterating on the look.
-            detail_normal_res: 32,
+            // 128×128 per-chunk detail map: now affordable because the slope source is the RAW
+            // `sample_world` analytic gradient (ONE eval/texel, no 2 m separable-tent convolution) instead of
+            // the band-limited grad — so the dense map costs ~the old res-32 band-limited bake while carrying
+            // far finer relief. Tune via the editor slider when iterating on the look.
+            detail_normal_res: 128,
             detail_normal_strength: 1.0,
         }
     }
@@ -2338,7 +2339,7 @@ mod tests {
     }
 
     /// DETAIL-NORMAL bake correctness: (1) the bake samples the RIGHT function — a chunk-center texel's
-    /// stored slope `(dh/dx, dh/dz)` equals `TerrainHifi::slope` (= `band_limited_grad`) at that exact world
+    /// stored slope `(dh/dx, dh/dz)` equals `TerrainHifi::slope` (= the raw `sample_world` grad) at that world
     /// XZ, packed through f16; and (2) the LOD GATE excludes FINE chunks (`vs ≤ finest 2 m node spacing`) →
     /// `None`, while a COARSE chunk → `Some`. Installs a matching per-bake snapshot (clipmap + hi-fi) so the
     /// bake's `bake_terrain_hifi()` lights up exactly as production.
