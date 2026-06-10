@@ -1338,6 +1338,18 @@ fn mesh_resident_chunks(
         let mut budget = MAX_NEW_TASKS_PER_FRAME;
         let mut idx: Vec<u32> = Vec::new();
         let debug = mesh_cfg.debug_lod_colour;
+        // Install the round's FROZEN clipmap snapshot on THIS (system) thread for the whole REQUEST loop, so
+        // the SYNCHRONOUS narrow-band cull below (`chunk_has_surface` → `terrain_sdf`) samples the EXACT
+        // clipmap whose coverage gate admitted this round's residency — the SAME snapshot the async
+        // `mesh_chunk` bakes against. Without this the cull falls through to the process-GLOBAL
+        // `cpu_height_clipmap()`, which `roll_worldgen` may have ROLLED/regenerated (Apply, streaming, a
+        // `lod_count` rebuild) to a DIFFERENT coverage since the round froze — so a chunk the gate admitted
+        // (against the frozen clipmap) would trip the strict `sample_clipmap_lod` panic in the cull (against
+        // the live global). The frozen snapshot is the SSOT: gate, sync cull, and async bake all sample it.
+        let _round_terrain = crate::sdf_render::worldgen::upload::set_bake_terrain(
+            round.clipmap.clone(),
+            crate::sdf_render::worldgen::upload::cpu_terrain_offset(),
+        );
         // Still-stale chunks of the FROZEN residency (need a bake), ordered by bake priority against the LIVE
         // camera (where the viewer is). Bake/commit/reap all agree on the frozen set; only the ORDER is live.
         let prio_cam = live_cam.or(round.cam).unwrap_or(Vec3::ZERO);
