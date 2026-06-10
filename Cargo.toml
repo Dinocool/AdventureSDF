@@ -134,6 +134,11 @@ transvoxel = "2.0.0"
 # `i32→f64`) are bit-identical to the scalar `noise.rs` primitives — preserving the bit-portable
 # determinism invariant (no FMA/reassociation). Already in the tree transitively via rapier (no new fetch).
 wide = "0.7.33"
+# IEEE-754 half-precision (`f16`) for the per-chunk terrain DETAIL-NORMAL map: the baked surface slope
+# `(dh/dx, dh/dz)` is stored in an `Rg16Float` GPU texture, so the CPU bake packs each f32 lane to f16
+# bits. The mature off-the-shelf converter (correct rounding/denormals) instead of hand-rolled bit
+# twiddling. Already in the tree transitively (via wgpu), so no new fetch.
+half = "2"
 
 [dev-dependencies]
 # spv-out: emit SPIR-V from naga in tests so we can inspect which opcode signed `%`

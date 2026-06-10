@@ -184,6 +184,9 @@ fn build_and_publish_clipmap(
 
     let tier_cells: Vec<u32> = (0..manager.tier_count()).map(|t| HEIGHT_CHUNK_CELLS << t).collect();
     let clipmap = Arc::new(build_height_clipmap(manager.height_store(), &tier_cells));
+    // Publish the tier-0 hi-fi DETAIL-NORMAL sampler too (mirrors `roll_worldgen`), so the rig's bake fires
+    // the per-chunk detail-normal map exactly as production does — its N² gradient cost shows in the timings.
+    crate::sdf_render::worldgen::upload::set_cpu_terrain_hifi(Some(Arc::new(manager.make_terrain_hifi())));
     set_cpu_height_clipmap(Some(clipmap.clone()));
     clipmap
 }
@@ -370,9 +373,16 @@ fn time_one_chunk(
     let flags = chunk_finer_faces(key, config, k, Some(cam), half0);
     let vs_l = config.voxel_size_at(key.lod);
     let t = std::time::Instant::now();
-    // `None` ⇒ the bake reads the process-global clipmap the rig published (set_cpu_height_clipmap); the
-    // terrain perf scene is terrain-only, so `terrain_only = true` (analytic stored-gradient normals).
-    let out = mesh_chunk(edits, &idx, grid_origin, vs_l, k * cs, flags, key.lod, false, None, true);
+    // Pass the published clipmap as the per-bake snapshot (mirrors production `round.clipmap`) so the
+    // DETAIL-NORMAL bake's `bake_terrain_hifi()` sees the matching tier-0 hi-fi source and bakes the per-chunk
+    // map — its N² gradient cost is then included in the timing. The terrain perf scene is terrain-only, so
+    // `terrain_only = true`; `detail_normal_res` from the live config (default 128) drives the bake (gated to
+    // coarse LODs inside `mesh_chunk`).
+    let terrain = crate::sdf_render::worldgen::upload::cpu_height_clipmap();
+    let out = mesh_chunk(
+        edits, &idx, grid_origin, vs_l, k * cs, flags, key.lod, false, terrain, true,
+        mesh_cfg.detail_normal_res,
+    );
     let us = t.elapsed().as_micros();
     let (verts, tris) = out.map_or((0, 0), |d| (d.positions.len(), d.indices.len() / 3));
     (us, verts, tris)
@@ -598,6 +608,7 @@ fn mesh_bake_perf_terrain() {
 
     // Clear the published clipmap so the global doesn't leak into other tests in the same process.
     set_cpu_height_clipmap(None);
+    crate::sdf_render::worldgen::upload::set_cpu_terrain_hifi(None);
 
     assert!(
         bounded,
@@ -769,4 +780,5 @@ fn sync_cull_uses_frozen_clipmap_not_rolled_global() {
     );
 
     set_cpu_height_clipmap(None); // clean up the global for sibling tests
+    crate::sdf_render::worldgen::upload::set_cpu_terrain_hifi(None);
 }
