@@ -1622,6 +1622,15 @@ fn graph_panel(world: &mut World, ui: &mut egui::Ui) {
                 panel.pan = pan;
                 panel.is3d = is3d;
             }
+            // Robust against a stale/closed layout: ensure the "Node Preview" tab exists (by the viewport)
+            // and focus it, so the button always works regardless of the persisted dock state.
+            let tab = super::dock::EditorTab::Registered("worldgen/node-preview".into());
+            super::layout::set_panel_present(world, tab.clone(), super::panels::DockSide::Center, true);
+            if let Some(mut dock) = world.get_resource_mut::<super::dock::EditorDockState>()
+                && let Some((n, t)) = dock.state.find_main_surface_tab(&tab)
+            {
+                dock.state.set_active_tab((egui_dock::SurfaceIndex::main(), n, t));
+            }
         }
         // Pop a node's preview out into a movable window (snapshotting its current view state + nav path).
         if let Some(node) = editor.pop_request.take() {
