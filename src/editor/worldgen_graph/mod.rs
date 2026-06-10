@@ -47,6 +47,38 @@ pub(crate) fn close_preview(world: &mut World, id: u64) {
     }
 }
 
+/// Descriptive title for the Node Preview tab `id` (the dock `title` arm calls this): `Node Preview:
+/// {context} {node}` — e.g. `Node Preview: World Fbm` or `Node Preview: Plains Ridge`. `context` is the
+/// biome the previewed node lives in (the innermost nav crumb, or `World` at the top level); `node` is the
+/// node's kind / biome name. Falls back to a plain `Node Preview` if the target no longer resolves.
+pub(crate) fn preview_tab_title(world: &World, id: u64) -> String {
+    let Some((nav, node)) =
+        world.get_resource::<WorldgenPreviewPanels>().and_then(|p| p.map.get(&id)).and_then(|p| p.target.clone())
+    else {
+        return "Node Preview".to_string();
+    };
+    let Some(editor) = world.get_resource::<WorldGraphEditor>() else {
+        return "Node Preview".to_string();
+    };
+    let node_label = resolve_snarl(&editor.snarl, &nav).and_then(|s| s.get_node(node)).map(ed_node_label).unwrap_or_default();
+    let context = convert::breadcrumb_names(&editor.snarl, &nav).last().cloned().unwrap_or_else(|| "World".to_string());
+    if node_label.is_empty() {
+        format!("Node Preview: {context}")
+    } else {
+        format!("Node Preview: {context} {node_label}")
+    }
+}
+
+/// A node's plain (icon-free) display label, for tab titles.
+fn ed_node_label(n: &EdNode) -> String {
+    match n {
+        EdNode::Op(k) => node::node_kind_name(k).to_string(),
+        EdNode::Biome { name, .. } => name.clone(),
+        EdNode::Input(k) => climate_name(*k).to_string(),
+        EdNode::Output => "Output".to_string(),
+    }
+}
+
 /// Default on-disk path the editor saves/loads the active biome graph to (the production graph the
 /// worldgen loads — see `WorldGenPlugin`'s asset hot-reload). Relative to the app's `assets/` root.
 const DEFAULT_GRAPH_PATH: &str = "assets/worldgen/world.graph.ron";

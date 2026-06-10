@@ -156,7 +156,7 @@ impl TabViewer for EditorTabViewer<'_> {
             EditorTab::ProjectFiles => "Project Files".into(),
             EditorTab::AssetsDrawer => "Assets".into(),
             EditorTab::Registered(id) => self.registry.title_for(id).into(),
-            EditorTab::WorldgenPreview(_) => "Node Preview".into(),
+            EditorTab::WorldgenPreview(id) => crate::editor::worldgen_graph::preview_tab_title(self.world, *id).into(),
         }
     }
 
