@@ -17,6 +17,7 @@ mod compile;
 mod convert;
 mod node;
 mod panel;
+mod persist;
 mod preview;
 mod viewer;
 #[cfg(test)]

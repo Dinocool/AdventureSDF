@@ -1,9 +1,9 @@
 use super::arrange::auto_arrange;
 use super::compile::output_root;
 use super::convert::{
-    breadcrumb_names, load_editor_snarl, new_biome_subgraph, resolve_snarl, valid_depth, world_biome_snarl,
-    worldgraph_path,
+    breadcrumb_names, new_biome_subgraph, resolve_snarl, valid_depth, world_biome_snarl, worldgraph_path,
 };
+use super::persist::{EditorView, WorldGraphDoc, load_editor_doc};
 use super::preview::{PANEL_GPU_KEY, gpu_inline_key};
 use super::*;
 use egui::pos2;
@@ -181,8 +181,10 @@ fn write_world_biome_assets() {
     (GraphAsset { graph: g })
         .save(std::path::Path::new("assets/worldgen/world.graph.ron"))
         .expect("save flat");
-    let s = ron::ser::to_string_pretty(&snarl, ron::ser::PrettyConfig::default()).expect("ser hierarchy");
-    std::fs::write("assets/worldgen/world.worldgraph.ron", s).expect("write hierarchy");
+    // The hierarchical sibling is now a versioned WorldGraphDoc (snarl + default view-state).
+    let doc = WorldGraphDoc { version: 1, snarl, view: EditorView::default() };
+    let s = ron::ser::to_string_pretty(&doc, ron::ser::PrettyConfig::default()).expect("ser document");
+    std::fs::write("assets/worldgen/world.worldgraph.ron", s).expect("write document");
 }
 
 /// The shipped `world.graph.ron` must match the compiled `world_biome_snarl` (catches drift after the
@@ -215,7 +217,7 @@ fn worldgraph_path_strips_known_suffixes() {
     assert_eq!(worldgraph_path("x.graph.ron"), "x.worldgraph.ron");
 }
 
-// -- load_editor_snarl fallback chain ------------------------------------------------------------
+// -- load_editor_doc fallback chain --------------------------------------------------------------
 
 /// A unique temp path under the test temp dir (TMP/TEMP), removed on drop, for the file-based tests.
 struct TmpFile(std::path::PathBuf);
@@ -248,50 +250,70 @@ impl Drop for TmpFile {
 }
 
 #[test]
-fn load_editor_snarl_prefers_hierarchical() {
-    // A valid hierarchical `.worldgraph.ron` (with a biome) is loaded in preference to the flat graph.
+fn load_editor_doc_prefers_hierarchical() {
+    // A valid hierarchical `.worldgraph.ron` document (with a biome) is loaded in preference to the flat
+    // graph, restoring its snarl AND its persisted view-state (here: a nav into the biome).
     let f = TmpFile::new("hier");
     let mut top = Snarl::new();
     let b = top.insert_node(p(), EdNode::Biome { name: "Hills".into(), graph: Box::new(new_biome_subgraph()) });
     let o = top.insert_node(p(), EdNode::Output);
     top.connect(out(b), inn(o, 0));
-    let s = ron::ser::to_string(&top).unwrap();
-    std::fs::write(f.wg(), s).expect("write hierarchical");
-    let loaded = load_editor_snarl(&f.str());
-    assert!(loaded.node_ids().any(|(_, n)| matches!(n, EdNode::Biome { .. })), "kept the biome hierarchy");
+    let view = EditorView { nav: vec![b], ..EditorView::default() };
+    let doc = WorldGraphDoc { version: 1, snarl: top, view };
+    let s = ron::ser::to_string(&doc).unwrap();
+    std::fs::write(f.wg(), s).expect("write hierarchical document");
+    let (snarl, view) = load_editor_doc(&f.str());
+    assert!(snarl.node_ids().any(|(_, n)| matches!(n, EdNode::Biome { .. })), "kept the biome hierarchy");
+    assert_eq!(view.nav, vec![b], "restored the persisted nav");
 }
 
 #[test]
-fn load_editor_snarl_falls_back_to_flat() {
+fn load_editor_doc_reads_bare_snarl_for_backward_compat() {
+    // A pre-document `.worldgraph.ron` that is a BARE `Snarl<EdNode>` (the old format) still loads —
+    // its snarl comes through and the view defaults.
+    let f = TmpFile::new("bare");
+    let mut top = Snarl::new();
+    let b = top.insert_node(p(), EdNode::Biome { name: "Hills".into(), graph: Box::new(new_biome_subgraph()) });
+    let o = top.insert_node(p(), EdNode::Output);
+    top.connect(out(b), inn(o, 0));
+    let s = ron::ser::to_string(&top).unwrap(); // bare snarl, NOT a doc
+    std::fs::write(f.wg(), s).expect("write bare snarl");
+    let (snarl, view) = load_editor_doc(&f.str());
+    assert!(snarl.node_ids().any(|(_, n)| matches!(n, EdNode::Biome { .. })), "bare snarl loaded");
+    assert!(view.nav.is_empty() && view.panel.is_none() && view.popped.is_empty(), "view defaulted");
+}
+
+#[test]
+fn load_editor_doc_falls_back_to_flat() {
     // No `.worldgraph.ron`, but a valid flat `.graph.ron` → loaded (and re-snarled, so no biomes).
     let f = TmpFile::new("flat");
     let g = mountains_plains_graph(700.0);
     (GraphAsset { graph: g }).save(f.path()).expect("save flat");
-    let loaded = load_editor_snarl(&f.str());
+    let (snarl, _view) = load_editor_doc(&f.str());
     // Round-trips to a compilable graph and has no biomes (flat).
-    assert!(snarl_to_graph(&loaded).is_ok());
-    assert!(!loaded.node_ids().any(|(_, n)| matches!(n, EdNode::Biome { .. })));
+    assert!(snarl_to_graph(&snarl).is_ok());
+    assert!(!snarl.node_ids().any(|(_, n)| matches!(n, EdNode::Biome { .. })));
 }
 
 #[test]
-fn load_editor_snarl_corrupt_falls_through_to_default() {
+fn load_editor_doc_corrupt_falls_through_to_default() {
     // Both files present but CORRUPT → falls through to the built-in default world (which has biomes).
     let f = TmpFile::new("corrupt");
     std::fs::write(f.wg(), "this is not valid ron {{{").expect("write corrupt hier");
     f.write("also not ron )))");
-    let loaded = load_editor_snarl(&f.str());
+    let (snarl, _view) = load_editor_doc(&f.str());
     let default = world_biome_snarl();
     // Same structure as the default: identical node count + both biomes present.
-    assert_eq!(loaded.node_ids().count(), default.node_ids().count());
-    assert_eq!(loaded.node_ids().filter(|(_, n)| matches!(n, EdNode::Biome { .. })).count(), 2);
+    assert_eq!(snarl.node_ids().count(), default.node_ids().count());
+    assert_eq!(snarl.node_ids().filter(|(_, n)| matches!(n, EdNode::Biome { .. })).count(), 2);
 }
 
 #[test]
-fn load_editor_snarl_missing_uses_default() {
+fn load_editor_doc_missing_uses_default() {
     // Neither file exists → the built-in default world.
     let f = TmpFile::new("missing");
-    let loaded = load_editor_snarl(&f.str());
-    assert_eq!(loaded.node_ids().count(), world_biome_snarl().node_ids().count());
+    let (snarl, _view) = load_editor_doc(&f.str());
+    assert_eq!(snarl.node_ids().count(), world_biome_snarl().node_ids().count());
 }
 
 // -- nav helpers (valid_depth / resolve_snarl / breadcrumb_names) --------------------------------
