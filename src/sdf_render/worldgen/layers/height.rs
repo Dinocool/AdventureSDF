@@ -96,12 +96,13 @@ impl Default for HeightParams {
             amplitude: 280.0,
             sea_level: 0.0,
             ridge: 0.5,
-            // Round sharp crests over ~3 nodes (≈6 m at tier 0) so the Transvoxel grid meshes them with
-            // well-formed triangles and continuous normals. The radius is the lever: the triangle-quality
-            // harness sweep shows worst crest normal-spread falling monotonically with it (dense ridge:
-            // 143°→91°→59°→30° at radius 0→2→4→8). A bigger radius cleans crests but also softens fine
-            // detail (it's a global low-pass) — tune live via the World Gen panel's "Crest band-limit".
-            band_limit: 3.0,
+            // SURFACE BAND-LIMIT OFF by default (`0` = point-sample the raw `sample_world` surface, no tent
+            // finalize). The knob is retained + runtime-tunable via the World Gen panel's "Crest band-limit"
+            // (it still rounds sharp crests over `~2·radius` nodes when raised), but the default no longer
+            // low-passes the meshed height — the terrain meshes the raw surface. Reversible: set > 0 to
+            // re-enable. The triangle-quality harness still shows crest normal-spread falling monotonically
+            // with the radius when it is raised (dense ridge: 143°→91°→59°→30° at radius 0→2→4→8).
+            band_limit: 0.0,
             seed_salt: 0,
         }
     }
@@ -579,16 +580,27 @@ mod tests {
         }
     }
 
-    /// With ridge/erosion on, `generate` BAND-LIMITS the composed surface (the finalize tent low-pass): a
-    /// node is a CONVEX COMBINATION (weighted average) of `sample_world` over its kernel neighbourhood, so
-    /// it (a) differs from the raw point sample (the low-pass is doing something) and (b) lies within the
-    /// local [min, max] of the surface (a low-pass can never overshoot — the property that rounds the sharp
-    /// crest instead of spiking it). Seam-freeness is asserted separately by
-    /// `adjacent_chunks_agree_on_shared_boundary` (which uses this same `layer()`).
+    /// A layer with the band-limit finalize EXPLICITLY enabled (`band_limit = 3`). The DEFAULT is now `0`
+    /// (point-sample the raw surface), so this explicitly exercises the still-supported `generate_band_limited`
+    /// finalize the slider drives — without depending on the default.
+    fn band_limited_layer() -> HeightLayer {
+        HeightLayer::new(
+            LayerId(0),
+            HeightParams { band_limit: 3.0, ..Default::default() },
+            ErosionParams::default(),
+        )
+    }
+
+    /// With ridge/erosion on AND `band_limit > 0`, `generate` BAND-LIMITS the composed surface (the finalize
+    /// tent low-pass): a node is a CONVEX COMBINATION (weighted average) of `sample_world` over its kernel
+    /// neighbourhood, so it (a) differs from the raw point sample (the low-pass is doing something) and (b)
+    /// lies within the local [min, max] of the surface (a low-pass can never overshoot — the property that
+    /// rounds the sharp crest instead of spiking it). Uses an EXPLICITLY band-limited layer (the default is
+    /// now `band_limit = 0` / raw); this pins the still-supported slider finalize path.
     #[test]
     fn generate_band_limits_sharp_features() {
-        let l = layer(); // default: ridge + erosion + band_limit > 0
-        assert!(l.params.band_limit > 0.0, "default layer must band-limit");
+        let l = band_limited_layer(); // ridge + erosion + band_limit = 3 (slider on)
+        assert!(l.params.band_limit > 0.0, "this test must use a band-limited layer");
         let coord = ChunkCoord::new(l.id(), IVec3::new(1, 0, -2));
         let ctx = GenCtx { coord, seed: 7, size: l.chunk_size() };
         let mut out = GenOutput::default();
