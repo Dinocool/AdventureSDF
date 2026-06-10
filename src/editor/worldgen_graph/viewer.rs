@@ -241,22 +241,26 @@ impl SnarlViewer<EdNode> for Viewer<'_> {
     }
 
     fn show_graph_menu(&mut self, pos: egui::Pos2, ui: &mut egui::Ui, snarl: &mut Snarl<EdNode>) {
+        // `pos` is the menu's top-left (egui-snarl passes `from_global * cursor`, not the click), and a node
+        // grows down-right from its position — so the panel re-centres each new node (`signals.added` →
+        // `pending_center`) on `pos` once its real size is measured, landing it at the right-click.
         ui.label("Add node");
         for kind in node_catalog() {
             if ui.button(node_kind_name(&kind)).clicked() {
-                snarl.insert_node(pos, EdNode::Op(kind));
+                self.signals.added.push(snarl.insert_node(pos, EdNode::Op(kind)));
                 ui.close();
             }
         }
         ui.separator();
         if ui.button(format!("{} Biome", icon::PLANT)).on_hover_text("A nested biome sub-graph (climate in, height out)").clicked() {
-            snarl.insert_node(pos, EdNode::Biome { name: "biome".into(), graph: Box::new(new_biome_subgraph()) });
+            let id = snarl.insert_node(pos, EdNode::Biome { name: "biome".into(), graph: Box::new(new_biome_subgraph()) });
+            self.signals.added.push(id);
             ui.close();
         }
         ui.menu_button("Climate input", |ui| {
             for (k, name) in CLIMATE_INPUTS.iter().enumerate() {
                 if ui.button(*name).on_hover_text("A climate value piped in from the parent biome").clicked() {
-                    snarl.insert_node(pos, EdNode::Input(k));
+                    self.signals.added.push(snarl.insert_node(pos, EdNode::Input(k)));
                     ui.close();
                 }
             }

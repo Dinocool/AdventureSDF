@@ -230,6 +230,25 @@ pub(super) fn graph_panel(world: &mut World, ui: &mut egui::Ui) {
         if std::mem::take(&mut editor.needs_arrange) {
             editor.rearrange();
         }
+        // Re-centre menu-added nodes on the cursor (egui-snarl positions a new node at the menu's top-left;
+        // it grows down-right from there → it would land offset from the right-click). Done once the node's
+        // real GRAPH-space size is measured (next frame), so it's exact at ANY zoom. Unmeasured ⇒ stays queued.
+        {
+            let ed = &mut *editor;
+            ed.pending_center.append(&mut ed.signals.added);
+        }
+        if !editor.pending_center.is_empty() {
+            let WorldGraphEditor { snarl, nav, caches, pending_center, .. } = &mut *editor;
+            let current = current_snarl_mut(snarl, nav);
+            pending_center.retain(|&id| match (caches.body_size.get(&id), current.get_node_info_mut(id)) {
+                (Some(size), Some(info)) => {
+                    info.pos -= 0.5 * *size; // centre the node on the recorded position
+                    false
+                }
+                (None, Some(_)) => true, // not measured yet → keep for next frame
+                (_, None) => false,      // node gone → drop
+            });
+        }
         // Descend into a biome the user opened this frame.
         if let Some(id) = editor.signals.enter.take() {
             editor.nav.push(id);

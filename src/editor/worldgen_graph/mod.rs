@@ -147,6 +147,10 @@ struct ViewerSignals {
     /// Raised when a node's `collapsed` flag is toggled this frame — the panel ORs it into
     /// `needs_arrange` so the layout re-packs (collapsed nodes shrink, so the columns tighten up).
     needs_arrange: bool,
+    /// Nodes created via the add-node menu this frame. egui-snarl positions a new node at the menu's
+    /// top-left and the node grows down-right from there, so the panel re-centres each on that point once
+    /// its real size is measured (see `pending_center`) — otherwise it lands offset from the right-click.
+    added: Vec<NodeId>,
 }
 
 /// Editor state: the working Snarl graph, whether it's been seeded from the live `WorldGraph` yet, and
@@ -179,6 +183,9 @@ pub struct WorldGraphEditor {
     /// Cut/copy clipboard for node select+copy+paste (transient; not part of the persist doc). Holds the
     /// last copied selection (kinds + positions + internal wires) so paste reproduces the subgraph.
     clipboard: Vec<ClipNode>,
+    /// Nodes added via the menu that still need re-centring on the cursor once their size is measured
+    /// (one or two frames). Per-nav-level (cleared on navigation). See the add-node centring in `panel`.
+    pending_center: Vec<NodeId>,
 }
 
 impl Default for WorldGraphEditor {
@@ -196,6 +203,7 @@ impl Default for WorldGraphEditor {
             next_pop_id: 1000,
             needs_arrange: true,
             clipboard: Vec::new(),
+            pending_center: Vec::new(),
         }
     }
 }
@@ -205,6 +213,7 @@ impl WorldGraphEditor {
     /// id namespace each level) so caches must not bleed between levels.
     fn clear_node_caches(&mut self) {
         self.caches = NodeCaches::default();
+        self.pending_center.clear();
     }
 
     /// Auto-arrange the CURRENTLY-NAVIGATED level's snarl (plain `&mut self` so the disjoint
