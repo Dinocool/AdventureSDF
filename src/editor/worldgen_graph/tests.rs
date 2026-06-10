@@ -1,6 +1,9 @@
+use super::convert::world_biome_snarl;
 use super::*;
 use egui_snarl::{InPinId, OutPinId};
 
+use crate::assets::Asset as _;
+use crate::sdf_render::worldgen::graph::GraphAsset;
 use crate::sdf_render::worldgen::graph::node::FbmAxis;
 use crate::sdf_render::worldgen::graph::preset::{default_terrain_graph, mountains_plains_graph};
 
