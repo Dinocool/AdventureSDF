@@ -11,8 +11,9 @@
 //! Bevy's runtime pipeline, not here.
 
 use naga_oil::compose::{
-    ComposableModuleDescriptor, Composer, NagaModuleDescriptor, ShaderLanguage,
+    ComposableModuleDescriptor, Composer, NagaModuleDescriptor, ShaderDefValue, ShaderLanguage,
 };
+use std::collections::HashMap;
 use std::path::Path;
 
 /// A `bevy_core_pipeline` import some entry shaders use. naga_oil doesn't know Bevy's built-in
@@ -26,6 +27,18 @@ struct FullscreenVertexOutput {
 };
 "#;
 
+/// A minimal `bevy_pbr::forward_io` stand-in providing only the `VertexOutput` fields the worldgen
+/// preview material shader reads (`uv`). naga_oil doesn't know Bevy's built-in PBR modules.
+const FORWARD_IO_STUB: &str = r#"
+#define_import_path bevy_pbr::forward_io
+struct VertexOutput {
+    @builtin(position) position: vec4<f32>,
+    @location(0) world_position: vec4<f32>,
+    @location(1) world_normal: vec3<f32>,
+    @location(2) uv: vec2<f32>,
+};
+"#;
+
 /// Register the Bevy fullscreen stub into a fresh composer.
 fn composer_with_stub() -> Composer {
     // Validate with FULL capabilities, exactly as bevy's runtime composer does via
@@ -33,19 +46,25 @@ fn composer_with_stub() -> Composer {
     // EMPTY capabilities, which rejects the paged atlas's non-uniform `binding_array` index that
     // the device + runtime accept.
     let mut composer = Composer::default().with_capabilities(naga::valid::Capabilities::all());
-    composer
-        .add_composable_module(ComposableModuleDescriptor {
-            source: FULLSCREEN_STUB,
-            file_path: "bevy_core_pipeline::fullscreen_vertex_shader",
-            language: ShaderLanguage::Wgsl,
-            ..Default::default()
-        })
-        .expect("fullscreen stub must compose");
+    for (source, path) in [
+        (FULLSCREEN_STUB, "bevy_core_pipeline::fullscreen_vertex_shader"),
+        (FORWARD_IO_STUB, "bevy_pbr::forward_io"),
+    ] {
+        composer
+            .add_composable_module(ComposableModuleDescriptor {
+                source,
+                file_path: path,
+                language: ShaderLanguage::Wgsl,
+                ..Default::default()
+            })
+            .unwrap_or_else(|e| panic!("stub {path} must compose: {e}"));
+    }
     composer
 }
 
-/// Compose an entry shader (importing at most the Bevy fullscreen stub) and validate it.
-fn validate_entry(path: &Path) -> Result<(), String> {
+/// Compose an entry shader (importing at most the Bevy stubs) and validate it, with the given
+/// `#{…}` shader-def substitutions.
+fn validate_entry_with_defs(path: &Path, defs: HashMap<String, ShaderDefValue>) -> Result<(), String> {
     let mut composer = composer_with_stub();
     let source =
         std::fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()))?;
@@ -53,6 +72,7 @@ fn validate_entry(path: &Path) -> Result<(), String> {
         .make_naga_module(NagaModuleDescriptor {
             source: &source,
             file_path: &path.to_string_lossy(),
+            shader_defs: defs,
             ..Default::default()
         })
         .map_err(|e| format!("compose {} failed:\n{e}", path.display()))?;
@@ -66,10 +86,25 @@ fn validate_entry(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// Compose an entry shader (importing at most the Bevy stubs) and validate it.
+fn validate_entry(path: &Path) -> Result<(), String> {
+    validate_entry_with_defs(path, HashMap::new())
+}
+
 #[test]
 fn sdf_brick_bake_wgsl_validates() {
     // The brick-bake compute shader is fully self-contained (no sdf::* imports). Validates the
     // ported eval_primitive/fold_csg/material slots + the packed storage-buffer writes.
     let path = Path::new("assets/shaders/sdf_brick_bake.wgsl");
     validate_entry(path).unwrap_or_else(|e| panic!("{e}"));
+}
+
+#[test]
+fn worldgen_preview_wgsl_validates() {
+    // The node-preview material shader: orbit raymarch of the baked heightfield. Uses
+    // `@group(#{MATERIAL_BIND_GROUP})` + imports `bevy_pbr::forward_io::VertexOutput`, so it needs
+    // the forward_io stub + the MATERIAL_BIND_GROUP def (2, matching Bevy's material bind group).
+    let path = Path::new("assets/shaders/worldgen_preview.wgsl");
+    let defs = HashMap::from([("MATERIAL_BIND_GROUP".to_string(), ShaderDefValue::UInt(2))]);
+    validate_entry_with_defs(path, defs).unwrap_or_else(|e| panic!("{e}"));
 }

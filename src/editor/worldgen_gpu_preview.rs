@@ -10,8 +10,9 @@
 //! egui panels can't touch the `World` mid-render, so they instead PUSH [`GpuPreviewRequest`]s into the
 //! [`GpuPreviewRequests`] resource and READ the resulting [`GpuPreviewTextures`] map (1-frame lag);
 //! [`process_gpu_previews`] assigns requests to slots (LRU-ish), re-bakes only on change, and toggles
-//! each slot's camera active. Overflow past `POOL_SIZE` simply gets no GPU texture (caller falls back to
-//! the CPU preview).
+//! each slot's camera active. Overflow past `POOL_SIZE` simply gets no GPU texture for the unassigned
+//! previews this frame — they draw the "baking…" placeholder until a slot frees up (and the overflow is
+//! `warn_once!`d). There is no CPU-preview fallback.
 
 use std::collections::{HashMap, HashSet};
 
@@ -131,8 +132,9 @@ struct GpuPreviewPool {
 /// Offscreen render-attachment image (the raymarch output egui samples) at `w`×`h`.
 fn make_output_image(images: &mut Assets<Image>, w: u32, h: u32) -> Handle<Image> {
     let size = Extent3d { width: w, height: h, depth_or_array_layers: 1 };
+    // Pure render target sampled by egui — no CPU read-back, so it only needs to live in the render world.
     let mut image =
-        Image::new_fill(size, TextureDimension::D2, &[0, 0, 0, 0], TextureFormat::Rgba8UnormSrgb, RenderAssetUsages::all());
+        Image::new_fill(size, TextureDimension::D2, &[0, 0, 0, 0], TextureFormat::Rgba8UnormSrgb, RenderAssetUsages::RENDER_WORLD);
     image.texture_descriptor.usage =
         TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST | TextureUsages::RENDER_ATTACHMENT;
     image.sampler = ImageSampler::linear();
@@ -319,6 +321,16 @@ fn process_gpu_previews(world: &mut World) {
                 *slot = Some(si);
             }
         }
+        // Overflow: more distinct previews requested this frame than the pool can render. The unassigned
+        // ones get no texture (they show the "baking…" placeholder). Warn once so it's not a silent stall.
+        let overflow = assign.iter().filter(|s| s.is_none()).count();
+        if overflow > 0 {
+            bevy::log::warn_once!(
+                "worldgen GPU preview pool exhausted: {overflow} of {} requested previews have no slot \
+                 (POOL_SIZE = {POOL_SIZE}); they will show the baking placeholder until a slot frees",
+                requests.len()
+            );
+        }
 
         let mut out: HashMap<u64, egui::TextureId> = HashMap::new();
         let active: HashSet<usize> = assign.iter().filter_map(|s| *s).collect();
@@ -394,6 +406,32 @@ impl Plugin for WorldgenGpuPreviewPlugin {
         app.add_systems(
             Update,
             (setup_gpu_pool, process_gpu_previews).chain().run_if(resource_exists::<EguiUserTextures>),
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The shader's `HF_TEX_RES` const MUST match the Rust `HEIGHTFIELD_RES` (the bake fills a
+    /// `HEIGHTFIELD_RES`² texture; the shader's manual bilinear fetch indexes by `HF_TEX_RES`). A mismatch
+    /// silently corrupts every preview's sampling — catch it at build time instead.
+    #[test]
+    fn shader_hf_tex_res_matches_rust() {
+        let src = include_str!("../../assets/shaders/worldgen_preview.wgsl");
+        // Find `const HF_TEX_RES: f32 = <N>.0;` and parse the integer part.
+        let line = src
+            .lines()
+            .find(|l| l.contains("HF_TEX_RES") && l.contains("const"))
+            .expect("worldgen_preview.wgsl declares `const HF_TEX_RES`");
+        let rhs = line.split('=').nth(1).expect("HF_TEX_RES has an `= value`").trim();
+        let digits: String = rhs.chars().take_while(|c| c.is_ascii_digit()).collect();
+        let shader_res: usize = digits.parse().expect("HF_TEX_RES value is numeric");
+        assert_eq!(
+            shader_res, HEIGHTFIELD_RES,
+            "HF_TEX_RES in worldgen_preview.wgsl ({shader_res}) != HEIGHTFIELD_RES in \
+             worldgen_gpu_preview.rs ({HEIGHTFIELD_RES})"
         );
     }
 }

@@ -11,7 +11,7 @@ struct PreviewParams {
     fwd: vec4<f32>,    // xyz = forward,     w = world half-extent Z (m)
     right: vec4<f32>,  // xyz = right,       w = height min (m)
     up: vec4<f32>,     // xyz = up,          w = height max (m)
-    levels: vec4<f32>, // sea, snow, water-depth, res(px)
+    levels: vec4<f32>, // sea, snow, water-depth, (unused)
     flags: vec4<f32>,  // x = mode (0 = 3D orbit, 1 = 2D top-down ortho), y = halfX (m), z = halfZ (m)
 };
 
@@ -47,7 +47,12 @@ fn hf_at(world_xz: vec2<f32>) -> vec4<f32> {
 
 // Slab ray–AABB → (tmin, tmax); .z < 0 means miss.
 fn ray_box(o: vec3<f32>, d: vec3<f32>, bmin: vec3<f32>, bmax: vec3<f32>) -> vec3<f32> {
-    let inv = 1.0 / d;
+    // Safe inverse: a zero (axis-aligned) direction component would make 1/d = ±inf and then 0*inf = NaN
+    // in the slab products. Floor |d| to a tiny epsilon, keeping the original sign (and +eps for exact 0),
+    // so the slab for that axis is effectively unbounded instead of NaN.
+    let eps = vec3<f32>(1e-6);
+    let safe_d = select(d, max(abs(d), eps) * sign(d + vec3<f32>(1e-30)), abs(d) < eps);
+    let inv = 1.0 / safe_d;
     let t1 = (bmin - o) * inv;
     let t2 = (bmax - o) * inv;
     let tmn = max(max(min(t1.x, t2.x), min(t1.y, t2.y)), min(t1.z, t2.z));
@@ -56,7 +61,8 @@ fn ray_box(o: vec3<f32>, d: vec3<f32>, bmin: vec3<f32>, bmax: vec3<f32>) -> vec3
     return vec3<f32>(0.0, 0.0, -1.0);
 }
 
-// Absolute-height + sea-level colour ramp (mirrors the CPU height_color_rgb).
+// Absolute-height + sea-level colour ramp. This shader is the single source for preview colour — the CPU
+// bake only writes height + normal; nothing on the CPU re-implements this ramp.
 fn land_ramp(t: f32) -> vec3<f32> {
     let beach = vec3<f32>(0.76, 0.70, 0.50);
     let grass = vec3<f32>(0.24, 0.55, 0.35);
