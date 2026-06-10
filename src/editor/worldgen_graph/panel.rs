@@ -24,7 +24,7 @@ use super::preview::{
     nav_hash, popped_preview_window,
 };
 use super::viewer::Viewer;
-use super::{EdNode, WorldGraphEditor, auto_arrange, snarl_to_graph};
+use super::{EdNode, ViewerSignals, WorldGraphEditor, auto_arrange, snarl_to_graph};
 
 pub(super) fn graph_panel(world: &mut World, ui: &mut egui::Ui) {
     // Seed the editor once by LOADING the graph from disk (the saved .worldgraph.ron / .graph.ron, falling
@@ -106,10 +106,10 @@ pub(super) fn graph_panel(world: &mut World, ui: &mut egui::Ui) {
             }
             if ui.button("Auto-arrange").on_hover_text("Lay nodes out left→right by dependency depth").clicked() {
                 // Arrange the CURRENTLY shown level (inside a biome, not the top graph).
-                let WorldGraphEditor { snarl, nav, body_size, .. } = &mut *editor;
+                let WorldGraphEditor { snarl, nav, caches, .. } = &mut *editor;
                 let vd = valid_depth(snarl, nav);
                 nav.truncate(vd);
-                auto_arrange(current_snarl_mut(snarl, nav), body_size);
+                auto_arrange(current_snarl_mut(snarl, nav), &caches.body_size);
                 editor.status = "arranged".into();
             }
         });
@@ -161,7 +161,7 @@ pub(super) fn graph_panel(world: &mut World, ui: &mut egui::Ui) {
         if let Some(node) = editor.hovered_preview.take() {
             let scroll = ui.input(|i| i.smooth_scroll_delta.y);
             if scroll != 0.0 {
-                let h = editor.zoom_half_m.entry(node).or_insert(PREVIEW_HALF_M);
+                let h = editor.caches.zoom_half_m.entry(node).or_insert(PREVIEW_HALF_M);
                 apply_scroll_zoom(ui, scroll, h);
             }
         }
@@ -174,40 +174,15 @@ pub(super) fn graph_panel(world: &mut World, ui: &mut egui::Ui) {
 
         // Show the snarl at the current nav depth. Disjoint borrows: `snarl`+`nav` resolve the level;
         // the rest are the per-node preview caches the Viewer drives.
-        editor.enter = None;
-        editor.pop_request = None;
-        editor.to_panel = None;
+        editor.signals = ViewerSignals::default();
         {
-            let WorldGraphEditor {
-                snarl,
-                nav,
-                collapsed,
-                zoom_half_m,
-                surface,
-                cam,
-                body_size,
-                disp_px,
-                pan,
-                hovered_preview,
-                enter,
-                pop_request,
-                to_panel,
-                ..
-            } = &mut *editor;
+            let WorldGraphEditor { snarl, nav, caches, signals, hovered_preview, .. } = &mut *editor;
             let current = current_snarl_mut(snarl, nav);
             let mut viewer = Viewer {
-                collapsed,
-                zoom_half_m,
-                surface,
-                cam,
-                body_size,
-                disp_px,
-                enter,
-                pop_request,
-                to_panel,
+                caches,
+                signals,
                 gpu_tex: &gpu_tex,
                 gpu_reqs: &mut gpu_reqs,
-                pan,
                 hovered_preview,
                 level_salt,
             };
@@ -226,17 +201,17 @@ pub(super) fn graph_panel(world: &mut World, ui: &mut egui::Ui) {
             editor.rearrange();
         }
         // Descend into a biome the user opened this frame.
-        if let Some(id) = editor.enter.take() {
+        if let Some(id) = editor.signals.enter.take() {
             editor.nav.push(id);
             editor.clear_node_caches();
         }
         // Retarget the dockable preview panel (snapshotting the node's nav + view state).
-        if let Some(node) = editor.to_panel.take() {
+        if let Some(node) = editor.signals.to_panel.take() {
             let nav = editor.nav.clone();
-            let half = editor.zoom_half_m.get(&node).copied().unwrap_or(PREVIEW_HALF_M);
-            let cam = editor.cam.get(&node).copied().unwrap_or(CAM_DEFAULT);
-            let pan = editor.pan.get(&node).copied().unwrap_or((0.0, 0.0));
-            let is3d = editor.surface.contains(&node);
+            let half = editor.caches.zoom_half_m.get(&node).copied().unwrap_or(PREVIEW_HALF_M);
+            let cam = editor.caches.cam.get(&node).copied().unwrap_or(CAM_DEFAULT);
+            let pan = editor.caches.pan.get(&node).copied().unwrap_or((0.0, 0.0));
+            let is3d = editor.caches.surface.contains(&node);
             if let Some(mut panel) = world.get_resource_mut::<WorldgenPreviewPanel>() {
                 panel.target = Some((nav, node));
                 panel.half = half;
@@ -249,11 +224,11 @@ pub(super) fn graph_panel(world: &mut World, ui: &mut egui::Ui) {
             }
         }
         // Pop a node's preview out into a movable window (snapshotting its current view state + nav path).
-        if let Some(node) = editor.pop_request.take() {
-            let half = editor.zoom_half_m.get(&node).copied().unwrap_or(PREVIEW_HALF_M);
-            let is3d = editor.surface.contains(&node);
-            let cam = editor.cam.get(&node).copied().unwrap_or(CAM_DEFAULT);
-            let size = editor.disp_px.get(&node).copied().unwrap_or(DEFAULT_PREVIEW_PX).max(260.0);
+        if let Some(node) = editor.signals.pop_request.take() {
+            let half = editor.caches.zoom_half_m.get(&node).copied().unwrap_or(PREVIEW_HALF_M);
+            let is3d = editor.caches.surface.contains(&node);
+            let cam = editor.caches.cam.get(&node).copied().unwrap_or(CAM_DEFAULT);
+            let size = editor.caches.disp_px.get(&node).copied().unwrap_or(DEFAULT_PREVIEW_PX).max(260.0);
             let nav = editor.nav.clone();
             let id = editor.next_pop_id;
             editor.next_pop_id += 1;

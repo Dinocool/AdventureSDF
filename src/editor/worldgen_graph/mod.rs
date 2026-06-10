@@ -54,15 +54,11 @@ pub enum EdNode {
     Output,
 }
 
-/// Editor state: the working Snarl graph, whether it's been seeded from the live `WorldGraph` yet, and
-/// the RON save/load path.
-#[derive(Resource)]
-pub struct WorldGraphEditor {
-    snarl: Snarl<EdNode>,
-    seeded: bool,
-    path: String,
-    /// Last save/load status message (shown in the toolbar).
-    status: String,
+/// Per-node UI caches the Viewer drives, keyed by `NodeId`. `NodeId`s are per-snarl-level (a fresh id
+/// namespace each level), so the whole set is cleared on navigation — see [`WorldGraphEditor::
+/// clear_node_caches`] (one assignment, can't miss a map).
+#[derive(Default)]
+struct NodeCaches {
     /// Which nodes have their preview COLLAPSED. Previews are on by default, so absence ⇒ open.
     collapsed: std::collections::HashSet<NodeId>,
     /// Per-node preview zoom: half-extent (metres) of the sampled world window. Absence ⇒ default. Shared
@@ -80,21 +76,42 @@ pub struct WorldGraphEditor {
     disp_px: std::collections::HashMap<NodeId, f32>,
     /// Per-node pan: world-XZ centre offset of the sampled window (drag-pan / scroll over the preview).
     pan: std::collections::HashMap<NodeId, (f64, f64)>,
+}
+
+/// One-shot signals the Viewer raises during a graph show, drained by `graph_panel` right after (each is
+/// a "the user clicked X this frame" request). Reset to default before every show.
+#[derive(Default)]
+struct ViewerSignals {
+    /// Set to a biome node id when the user clicks its "Open" — the panel descends after the show.
+    enter: Option<NodeId>,
+    /// Set to a node id when the user clicks its pop-out button — the panel opens a window after the show.
+    pop_request: Option<NodeId>,
+    /// Set to a node id when the user clicks "→ panel" — the panel retargets the dockable preview panel.
+    to_panel: Option<NodeId>,
+}
+
+/// Editor state: the working Snarl graph, whether it's been seeded from the live `WorldGraph` yet, and
+/// the RON save/load path.
+#[derive(Resource)]
+pub struct WorldGraphEditor {
+    snarl: Snarl<EdNode>,
+    seeded: bool,
+    path: String,
+    /// Last save/load status message (shown in the toolbar).
+    status: String,
+    /// Per-node UI caches (collapsed/zoom/surface/cam/body_size/disp_px/pan), all cleared on navigation.
+    caches: NodeCaches,
     /// Which inline preview image the pointer was over last frame — so `graph_panel` can intercept the
     /// scroll-zoom for it BEFORE egui-snarl applies its own (graph) zoom.
     hovered_preview: Option<NodeId>,
     /// Navigation stack of biome nodes we've descended into (empty ⇒ the top "World" graph). The shown
     /// snarl is `snarl` walked through each biome's sub-graph. (Distinct from `path`, the save file path.)
     nav: Vec<NodeId>,
-    /// Set by the Viewer when the user clicks a biome's "Open"; the panel descends into it after the show.
-    enter: Option<NodeId>,
+    /// One-shot Viewer→panel signals (Open / pop-out / → panel), drained each frame after the show.
+    signals: ViewerSignals,
     /// Previews "popped out" into floating windows (drag anywhere, incl. over the top panel). Each is
     /// self-contained so it survives navigation and doesn't clash with the in-graph preview caches.
     popped: Vec<PoppedPreview>,
-    /// Set by the Viewer when the user clicks a node's pop-out button; the panel snapshots it after show.
-    pop_request: Option<NodeId>,
-    /// Set by the Viewer when the user clicks "→ panel"; the panel retargets the dockable preview panel.
-    to_panel: Option<NodeId>,
     /// Monotonic id source for popped windows (their stable GPU pool key).
     next_pop_id: u64,
     /// Set after a graph is seeded/loaded; the panel auto-arranges once the nodes have been measured.
@@ -108,19 +125,11 @@ impl Default for WorldGraphEditor {
             seeded: false,
             path: DEFAULT_GRAPH_PATH.to_string(),
             status: String::new(),
-            collapsed: std::collections::HashSet::new(),
-            zoom_half_m: std::collections::HashMap::new(),
-            surface: std::collections::HashSet::new(),
-            cam: std::collections::HashMap::new(),
-            body_size: std::collections::HashMap::new(),
-            disp_px: std::collections::HashMap::new(),
-            pan: std::collections::HashMap::new(),
+            caches: NodeCaches::default(),
             hovered_preview: None,
             nav: Vec::new(),
-            enter: None,
+            signals: ViewerSignals::default(),
             popped: Vec::new(),
-            pop_request: None,
-            to_panel: None,
             next_pop_id: 1000,
             needs_arrange: true,
         }
@@ -131,19 +140,13 @@ impl WorldGraphEditor {
     /// Drop all per-node UI caches — called on navigation, since `NodeId`s are per-snarl-level (a fresh
     /// id namespace each level) so caches must not bleed between levels.
     fn clear_node_caches(&mut self) {
-        self.collapsed.clear();
-        self.zoom_half_m.clear();
-        self.surface.clear();
-        self.cam.clear();
-        self.body_size.clear();
-        self.disp_px.clear();
-        self.pan.clear();
+        self.caches = NodeCaches::default();
     }
 
     /// Auto-arrange the top-level snarl (plain `&mut self` so the disjoint snarl/body_size borrows don't
     /// alias through `Mut`'s deref).
     fn rearrange(&mut self) {
-        auto_arrange(&mut self.snarl, &self.body_size);
+        auto_arrange(&mut self.snarl, &self.caches.body_size);
     }
 }
 
