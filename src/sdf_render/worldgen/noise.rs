@@ -275,6 +275,135 @@ pub fn fbm_height(wx: f64, wz: f64, p: &FbmParams) -> f64 {
     h
 }
 
+// ============================================================================================
+// 4-wide SIMD primitives — bit-for-bit identical to the scalar path above.
+//
+// These mirror the scalar `fmix32`/`hash2`/`value_at_lattice`/`fade(_deriv)`/`value_noise_grad`/
+// `fbm_height_grad` EXACTLY: same op order, no `mul_add`/FMA, no reassociation. They exist purely to
+// process the columnar height grid 4 points at a time (the gen hot path); the scalar functions remain
+// the SSOT reference, and `x4_matches_scalar` (tests) `to_bits()`-pins the equality.
+//
+// ## Why this is bit-exact (the determinism invariant holds)
+// * **Integer ops** (`fmix32_x4`/`hash2_x4`): `wide`'s `u32x4` xor / wrapping-`mul` / shift are exact
+//   wrapping integer arithmetic on every target (SSE2/NEON intrinsics + a scalar `wrapping_*` fallback),
+//   identical to scalar `^`/`wrapping_mul`/`>>`.
+// * **`f64`→`i32` lane step**: scalar does `x.floor() as i32`. `f64x4::floor()` is IEEE correctly-rounded
+//   floor (hardware `roundpd`, or scalar `f64::floor()` fallback) ⇒ same bits as scalar `floor`. The
+//   truncating `as i32` of an already-floored value is then done per lane in scalar (`wide` has no
+//   `f64x4→i32x4`); for floored, in-range values that truncation is exact and matches scalar bit-for-bit.
+// * **`i32`→`f64` (`value_at_lattice_x4`)**: `f64x4::from(i32x4)` is `_mm256_cvtepi32_pd` / per-lane
+//   `as f64`; every `i32` is exactly representable in `f64`, so it equals scalar `(h as i32) as f64`.
+// * **fade / blend / gradient**: only `+ - *` on `f64x4` (lanewise = scalar splat op), same Horner /
+//   blend / chain-rule expression tree as scalar ⇒ correctly-rounded per IEEE-754 ⇒ identical bits.
+
+use wide::{f64x4, i32x4, u32x4};
+
+/// 4-wide [`fmix32`]: same xor-shift + wrapping-multiply finalizer per lane.
+#[inline]
+fn fmix32_x4(mut h: u32x4) -> u32x4 {
+    h ^= h >> 16;
+    h = h * u32x4::splat(0x85eb_ca6b);
+    h ^= h >> 13;
+    h = h * u32x4::splat(0xc2b2_ae35);
+    h ^= h >> 16;
+    h
+}
+
+/// 4-wide [`hash2`]: combines four `(ix, iz)` lattice coords (signed, reinterpreted as `u32` exactly
+/// like scalar `as u32`) with the shared `seed`, then avalanches with [`fmix32_x4`].
+#[inline]
+fn hash2_x4(ix: i32x4, iz: i32x4, seed: u32) -> u32x4 {
+    // `i32x4 → u32x4` is a pure bit reinterpret (same bytes), matching scalar `ix as u32`.
+    let ixu: u32x4 = bytemuck::cast(ix);
+    let izu: u32x4 = bytemuck::cast(iz);
+    let mut h = u32x4::splat(seed);
+    h += ixu * u32x4::splat(0x9E37_79B1);
+    h += izu * u32x4::splat(0x85EB_CA77);
+    fmix32_x4(h)
+}
+
+/// 4-wide [`value_at_lattice`]: hash → reinterpret as signed `i32` → `f64` → × `1/2³¹` (exact).
+#[inline]
+fn value_at_lattice_x4(ix: i32x4, iz: i32x4, seed: u32) -> f64x4 {
+    let h = hash2_x4(ix, iz, seed);
+    // `(hash as i32)`: bit reinterpret; `as f64`: exact (i32 ⊂ f64 mantissa).
+    let hi: i32x4 = bytemuck::cast(h);
+    f64x4::from(hi) * (1.0 / 2_147_483_648.0)
+}
+
+/// 4-wide [`fade`]: quintic `6t⁵ − 15t⁴ + 10t³`, same Horner form (`+ - *` only).
+#[inline]
+fn fade_x4(t: f64x4) -> f64x4 {
+    t * t * t * (t * (t * 6.0 - 15.0) + 10.0)
+}
+
+/// 4-wide [`fade_deriv`]: `30t²(t−1)²` = `30t²(t² − 2t + 1)`. EXACT same association as scalar
+/// (`30.0 * t * t * …`, i.e. `((30·t)·t)·…`) — NOT reassociated, so the bits match.
+#[inline]
+fn fade_deriv_x4(t: f64x4) -> f64x4 {
+    f64x4::splat(30.0) * t * t * (t * (t - 2.0) + 1.0)
+}
+
+/// 4-wide [`value_noise_grad`]: floors `(x, z)` per lane (bit-exact `floor` + per-lane `as i32`), then
+/// runs the identical faded-bilinear blend + analytic gradient on `f64x4`. Returns `(v, ∂v/∂x, ∂v/∂z)`.
+#[inline]
+fn value_noise_grad_x4(x: f64x4, z: f64x4, seed: u32) -> (f64x4, f64x4, f64x4) {
+    let xi = x.floor();
+    let zi = z.floor();
+    // f64→i32 per lane (wide has no f64x4→i32x4): scalar `as i32` of an already-floored value is exact.
+    let xa = xi.to_array();
+    let za = zi.to_array();
+    let ix = i32x4::new([xa[0] as i32, xa[1] as i32, xa[2] as i32, xa[3] as i32]);
+    let iz = i32x4::new([za[0] as i32, za[1] as i32, za[2] as i32, za[3] as i32]);
+    let one = i32x4::splat(1);
+
+    let fx = x - xi; // fractional position in [0,1) within the cell
+    let fz = z - zi;
+
+    let v00 = value_at_lattice_x4(ix, iz, seed);
+    let v10 = value_at_lattice_x4(ix + one, iz, seed);
+    let v01 = value_at_lattice_x4(ix, iz + one, seed);
+    let v11 = value_at_lattice_x4(ix + one, iz + one, seed);
+
+    let u = fade_x4(fx);
+    let v = fade_x4(fz);
+    let du = fade_deriv_x4(fx);
+    let dv = fade_deriv_x4(fz);
+
+    let a = v00 + (v10 - v00) * u;
+    let b = v01 + (v11 - v01) * u;
+    let value = a + (b - a) * v;
+
+    let da_dx = (v10 - v00) * du;
+    let db_dx = (v11 - v01) * du;
+    let dval_dx = da_dx + (db_dx - da_dx) * v;
+    let dval_dz = (b - a) * dv;
+
+    (value, dval_dx, dval_dz)
+}
+
+/// 4-wide [`fbm_height_grad`]: identical octave loop (per-octave seed, frequency/amplitude chain) on
+/// `f64x4`, summing [`value_noise_grad_x4`] over 4 world points at once. Returns `(h, ∂h/∂wx, ∂h/∂wz)`.
+#[inline]
+pub fn fbm_height_grad_x4(wx: f64x4, wz: f64x4, p: &FbmParams) -> (f64x4, f64x4, f64x4) {
+    let mut freq = p.base_freq;
+    let mut amp = p.amplitude;
+    let mut h = f64x4::splat(0.0);
+    let mut dh_dx = f64x4::splat(0.0);
+    let mut dh_dz = f64x4::splat(0.0);
+    for o in 0..p.octaves {
+        let oseed = p.seed.wrapping_add(o.wrapping_mul(0x9E37_79B9));
+        let (v, gx, gz) = value_noise_grad_x4(wx * freq, wz * freq, oseed);
+        h += v * amp;
+        // Match scalar association EXACTLY: `gx * amp * freq` = `(gx·amp)·freq`, NOT `gx·(amp·freq)`.
+        dh_dx += gx * amp * freq;
+        dh_dz += gz * amp * freq;
+        freq *= p.lacunarity;
+        amp *= p.gain;
+    }
+    (h, dh_dx, dh_dz)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -471,6 +600,64 @@ mod tests {
         for &(wx, wz) in &[(0.0, 0.0), (123.0, 456.0), (-789.0, -1011.0)] {
             let (hh, _, _) = fbm_height_grad(wx, wz, &p);
             assert!(hh.abs() <= bound + 1e-6, "fBm height {hh} exceeds amplitude bound {bound}");
+        }
+    }
+
+    /// HARD GATE: the 4-wide SIMD primitives are `to_bits()`-IDENTICAL to the scalar
+    /// `value_noise_grad` / `fbm_height_grad` over a spread of coordinates — negatives, lattice
+    /// boundaries (`x.floor()` edge cases), large magnitudes, and fractional positions. This is the
+    /// local guard that the SIMD octave sum did not reassociate / contract into an FMA / diverge in the
+    /// `f64↔i32` step. If this ever fails, the gen path is NO LONGER bit-portable — do not ship it.
+    #[test]
+    fn x4_matches_scalar() {
+        let seed = 0xC0FF_EE17u32;
+        // A spread including exact integers (floor boundary), negatives, sub-cell fractions, and large
+        // coords where f64 spacing > 1 (stress the floor / `as i32` lane step).
+        let xs = [
+            -3.0, -2.999_999, -0.5, 0.0, 0.137, 0.999_999, 1.0, 1.5, 7.25, -12.75, 1000.5,
+            -1_000_000.25, 123_456.789, -7.0, 4.000_000_1, 0.333_333_333,
+        ];
+        let zs = [
+            4.1, 4.0, 0.5, 0.0, -0.137, 2.000_001, -1.0, -1.5, -8.5, 13.25, -500.25, 2_000_000.5,
+            -654_321.123, 9.0, -3.999_999_9, 0.666_666_666,
+        ];
+
+        // value_noise_grad parity, processed 4 at a time.
+        for c in 0..(xs.len() / 4) {
+            let i = c * 4;
+            let xv = f64x4::new([xs[i], xs[i + 1], xs[i + 2], xs[i + 3]]);
+            let zv = f64x4::new([zs[i], zs[i + 1], zs[i + 2], zs[i + 3]]);
+            let (v, gx, gz) = value_noise_grad_x4(xv, zv, seed);
+            let (va, gxa, gza) = (v.to_array(), gx.to_array(), gz.to_array());
+            for l in 0..4 {
+                let (sv, sgx, sgz) = value_noise_grad(xs[i + l], zs[i + l], seed);
+                assert_eq!(va[l].to_bits(), sv.to_bits(), "value mismatch at ({},{})", xs[i + l], zs[i + l]);
+                assert_eq!(gxa[l].to_bits(), sgx.to_bits(), "∂x mismatch at ({},{})", xs[i + l], zs[i + l]);
+                assert_eq!(gza[l].to_bits(), sgz.to_bits(), "∂z mismatch at ({},{})", xs[i + l], zs[i + l]);
+            }
+        }
+
+        // fbm_height_grad parity across several param sets (incl. the production ~13-octave count).
+        let param_sets = [
+            FbmParams { octaves: 13, base_freq: 1.0 / 1024.0, lacunarity: 2.0, gain: 0.5, amplitude: 64.0, seed },
+            FbmParams { octaves: 1, base_freq: 0.01, lacunarity: 2.0, gain: 0.5, amplitude: 100.0, seed: 1 },
+            FbmParams { octaves: 7, base_freq: 1.0 / 333.0, lacunarity: 1.97, gain: 0.51, amplitude: 48.0, seed: 0xABCD },
+            FbmParams::default(),
+        ];
+        for p in &param_sets {
+            for c in 0..(xs.len() / 4) {
+                let i = c * 4;
+                let xv = f64x4::new([xs[i], xs[i + 1], xs[i + 2], xs[i + 3]]);
+                let zv = f64x4::new([zs[i], zs[i + 1], zs[i + 2], zs[i + 3]]);
+                let (h, gx, gz) = fbm_height_grad_x4(xv, zv, p);
+                let (ha, gxa, gza) = (h.to_array(), gx.to_array(), gz.to_array());
+                for l in 0..4 {
+                    let (sh, sgx, sgz) = fbm_height_grad(xs[i + l], zs[i + l], p);
+                    assert_eq!(ha[l].to_bits(), sh.to_bits(), "fBm h mismatch at ({},{}) oct={}", xs[i + l], zs[i + l], p.octaves);
+                    assert_eq!(gxa[l].to_bits(), sgx.to_bits(), "fBm ∂x mismatch at ({},{})", xs[i + l], zs[i + l]);
+                    assert_eq!(gza[l].to_bits(), sgz.to_bits(), "fBm ∂z mismatch at ({},{})", xs[i + l], zs[i + l]);
+                }
+            }
         }
     }
 
