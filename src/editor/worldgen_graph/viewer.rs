@@ -70,24 +70,21 @@ impl SnarlViewer<EdNode> for Viewer<'_> {
     /// its params — no body divider, no empty space (unlike an in-body collapse button).
     fn show_header(&mut self, node: NodeId, _inputs: &[InPin], _outputs: &[OutPin], ui: &mut egui::Ui, snarl: &mut Snarl<EdNode>) {
         let title = self.title(&snarl[node]);
-        let has_preview = matches!(snarl.get_node(node), Some(EdNode::Op(_) | EdNode::Biome { .. }));
-        // Span the body width (measured last frame) so the eye sits at the RIGHT edge, past the title.
-        let want_w = self.caches.body_size.get(&node).map_or(0.0, |s| s.x);
-        ui.horizontal(|ui| {
-            ui.set_min_width(want_w);
+        if !matches!(snarl.get_node(node), Some(EdNode::Op(_) | EdNode::Biome { .. })) {
             ui.label(title);
-            if has_preview {
-                // Right-aligned eye checkbox: lay out from the right edge.
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let nv = self.caches.views.entry(node).or_default();
-                    let mut shown = !nv.collapsed;
-                    if ui.checkbox(&mut shown, icon::EYE).on_hover_text("Show this node's 2D/3D preview").changed() {
-                        // Toggling shows/hides the preview; the node resizes IN PLACE — do NOT re-arrange the
-                        // graph (that would shift every other node, which is jarring).
-                        nv.collapsed = !shown;
-                    }
-                });
+            return;
+        }
+        // Right-align the eye WITHOUT forcing a width: lay the header out right-to-left (eye first = rightmost)
+        // with the title filling the rest from the left. (Do NOT set the header's min width from the measured
+        // body width — that feeds back and the node expands rightward every frame.)
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            let nv = self.caches.views.entry(node).or_default();
+            let mut shown = !nv.collapsed;
+            if ui.checkbox(&mut shown, icon::EYE).on_hover_text("Show this node's 2D/3D preview").changed() {
+                // Toggling shows/hides the preview; the node resizes IN PLACE — no re-arrange (don't shift others).
+                nv.collapsed = !shown;
             }
+            ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| ui.label(title));
         });
     }
 
