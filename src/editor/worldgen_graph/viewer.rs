@@ -99,100 +99,83 @@ impl SnarlViewer<EdNode> for Viewer<'_> {
         ui: &mut egui::Ui,
         snarl: &mut Snarl<EdNode>,
     ) {
-        // Node params / biome header, stacked vertically at the top of the body.
-        match &mut snarl[node] {
-            EdNode::Op(kind) => node_params_ui(ui, kind),
-            EdNode::Biome { name, .. } => {
-                ui.add(egui::TextEdit::singleline(name).desired_width(120.0).hint_text("biome name"));
+        // egui-snarl lays the body out LEFT-TO-RIGHT, so WRAP everything in a vertical stack — otherwise the
+        // preview image sits BESIDE the params and the node ~doubles in size (and won't shrink with it).
+        ui.vertical(|ui| {
+            // Node params / biome header at the top.
+            match &mut snarl[node] {
+                EdNode::Op(kind) => node_params_ui(ui, kind),
+                EdNode::Biome { name, .. } => {
+                    ui.add(egui::TextEdit::singleline(name).desired_width(120.0).hint_text("biome name"));
+                }
+                _ => {}
             }
-            _ => {}
-        }
-        if matches!(snarl.get_node(node), Some(EdNode::Biome { .. }))
-            && ui.button(format!("{} Open", icon::CARET_RIGHT)).on_hover_text("Edit this biome's sub-graph").clicked()
-        {
-            self.signals.enter = Some(node);
-        }
+            if matches!(snarl.get_node(node), Some(EdNode::Biome { .. }))
+                && ui.button(format!("{} Open", icon::CARET_RIGHT)).on_hover_text("Edit this biome's sub-graph").clicked()
+            {
+                self.signals.enter = Some(node);
+            }
 
-        // Preview hidden (the header eye is unchecked) ⇒ the body is just the params above — no divider,
-        // no preview, no wasted space. The node stays compact.
-        if self.caches.views.entry(node).or_default().collapsed {
-            self.caches.body_size.insert(node, ui.min_rect().size());
-            return;
-        }
-        // Divider between the node params (above) and the preview section (below).
-        ui.separator();
+            // Preview hidden (header eye unchecked) ⇒ body is just the params above — compact, no divider.
+            if self.caches.views.entry(node).or_default().collapsed {
+                return;
+            }
+            ui.separator();
 
-        // Open: the preview IMAGE, then a compact controls row BELOW it (so the node height tracks the size).
-        let view = *self.caches.views.entry(node).or_default();
-        let is3d = view.surface;
-        let size = view.disp_px;
-        // Render at the displayed size in physical pixels (no cap) so the preview is always crisp.
-        let ppp = ui.ctx().pixels_per_point();
-        let res = ((size * ppp).round() as usize).max(32);
-        let half = view.zoom_half_m;
-        let (yaw, pitch) = view.cam;
-        let (cx, cz) = view.pan;
+            let view = *self.caches.views.entry(node).or_default();
+            let is3d = view.surface;
+            let size = view.disp_px;
+            // Render at the displayed size in physical pixels (no cap) so the preview is always crisp.
+            let res = ((size * ui.ctx().pixels_per_point()).round() as usize).max(32);
+            let half = view.zoom_half_m;
+            let (yaw, pitch) = view.cam;
+            let (cx, cz) = view.pan;
 
-        match graph_rooted_at(snarl, node) {
-            Ok(g) => {
-                // Both 2D and 3D render on the GPU pool (one shader, one `height_colour` SSOT). Push a
-                // request and draw last frame's pool texture.
-                let gkey = gpu_inline_key(self.level_salt, node);
-                let view = PreviewView { half, cx, cz, yaw, pitch };
-                self.gpu_reqs.push(view.to_request(gkey, g, is3d, res as u32));
-                let tex = self.gpu_tex.get(&gkey).copied();
-                // The preview image (a flat placeholder for the ~1 frame before the GPU texture warms up)
-                // with on-image gestures: scroll = zoom, drag = orbit (3D) / pan (2D), right-drag = pan (3D).
-                let img_resp = preview_image(ui, tex, egui::vec2(size, size));
-                // Scale-label overlay: the visible world width, in a corner of the preview.
-                paint_scale_label(ui, img_resp.rect, half);
-                {
-                    // Read the node's view into one PreviewView, apply gestures, write back.
-                    let mut v = PreviewView { half, cx, cz, yaw, pitch };
-                    handle_preview_gestures(&img_resp, is3d, size, &mut v);
-                    let nv = self.caches.views.entry(node).or_default();
-                    nv.zoom_half_m = v.half;
-                    nv.cam = (v.yaw, v.pitch);
-                    nv.pan = (v.cx, v.cz);
-                }
-                // Record hover so the panel can intercept this preview's scroll-zoom next frame (before
-                // egui-snarl applies its own graph zoom).
-                if img_resp.hovered() {
-                    *self.hovered_preview = Some(node);
-                }
-                // Drag-resize grip at the image's bottom-right corner (its own widget rect, so its drag is
-                // separate from the image's orbit/pan gesture); grows/shrinks `disp_px`, clamped 64..=1024.
-                if let Some(delta) = preview_resize_grip(ui, img_resp.rect) {
-                    let sz = &mut self.caches.views.entry(node).or_default().disp_px;
-                    *sz = (*sz + delta).clamp(64.0, 1024.0);
-                }
-                // Compact controls in ONE row BELOW the image, so the node height tracks the preview size (a
-                // tall side column would pin the height and stop the node shrinking when you resize down).
-                ui.horizontal(|ui| {
-                    if ui.small_button(icon::ARROWS_OUT).on_hover_text("Pop out into a movable window").clicked() {
-                        self.signals.pop_request = Some(node);
-                    }
-                    if ui.small_button(icon::PICTURE_IN_PICTURE).on_hover_text("Show in a dockable preview panel").clicked() {
-                        self.signals.to_panel = Some(node);
-                    }
-                    if ui.selectable_label(is3d, "3D").on_hover_text("3D surface (drag the image to orbit)").clicked() {
-                        self.caches.views.entry(node).or_default().surface = !is3d;
-                    }
-                    let h = &mut self.caches.views.entry(node).or_default().zoom_half_m;
-                    let mut km = *h * 2.0 / 1000.0;
-                    if ui
-                        .add(egui::DragValue::new(&mut km).speed(0.25).range(0.05..=512.0).suffix(" km"))
-                        .on_hover_text("Zoom: width of the sampled world window")
-                        .changed()
+            match graph_rooted_at(snarl, node) {
+                Ok(g) => {
+                    // Both 2D and 3D render on the GPU pool (one shader, one `height_colour` SSOT).
+                    let gkey = gpu_inline_key(self.level_salt, node);
+                    self.gpu_reqs.push(PreviewView { half, cx, cz, yaw, pitch }.to_request(gkey, g, is3d, res as u32));
+                    let tex = self.gpu_tex.get(&gkey).copied();
+                    // Controls ABOVE the image: a compact icon row (no km field — zoom is scroll on the image).
+                    ui.horizontal(|ui| {
+                        if ui.small_button(icon::ARROWS_OUT).on_hover_text("Pop out into a movable window").clicked() {
+                            self.signals.pop_request = Some(node);
+                        }
+                        if ui.small_button(icon::PICTURE_IN_PICTURE).on_hover_text("Show in a dockable preview panel").clicked() {
+                            self.signals.to_panel = Some(node);
+                        }
+                        if ui.selectable_label(is3d, "3D").on_hover_text("3D surface (drag the image to orbit)").clicked() {
+                            self.caches.views.entry(node).or_default().surface = !is3d;
+                        }
+                    });
+                    // The preview image (placeholder for the ~1 frame before the GPU texture warms up) with
+                    // on-image gestures: scroll = zoom, drag = orbit (3D) / pan (2D), right-drag = pan (3D).
+                    let img_resp = preview_image(ui, tex, egui::vec2(size, size));
+                    paint_scale_label(ui, img_resp.rect, half);
                     {
-                        *h = (km * 1000.0 / 2.0).max(1.0);
+                        let mut v = PreviewView { half, cx, cz, yaw, pitch };
+                        handle_preview_gestures(&img_resp, is3d, size, &mut v);
+                        let nv = self.caches.views.entry(node).or_default();
+                        nv.zoom_half_m = v.half;
+                        nv.cam = (v.yaw, v.pitch);
+                        nv.pan = (v.cx, v.cz);
                     }
-                });
+                    if img_resp.hovered() {
+                        *self.hovered_preview = Some(node);
+                    }
+                    // Drag-resize grip at the image's bottom-right corner (own widget rect, separate from the
+                    // orbit/pan gesture); grows/shrinks `disp_px`, clamped 64..=1024.
+                    if let Some(delta) = preview_resize_grip(ui, img_resp.rect) {
+                        let sz = &mut self.caches.views.entry(node).or_default().disp_px;
+                        *sz = (*sz + delta).clamp(64.0, 1024.0);
+                    }
+                }
+                Err(e) => {
+                    ui.colored_label(egui::Color32::from_rgb(200, 150, 120), format!("connect inputs ({e})"));
+                }
             }
-            Err(e) => {
-                ui.colored_label(egui::Color32::from_rgb(200, 150, 120), format!("connect inputs ({e})"));
-            }
-        }
+        });
         self.caches.body_size.insert(node, ui.min_rect().size());
     }
 
