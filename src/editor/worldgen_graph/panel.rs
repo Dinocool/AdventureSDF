@@ -7,7 +7,6 @@ use std::sync::Arc;
 use bevy::prelude::*;
 use bevy_egui::egui;
 use egui_phosphor::regular as icon;
-use egui_snarl::Snarl;
 use egui_snarl::ui::{SnarlStyle, SnarlWidget};
 
 use crate::assets::Asset as _;
@@ -15,26 +14,31 @@ use crate::editor::worldgen_gpu_preview::{GpuPreviewRequest, GpuPreviewRequests,
 use crate::sdf_render::worldgen::WorldGraph;
 use crate::sdf_render::worldgen::graph::GraphAsset;
 
-use super::convert::{
-    breadcrumb_names, current_snarl_mut, graph_to_snarl, load_editor_snarl, valid_depth, world_biome_snarl,
-    worldgraph_path,
-};
+use super::convert::{breadcrumb_names, current_snarl_mut, valid_depth, world_biome_snarl};
+use super::persist::{apply_view, load_editor_doc, save_editor_doc};
 use super::preview::{
     PoppedPreview, WorldgenPreviewPanel, apply_scroll_zoom, nav_hash, popped_preview_window,
 };
 use super::viewer::Viewer;
-use super::{EdNode, ViewerSignals, WorldGraphEditor, auto_arrange, snarl_to_graph};
+use super::{ViewerSignals, WorldGraphEditor, auto_arrange, snarl_to_graph};
 
 pub(super) fn graph_panel(world: &mut World, ui: &mut egui::Ui) {
     // Seed the editor once by LOADING the graph from disk (the saved .worldgraph.ron / .graph.ron, falling
     // back to the built-in default), and drive the live terrain from it.
     world.resource_scope::<WorldGraphEditor, ()>(|world, mut editor| {
         if !editor.seeded {
-            editor.snarl = load_editor_snarl(&editor.path);
+            // Seed by LOADING the persisted document (snarl + resumable view-state) from disk, then
+            // restore the view (per-node settings, nav, panel target, pop-outs) and drive the world.
+            let (snarl, view) = load_editor_doc(&editor.path);
+            editor.snarl = snarl;
             editor.seeded = true;
+            editor.needs_arrange = true;
             if let Ok(g) = snarl_to_graph(&editor.snarl) {
                 world.resource_mut::<WorldGraph>().0 = Arc::new(g);
             }
+            world.resource_scope::<WorldgenPreviewPanel, ()>(|_w, mut panel| {
+                apply_view(view, &mut editor, &mut panel);
+            });
         }
 
         ui.horizontal(|ui| {
@@ -49,52 +53,35 @@ pub(super) fn graph_panel(world: &mut World, ui: &mut egui::Ui) {
                 }
             }
             // SAVE — write BOTH the compiled flat engine graph (.graph.ron, the world hot-reloads it) AND
-            // the hierarchical editor snarl with biomes (.worldgraph.ron, so the hierarchy survives reload).
-            if ui.button("Save").on_hover_text("Write the flat .graph.ron (world reloads it) + the .worldgraph.ron hierarchy").clicked() {
+            // the versioned editor document with biomes + view-state (.worldgraph.ron, so the hierarchy
+            // AND where-the-user-was survive reload).
+            if ui.button("Save").on_hover_text("Write the flat .graph.ron (world reloads it) + the .worldgraph.ron document").clicked() {
                 editor.status = match snarl_to_graph(&editor.snarl) {
                     Ok(g) => {
                         let flat = (GraphAsset { graph: g }).save(std::path::Path::new(&editor.path));
-                        let wg = worldgraph_path(&editor.path);
-                        let hier = ron::ser::to_string_pretty(&editor.snarl, ron::ser::PrettyConfig::default())
-                            .map_err(|e| e.to_string())
-                            .and_then(|s| std::fs::write(&wg, s).map_err(|e| e.to_string()));
-                        match (flat, hier) {
-                            (Ok(()), Ok(())) => format!("saved {} (+hierarchy)", editor.path),
+                        let doc = world
+                            .resource_scope::<WorldgenPreviewPanel, _>(|_w, panel| save_editor_doc(&editor, &panel));
+                        match (flat, doc) {
+                            (Ok(()), Ok(())) => format!("saved {} (+document)", editor.path),
                             (Err(e), _) => format!("save failed: {e}"),
-                            (_, Err(e)) => format!("flat saved; hierarchy failed: {e}"),
+                            (_, Err(e)) => format!("flat saved; document failed: {e}"),
                         }
                     }
                     Err(e) => format!("invalid: {e}"),
                 };
             }
-            // LOAD — prefer the hierarchical .worldgraph.ron (restores biomes); else the flat .graph.ron.
+            // LOAD — re-read the persisted document (snarl + view-state) and restore the editor + panel,
+            // degrading to the flat graph / default exactly like the startup seed.
             if ui.button("Load").clicked() {
-                let wg = worldgraph_path(&editor.path);
-                editor.status = match std::fs::read_to_string(&wg) {
-                    Ok(s) => match ron::de::from_str::<Snarl<EdNode>>(&s) {
-                        Ok(snarl) => {
-                            editor.snarl = snarl;
-                            editor.nav.clear();
-                            editor.clear_node_caches();
-                            editor.needs_arrange = true;
-                            format!("loaded {wg}")
-                        }
-                        Err(e) => format!("hierarchy parse failed: {e}"),
-                    },
-                    Err(_) => match std::fs::read_to_string(&editor.path) {
-                        Ok(s) => match ron::de::from_str::<GraphAsset>(&s) {
-                            Ok(asset) => {
-                                editor.snarl = graph_to_snarl(&asset.graph);
-                                editor.nav.clear();
-                                editor.clear_node_caches();
-                                editor.needs_arrange = true;
-                                format!("loaded {} (flat)", editor.path)
-                            }
-                            Err(e) => format!("parse failed: {e}"),
-                        },
-                        Err(e) => format!("read failed: {e}"),
-                    },
-                };
+                let (snarl, view) = load_editor_doc(&editor.path);
+                editor.snarl = snarl;
+                editor.nav.clear();
+                editor.clear_node_caches();
+                editor.needs_arrange = true;
+                world.resource_scope::<WorldgenPreviewPanel, ()>(|_w, mut panel| {
+                    apply_view(view, &mut editor, &mut panel);
+                });
+                editor.status = format!("loaded {}", editor.path);
             }
             if ui.button("Reset").on_hover_text("Restore the default multi-biome world graph").clicked() {
                 editor.snarl = world_biome_snarl();

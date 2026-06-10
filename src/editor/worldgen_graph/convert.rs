@@ -1,11 +1,10 @@
 //! Conversion between the engine [`Graph`] and the editor [`Snarl`], the built-in default world graph,
-//! the on-disk load chain, and biome-navigation helpers (drill into a biome's sub-graph / breadcrumb out).
+//! and biome-navigation helpers (drill into a biome's sub-graph / breadcrumb out). The on-disk
+//! load/save chain lives in `persist.rs`.
 
-use bevy::log::warn;
 use bevy_egui::egui;
 use egui_snarl::{InPinId, NodeId, OutPinId, Snarl};
 
-use crate::sdf_render::worldgen::graph::GraphAsset;
 use crate::sdf_render::worldgen::graph::node::{FbmAxis, Graph, NodeKind};
 
 use super::{CLIMATE_INPUTS, EdNode};
@@ -121,28 +120,6 @@ pub(super) fn worldgraph_path(graph_path: &str) -> String {
         Some(stem) => format!("{stem}.worldgraph.ron"),
         None => format!("{graph_path}.worldgraph.ron"),
     }
-}
-
-/// Load the editor graph for `graph_path`: prefer the hierarchical `.worldgraph.ron` (keeps biomes), then
-/// the flat `.graph.ron`, then the built-in default. Used by the startup seed + the Load button so the
-/// editor reflects what's actually on disk rather than a hard-coded graph. A file that's PRESENT but
-/// fails to parse is `warn!`ed (then falls through) so a corrupt save doesn't silently vanish into the
-/// default at startup.
-pub(super) fn load_editor_snarl(graph_path: &str) -> Snarl<EdNode> {
-    let wg = worldgraph_path(graph_path);
-    if let Ok(s) = std::fs::read_to_string(&wg) {
-        match ron::de::from_str::<Snarl<EdNode>>(&s) {
-            Ok(snarl) => return snarl,
-            Err(e) => warn!("worldgen: hierarchical graph '{wg}' is corrupt ({e}); trying the flat graph"),
-        }
-    }
-    if let Ok(s) = std::fs::read_to_string(graph_path) {
-        match ron::de::from_str::<GraphAsset>(&s) {
-            Ok(asset) => return graph_to_snarl(&asset.graph),
-            Err(e) => warn!("worldgen: flat graph '{graph_path}' is corrupt ({e}); using the default world"),
-        }
-    }
-    world_biome_snarl()
 }
 
 // Pin-id shorthands (every node has one output, pin 0).

@@ -48,11 +48,11 @@ impl Default for WorldgenPreviewPanel {
 
 impl WorldgenPreviewPanel {
     /// The panel's view params (half/pan/cam) as a [`PreviewView`].
-    fn view(&self) -> PreviewView {
+    pub(super) fn view(&self) -> PreviewView {
         PreviewView { half: self.half, cx: self.pan.0, cz: self.pan.1, yaw: self.cam.0, pitch: self.cam.1 }
     }
     /// Write a [`PreviewView`] back into the panel's half/pan/cam fields.
-    fn set_view(&mut self, v: PreviewView) {
+    pub(super) fn set_view(&mut self, v: PreviewView) {
         self.half = v.half;
         self.pan = (v.cx, v.cz);
         self.cam = (v.yaw, v.pitch);
@@ -62,7 +62,7 @@ impl WorldgenPreviewPanel {
 /// A preview's view parameters: the sampled world window (half-extent + XZ centre) and the 3D orbit
 /// camera (yaw/pitch). The single carrier for on-image gestures ([`handle_preview_gestures`]) and for
 /// building a [`GpuPreviewRequest`] ([`PreviewView::to_request`]).
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, serde::Serialize, serde::Deserialize)]
 pub(super) struct PreviewView {
     pub(super) half: f64,
     pub(super) cx: f64,
@@ -107,7 +107,7 @@ pub(super) struct PoppedPreview {
 
 impl PoppedPreview {
     /// This window's view params (half/cx/cz/cam) as a [`PreviewView`].
-    fn view(&self) -> PreviewView {
+    pub(super) fn view(&self) -> PreviewView {
         PreviewView { half: self.half, cx: self.cx, cz: self.cz, yaw: self.cam.0, pitch: self.cam.1 }
     }
     /// Write a [`PreviewView`] back into this window's half/cx/cz/cam fields.
