@@ -72,6 +72,7 @@ pub(crate) mod height;
 pub(crate) mod node_gizmos;
 pub(crate) mod overlays;
 pub(crate) mod picking;
+pub(crate) mod player;
 pub mod render;
 pub(crate) mod scatter;
 pub(crate) mod stress;
@@ -460,8 +461,8 @@ impl Plugin for SdfScenePlugin {
             .add_systems(
                 Update,
                 (
-                    editor_camera::orbit_camera.run_if(|m: Res<SdfCameraMode>| !m.fps),
-                    editor_camera::fps_camera.run_if(|m: Res<SdfCameraMode>| m.fps),
+                    editor_camera::orbit_camera.run_if(|m: Res<SdfCameraMode>| !m.fps && !m.player),
+                    editor_camera::fps_camera.run_if(|m: Res<SdfCameraMode>| m.fps && !m.player),
                 )
                     .run_if(in_state(AppScene::SdfEditor))
                     .run_if(|allowed: Res<ViewportInputAllowed>| allowed.0),
@@ -473,7 +474,19 @@ impl Plugin for SdfScenePlugin {
                 Update,
                 editor_camera::ease_orbit_focus
                     .run_if(in_state(AppScene::SdfEditor))
-                    .run_if(|m: Res<SdfCameraMode>| !m.fps),
+                    .run_if(|m: Res<SdfCameraMode>| !m.fps && !m.player),
+            )
+            // PLAYER mode: toggle (P), spawn/despawn, walk the terrain colliders, 3rd-person follow. Ordered
+            // so spawn → move → camera-follow run in one frame; gated to the SDF editor scene.
+            .add_systems(
+                Update,
+                (
+                    player::toggle_player_mode,
+                    player::manage_player.after(player::toggle_player_mode),
+                    player::move_worldgen_player.after(player::manage_player),
+                    player::follow_player_camera.after(player::move_worldgen_player),
+                )
+                    .run_if(in_state(AppScene::SdfEditor)),
             )
             // Gizmo interaction THEN click-selection, both in `Last`, chained so the
             // gizmo claims a handle click before `sdf_picking` would reselect the
