@@ -284,3 +284,65 @@ fn surface_biome_deterministic() {
         assert_eq!(surface_biome(wx, wz, seed), surface_biome(wx, wz, seed));
     }
 }
+
+// ---------------------------------------------------------------------------------------------
+// preview_color SSOT + GPU strata table flatten (preview slice / Stage-3 shader)
+// ---------------------------------------------------------------------------------------------
+
+/// `preview_color` is the SSOT for a material's flat colour — for a flat-colour material it equals
+/// `base_color` exactly (Stage 5 will redefine it to the texture average without touching callers).
+#[test]
+fn preview_color_is_base_color_for_flat_materials() {
+    let lib = shipped_library();
+    for m in &lib.materials {
+        assert_eq!(m.preview_color(), m.base_color, "{} preview_color != base_color", m.name);
+    }
+}
+
+/// The flattened GPU strata table matches `BiomeLibrary` row-for-row: one column per biome in id order,
+/// surface/bedrock/layer colours resolved through `preview_color`, and cumulative layer bottoms equal to
+/// the running sum of `StrataLayer::thickness` — i.e. a depth probe of the table reproduces
+/// `strata_material → preview_color` exactly.
+#[test]
+fn gpu_strata_table_matches_library() {
+    let lib = shipped_library();
+    let table = lib.gpu_strata_table();
+    assert_eq!(table.len(), BiomeId::ALL.len());
+
+    for (i, &biome) in BiomeId::ALL.iter().enumerate() {
+        let def = lib.biome(biome);
+        let col = &table[i];
+        assert_eq!(col.surface_color, lib.material(def.surface).preview_color());
+        assert_eq!(col.bedrock_color, lib.material(def.bedrock).preview_color());
+        assert_eq!(col.layer_count as usize, def.strata.len());
+
+        // Per-layer colour + cumulative bottom depth.
+        let mut cum = 0.0_f32;
+        for (k, layer) in def.strata.iter().enumerate() {
+            cum += layer.thickness;
+            assert_eq!(col.layer_color[k], lib.material(layer.material).preview_color());
+            assert_eq!(col.layer_bottom[k], cum, "biome {biome:?} layer {k} bottom");
+        }
+
+        // A depth probe of the GPU column == the CPU strata walk's colour, across the column.
+        for depth in [-1.0_f32, 0.0, 0.5, 2.5, 6.0, 500.0, 5000.0] {
+            let cpu = lib.material(strata_material(biome, depth as f64, &lib)).preview_color();
+            assert_eq!(gpu_probe(col, depth), cpu, "biome {biome:?} depth {depth}");
+        }
+    }
+}
+
+/// CPU mirror of the WGSL strata-column walk: find the first layer whose cumulative bottom exceeds
+/// `depth`; surface at/above 0, bedrock past the last layer. Used by the table test to assert the GPU
+/// layout reproduces `strata_material`.
+fn gpu_probe(col: &GpuStrataColumn, depth: f32) -> [f32; 4] {
+    if depth <= 0.0 {
+        return col.surface_color;
+    }
+    for k in 0..col.layer_count as usize {
+        if depth < col.layer_bottom[k] {
+            return col.layer_color[k];
+        }
+    }
+    col.bedrock_color
+}

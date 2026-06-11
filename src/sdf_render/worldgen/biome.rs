@@ -311,6 +311,18 @@ pub struct TerrainSurfaceMaterial {
     pub roughness: f32,
 }
 
+impl TerrainSurfaceMaterial {
+    /// The **single source of truth** for "what flat colour represents this material" — used by every
+    /// preview (biome map, strata slice) AND any flat-colour fallback so they always agree. For a
+    /// flat-colour material this IS its `base_color` (linear RGBA). When Stage 5 adds PBR textures this
+    /// becomes the average colour of the diffuse texture (computed once on load) WITHOUT changing any
+    /// caller — they all read `preview_color()`, never `base_color` directly for preview purposes.
+    #[inline]
+    pub fn preview_color(&self) -> [f32; 4] {
+        self.base_color
+    }
+}
+
 /// One stratum in a biome's vertical column: a material occupying `thickness` metres BELOW the layer
 /// above it (so the column is read top-down by accumulating thicknesses). The surface material sits
 /// above the first `StrataLayer`; bedrock fills everything below the last.
@@ -437,6 +449,96 @@ impl BiomeLibrary {
     }
 }
 
+// ============================================================================================
+// GPU strata table (reusable: preview slice AND the Stage-3 in-world surface shader)
+// ============================================================================================
+
+/// Max strata layers (excluding bedrock) the flattened GPU table stores per biome. The demo biomes use 3
+/// (surface band + sub-surface + stone); a fixed cap keeps the table a simple dense array the shader can
+/// index by `(biome * GPU_STRATA_MAX_LAYERS + layer)`. Extra authored layers beyond this are clamped into
+/// the last slot at flatten time (and a debug-assert fires in tests).
+pub const GPU_STRATA_MAX_LAYERS: usize = 6;
+
+/// One biome's flattened strata column for the GPU: each layer's resolved `preview_color` (linear RGBA)
+/// and its cumulative depth *bottom* (metres below the original surface), plus the surface colour and the
+/// bedrock colour. The shader walks `cum_bottom` to find the first layer whose bottom exceeds `depth`,
+/// taking its colour; past the last real layer it uses `bedrock`. This is exactly the CPU
+/// [`strata_material`] walk, pre-resolved to colours so no Whittaker/strata logic is ported to WGSL.
+///
+/// `bytemuck`-able + `std430`-friendly layout (all `[f32;4]` / `f32` / `u32`, 16-byte aligned by padding)
+/// so it uploads straight into a storage/uniform buffer in both the preview and Stage-3 pipelines.
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[repr(C)]
+pub struct GpuStrataColumn {
+    /// `surface` material colour (depth ≤ 0), linear RGBA.
+    pub surface_color: [f32; 4],
+    /// Per-layer colour (linear RGBA), `[GPU_STRATA_MAX_LAYERS]`; slots past `layer_count` are unused.
+    pub layer_color: [[f32; 4]; GPU_STRATA_MAX_LAYERS],
+    /// Per-layer cumulative BOTTOM depth (metres). `layer_bottom[i]` = Σ thickness up to & incl. layer i.
+    /// Stored as `[f32;4]` groups so the whole struct stays 16-byte aligned for std140/std430.
+    pub layer_bottom: [f32; GPU_STRATA_MAX_LAYERS],
+    /// Bedrock colour (linear RGBA) — fills depth below the last layer.
+    pub bedrock_color: [f32; 4],
+    /// Number of real layers (≤ [`GPU_STRATA_MAX_LAYERS`]).
+    pub layer_count: u32,
+    /// Padding to keep the trailing scalars 16-byte aligned (3 × u32).
+    pub _pad: [u32; 3],
+}
+
+impl Default for GpuStrataColumn {
+    fn default() -> Self {
+        Self {
+            surface_color: [0.0; 4],
+            layer_color: [[0.0; 4]; GPU_STRATA_MAX_LAYERS],
+            layer_bottom: [0.0; GPU_STRATA_MAX_LAYERS],
+            bedrock_color: [0.0; 4],
+            layer_count: 0,
+            _pad: [0; 3],
+        }
+    }
+}
+
+impl BiomeLibrary {
+    /// Flatten this library into the per-biome GPU strata table (one [`GpuStrataColumn`] per [`BiomeId`],
+    /// in id order). Resolves every `TerrainMatId` to its material's [`preview_color`](TerrainSurfaceMaterial::preview_color)
+    /// and accumulates layer thicknesses into cumulative bottom-depths — the exact data the preview-slice
+    /// shader AND the Stage-3 in-world surface shader index by `(biome, depth)`. Built REUSABLY (this is
+    /// the one flatten both consumers call), not throwaway. A biome with more than [`GPU_STRATA_MAX_LAYERS`]
+    /// strata clamps the overflow into the last slot (its bottom extended to the last layer's bottom).
+    pub fn gpu_strata_table(&self) -> Vec<GpuStrataColumn> {
+        BiomeId::ALL
+            .iter()
+            .map(|&id| {
+                let def = self.biome(id);
+                let mut col = GpuStrataColumn {
+                    surface_color: self.material(def.surface).preview_color(),
+                    bedrock_color: self.material(def.bedrock).preview_color(),
+                    ..Default::default()
+                };
+                let mut cum = 0.0_f32;
+                let mut n = 0usize;
+                for layer in &def.strata {
+                    cum += layer.thickness;
+                    let slot = n.min(GPU_STRATA_MAX_LAYERS - 1);
+                    col.layer_color[slot] = self.material(layer.material).preview_color();
+                    col.layer_bottom[slot] = cum;
+                    if n < GPU_STRATA_MAX_LAYERS {
+                        n += 1;
+                    }
+                }
+                debug_assert!(
+                    def.strata.len() <= GPU_STRATA_MAX_LAYERS,
+                    "biome {:?} has {} strata > GPU_STRATA_MAX_LAYERS {GPU_STRATA_MAX_LAYERS}",
+                    id,
+                    def.strata.len()
+                );
+                col.layer_count = n as u32;
+                col
+            })
+            .collect()
+    }
+}
+
 /// Loads `assets/worldgen/biomes.ron` into a [`BiomeLibraryAsset`] — plain RON deserialization (mirrors
 /// `GraphAssetLoader` / `MaterialAssetLoader`).
 #[derive(Default, bevy::reflect::TypePath)]
@@ -542,7 +644,7 @@ pub fn strata_material(biome: BiomeId, depth: f64, lib: &BiomeLibrary) -> Terrai
 pub fn terrain_color(wx: f64, wz: f64, depth: f64, seed: u64, lib: &BiomeLibrary) -> [f32; 4] {
     let sample = surface_biome(wx, wz, seed);
     let mat = strata_material(sample.primary, depth, lib);
-    lib.material(mat).base_color
+    lib.material(mat).preview_color()
 }
 
 #[cfg(test)]
