@@ -215,7 +215,7 @@ pub fn classify(t: f64, h: f64) -> BiomeSample {
     // is `(distance_to_border, neighbour_biome)`; we keep the minimum distance.
     let mut best_dist = f64::INFINITY;
     let mut secondary = primary;
-    for (dist, neigh, _axis) in neighbour_borders(t, h, primary) {
+    for (dist, neigh, _axis, _signed) in neighbour_borders(t, h, primary) {
         if dist < best_dist {
             best_dist = dist;
             secondary = neigh;
@@ -284,17 +284,17 @@ enum ClimateAxis {
 }
 
 /// For the cell `primary` at `(t,h)`, the borders to its neighbouring cells, each as
-/// `(distance_to_border, neighbour_biome, axis)`. Only borders that actually separate `primary` from a
-/// DIFFERENT biome are returned (so `secondary != primary` whenever a finite distance exists). The axis
-/// names which climate field the border threshold is on (so the bake can normalise by the right
-/// gradient). Pure basic ops.
-fn neighbour_borders(t: f64, h: f64, primary: BiomeId) -> Vec<(f64, BiomeId, ClimateAxis)> {
+/// `(distance_to_border, neighbour_biome, axis, signed_delta)`. `distance` is `|signed_delta|`; the SIGNED
+/// `axis_value − threshold` is kept too so the shape-blend gradient ([`biome_blend_weight_grad`]) can take
+/// the sign of `d(dist)/d(axis)`. Only borders that actually separate `primary` from a DIFFERENT biome are
+/// returned. The axis names which climate field the threshold is on. Pure basic ops.
+fn neighbour_borders(t: f64, h: f64, primary: BiomeId) -> Vec<(f64, BiomeId, ClimateAxis, f64)> {
     let mut out = Vec::new();
     // Helper: the biome just across a temperature/humidity boundary, evaluated by nudging the sample
     // across it and re-partitioning (keeps the neighbour identity consistent with `primary_biome`).
     let mut push = |dist: f64, neigh: BiomeId, axis: ClimateAxis| {
         if neigh != primary {
-            out.push((dist.abs(), neigh, axis));
+            out.push((dist.abs(), neigh, axis, dist));
         }
     };
     use ClimateAxis::{Humidity, Temperature};
@@ -883,7 +883,7 @@ pub fn surface_biome_world(wx: f64, wz: f64, seed: u64, transition_m: f64) -> Bi
     let mut best = f64::INFINITY;
     let mut secondary = primary;
     let mut best_axis = ClimateAxis::Temperature;
-    for (dist, neigh, axis) in neighbour_borders(t, h, primary) {
+    for (dist, neigh, axis, _signed) in neighbour_borders(t, h, primary) {
         if dist < best {
             best = dist;
             secondary = neigh;
@@ -923,6 +923,48 @@ fn climate_axis_gradient_mag(wx: f64, wz: f64, seed: u64, axis: ClimateAxis) -> 
     let gx = (f(wx + D, wz) - f(wx - D, wz)) / (2.0 * D);
     let gz = (f(wx, wz + D) - f(wx, wz - D)) / (2.0 * D);
     (gx * gx + gz * gz).sqrt()
+}
+
+/// The terrain-SHAPE blend at a point: the two biomes that blend here (`primary`, `secondary`), the weight
+/// `w ∈ [0, 0.5]` toward `secondary`, and `w`'s analytic world-XZ gradient `(dw/dx, dw/dz)`. The
+/// differentiable form of [`classify`]'s blend (`w = 0.5·(1 − dist/BLEND_BAND)` clamped) so SHAPE blends
+/// ALIGN with MATERIAL blends; the gradient lets per-biome shape graphs blend while keeping analytic terrain
+/// normals (the weight's gradient flows through the `Field` product rule). `dist = |axis − threshold|` in
+/// climate space; `∇w = −0.5/BLEND_BAND · sign(axis − threshold) · ∇axis`, zeroed at the clamp rails.
+/// Bit-portable (basic f64 ops on the portable climate fields). The bake/`sample_world` SSOT for shape blend.
+pub fn biome_blend_weight_grad(wx: f64, wz: f64, seed: u64) -> (BiomeId, BiomeId, f64, f64, f64) {
+    let (t, tdx, tdz) = temperature_grad(wx, wz, seed);
+    let (h, hdx, hdz) = humidity_grad(wx, wz, seed);
+    let primary = primary_biome(t, h);
+
+    let mut best = f64::INFINITY;
+    let mut secondary = primary;
+    let mut axis = ClimateAxis::Temperature;
+    let mut signed = 0.0;
+    for (dist, neigh, ax, sgn) in neighbour_borders(t, h, primary) {
+        if dist < best {
+            best = dist;
+            secondary = neigh;
+            axis = ax;
+            signed = sgn;
+        }
+    }
+    if !best.is_finite() {
+        return (primary, primary, 0.0, 0.0, 0.0);
+    }
+    let blend = (1.0 - best / BLEND_BAND).clamp(0.0, 1.0);
+    let w = blend * 0.5;
+    // Flat where clamped (blend 0 = interior, 1 = at the border) ⇒ zero gradient. Interior ramp:
+    // dw/d(axis) = −0.5/BLEND_BAND · sign(signed); chain through the climate-field gradient.
+    if blend <= 0.0 || blend >= 1.0 {
+        return (primary, secondary, w, 0.0, 0.0);
+    }
+    let dwd = -0.5 / BLEND_BAND * signed.signum();
+    let (agx, agz) = match axis {
+        ClimateAxis::Temperature => (tdx, tdz),
+        ClimateAxis::Humidity => (hdx, hdz),
+    };
+    (primary, secondary, w, dwd * agx, dwd * agz)
 }
 
 /// Per-field salt for [`SurfaceCond::Patch`] noise so it decorrelates from the climate streams.

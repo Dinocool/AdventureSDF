@@ -13,6 +13,7 @@ use super::super::artifact::{ArtifactKind, HeightNode, ScalarField2D};
 use super::super::coord::{Authority, ChunkSize, Dim, LayerId};
 use super::super::graph::preset::MAX_GRAPH_NODES;
 use super::super::graph::node::GridOut;
+use super::super::biome::{BIOME_COUNT, BiomeId, biome_blend_weight_grad};
 use super::super::graph::{Field, Graph};
 use super::super::layer::{ArtifactDecl, GenCtx, GenOutput, Layer};
 use super::super::noise::{FbmParams, fbm_height_grad, fbm_height_grad_hess};
@@ -146,6 +147,13 @@ pub struct HeightLayer {
     /// every tier samples the SAME graph (the cross-tier-agreement invariant). `None` ⇒ legacy path
     /// (tests / pre-graph fallback). Set by the `LayerManager` from the `WorldGraph` resource.
     graph: Option<Arc<Graph>>,
+    /// Per-biome SHAPE override graphs (index = `BiomeId as usize`); `None` ⇒ use the default [`graph`]. When
+    /// ANY override is set, [`sample_world`](Self::sample_world) blends the primary+secondary biomes' shape
+    /// graphs by the climate weight ([`biome_blend_weight_grad`]) — "biomes own their terrain shape". When ALL
+    /// are `None` ([`is_single`](Self::is_single)) the layer behaves EXACTLY as the single-graph path
+    /// (bit-identical), so attaching the registry with no overrides is a no-op. Shared `Arc`s ⇒ every tier
+    /// blends the SAME set (cross-tier agreement).
+    biome_shapes: [Option<Arc<Graph>>; BIOME_COUNT],
     decls: [ArtifactDecl; 1],
 }
 
@@ -166,6 +174,7 @@ impl HeightLayer {
             erosion,
             chunk_cells,
             graph: None,
+            biome_shapes: [const { None }; BIOME_COUNT],
             decls: [ArtifactDecl { name: Self::OUTPUT, kind: ArtifactKind::ScalarField2D }],
         }
     }
@@ -176,6 +185,58 @@ impl HeightLayer {
     pub fn with_graph(mut self, graph: Option<Arc<Graph>>) -> Self {
         self.graph = graph.filter(|g| g.nodes.len() <= MAX_GRAPH_NODES);
         self
+    }
+
+    /// Attach the per-biome SHAPE override graphs (builder style; see [`biome_shapes`](Self::biome_shapes)).
+    /// Index = `BiomeId as usize`; `None` keeps the default [`graph`]. Over-size graphs are rejected (kept
+    /// `None`). All-`None` ⇒ [`is_single`](Self::is_single) ⇒ the single-graph path (bit-identical).
+    pub fn with_biome_shapes(mut self, shapes: [Option<Arc<Graph>>; BIOME_COUNT]) -> Self {
+        self.biome_shapes = shapes.map(|g| g.filter(|g| g.nodes.len() <= MAX_GRAPH_NODES));
+        self
+    }
+
+    /// True iff no per-biome shape override is set — the layer is a single graph (or legacy fBm), evaluated
+    /// WITHOUT the biome blend (bit-identical to the pre-registry behaviour). The hot-path fast case.
+    #[inline]
+    fn is_single(&self) -> bool {
+        self.biome_shapes.iter().all(Option::is_none)
+    }
+
+    /// The shape graph for `biome`: its override if set, else the default [`graph`].
+    #[inline]
+    fn shape_of(&self, biome: BiomeId) -> Option<&Arc<Graph>> {
+        self.biome_shapes[biome as usize].as_ref().or(self.graph.as_ref())
+    }
+
+    /// Evaluate one shape graph at world `(wx, wz)` → its output [`Field`] (`height, dh/dx, dh/dz`). The
+    /// per-sample stack scratch keeps the bake hot path alloc-free.
+    #[inline]
+    fn eval_graph_field(g: &Graph, wx: f64, wz: f64, world_seed: u64) -> Field {
+        let n = g.nodes.len();
+        debug_assert!(n <= MAX_GRAPH_NODES);
+        let mut scratch = [Field::constant(0.0); MAX_GRAPH_NODES];
+        g.eval_into(wx, wz, world_seed, &mut scratch[..n])
+    }
+
+    /// BLENDED surface: the climate-weighted blend of the primary+secondary biomes' shape graphs at
+    /// `(wx, wz)` (only reached when a per-biome override exists — see [`biome_shapes`](Self::biome_shapes)).
+    /// `Field::mix` carries the weight gradient (product rule) so the terrain normal stays analytic. If the
+    /// two biomes resolve to the SAME graph (or the weight is 0) it evals ONCE — bit-identical to single.
+    fn sample_blended(&self, wx: f64, wz: f64, world_seed: u64) -> HeightNode {
+        let (prim, sec, w, dwdx, dwdz) = biome_blend_weight_grad(wx, wz, world_seed);
+        let Some(ga) = self.shape_of(prim) else {
+            // No graph at all (default None + no override) → legacy fBm fallback for this point.
+            return self.sample_world_legacy(wx, wz, world_seed);
+        };
+        let fa = Self::eval_graph_field(ga, wx, wz, world_seed);
+        let blended = match self.shape_of(sec) {
+            Some(gb) if w > 0.0 && !Arc::ptr_eq(ga, gb) => {
+                let fb = Self::eval_graph_field(gb, wx, wz, world_seed);
+                fa.mix(fb, Field { v: w, dx: dwdx, dz: dwdz })
+            }
+            _ => fa, // same graph or zero weight → primary only (bit-identical to single)
+        };
+        HeightNode { height: blended.v as f32, dh_dx: blended.dx as f32, dh_dz: blended.dz as f32 }
     }
 
     /// The name of this layer's single produced artifact.
@@ -250,19 +311,27 @@ impl HeightLayer {
     /// noise Hessian) — no central-difference taps. Still a pure deterministic `f(wx, wz, seed)`.
     #[inline]
     pub fn sample_world(&self, wx: f64, wz: f64, world_seed: u64) -> HeightNode {
+        // BIOME-SHAPE BLEND: when a per-biome shape override is set, blend the primary+secondary biomes'
+        // shape graphs by the climate weight ("biomes own their terrain shape"). All-`None` ⇒ the single
+        // path below (bit-identical to pre-registry).
+        if !self.is_single() {
+            return self.sample_blended(wx, wz, world_seed);
+        }
         // GRAPH PATH: when a biome terrain graph is attached, it IS the surface — evaluate it with
         // forward-mode autodiff (the output `Field` is `(height, dh_dx, dh_dz)` directly). Pure +
         // bit-portable; a fixed stack scratch keeps the bake hot path alloc-free.
         if let Some(g) = &self.graph {
-            let n = g.nodes.len();
-            debug_assert!(n <= MAX_GRAPH_NODES);
-            let mut scratch = [Field::constant(0.0); MAX_GRAPH_NODES];
-            let f = g.eval_into(wx, wz, world_seed, &mut scratch[..n]);
+            let f = Self::eval_graph_field(g, wx, wz, world_seed);
             return HeightNode { height: f.v as f32, dh_dx: f.dx as f32, dh_dz: f.dz as f32 };
         }
+        self.sample_world_legacy(wx, wz, world_seed)
+    }
 
+    /// The legacy (no-graph) fBm/ridge/erosion surface — the closed-form analytic path. Factored out so the
+    /// blend path can fall back to it for a biome with no graph at all.
+    #[inline]
+    fn sample_world_legacy(&self, wx: f64, wz: f64, world_seed: u64) -> HeightNode {
         let fbm = self.fbm_params(world_seed);
-
         if self.params.ridge == 0.0 && !self.erosion.enabled {
             // Exact analytic path (unchanged behaviour for plain-fBm configs).
             let (h, gx, gz) = fbm_height_grad(wx, wz, &fbm);
@@ -272,7 +341,6 @@ impl HeightLayer {
                 dh_dz: gz as f32,
             };
         }
-
         let (h, gx, gz) = self.carved_grad(wx, wz, &fbm, world_seed);
         HeightNode { height: h as f32, dh_dx: gx as f32, dh_dz: gz as f32 }
     }
@@ -287,6 +355,15 @@ impl HeightLayer {
     fn sample_world_grid(&self, xs: &[f64], zs: &[f64], world_seed: u64, out: &mut [HeightNode]) {
         debug_assert_eq!(xs.len(), zs.len());
         debug_assert_eq!(xs.len(), out.len());
+        // BIOME-SHAPE BLEND: a per-biome override is set → no single graph spans the column; blend per point
+        // (`sample_blended`). Most chunks are single-biome (km-scale climate), so this is the rare path; the
+        // common single case keeps the columnar fast path below.
+        if !self.is_single() {
+            for p in 0..xs.len() {
+                out[p] = self.sample_blended(xs[p], zs[p], world_seed);
+            }
+            return;
+        }
         if let Some(g) = &self.graph {
             let n = g.nodes.len();
             let npts = xs.len();
@@ -663,6 +740,55 @@ mod tests {
         let shared_x = fa.node_world_xz(res, 0).x;
         assert!((shared_x - bmin.x).abs() < 1e-9);
         let _ = DVec2::ZERO;
+    }
+
+    /// Biome-shape registry (B1): the same-`Arc` guard makes "override every biome with the default graph"
+    /// bit-identical to the single-graph layer (so attaching the registry with no real overrides is a no-op),
+    /// and a DISTINCT per-biome shape override actually changes the height somewhere while staying finite.
+    #[test]
+    fn biome_shape_blend_guard_and_override() {
+        use super::super::super::graph::node::FbmAxis;
+        use super::super::super::graph::preset::default_terrain_graph;
+        let seed = 42u64;
+        let ga = Arc::new(default_terrain_graph(
+            FbmAxis { octaves: 3, base_freq: 1.0 / 512.0, lacunarity: 2.0, gain: 0.5, amplitude: 100.0, seed_salt: 1 },
+            0.0,
+            2.0,
+            0.0,
+        ));
+        // A clearly different shape (different freq/amplitude/seed).
+        let gb = Arc::new(default_terrain_graph(
+            FbmAxis { octaves: 2, base_freq: 1.0 / 4096.0, lacunarity: 2.0, gain: 0.5, amplitude: 600.0, seed_salt: 2 },
+            0.0,
+            2.0,
+            0.0,
+        ));
+
+        let single = layer().with_graph(Some(ga.clone()));
+        // GUARD: every biome overridden with the SAME graph as the default → not `is_single`, but the
+        // same-`Arc` guard evals ONCE ⇒ bit-identical to the single-graph layer.
+        let guarded = layer().with_graph(Some(ga.clone())).with_biome_shapes(std::array::from_fn(|_| Some(ga.clone())));
+        // OVERRIDE: give one biome a DISTINCT shape graph.
+        let mut shapes: [Option<Arc<Graph>>; BIOME_COUNT] = std::array::from_fn(|_| None);
+        shapes[BiomeId::Snowy as usize] = Some(gb.clone());
+        let overridden = layer().with_graph(Some(ga.clone())).with_biome_shapes(shapes);
+
+        let mut changed = false;
+        let mut x = -20_000.0;
+        while x < 20_000.0 {
+            let (wx, wz) = (x, x * -0.61 + 1234.0);
+            let s = single.sample_world(wx, wz, seed);
+            let g = guarded.sample_world(wx, wz, seed);
+            assert_eq!(s.height.to_bits(), g.height.to_bits(), "same-Arc guard not bit-identical at ({wx},{wz})");
+            assert_eq!(s.dh_dx.to_bits(), g.dh_dx.to_bits(), "same-Arc guard ∂x not identical at ({wx},{wz})");
+            let o = overridden.sample_world(wx, wz, seed);
+            assert!(o.height.is_finite() && o.dh_dx.is_finite() && o.dh_dz.is_finite(), "blended result must be finite");
+            if o.height.to_bits() != s.height.to_bits() {
+                changed = true;
+            }
+            x += 173.0;
+        }
+        assert!(changed, "the Snowy shape override never changed the height over the sweep");
     }
 
     /// Different seeds give different terrain (the seed actually drives the field).
