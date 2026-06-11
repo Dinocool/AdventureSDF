@@ -12,6 +12,7 @@
 //! layer, and the GPU upload seam) land in later increments of the Phase-1 vertical slice.
 
 pub mod artifact;
+pub mod biome;
 pub mod coord;
 pub mod graph;
 pub mod layer;
@@ -196,6 +197,18 @@ impl Plugin for WorldGenPlugin {
             .init_asset::<graph::GraphAsset>()
             .register_asset_loader(graph::GraphAssetLoader)
             .register_type::<graph::GraphAsset>()
+            // Stage-1 terrain-materials: the biome/strata/material library (CPU/data only this stage —
+            // INERT visually; Stage 2/3 bake + shader consume it). Same load/hot-reload pipeline.
+            .init_resource::<biome::BiomeLibrary>()
+            .init_asset::<biome::BiomeLibraryAsset>()
+            .register_asset_loader(biome::BiomeLibraryAssetLoader)
+            .register_type::<biome::BiomeLibraryAsset>()
+            .register_type::<biome::TerrainSurfaceMaterial>()
+            .register_type::<biome::BiomeDef>()
+            .register_type::<biome::StrataLayer>()
+            .register_type::<biome::TerrainMatId>()
+            .register_type::<biome::BiomeId>()
+            .register_type::<biome::BiomeLibrary>()
             .insert_resource(LayerManager::new_clipmap(
                 WORLDGEN_SLICE_SEED,
                 HeightParams::default(),
@@ -206,8 +219,8 @@ impl Plugin for WorldGenPlugin {
             .register_type::<ErosionParams>()
             // Load the active biome graph from its .ron at startup + hot-reload it into `WorldGraph`
             // (the authored graph "plugs into" the live world; editor Save → .ron → re-mesh).
-            .add_systems(Startup, load_active_graph)
-            .add_systems(Update, apply_active_graph)
+            .add_systems(Startup, (load_active_graph, load_biome_library))
+            .add_systems(Update, (apply_active_graph, apply_biome_library))
             .add_systems(
                 OnEnter(AppScene::SdfEditor),
                 spawn_terrain_volume.run_if(|e: Res<WorldGenEnabled>| e.0),
@@ -466,6 +479,49 @@ fn apply_active_graph(
         if changed && let Some(asset) = assets.get(&active.0) {
             world_graph.0 = std::sync::Arc::new(asset.graph.clone());
             info!("worldgen: active biome graph loaded ({} nodes)", asset.graph.nodes.len());
+        }
+    }
+}
+
+/// Handle to the active biome library asset (`assets/worldgen/biomes.ron`). Loaded/hot-reloaded and
+/// compiled into the [`biome::BiomeLibrary`] resource — Stage-1 terrain-materials data (INERT visually
+/// this stage; Stage 2/3 consume the library).
+#[derive(Resource)]
+pub struct ActiveBiomeLibraryHandle(pub Handle<biome::BiomeLibraryAsset>);
+
+/// The on-disk biome library the world loads by default (relative to `assets/`).
+const ACTIVE_BIOMES_ASSET: &str = "worldgen/biomes.ron";
+
+/// Kick off loading the biome library asset at startup (async; compiled into [`biome::BiomeLibrary`]
+/// once it lands by [`apply_biome_library`]).
+fn load_biome_library(mut commands: Commands, assets: Res<AssetServer>) {
+    commands.insert_resource(ActiveBiomeLibraryHandle(assets.load(ACTIVE_BIOMES_ASSET)));
+}
+
+/// On load / hot-reload of the biome library asset, compile + validate it into the
+/// [`biome::BiomeLibrary`] resource. Mirrors [`apply_active_graph`]; a malformed/invalid library logs an
+/// error and leaves the previous (or empty default) library in place rather than panicking at runtime.
+fn apply_biome_library(
+    mut events: MessageReader<AssetEvent<biome::BiomeLibraryAsset>>,
+    assets: Res<Assets<biome::BiomeLibraryAsset>>,
+    active: Option<Res<ActiveBiomeLibraryHandle>>,
+    mut library: ResMut<biome::BiomeLibrary>,
+) {
+    let Some(active) = active else { return };
+    for ev in events.read() {
+        let changed = matches!(ev, AssetEvent::Added { id } | AssetEvent::Modified { id } if *id == active.0.id());
+        if changed && let Some(asset) = assets.get(&active.0) {
+            match biome::BiomeLibrary::compile(asset) {
+                Ok(lib) => {
+                    info!(
+                        "worldgen: biome library loaded ({} biomes, {} materials)",
+                        lib.biomes.len(),
+                        lib.materials.len()
+                    );
+                    *library = lib;
+                }
+                Err(e) => error!("worldgen: biome library invalid, keeping previous: {e}"),
+            }
         }
     }
 }
