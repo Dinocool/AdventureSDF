@@ -206,14 +206,13 @@ fn apply_water_face(col: vec3<f32>, p: vec3<f32>) -> vec3<f32> {
         let shallow = vec3<f32>(0.20, 0.45, 0.62);
         let deep = vec3<f32>(0.02, 0.10, 0.26);
         let t = clamp(under / max(params.levels.z, 1.0), 0.0, 1.0);
-        // Floor alpha 0.45 so the very top of the water column reads as water immediately below the line
-        // (a HARD edge, not a fade-in), deepening to mostly-water below.
-        out = mix(col, mix(shallow, deep, t), clamp(0.45 + 0.45 * t, 0.0, 0.9));
+        // Keep the tint TRANSLUCENT (max 0.55) so the strata/terrain stay VISIBLE through the water — a
+        // blue cast over readable rock layers, not an opaque blue slab. Deepens with depth below the level.
+        out = mix(col, mix(shallow, deep, t), clamp(0.22 + 0.33 * t, 0.0, 0.55));
     }
-    // Crisp bright waterline AT the level (~1.5 px via screen-space derivative of the cut-face height).
-    let w = max(fwidth(p.y) * 1.5, 1.0e-4);
-    let line = 1.0 - smoothstep(0.0, w, abs(p.y - wl));
-    return mix(out, vec3<f32>(0.70, 0.88, 0.98), line);
+    // Tint only — the sea-level waterline is drawn uniformly by `cut_line` at the call site (computing it
+    // here, inside the non-uniform cut-face branch, gave an undefined `fwidth` so it never drew).
+    return out;
 }
 
 // Flat WATER SURFACE over the submerged terrain `bg` seen at world `xz`. Tints by water DEPTH
@@ -232,7 +231,7 @@ fn water_plane(bg: vec3<f32>, xz: vec2<f32>) -> vec3<f32> {
     }
     let w = max(fwidth(depth) * 1.5, 1.0e-5); // ~1.5 px, zoom-independent
     let line = 1.0 - smoothstep(0.0, w, abs(depth));
-    return mix(out, vec3<f32>(0.70, 0.88, 0.98), clamp(line, 0.0, 1.0));
+    return mix(out, vec3<f32>(0.96, 0.98, 1.0), clamp(line, 0.0, 1.0));
 }
 
 // Is the slice plane active and is world point `p` on the HIDDEN (near) side of it? Axis 0=X,1=Z,2=Y; the
@@ -309,8 +308,22 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
     let wl = params.levels.w;
     let water_on = params.modes.z >= 0.5;
     let cut_on = params.modes.y >= 0.5;
+    // Cut waterline strength at this pixel — computed in UNIFORM control flow (cut_on/water_on are uniforms)
+    // so `fwidth(pe.y)` is reliable, then applied to BOTH the solid cut face and the non-solid cut so the
+    // sea-level border reads as one clean white line across the whole cutaway (like the shore line). Doing it
+    // inside the non-uniform `pe.y <= surf0` branch gave an undefined derivative → the line never drew.
+    // Waterline strength on a CROSS-SECTION face at this pixel. NOT gated on the slice — the box-EDGE cut
+    // faces (the heightfield boundary) are always rendered, so the line must draw there too, not only on the
+    // slice plane. World-band width (fraction of the FIXED height range) → reliable + ~constant screen width
+    // (a screen-space derivative read ~0 on the flat cut plane → invisible).
+    var cut_line = 0.0;
+    if (water_on) {
+        let lw = max((params.up.w - params.right.w) * 0.006, 0.5);
+        cut_line = clamp(1.0 - smoothstep(0.0, lw, abs(pe.y - wl)), 0.0, 1.0);
+    }
     if (pe.y <= surf0) {
-        return vec4<f32>(apply_water_face(strata_face(pe), pe), 1.0);
+        let col = mix(apply_water_face(strata_face(pe), pe), vec3<f32>(0.96, 0.98, 1.0), cut_line);
+        return vec4<f32>(col, 1.0);
     }
 
     // Adaptive march for the terrain backdrop; cap each step to ~2 texels HORIZONTALLY so thin ridges aren't
@@ -324,6 +337,8 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
     var a_prev = pe.y - surf0;
     var bg = sky(ndcy);
     var t_hit = t1;
+    var terr_hit = false;
+    var hit_xz = vec2<f32>(0.0);
     for (var i = 0; i < 512; i = i + 1) {
         if (t >= t1) { break; }
         var step = max((max(a_prev, 0.0) / descent) * 0.45, min_step);
@@ -345,25 +360,37 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
             let n = normalize(s.yzw);
             let lamb = clamp(dot(n, light), 0.0, 1.0);
             bg = surface_colour(pm.xz, s.x) * (0.28 + 0.72 * lamb);
+            terr_hit = true;
+            hit_xz = pm.xz;
             break;
         }
         a_prev = a_n;
         t = tn;
     }
 
-    // WATER. Compute the water-plane crossing unconditionally (keeps `fwidth` in water_plane in uniform
-    // control flow), then apply it only where the ray actually meets open water before the terrain.
+    // WATER.
     if (water_on) {
-        let safe_dy = select(dir.y, -1.0e-6, abs(dir.y) < 1.0e-6);
-        let tw = (wl - eye.y) / safe_dy;
-        let pw = eye + dir * tw;
-        let watered = water_plane(bg, pw.xz);
-        if (cut_on && pe.y <= wl) {
-            // The cut passes through the open-water COLUMN (solid already returned above): the cross
-            // section's water body — backdrop seen through water + the top waterline, at the cut entry.
+        if (pe.y <= wl) {
+            // The cross-section entry is in the open-water COLUMN (solid already returned above) — the box
+            // edge / cut passes through open water: tint by the cross-section depth, then draw the white
+            // waterline at the TOP of the open water (the "shore line on the parts WITHOUT terrain").
             bg = apply_water_face(bg, pe);
-        } else if (dir.y < -1.0e-6 && tw >= t0 && tw <= t_hit && hf_at(pw.xz).x < wl) {
-            bg = watered; // flat water surface over the submerged terrain
+            bg = mix(bg, vec3<f32>(0.96, 0.98, 1.0), cut_line);
+        } else if (terr_hit) {
+            // Far/submerged terrain seen THROUGH the cut (or the normal view): tint by its OWN water depth
+            // (level - surface) + its own shore line where it crosses the level. No cut overlay here.
+            bg = water_plane(bg, hit_xz);
+        } else if (dir.y < -1.0e-6) {
+            // No terrain hit ⇒ the ray EXITS the box — the FAR box edge. Where it exits at the boundary below
+            // the water level over submerged ground, that box edge IS the open-water surface: tint the wall +
+            // draw the waterline at the exit, so the far edge matches the near ones instead of bare sky.
+            let p_exit = eye + dir * t1;
+            if (p_exit.y < wl && hf_at(p_exit.xz).x < wl) {
+                bg = apply_water_face(bg, p_exit);
+                let lw = max((params.up.w - params.right.w) * 0.006, 0.5);
+                bg = mix(bg, vec3<f32>(0.96, 0.98, 1.0),
+                         clamp(1.0 - smoothstep(0.0, lw, abs(p_exit.y - wl)), 0.0, 1.0));
+            }
         }
     }
     return vec4<f32>(bg, 1.0);
