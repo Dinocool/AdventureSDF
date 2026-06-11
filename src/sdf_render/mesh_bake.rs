@@ -212,10 +212,11 @@ impl Default for MeshBakeConfig {
             // Tune via the editor slider (down for cheaper, up to 512 for finer) when iterating on the look.
             detail_normal_res: 256,
             detail_normal_strength: 1.0,
-            // 16×16 biome map per chunk: biome is km-scale (CLIMATE_WAVELENGTH_M ≈ 8 km), so even a far
-            // LOD chunk's footprint spans a small fraction of a biome cell → 16 texels resolve the
-            // primary/secondary/blend with room to spare. Cheap (256 classifier calls/chunk).
-            biome_res: 16,
+            // 64×64 biome map per chunk: biome is km-scale, but the ids are NEAREST-sampled (ids can't
+            // interpolate), so biome/snow boundaries step at the texel grid — 16² stepped visibly (blocky
+            // snow patch). 64² puts the steps below the detail scale (4096 classifier calls/chunk, still
+            // ~0.5 ms vs ~31 ms mesh). The blend weight + cold cross-fade smooth within each step.
+            biome_res: 64,
             surface_treatment: 1.0,
         }
     }

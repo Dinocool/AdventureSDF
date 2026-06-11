@@ -152,9 +152,14 @@ fn surface_treatment(base: vec3<f32>, n: vec3<f32>, y: f32, bio: vec3<f32>) -> v
     let sand_w = 1.0 - smoothstep(0.0, sand_band, abs(y - sea));
     col = mix(col, sand, sand_w * 0.85);
 
-    // SNOW on high + COLD ground. Cold = a low-temperature biome: Tundra (3) or Snowy (4) primary.
+    // SNOW on high + COLD ground. Cold = a low-temperature biome: Tundra (3) or Snowy (4). Blend the cold
+    // factor across the biome boundary (primary↔secondary by the baked blend) so the snow edge is SMOOTH,
+    // not a hard per-texel flip on the primary id (that read as a blocky patch).
     let prim = u32(bio.x + 0.5);
-    let cold = select(0.0, 1.0, prim == 3u || prim == 4u);
+    let sec = u32(bio.y + 0.5);
+    let cold_p = select(0.0, 1.0, prim == 3u || prim == 4u);
+    let cold_s = select(0.0, 1.0, sec == 3u || sec == 4u);
+    let cold = mix(cold_p, cold_s, clamp(bio.z, 0.0, 1.0));
     let snow = vec3<f32>(0.85, 0.88, 0.95);
     let snow_w = smoothstep(params.surf_a.z, params.surf_a.w, y) * cold;
     col = mix(col, snow, clamp(snow_w, 0.0, 1.0));
