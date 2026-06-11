@@ -62,8 +62,10 @@ SRC_DIR = Path("C:/Users/Aesthetic/Downloads")
 # worktree's assets — never the main checkout.
 DEST_ROOT = Path(__file__).resolve().parent.parent / "assets" / "textures"
 
-# variant.bmp name like "12_normal.bmp" -> ("12", "normal")
-BMP_RE = re.compile(r"^(\d+)_([A-Za-z]+)\.bmp$")
+# A variant MAP file like "12_normal.bmp" OR "1_diffuseOriginal.png" -> ("12", "normal"). Some packs ship
+# the diffuse (and occasionally other maps) as PNG rather than BMP, so match both extensions.
+MAP_RE = re.compile(r"^(\d+)_([A-Za-z]+)\.(?:bmp|png)$")
+# The bare numbered preview thumbnail, e.g. "12.png" (NOT a `_suffix` map).
 PNG_RE = re.compile(r"^(\d+)\.png$")
 
 
@@ -99,7 +101,7 @@ def import_material(zip_stem: str, slug: str) -> int:
                 continue
             variant = parts[-2]
 
-            m = BMP_RE.match(base)
+            m = MAP_RE.match(base)
             if m:
                 vnum, suffix = m.group(1), m.group(2)
                 if suffix not in MAP_ROLES:
@@ -107,9 +109,11 @@ def import_material(zip_stem: str, slug: str) -> int:
                 role, invert = MAP_ROLES[suffix]
                 out_dir = dest_mat / vnum
                 out_dir.mkdir(parents=True, exist_ok=True)
-                png = convert(zf.read(name), invert)
-                (out_dir / f"{role}.png").write_bytes(png)
+                out_path = out_dir / f"{role}.png"
                 variants.setdefault(vnum, {})[role] = f"{role}.png"
+                if out_path.exists():
+                    continue  # already imported (idempotent re-run only fills gaps)
+                out_path.write_bytes(convert(zf.read(name), invert))
                 print(f"  {slug}/{vnum}/{role}.png", flush=True)
                 continue
 
@@ -118,10 +122,12 @@ def import_material(zip_stem: str, slug: str) -> int:
                 vnum = p.group(1)
                 out_dir = dest_mat / vnum
                 out_dir.mkdir(parents=True, exist_ok=True)
-                # Re-encode the preview through PIL too (consistent, stripped).
-                png = convert(zf.read(name), False)
-                (out_dir / "preview.png").write_bytes(png)
                 variants.setdefault(vnum, {})["preview"] = "preview.png"
+                preview_path = out_dir / "preview.png"
+                if preview_path.exists():
+                    continue
+                # Re-encode the preview through PIL too (consistent, stripped).
+                preview_path.write_bytes(convert(zf.read(name), False))
 
     write_manifest(dest_mat, zip_stem, slug, variants)
     return len(variants)
