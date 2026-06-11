@@ -39,6 +39,12 @@ pub(crate) fn viewport_toolbar(world: &mut World, ui: &mut egui::Ui) {
                     mode.yaw = yaw + std::f32::consts::PI;
                     mode.pitch = -pitch;
                 }
+                // PLAYER toggle — drop a 3rd-person player that walks the baked terrain colliders (or `P`).
+                let player = world.resource::<SdfCameraMode>().player;
+                let player_label = format!("{} Player", egui_phosphor::regular::PERSON_SIMPLE_WALK);
+                if ui.selectable_label(player, player_label).on_hover_text("3rd-person player on the terrain colliders (P). RMB look · WASD · Space jump").clicked() {
+                    world.resource_mut::<SdfCameraMode>().player = !player;
+                }
 
                 ui.separator();
 
