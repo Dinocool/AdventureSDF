@@ -215,6 +215,9 @@ pub fn classify(t: f64, h: f64) -> BiomeSample {
 
 /// Width (in climate units) of the transition band over which [`classify`]'s `blend` ramps from 0
 /// (interior) to 1 (border). Small relative to the cell sizes so blending is confined near boundaries.
+/// NOTE: this is CLIMATE-space, so its WORLD width varies with the local climate gradient (steep gradient →
+/// sharp border, gentle → soft) — widening it can't fix that AND eats the ~0.33-wide cells. The real fix for
+/// uniformly-soft borders is a WORLD-space blend (divide by the climate gradient at bake time).
 pub const BLEND_BAND: f64 = 0.08;
 
 /// The total partition function: `(t,h) → BiomeId`. Factored out so [`classify`] and

@@ -145,11 +145,13 @@ fn surface_treatment(base: vec3<f32>, n: vec3<f32>, y: f32, bio: vec3<f32>) -> v
     if (master <= 0.0) { return base; }
     var col = base;
 
-    // SAND near sea level (any biome): a band ±surf_b.x around the sea level surf_b.y.
+    // SAND on FLAT low ground near sea level (beaches). Gated by slope (n.y → 1 = flat) so it does NOT draw
+    // thin sea-level CONTOUR RINGS across every rolling hill that happens to pass through the band.
     let sea = params.surf_b.y;
     let sand_band = max(params.surf_b.x, 1e-3);
     let sand = vec3<f32>(0.62, 0.50, 0.27);
-    let sand_w = 1.0 - smoothstep(0.0, sand_band, abs(y - sea));
+    let flat = smoothstep(0.86, 0.97, n.y);
+    let sand_w = (1.0 - smoothstep(0.0, sand_band, abs(y - sea))) * flat;
     col = mix(col, sand, sand_w * 0.85);
 
     // SNOW on high + COLD ground. Cold = a low-temperature biome: Tundra (3) or Snowy (4). Blend the cold
