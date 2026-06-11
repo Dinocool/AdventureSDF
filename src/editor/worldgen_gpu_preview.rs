@@ -28,9 +28,7 @@ use bevy::render::render_resource::{
 use bevy::shader::ShaderRef;
 use bevy_egui::{EguiTextureHandle, EguiUserTextures, egui};
 
-use crate::sdf_render::worldgen::biome::{
-    self, BiomeId, BiomeLibrary, GPU_STRATA_MAX_LAYERS, GpuStrataColumn,
-};
+use crate::sdf_render::worldgen::biome::{self, BIOME_COUNT, BiomeLibrary, StrataTableStd};
 use crate::sdf_render::worldgen::graph::node::Graph;
 
 /// Number of pre-allocated GPU preview targets (cap on simultaneous GPU-backed previews).
@@ -59,71 +57,6 @@ struct PreviewParams {
     flags: Vec4,  // x = mode (0 = 3D orbit, 1 = 2D top-down), y = halfX, z = halfZ
     modes: Vec4,  // x = biome-map on, y = slice on, z = water on, w = unused
     slice: Vec4,  // x = axis (0=X,1=Z,2=Y), y = world-plane coord, (z,w) unused
-}
-
-/// GPU mirror of [`GpuStrataColumn`] (one biome's flattened strata column) laid out for std140: the 6
-/// cumulative layer bottoms are packed into 2 `Vec4` lanes so the array stays 16-byte aligned. Built from
-/// the CPU SSOT [`BiomeLibrary::gpu_strata_table`] — the same table the Stage-3 in-world shader will use.
-#[derive(ShaderType, Clone, Copy, Default)]
-struct GpuStrataColumnStd {
-    surface_color: Vec4,
-    layer_color: [Vec4; GPU_STRATA_MAX_LAYERS],
-    layer_bottom: [Vec4; 2], // 6 floats packed: lane0.xyzw + lane1.xy
-    bedrock_color: Vec4,
-    layer_count: u32,
-    // `UVec3` (= `vec3<u32>`), NOT `[u32; 3]`: a uniform array element's stride must be 16-aligned, which a
-    // `u32` array (stride 4) can't satisfy — encase panics at encode time (see mesh_material.rs BlendParams).
-    _pad: UVec3,
-}
-
-impl From<&GpuStrataColumn> for GpuStrataColumnStd {
-    fn from(c: &GpuStrataColumn) -> Self {
-        let mut layer_color = [Vec4::ZERO; GPU_STRATA_MAX_LAYERS];
-        for (i, col) in c.layer_color.iter().enumerate() {
-            layer_color[i] = Vec4::from_array(*col);
-        }
-        // Pack 6 bottoms into 2 vec4 lanes (xyzw, then xy…).
-        let mut bottom = [Vec4::ZERO; 2];
-        for (i, &b) in c.layer_bottom.iter().enumerate() {
-            bottom[i / 4][i % 4] = b;
-        }
-        Self {
-            surface_color: Vec4::from_array(c.surface_color),
-            layer_color,
-            layer_bottom: bottom,
-            bedrock_color: Vec4::from_array(c.bedrock_color),
-            layer_count: c.layer_count,
-            _pad: UVec3::ZERO,
-        }
-    }
-}
-
-/// The full per-biome strata table uniform (one column per [`BiomeId`], id order) — the GPU side of
-/// [`BiomeLibrary::gpu_strata_table`]. A fixed-size array sized to the demo biome count.
-#[derive(ShaderType, Clone, Copy)]
-struct StrataTableStd {
-    columns: [GpuStrataColumnStd; BIOME_COUNT],
-}
-
-/// Demo biome count (matches `BiomeId::ALL.len()` and the shader's `BIOME_COUNT`).
-const BIOME_COUNT: usize = BiomeId::ALL.len();
-
-impl Default for StrataTableStd {
-    fn default() -> Self {
-        Self { columns: [GpuStrataColumnStd::default(); BIOME_COUNT] }
-    }
-}
-
-impl StrataTableStd {
-    /// Flatten a [`BiomeLibrary`] into the GPU table (via the CPU SSOT), clamped/padded to [`BIOME_COUNT`].
-    fn from_library(lib: &BiomeLibrary) -> Self {
-        let table = lib.gpu_strata_table();
-        let mut columns = [GpuStrataColumnStd::default(); BIOME_COUNT];
-        for (i, c) in table.iter().take(BIOME_COUNT).enumerate() {
-            columns[i] = GpuStrataColumnStd::from(c);
-        }
-        Self { columns }
-    }
 }
 
 /// Custom fullscreen-quad material: the camera uniform + the CPU-baked height/normal + biome textures and
@@ -620,6 +553,7 @@ impl Plugin for WorldgenGpuPreviewPlugin {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sdf_render::worldgen::biome::GPU_STRATA_MAX_LAYERS;
 
     /// The shader's `HF_TEX_RES` const MUST match the Rust `HEIGHTFIELD_RES` (the bake fills a
     /// `HEIGHTFIELD_RES`² texture; the shader's manual bilinear fetch indexes by `HF_TEX_RES`). A mismatch
@@ -681,47 +615,5 @@ mod tests {
         use bevy::render::render_resource::ShaderType;
         StrataTableStd::assert_uniform_compat();
         PreviewParams::assert_uniform_compat();
-    }
-
-    /// The packed `layer_bottom: [Vec4; 2]` must hold all `GPU_STRATA_MAX_LAYERS` layer bottoms.
-    #[test]
-    fn packed_layer_bottom_fits_all_layers() {
-        assert!(GPU_STRATA_MAX_LAYERS <= 8, "layer_bottom packs into 2 vec4 (8 floats)");
-    }
-
-    /// The GPU strata column mirrors the CPU `GpuStrataColumn`: a depth probe of `GpuStrataColumnStd`
-    /// (the packed/unpacked layout the shader reads) reproduces the source column's colours.
-    #[test]
-    fn gpu_strata_column_std_mirrors_cpu() {
-        let cpu = GpuStrataColumn {
-            surface_color: [0.1, 0.2, 0.3, 1.0],
-            layer_color: {
-                let mut a = [[0.0; 4]; GPU_STRATA_MAX_LAYERS];
-                a[0] = [0.4, 0.0, 0.0, 1.0];
-                a[1] = [0.0, 0.5, 0.0, 1.0];
-                a[2] = [0.0, 0.0, 0.6, 1.0];
-                a
-            },
-            layer_bottom: {
-                let mut a = [0.0; GPU_STRATA_MAX_LAYERS];
-                a[0] = 1.0;
-                a[1] = 5.0;
-                a[2] = 1005.0;
-                a
-            },
-            bedrock_color: [0.01, 0.01, 0.02, 1.0],
-            layer_count: 3,
-            _pad: [0; 3],
-        };
-        let std = GpuStrataColumnStd::from(&cpu);
-        // Surface / bedrock colours.
-        assert_eq!(std.surface_color, Vec4::from_array(cpu.surface_color));
-        assert_eq!(std.bedrock_color, Vec4::from_array(cpu.bedrock_color));
-        assert_eq!(std.layer_count, cpu.layer_count);
-        // Packed bottoms unpack to the source order.
-        for i in 0..3 {
-            assert_eq!(std.layer_bottom[i / 4][i % 4], cpu.layer_bottom[i], "bottom {i}");
-            assert_eq!(std.layer_color[i], Vec4::from_array(cpu.layer_color[i]), "colour {i}");
-        }
     }
 }

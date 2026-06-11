@@ -332,6 +332,71 @@ fn gpu_strata_table_matches_library() {
     }
 }
 
+/// `StrataTableStd` (the SHARED std140 flatten consumed by BOTH the editor preview AND the in-world
+/// terrain-surface material) must be a VALID std140 uniform. encase's "array stride must be a multiple of
+/// 16" assert fires only at encode/assert time — NOT in the layout-mirror tests — which is how a `[u32; 3]`
+/// pad (stride 4) passes `--lib` + naga validation yet panics `prepare_erased_assets` at launch. Keep every
+/// uniform field a `Vec*`/`UVec*` (never `[scalar; N]`).
+#[test]
+fn strata_table_std_is_valid_std140_uniform() {
+    StrataTableStd::assert_uniform_compat();
+}
+
+/// The packed `layer_bottom: [Vec4; 2]` (8 floats) must hold all `GPU_STRATA_MAX_LAYERS` layer bottoms.
+#[test]
+fn packed_layer_bottom_fits_all_layers() {
+    const { assert!(GPU_STRATA_MAX_LAYERS <= 8, "layer_bottom packs into 2 vec4 (8 floats)") };
+}
+
+/// `GpuStrataColumnStd` (the std140 flatten) mirrors the CPU `GpuStrataColumn`: a depth probe of the
+/// packed/unpacked layout the shaders read reproduces the source column's colours.
+#[test]
+fn gpu_strata_column_std_mirrors_cpu() {
+    let cpu = GpuStrataColumn {
+        surface_color: [0.1, 0.2, 0.3, 1.0],
+        layer_color: {
+            let mut a = [[0.0; 4]; GPU_STRATA_MAX_LAYERS];
+            a[0] = [0.4, 0.0, 0.0, 1.0];
+            a[1] = [0.0, 0.5, 0.0, 1.0];
+            a[2] = [0.0, 0.0, 0.6, 1.0];
+            a
+        },
+        layer_bottom: {
+            let mut a = [0.0; GPU_STRATA_MAX_LAYERS];
+            a[0] = 1.0;
+            a[1] = 5.0;
+            a[2] = 1005.0;
+            a
+        },
+        bedrock_color: [0.01, 0.01, 0.02, 1.0],
+        layer_count: 3,
+        _pad: [0; 3],
+    };
+    let std = GpuStrataColumnStd::from(&cpu);
+    assert_eq!(std.surface_color, Vec4::from_array(cpu.surface_color));
+    assert_eq!(std.bedrock_color, Vec4::from_array(cpu.bedrock_color));
+    assert_eq!(std.layer_count, cpu.layer_count);
+    for i in 0..3 {
+        assert_eq!(std.layer_bottom[i / 4][i % 4], cpu.layer_bottom[i], "bottom {i}");
+        assert_eq!(std.layer_color[i], Vec4::from_array(cpu.layer_color[i]), "colour {i}");
+    }
+}
+
+/// `StrataTableStd::from_library` flattens the shipped library row-for-row (one column per biome in id
+/// order), so the SHARED GPU table the preview + in-world material upload matches the CPU SSOT.
+#[test]
+fn strata_table_std_from_library_matches_cpu() {
+    let lib = shipped_library();
+    let table = StrataTableStd::from_library(&lib);
+    let cpu = lib.gpu_strata_table();
+    for (i, c) in cpu.iter().enumerate() {
+        let std = &table.columns[i];
+        assert_eq!(std.surface_color, Vec4::from_array(c.surface_color), "biome {i} surface");
+        assert_eq!(std.bedrock_color, Vec4::from_array(c.bedrock_color), "biome {i} bedrock");
+        assert_eq!(std.layer_count, c.layer_count, "biome {i} layer_count");
+    }
+}
+
 /// CPU mirror of the WGSL strata-column walk: find the first layer whose cumulative bottom exceeds
 /// `depth`; surface at/above 0, bedrock past the last layer. Used by the table test to assert the GPU
 /// layout reproduces `strata_material`.
