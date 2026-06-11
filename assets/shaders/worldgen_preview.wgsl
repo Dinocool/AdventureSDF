@@ -48,6 +48,9 @@ struct StrataTable {
 @group(#{MATERIAL_BIND_GROUP}) @binding(1) var height_tex: texture_2d<f32>;
 @group(#{MATERIAL_BIND_GROUP}) @binding(2) var biome_tex: texture_2d<f32>;
 @group(#{MATERIAL_BIND_GROUP}) @binding(3) var<uniform> strata: StrataTable;
+// CPU-baked RESOLVED surface colour (rgb) per texel — `biome::resolve_surface` → palette (biome base + snow/
+// rock caps + cliffs + patches), the SAME SSOT the in-world surface bakes, so the preview mirrors the world.
+@group(#{MATERIAL_BIND_GROUP}) @binding(4) var surface_tex: texture_2d<f32>;
 
 // Manual bilinear fetch (textureLoad needs no filterable format → portable for Rgba32Float).
 // Baked heightfield texture resolution — MUST match HEIGHTFIELD_RES in worldgen_gpu_preview.rs.
@@ -111,17 +114,25 @@ fn strata_color_for(biome: u32, depth: f32) -> vec3<f32> {
     return col.bedrock_color.rgb;
 }
 
-// Surface biome colour (depth 0) at a world XZ, blending primary↔secondary by the baked blend weight so
-// boundaries read smoothly (matches the CPU classifier's BiomeSample.blend intent).
+// The undug SURFACE colour at a world XZ — a BILINEAR fetch of the CPU-baked `surface_tex` (the resolved
+// `biome::resolve_surface` colour: biome base + snow/rock caps + cliff rock + patches). Bilinear so material
+// boundaries are smooth, exactly as the in-world surface shader interpolates them. Mirrors the live world.
 fn biome_surface_color(world_xz: vec2<f32>) -> vec3<f32> {
-    let s = biome_at(world_xz);
-    let prim = u32(s.x + 0.5);
-    let sec = u32(s.y + 0.5);
-    let blend = clamp(s.z, 0.0, 1.0);
-    let cp = strata_color_for(prim, 0.0);
-    let cs = strata_color_for(sec, 0.0);
-    // blend → 1 at a border halves toward the neighbour (0.5 max mix so the primary still dominates).
-    return mix(cp, cs, blend * 0.5);
+    let half_xz = vec2<f32>(params.flags.y, params.flags.z);
+    let uv = (world_xz + half_xz) / (2.0 * half_xz);
+    let res = HF_TEX_RES;
+    let p = clamp(uv, vec2<f32>(0.0), vec2<f32>(1.0)) * (res - 1.0);
+    let i0 = floor(p);
+    let f = p - i0;
+    let x0 = i32(i0.x);
+    let y0 = i32(i0.y);
+    let x1 = min(x0 + 1, i32(res) - 1);
+    let y1 = min(y0 + 1, i32(res) - 1);
+    let a = textureLoad(surface_tex, vec2<i32>(x0, y0), 0).rgb;
+    let b = textureLoad(surface_tex, vec2<i32>(x1, y0), 0).rgb;
+    let c = textureLoad(surface_tex, vec2<i32>(x0, y1), 0).rgb;
+    let d = textureLoad(surface_tex, vec2<i32>(x1, y1), 0).rgb;
+    return mix(mix(a, b, f.x), mix(c, d, f.x), f.y);
 }
 
 // Slab ray–AABB → (tmin, tmax); .z < 0 means miss.
