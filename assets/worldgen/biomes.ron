@@ -43,10 +43,12 @@ BiomeLibraryAsset(
             name: "Plains",
             surface: TerrainMatId(0),
             surface_rules: [
-                SurfaceLayer(material: TerrainMatId(11), when: Patch(wavelength: 500.0, threshold: 0.62, softness: 0.06, seed: 7)),
-                SurfaceLayer(material: TerrainMatId(9),  when: AboveY(start: 900.0, full: 1300.0)),
-                SurfaceLayer(material: TerrainMatId(10), when: AboveY(start: 1500.0, full: 1900.0)),
-                SurfaceLayer(material: TerrainMatId(10), when: Slope(gentle: 0.5, steep: 0.17)),
+                // Flower = noise patch AND flat ground (the Slope reads as "present as n_y → 1"), so flowers
+                // stay in the lowland flats and never paint steep Plains-climate mountainsides.
+                SurfaceLayer(material: TerrainMatId(11), when: [Patch(wavelength: 500.0, threshold: 0.62, softness: 0.06, seed: 7), Slope(gentle: 0.55, steep: 0.9)]),
+                SurfaceLayer(material: TerrainMatId(9),  when: [AboveY(start: 900.0, full: 1300.0)]),
+                SurfaceLayer(material: TerrainMatId(10), when: [AboveY(start: 1500.0, full: 1900.0)]),
+                SurfaceLayer(material: TerrainMatId(10), when: [Slope(gentle: 0.5, steep: 0.17)]),
             ],
             strata: [
                 StrataLayer(material: TerrainMatId(0), thickness: 1.0),    // grass
@@ -60,9 +62,9 @@ BiomeLibraryAsset(
             name: "Forest",
             surface: TerrainMatId(1),
             surface_rules: [
-                SurfaceLayer(material: TerrainMatId(9),  when: AboveY(start: 900.0, full: 1300.0)),
-                SurfaceLayer(material: TerrainMatId(10), when: AboveY(start: 1500.0, full: 1900.0)),
-                SurfaceLayer(material: TerrainMatId(10), when: Slope(gentle: 0.5, steep: 0.17)),
+                SurfaceLayer(material: TerrainMatId(9),  when: [AboveY(start: 900.0, full: 1300.0)]),
+                SurfaceLayer(material: TerrainMatId(10), when: [AboveY(start: 1500.0, full: 1900.0)]),
+                SurfaceLayer(material: TerrainMatId(10), when: [Slope(gentle: 0.5, steep: 0.17)]),
             ],
             strata: [
                 StrataLayer(material: TerrainMatId(1), thickness: 1.0),    // grass_dark
@@ -76,9 +78,9 @@ BiomeLibraryAsset(
             name: "Desert",
             surface: TerrainMatId(5),
             surface_rules: [
-                SurfaceLayer(material: TerrainMatId(9),  when: AboveY(start: 1100.0, full: 1500.0)),
-                SurfaceLayer(material: TerrainMatId(10), when: AboveY(start: 1700.0, full: 2100.0)),
-                SurfaceLayer(material: TerrainMatId(10), when: Slope(gentle: 0.5, steep: 0.17)),
+                SurfaceLayer(material: TerrainMatId(9),  when: [AboveY(start: 1100.0, full: 1500.0)]),
+                SurfaceLayer(material: TerrainMatId(10), when: [AboveY(start: 1700.0, full: 2100.0)]),
+                SurfaceLayer(material: TerrainMatId(10), when: [Slope(gentle: 0.5, steep: 0.17)]),
             ],
             strata: [
                 StrataLayer(material: TerrainMatId(5), thickness: 1.0),    // sand
@@ -92,9 +94,9 @@ BiomeLibraryAsset(
             name: "Tundra",
             surface: TerrainMatId(7),
             surface_rules: [
-                SurfaceLayer(material: TerrainMatId(9),  when: AboveY(start: 700.0, full: 1100.0)),
-                SurfaceLayer(material: TerrainMatId(10), when: AboveY(start: 1400.0, full: 1800.0)),
-                SurfaceLayer(material: TerrainMatId(10), when: Slope(gentle: 0.5, steep: 0.17)),
+                SurfaceLayer(material: TerrainMatId(9),  when: [AboveY(start: 700.0, full: 1100.0)]),
+                SurfaceLayer(material: TerrainMatId(10), when: [AboveY(start: 1400.0, full: 1800.0)]),
+                SurfaceLayer(material: TerrainMatId(10), when: [Slope(gentle: 0.5, steep: 0.17)]),
             ],
             strata: [
                 StrataLayer(material: TerrainMatId(7), thickness: 1.0),    // tundra
@@ -109,8 +111,8 @@ BiomeLibraryAsset(
             name: "Snowy",
             surface: TerrainMatId(9),
             surface_rules: [
-                SurfaceLayer(material: TerrainMatId(10), when: AboveY(start: 1300.0, full: 1700.0)),
-                SurfaceLayer(material: TerrainMatId(10), when: Slope(gentle: 0.5, steep: 0.17)),
+                SurfaceLayer(material: TerrainMatId(10), when: [AboveY(start: 1300.0, full: 1700.0)]),
+                SurfaceLayer(material: TerrainMatId(10), when: [Slope(gentle: 0.5, steep: 0.17)]),
             ],
             strata: [
                 StrataLayer(material: TerrainMatId(9), thickness: 1.0),    // snow
