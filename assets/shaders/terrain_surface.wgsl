@@ -23,6 +23,8 @@
 const STRATA_MAX_LAYERS: u32 = 6u;
 // Must match BiomeId::ALL.len() (= biome::BIOME_COUNT).
 const BIOME_COUNT: u32 = 5u;
+// Must match GPU_MAX_MATERIALS in src/sdf_render/worldgen/biome.rs.
+const MAX_MATERIALS: u32 = 32u;
 
 struct TerrainSurfaceParams {
     // World-XZ minimum corner of the chunk's footprint (all maps cover [chunk_min, chunk_min + size]).
@@ -55,12 +57,27 @@ struct StrataTable {
     columns: array<StrataColumn, BIOME_COUNT>,
 };
 
+// One palette material (mirror of biome::GpuMaterialStd): colour + props (.x = roughness).
+struct MaterialEntry {
+    color: vec4<f32>,
+    props: vec4<f32>,
+};
+
+// The flat material palette (mirror of biome::MaterialPaletteStd) the baked surface-material ids index.
+struct MaterialPalette {
+    materials: array<MaterialEntry, MAX_MATERIALS>,
+    count: u32,
+    _pad: vec3<u32>,
+};
+
 @group(#{MATERIAL_BIND_GROUP}) @binding(100) var<uniform> params: TerrainSurfaceParams;
 @group(#{MATERIAL_BIND_GROUP}) @binding(101) var detail_normal: texture_2d<f32>;
 @group(#{MATERIAL_BIND_GROUP}) @binding(102) var detail_sampler: sampler;
 @group(#{MATERIAL_BIND_GROUP}) @binding(103) var surface_height: texture_2d<f32>;
 @group(#{MATERIAL_BIND_GROUP}) @binding(104) var biome_tex: texture_2d<f32>;
 @group(#{MATERIAL_BIND_GROUP}) @binding(105) var<uniform> strata: StrataTable;
+@group(#{MATERIAL_BIND_GROUP}) @binding(106) var surface_mat_tex: texture_2d<f32>;
+@group(#{MATERIAL_BIND_GROUP}) @binding(107) var<uniform> palette: MaterialPalette;
 
 // Manual bilinear fetch of the R32Float surface-height map (unfilterable → textureLoad). `uv` in [0,1].
 fn sample_height(uv: vec2<f32>) -> f32 {
@@ -85,24 +102,6 @@ fn sample_biome(uv: vec2<f32>) -> vec3<f32> {
     let dims = vec2<f32>(textureDimensions(biome_tex));
     let px = vec2<i32>(clamp(uv * dims, vec2<f32>(0.0), dims - 1.0));
     return textureLoad(biome_tex, px, 0).xyz;
-}
-
-// Bilinear-fetch the biome map's 4th channel = the CONTINUOUS temperature [0,1]. Bilinear (unlike the
-// nearest-sampled ids) so the temperature — and thus the snow line driven by it — is SMOOTH across texels.
-fn sample_temp(uv: vec2<f32>) -> f32 {
-    let dims = vec2<f32>(textureDimensions(biome_tex));
-    let p = clamp(uv, vec2<f32>(0.0), vec2<f32>(1.0)) * (dims - 1.0);
-    let i0 = floor(p);
-    let f = p - i0;
-    let x0 = i32(i0.x);
-    let y0 = i32(i0.y);
-    let x1 = min(x0 + 1, i32(dims.x) - 1);
-    let y1 = min(y0 + 1, i32(dims.y) - 1);
-    let a = textureLoad(biome_tex, vec2<i32>(x0, y0), 0).a;
-    let b = textureLoad(biome_tex, vec2<i32>(x1, y0), 0).a;
-    let c = textureLoad(biome_tex, vec2<i32>(x0, y1), 0).a;
-    let d = textureLoad(biome_tex, vec2<i32>(x1, y1), 0).a;
-    return mix(mix(a, b, f.x), mix(c, d, f.x), f.y);
 }
 
 // The cumulative bottom-depth of layer `i` (i < layer_count), unpacking the 2-vec4 packed array.
@@ -154,22 +153,28 @@ fn volumetric_color(bio: vec3<f32>, depth: f32, boundary: f32) -> vec3<f32> {
     return mix(cp, cs, blend * 0.5);
 }
 
-// One texel's SURFACE colour (depth 0): the biome's surface material colour, primary↔secondary by blend.
-fn texel_surface_color(px: vec2<i32>) -> vec3<f32> {
-    let s = textureLoad(biome_tex, px, 0);
-    let prim = min(u32(s.x + 0.5), BIOME_COUNT - 1u);
-    let sec = min(u32(s.y + 0.5), BIOME_COUNT - 1u);
-    let cp = strata.columns[prim].surface_color.rgb;
-    let cs = strata.columns[sec].surface_color.rgb;
-    return mix(cp, cs, clamp(s.z, 0.0, 1.0) * 0.5);
+// One palette material's colour (rgb) + roughness (.a), clamped into the palette.
+fn palette_entry(id: u32) -> vec4<f32> {
+    let i = min(id, MAX_MATERIALS - 1u);
+    let m = palette.materials[i];
+    return vec4<f32>(m.color.rgb, m.props.x); // rgb + roughness
 }
 
-// BILINEAR biome SURFACE colour — interpolates the per-texel COLOUR (a continuous RGB) across the 4
-// surrounding texels, so biome boundaries are SMOOTH. The discrete biome IDS can't be interpolated
-// (nearest-sampled → the boundary STAIR-STEPS at the texel grid, the reported blocky edges); the resolved
-// colour can. Used for the undug surface; the depth strata (dug walls) still use the id-based lookup.
-fn biome_surface_color(uv: vec2<f32>) -> vec3<f32> {
-    let dims = vec2<f32>(textureDimensions(biome_tex));
+// One surface-material texel resolved to colour + roughness: the worldgen baked (mat_a, mat_b, weight); we
+// look the two materials up in the palette and mix. Packing rgb in .xyz, roughness in .w.
+fn texel_surface(px: vec2<i32>) -> vec4<f32> {
+    let s = textureLoad(surface_mat_tex, px, 0);
+    let ea = palette_entry(u32(s.x + 0.5));
+    let eb = palette_entry(u32(s.y + 0.5));
+    return mix(ea, eb, clamp(s.z, 0.0, 1.0));
+}
+
+// BILINEAR surface material — interpolates the per-texel resolved COLOUR+roughness (continuous) across the 4
+// surrounding texels, so material boundaries are SMOOTH. The discrete material IDS can't be interpolated
+// (nearest-sampled → the pair boundary would STAIR-STEP at the texel grid); the resolved colour can. This is
+// the worldgen-baked undug surface (biome base + altitude caps + cliffs + patches — all resolved at bake).
+fn surface_material(uv: vec2<f32>) -> vec4<f32> {
+    let dims = vec2<f32>(textureDimensions(surface_mat_tex));
     let p = clamp(uv, vec2<f32>(0.0), vec2<f32>(1.0)) * (dims - 1.0);
     let i0 = floor(p);
     let f = p - i0;
@@ -177,40 +182,11 @@ fn biome_surface_color(uv: vec2<f32>) -> vec3<f32> {
     let y0 = i32(i0.y);
     let x1 = min(x0 + 1, i32(dims.x) - 1);
     let y1 = min(y0 + 1, i32(dims.y) - 1);
-    let c00 = texel_surface_color(vec2<i32>(x0, y0));
-    let c10 = texel_surface_color(vec2<i32>(x1, y0));
-    let c01 = texel_surface_color(vec2<i32>(x0, y1));
-    let c11 = texel_surface_color(vec2<i32>(x1, y1));
+    let c00 = texel_surface(vec2<i32>(x0, y0));
+    let c10 = texel_surface(vec2<i32>(x1, y0));
+    let c01 = texel_surface(vec2<i32>(x0, y1));
+    let c11 = texel_surface(vec2<i32>(x1, y1));
     return mix(mix(c00, c10, f.x), mix(c01, c11, f.x), f.y);
-}
-
-// Surface treatment for the TOP (undug) layer: override the strata surface colour by slope/height/biome.
-// `n` = the geometric/world surface normal (its .y = cos of the slope from vertical); `y` = world height;
-// `bio` = the biome sample (so snow only caps COLD biomes). Returns the treated colour. Tunable via
-// params.surf_a / surf_b (editor sliders); the master strength surf_b.z fades the whole treatment.
-fn surface_treatment(base: vec3<f32>, n: vec3<f32>, y: f32, cold: f32) -> vec3<f32> {
-    let master = clamp(params.surf_b.z, 0.0, 1.0);
-    if (master <= 0.0) { return base; }
-    var col = base;
-
-    // (No "sand near sea level" treatment — it's a sea-level HEIGHT CONTOUR, so it drew thin squiggly rings
-    // across all rolling ground at that height, not beaches. Desert sand comes from the biome's strata
-    // surface material; real beaches need water-PROXIMITY, not a height band, and can be added later.)
-
-    // SNOW on high + COLD ground. `cold` is the WORLD-SPACE-normalised cold factor (computed in the fragment
-    // from temperature ÷ its gradient), so the snow line ramps over a constant width in METRES — uniformly
-    // smooth everywhere, regardless of how steep the climate gradient is on a given side.
-    let snow = vec3<f32>(0.85, 0.88, 0.95);
-    let snow_w = smoothstep(params.surf_a.z, params.surf_a.w, y) * cold;
-    col = mix(col, snow, clamp(snow_w, 0.0, 1.0));
-
-    // ROCK on STEEP slopes (any biome): n.y is the cos of the slope; rock from surf_a.x (start) to
-    // surf_a.y (full). Smaller cos = steeper, so the ramp goes start → full as n.y DECREASES.
-    let rock = vec3<f32>(0.13, 0.13, 0.14);
-    let rock_w = 1.0 - smoothstep(params.surf_a.y, params.surf_a.x, n.y);
-    col = mix(col, rock, clamp(rock_w, 0.0, 1.0));
-
-    return mix(base, col, master);
 }
 
 @fragment
@@ -251,19 +227,15 @@ fn fragment(in: VertexOutput, @builtin(front_facing) is_front: bool) -> Fragment
     let boundary = params.surf_b.w;
     let top_band = max(boundary * 2.0, 1.0);
     let depth_w = smoothstep(0.0, top_band, max(depth, 0.0)); // 0 = surface, 1 = below the surface band
-    let top_w = 1.0 - depth_w;                                // surface fraction (treatment + smooth colour)
-    // UNDUG surface = the BILINEAR surface colour (smooth biome borders); below the surface band = the
-    // id-based depth strata (only seen on dug walls). The bilinear colour is what kills the blocky biome edges.
-    var albedo = mix(biome_surface_color(uv), volumetric_color(bio, depth, boundary), depth_w);
-    // SNOW cold from the CONTINUOUS temperature (bilinear), a WIDE smoothstep. The km-scale climate varies
-    // slowly, so this is a wide smooth fade everywhere; the gradient-normalised variant stepped at the texel
-    // grid (the bilinear gradient is discontinuous across cells).
-    let temp = sample_temp(uv);
-    let cold = 1.0 - smoothstep(0.30, 0.46, temp);
-    let treated = surface_treatment(albedo, n_geo, in.world_position.y, cold);
-    albedo = mix(albedo, treated, top_w);
+    // UNDUG surface = the worldgen-baked SURFACE MATERIAL (palette colour + roughness, bilinear so material
+    // boundaries are smooth); below the surface band = the id-based depth strata (only seen on dug walls). ALL
+    // the "which material is here" logic (biome base, snow caps, cliff rock, patches) is resolved at BAKE time
+    // — the shader just renders it. (Stage 5 will give the dug strata their own per-material roughness.)
+    let surf = surface_material(uv);
+    var albedo = mix(surf.rgb, volumetric_color(bio, depth, boundary), depth_w);
 
     pbr_input.material.base_color = vec4<f32>(albedo, 1.0);
+    pbr_input.material.perceptual_roughness = surf.a;
     pbr_input.N = n;
 
     var out: FragmentOutput;
