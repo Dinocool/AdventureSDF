@@ -69,10 +69,15 @@ struct HeightPreviewMaterial {
     #[texture(1, sample_type = "float", filterable = false)]
     height: Handle<Image>,
     // Rgba32Float biome map: R = primary biome id, G = secondary id, B = blend (CPU-classified per texel).
+    // Used for the SLICE cut-face (volumetric strata by depth); the undug surface uses `surface` below.
     #[texture(2, sample_type = "float", filterable = false)]
     biome: Handle<Image>,
     #[uniform(3)]
     strata: StrataTableStd,
+    // Rgba32Float RESOLVED surface colour (rgb) per texel — `biome::resolve_surface` → palette, the SAME SSOT
+    // the in-world surface bakes, so the preview's undug surface mirrors the live world (caps/cliffs/patches).
+    #[texture(4, sample_type = "float", filterable = false)]
+    surface: Handle<Image>,
 }
 
 impl Material for HeightPreviewMaterial {
@@ -155,6 +160,8 @@ struct GpuTarget {
     height: Handle<Image>,
     /// The CPU-classified biome map (R = primary id, G = secondary id, B = blend), baked alongside height.
     biome: Handle<Image>,
+    /// The CPU-resolved surface-colour map (`resolve_surface` → palette), baked alongside height.
+    surface: Handle<Image>,
     /// The offscreen output image (resized to track the requested on-screen size).
     output: Handle<Image>,
     out_w: u32,
@@ -224,6 +231,24 @@ fn make_biome_image(images: &mut Assets<Image>) -> Handle<Image> {
     images.add(image)
 }
 
+/// The CPU-resolved surface-colour map (Rgba32Float: rgb = the `resolve_surface` colour, a = 0), filled by
+/// [`bake_surface`]. Same window/resolution as the heightfield; the shader bilinear-samples it for the undug
+/// surface so the preview mirrors the in-world surface materials.
+fn make_surface_image(images: &mut Assets<Image>) -> Handle<Image> {
+    let n = HEIGHTFIELD_RES as u32;
+    let data = vec![0u8; (n * n) as usize * 16]; // 4 × f32
+    let mut image = Image::new(
+        Extent3d { width: n, height: n, depth_or_array_layers: 1 },
+        TextureDimension::D2,
+        data,
+        TextureFormat::Rgba32Float,
+        RenderAssetUsages::all(),
+    );
+    image.texture_descriptor.usage = TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST;
+    image.sampler = ImageSampler::nearest();
+    images.add(image)
+}
+
 /// Run the Stage-1 Whittaker classifier ([`biome::surface_biome`]) per texel over the same ±`half` window
 /// as the heightfield, writing (primary id, secondary id, blend) into `image`. This keeps ALL biome
 /// classification on the CPU SSOT — the shader never re-implements the climate/Whittaker logic. Uses the
@@ -240,6 +265,44 @@ fn bake_biome(image: &mut Image, half: f64, center: (f64, f64)) {
             data[k] = s.primary as u8 as f32;
             data[k + 1] = s.secondary as u8 as f32;
             data[k + 2] = s.blend;
+            data[k + 3] = 0.0;
+        }
+    }
+    image.data = Some(bytemuck::cast_slice(&data).to_vec());
+}
+
+/// Surface-colour bake half-width for the biome border cross-fade (mirrors the in-world MeshBakeConfig
+/// default — the preview isn't a specific world chunk, so a representative value is fine).
+const PREVIEW_BIOME_BLEND_M: f64 = 150.0;
+
+/// Fill `image` with the RESOLVED surface colour per texel — `biome::resolve_surface` (biome base + snow/rock
+/// caps + cliffs + patches) looked up in `lib`'s palette — over the SAME window as the heightfield. The
+/// per-texel surface height + slope come from the graph (`g.eval`), exactly as the height bake. This is the
+/// preview's mirror of the in-world surface bake (the same CPU SSOT), so the preview surface matches the
+/// world. Re-baked when the graph/window OR the library changes (the bake key folds a library fingerprint).
+fn bake_surface(image: &mut Image, g: &Graph, half: f64, center: (f64, f64), lib: &BiomeLibrary) {
+    let n = HEIGHTFIELD_RES;
+    let mut data = vec![0f32; n * n * 4];
+    let have_lib = lib.biomes.len() == BIOME_COUNT && !lib.materials.is_empty();
+    for j in 0..n {
+        for i in 0..n {
+            let wx = center.0 - half + (i as f64 + 0.5) / n as f64 * 2.0 * half;
+            let wz = center.1 - half + (j as f64 + 0.5) / n as f64 * 2.0 * half;
+            let k = (j * n + i) * 4;
+            if !have_lib {
+                continue; // zeroed until the library compiles
+            }
+            let f = g.eval(wx, wz, PREVIEW_SEED);
+            // cos of the surface slope = N.y for N = normalize(-dx, 1, -dz).
+            let n_y = 1.0 / (1.0 + f.dx * f.dx + f.dz * f.dz).sqrt();
+            let bio = biome::surface_biome_world(wx, wz, PREVIEW_SEED, PREVIEW_BIOME_BLEND_M);
+            let sb = biome::resolve_surface(wx, wz, f.v, n_y, bio, PREVIEW_SEED, lib);
+            let ca = lib.materials[(sb.mat_a as usize).min(lib.materials.len() - 1)].base_color;
+            let cb = lib.materials[(sb.mat_b as usize).min(lib.materials.len() - 1)].base_color;
+            let w = sb.weight;
+            data[k] = ca[0] + (cb[0] - ca[0]) * w;
+            data[k + 1] = ca[1] + (cb[1] - ca[1]) * w;
+            data[k + 2] = ca[2] + (cb[2] - ca[2]) * w;
             data[k + 3] = 0.0;
         }
     }
@@ -279,15 +342,27 @@ fn bake_height(image: &mut Image, g: &Graph, half: f64, center: (f64, f64)) -> (
     (ymin, ymax)
 }
 
-/// Fingerprint the bake inputs (graph + window) so the heightfield is only re-baked on change. Orbit
-/// (yaw/pitch) is NOT included — rotation is a pure GPU-shader operation on the baked square.
-fn bake_key(g: &Graph, half: f64, center: (f64, f64)) -> u64 {
+/// Fingerprint the bake inputs (graph + window + biome-library fingerprint) so the height/biome/surface maps
+/// are only re-baked on change. `lib_fp` folds in the library so a `biomes.ron` edit re-bakes the surface
+/// colours. Orbit (yaw/pitch) is NOT included — rotation is a pure GPU-shader operation on the baked square.
+fn bake_key(g: &Graph, half: f64, center: (f64, f64), lib_fp: u64) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
     ron::to_string(g).unwrap_or_default().hash(&mut h);
     half.to_bits().hash(&mut h);
     center.0.to_bits().hash(&mut h);
     center.1.to_bits().hash(&mut h);
+    lib_fp.hash(&mut h);
+    h.finish()
+}
+
+/// A cheap fingerprint of the biome library (its palette + biome defs) so a `biomes.ron` edit invalidates
+/// the surface bake (see [`bake_key`]). Serialises the small palette/biome lists and hashes them.
+fn lib_fingerprint(lib: &BiomeLibrary) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    ron::to_string(&lib.materials).unwrap_or_default().hash(&mut h);
+    ron::to_string(&lib.biomes).unwrap_or_default().hash(&mut h);
     h.finish()
 }
 
@@ -368,12 +443,14 @@ fn setup_gpu_pool(
         let layer = RenderLayers::layer(POOL_LAYER_BASE + slot);
         let height = make_height_image(&mut images);
         let biome = make_biome_image(&mut images);
+        let surface = make_surface_image(&mut images);
         let output = make_output_image(&mut images, PREVIEW_SIZE, PREVIEW_SIZE);
         let material = materials.add(HeightPreviewMaterial {
             params: PreviewParams::default(),
             height: height.clone(),
             biome: biome.clone(),
             strata: StrataTableStd::default(),
+            surface: surface.clone(),
         });
         let quad = meshes.add(Rectangle::new(2.0, 2.0));
         commands.spawn((Mesh3d(quad), MeshMaterial3d(material.clone()), Transform::IDENTITY, layer.clone()));
@@ -401,6 +478,7 @@ fn setup_gpu_pool(
             material,
             height,
             biome,
+            surface,
             output,
             out_w: PREVIEW_SIZE,
             out_h: PREVIEW_SIZE,
@@ -428,6 +506,10 @@ fn process_gpu_previews(world: &mut World) {
         .filter(|lib| lib.biomes.len() == BIOME_COUNT)
         .map(StrataTableStd::from_library)
         .unwrap_or_default();
+    // The live biome library + a fingerprint of it: the surface bake reads `resolve_surface` from it, and a
+    // `biomes.ron` edit must re-bake the surface colours (folded into the bake key alongside graph/window).
+    let lib = world.get_resource::<BiomeLibrary>().cloned().unwrap_or_default();
+    let lib_fp = lib_fingerprint(&lib);
     world.resource_scope::<GpuPreviewPool, ()>(|world, mut pool| {
         let req_keys: HashSet<u64> = requests.iter().map(|r| r.key).collect();
         // request index → slot index. Reuse a slot already holding the key, else take a free one.
@@ -484,10 +566,11 @@ fn process_gpu_previews(world: &mut World) {
             }
             // Square world window (the previews are drawn square). The heightfield is baked once per
             // graph/zoom/pan; orbiting (yaw/pitch) is a pure GPU operation, so no re-bake on rotate.
-            let bk = bake_key(&r.graph, r.half, r.center);
+            let bk = bake_key(&r.graph, r.half, r.center, lib_fp);
             if pool.targets[si].key != r.key || pool.targets[si].baked_key != bk {
                 let h = pool.targets[si].height.clone();
                 let bio = pool.targets[si].biome.clone();
+                let surf = pool.targets[si].surface.clone();
                 let mut images = world.resource_mut::<Assets<Image>>();
                 if let Some(img) = images.get_mut(&h) {
                     let (ymin, ymax) = bake_height(img, &r.graph, r.half, r.center);
@@ -497,6 +580,10 @@ fn process_gpu_previews(world: &mut World) {
                 // Re-classify the biome map over the same window (CPU Whittaker SSOT, no GPU port).
                 if let Some(img) = images.get_mut(&bio) {
                     bake_biome(img, r.half, r.center);
+                }
+                // Re-resolve the surface-material colour over the same window (the SSOT mirror of the world).
+                if let Some(img) = images.get_mut(&surf) {
+                    bake_surface(img, &r.graph, r.half, r.center, &lib);
                 }
                 pool.targets[si].key = r.key;
                 pool.targets[si].baked_key = bk;
