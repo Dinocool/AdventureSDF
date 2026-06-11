@@ -182,6 +182,7 @@ fn compile_rejects_missing_material() {
             name: "only".into(),
             base_color: [0.5, 0.5, 0.5, 1.0],
             roughness: 1.0,
+            blend: 4.0,
         }],
         biomes: BiomeId::ALL
             .iter()
@@ -207,6 +208,7 @@ fn compile_rejects_biome_count_mismatch() {
             name: "m".into(),
             base_color: [0.0; 4],
             roughness: 1.0,
+            blend: 4.0,
         }],
         biomes: vec![],
     };
@@ -350,6 +352,34 @@ fn gpu_strata_table_matches_library() {
 #[test]
 fn strata_table_std_is_valid_std140_uniform() {
     StrataTableStd::assert_uniform_compat();
+}
+
+/// The material palette uniform must be a VALID std140 uniform too (same `[scalar; N]` stride hazard — the
+/// `_pad` is a `UVec3`, the arrays are `Vec4`). Fires the encase assert at test time, not launch.
+#[test]
+fn material_palette_std_is_valid_std140_uniform() {
+    MaterialPaletteStd::assert_uniform_compat();
+}
+
+/// `MaterialPaletteStd::from_library` flattens colour + roughness by `TerrainMatId`, sets `count`, and never
+/// panics on an empty (unloaded) library.
+#[test]
+fn material_palette_from_library_flattens_and_clamps() {
+    let empty = BiomeLibrary::default();
+    let p = MaterialPaletteStd::from_library(&empty);
+    assert_eq!(p.count, 0, "empty library ⇒ zeroed palette, no panic");
+
+    let lib = BiomeLibrary {
+        materials: vec![
+            TerrainSurfaceMaterial { name: "a".into(), base_color: [0.1, 0.2, 0.3, 1.0], roughness: 0.7, blend: 4.0 },
+            TerrainSurfaceMaterial { name: "b".into(), base_color: [0.4, 0.5, 0.6, 1.0], roughness: 0.2, blend: 8.0 },
+        ],
+        biomes: vec![],
+    };
+    let p = MaterialPaletteStd::from_library(&lib);
+    assert_eq!(p.count, 2);
+    assert_eq!(p.materials[1].color, bevy::math::Vec4::new(0.4, 0.5, 0.6, 1.0));
+    assert_eq!(p.materials[1].props.x, 0.2, "props.x = roughness");
 }
 
 /// The packed `layer_bottom: [Vec4; 2]` (8 floats) must hold all `GPU_STRATA_MAX_LAYERS` layer bottoms.

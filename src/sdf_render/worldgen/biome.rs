@@ -324,6 +324,19 @@ pub struct TerrainSurfaceMaterial {
     pub base_color: [f32; 4],
     /// PBR roughness fallback (0 = mirror, 1 = fully diffuse).
     pub roughness: f32,
+    /// Transition SOFTNESS in WORLD metres: how far THIS material cross-fades into an adjacent material at
+    /// a surface boundary (a biome border, an altitude cap, a slope/patch edge — see [`SurfaceCond`]). The
+    /// worldgen surface resolver ([`resolve_surface`]) uses it to turn a hard rule edge into a metres-wide
+    /// blend; the shader just renders the baked `(mat_a, mat_b, weight)`. `#[serde(default)]` so older RON
+    /// without the field still loads (0 ⇒ a hard edge). A RENDER attribute (no `HEIGHT_GEN_VERSION` tie).
+    #[serde(default = "default_material_blend")]
+    pub blend: f32,
+}
+
+/// Default [`TerrainSurfaceMaterial::blend`] (metres) when the RON omits it — a gentle few-metre fade so an
+/// unauthored material still blends rather than hard-edging.
+fn default_material_blend() -> f32 {
+    4.0
 }
 
 impl TerrainSurfaceMaterial {
@@ -639,6 +652,58 @@ impl StrataTableStd {
             columns[i] = GpuStrataColumnStd::from(c);
         }
         Self { columns }
+    }
+}
+
+/// Max materials in the GPU surface palette ([`MaterialPaletteStd`]) — the `TerrainMatId(i)` the baked
+/// surface map (`mat_a`, `mat_b`) indexes. A fixed cap so the uniform is a sized array; the WGSL palette
+/// declares the SAME `GPU_MAX_MATERIALS`. Bump (here + the shader const) if a world needs more than this.
+pub const GPU_MAX_MATERIALS: usize = 32;
+
+/// One palette material laid out for **std140**: `color` (linear RGBA) and `props` (`x` = roughness, rest
+/// reserved). The worldgen bakes a surface map of material IDs plus a blend weight; the shader looks the
+/// colour and roughness up here and mixes, so all the "which material is on the surface" logic lives in the
+/// bake, not the shader. The per-material `blend` softness is consumed CPU-side by [`resolve_surface`] to
+/// compute the baked weight, so it is not uploaded. `Vec4`s only — the `scalar`-array std140 stride gotcha.
+#[derive(ShaderType, Clone, Copy, Default)]
+pub struct GpuMaterialStd {
+    pub color: Vec4,
+    /// `x` = roughness; `y,z,w` reserved (metallic / future PBR scalars).
+    pub props: Vec4,
+}
+
+/// The flat material palette uniform — `TerrainMatId(i)` → colour + roughness, sized to [`GPU_MAX_MATERIALS`].
+/// Built from the live [`BiomeLibrary`] palette by [`MaterialPaletteStd::from_library`]; uploaded alongside
+/// the strata table for the terrain-surface material. `count` is the number of REAL materials (the rest are
+/// zeroed); the shader clamps `mat_a`/`mat_b` into `[0, count)`.
+#[derive(ShaderType, Clone, Copy)]
+pub struct MaterialPaletteStd {
+    pub materials: [GpuMaterialStd; GPU_MAX_MATERIALS],
+    pub count: u32,
+    pub _pad: UVec3,
+}
+
+impl Default for MaterialPaletteStd {
+    fn default() -> Self {
+        Self { materials: [GpuMaterialStd::default(); GPU_MAX_MATERIALS], count: 0, _pad: UVec3::ZERO }
+    }
+}
+
+impl MaterialPaletteStd {
+    /// Flatten the library's material palette into the GPU uniform (clamped to [`GPU_MAX_MATERIALS`]). The
+    /// SSOT the bake's `mat_a`/`mat_b` indices resolve against in the shader. Robust to an unloaded library
+    /// (empty `materials` ⇒ a zeroed palette, `count = 0` — never panics, mirrors [`gpu_strata_table`]).
+    pub fn from_library(lib: &BiomeLibrary) -> Self {
+        let mut out = Self::default();
+        let n = lib.materials.len().min(GPU_MAX_MATERIALS);
+        for (i, m) in lib.materials.iter().take(n).enumerate() {
+            out.materials[i] = GpuMaterialStd {
+                color: Vec4::from_array(m.base_color),
+                props: Vec4::new(m.roughness, 0.0, 0.0, 0.0),
+            };
+        }
+        out.count = n as u32;
+        out
     }
 }
 
