@@ -11,8 +11,8 @@ use crate::editor::worldgen_gpu_preview::GpuPreviewRequest;
 use super::convert::new_biome_subgraph;
 use super::node::{input_label, node_catalog, node_kind_name, node_params_ui};
 use super::preview::{
-    PreviewView, gpu_inline_key, handle_preview_gestures, paint_scale_label, preview_image,
-    preview_resize_grip,
+    PreviewView, gpu_inline_key, handle_preview_gestures, modes_controls_ui, paint_scale_label,
+    preview_image, preview_resize_grip,
 };
 use super::{CLIMATE_INPUTS, EdNode, NodeCaches, ViewerSignals, climate_name, graph_rooted_at};
 
@@ -148,12 +148,13 @@ impl SnarlViewer<EdNode> for Viewer<'_> {
             let half = view.zoom_half_m;
             let (yaw, pitch) = view.cam;
             let (cx, cz) = view.pan;
+            let mut modes = view.modes;
 
             match graph_rooted_at(snarl, node) {
                 Ok(g) => {
                     // Both 2D and 3D render on the GPU pool (one shader, one `height_colour` SSOT).
                     let gkey = gpu_inline_key(self.level_salt, node);
-                    self.gpu_reqs.push(PreviewView { half, cx, cz, yaw, pitch }.to_request(gkey, g, is3d, res as u32));
+                    self.gpu_reqs.push(PreviewView { half, cx, cz, yaw, pitch }.to_request(gkey, g, is3d, modes, res as u32));
                     let tex = self.gpu_tex.get(&gkey).copied();
                     // Controls ABOVE the image: a compact icon row (no km field — zoom is scroll on the image).
                     ui.horizontal(|ui| {
@@ -167,6 +168,9 @@ impl SnarlViewer<EdNode> for Viewer<'_> {
                             self.caches.views.entry(node).or_default().surface = !is3d;
                         }
                     });
+                    // Biome / slice / water overlay toggles (shared helper). Persist any change back below.
+                    modes_controls_ui(ui, &mut modes, is3d);
+                    self.caches.views.entry(node).or_default().modes = modes;
                     // The preview image (placeholder for the ~1 frame before the GPU texture warms up) with
                     // on-image gestures: scroll = zoom, drag = orbit (3D) / pan (2D), right-drag = pan (3D).
                     let img_resp = preview_image(ui, tex, egui::vec2(size, size));

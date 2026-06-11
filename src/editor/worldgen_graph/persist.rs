@@ -13,6 +13,8 @@ use egui_snarl::{NodeId, Snarl};
 
 use crate::sdf_render::worldgen::graph::GraphAsset;
 
+use crate::editor::worldgen_gpu_preview::PreviewModes;
+
 use super::convert::{graph_to_snarl, valid_depth, world_biome_snarl, worldgraph_path};
 use super::preview::{PoppedPreview, PreviewView, WorldgenPreviewPanels};
 use super::{EdNode, NodeView, WorldGraphEditor};
@@ -66,6 +68,9 @@ pub(super) struct PanelView {
     pub node: NodeId,
     pub is3d: bool,
     pub view: PreviewView,
+    /// Biome-map / slice / water overlay toggles (`#[serde(default)]` so older files load).
+    #[serde(default)]
+    pub modes: PreviewModes,
 }
 
 /// One floating pop-out preview window's persisted target + view.
@@ -76,6 +81,9 @@ pub(super) struct PoppedView {
     pub is3d: bool,
     pub size: f32,
     pub view: PreviewView,
+    /// Biome-map / slice / water overlay toggles (`#[serde(default)]` so older files load).
+    #[serde(default)]
+    pub modes: PreviewModes,
 }
 
 /// Snapshot the editor + preview panel SET into an [`EditorView`] (the resumable state half of the doc).
@@ -92,13 +100,21 @@ pub(super) fn gather_view(editor: &WorldGraphEditor, panels: &WorldgenPreviewPan
                 node: *node,
                 is3d: p.is3d,
                 view: p.view(),
+                modes: p.modes,
             })
         })
         .collect();
     let popped = editor
         .popped
         .iter()
-        .map(|p| PoppedView { nav: p.nav.clone(), node: p.node, is3d: p.is3d, size: p.size, view: p.view() })
+        .map(|p| PoppedView {
+            nav: p.nav.clone(),
+            node: p.node,
+            is3d: p.is3d,
+            size: p.size,
+            view: p.view(),
+            modes: p.modes,
+        })
         .collect();
     EditorView { nodes: editor.caches.views.clone(), nav: editor.nav.clone(), panels, panel: None, popped }
 }
@@ -117,7 +133,7 @@ pub(super) fn apply_view(view: EditorView, editor: &mut WorldGraphEditor, panels
     // Fold the deprecated single `panel` field (old saves) in front of the `panels` list, then spawn a
     // fresh preview instance + tab for each (allocates an id, queues `to_open`).
     for p in view.panel.into_iter().chain(view.panels) {
-        panels.open((p.nav, p.node), p.view, p.is3d);
+        panels.open((p.nav, p.node), p.view, p.is3d, p.modes);
     }
 
     editor.popped = view
@@ -136,6 +152,7 @@ pub(super) fn apply_view(view: EditorView, editor: &mut WorldGraphEditor, panels
                 size: p.size,
                 is3d: p.is3d,
                 cam: (p.view.yaw, p.view.pitch),
+                modes: p.modes,
                 open: true,
             }
         })

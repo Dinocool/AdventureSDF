@@ -28,6 +28,9 @@ use bevy::render::render_resource::{
 use bevy::shader::ShaderRef;
 use bevy_egui::{EguiTextureHandle, EguiUserTextures, egui};
 
+use crate::sdf_render::worldgen::biome::{
+    self, BiomeId, BiomeLibrary, GPU_STRATA_MAX_LAYERS, GpuStrataColumn,
+};
 use crate::sdf_render::worldgen::graph::node::Graph;
 
 /// Number of pre-allocated GPU preview targets (cap on simultaneous GPU-backed previews).
@@ -52,11 +55,77 @@ struct PreviewParams {
     fwd: Vec4,    // xyz forward, w = world half-extent Z
     right: Vec4,  // xyz right, w = height min
     up: Vec4,     // xyz up, w = height max
-    levels: Vec4, // sea, snow, water-depth, (unused)
+    levels: Vec4, // sea, snow, water-depth-ramp, water-level
     flags: Vec4,  // x = mode (0 = 3D orbit, 1 = 2D top-down), y = halfX, z = halfZ
+    modes: Vec4,  // x = biome-map on, y = slice on, z = water on, w = unused
+    slice: Vec4,  // x = axis (0=X,1=Z,2=Y), y = world-plane coord, (z,w) unused
 }
 
-/// Custom fullscreen-quad material: the camera uniform + the CPU-baked height/normal texture.
+/// GPU mirror of [`GpuStrataColumn`] (one biome's flattened strata column) laid out for std140: the 6
+/// cumulative layer bottoms are packed into 2 `Vec4` lanes so the array stays 16-byte aligned. Built from
+/// the CPU SSOT [`BiomeLibrary::gpu_strata_table`] — the same table the Stage-3 in-world shader will use.
+#[derive(ShaderType, Clone, Copy, Default)]
+struct GpuStrataColumnStd {
+    surface_color: Vec4,
+    layer_color: [Vec4; GPU_STRATA_MAX_LAYERS],
+    layer_bottom: [Vec4; 2], // 6 floats packed: lane0.xyzw + lane1.xy
+    bedrock_color: Vec4,
+    layer_count: u32,
+    _pad: [u32; 3],
+}
+
+impl From<&GpuStrataColumn> for GpuStrataColumnStd {
+    fn from(c: &GpuStrataColumn) -> Self {
+        let mut layer_color = [Vec4::ZERO; GPU_STRATA_MAX_LAYERS];
+        for (i, col) in c.layer_color.iter().enumerate() {
+            layer_color[i] = Vec4::from_array(*col);
+        }
+        // Pack 6 bottoms into 2 vec4 lanes (xyzw, then xy…).
+        let mut bottom = [Vec4::ZERO; 2];
+        for (i, &b) in c.layer_bottom.iter().enumerate() {
+            bottom[i / 4][i % 4] = b;
+        }
+        Self {
+            surface_color: Vec4::from_array(c.surface_color),
+            layer_color,
+            layer_bottom: bottom,
+            bedrock_color: Vec4::from_array(c.bedrock_color),
+            layer_count: c.layer_count,
+            _pad: [0; 3],
+        }
+    }
+}
+
+/// The full per-biome strata table uniform (one column per [`BiomeId`], id order) — the GPU side of
+/// [`BiomeLibrary::gpu_strata_table`]. A fixed-size array sized to the demo biome count.
+#[derive(ShaderType, Clone, Copy)]
+struct StrataTableStd {
+    columns: [GpuStrataColumnStd; BIOME_COUNT],
+}
+
+/// Demo biome count (matches `BiomeId::ALL.len()` and the shader's `BIOME_COUNT`).
+const BIOME_COUNT: usize = BiomeId::ALL.len();
+
+impl Default for StrataTableStd {
+    fn default() -> Self {
+        Self { columns: [GpuStrataColumnStd::default(); BIOME_COUNT] }
+    }
+}
+
+impl StrataTableStd {
+    /// Flatten a [`BiomeLibrary`] into the GPU table (via the CPU SSOT), clamped/padded to [`BIOME_COUNT`].
+    fn from_library(lib: &BiomeLibrary) -> Self {
+        let table = lib.gpu_strata_table();
+        let mut columns = [GpuStrataColumnStd::default(); BIOME_COUNT];
+        for (i, c) in table.iter().take(BIOME_COUNT).enumerate() {
+            columns[i] = GpuStrataColumnStd::from(c);
+        }
+        Self { columns }
+    }
+}
+
+/// Custom fullscreen-quad material: the camera uniform + the CPU-baked height/normal + biome textures and
+/// the flattened strata table.
 #[derive(Asset, AsBindGroup, Clone, TypePath)]
 struct HeightPreviewMaterial {
     #[uniform(0)]
@@ -64,6 +133,11 @@ struct HeightPreviewMaterial {
     // Rgba32Float, fetched via `textureLoad` (unfilterable → manual bilinear in the shader).
     #[texture(1, sample_type = "float", filterable = false)]
     height: Handle<Image>,
+    // Rgba32Float biome map: R = primary biome id, G = secondary id, B = blend (CPU-classified per texel).
+    #[texture(2, sample_type = "float", filterable = false)]
+    biome: Handle<Image>,
+    #[uniform(3)]
+    strata: StrataTableStd,
 }
 
 impl Material for HeightPreviewMaterial {
@@ -87,10 +161,48 @@ pub struct GpuPreviewRequest {
     /// Orbit camera (3D only).
     pub yaw: f32,
     pub pitch: f32,
+    /// Biome-map / slice / water preview toggles + their parameters.
+    pub modes: PreviewModes,
     /// Desired output resolution (px) — the pool resizes the slot's image to this (quantised) so the render
     /// tracks the on-screen size AND fills a non-square window (the camera fov widens by `res_w/res_h`).
     pub res_w: u32,
     pub res_h: u32,
+}
+
+/// The biome-map / strata-slice / water preview toggles + their parameters, carried per preview through
+/// the request and persisted per node/panel/pop-out. The single carrier for the three optional preview
+/// overlays (TERRAIN_MATERIALS_PLAN "Biome preview" / "SLICE" / "WATER plane").
+#[derive(Clone, Copy, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct PreviewModes {
+    /// Colour the preview by the SURFACE biome's `preview_color` (climate→biome→surface) instead of the
+    /// height ramp. 2D = a climate/biome map; 3D = the surface shaded by biome.
+    pub biome_map: bool,
+    /// Slice/cutaway: hide the near half past the clip plane + shade the exposed strata cross-section.
+    pub slice_on: bool,
+    /// Slice clip-plane axis: 0 = X, 1 = Z, 2 = Y.
+    pub slice_axis: u8,
+    /// Slice plane position along its axis, normalized `[0,1]` over the sampled window (mapped to a world
+    /// coordinate at build time).
+    pub slice_pos: f32,
+    /// Semi-transparent water plane at the water level, compositing over terrain below it.
+    pub water_on: bool,
+    /// Water level (world metres) — defaults to the preview sea level ([`SEA_LEVEL`]); an optional slider.
+    pub water_level: f32,
+}
+
+impl Default for PreviewModes {
+    fn default() -> Self {
+        // Sensible defaults: every overlay OFF (height preview), slice across X at the centre.
+        Self {
+            biome_map: false,
+            slice_on: false,
+            slice_axis: 0,
+            slice_pos: 0.5,
+            water_on: false,
+            water_level: SEA_LEVEL,
+        }
+    }
 }
 
 /// Inbox: preview consumers push requests here each frame; [`process_gpu_previews`] drains it.
@@ -106,6 +218,8 @@ struct GpuTarget {
     camera: Entity,
     material: Handle<HeightPreviewMaterial>,
     height: Handle<Image>,
+    /// The CPU-classified biome map (R = primary id, G = secondary id, B = blend), baked alongside height.
+    biome: Handle<Image>,
     /// The offscreen output image (resized to track the requested on-screen size).
     output: Handle<Image>,
     out_w: u32,
@@ -113,7 +227,7 @@ struct GpuTarget {
     tex_id: egui::TextureId,
     /// Preview key currently assigned to this slot (0 = free).
     key: u64,
-    /// Graph+zoom fingerprint last baked into `height`.
+    /// Graph+zoom fingerprint last baked into `height`/`biome`.
     baked_key: u64,
     ymin: f32,
     ymax: f32,
@@ -155,6 +269,46 @@ fn make_height_image(images: &mut Assets<Image>) -> Handle<Image> {
     image.texture_descriptor.usage = TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST;
     image.sampler = ImageSampler::nearest();
     images.add(image)
+}
+
+/// The CPU-classified biome map (Rgba32Float: R = primary biome id, G = secondary id, B = blend), filled
+/// by [`bake_biome`] over the same window as the heightfield. Same resolution as the heightfield so the
+/// shader can index both by the same planar UV.
+fn make_biome_image(images: &mut Assets<Image>) -> Handle<Image> {
+    let n = HEIGHTFIELD_RES as u32;
+    let data = vec![0u8; (n * n) as usize * 16]; // 4 × f32
+    let mut image = Image::new(
+        Extent3d { width: n, height: n, depth_or_array_layers: 1 },
+        TextureDimension::D2,
+        data,
+        TextureFormat::Rgba32Float,
+        RenderAssetUsages::all(),
+    );
+    image.texture_descriptor.usage = TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST;
+    image.sampler = ImageSampler::nearest();
+    images.add(image)
+}
+
+/// Run the Stage-1 Whittaker classifier ([`biome::surface_biome`]) per texel over the same ±`half` window
+/// as the heightfield, writing (primary id, secondary id, blend) into `image`. This keeps ALL biome
+/// classification on the CPU SSOT — the shader never re-implements the climate/Whittaker logic. Uses the
+/// preview seed so the map matches the world bake's biome placement.
+fn bake_biome(image: &mut Image, half: f64, center: (f64, f64)) {
+    let n = HEIGHTFIELD_RES;
+    let mut data = vec![0f32; n * n * 4];
+    for j in 0..n {
+        for i in 0..n {
+            let wx = center.0 - half + (i as f64 + 0.5) / n as f64 * 2.0 * half;
+            let wz = center.1 - half + (j as f64 + 0.5) / n as f64 * 2.0 * half;
+            let s = biome::surface_biome(wx, wz, PREVIEW_SEED);
+            let k = (j * n + i) * 4;
+            data[k] = s.primary as u8 as f32;
+            data[k + 1] = s.secondary as u8 as f32;
+            data[k + 2] = s.blend;
+            data[k + 3] = 0.0;
+        }
+    }
+    image.data = Some(bytemuck::cast_slice(&data).to_vec());
 }
 
 /// Evaluate the graph over the square ±`half` window into `image` (height + analytic world normal); returns
@@ -205,7 +359,15 @@ fn bake_key(g: &Graph, half: f64, center: (f64, f64)) -> u64 {
 /// Orbit camera + framing → the shader uniform. The window is **square** (±`half`); the camera distance is
 /// fit so the terrain AABB just fills the (square) frustum at this orbit angle — a tight margin, every
 /// corner in frame, no fixed slack.
-fn build_params(yaw: f32, pitch: f32, half: f32, ymin: f32, ymax: f32, is3d: bool) -> PreviewParams {
+fn build_params(
+    yaw: f32,
+    pitch: f32,
+    half: f32,
+    ymin: f32,
+    ymax: f32,
+    is3d: bool,
+    modes: &PreviewModes,
+) -> PreviewParams {
     let span = (ymax - ymin).max(1.0);
     let pad = span * 0.02 + 1.0; // minimal vertical breathing room (was 0.08)
     let centre = Vec3::new(0.0, (ymin + ymax) * 0.5, 0.0);
@@ -228,13 +390,29 @@ fn build_params(yaw: f32, pitch: f32, half: f32, ymin: f32, ymax: f32, is3d: boo
         }
     }
     let eye = centre - fwd * (d * 1.015); // tight margin so corners aren't pixel-clipped (was 1.06)
+
+    // Map the normalized slice position to a world coordinate along its axis: X/Z over [-half, half], Y
+    // over the baked height span [ymin, ymax].
+    let p = modes.slice_pos.clamp(0.0, 1.0);
+    let slice_coord = match modes.slice_axis {
+        2 => ymin + p * (ymax - ymin),
+        _ => -half + p * 2.0 * half,
+    };
+
     PreviewParams {
         eye: eye.extend(tan),
         fwd: fwd.extend(half),
         right: right.extend(ymin),
         up: up.extend(ymax),
-        levels: Vec4::new(SEA_LEVEL, SNOW_LEVEL, WATER_DEPTH, 0.0),
+        levels: Vec4::new(SEA_LEVEL, SNOW_LEVEL, WATER_DEPTH, modes.water_level),
         flags: Vec4::new(if is3d { 0.0 } else { 1.0 }, half, half, 0.0),
+        modes: Vec4::new(
+            if modes.biome_map { 1.0 } else { 0.0 },
+            if modes.slice_on { 1.0 } else { 0.0 },
+            if modes.water_on { 1.0 } else { 0.0 },
+            0.0,
+        ),
+        slice: Vec4::new(modes.slice_axis as f32, slice_coord, 0.0, 0.0),
     }
 }
 
@@ -254,8 +432,14 @@ fn setup_gpu_pool(
     for slot in 0..POOL_SIZE {
         let layer = RenderLayers::layer(POOL_LAYER_BASE + slot);
         let height = make_height_image(&mut images);
+        let biome = make_biome_image(&mut images);
         let output = make_output_image(&mut images, PREVIEW_SIZE, PREVIEW_SIZE);
-        let material = materials.add(HeightPreviewMaterial { params: PreviewParams::default(), height: height.clone() });
+        let material = materials.add(HeightPreviewMaterial {
+            params: PreviewParams::default(),
+            height: height.clone(),
+            biome: biome.clone(),
+            strata: StrataTableStd::default(),
+        });
         let quad = meshes.add(Rectangle::new(2.0, 2.0));
         commands.spawn((Mesh3d(quad), MeshMaterial3d(material.clone()), Transform::IDENTITY, layer.clone()));
         let camera = commands
@@ -281,6 +465,7 @@ fn setup_gpu_pool(
             camera,
             material,
             height,
+            biome,
             output,
             out_w: PREVIEW_SIZE,
             out_h: PREVIEW_SIZE,
@@ -301,6 +486,13 @@ fn process_gpu_previews(world: &mut World) {
         return;
     }
     let requests = std::mem::take(&mut world.resource_mut::<GpuPreviewRequests>().0);
+    // Flatten the live biome library into the GPU strata table once per frame (cheap — 5 columns) via the
+    // CPU SSOT, so the slice cut-face + biome map use the same authored colours the Stage-3 shader will.
+    let strata_table = world
+        .get_resource::<BiomeLibrary>()
+        .filter(|lib| lib.biomes.len() == BIOME_COUNT)
+        .map(StrataTableStd::from_library)
+        .unwrap_or_default();
     world.resource_scope::<GpuPreviewPool, ()>(|world, mut pool| {
         let req_keys: HashSet<u64> = requests.iter().map(|r| r.key).collect();
         // request index → slot index. Reuse a slot already holding the key, else take a free one.
@@ -360,20 +552,33 @@ fn process_gpu_previews(world: &mut World) {
             let bk = bake_key(&r.graph, r.half, r.center);
             if pool.targets[si].key != r.key || pool.targets[si].baked_key != bk {
                 let h = pool.targets[si].height.clone();
+                let bio = pool.targets[si].biome.clone();
                 let mut images = world.resource_mut::<Assets<Image>>();
                 if let Some(img) = images.get_mut(&h) {
                     let (ymin, ymax) = bake_height(img, &r.graph, r.half, r.center);
                     pool.targets[si].ymin = ymin;
                     pool.targets[si].ymax = ymax;
                 }
+                // Re-classify the biome map over the same window (CPU Whittaker SSOT, no GPU port).
+                if let Some(img) = images.get_mut(&bio) {
+                    bake_biome(img, r.half, r.center);
+                }
                 pool.targets[si].key = r.key;
                 pool.targets[si].baked_key = bk;
             }
-            let params =
-                build_params(r.yaw, r.pitch, r.half as f32, pool.targets[si].ymin, pool.targets[si].ymax, r.is3d);
+            let params = build_params(
+                r.yaw,
+                r.pitch,
+                r.half as f32,
+                pool.targets[si].ymin,
+                pool.targets[si].ymax,
+                r.is3d,
+                &r.modes,
+            );
             let mat_h = pool.targets[si].material.clone();
             if let Some(mat) = world.resource_mut::<Assets<HeightPreviewMaterial>>().get_mut(&mat_h) {
                 mat.params = params;
+                mat.strata = strata_table;
             }
             out.insert(r.key, pool.targets[si].tex_id);
         }
@@ -433,5 +638,76 @@ mod tests {
             "HF_TEX_RES in worldgen_preview.wgsl ({shader_res}) != HEIGHTFIELD_RES in \
              worldgen_gpu_preview.rs ({HEIGHTFIELD_RES})"
         );
+    }
+
+    /// Parse `const <name>: <ty> = <N>u?;` from the shader and return the integer literal.
+    fn shader_uint_const(src: &str, name: &str) -> usize {
+        let line = src
+            .lines()
+            .find(|l| l.contains(name) && l.contains("const"))
+            .unwrap_or_else(|| panic!("worldgen_preview.wgsl declares `const {name}`"));
+        let rhs = line.split('=').nth(1).expect("const has an `= value`").trim();
+        let digits: String = rhs.chars().take_while(|c| c.is_ascii_digit()).collect();
+        digits.parse().unwrap_or_else(|_| panic!("`{name}` value is numeric, got `{rhs}`"))
+    }
+
+    /// The shader's strata-table dimensions MUST match the Rust/biome SSOT — the `strata` uniform is laid
+    /// out as `[StrataColumn; BIOME_COUNT]` with `[Vec4; STRATA_MAX_LAYERS]` colours; a mismatch silently
+    /// corrupts the strata slice / biome map. Catch it at build time (like `HF_TEX_RES`).
+    #[test]
+    fn shader_strata_dims_match_rust() {
+        let src = include_str!("../../assets/shaders/worldgen_preview.wgsl");
+        assert_eq!(
+            shader_uint_const(src, "STRATA_MAX_LAYERS"),
+            GPU_STRATA_MAX_LAYERS,
+            "STRATA_MAX_LAYERS in the shader != GPU_STRATA_MAX_LAYERS in biome.rs"
+        );
+        assert_eq!(
+            shader_uint_const(src, "BIOME_COUNT"),
+            BIOME_COUNT,
+            "BIOME_COUNT in the shader != BiomeId::ALL.len()"
+        );
+    }
+
+    /// The packed `layer_bottom: [Vec4; 2]` must hold all `GPU_STRATA_MAX_LAYERS` layer bottoms.
+    #[test]
+    fn packed_layer_bottom_fits_all_layers() {
+        assert!(GPU_STRATA_MAX_LAYERS <= 8, "layer_bottom packs into 2 vec4 (8 floats)");
+    }
+
+    /// The GPU strata column mirrors the CPU `GpuStrataColumn`: a depth probe of `GpuStrataColumnStd`
+    /// (the packed/unpacked layout the shader reads) reproduces the source column's colours.
+    #[test]
+    fn gpu_strata_column_std_mirrors_cpu() {
+        let cpu = GpuStrataColumn {
+            surface_color: [0.1, 0.2, 0.3, 1.0],
+            layer_color: {
+                let mut a = [[0.0; 4]; GPU_STRATA_MAX_LAYERS];
+                a[0] = [0.4, 0.0, 0.0, 1.0];
+                a[1] = [0.0, 0.5, 0.0, 1.0];
+                a[2] = [0.0, 0.0, 0.6, 1.0];
+                a
+            },
+            layer_bottom: {
+                let mut a = [0.0; GPU_STRATA_MAX_LAYERS];
+                a[0] = 1.0;
+                a[1] = 5.0;
+                a[2] = 1005.0;
+                a
+            },
+            bedrock_color: [0.01, 0.01, 0.02, 1.0],
+            layer_count: 3,
+            _pad: [0; 3],
+        };
+        let std = GpuStrataColumnStd::from(&cpu);
+        // Surface / bedrock colours.
+        assert_eq!(std.surface_color, Vec4::from_array(cpu.surface_color));
+        assert_eq!(std.bedrock_color, Vec4::from_array(cpu.bedrock_color));
+        assert_eq!(std.layer_count, cpu.layer_count);
+        // Packed bottoms unpack to the source order.
+        for i in 0..3 {
+            assert_eq!(std.layer_bottom[i / 4][i % 4], cpu.layer_bottom[i], "bottom {i}");
+            assert_eq!(std.layer_color[i], Vec4::from_array(cpu.layer_color[i]), "colour {i}");
+        }
     }
 }

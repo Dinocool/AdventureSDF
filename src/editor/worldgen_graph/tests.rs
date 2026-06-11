@@ -580,6 +580,18 @@ fn scale_label_text_formats_metres_and_kilometres() {
 
 // -- persistence document (WorldGraphDoc / EditorView) -------------------------------------------
 
+/// A non-default `PreviewModes` (every overlay flipped from its default) to prove the toggles persist.
+fn sample_modes() -> crate::editor::worldgen_gpu_preview::PreviewModes {
+    crate::editor::worldgen_gpu_preview::PreviewModes {
+        biome_map: true,
+        slice_on: true,
+        slice_axis: 2,
+        slice_pos: 0.3,
+        water_on: true,
+        water_level: 42.0,
+    }
+}
+
 /// A non-default `NodeView` to prove every field survives serialization.
 fn sample_node_view() -> NodeView {
     NodeView {
@@ -589,6 +601,7 @@ fn sample_node_view() -> NodeView {
         cam: (0.25, 1.1),
         pan: (12.0, -34.0),
         disp_px: 256.0,
+        modes: sample_modes(),
     }
 }
 
@@ -609,9 +622,22 @@ fn world_graph_doc_round_trips_view_state() {
     let view = EditorView {
         nodes,
         nav: vec![b],
-        panels: vec![PanelView { nav: vec![b], node: o, is3d: true, view: sample_preview_view() }],
+        panels: vec![PanelView {
+            nav: vec![b],
+            node: o,
+            is3d: true,
+            view: sample_preview_view(),
+            modes: sample_modes(),
+        }],
         panel: None,
-        popped: vec![PoppedView { nav: vec![], node: b, is3d: false, size: 300.0, view: sample_preview_view() }],
+        popped: vec![PoppedView {
+            nav: vec![],
+            node: b,
+            is3d: false,
+            size: 300.0,
+            view: sample_preview_view(),
+            modes: sample_modes(),
+        }],
     };
     let doc = WorldGraphDoc { version: 1, snarl: top, view };
 
@@ -629,14 +655,26 @@ fn world_graph_doc_round_trips_view_state() {
     assert_eq!(nv.cam, want.cam);
     assert_eq!(nv.pan, want.pan);
     assert_eq!(nv.disp_px, want.disp_px);
+    // The biome/slice/water overlay toggles survive on the NodeView.
+    let m = sample_modes();
+    assert_eq!(nv.modes.biome_map, m.biome_map);
+    assert_eq!(nv.modes.slice_on, m.slice_on);
+    assert_eq!(nv.modes.slice_axis, m.slice_axis);
+    assert_eq!(nv.modes.slice_pos, m.slice_pos);
+    assert_eq!(nv.modes.water_on, m.water_on);
+    assert_eq!(nv.modes.water_level, m.water_level);
     // nav / panels / popped survive.
     assert_eq!(back.view.nav, vec![b]);
     assert_eq!(back.view.panels.len(), 1, "the one occupied panel survived");
     let pv = &back.view.panels[0];
     assert_eq!((pv.node, pv.is3d), (o, true));
     assert_eq!(pv.view.half, sample_preview_view().half);
+    // The panel's overlay toggles survive too.
+    assert_eq!(pv.modes.slice_axis, m.slice_axis);
+    assert_eq!(pv.modes.water_level, m.water_level);
     assert_eq!(back.view.popped.len(), 1);
     assert_eq!(back.view.popped[0].node, b);
+    assert_eq!(back.view.popped[0].modes.biome_map, m.biome_map);
 }
 
 /// Backward-compat: an old `EditorView` carrying the deprecated single `panel` field (pre-pool saves)
@@ -653,7 +691,13 @@ fn apply_view_folds_legacy_single_panel_into_pool() {
     let mut panels = WorldgenPreviewPanels::default();
     // Legacy field set, new `panels` empty — must produce exactly one instance, queued to open.
     let view = EditorView {
-        panel: Some(PanelView { nav: vec![], node: o, is3d: true, view: sample_preview_view() }),
+        panel: Some(PanelView {
+            nav: vec![],
+            node: o,
+            is3d: true,
+            view: sample_preview_view(),
+            modes: sample_modes(),
+        }),
         nav: vec![b],
         ..EditorView::default()
     };
@@ -697,6 +741,7 @@ fn gather_then_apply_round_trips_view_state() {
         size: 280.0,
         is3d: true,
         cam: (0.3, 0.7),
+        modes: sample_modes(),
         open: true,
     });
     // A set with one live instance.

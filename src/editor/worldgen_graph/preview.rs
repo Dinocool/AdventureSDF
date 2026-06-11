@@ -8,7 +8,9 @@ use egui_snarl::{NodeId, Snarl};
 
 use crate::sdf_render::worldgen::graph::node::Graph;
 
-use crate::editor::worldgen_gpu_preview::{GpuPreviewRequest, GpuPreviewRequests, GpuPreviewTextures};
+use crate::editor::worldgen_gpu_preview::{
+    GpuPreviewRequest, GpuPreviewRequests, GpuPreviewTextures, PreviewModes,
+};
 use super::{EdNode, WorldGraphEditor, graph_rooted_at, resolve_snarl};
 
 /// Default on-screen size (points) of a node preview; adjustable per node via the size control.
@@ -43,10 +45,16 @@ pub(super) struct WorldgenPreviewPanels {
 impl WorldgenPreviewPanels {
     /// Spawn a NEW preview instance targeting `target` with `view`/`is3d`, queue its dock tab for
     /// creation, and return its fresh id. Each "→ panel" click (or restored `PanelView`) calls this.
-    pub(super) fn open(&mut self, target: (Vec<NodeId>, NodeId), view: PreviewView, is3d: bool) -> u64 {
+    pub(super) fn open(
+        &mut self,
+        target: (Vec<NodeId>, NodeId),
+        view: PreviewView,
+        is3d: bool,
+        modes: PreviewModes,
+    ) -> u64 {
         let id = self.next_id;
         self.next_id += 1;
-        let mut panel = WorldgenPreviewPanel { target: Some(target), is3d, ..Default::default() };
+        let mut panel = WorldgenPreviewPanel { target: Some(target), is3d, modes, ..Default::default() };
         panel.set_view(view);
         self.map.insert(id, panel);
         self.to_open.push(id);
@@ -62,6 +70,8 @@ pub(super) struct WorldgenPreviewPanel {
     pub(super) cam: (f32, f32),
     pub(super) pan: (f64, f64),
     pub(super) is3d: bool,
+    /// Biome-map / slice / water overlay toggles + params.
+    pub(super) modes: PreviewModes,
 }
 
 impl Default for WorldgenPreviewPanel {
@@ -72,6 +82,7 @@ impl Default for WorldgenPreviewPanel {
             cam: CAM_DEFAULT,
             pan: (0.0, 0.0),
             is3d: true,
+            modes: PreviewModes::default(),
         }
     }
 }
@@ -102,8 +113,16 @@ pub(super) struct PreviewView {
 }
 
 impl PreviewView {
-    /// Build a GPU preview request for this view (the pool renders it next frame into key `key`).
-    pub(super) fn to_request(self, key: u64, graph: Graph, is3d: bool, res: u32) -> GpuPreviewRequest {
+    /// Build a GPU preview request for this view (the pool renders it next frame into key `key`), carrying
+    /// the biome-map / slice / water `modes`.
+    pub(super) fn to_request(
+        self,
+        key: u64,
+        graph: Graph,
+        is3d: bool,
+        modes: PreviewModes,
+        res: u32,
+    ) -> GpuPreviewRequest {
         GpuPreviewRequest {
             key,
             graph,
@@ -112,6 +131,7 @@ impl PreviewView {
             is3d,
             yaw: self.yaw,
             pitch: self.pitch,
+            modes,
             res_w: res,
             res_h: res,
         }
@@ -132,6 +152,8 @@ pub(super) struct PoppedPreview {
     pub(super) size: f32,
     pub(super) is3d: bool,
     pub(super) cam: (f32, f32),
+    /// Biome-map / slice / water overlay toggles + params.
+    pub(super) modes: PreviewModes,
     pub(super) open: bool,
 }
 
@@ -277,6 +299,55 @@ pub(super) fn preview_resize_grip(ui: &mut egui::Ui, rect: egui::Rect) -> Option
     }
 }
 
+/// Reusable **biome / strata-slice / water** overlay controls for a preview, mutating its [`PreviewModes`]
+/// in place. One helper called at every preview site (inline node body, dockable panel, pop-out window) so
+/// all three gain the same toggles consistently — mirrors how [`paint_scale_label`] is the single overlay.
+///
+/// Layout (compact, two rows): a "Biome" toggle (height ↔ biome map); a "Slice" toggle with an axis combo
+/// (X/Z/Y) + a 0–100% position slider when on; a "Water" toggle with a level field when on. The slice is
+/// only meaningful in 3D, so its row is shown only when `is3d`.
+pub(super) fn modes_controls_ui(ui: &mut egui::Ui, modes: &mut PreviewModes, is3d: bool) {
+    ui.horizontal(|ui| {
+        ui.selectable_value(&mut modes.biome_map, true, "Biome")
+            .on_hover_text("Colour by SURFACE biome (climate→biome) instead of height");
+        ui.selectable_value(&mut modes.biome_map, false, "Height").on_hover_text("Height-ramp colour");
+        ui.separator();
+        ui.checkbox(&mut modes.water_on, "Water").on_hover_text("Translucent water plane at sea level");
+        if modes.water_on {
+            ui.add(
+                egui::DragValue::new(&mut modes.water_level)
+                    .speed(1.0)
+                    .prefix("lvl ")
+                    .suffix(" m"),
+            )
+            .on_hover_text("Water level (world metres)");
+        }
+    });
+    if is3d {
+        ui.horizontal(|ui| {
+            ui.checkbox(&mut modes.slice_on, "Slice")
+                .on_hover_text("Cutaway: hide the near half + show the strata cross-section");
+            if modes.slice_on {
+                let axes = ["X", "Z", "Y"];
+                egui::ComboBox::from_id_salt("wg-slice-axis")
+                    .selected_text(axes.get(modes.slice_axis as usize).copied().unwrap_or("X"))
+                    .width(40.0)
+                    .show_ui(ui, |ui| {
+                        for (i, a) in axes.iter().enumerate() {
+                            ui.selectable_value(&mut modes.slice_axis, i as u8, *a);
+                        }
+                    });
+                ui.add(
+                    egui::Slider::new(&mut modes.slice_pos, 0.0..=1.0)
+                        .show_value(false)
+                        .text("pos"),
+                )
+                .on_hover_text("Clip-plane position along the axis (0–100%)");
+            }
+        });
+    }
+}
+
 /// Draw a preview image at `size`, or a flat "baking…" placeholder for the ~1 frame before the GPU pool
 /// texture is ready. Returns the (click-and-drag-sensing) response so on-image gestures work either way.
 pub(super) fn preview_image(ui: &mut egui::Ui, tex: Option<egui::TextureId>, size: egui::Vec2) -> egui::Response {
@@ -330,13 +401,14 @@ pub(super) fn preview_panel_impl(world: &mut World, ui: &mut egui::Ui, id: u64) 
             ui.add(egui::DragValue::new(&mut panel.pan.1).speed(10.0).prefix("Y ").suffix(" m"));
             ui.label("· drag orbit · right-drag pan · scroll zoom");
         });
+        modes_controls_ui(ui, &mut panel.modes, panel.is3d);
         let ppp = ui.ctx().pixels_per_point();
         // Square preview sized to fit the panel (drag the dock edge to resize), centred in the leftover space.
         let avail = ui.available_size();
         let side = avail.x.min(avail.y).max(64.0);
         let res = ((side * ppp).round() as usize).max(32);
         let view = panel.view();
-        world.resource_mut::<GpuPreviewRequests>().0.push(view.to_request(gpu_key, g, panel.is3d, res as u32));
+        world.resource_mut::<GpuPreviewRequests>().0.push(view.to_request(gpu_key, g, panel.is3d, panel.modes, res as u32));
         let tex = world.resource::<GpuPreviewTextures>().0.get(&gpu_key).copied();
         ui.vertical_centered(|ui| {
             let resp = preview_image(ui, tex, egui::vec2(side, side));
@@ -416,6 +488,7 @@ pub(super) fn popped_preview_window(
                     }
                 });
             }
+            modes_controls_ui(ui, &mut p.modes, p.is3d);
 
             let ppp = ui.ctx().pixels_per_point();
             // Square preview sized to fit the window (drag its edge to resize), centred in the leftover space.
@@ -423,7 +496,7 @@ pub(super) fn popped_preview_window(
             let side = avail.x.min(avail.y).max(64.0);
             let res = ((side * ppp).round() as usize).max(32);
             // GPU path (2D + 3D): request a render for next frame; draw last frame's pool texture.
-            gpu_reqs.push(p.view().to_request(p.id, g, p.is3d, res as u32));
+            gpu_reqs.push(p.view().to_request(p.id, g, p.is3d, p.modes, res as u32));
             let tex = gpu_tex.get(&p.id).copied();
             ui.vertical_centered(|ui| {
                 let resp = preview_image(ui, tex, egui::vec2(side, side));
