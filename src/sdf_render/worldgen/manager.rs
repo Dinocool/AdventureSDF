@@ -54,6 +54,11 @@ pub struct LayerManager {
     /// invariant — all tiers sample one graph). `None` ⇒ tiers use the legacy fBm+ridge+erosion path.
     /// Set via [`set_graph`](Self::set_graph) from the `WorldGraph` resource.
     graph: Option<Arc<Graph>>,
+    /// Per-biome SHAPE override graphs (index = `BiomeId as usize`) applied to every tier — "biomes own
+    /// their terrain shape". `None` for a biome ⇒ it uses the default [`graph`]; ALL `None` ⇒ the layer is a
+    /// single graph (bit-identical to pre-registry). Set via [`set_biome_shapes`](Self::set_biome_shapes)
+    /// from the `WorldBiomeShapes` resource.
+    biome_shapes: [Option<Arc<Graph>>; super::biome::BIOME_COUNT],
     /// Newly-required chunks generated per update.
     pub budget: usize,
 }
@@ -70,7 +75,7 @@ impl LayerManager {
             deps: layer.dependencies().to_vec(),
             direct_radius: Some(radius),
         }];
-        Self { layers: vec![Box::new(layer)], metas, height: ArtifactStore::new(), seed, params, erosion, graph: None, budget: DEFAULT_GEN_BUDGET }
+        Self { layers: vec![Box::new(layer)], metas, height: ArtifactStore::new(), seed, params, erosion, graph: None, biome_shapes: [const { None }; super::biome::BIOME_COUNT], budget: DEFAULT_GEN_BUDGET }
     }
 
     /// Build the TIERED HEIGHT CLIPMAP stack: `tiers` nested toroidal rings around the focus, tier `t`
@@ -99,13 +104,15 @@ impl LayerManager {
             });
             layers.push(Box::new(layer));
         }
-        Self { layers, metas, height: ArtifactStore::new(), seed, params, erosion, graph: None, budget: DEFAULT_GEN_BUDGET }
+        Self { layers, metas, height: ArtifactStore::new(), seed, params, erosion, graph: None, biome_shapes: [const { None }; super::biome::BIOME_COUNT], budget: DEFAULT_GEN_BUDGET }
     }
 
     /// Build a tier's `HeightLayer` from the manager's current params + active graph (one rebuild source
     /// of truth for `set_params`/`set_tier_count`/`set_graph`).
     fn make_tier(&self, id: LayerId, chunk_cells: u32) -> HeightLayer {
-        HeightLayer::new_tier(id, self.params, self.erosion, chunk_cells).with_graph(self.graph.clone())
+        HeightLayer::new_tier(id, self.params, self.erosion, chunk_cells)
+            .with_graph(self.graph.clone())
+            .with_biome_shapes(self.biome_shapes.clone())
     }
 
     /// Build the tier-0 [`TerrainHifi`](super::upload::TerrainHifi) detail-normal sampler from the
@@ -211,6 +218,16 @@ impl LayerManager {
     /// preserving its id + chunk size + current params, attaching `graph`. Returns the dropped count.
     pub fn set_graph(&mut self, graph: Option<Arc<Graph>>) -> usize {
         self.graph = graph;
+        self.rebuild_all_tiers();
+        self.height.retain(|_| false)
+    }
+
+    /// Set the per-biome SHAPE override graphs on EVERY tier ("biomes own their terrain shape") and evict
+    /// residency so the world regenerates. `None` for a biome keeps the default [`graph`]; ALL `None` ⇒ the
+    /// single-graph path (bit-identical). Called when the `WorldBiomeShapes` resource changes. Returns the
+    /// dropped count.
+    pub fn set_biome_shapes(&mut self, shapes: [Option<Arc<Graph>>; super::biome::BIOME_COUNT]) -> usize {
+        self.biome_shapes = shapes;
         self.rebuild_all_tiers();
         self.height.retain(|_| false)
     }

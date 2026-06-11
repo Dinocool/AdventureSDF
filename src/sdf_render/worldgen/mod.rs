@@ -141,6 +141,26 @@ impl Default for WorldGraph {
     }
 }
 
+/// Per-biome SHAPE override graphs (index = `BiomeId as usize`) — "biomes own their terrain shape". A
+/// `Resource` swappable live (editor / future per-biome assets); `roll_worldgen` republishes it into every
+/// tier on change (`set_biome_shapes`). `None` for a biome ⇒ it uses the [`WorldGraph`] default; ALL `None`
+/// ⇒ the single-graph path (bit-identical). The default SEEDS one demo — the Snowy biome rises into ridged
+/// peaks (cold+wet climate ⇒ mountains) — so the feature is visible; the rest keep the authored default.
+#[derive(Resource, Clone)]
+pub struct WorldBiomeShapes(pub [Option<Arc<graph::Graph>>; biome::BIOME_COUNT]);
+
+impl Default for WorldBiomeShapes {
+    fn default() -> Self {
+        let mut shapes: [Option<Arc<graph::Graph>>; biome::BIOME_COUNT] = std::array::from_fn(|_| None);
+        // DEMO: Snowy = tall ridged peaks (so cold+wet regions are mountainous) rising from a low base, so
+        // they grow OUT of the surrounding plains rather than forming a sudden plateau. Edit/extend per biome
+        // in the node editor (B3).
+        shapes[biome::BiomeId::Snowy as usize] =
+            Some(Arc::new(graph::preset::biome_peaks_graph(700.0, 120.0)));
+        Self(shapes)
+    }
+}
+
 /// Vertical AABB band `[min_y, max_y]` for a terrain GRAPH — derived from the graph's conservative
 /// output bound (the tallest peak it can produce) × the safety margin, symmetric about 0 (the graph's
 /// node offsets already encode base elevation). Keeps towering graph peaks inside the volume AABB.
@@ -193,6 +213,7 @@ impl Plugin for WorldGenPlugin {
             .init_resource::<ErosionParams>()
             .init_resource::<WorldGenGpuRing>()
             .init_resource::<WorldGraph>()
+            .init_resource::<WorldBiomeShapes>()
             // Biome terrain graphs follow the same resource pipeline as materials (load/hot-reload/save).
             .init_asset::<graph::GraphAsset>()
             .register_asset_loader(graph::GraphAssetLoader)
@@ -268,14 +289,21 @@ fn spawn_terrain_volume(
     mut commands: Commands,
     existing: Query<(), With<WorldGenTerrainVolume>>,
     world_graph: Res<WorldGraph>,
+    world_biome_shapes: Res<WorldBiomeShapes>,
 ) {
     if !existing.is_empty() {
         return; // already spawned (re-entering the editor scene)
     }
 
-    // DERIVE the vertical band from the active terrain GRAPH's conservative peak bound so the volume's
-    // AABB covers the tallest peaks it can produce. The narrow-band cull still bakes only the thin shell.
-    let (min_y, max_y) = terrain_band_graph(&world_graph.0);
+    // DERIVE the vertical band from the conservative peak bound — the MAX over the default graph AND every
+    // per-biome SHAPE override (a biome's mountains can be taller than the default), so the volume AABB
+    // covers the tallest peaks any biome can produce. The narrow-band cull still bakes only the thin shell.
+    let (mut min_y, mut max_y) = terrain_band_graph(&world_graph.0);
+    for g in world_biome_shapes.0.iter().flatten() {
+        let (lo, hi) = terrain_band_graph(g);
+        min_y = min_y.min(lo);
+        max_y = max_y.max(hi);
+    }
 
     // World-anchored volume ⇒ local space == world space ⇒ the CPU Terrain eval's world-XZ offset is
     // ZERO. Publish it once (the static defaults to ZERO already; this makes the invariant explicit and
@@ -351,6 +379,8 @@ fn roll_worldgen(
     params: Res<HeightParams>,
     erosion: Res<ErosionParams>,
     world_graph: Res<WorldGraph>,
+    // Per-biome SHAPE override graphs (biomes own their terrain shape) — republished to every tier on change.
+    world_biome_shapes: Res<WorldBiomeShapes>,
     // The mesh-bake clipmap config (the LOD slider) — the height-clipmap window tracks its `lod_count`.
     grid_cfg: Res<crate::sdf_render::SdfGridConfig>,
     mesh_cfg: Res<crate::sdf_render::mesh_bake::MeshBakeConfig>,
@@ -376,6 +406,11 @@ fn roll_worldgen(
     if graph_changed {
         manager.set_graph(Some(world_graph.0.clone()));
         *last_graph = Some(world_graph.0.clone());
+    }
+    // Per-biome SHAPE overrides → every tier (biomes own their terrain shape). `set_biome_shapes` rebuilds +
+    // evicts (full regen), so gate on a real change. Fires on first run (seeds the demo) + on editor edit.
+    if world_biome_shapes.is_changed() {
+        manager.set_biome_shapes(world_biome_shapes.0.clone());
     }
 
     // The LayerManager's generation window ALWAYS follows the camera (the LayerProcGen GenerationSource):
