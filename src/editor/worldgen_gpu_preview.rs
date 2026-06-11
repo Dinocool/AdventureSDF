@@ -71,7 +71,9 @@ struct GpuStrataColumnStd {
     layer_bottom: [Vec4; 2], // 6 floats packed: lane0.xyzw + lane1.xy
     bedrock_color: Vec4,
     layer_count: u32,
-    _pad: [u32; 3],
+    // `UVec3` (= `vec3<u32>`), NOT `[u32; 3]`: a uniform array element's stride must be 16-aligned, which a
+    // `u32` array (stride 4) can't satisfy — encase panics at encode time (see mesh_material.rs BlendParams).
+    _pad: UVec3,
 }
 
 impl From<&GpuStrataColumn> for GpuStrataColumnStd {
@@ -91,7 +93,7 @@ impl From<&GpuStrataColumn> for GpuStrataColumnStd {
             layer_bottom: bottom,
             bedrock_color: Vec4::from_array(c.bedrock_color),
             layer_count: c.layer_count,
-            _pad: [0; 3],
+            _pad: UVec3::ZERO,
         }
     }
 }
@@ -667,6 +669,18 @@ mod tests {
             BIOME_COUNT,
             "BIOME_COUNT in the shader != BiomeId::ALL.len()"
         );
+    }
+
+    /// `StrataTableStd` must be a VALID std140 uniform. encase's "array stride must be a multiple of 16"
+    /// assert fires only at encode/assert time — NOT in the layout-mirror tests above — which is exactly how
+    /// a `[u32; 3]` pad (stride 4) passed `--lib` + naga validation yet panicked `prepare_erased_assets` at
+    /// launch ("fails to launch"). `assert_uniform_compat` exercises that path; keep all uniform fields as
+    /// `Vec*`/`UVec*` (never `[scalar; N]`).
+    #[test]
+    fn strata_table_is_valid_std140_uniform() {
+        use bevy::render::render_resource::ShaderType;
+        StrataTableStd::assert_uniform_compat();
+        PreviewParams::assert_uniform_compat();
     }
 
     /// The packed `layer_bottom: [Vec4; 2]` must hold all `GPU_STRATA_MAX_LAYERS` layer bottoms.
