@@ -78,6 +78,12 @@ struct MaterialPalette {
 @group(#{MATERIAL_BIND_GROUP}) @binding(105) var<uniform> strata: StrataTable;
 @group(#{MATERIAL_BIND_GROUP}) @binding(106) var surface_mat_tex: texture_2d<f32>;
 @group(#{MATERIAL_BIND_GROUP}) @binding(107) var<uniform> palette: MaterialPalette;
+// Shared PBR texture arrays — one layer per material (layer == TerrainMatId). Triplanar-sampled by the baked
+// mat ids; a material with props.y (has_tex) == 0 uses its flat palette colour instead.
+@group(#{MATERIAL_BIND_GROUP}) @binding(108) var diffuse_arr: texture_2d_array<f32>;
+@group(#{MATERIAL_BIND_GROUP}) @binding(109) var normal_arr: texture_2d_array<f32>;
+@group(#{MATERIAL_BIND_GROUP}) @binding(110) var mra_arr: texture_2d_array<f32>;
+@group(#{MATERIAL_BIND_GROUP}) @binding(111) var tex_sampler: sampler;
 
 // Manual bilinear fetch of the R32Float surface-height map (unfilterable → textureLoad). `uv` in [0,1].
 fn sample_height(uv: vec2<f32>) -> f32 {
@@ -154,39 +160,51 @@ fn volumetric_color(bio: vec3<f32>, depth: f32, boundary: f32) -> vec3<f32> {
 }
 
 // One palette material's colour (rgb) + roughness (.a), clamped into the palette.
-fn palette_entry(id: u32) -> vec4<f32> {
-    let i = min(id, MAX_MATERIALS - 1u);
-    let m = palette.materials[i];
-    return vec4<f32>(m.color.rgb, m.props.x); // rgb + roughness
+// Triplanar projection weights from the world normal (sharpened so one axis dominates on near-flat ground).
+fn tri_weights(n: vec3<f32>) -> vec3<f32> {
+    let w = pow(abs(n), vec3<f32>(4.0));
+    return w / max(w.x + w.y + w.z, 1e-5);
 }
 
-// One surface-material texel resolved to colour + roughness: the worldgen baked (mat_a, mat_b, weight); we
-// look the two materials up in the palette and mix. Packing rgb in .xyz, roughness in .w.
-fn texel_surface(px: vec2<i32>) -> vec4<f32> {
-    let s = textureLoad(surface_mat_tex, px, 0);
-    let ea = palette_entry(u32(s.x + 0.5));
-    let eb = palette_entry(u32(s.y + 0.5));
-    return mix(ea, eb, clamp(s.z, 0.0, 1.0));
+// Triplanar sample of one array `layer` at world position `wp`, `tiling` world-metres per texture tile,
+// projection weights `tw`. textureSample is called UNCONDITIONALLY (uniform control flow — required for the
+// implicit-derivative LOD); callers `select` textured-vs-flat afterward rather than branching the sample.
+fn tri_sample(t: texture_2d_array<f32>, layer: i32, wp: vec3<f32>, tiling: f32, tw: vec3<f32>) -> vec4<f32> {
+    let inv = 1.0 / max(tiling, 0.01);
+    let x = textureSample(t, tex_sampler, wp.zy * inv, layer);
+    let y = textureSample(t, tex_sampler, wp.xz * inv, layer);
+    let z = textureSample(t, tex_sampler, wp.xy * inv, layer);
+    return x * tw.x + y * tw.y + z * tw.z;
 }
 
-// BILINEAR surface material — interpolates the per-texel resolved COLOUR+roughness (continuous) across the 4
-// surrounding texels, so material boundaries are SMOOTH. The discrete material IDS can't be interpolated
-// (nearest-sampled → the pair boundary would STAIR-STEP at the texel grid); the resolved colour can. This is
-// the worldgen-baked undug surface (biome base + altitude caps + cliffs + patches — all resolved at bake).
-fn surface_material(uv: vec2<f32>) -> vec4<f32> {
+// One material id → its surface (rgb albedo + roughness in `.a`). Textured materials (palette `props.y`)
+// triplanar-sample the array layer (== the material id, clamped to the live layer count) and tint by the
+// palette colour, modulated by baked AO; untextured materials are the flat palette colour. ALWAYS samples
+// (uniform control flow), then `select`s — so an untextured material costs the samples but reads the flat.
+fn resolve_mat(id: u32, wp: vec3<f32>, tw: vec3<f32>) -> vec4<f32> {
+    let m = palette.materials[min(id, MAX_MATERIALS - 1u)];
+    let layer = min(i32(id), max(i32(textureNumLayers(diffuse_arr)) - 1, 0));
+    let tiling = max(m.props.z, 0.5);
+    // Raw texture albedo (no palette tint — the texture provides the colour; `m.color` is the flat
+    // fallback / preview colour for UNTEXTURED materials only), modulated by baked AO.
+    let alb = tri_sample(diffuse_arr, layer, wp, tiling, tw).rgb;
+    let mra = tri_sample(mra_arr, layer, wp, tiling, tw); // x=metal, y=rough, z=ao
+    let textured = vec4<f32>(alb * mra.z, mra.y);
+    let flat = vec4<f32>(m.color.rgb, m.props.x);
+    return select(flat, textured, m.props.y > 0.5);
+}
+
+// The undug SURFACE (rgb albedo + roughness) at this fragment: the worldgen-baked `(mat_a, mat_b, weight)`
+// from the nearest surface-material texel, each resolved (textured or flat) and blended by `weight`. The
+// triplanar sampling means cliffs + dug walls don't stretch. The baked surface ALREADY encodes biome base +
+// snow/rock caps + cliffs + patches — the shader only turns ids into textured PBR.
+fn surface_textured(uv: vec2<f32>, wp: vec3<f32>, tw: vec3<f32>) -> vec4<f32> {
     let dims = vec2<f32>(textureDimensions(surface_mat_tex));
-    let p = clamp(uv, vec2<f32>(0.0), vec2<f32>(1.0)) * (dims - 1.0);
-    let i0 = floor(p);
-    let f = p - i0;
-    let x0 = i32(i0.x);
-    let y0 = i32(i0.y);
-    let x1 = min(x0 + 1, i32(dims.x) - 1);
-    let y1 = min(y0 + 1, i32(dims.y) - 1);
-    let c00 = texel_surface(vec2<i32>(x0, y0));
-    let c10 = texel_surface(vec2<i32>(x1, y0));
-    let c01 = texel_surface(vec2<i32>(x0, y1));
-    let c11 = texel_surface(vec2<i32>(x1, y1));
-    return mix(mix(c00, c10, f.x), mix(c01, c11, f.x), f.y);
+    let px = vec2<i32>(clamp(uv * dims, vec2<f32>(0.0), dims - 1.0));
+    let s = textureLoad(surface_mat_tex, px, 0);
+    let a = resolve_mat(u32(s.x + 0.5), wp, tw);
+    let b = resolve_mat(u32(s.y + 0.5), wp, tw);
+    return mix(a, b, clamp(s.z, 0.0, 1.0));
 }
 
 @fragment
@@ -235,11 +253,13 @@ fn fragment(in: VertexOutput, @builtin(front_facing) is_front: bool) -> Fragment
     // UNDUG surface = the worldgen-baked SURFACE MATERIAL (palette colour + roughness, bilinear so material
     // boundaries are smooth); below the surface band = the id-based depth strata (the DUG cavity walls — grass→
     // dirt→stone→bedrock). ALL the "which material is here" logic is resolved at BAKE time — the shader renders.
-    let surf = surface_material(uv);
+    // The undug surface = triplanar-textured baked materials; the dug walls = the flat strata colour (Stage 5
+    // can texture those too). `n_geo` drives the triplanar projection so cliffs/walls sample the side planes.
+    let surf = surface_textured(uv, in.world_position.xyz, tri_weights(n_geo));
     var albedo = mix(surf.rgb, volumetric_color(bio, depth, boundary), depth_w);
 
     pbr_input.material.base_color = vec4<f32>(albedo, 1.0);
-    pbr_input.material.perceptual_roughness = surf.a;
+    pbr_input.material.perceptual_roughness = mix(surf.a, 0.9, depth_w);
     pbr_input.N = n;
 
     var out: FragmentOutput;

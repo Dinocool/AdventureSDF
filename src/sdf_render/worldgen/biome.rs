@@ -331,12 +331,26 @@ pub struct TerrainSurfaceMaterial {
     /// without the field still loads (0 ⇒ a hard edge). A RENDER attribute (no `HEIGHT_GEN_VERSION` tie).
     #[serde(default = "default_material_blend")]
     pub blend: f32,
+    /// Optional PBR texture set, as `"<slug>/<variant>"` (e.g. `"grass/3"`) under `assets/textures/` — the
+    /// folder holds `diffuse/normal/metallic/roughness/ao.png`. `None` ⇒ the flat `base_color` (the shader
+    /// falls back to the colour when a material has no texture). A RENDER attribute.
+    #[serde(default)]
+    pub texture: Option<String>,
+    /// Texture tiling: WORLD metres per texture tile (the triplanar UV is `world_pos / tiling`). Smaller =
+    /// more repeats. `#[serde(default)]` ⇒ a sensible mid value when omitted.
+    #[serde(default = "default_material_tiling")]
+    pub tiling: f32,
 }
 
 /// Default [`TerrainSurfaceMaterial::blend`] (metres) when the RON omits it — a gentle few-metre fade so an
 /// unauthored material still blends rather than hard-edging.
 fn default_material_blend() -> f32 {
     4.0
+}
+
+/// Default [`TerrainSurfaceMaterial::tiling`] (world metres per texture tile) when the RON omits it.
+fn default_material_tiling() -> f32 {
+    6.0
 }
 
 impl TerrainSurfaceMaterial {
@@ -708,7 +722,8 @@ pub const GPU_MAX_MATERIALS: usize = 32;
 #[derive(ShaderType, Clone, Copy, Default)]
 pub struct GpuMaterialStd {
     pub color: Vec4,
-    /// `x` = roughness; `y,z,w` reserved (metallic / future PBR scalars).
+    /// `x` = roughness, `y` = has_texture (1 ⇒ sample the array layer = this material id; 0 ⇒ flat `color`),
+    /// `z` = tiling (world metres per texture tile), `w` reserved.
     pub props: Vec4,
 }
 
@@ -739,7 +754,7 @@ impl MaterialPaletteStd {
         for (i, m) in lib.materials.iter().take(n).enumerate() {
             out.materials[i] = GpuMaterialStd {
                 color: Vec4::from_array(m.base_color),
-                props: Vec4::new(m.roughness, 0.0, 0.0, 0.0),
+                props: Vec4::new(m.roughness, m.texture.is_some() as u32 as f32, m.tiling, 0.0),
             };
         }
         out.count = n as u32;

@@ -183,6 +183,8 @@ fn compile_rejects_missing_material() {
             base_color: [0.5, 0.5, 0.5, 1.0],
             roughness: 1.0,
             blend: 4.0,
+            texture: None,
+            tiling: 6.0,
         }],
         biomes: BiomeId::ALL
             .iter()
@@ -210,6 +212,8 @@ fn compile_rejects_biome_count_mismatch() {
             base_color: [0.0; 4],
             roughness: 1.0,
             blend: 4.0,
+            texture: None,
+            tiling: 6.0,
         }],
         biomes: vec![],
     };
@@ -372,8 +376,8 @@ fn material_palette_from_library_flattens_and_clamps() {
 
     let lib = BiomeLibrary {
         materials: vec![
-            TerrainSurfaceMaterial { name: "a".into(), base_color: [0.1, 0.2, 0.3, 1.0], roughness: 0.7, blend: 4.0 },
-            TerrainSurfaceMaterial { name: "b".into(), base_color: [0.4, 0.5, 0.6, 1.0], roughness: 0.2, blend: 8.0 },
+            TerrainSurfaceMaterial { name: "a".into(), base_color: [0.1, 0.2, 0.3, 1.0], roughness: 0.7, blend: 4.0, texture: None, tiling: 6.0 },
+            TerrainSurfaceMaterial { name: "b".into(), base_color: [0.4, 0.5, 0.6, 1.0], roughness: 0.2, blend: 8.0, texture: None, tiling: 6.0 },
         ],
         biomes: vec![],
     };
@@ -466,6 +470,8 @@ fn surf_lib() -> BiomeLibrary {
         base_color: c,
         roughness: 1.0,
         blend: 4.0,
+        texture: None,
+        tiling: 6.0,
     };
     let materials = vec![
         mat("grass", [0.0, 0.5, 0.0, 1.0]),  // 0
