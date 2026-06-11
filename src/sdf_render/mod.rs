@@ -291,7 +291,10 @@ impl Default for SdfGridConfig {
         Self {
             grid_size: 1024,
             brick_size: 8,
-            voxel_size: 0.1,
+            // 0.2 m base voxel (was 0.1): HALF the SDF/brick density at every LOD — the 0.1 m voxel hugely
+            // over-tessellated the terrain vs the height data. Halves the terrain mesh + collider triangle
+            // density (the detail-normal/surface textures key off the chunk world size, so detail is kept).
+            voxel_size: 0.2,
             lod_count: DEFAULT_LOD_COUNT,
             ring_bricks: DEFAULT_RING_BRICKS,
             recenter_snap_chunks: DEFAULT_RECENTER_SNAP_CHUNKS,

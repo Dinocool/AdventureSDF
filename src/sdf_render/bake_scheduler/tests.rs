@@ -752,7 +752,9 @@ fn gpu_emit_spilled_bricks_stay_non_resident() {
 /// the solid's full bounding-box brick count (what the old AABB-only cull kept).
 #[test]
 fn gpu_emit_culls_deep_interior_of_solid() {
-    let cfg = SdfGridConfig { lod_count: 1, ring_bricks: 8, recenter_snap_chunks: 1, ..config() };
+    // Pin the 0.1 m voxel this cull test was tuned for (radius/dirty-cube extents + the "< half the AABB
+    // cube" ratio), independent of the default voxel_size.
+    let cfg = SdfGridConfig { lod_count: 1, ring_bricks: 8, recenter_snap_chunks: 1, voxel_size: 0.1, ..config() };
     let radius = 10.0;
     let edits = vec![sphere_edit(Vec3::ZERO, radius, 0)];
     let mut sched = primed_sched(&edits);
