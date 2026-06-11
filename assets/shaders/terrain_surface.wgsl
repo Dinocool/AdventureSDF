@@ -154,6 +154,36 @@ fn volumetric_color(bio: vec3<f32>, depth: f32, boundary: f32) -> vec3<f32> {
     return mix(cp, cs, blend * 0.5);
 }
 
+// One texel's SURFACE colour (depth 0): the biome's surface material colour, primary↔secondary by blend.
+fn texel_surface_color(px: vec2<i32>) -> vec3<f32> {
+    let s = textureLoad(biome_tex, px, 0);
+    let prim = min(u32(s.x + 0.5), BIOME_COUNT - 1u);
+    let sec = min(u32(s.y + 0.5), BIOME_COUNT - 1u);
+    let cp = strata.columns[prim].surface_color.rgb;
+    let cs = strata.columns[sec].surface_color.rgb;
+    return mix(cp, cs, clamp(s.z, 0.0, 1.0) * 0.5);
+}
+
+// BILINEAR biome SURFACE colour — interpolates the per-texel COLOUR (a continuous RGB) across the 4
+// surrounding texels, so biome boundaries are SMOOTH. The discrete biome IDS can't be interpolated
+// (nearest-sampled → the boundary STAIR-STEPS at the texel grid, the reported blocky edges); the resolved
+// colour can. Used for the undug surface; the depth strata (dug walls) still use the id-based lookup.
+fn biome_surface_color(uv: vec2<f32>) -> vec3<f32> {
+    let dims = vec2<f32>(textureDimensions(biome_tex));
+    let p = clamp(uv, vec2<f32>(0.0), vec2<f32>(1.0)) * (dims - 1.0);
+    let i0 = floor(p);
+    let f = p - i0;
+    let x0 = i32(i0.x);
+    let y0 = i32(i0.y);
+    let x1 = min(x0 + 1, i32(dims.x) - 1);
+    let y1 = min(y0 + 1, i32(dims.y) - 1);
+    let c00 = texel_surface_color(vec2<i32>(x0, y0));
+    let c10 = texel_surface_color(vec2<i32>(x1, y0));
+    let c01 = texel_surface_color(vec2<i32>(x0, y1));
+    let c11 = texel_surface_color(vec2<i32>(x1, y1));
+    return mix(mix(c00, c10, f.x), mix(c01, c11, f.x), f.y);
+}
+
 // Surface treatment for the TOP (undug) layer: override the strata surface colour by slope/height/biome.
 // `n` = the geometric/world surface normal (its .y = cos of the slope from vertical); `y` = world height;
 // `bio` = the biome sample (so snow only caps COLD biomes). Returns the treated colour. Tunable via
@@ -219,21 +249,17 @@ fn fragment(in: VertexOutput, @builtin(front_facing) is_front: bool) -> Fragment
     let depth = surf_h - in.world_position.y - params.chunk_size * 0.15;
     let bio = sample_biome(uv);
     let boundary = params.surf_b.w;
-    var albedo = volumetric_color(bio, depth, boundary);
-    // Surface treatment only on the TOP (undug) band — fade it out as we go below the surface so exposed
-    // strata on a dug wall are NOT snowed/sanded over. Tied to the first stratum thickness (~ boundary*2).
     let top_band = max(boundary * 2.0, 1.0);
-    let top_w = 1.0 - smoothstep(0.0, top_band, max(depth, 0.0));
-    // SNOW cold factor, WORLD-SPACE normalised: ramp over a constant width in METRES (divide the temperature
-    // offset by |∇temperature|), so the snow line is uniformly smooth even where the climate gradient is
-    // steep (a plain temp threshold was sharp there → hard patches).
+    let depth_w = smoothstep(0.0, top_band, max(depth, 0.0)); // 0 = surface, 1 = below the surface band
+    let top_w = 1.0 - depth_w;                                // surface fraction (treatment + smooth colour)
+    // UNDUG surface = the BILINEAR surface colour (smooth biome borders); below the surface band = the
+    // id-based depth strata (only seen on dug walls). The bilinear colour is what kills the blocky biome edges.
+    var albedo = mix(biome_surface_color(uv), volumetric_color(bio, depth, boundary), depth_w);
+    // SNOW cold from the CONTINUOUS temperature (bilinear), a WIDE smoothstep. The km-scale climate varies
+    // slowly, so this is a wide smooth fade everywhere; the gradient-normalised variant stepped at the texel
+    // grid (the bilinear gradient is discontinuous across cells).
     let temp = sample_temp(uv);
-    let e = 1.0 / vec2<f32>(textureDimensions(biome_tex)).x;
-    let gx = sample_temp(uv + vec2<f32>(e, 0.0)) - sample_temp(uv - vec2<f32>(e, 0.0));
-    let gz = sample_temp(uv + vec2<f32>(0.0, e)) - sample_temp(uv - vec2<f32>(0.0, e));
-    let temp_grad = length(vec2<f32>(gx, gz)) / max(2.0 * e * params.chunk_size, 1e-4); // |∇temp| per metre
-    let snow_dist = (temp - 0.38) / max(temp_grad, 1e-9); // metres past the snow temp threshold (+ = warmer)
-    let cold = 1.0 - smoothstep(-150.0, 150.0, snow_dist); // ~300 m constant-width transition
+    let cold = 1.0 - smoothstep(0.30, 0.46, temp);
     let treated = surface_treatment(albedo, n_geo, in.world_position.y, cold);
     albedo = mix(albedo, treated, top_w);
 
