@@ -47,7 +47,7 @@ GraphAsset(
       ),
       Node(
         kind: Fbm(FbmAxis(
-          octaves: 4,
+          octaves: 8,
           base_freq: 0.002,
           lacunarity: 2.0,
           gain: 0.5,
@@ -66,7 +66,7 @@ GraphAsset(
       ),
       Node(
         kind: Fbm(FbmAxis(
-          octaves: 5,
+          octaves: 8,
           base_freq: 0.0007692307692307692,
           lacunarity: 2.0,
           gain: 0.5,
