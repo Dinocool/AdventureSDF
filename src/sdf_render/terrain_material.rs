@@ -169,15 +169,17 @@ impl TerrainSurfaceBake {
         [r[0], r[1], g[0], g[1]]
     }
 
-    /// Pack one biome texel `(primary, secondary, blend)` into the `Rgba16Float` 8-byte group (the 4th lane
-    /// is 0). Ids are small integers (0..=4) that f16 stores exactly.
+    /// Pack one biome texel `(primary, secondary, blend, temperature)` into the `Rgba16Float` 8-byte group.
+    /// Ids are small integers (0..=4) that f16 stores exactly; the 4th lane is the CONTINUOUS temperature
+    /// `[0,1]` — bilinear-sampled in the shader so cold-driven SNOW blends smoothly everywhere (the discrete
+    /// biome-id `cold` stepped with the climate gradient → hard snow edges on steep sides).
     #[inline]
-    pub fn pack_biome(primary: u8, secondary: u8, blend: f32) -> [u8; 8] {
+    pub fn pack_biome(primary: u8, secondary: u8, blend: f32, temperature: f32) -> [u8; 8] {
         let p = f16::from_f32(primary as f32).to_bits().to_le_bytes();
         let s = f16::from_f32(secondary as f32).to_bits().to_le_bytes();
         let b = f16::from_f32(blend).to_bits().to_le_bytes();
-        let z = f16::from_f32(0.0).to_bits().to_le_bytes();
-        [p[0], p[1], s[0], s[1], b[0], b[1], z[0], z[1]]
+        let t = f16::from_f32(temperature).to_bits().to_le_bytes();
+        [p[0], p[1], s[0], s[1], b[0], b[1], t[0], t[1]]
     }
 }
 
@@ -300,13 +302,14 @@ mod tests {
     /// `pack_biome` round-trips the (primary, secondary, blend) lanes through f16; ids store exactly.
     #[test]
     fn pack_biome_roundtrips_ids_exactly() {
-        for &(p, s, blend) in &[(0u8, 0u8, 0.0f32), (2, 3, 0.5), (4, 1, 1.0)] {
-            let b = TerrainSurfaceBake::pack_biome(p, s, blend);
+        for &(p, s, blend, temp) in &[(0u8, 0u8, 0.0f32, 0.3f32), (2, 3, 0.5, 0.7), (4, 1, 1.0, 0.1)] {
+            let b = TerrainSurfaceBake::pack_biome(p, s, blend, temp);
             let rp = f16::from_bits(u16::from_le_bytes([b[0], b[1]])).to_f32();
             let rs = f16::from_bits(u16::from_le_bytes([b[2], b[3]])).to_f32();
             assert_eq!(rp, p as f32, "primary id must store exactly");
             assert_eq!(rs, s as f32, "secondary id must store exactly");
             assert_eq!(f16::from_bits(u16::from_le_bytes([b[4], b[5]])).to_f32(), f16::from_f32(blend).to_f32());
+            assert_eq!(f16::from_bits(u16::from_le_bytes([b[6], b[7]])).to_f32(), f16::from_f32(temp).to_f32());
         }
     }
 

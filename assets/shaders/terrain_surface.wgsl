@@ -87,6 +87,24 @@ fn sample_biome(uv: vec2<f32>) -> vec3<f32> {
     return textureLoad(biome_tex, px, 0).xyz;
 }
 
+// Bilinear-fetch the biome map's 4th channel = the CONTINUOUS temperature [0,1]. Bilinear (unlike the
+// nearest-sampled ids) so the temperature — and thus the snow line driven by it — is SMOOTH across texels.
+fn sample_temp(uv: vec2<f32>) -> f32 {
+    let dims = vec2<f32>(textureDimensions(biome_tex));
+    let p = clamp(uv, vec2<f32>(0.0), vec2<f32>(1.0)) * (dims - 1.0);
+    let i0 = floor(p);
+    let f = p - i0;
+    let x0 = i32(i0.x);
+    let y0 = i32(i0.y);
+    let x1 = min(x0 + 1, i32(dims.x) - 1);
+    let y1 = min(y0 + 1, i32(dims.y) - 1);
+    let a = textureLoad(biome_tex, vec2<i32>(x0, y0), 0).a;
+    let b = textureLoad(biome_tex, vec2<i32>(x1, y0), 0).a;
+    let c = textureLoad(biome_tex, vec2<i32>(x0, y1), 0).a;
+    let d = textureLoad(biome_tex, vec2<i32>(x1, y1), 0).a;
+    return mix(mix(a, b, f.x), mix(c, d, f.x), f.y);
+}
+
 // The cumulative bottom-depth of layer `i` (i < layer_count), unpacking the 2-vec4 packed array.
 fn strata_bottom(col: StrataColumn, i: u32) -> f32 {
     let v = col.layer_bottom[i / 4u];
@@ -140,7 +158,7 @@ fn volumetric_color(bio: vec3<f32>, depth: f32, boundary: f32) -> vec3<f32> {
 // `n` = the geometric/world surface normal (its .y = cos of the slope from vertical); `y` = world height;
 // `bio` = the biome sample (so snow only caps COLD biomes). Returns the treated colour. Tunable via
 // params.surf_a / surf_b (editor sliders); the master strength surf_b.z fades the whole treatment.
-fn surface_treatment(base: vec3<f32>, n: vec3<f32>, y: f32, bio: vec3<f32>) -> vec3<f32> {
+fn surface_treatment(base: vec3<f32>, n: vec3<f32>, y: f32, temp: f32) -> vec3<f32> {
     let master = clamp(params.surf_b.z, 0.0, 1.0);
     if (master <= 0.0) { return base; }
     var col = base;
@@ -154,16 +172,11 @@ fn surface_treatment(base: vec3<f32>, n: vec3<f32>, y: f32, bio: vec3<f32>) -> v
     let sand_w = (1.0 - smoothstep(0.0, sand_band, abs(y - sea))) * flat;
     col = mix(col, sand, sand_w * 0.85);
 
-    // SNOW on high + COLD ground. Cold = a low-temperature biome: Tundra (3) or Snowy (4). Blend the cold
-    // factor across the biome boundary (primary↔secondary by the baked blend) so the snow edge is SMOOTH,
-    // not a hard per-texel flip on the primary id (that read as a blocky patch).
-    let prim = u32(bio.x + 0.5);
-    let sec = u32(bio.y + 0.5);
-    let cold_p = select(0.0, 1.0, prim == 3u || prim == 4u);
-    let cold_s = select(0.0, 1.0, sec == 3u || sec == 4u);
-    // `blend * 0.5` — the SAME weighting volumetric_color uses (primary frac = 1 - blend*0.5). At the border
-    // both sides read 0.5 ⇒ CONTINUOUS; the raw `blend` jumped 0↔1 as primary/secondary swapped → a hard edge.
-    let cold = mix(cold_p, cold_s, clamp(bio.z, 0.0, 1.0) * 0.5);
+    // SNOW on high + COLD ground. Cold from the CONTINUOUS temperature field (bilinear `temp`), a smooth ramp
+    // → the snow line blends UNIFORMLY everywhere. The old discrete biome-id cold stepped with the climate
+    // gradient (sharp where steep, soft where gentle → hard snow edges on some sides only). cold = 1 below
+    // temp ≈ 0.30, → 0 by ≈ 0.46 (the Tundra/Snowy low-temperature range).
+    let cold = 1.0 - smoothstep(0.30, 0.46, temp);
     let snow = vec3<f32>(0.85, 0.88, 0.95);
     let snow_w = smoothstep(params.surf_a.z, params.surf_a.w, y) * cold;
     col = mix(col, snow, clamp(snow_w, 0.0, 1.0));
@@ -218,7 +231,8 @@ fn fragment(in: VertexOutput, @builtin(front_facing) is_front: bool) -> Fragment
     // strata on a dug wall are NOT snowed/sanded over. Tied to the first stratum thickness (~ boundary*2).
     let top_band = max(boundary * 2.0, 1.0);
     let top_w = 1.0 - smoothstep(0.0, top_band, max(depth, 0.0));
-    let treated = surface_treatment(albedo, n_geo, in.world_position.y, bio);
+    let temp = sample_temp(uv);
+    let treated = surface_treatment(albedo, n_geo, in.world_position.y, temp);
     albedo = mix(albedo, treated, top_w);
 
     pbr_input.material.base_color = vec4<f32>(albedo, 1.0);
