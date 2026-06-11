@@ -194,24 +194,6 @@ fn strata_face(p: vec3<f32>) -> vec3<f32> {
     return col * (1.0 - 0.18 * clamp(line, 0.0, 1.0));
 }
 
-// Composite translucent water OVER an already-shaded terrain colour `terrain` whose surface sits at
-// world height `terrain_y`, when that surface is BELOW the water level. Tint deepens with the underwater
-// depth (water_level - terrain_y) so shallows read light, deeps dark; terrain stays visible through it.
-fn apply_water(terrain: vec3<f32>, terrain_y: f32) -> vec3<f32> {
-    if (params.modes.z < 0.5) { return terrain; }
-    let water_level = params.levels.w;
-    let under = water_level - terrain_y;
-    if (under <= 0.0) { return terrain; }
-    let shallow = vec3<f32>(0.20, 0.45, 0.62);
-    let deep = vec3<f32>(0.02, 0.10, 0.26);
-    // Deepening ramp over the same depth scale used by the height ramp's underwater band.
-    let t = clamp(under / max(params.levels.z, 1.0), 0.0, 1.0);
-    let water = mix(shallow, deep, t);
-    // Opacity grows with depth (shallow water is barely tinted, deep water mostly water-coloured).
-    let alpha = clamp(0.25 + 0.6 * t, 0.0, 0.9);
-    return mix(terrain, water, alpha);
-}
-
 // Water on the SLICE CUT FACE. Unlike `apply_water` (top-down: tint by the surface height), a vertical
 // cross-section must tint by the POINT'S OWN height `p.y` vs the level, with a HARD top edge + a crisp
 // waterline — otherwise the whole column tints uniformly and the level is invisible (the reported bug).
@@ -234,16 +216,23 @@ fn apply_water_face(col: vec3<f32>, p: vec3<f32>) -> vec3<f32> {
     return mix(out, vec3<f32>(0.70, 0.88, 0.98), line);
 }
 
-// Crisp waterline where the terrain SURFACE meets the level — the shore (water "next to terrain") in the
-// normal 3D/2D view, the same bright line the slice draws. Width = `fwidth(surface_y)` (the per-pixel
-// change in surface height), so the line stays ~constant SCREEN width at every zoom (a fixed world band
-// would read as a thin line zoomed-in and a massive gradient zoomed-out).
-fn shoreline(col: vec3<f32>, surface_y: f32) -> vec3<f32> {
-    if (params.modes.z < 0.5) { return col; }
+// Flat WATER SURFACE over the submerged terrain `bg` seen at world `xz`. Tints by water DEPTH
+// (`level - surface`) — shallows light, deeps dark — and draws a crisp bright shore line where the surface
+// meets the level. Sampled on the smooth top-down / water-plane projection (NOT the jumpy terrain march),
+// so the line is clean (no grain) and `fwidth` gives a ~constant SCREEN-width line at every zoom.
+fn water_plane(bg: vec3<f32>, xz: vec2<f32>) -> vec3<f32> {
+    if (params.modes.z < 0.5) { return bg; }
     let wl = params.levels.w;
-    let w = max(fwidth(surface_y) * 1.5, 1.0e-5); // ~1.5 px, zoom-independent
-    let line = 1.0 - smoothstep(0.0, w, abs(surface_y - wl));
-    return mix(col, vec3<f32>(0.70, 0.88, 0.98), clamp(line, 0.0, 1.0));
+    let depth = wl - hf_at(xz).x;
+    var out = bg;
+    if (depth > 0.0) {
+        let t = clamp(depth / max(params.levels.z, 1.0), 0.0, 1.0);
+        out = mix(bg, mix(vec3<f32>(0.20, 0.45, 0.62), vec3<f32>(0.02, 0.10, 0.26), t),
+                  clamp(0.25 + 0.6 * t, 0.0, 0.9));
+    }
+    let w = max(fwidth(depth) * 1.5, 1.0e-5); // ~1.5 px, zoom-independent
+    let line = 1.0 - smoothstep(0.0, w, abs(depth));
+    return mix(out, vec3<f32>(0.70, 0.88, 0.98), clamp(line, 0.0, 1.0));
 }
 
 // Is the slice plane active and is world point `p` on the HIDDEN (near) side of it? Axis 0=X,1=Z,2=Y; the
@@ -271,7 +260,7 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
         let wz = (in.uv.y * 2.0 - 1.0) * halfz;
         let h = hf_at(vec2<f32>(wx, wz)).x;
         var col = surface_colour(vec2<f32>(wx, wz), h);
-        col = shoreline(apply_water(col, h), h);
+        col = water_plane(col, vec2<f32>(wx, wz));
         return vec4<f32>(col, 1.0);
     }
 
@@ -314,25 +303,27 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
         }
     }
 
-    // Solid earth: if the ray ENTERS (post-slice) already at/below the surface, it pierced a wall / the
-    // cut face → shade the strata cross-section instead of marching into a hole.
+    // Solid earth: ray ENTERS (post-slice) at/below the surface → cut face / wall → strata cross-section.
     let pe = eye + dir * t0;
-    if (pe.y - hf_at(pe.xz).x <= 0.0) {
-        var col = strata_face(pe);
-        col = apply_water_face(col, pe);
-        return vec4<f32>(col, 1.0);
+    let surf0 = hf_at(pe.xz).x;
+    let wl = params.levels.w;
+    let water_on = params.modes.z >= 0.5;
+    let cut_on = params.modes.y >= 0.5;
+    if (pe.y <= surf0) {
+        return vec4<f32>(apply_water_face(strata_face(pe), pe), 1.0);
     }
 
-    // Adaptive march, but cap each step to ~2 texels HORIZONTALLY so thin ridges aren't tunnelled through
-    // when viewed from the side (the classic heightfield-undersampling artefact).
+    // Adaptive march for the terrain backdrop; cap each step to ~2 texels HORIZONTALLY so thin ridges aren't
+    // tunnelled through when viewed from the side (the classic heightfield-undersampling artefact).
     let texel = (2.0 * min(halfx, halfz)) / HF_TEX_RES;
     let hspeed = max(length(dir.xz), 1e-4);
     let max_h = 2.0 * texel / hspeed;
     let descent = max(-dir.y, 0.02);
     let min_step = max((t1 - t0) / 8192.0, 0.02);
     var t = t0;
-    var a_prev = pe.y - hf_at(pe.xz).x;
-
+    var a_prev = pe.y - surf0;
+    var bg = sky(ndcy);
+    var t_hit = t1;
     for (var i = 0; i < 512; i = i + 1) {
         if (t >= t1) { break; }
         var step = max((max(a_prev, 0.0) / descent) * 0.45, min_step);
@@ -341,7 +332,6 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
         let pn = eye + dir * tn;
         let a_n = pn.y - hf_at(pn.xz).x;
         if (a_n <= 0.0) {
-            // Bisect the crossing.
             var lo = t;
             var hi = tn;
             for (var k = 0; k < 20; k = k + 1) {
@@ -349,16 +339,32 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
                 let pm = eye + dir * m;
                 if (pm.y - hf_at(pm.xz).x > 0.0) { lo = m; } else { hi = m; }
             }
-            let pm = eye + dir * ((lo + hi) * 0.5);
+            t_hit = (lo + hi) * 0.5;
+            let pm = eye + dir * t_hit;
             let s = hf_at(pm.xz);
             let n = normalize(s.yzw);
             let lamb = clamp(dot(n, light), 0.0, 1.0);
-            var col = surface_colour(pm.xz, s.x) * (0.28 + 0.72 * lamb);
-            col = shoreline(apply_water(col, s.x), s.x);
-            return vec4<f32>(col, 1.0);
+            bg = surface_colour(pm.xz, s.x) * (0.28 + 0.72 * lamb);
+            break;
         }
         a_prev = a_n;
         t = tn;
     }
-    return vec4<f32>(sky(ndcy), 1.0);
+
+    // WATER. Compute the water-plane crossing unconditionally (keeps `fwidth` in water_plane in uniform
+    // control flow), then apply it only where the ray actually meets open water before the terrain.
+    if (water_on) {
+        let safe_dy = select(dir.y, -1.0e-6, abs(dir.y) < 1.0e-6);
+        let tw = (wl - eye.y) / safe_dy;
+        let pw = eye + dir * tw;
+        let watered = water_plane(bg, pw.xz);
+        if (cut_on && pe.y <= wl) {
+            // The cut passes through the open-water COLUMN (solid already returned above): the cross
+            // section's water body — backdrop seen through water + the top waterline, at the cut entry.
+            bg = apply_water_face(bg, pe);
+        } else if (dir.y < -1.0e-6 && tw >= t0 && tw <= t_hit && hf_at(pw.xz).x < wl) {
+            bg = watered; // flat water surface over the submerged terrain
+        }
+    }
+    return vec4<f32>(bg, 1.0);
 }
