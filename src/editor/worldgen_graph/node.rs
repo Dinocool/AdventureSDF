@@ -43,8 +43,11 @@ pub(super) fn node_params_ui(ui: &mut egui::Ui, kind: &mut NodeKind) {
             {
                 ax.base_freq = 1.0 / wavelength;
             }
-            ui.add(egui::DragValue::new(&mut ax.octaves).range(1..=8).prefix("oct "))
-                .on_hover_text("How many noise layers to sum — more octaves = finer detail (each half as tall, twice as fine).");
+            // Distant mountains need ≥8 octaves to read detailed (the detail-normal bake carries the high
+            // octaves to far shading); 8 was the old cap (= the floor), so allow up to 14. The eval has no
+            // cap; octaves are the gen hot path, so beyond ~12 is diminishing returns vs cost.
+            ui.add(egui::DragValue::new(&mut ax.octaves).range(1..=14).prefix("oct "))
+                .on_hover_text("How many noise layers to sum — more octaves = finer detail (each half as tall, twice as fine). Distant mountains want ≥8.");
         }
         NodeKind::Curve(_) => {
             ui.label("curve");
