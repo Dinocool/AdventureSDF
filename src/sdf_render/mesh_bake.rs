@@ -198,6 +198,12 @@ pub(crate) struct MeshBakeConfig {
     /// SURFACE-TREATMENT master strength `[0,1]` for the top (undug) layer (snow/sand/rock overrides): 0 =
     /// pure strata surface colour, 1 = full treatment. A LIVE shader uniform — no re-bake on change.
     pub(crate) surface_treatment: f32,
+    /// Attach a per-chunk PHYSICS collider (Rapier `trimesh` from the baked mesh) so the player/objects can
+    /// stand on the terrain. Re-bakes nothing (the collider is built at COMMIT from the same mesh data).
+    pub(crate) physics: bool,
+    /// Only chunks at this LOD or finer (`key.lod <= physics_lod`) get a collider — the "simplified" bound:
+    /// far chunks (never walked) skip the trimesh build. Higher = colliders reach further (more cost).
+    pub(crate) physics_lod: u32,
 }
 
 /// The clipmap's finest node spacing (the tier-0 height grid). A terrain-only chunk whose voxel size is at
@@ -235,6 +241,10 @@ impl Default for MeshBakeConfig {
             // no more hard lines where the climate happens to change quickly. Tune via the editor slider.
             biome_blend_m: 150.0,
             surface_treatment: 1.0,
+            // Per-chunk colliders on the nearest 2 LODs (0,1) by default — the player walks the near terrain;
+            // far chunks skip the trimesh build. Bump physics_lod to collide further out.
+            physics: true,
+            physics_lod: 1,
         }
     }
 }
@@ -1189,6 +1199,21 @@ struct SpawnAssets<'a> {
     /// The shared terrain PBR texture arrays (diffuse, normal, MRA) — the current handles to bake into a new
     /// chunk's material. `sync_terrain_texture_arrays` keeps already-spawned chunks current.
     tex_arrays: (Handle<Image>, Handle<Image>, Handle<Image>),
+    /// Per-chunk physics colliders: `Some(physics_lod)` ⇒ attach a Rapier trimesh collider to chunks with
+    /// `key.lod <= physics_lod`; `None` ⇒ no colliders.
+    physics: Option<u32>,
+}
+
+/// Build a static Rapier `trimesh` collider from a chunk's baked geometry (chunk-LOCAL positions + the flat
+/// `u32` index list grouped into triangles). `None` for a degenerate chunk (< 1 triangle) so the caller
+/// simply skips the collider. The collider matches the rendered surface (incl. dug/CSG geometry).
+fn chunk_trimesh_collider(positions: &[[f32; 3]], indices: &[u32]) -> Option<bevy_rapier3d::prelude::Collider> {
+    if positions.len() < 3 || indices.len() < 3 {
+        return None;
+    }
+    let verts: Vec<Vec3> = positions.iter().map(|p| Vec3::from_array(*p)).collect();
+    let tris: Vec<[u32; 3]> = indices.chunks_exact(3).map(|c| [c[0], c[1], c[2]]).collect();
+    bevy_rapier3d::prelude::Collider::trimesh(verts, tris).ok()
 }
 
 /// Spawn one chunk-mesh entity from baked data — the single SSOT used by BOTH the immediate terrain commit
@@ -1210,6 +1235,12 @@ fn spawn_chunk_mesh(
     use super::terrain_material::{self, TerrainDetailAssets};
     let origin = config.brick_min_world(key.coord, key.lod);
     let surface = data.terrain_surface;
+    // Per-chunk PHYSICS collider (near LODs only) — built from the baked geometry BEFORE it's moved into the
+    // render Mesh. Chunk-LOCAL like the mesh, so the entity Transform places it; static (RigidBody::Fixed).
+    let collider = assets
+        .physics
+        .filter(|&max_lod| key.lod <= max_lod)
+        .and_then(|_| chunk_trimesh_collider(&data.positions, &data.indices));
     let mesh = Mesh::new(PrimitiveTopology::TriangleList, RenderAssetUsages::default())
         .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, data.positions)
         .with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, data.normals)
@@ -1222,6 +1253,9 @@ fn spawn_chunk_mesh(
         ChunkMesh(key),
         Name::new("SDF Chunk Mesh"),
     ));
+    if let Some(c) = collider {
+        ent.insert((bevy_rapier3d::prelude::RigidBody::Fixed, c));
+    }
     if let Some(bake) = surface {
         // Terrain-only chunk: dedicated per-chunk terrain-surface material (volumetric biome strata + PBR).
         // Strong handles to the 3 per-chunk images AND the material live on the entity (in `MeshMaterial3d` +
@@ -1592,6 +1626,7 @@ fn mesh_resident_chunks(
             terrain_mat.tex.normal.clone(),
             terrain_mat.tex.mra.clone(),
         ),
+        physics: mesh_cfg.physics.then_some(mesh_cfg.physics_lod),
     };
 
     // 1b. IMMEDIATE TERRAIN COMMIT: a terrain-only chunk is an independent world-anchored surface with NO
@@ -1935,6 +1970,25 @@ fn mesh_bake_panel(world: &mut World, ui: &mut bevy_egui::egui::Ui) {
     }
     // (The old "Surface treatment" slider is gone — snow caps / cliff rock are now authored per-biome
     // SURFACE RULES in `biomes.ron`, resolved + baked by the worldgen, not a live shader override.)
+
+    // PHYSICS — per-chunk Rapier trimesh colliders so the player/objects can stand on the terrain. "Physics
+    // LOD" bounds how far out colliders are built (near chunks only). Changing either re-bakes (colliders
+    // attach at commit, so the chunks must respawn).
+    let mut phys = world.resource::<MeshBakeConfig>().physics;
+    if ui.checkbox(&mut phys, "Physics colliders").changed() {
+        world.resource_mut::<MeshBakeConfig>().physics = phys;
+        world.resource_mut::<MeshBakeRebuild>().0 = true;
+    }
+    let mut plod = world.resource::<MeshBakeConfig>().physics_lod;
+    if ui
+        .add(bevy_egui::egui::Slider::new(&mut plod, 0..=6).text("Physics LOD"))
+        .on_hover_text("Only chunks at this LOD or finer get a collider (near terrain). Higher = colliders \
+                        reach further out (more trimesh cost). Changing it re-bakes.")
+        .changed()
+    {
+        world.resource_mut::<MeshBakeConfig>().physics_lod = plod;
+        world.resource_mut::<MeshBakeRebuild>().0 = true;
+    }
     let mut freeze = world.resource::<MeshBakeConfig>().freeze_lod;
     if ui
         .checkbox(&mut freeze, "Freeze LOD (debug)")
