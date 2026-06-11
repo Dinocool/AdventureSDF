@@ -381,7 +381,7 @@ fn time_one_chunk(
     let terrain = crate::sdf_render::worldgen::upload::cpu_height_clipmap();
     let out = mesh_chunk(
         edits, &idx, grid_origin, vs_l, k * cs, flags, key.lod, false, terrain, true,
-        mesh_cfg.detail_normal_res, mesh_cfg.biome_res,
+        mesh_cfg.detail_normal_res, mesh_cfg.biome_res, mesh_cfg.biome_blend_m,
     );
     let us = t.elapsed().as_micros();
     let (verts, tris) = out.map_or((0, 0), |d| (d.positions.len(), d.indices.len() / 3));

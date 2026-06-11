@@ -184,7 +184,7 @@ pub fn classify(t: f64, h: f64) -> BiomeSample {
     // is `(distance_to_border, neighbour_biome)`; we keep the minimum distance.
     let mut best_dist = f64::INFINITY;
     let mut secondary = primary;
-    for (dist, neigh) in neighbour_borders(t, h, primary) {
+    for (dist, neigh, _axis) in neighbour_borders(t, h, primary) {
         if dist < best_dist {
             best_dist = dist;
             secondary = neigh;
@@ -243,48 +243,59 @@ fn primary_biome(t: f64, h: f64) -> BiomeId {
     }
 }
 
+/// Which climate axis a partition border lies on. Every Whittaker border in this partition is a pure
+/// temperature- or humidity-threshold line, so the world-space distance to it (used by the bake-time
+/// [`surface_biome_world`] blend) is the climate distance divided by that ONE axis's world gradient.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ClimateAxis {
+    Temperature,
+    Humidity,
+}
+
 /// For the cell `primary` at `(t,h)`, the borders to its neighbouring cells, each as
-/// `(distance_to_border, neighbour_biome)`. Only borders that actually separate `primary` from a
-/// DIFFERENT biome are returned (so `secondary != primary` whenever a finite distance exists). Pure
-/// basic ops.
-fn neighbour_borders(t: f64, h: f64, primary: BiomeId) -> Vec<(f64, BiomeId)> {
+/// `(distance_to_border, neighbour_biome, axis)`. Only borders that actually separate `primary` from a
+/// DIFFERENT biome are returned (so `secondary != primary` whenever a finite distance exists). The axis
+/// names which climate field the border threshold is on (so the bake can normalise by the right
+/// gradient). Pure basic ops.
+fn neighbour_borders(t: f64, h: f64, primary: BiomeId) -> Vec<(f64, BiomeId, ClimateAxis)> {
     let mut out = Vec::new();
     // Helper: the biome just across a temperature/humidity boundary, evaluated by nudging the sample
     // across it and re-partitioning (keeps the neighbour identity consistent with `primary_biome`).
-    let mut push = |dist: f64, neigh: BiomeId| {
+    let mut push = |dist: f64, neigh: BiomeId, axis: ClimateAxis| {
         if neigh != primary {
-            out.push((dist.abs(), neigh));
+            out.push((dist.abs(), neigh, axis));
         }
     };
+    use ClimateAxis::{Humidity, Temperature};
 
     match primary {
         BiomeId::Desert => {
             // Border to the mid tier at T_WARM; neighbour is Plains or Forest by current humidity.
             let neigh = if h >= H_MID_WET { BiomeId::Forest } else { BiomeId::Plains };
-            push(t - T_WARM, neigh);
+            push(t - T_WARM, neigh, Temperature);
         }
         BiomeId::Forest => {
             // Hot border (→ Desert) and the humidity border (→ Plains).
-            push(t - T_WARM, BiomeId::Desert);
-            push(h - H_MID_WET, BiomeId::Plains);
+            push(t - T_WARM, BiomeId::Desert, Temperature);
+            push(h - H_MID_WET, BiomeId::Plains, Humidity);
             // Cold border (→ Snowy, since H is high here).
-            push(t - T_COLD, BiomeId::Snowy);
+            push(t - T_COLD, BiomeId::Snowy, Temperature);
         }
         BiomeId::Plains => {
-            push(t - T_WARM, BiomeId::Desert);
-            push(h - H_MID_WET, BiomeId::Forest);
+            push(t - T_WARM, BiomeId::Desert, Temperature);
+            push(h - H_MID_WET, BiomeId::Forest, Humidity);
             // Cold border (→ Tundra, since H is low here).
-            push(t - T_COLD, BiomeId::Tundra);
+            push(t - T_COLD, BiomeId::Tundra, Temperature);
         }
         BiomeId::Tundra => {
             // Warm border (→ Plains, low H) and the humidity border (→ Snowy).
-            push(t - T_COLD, BiomeId::Plains);
-            push(h - H_COLD_WET, BiomeId::Snowy);
+            push(t - T_COLD, BiomeId::Plains, Temperature);
+            push(h - H_COLD_WET, BiomeId::Snowy, Humidity);
         }
         BiomeId::Snowy => {
             // Warm border (→ Forest, high H) and the humidity border (→ Tundra).
-            push(t - T_COLD, BiomeId::Forest);
-            push(h - H_COLD_WET, BiomeId::Tundra);
+            push(t - T_COLD, BiomeId::Forest, Temperature);
+            push(h - H_COLD_WET, BiomeId::Tundra, Humidity);
         }
     }
     out
@@ -701,6 +712,66 @@ pub fn surface_biome(wx: f64, wz: f64, seed: u64) -> BiomeSample {
     let t = temperature(wx, wz, seed);
     let h = humidity(wx, wz, seed);
     classify(t, h)
+}
+
+/// Like [`surface_biome`] but the `blend` ramps over a fixed WORLD distance (`transition_m` metres)
+/// instead of [`classify`]'s fixed climate-space [`BLEND_BAND`] — so biome borders are uniformly soft
+/// regardless of the local climate gradient (a steep-gradient border is no longer a hard line, a gentle
+/// one no longer a smear). Every Whittaker border is one axis-threshold, so the world distance to it is
+/// the climate distance divided by that axis's world gradient (a central difference on the true f64
+/// field — smooth, computed once at BAKE time, NOT per-fragment on bilinear-sampled texels, which stepped
+/// at the texel grid). `primary`/`secondary` are unchanged; only the ramp width/shape differs. The bake
+/// SSOT for the in-world surface colour. Determinism note: a RENDER attribute (not keyed by
+/// `HEIGHT_GEN_VERSION`); uses only basic f64 ops on the portable climate fields.
+pub fn surface_biome_world(wx: f64, wz: f64, seed: u64, transition_m: f64) -> BiomeSample {
+    let t = temperature(wx, wz, seed).clamp(0.0, 1.0);
+    let h = humidity(wx, wz, seed).clamp(0.0, 1.0);
+    let primary = primary_biome(t, h);
+
+    // Nearest cell border + the biome across it + which axis its threshold is on.
+    let mut best = f64::INFINITY;
+    let mut secondary = primary;
+    let mut best_axis = ClimateAxis::Temperature;
+    for (dist, neigh, axis) in neighbour_borders(t, h, primary) {
+        if dist < best {
+            best = dist;
+            secondary = neigh;
+            best_axis = axis;
+        }
+    }
+
+    let blend = if best.is_finite() {
+        // climate distance to the iso-threshold → WORLD distance: divide by |∇axis| (the perpendicular
+        // distance to an axis-aligned iso-line is |value − threshold| / |∇value|). Gradient by central
+        // difference on the true field at a 16 m delta (smooth at the ≥1 km climate wavelength).
+        let g = climate_axis_gradient_mag(wx, wz, seed, best_axis).max(1e-9);
+        let world_dist = best / g;
+        // smoothstep ramp: 1 at the border (dist 0), 0 once `world_dist ≥ transition_m`. C1 in distance;
+        // across the border `best → 0` on BOTH sides (primary/secondary swap) ⇒ blend → 1 both sides ⇒
+        // the colour mix meets at 50/50 — continuous, no seam.
+        let x = (world_dist / transition_m.max(1e-3)).clamp(0.0, 1.0);
+        (1.0 - x * x * (3.0 - 2.0 * x)) as f32
+    } else {
+        0.0
+    };
+
+    let secondary = if blend <= 0.0 { primary } else { secondary };
+    BiomeSample { primary, secondary, blend }
+}
+
+/// |∇(climate axis)| at world `(wx, wz)` by central difference (delta `D`). The world-space gradient
+/// magnitude of the temperature/humidity field; divides the climate border distance into a world
+/// distance in [`surface_biome_world`]. `D = 16 m` is small vs the ≥1 km climate wavelength, so the
+/// estimate is the smooth local slope.
+fn climate_axis_gradient_mag(wx: f64, wz: f64, seed: u64, axis: ClimateAxis) -> f64 {
+    const D: f64 = 16.0;
+    let f = |x: f64, z: f64| match axis {
+        ClimateAxis::Temperature => temperature(x, z, seed),
+        ClimateAxis::Humidity => humidity(x, z, seed),
+    };
+    let gx = (f(wx + D, wz) - f(wx - D, wz)) / (2.0 * D);
+    let gz = (f(wx, wz + D) - f(wx, wz - D)) / (2.0 * D);
+    (gx * gx + gz * gz).sqrt()
 }
 
 /// The material at `depth` metres below the original surface for `biome`, walking its strata column:
