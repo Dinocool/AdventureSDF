@@ -234,6 +234,17 @@ fn apply_water_face(col: vec3<f32>, p: vec3<f32>) -> vec3<f32> {
     return mix(out, vec3<f32>(0.70, 0.88, 0.98), line);
 }
 
+// Crisp waterline where the terrain SURFACE meets the level — the shore (water "next to terrain") in the
+// normal 3D/2D view, the same bright line the slice draws. A fixed world-height band (tied to the
+// water-depth scale) so it needs no screen-space derivative inside the march loop.
+fn shoreline(col: vec3<f32>, surface_y: f32) -> vec3<f32> {
+    if (params.modes.z < 0.5) { return col; }
+    let wl = params.levels.w;
+    let half = max(params.levels.z * 0.04, 0.5);
+    let line = 1.0 - smoothstep(0.0, half, abs(surface_y - wl));
+    return mix(col, vec3<f32>(0.70, 0.88, 0.98), clamp(line, 0.0, 1.0));
+}
+
 // Is the slice plane active and is world point `p` on the HIDDEN (near) side of it? Axis 0=X,1=Z,2=Y; the
 // plane coord is params.slice.y. We hide the half with coordinate < plane (the near half toward -axis).
 fn slice_hidden(p: vec3<f32>) -> bool {
@@ -259,7 +270,7 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
         let wz = (in.uv.y * 2.0 - 1.0) * halfz;
         let h = hf_at(vec2<f32>(wx, wz)).x;
         var col = surface_colour(vec2<f32>(wx, wz), h);
-        col = apply_water(col, h);
+        col = shoreline(apply_water(col, h), h);
         return vec4<f32>(col, 1.0);
     }
 
@@ -342,7 +353,7 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
             let n = normalize(s.yzw);
             let lamb = clamp(dot(n, light), 0.0, 1.0);
             var col = surface_colour(pm.xz, s.x) * (0.28 + 0.72 * lamb);
-            col = apply_water(col, s.x);
+            col = shoreline(apply_water(col, s.x), s.x);
             return vec4<f32>(col, 1.0);
         }
         a_prev = a_n;
