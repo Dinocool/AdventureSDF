@@ -213,12 +213,33 @@ struct ViewerSignals {
     added: Vec<NodeId>,
 }
 
+/// Which terrain SHAPE graph the node editor is currently editing: the DEFAULT world graph ([`WorldGraph`]),
+/// or a per-biome SHAPE override ([`WorldBiomeShapes`] slot — "biomes own their terrain shape"). Switching
+/// the target writes the current snarl back to the old slot and reloads the editor from the new one.
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+pub(super) enum ShapeTarget {
+    #[default]
+    Default,
+    Biome(crate::sdf_render::worldgen::biome::BiomeId),
+}
+
+impl ShapeTarget {
+    pub(super) fn label(self) -> String {
+        match self {
+            ShapeTarget::Default => "Default (all biomes)".to_string(),
+            ShapeTarget::Biome(b) => format!("{b:?}"),
+        }
+    }
+}
+
 /// Editor state: the working Snarl graph, whether it's been seeded from the live `WorldGraph` yet, and
 /// the RON save/load path.
 #[derive(Resource)]
 pub struct WorldGraphEditor {
     snarl: Snarl<EdNode>,
     seeded: bool,
+    /// Which shape graph the editor edits (default vs a per-biome override). See [`ShapeTarget`].
+    shape_target: ShapeTarget,
     path: String,
     /// Last save/load status message (shown in the toolbar).
     status: String,
@@ -253,6 +274,7 @@ impl Default for WorldGraphEditor {
         Self {
             snarl: Snarl::new(),
             seeded: false,
+            shape_target: ShapeTarget::default(),
             path: DEFAULT_GRAPH_PATH.to_string(),
             status: String::new(),
             caches: NodeCaches::default(),
@@ -325,6 +347,12 @@ fn save_worldgen_session_on_exit(
         return;
     }
     if let (Some(editor), Some(panels)) = (editor, panels) {
-        persist::save_session(&editor, &panels);
+        // Only persist the DEFAULT graph's session — `editor.snarl` holds whichever shape target is being
+        // edited, and the auto-persist file IS the default world graph. Exiting while editing a per-biome
+        // shape must NOT overwrite the default session with the biome graph (per-biome shape persistence is
+        // a follow-up); the prior default session is preserved.
+        if editor.shape_target == ShapeTarget::Default {
+            persist::save_session(&editor, &panels);
+        }
     }
 }
