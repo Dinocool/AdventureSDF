@@ -195,7 +195,13 @@ fn fragment(in: VertexOutput, @builtin(front_facing) is_front: bool) -> Fragment
 
     // ---- Volumetric biome strata ----
     let surf_h = sample_height(uv);
-    let depth = surf_h - in.world_position.y;
+    // SURFACE SKIN (dead-zone): the baked `surf_h` (bilinear of the coarse clipmap) and the mesh geometry
+    // (triangulated Transvoxel surface) differ by a sub-voxel residual that, with a thin top stratum, crosses
+    // the grass→dirt boundary across the UNDUG surface → speckled dirt/stone. Treat depth within a fraction of
+    // the chunk's cell scale as the SURFACE (depth ≤ 0); the strata begin below it. Scales with LOD via
+    // chunk_size (residual ∝ cell size). The EXACT fix is a per-vertex pristine-surface-Y attribute (depth
+    // interpolates to 0 on the undug face) — that lands with Stage-4 digging, which needs it regardless.
+    let depth = surf_h - in.world_position.y - params.chunk_size * 0.15;
     let bio = sample_biome(uv);
     let boundary = params.surf_b.w;
     var albedo = volumetric_color(bio, depth, boundary);
