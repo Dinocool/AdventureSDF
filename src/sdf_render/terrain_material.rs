@@ -115,6 +115,16 @@ pub struct TerrainSurfaceExt {
     /// flatten as the strata table; re-synced live on a `biomes.ron` edit.
     #[uniform(107)]
     pub palette: MaterialPaletteStd,
+    /// Shared PBR texture arrays (one `texture_2d_array` layer per material, layer == `TerrainMatId`). The
+    /// shader triplanar-samples the baked `mat_a`/`mat_b` layers; a material without a texture (`has_tex == 0`)
+    /// uses its flat palette colour instead. All three share the sampler at binding 111.
+    #[texture(108, dimension = "2d_array")]
+    #[sampler(111)]
+    pub diffuse_array: Handle<Image>,
+    #[texture(109, dimension = "2d_array")]
+    pub normal_array: Handle<Image>,
+    #[texture(110, dimension = "2d_array")]
+    pub mra_array: Handle<Image>,
 }
 
 impl MaterialExtension for TerrainSurfaceExt {
@@ -290,6 +300,7 @@ pub fn make_terrain_material(
     debug_normals: bool,
     strata: StrataTableStd,
     palette: MaterialPaletteStd,
+    arrays: (Handle<Image>, Handle<Image>, Handle<Image>),
 ) -> TerrainMaterial {
     TerrainMaterial {
         base: StandardMaterial {
@@ -314,6 +325,9 @@ pub fn make_terrain_material(
             strata,
             surface_mat,
             palette,
+            diffuse_array: arrays.0,
+            normal_array: arrays.1,
+            mra_array: arrays.2,
         },
     }
 }
@@ -324,7 +338,37 @@ pub struct TerrainMaterialPlugin;
 impl Plugin for TerrainMaterialPlugin {
     fn build(&self, app: &mut App) {
         app.add_plugins(MaterialPlugin::<TerrainMaterial>::default())
-            .register_type::<TerrainSurfaceParams>();
+            .register_type::<TerrainSurfaceParams>()
+            .init_resource::<super::terrain_textures::TerrainTextureArrays>()
+            .add_systems(
+                Update,
+                (
+                    super::terrain_textures::build_terrain_texture_arrays,
+                    sync_terrain_texture_arrays.after(super::terrain_textures::build_terrain_texture_arrays),
+                ),
+            );
+    }
+}
+
+/// Push the shared terrain texture-array handles into every live `TerrainMaterial` whenever the arrays
+/// resource changes (the assembled arrays swapped in once their PNGs loaded, or a `biomes.ron` retexture
+/// rebuilt them). New chunks already bake with the current handles (via the commit's `SpawnAssets`); this
+/// keeps already-spawned chunks in sync — the texture analogue of `sync_terrain_detail_params`' strata push.
+fn sync_terrain_texture_arrays(
+    arrays: Res<super::terrain_textures::TerrainTextureArrays>,
+    mut mats: ResMut<Assets<TerrainMaterial>>,
+) {
+    if !arrays.is_changed() {
+        return;
+    }
+    let (d, n, m) = (arrays.diffuse.clone(), arrays.normal.clone(), arrays.mra.clone());
+    let ids: Vec<_> = mats.iter().map(|(id, _)| id).collect();
+    for id in ids {
+        if let Some(mat) = mats.get_mut(id) {
+            mat.extension.diffuse_array = d.clone();
+            mat.extension.normal_array = n.clone();
+            mat.extension.mra_array = m.clone();
+        }
     }
 }
 

@@ -66,6 +66,7 @@ pub mod mesh_bake;
 /// Custom triplanar-PBR material for the baked meshes (`ExtendedMaterial<StandardMaterial, _>`).
 pub mod mesh_material;
 pub mod terrain_material;
+pub mod terrain_textures;
 pub mod gizmo;
 pub(crate) mod height;
 pub(crate) mod node_gizmos;

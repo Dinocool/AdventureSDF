@@ -119,12 +119,12 @@ pub(crate) struct MeshTextureArrays {
 }
 
 /// The five source-PNG handles for one texture-array layer (a resolved material map-set).
-struct LayerSrc {
-    diffuse: Option<Handle<Image>>,
-    normal: Option<Handle<Image>>,
-    metallic: Option<Handle<Image>>,
-    roughness: Option<Handle<Image>>,
-    ao: Option<Handle<Image>>,
+pub(crate) struct LayerSrc {
+    pub(crate) diffuse: Option<Handle<Image>>,
+    pub(crate) normal: Option<Handle<Image>>,
+    pub(crate) metallic: Option<Handle<Image>>,
+    pub(crate) roughness: Option<Handle<Image>>,
+    pub(crate) ao: Option<Handle<Image>>,
 }
 
 /// Plugin: the material pipeline + the array/table/material build systems + a per-camera ambient light.
@@ -162,7 +162,7 @@ fn ensure_camera_ambient(mut commands: Commands, cams: Query<Entity, (With<Camer
 
 /// Force an `Image`'s GPU view to be `2d_array` — a 2D texture (even with >1 layer) otherwise defaults to a
 /// plain `D2` view, which mismatches the `texture_2d_array` binding (a wgpu validation panic).
-fn as_d2_array_view(img: &mut Image) {
+pub(crate) fn as_d2_array_view(img: &mut Image) {
     img.texture_view_descriptor = Some(TextureViewDescriptor {
         dimension: Some(TextureViewDimension::D2Array),
         ..default()
@@ -170,7 +170,7 @@ fn as_d2_array_view(img: &mut Image) {
 }
 
 /// A 1×1 layer-0 fallback array image (so the material is bindable before the real arrays finish loading).
-fn fallback_array(images: &mut Assets<Image>, fill: [u8; 4], srgb: bool) -> Handle<Image> {
+pub(crate) fn fallback_array(images: &mut Assets<Image>, fill: [u8; 4], srgb: bool) -> Handle<Image> {
     let fmt = if srgb { TextureFormat::Rgba8UnormSrgb } else { TextureFormat::Rgba8Unorm };
     let mut img = Image::new(
         Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
@@ -185,7 +185,7 @@ fn fallback_array(images: &mut Assets<Image>, fill: [u8; 4], srgb: bool) -> Hand
 }
 
 /// A tiling (Repeat) trilinear sampler — triplanar UVs leave `[0,1]`, and mipmaps need linear mip filtering.
-fn tiling_sampler() -> ImageSampler {
+pub(crate) fn tiling_sampler() -> ImageSampler {
     ImageSampler::Descriptor(ImageSamplerDescriptor {
         address_mode_u: ImageAddressMode::Repeat,
         address_mode_v: ImageAddressMode::Repeat,
@@ -199,7 +199,7 @@ fn tiling_sampler() -> ImageSampler {
 
 /// Load a source PNG readable in the main world (so we can assemble it into an array), with the right colour
 /// space (`srgb` for diffuse, linear for normal/MRA channels).
-fn load_src(assets: &AssetServer, path: &Path, srgb: bool) -> Handle<Image> {
+pub(crate) fn load_src(assets: &AssetServer, path: &Path, srgb: bool) -> Handle<Image> {
     assets.load_with_settings(path.to_path_buf(), move |s: &mut ImageLoaderSettings| {
         s.is_srgb = srgb;
         s.asset_usage = RenderAssetUsages::all();
@@ -216,7 +216,7 @@ fn variants_hash(library: &MaterialTextureLibrary) -> u64 {
 }
 
 /// Read a loaded image as RGBA8 resized to `size`, or `fill` repeated if absent/unreadable.
-fn layer_rgba(images: &Assets<Image>, h: &Option<Handle<Image>>, size: u32, fill: [u8; 4]) -> Vec<u8> {
+pub(crate) fn layer_rgba(images: &Assets<Image>, h: &Option<Handle<Image>>, size: u32, fill: [u8; 4]) -> Vec<u8> {
     let n = (size * size) as usize;
     let resized = h.as_ref().and_then(|h| images.get(h)).and_then(|img| {
         img.clone()
@@ -228,7 +228,7 @@ fn layer_rgba(images: &Assets<Image>, h: &Option<Handle<Image>>, size: u32, fill
 }
 
 /// Build a layer's MRA (metal/rough/AO) by packing the R channel of three source maps (defaults 0/255/255).
-fn layer_mra(images: &Assets<Image>, l: &LayerSrc, size: u32) -> Vec<u8> {
+pub(crate) fn layer_mra(images: &Assets<Image>, l: &LayerSrc, size: u32) -> Vec<u8> {
     let m = layer_rgba(images, &l.metallic, size, [0, 0, 0, 255]);
     let r = layer_rgba(images, &l.roughness, size, [255, 255, 255, 255]);
     let a = layer_rgba(images, &l.ao, size, [255, 255, 255, 255]);
@@ -244,7 +244,7 @@ fn layer_mra(images: &Assets<Image>, l: &LayerSrc, size: u32) -> Vec<u8> {
 }
 
 /// Box-downsample one RGBA8 mip level (`w`×`h`) to half size.
-fn downsample(src: &[u8], w: u32, h: u32) -> Vec<u8> {
+pub(crate) fn downsample(src: &[u8], w: u32, h: u32) -> Vec<u8> {
     let (hw, hh) = ((w / 2).max(1), (h / 2).max(1));
     let mut out = vec![0u8; (hw * hh * 4) as usize];
     for y in 0..hh {
@@ -267,7 +267,7 @@ fn downsample(src: &[u8], w: u32, h: u32) -> Vec<u8> {
 
 /// Assemble `layers` of RGBA8 (each `size`×`size`) into a MIP-chained `texture_2d_array` image. Data layout is
 /// `TextureDataOrder::LayerMajor`: each layer's full mip chain contiguous.
-fn array_image(images: &mut Assets<Image>, layers: &[Vec<u8>], size: u32, srgb: bool) -> Handle<Image> {
+pub(crate) fn array_image(images: &mut Assets<Image>, layers: &[Vec<u8>], size: u32, srgb: bool) -> Handle<Image> {
     let mips = (32 - size.leading_zeros()).max(1); // floor(log2)+1 mip levels
     let mut data = Vec::new();
     for layer in layers {

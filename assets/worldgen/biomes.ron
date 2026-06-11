@@ -10,31 +10,33 @@
 // NOTE: colours are LINEAR; they look darker than the equivalent sRGB hex would. Picked low-ish so the
 // flat-lit demo reads naturally (e.g. grass ~ (0.05, 0.22, 0.05)).
 BiomeLibraryAsset(
+    // `base_color` is the flat fallback + preview/biome-map colour; `texture` (a "<slug>/<variant>" set under
+    // assets/textures/) supplies the in-world PBR look (raw texture, no tint). `tiling` = world metres/tile.
     materials: [
-        // 0  grass      — green
-        TerrainSurfaceMaterial(name: "grass",       base_color: (0.05, 0.22, 0.04, 1.0), roughness: 0.95),
-        // 1  grass_dark — darker forest green
-        TerrainSurfaceMaterial(name: "grass_dark",  base_color: (0.03, 0.13, 0.03, 1.0), roughness: 0.95),
-        // 2  dirt       — brown
-        TerrainSurfaceMaterial(name: "dirt",        base_color: (0.12, 0.07, 0.03, 1.0), roughness: 1.0),
-        // 3  stone      — grey
-        TerrainSurfaceMaterial(name: "stone",       base_color: (0.18, 0.18, 0.19, 1.0), roughness: 0.9),
-        // 4  bedrock    — near-black
-        TerrainSurfaceMaterial(name: "bedrock",     base_color: (0.02, 0.02, 0.025, 1.0), roughness: 0.85),
-        // 5  sand       — tan
-        TerrainSurfaceMaterial(name: "sand",        base_color: (0.62, 0.50, 0.27, 1.0), roughness: 1.0),
-        // 6  sandstone  — pale orange
-        TerrainSurfaceMaterial(name: "sandstone",   base_color: (0.45, 0.30, 0.15, 1.0), roughness: 0.95),
-        // 7  tundra     — pale khaki
-        TerrainSurfaceMaterial(name: "tundra",      base_color: (0.28, 0.27, 0.18, 1.0), roughness: 1.0),
-        // 8  permafrost — blue-grey
-        TerrainSurfaceMaterial(name: "permafrost",  base_color: (0.16, 0.19, 0.24, 1.0), roughness: 0.9),
-        // 9  snow       — white
-        TerrainSurfaceMaterial(name: "snow",        base_color: (0.85, 0.88, 0.95, 1.0), roughness: 0.7),
-        // 10 rock       — grey (steeper/exposed)
-        TerrainSurfaceMaterial(name: "rock",        base_color: (0.13, 0.13, 0.14, 1.0), roughness: 0.85),
-        // 11 flower      — wildflower magenta over grass (demo noise patch). `blend` widens its soft edge.
-        TerrainSurfaceMaterial(name: "flower",      base_color: (0.30, 0.05, 0.22, 1.0), roughness: 0.95, blend: 6.0),
+        // 0  grass
+        TerrainSurfaceMaterial(name: "grass",       base_color: (0.05, 0.22, 0.04, 1.0), roughness: 0.95, texture: Some("grass/1"), tiling: 4.0),
+        // 1  grass_dark — forest floor
+        TerrainSurfaceMaterial(name: "grass_dark",  base_color: (0.03, 0.13, 0.03, 1.0), roughness: 0.95, texture: Some("swamp/1"), tiling: 4.0),
+        // 2  dirt
+        TerrainSurfaceMaterial(name: "dirt",        base_color: (0.12, 0.07, 0.03, 1.0), roughness: 1.0, texture: Some("ground/1"), tiling: 4.0),
+        // 3  stone
+        TerrainSurfaceMaterial(name: "stone",       base_color: (0.18, 0.18, 0.19, 1.0), roughness: 0.9, texture: Some("stone_wall/1"), tiling: 5.0),
+        // 4  bedrock
+        TerrainSurfaceMaterial(name: "bedrock",     base_color: (0.02, 0.02, 0.025, 1.0), roughness: 0.85, texture: Some("cave_floor/1"), tiling: 5.0),
+        // 5  sand
+        TerrainSurfaceMaterial(name: "sand",        base_color: (0.62, 0.50, 0.27, 1.0), roughness: 1.0, texture: Some("sand/1"), tiling: 5.0),
+        // 6  sandstone
+        TerrainSurfaceMaterial(name: "sandstone",   base_color: (0.45, 0.30, 0.15, 1.0), roughness: 0.95, texture: Some("desert/1"), tiling: 6.0),
+        // 7  tundra
+        TerrainSurfaceMaterial(name: "tundra",      base_color: (0.28, 0.27, 0.18, 1.0), roughness: 1.0, texture: Some("snowy_grass/1"), tiling: 4.0),
+        // 8  permafrost
+        TerrainSurfaceMaterial(name: "permafrost",  base_color: (0.16, 0.19, 0.24, 1.0), roughness: 0.9, texture: Some("ice/1"), tiling: 5.0),
+        // 9  snow
+        TerrainSurfaceMaterial(name: "snow",        base_color: (0.85, 0.88, 0.95, 1.0), roughness: 0.7, texture: Some("snow/1"), tiling: 5.0),
+        // 10 rock       — steeper/exposed
+        TerrainSurfaceMaterial(name: "rock",        base_color: (0.13, 0.13, 0.14, 1.0), roughness: 0.85, texture: Some("cave_wall/1"), tiling: 5.0),
+        // 11 flower      — wildflower noise patch
+        TerrainSurfaceMaterial(name: "flower",      base_color: (0.30, 0.05, 0.22, 1.0), roughness: 0.95, blend: 6.0, texture: Some("fire_grass/1"), tiling: 3.0),
     ],
     biomes: [
         // 0 Plains: grass -> dirt -> stone -> bedrock. Surface: grass, a wildflower noise-patch sub-area, a

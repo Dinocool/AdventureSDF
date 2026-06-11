@@ -113,6 +113,14 @@ struct BakeRound {
     clipmap: Option<Arc<HeightClipmap>>,
 }
 
+/// The biome library + terrain texture arrays, bundled into one `SystemParam` so `mesh_resident_chunks`
+/// (already at Bevy's param-arity limit) can read both from a single slot.
+#[derive(bevy::ecs::system::SystemParam)]
+struct TerrainMatRes<'w> {
+    lib: Res<'w, super::worldgen::biome::BiomeLibrary>,
+    tex: Res<'w, super::terrain_textures::TerrainTextureArrays>,
+}
+
 /// Per-system scalar `Local` state, bundled (Bevy systems cap at 16 params).
 #[derive(Default)]
 struct MeshBakeScalars {
@@ -217,11 +225,11 @@ impl Default for MeshBakeConfig {
             // Tune via the editor slider (down for cheaper, up to 512 for finer) when iterating on the look.
             detail_normal_res: 256,
             detail_normal_strength: 1.0,
-            // 64×64 biome map per chunk: biome is km-scale, but the ids are NEAREST-sampled (ids can't
-            // interpolate), so biome/snow boundaries step at the texel grid — 16² stepped visibly (blocky
-            // snow patch). 64² puts the steps below the detail scale (4096 classifier calls/chunk, still
-            // ~0.5 ms vs ~31 ms mesh). The blend weight + cold cross-fade smooth within each step.
-            biome_res: 64,
+            // 128×128 biome + surface-material map per chunk. The surface-material pair (mat_a, mat_b) is
+            // NEAREST-sampled per texel (ids can't interpolate + the textures are per-fragment), so the
+            // material BOUNDARIES step at the texel grid — 128 keeps the steps fine (~the detail scale) while
+            // the textures mask the rest. Higher = smoother boundaries but more resolve_surface calls/chunk.
+            biome_res: 128,
             // 150 m biome-border cross-fade: the baked blend is WORLD-normalised (gradient-divided), so
             // every biome border fades over ~150 m regardless of how steep the local climate gradient is —
             // no more hard lines where the climate happens to change quickly. Tune via the editor slider.
@@ -1178,6 +1186,9 @@ struct SpawnAssets<'a> {
     /// The shared material palette (colour + roughness, flattened from the live `BiomeLibrary`) the baked
     /// `surface_mat` ids index. Re-synced live on a `biomes.ron` edit, same as `strata`.
     palette: super::worldgen::biome::MaterialPaletteStd,
+    /// The shared terrain PBR texture arrays (diffuse, normal, MRA) — the current handles to bake into a new
+    /// chunk's material. `sync_terrain_texture_arrays` keeps already-spawned chunks current.
+    tex_arrays: (Handle<Image>, Handle<Image>, Handle<Image>),
 }
 
 /// Spawn one chunk-mesh entity from baked data — the single SSOT used by BOTH the immediate terrain commit
@@ -1229,6 +1240,7 @@ fn spawn_chunk_mesh(
             assets.debug_normals,
             assets.strata,
             assets.palette,
+            assets.tex_arrays.clone(),
         ));
         ent.insert((
             MeshMaterial3d(mat.clone()),
@@ -1313,7 +1325,10 @@ fn mesh_resident_chunks(
     mesh_mats: Res<super::mesh_material::MeshMaterials>,
     // The live biome library → flattened into the shared strata GPU table baked into each terrain-only
     // chunk's `TerrainMaterial` (Stage 3). Hot-reload re-syncs existing materials (`sync_terrain_detail_params`).
-    biome_lib: Res<super::worldgen::biome::BiomeLibrary>,
+    // The live biome library + shared terrain texture arrays, bundled into one SystemParam (the system is at
+    // Bevy's param-arity limit, so they share a slot). `.lib` flattens into the strata/palette GPU tables;
+    // `.tex` supplies the texture-array handles baked into each new terrain chunk's material (Stage 5).
+    terrain_mat: TerrainMatRes,
     // Bundled scalar Locals: rebake epoch, prev K.
     mut scal: Local<MeshBakeScalars>,
     // The in-progress bake round's frozen edit + clipmap snapshot.
@@ -1570,8 +1585,13 @@ fn mesh_resident_chunks(
         mesh_mats: &mesh_mats,
         detail_strength: mesh_cfg.detail_normal_strength,
         debug_normals: mesh_cfg.debug_normals,
-        strata: super::worldgen::biome::StrataTableStd::from_library(&biome_lib),
-        palette: super::worldgen::biome::MaterialPaletteStd::from_library(&biome_lib),
+        strata: super::worldgen::biome::StrataTableStd::from_library(&terrain_mat.lib),
+        palette: super::worldgen::biome::MaterialPaletteStd::from_library(&terrain_mat.lib),
+        tex_arrays: (
+            terrain_mat.tex.diffuse.clone(),
+            terrain_mat.tex.normal.clone(),
+            terrain_mat.tex.mra.clone(),
+        ),
     };
 
     // 1b. IMMEDIATE TERRAIN COMMIT: a terrain-only chunk is an independent world-anchored surface with NO
@@ -1894,7 +1914,7 @@ fn mesh_bake_panel(world: &mut World, ui: &mut bevy_egui::egui::Ui) {
     // patches) is authored in `biomes.ron` surface_rules and baked — no live treatment slider.
     let mut bres = world.resource::<MeshBakeConfig>().biome_res;
     if ui
-        .add(bevy_egui::egui::Slider::new(&mut bres, 2..=64).text("Biome map res"))
+        .add(bevy_egui::egui::Slider::new(&mut bres, 2..=256).text("Biome map res"))
         .on_hover_text("N×N per-chunk biome (primary/secondary/blend) map resolution. Biome is km-scale, so \
                         small is plenty. Changing it re-bakes the terrain.")
         .changed()
