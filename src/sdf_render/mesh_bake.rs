@@ -182,6 +182,11 @@ pub(crate) struct MeshBakeConfig {
     /// (km-scale climate fields), so a small map suffices; it indexes the strata table per fragment.
     /// Changing it re-bakes (the texel data changes).
     pub(crate) biome_res: u32,
+    /// BIOME-BORDER blend HALF-WIDTH in WORLD metres: the baked biome `blend` ramps a biome→neighbour
+    /// surface-colour cross-fade over this distance (uniform width regardless of the local climate
+    /// gradient — see [`biome::surface_biome_world`]). Larger = softer, wider biome transitions.
+    /// Changing it re-bakes (the texel blend changes).
+    pub(crate) biome_blend_m: f32,
     /// SURFACE-TREATMENT master strength `[0,1]` for the top (undug) layer (snow/sand/rock overrides): 0 =
     /// pure strata surface colour, 1 = full treatment. A LIVE shader uniform — no re-bake on change.
     pub(crate) surface_treatment: f32,
@@ -217,6 +222,10 @@ impl Default for MeshBakeConfig {
             // snow patch). 64² puts the steps below the detail scale (4096 classifier calls/chunk, still
             // ~0.5 ms vs ~31 ms mesh). The blend weight + cold cross-fade smooth within each step.
             biome_res: 64,
+            // 150 m biome-border cross-fade: the baked blend is WORLD-normalised (gradient-divided), so
+            // every biome border fades over ~150 m regardless of how steep the local climate gradient is —
+            // no more hard lines where the climate happens to change quickly. Tune via the editor slider.
+            biome_blend_m: 150.0,
             surface_treatment: 1.0,
         }
     }
@@ -629,6 +638,8 @@ fn mesh_chunk(
     detail_res: u32,
     // BIOME map resolution (`N`): the per-chunk low-res biome (primary/secondary/blend) map.
     biome_res: u32,
+    // BIOME-border blend half-width in WORLD metres (the baked colour cross-fade width).
+    biome_blend_m: f32,
 ) -> Option<ChunkMeshData> {
     // Install THIS ROUND'S frozen Terrain clipmap snapshot ONCE on the bake thread (held for the whole
     // bake), so every field sample reads it via a thread-local borrow instead of a process-global RwLock +
@@ -685,8 +696,9 @@ fn mesh_chunk(
     // surface height (depth reference) + the fine surface slope (detail normal, coarse-gated) + the biome
     // (low-res Whittaker classification). The per-bake hi-fi snapshot is the SAME terrain the clipmap was
     // built from. Attached to the mesh data; the commit turns it into the chunk's `TerrainMaterial`.
-    data.terrain_surface =
-        bake_terrain_surface(grid_origin, subdivisions as f32 * vs, vs, terrain_only, detail_res, biome_res);
+    data.terrain_surface = bake_terrain_surface(
+        grid_origin, subdivisions as f32 * vs, vs, terrain_only, detail_res, biome_res, biome_blend_m,
+    );
     Some(data)
 }
 
@@ -721,6 +733,7 @@ fn bake_terrain_surface(
     terrain_only: bool,
     detail_res: u32,
     biome_res: u32,
+    biome_blend_m: f32,
 ) -> Option<super::terrain_material::TerrainSurfaceBake> {
     use super::terrain_material::TerrainSurfaceBake;
     if !terrain_only {
@@ -786,7 +799,12 @@ fn bake_terrain_surface(
         let wz = oz + (j as f64 + 0.5) * bstep;
         for i in 0..bn {
             let wx = ox + (i as f64 + 0.5) * bstep;
-            let s = crate::sdf_render::worldgen::biome::surface_biome(wx, wz, hifi.world_seed);
+            let s = crate::sdf_render::worldgen::biome::surface_biome_world(
+                wx,
+                wz,
+                hifi.world_seed,
+                biome_blend_m as f64,
+            );
             let temp = crate::sdf_render::worldgen::biome::temperature(wx, wz, hifi.world_seed) as f32;
             biome_texels.extend_from_slice(&TerrainSurfaceBake::pack_biome(
                 s.primary as u8,
@@ -1620,6 +1638,7 @@ fn mesh_resident_chunks(
         // detail-normal disabled; height/biome still bake).
         let detail_res = mesh_cfg.detail_normal_res;
         let biome_res = mesh_cfg.biome_res;
+        let biome_blend_m = mesh_cfg.biome_blend_m;
         // Install the round's FROZEN clipmap snapshot on THIS (system) thread for the whole REQUEST loop, so
         // the SYNCHRONOUS narrow-band cull below (`chunk_has_surface` → `terrain_sdf`) samples the EXACT
         // clipmap whose coverage gate admitted this round's residency — the SAME snapshot the async
@@ -1680,7 +1699,7 @@ fn mesh_resident_chunks(
             st.task = Some(pool.spawn(async move {
                 mesh_chunk(
                     &edits, &indices, grid_origin, vs_l, k * cs, flags, lod, debug, terrain, is_terrain,
-                    detail_res, biome_res,
+                    detail_res, biome_res, biome_blend_m,
                 )
             }));
             budget -= 1;
@@ -1811,6 +1830,17 @@ fn mesh_bake_panel(world: &mut World, ui: &mut bevy_egui::egui::Ui) {
         .changed()
     {
         world.resource_mut::<MeshBakeConfig>().biome_res = bres;
+        world.resource_mut::<MeshBakeRebuild>().0 = true;
+    }
+    let mut bblend = world.resource::<MeshBakeConfig>().biome_blend_m;
+    if ui
+        .add(bevy_egui::egui::Slider::new(&mut bblend, 0.0..=600.0).text("Biome blend width (m)"))
+        .on_hover_text("WORLD-space half-width of the biome→neighbour surface-colour cross-fade. The baked \
+                        blend is gradient-normalised, so borders fade over this many metres EVERYWHERE \
+                        regardless of how fast the climate changes locally (no hard lines). Changing it re-bakes.")
+        .changed()
+    {
+        world.resource_mut::<MeshBakeConfig>().biome_blend_m = bblend;
         world.resource_mut::<MeshBakeRebuild>().0 = true;
     }
     let mut treat = world.resource::<MeshBakeConfig>().surface_treatment;
@@ -2080,7 +2110,7 @@ mod tests {
         let edits = [sphere_edit(Vec3::ZERO, 1.0)];
         let (vs, sub) = (0.1f32, 28u32); // block span = 28·0.1 = 2.8 > sphere Ø 2.0 → clears all faces
         let origin = Vec3::splat(-1.4);
-        let data = mesh_chunk(&edits, &[0], origin, vs, sub, 0, 0, false, None, false, 0, 0).expect("sphere meshes");
+        let data = mesh_chunk(&edits, &[0], origin, vs, sub, 0, 0, false, None, false, 0, 0, 0.0).expect("sphere meshes");
         assert_eq!(open_edge_count(&chunk_tris(&data, origin)), 0, "closed sphere must be watertight");
     }
 
@@ -2100,8 +2130,8 @@ mod tests {
         let (vsf, vsc, sub) = (0.1f32, 0.2f32, 28u32);
         let of = Vec3::new(0.0, -1.4, -1.4); // fine x∈[0,2.8]; −X face at x=0 (regular, high-res)
         let oc = Vec3::new(-5.6, -2.8, -2.8); // coarse x∈[−5.6,0]; +X face at x=0 is the transition side
-        let fine = mesh_chunk(&edits, &idx, of, vsf, sub, 0, 0, false, None, false, 0, 0).expect("fine meshes");
-        let coarse = mesh_chunk(&edits, &idx, oc, vsc, sub, 1 << 1, 1, false, None, false, 0, 0).expect("coarse meshes");
+        let fine = mesh_chunk(&edits, &idx, of, vsf, sub, 0, 0, false, None, false, 0, 0, 0.0).expect("fine meshes");
+        let coarse = mesh_chunk(&edits, &idx, oc, vsc, sub, 1 << 1, 1, false, None, false, 0, 0, 0.0).expect("coarse meshes");
         let mut all = chunk_tris(&fine, of);
         all.extend(chunk_tris(&coarse, oc));
         assert_eq!(
@@ -2303,9 +2333,9 @@ mod tests {
         // Bake: fine = LOD 0, regular; coarse = LOD 1 with +X (HighX = bit 1) transition. `terrain_only =
         // true` ⇒ analytic stored-gradient normals (the smooth normal the LOD seam is judged on). Pass the
         // published clipmap as `mesh_chunk`'s `terrain` param (installed as the per-bake thread-local).
-        let fine = mesh_chunk(&edits_v, &idx, of, vsf, sub_f, 0, 0, false, Some(clip.clone()), true, 0, 0)
+        let fine = mesh_chunk(&edits_v, &idx, of, vsf, sub_f, 0, 0, false, Some(clip.clone()), true, 0, 0, 0.0)
             .expect("fine terrain chunk meshes");
-        let coarse = mesh_chunk(&edits_v, &idx, oc, vsc, sub, 1 << 1, 1, false, Some(clip.clone()), true, 0, 0)
+        let coarse = mesh_chunk(&edits_v, &idx, oc, vsc, sub, 1 << 1, 1, false, Some(clip.clone()), true, 0, 0, 0.0)
             .expect("coarse terrain chunk meshes");
 
         // (a) GEOMETRIC: fine ∪ coarse must weld watertight across the shared x=0 seam — no gap / overlap.
@@ -2374,7 +2404,7 @@ mod tests {
 
         // Bake the coarse chunk WITH the +X transition (matching the watertight harness). terrain_only ⇒
         // analytic stored-gradient normals (the smooth normal the surface morph is judged on).
-        let coarse = mesh_chunk(&edits_v, &idx, oc, vsc, sub, 1 << 1, 1, false, Some(clip.clone()), true, 0, 0)
+        let coarse = mesh_chunk(&edits_v, &idx, oc, vsc, sub, 1 << 1, 1, false, Some(clip.clone()), true, 0, 0, 0.0)
             .expect("coarse terrain chunk meshes");
 
         // Bin coarse-surface vertices by inward distance from the +X face (d = cmax.x − world.x = −world.x,
@@ -2508,7 +2538,7 @@ mod tests {
         let (vs, sub) = (8.0f32, 8u32);
         let chunk_world = sub as f32 * vs; // 64 m footprint
         let origin = Vec3::new(128.0, 0.0, 192.0);
-        let bake = bake_terrain_surface(origin, chunk_world, vs, true, res, bres)
+        let bake = bake_terrain_surface(origin, chunk_world, vs, true, res, bres, 150.0)
             .expect("coarse terrain chunk must bake a terrain-surface payload");
         assert_eq!(bake.detail_res, res);
         assert_eq!(bake.biome_res, bres);
@@ -2543,7 +2573,7 @@ mod tests {
 
         // DETAIL-NORMAL GATE: a FINE chunk (vs = 2 m = finest node spacing) STILL bakes (height/biome render
         // everywhere) but its detail-normal slope is ZERO-FILLED → geometry normal in the shader.
-        let fine = bake_terrain_surface(origin, 2.0 * sub as f32, 2.0, true, res, bres)
+        let fine = bake_terrain_surface(origin, 2.0 * sub as f32, 2.0, true, res, bres, 150.0)
             .expect("fine terrain chunk still bakes height + biome (strata render everywhere)");
         assert!(
             fine.detail_texels.iter().all(|&b| b == 0),
@@ -2551,7 +2581,7 @@ mod tests {
         );
         // GATE: a non-terrain chunk gets no surface payload regardless of LOD.
         assert!(
-            bake_terrain_surface(origin, chunk_world, vs, false, res, bres).is_none(),
+            bake_terrain_surface(origin, chunk_world, vs, false, res, bres, 150.0).is_none(),
             "mixed/object chunk → no terrain-surface payload"
         );
 
@@ -2641,7 +2671,7 @@ mod tests {
                     .height;
                     let y_min = ((h_mid - span * 0.5) / vs).floor() * vs;
                     let origin = Vec3::new(ox, y_min, oz);
-                    let Some(data) = mesh_chunk(&edits_v, &idx, origin, vs, sub, 0, 0, false, Some(clip.clone()), true, 0, 0)
+                    let Some(data) = mesh_chunk(&edits_v, &idx, origin, vs, sub, 0, 0, false, Some(clip.clone()), true, 0, 0, 0.0)
                     else {
                         continue;
                     };
@@ -2771,7 +2801,7 @@ mod tests {
         ];
         let (vs, sub) = (0.1f32, 32u32); // span 3.2 > shape Ø (cube corner ≈ 1.39) → closed in one chunk
         let origin = Vec3::splat(-1.6);
-        let data = mesh_chunk(&edits, &[0, 1], origin, vs, sub, 0, 0, false, None, false, 0, 0).expect("merged shape meshes");
+        let data = mesh_chunk(&edits, &[0, 1], origin, vs, sub, 0, 0, false, None, false, 0, 0, 0.0).expect("merged shape meshes");
         (data, origin)
     }
 
@@ -2811,7 +2841,7 @@ mod tests {
         // (0.4,0,0) crosses the block's +X face (x=0); every normal must point outward from the sphere centre.
         let edits = [sphere_edit(Vec3::new(0.4, 0.0, 0.0), 1.0)];
         let oc = Vec3::new(-5.6, -2.8, -2.8);
-        let coarse = mesh_chunk(&edits, &[0], oc, 0.2, 28, 1 << 1, 1, false, None, false, 0, 0).expect("coarse+transition meshes");
+        let coarse = mesh_chunk(&edits, &[0], oc, 0.2, 28, 1 << 1, 1, false, None, false, 0, 0, 0.0).expect("coarse+transition meshes");
         let center = Vec3::new(0.4, 0.0, 0.0);
         let (mut worst, mut inward, mut degenerate) = (1.0f32, 0, 0);
         for i in 0..coarse.positions.len() {
