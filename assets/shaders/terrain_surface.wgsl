@@ -196,15 +196,31 @@ fn fragment(in: VertexOutput, @builtin(front_facing) is_front: bool) -> Fragment
     // Top-down planar UV over the chunk's world-XZ footprint (clamped — the samplers clamp too).
     let uv = clamp((in.world_position.xz - params.chunk_min) / params.chunk_size, vec2<f32>(0.0), vec2<f32>(1.0));
 
-    // ---- Detail normal (coarse chunks) ----
+    // ---- Depth below the PRISTINE surface (drives the surface-vs-dug-strata split) ----
+    let surf_h = sample_height(uv);
+    // SURFACE SKIN (dead-zone): the baked `surf_h` (bilinear of the coarse clipmap) and the mesh geometry
+    // (triangulated Transvoxel surface) differ by a sub-voxel residual that, with a thin top stratum, crosses
+    // the grass→dirt boundary across the UNDUG surface → speckled dirt/stone. Treat depth within a fraction of
+    // the chunk's cell scale as the SURFACE (depth ≤ 0); the strata begin below it. Scales with LOD via
+    // chunk_size (residual ∝ cell size). The EXACT fix is a per-vertex pristine-surface-Y attribute (depth
+    // interpolates to 0 on the undug face) — lands with D3 of digging.
+    let depth = surf_h - in.world_position.y - params.chunk_size * 0.15;
+    let boundary = params.surf_b.w;
+    let top_band = max(boundary * 2.0, 1.0);
+    let depth_w = smoothstep(0.0, top_band, max(depth, 0.0)); // 0 = surface, 1 = below the surface band
+    let surf_w = 1.0 - depth_w;                               // 1 = undug surface, 0 = a dug wall
+
+    // ---- Detail normal (coarse chunks) — only on the UNDUG surface ----
     let n_geo = normalize(in.world_normal);
     var n = n_geo;
     if (params.flags.z != 0u) {
         // The Rg16Float texel stores the absolute fine surface slope (dh/dx, dh/dz); reconstruct the hi-fi
-        // heightfield normal N = normalize(-dh/dx, 1, -dh/dz) and blend toward it by `strength`.
+        // heightfield normal N = normalize(-dh/dx, 1, -dh/dz) and blend toward it by `strength`, FADED OUT on a
+        // dug wall (`surf_w`): the detail normal is the heightfield-up relief and would wrongly tilt a vertical
+        // cavity wall toward "up" — a carved chunk keeps its true CSG geometry normal on the walls.
         let slope = textureSample(detail_normal, detail_sampler, uv).rg;
         let n_detail = normalize(vec3<f32>(-slope.x, 1.0, -slope.y));
-        n = normalize(mix(n_geo, n_detail, params.strength));
+        n = normalize(mix(n_geo, n_detail, params.strength * surf_w));
     }
 
     // "View normals" debug: the APPLIED world-normal as RGB (unlit).
@@ -215,22 +231,10 @@ fn fragment(in: VertexOutput, @builtin(front_facing) is_front: bool) -> Fragment
     }
 
     // ---- Volumetric biome strata ----
-    let surf_h = sample_height(uv);
-    // SURFACE SKIN (dead-zone): the baked `surf_h` (bilinear of the coarse clipmap) and the mesh geometry
-    // (triangulated Transvoxel surface) differ by a sub-voxel residual that, with a thin top stratum, crosses
-    // the grass→dirt boundary across the UNDUG surface → speckled dirt/stone. Treat depth within a fraction of
-    // the chunk's cell scale as the SURFACE (depth ≤ 0); the strata begin below it. Scales with LOD via
-    // chunk_size (residual ∝ cell size). The EXACT fix is a per-vertex pristine-surface-Y attribute (depth
-    // interpolates to 0 on the undug face) — that lands with Stage-4 digging, which needs it regardless.
-    let depth = surf_h - in.world_position.y - params.chunk_size * 0.15;
     let bio = sample_biome(uv);
-    let boundary = params.surf_b.w;
-    let top_band = max(boundary * 2.0, 1.0);
-    let depth_w = smoothstep(0.0, top_band, max(depth, 0.0)); // 0 = surface, 1 = below the surface band
     // UNDUG surface = the worldgen-baked SURFACE MATERIAL (palette colour + roughness, bilinear so material
-    // boundaries are smooth); below the surface band = the id-based depth strata (only seen on dug walls). ALL
-    // the "which material is here" logic (biome base, snow caps, cliff rock, patches) is resolved at BAKE time
-    // — the shader just renders it. (Stage 5 will give the dug strata their own per-material roughness.)
+    // boundaries are smooth); below the surface band = the id-based depth strata (the DUG cavity walls — grass→
+    // dirt→stone→bedrock). ALL the "which material is here" logic is resolved at BAKE time — the shader renders.
     let surf = surface_material(uv);
     var albedo = mix(surf.rgb, volumetric_color(bio, depth, boundary), depth_w);
 

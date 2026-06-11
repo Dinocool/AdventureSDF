@@ -628,10 +628,13 @@ fn mesh_chunk(
     lod: u32,
     debug: bool,
     terrain: Option<Arc<HeightClipmap>>,
-    // Terrain-only chunk ⇒ take the surface NORMAL from the clipmap's smooth stored gradient (no
-    // central-difference faceting at coarse LODs / cross-LOD borders). Mixed/object chunks keep the
-    // CSG central-difference normal.
-    terrain_only: bool,
+    // Take the surface NORMAL from the clipmap's smooth stored gradient (no central-difference faceting at
+    // coarse LODs / cross-LOD borders). TRUE only for PURE (undug) terrain; a carved chunk uses CSG normals
+    // (the clipmap normal is wrong on the dug cavity walls), and mixed/object chunks always do.
+    terrain_normals: bool,
+    // Route this chunk through the terrain-surface material (volumetric strata): TRUE for terrain, including
+    // DUG terrain (so the cavity walls show the strata). A superset of `terrain_normals`.
+    surface_material: bool,
     // DETAIL-NORMAL bake resolution (`N`): a COARSE terrain-only chunk additionally bakes an `N×N`
     // surface-slope map (gated below). 0 disables the detail bake (height/biome still bake at `detail_res`/
     // a floor; see `bake_terrain_surface`).
@@ -686,7 +689,7 @@ fn mesh_chunk(
         }
     }
     let builder =
-        ChunkMeshBuilder::new(edits, indices, grid_origin, vs, lod, debug, cmin, cmax, flags, terrain_only);
+        ChunkMeshBuilder::new(edits, indices, grid_origin, vs, lod, debug, cmin, cmax, flags, terrain_normals);
     // MUST be CacheNothing: `CacheCentralBlockOnly` caches the central block at THIS chunk's (coarse)
     // resolution, which then serves the transition cell's FINE-resolution face samples too — collapsing the
     // transition so the cross-LOD weld fails. The analytic CSG field is cheap to re-evaluate, so just query it.
@@ -697,7 +700,7 @@ fn mesh_chunk(
     // (low-res Whittaker classification). The per-bake hi-fi snapshot is the SAME terrain the clipmap was
     // built from. Attached to the mesh data; the commit turns it into the chunk's `TerrainMaterial`.
     data.terrain_surface = bake_terrain_surface(
-        grid_origin, subdivisions as f32 * vs, vs, terrain_only, detail_res, biome_res, biome_blend_m,
+        grid_origin, subdivisions as f32 * vs, vs, surface_material, detail_res, biome_res, biome_blend_m,
     );
     Some(data)
 }
@@ -730,13 +733,13 @@ fn bake_terrain_surface(
     grid_origin: Vec3,
     chunk_world: f32,
     vs: f32,
-    terrain_only: bool,
+    surface_material: bool,
     detail_res: u32,
     biome_res: u32,
     biome_blend_m: f32,
 ) -> Option<super::terrain_material::TerrainSurfaceBake> {
     use super::terrain_material::TerrainSurfaceBake;
-    if !terrain_only {
+    if !surface_material {
         return None;
     }
     let (hifi, offset) = crate::sdf_render::worldgen::upload::bake_terrain_hifi()?;
@@ -879,8 +882,9 @@ struct ChunkMeshBuilder<'a> {
     cmin: Vec3,
     cmax: Vec3,
     flags: u8,
-    /// Terrain-only chunk ⇒ analytic stored-gradient normals (smooth, no central-diff faceting).
-    terrain_only: bool,
+    /// Pure (undug) terrain ⇒ analytic stored-gradient normals (smooth, no central-diff faceting). A carved
+    /// or mixed chunk is `false` (CSG normals — correct on dug cavity walls / object surfaces).
+    terrain_normals: bool,
     positions: Vec<[f32; 3]>,
     normals: Vec<[f32; 3]>,
     /// Per unique vertex: `(nearest, runner-up)` CSG material ids (the top-2 argmin). The triangle pair folds
@@ -901,7 +905,7 @@ impl<'a> ChunkMeshBuilder<'a> {
         cmin: Vec3,
         cmax: Vec3,
         flags: u8,
-        terrain_only: bool,
+        terrain_normals: bool,
     ) -> Self {
         Self {
             edits,
@@ -914,7 +918,7 @@ impl<'a> ChunkMeshBuilder<'a> {
             cmin,
             cmax,
             flags,
-            terrain_only,
+            terrain_normals,
             positions: Vec::new(),
             normals: Vec::new(),
             vmat: Vec::new(),
@@ -1022,7 +1026,7 @@ impl MeshBuilder<f32, f32> for ChunkMeshBuilder<'_> {
         // on a clipmap miss. Mixed/object chunks use the exact ∇(CSG distance) (toward increasing distance).
         let csg_normal =
             || field_gradient(self.edits, self.indices, world, vs_eff * 0.01, vs_eff).normalize_or_zero();
-        let n = if self.terrain_only {
+        let n = if self.terrain_normals {
             crate::sdf_render::worldgen::upload::terrain_normal(world, vs_eff).unwrap_or_else(csg_normal)
         } else {
             csg_normal()
@@ -1389,6 +1393,12 @@ fn mesh_resident_chunks(
         .iter()
         .map(|g| matches!(g.edit.prim, edits::SdfPrimitive::Terrain { .. }))
         .collect();
+    // Per-edit "is this a SUBTRACT (carving) edit" — a subtractor only removes geometry + carries no material,
+    // so a chunk of Terrain + only-Subtract edits is still a terrain SURFACE (just dug): it keeps the
+    // terrain-surface material (strata on the dug walls) but takes CSG normals (the clipmap normal is wrong on
+    // a cavity wall). See the `terrain_surface`/`carved` split below.
+    let is_subtract_edit: Vec<bool> =
+        gathered.iter().map(|g| g.edit.op.kind == edits::CsgKind::Subtract).collect();
     let height_clipmap = crate::sdf_render::worldgen::upload::cpu_height_clipmap();
 
     // The baked mesh is appearance-INDEPENDENT: vertices carry only geometry + top-2 material *ids* + a blend
@@ -1492,7 +1502,13 @@ fn mesh_resident_chunks(
     let mut current_hashes: HashMap<BrickKey, u64> = HashMap::with_capacity(resident.len());
     // Chunks whose candidate edits are ALL the Terrain primitive — they commit per-chunk immediately
     // (no atomic-edit round barrier). Recomputed every frame over the live residency.
-    let mut terrain_only: HashSet<BrickKey> = HashSet::new();
+    // `terrain_surface`: chunks eligible for the terrain-surface material (volumetric strata). Every candidate
+    // edit is Terrain OR a Subtract carve, AND at least one is Terrain — i.e. terrain, possibly DUG, but with
+    // no additive/object material placed. `carved`: the subset that has a subtractor, so it takes CSG normals
+    // (the clipmap normal is wrong on the dug cavity walls). A pure-terrain chunk is `terrain_surface` and NOT
+    // `carved` → smooth clipmap normals.
+    let mut terrain_surface: HashSet<BrickKey> = HashSet::new();
+    let mut carved: HashSet<BrickKey> = HashSet::new();
     let mut by_lod = [0usize; MAX_MESH_LODS as usize];
     {
         let mut idx: Vec<u32> = Vec::new();
@@ -1503,8 +1519,14 @@ fn mesh_resident_chunks(
             // resident for a larger one (the residency cull already keeps lone sub-voxel objects out). Same
             // predicate as the bake fold below → hash and geometry always agree.
             idx.retain(|&i| edit_resolvable_at(edit_extent[i as usize], &config, key.lod));
-            if !idx.is_empty() && idx.iter().all(|&i| is_terrain_edit[i as usize]) {
-                terrain_only.insert(key);
+            let all_terrain_or_carve =
+                idx.iter().all(|&i| is_terrain_edit[i as usize] || is_subtract_edit[i as usize]);
+            let has_terrain = idx.iter().any(|&i| is_terrain_edit[i as usize]);
+            if !idx.is_empty() && all_terrain_or_carve && has_terrain {
+                terrain_surface.insert(key);
+                if idx.iter().any(|&i| is_subtract_edit[i as usize]) {
+                    carved.insert(key);
+                }
             }
             let base = if idx.is_empty() { 0 } else { edits::bake_content_hash(&edits_arc, &idx) };
             let flags = chunk_finer_faces(key, &config, k, cam, half0);
@@ -1559,7 +1581,7 @@ fn mesh_resident_chunks(
     // edit/move stays visually coherent. A committed terrain chunk satisfies `round_done` (displayed==target,
     // staged taken), so it never gates the round. `terrain_only` membership ⇒ the chunk is live-resident.
     for (key, st) in states.0.iter_mut() {
-        if st.staged.is_none() || !terrain_only.contains(key) {
+        if st.staged.is_none() || !terrain_surface.contains(key) {
             continue;
         }
         let sb = st.staged.take().expect("staged checked just above");
@@ -1740,11 +1762,14 @@ fn mesh_resident_chunks(
             // The round's FROZEN clipmap snapshot — the bake samples THIS, not the live global, so a
             // mid-bake clipmap change (camera roll / lod_count rebuild) can't make it sample uncovered ground.
             let terrain = round.clipmap.clone();
-            let is_terrain = terrain_only.contains(&key); // analytic stored-gradient normals for terrain
+            // Surface-material chunks (terrain, incl. dug) render the strata; only PURE (uncarved) terrain
+            // takes the smooth clipmap normals — a carved chunk uses CSG normals for its cavity walls.
+            let surface_material = terrain_surface.contains(&key);
+            let terrain_normals = surface_material && !carved.contains(&key);
             st.task = Some(pool.spawn(async move {
                 mesh_chunk(
-                    &edits, &indices, grid_origin, vs_l, k * cs, flags, lod, debug, terrain, is_terrain,
-                    detail_res, biome_res, biome_blend_m,
+                    &edits, &indices, grid_origin, vs_l, k * cs, flags, lod, debug, terrain, terrain_normals,
+                    surface_material, detail_res, biome_res, biome_blend_m,
                 )
             }));
             budget -= 1;
@@ -2148,7 +2173,7 @@ mod tests {
         let edits = [sphere_edit(Vec3::ZERO, 1.0)];
         let (vs, sub) = (0.1f32, 28u32); // block span = 28·0.1 = 2.8 > sphere Ø 2.0 → clears all faces
         let origin = Vec3::splat(-1.4);
-        let data = mesh_chunk(&edits, &[0], origin, vs, sub, 0, 0, false, None, false, 0, 0, 0.0).expect("sphere meshes");
+        let data = mesh_chunk(&edits, &[0], origin, vs, sub, 0, 0, false, None, false, false, 0, 0, 0.0).expect("sphere meshes");
         assert_eq!(open_edge_count(&chunk_tris(&data, origin)), 0, "closed sphere must be watertight");
     }
 
@@ -2168,8 +2193,8 @@ mod tests {
         let (vsf, vsc, sub) = (0.1f32, 0.2f32, 28u32);
         let of = Vec3::new(0.0, -1.4, -1.4); // fine x∈[0,2.8]; −X face at x=0 (regular, high-res)
         let oc = Vec3::new(-5.6, -2.8, -2.8); // coarse x∈[−5.6,0]; +X face at x=0 is the transition side
-        let fine = mesh_chunk(&edits, &idx, of, vsf, sub, 0, 0, false, None, false, 0, 0, 0.0).expect("fine meshes");
-        let coarse = mesh_chunk(&edits, &idx, oc, vsc, sub, 1 << 1, 1, false, None, false, 0, 0, 0.0).expect("coarse meshes");
+        let fine = mesh_chunk(&edits, &idx, of, vsf, sub, 0, 0, false, None, false, false, 0, 0, 0.0).expect("fine meshes");
+        let coarse = mesh_chunk(&edits, &idx, oc, vsc, sub, 1 << 1, 1, false, None, false, false, 0, 0, 0.0).expect("coarse meshes");
         let mut all = chunk_tris(&fine, of);
         all.extend(chunk_tris(&coarse, oc));
         assert_eq!(
@@ -2371,9 +2396,9 @@ mod tests {
         // Bake: fine = LOD 0, regular; coarse = LOD 1 with +X (HighX = bit 1) transition. `terrain_only =
         // true` ⇒ analytic stored-gradient normals (the smooth normal the LOD seam is judged on). Pass the
         // published clipmap as `mesh_chunk`'s `terrain` param (installed as the per-bake thread-local).
-        let fine = mesh_chunk(&edits_v, &idx, of, vsf, sub_f, 0, 0, false, Some(clip.clone()), true, 0, 0, 0.0)
+        let fine = mesh_chunk(&edits_v, &idx, of, vsf, sub_f, 0, 0, false, Some(clip.clone()), true, true, 0, 0, 0.0)
             .expect("fine terrain chunk meshes");
-        let coarse = mesh_chunk(&edits_v, &idx, oc, vsc, sub, 1 << 1, 1, false, Some(clip.clone()), true, 0, 0, 0.0)
+        let coarse = mesh_chunk(&edits_v, &idx, oc, vsc, sub, 1 << 1, 1, false, Some(clip.clone()), true, true, 0, 0, 0.0)
             .expect("coarse terrain chunk meshes");
 
         // (a) GEOMETRIC: fine ∪ coarse must weld watertight across the shared x=0 seam — no gap / overlap.
@@ -2442,7 +2467,7 @@ mod tests {
 
         // Bake the coarse chunk WITH the +X transition (matching the watertight harness). terrain_only ⇒
         // analytic stored-gradient normals (the smooth normal the surface morph is judged on).
-        let coarse = mesh_chunk(&edits_v, &idx, oc, vsc, sub, 1 << 1, 1, false, Some(clip.clone()), true, 0, 0, 0.0)
+        let coarse = mesh_chunk(&edits_v, &idx, oc, vsc, sub, 1 << 1, 1, false, Some(clip.clone()), true, true, 0, 0, 0.0)
             .expect("coarse terrain chunk meshes");
 
         // Bin coarse-surface vertices by inward distance from the +X face (d = cmax.x − world.x = −world.x,
@@ -2600,14 +2625,24 @@ mod tests {
         assert_eq!(g, f16::from_f32(sz).to_f32(), "texel dh/dz must match hifi.surface slope at the texel centre");
         // SSOT: the slope packing matches `pack_slope` bit-for-bit.
         assert_eq!(&bake.detail_texels[off..off + 4], &TerrainSurfaceBake::pack_slope(sx, sz));
-        // The height texel stores the PRISTINE surface height (R32Float LE).
+        // The height texel stores the depth-reference surface height (R32Float LE). That is the CLIPMAP
+        // height the mesh is built from (the mottle fix — `depth = surf_h − mesh.y ≈ 0` on undug ground), NOT
+        // the finer `sample_world` height, so compare against the SAME clipmap sample the bake reads.
         let hr = f32::from_le_bytes([
             bake.height_texels[off],
             bake.height_texels[off + 1],
             bake.height_texels[off + 2],
             bake.height_texels[off + 3],
         ]);
-        assert_eq!(hr, sh, "height texel must store the pristine sample_world height at the texel centre");
+        let (clip_snap, _) = crate::sdf_render::worldgen::upload::bake_terrain_clipmap()
+            .expect("the per-bake clipmap snapshot is installed");
+        let expected_h = crate::sdf_render::worldgen::upload::try_sample_clipmap_lod(
+            &clip_snap,
+            bevy::math::DVec2::new(wx, wz),
+            vs,
+        )
+        .map_or(sh, |node| node.height);
+        assert_eq!(hr, expected_h, "height texel must store the clipmap-sampled depth-reference height");
 
         // DETAIL-NORMAL GATE: a FINE chunk (vs = 2 m = finest node spacing) STILL bakes (height/biome render
         // everywhere) but its detail-normal slope is ZERO-FILLED → geometry normal in the shader.
@@ -2709,7 +2744,7 @@ mod tests {
                     .height;
                     let y_min = ((h_mid - span * 0.5) / vs).floor() * vs;
                     let origin = Vec3::new(ox, y_min, oz);
-                    let Some(data) = mesh_chunk(&edits_v, &idx, origin, vs, sub, 0, 0, false, Some(clip.clone()), true, 0, 0, 0.0)
+                    let Some(data) = mesh_chunk(&edits_v, &idx, origin, vs, sub, 0, 0, false, Some(clip.clone()), true, true, 0, 0, 0.0)
                     else {
                         continue;
                     };
@@ -2839,7 +2874,7 @@ mod tests {
         ];
         let (vs, sub) = (0.1f32, 32u32); // span 3.2 > shape Ø (cube corner ≈ 1.39) → closed in one chunk
         let origin = Vec3::splat(-1.6);
-        let data = mesh_chunk(&edits, &[0, 1], origin, vs, sub, 0, 0, false, None, false, 0, 0, 0.0).expect("merged shape meshes");
+        let data = mesh_chunk(&edits, &[0, 1], origin, vs, sub, 0, 0, false, None, false, false, 0, 0, 0.0).expect("merged shape meshes");
         (data, origin)
     }
 
@@ -2879,7 +2914,7 @@ mod tests {
         // (0.4,0,0) crosses the block's +X face (x=0); every normal must point outward from the sphere centre.
         let edits = [sphere_edit(Vec3::new(0.4, 0.0, 0.0), 1.0)];
         let oc = Vec3::new(-5.6, -2.8, -2.8);
-        let coarse = mesh_chunk(&edits, &[0], oc, 0.2, 28, 1 << 1, 1, false, None, false, 0, 0, 0.0).expect("coarse+transition meshes");
+        let coarse = mesh_chunk(&edits, &[0], oc, 0.2, 28, 1 << 1, 1, false, None, false, false, 0, 0, 0.0).expect("coarse+transition meshes");
         let center = Vec3::new(0.4, 0.0, 0.0);
         let (mut worst, mut inward, mut degenerate) = (1.0f32, 0, 0);
         for i in 0..coarse.positions.len() {
