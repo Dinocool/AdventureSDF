@@ -133,6 +133,16 @@ way to inspect the columns without digging.
 - **SSOT**: same climate→biome→strata→`preview_color` path as the in-world shader + the biome map preview —
   one definition, three consumers (in-world terrain, biome map, slice).
 
+### 3D preview WATER plane
+
+A semi-transparent water plane at the **sea level** (`HeightParams::sea_level`, "layer 0") that still shows
+the terrain **underneath** it.
+- Toggle on/off; level = `sea_level` (reuse the existing param; optional override slider).
+- **Rendering** (raymarched 3D preview): after the terrain hit, where the terrain surface is **below** the
+  water level, composite a semi-transparent water color OVER the terrain seen below — tint deepening with
+  underwater depth (`water_level − terrain_y`) so shallows read lighter and deeps darker, terrain still
+  visible through it. Combines with the slice (the cut face shows the waterline) and the biome map.
+
 ## Standalone-then-integrate note
 The Stage-1 climate/biome classifier is a pragmatic **standalone** module (fast path to visible biomes +
 strata); it does NOT modify the height node-graph or `sample_world` (so parity holds). It can later feed /
