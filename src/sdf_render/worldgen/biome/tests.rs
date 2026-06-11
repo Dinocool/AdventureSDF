@@ -56,6 +56,26 @@ fn climate_temperature_and_humidity_decorrelated() {
     assert!(differ > 10, "temperature and humidity look correlated ({differ} differing samples)");
 }
 
+/// The differentiable climate fields: `value` matches the non-grad SSOT bit-for-bit, and the analytic
+/// gradient matches a central difference (so biome SHAPE placement reads the same climate as materials,
+/// with a correct gradient for terrain normals).
+#[test]
+fn climate_grad_value_matches_and_gradient_is_analytic() {
+    let seed = 0xC11_3A7Eu64;
+    for &(wx, wz) in &[(123.0, -456.0), (12_000.0, 5_000.0), (-2_000.0, 18_000.0)] {
+        let (tv, tdx, tdz) = temperature_grad(wx, wz, seed);
+        let (hv, _, _) = humidity_grad(wx, wz, seed);
+        assert_eq!(tv.to_bits(), temperature(wx, wz, seed).to_bits(), "temperature_grad value must equal temperature()");
+        assert_eq!(hv.to_bits(), humidity(wx, wz, seed).to_bits(), "humidity_grad value must equal humidity()");
+        // Analytic gradient vs central difference (the field is mid-range here — not at a clamp rail).
+        let d = 1.0;
+        let cdx = (temperature(wx + d, wz, seed) - temperature(wx - d, wz, seed)) / (2.0 * d);
+        let cdz = (temperature(wx, wz + d, seed) - temperature(wx, wz - d, seed)) / (2.0 * d);
+        assert!((tdx - cdx).abs() < 1e-6, "temp dx analytic {tdx} vs CD {cdx} at ({wx},{wz})");
+        assert!((tdz - cdz).abs() < 1e-6, "temp dz analytic {tdz} vs CD {cdz} at ({wx},{wz})");
+    }
+}
+
 /// Climate is low-frequency: two points 100 m apart have nearly-equal climate (biomes are large). Guards
 /// against an accidental high-frequency field (which would shatter biomes into noise).
 #[test]
