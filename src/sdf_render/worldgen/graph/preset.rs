@@ -30,6 +30,16 @@ pub fn default_terrain_graph(carrier: FbmAxis, ridge: f64, amp_sum: f64, sea_lev
     Graph { nodes, output: 2 }
 }
 
+/// A per-biome SHAPE preset: tall ridged PEAKS (8 octaves per the distant-mountain-detail rule), rising to
+/// ~`amplitude` m. Used as the demo Snowy-biome shape in the shape registry (cold+wet climate ⇒ mountains).
+/// A standalone absolute-height surface (it BLENDS with the neighbouring biomes' shapes by climate weight).
+pub fn biome_peaks_graph(amplitude: f64, base: f64) -> Graph {
+    let carrier = FbmAxis { octaves: 8, base_freq: 1.0 / 1300.0, lacunarity: 2.0, gain: 0.5, amplitude, seed_salt: 0x5_0FF1 };
+    // Geometric octave-amplitude sum (gain 0.5, 8 octaves) — the ridge fold's `amp_sum`.
+    let amp_sum = amplitude * (2.0 - 0.5f64.powi(7));
+    default_terrain_graph(carrier, 0.92, amp_sum, base)
+}
+
 /// "Broad plains + isolated towering mountains": a low-frequency CONTINENTALNESS axis gates (via a
 /// smoothstep) a blend between a gentle plains surface and a tall ridged mountain surface — biome
 /// PLACEMENT expressed as nodes. `amplitude` scales the mountain relief; the continentalness threshold
