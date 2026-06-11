@@ -159,7 +159,9 @@ fn surface_treatment(base: vec3<f32>, n: vec3<f32>, y: f32, bio: vec3<f32>) -> v
     let sec = u32(bio.y + 0.5);
     let cold_p = select(0.0, 1.0, prim == 3u || prim == 4u);
     let cold_s = select(0.0, 1.0, sec == 3u || sec == 4u);
-    let cold = mix(cold_p, cold_s, clamp(bio.z, 0.0, 1.0));
+    // `blend * 0.5` — the SAME weighting volumetric_color uses (primary frac = 1 - blend*0.5). At the border
+    // both sides read 0.5 ⇒ CONTINUOUS; the raw `blend` jumped 0↔1 as primary/secondary swapped → a hard edge.
+    let cold = mix(cold_p, cold_s, clamp(bio.z, 0.0, 1.0) * 0.5);
     let snow = vec3<f32>(0.85, 0.88, 0.95);
     let snow_w = smoothstep(params.surf_a.z, params.surf_a.w, y) * cold;
     col = mix(col, snow, clamp(snow_w, 0.0, 1.0));
