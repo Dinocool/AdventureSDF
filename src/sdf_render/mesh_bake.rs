@@ -1863,10 +1863,10 @@ fn mesh_bake_panel(world: &mut World, ui: &mut bevy_egui::egui::Ui) {
     {
         world.resource_mut::<MeshBakeConfig>().detail_normal_strength = dstr;
     }
-    // BIOME STRATA (Stages 2+3): the volumetric biome strata render on every terrain-only chunk. "Biome map
-    // res" = the per-chunk N×N biome (primary/secondary/blend) classification resolution (RE-BAKES; biome is
-    // low-frequency so a small map suffices). "Surface treatment" = how strongly the top undug layer is
-    // overridden by slope/height/biome (rock on cliffs, snow high+cold, sand near sea level) — LIVE uniform.
+    // BIOME STRATA (Stages 2+3): the volumetric biome strata + surface materials render on every terrain-only
+    // chunk. "Biome map res" = the per-chunk N×N biome + surface-material map resolution (RE-BAKES; biome is
+    // low-frequency so a small map suffices). The surface material (biome base + snow/rock caps + cliffs +
+    // patches) is authored in `biomes.ron` surface_rules and baked — no live treatment slider.
     let mut bres = world.resource::<MeshBakeConfig>().biome_res;
     if ui
         .add(bevy_egui::egui::Slider::new(&mut bres, 2..=64).text("Biome map res"))
@@ -1888,15 +1888,8 @@ fn mesh_bake_panel(world: &mut World, ui: &mut bevy_egui::egui::Ui) {
         world.resource_mut::<MeshBakeConfig>().biome_blend_m = bblend;
         world.resource_mut::<MeshBakeRebuild>().0 = true;
     }
-    let mut treat = world.resource::<MeshBakeConfig>().surface_treatment;
-    if ui
-        .add(bevy_egui::egui::Slider::new(&mut treat, 0.0..=1.0).text("Surface treatment"))
-        .on_hover_text("Strength of the top-layer surface treatment (snow high+cold, rock on steep slopes, \
-                        sand near sea level). 0 = pure biome surface colour, 1 = full treatment. Live uniform.")
-        .changed()
-    {
-        world.resource_mut::<MeshBakeConfig>().surface_treatment = treat;
-    }
+    // (The old "Surface treatment" slider is gone — snow caps / cliff rock are now authored per-biome
+    // SURFACE RULES in `biomes.ron`, resolved + baked by the worldgen, not a live shader override.)
     let mut freeze = world.resource::<MeshBakeConfig>().freeze_lod;
     if ui
         .checkbox(&mut freeze, "Freeze LOD (debug)")
