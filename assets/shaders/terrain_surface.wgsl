@@ -163,14 +163,9 @@ fn surface_treatment(base: vec3<f32>, n: vec3<f32>, y: f32, temp: f32) -> vec3<f
     if (master <= 0.0) { return base; }
     var col = base;
 
-    // SAND on FLAT low ground near sea level (beaches). Gated by slope (n.y → 1 = flat) so it does NOT draw
-    // thin sea-level CONTOUR RINGS across every rolling hill that happens to pass through the band.
-    let sea = params.surf_b.y;
-    let sand_band = max(params.surf_b.x, 1e-3);
-    let sand = vec3<f32>(0.62, 0.50, 0.27);
-    let flat = smoothstep(0.86, 0.97, n.y);
-    let sand_w = (1.0 - smoothstep(0.0, sand_band, abs(y - sea))) * flat;
-    col = mix(col, sand, sand_w * 0.85);
+    // (No "sand near sea level" treatment — it's a sea-level HEIGHT CONTOUR, so it drew thin squiggly rings
+    // across all rolling ground at that height, not beaches. Desert sand comes from the biome's strata
+    // surface material; real beaches need water-PROXIMITY, not a height band, and can be added later.)
 
     // SNOW on high + COLD ground. Cold from the CONTINUOUS temperature field (bilinear `temp`), a smooth ramp
     // → the snow line blends UNIFORMLY everywhere. The old discrete biome-id cold stepped with the climate
