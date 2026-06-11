@@ -204,6 +204,10 @@ pub(crate) struct MeshBakeConfig {
     /// Only chunks at this LOD or finer (`key.lod <= physics_lod`) get a collider — the "simplified" bound:
     /// far chunks (never walked) skip the trimesh build. Higher = colliders reach further (more cost).
     pub(crate) physics_lod: u32,
+    /// DEBUG: draw the chunks that HAVE a collider (the physics-LOD coverage) as a green wireframe overlay —
+    /// the collider geometry is the chunk's render mesh, so this shows the physics meshes + how far they
+    /// reach. A LIVE toggle (added/removed per frame on the collider chunks — no re-bake).
+    pub(crate) physics_wireframe: bool,
 }
 
 /// The clipmap's finest node spacing (the tier-0 height grid). A terrain-only chunk whose voxel size is at
@@ -245,6 +249,7 @@ impl Default for MeshBakeConfig {
             // far chunks skip the trimesh build. Bump physics_lod to collide further out.
             physics: true,
             physics_lod: 1,
+            physics_wireframe: false,
         }
     }
 }
@@ -331,6 +336,7 @@ impl Plugin for MeshBakePlugin {
             // on the editor-scene-gated GPU SDF atlas) and no-ops when no SDF volumes exist — which
             // also clears the meshes when an SDF scene is left.
             .add_systems(Update, sync_terrain_detail_params)
+            .add_systems(Update, sync_physics_wireframe)
             .add_systems(
                 Update,
                 mesh_resident_chunks.after(super::mesh_material::rebuild_mesh_material),
@@ -1178,6 +1184,36 @@ fn sync_terrain_detail_params(
     }
 }
 
+/// DEBUG overlay: draw the chunks that HAVE a physics collider (the `physics_lod` coverage) as a green
+/// wireframe. The collider IS the chunk's render mesh, so this shows the physics meshes + how far they reach.
+/// A LIVE toggle — adds `Wireframe` to collider-bearing chunk entities when on, removes it when off (per
+/// frame, only acting on the diff — `Without<Wireframe>` / `With<Wireframe>` filters keep it cheap at rest).
+fn sync_physics_wireframe(
+    cfg: Res<MeshBakeConfig>,
+    mut commands: Commands,
+    add: Query<
+        Entity,
+        (With<ChunkMesh>, With<bevy_rapier3d::prelude::Collider>, Without<bevy::pbr::wireframe::Wireframe>),
+    >,
+    remove: Query<Entity, (With<ChunkMesh>, With<bevy::pbr::wireframe::Wireframe>)>,
+) {
+    if cfg.physics_wireframe {
+        for e in &add {
+            commands.entity(e).insert((
+                bevy::pbr::wireframe::Wireframe,
+                bevy::pbr::wireframe::WireframeColor { color: Color::srgb(0.1, 1.0, 0.35) },
+            ));
+        }
+    } else {
+        for e in &remove {
+            commands
+                .entity(e)
+                .remove::<bevy::pbr::wireframe::Wireframe>()
+                .remove::<bevy::pbr::wireframe::WireframeColor>();
+        }
+    }
+}
+
 /// The main-thread asset stores + config the commit needs to spawn a chunk mesh AND (for a coarse
 /// terrain-only chunk) its per-chunk DETAIL-NORMAL `Image` + `TerrainMaterial`. Bundled so `spawn_chunk_mesh`
 /// stays under the arg cap and both commit sites pass the same set.
@@ -1988,6 +2024,15 @@ fn mesh_bake_panel(world: &mut World, ui: &mut bevy_egui::egui::Ui) {
     {
         world.resource_mut::<MeshBakeConfig>().physics_lod = plod;
         world.resource_mut::<MeshBakeRebuild>().0 = true;
+    }
+    let mut pwire = world.resource::<MeshBakeConfig>().physics_wireframe;
+    if ui
+        .checkbox(&mut pwire, "Physics wireframe (debug)")
+        .on_hover_text("Draw the chunks that have a collider (the Physics LOD coverage) as a green wireframe \
+                        — shows the physics meshes + how far they reach. Live toggle, no re-bake.")
+        .changed()
+    {
+        world.resource_mut::<MeshBakeConfig>().physics_wireframe = pwire;
     }
     let mut freeze = world.resource::<MeshBakeConfig>().freeze_lod;
     if ui
