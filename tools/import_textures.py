@@ -25,12 +25,26 @@ from pathlib import Path
 
 from PIL import Image, ImageOps
 
-# (source zip stem, destination material slug)
-MATERIALS = [
-    ("Cobble Stone", "cobble_stone"),
-    ("Sand", "sand"),
-    ("Ground", "ground"),
+# Source zip STEMS to import (the destination slug is derived by `slugify`). The full library the user
+# dropped in Downloads — terrain materials map onto these in `assets/worldgen/biomes.ron`.
+NAMES = [
+    "Cobble Stone", "Sand", "Ground", "Grass", "Snow", "Snow Ground", "Groomed Snow", "Snowy Grass",
+    "Ice", "Mud", "Beach", "Desert", "Stone Wall", "Cave Wall", "Cave Floor", "Tree Bark", "Roots",
+    "Swamp", "Fall Ground", "Burned Earth", "Fire Grass", "Lava", "Volcano", "Hell", "Flesh",
+    "Monster Skin", "Skull Floor", "Pile of Gold", "Water", "Bush_Hedge", "Snowy Hedge_Bush",
+    "Wall_with_plants", "Damaged Wall", "Horror Walls", "Indoor Walls", "Wood Planks",
+    "Magical Wood Planks", "Damaged Parquet", "Tiles", "Floor", "Roof", "Snow Roofs", "Metal",
+    "Metal Plates", "Sci-Fi", "Alien Planet", "Alien Floor", "Mystical", "Magical Forrest", "Fur",
 ]
+
+
+def slugify(name: str) -> str:
+    """`"Stone Wall"` -> `"stone_wall"`, `"Wall_with_plants"` -> `"wall_with_plants"`."""
+    return re.sub(r"[^a-z0-9]+", "_", name.lower()).strip("_")
+
+
+# (source zip stem, destination material slug)
+MATERIALS = [(n, slugify(n)) for n in NAMES]
 
 # suffix in source -> (role filename stem, invert?)
 MAP_ROLES = {
@@ -44,7 +58,9 @@ MAP_ROLES = {
 }
 
 SRC_DIR = Path("C:/Users/Aesthetic/Downloads")
-DEST_ROOT = Path("D:/Projects/bevy-setup/assets/textures")
+# Relative to THIS repo (the script lives in <repo>/tools/), so running the worktree copy writes into the
+# worktree's assets — never the main checkout.
+DEST_ROOT = Path(__file__).resolve().parent.parent / "assets" / "textures"
 
 # variant.bmp name like "12_normal.bmp" -> ("12", "normal")
 BMP_RE = re.compile(r"^(\d+)_([A-Za-z]+)\.bmp$")
