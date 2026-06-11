@@ -162,6 +162,9 @@ pub(super) struct NodeView {
     /// On-screen preview square side (points), used to pick the render resolution so previews stay
     /// crisp as the node is resized.
     pub disp_px: f32,
+    /// Biome-map / strata-slice / water preview overlay toggles + their params. One field, persisted for
+    /// free (the consolidation win — see the struct doc).
+    pub modes: crate::editor::worldgen_gpu_preview::PreviewModes,
 }
 
 impl Default for NodeView {
@@ -173,6 +176,7 @@ impl Default for NodeView {
             cam: CAM_DEFAULT,
             pan: (0.0, 0.0),
             disp_px: DEFAULT_PREVIEW_PX,
+            modes: crate::editor::worldgen_gpu_preview::PreviewModes::default(),
         }
     }
 }

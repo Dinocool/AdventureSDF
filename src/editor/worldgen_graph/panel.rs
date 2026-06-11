@@ -273,7 +273,7 @@ pub(super) fn graph_panel(world: &mut World, ui: &mut egui::Ui) {
                     yaw: v.cam.0,
                     pitch: v.cam.1,
                 };
-                panels.open((nav, node), view, v.surface);
+                panels.open((nav, node), view, v.surface, v.modes);
             }
         }
         // Pop a node's preview out into a movable window (snapshotting its current view state + nav path).
@@ -292,6 +292,7 @@ pub(super) fn graph_panel(world: &mut World, ui: &mut egui::Ui) {
                 size: v.disp_px.max(260.0),
                 is3d: v.surface,
                 cam: v.cam,
+                modes: v.modes,
                 open: true,
             });
         }

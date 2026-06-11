@@ -3,20 +3,51 @@
 // The CPU bakes the graph's height + analytic normal into `height_tex` (R = height m, GBA = normal),
 // the single Graph::eval source of truth — NO noise is re-implemented here. This shader only raymarches
 // that heightfield with the orbit camera in `params`, so rotating is pure-GPU (rebake only on edit/zoom).
+//
+// BIOME / STRATA / WATER preview (TERRAIN_MATERIALS_PLAN "Biome preview"):
+//   - The CPU also bakes a small `biome_tex` (R = primary biome id, G = secondary id, B = blend) by
+//     running the Stage-1 Whittaker classifier per texel — NO Whittaker logic is ported to WGSL.
+//   - The flattened per-biome strata table (each biome's surface/layer/bedrock `preview_color` +
+//     cumulative layer-bottom depths) arrives in the `strata` uniform — the SAME table the Stage-3
+//     in-world surface shader will index. The slice cut-face + the biome map read it here.
 
 #import bevy_pbr::forward_io::VertexOutput
+
+// Must match GPU_STRATA_MAX_LAYERS in src/sdf_render/worldgen/biome.rs.
+const STRATA_MAX_LAYERS: u32 = 6u;
+// Must match BiomeId::ALL.len() (the demo biome count).
+const BIOME_COUNT: u32 = 5u;
 
 struct PreviewParams {
     eye: vec4<f32>,    // xyz = camera eye,  w = image-plane tan
     fwd: vec4<f32>,    // xyz = forward,     w = world half-extent Z (m)
     right: vec4<f32>,  // xyz = right,       w = height min (m)
     up: vec4<f32>,     // xyz = up,          w = height max (m)
-    levels: vec4<f32>, // sea, snow, water-depth, (unused)
+    levels: vec4<f32>, // sea, snow, water-depth-ramp, water-level (m)
     flags: vec4<f32>,  // x = mode (0 = 3D orbit, 1 = 2D top-down ortho), y = halfX (m), z = halfZ (m)
+    modes: vec4<f32>,  // x = biome-map on, y = slice on, z = water on, w = (unused)
+    slice: vec4<f32>,  // x = axis (0=X,1=Z,2=Y), y = world-plane coord (m), (z,w) unused
+};
+
+// One biome's flattened strata column (mirror of biome::GpuStrataColumn, std140-padded).
+struct StrataColumn {
+    surface_color: vec4<f32>,
+    layer_color: array<vec4<f32>, STRATA_MAX_LAYERS>,
+    // 6 cumulative layer bottoms packed into 2 vec4 lanes (only .xyzw of [0] + .xy of [1] used here for 6).
+    layer_bottom: array<vec4<f32>, 2>,
+    bedrock_color: vec4<f32>,
+    layer_count: u32,
+    _pad: vec3<u32>,
+};
+
+struct StrataTable {
+    columns: array<StrataColumn, BIOME_COUNT>,
 };
 
 @group(#{MATERIAL_BIND_GROUP}) @binding(0) var<uniform> params: PreviewParams;
 @group(#{MATERIAL_BIND_GROUP}) @binding(1) var height_tex: texture_2d<f32>;
+@group(#{MATERIAL_BIND_GROUP}) @binding(2) var biome_tex: texture_2d<f32>;
+@group(#{MATERIAL_BIND_GROUP}) @binding(3) var<uniform> strata: StrataTable;
 
 // Manual bilinear fetch (textureLoad needs no filterable format → portable for Rgba32Float).
 // Baked heightfield texture resolution — MUST match HEIGHTFIELD_RES in worldgen_gpu_preview.rs.
@@ -45,6 +76,54 @@ fn hf_at(world_xz: vec2<f32>) -> vec4<f32> {
     return sample_hf(uv);
 }
 
+// World XZ → biome-texture UV; nearest-fetch the primary biome id (R), secondary (G), blend (B).
+fn biome_at(world_xz: vec2<f32>) -> vec3<f32> {
+    let half_xz = vec2<f32>(params.flags.y, params.flags.z);
+    let uv = clamp((world_xz + half_xz) / (2.0 * half_xz), vec2<f32>(0.0), vec2<f32>(1.0));
+    let res = HF_TEX_RES;
+    let px = vec2<i32>(clamp(uv * (res - 1.0), vec2<f32>(0.0), vec2<f32>(res - 1.0)));
+    let s = textureLoad(biome_tex, px, 0);
+    return s.xyz;
+}
+
+// The cumulative bottom-depth of layer `i` (i < layer_count), unpacking the 2-vec4 packed array.
+fn strata_bottom(col: StrataColumn, i: u32) -> f32 {
+    let v = col.layer_bottom[i / 4u];
+    let lane = i % 4u;
+    if (lane == 0u) { return v.x; }
+    if (lane == 1u) { return v.y; }
+    if (lane == 2u) { return v.z; }
+    return v.w;
+}
+
+// Walk one biome's strata column for `depth` (m below the original surface) → its `preview_color`.
+// Mirror of biome::strata_material + preview_color (the Stage-3 / CPU SSOT).
+fn strata_color_for(biome: u32, depth: f32) -> vec3<f32> {
+    let b = min(biome, BIOME_COUNT - 1u);
+    let col = strata.columns[b];
+    if (depth <= 0.0) { return col.surface_color.rgb; }
+    let n = min(col.layer_count, STRATA_MAX_LAYERS);
+    for (var i = 0u; i < n; i = i + 1u) {
+        if (depth < strata_bottom(col, i)) {
+            return col.layer_color[i].rgb;
+        }
+    }
+    return col.bedrock_color.rgb;
+}
+
+// Surface biome colour (depth 0) at a world XZ, blending primary↔secondary by the baked blend weight so
+// boundaries read smoothly (matches the CPU classifier's BiomeSample.blend intent).
+fn biome_surface_color(world_xz: vec2<f32>) -> vec3<f32> {
+    let s = biome_at(world_xz);
+    let prim = u32(s.x + 0.5);
+    let sec = u32(s.y + 0.5);
+    let blend = clamp(s.z, 0.0, 1.0);
+    let cp = strata_color_for(prim, 0.0);
+    let cs = strata_color_for(sec, 0.0);
+    // blend → 1 at a border halves toward the neighbour (0.5 max mix so the primary still dominates).
+    return mix(cp, cs, blend * 0.5);
+}
+
 // Slab ray–AABB → (tmin, tmax); .z < 0 means miss.
 fn ray_box(o: vec3<f32>, d: vec3<f32>, bmin: vec3<f32>, bmax: vec3<f32>) -> vec3<f32> {
     // Safe inverse: a zero (axis-aligned) direction component would make 1/d = ±inf and then 0*inf = NaN
@@ -61,8 +140,8 @@ fn ray_box(o: vec3<f32>, d: vec3<f32>, bmin: vec3<f32>, bmax: vec3<f32>) -> vec3
     return vec3<f32>(0.0, 0.0, -1.0);
 }
 
-// Absolute-height + sea-level colour ramp. This shader is the single source for preview colour — the CPU
-// bake only writes height + normal; nothing on the CPU re-implements this ramp.
+// Absolute-height + sea-level colour ramp. The default (non-biome) preview colour — the CPU bake only
+// writes height + normal; nothing on the CPU re-implements this ramp.
 fn land_ramp(t: f32) -> vec3<f32> {
     let beach = vec3<f32>(0.76, 0.70, 0.50);
     let grass = vec3<f32>(0.24, 0.55, 0.35);
@@ -86,18 +165,62 @@ fn height_colour(h: f32) -> vec3<f32> {
     return land_ramp(clamp((h - sea) / (snow - sea), 0.0, 1.0));
 }
 
+// The surface colour the preview paints at a world XZ for the active mode: biome-map ON ⇒ the surface
+// biome's preview_color, else the height ramp. Single chooser shared by the 2D path + the 3D surface hit.
+fn surface_colour(world_xz: vec2<f32>, h: f32) -> vec3<f32> {
+    if (params.modes.x >= 0.5) {
+        return biome_surface_color(world_xz);
+    }
+    return height_colour(h);
+}
+
 fn sky(ndcy: f32) -> vec3<f32> {
     let t = clamp(ndcy * 0.5 + 0.5, 0.0, 1.0);
     return mix(vec3<f32>(0.12, 0.15, 0.22), vec3<f32>(0.27, 0.36, 0.52), t);
 }
 
-// Earth cross-section: the absolute-height ramp banded into horizontal strata, so a box wall (where the
-// solid terrain is sliced by the window edge) reads as layered ground rather than a hole.
-fn strata(y: f32) -> vec3<f32> {
-    let base = height_colour(y);
-    let f = fract(y / 60.0);
-    let line = (1.0 - smoothstep(0.0, 0.06, f)) + smoothstep(0.94, 1.0, f);
-    return base * (1.0 - 0.4 * clamp(line, 0.0, 1.0));
+// Earth cross-section at a solid point `p` (the box wall / the slice cut face): depth below the ORIGINAL
+// surface → the biome's strata `preview_color` (so grass→dirt→stone→bedrock bands show). NOT the height
+// ramp — this is the volumetric strata view the slice exists to reveal.
+fn strata_face(p: vec3<f32>) -> vec3<f32> {
+    let surf = hf_at(p.xz).x;
+    let depth = surf - p.y;
+    let prim = u32(biome_at(p.xz).x + 0.5);
+    let col = strata_color_for(prim, depth);
+    // Subtle banding lines at each layer boundary so the strata read as distinct bands even where two
+    // adjacent layers share a near colour.
+    let f = fract(depth / 6.0);
+    let line = (1.0 - smoothstep(0.0, 0.04, f)) + smoothstep(0.96, 1.0, f);
+    return col * (1.0 - 0.18 * clamp(line, 0.0, 1.0));
+}
+
+// Composite translucent water OVER an already-shaded terrain colour `terrain` whose surface sits at
+// world height `terrain_y`, when that surface is BELOW the water level. Tint deepens with the underwater
+// depth (water_level - terrain_y) so shallows read light, deeps dark; terrain stays visible through it.
+fn apply_water(terrain: vec3<f32>, terrain_y: f32) -> vec3<f32> {
+    if (params.modes.z < 0.5) { return terrain; }
+    let water_level = params.levels.w;
+    let under = water_level - terrain_y;
+    if (under <= 0.0) { return terrain; }
+    let shallow = vec3<f32>(0.20, 0.45, 0.62);
+    let deep = vec3<f32>(0.02, 0.10, 0.26);
+    // Deepening ramp over the same depth scale used by the height ramp's underwater band.
+    let t = clamp(under / max(params.levels.z, 1.0), 0.0, 1.0);
+    let water = mix(shallow, deep, t);
+    // Opacity grows with depth (shallow water is barely tinted, deep water mostly water-coloured).
+    let alpha = clamp(0.25 + 0.6 * t, 0.0, 0.9);
+    return mix(terrain, water, alpha);
+}
+
+// Is the slice plane active and is world point `p` on the HIDDEN (near) side of it? Axis 0=X,1=Z,2=Y; the
+// plane coord is params.slice.y. We hide the half with coordinate < plane (the near half toward -axis).
+fn slice_hidden(p: vec3<f32>) -> bool {
+    if (params.modes.y < 0.5) { return false; }
+    let axis = params.slice.x;
+    let plane = params.slice.y;
+    var c = p.x;
+    if (axis >= 1.5) { c = p.y; } else if (axis >= 0.5) { c = p.z; }
+    return c < plane;
 }
 
 @fragment
@@ -108,12 +231,14 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
     let ymax = params.up.w;
     let light = normalize(vec3<f32>(0.4, 0.85, 0.3));
 
-    // 2D top-down orthographic field map: flat absolute-height colour (reads as a placement/climate map;
-    // left = −X, top = −Z, matching the bake). Same `height_colour` SSOT as the 3D path.
+    // 2D top-down field map: biome-map ON ⇒ the climate/biome map; else flat absolute-height colour.
     if (params.flags.x >= 0.5) {
         let wx = (in.uv.x * 2.0 - 1.0) * halfx;
         let wz = (in.uv.y * 2.0 - 1.0) * halfz;
-        return vec4<f32>(height_colour(hf_at(vec2<f32>(wx, wz)).x), 1.0);
+        let h = hf_at(vec2<f32>(wx, wz)).x;
+        var col = surface_colour(vec2<f32>(wx, wz), h);
+        col = apply_water(col, h);
+        return vec4<f32>(col, 1.0);
     }
 
     let ndcx = in.uv.x * 2.0 - 1.0;
@@ -131,14 +256,37 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
     if (hit.z < 0.0) {
         return vec4<f32>(sky(ndcy), 1.0);
     }
-    let t0 = max(hit.x, 0.0);
+    var t0 = max(hit.x, 0.0);
     let t1 = hit.y;
 
-    // Solid earth: if the ray ENTERS the box already at/below the surface, it pierced a side/bottom wall
-    // → shade the earth cross-section (strata) instead of marching into a hole.
+    // SLICE: advance the entry point to where the ray crosses the clip plane so the NEAR (hidden) half is
+    // skipped and the cut face is the first thing the march sees. Where the ray enters already past the
+    // plane into solid terrain, that entry pixel IS the cut face (strata).
+    if (params.modes.y >= 0.5) {
+        let axis = params.slice.x;
+        let plane = params.slice.y;
+        var o = eye.x; var d = dir.x;
+        if (axis >= 1.5) { o = eye.y; d = dir.y; } else if (axis >= 0.5) { o = eye.z; d = dir.z; }
+        // Hidden side = coord < plane. If we'd start hidden, jump to the plane crossing (if it's ahead).
+        let pe0 = eye + dir * t0;
+        if (slice_hidden(pe0)) {
+            if (abs(d) > 1e-6) {
+                let tp = (plane - o) / d;
+                if (tp > t0 && tp < t1) { t0 = tp; }
+                else { return vec4<f32>(sky(ndcy), 1.0); } // plane entirely behind/ahead of the box span
+            } else {
+                return vec4<f32>(sky(ndcy), 1.0); // ray parallel to plane, on the hidden side → nothing
+            }
+        }
+    }
+
+    // Solid earth: if the ray ENTERS (post-slice) already at/below the surface, it pierced a wall / the
+    // cut face → shade the strata cross-section instead of marching into a hole.
     let pe = eye + dir * t0;
     if (pe.y - hf_at(pe.xz).x <= 0.0) {
-        return vec4<f32>(strata(pe.y), 1.0);
+        var col = strata_face(pe);
+        col = apply_water(col, hf_at(pe.xz).x);
+        return vec4<f32>(col, 1.0);
     }
 
     // Adaptive march, but cap each step to ~2 texels HORIZONTALLY so thin ridges aren't tunnelled through
@@ -171,7 +319,8 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
             let s = hf_at(pm.xz);
             let n = normalize(s.yzw);
             let lamb = clamp(dot(n, light), 0.0, 1.0);
-            let col = height_colour(s.x) * (0.28 + 0.72 * lamb);
+            var col = surface_colour(pm.xz, s.x) * (0.28 + 0.72 * lamb);
+            col = apply_water(col, s.x);
             return vec4<f32>(col, 1.0);
         }
         a_prev = a_n;
