@@ -507,6 +507,14 @@ impl BiomeLibrary {
     /// the one flatten both consumers call), not throwaway. A biome with more than [`GPU_STRATA_MAX_LAYERS`]
     /// strata clamps the overflow into the last slot (its bottom extended to the last layer's bottom).
     pub fn gpu_strata_table(&self) -> Vec<GpuStrataColumn> {
+        // `biomes.ron` is an async asset, so the library can be EMPTY (its `Default`) for the first frames
+        // while it loads — but `sync_terrain_detail_params` + the preview flatten it EVERY frame. Return a
+        // zeroed table instead of indexing an empty `Vec` (this was a launch panic: `biome()`/`material()`
+        // index out of bounds at biome.rs while the asset was still loading). Once compiled the library has
+        // exactly one validated entry per `BiomeId`.
+        if self.biomes.len() != BiomeId::ALL.len() {
+            return vec![GpuStrataColumn::default(); BiomeId::ALL.len()];
+        }
         BiomeId::ALL
             .iter()
             .map(|&id| {
