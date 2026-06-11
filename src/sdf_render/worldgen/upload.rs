@@ -747,6 +747,14 @@ pub fn bake_terrain_hifi() -> Option<(Arc<TerrainHifi>, bevy::math::Vec2)> {
     })
 }
 
+/// The per-bake frozen clipmap + world-XZ offset (see [`BAKE_TERRAIN`]). This is the SAME height source the
+/// mesh geometry is built from (`sample_clipmap_lod`), so the terrain-surface bake derives its depth-reference
+/// `surf_h` from THIS (not the finer `sample_world`) — otherwise `depth = surf_h − mesh.y` carries the
+/// sub-voxel detail the coarse mesh dropped and the thin surface stratum mottles. Read once per chunk bake.
+pub fn bake_terrain_clipmap() -> Option<(Arc<HeightClipmap>, bevy::math::Vec2)> {
+    BAKE_TERRAIN.with(|tl| tl.borrow().as_ref().map(|snap| (snap.clipmap.clone(), snap.offset)))
+}
+
 /// The Terrain primitive's signed field at local point `p`, sampling the rolling height clipmap — the
 /// single SSOT for the `edits::eval_primitive` `Terrain` branch. Reads the per-bake thread-local snapshot
 /// ([`BAKE_TERRAIN`]) when one is installed (the hot mesh-bake path: no per-sample global lock), else the

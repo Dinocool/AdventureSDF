@@ -726,6 +726,11 @@ fn bake_terrain_surface(
         return None;
     }
     let (hifi, offset) = crate::sdf_render::worldgen::upload::bake_terrain_hifi()?;
+    // The depth-reference height comes from the SAME clipmap the mesh geometry is built from — NOT the finer
+    // `sample_world` — so `depth = surf_h − mesh.y ≈ 0` on undug terrain (else the sub-voxel detail the coarse
+    // mesh dropped makes `depth` cross the thin surface stratum → speckled dirt/stone). The detail-normal
+    // SLOPE still uses the fine hi-fi gradient below.
+    let (clip, _) = crate::sdf_render::worldgen::upload::bake_terrain_clipmap()?;
 
     // DETAIL-NORMAL LOD GATE: only coarse chunks bake real slopes; fine chunks zero-fill (geometry normal).
     // Logged ONCE so the cap is visible, never silent.
@@ -753,8 +758,15 @@ fn bake_terrain_surface(
         let wz = oz + (j as f64 + 0.5) * step;
         for i in 0..n {
             let wx = ox + (i as f64 + 0.5) * step;
-            // ONE eval yields BOTH the height (depth reference) and the slope (detail normal).
-            let (h, dhdx, dhdz) = hifi.surface(wx, wz);
+            // Slope (detail normal) = the FINE hi-fi gradient; height (depth reference) = the CLIPMAP height
+            // the mesh is built from (mesh-matching ⇒ depth ≈ 0 on undug terrain — fixes the strata mottle).
+            let (h_fine, dhdx, dhdz) = hifi.surface(wx, wz);
+            let h = crate::sdf_render::worldgen::upload::try_sample_clipmap_lod(
+                &clip,
+                bevy::math::DVec2::new(wx, wz),
+                vs,
+            )
+            .map_or(h_fine, |node| node.height);
             height_texels.extend_from_slice(&h.to_le_bytes());
             if detail_enabled {
                 detail_texels.extend_from_slice(&TerrainSurfaceBake::pack_slope(dhdx, dhdz));
