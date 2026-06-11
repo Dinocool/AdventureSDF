@@ -27,7 +27,7 @@ use bevy::prelude::*;
 use bevy::render::render_resource::ShaderType;
 use serde::{Deserialize, Serialize};
 
-use super::noise::{FbmParams, fbm_height};
+use super::noise::{FbmParams, fbm_height, fbm_height_grad};
 
 // ============================================================================================
 // Climate fields
@@ -64,16 +64,47 @@ fn climate_fbm(seed: u32) -> FbmParams {
 /// `|fbm|`; we divide by it (so the field reaches the rails only at extreme noise) and affine-map
 /// `[-1,1] → [0,1]`, then clamp for total safety. Pure basic ops ⇒ bit-portable.
 fn normalize_climate(raw: f64) -> f64 {
-    // Geometric sum of octave amplitudes for amplitude 1.0, gain 0.5: Σ 0.5^k, k=0..octaves.
+    let unit = raw / climate_norm_bound(); // ≈ [-1, 1]
+    let mapped = unit * 0.5 + 0.5; // → [0, 1]
+    mapped.clamp(0.0, 1.0)
+}
+
+/// The geometric sum of octave amplitudes (amplitude 1.0, gain 0.5: `Σ 0.5^k`, `k=0..CLIMATE_OCTAVES`) that
+/// bounds `|fbm|`. The SSOT divisor for [`normalize_climate`] AND the analytic climate gradient
+/// ([`temperature_grad`]) so the two can't drift. Pure basic ops ⇒ bit-portable.
+fn climate_norm_bound() -> f64 {
     let mut bound = 0.0;
     let mut amp = 1.0;
     for _ in 0..CLIMATE_OCTAVES {
         bound += amp;
         amp *= 0.5;
     }
-    let unit = raw / bound; // ≈ [-1, 1]
-    let mapped = unit * 0.5 + 0.5; // → [0, 1]
-    mapped.clamp(0.0, 1.0)
+    bound
+}
+
+/// A climate field's VALUE + analytic world-XZ gradient at `(wx,wz)` for `seed`/`salt` — the differentiable
+/// form of [`temperature`]/[`humidity`]. `fbm_height_grad` through the affine [`normalize_climate`] map
+/// (gradient ×= `0.5 / bound`), with the gradient zeroed at the clamp rails (`value` 0 or 1). The `value`
+/// EQUALS the non-grad function bit-for-bit (same fBm + same normalize) — the shared SSOT so a biome's SHAPE
+/// placement uses the identical climate the MATERIAL classifier reads. Bit-portable.
+fn climate_grad(wx: f64, wz: f64, seed: u64, salt: u64) -> (f64, f64, f64) {
+    let (raw, drx, drz) = fbm_height_grad(wx, wz, &climate_fbm(climate_seed(seed, salt)));
+    let value = (raw / climate_norm_bound() * 0.5 + 0.5).clamp(0.0, 1.0);
+    // Affine map slope; the clamp flattens the field at the rails (gradient 0 there).
+    let s = if value <= 0.0 || value >= 1.0 { 0.0 } else { 0.5 / climate_norm_bound() };
+    (value, drx * s, drz * s)
+}
+
+/// [`temperature`] as a differentiable field: `(value, dh/dx, dh/dz)`. `value == temperature(...)` exactly.
+#[inline]
+pub fn temperature_grad(wx: f64, wz: f64, seed: u64) -> (f64, f64, f64) {
+    climate_grad(wx, wz, seed, TEMPERATURE_SALT)
+}
+
+/// [`humidity`] as a differentiable field: `(value, dh/dx, dh/dz)`. `value == humidity(...)` exactly.
+#[inline]
+pub fn humidity_grad(wx: f64, wz: f64, seed: u64) -> (f64, f64, f64) {
+    climate_grad(wx, wz, seed, HUMIDITY_SALT)
 }
 
 /// Fold a 64-bit per-field salt into the world `seed` and narrow to the `u32` the noise basis hashes
