@@ -690,6 +690,23 @@ pub fn cpu_terrain_hifi() -> Option<Arc<TerrainHifi>> {
     CPU_TERRAIN_HIFI.read().expect("CPU_TERRAIN_HIFI poisoned").clone()
 }
 
+/// Process-global snapshot of the compiled [`super::biome::BiomeLibrary`] — the off-thread terrain-surface
+/// bake reads this (one cheap `Arc` clone per chunk, NOT per texel) to resolve the SURFACE MATERIAL ids per
+/// texel ([`super::biome::resolve_surface`]); the bake has no Bevy resource handle. Republished on change by
+/// `sync_terrain_detail_params`, which ALSO triggers a rebake (the baked material ids are a function of it).
+/// `None` until `biomes.ron` compiles into the resource.
+static CPU_BIOME_LIBRARY: RwLock<Option<Arc<super::biome::BiomeLibrary>>> = RwLock::new(None);
+
+/// Publish the compiled biome library as the bake snapshot (see [`CPU_BIOME_LIBRARY`]).
+pub fn set_cpu_biome_library(lib: Option<Arc<super::biome::BiomeLibrary>>) {
+    *CPU_BIOME_LIBRARY.write().expect("CPU_BIOME_LIBRARY poisoned") = lib;
+}
+
+/// Current biome-library snapshot (a cheap `Arc` clone), or `None` if `biomes.ron` hasn't compiled yet.
+pub fn cpu_biome_library() -> Option<Arc<super::biome::BiomeLibrary>> {
+    CPU_BIOME_LIBRARY.read().expect("CPU_BIOME_LIBRARY poisoned").clone()
+}
+
 thread_local! {
     /// Per-bake-thread Terrain snapshot — the clipmap `Arc`, world-XZ offset, and the hi-fi normal sampler
     /// captured ONCE at the top of `mesh_chunk` (via [`set_bake_terrain`]). [`terrain_sdf`] /

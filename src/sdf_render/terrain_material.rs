@@ -30,7 +30,7 @@ use bevy::render::render_resource::{AsBindGroup, Extent3d, ShaderType, TextureDi
 use bevy::shader::ShaderRef;
 use half::f16;
 
-use super::worldgen::biome::StrataTableStd;
+use super::worldgen::biome::{MaterialPaletteStd, StrataTableStd};
 
 /// The terrain surface material: StandardMaterial (PBR lighting) extended with the per-chunk baked
 /// strata/biome/height/detail-normal maps + the biome strata table.
@@ -99,12 +99,22 @@ pub struct TerrainSurfaceExt {
     #[texture(103, sample_type = "float", filterable = false)]
     pub surface_height: Handle<Image>,
     /// The baked low-res `Rgba16Float` biome map: `R = primary id, G = secondary id, B = blend`. Nearest
-    /// (`textureLoad`).
+    /// (`textureLoad`). Used for the VOLUMETRIC strata (dug walls) — the undug surface uses `surface_mat`.
     #[texture(104, sample_type = "float", filterable = false)]
     pub biome: Handle<Image>,
     /// The shared per-biome strata table (the SAME std140 flatten the editor preview uploads).
     #[uniform(105)]
     pub strata: StrataTableStd,
+    /// The baked low-res `Rgba16Float` SURFACE-MATERIAL map: `R = mat_a id, G = mat_b id, B = weight` — the
+    /// worldgen-resolved undug surface (biome base + altitude caps + cliffs + patches, all resolved at BAKE
+    /// time by [`super::worldgen::biome::resolve_surface`]). Nearest (`textureLoad`); the shader resolves each
+    /// texel to a palette colour then bilinear-interpolates the COLOUR (ids can't interpolate).
+    #[texture(106, sample_type = "float", filterable = false)]
+    pub surface_mat: Handle<Image>,
+    /// The flat material palette (`TerrainMatId` → colour + roughness) the `surface_mat` ids index. Same SSOT
+    /// flatten as the strata table; re-synced live on a `biomes.ron` edit.
+    #[uniform(107)]
+    pub palette: MaterialPaletteStd,
 }
 
 impl MaterialExtension for TerrainSurfaceExt {
@@ -128,6 +138,7 @@ pub struct TerrainDetailAssets {
     pub detail_normal: Handle<Image>,
     pub surface_height: Handle<Image>,
     pub biome: Handle<Image>,
+    pub surface_mat: Handle<Image>,
 }
 
 /// The CPU-side baked terrain-surface payload a terrain-only chunk's mesh task produces (off-thread),
@@ -157,6 +168,9 @@ pub struct TerrainSurfaceBake {
     pub height_texels: Vec<u8>,
     /// `Rgba16Float` biome bytes (`biome_res² × 8`).
     pub biome_texels: Vec<u8>,
+    /// `Rgba16Float` SURFACE-MATERIAL bytes (`biome_res² × 8`): `(mat_a, mat_b, weight, 0)` per texel, the
+    /// worldgen-resolved undug surface (the data-driven replacement for the hardcoded shader treatment).
+    pub surface_mat_texels: Vec<u8>,
 }
 
 impl TerrainSurfaceBake {
@@ -180,6 +194,18 @@ impl TerrainSurfaceBake {
         let b = f16::from_f32(blend).to_bits().to_le_bytes();
         let t = f16::from_f32(temperature).to_bits().to_le_bytes();
         [p[0], p[1], s[0], s[1], b[0], b[1], t[0], t[1]]
+    }
+
+    /// Pack one surface-material texel `(mat_a, mat_b, weight)` into the `Rgba16Float` 8-byte group. Ids are
+    /// small integers f16 stores exactly; `weight ∈ [0, 0.5]` is the fraction toward `mat_b`. SSOT for the
+    /// bake + test so the on-GPU layout can't drift from the shader's `textureLoad`.
+    #[inline]
+    pub fn pack_surface(mat_a: u16, mat_b: u16, weight: f32) -> [u8; 8] {
+        let a = f16::from_f32(mat_a as f32).to_bits().to_le_bytes();
+        let b = f16::from_f32(mat_b as f32).to_bits().to_le_bytes();
+        let w = f16::from_f32(weight).to_bits().to_le_bytes();
+        let z = f16::from_f32(0.0).to_bits().to_le_bytes();
+        [a[0], a[1], b[0], b[1], w[0], w[1], z[0], z[1]]
     }
 }
 
@@ -237,16 +263,33 @@ pub fn make_biome_image(bake: &TerrainSurfaceBake) -> Image {
     img
 }
 
+/// Build the per-chunk low-res `Rgba16Float` SURFACE-MATERIAL `Image` (nearest — material ids must not
+/// interpolate; the shader resolves each texel to a palette colour then bilinear-blends the colours).
+pub fn make_surface_mat_image(bake: &TerrainSurfaceBake) -> Image {
+    let mut img = Image::new(
+        Extent3d { width: bake.biome_res, height: bake.biome_res, depth_or_array_layers: 1 },
+        TextureDimension::D2,
+        bake.surface_mat_texels.clone(),
+        TextureFormat::Rgba16Float,
+        RenderAssetUsages::RENDER_WORLD,
+    );
+    img.sampler = ImageSampler::nearest();
+    img
+}
+
 /// Build a per-chunk `TerrainMaterial` from the chunk's baked images + footprint + the live strength + the
-/// shared strata table.
+/// shared strata table + material palette.
+#[allow(clippy::too_many_arguments)]
 pub fn make_terrain_material(
     detail_normal: Handle<Image>,
     surface_height: Handle<Image>,
     biome: Handle<Image>,
+    surface_mat: Handle<Image>,
     bake: &TerrainSurfaceBake,
     strength: f32,
     debug_normals: bool,
     strata: StrataTableStd,
+    palette: MaterialPaletteStd,
 ) -> TerrainMaterial {
     TerrainMaterial {
         base: StandardMaterial {
@@ -269,6 +312,8 @@ pub fn make_terrain_material(
             surface_height,
             biome,
             strata,
+            surface_mat,
+            palette,
         },
     }
 }
@@ -325,7 +370,7 @@ mod tests {
     /// silently corrupts the in-world strata lookup; catch it at build time (like the preview shader's test).
     #[test]
     fn shader_strata_dims_match_rust() {
-        use super::super::worldgen::biome::{BIOME_COUNT, GPU_STRATA_MAX_LAYERS};
+        use super::super::worldgen::biome::{BIOME_COUNT, GPU_MAX_MATERIALS, GPU_STRATA_MAX_LAYERS};
         let src = include_str!("../../assets/shaders/terrain_surface.wgsl");
         let uint_const = |name: &str| -> usize {
             let line = src
@@ -346,6 +391,11 @@ mod tests {
             BIOME_COUNT,
             "BIOME_COUNT in terrain_surface.wgsl != BiomeId::ALL.len()"
         );
+        assert_eq!(
+            uint_const("MAX_MATERIALS"),
+            GPU_MAX_MATERIALS,
+            "MAX_MATERIALS in terrain_surface.wgsl != GPU_MAX_MATERIALS in biome.rs"
+        );
     }
 
     /// The baked images have the expected extents + formats.
@@ -362,6 +412,7 @@ mod tests {
             detail_texels: vec![0u8; (dres * dres * 4) as usize],
             height_texels: vec![0u8; (dres * dres * 4) as usize],
             biome_texels: vec![0u8; (bres * bres * 8) as usize],
+            surface_mat_texels: vec![0u8; (bres * bres * 8) as usize],
         };
         let dn = make_detail_image(&bake);
         assert_eq!(dn.texture_descriptor.format, TextureFormat::Rg16Float);
@@ -372,5 +423,22 @@ mod tests {
         let bi = make_biome_image(&bake);
         assert_eq!(bi.texture_descriptor.format, TextureFormat::Rgba16Float);
         assert_eq!((bi.width(), bi.height()), (bres, bres));
+        let sm = make_surface_mat_image(&bake);
+        assert_eq!(sm.texture_descriptor.format, TextureFormat::Rgba16Float);
+        assert_eq!((sm.width(), sm.height()), (bres, bres));
+    }
+
+    /// `pack_surface` round-trips the ids exactly + the weight through f16 — pins the on-GPU layout.
+    #[test]
+    fn pack_surface_roundtrips() {
+        for &(a, b, w) in &[(0u16, 0u16, 0.0f32), (3, 7, 0.5), (11, 2, 0.25)] {
+            let p = TerrainSurfaceBake::pack_surface(a, b, w);
+            let ra = f16::from_bits(u16::from_le_bytes([p[0], p[1]])).to_f32();
+            let rb = f16::from_bits(u16::from_le_bytes([p[2], p[3]])).to_f32();
+            let rw = f16::from_bits(u16::from_le_bytes([p[4], p[5]])).to_f32();
+            assert_eq!(ra, a as f32, "mat_a id must store exactly");
+            assert_eq!(rb, b as f32, "mat_b id must store exactly");
+            assert_eq!(rw, f16::from_f32(w).to_f32(), "weight roundtrip");
+        }
     }
 }

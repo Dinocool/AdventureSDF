@@ -745,6 +745,10 @@ fn bake_terrain_surface(
     // mesh dropped makes `depth` cross the thin surface stratum → speckled dirt/stone). The detail-normal
     // SLOPE still uses the fine hi-fi gradient below.
     let (clip, _) = crate::sdf_render::worldgen::upload::bake_terrain_clipmap()?;
+    // The compiled biome library snapshot — the bake resolves the SURFACE MATERIAL per texel from it
+    // (biome base + altitude caps + cliffs + patches). `None` until `biomes.ron` compiles (a lib change
+    // triggers a rebake), in which case the surface-material map zero-fills (palette is empty too).
+    let lib = crate::sdf_render::worldgen::upload::cpu_biome_library();
 
     // DETAIL-NORMAL LOD GATE: only coarse chunks bake real slopes; fine chunks zero-fill (geometry normal).
     // Logged ONCE so the cap is visible, never silent.
@@ -795,6 +799,7 @@ fn bake_terrain_surface(
     let bn = biome_res.max(2);
     let bstep = (chunk_world / bn as f32) as f64;
     let mut biome_texels = Vec::with_capacity((bn * bn * 8) as usize);
+    let mut surface_mat_texels = Vec::with_capacity((bn * bn * 8) as usize);
     for j in 0..bn {
         let wz = oz + (j as f64 + 0.5) * bstep;
         for i in 0..bn {
@@ -812,6 +817,19 @@ fn bake_terrain_surface(
                 s.blend,
                 temp,
             ));
+            // SURFACE MATERIAL (undug top): the worldgen resolves it from the library — biome base + altitude
+            // caps + cliffs + patches — using this texel's surface altitude + slope. The shader just renders
+            // the baked (mat_a, mat_b, weight). No library yet ⇒ zero-fill (the palette is empty too).
+            let sm = match lib.as_deref() {
+                Some(lib) => {
+                    let (h, dhdx, dhdz) = hifi.surface(wx, wz);
+                    // cos of the surface slope = N.y for N = normalize(-dh/dx, 1, -dh/dz).
+                    let n_y = 1.0 / (1.0 + (dhdx * dhdx + dhdz * dhdz) as f64).sqrt();
+                    crate::sdf_render::worldgen::biome::resolve_surface(wx, wz, h as f64, n_y, s, hifi.world_seed, lib)
+                }
+                None => crate::sdf_render::worldgen::biome::SurfaceBlend { mat_a: 0, mat_b: 0, weight: 0.0 },
+            };
+            surface_mat_texels.extend_from_slice(&TerrainSurfaceBake::pack_surface(sm.mat_a, sm.mat_b, sm.weight));
         }
     }
 
@@ -824,6 +842,7 @@ fn bake_terrain_surface(
         detail_texels,
         height_texels,
         biome_texels,
+        surface_mat_texels,
     })
 }
 
@@ -1085,6 +1104,7 @@ fn sync_terrain_detail_params(
     cfg: Res<MeshBakeConfig>,
     biome_lib: Res<super::worldgen::biome::BiomeLibrary>,
     mut mats: ResMut<Assets<super::terrain_material::TerrainMaterial>>,
+    mut rebuild: ResMut<MeshBakeRebuild>,
 ) {
     let cfg_changed = cfg.is_changed();
     let lib_changed = biome_lib.is_changed();
@@ -1093,9 +1113,24 @@ fn sync_terrain_detail_params(
     }
     let (strength, debug, treatment) =
         (cfg.detail_normal_strength, cfg.debug_normals as u32, cfg.surface_treatment);
-    // Re-flatten the strata table only when the library changed (the shared SSOT flatten).
-    let strata = lib_changed.then(|| super::worldgen::biome::StrataTableStd::from_library(&biome_lib));
-    // Touch a material if any live scalar differs OR the library changed (the table must be re-pushed).
+    // Re-flatten the strata table + material palette only when the library changed (the shared SSOT flattens).
+    let (strata, palette) = if lib_changed {
+        (
+            Some(super::worldgen::biome::StrataTableStd::from_library(&biome_lib)),
+            Some(super::worldgen::biome::MaterialPaletteStd::from_library(&biome_lib)),
+        )
+    } else {
+        (None, None)
+    };
+    if lib_changed {
+        // The bake resolves SURFACE-MATERIAL ids from the library, so a `biomes.ron` change must re-bake (the
+        // baked `surface_mat` ids can't be live-patched like the colour tables). Publish the snapshot the
+        // off-thread bake reads, then request a rebuild. (The strata/palette tables ARE patched live below so
+        // dug-wall colours update without waiting for the rebake.)
+        crate::sdf_render::worldgen::upload::set_cpu_biome_library(Some(std::sync::Arc::new(biome_lib.clone())));
+        rebuild.0 = true;
+    }
+    // Touch a material if any live scalar differs OR the library changed (the tables must be re-pushed).
     let ids: Vec<_> = mats
         .iter()
         .filter(|(_, m)| {
@@ -1113,6 +1148,9 @@ fn sync_terrain_detail_params(
             m.extension.params.surf_b.z = treatment;
             if let Some(table) = strata {
                 m.extension.strata = table;
+            }
+            if let Some(p) = palette {
+                m.extension.palette = p;
             }
         }
     }
@@ -1133,6 +1171,9 @@ struct SpawnAssets<'a> {
     /// terrain-only chunk's `TerrainMaterial`. Hot-reload of `biomes.ron` re-syncs it (see
     /// [`sync_terrain_detail_params`]).
     strata: super::worldgen::biome::StrataTableStd,
+    /// The shared material palette (colour + roughness, flattened from the live `BiomeLibrary`) the baked
+    /// `surface_mat` ids index. Re-synced live on a `biomes.ron` edit, same as `strata`.
+    palette: super::worldgen::biome::MaterialPaletteStd,
 }
 
 /// Spawn one chunk-mesh entity from baked data — the single SSOT used by BOTH the immediate terrain commit
@@ -1173,18 +1214,21 @@ fn spawn_chunk_mesh(
         let detail_normal = assets.images.add(terrain_material::make_detail_image(&bake));
         let surface_height = assets.images.add(terrain_material::make_height_image(&bake));
         let biome = assets.images.add(terrain_material::make_biome_image(&bake));
+        let surface_mat = assets.images.add(terrain_material::make_surface_mat_image(&bake));
         let mat = assets.terrain_mats.add(terrain_material::make_terrain_material(
             detail_normal.clone(),
             surface_height.clone(),
             biome.clone(),
+            surface_mat.clone(),
             &bake,
             assets.detail_strength,
             assets.debug_normals,
             assets.strata,
+            assets.palette,
         ));
         ent.insert((
             MeshMaterial3d(mat.clone()),
-            TerrainDetailAssets { material: mat, detail_normal, surface_height, biome },
+            TerrainDetailAssets { material: mat, detail_normal, surface_height, biome, surface_mat },
         ));
     } else {
         ent.insert(MeshMaterial3d(assets.mesh_mats.handle.clone()));
@@ -1505,6 +1549,7 @@ fn mesh_resident_chunks(
         detail_strength: mesh_cfg.detail_normal_strength,
         debug_normals: mesh_cfg.debug_normals,
         strata: super::worldgen::biome::StrataTableStd::from_library(&biome_lib),
+        palette: super::worldgen::biome::MaterialPaletteStd::from_library(&biome_lib),
     };
 
     // 1b. IMMEDIATE TERRAIN COMMIT: a terrain-only chunk is an independent world-anchored surface with NO
