@@ -235,13 +235,14 @@ fn apply_water_face(col: vec3<f32>, p: vec3<f32>) -> vec3<f32> {
 }
 
 // Crisp waterline where the terrain SURFACE meets the level — the shore (water "next to terrain") in the
-// normal 3D/2D view, the same bright line the slice draws. A fixed world-height band (tied to the
-// water-depth scale) so it needs no screen-space derivative inside the march loop.
+// normal 3D/2D view, the same bright line the slice draws. Width = `fwidth(surface_y)` (the per-pixel
+// change in surface height), so the line stays ~constant SCREEN width at every zoom (a fixed world band
+// would read as a thin line zoomed-in and a massive gradient zoomed-out).
 fn shoreline(col: vec3<f32>, surface_y: f32) -> vec3<f32> {
     if (params.modes.z < 0.5) { return col; }
     let wl = params.levels.w;
-    let half = max(params.levels.z * 0.04, 0.5);
-    let line = 1.0 - smoothstep(0.0, half, abs(surface_y - wl));
+    let w = max(fwidth(surface_y) * 1.5, 1.0e-5); // ~1.5 px, zoom-independent
+    let line = 1.0 - smoothstep(0.0, w, abs(surface_y - wl));
     return mix(col, vec3<f32>(0.70, 0.88, 0.98), clamp(line, 0.0, 1.0));
 }
 
