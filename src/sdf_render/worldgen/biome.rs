@@ -381,13 +381,16 @@ pub enum SurfaceCond {
     Patch { wavelength: f32, threshold: f32, softness: f32, seed: u32 },
 }
 
-/// One layer in a biome's SURFACE stack (the undug top, bottom→top): its `material` appears where `when`'s
-/// weight is high, over-blending the layers below it (see [`resolve_surface`]). The stack is the
-/// data-driven replacement for the old hardcoded shader surface treatment (snow caps, cliff rock, …).
-#[derive(Reflect, Serialize, Deserialize, Clone, Copy, Debug, PartialEq)]
+/// One layer in a biome's SURFACE stack (the undug top, bottom→top): its `material` appears where the `when`
+/// conditions fire, over-blending the layers below it (see [`resolve_surface`]). `when` is AND-combined — the
+/// layer's weight is the PRODUCT of its conditions' weights — so a rule can require several things at once
+/// (e.g. a flower patch = noise AND flat ground, keeping flowers off steep mountainsides). An EMPTY `when`
+/// means "always" (weight 1). The data-driven replacement for the old hardcoded shader surface treatment.
+#[derive(Reflect, Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct SurfaceLayer {
     pub material: TerrainMatId,
-    pub when: SurfaceCond,
+    #[serde(default)]
+    pub when: Vec<SurfaceCond>,
 }
 
 /// A biome's full definition: its surface material (top, undug), the ordered sub-surface strata, and the
@@ -971,7 +974,8 @@ fn accumulate_biome_surface(
     let def = lib.biome(biome);
     let mut stack: Vec<(u16, f64)> = vec![(def.surface.0, 1.0)];
     for layer in &def.surface_rules {
-        let w = cond_weight(layer.when, wx, wz, surf_y, n_y, seed);
+        // AND-combine the layer's conditions: its weight is the product (empty ⇒ 1 = always).
+        let w: f64 = layer.when.iter().map(|c| cond_weight(*c, wx, wz, surf_y, n_y, seed)).product();
         if w <= 0.0 {
             continue;
         }

@@ -484,9 +484,9 @@ fn surf_lib() -> BiomeLibrary {
         name: "Plains".into(),
         surface: TerrainMatId(0),
         surface_rules: vec![
-            SurfaceLayer { material: TerrainMatId(1), when: SurfaceCond::AboveY { start: 100.0, full: 140.0 } },
-            SurfaceLayer { material: TerrainMatId(2), when: SurfaceCond::AboveY { start: 160.0, full: 200.0 } },
-            SurfaceLayer { material: TerrainMatId(2), when: SurfaceCond::Slope { gentle: 0.9, steep: 0.6 } },
+            SurfaceLayer { material: TerrainMatId(1), when: vec![SurfaceCond::AboveY { start: 100.0, full: 140.0 }] },
+            SurfaceLayer { material: TerrainMatId(2), when: vec![SurfaceCond::AboveY { start: 160.0, full: 200.0 }] },
+            SurfaceLayer { material: TerrainMatId(2), when: vec![SurfaceCond::Slope { gentle: 0.9, steep: 0.6 }] },
         ],
         strata: vec![],
         bedrock: TerrainMatId(0),
@@ -503,7 +503,7 @@ fn patch_lib() -> BiomeLibrary {
     let mut lib = surf_lib();
     lib.biomes[0].surface_rules = vec![SurfaceLayer {
         material: TerrainMatId(3),
-        when: SurfaceCond::Patch { wavelength: 600.0, threshold: 0.5, softness: 0.05, seed: 1 },
+        when: vec![SurfaceCond::Patch { wavelength: 600.0, threshold: 0.5, softness: 0.05, seed: 1 }],
     }];
     lib
 }
@@ -576,4 +576,30 @@ fn resolve_surface_patch_and_deterministic() {
         x += 137.0;
     }
     assert!(saw_flower, "the flower patch never appeared over a 6 km sweep");
+}
+
+/// AND-combined conditions: a flower rule requiring BOTH a noise patch AND flat ground appears on flat
+/// terrain but NEVER on steep terrain (the mountain-flowers bug) even where the patch noise fires.
+#[test]
+fn resolve_surface_and_conditions_gate_steep() {
+    let mut lib = surf_lib();
+    lib.biomes[0].surface_rules = vec![SurfaceLayer {
+        material: TerrainMatId(3),
+        when: vec![
+            SurfaceCond::Patch { wavelength: 600.0, threshold: 0.5, softness: 0.05, seed: 1 },
+            SurfaceCond::Slope { gentle: 0.7, steep: 0.95 }, // flat-only: weight → 1 as n_y → 1
+        ],
+    }];
+    let mut saw_flat_flower = false;
+    let mut x = -3000.0;
+    while x < 3000.0 {
+        let flat = resolve_surface(x, x * 0.7, 0.0, 1.0, plains_only(0.0), 7, &lib);
+        if flat.mat_a == 3 || flat.mat_b == 3 {
+            saw_flat_flower = true;
+        }
+        let steep = resolve_surface(x, x * 0.7, 0.0, 0.3, plains_only(0.0), 7, &lib);
+        assert!(steep.mat_a != 3 && steep.mat_b != 3, "flower must NOT appear on steep ground at {x}");
+        x += 137.0;
+    }
+    assert!(saw_flat_flower, "flower should still appear on flat ground");
 }
