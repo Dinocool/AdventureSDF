@@ -189,6 +189,7 @@ fn compile_rejects_missing_material() {
             .map(|id| BiomeDef {
                 name: format!("{id:?}"),
                 surface: TerrainMatId(0),
+                surface_rules: vec![],
                 strata: vec![StrataLayer { material: TerrainMatId(99), thickness: 1.0 }],
                 bedrock: TerrainMatId(0),
             })
@@ -450,4 +451,129 @@ fn gpu_probe(col: &GpuStrataColumn, depth: f32) -> [f32; 4] {
         }
     }
     col.bedrock_color
+}
+
+// ---------------------------------------------------------------------------------------------
+// Surface material resolver (Stage 2) — the data-driven replacement for the hardcoded shader treatment
+// ---------------------------------------------------------------------------------------------
+
+/// A tiny hand-built library for the resolver tests: materials 0=grass 1=snow 2=rock 3=flower; Plains (id 0)
+/// carries a snow→rock altitude cap + cliff-rock + a flower patch; Snowy (id 4) surfaces snow; the rest are
+/// plain grass. Built directly (not via `compile`) so the rules are explicit + isolated from `biomes.ron`.
+fn surf_lib() -> BiomeLibrary {
+    let mat = |name: &str, c: [f32; 4]| TerrainSurfaceMaterial {
+        name: name.into(),
+        base_color: c,
+        roughness: 1.0,
+        blend: 4.0,
+    };
+    let materials = vec![
+        mat("grass", [0.0, 0.5, 0.0, 1.0]),  // 0
+        mat("snow", [1.0, 1.0, 1.0, 1.0]),   // 1
+        mat("rock", [0.3, 0.3, 0.3, 1.0]),   // 2
+        mat("flower", [0.9, 0.1, 0.9, 1.0]), // 3
+    ];
+    let base = |n: &str, s: u16| BiomeDef {
+        name: n.into(),
+        surface: TerrainMatId(s),
+        surface_rules: vec![],
+        strata: vec![],
+        bedrock: TerrainMatId(s),
+    };
+    let plains = BiomeDef {
+        name: "Plains".into(),
+        surface: TerrainMatId(0),
+        surface_rules: vec![
+            SurfaceLayer { material: TerrainMatId(1), when: SurfaceCond::AboveY { start: 100.0, full: 140.0 } },
+            SurfaceLayer { material: TerrainMatId(2), when: SurfaceCond::AboveY { start: 160.0, full: 200.0 } },
+            SurfaceLayer { material: TerrainMatId(2), when: SurfaceCond::Slope { gentle: 0.9, steep: 0.6 } },
+        ],
+        strata: vec![],
+        bedrock: TerrainMatId(0),
+    };
+    BiomeLibrary {
+        materials,
+        biomes: vec![plains, base("Forest", 0), base("Desert", 0), base("Tundra", 0), base("Snowy", 1)],
+    }
+}
+
+/// Like [`surf_lib`] but Plains carries ONLY a flower [`SurfaceCond::Patch`] (isolated from the cap/cliff
+/// rules so the patch test isn't confounded by them, and vice-versa).
+fn patch_lib() -> BiomeLibrary {
+    let mut lib = surf_lib();
+    lib.biomes[0].surface_rules = vec![SurfaceLayer {
+        material: TerrainMatId(3),
+        when: SurfaceCond::Patch { wavelength: 600.0, threshold: 0.5, softness: 0.05, seed: 1 },
+    }];
+    lib
+}
+
+fn plains_only(blend: f32) -> BiomeSample {
+    BiomeSample { primary: BiomeId::Plains, secondary: BiomeId::Plains, blend }
+}
+
+/// A base-only sample (flat, low altitude) resolves to just the biome's surface material (`mat_a == mat_b`,
+/// weight 0) — no rule fires.
+#[test]
+fn resolve_surface_base_only() {
+    let lib = surf_lib();
+    let s = resolve_surface(0.0, 0.0, 0.0, 1.0, plains_only(0.0), 7, &lib);
+    assert_eq!(s.mat_a, 0, "flat low Plains = grass");
+    assert_eq!(s.mat_b, 0);
+    assert_eq!(s.weight, 0.0);
+}
+
+/// An altitude cap: high above the rock band the dominant surface is rock (2); in the snow band snow (1) is
+/// present. The hardcoded shader snow/rock treatment is now this data.
+#[test]
+fn resolve_surface_altitude_cap() {
+    let lib = surf_lib();
+    // Well above the rock full-altitude (200) → rock dominates.
+    let high = resolve_surface(0.0, 0.0, 300.0, 1.0, plains_only(0.0), 7, &lib);
+    assert_eq!(high.mat_a, 2, "peak caps to rock");
+    // Mid snow band (120, between 100 and 140) → snow is one of the two materials.
+    let mid = resolve_surface(0.0, 0.0, 120.0, 1.0, plains_only(0.0), 7, &lib);
+    assert!(mid.mat_a == 1 || mid.mat_b == 1, "snow present in the snow band: {mid:?}");
+}
+
+/// Cliff rock: a steep surface normal (low `n_y`) at low altitude resolves to rock; a flat one stays grass.
+#[test]
+fn resolve_surface_slope_cliff() {
+    let lib = surf_lib();
+    let flat = resolve_surface(5000.0, -3000.0, 0.0, 1.0, plains_only(0.0), 7, &lib);
+    assert_eq!(flat.mat_a, 0, "flat = grass");
+    let steep = resolve_surface(5000.0, -3000.0, 0.0, 0.4, plains_only(0.0), 7, &lib);
+    assert_eq!(steep.mat_a, 2, "steep = cliff rock");
+}
+
+/// A biome border (blend 1.0 → 50/50) mixes the two biomes' surface materials: Plains(grass 0) ↔ Snowy(snow
+/// 1), weight ≈ 0.5.
+#[test]
+fn resolve_surface_biome_border() {
+    let lib = surf_lib();
+    let sample = BiomeSample { primary: BiomeId::Plains, secondary: BiomeId::Snowy, blend: 1.0 };
+    let s = resolve_surface(0.0, 0.0, 0.0, 1.0, sample, 7, &lib);
+    let pair = [s.mat_a, s.mat_b];
+    assert!(pair.contains(&0) && pair.contains(&1), "grass↔snow border: {s:?}");
+    assert!((s.weight - 0.5).abs() < 1e-5, "even border ⇒ weight 0.5, got {}", s.weight);
+}
+
+/// A noise patch produces its material somewhere over a sampled region (the flower field), and the resolver
+/// is deterministic (byte-identical weight on recompute).
+#[test]
+fn resolve_surface_patch_and_deterministic() {
+    let lib = patch_lib();
+    let mut saw_flower = false;
+    let mut x = -3000.0;
+    while x < 3000.0 {
+        let s = resolve_surface(x, x * 0.7, 0.0, 1.0, plains_only(0.0), 7, &lib);
+        if s.mat_a == 3 || s.mat_b == 3 {
+            saw_flower = true;
+        }
+        // Determinism: recompute is byte-identical.
+        let s2 = resolve_surface(x, x * 0.7, 0.0, 1.0, plains_only(0.0), 7, &lib);
+        assert_eq!(s.weight.to_bits(), s2.weight.to_bits(), "resolver not deterministic at {x}");
+        x += 137.0;
+    }
+    assert!(saw_flower, "the flower patch never appeared over a 6 km sweep");
 }

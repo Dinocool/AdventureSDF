@@ -361,6 +361,35 @@ pub struct StrataLayer {
     pub thickness: f32,
 }
 
+/// A condition under which a [`SurfaceLayer`]'s material appears, as a pure function of world position /
+/// surface geometry / noise — evaluated by the worldgen at BAKE time (NOT the shader), yielding a smooth
+/// presence weight in `[0,1]`. This is the extensible "where is this material on the surface" vocabulary
+/// (leverages x/y/z, slope, noise…); add variants without touching the shader. Bit-portable (value noise +
+/// basic f64 ops); a RENDER attribute (no `HEIGHT_GEN_VERSION` tie).
+#[derive(Reflect, Serialize, Deserialize, Clone, Copy, Debug, PartialEq)]
+pub enum SurfaceCond {
+    /// Always present (weight 1). The biome's base surface — the bottom of the layer stack.
+    Base,
+    /// Above a world-Y altitude: weight ramps `0→1` from `start` m to `full` m (a snow line / the lower
+    /// edge of a rock cap). `full < start` inverts it (present BELOW an altitude).
+    AboveY { start: f32, full: f32 },
+    /// On steep ground: weight ramps `0→1` as the surface-normal `.y` (cos of the slope from vertical)
+    /// drops from `gentle` (cos, ~1 = flat, weight 0) to `steep` (cos, smaller = steeper, weight 1). Cliffs.
+    Slope { gentle: f32, steep: f32 },
+    /// A low-frequency value-noise PATCH: weight ramps across `threshold ± softness` of the `[0,1]` noise at
+    /// `wavelength` m with a `seed` salt — sub-areas like a flower field in plains. Soft-edged sub-biomes.
+    Patch { wavelength: f32, threshold: f32, softness: f32, seed: u32 },
+}
+
+/// One layer in a biome's SURFACE stack (the undug top, bottom→top): its `material` appears where `when`'s
+/// weight is high, over-blending the layers below it (see [`resolve_surface`]). The stack is the
+/// data-driven replacement for the old hardcoded shader surface treatment (snow caps, cliff rock, …).
+#[derive(Reflect, Serialize, Deserialize, Clone, Copy, Debug, PartialEq)]
+pub struct SurfaceLayer {
+    pub material: TerrainMatId,
+    pub when: SurfaceCond,
+}
+
 /// A biome's full definition: its surface material (top, undug), the ordered sub-surface strata, and the
 /// bedrock material that fills everything below the strata (down to the world bedrock floor). Referenced
 /// by [`BiomeId`] in the library.
@@ -368,8 +397,16 @@ pub struct StrataLayer {
 pub struct BiomeDef {
     /// Human-readable biome name.
     pub name: String,
-    /// The top (depth 0) material — the undug surface (before surface treatment, a later stage).
+    /// The top (depth 0) material for the VOLUMETRIC strata column (dug walls). The undug RENDER surface is
+    /// chosen by [`surface_rules`] (which default to just this material). Kept for the depth walk + as the
+    /// surface-stack base.
     pub surface: TerrainMatId,
+    /// SURFACE material stack (bottom→top) chosen by world position / slope / noise — the data-driven undug
+    /// surface (snow caps, cliff rock, patches). Bottom layer is the base; higher layers over-blend it where
+    /// their [`SurfaceCond`] fires. `#[serde(default)]` ⇒ EMPTY means "just the `surface` material" (old
+    /// behaviour); the resolver treats an empty stack as a single `Base` layer of `surface`.
+    #[serde(default)]
+    pub surface_rules: Vec<SurfaceLayer>,
     /// Sub-surface strata, top→down (each `thickness` metres below the previous). The `surface`
     /// material's band is the first entry's `thickness` (i.e. `strata[0]` IS the surface band); see
     /// [`strata_material`] for the exact depth walk.
@@ -837,6 +874,146 @@ fn climate_axis_gradient_mag(wx: f64, wz: f64, seed: u64, axis: ClimateAxis) -> 
     let gx = (f(wx + D, wz) - f(wx - D, wz)) / (2.0 * D);
     let gz = (f(wx, wz + D) - f(wx, wz - D)) / (2.0 * D);
     (gx * gx + gz * gz).sqrt()
+}
+
+/// Per-field salt for [`SurfaceCond::Patch`] noise so it decorrelates from the climate streams.
+const PATCH_SALT: u64 = 0xA24B_AED4_EAF7_1B9D;
+
+/// C1 smoothstep on `[edge0, edge1]` (handles `edge0 == edge1` and reversed edges). f64, bit-portable.
+fn smoothstep_f64(edge0: f64, edge1: f64, x: f64) -> f64 {
+    if (edge1 - edge0).abs() < 1e-12 {
+        return if x < edge0 { 0.0 } else { 1.0 };
+    }
+    let t = ((x - edge0) / (edge1 - edge0)).clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
+/// Low-frequency value-noise patch field at world `(wx,wz)`, normalised to `[0,1]` — drives
+/// [`SurfaceCond::Patch`] (flower fields etc.). One fBm octave at `wavelength` m, salted by `seed`.
+fn patch_noise(wx: f64, wz: f64, wavelength: f64, salt: u32, world_seed: u64) -> f64 {
+    let p = FbmParams {
+        octaves: 1,
+        base_freq: 1.0 / wavelength.max(1.0),
+        lacunarity: 2.0,
+        gain: 0.5,
+        amplitude: 1.0,
+        seed: climate_seed(world_seed, PATCH_SALT ^ (salt as u64)),
+    };
+    (fbm_height(wx, wz, &p) * 0.5 + 0.5).clamp(0.0, 1.0)
+}
+
+/// The presence weight `[0,1]` of one [`SurfaceCond`] at a point (`surf_y` = surface altitude, `n_y` = cos
+/// of the surface slope). The smooth bake-time evaluation of "is this material's rule firing here".
+fn cond_weight(cond: SurfaceCond, wx: f64, wz: f64, surf_y: f64, n_y: f64, seed: u64) -> f64 {
+    match cond {
+        SurfaceCond::Base => 1.0,
+        SurfaceCond::AboveY { start, full } => smoothstep_f64(start as f64, full as f64, surf_y),
+        // n_y drops from `gentle` (flat, 0) to `steep` (steep, 1): ramp on the REVERSED edges.
+        SurfaceCond::Slope { gentle, steep } => smoothstep_f64(gentle as f64, steep as f64, n_y),
+        SurfaceCond::Patch { wavelength, threshold, softness, seed: salt } => {
+            let v = patch_noise(wx, wz, wavelength as f64, salt, seed);
+            let s = (softness as f64).max(1e-4);
+            smoothstep_f64(threshold as f64 - s, threshold as f64 + s, v)
+        }
+    }
+}
+
+/// The resolved undug SURFACE at a point: the two dominant materials + a blend `weight` (`0` = all `mat_a`,
+/// `0.5` = an even 50/50). The bake writes this per texel; the shader looks the palette colours up and mixes
+/// (and bilinear-interpolates the resolved COLOUR across texels, so material-pair boundaries don't step).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SurfaceBlend {
+    pub mat_a: u16,
+    pub mat_b: u16,
+    /// Fraction toward `mat_b` in `[0, 0.5]` (mirrors the biome-blend convention the shader already mixes).
+    pub weight: f32,
+}
+
+/// Worldgen SSOT for the undug RENDER surface at world `(wx,wz)` (surface altitude `surf_y`, surface-normal
+/// cos `n_y`), for the baked `biome` sample. Composes (1) each biome's SURFACE STACK — base material
+/// over-blended by its altitude-cap / cliff / patch [`SurfaceLayer`]s — and (2) the biome-border cross-fade
+/// (primary↔secondary by the baked `biome.blend`). Reduces the weighted material set to its top two. Shared
+/// by the bake AND the editor preview so they never diverge. Bit-portable (RENDER attribute, no version tie).
+pub fn resolve_surface(
+    wx: f64,
+    wz: f64,
+    surf_y: f64,
+    n_y: f64,
+    biome: BiomeSample,
+    seed: u64,
+    lib: &BiomeLibrary,
+) -> SurfaceBlend {
+    let mut acc: Vec<(u16, f64)> = Vec::new();
+    let border = (biome.blend.clamp(0.0, 1.0) as f64) * 0.5; // fraction toward the neighbour biome
+    accumulate_biome_surface(&mut acc, biome.primary, wx, wz, surf_y, n_y, seed, lib, 1.0 - border);
+    if border > 0.0 && biome.secondary != biome.primary {
+        accumulate_biome_surface(&mut acc, biome.secondary, wx, wz, surf_y, n_y, seed, lib, border);
+    }
+    top_two(&acc)
+}
+
+/// Evaluate one biome's surface STACK (base + over-blended rule layers) at a point and merge its per-material
+/// weights (scaled by `scale`) into `acc`. The stack is seeded with the biome's `surface` material (weight 1)
+/// then each rule layer that fires scales everything below by `(1-w)` and adds its material with weight `w`
+/// (a standard back-to-front over-blend), so higher layers (caps, cliffs, patches) sit on top.
+#[allow(clippy::too_many_arguments)]
+fn accumulate_biome_surface(
+    acc: &mut Vec<(u16, f64)>,
+    biome: BiomeId,
+    wx: f64,
+    wz: f64,
+    surf_y: f64,
+    n_y: f64,
+    seed: u64,
+    lib: &BiomeLibrary,
+    scale: f64,
+) {
+    let def = lib.biome(biome);
+    let mut stack: Vec<(u16, f64)> = vec![(def.surface.0, 1.0)];
+    for layer in &def.surface_rules {
+        let w = cond_weight(layer.when, wx, wz, surf_y, n_y, seed);
+        if w <= 0.0 {
+            continue;
+        }
+        for e in stack.iter_mut() {
+            e.1 *= 1.0 - w;
+        }
+        merge_weight(&mut stack, layer.material.0, w);
+    }
+    for (m, w) in stack {
+        merge_weight(acc, m, w * scale);
+    }
+}
+
+/// Accumulate `w` onto material `id` in a `(id, weight)` list (collapsing duplicates).
+fn merge_weight(list: &mut Vec<(u16, f64)>, id: u16, w: f64) {
+    if let Some(e) = list.iter_mut().find(|e| e.0 == id) {
+        e.1 += w;
+    } else {
+        list.push((id, w));
+    }
+}
+
+/// Reduce a weighted material set to its two heaviest → a [`SurfaceBlend`] (`weight` = `wb/(wa+wb)` ∈ `[0,
+/// 0.5]`). One material (or empty) → `mat_a == mat_b`, weight 0.
+fn top_two(acc: &[(u16, f64)]) -> SurfaceBlend {
+    let mut a: Option<(u16, f64)> = None;
+    let mut b: Option<(u16, f64)> = None;
+    for &(id, w) in acc {
+        if a.is_none() || w > a.unwrap().1 {
+            b = a;
+            a = Some((id, w));
+        } else if b.is_none() || w > b.unwrap().1 {
+            b = Some((id, w));
+        }
+    }
+    match (a, b) {
+        (Some((ma, wa)), Some((mb, wb))) if wa + wb > 0.0 => {
+            SurfaceBlend { mat_a: ma, mat_b: mb, weight: (wb / (wa + wb)) as f32 }
+        }
+        (Some((ma, _)), _) => SurfaceBlend { mat_a: ma, mat_b: ma, weight: 0.0 },
+        _ => SurfaceBlend { mat_a: 0, mat_b: 0, weight: 0.0 },
+    }
 }
 
 /// The material at `depth` metres below the original surface for `biome`, walking its strata column:
