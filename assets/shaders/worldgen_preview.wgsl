@@ -212,6 +212,28 @@ fn apply_water(terrain: vec3<f32>, terrain_y: f32) -> vec3<f32> {
     return mix(terrain, water, alpha);
 }
 
+// Water on the SLICE CUT FACE. Unlike `apply_water` (top-down: tint by the surface height), a vertical
+// cross-section must tint by the POINT'S OWN height `p.y` vs the level, with a HARD top edge + a crisp
+// waterline — otherwise the whole column tints uniformly and the level is invisible (the reported bug).
+fn apply_water_face(col: vec3<f32>, p: vec3<f32>) -> vec3<f32> {
+    if (params.modes.z < 0.5) { return col; }
+    let wl = params.levels.w;
+    var out = col;
+    let under = wl - p.y;
+    if (under > 0.0) {
+        let shallow = vec3<f32>(0.20, 0.45, 0.62);
+        let deep = vec3<f32>(0.02, 0.10, 0.26);
+        let t = clamp(under / max(params.levels.z, 1.0), 0.0, 1.0);
+        // Floor alpha 0.45 so the very top of the water column reads as water immediately below the line
+        // (a HARD edge, not a fade-in), deepening to mostly-water below.
+        out = mix(col, mix(shallow, deep, t), clamp(0.45 + 0.45 * t, 0.0, 0.9));
+    }
+    // Crisp bright waterline AT the level (~1.5 px via screen-space derivative of the cut-face height).
+    let w = max(fwidth(p.y) * 1.5, 1.0e-4);
+    let line = 1.0 - smoothstep(0.0, w, abs(p.y - wl));
+    return mix(out, vec3<f32>(0.70, 0.88, 0.98), line);
+}
+
 // Is the slice plane active and is world point `p` on the HIDDEN (near) side of it? Axis 0=X,1=Z,2=Y; the
 // plane coord is params.slice.y. We hide the half with coordinate < plane (the near half toward -axis).
 fn slice_hidden(p: vec3<f32>) -> bool {
@@ -285,7 +307,7 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
     let pe = eye + dir * t0;
     if (pe.y - hf_at(pe.xz).x <= 0.0) {
         var col = strata_face(pe);
-        col = apply_water(col, hf_at(pe.xz).x);
+        col = apply_water_face(col, pe);
         return vec4<f32>(col, 1.0);
     }
 
