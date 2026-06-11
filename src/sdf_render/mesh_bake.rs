@@ -787,10 +787,12 @@ fn bake_terrain_surface(
         for i in 0..bn {
             let wx = ox + (i as f64 + 0.5) * bstep;
             let s = crate::sdf_render::worldgen::biome::surface_biome(wx, wz, hifi.world_seed);
+            let temp = crate::sdf_render::worldgen::biome::temperature(wx, wz, hifi.world_seed) as f32;
             biome_texels.extend_from_slice(&TerrainSurfaceBake::pack_biome(
                 s.primary as u8,
                 s.secondary as u8,
                 s.blend,
+                temp,
             ));
         }
     }
