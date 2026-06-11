@@ -11,8 +11,12 @@ use egui_snarl::ui::{SnarlStyle, SnarlWidget};
 
 use crate::assets::Asset as _;
 use crate::editor::worldgen_gpu_preview::{GpuPreviewRequest, GpuPreviewRequests, GpuPreviewTextures};
-use crate::sdf_render::worldgen::WorldGraph;
-use crate::sdf_render::worldgen::graph::GraphAsset;
+use crate::sdf_render::worldgen::biome::BiomeId;
+use crate::sdf_render::worldgen::graph::{GraphAsset, preset};
+use crate::sdf_render::worldgen::{WorldBiomeShapes, WorldGraph};
+
+use super::ShapeTarget;
+use super::convert::graph_to_snarl;
 
 use super::convert::{
     breadcrumb_names, copy_selection, current_snarl_mut, paste_clipboard, valid_depth, world_biome_snarl,
@@ -23,6 +27,17 @@ use super::preview::{
 };
 use super::viewer::Viewer;
 use super::{ViewerSignals, WorldGraphEditor, auto_arrange, snarl_to_graph};
+
+/// Write a compiled engine graph into the editor's currently-selected shape slot — the default world graph
+/// ([`WorldGraph`]) or a per-biome SHAPE override ([`WorldBiomeShapes`]). `roll_worldgen` republishes the
+/// changed slot into every tier (the default via `set_graph`, a biome via `set_biome_shapes`).
+fn store_shape_slot(world: &mut World, target: ShapeTarget, g: crate::sdf_render::worldgen::graph::Graph) {
+    let arc = Arc::new(g);
+    match target {
+        ShapeTarget::Default => world.resource_mut::<WorldGraph>().0 = arc,
+        ShapeTarget::Biome(b) => world.resource_mut::<WorldBiomeShapes>().0[b as usize] = Some(arc),
+    }
+}
 
 pub(super) fn graph_panel(world: &mut World, ui: &mut egui::Ui) {
     // Seed the editor once by LOADING the graph from disk (the saved .worldgraph.ron / .graph.ron, falling
@@ -44,13 +59,46 @@ pub(super) fn graph_panel(world: &mut World, ui: &mut egui::Ui) {
             });
         }
 
+        // SHAPE-GRAPH TARGET — edit the default world graph OR a per-biome SHAPE override ("biomes own their
+        // terrain shape"). Switching writes the current snarl back to the old slot and loads the new one.
         ui.horizontal(|ui| {
-            // APPLY — rebuild the engine graph + push it live into the world (roll_worldgen re-meshes).
+            let mut target = editor.shape_target;
+            egui::ComboBox::from_label("Shape graph")
+                .selected_text(target.label())
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut target, ShapeTarget::Default, ShapeTarget::Default.label());
+                    for b in BiomeId::ALL {
+                        ui.selectable_value(&mut target, ShapeTarget::Biome(b), ShapeTarget::Biome(b).label());
+                    }
+                });
+            if target != editor.shape_target {
+                // Write the current snarl back to the OLD slot (so edits aren't lost on switch)…
+                if let Ok(g) = snarl_to_graph(&editor.snarl) {
+                    store_shape_slot(world, editor.shape_target, g);
+                }
+                // …then load the NEW slot into the editor (a fresh peaks preset if a biome has no graph yet).
+                let g = match target {
+                    ShapeTarget::Default => world.resource::<WorldGraph>().0.clone(),
+                    ShapeTarget::Biome(b) => world.resource::<WorldBiomeShapes>().0[b as usize]
+                        .clone()
+                        .unwrap_or_else(|| Arc::new(preset::biome_peaks_graph(700.0, 120.0))),
+                };
+                editor.snarl = graph_to_snarl(&g);
+                editor.nav.clear();
+                editor.clear_node_caches();
+                editor.needs_arrange = true;
+                editor.shape_target = target;
+                editor.status = format!("editing {}", target.label());
+            }
+        });
+
+        ui.horizontal(|ui| {
+            // APPLY — rebuild the engine graph + push it live into the world's selected shape slot.
             if ui.button("Apply").on_hover_text("Rebuild + drive the live world terrain from this graph").clicked() {
                 match snarl_to_graph(&editor.snarl) {
                     Ok(g) => {
-                        world.resource_mut::<WorldGraph>().0 = Arc::new(g);
-                        editor.status = "applied to world".into();
+                        store_shape_slot(world, editor.shape_target, g);
+                        editor.status = format!("applied to {}", editor.shape_target.label());
                     }
                     Err(e) => editor.status = format!("invalid: {e}"),
                 }
@@ -59,7 +107,11 @@ pub(super) fn graph_panel(world: &mut World, ui: &mut egui::Ui) {
             // the versioned editor document with biomes + view-state (.worldgraph.ron, so the hierarchy
             // AND where-the-user-was survive reload).
             if ui.button("Save").on_hover_text("Write the flat .graph.ron (world reloads it) + the .worldgraph.ron document").clicked() {
-                editor.status = match snarl_to_graph(&editor.snarl) {
+                editor.status = if editor.shape_target != ShapeTarget::Default {
+                    // Save/Load operate on the DEFAULT world graph (.graph.ron). Per-biome shapes are
+                    // session-live but not yet persisted (a follow-up) — switch to Default to save.
+                    "switch to the Default shape to save the world graph (per-biome shapes are session-only for now)".to_string()
+                } else { match snarl_to_graph(&editor.snarl) {
                     Ok(g) => {
                         let flat = (GraphAsset { graph: g }).save(std::path::Path::new(&editor.path));
                         let doc = world
@@ -71,13 +123,14 @@ pub(super) fn graph_panel(world: &mut World, ui: &mut egui::Ui) {
                         }
                     }
                     Err(e) => format!("invalid: {e}"),
-                };
+                } };
             }
             // LOAD — re-read the persisted document (snarl + view-state) and restore the editor + panel,
             // degrading to the flat graph / default exactly like the startup seed.
             if ui.button("Load").clicked() {
                 let (snarl, view) = load_editor_doc(&editor.path);
                 editor.snarl = snarl;
+                editor.shape_target = ShapeTarget::Default; // Load operates on the default world graph
                 editor.nav.clear();
                 editor.clear_node_caches();
                 editor.needs_arrange = true;
