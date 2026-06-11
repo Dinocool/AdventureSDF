@@ -158,7 +158,7 @@ fn volumetric_color(bio: vec3<f32>, depth: f32, boundary: f32) -> vec3<f32> {
 // `n` = the geometric/world surface normal (its .y = cos of the slope from vertical); `y` = world height;
 // `bio` = the biome sample (so snow only caps COLD biomes). Returns the treated colour. Tunable via
 // params.surf_a / surf_b (editor sliders); the master strength surf_b.z fades the whole treatment.
-fn surface_treatment(base: vec3<f32>, n: vec3<f32>, y: f32, temp: f32) -> vec3<f32> {
+fn surface_treatment(base: vec3<f32>, n: vec3<f32>, y: f32, cold: f32) -> vec3<f32> {
     let master = clamp(params.surf_b.z, 0.0, 1.0);
     if (master <= 0.0) { return base; }
     var col = base;
@@ -167,11 +167,9 @@ fn surface_treatment(base: vec3<f32>, n: vec3<f32>, y: f32, temp: f32) -> vec3<f
     // across all rolling ground at that height, not beaches. Desert sand comes from the biome's strata
     // surface material; real beaches need water-PROXIMITY, not a height band, and can be added later.)
 
-    // SNOW on high + COLD ground. Cold from the CONTINUOUS temperature field (bilinear `temp`), a smooth ramp
-    // → the snow line blends UNIFORMLY everywhere. The old discrete biome-id cold stepped with the climate
-    // gradient (sharp where steep, soft where gentle → hard snow edges on some sides only). cold = 1 below
-    // temp ≈ 0.30, → 0 by ≈ 0.46 (the Tundra/Snowy low-temperature range).
-    let cold = 1.0 - smoothstep(0.30, 0.46, temp);
+    // SNOW on high + COLD ground. `cold` is the WORLD-SPACE-normalised cold factor (computed in the fragment
+    // from temperature ÷ its gradient), so the snow line ramps over a constant width in METRES — uniformly
+    // smooth everywhere, regardless of how steep the climate gradient is on a given side.
     let snow = vec3<f32>(0.85, 0.88, 0.95);
     let snow_w = smoothstep(params.surf_a.z, params.surf_a.w, y) * cold;
     col = mix(col, snow, clamp(snow_w, 0.0, 1.0));
@@ -226,8 +224,17 @@ fn fragment(in: VertexOutput, @builtin(front_facing) is_front: bool) -> Fragment
     // strata on a dug wall are NOT snowed/sanded over. Tied to the first stratum thickness (~ boundary*2).
     let top_band = max(boundary * 2.0, 1.0);
     let top_w = 1.0 - smoothstep(0.0, top_band, max(depth, 0.0));
+    // SNOW cold factor, WORLD-SPACE normalised: ramp over a constant width in METRES (divide the temperature
+    // offset by |∇temperature|), so the snow line is uniformly smooth even where the climate gradient is
+    // steep (a plain temp threshold was sharp there → hard patches).
     let temp = sample_temp(uv);
-    let treated = surface_treatment(albedo, n_geo, in.world_position.y, temp);
+    let e = 1.0 / vec2<f32>(textureDimensions(biome_tex)).x;
+    let gx = sample_temp(uv + vec2<f32>(e, 0.0)) - sample_temp(uv - vec2<f32>(e, 0.0));
+    let gz = sample_temp(uv + vec2<f32>(0.0, e)) - sample_temp(uv - vec2<f32>(0.0, e));
+    let temp_grad = length(vec2<f32>(gx, gz)) / max(2.0 * e * params.chunk_size, 1e-4); // |∇temp| per metre
+    let snow_dist = (temp - 0.38) / max(temp_grad, 1e-9); // metres past the snow temp threshold (+ = warmer)
+    let cold = 1.0 - smoothstep(-150.0, 150.0, snow_dist); // ~300 m constant-width transition
+    let treated = surface_treatment(albedo, n_geo, in.world_position.y, cold);
     albedo = mix(albedo, treated, top_w);
 
     pbr_input.material.base_color = vec4<f32>(albedo, 1.0);
