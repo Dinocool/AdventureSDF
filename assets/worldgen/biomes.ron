@@ -1,0 +1,94 @@
+// Stage-1 terrain-materials demo biome library (see docs/TERRAIN_MATERIALS_PLAN.md).
+//
+// Flat LINEAR-RGBA colours (no textures this stage). `materials` is the palette; `TerrainMatId(i)`
+// indexes it. Each biome's column reads top→down: `strata[0]` is the surface band (depth 0), then the
+// sub-surface band, then a thick stone band; `bedrock` fills everything below to the world bedrock floor.
+//
+// Layer thicknesses follow the plan: surface ~1 m, sub-surface ~4 m, stone to the floor (1000 m here —
+// effectively "to bedrock"; the real bedrock floor is a world-Y, applied at lookup time in Stage 4).
+//
+// NOTE: colours are LINEAR; they look darker than the equivalent sRGB hex would. Picked low-ish so the
+// flat-lit demo reads naturally (e.g. grass ~ (0.05, 0.22, 0.05)).
+BiomeLibraryAsset(
+    materials: [
+        // 0  grass      — green
+        TerrainSurfaceMaterial(name: "grass",       base_color: (0.05, 0.22, 0.04, 1.0), roughness: 0.95),
+        // 1  grass_dark — darker forest green
+        TerrainSurfaceMaterial(name: "grass_dark",  base_color: (0.03, 0.13, 0.03, 1.0), roughness: 0.95),
+        // 2  dirt       — brown
+        TerrainSurfaceMaterial(name: "dirt",        base_color: (0.12, 0.07, 0.03, 1.0), roughness: 1.0),
+        // 3  stone      — grey
+        TerrainSurfaceMaterial(name: "stone",       base_color: (0.18, 0.18, 0.19, 1.0), roughness: 0.9),
+        // 4  bedrock    — near-black
+        TerrainSurfaceMaterial(name: "bedrock",     base_color: (0.02, 0.02, 0.025, 1.0), roughness: 0.85),
+        // 5  sand       — tan
+        TerrainSurfaceMaterial(name: "sand",        base_color: (0.62, 0.50, 0.27, 1.0), roughness: 1.0),
+        // 6  sandstone  — pale orange
+        TerrainSurfaceMaterial(name: "sandstone",   base_color: (0.45, 0.30, 0.15, 1.0), roughness: 0.95),
+        // 7  tundra     — pale khaki
+        TerrainSurfaceMaterial(name: "tundra",      base_color: (0.28, 0.27, 0.18, 1.0), roughness: 1.0),
+        // 8  permafrost — blue-grey
+        TerrainSurfaceMaterial(name: "permafrost",  base_color: (0.16, 0.19, 0.24, 1.0), roughness: 0.9),
+        // 9  snow       — white
+        TerrainSurfaceMaterial(name: "snow",        base_color: (0.85, 0.88, 0.95, 1.0), roughness: 0.7),
+        // 10 rock       — grey (steeper/exposed)
+        TerrainSurfaceMaterial(name: "rock",        base_color: (0.13, 0.13, 0.14, 1.0), roughness: 0.85),
+    ],
+    biomes: [
+        // 0 Plains: grass -> dirt -> stone -> bedrock
+        BiomeDef(
+            name: "Plains",
+            surface: TerrainMatId(0),
+            strata: [
+                StrataLayer(material: TerrainMatId(0), thickness: 1.0),    // grass
+                StrataLayer(material: TerrainMatId(2), thickness: 4.0),    // dirt
+                StrataLayer(material: TerrainMatId(3), thickness: 1000.0), // stone
+            ],
+            bedrock: TerrainMatId(4),
+        ),
+        // 1 Forest: grass_dark -> dirt -> stone -> bedrock
+        BiomeDef(
+            name: "Forest",
+            surface: TerrainMatId(1),
+            strata: [
+                StrataLayer(material: TerrainMatId(1), thickness: 1.0),    // grass_dark
+                StrataLayer(material: TerrainMatId(2), thickness: 4.0),    // dirt
+                StrataLayer(material: TerrainMatId(3), thickness: 1000.0), // stone
+            ],
+            bedrock: TerrainMatId(4),
+        ),
+        // 2 Desert: sand -> sandstone -> stone -> bedrock
+        BiomeDef(
+            name: "Desert",
+            surface: TerrainMatId(5),
+            strata: [
+                StrataLayer(material: TerrainMatId(5), thickness: 1.0),    // sand
+                StrataLayer(material: TerrainMatId(6), thickness: 4.0),    // sandstone
+                StrataLayer(material: TerrainMatId(3), thickness: 1000.0), // stone
+            ],
+            bedrock: TerrainMatId(4),
+        ),
+        // 3 Tundra: tundra -> permafrost -> stone -> bedrock
+        BiomeDef(
+            name: "Tundra",
+            surface: TerrainMatId(7),
+            strata: [
+                StrataLayer(material: TerrainMatId(7), thickness: 1.0),    // tundra
+                StrataLayer(material: TerrainMatId(8), thickness: 4.0),    // permafrost
+                StrataLayer(material: TerrainMatId(3), thickness: 1000.0), // stone
+            ],
+            bedrock: TerrainMatId(4),
+        ),
+        // 4 Snowy: snow -> rock -> stone -> bedrock
+        BiomeDef(
+            name: "Snowy",
+            surface: TerrainMatId(9),
+            strata: [
+                StrataLayer(material: TerrainMatId(9), thickness: 1.0),    // snow
+                StrataLayer(material: TerrainMatId(10), thickness: 4.0),   // rock
+                StrataLayer(material: TerrainMatId(3), thickness: 1000.0), // stone
+            ],
+            bedrock: TerrainMatId(4),
+        ),
+    ],
+)
