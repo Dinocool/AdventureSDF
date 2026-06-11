@@ -302,6 +302,16 @@ fn preview_color_is_base_color_for_flat_materials() {
 /// The flattened GPU strata table matches `BiomeLibrary` row-for-row: one column per biome in id order,
 /// surface/bedrock/layer colours resolved through `preview_color`, and cumulative layer bottoms equal to
 /// the running sum of `StrataLayer::thickness` — i.e. a depth probe of the table reproduces
+/// An EMPTY/unloaded `BiomeLibrary` (its `Default`, before `biomes.ron` finishes loading) must flatten to
+/// a zeroed table of the right length — NOT panic indexing the empty `biomes` Vec. This was a launch crash:
+/// `sync_terrain_detail_params` + the preview flatten the library every frame from startup.
+#[test]
+fn gpu_strata_table_on_empty_library_is_zeroed_not_panic() {
+    let table = BiomeLibrary::default().gpu_strata_table();
+    assert_eq!(table.len(), BiomeId::ALL.len());
+    assert!(table.iter().all(|c| *c == super::GpuStrataColumn::default()));
+}
+
 /// `strata_material → preview_color` exactly.
 #[test]
 fn gpu_strata_table_matches_library() {
