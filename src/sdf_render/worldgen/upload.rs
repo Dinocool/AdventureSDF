@@ -661,6 +661,17 @@ impl TerrainHifi {
         let n = self.layer.sample_world(wx, wz, self.world_seed);
         (n.dh_dx, n.dh_dz)
     }
+
+    /// The PRISTINE surface HEIGHT and slope at world `(wx, wz)` in ONE `sample_world` eval — the
+    /// terrain-surface bake (Stages 2+3) needs both the height (the depth reference `depth = surf_h − y`)
+    /// AND the slope (the detail normal), and `sample_world` returns them together, so this avoids a second
+    /// eval. Returns `(height, dh_dx, dh_dz)`. Pure / deterministic / bit-portable. NOT keyed by
+    /// `HEIGHT_GEN_VERSION` — it's the same `sample_world` the clipmap meshes against, read for rendering.
+    #[inline]
+    pub fn surface(&self, wx: f64, wz: f64) -> (f32, f32, f32) {
+        let n = self.layer.sample_world(wx, wz, self.world_seed);
+        (n.height, n.dh_dx, n.dh_dz)
+    }
 }
 
 /// Process-global snapshot of the tier-0 terrain hi-fi sampler — the sibling of [`CPU_HEIGHT_CLIPMAP`]

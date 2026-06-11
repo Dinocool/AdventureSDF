@@ -76,11 +76,11 @@ struct ChunkMeshData {
     uvs: Vec<[f32; 2]>,
     colors: Vec<[f32; 4]>,
     indices: Vec<u32>,
-    /// For a COARSE terrain-only chunk: the baked per-chunk DETAIL-NORMAL map (the fine surface slope at
-    /// `N²` texels over the chunk's world-XZ footprint). `Some` ⇒ commit spawns the chunk with a dedicated
-    /// `TerrainMaterial` (per-pixel hi-fi shading); `None` ⇒ the chunk keeps the shared mesh material (near
-    /// terrain already has full geometric detail, mixed/object chunks are unaffected).
-    detail_normal: Option<super::terrain_material::DetailNormalBake>,
+    /// For a TERRAIN-ONLY chunk: the baked per-chunk surface maps (volumetric biome strata + pristine
+    /// surface height + the coarse-gated detail normal, over the chunk's world-XZ footprint). `Some` ⇒
+    /// commit spawns the chunk with a dedicated `TerrainMaterial` (per-fragment biome strata + PBR);
+    /// `None` ⇒ the chunk keeps the shared mesh material (mixed/object/CSG-cave chunks — no biome strata v1).
+    terrain_surface: Option<super::terrain_material::TerrainSurfaceBake>,
 }
 
 /// A completed bake for a chunk's round target, held until the coherent COMMIT (`None` = empty chunk).
@@ -178,6 +178,13 @@ pub(crate) struct MeshBakeConfig {
     /// DETAIL-NORMAL strength in `[0, 1]`: how far the per-pixel baked hi-fi normal pulls the coarse geometry
     /// normal (0 = no detail, 1 = full hi-fi detail). A LIVE shader uniform — no re-bake on change.
     pub(crate) detail_normal_strength: f32,
+    /// BIOME map resolution (`N×N`) baked per terrain-only chunk (Stage 2). Biome is LOW-FREQUENCY
+    /// (km-scale climate fields), so a small map suffices; it indexes the strata table per fragment.
+    /// Changing it re-bakes (the texel data changes).
+    pub(crate) biome_res: u32,
+    /// SURFACE-TREATMENT master strength `[0,1]` for the top (undug) layer (snow/sand/rock overrides): 0 =
+    /// pure strata surface colour, 1 = full treatment. A LIVE shader uniform — no re-bake on change.
+    pub(crate) surface_treatment: f32,
 }
 
 /// The clipmap's finest node spacing (the tier-0 height grid). A terrain-only chunk whose voxel size is at
@@ -205,6 +212,11 @@ impl Default for MeshBakeConfig {
             // Tune via the editor slider (down for cheaper, up to 512 for finer) when iterating on the look.
             detail_normal_res: 256,
             detail_normal_strength: 1.0,
+            // 16×16 biome map per chunk: biome is km-scale (CLIMATE_WAVELENGTH_M ≈ 8 km), so even a far
+            // LOD chunk's footprint spans a small fraction of a biome cell → 16 texels resolve the
+            // primary/secondary/blend with room to spare. Cheap (256 classifier calls/chunk).
+            biome_res: 16,
+            surface_treatment: 1.0,
         }
     }
 }
@@ -611,8 +623,11 @@ fn mesh_chunk(
     // CSG central-difference normal.
     terrain_only: bool,
     // DETAIL-NORMAL bake resolution (`N`): a COARSE terrain-only chunk additionally bakes an `N×N`
-    // surface-slope map (gated below). 0 disables the detail bake.
+    // surface-slope map (gated below). 0 disables the detail bake (height/biome still bake at `detail_res`/
+    // a floor; see `bake_terrain_surface`).
     detail_res: u32,
+    // BIOME map resolution (`N`): the per-chunk low-res biome (primary/secondary/blend) map.
+    biome_res: u32,
 ) -> Option<ChunkMeshData> {
     // Install THIS ROUND'S frozen Terrain clipmap snapshot ONCE on the bake thread (held for the whole
     // bake), so every field sample reads it via a thread-local borrow instead of a process-global RwLock +
@@ -665,66 +680,118 @@ fn mesh_chunk(
     // transition so the cross-LOD weld fails. The analytic CSG field is cheap to re-evaluate, so just query it.
     let builder = extract_from_field(&field, FieldCaching::CacheNothing, block, sides, 0.0, builder);
     let mut data = builder.finish()?;
-    // DETAIL-NORMAL bake (terrain-only coarse chunks): sample the FINE band-limited surface slope at N²
-    // texel centres over the chunk's world-XZ footprint → a per-chunk normal map. Gated to coarse LODs (the
-    // cost-bound + the only place it helps); the per-bake hi-fi snapshot is the SAME terrain the clipmap was
+    // TERRAIN-SURFACE bake (terrain-only chunks): over the chunk's world-XZ footprint, sample the PRISTINE
+    // surface height (depth reference) + the fine surface slope (detail normal, coarse-gated) + the biome
+    // (low-res Whittaker classification). The per-bake hi-fi snapshot is the SAME terrain the clipmap was
     // built from. Attached to the mesh data; the commit turns it into the chunk's `TerrainMaterial`.
-    data.detail_normal = bake_detail_normal(grid_origin, subdivisions as f32 * vs, vs, terrain_only, detail_res);
+    data.terrain_surface =
+        bake_terrain_surface(grid_origin, subdivisions as f32 * vs, vs, terrain_only, detail_res, biome_res);
     Some(data)
 }
 
 /// One-shot latch so the detail-normal LOD-gate log line prints only on the first gated chunk (never silent).
 static DETAIL_GATE_LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// Bake a COARSE terrain-only chunk's per-chunk DETAIL-NORMAL map: an `N×N` grid of the FINE (mip-0-scale)
-/// band-limited surface slope `(dh/dx, dh/dz)` sampled at TEXEL CENTRES over the chunk's world-XZ footprint
-/// (`[chunk_min, chunk_min + chunk_world]`), stored as `Rg16Float` bytes. The texel world step
-/// (`chunk_world / N`) is far finer than the coarse vertex spacing (`vs`), so the shader reconstructs the
-/// hi-fi surface normal per pixel — detail the averaged geometry lost. Returns `None` (no map) when:
-/// not a terrain-only chunk; `N < 2`; the chunk is FINE (`vs ≤` the clipmap's finest node spacing — its
-/// geometry already carries mip-0 detail, the LOD gate, logged once); or no hi-fi terrain source is
-/// installed. Uses the per-bake [`bake_terrain_hifi`] snapshot (no global lock) for the slope source.
-fn bake_detail_normal(
+/// Floor resolution for the surface-height grid when the detail-normal bake is disabled (`detail_res < 2`)
+/// but a terrain-only chunk still needs a height (depth-reference) map. Height is smooth, so a small grid
+/// suffices for the volumetric strata depth lookup even without detail normals.
+const TERRAIN_HEIGHT_FALLBACK_RES: u32 = 32;
+
+/// Bake a TERRAIN-ONLY chunk's per-chunk surface maps (Stages 2+3). Over the chunk's world-XZ footprint
+/// (`[chunk_min, chunk_min + chunk_world]`), at TEXEL CENTRES (`(i + 0.5)·step`, matching the shader's
+/// lookup):
+/// - **surface height** `h(x,z)` (`R32Float`, `detail_grid²`): the PRISTINE `sample_world` height — the
+///   depth reference (`depth = surf_h − world.y`). Baked on EVERY terrain-only chunk.
+/// - **detail normal** `(dh/dx, dh/dz)` (`Rg16Float`, same grid): the fine band-limited slope. GATED to
+///   COARSE chunks — fine chunks (`vs ≤ DETAIL_NORMAL_FINEST_SPACING`) already carry mip-0 relief in their
+///   geometry, so their detail map is ZERO-FILLED (all-zero slope ⇒ the shader uses the geometry normal),
+///   bounding the `N²` gradient cost to coarse chunks while every terrain chunk still gets strata/height.
+///   (Both come from ONE `sample_world` eval/texel via [`TerrainHifi::surface`], so the height is free.)
+/// - **biome** `(primary, secondary, blend)` (`Rgba16Float`, `biome_res²`): the Stage-1 Whittaker
+///   classifier per texel (low-res — biome is km-scale).
+///
+/// Returns `None` (the chunk keeps the shared mesh material) when it is not terrain-only or no hi-fi terrain
+/// source is installed. Uses the per-bake [`bake_terrain_hifi`] snapshot (no global lock) + its `world_seed`
+/// for the biome classification (a RENDER attribute — NOT keyed by `HEIGHT_GEN_VERSION`).
+fn bake_terrain_surface(
     grid_origin: Vec3,
     chunk_world: f32,
     vs: f32,
     terrain_only: bool,
     detail_res: u32,
-) -> Option<super::terrain_material::DetailNormalBake> {
-    use super::terrain_material::DetailNormalBake;
-    if !terrain_only || detail_res < 2 {
-        return None;
-    }
-    // LOD GATE: only coarse chunks (voxel coarser than the finest 2 m node grid) get a baked map — fine
-    // chunks already have full geometric detail. Logged ONCE so the cap is visible, never silent.
-    if vs <= DETAIL_NORMAL_FINEST_SPACING {
-        if !DETAIL_GATE_LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
-            bevy::log::info!(
-                "worldgen detail-normal: per-chunk normal maps GATED to coarse terrain LODs \
-                 (voxel_size > finest node spacing {DETAIL_NORMAL_FINEST_SPACING} m); fine chunks already \
-                 carry full mip-0 relief in their geometry — bounds the per-chunk Image/material count + \
-                 the N² gradient bake cost."
-            );
-        }
+    biome_res: u32,
+) -> Option<super::terrain_material::TerrainSurfaceBake> {
+    use super::terrain_material::TerrainSurfaceBake;
+    if !terrain_only {
         return None;
     }
     let (hifi, offset) = crate::sdf_render::worldgen::upload::bake_terrain_hifi()?;
-    let n = detail_res;
+
+    // DETAIL-NORMAL LOD GATE: only coarse chunks bake real slopes; fine chunks zero-fill (geometry normal).
+    // Logged ONCE so the cap is visible, never silent.
+    let detail_enabled = detail_res >= 2 && vs > DETAIL_NORMAL_FINEST_SPACING;
+    if !detail_enabled && vs <= DETAIL_NORMAL_FINEST_SPACING
+        && !DETAIL_GATE_LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed)
+    {
+        bevy::log::info!(
+            "worldgen terrain-surface: per-chunk DETAIL-NORMAL maps GATED to coarse terrain LODs \
+             (voxel_size > finest node spacing {DETAIL_NORMAL_FINEST_SPACING} m); fine chunks already carry \
+             full mip-0 relief in their geometry. Biome strata + surface height STILL bake on every terrain \
+             chunk (the strata render everywhere)."
+        );
+    }
+
+    // The detail/height grid: `detail_res` when the detail bake is on, else a small height-only floor.
+    let n = if detail_res >= 2 { detail_res } else { TERRAIN_HEIGHT_FALLBACK_RES };
     let chunk_min = Vec2::new(grid_origin.x, grid_origin.z);
-    // World-XZ minimum + texel size; sample at TEXEL CENTRES (`(i + 0.5)·step`) so the map represents the
-    // slope at the texel's footprint centre (matching the shader's bilinear lookup at fragment world XZ).
     let step = (chunk_world / n as f32) as f64;
     let (ox, oz) = ((chunk_min.x + offset.x) as f64, (chunk_min.y + offset.y) as f64);
-    let mut texels = Vec::with_capacity((n * n * 4) as usize);
+
+    let mut detail_texels = Vec::with_capacity((n * n * 4) as usize);
+    let mut height_texels = Vec::with_capacity((n * n * 4) as usize);
     for j in 0..n {
         let wz = oz + (j as f64 + 0.5) * step;
         for i in 0..n {
             let wx = ox + (i as f64 + 0.5) * step;
-            let (dhdx, dhdz) = hifi.slope(wx, wz);
-            texels.extend_from_slice(&DetailNormalBake::pack_texel(dhdx, dhdz));
+            // ONE eval yields BOTH the height (depth reference) and the slope (detail normal).
+            let (h, dhdx, dhdz) = hifi.surface(wx, wz);
+            height_texels.extend_from_slice(&h.to_le_bytes());
+            if detail_enabled {
+                detail_texels.extend_from_slice(&TerrainSurfaceBake::pack_slope(dhdx, dhdz));
+            } else {
+                detail_texels.extend_from_slice(&TerrainSurfaceBake::pack_slope(0.0, 0.0));
+            }
         }
     }
-    Some(DetailNormalBake { res: n, chunk_min, chunk_size: chunk_world, texels })
+
+    // BIOME map: the Whittaker classifier (CPU SSOT) per texel over the SAME footprint, low-res. Uses the
+    // hi-fi snapshot's world seed so the in-world biome placement matches the preview's.
+    let bn = biome_res.max(2);
+    let bstep = (chunk_world / bn as f32) as f64;
+    let mut biome_texels = Vec::with_capacity((bn * bn * 8) as usize);
+    for j in 0..bn {
+        let wz = oz + (j as f64 + 0.5) * bstep;
+        for i in 0..bn {
+            let wx = ox + (i as f64 + 0.5) * bstep;
+            let s = crate::sdf_render::worldgen::biome::surface_biome(wx, wz, hifi.world_seed);
+            biome_texels.extend_from_slice(&TerrainSurfaceBake::pack_biome(
+                s.primary as u8,
+                s.secondary as u8,
+                s.blend,
+            ));
+        }
+    }
+
+    Some(TerrainSurfaceBake {
+        detail_present: detail_enabled,
+        detail_res: n,
+        biome_res: bn,
+        chunk_min,
+        chunk_size: chunk_world,
+        detail_texels,
+        height_texels,
+        biome_texels,
+    })
 }
 
 /// `MeshBuilder` that turns Transvoxel's per-edge vertices into our `ChunkMeshData`: chunk-LOCAL positions,
@@ -867,7 +934,7 @@ impl<'a> ChunkMeshBuilder<'a> {
                 indices.push(n);
             }
         }
-        Some(ChunkMeshData { positions, normals, uvs, colors, indices, detail_normal: None })
+        Some(ChunkMeshData { positions, normals, uvs, colors, indices, terrain_surface: None })
     }
 }
 
@@ -974,29 +1041,46 @@ fn chunk_has_surface(
     edits::fold_csg_dist_indexed(edits, indices, center, vs).abs() <= reach
 }
 
-/// Push the LIVE `detail_normal_strength` + `debug_normals` config into EVERY per-chunk `TerrainMaterial`
-/// uniform whenever the config changes, so the strength slider + the "View normals" debug are live (no
-/// re-bake) — the materials are baked with a snapshot of these at spawn, this keeps them in sync after. Only
-/// runs on a config change and only touches materials whose value differs (cheap; no churn at rest).
+/// Push the LIVE shader-uniform config (`detail_normal_strength`, `debug_normals`, `surface_treatment`) AND
+/// the hot-reloadable strata table into EVERY per-chunk `TerrainMaterial` whenever the mesh-bake config OR
+/// the biome library changes — so the strength/treatment sliders + "View normals" debug + a `biomes.ron`
+/// edit are LIVE (no re-bake). Materials are baked with a snapshot of these at spawn; this keeps them in
+/// sync. Runs only on a change; for the scalar uniforms it touches only materials whose value differs
+/// (cheap, no churn at rest). When the library changes, the strata table is re-flattened ONCE (the shared
+/// SSOT flatten) and pushed to all terrain materials.
 fn sync_terrain_detail_params(
     cfg: Res<MeshBakeConfig>,
+    biome_lib: Res<super::worldgen::biome::BiomeLibrary>,
     mut mats: ResMut<Assets<super::terrain_material::TerrainMaterial>>,
 ) {
-    if !cfg.is_changed() {
+    let cfg_changed = cfg.is_changed();
+    let lib_changed = biome_lib.is_changed();
+    if !cfg_changed && !lib_changed {
         return;
     }
-    let (strength, debug) = (cfg.detail_normal_strength, cfg.debug_normals as u32);
-    // `iter_mut` marks each touched asset changed (re-uploads its uniform); guard so we only mark the ones
-    // that actually differ, avoiding a needless GPU re-upload of every terrain chunk on an unrelated edit.
+    let (strength, debug, treatment) =
+        (cfg.detail_normal_strength, cfg.debug_normals as u32, cfg.surface_treatment);
+    // Re-flatten the strata table only when the library changed (the shared SSOT flatten).
+    let strata = lib_changed.then(|| super::worldgen::biome::StrataTableStd::from_library(&biome_lib));
+    // Touch a material if any live scalar differs OR the library changed (the table must be re-pushed).
     let ids: Vec<_> = mats
         .iter()
-        .filter(|(_, m)| m.extension.params.strength != strength || m.extension.params.flags.x != debug)
+        .filter(|(_, m)| {
+            lib_changed
+                || m.extension.params.strength != strength
+                || m.extension.params.flags.x != debug
+                || m.extension.params.surf_b.z != treatment
+        })
         .map(|(id, _)| id)
         .collect();
     for id in ids {
         if let Some(m) = mats.get_mut(id) {
             m.extension.params.strength = strength;
             m.extension.params.flags.x = debug;
+            m.extension.params.surf_b.z = treatment;
+            if let Some(table) = strata {
+                m.extension.strata = table;
+            }
         }
     }
 }
@@ -1012,17 +1096,21 @@ struct SpawnAssets<'a> {
     /// Live detail-normal strength (shader uniform) + debug-normals flag, from `MeshBakeConfig`.
     detail_strength: f32,
     debug_normals: bool,
+    /// The shared per-biome strata table (flattened from the live `BiomeLibrary`), baked into each
+    /// terrain-only chunk's `TerrainMaterial`. Hot-reload of `biomes.ron` re-syncs it (see
+    /// [`sync_terrain_detail_params`]).
+    strata: super::worldgen::biome::StrataTableStd,
 }
 
 /// Spawn one chunk-mesh entity from baked data — the single SSOT used by BOTH the immediate terrain commit
 /// and the round commit. Transvoxel positions are chunk-LOCAL relative to the chunk's world MIN corner (no
 /// apron), so the entity `Transform` is exactly `brick_min_world`; one entity per chunk.
 ///
-/// A COARSE terrain-only chunk that baked a DETAIL-NORMAL map (`data.detail_normal = Some`) is spawned with
-/// a DEDICATED per-chunk `TerrainMaterial` (the baked `Rg16Float` slope map → per-pixel hi-fi shading). The
-/// per-chunk `Image` + material handles are parked on the entity via [`TerrainDetailAssets`] + `MeshMaterial3d`
-/// so they're FREED when the entity despawns (the same ref-counted lifecycle as the mesh). Every OTHER chunk
-/// (near terrain, mixed/object) keeps the single shared triplanar `MeshMaterial`.
+/// A TERRAIN-ONLY chunk that baked a surface payload (`data.terrain_surface = Some`) is spawned with a
+/// DEDICATED per-chunk `TerrainMaterial` (volumetric biome strata + per-fragment depth + PBR). The per-chunk
+/// `Image`s + material handles are parked on the entity via [`TerrainDetailAssets`] + `MeshMaterial3d` so
+/// they're FREED when the entity despawns (the same ref-counted lifecycle as the mesh). Every OTHER chunk
+/// (mixed/object/CSG-cave) keeps the single shared triplanar `MeshMaterial`.
 fn spawn_chunk_mesh(
     commands: &mut Commands,
     assets: &mut SpawnAssets,
@@ -1032,7 +1120,7 @@ fn spawn_chunk_mesh(
 ) -> Entity {
     use super::terrain_material::{self, TerrainDetailAssets};
     let origin = config.brick_min_world(key.coord, key.lod);
-    let detail = data.detail_normal;
+    let surface = data.terrain_surface;
     let mesh = Mesh::new(PrimitiveTopology::TriangleList, RenderAssetUsages::default())
         .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, data.positions)
         .with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, data.normals)
@@ -1045,20 +1133,25 @@ fn spawn_chunk_mesh(
         ChunkMesh(key),
         Name::new("SDF Chunk Mesh"),
     ));
-    if let Some(bake) = detail {
-        // Coarse terrain-only chunk: dedicated per-chunk detail-normal material. Strong handles to the image
-        // AND the material live on the entity (in `MeshMaterial3d` + `TerrainDetailAssets`) → both assets are
-        // freed when this entity despawns on evict/rebuild (no leak).
-        let image = assets.images.add(terrain_material::make_detail_image(&bake));
+    if let Some(bake) = surface {
+        // Terrain-only chunk: dedicated per-chunk terrain-surface material (volumetric biome strata + PBR).
+        // Strong handles to the 3 per-chunk images AND the material live on the entity (in `MeshMaterial3d` +
+        // `TerrainDetailAssets`) → all are freed when this entity despawns on evict/rebuild (no leak).
+        let detail_normal = assets.images.add(terrain_material::make_detail_image(&bake));
+        let surface_height = assets.images.add(terrain_material::make_height_image(&bake));
+        let biome = assets.images.add(terrain_material::make_biome_image(&bake));
         let mat = assets.terrain_mats.add(terrain_material::make_terrain_material(
-            image.clone(),
+            detail_normal.clone(),
+            surface_height.clone(),
+            biome.clone(),
             &bake,
             assets.detail_strength,
             assets.debug_normals,
+            assets.strata,
         ));
         ent.insert((
             MeshMaterial3d(mat.clone()),
-            TerrainDetailAssets { material: mat, image },
+            TerrainDetailAssets { material: mat, detail_normal, surface_height, biome },
         ));
     } else {
         ent.insert(MeshMaterial3d(assets.mesh_mats.handle.clone()));
@@ -1137,6 +1230,9 @@ fn mesh_resident_chunks(
     // The single shared triplanar `MeshMaterial` handle (built by `mesh_material::rebuild_mesh_material`);
     // EVERY chunk mesh uses it — the per-vertex ids + blend weight select/cross-fade materials in-shader.
     mesh_mats: Res<super::mesh_material::MeshMaterials>,
+    // The live biome library → flattened into the shared strata GPU table baked into each terrain-only
+    // chunk's `TerrainMaterial` (Stage 3). Hot-reload re-syncs existing materials (`sync_terrain_detail_params`).
+    biome_lib: Res<super::worldgen::biome::BiomeLibrary>,
     // Bundled scalar Locals: rebake epoch, prev K.
     mut scal: Local<MeshBakeScalars>,
     // The in-progress bake round's frozen edit + clipmap snapshot.
@@ -1375,6 +1471,7 @@ fn mesh_resident_chunks(
         mesh_mats: &mesh_mats,
         detail_strength: mesh_cfg.detail_normal_strength,
         debug_normals: mesh_cfg.debug_normals,
+        strata: super::worldgen::biome::StrataTableStd::from_library(&biome_lib),
     };
 
     // 1b. IMMEDIATE TERRAIN COMMIT: a terrain-only chunk is an independent world-anchored surface with NO
@@ -1504,8 +1601,10 @@ fn mesh_resident_chunks(
         let mut budget = MAX_NEW_TASKS_PER_FRAME;
         let mut idx: Vec<u32> = Vec::new();
         let debug = mesh_cfg.debug_lod_colour;
-        // Detail-normal bake resolution forwarded to each terrain-only coarse chunk's task (0 ⇒ disabled).
+        // Terrain-surface bake resolutions forwarded to each terrain-only chunk's task (detail_res 0 ⇒
+        // detail-normal disabled; height/biome still bake).
         let detail_res = mesh_cfg.detail_normal_res;
+        let biome_res = mesh_cfg.biome_res;
         // Install the round's FROZEN clipmap snapshot on THIS (system) thread for the whole REQUEST loop, so
         // the SYNCHRONOUS narrow-band cull below (`chunk_has_surface` → `terrain_sdf`) samples the EXACT
         // clipmap whose coverage gate admitted this round's residency — the SAME snapshot the async
@@ -1566,7 +1665,7 @@ fn mesh_resident_chunks(
             st.task = Some(pool.spawn(async move {
                 mesh_chunk(
                     &edits, &indices, grid_origin, vs_l, k * cs, flags, lod, debug, terrain, is_terrain,
-                    detail_res,
+                    detail_res, biome_res,
                 )
             }));
             budget -= 1;
@@ -1684,6 +1783,29 @@ fn mesh_bake_panel(world: &mut World, ui: &mut bevy_egui::egui::Ui) {
         .changed()
     {
         world.resource_mut::<MeshBakeConfig>().detail_normal_strength = dstr;
+    }
+    // BIOME STRATA (Stages 2+3): the volumetric biome strata render on every terrain-only chunk. "Biome map
+    // res" = the per-chunk N×N biome (primary/secondary/blend) classification resolution (RE-BAKES; biome is
+    // low-frequency so a small map suffices). "Surface treatment" = how strongly the top undug layer is
+    // overridden by slope/height/biome (rock on cliffs, snow high+cold, sand near sea level) — LIVE uniform.
+    let mut bres = world.resource::<MeshBakeConfig>().biome_res;
+    if ui
+        .add(bevy_egui::egui::Slider::new(&mut bres, 2..=64).text("Biome map res"))
+        .on_hover_text("N×N per-chunk biome (primary/secondary/blend) map resolution. Biome is km-scale, so \
+                        small is plenty. Changing it re-bakes the terrain.")
+        .changed()
+    {
+        world.resource_mut::<MeshBakeConfig>().biome_res = bres;
+        world.resource_mut::<MeshBakeRebuild>().0 = true;
+    }
+    let mut treat = world.resource::<MeshBakeConfig>().surface_treatment;
+    if ui
+        .add(bevy_egui::egui::Slider::new(&mut treat, 0.0..=1.0).text("Surface treatment"))
+        .on_hover_text("Strength of the top-layer surface treatment (snow high+cold, rock on steep slopes, \
+                        sand near sea level). 0 = pure biome surface colour, 1 = full treatment. Live uniform.")
+        .changed()
+    {
+        world.resource_mut::<MeshBakeConfig>().surface_treatment = treat;
     }
     let mut freeze = world.resource::<MeshBakeConfig>().freeze_lod;
     if ui
@@ -1943,7 +2065,7 @@ mod tests {
         let edits = [sphere_edit(Vec3::ZERO, 1.0)];
         let (vs, sub) = (0.1f32, 28u32); // block span = 28·0.1 = 2.8 > sphere Ø 2.0 → clears all faces
         let origin = Vec3::splat(-1.4);
-        let data = mesh_chunk(&edits, &[0], origin, vs, sub, 0, 0, false, None, false, 0).expect("sphere meshes");
+        let data = mesh_chunk(&edits, &[0], origin, vs, sub, 0, 0, false, None, false, 0, 0).expect("sphere meshes");
         assert_eq!(open_edge_count(&chunk_tris(&data, origin)), 0, "closed sphere must be watertight");
     }
 
@@ -1963,8 +2085,8 @@ mod tests {
         let (vsf, vsc, sub) = (0.1f32, 0.2f32, 28u32);
         let of = Vec3::new(0.0, -1.4, -1.4); // fine x∈[0,2.8]; −X face at x=0 (regular, high-res)
         let oc = Vec3::new(-5.6, -2.8, -2.8); // coarse x∈[−5.6,0]; +X face at x=0 is the transition side
-        let fine = mesh_chunk(&edits, &idx, of, vsf, sub, 0, 0, false, None, false, 0).expect("fine meshes");
-        let coarse = mesh_chunk(&edits, &idx, oc, vsc, sub, 1 << 1, 1, false, None, false, 0).expect("coarse meshes");
+        let fine = mesh_chunk(&edits, &idx, of, vsf, sub, 0, 0, false, None, false, 0, 0).expect("fine meshes");
+        let coarse = mesh_chunk(&edits, &idx, oc, vsc, sub, 1 << 1, 1, false, None, false, 0, 0).expect("coarse meshes");
         let mut all = chunk_tris(&fine, of);
         all.extend(chunk_tris(&coarse, oc));
         assert_eq!(
@@ -2166,9 +2288,9 @@ mod tests {
         // Bake: fine = LOD 0, regular; coarse = LOD 1 with +X (HighX = bit 1) transition. `terrain_only =
         // true` ⇒ analytic stored-gradient normals (the smooth normal the LOD seam is judged on). Pass the
         // published clipmap as `mesh_chunk`'s `terrain` param (installed as the per-bake thread-local).
-        let fine = mesh_chunk(&edits_v, &idx, of, vsf, sub_f, 0, 0, false, Some(clip.clone()), true, 0)
+        let fine = mesh_chunk(&edits_v, &idx, of, vsf, sub_f, 0, 0, false, Some(clip.clone()), true, 0, 0)
             .expect("fine terrain chunk meshes");
-        let coarse = mesh_chunk(&edits_v, &idx, oc, vsc, sub, 1 << 1, 1, false, Some(clip.clone()), true, 0)
+        let coarse = mesh_chunk(&edits_v, &idx, oc, vsc, sub, 1 << 1, 1, false, Some(clip.clone()), true, 0, 0)
             .expect("coarse terrain chunk meshes");
 
         // (a) GEOMETRIC: fine ∪ coarse must weld watertight across the shared x=0 seam — no gap / overlap.
@@ -2237,7 +2359,7 @@ mod tests {
 
         // Bake the coarse chunk WITH the +X transition (matching the watertight harness). terrain_only ⇒
         // analytic stored-gradient normals (the smooth normal the surface morph is judged on).
-        let coarse = mesh_chunk(&edits_v, &idx, oc, vsc, sub, 1 << 1, 1, false, Some(clip.clone()), true, 0)
+        let coarse = mesh_chunk(&edits_v, &idx, oc, vsc, sub, 1 << 1, 1, false, Some(clip.clone()), true, 0, 0)
             .expect("coarse terrain chunk meshes");
 
         // Bin coarse-surface vertices by inward distance from the +X face (d = cmax.x − world.x = −world.x,
@@ -2338,14 +2460,15 @@ mod tests {
         clip
     }
 
-    /// DETAIL-NORMAL bake correctness: (1) the bake samples the RIGHT function — a chunk-center texel's
-    /// stored slope `(dh/dx, dh/dz)` equals `TerrainHifi::slope` (= the raw `sample_world` grad) at that world
-    /// XZ, packed through f16; and (2) the LOD GATE excludes FINE chunks (`vs ≤ finest 2 m node spacing`) →
-    /// `None`, while a COARSE chunk → `Some`. Installs a matching per-bake snapshot (clipmap + hi-fi) so the
-    /// bake's `bake_terrain_hifi()` lights up exactly as production.
+    /// TERRAIN-SURFACE bake correctness (Stages 2+3): (1) a COARSE chunk's central detail texel stores the
+    /// slope `(dh/dx, dh/dz)` = `TerrainHifi::surface` (= raw `sample_world` grad) at that world XZ, packed
+    /// through f16; (2) the central height texel stores the PRISTINE `sample_world` height; (3) the biome map
+    /// is filled at `biome_res²`; (4) the DETAIL-NORMAL LOD gate ZERO-FILLS a FINE chunk's slope (but it
+    /// STILL bakes — height/biome render everywhere), while a COARSE chunk has real slope; (5) a non-terrain
+    /// chunk → `None`. Installs a matching per-bake snapshot (clipmap + hi-fi).
     #[test]
-    fn detail_normal_bake_samples_hifi_and_gates_fine_lods() {
-        use crate::sdf_render::terrain_material::DetailNormalBake;
+    fn terrain_surface_bake_samples_hifi_and_gates_detail_normal() {
+        use crate::sdf_render::terrain_material::TerrainSurfaceBake;
         use crate::sdf_render::worldgen::coord::LayerId;
         use crate::sdf_render::worldgen::layers::erosion::ErosionParams;
         use crate::sdf_render::worldgen::layers::height::{HeightLayer, HeightParams};
@@ -2365,42 +2488,57 @@ mod tests {
         // Install the per-bake snapshot (the bake reads its hi-fi via the thread-local). Held for this scope.
         let _g = set_bake_terrain(Some(clip), Vec2::ZERO);
 
-        // COARSE chunk (vs = 8 m > finest 2 m) at a non-trivial world origin → baked map.
-        let res = 16u32;
+        // COARSE chunk (vs = 8 m > finest 2 m) at a non-trivial world origin → real detail + height + biome.
+        let (res, bres) = (16u32, 4u32);
         let (vs, sub) = (8.0f32, 8u32);
         let chunk_world = sub as f32 * vs; // 64 m footprint
         let origin = Vec3::new(128.0, 0.0, 192.0);
-        let bake = bake_detail_normal(origin, chunk_world, vs, true, res)
-            .expect("coarse terrain chunk must bake a detail-normal map");
-        assert_eq!(bake.res, res);
+        let bake = bake_terrain_surface(origin, chunk_world, vs, true, res, bres)
+            .expect("coarse terrain chunk must bake a terrain-surface payload");
+        assert_eq!(bake.detail_res, res);
+        assert_eq!(bake.biome_res, bres);
         assert_eq!(bake.chunk_size, chunk_world);
         assert_eq!(bake.chunk_min, Vec2::new(origin.x, origin.z));
-        assert_eq!(bake.texels.len(), (res * res * 4) as usize);
+        assert_eq!(bake.detail_texels.len(), (res * res * 4) as usize);
+        assert_eq!(bake.height_texels.len(), (res * res * 4) as usize);
+        assert_eq!(bake.biome_texels.len(), (bres * bres * 8) as usize);
 
-        // The texel at (i, j) stores the slope at world ((i+0.5)·step, (j+0.5)·step) + origin.xz. Check a
-        // central texel reproduces `hifi.slope` at that exact world XZ, through the f16 pack/unpack.
+        // The texel at (i, j) stores the surface at world ((i+0.5)·step, (j+0.5)·step) + origin.xz. Check a
+        // central texel reproduces `hifi.surface` (height + slope) at that exact world XZ, through the pack.
         let step = (chunk_world / res as f32) as f64;
         let (i, j) = (res / 2, res / 2);
         let wx = origin.x as f64 + (i as f64 + 0.5) * step;
         let wz = origin.z as f64 + (j as f64 + 0.5) * step;
-        let (sx, sz) = hifi.slope(wx, wz);
+        let (sh, sx, sz) = hifi.surface(wx, wz);
         let off = ((j * res + i) * 4) as usize;
-        let r = f16::from_bits(u16::from_le_bytes([bake.texels[off], bake.texels[off + 1]])).to_f32();
-        let g = f16::from_bits(u16::from_le_bytes([bake.texels[off + 2], bake.texels[off + 3]])).to_f32();
-        assert_eq!(r, f16::from_f32(sx).to_f32(), "texel dh/dx must match hifi.slope at the texel centre");
-        assert_eq!(g, f16::from_f32(sz).to_f32(), "texel dh/dz must match hifi.slope at the texel centre");
-        // SSOT: the packing matches `DetailNormalBake::pack_texel` bit-for-bit.
-        assert_eq!(&bake.texels[off..off + 4], &DetailNormalBake::pack_texel(sx, sz));
+        let r = f16::from_bits(u16::from_le_bytes([bake.detail_texels[off], bake.detail_texels[off + 1]])).to_f32();
+        let g = f16::from_bits(u16::from_le_bytes([bake.detail_texels[off + 2], bake.detail_texels[off + 3]])).to_f32();
+        assert_eq!(r, f16::from_f32(sx).to_f32(), "texel dh/dx must match hifi.surface slope at the texel centre");
+        assert_eq!(g, f16::from_f32(sz).to_f32(), "texel dh/dz must match hifi.surface slope at the texel centre");
+        // SSOT: the slope packing matches `pack_slope` bit-for-bit.
+        assert_eq!(&bake.detail_texels[off..off + 4], &TerrainSurfaceBake::pack_slope(sx, sz));
+        // The height texel stores the PRISTINE surface height (R32Float LE).
+        let hr = f32::from_le_bytes([
+            bake.height_texels[off],
+            bake.height_texels[off + 1],
+            bake.height_texels[off + 2],
+            bake.height_texels[off + 3],
+        ]);
+        assert_eq!(hr, sh, "height texel must store the pristine sample_world height at the texel centre");
 
-        // GATE: a FINE chunk (vs = 2 m = finest node spacing) gets NO baked map.
+        // DETAIL-NORMAL GATE: a FINE chunk (vs = 2 m = finest node spacing) STILL bakes (height/biome render
+        // everywhere) but its detail-normal slope is ZERO-FILLED → geometry normal in the shader.
+        let fine = bake_terrain_surface(origin, 2.0 * sub as f32, 2.0, true, res, bres)
+            .expect("fine terrain chunk still bakes height + biome (strata render everywhere)");
         assert!(
-            bake_detail_normal(origin, 2.0 * sub as f32, 2.0, true, res).is_none(),
-            "fine LOD (vs ≤ 2 m finest node spacing) must be gated out (no detail map)"
+            fine.detail_texels.iter().all(|&b| b == 0),
+            "fine LOD (vs ≤ 2 m) must zero-fill the detail-normal slope (geometry normal)"
         );
-        // GATE: a non-terrain chunk gets no map regardless of LOD.
-        assert!(bake_detail_normal(origin, chunk_world, vs, false, res).is_none(), "mixed/object chunk → no map");
-        // res < 2 → no map (a 1×1 texture is meaningless).
-        assert!(bake_detail_normal(origin, chunk_world, vs, true, 1).is_none(), "res < 2 → no map");
+        // GATE: a non-terrain chunk gets no surface payload regardless of LOD.
+        assert!(
+            bake_terrain_surface(origin, chunk_world, vs, false, res, bres).is_none(),
+            "mixed/object chunk → no terrain-surface payload"
+        );
 
         drop(_g);
         set_cpu_height_clipmap(None);
@@ -2488,7 +2626,7 @@ mod tests {
                     .height;
                     let y_min = ((h_mid - span * 0.5) / vs).floor() * vs;
                     let origin = Vec3::new(ox, y_min, oz);
-                    let Some(data) = mesh_chunk(&edits_v, &idx, origin, vs, sub, 0, 0, false, Some(clip.clone()), true, 0)
+                    let Some(data) = mesh_chunk(&edits_v, &idx, origin, vs, sub, 0, 0, false, Some(clip.clone()), true, 0, 0)
                     else {
                         continue;
                     };
@@ -2618,7 +2756,7 @@ mod tests {
         ];
         let (vs, sub) = (0.1f32, 32u32); // span 3.2 > shape Ø (cube corner ≈ 1.39) → closed in one chunk
         let origin = Vec3::splat(-1.6);
-        let data = mesh_chunk(&edits, &[0, 1], origin, vs, sub, 0, 0, false, None, false, 0).expect("merged shape meshes");
+        let data = mesh_chunk(&edits, &[0, 1], origin, vs, sub, 0, 0, false, None, false, 0, 0).expect("merged shape meshes");
         (data, origin)
     }
 
@@ -2658,7 +2796,7 @@ mod tests {
         // (0.4,0,0) crosses the block's +X face (x=0); every normal must point outward from the sphere centre.
         let edits = [sphere_edit(Vec3::new(0.4, 0.0, 0.0), 1.0)];
         let oc = Vec3::new(-5.6, -2.8, -2.8);
-        let coarse = mesh_chunk(&edits, &[0], oc, 0.2, 28, 1 << 1, 1, false, None, false, 0).expect("coarse+transition meshes");
+        let coarse = mesh_chunk(&edits, &[0], oc, 0.2, 28, 1 << 1, 1, false, None, false, 0, 0).expect("coarse+transition meshes");
         let center = Vec3::new(0.4, 0.0, 0.0);
         let (mut worst, mut inward, mut degenerate) = (1.0f32, 0, 0);
         for i in 0..coarse.positions.len() {

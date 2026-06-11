@@ -24,6 +24,7 @@
 
 use bevy::asset::{AssetLoader, LoadContext, io::Reader};
 use bevy::prelude::*;
+use bevy::render::render_resource::ShaderType;
 use serde::{Deserialize, Serialize};
 
 use super::noise::{FbmParams, fbm_height};
@@ -536,6 +537,86 @@ impl BiomeLibrary {
                 col
             })
             .collect()
+    }
+}
+
+// ============================================================================================
+// GPU strata table — std140 UNIFORM layout (the ONE flatten shared by the editor preview AND the
+// in-world Stage-3 terrain-surface material; do NOT duplicate this for either consumer).
+// ============================================================================================
+
+/// Demo biome count — `BiomeId::ALL.len()`, the fixed length of the GPU strata table. The shaders that
+/// index the table (`worldgen_preview.wgsl`, `terrain_surface.wgsl`) declare a `BIOME_COUNT` const that
+/// MUST equal this (asserted by the shader-dims build tests).
+pub const BIOME_COUNT: usize = BiomeId::ALL.len();
+
+/// GPU mirror of [`GpuStrataColumn`] (one biome's flattened strata column) laid out for **std140**: the
+/// [`GPU_STRATA_MAX_LAYERS`] cumulative layer bottoms are packed into 2 `Vec4` lanes so the array stays
+/// 16-byte aligned. Built from the CPU SSOT [`BiomeLibrary::gpu_strata_table`]. This is the SHARED flatten:
+/// the editor biome/slice preview AND the in-world terrain surface material both upload [`StrataTableStd`]
+/// from it, so the two NEVER diverge.
+///
+/// `_pad` is a `UVec3` (= `vec3<u32>`), NOT `[u32; 3]`: a uniform array element's stride must be 16-aligned,
+/// which a `u32` array (stride 4) can't satisfy — encase panics at encode time (the `[u32; N]` gotcha — see
+/// `strata_table_is_valid_std140_uniform`). Keep every uniform field a `Vec*`/`UVec*`.
+#[derive(ShaderType, Clone, Copy, Default)]
+pub struct GpuStrataColumnStd {
+    pub surface_color: Vec4,
+    pub layer_color: [Vec4; GPU_STRATA_MAX_LAYERS],
+    /// `GPU_STRATA_MAX_LAYERS` (= 6) floats packed: `lane0.xyzw + lane1.xy`.
+    pub layer_bottom: [Vec4; 2],
+    pub bedrock_color: Vec4,
+    pub layer_count: u32,
+    pub _pad: UVec3,
+}
+
+impl From<&GpuStrataColumn> for GpuStrataColumnStd {
+    fn from(c: &GpuStrataColumn) -> Self {
+        let mut layer_color = [Vec4::ZERO; GPU_STRATA_MAX_LAYERS];
+        for (i, col) in c.layer_color.iter().enumerate() {
+            layer_color[i] = Vec4::from_array(*col);
+        }
+        // Pack the layer bottoms into 2 vec4 lanes (xyzw, then xy…). `GPU_STRATA_MAX_LAYERS <= 8` (asserted
+        // in tests) so they always fit.
+        let mut bottom = [Vec4::ZERO; 2];
+        for (i, &b) in c.layer_bottom.iter().enumerate() {
+            bottom[i / 4][i % 4] = b;
+        }
+        Self {
+            surface_color: Vec4::from_array(c.surface_color),
+            layer_color,
+            layer_bottom: bottom,
+            bedrock_color: Vec4::from_array(c.bedrock_color),
+            layer_count: c.layer_count,
+            _pad: UVec3::ZERO,
+        }
+    }
+}
+
+/// The full per-biome strata table uniform (one column per [`BiomeId`], id order) — the GPU side of
+/// [`BiomeLibrary::gpu_strata_table`]. A fixed-size array sized to [`BIOME_COUNT`]. SHARED by the preview
+/// and the in-world surface material; built once via [`StrataTableStd::from_library`].
+#[derive(ShaderType, Clone, Copy)]
+pub struct StrataTableStd {
+    pub columns: [GpuStrataColumnStd; BIOME_COUNT],
+}
+
+impl Default for StrataTableStd {
+    fn default() -> Self {
+        Self { columns: [GpuStrataColumnStd::default(); BIOME_COUNT] }
+    }
+}
+
+impl StrataTableStd {
+    /// Flatten a [`BiomeLibrary`] into the GPU table (via the CPU SSOT [`BiomeLibrary::gpu_strata_table`]),
+    /// clamped/padded to [`BIOME_COUNT`]. The single flatten both the preview and the in-world material call.
+    pub fn from_library(lib: &BiomeLibrary) -> Self {
+        let table = lib.gpu_strata_table();
+        let mut columns = [GpuStrataColumnStd::default(); BIOME_COUNT];
+        for (i, c) in table.iter().take(BIOME_COUNT).enumerate() {
+            columns[i] = GpuStrataColumnStd::from(c);
+        }
+        Self { columns }
     }
 }
 
