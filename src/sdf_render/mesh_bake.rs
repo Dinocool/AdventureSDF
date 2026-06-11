@@ -1188,6 +1188,7 @@ fn sync_terrain_detail_params(
 /// wireframe. The collider IS the chunk's render mesh, so this shows the physics meshes + how far they reach.
 /// A LIVE toggle — adds `Wireframe` to collider-bearing chunk entities when on, removes it when off (per
 /// frame, only acting on the diff — `Without<Wireframe>` / `With<Wireframe>` filters keep it cheap at rest).
+#[allow(clippy::type_complexity)] // Bevy query filter tuple; an alias hurts readability here.
 fn sync_physics_wireframe(
     cfg: Res<MeshBakeConfig>,
     mut commands: Commands,
