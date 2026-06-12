@@ -55,6 +55,9 @@ impl Plugin for AssetsPlugin {
             .register_type::<PbrTextureAsset>()
             .init_resource::<MaterialTextureLibrary>()
             .init_resource::<MaterialAssetTable>()
+            // MaterialRegistry was previously initialized by the (now-pruned) SDF scene/render
+            // plugin; the compile system here consumes it, so own its init here.
+            .init_resource::<crate::sdf_render::edits::MaterialRegistry>()
             .init_resource::<pbr_texture::PbrTextureHandles>();
 
         compile::register(app);

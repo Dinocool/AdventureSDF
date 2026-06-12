@@ -210,11 +210,6 @@ pub fn performance_panel(world: &mut World, ui: &mut egui::Ui) {
             ui.heading("Profiling capture");
             crate::editor::chrome_trace::capture_ui(world, ui);
 
-            // GPU memory breakdown (SDF atlas targets + the fixed-cap PBR texture arrays).
-            ui.separator();
-            ui.heading("GPU memory");
-            gpu_memory_ui(world, ui);
-
             // System (process / host) RAM.
             ui.separator();
             ui.heading("System memory");
@@ -294,41 +289,6 @@ fn mem_breakdown_ui(ui: &mut egui::Ui, id: &str, mut segments: Vec<MemSeg>) {
                 ui.end_row();
             }
         });
-}
-
-/// Bytes of VRAM the fixed-cap PBR texture arrays reserve: `MATERIAL_TEX_MAPS` BC7 arrays,
-/// each `MAX_TEXTURE_LAYERS` layers of a full 1024² mip chain. Allocated at full cap up front
-/// (the demand-driven library streams variants into existing layers), so it's a constant.
-fn pbr_textures_vram_bytes() -> u64 {
-    use crate::assets::MAX_TEXTURE_LAYERS;
-    use crate::sdf_render::edits::MATERIAL_TEX_MAPS;
-    use crate::sdf_render::textures::TEXTURE_SIZE;
-    MATERIAL_TEX_MAPS as u64
-        * MAX_TEXTURE_LAYERS as u64
-        * crate::sdf_render::bc7::bc7_layer_bytes(TEXTURE_SIZE) as u64
-}
-
-/// GPU memory: the SDF atlas targets (distance / material / lookup) plus the PBR texture
-/// arrays, as a stacked breakdown. Atlas figures come from [`SdfAtlasStats`]; the bricks /
-/// texels / dirty state is shown as context above the bar.
-fn gpu_memory_ui(world: &mut World, ui: &mut egui::Ui) {
-    use crate::sdf_render::debug::SdfAtlasStats;
-    let stats = world.resource::<SdfAtlasStats>();
-    ui.weak(format!(
-        "{} bricks · {}×{} texels · {}",
-        stats.total_bricks,
-        stats.atlas_width,
-        stats.atlas_height,
-        if stats.dirty { "dirty" } else { "clean" }
-    ));
-    let segments = vec![
-        MemSeg { label: "SDF distance".into(), bytes: stats.dist_bytes, color: band_color(0) },
-        MemSeg { label: "SDF material".into(), bytes: stats.object_bytes, color: band_color(1) },
-        MemSeg { label: "SDF gradient".into(), bytes: stats.blend_bytes, color: band_color(2) },
-        MemSeg { label: "SDF lookup".into(), bytes: stats.lookup_bytes, color: band_color(3) },
-        MemSeg { label: "PBR textures".into(), bytes: pbr_textures_vram_bytes(), color: band_color(4) },
-    ];
-    mem_breakdown_ui(ui, "gpu", segments);
 }
 
 /// System memory: a byte-level breakdown of host RAM into this process, other processes, and

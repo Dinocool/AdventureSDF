@@ -61,7 +61,7 @@ pub fn custom_layer(app: &mut App) -> Option<BoxedLayer> {
         .include_args(true)
         .build();
 
-    app.insert_non_send_resource(TraceFlushGuard(guard));
+    app.insert_non_send(TraceFlushGuard(guard));
     app.insert_resource(ChromeTraceFile(path));
 
     // Gate the chrome layer on `CAPTURING`. `dynamic_filter_fn` (not `filter_fn`) is the

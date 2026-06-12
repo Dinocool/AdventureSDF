@@ -9,7 +9,6 @@ edition = "2024"
 # can't hook a dynamically-linked Bevy — see the `renderdoc` feature).
 default = ["fast"]
 editor = [
-    "dep:bevy-inspector-egui",
     "dep:bevy_egui",
     "dep:egui_dock",
     "dep:egui-phosphor",
@@ -49,6 +48,18 @@ shader-debug = ["bevy_render/decoupled_naga"]
 # (Disable with `--no-default-features` when capturing in RenderDoc, which can't inject
 # into a dynamically-linked Bevy.)
 fast = ["bevy/dynamic_linking"]
+# Physics — DEFERRED to Stage 6 (see bevy_rapier3d note). Off by default during the voxel-RT migration.
+physics = ["dep:bevy_rapier3d"]
+# Stage 4c — NVIDIA DLSS Ray Reconstruction (denoiser + upscaler) for the HW-RT voxel path. OFF by
+# default — enabling needs the NVIDIA DLSS SDK (`DLSS_SDK`), Vulkan headers (`VULKAN_SDK`), and
+# libclang (`LIBCLANG_PATH`) at build time. `bevy/dlss` makes `DefaultPlugins` register
+# `DlssInitPlugin` BEFORE `RenderPlugin` (it hooks Vulkan instance/device creation to enable the DLSS
+# extensions + insert the `Dlss*Supported` resources) and exposes `bevy::anti_alias::dlss::*`
+# (`dlss_wgpu 4.0`, needs wgpu ^29 — satisfied by the fork's 29.0.3). Without it the `Dlss` camera
+# component is a no-op. DLSS is Vulkan-only, so `main.rs` pins `Backends::VULKAN` under this cfg.
+# `build.rs` copies the `nvngx_dlss*.dll` runtime next to the exe. Replaces the temporal-accum denoise
+# (which stays the non-dlss / non-RTX fallback). See memory `solari-gi-worktree` for the proven recipe.
+dlss = ["bevy/dlss"]
 
 [dependencies]
 # Pruned Bevy feature set: `default-features = false` then ONLY what this 3D + egui app
@@ -60,7 +71,7 @@ fast = ["bevy/dynamic_linking"]
 # (world.scn.ron), mesh+ui picking (camera MeshRayCast), winit/window, state,
 # tonemapping LUTs (the SDF HDR camera's Tonemapping pass — pulls ktx2+zstd), png/jpeg/bmp/tga.
 # (bevy_sprite + bevy_animation stay — pulled transitively by the UI/PBR features + rapier.)
-bevy = { version = "0.18", default-features = false, features = [
+bevy = { path = "D:/bevy-fork", default-features = false, features = [
     # app + platform
     "std", "multi_threaded", "async_executor", "reflect_auto_register",
     "bevy_asset", "bevy_log", "bevy_state", "bevy_window", "bevy_winit",
@@ -76,21 +87,27 @@ bevy = { version = "0.18", default-features = false, features = [
     # image formats
     "png", "jpeg", "bmp", "tga",
 ] }
-bevy_rapier3d = "0.34.0"
+# DEFERRED to Stage 6 of the voxel-RT rebuild: no bevy_rapier exists for Bevy 0.19 yet, and physics
+# isn't used until Stage 6. Optional + off by default; the rapier-using code is `#[cfg(feature="physics")]`.
+bevy_rapier3d = { version = "0.34.0", optional = true }
 # Direct dep on the SAME bevy_render the `bevy` umbrella already uses (Cargo unifies it — no extra
 # build cost, no second copy) so `shader-debug` can flip its `decoupled_naga` feature (round-trips
 # composed shaders to a WGSL string → naga emits `OpSource`/`OpLine` for Nsight). MUST be non-optional:
 # declaring it makes `bevy_manifest` emit `bevy_render::` paths in the ShaderType/etc. derives, which
 # only resolve if the crate is always present — an `optional = true` dep breaks every non-shader-debug
 # build (`bevy_render` unresolved). Not referenced by name in code; a feature/path carrier only.
-bevy_render = { version = "0.18", default-features = false }
-wgpu = "27"
+bevy_render = { path = "D:/bevy-fork/crates/bevy_render", default-features = false }
+wgpu = "29.0.3"
 # Fast non-cryptographic hasher (the rustc compiler's own FxHash) for the hot integer-keyed maps
 # in the SDF bake path — brick/chunk/tile lookups per baked brick. std's SipHash is ~3–5× slower
 # and pointless for these small integer keys. See `atlas.rs` / `chunk.rs` `Fx*` aliases.
 rustc-hash = "2"
-bevy-inspector-egui = { version = "0.36", optional = true }
-bevy_egui = { version = "0.39", optional = true }
+# Editor egui stack — unified on egui 0.34 (validated against the Bevy-0.19 + wgpu-trunk fork in
+# D:/spike-editor-egui). bevy-inspector-egui is DROPPED (no Bevy-0.19 release); its inspector panel
+# was removed from src/editor. bevy_egui is consumed via the local fork (D:/bevy_egui-fork) only to add
+# the `enable wgpu_binding_array;` directive its bindless egui.wgsl lacks (the wgpu-trunk naga requires
+# it) — see the `[patch.crates-io] bevy_egui` line below.
+bevy_egui = { version = "0.40.0-rc.1", optional = true, default-features = false, features = ["default_fonts", "render"] }
 # PBR texture-library loading: decode role-map source files (image) and read material
 # manifests (ron). Multiple formats so a PBR-texture resource can reference any of them.
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "bmp", "tga"] }
@@ -100,7 +117,7 @@ ron = "0.12"
 serde = { version = "1", features = ["derive"] }
 # Offline BC7 encode of the PBR texture arrays (cached to disk; ~1/6 the VRAM).
 intel_tex_2 = "0.2"
-egui_dock = { version = "0.18", optional = true, features = ["serde"] }
+egui_dock = { version = "0.19", optional = true, features = ["serde"] }
 # In-app RenderDoc capture, editor-only. `libloading` preloads renderdoc.dll early so the
 # graphics hook installs before the wgpu device exists.
 renderdoc = { version = "0.12", optional = true }
@@ -108,21 +125,22 @@ libloading = { version = "0.8", optional = true }
 # Editor-only Chrome-tracing layer, installed by us (not via `bevy/trace_chrome`) so the
 # editor can start/stop capture at runtime. See `editor::chrome_trace`.
 tracing-chrome = { version = "0.7", optional = true }
-# Phosphor icon font for the editor toolbar (egui 0.33-compatible). Installed into the
-# egui context at startup; gives named glyph constants so toolbar buttons show real icons.
-egui-phosphor = { version = "0.11", optional = true }
-# Off-the-shelf egui node-graph editor (egui 0.33) for the worldgen biome node editor. `serde` for
-# saving the editor's Snarl graph; the engine `Graph` (sdf_render::worldgen::graph) is converted to/from it.
-egui-snarl = { version = "0.9", optional = true, features = ["serde"] }
+# Phosphor icon font for the editor toolbar (egui 0.34). Installed into the egui context at
+# startup; gives named glyph constants so toolbar buttons show real icons.
+egui-phosphor = { version = "0.12", optional = true }
+# Off-the-shelf egui node-graph editor for the worldgen biome node editor. The crates.io 0.9.0
+# release is egui 0.33; this git rev is already on egui 0.34 (unreleased), so the whole stack
+# unifies on egui 0.34. `serde` for saving the editor's Snarl graph.
+egui-snarl = { git = "https://github.com/zakarumych/egui-snarl", rev = "5bdc34e4ebdb9d7a0968f21564dce51a1a027ee8", optional = true, features = ["serde"] }
 # Host/process RAM sampling for the Performance panel's memory breakdown (editor only). We
 # query it directly rather than via Bevy's SystemInformationDiagnosticsPlugin, which only
 # exposes host memory as a percentage (no byte total) — we want a byte-level breakdown.
 sysinfo = { version = "0.37", optional = true, default-features = false, features = ["system"] }
 # egui's 2D tessellation (filled, antialiased shapes) for the in-tree gizmo overlay
-# renderer. Pinned to 0.33 to reuse the copies bevy_egui 0.39 (egui 0.33) pulls in.
-epaint = "0.33"
-ecolor = "0.33"
-emath = "0.33"
+# renderer. Pinned to 0.34 to reuse the copies the editor egui stack (egui 0.34) pulls in.
+epaint = "0.34"
+ecolor = "0.34"
+emath = "0.34"
 # Cast gizmo vertex/index + the SDF GPU structs (point lights, materials, light-grid cells) to
 # &[u8] for buffer upload via `cast_slice`. `derive` for `#[derive(Pod, Zeroable)]` on those
 # `#[repr(C)]` structs (see `sdf_render::render::gpu`), replacing hand-rolled `to_le_bytes` packing.
@@ -143,14 +161,14 @@ half = "2"
 [dev-dependencies]
 # spv-out: emit SPIR-V from naga in tests so we can inspect which opcode signed `%`
 # lowers to (OpUMod vs OpSRem) — root-cause evidence for the negative-modulo divergence.
-naga = { version = "27", features = ["spv-out", "wgsl-in"] }
+naga = { version = "29.0.3", features = ["spv-out", "wgsl-in"] }
 # Composes #import-based WGSL modules so the shader-validation test can resolve the
 # split sdf shader the same way Bevy's ShaderCache does at runtime. `default-features = false`
 # drops naga_oil's `glsl` feature: with it on, naga_oil cross-checks each composable module's
 # interface by emitting a GLSL header too, and the GLSL backend panics on `binding_array` (the
 # paged atlas pool). The runtime build never enables `glsl` (bevy pulls only `test_shader`), so
 # this just matches the test to the real compose path. We compose WGSL only.
-naga_oil = { version = "0.20", default-features = false }
+naga_oil = { version = "0.22", default-features = false }
 # block_on for the GPU compute rig (tests/sdf_gpu_rig.rs) — run real WGSL, read back buffers.
 futures-lite = "2"
 
@@ -165,3 +183,74 @@ debug = "line-tables-only"
 opt-level = 3
 # Dependencies never get stepped into — no debuginfo at all. Big link-size + link-time win.
 debug = false
+
+# Voxel-RT engine rebuild: vendored Bevy 0.19-rc.3 (D:/bevy-fork) migrated to wgpu-trunk, consumed via
+# the `bevy`/`bevy_render` path deps above. These redirect Bevy's `wgpu = "29.0.3"` deps to the local
+# wgpu-trunk fork (D:/wgpu-fork = trunk rev 98a7062, version-bumped 29.0.0→29.0.3) which has AABB-BLAS
+# ray tracing. See memory `voxel-raytracing-engine-pivot`.
+[patch.crates-io]
+wgpu = { path = "D:/wgpu-fork/wgpu" }
+wgpu-core = { path = "D:/wgpu-fork/wgpu-core" }
+wgpu-hal = { path = "D:/wgpu-fork/wgpu-hal" }
+wgpu-types = { path = "D:/wgpu-fork/wgpu-types" }
+naga = { path = "D:/wgpu-fork/naga" }
+wgpu-naga-bridge = { path = "D:/wgpu-fork/wgpu-naga-bridge" }
+
+# Editor egui stack (feature = "editor"):
+# bevy_egui forked locally only to add `enable wgpu_binding_array;` to its bindless `egui.wgsl`
+# (the wgpu-trunk naga requires the directive; upstream omits it → a runtime validation crash).
+# The fork is the unmodified 0.40.0-rc.1 source apart from that one shader line.
+bevy_egui = { path = "D:/bevy_egui-fork" }
+# bevy_egui pulls its `bevy_*` sub-crates from crates.io; redirect every one to the local Bevy-0.19
+# fork (D:/bevy-fork) so the editor stack and the app share ONE Bevy (no second copy / no version
+# clash). Enumerated from D:/bevy-fork/crates/ — mirrors D:/spike-editor-egui/Cargo.toml.
+# NOTE: only the `bevy_*` crates actually present in the crate graph are patched. The fork's
+# audio / gilrs / gltf / camera_controller / dev_tools / remote / world_serialization crates are
+# NOT pulled by the pruned `bevy` feature set or by bevy_egui, so patching them would emit a
+# "patch was not used in the crate graph" advisory — they're intentionally omitted. Re-add a line
+# if a future feature config (or a bevy_egui feature) starts pulling one of them.
+bevy = { path = "D:/bevy-fork" }
+bevy_a11y = { path = "D:/bevy-fork/crates/bevy_a11y" }
+bevy_animation = { path = "D:/bevy-fork/crates/bevy_animation" }
+bevy_anti_alias = { path = "D:/bevy-fork/crates/bevy_anti_alias" }
+bevy_app = { path = "D:/bevy-fork/crates/bevy_app" }
+bevy_asset = { path = "D:/bevy-fork/crates/bevy_asset" }
+bevy_camera = { path = "D:/bevy-fork/crates/bevy_camera" }
+bevy_color = { path = "D:/bevy-fork/crates/bevy_color" }
+bevy_core_pipeline = { path = "D:/bevy-fork/crates/bevy_core_pipeline" }
+bevy_derive = { path = "D:/bevy-fork/crates/bevy_derive" }
+bevy_diagnostic = { path = "D:/bevy-fork/crates/bevy_diagnostic" }
+bevy_ecs = { path = "D:/bevy-fork/crates/bevy_ecs" }
+bevy_encase_derive = { path = "D:/bevy-fork/crates/bevy_encase_derive" }
+bevy_gizmos = { path = "D:/bevy-fork/crates/bevy_gizmos" }
+bevy_image = { path = "D:/bevy-fork/crates/bevy_image" }
+bevy_input = { path = "D:/bevy-fork/crates/bevy_input" }
+bevy_input_focus = { path = "D:/bevy-fork/crates/bevy_input_focus" }
+bevy_internal = { path = "D:/bevy-fork/crates/bevy_internal" }
+bevy_light = { path = "D:/bevy-fork/crates/bevy_light" }
+bevy_log = { path = "D:/bevy-fork/crates/bevy_log" }
+bevy_material = { path = "D:/bevy-fork/crates/bevy_material" }
+bevy_math = { path = "D:/bevy-fork/crates/bevy_math" }
+bevy_mesh = { path = "D:/bevy-fork/crates/bevy_mesh" }
+bevy_pbr = { path = "D:/bevy-fork/crates/bevy_pbr" }
+bevy_picking = { path = "D:/bevy-fork/crates/bevy_picking" }
+bevy_platform = { path = "D:/bevy-fork/crates/bevy_platform" }
+bevy_post_process = { path = "D:/bevy-fork/crates/bevy_post_process" }
+bevy_ptr = { path = "D:/bevy-fork/crates/bevy_ptr" }
+bevy_reflect = { path = "D:/bevy-fork/crates/bevy_reflect" }
+bevy_render = { path = "D:/bevy-fork/crates/bevy_render" }
+bevy_scene = { path = "D:/bevy-fork/crates/bevy_scene" }
+bevy_shader = { path = "D:/bevy-fork/crates/bevy_shader" }
+bevy_solari = { path = "D:/bevy-fork/crates/bevy_solari" }
+bevy_sprite = { path = "D:/bevy-fork/crates/bevy_sprite" }
+bevy_sprite_render = { path = "D:/bevy-fork/crates/bevy_sprite_render" }
+bevy_state = { path = "D:/bevy-fork/crates/bevy_state" }
+bevy_tasks = { path = "D:/bevy-fork/crates/bevy_tasks" }
+bevy_text = { path = "D:/bevy-fork/crates/bevy_text" }
+bevy_time = { path = "D:/bevy-fork/crates/bevy_time" }
+bevy_transform = { path = "D:/bevy-fork/crates/bevy_transform" }
+bevy_ui = { path = "D:/bevy-fork/crates/bevy_ui" }
+bevy_ui_render = { path = "D:/bevy-fork/crates/bevy_ui_render" }
+bevy_utils = { path = "D:/bevy-fork/crates/bevy_utils" }
+bevy_window = { path = "D:/bevy-fork/crates/bevy_window" }
+bevy_winit = { path = "D:/bevy-fork/crates/bevy_winit" }

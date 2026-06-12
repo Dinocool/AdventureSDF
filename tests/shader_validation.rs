@@ -100,6 +100,23 @@ fn sdf_brick_bake_wgsl_validates() {
 }
 
 #[test]
+fn voxel_raytrace_wgsl_validates() {
+    // The HW-RT voxel raymarch (+ the DLSS-RR `raymarch_dlss` entry point added in Stage 4c). Fully
+    // self-contained (no `#import`), but uses `enable wgpu_ray_query` + the `ray_query` types, so it needs
+    // the full-capability composer (which the device + runtime also use). Validating here catches a WGSL
+    // typo in the dlss guide-writing entry without a GPU/launch.
+    let path = Path::new("assets/shaders/voxel_raytrace.wgsl");
+    validate_entry(path).unwrap_or_else(|e| panic!("{e}"));
+}
+
+#[test]
+fn voxel_rt_composite_wgsl_validates() {
+    // The composite + the DLSS-RR `fs_resolve_dlss` resolve pass (multi-target colour+motion + frag_depth).
+    let path = Path::new("assets/shaders/voxel_rt_composite.wgsl");
+    validate_entry(path).unwrap_or_else(|e| panic!("{e}"));
+}
+
+#[test]
 fn worldgen_preview_wgsl_validates() {
     // The node-preview material shader: orbit raymarch of the baked heightfield. Uses
     // `@group(#{MATERIAL_BIND_GROUP})` + imports `bevy_pbr::forward_io::VertexOutput`, so it needs

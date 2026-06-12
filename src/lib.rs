@@ -1,17 +1,19 @@
 pub mod assets;
 pub mod camera;
-pub mod combat;
+// Legacy WoW gameplay modules — removed in the voxel-RT rebuild (kept on disk, off compilation).
+// pub mod combat;
 pub mod gizmo_render;
 pub mod instrument;
-pub mod inventory;
-pub mod networking;
+// pub mod inventory;
+// pub mod networking;
 pub mod node;
 pub mod player;
 pub mod scene_manager;
 pub mod sdf_render;
 pub mod soul_scene;
-pub mod ui;
-pub mod world;
+pub mod voxel;
+// pub mod ui;
+// pub mod world;
 
 #[cfg(feature = "editor")]
 pub mod editor;

@@ -32,7 +32,6 @@ use bevy::prelude::*;
 
 use crate::node::Node3D;
 use crate::scene_manager::{AppScene, SceneEntity};
-use crate::sdf_render::atlas::SdfAtlas;
 use crate::sdf_render::edits::{
     CsgKind, MaterialFields, SdfMaterialSource, SdfOp, SdfOrder, SdfPrimitive,
 };
@@ -81,10 +80,15 @@ pub fn height_tier_reach(tier: u32) -> f64 {
     (upload::HEIGHT_RING_CHUNKS as f64 / 2.0) * HEIGHT_CHUNK_CELLS as f64 * (1u64 << tier) as f64
 }
 
-/// SSOT for the height-clipmap TIER COUNT `T`, derived from the mesh-bake clipmap so terrain auto-extends
-/// to the full LOD-`(lod_count-1)` reach (and auto-grows if the default `lod_count` changes). Choose the
-/// smallest `T` whose COARSEST tier's covered radius (`512·2^(T-1)`) ≥ `reach` (the coarsest-LOD outer
-/// half-extent from `mesh_bake::coarsest_lod_outer_reach`). `T ≥ 1` always.
+/// Target world half-extent (metres) the height clipmap must cover. With the legacy mesh-bake
+/// renderer pruned in the voxel-RT rebuild, the tier count is no longer derived from the mesh-bake
+/// clipmap reach; instead the clipmap covers this fixed radius. ~16 km is well beyond any view the
+/// streamed terrain serves and keeps the tier count modest (`512·2^(T-1) ≥ reach`). The future
+/// voxel-RT renderer can re-derive this from its own LOD scheme.
+pub const WORLDGEN_TARGET_REACH: f64 = 16384.0;
+
+/// SSOT for the height-clipmap TIER COUNT `T`: the smallest `T` whose COARSEST tier's covered radius
+/// (`512·2^(T-1)`) ≥ `reach`. `T ≥ 1` always.
 pub fn height_clipmap_tiers(reach: f64) -> u32 {
     let mut t = 1u32;
     while height_tier_reach(t - 1) < reach {
@@ -194,11 +198,9 @@ pub struct WorldGenPlugin;
 
 impl Plugin for WorldGenPlugin {
     fn build(&self, app: &mut App) {
-        // Derive the height-clipmap tier count `T` from the mesh-bake clipmap (SSOT): `T` tiers must
-        // cover the coarsest-LOD outer reach so terrain extends to the full LOD-`(lod_count-1)` extent.
-        let grid = crate::sdf_render::SdfGridConfig::default();
-        let mesh_cfg = crate::sdf_render::mesh_bake::MeshBakeConfig::default();
-        let reach = crate::sdf_render::mesh_bake::coarsest_lod_outer_reach(&grid, &mesh_cfg) as f64;
+        // The height-clipmap tier count `T` covers a fixed target reach (the mesh-bake clipmap that
+        // formerly drove this was pruned in the voxel-RT rebuild).
+        let reach = WORLDGEN_TARGET_REACH;
         let tiers = height_clipmap_tiers(reach);
         info!(
             "worldgen height clipmap: {tiers} tiers (tier 0 = ±{} m, coarsest tier {} = ±{} m) covering \
@@ -246,16 +248,10 @@ impl Plugin for WorldGenPlugin {
                 OnEnter(AppScene::SdfEditor),
                 spawn_terrain_volume.run_if(|e: Res<WorldGenEnabled>| e.0),
             )
-            // BEFORE the bake scheduler so a terrain rebuild re-bakes the affected chunks the same
-            // frame (mirrors `update_height_field`'s ordering).
+            // Stream the rolling generation window around the camera + reframe the camera once.
             .add_systems(
                 Update,
-                (
-                    // BEFORE the bake scheduler so a terrain rebuild re-bakes the affected chunks the
-                    // same frame (mirrors `update_height_field`'s ordering).
-                    roll_worldgen.before(crate::sdf_render::bake_scheduler::schedule_bakes),
-                    reframe_worldgen_camera,
-                )
+                (roll_worldgen, reframe_worldgen_camera)
                     .run_if(in_state(AppScene::SdfEditor))
                     .run_if(|e: Res<WorldGenEnabled>| e.0),
             );
@@ -315,7 +311,7 @@ fn spawn_terrain_volume(
     // supplies a `DirectionalLight`. ~10000 lux matches the renderer's exposure (SDF_EXPOSURE_EV100).
     commands.spawn((
         Name::new("Worldgen Sun"),
-        DirectionalLight { illuminance: 10000.0, shadows_enabled: true, ..default() },
+        DirectionalLight { illuminance: 10000.0, shadow_maps_enabled: true, ..default() },
         // Terrain spans km, so the default (small-scene) cascade range would shadow only a tiny bubble.
         // Four cascades out to 2 km cover the near+mid terrain the camera actually reads; the baked terrain
         // meshes render through Bevy PBR so directional shadows + cascades work natively.
@@ -381,14 +377,7 @@ fn roll_worldgen(
     world_graph: Res<WorldGraph>,
     // Per-biome SHAPE override graphs (biomes own their terrain shape) — republished to every tier on change.
     world_biome_shapes: Res<WorldBiomeShapes>,
-    // The mesh-bake clipmap config (the LOD slider) — the height-clipmap window tracks its `lod_count`.
-    grid_cfg: Res<crate::sdf_render::SdfGridConfig>,
-    mesh_cfg: Res<crate::sdf_render::mesh_bake::MeshBakeConfig>,
     mut gpu_ring: ResMut<WorldGenGpuRing>,
-    mut atlas: ResMut<SdfAtlas>,
-    // The MESH renderer's full-rebake nudge. Pulsed ONLY on an explicit terrain-param edit (full regen);
-    // streaming deltas re-mesh per-chunk via the residency coverage gate, no global pulse needed.
-    mut mesh_rebuild: ResMut<crate::sdf_render::mesh_bake::MeshBakeRebuild>,
     // Read-only camera transform: the generation focus is the camera EYE.
     camera: Query<&Transform, (With<SdfCamera>, Without<SdfVolume>)>,
     mut last_params: Local<Option<HeightParams>>,
@@ -419,12 +408,11 @@ fn roll_worldgen(
     // the generation focus must still track the viewer so the right region streams in/out.
     let focus = DVec2::new(cam_pos.x as f64, cam_pos.z as f64);
 
-    // DYNAMIC WINDOW: the height-clipmap tier count tracks the live mesh-bake `lod_count` (the LOD slider),
-    // so the loaded sample-area window always covers the configured LOD reach. Recompute the needed tiers
-    // from the mesh-bake clipmap each frame; `set_tier_count` only changes the stack on an actual change —
-    // GROW appends coarse tiers (keeps loaded terrain, no flicker), SHRINK drops the coarsest tiers.
-    let reach = crate::sdf_render::mesh_bake::coarsest_lod_outer_reach(&grid_cfg, &mesh_cfg) as f64;
-    let tiers_changed = manager.set_tier_count(height_clipmap_tiers(reach), *params, *erosion);
+    // The height-clipmap tier count covers a fixed target reach (the mesh-bake clipmap that formerly
+    // drove a dynamic window was pruned in the voxel-RT rebuild). `set_tier_count` only changes the
+    // stack on an actual change — GROW appends coarse tiers, SHRINK drops the coarsest tiers.
+    let tiers_changed =
+        manager.set_tier_count(height_clipmap_tiers(WORLDGEN_TARGET_REACH), *params, *erosion);
 
     // Editor param tweak (height OR erosion) → rebuild ALL tiers from the new params + evict residency so
     // `update` regenerates. Tracked so an unchanged frame doesn't needlessly clear. A param edit is an
@@ -473,15 +461,10 @@ fn roll_worldgen(
     manager.height_store_mut().drain_dirty();
     manager.height_store_mut().drain_dropped();
 
-    // Re-mesh pulse ONLY on an explicit param edit (a full regen). A plain streaming delta needs NO
-    // pulse: the world-anchored volume's content hash is stable, so the residency coverage gate meshes
-    // newly-loaded chunks per-chunk and reaps evicted ones on its own (no whole-band re-mesh). On a
-    // param edit, every loaded chunk's surface changed, so force a full rebake (atlas lever = gated-off
-    // cloud foundation; `mesh_rebuild` = the real on-screen path).
-    if params_changed || graph_changed {
-        atlas.rebake_all = true;
-        mesh_rebuild.0 = true;
-    }
+    // (The mesh-bake re-mesh pulse that formerly fired here on a param/graph edit was removed with the
+    // mesh-bake renderer. The CPU height ring above is the published output the future voxel-RT
+    // renderer will consume; nothing to nudge until that renderer lands.)
+    let _ = (params_changed, graph_changed);
 }
 
 /// Handle to the active biome terrain graph asset — the production graph the world loads from

@@ -150,7 +150,7 @@ fn spawn_menu(commands: &mut Commands, current_scene: &AppScene) {
                     panel.spawn((
                         Text::new("Scene Selector"),
                         TextFont {
-                            font_size: 24.0,
+                            font_size: FontSize::Px(24.0),
                             ..default()
                         },
                         TextColor(Color::WHITE),
@@ -181,7 +181,7 @@ fn spawn_menu(commands: &mut Commands, current_scene: &AppScene) {
                         .with_child((
                             Text::new("Wireframe Test"),
                             TextFont {
-                                font_size: 16.0,
+                                font_size: FontSize::Px(16.0),
                                 ..default()
                             },
                             TextColor(Color::WHITE),
@@ -208,7 +208,7 @@ fn spawn_menu(commands: &mut Commands, current_scene: &AppScene) {
                         .with_child((
                             Text::new("SDF Editor"),
                             TextFont {
-                                font_size: 16.0,
+                                font_size: FontSize::Px(16.0),
                                 ..default()
                             },
                             TextColor(Color::WHITE),
@@ -235,7 +235,7 @@ fn spawn_menu(commands: &mut Commands, current_scene: &AppScene) {
                         .with_child((
                             Text::new("Adventure Game"),
                             TextFont {
-                                font_size: 16.0,
+                                font_size: FontSize::Px(16.0),
                                 ..default()
                             },
                             TextColor(Color::WHITE),

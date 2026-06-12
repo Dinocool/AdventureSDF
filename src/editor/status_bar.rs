@@ -5,8 +5,6 @@ use bevy_egui::egui;
 
 use crate::scene_manager::SceneEntity;
 use crate::sdf_render::SdfVolume;
-use crate::sdf_render::atlas::SdfAtlas;
-use crate::sdf_render::mesh_bake::MeshBakeStats;
 
 use super::config::EditorConfig;
 use super::profiling::ShaderProfilingData;
@@ -43,37 +41,24 @@ impl Plugin for StatusBarPlugin {
     }
 }
 
-/// Render the bottom status strip: entity/volume counts, atlas bake state, and the perf
-/// readout (FPS / frame time).
-pub fn status_bar_ui(world: &mut World, ctx: &egui::Context) {
+/// Render the bottom status strip: entity/volume counts and the perf readout (FPS / frame time).
+/// Drawn into the editor's root viewport `Ui` (bevy_egui 0.40 idiom) via `Panel::show_inside`.
+pub fn status_bar_ui(world: &mut World, viewport_ui: &mut egui::Ui) {
     let (scene_entities, volumes) = world
         .get_resource::<EditorSceneStats>()
         .map(|s| (s.scene_entities, s.volumes))
         .unwrap_or((0, 0));
-    let bricks = world.get_resource::<SdfAtlas>().map(|a| a.bricks.len()).unwrap_or(0);
-    // The mesh bake is the renderer; the editor "BAKING" light reflects ITS pending work, not the
-    // gated-off GPU SDF atlas (whose dirty flags stay set when the GPU bake never runs).
-    let pending = world.get_resource::<MeshBakeStats>().map(|s| s.pending).unwrap_or(0);
-    let dirty = pending > 0;
     let perf = world
         .get_resource::<ShaderProfilingData>()
         .map(|p| (p.fps_smoothed, p.frame_time_ms))
         .unwrap_or((0.0, 0.0));
 
-    egui::TopBottomPanel::bottom("editor_status_bar").show(ctx, |ui| {
+    egui::Panel::bottom("editor_status_bar").show_inside(viewport_ui, |ui| {
         ui.horizontal(|ui| {
             ui.label(format!("Entities: {scene_entities}"));
             ui.separator();
             ui.label(format!("SDF volumes: {volumes}"));
             ui.separator();
-            ui.label(format!("Bricks: {bricks}"));
-            ui.separator();
-            let (color, text) = if dirty {
-                (egui::Color32::YELLOW, format!("BAKING ({pending})"))
-            } else {
-                (egui::Color32::GREEN, "BAKED".to_string())
-            };
-            ui.colored_label(color, text);
 
             // Perf readout, right-aligned so it sits at the far end of the bar.
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {

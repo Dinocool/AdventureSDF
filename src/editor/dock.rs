@@ -1,146 +1,96 @@
-//! egui_dock-driven editor layout (the soul-engine shell, modelled on the Bevy
-//! Editor Figma / jackdaw `layout`). Replaces the old fixed-`SidePanel` dock.
+//! Minimal egui_dock editor shell (voxel-RT rebuild).
 //!
-//! The host owns an [`EditorDockState`] (an `egui_dock::DockState<EditorTab>`).
-//! Content panels are *not* hard-coded here: every panel contributed via
-//! [`super::panels::register_panel`] becomes an [`EditorTab::Registered`] tab, so
-//! the registry extension API is preserved unchanged — only the layout host moved
-//! from collapsing-sections-in-SidePanel to dockable/tabbed `egui_dock`.
+//! The old soul-engine dock hosted the SDF-editor toolchain — scene tabs, hierarchy,
+//! inspector, gizmo/picking, material editor, worldgen graph — all of which were pruned in
+//! the voxel-RT rebuild. This is a slimmed shell that keeps only what compiles cleanly against
+//! the surviving crate: a dockable/tabbed `egui_dock` host that renders every panel contributed
+//! via [`super::panels::register_panel`] (Performance, diagnostics, …) plus the status bar.
+//!
+//! Voxel-specific panels (a viewport, a voxel inspector, …) will be added back here later as the
+//! voxel-RT engine grows; the registry extension API ([`register_panel`](super::panels::register_panel))
+//! is preserved so they slot in without touching this host.
 
 use bevy::prelude::*;
 use bevy_egui::egui;
-use egui_dock::tab_viewer::OnCloseResponse;
+use bevy_egui::egui::{LayerId, Ui, UiBuilder};
 use egui_dock::{DockArea, DockState, NodeIndex, Style, TabViewer};
 
 use super::config::EditorConfig;
 use super::panels::{DebugPanelRegistry, DockSide};
-use super::scene_tabs::{self, INITIAL_SCENE_ID, OpenScenes, SceneId};
 
-/// A tab in the editor dock. `Scene(id)` is a center 3D scene view (one per open scene,
-/// named after the file); the rest are content panels. Built-in shell tabs have their own
-/// variants; contributed debug/tool panels come through `Registered`.
-///
-/// Serializable so the dock layout can be saved/restored. Saved layouts collapse the scene
-/// box to a single `NoScene` placeholder (scene ids are session-specific); applying a layout
-/// re-injects the live scenes — see [`super::layout`].
+/// A tab in the editor dock. Built-in shell tabs have their own variants; contributed
+/// debug/tool panels come through `Registered`.
 #[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum EditorTab {
-    /// Center 3D scene view for the open scene `id`. Only the active scene renders; the
-    /// tab's on-screen rect is fed back to the SDF camera so the raymarch only fills the
-    /// viewport region. Switching scene tabs swaps which scene is live in the world.
-    Scene(SceneId),
-    /// Empty-state placeholder shown in the center when every scene has been closed. Not
-    /// closeable; replaced by a `Scene` tab as soon as one is opened.
-    NoScene,
-    /// Scene-tree panel. Top-left.
-    Hierarchy,
-    /// Selected-entity component editor (Godot-style). Right.
-    Inspector,
-    /// Read-only `assets/` file tree. Bottom-left.
-    ProjectFiles,
-    /// Center-bottom drawer. A stub for now; gains tabs (assets, output, etc.) later.
-    AssetsDrawer,
+    /// Center placeholder tab — the empty viewport region. Replaced by a real voxel viewport
+    /// once that lands; for now it just shows a short hint.
+    Viewport,
     /// A panel from [`DebugPanelRegistry`], keyed by its stable id.
     Registered(String),
-    /// A dynamic worldgen **Node Preview** center tab, keyed by its unique preview-instance id. Spawned
-    /// by the Biome Graph's "→ panel" (unbounded — one per click); state lives in
-    /// `WorldgenPreviewPanels::map`. Like `Scene`, these are session-only and NOT layout-persisted.
-    WorldgenPreview(u64),
 }
 
-/// Editor dock state + the viewport rect/pointer feedback the camera system reads.
+/// Editor dock state.
 #[derive(Resource)]
 pub struct EditorDockState {
     pub state: DockState<EditorTab>,
-    /// Center viewport rect in egui points, captured each frame. Consumed by
-    /// `set_sdf_camera_viewport` to confine the 3D camera.
-    pub viewport_rect: egui::Rect,
-    /// True when the cursor is inside the viewport tab (gates picking so clicks on
-    /// panels don't fall through to the scene).
-    pub pointer_in_viewport: bool,
 }
 
 impl EditorDockState {
-    /// Build the initial layout from the registered panels: Hierarchy + left-dock
-    /// panels on the left, right-dock panels on the right, bottom-dock panels in a
-    /// strip under the center viewport. Mirrors the Bevy Editor Figma arrangement.
-    /// Reused by `layout::restore_default`, hence `pub(crate)`.
+    /// Build the initial layout from the registered panels: left-dock panels on the left,
+    /// right-dock panels on the right, bottom-dock panels under the center, center-dock panels
+    /// as tabs next to the viewport placeholder.
     pub(crate) fn build(registry: &DebugPanelRegistry) -> Self {
-        // Godot/jackdaw arrangement. Root holds the single Viewport tab. Each split
-        // returns [old_node, new_node]; we thread those indices so the viewport stays
-        // one center tab (splitting `root()` repeatedly caused the "two viewports" bug).
-        //
-        //   ┌──────────┬───────────────────┬───────────┐
-        //   │ Hierarchy│      Viewport     │ Inspector │
-        //   │          ├───────────────────┤  + right  │
-        //   │  Project │   Assets drawer   │   panels  │
-        //   │   Files  │  + bottom panels  │           │
-        //   └──────────┴───────────────────┴───────────┘
-        // egui_dock 0.18 semantics: `split_X(parent, fraction, tabs)` places the NEW
-        // `tabs` node on the X side at `fraction` of the parent's size, and returns
-        // `[old, new]` where `old` is the inherited content (the viewport). So a 20%
-        // left panel = `split_left(.., 0.20, ..)`, and we thread `old` (the viewport)
-        // forward as `center`.
-        let mut state = DockState::new(vec![EditorTab::Scene(INITIAL_SCENE_ID)]);
+        let mut state = DockState::new(vec![EditorTab::Viewport]);
         let surface = state.main_surface_mut();
         let mut center = NodeIndex::root();
 
-        // Left column: Hierarchy (+ Left-dock registered panels), 20% of the window.
-        let mut left_tabs = vec![EditorTab::Hierarchy];
-        left_tabs.extend(
-            registry
-                .ids_for(DockSide::Left)
-                .into_iter()
-                .map(EditorTab::Registered),
-        );
-        let [new_center, left] = surface.split_left(center, 0.20, left_tabs);
-        center = new_center;
-        // Stack Project Files under Hierarchy in the SAME left column (Hierarchy
-        // keeps the top 60%, Project Files the bottom 40%).
-        surface.split_below(left, 0.60, vec![EditorTab::ProjectFiles]);
+        let left_tabs: Vec<EditorTab> = registry
+            .ids_for(DockSide::Left)
+            .into_iter()
+            .map(EditorTab::Registered)
+            .collect();
+        if !left_tabs.is_empty() {
+            let [new_center, _left] = surface.split_left(center, 0.20, left_tabs);
+            center = new_center;
+        }
 
-        // Right column: Inspector (+ Right-dock registered panels), ~22% of the window.
-        let mut right_tabs = vec![EditorTab::Inspector];
-        right_tabs.extend(
-            registry
-                .ids_for(DockSide::Right)
-                .into_iter()
-                .map(EditorTab::Registered),
-        );
-        let [new_center, _right] = surface.split_right(center, 0.78, right_tabs);
-        center = new_center;
+        let right_tabs: Vec<EditorTab> = registry
+            .ids_for(DockSide::Right)
+            .into_iter()
+            .map(EditorTab::Registered)
+            .collect();
+        if !right_tabs.is_empty() {
+            let [new_center, _right] = surface.split_right(center, 0.78, right_tabs);
+            center = new_center;
+        }
 
-        // Center-bottom: Assets drawer (+ Bottom-dock panels); viewport keeps the top 72%. `split_below`
-        // turns `center` into a parent split, so the viewport LEAF is the returned `[top, _]`.
-        let mut bottom_tabs = vec![EditorTab::AssetsDrawer];
-        bottom_tabs.extend(
-            registry
-                .ids_for(DockSide::Bottom)
-                .into_iter()
-                .map(EditorTab::Registered),
-        );
-        let [viewport_leaf, _bottom] = surface.split_below(center, 0.72, bottom_tabs);
+        let bottom_tabs: Vec<EditorTab> = registry
+            .ids_for(DockSide::Bottom)
+            .into_iter()
+            .map(EditorTab::Registered)
+            .collect();
+        let viewport_leaf = if !bottom_tabs.is_empty() {
+            let [viewport_leaf, _bottom] = surface.split_below(center, 0.72, bottom_tabs);
+            viewport_leaf
+        } else {
+            center
+        };
 
-        // Center-dock panels become tabs in the viewport leaf, next to the Scene view.
+        // Center-dock panels become tabs in the viewport leaf, next to the placeholder.
         for id in registry.ids_for(DockSide::Center) {
             surface[viewport_leaf].append_tab(EditorTab::Registered(id));
         }
 
-        Self {
-            state,
-            viewport_rect: egui::Rect::NOTHING,
-            pointer_in_viewport: false,
-        }
+        Self { state }
     }
 }
 
-/// Bridges `egui_dock` tab rendering to the registry. Borrows `&mut World` so panel
-/// render closures (which take `&mut World`) can run; the registry is taken out of
-/// the world for the duration so the closures get exclusive access.
+/// Bridges `egui_dock` tab rendering to the registry. Borrows `&mut World` so panel render
+/// closures (which take `&mut World`) can run; the registry is taken out of the world for the
+/// duration so the closures get exclusive access.
 struct EditorTabViewer<'w> {
     world: &'w mut World,
     registry: &'w DebugPanelRegistry,
-    viewport_rect: &'w mut egui::Rect,
 }
 
 impl TabViewer for EditorTabViewer<'_> {
@@ -148,82 +98,27 @@ impl TabViewer for EditorTabViewer<'_> {
 
     fn title(&mut self, tab: &mut Self::Tab) -> egui::WidgetText {
         match tab {
-            EditorTab::Scene(id) => self.world.resource::<OpenScenes>().tab_title(*id).into(),
-            // Blank label: the empty-state center has no real tab, just room for the prompt.
-            EditorTab::NoScene => "".into(),
-            EditorTab::Hierarchy => "Scene".into(),
-            EditorTab::Inspector => "Inspector".into(),
-            EditorTab::ProjectFiles => "Project Files".into(),
-            EditorTab::AssetsDrawer => "Assets".into(),
+            EditorTab::Viewport => "Viewport".into(),
             EditorTab::Registered(id) => self.registry.title_for(id).into(),
-            EditorTab::WorldgenPreview(id) => crate::editor::worldgen_graph::preview_tab_title(self.world, *id).into(),
         }
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, tab: &mut Self::Tab) {
-        // Per-panel span so a chrome trace attributes the egui-pass cost panel-by-panel
-        // (perf roadmap E4 — measure before cutting).
-        let _span = match tab {
-            EditorTab::Scene(_) => bevy::log::info_span!("panel_viewport"),
-            EditorTab::NoScene => bevy::log::info_span!("panel_noscene"),
-            EditorTab::Hierarchy => bevy::log::info_span!("panel_hierarchy"),
-            EditorTab::Inspector => bevy::log::info_span!("panel_inspector"),
-            EditorTab::ProjectFiles => bevy::log::info_span!("panel_project_files"),
-            EditorTab::AssetsDrawer => bevy::log::info_span!("panel_assets"),
-            // Carry the panel id as a span field so a chrome trace attributes each registered
-            // panel (they otherwise share one span name and blur together).
-            EditorTab::Registered(id) => bevy::log::info_span!("panel_registered", panel = %id),
-            EditorTab::WorldgenPreview(_) => bevy::log::info_span!("panel_worldgen_preview"),
-        }
-        .entered();
-        // Live CPU tag mirroring the trace span, so the Performance panel's own breakdown
-        // attributes the editor-UI cost per panel instead of one opaque "editor ui" band.
-        // Only the Registered title is dynamic; intern it once for a `&'static` tag.
         let _cpu = crate::instrument::span(match tab {
-            EditorTab::Scene(_) => "ui: viewport",
-            EditorTab::NoScene => "ui: empty",
-            EditorTab::Hierarchy => "ui: hierarchy",
-            EditorTab::Inspector => "ui: inspector",
-            EditorTab::ProjectFiles => "ui: project files",
-            EditorTab::AssetsDrawer => "ui: assets",
+            EditorTab::Viewport => "ui: viewport",
             EditorTab::Registered(id) => {
                 crate::instrument::intern(&format!("ui: {}", self.registry.title_for(id)))
             }
-            EditorTab::WorldgenPreview(_) => "ui: node preview",
         });
         match tab {
-            EditorTab::Scene(id) => {
-                // Only the active scene tab's `ui()` runs (egui_dock renders one tab per
-                // leaf), so recording it here tells the swap logic which scene is visible.
-                self.world.resource_mut::<OpenScenes>().rendered = Some(*id);
-                // Toolbar strip across the top of the viewport tab. The remaining area
-                // below it is what the 3D camera renders into.
-                super::viewport_toolbar::viewport_toolbar(self.world, ui);
-                // Capture the region the 3D camera should render into. The SDF pass
-                // fills this rect; everything else here is just reserved space.
-                let rect = ui.clip_rect();
-                *self.viewport_rect = rect;
-                viewport_material_drop(self.world, ui, rect);
-            }
-            EditorTab::NoScene => {
-                // Empty-state center: no live viewport here, just the centered prompt. Clear
-                // the viewport rect so pointer-in-viewport (camera input) reads false.
-                *self.viewport_rect = egui::Rect::NOTHING;
-                empty_state_message(ui);
-            }
-            EditorTab::Hierarchy => {
-                super::hierarchy::hierarchy_ui(self.world, ui);
-            }
-            EditorTab::Inspector => {
-                egui::ScrollArea::vertical().show(ui, |ui| {
-                    super::inspector::inspector_ui(self.world, ui);
+            EditorTab::Viewport => {
+                ui.centered_and_justified(|ui| {
+                    ui.label(
+                        egui::RichText::new("Voxel-RT viewport")
+                            .weak()
+                            .size(16.0),
+                    );
                 });
-            }
-            EditorTab::ProjectFiles => {
-                super::project_files::project_files_ui(self.world, ui);
-            }
-            EditorTab::AssetsDrawer => {
-                super::assets_browser::assets_browser_ui(self.world, ui);
             }
             EditorTab::Registered(id) => {
                 if let Some(render) = self.registry.panel_by_id(id).map(|p| &p.render) {
@@ -234,94 +129,22 @@ impl TabViewer for EditorTabViewer<'_> {
                     ui.weak(format!("(panel '{id}' not registered)"));
                 }
             }
-            EditorTab::WorldgenPreview(id) => {
-                egui::ScrollArea::both().show(ui, |ui| {
-                    crate::editor::worldgen_graph::preview_panel_for(self.world, ui, *id);
-                });
-            }
         }
     }
 
     fn closeable(&mut self, tab: &mut Self::Tab) -> bool {
-        // The empty-state placeholder has no close button; everything else does.
-        !matches!(tab, EditorTab::NoScene)
-    }
-
-    fn on_close(&mut self, tab: &mut Self::Tab) -> OnCloseResponse {
-        match tab {
-            // Route scene-tab closes through the document manager (it handles the
-            // unsaved-changes prompt and the last-scene → empty-state transition); ignore
-            // the close here, the manager removes the tab once confirmed.
-            EditorTab::Scene(id) => {
-                self.world.resource_mut::<OpenScenes>().close_request = Some(*id);
-                OnCloseResponse::Ignore
-            }
-            // Closing a preview tab drops its instance state (so it doesn't leak / reopen).
-            EditorTab::WorldgenPreview(id) => {
-                crate::editor::worldgen_graph::close_preview(self.world, *id);
-                OnCloseResponse::Close
-            }
-            _ => OnCloseResponse::Close,
-        }
+        // The viewport placeholder stays; panels can be closed.
+        !matches!(tab, EditorTab::Viewport)
     }
 
     fn clear_background(&self, tab: &Self::Tab) -> bool {
-        // Don't paint over the active scene's region — the 3D camera renders there. The
-        // placeholder IS painted (the world is empty, so there's nothing to see through).
-        !matches!(tab, EditorTab::Scene(_))
+        // Paint the placeholder; a future real viewport would let the 3D camera show through.
+        !matches!(tab, EditorTab::Viewport)
     }
 }
 
-/// Centered "no scene open" prompt, shown in the empty state (no tabs, no buttons).
-fn empty_state_message(ui: &mut egui::Ui) {
-    ui.centered_and_justified(|ui| {
-        ui.label(
-            egui::RichText::new(format!(
-                "No scene open\nUse File {} Open to load a scene",
-                egui_phosphor::regular::CARET_RIGHT
-            ))
-                .weak()
-                .size(16.0),
-        );
-    });
-}
-
-/// Accept a material dropped onto the 3D viewport: ray-pick the SDF volume under the cursor
-/// and set its material. Mirrors the inspector drop, but resolves the target entity via CPU
-/// picking instead of an explicit selection.
-fn viewport_material_drop(world: &mut World, ui: &mut egui::Ui, rect: egui::Rect) {
-    use crate::editor::assets_browser::MaterialDrag;
-
-    let resp = ui.interact(
-        rect,
-        ui.id().with("viewport_material_drop"),
-        egui::Sense::hover(),
-    );
-
-    // Highlight the viewport while a material drag hovers it.
-    if egui::DragAndDrop::payload::<MaterialDrag>(ui.ctx()).is_some() && resp.contains_pointer() {
-        ui.painter().rect_stroke(
-            rect.shrink(1.0),
-            0.0,
-            ui.visuals().selection.stroke,
-            egui::StrokeKind::Inside,
-        );
-    }
-
-    if let Some(drag) = resp.dnd_release_payload::<MaterialDrag>() {
-        // Cursor in window-logical points — the SDF camera is full-window, so this matches
-        // what `sdf_picking` reads from `window.cursor_position()`.
-        if let Some(p) = ui.ctx().pointer_interact_pos() {
-            let cursor = bevy::math::Vec2::new(p.x, p.y);
-            if let Some(entity) = crate::sdf_render::pick_sdf_volume(world, cursor) {
-                crate::sdf_render::debug::set_entity_material(world, entity, &drag.0);
-            }
-        }
-    }
-}
-
-/// Initialise the dock layout from the registered panels, once, after all plugins
-/// have registered their panels.
+/// Initialise the dock layout from the registered panels, once, after all plugins have
+/// registered their panels.
 pub fn init_dock_state(world: &mut World) {
     let registry = world
         .remove_resource::<DebugPanelRegistry>()
@@ -329,12 +152,9 @@ pub fn init_dock_state(world: &mut World) {
     let dock = EditorDockState::build(&registry);
     world.insert_resource(registry);
     world.insert_resource(dock);
-    // Restore the auto-persisted layout from the last session, if any (keeps the live scenes
-    // in the center; only the panel arrangement is restored).
-    super::layout::load_current_layout(world);
 }
 
-/// Render the editor dock each frame (menu bar + status bar + central DockArea).
+/// Render the editor dock each frame (status bar + central DockArea).
 pub fn show_editor_dock(world: &mut World) {
     if !world.resource::<EditorConfig>().enabled {
         return;
@@ -348,23 +168,24 @@ pub fn show_editor_dock(world: &mut World) {
     };
     let ctx = egui_ctx.into_inner().get_mut().clone();
 
-    // Section spans so a chrome trace breaks the editor egui pass into its parts; the
-    // `instrument::span`s mirror them into the live Performance breakdown.
-    bevy::log::info_span!("editor_menu_bar").in_scope(|| {
-        let _cpu = crate::instrument::span("ui: menu bar");
-        super::menu_bar::menu_bar_ui(world, &ctx)
-    });
-    super::scene_browser::open_scene_dialog_ui(world, &ctx);
-    super::scene_browser::save_scene_dialog_ui(world, &ctx);
+    // bevy_egui 0.40 / egui 0.34 idiom: build ONE root viewport `Ui` covering the window on the
+    // background layer, then draw every panel + the dock into it with `show_inside`. (The old
+    // top-level `Panel::show(ctx, …)` / `DockArea::show(ctx, …)` entrypoints are deprecated.)
+    let mut viewport_ui = Ui::new(
+        ctx.clone(),
+        "editor_viewport".into(),
+        UiBuilder::new()
+            .layer_id(LayerId::background())
+            .max_rect(ctx.viewport_rect()),
+    );
+
     bevy::log::info_span!("editor_status_bar").in_scope(|| {
         let _cpu = crate::instrument::span("ui: status bar");
-        super::status_bar::status_bar_ui(world, &ctx)
+        super::status_bar::status_bar_ui(world, &mut viewport_ui)
     });
-    super::layout::layouts_ui(world, &ctx);
-    super::notifications::notifications_ui(world, &ctx);
 
-    // Take the registry and dock state out so the tab closures get exclusive
-    // `&mut World`. Both are restored before returning.
+    // Take the registry and dock state out so the tab closures get exclusive `&mut World`.
+    // Both are restored before returning.
     let registry = world
         .remove_resource::<DebugPanelRegistry>()
         .unwrap_or_default();
@@ -376,154 +197,38 @@ pub fn show_editor_dock(world: &mut World) {
         }
     };
 
-    // Multi-scene tab orchestration. Drain File-menu requests (which may add/remove scene
-    // tabs) BEFORE rendering, so the tab set is current this frame. The active scene's dirty
-    // flag is kept live by the `mark_scene_dirty` system (pure change-detection, no serialize).
-    let type_registry = world.resource::<AppTypeRegistry>().clone();
-    scene_tabs::drain_requests(world, &mut dock, &type_registry);
-
-    let mut viewport_rect = dock.viewport_rect;
     {
         let _dock_span = bevy::log::info_span!("editor_dockarea").entered();
         let mut viewer = EditorTabViewer {
             world,
             registry: &registry,
-            viewport_rect: &mut viewport_rect,
         };
+        // egui 0.34: `Context::style()` → `global_style()`.
         DockArea::new(&mut dock.state)
-            .style(Style::from_egui(ctx.style().as_ref()))
-            .show(&ctx, &mut viewer);
+            .style(Style::from_egui(ctx.global_style().as_ref()))
+            .show_inside(&mut viewport_ui, &mut viewer);
     }
-
-    // After render: swap to a scene tab the user clicked, and process any close request
-    // (which may pop the unsaved-changes prompt).
-    scene_tabs::handle_activation(world, &mut dock, &type_registry);
-    scene_tabs::handle_close(world, &mut dock, &type_registry, &ctx);
-
-    dock.viewport_rect = viewport_rect;
-    // Allow viewport interaction only while the pointer is inside the viewport tab AND not
-    // over a *floating* egui layer (a Window/popup such as the Create Node dialog). We test
-    // the layer order rather than `wants_pointer_input()`: the dock panels live on the
-    // Background layer, so `wants_pointer_input()` is true whenever the pointer hovers the
-    // viewport tab with no button down — which dropped wheel-zoom events (orbit/pan use a
-    // held button, so they were unaffected). A floating window is Order::Middle or above.
-    let over_floating = ctx.pointer_latest_pos().is_some_and(|p| {
-        ctx.layer_id_at(p)
-            .is_some_and(|layer| layer.order > egui::Order::Background)
-    });
-    let in_viewport = ctx
-        .pointer_latest_pos()
-        .is_some_and(|p| viewport_rect.contains(p))
-        && !over_floating;
-    dock.pointer_in_viewport = in_viewport;
-    world
-        .resource_mut::<crate::sdf_render::ViewportInputAllowed>()
-        .0 = in_viewport;
-
-    // NOTE: the SDF camera is left full-window (its `viewport` is NOT confined to the
-    // dock rect). bevy_egui auto-attaches the PrimaryEguiContext to that same camera,
-    // so shrinking its viewport collapses egui's layout area to a degenerate rect and
-    // egui_dock panics with a NaN separator. With a full-window camera + the gizmo's
-    // `viewport_rect = None`, the gizmo maps the cursor in full-window coords too, so
-    // handles stay aligned with where they're drawn. (A future dedicated full-window
-    // UI camera would let us confine the SDF camera to the center region.)
 
     world.insert_resource(dock);
     world.insert_resource(registry);
 }
 
-// --- Tab topology -----------------------------------------------------------------------
-// The single place that knows the `DockState<EditorTab>` leaf layout: which leaf is the center
-// "scene box", which leaf anchors each side, and how to splice a tab in. `scene_tabs` (document/swap)
-// and `layout` (panel show/hide + layout restore) call these instead of re-deriving leaves
-// themselves (they used to each scan `is_center_tab` / find anchors independently).
-
-/// The main-surface leaf hosting the scene tabs (or the empty-state placeholder).
-pub(crate) fn center_leaf(dock: &EditorDockState) -> Option<NodeIndex> {
-    dock.state
-        .main_surface()
-        .iter()
-        .enumerate()
-        .find_map(|(i, node)| {
-            let has_center = node
-                .tabs()
-                .is_some_and(|tabs| tabs.iter().any(is_center_tab));
-            has_center.then_some(NodeIndex(i))
-        })
-}
-
-/// Whether `tab` belongs to the center "scene box" (a scene view or the empty placeholder).
-pub(crate) fn is_center_tab(tab: &EditorTab) -> bool {
-    matches!(tab, EditorTab::Scene(_) | EditorTab::NoScene)
-}
-
-/// Leaf that anchors a given `side` (one of its shell panels), so re-shown panels group with
-/// their siblings instead of spawning a fresh region.
-pub(crate) fn side_anchor_leaf(dock: &EditorDockState, side: DockSide) -> Option<NodeIndex> {
-    let anchors: &[EditorTab] = match side {
-        DockSide::Left => &[EditorTab::Hierarchy, EditorTab::ProjectFiles],
-        DockSide::Right => &[EditorTab::Inspector],
-        DockSide::Bottom => &[EditorTab::AssetsDrawer],
-        DockSide::Center => return center_leaf(dock),
-    };
-    anchors
-        .iter()
-        .find_map(|t| dock.state.find_main_surface_tab(t).map(|(n, _)| n))
-}
-
-/// Add `tab` on its home `side`: into an existing same-side leaf if one is open, else split a
-/// new region off the center scene box.
-pub(crate) fn add_panel_tab(dock: &mut EditorDockState, tab: EditorTab, side: DockSide) {
-    if let Some(node) = side_anchor_leaf(dock, side) {
-        dock.state.main_surface_mut()[node].append_tab(tab);
-        return;
-    }
-    let Some(center) = center_leaf(dock) else {
-        dock.state.push_to_first_leaf(tab);
-        return;
-    };
-    let surface = dock.state.main_surface_mut();
-    match side {
-        DockSide::Left => {
-            surface.split_left(center, 0.20, vec![tab]);
-        }
-        DockSide::Right => {
-            surface.split_right(center, 0.78, vec![tab]);
-        }
-        DockSide::Bottom => {
-            surface.split_below(center, 0.72, vec![tab]);
-        }
-        DockSide::Center => {
-            surface[center].append_tab(tab);
-        }
-    }
-}
-
-/// Wires the dock shell: the egui input-absorption poke, the Phosphor icon font, the one-shot
-/// dock-layout build, and the per-frame dock render. Was inline in `EditorPlugin::build`; added
-/// LAST (after every plugin has registered its panels, which `init_dock_state` consumes).
+/// Wires the dock shell: disables egui's blanket input absorption, installs the Phosphor icon
+/// font, builds the dock layout after Startup (so every plugin's panels are registered), and
+/// renders the dock each frame.
 pub struct DockPlugin;
 
 impl Plugin for DockPlugin {
     fn build(&self, app: &mut App) {
-        // Do NOT use egui's blanket input absorption: egui_dock's central Viewport tab is itself an
-        // egui surface, so the absorber would clear mouse input even when the cursor is over the 3D
-        // region — killing viewport interaction. Instead the SDF orbit/pick/gizmo systems gate on
-        // `ViewportInputAllowed`, which `show_editor_dock` sets from the pointer-in-viewport test.
+        // Don't clear bevy input when egui has focus — the (future) viewport tab is itself an
+        // egui surface, so the absorber would kill 3D interaction over it.
         app.world_mut()
             .resource_mut::<bevy_egui::EguiGlobalSettings>()
             .enable_absorb_bevy_input_system = false;
 
-        // Install the Phosphor icon font into the primary egui context once it exists, build
-        // the dock layout after Startup (so every plugin's panels are registered), then
-        // render the dock each frame.
-        //
-        // The primary EguiContext is attached to the camera by bevy_egui's
-        // `setup_primary_egui_context_system`, which only resolves in PreUpdate's
-        // `InitContexts` of the first frame — AFTER PostStartup. Installing at PostStartup
-        // therefore found no context and silently no-op'd, leaving every icon as tofu. So we
-        // run in PreUpdate after InitContexts (and before BeginPass, so the fonts are live for
-        // that frame's pass) with a one-shot guard.
+        // Install the Phosphor icon font into the primary egui context once it exists (only
+        // resolves in PreUpdate's InitContexts of the first frame, after PostStartup), build the
+        // dock layout after Startup, then render the dock each frame.
         app.add_systems(
             PreUpdate,
             install_phosphor_font
@@ -535,10 +240,7 @@ impl Plugin for DockPlugin {
     }
 }
 
-/// Merge the Phosphor icon font into the primary egui context's fonts, once. `add_to_fonts`
-/// inserts it into the Proportional family alongside egui's built-ins, so icon glyphs
-/// (`egui_phosphor::regular::*`) render inline with normal toolbar text. Runs every frame
-/// until the primary context exists, then no-ops via the `installed` guard.
+/// Merge the Phosphor icon font into the primary egui context's fonts, once.
 fn install_phosphor_font(
     mut contexts: Query<&mut bevy_egui::EguiContext, With<bevy_egui::PrimaryEguiContext>>,
     mut installed: Local<bool>,

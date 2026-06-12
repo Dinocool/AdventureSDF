@@ -61,22 +61,3 @@ pub fn spawn_test_player(world: &mut World) -> Entity {
         ))
         .id()
 }
-
-/// Spawn an NPC quest-giver for world/interaction tests. Mirrors the entity built
-/// by the `generate_world_scene` test in `src/world/mod.rs`.
-pub fn spawn_test_npc(world: &mut World) -> Entity {
-    world
-        .spawn((
-            crate::world::Npc {
-                name: "TestNpc".into(),
-                level: 5,
-                hostile: false,
-            },
-            crate::world::QuestGiver {
-                quest_name: "Test Quest".into(),
-                quest_description: "A test quest.".into(),
-            },
-            Transform::from_xyz(2.0, 0.0, 2.0),
-        ))
-        .id()
-}

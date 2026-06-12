@@ -8,9 +8,14 @@ use bevy::window::{CursorGrabMode, CursorOptions};
 
 use crate::player::CharacterController;
 use crate::scene_manager::{AppScene, SceneEntity};
-use crate::world::Terrain;
 
 pub struct CameraPlugin;
+
+/// Marker for terrain meshes the third-person camera ray-casts against to avoid clipping. Previously
+/// lived in the now-removed `world` module (voxel-RT rebuild); kept here as a local marker so the
+/// camera's terrain-collision ray-cast still compiles. Nothing spawns it yet in the rebuilt app.
+#[derive(Component)]
+pub struct Terrain;
 
 #[derive(Resource)]
 pub struct CameraMode {

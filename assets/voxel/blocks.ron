@@ -1,0 +1,29 @@
+// Voxel block registry — SCHEMA REFERENCE (Stage 1).
+//
+// NOTE: Stage 1 builds the live `BlockRegistry` in CODE from the worldgen palette
+// (`assets/worldgen/biomes.ron`) so there is a single source of truth for the
+// `TerrainMatId -> BlockId -> colour` chain (see `src/voxel/palette.rs`). This file documents the
+// intended on-disk schema for when blocks need to DIVERGE from terrain materials (a later stage can
+// load it instead of deriving). It is NOT loaded by the engine yet.
+//
+// BlockId(0) is always AIR. `color`/`emissive` are LINEAR. `roughness`/`metal` are PBR fallbacks.
+// `tintable` flags whether a future per-instance tint may modulate `color`.
+//
+// The blocks below mirror the default `biomes.ron` materials (id i here == TerrainMatId(i) == BlockId(i+1)).
+BlockRegistryAsset(
+    blocks: [
+        // name          color (linear RGBA)           rough  metal  emissive       tintable
+        ( name: "grass",      color: (0.05, 0.22, 0.04, 1.0), roughness: 0.95, metal: 0.0, emissive: (0.0, 0.0, 0.0), tintable: true ),
+        ( name: "grass_dark", color: (0.03, 0.13, 0.03, 1.0), roughness: 0.95, metal: 0.0, emissive: (0.0, 0.0, 0.0), tintable: true ),
+        ( name: "dirt",       color: (0.12, 0.07, 0.03, 1.0), roughness: 1.0,  metal: 0.0, emissive: (0.0, 0.0, 0.0), tintable: true ),
+        ( name: "stone",      color: (0.18, 0.18, 0.19, 1.0), roughness: 0.9,  metal: 0.0, emissive: (0.0, 0.0, 0.0), tintable: true ),
+        ( name: "bedrock",    color: (0.02, 0.02, 0.025, 1.0),roughness: 0.85, metal: 0.0, emissive: (0.0, 0.0, 0.0), tintable: true ),
+        ( name: "sand",       color: (0.62, 0.50, 0.27, 1.0), roughness: 1.0,  metal: 0.0, emissive: (0.0, 0.0, 0.0), tintable: true ),
+        ( name: "sandstone",  color: (0.45, 0.30, 0.15, 1.0), roughness: 0.95, metal: 0.0, emissive: (0.0, 0.0, 0.0), tintable: true ),
+        ( name: "tundra",     color: (0.28, 0.27, 0.18, 1.0), roughness: 1.0,  metal: 0.0, emissive: (0.0, 0.0, 0.0), tintable: true ),
+        ( name: "permafrost", color: (0.16, 0.19, 0.24, 1.0), roughness: 0.9,  metal: 0.0, emissive: (0.0, 0.0, 0.0), tintable: true ),
+        ( name: "snow",       color: (0.85, 0.88, 0.95, 1.0), roughness: 0.7,  metal: 0.0, emissive: (0.0, 0.0, 0.0), tintable: true ),
+        ( name: "rock",       color: (0.13, 0.13, 0.14, 1.0), roughness: 0.85, metal: 0.0, emissive: (0.0, 0.0, 0.0), tintable: true ),
+        ( name: "flower",     color: (0.30, 0.05, 0.22, 1.0), roughness: 0.95, metal: 0.0, emissive: (0.0, 0.0, 0.0), tintable: true ),
+    ],
+)

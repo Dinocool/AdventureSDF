@@ -125,10 +125,9 @@ pub(crate) fn spawn_editor_camera(mut commands: Commands, existing: Query<(), Wi
             ..default()
         },
         // HDR so the view target is linear Rgba16Float and Bevy's Tonemapping pass converts
-        // (linear→sRGB) for display. The SDF shader then writes LINEAR radiance, which lets the
-        // SSR history buffer hold correct linear values for the reflection IBL term. In Bevy
-        // 0.18 `hdr` is the `Hdr` marker component (was `Camera.hdr`).
-        bevy::render::view::Hdr,
+        // (linear→sRGB) for display. In Bevy 0.19 the `Hdr` marker moved to `bevy::camera::Hdr`
+        // (was `bevy::render::view::Hdr` in 0.18).
+        bevy::camera::Hdr,
         Transform::from_translation(pos).looking_at(orbit.target, Vec3::Y),
         Msaa::Off,
         SdfCamera,

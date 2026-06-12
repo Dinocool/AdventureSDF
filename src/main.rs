@@ -6,7 +6,6 @@ use bevy::render::RenderPlugin;
 use bevy::render::render_resource::WgpuFeatures;
 use bevy::render::settings::{RenderCreation, WgpuSettings};
 use bevy::window::WindowResolution;
-use bevy_rapier3d::prelude::*;
 
 /// Each editor run creates a `trace-<timestamp>.json` (our `editor::chrome_trace` layer) in
 /// the CWD; a captured one can grow to tens of GB. Our chrome layer has no retention hook, so
@@ -91,7 +90,11 @@ fn wgpu_settings() -> WgpuSettings {
             // (sdf_render::render::atlas_pages), indexed per-fragment by the brick's page — needs the
             // texture binding array + non-uniform indexing features. Universal on desktop Vulkan/DX12.
             | WgpuFeatures::TEXTURE_BINDING_ARRAY
-            | WgpuFeatures::SAMPLED_TEXTURE_AND_STORAGE_BUFFER_ARRAY_NON_UNIFORM_INDEXING,
+            | WgpuFeatures::SAMPLED_TEXTURE_AND_STORAGE_BUFFER_ARRAY_NON_UNIFORM_INDEXING
+            // Voxel-RT Stage 2: hardware-ray-traced voxel path needs AABB-BLAS `ray_query` (per-brick
+            // procedural AABB + in-shader DDA). Bevy 0.19 already enables `ExperimentalFeatures` at device
+            // creation, so this flag is all that's required. Universal on desktop Vulkan/DX12 with RT.
+            | WgpuFeatures::EXPERIMENTAL_RAY_QUERY,
         ..default()
     };
     // Editor builds enable GPU timestamp + pipeline-statistics queries so `RenderDiagnosticsPlugin`
@@ -111,6 +114,22 @@ fn wgpu_settings() -> WgpuSettings {
         instance_flags: bevy::render::settings::InstanceFlags::DEBUG,
         ..settings
     };
+    // DLSS (via `dlss_wgpu`) only works on the Vulkan backend, so pin to Vulkan when built with
+    // `--features dlss`. The HW-RT voxel path (AABB-BLAS `ray_query`) is fully supported on Vulkan, so
+    // this is safe — it just drops the DX12 fallback that DLSS can't use anyway. We also RAISE
+    // `max_storage_textures_per_shader_stage` (wgpu's default is 4): the DLSS-RR `raymarch_dlss` compute
+    // writes 6 storage textures in one stage (colour + diffuse/specular albedo + normal/roughness + depth +
+    // motion). RTX GPUs support far more; bump to 8.
+    #[cfg(feature = "dlss")]
+    let settings = WgpuSettings {
+        backends: Some(bevy::render::settings::Backends::VULKAN),
+        limits: {
+            let mut l = settings.limits.clone();
+            l.max_storage_textures_per_shader_stage = l.max_storage_textures_per_shader_stage.max(8);
+            l
+        },
+        ..settings
+    };
     settings
 }
 
@@ -121,6 +140,15 @@ fn main() {
     load_renderdoc();
 
     let mut app = App::new();
+
+    // DLSS Ray Reconstruction (the HW-RT voxel denoiser/upscaler) needs a project UUID registered BEFORE
+    // the render device is created (inside DefaultPlugins, where `bevy/dlss` registers `DlssInitPlugin`).
+    // Feature-gated — only present when built with `--features dlss` (also needs the NVIDIA DLSS SDK +
+    // `DLSS_SDK` env var at build time). A fresh UUID for this project.
+    #[cfg(feature = "dlss")]
+    app.insert_resource(bevy::anti_alias::dlss::DlssProjectId(
+        bevy::asset::uuid::uuid!("b4f1d2c8-3a7e-4d92-9f60-7c5e1a8b3d04"),
+    ));
 
     let default_plugins = DefaultPlugins
         .set(WindowPlugin {
@@ -135,7 +163,8 @@ fn main() {
         // BC7 (~⅙ the VRAM of RGBA8). Desktop Vulkan/DX12/Metal support BC
         // universally; device init fails loudly if a backend somehow lacks it.
         .set(RenderPlugin {
-            render_creation: RenderCreation::Automatic(wgpu_settings()),
+            // 0.19: `RenderCreation::Automatic` now takes a `Box<WgpuSettings>`.
+            render_creation: RenderCreation::Automatic(Box::new(wgpu_settings())),
             ..default()
         });
 
@@ -147,25 +176,26 @@ fn main() {
         ..default()
     });
 
+    // Voxel-RT rebuild: the SDF GPU render path, mesh-bake terrain renderer, SDF editor, and the
+    // legacy WoW gameplay modules are being replaced — only the reusable core (scene infra,
+    // soul-scene format, node tree, gizmo overlay, free-fly camera + worldgen) is registered here.
     app.add_plugins(default_plugins)
-    .add_plugins(RapierPhysicsPlugin::<NoUserData>::default())
     .add_plugins(WireframePlugin::default())
     .add_plugins(adventure::node::NodePlugin)
     .add_plugins(adventure::scene_manager::SceneManagerPlugin)
     .add_plugins(adventure::soul_scene::SoulScenePlugin)
     .add_plugins(adventure::assets::AssetsPlugin)
     .add_plugins(adventure::sdf_render::SdfScenePlugin)
-    .add_plugins(adventure::sdf_render::render::SdfRenderPlugin)
-    // Phase-0 SDF→mesh bake spike (Surface Nets). Meshes the loaded scene; press F1 to view.
-    .add_plugins(adventure::sdf_render::mesh_bake::MeshBakePlugin)
-    .add_plugins(adventure::gizmo_render::GizmoRenderPlugin)
+    // GizmoRenderPlugin dropped: it's the editor gizmo-overlay renderer (its consumers — SDF
+    // overlays, node gizmos — were pruned), and its GizmoPipeline::from_world panics requesting
+    // the bevy_pbr `MeshPipeline` resource under 0.19's render init order. Re-add with a fix if
+    // the voxel editor needs filled gizmos later.
     .add_plugins(adventure::camera::CameraPlugin)
-    .add_plugins(adventure::player::PlayerPlugin)
-    .add_plugins(adventure::world::WorldPlugin)
-    .add_plugins(adventure::ui::UiPlugin)
-    .add_plugins(adventure::combat::CombatPlugin)
-    .add_plugins(adventure::inventory::InventoryPlugin)
-    .add_plugins(adventure::networking::NetworkingPlugin)
+    // Voxel-RT Stage 1: voxelize the worldgen surface into 0.2 m cubes and render a small origin patch.
+    .add_plugins(adventure::voxel::VoxelPlugin)
+    // Voxel-RT Stage 2: hardware-ray-traced voxel path (per-brick AABB BLAS + in-shader DDA). Additive +
+    // toggleable — press R to switch the cubes ↔ the HW-RT view (default OFF, so cubes show first).
+    .add_plugins(adventure::voxel::raytrace::VoxelRtPlugin)
     .insert_resource(ClearColor(Color::srgb(0.1, 0.1, 0.15)));
 
     #[cfg(feature = "editor")]

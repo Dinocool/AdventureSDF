@@ -1,7 +1,10 @@
 use bevy::prelude::*;
+#[cfg(feature = "physics")]
 use bevy_rapier3d::prelude::*;
 
-use crate::scene_manager::{AppScene, SceneEntity};
+#[cfg(feature = "physics")]
+use crate::scene_manager::SceneEntity;
+use crate::scene_manager::AppScene;
 
 pub struct PlayerPlugin;
 
@@ -85,17 +88,24 @@ impl Plugin for PlayerPlugin {
             .register_type::<MovementSpeed>()
             .register_type::<PlayerName>()
             .register_type::<PlayerLevel>()
-            .add_message::<PlayerLevelUp>()
-            .add_systems(OnEnter(AppScene::AdventureGame), spawn_player)
+            .add_message::<PlayerLevelUp>();
+
+        // The kinematic-character movement is Rapier-driven; only wire it under the `physics` feature.
+        #[cfg(feature = "physics")]
+        app.add_systems(OnEnter(AppScene::AdventureGame), spawn_player)
             .add_systems(
                 Update,
                 move_player
                     .after(crate::camera::toggle_camera_mode)
                     .run_if(in_state(AppScene::AdventureGame)),
             );
+        // Silence the unused-import warning for `AppScene` in the non-physics build.
+        #[cfg(not(feature = "physics"))]
+        let _ = AppScene::AdventureGame;
     }
 }
 
+#[cfg(feature = "physics")]
 fn spawn_player(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
@@ -128,6 +138,7 @@ fn spawn_player(
     ));
 }
 
+#[cfg(feature = "physics")]
 #[allow(clippy::type_complexity)] // Bevy query tuple; an alias hurts readability here.
 pub fn move_player(
     keyboard: Res<ButtonInput<KeyCode>>,
@@ -245,6 +256,7 @@ mod tests {
         assert_eq!(cc.vertical_velocity, 0.0);
     }
 
+    #[cfg(feature = "physics")]
     #[test]
     fn move_player_exits_early_in_free_camera() {
         let mut app = test_app_with_input();

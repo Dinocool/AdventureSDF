@@ -5,14 +5,13 @@
 //! (no per-gizmo `RenderAsset`).
 
 use bevy::asset::{load_internal_asset, uuid_handle};
-use bevy::core_pipeline::core_3d::{CORE_3D_DEPTH_FORMAT, Transparent3d};
+use bevy::core_pipeline::core_3d::{CORE_3D_DEPTH_FORMAT, Transparent3d, TransparentSortingInfo3d};
 use bevy::core_pipeline::prepass::{
     DeferredPrepass, DepthPrepass, MotionVectorPrepass, NormalPrepass,
 };
 use bevy::ecs::query::ROQueryItem;
 use bevy::ecs::system::SystemParamItem;
 use bevy::ecs::system::lifetimeless::SRes;
-use bevy::image::BevyDefault as _;
 use bevy::mesh::{PrimitiveTopology, VertexBufferLayout};
 use bevy::pbr::{MeshPipeline, MeshPipelineKey, SetMeshViewBindGroup};
 use bevy::prelude::*;
@@ -29,7 +28,7 @@ use bevy::render::render_resource::{
 };
 use bevy::render::renderer::RenderDevice;
 use bevy::render::sync_world::MainEntity;
-use bevy::render::view::{ExtractedView, ViewTarget};
+use bevy::render::view::ExtractedView;
 use bevy::render::{Render, RenderApp, RenderSystems};
 
 use super::{GizmoCamera, GizmoDraw};
@@ -130,27 +129,24 @@ impl FromWorld for GizmoPipeline {
 #[derive(PartialEq, Eq, Hash, Clone)]
 struct GizmoPipelineKey {
     view_key: MeshPipelineKey,
+    /// The view's target texture format (HDR `Rgba16Float` or the swapchain format). In Bevy 0.19
+    /// HDR is no longer a `MeshPipelineKey` flag — the colour-target format comes straight from
+    /// [`ExtractedView::target_format`].
+    target_format: TextureFormat,
 }
 
 impl SpecializedRenderPipeline for GizmoPipeline {
     type Key = GizmoPipelineKey;
 
     fn specialize(&self, key: Self::Key) -> RenderPipelineDescriptor {
-        let format = if key.view_key.contains(MeshPipelineKey::HDR) {
-            ViewTarget::TEXTURE_FORMAT_HDR
-        } else {
-            TextureFormat::bevy_default()
-        };
-        let view_layout = self
-            .mesh_pipeline
-            .get_view_layout(key.view_key.into())
-            .clone();
+        let format = key.target_format;
+        let view_layout = self.mesh_pipeline.get_view_layout(key.view_key.into());
 
         RenderPipelineDescriptor {
             label: Some("gizmo_overlay_pipeline".into()),
             zero_initialize_workgroup_memory: true,
             layout: vec![view_layout.main_layout.clone()],
-            push_constant_ranges: vec![],
+            immediate_size: 0,
             vertex: VertexState {
                 shader: GIZMO_SHADER_HANDLE,
                 entry_point: Some("vertex".into()),
@@ -194,8 +190,9 @@ impl SpecializedRenderPipeline for GizmoPipeline {
             // Always-pass depth so the overlay sits on top of the 3D scene.
             depth_stencil: Some(DepthStencilState {
                 format: CORE_3D_DEPTH_FORMAT,
-                depth_write_enabled: false,
-                depth_compare: CompareFunction::Always,
+                // 0.19: `depth_write_enabled` + `depth_compare` are now `Option`.
+                depth_write_enabled: Some(false),
+                depth_compare: Some(CompareFunction::Always),
                 stencil: StencilState::default(),
                 bias: DepthBiasState::default(),
             }),
@@ -273,8 +270,7 @@ fn queue_gizmos(
         // adds binding 20). OR those flags into the key or the bind group is
         // incompatible at draw time.
         let msaa = msaa.copied().unwrap_or_default();
-        let mut view_key = MeshPipelineKey::from_hdr(view.hdr)
-            | MeshPipelineKey::from_msaa_samples(msaa.samples());
+        let mut view_key = MeshPipelineKey::from_msaa_samples(msaa.samples());
         if normal_prepass {
             view_key |= MeshPipelineKey::NORMAL_PREPASS;
         }
@@ -287,10 +283,20 @@ fn queue_gizmos(
         if deferred_prepass {
             view_key |= MeshPipelineKey::DEFERRED_PREPASS;
         }
-        let pipeline_id =
-            pipelines.specialize(&pipeline_cache, &pipeline, GizmoPipelineKey { view_key });
+        let pipeline_id = pipelines.specialize(
+            &pipeline_cache,
+            &pipeline,
+            GizmoPipelineKey {
+                view_key,
+                target_format: view.target_format,
+            },
+        );
 
-        phase.add(Transparent3d {
+        // The overlay is drawn last with an always-pass depth test, so it sits on top of the 3D
+        // scene — `AlwaysOnTop` sorts it after every distance-sorted item. `add_transient` (was
+        // `add` in 0.18) since this item isn't retained across frames.
+        phase.add_transient(Transparent3d {
+            sorting_info: TransparentSortingInfo3d::AlwaysOnTop,
             entity: (Entity::PLACEHOLDER, MainEntity::from(Entity::PLACEHOLDER)),
             draw_function,
             pipeline: pipeline_id,
