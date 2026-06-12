@@ -12,7 +12,6 @@
 
 use bevy::prelude::*;
 use bevy_egui::egui;
-use bevy_egui::egui::{LayerId, Ui, UiBuilder};
 use egui_dock::{DockArea, DockState, NodeIndex, Style, TabViewer};
 
 use super::config::EditorConfig;
@@ -155,6 +154,12 @@ pub fn init_dock_state(world: &mut World) {
 }
 
 /// Render the editor dock each frame (status bar + central DockArea).
+///
+/// `#[allow(deprecated)]`: egui 0.34 flags the top-level `Panel::show(ctx, …)` / `DockArea::show(ctx, …)`
+/// entry points as deprecated in favour of `show_inside(ui, …)` (an eframe-`App::ui` migration). For
+/// bevy_egui — where we only have a `&Context`, not a parent `Ui` — these top-level entry points ARE the
+/// correct API (and the only ones that actually paint, confirmed via the egui spike).
+#[allow(deprecated)]
 pub fn show_editor_dock(world: &mut World) {
     if !world.resource::<EditorConfig>().enabled {
         return;
@@ -168,20 +173,10 @@ pub fn show_editor_dock(world: &mut World) {
     };
     let ctx = egui_ctx.into_inner().get_mut().clone();
 
-    // bevy_egui 0.40 / egui 0.34 idiom: build ONE root viewport `Ui` covering the window on the
-    // background layer, then draw every panel + the dock into it with `show_inside`. (The old
-    // top-level `Panel::show(ctx, …)` / `DockArea::show(ctx, …)` entrypoints are deprecated.)
-    let mut viewport_ui = Ui::new(
-        ctx.clone(),
-        "editor_viewport".into(),
-        UiBuilder::new()
-            .layer_id(LayerId::background())
-            .max_rect(ctx.viewport_rect()),
-    );
-
-    bevy::log::info_span!("editor_status_bar").in_scope(|| {
+    // Status bar across the top (a real `egui::TopBottomPanel`).
+    egui::TopBottomPanel::top("editor_status_bar").show(&ctx, |ui| {
         let _cpu = crate::instrument::span("ui: status bar");
-        super::status_bar::status_bar_ui(world, &mut viewport_ui)
+        super::status_bar::status_bar_ui(world, ui);
     });
 
     // Take the registry and dock state out so the tab closures get exclusive `&mut World`.
@@ -197,17 +192,20 @@ pub fn show_editor_dock(world: &mut World) {
         }
     };
 
+    // Draw the dock with the TOP-LEVEL `DockArea::show(ctx, …)` — the idiom the working egui spike uses.
+    // (The previous code drew into an ad-hoc background-layer `Ui` / a `CentralPanel`, neither of which
+    // produced any painted output — the entire dock was invisible.) `DockArea::show` opens its own
+    // CentralPanel internally and respects the top status-bar panel added above.
     {
         let _dock_span = bevy::log::info_span!("editor_dockarea").entered();
         let mut viewer = EditorTabViewer {
             world,
             registry: &registry,
         };
-        // egui 0.34: `Context::style()` → `global_style()`.
         DockArea::new(&mut dock.state)
             .style(Style::from_egui(ctx.global_style().as_ref()))
-            .show_inside(&mut viewport_ui, &mut viewer);
-    }
+            .show(&ctx, &mut viewer);
+    } // viewer drops here, releasing the `&mut World` + `&registry` borrows before reinsert.
 
     world.insert_resource(dock);
     world.insert_resource(registry);
@@ -220,24 +218,51 @@ pub struct DockPlugin;
 
 impl Plugin for DockPlugin {
     fn build(&self, app: &mut App) {
-        // Don't clear bevy input when egui has focus — the (future) viewport tab is itself an
-        // egui surface, so the absorber would kill 3D interaction over it.
-        app.world_mut()
-            .resource_mut::<bevy_egui::EguiGlobalSettings>()
-            .enable_absorb_bevy_input_system = false;
+        {
+            let mut settings = app
+                .world_mut()
+                .resource_mut::<bevy_egui::EguiGlobalSettings>();
+            // Don't clear bevy input when egui has focus — the (future) viewport tab is itself an
+            // egui surface, so the absorber would kill 3D interaction over it.
+            settings.enable_absorb_bevy_input_system = false;
+            // egui does NOT render onto an HDR camera on the wgpu-trunk fork (confirmed: an HDR camera
+            // → blank dock; non-HDR → full dock). The voxel SdfCamera is HDR, so we must NOT let egui
+            // auto-attach its primary context to it. Instead we host egui on a dedicated non-HDR
+            // `Camera2d` overlay (`spawn_editor_egui_camera`), which composites over the 3D view.
+            settings.auto_create_primary_context = false;
+        }
 
         // Install the Phosphor icon font into the primary egui context once it exists (only
         // resolves in PreUpdate's InitContexts of the first frame, after PostStartup), build the
         // dock layout after Startup, then render the dock each frame.
-        app.add_systems(
-            PreUpdate,
-            install_phosphor_font
-                .after(bevy_egui::EguiPreUpdateSet::InitContexts)
-                .before(bevy_egui::EguiPreUpdateSet::BeginPass),
-        )
-        .add_systems(PostStartup, init_dock_state)
-        .add_systems(bevy_egui::EguiPrimaryContextPass, show_editor_dock);
+        app.add_systems(Startup, spawn_editor_egui_camera)
+            .add_systems(
+                PreUpdate,
+                install_phosphor_font
+                    .after(bevy_egui::EguiPreUpdateSet::InitContexts)
+                    .before(bevy_egui::EguiPreUpdateSet::BeginPass),
+            )
+            .add_systems(PostStartup, init_dock_state)
+            .add_systems(bevy_egui::EguiPrimaryContextPass, show_editor_dock);
     }
+}
+
+/// The editor's egui overlay camera: a dedicated **non-HDR** `Camera2d` that renders AFTER the 3D
+/// SdfCamera (higher [`Camera::order`]) WITHOUT clearing it ([`ClearColorConfig::None`]), and hosts the
+/// [`PrimaryEguiContext`]. egui doesn't paint onto the HDR voxel camera on the wgpu-trunk fork, so the
+/// whole editor UI lives on this 2D overlay compositing on top of the ray-traced scene.
+fn spawn_editor_egui_camera(mut commands: Commands) {
+    commands.spawn((
+        Camera2d,
+        Camera {
+            order: 10,
+            clear_color: bevy::camera::ClearColorConfig::None,
+            ..default()
+        },
+        bevy_egui::PrimaryEguiContext,
+        Name::new("Editor egui Camera"),
+        crate::soul_scene::NonSerializable,
+    ));
 }
 
 /// Merge the Phosphor icon font into the primary egui context's fonts, once.
