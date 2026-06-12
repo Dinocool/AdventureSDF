@@ -9,7 +9,12 @@ use bevy::math::bounding::Aabb3d;
 use std::collections::HashSet;
 
 fn config() -> SdfGridConfig {
-    SdfGridConfig::default()
+    // Pin the GPU brick-scheduler tests to a FIXED 0.1 m voxel, decoupled from the render default
+    // (which we tune freely — currently 0.4 m). These tests validate scheduler residency/spill/flush
+    // logic, whose expected brick counts depend on how many bricks a fixed-size test object spans —
+    // a property of the voxel scale. Pinning here keeps the whole suite stable across voxel_size tuning
+    // (the same reason the deep-interior cull test pins 0.1 explicitly).
+    SdfGridConfig { voxel_size: 0.1, ..SdfGridConfig::default() }
 }
 
 /// Dirty an ENTIRE chunk in `pending` (all 64 bricks) — the whole-chunk dirty the unit tests used

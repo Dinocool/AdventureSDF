@@ -1185,8 +1185,13 @@ mod tests {
                 // Only the stepped axis advances, by exactly one chunk world size.
                 for a in 0..3 {
                     let want = if a == axis { size } else { 0.0 };
+                    // Scale-relative tolerance: at coarse LODs the chunk min-world coords reach the
+                    // thousands (one full chunk is `size` ≈ 1.4 km at LOD 7 with a 0.4 m voxel), where an
+                    // absolute 1e-4 sits below a single f32 ULP. Tie the tolerance to the chunk size so the
+                    // tiling-exactness check stays meaningful at any voxel scale.
+                    let tol = (size.max(1.0)) * 1e-5;
                     assert!(
-                        (step[a] - want).abs() < 1e-4,
+                        (step[a] - want).abs() < tol,
                         "lod {lod} axis {axis}: neighbour offset[{a}]={} want {want}",
                         step[a]
                     );

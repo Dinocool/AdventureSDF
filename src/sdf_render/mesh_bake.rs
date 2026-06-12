@@ -4,19 +4,26 @@
 //! aggregates more bricks into one contiguous mesh — fewer draw calls/entities, coherent atomic swaps,
 //! and contiguous geometry for later decimation/LOD.
 //!
-//! **Generational coherent rounds (the update model).** To make a whole multi-chunk edit appear
-//! UNIFORMLY (not chunk-by-chunk) while staying as real-time as possible, the bake advances in rounds:
-//!  1. SNAPSHOT — when idle and something is stale, freeze the current edit list as the round's target
-//!     and record each resident chunk's target content hash.
-//!  2. BAKE — async-mesh every stale chunk against that FROZEN snapshot (one pending bake per chunk; a
-//!     completed bake is STAGED, not shown). The in-flight target is never superseded mid-round, so no
-//!     work is evicted before it's displayed.
-//!  3. COMMIT — the instant every chunk of the round is staged (or already current), swap them all in
-//!     ONE frame (and reap departed chunks the same frame). The whole edit pops together.
-//!  4. Immediately snapshot the next position (same frame) and repeat. During a drag the mesh advances
-//!     in coherent snapshots that trail the live position by ~one bake-round; on release the final
-//!     position is just the last round. Latency is bounded by bake time → tune via `K` (smaller =
-//!     faster rounds = more real-time; larger = fewer draws).
+//! **Per-chunk, hash-driven lifecycle (the update model).** Each resident chunk is an INDEPENDENT state
+//! machine ([`ChunkState`]) keyed on its LIVE desired content hash (`current_hashes[key]` = edits ⊕ lod ⊕
+//! transition flags ⊕ epoch). There is NO frozen round; every chunk always advances toward the live target:
+//!  1. REQUEST — a chunk needs a bake iff neither its `displayed` nor its `hidden` geometry matches the
+//!     desired hash and no in-flight `task` already targets it. An in-flight task whose target is SUPERSEDED
+//!     (the camera/edits moved on) is dropped + re-issued toward the live hash. Spawn order is `bake_priority`
+//!     (near rings first, then in-view), budget-capped per frame.
+//!  2. COMMIT — when a bake completes it is displayed (`commit_baked`): an object/empty chunk swaps in
+//!     immediately; a terrain chunk is spawned `Visibility::Hidden` and held in `hidden` until its per-chunk
+//!     material textures are GPU-live (keep-old-until-revealed — the OLD `displayed` stays on screen).
+//!  3. REVEAL — `reveal_ready_chunks` flips a settled hidden mesh `Visible`, despawns the old `displayed`,
+//!     and promotes it. The swap is lockstep with the material, so no green flash / no hole.
+//!  4. EVICT — a displayed mesh is reaped only when a REVEALED resident chunk tiles its region
+//!     (`render_commit_reap`), or when the chunk is `gone` (off the live clipmap). A chunk's own key ∈
+//!     resident ⇒ it is never reaped — only superseded / out-of-residency meshes are.
+//!
+//! Because nothing is frozen, a chunk can never stall waiting for a round that never re-forms — the camera
+//! can move continuously and new chunks always bake + appear. (The tradeoff vs the old atomic-band swap: an
+//! LOD-shell snap re-bakes + reveals the affected band per-chunk; keep-old-until-revealed keeps cross-LOD
+//! cracks brief/rare but not provably zero. See the `TODO(watertight)` on `mesh_resident_chunks`.)
 //!
 //! Staleness is a CONTENT HASH (`edits::bake_content_hash` of the edits overlapping a chunk — the same
 //! key the GPU bake scheduler uses, quantized so `GlobalTransform` jitter doesn't churn it). Residency
@@ -83,35 +90,6 @@ struct ChunkMeshData {
     terrain_surface: Option<super::terrain_material::TerrainSurfaceBake>,
 }
 
-/// A completed bake for a chunk's round target, held until the coherent COMMIT (`None` = empty chunk).
-struct StagedBake {
-    data: Option<ChunkMeshData>,
-}
-
-/// The frozen snapshot a bake round is meshing against. `edits = Some` ⇒ a round is in progress; all of
-/// that round's bakes use THESE edits/AABBs, so they are mutually coherent regardless of how the live
-/// edits move while the round bakes. Cleared on COMMIT.
-#[derive(Default)]
-struct BakeRound {
-    edits: Option<Arc<Vec<edits::ResolvedEdit>>>,
-    aabbs: Vec<Aabb3d>,
-    /// Frozen camera world position for this round (`None` = no camera, single-LOD fallback). Frozen with
-    /// the edits so the round's per-face transition flags are self-consistent even if the camera moves mid-round.
-    cam: Option<Vec3>,
-    /// Frozen LOD-0 cube half-extent in LOD-0 chunks (even, so shells tile cleanly).
-    half0: i32,
-    /// Frozen RESIDENT chunk set for this round. The round bakes, commits, and reaps against THIS set — never
-    /// the live (current-camera) set — so the displayed geometry only ever swaps as a complete coherent round.
-    /// That makes a LOD swap atomic: the old meshes are held until every chunk of the new residency is baked,
-    /// then old-out/new-in happen in the same commit (no 1-frame hole). The live set seeds the NEXT snapshot.
-    resident: HashSet<BrickKey>,
-    /// Frozen height-clipmap snapshot for this round — the EXACT clipmap whose coverage gate admitted this
-    /// round's residency. Each bake samples THIS snapshot (not the live global), so a clipmap that changes
-    /// mid-round — a camera roll evicting a tier, or a `lod_count` slider growing/shrinking the window
-    /// (which rebuilds + may clear the store) — can never make an in-flight bake sample uncovered ground
-    /// and trip the strict sampler. `None` = no terrain (only object edits) → the bake reads the global.
-    clipmap: Option<Arc<HeightClipmap>>,
-}
 
 /// The biome library + terrain texture arrays, bundled into one `SystemParam` so `mesh_resident_chunks`
 /// (already at Bevy's param-arity limit) can read both from a single slot.
@@ -139,21 +117,62 @@ struct MeshBakeScalars {
 #[derive(Component)]
 struct ChunkMesh(BrickKey);
 
-/// Per-chunk bake state.
+/// A freshly-spawned terrain chunk mesh that fades in lockstep with its per-chunk `TerrainMaterial` textures.
+/// `frames_left` counts down a TWO-PHASE window: it's spawned `Visibility::Hidden`; after `REVEAL_SHOW_AFTER`
+/// frames (its per-chunk `Image`s have extracted+prepared to the render world, so it can draw textured — not
+/// flat-green) it's made `Visible`; then at `0` the OLD geometry it replaces is finally dropped. The gap
+/// between "shown" and "old dropped" is a brief OVERLAP that guarantees the new mesh is actually on screen
+/// before the old one leaves — so a GPU-upload that lags the counter can never open a hole.
+#[derive(Component)]
+struct PendingReveal {
+    frames_left: u8,
+}
+
+/// Total frames from spawn until the OLD geometry a terrain chunk replaces is dropped (`frames_left` start).
+/// Covers the per-chunk `Image` extract+prepare latency PLUS an overlap margin so the new mesh is provably
+/// rendering before the old is reaped (keep-old-until-revealed). Larger = safer under heavy bursts, slightly
+/// more streaming latency + overlap. 0 ⇒ no delay.
+const REVEAL_SETTLE_FRAMES: u8 = 5;
+
+/// Frames after spawn at which the (hidden) new mesh is made `Visible` — long enough for its per-chunk GPU
+/// textures to be live (draws textured, not flat-green), short enough to leave an overlap before the old mesh
+/// is dropped at `0`. So `[REVEAL_SHOW_AFTER, REVEAL_SETTLE_FRAMES]` is the new-and-old overlap window.
+const REVEAL_SHOW_AFTER: u8 = 2;
+
+/// Is a terrain chunk's replacement now SAFE TO SWAP — its settle window fully elapsed, so the new mesh is on
+/// screen and the OLD geometry can be dropped (it counts as a "cover" for the keep-old-until-revealed reap)?
+/// Pure → the reveal system and the reap share ONE testable predicate. (If the fixed window ever proves
+/// insufficient, swap this for a true render-world `RenderAssets<GpuImage>` readiness check — callers
+/// don't change.)
+fn chunk_renderable(frames_left: u8) -> bool {
+    frames_left == 0
+}
+
+/// Per-chunk bake state — a pure, hash-driven lifecycle keyed on the LIVE desired content hash (no frozen
+/// round). A chunk always bakes toward the current `current_hashes[key]`; an in-flight bake whose target is
+/// superseded is dropped and re-issued. This is what makes the post-fill stall impossible BY CONSTRUCTION.
 #[derive(Default)]
 struct ChunkState {
-    /// Currently displayed mesh entities — ONE per material sub-mesh (empty = meshed-empty / not yet meshed).
-    entities: Vec<Entity>,
-    /// Content hash of the inputs the DISPLAYED mesh was baked from.
+    /// Currently VISIBLE (revealed) mesh entities — ONE per material sub-mesh (empty = meshed-empty / nothing
+    /// shown yet). These keep rendering until their replacement in `hidden` is REVEALED.
+    displayed: Vec<Entity>,
+    /// Content hash the `displayed` meshes were baked from (`0` = nothing shown).
     displayed_hash: u64,
-    /// Content hash this chunk is baking toward THIS round — frozen at the round's SNAPSHOT, so the
-    /// in-flight bake is never superseded by a newer position before it's displayed. Equals
-    /// `displayed_hash` when the chunk is idle / up to date.
-    target_hash: u64,
-    /// The single in-flight meshing task (baking `target_hash`), if any.
+    /// Freshly-baked replacement entities, spawned `Visibility::Hidden`, awaiting reveal (their per-chunk
+    /// material textures GPU-live). On reveal: the old `displayed` are despawned and these are promoted to
+    /// `displayed`. This is what swaps a re-baked/streamed chunk's OLD→NEW mesh in lockstep with its material.
+    hidden: Vec<Entity>,
+    /// Content hash the `hidden` meshes were baked from.
+    hidden_hash: u64,
+    /// Is `displayed` this chunk's CURRENT, on-screen result (material GPU-live)? An empty/no-surface bake sets
+    /// this `true` with an empty `displayed`. A chunk counts as a "cover" for keep-old-until-revealed (drives
+    /// `is_revealed` for the reap) ONLY when true — a not-yet-revealed replacement can't evict the geometry it
+    /// overlaps. Set by `commit_baked` (object/empty) or `reveal_ready_chunks` (terrain).
+    revealed: bool,
+    /// The single in-flight meshing task, if any.
     task: Option<Task<Option<ChunkMeshData>>>,
-    /// Completed bake of `target_hash`, awaiting the round COMMIT.
-    staged: Option<StagedBake>,
+    /// Content hash the in-flight `task` targets. A bake whose `task_hash != desired` is superseded → dropped.
+    task_hash: u64,
 }
 
 /// Per-resident-chunk bake state.
@@ -198,15 +217,24 @@ pub(crate) struct MeshBakeConfig {
     /// SURFACE-TREATMENT master strength `[0,1]` for the top (undug) layer (snow/sand/rock overrides): 0 =
     /// pure strata surface colour, 1 = full treatment. A LIVE shader uniform — no re-bake on change.
     pub(crate) surface_treatment: f32,
-    /// Attach a per-chunk PHYSICS collider (Rapier `trimesh` from the baked mesh) so the player/objects can
-    /// stand on the terrain. Re-bakes nothing (the collider is built at COMMIT from the same mesh data).
+    /// Enable the SEPARATE coarse physics-collider clipmap layer (`physics_resident_chunks`): a self-contained
+    /// set of collider-only chunks around the player/camera, baked + streamed INDEPENDENTLY of the render mesh
+    /// so the colliders persist while the render mesh re-bakes underneath (no fall-through during streaming).
     pub(crate) physics: bool,
-    /// Only chunks at this LOD or finer (`key.lod <= physics_lod`) get a collider — the "simplified" bound:
-    /// far chunks (never walked) skip the trimesh build. Higher = colliders reach further (more cost).
-    pub(crate) physics_lod: u32,
-    /// DEBUG: draw the chunks that HAVE a collider (the physics-LOD coverage) as a green wireframe overlay —
-    /// the collider geometry is the chunk's render mesh, so this shows the physics meshes + how far they
-    /// reach. A LIVE toggle (added/removed per frame on the collider chunks — no re-bake).
+    /// FINEST physics LOD — the collider layer's "+N" coarseness vs render LOD 0 (default 2 ⇒ +2 LOD, ~16×
+    /// fewer collider triangles). A character controller doesn't need render fidelity, so the colliders are a
+    /// couple of LODs coarser than the near render mesh.
+    pub(crate) physics_base_lod: u32,
+    /// How many physics LODs the collider clipmap spans from `physics_base_lod` (default 2 ⇒ a small 2-ring
+    /// clipmap: finer near the player, one coarser ring out). Each ring doubles the world radius (2:1).
+    pub(crate) physics_lod_count: u32,
+    /// Physics clipmap radius in `physics_base_lod` chunks (half-extent of the finest physics cube around the
+    /// focus). Small — colliders only need to reach a bit past the player; the set stays tiny so it rarely
+    /// re-streams. Higher = colliders reach further (more chunks to keep baked).
+    pub(crate) physics_half_chunks: i32,
+    /// DEBUG: render each baked physics-collider chunk as a green wireframe (the COARSE collider mesh + the
+    /// physics clipmap's reach). Toggling rebuilds the small physics set (the wireframe mesh is attached at
+    /// bake time).
     pub(crate) physics_wireframe: bool,
 }
 
@@ -218,14 +246,14 @@ const DETAIL_NORMAL_FINEST_SPACING: f32 = 2.0;
 
 impl Default for MeshBakeConfig {
     fn default() -> Self {
-        // K=4 → 64 bricks/chunk. lod0_radius 16 keeps the finest LOD out to a comfortable distance (push
-        // it down to shrink the LOD-0 cube); lod_count 16 spans LOD 0..=15 (far worldgen horizon — the
+        // K=4 → 64 bricks/chunk. lod0_radius 32 keeps the finest LOD out to a comfortable distance (push
+        // it down to shrink the LOD-0 cube); lod_count 12 spans LOD 0..=11 (far worldgen horizon — the
         // height-clipmap window auto-grows to match). Cross-LOD seams are crack-free BY CONSTRUCTION
         // (Transvoxel transition cells) — no toggle needed.
         Self {
             chunk_bricks: 4,
-            lod0_radius: 16.0,
-            lod_count: 16,
+            lod0_radius: 32.0,
+            lod_count: 12,
             debug_lod_colour: false,
             debug_normals: false,
             freeze_lod: false,
@@ -245,10 +273,13 @@ impl Default for MeshBakeConfig {
             // no more hard lines where the climate happens to change quickly. Tune via the editor slider.
             biome_blend_m: 150.0,
             surface_treatment: 1.0,
-            // Per-chunk colliders on the nearest 2 LODs (0,1) by default — the player walks the near terrain;
-            // far chunks skip the trimesh build. Bump physics_lod to collide further out.
+            // Separate coarse physics clipmap: colliders at +3 LOD (physics_base_lod 3), a 3-ring clipmap of
+            // radius 8 base-chunks around the player/camera. Coarse ⇒ rarely re-streams, persists across render
+            // re-bakes. Bump physics_half_chunks/lod_count to collide further out.
             physics: true,
-            physics_lod: 1,
+            physics_base_lod: 3,
+            physics_lod_count: 3,
+            physics_half_chunks: 8,
             physics_wireframe: false,
         }
     }
@@ -317,6 +348,13 @@ pub(crate) struct MeshBakeStats {
     capture: bool,
     /// Copy-paste-able diagnostic dump — filled when `capture` is requested.
     dump: String,
+    // --- SEPARATE PHYSICS-COLLIDER CLIPMAP (`physics_resident_chunks`) diagnostics ---
+    /// Resident collider chunks this frame (`0` ⇒ physics off / not in player mode).
+    pub(crate) physics_resident: usize,
+    /// Collider entities currently live (baked + spawned).
+    pub(crate) physics_displayed: usize,
+    /// Collider bakes in flight on the dedicated physics task pool (the honest "physics still baking" signal).
+    pub(crate) physics_baking: usize,
 }
 
 /// Mesh-bake plugin. Added in `main.rs`. The bake itself is editor- AND scene-INDEPENDENT (it runs
@@ -328,6 +366,9 @@ impl Plugin for MeshBakePlugin {
         app.add_plugins(super::mesh_material::MeshMaterialPlugin)
             .add_plugins(super::terrain_material::TerrainMaterialPlugin)
             .init_resource::<ChunkStates>()
+            .init_resource::<PhysicsChunkStates>()
+            .init_resource::<PhysicsBakePool>()
+            .init_resource::<PhysicsWireMat>()
             .init_resource::<MeshBakeConfig>()
             .init_resource::<MeshBakeRebuild>()
             .init_resource::<MeshBakeStats>()
@@ -336,11 +377,14 @@ impl Plugin for MeshBakePlugin {
             // on the editor-scene-gated GPU SDF atlas) and no-ops when no SDF volumes exist — which
             // also clears the meshes when an SDF scene is left.
             .add_systems(Update, sync_terrain_detail_params)
-            .add_systems(Update, sync_physics_wireframe)
             .add_systems(
                 Update,
                 mesh_resident_chunks.after(super::mesh_material::rebuild_mesh_material),
-            );
+            )
+            // Reveal terrain chunks once their per-chunk material is GPU-live (keep-old-until-revealed swap).
+            .add_systems(Update, reveal_ready_chunks.after(mesh_resident_chunks))
+            // The separate coarse physics-collider clipmap, streamed independently of the render mesh.
+            .add_systems(Update, physics_resident_chunks);
         // Editor-only: a dedicated bottom dock panel for the mesh-bake controls (a debug overlay; the
         // bake above does not depend on it).
         #[cfg(feature = "editor")]
@@ -370,6 +414,24 @@ fn chunk_aabb(key: BrickKey, config: &SdfGridConfig, k: u32) -> Aabb3d {
     let min = config.brick_min_world(key.coord, key.lod);
     let cw = k as f32 * config.brick_world_size(key.lod);
     Aabb3d::from_min_max(min, min + Vec3::splat(cw))
+}
+
+/// World centre of a chunk. (Test-only since the reap switched to all-8-octant coverage sampling.)
+#[cfg(test)]
+fn chunk_centre_world(key: BrickKey, config: &SdfGridConfig, k: u32) -> Vec3 {
+    let b = chunk_aabb(key, config, k);
+    (Vec3::from(b.min) + Vec3::from(b.max)) * 0.5
+}
+
+/// The LOD-`lod` chunk whose region CONTAINS world point `p` (the chunk that tiles `p` at that LOD). Chunk
+/// index `j = floor(p / chunk_world_size)`, key coord `= j · (K·cell_stride)` — the inverse of
+/// [`chunk_aabb`]/[`chunk_lod0_range`]. Used to ask "does a committed chunk tile this region?" for
+/// keep-old-until-covered.
+fn chunk_key_at(p: Vec3, lod: u32, config: &SdfGridConfig, k: u32) -> BrickKey {
+    let cw = k as f32 * config.brick_world_size(lod);
+    let stride = k as i32 * config.cell_stride();
+    let j = (p / cw).floor().as_ivec3();
+    BrickKey::new(lod, j * stride)
 }
 
 /// COVERAGE GATE predicate: is this chunk allowed to mesh against the worldgen `Terrain`? True iff
@@ -450,6 +512,132 @@ pub(crate) fn coarsest_lod_outer_reach(config: &SdfGridConfig, mesh_cfg: &MeshBa
     let half0 = lod0_half_chunks(config, mesh_cfg, k);
     let lod = effective_lod_count(config, mesh_cfg, true).saturating_sub(1); // coarsest LOD index
     (half0 << lod) as f32 * cw0
+}
+
+/// Is chunk `key`'s CENTRE inside the outer-LOD clipmap cube centred on `cam` (half-extent
+/// `(half0 << (lod_count-1)) · cw0`)? The SSOT for "is this region within a clipmap's coverage". Two uses,
+/// which together make keep-old-until-covered hold BY CONSTRUCTION:
+/// - against the LIVE camera → `gone` (outside ⇒ the chunk left the world; safe to drop its mesh + work);
+/// - against the COMMITTED round's `cam`/`half0` → "does the just-committed clipmap cover this region?" A
+///   displayed mesh is reaped at a commit ONLY when the committed clipmap covers it (its replacement is now
+///   displayed) OR it's `gone` — so an old mesh is never despawned before a covering chunk exists.
+///
+/// `None` camera ⇒ single-LOD fallback ⇒ always "covered" (no clipmap to leave).
+fn chunk_in_outer_cube(
+    key: BrickKey,
+    cam: Option<Vec3>,
+    half0: i32,
+    lod_count: u32,
+    config: &SdfGridConfig,
+    k: u32,
+) -> bool {
+    let Some(c) = cam else {
+        return true;
+    };
+    let cw0 = k as f32 * config.brick_world_size(0);
+    let outer = lod_count.saturating_sub(1);
+    let centre = lod_centre(config, k, c, outer).as_vec3() * cw0;
+    let half = ((half0 << outer) as f32) * cw0;
+    let b = chunk_aabb(key, config, k);
+    let cc = (Vec3::from(b.min) + Vec3::from(b.max)) * 0.5;
+    (cc - centre).abs().cmple(Vec3::splat(half)).all()
+}
+
+/// KEEP-OLD-UNTIL-COVERED commit-reap decision — the single SSOT used by BOTH the render reap loop and its
+/// unit tests, so the invariant holds by construction. At a round COMMIT, a displayed chunk mesh is despawned
+/// (`true`) iff ALL of:
+/// - it is NOT re-committed by this round (`!in_committed_round` — a re-baked chunk's own commit swaps it);
+/// - it is NOT `gone` (still inside the LIVE clipmap; a gone chunk is despawned by the per-frame self-evict
+///   pass, never here — so we don't double-despawn);
+/// - this chunk's WHOLE region is TILED by REVEALED resident chunks (see [`region_covered_by_revealed`]), which
+///   handles an ARBITRARY LOD gap between the old mesh and its replacements — essential when fast movement puts
+///   SEVERAL LODs between where you were (the old chunk) and where you are (its many fine replacements).
+///
+/// The region test (not a coarse outer-cube test) is also what makes this correct under fast flight: when the
+/// height-coverage gate drops a region (the height clipmap lagging behind a fast camera), that region is
+/// ABSENT from `round_resident`, so the old mesh there is KEPT until the height loads and a committed chunk
+/// finally tiles it. This is the structural guarantee that a displayed mesh is never despawned before a
+/// covering, on-screen replacement exists.
+#[allow(clippy::too_many_arguments)] // clipmap geometry context; threading it is clearer than a wrapper struct
+fn render_commit_reap(
+    key: BrickKey,
+    in_committed_round: bool,
+    round_resident: &HashSet<BrickKey>,
+    is_revealed: &impl Fn(BrickKey) -> bool,
+    live_cam: Option<Vec3>,
+    live_half0: i32,
+    lod_count: u32,
+    config: &SdfGridConfig,
+    k: u32,
+) -> bool {
+    if in_committed_round {
+        return false;
+    }
+    if !chunk_in_outer_cube(key, live_cam, live_half0, lod_count, config, k) {
+        return false; // gone → despawned by the self-evict pass, not here
+    }
+    region_covered_by_revealed(key, round_resident, is_revealed, config, k, lod_count)
+}
+
+/// Is `key`'s WHOLE world region tiled by REVEALED resident chunks (its replacement is fully on screen)? The
+/// SSOT keep-old coverage test, correct for an ARBITRARY LOD gap. The resident chunk owning the region's CENTRE
+/// either COVERS the whole region (coarser-or-equal in the nested clipmap lattice → one `is_revealed` check) or
+/// is FINER (the region is split among finer chunks → RECURSE into the 8 child sub-chunks and require all
+/// covered). A point with NO resident owner anywhere (a coverage-gate gap, or outside the clipmap) makes it
+/// NOT covered → the old mesh is kept. The recursion descends only where coverage is actually finer (it returns
+/// immediately at a coarse owner), so it's cheap for the common adjacent (2:1) swap and bounded by the LOD gap
+/// for fast multi-LOD jumps. Replaces an 8-octant SAMPLE that silently under-counted coverage across >1 LOD and
+/// punched holes when the camera outran the bakes by several rings.
+fn region_covered_by_revealed(
+    key: BrickKey,
+    resident: &HashSet<BrickKey>,
+    is_revealed: &impl Fn(BrickKey) -> bool,
+    config: &SdfGridConfig,
+    k: u32,
+    lod_count: u32,
+) -> bool {
+    let b = chunk_aabb(key, config, k);
+    let min = Vec3::from(b.min);
+    let centre = (min + Vec3::from(b.max)) * 0.5;
+    // The resident chunk owning the centre — the finest resident LOD present there.
+    let owner = (0..lod_count).find_map(|lod| {
+        let o = chunk_key_at(centre, lod, config, k);
+        resident.contains(&o).then_some(o)
+    });
+    match owner {
+        None => false,                                  // no resident chunk here → gap → not covered
+        Some(o) if o.lod >= key.lod => is_revealed(o),  // a coarser-or-equal owner covers the whole region
+        Some(_) => {
+            // Finer coverage → split into the 8 child sub-chunks (key.lod − 1) and require ALL covered.
+            if key.lod == 0 {
+                return is_revealed(chunk_key_at(centre, 0, config, k)); // (unreachable: lod-0 owner is ≥ lod 0)
+            }
+            let child_lod = key.lod - 1;
+            let cw_child = k as f32 * config.brick_world_size(child_lod);
+            [0.0_f32, 1.0].iter().all(|&ox| {
+                [0.0_f32, 1.0].iter().all(|&oy| {
+                    [0.0_f32, 1.0].iter().all(|&oz| {
+                        let p = min + Vec3::new(ox, oy, oz) * cw_child + Vec3::splat(cw_child * 0.5);
+                        let child = chunk_key_at(p, child_lod, config, k);
+                        region_covered_by_revealed(child, resident, is_revealed, config, k, lod_count)
+                    })
+                })
+            })
+        }
+    }
+}
+
+/// Does a resident chunk need a NEW bake issued this frame? The SSOT for the REQUEST decision (shared by the
+/// production loop and the streaming simulation test). True iff neither the chunk's DISPLAYED nor its HIDDEN
+/// geometry matches the `desired` hash AND nothing is already baking.
+///
+/// CRITICAL — `has_task` short-circuits to `false`: we NEVER cancel an in-flight bake whose target was
+/// superseded. Under continuous movement the desired hash (its transition flags) changes most frames; a
+/// cancel-and-restart would drop the bake EVERY frame so it would never finish and the chunk would only appear
+/// once the camera stopped ("takes ages to show up"). Instead the in-flight bake completes + commits its
+/// slightly-stale result (the chunk appears promptly), then a follow-up bake re-issues toward the live target.
+fn chunk_needs_bake(displayed_hash: u64, hidden_hash: u64, has_task: bool, desired: u64) -> bool {
+    !has_task && displayed_hash != desired && hidden_hash != desired
 }
 
 /// LOD-0 cube half-extent in LOD-0 chunks — rounded to an EVEN number so the finer cube (half this) stays
@@ -671,9 +859,9 @@ fn mesh_chunk(
     // Install THIS ROUND'S frozen Terrain clipmap snapshot ONCE on the bake thread (held for the whole
     // bake), so every field sample reads it via a thread-local borrow instead of a process-global RwLock +
     // Arc-clone (the per-sample lock/atomic, contended across the async pool, was the dominant bake cost).
-    // Crucially the snapshot is the one whose coverage gate ADMITTED this chunk (see `BakeRound::clipmap`),
-    // so a clipmap that changes mid-bake (camera roll / `lod_count` slider rebuild) can't make this bake
-    // sample uncovered ground and trip the strict sampler. `None` (object-only round) ⇒ falls back to the
+    // Crucially the snapshot is the LIVE clipmap whose coverage gate ADMITTED this chunk this frame, so a
+    // clipmap that changes mid-bake (camera roll / `lod_count` slider rebuild) can't make this bake
+    // sample uncovered ground and trip the strict sampler. `None` (object-only scene) ⇒ falls back to the
     // global (the eval then panics only on a genuine rendering miss, which the gate still prevents).
     let _bake_terrain = crate::sdf_render::worldgen::upload::set_bake_terrain(
         terrain,
@@ -1184,35 +1372,409 @@ fn sync_terrain_detail_params(
     }
 }
 
-/// DEBUG overlay: draw the chunks that HAVE a physics collider (the `physics_lod` coverage) as a green
-/// wireframe. The collider IS the chunk's render mesh, so this shows the physics meshes + how far they reach.
-/// A LIVE toggle — adds `Wireframe` to collider-bearing chunk entities when on, removes it when off (per
-/// frame, only acting on the diff — `Without<Wireframe>` / `With<Wireframe>` filters keep it cheap at rest).
-#[allow(clippy::type_complexity)] // Bevy query filter tuple; an alias hurts readability here.
-fn sync_physics_wireframe(
-    cfg: Res<MeshBakeConfig>,
+// =====================================================================================================
+// SEPARATE PHYSICS-COLLIDER CLIPMAP LAYER
+// =====================================================================================================
+//
+// Colliders live in their OWN coarse clipmap (`physics_resident_chunks`), decoupled from the render-mesh
+// bake. A collider-only entity (`PhysicsChunk`) is a static Rapier `trimesh` baked from the SAME CSG+terrain
+// field as the render mesh, but at a COARSE LOD (`physics_base_lod`, default +2) and over a SMALL clipmap
+// around the player (else camera). Because the set is small + coarse it changes slowly → it rarely
+// re-streams, so colliders PERSIST while the render mesh churns under LOD streaming (no fall-through). No
+// cross-LOD weld is needed — a capsule controller tolerates the tiny gap/overlap at a coarse chunk border.
+
+/// A baked physics-collider chunk in the separate coarse physics clipmap (collider-only — no render mesh /
+/// material unless `physics_wireframe` attaches a debug mesh). Stamped with its chunk key. Distinct from the
+/// render `ChunkMesh`.
+#[derive(Component)]
+struct PhysicsChunk(BrickKey);
+
+/// A coarse physics bake's output: chunk-LOCAL collider positions + the flat triangle index list (`None` =
+/// empty chunk, no surface crossing).
+type PhysicsBakeResult = Option<(Vec<[f32; 3]>, Vec<u32>)>;
+
+/// Per-physics-chunk bake state. Far simpler than the render `ChunkState` — no rounds, no atomic swap, no
+/// transition flags (colliders don't weld across LODs). One in-flight bake + one displayed collider entity.
+#[derive(Default)]
+struct PhysicsChunkState {
+    /// The displayed collider entity (`None` = empty chunk / not yet baked).
+    entity: Option<Entity>,
+    /// In-flight coarse bake (returns the collider geometry: chunk-LOCAL positions + flat index list).
+    task: Option<Task<PhysicsBakeResult>>,
+    /// Content hash the displayed collider was baked from; `target_hash` is what the in-flight task targets.
+    displayed_hash: u64,
+    target_hash: u64,
+}
+
+#[derive(Resource, Default)]
+struct PhysicsChunkStates(HashMap<BrickKey, PhysicsChunkState>);
+
+/// DEDICATED task pool for collider bakes — separate from the global `AsyncComputeTaskPool` the RENDER mesh
+/// floods (up to `MAX_NEW_TASKS_PER_FRAME` chunks/frame). On the shared pool the few physics bakes queue
+/// BEHIND the entire render backlog (hundreds of chunks) and the player's colliders lag badly; their own pool
+/// runs them on independent threads so they're never blocked by render — collider bakes get effective top
+/// priority. A couple of threads is plenty for the small + coarse physics set.
+#[derive(Resource)]
+struct PhysicsBakePool(bevy::tasks::TaskPool);
+
+impl FromWorld for PhysicsBakePool {
+    fn from_world(_world: &mut World) -> Self {
+        let threads = (std::thread::available_parallelism().map_or(4, |n| n.get()) / 4).max(1);
+        Self(
+            bevy::tasks::TaskPoolBuilder::new()
+                .num_threads(threads)
+                .thread_name("physics-bake".to_string())
+                .build(),
+        )
+    }
+}
+
+/// Shared unlit material for the `physics_wireframe` debug mesh (green). Created once.
+#[derive(Resource)]
+struct PhysicsWireMat(Handle<StandardMaterial>);
+
+impl FromWorld for PhysicsWireMat {
+    fn from_world(world: &mut World) -> Self {
+        let mut mats = world.resource_mut::<Assets<StandardMaterial>>();
+        Self(mats.add(StandardMaterial {
+            base_color: Color::srgb(0.1, 1.0, 0.35),
+            unlit: true,
+            ..default()
+        }))
+    }
+}
+
+/// Per-frame budget for new physics-collider bakes (the set is small + coarse, so a low cap still fills
+/// quickly while keeping the spawn cost off the frame's critical path).
+/// Per-frame collider-bake spawn cap. Higher than before now that physics has its OWN [`PhysicsBakePool`] (it
+/// no longer competes with the render backlog), so colliders fill in fast under the moving player.
+const PHYSICS_MAX_NEW_TASKS_PER_FRAME: u32 = 24;
+
+/// Is a chunk resident in the SEPARATE physics clipmap? Mirrors [`mesh_chunk_in_shell`] but with `base` as
+/// the FINEST level (the base cube fills SOLID — no hole), so the physics layer is a self-contained coarse
+/// clipmap of LODs `[base, base+count)`, half-extent `base_half` LOD-0 chunks at the finest level, doubling
+/// per coarser ring (2:1).
+fn physics_chunk_in_shell(
+    key: BrickKey,
+    config: &SdfGridConfig,
+    k: u32,
+    center: Vec3,
+    base: u32,
+    count: u32,
+    base_half: i32,
+) -> bool {
+    if key.lod < base || key.lod >= base + count {
+        return false;
+    }
+    let lvl = key.lod - base;
+    let (lo, hi) = chunk_lod0_range(key, config, k);
+    let outer = base_half << lvl; // cube(L) half in LOD-0 chunks
+    if !range_in_cube(lo, hi, lod_centre(config, k, center, key.lod), outer) {
+        return false;
+    }
+    if key.lod == base {
+        return true; // finest physics LOD fills its cube (no finer ring to hollow it out)
+    }
+    let hole = base_half << (lvl - 1); // covered by the finer physics ring
+    !range_in_cube(lo, hi, lod_centre(config, k, center, key.lod - 1), hole)
+}
+
+/// The separate coarse physics-collider clipmap: residency → async coarse trimesh bake → collider-only
+/// entities, streamed on its own (slow) lifecycle independent of the render mesh. Tears everything down when
+/// `physics` is off, no edits exist, or there is no focus (player/camera).
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
+fn physics_resident_chunks(
     mut commands: Commands,
-    add: Query<
-        Entity,
-        (With<ChunkMesh>, With<bevy_rapier3d::prelude::Collider>, Without<bevy::pbr::wireframe::Wireframe>),
-    >,
-    remove: Query<Entity, (With<ChunkMesh>, With<bevy::pbr::wireframe::Wireframe>)>,
+    volumes: Query<VolumeQueryData, With<SdfVolume>>,
+    config: Res<SdfGridConfig>,
+    mesh_cfg: Res<MeshBakeConfig>,
+    mode: Res<super::editor_camera::SdfCameraMode>,
+    players: Query<&GlobalTransform, (With<super::player::WorldgenPlayer>, Without<SdfVolume>)>,
+    phys_chunks: Query<(Entity, &PhysicsChunk)>,
+    mut states: ResMut<PhysicsChunkStates>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    wire_mat: Res<PhysicsWireMat>,
+    bake_pool: Res<PhysicsBakePool>,
+    mut stats: ResMut<MeshBakeStats>,
 ) {
-    if cfg.physics_wireframe {
-        for e in &add {
-            commands.entity(e).insert((
+    // Default the physics diagnostics to "off"; the live counts are written at the end when we have a focus.
+    stats.physics_resident = 0;
+    stats.physics_displayed = 0;
+    stats.physics_baking = 0;
+    let teardown = |commands: &mut Commands, states: &mut PhysicsChunkStates, q: &Query<(Entity, &PhysicsChunk)>| {
+        if !states.0.is_empty() || q.iter().next().is_some() {
+            for (e, _) in q.iter() {
+                commands.entity(e).despawn();
+            }
+            states.0.clear();
+        }
+    };
+
+    let gathered = gather_sorted_edits(&volumes);
+    if !mesh_cfg.physics || gathered.is_empty() {
+        teardown(&mut commands, &mut states, &phys_chunks);
+        return;
+    }
+
+    // FOCUS = the PLAYER. Colliders are baked ONLY in player mode (when the capsule exists) — never under the
+    // free fly camera, which has nothing to collide with: baking coarse colliders there is pure wasted work
+    // (and, with the wireframe debug on, shows as stray green meshes leading the textured terrain). In fly mode
+    // the layer tears down; switching to player re-bakes it (coarse + small, so it fills near-instantly).
+    let center = mode
+        .player
+        .then(|| players.iter().next().map(|t| t.translation()))
+        .flatten();
+    let Some(center) = center else {
+        teardown(&mut commands, &mut states, &phys_chunks);
+        return;
+    };
+
+    // A `physics_wireframe` toggle is folded into the content hash below, so it RE-BAKES each collider (the new
+    // entity attaches/omits the debug mesh) and the keep-old-until-covered evict holds the old collider until
+    // the re-baked one commits — the wireframe toggles in place with NO collider teardown (no fall-through).
+
+    let k = mesh_cfg.chunk_bricks.clamp(1, 8);
+    let cs = config.cell_stride() as u32;
+    let base = mesh_cfg.physics_base_lod.min(MAX_MESH_LODS - 1);
+    let count = mesh_cfg.physics_lod_count.clamp(1, MAX_MESH_LODS - base);
+    let base_half = mesh_cfg.physics_half_chunks.max(1) << base; // finest-level half-extent, in LOD-0 chunks
+
+    // Edit AABBs (padded by the material blend reach, as the render path) + terrain coverage-gate inputs.
+    let n_edits = gathered.len();
+    let mut edit_aabbs: Vec<Aabb3d> = Vec::with_capacity(n_edits);
+    let mut edit_extent: Vec<f32> = Vec::with_capacity(n_edits);
+    let mut edit_vec: Vec<edits::ResolvedEdit> = Vec::with_capacity(n_edits);
+    for g in &gathered {
+        edit_extent.push((Vec3::from(g.aabb.max) - Vec3::from(g.aabb.min)).max_element());
+        let pad = bevy::math::Vec3A::splat(BLEND_REACH);
+        edit_aabbs.push(Aabb3d { min: g.aabb.min - pad, max: g.aabb.max + pad });
+        edit_vec.push(g.edit.clone());
+    }
+    let edits_arc = Arc::new(edit_vec);
+    let terrain_xz_aabbs: Vec<(Vec2, Vec2)> = gathered
+        .iter()
+        .filter(|g| matches!(g.edit.prim, edits::SdfPrimitive::Terrain { .. }))
+        .map(|g| (Vec2::new(g.aabb.min.x, g.aabb.min.z), Vec2::new(g.aabb.max.x, g.aabb.max.z)))
+        .collect();
+    let height_clipmap = crate::sdf_render::worldgen::upload::cpu_height_clipmap();
+
+    // RESIDENCY: per physics LOD, the chunks inside that ring's cube (clipped to the edit AABBs so we only
+    // bake where there's geometry) that pass the shell test + the terrain coverage gate.
+    let cw0 = k as f32 * config.brick_world_size(0);
+    let mut resident: HashSet<BrickKey> = HashSet::new();
+    let mut cand: HashSet<BrickKey> = HashSet::new();
+    for lvl in 0..count {
+        let lod = base + lvl;
+        cand.clear();
+        let centre = lod_centre(&config, k, center, lod).as_vec3() * cw0;
+        let half = ((base_half << lvl) as f32) * cw0;
+        let (smin, smax) = (centre - Vec3::splat(half), centre + Vec3::splat(half));
+        for a in &edit_aabbs {
+            let mn = Vec3::from(a.min).max(smin);
+            let mx = Vec3::from(a.max).min(smax);
+            if mn.cmpgt(mx).any() {
+                continue;
+            }
+            chunks_in_aabb(&Aabb3d::from_min_max(mn, mx), &config, k, lod, &mut cand);
+        }
+        for &key in &cand {
+            if !physics_chunk_in_shell(key, &config, k, center, base, count, base_half) {
+                continue;
+            }
+            if !terrain_xz_aabbs.is_empty()
+                && !terrain_chunk_covered(key, &config, k, &terrain_xz_aabbs, height_clipmap.as_deref())
+            {
+                continue;
+            }
+            resident.insert(key);
+        }
+    }
+
+    // The padded sampled AABB of a chunk (cell span + 1-voxel apron) — same as the render path.
+    let chunk_sampled = |key: BrickKey| -> Aabb3d {
+        let b = chunk_aabb(key, &config, k);
+        let apron = Vec3::splat(config.voxel_size_at(key.lod));
+        Aabb3d::from_min_max(Vec3::from(b.min) - apron, Vec3::from(b.max) + apron)
+    };
+
+    // Per-chunk content hash over the edits that touch it (sub-voxel-culled the same way as the fold). No
+    // LOD-transition flags (physics has none) — so a chunk re-bakes only when an edit it samples changes.
+    let mut current: HashMap<BrickKey, u64> = HashMap::with_capacity(resident.len());
+    {
+        // Fold the wireframe flag into the hash so toggling it re-bakes every collider (the new entity
+        // attaches/omits the debug mesh) → an in-place toggle via the normal keep-old swap, no teardown.
+        let wire_mix = if mesh_cfg.physics_wireframe { 0xC0DE_F00D_BA5E_DEAD_u64 } else { 0 };
+        let mut idx: Vec<u32> = Vec::new();
+        for &key in &resident {
+            cull_into(&edit_aabbs, &chunk_sampled(key), &mut idx);
+            idx.retain(|&i| edit_resolvable_at(edit_extent[i as usize], &config, key.lod));
+            let h = if idx.is_empty() { 0 } else { edits::bake_content_hash(&edits_arc, &idx) };
+            current.insert(key, ((key.lod as u64).wrapping_mul(0xA24B_AED4_963E_E407) ^ h) ^ wire_mix);
+        }
+    }
+
+    // EVICT (keep-old-until-covered — a collider is NEVER despawned before its replacement exists, so the
+    // player can't fall through during streaming / a physics-LOD transition). A collider whose key left the
+    // residency is kept until EITHER (a) a currently-DISPLAYED resident collider covers its centre (the
+    // replacement ground is in place), OR (b) it lies outside the live physics clipmap's outer cube (the
+    // focus flew away — truly gone). `displayed_resident` = resident chunks that already have a baked entity,
+    // collected first so the eviction predicate borrows no state. The query is a frame-start snapshot and
+    // RECEIVE below only spawns NEW (deferred) entities, so nothing is double-despawned.
+    let phys_outer_lod = base + count - 1;
+    let phys_outer_half = (base_half << (count - 1)) as f32 * cw0;
+    let phys_outer_centre = lod_centre(&config, k, center, phys_outer_lod).as_vec3() * cw0;
+    let chunk_centre = |key: BrickKey| -> Vec3 {
+        let b = chunk_aabb(key, &config, k);
+        (Vec3::from(b.min) + Vec3::from(b.max)) * 0.5
+    };
+    let phys_gone = |key: BrickKey| -> bool {
+        !(chunk_centre(key) - phys_outer_centre).abs().cmple(Vec3::splat(phys_outer_half)).all()
+    };
+    let displayed_resident: Vec<Aabb3d> = resident
+        .iter()
+        .filter(|r| states.0.get(r).is_some_and(|s| s.entity.is_some()))
+        .map(|r| chunk_aabb(*r, &config, k))
+        .collect();
+    let covered = |key: BrickKey| -> bool {
+        let cc = chunk_centre(key);
+        displayed_resident
+            .iter()
+            .any(|a| Vec3::from(a.min).cmple(cc).all() && cc.cmple(Vec3::from(a.max)).all())
+    };
+    for (e, pc) in &phys_chunks {
+        if !resident.contains(&pc.0) && (covered(pc.0) || phys_gone(pc.0)) {
+            commands.entity(e).despawn();
+        }
+    }
+    states.0.retain(|key, st| {
+        resident.contains(key)
+            || (st.entity.is_some() && !covered(*key) && !phys_gone(*key))
+    });
+
+    // RECEIVE: poll bakes; on completion replace the chunk's collider entity (despawn old → spawn new).
+    let wireframe = mesh_cfg.physics_wireframe;
+    for (key, st) in states.0.iter_mut() {
+        let Some(task) = st.task.as_mut() else {
+            continue;
+        };
+        let Some(result) = block_on(poll_once(&mut *task)) else {
+            continue;
+        };
+        st.task = None;
+        st.displayed_hash = st.target_hash;
+        if let Some(old) = st.entity.take() {
+            commands.entity(old).despawn();
+        }
+        let Some((pos, ind)) = result else {
+            continue; // empty chunk → no collider
+        };
+        let Some(collider) = chunk_trimesh_collider(&pos, &ind) else {
+            continue;
+        };
+        let origin = config.brick_min_world(key.coord, key.lod);
+        let mut ent = commands.spawn((
+            bevy_rapier3d::prelude::RigidBody::Fixed,
+            collider,
+            Transform::from_translation(origin),
+            PhysicsChunk(*key),
+            Name::new("Physics Collider Chunk"),
+        ));
+        if wireframe {
+            // Debug: render the coarse collider mesh as a green wireframe (chunk-LOCAL, like the collider).
+            let mut mesh = Mesh::new(PrimitiveTopology::TriangleList, RenderAssetUsages::default())
+                .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, pos)
+                .with_inserted_indices(Indices::U32(ind));
+            // `compute_flat_normals` panics on INDEXED geometry; the coarse collider mesh is indexed and this is
+            // only a debug wireframe, so smooth normals (index-compatible) are fine.
+            mesh.compute_smooth_normals();
+            ent.insert((
+                Mesh3d(meshes.add(mesh)),
+                MeshMaterial3d(wire_mat.0.clone()),
                 bevy::pbr::wireframe::Wireframe,
                 bevy::pbr::wireframe::WireframeColor { color: Color::srgb(0.1, 1.0, 0.35) },
             ));
         }
-    } else {
-        for e in &remove {
-            commands
-                .entity(e)
-                .remove::<bevy::pbr::wireframe::Wireframe>()
-                .remove::<bevy::pbr::wireframe::WireframeColor>();
-        }
+        st.entity = Some(ent.id());
     }
+
+    // EVICT: a chunk no longer resident is dropped immediately (the set is small + coarse, and the focus is
+    // always well inside it, so eviction only ever clips the far edge — no hole under the player). Dropping
+    // the state cancels any in-flight bake.
+    states.0.retain(|key, st| {
+        if resident.contains(key) {
+            true
+        } else {
+            if let Some(e) = st.entity.take() {
+                commands.entity(e).despawn();
+            }
+            false
+        }
+    });
+
+    // REQUEST: bake stale resident chunks (nearest-to-focus first), budget-limited. Spawn on the DEDICATED
+    // physics pool so the collider bakes are never queued behind the render mesh's backlog (top priority for
+    // the player's ground). Install the live clipmap snapshot on this thread for the SYNCHRONOUS surface cull.
+    let pool = &bake_pool.0;
+    let mut budget = PHYSICS_MAX_NEW_TASKS_PER_FRAME;
+    let _phys_terrain = crate::sdf_render::worldgen::upload::set_bake_terrain(
+        height_clipmap.clone(),
+        crate::sdf_render::worldgen::upload::cpu_terrain_offset(),
+    );
+    let mut pending: Vec<BrickKey> = resident
+        .iter()
+        .copied()
+        .filter(|key| match states.0.get(key) {
+            Some(st) => st.task.is_none() && st.displayed_hash != current[key],
+            None => true,
+        })
+        .collect();
+    // Finest physics LOD first (the collider directly under the player), then nearest within a LOD by distance
+    // to the chunk's NEAREST point (AABB) — an explicit tuple key (was a fragile bit-or of lod and dist-bits).
+    pending.sort_unstable_by_key(|&key| {
+        let b = chunk_aabb(key, &config, k);
+        let d2 = center.distance_squared(center.clamp(Vec3::from(b.min), Vec3::from(b.max)));
+        (key.lod, d2.to_bits())
+    });
+    let mut idx: Vec<u32> = Vec::new();
+    for key in pending {
+        if budget == 0 {
+            break;
+        }
+        let st = states.0.entry(key).or_default();
+        let target = current[&key];
+        st.target_hash = target;
+        let vs_l = config.voxel_size_at(key.lod);
+        cull_into(&edit_aabbs, &chunk_sampled(key), &mut idx);
+        idx.retain(|&i| edit_resolvable_at(edit_extent[i as usize], &config, key.lod));
+        if !chunk_has_surface(&edits_arc, &idx, &config, k, key, vs_l) {
+            // Empty chunk → no collider; settle it (drop any old entity) without spending budget.
+            st.displayed_hash = target;
+            if let Some(e) = st.entity.take() {
+                commands.entity(e).despawn();
+            }
+            continue;
+        }
+        let grid_origin = config.brick_min_world(key.coord, key.lod);
+        let edits = edits_arc.clone();
+        let indices = idx.clone();
+        let terrain = height_clipmap.clone();
+        let lod = key.lod;
+        let sub = k * cs;
+        st.task = Some(pool.spawn(async move {
+            // Plain coarse bake (no transition faces, no materials/normals/detail) — take just the geometry.
+            let d = mesh_chunk(
+                &edits, &indices, grid_origin, vs_l, sub, 0, lod, false, terrain, false, false, 0, 0, 0.0,
+            )?;
+            Some((d.positions, d.indices))
+        }));
+        budget -= 1;
+    }
+
+    // Diagnostics: resident collider chunks, live collider entities, and in-flight collider bakes (was not
+    // recorded anywhere). `physics_baking == 0` ⇒ all colliders are on the ground.
+    stats.physics_resident = resident.len();
+    stats.physics_displayed = states.0.values().filter(|s| s.entity.is_some()).count();
+    stats.physics_baking = states.0.values().filter(|s| s.task.is_some()).count();
 }
 
 /// The main-thread asset stores + config the commit needs to spawn a chunk mesh AND (for a coarse
@@ -1236,9 +1798,6 @@ struct SpawnAssets<'a> {
     /// The shared terrain PBR texture arrays (diffuse, normal, MRA) — the current handles to bake into a new
     /// chunk's material. `sync_terrain_texture_arrays` keeps already-spawned chunks current.
     tex_arrays: (Handle<Image>, Handle<Image>, Handle<Image>),
-    /// Per-chunk physics colliders: `Some(physics_lod)` ⇒ attach a Rapier trimesh collider to chunks with
-    /// `key.lod <= physics_lod`; `None` ⇒ no colliders.
-    physics: Option<u32>,
 }
 
 /// Build a static Rapier `trimesh` collider from a chunk's baked geometry (chunk-LOCAL positions + the flat
@@ -1253,8 +1812,8 @@ fn chunk_trimesh_collider(positions: &[[f32; 3]], indices: &[u32]) -> Option<bev
     bevy_rapier3d::prelude::Collider::trimesh(verts, tris).ok()
 }
 
-/// Spawn one chunk-mesh entity from baked data — the single SSOT used by BOTH the immediate terrain commit
-/// and the round commit. Transvoxel positions are chunk-LOCAL relative to the chunk's world MIN corner (no
+/// Spawn one chunk-mesh entity from baked data — the single SSOT [`commit_baked`] uses for every committed
+/// chunk. Transvoxel positions are chunk-LOCAL relative to the chunk's world MIN corner (no
 /// apron), so the entity `Transform` is exactly `brick_min_world`; one entity per chunk.
 ///
 /// A TERRAIN-ONLY chunk that baked a surface payload (`data.terrain_surface = Some`) is spawned with a
@@ -1262,22 +1821,26 @@ fn chunk_trimesh_collider(positions: &[[f32; 3]], indices: &[u32]) -> Option<bev
 /// `Image`s + material handles are parked on the entity via [`TerrainDetailAssets`] + `MeshMaterial3d` so
 /// they're FREED when the entity despawns (the same ref-counted lifecycle as the mesh). Every OTHER chunk
 /// (mixed/object/CSG-cave) keeps the single shared triplanar `MeshMaterial`.
+///
+/// Returns `(entity, hidden)`. A TERRAIN chunk (per-chunk `TerrainMaterial` textures) is spawned
+/// `Visibility::Hidden` + [`PendingReveal`] so it stays invisible until its per-chunk `Image`s are GPU-live
+/// (`hidden = true` — the caller stages it in `pending_entities` and the OLD mesh is held until reveal). An
+/// OBJECT/mixed chunk uses the shared material (no per-chunk textures, renderable immediately) → spawned
+/// visible (`hidden = false`).
 fn spawn_chunk_mesh(
     commands: &mut Commands,
     assets: &mut SpawnAssets,
     config: &SdfGridConfig,
     key: BrickKey,
     data: ChunkMeshData,
-) -> Entity {
+) -> (Entity, bool) {
     use super::terrain_material::{self, TerrainDetailAssets};
     let origin = config.brick_min_world(key.coord, key.lod);
     let surface = data.terrain_surface;
-    // Per-chunk PHYSICS collider (near LODs only) — built from the baked geometry BEFORE it's moved into the
-    // render Mesh. Chunk-LOCAL like the mesh, so the entity Transform places it; static (RigidBody::Fixed).
-    let collider = assets
-        .physics
-        .filter(|&max_lod| key.lod <= max_lod)
-        .and_then(|_| chunk_trimesh_collider(&data.positions, &data.indices));
+    let is_terrain = surface.is_some();
+    // NOTE: physics colliders are NOT attached here anymore — they live in the SEPARATE coarse physics clipmap
+    // layer (`physics_resident_chunks`), decoupled from the render-mesh lifecycle so they persist across
+    // render re-bakes (no fall-through during LOD streaming).
     let mesh = Mesh::new(PrimitiveTopology::TriangleList, RenderAssetUsages::default())
         .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, data.positions)
         .with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, data.normals)
@@ -1290,9 +1853,6 @@ fn spawn_chunk_mesh(
         ChunkMesh(key),
         Name::new("SDF Chunk Mesh"),
     ));
-    if let Some(c) = collider {
-        ent.insert((bevy_rapier3d::prelude::RigidBody::Fixed, c));
-    }
     if let Some(bake) = surface {
         // Terrain-only chunk: dedicated per-chunk terrain-surface material (volumetric biome strata + PBR).
         // Strong handles to the 3 per-chunk images AND the material live on the entity (in `MeshMaterial3d` +
@@ -1316,11 +1876,105 @@ fn spawn_chunk_mesh(
         ent.insert((
             MeshMaterial3d(mat.clone()),
             TerrainDetailAssets { material: mat, detail_normal, surface_height, biome, surface_mat },
+            // LOCKSTEP: hidden until its per-chunk textures are GPU-live (see `reveal_ready_chunks`).
+            Visibility::Hidden,
+            PendingReveal { frames_left: REVEAL_SETTLE_FRAMES },
         ));
     } else {
         ent.insert(MeshMaterial3d(assets.mesh_mats.handle.clone()));
     }
-    ent.id()
+    (ent.id(), is_terrain)
+}
+
+/// Commit a chunk's freshly-baked result (target hash `task_hash`), keep-old-until-REVEALED. Three cases:
+/// - EMPTY (`data` None, no-surface / meshed-empty): despawn old `displayed` + stale `hidden`, clear both,
+///   `displayed_hash = hidden_hash = task_hash`, `revealed = true` (the chunk's current result is "nothing").
+/// - TERRAIN (`spawn_chunk_mesh` returns `hidden = true`: per-chunk material textures not yet GPU-live):
+///   despawn any stale `hidden`, push the new entity to `hidden`, `hidden_hash = task_hash`. KEEP `displayed`
+///   visible — [`reveal_ready_chunks`] swaps it in when the textures settle. Do NOT set `revealed`.
+/// - OBJECT/mixed (`hidden = false`: shared material, renderable now): despawn old `displayed` + stale
+///   `hidden`, push the new entity to `displayed`, `displayed_hash = task_hash`, `revealed = true`.
+fn commit_baked(
+    commands: &mut Commands,
+    assets: &mut SpawnAssets,
+    config: &SdfGridConfig,
+    key: BrickKey,
+    data: Option<ChunkMeshData>,
+    task_hash: u64,
+    st: &mut ChunkState,
+) {
+    let Some(data) = data else {
+        // Meshed-empty / no surface: nothing to display; drop old displayed + any staged hidden.
+        for e in st.displayed.drain(..).chain(st.hidden.drain(..)) {
+            commands.entity(e).despawn();
+        }
+        st.displayed_hash = task_hash;
+        st.hidden_hash = task_hash;
+        st.revealed = true;
+        return;
+    };
+    let (e, hidden) = spawn_chunk_mesh(commands, assets, config, key, data);
+    if hidden {
+        // Terrain: keep `displayed` visible; stage the new mesh hidden (reveal swaps it when GPU-live).
+        for stale in st.hidden.drain(..) {
+            commands.entity(stale).despawn(); // a superseded not-yet-revealed replacement
+        }
+        st.hidden.push(e);
+        st.hidden_hash = task_hash;
+    } else {
+        // Object/mixed (shared material, renderable now): swap immediately.
+        for old in st.displayed.drain(..).chain(st.hidden.drain(..)) {
+            commands.entity(old).despawn();
+        }
+        st.displayed.push(e);
+        st.displayed_hash = task_hash;
+        st.revealed = true;
+    }
+}
+
+/// Fade terrain chunks in lockstep with their material, in TWO phases over the [`PendingReveal`] window.
+/// PHASE 1 (after `REVEAL_SHOW_AFTER` frames, per-chunk textures GPU-live): make the new mesh `Visible` while
+/// the OLD geometry it replaces stays on screen — a brief overlap, never a hole. PHASE 2 (at `frames_left == 0`,
+/// once the new mesh has had frames to actually render): SWAP — despawn the OLD `displayed`, promote the
+/// now-revealed `hidden` to live, mark the chunk `revealed` (so the keep-old-until-revealed reap may now drop
+/// anything IT covers). The phase-1→phase-2 gap guarantees the new mesh is rendering before the old leaves, so a
+/// GPU-upload lagging the counter can't open a hole. Runs after `mesh_resident_chunks`. Only terrain chunks
+/// carry `PendingReveal`; object/mixed chunks are visible + revealed at spawn.
+fn reveal_ready_chunks(
+    mut commands: Commands,
+    mut pending: Query<(Entity, &ChunkMesh, &mut Visibility, &mut PendingReveal)>,
+    mut states: ResMut<ChunkStates>,
+) {
+    for (e, cm, mut vis, mut pr) in &mut pending {
+        if pr.frames_left > 0 {
+            pr.frames_left -= 1;
+        }
+        // Phase 1 — show the new mesh once its textures are live, BUT keep the old one (overlap).
+        if pr.frames_left <= REVEAL_SETTLE_FRAMES - REVEAL_SHOW_AFTER {
+            *vis = Visibility::Visible;
+        }
+        // Phase 2 — only once the full window has elapsed (the new mesh has had frames to actually render) do
+        // we drop the old geometry.
+        if !chunk_renderable(pr.frames_left) {
+            continue;
+        }
+        commands.entity(e).remove::<PendingReveal>();
+        if let Some(st) = states.0.get_mut(&cm.0) {
+            // Swap in lockstep: despawn the OLD displayed mesh, promote this revealed entity to live.
+            for old in st.displayed.drain(..) {
+                if old != e {
+                    commands.entity(old).despawn();
+                }
+            }
+            st.hidden.retain(|&p| p != e);
+            for stale in st.hidden.drain(..) {
+                commands.entity(stale).despawn(); // a superseded replacement that slipped through
+            }
+            st.displayed.push(e);
+            st.displayed_hash = st.hidden_hash;
+            st.revealed = true;
+        }
+    }
 }
 
 /// True iff the chunk's world AABB is ENTIRELY outside the frustum (behind some plane) — for bake
@@ -1354,7 +2008,9 @@ fn bake_priority(key: BrickKey, config: &SdfGridConfig, k: u32, cam: Vec3, frust
     let b = chunk_aabb(key, config, k);
     let min = Vec3::from(b.min);
     let max = Vec3::from(b.max);
-    let d2 = ((min + max) * 0.5).distance_squared(cam);
+    // Distance to the chunk's NEAREST point (AABB), not its centre — so a large coarse chunk whose near face
+    // is under the camera sorts as "near", not "far" (centre-distance over-penalised big LOD chunks). 0 inside.
+    let d2 = cam.distance_squared(cam.clamp(min, max));
     let near = key.lod <= ALWAYS_NEAR_LOD_MAX;
     let near_rank: u64 = if near { 0 } else { 1 };
     // The near rings are view-independent (frustum_rank forced 0) so they never split by view; only the
@@ -1370,8 +2026,15 @@ fn bake_priority(key: BrickKey, config: &SdfGridConfig, k: u32, cam: Vec3, frust
     (near_rank << 37) | (frustum_rank << 36) | ((key.lod as u64) << 32) | (d2.to_bits() as u64)
 }
 
-/// Content-hash-driven, async, generational-coherent Transvoxel bake (see the module doc). The unit is
-/// a configurable `K×K×K`-brick chunk; whole edits commit uniformly via frozen bake rounds.
+/// Content-hash-driven, async Transvoxel bake (see the module doc). The unit is a configurable
+/// `K×K×K`-brick chunk. Each chunk is an INDEPENDENT, hash-driven state machine: it always bakes toward
+/// its LIVE desired content hash (`current_hashes[key]`), and an in-flight bake whose target is superseded
+/// is dropped + re-issued. There is NO frozen bake round — so a chunk can never get stuck waiting for a
+/// round that never re-forms (the post-fill streaming stall is impossible by construction).
+///
+/// TODO(watertight): optional atomic band-reveal on shell snap. Without a frozen-round atomic band swap,
+/// when the LOD shell snaps the affected band re-bakes + reveals per-chunk; keep-old-until-revealed +
+/// near-simultaneous reveal makes cross-LOD cracks brief/rare but not provably zero. Acceptable for v1.
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
 fn mesh_resident_chunks(
     mut commands: Commands,
@@ -1402,8 +2065,6 @@ fn mesh_resident_chunks(
     terrain_mat: TerrainMatRes,
     // Bundled scalar Locals: rebake epoch, prev K.
     mut scal: Local<MeshBakeScalars>,
-    // The in-progress bake round's frozen edit + clipmap snapshot.
-    mut round: Local<BakeRound>,
 ) {
     let k = mesh_cfg.chunk_bricks.clamp(1, 8);
 
@@ -1418,21 +2079,17 @@ fn mesh_resident_chunks(
             }
             states.0.clear();
         }
-        round.edits = None;
-        round.aabbs.clear();
         scal.prev_k = k;
         return;
     }
 
     // K changed live (slider): the key set is at a different stride now, so every old-stride chunk mesh
-    // is stale. Despawn all + clear state + abort any round for a clean swap.
+    // is stale. Despawn all + clear state for a clean swap.
     if scal.prev_k != 0 && scal.prev_k != k {
         for (e, _) in &chunk_meshes {
             commands.entity(e).despawn();
         }
         states.0.clear();
-        round.edits = None;
-        round.aabbs.clear();
     }
     scal.prev_k = k;
 
@@ -1625,30 +2282,15 @@ fn mesh_resident_chunks(
     stats.resident = resident.len();
     stats.resident_by_lod = by_lod;
 
-    // 1. RECEIVE: poll in-flight bakes; on completion STAGE the result (held until the round COMMIT).
-    for (_key, st) in states.0.iter_mut() {
-        let Some(task) = st.task.as_mut() else {
-            continue;
-        };
-        let Some(result) = block_on(poll_once(&mut *task)) else {
-            continue;
-        };
-        st.task = None;
-        st.staged = Some(StagedBake { data: result });
-    }
+    // SELF-EVICTION test: a chunk is "gone" when its centre lies outside the LIVE clipmap's outer-LOD cube —
+    // the camera has flown past it, so the world no longer contains it. Its bake work is wasted and its mesh
+    // can be dropped (it's off the clipmap entirely). This is the ONLY per-frame mesh despawn; every OTHER
+    // displayed mesh is held until a COMMITTED chunk covers its region (keep-old-until-covered), so a near
+    // chunk is never evicted before its replacement is ready. `chunk_in_outer_cube` is the shared SSOT.
+    let gone = |key: &BrickKey| -> bool { !chunk_in_outer_cube(*key, cam, half0, lod_count, &config, k) };
 
-    // Free pending work for chunks OUTSIDE the round's FROZEN residency (a chunk that left the round's set —
-    // e.g. the live camera moved on). Their displayed entity is HELD until the round COMMIT reaps it, so old
-    // geometry only clears as the new round appears.
-    for (key, st) in states.0.iter_mut() {
-        if !round.resident.contains(key) {
-            st.staged = None;
-            st.task = None;
-        }
-    }
-
-    // Bundled main-thread asset stores + live detail-normal config for the COMMITs below (the per-chunk
-    // mesh / detail-normal Image / TerrainMaterial allocations). Held across both commit blocks.
+    // Bundled main-thread asset stores + live detail-normal config for the commits below (the per-chunk
+    // mesh / detail-normal Image / TerrainMaterial allocations).
     let mut spawn_assets = SpawnAssets {
         mesh_assets: &mut mesh_assets,
         images: &mut images,
@@ -1663,105 +2305,73 @@ fn mesh_resident_chunks(
             terrain_mat.tex.normal.clone(),
             terrain_mat.tex.mra.clone(),
         ),
-        physics: mesh_cfg.physics.then_some(mesh_cfg.physics_lod),
     };
 
-    // 1b. IMMEDIATE TERRAIN COMMIT: a terrain-only chunk is an independent world-anchored surface with NO
-    // atomic-edit grouping, so DISPLAY its staged bake the instant it's ready — don't hold it for the whole
-    // frozen round to settle. Terrain then streams in per-chunk (nearest/finest first, per the bake order)
-    // instead of popping all at once. Object/mixed chunks still commit atomically in the round below so an
-    // edit/move stays visually coherent. A committed terrain chunk satisfies `round_done` (displayed==target,
-    // staged taken), so it never gates the round. `terrain_only` membership ⇒ the chunk is live-resident.
+    // 1. GONE EVICT: a chunk the camera has flown entirely past ("gone", off the live clipmap) is no longer
+    // valid — despawn its meshes (displayed AND hidden both carry `ChunkMesh`) and drop its state (which
+    // cancels its in-flight `Task` by drop). This is the ONLY unconditional per-frame mesh despawn; every
+    // OTHER displayed mesh is held until a REVEALED replacement covers its region (keep-old-until-revealed).
+    for (e, cm) in &chunk_meshes {
+        if gone(&cm.0) {
+            commands.entity(e).despawn();
+        }
+    }
+    states.0.retain(|key, _| !gone(key));
+
+    // 2. RECEIVE + COMMIT: poll each in-flight bake; on completion display its result (keep-old-until-revealed).
+    // The task targeted `task_hash` (the desired hash when it was issued); `commit_baked` records that as the
+    // hash the new geometry was baked from.
     for (key, st) in states.0.iter_mut() {
-        if st.staged.is_none() || !terrain_surface.contains(key) {
+        let Some(task) = st.task.as_mut() else {
             continue;
-        }
-        let sb = st.staged.take().expect("staged checked just above");
-        for old in st.entities.drain(..) {
-            commands.entity(old).despawn();
-        }
-        st.displayed_hash = st.target_hash;
-        if let Some(data) = sb.data {
-            let e = spawn_chunk_mesh(&mut commands, &mut spawn_assets, &config, *key, data);
-            st.entities.push(e);
-        }
+        };
+        let Some(result) = block_on(poll_once(&mut *task)) else {
+            continue;
+        };
+        st.task = None;
+        let task_hash = st.task_hash;
+        commit_baked(&mut commands, &mut spawn_assets, &config, *key, result, task_hash, st);
     }
 
-    // 2. COMMIT the round when every chunk of its FROZEN residency is settled — none still baking, and each
-    // either already displays its target or holds a staged bake of it. The REMAINING staged bakes (object/
-    // mixed chunks; terrain already committed above) swap in one frame, and every mesh outside the frozen set
-    // is reaped the same frame, so a whole edit / LOD shift pops together with no 1-frame hole. We commit
-    // against `round.resident`, NOT the live set, so the round only ever displays a residency it finished.
-    let round_done = round.resident.iter().all(|key| match states.0.get(key) {
-        Some(st) => st.task.is_none() && (st.displayed_hash == st.target_hash || st.staged.is_some()),
-        None => true, // not tracked yet → nothing to wait on (a frozen-set chunk always has a state)
+    // 3. EVICT (keep-old-until-revealed): despawn a displayed mesh once a REVEALED resident chunk TILES its
+    // region — its replacement is on screen, so dropping the old opens no hole and shows no green flash.
+    // `revealed_keys` snapshots the revealed set so the reap predicate borrows no live `states` (the despawn
+    // bookkeeping below mutates it). A displayed chunk's OWN key ∈ resident ⇒ `render_commit_reap` returns
+    // false ⇒ it is never reaped; only superseded / out-of-residency meshes covered by a revealed replacement
+    // are. `gone` meshes were already handled above.
+    let revealed_keys: HashSet<BrickKey> =
+        states.0.iter().filter(|(_, st)| st.revealed).map(|(key, _)| *key).collect();
+    let is_revealed = |key: BrickKey| revealed_keys.contains(&key);
+    let mut to_reap: Vec<(Entity, BrickKey)> = Vec::new();
+    for (e, cm) in &chunk_meshes {
+        if render_commit_reap(cm.0, resident.contains(&cm.0), &resident, &is_revealed, cam, half0, lod_count, &config, k)
+        {
+            to_reap.push((e, cm.0));
+        }
+    }
+    stats.reaped = to_reap.len();
+    for (e, key) in &to_reap {
+        commands.entity(*e).despawn();
+        if let Some(st) = states.0.get_mut(key) {
+            st.displayed.retain(|x| x != e);
+            st.hidden.retain(|x| x != e);
+        }
+    }
+    // Drop states with nothing displayed, nothing hidden, no in-flight task, and no longer resident.
+    states.0.retain(|key, st| {
+        resident.contains(key) || !st.displayed.is_empty() || !st.hidden.is_empty() || st.task.is_some()
     });
-    stats.reaped = 0;
-    // ALWAYS release the round once done — even if immediate terrain commits already consumed every staged
-    // bake (nothing left to swap) — so the next snapshot can start; otherwise the round would never release.
-    if round.edits.is_some() && round_done {
-        let mut reaped = 0usize;
-        for (key, st) in states.0.iter_mut() {
-            let Some(sb) = st.staged.take() else {
-                continue;
-            };
-            for old in st.entities.drain(..) {
-                commands.entity(old).despawn();
-            }
-            st.displayed_hash = st.target_hash;
-            if let Some(data) = sb.data {
-                let e = spawn_chunk_mesh(&mut commands, &mut spawn_assets, &config, *key, data);
-                st.entities.push(e);
-            }
-        }
-        // Reap every mesh OUTSIDE the frozen round set (query-based, so it also catches orphans). A re-baked
-        // resident chunk's OLD entity was already despawned above (its key stays in the set), so it is not
-        // double-despawned here.
-        for (e, cm) in &chunk_meshes {
-            if !round.resident.contains(&cm.0) {
-                commands.entity(e).despawn();
-                reaped += 1;
-            }
-        }
-        states.0.retain(|key, _| round.resident.contains(key));
-        stats.reaped = reaped;
-        round.edits = None;
-        round.aabbs.clear();
-    }
 
-    // 3. SNAPSHOT: if no round is in progress and some chunk is stale vs the live edits, freeze a new
-    // round — capture the current edit list + AABBs and each resident chunk's current hash as its target.
-    // Frozen until the next commit, so a continuously-moving object advances one coherent snapshot at a
-    // time (real-time trailing) instead of chasing and evicting every intermediate position.
-    if round.edits.is_none() {
-        let stale = resident
-            .iter()
-            .any(|key| states.0.get(key).is_none_or(|st| st.displayed_hash != current_hashes[key]));
-        if stale {
-            round.edits = Some(edits_arc.clone());
-            round.aabbs = edit_aabbs.clone();
-            round.cam = cam; // freeze the camera so the round's transition flags are self-consistent
-            round.half0 = half0;
-            round.resident = resident.clone(); // FREEZE the residency — the round bakes/commits/reaps this set
-            round.clipmap = height_clipmap.clone(); // FREEZE the clipmap that admitted this residency (bake snapshot)
-            for &key in &resident {
-                states.0.entry(key).or_default().target_hash = current_hashes[&key];
-            }
-        }
-    }
-
-    // Diagnostic dump (panel "Capture diagnostics"). At rest: round=idle, staged=in-flight=stale=held=0.
+    // Diagnostic dump (panel "Capture diagnostics"). At rest: in-flight=stale=held=0.
     if stats.capture {
         stats.capture = false;
-        let round_active = round.edits.is_some();
-        let staged_n = states.0.values().filter(|s| s.staged.is_some()).count();
         let inflight_n = states.0.values().filter(|s| s.task.is_some()).count();
         let stale_n = resident
             .iter()
             .filter(|k| states.0.get(*k).is_none_or(|s| s.displayed_hash != current_hashes[*k]))
             .count();
         let held_n = chunk_meshes.iter().filter(|(_, cm)| !resident.contains(&cm.0)).count();
-        let displayed_n = states.0.values().filter(|s| !s.entities.is_empty()).count();
+        let displayed_n = states.0.values().filter(|s| !s.displayed.is_empty()).count();
         let mut s = String::new();
         s.push_str("=== Mesh Bake Diagnostics ===\n");
         s.push_str(&format!(
@@ -1769,9 +2379,9 @@ fn mesh_resident_chunks(
             resident.len()
         ));
         s.push_str(&format!(
-            "round_active={round_active}  displayed={displayed_n}  staged={staged_n}  in-flight={inflight_n}  stale={stale_n}  held={held_n}\n"
+            "displayed={displayed_n}  in-flight={inflight_n}  stale={stale_n}  held={held_n}\n"
         ));
-        s.push_str("(at rest: round_active=false, staged=in-flight=stale=held=0)\n");
+        s.push_str("(at rest: in-flight=stale=held=0)\n");
         s.push_str("-- volumes (entity : world AABB) --\n");
         for g in &gathered {
             let a = g.aabb;
@@ -1783,12 +2393,13 @@ fn mesh_resident_chunks(
         stats.dump = s;
     }
 
-    // 4. REQUEST: bake every stale chunk toward its FROZEN round target, against the round's frozen edit
-    // snapshot (so all of a round's bakes are coherent). Spawn in PRIORITY order (`bake_priority`: the
-    // always-near LOD-0/1 rings omnidirectionally first, then in-view, then LOD/distance) so the nearby +
-    // visible world builds first; the per-frame budget caps task spawns. One pending bake per chunk; never
-    // supersede an in-flight/staged bake — it is always displayed before the next round is snapshotted.
-    if let Some(round_edits) = round.edits.clone() {
+    // 4. REQUEST: bake every resident chunk that needs work toward its LIVE desired hash. A chunk needs a bake
+    // iff neither its displayed nor its hidden geometry matches `desired`, and it has no task already targeting
+    // `desired`. A task whose `task_hash != desired` is SUPERSEDED (the camera/edits moved on) → drop it so it
+    // re-issues toward the live target. Spawn in PRIORITY order (`bake_priority`); the per-frame budget caps
+    // task spawns. Because there is no frozen round, every chunk always advances toward the live desired hash —
+    // the post-fill stall cannot happen.
+    {
         let pool = AsyncComputeTaskPool::get();
         let mut budget = MAX_NEW_TASKS_PER_FRAME;
         let mut idx: Vec<u32> = Vec::new();
@@ -1798,66 +2409,81 @@ fn mesh_resident_chunks(
         let detail_res = mesh_cfg.detail_normal_res;
         let biome_res = mesh_cfg.biome_res;
         let biome_blend_m = mesh_cfg.biome_blend_m;
-        // Install the round's FROZEN clipmap snapshot on THIS (system) thread for the whole REQUEST loop, so
-        // the SYNCHRONOUS narrow-band cull below (`chunk_has_surface` → `terrain_sdf`) samples the EXACT
-        // clipmap whose coverage gate admitted this round's residency — the SAME snapshot the async
-        // `mesh_chunk` bakes against. Without this the cull falls through to the process-GLOBAL
-        // `cpu_height_clipmap()`, which `roll_worldgen` may have ROLLED/regenerated (Apply, streaming, a
-        // `lod_count` rebuild) to a DIFFERENT coverage since the round froze — so a chunk the gate admitted
-        // (against the frozen clipmap) would trip the strict `sample_clipmap_lod` panic in the cull (against
-        // the live global). The frozen snapshot is the SSOT: gate, sync cull, and async bake all sample it.
-        let _round_terrain = crate::sdf_render::worldgen::upload::set_bake_terrain(
-            round.clipmap.clone(),
+        // Install the LIVE clipmap on THIS (system) thread for the whole REQUEST loop, so the SYNCHRONOUS
+        // narrow-band cull below (`chunk_has_surface` → `terrain_sdf`) samples the SAME clipmap the async
+        // `mesh_chunk` bakes against. Residency is live-gated this frame (the coverage gate ran against this
+        // exact `height_clipmap`), so a chunk only reaches here if the live clipmap covers it — no strict-
+        // sampler panic. Without this the cull would fall through to the process-global store.
+        let _bake_terrain = crate::sdf_render::worldgen::upload::set_bake_terrain(
+            height_clipmap.clone(),
             crate::sdf_render::worldgen::upload::cpu_terrain_offset(),
         );
-        // Still-stale chunks of the FROZEN residency (need a bake), ordered by bake priority against the LIVE
-        // camera (where the viewer is). Bake/commit/reap all agree on the frozen set; only the ORDER is live.
-        let prio_cam = live_cam.or(round.cam).unwrap_or(Vec3::ZERO);
-        let mut pending: Vec<BrickKey> = round
-            .resident
+        let prio_cam = cam.unwrap_or(Vec3::ZERO);
+        // Resident chunks needing a NEW bake: neither displayed nor hidden matches `desired`, AND nothing is
+        // already baking. We do NOT cancel an in-flight bake whose target was superseded: under continuous
+        // movement the desired hash (its transition flags) changes most frames, so cancel-and-restart would
+        // drop the bake EVERY frame → it would NEVER finish → the chunk only ever appears once you stop ("takes
+        // ages to show up"). Instead we let the in-flight bake COMPLETE and commit its (slightly stale) result —
+        // the chunk appears promptly — then a follow-up bake re-issues toward the live target and refines it.
+        let mut pending: Vec<BrickKey> = resident
             .iter()
             .copied()
-            .filter(|key| match states.0.get(key) {
-                Some(st) => st.task.is_none() && st.staged.is_none() && st.displayed_hash != st.target_hash,
-                None => true,
+            .filter(|key| {
+                let desired = current_hashes[key];
+                match states.0.get(key) {
+                    Some(st) => {
+                        chunk_needs_bake(st.displayed_hash, st.hidden_hash, st.task.is_some(), desired)
+                    }
+                    None => true,
+                }
             })
             .collect();
-        pending.sort_unstable_by_key(|&key| bake_priority(key, &config, k, prio_cam, cam_frustum.as_ref()));
+        // Only `budget` chunks are baked this frame, but `pending` can be thousands (a cold fill). Partition
+        // the budget-highest-priority chunks to the front in O(n) (`select_nth`), drop the rest, then sort just
+        // that prefix for the spawn order — instead of an O(n log n) sort of the whole list every frame.
+        let prio = |key: &BrickKey| bake_priority(*key, &config, k, prio_cam, cam_frustum.as_ref());
+        if pending.len() > budget {
+            pending.select_nth_unstable_by_key(budget, prio);
+            pending.truncate(budget);
+        }
+        pending.sort_unstable_by_key(prio);
         for key in pending {
             if budget == 0 {
-                break; // remaining (lower-priority) chunks re-detected next frame; the round stays frozen
+                break; // remaining (lower-priority) chunks re-detected next frame
             }
-            let st = states.0.entry(key).or_default();
+            let desired = current_hashes[&key];
             let vs_l = config.voxel_size_at(key.lod);
-            cull_into(&round.aabbs, &chunk_sampled(key), &mut idx);
+            cull_into(&edit_aabbs, &chunk_sampled(key), &mut idx);
             // Sub-voxel cull (same predicate as the hash fold): exclude edits too small to mesh at this LOD
             // from the field so they can't bake a degenerate sliver into a chunk resident for a larger edit.
             idx.retain(|&i| {
-                let a = round.aabbs[i as usize];
+                let a = edit_aabbs[i as usize];
                 edit_resolvable_at((Vec3::from(a.max) - Vec3::from(a.min)).max_element(), &config, key.lod)
             });
             // NARROW-BAND CULL: skip chunks with no surface crossing (interior/exterior of a solid) for a
             // single SDF eval instead of a full edge³ bake — the big win for large objects. Commit them
-            // empty (no task, no budget) so the round still settles.
-            if !chunk_has_surface(&round_edits, &idx, &config, k, key, vs_l) {
-                st.staged = Some(StagedBake { data: None });
+            // empty INLINE (no task, no budget spent): the chunk's current result is "nothing here".
+            if !chunk_has_surface(&edits_arc, &idx, &config, k, key, vs_l) {
+                let st = states.0.entry(key).or_default();
+                commit_baked(&mut commands, &mut spawn_assets, &config, key, None, desired, st);
                 continue;
             }
             // Transvoxel block = the chunk's exact world extent (NO apron); its origin is the chunk MIN corner.
             let grid_origin = config.brick_min_world(key.coord, key.lod);
-            // Transvoxel transition faces — those bordering a FINER LOD — from the FROZEN shell, so all of a
-            // round's chunks agree on the boundary. Folded into the content hash → re-bakes on a shell move.
-            let flags = chunk_finer_faces(key, &config, k, round.cam, round.half0);
+            // Transvoxel transition faces — those bordering a FINER LOD — from the LIVE shell. Folded into the
+            // content hash (`desired`) → a chunk re-bakes with the right transition sides when the shell moves.
+            let flags = chunk_finer_faces(key, &config, k, cam, half0);
             let lod = key.lod;
-            let edits = round_edits.clone();
+            let edits = edits_arc.clone();
             let indices = idx.clone();
-            // The round's FROZEN clipmap snapshot — the bake samples THIS, not the live global, so a
-            // mid-bake clipmap change (camera roll / lod_count rebuild) can't make it sample uncovered ground.
-            let terrain = round.clipmap.clone();
+            // The LIVE clipmap — the same snapshot the coverage gate admitted this chunk against this frame.
+            let terrain = height_clipmap.clone();
             // Surface-material chunks (terrain, incl. dug) render the strata; only PURE (uncarved) terrain
             // takes the smooth clipmap normals — a carved chunk uses CSG normals for its cavity walls.
             let surface_material = terrain_surface.contains(&key);
             let terrain_normals = surface_material && !carved.contains(&key);
+            let st = states.0.entry(key).or_default();
+            st.task_hash = desired;
             st.task = Some(pool.spawn(async move {
                 mesh_chunk(
                     &edits, &indices, grid_origin, vs_l, k * cs, flags, lod, debug, terrain, terrain_normals,
@@ -1868,12 +2494,13 @@ fn mesh_resident_chunks(
         }
     }
 
-    // "Still baking" signal for the editor status bar: resident chunks not yet showing their target —
-    // in-flight, staged, or not-yet-started (budget-limited / just entered residency). 0 ⇒ all baked.
+    // "Still baking" signal for the editor status bar: resident chunks whose DISPLAYED geometry doesn't yet
+    // match the desired hash — in-flight, hidden-awaiting-reveal, or not-yet-started (budget-limited / just
+    // entered residency). 0 ⇒ everything resident is on screen at its current target.
     stats.pending = resident
         .iter()
         .filter(|k| match states.0.get(k) {
-            Some(st) => st.task.is_some() || st.staged.is_some() || st.displayed_hash != st.target_hash,
+            Some(st) => st.displayed_hash != current_hashes[k],
             None => true,
         })
         .count();
@@ -2008,29 +2635,49 @@ fn mesh_bake_panel(world: &mut World, ui: &mut bevy_egui::egui::Ui) {
     // (The old "Surface treatment" slider is gone — snow caps / cliff rock are now authored per-biome
     // SURFACE RULES in `biomes.ron`, resolved + baked by the worldgen, not a live shader override.)
 
-    // PHYSICS — per-chunk Rapier trimesh colliders so the player/objects can stand on the terrain. "Physics
-    // LOD" bounds how far out colliders are built (near chunks only). Changing either re-bakes (colliders
-    // attach at commit, so the chunks must respawn).
+    // PHYSICS — the SEPARATE coarse collider clipmap (`physics_resident_chunks`): a small set of collider-only
+    // chunks around the player/camera at +N LOD, streamed independently of the render mesh so colliders persist
+    // through render re-bakes. These knobs are LIVE (the physics system re-streams itself; no render re-bake).
     let mut phys = world.resource::<MeshBakeConfig>().physics;
-    if ui.checkbox(&mut phys, "Physics colliders").changed() {
-        world.resource_mut::<MeshBakeConfig>().physics = phys;
-        world.resource_mut::<MeshBakeRebuild>().0 = true;
-    }
-    let mut plod = world.resource::<MeshBakeConfig>().physics_lod;
     if ui
-        .add(bevy_egui::egui::Slider::new(&mut plod, 0..=6).text("Physics LOD"))
-        .on_hover_text("Only chunks at this LOD or finer get a collider (near terrain). Higher = colliders \
-                        reach further out (more trimesh cost). Changing it re-bakes.")
+        .checkbox(&mut phys, "Physics colliders")
+        .on_hover_text("Separate coarse collider clipmap around the player/camera, decoupled from the render \
+                        mesh so colliders persist while it streams (no fall-through).")
         .changed()
     {
-        world.resource_mut::<MeshBakeConfig>().physics_lod = plod;
-        world.resource_mut::<MeshBakeRebuild>().0 = true;
+        world.resource_mut::<MeshBakeConfig>().physics = phys;
+    }
+    let mut pbase = world.resource::<MeshBakeConfig>().physics_base_lod;
+    if ui
+        .add(bevy_egui::egui::Slider::new(&mut pbase, 0..=6).text("Physics base LOD (+N)"))
+        .on_hover_text("Finest collider LOD = render LOD 0 + this. Higher = coarser colliders (far fewer \
+                        triangles); a character controller doesn't need render fidelity. Default 2 (+2 LOD).")
+        .changed()
+    {
+        world.resource_mut::<MeshBakeConfig>().physics_base_lod = pbase;
+    }
+    let mut pcount = world.resource::<MeshBakeConfig>().physics_lod_count;
+    if ui
+        .add(bevy_egui::egui::Slider::new(&mut pcount, 1..=4).text("Physics LOD rings"))
+        .on_hover_text("How many collider LODs the physics clipmap spans (each ring doubles the radius).")
+        .changed()
+    {
+        world.resource_mut::<MeshBakeConfig>().physics_lod_count = pcount;
+    }
+    let mut phalf = world.resource::<MeshBakeConfig>().physics_half_chunks;
+    if ui
+        .add(bevy_egui::egui::Slider::new(&mut phalf, 1..=8).text("Physics radius (chunks)"))
+        .on_hover_text("Half-extent of the finest collider cube around the focus, in physics-base chunks. \
+                        Small keeps the set tiny so it rarely re-streams. Higher = colliders reach further.")
+        .changed()
+    {
+        world.resource_mut::<MeshBakeConfig>().physics_half_chunks = phalf;
     }
     let mut pwire = world.resource::<MeshBakeConfig>().physics_wireframe;
     if ui
         .checkbox(&mut pwire, "Physics wireframe (debug)")
-        .on_hover_text("Draw the chunks that have a collider (the Physics LOD coverage) as a green wireframe \
-                        — shows the physics meshes + how far they reach. Live toggle, no re-bake.")
+        .on_hover_text("Render each baked collider chunk as a green wireframe (the COARSE physics mesh + the \
+                        clipmap's reach). Toggling rebuilds the small physics set.")
         .changed()
     {
         world.resource_mut::<MeshBakeConfig>().physics_wireframe = pwire;
@@ -2045,21 +2692,27 @@ fn mesh_bake_panel(world: &mut World, ui: &mut bevy_egui::egui::Ui) {
         world.resource_mut::<MeshBakeConfig>().freeze_lod = freeze;
     }
 
-    // Stats. `staged`/`meshing` are transiently non-zero while a round bakes; they drop to 0 once an edit
-    // settles (the round has committed).
+    // Stats. `meshing`/`hidden` are transiently non-zero while chunks bake + stream in; they drop to 0 once
+    // the resident set is fully baked + revealed.
     let states = world.resource::<ChunkStates>();
-    let meshes = states.0.values().map(|s| s.entities.len()).sum::<usize>();
+    let meshes = states.0.values().map(|s| s.displayed.len()).sum::<usize>();
     let in_flight = states.0.values().filter(|s| s.task.is_some()).count();
-    let staged = states.0.values().filter(|s| s.staged.is_some()).count();
-    ui.label(format!("Chunk meshes: {meshes}  ·  meshing: {in_flight}  ·  staged: {staged}"));
+    let hidden = states.0.values().filter(|s| !s.hidden.is_empty()).count();
+    ui.label(format!("Chunk meshes: {meshes}  ·  meshing: {in_flight}  ·  hidden: {hidden}"));
 
     // System view. `entities` may briefly exceed `resident` during an edit — departed meshes are HELD
-    // until the round commit reaps them (so old + new swap together); at rest they match.
+    // until a revealed replacement covers them (so old + new swap together); at rest they match.
     let stats = world.resource::<MeshBakeStats>();
     let (edits, resident, reaped) = (stats.edits, stats.resident, stats.reaped);
     let entities = world.query_filtered::<(), With<ChunkMesh>>().iter(world).count();
     ui.label(format!(
         "edits: {edits}  ·  resident: {resident}  ·  entities: {entities}  ·  reaped/commit: {reaped}"
+    ));
+    // PHYSICS collider clipmap (separate, dedicated-pool bake). `baking` > 0 ⇒ colliders still filling in.
+    let stats = world.resource::<MeshBakeStats>();
+    ui.label(format!(
+        "physics: resident {}  ·  colliders {}  ·  baking {}",
+        stats.physics_resident, stats.physics_displayed, stats.physics_baking
     ));
     let by_lod = world.resource::<MeshBakeStats>().resident_by_lod;
     let lod_counts: Vec<String> = by_lod
@@ -2120,6 +2773,343 @@ mod tests {
     fn chunk(cfg: &SdfGridConfig, k: u32, lod: u32, j: i32) -> BrickKey {
         let stride = k as i32 * cfg.cell_stride();
         BrickKey::new(lod, IVec3::new(j, 0, 0) * stride)
+    }
+
+    /// `chunk_key_at` is the exact inverse of a chunk's region: the chunk that tiles a chunk's own centre, at
+    /// that chunk's LOD, is the chunk itself. Guards the point→chunk mapping the coverage test relies on.
+    #[test]
+    fn chunk_key_at_inverts_chunk_region() {
+        let (cfg, _) = cfgs();
+        let k = 4;
+        for lod in 0..5 {
+            for j in [-7, -1, 0, 3, 12, 40] {
+                let key = chunk(&cfg, k, lod, j);
+                let c = chunk_centre_world(key, &cfg, k);
+                assert_eq!(chunk_key_at(c, lod, &cfg, k), key, "lod {lod} j {j}");
+            }
+        }
+    }
+
+    /// KEEP-OLD-UNTIL-COVERED, the structural invariant: a displayed chunk is reaped ONLY when a committed
+    /// chunk actually tiles its region; an uncovered region (coverage-gate-dropped under fast flight, or the
+    /// round froze behind) is KEPT so no hole opens; a re-committed or fully-departed chunk is left to its own
+    /// path. Tests the SSOT `render_commit_reap` the production reap loop calls.
+    #[test]
+    fn render_commit_reap_keeps_uncovered_until_replacement_exists() {
+        let (cfg, _) = cfgs();
+        let (k, lod_count, half0) = (4u32, 12u32, 4i32);
+        let live_cam = Some(Vec3::ZERO);
+        let d = chunk(&cfg, k, 0, 0); // a displayed near chunk, inside the live clipmap
+        assert!(chunk_in_outer_cube(d, live_cam, half0, lod_count, &cfg, k));
+        let all_revealed = |_: BrickKey| true; // baseline: every covering chunk is renderable
+
+        // (1) re-committed this round → never reaped here (its own commit swaps it).
+        let just_d: HashSet<BrickKey> = [d].into_iter().collect();
+        assert!(!render_commit_reap(d, true, &just_d, &all_revealed, live_cam, half0, lod_count, &cfg, k));
+
+        // (2) region ABSENT from the committed set (gate-dropped / frozen behind) → KEEP (no hole).
+        let empty = HashSet::new();
+        assert!(
+            !render_commit_reap(d, false, &empty, &all_revealed, live_cam, half0, lod_count, &cfg, k),
+            "uncovered region must be kept"
+        );
+
+        // (3) a committed+REVEALED chunk that TILES d's region (the coarser LOD-1 owner) → reap (swap).
+        let owner = chunk_key_at(chunk_centre_world(d, &cfg, k), 1, &cfg, k);
+        let covered: HashSet<BrickKey> = [owner].into_iter().collect();
+        assert!(render_commit_reap(d, false, &covered, &all_revealed, live_cam, half0, lod_count, &cfg, k));
+
+        // (3b) KEEP-OLD-UNTIL-REVEALED: the covering owner exists but is NOT yet revealed (its textured
+        // material isn't GPU-live) → the old geometry must be KEPT (no green flash, no hole).
+        let none_revealed = |_: BrickKey| false;
+        assert!(
+            !render_commit_reap(d, false, &covered, &none_revealed, live_cam, half0, lod_count, &cfg, k),
+            "a not-yet-revealed replacement must not evict the old mesh"
+        );
+
+        // (4) a chunk far outside the live clipmap is GONE → not reaped here (the self-evict pass owns it).
+        let faraway = chunk(&cfg, k, 0, 1_000_000);
+        assert!(!chunk_in_outer_cube(faraway, live_cam, half0, lod_count, &cfg, k));
+        assert!(!render_commit_reap(faraway, false, &empty, &all_revealed, live_cam, half0, lod_count, &cfg, k));
+    }
+
+    /// MULTI-LOD keep-old (the fast-movement bug): when the camera outruns the bakes by several rings, an old
+    /// COARSE chunk's region is tiled by MANY finer chunks SEVERAL LODs down — it must be kept until EVERY one
+    /// of them is revealed. A partial cover (one missing) must NOT reap it. Guards the recursive coverage test
+    /// against the old 8-octant SAMPLE, which under-counted across a >1 LOD gap and punched holes.
+    #[test]
+    fn render_commit_reap_keeps_coarse_across_multi_lod_gap() {
+        let (cfg, _) = cfgs();
+        let (k, lod_count, half0) = (4u32, 12u32, 4i32);
+        let live_cam = Some(Vec3::ZERO);
+        let all_revealed = |_: BrickKey| true;
+        let coarse = chunk(&cfg, k, 3, 0); // a displayed LOD-3 chunk — replaced by LOD-1 chunks (a 2-LOD gap)
+
+        // Enumerate EVERY LOD-1 chunk tiling the LOD-3 chunk's region (4×4×4 = 64 of them).
+        let b = chunk_aabb(coarse, &cfg, k);
+        let dmin = Vec3::from(b.min);
+        let cw1 = k as f32 * cfg.brick_world_size(1);
+        let span = (k as f32 * cfg.brick_world_size(3) / cw1).round() as i32; // 4 per axis
+        let mut fine: HashSet<BrickKey> = HashSet::new();
+        for i in 0..span {
+            for j in 0..span {
+                for l in 0..span {
+                    let p = dmin + Vec3::new(i as f32, j as f32, l as f32) * cw1 + Vec3::splat(cw1 * 0.5);
+                    fine.insert(chunk_key_at(p, 1, &cfg, k));
+                }
+            }
+        }
+        assert_eq!(fine.len(), (span * span * span) as usize, "expected a full 4×4×4 fine tiling");
+
+        // FULL cover (all 64 finer chunks resident + revealed) → reap.
+        assert!(render_commit_reap(coarse, false, &fine, &all_revealed, live_cam, half0, lod_count, &cfg, k));
+
+        // PARTIAL cover (drop ONE of the 64) → KEEP — the old coarse mesh must not leave a hole over the gap.
+        let mut partial = fine.clone();
+        let drop_key = *partial.iter().next().unwrap();
+        partial.remove(&drop_key);
+        assert!(
+            !render_commit_reap(coarse, false, &partial, &all_revealed, live_cam, half0, lod_count, &cfg, k),
+            "a coarse mesh must be kept until ALL its multi-LOD-finer replacements are on screen"
+        );
+    }
+
+    /// COARSE→FINE keep-old: a coarse chunk replaced by its 2×2×2 finer sub-chunks must be KEPT until ALL of
+    /// them are revealed — a PARTIAL cover (only some sub-chunks present) must NOT reap it (else the centre
+    /// test would punch holes over the missing sub-chunks). Guards the all-8-octant coverage rule.
+    #[test]
+    fn render_commit_reap_keeps_coarse_until_all_finer_subchunks_revealed() {
+        let (cfg, _) = cfgs();
+        let (k, lod_count, half0) = (4u32, 12u32, 4i32);
+        let live_cam = Some(Vec3::ZERO);
+        let all_revealed = |_: BrickKey| true;
+        let coarse = chunk(&cfg, k, 2, 0); // a displayed LOD-2 chunk over the origin
+
+        // The full set of finer (LOD-1) chunks tiling the coarse chunk's region — sample its 8 octant centres.
+        let b = chunk_aabb(coarse, &cfg, k);
+        let (mn, w) = (Vec3::from(b.min), Vec3::from(b.max) - Vec3::from(b.min));
+        let mut all_fine: HashSet<BrickKey> = HashSet::new();
+        for fx in [0.25_f32, 0.75] {
+            for fy in [0.25_f32, 0.75] {
+                for fz in [0.25_f32, 0.75] {
+                    all_fine.insert(chunk_key_at(mn + w * Vec3::new(fx, fy, fz), 1, &cfg, k));
+                }
+            }
+        }
+        // FULL cover (all finer sub-chunks resident + revealed) → reap.
+        assert!(render_commit_reap(coarse, false, &all_fine, &all_revealed, live_cam, half0, lod_count, &cfg, k));
+
+        // PARTIAL cover (drop one sub-chunk) → KEEP (the missing octant isn't on screen).
+        let mut partial = all_fine.clone();
+        let dropped = *partial.iter().next().unwrap();
+        partial.remove(&dropped);
+        assert!(
+            !render_commit_reap(coarse, false, &partial, &all_revealed, live_cam, half0, lod_count, &cfg, k),
+            "a coarse mesh must be kept until ALL its finer replacements are on screen"
+        );
+    }
+
+    /// `chunk_renderable` is the reveal/keep-old SSOT: a terrain chunk is renderable (safe to reveal + count
+    /// as a cover) only once its settle window has elapsed to `0`.
+    #[test]
+    fn chunk_renderable_only_after_settle() {
+        assert!(!chunk_renderable(REVEAL_SETTLE_FRAMES));
+        assert!(!chunk_renderable(1));
+        assert!(chunk_renderable(0));
+    }
+
+    /// An in-flight bake is NEVER cancelled because its target was superseded (the SSOT rule): a chunk that
+    /// already has a task in flight never asks for a new one, even when its desired hash has changed. This is
+    /// what stops the "restart every frame → never finish → takes ages to show up" failure.
+    #[test]
+    fn chunk_needs_bake_never_restarts_an_inflight_bake() {
+        // Nothing displayed/hidden matches the desired, AND a bake is in flight → do NOT issue another.
+        assert!(!chunk_needs_bake(0, 0, true, 999));
+        // No task in flight + nothing matches desired → DO bake.
+        assert!(chunk_needs_bake(0, 0, false, 999));
+        // Already displaying (or hidden) the desired result → no bake.
+        assert!(!chunk_needs_bake(999, 0, false, 999));
+        assert!(!chunk_needs_bake(0, 999, false, 999));
+    }
+
+    // ============================ STREAMING LIFECYCLE SIMULATION HARNESS ============================
+    // A deterministic, headless model of the per-chunk streaming lifecycle (residency → mock async bake →
+    // reveal → keep-old-until-revealed reap), driving the REAL production helpers (`mesh_chunk_in_shell`
+    // residency, `chunk_finer_faces` transition flags, `render_commit_reap`, `chunk_needs_bake`) with a
+    // fixed-latency mock bake. It drives a camera path and asserts the invariant the runtime kept breaking,
+    // with NO async/ECS: a chunk that stays resident long enough is ALWAYS on screen — even under CONTINUOUS
+    // movement, where every frame changes its desired transition-flag hash (the "drop the superseded in-flight
+    // bake" regression restarts bakes every frame so they never finish → "takes ages to show up").
+
+    #[derive(Default, Clone)]
+    struct SimChunk {
+        displayed_hash: u64, // mesh ON SCREEN (0 = nothing shown)
+        hidden_hash: u64,    // baked, awaiting reveal (0 = none)
+        reveal_left: u8,
+        task_hash: u64, // bake in flight toward this (0 = none)
+        task_left: u8,
+    }
+
+    struct Sim {
+        cfg: SdfGridConfig,
+        k: u32,
+        half0: i32,
+        lod_count: u32,
+        bake_latency: u8,
+        reveal_frames: u8,
+        chunks: HashMap<BrickKey, SimChunk>,
+        age: HashMap<BrickKey, u32>, // consecutive frames a chunk has been resident
+    }
+
+    impl Sim {
+        fn resident(&self, cam: Vec3) -> HashSet<BrickKey> {
+            let cw0 = self.k as f32 * self.cfg.brick_world_size(0);
+            let (mut out, mut cand) = (HashSet::new(), HashSet::new());
+            for lod in 0..self.lod_count {
+                cand.clear();
+                let centre = lod_centre(&self.cfg, self.k, cam, lod).as_vec3() * cw0;
+                let half = ((self.half0 << lod) as f32) * cw0;
+                let aabb = Aabb3d::from_min_max(centre - Vec3::splat(half), centre + Vec3::splat(half));
+                chunks_in_aabb(&aabb, &self.cfg, self.k, lod, &mut cand);
+                for &key in &cand {
+                    if mesh_chunk_in_shell(key, &self.cfg, self.k, Some(cam), self.half0) {
+                        out.insert(key);
+                    }
+                }
+            }
+            out
+        }
+        // A non-zero content hash that CHANGES with lod + the live transition flags (so it churns under motion).
+        fn desired(&self, key: BrickKey, cam: Vec3) -> u64 {
+            let f = chunk_finer_faces(key, &self.cfg, self.k, Some(cam), self.half0);
+            ((key.lod as u64 + 1) << 8) ^ (f as u64 + 1)
+        }
+        fn shown(&self, key: BrickKey) -> bool {
+            self.chunks.get(&key).is_some_and(|c| c.displayed_hash != 0)
+        }
+        fn frame(&mut self, cam: Vec3) {
+            let resident = self.resident(cam);
+            // RECEIVE: advance + complete in-flight bakes → hidden (terrain reveal path).
+            for c in self.chunks.values_mut() {
+                if c.task_left > 0 {
+                    c.task_left -= 1;
+                    if c.task_left == 0 {
+                        c.hidden_hash = c.task_hash;
+                        c.task_hash = 0;
+                        c.reveal_left = self.reveal_frames.max(1);
+                    }
+                }
+            }
+            // REVEAL: swap hidden → displayed once settled.
+            for c in self.chunks.values_mut() {
+                if c.hidden_hash != 0 && c.reveal_left > 0 {
+                    c.reveal_left -= 1;
+                    if c.reveal_left == 0 {
+                        c.displayed_hash = c.hidden_hash;
+                        c.hidden_hash = 0;
+                    }
+                }
+            }
+            // REAP (keep-old-until-revealed): drop a shown mesh only once its region is fully covered by shown
+            // chunks. `shown` (displayed != 0) is the sim's `is_revealed`.
+            let shown: HashSet<BrickKey> =
+                self.chunks.iter().filter(|(_, c)| c.displayed_hash != 0).map(|(k, _)| *k).collect();
+            let is_rev = |key: BrickKey| shown.contains(&key);
+            let reap: Vec<BrickKey> = self
+                .chunks
+                .iter()
+                .filter(|(key, c)| {
+                    c.displayed_hash != 0
+                        && render_commit_reap(
+                            **key, resident.contains(key), &resident, &is_rev, Some(cam), self.half0,
+                            self.lod_count, &self.cfg, self.k,
+                        )
+                })
+                .map(|(k, _)| *k)
+                .collect();
+            for key in reap {
+                self.chunks.get_mut(&key).unwrap().displayed_hash = 0;
+            }
+            self.chunks
+                .retain(|key, c| resident.contains(key) || c.displayed_hash != 0 || c.hidden_hash != 0 || c.task_left > 0);
+            // REQUEST: issue bakes (no budget cap in the sim; NO cancel of in-flight — the fix).
+            for &key in &resident {
+                let d = self.desired(key, cam);
+                let c = self.chunks.entry(key).or_default();
+                if chunk_needs_bake(c.displayed_hash, c.hidden_hash, c.task_left > 0, d) {
+                    c.task_hash = d;
+                    c.task_left = self.bake_latency.max(1);
+                }
+            }
+            // Track consecutive residency age.
+            self.age.retain(|key, _| resident.contains(key));
+            for &key in &resident {
+                *self.age.entry(key).or_default() += 1;
+            }
+        }
+    }
+
+    /// HARNESS: cold-fill then fly continuously. A chunk that has been resident for at least the bake+reveal
+    /// budget is ALWAYS on screen — the regression guard for "takes ages to show up" (a cancel-on-supersede
+    /// would leave long-resident chunks perpetually un-baked under motion).
+    #[test]
+    fn streaming_chunks_appear_even_under_continuous_movement() {
+        let cfg = SdfGridConfig { voxel_size: 0.4, ..SdfGridConfig::default() };
+        let mc = MeshBakeConfig { lod0_radius: 16.0, ..MeshBakeConfig::default() };
+        let k = mc.chunk_bricks.clamp(1, 8);
+        let (lod_count, bake_latency, reveal_frames) = (3u32, 4u8, REVEAL_SETTLE_FRAMES);
+        let half0 = lod0_half_chunks(&cfg, &mc, k);
+        let mut sim = Sim {
+            cfg: cfg.clone(), k, half0, lod_count, bake_latency, reveal_frames,
+            chunks: HashMap::new(), age: HashMap::new(),
+        };
+        let appear_bound = bake_latency as u32 + reveal_frames as u32 + 2;
+
+        // (1) COLD FILL at the origin — after the budget elapses, everything resident is on screen.
+        let cam0 = Vec3::new(0.0, 40.0, 0.0);
+        for _ in 0..(appear_bound + 4) {
+            sim.frame(cam0);
+        }
+        for &key in &sim.resident(cam0) {
+            assert!(sim.shown(key), "cold fill: a resident chunk is not on screen");
+        }
+
+        // (2) CONTINUOUS MOVEMENT — sub-chunk steps so the transition-flag hash churns most frames. Every frame,
+        // every chunk continuously resident for >= appear_bound frames MUST be on screen.
+        let step = Vec3::new(cfg.voxel_size * 0.5, 0.0, 0.0);
+        for f in 1..150u32 {
+            sim.frame(cam0 + step * f as f32);
+            for (&key, &age) in &sim.age {
+                assert!(
+                    age < appear_bound || sim.shown(key),
+                    "chunk resident {age} frames still off screen at frame {f} (lod {})",
+                    key.lod
+                );
+            }
+        }
+    }
+
+    /// The SEPARATE physics clipmap is a self-contained coarse shell: it admits ONLY its `[base, base+count)`
+    /// LODs, the finest level fills SOLID at the focus (no hole, unlike the render clipmap's LOD 0), and a
+    /// chunk far outside the small cube is rejected. Guards the physics residency math against drift.
+    #[test]
+    fn physics_clipmap_is_a_self_contained_coarse_shell() {
+        let (cfg, _mc) = cfgs();
+        let k = 4u32;
+        let (base, count, base_half) = (2u32, 2u32, 2i32 << 2); // matches the defaults (half=2 base-chunks)
+        let center = Vec3::ZERO;
+
+        // LODs outside the physics band are never resident — even a chunk at the focus.
+        assert!(!physics_chunk_in_shell(chunk(&cfg, k, 0, 0), &cfg, k, center, base, count, base_half));
+        assert!(!physics_chunk_in_shell(chunk(&cfg, k, base + count, 0), &cfg, k, center, base, count, base_half));
+
+        // The finest physics LOD fills SOLID at the focus (no inner hole) — the chunk over the origin is in.
+        assert!(physics_chunk_in_shell(chunk(&cfg, k, base, 0), &cfg, k, center, base, count, base_half));
+
+        // A chunk far beyond the small cube is rejected at every physics LOD.
+        for lod in base..base + count {
+            assert!(!physics_chunk_in_shell(chunk(&cfg, k, lod, 9999), &cfg, k, center, base, count, base_half));
+        }
     }
 
     /// The COVERAGE GATE excludes a terrain chunk whose XZ footprint reaches OUTSIDE the loaded height
