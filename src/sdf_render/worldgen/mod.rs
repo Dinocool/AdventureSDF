@@ -691,32 +691,8 @@ mod plugin_tests {
         );
     }
 
-    /// The derived tier count `T` covers the mesh-bake coarsest-LOD reach for the DEFAULT configs — so
-    /// "terrain to the full LOD-8 reach" is guaranteed, and `T` auto-extends if the default `lod_count`
-    /// changes. Asserts `512·2^(T-1) ≥ reach` and that `T-1` is the SMALLEST such tier (no over-build).
-    #[test]
-    fn clipmap_tiers_cover_mesh_bake_reach() {
-        let grid = crate::sdf_render::SdfGridConfig::default();
-        let mesh_cfg = crate::sdf_render::mesh_bake::MeshBakeConfig::default();
-        let reach = crate::sdf_render::mesh_bake::coarsest_lod_outer_reach(&grid, &mesh_cfg) as f64;
-        let t = height_clipmap_tiers(reach);
-        assert!(t >= 1);
-        assert!(
-            height_tier_reach(t - 1) >= reach,
-            "coarsest tier {} covers ±{} m but reach is ±{reach} m",
-            t - 1,
-            height_tier_reach(t - 1),
-        );
-        // Minimal: one fewer tier would NOT cover (unless T==1, i.e. tier 0 already covers).
-        if t > 1 {
-            assert!(
-                height_tier_reach(t - 2) < reach,
-                "T is not minimal: tier {} already covers ±{} m ≥ reach ±{reach} m",
-                t - 2,
-                height_tier_reach(t - 2),
-            );
-        }
-    }
+    // (`clipmap_tiers_cover_mesh_bake_reach` removed in the voxel-RT cut: it tied the height-clipmap tier
+    // count to the pruned `mesh_bake` reach. The voxel-RT renderer defines its own residency reach.)
 
     /// The DERIVED terrain band brackets the full default surface swing (fBm amplitude sum × the ridge
     /// fold + erosion strength, with margin) — so the volume AABB always contains the carved surface.

@@ -7,7 +7,8 @@ use bevy::prelude::*;
 use bevy::reflect::TypeRegistry;
 
 use crate::scene_manager::SceneEntity;
-use crate::sdf_render::{SdfMaterial, SdfOp, SdfOrder, SdfPrimitive, SdfVolume};
+use crate::sdf_render::SdfVolume;
+use crate::sdf_render::edits::{SdfMaterial, SdfOp, SdfOrder, SdfPrimitive};
 
 use super::format::{LocalId, SceneFile, SceneRecord};
 use super::{load::load_scene, save::save_scene_to_string};

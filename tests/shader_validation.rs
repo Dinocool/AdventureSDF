@@ -7,8 +7,6 @@
 //! (`sdf_brick_bake.wgsl`); the surface raymarch + its `sdf/*.wgsl` import modules were removed.
 //! The bake shader is fully self-contained (no `#import` of local modules), so it validates
 //! directly with naga (composed only against the Bevy fullscreen stub, which it doesn't even use).
-//! The baked-mesh material shader (`mesh_pbr.wgsl`) is an `ExtendedMaterial` shader validated by
-//! Bevy's runtime pipeline, not here.
 
 use naga_oil::compose::{
     ComposableModuleDescriptor, Composer, NagaModuleDescriptor, ShaderDefValue, ShaderLanguage,

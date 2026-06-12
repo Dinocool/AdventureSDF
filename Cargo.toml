@@ -48,8 +48,11 @@ shader-debug = ["bevy_render/decoupled_naga"]
 # (Disable with `--no-default-features` when capturing in RenderDoc, which can't inject
 # into a dynamically-linked Bevy.)
 fast = ["bevy/dynamic_linking"]
-# Physics — DEFERRED to Stage 6 (see bevy_rapier3d note). Off by default during the voxel-RT migration.
-physics = ["dep:bevy_rapier3d"]
+# Physics (Stage 6) — the player walks the voxels via a kinematic character controller colliding with
+# greedy-cuboid colliders built from voxel occupancy. We use the ENGINE-AGNOSTIC `rapier3d` solver
+# directly (no `bevy_rapier` — which has no Bevy-0.19 build and would be another vendored fork to track);
+# the thin Bevy integration lives in `voxel::physics`. Off by default.
+physics = ["dep:rapier3d"]
 # Stage 4c — NVIDIA DLSS Ray Reconstruction (denoiser + upscaler) for the HW-RT voxel path. OFF by
 # default — enabling needs the NVIDIA DLSS SDK (`DLSS_SDK`), Vulkan headers (`VULKAN_SDK`), and
 # libclang (`LIBCLANG_PATH`) at build time. `bevy/dlss` makes `DefaultPlugins` register
@@ -87,9 +90,11 @@ bevy = { path = "D:/bevy-fork", default-features = false, features = [
     # image formats
     "png", "jpeg", "bmp", "tga",
 ] }
-# DEFERRED to Stage 6 of the voxel-RT rebuild: no bevy_rapier exists for Bevy 0.19 yet, and physics
-# isn't used until Stage 6. Optional + off by default; the rapier-using code is `#[cfg(feature="physics")]`.
-bevy_rapier3d = { version = "0.34.0", optional = true }
+# Stage 6 physics — the engine-agnostic Rapier solver (no Bevy dep, so no fork to track against the Bevy
+# fork). We build static greedy-cuboid colliders from voxel occupancy + drive a kinematic character
+# controller; the thin Bevy glue is in `voxel::physics`. Optional + off by default; all rapier-using code
+# is `#[cfg(feature = "physics")]`. `dim3` = 3D, `f32` = single precision (matches our world units).
+rapier3d = { version = "0.33", optional = true, default-features = false, features = ["dim3", "f32", "std"] }
 # Direct dep on the SAME bevy_render the `bevy` umbrella already uses (Cargo unifies it — no extra
 # build cost, no second copy) so `shader-debug` can flip its `decoupled_naga` feature (round-trips
 # composed shaders to a WGSL string → naga emits `OpSource`/`OpLine` for Nsight). MUST be non-optional:
@@ -115,8 +120,6 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg",
 # Otherwise only transitive via bevy_scene.
 ron = "0.12"
 serde = { version = "1", features = ["derive"] }
-# Offline BC7 encode of the PBR texture arrays (cached to disk; ~1/6 the VRAM).
-intel_tex_2 = "0.2"
 egui_dock = { version = "0.19", optional = true, features = ["serde"] }
 # In-app RenderDoc capture, editor-only. `libloading` preloads renderdoc.dll early so the
 # graphics hook installs before the wgpu device exists.
@@ -145,18 +148,12 @@ emath = "0.34"
 # &[u8] for buffer upload via `cast_slice`. `derive` for `#[derive(Pod, Zeroable)]` on those
 # `#[repr(C)]` structs (see `sdf_render::render::gpu`), replacing hand-rolled `to_le_bytes` packing.
 bytemuck = { version = "1", features = ["derive"] }
-transvoxel = "2.0.0"
 # Portable 4-wide SIMD (`f64x4`/`i32x4`/`u32x4`) for the columnar worldgen height eval: the value-noise
 # octave sum is the gen hot path, processed 4 grid points at a time. `wide` falls back to scalar lanes on
 # non-SIMD targets, and its integer ops (xor/wrapping-mul/shift) + `f64` basic ops (`+ - *`, `floor`,
 # `i32→f64`) are bit-identical to the scalar `noise.rs` primitives — preserving the bit-portable
 # determinism invariant (no FMA/reassociation). Already in the tree transitively via rapier (no new fetch).
 wide = "0.7.33"
-# IEEE-754 half-precision (`f16`) for the per-chunk terrain DETAIL-NORMAL map: the baked surface slope
-# `(dh/dx, dh/dz)` is stored in an `Rg16Float` GPU texture, so the CPU bake packs each f32 lane to f16
-# bits. The mature off-the-shelf converter (correct rounding/denormals) instead of hand-rolled bit
-# twiddling. Already in the tree transitively (via wgpu), so no new fetch.
-half = "2"
 
 [dev-dependencies]
 # spv-out: emit SPIR-V from naga in tests so we can inspect which opcode signed `%`

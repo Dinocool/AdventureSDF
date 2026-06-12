@@ -24,6 +24,9 @@ pub mod cornell;
 pub mod edits;
 pub mod gpu;
 pub mod palette;
+/// Stage 6 — voxel physics (the player walks the cubes). Feature-gated on `physics` (pulls `rapier3d`).
+#[cfg(feature = "physics")]
+pub mod physics;
 pub mod raytrace;
 pub mod streaming;
 pub mod voxelize;
@@ -95,6 +98,27 @@ impl Plugin for VoxelPlugin {
         // camera isn't queryable on the first frame, and worldgen frames the camera for km-scale terrain at
         // distance 320, which would make the 0.2 m voxels invisible).
         app.add_systems(Update, reframe_camera_on_patch);
+
+        // Stage 6 — voxel physics (the player walks the cubes). First-person: `P` drops you into the
+        // Cornell box and the SdfCamera becomes your eyes. Gated on `physics` (rapier3d) + the SdfEditor
+        // scene (where the SdfCamera is active). The toggle/rebuild/move run in order each frame; the
+        // orbit/fps camera input is already gated off while `SdfCameraMode::player` is on (SdfScenePlugin).
+        #[cfg(feature = "physics")]
+        {
+            use crate::scene_manager::AppScene;
+            app.init_resource::<physics::VoxelColliders>()
+                .init_resource::<physics::VoxelWalk>()
+                .add_systems(
+                    Update,
+                    (
+                        physics::toggle_walk_mode,
+                        physics::rebuild_walk_colliders,
+                        physics::walk_player,
+                    )
+                        .chain()
+                        .run_if(in_state(AppScene::SdfEditor)),
+                );
+        }
     }
 }
 

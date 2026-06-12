@@ -11,15 +11,13 @@ use bevy::prelude::*;
 
 use super::{SdfCamera, SdfVolume};
 
-/// Double-click-to-focus state for the orbit camera. `sdf_picking` records each
-/// left-click time to detect double-clicks; a double-click on a volume sets
-/// `target`, which `orbit_camera` eases `SdfOrbitCamera.target` toward.
+/// Double-click-to-focus state for the orbit camera: a focus point the camera eases
+/// `SdfOrbitCamera.target` toward (set by a future picking path; the SDF picker that drove it was
+/// pruned in the voxel-RT rebuild, so `target` currently stays `None`).
 #[derive(Resource, Default)]
 pub struct OrbitFocus {
     /// World point the orbit target is easing toward; cleared once reached.
     pub target: Option<Vec3>,
-    /// Elapsed-seconds timestamp of the previous left-click (double-click detection).
-    pub(super) last_click: f32,
 }
 
 #[derive(Resource)]

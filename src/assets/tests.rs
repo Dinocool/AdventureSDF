@@ -121,52 +121,8 @@ fn texture_library_respects_cap() {
 
 // === One-off migration generators (run explicitly with `-- --ignored`) ==============
 
-/// Generate one `.pbrtex.ron` per existing texture variant directory, pointing at that
-/// dir's role PNGs. Run with:
-/// `cargo test --features editor export_variant_pbrtextures -- --ignored --nocapture`.
-#[test]
-#[ignore]
-fn export_variant_pbrtextures() {
-    use crate::sdf_render::textures::{TEXTURE_ROOT, read_manifest};
-
-    let role = |slug: &str, dir: &str, file: &str| -> Option<PathBuf> {
-        let rel = PathBuf::from(format!("textures/{slug}/{dir}/{file}.png"));
-        if std::path::Path::new("assets").join(&rel).is_file() {
-            Some(rel)
-        } else {
-            None
-        }
-    };
-
-    let Ok(entries) = std::fs::read_dir(TEXTURE_ROOT) else {
-        panic!("no {TEXTURE_ROOT} dir");
-    };
-    let slugs: Vec<String> = entries
-        .flatten()
-        .filter(|e| e.path().join("material.ron").is_file())
-        .filter_map(|e| e.file_name().into_string().ok())
-        .collect();
-
-    for slug in slugs {
-        for v in read_manifest(&slug) {
-            let tex = PbrTextureAsset {
-                diffuse: role(&v.slug, &v.dir, "diffuse"),
-                normal: role(&v.slug, &v.dir, "normal"),
-                metallic: role(&v.slug, &v.dir, "metallic"),
-                roughness: role(&v.slug, &v.dir, "roughness"),
-                ao: role(&v.slug, &v.dir, "ao"),
-                height: role(&v.slug, &v.dir, "height"),
-                edge: role(&v.slug, &v.dir, "edge"),
-            };
-            let path = PathBuf::from(format!(
-                "assets/pbrtextures/{}_{}.pbrtex.ron",
-                v.slug, v.dir
-            ));
-            tex.save(&path).expect("save pbrtex");
-            println!("wrote {}", path.display());
-        }
-    }
-}
+// (`export_variant_pbrtextures` removed in the voxel-RT cut: it depended on the pruned
+// `sdf_render::textures` manifest reader. The PBR-texture bundles it generated already exist on disk.)
 
 /// Regenerate the demo `.material.ron` resources to reference the migrated bundles.
 /// Run after `export_variant_pbrtextures`. Run with:
