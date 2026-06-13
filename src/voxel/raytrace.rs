@@ -1801,14 +1801,20 @@ fn voxel_rt_dlss_pass(
 
     // ReSTIR reset: a camera move, a render-resolution change, or a geometry re-pack invalidates the
     // same-pixel reservoirs (no reprojection yet — that's R2). DLSS-RR still reprojects the resolved colour.
+    // CRUCIAL: use the UN-JITTERED view-projection for the move test. `clip_from_world_arr` is built from the
+    // TemporalJitter-perturbed projection, which changes EVERY frame — comparing it would fire `reset` every
+    // frame and the reservoirs would never accumulate (the GI would boil exactly as before). The sub-pixel
+    // jitter must not count as camera motion. `extracted_view.clip_from_view` is the original un-jittered proj.
+    let view_proj_unjittered =
+        (extracted_view.clip_from_view * world_from_view.inverse()).to_cols_array_2d();
     let built_gen = resources.built_generation;
     let reset_restir = match resources.dlss_restir_prev {
         None => true,
         Some((r, vp, g)) => {
-            r != render_res || !matrices_close(&vp, &clip_from_world_arr) || g != built_gen
+            r != render_res || !matrices_close(&vp, &view_proj_unjittered) || g != built_gen
         }
     };
-    resources.dlss_restir_prev = Some((render_res, clip_from_world_arr, built_gen));
+    resources.dlss_restir_prev = Some((render_res, view_proj_unjittered, built_gen));
 
     let color_view = &resources.dlss_color.as_ref().expect("just allocated").1;
     let depth_view = &resources.dlss_depth.as_ref().expect("just allocated").1;
