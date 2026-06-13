@@ -25,6 +25,7 @@ pub mod registry;
 #[cfg(feature = "renderdoc")]
 pub mod renderdoc_capture;
 pub mod status_bar;
+pub mod viewport;
 
 use panels::DockSide;
 
@@ -40,6 +41,8 @@ impl Plugin for EditorPlugin {
             registry::ShaderDebugRegistryPlugin,
             profiling::ProfilingPlugin,
             status_bar::StatusBarPlugin,
+            // The 3D viewport: retargets the SdfCamera into an offscreen image shown in the Viewport tab.
+            viewport::ViewportPlugin,
             // Added LAST (after every plugin has registered its panels, which the dock's
             // `init_dock_state` consumes at PostStartup).
             dock::DockPlugin,

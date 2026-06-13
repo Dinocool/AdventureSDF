@@ -35,7 +35,7 @@ use crate::scene_manager::{AppScene, SceneEntity};
 use crate::sdf_render::edits::{
     CsgKind, MaterialFields, SdfMaterialSource, SdfOp, SdfOrder, SdfPrimitive,
 };
-use crate::sdf_render::{SdfCamera, SdfOrbitCamera, SdfVolume};
+use crate::sdf_render::{SdfCamera, SdfVolume};
 
 use layers::erosion::ErosionParams;
 use layers::height::{HEIGHT_CHUNK_CELLS, HeightParams};
@@ -248,10 +248,13 @@ impl Plugin for WorldGenPlugin {
                 OnEnter(AppScene::SdfEditor),
                 spawn_terrain_volume.run_if(|e: Res<WorldGenEnabled>| e.0),
             )
-            // Stream the rolling generation window around the camera + reframe the camera once.
+            // Stream the rolling generation window around the camera. (Camera framing is owned by the
+            // voxel-RT `reframe_camera_on_patch`, which frames BOTH the Cornell box and the worldgen patch
+            // at voxel scale — the old `reframe_worldgen_camera` set a km-scale distance-320 view for the
+            // removed mesh-bake terrain and fought it, so it was dropped.)
             .add_systems(
                 Update,
-                (roll_worldgen, reframe_worldgen_camera)
+                roll_worldgen
                     .run_if(in_state(AppScene::SdfEditor))
                     .run_if(|e: Res<WorldGenEnabled>| e.0),
             );
@@ -542,32 +545,6 @@ fn apply_biome_library(
             }
         }
     }
-}
-
-/// Reframe the orbit camera above the terrain, ONCE, after the camera entity exists.
-///
-/// Done in `Update` (not `OnEnter`) because the Startup-spawned camera isn't queryable at the first
-/// `OnEnter`. Writes the camera `Transform` DIRECTLY: `orbit_camera` only syncs orbit→transform while
-/// the pointer is over the viewport (`ViewportInputAllowed`), so otherwise the camera keeps its
-/// buried distance-8 startup transform until the user first interacts. We also set the orbit resource
-/// so it stays consistent once the user does grab the view.
-fn reframe_worldgen_camera(
-    mut done: Local<bool>,
-    mut orbit: ResMut<SdfOrbitCamera>,
-    mut cam: Query<&mut Transform, (With<SdfCamera>, Without<SdfVolume>)>,
-) {
-    if *done {
-        return;
-    }
-    let Ok(mut tf) = cam.single_mut() else {
-        return; // camera not spawned yet — retry next frame
-    };
-    orbit.target = Vec3::ZERO;
-    orbit.distance = 320.0;
-    orbit.yaw = 0.7;
-    orbit.pitch = 0.55;
-    *tf = orbit.view_transform();
-    *done = true;
 }
 
 /// The "World Gen" editor dock panel: live sliders for the height + erosion params. An edit mutates the

@@ -111,13 +111,27 @@ impl TabViewer for EditorTabViewer<'_> {
         });
         match tab {
             EditorTab::Viewport => {
-                ui.centered_and_justified(|ui| {
-                    ui.label(
-                        egui::RichText::new("Voxel-RT viewport")
-                            .weak()
-                            .size(16.0),
-                    );
-                });
+                // Draw the SdfCamera's offscreen render (the ray-traced voxel scene) filling the tab, and
+                // tell the viewport plugin what size the tab wants so it can resize the render image.
+                let avail = ui.available_size();
+                let want = UVec2::new((avail.x.max(16.0)) as u32, (avail.y.max(16.0)) as u32);
+                let tex = self
+                    .world
+                    .get_resource::<super::viewport::EditorViewport>()
+                    .map(|vp| vp.texture_id);
+                if let Some(tex) = tex {
+                    if let Some(mut vp) =
+                        self.world.get_resource_mut::<super::viewport::EditorViewport>()
+                        && vp.desired_size != want
+                    {
+                        vp.desired_size = want;
+                    }
+                    ui.image(egui::load::SizedTexture::new(tex, avail));
+                } else {
+                    ui.centered_and_justified(|ui| {
+                        ui.label(egui::RichText::new("Voxel-RT viewport").weak().size(16.0));
+                    });
+                }
             }
             EditorTab::Registered(id) => {
                 if let Some(render) = self.registry.panel_by_id(id).map(|p| &p.render) {
@@ -136,9 +150,9 @@ impl TabViewer for EditorTabViewer<'_> {
         !matches!(tab, EditorTab::Viewport)
     }
 
-    fn clear_background(&self, tab: &Self::Tab) -> bool {
-        // Paint the placeholder; a future real viewport would let the 3D camera show through.
-        !matches!(tab, EditorTab::Viewport)
+    fn clear_background(&self, _tab: &Self::Tab) -> bool {
+        // Every tab paints its own background now — the Viewport tab draws the SdfCamera's render image.
+        true
     }
 }
 
@@ -256,7 +270,9 @@ fn spawn_editor_egui_camera(mut commands: Commands) {
         Camera2d,
         Camera {
             order: 10,
-            clear_color: bevy::camera::ClearColorConfig::None,
+            // The SdfCamera now renders into an offscreen image (the Viewport tab), so this overlay OWNS
+            // the window: clear it to a neutral editor backdrop, then paint the dock on top.
+            clear_color: bevy::camera::ClearColorConfig::Custom(Color::srgb(0.06, 0.06, 0.07)),
             ..default()
         },
         bevy_egui::PrimaryEguiContext,
