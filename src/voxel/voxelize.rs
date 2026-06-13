@@ -30,11 +30,73 @@ pub fn voxel_center_world(world_voxel: IVec3) -> [f64; 3] {
     ]
 }
 
-/// The block at a single WORLD voxel coordinate, sampling the worldgen surface. Returns [`BlockId::AIR`]
-/// for any voxel ABOVE the surface (`depth < 0`); otherwise it resolves the climate biome at the column
-/// and the strata material at `depth = surface_height − voxel_y`, mapped through the [`BlockRegistry`] to
-/// a [`BlockId`]. The SSOT for one voxel — both [`voxelize_brick`] and the per-column tests call it, so
-/// they can never diverge.
+/// The undug RENDER-SURFACE skin thickness (metres) the [`resolve_surface`] rules paint: voxels within this
+/// depth of the surface take the surface-rule material (snow caps, cliff rock, flower / EMISSIVE lava +
+/// crystal patches); deeper voxels fall to the volumetric [`strata_material`] column (dug walls). One voxel
+/// edge ([`VOXEL_SIZE`]) — the exposed shell — so the glow sits on the surface, not buried under dirt.
+const SURFACE_SKIN_DEPTH: f64 = VOXEL_SIZE as f64;
+
+/// All the COLUMN-CONSTANT worldgen evaluation for one `(wx, wz)` ground column — the expensive 2D work
+/// (the `sample_world` fBm+erosion+biome graph eval, the surface gradient, and the climate biome lookups).
+/// Height + climate are height-INDEPENDENT, so this is computed ONCE per column and reused for every voxel in
+/// it (8 voxels per column in a brick) — that is the SSOT both [`voxel_block_at`] (per-voxel) and
+/// [`voxelize_brick`] (per-column, the hot path) build through, so they can never diverge. Hoisting it out of
+/// the per-voxel loop removes the 8× redundant `sample_world` the per-voxel form did.
+pub struct ColumnSample {
+    node: HeightNode,
+    /// Surface-normal cos: n = (−dh_dx, 1, −dh_dz) normalized ⇒ n_y = 1/|n| (for the slope surface-rules).
+    n_y: f64,
+    /// Biome SAMPLE (climate blend) for the SURFACE-skin rules (`resolve_surface`).
+    surf_biome: crate::sdf_render::worldgen::biome::BiomeSample,
+    /// Primary biome for the volumetric sub-surface strata column.
+    sub_biome: crate::sdf_render::worldgen::biome::BiomeId,
+    wx: f64,
+    wz: f64,
+    seed: u64,
+}
+
+impl ColumnSample {
+    /// Evaluate the column at world XZ `(wx, wz)` — ONE `sample_world` + the two climate-biome lookups.
+    #[inline]
+    pub fn at(wx: f64, wz: f64, layer: &HeightLayer, seed: u64) -> Self {
+        let node = layer.sample_world(wx, wz, seed);
+        let (dx, dz) = (node.dh_dx as f64, node.dh_dz as f64);
+        let n_y = 1.0 / (dx * dx + dz * dz + 1.0).sqrt();
+        let surf_biome = surface_biome(wx, wz, seed);
+        let sub_biome = classify(temperature(wx, wz, seed), humidity(wx, wz, seed)).primary;
+        Self { node, n_y, surf_biome, sub_biome, wx, wz, seed }
+    }
+
+    /// Surface height (metres) of this column.
+    #[inline]
+    pub fn height(&self) -> f64 {
+        self.node.height as f64
+    }
+
+    /// The block at world-Y centre `wy` in this column. AIR above the surface; within `SURFACE_SKIN_DEPTH`
+    /// the dominant surface-rule material (`resolve_surface`, matching the rendered terrain surface — altitude
+    /// caps, cliffs, patches, EMISSIVE lava/crystal); below the skin the volumetric `strata_material` column.
+    /// A base-only column yields `mat_a == def.surface`, bit-identical to the old per-voxel `strata_material`.
+    #[inline]
+    pub fn block_at(&self, wy: f64, lib: &BiomeLibrary, registry: &BlockRegistry) -> BlockId {
+        let h = self.height();
+        let depth = h - wy;
+        if depth < 0.0 {
+            return BlockId::AIR; // above the surface → empty
+        }
+        let mat = if depth < SURFACE_SKIN_DEPTH {
+            let blend = resolve_surface(self.wx, self.wz, h, self.n_y, self.surf_biome, self.seed, lib);
+            TerrainMatId(blend.mat_a)
+        } else {
+            strata_material(self.sub_biome, depth, lib)
+        };
+        registry.block_for_material(mat)
+    }
+}
+
+/// The block at a single WORLD voxel coordinate — the per-voxel SSOT (used by the per-column tests). Builds a
+/// one-shot [`ColumnSample`] for the voxel's column and reads its block. [`voxelize_brick`] shares the SAME
+/// `ColumnSample`/`block_at` path but amortizes the column eval across the column's 8 voxels.
 #[inline]
 pub fn voxel_block_at(
     world_voxel: IVec3,
@@ -44,52 +106,7 @@ pub fn voxel_block_at(
     seed: u64,
 ) -> BlockId {
     let [wx, wy, wz] = voxel_center_world(world_voxel);
-    let node = layer.sample_world(wx, wz, seed);
-    let h = node.height as f64;
-    let depth = h - wy;
-    if depth < 0.0 {
-        return BlockId::AIR; // above the surface → empty
-    }
-    let mat = surface_material_at(wx, wz, h, depth, &node, lib, seed);
-    registry.block_for_material(mat)
-}
-
-/// The undug RENDER-SURFACE skin thickness (metres) the [`resolve_surface`] rules paint: voxels within this
-/// depth of the surface take the surface-rule material (snow caps, cliff rock, flower / EMISSIVE lava +
-/// crystal patches); deeper voxels fall to the volumetric [`strata_material`] column (dug walls). One voxel
-/// edge ([`VOXEL_SIZE`]) — the exposed shell — so the glow sits on the surface, not buried under dirt.
-const SURFACE_SKIN_DEPTH: f64 = VOXEL_SIZE as f64;
-
-/// The terrain material occupying world voxel `(wx,wz)` at `depth` metres below the surface — the worldgen
-/// SSOT for the voxel block. WITHIN the surface skin (`depth < SURFACE_SKIN_DEPTH`) it uses the SAME
-/// [`resolve_surface`] the SDF/mesh renderer uses (so the voxel surface respects the biome `surface_rules`:
-/// altitude caps, cliffs, patches, and the new EMISSIVE lava/crystal placement), taking its DOMINANT
-/// material (`mat_a`); below the skin it walks the volumetric [`strata_material`] column. A base-only column
-/// (no surface rule firing) yields `mat_a == def.surface`, i.e. bit-identical to the old `strata_material`
-/// surface — so non-emissive terrain output is unchanged.
-#[inline]
-fn surface_material_at(
-    wx: f64,
-    wz: f64,
-    h: f64,
-    depth: f64,
-    node: &HeightNode,
-    lib: &BiomeLibrary,
-    seed: u64,
-) -> TerrainMatId {
-    if depth < SURFACE_SKIN_DEPTH {
-        // Surface skin: choose the dominant surface-rule material (matches the rendered terrain surface).
-        // Surface-normal cos from the stored gradient: n = (-dh_dx, 1, -dh_dz) normalized ⇒ n_y = 1/|n|.
-        let (dx, dz) = (node.dh_dx as f64, node.dh_dz as f64);
-        let n_y = 1.0 / (dx * dx + dz * dz + 1.0).sqrt();
-        let biome = surface_biome(wx, wz, seed);
-        let blend = resolve_surface(wx, wz, h, n_y, biome, seed, lib);
-        TerrainMatId(blend.mat_a)
-    } else {
-        // Sub-surface: the volumetric strata column (dug walls / depth ordering). Climate is height-indep.
-        let biome = classify(temperature(wx, wz, seed), humidity(wx, wz, seed)).primary;
-        strata_material(biome, depth, lib)
-    }
+    ColumnSample::at(wx, wz, layer, seed).block_at(wy, lib, registry)
 }
 
 /// Voxelize one `8³` brick at integer brick coordinate `brick_coord`. Samples [`voxel_block_at`] for each
@@ -105,11 +122,17 @@ pub fn voxelize_brick(
 ) -> Brick {
     let origin = brick_coord * BRICK_EDGE; // world voxel coordinate of the brick's (0,0,0) corner
     let mut voxels = Box::new([BlockId::AIR; BRICK_VOXELS]);
+    // Loop COLUMNS (x,z) outermost: evaluate the column-constant worldgen ONCE per (x,z), then read all 8
+    // voxels in the column from it (height/climate are height-independent). This is the SAME ColumnSample /
+    // block_at SSOT voxel_block_at uses, so the output is bit-identical — but with 1 `sample_world` per column
+    // instead of per voxel (8× fewer of the expensive graph evals — the dominant voxelize cost).
     for z in 0..BRICK_EDGE {
-        for y in 0..BRICK_EDGE {
-            for x in 0..BRICK_EDGE {
-                let world_voxel = origin + IVec3::new(x, y, z);
-                voxels[voxel_index(x, y, z)] = voxel_block_at(world_voxel, layer, lib, registry, seed);
+        for x in 0..BRICK_EDGE {
+            let [wx, _, wz] = voxel_center_world(origin + IVec3::new(x, 0, z));
+            let col = ColumnSample::at(wx, wz, layer, seed);
+            for y in 0..BRICK_EDGE {
+                let wy = (origin.y as f64 + y as f64 + 0.5) * VOXEL_SIZE as f64;
+                voxels[voxel_index(x, y, z)] = col.block_at(wy, lib, registry);
             }
         }
     }
