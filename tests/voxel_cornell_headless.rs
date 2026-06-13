@@ -155,23 +155,23 @@ fn headless_cornell_colours_and_bleed() {
     let mut lit = false;
     for _ in 0..120 {
         app.update();
-        if let Some(b) = latest.0.lock().unwrap().clone() {
-            if b.len() >= padded_row * H as usize {
-                // Mean luma over the centre of the frame — non-trivial once the box has actually rendered.
-                let mut sum = 0.0f32;
-                let mut n = 0.0f32;
-                for y in (H as usize / 4)..(H as usize * 3 / 4) {
-                    for x in (W as usize / 4)..(W as usize * 3 / 4) {
-                        let (r, g, bl) = px(&b, padded_row, x, y);
-                        sum += 0.2126 * r + 0.7152 * g + 0.0722 * bl;
-                        n += 1.0;
-                    }
+        if let Some(b) = latest.0.lock().unwrap().clone()
+            && b.len() >= padded_row * H as usize
+        {
+            // Mean luma over the centre of the frame — non-trivial once the box has actually rendered.
+            let mut sum = 0.0f32;
+            let mut n = 0.0f32;
+            for y in (H as usize / 4)..(H as usize * 3 / 4) {
+                for x in (W as usize / 4)..(W as usize * 3 / 4) {
+                    let (r, g, bl) = px(&b, padded_row, x, y);
+                    sum += 0.2126 * r + 0.7152 * g + 0.0722 * bl;
+                    n += 1.0;
                 }
-                if sum / n > 10.0 {
-                    bytes = b;
-                    lit = true;
-                    break;
-                }
+            }
+            if sum / n > 10.0 {
+                bytes = b;
+                lit = true;
+                break;
             }
         }
     }

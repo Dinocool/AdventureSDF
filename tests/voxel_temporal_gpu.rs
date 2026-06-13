@@ -143,11 +143,12 @@ fn temporal_accumulation_reduces_gi_noise() {
     let mut last: Option<Vec<u8>> = None;
     for _ in 0..240 {
         app.update();
-        if let Some(b) = latest.0.lock().unwrap().clone() {
-            if b.len() >= padded_row * H as usize && last.as_ref() != Some(&b) {
-                last = Some(b.clone());
-                frames.push(b);
-            }
+        if let Some(b) = latest.0.lock().unwrap().clone()
+            && b.len() >= padded_row * H as usize
+            && last.as_ref() != Some(&b)
+        {
+            last = Some(b.clone());
+            frames.push(b);
         }
         if frames.len() >= 80 {
             break;

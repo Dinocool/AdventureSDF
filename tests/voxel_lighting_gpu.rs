@@ -121,8 +121,7 @@ fn gpu_lighting_normals_and_shadows() {
 
     // Sun straight DOWN for a clean shadow setup: toward-sun = (0,+1,0). The floor top face normal is
     // (0,+1,0) so N·L = 1 everywhere on the floor — the only variable is the traced shadow.
-    let mut light = LightingUniformData::default();
-    light.sun_direction = [0.0, -1.0, 0.0];
+    let light = LightingUniformData { sun_direction: [0.0, -1.0, 0.0], ..Default::default() };
 
     let t_max = 1000.0f32;
     let n = patch.brick_count() as u32;

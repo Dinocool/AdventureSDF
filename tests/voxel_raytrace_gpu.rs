@@ -211,7 +211,7 @@ fn gpu_ray_query_hit_matches_cpu_ground_truth() {
     let reg = BlockRegistry::from_biome_library(&lib);
 
     // A region a few bricks wide around the origin column's surface. Find the surface to centre the Y band.
-    let surf_h = layer.sample_world(0.0, 0.0, SEED).height as f32;
+    let surf_h = layer.sample_world(0.0, 0.0, SEED).height;
     let surf_vy = (surf_h / VOXEL_SIZE).floor() as i32;
     // ~3×3 bricks in XZ, a Y band straddling the surface (a few bricks tall).
     let span = BRICK_EDGE; // one brick to each side in XZ
@@ -398,12 +398,12 @@ fn gpu_ray_query_hit_matches_cpu_ground_truth() {
             cpu_t
         );
         let expected = reg.color(cpu_block);
-        for c in 0..4 {
+        for (c, &exp) in expected.iter().enumerate() {
             assert!(
-                (gpu.color[c] - expected[c]).abs() < 1e-4,
+                (gpu.color[c] - exp).abs() < 1e-4,
                 "[{label}] GPU committed colour channel {c} ({}) must equal palette ({})",
                 gpu.color[c],
-                expected[c]
+                exp
             );
         }
     };

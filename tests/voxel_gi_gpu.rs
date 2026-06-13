@@ -269,12 +269,13 @@ fn luma(c: [f32; 3]) -> f32 {
 /// A lighting uniform with the sun straight DOWN and GI configured. `gi_rays == 0` disables GI (the
 /// GI-off baseline); a high ray count drives down the Monte-Carlo noise for stable assertions.
 fn light_with_gi(gi_rays: u32) -> LightingUniformData {
-    let mut l = LightingUniformData::default();
-    l.sun_direction = [0.0, -1.0, 0.0]; // straight down
-    l.gi_rays = gi_rays;
-    l.gi_intensity = 1.0;
-    l.gi_bounce_dist = 20.0;
-    l
+    LightingUniformData {
+        sun_direction: [0.0, -1.0, 0.0], // straight down
+        gi_rays,
+        gi_intensity: 1.0,
+        gi_bounce_dist: 20.0,
+        ..Default::default()
+    }
 }
 
 /// **Scenario 1 — indirect light fills a hard sun shadow.** A floor under a floating roof is in hard

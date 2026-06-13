@@ -937,12 +937,14 @@ fn sample_uniform_hemisphere(n: vec3<f32>, rng: ptr<function, u32>) -> vec3<f32>
 }
 fn uniform_hemisphere_inverse_pdf() -> f32 { return 6.2831853; } // 2π
 
-// Generate the per-shading-point INITIAL reservoir: one uniform-hemisphere bounce ray → its sample point +
-// outgoing radiance. Misses contribute nothing (the closed Cornell box rarely lets a bounce escape; the sky
-// term is negligible there, matching the assumption the energy test relies on).
-fn generate_initial_reservoir(world_position: vec3<f32>, world_normal: vec3<f32>, rng: ptr<function, u32>) -> Reservoir {
+// Build an INITIAL reservoir from ONE uniform-hemisphere bounce in direction `dir` (pdf = 1/2π, so the
+// unbiased contribution weight is 2π). The sample's outgoing radiance L_o = direct lighting at the hit +
+// its emissive (emissive INCLUDED — the adaptation). Misses contribute nothing (the closed Cornell box
+// rarely lets a bounce escape; the sky term is negligible there, matching the energy test's assumption).
+// Shared by the white-noise `generate_initial_reservoir` (the headless probe test) and the live
+// low-discrepancy path (`restir_p1_core`) — the ONLY difference between them is how `dir` is chosen.
+fn reservoir_from_bounce(world_position: vec3<f32>, world_normal: vec3<f32>, dir: vec3<f32>) -> Reservoir {
     var reservoir = empty_reservoir();
-    let dir = sample_uniform_hemisphere(world_normal, rng);
     let origin = world_position + world_normal * light.shadow_bias;
     let r = trace(origin, dir, 0.0, light.gi_bounce_dist);
     if (r.hit == 0u) {
@@ -952,7 +954,6 @@ fn generate_initial_reservoir(world_position: vec3<f32>, world_normal: vec3<f32>
     reservoir.sample_point_world_position = hp;
     reservoir.sample_point_world_normal = r.normal;
     reservoir.confidence_weight = 1.0;
-    // L_o at the sample point = direct lighting there + its emissive (emissive INCLUDED — the adaptation).
     reservoir.radiance = direct_lighting(r.color.rgb, r.normal, hp) + r.emissive * light.emissive_strength;
     // Firefly clamp (hue-preserving), same as `gather_gi`. ReSTIR STORES + reuses samples, so an unclamped
     // bright outlier (a grazing emissive hit) persists + propagates across the buffer — worse than in the
@@ -965,6 +966,32 @@ fn generate_initial_reservoir(world_position: vec3<f32>, world_normal: vec3<f32>
     }
     reservoir.unbiased_contribution_weight = uniform_hemisphere_inverse_pdf();
     return reservoir;
+}
+
+// White-noise initial reservoir (one random uniform-hemisphere bounce). Used by the headless `restir_probe`
+// estimator test, which asserts convergence to the high-spp `gather_gi` oracle (unbiased in expectation —
+// white noise keeps that test simple). The live path uses the low-discrepancy variant below.
+fn generate_initial_reservoir(world_position: vec3<f32>, world_normal: vec3<f32>, rng: ptr<function, u32>) -> Reservoir {
+    return reservoir_from_bounce(world_position, world_normal, sample_uniform_hemisphere(world_normal, rng));
+}
+
+// Low-discrepancy UNIFORM-hemisphere direction: Hammersley point (i/N, van-der-Corput(i)) Cranley–Patterson-
+// rotated by `rot`, mapped so z = cosθ is uniform — IDENTICAL parametrisation to `sample_uniform_hemisphere`,
+// so the 1/pdf = 2π convention (and the resolve math) is unchanged; only the noise structure improves. Within
+// a pixel the N RIS candidates stay well-stratified → a STEADIER fraction of them catch the bright emitter
+// frame-to-frame → far less of the per-frame COUNT variance that is the boil source (the cap-8 temporal
+// reservoir cannot average that away). The per-pixel/frame `rot` animates the residual noise uniformly
+// (blue-noise-like → exactly what DLSS-RR + the temporal accumulator reproject + average best). This is the
+// same technique the legacy `gather_gi` proved cuts boil at equal ray count; the ReSTIR path had regressed
+// to white noise, which is why boil persisted even at DLAA (native res, where reprojection error is nil).
+fn ld_uniform_hemisphere(n: vec3<f32>, i: u32, count: u32, rot: vec2<f32>) -> vec3<f32> {
+    let u1 = fract(f32(i) / f32(count) + rot.x);
+    let u2 = fract(radical_inverse_vdc(i) + rot.y);
+    let z = u1;                                   // cos(theta) uniform in [0,1] → uniform hemisphere
+    let r = sqrt(max(0.0, 1.0 - z * z));
+    let phi = 6.2831853 * u2;
+    let basis = onb(n);
+    return normalize(basis[0] * (r * cos(phi)) + basis[1] * (r * sin(phi)) + n * z);
 }
 
 // Jacobian of the solid-angle reparametrisation when a sample taken at `original_world_position` is reused
@@ -1207,13 +1234,18 @@ fn restir_p1_core(n: vec3<f32>, p: vec3<f32>, pix: vec2<u32>, temporal_base: vec
     var rng = seed;
     let brdf = vec3<f32>(1.0); // receiver albedo factored out (applied by the caller)
 
-    // INITIAL RIS over `gi_rays` candidates (same per-pixel sample budget as the legacy `gather_gi`): cuts the
-    // per-pixel variance ~1/M so each frame is smooth. Same-surface merges (Jacobian = 1). Counts as ONE frame
-    // (confidence 1) so the temporal reuse below stays strong.
+    // INITIAL RIS over `gi_rays` LOW-DISCREPANCY candidates (same per-pixel sample budget as the legacy
+    // `gather_gi`): cuts the per-pixel variance ~1/M so each frame is smooth. The candidates are a stratified
+    // Hammersley set with a per-pixel/frame Cranley–Patterson rotation (NOT independent white noise) — that is
+    // the lever that kills the residual DLAA boil (steadier emitter-catch fraction → less per-frame count
+    // variance for the cap-8 temporal reservoir to fight). Same-surface merges (Jacobian = 1). Counts as ONE
+    // frame (confidence 1) so the temporal reuse below stays strong. `rng` still drives the merge's stochastic
+    // selection; the LD directions are deterministic given (pixel, frame).
     let m = min(light.gi_rays, 32u);
-    var res = generate_initial_reservoir(p, n, &rng);
+    let rot = vec2<f32>(rand01(seed * 2u + 1u), rand01(seed * 2u + 2u));
+    var res = reservoir_from_bounce(p, n, ld_uniform_hemisphere(n, 0u, m, rot));
     for (var i = 1u; i < m; i = i + 1u) {
-        let cand = generate_initial_reservoir(p, n, &rng);
+        let cand = reservoir_from_bounce(p, n, ld_uniform_hemisphere(n, i, m, rot));
         let merged = merge_reservoirs(res, p, n, brdf, cand, p, n, brdf, &rng);
         res = merged.merged_reservoir;
     }
