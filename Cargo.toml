@@ -4,10 +4,15 @@ version = "0.1.0"
 edition = "2024"
 
 [features]
-# Dynamic-link Bevy by default for fast incremental dev builds. Release/ship builds and
-# RenderDoc captures must drop it: `cargo build --release --no-default-features` (RenderDoc
-# can't hook a dynamically-linked Bevy — see the `renderdoc` feature).
-default = ["fast"]
+# Default dev build = fast incremental linking + voxel physics + DLSS Ray Reconstruction. So a plain
+# `cargo run` (or `cargo run --features editor`) gets walk-the-cubes physics AND the RR denoiser with no
+# extra flags. NOTE: `dlss` makes the build REQUIRE the NVIDIA DLSS SDK (`DLSS_SDK`), Vulkan headers
+# (`VULKAN_SDK`) + libclang (`LIBCLANG_PATH`) at build time, and FORCES the Vulkan backend at runtime (DLSS is
+# Vulkan-only) — set on this dev machine. On a box without the SDK (or a non-NVIDIA GPU), build with
+# `--no-default-features --features fast` (drops dlss+physics) or `... --features fast,physics`. Release/ship
+# + RenderDoc also drop `fast`: `--release --no-default-features --features physics,dlss` (RenderDoc can't
+# hook a dynamically-linked Bevy — see the `renderdoc` feature).
+default = ["fast", "physics", "dlss"]
 editor = [
     "dep:bevy_egui",
     "dep:egui_dock",
