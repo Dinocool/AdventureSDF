@@ -295,7 +295,7 @@ fn gpu_ray_query_hit_matches_cpu_ground_truth() {
     });
 
     // Pipeline from the real shader, `trace_one` entry.
-    let src = std::fs::read_to_string("assets/shaders/voxel_raytrace.wgsl").expect("read shader");
+    let src = common::voxel_raytrace_shader_src();
     let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some("voxel_raytrace"),
         source: wgpu::ShaderSource::Wgsl(src.into()),
@@ -634,7 +634,7 @@ fn gpu_mixed_lod_matches_cpu_ground_truth() {
         mapped_at_creation: false,
     });
 
-    let src = std::fs::read_to_string("assets/shaders/voxel_raytrace.wgsl").expect("read shader");
+    let src = common::voxel_raytrace_shader_src();
     let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some("voxel_raytrace"),
         source: wgpu::ShaderSource::Wgsl(src.into()),

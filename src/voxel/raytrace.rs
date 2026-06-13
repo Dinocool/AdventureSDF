@@ -120,6 +120,7 @@ impl Plugin for VoxelRtPlugin {
             .init_resource::<VoxelRtLighting>()
             .init_resource::<VoxelRtSky>()
             .init_resource::<RestirSettings>()
+            .init_resource::<WorldCacheSettings>()
             .init_resource::<VoxelEdits>()
             .init_resource::<VoxelEditBrush>()
             .add_plugins(ExtractResourcePlugin::<VoxelRtToggle>::default())
@@ -127,6 +128,7 @@ impl Plugin for VoxelRtPlugin {
             .add_plugins(ExtractResourcePlugin::<VoxelRtLighting>::default())
             .add_plugins(ExtractResourcePlugin::<VoxelRtSky>::default())
             .add_plugins(ExtractResourcePlugin::<RestirSettings>::default())
+            .add_plugins(ExtractResourcePlugin::<WorldCacheSettings>::default())
             .add_systems(Startup, init_voxel_rt_streaming)
             // The edit click handler runs BEFORE the residency/re-bake so an edit's delta-generation bump is
             // observed the same frame (the re-bake then bumps the GPU generation → visible next frame).
@@ -554,6 +556,25 @@ fn sync_dlss_camera(
 
 const OUTPUT_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
 
+/// Number of entries in the world-space radiance-cache hash table (Phase 2.1). MUST be a power of two in the
+/// range 2^10..=2^20 (the prefix-sum compaction is a two-level scan over 1024-wide blocks, so 2^20 is the
+/// natural ceiling — one block-scan workgroup covers up to 1024 blocks). The live render path uses this full
+/// size; the headless test shrinks it via [`voxel_raytrace_shader_src`] so the cache buffers + compaction
+/// stay small + fast. Structural (resolution-independent) — the cache is WORLD-space, allocated ONCE.
+pub const WORLD_CACHE_SIZE: u32 = 1 << 20;
+
+/// **SSOT loader for `voxel_raytrace.wgsl`.** The world-cache section is parameterised by the hash-table size
+/// via the `#{WORLD_CACHE_SIZE}` token (so the headless test can use a tiny table); every shader-load site —
+/// the live pipelines here AND every GPU test — MUST go through this so the token is substituted before naga
+/// sees it (raw `read_to_string` would feed naga an un-substituted `#{...}` and fail to parse). `size` MUST be
+/// a power of two in `[2^10, 2^20]`.
+pub fn voxel_raytrace_shader_src(size: u32) -> String {
+    debug_assert!(size.is_power_of_two() && (1024..=WORLD_CACHE_SIZE).contains(&size));
+    let src = std::fs::read_to_string("assets/shaders/voxel_raytrace.wgsl")
+        .expect("read voxel_raytrace.wgsl");
+    src.replace("#{WORLD_CACHE_SIZE}", &size.to_string())
+}
+
 /// The raymarch compute pipeline + bind-group layouts (raw wgpu), built once on the device.
 #[derive(Resource)]
 struct VoxelRtPipelines {
@@ -573,6 +594,24 @@ struct VoxelRtPipelines {
     /// pass-1-writes-b before pass-2-reads-b). The live GI path.
     restir_p1: wgpu::ComputePipeline,
     restir_p2: wgpu::ComputePipeline,
+    /// `group(3)` (Phase 2.1 world-cache): the cache uniform (`wc`) + the 11 persistent cache storage buffers.
+    /// A DEDICATED bind group (not group 2) so `restir_p1` is never forced to bind all of them — in 2.2 the
+    /// reservoir path will add this group ALONGSIDE group 2, not merge into it.
+    world_cache_layout: wgpu::BindGroupLayout,
+    /// The cache passes' minimal `group(1)` layout ({2: light, 11: sky}) + the `group(2)` indirect-dispatch
+    /// layout ({0: dispatch buffer}). Stored so the per-frame cache dispatch can build the matching bind
+    /// groups (compaction layout is positional: scene(0), view(1), dispatch(2), cache(3); update/blend omit 2).
+    world_cache_view_layout: wgpu::BindGroupLayout,
+    world_cache_dispatch_layout: wgpu::BindGroupLayout,
+    /// The six world-cache compute pipelines, dispatched IN THIS ORDER each frame BEFORE `restir_p1`:
+    /// decay → compact_single_block → compact_blocks → compact_write_active → update (indirect) →
+    /// blend (indirect). All share one pipeline layout `[scene(0), view(1), <empty>(2), cache(3)]`.
+    wc_decay: wgpu::ComputePipeline,
+    wc_compact_single_block: wgpu::ComputePipeline,
+    wc_compact_blocks: wgpu::ComputePipeline,
+    wc_compact_write_active: wgpu::ComputePipeline,
+    wc_update: wgpu::ComputePipeline,
+    wc_blend: wgpu::ComputePipeline,
     /// The composite shader module + its bind-group layout + sampler. The composite render pipeline is
     /// built lazily (and cached) once the live view-target format is known.
     composite_module: wgpu::ShaderModule,
@@ -653,6 +692,17 @@ struct VoxelRtResources {
     /// reprojection and an edit ADAPTS locally (never full-clears the reservoirs). `None` until the first frame.
     restir_prev: Option<(UVec2, Option<u64>)>,
 
+    // --- Phase 2.1 world-space radiance cache (PERSISTENT; allocated ONCE, never realloc'd on resize) ---
+    /// The 11 persistent cache buffers + the bind group over them. The cache is WORLD-space /
+    /// resolution-independent, so this is built ONCE on the first frame (zero-initialised → every cell starts
+    /// empty) and is NEVER reallocated on a view resize and NEVER cleared on a terrain edit (stale cells decay
+    /// + re-fill locally; [[feedback-gi-adapt-not-reset]]). `None` until the first frame allocates it.
+    world_cache: Option<WorldCacheBuffers>,
+    /// `false` until the first cache dispatch has run, so the `reset` flag (blend overwrites instead of
+    /// accumulating) fires exactly ONCE — on the first frame after allocation — and never again (no clear on
+    /// edit / camera move).
+    world_cache_initialized: bool,
+
     // --- DLSS-RR (Stage 4c) intermediate textures + state (only used under `--features dlss`) ---
     /// The `raymarch_dlss` compute's COLOUR / DEPTH / MOTION storage outputs (the resolve render pass reads
     /// these to fill the view target + the RENDER_ATTACHMENT-only prepass depth/motion textures). The 3
@@ -693,6 +743,101 @@ struct SceneKeepAlive {
     _blas: wgpu::Blas,
     _tlas: wgpu::Tlas,
     _buffers: [wgpu::Buffer; 4],
+}
+
+/// The PERSISTENT world-space radiance-cache GPU state (Phase 2.1): the 11 storage buffers + the `group(3)`
+/// bind group over them (+ a re-uploaded `wc` uniform each frame). Allocated ONCE (zero-initialised so every
+/// cell starts empty), resolution-independent, never realloc'd on resize, never globally cleared on an edit.
+/// The buffers are retained here so they outlive the bind group for the program's lifetime.
+struct WorldCacheBuffers {
+    checksums: wgpu::Buffer,
+    life: wgpu::Buffer,
+    radiance: wgpu::Buffer,
+    geometry: wgpu::Buffer,
+    luminance_deltas: wgpu::Buffer,
+    new_radiance: wgpu::Buffer,
+    a: wgpu::Buffer,
+    b: wgpu::Buffer,
+    active_cell_indices: wgpu::Buffer,
+    active_cells_count: wgpu::Buffer,
+    /// INDIRECT|STORAGE — the update + blend passes dispatch indirect over this.
+    active_cells_dispatch: wgpu::Buffer,
+}
+
+impl WorldCacheBuffers {
+    /// Allocate the persistent cache buffers, ZERO-INITIALISED (`mapped_at_creation` zero-fill via wgpu's
+    /// default-zeroed mapping is not guaranteed, so we create them un-mapped — wgpu zeroes new buffers — and
+    /// rely on that; `checksums == 0` ⇒ every cell empty, `life == 0` ⇒ inactive). `size` = `WORLD_CACHE_SIZE`.
+    fn new(device: &wgpu::Device, size: u32) -> Self {
+        let n = size as u64;
+        let mk = |label: &str, bytes: u64, indirect: bool| {
+            let mut usage = wgpu::BufferUsages::STORAGE;
+            if indirect {
+                usage |= wgpu::BufferUsages::INDIRECT;
+            }
+            device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(label),
+                size: bytes,
+                usage,
+                // wgpu guarantees a freshly-created buffer is zero-initialised on first use, so every cell
+                // starts empty (checksum 0, life 0) with no explicit clear.
+                mapped_at_creation: false,
+            })
+        };
+        Self {
+            checksums: mk("voxel_rt_wc_checksums", n * 4, false),
+            life: mk("voxel_rt_wc_life", n * 4, false),
+            radiance: mk("voxel_rt_wc_radiance", n * 16, false),
+            geometry: mk("voxel_rt_wc_geometry", n * 32, false),
+            luminance_deltas: mk("voxel_rt_wc_luminance_deltas", n * 4, false),
+            new_radiance: mk("voxel_rt_wc_new_radiance", n * 16, false),
+            a: mk("voxel_rt_wc_a", n * 4, false),
+            b: mk("voxel_rt_wc_b", 1024 * 4, false),
+            active_cell_indices: mk("voxel_rt_wc_active_cell_indices", n * 4, false),
+            active_cells_count: mk("voxel_rt_wc_active_cells_count", 4, false),
+            active_cells_dispatch: mk("voxel_rt_wc_active_cells_dispatch", 12, true),
+        }
+    }
+
+    /// Build the `group(3)` cache bind group: binding 0 = the per-frame `wc` uniform, bindings 1..=10 = the
+    /// 10 persistent storage buffers (the indirect-dispatch buffer is in its own group 2 — see `dispatch_bg`).
+    fn bind_group(
+        &self,
+        device: &wgpu::Device,
+        layout: &wgpu::BindGroupLayout,
+        wc_uniform: &wgpu::Buffer,
+    ) -> wgpu::BindGroup {
+        device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("voxel_rt_world_cache_bg"),
+            layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: wc_uniform.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: self.checksums.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: self.life.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: self.radiance.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 4, resource: self.geometry.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 5, resource: self.luminance_deltas.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 6, resource: self.new_radiance.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 7, resource: self.a.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 8, resource: self.b.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 9, resource: self.active_cell_indices.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 10, resource: self.active_cells_count.as_entire_binding() },
+            ],
+        })
+    }
+
+    /// Build the `group(2)` indirect-dispatch bind group ({0: the dispatch-args buffer}), used ONLY by the
+    /// decay/compaction passes — unbound before the update/blend indirect dispatches consume it.
+    fn dispatch_bg(&self, device: &wgpu::Device, layout: &wgpu::BindGroupLayout) -> wgpu::BindGroup {
+        device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("voxel_rt_world_cache_dispatch_bg"),
+            layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: self.active_cells_dispatch.as_entire_binding(),
+            }],
+        })
+    }
 }
 
 /// Camera uniform mirroring the WGSL `CameraUniform` (group 1, binding 0): `world_from_clip` (64) +
@@ -883,6 +1028,56 @@ pub struct VoxelRtSky {
     pub data: SkyUniformData,
 }
 
+/// **SSOT for the world-space radiance-cache knobs** (Phase 2.1; the WGSL `WorldCacheUniform`, group 3
+/// binding 0). All runtime UNIFORMS (knobs-as-uniforms mandate) — editor sliders land in 2.4; nothing here is
+/// a WGSL const. Mirrors Solari's `WORLD_CACHE_*` tunables. 32 bytes (std140/std430-safe: 7 scalars + 1 pad =
+/// two 16-byte rows). `frame_index` + `reset` are stamped by the render pass, not user knobs.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct WorldCacheUniformData {
+    /// Size of a cache cell at the lowest LOD, in metres (Solari 0.15).
+    pub cell_base_size: f32,
+    /// How fast the cell LOD grows with camera distance (Solari 15.0).
+    pub lod_scale: f32,
+    /// Max length of an update-pass GI bounce ray, in metres (Solari 50.0).
+    pub gi_ray_distance: f32,
+    /// Frames a cell survives un-queried before the decay pass clears it (Solari 10).
+    pub cell_lifetime: u32,
+    /// Temporal-blend sample-count cap — higher is smoother but laggier (Solari 32.0).
+    pub max_temporal_samples: f32,
+    /// Per-frame counter (decorrelates the update-pass RNG). Stamped by the render pass.
+    pub frame_index: u32,
+    /// 1 = first-allocation clear (blend overwrites instead of accumulating). Stamped by the render pass.
+    pub reset: u32,
+    /// Fills the last std140 slot, so the struct is exactly 32 bytes.
+    pub _pad: u32,
+}
+
+impl Default for WorldCacheUniformData {
+    /// Solari's defaults (`world_cache_query.wgsl`). `frame_index`/`reset` are runtime-stamped, default 0.
+    fn default() -> Self {
+        Self {
+            cell_base_size: 0.15,
+            lod_scale: 15.0,
+            gi_ray_distance: 50.0,
+            cell_lifetime: 10,
+            max_temporal_samples: 32.0,
+            frame_index: 0,
+            reset: 0,
+            _pad: 0,
+        }
+    }
+}
+
+/// **SSOT for the editor-tunable world-cache knobs** (knobs-as-uniforms). Drives [`WorldCacheUniformData`]
+/// each frame; the Render/GI editor sliders (Stage 2.4) write it. Extracted to the render world. In 2.1 the
+/// cache RUNS off these knobs but is not yet read by the live image. `Default` = [`WorldCacheUniformData`]'s
+/// Solari-tuned defaults.
+#[derive(Resource, Clone, Copy, Debug, Default, ExtractResource)]
+pub struct WorldCacheSettings {
+    pub data: WorldCacheUniformData,
+}
+
 /// [`RenderStartup`]: build the raymarch compute pipeline + bind-group layouts on the wgpu device (which
 /// already has `EXPERIMENTAL_RAY_QUERY`, enabled in `main.rs`). The composite render pipeline is deferred
 /// to the pass (format-keyed).
@@ -970,8 +1165,7 @@ fn init_voxel_rt(mut commands: Commands, render_device: Res<RenderDevice>) {
         ],
     });
 
-    let raymarch_src =
-        std::fs::read_to_string("assets/shaders/voxel_raytrace.wgsl").expect("read voxel_raytrace.wgsl");
+    let raymarch_src = voxel_raytrace_shader_src(WORLD_CACHE_SIZE);
     let raymarch_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some("voxel_raytrace"),
         source: wgpu::ShaderSource::Wgsl(raymarch_src.into()),
@@ -1017,6 +1211,95 @@ fn init_voxel_rt(mut commands: Commands, render_device: Res<RenderDevice>) {
         compilation_options: Default::default(),
         cache: None,
     });
+
+    // --- Phase 2.1 world-cache: the dedicated group(3) cache layout + the 6 compute pipelines ---
+    // group(3): binding 0 = the `wc` uniform, bindings 1..=10 = the 10 persistent cache storage buffers
+    // (checksums, life, radiance, geometry, luminance_deltas, new_radiance, a, b, active_cell_indices,
+    // active_cells_count). The indirect-dispatch buffer lives in its OWN group(2) (see below).
+    let world_cache_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("voxel_rt_world_cache_layout"),
+        entries: &[
+            uniform_buf(0),
+            storage_rw(1),
+            storage_rw(2),
+            storage_rw(3),
+            storage_rw(4),
+            storage_rw(5),
+            storage_rw(6),
+            storage_rw(7),
+            storage_rw(8),
+            storage_rw(9),
+            storage_rw(10),
+        ],
+    });
+    // A MINIMAL group(1) layout for the cache passes holding ONLY the two uniforms the UPDATE pass reads from
+    // group 1 — `light` (binding 2) + `sky` (binding 11) — used by `direct_lighting` / `sky_radiance`. The
+    // cache passes never write `out_tex` / sample `history`, so we omit those (a smaller, dedicated layout
+    // avoids threading the full view bind group — camera/output/history/sampler — into the cache dispatch).
+    let world_cache_view_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("voxel_rt_world_cache_view_layout"),
+        entries: &[uniform_buf(2), uniform_buf(11)],
+    });
+    // group(2) — the indirect-dispatch-args buffer, in its OWN bind group. wgpu forbids a buffer being both
+    // bound read-write storage AND used as an indirect-dispatch source in one compute-pass usage scope, so the
+    // decay/compaction passes (which WRITE it) bind this group, while the update/blend passes (which CONSUME
+    // it as the indirect arg) use a layout that OMITS group 2 — and we unbind it at dispatch. Mirrors Solari's
+    // `bind_group_world_cache_active_cells_dispatch` + `set_bind_group(2, None)`.
+    let world_cache_dispatch_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("voxel_rt_world_cache_dispatch_layout"),
+        entries: &[storage_rw(0)],
+    });
+    // Pipeline layout A — decay + the 3 compaction passes: scene(0), view(1), dispatch(2), cache(3). (Only
+    // `compact_write_active` actually writes group 2, but sharing one layout across the 4 whole-table passes
+    // keeps the wiring uniform; naga prunes the unused dispatch global from the others.)
+    let world_cache_compact_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("voxel_rt_world_cache_compact_pl"),
+        bind_group_layouts: &[
+            Some(&scene_layout),
+            Some(&world_cache_view_layout),
+            Some(&world_cache_dispatch_layout),
+            Some(&world_cache_layout),
+        ],
+        immediate_size: 0,
+    });
+    // Pipeline layout B — update + blend: scene(0), view(1), <no group 2>, cache(3). Omitting group 2 lets the
+    // indirect dispatch consume the (now-unbound) dispatch buffer legally. The `trace` (group 0) + `light`/
+    // `sky` (group 1) are needed by the update pass; the cache (group 3) by both.
+    let world_cache_update_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("voxel_rt_world_cache_update_pl"),
+        bind_group_layouts: &[
+            Some(&scene_layout),
+            Some(&world_cache_view_layout),
+            None, // group 2 deliberately absent — the dispatch buffer is unbound when used as indirect args
+            Some(&world_cache_layout),
+        ],
+        immediate_size: 0,
+    });
+    let mk_wc = |label: &'static str, entry: &'static str, layout: &wgpu::PipelineLayout| {
+        device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some(label),
+            layout: Some(layout),
+            module: &raymarch_module,
+            entry_point: Some(entry),
+            compilation_options: Default::default(),
+            cache: None,
+        })
+    };
+    let wc_decay = mk_wc("voxel_rt_wc_decay", "world_cache_decay", &world_cache_compact_pl);
+    let wc_compact_single_block = mk_wc(
+        "voxel_rt_wc_compact_single_block",
+        "world_cache_compact_single_block",
+        &world_cache_compact_pl,
+    );
+    let wc_compact_blocks =
+        mk_wc("voxel_rt_wc_compact_blocks", "world_cache_compact_blocks", &world_cache_compact_pl);
+    let wc_compact_write_active = mk_wc(
+        "voxel_rt_wc_compact_write_active",
+        "world_cache_compact_write_active",
+        &world_cache_compact_pl,
+    );
+    let wc_update = mk_wc("voxel_rt_wc_update", "world_cache_update", &world_cache_update_pl);
+    let wc_blend = mk_wc("voxel_rt_wc_blend", "world_cache_blend", &world_cache_update_pl);
 
     let composite_src =
         std::fs::read_to_string("assets/shaders/voxel_rt_composite.wgsl").expect("read voxel_rt_composite.wgsl");
@@ -1064,6 +1347,15 @@ fn init_voxel_rt(mut commands: Commands, render_device: Res<RenderDevice>) {
         raymarch,
         restir_p1,
         restir_p2,
+        world_cache_layout,
+        world_cache_view_layout,
+        world_cache_dispatch_layout,
+        wc_decay,
+        wc_compact_single_block,
+        wc_compact_blocks,
+        wc_compact_write_active,
+        wc_update,
+        wc_blend,
         composite_module,
         composite_layout,
         composite_sampler,
@@ -1415,6 +1707,98 @@ fn prepare_voxel_rt(
     debug!("voxel-RT: built accel structures for patch gen {} — {n} bricks", patch_res.generation);
 }
 
+/// The objects the per-frame world-cache dispatch needs, built before the compute pass opens (so they can be
+/// `set_bind_group`'d into it): the three bind groups (scene group 0 is the caller's; here groups 1/2/3) and a
+/// handle to the indirect-dispatch buffer (cloned — wgpu `Buffer` is an `Arc`, so this is cheap and keeps the
+/// borrow off `resources` while the compute pass runs).
+struct WorldCachePrepared {
+    view_bg: wgpu::BindGroup,
+    dispatch_bg: wgpu::BindGroup,
+    cache_bg: wgpu::BindGroup,
+    dispatch_buf: wgpu::Buffer,
+}
+
+/// Allocate the persistent world-cache buffers on first use, upload the per-frame `wc` uniform (stamping
+/// `frame_index` + the one-shot `reset`), and build the bind groups for the six cache passes. Returns `None`
+/// only if there's nothing to do (never errors). `light_buf`/`sky_buf` are the caller's already-uploaded
+/// lighting/sky uniforms (the update pass reads `light`/`sky` via group 1). The cache is WORLD-space: the
+/// buffers are allocated ONCE and `reset` fires exactly once (first frame after allocation) — never on resize
+/// or edit ([[feedback-gi-adapt-not-reset]]).
+fn prepare_world_cache(
+    device: &wgpu::Device,
+    pipelines: &VoxelRtPipelines,
+    resources: &mut VoxelRtResources,
+    settings: &WorldCacheSettings,
+    frame_index: u32,
+    light_buf: &wgpu::Buffer,
+    sky_buf: &wgpu::Buffer,
+) -> WorldCachePrepared {
+    if resources.world_cache.is_none() {
+        resources.world_cache = Some(WorldCacheBuffers::new(device, WORLD_CACHE_SIZE));
+        resources.world_cache_initialized = false; // first dispatch this frame uses reset=1
+    }
+    // First cache frame after allocation: blend overwrites instead of accumulating (the buffers are
+    // zero-initialised, but reset=1 makes the very first blend exact). Cleared exactly ONCE.
+    let reset = !resources.world_cache_initialized;
+    resources.world_cache_initialized = true;
+
+    let mut wc = settings.data;
+    wc.frame_index = frame_index;
+    wc.reset = u32::from(reset);
+    let wc_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("voxel_rt_world_cache_uniform"),
+        contents: bytemuck::bytes_of(&wc),
+        usage: wgpu::BufferUsages::UNIFORM,
+    });
+
+    let cache = resources.world_cache.as_ref().expect("just allocated");
+    let view_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("voxel_rt_world_cache_view_bg"),
+        layout: &pipelines.world_cache_view_layout,
+        entries: &[
+            wgpu::BindGroupEntry { binding: 2, resource: light_buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 11, resource: sky_buf.as_entire_binding() },
+        ],
+    });
+    let dispatch_bg = cache.dispatch_bg(device, &pipelines.world_cache_dispatch_layout);
+    let cache_bg = cache.bind_group(device, &pipelines.world_cache_layout, &wc_buf);
+    let dispatch_buf = cache.active_cells_dispatch.clone();
+    WorldCachePrepared { view_bg, dispatch_bg, cache_bg, dispatch_buf }
+}
+
+/// Dispatch the six world-cache passes IN ORDER on an open compute pass: decay → compact_single_block →
+/// compact_blocks → compact_write_active → update (indirect) → blend (indirect). The caller has already set
+/// the scene bind group at index 0 and (for the live raymarch/restir) may rebind groups afterward. Consecutive
+/// dispatches in one compute pass get WebGPU's implicit storage barrier, so each pass sees the prior's writes.
+fn dispatch_world_cache_passes(
+    cpass: &mut wgpu::ComputePass,
+    pipelines: &VoxelRtPipelines,
+    prepared: &WorldCachePrepared,
+) {
+    cpass.set_bind_group(1, &prepared.view_bg, &[]);
+    cpass.set_bind_group(2, &prepared.dispatch_bg, &[]); // group 2 = the indirect-dispatch buffer (written here)
+    cpass.set_bind_group(3, &prepared.cache_bg, &[]);
+    // Whole-table passes: one thread per cell (workgroup_size 1024).
+    let table_groups = WORLD_CACHE_SIZE / 1024;
+    cpass.set_pipeline(&pipelines.wc_decay);
+    cpass.dispatch_workgroups(table_groups, 1, 1);
+    cpass.set_pipeline(&pipelines.wc_compact_single_block);
+    cpass.dispatch_workgroups(table_groups, 1, 1);
+    cpass.set_pipeline(&pipelines.wc_compact_blocks);
+    cpass.dispatch_workgroups(1, 1, 1);
+    cpass.set_pipeline(&pipelines.wc_compact_write_active);
+    cpass.dispatch_workgroups(table_groups, 1, 1);
+    // UNBIND group 2 before the indirect dispatches: wgpu forbids the dispatch buffer being bound read-write
+    // storage AND used as the indirect-args source in one usage scope. The update/blend pipeline layout omits
+    // group 2, so this clears it (Solari's `set_bind_group(2, None)` pattern).
+    cpass.set_bind_group(2, None, &[]);
+    // Active-cell passes: indirect over the compacted count (ceil(active / 64) workgroups).
+    cpass.set_pipeline(&pipelines.wc_update);
+    cpass.dispatch_workgroups_indirect(&prepared.dispatch_buf, 0);
+    cpass.set_pipeline(&pipelines.wc_blend);
+    cpass.dispatch_workgroups_indirect(&prepared.dispatch_buf, 0);
+}
+
 /// [`Core3d`]/[`Core3dSystems::MainPass`]: when the toggle is on and the scene is built, dispatch the
 /// raymarch compute pass into a per-view output texture, then composite it over the [`ViewTarget`]. When
 /// off, returns immediately so the Stage-1 cubes render unchanged.
@@ -1430,6 +1814,7 @@ fn voxel_rt_pass(
     lighting: Res<VoxelRtLighting>,
     sky: Res<VoxelRtSky>,
     restir_settings: Res<RestirSettings>,
+    world_cache_settings: Res<WorldCacheSettings>,
     pipelines: Option<Res<VoxelRtPipelines>>,
     mut resources: ResMut<VoxelRtResources>,
     render_device: Res<RenderDevice>,
@@ -1702,6 +2087,20 @@ fn voxel_rt_pass(
         ],
     });
 
+    // Phase 2.1 world-space radiance cache: allocate the persistent buffers (once) + build the cache bind
+    // groups. Dispatched BEFORE the live raymarch/restir, but it does NOT feed the live image this stage — the
+    // cache just runs + accumulates (zero visual change; 2.2 wires it into the reservoir). Mutably borrows
+    // `resources` here, before the immutable scene/output borrows below.
+    let wc_prepared = prepare_world_cache(
+        device,
+        &pipelines,
+        &mut resources,
+        &world_cache_settings,
+        frame_index,
+        &light_buf,
+        &sky_buf,
+    );
+
     let scene_bg = resources.scene_bind_group.as_ref().expect("checked above");
     // `gi_mode` A/B: ReSTIR GI (group-2 reservoirs, two passes) vs the legacy `gather_gi` raymarch (no group 2).
     let use_restir = restir_settings.restir;
@@ -1720,6 +2119,9 @@ fn voxel_rt_pass(
             timestamp_writes: None,
         });
         cpass.set_bind_group(0, scene_bg, &[]);
+        // World-cache passes FIRST (decay → compact ×3 → update → blend), sharing scene group 0. They set
+        // groups 1/2/3 themselves; the live raymarch/restir below rebinds groups 1/2 to the view + reservoirs.
+        dispatch_world_cache_passes(&mut cpass, &pipelines, &wc_prepared);
         cpass.set_bind_group(1, &view_bg, &[]);
         let groups = (viewport.x.div_ceil(8), viewport.y.div_ceil(8), 1);
         if use_restir {
@@ -1864,6 +2266,7 @@ fn voxel_rt_dlss_pass(
     lighting: Res<VoxelRtLighting>,
     sky: Res<VoxelRtSky>,
     restir_settings: Res<RestirSettings>,
+    world_cache_settings: Res<WorldCacheSettings>,
     pipelines: Option<Res<VoxelRtPipelines>>,
     mut resources: ResMut<VoxelRtResources>,
     render_device: Res<RenderDevice>,
@@ -2123,6 +2526,20 @@ fn voxel_rt_dlss_pass(
         contents: bytemuck::bytes_of(&restir_params),
         usage: wgpu::BufferUsages::UNIFORM,
     });
+
+    // Phase 2.1 world cache: allocate (once) + build the cache bind groups, BEFORE the immutable
+    // reservoir/scene borrows below. Same PERSISTENT world-space cache as the non-DLSS path (one shared
+    // `VoxelRtResources.world_cache`), so it keeps accumulating regardless of which present path runs.
+    let wc_prepared = prepare_world_cache(
+        device,
+        &pipelines,
+        &mut resources,
+        &world_cache_settings,
+        frame_index,
+        &light_buf,
+        &sky_buf,
+    );
+
     let (res_a, res_b, _) = resources.dlss_reservoirs.as_ref().expect("allocated above");
     let (surf_a, surf_b, _) = resources.dlss_surfaces.as_ref().expect("allocated above");
     let even = frame_index & 1 == 0;
@@ -2156,6 +2573,10 @@ fn voxel_rt_dlss_pass(
             timestamp_writes: None,
         });
         cpass.set_bind_group(0, scene_bg, &[]);
+        // World-cache passes FIRST (shared scene group 0); they set + leave groups 1/2/3, which the DLSS
+        // raymarch/restir below rebinds (group 1 = dlss view_bg, group 2 = reservoirs). The cache does NOT
+        // feed the live image this stage.
+        dispatch_world_cache_passes(&mut cpass, &pipelines, &wc_prepared);
         cpass.set_bind_group(1, &view_bg, &[]);
         let groups = (render_res.x.div_ceil(8), render_res.y.div_ceil(8), 1);
         if use_restir {

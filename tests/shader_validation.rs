@@ -99,12 +99,15 @@ fn sdf_brick_bake_wgsl_validates() {
 
 #[test]
 fn voxel_raytrace_wgsl_validates() {
-    // The HW-RT voxel raymarch (+ the DLSS-RR `raymarch_dlss` entry point added in Stage 4c). Fully
-    // self-contained (no `#import`), but uses `enable wgpu_ray_query` + the `ray_query` types, so it needs
-    // the full-capability composer (which the device + runtime also use). Validating here catches a WGSL
-    // typo in the dlss guide-writing entry without a GPU/launch.
+    // The HW-RT voxel raymarch (+ the DLSS-RR `raymarch_dlss` entry point added in Stage 4c + the Phase-2.1
+    // world-cache passes). Fully self-contained (no `#import`), but uses `enable wgpu_ray_query` + the
+    // `ray_query` types, so it needs the full-capability composer (which the device + runtime also use).
+    // The world-cache section is parameterised by the `#{WORLD_CACHE_SIZE}` hash-table-size def (a small
+    // power-of-two here for fast validation; the live path uses 2^20). Validating here catches a WGSL typo
+    // without a GPU/launch.
     let path = Path::new("assets/shaders/voxel_raytrace.wgsl");
-    validate_entry(path).unwrap_or_else(|e| panic!("{e}"));
+    let defs = HashMap::from([("WORLD_CACHE_SIZE".to_string(), ShaderDefValue::UInt(1024))]);
+    validate_entry_with_defs(path, defs).unwrap_or_else(|e| panic!("{e}"));
 }
 
 #[test]

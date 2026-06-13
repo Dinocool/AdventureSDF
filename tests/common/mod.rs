@@ -20,6 +20,17 @@ pub fn sky_uniform_buffer(device: &wgpu::Device) -> wgpu::Buffer {
     })
 }
 
+/// **SSOT shader loader for the GPU test rigs.** `voxel_raytrace.wgsl` now contains a `#{WORLD_CACHE_SIZE}`
+/// token (the world-cache hash-table size, Phase 2.1) that MUST be substituted before naga parses the source.
+/// Every test that loads the shader goes through this (forwarding to the production
+/// [`adventure::voxel::raytrace::voxel_raytrace_shader_src`] SSOT) so the token can never reach naga
+/// un-substituted. Tests that don't exercise the cache still get a valid (full-size-table) shader.
+pub fn voxel_raytrace_shader_src() -> String {
+    adventure::voxel::raytrace::voxel_raytrace_shader_src(
+        adventure::voxel::raytrace::WORLD_CACHE_SIZE,
+    )
+}
+
 /// A headless wgpu device requesting `required` features. Returns `None` — the caller then skips —
 /// if no adapter is available or the adapter lacks `required` (so a CI box without 16-bit-norm
 /// storage skips cleanly instead of failing deep in a texture create). Logs the adapter so CI shows
@@ -91,6 +102,58 @@ pub fn headless_ray_query_device_with_storage_textures(
     limits.max_storage_textures_per_shader_stage = min_storage;
     block_on(adapter.request_device(&wgpu::DeviceDescriptor {
         label: Some("voxel_rt_test_device_storage"),
+        required_features: wgpu::Features::EXPERIMENTAL_RAY_QUERY,
+        required_limits: limits,
+        memory_hints: Default::default(),
+        trace: wgpu::Trace::Off,
+        experimental_features: unsafe { wgpu::ExperimentalFeatures::enabled() },
+    }))
+    .ok()
+}
+
+/// Like [`headless_ray_query_device`] but raises `max_storage_buffers_per_shader_stage` to `min_storage`
+/// (wgpu's default is 8). The Phase-2.1 world-cache compute passes bind 3 scene storage buffers (group 0) +
+/// 11 cache storage buffers (group 3) in one pipeline layout = 14 in a single stage, exceeding the default —
+/// mirrors the renderer's `wgpu_settings()` bump. Returns `None` (caller skips) if no ray-query adapter is
+/// present or it can't reach `min_storage`.
+pub fn headless_ray_query_device_with_storage_buffers(
+    min_storage: u32,
+) -> Option<(wgpu::Device, wgpu::Queue)> {
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+        backends: wgpu::Backends::VULKAN,
+        flags: wgpu::InstanceFlags::default(),
+        memory_budget_thresholds: Default::default(),
+        backend_options: Default::default(),
+        display: None,
+    });
+    let adapter = block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+        power_preference: wgpu::PowerPreference::HighPerformance,
+        force_fallback_adapter: false,
+        compatible_surface: None,
+        ..Default::default()
+    }))
+    .ok()?;
+    if !adapter.features().contains(wgpu::Features::EXPERIMENTAL_RAY_QUERY) {
+        eprintln!("adapter lacks EXPERIMENTAL_RAY_QUERY — skipping");
+        return None;
+    }
+    if adapter.limits().max_storage_buffers_per_shader_stage < min_storage {
+        eprintln!(
+            "adapter max_storage_buffers_per_shader_stage {} < {min_storage} — skipping",
+            adapter.limits().max_storage_buffers_per_shader_stage
+        );
+        return None;
+    }
+    let mut limits =
+        wgpu::Limits::default().using_minimum_supported_acceleration_structure_values();
+    limits.max_storage_buffers_per_shader_stage = min_storage;
+    // The world-cache decay/compaction passes use `@workgroup_size(1024)` (the prefix-sum scan width). wgpu's
+    // default caps invocations-per-workgroup + workgroup_size_x at 256, so raise both to 1024 (desktop RTX
+    // supports it; mirrors the renderer's `wgpu_settings()` bump).
+    limits.max_compute_invocations_per_workgroup = limits.max_compute_invocations_per_workgroup.max(1024);
+    limits.max_compute_workgroup_size_x = limits.max_compute_workgroup_size_x.max(1024);
+    block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+        label: Some("voxel_rt_test_device_storage_buffers"),
         required_features: wgpu::Features::EXPERIMENTAL_RAY_QUERY,
         required_limits: limits,
         memory_hints: Default::default(),

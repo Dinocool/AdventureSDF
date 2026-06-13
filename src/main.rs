@@ -83,7 +83,7 @@ fn load_renderdoc() {
 /// GPU-Trace can correlate sampled cost to WGSL line NUMBERS. (Bevy/wgpu do NOT emit `OpSource`,
 /// so there's no inline source view — map the line numbers to the `.wgsl` by hand. See Cargo.toml.)
 fn wgpu_settings() -> WgpuSettings {
-    let settings = WgpuSettings {
+    let mut settings = WgpuSettings {
         features: WgpuFeatures::TEXTURE_COMPRESSION_BC
             | WgpuFeatures::TEXTURE_FORMAT_16BIT_NORM
             // Bindless paged SDF atlas: the dist/mat atlases are a `binding_array` of page textures
@@ -97,6 +97,19 @@ fn wgpu_settings() -> WgpuSettings {
             | WgpuFeatures::EXPERIMENTAL_RAY_QUERY,
         ..default()
     };
+    // Voxel-RT Phase 2.1: the world-space radiance-cache compute passes bind the scene storage buffers
+    // (group 0: metas/voxels/palette = 3) PLUS the dedicated cache bind group (group 3: 11 storage buffers —
+    // checksums/life/radiance/geometry/luminance/new_radiance/a/b/active_indices/count/dispatch) in one
+    // pipeline layout = 14 storage buffers in a single shader stage. wgpu's default
+    // `max_storage_buffers_per_shader_stage` is only 8, so raise it (desktop RTX/Vulkan GPUs support far more).
+    settings.limits.max_storage_buffers_per_shader_stage =
+        settings.limits.max_storage_buffers_per_shader_stage.max(16);
+    // The cache decay/compaction passes use `@workgroup_size(1024)` (the prefix-sum scan width). wgpu's
+    // default caps invocations-per-workgroup + workgroup_size_x at 256, so raise both to 1024.
+    settings.limits.max_compute_invocations_per_workgroup =
+        settings.limits.max_compute_invocations_per_workgroup.max(1024);
+    settings.limits.max_compute_workgroup_size_x =
+        settings.limits.max_compute_workgroup_size_x.max(1024);
     // Editor builds enable GPU timestamp + pipeline-statistics queries so `RenderDiagnosticsPlugin`
     // can measure per-pass GPU time (the Performance panel's "SDF GPU passes" table + the chrome
     // trace). Desktop Vulkan/DX12 support these universally; device init fails loudly otherwise —

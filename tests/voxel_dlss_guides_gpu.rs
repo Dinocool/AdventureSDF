@@ -250,7 +250,7 @@ fn dlss_guides_populated_where_voxels_hit() {
     });
 
     // --- Pipeline (raymarch_dlss entry, auto bind-group layout) ---
-    let src = std::fs::read_to_string("assets/shaders/voxel_raytrace.wgsl").expect("read shader");
+    let src = common::voxel_raytrace_shader_src();
     let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some("voxel_raytrace"),
         source: wgpu::ShaderSource::Wgsl(src.into()),

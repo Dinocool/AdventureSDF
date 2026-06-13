@@ -1602,3 +1602,403 @@ fn restir_dlss_p2(@builtin(global_invocation_id) gid: vec3<u32>) {
         textureStore(out_dlss_motion, px, vec4<f32>(0.0, 0.0, 0.0, 0.0));
     }
 }
+
+// ====================================================================================================
+// WORLD-SPACE RADIANCE CACHE (Phase 2.1) — ported from `bevy_solari::world_cache_*` and adapted to our
+// tracer (no light list). The cache stores PRE-ACCUMULATED outgoing radiance per (quantized world position +
+// quantized normal) in a GPU hash grid, refreshed by a per-frame six-pass compute loop. In 2.1 the cache RUNS
+// and converges but is NOT read by the live image (the reservoir/shading path is untouched) — so there is
+// ZERO visual change. Stage 2.2 wires `query_world_cache` into the initial reservoir.
+//
+// The full Solari loop is structurally required for a race-free, full-coverage, query-populated cache:
+//   decay -> compact_single_block -> compact_blocks -> compact_write_active -> update -> blend.
+// The active-cell compaction means each ACTIVE cell is owned by exactly ONE update thread, so the
+// `new_radiance` write is race-free WITHOUT float atomics. Cells are populated by LAZY-INSERT on query.
+//
+// ADAPTATION (no light list): Solari's update does sample_di (NEE over a light list) + sample_gi (a GI bounce
+// that queries the cache). WE HAVE NO LIGHT LIST, so we SKIP sample_di/presample_light_tiles entirely. The
+// update pass, per active cell, traces ONE cosine-hemisphere bounce from the cell's stored (pos,normal); the
+// sample radiance = `direct_lighting(hit) + emissive(hit)` on a hit, or `sky_radiance(dir)·gi_sky_intensity`
+// (the 1A sky SSOT) on a miss. This is SINGLE-BOUNCE in 2.1 — no cache-query-at-hit term yet (that is 2.3).
+//
+// The cache is WORLD-SPACE / resolution-independent: its buffers are PERSISTENT (allocated once,
+// zero-initialised so all cells start empty), never realloc'd on resize, and NEVER globally cleared on a
+// terrain edit ([[feedback-gi-adapt-not-reset]]) — stale cells decay (life→0) and re-fill locally.
+
+// Number of entries in the hash table (MUST be a power of two, >= 2^10). Substituted by the Rust pass /
+// headless test so the table can be shrunk for a fast deterministic test (the live path uses 2^20).
+const WORLD_CACHE_SIZE: u32 = #{WORLD_CACHE_SIZE}u;
+// Marker value for an empty cell (a checksum of 0). A real checksum is forced >= 1 (see `wc_checksum`).
+const WORLD_CACHE_EMPTY_CELL: u32 = 0u;
+// Max linear-probe steps after a hash collision (Solari).
+const WORLD_CACHE_MAX_SEARCH_STEPS: u32 = 3u;
+
+// Geometry stored per cell: the world position + face normal of the surface that first claimed the cell.
+// 16-byte-aligned rows (vec3 + pad) so the std430 layout matches the Rust `[f32; 8]` row stride (Solari's
+// `WorldCacheGeometryData`).
+struct WorldCacheGeometryData {
+    world_position: vec3<f32>,
+    padding_a: u32,
+    world_normal: vec3<f32>,
+    padding_b: u32,
+};
+
+// **SSOT for the world-cache KNOBS** (group 3 binding 0) — every tunable is a runtime UNIFORM
+// (knobs-as-uniforms mandate), never a WGSL const. Mirrors Solari's `WORLD_CACHE_*` constants. 32 bytes.
+struct WorldCacheUniform {
+    cell_base_size: f32,    // size of a cache cell at the lowest LOD, in metres (Solari 0.15)
+    lod_scale: f32,         // how fast the cell LOD grows with camera distance (Solari 15.0)
+    gi_ray_distance: f32,   // max length of an update-pass GI bounce ray, in metres (Solari 50.0)
+    cell_lifetime: u32,     // frames a cell survives un-queried before decay clears it (Solari 10)
+    max_temporal_samples: f32, // temporal-blend sample-count cap (Solari 32.0)
+    frame_index: u32,       // per-frame counter (decorrelates the update RNG)
+    reset: u32,             // 1 = first-allocation clear: blend overwrites instead of accumulating
+    _pad: u32,
+};
+
+@group(3) @binding(0) var<uniform> wc: WorldCacheUniform;
+// 0 = empty; a non-zero IQ checksum marks an occupied cell. ATOMIC: lazy-insert claims a slot via
+// `atomicCompareExchangeWeak`, so concurrent queries to colliding keys are race-free.
+@group(3) @binding(1) var<storage, read_write> world_cache_checksums: array<atomic<u32>, #{WORLD_CACHE_SIZE}u>;
+// Frames-to-live. ATOMIC so concurrent queries (and 2.3's cache-querying update) can `atomicStore`/`atomicMax`
+// it without a race; the decay pass owns each cell singly so it reads/writes plainly via atomic load/store.
+@group(3) @binding(2) var<storage, read_write> world_cache_life: array<atomic<u32>, #{WORLD_CACHE_SIZE}u>;
+// Accumulated outgoing radiance (rgb) + temporal sample_count (.a).
+@group(3) @binding(3) var<storage, read_write> world_cache_radiance: array<vec4<f32>, #{WORLD_CACHE_SIZE}u>;
+@group(3) @binding(4) var<storage, read_write> world_cache_geometry: array<WorldCacheGeometryData, #{WORLD_CACHE_SIZE}u>;
+// |luminance(new) - luminance(old)| EWMA — drives the adaptive blend responsiveness.
+@group(3) @binding(5) var<storage, read_write> world_cache_luminance_deltas: array<f32, #{WORLD_CACHE_SIZE}u>;
+// The update pass's per-active-cell fresh radiance, blended into `world_cache_radiance` by the blend pass.
+@group(3) @binding(6) var<storage, read_write> world_cache_active_cells_new_radiance: array<vec3<f32>, #{WORLD_CACHE_SIZE}u>;
+// Prefix-sum scratch: `a` is the per-cell exclusive prefix-sum within its 1024-block; `b` is the per-block
+// running offset. Together they give each active cell its compacted index.
+@group(3) @binding(7) var<storage, read_write> world_cache_a: array<u32, #{WORLD_CACHE_SIZE}u>;
+@group(3) @binding(8) var<storage, read_write> world_cache_b: array<u32, 1024u>;
+// The compacted list of active (life != 0) cell indices, one per update/blend thread.
+@group(3) @binding(9) var<storage, read_write> world_cache_active_cell_indices: array<u32, #{WORLD_CACHE_SIZE}u>;
+// Scalar count of active cells (the update/blend bound).
+@group(3) @binding(10) var<storage, read_write> world_cache_active_cells_count: u32;
+// Indirect dispatch args (ceil(active / 64), 1, 1) for the update + blend passes. In a SEPARATE bind group
+// (group 2), written ONLY by `compact_write_active`, because wgpu forbids a buffer being both bound
+// read-write storage AND used as an indirect-dispatch source within one compute-pass usage scope — so it must
+// be UNBOUND (the update/blend pipeline layout omits group 2) when consumed as the indirect arg.
+@group(2) @binding(0) var<storage, read_write> world_cache_active_cells_dispatch: vec3<u32>;
+
+// --- hash + quantization (ported verbatim from Solari world_cache_query.wgsl) -----------------------
+
+fn wc_pcg_hash(input: u32) -> u32 {
+    let state = input * 747796405u + 2891336453u;
+    let word = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
+    return (word >> 22u) ^ word;
+}
+
+fn wc_iqint_hash(input: u32) -> u32 {
+    let n = (input << 13u) ^ input;
+    return n * (n * n * 15731u + 789221u) + 1376312589u;
+}
+
+fn wc_wrap_key(key: u32) -> u32 {
+    return key & (WORLD_CACHE_SIZE - 1u);
+}
+
+// Distance-adaptive cell size: `cell_base_size · 2^lod`, lod growing with camera distance. The fractional LOD
+// is stochastically rounded (cubed-fract probability) so the transition between LODs dithers instead of
+// banding (Solari `get_cell_size`).
+fn wc_get_cell_size(world_position: vec3<f32>, view_position: vec3<f32>, rng: ptr<function, u32>) -> f32 {
+    let camera_distance = distance(view_position, world_position) / wc.lod_scale;
+    let lod_f = log2(1.0 + camera_distance);
+    let lod_fract = fract(lod_f);
+    let lod = floor(lod_f) + select(0.0, 1.0, rand_next(rng) < lod_fract * lod_fract * lod_fract);
+    return wc.cell_base_size * exp2(lod);
+}
+
+fn wc_quantize_position(world_position: vec3<f32>, quantization_factor: f32) -> vec3<f32> {
+    return floor(world_position / quantization_factor + 0.0001);
+}
+
+fn wc_quantize_normal(world_normal: vec3<f32>) -> vec3<f32> {
+    return floor(world_normal * 2.0 + 0.0001);
+}
+
+fn wc_compute_key(world_position: vec3<u32>, world_normal: vec3<u32>) -> u32 {
+    var key = wc_pcg_hash(world_position.x);
+    key = wc_pcg_hash(key + world_position.y);
+    key = wc_pcg_hash(key + world_position.z);
+    key = wc_pcg_hash(key + world_normal.x);
+    key = wc_pcg_hash(key + world_normal.y);
+    key = wc_pcg_hash(key + world_normal.z);
+    return wc_wrap_key(key);
+}
+
+fn wc_compute_checksum(world_position: vec3<u32>, world_normal: vec3<u32>) -> u32 {
+    var key = wc_iqint_hash(world_position.x);
+    key = wc_iqint_hash(key + world_position.y);
+    key = wc_iqint_hash(key + world_position.z);
+    key = wc_iqint_hash(key + world_normal.x);
+    key = wc_iqint_hash(key + world_normal.y);
+    key = wc_iqint_hash(key + world_normal.z);
+    return max(key, 1u); // 0 is reserved for WORLD_CACHE_EMPTY_CELL
+}
+
+// Query the cache for the outgoing radiance at (`world_position`, `world_normal`), as seen from `view_position`
+// (drives the cell LOD). Distance-adaptive cell size, tangent-plane jitter (blurs the grid), PCG key + IQ
+// checksum, <=3-step linear probe. On a MATCH: mark the cell alive (life = `cell_lifetime`) and return its
+// radiance.rgb. On an EMPTY slot: LAZY-INSERT — claim it via `atomicCompareExchangeWeak` on the checksum,
+// store the query's geometry, mark it alive, and return 0 (it fills over the next frames). Ported from Solari
+// `query_world_cache`. `ray_t` is reserved for the first-bounce light-leak guard (2.2+); unused in 2.1.
+fn query_world_cache(world_position_in: vec3<f32>, world_normal: vec3<f32>, view_position: vec3<f32>, ray_t: f32, cell_lifetime: u32, rng: ptr<function, u32>) -> vec3<f32> {
+    var world_position = world_position_in;
+    var cell_size = wc_get_cell_size(world_position, view_position, rng);
+
+    // Jitter the query point in the tangent plane (blurs the cache so it is not so grid-like).
+    let TBN = onb(world_normal);
+    let offset = (vec2<f32>(rand_next(rng), rand_next(rng)) * 2.0 - 1.0) * cell_size * 0.5;
+    world_position += offset.x * TBN[0] + offset.y * TBN[1];
+    cell_size = wc_get_cell_size(world_position, view_position, rng);
+
+    let world_position_quantized = bitcast<vec3<u32>>(wc_quantize_position(world_position, cell_size));
+    let world_normal_quantized = bitcast<vec3<u32>>(wc_quantize_normal(world_normal));
+    var key = wc_compute_key(world_position_quantized, world_normal_quantized);
+    let checksum = wc_compute_checksum(world_position_quantized, world_normal_quantized);
+
+    var result = vec3<f32>(0.0);
+    var done = false;
+    for (var i = 0u; i < WORLD_CACHE_MAX_SEARCH_STEPS; i = i + 1u) {
+        if (done) { continue; }
+        let existing_checksum = atomicCompareExchangeWeak(&world_cache_checksums[key], WORLD_CACHE_EMPTY_CELL, checksum).old_value;
+
+        if (existing_checksum == checksum || existing_checksum == WORLD_CACHE_EMPTY_CELL) {
+            // Cell exists or was just claimed — (re)set its lifetime so it stays active.
+            atomicMax(&world_cache_life[key], cell_lifetime);
+        }
+
+        if (existing_checksum == checksum) {
+            result = world_cache_radiance[key].rgb; // existing entry — return its accumulated radiance
+            done = true;
+        } else if (existing_checksum == WORLD_CACHE_EMPTY_CELL) {
+            // We claimed an empty cell — store the query's geometry; radiance fills over the next frames.
+            world_cache_geometry[key].world_position = world_position;
+            world_cache_geometry[key].world_normal = world_normal;
+            done = true;
+        } else {
+            key = key + 1u; // collision — linear probe to the next slot (wrap handled by the table size)
+            if (key >= WORLD_CACHE_SIZE) { key = 0u; }
+        }
+    }
+    return result;
+}
+
+// --- the six compute passes (one compute pass, dispatched in order: consecutive dispatches get WebGPU's
+//     implicit storage barrier, so each pass sees the previous pass's writes) ---------------------------
+
+var<workgroup> wc_w1: array<u32, 1024u>;
+var<workgroup> wc_w2: array<u32, 1024u>;
+
+// PASS 1 — DECAY. Every cell: life--; if it hit 0, mark the cell empty + clear its radiance/luminance so a
+// future query can re-claim the slot. The world-space ADAPT-NOT-RESET mechanism: stale cells age out locally;
+// there is no global clear (the only clear is the first-allocation `reset`, handled by the host zero-init).
+@compute @workgroup_size(1024, 1, 1)
+fn world_cache_decay(@builtin(global_invocation_id) global_id: vec3<u32>) {
+    let i = global_id.x;
+    var life = atomicLoad(&world_cache_life[i]);
+    if (life > 0u) {
+        life = life - 1u;
+        atomicStore(&world_cache_life[i], life);
+        if (life == 0u) {
+            atomicStore(&world_cache_checksums[i], WORLD_CACHE_EMPTY_CELL);
+            world_cache_radiance[i] = vec4<f32>(0.0);
+            world_cache_luminance_deltas[i] = 0.0;
+        }
+    }
+}
+
+// PASS 2 — COMPACT (single block): a 1024-wide exclusive prefix-sum of `life != 0` within each 1024-block,
+// written to `world_cache_a`. (Hillis–Steele scan, ported verbatim from Solari compact_world_cache_single_block.)
+@compute @workgroup_size(1024, 1, 1)
+fn world_cache_compact_single_block(
+    @builtin(global_invocation_id) cell_id: vec3<u32>,
+    @builtin(local_invocation_index) t: u32,
+) {
+    if (t == 0u) { wc_w1[0u] = 0u; } else { wc_w1[t] = u32(atomicLoad(&world_cache_life[cell_id.x - 1u]) != 0u); } workgroupBarrier();
+    if (t < 1u) { wc_w2[t] = wc_w1[t]; } else { wc_w2[t] = wc_w1[t] + wc_w1[t - 1u]; } workgroupBarrier();
+    if (t < 2u) { wc_w1[t] = wc_w2[t]; } else { wc_w1[t] = wc_w2[t] + wc_w2[t - 2u]; } workgroupBarrier();
+    if (t < 4u) { wc_w2[t] = wc_w1[t]; } else { wc_w2[t] = wc_w1[t] + wc_w1[t - 4u]; } workgroupBarrier();
+    if (t < 8u) { wc_w1[t] = wc_w2[t]; } else { wc_w1[t] = wc_w2[t] + wc_w2[t - 8u]; } workgroupBarrier();
+    if (t < 16u) { wc_w2[t] = wc_w1[t]; } else { wc_w2[t] = wc_w1[t] + wc_w1[t - 16u]; } workgroupBarrier();
+    if (t < 32u) { wc_w1[t] = wc_w2[t]; } else { wc_w1[t] = wc_w2[t] + wc_w2[t - 32u]; } workgroupBarrier();
+    if (t < 64u) { wc_w2[t] = wc_w1[t]; } else { wc_w2[t] = wc_w1[t] + wc_w1[t - 64u]; } workgroupBarrier();
+    if (t < 128u) { wc_w1[t] = wc_w2[t]; } else { wc_w1[t] = wc_w2[t] + wc_w2[t - 128u]; } workgroupBarrier();
+    if (t < 256u) { wc_w2[t] = wc_w1[t]; } else { wc_w2[t] = wc_w1[t] + wc_w1[t - 256u]; } workgroupBarrier();
+    if (t < 512u) { world_cache_a[cell_id.x] = wc_w2[t]; } else { world_cache_a[cell_id.x] = wc_w2[t] + wc_w2[t - 512u]; }
+}
+
+// PASS 3 — COMPACT (blocks): exclusive prefix-sum across the per-block totals (the last `a` entry of each
+// 1024-block) → `world_cache_b`, the per-block running offset. ONE workgroup of 1024 (covers up to 1024
+// blocks = 2^20 cells). Ported from Solari compact_world_cache_blocks.
+@compute @workgroup_size(1024, 1, 1)
+fn world_cache_compact_blocks(@builtin(local_invocation_index) t: u32) {
+    // Seed each block's total (the last `a` entry of the PREVIOUS block). Blocks beyond the table's block
+    // count contribute 0, so the scan is correct for any WORLD_CACHE_SIZE in [2^10, 2^20] (the live path is
+    // 2^20 = 1024 blocks; a smaller test table has fewer, and the high lanes seed 0).
+    let num_blocks = WORLD_CACHE_SIZE / 1024u;
+    if (t == 0u || t > num_blocks) { wc_w1[t] = 0u; } else { wc_w1[t] = world_cache_a[t * 1024u - 1u]; } workgroupBarrier();
+    if (t < 1u) { wc_w2[t] = wc_w1[t]; } else { wc_w2[t] = wc_w1[t] + wc_w1[t - 1u]; } workgroupBarrier();
+    if (t < 2u) { wc_w1[t] = wc_w2[t]; } else { wc_w1[t] = wc_w2[t] + wc_w2[t - 2u]; } workgroupBarrier();
+    if (t < 4u) { wc_w2[t] = wc_w1[t]; } else { wc_w2[t] = wc_w1[t] + wc_w1[t - 4u]; } workgroupBarrier();
+    if (t < 8u) { wc_w1[t] = wc_w2[t]; } else { wc_w1[t] = wc_w2[t] + wc_w2[t - 8u]; } workgroupBarrier();
+    if (t < 16u) { wc_w2[t] = wc_w1[t]; } else { wc_w2[t] = wc_w1[t] + wc_w1[t - 16u]; } workgroupBarrier();
+    if (t < 32u) { wc_w1[t] = wc_w2[t]; } else { wc_w1[t] = wc_w2[t] + wc_w2[t - 32u]; } workgroupBarrier();
+    if (t < 64u) { wc_w2[t] = wc_w1[t]; } else { wc_w2[t] = wc_w1[t] + wc_w1[t - 64u]; } workgroupBarrier();
+    if (t < 128u) { wc_w1[t] = wc_w2[t]; } else { wc_w1[t] = wc_w2[t] + wc_w2[t - 128u]; } workgroupBarrier();
+    if (t < 256u) { wc_w2[t] = wc_w1[t]; } else { wc_w2[t] = wc_w1[t] + wc_w1[t - 256u]; } workgroupBarrier();
+    if (t < 512u) { world_cache_b[t] = wc_w2[t]; } else { world_cache_b[t] = wc_w2[t] + wc_w2[t - 512u]; }
+}
+
+// PASS 4 — COMPACT (write active): each active cell's compacted index = its in-block prefix + its block offset;
+// scatter the cell index into `world_cache_active_cell_indices`. The last thread writes the active-cell count +
+// the indirect dispatch args (ceil(count / 64)). Ported from Solari compact_world_cache_write_active_cells.
+@compute @workgroup_size(1024, 1, 1)
+fn world_cache_compact_write_active(
+    @builtin(global_invocation_id) cell_id: vec3<u32>,
+    @builtin(workgroup_id) workgroup_id: vec3<u32>,
+    @builtin(local_invocation_index) thread_index: u32,
+) {
+    let compacted_index = world_cache_a[cell_id.x] + world_cache_b[workgroup_id.x];
+    let cell_active = atomicLoad(&world_cache_life[cell_id.x]) != 0u;
+
+    if (cell_active) {
+        world_cache_active_cell_indices[compacted_index] = cell_id.x;
+    }
+
+    if (thread_index == 1023u && workgroup_id.x == (WORLD_CACHE_SIZE / 1024u) - 1u) {
+        let active_cell_count = compacted_index + u32(cell_active);
+        world_cache_active_cells_count = active_cell_count;
+        world_cache_active_cells_dispatch = vec3<u32>((active_cell_count + 63u) / 64u, 1u, 1u);
+    }
+}
+
+// PASS 5 — UPDATE (indirect, one thread per ACTIVE cell). ADAPTATION (no light list): trace ONE cosine-weighted
+// hemisphere bounce from the cell's stored (pos,normal); the sample radiance = direct lighting at the hit +
+// the hit's emissive glow, or the procedural sky (the 1A SSOT) on a miss. SINGLE-BOUNCE in 2.1 (no
+// cache-query-at-hit term — that is 2.3). Because the compaction gives each active cell exactly ONE owning
+// thread, the `new_radiance` write is race-free WITHOUT float atomics.
+@compute @workgroup_size(64, 1, 1)
+fn world_cache_update(@builtin(global_invocation_id) active_cell_id: vec3<u32>) {
+    if (active_cell_id.x >= world_cache_active_cells_count) { return; }
+    let cell_index = world_cache_active_cell_indices[active_cell_id.x];
+    let geo = world_cache_geometry[cell_index];
+    var rng = (cell_index * 9781u + wc.frame_index * 26699u) | 1u;
+
+    // Cosine-weighted hemisphere bounce (the cosine pdf cancels the Lambert cosine, so the per-sample estimate
+    // is the gathered radiance directly — same convention as `gather_gi` / `reservoir_from_bounce`).
+    let n = geo.world_normal;
+    let basis = onb(n);
+    let u1 = rand_next(&rng);
+    let u2 = rand_next(&rng);
+    let r = sqrt(u1);
+    let phi = 6.2831853 * u2;
+    let dir = normalize(basis[0] * (r * cos(phi)) + basis[1] * (r * sin(phi)) + n * sqrt(max(0.0, 1.0 - u1)));
+
+    let origin = geo.world_position + n * light.shadow_bias;
+    let hit = trace(origin, dir, 0.0, wc.gi_ray_distance);
+    var radiance: vec3<f32>;
+    if (hit.hit != 0u) {
+        let hp = origin + dir * hit.t;
+        radiance = direct_lighting(hit.color.rgb, hit.normal, hp) + hit.emissive * light.emissive_strength;
+    } else {
+        radiance = sky_radiance(dir) * sky.gi_sky_intensity;
+    }
+    world_cache_active_cells_new_radiance[active_cell_id.x] = radiance;
+}
+
+// PASS 6 — BLEND (indirect, one thread per ACTIVE cell). Solari's adaptive temporal blend: an exponential
+// running mean with a sample-count cap, made MORE responsive when the luminance is changing fast (so a newly
+// lit/shadowed cell adapts quickly but a stable cell stays smooth). LOCAL adaptation — never a global clear;
+// the only reset is the first-allocation `wc.reset` (host zero-init), which overwrites instead of blending.
+// Ported from Solari blend_new_samples.
+@compute @workgroup_size(64, 1, 1)
+fn world_cache_blend(@builtin(global_invocation_id) active_cell_id: vec3<u32>) {
+    if (active_cell_id.x >= world_cache_active_cells_count) { return; }
+    let cell_index = world_cache_active_cell_indices[active_cell_id.x];
+
+    let old_radiance = world_cache_radiance[cell_index];
+    let new_radiance = world_cache_active_cells_new_radiance[active_cell_id.x];
+    let luminance_delta = world_cache_luminance_deltas[cell_index];
+
+    let sample_count = min(old_radiance.a + 1.0, wc.max_temporal_samples);
+    let alpha = abs(luminance_delta) / max(restir_luminance(old_radiance.rgb), 0.001);
+    let max_sample_count = mix(wc.max_temporal_samples, 1.0, pow(saturate(alpha), 1.0 / 8.0));
+    var blend_amount = 1.0 / min(sample_count, max_sample_count);
+    if (wc.reset != 0u) {
+        blend_amount = 1.0;
+    }
+
+    let blended_radiance = mix(old_radiance.rgb, new_radiance, blend_amount);
+    let new_delta = mix(luminance_delta, restir_luminance(blended_radiance) - restir_luminance(old_radiance.rgb), 1.0 / 8.0);
+    let blended_luminance_delta = select(new_delta, 0.0, wc.reset != 0u);
+
+    world_cache_radiance[cell_index] = vec4<f32>(blended_radiance, sample_count);
+    world_cache_luminance_deltas[cell_index] = blended_luminance_delta;
+}
+
+// --- headless TEST entry: seed cells via the cache hash + read a chosen cell back -------------------
+// The live path does NOT call `query_world_cache` in 2.1, so without a seeder no cell would ever become
+// active. This entry lets the headless harness INSERT a known set of (pos,normal) query points each frame
+// (driving the lazy-insert + the alive-mark), then read back the resolved cell index / checksum / radiance so
+// the test can assert the cache converges to the analytic single-bounce irradiance. It runs FIRST each frame
+// (before decay), exactly where the live reservoir query will sit in 2.2.
+struct WcQueryPoint { world_position: vec3<f32>, _p0: u32, world_normal: vec3<f32>, _p1: u32 };
+struct WcQueryOut { radiance: vec3<f32>, cell_index: u32, checksum: u32, life: u32, _p0: u32, _p1: u32 };
+struct WcQueryParams { view_position: vec3<f32>, n_points: u32, frame_index: u32, _p0: u32, _p1: u32, _p2: u32 };
+
+@group(3) @binding(12) var<storage, read> wc_query_points: array<WcQueryPoint>;
+@group(3) @binding(13) var<storage, read_write> wc_query_out: array<WcQueryOut>;
+@group(3) @binding(14) var<uniform> wc_query_params: WcQueryParams;
+
+@compute @workgroup_size(64, 1, 1)
+fn world_cache_query_seed(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    if (i >= wc_query_params.n_points) { return; }
+    let q = wc_query_points[i];
+    // Mark the cell alive with the full lifetime and recover its radiance. The recomputed key/checksum below
+    // mirror `query_world_cache` (no jitter here, so the harness reads back a DETERMINISTIC slot — jitter would
+    // scatter the same query across neighbouring cells frame-to-frame, which is good for coverage but bad for a
+    // single-cell read-back). This keeps the test's cell stable while still exercising the real insert+probe.
+    let cell_size = wc.cell_base_size; // LOD 0 (the test view is close), no jitter — stable read-back slot
+    let qpos = bitcast<vec3<u32>>(wc_quantize_position(q.world_position, cell_size));
+    let qnrm = bitcast<vec3<u32>>(wc_quantize_normal(q.world_normal));
+    var key = wc_compute_key(qpos, qnrm);
+    let checksum = wc_compute_checksum(qpos, qnrm);
+
+    var found_key = key;
+    var rad = vec3<f32>(0.0);
+    var done = false;
+    for (var s = 0u; s < WORLD_CACHE_MAX_SEARCH_STEPS; s = s + 1u) {
+        if (done) { continue; }
+        let existing = atomicCompareExchangeWeak(&world_cache_checksums[key], WORLD_CACHE_EMPTY_CELL, checksum).old_value;
+        if (existing == checksum || existing == WORLD_CACHE_EMPTY_CELL) {
+            atomicMax(&world_cache_life[key], wc.cell_lifetime);
+            if (existing == WORLD_CACHE_EMPTY_CELL) {
+                world_cache_geometry[key].world_position = q.world_position;
+                world_cache_geometry[key].world_normal = q.world_normal;
+            } else {
+                rad = world_cache_radiance[key].rgb;
+            }
+            found_key = key;
+            done = true;
+        } else {
+            found_key = key;
+            key = key + 1u;
+            if (key >= WORLD_CACHE_SIZE) { key = 0u; }
+        }
+    }
+
+    var o: WcQueryOut;
+    o.radiance = rad;
+    o.cell_index = found_key;
+    o.checksum = atomicLoad(&world_cache_checksums[found_key]);
+    o.life = atomicLoad(&world_cache_life[found_key]);
+    o._p0 = 0u;
+    o._p1 = 0u;
+    wc_query_out[i] = o;
+}

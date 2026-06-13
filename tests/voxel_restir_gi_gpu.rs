@@ -222,7 +222,7 @@ fn run_probes(
     });
     queue.write_buffer(&light_buf, 0, bytemuck::bytes_of(light));
 
-    let src = std::fs::read_to_string("assets/shaders/voxel_raytrace.wgsl").expect("read shader");
+    let src = common::voxel_raytrace_shader_src();
     let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some("voxel_raytrace"),
         source: wgpu::ShaderSource::Wgsl(src.into()),
@@ -491,7 +491,7 @@ fn restir_screen_space_entries_compile() {
         eprintln!("no ray-query device with 8 storage textures — skipping restir_screen_space_entries_compile");
         return;
     };
-    let src = std::fs::read_to_string("assets/shaders/voxel_raytrace.wgsl").expect("read shader");
+    let src = common::voxel_raytrace_shader_src();
     let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some("voxel_raytrace"),
         source: wgpu::ShaderSource::Wgsl(src.into()),
