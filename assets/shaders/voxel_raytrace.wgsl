@@ -1118,7 +1118,20 @@ fn restir_probe(@builtin(global_invocation_id) gid: vec3<u32>) {
 // accumulator), so reservoirs are dropped that frame — no reprojection yet (motion-vector reprojection +
 // spatial reuse are R2). Two reservoir storage buffers ping-pong (cur written, prev read) — no G-buffer
 // textures, so no storage-texture-limit pressure.
-struct RestirParams { reset: u32, frame_index: u32, viewport_x: u32, viewport_y: u32 };
+// Runtime ReSTIR knobs (group-2 uniform; editor-driven, knobs-as-uniforms). `spatial_samples` neighbours are
+// merged per pixel from last frame's reservoirs (smooths dark/shadow regions where the temporal permute alone
+// is too slow); `spatial_radius` is the disk radius in pixels; `confidence_weight_cap` bounds temporal/spatial
+// history (lag vs stability). 32 bytes (2×vec4).
+struct RestirParams {
+    reset: u32,
+    frame_index: u32,
+    viewport_x: u32,
+    viewport_y: u32,
+    spatial_samples: u32,
+    confidence_weight_cap: f32,
+    spatial_radius: f32,
+    _pad: u32,
+};
 // Per-pixel RECEIVER surface (world pos + face normal) — needed so a temporal/neighbour reservoir can be
 // merged with the correct Jacobian + rejected when it lands on a dissimilar surface (port of Solari's
 // gbuffer-resolve, but we store pos/normal directly instead of repacking depth).
@@ -1149,6 +1162,13 @@ fn surfaces_dissimilar(p: vec3<f32>, n: vec3<f32>, op: vec3<f32>, on: vec3<f32>)
     let tangent_plane_distance = abs(dot(n, op - p));
     let view_dist = max(length(p - camera.cam_pos), 1.0e-3);
     return tangent_plane_distance / view_dist > 0.01 || dot(n, on) < 0.5;
+}
+
+// Uniform sample in a disk of `radius` pixels (concentric area-uniform), for spatial-neighbour selection.
+fn sample_disk(radius: f32, rng: ptr<function, u32>) -> vec2<f32> {
+    let r = radius * sqrt(rand_next(rng));
+    let a = 6.2831853 * rand_next(rng);
+    return vec2<f32>(r * cos(a), r * sin(a));
 }
 
 // Reservoir-based indirect irradiance at pixel `idx` for surface (n, p): generate an initial candidate, merge
@@ -1197,10 +1217,30 @@ fn restir_gi(n: vec3<f32>, p: vec3<f32>, pix: vec2<u32>, temporal_base: vec2<i32
         let surf = surfaces_prev[tidx];
         if (surf.valid > 0.5 && !surfaces_dissimilar(p, n, surf.world_position, surf.world_normal)) {
             var temporal = reservoirs_prev[tidx];
-            temporal.confidence_weight = min(temporal.confidence_weight, RESTIR_CONFIDENCE_CAP);
+            temporal.confidence_weight = min(temporal.confidence_weight, restir_params.confidence_weight_cap);
             let merged =
                 merge_reservoirs(res, p, n, brdf, temporal, surf.world_position, surf.world_normal, brdf, &rng);
             res = merged.merged_reservoir;
+        }
+
+        // SPATIAL reuse: merge a few disk-sampled neighbours from last frame's reservoirs. A shadowed pixel
+        // borrows its (better-converged) neighbours' estimates → the dark-region noise floor collapses far
+        // faster than the temporal permute alone. Surface-dissimilarity + the merge Jacobian keep it on-surface.
+        for (var s = 0u; s < restir_params.spatial_samples; s = s + 1u) {
+            let off = sample_disk(restir_params.spatial_radius, &rng);
+            let npix = vec2<i32>(pix) + vec2<i32>(i32(round(off.x)), i32(round(off.y)));
+            if (npix.x < 0 || npix.y < 0 || npix.x >= i32(vp.x) || npix.y >= i32(vp.y)) {
+                continue;
+            }
+            let nidx = u32(npix.y) * vp.x + u32(npix.x);
+            let nsurf = surfaces_prev[nidx];
+            if (nsurf.valid > 0.5 && !surfaces_dissimilar(p, n, nsurf.world_position, nsurf.world_normal)) {
+                var nres = reservoirs_prev[nidx];
+                nres.confidence_weight = min(nres.confidence_weight, restir_params.confidence_weight_cap);
+                let merged =
+                    merge_reservoirs(res, p, n, brdf, nres, nsurf.world_position, nsurf.world_normal, brdf, &rng);
+                res = merged.merged_reservoir;
+            }
         }
     }
 

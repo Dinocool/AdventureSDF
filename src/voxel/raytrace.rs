@@ -118,11 +118,13 @@ impl Plugin for VoxelRtPlugin {
             .init_resource::<VoxelRtToggle>()
             .init_resource::<VoxelRtPatch>()
             .init_resource::<VoxelRtLighting>()
+            .init_resource::<RestirSettings>()
             .init_resource::<VoxelEdits>()
             .init_resource::<VoxelEditBrush>()
             .add_plugins(ExtractResourcePlugin::<VoxelRtToggle>::default())
             .add_plugins(ExtractResourcePlugin::<VoxelRtPatch>::default())
             .add_plugins(ExtractResourcePlugin::<VoxelRtLighting>::default())
+            .add_plugins(ExtractResourcePlugin::<RestirSettings>::default())
             .add_systems(Startup, init_voxel_rt_streaming)
             // The edit click handler runs BEFORE the residency/re-bake so an edit's delta-generation bump is
             // observed the same frame (the re-bake then bumps the GPU generation → visible next frame).
@@ -557,9 +559,8 @@ struct VoxelRtPipelines {
     /// `group(2)` (ReSTIR): the two per-pixel reservoir storage buffers (cur/prev) + the restir params uniform.
     /// Shared by the non-DLSS and DLSS ReSTIR entry points.
     reservoir_layout: wgpu::BindGroupLayout,
-    /// The `raymarch` compute pipeline (legacy `gather_gi` GI). Built but not dispatched yet — kept for the
-    /// R3 `gi_mode` A/B toggle (legacy vs ReSTIR in one build).
-    #[allow(dead_code)]
+    /// The `raymarch` compute pipeline (legacy `gather_gi` GI). Dispatched when `RestirSettings.restir` is
+    /// off — the `gi_mode` A/B toggle (legacy vs ReSTIR in one build).
     raymarch: wgpu::ComputePipeline,
     /// The `raymarch_restir` compute pipeline: same primary pass, reservoir (ReSTIR) GI. The live GI path.
     raymarch_restir: wgpu::ComputePipeline,
@@ -572,9 +573,8 @@ struct VoxelRtPipelines {
     /// storage textures) + its `group(1)` view layout, and the resolve render pass's bind-group layout
     /// (samples the colour/depth/motion storage textures → view target + prepass depth/motion). The resolve
     /// render pipeline itself is built lazily (format-keyed) in the pass.
-    /// Legacy DLSS guide-writing pass (`gather_gi` GI). Built but not dispatched — kept for the R3 A/B toggle.
+    /// Legacy DLSS guide-writing pass (`gather_gi` GI). Dispatched when `RestirSettings.restir` is off (A/B).
     #[cfg(feature = "dlss")]
-    #[allow(dead_code)]
     raymarch_dlss: wgpu::ComputePipeline,
     /// The `raymarch_dlss_restir` compute pipeline: the DLSS guide-writing pass with reservoir (ReSTIR) GI.
     #[cfg(feature = "dlss")]
@@ -1138,7 +1138,7 @@ const RESERVOIR_SIZE: u64 = 48;
 /// Bytes per WGSL `PixelSurface` (2×vec4 = 32): world pos + valid flag, world normal + pad.
 const SURFACE_SIZE: u64 = 32;
 
-/// Mirror of the WGSL `RestirParams` (group 2 binding 2): reset flag + frame index + viewport.
+/// Mirror of the WGSL `RestirParams` (group 2 binding 2): reset + frame + viewport + the editor ReSTIR knobs.
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct RestirParamsData {
@@ -1146,6 +1146,31 @@ struct RestirParamsData {
     frame_index: u32,
     viewport_x: u32,
     viewport_y: u32,
+    spatial_samples: u32,
+    confidence_weight_cap: f32,
+    spatial_radius: f32,
+    _pad: u32,
+}
+
+/// **SSOT for the editor-tunable ReSTIR knobs** (knobs-as-uniforms). Drives `RestirParamsData` each frame; the
+/// Render/GI panel writes it. `gi_mode` selects the live GI path: `false` = legacy `gather_gi`, `true` = ReSTIR
+/// (the A/B toggle). Extracted to the render world.
+#[derive(Resource, Clone, Copy, ExtractResource)]
+pub struct RestirSettings {
+    /// `true` = ReSTIR GI (default), `false` = legacy `gather_gi` (for A/B comparison).
+    pub restir: bool,
+    /// Spatial-neighbour samples merged per pixel (0 = temporal-only). Smooths shadows.
+    pub spatial_samples: u32,
+    /// Spatial-neighbour disk radius in pixels.
+    pub spatial_radius: f32,
+    /// Temporal/spatial history confidence cap (frames). Higher = smoother + more lag.
+    pub confidence_cap: f32,
+}
+
+impl Default for RestirSettings {
+    fn default() -> Self {
+        Self { restir: true, spatial_samples: 4, spatial_radius: 16.0, confidence_cap: 8.0 }
+    }
 }
 
 /// [`Render`]/[`RenderSystems::PrepareResources`]: upload the streamed patch buffers + build the AABB BLAS
@@ -1267,6 +1292,7 @@ fn prepare_voxel_rt(
 /// [`Core3d`]/[`Core3dSystems::MainPass`]: when the toggle is on and the scene is built, dispatch the
 /// raymarch compute pass into a per-view output texture, then composite it over the [`ViewTarget`]. When
 /// off, returns immediately so the Stage-1 cubes render unchanged.
+#[allow(clippy::too_many_arguments)]
 fn voxel_rt_pass(
     #[cfg(not(feature = "dlss"))] view: ViewQuery<(&ExtractedView, &ViewTarget)>,
     #[cfg(feature = "dlss")] view: ViewQuery<(
@@ -1276,6 +1302,7 @@ fn voxel_rt_pass(
     )>,
     toggle: Res<VoxelRtToggle>,
     lighting: Res<VoxelRtLighting>,
+    restir_settings: Res<RestirSettings>,
     pipelines: Option<Res<VoxelRtPipelines>>,
     mut resources: ResMut<VoxelRtResources>,
     render_device: Res<RenderDevice>,
@@ -1480,6 +1507,10 @@ fn voxel_rt_pass(
         frame_index,
         viewport_x: viewport.x,
         viewport_y: viewport.y,
+        spatial_samples: restir_settings.spatial_samples,
+        confidence_weight_cap: restir_settings.confidence_cap,
+        spatial_radius: restir_settings.spatial_radius,
+        _pad: 0,
     };
     let restir_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("voxel_rt_restir_params"),
@@ -1504,7 +1535,9 @@ fn voxel_rt_pass(
     });
 
     let scene_bg = resources.scene_bind_group.as_ref().expect("checked above");
-    let raymarch = &pipelines.raymarch_restir;
+    // `gi_mode` A/B: ReSTIR GI (group-2 reservoirs) vs the legacy `gather_gi` raymarch (no group 2).
+    let use_restir = restir_settings.restir;
+    let raymarch = if use_restir { &pipelines.raymarch_restir } else { &pipelines.raymarch };
     let composite = &resources.composite.as_ref().expect("just built").1;
     let main_view = target.main_texture_view();
     // Texture handles for the post-pass output→history copy (the accumulator feedback).
@@ -1522,7 +1555,9 @@ fn voxel_rt_pass(
         cpass.set_pipeline(raymarch);
         cpass.set_bind_group(0, scene_bg, &[]);
         cpass.set_bind_group(1, &view_bg, &[]);
-        cpass.set_bind_group(2, &reservoir_bg, &[]);
+        if use_restir {
+            cpass.set_bind_group(2, &reservoir_bg, &[]);
+        }
         cpass.dispatch_workgroups(viewport.x.div_ceil(8), viewport.y.div_ceil(8), 1);
     }
     // Feed this frame's accumulated output back into history for the next frame's blend (the running mean).
@@ -1651,6 +1686,7 @@ fn voxel_rt_dlss_pass(
     )>,
     toggle: Res<VoxelRtToggle>,
     lighting: Res<VoxelRtLighting>,
+    restir_settings: Res<RestirSettings>,
     pipelines: Option<Res<VoxelRtPipelines>>,
     mut resources: ResMut<VoxelRtResources>,
     render_device: Res<RenderDevice>,
@@ -1887,6 +1923,10 @@ fn voxel_rt_dlss_pass(
         frame_index,
         viewport_x: render_res.x,
         viewport_y: render_res.y,
+        spatial_samples: restir_settings.spatial_samples,
+        confidence_weight_cap: restir_settings.confidence_cap,
+        spatial_radius: restir_settings.spatial_radius,
+        _pad: 0,
     };
     let restir_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("voxel_rt_dlss_restir_params"),
@@ -1911,7 +1951,9 @@ fn voxel_rt_dlss_pass(
     });
 
     let scene_bg = resources.scene_bind_group.as_ref().expect("checked above");
-    let raymarch = &pipelines.raymarch_dlss_restir;
+    // `gi_mode` A/B: ReSTIR GI (group-2 reservoirs) vs the legacy `gather_gi` DLSS raymarch (no group 2).
+    let use_restir = restir_settings.restir;
+    let raymarch = if use_restir { &pipelines.raymarch_dlss_restir } else { &pipelines.raymarch_dlss };
     let resolve = &resources.dlss_resolve.as_ref().expect("just built").1;
     let main_view = target.main_texture_view();
     let depth_target = &depth_attach.texture.default_view;
@@ -1926,7 +1968,9 @@ fn voxel_rt_dlss_pass(
         cpass.set_pipeline(raymarch);
         cpass.set_bind_group(0, scene_bg, &[]);
         cpass.set_bind_group(1, &view_bg, &[]);
-        cpass.set_bind_group(2, &reservoir_bg, &[]);
+        if use_restir {
+            cpass.set_bind_group(2, &reservoir_bg, &[]);
+        }
         cpass.dispatch_workgroups(render_res.x.div_ceil(8), render_res.y.div_ceil(8), 1);
     }
     {
