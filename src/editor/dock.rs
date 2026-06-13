@@ -126,7 +126,24 @@ impl TabViewer for EditorTabViewer<'_> {
                     {
                         vp.desired_size = want;
                     }
-                    ui.image(egui::load::SizedTexture::new(tex, avail));
+                    let resp = ui.image(egui::load::SizedTexture::new(tex, avail));
+                    // Publish the viewport's screen rect (egui points == window logical px here) so the voxel
+                    // pick maps clicks through the tab, and gate scene input on hovering the viewport (not a
+                    // dock panel). `interact` makes the image report hover/clicks.
+                    let resp = resp.interact(egui::Sense::click_and_drag());
+                    let r = resp.rect;
+                    if let Some(mut vr) = self
+                        .world
+                        .get_resource_mut::<crate::sdf_render::EditorViewportRect>()
+                    {
+                        vr.rect = Some((Vec2::new(r.min.x, r.min.y), Vec2::new(r.width(), r.height())));
+                    }
+                    if let Some(mut allowed) = self
+                        .world
+                        .get_resource_mut::<crate::sdf_render::ViewportInputAllowed>()
+                    {
+                        allowed.0 = resp.hovered();
+                    }
                 } else {
                     ui.centered_and_justified(|ui| {
                         ui.label(egui::RichText::new("Voxel-RT viewport").weak().size(16.0));

@@ -22,6 +22,7 @@ pub mod nsight_capture;
 pub mod panels;
 pub mod profiling;
 pub mod registry;
+pub mod render_panel;
 #[cfg(feature = "renderdoc")]
 pub mod renderdoc_capture;
 pub mod status_bar;
@@ -65,6 +66,16 @@ impl Plugin for EditorPlugin {
             DockSide::Bottom,
             0,
             profiling::performance_panel,
+        );
+
+        // The voxel renderer's live lighting/GI knobs + debug-view overlays (normals/depth/AO/GI/face).
+        panels::register_panel(
+            app,
+            "voxel/render",
+            "Render / GI",
+            DockSide::Right,
+            1,
+            render_panel::render_gi_panel,
         );
 
         // F6 toggles chrome-trace capture (global).

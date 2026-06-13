@@ -493,7 +493,7 @@ struct LightingUniform {
     gi_bounce_dist: f32,       // max world-metre length of a diffuse bounce ray (miss past it = sky)
     emissive_strength: f32,    // scalar multiplier on every block's palette emissive
     frame_index: u32,          // per-frame counter to decorrelate the bounce-direction hash
-    _pad0: u32,
+    debug_view: u32,           // 0 = lit; 1 = normals; 2 = depth; 3 = albedo; 4 = AO; 5 = GI-only; 6 = face-toward-camera
     _pad1: u32,
 };
 @group(1) @binding(2) var<uniform> light: LightingUniform;
@@ -673,6 +673,37 @@ fn raymarch(@builtin(global_invocation_id) gid: vec3<u32>) {
     let rd = normalize(world_near - ro);
 
     let r = trace(ro, rd, 0.0, camera.t_max);
+
+    // --- Debug overlays (RAW output, no temporal accumulation, so they stay crisp under motion) ----------
+    if (light.debug_view != 0u) {
+        let dpx = vec2<i32>(i32(gid.x), i32(gid.y));
+        var dbg = vec3<f32>(0.0);
+        if (r.hit != 0u) {
+            let p = ro + rd * r.t;
+            let origin = p + r.normal * light.shadow_bias;
+            if (light.debug_view == 1u) {
+                dbg = r.normal * 0.5 + 0.5;                                  // world-space face normals
+            } else if (light.debug_view == 2u) {
+                dbg = vec3<f32>(clamp(r.t / 20.0, 0.0, 1.0));                // depth (0..20 m → black..white)
+            } else if (light.debug_view == 3u) {
+                dbg = r.color.rgb;                                          // raw palette albedo
+            } else if (light.debug_view == 4u) {
+                dbg = vec3<f32>(ambient_occlusion(origin, r.normal));       // AO only
+            } else if (light.debug_view == 5u) {
+                let seed = (gid.x * 1973u + gid.y * 9277u + light.frame_index * 26699u) | 1u;
+                dbg = gather_gi(r.normal, origin, seed);                    // indirect (GI) only
+            } else if (light.debug_view == 6u) {
+                // Face orientation: GREEN = front face (normal opposes the ray, correct); RED = BACK face
+                // (normal points ALONG the ray — i.e. we hit the inside/back of a voxel = the show-through bug).
+                dbg = select(vec3<f32>(0.0, 1.0, 0.0), vec3<f32>(1.0, 0.0, 0.0), dot(r.normal, rd) > 0.0);
+            } else {
+                dbg = r.color.rgb;
+            }
+        }
+        textureStore(out_tex, dpx, vec4<f32>(dbg, 1.0));
+        return;
+    }
+
     var color: vec4<f32>;
     if (r.hit != 0u) {
         // Hit: physically-plausible DIRECT lighting (Lambert sun + traced hard shadow + traced AO over the

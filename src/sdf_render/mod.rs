@@ -53,6 +53,15 @@ impl Default for ViewportInputAllowed {
     }
 }
 
+/// The on-screen rect the 3D viewport occupies, in WINDOW LOGICAL PIXELS as `(min, size)`. `None` ⇒ the
+/// camera fills the whole window (the non-editor / headless build). The editor's Viewport tab writes this
+/// each frame (the tab is a sub-rect of the window now that the SdfCamera renders into a docked image), so
+/// cursor→ray picking maps a click through the tab instead of assuming a full-window viewport.
+#[derive(Resource, Default)]
+pub struct EditorViewportRect {
+    pub rect: Option<(Vec2, Vec2)>,
+}
+
 // --- Plugin ---
 
 pub struct SdfScenePlugin;
@@ -63,6 +72,7 @@ impl Plugin for SdfScenePlugin {
             .init_resource::<SdfOrbitCamera>()
             .init_resource::<SdfCameraMode>()
             .init_resource::<ViewportInputAllowed>()
+            .init_resource::<EditorViewportRect>()
             .register_type::<SdfVolume>()
             .register_type::<SdfCamera>()
             // The viewport camera persists across scene-state transitions (editor infra),

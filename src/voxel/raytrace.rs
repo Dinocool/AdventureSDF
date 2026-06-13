@@ -370,6 +370,8 @@ fn voxel_edit_input(
     // `ViewportInputAllowed` is owned by `SdfScenePlugin` (the editor sets it false over dock panels). Optional
     // so `VoxelRtPlugin` stays standalone — the headless render tests add only this plugin; absent ⇒ allowed.
     allowed: Option<Res<crate::sdf_render::ViewportInputAllowed>>,
+    // The viewport's on-screen rect (set by the editor's Viewport tab); absent ⇒ full-window viewport.
+    viewport_rect: Option<Res<crate::sdf_render::EditorViewportRect>>,
     mouse: Res<ButtonInput<MouseButton>>,
     keys: Res<ButtonInput<KeyCode>>,
     streaming: Res<VoxelRtStreaming>,
@@ -415,9 +417,14 @@ fn voxel_edit_input(
         return; // cursor outside the window
     };
 
+    // The viewport rect: the editor's docked image rect, or the whole window in the non-editor build.
+    let (vp_min, vp_size) = viewport_rect
+        .and_then(|v| v.rect)
+        .unwrap_or((Vec2::ZERO, Vec2::new(window.width(), window.height())));
+
     // Build the camera ray from the cursor (mirrors the raymarch shader's reverse-Z near-plane unprojection,
     // so the CPU pick ray == the GPU primary ray).
-    let Some((ro, rd)) = cursor_world_ray(camera, cam_xf, window, cursor) else {
+    let Some((ro, rd)) = cursor_world_ray(camera, cam_xf, vp_min, vp_size, cursor) else {
         return;
     };
 
@@ -444,10 +451,25 @@ fn voxel_edit_input(
 /// raymarch shader's primary-ray generation: unproject the reverse-Z NEAR plane (NDC z = 1) through the
 /// camera's clip→view→world chain, so the CPU pick ray is identical to the GPU primary ray. `None` if the
 /// viewport size is unavailable or the direction degenerates.
-fn cursor_world_ray(camera: &Camera, cam_xf: &GlobalTransform, window: &Window, cursor: Vec2) -> Option<(Vec3, Vec3)> {
+fn cursor_world_ray(
+    camera: &Camera,
+    cam_xf: &GlobalTransform,
+    vp_min: Vec2,
+    vp_size: Vec2,
+    cursor: Vec2,
+) -> Option<(Vec3, Vec3)> {
     let _ = camera.physical_viewport_size()?; // ensure the camera has a live viewport
-    let ndc_x = (2.0 * cursor.x / window.width()) - 1.0;
-    let ndc_y = 1.0 - (2.0 * cursor.y / window.height());
+    // Cursor relative to the viewport rect (the docked image's screen rect in the editor, or the full
+    // window otherwise). Outside the rect ⇒ the click isn't on the 3D view.
+    let local = cursor - vp_min;
+    if vp_size.x <= 0.0 || vp_size.y <= 0.0 {
+        return None;
+    }
+    if local.x < 0.0 || local.y < 0.0 || local.x > vp_size.x || local.y > vp_size.y {
+        return None;
+    }
+    let ndc_x = (2.0 * local.x / vp_size.x) - 1.0;
+    let ndc_y = 1.0 - (2.0 * local.y / vp_size.y);
     let world_from_view = cam_xf.to_matrix();
     let view_from_clip = camera.clip_from_view().inverse();
     let ndc = Vec4::new(ndc_x, ndc_y, 1.0, 1.0);
@@ -632,8 +654,12 @@ pub struct LightingUniformData {
     /// Per-frame counter used to decorrelate the per-pixel bounce-direction hash (temporal variation /
     /// future temporal accumulation). The render path bumps this each frame; tests pass a fixed value.
     pub frame_index: u32,
-    /// std140 tail pad to a 16-byte multiple (struct is now 80 bytes).
-    pub _pad: [u32; 3],
+    /// Debug visualization mode (editor "Render" panel): 0 = lit (normal), 1 = world normals, 2 = depth,
+    /// 3 = albedo, 4 = AO, 5 = GI-only, 6 = face-orientation (green front / red BACK-face). Mirrors the
+    /// WGSL `LightingUniform.debug_view`.
+    pub debug_view: u32,
+    /// std140 tail pad to a 16-byte multiple.
+    pub _pad: [u32; 2],
 }
 
 impl Default for LightingUniformData {
@@ -655,7 +681,8 @@ impl Default for LightingUniformData {
             gi_bounce_dist: 12.0,
             emissive_strength: 4.0,
             frame_index: 0,
-            _pad: [0; 3],
+            debug_view: 0,
+            _pad: [0; 2],
         }
     }
 }
@@ -682,7 +709,8 @@ impl LightingUniformData {
             gi_bounce_dist: 24.0,
             emissive_strength: 6.0,
             frame_index: 0,
-            _pad: [0; 3],
+            debug_view: 0,
+            _pad: [0; 2],
         }
     }
 }
