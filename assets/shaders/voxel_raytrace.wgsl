@@ -1303,8 +1303,12 @@ fn permute_pixel(pixel_id: vec2<u32>, frame_index: u32, vp: vec2<u32>) -> vec2<u
 fn surfaces_dissimilar(p: vec3<f32>, n: vec3<f32>, op: vec3<f32>, on: vec3<f32>) -> bool {
     let tangent_plane_distance = abs(dot(n, op - p));
     let view_dist = max(length(p - camera.cam_pos), 1.0e-3);
-    // Solari thresholds: reject if the neighbour is >0.3% of view-distance out of the tangent plane, or its
-    // normal is >90° away. (Looser values leak GI across co-planar patches with different occlusion.)
+    // Solari thresholds (gbuffer_utils.wgsl:45 parity): reject if the neighbour is >0.3% of view-distance out
+    // of the tangent plane, or its normal is >90° away (`dot < 0`). At the worldgen/Cornell view distances the
+    // relative 0.003·view_dist threshold (≈cm) is well below the ≥0.4 m thin walls, so a far-side-of-a-thin-wall
+    // neighbour is already rejected; the world-cache thin-wall leak is handled at its source by the first-bounce
+    // cell-size clamp in `query_world_cache` (NOT here). Keep this exactly Solari — a tighter cone or an absolute
+    // floor would over-reject genuinely co-planar same-surface reuse and INCREASE boil.
     return tangent_plane_distance / view_dist > 0.003 || dot(n, on) < 0.0;
 }
 
@@ -1465,9 +1469,11 @@ fn restir_p2_core(n: vec3<f32>, p: vec3<f32>, pix: vec2<u32>, seed: u32) -> vec3
         let origin = p + n * light.shadow_bias;
         let to_sample = shaded.sample_point_world_position - origin;
         let dist = length(to_sample);
-        // Pull t_max back by one shadow_bias so the ray doesn't self-hit the sample point's own surface.
-        if (dist > light.shadow_bias
-            && trace_occluded(origin, to_sample / dist, 0.0, dist - light.shadow_bias)) {
+        // Pull t_max back by a RELATIVE epsilon (sub-voxel at these scales) so the ray doesn't self-hit the
+        // sample point's own surface. A FIXED `dist - shadow_bias` pull-back (one voxel near the wall) could
+        // drop a near-floor occluder into the trimmed tail and DISARM the occlusion backstop, letting a sample
+        // on the far side of a thin floor shade an interior face. Relative trim keeps the backstop armed.
+        if (dist > 0.0 && trace_occluded(origin, to_sample / dist, 0.0, dist * (1.0 - 1.0e-3))) {
             shaded.unbiased_contribution_weight = 0.0;
         }
     }
@@ -1807,6 +1813,16 @@ fn query_world_cache(world_position_in: vec3<f32>, world_normal: vec3<f32>, view
     var world_position = world_position_in;
     var cell_size = wc_get_cell_size(world_position, view_position, rng);
 
+    // FIRST-BOUNCE LIGHT-LEAK PREVENTION (Solari world_cache_query.wgsl:47-52, on-by-default node.rs:564).
+    // A bounce shorter than the distance-LOD cell straddles thin geometry (e.g. a cube face → adjacent 0.4 m
+    // floor, ray_t ~0.3-0.8 m) — the over-sized cell + tangent jitter then quantize the query onto the cell on
+    // the FAR side of the wall, reading exterior radiance into an interior face (the reported Cornell leak).
+    // Clamping back to the small base cell (0.15 m, fits inside the floor) makes the straddle impossible and
+    // shrinks the subsequent jitter amplitude (±0.5·cell_size). Robust-by-construction.
+    if (ray_t < cell_size) {
+        cell_size = wc.cell_base_size;
+    }
+
     // Jitter the query point in the tangent plane (blurs the cache so it is not so grid-like).
     let TBN = onb(world_normal);
     let offset = (vec2<f32>(rand_next(rng), rand_next(rng)) * 2.0 - 1.0) * cell_size * 0.5;
@@ -2006,7 +2022,7 @@ fn world_cache_blend(@builtin(global_invocation_id) active_cell_id: vec3<u32>) {
 // (before decay), exactly where the live reservoir query will sit in 2.2.
 struct WcQueryPoint { world_position: vec3<f32>, _p0: u32, world_normal: vec3<f32>, _p1: u32 };
 struct WcQueryOut { radiance: vec3<f32>, cell_index: u32, checksum: u32, life: u32, _p0: u32, _p1: u32 };
-struct WcQueryParams { view_position: vec3<f32>, n_points: u32, frame_index: u32, _p0: u32, _p1: u32, _p2: u32 };
+struct WcQueryParams { view_position: vec3<f32>, n_points: u32, frame_index: u32, ray_t: f32, _p1: u32, _p2: u32 };
 
 @group(3) @binding(12) var<storage, read> wc_query_points: array<WcQueryPoint>;
 @group(3) @binding(13) var<storage, read_write> wc_query_out: array<WcQueryOut>;
@@ -2133,4 +2149,38 @@ fn world_cache_energy_probe(@builtin(global_invocation_id) gid: vec3<u32>) {
     energy_out.hit_albedo = r.color.rgb;
     energy_out.cache_value = energy_read_cache_deterministic(hp, r.normal);
     energy_out.hit = r.hit;
+}
+
+// --- headless TEST entry: thin-wall LIGHT-LEAK probe (Phase 2.2.1 regression gate) ----------------------
+// Drives the REAL `query_world_cache` (so the first-bounce light-leak-prevention clamp is exercised exactly as
+// in the live path) for each query point, using a caller-chosen SHORT `ray_t` (`wc_query_params.ray_t`) — the
+// distance of the bounce that produced this query. A cube-face → adjacent-floor bounce is short (~0.3-0.8 m).
+// Many RNG samples are averaged so the tangent-plane jitter (which, with an over-sized cell, stochastically
+// crosses a thin wall into an exterior cell) is fully represented — the leak is "infrequent" precisely because
+// only some jitter offsets cross. Without the clamp the averaged read is contaminated by the bright exterior
+// cell; WITH the clamp the cell shrinks to `cell_base_size` (fits inside the wall) so the query NEVER reaches
+// the exterior cell and the read stays ≈ the interior cell's (dark) radiance. Writes the averaged radiance to
+// `wc_query_out[i].radiance` (cell_index/checksum/life unused here). `view_position` (params) sets the LOD so
+// the harness can put the un-clamped cell size above the wall thickness.
+const WC_LEAK_PROBE_SAMPLES: u32 = 256u;
+@compute @workgroup_size(64, 1, 1)
+fn world_cache_leak_probe(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    if (i >= wc_query_params.n_points) { return; }
+    let q = wc_query_points[i];
+    var rng = (wc_query_params.frame_index * 26699u + i * 747796405u) | 1u;
+    var acc = vec3<f32>(0.0);
+    for (var s = 0u; s < WC_LEAK_PROBE_SAMPLES; s = s + 1u) {
+        acc += query_world_cache(
+            q.world_position, q.world_normal, wc_query_params.view_position,
+            wc_query_params.ray_t, wc.cell_lifetime, &rng);
+    }
+    var o: WcQueryOut;
+    o.radiance = acc / f32(WC_LEAK_PROBE_SAMPLES);
+    o.cell_index = 0u;
+    o.checksum = 0u;
+    o.life = 0u;
+    o._p0 = 0u;
+    o._p1 = 0u;
+    wc_query_out[i] = o;
 }

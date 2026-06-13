@@ -75,7 +75,9 @@ pub fn render_gi_panel(world: &mut World, ui: &mut egui::Ui) {
         color_row(ui, "ambient", &mut d.ambient_color);
         ui.add(egui::Slider::new(&mut d.ao_radius, 0.0..=3.0).text("AO radius (m)"));
         ui.add(egui::Slider::new(&mut d.ao_samples, 0..=8).text("AO samples"));
-        ui.add(egui::Slider::new(&mut d.shadow_bias, 0.0..=0.2).text("shadow bias"));
+        // Clamp below one voxel (0.2 m): a shadow_bias >= one voxel near a thin wall pulls the shadow-ray
+        // origin past a floor and can disarm the occlusion backstop, leaking light through thin geometry.
+        ui.add(egui::Slider::new(&mut d.shadow_bias, 0.0..=0.15).text("shadow bias"));
 
         ui.separator();
         ui.label(egui::RichText::new("Global illumination").strong());

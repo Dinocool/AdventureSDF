@@ -114,7 +114,9 @@ struct WcQueryParams {
     view_position: [f32; 3],
     n_points: u32,
     frame_index: u32,
-    _p0: u32,
+    /// The bounce distance fed to `query_world_cache` (drives the first-bounce light-leak-prevention clamp).
+    /// Zero for the convergence/energy fill loops (they use the no-jitter LOD0 seed, which ignores it).
+    ray_t: f32,
     _p1: u32,
     _p2: u32,
 }
@@ -498,7 +500,7 @@ fn world_cache_converges_to_single_bounce_irradiance() {
             view_position,
             n_points,
             frame_index: wc.frame_index,
-            _p0: 0,
+            ray_t: 0.0,
             _p1: 0,
             _p2: 0,
         };
@@ -1110,7 +1112,7 @@ fn cached_initial_reservoir_adds_albedo_times_cache() {
             view_position,
             n_points,
             frame_index: wc.frame_index,
-            _p0: 0,
+            ray_t: 0.0,
             _p1: 0,
             _p2: 0,
         };
@@ -1248,5 +1250,523 @@ fn cached_initial_reservoir_adds_albedo_times_cache() {
         "resolved cache-ON irradiance must exceed cache-OFF (the cache adds reflected indirect): on={:.4} off={:.4}",
         luma(out.cache_on_irradiance),
         luma(out.cache_off_irradiance)
+    );
+}
+
+// === Phase 2.2.1 thin-wall LIGHT-LEAK regression gate ==================================================
+//
+// Reproduces, headlessly, the user-reported cache leak (light from UNDER the closed Cornell box bleeding onto
+// interior cube faces) and pins the first-bounce light-leak-prevention clamp that fixes it
+// (`voxel_raytrace.wgsl` `query_world_cache`: `if (ray_t < cell_size) { cell_size = wc.cell_base_size; }`).
+//
+// HOW THE CLAMP WORKS (verified against the ported Solari code): the clamp does NOT shrink the final
+// quantization cell (that is re-derived from the LOD AFTER the jitter, line ~1832, exactly as Solari does) —
+// it shrinks the TANGENT-PLANE JITTER amplitude (`offset = ±0.5·cell_size`, line ~1830). The leak is the jitter
+// stochastically pushing a near-wall query ACROSS a thin wall into the cell on the far side; clamping the cell
+// to the small base size (0.15 m) for a SHORT bounce keeps the jitter sub-wall so it cannot cross. (This is why
+// the leak is "infrequent" — only the fraction of jitter offsets that cross leak.)
+//
+// SCENE (matches that mechanism exactly): viewer at distance == `lod_scale` (15 m) ⇒ `lod_f = log2(1+15/15) =
+// 1` with fract 0 ⇒ a DETERMINISTIC LOD-1 cell of 0.15·2 = 0.3 m (no stochastic round-up). Two UP-FACING (+Y)
+// points under the emissive ceiling (so a +Y cosine bounce reaches it ⇒ a seeded cell fills to R≈12), with the
+// straddle along X (so it lies in the +Y tangent plane the jitter moves in):
+//   * EXTERIOR x=0.45 — in the LOD-1 X-bucket [0.30,0.60); SEEDED + filled bright every frame.
+//   * INTERIOR x=0.70 — in the next bucket [0.60,0.90), 0.10 m above the bucket boundary at x=0.60; NEVER
+//     seeded, so its own cell is empty (0). It is the leak target.
+// Un-jittered the two are in different buckets (no quantization-collapse leak). The jitter (in X) bridges them:
+//   * WITHOUT the clamp: jitter ±0.5·0.3 = ±0.15 m ⇒ the interior query reaches x as low as 0.55 < 0.60 ⇒ a
+//     fraction of samples quantize into the EXTERIOR bucket and read its bright radiance (the LEAK).
+//   * WITH the clamp (short bounce ⇒ cell = 0.15): jitter ±0.5·0.15 = ±0.075 m ⇒ interior x stays ≥ 0.625 >
+//     0.60 ⇒ NO sample crosses ⇒ the interior reads its own empty cell ⇒ ~0.
+// The probe fires the REAL `query_world_cache` (256 jittered samples averaged) via the new
+// `world_cache_leak_probe` entry, so the clamp is exercised exactly as the live ReSTIR path does.
+//
+// ASSERTS: with the clamp, the SHORT-`ray_t` interior read is ≪ the bright exterior cell. MUTATION CHECK (in
+// the verification report): deleting the clamp lets the ±0.15 jitter cross, so the interior read jumps to a
+// meaningful fraction of R and the assert fails.
+
+/// View distance == `WorldCacheUniformData::lod_scale` (15 m) ⇒ `lod_f = log2(1 + 15/15) = 1.0`, fract 0 ⇒ a
+/// DETERMINISTIC LOD-1 cell of `0.15·2^1 = 0.3 m` (the stochastic round-up term `rand < fract³` is 0 at fract
+/// 0). A small jitter perturbs the recomputed distance by ≤0.15 m ⇒ fract ≈ 1e-2 ⇒ round-up prob ≈ 1e-6, so the
+/// cell stays 0.3 m for essentially every sample. This is the regime where the clamp (jitter-amplitude) bites.
+const LEAK_VIEW_DIST: f32 = 15.0;
+
+#[test]
+fn thin_wall_no_exterior_leak_with_clamp() {
+    let Some((device, queue)) = common::headless_ray_query_device_with_storage_buffers(16) else {
+        eprintln!("no ray-query device with 16 storage buffers — skipping thin-wall leak test");
+        return;
+    };
+
+    let mut reg = BlockRegistry::from_biome_library(&test_library());
+    reg.set_emissive(EMITTER, [3.0, 3.0, 3.0]);
+    let patch = emitter_patch(&reg);
+    let n = patch.brick_count() as u32;
+
+    // Same single-light setup as the convergence test: sun off, ambient 0, dark sky ⇒ the emissive ceiling is
+    // the ONLY light, so a filled up-facing cell holds R = emissive·strength = 12.
+    let light = LightingUniformData {
+        sun_direction: [0.0, 1.0, 0.0],
+        ambient_color: [0.0, 0.0, 0.0],
+        gi_rays: 1,
+        gi_intensity: 1.0,
+        gi_bounce_dist: 40.0,
+        emissive_strength: 4.0,
+        ..LightingUniformData::default()
+    };
+    let sky = SkyUniformData {
+        horizon_color: [0.0, 0.0, 0.0],
+        zenith_color: [0.0, 0.0, 0.0],
+        ground_color: [0.0, 0.0, 0.0],
+        sun_size: 0.0,
+        intensity: 0.0,
+        gi_sky_intensity: 0.0,
+        sun_tint: [0.0, 0.0, 0.0],
+        _pad: 0.0,
+    };
+    // PRODUCTION base cell (0.15 m): the clamp target. The leak depends on the LOD cell exceeding the wall, so
+    // we keep the real base size and force a large LOD via the far viewer instead.
+    let wc_defaults = WorldCacheUniformData {
+        cell_base_size: 0.15,
+        lod_scale: 15.0,
+        gi_ray_distance: 40.0,
+        cell_lifetime: 8,
+        ..WorldCacheUniformData::default()
+    };
+
+    let cz = BRICK_WORLD_SIZE * 0.5;
+    // Both points sit in the open gap below the emissive ceiling (gap y∈[1.6,3.2]), UP-FACING, at the same y so
+    // a +Y cosine bounce reaches the ceiling and a seeded cell fills to R≈12. The straddle is along X (in the
+    // +Y tangent plane the jitter perturbs). The LOD-1 cell is 0.3 m with X-bucket boundaries at multiples of
+    // 0.3; the boundary at x=0.60 separates the two points.
+    let y_pt = 2.0;
+    let x_ext = 0.45; // bucket [0.30,0.60) — seeded + filled bright
+    let x_int = 0.70; // bucket [0.60,0.90), 0.10 m above the x=0.60 boundary — never seeded (the leak target)
+    // The viewer is directly above (distance == LEAK_VIEW_DIST regardless of the small X offset), pinning LOD 1.
+    let view_position = [(x_ext + x_int) * 0.5, y_pt + LEAK_VIEW_DIST, cz];
+    let exterior = WcQueryPoint {
+        world_position: [x_ext, y_pt, cz],
+        _p0: 0,
+        world_normal: [0.0, 1.0, 0.0],
+        _p1: 0,
+    };
+    let interior = WcQueryPoint {
+        world_position: [x_int, y_pt, cz],
+        _p0: 0,
+        world_normal: [0.0, 1.0, 0.0],
+        _p1: 0,
+    };
+    // index 0 = exterior (seeded/filled bright every frame), index 1 = interior (never seeded; the leak target).
+    let probes = [exterior, interior];
+    let n_points = probes.len() as u32;
+
+    // --- Scene (group 0) ---
+    let aabb_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("lk_aabbs"),
+        contents: bytemuck::cast_slice(&patch.aabbs),
+        usage: wgpu::BufferUsages::BLAS_INPUT | wgpu::BufferUsages::STORAGE,
+    });
+    let meta_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("lk_metas"),
+        contents: bytemuck::cast_slice(&patch.metas),
+        usage: wgpu::BufferUsages::STORAGE,
+    });
+    let voxel_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("lk_voxels"),
+        contents: bytemuck::cast_slice(&patch.voxels),
+        usage: wgpu::BufferUsages::STORAGE,
+    });
+    let palette_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("lk_palette"),
+        contents: bytemuck::cast_slice(&patch.palette),
+        usage: wgpu::BufferUsages::STORAGE,
+    });
+
+    let size_desc = wgpu::BlasAABBGeometrySizeDescriptor {
+        primitive_count: n,
+        flags: wgpu::AccelerationStructureGeometryFlags::OPAQUE,
+    };
+    let blas = device.create_blas(
+        &wgpu::CreateBlasDescriptor {
+            label: Some("lk_blas"),
+            flags: wgpu::AccelerationStructureFlags::PREFER_FAST_TRACE,
+            update_mode: wgpu::AccelerationStructureUpdateMode::Build,
+        },
+        wgpu::BlasGeometrySizeDescriptors::AABBs { descriptors: vec![size_desc.clone()] },
+    );
+    let mut tlas = device.create_tlas(&wgpu::CreateTlasDescriptor {
+        label: Some("lk_tlas"),
+        flags: wgpu::AccelerationStructureFlags::PREFER_FAST_TRACE,
+        update_mode: wgpu::AccelerationStructureUpdateMode::Build,
+        max_instances: 1,
+    });
+    tlas[0] = Some(wgpu::TlasInstance::new(
+        &blas,
+        [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0],
+        0,
+        0xff,
+    ));
+
+    // --- Persistent cache buffers (zero ⇒ all cells empty) ---
+    let tsz = TEST_WORLD_CACHE_SIZE as u64;
+    let zeroed = |label: &str, bytes: u64, indirect: bool| {
+        let mut usage = wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST;
+        if indirect {
+            usage |= wgpu::BufferUsages::INDIRECT;
+        }
+        let buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some(label),
+            size: bytes,
+            usage,
+            mapped_at_creation: false,
+        });
+        queue.write_buffer(&buf, 0, &vec![0u8; bytes as usize]);
+        buf
+    };
+    let checksums = zeroed("lk_checksums", tsz * 4, false);
+    let life = zeroed("lk_life", tsz * 4, false);
+    let radiance = zeroed("lk_radiance", tsz * 16, false);
+    let geometry = zeroed("lk_geometry", tsz * 32, false);
+    let luminance_deltas = zeroed("lk_luminance_deltas", tsz * 4, false);
+    let new_radiance = zeroed("lk_new_radiance", tsz * 16, false);
+    let a = zeroed("lk_a", tsz * 4, false);
+    let b = zeroed("lk_b", 1024 * 4, false);
+    let active_cell_indices = zeroed("lk_active_cell_indices", tsz * 4, false);
+    let active_cells_count = zeroed("lk_active_cells_count", 4, false);
+    let active_cells_dispatch = zeroed("lk_active_cells_dispatch", 12, true);
+
+    // --- Uniforms + test buffers ---
+    let wc_uniform = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("lk_wc_uniform"),
+        size: mem::size_of::<WorldCacheUniformData>() as u64,
+        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    let light_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("lk_light"),
+        contents: bytemuck::bytes_of(&light),
+        usage: wgpu::BufferUsages::UNIFORM,
+    });
+    let sky_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("lk_sky"),
+        contents: bytemuck::bytes_of(&sky),
+        usage: wgpu::BufferUsages::UNIFORM,
+    });
+    let query_points_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("lk_query_points"),
+        contents: bytemuck::cast_slice(&probes),
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST, // rewritten per read in `read_one`
+    });
+    let query_out_buf = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("lk_query_out"),
+        size: (n_points as u64) * mem::size_of::<WcQueryOut>() as u64,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        mapped_at_creation: false,
+    });
+    let query_params_buf = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("lk_query_params"),
+        size: mem::size_of::<WcQueryParams>() as u64,
+        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    let read_buf = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("lk_read"),
+        size: (n_points as u64) * mem::size_of::<WcQueryOut>() as u64,
+        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+
+    // --- Layouts (identical to the convergence test) ---
+    let storage_rw = |binding: u32| wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::COMPUTE,
+        ty: wgpu::BindingType::Buffer {
+            ty: wgpu::BufferBindingType::Storage { read_only: false },
+            has_dynamic_offset: false,
+            min_binding_size: None,
+        },
+        count: None,
+    };
+    let storage_ro = |binding: u32| wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::COMPUTE,
+        ty: wgpu::BindingType::Buffer {
+            ty: wgpu::BufferBindingType::Storage { read_only: true },
+            has_dynamic_offset: false,
+            min_binding_size: None,
+        },
+        count: None,
+    };
+    let uniform = |binding: u32| wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::COMPUTE,
+        ty: wgpu::BindingType::Buffer {
+            ty: wgpu::BufferBindingType::Uniform,
+            has_dynamic_offset: false,
+            min_binding_size: None,
+        },
+        count: None,
+    };
+
+    let scene_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("lk_scene_layout"),
+        entries: &[
+            wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::AccelerationStructure { vertex_return: false },
+                count: None,
+            },
+            storage_ro(1),
+            storage_ro(2),
+            storage_ro(3),
+        ],
+    });
+    let view_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("lk_view_layout"),
+        entries: &[uniform(2), uniform(11)],
+    });
+    let dispatch_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("lk_dispatch_layout"),
+        entries: &[storage_rw(0)],
+    });
+    let cache_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("lk_cache_layout"),
+        entries: &[
+            uniform(0),
+            storage_rw(1),
+            storage_rw(2),
+            storage_rw(3),
+            storage_rw(4),
+            storage_rw(5),
+            storage_rw(6),
+            storage_rw(7),
+            storage_rw(8),
+            storage_rw(9),
+            storage_rw(10),
+            storage_ro(12),
+            storage_rw(13),
+            uniform(14),
+        ],
+    });
+    let compact_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("lk_compact_pl"),
+        bind_group_layouts: &[Some(&scene_layout), Some(&view_layout), Some(&dispatch_layout), Some(&cache_layout)],
+        immediate_size: 0,
+    });
+    let update_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("lk_update_pl"),
+        bind_group_layouts: &[Some(&scene_layout), Some(&view_layout), None, Some(&cache_layout)],
+        immediate_size: 0,
+    });
+
+    let src = adventure::voxel::raytrace::voxel_raytrace_shader_src(TEST_WORLD_CACHE_SIZE);
+    let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("voxel_raytrace"),
+        source: wgpu::ShaderSource::Wgsl(src.into()),
+    });
+    let mk = |entry: &str, layout: &wgpu::PipelineLayout| {
+        device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some(entry),
+            layout: Some(layout),
+            module: &module,
+            entry_point: Some(entry),
+            compilation_options: Default::default(),
+            cache: None,
+        })
+    };
+    let p_seed = mk("world_cache_query_seed", &compact_pl);
+    let p_decay = mk("world_cache_decay", &compact_pl);
+    let p_csb = mk("world_cache_compact_single_block", &compact_pl);
+    let p_cb = mk("world_cache_compact_blocks", &compact_pl);
+    let p_cwa = mk("world_cache_compact_write_active", &compact_pl);
+    let p_update = mk("world_cache_update", &update_pl);
+    let p_blend = mk("world_cache_blend", &update_pl);
+    let p_leak = mk("world_cache_leak_probe", &update_pl);
+
+    // --- Bind groups ---
+    let scene_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("lk_scene_bg"),
+        layout: &scene_layout,
+        entries: &[
+            wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::AccelerationStructure(&tlas) },
+            wgpu::BindGroupEntry { binding: 1, resource: meta_buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 2, resource: voxel_buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 3, resource: palette_buf.as_entire_binding() },
+        ],
+    });
+    let view_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("lk_view_bg"),
+        layout: &view_layout,
+        entries: &[
+            wgpu::BindGroupEntry { binding: 2, resource: light_buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 11, resource: sky_buf.as_entire_binding() },
+        ],
+    });
+    let dispatch_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("lk_dispatch_bg"),
+        layout: &dispatch_layout,
+        entries: &[wgpu::BindGroupEntry { binding: 0, resource: active_cells_dispatch.as_entire_binding() }],
+    });
+    let cache_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("lk_cache_bg"),
+        layout: &cache_layout,
+        entries: &[
+            wgpu::BindGroupEntry { binding: 0, resource: wc_uniform.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 1, resource: checksums.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 2, resource: life.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 3, resource: radiance.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 4, resource: geometry.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 5, resource: luminance_deltas.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 6, resource: new_radiance.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 7, resource: a.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 8, resource: b.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 9, resource: active_cell_indices.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 10, resource: active_cells_count.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 12, resource: query_points_buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 13, resource: query_out_buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 14, resource: query_params_buf.as_entire_binding() },
+        ],
+    });
+
+    let mut build = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("lk_build") });
+    build.build_acceleration_structures(
+        iter::once(&wgpu::BlasBuildEntry {
+            blas: &blas,
+            geometry: wgpu::BlasGeometries::AabbGeometries(vec![wgpu::BlasAabbGeometry {
+                size: &size_desc,
+                stride: mem::size_of::<adventure::voxel::gpu::GpuBrickAabb>() as wgpu::BufferAddress,
+                aabb_buffer: &aabb_buf,
+                primitive_offset: 0,
+            }]),
+        }),
+        iter::once(&tlas),
+    );
+    queue.submit(Some(build.finish()));
+
+    let table_groups = TEST_WORLD_CACHE_SIZE / 1024;
+
+    // FILL: each frame, leak-probe ONLY the EXTERIOR point (`n_points = 1`) with a LARGE `ray_t` (no clamp ⇒
+    // the large LOD cell) so its lazy-insert + alive-mark land on the LARGE-cell key; the six fill passes then
+    // bounce it up to the emissive ceiling and accumulate R≈12 into that exterior cell. The interior cell is
+    // NEVER touched here — its only path to non-zero radiance is the (clamp-defeated) straddle, which is the leak.
+    let fill_params = |frame: u32| WcQueryParams {
+        view_position,
+        n_points: 1, // exterior only
+        frame_index: frame.wrapping_mul(5782582).wrapping_add(1),
+        ray_t: 1.0e4, // huge ⇒ ray_t >= cell_size ⇒ NO clamp ⇒ fills the LARGE cell
+        _p1: 0,
+        _p2: 0,
+    };
+    for frame in 0..N_FRAMES {
+        let mut wc = wc_defaults;
+        wc.frame_index = frame.wrapping_mul(5782582).wrapping_add(1);
+        wc.reset = u32::from(frame == 0);
+        queue.write_buffer(&wc_uniform, 0, bytemuck::bytes_of(&wc));
+        queue.write_buffer(&query_params_buf, 0, bytemuck::bytes_of(&fill_params(frame)));
+
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        {
+            let mut cpass =
+                encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: None, timestamp_writes: None });
+            cpass.set_bind_group(0, Some(&scene_bg), &[]);
+            cpass.set_bind_group(1, Some(&view_bg), &[]);
+            cpass.set_bind_group(3, Some(&cache_bg), &[]);
+            // Leak-probe the exterior point (group 2 unbound = update_pl) — lazy-inserts the LARGE-cell key.
+            cpass.set_pipeline(&p_leak);
+            cpass.dispatch_workgroups(1, 1, 1);
+            // Then the six fill passes (group 2 bound for decay/compaction).
+            cpass.set_bind_group(2, Some(&dispatch_bg), &[]);
+            cpass.set_pipeline(&p_seed); // no-op here (n_points stays 1 = the exterior; harmless re-mark)
+            cpass.dispatch_workgroups(1, 1, 1);
+            cpass.set_pipeline(&p_decay);
+            cpass.dispatch_workgroups(table_groups, 1, 1);
+            cpass.set_pipeline(&p_csb);
+            cpass.dispatch_workgroups(table_groups, 1, 1);
+            cpass.set_pipeline(&p_cb);
+            cpass.dispatch_workgroups(1, 1, 1);
+            cpass.set_pipeline(&p_cwa);
+            cpass.dispatch_workgroups(table_groups, 1, 1);
+            cpass.set_bind_group(2, None, &[]);
+            cpass.set_pipeline(&p_update);
+            cpass.dispatch_workgroups_indirect(&active_cells_dispatch, 0);
+            cpass.set_pipeline(&p_blend);
+            cpass.dispatch_workgroups_indirect(&active_cells_dispatch, 0);
+        }
+        queue.submit(Some(encoder.finish()));
+    }
+
+    // MEASURE: two final leak-probe reads on the filled cache (no fill passes — pure reads):
+    //   * EXTERIOR with a LARGE ray_t (no clamp, large cell) — anchors that the exterior cell IS bright (so a
+    //     "both zero" pass can't sneak through).
+    //   * INTERIOR with a SHORT ray_t (clamp ARMED) — the leak target; must stay ~0.
+    let read_one = |point_index: u32, ray_t: f32| -> [f32; 3] {
+        let mut wc = wc_defaults;
+        wc.frame_index = 0x1234567;
+        wc.reset = 0;
+        queue.write_buffer(&wc_uniform, 0, bytemuck::bytes_of(&wc));
+        // Point the probe at a single chosen query point by writing it alone to slot 0 + n_points = 1.
+        let pt = probes[point_index as usize];
+        queue.write_buffer(&query_points_buf, 0, bytemuck::bytes_of(&pt));
+        let qp = WcQueryParams {
+            view_position,
+            n_points: 1,
+            frame_index: 0x1234567,
+            ray_t,
+            _p1: 0,
+            _p2: 0,
+        };
+        queue.write_buffer(&query_params_buf, 0, bytemuck::bytes_of(&qp));
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        {
+            let mut cpass =
+                encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: None, timestamp_writes: None });
+            cpass.set_bind_group(0, Some(&scene_bg), &[]);
+            cpass.set_bind_group(1, Some(&view_bg), &[]);
+            cpass.set_bind_group(3, Some(&cache_bg), &[]);
+            cpass.set_pipeline(&p_leak);
+            cpass.dispatch_workgroups(1, 1, 1);
+        }
+        encoder.copy_buffer_to_buffer(&query_out_buf, 0, &read_buf, 0, mem::size_of::<WcQueryOut>() as u64);
+        queue.submit(Some(encoder.finish()));
+        let slice = read_buf.slice(..);
+        slice.map_async(wgpu::MapMode::Read, |r| r.expect("map failed"));
+        device.poll(wgpu::PollType::wait_indefinitely()).expect("poll failed");
+        let data = slice.get_mapped_range().unwrap();
+        let out: WcQueryOut = *bytemuck::from_bytes(&data[..mem::size_of::<WcQueryOut>()]);
+        drop(data);
+        read_buf.unmap();
+        out.radiance
+    };
+
+    // The SHORT ray_t (a cube-face→adjacent-floor bounce, ~one voxel) — strictly below the 0.3 m LOD-1 cell so
+    // `ray_t < cell_size` fires the clamp; comfortably below the sub-0.4 m wall the production guard targets.
+    let short_ray_t = 0.2_f32;
+    let exterior_rad = luma(read_one(0, 1.0e4)); // large ray_t ⇒ reads the bright LARGE-cell exterior value
+    let interior_rad = luma(read_one(1, short_ray_t)); // short ray_t ⇒ clamp ⇒ small cell ⇒ no straddle ⇒ ~0
+    let _ = (&aabb_buf, &blas, &tlas);
+
+    eprintln!(
+        "[leak] exterior cell luma={exterior_rad:.3} (analytic R≈{CEILING_RADIANCE:.1}) | interior (short ray_t, \
+         clamp ARMED) luma={interior_rad:.4} | leak ratio={:.4}",
+        interior_rad / exterior_rad.max(1e-6)
+    );
+
+    // Anchor: the exterior cell actually filled bright (else a both-zero pass would be meaningless).
+    assert!(
+        exterior_rad > 0.5 * CEILING_RADIANCE,
+        "the EXTERIOR cache cell must have filled bright (≈R={CEILING_RADIANCE}); got {exterior_rad:.3} — fill failed, \
+         the leak assertion below would be vacuous"
+    );
+
+    // THE LEAK GATE: with the clamp armed, the SHORT-ray_t interior query maps to its OWN (empty) base cell and
+    // does NOT collapse onto the bright exterior cell ⇒ ~0. MUTATION CHECK: deleting
+    // `if (ray_t < cell_size) { cell_size = wc.cell_base_size; }` makes the short-ray_t interior query use the
+    // LARGE cell, collapse onto the exterior cell, and read ≈ R — this assert then FAILS (interior ≈ exterior).
+    assert!(
+        interior_rad < 0.1 * exterior_rad,
+        "thin-wall LEAK: the interior receiver (short ray_t={short_ray_t}) must NOT pick up the exterior cell's \
+         radiance with the leak-prevention clamp armed — interior luma {interior_rad:.4} vs exterior {exterior_rad:.3} \
+         (the clamp `if (ray_t < cell_size) {{ cell_size = wc.cell_base_size; }}` was likely removed)"
     );
 }
