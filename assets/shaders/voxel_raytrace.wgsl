@@ -1104,3 +1104,169 @@ fn restir_probe(@builtin(global_invocation_id) gid: vec3<u32>) {
     // Per-FRAME slot so the harness reads the whole convergence history back in one map.
     probe_out[probe_params.frame_index * probe_params.n_probes + i] = out;
 }
+
+// ====================================================================================================
+// R1 — LIVE screen-space ReSTIR GI (single-pass, same-pixel temporal reuse).
+//
+// Each pixel keeps a per-pixel reservoir. This pass: traces the primary ray, generates ONE initial GI
+// candidate, merges the PREVIOUS frame's SAME-pixel reservoir (temporal reuse), writes the merged reservoir
+// to the current buffer, and resolves it to the indirect irradiance — replacing `gather_gi`'s per-frame mean.
+// For a STILL camera the previous-frame pixel is the same world surface, so same-pixel reuse is exact and the
+// estimate converges (the boil collapses). On camera motion the renderer raises `reset` (like the temporal
+// accumulator), so reservoirs are dropped that frame — no reprojection yet (motion-vector reprojection +
+// spatial reuse are R2). Two reservoir storage buffers ping-pong (cur written, prev read) — no G-buffer
+// textures, so no storage-texture-limit pressure.
+struct RestirParams { reset: u32, frame_index: u32, viewport_x: u32, viewport_y: u32 };
+@group(2) @binding(0) var<storage, read_write> reservoirs_cur: array<Reservoir>;
+@group(2) @binding(1) var<storage, read_write> reservoirs_prev: array<Reservoir>;
+@group(2) @binding(2) var<uniform> restir_params: RestirParams;
+
+// Reservoir-based indirect irradiance at pixel `idx` for surface (n, p): generate an initial candidate, merge
+// the previous frame's reservoir for this pixel (unless reset), store the merged reservoir, and resolve it.
+// Writes `reservoirs_cur[idx]` for the caller's pixel. Returns the indirect irradiance (× albedo by caller).
+fn restir_gi(n: vec3<f32>, p: vec3<f32>, idx: u32, seed: u32) -> vec3<f32> {
+    if (light.gi_rays == 0u || light.gi_intensity <= 0.0) {
+        reservoirs_cur[idx] = empty_reservoir();
+        return vec3<f32>(0.0);
+    }
+    var rng = seed;
+    var res = generate_initial_reservoir(p, n, &rng);
+    if (restir_params.reset == 0u) {
+        var temporal = reservoirs_prev[idx];
+        temporal.confidence_weight = min(temporal.confidence_weight, RESTIR_CONFIDENCE_CAP);
+        let brdf = vec3<f32>(1.0); // receiver albedo factored out (applied by the caller)
+        let merged = merge_reservoirs(res, p, n, brdf, temporal, p, n, brdf, &rng);
+        res = merged.merged_reservoir;
+    }
+    reservoirs_cur[idx] = res;
+    return restir_resolve_irradiance(res, p, n);
+}
+
+// Like `shade`, but the indirect term comes from the per-pixel reservoir (ReSTIR) instead of `gather_gi`.
+fn shade_restir(albedo: vec3<f32>, n: vec3<f32>, p: vec3<f32>, emissive: vec3<f32>, idx: u32, seed: u32) -> vec3<f32> {
+    let origin = p + n * light.shadow_bias;
+    let to_sun = -light.sun_direction;
+    let ndotl = max(dot(n, to_sun), 0.0);
+    var shadow = 1.0;
+    if (ndotl > 0.0) {
+        if (trace_occluded(origin, to_sun, 0.0, 1.0e4)) {
+            shadow = 0.0;
+        }
+    }
+    let ao = ambient_occlusion(origin, n);
+    let ambient = light.ambient_color * ao;
+    let direct = light.sun_color * (light.sun_intensity * ndotl * shadow);
+    let indirect = restir_gi(n, p, idx, seed) * albedo;
+    let glow = emissive * light.emissive_strength;
+    return albedo * (ambient + direct) + indirect + glow;
+}
+
+// The ReSTIR variant of `raymarch` (non-DLSS path). Identical primary-ray + debug + temporal-accumulation
+// structure, but the lit colour uses `shade_restir` (reservoir GI). The on-top history accumulation further
+// smooths the (already low-variance) ReSTIR output.
+@compute @workgroup_size(8, 8, 1)
+fn raymarch_restir(@builtin(global_invocation_id) gid: vec3<u32>) {
+    if (gid.x >= camera.viewport.x || gid.y >= camera.viewport.y) { return; }
+    let idx = gid.y * camera.viewport.x + gid.x;
+    reservoirs_cur[idx] = empty_reservoir(); // default for misses / debug; overwritten for lit hits
+
+    let uv = (vec2<f32>(f32(gid.x), f32(gid.y)) + 0.5) / vec2<f32>(camera.viewport);
+    let ndc = vec2<f32>(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0);
+    let near = camera.world_from_clip * vec4<f32>(ndc, 1.0, 1.0);
+    let world_near = near.xyz / near.w;
+    let ro = camera.cam_pos;
+    let rd = normalize(world_near - ro);
+
+    let r = trace(ro, rd, 0.0, camera.t_max);
+
+    if (light.debug_view != 0u) {
+        let dpx = vec2<i32>(i32(gid.x), i32(gid.y));
+        var dbg = vec3<f32>(0.0);
+        if (r.hit != 0u) {
+            let p = ro + rd * r.t;
+            let origin = p + r.normal * light.shadow_bias;
+            if (light.debug_view == 1u) {
+                dbg = r.normal * 0.5 + 0.5;
+            } else if (light.debug_view == 2u) {
+                dbg = vec3<f32>(clamp(r.t / 20.0, 0.0, 1.0));
+            } else if (light.debug_view == 3u) {
+                dbg = r.color.rgb;
+            } else if (light.debug_view == 4u) {
+                dbg = vec3<f32>(ambient_occlusion(origin, r.normal));
+            } else if (light.debug_view == 5u) {
+                let seed = (gid.x * 1973u + gid.y * 9277u + light.frame_index * 26699u) | 1u;
+                dbg = restir_gi(r.normal, p, idx, seed); // GI-only debug shows the reservoir estimate
+            } else if (light.debug_view == 6u) {
+                dbg = select(vec3<f32>(0.0, 1.0, 0.0), vec3<f32>(1.0, 0.0, 0.0), dot(r.normal, rd) > 0.0);
+            } else {
+                dbg = r.color.rgb;
+            }
+        }
+        textureStore(out_tex, dpx, vec4<f32>(dbg, 1.0));
+        return;
+    }
+
+    var color: vec4<f32>;
+    if (r.hit != 0u) {
+        let p = ro + rd * r.t;
+        let seed = (gid.x * 1973u + gid.y * 9277u + light.frame_index * 26699u) | 1u;
+        let lit = shade_restir(r.color.rgb, r.normal, p, r.emissive, idx, seed);
+        color = vec4<f32>(lit, 1.0);
+    } else {
+        let up = clamp(rd.y * 0.5 + 0.5, 0.0, 1.0);
+        let horizon = vec3<f32>(0.55, 0.65, 0.78);
+        let zenith = vec3<f32>(0.12, 0.22, 0.45);
+        color = vec4<f32>(mix(horizon, zenith, up), 1.0);
+    }
+
+    let prev = textureSampleLevel(history_tex, history_sampler, uv, 0.0).rgb;
+    let w = clamp(camera.accum_weight, 0.0, 1.0);
+    let accumulated = mix(prev, color.rgb, w);
+    textureStore(out_tex, vec2<i32>(i32(gid.x), i32(gid.y)), vec4<f32>(accumulated, color.a));
+}
+
+// The ReSTIR variant of `raymarch_dlss`. Same guide-writing contract; the lit colour uses `shade_restir`, so
+// DLSS-RR is fed a LOW-VARIANCE indirect term (the reservoir already integrated many frames) — RR then only
+// has to clean a near-converged signal, which is what fixes the residual boiling under DLSS.
+@compute @workgroup_size(8, 8, 1)
+fn raymarch_dlss_restir(@builtin(global_invocation_id) gid: vec3<u32>) {
+    if (gid.x >= camera.viewport.x || gid.y >= camera.viewport.y) { return; }
+    let idx = gid.y * camera.viewport.x + gid.x;
+    reservoirs_cur[idx] = empty_reservoir();
+    let px = vec2<i32>(i32(gid.x), i32(gid.y));
+    let uv = (vec2<f32>(f32(gid.x), f32(gid.y)) + 0.5) / vec2<f32>(camera.viewport);
+    let ndc = vec2<f32>(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0);
+    let near = camera.world_from_clip * vec4<f32>(ndc, 1.0, 1.0);
+    let world_near = near.xyz / near.w;
+    let ro = camera.cam_pos;
+    let rd = normalize(world_near - ro);
+
+    let r = trace(ro, rd, 0.0, camera.t_max);
+    if (r.hit != 0u) {
+        let p = ro + rd * r.t;
+        let seed = (gid.x * 1973u + gid.y * 9277u + light.frame_index * 26699u) | 1u;
+        let lit = shade_restir(r.color.rgb, r.normal, p, r.emissive, idx, seed);
+        textureStore(out_tex, px, vec4<f32>(lit, 1.0));
+        textureStore(out_diffuse_albedo, px, vec4<f32>(r.color.rgb, 1.0));
+        textureStore(out_specular_albedo, px, vec4<f32>(vec3<f32>(0.04), 1.0));
+        textureStore(out_normal_roughness, px, vec4<f32>(r.normal, 1.0));
+        let clip = dlss_cam.clip_from_world * vec4<f32>(p, 1.0);
+        let depth = clip.z / clip.w;
+        textureStore(out_dlss_depth, px, vec4<f32>(depth, 0.0, 0.0, 0.0));
+        let prev_clip = dlss_cam.prev_clip_from_world * vec4<f32>(p, 1.0);
+        let prev_ndc = prev_clip.xy / prev_clip.w;
+        let cur_ndc = clip.xy / clip.w;
+        let motion = (prev_ndc - cur_ndc) * vec2<f32>(0.5, -0.5);
+        textureStore(out_dlss_motion, px, vec4<f32>(motion, 0.0, 0.0));
+    } else {
+        let up = clamp(rd.y * 0.5 + 0.5, 0.0, 1.0);
+        let horizon = vec3<f32>(0.55, 0.65, 0.78);
+        let zenith = vec3<f32>(0.12, 0.22, 0.45);
+        textureStore(out_tex, px, vec4<f32>(mix(horizon, zenith, up), 1.0));
+        textureStore(out_diffuse_albedo, px, vec4<f32>(1.0, 1.0, 1.0, 1.0));
+        textureStore(out_specular_albedo, px, vec4<f32>(vec3<f32>(0.0), 1.0));
+        textureStore(out_normal_roughness, px, vec4<f32>(0.0, 0.0, 0.0, 1.0));
+        textureStore(out_dlss_depth, px, vec4<f32>(0.0, 0.0, 0.0, 0.0));
+        textureStore(out_dlss_motion, px, vec4<f32>(0.0, 0.0, 0.0, 0.0));
+    }
+}

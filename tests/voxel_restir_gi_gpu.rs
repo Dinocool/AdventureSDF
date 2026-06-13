@@ -474,3 +474,32 @@ fn restir_probe_is_valid_unbiased_and_concentrates() {
         "the ceiling-facing probe must gather more light than the sideways probe: {temporal_restir:.3} vs {far_restir:.3}"
     );
 }
+
+/// R1 compile gate: the live screen-space ReSTIR entry points (`raymarch_restir` + the DLSS variant) must
+/// compile on the real device. The lib build never compiles the WGSL (it's loaded at runtime), and the
+/// estimator test above only exercises `restir_probe` — so without this, a syntax/binding error in the
+/// screen-space entries would only surface at launch. Creating the pipelines (auto layout) forces naga to
+/// compile both entries + validate their bindings. Needs an 8-storage-texture device (the DLSS variant writes
+/// colour + 5 guides).
+#[test]
+fn restir_screen_space_entries_compile() {
+    let Some((device, _queue)) = common::headless_ray_query_device_with_storage_textures(8) else {
+        eprintln!("no ray-query device with 8 storage textures — skipping restir_screen_space_entries_compile");
+        return;
+    };
+    let src = std::fs::read_to_string("assets/shaders/voxel_raytrace.wgsl").expect("read shader");
+    let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("voxel_raytrace"),
+        source: wgpu::ShaderSource::Wgsl(src.into()),
+    });
+    for entry in ["raymarch_restir", "raymarch_dlss_restir"] {
+        let _pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some(entry),
+            layout: None, // auto layout from reflection — validates the entry + its bindings compile
+            module: &module,
+            entry_point: Some(entry),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+    }
+}
