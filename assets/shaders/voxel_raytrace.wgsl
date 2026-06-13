@@ -264,6 +264,15 @@ fn brick_hit_at(prim: u32, ro: vec3<f32>, rd: vec3<f32>) -> vec4<f32> {
 fn trace(ro: vec3<f32>, rd: vec3<f32>, t_min: f32, t_max: f32) -> TraceResult {
     var rq: ray_query;
     rayQueryInitialize(&rq, acc, RayDesc(0u, 0xFFu, t_min, t_max, ro, rd));
+    // Track the nearest VOXEL hit OURSELVES across the candidate bricks, rather than trusting the ray
+    // query's committed intersection. On the wgpu-trunk fork, `rayQueryGetCommittedIntersection().t` for a
+    // procedural-AABB hit is the AABB-ENTRY distance, not the per-voxel `t` we pass to
+    // `rayQueryGenerateIntersection` — so a brick the ray enters early but only hits solid DEEP inside would
+    // win at a too-near depth, painting its face THROUGH nearer geometry (the "show-through" bug; the
+    // logic-equivalent CPU oracle in tests/voxel_show_through.rs has zero such hits). We still call
+    // `generateIntersection` so the ray query culls far candidates, but the committed t/prim are NOT used.
+    var best_t: f32 = t_max * 2.0;
+    var best_prim: u32 = 0xffffffffu;
     loop {
         if (!rayQueryProceed(&rq)) { break; }
         let c = rayQueryGetCandidateIntersection(&rq);
@@ -284,25 +293,29 @@ fn trace(ro: vec3<f32>, rd: vec3<f32>, t_min: f32, t_max: f32) -> TraceResult {
             if (t_enter <= t_exit && t_exit >= t_min) {
                 let bh = dda_brick(c.primitive_index, ro, rd, t_enter, t_exit);
                 if (dh_found(bh)) {
-                    rayQueryGenerateIntersection(&rq, dh_t(bh));
+                    let ht = dh_t(bh);
+                    if (ht < best_t) {
+                        best_t = ht;
+                        best_prim = c.primitive_index;
+                    }
+                    rayQueryGenerateIntersection(&rq, ht);
                 }
             }
         }
     }
     var r: TraceResult;
-    let committed = rayQueryGetCommittedIntersection(&rq);
-    let has_hit = committed.kind != RAY_QUERY_INTERSECTION_NONE;
+    let has_hit = best_prim != 0xffffffffu;
     // Re-walk the winning brick ONCE to recover the first-solid cell's id AND its entry-face normal from the
-    // SAME DDA that committed the candidate — so the colour and the shading normal are always the committed
-    // cell's (no boundary drift / sideways-normal seam). Called with a safe index on a miss; gated by `has_hit`.
-    let prim = select(0u, committed.primitive_index, has_hit);
+    // SAME DDA — so the colour and the shading normal are always the committed cell's (no boundary drift /
+    // sideways-normal seam). Called with a safe index on a miss; gated by `has_hit`.
+    let prim = select(0u, best_prim, has_hit);
     let bh = brick_hit_at(prim, ro, rd);
     let id = select(0u, dh_block(bh), has_hit);
     if (has_hit) {
         r.hit = select(0u, 1u, id != 0u);
         r.block_id = id;
-        r.prim = committed.primitive_index;
-        r.t = committed.t;
+        r.prim = best_prim;
+        r.t = best_t;
         r.color = palette[id].rgba;
         r.emissive = palette[id].emissive.xyz;
         r.normal = dh_normal(bh, rd);
