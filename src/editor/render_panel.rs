@@ -106,13 +106,14 @@ pub fn render_gi_panel(world: &mut World, ui: &mut egui::Ui) {
             ui.checkbox(&mut s.restir, "ReSTIR GI (off = legacy gather_gi)");
             let on = s.restir;
             ui.add_enabled_ui(on, |ui| {
-                ui.add(egui::Slider::new(&mut s.spatial_samples, 0..=8).text("spatial samples"));
+                ui.add(egui::Slider::new(&mut s.spatial_samples, 0..=8).text("spatial search taps"));
                 ui.add(egui::Slider::new(&mut s.spatial_radius, 1.0..=48.0).text("spatial radius (px)"));
                 ui.add(egui::Slider::new(&mut s.confidence_cap, 1.0..=32.0).text("history cap (frames)"));
             });
             ui.label(
                 egui::RichText::new(
-                    "spatial samples smooth shadows; history cap trades lag vs stability (reset with camera moves)",
+                    "search taps = disk samples tried to find ONE valid neighbour/frame (not accumulated); \
+                     history cap trades lag vs stability",
                 )
                 .weak()
                 .size(11.0),

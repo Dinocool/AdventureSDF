@@ -1159,7 +1159,8 @@ struct RestirParamsData {
 pub struct RestirSettings {
     /// `true` = ReSTIR GI (default), `false` = legacy `gather_gi` (for A/B comparison).
     pub restir: bool,
-    /// Spatial-neighbour samples merged per pixel (0 = temporal-only). Smooths shadows.
+    /// Spatial reuse SEARCH budget: disk taps tried per pixel to find ONE valid neighbour to merge (0 =
+    /// temporal-only). NOT an accumulation count — one neighbour is merged per frame (variance-stable).
     pub spatial_samples: u32,
     /// Spatial-neighbour disk radius in pixels.
     pub spatial_radius: f32,

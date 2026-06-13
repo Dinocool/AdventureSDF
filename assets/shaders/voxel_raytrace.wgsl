@@ -1225,9 +1225,13 @@ fn restir_gi(n: vec3<f32>, p: vec3<f32>, pix: vec2<u32>, temporal_base: vec2<i32
             res = merged.merged_reservoir;
         }
 
-        // SPATIAL reuse: merge a few disk-sampled neighbours from last frame's reservoirs. A shadowed pixel
-        // borrows its (better-converged) neighbours' estimates → the dark-region noise floor collapses far
-        // faster than the temporal permute alone. Surface-dissimilarity + the merge Jacobian keep it on-surface.
+        // SPATIAL reuse: merge exactly ONE valid neighbour per frame (Solari `load_spatial_reservoir` / RTXDI /
+        // Wyman-2023). `spatial_samples` is the SEARCH BUDGET — how many disk taps to try to find a
+        // geometrically-valid neighbour — NOT an accumulation count. Merging many neighbours via iterated
+        // pairwise merges is biased (the balance-heuristic MIS partition Σm_i=1 only holds for two reservoirs)
+        // and inflates the combined confidence unboundedly, which AMPLIFIES variance with more samples (the
+        // "more spatial → more boil" bug). The effective sample count is built by TEMPORAL accumulation; one
+        // clean 2-reservoir spatial merge per frame keeps confidence bounded and variance falling.
         for (var s = 0u; s < restir_params.spatial_samples; s = s + 1u) {
             let off = sample_disk(restir_params.spatial_radius, &rng);
             let npix = vec2<i32>(pix) + vec2<i32>(i32(round(off.x)), i32(round(off.y)));
@@ -1242,6 +1246,7 @@ fn restir_gi(n: vec3<f32>, p: vec3<f32>, pix: vec2<u32>, temporal_base: vec2<i32
                 let merged =
                     merge_reservoirs(res, p, n, brdf, nres, nsurf.world_position, nsurf.world_normal, brdf, &rng);
                 res = merged.merged_reservoir;
+                break; // one neighbour only — temporal accumulation provides the rest
             }
         }
     }
