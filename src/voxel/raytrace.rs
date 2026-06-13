@@ -639,10 +639,19 @@ struct VoxelRtResources {
     /// converges. Capped so very long stills still adapt to slow changes (e.g. editor light tweaks).
     accum_samples: u32,
     /// The view-projection matrix the last frame accumulated against. A change (camera moved or projection
-    /// changed) resets accumulation. `None` until the first frame.
+    /// changed) resets the HISTORY-TEXTURE accumulation (not the reservoirs). `None` until the first frame.
     prev_view_proj: Option<[[f32; 4]; 4]>,
     /// The scene patch generation the accumulator is valid for; a re-pack (geometry changed) resets it.
     accum_generation: Option<u64>,
+    /// Previous-frame UN-jittered `clip_from_world` for the non-DLSS ReSTIR temporal reprojection (fed to the
+    /// shader as `camera.prev_clip_from_world`; mirrors `dlss_prev_clip_from_world`). The non-DLSS path is not
+    /// jittered, so the current frame's `clip_from_world` IS its un-jittered clip. `None` on the first frame
+    /// (then `prev == cur`, so the reprojection returns the current pixel).
+    prev_clip_from_world: Option<[[f32; 4]; 4]>,
+    /// `(viewport, built_generation)` at the last non-DLSS frame — drives the ReSTIR `reset` flag. Reset fires
+    /// ONLY on the first frame or a viewport (resolution) change; camera motion is handled by motion-vector
+    /// reprojection and an edit ADAPTS locally (never full-clears the reservoirs). `None` until the first frame.
+    restir_prev: Option<(UVec2, Option<u64>)>,
 
     // --- DLSS-RR (Stage 4c) intermediate textures + state (only used under `--features dlss`) ---
     /// The `raymarch_dlss` compute's COLOUR / DEPTH / MOTION storage outputs (the resolve render pass reads
@@ -687,7 +696,8 @@ struct SceneKeepAlive {
 }
 
 /// Camera uniform mirroring the WGSL `CameraUniform` (group 1, binding 0): `world_from_clip` (64) +
-/// `cam_pos` (12) + `t_max` (4) + `viewport` (8) + pad (8) = 96 bytes.
+/// `cam_pos` (12) + `t_max` (4) + `viewport` (8) + `accum_weight` (4) + pad (4) + `prev_clip_from_world` (64)
+/// = 160 bytes.
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct CameraUniformData {
@@ -700,6 +710,12 @@ struct CameraUniformData {
     /// so a static view converges to a clean average. Mirrors `CameraUniform.accum_weight` in the shader.
     accum_weight: f32,
     _pad: u32,
+    /// Previous-frame UN-jittered `clip_from_world`, for the non-DLSS ReSTIR temporal reprojection
+    /// (`reproject_pixel`). The non-DLSS path is not jittered, so the current frame's `clip_from_world` IS its
+    /// un-jittered clip; we store it each frame and feed last frame's here. On the first frame `prev == cur`
+    /// (so `reproject_pixel` returns the current pixel). The DLSS path fills this for layout parity but ignores
+    /// it (it reprojects via `dlss_cam.motion_prev`).
+    prev_clip_from_world: [[f32; 4]; 4],
 }
 
 /// **SSOT for the direct-lighting knobs** (the WGSL `LightingUniform`, group 1 binding 2). All values are
@@ -1497,6 +1513,10 @@ fn voxel_rt_pass(
         // A fresh-size history is uninitialised — force a reset (full new frame) this frame.
         resources.accum_samples = 0;
         resources.prev_view_proj = None;
+        // Reprojection has no stale prev across a resize; self-tap on the next frame (the `restir_prev`
+        // viewport change also forces the reservoir `reset`, so the stale-size reservoirs are discarded).
+        resources.prev_clip_from_world = None;
+        resources.restir_prev = None;
     }
 
     // Build the composite render pipeline lazily for the live view-target format (cached).
@@ -1546,12 +1566,18 @@ fn voxel_rt_pass(
     let world_from_clip = world_from_view * clip_from_view.inverse();
     let cam_pos = extracted_view.world_from_view.translation();
 
-    // --- Temporal accumulation control: reset on a camera move or a geometry re-pack, else run a 1/n mean. ---
-    // The view-projection (clip_from_world) fully captures both camera POSITION and PROJECTION; any change
-    // means the previous history no longer aligns pixel-for-pixel, so we must reset (show the fresh frame) to
-    // avoid ghosting. A scene re-pack (new geometry) likewise invalidates the history. Otherwise the camera is
-    // still: grow the sample count and blend at 1/n so the image converges to the clean average over n frames.
+    // The current frame's UN-jittered `clip_from_world`. The non-DLSS path applies NO TemporalJitter, so this
+    // IS the un-jittered clip (identical to the `view_proj` move-test matrix below). It feeds both the next
+    // frame's reservoir reprojection (stored at the end of this block) and the history-texture move test.
     let view_proj = (clip_from_view * world_from_view.inverse()).to_cols_array_2d();
+
+    // --- HISTORY-TEXTURE accumulation control: reset on a camera move or a geometry re-pack, else run a 1/n
+    // mean. --- The view-projection (clip_from_world) fully captures both camera POSITION and PROJECTION; any
+    // change means the previous history no longer aligns pixel-for-pixel, so we must reset (show the fresh
+    // frame) to avoid ghosting. A scene re-pack (new geometry) likewise invalidates the history. Otherwise the
+    // camera is still: grow the sample count and blend at 1/n so the image converges to the clean average over n
+    // frames. NOTE: this controls ONLY the on-top history TEXTURE blend (out_tex/history_tex `accum_weight`),
+    // NOT the ReSTIR reservoirs — those now reproject through camera motion (see the reset trigger below).
     let cur_generation = resources.built_generation;
     let moved = resources.prev_view_proj.map(|p| !matrices_close(&p, &view_proj)).unwrap_or(true);
     let geometry_changed = resources.accum_generation != cur_generation;
@@ -1566,6 +1592,12 @@ fn voxel_rt_pass(
     resources.accum_generation = cur_generation;
     let accum_weight = 1.0 / resources.accum_samples as f32;
 
+    // Previous-frame un-jittered clip for the ReSTIR temporal REPROJECTION. On the first frame there is no
+    // prev → use the current clip so `reproject_pixel` returns the current pixel (a no-op self-tap). Mirrors the
+    // DLSS path's `dlss_prev_clip_from_world.unwrap_or(view_proj)`. We store THIS frame's clip below for next.
+    let prev_clip_from_world = resources.prev_clip_from_world.unwrap_or(view_proj);
+    resources.prev_clip_from_world = Some(view_proj);
+
     let out_view = &resources.output.as_ref().expect("just allocated").1;
 
     let cam_uniform = CameraUniformData {
@@ -1575,6 +1607,7 @@ fn voxel_rt_pass(
         viewport: [viewport.x, viewport.y],
         accum_weight,
         _pad: 0,
+        prev_clip_from_world,
     };
     let cam_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("voxel_rt_camera"),
@@ -1620,12 +1653,21 @@ fn voxel_rt_pass(
     });
 
     // ReSTIR group(2): the restir params + the fixed-role reservoir buffers (a = final/history, b =
-    // intermediate). The reservoir `reset` fires only on a CAMERA MOVE (this non-DLSS path has no reprojection, so a move makes
-    // the same-pixel reservoir stale) — NOT on a geometry edit: the reservoirs adapt locally to terrain edits
-    // (fresh candidates + visibility + dissimilarity), so editing doesn't full-clear the GI. (The on-top
-    // history accumulator above still resets on `geometry_changed` — that just shows the fresh frame, not a clear.)
+    // intermediate). The reservoir `reset` fires ONLY on the first frame or a viewport (resolution) change —
+    // NEVER on a camera move and NEVER on a geometry edit. Camera motion is now handled by motion-vector
+    // reprojection (`reproject_pixel(p, camera.prev_clip_from_world, ...)` in `restir_p1`; disocclusions on
+    // fast motion are caught by the `surfaces_dissimilar` reject in `restir_p1_core`), and a geometry edit
+    // ADAPTS locally (fresh candidates re-trace the new geometry, the visibility trace drops now-occluded
+    // samples, dissimilarity rejects moved surfaces) — never a full clear. This mirrors the DLSS path's
+    // `reset_restir` keying. (The on-top history TEXTURE accumulator above still resets on a move/`geometry_changed`
+    // — that just shows the fresh frame, it is NOT a reservoir clear.)
+    let reset_restir = match resources.restir_prev {
+        None => true,
+        Some((vp, _g)) => vp != viewport,
+    };
+    resources.restir_prev = Some((viewport, cur_generation));
     let restir_params = RestirParamsData {
-        reset: u32::from(moved),
+        reset: u32::from(reset_restir),
         frame_index,
         viewport_x: viewport.x,
         viewport_y: viewport.y,
@@ -1987,6 +2029,8 @@ fn voxel_rt_dlss_pass(
         viewport: [render_res.x, render_res.y],
         accum_weight: 1.0, // unused by raymarch_dlss (DLSS denoises), kept for layout parity
         _pad: 0,
+        // Unused by the DLSS path (it reprojects via `dlss_cam.motion_prev`); filled for layout parity.
+        prev_clip_from_world: motion_prev,
     };
     let cam_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("voxel_rt_dlss_camera"),

@@ -470,6 +470,11 @@ struct CameraUniform {
     // y: reserved pad.
     accum_weight: f32,
     _pad: u32,
+    // Previous-frame UN-jittered clip_from_world for the non-DLSS ReSTIR temporal reprojection
+    // (`reproject_pixel`). The non-DLSS path is not jittered, so the current clip IS un-jittered; the renderer
+    // stores it each frame and feeds last frame's here. First frame: prev == cur (self-tap). The DLSS path
+    // fills this for layout parity but reprojects via `dlss_cam.motion_prev` instead.
+    prev_clip_from_world: mat4x4<f32>,
 };
 @group(1) @binding(0) var<uniform> camera: CameraUniform;
 @group(1) @binding(1) var out_tex: texture_storage_2d<rgba16float, write>;
@@ -1459,7 +1464,10 @@ fn restir_primary_ray(gid: vec3<u32>) -> array<vec3<f32>, 2> {
 // ===== PASS 1 entries: trace the primary ray, fill `reservoirs_b` (post-temporal) + `surfaces_cur`. No
 // shading, no out_tex, no guides — pass 2 re-traces the primary ray and does the spatial reuse + shading. =====
 
-// Non-DLSS pass 1 (base = current pixel; the non-DLSS path resets on camera move so it has no reprojection).
+// Non-DLSS pass 1 — reproject the temporal tap via the UN-jittered previous clip (`camera.prev_clip_from_world`)
+// so reservoir accumulation continues under camera motion instead of resetting (disocclusions on fast motion
+// caught by the `surfaces_dissimilar` reject in `restir_p1_core`). Same contract as `restir_dlss_p1`, just
+// without DLSS jitter. The reservoir `reset` flag now fires only on first-frame / resolution change.
 @compute @workgroup_size(8, 8, 1)
 fn restir_p1(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (gid.x >= camera.viewport.x || gid.y >= camera.viewport.y) { return; }
@@ -1471,7 +1479,8 @@ fn restir_p1(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (r.hit != 0u) {
         let p = ray[0] + ray[1] * r.t;
         let seed = (gid.x * 1973u + gid.y * 9277u + light.frame_index * 26699u) | 1u;
-        restir_p1_core(r.normal, p, gid.xy, vec2<i32>(gid.xy), seed);
+        let temporal_base = reproject_pixel(p, camera.prev_clip_from_world, camera.viewport);
+        restir_p1_core(r.normal, p, gid.xy, temporal_base, seed);
     }
 }
 

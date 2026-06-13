@@ -29,7 +29,8 @@ mod common;
 const W: u32 = 128;
 const H: u32 = 128;
 
-/// Mirror of the WGSL `CameraUniform` (group 1, binding 0): 96 bytes.
+/// Mirror of the WGSL `CameraUniform` (group 1, binding 0): 160 bytes (the trailing `prev_clip_from_world`
+/// drives the non-DLSS ReSTIR temporal reprojection; the DLSS path ignores it but the struct/binding is shared).
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct CameraUniform {
@@ -39,6 +40,7 @@ struct CameraUniform {
     viewport: [u32; 2],
     accum_weight: f32,
     _pad: u32,
+    prev_clip_from_world: [[f32; 4]; 4],
 }
 
 /// Mirror of the WGSL `DlssCamera` (group 1, binding 10): jittered depth clip + un-jittered prev/cur motion
@@ -221,6 +223,9 @@ fn dlss_guides_populated_where_voxels_hit() {
         viewport: [W, H],
         accum_weight: 1.0,
         _pad: 0,
+        // Un-jittered current clip; the DLSS entries this test drives ignore it (they reproject via
+        // `dlss_cam.motion_prev`). Set for binding-size parity with the 160-byte WGSL `CameraUniform`.
+        prev_clip_from_world: clip_from_world.to_cols_array_2d(),
     };
     let cam_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("camera"),
