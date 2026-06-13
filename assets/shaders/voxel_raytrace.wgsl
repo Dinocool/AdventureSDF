@@ -484,7 +484,7 @@ struct CameraUniform {
 //   sun_color     (12) + shadow_bias    (4)   — bias = normal-offset epsilon for the shadow/AO ray origin
 //   ambient_color (12) + ao_radius      (4)   — ao_radius = AO ray length in world metres
 //   ao_samples    (4)  + gi_rays (4) + gi_intensity (4) + gi_bounce_dist (4)
-//   emissive_strength (4) + frame_index (4) + _pad (8)
+//   emissive_strength (4) + frame_index (4) + debug_view (4) + gi_firefly_clamp (4)
 struct LightingUniform {
     sun_direction: vec3<f32>,  // normalized direction the sunlight travels (points away from the sun)
     sun_intensity: f32,        // scalar multiplier on sun_color
@@ -499,7 +499,7 @@ struct LightingUniform {
     emissive_strength: f32,    // scalar multiplier on every block's palette emissive
     frame_index: u32,          // per-frame counter to decorrelate the bounce-direction hash
     debug_view: u32,           // 0 = lit; 1 = normals; 2 = depth; 3 = albedo; 4 = AO; 5 = GI-only; 6 = face-toward-camera
-    _pad1: u32,
+    gi_firefly_clamp: f32,     // max per-bounce-sample GI radiance (0 = unclamped); tames emissive fireflies/boil
 };
 @group(1) @binding(2) var<uniform> light: LightingUniform;
 
@@ -591,6 +591,19 @@ fn rand01(seed: u32) -> f32 {
     return f32(hash_u32(seed)) * (1.0 / 4294967296.0);
 }
 
+// Van der Corput radical inverse in base 2 (bit-reversal) — the y coordinate of a Hammersley point set.
+// Paired with i/N for x, it gives a LOW-DISCREPANCY 2D set: far more uniform hemisphere coverage than
+// white noise for the same sample count, so the per-pixel GI estimate has much lower variance (less boil).
+fn radical_inverse_vdc(bits_in: u32) -> f32 {
+    var bits = bits_in;
+    bits = (bits << 16u) | (bits >> 16u);
+    bits = ((bits & 0x55555555u) << 1u) | ((bits & 0xAAAAAAAAu) >> 1u);
+    bits = ((bits & 0x33333333u) << 2u) | ((bits & 0xCCCCCCCCu) >> 2u);
+    bits = ((bits & 0x0F0F0F0Fu) << 4u) | ((bits & 0xF0F0F0F0u) >> 4u);
+    bits = ((bits & 0x00FF00FFu) << 8u) | ((bits & 0xFF00FF00u) >> 8u);
+    return f32(bits) * 2.3283064365386963e-10; // / 2^32
+}
+
 // Single-bounce diffuse GLOBAL ILLUMINATION at a surface hit. Cosine-sample `gi_rays` directions in the
 // hemisphere about the face normal `n` (Frisvad ONB + concentric cosine mapping), trace each as a bounce
 // ray on the SAME TLAS, and gather incoming radiance:
@@ -610,12 +623,17 @@ fn gather_gi(n: vec3<f32>, p: vec3<f32>, seed_base: u32) -> vec3<f32> {
     let basis = onb(n);
     let tang = basis[0];
     let bitang = basis[1];
+    // Per-pixel + per-frame Cranley–Patterson rotation: shift the whole Hammersley set by a random toroidal
+    // offset. Within a pixel the N samples stay LOW-DISCREPANCY (well-stratified hemisphere coverage); across
+    // pixels and frames the offset decorrelates, so the residual noise ANIMATES uniformly — exactly the
+    // blue-noise-like input DLSS-RR (and the temporal accumulator) reproject + average best. Far less boil
+    // than independent white-noise directions, at the same ray count.
+    let rot = vec2<f32>(rand01(seed_base * 2u + 1u), rand01(seed_base * 2u + 2u));
     var acc_rad = vec3<f32>(0.0);
     for (var i = 0u; i < rays; i = i + 1u) {
-        // Two decorrelated uniforms per ray from the pixel/frame seed.
-        let s = seed_base + i * 9781u;
-        let u1 = rand01(s * 2u + 1u);
-        let u2 = rand01(s * 2u + 2u);
+        // Hammersley point i of `rays`, rotated. (x → azimuth, y → cosine radius.)
+        let u1 = fract(f32(i) / f32(rays) + rot.x);
+        let u2 = fract(radical_inverse_vdc(i) + rot.y);
         // Cosine-weighted hemisphere sample (Malley / concentric-ish): r = sqrt(u1), phi = 2π·u2; z = sqrt(1-u1).
         let r = sqrt(u1);
         let phi = 6.2831853 * u2;
@@ -625,14 +643,26 @@ fn gather_gi(n: vec3<f32>, p: vec3<f32>, seed_base: u32) -> vec3<f32> {
         let dir = normalize(tang * x + bitang * y + n * z);
         // Trace the bounce ray (bounded to gi_bounce_dist) and gather incoming radiance.
         let h = trace(origin, dir, 0.0, light.gi_bounce_dist);
+        var contrib: vec3<f32>;
         if (h.hit != 0u) {
             let hp = origin + dir * h.t;
             let surf = direct_lighting(h.color.rgb, h.normal, hp);
             let emit = h.emissive * light.emissive_strength;
-            acc_rad = acc_rad + surf + emit;
+            contrib = surf + emit;
         } else {
-            acc_rad = acc_rad + bounce_sky();
+            contrib = bounce_sky();
         }
+        // Firefly clamp: cap a single bounce sample's radiance so one very bright hit (e.g. a grazing ray
+        // catching the emissive panel) can't dominate the mean and pop/boil under temporal denoise. Scales
+        // the whole sample so hue is preserved. `gi_firefly_clamp == 0` disables it (unbiased; tests rely on
+        // this). A small bias for a large variance cut — standard path-tracer practice.
+        if (light.gi_firefly_clamp > 0.0) {
+            let m = max(contrib.r, max(contrib.g, contrib.b));
+            if (m > light.gi_firefly_clamp) {
+                contrib = contrib * (light.gi_firefly_clamp / m);
+            }
+        }
+        acc_rad = acc_rad + contrib;
     }
     // Cosine-pdf importance sampling ⇒ the irradiance estimate is the mean of the gathered radiance.
     return (acc_rad / f32(rays)) * light.gi_intensity;

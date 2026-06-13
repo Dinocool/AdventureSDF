@@ -83,6 +83,12 @@ pub fn render_gi_panel(world: &mut World, ui: &mut egui::Ui) {
         ui.add(egui::Slider::new(&mut d.gi_intensity, 0.0..=4.0).text("GI intensity"));
         ui.add(egui::Slider::new(&mut d.gi_bounce_dist, 1.0..=64.0).text("bounce dist (m)"));
         ui.add(egui::Slider::new(&mut d.emissive_strength, 0.0..=16.0).text("emissive strength"));
+        ui.add(egui::Slider::new(&mut d.gi_firefly_clamp, 0.0..=32.0).text("firefly clamp (0 = off)"));
+        ui.label(
+            egui::RichText::new("firefly clamp caps bright bounce samples — lower it to kill GI sparkle/boil")
+                .weak()
+                .size(11.0),
+        );
 
         ui.separator();
         if ui.button("Reset to Cornell defaults").clicked() {

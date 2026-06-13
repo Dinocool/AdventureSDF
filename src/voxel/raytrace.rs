@@ -658,8 +658,9 @@ struct CameraUniformData {
 /// **SSOT for the direct-lighting knobs** (the WGSL `LightingUniform`, group 1 binding 2). All values are
 /// runtime UNIFORMS (knobs-as-uniforms mandate) — the GUI/editor can drive any of them; nothing here is a
 /// shader const. 80 bytes (std140-safe: each `Vec3` is followed by a scalar to fill its 16-byte slot; the
-/// GI knobs form a packed 16-byte row; trailing `[u32; 3]` pad rounds to 80). Mirrored field-for-field by
-/// both the WGSL shader and the headless lighting/GI tests, so the lighting layout has exactly one SSOT.
+/// GI knobs form a packed 16-byte row; the final row is `emissive_strength, frame_index, debug_view,
+/// gi_firefly_clamp` — exactly 16 bytes, no trailing pad). Mirrored field-for-field by both the WGSL shader
+/// and the headless lighting/GI tests, so the lighting layout has exactly one SSOT.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct LightingUniformData {
@@ -693,8 +694,10 @@ pub struct LightingUniformData {
     /// 3 = albedo, 4 = AO, 5 = GI-only, 6 = face-orientation (green front / red BACK-face). Mirrors the
     /// WGSL `LightingUniform.debug_view`.
     pub debug_view: u32,
-    /// std140 tail pad to a 16-byte multiple.
-    pub _pad: [u32; 2],
+    /// Max radiance of a single GI bounce sample before it's clamped down (hue-preserving). Caps fireflies /
+    /// bright-sample spikes that otherwise boil under temporal denoise. `0.0` disables the clamp (unbiased —
+    /// the headless GI tests rely on this). Fills the last std140 slot, so the struct is exactly 80 bytes.
+    pub gi_firefly_clamp: f32,
 }
 
 impl Default for LightingUniformData {
@@ -717,7 +720,7 @@ impl Default for LightingUniformData {
             emissive_strength: 4.0,
             frame_index: 0,
             debug_view: 0,
-            _pad: [0; 2],
+            gi_firefly_clamp: 0.0, // off by default (unbiased) — the headless GI tests assume no clamp
         }
     }
 }
@@ -745,7 +748,9 @@ impl LightingUniformData {
             emissive_strength: 6.0,
             frame_index: 0,
             debug_view: 0,
-            _pad: [0; 2],
+            // The ceiling emitter (emissive ≈ 1 × strength 6) is the brightest legitimate bounce sample;
+            // clamp a little above it so grazing/multi-hit fireflies are tamed but the panel itself is intact.
+            gi_firefly_clamp: 8.0,
         }
     }
 }

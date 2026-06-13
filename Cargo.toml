@@ -173,6 +173,9 @@ naga = { version = "29.0.3", features = ["spv-out", "wgsl-in"] }
 naga_oil = { version = "0.22", default-features = false }
 # block_on for the GPU compute rig (tests/sdf_gpu_rig.rs) — run real WGSL, read back buffers.
 futures-lite = "2"
+# Decode Rgba16Float texture readback (f16 → f32) in the DLSS-guide GPU test. Dev-only: the runtime
+# never decodes half floats on the CPU. (The render deps dropped `half` with the mesh-bake cut.)
+half = "2"
 
 [profile.dev]
 opt-level = 1

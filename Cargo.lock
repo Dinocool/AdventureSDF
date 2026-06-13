@@ -95,6 +95,7 @@ dependencies = [
  "emath",
  "epaint",
  "futures-lite",
+ "half",
  "image",
  "libloading",
  "naga",
