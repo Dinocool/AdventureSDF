@@ -860,3 +860,247 @@ fn raymarch_dlss(@builtin(global_invocation_id) gid: vec3<u32>) {
         textureStore(out_dlss_motion, px, vec4<f32>(0.0, 0.0, 0.0, 0.0));
     }
 }
+
+// ====================================================================================================
+// ReSTIR GI — reservoir-based spatiotemporal resampling of the single-bounce diffuse GI (Ouyang 2021 /
+// Wyman 2023 course notes). Ported from `bevy_solari::restir_gi` and adapted to OUR tracer + palette.
+//
+// The plain `gather_gi` mean boils because it re-randomises the bounce directions every frame and never
+// REUSES samples. ReSTIR keeps a per-shading-point RESERVOIR holding one selected sample (the bounce hit
+// point + the outgoing radiance there), resampled by RIS and REUSED across frames (temporal) and
+// neighbours (spatial) with balance-heuristic MIS + a Jacobian for the solid-angle reparametrisation.
+// Effective sample count grows into the hundreds for ~1 trace/pixel → the boil collapses.
+//
+// KEY ADAPTATION vs Solari: Solari EXCLUDES emissive sample points (its separate ReSTIR DI handles
+// emitters). Our only light IS the emissive panel, so we INCLUDE emissive sample points and define the
+// sample's outgoing radiance as `direct_lighting(sp) + emissive(sp)` — exactly the `contrib` term
+// `gather_gi` accumulates. Resampling then concentrates samples toward the bright panel (NEE-by-
+// resampling) with no separate DI pass. The estimator converges to the SAME irradiance `gather_gi`
+// estimates, so the headless harness can assert ReSTIR ≈ a high-spp `gather_gi` reference.
+//
+// This block defines the reusable core (struct + helpers + initial-reservoir generation + merge) used by
+// both the R0 headless probe test below and the live screen-space passes (R1+). The screen-space
+// G-buffer/motion entries are added in R1; here `restir_probe` exercises the estimator math in isolation.
+
+const RESTIR_PI: f32 = 3.14159265358979;
+const RESTIR_CONFIDENCE_CAP: f32 = 8.0; // temporal history cap (frames) — bounds lag/ghosting
+
+// A ReSTIR GI reservoir (48 bytes = 3×vec4; field order MUST match `GpuReservoir` in src/voxel/restir.rs
+// and bevy_solari's `Reservoir`).
+struct Reservoir {
+    sample_point_world_position: vec3<f32>,
+    weight_sum: f32,
+    radiance: vec3<f32>,            // OUTGOING radiance L_o at the sample point toward the shading point
+    confidence_weight: f32,         // ~ effective sample count M (capped)
+    sample_point_world_normal: vec3<f32>,
+    unbiased_contribution_weight: f32, // RIS contribution weight W (1/pdf · normalisation)
+}
+
+fn empty_reservoir() -> Reservoir {
+    return Reservoir(vec3<f32>(0.0), 0.0, vec3<f32>(0.0), 0.0, vec3<f32>(0.0), 0.0);
+}
+
+// Rec.709 luminance — the scalar target function ReSTIR resamples by.
+fn restir_luminance(c: vec3<f32>) -> f32 {
+    return dot(c, vec3<f32>(0.2126, 0.7152, 0.0722));
+}
+
+// Balance heuristic MIS weight for a pair (Veach): a / (a + b), 0 when both are 0.
+fn balance_heuristic(a: f32, b: f32) -> f32 {
+    let s = a + b;
+    return select(0.0, a / s, s > 0.0);
+}
+
+fn restir_isinf(x: f32) -> bool { return (bitcast<u32>(x) & 0x7fffffffu) == 0x7f800000u; }
+fn restir_isnan(x: f32) -> bool { return (bitcast<u32>(x) & 0x7fffffffu) > 0x7f800000u; }
+
+// A mutating PCG RNG (ReSTIR needs a stream: candidate dir + stochastic reservoir selection + neighbours).
+fn rand_next(rng: ptr<function, u32>) -> f32 {
+    *rng = *rng * 747796405u + 2891336453u;
+    let s = *rng;
+    let word = ((s >> ((s >> 28u) + 4u)) ^ s) * 277803737u;
+    return f32((word >> 22u) ^ word) * (1.0 / 4294967296.0);
+}
+
+// Uniform hemisphere sample about unit normal `n` (matches Solari's bounce sampling; pdf = 1/2π).
+fn sample_uniform_hemisphere(n: vec3<f32>, rng: ptr<function, u32>) -> vec3<f32> {
+    let z = rand_next(rng);                       // cos(theta) uniform in [0,1]
+    let r = sqrt(max(0.0, 1.0 - z * z));
+    let phi = 6.2831853 * rand_next(rng);
+    let basis = onb(n);
+    return normalize(basis[0] * (r * cos(phi)) + basis[1] * (r * sin(phi)) + n * z);
+}
+fn uniform_hemisphere_inverse_pdf() -> f32 { return 6.2831853; } // 2π
+
+// Generate the per-shading-point INITIAL reservoir: one uniform-hemisphere bounce ray → its sample point +
+// outgoing radiance. Misses contribute nothing (the closed Cornell box rarely lets a bounce escape; the sky
+// term is negligible there, matching the assumption the energy test relies on).
+fn generate_initial_reservoir(world_position: vec3<f32>, world_normal: vec3<f32>, rng: ptr<function, u32>) -> Reservoir {
+    var reservoir = empty_reservoir();
+    let dir = sample_uniform_hemisphere(world_normal, rng);
+    let origin = world_position + world_normal * light.shadow_bias;
+    let r = trace(origin, dir, 0.0, light.gi_bounce_dist);
+    if (r.hit == 0u) {
+        return reservoir;
+    }
+    let hp = origin + dir * r.t;
+    reservoir.sample_point_world_position = hp;
+    reservoir.sample_point_world_normal = r.normal;
+    reservoir.confidence_weight = 1.0;
+    // L_o at the sample point = direct lighting there + its emissive (emissive INCLUDED — the adaptation).
+    reservoir.radiance = direct_lighting(r.color.rgb, r.normal, hp) + r.emissive * light.emissive_strength;
+    reservoir.unbiased_contribution_weight = uniform_hemisphere_inverse_pdf();
+    return reservoir;
+}
+
+// Jacobian of the solid-angle reparametrisation when a sample taken at `original_world_position` is reused
+// at `new_world_position` (Ouyang 2021 eq. / Solari). 0 on degenerate (inf/nan).
+fn restir_jacobian(new_world_position: vec3<f32>, original_world_position: vec3<f32>, sample_point_world_position: vec3<f32>, sample_point_world_normal: vec3<f32>) -> f32 {
+    let rr = new_world_position - sample_point_world_position;
+    let qq = original_world_position - sample_point_world_position;
+    let rl = length(rr);
+    let ql = length(qq);
+    let phi_r = saturate(dot(rr / rl, sample_point_world_normal));
+    let phi_q = saturate(dot(qq / ql, sample_point_world_normal));
+    let j = (phi_r * ql * ql) / (phi_q * rl * rl);
+    return select(j, 0.0, restir_isinf(j) || restir_isnan(j));
+}
+
+struct ReservoirMergeResult {
+    merged_reservoir: Reservoir,
+    selected_sample_radiance: vec3<f32>,
+    wi: vec3<f32>,
+}
+
+// Pairwise RIS merge of a canonical reservoir with another (temporal or spatial), with balance-heuristic
+// MIS over the two target functions and the Jacobian for the shifted sample. Ported verbatim from
+// bevy_solari::restir_gi::merge_reservoirs (our `restir_luminance`/`restir_jacobian`). The diffuse BRDF is
+// `albedo / π`; for the irradiance estimate the receiver albedo is applied by the caller.
+fn merge_reservoirs(
+    canonical_reservoir: Reservoir,
+    canonical_world_position: vec3<f32>,
+    canonical_world_normal: vec3<f32>,
+    canonical_diffuse_brdf: vec3<f32>,
+    other_reservoir: Reservoir,
+    other_world_position: vec3<f32>,
+    other_world_normal: vec3<f32>,
+    other_diffuse_brdf: vec3<f32>,
+    rng: ptr<function, u32>,
+) -> ReservoirMergeResult {
+    let canonical_sample_wi = normalize(canonical_reservoir.sample_point_world_position - canonical_world_position);
+    let other_sample_wi = normalize(other_reservoir.sample_point_world_position - canonical_world_position);
+
+    let canonical_target_function_canonical_sample = restir_luminance(
+        canonical_reservoir.radiance * saturate(dot(canonical_sample_wi, canonical_world_normal)) * canonical_diffuse_brdf);
+    let canonical_target_function_other_sample = restir_luminance(
+        other_reservoir.radiance * saturate(dot(other_sample_wi, canonical_world_normal)) * canonical_diffuse_brdf);
+    let other_target_function_canonical_sample = restir_luminance(
+        canonical_reservoir.radiance * saturate(dot(normalize(canonical_reservoir.sample_point_world_position - other_world_position), other_world_normal)) * other_diffuse_brdf);
+    let other_target_function_other_sample = restir_luminance(
+        other_reservoir.radiance * saturate(dot(normalize(other_reservoir.sample_point_world_position - other_world_position), other_world_normal)) * other_diffuse_brdf);
+
+    let canonical_target_function_other_sample_jacobian = restir_jacobian(
+        canonical_world_position, other_world_position, other_reservoir.sample_point_world_position, other_reservoir.sample_point_world_normal);
+    let other_target_function_canonical_sample_jacobian = restir_jacobian(
+        other_world_position, canonical_world_position, canonical_reservoir.sample_point_world_position, canonical_reservoir.sample_point_world_normal);
+
+    // Huge jacobians explode the variance — skip the merge (keep the canonical).
+    if (canonical_target_function_other_sample_jacobian > 1.2 || other_target_function_canonical_sample_jacobian > 1.2) {
+        return ReservoirMergeResult(canonical_reservoir, canonical_reservoir.radiance, canonical_sample_wi);
+    }
+
+    let canonical_sample_mis_weight = balance_heuristic(
+        canonical_reservoir.confidence_weight * canonical_target_function_canonical_sample,
+        other_reservoir.confidence_weight * other_target_function_canonical_sample * other_target_function_canonical_sample_jacobian);
+    let canonical_sample_resampling_weight = canonical_sample_mis_weight * canonical_target_function_canonical_sample * canonical_reservoir.unbiased_contribution_weight;
+
+    let other_sample_mis_weight = balance_heuristic(
+        other_reservoir.confidence_weight * other_target_function_other_sample,
+        canonical_reservoir.confidence_weight * canonical_target_function_other_sample * canonical_target_function_other_sample_jacobian);
+    let other_sample_resampling_weight = other_sample_mis_weight * canonical_target_function_other_sample * other_reservoir.unbiased_contribution_weight * canonical_target_function_other_sample_jacobian;
+
+    var combined = empty_reservoir();
+    combined.confidence_weight = canonical_reservoir.confidence_weight + other_reservoir.confidence_weight;
+    combined.weight_sum = canonical_sample_resampling_weight + other_sample_resampling_weight;
+
+    if (rand_next(rng) < other_sample_resampling_weight / max(combined.weight_sum, 1e-12)) {
+        combined.sample_point_world_position = other_reservoir.sample_point_world_position;
+        combined.sample_point_world_normal = other_reservoir.sample_point_world_normal;
+        combined.radiance = other_reservoir.radiance;
+        let inv_tf = select(0.0, 1.0 / canonical_target_function_other_sample, canonical_target_function_other_sample > 0.0);
+        combined.unbiased_contribution_weight = combined.weight_sum * inv_tf;
+        return ReservoirMergeResult(combined, other_reservoir.radiance, other_sample_wi);
+    } else {
+        combined.sample_point_world_position = canonical_reservoir.sample_point_world_position;
+        combined.sample_point_world_normal = canonical_reservoir.sample_point_world_normal;
+        combined.radiance = canonical_reservoir.radiance;
+        let inv_tf = select(0.0, 1.0 / canonical_target_function_canonical_sample, canonical_target_function_canonical_sample > 0.0);
+        combined.unbiased_contribution_weight = combined.weight_sum * inv_tf;
+        return ReservoirMergeResult(combined, canonical_reservoir.radiance, canonical_sample_wi);
+    }
+}
+
+// Resolve a reservoir to the indirect IRRADIANCE at the shading point (the quantity `gather_gi` returns,
+// BEFORE the receiver albedo). With uniform-hemisphere sampling (1/pdf = 2π) and a cosine-weighted
+// integrand g = (1/π)·L_o·cos, the RIS estimate of I = (1/π)∫L_o cosθ dω is
+// `radiance · W · cos / π` — the same I that `gather_gi`'s cosine-mean estimates. ×gi_intensity to match.
+fn restir_resolve_irradiance(res: Reservoir, recv_pos: vec3<f32>, recv_normal: vec3<f32>) -> vec3<f32> {
+    if (res.confidence_weight <= 0.0) { return vec3<f32>(0.0); }
+    let wi = normalize(res.sample_point_world_position - recv_pos);
+    let cos = saturate(dot(wi, recv_normal));
+    return res.radiance * res.unbiased_contribution_weight * cos * (1.0 / RESTIR_PI) * light.gi_intensity;
+}
+
+// --- R0 headless probe test entry -------------------------------------------------------------------
+// Exercises the ReSTIR estimator math WITHOUT the screen-space G-buffer plumbing (added in R1). For each
+// probe (a shading point: world position + normal), each dispatch generates one initial reservoir and
+// merges it into the probe's PERSISTENT reservoir (temporal accumulation; same-surface merge so the
+// Jacobian = 1). Over N dispatches the resolved irradiance must converge (variance → 0) to the high-spp
+// `gather_gi` reference, and concentrate samples toward the emissive panel. `reset` clears the reservoir.
+
+struct ProbePoint { world_position: vec3<f32>, _p0: u32, world_normal: vec3<f32>, _p1: u32 };
+struct ProbeOut {
+    irradiance: vec3<f32>,        // resolved ReSTIR indirect irradiance this dispatch
+    confidence: f32,
+    reference: vec3<f32>,         // high-spp gather_gi irradiance (the unbiased oracle)
+    ucw: f32,
+};
+struct RestirProbeParams { frame_index: u32, reset: u32, n_probes: u32, _p: u32 };
+
+@group(0) @binding(8) var<storage, read> probes_in: array<ProbePoint>;
+@group(0) @binding(9) var<storage, read_write> probe_reservoirs: array<Reservoir>;
+@group(0) @binding(10) var<storage, read_write> probe_out: array<ProbeOut>;
+@group(0) @binding(11) var<uniform> probe_params: RestirProbeParams;
+
+@compute @workgroup_size(64)
+fn restir_probe(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    if (i >= probe_params.n_probes) { return; }
+    let probe = probes_in[i];
+    let pos = probe.world_position;
+    let n = probe.world_normal;
+
+    var rng = (i * 9781u + probe_params.frame_index * 26699u) | 1u;
+
+    var canonical = generate_initial_reservoir(pos, n, &rng);
+
+    // Temporal reuse: merge the probe's previous-dispatch reservoir (same surface → Jacobian 1), unless reset.
+    if (probe_params.reset == 0u) {
+        var temporal = probe_reservoirs[i];
+        temporal.confidence_weight = min(temporal.confidence_weight, RESTIR_CONFIDENCE_CAP);
+        let brdf = vec3<f32>(1.0); // receiver albedo factored out of the irradiance estimate
+        let merged = merge_reservoirs(canonical, pos, n, brdf, temporal, pos, n, brdf, &rng);
+        canonical = merged.merged_reservoir;
+    }
+
+    probe_reservoirs[i] = canonical;
+
+    var out: ProbeOut;
+    out.irradiance = restir_resolve_irradiance(canonical, pos, n);
+    out.confidence = canonical.confidence_weight;
+    out.ucw = canonical.unbiased_contribution_weight;
+    // Reference: the established cosine-mean GI estimator at this probe (high gi_rays driven by the harness).
+    out.reference = gather_gi(n, pos, (i * 2654435761u + probe_params.frame_index * 40503u) | 1u);
+    // Per-FRAME slot so the harness reads the whole convergence history back in one map.
+    probe_out[probe_params.frame_index * probe_params.n_probes + i] = out;
+}
