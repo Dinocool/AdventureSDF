@@ -270,17 +270,21 @@ pub fn pack_resident_set(entries: &[ResidentBrick<'_>], registry: &BlockRegistry
         palette: Vec::with_capacity(registry.len()),
     };
 
-    // Index entries by brick coordinate so each brick can read its 6 face-neighbours when building the HALO
-    // border (the seam fix — see `halo_edge`). A neighbour stored at the SAME LOD contributes its adjacent
-    // face cell; a neighbour that is absent or at a different LOD contributes AIR (the pre-halo behaviour, so
-    // no regression — the halo only ADDS correct boundary cells where a same-LOD neighbour exists, which is
-    // the common same-ring case where seams appear).
-    let by_coord: HashMap<IVec3, &ResidentBrick<'_>> = entries.iter().map(|e| (e.coord, e)).collect();
+    // Pre-downsample EVERY resident brick EXACTLY ONCE (at its own LOD), keyed by coord, storing (lod, grid).
+    // Both a brick's own core cells AND its neighbours' HALO border cells (the seam fix — see `halo_edge`) read
+    // from this shared map. Previously each brick re-downsampled all 6 of its neighbours via a per-brick
+    // `neighbour_cache`, so every brick was downsampled ~7× (once as self + once per neighbour that borders it),
+    // with a fresh HashMap + thousands of redundant Vec allocations per brick — the pack hot spot (~700 ms at
+    // ~19k bricks). One downsample per brick + one shared map collapses that to O(resident) once.
+    // Same-LOD neighbour contributes its adjacent face cell; an absent / different-LOD neighbour contributes
+    // AIR (the pre-halo behaviour — no regression).
+    let grids: HashMap<IVec3, (u32, Vec<BlockId>)> =
+        entries.iter().map(|e| (e.coord, (e.lod, e.brick.downsample(e.lod, lod_solid_keep_k(e.lod))))).collect();
 
     for e in entries {
         let lod = e.lod;
         let cedge = lod_edge(lod);
-        let grid = e.brick.downsample(lod, lod_solid_keep_k(lod));
+        let grid = &grids[&e.coord].1;
         debug_assert_eq!(grid.len(), (cedge * cedge * cedge) as usize);
         // Skip a brick that downsampled to all-air (sparsity at coarse LOD): no AABB, no DDA work.
         if grid.iter().all(|b| b.is_air()) {
@@ -299,9 +303,6 @@ pub fn pack_resident_set(entries: &[ResidentBrick<'_>], registry: &BlockRegistry
         let voxel_origin = [coord.x * BRICK_EDGE, coord.y * BRICK_EDGE, coord.z * BRICK_EDGE];
         patch.metas.push(GpuBrickMeta { voxel_origin, voxel_offset, world_min, lod });
 
-        // Lazily-downsampled neighbour grids (only the ones actually touched by the border), so a brick with
-        // no resident neighbour pays nothing and we never downsample a neighbour twice.
-        let mut neighbour_cache: HashMap<IVec3, Vec<BlockId>> = HashMap::new();
         let h = halo_edge(lod);
         for hz in 0..h {
             for hy in 0..h {
@@ -316,14 +317,7 @@ pub fn pack_resident_set(entries: &[ResidentBrick<'_>], registry: &BlockRegistry
                         grid[(cx + cy * cedge + cz * cedge * cedge) as usize]
                     } else {
                         // A border cell: resolve the owning neighbour brick + the wrapped coarse cell inside it.
-                        neighbour_border_cell(
-                            &by_coord,
-                            &mut neighbour_cache,
-                            coord,
-                            lod,
-                            cedge,
-                            IVec3::new(cx, cy, cz),
-                        )
+                        neighbour_border_cell(&grids, coord, lod, cedge, IVec3::new(cx, cy, cz))
                     };
                     patch.voxels.push(block.0 as u32);
                 }
@@ -340,8 +334,7 @@ pub fn pack_resident_set(entries: &[ResidentBrick<'_>], registry: &BlockRegistry
 /// LOD (cached), and return its cell there. Returns AIR when the owning neighbour is absent or stored at a
 /// different LOD (so a border with no same-LOD neighbour is air — the conservative pre-halo behaviour).
 fn neighbour_border_cell(
-    by_coord: &std::collections::HashMap<IVec3, &ResidentBrick<'_>>,
-    cache: &mut std::collections::HashMap<IVec3, Vec<BlockId>>,
+    grids: &std::collections::HashMap<IVec3, (u32, Vec<BlockId>)>,
     coord: IVec3,
     lod: u32,
     cedge: i32,
@@ -355,15 +348,13 @@ fn neighbour_border_cell(
             cc.y.div_euclid(cedge),
             cc.z.div_euclid(cedge),
         );
-    let Some(e) = by_coord.get(&nbr) else {
+    let Some((nbr_lod, grid)) = grids.get(&nbr) else {
         return BlockId::AIR;
     };
-    if e.lod != lod {
+    if *nbr_lod != lod {
         return BlockId::AIR; // different-LOD neighbour: cell sizes differ, fall back to air (no regression)
     }
-    let grid = cache
-        .entry(nbr)
-        .or_insert_with(|| e.brick.downsample(lod, lod_solid_keep_k(lod)));
+    // Read the neighbour's already-downsampled grid (computed once in the shared map — no re-downsample).
     let lx = cc.x.rem_euclid(cedge);
     let ly = cc.y.rem_euclid(cedge);
     let lz = cc.z.rem_euclid(cedge);
