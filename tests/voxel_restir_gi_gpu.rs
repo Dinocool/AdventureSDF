@@ -475,12 +475,12 @@ fn restir_probe_is_valid_unbiased_and_concentrates() {
     );
 }
 
-/// R1 compile gate: the live screen-space ReSTIR entry points (`raymarch_restir` + the DLSS variant) must
-/// compile on the real device. The lib build never compiles the WGSL (it's loaded at runtime), and the
-/// estimator test above only exercises `restir_probe` — so without this, a syntax/binding error in the
-/// screen-space entries would only surface at launch. Creating the pipelines (auto layout) forces naga to
-/// compile both entries + validate their bindings. Needs an 8-storage-texture device (the DLSS variant writes
-/// colour + 5 guides).
+/// R1 compile gate: the live screen-space two-pass ReSTIR entry points (`restir_p1`/`restir_p2` + the DLSS
+/// `restir_dlss_p1`/`restir_dlss_p2`) must compile on the real device. The lib build never compiles the WGSL
+/// (it's loaded at runtime), and the estimator test above only exercises `restir_probe` — so without this, a
+/// syntax/binding error in the screen-space entries would only surface at launch. Creating the pipelines (auto
+/// layout) forces naga to compile every entry + validate its bindings. Needs an 8-storage-texture device (the
+/// DLSS variants write colour + 5 guides).
 #[test]
 fn restir_screen_space_entries_compile() {
     let Some((device, _queue)) = common::headless_ray_query_device_with_storage_textures(8) else {
@@ -492,7 +492,7 @@ fn restir_screen_space_entries_compile() {
         label: Some("voxel_raytrace"),
         source: wgpu::ShaderSource::Wgsl(src.into()),
     });
-    for entry in ["raymarch_restir", "raymarch_dlss_restir"] {
+    for entry in ["restir_p1", "restir_p2", "restir_dlss_p1", "restir_dlss_p2"] {
         let _pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some(entry),
             layout: None, // auto layout from reflection — validates the entry + its bindings compile
