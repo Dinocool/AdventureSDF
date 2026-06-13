@@ -136,7 +136,7 @@ impl Plugin for VoxelRtPlugin {
         // TemporalJitter, MipBias, DepthPrepass, MotionVectorPrepass, Hdr — so bevy_anti_alias's DLSS node
         // runs in `Core3dSystems::EarlyPostProcess` (after our MainPass raymarch). No-op if RR is unsupported.
         #[cfg(feature = "dlss")]
-        app.add_systems(Update, add_dlss_to_camera);
+        app.init_resource::<DlssSettings>().add_systems(Update, sync_dlss_camera);
 
         let Some(render_app) = app.get_sub_app_mut(RenderApp) else {
             return;
@@ -484,27 +484,62 @@ fn cursor_world_ray(
     Some((origin, dir))
 }
 
-/// Main-world (Update): once DLSS-RR is detected as supported (the [`DlssRayReconstructionSupported`] resource
-/// appears after device init), attach a [`Dlss`]`<RayReconstruction>` component to the [`SdfCamera`]. Its
-/// `#[require(TemporalJitter, MipBias, DepthPrepass, MotionVectorPrepass, Hdr)]` then pulls in everything
-/// bevy_anti_alias's DLSS node needs. Idempotent (skips cameras that already have it); runs every frame but
-/// does nothing once attached. No-op forever on machines without RR support.
+/// Editor-tunable DLSS Ray Reconstruction settings (the "Render / GI" panel writes these); the SSOT
+/// [`sync_dlss_camera`] applies each frame. `enabled` toggles RR on/off on the camera; `mode` is the
+/// quality/upscale preset (Auto / DLAA-native / Quality / Balanced / Performance / UltraPerformance).
 #[cfg(feature = "dlss")]
-fn add_dlss_to_camera(
-    mut commands: Commands,
-    supported: Option<Res<DlssRayReconstructionSupported>>,
-    cams: Query<Entity, (With<SdfCamera>, Without<Dlss<DlssRayReconstructionFeature>>)>,
-) {
-    if supported.is_none() {
-        return;
+#[derive(Resource, Clone, Copy)]
+pub struct DlssSettings {
+    pub enabled: bool,
+    pub mode: bevy::anti_alias::dlss::DlssPerfQualityMode,
+}
+
+#[cfg(feature = "dlss")]
+impl Default for DlssSettings {
+    fn default() -> Self {
+        Self { enabled: true, mode: bevy::anti_alias::dlss::DlssPerfQualityMode::Auto }
     }
-    for cam in &cams {
-        commands.entity(cam).insert(Dlss::<DlssRayReconstructionFeature> {
-            perf_quality_mode: bevy::anti_alias::dlss::DlssPerfQualityMode::Auto,
-            reset: false,
-            _phantom_data: core::marker::PhantomData,
-        });
-        info!("voxel-RT: DLSS Ray Reconstruction enabled on the editor camera (Auto quality)");
+}
+
+/// Main-world (Update): reconcile DLSS Ray Reconstruction on the [`SdfCamera`] to match [`DlssSettings`]
+/// (gated on RR being supported — the [`DlssRayReconstructionSupported`] resource appears after device init).
+/// Adds the [`Dlss`]`<RayReconstruction>` component when enabled (its `#[require(TemporalJitter, MipBias,
+/// DepthPrepass, MotionVectorPrepass, Hdr)]` pulls in the rest); removes it (plus TemporalJitter + MipBias, so
+/// the non-RR temporal-accum fallback isn't left jittering) when disabled; and updates the quality mode live.
+/// No-op forever on machines without RR support.
+#[cfg(feature = "dlss")]
+fn sync_dlss_camera(
+    mut commands: Commands,
+    settings: Res<DlssSettings>,
+    supported: Option<Res<DlssRayReconstructionSupported>>,
+    mut cams: Query<(Entity, Option<&mut Dlss<DlssRayReconstructionFeature>>), With<SdfCamera>>,
+) {
+    let want = supported.is_some() && settings.enabled;
+    for (cam, dlss) in &mut cams {
+        match (want, dlss) {
+            (true, Some(mut d)) => {
+                if d.perf_quality_mode != settings.mode {
+                    d.perf_quality_mode = settings.mode;
+                }
+            }
+            (true, None) => {
+                commands.entity(cam).insert(Dlss::<DlssRayReconstructionFeature> {
+                    perf_quality_mode: settings.mode,
+                    reset: false,
+                    _phantom_data: core::marker::PhantomData,
+                });
+                info!("voxel-RT: DLSS-RR enabled on the editor camera ({:?})", settings.mode);
+            }
+            (false, Some(_)) => {
+                commands
+                    .entity(cam)
+                    .remove::<Dlss<DlssRayReconstructionFeature>>()
+                    .remove::<bevy::render::camera::TemporalJitter>()
+                    .remove::<bevy::render::camera::MipBias>();
+                info!("voxel-RT: DLSS-RR disabled (temporal-accumulation fallback)");
+            }
+            (false, None) => {}
+        }
     }
 }
 

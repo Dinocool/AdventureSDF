@@ -23,62 +23,119 @@ const DEBUG_LABELS: [&str; 7] = [
 
 /// The panel body. Registered via `editor::panels::register_panel`.
 pub fn render_gi_panel(world: &mut World, ui: &mut egui::Ui) {
-    let Some(mut lighting) = world.get_resource_mut::<VoxelRtLighting>() else {
-        ui.label("voxel renderer not active");
-        return;
-    };
-    let d = &mut lighting.data;
+    // Scope the `VoxelRtLighting` borrow so it ends before the DLSS section reads other world resources.
+    {
+        let Some(mut lighting) = world.get_resource_mut::<VoxelRtLighting>() else {
+            ui.label("voxel renderer not active");
+            return;
+        };
+        let d = &mut lighting.data;
 
-    ui.label(egui::RichText::new("Debug view").strong());
-    let cur = (d.debug_view as usize).min(DEBUG_LABELS.len() - 1);
-    egui::ComboBox::from_id_salt("voxel_debug_view")
-        .selected_text(DEBUG_LABELS[cur])
-        .show_ui(ui, |ui| {
-            for (i, label) in DEBUG_LABELS.iter().enumerate() {
-                ui.selectable_value(&mut d.debug_view, i as u32, *label);
-            }
-        });
-    ui.label(
-        egui::RichText::new("Face orient: green = front, RED = back-face hit (show-through bug)")
+        ui.label(egui::RichText::new("Debug view").strong());
+        let cur = (d.debug_view as usize).min(DEBUG_LABELS.len() - 1);
+        egui::ComboBox::from_id_salt("voxel_debug_view")
+            .selected_text(DEBUG_LABELS[cur])
+            .show_ui(ui, |ui| {
+                for (i, label) in DEBUG_LABELS.iter().enumerate() {
+                    ui.selectable_value(&mut d.debug_view, i as u32, *label);
+                }
+            });
+        ui.label(
+            egui::RichText::new(
+                "Face orient: green = front, RED = back-face hit (show-through bug)",
+            )
             .weak()
             .size(11.0),
-    );
+        );
 
-    ui.separator();
-    ui.label(egui::RichText::new("Sun").strong());
-    ui.add(egui::Slider::new(&mut d.sun_intensity, 0.0..=5.0).text("intensity"));
-    let mut dir = Vec3::from_array(d.sun_direction);
-    let mut dir_changed = false;
-    dir_changed |= ui.add(egui::Slider::new(&mut dir.x, -1.0..=1.0).text("dir x")).changed();
-    dir_changed |= ui.add(egui::Slider::new(&mut dir.y, -1.0..=1.0).text("dir y")).changed();
-    dir_changed |= ui.add(egui::Slider::new(&mut dir.z, -1.0..=1.0).text("dir z")).changed();
-    if dir_changed {
-        let n = dir.normalize_or_zero();
-        if n != Vec3::ZERO {
-            d.sun_direction = n.into();
+        ui.separator();
+        ui.label(egui::RichText::new("Sun").strong());
+        ui.add(egui::Slider::new(&mut d.sun_intensity, 0.0..=5.0).text("intensity"));
+        let mut dir = Vec3::from_array(d.sun_direction);
+        let mut dir_changed = false;
+        dir_changed |= ui
+            .add(egui::Slider::new(&mut dir.x, -1.0..=1.0).text("dir x"))
+            .changed();
+        dir_changed |= ui
+            .add(egui::Slider::new(&mut dir.y, -1.0..=1.0).text("dir y"))
+            .changed();
+        dir_changed |= ui
+            .add(egui::Slider::new(&mut dir.z, -1.0..=1.0).text("dir z"))
+            .changed();
+        if dir_changed {
+            let n = dir.normalize_or_zero();
+            if n != Vec3::ZERO {
+                d.sun_direction = n.into();
+            }
         }
-    }
-    color_row(ui, "color", &mut d.sun_color);
+        color_row(ui, "color", &mut d.sun_color);
 
-    ui.separator();
-    ui.label(egui::RichText::new("Ambient / AO").strong());
-    color_row(ui, "ambient", &mut d.ambient_color);
-    ui.add(egui::Slider::new(&mut d.ao_radius, 0.0..=3.0).text("AO radius (m)"));
-    ui.add(egui::Slider::new(&mut d.ao_samples, 0..=8).text("AO samples"));
-    ui.add(egui::Slider::new(&mut d.shadow_bias, 0.0..=0.2).text("shadow bias"));
+        ui.separator();
+        ui.label(egui::RichText::new("Ambient / AO").strong());
+        color_row(ui, "ambient", &mut d.ambient_color);
+        ui.add(egui::Slider::new(&mut d.ao_radius, 0.0..=3.0).text("AO radius (m)"));
+        ui.add(egui::Slider::new(&mut d.ao_samples, 0..=8).text("AO samples"));
+        ui.add(egui::Slider::new(&mut d.shadow_bias, 0.0..=0.2).text("shadow bias"));
 
-    ui.separator();
-    ui.label(egui::RichText::new("Global illumination").strong());
-    ui.add(egui::Slider::new(&mut d.gi_rays, 0..=32).text("GI rays / px"));
-    ui.add(egui::Slider::new(&mut d.gi_intensity, 0.0..=4.0).text("GI intensity"));
-    ui.add(egui::Slider::new(&mut d.gi_bounce_dist, 1.0..=64.0).text("bounce dist (m)"));
-    ui.add(egui::Slider::new(&mut d.emissive_strength, 0.0..=16.0).text("emissive strength"));
+        ui.separator();
+        ui.label(egui::RichText::new("Global illumination").strong());
+        ui.add(egui::Slider::new(&mut d.gi_rays, 0..=32).text("GI rays / px"));
+        ui.add(egui::Slider::new(&mut d.gi_intensity, 0.0..=4.0).text("GI intensity"));
+        ui.add(egui::Slider::new(&mut d.gi_bounce_dist, 1.0..=64.0).text("bounce dist (m)"));
+        ui.add(egui::Slider::new(&mut d.emissive_strength, 0.0..=16.0).text("emissive strength"));
 
-    ui.separator();
-    if ui.button("Reset to Cornell defaults").clicked() {
-        let keep = d.debug_view;
-        *d = LightingUniformData::cornell();
-        d.debug_view = keep;
+        ui.separator();
+        if ui.button("Reset to Cornell defaults").clicked() {
+            let keep = d.debug_view;
+            *d = LightingUniformData::cornell();
+            d.debug_view = keep;
+        }
+    } // `lighting` borrow released here
+
+    // DLSS Ray Reconstruction controls (only when built with `--features dlss`). RR denoises + upscales the
+    // noisy GI; toggle it and pick the quality preset live.
+    #[cfg(feature = "dlss")]
+    {
+        ui.separator();
+        ui.label(egui::RichText::new("DLSS Ray Reconstruction").strong());
+        let supported = world
+            .get_resource::<bevy::anti_alias::dlss::DlssRayReconstructionSupported>()
+            .is_some();
+        if !supported {
+            ui.label(egui::RichText::new("not supported on this GPU/driver").weak());
+        } else if let Some(mut s) = world.get_resource_mut::<crate::voxel::raytrace::DlssSettings>()
+        {
+            ui.checkbox(&mut s.enabled, "RR enabled (denoise + upscale)");
+            let enabled = s.enabled;
+            ui.add_enabled_ui(enabled, |ui| {
+                use bevy::anti_alias::dlss::DlssPerfQualityMode as M;
+                let modes = [
+                    (M::Auto, "Auto"),
+                    (M::Dlaa, "DLAA — native res, best quality"),
+                    (M::Quality, "Quality"),
+                    (M::Balanced, "Balanced"),
+                    (M::Performance, "Performance"),
+                    (M::UltraPerformance, "Ultra Performance"),
+                ];
+                let cur = modes
+                    .iter()
+                    .find(|(m, _)| *m == s.mode)
+                    .map(|(_, l)| *l)
+                    .unwrap_or("Auto");
+                egui::ComboBox::from_id_salt("dlss_mode")
+                    .selected_text(cur)
+                    .show_ui(ui, |ui| {
+                        for (m, label) in modes {
+                            ui.selectable_value(&mut s.mode, m, label);
+                        }
+                    });
+            });
+            ui.label(
+                egui::RichText::new("DLAA = denoise at native res (cleanest); lower presets render smaller + upscale")
+                    .weak()
+                    .size(11.0),
+            );
+        }
     }
 }
 
