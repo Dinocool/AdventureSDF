@@ -523,11 +523,14 @@ fn sync_dlss_camera(
                 if d.perf_quality_mode != settings.mode {
                     d.perf_quality_mode = settings.mode;
                 }
+                // Never reset RR on a terrain edit (or a camera move) — RR reprojects via motion and the
+                // ReSTIR reservoirs adapt locally, so the GI smoothly follows edits instead of full-clearing.
+                d.reset = false;
             }
             (true, None) => {
                 commands.entity(cam).insert(Dlss::<DlssRayReconstructionFeature> {
                     perf_quality_mode: settings.mode,
-                    reset: false,
+                    reset: true, // clean start only when RR is first attached
                     _phantom_data: core::marker::PhantomData,
                 });
                 info!("voxel-RT: DLSS-RR enabled on the editor camera ({:?})", settings.mode);
@@ -1501,10 +1504,13 @@ fn voxel_rt_pass(
         ],
     });
 
-    // ReSTIR group(2): the restir params + the ping-ponged reservoir buffers (write cur, read prev). `reset`
-    // (camera move / geometry re-pack / fresh allocation) makes the shader ignore the stale previous frame.
+    // ReSTIR group(2): the restir params + the ping-ponged reservoir buffers (write cur, read prev). The
+    // reservoir `reset` fires only on a CAMERA MOVE (this non-DLSS path has no reprojection, so a move makes
+    // the same-pixel reservoir stale) — NOT on a geometry edit: the reservoirs adapt locally to terrain edits
+    // (fresh candidates + visibility + dissimilarity), so editing doesn't full-clear the GI. (The on-top
+    // history accumulator above still resets on `geometry_changed` — that just shows the fresh frame, not a clear.)
     let restir_params = RestirParamsData {
-        reset: u32::from(moved || geometry_changed),
+        reset: u32::from(moved),
         frame_index,
         viewport_x: viewport.x,
         viewport_y: viewport.y,
@@ -1878,13 +1884,15 @@ fn voxel_rt_dlss_pass(
     });
     resources.dlss_prev_clip_from_world = Some(view_proj_unjittered);
 
-    // ReSTIR reset: ONLY a render-resolution change, a geometry re-pack, or the first frame invalidates the
-    // reservoirs. Camera motion is NO LONGER a reset — the shader reprojects the temporal tap via motion
-    // vectors (and rejects disocclusions by dissimilarity), so accumulation continues through motion.
+    // ReSTIR reset: ONLY a render-resolution change or the first frame fully clears the reservoirs. Camera
+    // motion is handled by motion-vector reprojection, and — deliberately — a GEOMETRY EDIT does NOT reset:
+    // the world-space reservoirs adapt locally (fresh candidates re-trace the new geometry, the visibility
+    // trace drops now-occluded samples, dissimilarity rejects moved surfaces), so editing terrain makes the
+    // GI smoothly follow the change over a few frames instead of full-screen clearing.
     let built_gen = resources.built_generation;
     let reset_restir = match resources.dlss_restir_prev {
         None => true,
-        Some((r, _vp, g)) => r != render_res || g != built_gen,
+        Some((r, _vp, _g)) => r != render_res,
     };
     resources.dlss_restir_prev = Some((render_res, view_proj_unjittered, built_gen));
 
@@ -1919,6 +1927,9 @@ fn voxel_rt_dlss_pass(
     });
 
     // ReSTIR group(2): params + ping-ponged reservoirs (write cur, read prev).
+    // Scale the spatial-reuse radius by the upscale factor so it covers a constant WORLD/output area at
+    // upscaling DLSS modes (the knob is in output pixels; the dispatch is at render_res). At DLAA this is 1.0.
+    let upscale = full.x as f32 / render_res.x.max(1) as f32;
     let restir_params = RestirParamsData {
         reset: u32::from(reset_restir),
         frame_index,
@@ -1926,7 +1937,7 @@ fn voxel_rt_dlss_pass(
         viewport_y: render_res.y,
         spatial_samples: restir_settings.spatial_samples,
         confidence_weight_cap: restir_settings.confidence_cap,
-        spatial_radius: restir_settings.spatial_radius,
+        spatial_radius: restir_settings.spatial_radius * upscale,
         _pad: 0,
     };
     let restir_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {

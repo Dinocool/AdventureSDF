@@ -907,10 +907,13 @@ fn restir_luminance(c: vec3<f32>) -> f32 {
     return dot(c, vec3<f32>(0.2126, 0.7152, 0.0722));
 }
 
-// Balance heuristic MIS weight for a pair (Veach): a / (a + b), 0 when both are 0.
+// Balance-heuristic MIS weight for a pair (Veach), Solari's NaN-safe form: a/(a+b) rewritten as
+// 1/(1+b/a). The naive `a/(a+b)` gives `inf/inf → NaN` when a target function overflows, and that NaN is
+// STORED in the reservoir and reused forever (a permanent dead pixel). This form returns 1 for a=inf and 0
+// for b=inf instead. 0 when a == 0.
 fn balance_heuristic(a: f32, b: f32) -> f32 {
-    let s = a + b;
-    return select(0.0, a / s, s > 0.0);
+    if (a == 0.0) { return 0.0; }
+    return max(0.0, 1.0 / (1.0 + b / a));
 }
 
 fn restir_isinf(x: f32) -> bool { return (bitcast<u32>(x) & 0x7fffffffu) == 0x7f800000u; }
@@ -951,6 +954,15 @@ fn generate_initial_reservoir(world_position: vec3<f32>, world_normal: vec3<f32>
     reservoir.confidence_weight = 1.0;
     // L_o at the sample point = direct lighting there + its emissive (emissive INCLUDED — the adaptation).
     reservoir.radiance = direct_lighting(r.color.rgb, r.normal, hp) + r.emissive * light.emissive_strength;
+    // Firefly clamp (hue-preserving), same as `gather_gi`. ReSTIR STORES + reuses samples, so an unclamped
+    // bright outlier (a grazing emissive hit) persists + propagates across the buffer — worse than in the
+    // plain mean. `gi_firefly_clamp == 0` disables it (the unbiased probe test sets 0). Small bias for stability.
+    if (light.gi_firefly_clamp > 0.0) {
+        let mx = max(reservoir.radiance.r, max(reservoir.radiance.g, reservoir.radiance.b));
+        if (mx > light.gi_firefly_clamp) {
+            reservoir.radiance = reservoir.radiance * (light.gi_firefly_clamp / mx);
+        }
+    }
     reservoir.unbiased_contribution_weight = uniform_hemisphere_inverse_pdf();
     return reservoir;
 }
@@ -1215,8 +1227,15 @@ fn restir_gi(n: vec3<f32>, p: vec3<f32>, pix: vec2<u32>, temporal_base: vec2<i32
             tb = vec2<i32>(pix);
         }
         let tpix = permute_pixel(vec2<u32>(tb), restir_params.frame_index, vp);
-        let tidx = tpix.y * vp.x + tpix.x;
-        let surf = surfaces_prev[tidx];
+        // Try the PERMUTED tap; if it lands on a dissimilar/invalid surface, fall back to the un-permuted
+        // reprojected pixel (Solari's point-reprojection fallback). This matters at DLSS upscaling, where the
+        // permute lands off-surface more often per render-res pixel — without it the history drops and boils.
+        var tidx = tpix.y * vp.x + tpix.x;
+        var surf = surfaces_prev[tidx];
+        if (surf.valid <= 0.5 || surfaces_dissimilar(p, n, surf.world_position, surf.world_normal)) {
+            tidx = u32(tb.y) * vp.x + u32(tb.x);
+            surf = surfaces_prev[tidx];
+        }
         if (surf.valid > 0.5 && !surfaces_dissimilar(p, n, surf.world_position, surf.world_normal)) {
             var temporal = reservoirs_prev[tidx];
             temporal.confidence_weight = min(temporal.confidence_weight, restir_params.confidence_weight_cap);
@@ -1257,6 +1276,11 @@ fn restir_gi(n: vec3<f32>, p: vec3<f32>, pix: vec2<u32>, temporal_base: vec2<i32
     // stored reservoir and then reusing it at other pixels is exactly what makes bright (e.g. red-wall)
     // samples diffuse across the buffer over frames (the leak). So: store first, then shade with a throwaway
     // visibility-corrected copy.
+    // Robustness: never persist a non-finite contribution weight — a stored NaN/Inf is reused forever (a
+    // permanent dead pixel). (A1's balance-heuristic form should prevent the source; this is belt-and-braces.)
+    if (restir_isnan(res.unbiased_contribution_weight) || restir_isinf(res.unbiased_contribution_weight)) {
+        res.unbiased_contribution_weight = 0.0;
+    }
     reservoirs_cur[idx] = res;
     var shaded = res;
     if (shaded.confidence_weight > 0.0) {
@@ -1297,7 +1321,11 @@ fn reproject_pixel(p: vec3<f32>, prev_clip_from_world: mat4x4<f32>, vp: vec2<u32
     let prev_clip = prev_clip_from_world * vec4<f32>(p, 1.0);
     let prev_ndc = prev_clip.xy / prev_clip.w;
     let prev_uv = prev_ndc * vec2<f32>(0.5, -0.5) + vec2<f32>(0.5);
-    return vec2<i32>(floor(prev_uv * vec2<f32>(vp)));
+    // ROUND to the nearest previous-frame pixel centre (Solari `load_temporal_reservoir`). `floor` biases the
+    // tap up to a full pixel toward the origin — and at DLSS upscaling modes one render-res pixel = several
+    // output pixels, so a `floor` bias visibly de-stabilises the temporal reuse (clean at DLAA, boils at
+    // Quality/Performance). `prev_uv*vp - 0.5` is the pixel-centre coordinate; round it to the pixel index.
+    return vec2<i32>(round(prev_uv * vec2<f32>(vp) - vec2<f32>(0.5)));
 }
 
 // The ReSTIR variant of `raymarch` (non-DLSS path). Identical primary-ray + debug + temporal-accumulation
