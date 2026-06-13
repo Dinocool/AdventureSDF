@@ -238,25 +238,49 @@ impl ResidencyManager {
         registry: &BlockRegistry,
         seed: u64,
     ) -> usize {
+        use bevy::tasks::{ComputeTaskPool, ParallelSlice};
         let budget = cfg.max_bricks_per_frame;
-        let mut done = 0usize;
-        while done < budget {
+        // Pop the per-frame batch first (serial, cheap): up to `budget` queued coords.
+        let mut coords: Vec<IVec3> = Vec::with_capacity(budget.min(self.queue.len()));
+        while coords.len() < budget {
             let Some(item) = self.queue.pop_front() else { break };
             self.queued.remove(&item.coord);
-            done += 1;
-
-            let want_lod = brick_lod(item.coord, self.last_cam, cfg);
-            let brick = voxelize_brick(item.coord, layer, lib, registry, seed);
-            if brick.is_empty() {
-                // All-air at full res → never resident (and if it WAS resident at a coarser LOD, drop it).
-                if self.resident.remove(&item.coord).is_some() {
+            coords.push(item.coord);
+        }
+        let done = coords.len();
+        if done > 0 {
+            // Voxelize the batch IN PARALLEL on the compute task pool. `voxelize_brick` is a pure function of
+            // `(coord, seed, &layer, &lib, &registry)` (all shared + Sync), so this is determinism-preserving:
+            // each coord yields an identical brick regardless of thread, and we apply the results in a fixed
+            // order — the resident set is bit-identical to the old serial loop. Chunked (~one chunk per worker)
+            // so we spawn a handful of tasks, not one per brick. (~5× of the per-frame drain on the 4090.)
+            let last_cam = self.last_cam;
+            // `get_or_init` (not `get`): the running app already initialized the ComputeTaskPool, but the
+            // headless tests + perf harness call drain_work directly with no Bevy app — there `get()` panics,
+            // so init a default pool on first use. (Same pool the live app uses when one exists.)
+            let pool = ComputeTaskPool::get_or_init(bevy::tasks::TaskPool::default);
+            let chunk = done.div_ceil(pool.thread_num().max(1)).max(1);
+            let results: Vec<(IVec3, Brick, u32)> = coords
+                .par_chunk_map(pool, chunk, |_, cs| {
+                    cs.iter()
+                        .map(|&c| (c, voxelize_brick(c, layer, lib, registry, seed), brick_lod(c, last_cam, cfg)))
+                        .collect::<Vec<_>>()
+                })
+                .into_iter()
+                .flatten()
+                .collect();
+            // Apply serially (HashMap mutation): non-empty bricks become resident; an all-air brick drops any
+            // existing (coarser-LOD) resident entry. Identical to the old per-brick logic.
+            for (coord, brick, want_lod) in results {
+                if brick.is_empty() {
+                    if self.resident.remove(&coord).is_some() {
+                        self.dirty = true;
+                    }
+                } else {
+                    self.resident.insert(coord, (brick, want_lod));
                     self.dirty = true;
                 }
-                continue;
             }
-            // Store the full-res brick + its target LOD; the packer downsamples at pack time.
-            self.resident.insert(item.coord, (brick, want_lod));
-            self.dirty = true;
         }
         if !self.queue.is_empty() {
             bevy::log::debug!(
