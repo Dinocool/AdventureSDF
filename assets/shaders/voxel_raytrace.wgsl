@@ -106,14 +106,17 @@ fn cell_index(x: i32, y: i32, z: i32, edge: i32) -> u32 {
 fn dh_found(d: vec4<f32>) -> bool { return d.x > 0.5; }
 fn dh_t(d: vec4<f32>) -> f32 { return d.y; }
 fn dh_block(d: vec4<f32>) -> u32 { return u32(d.z); }
-// The outward face normal from the packed axis index: points back along that axis against the ray.
+// The outward face normal, decoded from the packed occupancy-gradient code (`dda_brick` packs
+// (gx+1)+(gy+1)*3+(gz+1)*9 in [0,26] into `.w`). Camera-INDEPENDENT: a pure function of the hit cell's
+// 6-neighbour occupancy, so it never flips with the view angle. `rd` is unused (kept for call-site stability).
 fn dh_normal(d: vec4<f32>, rd: vec3<f32>) -> vec3<f32> {
-    let axis = i32(d.w);
-    var n = vec3<f32>(0.0);
-    if (axis == 0) { n.x = -sign(rd.x); }
-    else if (axis == 1) { n.y = -sign(rd.y); }
-    else { n.z = -sign(rd.z); }
-    return select(vec3<f32>(0.0), n, d.x > 0.5);
+    let code = i32(d.w);
+    let g = vec3<f32>(
+        f32((code % 3) - 1),
+        f32(((code / 3) % 3) - 1),
+        f32((code / 9) - 1),
+    );
+    return select(vec3<f32>(0.0), normalize(g), d.x > 0.5 && dot(g, g) > 0.0);
 }
 
 // DDA-march brick `prim`'s voxels along the world ray (`ro` + t·`rd`, t in [t_enter, t_exit]) to the first
@@ -152,27 +155,19 @@ fn dda_brick(prim: u32, ro: vec3<f32>, rd: vec3<f32>, t_enter: f32, t_exit: f32)
     var t_max = select(big, (next_boundary - ro) * inv, nonzero);   // world-t to cross each axis boundary
     let t_delta = select(big, abs(vec3<f32>(csize) * inv), nonzero); // world-t to cross one cell per axis
 
-    // The axis (0=x,1=y,2=z) the ray crossed to enter the CURRENT cell. Seeded with the grid-AABB entry face
-    // (the largest near-slab axis), then overwritten by the DDA on each advance — so it always reflects the
-    // last boundary actually crossed.
-    let ta = (gmin - ro) * inv;
-    let tb = (gmin + vec3<f32>(csize * f32(hedge)) - ro) * inv;
-    let t_near = min(ta, tb); // per-axis near-slab t
-    var enter_axis: i32 = 0;
-    if (t_near.y >= t_near.x && t_near.y >= t_near.z) {
-        enter_axis = 1;
-    } else if (t_near.z >= t_near.x && t_near.z >= t_near.y) {
-        enter_axis = 2;
-    } else {
-        enter_axis = 0;
-    }
-
     // Scalar accumulators with a SINGLE return at the end (naga dislikes returning a mutated `var` struct from
     // multiple in-loop exits). `found` flips true on the first solid CORE cell; `hit_vox` records its cell.
+    // `last_axis` is the axis whose boundary the ray CROSSED to enter the current cell — seeded with the
+    // AABB-entry face (largest near-slab t) and updated on every DDA advance. It is the face the ray actually
+    // struck, which is what gives a cube CRISP PER-FACE normals (each face reads its own normal).
     var found = false;
     var hit_t = -1.0;
     var hit_id = 0u;
     var hit_vox = vec3<i32>(0);
+    let tn = min((gmin - ro) * inv, (gmin + vec3<f32>(csize * f32(hedge)) - ro) * inv);
+    var last_axis: i32 = 0;
+    if (tn.y >= tn.x && tn.y >= tn.z) { last_axis = 1; }
+    else if (tn.z >= tn.x && tn.z >= tn.y) { last_axis = 2; }
 
     // Walk at most the full diagonal of the haloed grid (3·hedge cells is a safe bound).
     var t_cur = t0;
@@ -193,13 +188,13 @@ fn dda_brick(prim: u32, ro: vec3<f32>, rd: vec3<f32>, t_enter: f32, t_exit: f32)
             hit_id = id;
             hit_vox = vox;
         } else {
-            // Advance to the next cell across the smallest t_max axis.
+            // Advance to the next cell across the smallest t_max axis; record which axis we crossed.
             if (t_max.x < t_max.y && t_max.x < t_max.z) {
-                t_cur = t_max.x; t_max.x = t_max.x + t_delta.x; vox.x = vox.x + step.x;
+                t_cur = t_max.x; t_max.x = t_max.x + t_delta.x; vox.x = vox.x + step.x; last_axis = 0;
             } else if (t_max.y < t_max.z) {
-                t_cur = t_max.y; t_max.y = t_max.y + t_delta.y; vox.y = vox.y + step.y;
+                t_cur = t_max.y; t_max.y = t_max.y + t_delta.y; vox.y = vox.y + step.y; last_axis = 1;
             } else {
-                t_cur = t_max.z; t_max.z = t_max.z + t_delta.z; vox.z = vox.z + step.z;
+                t_cur = t_max.z; t_max.z = t_max.z + t_delta.z; vox.z = vox.z + step.z; last_axis = 2;
             }
             if (t_cur > t_exit) {
                 break; // left the brick before hitting anything solid
@@ -207,38 +202,35 @@ fn dda_brick(prim: u32, ro: vec3<f32>, rd: vec3<f32>, t_enter: f32, t_exit: f32)
         }
     }
 
-    // Outward FACE NORMAL from the OCCUPANCY GRADIENT of the hit cell in the HALOED grid (robust at every brick
-    // boundary because the halo carries the neighbour voxels). The exposed faces are the axes whose INCOMING
-    // neighbour cell (on the ray's near side, `hit_vox - step`) is AIR — a real air→solid surface there. Among
-    // those, pick the one the ray most head-on enters (largest |rd| component), so a grazing ray skimming a
-    // flat top still reads the +Y top face (its only air-neighbour face) instead of a sideways seam normal.
-    // `enter_axis` (the AABB-entry face) is the fallback if no neighbour is air (a fully-buried cell — never
-    // actually visible, but keeps the result defined).
-    var best_axis = enter_axis;
-    var best_score = -1.0;
-    for (var a = 0; a < 3; a = a + 1) {
-        let s = step[a];
-        if (s == 0) { continue; } // ray doesn't move along this axis → it cannot be the entry face
-        // The neighbour on the ray's INCOMING side of the hit cell (where the ray came from).
-        var nb = hit_vox;
-        nb[a] = nb[a] - s;
-        let nb_oob = nb.x < 0 || nb.x >= hedge || nb.y < 0 || nb.y >= hedge || nb.z < 0 || nb.z >= hedge;
-        var nb_solid = false;
-        if (!nb_oob) {
-            nb_solid = voxels[m.voxel_offset + cell_index(nb.x, nb.y, nb.z, hedge)] != 0u;
-        }
-        // Exposed face on this axis iff the incoming neighbour is AIR (or outside the haloed grid). Score by how
-        // head-on the ray meets it (|rd[a]|) so the dominant entry face wins ties.
-        if (!nb_solid) {
-            let score = abs(rd[a]);
-            if (score > best_score) {
-                best_score = score;
-                best_axis = a;
+    // Outward FACE NORMAL = the face the ray ENTERED the hit cell through (the crossed axis), so each face of a
+    // cube gets its OWN crisp normal and it is camera-INDEPENDENT per face (no whole-flat-face "normal swap").
+    // BUT a grazing ray skimming a FLAT surface enters the surface voxel through a BURIED side face (the
+    // surface continues there), which would read a sideways normal = the dark brick-seam line. So: use the
+    // crossed face ONLY when it is EXPOSED (its incoming-side neighbour is air); otherwise fall back to the
+    // (single, for a flat surface) exposed face, taken in a fixed axis order so it stays camera-independent.
+    // The halo carries the neighbours, so a core cell's face-neighbours are all in-bounds. Packed as a
+    // single-axis unit `grad` and decoded+normalized in `dh_normal`.
+    var grad = vec3<i32>(0);
+    var cnb = hit_vox; cnb[last_axis] = cnb[last_axis] - step[last_axis]; // neighbour the ray came from
+    let crossed_air = cnb[last_axis] < 0 || cnb[last_axis] >= hedge
+        || voxels[m.voxel_offset + cell_index(cnb.x, cnb.y, cnb.z, hedge)] == 0u;
+    if (crossed_air) {
+        grad[last_axis] = -step[last_axis]; // crisp crossed-axis face (outward = back along the ray)
+    } else {
+        // Grazing into a flat/buried surface → take the first EXPOSED face (a flat surface has exactly one).
+        for (var a = 0; a < 3; a = a + 1) {
+            if (grad.x == 0 && grad.y == 0 && grad.z == 0) {
+                var pn = hit_vox; pn[a] = pn[a] + 1;
+                var mn = hit_vox; mn[a] = mn[a] - 1;
+                let p_air = pn[a] >= hedge || voxels[m.voxel_offset + cell_index(pn.x, pn.y, pn.z, hedge)] == 0u;
+                let m_air = mn[a] < 0 || voxels[m.voxel_offset + cell_index(mn.x, mn.y, mn.z, hedge)] == 0u;
+                if (p_air) { grad[a] = 1; } else if (m_air) { grad[a] = -1; }
             }
         }
     }
+    let code = (grad.x + 1) + (grad.y + 1) * 3 + (grad.z + 1) * 9;
 
-    return vec4<f32>(select(0.0, 1.0, found), hit_t, f32(hit_id), f32(best_axis));
+    return vec4<f32>(select(0.0, 1.0, found), hit_t, f32(hit_id), f32(code));
 }
 
 // Re-DDA the COMMITTED brick to recover the first-solid voxel's block id AND its entry-face axis together (the
