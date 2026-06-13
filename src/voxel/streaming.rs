@@ -153,6 +153,13 @@ pub struct ResidencyManager {
     /// guard (`queued`) prevents a brick from being enqueued twice while it waits.
     queue: std::collections::VecDeque<WorkItem>,
     queued: FxHashSet<IVec3>,
+    /// KNOWN-EMPTY (all-air) coords in the current region: bricks that voxelized to empty (above the surface)
+    /// are NEVER resident (sparsity), so without this memo `update` would find them absent and re-enqueue +
+    /// re-voxelize them on EVERY camera move — and most of the desired region (~2/3) is empty sky/air, so that
+    /// was the dominant streaming churn (tens of thousands of pointless re-voxelizes per move). Memoize them so
+    /// each empty brick is voxelized ONCE; bounded to the region (`update` prunes coords that leave). Empty is
+    /// LOD-independent (all-air downsamples to all-air), so a LOD ring crossing never re-voxelizes them either.
+    empty: FxHashSet<IVec3>,
     /// True iff the resident set CHANGED since the last `take_dirty` — the render path re-packs + rebuilds
     /// the BLAS/TLAS only then (otherwise it keeps the old, still-valid GPU scene).
     dirty: bool,
@@ -207,16 +214,34 @@ impl ResidencyManager {
             dropped += 1;
             self.dirty = true; // the GPU set shrank → must re-pack
         }
+        // Prune the empty-memo to the current region (bounds it as the camera roams; a coord that re-enters
+        // is cheaply re-voxelized + re-memoized). Deterministic terrain ⇒ an empty coord is always empty.
+        self.empty.retain(|c| desired.contains_key(c));
 
-        // Enqueue desired bricks that are missing or at the wrong LOD (and not already queued).
+        // Reconcile each desired brick:
+        //  * RESIDENT, LOD changed (crossed a ring): the stored brick is FULL-RES and LOD-independent (the
+        //    packer downsamples at pack time), so the voxel data is UNCHANGED — just RETAG the LOD + mark
+        //    dirty. NO re-voxelize. This is the big win: a 1-brick camera move shifts every LOD-ring shell, so
+        //    re-voxelizing all those (expensive graph evals) was the dominant streaming churn (~tens of
+        //    thousands of bricks/move) when only their downsample-LOD changed.
+        //  * RESIDENT, LOD same: nothing to do.
+        //  * NOT resident (newly entered): enqueue for voxelization (if not already queued).
         for (&coord, &want_lod) in &desired {
-            let needs = match self.resident.get(&coord) {
-                Some((_, have_lod)) => *have_lod != want_lod, // crossed a LOD ring → re-voxelize at new LOD
-                None => true,                                 // newly entered
-            };
-            if needs && !self.queued.contains(&coord) {
-                self.queue.push_back(WorkItem { coord });
-                self.queued.insert(coord);
+            match self.resident.get_mut(&coord) {
+                Some((_, have_lod)) => {
+                    if *have_lod != want_lod {
+                        *have_lod = want_lod; // retag only; packer downsamples the unchanged full-res brick
+                        self.dirty = true;
+                    }
+                }
+                None => {
+                    // Enqueue only if not already queued AND not known-empty (a memoized all-air brick is
+                    // correctly absent from the GPU set — re-voxelizing it would find empty again).
+                    if !self.queued.contains(&coord) && !self.empty.contains(&coord) {
+                        self.queue.push_back(WorkItem { coord });
+                        self.queued.insert(coord);
+                    }
+                }
             }
         }
         dropped
@@ -273,10 +298,13 @@ impl ResidencyManager {
             // existing (coarser-LOD) resident entry. Identical to the old per-brick logic.
             for (coord, brick, want_lod) in results {
                 if brick.is_empty() {
+                    // All-air → never resident; MEMOIZE so future moves don't re-voxelize it (the big churn fix).
+                    self.empty.insert(coord);
                     if self.resident.remove(&coord).is_some() {
                         self.dirty = true;
                     }
                 } else {
+                    self.empty.remove(&coord); // defensive: a now-solid coord must not stay memoized empty
                     self.resident.insert(coord, (brick, want_lod));
                     self.dirty = true;
                 }
