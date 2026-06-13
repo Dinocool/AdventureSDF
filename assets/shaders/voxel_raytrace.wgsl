@@ -1161,7 +1161,9 @@ fn permute_pixel(pixel_id: vec2<u32>, frame_index: u32, vp: vec2<u32>) -> vec2<u
 fn surfaces_dissimilar(p: vec3<f32>, n: vec3<f32>, op: vec3<f32>, on: vec3<f32>) -> bool {
     let tangent_plane_distance = abs(dot(n, op - p));
     let view_dist = max(length(p - camera.cam_pos), 1.0e-3);
-    return tangent_plane_distance / view_dist > 0.01 || dot(n, on) < 0.5;
+    // Solari thresholds: reject if the neighbour is >0.3% of view-distance out of the tangent plane, or its
+    // normal is >90° away. (Looser values leak GI across co-planar patches with different occlusion.)
+    return tangent_plane_distance / view_dist > 0.003 || dot(n, on) < 0.0;
 }
 
 // Uniform sample in a disk of `radius` pixels (concentric area-uniform), for spatial-neighbour selection.
@@ -1244,21 +1246,25 @@ fn restir_gi(n: vec3<f32>, p: vec3<f32>, pix: vec2<u32>, temporal_base: vec2<i32
         }
     }
 
-    // VISIBILITY / bias correction: zero the contribution weight if the receiver can't actually see the
-    // selected sample point (Solari's `ucw *= trace_point_visibility`). Kills stale/occluded reused samples —
-    // the persistent fireflies that otherwise accumulate. Applied BEFORE store so the dead sample is also
-    // out-competed in future merges (the unbiased path).
-    if (res.confidence_weight > 0.0) {
+    // Store the UNBIASED reservoir (true ucw) BEFORE the visibility test — Solari's unbiased path. The stored
+    // reservoir must remain an unbiased estimate of incident radiance, because NEIGHBOURS resample it next
+    // frame; visibility is a per-RECEIVER shading correction only. Baking THIS pixel's occlusion into the
+    // stored reservoir and then reusing it at other pixels is exactly what makes bright (e.g. red-wall)
+    // samples diffuse across the buffer over frames (the leak). So: store first, then shade with a throwaway
+    // visibility-corrected copy.
+    reservoirs_cur[idx] = res;
+    var shaded = res;
+    if (shaded.confidence_weight > 0.0) {
         let origin = p + n * light.shadow_bias;
-        let to_sample = res.sample_point_world_position - origin;
+        let to_sample = shaded.sample_point_world_position - origin;
         let dist = length(to_sample);
-        if (dist > 2.0 * light.shadow_bias
-            && trace_occluded(origin, to_sample / dist, 0.0, dist - 2.0 * light.shadow_bias)) {
-            res.unbiased_contribution_weight = 0.0;
+        // Pull t_max back by one shadow_bias so the ray doesn't self-hit the sample point's own surface.
+        if (dist > light.shadow_bias
+            && trace_occluded(origin, to_sample / dist, 0.0, dist - light.shadow_bias)) {
+            shaded.unbiased_contribution_weight = 0.0;
         }
     }
-    reservoirs_cur[idx] = res;
-    return restir_resolve_irradiance(res, p, n);
+    return restir_resolve_irradiance(shaded, p, n);
 }
 
 // Like `shade`, but the indirect term comes from the per-pixel reservoir (ReSTIR) instead of `gather_gi`.
