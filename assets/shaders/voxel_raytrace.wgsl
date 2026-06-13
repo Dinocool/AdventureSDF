@@ -1130,11 +1130,27 @@ fn restir_gi(n: vec3<f32>, p: vec3<f32>, idx: u32, seed: u32) -> vec3<f32> {
         return vec3<f32>(0.0);
     }
     var rng = seed;
+    let brdf = vec3<f32>(1.0); // receiver albedo factored out (applied by the caller)
+
+    // INITIAL RIS over `gi_rays` candidates (same per-pixel sample budget as the legacy `gather_gi`). One
+    // candidate alone makes each pixel hold a single noisy sample → spatially-stable GRAIN that DLSS-RR
+    // preserves as if it were detail; resampling over M candidates cuts the per-pixel variance ~1/M, so the
+    // GI is smooth this frame AND the temporal merge below makes it stable across frames. Same-surface merges
+    // (Jacobian = 1). The combined reservoir then counts as ONE frame (confidence 1) so temporal reuse stays
+    // strong (history dominates a still camera). Spatial neighbour reuse is R2.
+    let m = min(light.gi_rays, 32u);
     var res = generate_initial_reservoir(p, n, &rng);
+    for (var i = 1u; i < m; i = i + 1u) {
+        let cand = generate_initial_reservoir(p, n, &rng);
+        let merged = merge_reservoirs(res, p, n, brdf, cand, p, n, brdf, &rng);
+        res = merged.merged_reservoir;
+    }
+    res.confidence_weight = 1.0;
+
+    // TEMPORAL reuse: merge the previous frame's same-pixel reservoir (unless reset).
     if (restir_params.reset == 0u) {
         var temporal = reservoirs_prev[idx];
         temporal.confidence_weight = min(temporal.confidence_weight, RESTIR_CONFIDENCE_CAP);
-        let brdf = vec3<f32>(1.0); // receiver albedo factored out (applied by the caller)
         let merged = merge_reservoirs(res, p, n, brdf, temporal, p, n, brdf, &rng);
         res = merged.merged_reservoir;
     }
