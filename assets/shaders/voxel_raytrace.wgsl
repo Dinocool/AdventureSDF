@@ -1154,7 +1154,10 @@ fn surfaces_dissimilar(p: vec3<f32>, n: vec3<f32>, op: vec3<f32>, on: vec3<f32>)
 // Reservoir-based indirect irradiance at pixel `idx` for surface (n, p): generate an initial candidate, merge
 // the previous frame's reservoir for this pixel (unless reset), store the merged reservoir, and resolve it.
 // Writes `reservoirs_cur[idx]` for the caller's pixel. Returns the indirect irradiance (× albedo by caller).
-fn restir_gi(n: vec3<f32>, p: vec3<f32>, pix: vec2<u32>, seed: u32) -> vec3<f32> {
+// `temporal_base` is the PREVIOUS-frame pixel this surface reprojects to (motion-vector reprojection done by
+// the caller; == `pix` for a still camera or the non-DLSS path). Reprojection lets temporal accumulation
+// CONTINUE through camera motion instead of resetting — disocclusions are caught by the dissimilarity reject.
+fn restir_gi(n: vec3<f32>, p: vec3<f32>, pix: vec2<u32>, temporal_base: vec2<i32>, seed: u32) -> vec3<f32> {
     let vp = vec2<u32>(restir_params.viewport_x, restir_params.viewport_y);
     let idx = pix.y * vp.x + pix.x;
     surfaces_cur[idx] = PixelSurface(p, 1.0, n, 0.0); // this pixel's receiver surface (for neighbours/next frame)
@@ -1183,7 +1186,13 @@ fn restir_gi(n: vec3<f32>, p: vec3<f32>, pix: vec2<u32>, seed: u32) -> vec3<f32>
     // dissimilar surfaces (no GI leak across edges) and merge with the NEIGHBOUR's surface so the Jacobian is
     // correct. Skipped on reset (camera move / re-pack).
     if (restir_params.reset == 0u) {
-        let tpix = permute_pixel(pix, restir_params.frame_index, vp);
+        // Reproject to where this surface was last frame, then permute (decorrelate). Off-screen → fall back
+        // to the current pixel (best effort); a dissimilar surface (disocclusion) is rejected below.
+        var tb = temporal_base;
+        if (tb.x < 0 || tb.y < 0 || tb.x >= i32(vp.x) || tb.y >= i32(vp.y)) {
+            tb = vec2<i32>(pix);
+        }
+        let tpix = permute_pixel(vec2<u32>(tb), restir_params.frame_index, vp);
         let tidx = tpix.y * vp.x + tpix.x;
         let surf = surfaces_prev[tidx];
         if (surf.valid > 0.5 && !surfaces_dissimilar(p, n, surf.world_position, surf.world_normal)) {
@@ -1213,7 +1222,7 @@ fn restir_gi(n: vec3<f32>, p: vec3<f32>, pix: vec2<u32>, seed: u32) -> vec3<f32>
 }
 
 // Like `shade`, but the indirect term comes from the per-pixel reservoir (ReSTIR) instead of `gather_gi`.
-fn shade_restir(albedo: vec3<f32>, n: vec3<f32>, p: vec3<f32>, emissive: vec3<f32>, pix: vec2<u32>, seed: u32) -> vec3<f32> {
+fn shade_restir(albedo: vec3<f32>, n: vec3<f32>, p: vec3<f32>, emissive: vec3<f32>, pix: vec2<u32>, temporal_base: vec2<i32>, seed: u32) -> vec3<f32> {
     let origin = p + n * light.shadow_bias;
     let to_sun = -light.sun_direction;
     let ndotl = max(dot(n, to_sun), 0.0);
@@ -1226,9 +1235,18 @@ fn shade_restir(albedo: vec3<f32>, n: vec3<f32>, p: vec3<f32>, emissive: vec3<f3
     let ao = ambient_occlusion(origin, n);
     let ambient = light.ambient_color * ao;
     let direct = light.sun_color * (light.sun_intensity * ndotl * shadow);
-    let indirect = restir_gi(n, p, pix, seed) * albedo;
+    let indirect = restir_gi(n, p, pix, temporal_base, seed) * albedo;
     let glow = emissive * light.emissive_strength;
     return albedo * (ambient + direct) + indirect + glow;
+}
+
+// Screen-space reprojection: the previous-frame pixel that the world point `p` projected to, using the
+// UN-jittered previous clip. For a still camera this is the current pixel. (Caller supplies the prev clip.)
+fn reproject_pixel(p: vec3<f32>, prev_clip_from_world: mat4x4<f32>, vp: vec2<u32>) -> vec2<i32> {
+    let prev_clip = prev_clip_from_world * vec4<f32>(p, 1.0);
+    let prev_ndc = prev_clip.xy / prev_clip.w;
+    let prev_uv = prev_ndc * vec2<f32>(0.5, -0.5) + vec2<f32>(0.5);
+    return vec2<i32>(floor(prev_uv * vec2<f32>(vp)));
 }
 
 // The ReSTIR variant of `raymarch` (non-DLSS path). Identical primary-ray + debug + temporal-accumulation
@@ -1266,7 +1284,7 @@ fn raymarch_restir(@builtin(global_invocation_id) gid: vec3<u32>) {
                 dbg = vec3<f32>(ambient_occlusion(origin, r.normal));
             } else if (light.debug_view == 5u) {
                 let seed = (gid.x * 1973u + gid.y * 9277u + light.frame_index * 26699u) | 1u;
-                dbg = restir_gi(r.normal, p, gid.xy, seed); // GI-only debug shows the reservoir estimate
+                dbg = restir_gi(r.normal, p, gid.xy, vec2<i32>(gid.xy), seed); // GI-only debug = reservoir estimate
             } else if (light.debug_view == 6u) {
                 dbg = select(vec3<f32>(0.0, 1.0, 0.0), vec3<f32>(1.0, 0.0, 0.0), dot(r.normal, rd) > 0.0);
             } else {
@@ -1281,7 +1299,8 @@ fn raymarch_restir(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (r.hit != 0u) {
         let p = ro + rd * r.t;
         let seed = (gid.x * 1973u + gid.y * 9277u + light.frame_index * 26699u) | 1u;
-        let lit = shade_restir(r.color.rgb, r.normal, p, r.emissive, gid.xy, seed);
+        // Non-DLSS path has no previous clip → no reprojection (it resets on move); base = current pixel.
+        let lit = shade_restir(r.color.rgb, r.normal, p, r.emissive, gid.xy, vec2<i32>(gid.xy), seed);
         color = vec4<f32>(lit, 1.0);
     } else {
         let up = clamp(rd.y * 0.5 + 0.5, 0.0, 1.0);
@@ -1317,7 +1336,9 @@ fn raymarch_dlss_restir(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (r.hit != 0u) {
         let p = ro + rd * r.t;
         let seed = (gid.x * 1973u + gid.y * 9277u + light.frame_index * 26699u) | 1u;
-        let lit = shade_restir(r.color.rgb, r.normal, p, r.emissive, gid.xy, seed);
+        // Reproject the temporal tap via the UN-jittered previous clip so accumulation continues under motion.
+        let temporal_base = reproject_pixel(p, dlss_cam.motion_prev, camera.viewport);
+        let lit = shade_restir(r.color.rgb, r.normal, p, r.emissive, gid.xy, temporal_base, seed);
         textureStore(out_tex, px, vec4<f32>(lit, 1.0));
         textureStore(out_diffuse_albedo, px, vec4<f32>(r.color.rgb, 1.0));
         textureStore(out_specular_albedo, px, vec4<f32>(vec3<f32>(0.04), 1.0));

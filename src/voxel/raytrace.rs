@@ -1841,15 +1841,13 @@ fn voxel_rt_dlss_pass(
     });
     resources.dlss_prev_clip_from_world = Some(view_proj_unjittered);
 
-    // ReSTIR reset: a camera move, a render-resolution change, or a geometry re-pack invalidates the
-    // reservoirs. Uses the UN-JITTERED view-projection (the jittered one changes every frame → would reset
-    // every frame → no temporal accumulation). DLSS-RR still reprojects the resolved colour via motion vectors.
+    // ReSTIR reset: ONLY a render-resolution change, a geometry re-pack, or the first frame invalidates the
+    // reservoirs. Camera motion is NO LONGER a reset — the shader reprojects the temporal tap via motion
+    // vectors (and rejects disocclusions by dissimilarity), so accumulation continues through motion.
     let built_gen = resources.built_generation;
     let reset_restir = match resources.dlss_restir_prev {
         None => true,
-        Some((r, vp, g)) => {
-            r != render_res || !matrices_close(&vp, &view_proj_unjittered) || g != built_gen
-        }
+        Some((r, _vp, g)) => r != render_res || g != built_gen,
     };
     resources.dlss_restir_prev = Some((render_res, view_proj_unjittered, built_gen));
 
