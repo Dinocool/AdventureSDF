@@ -799,10 +799,15 @@ fn raymarch(@builtin(global_invocation_id) gid: vec3<u32>) {
 // the final `Rg16Float` PREPASS motion texture via a render attachment (no storage requirement there).
 @group(1) @binding(9) var out_dlss_motion: texture_storage_2d<rgba16float, write>;
 
-// Previous-frame view-projection (clip_from_world), uploaded each frame, for motion-vector reprojection.
+// DLSS camera matrices. `depth_clip_from_world` is JITTERED (matches Bevy's jittered reverse-Z depth prepass
+// — used only for the depth write). `motion_cur`/`motion_prev` are UN-JITTERED clip_from_world for the
+// PREVIOUS and CURRENT frame: the motion vector must encode GEOMETRY/camera motion only, because DLSS is
+// given the sub-pixel jitter offset separately (via the TemporalJitter component) and resolves it itself.
+// Differencing jittered matrices would double-count the jitter → a per-frame sub-pixel "shake" (the bug).
 struct DlssCamera {
-    prev_clip_from_world: mat4x4<f32>,
-    clip_from_world: mat4x4<f32>,
+    depth_clip_from_world: mat4x4<f32>,
+    motion_prev: mat4x4<f32>,
+    motion_cur: mat4x4<f32>,
 };
 @group(1) @binding(10) var<uniform> dlss_cam: DlssCamera;
 
@@ -830,21 +835,18 @@ fn raymarch_dlss(@builtin(global_invocation_id) gid: vec3<u32>) {
         textureStore(out_specular_albedo, px, vec4<f32>(vec3<f32>(0.04), 1.0));
         textureStore(out_normal_roughness, px, vec4<f32>(r.normal, 1.0));
 
-        // True reverse-Z clip depth of the hit (matches Bevy's infinite-far reverse-Z prepass): project the
-        // world hit point with clip_from_world and take z/w. A hit always has finite positive depth.
-        let clip = dlss_cam.clip_from_world * vec4<f32>(p, 1.0);
-        let depth = clip.z / clip.w;
-        textureStore(out_dlss_depth, px, vec4<f32>(depth, 0.0, 0.0, 0.0));
+        // True reverse-Z clip depth of the hit (JITTERED, matching Bevy's jittered reverse-Z depth prepass).
+        let depth_clip = dlss_cam.depth_clip_from_world * vec4<f32>(p, 1.0);
+        textureStore(out_dlss_depth, px, vec4<f32>(depth_clip.z / depth_clip.w, 0.0, 0.0, 0.0));
 
-        // Screen-space motion: where THIS hit point was in the previous frame's screen, minus where it is now.
-        // DLSS-RR expects motion in pixels (LowResolutionMotionVectors + motion_vector_scale = -render_res in
-        // node.rs scales our NDC delta by -render_res → pixels). We output the NDC-space delta (cur−prev) here;
-        // the node's motion_vector_scale converts it. For a static scene + still camera this is ~0.
-        let prev_clip = dlss_cam.prev_clip_from_world * vec4<f32>(p, 1.0);
+        // Screen-space motion = where this hit point WAS vs IS, from the UN-JITTERED matrices (geometry motion
+        // only; DLSS adds the jitter offset itself). `(cur − prev)·(0.5,−0.5)` matches Bevy's prepass; the DLSS
+        // node's motion_vector_scale = −render_res converts the UV delta to pixels. ~0 for a static frame.
+        let prev_clip = dlss_cam.motion_prev * vec4<f32>(p, 1.0);
+        let cur_clip = dlss_cam.motion_cur * vec4<f32>(p, 1.0);
         let prev_ndc = prev_clip.xy / prev_clip.w;
-        let cur_ndc = clip.xy / clip.w;
-        // NDC delta in [-1,1] space → UV-space delta (×0.5). DLSS node multiplies by -render_res.
-        let motion = (prev_ndc - cur_ndc) * vec2<f32>(0.5, -0.5);
+        let cur_ndc = cur_clip.xy / cur_clip.w;
+        let motion = (cur_ndc - prev_ndc) * vec2<f32>(0.5, -0.5);
         textureStore(out_dlss_motion, px, vec4<f32>(motion, 0.0, 0.0));
     } else {
         // Miss: sky into the colour, far depth (0 in reverse-Z), no motion, no albedo (so DLSS doesn't
@@ -1117,14 +1119,45 @@ fn restir_probe(@builtin(global_invocation_id) gid: vec3<u32>) {
 // spatial reuse are R2). Two reservoir storage buffers ping-pong (cur written, prev read) — no G-buffer
 // textures, so no storage-texture-limit pressure.
 struct RestirParams { reset: u32, frame_index: u32, viewport_x: u32, viewport_y: u32 };
+// Per-pixel RECEIVER surface (world pos + face normal) — needed so a temporal/neighbour reservoir can be
+// merged with the correct Jacobian + rejected when it lands on a dissimilar surface (port of Solari's
+// gbuffer-resolve, but we store pos/normal directly instead of repacking depth).
+struct PixelSurface { world_position: vec3<f32>, valid: f32, world_normal: vec3<f32>, _pad: f32 };
 @group(2) @binding(0) var<storage, read_write> reservoirs_cur: array<Reservoir>;
 @group(2) @binding(1) var<storage, read_write> reservoirs_prev: array<Reservoir>;
 @group(2) @binding(2) var<uniform> restir_params: RestirParams;
+@group(2) @binding(3) var<storage, read_write> surfaces_cur: array<PixelSurface>;
+@group(2) @binding(4) var<storage, read_write> surfaces_prev: array<PixelSurface>;
+
+// Frame-dependent in-4×4-block pixel shuffle (Solari `permute_pixel`). Decorrelates the temporal tap so a
+// pixel doesn't re-consult ITS OWN previous reservoir every frame (which freezes it onto an early sample →
+// the grain that fades in). Over frames it cycles through the local neighbourhood, folding light spatial
+// reuse into the temporal step.
+fn permute_pixel(pixel_id: vec2<u32>, frame_index: u32, vp: vec2<u32>) -> vec2<u32> {
+    let r = frame_index;
+    let offset = vec2<u32>(r & 3u, (r >> 2u) & 3u);
+    var shifted = pixel_id + offset;
+    shifted = shifted ^ vec2<u32>(3u);
+    shifted = shifted - offset;
+    return min(shifted, vp - vec2<u32>(1u));
+}
+
+// Reject reuse across a surface discontinuity (Solari `pixel_dissimilar`, world-space form): tangent-plane
+// distance > ~1% of the camera distance, or normals more than ~60° apart. Keeps neighbour reuse on the same
+// wall/face (smooths grain) but never leaks GI across depth/normal edges.
+fn surfaces_dissimilar(p: vec3<f32>, n: vec3<f32>, op: vec3<f32>, on: vec3<f32>) -> bool {
+    let tangent_plane_distance = abs(dot(n, op - p));
+    let view_dist = max(length(p - camera.cam_pos), 1.0e-3);
+    return tangent_plane_distance / view_dist > 0.01 || dot(n, on) < 0.5;
+}
 
 // Reservoir-based indirect irradiance at pixel `idx` for surface (n, p): generate an initial candidate, merge
 // the previous frame's reservoir for this pixel (unless reset), store the merged reservoir, and resolve it.
 // Writes `reservoirs_cur[idx]` for the caller's pixel. Returns the indirect irradiance (× albedo by caller).
-fn restir_gi(n: vec3<f32>, p: vec3<f32>, idx: u32, seed: u32) -> vec3<f32> {
+fn restir_gi(n: vec3<f32>, p: vec3<f32>, pix: vec2<u32>, seed: u32) -> vec3<f32> {
+    let vp = vec2<u32>(restir_params.viewport_x, restir_params.viewport_y);
+    let idx = pix.y * vp.x + pix.x;
+    surfaces_cur[idx] = PixelSurface(p, 1.0, n, 0.0); // this pixel's receiver surface (for neighbours/next frame)
     if (light.gi_rays == 0u || light.gi_intensity <= 0.0) {
         reservoirs_cur[idx] = empty_reservoir();
         return vec3<f32>(0.0);
@@ -1132,12 +1165,9 @@ fn restir_gi(n: vec3<f32>, p: vec3<f32>, idx: u32, seed: u32) -> vec3<f32> {
     var rng = seed;
     let brdf = vec3<f32>(1.0); // receiver albedo factored out (applied by the caller)
 
-    // INITIAL RIS over `gi_rays` candidates (same per-pixel sample budget as the legacy `gather_gi`). One
-    // candidate alone makes each pixel hold a single noisy sample → spatially-stable GRAIN that DLSS-RR
-    // preserves as if it were detail; resampling over M candidates cuts the per-pixel variance ~1/M, so the
-    // GI is smooth this frame AND the temporal merge below makes it stable across frames. Same-surface merges
-    // (Jacobian = 1). The combined reservoir then counts as ONE frame (confidence 1) so temporal reuse stays
-    // strong (history dominates a still camera). Spatial neighbour reuse is R2.
+    // INITIAL RIS over `gi_rays` candidates (same per-pixel sample budget as the legacy `gather_gi`): cuts the
+    // per-pixel variance ~1/M so each frame is smooth. Same-surface merges (Jacobian = 1). Counts as ONE frame
+    // (confidence 1) so the temporal reuse below stays strong.
     let m = min(light.gi_rays, 32u);
     var res = generate_initial_reservoir(p, n, &rng);
     for (var i = 1u; i < m; i = i + 1u) {
@@ -1147,19 +1177,43 @@ fn restir_gi(n: vec3<f32>, p: vec3<f32>, idx: u32, seed: u32) -> vec3<f32> {
     }
     res.confidence_weight = 1.0;
 
-    // TEMPORAL reuse: merge the previous frame's same-pixel reservoir (unless reset).
+    // TEMPORAL + light-spatial reuse. CRUCIAL: read a PERMUTED previous-frame neighbour, NOT this pixel's own
+    // previous reservoir — same-pixel feedback freezes each pixel onto an early sample (grain that fades in);
+    // the permute decorrelates it (folds in genuinely new info each frame → variance falls, not grows). Reject
+    // dissimilar surfaces (no GI leak across edges) and merge with the NEIGHBOUR's surface so the Jacobian is
+    // correct. Skipped on reset (camera move / re-pack).
     if (restir_params.reset == 0u) {
-        var temporal = reservoirs_prev[idx];
-        temporal.confidence_weight = min(temporal.confidence_weight, RESTIR_CONFIDENCE_CAP);
-        let merged = merge_reservoirs(res, p, n, brdf, temporal, p, n, brdf, &rng);
-        res = merged.merged_reservoir;
+        let tpix = permute_pixel(pix, restir_params.frame_index, vp);
+        let tidx = tpix.y * vp.x + tpix.x;
+        let surf = surfaces_prev[tidx];
+        if (surf.valid > 0.5 && !surfaces_dissimilar(p, n, surf.world_position, surf.world_normal)) {
+            var temporal = reservoirs_prev[tidx];
+            temporal.confidence_weight = min(temporal.confidence_weight, RESTIR_CONFIDENCE_CAP);
+            let merged =
+                merge_reservoirs(res, p, n, brdf, temporal, surf.world_position, surf.world_normal, brdf, &rng);
+            res = merged.merged_reservoir;
+        }
+    }
+
+    // VISIBILITY / bias correction: zero the contribution weight if the receiver can't actually see the
+    // selected sample point (Solari's `ucw *= trace_point_visibility`). Kills stale/occluded reused samples —
+    // the persistent fireflies that otherwise accumulate. Applied BEFORE store so the dead sample is also
+    // out-competed in future merges (the unbiased path).
+    if (res.confidence_weight > 0.0) {
+        let origin = p + n * light.shadow_bias;
+        let to_sample = res.sample_point_world_position - origin;
+        let dist = length(to_sample);
+        if (dist > 2.0 * light.shadow_bias
+            && trace_occluded(origin, to_sample / dist, 0.0, dist - 2.0 * light.shadow_bias)) {
+            res.unbiased_contribution_weight = 0.0;
+        }
     }
     reservoirs_cur[idx] = res;
     return restir_resolve_irradiance(res, p, n);
 }
 
 // Like `shade`, but the indirect term comes from the per-pixel reservoir (ReSTIR) instead of `gather_gi`.
-fn shade_restir(albedo: vec3<f32>, n: vec3<f32>, p: vec3<f32>, emissive: vec3<f32>, idx: u32, seed: u32) -> vec3<f32> {
+fn shade_restir(albedo: vec3<f32>, n: vec3<f32>, p: vec3<f32>, emissive: vec3<f32>, pix: vec2<u32>, seed: u32) -> vec3<f32> {
     let origin = p + n * light.shadow_bias;
     let to_sun = -light.sun_direction;
     let ndotl = max(dot(n, to_sun), 0.0);
@@ -1172,7 +1226,7 @@ fn shade_restir(albedo: vec3<f32>, n: vec3<f32>, p: vec3<f32>, emissive: vec3<f3
     let ao = ambient_occlusion(origin, n);
     let ambient = light.ambient_color * ao;
     let direct = light.sun_color * (light.sun_intensity * ndotl * shadow);
-    let indirect = restir_gi(n, p, idx, seed) * albedo;
+    let indirect = restir_gi(n, p, pix, seed) * albedo;
     let glow = emissive * light.emissive_strength;
     return albedo * (ambient + direct) + indirect + glow;
 }
@@ -1185,6 +1239,7 @@ fn raymarch_restir(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (gid.x >= camera.viewport.x || gid.y >= camera.viewport.y) { return; }
     let idx = gid.y * camera.viewport.x + gid.x;
     reservoirs_cur[idx] = empty_reservoir(); // default for misses / debug; overwritten for lit hits
+    surfaces_cur[idx] = PixelSurface(vec3<f32>(0.0), 0.0, vec3<f32>(0.0), 0.0); // invalid until a lit hit
 
     let uv = (vec2<f32>(f32(gid.x), f32(gid.y)) + 0.5) / vec2<f32>(camera.viewport);
     let ndc = vec2<f32>(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0);
@@ -1211,7 +1266,7 @@ fn raymarch_restir(@builtin(global_invocation_id) gid: vec3<u32>) {
                 dbg = vec3<f32>(ambient_occlusion(origin, r.normal));
             } else if (light.debug_view == 5u) {
                 let seed = (gid.x * 1973u + gid.y * 9277u + light.frame_index * 26699u) | 1u;
-                dbg = restir_gi(r.normal, p, idx, seed); // GI-only debug shows the reservoir estimate
+                dbg = restir_gi(r.normal, p, gid.xy, seed); // GI-only debug shows the reservoir estimate
             } else if (light.debug_view == 6u) {
                 dbg = select(vec3<f32>(0.0, 1.0, 0.0), vec3<f32>(1.0, 0.0, 0.0), dot(r.normal, rd) > 0.0);
             } else {
@@ -1226,7 +1281,7 @@ fn raymarch_restir(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (r.hit != 0u) {
         let p = ro + rd * r.t;
         let seed = (gid.x * 1973u + gid.y * 9277u + light.frame_index * 26699u) | 1u;
-        let lit = shade_restir(r.color.rgb, r.normal, p, r.emissive, idx, seed);
+        let lit = shade_restir(r.color.rgb, r.normal, p, r.emissive, gid.xy, seed);
         color = vec4<f32>(lit, 1.0);
     } else {
         let up = clamp(rd.y * 0.5 + 0.5, 0.0, 1.0);
@@ -1249,6 +1304,7 @@ fn raymarch_dlss_restir(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (gid.x >= camera.viewport.x || gid.y >= camera.viewport.y) { return; }
     let idx = gid.y * camera.viewport.x + gid.x;
     reservoirs_cur[idx] = empty_reservoir();
+    surfaces_cur[idx] = PixelSurface(vec3<f32>(0.0), 0.0, vec3<f32>(0.0), 0.0); // invalid until a lit hit
     let px = vec2<i32>(i32(gid.x), i32(gid.y));
     let uv = (vec2<f32>(f32(gid.x), f32(gid.y)) + 0.5) / vec2<f32>(camera.viewport);
     let ndc = vec2<f32>(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0);
@@ -1261,18 +1317,20 @@ fn raymarch_dlss_restir(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (r.hit != 0u) {
         let p = ro + rd * r.t;
         let seed = (gid.x * 1973u + gid.y * 9277u + light.frame_index * 26699u) | 1u;
-        let lit = shade_restir(r.color.rgb, r.normal, p, r.emissive, idx, seed);
+        let lit = shade_restir(r.color.rgb, r.normal, p, r.emissive, gid.xy, seed);
         textureStore(out_tex, px, vec4<f32>(lit, 1.0));
         textureStore(out_diffuse_albedo, px, vec4<f32>(r.color.rgb, 1.0));
         textureStore(out_specular_albedo, px, vec4<f32>(vec3<f32>(0.04), 1.0));
         textureStore(out_normal_roughness, px, vec4<f32>(r.normal, 1.0));
-        let clip = dlss_cam.clip_from_world * vec4<f32>(p, 1.0);
-        let depth = clip.z / clip.w;
-        textureStore(out_dlss_depth, px, vec4<f32>(depth, 0.0, 0.0, 0.0));
-        let prev_clip = dlss_cam.prev_clip_from_world * vec4<f32>(p, 1.0);
+        // Depth JITTERED (matches the jittered depth prepass); motion UN-JITTERED (geometry only — DLSS adds
+        // the jitter), `(cur − prev)·(0.5,−0.5)`. Jittered motion would double-count jitter ⇒ a sub-pixel shake.
+        let depth_clip = dlss_cam.depth_clip_from_world * vec4<f32>(p, 1.0);
+        textureStore(out_dlss_depth, px, vec4<f32>(depth_clip.z / depth_clip.w, 0.0, 0.0, 0.0));
+        let prev_clip = dlss_cam.motion_prev * vec4<f32>(p, 1.0);
+        let cur_clip = dlss_cam.motion_cur * vec4<f32>(p, 1.0);
         let prev_ndc = prev_clip.xy / prev_clip.w;
-        let cur_ndc = clip.xy / clip.w;
-        let motion = (prev_ndc - cur_ndc) * vec2<f32>(0.5, -0.5);
+        let cur_ndc = cur_clip.xy / cur_clip.w;
+        let motion = (cur_ndc - prev_ndc) * vec2<f32>(0.5, -0.5);
         textureStore(out_dlss_motion, px, vec4<f32>(motion, 0.0, 0.0));
     } else {
         let up = clamp(rd.y * 0.5 + 0.5, 0.0, 1.0);

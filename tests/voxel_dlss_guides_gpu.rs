@@ -41,12 +41,14 @@ struct CameraUniform {
     _pad: u32,
 }
 
-/// Mirror of the WGSL `DlssCamera` (group 1, binding 10): prev + cur clip_from_world, 128 bytes.
+/// Mirror of the WGSL `DlssCamera` (group 1, binding 10): jittered depth clip + un-jittered prev/cur motion
+/// clip, 192 bytes.
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct DlssCamera {
-    prev_clip_from_world: [[f32; 4]; 4],
-    clip_from_world: [[f32; 4]; 4],
+    depth_clip_from_world: [[f32; 4]; 4],
+    motion_prev: [[f32; 4]; 4],
+    motion_cur: [[f32; 4]; 4],
 }
 
 /// Read back a full storage texture into a tightly-packed `Vec<f32>` of `channels` per pixel (handles the GPU
@@ -232,8 +234,9 @@ fn dlss_guides_populated_where_voxels_hit() {
     });
     let dlss_cam = DlssCamera {
         // No camera motion this frame → prev == cur (motion ≈ 0; the assert below only checks finiteness).
-        prev_clip_from_world: clip_from_world.to_cols_array_2d(),
-        clip_from_world: clip_from_world.to_cols_array_2d(),
+        depth_clip_from_world: clip_from_world.to_cols_array_2d(),
+        motion_prev: clip_from_world.to_cols_array_2d(),
+        motion_cur: clip_from_world.to_cols_array_2d(),
     };
     let dlss_cam_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("dlss_cam"),

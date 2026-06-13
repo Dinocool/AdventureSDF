@@ -610,6 +610,10 @@ struct VoxelRtResources {
     /// on view resize; the contents are discarded via the `reset` flag (camera move / resize / re-pack), so
     /// no clear is needed. Used by both the non-DLSS and DLSS ReSTIR entry points.
     reservoirs: Option<(wgpu::Buffer, wgpu::Buffer, UVec2)>,
+    /// Per-pixel RECEIVER surface (world pos + normal) buffers (cur/prev), same ping-pong as `reservoirs`.
+    /// The temporal/neighbour merge reads the prev surface at the permuted pixel to evaluate the Jacobian +
+    /// reject dissimilar surfaces. Non-DLSS path.
+    surfaces: Option<(wgpu::Buffer, wgpu::Buffer, UVec2)>,
     /// The composite render pipeline, keyed by the view-target format it was built for.
     composite: Option<(wgpu::TextureFormat, wgpu::RenderPipeline)>,
     /// Monotonic per-frame counter written into the lighting uniform's `frame_index` so the GI bounce
@@ -652,6 +656,9 @@ struct VoxelRtResources {
     /// DLSS views (the non-DLSS pass filters them out) at the render resolution.
     #[cfg(feature = "dlss")]
     dlss_reservoirs: Option<(wgpu::Buffer, wgpu::Buffer, UVec2)>,
+    /// DLSS-path per-pixel surface buffers (cur/prev), sized to the full render res (like dlss_reservoirs).
+    #[cfg(feature = "dlss")]
+    dlss_surfaces: Option<(wgpu::Buffer, wgpu::Buffer, UVec2)>,
     /// (render_res, clip_from_world, built_generation) at the last DLSS frame — drives the ReSTIR `reset`
     /// (a camera move, a resolution change, or a geometry re-pack invalidates the same-pixel reservoirs).
     #[cfg(feature = "dlss")]
@@ -884,10 +891,11 @@ fn init_voxel_rt(mut commands: Commands, render_device: Res<RenderDevice>) {
         cache: None,
     });
 
-    // ReSTIR group(2): two per-pixel reservoir storage buffers (cur/prev) + the restir params uniform.
+    // ReSTIR group(2): reservoir storage buffers (cur/prev) + restir params uniform + per-pixel receiver
+    // surface buffers (cur/prev) for neighbour-reuse Jacobian + dissimilarity rejection.
     let reservoir_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
         label: Some("voxel_rt_reservoir_layout"),
-        entries: &[storage_rw(0), storage_rw(1), uniform_buf(2)],
+        entries: &[storage_rw(0), storage_rw(1), uniform_buf(2), storage_rw(3), storage_rw(4)],
     });
     let restir_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: Some("voxel_rt_raymarch_restir_pl"),
@@ -1127,6 +1135,9 @@ fn uniform_buf(binding: u32) -> wgpu::BindGroupLayoutEntry {
 /// Bytes per WGSL `Reservoir` (3×vec4 = 48). One reservoir per pixel in each ping-pong buffer.
 const RESERVOIR_SIZE: u64 = 48;
 
+/// Bytes per WGSL `PixelSurface` (2×vec4 = 32): world pos + valid flag, world normal + pad.
+const SURFACE_SIZE: u64 = 32;
+
 /// Mirror of the WGSL `RestirParams` (group 2 binding 2): reset flag + frame index + viewport.
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -1323,19 +1334,27 @@ fn voxel_rt_pass(
         let (htex, hview) = make("voxel_rt_history", wgpu::TextureUsages::COPY_DST);
         resources.output = Some((otex, oview, viewport));
         resources.history = Some((htex, hview));
-        // ReSTIR per-pixel reservoirs (cur/prev ping-pong). Uninitialised — the `reset` flag (set below
-        // because prev_view_proj is now None) makes the shader ignore the stale `prev` this frame.
-        let reservoir_bytes = (viewport.x as u64) * (viewport.y as u64) * RESERVOIR_SIZE;
-        let mk_res = |label: &str| {
+        // ReSTIR per-pixel reservoirs + receiver-surface buffers (cur/prev ping-pong). Uninitialised — the
+        // `reset` flag (set below because prev_view_proj is now None) makes the shader ignore the stale prev.
+        let px = (viewport.x as u64) * (viewport.y as u64);
+        let mk_buf = |label: &str, bytes: u64| {
             device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some(label),
-                size: reservoir_bytes,
+                size: bytes,
                 usage: wgpu::BufferUsages::STORAGE,
                 mapped_at_creation: false,
             })
         };
-        resources.reservoirs =
-            Some((mk_res("voxel_rt_reservoir_a"), mk_res("voxel_rt_reservoir_b"), viewport));
+        resources.reservoirs = Some((
+            mk_buf("voxel_rt_reservoir_a", px * RESERVOIR_SIZE),
+            mk_buf("voxel_rt_reservoir_b", px * RESERVOIR_SIZE),
+            viewport,
+        ));
+        resources.surfaces = Some((
+            mk_buf("voxel_rt_surface_a", px * SURFACE_SIZE),
+            mk_buf("voxel_rt_surface_b", px * SURFACE_SIZE),
+            viewport,
+        ));
         // A fresh-size history is uninitialised — force a reset (full new frame) this frame.
         resources.accum_samples = 0;
         resources.prev_view_proj = None;
@@ -1468,14 +1487,19 @@ fn voxel_rt_pass(
         usage: wgpu::BufferUsages::UNIFORM,
     });
     let (res_a, res_b, _) = resources.reservoirs.as_ref().expect("allocated with output");
-    let (cur, prev) = if frame_index & 1 == 0 { (res_a, res_b) } else { (res_b, res_a) };
+    let (surf_a, surf_b, _) = resources.surfaces.as_ref().expect("allocated with output");
+    let even = frame_index & 1 == 0;
+    let (res_cur, res_prev) = if even { (res_a, res_b) } else { (res_b, res_a) };
+    let (surf_cur, surf_prev) = if even { (surf_a, surf_b) } else { (surf_b, surf_a) };
     let reservoir_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("voxel_rt_reservoir_bg"),
         layout: &pipelines.reservoir_layout,
         entries: &[
-            wgpu::BindGroupEntry { binding: 0, resource: cur.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 1, resource: prev.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 0, resource: res_cur.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 1, resource: res_prev.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 2, resource: restir_buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 3, resource: surf_cur.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 4, resource: surf_prev.as_entire_binding() },
         ],
     });
 
@@ -1594,14 +1618,18 @@ fn prepare_voxel_rt_dlss_textures(
     }
 }
 
-/// DLSS camera uniform (WGSL `DlssCamera`, group 1 binding 10): previous- and current-frame clip_from_world
-/// (JITTERED projection, to match the depth/motion the DLSS node expects). 128 bytes.
+/// DLSS camera uniform (WGSL `DlssCamera`, group 1 binding 10). 192 bytes.
+/// `depth_clip_from_world` is the JITTERED projection (matches Bevy's jittered reverse-Z depth prepass — used
+/// only for the depth write). `motion_prev`/`motion_cur` are the UN-JITTERED previous/current clip_from_world:
+/// the motion vector must be geometry motion only, because the DLSS node is given the sub-pixel jitter offset
+/// separately and resolves it itself. (Differencing jittered matrices double-counts the jitter → camera shake.)
 #[cfg(feature = "dlss")]
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct DlssCameraData {
-    prev_clip_from_world: [[f32; 4]; 4],
-    clip_from_world: [[f32; 4]; 4],
+    depth_clip_from_world: [[f32; 4]; 4],
+    motion_prev: [[f32; 4]; 4],
+    motion_cur: [[f32; 4]; 4],
 }
 
 /// [`Core3d`] (the `VoxelRtDlssSet`, between `MainPass` and `EarlyPostProcess`): the DLSS-RR raymarch. Runs
@@ -1681,18 +1709,27 @@ fn voxel_rt_dlss_pass(
         resources.dlss_motion = Some(make("voxel_rt_dlss_motion", wgpu::TextureFormat::Rgba16Float));
         resources.dlss_size = Some(full);
         resources.dlss_prev_clip_from_world = None;
-        // ReSTIR reservoirs at FULL size (≥ the render-res dispatch); reset forces a fresh frame.
-        let reservoir_bytes = (full.x as u64) * (full.y as u64) * RESERVOIR_SIZE;
-        let mk_res = |label: &str| {
+        // ReSTIR reservoirs + receiver-surface buffers at FULL size (≥ the render-res dispatch); reset forces
+        // a fresh frame.
+        let px = (full.x as u64) * (full.y as u64);
+        let mk_buf = |label: &str, bytes: u64| {
             device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some(label),
-                size: reservoir_bytes,
+                size: bytes,
                 usage: wgpu::BufferUsages::STORAGE,
                 mapped_at_creation: false,
             })
         };
-        resources.dlss_reservoirs =
-            Some((mk_res("voxel_rt_dlss_reservoir_a"), mk_res("voxel_rt_dlss_reservoir_b"), full));
+        resources.dlss_reservoirs = Some((
+            mk_buf("voxel_rt_dlss_reservoir_a", px * RESERVOIR_SIZE),
+            mk_buf("voxel_rt_dlss_reservoir_b", px * RESERVOIR_SIZE),
+            full,
+        ));
+        resources.dlss_surfaces = Some((
+            mk_buf("voxel_rt_dlss_surface_a", px * SURFACE_SIZE),
+            mk_buf("voxel_rt_dlss_surface_b", px * SURFACE_SIZE),
+            full,
+        ));
         resources.dlss_restir_prev = None;
     }
 
@@ -1765,8 +1802,12 @@ fn voxel_rt_dlss_pass(
     let world_from_clip = world_from_view * clip_from_view.inverse();
     let cam_pos = extracted_view.world_from_view.translation();
     let clip_from_world = clip_from_view * world_from_view.inverse();
-    let clip_from_world_arr = clip_from_world.to_cols_array_2d();
-    let prev = resources.dlss_prev_clip_from_world.unwrap_or(clip_from_world_arr);
+    let clip_from_world_arr = clip_from_world.to_cols_array_2d(); // JITTERED — depth write only
+    // UN-jittered current clip_from_world: motion vectors must exclude the jitter (DLSS resolves it itself),
+    // and this is also the stable matrix the ReSTIR reset move-test compares.
+    let view_proj_unjittered =
+        (extracted_view.clip_from_view * world_from_view.inverse()).to_cols_array_2d();
+    let motion_prev = resources.dlss_prev_clip_from_world.unwrap_or(view_proj_unjittered);
 
     let cam_uniform = CameraUniformData {
         world_from_clip: world_from_clip.to_cols_array_2d(),
@@ -1789,24 +1830,20 @@ fn voxel_rt_dlss_pass(
         usage: wgpu::BufferUsages::UNIFORM,
     });
     let dlss_cam = DlssCameraData {
-        prev_clip_from_world: prev,
-        clip_from_world: clip_from_world_arr,
+        depth_clip_from_world: clip_from_world_arr,
+        motion_prev,
+        motion_cur: view_proj_unjittered,
     };
     let dlss_cam_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("voxel_rt_dlss_cam"),
         contents: bytemuck::bytes_of(&dlss_cam),
         usage: wgpu::BufferUsages::UNIFORM,
     });
-    resources.dlss_prev_clip_from_world = Some(clip_from_world_arr);
+    resources.dlss_prev_clip_from_world = Some(view_proj_unjittered);
 
     // ReSTIR reset: a camera move, a render-resolution change, or a geometry re-pack invalidates the
-    // same-pixel reservoirs (no reprojection yet — that's R2). DLSS-RR still reprojects the resolved colour.
-    // CRUCIAL: use the UN-JITTERED view-projection for the move test. `clip_from_world_arr` is built from the
-    // TemporalJitter-perturbed projection, which changes EVERY frame — comparing it would fire `reset` every
-    // frame and the reservoirs would never accumulate (the GI would boil exactly as before). The sub-pixel
-    // jitter must not count as camera motion. `extracted_view.clip_from_view` is the original un-jittered proj.
-    let view_proj_unjittered =
-        (extracted_view.clip_from_view * world_from_view.inverse()).to_cols_array_2d();
+    // reservoirs. Uses the UN-JITTERED view-projection (the jittered one changes every frame → would reset
+    // every frame → no temporal accumulation). DLSS-RR still reprojects the resolved colour via motion vectors.
     let built_gen = resources.built_generation;
     let reset_restir = match resources.dlss_restir_prev {
         None => true,
@@ -1859,14 +1896,19 @@ fn voxel_rt_dlss_pass(
         usage: wgpu::BufferUsages::UNIFORM,
     });
     let (res_a, res_b, _) = resources.dlss_reservoirs.as_ref().expect("allocated above");
-    let (cur, prev) = if frame_index & 1 == 0 { (res_a, res_b) } else { (res_b, res_a) };
+    let (surf_a, surf_b, _) = resources.dlss_surfaces.as_ref().expect("allocated above");
+    let even = frame_index & 1 == 0;
+    let (res_cur, res_prev) = if even { (res_a, res_b) } else { (res_b, res_a) };
+    let (surf_cur, surf_prev) = if even { (surf_a, surf_b) } else { (surf_b, surf_a) };
     let reservoir_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("voxel_rt_dlss_reservoir_bg"),
         layout: &pipelines.reservoir_layout,
         entries: &[
-            wgpu::BindGroupEntry { binding: 0, resource: cur.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 1, resource: prev.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 0, resource: res_cur.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 1, resource: res_prev.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 2, resource: restir_buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 3, resource: surf_cur.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 4, resource: surf_prev.as_entire_binding() },
         ],
     });
 
