@@ -29,7 +29,7 @@ use adventure::sdf_render::worldgen::biome::{
 use adventure::voxel::brickmap::{BRICK_WORLD_SIZE, Brick};
 use adventure::voxel::gpu::{ResidentBrick, pack_resident_set};
 use adventure::voxel::palette::{BlockId, BlockRegistry};
-use adventure::voxel::raytrace::LightingUniformData;
+use adventure::voxel::raytrace::{LightingUniformData, SkyUniformData};
 
 mod common;
 
@@ -107,9 +107,14 @@ struct GiRig {
 }
 
 impl GiRig {
-    /// Build the GPU scene from a packed patch and return a runner closure `(light, ro, rd) -> GpuHit`.
-    /// The acceleration structure is built once; each call only rewrites the ray + lighting uniforms.
-    fn run_all(&self, patch: &adventure::voxel::gpu::GpuBrickPatch) -> impl Fn(&LightingUniformData, Vec3, Vec3) -> GpuHit + '_ {
+    /// Build the GPU scene from a packed patch and return a runner closure `(light, sky, ro, rd) -> GpuHit`.
+    /// The acceleration structure is built once; each call only rewrites the ray + lighting + SKY uniforms.
+    /// Sky is an EXPLICIT per-run input (never a hidden default): a transport test passes a dark sky to
+    /// isolate voxel-to-voxel bounce, while a sky-fill test passes the real procedural sky.
+    fn run_all(
+        &self,
+        patch: &adventure::voxel::gpu::GpuBrickPatch,
+    ) -> impl Fn(&LightingUniformData, &SkyUniformData, Vec3, Vec3) -> GpuHit + '_ {
         let device = &self.device;
         let queue = &self.queue;
         let n = patch.brick_count() as u32;
@@ -210,10 +215,19 @@ impl GiRig {
                 wgpu::BindGroupEntry { binding: 5, resource: out_buf.as_entire_binding() },
             ],
         });
+        let sky_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("gi_sky"),
+            size: mem::size_of::<SkyUniformData>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
         let light_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("gi_light_bg"),
             layout: &pipeline.get_bind_group_layout(1),
-            entries: &[wgpu::BindGroupEntry { binding: 2, resource: light_buf.as_entire_binding() }],
+            entries: &[
+                wgpu::BindGroupEntry { binding: 2, resource: light_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 11, resource: sky_buf.as_entire_binding() },
+            ],
         });
 
         let mut build = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("gi_build") });
@@ -232,8 +246,9 @@ impl GiRig {
         queue.submit(Some(build.finish()));
 
         // Move the GPU objects into the closure so they outlive every ray.
-        move |light: &LightingUniformData, ro: Vec3, rd: Vec3| -> GpuHit {
+        move |light: &LightingUniformData, sky: &SkyUniformData, ro: Vec3, rd: Vec3| -> GpuHit {
             queue.write_buffer(&light_buf, 0, bytemuck::bytes_of(light));
+            queue.write_buffer(&sky_buf, 0, bytemuck::bytes_of(sky));
             let ray = RayUniform { origin: ro.into(), t_min: 0.0, dir: rd.normalize().into(), t_max: 1000.0 };
             queue.write_buffer(&ray_buf, 0, bytemuck::bytes_of(&ray));
             let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
@@ -255,7 +270,7 @@ impl GiRig {
             drop(data);
             read_buf.unmap();
             // Keep the scene alive across calls.
-            let _ = (&aabb_buf, &meta_buf, &voxel_buf, &palette_buf, &blas, &tlas);
+            let _ = (&aabb_buf, &meta_buf, &voxel_buf, &palette_buf, &blas, &tlas, &sky_buf);
             gpu
         }
     }
@@ -275,6 +290,24 @@ fn light_with_gi(gi_rays: u32) -> LightingUniformData {
         gi_intensity: 1.0,
         gi_bounce_dist: 20.0,
         ..Default::default()
+    }
+}
+
+/// A BLACK sky (all-zero radiance) for the voxel-transport scenarios. Phase 1A made a bounce that escapes to
+/// open sky return `sky_radiance × gi_sky_intensity`; these open scenes have many such misses, so a non-zero
+/// sky would add a uniform fill that dilutes the voxel-to-voxel transport the test isolates. Zeroing the sky
+/// keeps the colour-bleed / shadow-fill / emissive assertions about voxel transport ALONE. The
+/// `open_scene_bounce_miss_returns_sky` test below covers the new sky-fill path explicitly.
+fn dark_sky() -> SkyUniformData {
+    SkyUniformData {
+        horizon_color: [0.0, 0.0, 0.0],
+        zenith_color: [0.0, 0.0, 0.0],
+        ground_color: [0.0, 0.0, 0.0],
+        sun_size: 0.0, // no sun disk either
+        intensity: 0.0,
+        gi_sky_intensity: 0.0,
+        sun_tint: [0.0, 0.0, 0.0],
+        _pad: 0.0,
     }
 }
 
@@ -310,8 +343,8 @@ fn gi_indirect_fills_shadow() {
     let centre = Vec3::new(s * 0.5, floor_top + 1.0, s * 0.5); // under the roof
     let down = Vec3::new(0.0, -1.0, 0.0);
 
-    let off = run(&light_with_gi(0), centre, down);
-    let on = run(&light_with_gi(64), centre, down);
+    let off = run(&light_with_gi(0), &dark_sky(), centre, down);
+    let on = run(&light_with_gi(64), &dark_sky(), centre, down);
 
     eprintln!(
         "[shadow-fill] hit={} shadowed={} direct={:?} indirect(off)={:?} indirect(on)={:?}",
@@ -377,8 +410,8 @@ fn gi_colour_bleed() {
     // unlit, so it would bounce nothing — the bleed needs a LIT red surface.
     let mut l = light_with_gi(64);
     l.sun_direction = Vec3::new(-0.7, -0.7, 0.0).normalize().into();
-    let near_hit = run(&l, near, down);
-    let far_hit = run(&l, far, down);
+    let near_hit = run(&l, &dark_sky(), near, down);
+    let far_hit = run(&l, &dark_sky(), far, down);
 
     eprintln!(
         "[colour-bleed] near indirect={:?} far indirect={:?}",
@@ -457,12 +490,14 @@ fn gi_emissive_illuminates() {
 
     let near = Vec3::new(s * 1.3, floor_top + 1.0, s * 0.5); // just past the emitter pillar at bx=0
     let far = Vec3::new(s * 7.5, floor_top + 1.0, s * 0.5);
-    let near_hit = run(&l, near, down);
-    let far_hit = run(&l, far, down);
+    // Dark sky too: with the sun below the +Y floor and ambient zeroed, the ONLY indirect energy must be the
+    // emitter's glow — a non-zero sky would add a uniform fill that breaks that isolation.
+    let near_hit = run(&l, &dark_sky(), near, down);
+    let far_hit = run(&l, &dark_sky(), far, down);
 
     // Fire a ray directly at the emitter block to read back its own glow term.
     let emitter_probe = Vec3::new(s * 0.5, s * 4.0, s * 0.5); // above the pillar, looking down at its top
-    let emit_hit = run(&l, emitter_probe, down);
+    let emit_hit = run(&l, &dark_sky(), emitter_probe, down);
 
     eprintln!(
         "[emissive] near indirect={:?} far indirect={:?} emitter glow={:?} (block {})",
@@ -488,5 +523,73 @@ fn gi_emissive_illuminates() {
         "floor near the emitter ({}) must be brighter than far ({})",
         luma(near_hit.indirect),
         luma(far_hit.indirect)
+    );
+}
+
+/// **Scenario 4 — OPEN-SCENE sky fill (Phase 1A).** On a flat open floor with no other geometry, the upward
+/// diffuse bounces escape to open sky and must return the SKY radiance — not the old flat `ambient_color`.
+/// With a bright RED sky (and a neutral-grey floor + no red voxels, sun below the floor), the floor's indirect
+/// term must be RED-tinted; with the sky BLACK it must be ~0. Proves the bounce-miss → `sky_radiance` path.
+#[test]
+fn open_scene_bounce_miss_returns_sky() {
+    let Some((device, queue)) = common::headless_ray_query_device() else {
+        eprintln!("no ray-query device — skipping open_scene_bounce_miss_returns_sky");
+        return;
+    };
+    let reg = BlockRegistry::from_biome_library(&test_library());
+    let s = BRICK_WORLD_SIZE;
+
+    // A flat 5×5 grey floor at by=0 — nothing above it, so a bounce up escapes to sky.
+    let floor = solid(FLOOR);
+    let mut entries: Vec<ResidentBrick> = Vec::new();
+    for bx in -2..=2i32 {
+        for bz in -2..=2i32 {
+            entries.push(ResidentBrick { coord: IVec3::new(bx, 0, bz), brick: &floor, lod: 0 });
+        }
+    }
+    let patch = pack_resident_set(&entries, &reg);
+    let rig = GiRig { device, queue };
+    let run = rig.run_all(&patch);
+
+    let floor_top = s;
+    let down = Vec3::new(0.0, -1.0, 0.0);
+    let probe = Vec3::new(0.0, floor_top + 1.0, 0.0);
+
+    // Sun BELOW the floor (travels upward) + ambient zeroed, so the only indirect energy is the sky a bounce
+    // escapes to (no direct, no voxel-bounce colour — the floor is neutral grey).
+    let mut l = light_with_gi(64);
+    l.sun_direction = [0.0, 1.0, 0.0];
+    l.ambient_color = [0.0, 0.0, 0.0];
+
+    // A bright uniform RED sky (flat gradient: horizon == zenith == ground), no sun disk.
+    let red_sky = SkyUniformData {
+        horizon_color: [1.0, 0.0, 0.0],
+        zenith_color: [1.0, 0.0, 0.0],
+        ground_color: [1.0, 0.0, 0.0],
+        sun_size: 0.0,
+        intensity: 1.0,
+        gi_sky_intensity: 1.0,
+        sun_tint: [0.0, 0.0, 0.0],
+        _pad: 0.0,
+    };
+
+    let sky_hit = run(&l, &red_sky, probe, down);
+    let dark_hit = run(&l, &dark_sky(), probe, down);
+    eprintln!(
+        "[sky-fill] red-sky indirect={:?} dark-sky indirect={:?}",
+        sky_hit.indirect, dark_hit.indirect
+    );
+    assert_eq!(sky_hit.hit, 1, "probe must hit the floor");
+    let si = sky_hit.indirect;
+    // The floor's indirect is RED-tinted (sky transport, × the grey floor albedo).
+    assert!(
+        si[0] > 1e-3 && si[0] > si[1] * 4.0 && si[0] > si[2] * 4.0,
+        "open-floor indirect must be red-tinted from the red SKY (R≫G,B), got {si:?}"
+    );
+    // And a BLACK sky gives ~0 indirect (the old flat-ambient fill is gone — sky is the only fill now).
+    assert!(
+        luma(dark_hit.indirect) < 1e-3,
+        "with a black sky the open floor's indirect must be ~0, got {:?}",
+        dark_hit.indirect
     );
 }

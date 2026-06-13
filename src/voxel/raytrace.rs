@@ -118,12 +118,14 @@ impl Plugin for VoxelRtPlugin {
             .init_resource::<VoxelRtToggle>()
             .init_resource::<VoxelRtPatch>()
             .init_resource::<VoxelRtLighting>()
+            .init_resource::<VoxelRtSky>()
             .init_resource::<RestirSettings>()
             .init_resource::<VoxelEdits>()
             .init_resource::<VoxelEditBrush>()
             .add_plugins(ExtractResourcePlugin::<VoxelRtToggle>::default())
             .add_plugins(ExtractResourcePlugin::<VoxelRtPatch>::default())
             .add_plugins(ExtractResourcePlugin::<VoxelRtLighting>::default())
+            .add_plugins(ExtractResourcePlugin::<VoxelRtSky>::default())
             .add_plugins(ExtractResourcePlugin::<RestirSettings>::default())
             .add_systems(Startup, init_voxel_rt_streaming)
             // The edit click handler runs BEFORE the residency/re-bake so an edit's delta-generation bump is
@@ -761,7 +763,10 @@ impl Default for LightingUniformData {
             ao_samples: 4,
             gi_rays: 8,
             gi_intensity: 1.0,
-            gi_bounce_dist: 12.0,
+            // Open-world default: a bounce reaches far enough to hit distant terrain (and otherwise returns the
+            // procedural sky), so GI is plausible outside a closed box. `cornell()` keeps its own tuned value,
+            // and the GPU tests pin their own `gi_bounce_dist`, so closed-scene tests are unaffected.
+            gi_bounce_dist: 64.0,
             emissive_strength: 4.0,
             frame_index: 0,
             debug_view: 0,
@@ -806,6 +811,60 @@ impl LightingUniformData {
 #[derive(Resource, Clone, Copy, Debug, Default, ExtractResource)]
 pub struct VoxelRtLighting {
     pub data: LightingUniformData,
+}
+
+/// **SSOT for the procedural-sky / environment knobs** (the WGSL `Sky`, group 1 binding 11). A SEPARATE UBO
+/// from [`LightingUniformData`] (which is full at 80 bytes). All runtime UNIFORMS (knobs-as-uniforms) — the
+/// editor drives any of them; nothing here is a shader const. 64 bytes (std140-safe: each `[f32;3]` vec3 is
+/// followed by a scalar to fill its 16-byte slot — NOT `[scalar;N]` padding, which `encase`/`bytemuck` would
+/// misalign). Mirrored field-for-field by the WGSL `Sky` struct, so the sky layout has exactly one SSOT.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct SkyUniformData {
+    /// Linear-RGB sky colour at the horizon (`dir.y == 0`).
+    pub horizon_color: [f32; 3],
+    /// Scalar multiplier on ALL sky radiance (the gradient + the sun disk).
+    pub intensity: f32,
+    /// Linear-RGB sky colour straight up (`dir.y == +1`).
+    pub zenith_color: [f32; 3],
+    /// How strongly a diffuse bounce that ESCAPES to sky lights the GI (multiplies `sky_radiance` for bounces).
+    pub gi_sky_intensity: f32,
+    /// Linear-RGB lower-hemisphere fill colour straight down (`dir.y == -1`).
+    pub ground_color: [f32; 3],
+    /// Angular HALF-size of the soft sun disk, in radians (`0` disables the disk). Tinted by `sun_tint`.
+    pub sun_size: f32,
+    /// Linear-RGB tint on the sun disk (multiplied by `light.sun_color × sun_intensity`).
+    pub sun_tint: [f32; 3],
+    /// Fills the last std140 slot, so the struct is exactly 64 bytes.
+    pub _pad: f32,
+}
+
+impl Default for SkyUniformData {
+    /// Reproduces the CURRENT look: the same horizon/zenith gradient the inline primary-miss sky used
+    /// (`horizon (0.55,0.65,0.78)`, `zenith (0.12,0.22,0.45)`), a modest unit intensity, full `gi_sky_intensity`
+    /// (a bounce into the sky returns the sky it sees), a ground fill near the horizon, and a small warm sun disk.
+    fn default() -> Self {
+        Self {
+            horizon_color: [0.55, 0.65, 0.78],
+            intensity: 1.0,
+            zenith_color: [0.12, 0.22, 0.45],
+            gi_sky_intensity: 1.0,
+            // Lower hemisphere: a dim earth-toned fill so a downward bounce isn't pure black (it was the flat
+            // ambient before). Kept dark so it doesn't wash out GI.
+            ground_color: [0.18, 0.17, 0.16],
+            sun_size: 0.04, // ~2.3° half-angle — a soft sun disk
+            sun_tint: [1.0, 0.95, 0.85],
+            _pad: 0.0,
+        }
+    }
+}
+
+/// Runtime sky resource: the SSOT [`SkyUniformData`] knobs, extracted to the render world each frame and
+/// uploaded to the WGSL `Sky` (group 1 binding 11). The Render/GI editor panel mutates this; defaults
+/// preserve the current look so existing GPU tests stay green. Knobs-as-uniforms.
+#[derive(Resource, Clone, Copy, Debug, Default, ExtractResource)]
+pub struct VoxelRtSky {
+    pub data: SkyUniformData,
 }
 
 /// [`RenderStartup`]: build the raymarch compute pipeline + bind-group layouts on the wgpu device (which
@@ -878,6 +937,18 @@ fn init_voxel_rt(mut commands: Commands, render_device: Res<RenderDevice>) {
                 binding: 4,
                 visibility: wgpu::ShaderStages::COMPUTE,
                 ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::NonFiltering),
+                count: None,
+            },
+            // binding 11: the procedural-sky uniform (`Sky`), updated per frame. Shared by the primary-miss
+            // sky, the GI bounce-miss sky, and the ReSTIR bounce-miss sky sample (one sky SSOT).
+            wgpu::BindGroupLayoutEntry {
+                binding: 11,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
                 count: None,
             },
         ],
@@ -1045,6 +1116,7 @@ fn init_dlss_pipelines(
             storage_tex(8, wgpu::TextureFormat::R32Float),             // depth
             storage_tex(9, wgpu::TextureFormat::Rgba16Float),          // motion (.xy used; rg16f storage isn't universal)
             uniform(10),                                                // dlss_cam (prev/cur view-proj)
+            uniform(11),                                                // sky (procedural-sky uniform, one SSOT)
         ],
     });
     let dlss_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -1340,6 +1412,7 @@ fn voxel_rt_pass(
     )>,
     toggle: Res<VoxelRtToggle>,
     lighting: Res<VoxelRtLighting>,
+    sky: Res<VoxelRtSky>,
     restir_settings: Res<RestirSettings>,
     pipelines: Option<Res<VoxelRtPipelines>>,
     mut resources: ResMut<VoxelRtResources>,
@@ -1518,6 +1591,12 @@ fn voxel_rt_pass(
         contents: bytemuck::bytes_of(&light_data),
         usage: wgpu::BufferUsages::UNIFORM,
     });
+    // The procedural-sky uniform (SSOT knobs), uploaded fresh each frame so editor tweaks take effect live.
+    let sky_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("voxel_rt_sky"),
+        contents: bytemuck::bytes_of(&sky.data),
+        usage: wgpu::BufferUsages::UNIFORM,
+    });
     let hist_view = &resources.history.as_ref().expect("allocated with output").1;
     let view_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("voxel_rt_view_bg"),
@@ -1528,6 +1607,7 @@ fn voxel_rt_pass(
             wgpu::BindGroupEntry { binding: 2, resource: light_buf.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(hist_view) },
             wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::Sampler(&pipelines.composite_sampler) },
+            wgpu::BindGroupEntry { binding: 11, resource: sky_buf.as_entire_binding() },
         ],
     });
     let composite_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -1740,6 +1820,7 @@ fn voxel_rt_dlss_pass(
     )>,
     toggle: Res<VoxelRtToggle>,
     lighting: Res<VoxelRtLighting>,
+    sky: Res<VoxelRtSky>,
     restir_settings: Res<RestirSettings>,
     pipelines: Option<Res<VoxelRtPipelines>>,
     mut resources: ResMut<VoxelRtResources>,
@@ -1919,6 +2000,11 @@ fn voxel_rt_dlss_pass(
         contents: bytemuck::bytes_of(&light_data),
         usage: wgpu::BufferUsages::UNIFORM,
     });
+    let sky_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("voxel_rt_dlss_sky"),
+        contents: bytemuck::bytes_of(&sky.data),
+        usage: wgpu::BufferUsages::UNIFORM,
+    });
     let dlss_cam = DlssCameraData {
         depth_clip_from_world: clip_from_world_arr,
         motion_prev,
@@ -1960,6 +2046,7 @@ fn voxel_rt_dlss_pass(
             wgpu::BindGroupEntry { binding: 8, resource: wgpu::BindingResource::TextureView(depth_view) },
             wgpu::BindGroupEntry { binding: 9, resource: wgpu::BindingResource::TextureView(motion_view) },
             wgpu::BindGroupEntry { binding: 10, resource: dlss_cam_buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 11, resource: sky_buf.as_entire_binding() },
         ],
     });
     let resolve_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {

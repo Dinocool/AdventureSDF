@@ -503,6 +503,53 @@ struct LightingUniform {
 };
 @group(1) @binding(2) var<uniform> light: LightingUniform;
 
+// Procedural-sky SSOT (mirror of `SkyUniformData` in src/voxel/raytrace.rs, group 1 binding 11). A SEPARATE
+// UBO — `LightingUniform` is full at 80 bytes, so the sky/environment knobs live here. All runtime uniforms
+// (knobs-as-uniforms), never WGSL consts. 64 bytes (std140-safe, four 16-byte rows):
+//   horizon_color (12) + intensity        (4)
+//   zenith_color  (12) + gi_sky_intensity (4)
+//   ground_color  (12) + sun_size         (4)
+//   sun_tint      (12) + _pad             (4)
+struct Sky {
+    horizon_color: vec3<f32>,   // linear RGB at the horizon (dir.y == 0)
+    intensity: f32,             // scalar multiplier on ALL sky radiance (gradient + sun disk)
+    zenith_color: vec3<f32>,    // linear RGB straight up (dir.y == +1)
+    gi_sky_intensity: f32,      // how strongly a bounce that escapes to sky lights GI (× sky_radiance)
+    ground_color: vec3<f32>,    // linear RGB straight down (dir.y == -1) — the lower hemisphere fill
+    sun_size: f32,              // angular HALF-size of the soft sun disk, in radians (0 disables the disk)
+    sun_tint: vec3<f32>,        // linear RGB tint on the sun disk (multiplied by light.sun_color)
+    _pad: f32,
+};
+@group(1) @binding(11) var<uniform> sky: Sky;
+
+// THE single source of sky/environment radiance for a ray travelling in direction `dir`. A directional
+// gradient (ground → horizon → zenith keyed off dir.y) plus a soft sun disk toward the sun, scaled by
+// `sky.intensity`. Used by EVERY primary miss, by `bounce_sky` (GI bounce miss), and by the ReSTIR
+// bounce-miss sky sample — so the look is defined ONCE (no inline-duplicated gradients).
+fn sky_radiance(dir: vec3<f32>) -> vec3<f32> {
+    // Upper hemisphere: horizon→zenith by the up component; lower hemisphere: horizon→ground. `dir.y` in
+    // [-1,1]; remap so 0 = horizon, +1 = zenith, -1 = ground.
+    let up = clamp(dir.y, -1.0, 1.0);
+    var grad: vec3<f32>;
+    if (up >= 0.0) {
+        grad = mix(sky.horizon_color, sky.zenith_color, up);
+    } else {
+        grad = mix(sky.horizon_color, sky.ground_color, -up);
+    }
+    // Soft sun disk toward the sun (the direction TOWARD the sun is the opposite of where the light travels).
+    // `cos_to_sun` is the cosine of the angle between the view ray and the sun; smoothstep gives a soft edge
+    // over `sun_size` radians. Tinted by `sun_tint × light.sun_color × sun_intensity`.
+    var sun = vec3<f32>(0.0);
+    if (sky.sun_size > 0.0) {
+        let to_sun = -light.sun_direction;
+        let cos_to_sun = dot(normalize(dir), to_sun);
+        let cos_edge = cos(sky.sun_size);
+        let disk = smoothstep(cos_edge, mix(cos_edge, 1.0, 0.5), cos_to_sun);
+        sun = disk * sky.sun_tint * light.sun_color * light.sun_intensity;
+    }
+    return (grad + sun) * sky.intensity;
+}
+
 // Build an orthonormal basis (tangent, bitangent) around unit normal `n` (Frisvad / Duff branchless).
 fn onb(n: vec3<f32>) -> mat2x3<f32> {
     let s = select(-1.0, 1.0, n.z >= 0.0);
@@ -567,11 +614,12 @@ fn direct_lighting(albedo: vec3<f32>, n: vec3<f32>, p: vec3<f32>) -> vec3<f32> {
     return albedo * (light.ambient_color + direct);
 }
 
-// The sky/ambient radiance a MISSED ray returns (a diffuse bounce that escapes to open sky). Keep it
-// consistent with the primary-miss sky and the ambient fill so GI energy is plausible — a bounce into the
-// sky brings back roughly the ambient term (the same hemispheric fill the direct ambient uses).
-fn bounce_sky() -> vec3<f32> {
-    return light.ambient_color;
+// The sky radiance a MISSED diffuse bounce returns (a bounce that escapes to open sky), scaled by
+// `gi_sky_intensity`. ONE source of sky radiance (`sky_radiance`) shared with the primary-miss sky, so a
+// bounce into the sky brings back exactly the directional sky it would see — open-world GI now gets sky fill
+// instead of the old flat `ambient_color`. `gi_sky_intensity` is the knob for how strongly the sky lights GI.
+fn bounce_sky(dir: vec3<f32>) -> vec3<f32> {
+    return sky_radiance(dir) * sky.gi_sky_intensity;
 }
 
 // A 2D → 1D hash (PCG-ish) for cheap per-pixel+frame jitter of the bounce directions. Deterministic given
@@ -650,7 +698,7 @@ fn gather_gi(n: vec3<f32>, p: vec3<f32>, seed_base: u32) -> vec3<f32> {
             let emit = h.emissive * light.emissive_strength;
             contrib = surf + emit;
         } else {
-            contrib = bounce_sky();
+            contrib = bounce_sky(dir);
         }
         // Firefly clamp: cap a single bounce sample's radiance so one very bright hit (e.g. a grazing ray
         // catching the emissive panel) can't dominate the mean and pop/boil under temporal denoise. Scales
@@ -750,14 +798,10 @@ fn raymarch(@builtin(global_invocation_id) gid: vec3<u32>) {
         let lit = shade(r.color.rgb, r.normal, p, r.emissive, seed);
         color = vec4<f32>(lit, 1.0);
     } else {
-        // Miss: a simple vertical sky gradient (horizon → zenith) keyed off the ray's up component, fully
-        // opaque. This makes the HW-RT view a complete renderer (no cube crutch to show through) AND lets the
-        // headless oracle distinguish "rays ran but missed" (sky) from "the composite never ran" (clear
-        // colour). Linear-space colours — tonemapping converts them to display.
-        let up = clamp(rd.y * 0.5 + 0.5, 0.0, 1.0);
-        let horizon = vec3<f32>(0.55, 0.65, 0.78);
-        let zenith = vec3<f32>(0.12, 0.22, 0.45);
-        color = vec4<f32>(mix(horizon, zenith, up), 1.0);
+        // Miss: the procedural sky (`sky_radiance`, the SINGLE sky SSOT), fully opaque. This makes the HW-RT
+        // view a complete renderer (no cube crutch to show through) AND lets the headless oracle distinguish
+        // "rays ran but missed" (sky) from "the composite never ran" (clear colour). Linear-space — tonemapped.
+        color = vec4<f32>(sky_radiance(rd), 1.0);
     }
 
     // --- Temporal accumulation (denoise the per-frame GI noise) ---------------------------------------
@@ -849,12 +893,9 @@ fn raymarch_dlss(@builtin(global_invocation_id) gid: vec3<u32>) {
         let motion = (cur_ndc - prev_ndc) * vec2<f32>(0.5, -0.5);
         textureStore(out_dlss_motion, px, vec4<f32>(motion, 0.0, 0.0));
     } else {
-        // Miss: sky into the colour, far depth (0 in reverse-Z), no motion, no albedo (so DLSS doesn't
-        // re-modulate sky with a stale albedo), default normal.
-        let up = clamp(rd.y * 0.5 + 0.5, 0.0, 1.0);
-        let horizon = vec3<f32>(0.55, 0.65, 0.78);
-        let zenith = vec3<f32>(0.12, 0.22, 0.45);
-        textureStore(out_tex, px, vec4<f32>(mix(horizon, zenith, up), 1.0));
+        // Miss: the procedural sky (`sky_radiance`) into the colour, far depth (0 in reverse-Z), no motion, no
+        // albedo (so DLSS doesn't re-modulate sky with a stale albedo), default normal.
+        textureStore(out_tex, px, vec4<f32>(sky_radiance(rd), 1.0));
         textureStore(out_diffuse_albedo, px, vec4<f32>(1.0, 1.0, 1.0, 1.0));
         textureStore(out_specular_albedo, px, vec4<f32>(vec3<f32>(0.0), 1.0));
         textureStore(out_normal_roughness, px, vec4<f32>(0.0, 0.0, 0.0, 1.0));
@@ -939,8 +980,14 @@ fn uniform_hemisphere_inverse_pdf() -> f32 { return 6.2831853; } // 2π
 
 // Build an INITIAL reservoir from ONE uniform-hemisphere bounce in direction `dir` (pdf = 1/2π, so the
 // unbiased contribution weight is 2π). The sample's outgoing radiance L_o = direct lighting at the hit +
-// its emissive (emissive INCLUDED — the adaptation). Misses contribute nothing (the closed Cornell box
-// rarely lets a bounce escape; the sky term is negligible there, matching the energy test's assumption).
+// its emissive (emissive INCLUDED — the adaptation).
+//
+// MISS → a valid DISTANT SKY sample (open-world GI): the bounce escapes to open sky, so we record a far
+// sample point along `dir` carrying `sky_radiance(dir) · gi_sky_intensity`. This keeps the uniform-hemisphere
+// estimator UNBIASED (a single sky sample → E[2π · sky · cosθ/π] = sky integrated over the hemisphere), and
+// putting the sample at `gi_bounce_dist` (far) makes the spatial/temporal-reuse Jacobian (cosθ'/dist²) ≈ 1 for
+// nearby receivers, so sky reuse across pixels/frames is stable. A closed box rarely misses (the sky term is
+// negligible there) so the energy probe test is unchanged; open scenes now get sky fill instead of black.
 // Shared by the white-noise `generate_initial_reservoir` (the headless probe test) and the live
 // low-discrepancy path (`restir_p1_core`) — the ONLY difference between them is how `dir` is chosen.
 fn reservoir_from_bounce(world_position: vec3<f32>, world_normal: vec3<f32>, dir: vec3<f32>) -> Reservoir {
@@ -948,16 +995,22 @@ fn reservoir_from_bounce(world_position: vec3<f32>, world_normal: vec3<f32>, dir
     let origin = world_position + world_normal * light.shadow_bias;
     let r = trace(origin, dir, 0.0, light.gi_bounce_dist);
     if (r.hit == 0u) {
-        return reservoir;
+        // Distant sky sample: a far virtual surface facing back along the ray, radiating the procedural sky.
+        reservoir.sample_point_world_position = origin + dir * light.gi_bounce_dist;
+        reservoir.sample_point_world_normal = -dir;
+        reservoir.confidence_weight = 1.0;
+        reservoir.radiance = sky_radiance(dir) * sky.gi_sky_intensity;
+    } else {
+        let hp = origin + dir * r.t;
+        reservoir.sample_point_world_position = hp;
+        reservoir.sample_point_world_normal = r.normal;
+        reservoir.confidence_weight = 1.0;
+        reservoir.radiance = direct_lighting(r.color.rgb, r.normal, hp) + r.emissive * light.emissive_strength;
     }
-    let hp = origin + dir * r.t;
-    reservoir.sample_point_world_position = hp;
-    reservoir.sample_point_world_normal = r.normal;
-    reservoir.confidence_weight = 1.0;
-    reservoir.radiance = direct_lighting(r.color.rgb, r.normal, hp) + r.emissive * light.emissive_strength;
-    // Firefly clamp (hue-preserving), same as `gather_gi`. ReSTIR STORES + reuses samples, so an unclamped
-    // bright outlier (a grazing emissive hit) persists + propagates across the buffer — worse than in the
-    // plain mean. `gi_firefly_clamp == 0` disables it (the unbiased probe test sets 0). Small bias for stability.
+    // Firefly clamp (hue-preserving), same as `gather_gi`, applied to BOTH the hit and sky paths. ReSTIR STORES
+    // + reuses samples, so an unclamped bright outlier (a grazing emissive hit / a bright sun-disk sky sample)
+    // persists + propagates across the buffer — worse than in the plain mean. `gi_firefly_clamp == 0` disables
+    // it (the unbiased probe test sets 0). Small bias for stability.
     if (light.gi_firefly_clamp > 0.0) {
         let mx = max(reservoir.radiance.r, max(reservoir.radiance.g, reservoir.radiance.b));
         if (mx > light.gi_firefly_clamp) {
@@ -1492,10 +1545,7 @@ fn restir_p2(@builtin(global_invocation_id) gid: vec3<u32>) {
         let lit = shade_restir_p2(r.color.rgb, r.normal, p, r.emissive, gid.xy, seed);
         color = vec4<f32>(lit, 1.0);
     } else {
-        let up = clamp(rd.y * 0.5 + 0.5, 0.0, 1.0);
-        let horizon = vec3<f32>(0.55, 0.65, 0.78);
-        let zenith = vec3<f32>(0.12, 0.22, 0.45);
-        color = vec4<f32>(mix(horizon, zenith, up), 1.0);
+        color = vec4<f32>(sky_radiance(rd), 1.0);
     }
 
     let prev = textureSampleLevel(history_tex, history_sampler, uv, 0.0).rgb;
@@ -1535,10 +1585,7 @@ fn restir_dlss_p2(@builtin(global_invocation_id) gid: vec3<u32>) {
         let motion = (cur_ndc - prev_ndc) * vec2<f32>(0.5, -0.5);
         textureStore(out_dlss_motion, px, vec4<f32>(motion, 0.0, 0.0));
     } else {
-        let up = clamp(rd.y * 0.5 + 0.5, 0.0, 1.0);
-        let horizon = vec3<f32>(0.55, 0.65, 0.78);
-        let zenith = vec3<f32>(0.12, 0.22, 0.45);
-        textureStore(out_tex, px, vec4<f32>(mix(horizon, zenith, up), 1.0));
+        textureStore(out_tex, px, vec4<f32>(sky_radiance(rd), 1.0));
         textureStore(out_diffuse_albedo, px, vec4<f32>(1.0, 1.0, 1.0, 1.0));
         textureStore(out_specular_albedo, px, vec4<f32>(vec3<f32>(0.0), 1.0));
         textureStore(out_normal_roughness, px, vec4<f32>(0.0, 0.0, 0.0, 1.0));

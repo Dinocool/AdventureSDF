@@ -249,10 +249,14 @@ fn run_probes(
             wgpu::BindGroupEntry { binding: 11, resource: params_buf.as_entire_binding() },
         ],
     });
+    let sky_buf = common::sky_uniform_buffer(device);
     let light_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("restir_light_bg"),
         layout: &pipeline.get_bind_group_layout(1),
-        entries: &[wgpu::BindGroupEntry { binding: 2, resource: light_buf.as_entire_binding() }],
+        entries: &[
+            wgpu::BindGroupEntry { binding: 2, resource: light_buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 11, resource: sky_buf.as_entire_binding() },
+        ],
     });
 
     let mut build = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("restir_build") });

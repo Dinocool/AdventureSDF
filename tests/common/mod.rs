@@ -4,6 +4,21 @@
 #![allow(dead_code)]
 
 use futures_lite::future::block_on;
+use wgpu::util::DeviceExt;
+
+/// A UNIFORM buffer holding the default [`SkyUniformData`] (group 1 binding 11 of `voxel_raytrace.wgsl`).
+/// Every entry point that shades or bounces (`trace_one`, `restir_probe`, `raymarch_dlss`, …) now references
+/// the `Sky` uniform via `sky_radiance`, so wgpu's auto-derived group(1) layout includes binding 11 — the
+/// test's group(1) bind group MUST supply it or pipeline-creation/validation fails. The defaults preserve the
+/// previous inline sky look, so behaviour-asserting tests are unaffected. Single SSOT for the test sky buffer.
+pub fn sky_uniform_buffer(device: &wgpu::Device) -> wgpu::Buffer {
+    let sky = adventure::voxel::raytrace::SkyUniformData::default();
+    device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("test_sky"),
+        contents: bytemuck::bytes_of(&sky),
+        usage: wgpu::BufferUsages::UNIFORM,
+    })
+}
 
 /// A headless wgpu device requesting `required` features. Returns `None` — the caller then skips —
 /// if no adapter is available or the adapter lacks `required` (so a CI box without 16-bit-norm

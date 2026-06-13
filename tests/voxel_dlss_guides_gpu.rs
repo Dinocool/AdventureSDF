@@ -258,6 +258,7 @@ fn dlss_guides_populated_where_voxels_hit() {
         compilation_options: Default::default(),
         cache: None,
     });
+    let sky_buf = common::sky_uniform_buffer(&device);
     let scene_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("scene_bg"),
         layout: &pipeline.get_bind_group_layout(0),
@@ -281,6 +282,7 @@ fn dlss_guides_populated_where_voxels_hit() {
             wgpu::BindGroupEntry { binding: 8, resource: wgpu::BindingResource::TextureView(&v(&depth)) },
             wgpu::BindGroupEntry { binding: 9, resource: wgpu::BindingResource::TextureView(&v(&motion)) },
             wgpu::BindGroupEntry { binding: 10, resource: dlss_cam_buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 11, resource: sky_buf.as_entire_binding() },
         ],
     });
 

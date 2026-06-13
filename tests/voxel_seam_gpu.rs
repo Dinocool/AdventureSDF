@@ -214,10 +214,14 @@ fn gpu_continuous_wall_has_no_brick_seams() {
         contents: bytemuck::bytes_of(&adventure::voxel::raytrace::LightingUniformData::default()),
         usage: wgpu::BufferUsages::UNIFORM,
     });
+    let sky_buf = common::sky_uniform_buffer(&device);
     let light_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("seam_lighting_bg"),
         layout: &pipeline.get_bind_group_layout(1),
-        entries: &[wgpu::BindGroupEntry { binding: 2, resource: light_buf.as_entire_binding() }],
+        entries: &[
+            wgpu::BindGroupEntry { binding: 2, resource: light_buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 11, resource: sky_buf.as_entire_binding() },
+        ],
     });
 
     let mut build = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("seam_build") });

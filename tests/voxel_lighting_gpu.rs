@@ -222,10 +222,14 @@ fn gpu_lighting_normals_and_shadows() {
             wgpu::BindGroupEntry { binding: 5, resource: out_buf.as_entire_binding() },
         ],
     });
+    let sky_buf = common::sky_uniform_buffer(&device);
     let light_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("lit_lighting_bg"),
         layout: &pipeline.get_bind_group_layout(1),
-        entries: &[wgpu::BindGroupEntry { binding: 2, resource: light_buf.as_entire_binding() }],
+        entries: &[
+            wgpu::BindGroupEntry { binding: 2, resource: light_buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 11, resource: sky_buf.as_entire_binding() },
+        ],
     });
 
     let mut build = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("lit_build") });

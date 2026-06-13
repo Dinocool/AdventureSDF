@@ -8,7 +8,7 @@
 use bevy::prelude::*;
 use bevy_egui::egui;
 
-use crate::voxel::raytrace::{LightingUniformData, VoxelRtLighting};
+use crate::voxel::raytrace::{LightingUniformData, SkyUniformData, VoxelRtLighting, VoxelRtSky};
 
 /// Labels for `LightingUniformData.debug_view` (index == the u32 value the shader branches on).
 const DEBUG_LABELS: [&str; 7] = [
@@ -97,6 +97,35 @@ pub fn render_gi_panel(world: &mut World, ui: &mut egui::Ui) {
             d.debug_view = keep;
         }
     } // `lighting` borrow released here
+
+    // Procedural sky / environment knobs (the `Sky` UBO, group 1 binding 11 — knobs-as-uniforms). Drives the
+    // primary-miss sky gradient + sun disk AND how strongly a GI bounce that escapes to sky lights the scene.
+    {
+        ui.separator();
+        ui.label(egui::RichText::new("Sky / environment").strong());
+        if let Some(mut sky) = world.get_resource_mut::<VoxelRtSky>() {
+            let s = &mut sky.data;
+            ui.add(egui::Slider::new(&mut s.intensity, 0.0..=4.0).text("sky intensity"));
+            ui.add(
+                egui::Slider::new(&mut s.gi_sky_intensity, 0.0..=4.0).text("GI sky intensity"),
+            );
+            color_row(ui, "horizon", &mut s.horizon_color);
+            color_row(ui, "zenith", &mut s.zenith_color);
+            color_row(ui, "ground", &mut s.ground_color);
+            color_row(ui, "sun tint", &mut s.sun_tint);
+            ui.add(egui::Slider::new(&mut s.sun_size, 0.0..=0.3).text("sun size (rad)"));
+            ui.label(
+                egui::RichText::new(
+                    "GI sky intensity = how strongly a bounce that escapes to open sky lights the scene",
+                )
+                .weak()
+                .size(11.0),
+            );
+            if ui.button("Reset sky defaults").clicked() {
+                *s = SkyUniformData::default();
+            }
+        }
+    }
 
     // ReSTIR GI controls: the A/B `gi_mode` toggle (ReSTIR vs legacy gather_gi) + the reservoir knobs.
     {
