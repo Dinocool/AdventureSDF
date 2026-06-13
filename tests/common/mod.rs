@@ -65,12 +65,15 @@ pub fn headless_device(required: wgpu::Features) -> Option<(wgpu::Device, wgpu::
 /// device setup in `D:/spike-aabb`: the experimental feature flag, the minimum acceleration-structure
 /// limits, and `ExperimentalFeatures::enabled()` (which wgpu-trunk requires at device creation for the
 /// ray-query path). Returns `None` — caller skips — if no Vulkan adapter is present or it lacks ray query.
-/// Like [`headless_ray_query_device`] but raises `max_storage_textures_per_shader_stage` to `min_storage`
-/// (wgpu's default is 4) so a G-buffer-style compute that storage-writes more than 4 textures in one stage —
-/// e.g. the DLSS-RR `raymarch_dlss` entry (6: colour + diffuse/specular albedo + normal/roughness + depth +
-/// motion) — can create its pipeline. Mirrors the renderer's `wgpu_settings()` bump under `--features dlss`.
-pub fn headless_ray_query_device_with_storage_textures(
-    min_storage: u32,
+/// **SSOT for a limit-bumped ray-query test device.** Acquires the forced-Vulkan ray-query adapter and
+/// requests a device that raises `max_storage_textures_per_shader_stage` to `min_storage_textures` AND
+/// `max_storage_buffers_per_shader_stage` to `min_storage_buffers` (both above wgpu's defaults of 4 / 8), plus
+/// the 1024-wide compute-workgroup limits the world-cache scan needs. Returns `None` (caller skips) if no
+/// ray-query adapter is present or it can't reach the requested limits. The renderer's `wgpu_settings()` makes
+/// the same bumps; this mirrors them so a pipeline that compiles in-engine also compiles here.
+fn request_ray_query_device(
+    min_storage_textures: u32,
+    min_storage_buffers: u32,
 ) -> Option<(wgpu::Device, wgpu::Queue)> {
     let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
         backends: wgpu::Backends::VULKAN,
@@ -90,18 +93,33 @@ pub fn headless_ray_query_device_with_storage_textures(
         eprintln!("adapter lacks EXPERIMENTAL_RAY_QUERY — skipping");
         return None;
     }
-    if adapter.limits().max_storage_textures_per_shader_stage < min_storage {
+    if adapter.limits().max_storage_textures_per_shader_stage < min_storage_textures {
         eprintln!(
-            "adapter max_storage_textures_per_shader_stage {} < {min_storage} — skipping",
+            "adapter max_storage_textures_per_shader_stage {} < {min_storage_textures} — skipping",
             adapter.limits().max_storage_textures_per_shader_stage
+        );
+        return None;
+    }
+    if adapter.limits().max_storage_buffers_per_shader_stage < min_storage_buffers {
+        eprintln!(
+            "adapter max_storage_buffers_per_shader_stage {} < {min_storage_buffers} — skipping",
+            adapter.limits().max_storage_buffers_per_shader_stage
         );
         return None;
     }
     let mut limits =
         wgpu::Limits::default().using_minimum_supported_acceleration_structure_values();
-    limits.max_storage_textures_per_shader_stage = min_storage;
+    limits.max_storage_textures_per_shader_stage =
+        limits.max_storage_textures_per_shader_stage.max(min_storage_textures);
+    limits.max_storage_buffers_per_shader_stage =
+        limits.max_storage_buffers_per_shader_stage.max(min_storage_buffers);
+    // The world-cache decay/compaction passes use `@workgroup_size(1024)` (the prefix-sum scan width). wgpu's
+    // default caps invocations-per-workgroup + workgroup_size_x at 256, so raise both to 1024 (desktop RTX
+    // supports it; mirrors the renderer's `wgpu_settings()` bump).
+    limits.max_compute_invocations_per_workgroup = limits.max_compute_invocations_per_workgroup.max(1024);
+    limits.max_compute_workgroup_size_x = limits.max_compute_workgroup_size_x.max(1024);
     block_on(adapter.request_device(&wgpu::DeviceDescriptor {
-        label: Some("voxel_rt_test_device_storage"),
+        label: Some("voxel_rt_test_device_limits"),
         required_features: wgpu::Features::EXPERIMENTAL_RAY_QUERY,
         required_limits: limits,
         memory_hints: Default::default(),
@@ -109,6 +127,18 @@ pub fn headless_ray_query_device_with_storage_textures(
         experimental_features: unsafe { wgpu::ExperimentalFeatures::enabled() },
     }))
     .ok()
+}
+
+/// Like [`headless_ray_query_device`] but raises `max_storage_textures_per_shader_stage` to `min_storage`
+/// (wgpu's default is 4) so a G-buffer-style compute that storage-writes more than 4 textures in one stage —
+/// e.g. the DLSS-RR `raymarch_dlss` entry (6: colour + diffuse/specular albedo + normal/roughness + depth +
+/// motion) — can create its pipeline. Mirrors the renderer's `wgpu_settings()` bump under `--features dlss`.
+/// Keeps the default storage-BUFFER limit (8); use [`headless_ray_query_device_with_storage`] if an entry also
+/// binds more than 8 storage buffers (e.g. `restir_p1` once it queries the group(3) world cache — Phase 2.2).
+pub fn headless_ray_query_device_with_storage_textures(
+    min_storage: u32,
+) -> Option<(wgpu::Device, wgpu::Queue)> {
+    request_ray_query_device(min_storage, 8)
 }
 
 /// Like [`headless_ray_query_device`] but raises `max_storage_buffers_per_shader_stage` to `min_storage`
@@ -119,48 +149,18 @@ pub fn headless_ray_query_device_with_storage_textures(
 pub fn headless_ray_query_device_with_storage_buffers(
     min_storage: u32,
 ) -> Option<(wgpu::Device, wgpu::Queue)> {
-    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
-        backends: wgpu::Backends::VULKAN,
-        flags: wgpu::InstanceFlags::default(),
-        memory_budget_thresholds: Default::default(),
-        backend_options: Default::default(),
-        display: None,
-    });
-    let adapter = block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-        power_preference: wgpu::PowerPreference::HighPerformance,
-        force_fallback_adapter: false,
-        compatible_surface: None,
-        ..Default::default()
-    }))
-    .ok()?;
-    if !adapter.features().contains(wgpu::Features::EXPERIMENTAL_RAY_QUERY) {
-        eprintln!("adapter lacks EXPERIMENTAL_RAY_QUERY — skipping");
-        return None;
-    }
-    if adapter.limits().max_storage_buffers_per_shader_stage < min_storage {
-        eprintln!(
-            "adapter max_storage_buffers_per_shader_stage {} < {min_storage} — skipping",
-            adapter.limits().max_storage_buffers_per_shader_stage
-        );
-        return None;
-    }
-    let mut limits =
-        wgpu::Limits::default().using_minimum_supported_acceleration_structure_values();
-    limits.max_storage_buffers_per_shader_stage = min_storage;
-    // The world-cache decay/compaction passes use `@workgroup_size(1024)` (the prefix-sum scan width). wgpu's
-    // default caps invocations-per-workgroup + workgroup_size_x at 256, so raise both to 1024 (desktop RTX
-    // supports it; mirrors the renderer's `wgpu_settings()` bump).
-    limits.max_compute_invocations_per_workgroup = limits.max_compute_invocations_per_workgroup.max(1024);
-    limits.max_compute_workgroup_size_x = limits.max_compute_workgroup_size_x.max(1024);
-    block_on(adapter.request_device(&wgpu::DeviceDescriptor {
-        label: Some("voxel_rt_test_device_storage_buffers"),
-        required_features: wgpu::Features::EXPERIMENTAL_RAY_QUERY,
-        required_limits: limits,
-        memory_hints: Default::default(),
-        trace: wgpu::Trace::Off,
-        experimental_features: unsafe { wgpu::ExperimentalFeatures::enabled() },
-    }))
-    .ok()
+    request_ray_query_device(4, min_storage)
+}
+
+/// A ray-query device that raises BOTH the storage-texture and storage-buffer limits. The Phase-2.2
+/// `restir_p1`/`restir_dlss_p1` entries query the group(3) world cache, so their auto-derived layout binds 11
+/// storage buffers (3 scene + 4 reservoir/surface + 4 cache) AND, for the DLSS variant, 6 storage textures —
+/// both over wgpu's defaults. The screen-space compile gate uses this so it mirrors the in-engine device.
+pub fn headless_ray_query_device_with_storage(
+    min_storage_textures: u32,
+    min_storage_buffers: u32,
+) -> Option<(wgpu::Device, wgpu::Queue)> {
+    request_ray_query_device(min_storage_textures, min_storage_buffers)
 }
 
 pub fn headless_ray_query_device() -> Option<(wgpu::Device, wgpu::Queue)> {

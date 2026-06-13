@@ -158,7 +158,7 @@ fn world_cache_converges_to_single_bounce_irradiance() {
         gi_intensity: 1.0,
         gi_bounce_dist: 40.0,
         emissive_strength: 4.0,
-        gi_firefly_clamp: 0.0,
+        // (firefly clamping discarded in Phase 2.2 — the cache update is unclamped, matching Solari sample_gi.)
         ..LightingUniformData::default()
     };
     // Dark sky so a (rare) sideways/over-the-edge bounce miss adds nothing — the radiance is the ceiling alone.
@@ -610,5 +610,642 @@ fn world_cache_converges_to_single_bounce_irradiance() {
     assert!(
         (conv - CEILING_RADIANCE).abs() / CEILING_RADIANCE < 0.3,
         "the cache cell must converge to the analytic single-bounce radiance R={CEILING_RADIANCE} (got {conv:.3})"
+    );
+}
+
+// === Phase 2.2 energy gate: `reservoir_from_bounce_cached` adds exactly `albedo·cache` ================
+//
+// The convergence test above proves the cache FILLS to the analytic incoming radiance (cache(floor) ≈ 12); the
+// restir_probe test proves the resolve constant. NEITHER drove `reservoir_from_bounce_cached` (the live
+// cache-fed initial reservoir) through the resolve — the only other coverage was a compile gate, so the 2.2
+// wrong-energy bug (it read the cache RAW, dropping the bounce surface's albedo AND its own direct+emissive)
+// would not have been caught. This test pins the corrected rendering-equation relation on the SAME floor /
+// emissive-ceiling scene the cache test fills:
+//   * fills the cache for N frames (seeding a small grid of up-facing floor cells so `query_world_cache`'s
+//     tangent-plane jitter still lands on a filled ≈12 cell), then
+//   * runs `world_cache_energy_probe`, which builds BOTH `reservoir_from_bounce` (cache OFF) and
+//     `reservoir_from_bounce_cached` (cache ON) for one shading point whose fixed straight-down bounce hits the
+//     filled floor, resolves each, and reports the raw radiances + the deterministic cache value + the floor
+//     albedo, and
+//   * asserts:  cache_on.radiance ≈ cache_off.radiance + floor_albedo·cache(floor)
+//     i.e. the cache adds ~ albedo(0.5)·12 = 6 of reflected indirect — NOT 12 (the bug read it raw) and NOT
+//     replacing the fresh direct+emissive (a prior reviewer's "* albedo only" mistake would have dropped those).
+
+// Mirror of the WGSL `EnergyProbeParams` (group 0 binding 8) — the shading point + a fixed bounce direction.
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct EnergyProbeParams {
+    shading_position: [f32; 3],
+    _p0: u32,
+    shading_normal: [f32; 3],
+    _p1: u32,
+    bounce_dir: [f32; 3],
+    _p2: u32,
+}
+
+// Mirror of the WGSL `EnergyProbeOut` (group 0 binding 9). Field order + padding MUST match the shader struct.
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable, Debug, Default)]
+struct EnergyProbeOut {
+    cache_off_radiance: [f32; 3],
+    _p0: u32,
+    cache_on_radiance: [f32; 3],
+    _p1: u32,
+    cache_off_irradiance: [f32; 3],
+    _p2: u32,
+    cache_on_irradiance: [f32; 3],
+    _p3: u32,
+    hit_albedo: [f32; 3],
+    _p4: u32,
+    cache_value: [f32; 3],
+    _p5: u32,
+    hit: u32,
+    _p6: u32,
+    _p7: u32,
+    _p8: u32,
+}
+
+// Mirror of the WGSL `CameraUniform` (group 1 binding 0): `world_from_clip`(64) + `cam_pos`(12) + `t_max`(4) +
+// `viewport`(8) + `accum_weight`(4) + pad(4) + `prev_clip_from_world`(64) = 160 bytes. The energy probe reads
+// only `cam_pos` (for the cache LOD), so the rest stays zero.
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct CameraUniformMirror {
+    world_from_clip: [[f32; 4]; 4],
+    cam_pos: [f32; 3],
+    t_max: f32,
+    viewport: [u32; 2],
+    accum_weight: f32,
+    _pad: u32,
+    prev_clip_from_world: [[f32; 4]; 4],
+}
+
+/// The floor albedo (material 0 = "floor", base_color 0.5) — the receiver/bounce reflectance the relation uses.
+const FLOOR_ALBEDO: f32 = 0.5;
+/// A small floor self-emissive (linear radiance) so the FRESH path carries a non-zero `emissive·strength`
+/// term — this is what lets the energy gate distinguish the correct form (keeps direct+emissive) from the
+/// "* albedo only" mistake (drops it). Kept small so it doesn't perturb cache(floor) (it isn't gathered into
+/// the floor's own cell). Fresh `cache_off.radiance` ≈ FLOOR_EMISSIVE · emissive_strength(4) = 2.0.
+const FLOOR_EMISSIVE: f32 = 0.5;
+
+#[test]
+fn cached_initial_reservoir_adds_albedo_times_cache() {
+    // The fill passes bind 16 storage buffers in one stage (3 scene + 11 cache + query_out + dispatch); the
+    // energy probe adds ONE more (`energy_out` on group 0) → 17, over the convergence test's 16.
+    let Some((device, queue)) = common::headless_ray_query_device_with_storage_buffers(17) else {
+        eprintln!("no ray-query device with 17 storage buffers — skipping energy test");
+        return;
+    };
+
+    let mut reg = BlockRegistry::from_biome_library(&test_library());
+    reg.set_emissive(EMITTER, [3.0, 3.0, 3.0]);
+    // Give the FLOOR a small self-emissive so the FRESH path's `direct_lighting + emissive` term is NON-ZERO
+    // (= FLOOR_EMISSIVE · emissive_strength). This is what makes the gate ALSO reject the "* albedo only"
+    // mistake (which drops the fresh direct+emissive): with a non-zero fresh term, the correct form gives
+    // `cache_on = fresh + albedo·cache` while the albedo-only form gives just `albedo·cache` — distinguishable.
+    // The floor's own emissive does NOT feed its own cache cell (that cell's +Y hemisphere bounce gathers the
+    // CEILING, not itself), so cache(floor) stays ≈ R = 12.
+    reg.set_emissive(FLOOR, [FLOOR_EMISSIVE, FLOOR_EMISSIVE, FLOOR_EMISSIVE]);
+    let patch = emitter_patch(&reg);
+    let n = patch.brick_count() as u32;
+
+    // Same lighting/sky/cache knobs as the convergence test (sun off, ambient 0, dark sky ⇒ the ceiling is the
+    // ONLY external light, so cache(floor) ≈ R = 12). The floor's small self-emissive is the only fresh term.
+    let light = LightingUniformData {
+        sun_direction: [0.0, 1.0, 0.0],
+        ambient_color: [0.0, 0.0, 0.0],
+        gi_rays: 1,
+        gi_intensity: 1.0,
+        gi_bounce_dist: 40.0,
+        emissive_strength: 4.0,
+        ..LightingUniformData::default()
+    };
+    let sky = SkyUniformData {
+        horizon_color: [0.0, 0.0, 0.0],
+        zenith_color: [0.0, 0.0, 0.0],
+        ground_color: [0.0, 0.0, 0.0],
+        sun_size: 0.0,
+        intensity: 0.0,
+        gi_sky_intensity: 0.0,
+        sun_tint: [0.0, 0.0, 0.0],
+        _pad: 0.0,
+    };
+    let wc_defaults = WorldCacheUniformData {
+        cell_base_size: 0.3,
+        gi_ray_distance: 40.0,
+        cell_lifetime: 8,
+        ..WorldCacheUniformData::default()
+    };
+
+    let s = BRICK_WORLD_SIZE;
+    let floor_top = s;
+    let cx = s * 0.5;
+    let cz = s * 0.5;
+    let view_position = [cx, floor_top + 3.0, cz]; // a near camera ⇒ cache LOD 0 (matches the cell_base_size)
+
+    // SEED a 3×3 grid of up-facing floor cells around the bounce-hit cell. Filling the neighbours means
+    // `query_world_cache`'s tangent-plane jitter (inside `reservoir_from_bounce_cached`) still lands on a
+    // filled ≈12 cell regardless of which neighbour it dithers into — so the energy relation is robust, not a
+    // lucky single-cell hit. The grid step is one cache cell (`cell_base_size`).
+    let step = wc_defaults.cell_base_size;
+    let mut probes: Vec<WcQueryPoint> = Vec::new();
+    for dz in -1..=1i32 {
+        for dx in -1..=1i32 {
+            probes.push(WcQueryPoint {
+                world_position: [cx + dx as f32 * step, floor_top, cz + dz as f32 * step],
+                _p0: 0,
+                world_normal: [0.0, 1.0, 0.0],
+                _p1: 0,
+            });
+        }
+    }
+    let n_points = probes.len() as u32;
+
+    // The energy probe: a shading point in the gap ABOVE the floor, facing DOWN, firing a fixed straight-down
+    // bounce so it deterministically hits the (filled) floor centre cell with normal +Y. Facing down (the
+    // sample point is straight below) makes the resolve cosine = 1, so the irradiance relation is clean too.
+    let energy_params = EnergyProbeParams {
+        shading_position: [cx, floor_top + 0.6, cz],
+        _p0: 0,
+        shading_normal: [0.0, -1.0, 0.0],
+        _p1: 0,
+        bounce_dir: [0.0, -1.0, 0.0],
+        _p2: 0,
+    };
+
+    // --- Scene (group 0) GPU objects ---
+    let aabb_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("e_aabbs"),
+        contents: bytemuck::cast_slice(&patch.aabbs),
+        usage: wgpu::BufferUsages::BLAS_INPUT | wgpu::BufferUsages::STORAGE,
+    });
+    let meta_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("e_metas"),
+        contents: bytemuck::cast_slice(&patch.metas),
+        usage: wgpu::BufferUsages::STORAGE,
+    });
+    let voxel_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("e_voxels"),
+        contents: bytemuck::cast_slice(&patch.voxels),
+        usage: wgpu::BufferUsages::STORAGE,
+    });
+    let palette_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("e_palette"),
+        contents: bytemuck::cast_slice(&patch.palette),
+        usage: wgpu::BufferUsages::STORAGE,
+    });
+
+    let size_desc = wgpu::BlasAABBGeometrySizeDescriptor {
+        primitive_count: n,
+        flags: wgpu::AccelerationStructureGeometryFlags::OPAQUE,
+    };
+    let blas = device.create_blas(
+        &wgpu::CreateBlasDescriptor {
+            label: Some("e_blas"),
+            flags: wgpu::AccelerationStructureFlags::PREFER_FAST_TRACE,
+            update_mode: wgpu::AccelerationStructureUpdateMode::Build,
+        },
+        wgpu::BlasGeometrySizeDescriptors::AABBs { descriptors: vec![size_desc.clone()] },
+    );
+    let mut tlas = device.create_tlas(&wgpu::CreateTlasDescriptor {
+        label: Some("e_tlas"),
+        flags: wgpu::AccelerationStructureFlags::PREFER_FAST_TRACE,
+        update_mode: wgpu::AccelerationStructureUpdateMode::Build,
+        max_instances: 1,
+    });
+    tlas[0] = Some(wgpu::TlasInstance::new(
+        &blas,
+        [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0],
+        0,
+        0xff,
+    ));
+
+    // --- Persistent cache buffers (zero-initialised → all cells empty) ---
+    let tsz = TEST_WORLD_CACHE_SIZE as u64;
+    let zeroed = |label: &str, bytes: u64, indirect: bool| {
+        let mut usage = wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST;
+        if indirect {
+            usage |= wgpu::BufferUsages::INDIRECT;
+        }
+        let buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some(label),
+            size: bytes,
+            usage,
+            mapped_at_creation: false,
+        });
+        queue.write_buffer(&buf, 0, &vec![0u8; bytes as usize]);
+        buf
+    };
+    let checksums = zeroed("e_checksums", tsz * 4, false);
+    let life = zeroed("e_life", tsz * 4, false);
+    let radiance = zeroed("e_radiance", tsz * 16, false);
+    let geometry = zeroed("e_geometry", tsz * 32, false);
+    let luminance_deltas = zeroed("e_luminance_deltas", tsz * 4, false);
+    let new_radiance = zeroed("e_new_radiance", tsz * 16, false);
+    let a = zeroed("e_a", tsz * 4, false);
+    let b = zeroed("e_b", 1024 * 4, false);
+    let active_cell_indices = zeroed("e_active_cell_indices", tsz * 4, false);
+    let active_cells_count = zeroed("e_active_cells_count", 4, false);
+    let active_cells_dispatch = zeroed("e_active_cells_dispatch", 12, true);
+
+    // --- Per-frame + uniform buffers ---
+    let wc_uniform = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("e_wc_uniform"),
+        size: mem::size_of::<WorldCacheUniformData>() as u64,
+        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    let light_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("e_light"),
+        contents: bytemuck::bytes_of(&light),
+        usage: wgpu::BufferUsages::UNIFORM,
+    });
+    let sky_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("e_sky"),
+        contents: bytemuck::bytes_of(&sky),
+        usage: wgpu::BufferUsages::UNIFORM,
+    });
+    let camera = CameraUniformMirror {
+        world_from_clip: [[0.0; 4]; 4],
+        cam_pos: view_position,
+        t_max: 1.0e4,
+        viewport: [1, 1],
+        accum_weight: 1.0,
+        _pad: 0,
+        prev_clip_from_world: [[0.0; 4]; 4],
+    };
+    let camera_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("e_camera"),
+        contents: bytemuck::bytes_of(&camera),
+        usage: wgpu::BufferUsages::UNIFORM,
+    });
+
+    // --- Seed (test) buffers — drive the cache fill (group 3 bindings 12/13/14) ---
+    let query_points_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("e_query_points"),
+        contents: bytemuck::cast_slice(&probes),
+        usage: wgpu::BufferUsages::STORAGE,
+    });
+    let query_out_buf = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("e_query_out"),
+        size: (n_points as u64) * mem::size_of::<WcQueryOut>() as u64,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        mapped_at_creation: false,
+    });
+    let query_params_buf = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("e_query_params"),
+        size: mem::size_of::<WcQueryParams>() as u64,
+        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+
+    // --- Energy-probe I/O (group 0 bindings 8/9) ---
+    let energy_params_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("e_energy_params"),
+        contents: bytemuck::bytes_of(&energy_params),
+        usage: wgpu::BufferUsages::UNIFORM,
+    });
+    let energy_out_buf = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("e_energy_out"),
+        size: mem::size_of::<EnergyProbeOut>() as u64,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        mapped_at_creation: false,
+    });
+    let energy_read_buf = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("e_energy_read"),
+        size: mem::size_of::<EnergyProbeOut>() as u64,
+        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+
+    // --- Bind-group layouts ---
+    let storage_rw = |binding: u32| wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::COMPUTE,
+        ty: wgpu::BindingType::Buffer {
+            ty: wgpu::BufferBindingType::Storage { read_only: false },
+            has_dynamic_offset: false,
+            min_binding_size: None,
+        },
+        count: None,
+    };
+    let storage_ro = |binding: u32| wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::COMPUTE,
+        ty: wgpu::BindingType::Buffer {
+            ty: wgpu::BufferBindingType::Storage { read_only: true },
+            has_dynamic_offset: false,
+            min_binding_size: None,
+        },
+        count: None,
+    };
+    let uniform = |binding: u32| wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::COMPUTE,
+        ty: wgpu::BindingType::Buffer {
+            ty: wgpu::BufferBindingType::Uniform,
+            has_dynamic_offset: false,
+            min_binding_size: None,
+        },
+        count: None,
+    };
+
+    // group 0: scene (0-3) for the FILL passes + energy I/O (8 uniform, 9 storage) for the probe. One layout
+    // shared by both pipelines (the fill passes simply don't touch bindings 8/9).
+    let scene_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("e_scene_layout"),
+        entries: &[
+            wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::AccelerationStructure { vertex_return: false },
+                count: None,
+            },
+            storage_ro(1),
+            storage_ro(2),
+            storage_ro(3),
+            uniform(8),
+            storage_rw(9),
+        ],
+    });
+    // group 1: camera (0) for the probe's cache LOD + light (2) + sky (11). The fill passes ignore camera.
+    let view_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("e_view_layout"),
+        entries: &[uniform(0), uniform(2), uniform(11)],
+    });
+    let dispatch_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("e_dispatch_layout"),
+        entries: &[storage_rw(0)],
+    });
+    let cache_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("e_cache_layout"),
+        entries: &[
+            uniform(0),
+            storage_rw(1),
+            storage_rw(2),
+            storage_rw(3),
+            storage_rw(4),
+            storage_rw(5),
+            storage_rw(6),
+            storage_rw(7),
+            storage_rw(8),
+            storage_rw(9),
+            storage_rw(10),
+            storage_ro(12),
+            storage_rw(13),
+            uniform(14),
+        ],
+    });
+    // Layout A — seed + decay + 3 compaction passes (group 2 = the indirect-dispatch buffer present).
+    let compact_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("e_compact_pl"),
+        bind_group_layouts: &[Some(&scene_layout), Some(&view_layout), Some(&dispatch_layout), Some(&cache_layout)],
+        immediate_size: 0,
+    });
+    // Layout B — update + blend + the energy probe (group 2 absent so the dispatch buffer is free as the
+    // indirect-args source; the energy probe doesn't touch group 2 either).
+    let update_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("e_update_pl"),
+        bind_group_layouts: &[Some(&scene_layout), Some(&view_layout), None, Some(&cache_layout)],
+        immediate_size: 0,
+    });
+
+    let src = adventure::voxel::raytrace::voxel_raytrace_shader_src(TEST_WORLD_CACHE_SIZE);
+    let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("voxel_raytrace"),
+        source: wgpu::ShaderSource::Wgsl(src.into()),
+    });
+    let mk = |entry: &str, layout: &wgpu::PipelineLayout| {
+        device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some(entry),
+            layout: Some(layout),
+            module: &module,
+            entry_point: Some(entry),
+            compilation_options: Default::default(),
+            cache: None,
+        })
+    };
+    let p_seed = mk("world_cache_query_seed", &compact_pl);
+    let p_decay = mk("world_cache_decay", &compact_pl);
+    let p_csb = mk("world_cache_compact_single_block", &compact_pl);
+    let p_cb = mk("world_cache_compact_blocks", &compact_pl);
+    let p_cwa = mk("world_cache_compact_write_active", &compact_pl);
+    let p_update = mk("world_cache_update", &update_pl);
+    let p_blend = mk("world_cache_blend", &update_pl);
+    let p_energy = mk("world_cache_energy_probe", &update_pl);
+
+    // --- Bind groups ---
+    let scene_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("e_scene_bg"),
+        layout: &scene_layout,
+        entries: &[
+            wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::AccelerationStructure(&tlas) },
+            wgpu::BindGroupEntry { binding: 1, resource: meta_buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 2, resource: voxel_buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 3, resource: palette_buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 8, resource: energy_params_buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 9, resource: energy_out_buf.as_entire_binding() },
+        ],
+    });
+    let view_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("e_view_bg"),
+        layout: &view_layout,
+        entries: &[
+            wgpu::BindGroupEntry { binding: 0, resource: camera_buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 2, resource: light_buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 11, resource: sky_buf.as_entire_binding() },
+        ],
+    });
+    let dispatch_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("e_dispatch_bg"),
+        layout: &dispatch_layout,
+        entries: &[wgpu::BindGroupEntry { binding: 0, resource: active_cells_dispatch.as_entire_binding() }],
+    });
+    let cache_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("e_cache_bg"),
+        layout: &cache_layout,
+        entries: &[
+            wgpu::BindGroupEntry { binding: 0, resource: wc_uniform.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 1, resource: checksums.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 2, resource: life.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 3, resource: radiance.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 4, resource: geometry.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 5, resource: luminance_deltas.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 6, resource: new_radiance.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 7, resource: a.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 8, resource: b.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 9, resource: active_cell_indices.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 10, resource: active_cells_count.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 12, resource: query_points_buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 13, resource: query_out_buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 14, resource: query_params_buf.as_entire_binding() },
+        ],
+    });
+
+    let mut build = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("e_build") });
+    build.build_acceleration_structures(
+        iter::once(&wgpu::BlasBuildEntry {
+            blas: &blas,
+            geometry: wgpu::BlasGeometries::AabbGeometries(vec![wgpu::BlasAabbGeometry {
+                size: &size_desc,
+                stride: mem::size_of::<adventure::voxel::gpu::GpuBrickAabb>() as wgpu::BufferAddress,
+                aabb_buffer: &aabb_buf,
+                primitive_offset: 0,
+            }]),
+        }),
+        iter::once(&tlas),
+    );
+    queue.submit(Some(build.finish()));
+
+    let table_groups = TEST_WORLD_CACHE_SIZE / 1024;
+
+    // FILL the cache: run the full fill loop for N frames (no energy probe yet — let the floor cells converge).
+    for frame in 0..N_FRAMES {
+        let mut wc = wc_defaults;
+        wc.frame_index = frame.wrapping_mul(5782582).wrapping_add(1);
+        wc.reset = u32::from(frame == 0);
+        queue.write_buffer(&wc_uniform, 0, bytemuck::bytes_of(&wc));
+        let qp = WcQueryParams {
+            view_position,
+            n_points,
+            frame_index: wc.frame_index,
+            _p0: 0,
+            _p1: 0,
+            _p2: 0,
+        };
+        queue.write_buffer(&query_params_buf, 0, bytemuck::bytes_of(&qp));
+
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        {
+            let mut cpass =
+                encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: None, timestamp_writes: None });
+            cpass.set_bind_group(0, Some(&scene_bg), &[]);
+            cpass.set_bind_group(1, Some(&view_bg), &[]);
+            cpass.set_bind_group(2, Some(&dispatch_bg), &[]);
+            cpass.set_bind_group(3, Some(&cache_bg), &[]);
+            cpass.set_pipeline(&p_seed);
+            cpass.dispatch_workgroups(n_points.div_ceil(64), 1, 1);
+            cpass.set_pipeline(&p_decay);
+            cpass.dispatch_workgroups(table_groups, 1, 1);
+            cpass.set_pipeline(&p_csb);
+            cpass.dispatch_workgroups(table_groups, 1, 1);
+            cpass.set_pipeline(&p_cb);
+            cpass.dispatch_workgroups(1, 1, 1);
+            cpass.set_pipeline(&p_cwa);
+            cpass.dispatch_workgroups(table_groups, 1, 1);
+            cpass.set_bind_group(2, None, &[]);
+            cpass.set_pipeline(&p_update);
+            cpass.dispatch_workgroups_indirect(&active_cells_dispatch, 0);
+            cpass.set_pipeline(&p_blend);
+            cpass.dispatch_workgroups_indirect(&active_cells_dispatch, 0);
+        }
+        queue.submit(Some(encoder.finish()));
+    }
+
+    // RUN the energy probe ONCE on the filled cache. group 2 is unbound (update_pl), and the probe touches only
+    // groups 0/1/3 — so the same scene/view/cache bind groups apply.
+    {
+        let mut wc = wc_defaults;
+        wc.frame_index = 0xABCDEF; // any non-zero stream
+        wc.reset = 0;
+        queue.write_buffer(&wc_uniform, 0, bytemuck::bytes_of(&wc));
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        {
+            let mut cpass =
+                encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: None, timestamp_writes: None });
+            cpass.set_bind_group(0, Some(&scene_bg), &[]);
+            cpass.set_bind_group(1, Some(&view_bg), &[]);
+            cpass.set_bind_group(3, Some(&cache_bg), &[]);
+            cpass.set_pipeline(&p_energy);
+            cpass.dispatch_workgroups(1, 1, 1);
+        }
+        encoder.copy_buffer_to_buffer(&energy_out_buf, 0, &energy_read_buf, 0, mem::size_of::<EnergyProbeOut>() as u64);
+        queue.submit(Some(encoder.finish()));
+    }
+
+    let slice = energy_read_buf.slice(..);
+    slice.map_async(wgpu::MapMode::Read, |r| r.expect("map failed"));
+    device.poll(wgpu::PollType::wait_indefinitely()).expect("poll failed");
+    let data = slice.get_mapped_range().unwrap();
+    let out: EnergyProbeOut = *bytemuck::from_bytes(&data[..mem::size_of::<EnergyProbeOut>()]);
+    drop(data);
+    energy_read_buf.unmap();
+    let _ = (&aabb_buf, &blas, &tlas);
+
+    let cache_off = luma(out.cache_off_radiance);
+    let cache_on = luma(out.cache_on_radiance);
+    let cache_val = luma(out.cache_value);
+    let albedo = luma(out.hit_albedo);
+    let delta = cache_on - cache_off;
+    let expected_delta = albedo * cache_val;
+    eprintln!(
+        "[energy] hit={} albedo={:.3} cache(floor)={:.3} | cache_off.radiance={:.3} cache_on.radiance={:.3} \
+         delta={:.3} vs albedo*cache={:.3} | irradiance off={:.3} on={:.3}",
+        out.hit,
+        albedo,
+        cache_val,
+        cache_off,
+        cache_on,
+        delta,
+        expected_delta,
+        luma(out.cache_off_irradiance),
+        luma(out.cache_on_irradiance),
+    );
+
+    // --- Sanity: the bounce hit the floor, with the expected albedo, and the cache there filled to ≈ R. ---
+    assert_eq!(out.hit, 1, "the fixed straight-down bounce must hit the floor (cache cell to read)");
+    assert!(
+        (albedo - FLOOR_ALBEDO).abs() < 0.02,
+        "the bounce must hit the FLOOR (albedo {FLOOR_ALBEDO}), got {albedo:.3}"
+    );
+    assert!(
+        (cache_val - CEILING_RADIANCE).abs() / CEILING_RADIANCE < 0.3,
+        "the floor cache cell must have filled to the analytic R={CEILING_RADIANCE} (got {cache_val:.3})"
+    );
+
+    // --- Cache OFF == the FRESH single bounce (direct+emissive). With sun off + ambient 0 the floor's
+    //     direct_lighting is 0, so the fresh radiance is its self-emissive ≈ FLOOR_EMISSIVE·emissive_strength.
+    //     This being NON-ZERO is what lets the relation distinguish "keeps direct+emissive" from "albedo only". ---
+    let fresh_expected = FLOOR_EMISSIVE * light.emissive_strength; // 0.5 · 4 = 2.0
+    assert!(
+        (cache_off - fresh_expected).abs() / fresh_expected < 0.1,
+        "cache-OFF must equal the fresh direct+emissive ≈ {fresh_expected:.3} (floor self-emissive), got {cache_off:.3}"
+    );
+
+    // --- THE ENERGY RELATION (the bug gate): cache_on.radiance ≈ cache_off.radiance + albedo·cache(floor).
+    //     The cache adds exactly one reflected indirect bounce (albedo·cache ≈ 0.5·12 = 6), ON TOP of the fresh
+    //     direct+emissive (≈ 2). This FAILS for BOTH wrong-energy forms:
+    //       * the original bug (raw cache → cache_on ≈ 12): delta ≈ 12 = the un-weighted cache — caught below;
+    //       * the "* albedo only" mistake (cache REPLACES direct+emissive → cache_on ≈ albedo·cache ≈ 6):
+    //         then delta = cache_on - cache_off ≈ 6 - 2 = 4 ≠ albedo·cache ≈ 6 — caught by the relation. ---
+    let denom = expected_delta.max(1e-3);
+    assert!(
+        (delta - expected_delta).abs() / denom < 0.15,
+        "cache_on.radiance must equal cache_off.radiance + albedo·cache(floor): delta={delta:.3} vs \
+         expected={expected_delta:.3} (cache_off={cache_off:.3}, albedo={albedo:.3}, cache={cache_val:.3})"
+    );
+    // Reject the RAW-cache bug: the cache contribution is ALBEDO-WEIGHTED (~6), not the raw cache (~12).
+    assert!(
+        delta < 0.75 * cache_val,
+        "the cache contribution must be albedo-weighted (≈{:.3}), not the RAW cache ({cache_val:.3}) — the 2.2 bug",
+        expected_delta
+    );
+    // Reject the "* albedo only" mistake: cache_on must KEEP the fresh direct+emissive (so it exceeds the bare
+    // albedo·cache by ≈ the fresh term). If the fix dropped direct+emissive, cache_on would be ≈ albedo·cache.
+    assert!(
+        cache_on > expected_delta + 0.5 * fresh_expected,
+        "cache_on.radiance must INCLUDE the fresh direct+emissive on top of albedo·cache (≈{:.3}+{:.3}), got \
+         {cache_on:.3} — does the cached path drop direct+emissive?",
+        fresh_expected,
+        expected_delta
+    );
+
+    // --- The resolve carries the SAME relation through (the live path resolves these to irradiance): the
+    //     extra irradiance is the resolve factor times albedo·cache, and is strictly positive (cache helps). ---
+    assert!(
+        luma(out.cache_on_irradiance) > luma(out.cache_off_irradiance) + 1e-3,
+        "resolved cache-ON irradiance must exceed cache-OFF (the cache adds reflected indirect): on={:.4} off={:.4}",
+        luma(out.cache_on_irradiance),
+        luma(out.cache_off_irradiance)
     );
 }

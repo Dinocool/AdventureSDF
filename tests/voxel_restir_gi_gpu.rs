@@ -329,7 +329,7 @@ fn emitter_scene() -> (BlockRegistry, LightingUniformData, [ProbePoint; N_PROBES
         gi_intensity: 1.0,
         gi_bounce_dist: 40.0, // must comfortably reach the ceiling (~1.6 m up)
         emissive_strength: 4.0,
-        gi_firefly_clamp: 0.0,
+        // (firefly clamping was discarded in Phase 2.2 — the probe estimator is the unbiased oracle, no clamp.)
         ..LightingUniformData::default()
     };
 
@@ -483,12 +483,17 @@ fn restir_probe_is_valid_unbiased_and_concentrates() {
 /// `restir_dlss_p1`/`restir_dlss_p2`) must compile on the real device. The lib build never compiles the WGSL
 /// (it's loaded at runtime), and the estimator test above only exercises `restir_probe` — so without this, a
 /// syntax/binding error in the screen-space entries would only surface at launch. Creating the pipelines (auto
-/// layout) forces naga to compile every entry + validate its bindings. Needs an 8-storage-texture device (the
-/// DLSS variants write colour + 5 guides).
+/// layout) forces naga to compile every entry + validate its bindings. Needs an 8-storage-texture +
+/// 16-storage-buffer device (the DLSS variants write colour + 5 guides; Phase 2.2's `restir_p1`/
+/// `restir_dlss_p1` query the group(3) world cache, so they bind 11 storage buffers — over the default 8).
 #[test]
 fn restir_screen_space_entries_compile() {
-    let Some((device, _queue)) = common::headless_ray_query_device_with_storage_textures(8) else {
-        eprintln!("no ray-query device with 8 storage textures — skipping restir_screen_space_entries_compile");
+    // 8 storage textures (the DLSS variants write colour + 5 guides) AND 16 storage buffers: Phase 2.2's
+    // `restir_p1`/`restir_dlss_p1` query the group(3) world cache, so their auto-derived layout binds 11
+    // storage buffers (3 scene + 4 reservoir/surface + 4 cache) — over wgpu's default of 8. Mirrors the
+    // in-engine `wgpu_settings()` device.
+    let Some((device, _queue)) = common::headless_ray_query_device_with_storage(8, 16) else {
+        eprintln!("no ray-query device with 8 storage textures + 16 storage buffers — skipping restir_screen_space_entries_compile");
         return;
     };
     let src = common::voxel_raytrace_shader_src();

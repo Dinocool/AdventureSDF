@@ -866,8 +866,8 @@ struct CameraUniformData {
 /// **SSOT for the direct-lighting knobs** (the WGSL `LightingUniform`, group 1 binding 2). All values are
 /// runtime UNIFORMS (knobs-as-uniforms mandate) — the GUI/editor can drive any of them; nothing here is a
 /// shader const. 80 bytes (std140-safe: each `Vec3` is followed by a scalar to fill its 16-byte slot; the
-/// GI knobs form a packed 16-byte row; the final row is `emissive_strength, frame_index, debug_view,
-/// gi_firefly_clamp` — exactly 16 bytes, no trailing pad). Mirrored field-for-field by both the WGSL shader
+/// GI knobs form a packed 16-byte row; the final row is `emissive_strength, frame_index, debug_view, _pad`
+/// — exactly 16 bytes, no trailing pad). Mirrored field-for-field by both the WGSL shader
 /// and the headless lighting/GI tests, so the lighting layout has exactly one SSOT.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
@@ -902,10 +902,11 @@ pub struct LightingUniformData {
     /// 3 = albedo, 4 = AO, 5 = GI-only, 6 = face-orientation (green front / red BACK-face). Mirrors the
     /// WGSL `LightingUniform.debug_view`.
     pub debug_view: u32,
-    /// Max radiance of a single GI bounce sample before it's clamped down (hue-preserving). Caps fireflies /
-    /// bright-sample spikes that otherwise boil under temporal denoise. `0.0` disables the clamp (unbiased —
-    /// the headless GI tests rely on this). Fills the last std140 slot, so the struct is exactly 80 bytes.
-    pub gi_firefly_clamp: f32,
+    /// Was `gi_firefly_clamp` (a biased per-bounce-sample radiance cap), discarded in Phase 2.2 as best
+    /// practice — fireflies are now handled correctly by ReSTIR resampling + the world-cache temporal
+    /// averaging + DLSS-RR, with no biased clamp anywhere. Kept as a pad so the struct stays EXACTLY 80 bytes
+    /// (same offsets, no UBO re-layout).
+    pub _pad: f32,
 }
 
 impl Default for LightingUniformData {
@@ -931,7 +932,7 @@ impl Default for LightingUniformData {
             emissive_strength: 4.0,
             frame_index: 0,
             debug_view: 0,
-            gi_firefly_clamp: 0.0, // off by default (unbiased) — the headless GI tests assume no clamp
+            _pad: 0.0, // was gi_firefly_clamp (discarded in 2.2 — best practice; no biased clamp anywhere)
         }
     }
 }
@@ -959,9 +960,7 @@ impl LightingUniformData {
             emissive_strength: 6.0,
             frame_index: 0,
             debug_view: 0,
-            // The ceiling emitter (emissive ≈ 1 × strength 6) is the brightest legitimate bounce sample;
-            // clamp a little above it so grazing/multi-hit fireflies are tamed but the panel itself is intact.
-            gi_firefly_clamp: 8.0,
+            _pad: 0.0, // firefly clamping discarded in 2.2 (best practice) — ReSTIR + cache + DLSS-RR handle fireflies
         }
     }
 }
@@ -1030,7 +1029,7 @@ pub struct VoxelRtSky {
 
 /// **SSOT for the world-space radiance-cache knobs** (Phase 2.1; the WGSL `WorldCacheUniform`, group 3
 /// binding 0). All runtime UNIFORMS (knobs-as-uniforms mandate) — editor sliders land in 2.4; nothing here is
-/// a WGSL const. Mirrors Solari's `WORLD_CACHE_*` tunables. 32 bytes (std140/std430-safe: 7 scalars + 1 pad =
+/// a WGSL const. Mirrors Solari's `WORLD_CACHE_*` tunables. 32 bytes (std140/std430-safe: 8 scalars =
 /// two 16-byte rows). `frame_index` + `reset` are stamped by the render pass, not user knobs.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
@@ -1049,8 +1048,11 @@ pub struct WorldCacheUniformData {
     pub frame_index: u32,
     /// 1 = first-allocation clear (blend overwrites instead of accumulating). Stamped by the render pass.
     pub reset: u32,
-    /// Fills the last std140 slot, so the struct is exactly 32 bytes.
-    pub _pad: u32,
+    /// Phase 2.2 A/B gate (knobs-as-uniforms): `1` = the ReSTIR initial reservoir reads the cache
+    /// (`reservoir_from_bounce_cached`, the live default); `0` = the FRESH `reservoir_from_bounce` path (no
+    /// cache query → no cell marked alive → the cache stays idle, exactly like Phase 2.1). Fills the last
+    /// std140 slot, so the struct is exactly 32 bytes.
+    pub use_world_cache: u32,
 }
 
 impl Default for WorldCacheUniformData {
@@ -1064,7 +1066,7 @@ impl Default for WorldCacheUniformData {
             max_temporal_samples: 32.0,
             frame_index: 0,
             reset: 0,
-            _pad: 0,
+            use_world_cache: 1, // 2.2 default: the initial reservoir reads the cache (A/B gate, editor-toggled)
         }
     }
 }
@@ -1190,9 +1192,38 @@ fn init_voxel_rt(mut commands: Commands, render_device: Res<RenderDevice>) {
         label: Some("voxel_rt_reservoir_layout"),
         entries: &[storage_rw(0), storage_rw(1), uniform_buf(2), storage_rw(3), storage_rw(4)],
     });
+    // group(3) world-cache layout (Phase 2.1). Created BEFORE `restir_pl` because Phase 2.2 binds the cache
+    // into `restir_p1`/`restir_dlss_p1` so the initial reservoir can `query_world_cache` (lazy-insert → the
+    // live query is what POPULATES the cache). Binding 0 = the `wc` uniform, bindings 1..=10 = the 10
+    // persistent cache storage buffers. The indirect-dispatch buffer lives in its OWN group(2) (see below).
+    let world_cache_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("voxel_rt_world_cache_layout"),
+        entries: &[
+            uniform_buf(0),
+            storage_rw(1),
+            storage_rw(2),
+            storage_rw(3),
+            storage_rw(4),
+            storage_rw(5),
+            storage_rw(6),
+            storage_rw(7),
+            storage_rw(8),
+            storage_rw(9),
+            storage_rw(10),
+        ],
+    });
+    // The two-pass ReSTIR pipeline layout. group(3) = the world cache: `restir_p1` queries it (read_write — the
+    // query lazy-inserts), and `restir_p2` shares the layout (it never touches the cache; binding an unused
+    // group is legal). The cache `group(3)` bind group set by the world-cache passes (which run earlier in the
+    // same compute pass) stays bound through both restir passes, so no extra `set_bind_group(3, ...)` is needed.
     let restir_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: Some("voxel_rt_raymarch_restir_pl"),
-        bind_group_layouts: &[Some(&scene_layout), Some(&view_layout), Some(&reservoir_layout)],
+        bind_group_layouts: &[
+            Some(&scene_layout),
+            Some(&view_layout),
+            Some(&reservoir_layout),
+            Some(&world_cache_layout),
+        ],
         immediate_size: 0,
     });
     let restir_p1 = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
@@ -1212,26 +1243,8 @@ fn init_voxel_rt(mut commands: Commands, render_device: Res<RenderDevice>) {
         cache: None,
     });
 
-    // --- Phase 2.1 world-cache: the dedicated group(3) cache layout + the 6 compute pipelines ---
-    // group(3): binding 0 = the `wc` uniform, bindings 1..=10 = the 10 persistent cache storage buffers
-    // (checksums, life, radiance, geometry, luminance_deltas, new_radiance, a, b, active_cell_indices,
-    // active_cells_count). The indirect-dispatch buffer lives in its OWN group(2) (see below).
-    let world_cache_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-        label: Some("voxel_rt_world_cache_layout"),
-        entries: &[
-            uniform_buf(0),
-            storage_rw(1),
-            storage_rw(2),
-            storage_rw(3),
-            storage_rw(4),
-            storage_rw(5),
-            storage_rw(6),
-            storage_rw(7),
-            storage_rw(8),
-            storage_rw(9),
-            storage_rw(10),
-        ],
-    });
+    // --- Phase 2.1 world-cache: the 6 compute pipelines (the group(3) `world_cache_layout` is created above,
+    // shared with `restir_pl` so Phase 2.2's initial reservoir can query the cache). ---
     // A MINIMAL group(1) layout for the cache passes holding ONLY the two uniforms the UPDATE pass reads from
     // group 1 — `light` (binding 2) + `sky` (binding 11) — used by `direct_lighting` / `sky_radiance`. The
     // cache passes never write `out_tex` / sample `history`, so we omit those (a smaller, dedicated layout
@@ -1338,7 +1351,14 @@ fn init_voxel_rt(mut commands: Commands, render_device: Res<RenderDevice>) {
     // --- DLSS-RR (Stage 4c) pipelines + layouts ---
     #[cfg(feature = "dlss")]
     let (raymarch_dlss, restir_dlss_p1, restir_dlss_p2, dlss_view_layout, dlss_resolve_layout) =
-        init_dlss_pipelines(device, &scene_layout, &reservoir_layout, &raymarch_module, &composite_module);
+        init_dlss_pipelines(
+            device,
+            &scene_layout,
+            &reservoir_layout,
+            &world_cache_layout,
+            &raymarch_module,
+            &composite_module,
+        );
 
     commands.insert_resource(VoxelRtPipelines {
         scene_layout,
@@ -1383,6 +1403,7 @@ fn init_dlss_pipelines(
     device: &wgpu::Device,
     scene_layout: &wgpu::BindGroupLayout,
     reservoir_layout: &wgpu::BindGroupLayout,
+    world_cache_layout: &wgpu::BindGroupLayout,
     raymarch_module: &wgpu::ShaderModule,
     composite_module: &wgpu::ShaderModule,
 ) -> (
@@ -1440,10 +1461,17 @@ fn init_dlss_pipelines(
         compilation_options: Default::default(),
         cache: None,
     });
-    // The two-pass ReSTIR variant: same DLSS guide layout + the group(2) reservoir buffers, two entries.
+    // The two-pass ReSTIR variant: same DLSS guide layout + the group(2) reservoir buffers + group(3) world
+    // cache, two entries. group(3) lets `restir_dlss_p1`'s initial reservoir `query_world_cache` (lazy-insert
+    // → the live query populates the cache); `restir_dlss_p2` shares the layout but never touches the cache.
     let dlss_restir_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: Some("voxel_rt_raymarch_dlss_restir_pl"),
-        bind_group_layouts: &[Some(scene_layout), Some(&dlss_view_layout), Some(reservoir_layout)],
+        bind_group_layouts: &[
+            Some(scene_layout),
+            Some(&dlss_view_layout),
+            Some(reservoir_layout),
+            Some(world_cache_layout),
+        ],
         immediate_size: 0,
     });
     let restir_dlss_p1 = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
@@ -2129,6 +2157,10 @@ fn voxel_rt_pass(
             // reservoirs_a + shade → out_tex), back-to-back. The intra-pass storage barrier orders p1's writes
             // to reservoirs_b before p2 reads them (WebGPU guarantees inter-dispatch storage visibility).
             cpass.set_bind_group(2, &reservoir_bg, &[]);
+            // group(3) = the world cache (Phase 2.2): `restir_p1`'s initial reservoir queries it (lazy-insert →
+            // the query is what POPULATES the cache). Re-set explicitly even though the cache passes left it
+            // bound — rebinding group 2 above can invalidate inheritance of higher-indexed groups.
+            cpass.set_bind_group(3, &wc_prepared.cache_bg, &[]);
             cpass.set_pipeline(&pipelines.restir_p1);
             cpass.dispatch_workgroups(groups.0, groups.1, groups.2);
             cpass.set_pipeline(&pipelines.restir_p2);
@@ -2584,6 +2616,9 @@ fn voxel_rt_dlss_pass(
             // (same-frame spatial → reservoirs_a + shade → out_tex + DLSS guides), back-to-back. The intra-pass
             // storage barrier orders p1's reservoirs_b writes before p2 reads them.
             cpass.set_bind_group(2, &reservoir_bg, &[]);
+            // group(3) = the world cache (Phase 2.2): `restir_dlss_p1`'s initial reservoir queries it
+            // (lazy-insert → populates the cache). Re-set explicitly (rebinding group 2 can drop higher groups).
+            cpass.set_bind_group(3, &wc_prepared.cache_bg, &[]);
             cpass.set_pipeline(&pipelines.restir_dlss_p1);
             cpass.dispatch_workgroups(groups.0, groups.1, groups.2);
             cpass.set_pipeline(&pipelines.restir_dlss_p2);

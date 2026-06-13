@@ -489,7 +489,7 @@ struct CameraUniform {
 //   sun_color     (12) + shadow_bias    (4)   — bias = normal-offset epsilon for the shadow/AO ray origin
 //   ambient_color (12) + ao_radius      (4)   — ao_radius = AO ray length in world metres
 //   ao_samples    (4)  + gi_rays (4) + gi_intensity (4) + gi_bounce_dist (4)
-//   emissive_strength (4) + frame_index (4) + debug_view (4) + gi_firefly_clamp (4)
+//   emissive_strength (4) + frame_index (4) + debug_view (4) + _pad (4)
 struct LightingUniform {
     sun_direction: vec3<f32>,  // normalized direction the sunlight travels (points away from the sun)
     sun_intensity: f32,        // scalar multiplier on sun_color
@@ -504,7 +504,7 @@ struct LightingUniform {
     emissive_strength: f32,    // scalar multiplier on every block's palette emissive
     frame_index: u32,          // per-frame counter to decorrelate the bounce-direction hash
     debug_view: u32,           // 0 = lit; 1 = normals; 2 = depth; 3 = albedo; 4 = AO; 5 = GI-only; 6 = face-toward-camera
-    gi_firefly_clamp: f32,     // max per-bounce-sample GI radiance (0 = unclamped); tames emissive fireflies/boil
+    _pad: f32,                 // was gi_firefly_clamp (firefly clamping discarded in 2.2 — best-practice); keeps the struct exactly 80 B
 };
 @group(1) @binding(2) var<uniform> light: LightingUniform;
 
@@ -705,16 +705,9 @@ fn gather_gi(n: vec3<f32>, p: vec3<f32>, seed_base: u32) -> vec3<f32> {
         } else {
             contrib = bounce_sky(dir);
         }
-        // Firefly clamp: cap a single bounce sample's radiance so one very bright hit (e.g. a grazing ray
-        // catching the emissive panel) can't dominate the mean and pop/boil under temporal denoise. Scales
-        // the whole sample so hue is preserved. `gi_firefly_clamp == 0` disables it (unbiased; tests rely on
-        // this). A small bias for a large variance cut — standard path-tracer practice.
-        if (light.gi_firefly_clamp > 0.0) {
-            let m = max(contrib.r, max(contrib.g, contrib.b));
-            if (m > light.gi_firefly_clamp) {
-                contrib = contrib * (light.gi_firefly_clamp / m);
-            }
-        }
+        // No firefly clamp: a biased radiance cap is discarded in Phase 2.2 (best practice). Bright bounce
+        // samples are handled correctly by ReSTIR resampling + the world cache's temporal averaging + DLSS-RR,
+        // so `gather_gi` accumulates the unbiased radiance directly (matching Solari `sample_gi`).
         acc_rad = acc_rad + contrib;
     }
     // Cosine-pdf importance sampling ⇒ the irradiance estimate is the mean of the gathered radiance.
@@ -1012,15 +1005,62 @@ fn reservoir_from_bounce(world_position: vec3<f32>, world_normal: vec3<f32>, dir
         reservoir.confidence_weight = 1.0;
         reservoir.radiance = direct_lighting(r.color.rgb, r.normal, hp) + r.emissive * light.emissive_strength;
     }
-    // Firefly clamp (hue-preserving), same as `gather_gi`, applied to BOTH the hit and sky paths. ReSTIR STORES
-    // + reuses samples, so an unclamped bright outlier (a grazing emissive hit / a bright sun-disk sky sample)
-    // persists + propagates across the buffer — worse than in the plain mean. `gi_firefly_clamp == 0` disables
-    // it (the unbiased probe test sets 0). Small bias for stability.
-    if (light.gi_firefly_clamp > 0.0) {
-        let mx = max(reservoir.radiance.r, max(reservoir.radiance.g, reservoir.radiance.b));
-        if (mx > light.gi_firefly_clamp) {
-            reservoir.radiance = reservoir.radiance * (light.gi_firefly_clamp / mx);
-        }
+    // No firefly clamp (discarded in Phase 2.2, best practice): a biased radiance cap is gone. ReSTIR's
+    // resampling, the world-cache temporal averaging, and DLSS-RR handle bright outliers correctly, so the
+    // reservoir stores the unbiased radiance (matching Solari, whose initial sample is unclamped too).
+    reservoir.unbiased_contribution_weight = uniform_hemisphere_inverse_pdf();
+    return reservoir;
+}
+
+// Cache-fed INITIAL reservoir (Phase 2.2 go-live). Identical to `reservoir_from_bounce` EXCEPT the bounce-HIT
+// radiance ADDS one reflected indirect bounce read from the world-space radiance cache (`query_world_cache`):
+// the cache holds PRE-ACCUMULATED, multi-frame-averaged INCOMING indirect radiance (cosine-pre-divided), which
+// collapses the per-frame variance that a fresh re-trace of the indirect term would boil with. The LD bounce
+// DIRECTION still stratifies WHICH cell we sample; the cache supplies the reflected indirect leaving it.
+//
+//   * bounce HIT  → L_o(hp) = direct_lighting(hp) + emissive(hp) + albedo(hp)·query_world_cache(hp, …). The
+//                   first two terms are byte-identical to the fresh path; the third is the reflected indirect.
+//                   `query_world_cache` LAZY-INSERTS: an empty/just-claimed cell stores the hit geometry, marks
+//                   itself alive, and returns 0 (it fills over the next ~1-2 frames via the update/blend passes
+//                   — Solari's query-driven fill), so cache-off degrades cleanly to the fresh single bounce and
+//                   cache-on adds the reflected indirect on top. Going live is ALSO what populates the cache.
+//   * bounce MISS → `sky_radiance(dir) · gi_sky_intensity` (Phase 1A sky SSOT), UNCHANGED — the sky is not
+//                   cached (it has no surface to anchor a cell), so a distant sky sample is recorded directly.
+//
+// `rng` is a mutating PCG stream the query uses for its stochastic cell-LOD rounding + tangent-plane jitter.
+fn reservoir_from_bounce_cached(world_position: vec3<f32>, world_normal: vec3<f32>, dir: vec3<f32>, rng: ptr<function, u32>) -> Reservoir {
+    var reservoir = empty_reservoir();
+    let origin = world_position + world_normal * light.shadow_bias;
+    let r = trace(origin, dir, 0.0, light.gi_bounce_dist);
+    if (r.hit == 0u) {
+        // Distant sky sample (unchanged from the fresh path) — the sky has no cache cell.
+        reservoir.sample_point_world_position = origin + dir * light.gi_bounce_dist;
+        reservoir.sample_point_world_normal = -dir;
+        reservoir.confidence_weight = 1.0;
+        reservoir.radiance = sky_radiance(dir) * sky.gi_sky_intensity;
+    } else {
+        let hp = origin + dir * r.t;
+        reservoir.sample_point_world_position = hp;
+        reservoir.sample_point_world_normal = r.normal;
+        reservoir.confidence_weight = 1.0;
+        // True OUTGOING radiance of the bounce surface toward the shading point — the full single-bounce-
+        // plus-cache rendering equation L_o(hp):
+        //     L_o(hp) = emissive(hp) + direct_lighting(hp) + albedo(hp)·cache(hp)
+        // The first two terms are IDENTICAL to the fresh path (`reservoir_from_bounce`): direct_lighting
+        // already folds in albedo, and emissive is added raw. The THIRD term is the one reflected indirect
+        // bounce the cache supplies: our 2.1 world cache stores, per cell x, the cosine-weighted mean of the
+        // NEIGHBORS' (direct+emissive) outgoing radiance, i.e. cache(x) == the indirect incoming radiance to
+        // x already divided by π (the cosine gather bakes the 1/π in). So the reflected indirect is
+        // albedo·cache with NO further /π — UNLIKE Solari's restir_gi.wgsl:119-120, which multiplies by
+        // base_color/π because ITS cache stores raw irradiance E and it has a SEPARATE DI pass for the
+        // direct+emissive term (we fold direct+emissive inline here). Reading the cache RAW (the prior bug)
+        // dropped both albedo and the surface's own direct+emissive — wrong energy. Multiplying by albedo
+        // only (a prior reviewer's suggestion) dropped direct+emissive — also wrong. The cache lazy-inserts
+        // on an empty cell → returns 0 (fills over the next frames), so cache-off degrades to the fresh
+        // single-bounce direct+emissive and cache-on adds the reflected indirect on top.
+        reservoir.radiance = direct_lighting(r.color.rgb, r.normal, hp)
+            + r.emissive * light.emissive_strength
+            + r.color.rgb * query_world_cache(hp, r.normal, camera.cam_pos, r.t, wc.cell_lifetime, rng);
     }
     reservoir.unbiased_contribution_weight = uniform_hemisphere_inverse_pdf();
     return reservoir;
@@ -1301,9 +1341,26 @@ fn restir_p1_core(n: vec3<f32>, p: vec3<f32>, pix: vec2<u32>, temporal_base: vec
     // selection; the LD directions are deterministic given (pixel, frame).
     let m = min(light.gi_rays, 32u);
     let rot = vec2<f32>(rand01(seed * 2u + 1u), rand01(seed * 2u + 2u));
-    var res = reservoir_from_bounce(p, n, ld_uniform_hemisphere(n, 0u, m, rot));
+    // A/B gate (2.2): when `wc.use_world_cache` is on (default), the bounce-HIT radiance is read from the
+    // world-space radiance cache (pre-accumulated → low variance, multi-bounce in 2.3) instead of a fresh
+    // single trace. The query LAZY-INSERTS, so this live path is ALSO what populates the cache (Solari's
+    // query-driven fill). When off, the FRESH `reservoir_from_bounce` path runs — identical to pre-2.2
+    // behaviour (minus the now-removed firefly clamp), and no query marks any cell alive, so the cache stays
+    // idle (update/blend no-op) exactly like Phase 2.1. The LD direction stratifies the sampling either way.
+    let use_cache = wc.use_world_cache != 0u;
+    var res: Reservoir;
+    if (use_cache) {
+        res = reservoir_from_bounce_cached(p, n, ld_uniform_hemisphere(n, 0u, m, rot), &rng);
+    } else {
+        res = reservoir_from_bounce(p, n, ld_uniform_hemisphere(n, 0u, m, rot));
+    }
     for (var i = 1u; i < m; i = i + 1u) {
-        let cand = reservoir_from_bounce(p, n, ld_uniform_hemisphere(n, i, m, rot));
+        var cand: Reservoir;
+        if (use_cache) {
+            cand = reservoir_from_bounce_cached(p, n, ld_uniform_hemisphere(n, i, m, rot), &rng);
+        } else {
+            cand = reservoir_from_bounce(p, n, ld_uniform_hemisphere(n, i, m, rot));
+        }
         let merged = merge_reservoirs(res, p, n, brdf, cand, p, n, brdf, &rng);
         res = merged.merged_reservoir;
     }
@@ -1653,7 +1710,7 @@ struct WorldCacheUniform {
     max_temporal_samples: f32, // temporal-blend sample-count cap (Solari 32.0)
     frame_index: u32,       // per-frame counter (decorrelates the update RNG)
     reset: u32,             // 1 = first-allocation clear: blend overwrites instead of accumulating
-    _pad: u32,
+    use_world_cache: u32,   // 2.2 A/B gate: 1 = the initial reservoir reads the cache (default), 0 = fresh bounce
 };
 
 @group(3) @binding(0) var<uniform> wc: WorldCacheUniform;
@@ -2001,4 +2058,79 @@ fn world_cache_query_seed(@builtin(global_invocation_id) gid: vec3<u32>) {
     o._p0 = 0u;
     o._p1 = 0u;
     wc_query_out[i] = o;
+}
+
+// --- headless TEST entry: drive the ACTUAL initial-reservoir builders through the resolve --------------
+// The convergence test (above) proves the cache FILLS to the analytic incoming radiance, and the restir_probe
+// test proves the resolve constant. NEITHER exercises `reservoir_from_bounce_cached` (the live cache-fed
+// initial reservoir) end-to-end — the only other coverage was a compile gate. This entry runs BOTH builders
+// for one shading point whose fixed bounce direction hits the (already-cache-filled) floor, then resolves each
+// to indirect irradiance, and reports the raw reservoir radiances + the deterministic cache value so the
+// harness can PIN the energy relation that the 2.2 bug violated:
+//     cache_on.radiance  ==  cache_off.radiance + albedo(hp) · cache(hp)
+// i.e. the cache adds exactly ONE reflected indirect bounce (albedo·cache), on top of the fresh path's
+// direct+emissive — NOT the raw cache (the bug) and NOT replacing direct+emissive (the prior reviewer's
+// mistake). Both builders trace the SAME `dir`, so they share `hp`, `r.color`, `r.emissive`; the ONLY
+// difference is the `+ albedo·cache` term, which is exactly what we assert. The `camera` uniform supplies the
+// cache-LOD view position (group 1 binding 0).
+struct EnergyProbeParams {
+    shading_position: vec3<f32>, _p0: u32,
+    shading_normal: vec3<f32>,   _p1: u32,
+    bounce_dir: vec3<f32>,       _p2: u32,
+};
+struct EnergyProbeOut {
+    cache_off_radiance: vec3<f32>, _p0: u32,   // reservoir_from_bounce(...).radiance  (fresh: direct+emissive)
+    cache_on_radiance: vec3<f32>,  _p1: u32,   // reservoir_from_bounce_cached(...).radiance (adds albedo·cache)
+    cache_off_irradiance: vec3<f32>, _p2: u32, // resolved indirect irradiance (cache OFF)
+    cache_on_irradiance: vec3<f32>,  _p3: u32, // resolved indirect irradiance (cache ON)
+    hit_albedo: vec3<f32>,         _p4: u32,   // albedo of the bounce-hit surface (the floor)
+    cache_value: vec3<f32>,        _p5: u32,   // deterministic (no-jitter, LOD0) cache read at the hit cell
+    hit: u32, _p6: u32, _p7: u32, _p8: u32,    // 1 = the bounce hit a surface (the relation is meaningful)
+};
+
+@group(0) @binding(8) var<uniform> energy_params: EnergyProbeParams;
+@group(0) @binding(9) var<storage, read_write> energy_out: EnergyProbeOut;
+
+// Deterministic (no-jitter, LOD0) cache read — mirrors `world_cache_query_seed`'s stable read-back so the
+// harness sees the exact incoming radiance the floor cell holds, decoupled from `query_world_cache`'s jitter.
+fn energy_read_cache_deterministic(world_position: vec3<f32>, world_normal: vec3<f32>) -> vec3<f32> {
+    let cell_size = wc.cell_base_size; // LOD 0 (test view is close), no jitter — stable read-back slot
+    let qpos = bitcast<vec3<u32>>(wc_quantize_position(world_position, cell_size));
+    let qnrm = bitcast<vec3<u32>>(wc_quantize_normal(world_normal));
+    var key = wc_compute_key(qpos, qnrm);
+    let checksum = wc_compute_checksum(qpos, qnrm);
+    for (var s = 0u; s < WORLD_CACHE_MAX_SEARCH_STEPS; s = s + 1u) {
+        let existing = atomicLoad(&world_cache_checksums[key]);
+        if (existing == checksum) { return world_cache_radiance[key].rgb; }
+        if (existing == WORLD_CACHE_EMPTY_CELL) { return vec3<f32>(0.0); }
+        key = key + 1u;
+        if (key >= WORLD_CACHE_SIZE) { key = 0u; }
+    }
+    return vec3<f32>(0.0);
+}
+
+@compute @workgroup_size(1, 1, 1)
+fn world_cache_energy_probe(@builtin(global_invocation_id) gid: vec3<u32>) {
+    if (gid.x != 0u) { return; }
+    let p = energy_params.shading_position;
+    let n = normalize(energy_params.shading_normal);
+    let dir = normalize(energy_params.bounce_dir);
+    var rng = (wc.frame_index * 26699u) | 1u;
+
+    // The two REAL builders, same shading point + bounce direction (so they differ only by the cache term).
+    let off = reservoir_from_bounce(p, n, dir);
+    let on = reservoir_from_bounce_cached(p, n, dir, &rng);
+
+    // Re-trace to recover the bounce-hit geometry the relation references (albedo + the cache cell).
+    let origin = p + n * light.shadow_bias;
+    let r = trace(origin, dir, 0.0, light.gi_bounce_dist);
+    let hp = origin + dir * r.t;
+
+    energy_out.cache_off_radiance = off.radiance;
+    energy_out.cache_on_radiance = on.radiance;
+    energy_out.cache_off_irradiance = restir_resolve_irradiance(off, p, n);
+    energy_out.cache_on_irradiance = restir_resolve_irradiance(on, p, n);
+    energy_out.hit_albedo = r.color.rgb;
+    energy_out.cache_value = energy_read_cache_deterministic(hp, r.normal);
+    energy_out.hit = r.hit;
 }

@@ -83,12 +83,6 @@ pub fn render_gi_panel(world: &mut World, ui: &mut egui::Ui) {
         ui.add(egui::Slider::new(&mut d.gi_intensity, 0.0..=4.0).text("GI intensity"));
         ui.add(egui::Slider::new(&mut d.gi_bounce_dist, 1.0..=64.0).text("bounce dist (m)"));
         ui.add(egui::Slider::new(&mut d.emissive_strength, 0.0..=16.0).text("emissive strength"));
-        ui.add(egui::Slider::new(&mut d.gi_firefly_clamp, 0.0..=32.0).text("firefly clamp (0 = off)"));
-        ui.label(
-            egui::RichText::new("firefly clamp caps bright bounce samples — lower it to kill GI sparkle/boil")
-                .weak()
-                .size(11.0),
-        );
 
         ui.separator();
         if ui.button("Reset to Cornell defaults").clicked() {
@@ -143,6 +137,26 @@ pub fn render_gi_panel(world: &mut World, ui: &mut egui::Ui) {
                 egui::RichText::new(
                     "search taps = disk samples tried to find ONE valid neighbour/frame (not accumulated); \
                      history cap trades lag vs stability",
+                )
+                .weak()
+                .size(11.0),
+            );
+        }
+
+        // Phase 2.2 A/B gate: the world-space radiance cache feeds the ReSTIR initial reservoir (default on).
+        // Off = the FRESH single-bounce path (no cache query → the cache stays idle, like Phase 2.1).
+        if let Some(mut wc) = world.get_resource_mut::<crate::voxel::raytrace::WorldCacheSettings>() {
+            let mut on = wc.data.use_world_cache != 0;
+            if ui
+                .checkbox(&mut on, "World-cache GI (off = fresh single-bounce reservoir)")
+                .changed()
+            {
+                wc.data.use_world_cache = u32::from(on);
+            }
+            ui.label(
+                egui::RichText::new(
+                    "on = the initial reservoir reads the pre-accumulated world cache (lower boil, multi-bounce \
+                     in 2.3); off = a fresh bounce trace each frame (A/B comparison)",
                 )
                 .weak()
                 .size(11.0),
