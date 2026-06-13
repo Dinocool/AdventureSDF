@@ -103,7 +103,18 @@ pub struct VoxelRtStreaming {
     /// (the user placed/removed a voxel) the static Cornell box is re-baked with the new overlay and re-packed
     /// — making the edit visible next frame. `None` until the first Cornell pack.
     packed_edit_gen: Option<u64>,
+    /// Worldgen re-pack AMORTIZATION (perf): whether the resident set has changed since the last pack, and how
+    /// many frames since the last pack. `pack_resident_set` + the BLAS rebuild are O(resident); running them on
+    /// EVERY dirty drain while streaming a region was a dominant cost. We instead pack on a settle
+    /// (`pending() == 0`) OR every [`WORLDGEN_REPACK_INTERVAL`] frames during a long stream — so terrain still
+    /// reveals progressively (keep-old-until-revealed) but the per-frame pack frequency is bounded.
+    worldgen_dirty_pending: bool,
+    worldgen_frames_since_pack: u32,
 }
+
+/// Max frames a worldgen stream batch drains before forcing a re-pack (so a big cold fill reveals in chunks
+/// rather than one final pop, while still bounding the O(resident) pack to ~once per this many frames).
+const WORLDGEN_REPACK_INTERVAL: u32 = 6;
 
 /// Stage-2 plugin: builds the patch in the main world, registers extraction, and wires the render-world
 /// resources + the [`Core3d`] raymarch pass. Added in `main.rs` alongside [`super::VoxelPlugin`].
@@ -232,6 +243,8 @@ fn init_voxel_rt_streaming(
         cornell_registry: BlockRegistry::cornell(),
         packed_scene: None,
         packed_edit_gen: None,
+        worldgen_dirty_pending: false,
+        worldgen_frames_since_pack: 0,
     });
 }
 
@@ -325,18 +338,40 @@ fn stream_voxel_rt_residency(
     }
 
     // Bounded voxelization of queued bricks.
-    let VoxelRtStreaming { manager, cfg, layer, lib, registry, seed, .. } = &mut *streaming;
+    let VoxelRtStreaming {
+        manager,
+        cfg,
+        layer,
+        lib,
+        registry,
+        seed,
+        worldgen_dirty_pending,
+        worldgen_frames_since_pack,
+        ..
+    } = &mut *streaming;
     manager.drain_work(cfg, layer, lib, registry, *seed);
 
-    // Re-pack only if the resident set changed (keep-old-until-revealed otherwise).
+    // AMORTIZE the O(resident) re-pack (pack_resident_set ~60 ms + the full BLAS rebuild): accumulate "resident
+    // set changed" and pack only on a SETTLE (queue drained) OR every WORLDGEN_REPACK_INTERVAL frames during a
+    // long stream — NOT on every dirty drain (which made each streaming frame pay the full O(resident) pack +
+    // rebuild). Terrain still reveals progressively (keep-old-until-revealed); the per-frame cost while
+    // streaming drops to just the bounded voxelize drain. `take_dirty` is consumed every frame so the dirty
+    // flag is never lost; we OR it into the accumulator.
     if manager.take_dirty() {
+        *worldgen_dirty_pending = true;
+    }
+    *worldgen_frames_since_pack = worldgen_frames_since_pack.saturating_add(1);
+    let settled = manager.pending() == 0;
+    if *worldgen_dirty_pending && (settled || *worldgen_frames_since_pack >= WORLDGEN_REPACK_INTERVAL) {
         let entries = manager.resident_entries();
         let patch = pack_resident_set(&entries, registry);
         let (n, v) = (patch.brick_count(), patch.voxels.len());
         patch_res.patch = patch;
         patch_res.generation = patch_res.generation.wrapping_add(1);
+        *worldgen_dirty_pending = false;
+        *worldgen_frames_since_pack = 0;
         debug!(
-            "voxel-RT: re-packed resident set gen {} — {n} bricks, {v} cells, {} pending",
+            "voxel-RT: re-packed resident set gen {} — {n} bricks, {v} cells, {} pending (settled={settled})",
             patch_res.generation,
             manager.pending()
         );

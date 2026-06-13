@@ -58,6 +58,13 @@ mod common;
 /// The SHIPPING streaming seed (matches `init_voxel_rt_streaming`'s `WORLDGEN_SLICE_SEED`).
 const SEED: u64 = WORLDGEN_SLICE_SEED;
 
+/// Mirror of the live `WORLDGEN_REPACK_INTERVAL` (raytrace.rs): the streaming system AMORTIZES the O(resident)
+/// re-pack — it packs on a SETTLE (`pending() == 0`) OR every this-many drained frames, NOT on every dirty
+/// drain. The fill / steady-state benches model the same cadence so their per-frame + total numbers reflect
+/// what the running engine actually pays (a streaming frame pays the bounded voxelize drain; the pack is paid
+/// only ~once per this interval + at settle).
+const REPACK_INTERVAL: u32 = 6;
+
 /// The shipping worldgen graph the live scene streams: deserialize `assets/worldgen/world.graph.ron` (the
 /// asset `load_active_graph` loads at runtime). Falls back to `WorldGraph::default()` (the
 /// `mountains_plains` preset the engine boots with until that asset lands) if the file is missing/invalid —
@@ -216,6 +223,8 @@ fn bench_initial_fill_cold() {
     let mut last_voxel_cells = 0usize;
     let fill_t0 = Instant::now();
     let mut frames = 0u32;
+    let mut dirty = false;
+    let mut since_pack = 0u32;
     while mgr.pending() > 0 {
         let td = Instant::now();
         let n = mgr.drain_work(&cfg, &layer, &lib, &registry, SEED);
@@ -223,6 +232,11 @@ fn bench_initial_fill_cold() {
         total_voxelized += n;
 
         if mgr.take_dirty() {
+            dirty = true;
+        }
+        since_pack += 1;
+        // AMORTIZED re-pack (mirrors the live system): pack on settle OR every REPACK_INTERVAL frames.
+        if dirty && (mgr.pending() == 0 || since_pack >= REPACK_INTERVAL) {
             let entries = mgr.resident_entries();
             let tp = Instant::now();
             let patch = pack_resident_set(&entries, &registry);
@@ -230,6 +244,8 @@ fn bench_initial_fill_cold() {
             packs += 1;
             last_brick_count = patch.brick_count();
             last_voxel_cells = patch.voxels.len();
+            dirty = false;
+            since_pack = 0;
         }
         frames += 1;
         assert!(frames < 5000, "fill must terminate");
@@ -329,20 +345,30 @@ fn bench_steady_state_moving() {
         // A step at radius 28 reveals a whole region face-slab; drain until caught up (each drain = one frame),
         // so the per-DRAIN time is the per-frame hitch. Record each drain + each re-pack.
         let mut step_drains = 0u32;
+        let mut dirty = false;
+        let mut since_pack = 0u32;
         loop {
             let td = Instant::now();
             let n = mgr.drain_work(&cfg, &layer, &lib, &registry, SEED);
             drain_times.push(td.elapsed());
             step_drains += 1;
             if mgr.take_dirty() {
+                dirty = true;
+            }
+            since_pack += 1;
+            let last = n == 0 || mgr.pending() == 0;
+            // AMORTIZED re-pack (mirrors the live system): pack on settle OR every REPACK_INTERVAL frames.
+            if dirty && (last || since_pack >= REPACK_INTERVAL) {
                 let entries = mgr.resident_entries();
                 let tp = Instant::now();
                 let patch = pack_resident_set(&entries, &registry);
                 pack_times.push(tp.elapsed());
                 packs += 1;
                 max_resident = max_resident.max(patch.brick_count());
+                dirty = false;
+                since_pack = 0;
             }
-            if n == 0 || mgr.pending() == 0 {
+            if last {
                 break;
             }
         }
