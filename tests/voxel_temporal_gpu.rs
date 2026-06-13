@@ -5,7 +5,8 @@
 //! that runs an exponential/cumulative mean across frames (reset on camera move), so with a STILL camera the
 //! image converges to a clean average and the frame-to-frame noise collapses.
 //!
-//! This rig boots the real [`VoxelRtPlugin`] on the default Cornell scene with a STILL camera, pumps frames
+//! This rig boots the real [`VoxelRtPlugin`] on the (explicitly-selected) Cornell scene with a STILL camera,
+//! pumps frames
 //! through the actual render path, and captures a time series of read-back frames. It then measures the
 //! per-pixel TEMPORAL standard deviation over an EARLY window (just after accumulation starts — still noisy)
 //! vs a LATE window (after many accumulated frames — converged). With accumulation working, the late window's
@@ -101,7 +102,9 @@ fn temporal_accumulation_reduces_gi_noise() {
             }),
     );
     app.add_plugins(VoxelRtPlugin);
-    assert_eq!(*app.world().resource::<VoxelScene>(), VoxelScene::Cornell);
+    // This rig renders the static CORNELL box. The engine now boots into the large streamed Worldgen scene by
+    // default (Phase 2.6); select Cornell explicitly (it is the `V`-toggle correctness anchor).
+    app.insert_resource(VoxelScene::Cornell);
 
     app.insert_resource(latest.clone());
     app.insert_resource(ClearColor(Color::srgb(0.0, 0.0, 0.0)));

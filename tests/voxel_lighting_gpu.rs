@@ -69,6 +69,7 @@ fn test_library() -> BiomeLibrary {
         blend: 0.0,
         texture: None,
         tiling: 4.0,
+        ..Default::default()
     };
     let materials = vec![mat("floor", [0.4, 0.4, 0.4, 1.0]), mat("wall", [0.6, 0.3, 0.2, 1.0])];
     let column = |_| BiomeDef {

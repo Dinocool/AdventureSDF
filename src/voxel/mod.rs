@@ -57,17 +57,19 @@ pub const PATCH_DEPTH_BELOW: f32 = 4.0;
 /// voxels are captured (and any overhang would be, though Stage-1 terrain is a heightfield).
 pub const PATCH_HEIGHT_ABOVE: f32 = 1.0;
 
-/// Which voxel scene the engine renders. The DEFAULT is [`VoxelScene::Cornell`] — a static, fully-resident
-/// Cornell box (a few bricks, NO streaming) that sidesteps the worldgen streaming glitch and is the
-/// canonical scene to validate lighting + GI (colour bleed, an emissive area light, soft shadows).
-/// [`VoxelScene::Worldgen`] selects the original infinite streaming terrain. The single SSOT knob the
-/// streaming + camera-framing systems read to decide which path runs; press **`V`** to switch at runtime.
+/// Which voxel scene the engine renders. The DEFAULT is now [`VoxelScene::Worldgen`] — the LARGE,
+/// streamed, GI-rich procedural terrain (Phase 2.6: the primary GI showcase + scale stress-test the user
+/// asked for: sky GI on slopes, multi-bounce fill in deep valleys, emissive lava/crystal colour bleed, and
+/// the world-cache running at scale). [`VoxelScene::Cornell`] — a static, fully-resident Cornell box (a few
+/// bricks, NO streaming) — stays reachable via the **`V`** toggle as the canonical GI correctness ANCHOR
+/// (colour bleed, an emissive area light, soft shadows). The single SSOT knob the streaming + camera-framing
+/// systems read to decide which path runs; press **`V`** to switch at runtime.
 #[derive(Resource, Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum VoxelScene {
-    /// Static Cornell box — fully resident, no streaming. The default.
-    #[default]
+    /// Static Cornell box — fully resident, no streaming. The GI correctness anchor (V to reach it).
     Cornell,
-    /// Infinite streaming worldgen terrain (the original Stage-3 path).
+    /// Infinite streaming worldgen terrain (the original Stage-3 path). The default boot scene.
+    #[default]
     Worldgen,
 }
 
@@ -357,6 +359,7 @@ mod tests {
             blend: 0.0,
             texture: None,
             tiling: 4.0,
+            ..Default::default()
         }];
         let biomes = BiomeId::ALL
             .iter()

@@ -37,6 +37,15 @@ BiomeLibraryAsset(
         TerrainSurfaceMaterial(name: "rock",        base_color: (0.13, 0.13, 0.14, 1.0), roughness: 0.85, texture: Some("cave_wall/1"), tiling: 5.0),
         // 11 flower      — wildflower noise patch
         TerrainSurfaceMaterial(name: "flower",      base_color: (0.30, 0.05, 0.22, 1.0), roughness: 0.95, blend: 6.0, texture: Some("fire_grass/1"), tiling: 3.0),
+        // 12 lava        — EMISSIVE molten rock (warm orange, strong glow). A first-class emitter: its
+        //                  `emissive_color * emissive_intensity` becomes the block's GI radiance, so lava
+        //                  voxels light the valley floors + cast a warm colour bleed up the surrounding walls.
+        //                  Placed as a deep-valley-floor surface rule in the hot/low biomes (Plains, Desert).
+        TerrainSurfaceMaterial(name: "lava",        base_color: (0.55, 0.10, 0.02, 1.0), roughness: 0.6,  blend: 5.0, emissive_color: (1.0, 0.42, 0.10), emissive_intensity: 7.0),
+        // 13 crystal     — EMISSIVE glowing crystal (cyan/blue, moderate glow). A cooler GI emitter scattered
+        //                  as noise PATCHES through the cold biomes (Tundra, Snowy) — soft blue fill light +
+        //                  cool colour bleed, complementing the warm lava. Moderate intensity (not a sun).
+        TerrainSurfaceMaterial(name: "crystal",     base_color: (0.10, 0.30, 0.42, 1.0), roughness: 0.35, blend: 4.0, emissive_color: (0.20, 0.70, 1.0),  emissive_intensity: 3.0),
     ],
     biomes: [
         // 0 Plains: grass -> dirt -> stone -> bedrock. Surface: grass, a wildflower noise-patch sub-area, a
@@ -45,6 +54,10 @@ BiomeLibraryAsset(
             name: "Plains",
             surface: TerrainMatId(0),
             surface_rules: [
+                // EMISSIVE lava in the deep valley floors: present BELOW Y≈-30 (full glow below Y≈-130).
+                // `full < start` inverts AboveY → "present below an altitude", so the deepest plains gullies
+                // (the erosion-carved shadowed floors) pool with lava that lights them + bleeds up the walls.
+                SurfaceLayer(material: TerrainMatId(12), when: [AboveY(start: -30.0, full: -130.0)]),
                 // Flower = noise patch AND flat ground (the Slope reads as "present as n_y → 1"), so flowers
                 // stay in the lowland flats and never paint steep Plains-climate mountainsides.
                 SurfaceLayer(material: TerrainMatId(11), when: [Patch(wavelength: 500.0, threshold: 0.62, softness: 0.06, seed: 7), Slope(gentle: 0.55, steep: 0.9)]),
@@ -80,6 +93,8 @@ BiomeLibraryAsset(
             name: "Desert",
             surface: TerrainMatId(5),
             surface_rules: [
+                // EMISSIVE lava in the deep desert valley floors (hot biome) — present below Y≈-20.
+                SurfaceLayer(material: TerrainMatId(12), when: [AboveY(start: -20.0, full: -120.0)]),
                 SurfaceLayer(material: TerrainMatId(9),  when: [AboveY(start: 1100.0, full: 1500.0)]),
                 SurfaceLayer(material: TerrainMatId(10), when: [AboveY(start: 1700.0, full: 2100.0)]),
                 SurfaceLayer(material: TerrainMatId(10), when: [Slope(gentle: 0.97, steep: 0.7)]),
@@ -96,6 +111,9 @@ BiomeLibraryAsset(
             name: "Tundra",
             surface: TerrainMatId(7),
             surface_rules: [
+                // EMISSIVE crystal noise PATCHES (cold biome) — soft cyan fields scattered across the tundra
+                // on flat-ish ground, a cool GI fill light complementing the warm valley lava elsewhere.
+                SurfaceLayer(material: TerrainMatId(13), when: [Patch(wavelength: 360.0, threshold: 0.66, softness: 0.07, seed: 21), Slope(gentle: 0.4, steep: 0.92)]),
                 SurfaceLayer(material: TerrainMatId(9),  when: [AboveY(start: 700.0, full: 1100.0)]),
                 SurfaceLayer(material: TerrainMatId(10), when: [AboveY(start: 1400.0, full: 1800.0)]),
                 SurfaceLayer(material: TerrainMatId(10), when: [Slope(gentle: 0.97, steep: 0.7)]),
@@ -113,6 +131,8 @@ BiomeLibraryAsset(
             name: "Snowy",
             surface: TerrainMatId(9),
             surface_rules: [
+                // EMISSIVE crystal noise PATCHES on the snowy slopes/flats (cold biome) — cyan glow on snow.
+                SurfaceLayer(material: TerrainMatId(13), when: [Patch(wavelength: 320.0, threshold: 0.64, softness: 0.07, seed: 22), Slope(gentle: 0.4, steep: 0.92)]),
                 SurfaceLayer(material: TerrainMatId(10), when: [AboveY(start: 1300.0, full: 1700.0)]),
                 SurfaceLayer(material: TerrainMatId(10), when: [Slope(gentle: 0.97, steep: 0.7)]),
             ],

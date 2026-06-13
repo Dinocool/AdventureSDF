@@ -371,6 +371,18 @@ pub struct TerrainSurfaceMaterial {
     /// more repeats. `#[serde(default)]` ⇒ a sensible mid value when omitted.
     #[serde(default = "default_material_tiling")]
     pub tiling: f32,
+    /// Linear-RGB emissive COLOUR (the hue this material glows). Multiplied by [`emissive_intensity`] to
+    /// give the radiance fed to the GI as a light source ([`emissive_radiance`]). `[0,0,0]` (the default) =
+    /// non-emitter — so every existing RON entry stays a pure surface. `#[serde(default)]` ⇒ older RON
+    /// without the field still loads (a RENDER attribute, no `HEIGHT_GEN_VERSION` tie; never affects the
+    /// authoritative height surface or the worldgen parity vectors).
+    #[serde(default)]
+    pub emissive_color: [f32; 3],
+    /// Scalar multiplier on [`emissive_color`] — how brightly this material emits (lava strong, crystal
+    /// moderate). `0` (the default) = no glow. `#[serde(default)]` so omitting it (every current biome)
+    /// yields a non-emissive material identical to the old struct.
+    #[serde(default)]
+    pub emissive_intensity: f32,
 }
 
 /// Default [`TerrainSurfaceMaterial::blend`] (metres) when the RON omits it — a gentle few-metre fade so an
@@ -384,6 +396,25 @@ fn default_material_tiling() -> f32 {
     6.0
 }
 
+impl Default for TerrainSurfaceMaterial {
+    /// A neutral mid-grey, fully-diffuse, NON-emissive flat material with the RON serde defaults — so a Rust
+    /// literal can spell out only the fields it cares about (`TerrainSurfaceMaterial { name, base_color, ..
+    /// Default::default() }`) and the emissive (and other defaulted) fields fall to their inert values. Keeps
+    /// the many test/helper literals robust against future struct growth (one place to extend).
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            base_color: [0.5, 0.5, 0.5, 1.0],
+            roughness: 0.9, // mostly-diffuse fallback
+            blend: default_material_blend(),
+            texture: None,
+            tiling: default_material_tiling(),
+            emissive_color: [0.0, 0.0, 0.0],
+            emissive_intensity: 0.0,
+        }
+    }
+}
+
 impl TerrainSurfaceMaterial {
     /// The **single source of truth** for "what flat colour represents this material" — used by every
     /// preview (biome map, strata slice) AND any flat-colour fallback so they always agree. For a
@@ -393,6 +424,19 @@ impl TerrainSurfaceMaterial {
     #[inline]
     pub fn preview_color(&self) -> [f32; 4] {
         self.base_color
+    }
+
+    /// The SSOT for "what linear-RGB radiance does this material EMIT into the GI" — `emissive_color *
+    /// emissive_intensity`. `[0,0,0]` for any non-emitter (the default), so the registry leaves those blocks
+    /// dark. The voxel [`BlockRegistry`](crate::voxel::palette::BlockRegistry) seeds each block's emissive
+    /// from this, so an emissive terrain voxel becomes a GI light source (the bounce returns this radiance).
+    #[inline]
+    pub fn emissive_radiance(&self) -> [f32; 3] {
+        [
+            self.emissive_color[0] * self.emissive_intensity,
+            self.emissive_color[1] * self.emissive_intensity,
+            self.emissive_color[2] * self.emissive_intensity,
+        ]
     }
 }
 

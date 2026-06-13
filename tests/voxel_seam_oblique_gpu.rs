@@ -70,6 +70,7 @@ fn wall_library() -> BiomeLibrary {
         blend: 0.0,
         texture: None,
         tiling: 4.0,
+        ..Default::default()
     };
     let materials = vec![mat("air_unused", [0.0, 0.0, 0.0, 1.0]), mat("wall", [0.8, 0.2, 0.05, 1.0])];
     let column = |_| BiomeDef {

@@ -102,10 +102,13 @@ pub struct BlockRegistry {
 
 impl BlockRegistry {
     /// Build the registry from a worldgen [`BiomeLibrary`]: block `0` = AIR, then one block per palette
-    /// material (id `i+1`), copying its `preview_color` (linear RGBA), roughness, and metal=0 (terrain
-    /// materials are dielectric this stage). Records the `TerrainMatId(i) → BlockId(i+1)` mapping — the
-    /// SSOT the voxelizer uses. Robust to an EMPTY library (no materials yet → only the AIR block); the
-    /// voxelizer then maps every material to AIR, producing an all-air (empty) world rather than panicking.
+    /// material (id `i+1`), copying its `preview_color` (linear RGBA), roughness, metal=0 (terrain materials
+    /// are dielectric this stage), and its `emissive_radiance` (`emissive_color * emissive_intensity`, the
+    /// material SSOT) — so an emissive terrain material (lava, glowing crystal) makes its voxels GI light
+    /// sources, exactly as the Cornell light panel does via [`set_emissive`]. Records the `TerrainMatId(i) →
+    /// BlockId(i+1)` mapping — the SSOT the voxelizer uses. Robust to an EMPTY library (no materials yet →
+    /// only the AIR block); the voxelizer then maps every material to AIR, producing an all-air (empty) world
+    /// rather than panicking.
     pub fn from_biome_library(lib: &BiomeLibrary) -> Self {
         let mut blocks = Vec::with_capacity(lib.materials.len() + 1);
         let mut mat_to_block = FxHashMap::default();
@@ -117,7 +120,9 @@ impl BlockRegistry {
                 color: m.preview_color(),
                 roughness: m.roughness,
                 metal: 0.0,
-                emissive: [0.0, 0.0, 0.0],
+                // The material's emissive radiance (0 for the common non-emitter) — a non-zero value makes
+                // every voxel of this block an emitter the GI bounce gathers. Same SSOT the preview/shader use.
+                emissive: m.emissive_radiance(),
                 tintable: true,
             });
             mat_to_block.insert(TerrainMatId(i as u16), id);
@@ -226,6 +231,7 @@ mod tests {
             blend: 0.0,
             texture: None,
             tiling: 4.0,
+            ..Default::default()
         };
         let materials = vec![
             mat("grass", [0.05, 0.22, 0.04, 1.0]),

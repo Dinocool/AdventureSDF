@@ -3,7 +3,8 @@
 //! `voxel_gi_gpu.rs` proves the GI math (colour bleed / emissive / shadow-fill) on single rays in
 //! isolation, and `voxel_render_headless.rs` proves the streaming-worldgen composite reaches the screen.
 //! This rig closes the gap for the CORNELL scene specifically: it boots a headless Bevy `App` with the real
-//! [`VoxelRtPlugin`], selects [`VoxelScene::Cornell`] (the engine default, asserted), frames a camera on the
+//! [`VoxelRtPlugin`], selects [`VoxelScene::Cornell`] explicitly (the engine now boots into the large
+//! streamed Worldgen scene; Cornell is the `V`-toggle correctness anchor), frames a camera on the
 //! OPEN front of the static box, renders to an offscreen image, reads it back, and asserts the box looks
 //! right AND that single-bounce GI colour-bleed is visible:
 //!
@@ -105,12 +106,10 @@ fn headless_cornell_colours_and_bleed() {
     );
     app.add_plugins(VoxelRtPlugin);
 
-    // Cornell is the DEFAULT scene — assert that, then keep it for the render.
-    assert_eq!(
-        *app.world().resource::<VoxelScene>(),
-        VoxelScene::Cornell,
-        "VoxelScene must default to Cornell (the static default scene)"
-    );
+    // This rig validates the static CORNELL scene. The engine now boots into the large streamed Worldgen
+    // scene by default (Phase 2.6 — the primary GI showcase); Cornell stays reachable via the `V` toggle and
+    // is the correctness anchor. Select it explicitly here (it is no longer the boot default).
+    app.insert_resource(VoxelScene::Cornell);
     assert!(app.world().resource::<VoxelRtToggle>().enabled, "HW-RT must default ON");
 
     app.insert_resource(latest.clone());

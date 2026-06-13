@@ -43,7 +43,9 @@ use crate::sdf_render::worldgen::layers::height::HeightLayer;
 #[derive(Clone, Copy, Debug, bevy::prelude::Resource)]
 pub struct StreamingConfig {
     /// Residency radius in bricks (Chebyshev): bricks within this many bricks of the camera brick on every
-    /// axis are resident. A radius of `r` gives a `(2r+1)³` cube. Default 20 bricks ≈ 32 m.
+    /// axis are resident. A radius of `r` gives a `(2r+1)³` cube. Default 28 bricks ≈ 45 m (Phase 2.6 raised
+    /// it from 20 for a longer view distance on the large worldgen GI/stress scene; the `max_resident_bricks`
+    /// cap still bounds it — only NON-empty surface bricks are stored, well under the cap in practice).
     pub residency_radius_bricks: i32,
     /// LOD ring radii in bricks: a brick at Chebyshev distance `d` from the camera takes LOD = the number
     /// of thresholds it exceeds. `lod_ring_bricks[i]` is the distance at/after which LOD becomes `i+1`.
@@ -60,7 +62,7 @@ pub struct StreamingConfig {
 impl Default for StreamingConfig {
     fn default() -> Self {
         Self {
-            residency_radius_bricks: 20,
+            residency_radius_bricks: 28,
             lod_ring_bricks: [6, 12, 18],
             max_resident_bricks: 60_000,
             max_bricks_per_frame: 256,
@@ -318,6 +320,7 @@ mod tests {
             blend: 0.0,
             texture: None,
             tiling: 4.0,
+            ..Default::default()
         };
         let materials = vec![mat("surface", [0.1, 0.5, 0.1, 1.0]), mat("stone", [0.5, 0.5, 0.5, 1.0])];
         let column = |_| BiomeDef {

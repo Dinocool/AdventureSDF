@@ -324,3 +324,111 @@ fn headless_render_shows_voxels() {
         "too few distinct terrain brightness levels ({distinct_lumas}) — surface is not being lit"
     );
 }
+
+/// **Phase 2.6 — emissive worldgen terrain present + threaded to the GPU palette (CPU-only, no GPU device).**
+///
+/// The large worldgen scene must (a) actually VOXELIZE emissive terrain (the new lava / crystal materials
+/// placed via `surface_rules`) and (b) carry that emissive all the way into the packed GPU palette
+/// (`GpuPaletteColor.emissive`), so the shader's `r.emissive` makes those voxels GI light sources. This pins
+/// the whole biome → registry → GPU chain WITHOUT needing a ray-query adapter (so it always runs in CI).
+///
+/// It does NOT depend on the camera/streaming/render path — it drives the SAME deterministic voxelization
+/// SSOT (`build_height_layer_pub` + `load_biome_library_pub` + `BlockRegistry::from_biome_library` +
+/// `voxel_block_at`/`voxelize_brick` + `pack_brickmap`) the streaming path uses.
+#[test]
+fn worldgen_voxelizes_emissive_terrain_into_palette() {
+    use adventure::voxel::brickmap::{BRICK_EDGE, BrickMap, VOXEL_SIZE, brick_coord_of_voxel};
+    use adventure::voxel::gpu::pack_brickmap;
+    use adventure::voxel::palette::{BlockId, BlockRegistry};
+    use adventure::voxel::voxelize::{voxel_block_at, voxelize_brick};
+    use bevy::math::IVec3;
+
+    // The dramatic worldgen layer + the SHIPPED biome library (now carrying the emissive lava/crystal) — the
+    // exact direct-construction path `init_voxel_rt_streaming` uses.
+    let layer = default_layer();
+    let lib = adventure::voxel::load_biome_library_pub();
+    let registry = BlockRegistry::from_biome_library(&lib);
+
+    // 1. Biome → registry plumbing: the shipped library MUST contain emissive materials, and they must reach
+    //    the registry as emissive blocks (radiance = emissive_color * emissive_intensity).
+    let mut emissive_blocks: Vec<(BlockId, [f32; 3])> = Vec::new();
+    for i in 0..registry.len() {
+        let id = BlockId(i as u16);
+        let e = registry.emissive(id);
+        if e[0] > 0.0 || e[1] > 0.0 || e[2] > 0.0 {
+            emissive_blocks.push((id, e));
+        }
+    }
+    assert!(
+        !emissive_blocks.is_empty(),
+        "the shipped biome library must define emissive terrain materials (lava/crystal) — the registry has \
+         no emissive blocks, so biome → registry emissive plumbing is broken"
+    );
+    eprintln!("emissive blocks in registry: {emissive_blocks:?}");
+
+    // 2. The worldgen surface MUST actually place an emissive voxel somewhere reachable. Scan a wide XZ grid
+    //    (deterministic seed) of surface columns and check the SURFACE voxel's block; emissive lava pools in
+    //    deep valley floors + crystal in cold-biome noise patches, so a broad sweep is guaranteed to hit one.
+    let seed = WORLDGEN_SLICE_SEED;
+    let mut found: Option<(IVec3, BlockId)> = None;
+    'scan: for gz in -800..=800 {
+        for gx in -800..=800 {
+            // World column at a coarse 4 m grid stride (keeps the scan bounded while covering ~±3.2 km — wide
+            // enough to reach the deep Plains valley floors where the emissive lava pools, plus the cold-biome
+            // crystal patches; the diagnostic sweep shows hundreds of thousands of emissive surface hits here).
+            let wx = gx as f64 * 4.0;
+            let wz = gz as f64 * 4.0;
+            let surf = layer.sample_world(wx, wz, seed).height as f64;
+            // The surface voxel (topmost solid): the integer voxel whose centre is just below `surf`.
+            let vy = (surf / VOXEL_SIZE as f64 - 0.5).floor() as i32;
+            let wv = IVec3::new(
+                (wx / VOXEL_SIZE as f64).floor() as i32,
+                vy,
+                (wz / VOXEL_SIZE as f64).floor() as i32,
+            );
+            let block = voxel_block_at(wv, &layer, &lib, &registry, seed);
+            if !block.is_air() {
+                let e = registry.emissive(block);
+                if e[0] > 0.0 || e[1] > 0.0 || e[2] > 0.0 {
+                    found = Some((wv, block));
+                    break 'scan;
+                }
+            }
+        }
+    }
+    let (emissive_voxel, emissive_id) = found.expect(
+        "no emissive surface voxel found over a ~±1.2 km worldgen sweep — emissive lava/crystal placement \
+         (surface_rules) never fired in any biome/altitude the scan reached",
+    );
+    let expected_e = registry.emissive(emissive_id);
+    eprintln!("found emissive surface voxel at {emissive_voxel:?} block {emissive_id:?} emissive {expected_e:?}");
+
+    // 3. Registry → GPU plumbing: voxelize the brick containing that emissive voxel, pack it, and assert the
+    //    packed palette entry for the emissive block carries the SAME emissive radiance the registry holds.
+    let bcoord = brick_coord_of_voxel(emissive_voxel);
+    let brick = voxelize_brick(bcoord, &layer, &lib, &registry, seed);
+    let mut map = BrickMap::new();
+    assert!(map.insert(bcoord, brick), "the emissive brick must be non-empty (it contains the surface)");
+    let patch = pack_brickmap(&map, &registry);
+    let packed = patch.palette[emissive_id.0 as usize].emissive;
+    assert_eq!(
+        [packed[0], packed[1], packed[2]],
+        expected_e,
+        "packed GPU palette emissive for the emissive block must equal the registry emissive — registry → \
+         GPU plumbing dropped it"
+    );
+    assert!(
+        packed[0] > 0.0 || packed[1] > 0.0 || packed[2] > 0.0,
+        "the packed emissive must be non-zero so the shader treats the voxel as a GI light source"
+    );
+
+    // Sanity: the brick covers BRICK_EDGE voxels per axis (the emissive voxel is inside it).
+    let origin = bcoord * BRICK_EDGE;
+    let local = emissive_voxel - origin;
+    assert!(
+        (0..BRICK_EDGE).contains(&local.x)
+            && (0..BRICK_EDGE).contains(&local.y)
+            && (0..BRICK_EDGE).contains(&local.z),
+        "the emissive voxel {local:?} must sit inside its brick"
+    );
+}

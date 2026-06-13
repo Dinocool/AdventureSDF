@@ -249,6 +249,7 @@ fn stream_voxel_rt_residency(
     mut streaming: ResMut<VoxelRtStreaming>,
     mut patch_res: ResMut<VoxelRtPatch>,
     mut lighting: ResMut<VoxelRtLighting>,
+    mut sky: ResMut<VoxelRtSky>,
     cam: Query<&GlobalTransform, With<SdfCamera>>,
 ) {
     // --- Static Cornell scene: build the resident set once, re-baking ONLY when the edit delta changes. ---
@@ -271,6 +272,9 @@ fn stream_voxel_rt_residency(
             // through the open front for soft shadow shaping. (Set once; an edit re-pack keeps it.)
             if scene_new {
                 lighting.data = LightingUniformData::cornell();
+                // Reset the sky to its default so a switch BACK from worldgen (which set the bright worldgen
+                // sky) restores Cornell's look exactly — Cornell is closed, but keep it identical regardless.
+                sky.data = SkyUniformData::default();
             }
             streaming.packed_scene = Some(VoxelScene::Cornell);
             streaming.packed_edit_gen = Some(edits.generation());
@@ -284,11 +288,18 @@ fn stream_voxel_rt_residency(
     }
 
     // --- Worldgen scene: camera-following streaming residency (the original Stage-3 path). ---
-    // On a switch INTO worldgen, drop any Cornell residency so the streamed set rebuilds cleanly.
+    // On a switch INTO worldgen, drop any Cornell residency so the streamed set rebuilds cleanly, AND apply
+    // the open-world lighting/sky presets (a crisp sun + a bright directional sky), mirroring how the Cornell
+    // branch applies `cornell()` lighting. The presets are runtime uniforms (knobs-as-uniforms) — an editor
+    // panel can still override them afterward; we set them only on the SWITCH so a later edit doesn't clobber
+    // a user's tweaks.
     if streaming.packed_scene != Some(VoxelScene::Worldgen) {
         streaming.manager = ResidencyManager::new();
         streaming.last_cam_brick = None;
         streaming.packed_scene = Some(VoxelScene::Worldgen);
+        lighting.data = LightingUniformData::worldgen();
+        sky.data = SkyUniformData::worldgen();
+        info!("voxel-RT: switched to WORLDGEN scene — applied worldgen sun + directional sky presets");
     }
 
     let Ok(cam_tf) = cam.single() else {
@@ -963,6 +974,36 @@ impl LightingUniformData {
             _pad: 0.0, // firefly clamping discarded in 2.2 (best practice) — ReSTIR + cache + DLSS-RR handle fireflies
         }
     }
+
+    /// Lighting tuned for the LARGE streamed WORLDGEN terrain (the Phase-2.6 GI showcase + stress scene).
+    /// Unlike the closed Cornell box, this is an OPEN world: a strong, crisp directional SUN (hard sun
+    /// shadows shaping the mountains + deep valleys) plus the directional sky (set via [`SkyUniformData::
+    /// worldgen`]) that the GI bounce reads when a ray escapes the resident clipmap — so open slopes are
+    /// SKY-LIT and shadowed valleys fill from multi-bounce + the emissive lava/crystal. A modest neutral
+    /// ambient keeps deep shadow off pure black before GI converges; a longer `gi_bounce_dist` so a bounce
+    /// can reach the far walls of a wide valley. All runtime uniforms (knobs-as-uniforms) — an editor panel
+    /// still overrides any of them.
+    pub fn worldgen() -> Self {
+        // A high afternoon sun coming down from +X/+Z (so peaks cast long valley shadows). Direction the
+        // light TRAVELS (away from the sun); Lambert uses `-sun_direction`.
+        let sun = Vec3::new(-0.45, -0.78, -0.42).normalize();
+        Self {
+            sun_direction: sun.into(),
+            sun_intensity: 3.2,
+            sun_color: [1.0, 0.95, 0.85],
+            shadow_bias: 0.06,
+            ambient_color: [0.06, 0.08, 0.11],
+            ao_radius: 1.5,
+            ao_samples: 4,
+            gi_rays: 8,
+            gi_intensity: 1.0,
+            gi_bounce_dist: 96.0,
+            emissive_strength: 4.0,
+            frame_index: 0,
+            debug_view: 0,
+            _pad: 0.0,
+        }
+    }
 }
 
 /// Runtime lighting resource: the SSOT [`LightingUniformData`] knobs, extracted to the render world each
@@ -1014,6 +1055,26 @@ impl Default for SkyUniformData {
             ground_color: [0.18, 0.17, 0.16],
             sun_size: 0.04, // ~2.3° half-angle — a soft sun disk
             sun_tint: [1.0, 0.95, 0.85],
+            _pad: 0.0,
+        }
+    }
+}
+
+impl SkyUniformData {
+    /// Sky tuned for the open WORLDGEN terrain (Phase 2.6): a BRIGHT directional daytime sky so open slopes
+    /// are strongly sky-lit and a bounce escaping the resident clipmap returns plenty of fill (the open-world
+    /// counterpart to Cornell's closed box). A deep-blue zenith → pale-blue horizon gradient, full
+    /// `gi_sky_intensity` (the sky is the dominant ambient source outdoors), an earthy lower-hemisphere fill,
+    /// and a crisp warm sun disk aligned with [`LightingUniformData::worldgen`]'s sun. Knobs-as-uniforms.
+    pub fn worldgen() -> Self {
+        Self {
+            horizon_color: [0.70, 0.80, 0.95],
+            intensity: 2.2,
+            zenith_color: [0.18, 0.34, 0.62],
+            gi_sky_intensity: 1.0,
+            ground_color: [0.20, 0.18, 0.15],
+            sun_size: 0.035,
+            sun_tint: [1.0, 0.93, 0.80],
             _pad: 0.0,
         }
     }

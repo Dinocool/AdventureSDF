@@ -8,7 +8,11 @@
 
 use bevy::math::IVec3;
 
-use crate::sdf_render::worldgen::biome::{BiomeLibrary, classify, humidity, strata_material, temperature};
+use crate::sdf_render::worldgen::artifact::HeightNode;
+use crate::sdf_render::worldgen::biome::{
+    BiomeLibrary, TerrainMatId, classify, humidity, resolve_surface, strata_material, surface_biome,
+    temperature,
+};
 use crate::sdf_render::worldgen::layers::height::HeightLayer;
 
 use super::brickmap::{BRICK_EDGE, BRICK_VOXELS, Brick, VOXEL_SIZE, voxel_index};
@@ -40,16 +44,52 @@ pub fn voxel_block_at(
     seed: u64,
 ) -> BlockId {
     let [wx, wy, wz] = voxel_center_world(world_voxel);
-    let h = layer.sample_world(wx, wz, seed).height as f64;
+    let node = layer.sample_world(wx, wz, seed);
+    let h = node.height as f64;
     let depth = h - wy;
     if depth < 0.0 {
         return BlockId::AIR; // above the surface → empty
     }
-    // Surface biome at this column (climate is height-independent), then the strata material at `depth`,
-    // then the block mirroring that material. One SSOT chain (worldgen → registry).
-    let biome = classify(temperature(wx, wz, seed), humidity(wx, wz, seed)).primary;
-    let mat = strata_material(biome, depth, lib);
+    let mat = surface_material_at(wx, wz, h, depth, &node, lib, seed);
     registry.block_for_material(mat)
+}
+
+/// The undug RENDER-SURFACE skin thickness (metres) the [`resolve_surface`] rules paint: voxels within this
+/// depth of the surface take the surface-rule material (snow caps, cliff rock, flower / EMISSIVE lava +
+/// crystal patches); deeper voxels fall to the volumetric [`strata_material`] column (dug walls). One voxel
+/// edge ([`VOXEL_SIZE`]) — the exposed shell — so the glow sits on the surface, not buried under dirt.
+const SURFACE_SKIN_DEPTH: f64 = VOXEL_SIZE as f64;
+
+/// The terrain material occupying world voxel `(wx,wz)` at `depth` metres below the surface — the worldgen
+/// SSOT for the voxel block. WITHIN the surface skin (`depth < SURFACE_SKIN_DEPTH`) it uses the SAME
+/// [`resolve_surface`] the SDF/mesh renderer uses (so the voxel surface respects the biome `surface_rules`:
+/// altitude caps, cliffs, patches, and the new EMISSIVE lava/crystal placement), taking its DOMINANT
+/// material (`mat_a`); below the skin it walks the volumetric [`strata_material`] column. A base-only column
+/// (no surface rule firing) yields `mat_a == def.surface`, i.e. bit-identical to the old `strata_material`
+/// surface — so non-emissive terrain output is unchanged.
+#[inline]
+fn surface_material_at(
+    wx: f64,
+    wz: f64,
+    h: f64,
+    depth: f64,
+    node: &HeightNode,
+    lib: &BiomeLibrary,
+    seed: u64,
+) -> TerrainMatId {
+    if depth < SURFACE_SKIN_DEPTH {
+        // Surface skin: choose the dominant surface-rule material (matches the rendered terrain surface).
+        // Surface-normal cos from the stored gradient: n = (-dh_dx, 1, -dh_dz) normalized ⇒ n_y = 1/|n|.
+        let (dx, dz) = (node.dh_dx as f64, node.dh_dz as f64);
+        let n_y = 1.0 / (dx * dx + dz * dz + 1.0).sqrt();
+        let biome = surface_biome(wx, wz, seed);
+        let blend = resolve_surface(wx, wz, h, n_y, biome, seed, lib);
+        TerrainMatId(blend.mat_a)
+    } else {
+        // Sub-surface: the volumetric strata column (dug walls / depth ordering). Climate is height-indep.
+        let biome = classify(temperature(wx, wz, seed), humidity(wx, wz, seed)).primary;
+        strata_material(biome, depth, lib)
+    }
 }
 
 /// Voxelize one `8³` brick at integer brick coordinate `brick_coord`. Samples [`voxel_block_at`] for each
@@ -98,6 +138,7 @@ mod tests {
             blend: 0.0,
             texture: None,
             tiling: 4.0,
+            ..Default::default()
         };
         // 0 surface, 1 sub-surface, 2 stone, 3 bedrock — distinct colours/ids.
         let materials = vec![

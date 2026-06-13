@@ -402,6 +402,7 @@ mod tests {
             blend: 0.0,
             texture: None,
             tiling: 4.0,
+            ..Default::default()
         };
         let materials = vec![mat("a", [0.1, 0.2, 0.3, 1.0]), mat("b", [0.4, 0.5, 0.6, 1.0])];
         let biomes = BiomeId::ALL
