@@ -14,11 +14,12 @@
 //!    builds and the rest of the pipeline is unchanged. FBX (e.g. the Lumberyard Bistro) is NOT handled —
 //!    convert it to glTF/OBJ externally first. If the asset is absent, fall back to a small procedural coloured
 //!    box room so the pipeline + downstream test still build + run (and print a clear "drop in a real" notice).
-//! 2. SURFACE-voxelize into a dense grid at `VOXEL_SIZE` (0.2 m) over the mesh AABB: each triangle is
+//! 2. SURFACE-voxelize into a SPARSE grid at `VOXEL_SIZE` (0.2 m) over the mesh AABB: each triangle is
 //!    conservatively rasterized (triangle–box overlap, the Akenine-Möller SAT) into every voxel it touches,
 //!    marking it SOLID. Each solid voxel's albedo is the base-colour texture sampled at the
 //!    barycentric-interpolated UV of the triangle point nearest the voxel centre (or the material
-//!    `base_color_factor` when untextured).
+//!    `base_color_factor` when untextured). The grid stores a 1-bit-per-cell occupancy bitset plus a
+//!    solid-only `cell → albedo` map, so a billion-cell AABB (Bistro @0.05 m) bakes in a few GB, not tens.
 //! 3. QUANTIZE the sampled albedos to a ≤255-colour palette (median-cut). Palette index 0 is reserved so the
 //!    written `.vox` voxel indices are 1-based (MagicaVoxel convention; `dot_vox` stores them 0-based).
 //! 4. WRITE `assets/models/sponza.vox` with `dot_vox`. A MagicaVoxel model is ≤256 per axis, so if the grid
@@ -493,22 +494,79 @@ fn fallback_room() -> Mesh {
 // Voxelization (surface / shell)
 // ============================================================================================
 
-/// A dense voxel grid over the mesh AABB at the voxelization's voxel size. `solid[i]` true ⇒ that voxel is
-/// on the surface; `albedo[i]` is its sampled sRGB colour. Indexed `x + y*dx + z*dx*dy` (X fastest). Only the
-/// dims + the solid/albedo arrays are needed downstream (quantize + `.vox` assembly); the world origin /
-/// voxel size are consumed entirely within [`voxelize`], so they aren't retained.
+/// A 1-bit-per-cell occupancy bitset over a linear cell range — the dense part of [`Grid`]. Bit `i` set ⇒
+/// cell `i` is solid. `O(1)` random access (the flood-fill needs it) at 1 bit/cell, so even a multi-billion
+/// cell AABB costs `N/8` bytes (vs the old `Vec<bool>`'s `N` bytes), which is what lets large scenes
+/// (Bistro @0.05 m ≈ a few billion cells) bake in a few GB instead of tens.
+struct BitGrid {
+    bits: Vec<u64>,
+}
+
+impl BitGrid {
+    fn new(n: usize) -> Self {
+        Self { bits: vec![0u64; n.div_ceil(64)] }
+    }
+    #[inline]
+    fn get(&self, i: usize) -> bool {
+        (self.bits[i >> 6] >> (i & 63)) & 1 != 0
+    }
+    #[inline]
+    fn set(&mut self, i: usize) {
+        self.bits[i >> 6] |= 1u64 << (i & 63);
+    }
+}
+
+/// A voxel grid over the mesh AABB at the voxelization's voxel size, stored SPARSELY: a 1-bit-per-cell
+/// occupancy [`BitGrid`] (`solid`) for `O(1)` flood-fill lookups, plus a `cell index → sRGB albedo` map
+/// holding ONLY solid cells. Surface voxelization + enclosed fill are sparse (a shell + thin interiors), so
+/// the albedo map is bounded by the SOLID count (millions), not the AABB volume (billions) — the prior dense
+/// `Vec<[u8;4]>` albedo (4 bytes/cell) was the memory wall for large scenes. Indexed `x + y·dx + z·dx·dy`
+/// (X fastest), computed in `usize` so it does NOT overflow past ~2 G cells (the old `i32` index did). The
+/// world origin / voxel size are consumed within [`voxelize`], so they aren't retained.
 struct Grid {
     dims: [i32; 3],
-    solid: Vec<bool>,
-    albedo: Vec<[u8; 4]>,
+    solid: BitGrid,
+    albedo: HashMap<usize, [u8; 4]>,
 }
 
 impl Grid {
-    fn idx(&self, x: i32, y: i32, z: i32) -> usize {
-        (x + y * self.dims[0] + z * self.dims[0] * self.dims[1]) as usize
+    /// An all-air grid of `dims` cells (no solid voxels).
+    fn new(dims: [i32; 3]) -> Self {
+        let total = (dims[0] as usize) * (dims[1] as usize) * (dims[2] as usize);
+        Self { dims, solid: BitGrid::new(total), albedo: HashMap::new() }
     }
+    #[inline]
+    fn idx(&self, x: i32, y: i32, z: i32) -> usize {
+        let (dx, dy) = (self.dims[0] as usize, self.dims[1] as usize);
+        (x as usize) + (y as usize) * dx + (z as usize) * dx * dy
+    }
+    /// Is cell `i` solid?
+    #[inline]
+    fn is_solid(&self, i: usize) -> bool {
+        self.solid.get(i)
+    }
+    /// Mark cell `i` solid with sRGB albedo `a` (sets the occupancy bit + records the albedo).
+    #[inline]
+    fn set_solid(&mut self, i: usize, a: [u8; 4]) {
+        self.solid.set(i);
+        self.albedo.insert(i, a);
+    }
+    /// The albedo of solid cell `i` (callers only ask for solid cells; air reads as transparent black).
+    #[inline]
+    fn albedo_at(&self, i: usize) -> [u8; 4] {
+        self.albedo.get(&i).copied().unwrap_or([0, 0, 0, 0])
+    }
+    /// Number of solid cells (== albedo entries; every solid cell records an albedo).
     fn solid_count(&self) -> usize {
-        self.solid.iter().filter(|&&s| s).count()
+        self.albedo.len()
+    }
+    /// Delinearize a cell index back to `(x, y, z)` (inverse of [`idx`](Self::idx)).
+    #[inline]
+    fn xyz(&self, i: usize) -> (i32, i32, i32) {
+        let (dx, dy) = (self.dims[0] as usize, self.dims[1] as usize);
+        let z = i / (dx * dy);
+        let r = i % (dx * dy);
+        ((r % dx) as i32, (r / dx) as i32, z as i32)
     }
 }
 
@@ -529,7 +587,7 @@ fn voxelize(mesh: &Mesh, voxel_size: f32) -> Grid {
     }
     if !lo[0].is_finite() {
         // No geometry — return a 1³ empty grid.
-        return Grid { dims: [1, 1, 1], solid: vec![false], albedo: vec![[0; 4]] };
+        return Grid::new([1, 1, 1]);
     }
     // Pad one voxel so surface triangles on the boundary still have a cell.
     let origin = [lo[0] - voxel_size, lo[1] - voxel_size, lo[2] - voxel_size];
@@ -538,11 +596,13 @@ fn voxelize(mesh: &Mesh, voxel_size: f32) -> Grid {
         (((hi[1] - lo[1]) / voxel_size).ceil() as i32 + 3).max(1),
         (((hi[2] - lo[2]) / voxel_size).ceil() as i32 + 3).max(1),
     ];
-    // Guard: a dense grid is allocated for the whole AABB, so an absurd extent (e.g. forgetting the glTF
-    // node transform, which once made Sponza ~3000 units) would try a terabyte allocation. Abort with a
-    // clear message naming the AABB + dims rather than OOM-crashing.
+    // Guard: the occupancy bitset + the flood-fill's `exterior` bitset are each `total/8` bytes (1 bit/cell)
+    // — the only AABB-volume cost now (the albedo is sparse). So the ceiling is generous: 16 G cells ⇒ ~2 GB
+    // per bitset (~4 GB peak during solid_fill). It still catches an absurd extent (e.g. forgetting the glTF
+    // node transform, which once made Sponza ~3000 units → trillions of cells) with a clear message rather
+    // than an OOM. A scene larger than this would need a spatially-tiled (blocked) flood-fill.
     let total = (dims[0] as i64) * (dims[1] as i64) * (dims[2] as i64);
-    const MAX_VOXELS: i64 = 1_500_000_000; // ~6 GB of (solid+albedo); generous for any real classic scene
+    const MAX_VOXELS: i64 = 16_000_000_000; // ~2 GB/bitset; spans billion-cell scenes (Bistro @0.05 m) sparsely
     assert!(
         total <= MAX_VOXELS,
         "voxel grid {dims:?} = {total} cells exceeds {MAX_VOXELS} — AABB world span is {:?}..{:?} ({:.1} m \
@@ -552,8 +612,7 @@ fn voxelize(mesh: &Mesh, voxel_size: f32) -> Grid {
         hi,
         (hi[0] - lo[0]).max(hi[1] - lo[1]).max(hi[2] - lo[2])
     );
-    let total = total as usize;
-    let mut grid = Grid { dims, solid: vec![false; total], albedo: vec![[0; 4]; total] };
+    let mut grid = Grid::new(dims);
 
     let half = voxel_size * 0.5;
     let dims = grid.dims; // Copy [i32;3] — captured by the parallel closures so they don't borrow `grid`.
@@ -595,7 +654,10 @@ fn voxelize(mesh: &Mesh, voxel_size: f32) -> Grid {
                             origin[2] + (z as f32 + 0.5) * voxel_size,
                         ];
                         if tri_box_overlap(center, half, &t.p) {
-                            let i = (x + y * dims[0] + z * dims[0] * dims[1]) as usize;
+                            // usize index (the i32 form overflowed past ~2 G cells, silently corrupting large bakes).
+                            let i = (x as usize)
+                                + (y as usize) * (dims[0] as usize)
+                                + (z as usize) * (dims[0] as usize) * (dims[1] as usize);
                             cells.push((i, sample_albedo(mesh, t, center)));
                         }
                     }
@@ -607,9 +669,8 @@ fn voxelize(mesh: &Mesh, voxel_size: f32) -> Grid {
     // First-writer-wins merge in triangle order (matches the original single-threaded semantics).
     for cells in &per_tri {
         for &(i, albedo) in cells {
-            if !grid.solid[i] {
-                grid.solid[i] = true;
-                grid.albedo[i] = albedo;
+            if !grid.is_solid(i) {
+                grid.set_solid(i, albedo);
             }
         }
     }
@@ -626,24 +687,25 @@ fn voxelize(mesh: &Mesh, voxel_size: f32) -> Grid {
 /// can reassign them later. Ported from `D:\Projects\asset gen` `_solid_fill` (exterior label → interior = unreached).
 fn solid_fill(grid: &mut Grid) {
     let [dx, dy, dz] = grid.dims;
-    let total = (dx * dy * dz) as usize;
+    let total = (dx as usize) * (dy as usize) * (dz as usize);
     if total == 0 {
         return;
     }
     const N6: [(i32, i32, i32); 6] =
         [(1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, -1, 0), (0, 0, 1), (0, 0, -1)];
 
-    // 1. EXTERIOR: 6-connected flood through AIR, seeded from every AIR cell on the grid boundary (outside the
-    //    grid is air, so a boundary air cell is exterior). Reached air = exterior; unreached air = enclosed.
-    let mut exterior = vec![false; total];
+    // 1. EXTERIOR: 6-connected flood through AIR (1-bit/cell bitset), seeded from every AIR cell on the grid
+    //    boundary (outside the grid is air, so a boundary air cell is exterior). Reached air = exterior;
+    //    unreached air = enclosed interior.
+    let mut exterior = BitGrid::new(total);
     let mut q: std::collections::VecDeque<(i32, i32, i32)> = std::collections::VecDeque::new();
     for z in 0..dz {
         for y in 0..dy {
             for x in 0..dx {
                 if x == 0 || y == 0 || z == 0 || x == dx - 1 || y == dy - 1 || z == dz - 1 {
                     let i = grid.idx(x, y, z);
-                    if !grid.solid[i] && !exterior[i] {
-                        exterior[i] = true;
+                    if !grid.is_solid(i) && !exterior.get(i) {
+                        exterior.set(i);
                         q.push_back((x, y, z));
                     }
                 }
@@ -657,40 +719,35 @@ fn solid_fill(grid: &mut Grid) {
                 continue;
             }
             let ni = grid.idx(nx, ny, nz);
-            if !grid.solid[ni] && !exterior[ni] {
-                exterior[ni] = true;
+            if !grid.is_solid(ni) && !exterior.get(ni) {
+                exterior.set(ni);
                 q.push_back((nx, ny, nz));
             }
         }
     }
 
     // 2. Fill the enclosed interior (air && !exterior) solid, colouring each cell with the NEAREST surface
-    //    voxel's albedo via a multi-source 6-connected BFS seeded from the surface (pre-fill solid) cells.
-    //    `filled` is the visited set — surface seeds start visited so they keep their own colour.
-    let mut filled = grid.solid.clone();
+    //    voxel's albedo via a multi-source 6-connected BFS seeded from the surface cells. The occupancy bit is
+    //    its own visited marker: a cell becomes solid the instant it's filled, so the `!is_solid` test stops
+    //    re-visits (no separate `filled` bitset). Seed from a SNAPSHOT of the current solid set (the sparse
+    //    albedo keys) so the in-loop inserts don't perturb iteration.
+    // Seed from a SNAPSHOT of the current solid set (the sparse albedo keys), SORTED by linear index so the
+    // multi-source BFS is deterministic — tie-broken interior colours (a cell equidistant from two surfaces)
+    // must not depend on HashMap iteration order, or re-bakes would differ.
+    let mut seed_idx: Vec<usize> = grid.albedo.keys().copied().collect();
+    seed_idx.sort_unstable();
     q.clear();
-    for z in 0..dz {
-        for y in 0..dy {
-            for x in 0..dx {
-                let i = grid.idx(x, y, z);
-                if grid.solid[i] {
-                    q.push_back((x, y, z));
-                }
-            }
-        }
-    }
+    q.extend(seed_idx.into_iter().map(|i| grid.xyz(i)));
     while let Some((x, y, z)) = q.pop_front() {
-        let src = grid.albedo[grid.idx(x, y, z)];
+        let src = grid.albedo_at(grid.idx(x, y, z));
         for (ox, oy, oz) in N6 {
             let (nx, ny, nz) = (x + ox, y + oy, z + oz);
             if nx < 0 || ny < 0 || nz < 0 || nx >= dx || ny >= dy || nz >= dz {
                 continue;
             }
             let ni = grid.idx(nx, ny, nz);
-            if !filled[ni] && !exterior[ni] {
-                filled[ni] = true;
-                grid.solid[ni] = true;
-                grid.albedo[ni] = src;
+            if !grid.is_solid(ni) && !exterior.get(ni) {
+                grid.set_solid(ni, src);
                 q.push_back((nx, ny, nz));
             }
         }
@@ -867,29 +924,24 @@ fn plane_box_overlap(normal: [f32; 3], vert: [f32; 3], half: [f32; 3]) -> bool {
 
 /// Quantize the grid's solid-voxel albedos to a ≤255-colour palette (median-cut) and map each solid voxel to
 /// its nearest palette index (1-based; 0 is reserved for empty/air per the `.vox` convention). Returns the
-/// palette (sRGB RGBA) and a per-voxel index parallel to `grid.solid` (0 for air voxels).
-fn quantize(grid: &Grid) -> (Vec<[u8; 4]>, Vec<u8>) {
+/// palette (sRGB RGBA) and a SPARSE `cell index → 1-based palette index` map over the solid cells only (a
+/// dense per-cell `Vec<u8>` would be billions of bytes for a large AABB; the solid set is millions).
+fn quantize(grid: &Grid) -> (Vec<[u8; 4]>, HashMap<usize, u8>) {
     // Gather distinct solid albedos with counts (median-cut works on the distinct set, weighted by count).
     let mut counts: HashMap<[u8; 4], u32> = HashMap::new();
-    for (i, &s) in grid.solid.iter().enumerate() {
-        if s {
-            *counts.entry(grid.albedo[i]).or_insert(0) += 1;
-        }
+    for &c in grid.albedo.values() {
+        *counts.entry(c).or_insert(0) += 1;
     }
-    let pixels: Vec<([u8; 4], u32)> = counts.into_iter().collect();
+    let mut pixels: Vec<([u8; 4], u32)> = counts.into_iter().collect();
+    pixels.sort_unstable(); // deterministic median-cut input (independent of HashMap order) → reproducible palette
     let palette = median_cut(&pixels, 255);
 
-    // Map every solid voxel to its nearest palette colour (1-based index).
-    let mut indices = vec![0u8; grid.solid.len()];
-    // Cache nearest-index per distinct albedo so we don't re-search per voxel.
+    // Map every solid voxel to its nearest palette colour (1-based index), caching per distinct albedo.
+    let mut indices: HashMap<usize, u8> = HashMap::with_capacity(grid.albedo.len());
     let mut nearest_cache: HashMap<[u8; 4], u8> = HashMap::new();
-    for (i, &s) in grid.solid.iter().enumerate() {
-        if !s {
-            continue;
-        }
-        let c = grid.albedo[i];
+    for (&i, &c) in &grid.albedo {
         let idx = *nearest_cache.entry(c).or_insert_with(|| nearest_palette(&palette, c));
-        indices[i] = idx + 1; // 1-based; 0 = air
+        indices.insert(i, idx + 1); // 1-based; 0 = air
     }
     (palette, indices)
 }
@@ -989,7 +1041,7 @@ fn nearest_palette(palette: &[[u8; 4]], c: [u8; 4]) -> u8 {
 /// block CENTER (the MagicaVoxel convention the runtime loader reverses), and attach the 256-entry palette.
 /// Z-up: the grid's Y (up) becomes `.vox` Z, the grid's Z becomes `.vox` Y, matching the loader's
 /// `.vox (x,y,z) → world (x,z,y)` swap so a round-trip is identity.
-fn build_dot_vox(grid: &Grid, palette: &[[u8; 4]], indices: &[u8]) -> DotVoxData {
+fn build_dot_vox(grid: &Grid, palette: &[[u8; 4]], indices: &HashMap<usize, u8>) -> DotVoxData {
     // Build the 256-entry `.vox` palette: our quantized colours, padded to 256.
     let mut vox_palette: Vec<Color> =
         palette.iter().map(|c| Color { r: c[0], g: c[1], b: c[2], a: c[3] }).collect();
@@ -1004,50 +1056,44 @@ fn build_dot_vox(grid: &Grid, palette: &[[u8; 4]], indices: &[u8]) -> DotVoxData
     let tiles_vy = ceil_div(dz, VOX_MODEL_MAX).max(1); // .vox Y from grid Z
     let tiles_vz = ceil_div(dy, VOX_MODEL_MAX).max(1); // .vox Z from grid Y
 
+    // Bucket each SOLID voxel into its ≤256³ tile — O(solid), not O(AABB): scanning every cell per tile would
+    // be billions of iterations for a large grid. Tile linear index over the `.vox` axes (X←gridX, Y←gridZ,
+    // Z←gridY): `tx + ty·tiles_x + tz·tiles_x·tiles_vy`.
+    let n_tiles = (tiles_x as usize) * (tiles_vy as usize) * (tiles_vz as usize);
+    let mut tile_voxels: Vec<Vec<Voxel>> = vec![Vec::new(); n_tiles];
+    for (&i, &pal) in indices {
+        if pal == 0 {
+            continue; // shouldn't happen for a solid voxel, but stay total
+        }
+        let (gx, gy, gz) = grid.xyz(i);
+        // `.vox` axes: vx ← grid x, vy ← grid z, vz ← grid y. Tile + local coords per axis.
+        let (tx, lx) = (gx / VOX_MODEL_MAX, gx % VOX_MODEL_MAX);
+        let (ty, ly) = (gz / VOX_MODEL_MAX, gz % VOX_MODEL_MAX);
+        let (tz, lz) = (gy / VOX_MODEL_MAX, gy % VOX_MODEL_MAX);
+        let tile = (tx + ty * tiles_x + tz * tiles_x * tiles_vy) as usize;
+        tile_voxels[tile].push(Voxel { x: lx as u8, y: ly as u8, z: lz as u8, i: pal - 1 });
+    }
+
     let mut models: Vec<Model> = Vec::new();
     // Each model's `.vox`-space min corner, for the scene Transform (center = corner + size/2).
     let mut model_corners: Vec<[i32; 3]> = Vec::new();
-
     for tz in 0..tiles_vz {
         for ty in 0..tiles_vy {
             for tx in 0..tiles_x {
-                // `.vox`-space tile bounds.
+                let tile = (tx + ty * tiles_x + tz * tiles_x * tiles_vy) as usize;
+                let mut voxels = std::mem::take(&mut tile_voxels[tile]);
+                if voxels.is_empty() {
+                    continue; // drop fully-empty tiles
+                }
+                // Sort (z,y,x) so the bake is BYTE-deterministic (the bucket push order is HashMap-order); the
+                // loader is order-independent, but reproducible `.vox` bytes ease diffing / CI / debugging.
+                voxels.sort_unstable_by_key(|v| (v.z, v.y, v.x));
                 let vx0 = tx * VOX_MODEL_MAX;
                 let vy0 = ty * VOX_MODEL_MAX;
                 let vz0 = tz * VOX_MODEL_MAX;
                 let sx = (dx - vx0).min(VOX_MODEL_MAX);
                 let sy = (dz - vy0).min(VOX_MODEL_MAX); // .vox Y extent ← grid Z
                 let sz = (dy - vz0).min(VOX_MODEL_MAX); // .vox Z extent ← grid Y
-
-                let mut voxels = Vec::new();
-                for lz in 0..sz {
-                    // .vox z ← grid y
-                    let gy = vz0 + lz;
-                    for ly in 0..sy {
-                        // .vox y ← grid z
-                        let gz = vy0 + ly;
-                        for lx in 0..sx {
-                            let gx = vx0 + lx;
-                            let i = grid.idx(gx, gy, gz);
-                            if !grid.solid[i] {
-                                continue;
-                            }
-                            let pal = indices[i];
-                            if pal == 0 {
-                                continue; // shouldn't happen for a solid voxel, but stay total
-                            }
-                            voxels.push(Voxel {
-                                x: lx as u8,
-                                y: ly as u8,
-                                z: lz as u8,
-                                i: pal - 1, // dot_vox stores 0-based (file is 1-based)
-                            });
-                        }
-                    }
-                }
-                if voxels.is_empty() {
-                    continue; // drop fully-empty tiles
-                }
                 model_corners.push([vx0, vy0, vz0]);
                 models.push(Model {
                     size: Size { x: sx as u32, y: sy as u32, z: sz as u32 },
@@ -1138,8 +1184,7 @@ mod tests {
         let grid = voxelize(&fallback_room(), 1.0);
         // Every one of the 6 distinctly-coloured faces must contribute voxels. Before the conservative ±1
         // candidate-AABB pad, grid-aligned faces were dropped and only 2 of 6 colours survived.
-        let distinct: std::collections::HashSet<[u8; 4]> =
-            grid.solid.iter().enumerate().filter(|&(_, &s)| s).map(|(i, _)| grid.albedo[i]).collect();
+        let distinct: std::collections::HashSet<[u8; 4]> = grid.albedo.values().copied().collect();
         for col in [
             [160u8, 160, 160, 255], // floor (grey)
             [240, 240, 240, 255],   // ceiling (white)
@@ -1158,24 +1203,21 @@ mod tests {
     #[test]
     fn solid_fill_closes_enclosed_but_keeps_open_air() {
         let dims = [5, 5, 5];
-        let total = 125usize;
         // A 3×3×3 box SHELL at [1,3]³ (its 6 faces solid) around a single air cavity at (2,2,2).
         let build = |open_face: bool| -> Grid {
-            let mut g = Grid { dims, solid: vec![false; total], albedo: vec![[0u8; 4]; total] };
+            let mut g = Grid::new(dims);
             for z in 1..=3 {
                 for y in 1..=3 {
                     for x in 1..=3 {
                         if x == 1 || x == 3 || y == 1 || y == 3 || z == 1 || z == 3 {
+                            if open_face && (x, y, z) == (2, 1, 2) {
+                                continue; // poke a hole in the -Y face → the cavity reaches outside
+                            }
                             let i = g.idx(x, y, z);
-                            g.solid[i] = true;
-                            g.albedo[i] = [200, 100, 50, 255]; // a surface colour
+                            g.set_solid(i, [200, 100, 50, 255]); // a surface colour
                         }
                     }
                 }
-            }
-            if open_face {
-                let i = g.idx(2, 1, 2); // poke a hole in the -Y face → the cavity reaches outside
-                g.solid[i] = false;
             }
             g
         };
@@ -1183,16 +1225,16 @@ mod tests {
         // CLOSED: the enclosed cavity at (2,2,2) fills solid and takes the nearest surface colour.
         let mut closed = build(false);
         let c = closed.idx(2, 2, 2);
-        assert!(!closed.solid[c], "cavity starts air");
+        assert!(!closed.is_solid(c), "cavity starts air");
         solid_fill(&mut closed);
-        assert!(closed.solid[c], "closed shell: the enclosed cavity is filled solid");
-        assert_eq!(closed.albedo[c], [200, 100, 50, 255], "interior takes the nearest surface colour");
+        assert!(closed.is_solid(c), "closed shell: the enclosed cavity is filled solid");
+        assert_eq!(closed.albedo_at(c), [200, 100, 50, 255], "interior takes the nearest surface colour");
 
         // OPEN: the hole connects the cavity to the outside → it stays air (we never fill reachable space).
         let mut open = build(true);
         let o = open.idx(2, 2, 2);
         solid_fill(&mut open);
-        assert!(!open.solid[o], "open shell: a cavity reachable from outside stays air");
+        assert!(!open.is_solid(o), "open shell: a cavity reachable from outside stays air");
     }
 
     /// OBJ loading: a tiny synthetic `.obj` (one coloured quad, two triangles, no `.mtl`) loads through the
@@ -1227,5 +1269,45 @@ f 1 3 4
         // The same downstream voxelizer the glTF/fallback path uses produces a non-empty surface grid.
         let grid = voxelize(&mesh, 0.5);
         assert!(grid.solid_count() > 0, "the OBJ quad voxelizes to a non-empty surface");
+    }
+
+    /// Bounded-RAM / large-AABB sanity: a grid with a huge AABB but only a handful of solid cells stores ONLY
+    /// those cells — the albedo + indices are solid-count-sized, NOT AABB-sized — and still bakes a valid,
+    /// multi-tile `.vox`. This sparsity is what lets billion-cell scenes (Bistro @0.05 m) bake without OOM.
+    /// Uses a 600³ AABB (216 M cells: a ~27 MB occupancy bitset — cheap; the old dense albedo would be ~864 MB).
+    #[test]
+    fn large_aabb_grid_stays_sparse_and_bakes() {
+        let mut grid = Grid::new([600, 600, 600]);
+        // A few solid voxels scattered to the AABB corners + interior (spanning multiple ≤256³ `.vox` tiles).
+        let pts = [
+            (0, 0, 0),
+            (599, 599, 599),
+            (300, 300, 300),
+            (1, 2, 3),
+            (599, 0, 0),
+            (0, 599, 0),
+            (0, 0, 599),
+            (300, 1, 599),
+        ];
+        for (n, &(x, y, z)) in pts.iter().enumerate() {
+            let i = grid.idx(x, y, z);
+            grid.set_solid(i, [(n as u8).wrapping_mul(30), 100, 200, 255]);
+        }
+        assert_eq!(grid.solid_count(), pts.len(), "only solid cells are stored (sparse, not AABB-sized)");
+        assert_eq!(grid.albedo.len(), pts.len(), "the albedo map holds ONLY solid cells");
+        // idx/xyz round-trip over the full 64-bit index range (the old i32 index overflowed past ~2 G cells).
+        for &(x, y, z) in &pts {
+            let i = grid.idx(x, y, z);
+            assert_eq!(grid.xyz(i), (x, y, z), "xyz ∘ idx is identity");
+            assert!(grid.is_solid(i));
+        }
+        // The whole downstream (quantize + `.vox` assembly) runs O(solid) and tiles the 600³ AABB into models.
+        let (palette, indices) = quantize(&grid);
+        assert!(!palette.is_empty());
+        assert_eq!(indices.len(), pts.len(), "sparse indices: one per solid cell");
+        let data = build_dot_vox(&grid, &palette, &indices);
+        let baked: usize = data.models.iter().map(|m| m.voxels.len()).sum();
+        assert_eq!(baked, pts.len(), "every solid voxel lands in some ≤256³ model");
+        assert!(data.models.len() > 1, "a 600³ AABB splits into multiple ≤256³ `.vox` models");
     }
 }
