@@ -196,6 +196,10 @@ half = "2"
 # dep is the same crate/version, so Cargo unifies it: no second copy).
 gltf = { version = "1.4", default-features = false, features = ["import", "utils", "image"] }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "bmp", "tga"] }
+# Parallel triangle rasterization in the offline voxelizer (`examples/voxelize_scene.rs`): the 13-axis SAT
+# overlap test + per-voxel albedo sample is embarrassingly parallel over triangles, so we fan it across all
+# cores. DEV-only — the shipped runtime `.vox` loader does no voxelization.
+rayon = "1"
 
 [profile.dev]
 opt-level = 1

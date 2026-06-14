@@ -32,6 +32,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use dot_vox::{Color, DotVoxData, Dict, Frame, Model, SceneNode, ShapeModel, Size, Voxel};
+use rayon::prelude::*;
 
 /// World edge of one voxel cell, in metres. MUST match `adventure::voxel::brickmap::VOXEL_SIZE` so the
 /// baked grid lines up with the runtime brick grid (0.2 m). Duplicated as a literal because the example is a
@@ -64,11 +65,13 @@ fn main() -> anyhow::Result<()> {
     };
     println!("mesh: {} triangles, {} textures", mesh.triangles.len(), mesh.textures.len());
 
-    // 2. Surface-voxelize.
+    // 2. Surface-voxelize (rayon-parallel rasterization; the dominant cost at fine voxel sizes — timed so a
+    // bake self-reports where the wall-clock goes).
+    let t_vox = std::time::Instant::now();
     let grid = voxelize(&mesh, voxel_size);
     println!(
-        "grid: {}×{}×{} voxels, {} solid",
-        grid.dims[0], grid.dims[1], grid.dims[2], grid.solid_count()
+        "grid: {}×{}×{} voxels, {} solid (voxelize {:.2}s)",
+        grid.dims[0], grid.dims[1], grid.dims[2], grid.solid_count(), t_vox.elapsed().as_secs_f32()
     );
 
     // 3. Quantize the sampled albedos to a ≤255 palette.
@@ -410,43 +413,60 @@ fn voxelize(mesh: &Mesh, voxel_size: f32) -> Grid {
     let mut grid = Grid { dims, solid: vec![false; total], albedo: vec![[0; 4]; total] };
 
     let half = voxel_size * 0.5;
-    for t in &mesh.triangles {
-        // Triangle voxel-AABB (clamped to the grid).
-        let mut tlo = [i32::MAX; 3];
-        let mut thi = [i32::MIN; 3];
-        for v in &t.p {
-            for a in 0..3 {
-                let c = ((v[a] - origin[a]) / voxel_size).floor() as i32;
-                tlo[a] = tlo[a].min(c);
-                thi[a] = thi[a].max(c);
+    let dims = grid.dims; // Copy [i32;3] — captured by the parallel closures so they don't borrow `grid`.
+    // Rasterize triangles into voxels IN PARALLEL: the 13-axis SAT overlap test + the per-voxel albedo sample
+    // is the hot path and is independent per triangle, so fan it across all cores with rayon. Each triangle
+    // returns its solid (cell-index, albedo) list; the lists are merged below in triangle order so the
+    // original "first triangle to claim a cell keeps its albedo" rule still holds deterministically — parallel
+    // writes into the shared grid couldn't preserve that ordering (and would race), so we don't try.
+    let per_tri: Vec<Vec<(usize, [u8; 4])>> = mesh
+        .triangles
+        .par_iter()
+        .map(|t| {
+            // Triangle voxel-AABB (clamped to the grid), expanded by ONE cell each side BEFORE clamping. A
+            // triangle lying exactly on a voxel boundary floors to the cell on the +side of its plane, and
+            // `tri_box_overlap`'s plane test then rejects that cell (the plane only TOUCHES its min face) —
+            // silently dropping every grid-aligned face (floors/walls/ceilings → holes, fatal for a GI
+            // reference). The ±1 pad keeps the candidate range conservative so the truly-overlapping cell is
+            // always tested; the SAT still rejects genuine non-overlaps, so no spurious voxels are added.
+            let mut tlo = [i32::MAX; 3];
+            let mut thi = [i32::MIN; 3];
+            for v in &t.p {
+                for a in 0..3 {
+                    let c = ((v[a] - origin[a]) / voxel_size).floor() as i32;
+                    tlo[a] = tlo[a].min(c);
+                    thi[a] = thi[a].max(c);
+                }
             }
-        }
-        for a in 0..3 {
-            // Expand the candidate AABB by ONE cell each side BEFORE clamping. A triangle lying exactly on a
-            // voxel boundary floors to the cell on the +side of its plane, and `tri_box_overlap`'s plane test
-            // then rejects that cell (the plane only TOUCHES its min face) — silently dropping every
-            // grid-aligned face (floors/walls/ceilings → holes, fatal for a GI reference). The ±1 pad makes the
-            // candidate range conservative so the truly-overlapping cell is always tested; the SAT still
-            // rejects genuine non-overlaps, so no spurious voxels are added.
-            tlo[a] = (tlo[a] - 1).clamp(0, grid.dims[a] - 1);
-            thi[a] = (thi[a] + 1).clamp(0, grid.dims[a] - 1);
-        }
-        for z in tlo[2]..=thi[2] {
-            for y in tlo[1]..=thi[1] {
-                for x in tlo[0]..=thi[0] {
-                    let center = [
-                        origin[0] + (x as f32 + 0.5) * voxel_size,
-                        origin[1] + (y as f32 + 0.5) * voxel_size,
-                        origin[2] + (z as f32 + 0.5) * voxel_size,
-                    ];
-                    if tri_box_overlap(center, half, &t.p) {
-                        let i = grid.idx(x, y, z);
-                        if !grid.solid[i] {
-                            grid.solid[i] = true;
-                            grid.albedo[i] = sample_albedo(mesh, t, center);
+            for a in 0..3 {
+                tlo[a] = (tlo[a] - 1).clamp(0, dims[a] - 1);
+                thi[a] = (thi[a] + 1).clamp(0, dims[a] - 1);
+            }
+            let mut cells = Vec::new();
+            for z in tlo[2]..=thi[2] {
+                for y in tlo[1]..=thi[1] {
+                    for x in tlo[0]..=thi[0] {
+                        let center = [
+                            origin[0] + (x as f32 + 0.5) * voxel_size,
+                            origin[1] + (y as f32 + 0.5) * voxel_size,
+                            origin[2] + (z as f32 + 0.5) * voxel_size,
+                        ];
+                        if tri_box_overlap(center, half, &t.p) {
+                            let i = (x + y * dims[0] + z * dims[0] * dims[1]) as usize;
+                            cells.push((i, sample_albedo(mesh, t, center)));
                         }
                     }
                 }
+            }
+            cells
+        })
+        .collect();
+    // First-writer-wins merge in triangle order (matches the original single-threaded semantics).
+    for cells in &per_tri {
+        for &(i, albedo) in cells {
+            if !grid.solid[i] {
+                grid.solid[i] = true;
+                grid.albedo[i] = albedo;
             }
         }
     }
