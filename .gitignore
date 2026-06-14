@@ -44,6 +44,9 @@ imgui.ini
 # large glTF + textures (~50 MB), re-fetched on demand by the example. Only the baked
 # assets/models/*.vox artifacts are committed, not their multi-MB source.
 /assets/models/src/
+# Bistro @0.05m bakes to a 1.4 GB .vox (354M voxels at 4 bytes/voxel) — too big to commit until the
+# .vxo paletted+zstd format (#130) compresses it (~tens of MB). Re-bake locally; the Gallery skips it if absent.
+/assets/models/bistro.vox
 
 # Stray rustc scratch output + session workflow scripts (per-machine, regenerable).
 rust_out.exe
