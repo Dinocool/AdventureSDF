@@ -77,11 +77,12 @@ pub fn sync_orbit_camera_transform(world: &mut World) {
 pub struct SdfCameraMode {
     /// True = free-fly (FPS) camera; false = orbit camera.
     pub fps: bool,
-    /// True = PLAYER mode: a 3rd-person controlled player capsule walks the terrain colliders and the
-    /// `SdfCamera` follows it (overrides orbit/fps while on). See `sdf_render::player`.
+    /// True = PLAYER mode: a FIRST-person walker drives the `SdfCamera` as the player's eyes (overrides
+    /// orbit/fps while on). Cornell walks the cuboid colliders; worldgen follows the analytic terrain
+    /// surface (heightmap, no colliders) for a true sense of scale. See `voxel::physics::walk_player`.
     pub player: bool,
     /// Free-fly yaw/pitch (radians). Seeded from the orbit camera on each toggle so the
-    /// view doesn't jump. Reused as the PLAYER's look yaw/pitch (the 3rd-person orbit).
+    /// view doesn't jump. (The PLAYER walker keeps its own look yaw/pitch in `VoxelWalk`.)
     pub yaw: f32,
     pub pitch: f32,
     /// Movement speed in world units/second (adjustable with the mouse wheel in FPS).
