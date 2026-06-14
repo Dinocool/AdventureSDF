@@ -211,6 +211,26 @@ impl BlockRegistry {
         Self { blocks, mat_to_block: FxHashMap::default() }
     }
 
+    /// An AIR-only registry — just the AIR block (id 0), no solid blocks. The empty starting point the GALLERY
+    /// merge ([`super::gallery::load_gallery`]) extends one scene's palette at a time onto via
+    /// [`extend_blocks_from`](Self::extend_blocks_from). No worldgen-material bridge (a merged static scene has
+    /// no [`TerrainMatId`] chain). Equivalent to [`from_vox_palette`](Self::from_vox_palette)`(&[])` but named
+    /// for intent.
+    pub fn air_only() -> Self {
+        Self { blocks: vec![BlockDef::air()], mat_to_block: FxHashMap::default() }
+    }
+
+    /// APPEND every SOLID block of `other` (its blocks `1..`, i.e. excluding AIR) onto `self`, preserving each
+    /// block's full appearance (colour, roughness, metal, emissive, tintable). The SSOT for the GALLERY palette
+    /// concat: with `palette_base = self.len()` BEFORE the call, `other`'s first solid block (local
+    /// [`BlockId`] `1`) is appended at merged index `palette_base`, so after this call `other`'s local block
+    /// `b` (`b >= 1`) is `self`'s block at merged id `palette_base - 1 + b`. AIR is shared (block 0) and never
+    /// duplicated. The caller is responsible for keeping the total `<= u16::MAX` (a [`BlockId`] is a `u16`).
+    pub fn extend_blocks_from(&mut self, other: &BlockRegistry) {
+        // Skip `other`'s AIR (index 0); append its solid blocks verbatim so colours/materials are preserved.
+        self.blocks.extend(other.blocks.iter().skip(1).cloned());
+    }
+
     /// The block a worldgen [`TerrainMatId`] maps to (the single bridge). An unknown id (e.g. a library
     /// that grew after the registry was built) maps to AIR — a robust default that simply leaves that
     /// voxel empty rather than indexing out of range.

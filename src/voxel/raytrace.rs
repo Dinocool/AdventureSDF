@@ -43,6 +43,7 @@ use bevy::core_pipeline::prepass::ViewPrepassTextures;
 
 use super::brickmap::BrickMap;
 use super::cornell::{build_cornell, build_cornell_with_edits};
+use super::gallery::{GALLERY_SCENES, load_gallery};
 use super::edits::{VoxelEdits, VoxelHit, pick_voxel};
 use super::gpu::{GpuAliasEntry, GpuBrickAabb, GpuBrickPatch, GpuVoxelLight, pack_brickmap, pack_resident_set};
 use super::palette::{BlockId, BlockRegistry, CornellBlock};
@@ -110,6 +111,17 @@ pub struct VoxelRtStreaming {
     /// the drain: calling `StaticVoxSource::new` in the per-frame sourcing block rebuilt the entire pyramid
     /// every streaming frame — the Sponza load-lag root cause. `None` off Sponza (freed on a switch away).
     sponza_source: Option<StaticVoxSource>,
+    /// Cache of the merged GALLERY scene `(BrickMap, BlockRegistry)` — the [`super::gallery::GALLERY_SCENES`]
+    /// row loaded + merged ONCE the first time the Gallery is selected, then kept (loading + merging several
+    /// `.vox` is not free, so we never re-merge per frame — mirrors [`sponza`](Self::sponza)). `None` until the
+    /// first Gallery switch; absent assets are skipped during the merge (never a load FAILURE, so this is
+    /// `Some` with whatever scenes existed — possibly an empty map if none were baked).
+    gallery: Option<(BrickMap, BlockRegistry)>,
+    /// The Gallery's [`StaticVoxSource`] — its MIP PYRAMID over the MERGED multi-scene map, built ONCE on the
+    /// Gallery switch and reused every frame (NOT per-frame in the drain — the same build-once rule as
+    /// [`sponza_source`](Self::sponza_source), so the merged row never re-downsamples per streaming frame).
+    /// `None` off Gallery (freed on a switch away).
+    gallery_source: Option<StaticVoxSource>,
     /// Which scene the last packed patch was built for. `None` until the first pack; on a scene switch this
     /// differs from the live [`VoxelScene`], triggering a one-shot re-pack of the new scene.
     packed_scene: Option<VoxelScene>,
@@ -264,6 +276,8 @@ fn init_voxel_rt_streaming(
         cornell_registry: BlockRegistry::cornell(),
         sponza: None,
         sponza_source: None,
+        gallery: None,
+        gallery_source: None,
         packed_scene: None,
         packed_edit_gen: None,
         worldgen_dirty_pending: false,
@@ -346,33 +360,54 @@ fn stream_voxel_rt_residency(
                 ),
             }
         }
-        // A Sponza switch with NO loaded map (the asset is missing): pack a static Cornell box this frame so
-        // the engine still renders + never panics, latch packed_scene = Sponza (so we don't re-pack every
-        // frame), and bail out of the streaming path for this scene until the asset exists / the scene changes.
-        if matches!(*scene, VoxelScene::Sponza) && streaming.sponza.is_none() {
+        // On the Gallery switch, load + MERGE the data-driven scene row ONCE + cache it (mirrors the Sponza
+        // `.vox` cache). `load_gallery` never FAILS — absent assets are skipped with a warn — so this is always
+        // `Some`; an empty merged map (no scene baked) is treated as "nothing to stream" below, exactly like a
+        // missing Sponza asset (Cornell fallback), so the engine still renders + never panics.
+        if matches!(*scene, VoxelScene::Gallery) && streaming.gallery.is_none() {
+            streaming.gallery = Some(load_gallery(GALLERY_SCENES));
+        }
+        // A static `.vox`-backed scene whose merged/loaded map is MISSING or EMPTY (the asset(s) aren't baked):
+        // pack a static Cornell box this frame so the engine still renders + never panics, latch
+        // packed_scene = *scene (so we don't re-pack every frame), and bail out of the streaming path for this
+        // scene until the asset exists / the scene changes. Sponza: `sponza == None` (load failed). Gallery:
+        // the merge produced an empty map (no rows loaded).
+        let static_map_missing = match *scene {
+            VoxelScene::Sponza => streaming.sponza.is_none(),
+            VoxelScene::Gallery => streaming.gallery.as_ref().is_none_or(|(map, _)| map.is_empty()),
+            _ => false,
+        };
+        if static_map_missing {
             let map = build_cornell_with_edits(&streaming.cornell_registry, &edits);
             let patch = pack_brickmap(&map, &streaming.cornell_registry);
             patch_res.patch = patch;
             patch_res.generation = patch_res.generation.wrapping_add(1);
             lighting.data = LightingUniformData::cornell();
             sky.data = SkyUniformData::default();
-            streaming.packed_scene = Some(VoxelScene::Sponza);
+            streaming.packed_scene = Some(*scene);
             streaming.packed_edit_gen = Some(edits.generation());
             return;
         }
 
-        // Fresh residency for the new streamed scene (worldgen surface or the loaded Sponza map).
+        // Fresh residency for the new streamed scene (worldgen surface, the loaded Sponza map, or the merged
+        // Gallery map).
         streaming.manager = ResidencyManager::new();
         streaming.last_cam_brick = None;
         streaming.worldgen_dirty_pending = false;
         streaming.worldgen_frames_since_pack = 0;
         streaming.packed_edit_gen = Some(edits.generation());
         streaming.packed_scene = Some(*scene);
-        // Build the Sponza source's mip PYRAMID ONCE here, on the switch — NOT per-frame in the drain below
-        // (that rebuilt the whole-building downsample every streaming frame: the load-lag root cause). It is
-        // owned, so it lives in the resource across frames; worldgen / a switch away from Sponza frees it.
+        // Build the static scene's mip PYRAMID ONCE here, on the switch — NOT per-frame in the drain below
+        // (that rebuilt the whole-building/whole-row downsample every streaming frame: the load-lag root
+        // cause). It is owned, so it lives in the resource across frames; worldgen / a switch away frees it.
+        // Each static scene gets its own source field (mutually exclusive — only the live scene's is Some).
         streaming.sponza_source = if matches!(*scene, VoxelScene::Sponza) {
             streaming.sponza.as_ref().map(|(map, _)| StaticVoxSource::new(map))
+        } else {
+            None
+        };
+        streaming.gallery_source = if matches!(*scene, VoxelScene::Gallery) {
+            streaming.gallery.as_ref().map(|(map, _)| StaticVoxSource::new(map))
         } else {
             None
         };
@@ -382,6 +417,14 @@ fn stream_voxel_rt_residency(
                 sky.data = SkyUniformData::sponza();
                 info!("voxel-RT: switched to SPONZA scene — streaming the baked .vox through the clipmap");
             }
+            VoxelScene::Gallery => {
+                // The gallery is a row of baked scenes (Sponza et al.) under the same open-sky GI preset Sponza
+                // uses — the row is a GI/LOD COMPARISON, so all scenes share one lighting/sky so differences read
+                // as scene-geometry, not lighting. Knobs-as-uniforms; the editor overrides afterward.
+                lighting.data = LightingUniformData::sponza();
+                sky.data = SkyUniformData::sponza();
+                info!("voxel-RT: switched to GALLERY scene — streaming the MERGED multi-.vox row through the clipmap");
+            }
             _ => {
                 lighting.data = LightingUniformData::worldgen();
                 sky.data = SkyUniformData::worldgen();
@@ -390,14 +433,19 @@ fn stream_voxel_rt_residency(
         }
     }
 
-    // LATCHED missing-Sponza guard (never-panic invariant): on the SWITCH frame the block above packs the
-    // Cornell fallback + latches `packed_scene = Sponza` + returns — but on EVERY subsequent frame that switch
+    // LATCHED missing-static-asset guard (never-panic invariant): on the SWITCH frame the block above packs the
+    // Cornell fallback + latches `packed_scene = *scene` + returns — but on EVERY subsequent frame that switch
     // block is skipped (`packed_scene == *scene`), so without this guard execution would fall through to the
-    // Sponza streaming arm below and hit `sponza.expect(...)` with `sponza == None` → panic. When Sponza is
-    // selected but its `.vox` never loaded (the asset is absent), there is nothing to stream: the Cornell
-    // fallback is already packed and stays valid, so just bail every frame until the asset exists / the scene
-    // changes. Worldgen is unaffected (it has no `sponza` dependency).
-    if matches!(*scene, VoxelScene::Sponza) && streaming.sponza.is_none() {
+    // static streaming arm below and hit `.expect(...)` on a `None` source → panic. When a `.vox`-backed scene
+    // is selected but its map never loaded / merged empty (the asset(s) are absent), there is nothing to
+    // stream: the Cornell fallback is already packed and stays valid, so just bail every frame until the asset
+    // exists / the scene changes. Worldgen is unaffected (it has no static-map dependency).
+    let static_map_missing = match *scene {
+        VoxelScene::Sponza => streaming.sponza.is_none(),
+        VoxelScene::Gallery => streaming.gallery.as_ref().is_none_or(|(map, _)| map.is_empty()),
+        _ => false,
+    };
+    if static_map_missing {
         return;
     }
 
@@ -454,11 +502,15 @@ fn stream_voxel_rt_residency(
         seed,
         sponza,
         sponza_source,
+        gallery,
+        gallery_source,
         worldgen_dirty_pending,
         worldgen_frames_since_pack,
         ..
     } = &mut *streaming;
-    // The registry whose palette this scene's bricks index (so drain + pack agree on it).
+    // The registry whose palette this scene's bricks index (so drain + pack agree on it). Each static scene
+    // indexes its OWN `.vox`-derived palette (Sponza's loaded one, or the Gallery's CONCATENATED merged one),
+    // never the worldgen registry, or the colours would be wrong.
     let active_registry: &BlockRegistry = match scene_now {
         VoxelScene::Sponza => {
             // Map + palette + the prebuilt source are ready by here (the source's pyramid was built ONCE on the
@@ -466,6 +518,15 @@ fn stream_voxel_rt_residency(
             // pyramid per frame (that was the load-lag root cause).
             let (_, vox_registry) = sponza.as_ref().expect("sponza map loaded before streaming");
             let source = sponza_source.as_ref().expect("sponza source built on the switch");
+            manager.drain_work_from(cfg, source, vox_registry, &edits);
+            vox_registry
+        }
+        VoxelScene::Gallery => {
+            // The MERGED multi-scene map + its concatenated registry + the prebuilt source are ready by here
+            // (the source's pyramid over the whole row was built ONCE on the switch; the empty-merge case
+            // returned above). Reuse the CACHED source — never re-merge / re-downsample per frame.
+            let (_, vox_registry) = gallery.as_ref().expect("gallery map merged before streaming");
+            let source = gallery_source.as_ref().expect("gallery source built on the switch");
             manager.drain_work_from(cfg, source, vox_registry, &edits);
             vox_registry
         }
@@ -3407,6 +3468,8 @@ mod tests {
             cornell_registry: BlockRegistry::cornell(),
             sponza: None, // the missing-asset case: never loaded
             sponza_source: None,
+            gallery: None,
+            gallery_source: None,
             packed_scene: Some(VoxelScene::Sponza), // already latched on the switch frame
             packed_edit_gen: Some(0),
             worldgen_dirty_pending: false,

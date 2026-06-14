@@ -200,6 +200,12 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg",
 # overlap test + per-voxel albedo sample is embarrassingly parallel over triangles, so we fan it across all
 # cores. DEV-only — the shipped runtime `.vox` loader does no voxelization.
 rayon = "1"
+# OBJ + MTL loader for the offline voxelizer (`examples/voxelize_scene.rs`): load classic OBJ scenes
+# (Sibenik, San Miguel, the OBJ Sponza variants) into the SAME `Mesh` the glTF path builds, picked by file
+# extension. `tobj` reads positions/indices/UVs + the `.mtl` material (diffuse `Kd` base colour + `map_Kd`
+# diffuse-texture path, which we decode with the dev `image` crate). DEV-only — the runtime `.vox` loader
+# never parses OBJ. (FBX, e.g. the Lumberyard Bistro, is NOT handled — convert it to glTF/OBJ externally.)
+tobj = "4"
 
 [profile.dev]
 opt-level = 1

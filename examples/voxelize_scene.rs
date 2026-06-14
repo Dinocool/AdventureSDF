@@ -6,10 +6,14 @@
 //! the runtime reads only the baked `.vox` via `dot_vox`.
 //!
 //! PIPELINE
-//! 1. Load `assets/models/src/Sponza.gltf` with `gltf` (positions + indices + UV0 + the base-colour texture
-//!    per primitive, textures decoded by `gltf`'s `image` feature). If that asset is absent, fall back to a
-//!    small procedural coloured box room so the pipeline + downstream test still build + run (and print a
-//!    clear "drop in real Sponza" notice).
+//! 1. Load a classic mesh scene into a [`Mesh`] (positions + indices + UV0 + per-primitive base colour /
+//!    texture), picked by FILE EXTENSION — `.gltf`/`.glb` via `gltf` (textures decoded by `gltf`'s `image`
+//!    feature; the default `assets/models/src/Sponza.gltf`), or `.obj` via `tobj` (positions/indices/UVs + the
+//!    companion `.mtl` diffuse `Kd` base colour and `map_Kd` diffuse texture, decoded with `image`) — so
+//!    classic OBJ scenes (Sibenik, San Miguel, OBJ Sponza variants) load into the SAME `Mesh` the glTF path
+//!    builds and the rest of the pipeline is unchanged. FBX (e.g. the Lumberyard Bistro) is NOT handled —
+//!    convert it to glTF/OBJ externally first. If the asset is absent, fall back to a small procedural coloured
+//!    box room so the pipeline + downstream test still build + run (and print a clear "drop in a real" notice).
 //! 2. SURFACE-voxelize into a dense grid at `VOXEL_SIZE` (0.2 m) over the mesh AABB: each triangle is
 //!    conservatively rasterized (triangle–box overlap, the Akenine-Möller SAT) into every voxel it touches,
 //!    marking it SOLID. Each solid voxel's albedo is the base-colour texture sampled at the
@@ -21,7 +25,8 @@
 //!    exceeds 256 on any axis it is SPLIT into a grid of ≤256³ sub-models, each placed by a scene-graph
 //!    Transform (the model CENTER convention), reassembling into one contiguous scene at load.
 //!
-//! RUN: `cargo run --example voxelize_scene` (optionally `-- <out.vox> <voxel_metres>`).
+//! RUN: `cargo run --example voxelize_scene` (optionally `-- <out.vox> <voxel_metres> <in_mesh>`), e.g.
+//! `cargo run --example voxelize_scene -- assets/models/sibenik.vox 0.2 assets/models/src/sibenik.obj`.
 //!
 //! NOTE on colour space: glTF base-colour textures/factors are sRGB; MagicaVoxel `.vox` palettes are also
 //! sRGB `u8`. So this tool keeps everything in sRGB `u8` end-to-end (no linearization here) — the RUNTIME
@@ -48,21 +53,11 @@ fn main() -> anyhow::Result<()> {
     let mut args = std::env::args().skip(1);
     let out_path = args.next().map(PathBuf::from).unwrap_or_else(|| PathBuf::from("assets/models/sponza.vox"));
     let voxel_size: f32 = args.next().and_then(|s| s.parse().ok()).unwrap_or(DEFAULT_VOXEL_SIZE);
+    // The input mesh path: an explicit 3rd arg, else the default Sponza glTF. Picked by extension (glTF / OBJ).
+    let in_path = args.next().map(PathBuf::from).unwrap_or_else(|| PathBuf::from("assets/models/src/Sponza.gltf"));
 
-    // 1. Load the mesh (Sponza glTF, or a procedural fallback room).
-    let gltf_path = Path::new("assets/models/src/Sponza.gltf");
-    let mesh = if gltf_path.exists() {
-        println!("loading Sponza glTF: {}", gltf_path.display());
-        load_gltf(gltf_path)?
-    } else {
-        println!(
-            "NOTE: {} not found — using the PROCEDURAL FALLBACK box room. Drop the real Khronos \
-             glTF-Sample-Assets Sponza into assets/models/src/ (Sponza.gltf + Sponza.bin + textures) and \
-             re-run to bake the real scene.",
-            gltf_path.display()
-        );
-        fallback_room()
-    };
+    // 1. Load the mesh, dispatching on file extension (glTF / OBJ); a procedural fallback room when absent.
+    let mesh = load_mesh(&in_path)?;
     println!("mesh: {} triangles, {} textures", mesh.triangles.len(), mesh.textures.len());
 
     // 2. Surface-voxelize (rayon-parallel rasterization; the dominant cost at fine voxel sizes — timed so a
@@ -152,6 +147,47 @@ struct Triangle {
 struct Mesh {
     triangles: Vec<Triangle>,
     textures: Vec<Texture>,
+}
+
+// ============================================================================================
+// Mesh loading — dispatch by file extension (glTF / OBJ), with a procedural fallback
+// ============================================================================================
+
+/// Load the input mesh, picking the loader by FILE EXTENSION: `.gltf`/`.glb` → [`load_gltf`], `.obj` →
+/// [`load_obj`]. The rest of the pipeline (voxelize + solid_fill + palette + `.vox` write) is identical
+/// regardless of source — both loaders build the SAME [`Mesh`] (world-space triangle soup + textures). An
+/// ABSENT file (or an unrecognized extension) falls back to the procedural box room so the pipeline + the
+/// round-trip test still build + run end-to-end (with a clear "drop in a real scene" notice). FBX is NOT
+/// handled — convert it to glTF/OBJ externally first (e.g. the Lumberyard Bistro ships as FBX).
+fn load_mesh(path: &Path) -> anyhow::Result<Mesh> {
+    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
+    if !path.exists() {
+        println!(
+            "NOTE: {} not found — using the PROCEDURAL FALLBACK box room. Drop a real classic scene into \
+             assets/models/src/ (glTF: .gltf + .bin + textures; OBJ: .obj + .mtl + textures) and re-run \
+             (pass the path as the 3rd CLI arg) to bake it.",
+            path.display()
+        );
+        return Ok(fallback_room());
+    }
+    match ext.as_str() {
+        "gltf" | "glb" => {
+            println!("loading glTF: {}", path.display());
+            load_gltf(path)
+        }
+        "obj" => {
+            println!("loading OBJ: {}", path.display());
+            load_obj(path)
+        }
+        "fbx" => Err(anyhow::anyhow!(
+            "FBX ({}) is not supported — convert it to glTF or OBJ externally first (e.g. Blender import→export)",
+            path.display()
+        )),
+        other => Err(anyhow::anyhow!(
+            "unrecognized mesh extension '.{other}' for {} — use .gltf/.glb or .obj",
+            path.display()
+        )),
+    }
 }
 
 // ============================================================================================
@@ -315,6 +351,105 @@ fn decode_image(img: &gltf::image::Data) -> Texture {
         _ => return Texture { width: 0, height: 0, rgba: Vec::new() },
     }
     Texture { width: w, height: h, rgba }
+}
+
+// ============================================================================================
+// OBJ loading (+ MTL base colours / diffuse textures)
+// ============================================================================================
+
+/// Load a Wavefront `.obj` (+ its companion `.mtl`) into the SAME [`Mesh`] the glTF path builds: every face's
+/// world-space positions + UV0, with each material's diffuse `Kd` base colour and `map_Kd` diffuse texture
+/// (decoded with `image`, relative to the OBJ's directory). OBJ has NO scene-node transform hierarchy —
+/// positions are already world-space — so unlike glTF there's no matrix to bake (the loader uses them
+/// verbatim). `tobj` is asked to TRIANGULATE (so quads/n-gons become triangles) and use a SINGLE index
+/// (positions/texcoords share one index buffer, matching how we read them). A texture that fails to decode
+/// (missing / unsupported) falls back to the material's flat `Kd` colour, so a partially-textured scene still
+/// bakes. The downstream pipeline (voxelize + solid_fill + palette + `.vox` write) is identical to glTF.
+fn load_obj(path: &Path) -> anyhow::Result<Mesh> {
+    let load_opts = tobj::LoadOptions { triangulate: true, single_index: true, ..Default::default() };
+    let (models, materials) = tobj::load_obj(path, &load_opts)
+        .map_err(|e| anyhow::anyhow!("obj: load {}: {e}", path.display()))?;
+    // Materials may fail to load (a missing `.mtl`) without failing the OBJ — treat that as "no materials"
+    // (every face then falls back to a neutral base colour). The OBJ's directory anchors relative texture paths.
+    let materials = materials.unwrap_or_default();
+    let base_dir = path.parent().unwrap_or_else(|| Path::new("."));
+
+    // Decode each material's diffuse texture once (indexed parallel to `materials`); `None` if it has no
+    // `map_Kd` or the file can't be decoded (then the flat `Kd` colour is used). Same `Texture` the glTF path
+    // produces, so `sample_albedo` is shared verbatim.
+    let textures: Vec<Option<Texture>> = materials
+        .iter()
+        .map(|m| {
+            m.diffuse_texture.as_ref().and_then(|rel| {
+                let tex_path = base_dir.join(rel);
+                match image::open(&tex_path) {
+                    Ok(img) => {
+                        let rgba = img.to_rgba8();
+                        let (w, h) = rgba.dimensions();
+                        Some(Texture { width: w, height: h, rgba: rgba.into_raw() })
+                    }
+                    Err(e) => {
+                        eprintln!("  obj: texture {} failed to decode ({e}) — using flat Kd", tex_path.display());
+                        None
+                    }
+                }
+            })
+        })
+        .collect();
+    // Flatten the decoded textures into the `Mesh.textures` vec, remembering each material's texture index (so
+    // a triangle can reference it). `mat_tex_index[mi]` is `Some(slot)` iff material `mi` has a decoded texture.
+    let mut mesh_textures: Vec<Texture> = Vec::new();
+    let mut mat_tex_index: Vec<Option<usize>> = Vec::with_capacity(materials.len());
+    for tex in textures {
+        match tex {
+            Some(t) => {
+                mat_tex_index.push(Some(mesh_textures.len()));
+                mesh_textures.push(t);
+            }
+            None => mat_tex_index.push(None),
+        }
+    }
+    // Each material's flat sRGB base colour from its diffuse `Kd` (0..1 f64 → 0..255 u8), defaulting to neutral
+    // grey for an untextured/material-less face.
+    let mat_base = |mi: Option<usize>| -> [u8; 4] {
+        let kd = mi.and_then(|i| materials.get(i)).and_then(|m| m.diffuse).unwrap_or([0.7, 0.7, 0.7]);
+        [
+            (kd[0].clamp(0.0, 1.0) * 255.0) as u8,
+            (kd[1].clamp(0.0, 1.0) * 255.0) as u8,
+            (kd[2].clamp(0.0, 1.0) * 255.0) as u8,
+            255,
+        ]
+    };
+
+    let mut triangles = Vec::new();
+    for model in &models {
+        let m = &model.mesh;
+        let mi = m.material_id;
+        let base = mat_base(mi);
+        // The decoded texture slot for this model's material (if any).
+        let texture = mi.and_then(|i| mat_tex_index.get(i).copied().flatten());
+        let has_uv = !m.texcoords.is_empty();
+        // single_index: positions (xyz) + texcoords (uv) are parallel arrays indexed by `indices` (triangulated
+        // ⇒ chunks of 3). A vertex `v`'s position is positions[3v..3v+3]; its UV is texcoords[2v..2v+2].
+        for tri in m.indices.chunks_exact(3) {
+            let mut p = [[0.0f32; 3]; 3];
+            let mut uv = [[0.0f32; 2]; 3];
+            for (k, &vi) in tri.iter().enumerate() {
+                let vi = vi as usize;
+                if 3 * vi + 2 >= m.positions.len() {
+                    continue;
+                }
+                p[k] = [m.positions[3 * vi], m.positions[3 * vi + 1], m.positions[3 * vi + 2]];
+                if has_uv && 2 * vi + 1 < m.texcoords.len() {
+                    // OBJ's V origin is bottom-left; our `Texture::sample` wraps so this matches the glTF path's
+                    // top-left convention after the flip (1 − v).
+                    uv[k] = [m.texcoords[2 * vi], 1.0 - m.texcoords[2 * vi + 1]];
+                }
+            }
+            triangles.push(Triangle { p, uv, texture, base });
+        }
+    }
+    Ok(Mesh { triangles, textures: mesh_textures })
 }
 
 /// A procedural fallback: a coloured box room (floor + 4 walls + ceiling), each face a distinct flat colour,
@@ -1058,5 +1193,39 @@ mod tests {
         let o = open.idx(2, 2, 2);
         solid_fill(&mut open);
         assert!(!open.solid[o], "open shell: a cavity reachable from outside stays air");
+    }
+
+    /// OBJ loading: a tiny synthetic `.obj` (one coloured quad, two triangles, no `.mtl`) loads through the
+    /// SAME `load_obj` → `Mesh` → `voxelize` pipeline the glTF path uses. Proves the extension-dispatched OBJ
+    /// loader builds a real `Mesh` (world-space positions verbatim, no node transform) the rest of the
+    /// pipeline voxelizes — the OBJ half of the new dual-format loader, exercised end-to-end on an in-repo
+    /// asset. The quad has no material, so each face takes the neutral-grey `Kd` fallback (an untextured OBJ
+    /// still bakes).
+    #[test]
+    fn obj_loader_voxelizes_a_synthetic_quad() {
+        // A 4×4 m floor quad at y=0 in the XZ plane (two CCW triangles), no usemtl / no .mtl companion.
+        let obj = "\
+o quad
+v -2.0 0.0 -2.0
+v  2.0 0.0 -2.0
+v  2.0 0.0  2.0
+v -2.0 0.0  2.0
+f 1 2 3
+f 1 3 4
+";
+        let dir = std::env::temp_dir();
+        let file = dir.join(format!("voxelize_obj_test_{}.obj", std::process::id()));
+        std::fs::write(&file, obj).expect("write temp .obj");
+        let mesh = load_obj(&file).expect("load_obj must parse the synthetic quad");
+        let _ = std::fs::remove_file(&file);
+
+        // Two triangles, no textures, every face the neutral-grey Kd fallback (no material in the OBJ).
+        assert_eq!(mesh.triangles.len(), 2, "the quad triangulates to two triangles");
+        assert!(mesh.textures.is_empty(), "an untextured OBJ has no decoded textures");
+        assert_eq!(mesh.triangles[0].base, [178, 178, 178, 255], "untextured face takes the neutral Kd fallback");
+
+        // The same downstream voxelizer the glTF/fallback path uses produces a non-empty surface grid.
+        let grid = voxelize(&mesh, 0.5);
+        assert!(grid.solid_count() > 0, "the OBJ quad voxelizes to a non-empty surface");
     }
 }

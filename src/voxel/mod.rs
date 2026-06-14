@@ -22,6 +22,7 @@
 pub mod brickmap;
 pub mod cornell;
 pub mod edits;
+pub mod gallery;
 pub mod gpu;
 pub mod palette;
 /// Stage 6 — voxel physics (the player walks the cubes). Feature-gated on `physics` (pulls `rapier3d`).
@@ -84,6 +85,14 @@ pub enum VoxelScene {
     /// the floor + coloured drapes under a raking sun).
     #[default]
     Sponza,
+    /// Several baked `.vox` scenes placed SIDE BY SIDE in one world for a GI / LOD comparison row (the
+    /// pre-instancing MERGE — see [`gallery`]). On the switch in, the DATA-DRIVEN [`gallery::GALLERY_SCENES`]
+    /// list is loaded + merged ONCE into a single [`BrickMap`] + [`BlockRegistry`] (each scene shifted into a
+    /// non-overlapping region, palettes concatenated) and cached; that merged map then STREAMS through the
+    /// IDENTICAL [`source::StaticVoxSource`] + clipmap residency Sponza uses (source built ONCE on the switch,
+    /// never per frame). Starts as just Sponza but is trivially extensible — add a `GalleryEntry` row per baked
+    /// classic (Sibenik / San Miguel / …); absent assets are skipped with a `warn!` (never a panic).
+    Gallery,
 }
 
 impl VoxelScene {
@@ -102,14 +111,16 @@ impl VoxelScene {
         matches!(self, VoxelScene::Worldgen)
     }
 
-    /// The next scene in the **`V`**-key cycle: Sponza → Cornell → Worldgen → Sponza. The SSOT for the cycle
-    /// order, shared by the keyboard toggle and (for parity) any other caller that wants "advance the scene".
+    /// The next scene in the **`V`**-key cycle: Sponza → Cornell → Worldgen → Gallery → Sponza. The SSOT for the
+    /// cycle order, shared by the keyboard toggle and (for parity) any other caller that wants "advance the
+    /// scene".
     #[inline]
     pub fn next(self) -> Self {
         match self {
             VoxelScene::Sponza => VoxelScene::Cornell,
             VoxelScene::Cornell => VoxelScene::Worldgen,
-            VoxelScene::Worldgen => VoxelScene::Sponza,
+            VoxelScene::Worldgen => VoxelScene::Gallery,
+            VoxelScene::Gallery => VoxelScene::Sponza,
         }
     }
 }
@@ -382,6 +393,26 @@ fn reframe_camera_on_patch(
             // clutter and takes in the receding 122 m hall, a hair off the X/Z centreline so the colonnade on
             // both sides frames the nave. Well inside the clipmap's inner LOD0 cube (centred on the eye).
             let eye = Vec3::new(-52.0, 9.0, 1.0);
+            let forward = Vec3::new(
+                mode.yaw.cos() * mode.pitch.cos(),
+                mode.pitch.sin(),
+                mode.yaw.sin() * mode.pitch.cos(),
+            )
+            .normalize_or_zero();
+            *tf = Transform::from_translation(eye).looking_at(eye + forward, Vec3::Y);
+            orbit.target = eye + forward * orbit.distance; // sensible if the user toggles to orbit
+        }
+        VoxelScene::Gallery => {
+            // The Gallery is a ROW of scenes laid out side by side along +X (the merge auto-spaces them past the
+            // first scene, which is anchored at the world origin like standalone Sponza). The right interaction
+            // is the FREE-FLY (FPS) camera so the user can fly DOWN the row comparing GI/LOD on each scene. Seed
+            // the eye in front of the first scene (near the −X / −Z corner), raised to a vantage height, looking
+            // along +X (and a touch toward +Z) so the row recedes across the view — exactly Sponza's framing but
+            // aimed to take in the aisle of scenes rather than one nave. WASD/Space/Ctrl fly; right-mouse looks.
+            mode.fps = true;
+            mode.yaw = 0.18; // look down the +X row, angled slightly toward the scenes
+            mode.pitch = 0.04; // a touch upward so the tall scenes' upper geometry reads
+            let eye = Vec3::new(-52.0, 12.0, -40.0);
             let forward = Vec3::new(
                 mode.yaw.cos() * mode.pitch.cos(),
                 mode.pitch.sin(),

@@ -25,16 +25,18 @@ struct SceneOption {
     vox_path: Option<&'static str>,
 }
 
-/// The scene-selector table. Cornell + Worldgen are built-in (always available); Sponza is the baked default.
-/// San Miguel + Sibenik are listed but NOT yet baked — their `.vox` files don't exist, so the selector shows
-/// them disabled with a "bake via `cargo run --example voxelize_scene`" tooltip until the asset is produced.
-/// Their `VoxelScene` variants don't exist yet either, so they are omitted from the live enum and surface here
-/// only as a roadmap placeholder (commented) — uncomment + add the variant when baking them.
-fn scene_options() -> [SceneOption; 3] {
+/// The scene-selector table. Cornell + Worldgen are built-in (always available); Sponza is the baked default;
+/// the Gallery is the side-by-side MERGED row (always available — its merge skips any unbaked row with a warn,
+/// so the entry never hard-fails even with nothing baked, falling back to a Cornell box). San Miguel + Sibenik
+/// are listed but NOT yet baked — their `.vox` files don't exist, so the selector shows them disabled with a
+/// "bake via `cargo run --example voxelize_scene`" tooltip until the asset is produced. Their `VoxelScene`
+/// variants don't exist yet either, so they surface in [`UNBAKED_SCENES`] as a roadmap placeholder until baked.
+fn scene_options() -> [SceneOption; 4] {
     [
         SceneOption { label: "Sponza", scene: VoxelScene::Sponza, vox_path: Some(crate::voxel::raytrace::SPONZA_VOX_PATH) },
         SceneOption { label: "Cornell", scene: VoxelScene::Cornell, vox_path: None },
         SceneOption { label: "Worldgen", scene: VoxelScene::Worldgen, vox_path: None },
+        SceneOption { label: "Gallery (side-by-side)", scene: VoxelScene::Gallery, vox_path: None },
     ]
 }
 

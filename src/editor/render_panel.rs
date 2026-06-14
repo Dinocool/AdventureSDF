@@ -92,9 +92,12 @@ pub fn render_gi_panel(world: &mut World, ui: &mut egui::Ui) {
         ui.separator();
         if ui.button(format!("Reset to {scene:?} defaults")).clicked() {
             let keep = d.debug_view;
-            // Scene-aware: restore the preset for the LIVE scene (Sponza/Worldgen/Cornell), not always Cornell.
+            // Scene-aware: restore the preset for the LIVE scene, not always Cornell. The Gallery (a row of
+            // baked scenes) shares Sponza's open-sky GI preset so the comparison reads as geometry, not lighting.
             *d = match scene {
-                crate::voxel::VoxelScene::Sponza => LightingUniformData::sponza(),
+                crate::voxel::VoxelScene::Sponza | crate::voxel::VoxelScene::Gallery => {
+                    LightingUniformData::sponza()
+                }
                 crate::voxel::VoxelScene::Worldgen => LightingUniformData::worldgen(),
                 crate::voxel::VoxelScene::Cornell => LightingUniformData::cornell(),
             };
