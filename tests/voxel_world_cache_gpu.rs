@@ -1833,6 +1833,9 @@ fn run_box_fill(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
     multibounce: bool,
+    // Phase 2.4 SOFT per-frame active-cell cap: 0 = unlimited (the original behaviour). > 0 bounds the
+    // update/blend dispatch to N active cells/frame (the rest stay alive + refresh next frame).
+    max_active_cells_per_frame: u32,
 ) -> Vec<WcQueryOut> {
     let mut reg = BlockRegistry::from_biome_library(&test_library());
     reg.set_emissive(EMITTER, [3.0, 3.0, 3.0]);
@@ -1863,6 +1866,7 @@ fn run_box_fill(
         gi_ray_distance: 40.0,
         cell_lifetime: 8,
         gi_multibounce: u32::from(multibounce),
+        max_active_cells_per_frame,
         ..WorldCacheUniformData::default()
     };
 
@@ -2255,8 +2259,8 @@ fn multibounce_exceeds_single_bounce_and_stays_bounded() {
         return;
     };
 
-    let single = run_box_fill(&device, &queue, false);
-    let multi = run_box_fill(&device, &queue, true);
+    let single = run_box_fill(&device, &queue, false, 0);
+    let multi = run_box_fill(&device, &queue, true, 0);
 
     // The converged (tail-averaged) floor-cell radiance under each gate.
     let conv = |h: &[WcQueryOut]| -> f32 {
@@ -2323,5 +2327,76 @@ fn multibounce_exceeds_single_bounce_and_stays_bounded() {
         multi_conv < 4.0 * CEILING_RADIANCE,
         "multi-bounce floor radiance must stay bounded (≪ a runaway accumulation); got {multi_conv:.4} vs the \
          ceiling radiance {CEILING_RADIANCE:.1}"
+    );
+}
+
+/// **Phase 2.4 SOFT per-frame active-cell cap (issue #123)** — the cap is a STEADY-COST knob, NOT a
+/// correctness one: it must never corrupt the cache. This drives the same closed-box multi-bounce scene
+/// (≫ 64 active floor + lazy-filled wall/ceiling cells) and checks two invariants:
+///   * a TIGHT cap (8 cells/frame, far below the active count) keeps every read-back finite + non-negative +
+///     the tested floor cell occupied EVERY frame — a skipped cell keeps its last radiance/life, it is never
+///     cleared or NaN'd (the "never corrupts the cache" guarantee);
+///   * a cap ≥ the active-cell count is a NO-OP — the clamp `min(count, N)` and the `active_index >= N`
+///     early-out can't bind once N covers everything, so it converges to the SAME value as unlimited (cap 0).
+///     The closed-box update pass uses atomics (lazy-insert + `atomicMax(life)`), so two runs differ by a tiny
+///     GPU-scheduling jitter — we assert the converged tail-average matches within a tolerance (the suite's
+///     convention; bit-identity is not a valid expectation for the atomic multi-bounce path), and crucially
+///     that the generous cap tracks unlimited FAR more tightly than the tight cap does.
+#[test]
+fn active_cell_cap_never_corrupts_and_is_noop_when_generous() {
+    let Some((device, queue)) = common::headless_ray_query_device_with_storage_buffers(16) else {
+        eprintln!("no ray-query device with 16 storage buffers — skipping active-cell-cap test");
+        return;
+    };
+
+    let unlimited = run_box_fill(&device, &queue, true, 0);
+    let tight = run_box_fill(&device, &queue, true, 8);
+    // A cap comfortably above the whole table can never bind (active count ≤ table size).
+    let generous = run_box_fill(&device, &queue, true, TEST_WORLD_CACHE_SIZE);
+
+    // (1) NEVER CORRUPTS: under the tight cap, the tested cell stays occupied + finite + non-negative every
+    // frame. Cells the cap skips keep their prior radiance/life (untouched) — never cleared, never NaN.
+    for h in [&tight, &generous] {
+        for (f, o) in h.iter().enumerate() {
+            assert!(
+                o.radiance.iter().all(|v| v.is_finite() && *v >= 0.0),
+                "capped frame {f}: floor-cell radiance must stay finite + non-negative (the cap must not \
+                 corrupt a skipped cell), got {:?}",
+                o.radiance
+            );
+            assert_ne!(
+                o.checksum, 0,
+                "capped frame {f}: the tested floor cell must remain occupied (the cap never evicts cells)"
+            );
+        }
+    }
+
+    // (2) GENEROUS CAP ≈ UNLIMITED: a cap ≥ the active count never binds (capped = count, window_start = 0), so
+    // the dispatch is IDENTICAL to unlimited — they differ ONLY by run-to-run atomic-scheduling jitter on the
+    // multi-bounce feed-forward path (~2%; bit-identity is not a valid expectation, matching the suite's
+    // ratio/tolerance convention). A tolerance well above that jitter still catches a cap that wrongly binds.
+    let conv = |h: &[WcQueryOut]| -> f32 {
+        let tail = &h[(N_FRAMES as usize - 8)..];
+        tail.iter().map(|o| luma(o.radiance)).sum::<f32>() / tail.len() as f32
+    };
+    let u_conv = conv(&unlimited);
+    let g_conv = conv(&generous);
+    eprintln!("[active-cell-cap] unlimited floor luma={u_conv:.4} | generous-cap luma={g_conv:.4}");
+    let g_rel = (g_conv - u_conv).abs() / u_conv.max(1e-6);
+    assert!(
+        g_rel < 0.06,
+        "a cap ≥ the active count must track unlimited (identical dispatch, atomic jitter only): \
+         unlimited={u_conv:.4} vs generous-cap={g_conv:.4} (rel {g_rel:.4})"
+    );
+
+    // (3) ROTATION SERVICES EVERY CELL (the Phase-2.4 cap FIX): under a TIGHT cap (8 ≪ active count) the
+    // per-frame window ROTATES (`wc_window_start` advances by `capped` each frame), so the tested floor cell —
+    // whatever its fixed compacted index — is serviced within ceil(count/8) frames and lights up to the box
+    // multi-bounce radiance. BEFORE the rotation fix the cap processed the first 8 compacted cells FOREVER, so
+    // this cell stayed 0.0 in every frame (a permanent dark patch). Assert it is lit in ≥ 1 of the N frames.
+    assert!(
+        tight.iter().any(|o| luma(o.radiance) > 0.05),
+        "the rotating soft cap must SERVICE every active cell over time — the tight-capped floor cell never lit \
+         (luma ~0 across all {N_FRAMES} frames), so the window is NOT rotating (cells beyond N are starved)"
     );
 }

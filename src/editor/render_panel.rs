@@ -193,6 +193,89 @@ pub fn render_gi_panel(world: &mut World, ui: &mut egui::Ui) {
         }
     }
 
+    // World-cache TUNING (Phase 2.4 knobs-as-uniforms): per-tunable sliders on `WorldCacheUniformData`. These
+    // mutate `WorldCacheSettings.data` (already extracted + uploaded to the WGSL `WorldCacheUniform` each frame),
+    // so tweaks are live. Defaults are byte-identical to the Solari-tuned values the GPU convergence/energy tests
+    // assert, so leaving the sliders alone changes nothing. Collapsed by default to keep the panel tidy.
+    {
+        ui.separator();
+        egui::CollapsingHeader::new(egui::RichText::new("World Cache").strong())
+            .default_open(false)
+            .show(ui, |ui| {
+                if let Some(mut wc) =
+                    world.get_resource_mut::<crate::voxel::raytrace::WorldCacheSettings>()
+                {
+                    let d = &mut wc.data;
+                    // Cell sizing / LOD. `cell_base_size` = the LOD-0 cell edge (m); `lod_scale` = how fast cells
+                    // grow with camera distance (bigger ⇒ slower growth ⇒ finer cells further out, more cells).
+                    ui.label(egui::RichText::new("Cell sizing").strong());
+                    ui.add(
+                        egui::Slider::new(&mut d.cell_base_size, 0.02..=2.0)
+                            .text("cell base size (m)"),
+                    );
+                    ui.add(egui::Slider::new(&mut d.lod_scale, 1.0..=64.0).text("distance-LOD scale"));
+
+                    // Update-pass GI ray reach + temporal behaviour.
+                    ui.label(egui::RichText::new("GI / temporal").strong());
+                    ui.add(
+                        egui::Slider::new(&mut d.gi_ray_distance, 1.0..=200.0)
+                            .text("GI ray distance (m)"),
+                    );
+                    ui.add(
+                        egui::Slider::new(&mut d.cell_lifetime, 1..=120)
+                            .text("cell lifetime (frames)"),
+                    );
+                    ui.add(
+                        egui::Slider::new(&mut d.max_temporal_samples, 1.0..=128.0)
+                            .text("max temporal samples"),
+                    );
+                    ui.label(
+                        egui::RichText::new(
+                            "lifetime = frames a cell survives un-queried before decay clears it; \
+                             temporal samples cap = smoother but laggier",
+                        )
+                        .weak()
+                        .size(11.0),
+                    );
+
+                    // SOFT per-frame active-cell cap (Phase 2.4). 0 = UNLIMITED (default — no behaviour change);
+                    // > 0 bounds the update/blend dispatch to N cells/frame (lower steady GPU cost, slower fill).
+                    ui.separator();
+                    ui.label(egui::RichText::new("Per-frame active-cell cap").strong());
+                    ui.add(
+                        egui::Slider::new(&mut d.max_active_cells_per_frame, 0..=131_072)
+                            .text("max active cells / frame (0 = unlimited)"),
+                    );
+                    ui.label(
+                        egui::RichText::new(
+                            "0 = unlimited (every active cell updates each frame — default). > 0 caps the \
+                             update/blend dispatch to N cells/frame: lower, steadier GPU cost but a slower \
+                             cache fill (skipped cells keep last radiance, refresh next frame — never cleared).",
+                        )
+                        .weak()
+                        .size(11.0),
+                    );
+
+                    ui.separator();
+                    if ui.button("Reset world-cache defaults").clicked() {
+                        // Preserve the A/B gates the ReSTIR section owns (use_world_cache / gi_multibounce) +
+                        // the render-pass-stamped fields; reset only the TUNABLE knobs to their defaults.
+                        let keep_use = d.use_world_cache;
+                        let keep_mb = d.gi_multibounce;
+                        let def = crate::voxel::raytrace::WorldCacheUniformData::default();
+                        d.cell_base_size = def.cell_base_size;
+                        d.lod_scale = def.lod_scale;
+                        d.gi_ray_distance = def.gi_ray_distance;
+                        d.cell_lifetime = def.cell_lifetime;
+                        d.max_temporal_samples = def.max_temporal_samples;
+                        d.max_active_cells_per_frame = def.max_active_cells_per_frame;
+                        d.use_world_cache = keep_use;
+                        d.gi_multibounce = keep_mb;
+                    }
+                }
+            });
+    }
+
     // DLSS Ray Reconstruction controls (only when built with `--features dlss`). RR denoises + upscales the
     // noisy GI; toggle it and pick the quality preset live.
     #[cfg(feature = "dlss")]

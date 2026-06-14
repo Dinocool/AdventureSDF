@@ -158,6 +158,8 @@ fn collect_profiling_data(
     mut costs: ResMut<FrameCostHistory>,
     diagnostics: Res<DiagnosticsStore>,
     time: Res<Time<Real>>,
+    // Throttle for the world-cache/ReSTIR per-pass GPU-timing debug log (#123): seconds since the last line.
+    mut wc_log_since: Local<f32>,
 ) {
     data.frame_count += 1;
 
@@ -192,6 +194,33 @@ fn collect_profiling_data(
     }
     for (tag, ms) in crate::instrument::drain() {
         samples.insert(format!("cpu: {tag}"), ms);
+    }
+    // Phase 2.4 (#123): the render world's world-cache + ReSTIR timestamp read-back drops its per-pass GPU ms
+    // into the `instrument` GPU sink (1-frame latency). Fold them into the SAME GPU stack as the
+    // RenderDiagnostics passes so the cache update's steady cost shows up alongside the gbuffer/etc. The tags
+    // already carry their own group prefix ("world_cache: decay", "restir: p1"), so we only add the "gpu: "
+    // stack prefix `ranked_bands` strips. Skip zeros so an idle cache (no active cells) doesn't pin a band.
+    let mut wc_pass_log: Vec<(String, f32)> = Vec::new();
+    for (tag, ms) in crate::instrument::drain_gpu() {
+        if ms > 0.0 {
+            // Collect the world-cache/ReSTIR passes (everything fed via the GPU sink) for the throttled log.
+            wc_pass_log.push((tag.clone(), ms));
+            samples.insert(format!("gpu: {tag}"), ms);
+        }
+    }
+    // Throttled per-pass GPU-timing debug log (the other half of #123's "steady-FPS cost" diagnostic): one line
+    // every ~2 s, ordered by cost, so a headless/AI run sees the numbers without the egui panel.
+    *wc_log_since += time.delta_secs();
+    if !wc_pass_log.is_empty() && *wc_log_since >= 2.0 {
+        *wc_log_since = 0.0;
+        wc_pass_log.sort_by(|a, b| b.1.total_cmp(&a.1));
+        let total: f32 = wc_pass_log.iter().map(|(_, ms)| ms).sum();
+        let line = wc_pass_log
+            .iter()
+            .map(|(tag, ms)| format!("{tag} {ms:.3}ms"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        bevy::log::debug!("world-cache GPU passes (Σ {total:.3}ms): {line}");
     }
     costs.accumulate(&samples, time.delta_secs());
 }

@@ -1772,7 +1772,7 @@ struct WorldCacheGeometryData {
 };
 
 // **SSOT for the world-cache KNOBS** (group 3 binding 0) — every tunable is a runtime UNIFORM
-// (knobs-as-uniforms mandate), never a WGSL const. Mirrors Solari's `WORLD_CACHE_*` constants. 32 bytes.
+// (knobs-as-uniforms mandate), never a WGSL const. Mirrors Solari's `WORLD_CACHE_*` constants. 64 bytes.
 struct WorldCacheUniform {
     cell_base_size: f32,    // size of a cache cell at the lowest LOD, in metres (Solari 0.15)
     lod_scale: f32,         // how fast the cell LOD grows with camera distance (Solari 15.0)
@@ -1786,16 +1786,47 @@ struct WorldCacheUniform {
     // The camera world position, stamped by the render pass. The update pass's multi-bounce cache query needs
     // it for the distance-adaptive cell LOD (`wc_get_cell_size`) — the cache view layout binds light+sky only,
     // NOT the `camera` uniform, so the view position rides in here instead. Three scalars (not a vec3) keep the
-    // struct a clean 48-byte / three-16-byte-row std140 layout with no vec3 alignment padding.
+    // struct a clean 64-byte / four-16-byte-row std140 layout with no vec3 alignment padding.
     view_x: f32,
     view_y: f32,
     view_z: f32,
+    // Phase 2.4 SOFT per-frame active-cell cap. 0 (default) = UNLIMITED (every active cell updated+blended each
+    // frame — the pre-2.4 behaviour). When > 0, `compact_write_active` clamps the indirect dispatch to ceil(N/64)
+    // workgroups AND the update/blend entries early-out for active_index >= N, so at most N cells are processed
+    // this frame; the rest keep their last radiance+life and update next frame. Never corrupts the cache.
+    max_active_cells_per_frame: u32,
+    // std140 pad → 64 bytes (four 16-byte rows). Never read.
+    _wc_pad0: u32,
+    _wc_pad1: u32,
+    _wc_pad2: u32,
 };
 
 // The camera world position the update pass feeds to `query_world_cache` for its LOD (reconstructed from the
 // three scalars above). Matches the live `reservoir_from_bounce_cached` consumer, which passes `camera.cam_pos`.
 fn wc_view_position() -> vec3<f32> {
     return vec3<f32>(wc.view_x, wc.view_y, wc.view_z);
+}
+
+// SOFT per-frame active-cell cap (Phase 2.4): the number of active cells to actually update+blend THIS frame.
+// `max_active_cells_per_frame == 0` (default) ⇒ unlimited (the full active count). Otherwise the smaller of the
+// two — at most N cells are processed, the rest keep their last radiance+life and are picked up next frame as
+// they stay alive. Used both to clamp the indirect dispatch (`compact_write_active`) and to bound the
+// update/blend entries, so the two agree (no thread runs past the dispatched range, no dispatched thread skips).
+fn wc_capped_count(active_cell_count: u32) -> u32 {
+    if (wc.max_active_cells_per_frame == 0u) {
+        return active_cell_count;
+    }
+    return min(active_cell_count, wc.max_active_cells_per_frame);
+}
+
+// The rotating START index for the soft cap's per-frame window (Phase 2.4). When the cap BINDS (capped <
+// count) the window of `capped` cells advances by `capped` every frame, so every active cell is serviced
+// within ceil(count/capped) frames — NO permanent starvation (without this, the cap processed the first N
+// compacted cells forever and starved the rest into dark patches). At cap 0 / cap >= count the start is
+// always 0 (`frame_index * count` is a multiple of count), i.e. the full set, unchanged.
+fn wc_window_start(active_cell_count: u32) -> u32 {
+    if (active_cell_count == 0u) { return 0u; }
+    return (wc.frame_index * wc_capped_count(active_cell_count)) % active_cell_count;
 }
 
 @group(3) @binding(0) var<uniform> wc: WorldCacheUniform;
@@ -2025,7 +2056,11 @@ fn world_cache_compact_write_active(
     if (thread_index == 1023u && workgroup_id.x == (WORLD_CACHE_SIZE / 1024u) - 1u) {
         let active_cell_count = compacted_index + u32(cell_active);
         world_cache_active_cells_count = active_cell_count;
-        world_cache_active_cells_dispatch = vec3<u32>((active_cell_count + 63u) / 64u, 1u, 1u);
+        // SOFT per-frame cap (Phase 2.4): when `max_active_cells_per_frame > 0`, only the FIRST N cells of the
+        // compacted list are dispatched this frame (ceil(N/64) workgroups); the rest stay alive (their life is
+        // untouched here) and are processed next frame. 0 = unlimited (dispatch ceil(count/64), the default).
+        let dispatched = wc_capped_count(active_cell_count);
+        world_cache_active_cells_dispatch = vec3<u32>((dispatched + 63u) / 64u, 1u, 1u);
     }
 }
 
@@ -2046,8 +2081,16 @@ fn world_cache_compact_write_active(
 // (returns 0, fills over the next frames). BOUNDED by construction — see the energy note below.
 @compute @workgroup_size(64, 1, 1)
 fn world_cache_update(@builtin(global_invocation_id) active_cell_id: vec3<u32>) {
-    if (active_cell_id.x >= world_cache_active_cells_count) { return; }
-    let cell_index = world_cache_active_cell_indices[active_cell_id.x];
+    // Bound by the SOFT cap (Phase 2.4): the clamped indirect dispatch already trims whole workgroups, but
+    // ceil(N/64) can over-launch the last workgroup, so re-bound here so cells past N keep their last radiance
+    // this frame (untouched — never corrupted) and are picked up next frame. Default (cap 0) == active count.
+    if (active_cell_id.x >= wc_capped_count(world_cache_active_cells_count)) { return; }
+    // ROTATE the per-frame window (Phase 2.4 cap fix): the dispatch slot maps to active cell
+    // `(window_start + slot) mod count`, the window advancing each frame so EVERY cell is serviced over time
+    // (no starvation). `new_radiance[active_cell_id.x]` stays the transient scratch slot (written here, read in
+    // `world_cache_blend` THIS frame at the same slot). Cap 0 ⇒ window_start 0 ⇒ unchanged full pass.
+    let ai = (wc_window_start(world_cache_active_cells_count) + active_cell_id.x) % world_cache_active_cells_count;
+    let cell_index = world_cache_active_cell_indices[ai];
     let geo = world_cache_geometry[cell_index];
     var rng = (cell_index * 9781u + wc.frame_index * 26699u) | 1u;
 
@@ -2088,8 +2131,14 @@ fn world_cache_update(@builtin(global_invocation_id) active_cell_id: vec3<u32>) 
 // Ported from Solari blend_new_samples.
 @compute @workgroup_size(64, 1, 1)
 fn world_cache_blend(@builtin(global_invocation_id) active_cell_id: vec3<u32>) {
-    if (active_cell_id.x >= world_cache_active_cells_count) { return; }
-    let cell_index = world_cache_active_cell_indices[active_cell_id.x];
+    // Same SOFT-cap bound as `world_cache_update` (Phase 2.4): blend EXACTLY the cells the update pass refreshed
+    // this frame. A capped cell's `new_radiance` slot is stale, so blending it would re-fold an old sample — so
+    // we skip it here too; its `world_cache_radiance` keeps last frame's value untouched (no corruption).
+    if (active_cell_id.x >= wc_capped_count(world_cache_active_cells_count)) { return; }
+    // SAME rotating window as `world_cache_update` (same frame ⇒ same `wc_window_start`), so blend processes
+    // EXACTLY the cell the update pass just refreshed at this dispatch slot.
+    let ai = (wc_window_start(world_cache_active_cells_count) + active_cell_id.x) % world_cache_active_cells_count;
+    let cell_index = world_cache_active_cell_indices[ai];
 
     let old_radiance = world_cache_radiance[cell_index];
     let new_radiance = world_cache_active_cells_new_radiance[active_cell_id.x];

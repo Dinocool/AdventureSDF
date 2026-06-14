@@ -821,6 +821,16 @@ struct VoxelRtResources {
     /// edit / camera move).
     world_cache_initialized: bool,
 
+    /// Phase 2.4 GPU per-pass timing (editor only): the persistent timestamp QuerySet + resolve/read-back
+    /// buffers. `None` until the first timed frame allocates it — OR permanently `None` if the device lacks the
+    /// TIMESTAMP features (then per-pass timing is reported unavailable once and every pass is dispatched
+    /// untimed, zero behaviour change). `gpu_timer_checked` gates the one-time allocation attempt + the
+    /// unavailable log so we don't retry/spam every frame.
+    #[cfg(feature = "editor")]
+    gpu_timer: Option<WorldCacheGpuTimer>,
+    #[cfg(feature = "editor")]
+    gpu_timer_checked: bool,
+
     // --- DLSS-RR (Stage 4c) intermediate textures + state (only used under `--features dlss`) ---
     /// The `raymarch_dlss` compute's COLOUR / DEPTH / MOTION storage outputs (the resolve render pass reads
     /// these to fill the view target + the RENDER_ATTACHMENT-only prepass depth/motion textures). The 3
@@ -955,6 +965,137 @@ impl WorldCacheBuffers {
                 resource: self.active_cells_dispatch.as_entire_binding(),
             }],
         })
+    }
+}
+
+// --- Phase 2.4 GPU per-pass timing (issue #123, editor builds only) ----------------------------------
+
+/// The world-cache + ReSTIR passes this timer measures, in dispatch order. Each consumes TWO timestamp slots
+/// (begin, end). The compaction is three tiny back-to-back passes; we bracket them as ONE "compact" segment
+/// (their individual times are sub-µs noise). Index here == the segment's position in the QuerySet.
+#[cfg(feature = "editor")]
+const WC_TIMING_LABELS: [&str; 6] = [
+    "world_cache: decay",
+    "world_cache: compact",
+    "world_cache: update",
+    "world_cache: blend",
+    "restir: p1",
+    "restir: p2",
+];
+
+/// One begin+end timestamp pair per measured segment.
+#[cfg(feature = "editor")]
+const WC_TIMING_SLOTS: u32 = (WC_TIMING_LABELS.len() as u32) * 2;
+
+/// **GPU per-pass timing for the world-cache + ReSTIR passes** (editor builds; issue #123). A persistent
+/// timestamp `QuerySet` (one begin/end pair per segment) + a resolve buffer (`resolve_query_set` target,
+/// `QUERY_RESOLVE | COPY_SRC`) + a `MAP_READ` read-back buffer. The flow per frame, all on the pass's existing
+/// command encoder (so it adds NO extra submit): (a) read back the PREVIOUS frame's resolved timestamps (the
+/// buffer was submitted + the device polled by Bevy on the prior frame, so the map is ready — 1-frame latency,
+/// which is fine for a diagnostic); (b) convert ticks → ms via `queue.get_timestamp_period()` and push each
+/// segment into the global `instrument` GPU sink (the editor profiler drains it into the Performance panel's
+/// GPU stack + a debug log); (c) record THIS frame's begin/end timestamps via `cpass.write_timestamp` between
+/// the pipeline switches (needs `TIMESTAMP_QUERY_INSIDE_PASSES`), `resolve_query_set` into the resolve buffer,
+/// and copy it into the read-back buffer to be mapped next frame.
+///
+/// Built only when the device exposes the timestamp features; otherwise the whole timer is `None` and the
+/// passes dispatch untimed (zero behaviour change). NEVER touches the cache data — it only reads the clock.
+#[cfg(feature = "editor")]
+struct WorldCacheGpuTimer {
+    query_set: wgpu::QuerySet,
+    resolve_buf: wgpu::Buffer,
+    readback_buf: wgpu::Buffer,
+    /// `true` once a frame's timestamps have been written (so the FIRST read-back, before any write, is skipped
+    /// rather than reading an unmapped/garbage buffer).
+    have_pending: bool,
+}
+
+#[cfg(feature = "editor")]
+impl WorldCacheGpuTimer {
+    /// Allocate the timer iff the device supports timestamp queries INSIDE compute passes. Returns `None`
+    /// (timing unavailable, reported once by the caller) otherwise — the passes then run untimed.
+    fn new(device: &wgpu::Device) -> Option<Self> {
+        let feats = device.features();
+        if !feats.contains(wgpu::Features::TIMESTAMP_QUERY)
+            || !feats.contains(wgpu::Features::TIMESTAMP_QUERY_INSIDE_PASSES)
+        {
+            return None;
+        }
+        let query_set = device.create_query_set(&wgpu::QuerySetDescriptor {
+            label: Some("voxel_rt_wc_timing_qs"),
+            ty: wgpu::QueryType::Timestamp,
+            count: WC_TIMING_SLOTS,
+        });
+        let bytes = u64::from(WC_TIMING_SLOTS) * 8; // u64 ticks per slot
+        let resolve_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("voxel_rt_wc_timing_resolve"),
+            size: bytes,
+            usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let readback_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("voxel_rt_wc_timing_readback"),
+            size: bytes,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        Some(Self { query_set, resolve_buf, readback_buf, have_pending: false })
+    }
+
+    /// Read back the PREVIOUS frame's resolved timestamps (if any), convert to ms via `period` (ns/tick), and
+    /// push each segment into the `instrument` GPU sink. Must run BEFORE re-recording this frame's queries (it
+    /// leaves the read-back buffer UNMAPPED so the encoder can copy into it again). 1-frame latency.
+    ///
+    /// The buffer was submitted + presented last frame, so its GPU writes are done; a NON-BLOCKING `Poll` fires
+    /// the map callback immediately without stalling the render thread. If the map somehow isn't ready yet (a
+    /// stalled frame), we just unmap + skip this read — next frame picks it up. NEVER waits on the GPU.
+    fn read_previous(&mut self, device: &wgpu::Device, period: f32) {
+        if !self.have_pending {
+            return;
+        }
+        let slice = self.readback_buf.slice(..);
+        slice.map_async(wgpu::MapMode::Read, |_| {});
+        // Non-blocking poll: completes the map for work that already finished (last frame) without waiting.
+        let _ = device.poll(wgpu::PollType::Poll);
+        if let Ok(view) = slice.get_mapped_range() {
+            let ticks: Vec<u64> = bytemuck::cast_slice::<u8, u64>(&view).to_vec();
+            drop(view);
+            for (i, label) in WC_TIMING_LABELS.iter().enumerate() {
+                let begin = ticks.get(i * 2).copied().unwrap_or(0);
+                let end = ticks.get(i * 2 + 1).copied().unwrap_or(0);
+                // ticks increase within a frame; guard against a zeroed/garbage pair (skip if end < begin).
+                if end >= begin {
+                    let ms = (end - begin) as f32 * period * 1e-6;
+                    crate::instrument::record_gpu(label, ms);
+                }
+            }
+        }
+        // Always unmap so the encoder can copy into the read-back buffer again this frame.
+        self.readback_buf.unmap();
+    }
+
+    /// Write `segment`'s BEGIN timestamp on the open compute pass (call right before `set_pipeline`+dispatch).
+    fn begin(&self, cpass: &mut wgpu::ComputePass, segment: usize) {
+        cpass.write_timestamp(&self.query_set, segment as u32 * 2);
+    }
+
+    /// Write `segment`'s END timestamp on the open compute pass (call right after the dispatch).
+    fn end(&self, cpass: &mut wgpu::ComputePass, segment: usize) {
+        cpass.write_timestamp(&self.query_set, segment as u32 * 2 + 1);
+    }
+
+    /// After the compute pass closes: resolve the QuerySet into the resolve buffer and copy it into the
+    /// MAP_READ read-back buffer (mapped + read NEXT frame). Marks a pending read-back.
+    fn resolve(&mut self, encoder: &mut wgpu::CommandEncoder) {
+        encoder.resolve_query_set(&self.query_set, 0..WC_TIMING_SLOTS, &self.resolve_buf, 0);
+        encoder.copy_buffer_to_buffer(
+            &self.resolve_buf,
+            0,
+            &self.readback_buf,
+            0,
+            u64::from(WC_TIMING_SLOTS) * 8,
+        );
+        self.have_pending = true;
     }
 }
 
@@ -1255,9 +1396,10 @@ pub struct VoxelRtSky {
 }
 
 /// **SSOT for the world-space radiance-cache knobs** (Phase 2.1; the WGSL `WorldCacheUniform`, group 3
-/// binding 0). All runtime UNIFORMS (knobs-as-uniforms mandate) — editor sliders land in 2.4; nothing here is
-/// a WGSL const. Mirrors Solari's `WORLD_CACHE_*` tunables. 48 bytes (std140/std430-safe: 12 scalars =
-/// three 16-byte rows). `frame_index`, `reset`, and `view_x/y/z` are stamped by the render pass, not user knobs.
+/// binding 0). All runtime UNIFORMS (knobs-as-uniforms mandate) — editor sliders land in 2.4 (Render/GI panel's
+/// "World Cache" section); nothing here is a WGSL const. Mirrors Solari's `WORLD_CACHE_*` tunables. 64 bytes
+/// (std140/std430-safe: 13 live scalars + 3 pad = four 16-byte rows). `frame_index`, `reset`, and `view_x/y/z`
+/// are stamped by the render pass, not user knobs.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct WorldCacheUniformData {
@@ -1285,13 +1427,26 @@ pub struct WorldCacheUniformData {
     /// never clears the cache either way (adapt-not-reset — stale cells decay + refill).
     pub gi_multibounce: u32,
     /// Camera world position (X), stamped by the render pass — feeds the update pass's multi-bounce cache
-    /// query LOD. Three scalars (not a `Vec3`) keep the std140 layout a clean three-16-byte-row 48 bytes with
+    /// query LOD. Three scalars (not a `Vec3`) keep the std140 layout a clean four-16-byte-row 64 bytes with
     /// no vec3 alignment padding (`[scalar;N]`/encase-pad foot-guns avoided per the GPU-uniform-verify note).
     pub view_x: f32,
     /// Camera world position (Y), stamped by the render pass.
     pub view_y: f32,
     /// Camera world position (Z), stamped by the render pass.
     pub view_z: f32,
+    /// Phase 2.4 SOFT per-frame active-cell cap (knobs-as-uniforms). `0` (the default) = UNLIMITED — every
+    /// active cell is updated + blended each frame, exactly the pre-2.4 behaviour (byte-identical GPU tests).
+    /// When `> 0`, `compact_write_active` clamps the indirect update/blend dispatch to `ceil(N/64)` workgroups
+    /// AND the update/blend entries early-out for `active_index >= N`, so at most `N` active cells are processed
+    /// this frame; the rest keep their last radiance + life and are picked up next frame as they stay alive.
+    /// NEVER corrupts the cache (skipped cells are untouched, not cleared). Trade: lower steady GPU cost vs a
+    /// slower cache fill (more frames to converge). OFF by default.
+    pub max_active_cells_per_frame: u32,
+    /// std140 pad → 64 bytes (four 16-byte rows). `[scalar;N]`/encase-pad foot-guns avoided per the
+    /// GPU-uniform-verify note by naming each pad scalar explicitly. Never read by the shader.
+    pub _pad0: u32,
+    pub _pad1: u32,
+    pub _pad2: u32,
 }
 
 impl Default for WorldCacheUniformData {
@@ -1310,6 +1465,10 @@ impl Default for WorldCacheUniformData {
             view_x: 0.0,
             view_y: 0.0,
             view_z: 0.0,
+            max_active_cells_per_frame: 0, // 2.4 default: UNLIMITED (no behaviour change; cap is opt-in)
+            _pad0: 0,
+            _pad1: 0,
+            _pad2: 0,
         }
     }
 }
@@ -2046,33 +2205,64 @@ fn prepare_world_cache(
 /// compact_blocks → compact_write_active → update (indirect) → blend (indirect). The caller has already set
 /// the scene bind group at index 0 and (for the live raymarch/restir) may rebind groups afterward. Consecutive
 /// dispatches in one compute pass get WebGPU's implicit storage barrier, so each pass sees the prior's writes.
+///
+/// Editor builds pass an optional [`WorldCacheGpuTimer`] (issue #123): we bracket each measured segment
+/// (decay=0, compact=1 over the three compaction passes, update=2, blend=3) with begin/end timestamps. The
+/// timing is purely additive — the dispatches are byte-identical with or without it.
 fn dispatch_world_cache_passes(
     cpass: &mut wgpu::ComputePass,
     pipelines: &VoxelRtPipelines,
     prepared: &WorldCachePrepared,
+    #[cfg(feature = "editor")] timer: Option<&WorldCacheGpuTimer>,
 ) {
     cpass.set_bind_group(1, &prepared.view_bg, &[]);
     cpass.set_bind_group(2, &prepared.dispatch_bg, &[]); // group 2 = the indirect-dispatch buffer (written here)
     cpass.set_bind_group(3, &prepared.cache_bg, &[]);
     // Whole-table passes: one thread per cell (workgroup_size 1024).
     let table_groups = WORLD_CACHE_SIZE / 1024;
+    #[cfg(feature = "editor")]
+    if let Some(t) = timer {
+        t.begin(cpass, 0);
+    }
     cpass.set_pipeline(&pipelines.wc_decay);
     cpass.dispatch_workgroups(table_groups, 1, 1);
+    #[cfg(feature = "editor")]
+    if let Some(t) = timer {
+        t.end(cpass, 0); // decay
+        t.begin(cpass, 1); // compact (×3)
+    }
     cpass.set_pipeline(&pipelines.wc_compact_single_block);
     cpass.dispatch_workgroups(table_groups, 1, 1);
     cpass.set_pipeline(&pipelines.wc_compact_blocks);
     cpass.dispatch_workgroups(1, 1, 1);
     cpass.set_pipeline(&pipelines.wc_compact_write_active);
     cpass.dispatch_workgroups(table_groups, 1, 1);
+    #[cfg(feature = "editor")]
+    if let Some(t) = timer {
+        t.end(cpass, 1); // compact
+    }
     // UNBIND group 2 before the indirect dispatches: wgpu forbids the dispatch buffer being bound read-write
     // storage AND used as the indirect-args source in one usage scope. The update/blend pipeline layout omits
     // group 2, so this clears it (Solari's `set_bind_group(2, None)` pattern).
     cpass.set_bind_group(2, None, &[]);
     // Active-cell passes: indirect over the compacted count (ceil(active / 64) workgroups).
+    #[cfg(feature = "editor")]
+    if let Some(t) = timer {
+        t.begin(cpass, 2); // update
+    }
     cpass.set_pipeline(&pipelines.wc_update);
     cpass.dispatch_workgroups_indirect(&prepared.dispatch_buf, 0);
+    #[cfg(feature = "editor")]
+    if let Some(t) = timer {
+        t.end(cpass, 2); // update
+        t.begin(cpass, 3); // blend
+    }
     cpass.set_pipeline(&pipelines.wc_blend);
     cpass.dispatch_workgroups_indirect(&prepared.dispatch_buf, 0);
+    #[cfg(feature = "editor")]
+    if let Some(t) = timer {
+        t.end(cpass, 3); // blend
+    }
 }
 
 /// [`Core3d`]/[`Core3dSystems::MainPass`]: when the toggle is on and the scene is built, dispatch the
@@ -2094,6 +2284,9 @@ fn voxel_rt_pass(
     pipelines: Option<Res<VoxelRtPipelines>>,
     mut resources: ResMut<VoxelRtResources>,
     render_device: Res<RenderDevice>,
+    // Phase 2.4 GPU per-pass timing (editor builds): the queue converts timestamp ticks → ms via
+    // `get_timestamp_period()`. Unused by the GI math; cfg-gated so the non-editor signature is untouched.
+    #[cfg(feature = "editor")] render_queue: Res<RenderQueue>,
     mut ctx: RenderContext,
 ) {
     if !toggle.enabled {
@@ -2378,6 +2571,28 @@ fn voxel_rt_pass(
         &sky_buf,
     );
 
+    // Phase 2.4 GPU per-pass timing (editor only). Take the persistent timer OUT of `resources` so the
+    // immutable scene/output borrows below can coexist with the timer's `&mut` use; it goes back at the end of
+    // the pass. Allocate it lazily (and read back LAST frame's timestamps now, before re-recording).
+    #[cfg(feature = "editor")]
+    let mut gpu_timer = {
+        if !resources.gpu_timer_checked {
+            resources.gpu_timer_checked = true;
+            resources.gpu_timer = WorldCacheGpuTimer::new(device);
+            if resources.gpu_timer.is_none() {
+                bevy::log::warn!(
+                    "voxel-rt: GPU per-pass timing unavailable — device lacks TIMESTAMP_QUERY / \
+                     TIMESTAMP_QUERY_INSIDE_PASSES; world-cache passes run untimed"
+                );
+            }
+        }
+        let mut t = resources.gpu_timer.take();
+        if let Some(timer) = t.as_mut() {
+            timer.read_previous(device, render_queue.get_timestamp_period());
+        }
+        t
+    };
+
     let scene_bg = resources.scene_bind_group.as_ref().expect("checked above");
     // `gi_mode` A/B: ReSTIR GI (group-2 reservoirs, two passes) vs the legacy `gather_gi` raymarch (no group 2).
     let use_restir = restir_settings.restir;
@@ -2398,7 +2613,13 @@ fn voxel_rt_pass(
         cpass.set_bind_group(0, scene_bg, &[]);
         // World-cache passes FIRST (decay → compact ×3 → update → blend), sharing scene group 0. They set
         // groups 1/2/3 themselves; the live raymarch/restir below rebinds groups 1/2 to the view + reservoirs.
-        dispatch_world_cache_passes(&mut cpass, &pipelines, &wc_prepared);
+        dispatch_world_cache_passes(
+            &mut cpass,
+            &pipelines,
+            &wc_prepared,
+            #[cfg(feature = "editor")]
+            gpu_timer.as_ref(),
+        );
         cpass.set_bind_group(1, &view_bg, &[]);
         let groups = (viewport.x.div_ceil(8), viewport.y.div_ceil(8), 1);
         if use_restir {
@@ -2410,14 +2631,33 @@ fn voxel_rt_pass(
             // the query is what POPULATES the cache). Re-set explicitly even though the cache passes left it
             // bound — rebinding group 2 above can invalidate inheritance of higher-indexed groups.
             cpass.set_bind_group(3, &wc_prepared.cache_bg, &[]);
+            #[cfg(feature = "editor")]
+            if let Some(t) = gpu_timer.as_ref() {
+                t.begin(&mut cpass, 4);
+            }
             cpass.set_pipeline(&pipelines.restir_p1);
             cpass.dispatch_workgroups(groups.0, groups.1, groups.2);
+            #[cfg(feature = "editor")]
+            if let Some(t) = gpu_timer.as_ref() {
+                t.end(&mut cpass, 4); // restir p1
+                t.begin(&mut cpass, 5); // restir p2
+            }
             cpass.set_pipeline(&pipelines.restir_p2);
             cpass.dispatch_workgroups(groups.0, groups.1, groups.2);
+            #[cfg(feature = "editor")]
+            if let Some(t) = gpu_timer.as_ref() {
+                t.end(&mut cpass, 5); // restir p2
+            }
         } else {
             cpass.set_pipeline(&pipelines.raymarch);
             cpass.dispatch_workgroups(groups.0, groups.1, groups.2);
         }
+    }
+    // Phase 2.4: resolve this frame's world-cache/ReSTIR timestamps into the read-back buffer (mapped + read
+    // next frame). Additive — the GI passes above are byte-identical with or without the timer.
+    #[cfg(feature = "editor")]
+    if let Some(t) = gpu_timer.as_mut() {
+        t.resolve(encoder);
     }
     // Feed this frame's accumulated output back into history for the next frame's blend (the running mean).
     encoder.copy_texture_to_texture(
@@ -2442,6 +2682,11 @@ fn voxel_rt_pass(
         rpass.set_pipeline(composite);
         rpass.set_bind_group(0, &composite_bg, &[]);
         rpass.draw(0..3, 0..1);
+    }
+    // Return the persistent timer to `resources` (the scene/output borrows above have ended).
+    #[cfg(feature = "editor")]
+    {
+        resources.gpu_timer = gpu_timer.take();
     }
 }
 
@@ -2551,6 +2796,8 @@ fn voxel_rt_dlss_pass(
     pipelines: Option<Res<VoxelRtPipelines>>,
     mut resources: ResMut<VoxelRtResources>,
     render_device: Res<RenderDevice>,
+    // Phase 2.4 GPU per-pass timing (editor builds): ticks → ms via `get_timestamp_period()`.
+    #[cfg(feature = "editor")] render_queue: Res<RenderQueue>,
     mut ctx: RenderContext,
 ) {
     if !toggle.enabled {
@@ -2822,6 +3069,29 @@ fn voxel_rt_dlss_pass(
         &sky_buf,
     );
 
+    // Phase 2.4 GPU per-pass timing (editor only) — same pattern as the non-DLSS pass: take the persistent
+    // timer out so it can be `&mut`-used alongside the immutable scene/reservoir borrows below, read back last
+    // frame's timestamps, and return it at the end. The shared `world_cache`/timer means either present path
+    // produces the per-pass numbers.
+    #[cfg(feature = "editor")]
+    let mut gpu_timer = {
+        if !resources.gpu_timer_checked {
+            resources.gpu_timer_checked = true;
+            resources.gpu_timer = WorldCacheGpuTimer::new(device);
+            if resources.gpu_timer.is_none() {
+                bevy::log::warn!(
+                    "voxel-rt: GPU per-pass timing unavailable — device lacks TIMESTAMP_QUERY / \
+                     TIMESTAMP_QUERY_INSIDE_PASSES; world-cache passes run untimed"
+                );
+            }
+        }
+        let mut t = resources.gpu_timer.take();
+        if let Some(timer) = t.as_mut() {
+            timer.read_previous(device, render_queue.get_timestamp_period());
+        }
+        t
+    };
+
     let (res_a, res_b, _) = resources.dlss_reservoirs.as_ref().expect("allocated above");
     let (surf_a, surf_b, _) = resources.dlss_surfaces.as_ref().expect("allocated above");
     let even = frame_index & 1 == 0;
@@ -2858,7 +3128,13 @@ fn voxel_rt_dlss_pass(
         // World-cache passes FIRST (shared scene group 0); they set + leave groups 1/2/3, which the DLSS
         // raymarch/restir below rebinds (group 1 = dlss view_bg, group 2 = reservoirs). The cache does NOT
         // feed the live image this stage.
-        dispatch_world_cache_passes(&mut cpass, &pipelines, &wc_prepared);
+        dispatch_world_cache_passes(
+            &mut cpass,
+            &pipelines,
+            &wc_prepared,
+            #[cfg(feature = "editor")]
+            gpu_timer.as_ref(),
+        );
         cpass.set_bind_group(1, &view_bg, &[]);
         let groups = (render_res.x.div_ceil(8), render_res.y.div_ceil(8), 1);
         if use_restir {
@@ -2869,14 +3145,32 @@ fn voxel_rt_dlss_pass(
             // group(3) = the world cache (Phase 2.2): `restir_dlss_p1`'s initial reservoir queries it
             // (lazy-insert → populates the cache). Re-set explicitly (rebinding group 2 can drop higher groups).
             cpass.set_bind_group(3, &wc_prepared.cache_bg, &[]);
+            #[cfg(feature = "editor")]
+            if let Some(t) = gpu_timer.as_ref() {
+                t.begin(&mut cpass, 4);
+            }
             cpass.set_pipeline(&pipelines.restir_dlss_p1);
             cpass.dispatch_workgroups(groups.0, groups.1, groups.2);
+            #[cfg(feature = "editor")]
+            if let Some(t) = gpu_timer.as_ref() {
+                t.end(&mut cpass, 4); // restir p1
+                t.begin(&mut cpass, 5); // restir p2
+            }
             cpass.set_pipeline(&pipelines.restir_dlss_p2);
             cpass.dispatch_workgroups(groups.0, groups.1, groups.2);
+            #[cfg(feature = "editor")]
+            if let Some(t) = gpu_timer.as_ref() {
+                t.end(&mut cpass, 5); // restir p2
+            }
         } else {
             cpass.set_pipeline(&pipelines.raymarch_dlss);
             cpass.dispatch_workgroups(groups.0, groups.1, groups.2);
         }
+    }
+    // Phase 2.4: resolve this frame's timestamps (mapped + read next frame). Additive — no GI-math change.
+    #[cfg(feature = "editor")]
+    if let Some(t) = gpu_timer.as_mut() {
+        t.resolve(encoder);
     }
     {
         // Resolve into the view target (colour) + the prepass motion (colour 1) + prepass depth (frag_depth).
@@ -2910,5 +3204,10 @@ fn voxel_rt_dlss_pass(
         rpass.set_pipeline(resolve);
         rpass.set_bind_group(0, &resolve_bg, &[]);
         rpass.draw(0..3, 0..1);
+    }
+    // Return the persistent timer to `resources` (the scene/reservoir borrows above have ended).
+    #[cfg(feature = "editor")]
+    {
+        resources.gpu_timer = gpu_timer.take();
     }
 }

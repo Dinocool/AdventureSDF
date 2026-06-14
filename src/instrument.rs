@@ -35,6 +35,9 @@ pub fn set_enabled(on: bool) {
         if let Some(m) = SINK.get() {
             m.lock().unwrap().clear();
         }
+        if let Some(m) = GPU_SINK.get() {
+            m.lock().unwrap().clear();
+        }
     }
 }
 
@@ -83,6 +86,38 @@ pub fn span(tag: &'static str) -> Span {
         tag,
         start: enabled().then(Instant::now),
     }
+}
+
+/// Per-tag accumulated GPU time (milliseconds) for the current frame, fed from the render world's
+/// timestamp-query read-back (1-frame latency). Kept SEPARATE from the CPU [`SINK`] because GPU-busy time
+/// and CPU wall time are different axes (the profiler stacks them in their own graphs); the panel drains
+/// this with a `gpu:` prefix. `String` keys (not `&'static str`) so render-world callers can pass owned
+/// pass labels without leaking. Lazily created on first use.
+static GPU_SINK: OnceLock<Mutex<HashMap<String, f32>>> = OnceLock::new();
+
+fn gpu_sink() -> &'static Mutex<HashMap<String, f32>> {
+    GPU_SINK.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Set `tag`'s GPU milliseconds for this frame (the render-world timestamp read-back computes the whole
+/// per-pass delta, so this STORES rather than accumulates — repeated passes in a frame would overwrite,
+/// which matches the single-dispatch-per-pass reality). No-op while collection is disabled. Mirrors the CPU
+/// [`record`] path so the editor profiler turns both on with one [`set_enabled`].
+pub fn record_gpu(tag: &str, ms: f32) {
+    if !enabled() {
+        return;
+    }
+    let mut sink = gpu_sink().lock().unwrap();
+    sink.insert(tag.to_owned(), ms);
+}
+
+/// Take and clear all accumulated per-tag GPU milliseconds for the frame. Returns empty while disabled.
+/// Called once per frame by the profiler (alongside [`drain`]).
+pub fn drain_gpu() -> HashMap<String, f32> {
+    if !enabled() {
+        return HashMap::new();
+    }
+    std::mem::take(&mut *gpu_sink().lock().unwrap())
 }
 
 /// Cache of leaked tag strings so a dynamically-built tag (e.g. a panel title) can be used
