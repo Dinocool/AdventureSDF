@@ -110,12 +110,11 @@ fn headless_render_shows_voxels() {
                 ..default()
             }),
     );
-    // A tight streaming region so the surface around the camera voxelizes in a handful of frames (the
-    // default 32 m radius / 60k-brick cap would need hundreds of frames to drain). Inserted BEFORE Startup so
+    // A tight clipmap so the surface around the camera voxelizes in a handful of frames (the default
+    // clip_half-8 clipmap / 60k-brick cap would need many frames to drain). Inserted BEFORE Startup so
     // `init_voxel_rt_streaming` picks it up.
     app.insert_resource(StreamingConfig {
-        residency_radius_bricks: 14,
-        lod_ring_bricks: [6, 10, 13],
+        clip_half_bricks: 4,
         max_resident_bricks: 30_000,
         max_bricks_per_frame: 8192,
     });
@@ -406,7 +405,7 @@ fn worldgen_voxelizes_emissive_terrain_into_palette() {
     // 3. Registry → GPU plumbing: voxelize the brick containing that emissive voxel, pack it, and assert the
     //    packed palette entry for the emissive block carries the SAME emissive radiance the registry holds.
     let bcoord = brick_coord_of_voxel(emissive_voxel);
-    let brick = voxelize_brick(bcoord, &layer, &lib, &registry, seed);
+    let brick = voxelize_brick(bcoord, 0, &layer, &lib, &registry, seed); // LOD0 brick (world-voxel grid)
     let mut map = BrickMap::new();
     assert!(map.insert(bcoord, brick), "the emissive brick must be non-empty (it contains the surface)");
     let patch = pack_brickmap(&map, &registry);

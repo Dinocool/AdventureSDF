@@ -226,9 +226,10 @@ fn init_voxel_rt_streaming(
     // a few frames; the app leaves it unset and gets the default.
     let cfg = cfg_override.map(|c| *c).unwrap_or_default();
     info!(
-        "voxel-RT Stage 3: streaming residency ready (radius {} bricks ≈ {:.0} m, ≤{} bricks/frame, cap {} resident)",
-        cfg.residency_radius_bricks,
+        "voxel-RT clipmap streaming ready (clip_half {} bricks ⇒ view radius ≈ {:.0} m over {} nested LOD shells, ≤{} bricks/frame, cap {} resident)",
+        cfg.clip_half_bricks,
         region_half_extent_m(&cfg),
+        crate::voxel::brickmap::MAX_LOD + 1,
         cfg.max_bricks_per_frame,
         cfg.max_resident_bricks,
     );
@@ -319,15 +320,18 @@ fn stream_voxel_rt_residency(
         return; // camera not spawned yet — try next frame
     };
     let cam_world: [f32; 3] = cam_tf.translation().into();
+    // The LOD0 brick the camera sits in — the FINEST clipmap boundary, so it crosses whenever ANY level's
+    // shell could shift (a coarse boundary is `2^L×` farther apart, so a LOD0 crossing strictly implies it).
     let cam_brick = camera_brick_coord(cam_world);
 
-    // Reconcile only when the camera crosses into a new brick (the desired set changes), OR when there is
-    // still pending work to drain. This avoids recomputing the (2r+1)³ region every idle frame.
+    // Reconcile only when the camera crosses into a new LOD0 brick (a shell could shift), OR when there is
+    // still pending work to drain. This avoids recomputing the clipmap every idle frame. The per-move
+    // enqueue/drop is O(shell) — only the LOD0 face-slab shifts on a small move; coarse shells are unchanged.
     let cam_changed = streaming.last_cam_brick != Some(cam_brick);
     if cam_changed {
         let dropped = {
             let VoxelRtStreaming { manager, cfg, .. } = &mut *streaming;
-            manager.update(cam_brick, cfg)
+            manager.update(cam_world, cfg)
         };
         streaming.last_cam_brick = Some(cam_brick);
         if dropped > 0 {

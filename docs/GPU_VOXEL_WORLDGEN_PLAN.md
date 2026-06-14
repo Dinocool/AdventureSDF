@@ -88,9 +88,15 @@ zero-warning + the GPU/headless suite green.
   Benchmark: BLAS cost scales with *edited/streamed* chunks, not world size. (Folds in the old Phase-3
   plan + the #94 streaming glitch revisit.)
 
-- **Stage 4 — LOD aggregation + clipmap rings → view distance.** Raise the view extent with bounded VRAM
-  via coarse outer rings (target: Aokana-class — hundreds of metres at a few hundred MB). The LOD debug
-  view (Stage 0) validates ring placement + cross-LOD continuity.
+- **Stage 4 — LOD aggregation + clipmap rings → view distance. [LANDED — CPU clipmap]** A brick is always
+  `8³` voxels; its world span scales with LOD (`brick_span(L) = BRICK_WORLD_SIZE · 2^L`, `MAX_LOD = 6`). The
+  voxelizer samples each `(coord, lod)` directly at its coarse spacing (a true in-place 3D mip). Residency is
+  re-keyed by `(coord, lod)` and built as NESTED CLIPMAP SHELLS (`desired_clipmap`: LOD0 fills the inner
+  cube; each coarser level a shell `clip_half/2 < cheby ≤ clip_half`). View radius 45 m → **819 m (18.3×)**
+  at `clip_half_bricks = 8`; per-single-brick-move STREAMING cost is **O(shell)** (~6.7 ms / 786 bricks vs a
+  138 ms dense cold-fill — 21×). Cross-LOD seams handled by the existing `BRICK_AABB_EPSILON` overlap +
+  nearest-hit DDA (no cross-LOD halo). The remaining per-move re-pack is O(resident) — the BLAS-rebuild cost
+  Stage 3 amortizes, not the clipmap stutter. GPU mixed-LOD oracle + seam/show-through GPU tests pass.
 
 - **Stage 5 (optional endgame) — demand / ray-guided residency.** Rays request bricks via a feedback
   buffer (GigaVoxels); CPU coarse octree shrinks to a seed. Only if Stages 2–4 leave residual stalls.

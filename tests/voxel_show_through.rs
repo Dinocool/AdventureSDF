@@ -10,7 +10,7 @@
 //! truth is the show-through bug. The fix must make this test pass.
 
 use adventure::voxel::brickmap::{
-    BRICK_EDGE, BRICK_WORLD_SIZE, BrickMap, VOXEL_SIZE, lod_edge, lod_voxel_size,
+    BRICK_EDGE, BrickMap, VOXEL_SIZE, brick_span, lod_edge, lod_voxel_size,
 };
 use adventure::voxel::cornell::{INTERIOR, build_cornell};
 use adventure::voxel::gpu::{BRICK_AABB_EPSILON, GpuBrickPatch, pack_brickmap};
@@ -79,9 +79,10 @@ fn dda_brick_faithful(patch: &GpuBrickPatch, bi: usize, ro: Vec3, rd: Vec3) -> O
     let csize = lod_voxel_size(m.lod);
     let wmin = Vec3::from(m.world_min);
 
-    // Grown-AABB slab (same as the shader's trace candidate test).
+    // Grown-AABB slab (same as the shader's trace candidate test). `brick_span(m.lod)` is the clipmap span
+    // (Cornell is all LOD0, so this is BRICK_WORLD_SIZE here — but use the SSOT so it never drifts).
     let bmin = wmin - Vec3::splat(BRICK_AABB_EPSILON);
-    let bmax = wmin + Vec3::splat(BRICK_WORLD_SIZE + BRICK_AABB_EPSILON);
+    let bmax = wmin + Vec3::splat(brick_span(m.lod) + BRICK_AABB_EPSILON);
     let inv = Vec3::new(1.0 / rd.x, 1.0 / rd.y, 1.0 / rd.z);
     let ta = (bmin - ro) * inv;
     let tb = (bmax - ro) * inv;

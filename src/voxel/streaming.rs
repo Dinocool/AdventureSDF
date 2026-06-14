@@ -1,58 +1,78 @@
-//! **Stage 3 — camera-following residency + per-LOD voxel mips.**
+//! **Camera-following residency — a true nested CLIPMAP of voxel bricks.**
 //!
-//! The Stage-2 HW-RT path traced a STATIC ~32 m patch at the origin. Stage 3 replaces that with a brick
-//! set that STREAMS around the camera and stores far bricks at a coarser voxel mip, so the view distance is
-//! large while per-frame work and VRAM stay bounded.
+//! The HW-RT path streams a brick set around the camera. A brick is ALWAYS `8³` voxels, but its WORLD SPAN
+//! scales with LOD ([`super::brickmap::brick_span`]`(L) = BRICK_WORLD_SIZE · 2^L`), so COARSER levels cover
+//! MORE world at the same resolution — a geometry-clipmap / GigaVoxels 3D-mipmap. This replaces the old
+//! dense-cube residency (every brick a fixed `1.6 m`, so coarse LOD added no coverage and view distance was
+//! hard-capped) with NESTED CLIPMAP SHELLS: LOD0 fills the inner cube, each coarser level is a thin SHELL
+//! that doubles the reach. Total view radius = `clip_half · BRICK_WORLD_SIZE · 2^MAX_LOD`.
 //!
 //! This module owns the pure, headless-testable bookkeeping — no GPU, no Bevy systems — so the residency
 //! scheme is proven in isolation and the render wiring ([`super::raytrace`]) just drives it:
 //!
-//! * [`brick_lod`] / [`desired_residency`] — given the camera brick coordinate, which bricks should be
-//!   resident and at what LOD (concentric rings: near = LOD0 full res, farther = progressively coarser).
-//! * [`ResidencyManager`] — the live set of resident bricks + a bounded WORK QUEUE. Each `update` diffs the
-//!   desired set against the current one, ENQUEUES newly-entered / LOD-changed bricks, and DROPS exited
-//!   ones; [`ResidencyManager::drain_work`] processes at most `max_per_frame` queue items per call
-//!   (voxelizing them) so a big camera jump can't stall the frame. The packed brick list it exposes
-//!   ([`ResidencyManager::resident_entries`]) is the input to the SSOT [`super::gpu::pack_resident_set`].
+//! * [`brick_lod`] / [`desired_clipmap`] — given the camera world position, which `(coord, lod)` bricks
+//!   should be resident: each level `L` resident in the shell `clip_half/2 < cheby(c, cam_brick_L) ≤
+//!   clip_half` (LOD0 fills the full `cheby ≤ clip_half` cube), so each level is a bounded shell.
+//! * [`ResidencyManager`] — the live set of resident bricks + a bounded WORK QUEUE, keyed by [`BrickKey`]
+//!   `{coord, lod}` (coords now OVERLAP across LOD grids, so the lod is part of the key). Each `update`
+//!   diffs the desired clipmap against the current set, ENQUEUES newly-entered / LOD-changed bricks, and
+//!   DROPS exited ones; [`ResidencyManager::drain_work`] voxelizes at most `max_per_frame` per call so a big
+//!   camera jump can't stall the frame. The packed list it exposes
+//!   ([`ResidencyManager::resident_entries`]) feeds the SSOT [`super::gpu::pack_resident_set`].
+//!
+//! ## The stutter fix — incremental, O(shell) per move
+//! Each level only changes when the camera crosses a LOD-`L` brick boundary (every `brick_span(L)` m), and a
+//! coarse boundary is `2^L×` farther apart than LOD0's. So a small move shifts only the LOD0 shell (a thin
+//! face-slab) and NOTHING coarse — the per-move enqueue/drop count is O(shell), not O(region). The
+//! diff-reconcile `update` (drop-not-desired + enqueue-not-resident/lod-changed) gives this for free once
+//! keyed by `(coord, lod)`.
 //!
 //! ## Keep-old-until-revealed
 //! The manager only marks itself DIRTY (needing a re-pack + BLAS/TLAS rebuild) once a non-empty batch of
-//! queued bricks has been voxelized. The previous resident set — and therefore the previous TLAS the render
-//! path keeps bound — stays valid until the new one is ready, so the camera never sees a hole/flash while a
-//! batch streams in.
+//! queued bricks has been voxelized. The previous resident set — and the TLAS the render path keeps bound —
+//! stays valid until the new one is ready, so the camera never sees a hole/flash while a batch streams in.
 //!
-//! ## Bounds (all `log`ged when hit)
-//! * Region: a CUBE of bricks of radius [`StreamingConfig::residency_radius_bricks`] around the camera
-//!   brick (Chebyshev distance), capped at [`StreamingConfig::max_resident_bricks`] resident bricks.
-//! * Work: at most [`StreamingConfig::max_bricks_per_frame`] bricks voxelized+queued per `drain_work`.
+//! ## Cross-LOD seams
+//! At a shell boundary a fine brick abuts a `2×`-coarser brick. We do NOT build a cross-LOD halo; the two
+//! bricks are SEPARATE BLAS AABBs and the [`BRICK_AABB_EPSILON`](super::gpu::BRICK_AABB_EPSILON) overlap +
+//! the nearest-solid-hit DDA commit the nearest surface across the LOD step. See the seam discussion in
+//! [`super::gpu::pack_resident_set`].
 
 use bevy::math::IVec3;
 use rustc_hash::{FxHashMap, FxHashSet};
 
-use super::brickmap::{BRICK_WORLD_SIZE, Brick, MAX_LOD, brick_coord_of_voxel};
+use super::brickmap::{Brick, MAX_LOD, brick_span};
 use super::gpu::ResidentBrick;
 use super::palette::BlockRegistry;
 use super::voxelize::voxelize_brick;
 use crate::sdf_render::worldgen::biome::BiomeLibrary;
 use crate::sdf_render::worldgen::layers::height::HeightLayer;
 
-/// Tunable streaming + LOD knobs. All distances are in BRICKS (1 brick = [`BRICK_WORLD_SIZE`] = 1.6 m), so
-/// the region scales cleanly with brick size. Defaults give a ~32 m-radius region (matching the Stage-2
-/// patch's reach) with LOD rings, bounded per-frame work, and a hard resident cap. Plain `Copy` data so it
-/// can be a Bevy resource or a test literal.
+/// A resident-brick key in the nested clipmap: the integer brick `coord` ON the LOD-`lod` grid. Coords now
+/// OVERLAP across LOD grids — the same integer coord at two LODs is two DIFFERENT world bricks
+/// (`world_min = coord · brick_span(lod)`) — so the `lod` MUST be part of the key. The SSOT key for the
+/// resident map, the work queue, and the empty-memo.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct BrickKey {
+    /// Integer brick coordinate on the LOD-`lod` grid.
+    pub coord: IVec3,
+    /// The clipmap LOD level.
+    pub lod: u32,
+}
+
+/// Tunable clipmap streaming knobs. Plain `Copy` data so it can be a Bevy resource or a test literal.
 #[derive(Clone, Copy, Debug, bevy::prelude::Resource)]
 pub struct StreamingConfig {
-    /// Residency radius in bricks (Chebyshev): bricks within this many bricks of the camera brick on every
-    /// axis are resident. A radius of `r` gives a `(2r+1)³` cube. Default 28 bricks ≈ 45 m (Phase 2.6 raised
-    /// it from 20 for a longer view distance on the large worldgen GI/stress scene; the `max_resident_bricks`
-    /// cap still bounds it — only NON-empty surface bricks are stored, well under the cap in practice).
-    pub residency_radius_bricks: i32,
-    /// LOD ring radii in bricks: a brick at Chebyshev distance `d` from the camera takes LOD = the number
-    /// of thresholds it exceeds. `lod_ring_bricks[i]` is the distance at/after which LOD becomes `i+1`.
-    /// Must be ascending. Distances beyond the last threshold clamp to [`MAX_LOD`]. Default `[6, 12, 18]`.
-    pub lod_ring_bricks: [i32; MAX_LOD as usize],
-    /// Hard cap on resident bricks. If the desired set exceeds it the farthest bricks are dropped (logged).
-    /// A safety bound so a mis-set radius can't blow VRAM. Default 60_000.
+    /// The clipmap half-extent, in bricks: each nested level covers `cheby ≤ clip_half` of ITS grid (a
+    /// `(2·clip_half+1)³` cube), and the finer level below it covers the inner `cheby ≤ clip_half/2`, so each
+    /// level is resident only in the SHELL `clip_half/2 < cheby ≤ clip_half` (LOD0 fills the full cube). The
+    /// total view radius is `clip_half · BRICK_WORLD_SIZE · 2^MAX_LOD`. Default 8 ⇒ each level `17³` and a
+    /// view half-extent of `8 · 1.6 · 64 ≈ 820 m` (vs the old dense ~45 m), at bounded VRAM (a clipmap of
+    /// `MAX_LOD+1` thin shells, not a dense cube).
+    pub clip_half_bricks: i32,
+    /// Hard cap on resident bricks — a SAFETY bound so a mis-set `clip_half` can't blow VRAM. With the nested
+    /// shells this should NOT bind (only NON-empty surface bricks are stored, a thin shell each level). If the
+    /// desired set exceeds it the farthest bricks are dropped (logged). Default 60_000.
     pub max_resident_bricks: usize,
     /// Max bricks voxelized + enqueued→processed per `drain_work` call (per frame). Bounds the per-frame
     /// CPU cost of a big camera move; the rest carry in the queue to later frames. Default 256.
@@ -62,109 +82,177 @@ pub struct StreamingConfig {
 impl Default for StreamingConfig {
     fn default() -> Self {
         Self {
-            residency_radius_bricks: 28,
-            lod_ring_bricks: [6, 12, 18],
+            clip_half_bricks: 8,
             max_resident_bricks: 60_000,
             max_bricks_per_frame: 256,
         }
     }
 }
 
-/// The brick coordinate the camera world position falls in (its containing brick), via the SSOT
-/// voxel→brick addressing. The streaming region is centred here.
+/// The brick coordinate the camera world position falls in on the LOD-`lod` grid: `floor(cam_world /
+/// brick_span(lod))` per axis. DIFFERENT LODs are different coord grids, so the per-level clipmap centre
+/// differs — this is the SSOT mapping camera world → the LOD-`lod` brick that contains it.
 #[inline]
-pub fn camera_brick_coord(cam_world: [f32; 3]) -> IVec3 {
-    // World metres → world voxel (floor by VOXEL_SIZE) → brick coord. Reuse the brick addressing SSOT by
-    // going through a voxel coordinate at the camera position.
-    let to_voxel = |m: f32| (m / super::brickmap::VOXEL_SIZE).floor() as i32;
-    brick_coord_of_voxel(IVec3::new(to_voxel(cam_world[0]), to_voxel(cam_world[1]), to_voxel(cam_world[2])))
+pub fn camera_brick_coord_lod(cam_world: [f32; 3], lod: u32) -> IVec3 {
+    let span = brick_span(lod);
+    IVec3::new(
+        (cam_world[0] / span).floor() as i32,
+        (cam_world[1] / span).floor() as i32,
+        (cam_world[2] / span).floor() as i32,
+    )
 }
 
-/// The Chebyshev (L∞) distance in bricks between two brick coordinates — the ring metric. A cube region of
-/// radius `r` is exactly `{ b : cheby(b, centre) <= r }`.
+/// The LOD0 brick coordinate the camera falls in (`camera_brick_coord_lod(_, 0)`) — the SSOT "has the camera
+/// crossed a brick?" key the render loop uses to decide when to re-`update`. A LOD0 crossing is the FINEST
+/// boundary, so it strictly implies any coarser crossing; reconciling on it never misses a shell shift.
+#[inline]
+pub fn camera_brick_coord(cam_world: [f32; 3]) -> IVec3 {
+    camera_brick_coord_lod(cam_world, 0)
+}
+
+/// The Chebyshev (L∞) distance in bricks between two brick coordinates — the clipmap shell metric. A cube
+/// of radius `r` is exactly `{ b : cheby(b, centre) <= r }`.
 #[inline]
 fn cheby(a: IVec3, b: IVec3) -> i32 {
     (a.x - b.x).abs().max((a.y - b.y).abs()).max((a.z - b.z).abs())
 }
 
-/// The LOD level for a brick at `coord` given the camera brick `cam` and the ring config: the number of
-/// `lod_ring_bricks` thresholds the Chebyshev distance meets/exceeds, clamped to [`MAX_LOD`]. Near bricks
-/// (distance < first threshold) are LOD0 (full res); each farther ring is one coarser mip. Pure function —
-/// the SSOT for distance→LOD, shared by [`desired_residency`] and the tests.
+/// The clipmap LOD that COVERS a world position, given as a LOD0 brick coordinate `coord` (world centre =
+/// `(coord + 0.5) · brick_span(0)`). Returns the FINEST level whose [`desired_clipmap`] shell contains that
+/// world position: LOD0 if it is inside the LOD0 cube, else the coarser shell it falls into, clamped to
+/// [`MAX_LOD`]. The SSOT for "what resolution does the renderer see at this world point" — used by the
+/// streaming tests to assert shell placement; the residency itself uses [`desired_clipmap`] directly.
 #[inline]
-pub fn brick_lod(coord: IVec3, cam: IVec3, cfg: &StreamingConfig) -> u32 {
-    let d = cheby(coord, cam);
-    let mut lod = 0u32;
-    for &threshold in &cfg.lod_ring_bricks {
-        if d >= threshold {
-            lod += 1;
+pub fn brick_lod(coord: IVec3, cam_world: [f32; 3], cfg: &StreamingConfig) -> u32 {
+    let half = cfg.clip_half_bricks;
+    // The world centre of the LOD0 brick `coord`.
+    let span0 = brick_span(0);
+    let world = [
+        (coord.x as f32 + 0.5) * span0,
+        (coord.y as f32 + 0.5) * span0,
+        (coord.z as f32 + 0.5) * span0,
+    ];
+    for lod in 0..=MAX_LOD {
+        // The brick on the LOD-`lod` grid that contains `world`, and the camera's brick on the same grid.
+        let here = camera_brick_coord_lod(world, lod);
+        let cam_l = camera_brick_coord_lod(cam_world, lod);
+        let d = cheby(here, cam_l);
+        // Cede `half/2 - 1` (NOT `half/2`) to the finer level: the two levels floor their grids
+        // INDEPENDENTLY, so the finer level's outer face can fall up to one COARSE brick short of the
+        // `half/2` boundary on the side away from the camera's sub-cell offset. Ceding one ring LESS makes the
+        // coarse shell OVERLAP the finer level by one ring, structurally closing that gap for every clip_half
+        // (a covered→empty→covered hole would otherwise open as a black crack at each LOD radius). The overlap
+        // is a no-op for correctness: `trace` keeps the NEAREST per-voxel t across all candidates.
+        let inner = if lod == 0 { -1 } else { half / 2 - 1 };
+        if d > inner && d <= half {
+            return lod;
         }
     }
-    lod.min(MAX_LOD)
+    MAX_LOD
 }
 
-/// The DESIRED resident set: every brick coordinate within the cube region of radius
-/// `residency_radius_bricks` around the camera brick, mapped to its [`brick_lod`]. Deterministic ITERATION
-/// is not guaranteed (it's a map); callers that need a stable `primitive_index` order sort the keys (the
-/// manager does). If the region exceeds `max_resident_bricks`, the FARTHEST bricks (largest Chebyshev
-/// distance, then by coordinate) are dropped so the cap holds — the dropped count is the caller's to log.
-pub fn desired_residency(cam: IVec3, cfg: &StreamingConfig) -> FxHashMap<IVec3, u32> {
-    let r = cfg.residency_radius_bricks;
-    let mut out: FxHashMap<IVec3, u32> = FxHashMap::default();
-    for dz in -r..=r {
-        for dy in -r..=r {
-            for dx in -r..=r {
-                let coord = cam + IVec3::new(dx, dy, dz);
-                out.insert(coord, brick_lod(coord, cam, cfg));
+/// The DESIRED clipmap residency: the set of `(coord, lod)` bricks that should be resident around the camera
+/// at world position `cam_world`. NESTED SHELLS — for each level `L` in `0..=MAX_LOD`:
+/// * `cam_brick_L = floor(cam_world / brick_span(L))` is the camera's brick on the LOD-`L` grid;
+/// * level `L` is resident in the SHELL `clip_half/2 - 1 < cheby(c, cam_brick_L) <= clip_half`, ceding the
+///   inner region to the FINER level `L-1`. The cede is `clip_half/2 - 1` (one ring LESS than the naive
+///   `clip_half/2`) because the levels floor their grids INDEPENDENTLY, so the finer level's outer face can
+///   fall up to one coarse brick short of the boundary; the extra ring makes adjacent shells OVERLAP and
+///   structurally closes that gap (no covered→empty→covered crack at any LOD radius). LOD0 fills the full
+///   `cheby <= clip_half` cube (it has no finer level beneath it).
+///
+/// Result: each level is a thin bounded shell, and the union reaches `clip_half · BRICK_WORLD_SIZE ·
+/// 2^MAX_LOD` from the camera. Returned as a map keyed by [`BrickKey`]; iteration order is not guaranteed
+/// (callers that need a stable `primitive_index` order sort — the manager does). If the union exceeds
+/// `max_resident_bricks`, the FARTHEST bricks are dropped (deterministic) so the cap holds.
+pub fn desired_clipmap(cam_world: [f32; 3], cfg: &StreamingConfig) -> FxHashMap<BrickKey, ()> {
+    let half = cfg.clip_half_bricks;
+    let mut out: FxHashMap<BrickKey, ()> = FxHashMap::default();
+    for lod in 0..=MAX_LOD {
+        let cam_l = camera_brick_coord_lod(cam_world, lod);
+        // Cede `half/2 - 1` (NOT `half/2`) to the finer level: the two levels floor their grids
+        // INDEPENDENTLY, so the finer level's outer face can fall up to one COARSE brick short of the
+        // `half/2` boundary on the side away from the camera's sub-cell offset. Ceding one ring LESS makes the
+        // coarse shell OVERLAP the finer level by one ring, structurally closing that gap for every clip_half
+        // (a covered→empty→covered hole would otherwise open as a black crack at each LOD radius). The overlap
+        // is a no-op for correctness: `trace` keeps the NEAREST per-voxel t across all candidates.
+        let inner = if lod == 0 { -1 } else { half / 2 - 1 };
+        for dz in -half..=half {
+            for dy in -half..=half {
+                for dx in -half..=half {
+                    let coord = cam_l + IVec3::new(dx, dy, dz);
+                    let d = cheby(coord, cam_l);
+                    if d > inner {
+                        // d <= half by the loop bounds; d > inner excludes the finer-level interior → SHELL.
+                        out.insert(BrickKey { coord, lod }, ());
+                    }
+                }
             }
         }
     }
     if out.len() > cfg.max_resident_bricks {
-        // Keep the nearest `max_resident_bricks`; drop the rest (farthest first). Deterministic tiebreak.
-        let mut all: Vec<IVec3> = out.keys().copied().collect();
-        all.sort_by_key(|c| (cheby(*c, cam), c.z, c.y, c.x));
-        for c in all.into_iter().skip(cfg.max_resident_bricks) {
-            out.remove(&c);
+        // Keep the nearest `max_resident_bricks`; drop the rest (farthest first). The "distance" is the
+        // shell distance in the level's own grid, so a far coarse shell drops before a near fine one only if
+        // it is genuinely farther in WORLD metres — rank by world distance. Deterministic tiebreak.
+        let world_d = |k: &BrickKey| {
+            // Approx world centre distance: brick centre = (coord + 0.5)·brick_span(lod).
+            let span = brick_span(k.lod);
+            let cx = (k.coord.x as f32 + 0.5) * span - cam_world[0];
+            let cy = (k.coord.y as f32 + 0.5) * span - cam_world[1];
+            let cz = (k.coord.z as f32 + 0.5) * span - cam_world[2];
+            (cx * cx + cy * cy + cz * cz).sqrt()
+        };
+        let mut all: Vec<BrickKey> = out.keys().copied().collect();
+        all.sort_by(|a, b| {
+            world_d(a)
+                .partial_cmp(&world_d(b))
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then((a.lod, a.coord.z, a.coord.y, a.coord.x).cmp(&(b.lod, b.coord.z, b.coord.y, b.coord.x)))
+        });
+        for k in all.into_iter().skip(cfg.max_resident_bricks) {
+            out.remove(&k);
         }
     }
     out
 }
 
-/// A queued unit of streaming work: voxelize the brick at `coord` (its desired LOD is looked up at process
-/// time so a brick re-queued after a LOD ring change picks up the latest LOD).
+/// A queued unit of streaming work: voxelize the brick at clipmap key `key` (`(coord, lod)`). The LOD is part
+/// of the key, so a brick that changes LOD (a shell shift) is a DIFFERENT key — enqueued + voxelized fresh at
+/// the new LOD's coarse spacing, never silently re-tagged (the in-place mip means the voxel data differs).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct WorkItem {
-    coord: IVec3,
+    key: BrickKey,
 }
 
-/// The live residency state + bounded work queue. Holds the voxelized [`Brick`]s currently resident (only
-/// NON-empty bricks are stored — empty/all-air bricks are skipped, the sparsity invariant), each tagged
-/// with the LOD it should pack at, plus a FIFO queue of bricks awaiting voxelization. `update` recomputes
-/// the desired set and reconciles; `drain_work` does the bounded voxelization.
+/// The live clipmap residency state + bounded work queue. Holds the voxelized [`Brick`]s currently resident
+/// (only NON-empty bricks are stored — empty/all-air bricks are skipped, the sparsity invariant), keyed by
+/// [`BrickKey`] `(coord, lod)`, plus a FIFO queue of bricks awaiting voxelization. `update` recomputes the
+/// desired clipmap and reconciles; `drain_work` does the bounded voxelization.
 ///
 /// Robust-by-construction: the resident map is the single source of what's live; `dirty` is set only when a
 /// drained batch actually changes it, so the render path re-packs exactly when (and only when) the GPU set
-/// must change — keep-old-until-revealed falls out for free.
+/// must change — keep-old-until-revealed falls out for free. Keying by `(coord, lod)` makes a LOD change a
+/// DIFFERENT key (a fresh voxelize at the new coarse spacing), so the old "retag the same brick" confusion
+/// is structurally impossible.
 #[derive(Default)]
 pub struct ResidencyManager {
-    /// Resident, voxelized bricks: coord → (brick, current LOD). Empty bricks are never inserted.
-    resident: FxHashMap<IVec3, (Brick, u32)>,
-    /// Coords awaiting voxelization (enqueued by `update`, processed by `drain_work`). A set membership
-    /// guard (`queued`) prevents a brick from being enqueued twice while it waits.
+    /// Resident, voxelized bricks: clipmap key → its `8³` brick (voxelized at the key's LOD). Empty bricks
+    /// are never inserted.
+    resident: FxHashMap<BrickKey, Brick>,
+    /// Keys awaiting voxelization (enqueued by `update`, processed by `drain_work`). A set membership guard
+    /// (`queued`) prevents a key from being enqueued twice while it waits.
     queue: std::collections::VecDeque<WorkItem>,
-    queued: FxHashSet<IVec3>,
-    /// KNOWN-EMPTY (all-air) coords in the current region: bricks that voxelized to empty (above the surface)
+    queued: FxHashSet<BrickKey>,
+    /// KNOWN-EMPTY (all-air) keys in the current clipmap: bricks that voxelized to empty (above the surface)
     /// are NEVER resident (sparsity), so without this memo `update` would find them absent and re-enqueue +
-    /// re-voxelize them on EVERY camera move — and most of the desired region (~2/3) is empty sky/air, so that
-    /// was the dominant streaming churn (tens of thousands of pointless re-voxelizes per move). Memoize them so
-    /// each empty brick is voxelized ONCE; bounded to the region (`update` prunes coords that leave). Empty is
-    /// LOD-independent (all-air downsamples to all-air), so a LOD ring crossing never re-voxelizes them either.
-    empty: FxHashSet<IVec3>,
+    /// re-voxelize them on EVERY camera move — and most of the desired clipmap (~2/3) is empty sky/air, the
+    /// dominant streaming churn otherwise. Memoize them so each empty key is voxelized ONCE; bounded to the
+    /// clipmap (`update` prunes keys that leave). Emptiness is per-`(coord, lod)` (a coarse brick samples the
+    /// surface at coarse spacing, so it can differ from a finer one — hence the LOD is in the key).
+    empty: FxHashSet<BrickKey>,
     /// True iff the resident set CHANGED since the last `take_dirty` — the render path re-packs + rebuilds
     /// the BLAS/TLAS only then (otherwise it keeps the old, still-valid GPU scene).
     dirty: bool,
-    /// The camera brick from the last `update`, so `drain_work` knows each queued brick's current LOD.
-    last_cam: IVec3,
     /// Total bricks dropped by the resident cap over the manager's life (for logging).
     pub capped_total: usize,
 }
@@ -193,68 +281,59 @@ impl ResidencyManager {
         self.dirty
     }
 
-    /// Reconcile the resident set toward the desired region around camera brick `cam`:
-    /// * DROP every resident brick no longer in the desired set (camera moved away) — marks dirty.
-    /// * ENQUEUE every desired brick that is NOT resident, OR whose desired LOD differs from its resident
-    ///   LOD (it crossed a ring) — these are voxelized later by [`drain_work`].
+    /// Reconcile the resident set toward the desired CLIPMAP around the camera at world position `cam_world`:
+    /// * DROP every resident brick no longer in the desired clipmap (a shell shifted / the camera moved) —
+    ///   marks dirty.
+    /// * ENQUEUE every desired `(coord, lod)` that is NOT resident — voxelized later by [`drain_work`].
     ///
-    /// Does NOT itself voxelize (that's bounded work in `drain_work`), so a huge camera jump only enqueues
-    /// here — cheap. Returns the number of bricks dropped (so the caller can log churn).
-    pub fn update(&mut self, cam: IVec3, cfg: &StreamingConfig) -> usize {
-        self.last_cam = cam;
-        let desired = desired_residency(cam, cfg);
-        let capped = (2 * cfg.residency_radius_bricks as usize + 1).pow(3).saturating_sub(desired.len());
-        self.capped_total += capped;
+    /// A LOD change is just a different [`BrickKey`] entering + the old one leaving (different coord grids),
+    /// so there is NO retag path — each brick is voxelized at exactly one LOD. Does NOT itself voxelize, so a
+    /// huge camera jump only enqueues here (cheap). The per-move enqueue/drop is O(shell): only the bricks
+    /// whose key entered/left change, and a small move shifts only the LOD0 shell (coarse shells move
+    /// `2^L×` less often). Returns the number of bricks dropped (so the caller can log churn).
+    pub fn update(&mut self, cam_world: [f32; 3], cfg: &StreamingConfig) -> usize {
+        let desired = desired_clipmap(cam_world, cfg);
+        // The uncapped clipmap size (Σ over levels of each shell), for the cap-drop log.
+        let half = cfg.clip_half_bricks as usize;
+        let full_cube = (2 * half + 1).pow(3);
+        let inner_cube = (half + 1).pow(3); // (2·(half/2)+1)³ with half/2 → bounded approximation for the log
+        let uncapped = full_cube + MAX_LOD as usize * full_cube.saturating_sub(inner_cube);
+        self.capped_total += uncapped.saturating_sub(desired.len());
 
-        // Drop resident bricks that left the region.
+        // Drop resident bricks that left the clipmap.
         let mut dropped = 0usize;
-        let to_drop: Vec<IVec3> = self.resident.keys().filter(|c| !desired.contains_key(*c)).copied().collect();
-        for c in to_drop {
-            self.resident.remove(&c);
+        let to_drop: Vec<BrickKey> =
+            self.resident.keys().filter(|k| !desired.contains_key(*k)).copied().collect();
+        for k in to_drop {
+            self.resident.remove(&k);
             dropped += 1;
             self.dirty = true; // the GPU set shrank → must re-pack
         }
-        // Prune the empty-memo to the current region (bounds it as the camera roams; a coord that re-enters
-        // is cheaply re-voxelized + re-memoized). Deterministic terrain ⇒ an empty coord is always empty.
-        self.empty.retain(|c| desired.contains_key(c));
+        // Prune the empty-memo to the current clipmap (bounds it as the camera roams; a key that re-enters is
+        // cheaply re-voxelized + re-memoized). Deterministic terrain ⇒ an empty key is always empty.
+        self.empty.retain(|k| desired.contains_key(k));
 
-        // Reconcile each desired brick:
-        //  * RESIDENT, LOD changed (crossed a ring): the stored brick is FULL-RES and LOD-independent (the
-        //    packer downsamples at pack time), so the voxel data is UNCHANGED — just RETAG the LOD + mark
-        //    dirty. NO re-voxelize. This is the big win: a 1-brick camera move shifts every LOD-ring shell, so
-        //    re-voxelizing all those (expensive graph evals) was the dominant streaming churn (~tens of
-        //    thousands of bricks/move) when only their downsample-LOD changed.
-        //  * RESIDENT, LOD same: nothing to do.
-        //  * NOT resident (newly entered): enqueue for voxelization (if not already queued).
-        for (&coord, &want_lod) in &desired {
-            match self.resident.get_mut(&coord) {
-                Some((_, have_lod)) => {
-                    if *have_lod != want_lod {
-                        *have_lod = want_lod; // retag only; packer downsamples the unchanged full-res brick
-                        self.dirty = true;
-                    }
-                }
-                None => {
-                    // Enqueue only if not already queued AND not known-empty (a memoized all-air brick is
-                    // correctly absent from the GPU set — re-voxelizing it would find empty again).
-                    if !self.queued.contains(&coord) && !self.empty.contains(&coord) {
-                        self.queue.push_back(WorkItem { coord });
-                        self.queued.insert(coord);
-                    }
-                }
+        // Enqueue each desired brick that is NOT already resident (and not known-empty / already queued).
+        for key in desired.keys() {
+            if !self.resident.contains_key(key)
+                && !self.queued.contains(key)
+                && !self.empty.contains(key)
+            {
+                self.queue.push_back(WorkItem { key: *key });
+                self.queued.insert(*key);
             }
         }
         dropped
     }
 
-    /// Process up to `cfg.max_bricks_per_frame` queued bricks: voxelize each at its CURRENT desired LOD
-    /// (recomputed from `last_cam`), store NON-empty results as resident, and drop empty ones (sparsity).
-    /// Marks the set dirty iff at least one brick was actually added/updated — so a batch that produced only
-    /// empty bricks does NOT trigger a needless re-pack, and the old GPU scene stays valid until a
-    /// REVEALING batch lands (keep-old-until-revealed). Returns the number of bricks voxelized this call.
+    /// Process up to `cfg.max_bricks_per_frame` queued bricks: voxelize each at ITS key's LOD (the in-place
+    /// mip — coarse keys sample the surface at coarse spacing), store NON-empty results as resident, and drop
+    /// empty ones (sparsity). Marks the set dirty iff at least one brick was actually added — so a batch that
+    /// produced only empty bricks does NOT trigger a needless re-pack, and the old GPU scene stays valid until
+    /// a REVEALING batch lands (keep-old-until-revealed). Returns the number of bricks voxelized this call.
     ///
-    /// Bounded: never does more than `max_bricks_per_frame` voxelizations; leftover queue items carry to
-    /// the next call. Logs when it caps (leaves work pending).
+    /// Bounded: never does more than `max_bricks_per_frame` voxelizations; leftover queue items carry to the
+    /// next call. Logs when it caps (leaves work pending).
     pub fn drain_work(
         &mut self,
         cfg: &StreamingConfig,
@@ -265,47 +344,46 @@ impl ResidencyManager {
     ) -> usize {
         use bevy::tasks::{ComputeTaskPool, ParallelSlice};
         let budget = cfg.max_bricks_per_frame;
-        // Pop the per-frame batch first (serial, cheap): up to `budget` queued coords.
-        let mut coords: Vec<IVec3> = Vec::with_capacity(budget.min(self.queue.len()));
-        while coords.len() < budget {
+        // Pop the per-frame batch first (serial, cheap): up to `budget` queued keys.
+        let mut keys: Vec<BrickKey> = Vec::with_capacity(budget.min(self.queue.len()));
+        while keys.len() < budget {
             let Some(item) = self.queue.pop_front() else { break };
-            self.queued.remove(&item.coord);
-            coords.push(item.coord);
+            self.queued.remove(&item.key);
+            keys.push(item.key);
         }
-        let done = coords.len();
+        let done = keys.len();
         if done > 0 {
             // Voxelize the batch IN PARALLEL on the compute task pool. `voxelize_brick` is a pure function of
-            // `(coord, seed, &layer, &lib, &registry)` (all shared + Sync), so this is determinism-preserving:
-            // each coord yields an identical brick regardless of thread, and we apply the results in a fixed
-            // order — the resident set is bit-identical to the old serial loop. Chunked (~one chunk per worker)
-            // so we spawn a handful of tasks, not one per brick. (~5× of the per-frame drain on the 4090.)
-            let last_cam = self.last_cam;
+            // `(coord, lod, seed, &layer, &lib, &registry)` (all shared + Sync), so this is
+            // determinism-preserving: each key yields an identical brick regardless of thread, and we apply
+            // the results in a fixed order — the resident set is bit-identical to a serial loop. Chunked (~one
+            // chunk per worker) so we spawn a handful of tasks, not one per brick.
+            //
             // `get_or_init` (not `get`): the running app already initialized the ComputeTaskPool, but the
             // headless tests + perf harness call drain_work directly with no Bevy app — there `get()` panics,
             // so init a default pool on first use. (Same pool the live app uses when one exists.)
             let pool = ComputeTaskPool::get_or_init(bevy::tasks::TaskPool::default);
             let chunk = done.div_ceil(pool.thread_num().max(1)).max(1);
-            let results: Vec<(IVec3, Brick, u32)> = coords
-                .par_chunk_map(pool, chunk, |_, cs| {
-                    cs.iter()
-                        .map(|&c| (c, voxelize_brick(c, layer, lib, registry, seed), brick_lod(c, last_cam, cfg)))
+            let results: Vec<(BrickKey, Brick)> = keys
+                .par_chunk_map(pool, chunk, |_, ks| {
+                    ks.iter()
+                        .map(|&k| (k, voxelize_brick(k.coord, k.lod, layer, lib, registry, seed)))
                         .collect::<Vec<_>>()
                 })
                 .into_iter()
                 .flatten()
                 .collect();
-            // Apply serially (HashMap mutation): non-empty bricks become resident; an all-air brick drops any
-            // existing (coarser-LOD) resident entry. Identical to the old per-brick logic.
-            for (coord, brick, want_lod) in results {
+            // Apply serially (HashMap mutation): non-empty bricks become resident; an all-air brick is dropped.
+            for (key, brick) in results {
                 if brick.is_empty() {
-                    // All-air → never resident; MEMOIZE so future moves don't re-voxelize it (the big churn fix).
-                    self.empty.insert(coord);
-                    if self.resident.remove(&coord).is_some() {
+                    // All-air → never resident; MEMOIZE so future moves don't re-voxelize it (the churn fix).
+                    self.empty.insert(key);
+                    if self.resident.remove(&key).is_some() {
                         self.dirty = true;
                     }
                 } else {
-                    self.empty.remove(&coord); // defensive: a now-solid coord must not stay memoized empty
-                    self.resident.insert(coord, (brick, want_lod));
+                    self.empty.remove(&key); // defensive: a now-solid key must not stay memoized empty
+                    self.resident.insert(key, brick);
                     self.dirty = true;
                 }
             }
@@ -326,26 +404,27 @@ impl ResidencyManager {
         std::mem::take(&mut self.dirty)
     }
 
-    /// The resident bricks as [`ResidentBrick`] entries in a DETERMINISTIC order (sorted by brick
-    /// coordinate `(z,y,x)`), ready for [`super::gpu::pack_resident_set`]. The stable order keeps each
-    /// brick's `primitive_index` reproducible (the test oracle relies on it). Borrows `self`, so the
-    /// returned entries live as long as the manager isn't mutated.
+    /// The resident bricks as [`ResidentBrick`] entries in a DETERMINISTIC order (sorted by `(lod, z, y, x)`),
+    /// ready for [`super::gpu::pack_resident_set`]. The stable order keeps each brick's `primitive_index`
+    /// reproducible (the test oracle relies on it). Borrows `self`, so the returned entries live as long as
+    /// the manager isn't mutated.
     pub fn resident_entries(&self) -> Vec<ResidentBrick<'_>> {
-        let mut coords: Vec<IVec3> = self.resident.keys().copied().collect();
-        coords.sort_by_key(|c| (c.z, c.y, c.x));
-        coords
-            .into_iter()
-            .map(|coord| {
-                let (brick, lod) = self.resident.get(&coord).expect("coord came from keys");
-                ResidentBrick { coord, brick, lod: *lod }
+        let mut keys: Vec<BrickKey> = self.resident.keys().copied().collect();
+        keys.sort_by_key(|k| (k.lod, k.coord.z, k.coord.y, k.coord.x));
+        keys.into_iter()
+            .map(|key| {
+                let brick = self.resident.get(&key).expect("key came from keys");
+                ResidentBrick { coord: key.coord, brick, lod: key.lod }
             })
             .collect()
     }
 }
 
-/// The world-metre AABB half-extent the resident region covers around the camera (for logging / framing).
+/// The world-metre AABB half-extent the resident CLIPMAP covers around the camera (for logging / framing):
+/// the OUTERMOST shell reaches `clip_half · brick_span(MAX_LOD) = clip_half · BRICK_WORLD_SIZE · 2^MAX_LOD`.
+/// This is the clipmap view radius — `2^MAX_LOD×` the old dense-cube reach at the same `clip_half`.
 pub fn region_half_extent_m(cfg: &StreamingConfig) -> f32 {
-    cfg.residency_radius_bricks as f32 * BRICK_WORLD_SIZE
+    cfg.clip_half_bricks as f32 * brick_span(MAX_LOD)
 }
 
 #[cfg(test)]
@@ -390,87 +469,117 @@ mod tests {
         BlockRegistry::from_biome_library(&test_library())
     }
 
-    /// LOD rings: a brick at the camera is LOD0; crossing each ring threshold bumps the LOD; far bricks
-    /// clamp at MAX_LOD.
+    /// A LOD-`L` brick's containing camera coord scales with `brick_span(L)`: a fixed world position maps to
+    /// a coarser brick coord at coarser LODs (the per-level clipmap centres differ).
     #[test]
-    fn lod_rings_by_distance() {
-        let cfg = StreamingConfig { lod_ring_bricks: [6, 12, 18], ..Default::default() };
-        let cam = IVec3::new(0, 0, 0);
-        assert_eq!(brick_lod(IVec3::new(0, 0, 0), cam, &cfg), 0);
-        assert_eq!(brick_lod(IVec3::new(5, 0, 0), cam, &cfg), 0); // just inside ring 0
-        assert_eq!(brick_lod(IVec3::new(6, 0, 0), cam, &cfg), 1); // hits first threshold
-        assert_eq!(brick_lod(IVec3::new(0, 11, 0), cam, &cfg), 1);
-        assert_eq!(brick_lod(IVec3::new(0, 0, 12), cam, &cfg), 2);
-        assert_eq!(brick_lod(IVec3::new(18, 0, 0), cam, &cfg), 3);
-        assert_eq!(brick_lod(IVec3::new(999, 0, 0), cam, &cfg), MAX_LOD); // clamps
-        // Chebyshev metric: a diagonal brick uses the max axis distance.
-        assert_eq!(brick_lod(IVec3::new(6, 6, 0), cam, &cfg), 1);
+    fn camera_brick_coord_scales_with_lod() {
+        // World position 5 m: LOD0 (span 1.6) → floor(5/1.6)=3; LOD1 (3.2) → 1; LOD2 (6.4) → 0.
+        let w = [5.0, 5.0, 5.0];
+        assert_eq!(camera_brick_coord_lod(w, 0), IVec3::splat(3));
+        assert_eq!(camera_brick_coord_lod(w, 1), IVec3::splat(1));
+        assert_eq!(camera_brick_coord_lod(w, 2), IVec3::splat(0));
+        // camera_brick_coord is the LOD0 alias.
+        assert_eq!(camera_brick_coord(w), camera_brick_coord_lod(w, 0));
     }
 
-    /// The desired region is a cube of `(2r+1)³` bricks centred on the camera brick, each tagged with its
-    /// ring LOD.
+    /// The desired clipmap is NESTED SHELLS: LOD0 fills the full `(2·half+1)³` cube; each coarser level is a
+    /// SHELL `half/2 < cheby ≤ half` in its own grid. Every level is present, each a bounded shell.
     #[test]
-    fn desired_region_is_a_cube() {
-        let cfg = StreamingConfig { residency_radius_bricks: 3, lod_ring_bricks: [2, 3, 4], max_resident_bricks: 100_000, ..Default::default() };
-        let cam = IVec3::new(10, -5, 7);
-        let d = desired_residency(cam, &cfg);
-        assert_eq!(d.len(), (2 * 3 + 1usize).pow(3));
-        assert_eq!(d[&cam], 0);
-        // A corner brick (distance 3) is past the lod_ring threshold [2,3,4] → exceeds 2 and 3 → LOD2.
-        assert_eq!(d[&(cam + IVec3::new(3, 3, 3))], 2);
-        // Outside the region is absent.
-        assert!(!d.contains_key(&(cam + IVec3::new(4, 0, 0))));
+    fn desired_clipmap_is_nested_shells() {
+        let cfg = StreamingConfig { clip_half_bricks: 8, max_resident_bricks: 1_000_000, ..Default::default() };
+        let cam = [0.5_f32, 0.5, 0.5]; // near the origin
+        let d = desired_clipmap(cam, &cfg);
+        let half = cfg.clip_half_bricks;
+
+        // LOD0 is the full cube.
+        let lod0: usize = d.keys().filter(|k| k.lod == 0).count();
+        assert_eq!(lod0, (2 * half as usize + 1).pow(3), "LOD0 fills the full clip cube");
+        // Every level 0..=MAX_LOD is present (the clipmap reaches all the way out).
+        for lod in 0..=MAX_LOD {
+            assert!(d.keys().any(|k| k.lod == lod), "level {lod} present in the clipmap");
+        }
+        // Each coarse level is a SHELL: it has NO brick strictly inside the finer-level interior (cheby ≤
+        // half/2 in its grid), and DOES have bricks out at cheby == half.
+        for lod in 1..=MAX_LOD {
+            let cam_l = camera_brick_coord_lod(cam, lod);
+            let inner = half / 2;
+            assert!(
+                d.keys().filter(|k| k.lod == lod).all(|k| cheby(k.coord, cam_l) > inner),
+                "level {lod} is a shell — nothing inside the finer-level interior"
+            );
+            assert!(
+                d.keys().any(|k| k.lod == lod && cheby(k.coord, cam_l) == half),
+                "level {lod} reaches the shell's outer edge (cheby == half)"
+            );
+        }
     }
 
-    /// The resident cap drops the farthest bricks so the desired set never exceeds `max_resident_bricks`.
+    /// `brick_lod(lod0_coord, cam_world, cfg)` reports the FINEST shell covering that world position: a LOD0
+    /// brick inside the LOD0 cube is LOD0; one far enough out (past the LOD0 cube) lands in a coarse shell.
+    #[test]
+    fn brick_lod_reports_shell_level() {
+        let cfg = StreamingConfig { clip_half_bricks: 8, ..Default::default() };
+        let cam = [0.5_f32, 0.5, 0.5];
+        // The camera's own LOD0 brick is covered by LOD0.
+        assert_eq!(brick_lod(camera_brick_coord_lod(cam, 0), cam, &cfg), 0);
+        // A LOD0 brick just inside the LOD0 cube edge (cheby 7 of 8) is still LOD0.
+        assert_eq!(brick_lod(IVec3::new(7, 0, 0), cam, &cfg), 0);
+        // A LOD0 brick PAST the LOD0 cube (cheby 12 > 8) falls into the LOD1 shell: on the LOD1 grid its world
+        // centre (~20 m) is ~6 LOD1-bricks out — inside half/2(=4) < 6 ≤ 8.
+        assert_eq!(brick_lod(IVec3::new(12, 0, 0), cam, &cfg), 1);
+        // Far out (cheby 30 LOD0-bricks ≈ 48 m) is a coarser shell still.
+        assert!(brick_lod(IVec3::new(30, 0, 0), cam, &cfg) >= 2);
+    }
+
+    /// The resident cap drops the farthest (in WORLD metres) bricks so the clipmap never exceeds
+    /// `max_resident_bricks`, and the camera's own brick is always kept.
     #[test]
     fn resident_cap_drops_farthest() {
-        let cfg = StreamingConfig { residency_radius_bricks: 4, max_resident_bricks: 10, ..Default::default() };
-        let cam = IVec3::ZERO;
-        let d = desired_residency(cam, &cfg);
-        assert_eq!(d.len(), 10, "capped to max_resident_bricks");
-        // The camera brick (nearest) is always kept.
-        assert!(d.contains_key(&cam));
+        let cfg = StreamingConfig { clip_half_bricks: 8, max_resident_bricks: 50, ..Default::default() };
+        let cam = [0.5_f32, 0.5, 0.5];
+        let d = desired_clipmap(cam, &cfg);
+        assert_eq!(d.len(), 50, "capped to max_resident_bricks");
+        let cam0 = camera_brick_coord_lod(cam, 0);
+        assert!(d.contains_key(&BrickKey { coord: cam0, lod: 0 }), "the camera's LOD0 brick is always kept");
     }
 
     /// Residency reconciliation: a simulated camera move enters new bricks (enqueued, then voxelized into
     /// resident) and drops exited ones; empty (sky) bricks are skipped; the keep-old invariant holds (the
-    /// set isn't dirty until a revealing batch lands).
+    /// set isn't dirty until a revealing batch lands). Resident bricks always lie within the clipmap.
     #[test]
     fn residency_updates_as_camera_moves() {
         let layer = test_layer();
         let lib = test_library();
         let reg = registry();
-        // Small region near the surface so most bricks are non-empty terrain.
+        // Place the camera AT the surface so the inner LOD0 cube straddles terrain (non-empty bricks).
         let surf = layer.sample_world(0.0, 0.0, SEED).height;
-        let surf_brick_y = (surf / BRICK_WORLD_SIZE).floor() as i32;
-        let cfg = StreamingConfig { residency_radius_bricks: 2, lod_ring_bricks: [1, 2, 3], max_resident_bricks: 10_000, max_bricks_per_frame: 1000 };
+        let cfg = StreamingConfig { clip_half_bricks: 2, max_resident_bricks: 100_000, max_bricks_per_frame: 100_000 };
 
         let mut mgr = ResidencyManager::new();
-        let cam0 = IVec3::new(0, surf_brick_y, 0);
+        let cam0 = [0.0_f32, surf, 0.0];
         mgr.update(cam0, &cfg);
-        assert!(mgr.pending() > 0, "entering a fresh region enqueues work");
+        assert!(mgr.pending() > 0, "entering a fresh clipmap enqueues work");
         assert!(!mgr.is_dirty(), "no bricks voxelized yet → not dirty (keep-old)");
 
-        let n0 = mgr.drain_work(&cfg, &layer, &lib, &reg, SEED);
-        assert_eq!(n0, (2 * 2 + 1i32).pow(3) as usize, "voxelized the whole 5³ region in one drain");
+        mgr.drain_work(&cfg, &layer, &lib, &reg, SEED);
         assert!(mgr.is_dirty(), "voxelizing real terrain bricks reveals new geometry → dirty");
         assert!(mgr.take_dirty());
-        let resident0 = mgr.resident_count();
-        assert!(resident0 > 0 && resident0 <= 125, "some non-empty bricks resident, ≤ region size");
+        assert!(mgr.resident_count() > 0, "some non-empty bricks resident");
 
-        // Move the camera +5 bricks in X (region fully shifts). New bricks enter, far ones drop.
-        let cam1 = cam0 + IVec3::new(5, 0, 0);
+        // Move the camera +5 m in X (crosses a few LOD0 bricks). New bricks enter, far ones drop.
+        let cam1 = [5.0_f32, surf, 0.0];
         let dropped = mgr.update(cam1, &cfg);
         assert!(dropped > 0, "moving away drops the bricks left behind");
         mgr.drain_work(&cfg, &layer, &lib, &reg, SEED);
-        // After the move every resident brick lies within the new region.
+        // Every resident brick lies within its level's clipmap shell around the new camera.
+        let half = cfg.clip_half_bricks;
         for e in mgr.resident_entries() {
-            assert!(cheby(e.coord, cam1) <= cfg.residency_radius_bricks, "resident bricks stay in-region");
+            let cam_l = camera_brick_coord_lod(cam1, e.lod);
+            assert!(cheby(e.coord, cam_l) <= half, "resident bricks stay in the clipmap");
         }
     }
 
-    /// The per-frame cap bounds work: a large fresh region drains at most `max_bricks_per_frame` per call,
+    /// The per-frame cap bounds work: a large fresh clipmap drains at most `max_bricks_per_frame` per call,
     /// carrying the rest in the queue across calls until empty.
     #[test]
     fn carry_queue_caps_per_frame_work() {
@@ -478,55 +587,57 @@ mod tests {
         let lib = test_library();
         let reg = registry();
         let surf = layer.sample_world(0.0, 0.0, SEED).height;
-        let surf_brick_y = (surf / BRICK_WORLD_SIZE).floor() as i32;
-        let cfg = StreamingConfig { residency_radius_bricks: 4, lod_ring_bricks: [2, 3, 4], max_resident_bricks: 10_000, max_bricks_per_frame: 50 };
+        let cfg = StreamingConfig { clip_half_bricks: 3, max_resident_bricks: 1_000_000, max_bricks_per_frame: 50 };
 
         let mut mgr = ResidencyManager::new();
-        let cam = IVec3::new(0, surf_brick_y, 0);
+        let cam = [0.0_f32, surf, 0.0];
         mgr.update(cam, &cfg);
-        let total = (2 * 4 + 1i32).pow(3) as usize; // 729
-        assert_eq!(mgr.pending(), total);
+        let total = mgr.pending();
+        assert!(total > 50, "the clipmap enqueues more than one frame's budget");
 
-        // Each drain does at most 50; it takes ceil(729/50)=15 drains to clear the queue.
         let mut drains = 0;
+        let mut voxelized = 0usize;
         while mgr.pending() > 0 {
             let n = mgr.drain_work(&cfg, &layer, &lib, &reg, SEED);
             assert!(n <= 50, "never exceeds the per-frame cap");
+            voxelized += n;
             drains += 1;
-            assert!(drains <= 20, "must terminate");
+            assert!(drains <= total / 50 + 5, "must terminate");
         }
-        assert_eq!(drains, total.div_ceil(50));
+        assert_eq!(voxelized, total, "every enqueued brick is eventually voxelized");
+        assert_eq!(drains, total.div_ceil(50), "carries the rest across frames");
     }
 
-    /// LOD change re-queues a brick: as a brick crosses into a coarser ring (camera moves so the brick's
-    /// Chebyshev distance grows), `update` enqueues it for re-voxelization at the new LOD.
+    /// A LOD change is a DIFFERENT key: when the camera moves so a world region's covering level shifts (the
+    /// shell boundary crosses it), the old `(coord, lod)` key leaves the clipmap and a new `(coord', lod')`
+    /// key enters — voxelized fresh at the new LOD's coarse spacing, never silently re-tagged. We verify a
+    /// move re-keys: a coord that was LOD0-resident is no longer LOD0-resident once it falls into the LOD1
+    /// shell, and the manager enqueues the new coarse key.
     #[test]
-    fn lod_change_requeues_brick() {
+    fn lod_change_is_a_fresh_key() {
         let layer = test_layer();
         let lib = test_library();
         let reg = registry();
         let surf = layer.sample_world(0.0, 0.0, SEED).height;
-        let surf_brick_y = (surf / BRICK_WORLD_SIZE).floor() as i32;
-        let cfg = StreamingConfig { residency_radius_bricks: 6, lod_ring_bricks: [2, 4, 6], max_resident_bricks: 10_000, max_bricks_per_frame: 10_000 };
+        let cfg = StreamingConfig { clip_half_bricks: 4, max_resident_bricks: 1_000_000, max_bricks_per_frame: 1_000_000 };
 
         let mut mgr = ResidencyManager::new();
-        let cam0 = IVec3::new(0, surf_brick_y, 0);
+        let cam0 = [0.0_f32, surf, 0.0];
         mgr.update(cam0, &cfg);
         mgr.drain_work(&cfg, &layer, &lib, &reg, SEED);
         mgr.take_dirty();
-
-        // Pick a resident brick at LOD0 near the camera, then move the camera so its distance jumps a ring.
-        let probe = IVec3::new(0, surf_brick_y, 1); // distance 1 from cam0 → LOD0
-        if mgr.resident_entries().iter().any(|e| e.coord == probe) {
-            let lod_before = mgr.resident_entries().into_iter().find(|e| e.coord == probe).unwrap().lod;
-            assert_eq!(lod_before, 0);
-            // Move camera away so `probe` is now ≥ ring threshold 2 (distance 3).
-            let cam1 = probe + IVec3::new(3, 0, 0);
-            mgr.update(cam1, &cfg);
-            assert!(mgr.pending() > 0, "the LOD-changed brick is re-queued");
-            mgr.drain_work(&cfg, &layer, &lib, &reg, SEED);
-            let lod_after = mgr.resident_entries().into_iter().find(|e| e.coord == probe).map(|e| e.lod);
-            assert_eq!(lod_after, Some(1), "the brick is now stored at the coarser ring's LOD");
+        // Every resident brick is in SOME shell of the desired clipmap (keys are well-formed).
+        let d0 = desired_clipmap(cam0, &cfg);
+        for e in mgr.resident_entries() {
+            assert!(d0.contains_key(&BrickKey { coord: e.coord, lod: e.lod }), "resident keys are desired");
         }
+
+        // Jump the camera far in +X so the inner cube fully shifts: the old keys leave, new ones enter and are
+        // enqueued (a re-key, not a retag).
+        let jump = brick_span(0) * (cfg.clip_half_bricks as f32 * 2.0 + 1.0);
+        let cam1 = [jump, surf, 0.0];
+        let dropped = mgr.update(cam1, &cfg);
+        assert!(dropped > 0, "the fully-shifted clipmap drops the old keys");
+        assert!(mgr.pending() > 0, "and enqueues the new keys (fresh voxelize at their LOD)");
     }
 }

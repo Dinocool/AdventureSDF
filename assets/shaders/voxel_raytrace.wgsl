@@ -18,10 +18,12 @@ enable wgpu_ray_query;
 
 // --- SSOT layout (mirrors src/voxel/gpu.rs) ---------------------------------------------------------
 
-// Brick geometry constants (mirror src/voxel/brickmap.rs). 8³ voxels of 0.2 m → 1.6 m brick.
+// Brick geometry constants (mirror src/voxel/brickmap.rs). A brick is ALWAYS 8³ voxels; only its world span
+// scales with LOD (the clipmap). LOD0 = 8³ voxels of 0.2 m → a 1.6 m brick.
 const BRICK_EDGE: i32 = 8;
 const VOXEL_SIZE: f32 = 0.2;
-// World-metre extent of a brick (= BRICK_EDGE · VOXEL_SIZE = 1.6 m).
+// World-metre span of a LOD0 brick (= BRICK_EDGE · VOXEL_SIZE = 1.6 m). A LOD-L brick spans
+// brick_span(L) = BRICK_WORLD_SIZE · 2^L — see `brick_span` below (the clipmap SSOT mirror of brickmap.rs).
 const BRICK_WORLD_SIZE: f32 = f32(BRICK_EDGE) * VOXEL_SIZE;
 // The per-side AABB grow used to overlap abutting bricks — the SEAM fix. MUST mirror `BRICK_AABB_EPSILON`
 // in src/voxel/gpu.rs. The shader recomputes the per-brick ray/AABB slab from the GROWN bounds (matching
@@ -30,37 +32,46 @@ const BRICK_WORLD_SIZE: f32 = f32(BRICK_EDGE) * VOXEL_SIZE;
 // real grid, so the halo never adds phantom voxels.
 const BRICK_AABB_EPSILON: f32 = VOXEL_SIZE * 1.0e-3;
 
-// Max LOD level (mirrors src/voxel/brickmap.rs MAX_LOD). LOD0 = 8³, LOD3 = 1³.
-const MAX_LOD: u32 = 3u;
+// Max LOD level (mirrors src/voxel/brickmap.rs MAX_LOD = 7). A brick is 8³ at every LOD; the coarsest level
+// spans 2^7 = 128× the LOD0 world extent — the clipmap's outer reach (~1.6 km half-extent at clip_half 8).
+const MAX_LOD: u32 = 7u;
 
 // One brick's metadata (parallel to the AABB / BLAS primitive array). 32 bytes — matches `GpuBrickMeta`.
-// Variable per-brick LOD: the grid EDGE and per-cell world size are DERIVED from `lod`, not constant, so a
-// coarse brick is DDA-marched over its coarse grid (`BRICK_EDGE >> lod` cells of `VOXEL_SIZE << lod` m).
+// The grid is ALWAYS 8³ (clipmap); the per-cell world size + the brick SPAN are DERIVED from `lod`, so a
+// coarse brick is DDA-marched over the SAME 8³ grid covering 2^lod× more world.
 struct BrickMeta {
     voxel_origin: vec3<i32>,  // brick's world-VOXEL origin (= brick_coord · BRICK_EDGE)
-    voxel_offset: u32,        // start of this brick's lod_edge(lod)³ block ids in `voxels`
-    world_min: vec3<f32>,     // brick's world-metre min corner
-    lod: u32,                 // brick LOD level (0 = full 8³)
+    voxel_offset: u32,        // start of this brick's haloed 10³ block ids in `voxels`
+    world_min: vec3<f32>,     // brick's world-metre min corner (= coord · brick_span(lod))
+    lod: u32,                 // brick LOD level (0 = finest)
 };
 
-// The CORE grid edge (cells per axis) of a brick at LOD `lod`: BRICK_EDGE >> lod. SSOT mirror of `lod_edge`.
+// The CORE grid edge (cells per axis) of a brick at LOD `lod`: a CONSTANT BRICK_EDGE (8) at every LOD — the
+// clipmap scales the world span, not the resolution. SSOT mirror of `lod_edge` in brickmap.rs.
 fn lod_edge(lod: u32) -> i32 {
-    return BRICK_EDGE >> min(lod, MAX_LOD);
+    return BRICK_EDGE;
 }
 
-// The STORED grid edge: the core grid PLUS a 1-cell HALO border on every side (so `core + 2`). The packer
-// fills the border with the adjacent NEIGHBOUR brick's boundary voxels (AIR where the neighbour is absent),
-// so the DDA always crosses a real air→solid cell boundary AT the true surface — even when that surface lies
-// exactly on a brick face. This is the seam fix: it gives the first-solid hit the correct entry-face normal
-// (and an always-present boundary cell) from EVERY direction, instead of guessing the face at a brick corner
-// (which produced the sideways normal → thin dark line at oblique angles). Mirrors `halo_edge` in gpu.rs.
+// The STORED grid edge: the core 8³ grid PLUS a 1-cell HALO border on every side (so 10). The packer fills
+// the border with the adjacent SAME-LOD NEIGHBOUR brick's boundary voxels (AIR where absent / a different
+// LOD — a clipmap shell boundary), so the DDA always crosses a real air→solid cell boundary AT the true
+// surface — even when that surface lies exactly on a brick face. This is the seam fix: it gives the
+// first-solid hit the correct entry-face normal (and an always-present boundary cell) from EVERY direction.
+// Mirrors `halo_edge` in gpu.rs.
 fn halo_edge(lod: u32) -> i32 {
     return lod_edge(lod) + 2;
 }
 
-// The world-metre size of one cell of a brick at LOD `lod`: VOXEL_SIZE << lod. Mirror of `lod_voxel_size`.
+// The world-metre size of one cell of a brick at LOD `lod`: VOXEL_SIZE · 2^lod. Mirror of `lod_voxel_size`.
 fn lod_cell_size(lod: u32) -> f32 {
     return VOXEL_SIZE * f32(1u << min(lod, MAX_LOD));
+}
+
+// The world-metre SPAN of a brick at LOD `lod`: BRICK_WORLD_SIZE · 2^lod (= BRICK_EDGE · lod_cell_size). The
+// clipmap SSOT — mirrors `brick_span` in brickmap.rs / gpu.rs. The brick's true world AABB is
+// [world_min, world_min + brick_span(lod)); a coarse brick covers 2^lod× more world.
+fn brick_span(lod: u32) -> f32 {
+    return BRICK_WORLD_SIZE * f32(1u << min(lod, MAX_LOD));
 }
 
 // One palette entry (mirrors `GpuPaletteColor` in src/voxel/gpu.rs): linear-RGBA albedo + linear-RGB
@@ -241,8 +252,9 @@ fn dda_brick(prim: u32, ro: vec3<f32>, rd: vec3<f32>, t_enter: f32, t_exit: f32)
 // entry cell into `[0, edge)`, so the grown halo never adds a phantom cell.
 fn brick_hit_at(prim: u32, ro: vec3<f32>, rd: vec3<f32>) -> vec4<f32> {
     let m = metas[prim];
+    let span = brick_span(m.lod); // clipmap: a LOD-L brick spans 2^L× more world (NOT LOD-invariant)
     let bmin = m.world_min - vec3<f32>(BRICK_AABB_EPSILON);
-    let bmax = m.world_min + vec3<f32>(BRICK_WORLD_SIZE + BRICK_AABB_EPSILON);
+    let bmax = m.world_min + vec3<f32>(span + BRICK_AABB_EPSILON);
     let inv = 1.0 / rd;
     let ta = (bmin - ro) * inv;
     let tb = (bmax - ro) * inv;
@@ -274,9 +286,11 @@ fn trace(ro: vec3<f32>, rd: vec3<f32>, t_min: f32, t_max: f32) -> TraceResult {
             let m = metas[c.primitive_index];
             // Slab against the GROWN brick bounds (same overlap as the BLAS AABB — the seam fix). Using the
             // grown bounds keeps a face-grazing axis-parallel ray off the exact tangent plane (where the true
-            // bounds give a 0·inf = NaN slab t), so it reliably enters the brick.
+            // bounds give a 0·inf = NaN slab t), so it reliably enters the brick. `brick_span(m.lod)` is the
+            // clipmap span — a coarse brick covers 2^lod× more world (the AABB is NOT LOD-invariant).
+            let span = brick_span(m.lod);
             let bmin = m.world_min - vec3<f32>(BRICK_AABB_EPSILON);
-            let bmax = m.world_min + vec3<f32>(BRICK_WORLD_SIZE + BRICK_AABB_EPSILON);
+            let bmax = m.world_min + vec3<f32>(span + BRICK_AABB_EPSILON);
             let inv = 1.0 / rd;
             let ta = (bmin - ro) * inv;
             let tb = (bmax - ro) * inv;
@@ -338,9 +352,11 @@ fn trace_occluded(ro: vec3<f32>, rd: vec3<f32>, t_min: f32, t_max: f32) -> bool 
         let c = rayQueryGetCandidateIntersection(&rq);
         if (c.kind == RAY_QUERY_INTERSECTION_AABB) {
             let m = metas[c.primitive_index];
-            // Grown-bounds slab (matches the BLAS AABB overlap — the seam fix; see `trace`).
+            // Grown-bounds slab (matches the BLAS AABB overlap — the seam fix; see `trace`). `brick_span(m.lod)`
+            // is the clipmap span (a coarse brick covers 2^lod× more world).
+            let span = brick_span(m.lod);
             let bmin = m.world_min - vec3<f32>(BRICK_AABB_EPSILON);
-            let bmax = m.world_min + vec3<f32>(BRICK_WORLD_SIZE + BRICK_AABB_EPSILON);
+            let bmax = m.world_min + vec3<f32>(span + BRICK_AABB_EPSILON);
             let inv = 1.0 / rd;
             let ta = (bmin - ro) * inv;
             let tb = (bmax - ro) * inv;

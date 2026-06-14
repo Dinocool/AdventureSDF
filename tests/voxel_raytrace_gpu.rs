@@ -25,7 +25,7 @@ use adventure::sdf_render::worldgen::coord::LayerId;
 use adventure::sdf_render::worldgen::layers::erosion::ErosionParams;
 use adventure::sdf_render::worldgen::layers::height::{HeightLayer, HeightParams};
 use adventure::voxel::brickmap::{
-    BRICK_EDGE, BRICK_WORLD_SIZE, Brick, BrickMap, VOXEL_SIZE, brick_coord_of_voxel, lod_edge,
+    BRICK_EDGE, BRICK_WORLD_SIZE, Brick, BrickMap, VOXEL_SIZE, brick_coord_of_voxel, brick_span, lod_edge,
     lod_voxel_size,
 };
 use adventure::voxel::gpu::{GpuBrickPatch, ResidentBrick, pack_brickmap, pack_resident_set};
@@ -127,7 +127,7 @@ fn voxelize_region(
         for by in bc_min.y..=bc_max.y {
             for bx in bc_min.x..=bc_max.x {
                 let coord = IVec3::new(bx, by, bz);
-                map.insert(coord, voxelize_brick(coord, layer, lib, reg, SEED));
+                map.insert(coord, voxelize_brick(coord, 0, layer, lib, reg, SEED));
             }
         }
     }
@@ -434,7 +434,7 @@ fn cpu_first_solid_packed(patch: &GpuBrickPatch, ro: Vec3, rd: Vec3, t_max: f32)
     let mut best: Option<(u32, f32)> = None;
     for (bi, m) in patch.metas.iter().enumerate() {
         let bmin = Vec3::from(m.world_min);
-        let bmax = bmin + Vec3::splat(BRICK_WORLD_SIZE);
+        let bmax = bmin + Vec3::splat(brick_span(m.lod)); // clipmap: coarse bricks span 2^lod× more world
         // Ray/AABB slab test → [t_enter, t_exit].
         let inv = Vec3::new(1.0 / rd.x, 1.0 / rd.y, 1.0 / rd.z);
         let ta = (bmin - ro) * inv;
@@ -515,11 +515,12 @@ fn cpu_first_solid_packed(patch: &GpuBrickPatch, ro: Vec3, rd: Vec3, t_max: f32)
     best
 }
 
-/// **The Stage-3 multi-LOD GPU oracle.** Builds a multi-brick STREAMED region with MIXED per-brick LODs
-/// (near bricks LOD0 full-res, far bricks LOD1/LOD2 coarse), packs it via the SSOT `pack_resident_set`,
-/// builds the BLAS/TLAS, runs the REAL `voxel_raytrace.wgsl` for several rays, and asserts each GPU hit
-/// (block id + world-t) matches a CPU DDA over the SAME LOD'd packed grids. This is the key correctness
-/// proof that a coarse-LOD brick is marched at its coarse resolution correctly on the GPU.
+/// **The multi-LOD CLIPMAP GPU oracle.** Builds a brick set with MIXED per-brick LODs placed at their TRUE
+/// clipmap world positions — different LODs are DIFFERENT coord grids (`world_min = coord · brick_span(lod)`,
+/// a coarse brick spans `2^lod×` more world). Packs it via the SSOT `pack_resident_set`, builds the
+/// BLAS/TLAS, runs the REAL `voxel_raytrace.wgsl` for several rays, and asserts each GPU hit (block id +
+/// world-t) matches a CPU DDA over the SAME LOD'd packed grids. The key proof that a coarse-LOD brick is
+/// marched over its coarse-cell grid (covering more world) correctly on the GPU.
 #[test]
 fn gpu_mixed_lod_matches_cpu_ground_truth() {
     let Some((device, queue)) = common::headless_ray_query_device() else {
@@ -527,21 +528,22 @@ fn gpu_mixed_lod_matches_cpu_ground_truth() {
         return;
     };
 
-    // A flat solid floor (block 1) filling a row of bricks, with a block-2 pillar in one brick so the
-    // majority-block downsample is observable. Build a small explicit brick set with hand-assigned LODs.
     let reg = {
         let lib = test_library();
         BlockRegistry::from_biome_library(&lib)
     };
 
-    // Bricks laid out along +X at y=0,z=0: a solid floor brick at each x in 0..6. The near ones (small x)
-    // get LOD0, far ones LOD1/LOD2 — a deliberate mixed-LOD region.
-    let mut bricks: Vec<(IVec3, Brick, u32)> = Vec::new();
-    for x in 0..6i32 {
-        // Each brick: fully solid block 1, except brick x=2 has its upper half block 2 (so LOD downsample
-        // must resolve a majority per coarse cell).
+    // Three side-by-side bands along +X, each at its OWN LOD's world span (the clipmap layout). A fully-solid
+    // floor brick (block 1) fills each band's X cells; the LOD1 pillar brick gets a block-2 top half so a
+    // coarse-cell read is observable. Each band is placed at an explicit GRID-ALIGNED coord range so the
+    // bricks' world bounds (`coord · brick_span(lod)`) are exact (no rounding gaps).
+    //   LOD0: coords {0,1} → world X [0, 3.2)   (span 1.6)
+    //   LOD1: coords {2,3} → world X [6.4, 12.8) (span 3.2; pillar in coord 3 = [9.6, 12.8))
+    //   LOD2: coords {2,3} → world X [12.8, 25.6) (span 6.4)
+    let mut entries_owned: Vec<(IVec3, Brick, u32)> = Vec::new();
+    let solid_floor = |pillar: bool| {
         let mut v = Box::new([BlockId(1); BRICK_EDGE as usize * BRICK_EDGE as usize * BRICK_EDGE as usize]);
-        if x == 2 {
+        if pillar {
             for zz in 0..BRICK_EDGE {
                 for yy in 4..BRICK_EDGE {
                     for xx in 0..BRICK_EDGE {
@@ -550,16 +552,17 @@ fn gpu_mixed_lod_matches_cpu_ground_truth() {
                 }
             }
         }
-        let brick = Brick::from_voxels(v);
-        let lod = match x {
-            0 | 1 => 0u32, // near: full res
-            2 | 3 => 1u32, // mid: 4³
-            _ => 2u32,     // far: 2³
-        };
-        bricks.push((IVec3::new(x, 0, 0), brick, lod));
-    }
+        Brick::from_voxels(v)
+    };
+    entries_owned.push((IVec3::new(0, 0, 0), solid_floor(false), 0));
+    entries_owned.push((IVec3::new(1, 0, 0), solid_floor(false), 0));
+    entries_owned.push((IVec3::new(2, 0, 0), solid_floor(false), 1));
+    entries_owned.push((IVec3::new(3, 0, 0), solid_floor(true), 1)); // pillar
+    entries_owned.push((IVec3::new(2, 0, 0), solid_floor(false), 2));
+    entries_owned.push((IVec3::new(3, 0, 0), solid_floor(false), 2));
+
     let entries: Vec<ResidentBrick> =
-        bricks.iter().map(|(c, b, l)| ResidentBrick { coord: *c, brick: b, lod: *l }).collect();
+        entries_owned.iter().map(|(c, b, l)| ResidentBrick { coord: *c, brick: b, lod: *l }).collect();
     let patch = pack_resident_set(&entries, &reg);
     assert!(!patch.is_empty());
     // Sanity: mixed LODs actually present in the packed metas.
@@ -713,8 +716,12 @@ fn gpu_mixed_lod_matches_cpu_ground_truth() {
         gpu
     };
 
-    // Each brick spans [x*S, (x+1)*S] in world X (S = BRICK_WORLD_SIZE), full S in Y/Z from 0.
-    let s = BRICK_WORLD_SIZE;
+    // Band world-X layout (the clipmap, grid-aligned coords): LOD0 coords {0,1} = X [0, 3.2); LOD1 coords
+    // {2,3} = X [6.4, 12.8) (pillar brick coord 3 = [9.6, 12.8)); LOD2 coords {2,3} = X [12.8, 25.6). Each
+    // band's bricks span their LOD's world height [0, brick_span(lod)) in Y/Z.
+    let s0 = BRICK_WORLD_SIZE; // 1.6
+    let s1 = brick_span(1); // 3.2
+    let s2 = brick_span(2); // 6.4
     let assert_matches = |label: &str, ro: Vec3, rd: Vec3| {
         let (cpu_id, cpu_t) =
             cpu_first_solid_packed(&patch, ro, rd, t_max).expect("CPU ray must hit a brick");
@@ -730,16 +737,16 @@ fn gpu_mixed_lod_matches_cpu_ground_truth() {
         );
     };
 
-    // Ray 1: straight down into the LOD0 near brick x=0 (full-res floor, block 1).
-    assert_matches("down_lod0", Vec3::new(s * 0.5, s + 2.0, s * 0.5), Vec3::new(0.0, -1.0, 0.0));
-    // Ray 2: straight down into the LOD1 brick x=2 — top half is block 2, so the surface hit is block 2,
-    // and it must be resolved on the 4³ coarse grid.
-    assert_matches("down_lod1_pillar", Vec3::new(s * 2.5, s + 2.0, s * 0.5), Vec3::new(0.0, -1.0, 0.0));
-    // Ray 3: straight down into a LOD2 far brick x=5 (2³ coarse grid, block 1 floor).
-    assert_matches("down_lod2", Vec3::new(s * 5.5, s + 2.0, s * 0.5), Vec3::new(0.0, -1.0, 0.0));
-    // Ray 4: a near-horizontal ray skimming +X across the row from before x=0 — crosses several bricks of
-    // DIFFERENT LODs; the nearest solid hit (the first brick's wall) must win the TLAS merge.
-    assert_matches("across_mixed", Vec3::new(-2.0, s * 0.5, s * 0.5), Vec3::new(1.0, 0.0, 0.0));
+    // Ray 1: straight DOWN into the LOD0 band (full-res floor, block 1), from above its top (Y = s0).
+    assert_matches("down_lod0", Vec3::new(s0 * 0.5, s0 + 2.0, s0 * 0.5), Vec3::new(0.0, -1.0, 0.0));
+    // Ray 2: straight DOWN into the LOD1 PILLAR brick (coord 3, world X [9.6, 12.8)): its top half (world Y
+    // [1.6, 3.2)) is block 2, marched on the LOD1 (0.4 m) coarse grid — the surface hit must be block 2.
+    assert_matches("down_lod1_pillar", Vec3::new(3.0 * s1 + s1 * 0.5, s1 + 2.0, s1 * 0.5), Vec3::new(0.0, -1.0, 0.0));
+    // Ray 3: straight DOWN into the LOD2 band (coord 2, world X [12.8, 19.2), 0.8 m coarse grid, block 1).
+    assert_matches("down_lod2", Vec3::new(2.0 * s2 + s2 * 0.5, s2 + 2.0, s2 * 0.5), Vec3::new(0.0, -1.0, 0.0));
+    // Ray 4: a horizontal ray skimming +X from before the LOD0 band, into the LOD0 floor — the nearest solid
+    // hit (the first LOD0 brick's −X wall) must win the TLAS merge across mixed-LOD AABBs.
+    assert_matches("across_mixed", Vec3::new(-2.0, s0 * 0.5, s0 * 0.5), Vec3::new(1.0, 0.0, 0.0));
 
     let _ = (&aabb_buf, &meta_buf, &voxel_buf, &palette_buf, &blas, &tlas);
 }

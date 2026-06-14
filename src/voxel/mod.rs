@@ -216,7 +216,7 @@ fn voxelize_patch(
         for by in bc_min.y..=bc_max.y {
             for bx in bc_min.x..=bc_max.x {
                 let coord = IVec3::new(bx, by, bz);
-                let brick = voxelize_brick(coord, layer, lib, registry, seed);
+                let brick = voxelize_brick(coord, 0, layer, lib, registry, seed); // static patch = all LOD0
                 map.insert(coord, brick); // empty bricks are dropped by insert
             }
         }

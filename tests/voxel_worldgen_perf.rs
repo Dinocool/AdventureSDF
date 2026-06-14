@@ -44,10 +44,12 @@ use adventure::sdf_render::worldgen::graph::GraphAsset;
 use adventure::sdf_render::worldgen::layers::erosion::ErosionParams;
 use adventure::sdf_render::worldgen::layers::height::HeightParams;
 use adventure::sdf_render::worldgen::{WORLDGEN_SLICE_SEED, WorldBiomeShapes, WorldGraph};
-use adventure::voxel::brickmap::{BRICK_WORLD_SIZE, Brick};
+use adventure::voxel::brickmap::{BRICK_WORLD_SIZE, Brick, MAX_LOD, brick_span};
 use adventure::voxel::gpu::{GpuBrickAabb, GpuBrickMeta, GpuPaletteColor, pack_resident_set};
 use adventure::voxel::palette::BlockRegistry;
-use adventure::voxel::streaming::{ResidencyManager, StreamingConfig, camera_brick_coord};
+use adventure::voxel::streaming::{
+    ResidencyManager, StreamingConfig, camera_brick_coord, region_half_extent_m,
+};
 use adventure::voxel::voxelize::voxelize_brick;
 use adventure::voxel::{build_height_layer_pub, load_biome_library_pub};
 use adventure::sdf_render::worldgen::layers::height::HeightLayer;
@@ -102,18 +104,19 @@ fn worldgen_stack() -> (HeightLayer, adventure::sdf_render::worldgen::biome::Bio
     (layer, lib, registry, label)
 }
 
-/// The SHIPPING `StreamingConfig` the worldgen scene runs with (the `Default` — radius 28 bricks ≈ 45 m,
-/// LOD rings [6,12,18], cap 60_000 resident, 256 bricks/frame). The single SSOT knob the live path uses.
+/// The SHIPPING `StreamingConfig` the worldgen scene runs with (the `Default` — clip_half 8 bricks ⇒ a
+/// nested clipmap of `MAX_LOD+1` shells reaching ~820 m, cap 60_000 resident, 256 bricks/frame). The single
+/// SSOT knob the live path uses.
 fn shipping_config() -> StreamingConfig {
     StreamingConfig::default()
 }
 
-/// The camera brick at the worldgen reframe pose: the editor frames the origin surface (`reframe_camera_on_patch`
-/// sets `target = (0, surface_y, 0)`, eye ~40 m back). We center the streaming region on the SURFACE brick at
-/// the origin — that's where the densest non-empty terrain bricks (and the worst-case fill) live.
-fn origin_surface_cam(layer: &HeightLayer) -> IVec3 {
+/// The camera WORLD position at the worldgen reframe pose: the editor frames the origin surface. We center
+/// the clipmap on the SURFACE at the origin — where the densest non-empty terrain bricks (and the worst-case
+/// fill) live.
+fn origin_surface_cam(layer: &HeightLayer) -> [f32; 3] {
     let surf = layer.sample_world(0.0, 0.0, SEED).height;
-    camera_brick_coord([0.0, surf, 0.0])
+    [0.0, surf, 0.0]
 }
 
 /// p50/p95/max over a slice of durations (ms), plus the mean. Small, dependency-free percentile (nearest-rank).
@@ -138,13 +141,15 @@ fn stats_ms(samples: &[Duration]) -> (f64, f64, f64, f64) {
 fn bench_voxelize_brick_cost() {
     let (layer, lib, registry, label) = worldgen_stack();
     let cam = origin_surface_cam(&layer);
+    let cam_brick = camera_brick_coord(cam);
 
-    // Sample a spread of surface-straddling bricks (a 7×7 XZ tile at the surface Y band, plus a few Y above/below).
+    // Sample a spread of surface-straddling LOD0 bricks (a 7×7 XZ tile at the surface Y band, plus a few Y
+    // above/below). LOD0 is the per-frame hot path (the densest, full-res bricks).
     let mut coords = Vec::new();
     for dz in -3..=3 {
         for dx in -3..=3 {
             for dy in -1..=1 {
-                coords.push(cam + IVec3::new(dx, dy, dz));
+                coords.push(cam_brick + IVec3::new(dx, dy, dz));
             }
         }
     }
@@ -154,7 +159,7 @@ fn bench_voxelize_brick_cost() {
     let mut empty = 0usize;
     let mut uniform_solid = 0usize;
     for &c in &coords {
-        let b = voxelize_brick(c, &layer, &lib, &registry, SEED);
+        let b = voxelize_brick(c, 0, &layer, &lib, &registry, SEED);
         if b.is_empty() {
             empty += 1;
         } else if b.is_uniform_solid() {
@@ -169,7 +174,7 @@ fn bench_voxelize_brick_cost() {
     let mut sink = 0u64;
     for _ in 0..ITERS {
         for &c in &coords {
-            let b = voxelize_brick(c, &layer, &lib, &registry, SEED);
+            let b = voxelize_brick(c, 0, &layer, &lib, &registry, SEED);
             sink = sink.wrapping_add(b.get(0, 0, 0).0 as u64);
         }
     }
@@ -257,11 +262,13 @@ fn bench_initial_fill_cold() {
     let drain_total: f64 = drain_times.iter().map(|d| d.as_secs_f64() * 1e3).sum();
     let pack_total: f64 = pack_times.iter().map(|d| d.as_secs_f64() * 1e3).sum();
 
-    let region_uncapped = (2 * cfg.residency_radius_bricks as usize + 1).pow(3);
     println!("\n========== INITIAL FILL (cold stream into worldgen) — graph={label} ==========");
     println!(
-        "region enqueued      : {region} brick coords (radius {} ⇒ (2r+1)³ = {region_uncapped}, capped at {}), {update_ms:.3} ms to enqueue",
-        cfg.residency_radius_bricks, cfg.max_resident_bricks,
+        "clipmap enqueued     : {region} brick coords (clip_half {} ⇒ {} nested LOD shells, view ≈ {:.0} m, capped at {}), {update_ms:.3} ms to enqueue",
+        cfg.clip_half_bricks,
+        MAX_LOD + 1,
+        region_half_extent_m(&cfg),
+        cfg.max_resident_bricks,
     );
     println!("frames to settle     : {frames} (at {} bricks/frame)", cfg.max_bricks_per_frame);
     println!("bricks voxelized      : {total_voxelized} total");
@@ -303,12 +310,10 @@ fn bench_steady_state_moving() {
     mgr.take_dirty();
     let warm_resident = mgr.resident_count();
 
-    // The script: 6 single-brick +X steps (a straight surface traverse), then 1 jump of +6 bricks (crossing
-    // LOD rings + revealing a deep fresh slab), then 6 more single-brick steps. Deterministic. Kept short
-    // because each brick-step at radius 28 reveals a whole region FACE-slab (~(2r+1)² ≈ 3.2k coords) that
-    // takes MANY bounded 256-brick drains to settle — and EACH dirty drain re-packs the full resident set — so
-    // even a dozen steps exercises hundreds of packs. The per-DRAIN / per-PACK stats (the real per-frame
-    // hitches) converge well before then; more steps only lengthen the run, they don't change the per-unit cost.
+    // The script: 6 single-brick (one `brick_span(0)` = 1.6 m) +X steps (a straight surface traverse), then 1
+    // jump of +6 bricks (crossing a LOD0 shell-width + revealing a fresh slab), then 6 more single-brick
+    // steps. With the CLIPMAP, a single-brick step shifts only the LOD0 shell (a thin face-slab) — the coarse
+    // shells move `2^L×` less often — so each Walk reveals far fewer bricks than the old dense region did.
     #[derive(Clone, Copy)]
     enum Step {
         Walk,
@@ -323,6 +328,7 @@ fn bench_steady_state_moving() {
         script.push(Step::Walk);
     }
 
+    let span0 = brick_span(0); // one LOD0 brick in world metres
     let mut update_times = Vec::new();
     let mut drain_times = Vec::new();
     let mut pack_times = Vec::new();
@@ -331,19 +337,19 @@ fn bench_steady_state_moving() {
     let mut max_resident = warm_resident;
 
     for (i, step) in script.iter().enumerate() {
-        let delta = match step {
-            Step::Walk => IVec3::new(1, 0, 0),
-            Step::Jump => IVec3::new(6, 0, 0),
+        let bricks = match step {
+            Step::Walk => 1.0,
+            Step::Jump => 6.0,
         };
-        cam += delta;
+        cam[0] += bricks * span0;
 
         let step_t0 = Instant::now();
         let tu = Instant::now();
         mgr.update(cam, &cfg);
         update_times.push(tu.elapsed());
 
-        // A step at radius 28 reveals a whole region face-slab; drain until caught up (each drain = one frame),
-        // so the per-DRAIN time is the per-frame hitch. Record each drain + each re-pack.
+        // A Walk shifts only the LOD0 shell; drain until caught up (each drain = one frame), so the per-DRAIN
+        // time is the per-frame hitch. Record each drain + each re-pack.
         let mut step_drains = 0u32;
         let mut dirty = false;
         let mut since_pack = 0u32;
@@ -577,19 +583,117 @@ fn bench_blas_build_at_resident_count() {
     println!("=============================================================================");
 }
 
-/// Sanity: the harness's worldgen stack actually produces a non-trivial region (so a green CI `--lib` run of
-/// the file's non-ignored part can't silently pass on an empty world). Cheap (radius-2 region only).
+// ============================================================================================
+//  (6) CLIPMAP DELIVERABLE — max view radius + per-single-brick-move stutter, BEFORE vs AFTER.
+// ============================================================================================
+
+/// The OLD dense-cube view radius at a given brick radius: `r · BRICK_WORLD_SIZE` (every brick a fixed
+/// 1.6 m, coarse LOD added NO coverage). The shipping default before the pivot was `r = 28` ⇒ ~44.8 m.
+const OLD_DENSE_RADIUS_BRICKS: f32 = 28.0;
+
+/// **The view-distance deliverable (runs on CI — pure arithmetic, no GPU/voxelize).** Asserts the clipmap
+/// view radius (`clip_half · brick_span(MAX_LOD)`) is ≥ ~15× the old dense cube (`28 · BRICK_WORLD_SIZE`).
+#[test]
+fn clipmap_view_distance() {
+    let cfg = shipping_config();
+    let new_view = region_half_extent_m(&cfg);
+    let old_view = OLD_DENSE_RADIUS_BRICKS * BRICK_WORLD_SIZE;
+    let ratio = new_view / old_view;
+    println!("\n========== CLIPMAP VIEW DISTANCE ==========");
+    println!("config                : clip_half {} bricks, {} nested LOD shells (MAX_LOD {MAX_LOD})", cfg.clip_half_bricks, MAX_LOD + 1);
+    println!("BEFORE (dense cube)   : {old_view:.0} m  (radius {OLD_DENSE_RADIUS_BRICKS:.0} bricks · {BRICK_WORLD_SIZE} m, coarse LOD added no reach)");
+    println!("AFTER  (clipmap)      : {new_view:.0} m  (clip_half {} · brick_span(MAX_LOD) {:.1} m)", cfg.clip_half_bricks, brick_span(MAX_LOD));
+    println!("view-distance gain    : {ratio:.1}×");
+    assert!(ratio >= 15.0, "clipmap view radius must be ≥ ~15× the old dense cube (got {ratio:.1}×)");
+}
+
+/// **The per-move stutter deliverable (perf harness — `--ignored`, voxelizes the real shipping clipmap).**
+/// Warms the clipmap, then nudges the camera ONE LOD0 brick and measures the incremental STREAMING work —
+/// the clipmap pivot's stutter metric — SEPARATELY from the re-pack:
+///   * `update` (the diff-reconcile) + `drain_work` (voxelize the entering bricks) — O(shell): a thin
+///     LOD0 face-slab, NOT the O(region) dense recompute the old model paid every move. THIS is the hitch
+///     the pivot removes; the harness asserts it is a small fraction of the cold fill.
+///   * `pack_resident_set` is reported separately: it is O(resident) (it rebuilds the whole GPU buffer set)
+///     and the LIVE path AMORTIZES it (packs on settle / every few frames, not every move) — it is the
+///     pre-existing BLAS-rebuild cost (plan Stage 3), NOT the clipmap stutter this pivot targets.
+#[test]
+#[ignore = "perf harness; voxelizes the shipping clipmap — run with --ignored --nocapture"]
+fn clipmap_per_move_cost() {
+    let (layer, lib, registry, label) = worldgen_stack();
+    let cfg = shipping_config();
+
+    // Warm the clipmap fully at the origin surface, timing the cold fill (the baseline a dense "recompute
+    // everything every move" model would approach on EVERY brick crossing).
+    let cam0 = origin_surface_cam(&layer);
+    let mut mgr = ResidencyManager::new();
+    let cold_t0 = Instant::now();
+    mgr.update(cam0, &cfg);
+    let cold_enqueued = mgr.pending();
+    while mgr.pending() > 0 {
+        mgr.drain_work(&cfg, &layer, &lib, &registry, SEED);
+    }
+    let cold_ms = cold_t0.elapsed().as_secs_f64() * 1e3;
+    mgr.take_dirty();
+
+    // Per-move: nudge ONE LOD0 brick in +X. Time the STREAMING (update + drain) and the PACK separately.
+    let span0 = brick_span(0);
+    let mut stream_costs = Vec::new(); // update + drain — the clipmap stutter metric
+    let mut pack_costs = Vec::new(); // pack — the amortized O(resident) BLAS-rebuild cost (reported, not asserted)
+    let mut move_churns = Vec::new();
+    let mut cam = cam0;
+    for _ in 0..8 {
+        cam[0] += span0;
+        let t_stream = Instant::now();
+        let dropped = mgr.update(cam, &cfg);
+        let entered = mgr.pending();
+        while mgr.pending() > 0 {
+            mgr.drain_work(&cfg, &layer, &lib, &registry, SEED);
+        }
+        stream_costs.push(t_stream.elapsed());
+        let t_pack = Instant::now();
+        let entries = mgr.resident_entries();
+        let _ = pack_resident_set(&entries, &registry);
+        pack_costs.push(t_pack.elapsed());
+        mgr.take_dirty();
+        move_churns.push(entered + dropped);
+    }
+    let (s_mean, s_p50, s_p95, s_max) = stats_ms(&stream_costs);
+    let (pk_mean, _pk_p50, pk_p95, pk_max) = stats_ms(&pack_costs);
+    let churn_mean = move_churns.iter().sum::<usize>() as f64 / move_churns.len().max(1) as f64;
+
+    // The O(region) volume a dense recompute would touch (per level) vs the O(shell) face-slab area.
+    let half = cfg.clip_half_bricks as usize;
+    let region_vol = (2 * half + 1).pow(3);
+    let shell_area = (2 * half + 1).pow(2);
+
+    println!("\n========== PER-MOVE STUTTER (single-brick nudge) — graph={label} ==========");
+    println!("cold fill (baseline)  : {cold_ms:.1} ms, {cold_enqueued} bricks enqueued (what a dense per-move recompute approached)");
+    println!("STREAM per-brick-move : mean {s_mean:.3} p50 {s_p50:.3} p95 {s_p95:.3} max {s_max:.3} ms  ⟵ the stutter metric (update+drain, O(shell))");
+    println!("per-move churn        : mean {churn_mean:.0} bricks (enter+drop) | O(shell) ~{shell_area} vs O(region) {region_vol}");
+    println!("stutter reduction     : streaming per-move is {:.0}× cheaper than the cold fill", cold_ms / s_mean.max(1e-6));
+    println!("pack (amortized)      : mean {pk_mean:.1} p95 {pk_p95:.1} max {pk_max:.1} ms — O(resident) BLAS-rebuild cost, AMORTIZED by the live path (plan Stage 3, NOT this pivot)");
+    println!("=============================================================================");
+
+    // The stutter metric: a single-brick move's churn is O(shell), comfortably below the region volume a
+    // dense recompute would touch — and the STREAMING wall time is a small fraction of the cold fill.
+    assert!(churn_mean < region_vol as f64, "per-move churn must be O(shell), not O(region)");
+    assert!(churn_mean <= 8.0 * shell_area as f64, "per-move churn must be shell-sized (≈ a few face-slabs)");
+    assert!(s_mean < cold_ms * 0.5, "the per-move STREAMING cost must be well under the cold fill (the stutter fix)");
+}
+
+/// Sanity: the harness's worldgen stack actually produces a non-trivial clipmap (so a green CI `--lib` run of
+/// the file's non-ignored part can't silently pass on an empty world). Cheap (clip_half-2 clipmap only).
 #[test]
 fn worldgen_stack_is_non_empty() {
     let (layer, lib, registry, _label) = worldgen_stack();
-    let cfg = StreamingConfig { residency_radius_bricks: 2, max_bricks_per_frame: 10_000, ..Default::default() };
+    let cfg = StreamingConfig { clip_half_bricks: 2, max_bricks_per_frame: 1_000_000, ..Default::default() };
     let cam = origin_surface_cam(&layer);
     let mut mgr = ResidencyManager::new();
     mgr.update(cam, &cfg);
     mgr.drain_work(&cfg, &layer, &lib, &registry, SEED);
-    assert!(mgr.resident_count() > 0, "origin-surface region must have non-empty terrain bricks");
-    // And the brick at the surface is a real, surface-spanning brick (not the uniform fast path everywhere).
+    assert!(mgr.resident_count() > 0, "origin-surface clipmap must have non-empty terrain bricks");
+    // And the LOD0 brick at the surface is a real, surface-spanning brick (not the uniform fast path).
     let surf = layer.sample_world(0.0, 0.0, SEED).height;
-    let b: Brick = voxelize_brick(cam, &layer, &lib, &registry, SEED);
+    let b: Brick = voxelize_brick(camera_brick_coord(cam), 0, &layer, &lib, &registry, SEED);
     let _ = (surf, BRICK_WORLD_SIZE, b);
 }

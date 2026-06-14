@@ -9,7 +9,8 @@
 //!
 //! - **AABB buffer** (`Vec<GpuBrickAabb>`): one procedural AABB per resident brick, in world metres. This
 //!   is the BLAS geometry — `primitive_index` in the ray query indexes it. AABBs are the brick's world
-//!   bounds (`brick_coord · BRICK_WORLD_SIZE .. +BRICK_WORLD_SIZE`).
+//!   bounds at its LOD (`brick_coord · brick_span(lod) .. +brick_span(lod)`); a coarse brick covers more
+//!   world (the clipmap span scales `2^lod`), so the AABB is NOT LOD-invariant.
 //! - **Brick directory** (`Vec<GpuBrickMeta>`): parallel to the AABB buffer (same index = same brick).
 //!   Each entry carries the brick's world-voxel origin and the offset (in `u32`s) into the voxel buffer
 //!   where its [`halo_cells`] block ids start. The shader, given `primitive_index`, reads this to locate
@@ -30,11 +31,12 @@
 use bevy::math::IVec3;
 use bytemuck::{Pod, Zeroable};
 
-use super::brickmap::{BRICK_EDGE, BRICK_WORLD_SIZE, Brick, BrickMap, VOXEL_SIZE, lod_edge};
+use super::brickmap::{BRICK_EDGE, BRICK_WORLD_SIZE, Brick, BrickMap, VOXEL_SIZE, brick_span, lod_edge};
 use super::palette::{BlockId, BlockRegistry};
 
-/// The STORED per-axis grid edge of a brick at LOD `lod`: the core grid ([`lod_edge`]) PLUS a 1-cell HALO
-/// border on every side (`core + 2`). The packer fills that border with the adjacent NEIGHBOUR brick's
+/// The STORED per-axis grid edge of a brick at LOD `lod`: the core grid ([`lod_edge`], a constant
+/// [`BRICK_EDGE`] at every LOD) PLUS a 1-cell HALO border on every side (`core + 2` = 10). The packer fills
+/// that border with the adjacent SAME-LOD NEIGHBOUR brick's
 /// boundary voxels (AIR where the neighbour is absent), so the in-shader DDA always crosses a real air→solid
 /// cell boundary AT the true surface — even when the surface lies exactly on a brick face. This is the
 /// robust brick-seam fix (see the WGSL `halo_edge`): it gives the first-solid hit the correct entry-face
@@ -77,16 +79,18 @@ pub fn halo_index(x: i32, y: i32, z: i32, lod: u32) -> usize {
 /// defined exactly once.
 pub const BRICK_AABB_EPSILON: f32 = VOXEL_SIZE * 1.0e-3;
 
-/// The (epsilon-grown) BLAS AABB for a brick whose TRUE world-min corner is `world_min`. The true extent is
-/// `BRICK_WORLD_SIZE` per axis; this grows it by [`BRICK_AABB_EPSILON`] on every side so abutting bricks
-/// overlap (the seam fix — see that constant). The single place the BLAS AABB bounds are formed, shared by
-/// both packers so the overlap rule never drifts.
+/// The (epsilon-grown) BLAS AABB for a LOD-`lod` brick whose TRUE world-min corner is `world_min`. The true
+/// extent is [`brick_span`]`(lod)` per axis (the clipmap span scales `2^lod`, so a coarse brick covers more
+/// world); this grows it by [`BRICK_AABB_EPSILON`] on every side so abutting bricks overlap (the seam fix —
+/// see that constant). The single place the BLAS AABB bounds are formed, shared by both packers so the
+/// overlap rule (and the per-LOD span) never drifts from the WGSL `brick_span`.
 #[inline]
-pub fn brick_aabb(world_min: [f32; 3]) -> GpuBrickAabb {
+pub fn brick_aabb(world_min: [f32; 3], lod: u32) -> GpuBrickAabb {
     let e = BRICK_AABB_EPSILON;
+    let span = brick_span(lod);
     GpuBrickAabb {
         min: [world_min[0] - e, world_min[1] - e, world_min[2] - e],
-        max: [world_min[0] + BRICK_WORLD_SIZE + e, world_min[1] + BRICK_WORLD_SIZE + e, world_min[2] + BRICK_WORLD_SIZE + e],
+        max: [world_min[0] + span + e, world_min[1] + span + e, world_min[2] + span + e],
         _pad: [0.0; 2],
     }
 }
@@ -113,15 +117,17 @@ pub struct GpuBrickMeta {
     /// The brick's world-VOXEL origin (its local `(0,0,0)` corner in world voxel coordinates) =
     /// `brick_coord · BRICK_EDGE`. The shader maps a world position to a local voxel via this.
     pub voxel_origin: [i32; 3],
-    /// Offset (in `u32` elements) into the voxel buffer where this brick's voxel block ids begin. The brick
-    /// stores `lod_edge(lod)³` ids (the LOD-downsampled grid), NOT always `BRICK_VOXELS`.
+    /// Offset (in `u32` elements) into the voxel buffer where this brick's voxel block ids begin. A brick
+    /// stores [`halo_cells`]`(lod)` = `10³` ids (the `8³` core + 1-cell halo) at EVERY LOD (the grid is a
+    /// constant `8³`; only the world span scales), so this stride is LOD-independent.
     pub voxel_offset: u32,
     /// The brick's world-metre minimum corner (= `aabbs[i].min`), duplicated here so the shader's DDA has
-    /// the brick origin without a second buffer fetch.
+    /// the brick origin without a second buffer fetch. `world_min = coord · brick_span(lod)`.
     pub world_min: [f32; 3],
-    /// The brick's LOD level (0 = full `8³`, 1 = `4³`, …). The shader derives the grid EDGE
-    /// (`BRICK_EDGE >> lod`) and the per-cell world size (`VOXEL_SIZE << lod`) from this, so a coarse brick
-    /// is DDA-marched over its coarse grid. Part of the SSOT — uploader, shader, and tests agree on it.
+    /// The brick's LOD level. The grid is ALWAYS `8³` ([`lod_edge`]); the shader derives the per-cell world
+    /// size ([`brick_span`]`(lod) / 8 = VOXEL_SIZE · 2^lod`) + the brick span (`brick_span(lod)`) from this,
+    /// so a coarse brick is DDA-marched over the SAME `8³` grid covering `2^lod×` more world. Part of the
+    /// SSOT — uploader, shader, and tests agree on it.
     pub lod: u32,
 }
 
@@ -195,8 +201,9 @@ pub fn pack_brickmap(map: &BrickMap, registry: &BlockRegistry) -> GpuBrickPatch 
             coord.z as f32 * BRICK_WORLD_SIZE,
         ];
         // BLAS AABB is the brick's world extent GROWN by the seam epsilon (so abutting bricks overlap — see
-        // `brick_aabb`). `world_min` stored in the meta stays the TRUE corner the DDA reconstructs cells from.
-        patch.aabbs.push(brick_aabb(world_min));
+        // `brick_aabb`). `pack_brickmap` is the static all-LOD0 path (Cornell), so the span is `brick_span(0)
+        // == BRICK_WORLD_SIZE`. `world_min` stored in the meta stays the TRUE corner the DDA reconstructs from.
+        patch.aabbs.push(brick_aabb(world_min, 0));
 
         let voxel_offset = patch.voxels.len() as u32;
         let voxel_origin = [coord.x * BRICK_EDGE, coord.y * BRICK_EDGE, coord.z * BRICK_EDGE];
@@ -224,45 +231,35 @@ pub fn pack_brickmap(map: &BrickMap, registry: &BlockRegistry) -> GpuBrickPatch 
     patch
 }
 
-/// One resident brick ready to pack: its brick coordinate, the brick voxels, and the LOD it should be
-/// stored at. The streaming layer ([`super::streaming`]) produces these in a DETERMINISTIC order; the
-/// packer preserves that order so `primitive_index ↔ brick` is stable (the test oracle relies on it).
+/// One resident brick ready to pack: its `(coord, lod)` clipmap key + the voxelized brick. The streaming
+/// layer ([`super::streaming`]) voxelizes each `(coord, lod)` DIRECTLY at its LOD spacing (a true in-place
+/// mip — NOT a downsample of a finer brick), so the `8³` voxels are ALREADY at the right resolution; the
+/// packer stores them verbatim. Produced in a DETERMINISTIC order; the packer preserves it so
+/// `primitive_index ↔ brick` is stable (the test oracle relies on it).
 pub struct ResidentBrick<'a> {
-    /// Integer brick coordinate.
+    /// Integer brick coordinate, on the LOD-`lod` grid (`world_min = coord · brick_span(lod)`).
     pub coord: IVec3,
-    /// The brick's full-resolution `8³` voxels (downsampled here per its `lod`).
+    /// The brick's `8³` voxels, voxelized at LOD `lod` (already at the coarse spacing — packed as-is).
     pub brick: &'a Brick,
-    /// The LOD level to store this brick at (0 = full `8³`).
+    /// The clipmap LOD level of this brick. Different LODs are different coord grids.
     pub lod: u32,
 }
 
-/// The k-of-N "keep solid" threshold used when downsampling a brick at LOD `lod` (the thin-feature rule —
-/// see [`Brick::downsample`](super::brickmap::Brick::downsample)). The SSOT rule shared by the packer and
-/// the tests: the NEAREST coarse ring (`lod == 1`) is CONSERVATIVE (`k = 1`, "keep solid if ANY child is
-/// solid") so a thin one-voxel surface survives its first downsample without holes; deeper LODs use a
-/// majority threshold (half the `2^lod`-cubed children, rounded up) where the brick is far enough that
-/// erosion is sub-pixel and majority occupancy reads cleaner.
-#[inline]
-pub fn lod_solid_keep_k(lod: u32) -> u32 {
-    match lod {
-        0 | 1 => 1,
-        l => {
-            let children = 1u32 << (3 * l); // (2^l)³
-            children.div_ceil(2)
-        }
-    }
-}
-
-/// Pack a camera-following RESIDENT brick set (with per-brick LOD) into the SSOT GPU layout — the
-/// streaming successor to [`pack_brickmap`]. Each entry's brick is downsampled to its `lod` grid
-/// (`lod_edge(lod)³` cells) via [`lod_solid_keep_k`]'s thin-feature rule, and only NON-EMPTY downsampled
-/// bricks are emitted (a coarse brick whose every cell eroded to air is skipped — the sparsity invariant
-/// holds at every LOD). The AABB is the brick's full world extent regardless of LOD (only the marched grid
-/// resolution differs). The entry ORDER defines each brick's `primitive_index`, so the caller must pass a
-/// deterministic order.
+/// Pack a camera-following RESIDENT brick set (clipmap-keyed by `(coord, lod)`) into the SSOT GPU layout —
+/// the streaming successor to [`pack_brickmap`]. Each entry's brick is ALREADY the `8³` grid at its LOD
+/// (the voxelizer samples each `(coord, lod)` directly at its `lod_voxel_size(lod)` spacing — a true mip),
+/// so the packer stores the `8³` core verbatim (no downsampling) plus the 1-cell halo (the seam fix). The
+/// AABB is the brick's per-LOD world extent ([`brick_span`]`(lod)`, so a coarse brick covers `2^lod×` more
+/// world). The empty bricks never reach here (the streaming layer drops all-air ones), so every entry is
+/// emitted. The entry ORDER defines each brick's `primitive_index`, so the caller must pass a deterministic
+/// order. The halo border reads the SAME-LOD neighbour at `(coord ± 1, lod)` from a shared map (one lookup,
+/// no per-brick re-voxelize); an absent / different-LOD neighbour (a clipmap SHELL boundary) contributes
+/// AIR — the conservative seam behaviour, which the AABB-overlap + nearest-hit DDA then resolve across the
+/// LOD step (see the module / streaming docs on cross-LOD seams).
 pub fn pack_resident_set(entries: &[ResidentBrick<'_>], registry: &BlockRegistry) -> GpuBrickPatch {
     use std::collections::HashMap;
 
+    let h = halo_edge(0); // constant haloed edge (= BRICK_EDGE + 2 = 10) at every LOD
     let mut patch = GpuBrickPatch {
         aabbs: Vec::with_capacity(entries.len()),
         metas: Vec::with_capacity(entries.len()),
@@ -270,54 +267,41 @@ pub fn pack_resident_set(entries: &[ResidentBrick<'_>], registry: &BlockRegistry
         palette: Vec::with_capacity(registry.len()),
     };
 
-    // Pre-downsample EVERY resident brick EXACTLY ONCE (at its own LOD), keyed by coord, storing (lod, grid).
-    // Both a brick's own core cells AND its neighbours' HALO border cells (the seam fix — see `halo_edge`) read
-    // from this shared map. Previously each brick re-downsampled all 6 of its neighbours via a per-brick
-    // `neighbour_cache`, so every brick was downsampled ~7× (once as self + once per neighbour that borders it),
-    // with a fresh HashMap + thousands of redundant Vec allocations per brick — the pack hot spot (~700 ms at
-    // ~19k bricks). One downsample per brick + one shared map collapses that to O(resident) once.
-    // Same-LOD neighbour contributes its adjacent face cell; an absent / different-LOD neighbour contributes
-    // AIR (the pre-halo behaviour — no regression).
-    let grids: HashMap<IVec3, (u32, Vec<BlockId>)> =
-        entries.iter().map(|e| (e.coord, (e.lod, e.brick.downsample(e.lod, lod_solid_keep_k(e.lod))))).collect();
+    // Index every resident brick by its `(coord, lod)` clipmap key, so a brick's HALO border can read its
+    // SAME-LOD neighbour's adjacent face voxel (the seam fix) with one map lookup. Keyed by `(coord, lod)`
+    // because coords now OVERLAP across LOD grids — the same integer coord at two LODs is two different world
+    // bricks, so the lod must be part of the key. A border whose neighbour is absent or at a DIFFERENT lod (a
+    // shell boundary) falls back to AIR (the conservative pre-halo behaviour — no cross-LOD halo).
+    let by_key: HashMap<(IVec3, u32), &Brick> =
+        entries.iter().map(|e| ((e.coord, e.lod), e.brick)).collect();
 
     for e in entries {
         let lod = e.lod;
-        let cedge = lod_edge(lod);
-        let grid = &grids[&e.coord].1;
-        debug_assert_eq!(grid.len(), (cedge * cedge * cedge) as usize);
-        // Skip a brick that downsampled to all-air (sparsity at coarse LOD): no AABB, no DDA work.
-        if grid.iter().all(|b| b.is_air()) {
-            continue;
-        }
         let coord = e.coord;
-        let world_min = [
-            coord.x as f32 * BRICK_WORLD_SIZE,
-            coord.y as f32 * BRICK_WORLD_SIZE,
-            coord.z as f32 * BRICK_WORLD_SIZE,
-        ];
+        let span = brick_span(lod);
+        let world_min = [coord.x as f32 * span, coord.y as f32 * span, coord.z as f32 * span];
         // BLAS AABB grown by the seam epsilon (overlapping neighbours); the meta keeps the TRUE `world_min`.
-        patch.aabbs.push(brick_aabb(world_min));
+        patch.aabbs.push(brick_aabb(world_min, lod));
 
         let voxel_offset = patch.voxels.len() as u32;
         let voxel_origin = [coord.x * BRICK_EDGE, coord.y * BRICK_EDGE, coord.z * BRICK_EDGE];
         patch.metas.push(GpuBrickMeta { voxel_origin, voxel_offset, world_min, lod });
 
-        let h = halo_edge(lod);
         for hz in 0..h {
             for hy in 0..h {
                 for hx in 0..h {
                     debug_assert_eq!(patch.voxels.len() - voxel_offset as usize, halo_index(hx, hy, hz, lod));
-                    // Coarse-cell coordinate this haloed cell maps to (core cells are halo index [1, cedge]).
+                    // Core cells are halo index [1, BRICK_EDGE]; halo index 0 / h-1 is the 1-cell border ring.
                     let cx = hx - 1;
                     let cy = hy - 1;
                     let cz = hz - 1;
-                    let in_core = (0..cedge).contains(&cx) && (0..cedge).contains(&cy) && (0..cedge).contains(&cz);
+                    let in_core =
+                        (0..BRICK_EDGE).contains(&cx) && (0..BRICK_EDGE).contains(&cy) && (0..BRICK_EDGE).contains(&cz);
                     let block = if in_core {
-                        grid[(cx + cy * cedge + cz * cedge * cedge) as usize]
+                        e.brick.get(cx, cy, cz)
                     } else {
-                        // A border cell: resolve the owning neighbour brick + the wrapped coarse cell inside it.
-                        neighbour_border_cell(&grids, coord, lod, cedge, IVec3::new(cx, cy, cz))
+                        // A border cell: resolve the SAME-LOD neighbour brick + the wrapped voxel inside it.
+                        neighbour_border_cell(&by_key, coord, lod, IVec3::new(cx, cy, cz))
                     };
                     patch.voxels.push(block.0 as u32);
                 }
@@ -329,36 +313,28 @@ pub fn pack_resident_set(entries: &[ResidentBrick<'_>], registry: &BlockRegistry
     patch
 }
 
-/// Resolve one HALO BORDER cell at coarse coordinate `cc` (which lies outside `[0, cedge)` on ≥1 axis) for the
-/// brick at `coord`/`lod`: find the neighbour brick that owns the world coarse-cell, downsample it at the same
-/// LOD (cached), and return its cell there. Returns AIR when the owning neighbour is absent or stored at a
-/// different LOD (so a border with no same-LOD neighbour is air — the conservative pre-halo behaviour).
+/// Resolve one HALO BORDER cell at local voxel coordinate `cc` (outside `[0, BRICK_EDGE)` on ≥1 axis) for the
+/// brick at `(coord, lod)`: find the SAME-LOD neighbour brick that owns the wrapped voxel and return that
+/// voxel. Returns AIR when the owning neighbour is absent or at a DIFFERENT LOD (a clipmap shell boundary) —
+/// so a border with no same-LOD neighbour is air, the conservative pre-halo behaviour the AABB-overlap +
+/// nearest-hit DDA then resolve across the LOD step (no cross-LOD halo by design).
 fn neighbour_border_cell(
-    grids: &std::collections::HashMap<IVec3, (u32, Vec<BlockId>)>,
+    by_key: &std::collections::HashMap<(IVec3, u32), &Brick>,
     coord: IVec3,
     lod: u32,
-    cedge: i32,
     cc: IVec3,
 ) -> BlockId {
-    // The neighbour brick coordinate = `coord` shifted by which face(s) `cc` overflows; the wrapped coarse
-    // cell inside the neighbour is `cc mod cedge` (Euclidean, so −1 ↦ cedge−1).
+    // The neighbour brick coordinate = `coord` shifted by which face(s) `cc` overflows; the wrapped voxel
+    // inside the neighbour is `cc mod BRICK_EDGE` (Euclidean, so −1 ↦ BRICK_EDGE−1). Same-LOD by construction.
     let nbr = coord
-        + IVec3::new(
-            cc.x.div_euclid(cedge),
-            cc.y.div_euclid(cedge),
-            cc.z.div_euclid(cedge),
-        );
-    let Some((nbr_lod, grid)) = grids.get(&nbr) else {
+        + IVec3::new(cc.x.div_euclid(BRICK_EDGE), cc.y.div_euclid(BRICK_EDGE), cc.z.div_euclid(BRICK_EDGE));
+    let Some(brick) = by_key.get(&(nbr, lod)) else {
         return BlockId::AIR;
     };
-    if *nbr_lod != lod {
-        return BlockId::AIR; // different-LOD neighbour: cell sizes differ, fall back to air (no regression)
-    }
-    // Read the neighbour's already-downsampled grid (computed once in the shared map — no re-downsample).
-    let lx = cc.x.rem_euclid(cedge);
-    let ly = cc.y.rem_euclid(cedge);
-    let lz = cc.z.rem_euclid(cedge);
-    grid[(lx + ly * cedge + lz * cedge * cedge) as usize]
+    let lx = cc.x.rem_euclid(BRICK_EDGE);
+    let ly = cc.y.rem_euclid(BRICK_EDGE);
+    let lz = cc.z.rem_euclid(BRICK_EDGE);
+    brick.get(lx, ly, lz)
 }
 
 /// Append the palette buffer: `BlockId(i)` → linear RGBA, indexed directly (block 0 = AIR). Shared by both
@@ -447,9 +423,9 @@ mod tests {
         assert_eq!(patch.voxels[patch.metas[0].voxel_offset as usize + i0], 1);
         assert_eq!(patch.voxels[patch.metas[1].voxel_offset as usize + i1], 2);
 
-        // AABB bounds match the brick world extent GROWN by the seam epsilon (overlapping neighbours).
-        assert_eq!(patch.aabbs[0], brick_aabb([0.0, 0.0, 0.0]));
-        assert_eq!(patch.aabbs[1], brick_aabb([BRICK_WORLD_SIZE, 0.0, 0.0]));
+        // AABB bounds match the LOD0 brick world extent GROWN by the seam epsilon (overlapping neighbours).
+        assert_eq!(patch.aabbs[0], brick_aabb([0.0, 0.0, 0.0], 0));
+        assert_eq!(patch.aabbs[1], brick_aabb([BRICK_WORLD_SIZE, 0.0, 0.0], 0));
         // The grow makes neighbours OVERLAP: brick 1's min.x is below brick 0's max.x (no gap → no seam).
         assert!(patch.aabbs[1].min[0] < patch.aabbs[0].max[0], "abutting bricks' AABBs must overlap");
     }
@@ -503,58 +479,54 @@ mod tests {
         }
     }
 
-    /// A coarse brick stores fewer voxels: a uniform brick at LOD1 stores a HALOED `6³ = 216` block ids
-    /// (core `4³` + the 1-cell border), the meta records lod==1, and the AABB is still the full brick world
-    /// extent (LOD changes resolution, not bounds).
+    /// A coarse brick is the SAME haloed `10³` grid (the clipmap keeps resolution constant); what changes is
+    /// its world span + per-cell size. The meta records the LOD, and the AABB is the per-LOD span
+    /// (`brick_span(lod)` — a coarse brick covers `2^lod×` more world), grown by the seam epsilon.
     #[test]
-    fn resident_coarse_brick_is_smaller() {
+    fn resident_coarse_brick_spans_more_world() {
         let reg = registry();
         let b = solid_brick(BlockId(1));
-        let entries = vec![ResidentBrick { coord: IVec3::new(2, -1, 3), brick: &b, lod: 1 }];
+        let lod = 2u32;
+        let entries = vec![ResidentBrick { coord: IVec3::new(2, -1, 3), brick: &b, lod }];
         let patch = pack_resident_set(&entries, &reg);
         assert_eq!(patch.brick_count(), 1);
-        assert_eq!(patch.metas[0].lod, 1);
-        assert_eq!(patch.voxels.len(), halo_cells(1), "LOD1 stores a haloed 6³ grid");
-        assert_eq!(halo_cells(1), 6 * 6 * 6);
-        // Core cells are solid; this lone brick has no neighbours, so the border ring is all air.
-        for z in 1..=4 {
-            for y in 1..=4 {
-                for x in 1..=4 {
-                    assert_eq!(patch.voxels[halo_index(x, y, z, 1)], 1, "core cell solid");
+        assert_eq!(patch.metas[0].lod, lod);
+        assert_eq!(patch.voxels.len(), halo_cells(lod), "every LOD stores a haloed 10³ grid");
+        assert_eq!(halo_cells(lod), 10 * 10 * 10);
+        // Core cells (halo index [1, BRICK_EDGE]) are solid; this lone brick has no neighbours → air border.
+        for z in 1..=BRICK_EDGE {
+            for y in 1..=BRICK_EDGE {
+                for x in 1..=BRICK_EDGE {
+                    assert_eq!(patch.voxels[halo_index(x, y, z, lod)], 1, "core cell solid");
                 }
             }
         }
-        let wmin = [2.0 * BRICK_WORLD_SIZE, -BRICK_WORLD_SIZE, 3.0 * BRICK_WORLD_SIZE];
-        // AABB is the full world extent (LOD changes resolution, not bounds), grown by the seam epsilon.
-        assert_eq!(patch.aabbs[0], brick_aabb(wmin));
+        // world_min = coord · brick_span(lod) (the clipmap span, 2^lod× the LOD0 span).
+        let span = brick_span(lod);
+        let wmin = [2.0 * span, -span, 3.0 * span];
+        assert_eq!(patch.metas[0].world_min, wmin);
+        assert_eq!(patch.aabbs[0], brick_aabb(wmin, lod));
+        // The AABB extent is the per-LOD span (grown by the seam epsilon): a LOD2 brick is 4× wider than LOD0.
+        let extent = patch.aabbs[0].max[0] - patch.aabbs[0].min[0];
+        assert!((extent - (span + 2.0 * BRICK_AABB_EPSILON)).abs() < 1e-3, "AABB spans brick_span(lod)");
+        assert!((span - 4.0 * BRICK_WORLD_SIZE).abs() < 1e-4, "LOD2 span is 4× the LOD0 span");
     }
 
-    /// A brick that downsamples to all-air at its LOD is SKIPPED (sparsity at coarse LOD): a single solid
-    /// voxel at LOD3 (k = majority of 512) erodes away, so the brick contributes no AABB/meta/voxels.
+    /// The clipmap voxelizes each `(coord, lod)` directly (a true in-place mip), so the packer stores the
+    /// brick's `8³` core VERBATIM — no downsampling/erosion. A brick with a single solid voxel is packed with
+    /// that voxel at every LOD (the streaming layer, not the packer, drops all-AIR bricks).
     #[test]
-    fn resident_eroded_brick_is_skipped() {
+    fn resident_packs_core_verbatim_no_erosion() {
         let reg = registry();
         let mut voxels = Box::new([BlockId::AIR; BRICK_VOXELS]);
         voxels[voxel_index(0, 0, 0)] = BlockId(1); // one solid voxel
         let thin = Brick::from_voxels(voxels);
-        let solid = solid_brick(BlockId(2));
-        let entries = vec![
-            ResidentBrick { coord: IVec3::new(0, 0, 0), brick: &thin, lod: 3 },
-            ResidentBrick { coord: IVec3::new(1, 0, 0), brick: &solid, lod: 3 },
-        ];
+        let entries = vec![ResidentBrick { coord: IVec3::new(0, 0, 0), brick: &thin, lod: 5 }];
         let patch = pack_resident_set(&entries, &reg);
-        // The thin brick eroded to air at LOD3 and was dropped; only the solid brick remains.
+        // Not eroded — the brick is packed as-is (one solid core voxel) at LOD5.
         assert_eq!(patch.brick_count(), 1);
-        assert_eq!(patch.metas[0].voxel_origin, [BRICK_EDGE, 0, 0]);
-    }
-
-    /// The keep-k rule: LOD0/1 are conservative (k=1), deeper LODs are a majority of their child count.
-    #[test]
-    fn keep_k_rule() {
-        assert_eq!(lod_solid_keep_k(0), 1);
-        assert_eq!(lod_solid_keep_k(1), 1);
-        assert_eq!(lod_solid_keep_k(2), (1u32 << 6).div_ceil(2)); // 64 children → 32
-        assert_eq!(lod_solid_keep_k(3), (1u32 << 9).div_ceil(2)); // 512 children → 256
+        assert_eq!(patch.metas[0].lod, 5);
+        assert_eq!(patch.voxels[halo_index(1, 1, 1, 5)], 1, "the lone solid voxel survives verbatim");
     }
 
     /// Packing is deterministic: same map → byte-identical buffers (the property the test oracle relies

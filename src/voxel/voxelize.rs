@@ -15,7 +15,7 @@ use crate::sdf_render::worldgen::biome::{
 };
 use crate::sdf_render::worldgen::layers::height::HeightLayer;
 
-use super::brickmap::{BRICK_EDGE, BRICK_VOXELS, Brick, VOXEL_SIZE, voxel_index};
+use super::brickmap::{BRICK_EDGE, BRICK_VOXELS, Brick, VOXEL_SIZE, brick_span, lod_voxel_size, voxel_index};
 use super::palette::{BlockId, BlockRegistry};
 
 /// The world-space metre position of the CENTRE of the voxel at world voxel coordinate `world_voxel`.
@@ -109,29 +109,47 @@ pub fn voxel_block_at(
     ColumnSample::at(wx, wz, layer, seed).block_at(wy, lib, registry)
 }
 
-/// Voxelize one `8³` brick at integer brick coordinate `brick_coord`. Samples [`voxel_block_at`] for each
-/// of its `BRICK_VOXELS` voxels and builds a [`Brick`] (collapsing to the uniform fast path when every
-/// voxel is identical — buried solids or pure air). Pure + deterministic in `(brick_coord, seed, layer,
+/// Voxelize one `8³` brick at clipmap key `(brick_coord, lod)`. The brick spans world
+/// `[brick_coord · brick_span(lod), +brick_span(lod))` per axis and is sampled at its OWN (coarse) cell
+/// size [`lod_voxel_size`]`(lod) = VOXEL_SIZE · 2^lod`: voxel `v`'s world centre is
+/// `world_min + (v + 0.5) · lod_voxel_size(lod)`. A coarse brick therefore samples the worldgen surface at
+/// coarse spacing — a TRUE in-place mip (not a downsample of a finer brick), giving more world coverage per
+/// brick at the same `8³` resolution. At LOD0 (`lod_voxel_size == VOXEL_SIZE`) this is the original full-res
+/// brick, bit-identical to the old per-voxel path. Pure + deterministic in `(brick_coord, lod, seed, layer,
 /// lib, registry)`.
+///
+/// Builds a [`Brick`] (collapsing to the uniform fast path when every voxel is identical — buried solids or
+/// pure air). Keeps the per-COLUMN `ColumnSample` optimization (one `sample_world` graph eval per `(x,z)`,
+/// shared across the 8 voxels in the column).
 pub fn voxelize_brick(
     brick_coord: IVec3,
+    lod: u32,
     layer: &HeightLayer,
     lib: &BiomeLibrary,
     registry: &BlockRegistry,
     seed: u64,
 ) -> Brick {
-    let origin = brick_coord * BRICK_EDGE; // world voxel coordinate of the brick's (0,0,0) corner
+    // The brick's world-min corner + the per-LOD cell size (the clipmap SSOT). At LOD0 `cell == VOXEL_SIZE`
+    // and `world_min == origin · VOXEL_SIZE`, so this collapses to the original full-res sampling exactly.
+    let span = brick_span(lod) as f64;
+    let cell = lod_voxel_size(lod) as f64;
+    let world_min = [
+        brick_coord.x as f64 * span,
+        brick_coord.y as f64 * span,
+        brick_coord.z as f64 * span,
+    ];
     let mut voxels = Box::new([BlockId::AIR; BRICK_VOXELS]);
-    // Loop COLUMNS (x,z) outermost: evaluate the column-constant worldgen ONCE per (x,z), then read all 8
-    // voxels in the column from it (height/climate are height-independent). This is the SAME ColumnSample /
-    // block_at SSOT voxel_block_at uses, so the output is bit-identical — but with 1 `sample_world` per column
-    // instead of per voxel (8× fewer of the expensive graph evals — the dominant voxelize cost).
+    // Loop COLUMNS (x,z) outermost: evaluate the column-constant worldgen ONCE per (x,z) at the LOD's coarse
+    // spacing, then read all 8 voxels in the column from it (height/climate are height-independent). The SAME
+    // ColumnSample / block_at SSOT `voxel_block_at` uses, so a LOD0 brick is bit-identical to the per-voxel
+    // path — but with 1 `sample_world` per column (8× fewer of the expensive graph evals — the dominant cost).
     for z in 0..BRICK_EDGE {
         for x in 0..BRICK_EDGE {
-            let [wx, _, wz] = voxel_center_world(origin + IVec3::new(x, 0, z));
+            let wx = world_min[0] + (x as f64 + 0.5) * cell;
+            let wz = world_min[2] + (z as f64 + 0.5) * cell;
             let col = ColumnSample::at(wx, wz, layer, seed);
             for y in 0..BRICK_EDGE {
-                let wy = (origin.y as f64 + y as f64 + 0.5) * VOXEL_SIZE as f64;
+                let wy = world_min[1] + (y as f64 + 0.5) * cell;
                 voxels[voxel_index(x, y, z)] = col.block_at(wy, lib, registry);
             }
         }
@@ -203,8 +221,8 @@ mod tests {
         let (lib, reg) = registry();
         let layer = test_layer();
         let coord = IVec3::new(2, -1, 3);
-        let a = voxelize_brick(coord, &layer, &lib, &reg, SEED);
-        let b = voxelize_brick(coord, &layer, &lib, &reg, SEED);
+        let a = voxelize_brick(coord, 0, &layer, &lib, &reg, SEED);
+        let b = voxelize_brick(coord, 0, &layer, &lib, &reg, SEED);
         assert_eq!(a, b, "voxelizing the same brick twice must be identical");
     }
 
@@ -262,10 +280,48 @@ mod tests {
         let (lib, reg) = registry();
         let layer = test_layer();
         // Very high brick (Y ≈ +6000 m) — guaranteed above the surface everywhere → empty.
-        let sky = voxelize_brick(IVec3::new(0, 4000, 0), &layer, &lib, &reg, SEED);
+        let sky = voxelize_brick(IVec3::new(0, 4000, 0), 0, &layer, &lib, &reg, SEED);
         assert!(sky.is_empty(), "a brick far above terrain must be empty");
         // Very deep brick (Y ≈ -6000 m) — guaranteed below → all solid, uniform fast path.
-        let deep = voxelize_brick(IVec3::new(0, -4000, 0), &layer, &lib, &reg, SEED);
+        let deep = voxelize_brick(IVec3::new(0, -4000, 0), 0, &layer, &lib, &reg, SEED);
         assert!(!deep.is_empty(), "a deep brick must be solid");
+    }
+
+    /// A coarse-LOD brick is a TRUE in-place mip: it samples the surface at `lod_voxel_size(lod)` spacing and
+    /// spans `brick_span(lod)` world. A LOD-`L` brick at coord 0 covers exactly the world a `2^L`-wide block
+    /// of LOD0 bricks would — its surface voxels match LOD0 surface voxels sampled at the SAME coarse cell
+    /// centres (a mip, not a finer brick re-aggregated). We check coverage + that the coarse brick's surface
+    /// column boundary agrees with a direct coarse-spacing surface sample.
+    #[test]
+    fn coarse_lod_brick_is_in_place_mip() {
+        let (lib, reg) = registry();
+        let layer = test_layer();
+        // A LOD2 brick at coord (0, ?, 0): cell = 0.2·4 = 0.8 m, span = 1.6·4 = 6.4 m. Centre it on the
+        // surface Y band so it straddles the surface (non-trivial brick).
+        let lod = 2u32;
+        let cell = lod_voxel_size(lod) as f64;
+        let span = brick_span(lod) as f64;
+        let surf = layer.sample_world(span * 0.5, span * 0.5, SEED).height as f64;
+        let by = (surf / span).floor() as i32;
+        let coord = IVec3::new(0, by, 0);
+        let b = voxelize_brick(coord, lod, &layer, &lib, &reg, SEED);
+        assert!(!b.is_empty(), "a surface-straddling coarse brick must have solid voxels");
+
+        // Each local voxel `v` must read the block at its coarse cell-centre world position — the in-place
+        // mip rule. Cross-check a column against a direct ColumnSample at the SAME coarse cell centre.
+        let world_min = [coord.x as f64 * span, coord.y as f64 * span, coord.z as f64 * span];
+        for &(x, z) in &[(0i32, 0i32), (3, 5), (7, 7)] {
+            let wx = world_min[0] + (x as f64 + 0.5) * cell;
+            let wz = world_min[2] + (z as f64 + 0.5) * cell;
+            let col = ColumnSample::at(wx, wz, &layer, SEED);
+            for y in 0..BRICK_EDGE {
+                let wy = world_min[1] + (y as f64 + 0.5) * cell;
+                assert_eq!(
+                    b.get(x, y, z),
+                    col.block_at(wy, &lib, &reg),
+                    "coarse voxel must equal a direct surface sample at its coarse cell centre"
+                );
+            }
+        }
     }
 }
