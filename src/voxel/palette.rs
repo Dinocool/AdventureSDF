@@ -19,6 +19,29 @@ use rustc_hash::FxHashMap;
 
 use crate::sdf_render::worldgen::biome::{BiomeLibrary, TerrainMatId};
 
+/// Convert ONE sRGB-encoded channel byte (`0..=255`) to a LINEAR `[0,1]` value via the standard sRGB EOTF
+/// (the IEC 61966-2-1 piecewise curve Bevy's `Color::srgb` uses). MagicaVoxel `.vox` palettes store sRGB
+/// `u8`; the voxel registry stores LINEAR colour, so the loader must decode here. The single SSOT for the
+/// `.vox` sRGB→linear conversion (shared by the loader + its tests).
+#[inline]
+pub fn srgb_channel_to_linear(byte: u8) -> f32 {
+    let c = byte as f32 / 255.0;
+    if c <= 0.04045 { c / 12.92 } else { ((c + 0.055) / 1.055).powf(2.4) }
+}
+
+/// Convert an sRGB-`u8` RGBA colour (the `.vox` palette convention) to LINEAR RGBA. RGB go through the sRGB
+/// EOTF ([`srgb_channel_to_linear`]); ALPHA is linear by convention (sRGB encodes only the colour channels),
+/// so it is just normalized to `[0,1]`. Matches the linear-RGBA colours the rest of the registry stores.
+#[inline]
+pub fn srgb_u8_to_linear(c: [u8; 4]) -> [f32; 4] {
+    [
+        srgb_channel_to_linear(c[0]),
+        srgb_channel_to_linear(c[1]),
+        srgb_channel_to_linear(c[2]),
+        c[3] as f32 / 255.0,
+    ]
+}
+
 /// A voxel block id. `0` is always AIR (empty space); `1..=N` are solid blocks. A `u16` so a world can
 /// hold many distinct block types and a brick can store one per voxel cheaply.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -161,6 +184,30 @@ impl BlockRegistry {
         });
         debug_assert_eq!(blocks.len(), CornellBlock::COUNT + 1, "cornell palette length must match CornellBlock");
         // The Cornell palette has no worldgen-material bridge (it isn't built from a library).
+        Self { blocks, mat_to_block: FxHashMap::default() }
+    }
+
+    /// Build a registry DIRECTLY from a raw `.vox`-style palette of sRGB-`u8` RGBA colours — the SSOT for a
+    /// baked static scene loaded by [`super::vox::load_vox`] (Sponza et al.). Block `0` = AIR, then one
+    /// opaque dielectric block per palette entry (`BlockId(i+1)` mirrors `colors[i]`). Each colour is
+    /// converted from sRGB-`u8` (the `.vox`/MagicaVoxel convention) to LINEAR RGBA via [`srgb_u8_to_linear`]
+    /// so it matches every other registry colour (which are linear). No worldgen-material bridge (a baked
+    /// scene has no [`TerrainMatId`] chain), so `mat_to_block` is empty. Robust to an empty palette (only the
+    /// AIR block). The alpha byte is carried through (sRGB→linear is applied to RGB only; alpha is linear).
+    pub fn from_vox_palette(colors: &[[u8; 4]]) -> Self {
+        let mut blocks = Vec::with_capacity(colors.len() + 1);
+        blocks.push(BlockDef::air()); // block 0 = AIR
+        for (i, &c) in colors.iter().enumerate() {
+            let lin = srgb_u8_to_linear(c);
+            blocks.push(BlockDef {
+                name: format!("vox_{i}"),
+                color: lin,
+                roughness: 1.0,
+                metal: 0.0,
+                emissive: [0.0, 0.0, 0.0],
+                tintable: false,
+            });
+        }
         Self { blocks, mat_to_block: FxHashMap::default() }
     }
 

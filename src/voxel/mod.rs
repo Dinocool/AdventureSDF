@@ -29,6 +29,7 @@ pub mod palette;
 pub mod physics;
 pub mod raytrace;
 pub mod streaming;
+pub mod vox;
 pub mod voxelize;
 
 use bevy::math::IVec3;

@@ -39,3 +39,13 @@ rdoc/scripts/**/__pycache__/
 
 # Dear ImGui / Nsight overlay config dropped next to the exe during a capture.
 imgui.ini
+
+# Downloaded source meshes for the offline .vox voxelizer (examples/voxelize_scene.rs):
+# large glTF + textures (~50 MB), re-fetched on demand by the example. Only the baked
+# assets/models/*.vox artifacts are committed, not their multi-MB source.
+/assets/models/src/
+
+# Stray rustc scratch output + session workflow scripts (per-machine, regenerable).
+rust_out.exe
+rust_out.pdb
+.claude/wf-*.mjs

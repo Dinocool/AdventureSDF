@@ -159,6 +159,17 @@ bytemuck = { version = "1", features = ["derive"] }
 # `i32→f64`) are bit-identical to the scalar `noise.rs` primitives — preserving the bit-portable
 # determinism invariant (no FMA/reassociation). Already in the tree transitively via rapier (no new fetch).
 wide = "0.7.33"
+# MagicaVoxel `.vox` reader/writer. A RUNTIME dependency: the static-scene loader (`voxel::vox::load_vox`)
+# reads the offline-baked `assets/models/*.vox` (Sponza etc.) into a `BrickMap` + `BlockRegistry`. Pure
+# CPU, no Bevy/render deps; the offline voxelizer (`examples/voxelize_scene.rs`) uses the SAME crate to
+# WRITE the .vox, so read and write share one format SSOT. Deliberately NOT behind a feature: a baked .vox
+# is a first-class static GI-measurement scene the shipped game loads. `gltf`/`image` (the mesh + texture
+# decoders) are DEV-only, in the offline example, never in the runtime loader.
+dot_vox = "5.2"
+# Ergonomic error type for the fallible `.vox` loader (`voxel::vox::load_vox -> anyhow::Result<...>`): wraps
+# the file-read IO error + the `dot_vox` parse error behind one `anyhow::Error` so callers get a clean
+# `Result` without a bespoke error enum. Tiny, ubiquitous, no transitive weight.
+anyhow = "1"
 
 [dev-dependencies]
 # spv-out: emit SPIR-V from naga in tests so we can inspect which opcode signed `%`
@@ -176,6 +187,15 @@ futures-lite = "2"
 # Decode Rgba16Float texture readback (f16 → f32) in the DLSS-guide GPU test. Dev-only: the runtime
 # never decodes half floats on the CPU. (The render deps dropped `half` with the mesh-bake cut.)
 half = "2"
+# Offline .vox preprocessor ONLY (`examples/voxelize_scene.rs`): decode the Sponza glTF mesh
+# (positions/indices/UVs + materials) and its base-colour textures, then voxelize + quantize to a
+# palette and bake `assets/models/sponza.vox`. DEV-dependencies on purpose: the shipped game's runtime
+# .vox loader (`voxel::vox`) must NOT pull a glTF/JSON parser or the full image stack. `gltf`'s `image`
+# feature decodes embedded/external textures into `image` buffers; `utils` gives the reader iterators
+# (positions/indices/tex-coords). `image` here just adds the formats Sponza ships (the runtime `image`
+# dep is the same crate/version, so Cargo unifies it: no second copy).
+gltf = { version = "1.4", default-features = false, features = ["import", "utils", "image"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "bmp", "tga"] }
 
 [profile.dev]
 opt-level = 1
