@@ -30,6 +30,7 @@ use bevy::render::extract_resource::{ExtractResource, ExtractResourcePlugin};
 use bevy::render::renderer::{RenderContext, RenderDevice, RenderQueue, ViewQuery};
 use bevy::render::view::{ExtractedView, ViewTarget};
 use bevy::render::{Render, RenderApp, RenderStartup, RenderSystems};
+use rustc_hash::FxHashSet;
 use wgpu::util::DeviceExt;
 
 #[cfg(feature = "dlss")]
@@ -45,7 +46,8 @@ use super::cornell::{build_cornell, build_cornell_with_edits};
 use super::edits::{VoxelEdits, VoxelHit, pick_voxel};
 use super::gpu::{GpuAliasEntry, GpuBrickAabb, GpuBrickPatch, GpuVoxelLight, pack_brickmap, pack_resident_set};
 use super::palette::{BlockId, BlockRegistry, CornellBlock};
-use super::streaming::{ResidencyManager, StreamingConfig, camera_brick_coord, region_half_extent_m};
+use super::source::{StaticVoxSource, WorldgenSource};
+use super::streaming::{BrickKey, ResidencyManager, StreamingConfig, camera_brick_coord, region_half_extent_m};
 use super::vox::load_vox;
 use super::{VoxelScene, build_height_layer_pub, load_biome_library_pub};
 use crate::sdf_render::SdfCamera;
@@ -315,73 +317,74 @@ fn stream_voxel_rt_residency(
         return; // static — only re-bakes on an edit, never streams
     }
 
-    // --- Static Sponza scene: load the baked `.vox` ONCE, pack it like Cornell (NOT streamed). ---
-    // Mirrors the Cornell static path exactly: a one-shot load+pack on the switch INTO Sponza, the same
-    // `pack_brickmap` packer + generation bump (so `prepare_voxel_rt` rebuilds the BLAS), and a per-scene
-    // lighting/sky preset applied on the switch. The loaded `(BrickMap, BlockRegistry)` is cached in
-    // `streaming.sponza` so we never reload the file per frame. On a load FAILURE we log + pack the Cornell
-    // box THIS frame (never panic) so the engine stays usable + renders something.
-    if matches!(*scene, VoxelScene::Sponza) {
-        if streaming.packed_scene == Some(VoxelScene::Sponza) {
-            return; // already packed this static scene — nothing to do (no streaming, no per-edit re-bake)
-        }
-        // Load the `.vox` lazily on the first Sponza selection and cache it. A failure leaves the cache empty.
-        if streaming.sponza.is_none() {
+    // --- Streamed scenes (Sponza + Worldgen): the SAME camera-following clipmap residency. ---
+    // Both run the identical pipeline — `update` (reconcile the desired clipmap) → `drain_work_from(source)`
+    // (bounded parallel sourcing + the shared edit overlay) → `take_dirty` → `pack_resident_set` — and differ
+    // ONLY in their BrickSource: worldgen samples the procedural surface; Sponza reads the baked `.vox`
+    // BrickMap (LOD0 extract / coarse downsample, all-air outside its bounds so the clipmap naturally bounds
+    // the building). There is no bespoke static path anymore — Sponza supports LOD/clipmaps + editing exactly
+    // like worldgen.
+    //
+    // On a switch INTO a streamed scene, reset the residency so the new set streams in cleanly and apply that
+    // scene's lighting/sky presets (knobs-as-uniforms — the editor can still override afterward; we set them
+    // only on the SWITCH so a later edit doesn't clobber a user's tweaks). For Sponza we lazily load + cache
+    // the `.vox` here; a load failure falls back to a static Cornell pack so the engine never panics.
+    if streaming.packed_scene != Some(*scene) {
+        // On the Sponza switch, ensure the `.vox` is loaded + cached (once). A failure leaves the cache empty.
+        if matches!(*scene, VoxelScene::Sponza) && streaming.sponza.is_none() {
             match load_vox(SPONZA_VOX_PATH) {
                 Ok(loaded) => streaming.sponza = Some(loaded),
-                Err(e) => {
-                    error!(
-                        "voxel-RT: could not load {SPONZA_VOX_PATH}: {e} — falling back to the Cornell box \
-                         (bake Sponza via `cargo run --example voxelize_scene`)"
-                    );
-                }
+                Err(e) => error!(
+                    "voxel-RT: could not load {SPONZA_VOX_PATH}: {e} — falling back to the Cornell box \
+                     (bake Sponza via `cargo run --example voxelize_scene`)"
+                ),
             }
         }
-        match &streaming.sponza {
-            Some((map, registry)) => {
-                let patch = pack_brickmap(map, registry);
-                let (n, v) = (patch.brick_count(), patch.voxels.len());
-                patch_res.patch = patch;
-                patch_res.generation = patch_res.generation.wrapping_add(1);
-                lighting.data = LightingUniformData::sponza();
-                sky.data = SkyUniformData::sponza();
-                streaming.packed_scene = Some(VoxelScene::Sponza);
-                info!("voxel-RT: loaded + packed STATIC Sponza .vox — {n} bricks, {v} voxels (no streaming)");
-            }
-            None => {
-                // Load failed: pack the Cornell box this frame so the engine still renders + never panics.
-                // LATCH the fallback as `packed_scene = Sponza` (NOT Cornell): the live scene resource is still
-                // Sponza, so marking the packed scene Sponza makes the early-return at the top of this branch
-                // fire next frame. Marking it Cornell would NOT match the live Sponza scene, so we would re-read
-                // the (missing) file, re-pack, and bump the generation — forcing a full BLAS rebuild — AND spam
-                // the error EVERY frame. Switching to Cornell/Worldgen sets packed_scene to that one, so
-                // re-selecting Sponza (e.g. after baking the asset) cleanly re-attempts load_vox.
-                let map = build_cornell_with_edits(&streaming.cornell_registry, &edits);
-                let patch = pack_brickmap(&map, &streaming.cornell_registry);
-                patch_res.patch = patch;
-                patch_res.generation = patch_res.generation.wrapping_add(1);
-                lighting.data = LightingUniformData::cornell();
-                sky.data = SkyUniformData::default();
-                streaming.packed_scene = Some(VoxelScene::Sponza);
-                streaming.packed_edit_gen = Some(edits.generation());
-            }
+        // A Sponza switch with NO loaded map (the asset is missing): pack a static Cornell box this frame so
+        // the engine still renders + never panics, latch packed_scene = Sponza (so we don't re-pack every
+        // frame), and bail out of the streaming path for this scene until the asset exists / the scene changes.
+        if matches!(*scene, VoxelScene::Sponza) && streaming.sponza.is_none() {
+            let map = build_cornell_with_edits(&streaming.cornell_registry, &edits);
+            let patch = pack_brickmap(&map, &streaming.cornell_registry);
+            patch_res.patch = patch;
+            patch_res.generation = patch_res.generation.wrapping_add(1);
+            lighting.data = LightingUniformData::cornell();
+            sky.data = SkyUniformData::default();
+            streaming.packed_scene = Some(VoxelScene::Sponza);
+            streaming.packed_edit_gen = Some(edits.generation());
+            return;
         }
-        return; // static — packed once, never streams
-    }
 
-    // --- Worldgen scene: camera-following streaming residency (the original Stage-3 path). ---
-    // On a switch INTO worldgen, drop any Cornell residency so the streamed set rebuilds cleanly, AND apply
-    // the open-world lighting/sky presets (a crisp sun + a bright directional sky), mirroring how the Cornell
-    // branch applies `cornell()` lighting. The presets are runtime uniforms (knobs-as-uniforms) — an editor
-    // panel can still override them afterward; we set them only on the SWITCH so a later edit doesn't clobber
-    // a user's tweaks.
-    if streaming.packed_scene != Some(VoxelScene::Worldgen) {
+        // Fresh residency for the new streamed scene (worldgen surface or the loaded Sponza map).
         streaming.manager = ResidencyManager::new();
         streaming.last_cam_brick = None;
-        streaming.packed_scene = Some(VoxelScene::Worldgen);
-        lighting.data = LightingUniformData::worldgen();
-        sky.data = SkyUniformData::worldgen();
-        info!("voxel-RT: switched to WORLDGEN scene — applied worldgen sun + directional sky presets");
+        streaming.worldgen_dirty_pending = false;
+        streaming.worldgen_frames_since_pack = 0;
+        streaming.packed_edit_gen = Some(edits.generation());
+        streaming.packed_scene = Some(*scene);
+        match *scene {
+            VoxelScene::Sponza => {
+                lighting.data = LightingUniformData::sponza();
+                sky.data = SkyUniformData::sponza();
+                info!("voxel-RT: switched to SPONZA scene — streaming the baked .vox through the clipmap");
+            }
+            _ => {
+                lighting.data = LightingUniformData::worldgen();
+                sky.data = SkyUniformData::worldgen();
+                info!("voxel-RT: switched to WORLDGEN scene — applied worldgen sun + directional sky presets");
+            }
+        }
+    }
+
+    // LATCHED missing-Sponza guard (never-panic invariant): on the SWITCH frame the block above packs the
+    // Cornell fallback + latches `packed_scene = Sponza` + returns — but on EVERY subsequent frame that switch
+    // block is skipped (`packed_scene == *scene`), so without this guard execution would fall through to the
+    // Sponza streaming arm below and hit `sponza.expect(...)` with `sponza == None` → panic. When Sponza is
+    // selected but its `.vox` never loaded (the asset is absent), there is nothing to stream: the Cornell
+    // fallback is already packed and stays valid, so just bail every frame until the asset exists / the scene
+    // changes. Worldgen is unaffected (it has no `sponza` dependency).
+    if matches!(*scene, VoxelScene::Sponza) && streaming.sponza.is_none() {
+        return;
     }
 
     let Ok(cam_tf) = cam.single() else {
@@ -392,9 +395,21 @@ fn stream_voxel_rt_residency(
     // shell could shift (a coarse boundary is `2^L×` farther apart, so a LOD0 crossing strictly implies it).
     let cam_brick = camera_brick_coord(cam_world);
 
-    // Reconcile only when the camera crosses into a new LOD0 brick (a shell could shift), OR when there is
-    // still pending work to drain. This avoids recomputing the clipmap every idle frame. The per-move
-    // enqueue/drop is O(shell) — only the LOD0 face-slab shifts on a small move; coarse shells are unchanged.
+    // An EDIT (build/destroy) re-queues exactly the affected resident bricks so the change re-sources +
+    // re-packs LOCALLY (it ADAPTS — the resident set, GI reservoirs, and world cache all stay; never a full
+    // clear, see [[feedback-gi-adapt-not-reset]]). Detected by the delta generation changing since the last
+    // pack. Works for EVERY streamed scene through the shared `apply_edit_overlay` in `drain_work_from`.
+    let edits_changed = streaming.packed_edit_gen != Some(edits.generation());
+    if edits_changed {
+        let dirty = affected_resident_keys(&edits);
+        streaming.manager.requeue_keys(dirty);
+        streaming.packed_edit_gen = Some(edits.generation());
+    }
+
+    // Reconcile only when the camera crosses into a new LOD0 brick (a shell could shift), an edit re-queued
+    // bricks, OR there is still pending work to drain. This avoids recomputing the clipmap every idle frame.
+    // The per-move enqueue/drop is O(shell) — only the LOD0 face-slab shifts on a small move; coarse shells
+    // are unchanged.
     let cam_changed = streaming.last_cam_brick != Some(cam_brick);
     if cam_changed {
         let dropped = {
@@ -409,7 +424,13 @@ fn stream_voxel_rt_residency(
         return; // nothing to do this frame
     }
 
-    // Bounded voxelization of queued bricks.
+    // Bounded SOURCING of queued bricks from this scene's BrickSource + the shared edit overlay. Split-borrow
+    // the streaming fields so the static `.vox` map (`sponza`) can back the source while the manager drains.
+    // The packing PALETTE/registry is scene-specific: worldgen bricks index the worldgen registry; Sponza
+    // bricks index the `.vox`'s OWN palette (loaded alongside its map), so both the drain (face-exposure /
+    // light gather) and the pack below use that registry — never the worldgen one — or the colours would be
+    // wrong.
+    let scene_now = *scene;
     let VoxelRtStreaming {
         manager,
         cfg,
@@ -417,17 +438,32 @@ fn stream_voxel_rt_residency(
         lib,
         registry,
         seed,
+        sponza,
         worldgen_dirty_pending,
         worldgen_frames_since_pack,
         ..
     } = &mut *streaming;
-    manager.drain_work(cfg, layer, lib, registry, *seed);
+    // The registry whose palette this scene's bricks index (so drain + pack agree on it).
+    let active_registry: &BlockRegistry = match scene_now {
+        VoxelScene::Sponza => {
+            // The Sponza map + its palette are loaded by here (the missing-asset case returned above).
+            let (map, vox_registry) = sponza.as_ref().expect("sponza map loaded before streaming");
+            let source = StaticVoxSource::new(map);
+            manager.drain_work_from(cfg, &source, vox_registry, &edits);
+            vox_registry
+        }
+        _ => {
+            let source = WorldgenSource::new(layer, lib, *seed);
+            manager.drain_work_from(cfg, &source, registry, &edits);
+            registry
+        }
+    };
 
     // AMORTIZE the O(resident) re-pack (pack_resident_set ~60 ms + the full BLAS rebuild): accumulate "resident
     // set changed" and pack only on a SETTLE (queue drained) OR every WORLDGEN_REPACK_INTERVAL frames during a
     // long stream — NOT on every dirty drain (which made each streaming frame pay the full O(resident) pack +
     // rebuild). Terrain still reveals progressively (keep-old-until-revealed); the per-frame cost while
-    // streaming drops to just the bounded voxelize drain. `take_dirty` is consumed every frame so the dirty
+    // streaming drops to just the bounded sourcing drain. `take_dirty` is consumed every frame so the dirty
     // flag is never lost; we OR it into the accumulator.
     if manager.take_dirty() {
         *worldgen_dirty_pending = true;
@@ -436,7 +472,7 @@ fn stream_voxel_rt_residency(
     let settled = manager.pending() == 0;
     if *worldgen_dirty_pending && (settled || *worldgen_frames_since_pack >= WORLDGEN_REPACK_INTERVAL) {
         let entries = manager.resident_entries();
-        let patch = pack_resident_set(&entries, registry);
+        let patch = pack_resident_set(&entries, active_registry);
         let (n, v) = (patch.brick_count(), patch.voxels.len());
         patch_res.patch = patch;
         patch_res.generation = patch_res.generation.wrapping_add(1);
@@ -448,6 +484,33 @@ fn stream_voxel_rt_residency(
             manager.pending()
         );
     }
+}
+
+/// The resident clipmap keys an edit-delta change INVALIDATES: for each overridden world voxel, the LOD0
+/// brick that OWNS it plus its LOD0 halo-neighbour bricks (so a boundary edit refreshes the neighbour's stale
+/// halo). Bricks not yet resident are still re-queued (a place into empty space appears). The SSOT mapping
+/// "edit → bricks to re-source", shared by every streamed scene (it consults only the [`VoxelEdits`] delta).
+///
+/// LOD0 ONLY, by design: the edit overlay ([`apply_edit_overlay`], applied in
+/// [`ResidencyManager::drain_work_from`]) is keyed on the LOD0 world-voxel grid and is SKIPPED for any
+/// `lod > 0` brick — a `0.2 m` LOD0 edit does not align with a coarse brick's wider cells, so a coarse brick
+/// cannot carry it. Re-queuing coarse bricks here was therefore DEAD WORK: they would be re-sourced (paying
+/// the coarse extract cost) and come back byte-identical, never reflecting the edit. So we re-queue ONLY the
+/// LOD0 owner + halo neighbours. CONSEQUENCE (stated honestly): once the camera retreats far enough that the
+/// edited region falls into a COARSE clipmap shell, the edit is no longer visible — the coarse brick shows the
+/// un-edited baked/sourced geometry. This is acceptable: edits happen near the camera (where the region is
+/// LOD0); a coarse-aware edit mip (folding the LOD0 override down the pyramid) is a future item.
+fn affected_resident_keys(edits: &VoxelEdits) -> FxHashSet<BrickKey> {
+    use super::edits::dirty_bricks_for_edit;
+    let mut keys: FxHashSet<BrickKey> = FxHashSet::default();
+    for (wv, _block) in edits.iter() {
+        // LOD0 owner + halo neighbours (the bricks whose stored voxels / halo read this edited voxel). The
+        // edit grid IS the LOD0 grid, so these are the only bricks the overlay can change.
+        for bc in dirty_bricks_for_edit(wv) {
+            keys.insert(BrickKey { coord: bc, lod: 0 });
+        }
+    }
+    keys
 }
 
 /// Main-world input: press **R** to flip the HW-RT view on/off.
@@ -3299,5 +3362,78 @@ fn voxel_rt_dlss_pass(
     #[cfg(feature = "editor")]
     {
         resources.gpu_timer = gpu_timer.take();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sdf_render::worldgen::coord::LayerId;
+
+    /// Build a [`VoxelRtStreaming`] in the LATCHED, asset-MISSING Sponza state: `sponza == None` (the `.vox`
+    /// never loaded) and `packed_scene == Some(Sponza)` (the switch frame already packed the Cornell fallback
+    /// and latched). This is the exact post-switch state that, before the latched guard was re-added, fell
+    /// through to `sponza.expect(None)` on frame 2 and panicked. Mirrors `init_voxel_rt_streaming`'s
+    /// construction with empty worldgen context (Cornell/Sponza never touch it).
+    fn latched_missing_sponza_streaming() -> VoxelRtStreaming {
+        let layer = HeightLayer::new(LayerId(0), HeightParams::default(), ErosionParams::default());
+        let lib = BiomeLibrary::default();
+        let registry = BlockRegistry::from_biome_library(&lib);
+        VoxelRtStreaming {
+            cfg: StreamingConfig::default(),
+            manager: ResidencyManager::new(),
+            layer,
+            lib,
+            registry,
+            seed: WORLDGEN_SLICE_SEED,
+            last_cam_brick: None,
+            cornell_registry: BlockRegistry::cornell(),
+            sponza: None, // the missing-asset case: never loaded
+            packed_scene: Some(VoxelScene::Sponza), // already latched on the switch frame
+            packed_edit_gen: Some(0),
+            worldgen_dirty_pending: false,
+            worldgen_frames_since_pack: 0,
+        }
+    }
+
+    /// REGRESSION (the documented never-panic path): when Sponza is selected but its `.vox` is absent, the
+    /// streaming system must NOT panic on the 2nd+ frame. We drive the REAL `stream_voxel_rt_residency` system
+    /// for several ticks in the latched asset-missing state (the switch frame already packed the Cornell
+    /// fallback) and assert it runs to completion every tick. Before the latched guard was re-added, frame 2
+    /// skipped the switch block (`packed_scene == *scene`) and fell through to `sponza.expect(...)` with
+    /// `sponza == None` → panic. No GPU / no render app — this is the main-world system only.
+    #[test]
+    fn missing_sponza_does_not_panic_across_ticks() {
+        let mut app = App::new();
+        // Only the resources the main-world system reads (no MinimalPlugins/Input/GPU needed).
+        app.insert_resource(VoxelScene::Sponza)
+            .init_resource::<VoxelEdits>()
+            .init_resource::<VoxelRtPatch>()
+            .init_resource::<VoxelRtLighting>()
+            .init_resource::<VoxelRtSky>()
+            .insert_resource(latched_missing_sponza_streaming())
+            .add_systems(Update, stream_voxel_rt_residency);
+        // A real camera so `cam.single()` SUCCEEDS and execution reaches the Sponza streaming arm — this is what
+        // makes the test actually EXERCISE the panic path: without the latched missing-Sponza guard, frame 2 would
+        // fall through to `sponza.expect(None)` and panic. With the guard it returns before the camera query, so
+        // the camera's presence is precisely what makes this test FAIL if the guard is ever removed (rather than
+        // being silently short-circuited by an empty-query early-return).
+        app.world_mut().spawn((SdfCamera, GlobalTransform::default()));
+
+        // Drive 3 ticks: frame "2", "3", "4" of the asset-missing latched state. None may panic; the patch
+        // generation must stay put (no streaming work happens — the fallback is already packed + bound).
+        let gen_before = app.world().resource::<VoxelRtPatch>().generation;
+        for _ in 0..3 {
+            app.update();
+        }
+        let gen_after = app.world().resource::<VoxelRtPatch>().generation;
+        assert_eq!(
+            gen_before, gen_after,
+            "the latched missing-Sponza guard must bail without re-packing (and without panicking)"
+        );
+        // And the residency never started streaming (sponza stayed None ⇒ no source ⇒ no resident bricks).
+        let streaming = app.world().resource::<VoxelRtStreaming>();
+        assert!(streaming.sponza.is_none(), "the missing asset stays unloaded");
+        assert_eq!(streaming.manager.resident_count(), 0, "no bricks stream while the asset is missing");
     }
 }

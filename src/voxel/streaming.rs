@@ -42,9 +42,10 @@ use bevy::math::IVec3;
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use super::brickmap::{Brick, MAX_LOD, brick_span};
+use super::edits::{VoxelEdits, apply_edit_overlay};
 use super::gpu::ResidentBrick;
 use super::palette::BlockRegistry;
-use super::voxelize::voxelize_brick;
+use super::source::{BrickSource, WorldgenSource};
 use crate::sdf_render::worldgen::biome::BiomeLibrary;
 use crate::sdf_render::worldgen::layers::height::HeightLayer;
 
@@ -67,7 +68,7 @@ pub struct StreamingConfig {
     /// `(2·clip_half+1)³` cube), and the finer level below it covers the inner `cheby ≤ clip_half/2`, so each
     /// level is resident only in the SHELL `clip_half/2 < cheby ≤ clip_half` (LOD0 fills the full cube). The
     /// total view radius is `clip_half · BRICK_WORLD_SIZE · 2^MAX_LOD`. Default 8 ⇒ each level `17³` and a
-    /// view half-extent of `8 · 1.6 · 64 ≈ 820 m` (vs the old dense ~45 m), at bounded VRAM (a clipmap of
+    /// view half-extent of `8 · 1.6 · 2^7 ≈ 1640 m` (vs the old dense ~45 m), at bounded VRAM (a clipmap of
     /// `MAX_LOD+1` thin shells, not a dense cube).
     pub clip_half_bricks: i32,
     /// Hard cap on resident bricks — a SAFETY bound so a mis-set `clip_half` can't blow VRAM. With the nested
@@ -269,6 +270,12 @@ impl ResidencyManager {
         self.resident.len()
     }
 
+    /// True iff `key` is currently resident (a non-empty brick is stored for it).
+    #[inline]
+    pub fn is_resident(&self, key: &BrickKey) -> bool {
+        self.resident.contains_key(key)
+    }
+
     /// Number of bricks waiting in the work queue.
     #[inline]
     pub fn pending(&self) -> usize {
@@ -326,14 +333,12 @@ impl ResidencyManager {
         dropped
     }
 
-    /// Process up to `cfg.max_bricks_per_frame` queued bricks: voxelize each at ITS key's LOD (the in-place
-    /// mip — coarse keys sample the surface at coarse spacing), store NON-empty results as resident, and drop
-    /// empty ones (sparsity). Marks the set dirty iff at least one brick was actually added — so a batch that
-    /// produced only empty bricks does NOT trigger a needless re-pack, and the old GPU scene stays valid until
-    /// a REVEALING batch lands (keep-old-until-revealed). Returns the number of bricks voxelized this call.
-    ///
-    /// Bounded: never does more than `max_bricks_per_frame` voxelizations; leftover queue items carry to the
-    /// next call. Logs when it caps (leaves work pending).
+    /// Process up to `cfg.max_bricks_per_frame` queued bricks from the WORLDGEN surface — the original
+    /// worldgen drain (signature unchanged, so the streaming + perf harness tests are bit-identical). A thin
+    /// wrapper over the source-generic [`drain_work_from`](Self::drain_work_from): it builds a
+    /// [`WorldgenSource`] over `(layer, lib, seed)` and drains with NO edit overlay
+    /// ([`VoxelEdits::is_empty`]), so the resident set is exactly what the direct `voxelize_brick` drain
+    /// produced before the source abstraction.
     pub fn drain_work(
         &mut self,
         cfg: &StreamingConfig,
@@ -341,6 +346,29 @@ impl ResidencyManager {
         lib: &BiomeLibrary,
         registry: &BlockRegistry,
         seed: u64,
+    ) -> usize {
+        let source = WorldgenSource::new(layer, lib, seed);
+        self.drain_work_from(cfg, &source, registry, &VoxelEdits::new())
+    }
+
+    /// Process up to `cfg.max_bricks_per_frame` queued bricks from ANY [`BrickSource`] (worldgen or a static
+    /// `.vox`): SOURCE each at ITS key's LOD (the in-place mip — coarse keys sample at coarse spacing), apply
+    /// the shared [`VoxelEdits`] overlay (so build/destroy editing works UNIFORMLY for every scene), store
+    /// NON-empty results as resident, and drop empty ones (sparsity). Marks the set dirty iff at least one
+    /// brick was actually added/removed — so a batch that produced only empty bricks does NOT trigger a
+    /// needless re-pack, and the old GPU scene stays valid until a REVEALING batch lands
+    /// (keep-old-until-revealed). Returns the number of bricks sourced this call.
+    ///
+    /// Bounded: never does more than `max_bricks_per_frame` sourcings; leftover queue items carry to the next
+    /// call. Logs when it caps (leaves work pending). DETERMINISTIC: the source is [`Sync`] + pure and the
+    /// per-brick overlay is pure, so the parallel drain yields a brick identical regardless of thread, applied
+    /// in a fixed order — the resident set is bit-identical to a serial loop.
+    pub fn drain_work_from(
+        &mut self,
+        cfg: &StreamingConfig,
+        source: &dyn BrickSource,
+        registry: &BlockRegistry,
+        edits: &VoxelEdits,
     ) -> usize {
         use bevy::tasks::{ComputeTaskPool, ParallelSlice};
         let budget = cfg.max_bricks_per_frame;
@@ -353,21 +381,39 @@ impl ResidencyManager {
         }
         let done = keys.len();
         if done > 0 {
-            // Voxelize the batch IN PARALLEL on the compute task pool. `voxelize_brick` is a pure function of
-            // `(coord, lod, seed, &layer, &lib, &registry)` (all shared + Sync), so this is
-            // determinism-preserving: each key yields an identical brick regardless of thread, and we apply
-            // the results in a fixed order — the resident set is bit-identical to a serial loop. Chunked (~one
+            // Source the batch IN PARALLEL on the compute task pool. The source's `brick` is a pure function of
+            // `(coord, lod, &registry)` (all shared + Sync), and the per-brick edit overlay is pure, so this is
+            // determinism-preserving: each key yields an identical brick regardless of thread, and we apply the
+            // results in a fixed order — the resident set is bit-identical to a serial loop. Chunked (~one
             // chunk per worker) so we spawn a handful of tasks, not one per brick.
             //
             // `get_or_init` (not `get`): the running app already initialized the ComputeTaskPool, but the
             // headless tests + perf harness call drain_work directly with no Bevy app — there `get()` panics,
             // so init a default pool on first use. (Same pool the live app uses when one exists.)
+            //
+            // The edit overlay is SKIPPED entirely when there are no edits — so a no-edit drain (the common
+            // case, and EVERY worldgen-harness test) is the literal `source.brick(...)` path, bit-identical to
+            // before the abstraction. When edits exist, each base brick is overlaid per-voxel via the shared
+            // `apply_edit_overlay` SSOT (the same rule the static-scene + pick paths use).
+            let has_edits = !edits.is_empty();
             let pool = ComputeTaskPool::get_or_init(bevy::tasks::TaskPool::default);
             let chunk = done.div_ceil(pool.thread_num().max(1)).max(1);
             let results: Vec<(BrickKey, Brick)> = keys
                 .par_chunk_map(pool, chunk, |_, ks| {
                     ks.iter()
-                        .map(|&k| (k, voxelize_brick(k.coord, k.lod, layer, lib, registry, seed)))
+                        .map(|&k| {
+                            let base = source.brick(k.coord, k.lod, registry);
+                            // The overlay is keyed by world VOXEL coord on the LOD0 grid; it only affects LOD0
+                            // bricks (a coarse brick's world-voxel footprint doesn't align with the override
+                            // grid). Applying it unconditionally is still correct (a coarse base has no
+                            // matching override key ⇒ unchanged), but skip non-LOD0 to keep coarse drains cheap.
+                            let brick = if has_edits && k.lod == 0 {
+                                apply_edit_overlay(k.coord, &base, edits)
+                            } else {
+                                base
+                            };
+                            (k, brick)
+                        })
                         .collect::<Vec<_>>()
                 })
                 .into_iter()
@@ -376,7 +422,8 @@ impl ResidencyManager {
             // Apply serially (HashMap mutation): non-empty bricks become resident; an all-air brick is dropped.
             for (key, brick) in results {
                 if brick.is_empty() {
-                    // All-air → never resident; MEMOIZE so future moves don't re-voxelize it (the churn fix).
+                    // All-air → never resident; MEMOIZE so future moves don't re-source it (the churn fix +
+                    // the static-scene clipmap BOUND: bricks outside the loaded map source empty once).
                     self.empty.insert(key);
                     if self.resident.remove(&key).is_some() {
                         self.dirty = true;
@@ -395,6 +442,26 @@ impl ResidencyManager {
             );
         }
         done
+    }
+
+    /// Force a RE-SOURCE of specific keys on the NEXT [`drain_work_from`](Self::drain_work_from): clear them
+    /// from the empty-memo (so a now-solid edit isn't skipped as known-air) and re-enqueue them. It does NOT
+    /// drop the resident entry — the OLD voxelized brick stays resident + bound until the re-source overwrites
+    /// it next drain (keep-old-until-revealed: the camera never sees a hole/flash while the edited brick
+    /// re-sources). Used for UNIFORM editing — an edit names the affected LOD0 bricks (owner + halo neighbours)
+    /// and this re-queues exactly those, so the edit re-sources + re-packs LOCALLY (it ADAPTS, never
+    /// full-clears — the resident set, the GI reservoirs, and the world cache all stay; see
+    /// [[feedback-gi-adapt-not-reset]]). Keys not currently resident are simply enqueued so a place into empty
+    /// space still appears. A key already queued is left as-is (the membership guard avoids a double-enqueue).
+    /// No-op for an empty set.
+    pub fn requeue_keys(&mut self, keys: impl IntoIterator<Item = BrickKey>) {
+        for key in keys {
+            self.empty.remove(&key);
+            if !self.queued.contains(&key) {
+                self.queue.push_back(WorkItem { key });
+                self.queued.insert(key);
+            }
+        }
     }
 
     /// Take the dirty flag, clearing it. `true` ⇒ the resident set changed and the render path should

@@ -28,6 +28,7 @@ pub mod palette;
 #[cfg(feature = "physics")]
 pub mod physics;
 pub mod raytrace;
+pub mod source;
 pub mod streaming;
 pub mod vox;
 pub mod voxelize;
@@ -58,15 +59,16 @@ pub const PATCH_DEPTH_BELOW: f32 = 4.0;
 /// voxels are captured (and any overhang would be, though Stage-1 terrain is a heightfield).
 pub const PATCH_HEIGHT_ABOVE: f32 = 1.0;
 
-/// Which voxel scene the engine renders. The DEFAULT is [`VoxelScene::Sponza`] — a baked, fully-resident
-/// classic GI-measurement scene (the Crytek Sponza atrium voxelized once offline into `assets/models/
-/// sponza.vox`), loaded + packed exactly like Cornell (NOT streamed). [`VoxelScene::Cornell`] — a static,
-/// fully-resident Cornell box, the canonical GI correctness anchor (colour bleed, an emissive area light,
-/// soft shadows). [`VoxelScene::Worldgen`] — the LARGE, streamed, GI-rich procedural terrain (Phase 2.6: sky
-/// GI on slopes, multi-bounce fill in deep valleys, emissive lava/crystal colour bleed, the world-cache at
-/// scale), now PERF-OPTIMIZED (cold fill ~1.7 s, ~2.5 ms/frame streaming drain). All three stay reachable via
-/// the **`V`** toggle (and the editor scene selector). The single SSOT knob the streaming + camera-framing
-/// systems read to decide which path runs.
+/// Which voxel scene the engine renders. The DEFAULT is [`VoxelScene::Sponza`] — a baked classic
+/// GI-measurement scene (the Crytek Sponza atrium voxelized once offline into `assets/models/sponza.vox`) that
+/// now STREAMS through the SAME camera-following clipmap residency as worldgen (via a
+/// [`source::StaticVoxSource`] over the loaded `.vox` [`BrickMap`]) — NOT the old pack-once static path. Only
+/// [`VoxelScene::Cornell`] is still fully resident: a static Cornell box, the canonical GI correctness anchor
+/// (colour bleed, an emissive area light, soft shadows). [`VoxelScene::Worldgen`] — the LARGE, streamed,
+/// GI-rich procedural terrain (Phase 2.6: sky GI on slopes, multi-bounce fill in deep valleys, emissive
+/// lava/crystal colour bleed, the world-cache at scale), now PERF-OPTIMIZED (cold fill ~1.7 s, ~2.5 ms/frame
+/// streaming drain). All three stay reachable via the **`V`** toggle (and the editor scene selector). The
+/// single SSOT knob the streaming + camera-framing systems read to decide which path runs.
 #[derive(Resource, Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum VoxelScene {
     /// Static Cornell box — fully resident, no streaming. The GI correctness anchor (reachable via **`V`**).
@@ -74,9 +76,12 @@ pub enum VoxelScene {
     /// Infinite streaming worldgen terrain (the original Stage-3 path) — the large GI-rich scene, now
     /// perf-optimized (cold fill ~1.7 s, ~2.5 ms/frame streaming drain).
     Worldgen,
-    /// Static, fully-resident BAKED `.vox` scene (Sponza) — loaded from `assets/models/sponza.vox` once and
-    /// packed like Cornell (NOT streamed). The default boot scene: a classic GI-measurement atrium (strong
-    /// single + multi-bounce colour bleed off the floor + coloured drapes under a raking sun).
+    /// Baked `.vox` scene (Sponza) — loaded from `assets/models/sponza.vox` once and then STREAMED through the
+    /// SAME clipmap residency worldgen uses (a [`source::StaticVoxSource`] over the loaded [`BrickMap`]: LOD0
+    /// extract / coarse mip-pyramid downsample, all-air outside its bounds so the clipmap naturally bounds the
+    /// building). NOT pack-once-static anymore — Sponza supports LOD/clipmaps + editing exactly like worldgen.
+    /// The default boot scene: a classic GI-measurement atrium (strong single + multi-bounce colour bleed off
+    /// the floor + coloured drapes under a raking sun).
     #[default]
     Sponza,
 }
@@ -88,8 +93,10 @@ impl VoxelScene {
         matches!(self, VoxelScene::Cornell)
     }
 
-    /// True iff this is the streaming worldgen scene (the only scene that drives the clipmap/streaming path).
-    /// Every OTHER scene (Cornell, Sponza) is a static fully-resident `.vox`/box loaded + packed once.
+    /// True iff this is the PROCEDURAL worldgen scene. Note this is NOT "the only streamed scene": Sponza now
+    /// streams through the same clipmap residency too (via a [`source::StaticVoxSource`]). The distinction this
+    /// predicate draws is the SOURCE — worldgen samples the procedural surface; Sponza reads a baked `.vox`
+    /// map; Cornell is the only remaining fully-resident, packed-once box.
     #[inline]
     pub fn is_worldgen(self) -> bool {
         matches!(self, VoxelScene::Worldgen)
@@ -359,18 +366,22 @@ fn reframe_camera_on_patch(
             orbit.target = eye + forward * orbit.distance; // sensible if the user toggles back to orbit
         }
         VoxelScene::Sponza => {
-            // Sponza is a fixed, bounded atrium (the `.vox` loader anchors it floor-at-y=0, centred on X/Z;
-            // it spans ~30 m × ~13 m × ~19 m). The right interaction is the FREE-FLY (FPS) camera — you stand
-            // INSIDE the atrium and look down its long axis at the colonnade, drapes, and lit floor (an orbit
-            // would put the eye outside the closed building). Seed an eye near one short end at standing
-            // height, looking along +X down the nave with a slight upward tilt so the arches + the raking sun
-            // through the open roof read. WASD/Space/Ctrl fly; right-mouse looks.
+            // Sponza is a fixed, bounded building streamed through the SAME clipmap as worldgen (the `.vox`
+            // loader anchors it floor-at-y=0, centred on X/Z). The baked Khronos Sponza is LARGE — it spans
+            // ~122 m along its long (X) axis, ~74 m in Z, and ~51 m tall — so the clipmap (≈1640 m view radius,
+            // 8 · 1.6 · 2^7) covers it fully and the bricks stream in from the StaticVoxSource. The right
+            // interaction is the
+            // FREE-FLY (FPS) camera — you stand INSIDE the nave looking down its long axis at the colonnade,
+            // drapes, and lit floor (an orbit would put the eye outside the building). Seed the eye near the
+            // −X short end at a vantage height, looking along +X down the full 122 m hall with a slight upward
+            // tilt so the upper colonnade + the sky-lit roof line read. WASD/Space/Ctrl fly; right-mouse looks.
             mode.fps = true;
-            mode.yaw = 0.0; // look toward +X (down the long axis of the atrium)
-            mode.pitch = 0.05; // a touch upward so the upper colonnade + sky-lit roof line read
-            // Stand near the −X short end (the floor spans roughly ±15 m in X), at ~2.5 m eye height, a hair
-            // off the X/Z centreline so the colonnade on both sides frames the nave.
-            let eye = Vec3::new(-12.0, 2.5, 0.5);
+            mode.yaw = 0.0; // look toward +X (down the long axis of the building)
+            mode.pitch = 0.06; // a touch upward so the tall colonnade + sky-lit roof line read
+            // Stand near the −X end (the floor spans roughly ±61 m in X), ~9 m up so the eye clears the floor
+            // clutter and takes in the receding 122 m hall, a hair off the X/Z centreline so the colonnade on
+            // both sides frames the nave. Well inside the clipmap's inner LOD0 cube (centred on the eye).
+            let eye = Vec3::new(-52.0, 9.0, 1.0);
             let forward = Vec3::new(
                 mode.yaw.cos() * mode.pitch.cos(),
                 mode.pitch.sin(),

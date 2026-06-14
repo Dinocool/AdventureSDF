@@ -1,14 +1,18 @@
-//! **Headless load + pack oracle for the static Sponza GI-measurement scene** (no GPU required).
+//! **Headless load + pack oracle for the baked Sponza GI-measurement scene** (no GPU required).
 //!
-//! Sponza is a baked `.vox` scene loaded + packed EXACTLY like the Cornell box (fully resident, NOT streamed):
-//! `load_vox(SPONZA_VOX_PATH) -> (BrickMap, BlockRegistry)`, then `pack_brickmap(&map, &registry)` — the same
-//! packer the Cornell static path uses — into the SSOT `GpuBrickPatch` the renderer's BLAS is built from.
+//! Sponza is a baked `.vox` scene. At RUNTIME it now STREAMS through the same camera-following clipmap
+//! residency as worldgen (via a `StaticVoxSource` over the loaded map — see `voxel_sponza_residency.rs` for
+//! that path); it is no longer pack-once-static like Cornell. This rig is a narrower, device-free LOAD assert:
+//! `load_vox(SPONZA_VOX_PATH) -> (BrickMap, BlockRegistry)`, then `pack_brickmap(&map, &registry)` (a direct
+//! whole-map pack, used here only as a self-contained oracle that the asset is well-formed) into the SSOT
+//! `GpuBrickPatch`.
 //!
-//! This rig proves the CPU half of that path with no GPU: that the baked asset loads, packs into a non-empty
-//! patch whose per-brick buffers line up, and carries a POPULATED palette (so the renderer has real colours to
-//! shade + bounce). The GPU rigs (`voxel_raytrace_gpu`, `voxel_gi_gpu`, `voxel_render_headless`,
-//! `voxel_cornell_headless`) cover the trace/GI/composite; this one is a fast, device-free build assert that
-//! the Sponza scene is wired correctly. It ALSO pins Sponza as the default boot scene (the user requirement).
+//! It proves the CPU load half with no GPU: that the baked asset loads, packs into a non-empty patch whose
+//! per-brick buffers line up, and carries a POPULATED palette (so the renderer has real colours to shade +
+//! bounce). The streaming/clipmap residency over the loaded map is covered by `voxel_sponza_residency.rs`; the
+//! GPU rigs (`voxel_raytrace_gpu`, `voxel_gi_gpu`, `voxel_render_headless`, `voxel_cornell_headless`) cover the
+//! trace/GI/composite. This one is a fast build assert that the asset is wired correctly. It ALSO pins Sponza
+//! as the default boot scene (the user requirement).
 //!
 //! If the baked `assets/models/sponza.vox` is absent (a checkout that hasn't run the offline bake) the
 //! load/pack body is skipped (the test passes vacuously on that part), but the default-scene assert always
@@ -28,14 +32,16 @@ fn sponza_is_the_default_scene() {
         VoxelScene::Sponza,
         "Sponza must be the default boot scene"
     );
-    // It is a STATIC scene (not the streaming worldgen path) — the residency packs it once like Cornell.
-    assert!(!VoxelScene::Sponza.is_worldgen(), "Sponza must NOT route through the streaming worldgen path");
-    assert!(!VoxelScene::Sponza.is_cornell(), "Sponza is its own static scene, distinct from Cornell");
+    // Sponza is its OWN scene variant: it streams through the clipmap like worldgen (via a StaticVoxSource),
+    // but it is neither the procedural `Worldgen` variant nor the fully-resident `Cornell` box.
+    assert!(!VoxelScene::Sponza.is_worldgen(), "Sponza is not the procedural worldgen variant");
+    assert!(!VoxelScene::Sponza.is_cornell(), "Sponza is its own scene, distinct from the resident Cornell box");
 }
 
-/// The baked Sponza `.vox` loads and packs into a NON-EMPTY `GpuBrickPatch` with a POPULATED palette, via the
-/// SAME `load_vox` → `pack_brickmap` path the live `stream_voxel_rt_residency` Sponza branch runs (mirroring
-/// the Cornell fully-resident pack, NOT streaming). No GPU needed — this is the CPU load/pack assert.
+/// The baked Sponza `.vox` loads (`load_vox`) and packs into a NON-EMPTY `GpuBrickPatch` with a POPULATED
+/// palette. This uses `pack_brickmap` as a self-contained oracle (the live runtime instead STREAMS the loaded
+/// map through the clipmap via a `StaticVoxSource` — see `voxel_sponza_residency.rs`); here it just proves the
+/// asset is well-formed. No GPU needed — this is the CPU load assert.
 #[test]
 fn sponza_loads_and_packs_non_empty() {
     let path = std::path::Path::new(SPONZA_VOX_PATH);
@@ -49,7 +55,7 @@ fn sponza_loads_and_packs_non_empty() {
     assert!(!map.is_empty(), "Sponza must have solid bricks");
     assert!(registry.len() > 1, "Sponza registry must carry the .vox palette (more than just AIR)");
 
-    // 2. Pack EXACTLY as the static Cornell path does — `pack_brickmap`, no streaming.
+    // 2. Pack the whole map directly with `pack_brickmap` (the device-free load oracle; the live path streams).
     let patch = pack_brickmap(&map, &registry);
 
     // 3. The packed patch is non-empty and internally consistent (the SSOT GPU layout).
