@@ -58,21 +58,27 @@ pub const PATCH_DEPTH_BELOW: f32 = 4.0;
 /// voxels are captured (and any overhang would be, though Stage-1 terrain is a heightfield).
 pub const PATCH_HEIGHT_ABOVE: f32 = 1.0;
 
-/// Which voxel scene the engine renders. The DEFAULT is [`VoxelScene::Worldgen`] — the LARGE, streamed,
-/// GI-rich procedural terrain (Phase 2.6: sky GI on slopes, multi-bounce fill in deep valleys, emissive
-/// lava/crystal colour bleed, the world-cache at scale), now PERF-OPTIMIZED (cold fill ~1.7 s, ~2.5 ms/frame
-/// streaming drain — the pack de-dup / per-column voxelize / amortized re-pack / parallel drain / churn-fix
-/// work). [`VoxelScene::Cornell`] — a static, fully-resident Cornell box, the canonical GI correctness anchor
-/// (colour bleed, an emissive area light, soft shadows) — stays reachable via the **`V`** toggle. The single
-/// SSOT knob the streaming + camera-framing systems read to decide which path runs.
+/// Which voxel scene the engine renders. The DEFAULT is [`VoxelScene::Sponza`] — a baked, fully-resident
+/// classic GI-measurement scene (the Crytek Sponza atrium voxelized once offline into `assets/models/
+/// sponza.vox`), loaded + packed exactly like Cornell (NOT streamed). [`VoxelScene::Cornell`] — a static,
+/// fully-resident Cornell box, the canonical GI correctness anchor (colour bleed, an emissive area light,
+/// soft shadows). [`VoxelScene::Worldgen`] — the LARGE, streamed, GI-rich procedural terrain (Phase 2.6: sky
+/// GI on slopes, multi-bounce fill in deep valleys, emissive lava/crystal colour bleed, the world-cache at
+/// scale), now PERF-OPTIMIZED (cold fill ~1.7 s, ~2.5 ms/frame streaming drain). All three stay reachable via
+/// the **`V`** toggle (and the editor scene selector). The single SSOT knob the streaming + camera-framing
+/// systems read to decide which path runs.
 #[derive(Resource, Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum VoxelScene {
     /// Static Cornell box — fully resident, no streaming. The GI correctness anchor (reachable via **`V`**).
     Cornell,
     /// Infinite streaming worldgen terrain (the original Stage-3 path) — the large GI-rich scene, now
-    /// perf-optimized (cold fill ~1.7 s, ~2.5 ms/frame streaming drain). The DEFAULT boot scene.
-    #[default]
+    /// perf-optimized (cold fill ~1.7 s, ~2.5 ms/frame streaming drain).
     Worldgen,
+    /// Static, fully-resident BAKED `.vox` scene (Sponza) — loaded from `assets/models/sponza.vox` once and
+    /// packed like Cornell (NOT streamed). The default boot scene: a classic GI-measurement atrium (strong
+    /// single + multi-bounce colour bleed off the floor + coloured drapes under a raking sun).
+    #[default]
+    Sponza,
 }
 
 impl VoxelScene {
@@ -80,6 +86,24 @@ impl VoxelScene {
     #[inline]
     pub fn is_cornell(self) -> bool {
         matches!(self, VoxelScene::Cornell)
+    }
+
+    /// True iff this is the streaming worldgen scene (the only scene that drives the clipmap/streaming path).
+    /// Every OTHER scene (Cornell, Sponza) is a static fully-resident `.vox`/box loaded + packed once.
+    #[inline]
+    pub fn is_worldgen(self) -> bool {
+        matches!(self, VoxelScene::Worldgen)
+    }
+
+    /// The next scene in the **`V`**-key cycle: Sponza → Cornell → Worldgen → Sponza. The SSOT for the cycle
+    /// order, shared by the keyboard toggle and (for parity) any other caller that wants "advance the scene".
+    #[inline]
+    pub fn next(self) -> Self {
+        match self {
+            VoxelScene::Sponza => VoxelScene::Cornell,
+            VoxelScene::Cornell => VoxelScene::Worldgen,
+            VoxelScene::Worldgen => VoxelScene::Sponza,
+        }
     }
 }
 
@@ -252,19 +276,17 @@ pub fn voxelize_patch_pub(
     voxelize_patch(layer, lib, registry, seed)
 }
 
-/// Runtime input: press **V** to switch between the static Cornell box and the streaming worldgen terrain.
-/// Switching resets the one-shot camera-reframe latch (via [`SceneReframed`]) so the camera re-frames onto
-/// the newly-selected scene next frame.
+/// Runtime input: press **V** to cycle the voxel scene Sponza → Cornell → Worldgen → Sponza. Switching
+/// resets the one-shot camera-reframe latch (via [`SceneReframed`]) so the camera re-frames onto the
+/// newly-selected scene next frame. The editor scene selector mutates the SAME [`VoxelScene`] resource (and
+/// must reset the latch the same way) — this is one of two entry points to the single SSOT.
 fn switch_voxel_scene_input(
     keys: Res<ButtonInput<KeyCode>>,
     mut scene: ResMut<VoxelScene>,
     mut reframed: ResMut<SceneReframed>,
 ) {
     if keys.just_pressed(KeyCode::KeyV) {
-        *scene = match *scene {
-            VoxelScene::Cornell => VoxelScene::Worldgen,
-            VoxelScene::Worldgen => VoxelScene::Cornell,
-        };
+        *scene = scene.next();
         reframed.0 = false; // re-frame the camera onto the new scene
         info!("voxel scene: {:?}", *scene);
     }
@@ -335,6 +357,28 @@ fn reframe_camera_on_patch(
             .normalize_or_zero();
             *tf = Transform::from_translation(eye).looking_at(eye + forward, Vec3::Y);
             orbit.target = eye + forward * orbit.distance; // sensible if the user toggles back to orbit
+        }
+        VoxelScene::Sponza => {
+            // Sponza is a fixed, bounded atrium (the `.vox` loader anchors it floor-at-y=0, centred on X/Z;
+            // it spans ~30 m × ~13 m × ~19 m). The right interaction is the FREE-FLY (FPS) camera — you stand
+            // INSIDE the atrium and look down its long axis at the colonnade, drapes, and lit floor (an orbit
+            // would put the eye outside the closed building). Seed an eye near one short end at standing
+            // height, looking along +X down the nave with a slight upward tilt so the arches + the raking sun
+            // through the open roof read. WASD/Space/Ctrl fly; right-mouse looks.
+            mode.fps = true;
+            mode.yaw = 0.0; // look toward +X (down the long axis of the atrium)
+            mode.pitch = 0.05; // a touch upward so the upper colonnade + sky-lit roof line read
+            // Stand near the −X short end (the floor spans roughly ±15 m in X), at ~2.5 m eye height, a hair
+            // off the X/Z centreline so the colonnade on both sides frames the nave.
+            let eye = Vec3::new(-12.0, 2.5, 0.5);
+            let forward = Vec3::new(
+                mode.yaw.cos() * mode.pitch.cos(),
+                mode.pitch.sin(),
+                mode.yaw.sin() * mode.pitch.cos(),
+            )
+            .normalize_or_zero();
+            *tf = Transform::from_translation(eye).looking_at(eye + forward, Vec3::Y);
+            orbit.target = eye + forward * orbit.distance; // sensible if the user toggles to orbit
         }
     }
     // `AmbientLight` is a per-camera component in 0.19 — give the viewport camera a soft ambient so the

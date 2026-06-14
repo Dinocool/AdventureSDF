@@ -40,11 +40,13 @@ use bevy::anti_alias::dlss::{
 #[cfg(feature = "dlss")]
 use bevy::core_pipeline::prepass::ViewPrepassTextures;
 
+use super::brickmap::BrickMap;
 use super::cornell::{build_cornell, build_cornell_with_edits};
 use super::edits::{VoxelEdits, VoxelHit, pick_voxel};
 use super::gpu::{GpuBrickAabb, GpuBrickPatch, pack_brickmap, pack_resident_set};
 use super::palette::{BlockId, BlockRegistry, CornellBlock};
 use super::streaming::{ResidencyManager, StreamingConfig, camera_brick_coord, region_half_extent_m};
+use super::vox::load_vox;
 use super::{VoxelScene, build_height_layer_pub, load_biome_library_pub};
 use crate::sdf_render::SdfCamera;
 use crate::sdf_render::worldgen::WORLDGEN_SLICE_SEED;
@@ -96,6 +98,11 @@ pub struct VoxelRtStreaming {
     last_cam_brick: Option<IVec3>,
     /// The Cornell-box block palette (independent of worldgen) — used to pack the static Cornell patch.
     cornell_registry: BlockRegistry,
+    /// Cache of the baked Sponza `.vox` scene `(BrickMap, BlockRegistry)`, loaded LAZILY the first time the
+    /// Sponza scene is selected and kept thereafter (loading + parsing the `.vox` is not free, so we never
+    /// reload it per frame — the static scene is packed once from this cache). `None` until the first Sponza
+    /// switch; on a load FAILURE it stays `None` and the residency falls back to Cornell (never panics).
+    sponza: Option<(BrickMap, BlockRegistry)>,
     /// Which scene the last packed patch was built for. `None` until the first pack; on a scene switch this
     /// differs from the live [`VoxelScene`], triggering a one-shot re-pack of the new scene.
     packed_scene: Option<VoxelScene>,
@@ -115,6 +122,12 @@ pub struct VoxelRtStreaming {
 /// Max frames a worldgen stream batch drains before forcing a re-pack (so a big cold fill reveals in chunks
 /// rather than one final pop, while still bounding the O(resident) pack to ~once per this many frames).
 const WORLDGEN_REPACK_INTERVAL: u32 = 6;
+
+/// Asset path of the baked Sponza `.vox` — the default static GI-measurement scene. Voxelized offline once
+/// (see `examples/voxelize_scene.rs`); the runtime only reads this baked file. Relative to the crate root /
+/// working directory (matching how `biomes.ron` is read), so headless tests run from the crate root resolve
+/// it too. The single SSOT for the Sponza asset location (the editor scene-selector path table points here).
+pub const SPONZA_VOX_PATH: &str = "assets/models/sponza.vox";
 
 /// Stage-2 plugin: builds the patch in the main world, registers extraction, and wires the render-world
 /// resources + the [`Core3d`] raymarch pass. Added in `main.rs` alongside [`super::VoxelPlugin`].
@@ -242,6 +255,7 @@ fn init_voxel_rt_streaming(
         seed,
         last_cam_brick: None,
         cornell_registry: BlockRegistry::cornell(),
+        sponza: None,
         packed_scene: None,
         packed_edit_gen: None,
         worldgen_dirty_pending: false,
@@ -299,6 +313,60 @@ fn stream_voxel_rt_residency(
             }
         }
         return; // static — only re-bakes on an edit, never streams
+    }
+
+    // --- Static Sponza scene: load the baked `.vox` ONCE, pack it like Cornell (NOT streamed). ---
+    // Mirrors the Cornell static path exactly: a one-shot load+pack on the switch INTO Sponza, the same
+    // `pack_brickmap` packer + generation bump (so `prepare_voxel_rt` rebuilds the BLAS), and a per-scene
+    // lighting/sky preset applied on the switch. The loaded `(BrickMap, BlockRegistry)` is cached in
+    // `streaming.sponza` so we never reload the file per frame. On a load FAILURE we log + pack the Cornell
+    // box THIS frame (never panic) so the engine stays usable + renders something.
+    if matches!(*scene, VoxelScene::Sponza) {
+        if streaming.packed_scene == Some(VoxelScene::Sponza) {
+            return; // already packed this static scene — nothing to do (no streaming, no per-edit re-bake)
+        }
+        // Load the `.vox` lazily on the first Sponza selection and cache it. A failure leaves the cache empty.
+        if streaming.sponza.is_none() {
+            match load_vox(SPONZA_VOX_PATH) {
+                Ok(loaded) => streaming.sponza = Some(loaded),
+                Err(e) => {
+                    error!(
+                        "voxel-RT: could not load {SPONZA_VOX_PATH}: {e} — falling back to the Cornell box \
+                         (bake Sponza via `cargo run --example voxelize_scene`)"
+                    );
+                }
+            }
+        }
+        match &streaming.sponza {
+            Some((map, registry)) => {
+                let patch = pack_brickmap(map, registry);
+                let (n, v) = (patch.brick_count(), patch.voxels.len());
+                patch_res.patch = patch;
+                patch_res.generation = patch_res.generation.wrapping_add(1);
+                lighting.data = LightingUniformData::sponza();
+                sky.data = SkyUniformData::sponza();
+                streaming.packed_scene = Some(VoxelScene::Sponza);
+                info!("voxel-RT: loaded + packed STATIC Sponza .vox — {n} bricks, {v} voxels (no streaming)");
+            }
+            None => {
+                // Load failed: pack the Cornell box this frame so the engine still renders + never panics.
+                // LATCH the fallback as `packed_scene = Sponza` (NOT Cornell): the live scene resource is still
+                // Sponza, so marking the packed scene Sponza makes the early-return at the top of this branch
+                // fire next frame. Marking it Cornell would NOT match the live Sponza scene, so we would re-read
+                // the (missing) file, re-pack, and bump the generation — forcing a full BLAS rebuild — AND spam
+                // the error EVERY frame. Switching to Cornell/Worldgen sets packed_scene to that one, so
+                // re-selecting Sponza (e.g. after baking the asset) cleanly re-attempts load_vox.
+                let map = build_cornell_with_edits(&streaming.cornell_registry, &edits);
+                let patch = pack_brickmap(&map, &streaming.cornell_registry);
+                patch_res.patch = patch;
+                patch_res.generation = patch_res.generation.wrapping_add(1);
+                lighting.data = LightingUniformData::cornell();
+                sky.data = SkyUniformData::default();
+                streaming.packed_scene = Some(VoxelScene::Sponza);
+                streaming.packed_edit_gen = Some(edits.generation());
+            }
+        }
+        return; // static — packed once, never streams
     }
 
     // --- Worldgen scene: camera-following streaming residency (the original Stage-3 path). ---
@@ -1043,6 +1111,44 @@ impl LightingUniformData {
             _pad: 0.0,
         }
     }
+
+    /// Lighting tuned for the baked SPONZA atrium — the GI-MEASUREMENT scene. Sponza is a half-open building
+    /// (a colonnaded courtyard with an open roof + open ends), so the classic key light is a strong, warm
+    /// directional SUN raking STEEPLY DOWN through the open roof to strike the floor + lower colonnade. That
+    /// directly-lit floor and the coloured drapes then bounce a MEASURABLE indirect signal up into the shaded
+    /// arcades (single-bounce floor→arch fill + multi-bounce colour bleed off the red/green hangings) — the
+    /// whole reason this scene exists. The values are picked for a strong, clearly-attributable GI signal:
+    /// a bright sun (direct lighting that drives a strong first bounce), plenty of GI rays for low-variance
+    /// colour bleed, a long-enough `gi_bounce_dist` to cross the ~30 m nave so a bounce off one wall reaches
+    /// the far colonnade, and only a faint neutral ambient (so the GI — not a flat fill — is what lights the
+    /// shadowed arcades). The sky ([`SkyUniformData::sponza`]) supplies the open-roof ambient + sky-GI a
+    /// bounce escaping upward returns. All runtime uniforms (knobs-as-uniforms) — the editor overrides any.
+    pub fn sponza() -> Self {
+        // NOTE the baked Khronos Sponza is a mostly-ROOFED interior — the sun reaches almost none of the floor,
+        // so the dominant light is SKY-GI entering through the open nave + the colonnade arches (see
+        // `SkyUniformData::sponza`, with a boosted `gi_sky_intensity`). The sun is a strong KEY on the nave +
+        // exposed upper geometry it DOES reach. Direction the light travels (away from the sun); Lambert uses
+        // `-sun_direction`; steep down the nave. The editor sliders re-aim/re-weight it for your measurement.
+        let sun = Vec3::new(0.32, -0.90, -0.28).normalize();
+        Self {
+            sun_direction: sun.into(),
+            sun_intensity: 2.4,
+            sun_color: [1.0, 0.94, 0.82], // warm midday sun
+            shadow_bias: 0.05,
+            // A modest neutral-cool fill so the deep, sky-occluded interior still reads (the asset is roofed),
+            // kept low enough that the sky-GI bounce — not a flat fill — is what shapes the arcades.
+            ambient_color: [0.09, 0.10, 0.13],
+            ao_radius: 1.2,
+            ao_samples: 4,
+            gi_rays: 16, // a strong, low-variance colour-bleed signal for the GI measurement
+            gi_intensity: 1.0,
+            gi_bounce_dist: 48.0, // long enough to cross the ~30 m nave (wall→far-colonnade bounce)
+            emissive_strength: 4.0, // Sponza has no baked emitters, but keep the knob at the open-world default
+            frame_index: 0,
+            debug_view: 0,
+            _pad: 0.0,
+        }
+    }
 }
 
 /// Runtime lighting resource: the SSOT [`LightingUniformData`] knobs, extracted to the render world each
@@ -1114,6 +1220,27 @@ impl SkyUniformData {
             ground_color: [0.20, 0.18, 0.15],
             sun_size: 0.035,
             sun_tint: [1.0, 0.93, 0.80],
+            _pad: 0.0,
+        }
+    }
+
+    /// Sky tuned for the baked SPONZA interior (the GI-measurement scene). The baked Khronos Sponza is mostly
+    /// ROOFED, so the sky is the DOMINANT light: it enters through the open nave + the colonnade arches and is
+    /// the main fill the shaded arcades see (hence the boosted `gi_sky_intensity`), plus the radiance a GI
+    /// bounce returns when it escapes upward through an opening. It is
+    /// a deep-blue zenith → pale-blue horizon gradient (a clear midday sky), full `gi_sky_intensity` (the sky
+    /// is the dominant FILL on surfaces the sun doesn't reach directly — measurable sky-GI in the arcades), a
+    /// warm-grey lower-hemisphere fill, and a crisp warm sun disk aligned with [`LightingUniformData::sponza`]'s
+    /// sun. Knobs-as-uniforms — the editor overrides any of them.
+    pub fn sponza() -> Self {
+        Self {
+            horizon_color: [0.72, 0.81, 0.93],
+            intensity: 2.6,
+            zenith_color: [0.20, 0.36, 0.64],
+            gi_sky_intensity: 2.5, // sky is the DOMINANT interior light (enters via the open nave + the arches)
+            ground_color: [0.16, 0.15, 0.13],
+            sun_size: 0.03,
+            sun_tint: [1.0, 0.92, 0.78],
             _pad: 0.0,
         }
     }

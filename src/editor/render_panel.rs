@@ -24,6 +24,8 @@ const DEBUG_LABELS: [&str; 8] = [
 
 /// The panel body. Registered via `editor::panels::register_panel`.
 pub fn render_gi_panel(world: &mut World, ui: &mut egui::Ui) {
+    // The live scene decides which preset the Reset button restores (Sponza is the default boot scene).
+    let scene = world.get_resource::<crate::voxel::VoxelScene>().copied().unwrap_or_default();
     // Scope the `VoxelRtLighting` borrow so it ends before the DLSS section reads other world resources.
     {
         let Some(mut lighting) = world.get_resource_mut::<VoxelRtLighting>() else {
@@ -88,9 +90,14 @@ pub fn render_gi_panel(world: &mut World, ui: &mut egui::Ui) {
         ui.add(egui::Slider::new(&mut d.emissive_strength, 0.0..=16.0).text("emissive strength"));
 
         ui.separator();
-        if ui.button("Reset to Cornell defaults").clicked() {
+        if ui.button(format!("Reset to {scene:?} defaults")).clicked() {
             let keep = d.debug_view;
-            *d = LightingUniformData::cornell();
+            // Scene-aware: restore the preset for the LIVE scene (Sponza/Worldgen/Cornell), not always Cornell.
+            *d = match scene {
+                crate::voxel::VoxelScene::Sponza => LightingUniformData::sponza(),
+                crate::voxel::VoxelScene::Worldgen => LightingUniformData::worldgen(),
+                crate::voxel::VoxelScene::Cornell => LightingUniformData::cornell(),
+            };
             d.debug_view = keep;
         }
     } // `lighting` borrow released here
