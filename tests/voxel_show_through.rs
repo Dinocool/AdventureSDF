@@ -120,7 +120,14 @@ fn dda_brick_faithful(patch: &GpuBrickPatch, bi: usize, ro: Vec3, rd: Vec3) -> O
         pick(nz(rd.z), (csize * inv.z).abs()),
     );
     let off = m.voxel_offset as usize;
-    let cell = |x: i32, y: i32, z: i32| patch.voxels[off + (x + y * hedge + z * hedge * hedge) as usize];
+    // Storage plan R1: a UNIFORM brick has no voxel array — every haloed cell is its single block id.
+    let cell = |x: i32, y: i32, z: i32| {
+        if m.is_uniform() {
+            m.uniform_block().0 as u32
+        } else {
+            patch.voxels[off + (x + y * hedge + z * hedge * hedge) as usize]
+        }
+    };
     let mut t = t0;
     let lim = 3 * (BRICK_EDGE + 2);
     for _ in 0..lim {

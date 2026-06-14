@@ -131,7 +131,14 @@ fn dda_brick_faithful(patch: &GpuBrickPatch, bi: usize, ro: Vec3, rd: Vec3) -> O
     };
 
     let off = m.voxel_offset as usize;
-    let cell = |x: i32, y: i32, z: i32| patch.voxels[off + (x + y * hedge + z * hedge * hedge) as usize];
+    // Storage plan R1: a UNIFORM brick has no voxel array — every haloed cell is its single block id.
+    let cell = |x: i32, y: i32, z: i32| {
+        if m.is_uniform() {
+            m.uniform_block().0 as u32
+        } else {
+            patch.voxels[off + (x + y * hedge + z * hedge * hedge) as usize]
+        }
+    };
 
     let mut found = false;
     let mut hit_t = -1.0f32;
@@ -325,7 +332,14 @@ fn dda_brick_crossed_axis(patch: &GpuBrickPatch, bi: usize, ro: Vec3, rd: Vec3) 
     };
 
     let off = m.voxel_offset as usize;
-    let cell = |x: i32, y: i32, z: i32| patch.voxels[off + (x + y * hedge + z * hedge * hedge) as usize];
+    // Storage plan R1: a UNIFORM brick has no voxel array — every haloed cell is its single block id.
+    let cell = |x: i32, y: i32, z: i32| {
+        if m.is_uniform() {
+            m.uniform_block().0 as u32
+        } else {
+            patch.voxels[off + (x + y * hedge + z * hedge * hedge) as usize]
+        }
+    };
 
     let mut found = false;
     let mut hit_t = -1.0f32;
@@ -756,6 +770,8 @@ fn occupancy_gradient_normal(patch: &GpuBrickPatch, bi: usize, hit_vox: IVec3) -
     let cell = |x: i32, y: i32, z: i32| -> u32 {
         if x < 0 || x >= hedge || y < 0 || y >= hedge || z < 0 || z >= hedge {
             0 // outside the haloed grid reads as air (matches the halo's absent-neighbour convention)
+        } else if m.is_uniform() {
+            m.uniform_block().0 as u32 // storage plan R1: uniform brick, no voxel array
         } else {
             patch.voxels[off + (x + y * hedge + z * hedge * hedge) as usize]
         }

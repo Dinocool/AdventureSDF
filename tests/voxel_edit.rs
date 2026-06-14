@@ -288,6 +288,10 @@ fn core_cell(patch: &GpuBrickPatch, world_voxel: IVec3) -> Option<u32> {
     let meta = patch.metas.iter().find(|m| {
         m.voxel_origin == [origin.x, origin.y, origin.z]
     })?;
+    // Storage plan R1: a UNIFORM brick carries no voxel array — its single block id covers every core cell.
+    if meta.is_uniform() {
+        return Some(meta.uniform_block().0 as u32);
+    }
     Some(patch.voxels[meta.voxel_offset as usize + idx])
 }
 
@@ -305,6 +309,10 @@ fn halo_cell_for_world_voxel(patch: &GpuBrickPatch, brick_coord: IVec3, world_vo
     let hz = local.z + 1;
     let idx = (hx + hy * HALO_EDGE + hz * HALO_EDGE * HALO_EDGE) as usize;
     let meta = patch.metas.iter().find(|m| m.voxel_origin == [origin.x, origin.y, origin.z])?;
+    // Storage plan R1: a UNIFORM brick carries no voxel array — every halo cell is its single block id too.
+    if meta.is_uniform() {
+        return Some(meta.uniform_block().0 as u32);
+    }
     Some(patch.voxels[meta.voxel_offset as usize + idx])
 }
 

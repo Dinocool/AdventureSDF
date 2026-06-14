@@ -481,12 +481,18 @@ fn cpu_first_solid_packed(patch: &GpuBrickPatch, ro: Vec3, rd: Vec3, t_max: f32)
             if vox.x < 0 || vox.x >= edge || vox.y < 0 || vox.y >= edge || vox.z < 0 || vox.z >= edge {
                 break;
             }
-            // The packed grid is HALOED (`(edge+2)³`, core cells at halo index [1, edge]) — the brick-seam
-            // fix. The core cell `vox` lives at haloed index `vox + 1`. Mirror the shader's `cell_index` at the
-            // haloed edge so this CPU oracle reads the SAME cell the GPU DDA commits.
-            let hedge = edge + 2;
-            let idx = ((vox.x + 1) + (vox.y + 1) * hedge + (vox.z + 1) * hedge * hedge) as usize;
-            let id = patch.voxels[off + idx];
+            // Storage plan R1: a UNIFORM brick carries NO voxel array — every cell is its single block id (read
+            // from the meta, exactly as the GPU `cell_block` does). A DENSE brick reads the HALOED grid
+            // (`(edge+2)³`, core cells at halo index [1, edge]); the core cell `vox` lives at haloed index
+            // `vox + 1` — mirror the shader's `cell_index` so this CPU oracle reads the SAME cell the GPU
+            // commits.
+            let id = if m.is_uniform() {
+                m.uniform_block().0 as u32
+            } else {
+                let hedge = edge + 2;
+                let idx = ((vox.x + 1) + (vox.y + 1) * hedge + (vox.z + 1) * hedge * hedge) as usize;
+                patch.voxels[off + idx]
+            };
             if id != 0 {
                 if best.map(|(_, bt)| t_cur < bt).unwrap_or(true) {
                     best = Some((id, t_cur));

@@ -109,6 +109,14 @@ pub struct GpuBrickAabb {
     pub _pad: [f32; 2],
 }
 
+/// The `voxel_offset` high bit (bit 31) marking a UNIFORM brick (storage plan R1): when set, the brick's
+/// FULL haloed `10³` grid is ONE block, so it carries NO per-voxel array — its single block id is packed into
+/// the LOW 16 bits of `voxel_offset` (see [`GpuBrickMeta::uniform`] / [`GpuBrickMeta::is_uniform`]). A
+/// non-uniform brick stores a real byte offset into the voxel buffer here, which is always `< 2^31` (≤ ~60k
+/// bricks × `halo_cells` = ~60 M `u32`s), so bit 31 is free to repurpose without growing the meta or breaking
+/// the std140/`bytemuck` layout. The WGSL `BRICK_UNIFORM_FLAG` mirror MUST match this exactly.
+pub const BRICK_UNIFORM_FLAG: u32 = 1u32 << 31;
+
 /// Per-brick metadata, parallel to the AABB buffer (index `i` describes the brick whose AABB is
 /// `aabbs[i]` and whose `primitive_index` in the ray query is `i`). 32 bytes, `bytemuck`-uploadable.
 #[repr(C)]
@@ -117,9 +125,13 @@ pub struct GpuBrickMeta {
     /// The brick's world-VOXEL origin (its local `(0,0,0)` corner in world voxel coordinates) =
     /// `brick_coord · BRICK_EDGE`. The shader maps a world position to a local voxel via this.
     pub voxel_origin: [i32; 3],
-    /// Offset (in `u32` elements) into the voxel buffer where this brick's voxel block ids begin. A brick
-    /// stores [`halo_cells`]`(lod)` = `10³` ids (the `8³` core + 1-cell halo) at EVERY LOD (the grid is a
-    /// constant `8³`; only the world span scales), so this stride is LOD-independent.
+    /// Offset (in `u32` elements) into the voxel buffer where this brick's voxel block ids begin — UNLESS the
+    /// [`BRICK_UNIFORM_FLAG`] high bit is set, in which case this is a UNIFORM brick (storage plan R1): no
+    /// voxel-array entries are emitted and the LOW 16 bits hold the single [`BlockId`] of the whole brick.
+    /// A DENSE brick stores [`halo_cells`]`(lod)` = `10³` ids (the `8³` core + 1-cell halo) at EVERY LOD (the
+    /// grid is a constant `8³`; only the world span scales), so its stride is LOD-independent and bit 31 is
+    /// always 0 (real offsets are `< 2^31`). Read via [`Self::is_uniform`] / [`Self::uniform_block`] /
+    /// [`Self::dense_offset`] — never compare the raw field.
     pub voxel_offset: u32,
     /// The brick's world-metre minimum corner (= `aabbs[i].min`), duplicated here so the shader's DDA has
     /// the brick origin without a second buffer fetch. `world_min = coord · brick_span(lod)`.
@@ -129,6 +141,45 @@ pub struct GpuBrickMeta {
     /// so a coarse brick is DDA-marched over the SAME `8³` grid covering `2^lod×` more world. Part of the
     /// SSOT — uploader, shader, and tests agree on it.
     pub lod: u32,
+}
+
+impl GpuBrickMeta {
+    /// Build a DENSE-brick meta whose voxels begin at `voxel_offset` in the voxel buffer (bit 31 clear). The
+    /// non-uniform path the engine has always emitted — byte-identical to before storage plan R1.
+    #[inline]
+    pub fn dense(voxel_origin: [i32; 3], voxel_offset: u32, world_min: [f32; 3], lod: u32) -> Self {
+        debug_assert!(voxel_offset & BRICK_UNIFORM_FLAG == 0, "voxel offset must leave bit 31 free for the uniform flag");
+        Self { voxel_origin, voxel_offset, world_min, lod }
+    }
+
+    /// Build a UNIFORM-brick meta (storage plan R1): the whole haloed `10³` grid is `block`, so NO voxel-array
+    /// entries are emitted — the block id is packed into the low 16 bits of `voxel_offset` with the
+    /// [`BRICK_UNIFORM_FLAG`] high bit set. The shader's DDA reads the id straight from the meta (no
+    /// `voxels[]` fetch). `block` must be a SOLID block (a uniform-air brick is empty and never resident).
+    #[inline]
+    pub fn uniform(voxel_origin: [i32; 3], block: BlockId, world_min: [f32; 3], lod: u32) -> Self {
+        Self { voxel_origin, voxel_offset: BRICK_UNIFORM_FLAG | block.0 as u32, world_min, lod }
+    }
+
+    /// True iff this meta is a collapsed UNIFORM brick (no voxel array; block id in the low bits).
+    #[inline]
+    pub fn is_uniform(&self) -> bool {
+        self.voxel_offset & BRICK_UNIFORM_FLAG != 0
+    }
+
+    /// The single [`BlockId`] of a UNIFORM brick (low 16 bits of `voxel_offset`). Meaningless for a dense
+    /// brick — gate on [`Self::is_uniform`] first.
+    #[inline]
+    pub fn uniform_block(&self) -> BlockId {
+        BlockId((self.voxel_offset & 0xFFFF) as u16)
+    }
+
+    /// The voxel-buffer start offset of a DENSE brick (bit 31 masked off — it is always 0 for a dense brick,
+    /// so this equals the raw field, but masking keeps the accessor total). Meaningless for a uniform brick.
+    #[inline]
+    pub fn dense_offset(&self) -> u32 {
+        self.voxel_offset & !BRICK_UNIFORM_FLAG
+    }
 }
 
 /// One palette entry: linear-RGBA albedo + linear-RGB emissive radiance. Indexed by `BlockId(i)`
@@ -229,6 +280,86 @@ impl GpuBrickPatch {
     pub fn is_empty(&self) -> bool {
         self.aabbs.is_empty()
     }
+
+    /// The number of UNIFORM-collapsed bricks in this patch (storage plan R1: a fully-buried uniform-incl-halo
+    /// brick whose voxel array was dropped — its block id lives in the meta). The win predictor: a high fraction
+    /// means most resident bricks cost ~0 voxel-buffer bytes.
+    pub fn uniform_brick_count(&self) -> usize {
+        self.metas.iter().filter(|m| m.is_uniform()).count()
+    }
+
+    /// A device-free STORAGE-BYTES report for this packed patch (storage plan R1 measurement — the
+    /// benchmark-every-delivery number). Compares the AFTER layout (uniform bricks carry no voxel array) against
+    /// the pre-R1 BEFORE layout (EVERY brick expanded to a haloed `10³` `u32` array, the content-blind cost the
+    /// engine paid before this change). All numbers are CPU-computable from the patch — no GPU device needed.
+    pub fn storage_report(&self) -> StorageReport {
+        let bricks = self.brick_count();
+        let uniform = self.uniform_brick_count();
+        let meta_aabb_bytes =
+            bricks * (std::mem::size_of::<GpuBrickMeta>() + std::mem::size_of::<GpuBrickAabb>());
+        let palette_bytes = self.palette.len() * std::mem::size_of::<GpuPaletteColor>();
+        let light_bytes = self.lights.len() * std::mem::size_of::<GpuVoxelLight>()
+            + self.alias.len() * std::mem::size_of::<GpuAliasEntry>();
+        // AFTER (R1): the actual emitted voxel buffer (uniform bricks contributed nothing).
+        let voxel_bytes_after = self.voxels.len() * std::mem::size_of::<u32>();
+        // BEFORE (pre-R1): every brick expanded to a haloed 10³ array regardless of content.
+        let voxel_bytes_before = bricks * halo_cells(0) * std::mem::size_of::<u32>();
+        StorageReport {
+            bricks,
+            uniform_bricks: uniform,
+            meta_aabb_bytes,
+            palette_bytes,
+            light_bytes,
+            voxel_bytes_before,
+            voxel_bytes_after,
+        }
+    }
+}
+
+/// A device-free storage-bytes breakdown of a packed [`GpuBrickPatch`] (storage plan R1 measurement). Built by
+/// [`GpuBrickPatch::storage_report`]. The headline number is `total_vram_after` vs `total_vram_before` — the
+/// resident VRAM the uniform-brick collapse claws back. `meta_aabb_bytes`/`palette_bytes`/`light_bytes` are
+/// unchanged by R1 (only the voxel buffer shrinks), so they appear in both totals.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct StorageReport {
+    /// Resident brick count (== BLAS primitives).
+    pub bricks: usize,
+    /// Of those, the UNIFORM-collapsed bricks (no voxel array — R1's win predictor).
+    pub uniform_bricks: usize,
+    /// Per-brick meta + AABB bytes (`bricks · (32 + 32)`). Unchanged by R1.
+    pub meta_aabb_bytes: usize,
+    /// Palette buffer bytes. Unchanged by R1.
+    pub palette_bytes: usize,
+    /// NEE light-list + alias-table bytes. Unchanged by R1.
+    pub light_bytes: usize,
+    /// Voxel buffer bytes BEFORE R1 (every brick a haloed `10³` `u32` array — content-blind).
+    pub voxel_bytes_before: usize,
+    /// Voxel buffer bytes AFTER R1 (uniform bricks emit nothing — only dense surface bricks remain).
+    pub voxel_bytes_after: usize,
+}
+
+impl StorageReport {
+    /// The fraction of resident bricks that collapsed to uniform (0..=1) — R1's win predictor.
+    pub fn uniform_fraction(&self) -> f64 {
+        if self.bricks == 0 { 0.0 } else { self.uniform_bricks as f64 / self.bricks as f64 }
+    }
+    /// Mean bytes/brick of the voxel buffer AFTER R1 (the headline density number).
+    pub fn voxel_bytes_per_brick_after(&self) -> f64 {
+        if self.bricks == 0 { 0.0 } else { self.voxel_bytes_after as f64 / self.bricks as f64 }
+    }
+    /// Total resident VRAM estimate BEFORE R1 (all GPU buffers, content-blind voxel layout).
+    pub fn total_vram_before(&self) -> usize {
+        self.meta_aabb_bytes + self.palette_bytes + self.light_bytes + self.voxel_bytes_before
+    }
+    /// Total resident VRAM estimate AFTER R1 (the single number each phase must reduce).
+    pub fn total_vram_after(&self) -> usize {
+        self.meta_aabb_bytes + self.palette_bytes + self.light_bytes + self.voxel_bytes_after
+    }
+    /// The VRAM-reduction factor (`before / after`) — `1.0` when nothing collapsed.
+    pub fn vram_reduction(&self) -> f64 {
+        let after = self.total_vram_after();
+        if after == 0 { 1.0 } else { self.total_vram_before() as f64 / after as f64 }
+    }
 }
 
 /// Pack a resident [`BrickMap`] + its [`BlockRegistry`] palette into GPU-ready buffers (the SSOT layout).
@@ -267,17 +398,28 @@ pub fn pack_brickmap(map: &BrickMap, registry: &BlockRegistry) -> GpuBrickPatch 
         // == BRICK_WORLD_SIZE`. `world_min` stored in the meta stays the TRUE corner the DDA reconstructs from.
         patch.aabbs.push(brick_aabb(world_min, 0));
 
-        let voxel_offset = patch.voxels.len() as u32;
         let voxel_origin = [coord.x * BRICK_EDGE, coord.y * BRICK_EDGE, coord.z * BRICK_EDGE];
+        let origin = IVec3::new(voxel_origin[0], voxel_origin[1], voxel_origin[2]);
+
+        // STORAGE PLAN R1 — UNIFORM-INCLUDING-HALO collapse (same rule as `pack_resident_set`, expressed over
+        // the `BrickMap`'s world-voxel addressing). A brick whose core is one solid block AND whose entire
+        // 1-cell halo (read via `map.voxel_block`, AIR where a neighbour is absent) is that same block is fully
+        // buried: drop its voxel array + halo and flag it uniform in the meta. A core-uniform brick on a SEAM
+        // (an exposed face whose halo reads AIR) keeps its dense halo for the correct boundary-face normal.
+        if let Some(block) = map_uniform_incl_halo_block(map, coord, origin) {
+            patch.metas.push(GpuBrickMeta::uniform(voxel_origin, block, world_min, 0));
+            continue; // no voxel emit, no light gather (fully buried ⇒ no air-exposed emissive face)
+        }
+
+        let voxel_offset = patch.voxels.len() as u32;
         // LOD0 (full res) for the static patch packer — every brick keeps its 8³ core grid (+ halo).
-        patch.metas.push(GpuBrickMeta { voxel_origin, voxel_offset, world_min, lod: 0 });
+        patch.metas.push(GpuBrickMeta::dense(voxel_origin, voxel_offset, world_min, 0));
 
         // Append the brick's voxels in HALOED-grid order (+X fastest, then +Y, then +Z): the haloed grid is
         // `(BRICK_EDGE+2)³`, with halo index 0/`h-1` the border ring and core cells at `[1, BRICK_EDGE]`. The
         // border holds the NEIGHBOUR brick's adjacent voxel (read from the map via `voxel_block`; AIR where the
         // neighbour is absent), so the DDA sees a real air→solid crossing at the true surface. The brick's
         // world-voxel origin is `voxel_origin`; haloed local `(hx,hy,hz)` ↦ world voxel `origin + (h*-1)`.
-        let origin = IVec3::new(voxel_origin[0], voxel_origin[1], voxel_origin[2]);
         for hz in 0..h {
             for hy in 0..h {
                 for hx in 0..h {
@@ -292,9 +434,23 @@ pub fn pack_brickmap(map: &BrickMap, registry: &BlockRegistry) -> GpuBrickPatch 
         gather_lights_into(&mut found, &patch, registry, voxel_offset as usize, world_min, 0);
     }
 
+    ensure_voxels_nonempty(&mut patch);
     push_palette(&mut patch, registry);
     finalize_lights(&mut patch, found);
     patch
+}
+
+/// Keep the voxel buffer NON-EMPTY for upload (storage plan R1 edge case). With uniform-brick collapse a patch
+/// whose every brick is uniform-incl-halo emits ZERO voxel-array entries; `wgpu::create_buffer_init` rejects a
+/// zero-sized storage buffer, so push a single unreferenced sentinel `0u32`. No `GpuBrickMeta` points at it
+/// (every uniform brick reads its id from the meta; every dense brick has its own slice at index 0+), so this
+/// is invisible to the trace and keeps every consumer's `cast_slice(&patch.voxels)` valid with no per-site
+/// guard. Only fires for the all-uniform degenerate case — a normal scene has dense surface bricks.
+#[inline]
+fn ensure_voxels_nonempty(patch: &mut GpuBrickPatch) {
+    if patch.voxels.is_empty() {
+        patch.voxels.push(0);
+    }
 }
 
 /// One resident brick ready to pack: its `(coord, lod)` clipmap key + the voxelized brick. The streaming
@@ -353,9 +509,26 @@ pub fn pack_resident_set(entries: &[ResidentBrick<'_>], registry: &BlockRegistry
         // BLAS AABB grown by the seam epsilon (overlapping neighbours); the meta keeps the TRUE `world_min`.
         patch.aabbs.push(brick_aabb(world_min, lod));
 
-        let voxel_offset = patch.voxels.len() as u32;
         let voxel_origin = [coord.x * BRICK_EDGE, coord.y * BRICK_EDGE, coord.z * BRICK_EDGE];
-        patch.metas.push(GpuBrickMeta { voxel_origin, voxel_offset, world_min, lod });
+
+        // STORAGE PLAN R1 — UNIFORM-INCLUDING-HALO collapse. A brick whose FULL haloed `10³` grid is ONE solid
+        // block (every CORE *and* every HALO cell identical) carries NO per-voxel array: the meta flags it
+        // uniform + packs the single block id. This is the DEEP-INTERIOR case (the bulk of the solid fill) and
+        // is robust by construction — a fully-buried brick whose halo also matches has zero air-exposed faces,
+        // so the seam/normal logic the halo exists for never fires (and `gather_lights_into` would cull it as
+        // unexposed anyway). A core-uniform brick whose HALO DIFFERS (a surface brick: a neighbour, or a
+        // clipmap shell boundary contributing AIR) is NOT collapsed — its boundary faces are exposed and need
+        // the dense halo for the correct entry-face normal, so it falls through to the byte-identical dense path.
+        if let Some(block) = uniform_incl_halo_block(e, &by_key) {
+            patch.metas.push(GpuBrickMeta::uniform(voxel_origin, block, world_min, lod));
+            // No voxel-array emit, and no light gather: a uniform-incl-halo brick is fully buried (every face
+            // neighbour is the same solid block), so it exposes no emissive faces — identical to the dense path,
+            // where `gather_lights_into`'s air-exposure test would reject every interior voxel.
+            continue;
+        }
+
+        let voxel_offset = patch.voxels.len() as u32;
+        patch.metas.push(GpuBrickMeta::dense(voxel_origin, voxel_offset, world_min, lod));
 
         for hz in 0..h {
             for hy in 0..h {
@@ -383,9 +556,75 @@ pub fn pack_resident_set(entries: &[ResidentBrick<'_>], registry: &BlockRegistry
         gather_lights_into(&mut found, &patch, registry, voxel_offset as usize, world_min, lod);
     }
 
+    ensure_voxels_nonempty(&mut patch);
     push_palette(&mut patch, registry);
     finalize_lights(&mut patch, found);
     patch
+}
+
+/// Storage plan R1: is the resident brick `e` UNIFORM INCLUDING ITS HALO — i.e. its CORE is a single solid
+/// block AND every one of its `10³ − 8³` halo border cells (the SAME-LOD neighbour voxels the packer would
+/// write) is that same block? Returns the block id when so (safe to drop both the voxel array and the halo),
+/// else `None` (keep the dense array). Computed from the resident map (`by_key`) the same way the dense
+/// halo-fill does (`neighbour_border_cell`), so the collapse decision can never disagree with what would have
+/// been packed. Only the FULLY-buried case qualifies: a core-uniform brick with even one differing halo cell
+/// (a real neighbour with a hole, or a shell boundary contributing AIR) is a SURFACE brick that keeps its
+/// halo for the correct boundary-face normal.
+fn uniform_incl_halo_block(
+    e: &ResidentBrick<'_>,
+    by_key: &std::collections::HashMap<(IVec3, u32), &Brick>,
+) -> Option<BlockId> {
+    // The core must be a single SOLID block (the cheap CPU fast path already collapses these). A uniform-AIR
+    // brick is empty and never reaches the packer, so `uniform_block()` here is always solid when `Some`.
+    let block = e.brick.uniform_block()?;
+    if block.is_air() {
+        return None;
+    }
+    // Every halo border cell (one ring beyond each face/edge/corner) must equal `block`. The border spans
+    // local voxel coords in `[-1, BRICK_EDGE]` with at least one axis at `-1` or `BRICK_EDGE`; check exactly
+    // those cells via the same neighbour resolution the dense halo-fill uses.
+    for cz in -1..=BRICK_EDGE {
+        for cy in -1..=BRICK_EDGE {
+            for cx in -1..=BRICK_EDGE {
+                let in_core =
+                    (0..BRICK_EDGE).contains(&cx) && (0..BRICK_EDGE).contains(&cy) && (0..BRICK_EDGE).contains(&cz);
+                if in_core {
+                    continue; // core is `block` by construction (uniform)
+                }
+                if neighbour_border_cell(by_key, e.coord, e.lod, IVec3::new(cx, cy, cz)) != block {
+                    return None; // a halo cell differs ⇒ this is a surface brick, keep it dense
+                }
+            }
+        }
+    }
+    Some(block)
+}
+
+/// Storage plan R1 for the static [`BrickMap`] packer ([`pack_brickmap`]): is the LOD0 brick at `coord`
+/// (world-voxel origin `origin`) UNIFORM INCLUDING ITS HALO? Mirrors [`uniform_incl_halo_block`] but resolves
+/// the halo through the map's world-voxel addressing (`voxel_block`, AIR for an absent neighbour) — exactly
+/// what `pack_brickmap`'s dense halo-fill reads — so the collapse decision matches the bytes that would have
+/// been packed. Returns the single solid block when fully buried, else `None` (keep the dense halo).
+fn map_uniform_incl_halo_block(map: &BrickMap, coord: IVec3, origin: IVec3) -> Option<BlockId> {
+    let block = map.get(coord)?.uniform_block()?;
+    if block.is_air() {
+        return None;
+    }
+    for hz in -1..=BRICK_EDGE {
+        for hy in -1..=BRICK_EDGE {
+            for hx in -1..=BRICK_EDGE {
+                let in_core =
+                    (0..BRICK_EDGE).contains(&hx) && (0..BRICK_EDGE).contains(&hy) && (0..BRICK_EDGE).contains(&hz);
+                if in_core {
+                    continue; // core is `block` by construction (uniform)
+                }
+                if map.voxel_block(origin + IVec3::new(hx, hy, hz)) != block {
+                    return None; // a halo cell differs ⇒ surface brick, keep it dense
+                }
+            }
+        }
+    }
+    Some(block)
 }
 
 /// Resolve one HALO BORDER cell at local voxel coordinate `cc` (outside `[0, BRICK_EDGE)` on ≥1 axis) for the
@@ -943,5 +1182,153 @@ mod tests {
         for l in &patch.lights {
             assert!((l.area - cell * cell).abs() < 1e-4, "coarse light area = (VOXEL_SIZE·2^lod)²");
         }
+    }
+
+    // --- STORAGE PLAN R1: uniform-including-halo collapse ----------------------------------------------
+
+    /// The `GpuBrickMeta` flag encoding round-trips and stays 32 bytes (std140/encase-safe): a uniform meta is
+    /// flagged + carries its block id in the low bits; a dense meta is byte-identical to before R1 (bit 31
+    /// clear, offset readable). The Rust struct size is pinned so the WGSL mirror can't silently drift.
+    #[test]
+    fn meta_uniform_flag_roundtrips_without_growing() {
+        assert_eq!(std::mem::size_of::<GpuBrickMeta>(), 32, "meta must stay 32 bytes (WGSL byte-match)");
+        let u = GpuBrickMeta::uniform([8, 0, -8], BlockId(1234), [1.6, 0.0, -1.6], 3);
+        assert!(u.is_uniform());
+        assert_eq!(u.uniform_block(), BlockId(1234));
+        assert_eq!(u.voxel_origin, [8, 0, -8]);
+        assert_eq!(u.lod, 3);
+
+        let d = GpuBrickMeta::dense([0, 0, 0], 5000, [0.0; 3], 0);
+        assert!(!d.is_uniform(), "a dense brick must NOT be flagged uniform");
+        assert_eq!(d.dense_offset(), 5000, "dense offset reads back unchanged (bit 31 clear)");
+    }
+
+    /// A fully-buried uniform brick (its 6/26 neighbours all the SAME solid block) collapses: the meta is
+    /// flagged uniform with that block id and NO voxel-array entries are emitted for it; its surrounding
+    /// SURFACE bricks (an exposed face whose halo reads AIR) stay DENSE. This is the deep-interior win.
+    #[test]
+    fn uniform_incl_halo_brick_collapses_no_array() {
+        let reg = registry();
+        let block = BlockId(1);
+        let b = solid_brick(block);
+        // A 3×3×3 block of identical solid bricks. The CENTER (1,1,1) is fully surrounded by same-block
+        // neighbours ⇒ uniform-incl-halo ⇒ collapses. The 26 shell bricks have ≥1 air-halo face ⇒ dense.
+        let mut entries = Vec::new();
+        for z in 0..3 {
+            for y in 0..3 {
+                for x in 0..3 {
+                    entries.push(ResidentBrick { coord: IVec3::new(x, y, z), brick: &b, lod: 0 });
+                }
+            }
+        }
+        let patch = pack_resident_set(&entries, &reg);
+        assert_eq!(patch.brick_count(), 27);
+        assert_eq!(patch.uniform_brick_count(), 1, "only the fully-buried center brick collapses");
+
+        // The center brick's meta is uniform with the right block id; the surface bricks are dense.
+        let center = patch.metas.iter().find(|m| m.voxel_origin == [BRICK_EDGE, BRICK_EDGE, BRICK_EDGE]).unwrap();
+        assert!(center.is_uniform());
+        assert_eq!(center.uniform_block(), block);
+
+        // Exactly the 26 dense surface bricks emit a haloed 10³ array each; the uniform brick emits nothing.
+        assert_eq!(patch.voxels.len(), 26 * halo_cells(0), "only the 26 dense bricks carry voxel arrays");
+    }
+
+    /// An ISOLATED uniform brick (no neighbours ⇒ AIR halo) is NOT collapsed — its boundary faces are exposed
+    /// and need the dense halo for the correct entry-face normal. R1 collapses ONLY the fully-buried case.
+    #[test]
+    fn isolated_uniform_brick_stays_dense() {
+        let reg = registry();
+        let b = solid_brick(BlockId(1));
+        let entries = vec![ResidentBrick { coord: IVec3::new(0, 0, 0), brick: &b, lod: 0 }];
+        let patch = pack_resident_set(&entries, &reg);
+        assert_eq!(patch.uniform_brick_count(), 0, "an air-haloed (surface) uniform brick must stay dense");
+        assert!(!patch.metas[0].is_uniform());
+        assert_eq!(patch.voxels.len(), halo_cells(0), "a dense brick keeps its full haloed array");
+    }
+
+    /// A core-uniform brick whose HALO DIFFERS (a same-block neighbour with a hole on the shared face) is NOT
+    /// collapsed — the differing halo cell means a boundary face is exposed, so the dense halo is required.
+    #[test]
+    fn core_uniform_but_halo_differs_stays_dense() {
+        let reg = registry();
+        let block = BlockId(1);
+        let solid = solid_brick(block);
+        // The neighbour at (+X) is solid EXCEPT one voxel on its shared (−X) face is air, so the center brick's
+        // +X halo ring is not all `block` ⇒ the center must stay dense.
+        let mut holed = Box::new([block; BRICK_VOXELS]);
+        holed[voxel_index(0, 3, 3)] = BlockId::AIR; // a hole on the neighbour's −X face (shared with center +X)
+        let holed = Brick::from_voxels(holed);
+        let entries = vec![
+            ResidentBrick { coord: IVec3::new(0, 0, 0), brick: &solid, lod: 0 },
+            ResidentBrick { coord: IVec3::new(1, 0, 0), brick: &holed, lod: 0 },
+        ];
+        let patch = pack_resident_set(&entries, &reg);
+        let center = patch.metas.iter().find(|m| m.voxel_origin == [0, 0, 0]).unwrap();
+        assert!(!center.is_uniform(), "a core-uniform brick whose halo differs must stay dense");
+    }
+
+    /// `pack_brickmap` (the static path) collapses a fully-buried uniform brick too, identically to
+    /// `pack_resident_set`. A 3×3×3 solid `BrickMap` ⇒ 1 collapsed center + 26 dense shell bricks.
+    #[test]
+    fn pack_brickmap_collapses_buried_uniform() {
+        let reg = registry();
+        let block = BlockId(1);
+        let mut map = BrickMap::new();
+        for z in 0..3 {
+            for y in 0..3 {
+                for x in 0..3 {
+                    map.insert(IVec3::new(x, y, z), Brick::uniform(block));
+                }
+            }
+        }
+        let patch = pack_brickmap(&map, &reg);
+        assert_eq!(patch.brick_count(), 27);
+        assert_eq!(patch.uniform_brick_count(), 1, "the buried center brick collapses");
+        assert_eq!(patch.voxels.len(), 26 * halo_cells(0));
+    }
+
+    /// The storage report quantifies the R1 win: for the 3×3×3 solid block the 1 collapsed brick's 4 KB of
+    /// voxel array vanishes, so the AFTER voxel buffer is 26/27 of the BEFORE content-blind layout and the
+    /// reported VRAM reduction is `> 1`.
+    #[test]
+    fn storage_report_quantifies_uniform_win() {
+        let reg = registry();
+        let b = solid_brick(BlockId(1));
+        let mut entries = Vec::new();
+        for z in 0..3 {
+            for y in 0..3 {
+                for x in 0..3 {
+                    entries.push(ResidentBrick { coord: IVec3::new(x, y, z), brick: &b, lod: 0 });
+                }
+            }
+        }
+        let patch = pack_resident_set(&entries, &reg);
+        let rep = patch.storage_report();
+        assert_eq!(rep.bricks, 27);
+        assert_eq!(rep.uniform_bricks, 1);
+        assert_eq!(rep.voxel_bytes_before, 27 * halo_cells(0) * 4);
+        assert_eq!(rep.voxel_bytes_after, 26 * halo_cells(0) * 4, "the collapsed brick emits no voxel bytes");
+        assert!(rep.total_vram_after() < rep.total_vram_before(), "R1 reduces resident VRAM");
+        assert!(rep.vram_reduction() > 1.0, "the reduction factor is > 1");
+        assert!((rep.uniform_fraction() - 1.0 / 27.0).abs() < 1e-9);
+    }
+
+    /// An all-uniform-collapse patch keeps the voxel buffer NON-EMPTY (the `wgpu` zero-sized-buffer guard): a
+    /// patch whose only brick collapsed would emit zero voxel entries, but the sentinel keeps `cast_slice`
+    /// valid. Asserts the guard directly on a hand-built empty-voxel patch.
+    #[test]
+    fn all_uniform_patch_keeps_voxels_nonempty() {
+        let mut patch = GpuBrickPatch {
+            aabbs: vec![brick_aabb([0.0; 3], 0)],
+            metas: vec![GpuBrickMeta::uniform([0, 0, 0], BlockId(1), [0.0; 3], 0)],
+            voxels: Vec::new(),
+            palette: Vec::new(),
+            lights: Vec::new(),
+            alias: Vec::new(),
+        };
+        ensure_voxels_nonempty(&mut patch);
+        assert_eq!(patch.voxels.len(), 1, "an all-uniform patch gets a single unreferenced sentinel voxel");
+        assert_eq!(patch.voxels[0], 0);
     }
 }

@@ -41,10 +41,39 @@ const MAX_LOD: u32 = 7u;
 // coarse brick is DDA-marched over the SAME 8³ grid covering 2^lod× more world.
 struct BrickMeta {
     voxel_origin: vec3<i32>,  // brick's world-VOXEL origin (= brick_coord · BRICK_EDGE)
-    voxel_offset: u32,        // start of this brick's haloed 10³ block ids in `voxels`
+    voxel_offset: u32,        // DENSE: start of this brick's haloed 10³ block ids in `voxels`. UNIFORM (bit 31
+                              // set): no array — the single block id is the low 16 bits (storage plan R1).
     world_min: vec3<f32>,     // brick's world-metre min corner (= coord · brick_span(lod))
     lod: u32,                 // brick LOD level (0 = finest)
 };
+
+// STORAGE PLAN R1 — the `voxel_offset` high bit marking a UNIFORM brick (its FULL haloed 10³ grid is ONE solid
+// block, so it carries NO per-voxel array). MUST mirror `BRICK_UNIFORM_FLAG` in src/voxel/gpu.rs. When set,
+// the DDA reads the block id straight from the meta (low 16 bits) — NO `voxels[]` fetch per step (strictly
+// fewer memory ops); a fully-buried uniform brick is a couple of geometric DDA steps with zero loads. A DENSE
+// brick has bit 31 clear (real offsets are < 2^31) and is byte-identical to before R1.
+const BRICK_UNIFORM_FLAG: u32 = 0x80000000u;
+
+// True iff brick meta `m` is a collapsed UNIFORM brick (no voxel array; block id in the low 16 bits).
+fn meta_is_uniform(m: BrickMeta) -> bool {
+    return (m.voxel_offset & BRICK_UNIFORM_FLAG) != 0u;
+}
+
+// The single block id of a UNIFORM brick (low 16 bits of `voxel_offset`). Only valid when `meta_is_uniform`.
+fn meta_uniform_block(m: BrickMeta) -> u32 {
+    return m.voxel_offset & 0xFFFFu;
+}
+
+// The block id at HALOED-grid cell `(x,y,z)` of brick `m` — the SSOT read used by the DDA. A UNIFORM brick
+// returns its single id with NO memory access (every cell, core and halo, is that block by construction). A
+// DENSE brick reads `voxels[m.voxel_offset + cell_index(...)]` exactly as before R1 (byte-identical). Callers
+// pass only IN-BOUNDS cells; out-of-bounds is handled at the call site (treated as air for the normal scan).
+fn cell_block(m: BrickMeta, x: i32, y: i32, z: i32, hedge: i32) -> u32 {
+    if (meta_is_uniform(m)) {
+        return meta_uniform_block(m);
+    }
+    return voxels[m.voxel_offset + cell_index(x, y, z, hedge)];
+}
 
 // The CORE grid edge (cells per axis) of a brick at LOD `lod`: a CONSTANT BRICK_EDGE (8) at every LOD — the
 // clipmap scales the world span, not the resolution. SSOT mirror of `lod_edge` in brickmap.rs.
@@ -188,7 +217,9 @@ fn dda_brick(prim: u32, ro: vec3<f32>, rd: vec3<f32>, t_enter: f32, t_exit: f32)
         if (oob || found) {
             break;
         }
-        let id = voxels[m.voxel_offset + cell_index(vox.x, vox.y, vox.z, hedge)];
+        // UNIFORM brick (storage plan R1): `cell_block` returns the single id with NO `voxels[]` fetch — fewer
+        // memory ops per step. DENSE brick: the byte-identical `voxels[m.voxel_offset + cell_index(...)]` read.
+        let id = cell_block(m, vox.x, vox.y, vox.z, hedge);
         // A solid cell is a HIT only when it is a CORE cell (halo index in [1, core]); a solid HALO cell is the
         // neighbour's voxel — the neighbour brick owns it, so we don't commit it (we only marched it so the
         // surface normal can see across the brick boundary). Continue marching through it.
@@ -224,7 +255,7 @@ fn dda_brick(prim: u32, ro: vec3<f32>, rd: vec3<f32>, t_enter: f32, t_exit: f32)
     var grad = vec3<i32>(0);
     var cnb = hit_vox; cnb[last_axis] = cnb[last_axis] - step[last_axis]; // neighbour the ray came from
     let crossed_air = cnb[last_axis] < 0 || cnb[last_axis] >= hedge
-        || voxels[m.voxel_offset + cell_index(cnb.x, cnb.y, cnb.z, hedge)] == 0u;
+        || cell_block(m, cnb.x, cnb.y, cnb.z, hedge) == 0u;
     if (crossed_air) {
         grad[last_axis] = -step[last_axis]; // crisp crossed-axis face (outward = back along the ray)
     } else {
@@ -233,8 +264,8 @@ fn dda_brick(prim: u32, ro: vec3<f32>, rd: vec3<f32>, t_enter: f32, t_exit: f32)
             if (grad.x == 0 && grad.y == 0 && grad.z == 0) {
                 var pn = hit_vox; pn[a] = pn[a] + 1;
                 var mn = hit_vox; mn[a] = mn[a] - 1;
-                let p_air = pn[a] >= hedge || voxels[m.voxel_offset + cell_index(pn.x, pn.y, pn.z, hedge)] == 0u;
-                let m_air = mn[a] < 0 || voxels[m.voxel_offset + cell_index(mn.x, mn.y, mn.z, hedge)] == 0u;
+                let p_air = pn[a] >= hedge || cell_block(m, pn.x, pn.y, pn.z, hedge) == 0u;
+                let m_air = mn[a] < 0 || cell_block(m, mn.x, mn.y, mn.z, hedge) == 0u;
                 if (p_air) { grad[a] = 1; } else if (m_air) { grad[a] = -1; }
             }
         }

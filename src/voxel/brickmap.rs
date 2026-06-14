@@ -153,6 +153,18 @@ impl Brick {
     pub fn is_uniform_solid(&self) -> bool {
         matches!(self.storage, BrickStorage::Uniform(b) if !b.is_air())
     }
+
+    /// The single block id of a UNIFORM brick (every voxel the same block), or `None` for a dense brick.
+    /// Returns `Some(AIR)` only for the degenerate uniform-air brick (which is never stored in the map). The
+    /// GPU packer ([`super::gpu::pack_resident_set`]) uses this to collapse a fully-buried uniform brick whose
+    /// HALO also matches into a flag + block id in the meta — no per-voxel array in VRAM (storage plan R1).
+    #[inline]
+    pub fn uniform_block(&self) -> Option<BlockId> {
+        match self.storage {
+            BrickStorage::Uniform(b) => Some(b),
+            BrickStorage::Dense(_) => None,
+        }
+    }
 }
 
 /// A sparse store of [`Brick`]s keyed by integer BRICK coordinate on the LOD0 grid (world brick =

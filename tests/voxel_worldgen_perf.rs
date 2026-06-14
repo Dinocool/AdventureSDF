@@ -45,7 +45,10 @@ use adventure::sdf_render::worldgen::layers::erosion::ErosionParams;
 use adventure::sdf_render::worldgen::layers::height::HeightParams;
 use adventure::sdf_render::worldgen::{WORLDGEN_SLICE_SEED, WorldBiomeShapes, WorldGraph};
 use adventure::voxel::brickmap::{BRICK_WORLD_SIZE, Brick, MAX_LOD, brick_span};
-use adventure::voxel::gpu::{GpuBrickAabb, GpuBrickMeta, GpuPaletteColor, pack_resident_set};
+use adventure::voxel::gpu::{
+    GpuBrickAabb, GpuBrickMeta, GpuBrickPatch, GpuPaletteColor, StorageReport, pack_brickmap,
+    pack_resident_set,
+};
 use adventure::voxel::palette::BlockRegistry;
 use adventure::voxel::streaming::{
     ResidencyManager, StreamingConfig, camera_brick_coord, region_half_extent_m,
@@ -679,6 +682,149 @@ fn clipmap_per_move_cost() {
     assert!(churn_mean < region_vol as f64, "per-move churn must be O(shell), not O(region)");
     assert!(churn_mean <= 8.0 * shell_area as f64, "per-move churn must be shell-sized (≈ a few face-slabs)");
     assert!(s_mean < cold_ms * 0.5, "the per-move STREAMING cost must be well under the cold fill (the stutter fix)");
+}
+
+// ============================================================================================
+//  (7) STORAGE BYTES — the storage-plan-R1 (uniform-brick collapse) VRAM measurement.
+// ============================================================================================
+
+/// Pretty-print a [`StorageReport`] (storage plan R1 BEFORE/AFTER) under a label. The headline is the voxel
+/// buffer shrink + the total resident VRAM reduction the uniform-brick collapse claws back.
+fn print_storage_report(label: &str, rep: &StorageReport) {
+    println!("\n========== STORAGE BYTES (R1 uniform-brick collapse) — {label} ==========");
+    println!(
+        "resident bricks       : {} | uniform-collapsed {} ({:.1}%)",
+        rep.bricks,
+        rep.uniform_bricks,
+        rep.uniform_fraction() * 100.0,
+    );
+    println!("meta+AABB / palette   : {:.2} MB / {} B (unchanged by R1)", rep.meta_aabb_bytes as f64 / 1e6, rep.palette_bytes);
+    println!("light list + alias    : {:.2} MB (unchanged by R1)", rep.light_bytes as f64 / 1e6);
+    println!(
+        "voxel buffer BEFORE   : {:.1} MB ({} bricks × 1000 × 4 B, content-blind)",
+        rep.voxel_bytes_before as f64 / 1e6,
+        rep.bricks,
+    );
+    println!(
+        "voxel buffer AFTER    : {:.1} MB ({:.0} B/brick mean — uniform bricks cost 0)",
+        rep.voxel_bytes_after as f64 / 1e6,
+        rep.voxel_bytes_per_brick_after(),
+    );
+    println!("-----------------------------------------------------------------------------");
+    println!(
+        "TOTAL VRAM est BEFORE : {:.1} MB   AFTER : {:.1} MB   ⇒ {:.2}× reduction",
+        rep.total_vram_before() as f64 / 1e6,
+        rep.total_vram_after() as f64 / 1e6,
+        rep.vram_reduction(),
+    );
+    println!("=============================================================================");
+}
+
+/// **The solid-Sponza storage-bytes deliverable (storage plan R1).** Loads the baked `assets/models/sponza.vox`
+/// (via `vox::load_vox`), packs the whole map with `pack_brickmap`, and reports the BEFORE/AFTER resident VRAM.
+/// With imported-model interiors now ALWAYS SOLID (`examples/voxelize_scene.rs` `solid_fill`), Sponza's
+/// deep-interior bricks are uniform-incl-halo and collapse — the win is large. Skips cleanly if the asset
+/// hasn't been baked. NOTE: if the on-disk `.vox` was baked BEFORE the `solid_fill` change (a HOLLOW asset), it
+/// has no buried bricks and R1 finds nothing to collapse — the test then flags the asset as needing a re-bake
+/// rather than asserting a win on stale data (`solid_building_storage_collapses` proves the solid-interior win
+/// deterministically without depending on the asset's bake date).
+#[test]
+#[ignore = "storage harness; needs assets/models/sponza.vox; run with --ignored --nocapture"]
+fn report_storage_bytes_sponza() {
+    use adventure::voxel::raytrace::SPONZA_VOX_PATH;
+    use adventure::voxel::vox::load_vox;
+
+    // The committed `sponza.vox` may be a STALE pre-`solid_fill` (hollow) bake; `VOXEL_RT_SPONZA_VOX` overrides
+    // the path so a freshly re-baked SOLID asset can be measured without touching the committed one.
+    let path_str = std::env::var("VOXEL_RT_SPONZA_VOX").unwrap_or_else(|_| SPONZA_VOX_PATH.to_string());
+    let path = std::path::Path::new(&path_str);
+    if !path.exists() {
+        eprintln!("[skip] {path_str} not baked — run `cargo run --example voxelize_scene` first");
+        return;
+    }
+    let (map, registry) = load_vox(path).expect("sponza .vox must load");
+    let patch = pack_brickmap(&map, &registry);
+    let rep = patch.storage_report();
+    print_storage_report(&format!("Sponza ({path_str})"), &rep);
+    assert!(rep.bricks > 0, "Sponza must pack resident bricks");
+    if rep.uniform_bricks == 0 {
+        // R1 collapses only FULLY-BURIED bricks (a whole 10³ neighbourhood one solid block). Zero uniform
+        // bricks means either (a) the asset was baked HOLLOW (pre `solid_fill` — re-bake), or (b) the geometry
+        // is THIN-SHELLED (walls/columns/arches < 3 voxels thick never enclose a fully-buried 8³ brick), so even
+        // solid-filled it exposes no buried interior. Both are honest no-ops for R1 — the win is realised on
+        // THICK solid masses (terrain bedrock, a solid building); see `solid_building_storage_collapses` and the
+        // worldgen-slice report. This is a measurement, not a regression, so it does not fail.
+        println!(
+            "[note] this Sponza packs 0 uniform-incl-halo bricks (hollow bake OR thin-shelled geometry < 3 \
+             voxels thick). R1's win is proven on thick solid interiors by `solid_building_storage_collapses` \
+             + `report_storage_bytes_worldgen_slice`; re-bake with `cargo run --example voxelize_scene` if the \
+             asset is stale."
+        );
+    } else {
+        assert!(rep.voxel_bytes_after < rep.voxel_bytes_before, "a buried-interior Sponza's interiors must collapse (R1 win)");
+    }
+}
+
+/// **The solid-interior win, proven deterministically (storage plan R1).** Builds a `.vox`-class SOLID building
+/// — a fully-filled box of bricks (every voxel solid, the always-on `solid_fill` result) — and asserts the
+/// uniform-incl-halo collapse turns the buried interior into ~0 voxel bytes. This is the Sponza-class win the
+/// plan predicts, computed without the stale on-disk asset: for an `n³`-brick solid block, only the `(n-2)³`
+/// fully-buried interior collapses, but as `n` grows that dominates, so the VRAM reduction approaches the
+/// surface-shell-only cost. Runs on CI (small, no GPU, no asset).
+#[test]
+fn solid_building_storage_collapses() {
+    let reg = {
+        let (layer, lib, registry, _label) = worldgen_stack();
+        let _ = layer;
+        let _ = lib;
+        registry
+    };
+    // A 6×6×6 fully-solid block (every voxel block 1) — the solid_fill interior. Bricks form a 6³ grid; the
+    // inner 4³ = 64 are fully buried (uniform-incl-halo), the 216−64 = 152 shell bricks stay dense.
+    let n = 6i32;
+    let solid = Brick::uniform(adventure::voxel::palette::BlockId(1));
+    let mut entries = Vec::new();
+    for z in 0..n {
+        for y in 0..n {
+            for x in 0..n {
+                entries.push(adventure::voxel::gpu::ResidentBrick { coord: IVec3::new(x, y, z), brick: &solid, lod: 0 });
+            }
+        }
+    }
+    let patch = pack_resident_set(&entries, &reg);
+    let rep = patch.storage_report();
+    print_storage_report(&format!("synthetic SOLID {n}³-brick building (solid_fill)"), &rep);
+    let interior = ((n - 2) * (n - 2) * (n - 2)) as usize;
+    assert_eq!(rep.uniform_bricks, interior, "the fully-buried (n-2)³ interior collapses");
+    assert!(rep.vram_reduction() > 1.0, "a solid building's buried interior must collapse (R1 win)");
+    // The buried interior pays ZERO voxel bytes — the AFTER voxel buffer is exactly the dense shell.
+    assert_eq!(rep.voxel_bytes_after, (rep.bricks - interior) * 1000 * 4, "only the dense shell carries voxel bytes");
+}
+
+/// **The worldgen-slice storage-bytes deliverable (storage plan R1).** Cold-fills the SHIPPING worldgen clipmap
+/// at the origin surface (same path as the fill bench) and reports the resident-set BEFORE/AFTER VRAM. Deep
+/// stone/bedrock interior bricks are uniform-incl-halo, so the resident voxel buffer drops by the uniform
+/// fraction. Runs the full shipping config (60k cap) — `--ignored` (it voxelizes the real clipmap).
+#[test]
+#[ignore = "storage harness; voxelizes the shipping clipmap — run with --ignored --nocapture"]
+fn report_storage_bytes_worldgen_slice() {
+    let (layer, lib, registry, label) = worldgen_stack();
+    let cfg = shipping_config();
+    let cam = origin_surface_cam(&layer);
+
+    let mut mgr = ResidencyManager::new();
+    mgr.update(cam, &cfg);
+    let mut guard = 0;
+    while mgr.pending() > 0 {
+        mgr.drain_work(&cfg, &layer, &lib, &registry, SEED);
+        guard += 1;
+        assert!(guard < 5000, "fill must terminate");
+    }
+    let entries = mgr.resident_entries();
+    let patch: GpuBrickPatch = pack_resident_set(&entries, &registry);
+    let rep = patch.storage_report();
+    print_storage_report(&format!("worldgen slice (graph={label})"), &rep);
+    assert!(rep.bricks > 0, "the worldgen slice must pack resident bricks");
 }
 
 /// Sanity: the harness's worldgen stack actually produces a non-trivial clipmap (so a green CI `--lib` run of
