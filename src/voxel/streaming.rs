@@ -498,14 +498,14 @@ mod tests {
         for lod in 0..=MAX_LOD {
             assert!(d.keys().any(|k| k.lod == lod), "level {lod} present in the clipmap");
         }
-        // Each coarse level is a SHELL: it has NO brick strictly inside the finer-level interior (cheby ≤
-        // half/2 in its grid), and DOES have bricks out at cheby == half.
+        // Each coarse level is a SHELL that OVERLAPS the finer level by one ring (cede `half/2 - 1`, the
+        // coverage-gap fix): nothing deeper than that overlap boundary, and bricks out at cheby == half.
         for lod in 1..=MAX_LOD {
             let cam_l = camera_brick_coord_lod(cam, lod);
-            let inner = half / 2;
+            let inner = half / 2 - 1;
             assert!(
                 d.keys().filter(|k| k.lod == lod).all(|k| cheby(k.coord, cam_l) > inner),
-                "level {lod} is a shell — nothing inside the finer-level interior"
+                "level {lod} is a shell — nothing deeper than the one-ring overlap"
             );
             assert!(
                 d.keys().any(|k| k.lod == lod && cheby(k.coord, cam_l) == half),
