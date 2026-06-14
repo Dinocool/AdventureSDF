@@ -11,7 +11,9 @@ pub mod asset;
 pub mod field;
 pub mod node;
 pub mod preset;
+pub mod wgsl_codegen;
 
 pub use asset::{GraphAsset, GraphAssetLoader};
 pub use field::Field;
 pub use node::{FbmAxis, Graph, GraphError, Node, NodeKind};
+pub use wgsl_codegen::graph_to_wgsl;

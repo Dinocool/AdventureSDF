@@ -62,6 +62,12 @@ impl Spline {
         self.ys[..self.len].iter().fold(0.0f64, |m, &y| m.max(y.abs()))
     }
 
+    /// The active `(x, y)` control points (read-only) — what the WGSL `Curve` codegen emits as the
+    /// per-node spline arrays (see `graph::wgsl_codegen`). Pure accessor; no math/behaviour change.
+    pub fn points(&self) -> impl Iterator<Item = (f64, f64)> + '_ {
+        (0..self.len).map(move |i| (self.xs[i], self.ys[i]))
+    }
+
     /// Evaluate the spline at `x`, returning `(y, dy/dx)`. Flat-clamped outside `[x₀, x_{n-1}]`.
     pub fn eval(&self, x: f64) -> (f64, f64) {
         let n = self.len;
