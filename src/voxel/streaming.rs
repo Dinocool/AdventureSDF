@@ -358,6 +358,26 @@ impl ResidencyManager {
         self.resident.len()
     }
 
+    /// Number of keys PRUNED by the surface-following classify (deep-buried interior + high sky skipped at
+    /// enqueue) and memoized in the current clipmap. The cull effectiveness — grows with `clip_half`. For the
+    /// perf/stats panel.
+    #[inline]
+    pub fn pruned_count(&self) -> usize {
+        self.pruned.len()
+    }
+
+    /// Resident brick count per LOD level (index = lod, length `MAX_LOD + 1`) — the clipmap's LOD distribution
+    /// for the perf/stats panel. `O(resident)`; call only when displaying (e.g. the panel is open).
+    pub fn resident_lod_counts(&self) -> Vec<usize> {
+        let mut counts = vec![0usize; (MAX_LOD + 1) as usize];
+        for k in self.resident.keys() {
+            if let Some(c) = counts.get_mut(k.lod as usize) {
+                *c += 1;
+            }
+        }
+        counts
+    }
+
     /// True iff `key` is currently resident (a non-empty brick is stored for it).
     #[inline]
     pub fn is_resident(&self, key: &BrickKey) -> bool {

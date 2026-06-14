@@ -233,6 +233,13 @@ pub fn performance_panel(world: &mut World, ui: &mut egui::Ui) {
         .show(ui, |ui| {
             frame_cost_ui(world, ui);
 
+            // Voxel-RT residency + GPU memory: clipmap reach (clip_half → LOD0 detail distance), the
+            // surface-following cull effectiveness, the per-LOD brick distribution, and the resident-patch
+            // VRAM breakdown — the live numbers for tuning LOD reach / storage.
+            ui.separator();
+            ui.heading("Voxel residency");
+            voxel_residency_ui(world, ui);
+
             // Chrome-trace capture toggle (off by default). Records Bevy system /
             // render-graph spans to a JSON file only while enabled.
             ui.separator();
@@ -336,6 +343,83 @@ fn system_memory_ui(world: &mut World, ui: &mut egui::Ui) {
         MemSeg { label: "Free".into(), bytes: free, color: egui::Color32::from_gray(70) },
     ];
     mem_breakdown_ui(ui, "sys", segments);
+}
+
+/// Voxel-RT residency + GPU-memory stats: resident / pruned brick counts (the surface-following cull
+/// effectiveness, which grows with `clip_half`), the per-LOD distribution, the clipmap reach (`clip_half` →
+/// LOD0 detail distance + total view radius), and the resident-patch GPU buffer breakdown ([`StorageReport`]).
+/// Reads the main-world [`VoxelRtPatch`] + [`VoxelRtStreaming`] (absent ⇒ no voxel scene active). The live
+/// numbers for tuning LOD reach / storage.
+fn voxel_residency_ui(world: &mut World, ui: &mut egui::Ui) {
+    use crate::voxel::brickmap::{MAX_LOD, brick_span};
+    use crate::voxel::raytrace::{VoxelRtPatch, VoxelRtStreaming};
+    use crate::voxel::streaming::region_half_extent_m;
+
+    // Snapshot the streaming stats into owned values, dropping the resource borrow before touching the patch.
+    let Some((resident, pruned, pending, lod_counts, cfg)) =
+        world.get_resource::<VoxelRtStreaming>().map(|s| {
+            let m = s.manager();
+            (m.resident_count(), m.pruned_count(), m.pending(), m.resident_lod_counts(), *s.cfg())
+        })
+    else {
+        ui.weak("no voxel scene active");
+        return;
+    };
+    let report = world.get_resource::<VoxelRtPatch>().map(|p| (p.patch.storage_report(), p.generation));
+
+    let clip_half = cfg.clip_half_bricks;
+    let lod0_reach = clip_half as f32 * brick_span(0);
+    let view = region_half_extent_m(&cfg);
+    let considered = resident + pruned;
+    let cull_pct = if considered > 0 { 100.0 * pruned as f32 / considered as f32 } else { 0.0 };
+
+    egui::Grid::new("voxel_residency_counts").num_columns(2).striped(true).show(ui, |ui| {
+        ui.label("Resident bricks");
+        ui.strong(format!("{resident}"));
+        ui.end_row();
+        ui.label("Pruned (surface cull)");
+        ui.strong(format!("{pruned}  ({cull_pct:.0}% of {considered})"));
+        ui.end_row();
+        ui.label("Queued (streaming)");
+        ui.strong(format!("{pending}"));
+        ui.end_row();
+        ui.label("clip_half");
+        ui.strong(format!("{clip_half} bricks"));
+        ui.end_row();
+        ui.label("LOD0 detail reach");
+        ui.strong(format!("{lod0_reach:.0} m"));
+        ui.end_row();
+        ui.label("View radius");
+        ui.strong(format!("{view:.0} m"));
+        ui.end_row();
+    });
+
+    if resident > 0 {
+        ui.add_space(4.0);
+        ui.weak("Resident bricks per LOD:");
+        egui::Grid::new("voxel_residency_lods").striped(true).show(ui, |ui| {
+            for lod in 0..=MAX_LOD as usize {
+                ui.weak(format!("L{lod}"));
+            }
+            ui.end_row();
+            for lod in 0..=MAX_LOD as usize {
+                ui.label(format!("{}", lod_counts.get(lod).copied().unwrap_or(0)));
+            }
+            ui.end_row();
+        });
+    }
+
+    if let Some((rep, generation)) = report {
+        ui.add_space(6.0);
+        ui.weak(format!("GPU buffers (patch gen {generation}, {} bricks):", rep.bricks));
+        let segs = vec![
+            MemSeg { label: "voxels".into(), bytes: rep.voxel_bytes_after as u64, color: band_color(0) },
+            MemSeg { label: "meta + aabb".into(), bytes: rep.meta_aabb_bytes as u64, color: band_color(1) },
+            MemSeg { label: "palette".into(), bytes: rep.palette_bytes as u64, color: band_color(2) },
+            MemSeg { label: "lights".into(), bytes: rep.light_bytes as u64, color: band_color(3) },
+        ];
+        mem_breakdown_ui(ui, "voxel_vram", segs);
+    }
 }
 
 /// A ranked contributor: its display label, color in the stack, and per-frame ms history.

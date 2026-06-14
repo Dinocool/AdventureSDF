@@ -138,6 +138,21 @@ pub struct VoxelRtStreaming {
     worldgen_frames_since_pack: u32,
 }
 
+impl VoxelRtStreaming {
+    /// Read-only access to the live residency manager (resident / pruned / pending counts, LOD histogram) for
+    /// the editor perf/stats panel.
+    #[inline]
+    pub fn manager(&self) -> &ResidencyManager {
+        &self.manager
+    }
+
+    /// The active streaming config (clip_half, caps) — for the perf/stats panel's view-radius / LOD0-reach.
+    #[inline]
+    pub fn cfg(&self) -> &StreamingConfig {
+        &self.cfg
+    }
+}
+
 /// Max frames a worldgen stream batch drains before forcing a re-pack (so a big cold fill reveals in chunks
 /// rather than one final pop, while still bounding the O(resident) pack to ~once per this many frames).
 const WORLDGEN_REPACK_INTERVAL: u32 = 6;
