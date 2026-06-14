@@ -11,8 +11,9 @@
 //! scheme is proven in isolation and the render wiring ([`super::raytrace`]) just drives it:
 //!
 //! * [`brick_lod`] / [`desired_clipmap`] — given the camera world position, which `(coord, lod)` bricks
-//!   should be resident: each level `L` resident in the shell `clip_half/2 < cheby(c, cam_brick_L) ≤
-//!   clip_half` (LOD0 fills the full `cheby ≤ clip_half` cube), so each level is a bounded shell.
+//!   should be resident: each level `L` fills a box of half-extent `clip_half` around the camera on grid `L`,
+//!   snapped to the 2×-coarser grid, MINUS the finer level's footprint — so the levels tile EXACTLY (no
+//!   overlap, no gap; the union telescopes to the outermost box). Each level is a bounded rectangular shell.
 //! * [`ResidencyManager`] — the live set of resident bricks + a bounded WORK QUEUE, keyed by [`BrickKey`]
 //!   `{coord, lod}` (coords now OVERLAP across LOD grids, so the lod is part of the key). Each `update`
 //!   diffs the desired clipmap against the current set, ENQUEUES newly-entered / LOD-changed bricks, and
@@ -64,12 +65,14 @@ pub struct BrickKey {
 /// Tunable clipmap streaming knobs. Plain `Copy` data so it can be a Bevy resource or a test literal.
 #[derive(Clone, Copy, Debug, bevy::prelude::Resource)]
 pub struct StreamingConfig {
-    /// The clipmap half-extent, in bricks: each nested level covers `cheby ≤ clip_half` of ITS grid (a
-    /// `(2·clip_half+1)³` cube), and the finer level below it covers the inner `cheby ≤ clip_half/2`, so each
-    /// level is resident only in the SHELL `clip_half/2 < cheby ≤ clip_half` (LOD0 fills the full cube). The
-    /// total view radius is `clip_half · BRICK_WORLD_SIZE · 2^MAX_LOD`. Default 8 ⇒ each level `17³` and a
-    /// view half-extent of `8 · 1.6 · 2^7 ≈ 1640 m` (vs the old dense ~45 m), at bounded VRAM (a clipmap of
-    /// `MAX_LOD+1` thin shells, not a dense cube).
+    /// The clipmap half-extent, in bricks: each nested level fills an `~(2·clip_half)³` box around the camera
+    /// on ITS grid ([`level_box`]), MINUS the footprint of the finer level below it ([`level_hole`]). Because
+    /// each box snaps to the 2×-coarser grid, the levels tile EXACTLY — adjacent levels abut with NO overlap
+    /// and NO gap (the union telescopes to the outermost box). The total view radius is
+    /// `clip_half · BRICK_WORLD_SIZE · 2^MAX_LOD`. Default 8 ⇒ a view half-extent of `8 · 1.6 · 2^7 ≈ 1640 m`
+    /// at bounded VRAM (`MAX_LOD+1` thin rectangular shells, not a dense cube). Use `>= 2` (below that the
+    /// nested annuli degenerate). Push it UP to move the LOD transitions farther out (fine detail reaches
+    /// farther), bounded by `max_resident_bricks`.
     pub clip_half_bricks: i32,
     /// Hard cap on resident bricks — a SAFETY bound so a mis-set `clip_half` can't blow VRAM. With the nested
     /// shells this should NOT bind (only NON-empty surface bricks are stored, a thin shell each level). If the
@@ -111,22 +114,113 @@ pub fn camera_brick_coord(cam_world: [f32; 3]) -> IVec3 {
     camera_brick_coord_lod(cam_world, 0)
 }
 
-/// The Chebyshev (L∞) distance in bricks between two brick coordinates — the clipmap shell metric. A cube
-/// of radius `r` is exactly `{ b : cheby(b, centre) <= r }`.
+/// The Chebyshev (L∞) distance in bricks between two brick coordinates. The exact tiling
+/// ([`desired_clipmap`]) is AABB-based, not Chebyshev — this is only used by the residency tests to bound
+/// resident bricks to their level's box.
+#[cfg(test)]
 #[inline]
 fn cheby(a: IVec3, b: IVec3) -> i32 {
     (a.x - b.x).abs().max((a.y - b.y).abs()).max((a.z - b.z).abs())
 }
 
+/// Round an inclusive brick range `[lo, hi]` OUTWARD to align with the next-COARSER (2×) grid: `lo` DOWN to
+/// the nearest even, `hi` UP to the nearest odd. The snapped range then spans WHOLE 2×-coarser bricks
+/// (`[lo/2, (hi-1)/2]`) — the property that lets nested clipmap levels tile EXACTLY: a finer level's footprint
+/// becomes an integer number of coarse bricks, so the coarse level can cede precisely that footprint with no
+/// partial brick left covered (overlap) or uncovered (gap). The bit ops are correct for two's-complement
+/// negatives: `& !1` floors to even, `| 1` ceils to odd.
+#[inline]
+fn snap_even_odd(lo: i32, hi: i32) -> (i32, i32) {
+    (lo & !1, hi | 1)
+}
+
+/// Level `lod`'s resident AABB (INCLUSIVE, in LOD-`lod` brick coords): a cube of half-extent `half` around the
+/// camera's brick on that grid, [`snap_even_odd`]-snapped per axis so the box boundary lies on the 2×-coarser
+/// grid. Every level — and every level's hole — is derived from this one SSOT box, so the enumeration
+/// ([`desired_clipmap`]) and the per-point query ([`brick_lod`]) can never disagree about the tiling.
+#[inline]
+fn level_box(cam_world: [f32; 3], lod: u32, half: i32) -> (IVec3, IVec3) {
+    let c = camera_brick_coord_lod(cam_world, lod);
+    let (lx, hx) = snap_even_odd(c.x - half, c.x + half);
+    let (ly, hy) = snap_even_odd(c.y - half, c.y + half);
+    let (lz, hz) = snap_even_odd(c.z - half, c.z + half);
+    (IVec3::new(lx, ly, lz), IVec3::new(hx, hy, hz))
+}
+
+/// The INCLUSIVE AABB (on grid `lod`) that level `lod` cedes to the FINER level `lod - 1`: the finer level's
+/// [`level_box`] footprint expressed on THIS grid (downsampled by 2). Because the finer box is
+/// `[even, odd]`-snapped, the downsample is EXACT — `[flo/2, (fhi-1)/2]` are whole coarse bricks, and their
+/// world extent equals the finer box's world extent EXACTLY (`flo·span_{lod-1} … (fhi+1)·span_{lod-1}`). The
+/// coarse level is resident in `level_box \ hole`; that subtraction is where BOTH no-overlap (the finer
+/// region is removed) AND no-gap (the removed region is EXACTLY what the finer level fills — the telescoping
+/// property) come from. `None` for LOD0 (the finest level cedes nothing). For `half >= 2` the hole is always
+/// strictly inside the box, so the annulus is a proper shell.
+#[inline]
+fn level_hole(cam_world: [f32; 3], lod: u32, half: i32) -> Option<(IVec3, IVec3)> {
+    if lod == 0 {
+        return None;
+    }
+    let (flo, fhi) = level_box(cam_world, lod - 1, half);
+    // flo even, fhi odd ⇒ flo/2 and (fhi-1)/2 are exact (no truncation), for either sign.
+    let hlo = IVec3::new(flo.x / 2, flo.y / 2, flo.z / 2);
+    let hhi = IVec3::new((fhi.x - 1) / 2, (fhi.y - 1) / 2, (fhi.z - 1) / 2);
+    Some((hlo, hhi))
+}
+
+/// True iff `coord` is inside the inclusive AABB `[lo, hi]`.
+#[inline]
+fn in_box(coord: IVec3, lo: IVec3, hi: IVec3) -> bool {
+    coord.x >= lo.x
+        && coord.x <= hi.x
+        && coord.y >= lo.y
+        && coord.y <= hi.y
+        && coord.z >= lo.z
+        && coord.z <= hi.z
+}
+
+/// True iff brick `coord` on grid `lod` is RESIDENT at that level: inside the level's [`level_box`] and NOT in
+/// the [`level_hole`] ceded to the finer level. The single membership predicate both [`desired_clipmap`]
+/// (which enumerates it) and [`brick_lod`] (which queries it per world point) share — one SSOT for the tiling.
+#[inline]
+fn level_resident(cam_world: [f32; 3], coord: IVec3, lod: u32, half: i32) -> bool {
+    let (lo, hi) = level_box(cam_world, lod, half);
+    if !in_box(coord, lo, hi) {
+        return false;
+    }
+    match level_hole(cam_world, lod, half) {
+        Some((hlo, hhi)) => !in_box(coord, hlo, hhi),
+        None => true,
+    }
+}
+
+/// The uncapped clipmap brick count — `Σ over levels of |level_box \ level_hole|` — for the cap-drop log (and
+/// an exact figure for tests). `level_hole ⊆ level_box` for `half >= 2`, so the subtraction is exact.
+fn clipmap_uncapped_len(cam_world: [f32; 3], half: i32) -> usize {
+    let vol = |lo: IVec3, hi: IVec3| {
+        (hi.x - lo.x + 1).max(0) as usize
+            * (hi.y - lo.y + 1).max(0) as usize
+            * (hi.z - lo.z + 1).max(0) as usize
+    };
+    let mut n = 0usize;
+    for lod in 0..=MAX_LOD {
+        let (lo, hi) = level_box(cam_world, lod, half);
+        let mut v = vol(lo, hi);
+        if let Some((hlo, hhi)) = level_hole(cam_world, lod, half) {
+            v = v.saturating_sub(vol(hlo, hhi));
+        }
+        n += v;
+    }
+    n
+}
+
 /// The clipmap LOD that COVERS a world position, given as a LOD0 brick coordinate `coord` (world centre =
-/// `(coord + 0.5) · brick_span(0)`). Returns the FINEST level whose [`desired_clipmap`] shell contains that
-/// world position: LOD0 if it is inside the LOD0 cube, else the coarser shell it falls into, clamped to
-/// [`MAX_LOD`]. The SSOT for "what resolution does the renderer see at this world point" — used by the
-/// streaming tests to assert shell placement; the residency itself uses [`desired_clipmap`] directly.
+/// `(coord + 0.5) · brick_span(0)`). Returns the FINEST level whose [`desired_clipmap`] region contains that
+/// world position. Because the levels tile EXACTLY (no overlap, no gap — see [`level_hole`]), every world
+/// point inside the outer box is covered by exactly ONE level and this returns it; a point past the outer box
+/// clamps to [`MAX_LOD`]. The SSOT for "what resolution does the renderer see at this world point".
 #[inline]
 pub fn brick_lod(coord: IVec3, cam_world: [f32; 3], cfg: &StreamingConfig) -> u32 {
     let half = cfg.clip_half_bricks;
-    // The world centre of the LOD0 brick `coord`.
     let span0 = brick_span(0);
     let world = [
         (coord.x as f32 + 0.5) * span0,
@@ -134,18 +228,8 @@ pub fn brick_lod(coord: IVec3, cam_world: [f32; 3], cfg: &StreamingConfig) -> u3
         (coord.z as f32 + 0.5) * span0,
     ];
     for lod in 0..=MAX_LOD {
-        // The brick on the LOD-`lod` grid that contains `world`, and the camera's brick on the same grid.
         let here = camera_brick_coord_lod(world, lod);
-        let cam_l = camera_brick_coord_lod(cam_world, lod);
-        let d = cheby(here, cam_l);
-        // Cede `half/2 - 1` (NOT `half/2`) to the finer level: the two levels floor their grids
-        // INDEPENDENTLY, so the finer level's outer face can fall up to one COARSE brick short of the
-        // `half/2` boundary on the side away from the camera's sub-cell offset. Ceding one ring LESS makes the
-        // coarse shell OVERLAP the finer level by one ring, structurally closing that gap for every clip_half
-        // (a covered→empty→covered hole would otherwise open as a black crack at each LOD radius). The overlap
-        // is a no-op for correctness: `trace` keeps the NEAREST per-voxel t across all candidates.
-        let inner = if lod == 0 { -1 } else { half / 2 - 1 };
-        if d > inner && d <= half {
+        if level_resident(cam_world, here, lod, half) {
             return lod;
         }
     }
@@ -153,40 +237,36 @@ pub fn brick_lod(coord: IVec3, cam_world: [f32; 3], cfg: &StreamingConfig) -> u3
 }
 
 /// The DESIRED clipmap residency: the set of `(coord, lod)` bricks that should be resident around the camera
-/// at world position `cam_world`. NESTED SHELLS — for each level `L` in `0..=MAX_LOD`:
-/// * `cam_brick_L = floor(cam_world / brick_span(L))` is the camera's brick on the LOD-`L` grid;
-/// * level `L` is resident in the SHELL `clip_half/2 - 1 < cheby(c, cam_brick_L) <= clip_half`, ceding the
-///   inner region to the FINER level `L-1`. The cede is `clip_half/2 - 1` (one ring LESS than the naive
-///   `clip_half/2`) because the levels floor their grids INDEPENDENTLY, so the finer level's outer face can
-///   fall up to one coarse brick short of the boundary; the extra ring makes adjacent shells OVERLAP and
-///   structurally closes that gap (no covered→empty→covered crack at any LOD radius). LOD0 fills the full
-///   `cheby <= clip_half` cube (it has no finer level beneath it).
+/// at world position `cam_world`. EXACT NESTED TILING — for each level `L` in `0..=MAX_LOD`, level `L` is
+/// resident in `level_box(L) \ level_hole(L)`:
+/// * [`level_box`] is an `[even, odd]`-snapped cube of half-extent `clip_half` around the camera's brick on
+///   grid `L`, so its boundary lies on the 2×-coarser grid;
+/// * [`level_hole`] is the FINER level's box footprint on grid `L` — the region ceded to level `L-1`.
 ///
-/// Result: each level is a thin bounded shell, and the union reaches `clip_half · BRICK_WORLD_SIZE ·
-/// 2^MAX_LOD` from the camera. Returned as a map keyed by [`BrickKey`]; iteration order is not guaranteed
-/// (callers that need a stable `primitive_index` order sort — the manager does). If the union exceeds
-/// `max_resident_bricks`, the FARTHEST bricks are dropped (deterministic) so the cap holds.
+/// Because a level's box snaps to the coarser grid, the hole it carves equals the finer level's box world
+/// EXACTLY: adjacent levels ABUT with NEITHER overlap NOR gap, and the union telescopes to the outermost box.
+/// No band-aid one-ring overlap — a ray crossing a LOD boundary passes from a fine brick to the coarse brick
+/// that shares its face (the [`BRICK_AABB_EPSILON`](super::gpu::BRICK_AABB_EPSILON) + nearest-hit DDA commit
+/// the surface across the seam). LOD0 has no hole (it is the solid inner box). The union reaches
+/// `clip_half · BRICK_WORLD_SIZE · 2^MAX_LOD` from the camera. Returned keyed by [`BrickKey`]; iteration order
+/// is not guaranteed (callers needing a stable `primitive_index` sort — the manager does). If the union
+/// exceeds `max_resident_bricks`, the FARTHEST bricks (world metres) are dropped (deterministic).
 pub fn desired_clipmap(cam_world: [f32; 3], cfg: &StreamingConfig) -> FxHashMap<BrickKey, ()> {
     let half = cfg.clip_half_bricks;
     let mut out: FxHashMap<BrickKey, ()> = FxHashMap::default();
     for lod in 0..=MAX_LOD {
-        let cam_l = camera_brick_coord_lod(cam_world, lod);
-        // Cede `half/2 - 1` (NOT `half/2`) to the finer level: the two levels floor their grids
-        // INDEPENDENTLY, so the finer level's outer face can fall up to one COARSE brick short of the
-        // `half/2` boundary on the side away from the camera's sub-cell offset. Ceding one ring LESS makes the
-        // coarse shell OVERLAP the finer level by one ring, structurally closing that gap for every clip_half
-        // (a covered→empty→covered hole would otherwise open as a black crack at each LOD radius). The overlap
-        // is a no-op for correctness: `trace` keeps the NEAREST per-voxel t across all candidates.
-        let inner = if lod == 0 { -1 } else { half / 2 - 1 };
-        for dz in -half..=half {
-            for dy in -half..=half {
-                for dx in -half..=half {
-                    let coord = cam_l + IVec3::new(dx, dy, dz);
-                    let d = cheby(coord, cam_l);
-                    if d > inner {
-                        // d <= half by the loop bounds; d > inner excludes the finer-level interior → SHELL.
-                        out.insert(BrickKey { coord, lod }, ());
+        let (lo, hi) = level_box(cam_world, lod, half);
+        let hole = level_hole(cam_world, lod, half);
+        for z in lo.z..=hi.z {
+            for y in lo.y..=hi.y {
+                for x in lo.x..=hi.x {
+                    let coord = IVec3::new(x, y, z);
+                    if let Some((hlo, hhi)) = hole
+                        && in_box(coord, hlo, hhi)
+                    {
+                        continue; // ceded to the finer level — no overlap
                     }
+                    out.insert(BrickKey { coord, lod }, ());
                 }
             }
         }
@@ -300,11 +380,8 @@ impl ResidencyManager {
     /// `2^L×` less often). Returns the number of bricks dropped (so the caller can log churn).
     pub fn update(&mut self, cam_world: [f32; 3], cfg: &StreamingConfig) -> usize {
         let desired = desired_clipmap(cam_world, cfg);
-        // The uncapped clipmap size (Σ over levels of each shell), for the cap-drop log.
-        let half = cfg.clip_half_bricks as usize;
-        let full_cube = (2 * half + 1).pow(3);
-        let inner_cube = (half + 1).pow(3); // (2·(half/2)+1)³ with half/2 → bounded approximation for the log
-        let uncapped = full_cube + MAX_LOD as usize * full_cube.saturating_sub(inner_cube);
+        // The EXACT uncapped clipmap size (Σ over levels of |box \ hole|), for the cap-drop log.
+        let uncapped = clipmap_uncapped_len(cam_world, cfg.clip_half_bricks);
         self.capped_total += uncapped.saturating_sub(desired.len());
 
         // Drop resident bricks that left the clipmap.
@@ -549,53 +626,93 @@ mod tests {
         assert_eq!(camera_brick_coord(w), camera_brick_coord_lod(w, 0));
     }
 
-    /// The desired clipmap is NESTED SHELLS: LOD0 fills the full `(2·half+1)³` cube; each coarser level is a
-    /// SHELL `half/2 < cheby ≤ half` in its own grid. Every level is present, each a bounded shell.
+    /// EXACT nested tiling (no overlap, no gap). Closed-form proof on the level boxes: each level's box is
+    /// `[even, odd]`-snapped, its hole sits strictly inside its box (proper annulus), and the hole's WORLD
+    /// extent equals the finer level's box WORLD extent EXACTLY (the telescoping property). Together these
+    /// guarantee adjacent levels abut with neither overlap nor gap — proven for a spread of camera sub-cell
+    /// offsets, not just the origin. Replaces the old one-ring-overlap scheme (the user requires NO overlap).
     #[test]
-    fn desired_clipmap_is_nested_shells() {
-        let cfg = StreamingConfig { clip_half_bricks: 8, max_resident_bricks: 1_000_000, ..Default::default() };
-        let cam = [0.5_f32, 0.5, 0.5]; // near the origin
-        let d = desired_clipmap(cam, &cfg);
-        let half = cfg.clip_half_bricks;
-
-        // LOD0 is the full cube.
-        let lod0: usize = d.keys().filter(|k| k.lod == 0).count();
-        assert_eq!(lod0, (2 * half as usize + 1).pow(3), "LOD0 fills the full clip cube");
-        // Every level 0..=MAX_LOD is present (the clipmap reaches all the way out).
-        for lod in 0..=MAX_LOD {
-            assert!(d.keys().any(|k| k.lod == lod), "level {lod} present in the clipmap");
-        }
-        // Each coarse level is a SHELL that OVERLAPS the finer level by one ring (cede `half/2 - 1`, the
-        // coverage-gap fix): nothing deeper than that overlap boundary, and bricks out at cheby == half.
-        for lod in 1..=MAX_LOD {
-            let cam_l = camera_brick_coord_lod(cam, lod);
-            let inner = half / 2 - 1;
-            assert!(
-                d.keys().filter(|k| k.lod == lod).all(|k| cheby(k.coord, cam_l) > inner),
-                "level {lod} is a shell — nothing deeper than the one-ring overlap"
-            );
-            assert!(
-                d.keys().any(|k| k.lod == lod && cheby(k.coord, cam_l) == half),
-                "level {lod} reaches the shell's outer edge (cheby == half)"
-            );
+    fn clipmap_tiles_exactly_no_overlap_no_gap() {
+        let half = 8;
+        let cfg = StreamingConfig { clip_half_bricks: half, max_resident_bricks: usize::MAX, ..Default::default() };
+        let cams = [
+            [0.5_f32, 0.5, 0.5],
+            [7.4, 14.5, 17.7],
+            [-7.05, -13.97, 6.04],
+            [3.3, 0.1, -9.9],
+            [101.2, -50.7, 33.3],
+        ];
+        for cam in cams {
+            // Every level present in the enumerated set.
+            let d = desired_clipmap(cam, &cfg);
+            for lod in 0..=MAX_LOD {
+                assert!(d.keys().any(|k| k.lod == lod), "level {lod} present, cam={cam:?}");
+            }
+            for lod in 0..=MAX_LOD {
+                let (lo, hi) = level_box(cam, lod, half);
+                let (loa, hia) = (lo.to_array(), hi.to_array());
+                for a in 0..3 {
+                    assert_eq!(loa[a] & 1, 0, "box lo even (lod {lod} axis {a}, cam {cam:?})");
+                    assert_eq!(hia[a] & 1, 1, "box hi odd (lod {lod} axis {a}, cam {cam:?})");
+                }
+                match level_hole(cam, lod, half) {
+                    None => assert_eq!(lod, 0, "only LOD0 has no hole"),
+                    Some((hlo, hhi)) => {
+                        // Proper annulus: the hole is strictly inside the box.
+                        assert!(
+                            in_box(hlo, lo, hi) && in_box(hhi, lo, hi),
+                            "hole ⊆ box (lod {lod}, cam {cam:?})"
+                        );
+                        // Telescoping: the hole's WORLD extent == the finer level's box WORLD extent exactly.
+                        let span = brick_span(lod);
+                        let span_f = brick_span(lod - 1);
+                        let (flo, fhi) = level_box(cam, lod - 1, half);
+                        let (hloa, hhia) = (hlo.to_array(), hhi.to_array());
+                        let (floa, fhia) = (flo.to_array(), fhi.to_array());
+                        for a in 0..3 {
+                            assert!(
+                                (hloa[a] as f32 * span - floa[a] as f32 * span_f).abs() < 1e-3,
+                                "hole min == finer box min in world (lod {lod} axis {a})"
+                            );
+                            assert!(
+                                ((hhia[a] + 1) as f32 * span - (fhia[a] + 1) as f32 * span_f).abs() < 1e-3,
+                                "hole max == finer box max in world (lod {lod} axis {a})"
+                            );
+                        }
+                    }
+                }
+            }
         }
     }
 
-    /// `brick_lod(lod0_coord, cam_world, cfg)` reports the FINEST shell covering that world position: a LOD0
-    /// brick inside the LOD0 cube is LOD0; one far enough out (past the LOD0 cube) lands in a coarse shell.
+    /// `brick_lod(lod0_coord, cam_world, cfg)` reports the FINEST level whose tiled region covers that world
+    /// position: inside the LOD0 box ⇒ LOD0; past it ⇒ the coarser level whose annulus it lands in.
     #[test]
-    fn brick_lod_reports_shell_level() {
+    fn brick_lod_reports_covering_level() {
         let cfg = StreamingConfig { clip_half_bricks: 8, ..Default::default() };
         let cam = [0.5_f32, 0.5, 0.5];
-        // The camera's own LOD0 brick is covered by LOD0.
+        // The camera's own LOD0 brick is covered by LOD0 (LOD0 box at this cam is [-8, 9] per axis).
         assert_eq!(brick_lod(camera_brick_coord_lod(cam, 0), cam, &cfg), 0);
-        // A LOD0 brick just inside the LOD0 cube edge (cheby 7 of 8) is still LOD0.
+        // A LOD0 brick still inside the LOD0 box is LOD0.
         assert_eq!(brick_lod(IVec3::new(7, 0, 0), cam, &cfg), 0);
-        // A LOD0 brick PAST the LOD0 cube (cheby 12 > 8) falls into the LOD1 shell: on the LOD1 grid its world
-        // centre (~20 m) is ~6 LOD1-bricks out — inside half/2(=4) < 6 ≤ 8.
+        // Just past the LOD0 box (x=12 ∉ [-8, 9]): its world centre (~20 m) lands in the LOD1 annulus.
         assert_eq!(brick_lod(IVec3::new(12, 0, 0), cam, &cfg), 1);
-        // Far out (cheby 30 LOD0-bricks ≈ 48 m) is a coarser shell still.
+        // Far out (≈49 m) is a coarser level still.
         assert!(brick_lod(IVec3::new(30, 0, 0), cam, &cfg) >= 2);
+        // Consistency: the level brick_lod reports is exactly the one that holds that point in desired_clipmap.
+        let cfg_big = StreamingConfig { max_resident_bricks: usize::MAX, ..cfg };
+        let d = desired_clipmap(cam, &cfg_big);
+        let span0 = brick_span(0);
+        for cx in [0, 5, 11, 13, 25, 60, 150] {
+            let coord = IVec3::new(cx, 0, 0);
+            let lod = brick_lod(coord, cam, &cfg_big);
+            let world = [(cx as f32 + 0.5) * span0, 0.5 * span0, 0.5 * span0];
+            let here = camera_brick_coord_lod(world, lod);
+            assert!(
+                lod == MAX_LOD || d.contains_key(&BrickKey { coord: here, lod }),
+                "brick_lod({cx}) = {lod} must be the resident level for that point"
+            );
+        }
     }
 
     /// The resident cap drops the farthest (in WORLD metres) bricks so the clipmap never exceeds
@@ -639,10 +756,11 @@ mod tests {
         assert!(dropped > 0, "moving away drops the bricks left behind");
         mgr.drain_work(&cfg, &layer, &lib, &reg, SEED);
         // Every resident brick lies within its level's clipmap shell around the new camera.
+        // The snapped box has half-extent up to `half + 1` (snap_even_odd can extend one side by one brick).
         let half = cfg.clip_half_bricks;
         for e in mgr.resident_entries() {
             let cam_l = camera_brick_coord_lod(cam1, e.lod);
-            assert!(cheby(e.coord, cam_l) <= half, "resident bricks stay in the clipmap");
+            assert!(cheby(e.coord, cam_l) <= half + 1, "resident bricks stay in the clipmap");
         }
     }
 
