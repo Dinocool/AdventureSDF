@@ -1129,8 +1129,8 @@ pub struct VoxelRtSky {
 
 /// **SSOT for the world-space radiance-cache knobs** (Phase 2.1; the WGSL `WorldCacheUniform`, group 3
 /// binding 0). All runtime UNIFORMS (knobs-as-uniforms mandate) — editor sliders land in 2.4; nothing here is
-/// a WGSL const. Mirrors Solari's `WORLD_CACHE_*` tunables. 32 bytes (std140/std430-safe: 8 scalars =
-/// two 16-byte rows). `frame_index` + `reset` are stamped by the render pass, not user knobs.
+/// a WGSL const. Mirrors Solari's `WORLD_CACHE_*` tunables. 48 bytes (std140/std430-safe: 12 scalars =
+/// three 16-byte rows). `frame_index`, `reset`, and `view_x/y/z` are stamped by the render pass, not user knobs.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct WorldCacheUniformData {
@@ -1150,13 +1150,25 @@ pub struct WorldCacheUniformData {
     pub reset: u32,
     /// Phase 2.2 A/B gate (knobs-as-uniforms): `1` = the ReSTIR initial reservoir reads the cache
     /// (`reservoir_from_bounce_cached`, the live default); `0` = the FRESH `reservoir_from_bounce` path (no
-    /// cache query → no cell marked alive → the cache stays idle, exactly like Phase 2.1). Fills the last
-    /// std140 slot, so the struct is exactly 32 bytes.
+    /// cache query → no cell marked alive → the cache stays idle, exactly like Phase 2.1).
     pub use_world_cache: u32,
+    /// Phase 2.3 A/B gate (knobs-as-uniforms): `1` = the cache UPDATE pass feeds the cache forward at each
+    /// bounce hit (`new_radiance += albedo·query_world_cache`, multi-bounce, the live default); `0` =
+    /// single-bounce (the Phase 2.1 behaviour — direct+emissive / sky only). Reversible at runtime; an edit
+    /// never clears the cache either way (adapt-not-reset — stale cells decay + refill).
+    pub gi_multibounce: u32,
+    /// Camera world position (X), stamped by the render pass — feeds the update pass's multi-bounce cache
+    /// query LOD. Three scalars (not a `Vec3`) keep the std140 layout a clean three-16-byte-row 48 bytes with
+    /// no vec3 alignment padding (`[scalar;N]`/encase-pad foot-guns avoided per the GPU-uniform-verify note).
+    pub view_x: f32,
+    /// Camera world position (Y), stamped by the render pass.
+    pub view_y: f32,
+    /// Camera world position (Z), stamped by the render pass.
+    pub view_z: f32,
 }
 
 impl Default for WorldCacheUniformData {
-    /// Solari's defaults (`world_cache_query.wgsl`). `frame_index`/`reset` are runtime-stamped, default 0.
+    /// Solari's defaults (`world_cache_query.wgsl`). `frame_index`/`reset`/`view_*` are runtime-stamped, default 0.
     fn default() -> Self {
         Self {
             cell_base_size: 0.15,
@@ -1167,6 +1179,10 @@ impl Default for WorldCacheUniformData {
             frame_index: 0,
             reset: 0,
             use_world_cache: 1, // 2.2 default: the initial reservoir reads the cache (A/B gate, editor-toggled)
+            gi_multibounce: 1,  // 2.3 default: the update pass feeds the cache forward (multi-bounce, A/B-gated)
+            view_x: 0.0,
+            view_y: 0.0,
+            view_z: 0.0,
         }
     }
 }
@@ -1852,12 +1868,14 @@ struct WorldCachePrepared {
 /// lighting/sky uniforms (the update pass reads `light`/`sky` via group 1). The cache is WORLD-space: the
 /// buffers are allocated ONCE and `reset` fires exactly once (first frame after allocation) — never on resize
 /// or edit ([[feedback-gi-adapt-not-reset]]).
+#[allow(clippy::too_many_arguments)]
 fn prepare_world_cache(
     device: &wgpu::Device,
     pipelines: &VoxelRtPipelines,
     resources: &mut VoxelRtResources,
     settings: &WorldCacheSettings,
     frame_index: u32,
+    cam_pos: [f32; 3],
     light_buf: &wgpu::Buffer,
     sky_buf: &wgpu::Buffer,
 ) -> WorldCachePrepared {
@@ -1873,6 +1891,9 @@ fn prepare_world_cache(
     let mut wc = settings.data;
     wc.frame_index = frame_index;
     wc.reset = u32::from(reset);
+    // Stamp the camera position so the multi-bounce update-pass cache query (`wc_view_position`) uses the same
+    // distance-adaptive cell LOD as the live `reservoir_from_bounce_cached` consumer (which reads `camera`).
+    [wc.view_x, wc.view_y, wc.view_z] = cam_pos;
     let wc_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("voxel_rt_world_cache_uniform"),
         contents: bytemuck::bytes_of(&wc),
@@ -2225,6 +2246,7 @@ fn voxel_rt_pass(
         &mut resources,
         &world_cache_settings,
         frame_index,
+        cam_pos.into(),
         &light_buf,
         &sky_buf,
     );
@@ -2668,6 +2690,7 @@ fn voxel_rt_dlss_pass(
         &mut resources,
         &world_cache_settings,
         frame_index,
+        cam_pos.into(),
         &light_buf,
         &sky_buf,
     );

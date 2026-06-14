@@ -159,7 +159,26 @@ pub fn render_gi_panel(world: &mut World, ui: &mut egui::Ui) {
             ui.label(
                 egui::RichText::new(
                     "on = the initial reservoir reads the pre-accumulated world cache (lower boil, multi-bounce \
-                     in 2.3); off = a fresh bounce trace each frame (A/B comparison)",
+                     below); off = a fresh bounce trace each frame (A/B comparison)",
+                )
+                .weak()
+                .size(11.0),
+            );
+
+            // Phase 2.3 A/B gate: the cache UPDATE pass feeds the cache forward at each bounce hit (cells
+            // querying cells ⇒ multi-bounce fill light), stabilised by the temporal blend. Only meaningful
+            // when the world cache is live; an edit never clears the cache either way (adapt-not-reset).
+            let cache_live = wc.data.use_world_cache != 0;
+            ui.add_enabled_ui(cache_live, |ui| {
+                let mut mb = wc.data.gi_multibounce != 0;
+                if ui.checkbox(&mut mb, "Multi-bounce (cache feeds itself)").changed() {
+                    wc.data.gi_multibounce = u32::from(mb);
+                }
+            });
+            ui.label(
+                egui::RichText::new(
+                    "on = each cache cell adds albedo·cache(hit) on its bounce ⇒ feed-forward multi-bounce \
+                     fill light (open-world / shadow GI); off = single-bounce (direct+emissive/sky only)",
                 )
                 .weak()
                 .size(11.0),

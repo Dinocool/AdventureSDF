@@ -43,6 +43,10 @@ mod common;
 const TEST_WORLD_CACHE_SIZE: u32 = 1 << 12;
 
 const FLOOR: BlockId = BlockId(1);
+/// The coloured wall block (material 1 = "red", base_color [0.9,0.02,0.02]) — the closed-box side walls in the
+/// Phase 2.3 multi-bounce test. A wall lit by the ceiling holds cached radiance that the floor cell's
+/// side-bounces read ONLY when multi-bounce is on (the feed-forward fill light).
+const WALL: BlockId = BlockId(2);
 const EMITTER: BlockId = BlockId(3);
 
 /// Analytic outgoing radiance of an up-facing floor cell under a full emissive ceiling: with the ceiling
@@ -1768,5 +1772,556 @@ fn thin_wall_no_exterior_leak_with_clamp() {
         "thin-wall LEAK: the interior receiver (short ray_t={short_ray_t}) must NOT pick up the exterior cell's \
          radiance with the leak-prevention clamp armed — interior luma {interior_rad:.4} vs exterior {exterior_rad:.3} \
          (the clamp `if (ray_t < cell_size) {{ cell_size = wc.cell_base_size; }}` was likely removed)"
+    );
+}
+
+// === Phase 2.3 MULTI-BOUNCE gate: cells query cells (feed-forward fill light) > single-bounce, BOUNDED ====
+//
+// Phase 2.3 adds, in the cache UPDATE pass, the feed-forward term `new_radiance += albedo(hit)·query_world_cache(
+// hit)` (gated by `wc.gi_multibounce`, mirroring Solari `world_cache_update.wgsl:44-62 sample_gi`) so each cell
+// gathers its NEIGHBOURS' cached outgoing radiance — one more light bounce per frame, stabilised by the temporal
+// blend (the query reads LAST frame's blended radiance; the pass writes THIS frame's new_radiance — feed-forward,
+// not in-frame recursion). This test pins BOTH halves of the contract on a CLOSED COLOURED BOX:
+//   (A) MULTI-BOUNCE > SINGLE-BOUNCE — the floor cell's side-bounces hit the coloured walls; with multi-bounce
+//       those walls (lit by the ceiling) contribute their cached radiance as fill light, so the floor cell's
+//       converged radiance is strictly greater than the single-bounce value (where a wall hit returns 0:
+//       direct=0, emissive=0, no cache term). This is the open-world / shadowed-area fill light the plan calls for.
+//   (B) STILL CONVERGES (BOUNDED) — with multi-bounce ON the floor cell's frame-to-frame radiance variance still
+//       FALLS over time (it does not run away). The geometric series is bounded by albedo<1 (each wall reflects
+//       <1 of what it receives) × the temporal sample-count blend (each frame mixes in only 1/n of the new value)
+//       × the cache being pre-divided (no double-counting) — so the feed-forward term is a convergent sum, not an
+//       unclamped accumulator.
+//
+// SCENE: a fully ENCLOSED box (interior cavity 3×3×3 bricks ⇒ world [1.6,6.4]³). Floor (y=0) + ceiling (y=4,
+// EMITTER) + four RED walls (x/z=0,4 for y∈1..3). Sun off, ambient 0, dark sky ⇒ the ceiling is the ONLY light;
+// everything else is lit purely by GI. We seed a dense grid of up/side-facing cells across the floor and the
+// four walls so the floor cell's bounce-hit cells (walls + ceiling) are all populated, then read back a floor
+// cell whose hemisphere sees BOTH the ceiling (direct, single-bounce) and the walls (cached, multi-bounce only).
+
+/// Build the closed coloured box. Interior cavity = brick coords x,z ∈ {1,2}, y ∈ {1,2} (air). The shell: floor
+/// y=0 + ceiling y=3 (full x,z ∈ 0..=3) and the four RED walls (x or z ∈ {0,3}) for y ∈ 1..=2. A SMALL cavity
+/// (world [1.6,4.8]³) keeps the cache cell count well inside the 2^12 test table AND makes the walls subtend a
+/// large solid angle from the floor centre (so the multi-bounce wall fill is a clear fraction of the floor value).
+fn closed_box_patch(reg: &BlockRegistry) -> adventure::voxel::gpu::GpuBrickPatch {
+    let floor = solid(FLOOR);
+    let wall = solid(WALL);
+    let emit = solid(EMITTER);
+    let mut entries: Vec<ResidentBrick> = Vec::new();
+    for bx in 0..=3i32 {
+        for bz in 0..=3i32 {
+            entries.push(ResidentBrick { coord: IVec3::new(bx, 0, bz), brick: &floor, lod: 0 });
+            entries.push(ResidentBrick { coord: IVec3::new(bx, 3, bz), brick: &emit, lod: 0 });
+        }
+    }
+    for by in 1..=2i32 {
+        for k in 0..=3i32 {
+            // the four side walls (x=0, x=3, z=0, z=3); corners covered twice — harmless (same block).
+            entries.push(ResidentBrick { coord: IVec3::new(0, by, k), brick: &wall, lod: 0 });
+            entries.push(ResidentBrick { coord: IVec3::new(3, by, k), brick: &wall, lod: 0 });
+            entries.push(ResidentBrick { coord: IVec3::new(k, by, 0), brick: &wall, lod: 0 });
+            entries.push(ResidentBrick { coord: IVec3::new(k, by, 3), brick: &wall, lod: 0 });
+        }
+    }
+    pack_resident_set(&entries, reg)
+}
+
+/// Drive the FULL cache pass sequence for N frames on the closed box with multi-bounce `on`/`off`, returning the
+/// per-frame read-back of the tested FLOOR cell (a `WcQueryOut` per frame). The harness is byte-identical to the
+/// convergence test's (15 storage buffers, light+sky view layout, no camera) — the multi-bounce query reads the
+/// camera position from `wc.view_*` (stamped below), so no camera binding is needed.
+fn run_box_fill(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    multibounce: bool,
+) -> Vec<WcQueryOut> {
+    let mut reg = BlockRegistry::from_biome_library(&test_library());
+    reg.set_emissive(EMITTER, [3.0, 3.0, 3.0]);
+    let patch = closed_box_patch(&reg);
+    let n = patch.brick_count() as u32;
+
+    let light = LightingUniformData {
+        sun_direction: [0.0, 1.0, 0.0],
+        ambient_color: [0.0, 0.0, 0.0],
+        gi_rays: 1,
+        gi_intensity: 1.0,
+        gi_bounce_dist: 40.0,
+        emissive_strength: 4.0,
+        ..LightingUniformData::default()
+    };
+    let sky = SkyUniformData {
+        horizon_color: [0.0, 0.0, 0.0],
+        zenith_color: [0.0, 0.0, 0.0],
+        ground_color: [0.0, 0.0, 0.0],
+        sun_size: 0.0,
+        intensity: 0.0,
+        gi_sky_intensity: 0.0,
+        sun_tint: [0.0, 0.0, 0.0],
+        _pad: 0.0,
+    };
+    let wc_defaults = WorldCacheUniformData {
+        cell_base_size: 0.3,
+        gi_ray_distance: 40.0,
+        cell_lifetime: 8,
+        gi_multibounce: u32::from(multibounce),
+        ..WorldCacheUniformData::default()
+    };
+
+    let s = BRICK_WORLD_SIZE;
+    let floor_top = s; // y = 1.6, the interior floor surface
+    // Centre of the cavity (world x,z ∈ [1.6,4.8] ⇒ centre 3.2); a near camera (LOD 0).
+    let cx = s * 2.0; // 3.2
+    let cz = s * 2.0;
+    let cavity_centre_y = s * 2.0; // 3.2
+    let view_position = [cx, cavity_centre_y, cz];
+    let step = wc_defaults.cell_base_size;
+
+    // SEED only a grid of UP-facing FLOOR cells (so the floor cells are active + trace bounces). The walls + the
+    // ceiling underside are populated by the cache's own query-driven LAZY-INSERT: a floor cell's side/up bounce
+    // claims the hit cell (Solari's fill mechanism), so they become active and fill over the next frames — no
+    // need to hand-seed them. The tested cell is the floor centre (index 0): its +Y bounce sees the ceiling
+    // (single-bounce) and its side bounces see the (multi-bounce-only) walls.
+    let mut probes: Vec<WcQueryPoint> = Vec::new();
+    probes.push(WcQueryPoint {
+        world_position: [cx, floor_top, cz],
+        _p0: 0,
+        world_normal: [0.0, 1.0, 0.0],
+        _p1: 0,
+    });
+    let lo = s * 1.3; // ~2.08, inside the cavity x∈[1.6,4.8]
+    let hi = s * 2.7; // ~4.32
+    let mut g = lo;
+    while g <= hi {
+        let mut h = lo;
+        while h <= hi {
+            probes.push(WcQueryPoint {
+                world_position: [g, floor_top, h],
+                _p0: 0,
+                world_normal: [0.0, 1.0, 0.0],
+                _p1: 0,
+            });
+            h += step;
+        }
+        g += step;
+    }
+    let n_points = probes.len() as u32;
+
+    // --- Scene (group 0) ---
+    let aabb_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("mb_aabbs"),
+        contents: bytemuck::cast_slice(&patch.aabbs),
+        usage: wgpu::BufferUsages::BLAS_INPUT | wgpu::BufferUsages::STORAGE,
+    });
+    let meta_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("mb_metas"),
+        contents: bytemuck::cast_slice(&patch.metas),
+        usage: wgpu::BufferUsages::STORAGE,
+    });
+    let voxel_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("mb_voxels"),
+        contents: bytemuck::cast_slice(&patch.voxels),
+        usage: wgpu::BufferUsages::STORAGE,
+    });
+    let palette_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("mb_palette"),
+        contents: bytemuck::cast_slice(&patch.palette),
+        usage: wgpu::BufferUsages::STORAGE,
+    });
+
+    let size_desc = wgpu::BlasAABBGeometrySizeDescriptor {
+        primitive_count: n,
+        flags: wgpu::AccelerationStructureGeometryFlags::OPAQUE,
+    };
+    let blas = device.create_blas(
+        &wgpu::CreateBlasDescriptor {
+            label: Some("mb_blas"),
+            flags: wgpu::AccelerationStructureFlags::PREFER_FAST_TRACE,
+            update_mode: wgpu::AccelerationStructureUpdateMode::Build,
+        },
+        wgpu::BlasGeometrySizeDescriptors::AABBs { descriptors: vec![size_desc.clone()] },
+    );
+    let mut tlas = device.create_tlas(&wgpu::CreateTlasDescriptor {
+        label: Some("mb_tlas"),
+        flags: wgpu::AccelerationStructureFlags::PREFER_FAST_TRACE,
+        update_mode: wgpu::AccelerationStructureUpdateMode::Build,
+        max_instances: 1,
+    });
+    tlas[0] = Some(wgpu::TlasInstance::new(
+        &blas,
+        [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0],
+        0,
+        0xff,
+    ));
+
+    // --- Persistent cache buffers (zero ⇒ all cells empty) ---
+    let tsz = TEST_WORLD_CACHE_SIZE as u64;
+    let zeroed = |label: &str, bytes: u64, indirect: bool| {
+        let mut usage = wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST;
+        if indirect {
+            usage |= wgpu::BufferUsages::INDIRECT;
+        }
+        let buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some(label),
+            size: bytes,
+            usage,
+            mapped_at_creation: false,
+        });
+        queue.write_buffer(&buf, 0, &vec![0u8; bytes as usize]);
+        buf
+    };
+    let checksums = zeroed("mb_checksums", tsz * 4, false);
+    let life = zeroed("mb_life", tsz * 4, false);
+    let radiance = zeroed("mb_radiance", tsz * 16, false);
+    let geometry = zeroed("mb_geometry", tsz * 32, false);
+    let luminance_deltas = zeroed("mb_luminance_deltas", tsz * 4, false);
+    let new_radiance = zeroed("mb_new_radiance", tsz * 16, false);
+    let a = zeroed("mb_a", tsz * 4, false);
+    let b = zeroed("mb_b", 1024 * 4, false);
+    let active_cell_indices = zeroed("mb_active_cell_indices", tsz * 4, false);
+    let active_cells_count = zeroed("mb_active_cells_count", 4, false);
+    let active_cells_dispatch = zeroed("mb_active_cells_dispatch", 12, true);
+
+    // --- Uniforms + test buffers ---
+    let wc_uniform = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("mb_wc_uniform"),
+        size: mem::size_of::<WorldCacheUniformData>() as u64,
+        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    let light_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("mb_light"),
+        contents: bytemuck::bytes_of(&light),
+        usage: wgpu::BufferUsages::UNIFORM,
+    });
+    let sky_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("mb_sky"),
+        contents: bytemuck::bytes_of(&sky),
+        usage: wgpu::BufferUsages::UNIFORM,
+    });
+    let query_points_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("mb_query_points"),
+        contents: bytemuck::cast_slice(&probes),
+        usage: wgpu::BufferUsages::STORAGE,
+    });
+    let query_out_buf = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("mb_query_out"),
+        size: (n_points as u64) * mem::size_of::<WcQueryOut>() as u64,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        mapped_at_creation: false,
+    });
+    let query_params_buf = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("mb_query_params"),
+        size: mem::size_of::<WcQueryParams>() as u64,
+        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    let read_buf = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("mb_read"),
+        size: mem::size_of::<WcQueryOut>() as u64,
+        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+
+    // --- Layouts (identical to the convergence test: 15 storage buffers, no camera) ---
+    let storage_rw = |binding: u32| wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::COMPUTE,
+        ty: wgpu::BindingType::Buffer {
+            ty: wgpu::BufferBindingType::Storage { read_only: false },
+            has_dynamic_offset: false,
+            min_binding_size: None,
+        },
+        count: None,
+    };
+    let storage_ro = |binding: u32| wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::COMPUTE,
+        ty: wgpu::BindingType::Buffer {
+            ty: wgpu::BufferBindingType::Storage { read_only: true },
+            has_dynamic_offset: false,
+            min_binding_size: None,
+        },
+        count: None,
+    };
+    let uniform = |binding: u32| wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::COMPUTE,
+        ty: wgpu::BindingType::Buffer {
+            ty: wgpu::BufferBindingType::Uniform,
+            has_dynamic_offset: false,
+            min_binding_size: None,
+        },
+        count: None,
+    };
+
+    let scene_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("mb_scene_layout"),
+        entries: &[
+            wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::AccelerationStructure { vertex_return: false },
+                count: None,
+            },
+            storage_ro(1),
+            storage_ro(2),
+            storage_ro(3),
+        ],
+    });
+    let view_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("mb_view_layout"),
+        entries: &[uniform(2), uniform(11)],
+    });
+    let dispatch_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("mb_dispatch_layout"),
+        entries: &[storage_rw(0)],
+    });
+    let cache_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("mb_cache_layout"),
+        entries: &[
+            uniform(0),
+            storage_rw(1),
+            storage_rw(2),
+            storage_rw(3),
+            storage_rw(4),
+            storage_rw(5),
+            storage_rw(6),
+            storage_rw(7),
+            storage_rw(8),
+            storage_rw(9),
+            storage_rw(10),
+            storage_ro(12),
+            storage_rw(13),
+            uniform(14),
+        ],
+    });
+    let compact_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("mb_compact_pl"),
+        bind_group_layouts: &[Some(&scene_layout), Some(&view_layout), Some(&dispatch_layout), Some(&cache_layout)],
+        immediate_size: 0,
+    });
+    let update_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("mb_update_pl"),
+        bind_group_layouts: &[Some(&scene_layout), Some(&view_layout), None, Some(&cache_layout)],
+        immediate_size: 0,
+    });
+
+    let src = adventure::voxel::raytrace::voxel_raytrace_shader_src(TEST_WORLD_CACHE_SIZE);
+    let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("voxel_raytrace"),
+        source: wgpu::ShaderSource::Wgsl(src.into()),
+    });
+    let mk = |entry: &str, layout: &wgpu::PipelineLayout| {
+        device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some(entry),
+            layout: Some(layout),
+            module: &module,
+            entry_point: Some(entry),
+            compilation_options: Default::default(),
+            cache: None,
+        })
+    };
+    let p_seed = mk("world_cache_query_seed", &compact_pl);
+    let p_decay = mk("world_cache_decay", &compact_pl);
+    let p_csb = mk("world_cache_compact_single_block", &compact_pl);
+    let p_cb = mk("world_cache_compact_blocks", &compact_pl);
+    let p_cwa = mk("world_cache_compact_write_active", &compact_pl);
+    let p_update = mk("world_cache_update", &update_pl);
+    let p_blend = mk("world_cache_blend", &update_pl);
+
+    // --- Bind groups ---
+    let scene_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("mb_scene_bg"),
+        layout: &scene_layout,
+        entries: &[
+            wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::AccelerationStructure(&tlas) },
+            wgpu::BindGroupEntry { binding: 1, resource: meta_buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 2, resource: voxel_buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 3, resource: palette_buf.as_entire_binding() },
+        ],
+    });
+    let view_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("mb_view_bg"),
+        layout: &view_layout,
+        entries: &[
+            wgpu::BindGroupEntry { binding: 2, resource: light_buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 11, resource: sky_buf.as_entire_binding() },
+        ],
+    });
+    let dispatch_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("mb_dispatch_bg"),
+        layout: &dispatch_layout,
+        entries: &[wgpu::BindGroupEntry { binding: 0, resource: active_cells_dispatch.as_entire_binding() }],
+    });
+    let cache_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("mb_cache_bg"),
+        layout: &cache_layout,
+        entries: &[
+            wgpu::BindGroupEntry { binding: 0, resource: wc_uniform.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 1, resource: checksums.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 2, resource: life.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 3, resource: radiance.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 4, resource: geometry.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 5, resource: luminance_deltas.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 6, resource: new_radiance.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 7, resource: a.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 8, resource: b.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 9, resource: active_cell_indices.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 10, resource: active_cells_count.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 12, resource: query_points_buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 13, resource: query_out_buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 14, resource: query_params_buf.as_entire_binding() },
+        ],
+    });
+
+    let mut build = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("mb_build") });
+    build.build_acceleration_structures(
+        iter::once(&wgpu::BlasBuildEntry {
+            blas: &blas,
+            geometry: wgpu::BlasGeometries::AabbGeometries(vec![wgpu::BlasAabbGeometry {
+                size: &size_desc,
+                stride: mem::size_of::<adventure::voxel::gpu::GpuBrickAabb>() as wgpu::BufferAddress,
+                aabb_buffer: &aabb_buf,
+                primitive_offset: 0,
+            }]),
+        }),
+        iter::once(&tlas),
+    );
+    queue.submit(Some(build.finish()));
+
+    let table_groups = TEST_WORLD_CACHE_SIZE / 1024;
+    let mut history: Vec<WcQueryOut> = Vec::with_capacity(N_FRAMES as usize);
+    for frame in 0..N_FRAMES {
+        let mut wc = wc_defaults;
+        wc.frame_index = frame.wrapping_mul(5782582).wrapping_add(1);
+        wc.reset = u32::from(frame == 0);
+        // Stamp the camera position so the multi-bounce update-pass query uses a sensible (near, LOD 0) cell.
+        [wc.view_x, wc.view_y, wc.view_z] = view_position;
+        queue.write_buffer(&wc_uniform, 0, bytemuck::bytes_of(&wc));
+        let qp = WcQueryParams {
+            view_position,
+            n_points,
+            frame_index: wc.frame_index,
+            ray_t: 0.0,
+            _p1: 0,
+            _p2: 0,
+        };
+        queue.write_buffer(&query_params_buf, 0, bytemuck::bytes_of(&qp));
+
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        {
+            let mut cpass =
+                encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: None, timestamp_writes: None });
+            cpass.set_bind_group(0, Some(&scene_bg), &[]);
+            cpass.set_bind_group(1, Some(&view_bg), &[]);
+            cpass.set_bind_group(2, Some(&dispatch_bg), &[]);
+            cpass.set_bind_group(3, Some(&cache_bg), &[]);
+            cpass.set_pipeline(&p_seed);
+            cpass.dispatch_workgroups(n_points.div_ceil(64), 1, 1);
+            cpass.set_pipeline(&p_decay);
+            cpass.dispatch_workgroups(table_groups, 1, 1);
+            cpass.set_pipeline(&p_csb);
+            cpass.dispatch_workgroups(table_groups, 1, 1);
+            cpass.set_pipeline(&p_cb);
+            cpass.dispatch_workgroups(1, 1, 1);
+            cpass.set_pipeline(&p_cwa);
+            cpass.dispatch_workgroups(table_groups, 1, 1);
+            cpass.set_bind_group(2, None, &[]);
+            cpass.set_pipeline(&p_update);
+            cpass.dispatch_workgroups_indirect(&active_cells_dispatch, 0);
+            cpass.set_pipeline(&p_blend);
+            cpass.dispatch_workgroups_indirect(&active_cells_dispatch, 0);
+        }
+        // Read back ONLY the tested floor cell (slot 0).
+        encoder.copy_buffer_to_buffer(&query_out_buf, 0, &read_buf, 0, mem::size_of::<WcQueryOut>() as u64);
+        queue.submit(Some(encoder.finish()));
+
+        let slice = read_buf.slice(..);
+        slice.map_async(wgpu::MapMode::Read, |r| r.expect("map failed"));
+        device.poll(wgpu::PollType::wait_indefinitely()).expect("poll failed");
+        let data = slice.get_mapped_range().unwrap();
+        let out: WcQueryOut = *bytemuck::from_bytes(&data[..mem::size_of::<WcQueryOut>()]);
+        drop(data);
+        read_buf.unmap();
+        history.push(out);
+    }
+    let _ = (&aabb_buf, &blas, &tlas);
+    history
+}
+
+#[test]
+fn multibounce_exceeds_single_bounce_and_stays_bounded() {
+    let Some((device, queue)) = common::headless_ray_query_device_with_storage_buffers(16) else {
+        eprintln!("no ray-query device with 16 storage buffers — skipping multi-bounce test");
+        return;
+    };
+
+    let single = run_box_fill(&device, &queue, false);
+    let multi = run_box_fill(&device, &queue, true);
+
+    // The converged (tail-averaged) floor-cell radiance under each gate.
+    let conv = |h: &[WcQueryOut]| -> f32 {
+        let tail = &h[(N_FRAMES as usize - 8)..];
+        tail.iter().map(|o| luma(o.radiance)).sum::<f32>() / tail.len() as f32
+    };
+    let single_conv = conv(&single);
+    let multi_conv = conv(&multi);
+    eprintln!(
+        "[multibounce] single-bounce floor luma={single_conv:.4} | multi-bounce floor luma={multi_conv:.4} | \
+         gain={:.3}x (+{:.4})",
+        multi_conv / single_conv.max(1e-6),
+        multi_conv - single_conv,
+    );
+
+    // Both must be finite + non-negative every frame (no NaN/Inf runaway with the feed-forward term on).
+    for (label, h) in [("single", &single), ("multi", &multi)] {
+        for (f, o) in h.iter().enumerate() {
+            assert!(
+                o.radiance.iter().all(|v| v.is_finite() && *v >= 0.0),
+                "{label} frame {f}: floor-cell radiance must be finite + non-negative, got {:?}",
+                o.radiance
+            );
+            assert_ne!(o.checksum, 0, "{label} frame {f}: the tested floor cell must be occupied");
+        }
+    }
+
+    // --- (A) MULTI-BOUNCE > SINGLE-BOUNCE: the coloured-wall fill light. The floor cell's side-bounces hit the
+    //     walls; with multi-bounce those (ceiling-lit) walls contribute their cached radiance, so the floor cell
+    //     is strictly brighter. A clear margin (≥ 10 %) rules out noise. ---
+    assert!(
+        single_conv > 1e-2,
+        "the single-bounce floor cell must itself accumulate the direct ceiling contribution (got {single_conv:.4}) \
+         — else the comparison is vacuous"
+    );
+    assert!(
+        multi_conv > single_conv * 1.10,
+        "multi-bounce floor radiance must EXCEED single-bounce by a clear margin (the coloured-wall feed-forward \
+         fill light): multi={multi_conv:.4} vs single={single_conv:.4} (gain {:.3}x)",
+        multi_conv / single_conv.max(1e-6)
+    );
+
+    // --- (B) STILL CONVERGES (BOUNDED): with multi-bounce ON, the floor cell's frame-to-frame radiance variance
+    //     in the SECOND half is not larger than in the FIRST half (the feed-forward series converges — albedo<1 +
+    //     the temporal blend bound it; it does NOT run away into an unclamped accumulation). ---
+    let half = N_FRAMES as usize / 2;
+    let warmup = 8usize; // the multi-bounce series takes a few more frames to settle (one bounce/frame)
+    let lvar = |slice: &[WcQueryOut]| -> f32 {
+        let m = slice.iter().map(|o| luma(o.radiance)).sum::<f32>() / slice.len().max(1) as f32;
+        slice.iter().map(|o| (luma(o.radiance) - m).powi(2)).sum::<f32>() / slice.len().max(1) as f32
+    };
+    let first_var = lvar(&multi[warmup..half]);
+    let second_var = lvar(&multi[half..]);
+    eprintln!("[multibounce] BOUNDED check: first-half var={first_var:.5} second-half var={second_var:.5}");
+    assert!(
+        second_var <= first_var + 1e-3,
+        "multi-bounce radiance variance must not GROW (it must converge, not run away): first {first_var:.5} → \
+         second {second_var:.5}"
+    );
+    // And the converged value is a finite, bounded number (a sanity ceiling: even a perfectly white closed box's
+    // geometric series 1/(1-albedo) with albedo≈0.5 gives ~2× the single bounce; the red walls reflect far less,
+    // so a value many× the ceiling radiance would signal a double-counting / unclamped-accumulation bug).
+    assert!(
+        multi_conv < 4.0 * CEILING_RADIANCE,
+        "multi-bounce floor radiance must stay bounded (≪ a runaway accumulation); got {multi_conv:.4} vs the \
+         ceiling radiance {CEILING_RADIANCE:.1}"
     );
 }

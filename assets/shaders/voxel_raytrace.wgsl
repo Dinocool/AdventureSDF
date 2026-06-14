@@ -1782,7 +1782,21 @@ struct WorldCacheUniform {
     frame_index: u32,       // per-frame counter (decorrelates the update RNG)
     reset: u32,             // 1 = first-allocation clear: blend overwrites instead of accumulating
     use_world_cache: u32,   // 2.2 A/B gate: 1 = the initial reservoir reads the cache (default), 0 = fresh bounce
+    gi_multibounce: u32,    // 2.3 A/B gate: 1 = the update pass FEEDS-FORWARD the cache at the bounce hit (default), 0 = single-bounce
+    // The camera world position, stamped by the render pass. The update pass's multi-bounce cache query needs
+    // it for the distance-adaptive cell LOD (`wc_get_cell_size`) — the cache view layout binds light+sky only,
+    // NOT the `camera` uniform, so the view position rides in here instead. Three scalars (not a vec3) keep the
+    // struct a clean 48-byte / three-16-byte-row std140 layout with no vec3 alignment padding.
+    view_x: f32,
+    view_y: f32,
+    view_z: f32,
 };
+
+// The camera world position the update pass feeds to `query_world_cache` for its LOD (reconstructed from the
+// three scalars above). Matches the live `reservoir_from_bounce_cached` consumer, which passes `camera.cam_pos`.
+fn wc_view_position() -> vec3<f32> {
+    return vec3<f32>(wc.view_x, wc.view_y, wc.view_z);
+}
 
 @group(3) @binding(0) var<uniform> wc: WorldCacheUniform;
 // 0 = empty; a non-zero IQ checksum marks an occupied cell. ATOMIC: lazy-insert claims a slot via
@@ -2017,9 +2031,19 @@ fn world_cache_compact_write_active(
 
 // PASS 5 — UPDATE (indirect, one thread per ACTIVE cell). ADAPTATION (no light list): trace ONE cosine-weighted
 // hemisphere bounce from the cell's stored (pos,normal); the sample radiance = direct lighting at the hit +
-// the hit's emissive glow, or the procedural sky (the 1A SSOT) on a miss. SINGLE-BOUNCE in 2.1 (no
-// cache-query-at-hit term — that is 2.3). Because the compaction gives each active cell exactly ONE owning
-// thread, the `new_radiance` write is race-free WITHOUT float atomics.
+// the hit's emissive glow, or the procedural sky (the 1A SSOT) on a miss. Because the compaction gives each
+// active cell exactly ONE owning thread, the `new_radiance` write is race-free WITHOUT float atomics.
+//
+// MULTI-BOUNCE (Phase 2.3, gated by `wc.gi_multibounce`, default ON; mirrors Solari `world_cache_update.wgsl`
+// `sample_gi`:44-62): at the bounce HIT we ALSO add the reflected indirect read FROM the cache —
+//   new_radiance += albedo(hit) · query_world_cache(hit_pos, hit_normal, …)
+// so each cell's outgoing radiance gathers its neighbours' CACHED outgoing radiance → cells query cells →
+// every frame the cache carries one MORE light bounce than the last (feed-forward, NOT in-frame recursion: the
+// query reads LAST frame's blended `world_cache_radiance` and this thread writes THIS frame's `new_radiance`).
+// Convention: our cache is COSINE-PRE-DIVIDED (the cosine-weighted gather bakes the 1/π in), so the consumer
+// multiplies by albedo ONLY — NO further /π — byte-identical to the 2.2 `reservoir_from_bounce_cached` term
+// (which also uses `r.color.rgb * query_world_cache(…)`). The cache lazy-inserts the hit cell on a miss
+// (returns 0, fills over the next frames). BOUNDED by construction — see the energy note below.
 @compute @workgroup_size(64, 1, 1)
 fn world_cache_update(@builtin(global_invocation_id) active_cell_id: vec3<u32>) {
     if (active_cell_id.x >= world_cache_active_cells_count) { return; }
@@ -2043,6 +2067,14 @@ fn world_cache_update(@builtin(global_invocation_id) active_cell_id: vec3<u32>) 
     if (hit.hit != 0u) {
         let hp = origin + dir * hit.t;
         radiance = direct_lighting(hit.color.rgb, hit.normal, hp) + hit.emissive * light.emissive_strength;
+        // Feed-forward multi-bounce: add the reflected indirect the cache already holds for the hit surface.
+        // `query_world_cache` reads LAST frame's blended radiance (this pass only writes `new_radiance`), so
+        // there is no in-frame recursion; the recursion unrolls one bounce per frame and is stabilised by the
+        // temporal blend. Albedo only (cosine-pre-divided cache convention), mirroring the 2.2 consumer.
+        if (wc.gi_multibounce != 0u) {
+            let cell_life = atomicLoad(&world_cache_life[cell_index]);
+            radiance += hit.color.rgb * query_world_cache(hp, hit.normal, wc_view_position(), hit.t, cell_life, &rng);
+        }
     } else {
         radiance = sky_radiance(dir) * sky.gi_sky_intensity;
     }
