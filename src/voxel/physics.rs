@@ -43,6 +43,9 @@ use super::cornell::build_cornell_with_edits;
 use super::edits::VoxelEdits;
 use super::palette::BlockRegistry;
 use crate::sdf_render::editor_camera::SdfCameraMode;
+use crate::sdf_render::worldgen::layers::erosion::ErosionParams;
+use crate::sdf_render::worldgen::layers::height::HeightParams;
+use crate::sdf_render::worldgen::{WORLDGEN_SLICE_SEED, WorldBiomeShapes, WorldGraph};
 use crate::sdf_render::{SdfCamera, SdfOrbitCamera};
 
 // --- Tunables (first-person walk) ---
@@ -276,15 +279,22 @@ pub struct VoxelWalk {
     pub pitch: f32,
 }
 
-/// `P` toggles first-person walk mode (Cornell scene only — see module docs). On enable it drops the
-/// player onto the floor under the orbit target and seeds the look heading; on disable the orbit camera
-/// resumes. Refused (with a one-shot log) outside the Cornell scene until worldgen physics lands.
+/// `P` toggles first-person walk mode. On enable it drops the player onto the ground under the orbit
+/// target and seeds the look heading; on disable the orbit camera resumes. Works in BOTH scenes: Cornell
+/// walks the cuboid colliders; worldgen follows the analytic `sample_world` surface (heightmap, no
+/// colliders) — so you can walk the terrain for a true sense of scale.
+#[allow(clippy::too_many_arguments)] // a Bevy system; an arg struct would hurt readability here
 pub fn toggle_walk_mode(
     keyboard: Res<ButtonInput<KeyCode>>,
     scene: Res<VoxelScene>,
     mut mode: ResMut<SdfCameraMode>,
     mut walk: ResMut<VoxelWalk>,
     orbit: Res<SdfOrbitCamera>,
+    height: Res<HeightParams>,
+    erosion: Res<ErosionParams>,
+    graph: Res<WorldGraph>,
+    biome_shapes: Res<WorldBiomeShapes>,
+    cam: Query<&Transform, With<SdfCamera>>,
 ) {
     if !keyboard.just_pressed(KeyCode::KeyP) {
         return;
@@ -294,16 +304,27 @@ pub fn toggle_walk_mode(
         info!("voxel walk mode: OFF (orbit camera)");
         return;
     }
-    if !scene.is_cornell() {
-        info!("voxel walk mode: only the Cornell scene has physics for now — press V for Cornell first");
-        return;
-    }
-    // Drop in above the floor under the current orbit target (the box interior); gravity settles it.
-    walk.feet = Vec3::new(orbit.target.x, super::cornell::INTERIOR as f32 * VOXEL_SIZE * 0.5, orbit.target.z);
+    // Drop the player straight DOWN from the camera onto the ground (NOT at `orbit.target`, which sits
+    // `forward * distance` AHEAD of the eye — in worldgen free-fly that projected the spawn tens of metres
+    // out onto distant/tall terrain, so P appeared to fling you "up in the sky"). Spawn under the camera:
+    // Cornell snaps to the box-interior floor at the orbit target; worldgen samples the analytic surface
+    // (the same SSOT the renderer voxelizes) directly beneath the camera XZ.
+    let (cam_pos, cam_fwd) = match cam.single() {
+        Ok(t) => (t.translation, *t.forward()),
+        Err(_) => (orbit.target, Vec3::NEG_Z),
+    };
+    let (fx, fz, feet_y) = if scene.is_cornell() {
+        (orbit.target.x, orbit.target.z, super::cornell::INTERIOR as f32 * VOXEL_SIZE * 0.5)
+    } else {
+        let y = worldgen_surface_y(cam_pos.x, cam_pos.z, &height, &erosion, &graph, &biome_shapes);
+        (cam_pos.x, cam_pos.z, y)
+    };
+    walk.feet = Vec3::new(fx, feet_y, fz);
     walk.vy = 0.0;
-    // Seed the look heading from the orbit yaw so the view doesn't snap.
-    walk.yaw = orbit.yaw;
-    walk.pitch = -0.1;
+    // Seed the look heading from the camera's ACTUAL forward so the view doesn't snap on entry. `walk`'s
+    // forward convention is `(-sin yaw, 0, -cos yaw)` (see `walk_player`), so yaw = atan2(-fwd.x, -fwd.z).
+    walk.yaw = (-cam_fwd.x).atan2(-cam_fwd.z);
+    walk.pitch = cam_fwd.y.clamp(-0.99, 0.99).asin();
     mode.player = true;
     info!("voxel walk mode: ON (WASD walk, Space jump, hold RMB to look, P to exit)");
 }
@@ -335,11 +356,16 @@ pub fn rebuild_walk_colliders(
 #[allow(clippy::too_many_arguments)] // a Bevy system; an arg struct would hurt readability here
 pub fn walk_player(
     mode: Res<SdfCameraMode>,
+    scene: Res<VoxelScene>,
     keyboard: Res<ButtonInput<KeyCode>>,
     mouse: Res<ButtonInput<MouseButton>>,
     mut motion: MessageReader<bevy::input::mouse::MouseMotion>,
     time: Res<Time>,
     colliders: Res<VoxelColliders>,
+    height: Res<HeightParams>,
+    erosion: Res<ErosionParams>,
+    graph: Res<WorldGraph>,
+    biome_shapes: Res<WorldBiomeShapes>,
     mut walk: ResMut<VoxelWalk>,
     mut cam: Query<&mut Transform, With<SdfCamera>>,
 ) {
@@ -363,7 +389,12 @@ pub fn walk_player(
     let dt = time.delta_secs();
 
     // --- Gravity + jump (vy integrated; reset on ground) ---
-    let grounded_now = colliders_grounded(&colliders, walk.feet);
+    let grounded_now = if scene.is_cornell() {
+        colliders_grounded(&colliders, walk.feet)
+    } else {
+        walk.feet.y
+            <= worldgen_surface_y(walk.feet.x, walk.feet.z, &height, &erosion, &graph, &biome_shapes) + 0.02
+    };
     if keyboard.just_pressed(KeyCode::Space) && grounded_now {
         walk.vy = JUMP_SPEED;
     }
@@ -394,10 +425,28 @@ pub fn walk_player(
     }
 
     let desired = dir * WALK_SPEED * dt + Vec3::Y * walk.vy * dt;
-    let (new_feet, grounded) = colliders.move_character(&walk_controller(), walk.feet, PLAYER_HALF, desired, dt);
-    walk.feet = new_feet;
-    if grounded && walk.vy < 0.0 {
-        walk.vy = 0.0;
+    if scene.is_cornell() {
+        let (new_feet, grounded) = colliders.move_character(&walk_controller(), walk.feet, PLAYER_HALF, desired, dt);
+        walk.feet = new_feet;
+        if grounded && walk.vy < 0.0 {
+            walk.vy = 0.0;
+        }
+    } else {
+        // Worldgen is a heightmap (no overhangs) → follow the analytic `sample_world` surface directly:
+        // step horizontally, then clamp the feet onto (never under) the ground. The SAME SSOT the renderer
+        // voxelizes, so the player walks exactly on the rendered terrain — no colliders to build or stream.
+        // Gravity still applies (step off a ledge and you fall), and `vy` zeroes on landing.
+        let nx = walk.feet.x + desired.x;
+        let nz = walk.feet.z + desired.z;
+        let ground = worldgen_surface_y(nx, nz, &height, &erosion, &graph, &biome_shapes);
+        let mut fy = walk.feet.y + desired.y;
+        if fy <= ground {
+            fy = ground;
+            if walk.vy < 0.0 {
+                walk.vy = 0.0;
+            }
+        }
+        walk.feet = Vec3::new(nx, fy, nz);
     }
 
     // --- Drive the camera to the eye position, looking along yaw/pitch ---
@@ -413,6 +462,22 @@ pub fn walk_player(
 fn colliders_grounded(colliders: &VoxelColliders, feet: Vec3) -> bool {
     let (_, grounded) = colliders.move_character(&walk_controller(), feet, PLAYER_HALF, Vec3::new(0.0, -0.01, 0.0), 1.0 / 60.0);
     grounded
+}
+
+/// The worldgen terrain surface height (world Y in metres) at a world XZ — from the SAME `sample_world`
+/// SSOT the renderer voxelizes, so the first-person player walks exactly on the rendered ground. The
+/// terrain is heightmap-only (no overhangs), so one analytic sample fully defines the floor and no
+/// colliders need to be built or streamed for the walk. Cheap: a small graph clone + one column eval.
+fn worldgen_surface_y(
+    wx: f32,
+    wz: f32,
+    height: &HeightParams,
+    erosion: &ErosionParams,
+    graph: &WorldGraph,
+    biome_shapes: &WorldBiomeShapes,
+) -> f32 {
+    let layer = super::build_height_layer(height, erosion, graph, biome_shapes);
+    layer.sample_world(wx as f64, wz as f64, WORLDGEN_SLICE_SEED).height
 }
 
 #[cfg(test)]
