@@ -11,9 +11,14 @@
 //!    feature; the default `assets/models/src/Sponza.gltf`), or `.obj` via `tobj` (positions/indices/UVs + the
 //!    companion `.mtl` diffuse `Kd` base colour and `map_Kd` diffuse texture, decoded with `image`) — so
 //!    classic OBJ scenes (Sibenik, San Miguel, OBJ Sponza variants) load into the SAME `Mesh` the glTF path
-//!    builds and the rest of the pipeline is unchanged. FBX (e.g. the Lumberyard Bistro) is NOT handled —
-//!    convert it to glTF/OBJ externally first. If the asset is absent, fall back to a small procedural coloured
-//!    box room so the pipeline + downstream test still build + run (and print a clear "drop in a real" notice).
+//!    builds and the rest of the pipeline is unchanged. The glTF path also handles `KHR_texture_basisu` KTX2
+//!    textures (the Amazon Lumberyard Bistro, converted to glTF, ships its base colours as UASTC+Zstd KTX2):
+//!    the unsupported `extensionsRequired` entry is stripped so `gltf` parses the document, and each external
+//!    `.ktx2` base colour is decoded to RGBA8 by [`ktx2_to_rgba`] (the same `ktx2`/`ruzstd`/`basis-universal`
+//!    path `bevy_image` uses) instead of by `gltf`'s `image` feature (which can't read KTX2). FBX (the raw
+//!    Lumberyard Bistro) is NOT handled — convert it to glTF/OBJ externally first. If the asset is absent,
+//!    fall back to a small procedural coloured box room so the pipeline + downstream test still build + run
+//!    (and print a clear "drop in a real" notice).
 //! 2. SURFACE-voxelize into a SPARSE grid at `VOXEL_SIZE` (0.2 m) over the mesh AABB: each triangle is
 //!    conservatively rasterized (triangle–box overlap, the Akenine-Möller SAT) into every voxel it touches,
 //!    marking it SOLID. Each solid voxel's albedo is the base-colour texture sampled at the
@@ -132,6 +137,12 @@ struct Texture {
 }
 
 impl Texture {
+    /// An empty (0×0) texture — a sentinel for "could not decode this image". Callers treat `width == 0` as
+    /// "no texture" and flat-fall-back to the material `base_color_factor`.
+    fn empty() -> Self {
+        Self { width: 0, height: 0, rgba: Vec::new() }
+    }
+
     /// Nearest-sample sRGB RGBA at UV (wrapping). Returns `[r,g,b,a]` sRGB `u8`.
     fn sample(&self, u: f32, v: f32) -> [u8; 4] {
         if self.width == 0 || self.height == 0 {
@@ -211,31 +222,180 @@ fn load_mesh(path: &Path) -> anyhow::Result<Mesh> {
 // ============================================================================================
 
 /// Load a glTF file into a [`Mesh`]: every primitive's positions + indices + UV0, with the material's
-/// base-colour texture (decoded via `gltf`'s `image` feature) or its `base_color_factor`. Positions are
-/// transformed to WORLD space by walking the scene-node hierarchy and accumulating each node's local
-/// transform (CRITICAL: Sponza's single node carries a 0.008 scale, so mesh-local coords of ±1400 become a
-/// ~24 m world scene — without this the AABB would be ~3000 units and the dense grid would be astronomically
-/// large). glTF and this engine are both Y-up; the Z-up swap for `.vox` happens at write time.
+/// base-colour texture (decoded via `gltf`'s `image` feature, or — for `KHR_texture_basisu` KTX2 — via
+/// [`ktx2_to_rgba`]) or its `base_color_factor`. Positions are transformed to WORLD space by walking the
+/// scene-node hierarchy and accumulating each node's local transform (CRITICAL: Sponza's single node carries
+/// a 0.008 scale, so mesh-local coords of ±1400 become a ~24 m world scene — without this the AABB would be
+/// ~3000 units and the dense grid would be astronomically large). glTF and this engine are both Y-up; the
+/// Z-up swap for `.vox` happens at write time.
+///
+/// Texture resolution is by IMAGE index throughout: `Mesh.textures[k]` is the decoded image `k`, and a
+/// triangle's `Triangle::texture` is that image index. The `base_color_texture` is a glTF TEXTURE index,
+/// which [`emit_mesh_primitives`] maps to an image index via `tex_to_image` (the `KHR_texture_basisu` source
+/// when present, else the texture's plain `source`). This keeps the Sponza (PNG/JPEG) and Bistro (KTX2)
+/// paths on one code path — only the per-image DECODER differs.
 fn load_gltf(path: &Path) -> anyhow::Result<Mesh> {
+    // Read the raw glTF JSON FIRST so we can (a) detect / strip the unsupported `KHR_texture_basisu`
+    // `extensionsRequired` entry that would make `gltf::import` reject the file, and (b) build the
+    // texture-index → image-index map from each texture's `KHR_texture_basisu.source` (the `gltf` crate is
+    // pulled WITHOUT its `extensions` feature, so its typed JSON silently drops that extension — we must read
+    // the raw JSON ourselves). `.glb` (binary) has no external KTX2 textures in our scene set, so it keeps the
+    // plain `gltf::import` path; only the textual `.gltf` Bistro needs the basisu handling.
+    let is_glb = path.extension().and_then(|e| e.to_str()).is_some_and(|e| e.eq_ignore_ascii_case("glb"));
+    if !is_glb
+        && let Some(mesh) = load_gltf_basisu(path)?
+    {
+        return Ok(mesh);
+    }
+
+    // Standard path (Sponza + any glTF whose textures `gltf` can decode itself): unchanged from before.
     let (doc, buffers, images) = gltf::import(path)?;
 
     // Decode every glTF image to RGBA8 once (indexed by image source index).
     let textures: Vec<Texture> = images.iter().map(decode_image).collect();
+    // Texture-index → image-index is identity-via-`source()` on this path (no basisu remap).
+    let tex_to_image: Vec<usize> = doc.textures().map(|t| t.source().index()).collect();
 
     let mut triangles = Vec::new();
     // Walk every scene's node hierarchy with the accumulated world matrix (column-major 4×4 from glTF).
     let scene = doc.default_scene().or_else(|| doc.scenes().next());
     if let Some(scene) = scene {
         for node in scene.nodes() {
-            walk_node(&node, IDENTITY4, &buffers, &textures, &mut triangles);
+            walk_node(&node, IDENTITY4, &buffers, &textures, &tex_to_image, &mut triangles);
         }
     } else {
         // No scene graph: emit meshes at identity (rare; keeps the loader total).
         for mesh in doc.meshes() {
-            emit_mesh_primitives(&mesh, IDENTITY4, &buffers, &textures, &mut triangles);
+            emit_mesh_primitives(&mesh, IDENTITY4, &buffers, &textures, &tex_to_image, &mut triangles);
         }
     }
     Ok(Mesh { triangles, textures })
+}
+
+/// The `KHR_texture_basisu` (KTX2) glTF path: if the document does NOT require that extension, returns `None`
+/// so [`load_gltf`] falls through to the standard `gltf::import` path (Sponza stays byte-for-byte identical).
+/// If it DOES (the Bistro), this:
+///   1. reads the raw JSON, builds `texture index → image index` from each texture's
+///      `extensions.KHR_texture_basisu.source` (fallback the texture's plain `source`) and `image index → uri`,
+///   2. STRIPS `KHR_texture_basisu` from `extensionsRequired` (leaving `extensionsUsed`) and re-parses the
+///      stripped bytes with `gltf` (validation now passes) for the mesh,
+///   3. loads buffers via [`gltf::import_buffers`], then decodes each REFERENCED external `.ktx2` ONCE (by
+///      image index, relative to the glTF dir) with [`ktx2_to_rgba`]; an image that fails to decode becomes an
+///      empty `Texture` so its triangles fall back to `base_color_factor`.
+fn load_gltf_basisu(path: &Path) -> anyhow::Result<Option<Mesh>> {
+    let bytes = std::fs::read(path)?;
+    let root: serde_json::Value = serde_json::from_slice(&bytes)?;
+
+    // Only take over when the file actually requires KHR_texture_basisu — otherwise let the standard path run.
+    let requires_basisu = root
+        .get("extensionsRequired")
+        .and_then(|v| v.as_array())
+        .is_some_and(|a| a.iter().any(|e| e.as_str() == Some("KHR_texture_basisu")));
+    if !requires_basisu {
+        return Ok(None);
+    }
+    println!("  glTF requires KHR_texture_basisu — decoding external KTX2 base colours");
+
+    // (a) texture index → image index (basisu source, fallback plain source).
+    let tex_to_image: Vec<usize> = root
+        .get("textures")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .map(|t| {
+                    t.get("extensions")
+                        .and_then(|e| e.get("KHR_texture_basisu"))
+                        .and_then(|b| b.get("source"))
+                        .or_else(|| t.get("source"))
+                        .and_then(serde_json::Value::as_u64)
+                        .unwrap_or(0) as usize
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    // (b) image index → external URI (relative to the glTF directory).
+    let image_uris: Vec<Option<String>> = root
+        .get("images")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .map(|im| im.get("uri").and_then(|u| u.as_str()).map(str::to_owned))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    // Strip the unsupported required-extension entry, then re-parse with `gltf` (validation passes now). The
+    // `gltf` JSON deserialize ignores unknown texture/image extensions, so the document is well-formed; we
+    // supply the textures ourselves below.
+    let stripped = strip_basisu_required(&bytes)?;
+    let gltf = gltf::Gltf::from_slice(&stripped)
+        .map_err(|e| anyhow::anyhow!("re-parsing the basisu-stripped glTF failed: {e}"))?;
+    let doc = gltf.document;
+    let base = path.parent();
+    let buffers = gltf::import_buffers(&doc, base, gltf.blob)
+        .map_err(|e| anyhow::anyhow!("importing glTF buffers failed: {e}"))?;
+
+    // Decode each external `.ktx2` ONCE, indexed by image index (Bistro has 405 images; one-time, large). An
+    // image with no URI or that fails to decode becomes an empty `Texture` (its triangles flat-fall-back).
+    let dir = base.unwrap_or_else(|| Path::new("."));
+    let mut decoded = 0usize;
+    let mut failed = 0usize;
+    let textures: Vec<Texture> = image_uris
+        .iter()
+        .map(|uri| {
+            let Some(uri) = uri else { return Texture::empty() };
+            let tex_path = dir.join(uri);
+            match std::fs::read(&tex_path) {
+                Ok(raw) => match ktx2_to_rgba(&raw) {
+                    Some(t) => {
+                        decoded += 1;
+                        t
+                    }
+                    None => {
+                        failed += 1;
+                        Texture::empty()
+                    }
+                },
+                Err(e) => {
+                    eprintln!("  ktx2: read {} failed ({e}) — flat factor fallback", tex_path.display());
+                    failed += 1;
+                    Texture::empty()
+                }
+            }
+        })
+        .collect();
+    println!("  KTX2 base colours: {decoded} decoded, {failed} skipped (flat-factor fallback)");
+
+    let mut triangles = Vec::new();
+    let scene = doc.default_scene().or_else(|| doc.scenes().next());
+    if let Some(scene) = scene {
+        for node in scene.nodes() {
+            walk_node(&node, IDENTITY4, &buffers, &textures, &tex_to_image, &mut triangles);
+        }
+    } else {
+        for mesh in doc.meshes() {
+            emit_mesh_primitives(&mesh, IDENTITY4, &buffers, &textures, &tex_to_image, &mut triangles);
+        }
+    }
+    Ok(Some(Mesh { triangles, textures }))
+}
+
+/// Remove `"KHR_texture_basisu"` from the glTF's `extensionsRequired` array (leaving `extensionsUsed`
+/// untouched) and re-serialize, so `gltf`'s validation no longer rejects the file as an unsupported required
+/// extension. Operates on the parsed `serde_json` tree so it's robust to formatting (whitespace / ordering),
+/// not a brittle string edit.
+fn strip_basisu_required(bytes: &[u8]) -> anyhow::Result<Vec<u8>> {
+    let mut root: serde_json::Value = serde_json::from_slice(bytes)?;
+    if let Some(arr) = root.get_mut("extensionsRequired").and_then(|v| v.as_array_mut()) {
+        arr.retain(|e| e.as_str() != Some("KHR_texture_basisu"));
+        if arr.is_empty() {
+            // An empty `extensionsRequired` is valid, but drop it entirely to keep the document tidy.
+            if let Some(obj) = root.as_object_mut() {
+                obj.remove("extensionsRequired");
+            }
+        }
+    }
+    Ok(serde_json::to_vec(&root)?)
 }
 
 /// Column-major 4×4 identity (glTF transform convention).
@@ -269,14 +429,15 @@ fn walk_node(
     parent: [[f32; 4]; 4],
     buffers: &[gltf::buffer::Data],
     textures: &[Texture],
+    tex_to_image: &[usize],
     out: &mut Vec<Triangle>,
 ) {
     let world = mat4_mul(parent, node.transform().matrix());
     if let Some(mesh) = node.mesh() {
-        emit_mesh_primitives(&mesh, world, buffers, textures, out);
+        emit_mesh_primitives(&mesh, world, buffers, textures, tex_to_image, out);
     }
     for child in node.children() {
-        walk_node(&child, world, buffers, textures, out);
+        walk_node(&child, world, buffers, textures, tex_to_image, out);
     }
 }
 
@@ -287,6 +448,7 @@ fn emit_mesh_primitives(
     world: [[f32; 4]; 4],
     buffers: &[gltf::buffer::Data],
     textures: &[Texture],
+    tex_to_image: &[usize],
     out: &mut Vec<Triangle>,
 ) {
     for prim in mesh.primitives() {
@@ -309,9 +471,14 @@ fn emit_mesh_primitives(
             (factor[2].clamp(0.0, 1.0) * 255.0) as u8,
             (factor[3].clamp(0.0, 1.0) * 255.0) as u8,
         ];
+        // Resolve the base-colour TEXTURE index → IMAGE index (via `tex_to_image`, which carries the
+        // `KHR_texture_basisu` remap on the Bistro path and is identity-via-`source()` otherwise), then keep
+        // it only if that image actually decoded (non-empty) — an undecodable KTX2 / missing image falls back
+        // to `base_color_factor`.
         let texture = pbr
             .base_color_texture()
-            .map(|info| info.texture().source().index())
+            .map(|info| info.texture().index())
+            .map(|ti| tex_to_image.get(ti).copied().unwrap_or(ti))
             .filter(|&i| i < textures.len() && textures[i].width > 0);
 
         // Index iterator: explicit indices, or implied 0..n for a non-indexed primitive.
@@ -367,6 +534,123 @@ fn decode_image(img: &gltf::image::Data) -> Texture {
         _ => return Texture { width: 0, height: 0, rgba: Vec::new() },
     }
     Texture { width: w, height: h, rgba }
+}
+
+// ============================================================================================
+// KTX2 / Basis Universal texture decode (KHR_texture_basisu — the Bistro base colours)
+// ============================================================================================
+
+/// Decode a `KHR_texture_basisu` KTX2 image (the Amazon Lumberyard Bistro base colours: `vkFormat = 0`
+/// UASTC blocks, `supercompressionScheme = 2` Zstandard, 2048², a single mip level) to an interleaved RGBA8
+/// [`Texture`]. Returns `None` (caller flat-falls-back to `base_color_factor`) for anything outside that
+/// path — an uncompressed / non-Zstd / non-UASTC KTX2, ETC1S, a `vkFormat ≠ 0` already-GPU format, or a
+/// transcode failure — with a logged note. Only Bistro's UASTC+Zstd path is required, so the decoder is
+/// deliberately narrow; mirrors `bevy_image`'s `ktx2_buffer_to_image` (`D:/bevy-fork/.../ktx2.rs`, the Zstd
+/// supercompression branch + the `TranscodeFormat::Uastc` branch).
+///
+/// CRITICAL: the UASTC source block grid is 4×4 texels (`num_blocks_x = width.div_ceil(4)`), independent of
+/// the OUTPUT format's block size. Bevy slices the input by the OUTPUT format's `block_dimensions` because it
+/// transcodes to a compressed GPU format (ASTC/BC7, also 4×4) — but we transcode to UNCOMPRESSED `RGBA32`
+/// (output "block" 1×1), so reusing the output block size would mis-slice the input. We compute the block
+/// counts from the true UASTC 4×4 grid.
+fn ktx2_to_rgba(bytes: &[u8]) -> Option<Texture> {
+    use basis_universal::{
+        DecodeFlags, LowLevelUastcTranscoder, SliceParametersUastc, TranscoderBlockFormat,
+    };
+    use std::io::Read as _;
+
+    let reader = match ktx2::Reader::new(bytes) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("  ktx2: parse failed ({e:?}) — flat factor fallback");
+            return None;
+        }
+    };
+    let header = reader.header();
+    let (width, height) = (header.pixel_width, header.pixel_height);
+
+    // Only the UASTC-universal layout (vkFormat = VK_FORMAT_UNDEFINED) is transcodable here. A non-zero
+    // vkFormat is an already-decided GPU format (e.g. an uncompressed or BC/ASTC KTX2) we don't handle.
+    if header.format.is_some() {
+        eprintln!(
+            "  ktx2: {width}x{height} has a concrete vkFormat (not UASTC-universal) — flat factor fallback"
+        );
+        return None;
+    }
+    // Single supercompressed level expected. Decompress it (Zstandard only — the Bistro scheme).
+    let level = reader.levels().next()?;
+    let uastc_blocks: Vec<u8> = match header.supercompression_scheme {
+        Some(ktx2::SupercompressionScheme::Zstandard) => {
+            let mut cursor = std::io::Cursor::new(level.data);
+            let mut decoder = match ruzstd::decoding::StreamingDecoder::new(&mut cursor) {
+                Ok(d) => d,
+                Err(e) => {
+                    eprintln!("  ktx2: zstd init failed ({e}) — flat factor fallback");
+                    return None;
+                }
+            };
+            let mut out = Vec::new();
+            if let Err(e) = decoder.read_to_end(&mut out) {
+                eprintln!("  ktx2: zstd decompress failed ({e}) — flat factor fallback");
+                return None;
+            }
+            out
+        }
+        // An uncompressed UASTC KTX2 would carry the blocks verbatim — but the Bistro is always Zstd, so we
+        // only support that one supercompression scheme (the task's required path); anything else falls back.
+        other => {
+            eprintln!(
+                "  ktx2: {width}x{height} supercompression {other:?} unsupported (need Zstandard) — flat factor fallback"
+            );
+            return None;
+        }
+    };
+
+    // Transcode the UASTC 4×4 blocks → uncompressed RGBA8. The block grid is the UASTC 4×4 grid (NOT the
+    // RGBA32 1×1 output "block"): one 16-byte UASTC block per 4×4 texels.
+    let (num_blocks_x, num_blocks_y) = (width.div_ceil(4).max(1), height.div_ceil(4).max(1));
+
+    // BUG WORKAROUND (basis-universal 0.3.1): `transcode_slice` computes the C++ output ROW PITCH as
+    // `original_width / block_width()`, and `block_width()` is a hard-coded 4 for EVERY format — including
+    // the uncompressed `RGBA32`, whose "blocks" are single pixels. The C++ `cRGBA32` writer treats that
+    // pitch as a PIXEL stride and clips each block row to `min(4, pitch - block_x*4)`; with the 4×-too-small
+    // pitch that subtraction goes negative, underflows to a huge `u32`, and the inner loop writes billions of
+    // pixels out of bounds → STATUS_ACCESS_VIOLATION (verified: any image ≥ 8×8 crashes). We can't fix the
+    // wrapper, but its pitch formula is `original_width / 4`, so passing `original_width = width * 4` makes
+    // the emitted pitch exactly `width` PIXELS — the correct uncompressed RGBA8 row stride — while
+    // `original_height` (the row COUNT) and `num_blocks_*` (the source 4×4 grid) stay real. The output is
+    // then the correct, contiguous `width*height*4` RGBA8 buffer (validated below). Mirrors the data Bevy
+    // gets on its GPU path (ASTC/BC7), where the same `/4` happens to be right because those blocks ARE 4×4.
+    let slice = SliceParametersUastc {
+        num_blocks_x,
+        num_blocks_y,
+        has_alpha: true,
+        original_width: width.saturating_mul(4),
+        original_height: height,
+    };
+    let rgba = match LowLevelUastcTranscoder::new().transcode_slice(
+        &uastc_blocks,
+        slice,
+        DecodeFlags::HIGH_QUALITY,
+        TranscoderBlockFormat::RGBA32,
+    ) {
+        Ok(rgba) => rgba,
+        Err(e) => {
+            eprintln!("  ktx2: UASTC→RGBA32 transcode failed ({e:?}) — flat factor fallback");
+            return None;
+        }
+    };
+    // RGBA32 output must be exactly width*height*4 bytes — a guard that also catches the wrapper's pitch math
+    // ever changing under us (it would yield a different length, and we'd fall back rather than ship garbage).
+    let expected = (width as usize) * (height as usize) * 4;
+    if rgba.len() != expected {
+        eprintln!(
+            "  ktx2: {width}x{height} transcoded {} bytes, expected {expected} — flat factor fallback",
+            rgba.len()
+        );
+        return None;
+    }
+    Some(Texture { width, height, rgba })
 }
 
 // ============================================================================================
@@ -1324,5 +1608,80 @@ f 1 3 4
         let baked: usize = data.models.iter().map(|m| m.voxels.len()).sum();
         assert_eq!(baked, pts.len(), "every solid voxel lands in some ≤256³ model");
         assert!(data.models.len() > 1, "a 600³ AABB splits into multiple ≤256³ `.vox` models");
+    }
+
+    /// `strip_basisu_required` removes ONLY the `KHR_texture_basisu` entry from `extensionsRequired` (so
+    /// `gltf` stops rejecting the file) while leaving `extensionsUsed` and every other field intact. A
+    /// purely-synthetic JSON (no external asset needed), so it always runs.
+    #[test]
+    fn strip_basisu_required_drops_only_the_required_entry() {
+        let src = br#"{
+            "asset": {"version": "2.0"},
+            "extensionsUsed": ["KHR_materials_specular", "KHR_texture_basisu"],
+            "extensionsRequired": ["KHR_texture_basisu"],
+            "meshes": []
+        }"#;
+        let stripped = strip_basisu_required(src).expect("strip must succeed");
+        let v: serde_json::Value = serde_json::from_slice(&stripped).expect("stripped JSON re-parses");
+        // The required-extension array is gone (it had only the one entry), so `gltf` validation passes.
+        assert!(v.get("extensionsRequired").is_none(), "the sole required basisu entry is removed");
+        // extensionsUsed is untouched — basisu is still advertised as used (correct: we DID use it offline).
+        let used = v["extensionsUsed"].as_array().expect("extensionsUsed preserved");
+        assert!(used.iter().any(|e| e.as_str() == Some("KHR_texture_basisu")), "extensionsUsed keeps basisu");
+        assert!(used.iter().any(|e| e.as_str() == Some("KHR_materials_specular")), "other ext kept");
+        assert_eq!(v["asset"]["version"], "2.0", "the rest of the document is untouched");
+    }
+
+    /// One real Bistro `.ktx2` base colour decodes to a full 2048×2048 RGBA8 image with non-uniform pixels
+    /// (proves the UASTC+Zstd → RGBA path, not a flat fill). The Bistro textures are gitignored, so this SKIPS
+    /// gracefully when the asset is absent (mirroring the round-trip test's optional-asset convention).
+    #[test]
+    fn ktx2_decodes_a_real_bistro_basecolor() {
+        // A 2048² BaseColor present in the Bistro texture set (see the file listing in #126).
+        let tex = Path::new(
+            "assets/models/src/_gltfassets/Bistro/Textures/Antenna_Metal_BaseColor.ktx2",
+        );
+        if !tex.exists() {
+            eprintln!("SKIP ktx2_decodes_a_real_bistro_basecolor: {} not present (gitignored asset)", tex.display());
+            return;
+        }
+        let bytes = std::fs::read(tex).expect("read the .ktx2");
+        let decoded = ktx2_to_rgba(&bytes).expect("a UASTC+Zstd KTX2 base colour must decode");
+        assert_eq!((decoded.width, decoded.height), (2048, 2048), "full logical extent");
+        assert_eq!(decoded.rgba.len(), 2048 * 2048 * 4, "exactly width*height*4 RGBA8 bytes");
+        // Non-uniform: at least two distinct pixels (a real texture, not a flat-decoded constant).
+        let first = &decoded.rgba[0..4];
+        let differs = decoded.rgba.chunks_exact(4).any(|px| px != first);
+        assert!(differs, "decoded texture has more than one colour (real content, not a flat fill)");
+    }
+
+    /// Bistro-load smoke: `BistroExterior.gltf` loads through the basisu path (the unsupported
+    /// `extensionsRequired` is stripped, KTX2 base colours decode) and a COARSE bake (0.5 m, fast) produces a
+    /// non-empty grid with MANY distinct albedos — proof the textures were decoded per-voxel, not collapsed to
+    /// flat material factors. SKIPS gracefully when the gitignored Bistro asset is absent.
+    #[test]
+    fn bistro_loads_and_bakes_with_decoded_textures() {
+        let gltf = Path::new("assets/models/src/_gltfassets/Bistro/BistroExterior.gltf");
+        if !gltf.exists() {
+            eprintln!("SKIP bistro_loads_and_bakes_with_decoded_textures: {} not present (gitignored asset)", gltf.display());
+            return;
+        }
+        // Loads WITHOUT the "Unsupported extension" rejection (the basisu strip) and decodes KTX2 base colours.
+        let mesh = load_gltf(gltf).expect("Bistro glTF must load via the basisu path");
+        assert!(!mesh.triangles.is_empty(), "Bistro has geometry");
+        // At least some textures decoded to real images (non-empty) — not every image flat-fell-back.
+        let decoded_textures = mesh.textures.iter().filter(|t| t.width > 0).count();
+        assert!(decoded_textures > 0, "at least one KTX2 base colour decoded ({decoded_textures} did)");
+
+        // A coarse 0.5 m bake is fast but still exercises real texture sampling. The grid must be non-empty
+        // with MANY distinct albedos (flat-factor-only would yield a handful of material colours).
+        let grid = voxelize(&mesh, 0.5);
+        assert!(grid.solid_count() > 0, "the coarse Bistro bake is non-empty");
+        let distinct: std::collections::HashSet<[u8; 4]> = grid.albedo.values().copied().collect();
+        assert!(
+            distinct.len() > 100,
+            "decoded textures yield MANY distinct albedos (got {}); flat factors would give few",
+            distinct.len()
+        );
     }
 }

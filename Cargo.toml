@@ -196,6 +196,20 @@ half = "2"
 # dep is the same crate/version, so Cargo unifies it: no second copy).
 gltf = { version = "1.4", default-features = false, features = ["import", "utils", "image"] }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "bmp", "tga"] }
+# KTX2/Basis base-colour TEXTURE DECODE for the offline voxelizer ONLY (`examples/voxelize_scene.rs`),
+# so Bistro Exterior bakes per-voxel albedo from its KTX2 textures (UASTC blocks + Zstd supercompression,
+# `KHR_texture_basisu`) instead of flat factors. `gltf`'s `image` feature can't decode KTX2, so we decode
+# it ourselves the same way Bevy's `bevy_image` does: `ktx2` parses the container/header/levels; `ruzstd`
+# (pure-Rust Zstd, matching Bevy's `zstd_rust` backend — no C toolchain) decompresses the supercompressed
+# level; `basis-universal` transcodes the UASTC 4×4 blocks to RGBA8. `serde_json` reads the raw glTF JSON
+# to map each texture → its `KHR_texture_basisu` KTX2 image and to STRIP the unsupported `extensionsRequired`
+# entry that otherwise makes `gltf::import` reject the file. ALL DEV-only — the shipped `.vox` runtime
+# loader never decodes textures, parses glTF/JSON, or links a Basis transcoder. Versions match `bevy_image`
+# (D:/bevy-fork): ktx2 0.5, basis-universal 0.3, ruzstd 0.8.
+ktx2 = "0.5"
+basis-universal = "0.3"
+ruzstd = "0.8"
+serde_json = "1"
 # Parallel triangle rasterization in the offline voxelizer (`examples/voxelize_scene.rs`): the 13-axis SAT
 # overlap test + per-voxel albedo sample is embarrassingly parallel over triangles, so we fan it across all
 # cores. DEV-only — the shipped runtime `.vox` loader does no voxelization.
