@@ -68,10 +68,18 @@ fn main() -> anyhow::Result<()> {
     // 2. Surface-voxelize (rayon-parallel rasterization; the dominant cost at fine voxel sizes — timed so a
     // bake self-reports where the wall-clock goes).
     let t_vox = std::time::Instant::now();
-    let grid = voxelize(&mesh, voxel_size);
+    let mut grid = voxelize(&mesh, voxel_size);
     println!(
-        "grid: {}×{}×{} voxels, {} solid (voxelize {:.2}s)",
+        "grid: {}×{}×{} voxels, {} surface (voxelize {:.2}s)",
         grid.dims[0], grid.dims[1], grid.dims[2], grid.solid_count(), t_vox.elapsed().as_secs_f32()
+    );
+    // 2b. Fill ENCLOSED interiors solid (always-on): a destructible voxel object must be solid inside so a cut
+    // reveals interior, not empty space. Open / exterior-reachable space stays air (see `solid_fill`).
+    let t_fill = std::time::Instant::now();
+    solid_fill(&mut grid);
+    println!(
+        "  + solid fill: {} total solid (fill {:.2}s)",
+        grid.solid_count(), t_fill.elapsed().as_secs_f32()
     );
 
     // 3. Quantize the sampled albedos to a ≤255 palette.
@@ -471,6 +479,87 @@ fn voxelize(mesh: &Mesh, voxel_size: f32) -> Grid {
         }
     }
     grid
+}
+
+/// Fill ENCLOSED interiors solid (always-on): a destructible voxel object must be solid inside so a cut reveals
+/// interior, not empty space. EXTERIOR flood-fill — everything 6-connected to OUTSIDE the grid stays air; every
+/// air voxel NOT reachable from outside is enclosed interior → made solid. So open / exterior-reachable space
+/// (Sponza's nave, a doorway) stays air; only enclosed interiors (inside walls/columns) fill — "solid where it
+/// should be," not the whole bounding box. Robust for non-watertight meshes: a hole connecting an interior to the
+/// outside leaks that region to air (correct). Interior voxels take the NEAREST surface voxel's albedo (a
+/// multi-source BFS from the surface) so a freshly-cut interior looks like its material; a strata/material system
+/// can reassign them later. Ported from `D:\Projects\asset gen` `_solid_fill` (exterior label → interior = unreached).
+fn solid_fill(grid: &mut Grid) {
+    let [dx, dy, dz] = grid.dims;
+    let total = (dx * dy * dz) as usize;
+    if total == 0 {
+        return;
+    }
+    const N6: [(i32, i32, i32); 6] =
+        [(1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, -1, 0), (0, 0, 1), (0, 0, -1)];
+
+    // 1. EXTERIOR: 6-connected flood through AIR, seeded from every AIR cell on the grid boundary (outside the
+    //    grid is air, so a boundary air cell is exterior). Reached air = exterior; unreached air = enclosed.
+    let mut exterior = vec![false; total];
+    let mut q: std::collections::VecDeque<(i32, i32, i32)> = std::collections::VecDeque::new();
+    for z in 0..dz {
+        for y in 0..dy {
+            for x in 0..dx {
+                if x == 0 || y == 0 || z == 0 || x == dx - 1 || y == dy - 1 || z == dz - 1 {
+                    let i = grid.idx(x, y, z);
+                    if !grid.solid[i] && !exterior[i] {
+                        exterior[i] = true;
+                        q.push_back((x, y, z));
+                    }
+                }
+            }
+        }
+    }
+    while let Some((x, y, z)) = q.pop_front() {
+        for (ox, oy, oz) in N6 {
+            let (nx, ny, nz) = (x + ox, y + oy, z + oz);
+            if nx < 0 || ny < 0 || nz < 0 || nx >= dx || ny >= dy || nz >= dz {
+                continue;
+            }
+            let ni = grid.idx(nx, ny, nz);
+            if !grid.solid[ni] && !exterior[ni] {
+                exterior[ni] = true;
+                q.push_back((nx, ny, nz));
+            }
+        }
+    }
+
+    // 2. Fill the enclosed interior (air && !exterior) solid, colouring each cell with the NEAREST surface
+    //    voxel's albedo via a multi-source 6-connected BFS seeded from the surface (pre-fill solid) cells.
+    //    `filled` is the visited set — surface seeds start visited so they keep their own colour.
+    let mut filled = grid.solid.clone();
+    q.clear();
+    for z in 0..dz {
+        for y in 0..dy {
+            for x in 0..dx {
+                let i = grid.idx(x, y, z);
+                if grid.solid[i] {
+                    q.push_back((x, y, z));
+                }
+            }
+        }
+    }
+    while let Some((x, y, z)) = q.pop_front() {
+        let src = grid.albedo[grid.idx(x, y, z)];
+        for (ox, oy, oz) in N6 {
+            let (nx, ny, nz) = (x + ox, y + oy, z + oz);
+            if nx < 0 || ny < 0 || nz < 0 || nx >= dx || ny >= dy || nz >= dz {
+                continue;
+            }
+            let ni = grid.idx(nx, ny, nz);
+            if !filled[ni] && !exterior[ni] {
+                filled[ni] = true;
+                grid.solid[ni] = true;
+                grid.albedo[ni] = src;
+                q.push_back((nx, ny, nz));
+            }
+        }
+    }
 }
 
 /// The sRGB albedo for a voxel: the triangle's texture sampled at the barycentric UV of the triangle point
@@ -926,5 +1015,48 @@ mod tests {
         ] {
             assert!(distinct.contains(&col), "face colour {col:?} dropped — non-conservative rasterization");
         }
+    }
+
+    /// `solid_fill` closes ENCLOSED interiors but leaves exterior-reachable air alone (the always-on solid
+    /// model): a fully-closed shell gets its hollow filled solid; the same shell with an open face stays hollow
+    /// (the cavity reaches outside). Also checks the filled interior takes a nearby surface colour, not transparent.
+    #[test]
+    fn solid_fill_closes_enclosed_but_keeps_open_air() {
+        let dims = [5, 5, 5];
+        let total = 125usize;
+        // A 3×3×3 box SHELL at [1,3]³ (its 6 faces solid) around a single air cavity at (2,2,2).
+        let build = |open_face: bool| -> Grid {
+            let mut g = Grid { dims, solid: vec![false; total], albedo: vec![[0u8; 4]; total] };
+            for z in 1..=3 {
+                for y in 1..=3 {
+                    for x in 1..=3 {
+                        if x == 1 || x == 3 || y == 1 || y == 3 || z == 1 || z == 3 {
+                            let i = g.idx(x, y, z);
+                            g.solid[i] = true;
+                            g.albedo[i] = [200, 100, 50, 255]; // a surface colour
+                        }
+                    }
+                }
+            }
+            if open_face {
+                let i = g.idx(2, 1, 2); // poke a hole in the -Y face → the cavity reaches outside
+                g.solid[i] = false;
+            }
+            g
+        };
+
+        // CLOSED: the enclosed cavity at (2,2,2) fills solid and takes the nearest surface colour.
+        let mut closed = build(false);
+        let c = closed.idx(2, 2, 2);
+        assert!(!closed.solid[c], "cavity starts air");
+        solid_fill(&mut closed);
+        assert!(closed.solid[c], "closed shell: the enclosed cavity is filled solid");
+        assert_eq!(closed.albedo[c], [200, 100, 50, 255], "interior takes the nearest surface colour");
+
+        // OPEN: the hole connects the cavity to the outside → it stays air (we never fill reachable space).
+        let mut open = build(true);
+        let o = open.idx(2, 2, 2);
+        solid_fill(&mut open);
+        assert!(!open.solid[o], "open shell: a cavity reachable from outside stays air");
     }
 }
