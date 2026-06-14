@@ -49,3 +49,7 @@ imgui.ini
 rust_out.exe
 rust_out.pdb
 .claude/wf-*.mjs
+
+# isolated QA target dir + stray research clone
+/target-qa/
+/tmp_testre-flora/
