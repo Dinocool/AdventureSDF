@@ -116,7 +116,7 @@ fn static_residency_covers_and_bounds_the_scene() {
     let mut mgr = ResidencyManager::new();
     // Camera just above the floor near the column, looking into the scene.
     let cam = [0.4_f32, 1.0, 0.4];
-    mgr.update(cam, &cfg);
+    mgr.update(cam, &cfg, &src);
     assert!(mgr.pending() > 0, "entering the static clipmap enqueues work");
     drain_all(&mut mgr, &cfg, &src, &reg, &edits);
     assert!(mgr.resident_count() > 0, "the floor + column stream in as resident bricks");
@@ -156,7 +156,7 @@ fn resident_bricks_source_from_the_loaded_map() {
 
     let mut mgr = ResidencyManager::new();
     let cam = [0.4_f32, 1.0, 0.4];
-    mgr.update(cam, &cfg);
+    mgr.update(cam, &cfg, &src);
     drain_all(&mut mgr, &cfg, &src, &reg, &edits);
 
     // Every resident LOD0 brick equals the source brick at its key — the residency stored exactly what the
@@ -198,7 +198,7 @@ fn edit_applies_and_repacks_through_the_residency() {
     // Initial residency with NO edits.
     let mut mgr = ResidencyManager::new();
     let cam = [0.4_f32, 1.0, 0.4];
-    mgr.update(cam, &cfg);
+    mgr.update(cam, &cfg, &src);
     drain_all(&mut mgr, &cfg, &src, &reg, &VoxelEdits::new());
     mgr.take_dirty();
     let before = pack_resident_set(&mgr.resident_entries(), &reg);
@@ -252,12 +252,12 @@ fn outside_air_bricks_are_memoized_no_churn() {
     // Place the camera so the clipmap straddles the building EDGE — the footprint ends at x=z=16, so world
     // (15, 1, 15) sits in the near corner with much of the clipmap reaching OUT past the building into air.
     let cam = [15.0_f32, 1.0, 15.0];
-    mgr.update(cam, &cfg);
+    mgr.update(cam, &cfg, &src);
     drain_all(&mut mgr, &cfg, &src, &reg, &edits);
     mgr.take_dirty();
 
     // A re-update at the SAME camera position must enqueue nothing — the resident bricks are still resident and
     // the air bricks are memoized empty (not re-enqueued). This is the no-churn / bounded-static guarantee.
-    mgr.update(cam, &cfg);
+    mgr.update(cam, &cfg, &src);
     assert_eq!(mgr.pending(), 0, "an idle re-update enqueues nothing (resident + empty-memo cover the clipmap)");
 }

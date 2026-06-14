@@ -53,6 +53,7 @@ use adventure::voxel::palette::BlockRegistry;
 use adventure::voxel::streaming::{
     ResidencyManager, StreamingConfig, camera_brick_coord, region_half_extent_m,
 };
+use adventure::voxel::source::WorldgenSource;
 use adventure::voxel::voxelize::voxelize_brick;
 use adventure::voxel::{build_height_layer_pub, load_biome_library_pub};
 use adventure::sdf_render::worldgen::layers::height::HeightLayer;
@@ -216,12 +217,36 @@ fn bench_initial_fill_cold() {
     let cfg = shipping_config();
     let cam = origin_surface_cam(&layer);
 
+    let src = WorldgenSource::new(&layer, &lib, SEED);
     let mut mgr = ResidencyManager::new();
 
     let t_update = Instant::now();
-    mgr.update(cam, &cfg);
+    mgr.update(cam, &cfg, &src);
     let update_ms = t_update.elapsed().as_secs_f64() * 1e3;
     let region = mgr.pending();
+    // SURFACE-FOLLOWING RESIDENCY: how much the classify prune drops at enqueue (the desired clipmap VOLUME vs
+    // the SURFACE-only `pending`). The buried Interior + high-sky Air are never voxelized — `region` (Surface)
+    // is the cold-fill voxelize count, far below the full desired volume.
+    let desired_volume = {
+        use adventure::voxel::source::{BrickClass, BrickSource};
+        let d = adventure::voxel::streaming::desired_clipmap(cam, &cfg);
+        let (mut interior, mut air) = (0usize, 0usize);
+        for k in d.keys() {
+            match src.classify(k.coord, k.lod) {
+                BrickClass::Interior => interior += 1,
+                BrickClass::Air => air += 1,
+                BrickClass::Surface => {}
+            }
+        }
+        eprintln!(
+            "[surface-residency] desired clipmap = {} bricks; classify prunes {interior} Interior + {air} Air \
+             ⇒ only {region} Surface voxelized ({:.2}× fewer cold-fill voxelizations)",
+            d.len(),
+            d.len() as f64 / region.max(1) as f64,
+        );
+        d.len()
+    };
+    let _ = desired_volume;
 
     let mut drain_times = Vec::new();
     let mut pack_times = Vec::new();
@@ -300,10 +325,11 @@ fn bench_steady_state_moving() {
     let (layer, lib, registry, label) = worldgen_stack();
     let cfg = shipping_config();
     let mut cam = origin_surface_cam(&layer);
+    let src = WorldgenSource::new(&layer, &lib, SEED);
 
     // Warm the region fully (untimed).
     let mut mgr = ResidencyManager::new();
-    mgr.update(cam, &cfg);
+    mgr.update(cam, &cfg, &src);
     let mut guard = 0;
     while mgr.pending() > 0 {
         mgr.drain_work(&cfg, &layer, &lib, &registry, SEED);
@@ -348,7 +374,7 @@ fn bench_steady_state_moving() {
 
         let step_t0 = Instant::now();
         let tu = Instant::now();
-        mgr.update(cam, &cfg);
+        mgr.update(cam, &cfg, &src);
         update_times.push(tu.elapsed());
 
         // A Walk shifts only the LOD0 shell; drain until caught up (each drain = one frame), so the per-DRAIN
@@ -425,9 +451,10 @@ fn bench_pack_at_resident_count() {
     let (layer, lib, registry, label) = worldgen_stack();
     let cfg = shipping_config();
     let cam = origin_surface_cam(&layer);
+    let src = WorldgenSource::new(&layer, &lib, SEED);
 
     let mut mgr = ResidencyManager::new();
-    mgr.update(cam, &cfg);
+    mgr.update(cam, &cfg, &src);
     let mut guard = 0;
     while mgr.pending() > 0 {
         mgr.drain_work(&cfg, &layer, &lib, &registry, SEED);
@@ -481,9 +508,10 @@ fn bench_blas_build_at_resident_count() {
     let (layer, lib, registry, label) = worldgen_stack();
     let cfg = shipping_config();
     let cam = origin_surface_cam(&layer);
+    let src = WorldgenSource::new(&layer, &lib, SEED);
 
     let mut mgr = ResidencyManager::new();
-    mgr.update(cam, &cfg);
+    mgr.update(cam, &cfg, &src);
     let mut guard = 0;
     while mgr.pending() > 0 {
         mgr.drain_work(&cfg, &layer, &lib, &registry, SEED);
@@ -628,9 +656,10 @@ fn clipmap_per_move_cost() {
     // Warm the clipmap fully at the origin surface, timing the cold fill (the baseline a dense "recompute
     // everything every move" model would approach on EVERY brick crossing).
     let cam0 = origin_surface_cam(&layer);
+    let src = WorldgenSource::new(&layer, &lib, SEED);
     let mut mgr = ResidencyManager::new();
     let cold_t0 = Instant::now();
-    mgr.update(cam0, &cfg);
+    mgr.update(cam0, &cfg, &src);
     let cold_enqueued = mgr.pending();
     while mgr.pending() > 0 {
         mgr.drain_work(&cfg, &layer, &lib, &registry, SEED);
@@ -647,7 +676,7 @@ fn clipmap_per_move_cost() {
     for _ in 0..8 {
         cam[0] += span0;
         let t_stream = Instant::now();
-        let dropped = mgr.update(cam, &cfg);
+        let dropped = mgr.update(cam, &cfg, &src);
         let entered = mgr.pending();
         while mgr.pending() > 0 {
             mgr.drain_work(&cfg, &layer, &lib, &registry, SEED);
@@ -811,9 +840,10 @@ fn report_storage_bytes_worldgen_slice() {
     let (layer, lib, registry, label) = worldgen_stack();
     let cfg = shipping_config();
     let cam = origin_surface_cam(&layer);
+    let src = WorldgenSource::new(&layer, &lib, SEED);
 
     let mut mgr = ResidencyManager::new();
-    mgr.update(cam, &cfg);
+    mgr.update(cam, &cfg, &src);
     let mut guard = 0;
     while mgr.pending() > 0 {
         mgr.drain_work(&cfg, &layer, &lib, &registry, SEED);
@@ -834,8 +864,9 @@ fn worldgen_stack_is_non_empty() {
     let (layer, lib, registry, _label) = worldgen_stack();
     let cfg = StreamingConfig { clip_half_bricks: 2, max_bricks_per_frame: 1_000_000, ..Default::default() };
     let cam = origin_surface_cam(&layer);
+    let src = WorldgenSource::new(&layer, &lib, SEED);
     let mut mgr = ResidencyManager::new();
-    mgr.update(cam, &cfg);
+    mgr.update(cam, &cfg, &src);
     mgr.drain_work(&cfg, &layer, &lib, &registry, SEED);
     assert!(mgr.resident_count() > 0, "origin-surface clipmap must have non-empty terrain bricks");
     // And the LOD0 brick at the surface is a real, surface-spanning brick (not the uniform fast path).

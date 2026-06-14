@@ -188,7 +188,7 @@ fn merged_map_streams_through_clipmap_and_sources_from_merge() {
 
     // Camera just above scene A's floor at the origin (A is centred on the origin like standalone Sponza).
     let cam = [0.4_f32, 1.0, 0.4];
-    mgr.update(cam, &cfg);
+    mgr.update(cam, &cfg, &src);
     assert!(mgr.pending() > 0, "entering the merged-map clipmap enqueues work");
     while mgr.pending() > 0 {
         mgr.drain_work_from(&cfg, &src, merged_pack_registry(&reg), &edits);

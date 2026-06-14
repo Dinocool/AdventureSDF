@@ -47,7 +47,7 @@ use super::gallery::{GALLERY_SCENES, load_gallery};
 use super::edits::{VoxelEdits, VoxelHit, pick_voxel};
 use super::gpu::{GpuAliasEntry, GpuBrickAabb, GpuBrickPatch, GpuVoxelLight, pack_brickmap, pack_resident_set};
 use super::palette::{BlockId, BlockRegistry, CornellBlock};
-use super::source::{StaticVoxSource, WorldgenSource};
+use super::source::{BrickSource, StaticVoxSource, WorldgenSource};
 use super::streaming::{BrickKey, ResidencyManager, StreamingConfig, camera_brick_coord, region_half_extent_m};
 use super::vox::load_vox;
 use super::{VoxelScene, build_height_layer_pub, load_biome_library_pub};
@@ -468,24 +468,6 @@ fn stream_voxel_rt_residency(
         streaming.packed_edit_gen = Some(edits.generation());
     }
 
-    // Reconcile only when the camera crosses into a new LOD0 brick (a shell could shift), an edit re-queued
-    // bricks, OR there is still pending work to drain. This avoids recomputing the clipmap every idle frame.
-    // The per-move enqueue/drop is O(shell) — only the LOD0 face-slab shifts on a small move; coarse shells
-    // are unchanged.
-    let cam_changed = streaming.last_cam_brick != Some(cam_brick);
-    if cam_changed {
-        let dropped = {
-            let VoxelRtStreaming { manager, cfg, .. } = &mut *streaming;
-            manager.update(cam_world, cfg)
-        };
-        streaming.last_cam_brick = Some(cam_brick);
-        if dropped > 0 {
-            debug!("voxel streaming: dropped {dropped} bricks left behind by camera move");
-        }
-    } else if streaming.manager.pending() == 0 {
-        return; // nothing to do this frame
-    }
-
     // Bounded SOURCING of queued bricks from this scene's BrickSource + the shared edit overlay. Split-borrow
     // the streaming fields so the static `.vox` map (`sponza`) can back the source while the manager drains.
     // The packing PALETTE/registry is scene-specific: worldgen bricks index the worldgen registry; Sponza
@@ -506,36 +488,52 @@ fn stream_voxel_rt_residency(
         gallery_source,
         worldgen_dirty_pending,
         worldgen_frames_since_pack,
+        last_cam_brick,
         ..
     } = &mut *streaming;
-    // The registry whose palette this scene's bricks index (so drain + pack agree on it). Each static scene
-    // indexes its OWN `.vox`-derived palette (Sponza's loaded one, or the Gallery's CONCATENATED merged one),
-    // never the worldgen registry, or the colours would be wrong.
-    let active_registry: &BlockRegistry = match scene_now {
+
+    // The scene's BrickSource — built ONCE here so it backs BOTH `update`'s classify FILTER (the
+    // SURFACE-FOLLOWING RESIDENCY prune) and the drain's sourcing. Worldgen wraps the procedural surface (a
+    // height-based classify that prunes the deep underground + high sky); the static scenes reuse the CACHED
+    // pyramid source (default-Surface classify — the wholly-outside reject already bounds them). The registry
+    // whose palette this scene's bricks index travels alongside (drain + pack must agree on it).
+    let worldgen_source = WorldgenSource::new(layer, lib, *seed);
+    let (source, active_registry): (&dyn BrickSource, &BlockRegistry) = match scene_now {
         VoxelScene::Sponza => {
             // Map + palette + the prebuilt source are ready by here (the source's pyramid was built ONCE on the
             // switch; the missing-asset case returned above). Reuse the CACHED source — never rebuild the
             // pyramid per frame (that was the load-lag root cause).
             let (_, vox_registry) = sponza.as_ref().expect("sponza map loaded before streaming");
-            let source = sponza_source.as_ref().expect("sponza source built on the switch");
-            manager.drain_work_from(cfg, source, vox_registry, &edits);
-            vox_registry
+            let src = sponza_source.as_ref().expect("sponza source built on the switch");
+            (src, vox_registry)
         }
         VoxelScene::Gallery => {
             // The MERGED multi-scene map + its concatenated registry + the prebuilt source are ready by here
             // (the source's pyramid over the whole row was built ONCE on the switch; the empty-merge case
             // returned above). Reuse the CACHED source — never re-merge / re-downsample per frame.
             let (_, vox_registry) = gallery.as_ref().expect("gallery map merged before streaming");
-            let source = gallery_source.as_ref().expect("gallery source built on the switch");
-            manager.drain_work_from(cfg, source, vox_registry, &edits);
-            vox_registry
+            let src = gallery_source.as_ref().expect("gallery source built on the switch");
+            (src, vox_registry)
         }
-        _ => {
-            let source = WorldgenSource::new(layer, lib, *seed);
-            manager.drain_work_from(cfg, &source, registry, &edits);
-            registry
-        }
+        _ => (&worldgen_source, registry),
     };
+
+    // Reconcile only when the camera crosses into a new LOD0 brick (a shell could shift), an edit re-queued
+    // bricks, OR there is still pending work to drain. This avoids recomputing the clipmap every idle frame.
+    // The per-move enqueue/drop is O(shell) — only the LOD0 face-slab shifts on a small move; coarse shells
+    // are unchanged. `update` takes the source so its classify FILTER can prune non-surface bricks at enqueue.
+    let cam_changed = *last_cam_brick != Some(cam_brick);
+    if cam_changed {
+        let dropped = manager.update(cam_world, cfg, source);
+        *last_cam_brick = Some(cam_brick);
+        if dropped > 0 {
+            debug!("voxel streaming: dropped {dropped} bricks left behind by camera move");
+        }
+    } else if manager.pending() == 0 {
+        return; // nothing to do this frame
+    }
+
+    manager.drain_work_from(cfg, source, active_registry, &edits);
 
     // AMORTIZE the O(resident) re-pack (pack_resident_set ~60 ms + the full BLAS rebuild): accumulate "resident
     // set changed" and pack only on a SETTLE (queue drained) OR every WORLDGEN_REPACK_INTERVAL frames during a

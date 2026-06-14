@@ -31,11 +31,36 @@
 use bevy::math::IVec3;
 use rustc_hash::FxHashMap;
 
-use super::brickmap::{BRICK_EDGE, BRICK_VOXELS, Brick, BrickMap, MAX_LOD, voxel_index};
+use super::brickmap::{BRICK_EDGE, BRICK_VOXELS, Brick, BrickMap, MAX_LOD, brick_span, voxel_index};
 use super::palette::{BlockId, BlockRegistry};
 use super::voxelize::voxelize_brick;
 use crate::sdf_render::worldgen::biome::BiomeLibrary;
 use crate::sdf_render::worldgen::layers::height::HeightLayer;
+
+/// The coarse, CHEAP classification of a `(coord, lod)` brick relative to the scene surface — the
+/// SURFACE-FOLLOWING RESIDENCY filter ([`super::streaming::ResidencyManager::update`] keeps only
+/// [`BrickClass::Surface`] bricks resident, pruning the deep-buried interior + the high sky). It is a
+/// conservative geometric predicate computed WITHOUT voxelizing the brick (no `8³` surface evals): a brick
+/// is pruned ONLY when it is PROVABLY unhittable by any primary ray (occluded by the surface, or empty sky),
+/// so the prune is hole-free for band-limited terrain.
+///
+/// The whole point is to bound residency + the per-frame voxelize to the SURFACE SHEET (O(clip_half²)) rather
+/// than the clipmap VOLUME (O(clip_half³)) — the deep underground (millions of bricks at a large `clip_half`)
+/// is never voxelized nor kept resident, because a primary ray hits the surface long before reaching it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BrickClass {
+    /// PROVABLY entirely above the surface (the whole brick AND its `+1`-brick margin are sky) — no solid
+    /// voxel, never a ray hit. Pruned from residency.
+    Air,
+    /// PROVABLY fully buried — this brick AND the brick directly above it are entirely solid, so NO voxel of
+    /// this brick has an exposed (air-adjacent) face. A primary ray hits the shallower surface first, so this
+    /// brick is occluded and never the nearest hit. Pruned from residency.
+    Interior,
+    /// Straddles the surface, or is close enough to it that the conservative margin can't rule out an exposed
+    /// face. KEPT resident + voxelized (the surface shell). The DEFAULT (never-prune) class — any uncertainty
+    /// resolves here, so pruning is conservative by construction.
+    Surface,
+}
 
 /// The single degree of freedom the streaming residency varies per scene: where a `(coord, lod)` brick's
 /// `8³` voxels come from. Implementors return the brick's CORE grid (the halo is added later by the packer
@@ -51,6 +76,24 @@ pub trait BrickSource: Sync {
     /// +brick_span(lod))`; voxel `v`'s world centre is `world_min + (v + 0.5) · lod_voxel_size(lod)`. An
     /// all-air result is dropped by the residency (sparsity) and memoized so it isn't re-sourced.
     fn brick(&self, coord: IVec3, lod: u32, registry: &BlockRegistry) -> Brick;
+
+    /// CHEAP, CONSERVATIVE classification of a `(coord, lod)` brick relative to the surface — the
+    /// SURFACE-FOLLOWING RESIDENCY filter ([`BrickClass`]). MUST NOT voxelize the brick (no `8³` surface
+    /// evals): it is a coarse geometric predicate the residency runs on EVERY desired key per camera move, so
+    /// it has to be far cheaper than `brick`.
+    ///
+    /// The contract is CONSERVATIVE: return [`BrickClass::Surface`] unless the brick is PROVABLY unhittable by
+    /// a primary ray ([`BrickClass::Air`] = entirely above the surface incl. a `+1`-brick margin;
+    /// [`BrickClass::Interior`] = fully buried with the brick above it also fully buried, so no exposed face).
+    /// A brick adjacent to ANY air MUST classify `Surface` — that is what keeps the prune hole-free.
+    ///
+    /// DEFAULT = [`BrickClass::Surface`] (never prune): correct for any finite/static source where the
+    /// wholly-outside reject already bounds residency. Procedural sources (the unbounded worldgen volume)
+    /// override this with a height-based predicate.
+    #[inline]
+    fn classify(&self, _coord: IVec3, _lod: u32) -> BrickClass {
+        BrickClass::Surface
+    }
 }
 
 /// The WORLDGEN brick source: a thin wrapper over `(layer, lib, seed)` that delegates to the
@@ -76,6 +119,63 @@ impl BrickSource for WorldgenSource<'_> {
     #[inline]
     fn brick(&self, coord: IVec3, lod: u32, registry: &BlockRegistry) -> Brick {
         voxelize_brick(coord, lod, self.layer, self.lib, registry, self.seed)
+    }
+
+    /// HEIGHT-BASED conservative classification of a worldgen brick (the SURFACE-FOLLOWING RESIDENCY prune).
+    /// The worldgen surface is a height field: a voxel is solid iff its centre Y is `<= surface_height(x, z)`.
+    /// So a brick's solidity is bounded by the surface min/max over its XZ footprint:
+    ///
+    /// * Sample the surface ([`HeightLayer::sample_world`]`.height`) over the brick's XZ footprint EXPANDED by
+    ///   ONE brick on every side — a `3×3` grid of taps (corners + edge midpoints + centre of the expanded
+    ///   footprint) — and take the conservative `surf_min` / `surf_max`. The `+1`-brick expansion makes the
+    ///   bound cover the halo neighbours' columns too (face-exposure across a brick boundary reads the
+    ///   neighbour), so a brick that is buried but ADJACENT to an exposed column is not mis-pruned.
+    /// * The brick spans world Y `[brick_min_y, brick_max_y) = [coord.y·span, coord.y·span + span)`, `span =
+    ///   brick_span(lod)`.
+    /// * **AIR** iff `brick_min_y >= surf_max + span`: the WHOLE brick (and a `span` margin above the highest
+    ///   surface in the footprint) is above the surface ⇒ every voxel is air ⇒ no ray hit.
+    /// * **INTERIOR** iff `surf_min >= brick_max_y + span`: the LOWEST surface in the footprint is at least one
+    ///   brick-span ABOVE the brick's top ⇒ this brick AND the brick directly above it are FULLY solid ⇒ no
+    ///   voxel of this brick has an air-adjacent (exposed) face ⇒ occluded, never the nearest hit.
+    /// * else **SURFACE** (the surface passes through the brick or its `+1` margin).
+    ///
+    /// The `+span` margins are what make the prune PROVABLY hole-free for band-limited terrain: a brick is
+    /// pruned only when the surface is a full brick-span clear of it (above for Air, below for Interior), so no
+    /// voxel that COULD be exposed is ever dropped. CAVEAT — a STEEP CLIFF whose surface varies by more than
+    /// `span` BETWEEN the `3×3` taps could in principle slip a feature past the conservative min/max. The
+    /// worldgen surface is band-limited (the height layer's tent finalize + the bounded octave amplitudes keep
+    /// `|∇h|` finite), so over the `3·span` expanded footprint at any LOD the surface variation stays within
+    /// the sampled min/max envelope — the taps bracket the true extrema and the `+span` margin absorbs the
+    /// residual, keeping the shell hole-free. (For pathological near-vertical terrain, raise the tap density
+    /// or the margin; the default is safe for the shipping band-limited graphs.)
+    #[inline]
+    fn classify(&self, coord: IVec3, lod: u32) -> BrickClass {
+        let span = brick_span(lod) as f64;
+        let world_min_x = coord.x as f64 * span;
+        let world_min_z = coord.z as f64 * span;
+        let brick_min_y = coord.y as f64 * span;
+        let brick_max_y = brick_min_y + span;
+        // The XZ footprint EXPANDED by one brick on each side: [world_min - span, world_min + 2·span]. Sample a
+        // 3×3 grid over it (the corners, edge midpoints, and centre of the expanded footprint) — corners+centre
+        // is the conservative contract; the extra edge taps only tighten the bracket (more conservative).
+        let mut surf_min = f64::INFINITY;
+        let mut surf_max = f64::NEG_INFINITY;
+        for iz in 0..3 {
+            let wz = world_min_z - span + (iz as f64) * 1.5 * span;
+            for ix in 0..3 {
+                let wx = world_min_x - span + (ix as f64) * 1.5 * span;
+                let h = self.layer.sample_world(wx, wz, self.seed).height as f64;
+                surf_min = surf_min.min(h);
+                surf_max = surf_max.max(h);
+            }
+        }
+        if brick_min_y >= surf_max + span {
+            BrickClass::Air // wholly above the surface (+1-brick margin) ⇒ no solid voxel
+        } else if surf_min >= brick_max_y + span {
+            BrickClass::Interior // brick + the one above it fully buried ⇒ no exposed face
+        } else {
+            BrickClass::Surface // the surface (or its margin) passes through ⇒ keep resident
+        }
     }
 }
 

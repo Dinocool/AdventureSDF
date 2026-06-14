@@ -25,6 +25,7 @@ use adventure::voxel::brickmap::{
 };
 use adventure::voxel::gpu::{ResidentBrick, halo_cells, halo_index, pack_resident_set};
 use adventure::voxel::palette::{BlockId, BlockRegistry};
+use adventure::voxel::source::{BrickClass, BrickSource, WorldgenSource};
 use adventure::voxel::streaming::{
     BrickKey, ResidencyManager, StreamingConfig, brick_lod, camera_brick_coord, camera_brick_coord_lod,
     desired_clipmap, region_half_extent_m,
@@ -220,9 +221,10 @@ fn residency_enters_and_exits_as_camera_moves() {
     let surf = layer.sample_world(0.0, 0.0, SEED).height;
     let cfg = StreamingConfig { clip_half_bricks: 2, max_resident_bricks: 1_000_000, max_bricks_per_frame: 1_000_000 };
 
+    let src = WorldgenSource::new(&layer, &lib, SEED);
     let mut mgr = ResidencyManager::new();
     let cam0 = [0.0_f32, surf, 0.0];
-    mgr.update(cam0, &cfg);
+    mgr.update(cam0, &cfg, &src);
     assert!(mgr.pending() > 0, "entering a fresh clipmap enqueues work");
     assert!(!mgr.is_dirty(), "keep-old: nothing voxelized yet → not dirty");
 
@@ -233,7 +235,7 @@ fn residency_enters_and_exits_as_camera_moves() {
 
     // Move +5 m in X: new bricks enter, far ones drop.
     let cam1 = [5.0_f32, surf, 0.0];
-    let dropped = mgr.update(cam1, &cfg);
+    let dropped = mgr.update(cam1, &cfg, &src);
     assert!(dropped > 0, "moving away drops bricks left behind");
     mgr.drain_work(&cfg, &layer, &lib, &reg, SEED);
     // The snapped box has half-extent up to `half + 1` (snap_even_odd can extend one side by one brick).
@@ -251,9 +253,10 @@ fn empty_sky_bricks_skipped() {
     let reg = registry();
     // A clipmap far ABOVE any terrain → every brick all-air → none become resident.
     let cfg = StreamingConfig { clip_half_bricks: 1, max_resident_bricks: 1_000_000, max_bricks_per_frame: 1_000_000 };
+    let src = WorldgenSource::new(&layer, &lib, SEED);
     let mut mgr = ResidencyManager::new();
     let sky = [0.0_f32, 6400.0, 0.0]; // ~+6.4 km up
-    mgr.update(sky, &cfg);
+    mgr.update(sky, &cfg, &src);
     mgr.drain_work(&cfg, &layer, &lib, &reg, SEED);
     assert_eq!(mgr.resident_count(), 0, "all-air sky bricks are skipped (sparsity)");
     assert!(!mgr.is_dirty(), "an all-empty batch does not reveal geometry → not dirty (keep-old)");
@@ -266,8 +269,9 @@ fn carry_queue_caps_per_frame_work() {
     let reg = registry();
     let surf = layer.sample_world(0.0, 0.0, SEED).height;
     let cfg = StreamingConfig { clip_half_bricks: 3, max_resident_bricks: 1_000_000, max_bricks_per_frame: 50 };
+    let src = WorldgenSource::new(&layer, &lib, SEED);
     let mut mgr = ResidencyManager::new();
-    mgr.update([0.0, surf, 0.0], &cfg);
+    mgr.update([0.0, surf, 0.0], &cfg, &src);
     let total = mgr.pending();
     assert!(total > 50, "the clipmap enqueues more than one frame's budget");
 
@@ -297,9 +301,10 @@ fn per_move_churn_is_o_shell_not_o_region() {
     let half = 6;
     let cfg = StreamingConfig { clip_half_bricks: half, max_resident_bricks: 1_000_000, max_bricks_per_frame: 1_000_000 };
 
+    let src = WorldgenSource::new(&layer, &lib, SEED);
     let mut mgr = ResidencyManager::new();
     let cam0 = [0.5_f32, surf, 0.5];
-    mgr.update(cam0, &cfg);
+    mgr.update(cam0, &cfg, &src);
     while mgr.pending() > 0 {
         mgr.drain_work(&cfg, &layer, &lib, &reg, SEED);
     }
@@ -308,7 +313,7 @@ fn per_move_churn_is_o_shell_not_o_region() {
     // Nudge ONE LOD0 brick in +X (one brick_span(0) = 1.6 m). Count what enters (pending) + what drops.
     let span0 = brick_span(0);
     let cam1 = [cam0[0] + span0, surf, cam0[2]];
-    let dropped = mgr.update(cam1, &cfg);
+    let dropped = mgr.update(cam1, &cfg, &src);
     let entered = mgr.pending();
 
     // A full region recompute would touch ~(2·half+1)³ bricks PER LEVEL. A shell shift touches at most a few
@@ -343,9 +348,10 @@ fn lod_change_is_a_fresh_key() {
     let reg = registry();
     let surf = layer.sample_world(0.0, 0.0, SEED).height;
     let cfg = StreamingConfig { clip_half_bricks: 4, max_resident_bricks: 1_000_000, max_bricks_per_frame: 1_000_000 };
+    let src = WorldgenSource::new(&layer, &lib, SEED);
     let mut mgr = ResidencyManager::new();
     let cam0 = [0.0_f32, surf, 0.0];
-    mgr.update(cam0, &cfg);
+    mgr.update(cam0, &cfg, &src);
     mgr.drain_work(&cfg, &layer, &lib, &reg, SEED);
     mgr.take_dirty();
     let d0 = desired_clipmap(cam0, &cfg);
@@ -355,9 +361,197 @@ fn lod_change_is_a_fresh_key() {
 
     let jump = brick_span(0) * (cfg.clip_half_bricks as f32 * 2.0 + 1.0);
     let cam1 = [jump, surf, 0.0];
-    let dropped = mgr.update(cam1, &cfg);
+    let dropped = mgr.update(cam1, &cfg, &src);
     assert!(dropped > 0, "the fully-shifted clipmap drops the old keys");
     assert!(mgr.pending() > 0, "and enqueues the new keys (fresh voxelize at their LOD)");
+}
+
+// --- surface-following residency (classify prune) -------------------------------------------------
+
+/// The `classify` predicate is CONSERVATIVE + correct: deep-underground ⇒ Interior, a surface-straddling
+/// brick ⇒ Surface, high-sky ⇒ Air, and a brick directly ADJACENT to the surface (one brick above/below the
+/// straddle) ⇒ Surface (it has an exposed face / is reachable). The adversarial target: pruning must never
+/// drop a brick that could have an exposed voxel.
+#[test]
+fn classify_prunes_only_provably_unhittable_bricks() {
+    let layer = test_layer();
+    let lib = test_library();
+    let src = WorldgenSource::new(&layer, &lib, SEED);
+    let span0 = brick_span(0) as f64;
+    // The LOD0 brick coord straddling the surface at the origin column.
+    let surf = layer.sample_world(0.5 * span0, 0.5 * span0, SEED).height as f64;
+    let surf_by = (surf / span0).floor() as i32;
+
+    // The straddle brick itself is Surface.
+    assert_eq!(
+        src.classify(IVec3::new(0, surf_by, 0), 0),
+        BrickClass::Surface,
+        "a surface-straddling brick stays Surface (never pruned)"
+    );
+    // Deep underground (well below the surface, beyond the +1-brick margin) is Interior.
+    assert_eq!(
+        src.classify(IVec3::new(0, surf_by - 50, 0), 0),
+        BrickClass::Interior,
+        "a deep-buried brick (and the brick above it buried) is Interior"
+    );
+    // High sky (well above the surface) is Air.
+    assert_eq!(
+        src.classify(IVec3::new(0, surf_by + 50, 0), 0),
+        BrickClass::Air,
+        "a brick far above the surface is Air"
+    );
+    // The brick DIRECTLY above the straddle (the +1-margin band) must stay Surface — its faces can be exposed.
+    assert_eq!(
+        src.classify(IVec3::new(0, surf_by + 1, 0), 0),
+        BrickClass::Surface,
+        "the brick one above the straddle is within the +1 margin ⇒ Surface (conservative, no hole)"
+    );
+    // And the brick DIRECTLY below the straddle must stay Surface too — its top voxels may abut the air above.
+    assert_eq!(
+        src.classify(IVec3::new(0, surf_by - 1, 0), 0),
+        BrickClass::Surface,
+        "the brick one below the straddle is within the +1 margin ⇒ Surface (no exposed-face hole)"
+    );
+}
+
+/// **The measurement: surface-following residency BOUNDS the resident set to the shell.** With the prune ON,
+/// the cold-filled resident set drops from the clipmap VOLUME (which includes every buried underground brick)
+/// to the surface SHEET. We cold-fill the SAME clipmap with the classify prune ON vs OFF (a default-Surface
+/// source forces prune OFF) and assert the ON set is a strict, large subset — the underground was culled.
+#[test]
+fn prune_bounds_residency_to_the_surface_shell() {
+    let layer = test_layer();
+    let lib = test_library();
+    let reg = registry();
+    let surf = layer.sample_world(0.0, 0.0, SEED).height;
+    // clip_half 5 keeps the non-ignored CI test fast while the volume-vs-shell gap is already large; cap high,
+    // drain unbounded. (The full shipping clip_half-8 BEFORE/AFTER count lives in the `--ignored`
+    // tests/voxel_worldgen_perf harness.)
+    let cfg = StreamingConfig { clip_half_bricks: 5, max_resident_bricks: 10_000_000, max_bricks_per_frame: 10_000_000 };
+    let cam = [0.0_f32, surf, 0.0];
+
+    // PRUNE ON: the real WorldgenSource (height-based classify).
+    let src = WorldgenSource::new(&layer, &lib, SEED);
+    let mut on = ResidencyManager::new();
+    on.update(cam, &cfg, &src);
+    while on.pending() > 0 {
+        on.drain_work(&cfg, &layer, &lib, &reg, SEED);
+    }
+    let resident_on = on.resident_count();
+
+    // PRUNE OFF: a wrapper whose classify is the default (always Surface), so update enqueues the whole volume.
+    struct NoPrune<'a>(WorldgenSource<'a>);
+    impl BrickSource for NoPrune<'_> {
+        fn brick(&self, c: IVec3, lod: u32, r: &BlockRegistry) -> adventure::voxel::brickmap::Brick {
+            self.0.brick(c, lod, r)
+        }
+        // classify defaults to Surface ⇒ no prune.
+    }
+    let src_off = NoPrune(WorldgenSource::new(&layer, &lib, SEED));
+    let mut off = ResidencyManager::new();
+    off.update(cam, &cfg, &src_off);
+    while off.pending() > 0 {
+        off.drain_work(&cfg, &layer, &lib, &reg, SEED);
+    }
+    let resident_off = off.resident_count();
+
+    eprintln!(
+        "[surface-residency] clip_half={} resident: prune OFF (volume incl. underground) = {resident_off}, \
+         prune ON (surface shell) = {resident_on}  ⇒ {:.2}× fewer",
+        cfg.clip_half_bricks,
+        resident_off as f64 / resident_on.max(1) as f64
+    );
+    assert!(resident_on > 0, "the surface shell still has resident bricks");
+    assert!(
+        resident_on < resident_off,
+        "the prune must cull the buried underground (ON {resident_on} < OFF {resident_off})"
+    );
+    // The underground is the bulk of the volume below the surface, so the cull is large (well over 2×).
+    assert!(
+        (resident_on as f64) < 0.75 * resident_off as f64,
+        "surface-following residency must cull a large fraction of the volume (ON {resident_on} vs OFF {resident_off})"
+    );
+    // CONSERVATIVE / HOLE-FREE: every brick resident under the prune is ALSO resident without it (the prune is
+    // purely subtractive — it never adds nor changes a brick, so no surface brick is lost).
+    for e in on.resident_entries() {
+        assert!(
+            off.is_resident(&BrickKey { coord: e.coord, lod: e.lod }),
+            "a pruned-set brick {:?}@lod{} must also be resident without the prune (prune is subtractive)",
+            e.coord,
+            e.lod
+        );
+    }
+}
+
+/// **Dig-reveal: an edit into the ground exposes the pruned interior.** A deep-buried brick classifies
+/// Interior, so `update` PRUNES it (never resident). When the player digs into it, the edit path
+/// (`requeue_keys`) FORCE-enqueues the dug brick + its halo neighbours past the classify-skip and clears them
+/// from the pruned memo — so the dug shell becomes resident (SOLID interior, not a void). We verify the dug
+/// brick + the requeued neighbours stream in and carry solid voxels.
+#[test]
+fn dig_reveals_pruned_interior() {
+    use adventure::voxel::edits::VoxelEdits;
+
+    let layer = test_layer();
+    let lib = test_library();
+    let reg = registry();
+    let surf = layer.sample_world(0.0, 0.0, SEED).height;
+    let span0 = brick_span(0);
+    let cfg = StreamingConfig { clip_half_bricks: 8, max_resident_bricks: 10_000_000, max_bricks_per_frame: 10_000_000 };
+    let cam = [0.0_f32, surf, 0.0];
+    let src = WorldgenSource::new(&layer, &lib, SEED);
+
+    // Cold-fill with the prune ON.
+    let mut mgr = ResidencyManager::new();
+    mgr.update(cam, &cfg, &src);
+    while mgr.pending() > 0 {
+        mgr.drain_work_from(&cfg, &src, &reg, &VoxelEdits::new());
+    }
+    mgr.take_dirty();
+
+    // Pick a buried LOD0 brick a few bricks below the surface (within the clip_half-8 LOD0 box) that the prune
+    // dropped. brick world_min.y = by·span0; choose by so it is ~6 bricks under the surface ⇒ Interior.
+    let surf_by = (surf / span0).floor() as i32;
+    let dug_owner = IVec3::new(0, surf_by - 6, 0);
+    assert_eq!(src.classify(dug_owner, 0), BrickClass::Interior, "the target brick is a pruned Interior brick");
+    assert!(!mgr.is_resident(&BrickKey { coord: dug_owner, lod: 0 }), "the buried brick was pruned (not resident)");
+
+    // DIG: remove a voxel inside that brick (the player carves into the ground). The production edit path then
+    // re-queues the owner + its 6 face neighbours (the halo) so the dug shell reveals.
+    let mut edits = VoxelEdits::new();
+    let dug_voxel = dug_owner * BRICK_EDGE + IVec3::new(4, 4, 4);
+    edits.remove(dug_voxel);
+    let neighbours = [
+        dug_owner,
+        dug_owner + IVec3::X,
+        dug_owner - IVec3::X,
+        dug_owner + IVec3::Y,
+        dug_owner - IVec3::Y,
+        dug_owner + IVec3::Z,
+        dug_owner - IVec3::Z,
+    ];
+    mgr.requeue_keys(neighbours.iter().map(|&coord| BrickKey { coord, lod: 0 }));
+    assert!(mgr.pending() > 0, "the dig force-enqueues the owner + halo neighbours past the classify prune");
+    while mgr.pending() > 0 {
+        mgr.drain_work_from(&cfg, &src, &reg, &edits);
+    }
+
+    // The dug brick is now resident (solid interior minus the carved voxel), AND its neighbours are resident
+    // (still-solid interior exposed by the hole) — no void.
+    let dug = mgr
+        .resident_entries()
+        .into_iter()
+        .find(|e| e.coord == dug_owner && e.lod == 0)
+        .expect("the dug brick is now resident (dig revealed the pruned interior)");
+    let local = dug_voxel - dug_owner * BRICK_EDGE;
+    assert!(dug.brick.get(local.x, local.y, local.z).is_air(), "the carved voxel is now air (the dig)");
+    assert!(!dug.brick.is_empty(), "the dug brick still has solid interior (not a void)");
+    for &coord in &neighbours[1..] {
+        assert!(
+            mgr.is_resident(&BrickKey { coord, lod: 0 }),
+            "the dug brick's neighbour {coord:?} is revealed resident (solid interior, no hole)"
+        );
+    }
 }
 
 // --- packing SSOT ---------------------------------------------------------------------------------

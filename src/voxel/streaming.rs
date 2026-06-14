@@ -46,7 +46,7 @@ use super::brickmap::{Brick, MAX_LOD, brick_span};
 use super::edits::{VoxelEdits, apply_edit_overlay};
 use super::gpu::ResidentBrick;
 use super::palette::BlockRegistry;
-use super::source::{BrickSource, WorldgenSource};
+use super::source::{BrickClass, BrickSource, WorldgenSource};
 use crate::sdf_render::worldgen::biome::BiomeLibrary;
 use crate::sdf_render::worldgen::layers::height::HeightLayer;
 
@@ -331,6 +331,14 @@ pub struct ResidencyManager {
     /// clipmap (`update` prunes keys that leave). Emptiness is per-`(coord, lod)` (a coarse brick samples the
     /// surface at coarse spacing, so it can differ from a finer one — hence the LOD is in the key).
     empty: FxHashSet<BrickKey>,
+    /// CLASSIFY-PRUNED keys in the current clipmap: bricks the [`BrickSource::classify`] filter marked
+    /// non-[`BrickClass::Surface`] (deep-buried interior or high sky), so they were NOT enqueued (the
+    /// SURFACE-FOLLOWING RESIDENCY bound — only the surface shell is voxelized/kept resident). Memoized for the
+    /// SAME reason as `empty`: without it `update` would re-classify the whole clipmap volume (most of it
+    /// non-surface) on EVERY camera move. Bounded to the clipmap (`update` prunes keys that leave); a key
+    /// re-evaluates when it re-enters. An EDIT clears keys here ([`requeue_keys`](Self::requeue_keys)) so a dig
+    /// into a geometrically-Interior brick can still reveal it (the classify is edit-unaware).
+    pruned: FxHashSet<BrickKey>,
     /// True iff the resident set CHANGED since the last `take_dirty` — the render path re-packs + rebuilds
     /// the BLAS/TLAS only then (otherwise it keeps the old, still-valid GPU scene).
     dirty: bool,
@@ -371,14 +379,22 @@ impl ResidencyManager {
     /// Reconcile the resident set toward the desired CLIPMAP around the camera at world position `cam_world`:
     /// * DROP every resident brick no longer in the desired clipmap (a shell shifted / the camera moved) —
     ///   marks dirty.
-    /// * ENQUEUE every desired `(coord, lod)` that is NOT resident — voxelized later by [`drain_work`].
+    /// * ENQUEUE every desired `(coord, lod)` that is NOT resident AND classifies [`BrickClass::Surface`] —
+    ///   voxelized later by [`drain_work`]. Non-surface keys (deep-buried Interior / high sky Air) are PRUNED:
+    ///   skipped + memoized in `pruned` (the SURFACE-FOLLOWING RESIDENCY bound — only the surface SHEET is
+    ///   voxelized + kept resident, so residency + the per-frame voxelize are O(clip_half²), not O(clip_half³)).
+    ///
+    /// `source` supplies the cheap [`BrickSource::classify`] predicate. The classify is an ADDITIVE FILTER on
+    /// top of the exact-tiling [`desired_clipmap`] (which is unchanged — the no-overlap/no-gap tiling holds);
+    /// it only removes provably-unhittable bricks. A finite/static source defaults to `Surface` (never prune),
+    /// so its behaviour is unchanged (the wholly-outside reject + the empty-memo already bound it).
     ///
     /// A LOD change is just a different [`BrickKey`] entering + the old one leaving (different coord grids),
     /// so there is NO retag path — each brick is voxelized at exactly one LOD. Does NOT itself voxelize, so a
     /// huge camera jump only enqueues here (cheap). The per-move enqueue/drop is O(shell): only the bricks
     /// whose key entered/left change, and a small move shifts only the LOD0 shell (coarse shells move
     /// `2^L×` less often). Returns the number of bricks dropped (so the caller can log churn).
-    pub fn update(&mut self, cam_world: [f32; 3], cfg: &StreamingConfig) -> usize {
+    pub fn update(&mut self, cam_world: [f32; 3], cfg: &StreamingConfig, source: &dyn BrickSource) -> usize {
         let desired = desired_clipmap(cam_world, cfg);
         // The EXACT uncapped clipmap size (Σ over levels of |box \ hole|), for the cap-drop log.
         let uncapped = clipmap_uncapped_len(cam_world, cfg.clip_half_bricks);
@@ -393,18 +409,35 @@ impl ResidencyManager {
             dropped += 1;
             self.dirty = true; // the GPU set shrank → must re-pack
         }
-        // Prune the empty-memo to the current clipmap (bounds it as the camera roams; a key that re-enters is
-        // cheaply re-voxelized + re-memoized). Deterministic terrain ⇒ an empty key is always empty.
+        // Prune the empty + classify-pruned memos to the current clipmap (bounds them as the camera roams; a
+        // key that re-enters is cheaply re-evaluated + re-memoized). Deterministic terrain ⇒ an empty/pruned
+        // key is stably so until an EDIT (which clears it via `requeue_keys`).
         self.empty.retain(|k| desired.contains_key(k));
+        self.pruned.retain(|k| desired.contains_key(k));
 
-        // Enqueue each desired brick that is NOT already resident (and not known-empty / already queued).
+        // Enqueue each desired brick that is NOT already resident (and not known-empty / known-pruned / already
+        // queued). The classify FILTER prunes non-surface keys at enqueue time: a deep-buried Interior brick or
+        // a high-sky Air brick is never voxelized nor kept resident (it can't be a primary-ray hit), so the
+        // resident set + the per-frame drain track the SURFACE SHEET, not the clipmap volume. A `Surface` brick
+        // (the default, and any straddle/uncertain case) is enqueued exactly as before — the prune is purely
+        // subtractive, so the exact-tiling residency stays valid.
         for key in desired.keys() {
-            if !self.resident.contains_key(key)
-                && !self.queued.contains(key)
-                && !self.empty.contains(key)
+            if self.resident.contains_key(key)
+                || self.queued.contains(key)
+                || self.empty.contains(key)
+                || self.pruned.contains(key)
             {
-                self.queue.push_back(WorkItem { key: *key });
-                self.queued.insert(*key);
+                continue;
+            }
+            match source.classify(key.coord, key.lod) {
+                BrickClass::Surface => {
+                    self.queue.push_back(WorkItem { key: *key });
+                    self.queued.insert(*key);
+                }
+                BrickClass::Air | BrickClass::Interior => {
+                    // Provably unhittable — prune (memoized so we don't re-classify it every move).
+                    self.pruned.insert(*key);
+                }
             }
         }
         dropped
@@ -522,18 +555,29 @@ impl ResidencyManager {
     }
 
     /// Force a RE-SOURCE of specific keys on the NEXT [`drain_work_from`](Self::drain_work_from): clear them
-    /// from the empty-memo (so a now-solid edit isn't skipped as known-air) and re-enqueue them. It does NOT
-    /// drop the resident entry — the OLD voxelized brick stays resident + bound until the re-source overwrites
-    /// it next drain (keep-old-until-revealed: the camera never sees a hole/flash while the edited brick
-    /// re-sources). Used for UNIFORM editing — an edit names the affected LOD0 bricks (owner + halo neighbours)
-    /// and this re-queues exactly those, so the edit re-sources + re-packs LOCALLY (it ADAPTS, never
-    /// full-clears — the resident set, the GI reservoirs, and the world cache all stay; see
-    /// [[feedback-gi-adapt-not-reset]]). Keys not currently resident are simply enqueued so a place into empty
-    /// space still appears. A key already queued is left as-is (the membership guard avoids a double-enqueue).
-    /// No-op for an empty set.
+    /// from the empty-memo (so a now-solid edit isn't skipped as known-air) AND the classify-pruned memo (so a
+    /// DIG into a geometrically-buried brick isn't skipped as known-Interior), then re-enqueue them. It does
+    /// NOT drop the resident entry — the OLD voxelized brick stays resident + bound until the re-source
+    /// overwrites it next drain (keep-old-until-revealed: the camera never sees a hole/flash while the edited
+    /// brick re-sources).
+    ///
+    /// This is the DIG-REVEAL path, and it deliberately BYPASSES the classify FILTER that [`update`](Self::update)
+    /// applies: the geometric [`BrickSource::classify`] is edit-UNAWARE (it samples the procedural surface, not
+    /// the edit overlay), so a brick dug below the surface is still classified `Interior` and would never be
+    /// enqueued by `update`. By FORCE-enqueueing the edit's owner + halo neighbours here (regardless of class)
+    /// and clearing them from `pruned`, the dug shell — the newly-exposed brick AND its now-exposed neighbours —
+    /// becomes resident, so the dig reveals SOLID interior (not a void). Digging deeper re-fires this per shell,
+    /// progressively revealing the next layer.
+    ///
+    /// Used for UNIFORM editing — an edit names the affected LOD0 bricks (owner + halo neighbours) and this
+    /// re-queues exactly those, so the edit re-sources + re-packs LOCALLY (it ADAPTS, never full-clears — the
+    /// resident set, the GI reservoirs, and the world cache all stay; see [[feedback-gi-adapt-not-reset]]). Keys
+    /// not currently resident are simply enqueued so a place into empty space still appears. A key already
+    /// queued is left as-is (the membership guard avoids a double-enqueue). No-op for an empty set.
     pub fn requeue_keys(&mut self, keys: impl IntoIterator<Item = BrickKey>) {
         for key in keys {
             self.empty.remove(&key);
+            self.pruned.remove(&key); // dig-reveal: a buried brick force-enqueued past the classify prune
             if !self.queued.contains(&key) {
                 self.queue.push_back(WorkItem { key });
                 self.queued.insert(key);
@@ -739,9 +783,10 @@ mod tests {
         let surf = layer.sample_world(0.0, 0.0, SEED).height;
         let cfg = StreamingConfig { clip_half_bricks: 2, max_resident_bricks: 100_000, max_bricks_per_frame: 100_000 };
 
+        let src = WorldgenSource::new(&layer, &lib, SEED);
         let mut mgr = ResidencyManager::new();
         let cam0 = [0.0_f32, surf, 0.0];
-        mgr.update(cam0, &cfg);
+        mgr.update(cam0, &cfg, &src);
         assert!(mgr.pending() > 0, "entering a fresh clipmap enqueues work");
         assert!(!mgr.is_dirty(), "no bricks voxelized yet → not dirty (keep-old)");
 
@@ -752,7 +797,7 @@ mod tests {
 
         // Move the camera +5 m in X (crosses a few LOD0 bricks). New bricks enter, far ones drop.
         let cam1 = [5.0_f32, surf, 0.0];
-        let dropped = mgr.update(cam1, &cfg);
+        let dropped = mgr.update(cam1, &cfg, &src);
         assert!(dropped > 0, "moving away drops the bricks left behind");
         mgr.drain_work(&cfg, &layer, &lib, &reg, SEED);
         // Every resident brick lies within its level's clipmap shell around the new camera.
@@ -774,9 +819,10 @@ mod tests {
         let surf = layer.sample_world(0.0, 0.0, SEED).height;
         let cfg = StreamingConfig { clip_half_bricks: 3, max_resident_bricks: 1_000_000, max_bricks_per_frame: 50 };
 
+        let src = WorldgenSource::new(&layer, &lib, SEED);
         let mut mgr = ResidencyManager::new();
         let cam = [0.0_f32, surf, 0.0];
-        mgr.update(cam, &cfg);
+        mgr.update(cam, &cfg, &src);
         let total = mgr.pending();
         assert!(total > 50, "the clipmap enqueues more than one frame's budget");
 
@@ -806,9 +852,10 @@ mod tests {
         let surf = layer.sample_world(0.0, 0.0, SEED).height;
         let cfg = StreamingConfig { clip_half_bricks: 4, max_resident_bricks: 1_000_000, max_bricks_per_frame: 1_000_000 };
 
+        let src = WorldgenSource::new(&layer, &lib, SEED);
         let mut mgr = ResidencyManager::new();
         let cam0 = [0.0_f32, surf, 0.0];
-        mgr.update(cam0, &cfg);
+        mgr.update(cam0, &cfg, &src);
         mgr.drain_work(&cfg, &layer, &lib, &reg, SEED);
         mgr.take_dirty();
         // Every resident brick is in SOME shell of the desired clipmap (keys are well-formed).
@@ -821,7 +868,7 @@ mod tests {
         // enqueued (a re-key, not a retag).
         let jump = brick_span(0) * (cfg.clip_half_bricks as f32 * 2.0 + 1.0);
         let cam1 = [jump, surf, 0.0];
-        let dropped = mgr.update(cam1, &cfg);
+        let dropped = mgr.update(cam1, &cfg, &src);
         assert!(dropped > 0, "the fully-shifted clipmap drops the old keys");
         assert!(mgr.pending() > 0, "and enqueues the new keys (fresh voxelize at their LOD)");
     }
