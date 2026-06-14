@@ -105,6 +105,11 @@ pub struct VoxelRtStreaming {
     /// reload it per frame — the static scene is packed once from this cache). `None` until the first Sponza
     /// switch; on a load FAILURE it stays `None` and the residency falls back to Cornell (never panics).
     sponza: Option<(BrickMap, BlockRegistry)>,
+    /// The Sponza scene's [`StaticVoxSource`] — its per-LOD MIP PYRAMID (a downsample of the WHOLE building,
+    /// ~hundreds of ms) built ONCE on the Sponza switch and reused every frame. Built here, NOT per-frame in
+    /// the drain: calling `StaticVoxSource::new` in the per-frame sourcing block rebuilt the entire pyramid
+    /// every streaming frame — the Sponza load-lag root cause. `None` off Sponza (freed on a switch away).
+    sponza_source: Option<StaticVoxSource>,
     /// Which scene the last packed patch was built for. `None` until the first pack; on a scene switch this
     /// differs from the live [`VoxelScene`], triggering a one-shot re-pack of the new scene.
     packed_scene: Option<VoxelScene>,
@@ -258,6 +263,7 @@ fn init_voxel_rt_streaming(
         last_cam_brick: None,
         cornell_registry: BlockRegistry::cornell(),
         sponza: None,
+        sponza_source: None,
         packed_scene: None,
         packed_edit_gen: None,
         worldgen_dirty_pending: false,
@@ -362,6 +368,14 @@ fn stream_voxel_rt_residency(
         streaming.worldgen_frames_since_pack = 0;
         streaming.packed_edit_gen = Some(edits.generation());
         streaming.packed_scene = Some(*scene);
+        // Build the Sponza source's mip PYRAMID ONCE here, on the switch — NOT per-frame in the drain below
+        // (that rebuilt the whole-building downsample every streaming frame: the load-lag root cause). It is
+        // owned, so it lives in the resource across frames; worldgen / a switch away from Sponza frees it.
+        streaming.sponza_source = if matches!(*scene, VoxelScene::Sponza) {
+            streaming.sponza.as_ref().map(|(map, _)| StaticVoxSource::new(map))
+        } else {
+            None
+        };
         match *scene {
             VoxelScene::Sponza => {
                 lighting.data = LightingUniformData::sponza();
@@ -439,6 +453,7 @@ fn stream_voxel_rt_residency(
         registry,
         seed,
         sponza,
+        sponza_source,
         worldgen_dirty_pending,
         worldgen_frames_since_pack,
         ..
@@ -446,10 +461,12 @@ fn stream_voxel_rt_residency(
     // The registry whose palette this scene's bricks index (so drain + pack agree on it).
     let active_registry: &BlockRegistry = match scene_now {
         VoxelScene::Sponza => {
-            // The Sponza map + its palette are loaded by here (the missing-asset case returned above).
-            let (map, vox_registry) = sponza.as_ref().expect("sponza map loaded before streaming");
-            let source = StaticVoxSource::new(map);
-            manager.drain_work_from(cfg, &source, vox_registry, &edits);
+            // Map + palette + the prebuilt source are ready by here (the source's pyramid was built ONCE on the
+            // switch; the missing-asset case returned above). Reuse the CACHED source — never rebuild the
+            // pyramid per frame (that was the load-lag root cause).
+            let (_, vox_registry) = sponza.as_ref().expect("sponza map loaded before streaming");
+            let source = sponza_source.as_ref().expect("sponza source built on the switch");
+            manager.drain_work_from(cfg, source, vox_registry, &edits);
             vox_registry
         }
         _ => {
@@ -3389,6 +3406,7 @@ mod tests {
             last_cam_brick: None,
             cornell_registry: BlockRegistry::cornell(),
             sponza: None, // the missing-asset case: never loaded
+            sponza_source: None,
             packed_scene: Some(VoxelScene::Sponza), // already latched on the switch frame
             packed_edit_gen: Some(0),
             worldgen_dirty_pending: false,
