@@ -738,6 +738,52 @@ fn shade(albedo: vec3<f32>, n: vec3<f32>, p: vec3<f32>, emissive: vec3<f32>, see
     return albedo * (ambient + direct) + indirect + glow;
 }
 
+// Distinct, high-contrast colour per LOD ring for the LOD debug view (`debug_view == 7`). Cycles a small
+// palette so adjacent rings always contrast: LOD 0 (finest, native) = green, rising green→yellow→orange→red
+// →magenta→blue→cyan→grey for progressively coarser rings. The instrument for validating clipmap/LOD-ring
+// placement + cross-LOD continuity (GPU-worldgen plan Stages 3–4).
+fn lod_color(lod: u32) -> vec3<f32> {
+    var pal = array<vec3<f32>, 8>(
+        vec3<f32>(0.15, 0.85, 0.25),  // 0 finest — green
+        vec3<f32>(0.95, 0.90, 0.20),  // 1 — yellow
+        vec3<f32>(0.95, 0.55, 0.15),  // 2 — orange
+        vec3<f32>(0.90, 0.20, 0.20),  // 3 — red
+        vec3<f32>(0.85, 0.30, 0.85),  // 4 — magenta
+        vec3<f32>(0.25, 0.55, 0.95),  // 5 — blue
+        vec3<f32>(0.20, 0.85, 0.85),  // 6 — cyan
+        vec3<f32>(0.80, 0.80, 0.80),  // 7+ — grey
+    );
+    return pal[min(lod, 7u)];
+}
+
+// SSOT for the debug-view overlay colour (`debug_view` 1..7), shared by `raymarch`, `restir_p2`, and
+// `restir_dlss_p2` so the three entries can NEVER disagree on a debug mode. `gi` is the caller's own GI-only
+// estimate (the forward `gather_gi` for `raymarch`, the reservoir estimate `restir_p2_core` for the ReSTIR
+// entries) — used only for `debug_view == 5`. Returns black on a miss.
+fn debug_overlay_color(r: TraceResult, ro: vec3<f32>, rd: vec3<f32>, gi: vec3<f32>) -> vec3<f32> {
+    if (r.hit == 0u) { return vec3<f32>(0.0); }
+    let p = ro + rd * r.t;
+    let origin = p + r.normal * light.shadow_bias;
+    if (light.debug_view == 1u) {
+        return r.normal * 0.5 + 0.5;                              // world-space face normals
+    } else if (light.debug_view == 2u) {
+        return vec3<f32>(clamp(r.t / 20.0, 0.0, 1.0));            // depth (0..20 m → black..white)
+    } else if (light.debug_view == 3u) {
+        return r.color.rgb;                                      // raw palette albedo
+    } else if (light.debug_view == 4u) {
+        return vec3<f32>(ambient_occlusion(origin, r.normal));   // AO only
+    } else if (light.debug_view == 5u) {
+        return gi;                                               // indirect (GI) only — caller's estimator
+    } else if (light.debug_view == 6u) {
+        // Face orientation: GREEN = front face (normal opposes the ray); RED = BACK face (normal along the
+        // ray — i.e. we hit the inside/back of a voxel = the show-through bug).
+        return select(vec3<f32>(0.0, 1.0, 0.0), vec3<f32>(1.0, 0.0, 0.0), dot(r.normal, rd) > 0.0);
+    } else if (light.debug_view == 7u) {
+        return lod_color(metas[r.prim].lod);                     // LOD ring of the hit brick
+    }
+    return r.color.rgb;
+}
+
 @compute @workgroup_size(8, 8, 1)
 fn raymarch(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (gid.x >= camera.viewport.x || gid.y >= camera.viewport.y) { return; }
@@ -758,30 +804,14 @@ fn raymarch(@builtin(global_invocation_id) gid: vec3<u32>) {
     // --- Debug overlays (RAW output, no temporal accumulation, so they stay crisp under motion) ----------
     if (light.debug_view != 0u) {
         let dpx = vec2<i32>(i32(gid.x), i32(gid.y));
-        var dbg = vec3<f32>(0.0);
-        if (r.hit != 0u) {
+        var gi = vec3<f32>(0.0);
+        if (r.hit != 0u && light.debug_view == 5u) {
             let p = ro + rd * r.t;
             let origin = p + r.normal * light.shadow_bias;
-            if (light.debug_view == 1u) {
-                dbg = r.normal * 0.5 + 0.5;                                  // world-space face normals
-            } else if (light.debug_view == 2u) {
-                dbg = vec3<f32>(clamp(r.t / 20.0, 0.0, 1.0));                // depth (0..20 m → black..white)
-            } else if (light.debug_view == 3u) {
-                dbg = r.color.rgb;                                          // raw palette albedo
-            } else if (light.debug_view == 4u) {
-                dbg = vec3<f32>(ambient_occlusion(origin, r.normal));       // AO only
-            } else if (light.debug_view == 5u) {
-                let seed = (gid.x * 1973u + gid.y * 9277u + light.frame_index * 26699u) | 1u;
-                dbg = gather_gi(r.normal, origin, seed);                    // indirect (GI) only
-            } else if (light.debug_view == 6u) {
-                // Face orientation: GREEN = front face (normal opposes the ray, correct); RED = BACK face
-                // (normal points ALONG the ray — i.e. we hit the inside/back of a voxel = the show-through bug).
-                dbg = select(vec3<f32>(0.0, 1.0, 0.0), vec3<f32>(1.0, 0.0, 0.0), dot(r.normal, rd) > 0.0);
-            } else {
-                dbg = r.color.rgb;
-            }
+            let seed = (gid.x * 1973u + gid.y * 9277u + light.frame_index * 26699u) | 1u;
+            gi = gather_gi(r.normal, origin, seed);                         // GI-only = forward gather
         }
-        textureStore(out_tex, dpx, vec4<f32>(dbg, 1.0));
+        textureStore(out_tex, dpx, vec4<f32>(debug_overlay_color(r, ro, rd, gi), 1.0));
         return;
     }
 
@@ -899,6 +929,23 @@ fn raymarch_dlss(@builtin(global_invocation_id) gid: vec3<u32>) {
         textureStore(out_normal_roughness, px, vec4<f32>(0.0, 0.0, 0.0, 1.0));
         textureStore(out_dlss_depth, px, vec4<f32>(0.0, 0.0, 0.0, 0.0));
         textureStore(out_dlss_motion, px, vec4<f32>(0.0, 0.0, 0.0, 0.0));
+    }
+
+    // Debug overlay (forward DLSS path): override the colour AFTER the guides; albedo = debug colour so
+    // DLSS-RR passes it through ~unchanged, depth/normal/motion stay real for stable reprojection. Shared
+    // `debug_overlay_color` SSOT; GI-only uses the forward `gather_gi` estimator (matches `raymarch`).
+    if (light.debug_view != 0u) {
+        var gi = vec3<f32>(0.0);
+        if (r.hit != 0u && light.debug_view == 5u) {
+            let p = ro + rd * r.t;
+            let origin = p + r.normal * light.shadow_bias;
+            let seed = (gid.x * 1973u + gid.y * 9277u + light.frame_index * 26699u) | 1u;
+            gi = gather_gi(r.normal, origin, seed);
+        }
+        let dbg = debug_overlay_color(r, ro, rd, gi);
+        textureStore(out_tex, px, vec4<f32>(dbg, 1.0));
+        textureStore(out_diffuse_albedo, px, vec4<f32>(dbg, 1.0));
+        textureStore(out_specular_albedo, px, vec4<f32>(vec3<f32>(0.0), 1.0));
     }
 }
 
@@ -1585,28 +1632,13 @@ fn restir_p2(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     if (light.debug_view != 0u) {
         let dpx = vec2<i32>(i32(gid.x), i32(gid.y));
-        var dbg = vec3<f32>(0.0);
-        if (r.hit != 0u) {
+        var gi = vec3<f32>(0.0);
+        if (r.hit != 0u && light.debug_view == 5u) {
             let p = ro + rd * r.t;
-            let origin = p + r.normal * light.shadow_bias;
-            if (light.debug_view == 1u) {
-                dbg = r.normal * 0.5 + 0.5;
-            } else if (light.debug_view == 2u) {
-                dbg = vec3<f32>(clamp(r.t / 20.0, 0.0, 1.0));
-            } else if (light.debug_view == 3u) {
-                dbg = r.color.rgb;
-            } else if (light.debug_view == 4u) {
-                dbg = vec3<f32>(ambient_occlusion(origin, r.normal));
-            } else if (light.debug_view == 5u) {
-                let seed = (gid.x * 1973u + gid.y * 9277u + light.frame_index * 26699u) | 1u;
-                dbg = restir_p2_core(r.normal, p, gid.xy, seed); // GI-only debug = reservoir estimate
-            } else if (light.debug_view == 6u) {
-                dbg = select(vec3<f32>(0.0, 1.0, 0.0), vec3<f32>(1.0, 0.0, 0.0), dot(r.normal, rd) > 0.0);
-            } else {
-                dbg = r.color.rgb;
-            }
+            let seed = (gid.x * 1973u + gid.y * 9277u + light.frame_index * 26699u) | 1u;
+            gi = restir_p2_core(r.normal, p, gid.xy, seed); // GI-only debug = reservoir estimate
         }
-        textureStore(out_tex, dpx, vec4<f32>(dbg, 1.0));
+        textureStore(out_tex, dpx, vec4<f32>(debug_overlay_color(r, ro, rd, gi), 1.0));
         return;
     }
 
@@ -1663,6 +1695,23 @@ fn restir_dlss_p2(@builtin(global_invocation_id) gid: vec3<u32>) {
         textureStore(out_normal_roughness, px, vec4<f32>(0.0, 0.0, 0.0, 1.0));
         textureStore(out_dlss_depth, px, vec4<f32>(0.0, 0.0, 0.0, 0.0));
         textureStore(out_dlss_motion, px, vec4<f32>(0.0, 0.0, 0.0, 0.0));
+    }
+
+    // Debug overlay (ReSTIR DLSS path): override the colour AFTER the guides; albedo = debug colour so
+    // DLSS-RR passes it through ~unchanged, depth/normal/motion stay real for stable reprojection. Shared
+    // `debug_overlay_color` SSOT; GI-only uses the reservoir estimate `restir_p2_core` (matches `restir_p2`).
+    // This is the fix for "debug views stopped working" — the default DLSS path ignored `debug_view`.
+    if (light.debug_view != 0u) {
+        var gi = vec3<f32>(0.0);
+        if (r.hit != 0u && light.debug_view == 5u) {
+            let p = ro + rd * r.t;
+            let seed = (gid.x * 1973u + gid.y * 9277u + light.frame_index * 26699u) | 1u;
+            gi = restir_p2_core(r.normal, p, gid.xy, seed);
+        }
+        let dbg = debug_overlay_color(r, ro, rd, gi);
+        textureStore(out_tex, px, vec4<f32>(dbg, 1.0));
+        textureStore(out_diffuse_albedo, px, vec4<f32>(dbg, 1.0));
+        textureStore(out_specular_albedo, px, vec4<f32>(vec3<f32>(0.0), 1.0));
     }
 }
 

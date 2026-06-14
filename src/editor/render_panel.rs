@@ -11,7 +11,7 @@ use bevy_egui::egui;
 use crate::voxel::raytrace::{LightingUniformData, SkyUniformData, VoxelRtLighting, VoxelRtSky};
 
 /// Labels for `LightingUniformData.debug_view` (index == the u32 value the shader branches on).
-const DEBUG_LABELS: [&str; 7] = [
+const DEBUG_LABELS: [&str; 8] = [
     "Lit (normal)",
     "Normals",
     "Depth",
@@ -19,6 +19,7 @@ const DEBUG_LABELS: [&str; 7] = [
     "Ambient occlusion",
     "GI only",
     "Face orient (red = BACK face)",
+    "LOD (ring colour)",
 ];
 
 /// The panel body. Registered via `editor::panels::register_panel`.
