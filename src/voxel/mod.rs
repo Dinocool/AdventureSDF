@@ -34,7 +34,7 @@ pub mod voxelize;
 use bevy::math::IVec3;
 use bevy::prelude::*;
 
-use crate::sdf_render::{SdfCamera, SdfOrbitCamera};
+use crate::sdf_render::{SdfCamera, SdfCameraMode, SdfOrbitCamera};
 use crate::sdf_render::worldgen::biome::{BiomeLibrary, BiomeLibraryAsset};
 use crate::sdf_render::worldgen::coord::LayerId;
 use crate::sdf_render::worldgen::layers::erosion::ErosionParams;
@@ -290,6 +290,7 @@ fn reframe_camera_on_patch(
     graph: Res<WorldGraph>,
     biome_shapes: Res<WorldBiomeShapes>,
     mut orbit: ResMut<SdfOrbitCamera>,
+    mut mode: ResMut<SdfCameraMode>,
     mut cam: Query<(Entity, &mut Transform), With<SdfCamera>>,
 ) {
     if reframed.0 {
@@ -300,6 +301,8 @@ fn reframe_camera_on_patch(
     };
     match *scene {
         VoxelScene::Cornell => {
+            // Cornell is a small static box → the ORBIT camera (orbit a point) is the right interaction.
+            mode.fps = false;
             // Frame the OPEN front (−Z) of the box, looking +Z into it, centred so the box fills the view.
             let [cx, cy, cz] = cornell::interior_center_world();
             orbit.target = Vec3::new(cx, cy, cz);
@@ -311,13 +314,26 @@ fn reframe_camera_on_patch(
             *tf = orbit.view_transform();
         }
         VoxelScene::Worldgen => {
+            // Worldgen is a streamed, camera-FOLLOWING world → use the FREE-FLY (FPS) camera, NOT orbit.
+            // Rotating the orbit camera moves the EYE on a ~40 m sphere, so the streaming region (centred on
+            // the eye brick) re-streamed on every rotate ("the whole world regenerates"), and the resident
+            // bubble chased the orbiting eye so the terrain sat at its far edge ("barely see anywhere"). In
+            // free-fly, rotation (right-mouse) is LOOK-only — the eye stays put, so no re-stream — and the eye
+            // sits IN the terrain (the resident region centres on you). WASD/Space/Ctrl fly; wheel = speed.
+            mode.fps = true;
+            mode.yaw = 0.7;
+            mode.pitch = -0.18; // look out + slightly down over the terrain
             let layer = build_height_layer(&height, &erosion, &graph, &biome_shapes);
             let surface_y = layer.sample_world(0.0, 0.0, WORLDGEN_SLICE_SEED).height;
-            orbit.target = Vec3::new(0.0, surface_y, 0.0);
-            orbit.distance = PATCH_HALF_XZ * 2.5; // ~40 m back — the whole patch fits the view
-            orbit.yaw = 0.7;
-            orbit.pitch = 0.45;
-            *tf = orbit.view_transform();
+            let eye = Vec3::new(0.0, surface_y + 10.0, 0.0); // stand ~10 m above the origin ground
+            let forward = Vec3::new(
+                mode.yaw.cos() * mode.pitch.cos(),
+                mode.pitch.sin(),
+                mode.yaw.sin() * mode.pitch.cos(),
+            )
+            .normalize_or_zero();
+            *tf = Transform::from_translation(eye).looking_at(eye + forward, Vec3::Y);
+            orbit.target = eye + forward * orbit.distance; // sensible if the user toggles back to orbit
         }
     }
     // `AmbientLight` is a per-camera component in 0.19 — give the viewport camera a soft ambient so the
