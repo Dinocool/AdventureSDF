@@ -26,8 +26,9 @@
 //!    exceeds 256 on any axis it is SPLIT into a grid of ≤256³ sub-models, each placed by a scene-graph
 //!    Transform (the model CENTER convention), reassembling into one contiguous scene at load.
 //!
-//! RUN: `cargo run --example voxelize_scene` (optionally `-- <out.vox> <voxel_metres> <in_mesh>`), e.g.
-//! `cargo run --example voxelize_scene -- assets/models/sibenik.vox 0.2 assets/models/src/sibenik.obj`.
+//! RUN: `cargo run --example voxelize_scene` (optionally `-- <out.vox> <voxel_metres> <in_mesh> <scale>`), e.g.
+//! `cargo run --example voxelize_scene -- assets/models/sibenik.vox 0.05 assets/models/src/sibenik/sibenik.obj`
+//! (Conference is authored in cm → add a `0.01` 4th arg to land it in metres).
 //!
 //! NOTE on colour space: glTF base-colour textures/factors are sRGB; MagicaVoxel `.vox` palettes are also
 //! sRGB `u8`. So this tool keeps everything in sRGB `u8` end-to-end (no linearization here) — the RUNTIME
@@ -56,9 +57,23 @@ fn main() -> anyhow::Result<()> {
     let voxel_size: f32 = args.next().and_then(|s| s.parse().ok()).unwrap_or(DEFAULT_VOXEL_SIZE);
     // The input mesh path: an explicit 3rd arg, else the default Sponza glTF. Picked by extension (glTF / OBJ).
     let in_path = args.next().map(PathBuf::from).unwrap_or_else(|| PathBuf::from("assets/models/src/Sponza.gltf"));
+    // Optional uniform scale (4th arg) applied to all positions AFTER loading. glTF carries unit scale in its
+    // node transforms (Sponza's 0.008), but OBJ has none — some classic OBJ scenes are authored in cm/mm/other
+    // (e.g. McGuire's Conference spans ~2700 units → needs ~0.01 to land in metres). Default 1.0 (no scale).
+    let scale: f32 = args.next().and_then(|s| s.parse().ok()).unwrap_or(1.0);
 
     // 1. Load the mesh, dispatching on file extension (glTF / OBJ); a procedural fallback room when absent.
-    let mesh = load_mesh(&in_path)?;
+    let mut mesh = load_mesh(&in_path)?;
+    if scale != 1.0 {
+        for t in &mut mesh.triangles {
+            for p in &mut t.p {
+                for x in p.iter_mut() {
+                    *x *= scale;
+                }
+            }
+        }
+        println!("applied uniform scale {scale} to {} triangles", mesh.triangles.len());
+    }
     println!("mesh: {} triangles, {} textures", mesh.triangles.len(), mesh.textures.len());
 
     // 2. Surface-voxelize (rayon-parallel rasterization; the dominant cost at fine voxel sizes — timed so a

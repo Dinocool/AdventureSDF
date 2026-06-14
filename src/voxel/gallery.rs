@@ -68,8 +68,10 @@ pub struct GalleryEntry {
 /// skipped with a `warn!` at load (never a panic), so an un-baked row simply doesn't appear in the merge.
 pub const GALLERY_SCENES: &[GalleryEntry] = &[
     GalleryEntry { vox_path: super::raytrace::SPONZA_VOX_PATH, offset: None, label: "Sponza" },
+    GalleryEntry { vox_path: "assets/models/sibenik.vox", offset: None, label: "Sibenik" },
+    GalleryEntry { vox_path: "assets/models/conference.vox", offset: None, label: "Conference" },
     // Roadmap (uncomment as each is baked — auto-spaced +X with a gap, no offset math needed):
-    // GalleryEntry { vox_path: "assets/models/sibenik.vox",   offset: None, label: "Sibenik" },
+    // GalleryEntry { vox_path: "assets/models/bistro.vox", offset: None, label: "Bistro" }, // needs #126 KTX2
     // GalleryEntry { vox_path: "assets/models/san_miguel.vox", offset: None, label: "San Miguel" },
 ];
 
