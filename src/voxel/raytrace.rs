@@ -43,7 +43,7 @@ use bevy::core_pipeline::prepass::ViewPrepassTextures;
 use super::brickmap::BrickMap;
 use super::cornell::{build_cornell, build_cornell_with_edits};
 use super::edits::{VoxelEdits, VoxelHit, pick_voxel};
-use super::gpu::{GpuBrickAabb, GpuBrickPatch, pack_brickmap, pack_resident_set};
+use super::gpu::{GpuAliasEntry, GpuBrickAabb, GpuBrickPatch, GpuVoxelLight, pack_brickmap, pack_resident_set};
 use super::palette::{BlockId, BlockRegistry, CornellBlock};
 use super::streaming::{ResidencyManager, StreamingConfig, camera_brick_coord, region_half_extent_m};
 use super::vox::load_vox;
@@ -821,6 +821,13 @@ struct VoxelRtResources {
     /// edit / camera move).
     world_cache_initialized: bool,
 
+    /// Phase 2.5 NEE: the emissive-voxel LIGHT LIST + its power-weighted alias table as GPU storage buffers,
+    /// plus the live light COUNT and the patch generation they were built for. Rebuilt (in `prepare_voxel_rt`)
+    /// whenever the patch generation changes — the lights are derived from the resident set, so they follow the
+    /// streamed/edited geometry. `count == 0` ⇒ no emitters ⇒ NEE is skipped (the buffers are 1-long dummies so
+    /// the bind group is always valid; the shader never indexes them). `None` until the first non-empty patch.
+    world_cache_lights: Option<WorldCacheLights>,
+
     /// Phase 2.4 GPU per-pass timing (editor only): the persistent timestamp QuerySet + resolve/read-back
     /// buffers. `None` until the first timed frame allocates it — OR permanently `None` if the device lacks the
     /// TIMESTAMP features (then per-pass timing is reported unavailable once and every pass is dispatched
@@ -892,6 +899,51 @@ struct WorldCacheBuffers {
     active_cells_dispatch: wgpu::Buffer,
 }
 
+/// Phase 2.5 NEE: the emissive-voxel LIGHT LIST GPU buffers (light array + power-weighted alias table) + the
+/// live light count + the patch generation they were built for. Unlike the persistent world-cache buffers
+/// (allocated once, world-space), these are REBUILT whenever the patch generation changes — the lights are
+/// derived from the resident set, so they track the streamed/edited geometry. When the scene has NO emitters
+/// the buffers are 1-long dummies (count 0) so the cache bind group is always valid; the shader skips NEE.
+struct WorldCacheLights {
+    lights: wgpu::Buffer,
+    alias: wgpu::Buffer,
+    /// Number of lights (== `patch.lights.len()`); stamped into `WorldCacheUniform.light_count`. 0 ⇒ NEE off.
+    count: u32,
+}
+
+impl WorldCacheLights {
+    /// Build the light-list buffers from a packed patch's `lights` + `alias`. An EMPTY list (no emitters) is
+    /// uploaded as a single zeroed dummy element each so the storage bindings are never zero-length (wgpu
+    /// rejects a 0-byte storage binding) — `count == 0` makes the shader skip NEE so the dummies are never read.
+    fn new(device: &wgpu::Device, patch: &GpuBrickPatch) -> Self {
+        let count = patch.lights.len() as u32;
+        // Non-empty contents (≥1 element) so the storage buffers are valid even with no emitters.
+        let dummy_light = GpuVoxelLight { pos: [0.0; 3], area: 0.0, radiance: [0.0; 3], inv_pdf: 0.0 };
+        let dummy_alias = GpuAliasEntry { prob: 1.0, alias: 0 };
+        let lights_bytes: Vec<u8> = if patch.lights.is_empty() {
+            bytemuck::bytes_of(&dummy_light).to_vec()
+        } else {
+            bytemuck::cast_slice(&patch.lights).to_vec()
+        };
+        let alias_bytes: Vec<u8> = if patch.alias.is_empty() {
+            bytemuck::bytes_of(&dummy_alias).to_vec()
+        } else {
+            bytemuck::cast_slice(&patch.alias).to_vec()
+        };
+        let lights = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("voxel_rt_nee_lights"),
+            contents: &lights_bytes,
+            usage: wgpu::BufferUsages::STORAGE,
+        });
+        let alias = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("voxel_rt_nee_alias"),
+            contents: &alias_bytes,
+            usage: wgpu::BufferUsages::STORAGE,
+        });
+        Self { lights, alias, count }
+    }
+}
+
 impl WorldCacheBuffers {
     /// Allocate the persistent cache buffers, ZERO-INITIALISED (`mapped_at_creation` zero-fill via wgpu's
     /// default-zeroed mapping is not guaranteed, so we create them un-mapped — wgpu zeroes new buffers — and
@@ -928,12 +980,16 @@ impl WorldCacheBuffers {
     }
 
     /// Build the `group(3)` cache bind group: binding 0 = the per-frame `wc` uniform, bindings 1..=10 = the
-    /// 10 persistent storage buffers (the indirect-dispatch buffer is in its own group 2 — see `dispatch_bg`).
+    /// 10 persistent storage buffers, bindings 15/16 = the Phase-2.5 NEE light list + alias table (the
+    /// indirect-dispatch buffer is in its own group 2 — see `dispatch_bg`). The light buffers are rebuilt per
+    /// patch generation (`WorldCacheLights`); they're always ≥1-long (dummy when no emitters), so the binding
+    /// is valid even with NEE effectively off.
     fn bind_group(
         &self,
         device: &wgpu::Device,
         layout: &wgpu::BindGroupLayout,
         wc_uniform: &wgpu::Buffer,
+        lights: &WorldCacheLights,
     ) -> wgpu::BindGroup {
         device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("voxel_rt_world_cache_bg"),
@@ -950,6 +1006,8 @@ impl WorldCacheBuffers {
                 wgpu::BindGroupEntry { binding: 8, resource: self.b.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 9, resource: self.active_cell_indices.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 10, resource: self.active_cells_count.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 15, resource: lights.lights.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 16, resource: lights.alias.as_entire_binding() },
             ],
         })
     }
@@ -1442,11 +1500,18 @@ pub struct WorldCacheUniformData {
     /// NEVER corrupts the cache (skipped cells are untouched, not cleared). Trade: lower steady GPU cost vs a
     /// slower cache fill (more frames to converge). OFF by default.
     pub max_active_cells_per_frame: u32,
-    /// std140 pad → 64 bytes (four 16-byte rows). `[scalar;N]`/encase-pad foot-guns avoided per the
-    /// GPU-uniform-verify note by naming each pad scalar explicitly. Never read by the shader.
-    pub _pad0: u32,
-    pub _pad1: u32,
-    pub _pad2: u32,
+    /// Phase 2.5 NEE: number of emissive-voxel lights in the bound light list (`0` ⇒ NEE skipped — no emitters).
+    /// Stamped by the render pass from the packed patch's `lights.len()`; never a user knob.
+    pub light_count: u32,
+    /// Phase 2.5 NEE A/B gate (knobs-as-uniforms): `1` = the update pass adds direct emissive-voxel light
+    /// sampling (NEE) with MIS (the live default — the principled firefly/variance fix); `0` = bounce-only (the
+    /// pre-2.5 behaviour: emitters found only by the random cosine bounce). Reversible at runtime; the editor
+    /// slider toggles it. Adapt-not-reset (toggling never clears the cache — stale cells decay + refill).
+    pub nee_enabled: u32,
+    /// Phase 2.5 NEE: shadow-ray light samples per cell update (clamped to `≥1` in-shader). Higher cuts the
+    /// direct-light variance further at a linear shadow-ray cost; `1` is the Solari-class default (the temporal
+    /// blend averages successive frames). A runtime uniform (knobs-as-uniforms).
+    pub nee_samples: u32,
 }
 
 impl Default for WorldCacheUniformData {
@@ -1466,9 +1531,9 @@ impl Default for WorldCacheUniformData {
             view_y: 0.0,
             view_z: 0.0,
             max_active_cells_per_frame: 0, // 2.4 default: UNLIMITED (no behaviour change; cap is opt-in)
-            _pad0: 0,
-            _pad1: 0,
-            _pad2: 0,
+            light_count: 0,                // 2.5: stamped per frame from the packed light list (0 ⇒ NEE skipped)
+            nee_enabled: 1,                // 2.5 default: NEE ON (the principled firefly/variance fix; A/B-gated)
+            nee_samples: 1,                // 2.5 default: 1 shadow ray/cell/frame (the temporal blend averages)
         }
     }
 }
@@ -1612,6 +1677,11 @@ fn init_voxel_rt(mut commands: Commands, render_device: Res<RenderDevice>) {
             storage_rw(8),
             storage_rw(9),
             storage_rw(10),
+            // Phase 2.5 NEE: the emissive-voxel light list (15) + power-weighted alias table (16), read-only.
+            // In `world_cache_layout` (not a new group) so the update pass reads them AND the restir passes —
+            // which share this layout for the cache query — keep a valid (unused) binding.
+            storage_ro(15),
+            storage_ro(16),
         ],
     });
     // The two-pass ReSTIR pipeline layout. group(3) = the world cache: `restir_p1` queries it (read_write — the
@@ -2124,6 +2194,16 @@ fn prepare_voxel_rt(
         ],
     });
 
+    // Phase 2.5 NEE: rebuild the emissive-voxel light list + alias table for this generation (the lights are
+    // derived from the resident set, so they follow streamed/edited geometry). Built alongside the scene swap
+    // so the light list and the BLAS/voxels always describe the SAME generation (never a frame out of sync).
+    let lights = WorldCacheLights::new(device, patch);
+    debug!(
+        "voxel-RT NEE: built light list for gen {} — {} emissive-voxel lights",
+        patch_res.generation, lights.count
+    );
+    resources.world_cache_lights = Some(lights);
+
     // Swap in the new scene atomically (the old `_keep` + bind group drop only now that the new ones are
     // fully built — keep-old-until-revealed).
     resources.scene_bind_group = Some(scene_bind_group);
@@ -2180,13 +2260,23 @@ fn prepare_world_cache(
     // Stamp the camera position so the multi-bounce update-pass cache query (`wc_view_position`) uses the same
     // distance-adaptive cell LOD as the live `reservoir_from_bounce_cached` consumer (which reads `camera`).
     [wc.view_x, wc.view_y, wc.view_z] = cam_pos;
+    // Phase 2.5 NEE: stamp the live light count from the packed list. 0 (no emitters, or the list not yet built)
+    // ⇒ the shader skips NEE cleanly. The `nee_enabled`/`nee_samples` knobs ride in from `settings.data`.
+    wc.light_count = resources.world_cache_lights.as_ref().map(|l| l.count).unwrap_or(0);
     let wc_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("voxel_rt_world_cache_uniform"),
         contents: bytemuck::bytes_of(&wc),
         usage: wgpu::BufferUsages::UNIFORM,
     });
 
+    // The NEE light buffers (bound at cache bindings 15/16). On the very first frames (cache allocated before
+    // the first patch is packed) the list may not exist yet — bind a zeroed dummy so the bind group is valid;
+    // `light_count == 0` then keeps the shader off the dummy. The real list swaps in on the next packed gen.
+    if resources.world_cache_lights.is_none() {
+        resources.world_cache_lights = Some(WorldCacheLights::new(device, &GpuBrickPatch::default()));
+    }
     let cache = resources.world_cache.as_ref().expect("just allocated");
+    let lights = resources.world_cache_lights.as_ref().expect("just ensured");
     let view_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("voxel_rt_world_cache_view_bg"),
         layout: &pipelines.world_cache_view_layout,
@@ -2196,7 +2286,7 @@ fn prepare_world_cache(
         ],
     });
     let dispatch_bg = cache.dispatch_bg(device, &pipelines.world_cache_dispatch_layout);
-    let cache_bg = cache.bind_group(device, &pipelines.world_cache_layout, &wc_buf);
+    let cache_bg = cache.bind_group(device, &pipelines.world_cache_layout, &wc_buf, lights);
     let dispatch_buf = cache.active_cells_dispatch.clone();
     WorldCachePrepared { view_bg, dispatch_bg, cache_bg, dispatch_buf }
 }

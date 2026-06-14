@@ -190,6 +190,29 @@ pub fn render_gi_panel(world: &mut World, ui: &mut egui::Ui) {
                 .weak()
                 .size(11.0),
             );
+
+            // Phase 2.5 A/B gate: NEE (direct emissive-voxel light sampling, MIS-balanced) in the cache update.
+            // The principled firefly/variance fix — emitters are sampled DIRECTLY (a shadow ray per cell) instead
+            // of only being found by the random bounce. Off = the pre-2.5 bounce-only path (higher boil). An edit
+            // never clears the cache either way (adapt-not-reset).
+            let mut nee = wc.data.nee_enabled != 0;
+            if ui.checkbox(&mut nee, "NEE (direct emissive-voxel light sampling + MIS)").changed() {
+                wc.data.nee_enabled = u32::from(nee);
+            }
+            ui.add_enabled_ui(nee, |ui| {
+                ui.add(
+                    egui::Slider::new(&mut wc.data.nee_samples, 1..=8).text("NEE shadow rays / cell / frame"),
+                );
+            });
+            ui.label(
+                egui::RichText::new(
+                    "on = sample emissive voxels DIRECTLY (importance-sampled light list + shadow ray, MIS-combined \
+                     with the bounce ⇒ no double-count) ⇒ far lower emitter variance (the principled clamp \
+                     replacement); off = emitters found only by the random bounce (pre-2.5, more boil)",
+                )
+                .weak()
+                .size(11.0),
+            );
         }
     }
 
@@ -258,10 +281,13 @@ pub fn render_gi_panel(world: &mut World, ui: &mut egui::Ui) {
 
                     ui.separator();
                     if ui.button("Reset world-cache defaults").clicked() {
-                        // Preserve the A/B gates the ReSTIR section owns (use_world_cache / gi_multibounce) +
-                        // the render-pass-stamped fields; reset only the TUNABLE knobs to their defaults.
+                        // Preserve the A/B gates the ReSTIR section owns (use_world_cache / gi_multibounce /
+                        // nee_enabled / nee_samples) + the render-pass-stamped fields; reset only the TUNABLE
+                        // sliders to their defaults.
                         let keep_use = d.use_world_cache;
                         let keep_mb = d.gi_multibounce;
+                        let keep_nee = d.nee_enabled;
+                        let keep_nee_n = d.nee_samples;
                         let def = crate::voxel::raytrace::WorldCacheUniformData::default();
                         d.cell_base_size = def.cell_base_size;
                         d.lod_scale = def.lod_scale;
@@ -271,6 +297,8 @@ pub fn render_gi_panel(world: &mut World, ui: &mut egui::Ui) {
                         d.max_active_cells_per_frame = def.max_active_cells_per_frame;
                         d.use_world_cache = keep_use;
                         d.gi_multibounce = keep_mb;
+                        d.nee_enabled = keep_nee;
+                        d.nee_samples = keep_nee_n;
                     }
                 }
             });

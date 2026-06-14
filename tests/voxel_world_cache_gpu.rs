@@ -127,6 +127,41 @@ struct WcQueryParams {
 
 const N_FRAMES: u32 = 64;
 
+/// Upload a packed patch's Phase-2.5 NEE light list + alias table as storage buffers (cache bindings 15/16).
+/// Always uploads ≥1 element each (a zeroed dummy when the patch has no emitters) so the storage binding is
+/// never zero-length — `wc.light_count == 0` then keeps the shader off the dummies. Mirrors the production
+/// `WorldCacheLights::new`. Returns `(lights_buf, alias_buf, light_count)`.
+fn upload_nee_lights(
+    device: &wgpu::Device,
+    patch: &adventure::voxel::gpu::GpuBrickPatch,
+) -> (wgpu::Buffer, wgpu::Buffer, u32) {
+    use adventure::voxel::gpu::{GpuAliasEntry, GpuVoxelLight};
+    let count = patch.lights.len() as u32;
+    let dummy_light = GpuVoxelLight { pos: [0.0; 3], area: 0.0, radiance: [0.0; 3], inv_pdf: 0.0 };
+    let dummy_alias = GpuAliasEntry { prob: 1.0, alias: 0 };
+    let lights_bytes: Vec<u8> = if patch.lights.is_empty() {
+        bytemuck::bytes_of(&dummy_light).to_vec()
+    } else {
+        bytemuck::cast_slice(&patch.lights).to_vec()
+    };
+    let alias_bytes: Vec<u8> = if patch.alias.is_empty() {
+        bytemuck::bytes_of(&dummy_alias).to_vec()
+    } else {
+        bytemuck::cast_slice(&patch.alias).to_vec()
+    };
+    let lights = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("nee_lights"),
+        contents: &lights_bytes,
+        usage: wgpu::BufferUsages::STORAGE,
+    });
+    let alias = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("nee_alias"),
+        contents: &alias_bytes,
+        usage: wgpu::BufferUsages::STORAGE,
+    });
+    (lights, alias, count)
+}
+
 /// Build the wide-floor + wide-emissive-ceiling scene (a 2-brick gap) so the probe cell's upper hemisphere is
 /// filled by the emitter (closed-form outgoing radiance = R). Mirrors the ReSTIR oracle scene.
 fn emitter_patch(reg: &BlockRegistry) -> adventure::voxel::gpu::GpuBrickPatch {
@@ -146,7 +181,7 @@ fn emitter_patch(reg: &BlockRegistry) -> adventure::voxel::gpu::GpuBrickPatch {
 fn world_cache_converges_to_single_bounce_irradiance() {
     // The cache binds 3 scene storage buffers (group 0) + 12 cache storage buffers (group 3, including the
     // two test-only seed buffers) in one pipeline layout = 15 in a single stage; raise the limit accordingly.
-    let Some((device, queue)) = common::headless_ray_query_device_with_storage_buffers(16) else {
+    let Some((device, queue)) = common::headless_ray_query_device_with_storage_buffers(18) else {
         eprintln!("no ray-query device with 16 storage buffers — skipping world_cache test");
         return;
     };
@@ -398,6 +433,11 @@ fn world_cache_converges_to_single_bounce_irradiance() {
             storage_ro(12),
             storage_rw(13),
             uniform(14),
+            // Phase 2.5 NEE: the emissive-voxel light list (15) + alias table (16), read-only. The shader's
+            // `world_cache_update` now references both, so the group(3) layout must declare them even when the
+            // test runs NEE off (light_count 0 → dummy buffers).
+            storage_ro(15),
+            storage_ro(16),
         ],
     });
     // Layout A — seed + decay + 3 compaction passes (group 2 = dispatch present).
@@ -454,6 +494,10 @@ fn world_cache_converges_to_single_bounce_irradiance() {
         layout: &dispatch_layout,
         entries: &[wgpu::BindGroupEntry { binding: 0, resource: active_cells_dispatch.as_entire_binding() }],
     });
+    // NEE light list (cache bindings 15/16) — this scene has no emitters bound as lights here (the emissive
+    // ceiling fills the cache via the bounce; NEE off → light_count 0 → dummy buffers), so this is the
+    // pipeline-validation dummy.
+    let (nee_lights, nee_alias, _nee_count) = upload_nee_lights(&device, &patch);
     let cache_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("wc_cache_bg"),
         layout: &cache_layout,
@@ -472,6 +516,8 @@ fn world_cache_converges_to_single_bounce_irradiance() {
             wgpu::BindGroupEntry { binding: 12, resource: query_points_buf.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 13, resource: query_out_buf.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 14, resource: query_params_buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 15, resource: nee_lights.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 16, resource: nee_alias.as_entire_binding() },
         ],
     });
 
@@ -699,7 +745,7 @@ const FLOOR_EMISSIVE: f32 = 0.5;
 fn cached_initial_reservoir_adds_albedo_times_cache() {
     // The fill passes bind 16 storage buffers in one stage (3 scene + 11 cache + query_out + dispatch); the
     // energy probe adds ONE more (`energy_out` on group 0) → 17, over the convergence test's 16.
-    let Some((device, queue)) = common::headless_ray_query_device_with_storage_buffers(17) else {
+    let Some((device, queue)) = common::headless_ray_query_device_with_storage_buffers(19) else {
         eprintln!("no ray-query device with 17 storage buffers — skipping energy test");
         return;
     };
@@ -1001,6 +1047,11 @@ fn cached_initial_reservoir_adds_albedo_times_cache() {
             storage_ro(12),
             storage_rw(13),
             uniform(14),
+            // Phase 2.5 NEE: the emissive-voxel light list (15) + alias table (16), read-only. The shader's
+            // `world_cache_update` now references both, so the group(3) layout must declare them even when the
+            // test runs NEE off (light_count 0 → dummy buffers).
+            storage_ro(15),
+            storage_ro(16),
         ],
     });
     // Layout A — seed + decay + 3 compaction passes (group 2 = the indirect-dispatch buffer present).
@@ -1068,6 +1119,8 @@ fn cached_initial_reservoir_adds_albedo_times_cache() {
         layout: &dispatch_layout,
         entries: &[wgpu::BindGroupEntry { binding: 0, resource: active_cells_dispatch.as_entire_binding() }],
     });
+    // NEE light list (cache bindings 15/16) — NEE off (light_count 0) for this energy gate, so the dummy.
+    let (nee_lights, nee_alias, _nee_count) = upload_nee_lights(&device, &patch);
     let cache_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("e_cache_bg"),
         layout: &cache_layout,
@@ -1086,6 +1139,8 @@ fn cached_initial_reservoir_adds_albedo_times_cache() {
             wgpu::BindGroupEntry { binding: 12, resource: query_points_buf.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 13, resource: query_out_buf.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 14, resource: query_params_buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 15, resource: nee_lights.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 16, resource: nee_alias.as_entire_binding() },
         ],
     });
 
@@ -1297,7 +1352,7 @@ const LEAK_VIEW_DIST: f32 = 15.0;
 
 #[test]
 fn thin_wall_no_exterior_leak_with_clamp() {
-    let Some((device, queue)) = common::headless_ray_query_device_with_storage_buffers(16) else {
+    let Some((device, queue)) = common::headless_ray_query_device_with_storage_buffers(18) else {
         eprintln!("no ray-query device with 16 storage buffers — skipping thin-wall leak test");
         return;
     };
@@ -1551,6 +1606,11 @@ fn thin_wall_no_exterior_leak_with_clamp() {
             storage_ro(12),
             storage_rw(13),
             uniform(14),
+            // Phase 2.5 NEE: the emissive-voxel light list (15) + alias table (16), read-only. The shader's
+            // `world_cache_update` now references both, so the group(3) layout must declare them even when the
+            // test runs NEE off (light_count 0 → dummy buffers).
+            storage_ro(15),
+            storage_ro(16),
         ],
     });
     let compact_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -1612,6 +1672,8 @@ fn thin_wall_no_exterior_leak_with_clamp() {
         layout: &dispatch_layout,
         entries: &[wgpu::BindGroupEntry { binding: 0, resource: active_cells_dispatch.as_entire_binding() }],
     });
+    // NEE light list (cache bindings 15/16) — NEE off (light_count 0) for the leak gate, so the dummy.
+    let (nee_lights, nee_alias, _nee_count) = upload_nee_lights(&device, &patch);
     let cache_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("lk_cache_bg"),
         layout: &cache_layout,
@@ -1630,6 +1692,8 @@ fn thin_wall_no_exterior_leak_with_clamp() {
             wgpu::BindGroupEntry { binding: 12, resource: query_points_buf.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 13, resource: query_out_buf.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 14, resource: query_params_buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 15, resource: nee_lights.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 16, resource: nee_alias.as_entire_binding() },
         ],
     });
 
@@ -2096,6 +2160,11 @@ fn run_box_fill(
             storage_ro(12),
             storage_rw(13),
             uniform(14),
+            // Phase 2.5 NEE: the emissive-voxel light list (15) + alias table (16), read-only. The shader's
+            // `world_cache_update` now references both, so the group(3) layout must declare them even when the
+            // test runs NEE off (light_count 0 → dummy buffers).
+            storage_ro(15),
+            storage_ro(16),
         ],
     });
     let compact_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -2156,6 +2225,8 @@ fn run_box_fill(
         layout: &dispatch_layout,
         entries: &[wgpu::BindGroupEntry { binding: 0, resource: active_cells_dispatch.as_entire_binding() }],
     });
+    // NEE light list (cache bindings 15/16) — NEE off (light_count 0) for the multi-bounce gate, so the dummy.
+    let (nee_lights, nee_alias, _nee_count) = upload_nee_lights(device, &patch);
     let cache_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("mb_cache_bg"),
         layout: &cache_layout,
@@ -2174,6 +2245,8 @@ fn run_box_fill(
             wgpu::BindGroupEntry { binding: 12, resource: query_points_buf.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 13, resource: query_out_buf.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 14, resource: query_params_buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 15, resource: nee_lights.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 16, resource: nee_alias.as_entire_binding() },
         ],
     });
 
@@ -2254,7 +2327,7 @@ fn run_box_fill(
 
 #[test]
 fn multibounce_exceeds_single_bounce_and_stays_bounded() {
-    let Some((device, queue)) = common::headless_ray_query_device_with_storage_buffers(16) else {
+    let Some((device, queue)) = common::headless_ray_query_device_with_storage_buffers(18) else {
         eprintln!("no ray-query device with 16 storage buffers — skipping multi-bounce test");
         return;
     };
@@ -2344,7 +2417,7 @@ fn multibounce_exceeds_single_bounce_and_stays_bounded() {
 ///     that the generous cap tracks unlimited FAR more tightly than the tight cap does.
 #[test]
 fn active_cell_cap_never_corrupts_and_is_noop_when_generous() {
-    let Some((device, queue)) = common::headless_ray_query_device_with_storage_buffers(16) else {
+    let Some((device, queue)) = common::headless_ray_query_device_with_storage_buffers(18) else {
         eprintln!("no ray-query device with 16 storage buffers — skipping active-cell-cap test");
         return;
     };
@@ -2398,5 +2471,515 @@ fn active_cell_cap_never_corrupts_and_is_noop_when_generous() {
         tight.iter().any(|o| luma(o.radiance) > 0.05),
         "the rotating soft cap must SERVICE every active cell over time — the tight-capped floor cell never lit \
          (luma ~0 across all {N_FRAMES} frames), so the window is NOT rotating (cells beyond N are starved)"
+    );
+}
+
+// === Phase 2.5 NEE variance-reduction gate: direct emissive-voxel light sampling = the principled clamp =====
+//
+// NEE (next-event estimation) samples the emissive-voxel LIGHT LIST DIRECTLY (`wc_sample_light_nee`, MIS-
+// balanced against the cosine bounce) so a cell finds emitters WITHOUT relying on a random bounce catching one.
+// This is the principled replacement for the discarded firefly clamp: with NEE OFF a cell whose hemisphere a
+// SMALL bright emitter subtends catches it in only a small FRACTION of cosine bounces, so the per-frame radiance
+// has high COUNT VARIANCE (it "boils") — exactly the variance the clamp used to band-aid (biasedly). With NEE ON
+// every frame's update samples the emitter directly, so the direct-light term is (near-)deterministic → far
+// lower frame-to-frame variance. Because NEE is an UNBIASED estimator (area-light pdf + MIS, no double-count),
+// the CONVERGED MEAN must MATCH the bounce-only mean — only the variance / convergence speed changes.
+//
+// SCENE (engineered so the bounce rarely catches the emitter): a wide DARK floor (sun off, ambient 0, dark sky
+// ⇒ a bounce that misses the emitter returns ~0) with a SMALL emissive patch offset to one SIDE and ABOVE, so an
+// up-facing floor cell's cosine hemisphere only occasionally bounces into it (high count variance for bounce-
+// only). The emitter is bright so it dominates the cell's radiance.
+//
+// ASSERTS: (1) both NEE-on and NEE-off converge to the SAME tail mean (NEE is unbiased — the converged value is
+// the bounce-only value, proving NEE is a variance fix not an energy change); (2) NEE-on's frame-to-frame
+// radiance VARIANCE (over the converged tail) is materially BELOW NEE-off's (the principled clamp replacement).
+
+/// A small bright emissive block id for the NEE scene (material 2 = "emit", made emissive below). A SMALL,
+/// OFFSET emitter so the bounce rarely catches it (the variance the NEE direct sample collapses).
+const NEE_EMIT_RADIANCE: f32 = 8.0;
+
+/// Build the NEE variance scene: a wide dark floor (y=0, x,z ∈ -3..=3) with a SMALL emissive patch (a single
+/// emissive brick) offset to +X and raised to y=4 so it subtends a modest solid angle from the probe floor cell
+/// at the origin — an up-facing cosine bounce there only occasionally hits it (the bounce-only variance). The
+/// floor is non-emissive and the rest of the hemisphere is dark, so the cell's radiance is the emitter alone.
+fn nee_variance_patch(reg: &BlockRegistry) -> adventure::voxel::gpu::GpuBrickPatch {
+    let floor = solid(FLOOR);
+    let emit = solid(EMITTER);
+    let mut entries: Vec<ResidentBrick> = Vec::new();
+    for bx in -3..=3i32 {
+        for bz in -3..=3i32 {
+            entries.push(ResidentBrick { coord: IVec3::new(bx, 0, bz), brick: &floor, lod: 0 });
+        }
+    }
+    // One small emissive brick, offset in +X and raised, so it is a SMALL off-axis light (low bounce-hit rate).
+    entries.push(ResidentBrick { coord: IVec3::new(2, 4, 0), brick: &emit, lod: 0 });
+    pack_resident_set(&entries, reg)
+}
+
+/// Drive the full world-cache pass sequence for `frames` frames on the NEE scene with NEE `on`/`off`, returning
+/// the per-frame read-back of the probe FLOOR cell. The light list (cache bindings 15/16) is the REAL packed
+/// emissive-voxel list, so NEE samples the actual emitter voxels. NEE off (`nee_enabled = 0`) reproduces the
+/// pre-2.5 bounce-only behaviour on the same scene (the control). Mirrors the convergence harness.
+fn run_nee_fill(device: &wgpu::Device, queue: &wgpu::Queue, nee_on: bool, frames: u32) -> Vec<WcQueryOut> {
+    let mut reg = BlockRegistry::from_biome_library(&test_library());
+    reg.set_emissive(EMITTER, [NEE_EMIT_RADIANCE, NEE_EMIT_RADIANCE, NEE_EMIT_RADIANCE]);
+    let patch = nee_variance_patch(&reg);
+    let n = patch.brick_count() as u32;
+    let (nee_lights, nee_alias, light_count) = upload_nee_lights(device, &patch);
+    assert!(light_count > 0, "the NEE scene must pack at least one emissive-voxel light");
+
+    // Sun off, ambient 0, dark sky ⇒ the ONLY light is the emissive patch; a bounce that misses it returns ~0.
+    let light = LightingUniformData {
+        sun_direction: [0.0, 1.0, 0.0],
+        ambient_color: [0.0, 0.0, 0.0],
+        gi_rays: 1,
+        gi_intensity: 1.0,
+        gi_bounce_dist: 40.0,
+        emissive_strength: 4.0,
+        ..LightingUniformData::default()
+    };
+    let sky = SkyUniformData {
+        horizon_color: [0.0, 0.0, 0.0],
+        zenith_color: [0.0, 0.0, 0.0],
+        ground_color: [0.0, 0.0, 0.0],
+        sun_size: 0.0,
+        intensity: 0.0,
+        gi_sky_intensity: 0.0,
+        sun_tint: [0.0, 0.0, 0.0],
+        _pad: 0.0,
+    };
+    let wc_defaults = WorldCacheUniformData {
+        cell_base_size: 0.3,
+        gi_ray_distance: 40.0,
+        cell_lifetime: 8,
+        // Phase 2.5 NEE A/B: ON adds the direct light sample; OFF is the bounce-only control. Single-bounce
+        // (multibounce off) so the cell's radiance is purely the emitter's direct contribution — the cleanest
+        // signal for the variance comparison (no feed-forward fill mixing in).
+        gi_multibounce: 0,
+        nee_enabled: u32::from(nee_on),
+        nee_samples: 1,
+        light_count,
+        ..WorldCacheUniformData::default()
+    };
+
+    let s = BRICK_WORLD_SIZE;
+    let floor_top = s;
+    // The probe: an up-facing floor cell at the origin column (the emitter is offset to +X above it).
+    let probe = WcQueryPoint {
+        world_position: [s * 0.5, floor_top, s * 0.5],
+        _p0: 0,
+        world_normal: [0.0, 1.0, 0.0],
+        _p1: 0,
+    };
+    let probes = [probe];
+    let n_points = probes.len() as u32;
+    let view_position = [s * 0.5, floor_top + 3.0, s * 0.5];
+
+    // --- Scene (group 0) ---
+    let aabb_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("nv_aabbs"),
+        contents: bytemuck::cast_slice(&patch.aabbs),
+        usage: wgpu::BufferUsages::BLAS_INPUT | wgpu::BufferUsages::STORAGE,
+    });
+    let meta_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("nv_metas"),
+        contents: bytemuck::cast_slice(&patch.metas),
+        usage: wgpu::BufferUsages::STORAGE,
+    });
+    let voxel_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("nv_voxels"),
+        contents: bytemuck::cast_slice(&patch.voxels),
+        usage: wgpu::BufferUsages::STORAGE,
+    });
+    let palette_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("nv_palette"),
+        contents: bytemuck::cast_slice(&patch.palette),
+        usage: wgpu::BufferUsages::STORAGE,
+    });
+
+    let size_desc = wgpu::BlasAABBGeometrySizeDescriptor {
+        primitive_count: n,
+        flags: wgpu::AccelerationStructureGeometryFlags::OPAQUE,
+    };
+    let blas = device.create_blas(
+        &wgpu::CreateBlasDescriptor {
+            label: Some("nv_blas"),
+            flags: wgpu::AccelerationStructureFlags::PREFER_FAST_TRACE,
+            update_mode: wgpu::AccelerationStructureUpdateMode::Build,
+        },
+        wgpu::BlasGeometrySizeDescriptors::AABBs { descriptors: vec![size_desc.clone()] },
+    );
+    let mut tlas = device.create_tlas(&wgpu::CreateTlasDescriptor {
+        label: Some("nv_tlas"),
+        flags: wgpu::AccelerationStructureFlags::PREFER_FAST_TRACE,
+        update_mode: wgpu::AccelerationStructureUpdateMode::Build,
+        max_instances: 1,
+    });
+    tlas[0] = Some(wgpu::TlasInstance::new(
+        &blas,
+        [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0],
+        0,
+        0xff,
+    ));
+
+    // --- Persistent cache buffers (zero ⇒ all cells empty) ---
+    let tsz = TEST_WORLD_CACHE_SIZE as u64;
+    let zeroed = |label: &str, bytes: u64, indirect: bool| {
+        let mut usage = wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST;
+        if indirect {
+            usage |= wgpu::BufferUsages::INDIRECT;
+        }
+        let buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some(label),
+            size: bytes,
+            usage,
+            mapped_at_creation: false,
+        });
+        queue.write_buffer(&buf, 0, &vec![0u8; bytes as usize]);
+        buf
+    };
+    let checksums = zeroed("nv_checksums", tsz * 4, false);
+    let life = zeroed("nv_life", tsz * 4, false);
+    let radiance = zeroed("nv_radiance", tsz * 16, false);
+    let geometry = zeroed("nv_geometry", tsz * 32, false);
+    let luminance_deltas = zeroed("nv_luminance_deltas", tsz * 4, false);
+    let new_radiance = zeroed("nv_new_radiance", tsz * 16, false);
+    let a = zeroed("nv_a", tsz * 4, false);
+    let b = zeroed("nv_b", 1024 * 4, false);
+    let active_cell_indices = zeroed("nv_active_cell_indices", tsz * 4, false);
+    let active_cells_count = zeroed("nv_active_cells_count", 4, false);
+    let active_cells_dispatch = zeroed("nv_active_cells_dispatch", 12, true);
+
+    // --- Uniforms + test buffers ---
+    let wc_uniform = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("nv_wc_uniform"),
+        size: mem::size_of::<WorldCacheUniformData>() as u64,
+        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    let light_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("nv_light"),
+        contents: bytemuck::bytes_of(&light),
+        usage: wgpu::BufferUsages::UNIFORM,
+    });
+    let sky_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("nv_sky"),
+        contents: bytemuck::bytes_of(&sky),
+        usage: wgpu::BufferUsages::UNIFORM,
+    });
+    let query_points_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("nv_query_points"),
+        contents: bytemuck::cast_slice(&probes),
+        usage: wgpu::BufferUsages::STORAGE,
+    });
+    let query_out_buf = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("nv_query_out"),
+        size: (n_points as u64) * mem::size_of::<WcQueryOut>() as u64,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        mapped_at_creation: false,
+    });
+    let query_params_buf = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("nv_query_params"),
+        size: mem::size_of::<WcQueryParams>() as u64,
+        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    let read_buf = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("nv_read"),
+        size: (n_points as u64) * mem::size_of::<WcQueryOut>() as u64,
+        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+
+    // --- Layouts (identical to the convergence test, with the NEE 15/16 bindings) ---
+    let storage_rw = |binding: u32| wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::COMPUTE,
+        ty: wgpu::BindingType::Buffer {
+            ty: wgpu::BufferBindingType::Storage { read_only: false },
+            has_dynamic_offset: false,
+            min_binding_size: None,
+        },
+        count: None,
+    };
+    let storage_ro = |binding: u32| wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::COMPUTE,
+        ty: wgpu::BindingType::Buffer {
+            ty: wgpu::BufferBindingType::Storage { read_only: true },
+            has_dynamic_offset: false,
+            min_binding_size: None,
+        },
+        count: None,
+    };
+    let uniform = |binding: u32| wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::COMPUTE,
+        ty: wgpu::BindingType::Buffer {
+            ty: wgpu::BufferBindingType::Uniform,
+            has_dynamic_offset: false,
+            min_binding_size: None,
+        },
+        count: None,
+    };
+
+    let scene_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("nv_scene_layout"),
+        entries: &[
+            wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::AccelerationStructure { vertex_return: false },
+                count: None,
+            },
+            storage_ro(1),
+            storage_ro(2),
+            storage_ro(3),
+        ],
+    });
+    let view_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("nv_view_layout"),
+        entries: &[uniform(2), uniform(11)],
+    });
+    let dispatch_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("nv_dispatch_layout"),
+        entries: &[storage_rw(0)],
+    });
+    let cache_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("nv_cache_layout"),
+        entries: &[
+            uniform(0),
+            storage_rw(1),
+            storage_rw(2),
+            storage_rw(3),
+            storage_rw(4),
+            storage_rw(5),
+            storage_rw(6),
+            storage_rw(7),
+            storage_rw(8),
+            storage_rw(9),
+            storage_rw(10),
+            storage_ro(12),
+            storage_rw(13),
+            uniform(14),
+            storage_ro(15),
+            storage_ro(16),
+        ],
+    });
+    let compact_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("nv_compact_pl"),
+        bind_group_layouts: &[Some(&scene_layout), Some(&view_layout), Some(&dispatch_layout), Some(&cache_layout)],
+        immediate_size: 0,
+    });
+    let update_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("nv_update_pl"),
+        bind_group_layouts: &[Some(&scene_layout), Some(&view_layout), None, Some(&cache_layout)],
+        immediate_size: 0,
+    });
+
+    let src = adventure::voxel::raytrace::voxel_raytrace_shader_src(TEST_WORLD_CACHE_SIZE);
+    let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("voxel_raytrace"),
+        source: wgpu::ShaderSource::Wgsl(src.into()),
+    });
+    let mk = |entry: &str, layout: &wgpu::PipelineLayout| {
+        device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some(entry),
+            layout: Some(layout),
+            module: &module,
+            entry_point: Some(entry),
+            compilation_options: Default::default(),
+            cache: None,
+        })
+    };
+    let p_seed = mk("world_cache_query_seed", &compact_pl);
+    let p_decay = mk("world_cache_decay", &compact_pl);
+    let p_csb = mk("world_cache_compact_single_block", &compact_pl);
+    let p_cb = mk("world_cache_compact_blocks", &compact_pl);
+    let p_cwa = mk("world_cache_compact_write_active", &compact_pl);
+    let p_update = mk("world_cache_update", &update_pl);
+    let p_blend = mk("world_cache_blend", &update_pl);
+
+    // --- Bind groups ---
+    let scene_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("nv_scene_bg"),
+        layout: &scene_layout,
+        entries: &[
+            wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::AccelerationStructure(&tlas) },
+            wgpu::BindGroupEntry { binding: 1, resource: meta_buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 2, resource: voxel_buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 3, resource: palette_buf.as_entire_binding() },
+        ],
+    });
+    let view_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("nv_view_bg"),
+        layout: &view_layout,
+        entries: &[
+            wgpu::BindGroupEntry { binding: 2, resource: light_buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 11, resource: sky_buf.as_entire_binding() },
+        ],
+    });
+    let dispatch_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("nv_dispatch_bg"),
+        layout: &dispatch_layout,
+        entries: &[wgpu::BindGroupEntry { binding: 0, resource: active_cells_dispatch.as_entire_binding() }],
+    });
+    let cache_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("nv_cache_bg"),
+        layout: &cache_layout,
+        entries: &[
+            wgpu::BindGroupEntry { binding: 0, resource: wc_uniform.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 1, resource: checksums.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 2, resource: life.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 3, resource: radiance.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 4, resource: geometry.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 5, resource: luminance_deltas.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 6, resource: new_radiance.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 7, resource: a.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 8, resource: b.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 9, resource: active_cell_indices.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 10, resource: active_cells_count.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 12, resource: query_points_buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 13, resource: query_out_buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 14, resource: query_params_buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 15, resource: nee_lights.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 16, resource: nee_alias.as_entire_binding() },
+        ],
+    });
+
+    let mut build = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("nv_build") });
+    build.build_acceleration_structures(
+        iter::once(&wgpu::BlasBuildEntry {
+            blas: &blas,
+            geometry: wgpu::BlasGeometries::AabbGeometries(vec![wgpu::BlasAabbGeometry {
+                size: &size_desc,
+                stride: mem::size_of::<adventure::voxel::gpu::GpuBrickAabb>() as wgpu::BufferAddress,
+                aabb_buffer: &aabb_buf,
+                primitive_offset: 0,
+            }]),
+        }),
+        iter::once(&tlas),
+    );
+    queue.submit(Some(build.finish()));
+
+    let table_groups = TEST_WORLD_CACHE_SIZE / 1024;
+    let mut history: Vec<WcQueryOut> = Vec::with_capacity(frames as usize);
+    for frame in 0..frames {
+        let mut wc = wc_defaults;
+        wc.frame_index = frame.wrapping_mul(5782582).wrapping_add(1);
+        wc.reset = u32::from(frame == 0);
+        queue.write_buffer(&wc_uniform, 0, bytemuck::bytes_of(&wc));
+        let qp = WcQueryParams { view_position, n_points, frame_index: wc.frame_index, ray_t: 0.0, _p1: 0, _p2: 0 };
+        queue.write_buffer(&query_params_buf, 0, bytemuck::bytes_of(&qp));
+
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        {
+            let mut cpass =
+                encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: None, timestamp_writes: None });
+            cpass.set_bind_group(0, Some(&scene_bg), &[]);
+            cpass.set_bind_group(1, Some(&view_bg), &[]);
+            cpass.set_bind_group(2, Some(&dispatch_bg), &[]);
+            cpass.set_bind_group(3, Some(&cache_bg), &[]);
+            cpass.set_pipeline(&p_seed);
+            cpass.dispatch_workgroups(n_points.div_ceil(64), 1, 1);
+            cpass.set_pipeline(&p_decay);
+            cpass.dispatch_workgroups(table_groups, 1, 1);
+            cpass.set_pipeline(&p_csb);
+            cpass.dispatch_workgroups(table_groups, 1, 1);
+            cpass.set_pipeline(&p_cb);
+            cpass.dispatch_workgroups(1, 1, 1);
+            cpass.set_pipeline(&p_cwa);
+            cpass.dispatch_workgroups(table_groups, 1, 1);
+            cpass.set_bind_group(2, None, &[]);
+            cpass.set_pipeline(&p_update);
+            cpass.dispatch_workgroups_indirect(&active_cells_dispatch, 0);
+            cpass.set_pipeline(&p_blend);
+            cpass.dispatch_workgroups_indirect(&active_cells_dispatch, 0);
+        }
+        encoder.copy_buffer_to_buffer(
+            &query_out_buf,
+            0,
+            &read_buf,
+            0,
+            (n_points as u64) * mem::size_of::<WcQueryOut>() as u64,
+        );
+        queue.submit(Some(encoder.finish()));
+
+        let slice = read_buf.slice(..);
+        slice.map_async(wgpu::MapMode::Read, |r| r.expect("map failed"));
+        device.poll(wgpu::PollType::wait_indefinitely()).expect("poll failed");
+        let data = slice.get_mapped_range().unwrap();
+        let out: WcQueryOut = *bytemuck::from_bytes(&data[..mem::size_of::<WcQueryOut>()]);
+        drop(data);
+        read_buf.unmap();
+        history.push(out);
+    }
+    let _ = (&aabb_buf, &blas, &tlas);
+    history
+}
+
+#[test]
+fn nee_matches_bounce_only_mean_with_lower_variance() {
+    // 18 storage in one stage (3 scene + 13 cache incl. the 12/13 test seed + 15/16 NEE lights).
+    let Some((device, queue)) = common::headless_ray_query_device_with_storage_buffers(18) else {
+        eprintln!("no ray-query device with 18 storage buffers — skipping NEE variance test");
+        return;
+    };
+
+    let frames = 96u32; // a longer run so both estimators reach their tail mean (bounce-only converges slower)
+    let bounce_only = run_nee_fill(&device, &queue, false, frames);
+    let with_nee = run_nee_fill(&device, &queue, true, frames);
+
+    // The CONVERGED tail mean of each (the last quarter — both have settled by then).
+    let tail = (frames as usize) * 3 / 4;
+    let mean = |h: &[WcQueryOut]| -> f32 {
+        let t = &h[tail..];
+        t.iter().map(|o| luma(o.radiance)).sum::<f32>() / t.len() as f32
+    };
+    // Frame-to-frame variance over the SAME converged tail (the boil measure).
+    let var = |h: &[WcQueryOut]| -> f32 {
+        let t = &h[tail..];
+        let m = t.iter().map(|o| luma(o.radiance)).sum::<f32>() / t.len() as f32;
+        t.iter().map(|o| (luma(o.radiance) - m).powi(2)).sum::<f32>() / t.len() as f32
+    };
+    let bo_mean = mean(&bounce_only);
+    let nee_mean = mean(&with_nee);
+    let bo_var = var(&bounce_only);
+    let nee_var = var(&with_nee);
+    eprintln!(
+        "[nee] bounce-only mean={bo_mean:.4} var={bo_var:.6} | NEE mean={nee_mean:.4} var={nee_var:.6} | \
+         mean rel-diff={:.3} var ratio NEE/bounce={:.3}",
+        (nee_mean - bo_mean).abs() / bo_mean.max(1e-6),
+        nee_var / bo_var.max(1e-9)
+    );
+
+    // --- Sanity: the bounce-only control actually CONVERGED to a meaningful, finite radiance (the emitter is
+    //     reached by SOME bounces), else the comparison is vacuous. ---
+    assert!(
+        bo_mean > 1e-2 && bo_mean.is_finite(),
+        "the bounce-only control must accumulate a non-trivial emitter radiance (got {bo_mean:.4}) — the scene \
+         must let SOME cosine bounces catch the emitter"
+    );
+
+    // --- (1) UNBIASED: NEE converges to the SAME mean as bounce-only. NEE is an unbiased estimator (area-light
+    //     pdf + MIS, no double-count), so the converged value is the bounce-only value — NEE changes the
+    //     VARIANCE, not the energy. A generous tolerance absorbs the residual boil + atomic jitter in the means
+    //     themselves; the point is they agree, not that either is bit-exact. This is the proof NEE is a
+    //     principled clamp REPLACEMENT (same converged image), not a brightness change. ---
+    let mean_rel = (nee_mean - bo_mean).abs() / bo_mean.max(1e-6);
+    assert!(
+        mean_rel < 0.20,
+        "NEE must converge to the SAME mean as bounce-only (unbiased): bounce-only {bo_mean:.4} vs NEE \
+         {nee_mean:.4} (rel {mean_rel:.3}) — a large gap would mean NEE changed the ENERGY, not just the variance"
+    );
+
+    // --- (2) LOWER VARIANCE: NEE's frame-to-frame radiance variance over the converged tail is materially below
+    //     bounce-only's — the direct light sample collapses the count variance the bounce-only estimator boils
+    //     with (the variance the discarded firefly clamp used to band-aid). This is the principled fix. ---
+    assert!(
+        nee_var < bo_var * 0.6,
+        "NEE must materially REDUCE the per-frame radiance variance vs bounce-only (the boil the clamp masked): \
+         bounce-only var={bo_var:.6} vs NEE var={nee_var:.6} (NEE/bounce {:.3}, need < 0.6)",
+        nee_var / bo_var.max(1e-9)
     );
 }

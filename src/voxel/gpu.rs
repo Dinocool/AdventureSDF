@@ -143,6 +143,56 @@ pub struct GpuPaletteColor {
     pub emissive: [f32; 4],
 }
 
+/// One EMISSIVE-VOXEL LIGHT (Phase 2.5 NEE). Built CPU-side from the resident set: every emissive voxel
+/// (palette `emissive·strength > 0`) on the air-exposed surface becomes one light, so the world-cache update
+/// pass can sample emitters DIRECTLY (next-event estimation) instead of only finding them by random bounce —
+/// the principled variance / firefly fix. 32 bytes (`pos` 16 + `radiance` 16), `bytemuck`-uploadable.
+///
+/// The light is treated as a small AREA light = the emissive voxel's world cell: `pos` is the voxel CENTRE and
+/// `area` is one voxel FACE area (`cell²`) at the voxel's LOD (the solid-angle measure the shader uses for the
+/// area-light pdf). The shader applies the runtime `emissive_strength` knob to `radiance` so it stays the
+/// per-block palette emissive SSOT (never pre-baked here — knobs-as-uniforms).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Pod, Zeroable)]
+pub struct GpuVoxelLight {
+    /// World-metre position of the emissive voxel CENTRE (the area light's reference point).
+    pub pos: [f32; 3],
+    /// One voxel FACE area at the voxel's LOD, in m² (`cell_size²`). The area measure for the NEE pdf
+    /// (`inverse_pdf = area · light_count`), so a coarse (larger) emissive voxel is a proportionally
+    /// stronger light.
+    pub area: f32,
+    /// Linear-RGB palette emissive radiance of the voxel's block (BEFORE the runtime `emissive_strength`
+    /// knob, which the shader multiplies in — the per-block emissive SSOT, not pre-scaled).
+    pub radiance: [f32; 3],
+    /// The NEE area-measure INVERSE PDF for THIS light when it is drawn by the power-weighted alias table:
+    /// `inverse_pdf = sum_power / luminance(radiance)` (the `area` cancels because the alias pick probability is
+    /// `luminance·area / sum_power` and the per-area sample pdf divides by `area`). Pre-baked at build time so
+    /// the shader needs no global `sum_power` (a degenerate luminance-0 light falls back to `area · light_count`,
+    /// the uniform-pick inverse_pdf, so its estimator is still unbiased). This is exactly the `inverse_pdf` the
+    /// NEE contribution `radiance · G · inverse_pdf` uses.
+    pub inv_pdf: f32,
+}
+
+/// One POWER-WEIGHTED ALIAS-TABLE entry (Walker's alias method) for O(1) importance sampling of the
+/// emissive-voxel light list (Phase 2.5 NEE). Parallel to [`GpuVoxelLight`] — entry `i` is drawn when a
+/// uniform pick lands on slot `i`: with probability `prob` keep light `i`, else take light `alias`. Built so a
+/// light is selected proportional to its power (`luminance·area`), concentrating shadow rays on the brightest
+/// emitters. 8 bytes, `bytemuck`-uploadable.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Pod, Zeroable)]
+pub struct GpuAliasEntry {
+    /// Probability in `[0,1]` of KEEPING this slot's own light `i` (else fall through to `alias`).
+    pub prob: f32,
+    /// The light index to fall through to when the `prob` test fails.
+    pub alias: u32,
+}
+
+/// Max emissive-voxel lights packed into the NEE light list. A worldgen lava field could expose far more
+/// emissive surface voxels than is useful to shadow-sample (a few thousand picked by the alias table already
+/// importance-samples the dominant emitters); cap the list so the buffer + alias build stay bounded, logging
+/// once when the cap truncates. Power-sorted truncation keeps the brightest lights (see [`build_light_list`]).
+pub const MAX_VOXEL_LIGHTS: usize = 4096;
+
 /// The packed, GPU-ready representation of a resident [`BrickMap`] patch: the three parallel per-brick
 /// buffers plus the palette. Built once by [`pack_brickmap`]; uploaded verbatim to storage buffers. The
 /// ORDER of `aabbs`/`metas` defines each brick's `primitive_index` (= its position here) — the BLAS is
@@ -157,6 +207,14 @@ pub struct GpuBrickPatch {
     pub voxels: Vec<u32>,
     /// `BlockId(i)` → linear RGBA. Length == registry length.
     pub palette: Vec<GpuPaletteColor>,
+    /// The EMISSIVE-VOXEL LIGHT LIST (Phase 2.5 NEE): one [`GpuVoxelLight`] per air-exposed emissive voxel in
+    /// the resident set, capped at [`MAX_VOXEL_LIGHTS`] (power-sorted, brightest kept). EMPTY when the scene has
+    /// no emitters (NEE is then skipped cleanly). Built by [`build_light_list`] in the SAME pack that produces
+    /// the voxel buffers, so the light list and the geometry can never drift.
+    pub lights: Vec<GpuVoxelLight>,
+    /// The power-weighted alias table parallel to `lights` (same length): O(1) importance sampling of the light
+    /// list by power (`luminance·area`). Empty iff `lights` is empty.
+    pub alias: Vec<GpuAliasEntry>,
 }
 
 impl GpuBrickPatch {
@@ -191,7 +249,11 @@ pub fn pack_brickmap(map: &BrickMap, registry: &BlockRegistry) -> GpuBrickPatch 
         metas: Vec::with_capacity(coords.len()),
         voxels: Vec::with_capacity(coords.len() * halo_cells(0)),
         palette: Vec::with_capacity(registry.len()),
+        lights: Vec::new(),
+        alias: Vec::new(),
     };
+    // The air-exposed emissive voxels found across all bricks — finalized into the NEE light list at the end.
+    let mut found: Vec<EmissiveVoxel> = Vec::new();
 
     let h = halo_edge(0); // LOD0 haloed edge (= BRICK_EDGE + 2)
     for coord in coords {
@@ -225,9 +287,13 @@ pub fn pack_brickmap(map: &BrickMap, registry: &BlockRegistry) -> GpuBrickPatch 
                 }
             }
         }
+        // Gather this brick's air-exposed emissive voxels into the NEE light list (Phase 2.5). Done AFTER the
+        // brick's voxels (incl. halo) are written, so face-exposure reads the just-packed haloed grid.
+        gather_lights_into(&mut found, &patch, registry, voxel_offset as usize, world_min, 0);
     }
 
     push_palette(&mut patch, registry);
+    finalize_lights(&mut patch, found);
     patch
 }
 
@@ -265,7 +331,11 @@ pub fn pack_resident_set(entries: &[ResidentBrick<'_>], registry: &BlockRegistry
         metas: Vec::with_capacity(entries.len()),
         voxels: Vec::with_capacity(entries.len() * halo_cells(0)),
         palette: Vec::with_capacity(registry.len()),
+        lights: Vec::new(),
+        alias: Vec::new(),
     };
+    // The air-exposed emissive voxels across all resident bricks — finalized into the NEE light list at the end.
+    let mut found: Vec<EmissiveVoxel> = Vec::new();
 
     // Index every resident brick by its `(coord, lod)` clipmap key, so a brick's HALO border can read its
     // SAME-LOD neighbour's adjacent face voxel (the seam fix) with one map lookup. Keyed by `(coord, lod)`
@@ -307,9 +377,14 @@ pub fn pack_resident_set(entries: &[ResidentBrick<'_>], registry: &BlockRegistry
                 }
             }
         }
+        // Gather this brick's air-exposed emissive voxels into the NEE light list (after its haloed grid is
+        // written, so cross-brick face-exposure uses the just-packed neighbour halo). Per-LOD `world_min`/`lod`
+        // place a coarse brick's larger cells correctly (its emissive voxel is a proportionally larger light).
+        gather_lights_into(&mut found, &patch, registry, voxel_offset as usize, world_min, lod);
     }
 
     push_palette(&mut patch, registry);
+    finalize_lights(&mut patch, found);
     patch
 }
 
@@ -348,6 +423,184 @@ fn push_palette(patch: &mut GpuBrickPatch, registry: &BlockRegistry) {
             emissive: [e[0], e[1], e[2], 0.0],
         });
     }
+}
+
+/// Rec.709 luminance of a linear-RGB triple — the scalar POWER measure the alias table importance-samples by
+/// (mirrors the shader's `restir_luminance`). One SSOT for the light-power weight, shared by the builder + the
+/// per-light `weight`.
+#[inline]
+fn light_luma(c: [f32; 3]) -> f32 {
+    0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2]
+}
+
+/// Build Walker's POWER-WEIGHTED ALIAS TABLE over `weights` (one per light): the O(1) sampler that picks a
+/// light proportional to its power. Returns one [`GpuAliasEntry`] per input weight. Robust to all-zero weights
+/// (degenerate emitters with luminance 0 but `area > 0`): falls back to a uniform table so sampling never
+/// divides by zero. Empty input → empty table. The classic two-stack construction (small/large) so the build
+/// is O(n) and the table is exact (each entry's expected draw probability == `weight / sum`).
+fn build_alias_table(weights: &[f32]) -> Vec<GpuAliasEntry> {
+    let n = weights.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    let sum: f64 = weights.iter().map(|&w| w as f64).sum();
+    // All-zero (or non-finite) total → uniform table (prob 1, alias self): every light equally likely, no NaN.
+    let uniform = !(sum.is_finite() && sum > 0.0);
+    // Scaled probabilities: `p_i · n` so the average is 1.0 (alias-method convention).
+    let mut scaled: Vec<f64> = weights
+        .iter()
+        .map(|&w| if uniform { 1.0 } else { (w as f64) / sum * n as f64 })
+        .collect();
+    let mut prob = vec![1.0f32; n];
+    let mut alias = vec![0u32; n];
+    for (i, a) in alias.iter_mut().enumerate() {
+        *a = i as u32; // default: keep self (correct for the exactly-balanced case)
+    }
+    let mut small: Vec<usize> = Vec::new();
+    let mut large: Vec<usize> = Vec::new();
+    for (i, &p) in scaled.iter().enumerate() {
+        if p < 1.0 { small.push(i) } else { large.push(i) }
+    }
+    while let (Some(s), Some(l)) = (small.pop(), large.pop()) {
+        prob[s] = scaled[s] as f32;
+        alias[s] = l as u32;
+        // Move the leftover mass from the large bucket back onto the working set.
+        scaled[l] = (scaled[l] + scaled[s]) - 1.0;
+        if scaled[l] < 1.0 { small.push(l) } else { large.push(l) }
+    }
+    // Any buckets left (FP round-off) keep prob 1 / self-alias — they are exactly balanced.
+    for i in large.into_iter().chain(small) {
+        prob[i] = 1.0;
+        alias[i] = i as u32;
+    }
+    prob.into_iter().zip(alias).map(|(prob, alias)| GpuAliasEntry { prob, alias }).collect()
+}
+
+/// One emissive voxel found during light-list gathering: its world centre, the world cell size at its LOD (for
+/// the area measure), and its palette emissive radiance. Internal to [`gather_lights_into`].
+struct EmissiveVoxel {
+    centre: [f32; 3],
+    cell: f32,
+    emissive: [f32; 3],
+}
+
+/// Finalize the gathered emissive voxels into the patch's NEE light list + alias table (Phase 2.5). Each
+/// emissive voxel becomes one [`GpuVoxelLight`] (centre, face area = `cell²`, palette emissive). When the count
+/// exceeds [`MAX_VOXEL_LIGHTS`] the list is POWER-SORTED (descending) and TRUNCATED to the cap so the brightest
+/// emitters survive (a logged event), then the alias table is built over the kept lights. Empty input → empty
+/// list (NEE skips cleanly). The SSOT both packers call so the light list is derived exactly once.
+fn finalize_lights(patch: &mut GpuBrickPatch, mut found: Vec<EmissiveVoxel>) {
+    if found.is_empty() {
+        return; // no emitters — NEE is skipped (light_count == 0)
+    }
+    if found.len() > MAX_VOXEL_LIGHTS {
+        // Keep the brightest (power = luminance · face-area) — they dominate the direct-light estimate.
+        let power = |v: &EmissiveVoxel| light_luma(v.emissive) * (v.cell * v.cell);
+        found.sort_by(|a, b| {
+            power(b).partial_cmp(&power(a)).unwrap_or(std::cmp::Ordering::Equal)
+        });
+        let dropped = found.len() - MAX_VOXEL_LIGHTS;
+        found.truncate(MAX_VOXEL_LIGHTS);
+        bevy::log::warn!(
+            "voxel NEE: {} emissive-voxel lights exceeded the cap {MAX_VOXEL_LIGHTS} — kept the {} brightest, dropped {dropped}",
+            MAX_VOXEL_LIGHTS + dropped,
+            MAX_VOXEL_LIGHTS
+        );
+    }
+    let light_count = found.len() as f32;
+    // Power weights (`luminance · face-area`) drive the alias table; the total is the `sum_power` that turns a
+    // power-weighted pick into an unbiased area-measure inverse_pdf per light.
+    let weights: Vec<f32> = found.iter().map(|v| light_luma(v.emissive) * (v.cell * v.cell)).collect();
+    let sum_power: f64 = weights.iter().map(|&w| w as f64).sum();
+    let usable = sum_power.is_finite() && sum_power > 0.0;
+    patch.lights = found
+        .iter()
+        .zip(&weights)
+        .map(|(v, &w)| {
+            let area = v.cell * v.cell;
+            // Area-measure inverse_pdf for the alias (power-weighted) pick: `sum_power / luminance`. The `area`
+            // cancels (pick prob `= luma·area / sum_power`, per-area pdf divides by `area`). A luminance-0 light
+            // (weight 0) can't be drawn by a non-degenerate alias table, but the fallback uniform table CAN draw
+            // it, so give it the uniform-pick inverse_pdf `area · light_count` to stay unbiased there.
+            let inv_pdf = if usable && w > 0.0 {
+                (sum_power / (light_luma(v.emissive) as f64)) as f32
+            } else {
+                area * light_count
+            };
+            GpuVoxelLight { pos: v.centre, area, radiance: v.emissive, inv_pdf }
+        })
+        .collect();
+    patch.alias = build_alias_table(&weights);
+}
+
+/// Gather every AIR-EXPOSED emissive voxel of one packed brick into `found` (Phase 2.5 NEE). A voxel is an
+/// emitter iff its block's palette emissive luminance is `> 0`; it is "exposed" iff at least one of its six
+/// face neighbours (read from the SAME haloed grid the packer just wrote, so the brick-boundary neighbour is
+/// included) is AIR — an interior emissive voxel radiates into solid and can't light anything, so it is
+/// skipped (this both bounds the list and matches what the bounce actually sees). `voxel_offset` is the brick's
+/// start in `patch.voxels`; `lod`/`world_min` place the cell in world space. Reads ONLY the just-packed buffers
+/// + the registry emissive, so the light list can never drift from the geometry.
+fn gather_lights_into(
+    found: &mut Vec<EmissiveVoxel>,
+    patch: &GpuBrickPatch,
+    registry: &BlockRegistry,
+    voxel_offset: usize,
+    world_min: [f32; 3],
+    lod: u32,
+) {
+    let cell = lod_voxel_size_pub(lod);
+    let core = lod_edge(lod);
+    // Iterate the CORE cells (halo index [1, core]); the brick OWNS these (the halo ring is the neighbour's).
+    for cz in 1..=core {
+        for cy in 1..=core {
+            for cx in 1..=core {
+                let id = BlockId(patch.voxels[voxel_offset + halo_index(cx, cy, cz, lod)] as u16);
+                if id.is_air() {
+                    continue;
+                }
+                let e = registry.emissive(id);
+                if light_luma(e) <= 0.0 {
+                    continue; // not an emitter
+                }
+                // Air-exposed iff any of the 6 face neighbours (in the haloed grid) is AIR.
+                let face = |dx: i32, dy: i32, dz: i32| -> bool {
+                    let nid = patch.voxels[voxel_offset + halo_index(cx + dx, cy + dy, cz + dz, lod)];
+                    nid == BlockId::AIR.0 as u32
+                };
+                let exposed = face(1, 0, 0)
+                    || face(-1, 0, 0)
+                    || face(0, 1, 0)
+                    || face(0, -1, 0)
+                    || face(0, 0, 1)
+                    || face(0, 0, -1);
+                if !exposed {
+                    continue;
+                }
+                // World centre of this core voxel. Core cell `c∈[1,core]` is brick-local voxel `c-1`, whose
+                // world min is `world_min + (c-1)·cell`; the centre adds half a cell.
+                let lx = (cx - 1) as f32;
+                let ly = (cy - 1) as f32;
+                let lz = (cz - 1) as f32;
+                found.push(EmissiveVoxel {
+                    centre: [
+                        world_min[0] + (lx + 0.5) * cell,
+                        world_min[1] + (ly + 0.5) * cell,
+                        world_min[2] + (lz + 0.5) * cell,
+                    ],
+                    cell,
+                    emissive: e,
+                });
+            }
+        }
+    }
+}
+
+/// The per-LOD world voxel-cell size (`VOXEL_SIZE · 2^lod`) — a thin re-export of [`super::brickmap::
+/// lod_voxel_size`] so the light gather stays inside this module's imports. SSOT-correct (the same function the
+/// DDA + AABB use).
+#[inline]
+fn lod_voxel_size_pub(lod: u32) -> f32 {
+    super::brickmap::lod_voxel_size(lod)
 }
 
 #[cfg(test)]
@@ -544,5 +797,151 @@ mod tests {
         assert_eq!(a.aabbs, b.aabbs);
         assert_eq!(a.metas, b.metas);
         assert_eq!(a.voxels, b.voxels);
+    }
+
+    // --- Phase 2.5 NEE light-list builder tests --------------------------------------------------------
+
+    /// A registry whose block `1` is a bright emitter, block `2` a non-emitter (for the light-list tests).
+    fn emissive_registry() -> BlockRegistry {
+        let mut reg = registry();
+        reg.set_emissive(BlockId(1), [4.0, 4.0, 4.0]);
+        reg
+    }
+
+    /// A scene with NO emitters packs an EMPTY light list + alias table (NEE then skips cleanly).
+    #[test]
+    fn no_emitters_empty_light_list() {
+        let reg = registry(); // nothing emissive
+        let b = solid_brick(BlockId(1));
+        let entries = vec![ResidentBrick { coord: IVec3::new(0, 0, 0), brick: &b, lod: 0 }];
+        let patch = pack_resident_set(&entries, &reg);
+        assert!(patch.lights.is_empty(), "no emissive blocks ⇒ no lights");
+        assert!(patch.alias.is_empty(), "no lights ⇒ no alias table");
+    }
+
+    /// A single ISOLATED emissive brick: every one of its 8³ surface voxels is air-exposed, so each becomes a
+    /// light carrying the block's palette emissive; the centres lie inside the brick's world AABB and the alias
+    /// table is parallel (one entry per light). An isolated solid brick's INTERIOR voxels (6³ of the 8³) are
+    /// NOT air-exposed, so the light count is the SHELL only (8³ − 6³ = 296), proving interior voxels are culled.
+    #[test]
+    fn emissive_brick_gathers_exposed_shell_lights() {
+        let reg = emissive_registry();
+        let b = solid_brick(BlockId(1));
+        let entries = vec![ResidentBrick { coord: IVec3::new(0, 0, 0), brick: &b, lod: 0 }];
+        let patch = pack_resident_set(&entries, &reg);
+        // Only the air-exposed SHELL voxels (not the solid interior) are lights: 8³ − 6³ = 512 − 216 = 296.
+        assert_eq!(patch.lights.len(), 296, "an isolated solid emitter exposes only its surface shell as lights");
+        assert_eq!(patch.alias.len(), patch.lights.len(), "the alias table is parallel to the light list");
+        let span = BRICK_WORLD_SIZE;
+        for l in &patch.lights {
+            // Palette emissive carried verbatim (the runtime emissive_strength is applied in the shader).
+            assert_eq!(l.radiance, [4.0, 4.0, 4.0], "light radiance = the block's palette emissive");
+            // One voxel FACE area at LOD0 (`VOXEL_SIZE²`).
+            assert!((l.area - VOXEL_SIZE * VOXEL_SIZE).abs() < 1e-6, "light area = one voxel face");
+            // Centre lies within the brick's world AABB [0, span]³ (with a half-voxel margin).
+            for k in 0..3 {
+                assert!(l.pos[k] > -1e-3 && l.pos[k] < span + 1e-3, "light centre {:?} inside the brick AABB", l.pos);
+            }
+            assert!(l.inv_pdf > 0.0 && l.inv_pdf.is_finite(), "the per-light inverse_pdf must be positive + finite");
+        }
+    }
+
+    /// The power-weighted alias table is a VALID distribution: every `prob ∈ [0,1]`, every `alias` index is in
+    /// range, and for EQUAL-power lights the table reduces to ~uniform (each entry keeps itself with prob ~1).
+    #[test]
+    fn alias_table_is_a_valid_distribution() {
+        let reg = emissive_registry();
+        let b = solid_brick(BlockId(1));
+        let entries = vec![ResidentBrick { coord: IVec3::new(0, 0, 0), brick: &b, lod: 0 }];
+        let patch = pack_resident_set(&entries, &reg);
+        let n = patch.alias.len() as u32;
+        assert!(n > 0);
+        for (i, e) in patch.alias.iter().enumerate() {
+            assert!((0.0..=1.0).contains(&e.prob), "alias[{i}].prob {} must be in [0,1]", e.prob);
+            assert!(e.alias < n, "alias[{i}].alias {} out of range (n={n})", e.alias);
+            // Equal-power lights ⇒ each entry's own probability ≈ 1 (no fall-through needed).
+            assert!(e.prob > 0.99, "equal-power lights ⇒ alias entry keeps itself (prob {} ≈ 1)", e.prob);
+        }
+    }
+
+    /// Two emitters of DIFFERENT power: the brighter one's alias entries concentrate probability toward it.
+    /// (A direct check that the table is POWER-weighted, not uniform.) We sample the alias table many times and
+    /// assert the bright light is picked far more often than the dim one.
+    #[test]
+    fn alias_table_is_power_weighted() {
+        // Two single-voxel emitter bricks, far apart, with very different emissive — one 10× the other.
+        let mut reg = registry();
+        reg.set_emissive(BlockId(1), [10.0, 10.0, 10.0]);
+        reg.set_emissive(BlockId(2), [1.0, 1.0, 1.0]);
+        let mut bright_v = Box::new([BlockId::AIR; BRICK_VOXELS]);
+        bright_v[voxel_index(0, 0, 0)] = BlockId(1);
+        let bright = Brick::from_voxels(bright_v);
+        let mut dim_v = Box::new([BlockId::AIR; BRICK_VOXELS]);
+        dim_v[voxel_index(0, 0, 0)] = BlockId(2);
+        let dim = Brick::from_voxels(dim_v);
+        let entries = vec![
+            ResidentBrick { coord: IVec3::new(0, 0, 0), brick: &bright, lod: 0 },
+            ResidentBrick { coord: IVec3::new(10, 0, 0), brick: &dim, lod: 0 },
+        ];
+        let patch = pack_resident_set(&entries, &reg);
+        assert_eq!(patch.lights.len(), 2, "two single-voxel emitters ⇒ two lights");
+        // Find which light is the bright one (radiance 10).
+        let bright_idx = patch.lights.iter().position(|l| l.radiance[0] > 5.0).unwrap();
+        // Walk the alias table deterministically: count, over all slots, the expected pick mass landing on each
+        // light. Slot `i` contributes `prob` to light `i` and `1-prob` to light `alias`.
+        let mut mass = [0.0f64; 2];
+        for (i, e) in patch.alias.iter().enumerate() {
+            mass[i] += e.prob as f64;
+            mass[e.alias as usize] += (1.0 - e.prob) as f64;
+        }
+        // The bright light (10× the power) should carry ~10/11 of the total pick mass.
+        let frac_bright = mass[bright_idx] / (mass[0] + mass[1]);
+        assert!(
+            frac_bright > 0.8,
+            "the power-weighted alias table must pick the 10×-brighter light far more often (got {frac_bright:.3} \
+             of the mass, expected ≈ 0.91)"
+        );
+    }
+
+    /// Exceeding the light cap truncates to the BRIGHTEST lights (power-sorted) and keeps the alias table
+    /// parallel — the list never grows past [`MAX_VOXEL_LIGHTS`].
+    #[test]
+    fn light_list_caps_and_keeps_brightest() {
+        // Build a registry with two emitter blocks: a DIM one (most voxels) + a BRIGHT one (few voxels). Pack
+        // enough emissive voxels to exceed the cap, then assert the kept lights are the bright ones.
+        let mut reg = registry();
+        reg.set_emissive(BlockId(1), [0.5, 0.5, 0.5]); // dim — the bulk
+        reg.set_emissive(BlockId(2), [50.0, 50.0, 50.0]); // bright — must survive the cap
+        // Many solid DIM bricks (each contributes 296 shell lights) to blow past MAX_VOXEL_LIGHTS, plus a few
+        // BRIGHT bricks. 16 dim bricks ⇒ 16·296 = 4736 > 4096 cap.
+        let dim = solid_brick(BlockId(1));
+        let bright = solid_brick(BlockId(2));
+        let mut entries: Vec<ResidentBrick> = Vec::new();
+        for i in 0..16i32 {
+            entries.push(ResidentBrick { coord: IVec3::new(i * 2, 0, 0), brick: &dim, lod: 0 });
+        }
+        entries.push(ResidentBrick { coord: IVec3::new(0, 4, 0), brick: &bright, lod: 0 });
+        let patch = pack_resident_set(&entries, &reg);
+        assert_eq!(patch.lights.len(), MAX_VOXEL_LIGHTS, "the light list is capped at MAX_VOXEL_LIGHTS");
+        assert_eq!(patch.alias.len(), MAX_VOXEL_LIGHTS, "the alias table stays parallel after the cap");
+        // ALL of the bright block's exposed lights (296) must survive (they are the brightest).
+        let bright_count = patch.lights.iter().filter(|l| l.radiance[0] > 25.0).count();
+        assert_eq!(bright_count, 296, "the cap must keep EVERY bright light (power-sorted truncation)");
+    }
+
+    /// A coarse-LOD emissive brick produces lights whose area scales with the LOD cell size (a coarse emissive
+    /// voxel is a proportionally larger area light).
+    #[test]
+    fn coarse_lod_light_area_scales() {
+        let reg = emissive_registry();
+        let b = solid_brick(BlockId(1));
+        let lod = 2u32;
+        let entries = vec![ResidentBrick { coord: IVec3::new(0, 0, 0), brick: &b, lod }];
+        let patch = pack_resident_set(&entries, &reg);
+        assert!(!patch.lights.is_empty());
+        let cell = VOXEL_SIZE * (1u32 << lod) as f32;
+        for l in &patch.lights {
+            assert!((l.area - cell * cell).abs() < 1e-4, "coarse light area = (VOXEL_SIZE·2^lod)²");
+        }
     }
 }

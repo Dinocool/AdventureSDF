@@ -1795,10 +1795,15 @@ struct WorldCacheUniform {
     // workgroups AND the update/blend entries early-out for active_index >= N, so at most N cells are processed
     // this frame; the rest keep their last radiance+life and update next frame. Never corrupts the cache.
     max_active_cells_per_frame: u32,
-    // std140 pad → 64 bytes (four 16-byte rows). Never read.
-    _wc_pad0: u32,
-    _wc_pad1: u32,
-    _wc_pad2: u32,
+    // Phase 2.5 NEE: number of emissive-voxel lights in `voxel_lights` (0 ⇒ NEE skipped — no emitters; the
+    // light buffers are bound 1-long dummies, never indexed). Stamped by the render pass from the packed list.
+    light_count: u32,
+    // Phase 2.5 NEE A/B gate (knobs-as-uniforms): 1 = the update pass adds DIRECT light sampling (NEE) with MIS
+    // (the live default), 0 = bounce-only (the pre-2.5 behaviour — emitters found only by the cosine bounce).
+    nee_enabled: u32,
+    // Phase 2.5 NEE: shadow-ray light samples per cell update (≥1). More samples cut the direct-light variance
+    // further at a linear shadow-ray cost; 1 is the Solari-class default (the temporal blend averages frames).
+    nee_samples: u32,
 };
 
 // The camera world position the update pass feeds to `query_world_cache` for its LOD (reconstructed from the
@@ -1856,6 +1861,20 @@ fn wc_window_start(active_cell_count: u32) -> u32 {
 // read-write storage AND used as an indirect-dispatch source within one compute-pass usage scope — so it must
 // be UNBOUND (the update/blend pipeline layout omits group 2) when consumed as the indirect arg.
 @group(2) @binding(0) var<storage, read_write> world_cache_active_cells_dispatch: vec3<u32>;
+
+// --- Phase 2.5 NEE: emissive-voxel LIGHT LIST + power-weighted alias table (group 3) -----------------
+// One VoxelLight per air-exposed emissive voxel of the resident set (mirror of `GpuVoxelLight` in gpu.rs):
+// `pos` = voxel centre, `area` = one face area at the voxel's LOD, `radiance` = palette emissive (BEFORE the
+// runtime `emissive_strength` knob, applied here), `weight` = luminance·area (the alias-table power). Built
+// CPU-side during pack; sampled DIRECTLY (next-event estimation) by the world-cache update pass so emitters
+// are found without relying on a random bounce — the principled variance/firefly fix. `wc.light_count == 0`
+// (no emitters) ⇒ NEE is skipped cleanly. The buffers are bound 1-long dummies when empty (never zero-length).
+struct VoxelLight { pos: vec3<f32>, area: f32, radiance: vec3<f32>, inv_pdf: f32 };
+// One alias-table entry (Walker's method, mirror of `GpuAliasEntry`): with prob `prob` keep this slot's light
+// `i`, else fall through to light `alias`. Picks a light proportional to its power in O(1).
+struct AliasEntry { prob: f32, alias_idx: u32 };
+@group(3) @binding(15) var<storage, read> voxel_lights: array<VoxelLight>;
+@group(3) @binding(16) var<storage, read> voxel_light_alias: array<AliasEntry>;
 
 // --- hash + quantization (ported verbatim from Solari world_cache_query.wgsl) -----------------------
 
@@ -2064,10 +2083,146 @@ fn world_cache_compact_write_active(
     }
 }
 
-// PASS 5 — UPDATE (indirect, one thread per ACTIVE cell). ADAPTATION (no light list): trace ONE cosine-weighted
-// hemisphere bounce from the cell's stored (pos,normal); the sample radiance = direct lighting at the hit +
-// the hit's emissive glow, or the procedural sky (the 1A SSOT) on a miss. Because the compaction gives each
-// active cell exactly ONE owning thread, the `new_radiance` write is race-free WITHOUT float atomics.
+// --- Phase 2.5 NEE: direct emissive-voxel light sampling with MIS ------------------------------------
+//
+// The world-cache update finds emitters ONLY by the random cosine bounce — high variance (a cell whose
+// hemisphere a small bright emitter subtends catches it in few samples, so the per-cell radiance "boils"; this
+// is the variance the discarded firefly clamp used to band-aid). NEE samples the emissive-voxel LIGHT LIST
+// (`voxel_lights`) DIRECTLY: pick a light by power (alias table), trace ONE shadow ray, and add its unoccluded
+// area-light contribution. The two estimators of the SAME emitter contribution (the cosine bounce that may hit
+// an emitter, and this direct light sample) are reconciled by the BALANCE-HEURISTIC MIS WEIGHT so emitters are
+// never double-counted (Veach; mirrors Solari's `sample_di` + the path tracer's `power_heuristic`).
+//
+// CONVENTION: the cache is COSINE-PRE-DIVIDED — a cosine-sampled bounce contributes the gathered radiance
+// directly (the `cos θ/π` pdf cancels the `cos θ/π` Lambert kernel), so the cell stores `(1/π)∫ L cos θ dω`.
+// The NEE term is the SAME quantity estimated by area sampling, so it carries the matching `1/π` and a `cos θ`
+// at the receiver: `(1/π) · L · cosθ_surf · cosθ_light/dist² · V · inverse_pdf_area`. Returned RAW (no MIS) so
+// the update pass can apply the MIS weight + `emissive_strength` knob once, consistently with the bounce term.
+
+const WC_INV_PI: f32 = 0.31830988618; // 1/π — the cosine-pre-divide factor
+
+// Solid-angle pdf of the cosine-hemisphere bounce in direction `dir` about normal `n` (= cosθ/π). Used as the
+// "other technique" pdf in the MIS weight for both estimators.
+fn wc_bounce_pdf(n: vec3<f32>, dir: vec3<f32>) -> f32 {
+    return max(dot(n, dir), 0.0) * WC_INV_PI;
+}
+
+// One NEE light sample's contribution to the cache quantity, ALREADY cosine-pre-divided and MIS-weighted, plus
+// the geometry the caller needs for nothing more (the MIS is applied inside). Picks a light from the alias
+// table by power, forms the area-light estimator with the receiver cosine, traces a shadow ray for visibility,
+// and multiplies by `balance_heuristic(p_light, p_bounce)` so the cosine bounce (which also catches emitters)
+// is not double-counted. Returns 0 when there are no lights, the light is back-facing/behind the surface, or
+// the shadow ray is occluded. `world_position`/`n` are the cell's stored geometry; `rng` is the cell's stream.
+fn wc_sample_light_nee(world_position: vec3<f32>, n: vec3<f32>, rng: ptr<function, u32>) -> vec3<f32> {
+    let count = wc.light_count;
+    if (count == 0u) {
+        return vec3<f32>(0.0);
+    }
+    // Power-weighted alias draw: a uniform slot pick, then keep-or-fall-through by `prob`.
+    let slot = min(u32(rand_next(rng) * f32(count)), count - 1u);
+    let entry = voxel_light_alias[slot];
+    var li = slot;
+    if (rand_next(rng) >= entry.prob) {
+        li = entry.alias_idx;
+    }
+    let lgt = voxel_lights[li];
+
+    // Sample a point on the light's voxel FACE: jitter within ±half a cell in the surface tangent plane around
+    // the voxel centre (the face-area measure `lgt.area` matches this — a square of side sqrt(area)). Keeps the
+    // estimator unbiased (uniform over the area) and softens contact shadows vs a bare point sample.
+    let half = sqrt(lgt.area) * 0.5;
+    let jb = onb(normalize(lgt.pos - world_position)); // a basis facing the receiver (any face-tangent is fine)
+    let j = (vec2<f32>(rand_next(rng), rand_next(rng)) * 2.0 - 1.0) * half;
+    let y = lgt.pos + jb[0] * j.x + jb[1] * j.y;
+
+    let to_light = y - world_position;
+    let dist2 = dot(to_light, to_light);
+    if (dist2 <= 1e-8) {
+        return vec3<f32>(0.0);
+    }
+    let dist = sqrt(dist2);
+    let wi = to_light / dist;
+    let cos_surf = dot(n, wi);
+    if (cos_surf <= 0.0) {
+        return vec3<f32>(0.0); // light is below the receiver's hemisphere
+    }
+    // FACE-ORIENTATION MODEL: the light list does NOT store which of the emissive voxel's faces is exposed (a
+    // voxel can emit from up to six faces), so we model the emitter as facing the receiver head-on — `cos_light
+    // = 1`. This is the standard ISOTROPIC-voxel-emitter approximation: it keeps the estimator unbiased for the
+    // chosen `inverse_pdf` (the SAME `cos_light = 1` is used in `p_light` below, so the two are self-consistent)
+    // and avoids an oriented-face fetch. `cos_light` cancels out of `geom · inv_pdf` here and reappears in
+    // `p_light`, so the cancellation is exact — no hidden bias.
+    let cos_light = 1.0;
+    let geom = cos_surf * cos_light / dist2;
+
+    // Shadow ray: is the light point visible? Offset off the RECEIVER along its normal to avoid self-hit, and —
+    // crucially — stop the ray ONE VOXEL CELL SHORT of the light point. The light reference (`lgt.pos`) is the
+    // emitter voxel CENTRE, which sits ~half a cell INSIDE the solid emissive voxel, so a ray reaching it would
+    // be occluded by the emitter's OWN surface (the voxel is solid) — making EVERY NEE sample spuriously
+    // shadowed (a silent total energy loss). Pulling `t_max` back by `sqrt(area)` (one voxel edge ≥ the
+    // centre-to-face distance) stops the ray in the AIR just before the emitter, so only TRUE occluders between
+    // the receiver and the emitter shadow it. `cell = sqrt(area)` is the emitter voxel's edge length.
+    let cell = sqrt(lgt.area);
+    let t_max = dist - cell;
+    let origin = world_position + n * light.shadow_bias;
+    if (t_max <= light.shadow_bias) {
+        // The light is within one voxel of the receiver (e.g. an adjacent emissive voxel) — treat as unoccluded
+        // (no room for an occluder), so contact light from a directly-adjacent emitter is not lost.
+    } else if (trace_occluded(origin, wi, light.shadow_bias, t_max)) {
+        return vec3<f32>(0.0);
+    }
+
+    // Area-light estimator of the cosine-pre-divided cache quantity (apply the `emissive_strength` knob — the
+    // per-block emissive SSOT — exactly like the bounce term does).
+    let radiance = lgt.radiance * light.emissive_strength;
+    let estimator = radiance * (WC_INV_PI * geom * lgt.inv_pdf);
+
+    // MIS (balance heuristic): weight NEE by p_light / (p_light + p_bounce), both in SOLID-ANGLE measure, so the
+    // bounce estimator (weighted symmetrically where it hits an emitter) and NEE together are unbiased + low
+    // variance with no double-count. p_light (sa) = pdf_area · dist² / cos_light; pdf_area = 1/inv_pdf.
+    let p_light = (1.0 / lgt.inv_pdf) * dist2 / max(cos_light, 1e-4);
+    let p_bounce = wc_bounce_pdf(n, wi);
+    let w_nee = balance_heuristic(p_light, p_bounce);
+    return estimator * w_nee;
+}
+
+// The MIS weight to apply to the cosine-BOUNCE estimator when the bounce HITS an emitter (so it is not
+// double-counted against NEE). The bounce sampled `dir` with pdf `cosθ/π`; the light it struck would have been
+// drawn by NEE with solid-angle pdf `p_light` (computed from the hit emitter's area + distance + the alias
+// inverse_pdf). Weight = p_bounce / (p_bounce + p_light) (balance heuristic). When NEE is OFF (`nee_enabled==0`)
+// or there are no lights, returns 1 (the bounce carries the FULL emitter term, the pre-2.5 behaviour).
+//
+// We do NOT know WHICH light-list entry the bounce struck, so we reconstruct the NEE solid-angle pdf the hit
+// emitter WOULD have had from its own geometry: a voxel face of area `VOXEL_SIZE²` at distance `hit_t`, picked
+// with probability `≈ 1/light_count` (the equal-power surrogate — exact for equal emitters, the common case;
+// for unequal emitters the alias pick differs but MIS stays unbiased for any partition, only the variance
+// shifts). With the SAME isotropic `cos_light = 1` model NEE uses, `p_light(sa) = pick_prob · hit_t² / area`,
+// and `p_bounce(sa) = cosθ/π` at the ACTUAL bounce direction (`wc_bounce_pdf(n, dir)`) — the SAME representation
+// NEE evaluates for a shared direction, so the two `balance_heuristic` weights (args swapped) form a valid
+// partition summing to ≤ 1 (no double-count). NOTE: the original used the `1/π` PEAK here, which made the two
+// weights disagree on `p_bounce` off normal incidence → an energy bias up to ~50% at grazing angles (caught in
+// GI 2.5 review). Matching the real cosθ/π restores the partition. The `1/light_count` pick-prob + LOD0
+// `VOXEL_SIZE²` area remain a surrogate for the hit light's true alias pdf — EXACT for equal-power LOD0 emitters
+// (Cornell's single emitter; Sponza has none), approximate for unequal-power/mixed-LOD scenes (a documented
+// residual that needs a per-hit light-id lookup to close; both GI 2.5 reviewers flagged it as unavoidable here).
+fn wc_bounce_emitter_mis(n: vec3<f32>, hit_t: f32, dir: vec3<f32>) -> f32 {
+    if (wc.nee_enabled == 0u || wc.light_count == 0u) {
+        return 1.0; // NEE off → the bounce is the only emitter estimator (no MIS split)
+    }
+    // The bounce-hit emitter as a NEE light: a VOXEL_SIZE² face, pick prob ≈ 1/light_count, isotropic (cos_light
+    // = 1) — matching `wc_sample_light_nee`'s model so the two weights partition consistently.
+    let area = VOXEL_SIZE * VOXEL_SIZE;
+    let pick_prob = 1.0 / f32(wc.light_count);
+    let p_light = pick_prob * (hit_t * hit_t) / area;
+    let p_bounce = wc_bounce_pdf(n, dir); // cosθ/π at the actual dir — matches NEE's p_bounce (valid partition)
+    return balance_heuristic(p_bounce, p_light);
+}
+
+// PASS 5 — UPDATE (indirect, one thread per ACTIVE cell). ADAPTATION (Phase 2.5: NEE light list): trace ONE
+// cosine-weighted hemisphere bounce from the cell's stored (pos,normal); the sample radiance = direct lighting
+// at the hit + the hit's emissive glow (MIS-weighted), or the procedural sky (the 1A SSOT) on a miss; PLUS a
+// DIRECT next-event light sample (`wc_sample_light_nee`) of the emissive-voxel list. Because the compaction
+// gives each active cell exactly ONE owning thread, the `new_radiance` write is race-free WITHOUT float atomics.
 //
 // MULTI-BOUNCE (Phase 2.3, gated by `wc.gi_multibounce`, default ON; mirrors Solari `world_cache_update.wgsl`
 // `sample_gi`:44-62): at the bounce HIT we ALSO add the reflected indirect read FROM the cache —
@@ -2109,7 +2264,13 @@ fn world_cache_update(@builtin(global_invocation_id) active_cell_id: vec3<u32>) 
     var radiance: vec3<f32>;
     if (hit.hit != 0u) {
         let hp = origin + dir * hit.t;
-        radiance = direct_lighting(hit.color.rgb, hit.normal, hp) + hit.emissive * light.emissive_strength;
+        // The bounce-hit surface's emissive is ONE of the two estimators of the emitter contribution; weight it
+        // by the MIS bounce-share so it isn't double-counted against NEE (`wc_bounce_emitter_mis` returns 1 when
+        // NEE is off / no lights, recovering the pre-2.5 full emitter term). `direct_lighting` (sun/ambient) is
+        // NOT an emitter term, so it is unweighted.
+        let emit_mis = wc_bounce_emitter_mis(n, hit.t, dir);
+        radiance = direct_lighting(hit.color.rgb, hit.normal, hp)
+            + hit.emissive * (light.emissive_strength * emit_mis);
         // Feed-forward multi-bounce: add the reflected indirect the cache already holds for the hit surface.
         // `query_world_cache` reads LAST frame's blended radiance (this pass only writes `new_radiance`), so
         // there is no in-frame recursion; the recursion unrolls one bounce per frame and is stabilised by the
@@ -2121,6 +2282,20 @@ fn world_cache_update(@builtin(global_invocation_id) active_cell_id: vec3<u32>) 
     } else {
         radiance = sky_radiance(dir) * sky.gi_sky_intensity;
     }
+
+    // Phase 2.5 NEE: add the DIRECT emissive-voxel light sample(s), MIS-balanced against the bounce above so the
+    // emitter contribution is unbiased + low-variance with no double-count. Averaged over `nee_samples` shadow
+    // rays (≥1) so a cell can pull down the direct-light variance further at a linear cost. Skipped cleanly when
+    // NEE is off or there are no lights (`wc_sample_light_nee` returns 0).
+    if (wc.nee_enabled != 0u && wc.light_count != 0u) {
+        let ns = max(wc.nee_samples, 1u);
+        var nee = vec3<f32>(0.0);
+        for (var s = 0u; s < ns; s = s + 1u) {
+            nee += wc_sample_light_nee(geo.world_position, n, &rng);
+        }
+        radiance += nee / f32(ns);
+    }
+
     world_cache_active_cells_new_radiance[active_cell_id.x] = radiance;
 }
 
