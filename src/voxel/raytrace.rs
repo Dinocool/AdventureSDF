@@ -621,7 +621,7 @@ pub struct DlssSettings {
 #[cfg(feature = "dlss")]
 impl Default for DlssSettings {
     fn default() -> Self {
-        Self { enabled: true, mode: bevy::anti_alias::dlss::DlssPerfQualityMode::Auto }
+        Self { enabled: true, mode: bevy::anti_alias::dlss::DlssPerfQualityMode::Quality }
     }
 }
 
