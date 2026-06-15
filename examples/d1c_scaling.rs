@@ -19,7 +19,8 @@ use adventure::voxel::gpu::pack_resident_set;
 use adventure::voxel::palette::BlockRegistry;
 use adventure::voxel::source::{BrickClass, BrickSource, WorldgenSource};
 use adventure::voxel::streaming::{
-    MAX_CLIP_ENUMERATION, ResidencyManager, StreamingConfig, desired_clipmap, region_half_extent_m,
+    MAX_CLIP_ENUMERATION, ResidencyManager, StreamingConfig, desired_clipmap, desired_clipmap_surface,
+    region_half_extent_m,
 };
 use adventure::voxel::{build_height_layer_pub, load_biome_library_pub};
 
@@ -98,14 +99,35 @@ fn main() {
     println!("interior (pruned)     : {interior}");
     println!("air (pruned)          : {air}");
 
-    // (C) SINGLE cold update (enqueue) cost + the capped surface-candidate count.
+    // (A') D1d SHELL-FIRST enumeration: the Θ(H²) surface candidates, enumerated DIRECTLY (no cube). Compare
+    // its per-LOD distribution + ceiling status against the cube path above — coarse LODs must now appear.
+    let t = Instant::now();
+    let surf_desired = desired_clipmap_surface(cam, &cfg, &src);
+    let surf_enum_ms = t.elapsed().as_secs_f64() * 1e3;
+    let mut surf_per_lod = vec![0usize; (MAX_LOD + 1) as usize];
+    for k in surf_desired.keys() {
+        surf_per_lod[k.lod as usize] += 1;
+    }
+    println!("\n-- (A') D1d shell-first desired_clipmap_surface --");
+    println!("candidate keys        : {} ({surf_enum_ms:.1} ms to enumerate)", surf_desired.len());
+    println!(
+        "hit ceiling?          : {}  (false ⇒ coarse shells DO enumerate now)",
+        surf_desired.len() > MAX_CLIP_ENUMERATION
+    );
+    for (l, n) in surf_per_lod.iter().enumerate() {
+        if *n > 0 {
+            println!("  LOD{l}                : {n} candidates (brick_span {:.1} m)", brick_span(l as u32));
+        }
+    }
+
+    // (C) SINGLE cold update (enqueue) cost — NOW the D1d shell-first path. (Was ~38 s on the cube path.)
     let mut mgr = ResidencyManager::new();
     let t = Instant::now();
     mgr.update(cam, &cfg, &src);
     let update_ms = t.elapsed().as_secs_f64() * 1e3;
     let enqueued = mgr.pending();
-    println!("\n-- (C) single cold update (enqueue) --");
-    println!("update wall           : {update_ms:.0} ms");
+    println!("\n-- (C) single cold update (enqueue) — D1d shell-first --");
+    println!("update wall           : {update_ms:.1} ms  (D1c cube path was ~38_000 ms)");
     println!("enqueued (capped)     : {enqueued}  (cap {})", cfg.max_resident_bricks);
     println!("capped_total dropped  : {}", mgr.capped_total);
 

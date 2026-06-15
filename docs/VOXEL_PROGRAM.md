@@ -2,9 +2,16 @@
 
 Status: APPROVED (user, 2026-06: "we'll go with your sequencing"). This is THE execution plan — it supersedes the
 ad-hoc stage lists in the other docs and synthesizes the 5-agent SOTA-alignment audit (Storage, GI, Streaming/LOD,
-AS/DDA, Voxelization). Detail per area still lives in the owning doc (`VOXEL_STORAGE_PLAN`, `VOXEL_LARGE_SCENE_PLAN`,
-`VOXEL_INSTANCING_PLAN`, `VOXEL_FINE_RESOLUTION_PLAN`, `SOTA_REFERENCE`); this ties them into one sequenced program.
+AS/DDA, Voxelization) + the later 4-agent SOTA-GAP audit (2026-06, incl. a re-flora deep-dive — see the
+`## Committed roadmap` section below + the `voxel-rt-sota-gap-analysis` memory). Detail per area still lives in the
+owning doc (`VOXEL_STORAGE_PLAN`, `VOXEL_LARGE_SCENE_PLAN`, `VOXEL_INSTANCING_PLAN`, `VOXEL_FINE_RESOLUTION_PLAN`,
+`GPU_VOXEL_WORLDGEN_PLAN`, `TILED_VOXELIZER_PLAN`, `SOTA_REFERENCE`); this ties them into one sequenced program.
 Read `ENGINE_OVERVIEW.md` first for the architecture.
+
+**USER DECISION (2026-06): the GPU-driven pivot (Phase G below) is COMMITTED regardless of performance — it is the
+CORRECT architecture, not a perf-gated choice ([[feedback-plan-to-best-practice]]).** The CPU-side D1d/A1 wins do
+NOT change the go decision; any re-benchmark is informational only. We are doing the whole GPU-driven model + the
+full committed roadmap below.
 
 ## Alignment baseline (the audit verdict — don't re-derive)
 SOTA-aligned: the in-shader DDA/trace, the streaming *bookkeeping* (exact clipmap tiling, surface `classify`), the GI
@@ -20,6 +27,60 @@ ReSTIR DI pass / light-tile presampling (quality, independent of scene-loading).
 multi-scene gallery smooth NOW), ~90% already built. **Then B (disk) → C (bake) → D (flip + reach).** Build the AS work
 with the instance descriptor **from day one**. GI 3.0 **deferred**. Re-bake **Sponza/Sibenik/Conference at 0.05 m
 first** (Sponza already is); **Bistro after** the tiled voxelizer + R5a/R6.
+
+---
+
+## Committed roadmap — the full SOTA-gap set (2026-06 4-agent audit; ALL committed)
+
+The audit (storage / GI / streaming / re-flora deep-dive, code-grounded) confirmed we are SOTA-aligned and AHEAD
+of OSS peers (incl. re-flora — a SW 64-tree, 1-bounce GI, no-LOD engine) on every RENDERING axis. The gaps are
+execution + a convergent set, ALL now committed (✅ done · 🔜 to do · 🔬 research · ⛔ verified-reject). The single
+biggest convergent finding (two independent agents): move the residency **ENUMERATION/COMPACTION** to GPU, not just
+voxelize — the re-flora `contree/` build + gvox_engine GPU allocator are working references.
+
+### Phase G — GPU-driven pipeline (the committed pivot; owning doc `GPU_VOXEL_WORLDGEN_PLAN.md`)
+Headline = the residency enumeration/compaction on GPU (not merely GPU voxelize).
+- 🔜 **G1 GPU residency enumeration + classify** — kill the per-camera-crossing CPU enumerate→classify→sort; evaluate `classify` per candidate on GPU.
+- 🔜 **G2 Readback-free build** — workgroup prefix-sum **stream compaction** + atomic **sparse active-brick list** + **GPU-written indirect dispatch** (the re-flora pattern; zero render-path readback).
+- 🔜 **G3 GPU voxelization** — Field/NodeKind graph → WGSL codegen + a GPU/CPU parity test.
+- 🔜 **G4 GPU-resident pool allocator** — fixed-cap, degenerate-AABB free slots (extends the A1 substrate GPU-side); optional adaptive high-water capacity readback (no indirect AS build on the fork).
+- 🔜 **G5 Occupancy-aware dispatch** — compact-then-dispatch (work-graphs are wgpu-unavailable; the manual prefix-sum-compact is the portable substitute; we are occupancy/register-bound per the SDF trace finding).
+- 🔜 **G6 3D-capable surface enumeration** — GPU 3D-occupancy classify so shell-first survives caves/overhangs (today's column-walk is 2.5D-only → O(H³) fallback when 3D worldgen lands). Unifies worldgen `classify` with the static 6-neighbour predicate (was streaming F5/F7).
+- 🔜 **G7 GPU edit path** — edit → re-extract surface → rebuild region on GPU (destructible at scale).
+
+### Streaming / LOD (rest of `VOXEL_LARGE_SCENE_PLAN.md`)
+- 🔜 **D2 Screen-error / projected-footprint LOD** — PROMOTED ahead of/with the flip (distance-only shells are FOV/res-blind; the 0.05 flip makes it near-mandatory).
+- 🔜 **S-async Async-offload the `update` enumeration** — cheap interim before G1 (keep-old-until-revealed tolerates a frame of latency).
+- 🔜 **S-prefetch Async region prefetch** — fetch the shell one ring out (the `.vxo` B2.3 deferred piece).
+- 🔜 **S-lru Ray-guided demand paging + LRU** (GigaVoxels) — for all-surface views (forest/city); layers on the G4 pool.
+
+### GI 3.0 (`SOTA_REFERENCE §2`)
+- 🔜 **GI-DI Screen-space ReSTIR DI pass** — crisp, low-variance direct light from emissive voxels (today only laundered through the world cache → soft/laggy, no contact shadows).
+- 🔜 **GI-tiles Light-tile presampling** (RTXDI) — scales NEE to thousands of emissive voxels (the destructible target).
+- 🔜 **GI-regir ReGIR grid light reservoirs** — alternative/complement to light-tiles for many-lights (pick one, not both).
+- 🔜 **GI-dc Double-count SSOT fix** — when DI lands, the cache-fed GI reservoir's inline direct+emissive double-counts; one SSOT for where the bounce-surface direct term lives.
+- 🔜 **GI-thinwall Thin-wall ReSTIR-reuse cap** — `surfaces_dissimilar` `TODO(D-GI)`: the relative threshold leaks reuse across a thin wall >~16.7 m within the 64 m reach.
+- 🔜 **GI-denoise Non-DLSS à-trous/SVGF fallback** — portability off NVIDIA/Vulkan (re-flora's SVGF is a reference).
+- 🔜 **GI-spec Specular/glossy GI** — after a material-system expansion (wet/metal/glass voxels).
+
+### Storage / acceleration tail
+- 🔜 **B3 SVDAG transport** — `.vxo` `flags` bit1; ~0.12 bits/voxel; immutable assets only (no COW hazard); decode-to-R2b Tier-B.
+- 🔜 **AS-c In-brick occupancy empty-space skip / two-level DDA** — 4³ sub-bitmask skip (measure-first; may be occupancy/register-bound not memory-bound).
+- 🔜 **R4 Occupancy-mask compacted format** — demoted; decide from a post-flip fill-fraction histogram.
+- 🔬 **Per-format auto-codegen** (Hybrid Voxel Formats, arXiv 2410.14128) — research; per-level heterogeneous format via codegen; read before hand-coding R4 (aligns with the G3 NodeKind→WGSL direction).
+
+### Import / bake
+- 🔜 **C1 Tiled out-of-core voxelizer** — Bistro @0.05 m bake <4 GiB (union-find tiled flood; `TILED_VOXELIZER_PLAN.md`). [C2 emissive ✅, C3 CIELAB+area-avg ✅]
+
+### Minor / aesthetic (re-flora landscape)
+- 🔜 Baked per-voxel gradient normals (opt-in SMOOTH-voxel material, computed in the G3 GPU build pass).
+- 🔜 Per-voxel hash colour-variance; blue-noise sample textures for AO taps (both marginal — ReSTIR already low-discrepancy).
+
+### ⛔ Verified rejections (do NOT pursue)
+NanoVDB/OpenVDB/GVDB or SVDAG/64-tree as a **live trace** structure (we're HW-RT AABB-BLAS; SVDAG stays B3 disk
+transport); NRC (tensor-core lock-in vs SHARC, our vendor-neutral sibling); DDGI / Radiance Cascades (dominated by
+ReSTIR + world-cache for 3D voxels); RTX Mega Geometry / CLAS (triangle-cluster-only — N/A to procedural AABBs);
+coverage-threshold (≥50 %) occupancy (drops sub-voxel-thin geometry); Atomontage server-side streaming (out of scope).
 
 ---
 
@@ -46,13 +107,14 @@ first** (Sponza already is); **Bistro after** the tiled voxelizer + R5a/R6.
 
 ---
 
-## Deferred / independent tracks (NOT gating the flip)
-- **GI 3.0** — screen-space ReSTIR DI pass + light-tile presampling (the missing third of the Solari stack; GI quality, independent of scene-loading). **Latent hazard to fix WHEN DI lands:** the cache-fed GI reservoir's inline `direct+emissive` will double-count once a DI pass exists — pick one SSOT for "where the bounce surface's direct term lives." *(GI MAJOR×3)*
-- **Demand / ray-guided residency + LRU** — behind a concrete **gallery-worst-case measurement gate** (camera mid-gallery, all scenes at 0.05 m, surface-only on; if peak surface count > cap, it becomes required). The A1 fixed-cap slot pool is its substrate. *(streaming F3)*
-- **R4 occupancy-mask + compacted solid list** — DEMOTED to conditional/post-flip; surface-only + R2 largely consumed its win. Decide from a post-flip fill-fraction histogram. *(storage MAJOR)*
-- **Multi-instance FEATURE work** (`.vox`-as-instances, off-axis rotation, per-instance COW destruction) — deferred; the A3 descriptor makes it a no-second-rewrite addition. *(VOXEL_INSTANCING Phases 2–6)*
-- **Worldgen `classify` + coarse-LOD SSOT unification** — when 3D worldgen (caves/overhangs) lands, replace the 2.5D height cull with the static path's 6-neighbour predicate. *(streaming F5/F7)*
-- **In-`dda_brick` occupancy-mask empty-space skip** + removing the redundant double-DDA — after Phase A; measure first (the trace is occupancy/register-bound, not memory-bound). *(AS-c)*
+## Now committed (formerly "deferred / independent") — see the `## Committed roadmap` above
+The 2026-06 gap audit + user decision moved these from "deferred" to COMMITTED; they live in the roadmap now:
+- **GI 3.0** (ReSTIR DI + light-tiles/ReGIR + the double-count fix + thin-wall cap + non-DLSS denoiser + specular) → roadmap §GI 3.0.
+- **Demand / ray-guided residency + LRU** → roadmap §Streaming (S-lru). The G4 GPU pool is its substrate.
+- **R4 occupancy-mask** → roadmap §Storage tail (still post-flip-histogram-decided).
+- **Worldgen `classify` + coarse-LOD SSOT unification** → roadmap §Phase G (G6, GPU 3D-occupancy classify).
+- **In-`dda_brick` empty-space skip** → roadmap §Storage tail (AS-c, measure-first).
+- **Multi-instance FEATURE work** (`.vox`-as-instances, off-axis rotation, per-instance COW destruction) — the only item STILL genuinely deferred; the A3 descriptor makes it a no-second-rewrite addition. *(VOXEL_INSTANCING Phases 2–6)*
 
 ## Doc-accuracy fixes (apply with the next commit)
 - `VOXEL_STORAGE_PLAN`: R4 (per-brick byte compression) ≠ surface-only residency (whole-brick cull) — they're orthogonal, currently conflated; R3's surface-brick dedup expectation is optimistic (halo variation limits hits to interior/strata).
@@ -68,6 +130,18 @@ R1 ✓ · **R2 ✓** (R2b landed, commit `d17f30d2`: `GpuBrickMeta` 48 B with `p
 
 **A4.4 ✓ (LANDED — Phase A COMPLETE) — the streamed arena is now R2b PALETTED, recovering the VRAM A1-β traded away.** Replaced the raw fixed-block arena with **size-class SLABS** via a generic `SlabArena` (per-class free-list + bump + grow-on-overflow), used as ONE SSOT for BOTH the index-stream arena (classes `{32,63,125,250,500}` words keyed by `index_bits`) AND the per-brick palette arena (power-of-2 ladder `{2..65536}`, variable — Checkpoint-2). `SnapshotBuffers`/`ChangedSlot` carry paletted index + palette blocks; the streamed metas now carry real `index_bits ≥ 1` + a variable `palette_base`, so the shader uses the EXISTING paletted `cell_block` decode (ZERO shader change; the raw `index_bits==0` branch is now streamed-unused). A grow in either arena forces a re-snapshot. **Measured (worldgen slice, 10k resident): resident streamed VRAM 245 MB → 11.6 MB (21.1×; index slabs 6.4 + palette 0.41 + meta/aabb 4.8); per-move upload ~140 KB; incremental re-pack 10.3 ms (153× the full pack).** The palette-slab win scales further on high-registry `.vox` scenes (Checkpoint-1's fixed palette alone would reserve ~61 MB for a 256-id registry). Gates green: `voxel_raytrace_gpu` oracle + the streamed byte-identity gates (`delta_upload_matches_snapshot_buffers_over_sequence`, `streamed_snapshot_decodes_same_logical_cells_as_r2b`) + the GPU suite (streaming/gi/seam/world_cache/gallery/sponza) + zero-warning default/editor build + clippy `--all-targets`.
 
-**NEXT = Phase B** (`.vxo` disk format — `VXO_FORMAT.md`) per `VOXEL_PROGRAM.md`. (Phase A is done.)
+**Phase B ✓ (DONE)** — `.vxo` format (B-i `517ed90` + review fix `45a0461`) + region-streamed `VxoSource` loader
+(B-ii `731e2601` + coarse-LOD fix `1b0bf11`), each specialist→3-reviewer-panel→fix→verify. B3 SVDAG deferred to the
+roadmap. **`.vox→.vxo` conversion ✓** (`afaacde5`: Sponza/Sibenik/Conference @0.05 m; Bistro→C1). **Phase C: C2
+emissive ✓ (`72260ff`), C3 CIELAB+area-avg ✓ (`f2f871f` + review fix `cd889ed`); C1 tiled voxelizer remains** (in
+the roadmap). **Phase D1 (early partial flip, user-chosen ahead of C1):** D1a `VOXEL_SIZE`→0.05 + `clip_half`→160
+(64 m reach) + scale re-pin ✓ (`8ee9591`) + GI-blocker fix (production world-cache cell/bias made BRICK_WORLD_SIZE-
+relative) ✓ (`def8e62`); D1c benchmark ✓ (`cceec457`) — found the 64 m reach was *fiction* (O(H³) cube enumeration
+hit the 8 M ceiling, LOD0-only, ~38 s/crossing); **D1d shell-first O(H²) enumeration IN PROGRESS** (restores coarse
+LODs + kills the 38 s). worldgen + legacy scenes now render at 0.05 m.
+
+**NEXT after D1d:** the committed roadmap above — Phase G (GPU-driven pivot, headline = GPU enumeration/compaction)
+is the user-committed correct architecture; D2 screen-error LOD promoted alongside the flip; then GI 3.0 / C1 / the
+storage tail. Sequencing of the roadmap items TBD with the user.
 
 **R2b reconciliation for A1 (IMPORTANT — the design doc predates R2b's final state):** R2b **removed `snapshot_buffers`** (the raw fixed-block arena) and made the per-brick voxel payload a **VARIABLE-size index stream** (`index_bits·1000/32` words: 32 for 1-bit … 500 for 16-bit). So A1's fixed-capacity O(changed) upload can no longer assume a 1000-u32 fixed block per slot. A1 must choose: **(a)** re-add a RAW fixed-block path + an `index_bits==0 ⇒ raw` shader decode branch (the doc's "A1-β" — keeps the fixed-block free-list + O(changed) `queue_write_buffer`, at the cost of R2's VRAM win on the *streamed* path; recover it later via the persistent-interner A4.4), or **(b)** a variable-size paletted index arena (keeps R2 VRAM, needs a non-fixed-block allocator). Recommend (a) first. The A1 agent reconciles against the post-R2b code, not the pre-R2b doc text.

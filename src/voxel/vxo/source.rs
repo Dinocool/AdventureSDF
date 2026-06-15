@@ -511,6 +511,66 @@ impl BrickSource for VxoSource {
             }
         }
     }
+
+    /// **SHELL-FIRST candidate enumeration (D1d)** for a streamed `.vxo` — at LOD0, yield the world brick
+    /// coords of the PRESENT `BIDX` regions that intersect `[lo, hi]` (a region is `K³` bricks). The `.vxo`'s
+    /// region directory IS its spatial index, so this is a SUPERSET of every `Surface` brick: `classify`
+    /// returns `Surface`/`Interior` only for bricks in a present region (an absent region/brick ⇒ `Air`), so
+    /// iterating the present regions' bricks covers every `Surface` one — the buried/absent ones are pruned
+    /// by the downstream `classify`. The candidate count is bounded by the present regions overlapping the
+    /// shell (`Θ(surface)`), NOT the box volume, and crucially does NOT decode any region (it reads only the
+    /// in-RAM `BIDX` + computes coord ranges) — so the residency narrows the cube to the shell BEFORE paying
+    /// any region decode.
+    ///
+    /// **Coarse `lod > 0` falls back to the FULL BOX** (the trait default): the region grid is on the LOD0
+    /// brick grid, so it does not map 1:1 to a coarse coord, and the coarse pyramid is demand-SYNTHESIZED
+    /// (no coarse region directory to intersect). The box fallback is a correct superset; the coarse shells
+    /// are thin and bounded by the empty-memo, and a baked-`LODS` directory (§B1.7 option (b)) would let this
+    /// narrow at coarse LODs too once it lands. (No `.vxo` scene is wired into the live residency yet — the
+    /// scene-switch is deferred to Phase C/D, see the module doc — so the LOD0 superset is the path exercised
+    /// by the §B2.8 gate today.)
+    fn surface_bricks_in(&self, lo: IVec3, hi: IVec3, lod: u32, out: &mut Vec<IVec3>) {
+        if lod != 0 {
+            // Coarse: no region directory on the coarse grid — full box (correct superset; empty-memo bounds it).
+            for z in lo.z..=hi.z {
+                for y in lo.y..=hi.y {
+                    for x in lo.x..=hi.x {
+                        out.push(IVec3::new(x, y, z));
+                    }
+                }
+            }
+            return;
+        }
+        let k = self.region_edge();
+        // World brick coord -> local (offset-applied) coord: `local = coord - offset_bricks`. The box in LOCAL
+        // coords; intersect each present region's [r·K, r·K + K) local span with it, then shift back to world.
+        let lo_l = lo - self.offset_bricks;
+        let hi_l = hi - self.offset_bricks;
+        for dir in &self.bidx {
+            let rc = IVec3::new(dir.region_coord[0], dir.region_coord[1], dir.region_coord[2]);
+            let rlo = rc * k; // inclusive local brick min of this region
+            let rhi = rlo + IVec3::splat(k - 1); // inclusive local brick max
+            // Intersect the region's local span with the (local) box; skip a region wholly outside.
+            let ax = rlo.x.max(lo_l.x);
+            let bx = rhi.x.min(hi_l.x);
+            let ay = rlo.y.max(lo_l.y);
+            let by = rhi.y.min(hi_l.y);
+            let az = rlo.z.max(lo_l.z);
+            let bz = rhi.z.min(hi_l.z);
+            if ax > bx || ay > by || az > bz {
+                continue;
+            }
+            // Yield the overlap (shifted back to WORLD coords). A superset: every stored brick of the region is
+            // covered; the downstream classify prunes the absent/buried ones.
+            for z in az..=bz {
+                for y in ay..=by {
+                    for x in ax..=bx {
+                        out.push(IVec3::new(x, y, z) + self.offset_bricks);
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// The MERGED-GALLERY source (`VXO_FORMAT.md` §B2.4): several `.vxo` assets loaded into ONE world brick map by
@@ -627,6 +687,28 @@ impl BrickSource for MergedSource {
         match self.asset_at(coord) {
             Some(asset) => asset.source.classify(coord, lod),
             None => BrickClass::Air,
+        }
+    }
+
+    /// **SHELL-FIRST candidate enumeration (D1d)** across the merged gallery: ask EACH asset whose placed
+    /// brick AABB intersects `[lo, hi]` for its surface candidates, clipped to the overlap. Because assets
+    /// are placed DISJOINT (with a gap), their candidate sets don't collide; the union is a superset of every
+    /// merged-world `Surface` brick (a coord in no asset is `Air` and yields nothing — the merged clipmap
+    /// bound). Delegating to each asset's `surface_bricks_in` preserves the per-asset region-directory bound
+    /// (`Θ(surface)`, no region decode), so the merge stays shell-first too.
+    fn surface_bricks_in(&self, lo: IVec3, hi: IVec3, lod: u32, out: &mut Vec<IVec3>) {
+        for asset in &self.assets {
+            // The overlap of this asset's placed bounds with the query box (asset bounds are [lo, hi) excl).
+            let ax = asset.lo.x.max(lo.x);
+            let ay = asset.lo.y.max(lo.y);
+            let az = asset.lo.z.max(lo.z);
+            let bx = (asset.hi.x - 1).min(hi.x);
+            let by = (asset.hi.y - 1).min(hi.y);
+            let bz = (asset.hi.z - 1).min(hi.z);
+            if ax > bx || ay > by || az > bz {
+                continue; // this asset doesn't touch the query box
+            }
+            asset.source.surface_bricks_in(IVec3::new(ax, ay, az), IVec3::new(bx, by, bz), lod, out);
         }
     }
 }

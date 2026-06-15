@@ -87,11 +87,12 @@ pub struct StreamingConfig {
     /// desired set exceeds it the farthest bricks are dropped (logged). Default 400_000 — MEASURED (D1c
     /// benchmark, `examples/d1c_scaling.rs`): a cold fill at the origin-surface clipmap settles to **143_013**
     /// resident surface bricks (40.5 MB A4.4 VRAM), so 400_000 holds it with ~2.8× headroom and is NOT the
-    /// binding constraint. (NB: that 143k is the *enumeration-ceiling-truncated* near field — `desired_clipmap`
-    /// hits [`MAX_CLIP_ENUMERATION`] at 8 M LOD0 keys before reaching the coarse shells, so the FULL 64 m + 8-shell
-    /// reach is not actually streamed today. The real D1c blocker is CPU time, not this cap: a single cold
-    /// `update` costs ~38 s — 9 height taps × 8 M classify calls, single-threaded — which makes 64 m@0.05 m CPU
-    /// streaming non-performant and motivates the GPU-voxel-worldgen pivot. See `gpu-voxel-worldgen-pivot`.)
+    /// binding constraint. (HISTORICAL — the D1c blocker, FIXED by D1d: the cube [`desired_clipmap`] hit
+    /// [`MAX_CLIP_ENUMERATION`] at 8 M LOD0 keys before reaching the coarse shells, so the full 64 m + 8-shell
+    /// reach was not streamed and a single cold `update` cost ~38 s — 9 height taps × 8 M single-threaded
+    /// classify calls. **D1d — shell-first enumeration** ([`desired_clipmap_surface`] +
+    /// [`BrickSource::surface_bricks_in`]) now enumerates the surface candidates DIRECTLY in `Θ(H²)`, so all
+    /// coarse LODs enumerate and the cold `update` drops to milliseconds — see [`desired_clipmap_surface`].)
     pub max_resident_bricks: usize,
     /// Max bricks voxelized + enqueued→processed per `drain_work` call (per frame). Bounds the per-frame
     /// CPU cost of a big camera move; the rest carry in the queue to later frames. Default 256.
@@ -308,6 +309,72 @@ pub fn desired_clipmap(cam_world: [f32; 3], cfg: &StreamingConfig) -> FxHashMap<
     out
 }
 
+/// **SHELL-FIRST desired clipmap (D1d)** — the candidate surface keys to consider for residency, enumerated
+/// `Θ(H²)` DIRECTLY from the source's surface query instead of the `Θ(H³)` cube
+/// ([`desired_clipmap`]). This is the SSOT enumeration the live [`ResidencyManager::update`] uses.
+///
+/// # Why (the D1c blocker this fixes)
+/// [`desired_clipmap`] enumerates the full `level_box` CUBE per LOD. At `clip_half = 160` that is `321³ ≈
+/// 33 M` keys on LOD0 — it BLOWS [`MAX_CLIP_ENUMERATION`] (8 M) and BAILS before reaching the coarse shells,
+/// so the advertised 64 m + 8-shell reach was fiction; and `update` then classified all ~8 M keys
+/// single-threaded at ~38 s per camera crossing. But the RESIDENT set is only the surface SHELL (`Θ(H²)`,
+/// ~143 k bricks) — the work was `Θ(H³)` for an `Θ(H²)` result. Here we enumerate the surface candidates
+/// directly: each level's `level_box \ level_hole` region is handed to
+/// [`BrickSource::surface_bricks_in`], which yields a CONSERVATIVE SUPERSET of the bricks that
+/// [`classify`](BrickSource::classify) could call `Surface` — `O(surface)` per level, so the coarse LODs now
+/// enumerate (and [`MAX_CLIP_ENUMERATION`] becomes a slack `Θ(H²) ≪ 8 M` sanity bound that no longer binds).
+///
+/// # Identical TILING — only the ENUMERATION narrows
+/// The tiling SSOT ([`level_box`]/[`level_hole`]/[`level_resident`]) is UNCHANGED. Each surface candidate is
+/// then re-confirmed by [`classify`](BrickSource::classify) (pruning the superset's false positives) and
+/// box-clipped against `level_box \ level_hole` (so a candidate the source over-yielded outside the shell —
+/// or inside the finer level's hole — is dropped), EXACTLY as the cube path's keys were. So the resident set
+/// after classify + cap is IDENTICAL to the cube path's — the D1d oracle test
+/// ([`tests::shell_first_resident_set_matches_cube_oracle`]) asserts this set-equality on cliff / thin-wall /
+/// LOD-seam / flat scenes. A source WITHOUT a fast surface query falls back to
+/// [`BrickSource::surface_bricks_in`]'s default (the full box), so this degrades gracefully to the cube
+/// behaviour for it (still correct, just not faster).
+///
+/// Returned keyed by [`BrickKey`] (deduped by the map); the per-level `level_hole` clip + the box clip make
+/// the result the SAME `(coord, lod)` SET the cube path would, minus the buried/sky volume the source's
+/// surface query never yields. The [`MAX_CLIP_ENUMERATION`] ceiling still guards the accumulated candidate
+/// count (now `Θ(H²)`, so it does not bind at the shipping `clip_half`).
+pub fn desired_clipmap_surface(
+    cam_world: [f32; 3],
+    cfg: &StreamingConfig,
+    source: &dyn BrickSource,
+) -> FxHashMap<BrickKey, ()> {
+    let half = cfg.clip_half_bricks;
+    let mut out: FxHashMap<BrickKey, ()> = FxHashMap::default();
+    let mut candidates: Vec<IVec3> = Vec::new();
+    for lod in 0..=MAX_LOD {
+        let (lo, hi) = level_box(cam_world, lod, half);
+        let hole = level_hole(cam_world, lod, half);
+        // Ask the source for a conservative superset of the surface bricks in this level's box (Θ(H²)).
+        candidates.clear();
+        source.surface_bricks_in(lo, hi, lod, &mut candidates);
+        for &coord in &candidates {
+            // BOX-CLIP exactly as the cube path: a candidate the source over-yielded outside the level box —
+            // or inside the finer level's hole — is dropped, so the per-level tiling is bit-identical.
+            if !in_box(coord, lo, hi) {
+                continue;
+            }
+            if let Some((hlo, hhi)) = hole
+                && in_box(coord, hlo, hhi)
+            {
+                continue; // ceded to the finer level — no overlap
+            }
+            out.insert(BrickKey { coord, lod }, ());
+            if out.len() > MAX_CLIP_ENUMERATION {
+                // Defensive ceiling — now Θ(H²), so it does NOT bind at the shipping clip_half. A source whose
+                // surface query degenerated to the full box (the default) could still hit it; bail as before.
+                return out;
+            }
+        }
+    }
+    out
+}
+
 /// The approximate WORLD-metre centre distance of a clipmap brick `key` from `cam_world` — the cap-ranking key
 /// shared by the surface cap (A2). Brick centre = `(coord + 0.5)·brick_span(lod)`, so a far coarse shell ranks
 /// behind a near fine one only when it is genuinely farther in world metres.
@@ -427,10 +494,14 @@ impl ResidencyManager {
     ///   skipped + memoized in `pruned` (the SURFACE-FOLLOWING RESIDENCY bound — only the surface SHEET is
     ///   voxelized + kept resident, so residency + the per-frame voxelize are O(clip_half²), not O(clip_half³)).
     ///
-    /// `source` supplies the cheap [`BrickSource::classify`] predicate. The classify is an ADDITIVE FILTER on
-    /// top of the exact-tiling [`desired_clipmap`] (which is unchanged — the no-overlap/no-gap tiling holds);
-    /// it only removes provably-unhittable bricks. A finite/static source defaults to `Surface` (never prune),
-    /// so its behaviour is unchanged (the wholly-outside reject + the empty-memo already bound it).
+    /// `source` supplies the cheap [`BrickSource::classify`] predicate AND (D1d) the `Θ(H²)`
+    /// [`BrickSource::surface_bricks_in`] enumeration: the desired set is built by
+    /// [`desired_clipmap_surface`] (surface candidates enumerated DIRECTLY), then `classify` re-confirms each
+    /// candidate and prunes the superset's false positives. The classify is still an ADDITIVE FILTER on top of the
+    /// exact-tiling residency ([`level_resident`] / [`level_box`] / [`level_hole`] — UNCHANGED, the
+    /// no-overlap/no-gap tiling holds); it only removes provably-unhittable bricks. A finite/static source
+    /// defaults to the full-box `surface_bricks_in` + `Surface` classify (never prune), so its behaviour is
+    /// unchanged (the wholly-outside reject + the empty-memo already bound it).
     ///
     /// A LOD change is just a different [`BrickKey`] entering + the old one leaving (different coord grids),
     /// so there is NO retag path — each brick is voxelized at exactly one LOD. Does NOT itself voxelize, so a
@@ -438,7 +509,14 @@ impl ResidencyManager {
     /// whose key entered/left change, and a small move shifts only the LOD0 shell (coarse shells move
     /// `2^L×` less often). Returns the number of bricks dropped (so the caller can log churn).
     pub fn update(&mut self, cam_world: [f32; 3], cfg: &StreamingConfig, source: &dyn BrickSource) -> usize {
-        let desired = desired_clipmap(cam_world, cfg);
+        // SHELL-FIRST (D1d): enumerate the desired set from the source's Θ(H²) surface query, NOT the Θ(H³)
+        // cube. `desired` now holds the surface CANDIDATES (a conservative superset of `Surface` bricks, the
+        // classify below re-confirms + prunes). Every resident brick was classified `Surface` to be
+        // enqueued, so it is in this superset — the drop step below is correct (it never spuriously drops a
+        // resident surface brick). The tiling is unchanged; only the enumeration narrowed from cube to shell,
+        // restoring the coarse LODs (the cube path bailed at MAX_CLIP_ENUMERATION before reaching them) and
+        // killing the 38 s/crossing classify (was 9 taps × 8 M keys; now 9 taps × Θ(H²) candidates).
+        let desired = desired_clipmap_surface(cam_world, cfg, source);
 
         // Drop resident bricks that left the clipmap.
         let mut dropped = 0usize;
@@ -1055,5 +1133,212 @@ mod tests {
             surface_count(h2 as i32) < 0.5 * volume_count(h2 as i32),
             "the surface shell is far smaller than the clip volume at clip_half={h2}"
         );
+    }
+
+    // ===== D1d — SHELL-FIRST ENUMERATION ORACLE =================================================
+    // The candidate set MUST be a CONSERVATIVE SUPERSET of every `Surface` brick the full-cube path keeps; a
+    // missed brick is a render hole. These tests pin that: the NEW surface-first resident set (after classify
+    // + cap) is IDENTICAL to the OLD cube-enumerate-then-classify resident set, on scenes that STRESS the
+    // worldgen superset — a CLIFF (a steep height step spanning many vertical bricks across one column
+    // boundary), a THIN WALL, a surface crossing a LOD SEAM, and a FLAT plane. Plus: the coarse LODs now
+    // actually enumerate at the shipping clip_half = 160 (the cube path bailed at MAX_CLIP_ENUMERATION).
+
+    /// A synthetic [`BrickSource`] whose classify + `surface_bricks_in` are the WORLDGEN height-based logic
+    /// (the exact `3×3`-tap envelope + the column Surface-band derivation) over a PROGRAMMABLE height field
+    /// `h(wx, wz)`. This lets the oracle drive the worldgen surface predicate with adversarial heightfields a
+    /// real `HeightLayer` can't easily produce on demand (a vertical cliff, a 1-brick-wide wall), so the
+    /// superset guarantee is tested against the hard cases. The two methods share `surf_minmax`, exactly as
+    /// `WorldgenSource` shares [`WorldgenSource::column_surf_minmax`] — so this faithfully mirrors the shipping
+    /// source's contract (the classify formula here is copied verbatim from `source.rs`, with the SAME band
+    /// derivation in `surface_bricks_in`). `brick` is unused by `update` (classify prunes/keeps), so it is a
+    /// trivial air brick.
+    struct HeightFnSource<F: Fn(f64, f64) -> f64 + Sync> {
+        h: F,
+    }
+    impl<F: Fn(f64, f64) -> f64 + Sync> HeightFnSource<F> {
+        /// The `(surf_min, surf_max)` envelope over column `(bx, bz)` — the SAME `3×3` taps over the
+        /// `+1`-brick-expanded footprint that `WorldgenSource::column_surf_minmax` uses.
+        fn surf_minmax(&self, bx: i32, bz: i32, span: f64) -> (f64, f64) {
+            let wmx = bx as f64 * span;
+            let wmz = bz as f64 * span;
+            let mut lo = f64::INFINITY;
+            let mut hi = f64::NEG_INFINITY;
+            for iz in 0..3 {
+                let wz = wmz - span + (iz as f64) * 1.5 * span;
+                for ix in 0..3 {
+                    let wx = wmx - span + (ix as f64) * 1.5 * span;
+                    let h = (self.h)(wx, wz);
+                    lo = lo.min(h);
+                    hi = hi.max(h);
+                }
+            }
+            (lo, hi)
+        }
+    }
+    impl<F: Fn(f64, f64) -> f64 + Sync> BrickSource for HeightFnSource<F> {
+        fn brick(&self, _c: IVec3, _l: u32, _r: &BlockRegistry) -> Brick {
+            Brick::uniform(super::super::palette::BlockId::AIR)
+        }
+        fn classify(&self, coord: IVec3, lod: u32) -> BrickClass {
+            let span = brick_span(lod) as f64;
+            let (surf_min, surf_max) = self.surf_minmax(coord.x, coord.z, span);
+            let bmin = coord.y as f64 * span;
+            let bmax = bmin + span;
+            if bmin >= surf_max + span {
+                BrickClass::Air
+            } else if surf_min >= bmax + span {
+                BrickClass::Interior
+            } else {
+                BrickClass::Surface
+            }
+        }
+        fn surface_bricks_in(&self, lo: IVec3, hi: IVec3, lod: u32, out: &mut Vec<IVec3>) {
+            const PAD: i32 = 1;
+            let span = brick_span(lod) as f64;
+            for bz in lo.z..=hi.z {
+                for bx in lo.x..=hi.x {
+                    let (surf_min, surf_max) = self.surf_minmax(bx, bz, span);
+                    let by_lo = ((surf_min / span).floor() as i32 - 1 - PAD).max(lo.y);
+                    let by_hi = ((surf_max / span).floor() as i32 + PAD).min(hi.y);
+                    for by in by_lo..=by_hi {
+                        out.push(IVec3::new(bx, by, bz));
+                    }
+                }
+            }
+        }
+    }
+
+    /// The OLD resident-set ORACLE: enumerate the full `level_box \ level_hole` CUBE per LOD
+    /// ([`desired_clipmap`]), classify every key, and keep the `(coord, lod)` of those that are `Surface`.
+    /// This is the ground-truth set the surface-first path must reproduce EXACTLY. No cap (the oracle measures
+    /// the geometric surface set, not the cap).
+    fn cube_surface_set(cam: [f32; 3], cfg: &StreamingConfig, src: &dyn BrickSource) -> FxHashSet<BrickKey> {
+        desired_clipmap(cam, cfg)
+            .keys()
+            .filter(|k| matches!(src.classify(k.coord, k.lod), BrickClass::Surface))
+            .copied()
+            .collect()
+    }
+
+    /// The NEW resident-set under test: run `update` (which enumerates via the shell-first
+    /// [`desired_clipmap_surface`] + re-confirms with classify) at an UNCAPPED budget, and read the enqueued
+    /// surface keys — exactly the set that becomes resident. `max_resident_bricks = usize::MAX` so the cap
+    /// never perturbs the comparison (the oracle tests the ENUMERATION, not the cap, which has its own tests).
+    fn shell_surface_set(cam: [f32; 3], cfg: &StreamingConfig, src: &dyn BrickSource) -> FxHashSet<BrickKey> {
+        let mut mgr = ResidencyManager::new();
+        mgr.update(cam, cfg, src);
+        mgr.queued.iter().copied().collect()
+    }
+
+    /// THE ORACLE: surface-first ≡ cube-then-classify, on cliff / thin-wall / LOD-seam / flat. Uses a
+    /// `clip_half` small enough that the cube path actually runs (no MAX_CLIP_ENUMERATION bail), so the two
+    /// enumerations can be compared key-for-key. If `surface_bricks_in` ever MISSED a `Surface` brick the cube
+    /// path keeps, the set-equality assert fails (the candidate set is not a superset).
+    #[test]
+    fn shell_first_resident_set_matches_cube_oracle() {
+        // Small half so the cube path enumerates without bailing; an asymmetric cam to exercise sub-cell snap.
+        let cfg = StreamingConfig { clip_half_bricks: 10, max_resident_bricks: usize::MAX, max_bricks_per_frame: 1 };
+        let span0 = brick_span(0) as f64;
+
+        // (a) FLAT plane at y = 3.3 m: the surface is one near-constant band; trivial but the baseline.
+        let flat = HeightFnSource { h: |_x: f64, _z: f64| 3.3 };
+        // (b) CLIFF: a steep step at world x = 0 — h jumps from 0 to 40 m across one column boundary, so a
+        //     TALL vertical wall of surface bricks spans the seam between the two adjacent columns. This is the
+        //     case the per-column `±1`-brick taps + the PAD must bracket (the worst case for a missed brick).
+        let cliff = HeightFnSource { h: |x: f64, _z: f64| if x < 0.0 { 0.0 } else { 40.0 } };
+        // (c) THIN WALL: a 1-brick-wide ridge at x ∈ [0, span0) rising to 30 m, flat elsewhere — a thin sheet
+        //     of vertical surface bricks the column enumeration must not skip.
+        let wall = HeightFnSource {
+            h: move |x: f64, _z: f64| if (0.0..span0).contains(&x) { 30.0 } else { 1.0 },
+        };
+        // (d) LOD-SEAM crossing: a gentle slope so the surface threads through every LOD shell — the surface
+        //     crosses the level boundaries, stressing the per-level box-clip + hole-clip of the candidate set.
+        let slope = HeightFnSource { h: |x: f64, z: f64| 0.15 * x + 0.05 * z };
+
+        // Cameras chosen so the surface passes through the clipmap (near the terrain) — place the cam at the
+        // height the field takes near the origin so LOD0 straddles it.
+        let cases: [(&str, &dyn BrickSource, [f32; 3]); 4] = [
+            ("flat", &flat, [0.5, 3.3, 0.5]),
+            ("cliff", &cliff, [0.3, 20.0, 0.3]),
+            ("thin_wall", &wall, [0.3, 15.0, 0.3]),
+            ("lod_seam", &slope, [0.7, 0.0, -0.4]),
+        ];
+        for (name, src, cam) in cases {
+            let oracle = cube_surface_set(cam, &cfg, src);
+            let shell = shell_surface_set(cam, &cfg, src);
+            // SUPERSET (the load-bearing direction): every Surface brick the cube path keeps is in the shell
+            // candidate set — a failure here is a render hole. Report the first miss for diagnosis.
+            for k in &oracle {
+                assert!(
+                    shell.contains(k),
+                    "[{name}] shell-first MISSED a Surface brick the cube keeps: {k:?} (a render hole)"
+                );
+            }
+            // And IDENTICAL: the shell set introduces no spurious Surface key the cube path didn't keep (the
+            // classify re-confirm + box-clip prunes the superset's extras), so the resident set is bit-equal.
+            assert_eq!(oracle, shell, "[{name}] shell-first resident set must EQUAL the cube oracle set");
+            assert!(!oracle.is_empty(), "[{name}] the surface set is non-empty (the surface is in the clipmap)");
+        }
+    }
+
+    /// The SAME superset/equality oracle on the REAL [`WorldgenSource`] + the shipping height layer (not just
+    /// the synthetic source) — proving the production worldgen `surface_bricks_in` reproduces its own
+    /// `classify`-Surface set over the real band-limited terrain, at a comparable small `clip_half`.
+    #[test]
+    fn shell_first_matches_cube_oracle_real_worldgen() {
+        let layer = test_layer();
+        let lib = test_library();
+        let src = WorldgenSource::new(&layer, &lib, SEED);
+        let surf = layer.sample_world(0.0, 0.0, SEED).height;
+        let cfg = StreamingConfig { clip_half_bricks: 12, max_resident_bricks: usize::MAX, max_bricks_per_frame: 1 };
+        let cam = [0.0_f32, surf, 0.0];
+        let oracle = cube_surface_set(cam, &cfg, &src);
+        let shell = shell_surface_set(cam, &cfg, &src);
+        for k in &oracle {
+            assert!(shell.contains(k), "real worldgen: shell-first MISSED Surface brick {k:?} (a render hole)");
+        }
+        assert_eq!(oracle, shell, "real worldgen: shell-first resident set must EQUAL the cube oracle");
+        assert!(!oracle.is_empty(), "the real worldgen surface set is non-empty");
+    }
+
+    /// COARSE LODS NOW ENUMERATE at the shipping `clip_half = 160` (the D1d payoff). The cube
+    /// [`desired_clipmap`] bailed at [`MAX_CLIP_ENUMERATION`] on LOD0's `321³ ≈ 33 M` keys — so it was LOD0-only
+    /// and the coarse reach was fiction. The shell-first [`desired_clipmap_surface`] enumerates `Θ(H²)`
+    /// candidates, so EVERY level `0..=MAX_LOD` is present AND the candidate count stays well under
+    /// `MAX_CLIP_ENUMERATION`. We use the synthetic flat source (a real surface in every shell) so each level
+    /// has surface candidates to enumerate.
+    #[test]
+    fn shell_first_enumerates_all_coarse_lods_at_clip_half_160() {
+        let cfg = StreamingConfig::default(); // clip_half = 160, the shipping config
+        assert_eq!(cfg.clip_half_bricks, 160, "this test pins the shipping clip_half");
+        // A flat plane near y = 0 so the surface threads EVERY shell (each level's box straddles it).
+        let src = HeightFnSource { h: |_x: f64, _z: f64| 0.0 };
+        let cam = [0.0_f32, 0.0, 0.0];
+
+        // FIRST: the cube path is the broken baseline — it bails at the ceiling and is LOD0-only.
+        let cube = desired_clipmap(cam, &cfg);
+        assert!(cube.len() > MAX_CLIP_ENUMERATION, "the cube path hits the enumeration ceiling at clip_half 160");
+        let cube_has_coarse = cube.keys().any(|k| k.lod > 0);
+        assert!(!cube_has_coarse, "the cube path bailed before reaching ANY coarse shell (the D1c bug)");
+
+        // SHELL-FIRST: every LOD enumerates, and the candidate count is far under the ceiling.
+        let surf = desired_clipmap_surface(cam, &cfg, &src);
+        assert!(
+            surf.len() <= MAX_CLIP_ENUMERATION,
+            "shell-first stays under the enumeration ceiling (Θ(H²)), got {}",
+            surf.len()
+        );
+        for lod in 0..=MAX_LOD {
+            assert!(
+                surf.keys().any(|k| k.lod == lod),
+                "shell-first must enumerate LOD{lod} at clip_half 160 (coarse reach restored); got levels {:?}",
+                {
+                    let mut ls: Vec<u32> = surf.keys().map(|k| k.lod).collect();
+                    ls.sort_unstable();
+                    ls.dedup();
+                    ls
+                }
+            );
+        }
     }
 }

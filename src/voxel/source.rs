@@ -94,6 +94,46 @@ pub trait BrickSource: Sync {
     fn classify(&self, _coord: IVec3, _lod: u32) -> BrickClass {
         BrickClass::Surface
     }
+
+    /// **SHELL-FIRST ENUMERATION (D1d)** — yield a CONSERVATIVE SUPERSET of the bricks in the inclusive
+    /// AABB `[lo, hi]` (on the LOD-`lod` brick grid) that [`classify`](Self::classify) could return
+    /// [`BrickClass::Surface`] for. The whole point: the camera-following clipmap's resident set is the
+    /// SURFACE SHELL (`Θ(H²)`), but [`super::streaming::desired_clipmap`] enumerates the full clip VOLUME
+    /// (`Θ(H³)`) and then classifies every cube key — at `clip_half = 160` that is `321³ ≈ 33 M` keys on
+    /// LOD0 alone, which BLOWS the [`super::streaming::MAX_CLIP_ENUMERATION`] guard (so the coarse shells +
+    /// the far reach never enumerate) and costs ~38 s of single-threaded classify per camera crossing
+    /// (D1c). This method lets [`super::streaming::ResidencyManager::update`] enumerate the candidate
+    /// surface bricks DIRECTLY — `O(surface) = Θ(H²)` — instead of the cube, restoring the coarse LODs and
+    /// killing the 38 s update.
+    ///
+    /// # The conservative-superset CONTRACT (correctness is paramount — a missed brick is a render hole)
+    /// `surface_bricks_in` MUST yield a SUPERSET of every brick in `[lo, hi]` that `classify(coord, lod)`
+    /// returns `Surface` for. The downstream [`classify`](Self::classify) RE-CONFIRMS each candidate and
+    /// prunes the superset's false positives (so over-inclusion only costs a few extra classify calls — it
+    /// is always SAFE). A FALSE NEGATIVE — a `Surface` brick the candidate set omits — is NOT pruned by
+    /// anything and renders as a hole, so when in doubt INCLUDE MORE. The exact-tiling residency
+    /// ([`super::streaming::level_resident`]) is unchanged: the candidate is then `classify`-confirmed and
+    /// box-clipped exactly as the cube path's keys were, so the resident set is IDENTICAL to enumerating the
+    /// full cube and classifying it (the D1d oracle test asserts this set-equality).
+    ///
+    /// `out` is APPENDED to (not cleared) — the caller accumulates candidates across the per-level
+    /// box-minus-hole regions. Candidates may be DUPLICATED or fall outside `[lo, hi]`; the caller
+    /// box-clips + dedups via the resident/queued/memo guards, so an impl may be loose at the edges.
+    ///
+    /// # DEFAULT — the full box (today's behaviour, the graceful fallback)
+    /// The default enumerates EVERY brick in `[lo, hi]` — a trivially-correct (if not cheap) superset for any
+    /// source without a fast surface query. A source that CAN cheaply bound its surface (worldgen's
+    /// heightfield, a static map's occupied keys) overrides this to yield only the `Θ(H²)` shell.
+    fn surface_bricks_in(&self, lo: IVec3, hi: IVec3, _lod: u32, out: &mut Vec<IVec3>) {
+        // Graceful fallback: the full box (a correct superset — every Surface brick is in the box).
+        for z in lo.z..=hi.z {
+            for y in lo.y..=hi.y {
+                for x in lo.x..=hi.x {
+                    out.push(IVec3::new(x, y, z));
+                }
+            }
+        }
+    }
 }
 
 /// The WORLDGEN brick source: a thin wrapper over `(layer, lib, seed)` that delegates to the
@@ -151,13 +191,74 @@ impl BrickSource for WorldgenSource<'_> {
     #[inline]
     fn classify(&self, coord: IVec3, lod: u32) -> BrickClass {
         let span = brick_span(lod) as f64;
-        let world_min_x = coord.x as f64 * span;
-        let world_min_z = coord.z as f64 * span;
+        let (surf_min, surf_max) = self.column_surf_minmax(coord.x, coord.z, span);
         let brick_min_y = coord.y as f64 * span;
         let brick_max_y = brick_min_y + span;
-        // The XZ footprint EXPANDED by one brick on each side: [world_min - span, world_min + 2·span]. Sample a
-        // 3×3 grid over it (the corners, edge midpoints, and centre of the expanded footprint) — corners+centre
-        // is the conservative contract; the extra edge taps only tighten the bracket (more conservative).
+        if brick_min_y >= surf_max + span {
+            BrickClass::Air // wholly above the surface (+1-brick margin) ⇒ no solid voxel
+        } else if surf_min >= brick_max_y + span {
+            BrickClass::Interior // brick + the one above it fully buried ⇒ no exposed face
+        } else {
+            BrickClass::Surface // the surface (or its margin) passes through ⇒ keep resident
+        }
+    }
+
+    /// **SHELL-FIRST candidate enumeration (D1d)** for the worldgen heightfield: yield ONLY the bricks in
+    /// `[lo, hi]` (on grid `lod`) that [`classify`](Self::classify) could mark `Surface`, column by column —
+    /// `O((hi.x-lo.x)·(hi.z-lo.z))` columns, each yielding a thin O(1) vertical span, so the whole region is
+    /// `Θ(H²)` (the surface SHEET) instead of the `Θ(H³)` cube the default enumerates.
+    ///
+    /// PER-COLUMN EXACTNESS (the superset guarantee): for each brick column `(bx, bz)` this uses the IDENTICAL
+    /// per-column `surf_min`/`surf_max` envelope that [`classify`](Self::classify) computes (the shared
+    /// [`column_surf_minmax`](Self::column_surf_minmax) SSOT — same `3×3` taps over the `+1`-brick-expanded
+    /// XZ footprint, which already brackets CLIFFS: a steep slope's tall vertical wall of surface bricks
+    /// between adjacent columns is covered because each column's taps reach one brick into its neighbours, so
+    /// `surf_min`/`surf_max` of BOTH bordering columns span the cliff face). The vertical Surface range for a
+    /// column is then EXACTLY `classify`'s non-Air ∧ non-Interior `by`-band:
+    /// * non-Air     ⇔ `by·span < surf_max + span`      ⇔ `by <= floor((surf_max)/span)`            → `by_hi`,
+    /// * non-Interior⇔ `surf_min < (by+1)·span + span`  ⇔ `by >= floor((surf_min)/span) - 1`        → `by_lo`.
+    ///
+    /// We yield `by ∈ [by_lo, by_hi]` clamped to `[lo.y, hi.y]`, with a `+PAD`/`-PAD` (`PAD = 1`) safety
+    /// expansion: even though the band is derived from `classify`'s own formula (so it is already exact, not
+    /// merely a superset), the `±1` PAD absorbs any floating-point edge case at a brick boundary and keeps the
+    /// set a STRICT SUPERSET by construction — the downstream `classify` re-confirm prunes the pad's extra
+    /// rows for free. This is the property the D1d oracle test pins: the surface-first candidate set ⊇ every
+    /// `Surface` brick the full-cube path keeps (cliff, thin wall, LOD-seam, flat plane).
+    fn surface_bricks_in(&self, lo: IVec3, hi: IVec3, lod: u32, out: &mut Vec<IVec3>) {
+        const PAD: i32 = 1;
+        let span = brick_span(lod) as f64;
+        for bz in lo.z..=hi.z {
+            for bx in lo.x..=hi.x {
+                let (surf_min, surf_max) = self.column_surf_minmax(bx, bz, span);
+                // The exact `classify` Surface band for this column (see the doc derivation), then padded.
+                let by_lo = (surf_min / span).floor() as i32 - 1 - PAD;
+                let by_hi = (surf_max / span).floor() as i32 + PAD;
+                let by_lo = by_lo.max(lo.y);
+                let by_hi = by_hi.min(hi.y);
+                for by in by_lo..=by_hi {
+                    out.push(IVec3::new(bx, by, bz));
+                }
+            }
+        }
+    }
+}
+
+impl WorldgenSource<'_> {
+    /// The conservative `(surf_min, surf_max)` height envelope over brick COLUMN `(bx, bz)`'s XZ footprint at
+    /// brick `span` — the SHARED SSOT for both [`classify`](BrickSource::classify) (the per-key prune) and
+    /// [`surface_bricks_in`](BrickSource::surface_bricks_in) (the shell-first candidate band), so the two can
+    /// NEVER disagree about which `by` rows are `Surface` (the superset guarantee falls out of using one
+    /// formula). Samples a `3×3` grid over the footprint EXPANDED by one brick on each side
+    /// (`[world_min - span, world_min + 2·span]`, taps at `world_min - span + i·1.5·span`): the `+1`-brick
+    /// expansion makes the bound cover the halo neighbours' columns (face-exposure across a brick boundary
+    /// reads the neighbour) AND brackets a CLIFF between adjacent columns — corners+centre is the conservative
+    /// contract; the edge taps only tighten it. The worldgen surface is band-limited, so over the `3·span`
+    /// expanded footprint the taps bracket the true extrema and the `±span` `classify` margins absorb the
+    /// residual (the prune stays hole-free; see [`classify`](BrickSource::classify)'s cliff caveat).
+    #[inline]
+    fn column_surf_minmax(&self, bx: i32, bz: i32, span: f64) -> (f64, f64) {
+        let world_min_x = bx as f64 * span;
+        let world_min_z = bz as f64 * span;
         let mut surf_min = f64::INFINITY;
         let mut surf_max = f64::NEG_INFINITY;
         for iz in 0..3 {
@@ -169,13 +270,7 @@ impl BrickSource for WorldgenSource<'_> {
                 surf_max = surf_max.max(h);
             }
         }
-        if brick_min_y >= surf_max + span {
-            BrickClass::Air // wholly above the surface (+1-brick margin) ⇒ no solid voxel
-        } else if surf_min >= brick_max_y + span {
-            BrickClass::Interior // brick + the one above it fully buried ⇒ no exposed face
-        } else {
-            BrickClass::Surface // the surface (or its margin) passes through ⇒ keep resident
-        }
+        (surf_min, surf_max)
     }
 }
 
@@ -326,6 +421,50 @@ impl BrickSource for StaticVoxSource {
         }
         BrickClass::Interior
     }
+
+    /// **SHELL-FIRST candidate enumeration (D1d)** for a static map: yield ONLY the OCCUPIED bricks of the
+    /// matching pyramid level that intersect `[lo, hi]` — a static source already KNOWS its occupied set (the
+    /// `BrickMap` keys), so the candidate count is the asset's stored-brick count clipped to the box, never
+    /// the box volume. This is a SUPERSET of every `Surface` brick: `classify` only ever returns `Surface`
+    /// for a brick that is PRESENT in the map (an absent brick is `Air`), so iterating the present bricks
+    /// covers every `Surface` one (and the buried `Interior` ones, which `classify` then prunes). For a
+    /// CLAMPED coarse level (a tiny asset collapsed below `lod`, so the coord grid ≠ the pyramid level grid)
+    /// we fall back to the FULL BOX (the trait default) — the coord-grid mismatch makes the level's keys
+    /// non-comparable to `[lo, hi]`, and the wholly-outside reject + empty-memo bound that case as before.
+    fn surface_bricks_in(&self, lo: IVec3, hi: IVec3, lod: u32, out: &mut Vec<IVec3>) {
+        let level = self.level(lod);
+        if level != lod as usize {
+            // Clamped coarse level: the coord grid differs from the pyramid level grid, so we cannot intersect
+            // its keys with `[lo, hi]`. Fall back to the full box (correct superset; the empty-memo bounds it).
+            for z in lo.z..=hi.z {
+                for y in lo.y..=hi.y {
+                    for x in lo.x..=hi.x {
+                        out.push(IVec3::new(x, y, z));
+                    }
+                }
+            }
+            return;
+        }
+        // Iterate the level's occupied bricks (sparse), keeping those inside the box. The candidate count is
+        // the stored-brick count clipped to the shell — Θ(surface), not Θ(volume).
+        for (coord, _brick) in self.pyramid[level].iter() {
+            if in_box_incl(*coord, lo, hi) {
+                out.push(*coord);
+            }
+        }
+    }
+}
+
+/// True iff `coord` is inside the inclusive AABB `[lo, hi]` (the `source.rs`-local mirror of the streaming
+/// module's `in_box`, for the shell-first candidate box-clip).
+#[inline]
+fn in_box_incl(coord: IVec3, lo: IVec3, hi: IVec3) -> bool {
+    coord.x >= lo.x
+        && coord.x <= hi.x
+        && coord.y >= lo.y
+        && coord.y <= hi.y
+        && coord.z >= lo.z
+        && coord.z <= hi.z
 }
 
 /// Downsample one pyramid level into the next-coarser one by `2³`: each coarse voxel aggregates its `2×2×2`
