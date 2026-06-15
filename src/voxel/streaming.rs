@@ -84,8 +84,14 @@ pub struct StreamingConfig {
     pub clip_half_bricks: i32,
     /// Hard cap on resident bricks — a SAFETY bound so a mis-set `clip_half` can't blow VRAM. With the nested
     /// shells this should NOT bind (only NON-empty surface bricks are stored, a thin shell each level). If the
-    /// desired set exceeds it the farthest bricks are dropped (logged). Default 400_000 (D1a) — PROVISIONAL,
-    /// pending the D1c benchmark: the ~O(H²) surface shell grows ~20× with the 64 m LOD0 reach the flip forces.
+    /// desired set exceeds it the farthest bricks are dropped (logged). Default 400_000 — MEASURED (D1c
+    /// benchmark, `examples/d1c_scaling.rs`): a cold fill at the origin-surface clipmap settles to **143_013**
+    /// resident surface bricks (40.5 MB A4.4 VRAM), so 400_000 holds it with ~2.8× headroom and is NOT the
+    /// binding constraint. (NB: that 143k is the *enumeration-ceiling-truncated* near field — `desired_clipmap`
+    /// hits [`MAX_CLIP_ENUMERATION`] at 8 M LOD0 keys before reaching the coarse shells, so the FULL 64 m + 8-shell
+    /// reach is not actually streamed today. The real D1c blocker is CPU time, not this cap: a single cold
+    /// `update` costs ~38 s — 9 height taps × 8 M classify calls, single-threaded — which makes 64 m@0.05 m CPU
+    /// streaming non-performant and motivates the GPU-voxel-worldgen pivot. See `gpu-voxel-worldgen-pivot`.)
     pub max_resident_bricks: usize,
     /// Max bricks voxelized + enqueued→processed per `drain_work` call (per frame). Bounds the per-frame
     /// CPU cost of a big camera move; the rest carry in the queue to later frames. Default 256.
@@ -97,7 +103,9 @@ impl Default for StreamingConfig {
         Self {
             // D1a: 160 · 0.4 m = 64 m LOD0 reach; 160 · 0.4 · 2^7 = 8192 m total view (UNIFORM knob, all LODs).
             clip_half_bricks: 160,
-            // D1a PROVISIONAL cap (pending the D1c benchmark): the surface shell grows ~20× with the 64 m reach.
+            // MEASURED (D1c): the origin-surface cold fill settles to 143_013 resident bricks (40.5 MB VRAM),
+            // so 400_000 holds it with ~2.8× headroom. The cap is NOT the bottleneck — the 38 s/`update` CPU
+            // classify is (see the field doc + the GPU-voxel-worldgen pivot).
             max_resident_bricks: 400_000,
             max_bricks_per_frame: 256,
         }

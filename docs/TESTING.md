@@ -89,6 +89,12 @@ bench wants optimized timings).
 | `voxel_sponza_pack.rs::sponza_loads_and_packs_non_empty` | **long-running (~115 s)** asset-integrity check: load + `pack_brickmap` the full 16 MB shipped `sponza.vox` (33k bricks, 7.5M cells) | `TMP=D:\tmp_test TEMP=D:\tmp_test cargo test --test voxel_sponza_pack sponza_loads_and_packs_non_empty -- --ignored --nocapture` | `sponza pack: 33591 bricks, 7472628 voxel cells, 257 palette entries` |
 | `worldgen_parity.rs::print_reference_vectors` | **generator, not a bench** — prints the pinned determinism reference literals for paste when the height layer's output intentionally changes | `cargo test --features editor --test worldgen_parity print_reference_vectors -- --ignored --nocapture` | prints Rust literal tables (never writes a file) |
 
+### Standalone example (`examples/*.rs`)
+
+| Example | What it measures | Run command | Ballpark / output |
+|---|---|---|---|
+| `d1c_scaling.rs` | **D1c de-risk** — 64 m@0.05 m reach/perf scaling at the PRODUCTION `StreamingConfig::default()` (clip_half 160). A FAST single-pass version of the `voxel_worldgen_perf` benches (one cold `update` + one bounded drain + one full pack), because the full harness pays the O(8 M-key) `update` repeatedly and is impractically slow at clip_half 160. Reports the `desired_clipmap` enumeration-ceiling truncation, per-LOD distribution, surface/interior/air classify split, single-`update` wall, steady-state resident count, full-pack wall, and A4.4 resident VRAM. | `TMP=D:/tmp_test TEMP=D:/tmp_test cargo run --release --no-default-features --features fast,physics --example d1c_scaling` | prints the D1c table (≈ enumeration 8 M keys / hit-ceiling true / 143 k resident / 40.5 MB VRAM / 38 s update / 213 s full pack on this box) |
+
 ### Lib crate (`src/**`, `#[cfg(test)]`)
 
 These four are `#[ignore]`d in the lib build (`cargo test --lib` reports `4 ignored`):
