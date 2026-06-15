@@ -56,6 +56,12 @@ const DEFAULT_VOXEL_SIZE: f32 = 0.2;
 /// scene grid of sub-models.
 const VOX_MODEL_MAX: i32 = 256;
 
+/// Default per-axis supersample count for area-averaged albedo (an `S×S×S` grid of texture taps over each
+/// voxel's surface footprint; `S=3` = 27 candidate taps, matching asset-gen's `supersample=3`). At fine voxel
+/// sizes a voxel covers many texels, so a single point sample aliases; averaging the footprint fixes it.
+/// Overridable per-bake with `--supersample <N>` (`N=1` reproduces the old single point sample).
+const SUPERSAMPLE: usize = 3;
+
 fn main() -> anyhow::Result<()> {
     // Positional args first (skipping any `--flag`s), then collect the flags. The CLI:
     //   <out.{vox|vxo}> <voxel_metres> <in_mesh> <scale> [--store]
@@ -64,7 +70,27 @@ fn main() -> anyhow::Result<()> {
     // writes uncompressed region bodies instead of the default per-region zstd (`docs/VXO_FORMAT.md` §B1.9).
     let raw_args: Vec<String> = std::env::args().skip(1).collect();
     let store = raw_args.iter().any(|a| a == "--store");
-    let mut pos = raw_args.iter().filter(|a| !a.starts_with("--"));
+    // `--supersample <N>`: per-axis area-average tap count for albedo (default SUPERSAMPLE; N=1 = point sample).
+    let supersample = raw_args
+        .iter()
+        .position(|a| a == "--supersample")
+        .and_then(|p| raw_args.get(p + 1))
+        .and_then(|s| s.parse::<usize>().ok())
+        .map(|n| n.max(1))
+        .unwrap_or(SUPERSAMPLE);
+    // Positional args skip flags AND the flag VALUE that follows `--supersample` (so it isn't mistaken for one).
+    let mut skip_next = false;
+    let mut pos = raw_args.iter().filter(|a| {
+        if skip_next {
+            skip_next = false;
+            return false;
+        }
+        if *a == "--supersample" {
+            skip_next = true;
+            return false;
+        }
+        !a.starts_with("--")
+    });
     let out_path = pos.next().map(PathBuf::from).unwrap_or_else(|| PathBuf::from("assets/models/sponza.vox"));
     let voxel_size: f32 = pos.next().and_then(|s| s.parse().ok()).unwrap_or(DEFAULT_VOXEL_SIZE);
     // The input mesh path: an explicit 3rd arg, else the default Sponza glTF. Picked by extension (glTF / OBJ).
@@ -92,7 +118,8 @@ fn main() -> anyhow::Result<()> {
     // 2. Surface-voxelize (rayon-parallel rasterization; the dominant cost at fine voxel sizes — timed so a
     // bake self-reports where the wall-clock goes).
     let t_vox = std::time::Instant::now();
-    let mut grid = voxelize(&mesh, voxel_size);
+    println!("albedo supersample: {supersample}×{supersample}×{supersample} (area-averaged)");
+    let mut grid = voxelize(&mesh, voxel_size, supersample);
     println!(
         "grid: {}×{}×{} voxels, {} surface (voxelize {:.2}s)",
         grid.dims[0], grid.dims[1], grid.dims[2], grid.solid_count(), t_vox.elapsed().as_secs_f32()
@@ -167,8 +194,9 @@ fn write_vxo_output(out_path: &Path, data: &DotVoxData, voxel_size: f32, store: 
 // Mesh representation (decoupled from glTF so the fallback room is the same shape)
 // ============================================================================================
 
-/// A texture decoded to interleaved 8-bit RGBA (sRGB). Sampled with wrapping + nearest filtering — adequate
-/// for per-voxel albedo (a voxel is far coarser than a texel).
+/// A texture decoded to interleaved 8-bit RGBA (sRGB). Sampled with wrapping + BILINEAR filtering — at the
+/// fine voxel sizes the engine targets (0.05 m) a voxel still spans many texels, so a smooth per-tap filter
+/// (combined with the area supersample in [`sample_albedo`]) is what kills texel aliasing.
 struct Texture {
     width: u32,
     height: u32,
@@ -182,19 +210,48 @@ impl Texture {
         Self { width: 0, height: 0, rgba: Vec::new() }
     }
 
-    /// Nearest-sample sRGB RGBA at UV (wrapping). Returns `[r,g,b,a]` sRGB `u8`.
+    /// Fetch one texel's sRGB RGBA at integer texel coords (already wrapped into range).
+    #[inline]
+    fn texel(&self, x: u32, y: u32) -> [u8; 4] {
+        let i = ((y * self.width + x) * 4) as usize;
+        [self.rgba[i], self.rgba[i + 1], self.rgba[i + 2], self.rgba[i + 3]]
+    }
+
+    /// BILINEAR-sample sRGB RGBA at UV (wrapping on both axes). Returns `[r,g,b,a]` sRGB `u8`.
+    ///
+    /// COLOUR SPACE: the blend is done in sRGB `u8` space (the tool is sRGB end-to-end — the runtime loader
+    /// does the single sRGB→linear), so this preserves the one-conversion invariant. The slight gamma
+    /// inaccuracy of an sRGB-space blend is immaterial at voxel granularity and keeps the colour pipeline
+    /// uniform with the rest of the voxelizer.
     fn sample(&self, u: f32, v: f32) -> [u8; 4] {
         if self.width == 0 || self.height == 0 {
             return [255, 255, 255, 255];
         }
-        let wrap = |t: f32, n: u32| -> u32 {
-            let f = t - t.floor(); // [0,1)
-            ((f * n as f32) as u32).min(n - 1)
-        };
-        let x = wrap(u, self.width);
-        let y = wrap(v, self.height);
-        let i = ((y * self.width + x) * 4) as usize;
-        [self.rgba[i], self.rgba[i + 1], self.rgba[i + 2], self.rgba[i + 3]]
+        // Map UV → continuous texel space at texel CENTRES (the -0.5 puts the integer texel at its centre), so
+        // the bilinear weights are symmetric about a texel.
+        let fx = (u - u.floor()) * self.width as f32 - 0.5;
+        let fy = (v - v.floor()) * self.height as f32 - 0.5;
+        let x0f = fx.floor();
+        let y0f = fy.floor();
+        let tx = fx - x0f;
+        let ty = fy - y0f;
+        // Wrap the four neighbour texels (so sampling near the UV seam still bilinearly blends across the wrap).
+        let wrap = |c: i32, n: u32| -> u32 { c.rem_euclid(n as i32) as u32 };
+        let x0 = wrap(x0f as i32, self.width);
+        let y0 = wrap(y0f as i32, self.height);
+        let x1 = wrap(x0f as i32 + 1, self.width);
+        let y1 = wrap(y0f as i32 + 1, self.height);
+        let c00 = self.texel(x0, y0);
+        let c10 = self.texel(x1, y0);
+        let c01 = self.texel(x0, y1);
+        let c11 = self.texel(x1, y1);
+        let mut out = [0u8; 4];
+        for ch in 0..4 {
+            let top = c00[ch] as f32 * (1.0 - tx) + c10[ch] as f32 * tx;
+            let bot = c01[ch] as f32 * (1.0 - tx) + c11[ch] as f32 * tx;
+            out[ch] = (top * (1.0 - ty) + bot * ty).round().clamp(0.0, 255.0) as u8;
+        }
+        out
     }
 }
 
@@ -911,7 +968,7 @@ impl Grid {
 /// Surface-voxelize the mesh: for every triangle, conservatively rasterize into each voxel it overlaps
 /// (triangle–AABB SAT), marking it solid and recording the albedo of the triangle point nearest the voxel
 /// centre. The result is a SHELL (the visible surface), which is what we render + measure GI on.
-fn voxelize(mesh: &Mesh, voxel_size: f32) -> Grid {
+fn voxelize(mesh: &Mesh, voxel_size: f32, supersample: usize) -> Grid {
     // AABB of all triangle vertices.
     let mut lo = [f32::INFINITY; 3];
     let mut hi = [f32::NEG_INFINITY; 3];
@@ -996,7 +1053,7 @@ fn voxelize(mesh: &Mesh, voxel_size: f32) -> Grid {
                             let i = (x as usize)
                                 + (y as usize) * (dims[0] as usize)
                                 + (z as usize) * (dims[0] as usize) * (dims[1] as usize);
-                            cells.push((i, sample_albedo(mesh, t, center)));
+                            cells.push((i, sample_albedo(mesh, t, center, half, supersample)));
                         }
                     }
                 }
@@ -1092,17 +1149,84 @@ fn solid_fill(grid: &mut Grid) {
     }
 }
 
-/// The sRGB albedo for a voxel: the triangle's texture sampled at the barycentric UV of the triangle point
-/// nearest the voxel centre (so the colour is spatially right even when the voxel centre is off the
-/// triangle), or the flat `base` colour when the triangle is untextured.
-fn sample_albedo(mesh: &Mesh, t: &Triangle, center: [f32; 3]) -> [u8; 4] {
+/// The sRGB albedo for a voxel from one triangle's contribution: an AREA-AVERAGE of the texture over the
+/// triangle's surface footprint inside the voxel box (replacing the old single nearest-texel point sample).
+/// Untextured triangles return the flat `base` colour unchanged.
+///
+/// At fine voxel sizes a voxel covers many texels, so one point sample aliases (a lone texel decides the whole
+/// voxel). Instead we lay an `S×S` grid of sample points across the voxel box centred at `center` with
+/// half-extent `half` (default `S = SUPERSAMPLE = 3`), project EACH onto the triangle via
+/// `closest_point_barycentric`, and average the texture lookups. A sample is kept only if its nearest-triangle
+/// point actually lies inside the (slightly padded) voxel box — so off-triangle grid points (whose projection
+/// snaps to a far edge) don't pull the average toward colours outside the voxel's true footprint. If no sample
+/// lands on-footprint (a sliver), we fall back to the single nearest-point sample so the voxel still gets a
+/// sensible colour. Each tap is itself bilinear (`Texture::sample`), compounding to kill texel aliasing.
+///
+/// COLOUR SPACE: the average is in sRGB `u8` space (the tool is sRGB end-to-end; the runtime loader does the
+/// single sRGB→linear), preserving the one-conversion invariant.
+fn sample_albedo(mesh: &Mesh, t: &Triangle, center: [f32; 3], half: f32, supersample: usize) -> [u8; 4] {
     let Some(tex) = t.texture.and_then(|i| mesh.textures.get(i)) else {
         return t.base;
     };
-    let bary = closest_point_barycentric(center, &t.p);
-    let u = bary[0] * t.uv[0][0] + bary[1] * t.uv[1][0] + bary[2] * t.uv[2][0];
-    let v = bary[0] * t.uv[0][1] + bary[1] * t.uv[1][1] + bary[2] * t.uv[2][1];
-    tex.sample(u, v)
+    // Sample the texture at the barycentric UV of `p`'s nearest triangle point. Returns the texel colour plus
+    // the world-space nearest point (so the caller can reject off-footprint samples).
+    let tap = |p: [f32; 3]| -> ([u8; 4], [f32; 3]) {
+        let bary = closest_point_barycentric(p, &t.p);
+        let u = bary[0] * t.uv[0][0] + bary[1] * t.uv[1][0] + bary[2] * t.uv[2][0];
+        let v = bary[0] * t.uv[0][1] + bary[1] * t.uv[1][1] + bary[2] * t.uv[2][1];
+        let near = [
+            bary[0] * t.p[0][0] + bary[1] * t.p[1][0] + bary[2] * t.p[2][0],
+            bary[0] * t.p[0][1] + bary[1] * t.p[1][1] + bary[2] * t.p[2][1],
+            bary[0] * t.p[0][2] + bary[1] * t.p[1][2] + bary[2] * t.p[2][2],
+        ];
+        (tex.sample(u, v), near)
+    };
+
+    let s = supersample.max(1);
+    // Grid of sample points across the voxel box; for S=1 this is just the centre (= the old point sample).
+    // Offsets are the cell-centres of an S×S×S subdivision of [-half, half] on each axis, but we only need the
+    // triangle's footprint, so we walk the full S³ lattice and let the on-footprint test prune it (cheap for
+    // S=3 → 27 points). Project each onto the triangle and keep on-footprint taps.
+    let mut sum = [0u64; 4];
+    let mut n = 0u64;
+    // A small tolerance so a sample whose nearest point sits exactly on the box face still counts.
+    let tol = half * 1.0e-3 + 1.0e-6;
+    let step = if s == 1 { 0.0 } else { 2.0 * half / s as f32 };
+    let base = if s == 1 { 0.0 } else { -half + 0.5 * step };
+    for iz in 0..s {
+        for iy in 0..s {
+            for ix in 0..s {
+                let p = [
+                    center[0] + base + ix as f32 * step,
+                    center[1] + base + iy as f32 * step,
+                    center[2] + base + iz as f32 * step,
+                ];
+                let (col, near) = tap(p);
+                // On-footprint test: the projected triangle point must lie within the voxel box (padded by
+                // `tol`). This is exactly "the triangle's area clipped to the voxel box".
+                if (near[0] - center[0]).abs() <= half + tol
+                    && (near[1] - center[1]).abs() <= half + tol
+                    && (near[2] - center[2]).abs() <= half + tol
+                {
+                    for ch in 0..4 {
+                        sum[ch] += col[ch] as u64;
+                    }
+                    n += 1;
+                }
+            }
+        }
+    }
+    if n == 0 {
+        // Sliver: no grid point projected inside the box — fall back to the single nearest-point sample so the
+        // voxel still gets a sensible colour (the conservative SAT already proved the triangle overlaps).
+        return tap(center).0;
+    }
+    [
+        (sum[0] / n) as u8,
+        (sum[1] / n) as u8,
+        (sum[2] / n) as u8,
+        (sum[3] / n) as u8,
+    ]
 }
 
 /// Barycentric coordinates of the point on triangle `p` nearest `q` (Ericson, *Real-Time Collision
@@ -1257,118 +1381,289 @@ fn plane_box_overlap(normal: [f32; 3], vert: [f32; 3], half: [f32; 3]) -> bool {
 }
 
 // ============================================================================================
-// Palette quantization (median-cut)
+// Palette quantization (perceptual CIELAB k-means)
 // ============================================================================================
 
-/// Quantize the grid's solid-voxel albedos to a ≤255-colour palette (median-cut) and map each solid voxel to
-/// its nearest palette index (1-based; 0 is reserved for empty/air per the `.vox` convention). Returns the
-/// palette (sRGB RGBA) and a SPARSE `cell index → 1-based palette index` map over the solid cells only (a
-/// dense per-cell `Vec<u8>` would be billions of bytes for a large AABB; the solid set is millions).
+/// Maximum palette colours the `.vox` writer can carry (slot 0 is air → usable 1..=255).
+const MAX_PALETTE: usize = 255;
+
+/// k-means upper bound on Lloyd iterations. Convergence (no centroid moves more than `KMEANS_EPS²` in Lab²)
+/// usually trips well before this; the cap keeps a pathological input from looping unboundedly and — being a
+/// fixed function of the (deterministic) input — preserves byte-reproducibility.
+const KMEANS_MAX_ITERS: usize = 64;
+
+/// Convergence threshold for k-means, as a SQUARED Lab distance (a centroid moving less than ~0.32 ΔE between
+/// Lloyd sweeps is "settled"). Squared so we never take a `sqrt` in the hot loop.
+const KMEANS_EPS_SQ: f32 = 0.1;
+
+/// Quantize the grid's solid-voxel albedos to a ≤255-colour palette and map each solid voxel to its nearest
+/// palette index (1-based; 0 is reserved for empty/air per the `.vox` convention). Returns the palette (sRGB
+/// RGBA) and a SPARSE `cell index → 1-based palette index` map over the solid cells only (a dense per-cell
+/// `Vec<u8>` would be billions of bytes for a large AABB; the solid set is millions).
+///
+/// Clustering is **perceptual CIELAB k-means** (replacing the old sRGB median-cut): sRGB is perceptually
+/// non-uniform, so equal sRGB distances span unequal perceived differences and median-cut muddies/biases the
+/// palette. We convert each distinct albedo to CIELAB, cluster there with a deterministic seeded k-means
+/// (k-means++ init + Lloyd), and use the **count-weighted mean sRGB** of each cluster as the representative
+/// (truer than the Lab centroid). Determinism: the input is the `counts` map collected into a vec and
+/// `sort_unstable`d, the RNG is a fixed-seed LCG, and Lloyd's tie-breaks are by lowest index — so the same
+/// scene bakes byte-identical bytes. **Lossless short-circuit:** ≤255 distinct colours are emitted exactly.
 fn quantize(grid: &Grid) -> (Vec<[u8; 4]>, HashMap<usize, u8>) {
-    // Gather distinct solid albedos with counts (median-cut works on the distinct set, weighted by count).
+    // Gather distinct solid albedos with counts (clustering works on the DISTINCT set — bounded by texture
+    // content, not by the billions of solid voxels — weighted by how many voxels carry each colour).
     let mut counts: HashMap<[u8; 4], u32> = HashMap::new();
     for &c in grid.albedo.values() {
         *counts.entry(c).or_insert(0) += 1;
     }
     let mut pixels: Vec<([u8; 4], u32)> = counts.into_iter().collect();
-    pixels.sort_unstable(); // deterministic median-cut input (independent of HashMap order) → reproducible palette
-    let palette = median_cut(&pixels, 255);
+    pixels.sort_unstable(); // deterministic clustering input (independent of HashMap order) → reproducible palette
 
-    // Map every solid voxel to its nearest palette colour (1-based index), caching per distinct albedo.
+    let palette = build_palette(&pixels, MAX_PALETTE);
+
+    // Map every solid voxel to its nearest palette colour IN LAB (1-based index), caching per distinct albedo.
+    // The palette's own Lab is precomputed once so each cache miss is a linear scan over ≤255 Lab points.
+    let palette_lab: Vec<[f32; 3]> = palette.iter().map(|c| rgb_to_lab([c[0], c[1], c[2]])).collect();
     let mut indices: HashMap<usize, u8> = HashMap::with_capacity(grid.albedo.len());
     let mut nearest_cache: HashMap<[u8; 4], u8> = HashMap::new();
     for (&i, &c) in &grid.albedo {
-        let idx = *nearest_cache.entry(c).or_insert_with(|| nearest_palette(&palette, c));
+        let idx = *nearest_cache.entry(c).or_insert_with(|| nearest_palette_lab(&palette_lab, c));
         indices.insert(i, idx + 1); // 1-based; 0 = air
     }
     (palette, indices)
 }
 
-/// Median-cut colour quantization: recursively split the colour set along its widest channel at the
-/// (count-weighted) median until `max_colors` buckets exist, then average each bucket. Returns ≤`max_colors`
-/// representative sRGB colours. Robust to fewer distinct colours than `max_colors` (returns them all).
-fn median_cut(pixels: &[([u8; 4], u32)], max_colors: usize) -> Vec<[u8; 4]> {
+/// Build a ≤`max_colors` sRGB palette from distinct `(colour, count)` pairs via perceptual CIELAB k-means.
+/// `pixels` MUST already be sorted (deterministic input). Empty clusters are dropped. **Lossless
+/// short-circuit:** if the distinct-colour set is ≤`max_colors`, the exact colours are returned (no k-means),
+/// matching the asset-gen `quantize` fast path.
+fn build_palette(pixels: &[([u8; 4], u32)], max_colors: usize) -> Vec<[u8; 4]> {
     if pixels.is_empty() {
         return vec![[255, 255, 255, 255]];
     }
-    let mut buckets: Vec<Vec<([u8; 4], u32)>> = vec![pixels.to_vec()];
-    while buckets.len() < max_colors {
-        // Find the bucket with the largest channel range to split.
-        let mut best = None;
-        let mut best_range = 0i32;
-        let mut best_channel = 0usize;
-        for (bi, b) in buckets.iter().enumerate() {
-            if b.len() < 2 {
-                continue;
-            }
-            for ch in 0..3 {
-                let mut mn = 255i32;
-                let mut mx = 0i32;
-                for (c, _) in b {
-                    mn = mn.min(c[ch] as i32);
-                    mx = mx.max(c[ch] as i32);
-                }
-                if mx - mn > best_range {
-                    best_range = mx - mn;
-                    best = Some(bi);
-                    best_channel = ch;
-                }
-            }
-        }
-        let Some(bi) = best else { break }; // every bucket is a single colour
-        let mut bucket = buckets.swap_remove(bi);
-        bucket.sort_by_key(|(c, _)| c[best_channel]);
-        // Split at the weighted median.
-        let total: u32 = bucket.iter().map(|(_, w)| *w).sum();
-        let mut acc = 0u32;
-        let mut split = bucket.len() / 2;
-        for (i, (_, w)) in bucket.iter().enumerate() {
-            acc += *w;
-            if acc * 2 >= total {
-                split = (i + 1).clamp(1, bucket.len() - 1);
-                break;
-            }
-        }
-        let right = bucket.split_off(split);
-        buckets.push(bucket);
-        buckets.push(right);
+    // Lossless: already within the palette budget — emit every distinct colour verbatim (the order is the
+    // sorted input order, so it's reproducible).
+    if pixels.len() <= max_colors {
+        return pixels.iter().map(|(c, _)| *c).collect();
     }
-    // Average each bucket (count-weighted) into one representative colour.
-    buckets
-        .iter()
-        .filter(|b| !b.is_empty())
-        .map(|b| {
-            let mut sum = [0u64; 4];
-            let mut w = 0u64;
-            for (c, cnt) in b {
-                let cnt = *cnt as u64;
-                for a in 0..4 {
-                    sum[a] += c[a] as u64 * cnt;
-                }
-                w += cnt;
-            }
-            let w = w.max(1);
-            [(sum[0] / w) as u8, (sum[1] / w) as u8, (sum[2] / w) as u8, (sum[3] / w) as u8]
+
+    // Cluster in Lab. Each distinct colour is one weighted point; we keep its sRGB alongside so the cluster
+    // representative is the count-weighted MEAN sRGB (not the Lab centroid mapped back).
+    let labs: Vec<[f32; 3]> = pixels.iter().map(|(c, _)| rgb_to_lab([c[0], c[1], c[2]])).collect();
+    let weights: Vec<f32> = pixels.iter().map(|(_, w)| *w as f32).collect();
+
+    let assignments = kmeans_lab(&labs, &weights, max_colors);
+
+    // Representative colour = count-weighted mean sRGB of each cluster (truer than the Lab centroid), clamped
+    // to [0,255]; alpha = the count-weighted mean alpha. Drop empty clusters (k-means can leave some empty).
+    let k = max_colors;
+    let mut sum = vec![[0.0f64; 4]; k];
+    let mut wsum = vec![0.0f64; k];
+    for (pi, &cluster) in assignments.iter().enumerate() {
+        let (c, _) = pixels[pi];
+        let w = weights[pi] as f64;
+        for ch in 0..4 {
+            sum[cluster][ch] += c[ch] as f64 * w;
+        }
+        wsum[cluster] += w;
+    }
+    (0..k)
+        .filter(|&c| wsum[c] > 0.0)
+        .map(|c| {
+            let w = wsum[c];
+            [
+                (sum[c][0] / w).round().clamp(0.0, 255.0) as u8,
+                (sum[c][1] / w).round().clamp(0.0, 255.0) as u8,
+                (sum[c][2] / w).round().clamp(0.0, 255.0) as u8,
+                (sum[c][3] / w).round().clamp(0.0, 255.0) as u8,
+            ]
         })
         .collect()
 }
 
-/// Index of the palette colour nearest `c` by squared RGB distance (alpha ignored — surface voxels are
-/// opaque). Linear scan over ≤255 entries; results are cached per distinct albedo by the caller.
-fn nearest_palette(palette: &[[u8; 4]], c: [u8; 4]) -> u8 {
+/// Deterministic weighted k-means over Lab points. Returns, per input point, its cluster id `0..k`. Seeding is
+/// **k-means++** driven by a FIXED-seed LCG (no entropy/time → byte-reproducible bake; mirrors asset-gen's
+/// `kmeans2(minit="++", seed=0)`), then **Lloyd** iterations to convergence (`KMEANS_EPS_SQ`) or
+/// `KMEANS_MAX_ITERS`. Assignment ties break to the lowest centroid index; an empty cluster keeps its previous
+/// centroid (it is simply dropped by the caller). `k` is assumed `< labs.len()` (the caller short-circuits the
+/// lossless ≤k case), so k-means++ always finds distinct enough seeds.
+fn kmeans_lab(labs: &[[f32; 3]], weights: &[f32], k: usize) -> Vec<usize> {
+    let n = labs.len();
+    let dist2 = |a: &[f32; 3], b: &[f32; 3]| {
+        let (dl, da, db) = (a[0] - b[0], a[1] - b[1], a[2] - b[2]);
+        dl * dl + da * da + db * db
+    };
+
+    // --- k-means++ seeding (weighted) with a fixed-seed LCG. ---
+    let mut rng = Lcg::new(0x9E37_79B9_7F4A_7C15);
+    let mut centroids: Vec<[f32; 3]> = Vec::with_capacity(k);
+    // First centroid: a weighted random pick.
+    let total_w: f64 = weights.iter().map(|&w| w as f64).sum();
+    centroids.push(labs[weighted_pick(weights, total_w, rng.next_f64())]);
+    // Remaining centroids: pick proportional to weighted squared distance to the nearest chosen centroid.
+    let mut d2_nearest: Vec<f32> = labs.iter().map(|p| dist2(p, &centroids[0])).collect();
+    while centroids.len() < k {
+        // Weight each point by count × D² (k-means++ ∝ D², count-weighted because a colour stands in for many
+        // voxels). Deterministic given the sorted input + the fixed LCG draw.
+        let mut wsum = 0.0f64;
+        for i in 0..n {
+            wsum += weights[i] as f64 * d2_nearest[i] as f64;
+        }
+        let pick = if wsum <= 0.0 {
+            // All remaining points coincide with chosen centroids — fall back to the first under-used point.
+            // (Deterministic: lowest index whose nearest distance is largest, i.e. 0 here.)
+            0
+        } else {
+            let target = rng.next_f64() * wsum;
+            let mut acc = 0.0f64;
+            let mut chosen = n - 1;
+            for i in 0..n {
+                acc += weights[i] as f64 * d2_nearest[i] as f64;
+                if acc >= target {
+                    chosen = i;
+                    break;
+                }
+            }
+            chosen
+        };
+        let c = labs[pick];
+        centroids.push(c);
+        for i in 0..n {
+            let d = dist2(&labs[i], &c);
+            if d < d2_nearest[i] {
+                d2_nearest[i] = d;
+            }
+        }
+    }
+
+    // --- Lloyd iterations. ---
+    let mut assign = vec![0usize; n];
+    for _ in 0..KMEANS_MAX_ITERS {
+        // Assignment step: each point → nearest centroid (lowest index on ties).
+        for i in 0..n {
+            let mut best = 0usize;
+            let mut best_d = f32::INFINITY;
+            for (c, cen) in centroids.iter().enumerate() {
+                let d = dist2(&labs[i], cen);
+                if d < best_d {
+                    best_d = d;
+                    best = c;
+                }
+            }
+            assign[i] = best;
+        }
+        // Update step: each centroid → weighted mean of its members (in Lab). Track the largest move²; an
+        // empty cluster keeps its old centroid (it will be dropped downstream).
+        let mut sum = vec![[0.0f64; 3]; k];
+        let mut wsum = vec![0.0f64; k];
+        for i in 0..n {
+            let c = assign[i];
+            let w = weights[i] as f64;
+            for ch in 0..3 {
+                sum[c][ch] += labs[i][ch] as f64 * w;
+            }
+            wsum[c] += w;
+        }
+        let mut max_move2 = 0.0f32;
+        for c in 0..k {
+            if wsum[c] > 0.0 {
+                let new = [
+                    (sum[c][0] / wsum[c]) as f32,
+                    (sum[c][1] / wsum[c]) as f32,
+                    (sum[c][2] / wsum[c]) as f32,
+                ];
+                max_move2 = max_move2.max(dist2(&new, &centroids[c]));
+                centroids[c] = new;
+            }
+        }
+        if max_move2 < KMEANS_EPS_SQ {
+            break;
+        }
+    }
+    assign
+}
+
+/// A small linear-congruential generator (Numerical Recipes / Knuth MMIX constants). Used ONLY to seed
+/// k-means++ deterministically — a fixed seed makes the whole bake byte-reproducible (no `rand`/entropy/time
+/// dependency, satisfying the determinism invariant).
+struct Lcg {
+    state: u64,
+}
+
+impl Lcg {
+    fn new(seed: u64) -> Self {
+        Self { state: seed }
+    }
+    /// Next `u64` (MMIX LCG: `x' = a·x + c`).
+    fn next_u64(&mut self) -> u64 {
+        self.state = self.state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        self.state
+    }
+    /// Next `f64` in `[0,1)` (top 53 bits → mantissa).
+    fn next_f64(&mut self) -> f64 {
+        (self.next_u64() >> 11) as f64 / (1u64 << 53) as f64
+    }
+}
+
+/// Pick an index from `weights` proportional to its weight, given a draw `r ∈ [0,1)` and the precomputed
+/// `total` weight. Deterministic linear scan (returns the last index if `r` rounds past the end).
+fn weighted_pick(weights: &[f32], total: f64, r: f64) -> usize {
+    if total <= 0.0 {
+        return 0;
+    }
+    let target = r * total;
+    let mut acc = 0.0f64;
+    for (i, &w) in weights.iter().enumerate() {
+        acc += w as f64;
+        if acc >= target {
+            return i;
+        }
+    }
+    weights.len() - 1
+}
+
+/// Index of the palette colour nearest `c` by squared **CIELAB** distance (alpha ignored — surface voxels are
+/// opaque). `palette_lab` is the palette pre-converted to Lab. Linear scan over ≤255 entries; results are
+/// cached per distinct albedo by the caller. Replaces the old sRGB squared-distance `nearest_palette` so
+/// assignment is perceptual, matching the perceptual clustering.
+fn nearest_palette_lab(palette_lab: &[[f32; 3]], c: [u8; 4]) -> u8 {
+    let lab = rgb_to_lab([c[0], c[1], c[2]]);
     let mut best = 0usize;
-    let mut best_d = i64::MAX;
-    for (i, p) in palette.iter().enumerate() {
-        let dr = c[0] as i64 - p[0] as i64;
-        let dg = c[1] as i64 - p[1] as i64;
-        let db = c[2] as i64 - p[2] as i64;
-        let d = dr * dr + dg * dg + db * db;
+    let mut best_d = f32::INFINITY;
+    for (i, p) in palette_lab.iter().enumerate() {
+        let (dl, da, db) = (lab[0] - p[0], lab[1] - p[1], lab[2] - p[2]);
+        let d = dl * dl + da * da + db * db;
         if d < best_d {
             best_d = d;
             best = i;
         }
     }
     best as u8
+}
+
+/// Convert an sRGB `u8` triple to CIELAB (D65), porting asset-gen's `palette.py::_rgb_to_lab`: sRGB→linear
+/// (the standard 0.04045 piecewise), linear→XYZ via the standard 3×3 matrix, XYZ→Lab with `eps = 216/24389`
+/// and `kappa = 24389/27`. CIELAB is perceptually ~uniform, so Euclidean distance there approximates
+/// perceived colour difference — the basis for the perceptual palette + nearest-colour assignment.
+fn rgb_to_lab(rgb: [u8; 3]) -> [f32; 3] {
+    // sRGB u8 → [0,1] → linear.
+    let lin = |c: u8| -> f32 {
+        let s = c as f32 / 255.0;
+        if s > 0.04045 { ((s + 0.055) / 1.055).powf(2.4) } else { s / 12.92 }
+    };
+    let (r, g, b) = (lin(rgb[0]), lin(rgb[1]), lin(rgb[2]));
+    // linear sRGB → XYZ (D65), the standard matrix (matches asset-gen's `m`).
+    let x = 0.4124 * r + 0.3576 * g + 0.1805 * b;
+    let y = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+    let z = 0.0193 * r + 0.1192 * g + 0.9505 * b;
+    // Normalize by the D65 white point.
+    let (xn, yn, zn) = (x / 0.95047, y / 1.0, z / 1.08883);
+    let eps = 216.0 / 24389.0;
+    let kappa = 24389.0 / 27.0;
+    let f = |t: f32| -> f32 {
+        if t > eps { t.cbrt() } else { (kappa * t + 16.0) / 116.0 }
+    };
+    let (fx, fy, fz) = (f(xn), f(yn), f(zn));
+    [116.0 * fy - 16.0, 500.0 * (fx - fy), 200.0 * (fy - fz)]
 }
 
 // ============================================================================================
@@ -1519,7 +1814,7 @@ mod tests {
     /// GI reference). Assert the floor + ceiling planes are solid and all six face colours appear.
     #[test]
     fn fallback_room_bakes_all_six_faces() {
-        let grid = voxelize(&fallback_room(), 1.0);
+        let grid = voxelize(&fallback_room(), 1.0, SUPERSAMPLE);
         // Every one of the 6 distinctly-coloured faces must contribute voxels. Before the conservative ±1
         // candidate-AABB pad, grid-aligned faces were dropped and only 2 of 6 colours survived.
         let distinct: std::collections::HashSet<[u8; 4]> = grid.albedo.values().copied().collect();
@@ -1605,7 +1900,7 @@ f 1 3 4
         assert_eq!(mesh.triangles[0].base, [178, 178, 178, 255], "untextured face takes the neutral Kd fallback");
 
         // The same downstream voxelizer the glTF/fallback path uses produces a non-empty surface grid.
-        let grid = voxelize(&mesh, 0.5);
+        let grid = voxelize(&mesh, 0.5, SUPERSAMPLE);
         assert!(grid.solid_count() > 0, "the OBJ quad voxelizes to a non-empty surface");
     }
 
@@ -1714,7 +2009,7 @@ f 1 3 4
 
         // A coarse 0.5 m bake is fast but still exercises real texture sampling. The grid must be non-empty
         // with MANY distinct albedos (flat-factor-only would yield a handful of material colours).
-        let grid = voxelize(&mesh, 0.5);
+        let grid = voxelize(&mesh, 0.5, SUPERSAMPLE);
         assert!(grid.solid_count() > 0, "the coarse Bistro bake is non-empty");
         let distinct: std::collections::HashSet<[u8; 4]> = grid.albedo.values().copied().collect();
         assert!(
@@ -1722,5 +2017,200 @@ f 1 3 4
             "decoded textures yield MANY distinct albedos (got {}); flat factors would give few",
             distinct.len()
         );
+    }
+
+    // ----------------------------------------------------------------------------------------
+    // C3.1 — perceptual CIELAB k-means palette
+    // ----------------------------------------------------------------------------------------
+
+    /// `rgb_to_lab` matches known reference values (D65): black→L0, white→L≈100, and mid-grey 128→L≈53.6. A
+    /// guard that the sRGB→linear→XYZ→Lab port is correct (a wrong matrix / missing piecewise would shift L).
+    #[test]
+    fn rgb_to_lab_matches_reference() {
+        let black = rgb_to_lab([0, 0, 0]);
+        assert!(black[0].abs() < 0.01 && black[1].abs() < 0.01 && black[2].abs() < 0.01, "black → L*a*b* ≈ 0");
+        let white = rgb_to_lab([255, 255, 255]);
+        assert!((white[0] - 100.0).abs() < 0.1, "white → L ≈ 100 (got {})", white[0]);
+        // The asset-gen matrix rows don't sum EXACTLY to the white point (0.4124+0.3576+0.1805 = 0.9505 vs
+        // the 0.95047 Xn), so white's chroma is a hair off zero — neutral to within ~0.5 ΔE, which is correct
+        // for this standard truncated matrix.
+        assert!(white[1].abs() < 0.5 && white[2].abs() < 0.5, "white is ~neutral (a,b ≈ 0): {white:?}");
+        // sRGB 128 → linear ≈ 0.2158 → Y ≈ 0.2158 → L ≈ 53.59 (the canonical mid-grey lightness).
+        let grey = rgb_to_lab([128, 128, 128]);
+        assert!((grey[0] - 53.59).abs() < 0.2, "mid-grey → L ≈ 53.6 (got {})", grey[0]);
+    }
+
+    /// The CIELAB k-means palette keeps PERCEPTUALLY-DISTINCT colours distinct where the input exceeds the
+    /// budget. We build > `max` distinct colours dominated by two well-separated greens plus filler, force a
+    /// tiny palette, and assert both greens survive as separate entries (a perceptual clustering keeps the two
+    /// green modes apart). Also asserts DETERMINISM: two builds → byte-identical palette.
+    #[test]
+    fn cielab_palette_keeps_distinct_greens_and_is_deterministic() {
+        // Two clearly-distinct greens (the perceptual pair we must NOT merge) given heavy weight, plus a spread
+        // of filler colours so the distinct count exceeds the budget and k-means actually runs.
+        let mut pixels: Vec<([u8; 4], u32)> = Vec::new();
+        pixels.push(([40, 180, 60, 255], 500)); // vivid green
+        pixels.push(([90, 140, 70, 255], 500)); // olive/muted green — perceptually distinct from the first
+        // Filler: a ramp of distinct colours (low weight) to push past the palette budget.
+        for i in 0..40u32 {
+            pixels.push(([(i * 6) as u8, 10, (200 - i * 4) as u8, 255], 1));
+        }
+        pixels.sort_unstable();
+
+        let max = 8;
+        let pal = build_palette(&pixels, max);
+        assert!(pal.len() <= max, "palette respects the budget");
+
+        // Each input green must map to a palette entry that is itself green-dominant and close in Lab — i.e.
+        // they are NOT collapsed into one shared bucket. Assert the two greens land on DIFFERENT palette entries.
+        let pal_lab: Vec<[f32; 3]> = pal.iter().map(|c| rgb_to_lab([c[0], c[1], c[2]])).collect();
+        let g1 = nearest_palette_lab(&pal_lab, [40, 180, 60, 255]);
+        let g2 = nearest_palette_lab(&pal_lab, [90, 140, 70, 255]);
+        assert_ne!(g1, g2, "the two perceptually-distinct greens stay on separate palette entries");
+
+        // Determinism: a second build of the same (sorted) input is byte-identical.
+        let pal2 = build_palette(&pixels, max);
+        assert_eq!(pal, pal2, "the CIELAB k-means palette is byte-reproducible (fixed seed, sorted input)");
+    }
+
+    /// Perf + determinism at scale: k-means over a realistic distinct-colour count (10 000 → 255 palette)
+    /// runs in well under a second AND is byte-reproducible. Reports the wall-clock (the C3 perf gate).
+    #[test]
+    fn kmeans_palette_is_fast_and_deterministic_at_scale() {
+        // 10 000 distinct colours on a deterministic Lab-spanning ramp, each with a pseudo-count.
+        let mut pixels: Vec<([u8; 4], u32)> = Vec::with_capacity(10_000);
+        for i in 0..10_000u32 {
+            let r = (i % 256) as u8;
+            let g = ((i / 256) * 7 % 256) as u8;
+            let b = ((i * 13) % 256) as u8;
+            pixels.push(([r, g, b, 255], 1 + (i % 17)));
+        }
+        pixels.sort_unstable();
+        pixels.dedup_by_key(|(c, _)| *c);
+
+        let t = std::time::Instant::now();
+        let pal = build_palette(&pixels, 255);
+        let elapsed = t.elapsed();
+        assert!(pal.len() <= 255 && !pal.is_empty(), "produces a bounded non-empty palette");
+        let pal2 = build_palette(&pixels, 255);
+        assert_eq!(pal, pal2, "k-means palette is byte-reproducible at scale");
+        eprintln!(
+            "k-means: {} distinct colours → {} palette entries in {:.1} ms",
+            pixels.len(),
+            pal.len(),
+            elapsed.as_secs_f64() * 1000.0
+        );
+        // Generous ceiling: the offline tool is fine at hundreds of ms, but flag a pathological blowup.
+        assert!(elapsed.as_secs_f64() < 30.0, "k-means must stay tractable (took {elapsed:?})");
+    }
+
+    /// The lossless short-circuit: ≤`max` distinct colours are emitted EXACTLY (no k-means, no averaging), in
+    /// sorted input order.
+    #[test]
+    fn palette_lossless_short_circuit_returns_exact_colours() {
+        let mut pixels: Vec<([u8; 4], u32)> = vec![
+            ([10, 20, 30, 255], 3),
+            ([200, 100, 50, 255], 1),
+            ([0, 0, 0, 255], 7),
+        ];
+        pixels.sort_unstable();
+        let pal = build_palette(&pixels, 255);
+        let exact: Vec<[u8; 4]> = pixels.iter().map(|(c, _)| *c).collect();
+        assert_eq!(pal, exact, "≤max distinct colours are returned exactly (lossless), in sorted order");
+    }
+
+    // ----------------------------------------------------------------------------------------
+    // C3.2 — area-averaged albedo
+    // ----------------------------------------------------------------------------------------
+
+    /// Build a high-frequency black/white checkerboard texture (`n×n` texels, 1 texel per check) and a single
+    /// large quad in the XZ plane mapped to the full [0,1]² UV range. Used to prove area-averaging collapses
+    /// the checker to mid-grey at a voxel pitch far coarser than a check.
+    fn checkerboard_quad(n: u32, world: f32) -> Mesh {
+        let mut rgba = Vec::with_capacity((n * n * 4) as usize);
+        for y in 0..n {
+            for x in 0..n {
+                let on = (x + y) % 2 == 0;
+                let c = if on { 255 } else { 0 };
+                rgba.extend_from_slice(&[c, c, c, 255]);
+            }
+        }
+        let tex = Texture { width: n, height: n, rgba };
+        let h = world * 0.5;
+        // Two triangles for a quad in the y=0 plane, UVs covering [0,1]².
+        let p = [[-h, 0.0, -h], [h, 0.0, -h], [h, 0.0, h], [-h, 0.0, h]];
+        let uv = [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]];
+        let tri = |a: usize, b: usize, c: usize| Triangle {
+            p: [p[a], p[b], p[c]],
+            uv: [uv[a], uv[b], uv[c]],
+            texture: Some(0),
+            base: [255, 255, 255, 255],
+        };
+        Mesh { triangles: vec![tri(0, 1, 2), tri(0, 2, 3)], textures: vec![tex] }
+    }
+
+    /// Per-voxel-albedo variance over the solid (textured) cells' grey level. The baseline (point sample, S=1)
+    /// aliases each voxel to pure black or white → high variance; area-averaging (S>1) pulls each toward the
+    /// mid-grey footprint average → variance drops. Returns `(mean_grey, variance)`.
+    fn grey_variance(grid: &Grid) -> (f64, f64) {
+        let greys: Vec<f64> = grid.albedo.values().map(|c| c[0] as f64).collect();
+        let n = greys.len() as f64;
+        let mean = greys.iter().sum::<f64>() / n;
+        let var = greys.iter().map(|g| (g - mean) * (g - mean)).sum::<f64>() / n;
+        (mean, var)
+    }
+
+    /// Area-averaging a high-frequency checkerboard at a COARSE voxel pitch yields ~mid-grey voxels (not
+    /// aliased pure black/white), and the per-voxel-albedo variance DROPS sharply vs the point-sample baseline
+    /// (`SUPERSAMPLE = 1`). This is the C3.2 acceptance: the area average kills texel aliasing.
+    #[test]
+    fn area_average_reduces_albedo_variance_on_checkerboard() {
+        // A high-frequency checker whose period is NON-commensurate with the voxel pitch, so the per-voxel
+        // point sample scatters across both checker phases (genuine texel aliasing → high per-voxel variance),
+        // while the area average sees ≈half of each phase in every voxel → ~mid-grey (low variance). 50 checks
+        // over 6.4 m = 0.128 m/check; voxelize at 0.8 m → 6.25 checks/voxel (non-integer) so no phase locking.
+        // A finer supersample (5×5) is used so the area average resolves the ~6 checks per voxel cleanly.
+        let mesh = checkerboard_quad(50, 6.4);
+        let voxel = 0.8;
+        let s_area = 5;
+
+        let point = voxelize(&mesh, voxel, 1); // baseline: single nearest-texel point sample
+        let area = voxelize(&mesh, voxel, s_area); // area-averaged
+
+        assert!(point.solid_count() > 0 && area.solid_count() > 0, "both bakes produce solid voxels");
+
+        let (point_mean, point_var) = grey_variance(&point);
+        let (area_mean, area_var) = grey_variance(&area);
+
+        // Area average lands near mid-grey (≈128) — NOT aliased to the extremes.
+        assert!(
+            (area_mean - 128.0).abs() < 60.0,
+            "area-averaged voxels are ~mid-grey (mean {area_mean:.1}), not aliased black/white"
+        );
+        // The headline gate: per-voxel variance drops sharply with area-averaging vs the point baseline.
+        assert!(
+            area_var < point_var * 0.5,
+            "per-voxel variance drops with area-averaging: point {point_var:.1} → area {area_var:.1}"
+        );
+        eprintln!(
+            "checkerboard variance: point(S=1) mean {point_mean:.1} var {point_var:.1} | \
+             area(S={s_area}) mean {area_mean:.1} var {area_var:.1} \
+             (drop {:.1}×)",
+            point_var / area_var.max(1e-9)
+        );
+    }
+
+    /// Bilinear `Texture::sample`: at a texel CENTRE the sample equals that texel exactly (no neighbour bleed),
+    /// and exactly BETWEEN two texels it is their average (the 4-tap blend), proving the filter upgrade.
+    #[test]
+    fn texture_sample_is_bilinear() {
+        // 2×1 texture: left texel black, right texel white.
+        let tex = Texture { width: 2, height: 1, rgba: vec![0, 0, 0, 255, 255, 255, 255, 255] };
+        // Texel centres are at u = 0.25 (left) and u = 0.75 (right).
+        assert_eq!(tex.sample(0.25, 0.5)[0], 0, "at the left texel centre → exact black");
+        assert_eq!(tex.sample(0.75, 0.5)[0], 255, "at the right texel centre → exact white");
+        // Halfway between the two centres (u = 0.5) → average grey (~128).
+        let mid = tex.sample(0.5, 0.5)[0];
+        assert!((mid as i32 - 128).abs() <= 1, "midway between texels → bilinear average (~128, got {mid})");
     }
 }
