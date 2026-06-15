@@ -276,6 +276,15 @@ impl BlockRegistry {
         self.blocks.len()
     }
 
+    /// True iff ANY registered block has non-zero emissive radiance — i.e. the scene CAN have NEE lights. When
+    /// false (the common worldgen-terrain case: no glowing blocks) the per-brick air-exposed-emissive gather
+    /// can be SKIPPED entirely (it would find nothing), turning the O(resident) light pass into an O(1) check.
+    /// The incremental `snapshot_patch` uses this so a non-emissive scene's per-move re-pack stays O(changed).
+    #[inline]
+    pub fn has_emitters(&self) -> bool {
+        self.blocks.iter().any(|b| b.emissive != [0.0, 0.0, 0.0])
+    }
+
     /// True iff only the AIR block is registered (an empty world palette).
     #[inline]
     pub fn is_empty(&self) -> bool {

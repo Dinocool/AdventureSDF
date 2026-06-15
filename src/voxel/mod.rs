@@ -24,6 +24,7 @@ pub mod cornell;
 pub mod edits;
 pub mod gallery;
 pub mod gpu;
+pub mod incremental;
 pub mod palette;
 /// Stage 6 — voxel physics (the player walks the cubes). Feature-gated on `physics` (pulls `rapier3d`).
 #[cfg(feature = "physics")]

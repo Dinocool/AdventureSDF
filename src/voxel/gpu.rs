@@ -161,6 +161,16 @@ impl GpuBrickMeta {
         Self { voxel_origin, voxel_offset: BRICK_UNIFORM_FLAG | block.0 as u32, world_min, lod }
     }
 
+    /// An ALL-ZERO meta for an UNUSED slot in the incremental fixed-capacity buffers (storage plan: the
+    /// per-brick slot allocator never trace-references a freed slot — its AABB is collapsed to
+    /// [`super::incremental::degenerate_aabb`] so the BLAS skips it — but the meta still needs defined bytes for
+    /// the buffer. `voxel_offset == 0` clears the uniform flag, so even if it were ever read it points at the
+    /// arena's first word, not garbage). `Zeroable`-equivalent, written by name for clarity.
+    #[inline]
+    pub fn zeroed() -> Self {
+        Self { voxel_origin: [0; 3], voxel_offset: 0, world_min: [0.0; 3], lod: 0 }
+    }
+
     /// True iff this meta is a collapsed UNIFORM brick (no voxel array; block id in the low bits).
     #[inline]
     pub fn is_uniform(&self) -> bool {
@@ -467,6 +477,113 @@ pub struct ResidentBrick<'a> {
     pub lod: u32,
 }
 
+/// The voxel content one resident brick contributes to the GPU buffers, produced by the [`pack_one`] SSOT and
+/// consumed BOTH by the full [`pack_resident_set`] (which concatenates these in deterministic order) and by the
+/// INCREMENTAL re-packer ([`super::incremental`], which writes each into a fixed slot via `queue_write_buffer`).
+/// Factoring the per-brick byte production here is what guarantees the incremental patch is byte-identical to a
+/// from-scratch pack for the same `(key → brick)` mapping — the two paths can never drift.
+#[derive(Clone, Debug, PartialEq)]
+pub enum BrickVoxels {
+    /// A UNIFORM-incl-halo brick (storage plan R1): no voxel-array entries; the single block id rides in the
+    /// meta (`GpuBrickMeta::uniform`). Costs ZERO voxel-buffer bytes.
+    Uniform(BlockId),
+    /// A DENSE brick: its full haloed `10³` (= [`halo_cells`]`(lod)`) grid of block ids, in [`halo_index`]
+    /// order. The incremental packer writes this into the brick's voxel-arena slot; the full packer appends it.
+    Dense(Vec<u32>),
+}
+
+/// The fully-resolved GPU contribution of ONE resident brick: its BLAS AABB, its world-voxel origin, its
+/// world-min corner, its LOD, and its voxel content ([`BrickVoxels`]). The `voxel_offset` in the final
+/// [`GpuBrickMeta`] is filled in by the CALLER (it owns the layout: a running offset for the full packer, a
+/// fixed arena slot for the incremental one), so this struct is layout-independent — pure function of the
+/// brick + its same-LOD neighbours. This is the SSOT both packers build a brick from.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PackedBrick {
+    /// The (epsilon-grown) BLAS AABB for this brick — pure function of `(coord, lod)`.
+    pub aabb: GpuBrickAabb,
+    /// The brick's world-VOXEL origin (`coord · BRICK_EDGE`).
+    pub voxel_origin: [i32; 3],
+    /// The brick's TRUE world-min corner (`coord · brick_span(lod)`).
+    pub world_min: [f32; 3],
+    /// The brick's clipmap LOD.
+    pub lod: u32,
+    /// Uniform (no voxel bytes) or dense (a haloed `10³` grid).
+    pub voxels: BrickVoxels,
+}
+
+impl PackedBrick {
+    /// The [`GpuBrickMeta`] for this brick once its dense voxels live at `dense_offset` in the voxel buffer
+    /// (ignored for a uniform brick, which packs its id into the meta). The SSOT meta builder both packers call
+    /// so the uniform-flag / offset rules are defined exactly once.
+    #[inline]
+    pub fn meta(&self, dense_offset: u32) -> GpuBrickMeta {
+        match &self.voxels {
+            BrickVoxels::Uniform(block) => {
+                GpuBrickMeta::uniform(self.voxel_origin, *block, self.world_min, self.lod)
+            }
+            BrickVoxels::Dense(_) => {
+                GpuBrickMeta::dense(self.voxel_origin, dense_offset, self.world_min, self.lod)
+            }
+        }
+    }
+}
+
+/// Produce ONE resident brick's GPU contribution (AABB + origin + voxel content) from the brick `e` and the
+/// resident map `by_key` (its same-LOD neighbours, for the halo + the R1 uniform-incl-halo decision). The
+/// SSOT per-brick byte producer: [`pack_resident_set`] concatenates these in deterministic order and the
+/// incremental re-packer ([`super::incremental`]) writes each into a fixed slot — so a brick re-packed in
+/// isolation is byte-identical to the same brick in a from-scratch full pack (the incremental-vs-full A/B
+/// equality test is the completeness gate). Does NOT gather lights (the caller owns the light list); a uniform
+/// brick exposes no emissive faces, and a dense brick's faces are gathered from the concatenated buffer.
+pub fn pack_one(
+    e: &ResidentBrick<'_>,
+    by_key: &std::collections::HashMap<(IVec3, u32), &Brick>,
+) -> PackedBrick {
+    let lod = e.lod;
+    let coord = e.coord;
+    let span = brick_span(lod);
+    let world_min = [coord.x as f32 * span, coord.y as f32 * span, coord.z as f32 * span];
+    let voxel_origin = [coord.x * BRICK_EDGE, coord.y * BRICK_EDGE, coord.z * BRICK_EDGE];
+    let aabb = brick_aabb(world_min, lod);
+
+    // STORAGE PLAN R1 — UNIFORM-INCLUDING-HALO collapse (the exact rule pack_resident_set's loop used): a brick
+    // whose full haloed 10³ grid is one solid block carries no voxel array.
+    if let Some(block) = uniform_incl_halo_block(e, by_key) {
+        return PackedBrick { aabb, voxel_origin, world_min, lod, voxels: BrickVoxels::Uniform(block) };
+    }
+
+    // DENSE: the full haloed 10³ grid in halo_index order (core from the brick, border from the same-LOD
+    // neighbour, AIR where absent) — byte-identical to the inline fill pack_resident_set previously did.
+    let h = halo_edge(0); // constant haloed edge (= BRICK_EDGE + 2 = 10) at every LOD
+    let mut voxels = Vec::with_capacity(halo_cells(0));
+    for hz in 0..h {
+        for hy in 0..h {
+            for hx in 0..h {
+                debug_assert_eq!(voxels.len(), halo_index(hx, hy, hz, lod));
+                let cx = hx - 1;
+                let cy = hy - 1;
+                let cz = hz - 1;
+                let in_core =
+                    (0..BRICK_EDGE).contains(&cx) && (0..BRICK_EDGE).contains(&cy) && (0..BRICK_EDGE).contains(&cz);
+                let block = if in_core {
+                    e.brick.get(cx, cy, cz)
+                } else {
+                    neighbour_border_cell(by_key, coord, lod, IVec3::new(cx, cy, cz))
+                };
+                voxels.push(block.0 as u32);
+            }
+        }
+    }
+    PackedBrick { aabb, voxel_origin, world_min, lod, voxels: BrickVoxels::Dense(voxels) }
+}
+
+/// Build the `(coord, lod) → &Brick` index over a resident-brick slice — the same map [`pack_resident_set`]
+/// builds internally, exposed so the incremental re-packer ([`super::incremental`]) can pass it to [`pack_one`]
+/// (one SSOT for the key shape). A brick's halo reads its SAME-LOD neighbours through this map.
+pub fn build_by_key<'a>(entries: &[ResidentBrick<'a>]) -> std::collections::HashMap<(IVec3, u32), &'a Brick> {
+    entries.iter().map(|e| ((e.coord, e.lod), e.brick)).collect()
+}
+
 /// Pack a camera-following RESIDENT brick set (clipmap-keyed by `(coord, lod)`) into the SSOT GPU layout —
 /// the streaming successor to [`pack_brickmap`]. Each entry's brick is ALREADY the `8³` grid at its LOD
 /// (the voxelizer samples each `(coord, lod)` directly at its `lod_voxel_size(lod)` spacing — a true mip),
@@ -479,9 +596,6 @@ pub struct ResidentBrick<'a> {
 /// AIR — the conservative seam behaviour, which the AABB-overlap + nearest-hit DDA then resolve across the
 /// LOD step (see the module / streaming docs on cross-LOD seams).
 pub fn pack_resident_set(entries: &[ResidentBrick<'_>], registry: &BlockRegistry) -> GpuBrickPatch {
-    use std::collections::HashMap;
-
-    let h = halo_edge(0); // constant haloed edge (= BRICK_EDGE + 2 = 10) at every LOD
     let mut patch = GpuBrickPatch {
         aabbs: Vec::with_capacity(entries.len()),
         metas: Vec::with_capacity(entries.len()),
@@ -498,62 +612,28 @@ pub fn pack_resident_set(entries: &[ResidentBrick<'_>], registry: &BlockRegistry
     // because coords now OVERLAP across LOD grids — the same integer coord at two LODs is two different world
     // bricks, so the lod must be part of the key. A border whose neighbour is absent or at a DIFFERENT lod (a
     // shell boundary) falls back to AIR (the conservative pre-halo behaviour — no cross-LOD halo).
-    let by_key: HashMap<(IVec3, u32), &Brick> =
-        entries.iter().map(|e| ((e.coord, e.lod), e.brick)).collect();
+    let by_key = build_by_key(entries);
 
     for e in entries {
-        let lod = e.lod;
-        let coord = e.coord;
-        let span = brick_span(lod);
-        let world_min = [coord.x as f32 * span, coord.y as f32 * span, coord.z as f32 * span];
-        // BLAS AABB grown by the seam epsilon (overlapping neighbours); the meta keeps the TRUE `world_min`.
-        patch.aabbs.push(brick_aabb(world_min, lod));
-
-        let voxel_origin = [coord.x * BRICK_EDGE, coord.y * BRICK_EDGE, coord.z * BRICK_EDGE];
-
-        // STORAGE PLAN R1 — UNIFORM-INCLUDING-HALO collapse. A brick whose FULL haloed `10³` grid is ONE solid
-        // block (every CORE *and* every HALO cell identical) carries NO per-voxel array: the meta flags it
-        // uniform + packs the single block id. This is the DEEP-INTERIOR case (the bulk of the solid fill) and
-        // is robust by construction — a fully-buried brick whose halo also matches has zero air-exposed faces,
-        // so the seam/normal logic the halo exists for never fires (and `gather_lights_into` would cull it as
-        // unexposed anyway). A core-uniform brick whose HALO DIFFERS (a surface brick: a neighbour, or a
-        // clipmap shell boundary contributing AIR) is NOT collapsed — its boundary faces are exposed and need
-        // the dense halo for the correct entry-face normal, so it falls through to the byte-identical dense path.
-        if let Some(block) = uniform_incl_halo_block(e, &by_key) {
-            patch.metas.push(GpuBrickMeta::uniform(voxel_origin, block, world_min, lod));
-            // No voxel-array emit, and no light gather: a uniform-incl-halo brick is fully buried (every face
-            // neighbour is the same solid block), so it exposes no emissive faces — identical to the dense path,
-            // where `gather_lights_into`'s air-exposure test would reject every interior voxel.
-            continue;
-        }
-
-        let voxel_offset = patch.voxels.len() as u32;
-        patch.metas.push(GpuBrickMeta::dense(voxel_origin, voxel_offset, world_min, lod));
-
-        for hz in 0..h {
-            for hy in 0..h {
-                for hx in 0..h {
-                    debug_assert_eq!(patch.voxels.len() - voxel_offset as usize, halo_index(hx, hy, hz, lod));
-                    // Core cells are halo index [1, BRICK_EDGE]; halo index 0 / h-1 is the 1-cell border ring.
-                    let cx = hx - 1;
-                    let cy = hy - 1;
-                    let cz = hz - 1;
-                    let in_core =
-                        (0..BRICK_EDGE).contains(&cx) && (0..BRICK_EDGE).contains(&cy) && (0..BRICK_EDGE).contains(&cz);
-                    let block = if in_core {
-                        e.brick.get(cx, cy, cz)
-                    } else {
-                        // A border cell: resolve the SAME-LOD neighbour brick + the wrapped voxel inside it.
-                        neighbour_border_cell(&by_key, coord, lod, IVec3::new(cx, cy, cz))
-                    };
-                    patch.voxels.push(block.0 as u32);
-                }
+        // Produce this brick's GPU contribution through the SSOT `pack_one` (the SAME per-brick byte producer
+        // the incremental re-packer uses, so a from-scratch pack and an incremental patch can never drift).
+        let pb = pack_one(e, &by_key);
+        patch.aabbs.push(pb.aabb);
+        match &pb.voxels {
+            BrickVoxels::Uniform(_) => {
+                // R1: no voxel-array emit, and no light gather — a uniform-incl-halo brick is fully buried (every
+                // face neighbour is the same solid block), so it exposes no emissive faces.
+                patch.metas.push(pb.meta(0));
+            }
+            BrickVoxels::Dense(cells) => {
+                let voxel_offset = patch.voxels.len() as u32;
+                patch.metas.push(pb.meta(voxel_offset));
+                patch.voxels.extend_from_slice(cells);
+                // Gather this brick's air-exposed emissive voxels (after its haloed grid is appended, so
+                // cross-brick face-exposure uses the just-packed neighbour halo).
+                gather_lights_into(&mut found, &patch, registry, voxel_offset as usize, pb.world_min, pb.lod);
             }
         }
-        // Gather this brick's air-exposed emissive voxels into the NEE light list (after its haloed grid is
-        // written, so cross-brick face-exposure uses the just-packed neighbour halo). Per-LOD `world_min`/`lod`
-        // place a coarse brick's larger cells correctly (its emissive voxel is a proportionally larger light).
-        gather_lights_into(&mut found, &patch, registry, voxel_offset as usize, world_min, lod);
     }
 
     ensure_voxels_nonempty(&mut patch);
@@ -770,6 +850,37 @@ fn finalize_lights(patch: &mut GpuBrickPatch, mut found: Vec<EmissiveVoxel>) {
         })
         .collect();
     patch.alias = build_alias_table(&weights);
+}
+
+/// Finalize a [`GpuBrickPatch`]'s palette + NEE light list from its already-assembled `metas`/`voxels` — the
+/// SHARED tail both the from-scratch [`pack_resident_set`] and the incremental
+/// [`ResidentPacker::snapshot_patch`](super::incremental::ResidentPacker::snapshot_patch) run so the palette +
+/// light list are derived EXACTLY ONCE (no drift). Iterates the dense bricks in the patch (uniform bricks
+/// expose no air faces, so they contribute no lights — same as the per-brick path) gathering their air-exposed
+/// emissive voxels, then builds the alias table. Assumes `aabbs`/`metas`/`voxels` are populated; clears + fills
+/// `palette`/`lights`/`alias`.
+pub fn finalize_patch_palette_and_lights(patch: &mut GpuBrickPatch, registry: &BlockRegistry) {
+    patch.palette.clear();
+    patch.lights.clear();
+    patch.alias.clear();
+    let mut found: Vec<EmissiveVoxel> = Vec::new();
+    // SKIP the O(resident) per-brick gather entirely when the palette has NO emitters (the common worldgen
+    // case) — it would find nothing, so this keeps a non-emissive scene's re-pack O(changed). When emitters
+    // exist, snapshot the dense metas first (gather_lights_into borrows `patch` immutably, so collect the dense
+    // brick params up front to avoid an aliasing borrow). A uniform brick exposes no faces → skipped.
+    if registry.has_emitters() {
+        let dense: Vec<(usize, [f32; 3], u32)> = patch
+            .metas
+            .iter()
+            .filter(|m| !m.is_uniform())
+            .map(|m| (m.dense_offset() as usize, m.world_min, m.lod))
+            .collect();
+        for (offset, world_min, lod) in dense {
+            gather_lights_into(&mut found, patch, registry, offset, world_min, lod);
+        }
+    }
+    push_palette(patch, registry);
+    finalize_lights(patch, found);
 }
 
 /// Gather every AIR-EXPOSED emissive voxel of one packed brick into `found` (Phase 2.5 NEE). A voxel is an

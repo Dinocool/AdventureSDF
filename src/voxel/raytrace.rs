@@ -136,6 +136,15 @@ pub struct VoxelRtStreaming {
     /// reveals progressively (keep-old-until-revealed) but the per-frame pack frequency is bounded.
     worldgen_dirty_pending: bool,
     worldgen_frames_since_pack: u32,
+    /// The INCREMENTAL re-packer for the streamed (worldgen / Sponza / Gallery) arm: the O(changed) successor
+    /// to the per-move full [`pack_resident_set`]. It owns a per-brick slot allocator, a fixed-block voxel
+    /// arena, and shadow copies of each slot's bytes, so a re-pack re-`pack_one`s ONLY the entered/dropped
+    /// bricks plus their resident 26-neighbourhood (the halo dependency), then assembles the extracted patch by
+    /// memcpy of the cached bytes. The result is byte-identical to a from-scratch pack (proven by
+    /// `snapshot_patch_matches_full_pack`), so the render path and shader are unchanged and pixel-identical.
+    /// `None` until the first streamed pack; a fresh packer is set on every scene switch (so a switch streams in
+    /// cleanly), mirroring `manager`.
+    packer: Option<super::incremental::ResidentPacker>,
 }
 
 impl VoxelRtStreaming {
@@ -297,6 +306,7 @@ fn init_voxel_rt_streaming(
         packed_edit_gen: None,
         worldgen_dirty_pending: false,
         worldgen_frames_since_pack: 0,
+        packer: None,
     });
 }
 
@@ -407,6 +417,9 @@ fn stream_voxel_rt_residency(
         // Fresh residency for the new streamed scene (worldgen surface, the loaded Sponza map, or the merged
         // Gallery map).
         streaming.manager = ResidencyManager::new();
+        // Fresh incremental packer for the new scene (sized to the resident cap) — a switch streams in cleanly,
+        // and the slot allocator / arena / shadows start empty (mirrors the manager reset).
+        streaming.packer = Some(super::incremental::ResidentPacker::new(streaming.cfg.max_resident_bricks as u32));
         streaming.last_cam_brick = None;
         streaming.worldgen_dirty_pending = false;
         streaming.worldgen_frames_since_pack = 0;
@@ -479,6 +492,12 @@ fn stream_voxel_rt_residency(
     let edits_changed = streaming.packed_edit_gen != Some(edits.generation());
     if edits_changed {
         let dirty = affected_resident_keys(&edits);
+        // Mark the affected bricks REWRITTEN in the incremental packer too, so the edit re-packs exactly those
+        // bricks + their 26-neighbourhood next re-pack (the edit/dig path stays incremental — it ADAPTS, never
+        // a full clear). The manager re-sources them; the packer re-`pack_one`s them.
+        if let Some(packer) = streaming.packer.as_mut() {
+            packer.mark_rewritten(dirty.iter().copied());
+        }
         streaming.manager.requeue_keys(dirty);
         streaming.packed_edit_gen = Some(edits.generation());
     }
@@ -504,6 +523,7 @@ fn stream_voxel_rt_residency(
         worldgen_dirty_pending,
         worldgen_frames_since_pack,
         last_cam_brick,
+        packer,
         ..
     } = &mut *streaming;
 
@@ -563,7 +583,19 @@ fn stream_voxel_rt_residency(
     let settled = manager.pending() == 0;
     if *worldgen_dirty_pending && (settled || *worldgen_frames_since_pack >= WORLDGEN_REPACK_INTERVAL) {
         let entries = manager.resident_entries();
-        let patch = pack_resident_set(&entries, active_registry);
+        // INCREMENTAL re-pack: `update` re-`pack_one`s ONLY the entered/dropped bricks + their resident
+        // 26-neighbourhood (the O(changed) cost), then `snapshot_patch` assembles the extracted patch by MEMCPY
+        // of the cached per-brick bytes — byte-identical to a from-scratch `pack_resident_set` (proven by
+        // `snapshot_patch_matches_full_pack`), so the render path + shader are UNCHANGED + pixel-identical. The
+        // packer is `Some` for every streamed scene (set on the switch); the `unwrap_or_else` is a defensive
+        // first-tick guard that falls back to the full pack.
+        let patch = match packer.as_mut() {
+            Some(p) => {
+                p.update(&entries);
+                p.snapshot_patch(active_registry)
+            }
+            None => pack_resident_set(&entries, active_registry),
+        };
         let (n, v) = (patch.brick_count(), patch.voxels.len());
         patch_res.patch = patch;
         patch_res.generation = patch_res.generation.wrapping_add(1);
@@ -3487,6 +3519,7 @@ mod tests {
             packed_edit_gen: Some(0),
             worldgen_dirty_pending: false,
             worldgen_frames_since_pack: 0,
+            packer: None,
         }
     }
 

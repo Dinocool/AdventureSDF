@@ -53,6 +53,7 @@ use adventure::voxel::palette::BlockRegistry;
 use adventure::voxel::streaming::{
     ResidencyManager, StreamingConfig, camera_brick_coord, region_half_extent_m,
 };
+use adventure::voxel::incremental::ResidentPacker;
 use adventure::voxel::source::WorldgenSource;
 use adventure::voxel::voxelize::voxelize_brick;
 use adventure::voxel::{build_height_layer_pub, load_biome_library_pub};
@@ -612,6 +613,106 @@ fn bench_blas_build_at_resident_count() {
     println!("build_accel + fence   : mean {b_mean:.2} p95 {b_p95:.2} max {b_max:.2} ms");
     println!("TOTAL per generation  : ~{:.2} ms (upload + create + build)", u_mean + c_mean + b_mean);
     println!("=============================================================================");
+}
+
+// ============================================================================================
+//  (5b) INCREMENTAL RE-PACK — the O(changed) per-move re-pack vs the O(resident) full pack (A/B).
+// ============================================================================================
+
+/// **The incremental-re-pack deliverable.** Warms the shipping clipmap, then walks the camera one LOD0 brick
+/// per step and times, per step, BOTH paths over the SAME resident set:
+///   * FULL `pack_resident_set(&entries)` — the O(resident) re-pack the live path AMORTIZED (~137 ms at
+///     clip_half 8), rebuilding the whole AABB/meta/voxel buffer set;
+///   * INCREMENTAL `ResidentPacker::update(&entries)` — the O(changed) slot-patch path: it diffs the resident
+///     set, expands the changed keys by their 26-neighbourhood (the halo dependency), and re-packs ONLY those
+///     bricks, returning the changed-slot list the GPU patches via `queue_write_buffer`.
+///
+/// Asserts the incremental per-step cost is a small fraction of the full pack (the O(changed) win) AND that the
+/// changed-slot count is O(shell), not O(resident). Reports both so the per-move drop is a measured number.
+#[test]
+#[ignore = "perf harness; voxelizes the shipping clipmap — run with --ignored --nocapture"]
+fn bench_incremental_repack_vs_full() {
+    let (layer, lib, registry, label) = worldgen_stack();
+    let cfg = shipping_config();
+    let mut cam = origin_surface_cam(&layer);
+    let src = WorldgenSource::new(&layer, &lib, SEED);
+
+    // Warm the region fully (untimed), then seed the incremental packer with the same warm set.
+    let mut mgr = ResidencyManager::new();
+    mgr.update(cam, &cfg, &src);
+    let mut guard = 0;
+    while mgr.pending() > 0 {
+        mgr.drain_work(&cfg, &layer, &lib, &registry, SEED);
+        guard += 1;
+        assert!(guard < 5000);
+    }
+    mgr.take_dirty();
+    let warm_resident = mgr.resident_count();
+
+    let mut packer = ResidentPacker::new(cfg.max_resident_bricks as u32);
+    {
+        let entries = mgr.resident_entries();
+        packer.update(&entries); // cold seed (untimed)
+    }
+
+    let span0 = brick_span(0);
+    let mut full_times = Vec::new();
+    let mut inc_times = Vec::new();
+    let mut live_times = Vec::new();
+    let mut changed_counts = Vec::new();
+    for _ in 0..12 {
+        cam[0] += span0;
+        mgr.update(cam, &cfg, &src);
+        while mgr.pending() > 0 {
+            mgr.drain_work(&cfg, &layer, &lib, &registry, SEED);
+        }
+        mgr.take_dirty();
+        let entries = mgr.resident_entries();
+
+        // FULL pack (the old per-move cost).
+        let tf = Instant::now();
+        let full = pack_resident_set(&entries, &registry);
+        full_times.push(tf.elapsed());
+        let _ = full.brick_count();
+
+        // INCREMENTAL update — the O(changed) re-pack: it re-packs ONLY the entered/dropped bricks + their
+        // resident 26-neighbourhood (the halo dependency) and returns the changed-slot DELTA the render world
+        // could patch via `queue_write_buffer`. This is the core per-move re-pack cost (the few-ms number).
+        let ti = Instant::now();
+        let delta = packer.update(&entries);
+        inc_times.push(ti.elapsed());
+        changed_counts.push(delta.changed.len());
+
+        // LIVE path the shipping system pays this build: the O(changed) update PLUS `snapshot_patch` (the memcpy
+        // assembly of the contiguous patch the render world uploads unchanged). Reported separately so the
+        // residual memcpy cost is visible — the next stage (ship the DELTA + queue_write_buffer the fixed-cap
+        // buffers) removes it, taking the live cost down to the pure-update number above.
+        let tl = Instant::now();
+        let _live = packer.snapshot_patch(&registry);
+        live_times.push(ti.elapsed() + tl.elapsed());
+    }
+
+    let (f_mean, _f_p50, f_p95, f_max) = stats_ms(&full_times);
+    let (i_mean, i_p50, i_p95, i_max) = stats_ms(&inc_times);
+    let (l_mean, _l_p50, l_p95, l_max) = stats_ms(&live_times);
+    let changed_mean = changed_counts.iter().sum::<usize>() as f64 / changed_counts.len().max(1) as f64;
+    let half = cfg.clip_half_bricks as usize;
+    let region_vol = (2 * half + 1).pow(3);
+    let shell_area = (2 * half + 1).pow(2);
+
+    println!("\n========== INCREMENTAL RE-PACK vs FULL (per single-brick move) — graph={label} ==========");
+    println!("warm resident         : {warm_resident} bricks");
+    println!("FULL  pack_resident_set : mean {f_mean:.2} p95 {f_p95:.2} max {f_max:.2} ms  (O(resident), the AMORTIZED cost)");
+    println!("INCR  ResidentPacker    : mean {i_mean:.3} p50 {i_p50:.3} p95 {i_p95:.3} max {i_max:.3} ms  (O(changed) re-pack — the few-ms target)");
+    println!("LIVE  update+snapshot   : mean {l_mean:.3} p95 {l_p95:.3} max {l_max:.3} ms  (this build's live cost; the residual is the contiguous-patch memcpy)");
+    println!("changed slots / move  : mean {changed_mean:.0} (O(shell) ~{shell_area} vs O(resident) ~{warm_resident}, region vol {region_vol})");
+    println!("per-move re-pack drop  : {:.0}× cheaper core ({f_mean:.2} ms full → {i_mean:.3} ms incremental); {:.0}× live ({l_mean:.3} ms)", f_mean / i_mean.max(1e-6), f_mean / l_mean.max(1e-6));
+    println!("=============================================================================");
+
+    // The O(changed) win: the incremental per-move re-pack is a small fraction of the full pack.
+    assert!(i_mean < f_mean * 0.5, "incremental re-pack must be well under the full pack (got incr {i_mean:.3} ms vs full {f_mean:.2} ms)");
+    // And the changed-slot count is O(shell), not O(resident).
+    assert!(changed_mean < warm_resident as f64, "changed slots must be O(changed), not O(resident)");
 }
 
 // ============================================================================================
