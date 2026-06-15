@@ -595,6 +595,48 @@ pub fn build_by_key<'a>(entries: &[ResidentBrick<'a>]) -> std::collections::Hash
 /// no per-brick re-voxelize); an absent / different-LOD neighbour (a clipmap SHELL boundary) contributes
 /// AIR — the conservative seam behaviour, which the AABB-overlap + nearest-hit DDA then resolve across the
 /// LOD step (see the module / streaming docs on cross-LOD seams).
+/// **Storage plan R3 — brick-level dedup.** Interns identical HALOED voxel slices so duplicate dense bricks
+/// (repeated columns/arches, identical strata bands, an interior brick that escaped R1's fully-buried test)
+/// share ONE slice in the voxel buffer — two such bricks' `metas[].voxel_offset` point at the SAME offset.
+///
+/// Tier A (GPU-DDA-traceable): **shader-invisible** — the DDA addresses voxels purely through `voxel_offset`,
+/// so pointing two metas at one slice is undetectable on the trace (the AABB/meta stay per-brick; only the
+/// voxel payload is shared). Identical INCLUDING the halo (the seam-fix border), so two shared bricks render
+/// byte-identical geometry AND boundary-face normals. A cut into a shared brick re-packs it with different
+/// content → a fresh slice — copy-on-write falls out of keying on content. Used by BOTH [`pack_resident_set`]
+/// (the SSOT pack) and [`ResidentPacker::snapshot_patch`](super::incremental) (the live streamed re-pack) so
+/// their voxel buffers dedup identically and never drift.
+///
+/// Cost: one hash of the slice per brick — the same O(cells) order as the `extend_from_slice` copy it replaces
+/// on a first sighting, and it SAVES that copy on a hit. FxHash over the 4 KB slice is cheap; the distinct-slice
+/// set is small (the dedup ratio), so memory is bounded.
+#[derive(Default)]
+pub struct VoxelInterner {
+    /// Haloed slice content → the `voxel_offset` it was first written at.
+    seen: rustc_hash::FxHashMap<Box<[u32]>, u32>,
+}
+
+impl VoxelInterner {
+    #[inline]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Append `cells` to `buffer` and return its `voxel_offset` — UNLESS an identical slice was already
+    /// interned, in which case return the shared offset and append nothing. The returned offset always points
+    /// at a slice equal to `cells` (so a caller's subsequent read at that offset is valid).
+    pub fn intern(&mut self, buffer: &mut Vec<u32>, cells: &[u32]) -> u32 {
+        if let Some(&off) = self.seen.get(cells) {
+            return off;
+        }
+        let off = buffer.len() as u32;
+        debug_assert!(off & BRICK_UNIFORM_FLAG == 0, "voxel offset must leave bit 31 free for the uniform flag");
+        buffer.extend_from_slice(cells);
+        self.seen.insert(cells.into(), off);
+        off
+    }
+}
+
 pub fn pack_resident_set(entries: &[ResidentBrick<'_>], registry: &BlockRegistry) -> GpuBrickPatch {
     let mut patch = GpuBrickPatch {
         aabbs: Vec::with_capacity(entries.len()),
@@ -613,6 +655,8 @@ pub fn pack_resident_set(entries: &[ResidentBrick<'_>], registry: &BlockRegistry
     // bricks, so the lod must be part of the key. A border whose neighbour is absent or at a DIFFERENT lod (a
     // shell boundary) falls back to AIR (the conservative pre-halo behaviour — no cross-LOD halo).
     let by_key = build_by_key(entries);
+    // R3: dedup identical haloed slices so duplicate dense bricks share one voxel slice (shader-invisible).
+    let mut interner = VoxelInterner::new();
 
     for e in entries {
         // Produce this brick's GPU contribution through the SSOT `pack_one` (the SAME per-brick byte producer
@@ -626,11 +670,11 @@ pub fn pack_resident_set(entries: &[ResidentBrick<'_>], registry: &BlockRegistry
                 patch.metas.push(pb.meta(0));
             }
             BrickVoxels::Dense(cells) => {
-                let voxel_offset = patch.voxels.len() as u32;
+                // R3: intern the haloed slice — an identical brick shares ONE slice. `intern` appends only on a
+                // first sighting and returns the shared offset on a hit, so the gather below always reads a
+                // (present) slice equal to `cells` at `voxel_offset` (its own world_min → its own lights).
+                let voxel_offset = interner.intern(&mut patch.voxels, cells);
                 patch.metas.push(pb.meta(voxel_offset));
-                patch.voxels.extend_from_slice(cells);
-                // Gather this brick's air-exposed emissive voxels (after its haloed grid is appended, so
-                // cross-brick face-exposure uses the just-packed neighbour halo).
                 gather_lights_into(&mut found, &patch, registry, voxel_offset as usize, pb.world_min, pb.lod);
             }
         }
@@ -1356,6 +1400,26 @@ mod tests {
         assert_eq!(patch.uniform_brick_count(), 0, "an air-haloed (surface) uniform brick must stay dense");
         assert!(!patch.metas[0].is_uniform());
         assert_eq!(patch.voxels.len(), halo_cells(0), "a dense brick keeps its full haloed array");
+    }
+
+    /// R3 (brick dedup): four IDENTICAL isolated dense bricks share ONE voxel slice — their metas point at the
+    /// same `voxel_offset` and the voxel buffer holds a single haloed slice, not four. (Isolated ⇒ every halo
+    /// border is AIR ⇒ the four slices are byte-identical; they stay dense because that AIR halo ≠ the solid
+    /// core.) The win is shader-invisible: the trace addresses voxels purely through `voxel_offset`.
+    #[test]
+    fn r3_dedups_identical_dense_bricks() {
+        let reg = registry();
+        let b = solid_brick(BlockId(1));
+        // Four bricks far enough apart that none is another's neighbour (so every halo border resolves to AIR).
+        let coords = [IVec3::new(0, 0, 0), IVec3::new(50, 0, 0), IVec3::new(0, 50, 0), IVec3::new(0, 0, 50)];
+        let entries: Vec<ResidentBrick> =
+            coords.iter().map(|&c| ResidentBrick { coord: c, brick: &b, lod: 0 }).collect();
+        let patch = pack_resident_set(&entries, &reg);
+        assert_eq!(patch.brick_count(), 4);
+        assert_eq!(patch.uniform_brick_count(), 0, "isolated solid bricks have AIR halos ⇒ dense, not R1-collapsed");
+        let offsets: std::collections::HashSet<u32> = patch.metas.iter().map(|m| m.dense_offset()).collect();
+        assert_eq!(offsets.len(), 1, "four identical bricks dedup to one slice");
+        assert_eq!(patch.voxels.len(), halo_cells(0), "the deduped voxel buffer holds exactly one haloed slice");
     }
 
     /// A core-uniform brick whose HALO DIFFERS (a same-block neighbour with a hole on the shared face) is NOT

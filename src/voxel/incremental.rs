@@ -477,6 +477,8 @@ impl ResidentPacker {
             lights: Vec::new(),
             alias: Vec::new(),
         };
+        // R3: dedup identical haloed slices in the live re-pack too, the SAME way `pack_resident_set` does.
+        let mut interner = super::gpu::VoxelInterner::new();
         for slot in slots {
             let aabb = *self.last_aabb.get(&slot).expect("resident slot has an aabb shadow");
             let meta = *self.last_meta.get(&slot).expect("resident slot has a meta shadow");
@@ -484,12 +486,12 @@ impl ResidentPacker {
             if meta.is_uniform() {
                 patch.metas.push(meta);
             } else {
-                // Re-base the dense voxel offset into the CONTIGUOUS output buffer (the arena offset is sparse).
+                // Re-base the dense voxel offset into the CONTIGUOUS output buffer (the arena offset is sparse),
+                // deduping identical haloed slices (R3) so a repeated brick shares one slice.
                 let cells = self.last_voxels.get(&slot).expect("dense slot has a voxel shadow");
-                let voxel_offset = patch.voxels.len() as u32;
+                let voxel_offset = interner.intern(&mut patch.voxels, cells);
                 let rebased = super::gpu::GpuBrickMeta::dense(meta.voxel_origin, voxel_offset, meta.world_min, meta.lod);
                 patch.metas.push(rebased);
-                patch.voxels.extend_from_slice(cells);
             }
         }
         // Keep the voxel buffer non-empty for upload (mirrors `pack_resident_set`'s `ensure_voxels_nonempty`).
