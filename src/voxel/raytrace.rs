@@ -686,11 +686,14 @@ fn stream_voxel_rt_residency(
         // scene (set on the switch); the `None` arm is a defensive first-tick fallback to a contiguous Snapshot.
         let upload = match packer.as_mut() {
             Some(p) => {
-                let delta = p.update(&entries);
+                let delta = p.update(&entries, active_registry.len() as u32);
                 let (lights, alias) = build_lights_from_entries(&entries, active_registry);
                 let brick_count = p.resident_count() as u32;
-                if !*epoch_snapshotted {
-                    // First pack of this epoch: snapshot the fixed-cap buffers (allocate once).
+                // A4.4: the index slab arena GROWS on overflow — a grow re-allocates the GPU index buffer, so the
+                // upload must be a StreamSnapshot (not a Delta into the old, too-small buffer). `grew()` is set by
+                // `update`'s allocations and cleared by `snapshot_buffers`.
+                if !*epoch_snapshotted || p.grew() {
+                    // First pack of this epoch (or a grow): snapshot the fixed-cap buffers (allocate once / resize).
                     let buffers = p.snapshot_buffers(active_registry);
                     *epoch_snapshotted = true;
                     VoxelRtUpload::StreamSnapshot { buffers, lights, alias }
@@ -706,7 +709,7 @@ fn stream_voxel_rt_residency(
             None => VoxelRtUpload::Snapshot(pack_resident_set(&entries, active_registry)),
         };
         let (n, v) = match &upload {
-            VoxelRtUpload::StreamSnapshot { buffers, .. } => (buffers.brick_count as usize, buffers.voxels.len()),
+            VoxelRtUpload::StreamSnapshot { buffers, .. } => (buffers.brick_count as usize, buffers.indices.len()),
             VoxelRtUpload::Delta { brick_count, delta, .. } => (*brick_count as usize, delta.changed.len()),
             VoxelRtUpload::Snapshot(p) => (p.brick_count(), p.voxels.len()),
         };
@@ -1227,13 +1230,16 @@ struct SceneKeepAlive {
     aabb_buf: wgpu::Buffer,
     /// The fixed-cap meta buffer (STORAGE | COPY_DST) — patched at `slot · 48`.
     meta_buf: wgpu::Buffer,
-    /// The fixed-cap raw voxel arena (STORAGE | COPY_DST) — the Delta writes the raw block at `voxel_word_offset`.
+    /// The fixed-cap index-slab arena (STORAGE | COPY_DST) — A4.4: the Delta writes a changed dense slot's
+    /// bit-packed INDEX block at `index_word_offset`.
     voxel_buf: wgpu::Buffer,
     /// The palette buffer (fixed per scene — never patched by a Delta). Keep-alive only (the bind group's Arc
     /// references it); never read back.
     _palette_buf: wgpu::Buffer,
-    /// The per-brick palette buffer (R2b static path; a 1-word dummy on the raw streamed path). Keep-alive only.
-    _brick_palettes_buf: wgpu::Buffer,
+    /// The per-brick PALETTE buffer (group 0 binding 12). Static path: R2b contiguous palettes. A4.4 streamed
+    /// path: the fixed per-slot palette (`slot · palette_stride`) — the Delta patches a changed dense slot's
+    /// palette block at `palette_word_offset` (STORAGE | COPY_DST).
+    brick_palettes_buf: wgpu::Buffer,
     /// A3 — the per-CHUNK DESCRIPTOR buffer (group 0 binding 13): one identity descriptor per chunk, each with
     /// `meta_base = chunk·CHUNK_SLOTS`. Keep-alive only (the bind group's Arc references it).
     _descriptors_buf: wgpu::Buffer,
@@ -2523,12 +2529,12 @@ fn prepare_voxel_rt(
             resources.world_cache_lights = Some(WorldCacheLights::new(device, patch));
         }
         VoxelRtUpload::StreamSnapshot { buffers, lights, alias } => {
-            // STREAMED epoch start: (re)allocate the FIXED-CAPACITY raw-arena buffers (with COPY_DST) + a BLAS over
-            // `capacity` primitives (degenerate AABBs for free slots). `brick_palettes` is a 1-word dummy on the
-            // raw path (a raw `index_bits == 0` brick never indirects through it). The light list ships whole.
+            // STREAMED epoch start (or an index-arena grow): (re)allocate the FIXED-CAPACITY paletted-slab buffers
+            // (with COPY_DST) + a BLAS over `capacity` primitives (degenerate AABBs for free slots). A4.4 — the
+            // voxel buffer holds the bit-packed INDEX slabs and `brick_palettes` the real per-brick palettes (the
+            // streamed path now uses the same paletted `cell_block` decode as the static path). The light list
+            // ships whole.
             let capacity = buffers.metas.len() as u32;
-            // A1-β raw path never reads `brick_palettes`; bind a 1-word dummy so the storage binding is valid.
-            let brick_palettes_dummy: [u32; 1] = [0];
             build_scene_full(
                 device,
                 &render_queue,
@@ -2536,20 +2542,21 @@ fn prepare_voxel_rt(
                 &mut resources,
                 bytemuck::cast_slice(&buffers.aabbs),
                 bytemuck::cast_slice(&buffers.metas),
-                bytemuck::cast_slice(&buffers.voxels),
+                bytemuck::cast_slice(&buffers.indices),
                 bytemuck::cast_slice(&buffers.palette),
-                bytemuck::cast_slice(&brick_palettes_dummy),
+                bytemuck::cast_slice(&buffers.brick_palettes),
                 capacity,
                 buffers.brick_count,
                 true,
             );
             resources.world_cache_lights = Some(WorldCacheLights::from_lists(device, lights, alias));
             debug!(
-                "voxel-RT A1: StreamSnapshot epoch {} gen {} — cap {capacity}, {} resident bricks, {} voxel u32, {} lights",
+                "voxel-RT A4.4: StreamSnapshot epoch {} gen {} — cap {capacity}, {} resident bricks, {} index u32, {} palette u32, {} lights",
                 patch_res.epoch,
                 patch_res.generation,
                 buffers.brick_count,
-                buffers.voxels.len(),
+                buffers.indices.len(),
+                buffers.brick_palettes.len(),
                 lights.len(),
             );
         }
@@ -2744,7 +2751,7 @@ fn build_scene_full(
         meta_buf,
         voxel_buf,
         _palette_buf: palette_buf,
-        _brick_palettes_buf: brick_palettes_buf,
+        brick_palettes_buf,
         _descriptors_buf: descriptors_buf,
         streamed,
     });
@@ -2752,10 +2759,11 @@ fn build_scene_full(
 
 /// Apply a [`RepackDelta`] to the persistent fixed-cap scene buffers (storage plan A1 — the O(changed) GPU
 /// upload). For each changed slot: `queue_write_buffer` the meta (at `slot·48`) + AABB (at `slot·32`) and, for a
-/// dense slot, the raw `dense_block_u32()`-u32 voxel block (at `voxel_word_offset·4`). On a topology change
-/// (enter/drop) the BLAS is rebuilt IN PLACE over the SAME aabb_buf (the same wgpu BLAS handle, so the bind
-/// group — which references the TLAS, which references the BLAS — stays valid) + the TLAS rebuilt; a pure
-/// meta/voxel edit (no enter/drop) needs no BLAS work (the AABBs didn't move).
+/// dense slot whose content changed, the A4.4 PALETTED index block (at `index_word_offset·4`) + the per-brick
+/// palette block (at `palette_word_offset·4` in `brick_palettes`). On a topology change (enter/drop) the BLAS is
+/// rebuilt IN PLACE over the SAME aabb_buf (the same wgpu BLAS handle, so the bind group — which references the
+/// TLAS, which references the BLAS — stays valid) + the TLAS rebuilt; a pure meta/voxel edit (no enter/drop)
+/// needs no BLAS work (the AABBs didn't move).
 fn apply_delta(
     device: &wgpu::Device,
     render_queue: &RenderQueue,
@@ -2767,8 +2775,15 @@ fn apply_delta(
     for cs in &delta.changed {
         render_queue.write_buffer(&scene.meta_buf, cs.slot as u64 * meta_stride, bytemuck::bytes_of(&cs.meta));
         render_queue.write_buffer(&scene.aabb_buf, cs.slot as u64 * aabb_stride, bytemuck::bytes_of(&cs.aabb));
-        if let Some(v) = &cs.voxels {
-            render_queue.write_buffer(&scene.voxel_buf, cs.voxel_word_offset as u64 * 4, bytemuck::cast_slice(v));
+        if let Some(idx) = &cs.index {
+            render_queue.write_buffer(&scene.voxel_buf, cs.index_word_offset as u64 * 4, bytemuck::cast_slice(idx));
+        }
+        if let Some(pal) = &cs.palette {
+            render_queue.write_buffer(
+                &scene.brick_palettes_buf,
+                cs.palette_word_offset as u64 * 4,
+                bytemuck::cast_slice(pal),
+            );
         }
     }
     // A3 Stage 3 — rebuild ONLY the CHUNKS whose slots changed (O(changed chunks), not O(resident)). A pure

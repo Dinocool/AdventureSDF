@@ -862,14 +862,13 @@ fn bench_incremental_repack_vs_full() {
     let mut packer = ResidentPacker::new(cfg.max_resident_bricks as u32);
     {
         let entries = mgr.resident_entries();
-        packer.update(&entries); // cold seed (untimed)
+        packer.update(&entries, registry.len() as u32); // cold seed (untimed)
     }
 
     // Storage plan A1 — the FIXED-CAP buffer bytes the OLD path re-created (`create_buffer_init`) EVERY move:
     // the whole contiguous AABB+meta+voxel patch. The NEW path `queue_write_buffer`s ONLY the changed slots.
     let meta_b = std::mem::size_of::<GpuBrickMeta>(); // 48
     let aabb_b = std::mem::size_of::<GpuBrickAabb>(); // 32
-    let dense_block_bytes = adventure::voxel::incremental::dense_block_u32() * 4; // raw haloed 10³ u32 block
 
     let span0 = brick_span(0);
     let mut full_times = Vec::new();
@@ -902,17 +901,23 @@ fn bench_incremental_repack_vs_full() {
         // resident 26-neighbourhood (the halo dependency) and returns the changed-slot DELTA the render world
         // patches via `queue_write_buffer`. This is the core per-move re-pack cost (the few-ms number).
         let ti = Instant::now();
-        let delta = packer.update(&entries);
+        let delta = packer.update(&entries, registry.len() as u32);
         inc_times.push(ti.elapsed());
         changed_counts.push(delta.changed.len());
 
-        // A1 GPU UPLOAD bytes: the EXACT bytes `apply_delta`'s `queue_write_buffer`s touch this move — meta(48)+
-        // aabb(32) per changed slot, plus a raw dense block (4 KB) for each dense slot rewritten. This is what
-        // crosses to the GPU now, vs the whole contiguous buffer the OLD path re-created.
+        // A1/A4.4 GPU UPLOAD bytes: the EXACT bytes `apply_delta`'s `queue_write_buffer`s touch this move — meta(48)+
+        // aabb(32) per changed slot, plus the PALETTED index block (size-class slab) + per-brick palette block for
+        // each dense slot rewritten (A4.4 — far smaller than the old raw 4 KB block). This is what crosses to the
+        // GPU now, vs the whole contiguous buffer the OLD path re-created.
         let move_bytes: usize = delta
             .changed
             .iter()
-            .map(|cs| meta_b + aabb_b + cs.voxels.as_ref().map_or(0, |_| dense_block_bytes))
+            .map(|cs| {
+                meta_b
+                    + aabb_b
+                    + cs.index.as_ref().map_or(0, |idx| idx.len() * 4)
+                    + cs.palette.as_ref().map_or(0, |pal| pal.len() * 4)
+            })
             .sum();
         delta_bytes.push(move_bytes);
 
@@ -942,12 +947,13 @@ fn bench_incremental_repack_vs_full() {
     println!("LIVE  update+snapshot   : mean {l_mean:.3} p95 {l_p95:.3} max {l_max:.3} ms  (OLD live cost; A1 drops the snapshot_patch)");
     println!("changed slots / move  : mean {changed_mean:.0} (O(shell) ~{shell_area} vs O(resident) ~{warm_resident}, region vol {region_vol})");
     println!("-----------------------------------------------------------------------------");
-    // The fixed-cap RAW arena the OLD path conceptually re-created + re-uploaded every move (the buffers
-    // `prepare_voxel_rt` rebuilt from scratch per generation): cap meta+aabb + the raw voxel arena.
+    // The fixed-cap PRE-A4.4 RAW arena the A1-β path reserved (cap meta+aabb + a raw 4 KB block/brick) — the
+    // ~240 MB baseline A4.4's paletted size-class slabs shrink to the actual paletted footprint.
     let cap = cfg.max_resident_bricks;
+    let raw_dense_block_bytes = adventure::voxel::incremental::dense_block_u32() * 4; // pre-A4.4 raw 10³ u32 block
     let cap_buffer_bytes =
-        cap * (meta_b + aabb_b) + cap * dense_block_bytes; // ~60k · (80 + 4096) ≈ 240 MB raw arena
-    println!("A1 GPU UPLOAD bytes/move : mean {:.1} KB  max {:.1} KB  (queue_write_buffer of ONLY the {changed_mean:.0} changed slots: 48B meta + 32B aabb + 4KB raw block/dense)",
+        cap * (meta_b + aabb_b) + cap * raw_dense_block_bytes; // ~60k · (80 + 4096) ≈ 240 MB raw arena
+    println!("A4.4 GPU UPLOAD bytes/move : mean {:.1} KB  max {:.1} KB  (queue_write_buffer of ONLY the {changed_mean:.0} changed slots: 48B meta + 32B aabb + paletted index slab + per-brick palette/dense)",
         delta_bytes_mean / 1e3, delta_bytes_max as f64 / 1e3);
     println!("OLD R2b full patch       : mean {:.1} MB/move  (create_buffer_init of the WHOLE contiguous R2b patch — every move)", full_buffer_mean / 1e6);
     println!("fixed-cap raw arena      : {:.0} MB  (the buffers the OLD path RE-CREATED every generation; A1 allocates ONCE/epoch then queue_writes deltas)", cap_buffer_bytes as f64 / 1e6);

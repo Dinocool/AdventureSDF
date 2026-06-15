@@ -42,17 +42,44 @@ use rustc_hash::FxHashMap;
 
 use super::brickmap::Brick;
 use super::gpu::{
-    BrickVoxels, GpuBrickAabb, GpuBrickMeta, GpuPaletteColor, PackedBrick, ResidentBrick, halo_cells,
-    pack_one,
+    BrickVoxels, GpuBrickAabb, GpuBrickMeta, GpuPaletteColor, PackedBrick, ResidentBrick, encode_paletted,
+    halo_cells, pack_one,
 };
 use super::streaming::BrickKey;
 
-/// The fixed number of `u32`s a DENSE brick occupies in the voxel arena — a haloed `10³` grid. CONSTANT at
-/// every LOD ([`halo_cells`]`(0) == halo_cells(lod)`), so the arena is a perfect fixed-block free-list with no
-/// fragmentation. A UNIFORM (R1) brick consumes zero arena blocks.
+/// The fixed number of `u32`s a DENSE brick's RAW haloed `10³` grid occupies (one `u32` id per cell). CONSTANT at
+/// every LOD ([`halo_cells`]`(0) == halo_cells(lod)`). The packer's per-slot SHADOW (`last_voxels`) stores cells
+/// in this raw form (so the byte-identity gate + the A4.4 re-encode are exact); the GPU arena stores the
+/// PALETTED index stream (≤ this size — see [`index_class_words`]).
 #[inline]
 pub fn dense_block_u32() -> usize {
     halo_cells(0)
+}
+
+/// **A4.4 — the 5 paletted-index SIZE CLASSES**, keyed by `index_bits ∈ {1,2,4,8,16}`. A dense brick's bit-packed
+/// index stream is `ceil(dense_block_u32() · index_bits / 32)` words; for the `10³` haloed block that is
+/// `{32, 63, 125, 250, 500}` words. Each class is a fixed-size free-list (no fragmentation WITHIN a class), so a
+/// freed block is always exactly reusable by another brick of the same width.
+const INDEX_CLASS_BITS: [u8; 5] = [1, 2, 4, 8, 16];
+
+/// Words a dense brick's bit-packed index stream occupies for `index_bits ∈ {1,2,4,8,16}` (its size-class block
+/// size). Mirror of [`encode_paletted`]'s `indices.len()`.
+#[inline]
+pub fn index_class_words(index_bits: u8) -> usize {
+    (dense_block_u32() * index_bits as usize).div_ceil(32)
+}
+
+/// The size-class slot index (`0..5`) for an `index_bits ∈ {1,2,4,8,16}`.
+#[inline]
+fn index_class_of(index_bits: u8) -> usize {
+    match index_bits {
+        1 => 0,
+        2 => 1,
+        4 => 2,
+        8 => 3,
+        16 => 4,
+        _ => unreachable!("index_bits must be a power of 2 in {{1,2,4,8,16}}, got {index_bits}"),
+    }
 }
 
 /// A DEGENERATE BLAS AABB (min > max on every axis) for an UNUSED slot: the BLAS build never reports a
@@ -121,24 +148,31 @@ impl SlotAllocator {
 }
 
 /// One slot's new GPU bytes after an incremental re-pack: the slot index (= `primitive_index`), its meta, its
-/// AABB, and — for a dense brick — the arena byte offset + the voxel block to write there. The GPU uploader
-/// patches `metas[slot]`, `aabbs[slot]`, and (dense) the arena slice at `voxel_word_offset` from this.
+/// AABB, and — for a dense brick whose content changed — the PALETTED index block + per-brick palette block to
+/// write (A4.4). The GPU uploader patches `metas[slot]`, `aabbs[slot]`, the index arena at `index_word_offset`,
+/// and `brick_palettes` at `palette_word_offset` from this.
 #[derive(Clone, Debug)]
 pub struct ChangedSlot {
     /// The slot whose buffers this patches (= `primitive_index`).
     pub slot: u32,
-    /// The new per-brick meta (already carries the correct `voxel_offset` for dense, or the uniform flag/id;
-    /// all-zero for a freed slot).
+    /// The new per-brick meta (carries the real `voxel_offset` (index-arena word) + `index_bits` + `palette_base`
+    /// for a dense brick, or the uniform flag/id; all-zero for a freed slot).
     pub meta: GpuBrickMeta,
     /// The new BLAS AABB ([`degenerate_aabb`] for a freed slot).
     pub aabb: GpuBrickAabb,
-    /// `Some(words)` for a DENSE brick whose voxel block must be (re-)written: the `dense_block_u32()`-u32 block
-    /// to write at `voxel_word_offset`. `None` for a uniform/freed slot, or a dense brick whose meta changed but
-    /// whose voxel bytes did not (no arena re-write needed).
-    pub voxels: Option<Vec<u32>>,
-    /// The arena WORD offset (`u32` index into the voxel buffer) the dense block goes at (= `meta.dense_offset()`
-    /// when `voxels.is_some()`).
-    pub voxel_word_offset: u32,
+    /// `Some(words)` for a DENSE brick whose voxel content changed: the bit-packed INDEX stream
+    /// ([`index_class_words`]`(index_bits)` words) to write at `index_word_offset`. `None` for a uniform/freed
+    /// slot, or a dense brick whose meta changed but whose voxel content did not.
+    pub index: Option<Vec<u32>>,
+    /// The index-arena WORD offset the index block goes at (= `meta.dense_offset()` when `index.is_some()`).
+    pub index_word_offset: u32,
+    /// `Some(ids)` for a DENSE brick whose voxel content changed: the per-brick palette (its `k` distinct block
+    /// ids, one `u32` each) to write into `brick_palettes` at `palette_word_offset`. Paired with `index` (same
+    /// `Some`/`None`).
+    pub palette: Option<Vec<u32>>,
+    /// The `brick_palettes` WORD offset the palette block goes at (= `meta.palette_base` = `slot · palette_stride`
+    /// in Checkpoint-1's fixed palette).
+    pub palette_word_offset: u32,
 }
 
 /// The set of slots an incremental [`update`](ResidentPacker::update) changed, so the GPU side patches ONLY
@@ -169,22 +203,26 @@ impl RepackDelta {
 /// After this snapshot the render path applies each generation's [`RepackDelta`] via `queue_write_buffer` — it
 /// NEVER re-creates these buffers within an epoch (only a scene switch / new epoch re-snapshots).
 ///
-/// **A1-β representation — the streamed arena is RAW, not R2b paletted.** Each dense slot's voxel block is the
-/// HALOED `10³` `u32`-per-cell grid written verbatim at `arena_block · dense_block_u32()`, and its meta carries
-/// `index_bits == 0` / `palette_base == 0` as the RAW-ARENA marker. The shader's `cell_block` decodes a raw
-/// `index_bits == 0` dense brick as `voxel_indices[voxel_offset + cell_index]` directly (no palette indirection);
-/// the R2b paletted decode (`index_bits >= 1`) is kept for the static `pack_brickmap`/`pack_resident_set` path.
-/// This trades R2b's voxel-VRAM win on the STREAMED path for the O(changed) upload — see the `cell_block` doc and
-/// `PHASE_A_GPU_EXECUTION.md` §"The encoding question" (A1-β). R2b is recovered later (A4.4 persistent interner).
+/// **A4.4 representation — the streamed arena is R2b PALETTED (size-class slabs).** Each dense slot's voxel block
+/// is a bit-packed INDEX stream ([`encode_paletted`]) living in its `index_bits` size-class slab in [`Self::indices`]
+/// at `meta.voxel_offset`, and a per-brick PALETTE (its `k` distinct ids) in [`Self::brick_palettes`] at
+/// `meta.palette_base` (Checkpoint-1: `slot · palette_stride`). The shader's `cell_block` paletted branch
+/// (`index_bits >= 1`) decodes `id = brick_palettes[palette_base + (indices[voxel_offset + ..] >> .. & mask)]` —
+/// the SAME decode the static `pack_brickmap`/`pack_resident_set` path uses. This recovers R2b's voxel-VRAM win on
+/// the STREAMED path while keeping A1's O(changed) upload — see `PHASE_A_GPU_EXECUTION.md` §A4.4 + the scoping note.
 #[derive(Clone, Debug)]
 pub struct SnapshotBuffers {
     /// Capacity-length AABB buffer; unused slots = [`degenerate_aabb`].
     pub aabbs: Vec<GpuBrickAabb>,
     /// Capacity-length meta buffer; unused slots = [`GpuBrickMeta::zeroed`].
     pub metas: Vec<GpuBrickMeta>,
-    /// The `arena_capacity_u32()` raw block pool: each resident dense brick's HALOED `10³` `u32`-per-cell block
-    /// written at its arena offset (`arena_block · dense_block_u32()`); zero elsewhere.
-    pub voxels: Vec<u32>,
+    /// The index-arena slab pool ([`Self::index_capacity_u32`] words): each resident dense brick's bit-packed
+    /// index stream written at its slab offset (`meta.voxel_offset`); zero elsewhere.
+    pub indices: Vec<u32>,
+    /// The per-brick PALETTE buffer (`capacity · palette_stride` words): each resident dense brick's `k` distinct
+    /// block ids written at `slot · palette_stride` (Checkpoint-1 fixed palette); zero elsewhere. Bound at
+    /// `group(0)/binding(12)`. A `RepackDelta` patches only changed slots' blocks.
+    pub brick_palettes: Vec<u32>,
     /// The registry palette (`BlockId(i)` → linear RGBA + emissive). Length == registry length. Fixed per scene
     /// (never re-uploaded on a [`RepackDelta`]).
     pub palette: Vec<GpuPaletteColor>,
@@ -193,13 +231,22 @@ pub struct SnapshotBuffers {
     pub brick_count: u32,
 }
 
-/// One resident brick's live state in the packer: its slot + (for a dense brick) its voxel-arena block index.
+/// A DENSE brick's index-slab allocation (A4.4): where its bit-packed index stream lives in the index arena + its
+/// width (which size class to free it back to on a drop/width-change).
+#[derive(Clone, Copy, Debug)]
+struct DenseSlot {
+    /// Word offset of this brick's index stream in the index arena (= `meta.voxel_offset`).
+    index_offset: u32,
+    /// Index bit width ∈ {1,2,4,8,16} — the size class ([`index_class_of`]).
+    index_bits: u8,
+}
+
+/// One resident brick's live state in the packer: its slot + (for a dense brick) its index-slab allocation.
 #[derive(Clone, Copy, Debug)]
 struct SlotState {
     slot: u32,
-    /// `Some(block)` for a DENSE brick (its arena block index; word offset = `block · dense_block_u32()`).
-    /// `None` for a UNIFORM brick (no arena block).
-    arena_block: Option<u32>,
+    /// `Some` for a DENSE brick (its index-slab allocation); `None` for a UNIFORM brick (no index/palette block).
+    dense: Option<DenseSlot>,
 }
 
 /// The incremental resident-set packer: owns the slot/arena allocators + the live `key → SlotState` map +
@@ -212,46 +259,61 @@ struct SlotState {
 /// A/B test). The dirty set is EXPANDED by the 26-neighbourhood so no halo/uniform-classification goes stale.
 pub struct ResidentPacker {
     slots: SlotAllocator,
-    /// Live resident bricks → their slot + arena block.
+    /// Live resident bricks → their slot + index-slab allocation.
     resident: FxHashMap<BrickKey, SlotState>,
-    /// The voxel-arena free-list of `dense_block_u32()`-u32 BLOCKS (block index, not word offset). Mirrors the
-    /// slot allocator; capacity = `max_resident_bricks` blocks (a dense brick needs one, uniform bricks none —
-    /// so the arena never binds before the slot cap).
-    arena_high_water: u32,
-    arena_free: Vec<u32>,
-    arena_capacity: u32,
+    /// **A4.4 index-arena SIZE-CLASS SLABS.** A bump pointer (`index_high_water`, in words) + a per-class free-list
+    /// of freed block word-offsets ([`INDEX_CLASS_BITS`]). A dense brick's index stream is allocated from its
+    /// `index_bits` class; a freed block returns to that class's list (exactly reusable). The arena GROWS on
+    /// overflow past [`Self::index_gpu_cap`] — `grew` then forces the next upload to a StreamSnapshot.
+    index_high_water: u32,
+    index_free: [Vec<u32>; INDEX_CLASS_BITS.len()],
+    /// The index-arena WORD capacity the LAST [`snapshot_buffers`](Self::snapshot_buffers) sized the GPU buffer to.
+    /// A delta-time allocation past this sets [`Self::grew`].
+    index_gpu_cap: u32,
+    /// Per-slot palette STRIDE in `brick_palettes` (Checkpoint-1 fixed palette = `MAX_PAL`): a dense slot's palette
+    /// lives at `slot · palette_stride`. Set from the registry length each [`update`](Self::update) — `k ≤
+    /// registry.len()` so a brick's palette never overflows its stride (correct-by-construction). Checkpoint-2
+    /// makes the palette a slab too.
+    palette_stride: u32,
+    /// Set when an index allocation since the last snapshot exceeded [`Self::index_gpu_cap`] — the next upload must
+    /// be a StreamSnapshot (re-allocate the larger index buffer), not a Delta. Cleared by `snapshot_buffers`.
+    grew: bool,
     /// Shadow of the last-uploaded bytes per slot — the byte-compare source so a re-pack that reproduces the
-    /// same bytes (a neighbour that did not actually change) costs no upload.
+    /// same bytes (a neighbour that did not actually change) costs no upload. `last_voxels` holds RAW haloed cells
+    /// (the A4.4 re-encode source — kept raw so the byte-identity gate is exact).
     last_meta: FxHashMap<u32, GpuBrickMeta>,
     last_aabb: FxHashMap<u32, GpuBrickAabb>,
     last_voxels: FxHashMap<u32, Vec<u32>>,
     /// Keys the caller explicitly marked rewritten (edit / dig re-source) since the last update — re-packed even
     /// though they neither entered nor dropped. Drained each update.
     pending_rewrites: Vec<BrickKey>,
-    /// DEFERRED-FREE quarantine (keep-old-until-revealed): slots/arena-blocks dropped THIS update can't be
+    /// DEFERRED-FREE quarantine (keep-old-until-revealed): slots/index-blocks dropped THIS update can't be
     /// reused until the NEXT update, so an in-flight frame tracing the old generation never sees a slot's bytes
     /// overwritten by a different brick mid-flight. Released at the top of the next update.
     quarantine_slots: Vec<u32>,
-    quarantine_arena: Vec<u32>,
+    /// Freed index blocks `(word_offset, index_bits)` — returned to their size-class free-list next update.
+    quarantine_index: Vec<(u32, u8)>,
 }
 
 impl ResidentPacker {
-    /// A fresh packer sized for `max_resident_bricks` slots (and the same number of dense arena blocks — the
-    /// worst case where every resident brick is dense). The GPU buffers the render path allocates must match
-    /// this capacity.
+    /// A fresh packer sized for `max_resident_bricks` slots. The index arena (A4.4 size-class slabs) starts empty
+    /// and grows as bricks are slotted; the render path sizes the GPU index buffer to [`index_capacity_u32`](Self::index_capacity_u32)
+    /// at each snapshot. `palette_stride` starts 0 and is set from the registry length on the first [`update`].
     pub fn new(max_resident_bricks: u32) -> Self {
         Self {
             slots: SlotAllocator::new(max_resident_bricks),
             resident: FxHashMap::default(),
-            arena_high_water: 0,
-            arena_free: Vec::new(),
-            arena_capacity: max_resident_bricks,
+            index_high_water: 0,
+            index_free: std::array::from_fn(|_| Vec::new()),
+            index_gpu_cap: 0,
+            palette_stride: 0,
+            grew: false,
             last_meta: FxHashMap::default(),
             last_aabb: FxHashMap::default(),
             last_voxels: FxHashMap::default(),
             pending_rewrites: Vec::new(),
             quarantine_slots: Vec::new(),
-            quarantine_arena: Vec::new(),
+            quarantine_index: Vec::new(),
         }
     }
 
@@ -261,11 +323,20 @@ impl ResidentPacker {
         self.slots.capacity
     }
 
-    /// The voxel ARENA capacity in `u32`s (`arena_capacity · dense_block_u32()`) — the voxel buffer length the
-    /// render path must allocate.
+    /// The index-arena capacity in `u32`s the render path must allocate for the index buffer — the current
+    /// high-water plus headroom (so a few deltas can allocate without forcing an immediate re-snapshot). Set as
+    /// [`Self::index_gpu_cap`] by [`snapshot_buffers`](Self::snapshot_buffers).
     #[inline]
-    pub fn arena_capacity_u32(&self) -> usize {
-        self.arena_capacity as usize * dense_block_u32()
+    pub fn index_capacity_u32(&self) -> usize {
+        // Headroom: 2× the live high-water, with a small absolute floor so an empty/tiny arena still has slack.
+        (self.index_high_water as usize * 2).max(self.index_high_water as usize + 8192).max(index_class_words(16))
+    }
+
+    /// The per-slot palette buffer capacity in `u32`s (`capacity · palette_stride`) — the `brick_palettes` buffer
+    /// length the render path must allocate (Checkpoint-1 fixed palette).
+    #[inline]
+    pub fn palette_capacity_u32(&self) -> usize {
+        self.slots.capacity as usize * self.palette_stride as usize
     }
 
     /// Number of resident bricks currently slotted.
@@ -274,19 +345,22 @@ impl ResidentPacker {
         self.resident.len()
     }
 
-    /// Build the FULL capacity-sized initial GPU buffers (storage plan A1 — the O(changed) upload). Called ONCE
-    /// per scene epoch, right after the packer (re-)created + the first [`update`](Self::update) ran. `aabbs`/
-    /// `metas` are capacity-length with [`degenerate_aabb`]/[`GpuBrickMeta::zeroed`] in the unused slots; `voxels`
-    /// is the `arena_capacity_u32()` RAW block pool with each resident dense brick's haloed `10³` block copied to
-    /// `arena_block · dense_block_u32()`. O(capacity) — paid ONCE per scene switch, never per move. After this the
-    /// render path applies each [`RepackDelta`] via `queue_write_buffer` (meta/aabb at `slot · stride`, the raw
-    /// block at `voxel_word_offset`), never re-creating these buffers within the epoch.
+    /// Build the FULL initial GPU buffers (storage plan A1 — the O(changed) upload). Called ONCE per scene epoch
+    /// (and again on a grow), right after the first [`update`](Self::update) ran. `aabbs`/`metas` are
+    /// capacity-length with [`degenerate_aabb`]/[`GpuBrickMeta::zeroed`] in unused slots; `indices` is the
+    /// [`index_capacity_u32`](Self::index_capacity_u32) slab pool with each resident dense brick's bit-packed
+    /// index stream copied to its slab offset (`meta.voxel_offset`); `brick_palettes` is the
+    /// [`palette_capacity_u32`](Self::palette_capacity_u32) buffer with each dense brick's palette at
+    /// `slot · palette_stride`. O(resident) — paid ONCE per epoch/grow, never per move. After this the render path
+    /// applies each [`RepackDelta`] via `queue_write_buffer` (meta/aabb at `slot · stride`, index at
+    /// `index_word_offset`, palette at `palette_word_offset`), never re-creating these buffers within the epoch.
     ///
-    /// The metas/aabbs are filled from the per-slot shadow (`last_meta`/`last_aabb`), which after `update` is
-    /// EXACTLY the bytes a `snapshot_buffers`-then-delta sequence converges to (the byte-identity gate). The
-    /// `palette` is the registry (fixed per scene); the NEE light list is NOT per-slot and is built separately by
-    /// the caller (see `build_lights_from_entries`).
-    pub fn snapshot_buffers(&self, registry: &super::palette::BlockRegistry) -> SnapshotBuffers {
+    /// The bytes come from the per-slot shadow (`last_meta`/`last_aabb` + the RE-ENCODED `last_voxels` raw cells),
+    /// which after `update` is EXACTLY the state a `snapshot_buffers`-then-delta sequence converges to (the
+    /// byte-identity gate). Re-encoding `last_voxels` here with [`encode_paletted`] reproduces the SAME index/
+    /// palette bytes `emit_changed_slot` shipped (the shadow stores the offsets in `metas`). The `palette` is the
+    /// registry (fixed per scene); the NEE light list is built separately by the caller.
+    pub fn snapshot_buffers(&mut self, registry: &super::palette::BlockRegistry) -> SnapshotBuffers {
         let cap = self.slots.capacity as usize;
         // Capacity-length meta/aabb: each occupied slot's shadow; degenerate/zeroed for the rest. The shadow
         // holds an entry for every slot that has EVER been written (occupied or freed→zeroed), so a slot absent
@@ -299,17 +373,25 @@ impl ResidentPacker {
         for (&slot, aabb) in &self.last_aabb {
             aabbs[slot as usize] = *aabb;
         }
-        // Raw voxel arena: each resident DENSE slot's haloed block at its arena offset. `last_voxels` holds the
-        // raw cells per slot; `resident` carries the arena_block index. A uniform brick has no arena block / no
-        // voxel shadow, so it contributes nothing (its id rides in the meta).
-        let mut voxels = vec![0u32; self.arena_capacity_u32()];
-        let block_u32 = dense_block_u32();
+        // A4.4 index slabs + per-brick palettes: each resident DENSE slot's bit-packed index stream at its slab
+        // offset + its `k` palette ids at `slot · palette_stride`. `last_voxels` holds the RAW cells; re-encode
+        // them (byte-identical to what `emit_changed_slot` shipped). The meta's `voxel_offset`/`palette_base`/
+        // `index_bits` are the canonical offsets (written by `emit_changed_slot`), so writing there keeps a fresh
+        // snapshot byte-identical to seed+deltas. A uniform brick has no dense slot / voxel shadow — its id rides
+        // in the meta.
+        let index_cap = self.index_capacity_u32();
+        let mut indices = vec![0u32; index_cap];
+        let mut brick_palettes = vec![0u32; self.palette_capacity_u32()];
         for st in self.resident.values() {
-            if let Some(block) = st.arena_block
-                && let Some(cells) = self.last_voxels.get(&st.slot)
-            {
-                let off = block as usize * block_u32;
-                voxels[off..off + cells.len()].copy_from_slice(cells);
+            let Some(dense) = st.dense else { continue };
+            let Some(cells) = self.last_voxels.get(&st.slot) else { continue };
+            let pb = encode_paletted(cells);
+            debug_assert_eq!(pb.index_bits, dense.index_bits, "shadow index_bits disagrees with re-encode");
+            let ioff = dense.index_offset as usize;
+            indices[ioff..ioff + pb.indices.len()].copy_from_slice(&pb.indices);
+            let poff = st.slot as usize * self.palette_stride as usize;
+            for (j, &id) in pb.palette.iter().enumerate() {
+                brick_palettes[poff + j] = id as u32;
             }
         }
         // Palette = the registry (block id → linear RGBA + emissive), indexed directly. Fixed per scene.
@@ -320,7 +402,18 @@ impl ResidentPacker {
                 GpuPaletteColor { rgba: registry.color(id), emissive: [e[0], e[1], e[2], 0.0] }
             })
             .collect();
-        SnapshotBuffers { aabbs, metas, voxels, palette, brick_count: self.resident.len() as u32 }
+        // Record the committed GPU buffer size for grow detection, and clear the grow flag (this snapshot IS the
+        // (re)allocation to `index_cap`). A subsequent delta-time allocation past `index_cap` re-sets `grew`.
+        self.index_gpu_cap = index_cap as u32;
+        self.grew = false;
+        SnapshotBuffers { aabbs, metas, indices, brick_palettes, palette, brick_count: self.resident.len() as u32 }
+    }
+
+    /// Peek the GROW signal without clearing it (the render path's snapshot-vs-delta decision). True iff an index
+    /// allocation since the last snapshot exceeded the committed GPU buffer capacity — ship a StreamSnapshot.
+    #[inline]
+    pub fn grew(&self) -> bool {
+        self.grew
     }
 
     /// Mark `keys` as REWRITTEN (an edit / dig re-source replaced their voxels in place): they re-pack on the
@@ -332,28 +425,42 @@ impl ResidentPacker {
         self.pending_rewrites.extend(keys);
     }
 
-    /// Claim a voxel-arena block, or `None` at capacity.
-    fn claim_arena(&mut self) -> Option<u32> {
-        if self.arena_high_water < self.arena_capacity {
-            let b = self.arena_high_water;
-            self.arena_high_water += 1;
-            Some(b)
-        } else {
-            self.arena_free.pop()
+    /// Claim a WORD offset for a dense brick's index stream of width `index_bits` from its size-class slab: reuse a
+    /// freed block of that class (exact size match), else bump the high-water by the class block size. Sets
+    /// [`Self::grew`] if the bump pushes past the committed GPU buffer capacity (the next upload re-snapshots into a
+    /// larger buffer). Always succeeds — the index arena grows on demand (the slot cap binds first).
+    fn claim_index(&mut self, index_bits: u8) -> u32 {
+        let class = index_class_of(index_bits);
+        if let Some(off) = self.index_free[class].pop() {
+            return off;
         }
+        let off = self.index_high_water;
+        self.index_high_water += index_class_words(index_bits) as u32;
+        if self.index_high_water > self.index_gpu_cap {
+            self.grew = true;
+        }
+        off
     }
 
     /// Incrementally reconcile the packer toward `entries` (the manager's `resident_entries()`, in the SSOT
     /// `(lod,z,y,x)` order). Returns the [`RepackDelta`] of slots whose GPU bytes changed — O(changed + halo),
-    /// never O(resident). The CALLER uploads only `delta.changed` via `queue_write_buffer`.
-    pub fn update(&mut self, entries: &[ResidentBrick<'_>]) -> RepackDelta {
-        // (1) Deferred-free: last update's quarantined slots/arena blocks are now safe to reuse (the frame that
+    /// never O(resident). The CALLER uploads only `delta.changed` via `queue_write_buffer`. `palette_stride` is the
+    /// per-slot palette stride (= the packing registry's length, which bounds a brick's `k`) — constant within an
+    /// epoch; it sizes `brick_palettes` and the dense metas' `palette_base = slot · palette_stride` (A4.4).
+    pub fn update(&mut self, entries: &[ResidentBrick<'_>], palette_stride: u32) -> RepackDelta {
+        debug_assert!(
+            self.palette_stride == 0 || self.palette_stride == palette_stride,
+            "palette_stride must be constant within an epoch ({} → {palette_stride})",
+            self.palette_stride,
+        );
+        self.palette_stride = palette_stride;
+        // (1) Deferred-free: last update's quarantined slots/index blocks are now safe to reuse (the frame that
         // could still be tracing them has been submitted). Release them BEFORE claiming this update's slots.
         for s in self.quarantine_slots.drain(..) {
             self.slots.release(s);
         }
-        for b in self.quarantine_arena.drain(..) {
-            self.arena_free.push(b);
+        for (off, bits) in std::mem::take(&mut self.quarantine_index) {
+            self.index_free[index_class_of(bits)].push(off);
         }
 
         // The NEW resident map (key → brick) + the by_key index pack_one reads for halos.
@@ -377,16 +484,18 @@ impl ResidentPacker {
                 slot: st.slot,
                 meta: GpuBrickMeta::zeroed(),
                 aabb: degenerate_aabb(),
-                voxels: None,
-                voxel_word_offset: 0,
+                index: None,
+                index_word_offset: 0,
+                palette: None,
+                palette_word_offset: 0,
             });
             delta.freed.push(st.slot);
             self.quarantine_slots.push(st.slot);
             self.last_meta.insert(st.slot, GpuBrickMeta::zeroed());
             self.last_aabb.insert(st.slot, degenerate_aabb());
             self.last_voxels.remove(&st.slot);
-            if let Some(b) = st.arena_block {
-                self.quarantine_arena.push(b);
+            if let Some(d) = st.dense {
+                self.quarantine_index.push((d.index_offset, d.index_bits));
             }
             topology_changed = true;
             for nbr in neighbourhood_26(key) {
@@ -406,7 +515,7 @@ impl ResidentPacker {
                 // At capacity — drop this brick (the manager already bounds the set; defensive skip).
                 continue;
             };
-            self.resident.insert(key, SlotState { slot, arena_block: None });
+            self.resident.insert(key, SlotState { slot, dense: None });
             dirty.insert(key, ());
             topology_changed = true;
         }
@@ -444,18 +553,22 @@ impl ResidentPacker {
         delta
     }
 
-    /// Write `pb`'s bytes into `key`'s slot, allocating/freeing its arena block as the dense/uniform
-    /// classification changed, and push a [`ChangedSlot`] iff the bytes actually differ from the slot's shadow.
+    /// Write `pb`'s bytes into `key`'s slot, allocating/freeing/re-classing its index slab as the dense/uniform
+    /// classification (and the dense brick's `index_bits` size class) changed, and push a [`ChangedSlot`] iff the
+    /// bytes actually differ from the slot's shadow. The dense path RE-ENCODES the brick's haloed cells into a
+    /// per-brick palette + bit-packed index stream ([`encode_paletted`], A4.4) and writes them into the index slab
+    /// and the fixed per-slot palette block — the SAME (palette, indices) bytes `snapshot_buffers` reproduces from
+    /// the raw `last_voxels` shadow (the byte-identity gate). `last_voxels` keeps RAW cells so the re-encode is exact.
     fn emit_changed_slot(&mut self, key: BrickKey, pb: &PackedBrick, delta: &mut RepackDelta) {
         let st = *self.resident.get(&key).expect("dirty key is resident");
         match &pb.voxels {
             BrickVoxels::Uniform(_) => {
-                // Uniform now: free any arena block it held (→ quarantine, keep-old).
-                if let Some(b) = st.arena_block {
-                    self.quarantine_arena.push(b);
+                // Uniform now: free any index slab it held (→ quarantine, keep-old).
+                if let Some(d) = st.dense {
+                    self.quarantine_index.push((d.index_offset, d.index_bits));
                 }
                 let meta = pb.meta_uniform();
-                self.resident.insert(key, SlotState { slot: st.slot, arena_block: None });
+                self.resident.insert(key, SlotState { slot: st.slot, dense: None });
                 let changed =
                     self.last_meta.get(&st.slot) != Some(&meta) || self.last_aabb.get(&st.slot) != Some(&pb.aabb);
                 self.last_meta.insert(st.slot, meta);
@@ -466,28 +579,44 @@ impl ResidentPacker {
                         slot: st.slot,
                         meta,
                         aabb: pb.aabb,
-                        voxels: None,
-                        voxel_word_offset: 0,
+                        index: None,
+                        index_word_offset: 0,
+                        palette: None,
+                        palette_word_offset: 0,
                     });
                 }
             }
             BrickVoxels::Dense(cells) => {
-                // Dense now: ensure it has an arena block (allocate if it just toggled from uniform).
-                let block = match st.arena_block {
-                    Some(b) => b,
-                    None => match self.claim_arena() {
-                        Some(b) => b,
-                        None => return, // arena full (defensive — slot cap binds first); skip
-                    },
+                // Encode the haloed cells → per-brick palette + bit-packed index stream. `index_bits` picks the
+                // size class; `k = palette.len() ≤ palette_stride` (the registry bounds it — correct by construction).
+                let enc = encode_paletted(cells);
+                debug_assert!(
+                    enc.palette.len() as u32 <= self.palette_stride,
+                    "brick palette k={} exceeds palette_stride={} (registry too large for fixed palette?)",
+                    enc.palette.len(),
+                    self.palette_stride,
+                );
+                // Ensure an index slab block of the RIGHT class: reuse the existing block iff its class already
+                // matches; else free the old one (→ quarantine) and claim a new one of the new class.
+                let index_offset = match st.dense {
+                    Some(d) if d.index_bits == enc.index_bits => d.index_offset,
+                    Some(d) => {
+                        self.quarantine_index.push((d.index_offset, d.index_bits));
+                        self.claim_index(enc.index_bits)
+                    }
+                    None => self.claim_index(enc.index_bits),
                 };
-                let word_offset = block * dense_block_u32() as u32;
-                // FIXED-ARENA shadow meta: the arena stores RAW haloed cells (NOT a paletted index stream — the
-                // R2b encode happens at `snapshot_patch` time, see that method), so this dense meta uses the
-                // arena `word_offset` as its offset with `index_bits = 0` / `palette_base = 0` as the RAW-ARENA
-                // marker. `snapshot_patch` reads only `is_uniform`/`voxel_origin`/`world_min`/`lod()` from the
-                // shadow and re-encodes from the raw `last_voxels`, so these two fields are inert here.
-                let meta = super::gpu::GpuBrickMeta::dense(pb.voxel_origin, word_offset, pb.world_min, pb.lod, 0, 0);
-                self.resident.insert(key, SlotState { slot: st.slot, arena_block: Some(block) });
+                let palette_base = st.slot * self.palette_stride;
+                let meta = super::gpu::GpuBrickMeta::dense(
+                    pb.voxel_origin,
+                    index_offset,
+                    pb.world_min,
+                    pb.lod,
+                    enc.index_bits,
+                    palette_base,
+                );
+                self.resident
+                    .insert(key, SlotState { slot: st.slot, dense: Some(DenseSlot { index_offset, index_bits: enc.index_bits }) });
                 let meta_changed =
                     self.last_meta.get(&st.slot) != Some(&meta) || self.last_aabb.get(&st.slot) != Some(&pb.aabb);
                 let voxels_changed = self.last_voxels.get(&st.slot) != Some(cells);
@@ -497,12 +626,21 @@ impl ResidentPacker {
                     self.last_voxels.insert(st.slot, cells.clone());
                 }
                 if meta_changed || voxels_changed {
+                    // The index + palette blocks are (re-)written exactly when the brick's content changed (a moved
+                    // slab — class change / uniform→dense — implies new content, so `voxels_changed` covers it).
+                    let (index, palette) = if voxels_changed {
+                        (Some(enc.indices), Some(enc.palette.into_iter().map(|id| id as u32).collect::<Vec<u32>>()))
+                    } else {
+                        (None, None)
+                    };
                     delta.changed.push(ChangedSlot {
                         slot: st.slot,
                         meta,
                         aabb: pb.aabb,
-                        voxels: if voxels_changed { Some(cells.clone()) } else { None },
-                        voxel_word_offset: word_offset,
+                        index,
+                        index_word_offset: index_offset,
+                        palette,
+                        palette_word_offset: palette_base,
                     });
                 }
             }
