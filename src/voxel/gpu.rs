@@ -34,7 +34,7 @@
 use bevy::math::IVec3;
 use bytemuck::{Pod, Zeroable};
 
-use super::brickmap::{BRICK_EDGE, BRICK_WORLD_SIZE, Brick, BrickMap, VOXEL_SIZE, brick_span, lod_edge};
+use super::brickmap::{BRICK_EDGE, BRICK_WORLD_SIZE, Brick, BrickMap, brick_span, lod_edge};
 use super::palette::{BlockId, BlockRegistry};
 
 /// The STORED per-axis grid edge of a brick at LOD `lod`: the core grid ([`lod_edge`], a constant
@@ -77,19 +77,37 @@ pub fn halo_index(x: i32, y: i32, z: i32, lod: u32) -> usize {
 /// This ONLY enlarges the BLAS candidate volume — it does NOT move any voxel. The in-shader DDA reconstructs
 /// cells from the brick's TRUE `world_min` and clamps the entry cell into `[0, edge)`, so a ray that enters
 /// only the epsilon halo (and never the real brick) finds no solid cell there and the true-bounds slab test
-/// in the shader rejects it. Chosen at `1e-3` of a voxel (~0.2 µm): far below sub-voxel precision yet well
-/// above the FP tangency that causes the miss. SSOT: both packers call [`brick_aabb`] so the overlap is
-/// defined exactly once.
-pub const BRICK_AABB_EPSILON: f32 = VOXEL_SIZE * 1.0e-3;
+/// in the shader rejects it. SSOT: both packers call [`brick_aabb`] (whose grow is [`brick_aabb_epsilon`]) so
+/// the overlap is defined exactly once.
+///
+/// **A4.2 — relative-per-LOD.** The grow is now [`brick_aabb_epsilon`]`(lod) = brick_span(lod) · REL_EPS`,
+/// a fixed FRACTION of the brick's per-LOD world span (NOT an absolute world distance). A coarse-LOD brick
+/// spans `2^lod×` more world, so its slab gap scales `2^lod×` too — an absolute epsilon would overlap a
+/// coarse brick by a relatively tinier fraction and risk re-opening the seam it exists to close. Making the
+/// grow proportional to the span bridges the FP slab-gap identically at every LOD and every voxel size (so it
+/// survives the Phase-D flip to 0.05 m, where an absolute `VOXEL_SIZE·1e-3` would quarter). `REL_EPS` is
+/// chosen so the LOD0/0.2 m grow EXACTLY equals the historical `VOXEL_SIZE · 1e-3` (`= brick_span(0)·REL_EPS`),
+/// so existing LOD0 renders are byte-identical.
+pub const BRICK_AABB_REL_EPS: f32 = 1.25e-4;
+
+/// The per-side BLAS-AABB grow (the seam-overlap fudge) for a brick at LOD `lod`, in world metres: a fixed
+/// FRACTION ([`BRICK_AABB_REL_EPS`]) of the brick's per-LOD world [`brick_span`]. SSOT shared by [`brick_aabb`]
+/// (the CPU AABB build) and the WGSL `brick_aabb_epsilon` (the in-shader slab grow) — the two MUST agree or
+/// the seam fix breaks. At LOD0/0.2 m this equals the historical absolute `VOXEL_SIZE · 1e-3`; at coarser LODs
+/// it grows `2^lod×` so the overlap stays the same FRACTION of the (wider) coarse brick.
+#[inline]
+pub fn brick_aabb_epsilon(lod: u32) -> f32 {
+    brick_span(lod) * BRICK_AABB_REL_EPS
+}
 
 /// The (epsilon-grown) BLAS AABB for a LOD-`lod` brick whose TRUE world-min corner is `world_min`. The true
 /// extent is [`brick_span`]`(lod)` per axis (the clipmap span scales `2^lod`, so a coarse brick covers more
-/// world); this grows it by [`BRICK_AABB_EPSILON`] on every side so abutting bricks overlap (the seam fix —
-/// see that constant). The single place the BLAS AABB bounds are formed, shared by both packers so the
+/// world); this grows it by [`brick_aabb_epsilon`]`(lod)` on every side so abutting bricks overlap (the seam
+/// fix — see that function). The single place the BLAS AABB bounds are formed, shared by both packers so the
 /// overlap rule (and the per-LOD span) never drifts from the WGSL `brick_span`.
 #[inline]
 pub fn brick_aabb(world_min: [f32; 3], lod: u32) -> GpuBrickAabb {
-    let e = BRICK_AABB_EPSILON;
+    let e = brick_aabb_epsilon(lod);
     let span = brick_span(lod);
     GpuBrickAabb {
         min: [world_min[0] - e, world_min[1] - e, world_min[2] - e],
@@ -112,13 +130,17 @@ pub struct GpuBrickAabb {
     pub _pad: [f32; 2],
 }
 
-/// The `voxel_offset` high bit (bit 31) marking a UNIFORM brick (storage plan R1): when set, the brick's
-/// FULL haloed `10³` grid is ONE block, so it carries NO per-voxel array — its single block id is packed into
-/// the LOW 16 bits of `voxel_offset` (see [`GpuBrickMeta::uniform`] / [`GpuBrickMeta::is_uniform`]). A
-/// non-uniform brick stores a real byte offset into the voxel buffer here, which is always `< 2^31` (≤ ~60k
-/// bricks × `halo_cells` = ~60 M `u32`s), so bit 31 is free to repurpose without growing the meta or breaking
-/// the std140/`bytemuck` layout. The WGSL `BRICK_UNIFORM_FLAG` mirror MUST match this exactly.
-pub const BRICK_UNIFORM_FLAG: u32 = 1u32 << 31;
+/// The [`GpuBrickMeta::flags`] bit marking a UNIFORM brick (storage plan R1): when set, the brick's FULL
+/// haloed `10³` grid is ONE block, so it carries NO per-voxel array — its single block id is packed into the
+/// LOW 16 bits of `voxel_offset` (see [`GpuBrickMeta::uniform`] / [`GpuBrickMeta::is_uniform`]).
+///
+/// **A4.1 — retired the bit-31 invariant.** The uniform flag formerly stole bit 31 of `voxel_offset`
+/// (`BRICK_UNIFORM_FLAG = 1<<31`), which silently capped a real dense `voxel_offset` (an arena/index word
+/// offset) at `< 2^31` — fine at today's ~60k-brick budget but a silent-corruption trap the moment the flip
+/// (Phase D) or a larger budget pushes the arena past `2^31` `u32`s. The flag now lives in a dedicated
+/// `flags` word (the former meta pad `_pad[0]`), so `voxel_offset` (and `palette_base`) use the FULL `u32`
+/// range with no reserved bit. The WGSL `META_FLAG_UNIFORM` mirror MUST match this exactly.
+pub const META_FLAG_UNIFORM: u32 = 1u32;
 
 /// Per-brick metadata, parallel to the AABB buffer (index `i` describes the brick whose AABB is
 /// `aabbs[i]` and whose `primitive_index` in the ray query is `i`). 48 bytes, `bytemuck`-uploadable.
@@ -137,11 +159,11 @@ pub struct GpuBrickMeta {
     /// `brick_coord · BRICK_EDGE`. The shader maps a world position to a local voxel via this.
     pub voxel_origin: [i32; 3],
     /// Offset (in `u32` elements) into the voxel INDEX-STREAM buffer where this brick's bit-packed indices begin
-    /// — UNLESS the [`BRICK_UNIFORM_FLAG`] high bit is set, in which case this is a UNIFORM brick (storage plan
-    /// R1): no index entries are emitted and the LOW 16 bits hold the single [`BlockId`] of the whole brick.
-    /// A DENSE brick's index stream is `encode_paletted(cells).indices` (R2b); bit 31 is always 0 for it (real
-    /// offsets are `< 2^31`). Read via [`Self::is_uniform`] / [`Self::uniform_block`] / [`Self::dense_offset`] —
-    /// never compare the raw field.
+    /// — UNLESS [`Self::flags`] has [`META_FLAG_UNIFORM`] set, in which case this is a UNIFORM brick (storage
+    /// plan R1): no index entries are emitted and the LOW 16 bits hold the single [`BlockId`] of the whole brick.
+    /// A DENSE brick's index stream is `encode_paletted(cells).indices` (R2b). **A4.1: the full `u32` range is
+    /// available — no reserved high bit** (the uniform flag moved to [`Self::flags`]). Read via
+    /// [`Self::uniform_block`] / [`Self::dense_offset`] — never compare the raw field.
     pub voxel_offset: u32,
     /// The brick's world-metre minimum corner (= `aabbs[i].min`), duplicated here so the shader's DDA has
     /// the brick origin without a second buffer fetch. `world_min = coord · brick_span(lod)`.
@@ -154,8 +176,13 @@ pub struct GpuBrickMeta {
     /// brick's palette (its `k` distinct block ids, one `u32` each) begins. The decode is
     /// `id = brick_palettes[palette_base + local_index]`. Meaningless (0) for a uniform/freed brick.
     pub palette_base: u32,
+    /// Per-brick FLAG bits (A4.1). Bit 0 ([`META_FLAG_UNIFORM`]) marks a UNIFORM brick (its single block id
+    /// rides in the low 16 bits of `voxel_offset`); all other bits are reserved (0). This dedicated word
+    /// replaces the old bit-31-of-`voxel_offset` flag, freeing `voxel_offset`/`palette_base` for the full
+    /// `u32` range. (Formerly the first meta pad word.)
+    pub flags: u32,
     /// Pad to 48 bytes (16-aligned, the WGSL `vec3` storage stride). Always zero.
-    pub _pad: [u32; 3],
+    pub _pad: [u32; 2],
 }
 
 impl GpuBrickMeta {
@@ -170,30 +197,32 @@ impl GpuBrickMeta {
         index_bits: u8,
         palette_base: u32,
     ) -> Self {
-        debug_assert!(voxel_offset & BRICK_UNIFORM_FLAG == 0, "voxel offset must leave bit 31 free for the uniform flag");
         Self {
             voxel_origin,
             voxel_offset,
             world_min,
             lod_and_bits: pack_lod_bits(lod, index_bits),
             palette_base,
-            _pad: [0; 3],
+            flags: 0,
+            _pad: [0; 2],
         }
     }
 
     /// Build a UNIFORM-brick meta (storage plan R1): the whole haloed `10³` grid is `block`, so NO index/palette
-    /// entries are emitted — the block id is packed into the low 16 bits of `voxel_offset` with the
-    /// [`BRICK_UNIFORM_FLAG`] high bit set. The shader's DDA reads the id straight from the meta (no buffer
-    /// fetch). `block` must be a SOLID block (a uniform-air brick is empty and never resident).
+    /// entries are emitted — the block id is packed into the low 16 bits of `voxel_offset` and [`Self::flags`]
+    /// carries [`META_FLAG_UNIFORM`] (A4.1: a dedicated flag word, not a stolen `voxel_offset` bit). The shader's
+    /// DDA reads the id straight from the meta (no buffer fetch). `block` must be a SOLID block (a uniform-air
+    /// brick is empty and never resident).
     #[inline]
     pub fn uniform(voxel_origin: [i32; 3], block: BlockId, world_min: [f32; 3], lod: u32) -> Self {
         Self {
             voxel_origin,
-            voxel_offset: BRICK_UNIFORM_FLAG | block.0 as u32,
+            voxel_offset: block.0 as u32,
             world_min,
             lod_and_bits: pack_lod_bits(lod, 0),
             palette_base: 0,
-            _pad: [0; 3],
+            flags: META_FLAG_UNIFORM,
+            _pad: [0; 2],
         }
     }
 
@@ -201,7 +230,8 @@ impl GpuBrickMeta {
     /// per-brick slot allocator never trace-references a freed slot — its AABB is collapsed to
     /// [`super::incremental::degenerate_aabb`] so the BLAS skips it — but the meta still needs defined bytes for
     /// the buffer. `voxel_offset == 0` clears the uniform flag, so even if it were ever read it points at the
-    /// arena's first word, not garbage). `Zeroable`-equivalent, written by name for clarity.
+    /// arena's first word, not garbage; `flags = 0` ⇒ not uniform, correct for a freed slot). `Zeroable`-
+    /// equivalent, written by name for clarity.
     #[inline]
     pub fn zeroed() -> Self {
         Self {
@@ -210,14 +240,16 @@ impl GpuBrickMeta {
             world_min: [0.0; 3],
             lod_and_bits: 0,
             palette_base: 0,
-            _pad: [0; 3],
+            flags: 0,
+            _pad: [0; 2],
         }
     }
 
-    /// True iff this meta is a collapsed UNIFORM brick (no index/palette; block id in the low bits).
+    /// True iff this meta is a collapsed UNIFORM brick (no index/palette; block id in the low bits). Reads the
+    /// dedicated [`Self::flags`] word (A4.1) — no longer a `voxel_offset` high bit.
     #[inline]
     pub fn is_uniform(&self) -> bool {
-        self.voxel_offset & BRICK_UNIFORM_FLAG != 0
+        self.flags & META_FLAG_UNIFORM != 0
     }
 
     /// The single [`BlockId`] of a UNIFORM brick (low 16 bits of `voxel_offset`). Meaningless for a dense
@@ -227,11 +259,11 @@ impl GpuBrickMeta {
         BlockId((self.voxel_offset & 0xFFFF) as u16)
     }
 
-    /// The index-stream start offset of a DENSE brick (bit 31 masked off — it is always 0 for a dense brick,
-    /// so this equals the raw field, but masking keeps the accessor total). Meaningless for a uniform brick.
+    /// The index-stream start offset of a DENSE brick — now the FULL `voxel_offset` (A4.1: no flag bit to mask;
+    /// the uniform flag moved to [`Self::flags`]). Meaningless for a uniform brick.
     #[inline]
     pub fn dense_offset(&self) -> u32 {
-        self.voxel_offset & !BRICK_UNIFORM_FLAG
+        self.voxel_offset
     }
 
     /// The brick's LOD level (bits 0-2 of `lod_and_bits`).
@@ -807,8 +839,7 @@ impl VoxelInterner {
         let pb = encode_paletted(cells);
         let voxel_offset = indices.len() as u32;
         let palette_base = palettes.len() as u32;
-        debug_assert!(voxel_offset & BRICK_UNIFORM_FLAG == 0, "voxel offset must leave bit 31 free for the uniform flag");
-        debug_assert!(palette_base & BRICK_UNIFORM_FLAG == 0, "palette base must leave bit 31 free");
+        // A4.1: voxel_offset / palette_base use the FULL u32 range — the uniform flag no longer steals bit 31.
         indices.extend_from_slice(&pb.indices);
         palettes.extend(pb.palette.iter().map(|&id| id as u32));
         let layout = DenseLayout { voxel_offset, palette_base, index_bits: pb.index_bits };
@@ -1281,7 +1312,7 @@ mod tests {
     };
     use bevy::math::IVec3;
 
-    use super::super::brickmap::{BRICK_VOXELS, Brick, voxel_index};
+    use super::super::brickmap::{BRICK_VOXELS, Brick, MAX_LOD, VOXEL_SIZE, voxel_index};
 
     /// A tiny registry + a small hand-built brick map for the packing tests.
     fn registry() -> BlockRegistry {
@@ -1436,10 +1467,31 @@ mod tests {
         let wmin = [2.0 * span, -span, 3.0 * span];
         assert_eq!(patch.metas[0].world_min, wmin);
         assert_eq!(patch.aabbs[0], brick_aabb(wmin, lod));
-        // The AABB extent is the per-LOD span (grown by the seam epsilon): a LOD2 brick is 4× wider than LOD0.
+        // The AABB extent is the per-LOD span (grown by the relative-per-LOD seam epsilon): a LOD2 brick is 4×
+        // wider than LOD0, and so (A4.2) is its grow.
         let extent = patch.aabbs[0].max[0] - patch.aabbs[0].min[0];
-        assert!((extent - (span + 2.0 * BRICK_AABB_EPSILON)).abs() < 1e-3, "AABB spans brick_span(lod)");
+        assert!((extent - (span + 2.0 * brick_aabb_epsilon(lod))).abs() < 1e-3, "AABB spans brick_span(lod)");
         assert!((span - 4.0 * BRICK_WORLD_SIZE).abs() < 1e-4, "LOD2 span is 4× the LOD0 span");
+    }
+
+    /// A4.2 — the BLAS-AABB seam epsilon is RELATIVE-PER-LOD: a fixed fraction of the brick's per-LOD span, so
+    /// it scales `2^lod×` with the (wider) coarse brick instead of staying an absolute world distance. The
+    /// LOD0/0.2 m grow is pinned EXACTLY to the historical `VOXEL_SIZE · 1e-3` (so existing LOD0 renders are
+    /// byte-identical), and each coarser LOD doubles it.
+    #[test]
+    fn brick_aabb_epsilon_is_relative_per_lod() {
+        // LOD0 backward-compat: identical to the pre-A4.2 absolute constant.
+        let lod0 = brick_aabb_epsilon(0);
+        assert!((lod0 - VOXEL_SIZE * 1.0e-3).abs() < 1e-9, "LOD0 grow == historical VOXEL_SIZE·1e-3");
+        // Scales with the per-LOD span: each coarser LOD's grow is 2× the finer one (and a fixed fraction of
+        // brick_span(lod)).
+        for lod in 0..=MAX_LOD {
+            let e = brick_aabb_epsilon(lod);
+            assert!((e - brick_span(lod) * BRICK_AABB_REL_EPS).abs() < 1e-9, "grow == span·REL_EPS");
+            if lod > 0 {
+                assert!((e - 2.0 * brick_aabb_epsilon(lod - 1)).abs() < 1e-9, "grow doubles per LOD");
+            }
+        }
     }
 
     /// The clipmap voxelizes each `(coord, lod)` directly (a true in-place mip), so the packer stores the
@@ -1624,16 +1676,19 @@ mod tests {
 
     // --- STORAGE PLAN R1: uniform-including-halo collapse ----------------------------------------------
 
-    /// The `GpuBrickMeta` flag encoding round-trips and stays 32 bytes (std140/encase-safe): a uniform meta is
-    /// flagged + carries its block id in the low bits; a dense meta is byte-identical to before R1 (bit 31
-    /// clear, offset readable). The Rust struct size is pinned so the WGSL mirror can't silently drift.
+    /// The `GpuBrickMeta` flag encoding round-trips and stays 48 bytes (std140/encase-safe): a uniform meta is
+    /// flagged in the dedicated `flags` word + carries its block id in the low bits; a dense meta's
+    /// `voxel_offset` uses the FULL `u32` range (A4.1 — the uniform flag no longer steals bit 31). The Rust
+    /// struct size/align is pinned so the WGSL mirror can't silently drift.
     #[test]
     fn meta_uniform_flag_roundtrips_without_growing() {
-        // R2b grew the meta to 48 bytes (16-aligned) to carry palette_base + the packed lod/index_bits.
+        // R2b grew the meta to 48 bytes (16-aligned) to carry palette_base + the packed lod/index_bits; A4.1
+        // repurposed one pad word as `flags` (no size change).
         assert_eq!(std::mem::size_of::<GpuBrickMeta>(), 48, "meta must be 48 bytes (WGSL byte-match)");
         assert_eq!(std::mem::align_of::<GpuBrickMeta>(), 4, "POD meta is 4-byte aligned (vec3 is [i32;3])");
         let u = GpuBrickMeta::uniform([8, 0, -8], BlockId(1234), [1.6, 0.0, -1.6], 3);
         assert!(u.is_uniform());
+        assert_eq!(u.flags & META_FLAG_UNIFORM, META_FLAG_UNIFORM, "uniform flag lives in the `flags` word");
         assert_eq!(u.uniform_block(), BlockId(1234));
         assert_eq!(u.voxel_origin, [8, 0, -8]);
         assert_eq!(u.lod(), 3);
@@ -1641,10 +1696,23 @@ mod tests {
         // R2b dense meta packs lod (bits 0-2) + index_bits (bits 3-7) into `lod_and_bits`, plus palette_base.
         let d = GpuBrickMeta::dense([0, 0, 0], 5000, [0.0; 3], 5, 4, 777);
         assert!(!d.is_uniform(), "a dense brick must NOT be flagged uniform");
-        assert_eq!(d.dense_offset(), 5000, "dense offset reads back unchanged (bit 31 clear)");
+        assert_eq!(d.flags, 0, "a dense brick's flag word is clear");
+        assert_eq!(d.dense_offset(), 5000, "dense offset reads back unchanged");
         assert_eq!(d.lod(), 5, "lod round-trips through the packed field");
         assert_eq!(d.index_bits(), 4, "index_bits round-trips through the packed field");
         assert_eq!(d.palette_base, 777, "palette_base round-trips");
+
+        // A4.1 CORRUPTION REGRESSION: a dense `voxel_offset` / `palette_base` at or above 2^31 — which the old
+        // bit-31 uniform flag would have aliased into a (wrong) uniform brick / truncated offset — now round-trip
+        // EXACTLY through the full u32 range, and the meta still reads as DENSE.
+        let big_off: u32 = (1u32 << 31) | 0x1234;
+        let big_pal: u32 = 0xFFFF_FFFF;
+        let big = GpuBrickMeta::dense([0, 0, 0], big_off, [0.0; 3], 2, 8, big_pal);
+        assert!(!big.is_uniform(), "a dense brick with voxel_offset >= 2^31 must NOT alias to uniform (A4.1)");
+        assert_eq!(big.dense_offset(), big_off, "dense offset >= 2^31 round-trips through the full u32");
+        assert_eq!(big.palette_base, big_pal, "palette_base = u32::MAX round-trips through the full u32");
+        assert_eq!(big.lod(), 2);
+        assert_eq!(big.index_bits(), 8);
     }
 
     /// A fully-buried uniform brick (its 6/26 neighbours all the SAME solid block) collapses: the meta is

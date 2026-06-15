@@ -35,7 +35,7 @@
 //!
 //! ## Cross-LOD seams
 //! At a shell boundary a fine brick abuts a `2×`-coarser brick. We do NOT build a cross-LOD halo; the two
-//! bricks are SEPARATE BLAS AABBs and the [`BRICK_AABB_EPSILON`](super::gpu::BRICK_AABB_EPSILON) overlap +
+//! bricks are SEPARATE BLAS AABBs and the [`brick_aabb_epsilon`](super::gpu::brick_aabb_epsilon) overlap +
 //! the nearest-solid-hit DDA commit the nearest surface across the LOD step. See the seam discussion in
 //! [`super::gpu::pack_resident_set`].
 
@@ -61,6 +61,13 @@ pub struct BrickKey {
     /// The clipmap LOD level.
     pub lod: u32,
 }
+
+/// A purely-DEFENSIVE ceiling on the RAW [`desired_clipmap`] enumeration size (A2): a guard so a pathological
+/// `clip_half_bricks` can't OOM the geometric tiling itself. This is NOT the resident cap (`max_resident_bricks`)
+/// — it is the bound on the UNCLASSIFIED clip-VOLUME enumeration, deliberately ~orders of magnitude larger than
+/// any sane resident set so it never binds in practice (the surface-shell cap in [`ResidencyManager::update`] is
+/// the real, much tighter bound). At `clip_half = 26` the uncapped tiling is well under this.
+pub const MAX_CLIP_ENUMERATION: usize = 8_000_000;
 
 /// Tunable clipmap streaming knobs. Plain `Copy` data so it can be a Bevy resource or a test literal.
 #[derive(Clone, Copy, Debug, bevy::prelude::Resource)]
@@ -193,8 +200,11 @@ fn level_resident(cam_world: [f32; 3], coord: IVec3, lod: u32, half: i32) -> boo
     }
 }
 
-/// The uncapped clipmap brick count — `Σ over levels of |level_box \ level_hole|` — for the cap-drop log (and
-/// an exact figure for tests). `level_hole ⊆ level_box` for `half >= 2`, so the subtraction is exact.
+/// The uncapped clipmap brick count — `Σ over levels of |level_box \ level_hole|` — the closed-form full
+/// tiling size (an exact figure for tests). `level_hole ⊆ level_box` for `half >= 2`, so the subtraction is
+/// exact. (A2: `desired_clipmap` is now itself uncapped, so `desired.len()` equals this; kept as the
+/// independent closed-form oracle the residency / Θ-exponent tests check against.)
+#[cfg(test)]
 fn clipmap_uncapped_len(cam_world: [f32; 3], half: i32) -> usize {
     let vol = |lo: IVec3, hi: IVec3| {
         (hi.x - lo.x + 1).max(0) as usize
@@ -246,11 +256,17 @@ pub fn brick_lod(coord: IVec3, cam_world: [f32; 3], cfg: &StreamingConfig) -> u3
 /// Because a level's box snaps to the coarser grid, the hole it carves equals the finer level's box world
 /// EXACTLY: adjacent levels ABUT with NEITHER overlap NOR gap, and the union telescopes to the outermost box.
 /// No band-aid one-ring overlap — a ray crossing a LOD boundary passes from a fine brick to the coarse brick
-/// that shares its face (the [`BRICK_AABB_EPSILON`](super::gpu::BRICK_AABB_EPSILON) + nearest-hit DDA commit
+/// that shares its face (the [`BRICK_AABB_EPSILON`](super::gpu::brick_aabb_epsilon) + nearest-hit DDA commit
 /// the surface across the seam). LOD0 has no hole (it is the solid inner box). The union reaches
 /// `clip_half · BRICK_WORLD_SIZE · 2^MAX_LOD` from the camera. Returned keyed by [`BrickKey`]; iteration order
-/// is not guaranteed (callers needing a stable `primitive_index` sort — the manager does). If the union
-/// exceeds `max_resident_bricks`, the FARTHEST bricks (world metres) are dropped (deterministic).
+/// is not guaranteed (callers needing a stable `primitive_index` sort — the manager does).
+///
+/// **A2 — this is the UNCAPPED geometric tiling.** It is NO LONGER capped to `max_resident_bricks` here: the
+/// `max_resident_bricks` cap is applied in [`ResidencyManager::update`] AFTER the surface [`classify`](BrickSource::classify)
+/// split, so it bounds the surface SHELL (Θ(H²)) rather than the clip VOLUME (Θ(H³)) — a far buried-interior or
+/// sky brick `classify` would prune anyway must NOT steal a slot from a near surface brick. A pure geometric
+/// SAFETY ceiling ([`MAX_CLIP_ENUMERATION`]) still bounds the raw enumeration so a pathological `clip_half`
+/// can't OOM the enumeration itself; that ceiling is NOT the resident cap (it is ~orders of magnitude larger).
 pub fn desired_clipmap(cam_world: [f32; 3], cfg: &StreamingConfig) -> FxHashMap<BrickKey, ()> {
     let half = cfg.clip_half_bricks;
     let mut out: FxHashMap<BrickKey, ()> = FxHashMap::default();
@@ -267,34 +283,29 @@ pub fn desired_clipmap(cam_world: [f32; 3], cfg: &StreamingConfig) -> FxHashMap<
                         continue; // ceded to the finer level — no overlap
                     }
                     out.insert(BrickKey { coord, lod }, ());
+                    if out.len() > MAX_CLIP_ENUMERATION {
+                        // Defensive enumeration ceiling (NOT the resident cap): a pathological `clip_half` can't
+                        // OOM the raw tiling. The surface cap in `update` is the real bound; this only guards the
+                        // enumeration's own memory. Bail out — the tiling is already absurdly large.
+                        return out;
+                    }
                 }
             }
         }
     }
-    if out.len() > cfg.max_resident_bricks {
-        // Keep the nearest `max_resident_bricks`; drop the rest (farthest first). The "distance" is the
-        // shell distance in the level's own grid, so a far coarse shell drops before a near fine one only if
-        // it is genuinely farther in WORLD metres — rank by world distance. Deterministic tiebreak.
-        let world_d = |k: &BrickKey| {
-            // Approx world centre distance: brick centre = (coord + 0.5)·brick_span(lod).
-            let span = brick_span(k.lod);
-            let cx = (k.coord.x as f32 + 0.5) * span - cam_world[0];
-            let cy = (k.coord.y as f32 + 0.5) * span - cam_world[1];
-            let cz = (k.coord.z as f32 + 0.5) * span - cam_world[2];
-            (cx * cx + cy * cy + cz * cz).sqrt()
-        };
-        let mut all: Vec<BrickKey> = out.keys().copied().collect();
-        all.sort_by(|a, b| {
-            world_d(a)
-                .partial_cmp(&world_d(b))
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then((a.lod, a.coord.z, a.coord.y, a.coord.x).cmp(&(b.lod, b.coord.z, b.coord.y, b.coord.x)))
-        });
-        for k in all.into_iter().skip(cfg.max_resident_bricks) {
-            out.remove(&k);
-        }
-    }
     out
+}
+
+/// The approximate WORLD-metre centre distance of a clipmap brick `key` from `cam_world` — the cap-ranking key
+/// shared by the surface cap (A2). Brick centre = `(coord + 0.5)·brick_span(lod)`, so a far coarse shell ranks
+/// behind a near fine one only when it is genuinely farther in world metres.
+#[inline]
+fn brick_world_dist(key: &BrickKey, cam_world: [f32; 3]) -> f32 {
+    let span = brick_span(key.lod);
+    let cx = (key.coord.x as f32 + 0.5) * span - cam_world[0];
+    let cy = (key.coord.y as f32 + 0.5) * span - cam_world[1];
+    let cz = (key.coord.z as f32 + 0.5) * span - cam_world[2];
+    (cx * cx + cy * cy + cz * cz).sqrt()
 }
 
 /// A queued unit of streaming work: voxelize the brick at clipmap key `key` (`(coord, lod)`). The LOD is part
@@ -416,9 +427,6 @@ impl ResidencyManager {
     /// `2^L×` less often). Returns the number of bricks dropped (so the caller can log churn).
     pub fn update(&mut self, cam_world: [f32; 3], cfg: &StreamingConfig, source: &dyn BrickSource) -> usize {
         let desired = desired_clipmap(cam_world, cfg);
-        // The EXACT uncapped clipmap size (Σ over levels of |box \ hole|), for the cap-drop log.
-        let uncapped = clipmap_uncapped_len(cam_world, cfg.clip_half_bricks);
-        self.capped_total += uncapped.saturating_sub(desired.len());
 
         // Drop resident bricks that left the clipmap.
         let mut dropped = 0usize;
@@ -435,12 +443,18 @@ impl ResidencyManager {
         self.empty.retain(|k| desired.contains_key(k));
         self.pruned.retain(|k| desired.contains_key(k));
 
-        // Enqueue each desired brick that is NOT already resident (and not known-empty / known-pruned / already
-        // queued). The classify FILTER prunes non-surface keys at enqueue time: a deep-buried Interior brick or
-        // a high-sky Air brick is never voxelized nor kept resident (it can't be a primary-ray hit), so the
-        // resident set + the per-frame drain track the SURFACE SHEET, not the clipmap volume. A `Surface` brick
-        // (the default, and any straddle/uncertain case) is enqueued exactly as before — the prune is purely
-        // subtractive, so the exact-tiling residency stays valid.
+        // CLASSIFY each desired brick that is NOT already resident (and not known-empty / known-pruned / already
+        // queued). The classify FILTER prunes non-surface keys: a deep-buried Interior brick or a high-sky Air
+        // brick is never voxelized nor kept resident (it can't be a primary-ray hit), so the resident set + the
+        // per-frame drain track the SURFACE SHEET, not the clipmap volume. A `Surface` brick (the default, and
+        // any straddle/uncertain case) is a candidate exactly as before — the prune is purely subtractive, so
+        // the exact-tiling residency stays valid.
+        //
+        // A2 — CAP AFTER CLASSIFY: we collect the new SURFACE candidates here and apply `max_resident_bricks`
+        // to the surface SHELL below (NOT the clip VOLUME in `desired_clipmap`). So a far buried-interior / sky
+        // brick — which `classify` prunes anyway — can never steal a slot from a near surface brick; the cap
+        // bounds Θ(H²) surface, not Θ(H³) volume.
+        let mut surface_candidates: Vec<BrickKey> = Vec::new();
         for key in desired.keys() {
             if self.resident.contains_key(key)
                 || self.queued.contains(key)
@@ -450,15 +464,38 @@ impl ResidencyManager {
                 continue;
             }
             match source.classify(key.coord, key.lod) {
-                BrickClass::Surface => {
-                    self.queue.push_back(WorkItem { key: *key });
-                    self.queued.insert(*key);
-                }
+                BrickClass::Surface => surface_candidates.push(*key),
                 BrickClass::Air | BrickClass::Interior => {
                     // Provably unhittable — prune (memoized so we don't re-classify it every move).
                     self.pruned.insert(*key);
                 }
             }
+        }
+
+        // A2 surface-shell cap: the resident set + the in-flight queue + the new surface candidates must not
+        // exceed `max_resident_bricks`. When they would, drop the FARTHEST surface candidates (world-metre rank)
+        // so the nearest surface shell is kept — the cap binds the surface SHEET, never the buried volume (those
+        // were already pruned above and never count against it). With the nested shells this should rarely bind.
+        let budget = cfg.max_resident_bricks;
+        let already = self.resident.len() + self.queued.len();
+        let room = budget.saturating_sub(already);
+        if surface_candidates.len() > room {
+            // Keep the nearest `room`; drop the rest (farthest first), deterministic tiebreak. Rank by world
+            // distance so a far coarse shell drops before a near fine one only if it is genuinely farther.
+            surface_candidates.sort_by(|a, b| {
+                brick_world_dist(a, cam_world)
+                    .partial_cmp(&brick_world_dist(b, cam_world))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then((a.lod, a.coord.z, a.coord.y, a.coord.x).cmp(&(b.lod, b.coord.z, b.coord.y, b.coord.x)))
+            });
+            self.capped_total += surface_candidates.len() - room;
+            surface_candidates.truncate(room);
+        }
+
+        // Enqueue the (surviving) surface candidates for voxelization by `drain_work`.
+        for key in surface_candidates {
+            self.queue.push_back(WorkItem { key });
+            self.queued.insert(key);
         }
         dropped
     }
@@ -779,16 +816,79 @@ mod tests {
         }
     }
 
-    /// The resident cap drops the farthest (in WORLD metres) bricks so the clipmap never exceeds
-    /// `max_resident_bricks`, and the camera's own brick is always kept.
+    /// A test [`BrickSource`] that classifies EVERY brick as [`BrickClass::Surface`] (the default), so
+    /// `ResidencyManager::update`'s classify split keeps all desired keys as surface candidates — letting the
+    /// A2 surface cap be exercised directly (every desired brick competes for a slot). `brick` is never called
+    /// by `update`, so it returns a trivial empty brick.
+    struct AllSurfaceSource;
+    impl BrickSource for AllSurfaceSource {
+        fn brick(&self, _coord: IVec3, _lod: u32, _registry: &BlockRegistry) -> Brick {
+            Brick::uniform(super::super::palette::BlockId::AIR)
+        }
+        // classify uses the trait default (always Surface) — exactly what we want.
+    }
+
+    /// A2 — the cap is applied AFTER the classify split, so it bounds the surface SHELL: a cold `update` at a
+    /// small `max_resident_bricks` enqueues at most the cap, the resident+pending set never exceeds it, and the
+    /// KEPT surface candidates are the NEAREST ones (a far surface brick is dropped before a near one). The
+    /// `desired_clipmap` itself is now UNCAPPED — the cap lives in `update`.
     #[test]
-    fn resident_cap_drops_farthest() {
-        let cfg = StreamingConfig { clip_half_bricks: 8, max_resident_bricks: 50, ..Default::default() };
+    fn surface_cap_bounds_shell_keeping_nearest() {
+        let cap = 50usize;
+        let cfg = StreamingConfig { clip_half_bricks: 8, max_resident_bricks: cap, ..Default::default() };
         let cam = [0.5_f32, 0.5, 0.5];
-        let d = desired_clipmap(cam, &cfg);
-        assert_eq!(d.len(), 50, "capped to max_resident_bricks");
+
+        // desired_clipmap is no longer capped — it returns the full geometric tiling (≫ cap here).
+        let big = StreamingConfig { max_resident_bricks: usize::MAX, ..cfg };
+        let d = desired_clipmap(cam, &big);
+        assert!(d.len() > cap, "the uncapped tiling is far larger than the cap");
+
+        let src = AllSurfaceSource;
+        let mut mgr = ResidencyManager::new();
+        mgr.update(cam, &cfg, &src);
+        // The cap binds the SURFACE shell: resident (0 yet) + pending must not exceed the cap.
+        assert!(mgr.resident_count() + mgr.pending() <= cap, "the surface cap bounds resident+pending to the cap");
+        assert_eq!(mgr.pending(), cap, "an all-surface cold fill enqueues exactly the cap (nearest kept)");
+        assert!(mgr.capped_total > 0, "the cap dropped the farther surface candidates");
+
+        // The KEPT (queued) candidates are the NEAREST surface bricks: the farthest queued brick is no farther
+        // than the nearest DROPPED desired brick. Reconstruct the world-distance ranking over the full tiling.
+        let mut all: Vec<BrickKey> = d.keys().copied().collect();
+        all.sort_by(|a, b| {
+            brick_world_dist(a, cam)
+                .partial_cmp(&brick_world_dist(b, cam))
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then((a.lod, a.coord.z, a.coord.y, a.coord.x).cmp(&(b.lod, b.coord.z, b.coord.y, b.coord.x)))
+        });
+        let kept: FxHashSet<BrickKey> = all.iter().take(cap).copied().collect();
+        for item in &mgr.queue {
+            assert!(kept.contains(&item.key), "every queued brick is among the nearest `cap` desired bricks");
+        }
+        // The camera's own LOD0 brick (nearest) is always kept.
         let cam0 = camera_brick_coord_lod(cam, 0);
-        assert!(d.contains_key(&BrickKey { coord: cam0, lod: 0 }), "the camera's LOD0 brick is always kept");
+        assert!(mgr.queued.contains(&BrickKey { coord: cam0, lod: 0 }), "the camera's LOD0 brick is always kept");
+    }
+
+    /// A2 — a deep-buried INTERIOR / high-sky AIR brick (which `classify` prunes) NEVER counts against the cap:
+    /// the cap bounds only the surface candidates. With a source that prunes everything to Interior, even a
+    /// tiny cap enqueues NOTHING and the resident set stays empty — the volume can't steal slots from a shell.
+    #[test]
+    fn surface_cap_ignores_pruned_interior() {
+        struct AllInteriorSource;
+        impl BrickSource for AllInteriorSource {
+            fn brick(&self, _c: IVec3, _l: u32, _r: &BlockRegistry) -> Brick {
+                Brick::uniform(super::super::palette::BlockId::AIR)
+            }
+            fn classify(&self, _c: IVec3, _l: u32) -> BrickClass {
+                BrickClass::Interior
+            }
+        }
+        let cfg = StreamingConfig { clip_half_bricks: 8, max_resident_bricks: 10, ..Default::default() };
+        let cam = [0.5_f32, 0.5, 0.5];
+        let mut mgr = ResidencyManager::new();
+        mgr.update(cam, &cfg, &AllInteriorSource);
+        assert_eq!(mgr.pending(), 0, "pruned interior bricks never become surface candidates");
+        assert_eq!(mgr.capped_total, 0, "the cap never binds — nothing surface to drop");
     }
 
     /// Residency reconciliation: a simulated camera move enters new bricks (enqueued, then voxelized into
@@ -891,5 +991,55 @@ mod tests {
         let dropped = mgr.update(cam1, &cfg, &src);
         assert!(dropped > 0, "the fully-shifted clipmap drops the old keys");
         assert!(mgr.pending() > 0, "and enqueues the new keys (fresh voxelize at their LOD)");
+    }
+
+    /// A2 — SURFACE-SHELL SCALING (`VOXEL_LARGE_SCENE_PLAN` §7). With the cap applied AFTER the classify split,
+    /// the SURFACE candidate set the residency keeps scales ~Θ(H²) (a thin shell over the terrain), NOT Θ(H³)
+    /// (the clip volume). We grow `clip_half` and fit the exponent of the surface-candidate count vs H: the
+    /// classify-pruned volume (buried interior + high sky) must NOT inflate it to a cubic. The UNCAPPED tiling
+    /// (`desired_clipmap`) by contrast grows ~cubically — so this also proves the cap-after-classify is what
+    /// turns Θ(H³)→Θ(H²).
+    #[test]
+    fn surface_candidates_scale_quadratically_not_cubically() {
+        let layer = test_layer();
+        let lib = test_library();
+        let surf = layer.sample_world(0.0, 0.0, SEED).height;
+        let src = WorldgenSource::new(&layer, &lib, SEED);
+        let cam = [0.0_f32, surf, 0.0];
+
+        // The surface-candidate count for a given clip_half: a cold uncapped `update` enqueues exactly the
+        // surface shell (classify prunes the buried/sky volume), so `pending()` IS the surface-candidate count.
+        let surface_count = |half: i32| -> f64 {
+            let cfg = StreamingConfig {
+                clip_half_bricks: half,
+                max_resident_bricks: usize::MAX, // uncapped — measure the true surface shell, not the cap
+                max_bricks_per_frame: 1,
+            };
+            let mut mgr = ResidencyManager::new();
+            mgr.update(cam, &cfg, &src);
+            mgr.pending() as f64
+        };
+        // The full UNCAPPED geometric tiling (volume) for the same half — the Θ(H³) baseline the classify avoids.
+        let volume_count = |half: i32| -> f64 { clipmap_uncapped_len(cam, half) as f64 };
+
+        // Fit the power-law exponent p in count ≈ c·H^p from two clip_half samples: p = ln(n2/n1)/ln(h2/h1).
+        let (h1, h2) = (8.0_f64, 16.0_f64);
+        let exponent = |f: &dyn Fn(i32) -> f64| (f(h2 as i32).ln() - f(h1 as i32).ln()) / (h2 / h1).ln();
+
+        let surf_p = exponent(&surface_count);
+        let vol_p = exponent(&volume_count);
+        // The surface shell scales ~quadratically: comfortably below cubic, around 2. (Allow slack for the
+        // discrete shell + the band-limited terrain's gentle slope; the point is it is NOT ~3.)
+        assert!(
+            surf_p < 2.6,
+            "surface candidates must scale sub-cubically (Θ(H²)), got exponent {surf_p:.2} (volume {vol_p:.2})"
+        );
+        // Sanity: the uncapped VOLUME really is ~cubic (so the surface sub-cubic result is meaningful).
+        assert!(vol_p > 2.6, "the uncapped clip volume scales ~cubically, got {vol_p:.2}");
+        // And the surface shell is materially SMALLER than the volume at the large half (the cull works).
+        assert!(
+            surface_count(h2 as i32) < 0.5 * volume_count(h2 as i32),
+            "the surface shell is far smaller than the clip volume at clip_half={h2}"
+        );
     }
 }

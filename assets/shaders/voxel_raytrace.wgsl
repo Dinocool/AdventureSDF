@@ -25,12 +25,14 @@ const VOXEL_SIZE: f32 = 0.2;
 // World-metre span of a LOD0 brick (= BRICK_EDGE · VOXEL_SIZE = 1.6 m). A LOD-L brick spans
 // brick_span(L) = BRICK_WORLD_SIZE · 2^L — see `brick_span` below (the clipmap SSOT mirror of brickmap.rs).
 const BRICK_WORLD_SIZE: f32 = f32(BRICK_EDGE) * VOXEL_SIZE;
-// The per-side AABB grow used to overlap abutting bricks — the SEAM fix. MUST mirror `BRICK_AABB_EPSILON`
-// in src/voxel/gpu.rs. The shader recomputes the per-brick ray/AABB slab from the GROWN bounds (matching
-// the BLAS geometry), so a ray grazing a shared face/edge enters the brick instead of falling in the FP gap
-// between abutting AABBs. The DDA still reconstructs cells from the TRUE `world_min` and clamps into the
-// real grid, so the halo never adds phantom voxels.
-const BRICK_AABB_EPSILON: f32 = VOXEL_SIZE * 1.0e-3;
+// A4.2 — the per-side AABB grow (the SEAM fix) is now RELATIVE-PER-LOD: a fixed FRACTION of the brick's
+// per-LOD world span, via `brick_aabb_epsilon(lod)` below. MUST mirror `BRICK_AABB_REL_EPS` / `brick_aabb_epsilon`
+// in src/voxel/gpu.rs. The shader recomputes the per-brick ray/AABB slab from the GROWN bounds (matching the
+// BLAS geometry), so a ray grazing a shared face/edge enters the brick instead of falling in the FP gap between
+// abutting AABBs. The DDA still reconstructs cells from the TRUE `world_min` and clamps into the real grid, so
+// the halo never adds phantom voxels. The grow scales with the (2^lod×-wider) coarse span, so it bridges the FP
+// slab-gap identically at every LOD / voxel size; at LOD0/0.2 m it equals the historical `VOXEL_SIZE·1e-3`.
+const BRICK_AABB_REL_EPS: f32 = 1.25e-4;
 
 // Max LOD level (mirrors src/voxel/brickmap.rs MAX_LOD = 7). A brick is 8³ at every LOD; the coarsest level
 // spans 2^7 = 128× the LOD0 world extent — the clipmap's outer reach (~1.6 km half-extent at clip_half 8).
@@ -42,24 +44,25 @@ const MAX_LOD: u32 = 7u;
 // over the SAME 8³ grid covering 2^lod× more world.
 struct BrickMeta {
     voxel_origin: vec3<i32>,  // brick's world-VOXEL origin (= brick_coord · BRICK_EDGE)
-    voxel_offset: u32,        // DENSE: start word of this brick's bit-packed INDEX STREAM in `voxel_indices`.
-                              // UNIFORM (bit 31 set): no stream — the single block id is the low 16 bits (R1).
+    voxel_offset: u32,        // DENSE: start word of this brick's bit-packed INDEX STREAM in `voxel_indices`
+                              //   (A4.1: full u32 range — no reserved high bit). UNIFORM (flags bit 0 set): no
+                              //   stream — the single block id is the low 16 bits (R1).
     world_min: vec3<f32>,     // brick's world-metre min corner (= coord · brick_span(lod))
     lod_and_bits: u32,        // bits 0-2: brick LOD level (0 = finest). bits 3-7: R2b index bit width ∈ {1,2,4,8,16}.
     palette_base: u32,        // R2b: start word of this brick's palette in `brick_palettes` (dense only)
+    flags: u32,               // A4.1: per-brick flag bits. bit 0 (META_FLAG_UNIFORM) marks a UNIFORM brick.
     // Pad to a 48-byte stride (matches Rust `GpuBrickMeta`). SCALAR u32s (align 4) — a `vec3<u32>` here would be
     // align-16 and land at offset 48, blowing the struct to 64 B and silently breaking the field layout.
-    _pad0: u32,
     _pad1: u32,
     _pad2: u32,
 };
 
-// STORAGE PLAN R1 — the `voxel_offset` high bit marking a UNIFORM brick (its FULL haloed 10³ grid is ONE solid
-// block, so it carries NO index stream). MUST mirror `BRICK_UNIFORM_FLAG` in src/voxel/gpu.rs. When set,
-// the DDA reads the block id straight from the meta (low 16 bits) — NO buffer fetch per step (strictly
+// STORAGE PLAN R1 / A4.1 — the `flags` bit marking a UNIFORM brick (its FULL haloed 10³ grid is ONE solid
+// block, so it carries NO index stream). MUST mirror `META_FLAG_UNIFORM` in src/voxel/gpu.rs. When set, the DDA
+// reads the block id straight from the meta (low 16 bits of `voxel_offset`) — NO buffer fetch per step (strictly
 // fewer memory ops); a fully-buried uniform brick is a couple of geometric DDA steps with zero loads. A DENSE
-// brick has bit 31 clear (real offsets are < 2^31).
-const BRICK_UNIFORM_FLAG: u32 = 0x80000000u;
+// brick has the bit clear and its `voxel_offset` uses the FULL u32 range (A4.1 retired the bit-31 invariant).
+const META_FLAG_UNIFORM: u32 = 1u;
 
 // The brick LOD level (bits 0-2 of `lod_and_bits`). Mirror of `GpuBrickMeta::lod`.
 fn meta_lod(m: BrickMeta) -> u32 {
@@ -72,9 +75,10 @@ fn meta_index_bits(m: BrickMeta) -> u32 {
     return (m.lod_and_bits >> 3u) & 0x1Fu;
 }
 
-// True iff brick meta `m` is a collapsed UNIFORM brick (no index stream; block id in the low 16 bits).
+// True iff brick meta `m` is a collapsed UNIFORM brick (no index stream; block id in the low 16 bits). A4.1:
+// reads the dedicated `flags` word — no longer a `voxel_offset` high bit.
 fn meta_is_uniform(m: BrickMeta) -> bool {
-    return (m.voxel_offset & BRICK_UNIFORM_FLAG) != 0u;
+    return (m.flags & META_FLAG_UNIFORM) != 0u;
 }
 
 // The single block id of a UNIFORM brick (low 16 bits of `voxel_offset`). Only valid when `meta_is_uniform`.
@@ -138,6 +142,13 @@ fn lod_cell_size(lod: u32) -> f32 {
 // [world_min, world_min + brick_span(lod)); a coarse brick covers 2^lod× more world.
 fn brick_span(lod: u32) -> f32 {
     return BRICK_WORLD_SIZE * f32(1u << min(lod, MAX_LOD));
+}
+
+// A4.2 — the per-side BLAS-AABB grow (seam-overlap fudge) for a brick at LOD `lod`, in world metres: a fixed
+// FRACTION (BRICK_AABB_REL_EPS) of the brick's per-LOD world span. SSOT mirror of `brick_aabb_epsilon` in
+// src/voxel/gpu.rs — the in-shader slab grow MUST equal the CPU AABB grow or the seam fix breaks.
+fn brick_aabb_epsilon(lod: u32) -> f32 {
+    return brick_span(lod) * BRICK_AABB_REL_EPS;
 }
 
 // One palette entry (mirrors `GpuPaletteColor` in src/voxel/gpu.rs): linear-RGBA albedo + linear-RGB
@@ -320,14 +331,15 @@ fn dda_brick(prim: u32, ro: vec3<f32>, rd: vec3<f32>, t_enter: f32, t_exit: f32)
 // Re-DDA the COMMITTED brick to recover the first-solid voxel's block id AND its entry-face axis together (the
 // ray query only carries primitive_index + t across the commit, not the voxel id/normal, so we re-walk the
 // winning brick). The re-walk reproduces the candidate-pass `dda_brick` EXACTLY — the SAME grown-AABB slab
-// (`±BRICK_AABB_EPSILON`) and the same march — so the recovered block id + normal are guaranteed to be those
+// (`±brick_aabb_epsilon(lod)`) and the same march — so the recovered block id + normal are guaranteed to be those
 // of the cell the candidate committed (no boundary drift, no sideways-normal seam). `dda_brick` clamps the
 // entry cell into `[0, edge)`, so the grown halo never adds a phantom cell.
 fn brick_hit_at(prim: u32, ro: vec3<f32>, rd: vec3<f32>) -> vec4<f32> {
     let m = metas[prim];
     let span = brick_span(meta_lod(m)); // clipmap: a LOD-L brick spans 2^L× more world (NOT LOD-invariant)
-    let bmin = m.world_min - vec3<f32>(BRICK_AABB_EPSILON);
-    let bmax = m.world_min + vec3<f32>(span + BRICK_AABB_EPSILON);
+    let eps = brick_aabb_epsilon(meta_lod(m)); // A4.2: relative-per-LOD grow (mirror of the CPU AABB)
+    let bmin = m.world_min - vec3<f32>(eps);
+    let bmax = m.world_min + vec3<f32>(span + eps);
     let inv = 1.0 / rd;
     let ta = (bmin - ro) * inv;
     let tb = (bmax - ro) * inv;
@@ -362,8 +374,9 @@ fn trace(ro: vec3<f32>, rd: vec3<f32>, t_min: f32, t_max: f32) -> TraceResult {
             // bounds give a 0·inf = NaN slab t), so it reliably enters the brick. `brick_span(meta_lod(m))` is the
             // clipmap span — a coarse brick covers 2^lod× more world (the AABB is NOT LOD-invariant).
             let span = brick_span(meta_lod(m));
-            let bmin = m.world_min - vec3<f32>(BRICK_AABB_EPSILON);
-            let bmax = m.world_min + vec3<f32>(span + BRICK_AABB_EPSILON);
+            let eps = brick_aabb_epsilon(meta_lod(m)); // A4.2: relative-per-LOD grow
+            let bmin = m.world_min - vec3<f32>(eps);
+            let bmax = m.world_min + vec3<f32>(span + eps);
             let inv = 1.0 / rd;
             let ta = (bmin - ro) * inv;
             let tb = (bmax - ro) * inv;
@@ -428,8 +441,9 @@ fn trace_occluded(ro: vec3<f32>, rd: vec3<f32>, t_min: f32, t_max: f32) -> bool 
             // Grown-bounds slab (matches the BLAS AABB overlap — the seam fix; see `trace`). `brick_span(meta_lod(m))`
             // is the clipmap span (a coarse brick covers 2^lod× more world).
             let span = brick_span(meta_lod(m));
-            let bmin = m.world_min - vec3<f32>(BRICK_AABB_EPSILON);
-            let bmax = m.world_min + vec3<f32>(span + BRICK_AABB_EPSILON);
+            let eps = brick_aabb_epsilon(meta_lod(m)); // A4.2: relative-per-LOD grow
+            let bmin = m.world_min - vec3<f32>(eps);
+            let bmax = m.world_min + vec3<f32>(span + eps);
             let inv = 1.0 / rd;
             let ta = (bmin - ro) * inv;
             let tb = (bmax - ro) * inv;

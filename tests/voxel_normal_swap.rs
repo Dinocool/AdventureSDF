@@ -35,7 +35,7 @@ use adventure::voxel::brickmap::{
     BRICK_EDGE, BRICK_WORLD_SIZE, VOXEL_SIZE, lod_edge, lod_voxel_size,
 };
 use adventure::voxel::cornell::{INTERIOR, build_cornell};
-use adventure::voxel::gpu::{BRICK_AABB_EPSILON, GpuBrickPatch, pack_brickmap};
+use adventure::voxel::gpu::{GpuBrickPatch, brick_aabb_epsilon, pack_brickmap};
 use adventure::voxel::palette::BlockRegistry;
 use bevy::math::{IVec3, Vec3};
 
@@ -79,8 +79,9 @@ fn dda_brick_faithful(patch: &GpuBrickPatch, bi: usize, ro: Vec3, rd: Vec3) -> O
     let wmin = Vec3::from(m.world_min);
 
     // Grown-AABB slab (same as the shader's trace candidate test) → t_enter/t_exit.
-    let bmin = wmin - Vec3::splat(BRICK_AABB_EPSILON);
-    let bmax = wmin + Vec3::splat(BRICK_WORLD_SIZE + BRICK_AABB_EPSILON);
+    let eps = brick_aabb_epsilon(m.lod()); // A4.2: relative-per-LOD grow (SSOT)
+    let bmin = wmin - Vec3::splat(eps);
+    let bmax = wmin + Vec3::splat(BRICK_WORLD_SIZE + eps);
     let inv = Vec3::new(1.0 / rd.x, 1.0 / rd.y, 1.0 / rd.z);
     let ta = (bmin - ro) * inv;
     let tb = (bmax - ro) * inv;
@@ -275,8 +276,9 @@ fn dda_brick_crossed_axis(patch: &GpuBrickPatch, bi: usize, ro: Vec3, rd: Vec3) 
     let csize = lod_voxel_size(m.lod());
     let wmin = Vec3::from(m.world_min);
 
-    let bmin = wmin - Vec3::splat(BRICK_AABB_EPSILON);
-    let bmax = wmin + Vec3::splat(BRICK_WORLD_SIZE + BRICK_AABB_EPSILON);
+    let eps = brick_aabb_epsilon(m.lod()); // A4.2: relative-per-LOD grow (SSOT)
+    let bmin = wmin - Vec3::splat(eps);
+    let bmax = wmin + Vec3::splat(BRICK_WORLD_SIZE + eps);
     let inv = Vec3::new(1.0 / rd.x, 1.0 / rd.y, 1.0 / rd.z);
     let ta = (bmin - ro) * inv;
     let tb = (bmax - ro) * inv;

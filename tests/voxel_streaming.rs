@@ -201,14 +201,42 @@ fn brick_lod_reports_covering_level() {
     }
 }
 
+/// A `BrickSource` that classifies EVERY brick `Surface` (the trait default), so the A2 surface cap is
+/// exercised directly — every desired brick is a surface candidate competing for a slot. `brick` is never
+/// called by `update`.
+struct AllSurfaceSource;
+impl BrickSource for AllSurfaceSource {
+    fn brick(
+        &self,
+        _coord: IVec3,
+        _lod: u32,
+        _registry: &BlockRegistry,
+    ) -> adventure::voxel::brickmap::Brick {
+        adventure::voxel::brickmap::Brick::uniform(BlockId::AIR)
+    }
+}
+
+/// A2 — the cap is applied AFTER the classify split, so it bounds the surface SHELL: `desired_clipmap` is now
+/// UNCAPPED (returns the full geometric tiling), and `ResidencyManager::update` caps the surface candidates,
+/// keeping the NEAREST and always the camera's own brick.
 #[test]
 fn resident_cap_drops_farthest() {
-    let cfg = StreamingConfig { clip_half_bricks: 8, max_resident_bricks: 50, ..Default::default() };
+    let cap = 50usize;
+    let cfg = StreamingConfig { clip_half_bricks: 8, max_resident_bricks: cap, ..Default::default() };
     let cam = [0.5_f32, 0.5, 0.5];
-    let d = desired_clipmap(cam, &cfg);
-    assert_eq!(d.len(), 50, "capped to max_resident_bricks");
-    let cam0 = camera_brick_coord_lod(cam, 0);
-    assert!(d.contains_key(&BrickKey { coord: cam0, lod: 0 }), "the camera's LOD0 brick is always kept");
+
+    // desired_clipmap no longer caps — the full tiling is far larger than the cap.
+    let big = StreamingConfig { max_resident_bricks: usize::MAX, ..cfg };
+    let d = desired_clipmap(cam, &big);
+    assert!(d.len() > cap, "the uncapped tiling is far larger than the cap");
+
+    let mut mgr = ResidencyManager::new();
+    mgr.update(cam, &cfg, &AllSurfaceSource);
+    assert!(mgr.resident_count() + mgr.pending() <= cap, "the surface cap bounds resident+pending to the cap");
+    assert_eq!(mgr.pending(), cap, "an all-surface cold fill enqueues exactly the cap (nearest kept)");
+    assert!(mgr.capped_total > 0, "the cap dropped the farther surface candidates");
+    // (The nearest-kept ordering + camera-brick-always-kept is asserted in the in-module unit test, which can
+    // see the private work queue; here we verify the cap binds the surface SHELL to the cap.)
 }
 
 // --- residency ------------------------------------------------------------------------------------
