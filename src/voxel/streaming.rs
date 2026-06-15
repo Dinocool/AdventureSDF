@@ -667,9 +667,14 @@ impl ResidencyManager {
         let already = self.resident.len() + self.queued.len();
         let room = budget.saturating_sub(already);
         if surface_candidates.len() > room {
-            // Keep the nearest `room`; drop the rest (farthest first), deterministic tiebreak. Rank by world
-            // distance so a far coarse shell drops before a near fine one only if it is genuinely farther.
-            surface_candidates.sort_by(|a, b| {
+            // Keep the nearest `room`; drop the farthest. **O(n) partial-select, not an O(n log n) full sort**
+            // (G0 — at the 64 m@0.05 m reach this is ~6.7 M candidates and the full sort was the residual ~few-s
+            // `update` cost after D1d). `select_nth_unstable_by` partitions so `[0, room)` are the `room` SMALLEST
+            // by the comparator; the comparator is a TOTAL order (world-distance, then the unique `(lod,z,y,x)`
+            // tiebreak), so the kept SET is uniquely defined and byte-identical to what `sort+truncate` kept —
+            // only the within-set order differs, and `resident_entries()` re-sorts downstream anyway. Rank by
+            // world distance so a far coarse shell drops before a near fine one only if genuinely farther.
+            surface_candidates.select_nth_unstable_by(room, |a, b| {
                 brick_world_dist(a, cam_world)
                     .partial_cmp(&brick_world_dist(b, cam_world))
                     .unwrap_or(std::cmp::Ordering::Equal)
