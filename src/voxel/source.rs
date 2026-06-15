@@ -286,6 +286,46 @@ impl BrickSource for StaticVoxSource {
         }
         Brick::from_voxels(voxels)
     }
+
+    /// STATIC enclosed-cull (always on): prune a fully-BURIED brick from residency. `Interior` iff the brick is
+    /// fully solid AND all 6 same-LOD FACE-neighbours are fully solid — then no surface voxel is air-adjacent,
+    /// so a primary ray is occluded by the surrounding solid and never reaches it (correct-by-construction,
+    /// hole-free; a partial / absent neighbour ⇒ `Surface`). Only the 6 FACES matter for first-hit visibility
+    /// (edge/corner neighbours only affect the render HALO, not whether a ray reaches the brick). Reads the
+    /// pyramid occupancy ([`Brick::is_full`]) — an O(1) brick-map lookup × 7. For a CLAMPED coarse level (a
+    /// tiny asset collapsed below `lod`, so the coord grid ≠ the pyramid level grid) don't prune (`Surface`) —
+    /// the wholly-outside reject + empty-memo bound those. Absent brick ⇒ `Air`. Pixel-identical: an `Interior`
+    /// brick is never the first hit, so dropping it from the packed set leaves the render unchanged.
+    fn classify(&self, coord: IVec3, lod: u32) -> BrickClass {
+        let level = self.level(lod);
+        // Only the levels we built map a coord 1:1 to a brick on that grid; a clamped coarse lod does not.
+        if level != lod as usize {
+            return BrickClass::Surface;
+        }
+        let map = &self.pyramid[level];
+        let Some(here) = map.get(coord) else {
+            return BrickClass::Air; // absent ⇒ all-air outside the loaded scene
+        };
+        if !here.is_full() {
+            return BrickClass::Surface; // an internal air voxel ⇒ an exposed surface
+        }
+        // Fully solid: buried iff all 6 FACE-neighbours are fully solid too (no air-adjacent face).
+        const N6: [IVec3; 6] = [
+            IVec3::new(1, 0, 0),
+            IVec3::new(-1, 0, 0),
+            IVec3::new(0, 1, 0),
+            IVec3::new(0, -1, 0),
+            IVec3::new(0, 0, 1),
+            IVec3::new(0, 0, -1),
+        ];
+        for off in N6 {
+            match map.get(coord + off) {
+                Some(n) if n.is_full() => {}
+                _ => return BrickClass::Surface, // a non-full / absent neighbour ⇒ this face is exposed
+            }
+        }
+        BrickClass::Interior
+    }
 }
 
 /// Downsample one pyramid level into the next-coarser one by `2³`: each coarse voxel aggregates its `2×2×2`
@@ -654,5 +694,45 @@ mod tests {
             let direct = voxelize_brick(c, lod, &layer, &lib, &reg, SEED);
             assert_eq!(via_src, direct, "WorldgenSource must equal voxelize_brick (SSOT pass-through)");
         }
+    }
+
+    /// STATIC enclosed-cull: a fully-buried brick (full + all 6 face-neighbours full) classifies `Interior`
+    /// (prunable — never the first hit); a face/corner brick (an outward neighbour absent) or a partial brick
+    /// classifies `Surface` (conservative, hole-free); an absent brick is `Air`.
+    #[test]
+    fn static_classify_prunes_only_fully_buried_bricks() {
+        // A 3×3×3 block of fully-solid bricks at brick coords [0,3)³.
+        let mut map = BrickMap::new();
+        for z in 0..3 {
+            for y in 0..3 {
+                for x in 0..3 {
+                    map.insert(IVec3::new(x, y, z), Brick::uniform(BlockId(1)));
+                }
+            }
+        }
+        let src = StaticVoxSource::new(&map);
+        // CENTRE (1,1,1): full + all 6 face-neighbours full ⇒ Interior (buried, occluded — never the first hit).
+        assert!(matches!(src.classify(IVec3::new(1, 1, 1), 0), BrickClass::Interior));
+        // FACE-centre (1,1,0): the −Z neighbour (1,1,−1) is absent ⇒ exposed face ⇒ Surface.
+        assert!(matches!(src.classify(IVec3::new(1, 1, 0), 0), BrickClass::Surface));
+        // CORNER (0,0,0): three outward neighbours absent ⇒ Surface.
+        assert!(matches!(src.classify(IVec3::new(0, 0, 0), 0), BrickClass::Surface));
+        // OUTSIDE the block ⇒ Air (absent in the map).
+        assert!(matches!(src.classify(IVec3::new(9, 9, 9), 0), BrickClass::Air));
+
+        // A PARTIAL centre brick (one air voxel) surrounded by full ⇒ Surface (it has an exposed internal face).
+        let mut map2 = BrickMap::new();
+        for z in 0..3 {
+            for y in 0..3 {
+                for x in 0..3 {
+                    map2.insert(IVec3::new(x, y, z), Brick::uniform(BlockId(1)));
+                }
+            }
+        }
+        let mut arr = Box::new([BlockId(1); BRICK_VOXELS]);
+        arr[voxel_index(0, 0, 0)] = BlockId::AIR; // one air voxel ⇒ not full
+        map2.insert(IVec3::new(1, 1, 1), Brick::from_voxels(arr));
+        let src2 = StaticVoxSource::new(&map2);
+        assert!(matches!(src2.classify(IVec3::new(1, 1, 1), 0), BrickClass::Surface));
     }
 }

@@ -147,6 +147,14 @@ impl Brick {
         self.occupancy.iter().all(|&w| w == 0)
     }
 
+    /// True iff EVERY voxel is solid (occupancy all-set). Used by the static enclosed-cull: a FULL brick whose
+    /// 6 same-LOD neighbours are also full has no air-adjacent face, so a primary ray never reaches it (it is
+    /// occluded by the surrounding solid) — it can be pruned from residency, correct-by-construction.
+    #[inline]
+    pub fn is_full(&self) -> bool {
+        self.occupancy.iter().all(|&w| w == u64::MAX)
+    }
+
     /// True iff every voxel is the SAME solid block (the uniform fast path with a non-air block) — a
     /// fully-buried interior brick. Used to skip exposed-surface meshing of solid interiors.
     #[inline]
