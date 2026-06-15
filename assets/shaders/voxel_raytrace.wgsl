@@ -95,6 +95,16 @@ fn cell_block(m: BrickMeta, x: i32, y: i32, z: i32, hedge: i32) -> u32 {
         return meta_uniform_block(m);
     }
     let bits = meta_index_bits(m);
+    // STORAGE PLAN A1-β — RAW-ARENA dense brick (the STREAMED path's fixed-block voxel arena). `index_bits == 0`
+    // (with bit 31 clear ⇒ not uniform) is the RAW marker: `voxel_indices[voxel_offset + cell_index]` IS the
+    // block id directly — one `u32` per cell, NO bit-pack + NO per-brick-palette indirection. The fixed-cap
+    // incremental upload (`queue_write_buffer` of only the CHANGED slots) needs a stable per-slot block stride,
+    // so the streamed arena stores raw haloed cells; the R2b paletted decode below serves the STATIC
+    // (`pack_brickmap`/`pack_resident_set`) path where `index_bits >= 1`. Mirror of the Rust
+    // `GpuBrickPatch::cell_block` raw branch. See `SnapshotBuffers` / PHASE_A_GPU_EXECUTION.md §A1-β.
+    if (bits == 0u) {
+        return voxel_indices[m.voxel_offset + cell_index(x, y, z, hedge)];
+    }
     let bit = cell_index(x, y, z, hedge) * bits;
     let word = voxel_indices[m.voxel_offset + bit / 32u];
     let mask = select((1u << bits) - 1u, 0xFFFFFFFFu, bits == 32u);

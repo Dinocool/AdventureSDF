@@ -42,7 +42,8 @@ use rustc_hash::FxHashMap;
 
 use super::brickmap::Brick;
 use super::gpu::{
-    BrickVoxels, GpuBrickAabb, GpuBrickMeta, PackedBrick, ResidentBrick, halo_cells, pack_one,
+    BrickVoxels, GpuBrickAabb, GpuBrickMeta, GpuPaletteColor, PackedBrick, ResidentBrick, halo_cells,
+    pack_one,
 };
 use super::streaming::BrickKey;
 
@@ -163,6 +164,35 @@ impl RepackDelta {
     }
 }
 
+/// The FIXED-CAPACITY initial buffer contents the render path allocates ONCE per scene epoch (storage plan A1:
+/// the O(changed) GPU upload). Built from the packer's current shadow state by [`ResidentPacker::snapshot_buffers`].
+/// After this snapshot the render path applies each generation's [`RepackDelta`] via `queue_write_buffer` — it
+/// NEVER re-creates these buffers within an epoch (only a scene switch / new epoch re-snapshots).
+///
+/// **A1-β representation — the streamed arena is RAW, not R2b paletted.** Each dense slot's voxel block is the
+/// HALOED `10³` `u32`-per-cell grid written verbatim at `arena_block · dense_block_u32()`, and its meta carries
+/// `index_bits == 0` / `palette_base == 0` as the RAW-ARENA marker. The shader's `cell_block` decodes a raw
+/// `index_bits == 0` dense brick as `voxel_indices[voxel_offset + cell_index]` directly (no palette indirection);
+/// the R2b paletted decode (`index_bits >= 1`) is kept for the static `pack_brickmap`/`pack_resident_set` path.
+/// This trades R2b's voxel-VRAM win on the STREAMED path for the O(changed) upload — see the `cell_block` doc and
+/// `PHASE_A_GPU_EXECUTION.md` §"The encoding question" (A1-β). R2b is recovered later (A4.4 persistent interner).
+#[derive(Clone, Debug)]
+pub struct SnapshotBuffers {
+    /// Capacity-length AABB buffer; unused slots = [`degenerate_aabb`].
+    pub aabbs: Vec<GpuBrickAabb>,
+    /// Capacity-length meta buffer; unused slots = [`GpuBrickMeta::zeroed`].
+    pub metas: Vec<GpuBrickMeta>,
+    /// The `arena_capacity_u32()` raw block pool: each resident dense brick's HALOED `10³` `u32`-per-cell block
+    /// written at its arena offset (`arena_block · dense_block_u32()`); zero elsewhere.
+    pub voxels: Vec<u32>,
+    /// The registry palette (`BlockId(i)` → linear RGBA + emissive). Length == registry length. Fixed per scene
+    /// (never re-uploaded on a [`RepackDelta`]).
+    pub palette: Vec<GpuPaletteColor>,
+    /// The number of resident bricks (== the live BLAS primitive count; the BLAS is still built over `capacity`
+    /// primitives with degenerate free slots, but this is reported for diagnostics).
+    pub brick_count: u32,
+}
+
 /// One resident brick's live state in the packer: its slot + (for a dense brick) its voxel-arena block index.
 #[derive(Clone, Copy, Debug)]
 struct SlotState {
@@ -242,6 +272,55 @@ impl ResidentPacker {
     #[inline]
     pub fn resident_count(&self) -> usize {
         self.resident.len()
+    }
+
+    /// Build the FULL capacity-sized initial GPU buffers (storage plan A1 — the O(changed) upload). Called ONCE
+    /// per scene epoch, right after the packer (re-)created + the first [`update`](Self::update) ran. `aabbs`/
+    /// `metas` are capacity-length with [`degenerate_aabb`]/[`GpuBrickMeta::zeroed`] in the unused slots; `voxels`
+    /// is the `arena_capacity_u32()` RAW block pool with each resident dense brick's haloed `10³` block copied to
+    /// `arena_block · dense_block_u32()`. O(capacity) — paid ONCE per scene switch, never per move. After this the
+    /// render path applies each [`RepackDelta`] via `queue_write_buffer` (meta/aabb at `slot · stride`, the raw
+    /// block at `voxel_word_offset`), never re-creating these buffers within the epoch.
+    ///
+    /// The metas/aabbs are filled from the per-slot shadow (`last_meta`/`last_aabb`), which after `update` is
+    /// EXACTLY the bytes a `snapshot_buffers`-then-delta sequence converges to (the byte-identity gate). The
+    /// `palette` is the registry (fixed per scene); the NEE light list is NOT per-slot and is built separately by
+    /// the caller (see `build_lights_from_entries`).
+    pub fn snapshot_buffers(&self, registry: &super::palette::BlockRegistry) -> SnapshotBuffers {
+        let cap = self.slots.capacity as usize;
+        // Capacity-length meta/aabb: each occupied slot's shadow; degenerate/zeroed for the rest. The shadow
+        // holds an entry for every slot that has EVER been written (occupied or freed→zeroed), so a slot absent
+        // from the shadow is one that was never claimed — fill it degenerate/zeroed too.
+        let mut metas = vec![GpuBrickMeta::zeroed(); cap];
+        let mut aabbs = vec![degenerate_aabb(); cap];
+        for (&slot, meta) in &self.last_meta {
+            metas[slot as usize] = *meta;
+        }
+        for (&slot, aabb) in &self.last_aabb {
+            aabbs[slot as usize] = *aabb;
+        }
+        // Raw voxel arena: each resident DENSE slot's haloed block at its arena offset. `last_voxels` holds the
+        // raw cells per slot; `resident` carries the arena_block index. A uniform brick has no arena block / no
+        // voxel shadow, so it contributes nothing (its id rides in the meta).
+        let mut voxels = vec![0u32; self.arena_capacity_u32()];
+        let block_u32 = dense_block_u32();
+        for st in self.resident.values() {
+            if let Some(block) = st.arena_block
+                && let Some(cells) = self.last_voxels.get(&st.slot)
+            {
+                let off = block as usize * block_u32;
+                voxels[off..off + cells.len()].copy_from_slice(cells);
+            }
+        }
+        // Palette = the registry (block id → linear RGBA + emissive), indexed directly. Fixed per scene.
+        let palette: Vec<GpuPaletteColor> = (0..registry.len())
+            .map(|i| {
+                let id = super::palette::BlockId(i as u16);
+                let e = registry.emissive(id);
+                GpuPaletteColor { rgba: registry.color(id), emissive: [e[0], e[1], e[2], 0.0] }
+            })
+            .collect();
+        SnapshotBuffers { aabbs, metas, voxels, palette, brick_count: self.resident.len() as u32 }
     }
 
     /// Mark `keys` as REWRITTEN (an edit / dig re-source replaced their voxels in place): they re-pack on the

@@ -159,7 +159,7 @@ fn temporal_accumulation_reduces_gi_noise() {
     }
 
     let patch = app.world().resource::<VoxelRtPatch>();
-    assert!(!patch.patch.is_empty(), "the static Cornell brick set must be non-empty");
+    assert!(!patch.upload.is_empty(), "the static Cornell brick set must be non-empty");
     assert!(
         frames.len() >= 30,
         "need a run of distinct frames to measure temporal noise (got {})",

@@ -313,6 +313,216 @@ fn edit_patches_only_local_neighbourhood() {
     assert!(!d.changed.is_empty());
 }
 
+/// A CPU mirror of the render-world's fixed-cap GPU buffers (storage plan A1): the meta/aabb arrays + the raw
+/// voxel arena. A `StreamSnapshot` overwrites all three; a `Delta` `queue_write`s ONLY the changed slots — the
+/// exact `queue_write_buffer` the render path runs. After a sequence of deltas this must byte-equal a
+/// from-scratch `snapshot_buffers()` at the same generation (the GPU-side analogue of the contiguous A/B gate).
+struct SimBuffers {
+    metas: Vec<GpuBrickMeta>,
+    aabbs: Vec<crate::voxel::gpu::GpuBrickAabb>,
+    voxels: Vec<u32>,
+}
+
+impl SimBuffers {
+    /// Initialise from a full `snapshot_buffers()` (the epoch-start StreamSnapshot the render path uploads once).
+    fn from_snapshot(s: &SnapshotBuffers) -> Self {
+        Self { metas: s.metas.clone(), aabbs: s.aabbs.clone(), voxels: s.voxels.clone() }
+    }
+
+    /// Apply a `RepackDelta` exactly as the render world's `apply_delta` does: write each changed slot's meta (at
+    /// `slot`) + aabb (at `slot`) and, for a dense slot, the raw block at `voxel_word_offset`.
+    fn apply(&mut self, delta: &RepackDelta) {
+        for cs in &delta.changed {
+            self.metas[cs.slot as usize] = cs.meta;
+            self.aabbs[cs.slot as usize] = cs.aabb;
+            if let Some(v) = &cs.voxels {
+                let off = cs.voxel_word_offset as usize;
+                self.voxels[off..off + v.len()].copy_from_slice(v);
+            }
+        }
+    }
+}
+
+/// **THE A1 BYTE-IDENTITY GATE.** Drive the packer through a camera-class sequence (cold fill → drop → re-add →
+/// edit → face-slab drop), applying each `RepackDelta` to a CPU mirror of the fixed-cap GPU buffers the SAME way
+/// the render world's `queue_write_buffer` does, and after EACH step assert the delta-mirrored buffers
+/// byte-equal a from-scratch `snapshot_buffers()` at that generation. This proves the streamed O(changed) upload
+/// reconstructs EXACTLY the buffer state a full re-snapshot would — so a half-applied delta (a stale slot, a
+/// missed neighbour) can't slip through as a divergent GPU buffer.
+#[test]
+fn delta_upload_matches_snapshot_buffers_over_sequence() {
+    let reg = registry();
+    let mut packer = ResidentPacker::new(4096);
+
+    let make = |omit: Option<IVec3>, edit: Option<(IVec3, Brick)>| -> Vec<(IVec3, Brick, u32)> {
+        let mut v = Vec::new();
+        for z in 0..4 {
+            for y in 0..4 {
+                for x in 0..4 {
+                    let c = IVec3::new(x, y, z);
+                    if Some(c) == omit {
+                        continue;
+                    }
+                    if let Some((ec, ref eb)) = edit
+                        && ec == c
+                    {
+                        v.push((c, eb.clone(), 0));
+                        continue;
+                    }
+                    let brick = if (1..=2).contains(&x) && (1..=2).contains(&y) && (1..=2).contains(&z) {
+                        Brick::uniform(BlockId(1))
+                    } else {
+                        patterned_brick(x + y + z)
+                    };
+                    v.push((c, brick, 0));
+                }
+            }
+        }
+        v.sort_by_key(|(c, _, l)| (*l, c.z, c.y, c.x));
+        v
+    };
+    fn to_entries(owned: &[(IVec3, Brick, u32)]) -> Vec<ResidentBrick<'_>> {
+        owned.iter().map(|(c, b, l)| ResidentBrick { coord: *c, brick: b, lod: *l }).collect()
+    }
+    fn check(
+        packer: &mut ResidentPacker,
+        owned: &[(IVec3, Brick, u32)],
+        sim: &mut SimBuffers,
+        reg: &BlockRegistry,
+        label: &str,
+    ) {
+        let delta = packer.update(&to_entries(owned));
+        sim.apply(&delta);
+        let fresh = packer.snapshot_buffers(reg);
+        // Metas + AABBs are byte-identical: a freed slot's delta writes a zeroed meta + degenerate AABB, exactly
+        // what `snapshot_buffers` puts there. So the directory is reconstructed byte-for-byte by the delta path.
+        assert_eq!(sim.metas, fresh.metas, "{label}: delta-mirrored metas != fresh snapshot");
+        assert_eq!(sim.aabbs, fresh.aabbs, "{label}: delta-mirrored aabbs != fresh snapshot");
+        // The voxel arena: only RESIDENT DENSE slots' blocks are referenced (a freed block keeps stale-but-
+        // unreferenced bytes the delta never zeroes — its meta is zeroed/degenerate, so it is never traced; the
+        // live GPU buffer behaves identically and re-converges to zero only at an epoch re-snapshot). So compare
+        // only the referenced blocks: a slot whose AABB is non-degenerate (a real resident brick) AND whose meta
+        // is dense (raw `index_bits == 0`, has an arena block) must have a byte-identical block in the mirror.
+        let degenerate = degenerate_aabb();
+        for (slot, m) in fresh.metas.iter().enumerate() {
+            if fresh.aabbs[slot] == degenerate || m.is_uniform() {
+                continue; // a freed slot (degenerate) or a uniform brick (no arena block)
+            }
+            let off = m.dense_offset() as usize;
+            let len = dense_block_u32();
+            assert_eq!(
+                &sim.voxels[off..off + len],
+                &fresh.voxels[off..off + len],
+                "{label}: delta-mirrored voxel block at {off} (slot {slot}, origin {:?}) != fresh snapshot",
+                m.voxel_origin,
+            );
+        }
+    }
+
+    // Step 1: cold fill → StreamSnapshot (the epoch-start upload). Seed the mirror from it.
+    let s1 = make(None, None);
+    let d1 = packer.update(&to_entries(&s1));
+    assert!(d1.topology_changed);
+    let snap = packer.snapshot_buffers(&reg);
+    let mut sim = SimBuffers::from_snapshot(&snap);
+    assert_eq!(sim.metas, snap.metas, "step1 snapshot mirror metas");
+    assert_eq!(sim.voxels, snap.voxels, "step1 snapshot mirror voxels");
+
+    // Step 2: drop an interior brick (its 26 neighbours' halos update; its slot collapses to degenerate/zeroed).
+    check(&mut packer, &make(Some(IVec3::new(2, 2, 2)), None), &mut sim, &reg, "step2 drop interior");
+    // Step 3: re-add it (enter).
+    check(&mut packer, &make(None, None), &mut sim, &reg, "step3 re-add");
+    // Step 4: edit a boundary brick in place (mark rewritten so it re-packs).
+    let edited = patterned_brick(99);
+    packer.mark_rewritten([BrickKey { coord: IVec3::new(0, 0, 0), lod: 0 }]);
+    check(&mut packer, &make(None, Some((IVec3::new(0, 0, 0), edited))), &mut sim, &reg, "step4 edit boundary");
+    // Step 5: drop a whole face slab (x==0) — many drops + neighbour re-packs.
+    let mut slab = Vec::new();
+    for z in 0..4 {
+        for y in 0..4 {
+            for x in 1..4 {
+                let c = IVec3::new(x, y, z);
+                let brick = if (1..=2).contains(&x) && (1..=2).contains(&y) && (1..=2).contains(&z) {
+                    Brick::uniform(BlockId(1))
+                } else {
+                    patterned_brick(x + y + z)
+                };
+                slab.push((c, brick, 0u32));
+            }
+        }
+    }
+    slab.sort_by_key(|(c, _, l)| (*l, c.z, c.y, c.x));
+    check(&mut packer, &slab, &mut sim, &reg, "step5 drop face slab");
+}
+
+/// **The A1 raw-arena LOGICAL-CONTENT gate.** The raw arena stores `u32`-per-cell ids; the from-scratch
+/// `pack_resident_set` stores R2b bit-packed palette indices. Decoding the raw arena via the SSOT `cell_block`
+/// raw branch (`index_bits == 0`) must yield the EXACT same logical block ids per haloed cell as decoding the
+/// R2b patch — proving the A1-β raw representation renders identically to the static R2b path through the one
+/// shared decode (the shader mirrors this `cell_block`). Keyed by `(voxel_origin, lod)`, slot-order independent.
+#[test]
+fn raw_arena_decodes_same_logical_cells_as_r2b() {
+    use crate::voxel::gpu::{GpuBrickPatch, halo_cells};
+    let reg = registry();
+    let mut packer = ResidentPacker::new(4096);
+    let mut owned = Vec::new();
+    for z in 0..3 {
+        for y in 0..3 {
+            for x in 0..3 {
+                let brick = if (x, y, z) == (1, 1, 1) {
+                    Brick::uniform(BlockId(1))
+                } else {
+                    patterned_brick(x + 2 * y + 3 * z)
+                };
+                owned.push((IVec3::new(x, y, z), brick, 0u32));
+            }
+        }
+    }
+    owned.sort_by_key(|(c, _, l)| (*l, c.z, c.y, c.x));
+    let entries: Vec<ResidentBrick> =
+        owned.iter().map(|(c, b, l)| ResidentBrick { coord: *c, brick: b, lod: *l }).collect();
+    packer.update(&entries);
+
+    // The from-scratch R2b patch (the static path).
+    let r2b = pack_resident_set(&entries, &reg);
+    // A raw-arena patch built from `snapshot_buffers`: wrap the cap buffers as a `GpuBrickPatch` so the SSOT
+    // `cell_block` raw branch decodes them (`index_bits == 0` ⇒ raw `voxels[off + cell]`). Only the resident
+    // metas matter; degenerate slots are uniform-zeroed (block 0, never compared).
+    let snap = packer.snapshot_buffers(&reg);
+    let raw = GpuBrickPatch {
+        aabbs: snap.aabbs.clone(),
+        metas: snap.metas.clone(),
+        voxels: snap.voxels.clone(),
+        brick_palettes: vec![0], // unused on the raw path
+        palette: snap.palette.clone(),
+        lights: Vec::new(),
+        alias: Vec::new(),
+    };
+
+    // Index the raw metas by (voxel_origin, lod) so we compare the same brick regardless of slot order.
+    let raw_by_key: std::collections::HashMap<([i32; 3], u32), GpuBrickMeta> =
+        raw.metas.iter().filter(|m| !(m.is_uniform() && m.uniform_block().0 == 0 && m.world_min == [0.0; 3]))
+            .map(|m| ((m.voxel_origin, m.lod()), *m)).collect();
+
+    // For every R2b brick, decode all haloed cells both ways and assert they agree.
+    for m_r2b in &r2b.metas {
+        let key = (m_r2b.voxel_origin, m_r2b.lod());
+        let m_raw = raw_by_key.get(&key).unwrap_or_else(|| panic!("brick {key:?} missing from raw arena"));
+        // A uniform brick must stay uniform with the same id; a dense brick must be raw (index_bits 0).
+        assert_eq!(m_raw.is_uniform(), m_r2b.is_uniform(), "brick {key:?} uniform-ness differs");
+        if m_r2b.is_uniform() {
+            assert_eq!(m_raw.uniform_block(), m_r2b.uniform_block(), "brick {key:?} uniform id differs");
+            continue;
+        }
+        assert_eq!(m_raw.index_bits(), 0, "raw-arena dense brick must carry the index_bits==0 marker");
+        for cell in 0..halo_cells(m_r2b.lod()) {
+            let a = raw.cell_block(m_raw, cell);
+            let b = r2b.cell_block(m_r2b, cell);
+            assert_eq!(a, b, "brick {key:?} cell {cell} decodes differently (raw {a:?} vs r2b {b:?})");
+        }
+    }
+}
+
 /// Slots are reused after a drop (the free list), and the deferred-free quarantine means a slot freed this
 /// update is NOT reclaimed until the next update (keep-old-until-revealed at the slot level).
 #[test]

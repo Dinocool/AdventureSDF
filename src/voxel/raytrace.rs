@@ -45,7 +45,11 @@ use super::brickmap::BrickMap;
 use super::cornell::{build_cornell, build_cornell_with_edits};
 use super::gallery::{GALLERY_SCENES, load_gallery};
 use super::edits::{VoxelEdits, VoxelHit, pick_voxel};
-use super::gpu::{GpuAliasEntry, GpuBrickAabb, GpuBrickPatch, GpuVoxelLight, pack_brickmap, pack_resident_set};
+use super::gpu::{
+    GpuAliasEntry, GpuBrickAabb, GpuBrickMeta, GpuBrickPatch, GpuVoxelLight, build_lights_from_entries,
+    pack_brickmap, pack_resident_set,
+};
+use super::incremental::{RepackDelta, ResidentPacker, SnapshotBuffers};
 use super::palette::{BlockId, BlockRegistry, CornellBlock};
 use super::source::{BrickSource, StaticVoxSource, WorldgenSource};
 use super::streaming::{BrickKey, ResidencyManager, StreamingConfig, camera_brick_coord, region_half_extent_m};
@@ -74,16 +78,75 @@ impl Default for VoxelRtToggle {
     }
 }
 
-/// The packed, GPU-ready brick patch (the SSOT [`GpuBrickPatch`]) — re-built in the main world whenever the
-/// streamed resident set changes, extracted to the render world for upload. `generation` increments on
-/// every re-pack so the render world knows to rebuild the BLAS/TLAS (and keeps the OLD one bound until then
-/// — keep-old-until-revealed).
-#[derive(Resource, Clone, Default, ExtractResource)]
+/// What the main world ships to the render world this generation (storage plan A1 — the O(changed) GPU upload).
+/// A scene switch / first pack ships a SNAPSHOT (the render path re-creates buffers + BLAS); an incremental
+/// streamed move ships only a [`RepackDelta`] (the render path `queue_write_buffer`s ONLY the changed slots into
+/// the already-allocated fixed-cap buffers — the per-move hitch fix).
+#[derive(Clone)]
+pub enum VoxelRtUpload {
+    /// A fresh CONTIGUOUS R2b patch (the STATIC Cornell / Sponza / Gallery scenes + the streamed FIRST-pack
+    /// fallback). The render path re-creates all buffers from this and builds a single BLAS over `brick_count`
+    /// primitives — the pre-A1 behaviour, kept verbatim for the tiny static scenes that never stream
+    /// incrementally. R2b paletted (`index_bits >= 1`).
+    Snapshot(GpuBrickPatch),
+    /// A streamed scene EPOCH start (a switch into worldgen/Sponza/Gallery + its first re-pack): allocate the
+    /// FIXED-CAPACITY raw-arena buffers ONCE from these capacity-sized contents, then build the BLAS over
+    /// `capacity` primitives (degenerate AABBs for free slots). The NEE lights are shipped whole (not per-slot).
+    /// A1-β RAW arena (`index_bits == 0` dense bricks; see [`SnapshotBuffers`]).
+    StreamSnapshot { buffers: SnapshotBuffers, lights: Vec<GpuVoxelLight>, alias: Vec<GpuAliasEntry> },
+    /// An incremental streamed generation: `queue_write_buffer` ONLY `delta.changed` into the already-allocated
+    /// fixed-cap buffers (meta/aabb at `slot · stride`, the raw dense block at `voxel_word_offset`). Rebuild the
+    /// BLAS iff `delta.topology_changed`. Carries the FULL light list for the generation (NEE is not per-slot).
+    Delta { delta: RepackDelta, brick_count: u32, lights: Vec<GpuVoxelLight>, alias: Vec<GpuAliasEntry> },
+}
+
+impl VoxelRtUpload {
+    /// True iff this upload describes an EMPTY scene (nothing to trace) — the render path keeps the old scene.
+    pub fn is_empty(&self) -> bool {
+        match self {
+            VoxelRtUpload::Snapshot(p) => p.is_empty(),
+            VoxelRtUpload::StreamSnapshot { buffers, .. } => buffers.brick_count == 0,
+            // A Delta never starts an epoch, so it always has a prior StreamSnapshot's buffers to patch — even an
+            // all-freed delta still patches (collapsing slots to degenerate) and must not be skipped.
+            VoxelRtUpload::Delta { .. } => false,
+        }
+    }
+}
+
+/// The packed, GPU-ready brick upload (storage plan A1) — re-built in the main world whenever the streamed
+/// resident set changes, extracted to the render world for upload. `generation` increments on every re-pack so
+/// the render world knows to (re)build/patch; `epoch` increments on every scene switch (fresh packer) so the
+/// render world reallocates the fixed-cap buffers exactly at epoch boundaries (keep-old-until-revealed).
+#[derive(Resource, Clone, ExtractResource)]
 pub struct VoxelRtPatch {
-    pub patch: GpuBrickPatch,
-    /// Bumped on every re-pack. The render world rebuilds its accel structures when this differs from the
-    /// generation it last built for.
+    pub upload: VoxelRtUpload,
+    /// Bumped on every re-pack. The render world rebuilds/patches when this differs from the generation it last
+    /// built for.
     pub generation: u64,
+    /// The scene EPOCH id — incremented on every scene switch (fresh packer). The render world REALLOCATES the
+    /// fixed-cap buffers when this changes (a `StreamSnapshot`/`Snapshot` always carries a new epoch).
+    pub epoch: u64,
+}
+
+impl Default for VoxelRtPatch {
+    fn default() -> Self {
+        // An empty contiguous snapshot at generation/epoch 0 — `prepare_voxel_rt` keeps the old (none) scene
+        // until the first real pack ships.
+        Self { upload: VoxelRtUpload::Snapshot(GpuBrickPatch::default()), generation: 0, epoch: 0 }
+    }
+}
+
+impl VoxelRtPatch {
+    /// A device-free [`StorageReport`](super::gpu::StorageReport) of the current upload, for the editor VRAM
+    /// panel. Only the contiguous static `Snapshot` (R2b) carries one — the streamed raw-arena
+    /// `StreamSnapshot`/`Delta` paths don't assemble a `GpuBrickPatch` (the per-slot deltas would need a full
+    /// re-gather to report), so they return `None` and the panel omits the breakdown.
+    pub fn storage_report(&self) -> Option<super::gpu::StorageReport> {
+        match &self.upload {
+            VoxelRtUpload::Snapshot(p) => Some(p.storage_report()),
+            VoxelRtUpload::StreamSnapshot { .. } | VoxelRtUpload::Delta { .. } => None,
+        }
+    }
 }
 
 /// The main-world streaming state: the worldgen sampling context (built once) + the live
@@ -144,7 +207,15 @@ pub struct VoxelRtStreaming {
     /// `snapshot_patch_matches_full_pack`), so the render path and shader are unchanged and pixel-identical.
     /// `None` until the first streamed pack; a fresh packer is set on every scene switch (so a switch streams in
     /// cleanly), mirroring `manager`.
-    packer: Option<super::incremental::ResidentPacker>,
+    packer: Option<ResidentPacker>,
+    /// The current scene EPOCH (storage plan A1) — bumped on every scene switch (Cornell, Sponza, Gallery,
+    /// worldgen, and the static-missing fallback). Stamped into every shipped [`VoxelRtPatch`] so the render
+    /// world reallocates the fixed-cap buffers exactly at epoch boundaries.
+    epoch: u64,
+    /// Whether the CURRENT streamed epoch has already shipped its [`VoxelRtUpload::StreamSnapshot`]. The FIRST
+    /// re-pack of a streamed epoch ships a snapshot (allocate fixed-cap buffers); subsequent re-packs ship a
+    /// [`VoxelRtUpload::Delta`]. Reset to `false` on every scene switch.
+    epoch_snapshotted: bool,
 }
 
 impl VoxelRtStreaming {
@@ -307,6 +378,8 @@ fn init_voxel_rt_streaming(
         worldgen_dirty_pending: false,
         worldgen_frames_since_pack: 0,
         packer: None,
+        epoch: 0,
+        epoch_snapshotted: false,
     });
 }
 
@@ -339,8 +412,17 @@ fn stream_voxel_rt_residency(
             let map = build_cornell_with_edits(&streaming.cornell_registry, &edits);
             let patch = pack_brickmap(&map, &streaming.cornell_registry);
             let (n, v) = (patch.brick_count(), patch.voxels.len());
-            patch_res.patch = patch;
+            // STATIC scene: ship a contiguous R2b Snapshot (the render path re-creates buffers + a single BLAS,
+            // the pre-A1 behaviour). Bump the epoch on a scene SWITCH (so the render world reallocates) but NOT
+            // on an in-place edit re-pack of the same Cornell scene (a Snapshot already reallocates anyway, but
+            // keeping the epoch stable across edits avoids spurious churn signalling). A `scene_new` is a switch.
+            if scene_new {
+                streaming.epoch = streaming.epoch.wrapping_add(1);
+                streaming.epoch_snapshotted = false;
+            }
+            patch_res.upload = VoxelRtUpload::Snapshot(patch);
             patch_res.generation = patch_res.generation.wrapping_add(1);
+            patch_res.epoch = streaming.epoch;
             // Cornell lighting: the box is closed (only the −Z front is open), so the sun can't fill it — the
             // EMISSIVE ceiling panel is the dominant light. Use plenty of GI rays for clear colour bleed, a
             // dim ambient (so the room isn't pitch black before GI converges), and a weak sun angled in
@@ -405,8 +487,13 @@ fn stream_voxel_rt_residency(
         if static_map_missing {
             let map = build_cornell_with_edits(&streaming.cornell_registry, &edits);
             let patch = pack_brickmap(&map, &streaming.cornell_registry);
-            patch_res.patch = patch;
+            // The asset-missing fallback is a fresh (Cornell) scene — bump the epoch so the render path
+            // reallocates from this contiguous Snapshot.
+            streaming.epoch = streaming.epoch.wrapping_add(1);
+            streaming.epoch_snapshotted = false;
+            patch_res.upload = VoxelRtUpload::Snapshot(patch);
             patch_res.generation = patch_res.generation.wrapping_add(1);
+            patch_res.epoch = streaming.epoch;
             lighting.data = LightingUniformData::cornell();
             sky.data = SkyUniformData::default();
             streaming.packed_scene = Some(*scene);
@@ -419,7 +506,11 @@ fn stream_voxel_rt_residency(
         streaming.manager = ResidencyManager::new();
         // Fresh incremental packer for the new scene (sized to the resident cap) — a switch streams in cleanly,
         // and the slot allocator / arena / shadows start empty (mirrors the manager reset).
-        streaming.packer = Some(super::incremental::ResidentPacker::new(streaming.cfg.max_resident_bricks as u32));
+        streaming.packer = Some(ResidentPacker::new(streaming.cfg.max_resident_bricks as u32));
+        // Storage plan A1: a fresh streamed epoch — bump the epoch (so the render world reallocates the fixed-cap
+        // buffers) and arm the first-pack snapshot (the first re-pack ships a StreamSnapshot; later ones a Delta).
+        streaming.epoch = streaming.epoch.wrapping_add(1);
+        streaming.epoch_snapshotted = false;
         streaming.last_cam_brick = None;
         streaming.worldgen_dirty_pending = false;
         streaming.worldgen_frames_since_pack = 0;
@@ -524,6 +615,8 @@ fn stream_voxel_rt_residency(
         worldgen_frames_since_pack,
         last_cam_brick,
         packer,
+        epoch,
+        epoch_snapshotted,
         ..
     } = &mut *streaming;
 
@@ -583,27 +676,49 @@ fn stream_voxel_rt_residency(
     let settled = manager.pending() == 0;
     if *worldgen_dirty_pending && (settled || *worldgen_frames_since_pack >= WORLDGEN_REPACK_INTERVAL) {
         let entries = manager.resident_entries();
-        // INCREMENTAL re-pack: `update` re-`pack_one`s ONLY the entered/dropped bricks + their resident
-        // 26-neighbourhood (the O(changed) cost), then `snapshot_patch` assembles the extracted patch by MEMCPY
-        // of the cached per-brick bytes — byte-identical to a from-scratch `pack_resident_set` (proven by
-        // `snapshot_patch_matches_full_pack`), so the render path + shader are UNCHANGED + pixel-identical. The
-        // packer is `Some` for every streamed scene (set on the switch); the `unwrap_or_else` is a defensive
-        // first-tick guard that falls back to the full pack.
-        let patch = match packer.as_mut() {
+        // STORAGE PLAN A1 — the O(changed) GPU upload. `update` re-`pack_one`s ONLY the entered/dropped bricks +
+        // their resident 26-neighbourhood (the halo dependency) and returns the [`RepackDelta`]. The FIRST re-pack
+        // of a streamed epoch ships a `StreamSnapshot` (the render path allocates the fixed-cap raw-arena buffers
+        // ONCE + builds the BLAS over capacity); every later re-pack ships only the `Delta` (the render path
+        // `queue_write_buffer`s ONLY the changed slots — no full buffer re-create, no full BLAS rebuild). The NEE
+        // light list is NOT per-slot, so it is built whole from the resident set each re-pack (FREE when the
+        // registry has no emitters — the common worldgen/Sponza case). The packer is `Some` for every streamed
+        // scene (set on the switch); the `None` arm is a defensive first-tick fallback to a contiguous Snapshot.
+        let upload = match packer.as_mut() {
             Some(p) => {
-                p.update(&entries);
-                p.snapshot_patch(active_registry)
+                let delta = p.update(&entries);
+                let (lights, alias) = build_lights_from_entries(&entries, active_registry);
+                let brick_count = p.resident_count() as u32;
+                if !*epoch_snapshotted {
+                    // First pack of this epoch: snapshot the fixed-cap buffers (allocate once).
+                    let buffers = p.snapshot_buffers(active_registry);
+                    *epoch_snapshotted = true;
+                    VoxelRtUpload::StreamSnapshot { buffers, lights, alias }
+                } else if !delta.is_empty() {
+                    VoxelRtUpload::Delta { delta, brick_count, lights, alias }
+                } else {
+                    // Nothing changed this re-pack — don't bump the generation (no GPU work).
+                    *worldgen_dirty_pending = false;
+                    *worldgen_frames_since_pack = 0;
+                    return;
+                }
             }
-            None => pack_resident_set(&entries, active_registry),
+            None => VoxelRtUpload::Snapshot(pack_resident_set(&entries, active_registry)),
         };
-        let (n, v) = (patch.brick_count(), patch.voxels.len());
-        patch_res.patch = patch;
+        let (n, v) = match &upload {
+            VoxelRtUpload::StreamSnapshot { buffers, .. } => (buffers.brick_count as usize, buffers.voxels.len()),
+            VoxelRtUpload::Delta { brick_count, delta, .. } => (*brick_count as usize, delta.changed.len()),
+            VoxelRtUpload::Snapshot(p) => (p.brick_count(), p.voxels.len()),
+        };
+        patch_res.upload = upload;
         patch_res.generation = patch_res.generation.wrapping_add(1);
+        patch_res.epoch = *epoch;
         *worldgen_dirty_pending = false;
         *worldgen_frames_since_pack = 0;
         debug!(
-            "voxel-RT: re-packed resident set gen {} — {n} bricks, {v} cells, {} pending (settled={settled})",
+            "voxel-RT: re-packed resident set gen {} epoch {} — {n} bricks, {v} cells/changed-slots, {} pending (settled={settled})",
             patch_res.generation,
+            *epoch,
             manager.pending()
         );
     }
@@ -949,12 +1064,19 @@ struct VoxelRtResources {
     /// one stays bound until the new one is fully built (keep-old-until-revealed).
     scene_bind_group: Option<wgpu::BindGroup>,
     /// Keep-alive holders for the GPU objects the bind group / TLAS reference (wgpu uses Arc internally,
-    /// but we retain the BLAS + TLAS explicitly so they outlive the bind group deterministically).
-    _keep: Option<SceneKeepAlive>,
+    /// but we retain the BLAS + TLAS + buffers explicitly so they outlive the bind group deterministically).
+    /// Storage plan A1: within a streamed EPOCH these buffers PERSIST across generations — a `Delta` patches them
+    /// in place via `queue_write_buffer` and only rebuilds the BLAS on a topology change. Re-created only on an
+    /// epoch boundary (a scene switch) or a contiguous `Snapshot`.
+    scene: Option<SceneKeepAlive>,
     brick_count: u32,
-    /// The patch generation the current scene bind group was built for. We rebuild when the extracted
+    /// The patch generation the current scene bind group was built for. We rebuild/patch when the extracted
     /// patch's generation differs (and only then).
     built_generation: Option<u64>,
+    /// The scene EPOCH the current fixed-cap buffers were allocated for (storage plan A1). A `Delta` whose epoch
+    /// matches PATCHES the existing buffers; a new epoch (or a `Snapshot`) REALLOCATES them. `None` until the
+    /// first scene is built.
+    built_epoch: Option<u64>,
     /// Output storage texture (rgba16float) + view + size; reallocated on view resize.
     output: Option<(wgpu::Texture, wgpu::TextureView, UVec2)>,
     /// The TEMPORAL-ACCUMULATION history texture (rgba16float) + view: the previous frame's accumulated
@@ -1059,11 +1181,31 @@ struct VoxelRtResources {
     dlss_restir_prev: Option<(UVec2, [[f32; 4]; 4], Option<u64>)>,
 }
 
-/// Holders that must outlive the scene bind group / TLAS for the program's lifetime.
+/// The persistent GPU scene objects the bind group / TLAS reference, retained so they outlive the bind group
+/// deterministically. Storage plan A1: for a STREAMED epoch these are allocated ONCE at fixed capacity (with
+/// `COPY_DST` usage) and the per-generation `Delta` patches them in place via `queue_write_buffer`; the BLAS is
+/// rebuilt only on a topology change. A contiguous `Snapshot` (static scenes) re-creates them every generation.
 struct SceneKeepAlive {
-    _blas: wgpu::Blas,
-    _tlas: wgpu::Tlas,
-    _buffers: [wgpu::Buffer; 5],
+    blas: wgpu::Blas,
+    tlas: wgpu::Tlas,
+    /// The fixed-cap AABB buffer (BLAS_INPUT | STORAGE | COPY_DST) — the BLAS geometry the Delta patches at
+    /// `slot · 32`.
+    aabb_buf: wgpu::Buffer,
+    /// The fixed-cap meta buffer (STORAGE | COPY_DST) — patched at `slot · 48`.
+    meta_buf: wgpu::Buffer,
+    /// The fixed-cap raw voxel arena (STORAGE | COPY_DST) — the Delta writes the raw block at `voxel_word_offset`.
+    voxel_buf: wgpu::Buffer,
+    /// The palette buffer (fixed per scene — never patched by a Delta). Keep-alive only (the bind group's Arc
+    /// references it); never read back.
+    _palette_buf: wgpu::Buffer,
+    /// The per-brick palette buffer (R2b static path; a 1-word dummy on the raw streamed path). Keep-alive only.
+    _brick_palettes_buf: wgpu::Buffer,
+    /// The number of BLAS primitives (== `capacity` for a streamed epoch, == `brick_count` for a static
+    /// Snapshot) — the size the BLAS was created for, reused on a Delta's in-place BLAS rebuild.
+    blas_primitives: u32,
+    /// True iff this scene is a STREAMED fixed-cap epoch (a `Delta` can patch it). False for a static contiguous
+    /// `Snapshot` (every generation re-creates).
+    streamed: bool,
 }
 
 /// The PERSISTENT world-space radiance-cache GPU state (Phase 2.1): the 11 storage buffers + the `group(3)`
@@ -1102,19 +1244,25 @@ impl WorldCacheLights {
     /// uploaded as a single zeroed dummy element each so the storage bindings are never zero-length (wgpu
     /// rejects a 0-byte storage binding) — `count == 0` makes the shader skip NEE so the dummies are never read.
     fn new(device: &wgpu::Device, patch: &GpuBrickPatch) -> Self {
-        let count = patch.lights.len() as u32;
-        // Non-empty contents (≥1 element) so the storage buffers are valid even with no emitters.
+        Self::from_lists(device, &patch.lights, &patch.alias)
+    }
+
+    /// Build the light-list buffers from raw light + alias slices (storage plan A1 — the streamed Delta path
+    /// ships `lights`/`alias` vecs, not a contiguous patch). An EMPTY list (no emitters) is uploaded as a single
+    /// zeroed dummy each so the storage bindings are never zero-length; `count == 0` makes the shader skip NEE.
+    fn from_lists(device: &wgpu::Device, lights_in: &[GpuVoxelLight], alias_in: &[GpuAliasEntry]) -> Self {
+        let count = lights_in.len() as u32;
         let dummy_light = GpuVoxelLight { pos: [0.0; 3], area: 0.0, radiance: [0.0; 3], inv_pdf: 0.0 };
         let dummy_alias = GpuAliasEntry { prob: 1.0, alias: 0 };
-        let lights_bytes: Vec<u8> = if patch.lights.is_empty() {
+        let lights_bytes: Vec<u8> = if lights_in.is_empty() {
             bytemuck::bytes_of(&dummy_light).to_vec()
         } else {
-            bytemuck::cast_slice(&patch.lights).to_vec()
+            bytemuck::cast_slice(lights_in).to_vec()
         };
-        let alias_bytes: Vec<u8> = if patch.alias.is_empty() {
+        let alias_bytes: Vec<u8> = if alias_in.is_empty() {
             bytemuck::bytes_of(&dummy_alias).to_vec()
         } else {
-            bytemuck::cast_slice(&patch.alias).to_vec()
+            bytemuck::cast_slice(alias_in).to_vec()
         };
         let lights = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("voxel_rt_nee_lights"),
@@ -2278,12 +2426,25 @@ impl Default for RestirSettings {
     }
 }
 
-/// [`Render`]/[`RenderSystems::PrepareResources`]: upload the streamed patch buffers + build the AABB BLAS
-/// / brick TLAS for the CURRENT patch generation, then swap in a fresh `group(0)` scene bind group. Rebuilds
-/// whenever the extracted patch's `generation` differs from the one already built (and ONLY then), so a
-/// static camera does no GPU rebuild. Keep-old-until-revealed: the new BLAS/TLAS/buffers are built into
-/// locals and only assigned at the end — the previous scene bind group (and its TLAS) stays bound for any
-/// in-flight pass until this function completes the swap. Skips when the toggle is off or the patch is empty.
+/// [`Render`]/[`RenderSystems::PrepareResources`]: apply the streamed [`VoxelRtUpload`] for the CURRENT patch
+/// generation (storage plan A1 — the O(changed) GPU upload), then swap in / keep the `group(0)` scene bind
+/// group. Runs only when the extracted patch's `generation` differs from the one already built (and ONLY then),
+/// so a static camera does no GPU work.
+///
+/// - A `Snapshot` (static Cornell/Sponza/Gallery) or `StreamSnapshot` (a fresh streamed epoch) (RE)ALLOCATES the
+///   buffers + BLAS/TLAS from scratch (the `StreamSnapshot` buffers are fixed-capacity with `COPY_DST`, so the
+///   following deltas can `queue_write` them). The BLAS is built over `capacity` primitives for a stream (free
+///   slots are degenerate AABBs ⇒ guaranteed non-candidates) or `brick_count` for a static patch.
+/// - A `Delta` (an incremental streamed move) `queue_write_buffer`s ONLY `delta.changed` into the already-
+///   allocated fixed-cap buffers (meta at `slot·48`, aabb at `slot·32`, the raw block at `voxel_word_offset·4`),
+///   rebuilds the BLAS in place ONLY iff `topology_changed`, and rebuilds the NEE light list. No full buffer
+///   re-create, no full BLAS rebuild — the per-move hitch fix.
+///
+/// Keep-old-until-revealed: on a (re)allocation the new objects are built into locals and only assigned at the
+/// end, so the previous scene stays bound for any in-flight pass until the swap completes. A `Delta` patches in
+/// place (the buffers persist across the epoch), which is safe because the packer QUARANTINES freed slots for a
+/// generation (a slot freed this update isn't reused until the next), so an in-flight frame never sees a slot's
+/// bytes overwritten by a different brick mid-flight.
 fn prepare_voxel_rt(
     toggle: Res<VoxelRtToggle>,
     patch_res: Option<Res<VoxelRtPatch>>,
@@ -2295,47 +2456,156 @@ fn prepare_voxel_rt(
     let (Some(patch_res), Some(pipelines)) = (patch_res, pipelines) else {
         return;
     };
-    // Rebuild only on a NEW non-empty generation. An empty patch (no resident bricks yet) leaves any
-    // previously-built scene untouched (keep-old), and a static camera (same generation) does nothing.
-    if !toggle.enabled || patch_res.patch.is_empty() {
+    // Apply only a NEW non-empty generation. An empty upload (no resident bricks yet) leaves any previously-built
+    // scene untouched (keep-old), and a static camera (same generation) does nothing.
+    if !toggle.enabled || patch_res.upload.is_empty() {
         return;
     }
     if resources.built_generation == Some(patch_res.generation) {
-        return; // already built this generation — keep the current scene
+        return; // already applied this generation — keep the current scene
     }
     let device = render_device.wgpu_device();
-    let patch = &patch_res.patch;
-    let n = patch.brick_count() as u32;
 
+    match &patch_res.upload {
+        VoxelRtUpload::Snapshot(patch) => {
+            // STATIC contiguous R2b patch: (re)allocate all buffers + a single BLAS over `brick_count`
+            // primitives. `brick_palettes` is the real R2b per-brick palette buffer.
+            build_scene_full(
+                device,
+                &render_queue,
+                &pipelines,
+                &mut resources,
+                bytemuck::cast_slice(&patch.aabbs),
+                bytemuck::cast_slice(&patch.metas),
+                bytemuck::cast_slice(&patch.voxels),
+                bytemuck::cast_slice(&patch.palette),
+                bytemuck::cast_slice(&patch.brick_palettes),
+                patch.brick_count() as u32,
+                patch.brick_count() as u32,
+                false,
+            );
+            // NEE lights from the contiguous patch (R2b path).
+            resources.world_cache_lights = Some(WorldCacheLights::new(device, patch));
+        }
+        VoxelRtUpload::StreamSnapshot { buffers, lights, alias } => {
+            // STREAMED epoch start: (re)allocate the FIXED-CAPACITY raw-arena buffers (with COPY_DST) + a BLAS over
+            // `capacity` primitives (degenerate AABBs for free slots). `brick_palettes` is a 1-word dummy on the
+            // raw path (a raw `index_bits == 0` brick never indirects through it). The light list ships whole.
+            let capacity = buffers.metas.len() as u32;
+            // A1-β raw path never reads `brick_palettes`; bind a 1-word dummy so the storage binding is valid.
+            let brick_palettes_dummy: [u32; 1] = [0];
+            build_scene_full(
+                device,
+                &render_queue,
+                &pipelines,
+                &mut resources,
+                bytemuck::cast_slice(&buffers.aabbs),
+                bytemuck::cast_slice(&buffers.metas),
+                bytemuck::cast_slice(&buffers.voxels),
+                bytemuck::cast_slice(&buffers.palette),
+                bytemuck::cast_slice(&brick_palettes_dummy),
+                capacity,
+                buffers.brick_count,
+                true,
+            );
+            resources.world_cache_lights = Some(WorldCacheLights::from_lists(device, lights, alias));
+            debug!(
+                "voxel-RT A1: StreamSnapshot epoch {} gen {} — cap {capacity}, {} resident bricks, {} voxel u32, {} lights",
+                patch_res.epoch,
+                patch_res.generation,
+                buffers.brick_count,
+                buffers.voxels.len(),
+                lights.len(),
+            );
+        }
+        VoxelRtUpload::Delta { delta, brick_count, lights, alias } => {
+            // STREAMED incremental move: patch ONLY the changed slots into the persistent fixed-cap buffers. The
+            // scene must already exist for this epoch (the first re-pack shipped a StreamSnapshot). If the epoch
+            // doesn't match (a defensive race — a Delta arrived before its epoch's snapshot built) skip and keep
+            // the old scene; the next re-pack re-snapshots.
+            if resources.built_epoch != Some(patch_res.epoch) {
+                debug!(
+                    "voxel-RT A1: Delta for epoch {} but built epoch is {:?} — skipping (await snapshot)",
+                    patch_res.epoch, resources.built_epoch
+                );
+                return;
+            }
+            let Some(scene) = resources.scene.as_ref() else {
+                return; // no buffers to patch — keep old (defensive)
+            };
+            if !scene.streamed {
+                return; // a static Snapshot scene can't take a Delta (shouldn't happen — defensive)
+            }
+            apply_delta(device, &render_queue, scene, delta);
+            // The buffers were patched in place; the bind group (which references the SAME TLAS/meta/voxel/palette
+            // handles) is unchanged. Rebuild the NEE light list (it follows the resident set's emissive surface).
+            resources.world_cache_lights = Some(WorldCacheLights::from_lists(device, lights, alias));
+            resources.brick_count = *brick_count;
+            debug!(
+                "voxel-RT A1: Delta epoch {} gen {} — {} changed slots, {} freed, topology_changed={}, {} bricks",
+                patch_res.epoch,
+                patch_res.generation,
+                delta.changed.len(),
+                delta.freed.len(),
+                delta.topology_changed,
+                brick_count,
+            );
+        }
+    }
+
+    resources.built_generation = Some(patch_res.generation);
+    resources.built_epoch = Some(patch_res.epoch);
+}
+
+/// (Re)allocate the full scene GPU objects (storage plan A1): the AABB/meta/voxel/palette/brick-palette buffers
+/// (all with `COPY_DST` so the streamed delta path can patch them), a single-geometry BLAS over `blas_primitives`
+/// AABBs, a single-instance identity TLAS, and the `group(0)` scene bind group. `streamed` marks a fixed-cap
+/// streamed epoch (the deltas patch it) vs a static contiguous Snapshot. Keep-old-until-revealed: builds into
+/// locals, assigns into `resources` only at the end.
+#[allow(clippy::too_many_arguments)]
+fn build_scene_full(
+    device: &wgpu::Device,
+    render_queue: &RenderQueue,
+    pipelines: &VoxelRtPipelines,
+    resources: &mut VoxelRtResources,
+    aabb_bytes: &[u8],
+    meta_bytes: &[u8],
+    voxel_bytes: &[u8],
+    palette_bytes: &[u8],
+    brick_palettes_bytes: &[u8],
+    blas_primitives: u32,
+    brick_count: u32,
+    streamed: bool,
+) {
+    // COPY_DST on every patchable buffer so the streamed Delta path can `queue_write_buffer` changed slots (A1).
     let aabb_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("voxel_rt_aabbs"),
-        contents: bytemuck::cast_slice(&patch.aabbs),
-        usage: wgpu::BufferUsages::BLAS_INPUT | wgpu::BufferUsages::STORAGE,
+        contents: aabb_bytes,
+        usage: wgpu::BufferUsages::BLAS_INPUT | wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
     });
     let meta_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("voxel_rt_metas"),
-        contents: bytemuck::cast_slice(&patch.metas),
-        usage: wgpu::BufferUsages::STORAGE,
+        contents: meta_bytes,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
     });
     let voxel_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("voxel_rt_voxel_indices"),
-        contents: bytemuck::cast_slice(&patch.voxels),
-        usage: wgpu::BufferUsages::STORAGE,
+        contents: voxel_bytes,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
     });
     let palette_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("voxel_rt_palette"),
-        contents: bytemuck::cast_slice(&patch.palette),
-        usage: wgpu::BufferUsages::STORAGE,
+        contents: palette_bytes,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
     });
-    // Storage plan R2b — the per-brick palettes the bit-packed index stream indirects through.
     let brick_palettes_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("voxel_rt_brick_palettes"),
-        contents: bytemuck::cast_slice(&patch.brick_palettes),
-        usage: wgpu::BufferUsages::STORAGE,
+        contents: brick_palettes_bytes,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
     });
 
     let size_desc = wgpu::BlasAABBGeometrySizeDescriptor {
-        primitive_count: n,
+        primitive_count: blas_primitives,
         flags: wgpu::AccelerationStructureGeometryFlags::OPAQUE,
     };
     let blas = device.create_blas(
@@ -2388,27 +2658,70 @@ fn prepare_voxel_rt(
         ],
     });
 
-    // Phase 2.5 NEE: rebuild the emissive-voxel light list + alias table for this generation (the lights are
-    // derived from the resident set, so they follow streamed/edited geometry). Built alongside the scene swap
-    // so the light list and the BLAS/voxels always describe the SAME generation (never a frame out of sync).
-    let lights = WorldCacheLights::new(device, patch);
-    debug!(
-        "voxel-RT NEE: built light list for gen {} — {} emissive-voxel lights",
-        patch_res.generation, lights.count
-    );
-    resources.world_cache_lights = Some(lights);
-
-    // Swap in the new scene atomically (the old `_keep` + bind group drop only now that the new ones are
-    // fully built — keep-old-until-revealed).
+    // Swap in the new scene atomically (the old scene + bind group drop only now that the new ones are fully
+    // built — keep-old-until-revealed).
     resources.scene_bind_group = Some(scene_bind_group);
-    resources.brick_count = n;
-    resources.built_generation = Some(patch_res.generation);
-    resources._keep = Some(SceneKeepAlive {
-        _blas: blas,
-        _tlas: tlas,
-        _buffers: [aabb_buf, meta_buf, voxel_buf, palette_buf, brick_palettes_buf],
+    resources.brick_count = brick_count;
+    resources.scene = Some(SceneKeepAlive {
+        blas,
+        tlas,
+        aabb_buf,
+        meta_buf,
+        voxel_buf,
+        _palette_buf: palette_buf,
+        _brick_palettes_buf: brick_palettes_buf,
+        blas_primitives,
+        streamed,
     });
-    debug!("voxel-RT: built accel structures for patch gen {} — {n} bricks", patch_res.generation);
+}
+
+/// Apply a [`RepackDelta`] to the persistent fixed-cap scene buffers (storage plan A1 — the O(changed) GPU
+/// upload). For each changed slot: `queue_write_buffer` the meta (at `slot·48`) + AABB (at `slot·32`) and, for a
+/// dense slot, the raw `dense_block_u32()`-u32 voxel block (at `voxel_word_offset·4`). On a topology change
+/// (enter/drop) the BLAS is rebuilt IN PLACE over the SAME aabb_buf (the same wgpu BLAS handle, so the bind
+/// group — which references the TLAS, which references the BLAS — stays valid) + the TLAS rebuilt; a pure
+/// meta/voxel edit (no enter/drop) needs no BLAS work (the AABBs didn't move).
+fn apply_delta(
+    device: &wgpu::Device,
+    render_queue: &RenderQueue,
+    scene: &SceneKeepAlive,
+    delta: &RepackDelta,
+) {
+    let meta_stride = core::mem::size_of::<GpuBrickMeta>() as u64; // 48
+    let aabb_stride = core::mem::size_of::<GpuBrickAabb>() as u64; // 32
+    for cs in &delta.changed {
+        render_queue.write_buffer(&scene.meta_buf, cs.slot as u64 * meta_stride, bytemuck::bytes_of(&cs.meta));
+        render_queue.write_buffer(&scene.aabb_buf, cs.slot as u64 * aabb_stride, bytemuck::bytes_of(&cs.aabb));
+        if let Some(v) = &cs.voxels {
+            render_queue.write_buffer(&scene.voxel_buf, cs.voxel_word_offset as u64 * 4, bytemuck::cast_slice(v));
+        }
+    }
+    // Rebuild the BLAS in place ONLY when the resident set's occupancy changed (an enter/drop moved/collapsed an
+    // AABB). A pure edit (rewrite of a brick's voxels, same coord/lod ⇒ same AABB) leaves the geometry untouched,
+    // so no BLAS rebuild is needed. The BLAS is rebuilt over the SAME capacity-sized aabb_buf (degenerate free
+    // slots are non-candidates), keeping the BLAS/TLAS handles + the bind group stable.
+    if delta.topology_changed {
+        let size_desc = wgpu::BlasAABBGeometrySizeDescriptor {
+            primitive_count: scene.blas_primitives,
+            flags: wgpu::AccelerationStructureGeometryFlags::OPAQUE,
+        };
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("voxel_rt_delta_rebuild_accel"),
+        });
+        encoder.build_acceleration_structures(
+            core::iter::once(&wgpu::BlasBuildEntry {
+                blas: &scene.blas,
+                geometry: wgpu::BlasGeometries::AabbGeometries(vec![wgpu::BlasAabbGeometry {
+                    size: &size_desc,
+                    stride: aabb_stride,
+                    aabb_buffer: &scene.aabb_buf,
+                    primitive_offset: 0,
+                }]),
+            }),
+            core::iter::once(&scene.tlas),
+        );
+        render_queue.submit(core::iter::once(encoder.finish()));
+    }
 }
 
 /// The objects the per-frame world-cache dispatch needs, built before the compute pass opens (so they can be
@@ -3528,6 +3841,8 @@ mod tests {
             worldgen_dirty_pending: false,
             worldgen_frames_since_pack: 0,
             packer: None,
+            epoch: 0,
+            epoch_snapshotted: false,
         }
     }
 

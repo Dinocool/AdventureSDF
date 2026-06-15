@@ -141,9 +141,18 @@ pub fn intern(s: &str) -> &'static str {
 mod tests {
     use super::*;
 
+    /// These tests drive PROCESS-GLOBAL state (the `enabled` flag + the single accumulation sink), so running
+    /// them concurrently (the default `cargo test` thread pool) lets one's `set_enabled`/`drain` clobber the
+    /// other's — the `section_a` entry the enabled test asserts can be drained or its flag flipped mid-flight by
+    /// the disabled test. Serialize them on this guard so each runs in isolation (robust-by-construction, not a
+    /// timing fudge). A poisoned lock (a prior panic) is recovered so one failure doesn't cascade.
+    static TEST_GUARD: Mutex<()> = Mutex::new(());
+
     #[test]
     fn disabled_spans_record_nothing() {
+        let _g = TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
         set_enabled(false);
+        let _ = drain(); // clear any leftover from a prior test that shared the global sink
         {
             let _s = span("disabled_tag");
             std::thread::sleep(Duration::from_millis(1));
@@ -153,7 +162,9 @@ mod tests {
 
     #[test]
     fn enabled_spans_accumulate_then_drain_clears() {
+        let _g = TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
         set_enabled(true);
+        let _ = drain(); // start from a clean sink (the disabled test may have left it enabled-off)
         {
             let _s = span("section_a");
             std::thread::sleep(Duration::from_millis(2));

@@ -56,3 +56,5 @@ rust_out.pdb
 # isolated QA target dir + stray research clone
 /target-qa/
 /tmp_testre-flora/
+# per-stage isolated build target dirs
+/target-a1/

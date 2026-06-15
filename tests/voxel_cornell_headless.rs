@@ -177,7 +177,7 @@ fn headless_cornell_colours_and_bleed() {
 
     // The static patch is resident (the box voxelized).
     let patch = app.world().resource::<VoxelRtPatch>();
-    assert!(!patch.patch.is_empty(), "the static Cornell brick set must be non-empty");
+    assert!(!patch.upload.is_empty(), "the static Cornell brick set must be non-empty");
     assert!(lit, "the Cornell box never rendered a lit frame within the frame budget");
     assert!(bytes.len() >= padded_row * H as usize, "readback too small");
 

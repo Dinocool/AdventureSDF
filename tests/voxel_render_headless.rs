@@ -181,7 +181,7 @@ fn headless_render_shows_voxels() {
     // Sanity: the streamed patch actually has resident bricks (the surface near the camera voxelized).
     let patch = app.world().resource::<VoxelRtPatch>();
     assert!(
-        !patch.patch.is_empty(),
+        !patch.upload.is_empty(),
         "the streamed brick set must be non-empty (surface near the camera voxelized) — got 0 bricks"
     );
 

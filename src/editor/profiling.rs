@@ -365,7 +365,9 @@ fn voxel_residency_ui(world: &mut World, ui: &mut egui::Ui) {
         ui.weak("no voxel scene active");
         return;
     };
-    let report = world.get_resource::<VoxelRtPatch>().map(|p| (p.patch.storage_report(), p.generation));
+    let report = world
+        .get_resource::<VoxelRtPatch>()
+        .and_then(|p| p.storage_report().map(|r| (r, p.generation)));
 
     let clip_half = cfg.clip_half_bricks;
     let lod0_reach = clip_half as f32 * brick_span(0);

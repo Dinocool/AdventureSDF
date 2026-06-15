@@ -655,11 +655,19 @@ fn bench_incremental_repack_vs_full() {
         packer.update(&entries); // cold seed (untimed)
     }
 
+    // Storage plan A1 — the FIXED-CAP buffer bytes the OLD path re-created (`create_buffer_init`) EVERY move:
+    // the whole contiguous AABB+meta+voxel patch. The NEW path `queue_write_buffer`s ONLY the changed slots.
+    let meta_b = std::mem::size_of::<GpuBrickMeta>(); // 48
+    let aabb_b = std::mem::size_of::<GpuBrickAabb>(); // 32
+    let dense_block_bytes = adventure::voxel::incremental::dense_block_u32() * 4; // raw haloed 10³ u32 block
+
     let span0 = brick_span(0);
     let mut full_times = Vec::new();
     let mut inc_times = Vec::new();
     let mut live_times = Vec::new();
     let mut changed_counts = Vec::new();
+    let mut delta_bytes = Vec::new(); // A1: bytes the delta-driven queue_write_buffer touches per move
+    let mut full_buffer_bytes = Vec::new(); // the bytes the OLD per-move create_buffer_init re-uploaded
     for _ in 0..12 {
         cam[0] += span0;
         mgr.update(cam, &cfg, &src);
@@ -669,24 +677,38 @@ fn bench_incremental_repack_vs_full() {
         mgr.take_dirty();
         let entries = mgr.resident_entries();
 
-        // FULL pack (the old per-move cost).
+        // FULL pack (the old per-move cost) + the contiguous buffer bytes the OLD path re-created every move.
         let tf = Instant::now();
         let full = pack_resident_set(&entries, &registry);
         full_times.push(tf.elapsed());
-        let _ = full.brick_count();
+        full_buffer_bytes.push(
+            full.aabbs.len() * aabb_b
+                + full.metas.len() * meta_b
+                + full.voxels.len() * 4
+                + full.brick_palettes.len() * 4,
+        );
 
         // INCREMENTAL update — the O(changed) re-pack: it re-packs ONLY the entered/dropped bricks + their
         // resident 26-neighbourhood (the halo dependency) and returns the changed-slot DELTA the render world
-        // could patch via `queue_write_buffer`. This is the core per-move re-pack cost (the few-ms number).
+        // patches via `queue_write_buffer`. This is the core per-move re-pack cost (the few-ms number).
         let ti = Instant::now();
         let delta = packer.update(&entries);
         inc_times.push(ti.elapsed());
         changed_counts.push(delta.changed.len());
 
-        // LIVE path the shipping system pays this build: the O(changed) update PLUS `snapshot_patch` (the memcpy
-        // assembly of the contiguous patch the render world uploads unchanged). Reported separately so the
-        // residual memcpy cost is visible — the next stage (ship the DELTA + queue_write_buffer the fixed-cap
-        // buffers) removes it, taking the live cost down to the pure-update number above.
+        // A1 GPU UPLOAD bytes: the EXACT bytes `apply_delta`'s `queue_write_buffer`s touch this move — meta(48)+
+        // aabb(32) per changed slot, plus a raw dense block (4 KB) for each dense slot rewritten. This is what
+        // crosses to the GPU now, vs the whole contiguous buffer the OLD path re-created.
+        let move_bytes: usize = delta
+            .changed
+            .iter()
+            .map(|cs| meta_b + aabb_b + cs.voxels.as_ref().map_or(0, |_| dense_block_bytes))
+            .sum();
+        delta_bytes.push(move_bytes);
+
+        // LIVE path the OLD shipping build paid: the O(changed) update PLUS `snapshot_patch` (the memcpy assembly
+        // of the contiguous patch the render world re-uploaded). A1 REMOVES this `snapshot_patch` — the live cost
+        // is now just the `update` above (the GPU side is the delta's `queue_write_buffer`s, microseconds).
         let tl = Instant::now();
         let _live = packer.snapshot_patch(&registry);
         live_times.push(ti.elapsed() + tl.elapsed());
@@ -696,6 +718,9 @@ fn bench_incremental_repack_vs_full() {
     let (i_mean, i_p50, i_p95, i_max) = stats_ms(&inc_times);
     let (l_mean, _l_p50, l_p95, l_max) = stats_ms(&live_times);
     let changed_mean = changed_counts.iter().sum::<usize>() as f64 / changed_counts.len().max(1) as f64;
+    let delta_bytes_mean = delta_bytes.iter().sum::<usize>() as f64 / delta_bytes.len().max(1) as f64;
+    let delta_bytes_max = *delta_bytes.iter().max().unwrap_or(&0);
+    let full_buffer_mean = full_buffer_bytes.iter().sum::<usize>() as f64 / full_buffer_bytes.len().max(1) as f64;
     let half = cfg.clip_half_bricks as usize;
     let region_vol = (2 * half + 1).pow(3);
     let shell_area = (2 * half + 1).pow(2);
@@ -704,15 +729,36 @@ fn bench_incremental_repack_vs_full() {
     println!("warm resident         : {warm_resident} bricks");
     println!("FULL  pack_resident_set : mean {f_mean:.2} p95 {f_p95:.2} max {f_max:.2} ms  (O(resident), the AMORTIZED cost)");
     println!("INCR  ResidentPacker    : mean {i_mean:.3} p50 {i_p50:.3} p95 {i_p95:.3} max {i_max:.3} ms  (O(changed) re-pack — the few-ms target)");
-    println!("LIVE  update+snapshot   : mean {l_mean:.3} p95 {l_p95:.3} max {l_max:.3} ms  (this build's live cost; the residual is the contiguous-patch memcpy)");
+    println!("LIVE  update+snapshot   : mean {l_mean:.3} p95 {l_p95:.3} max {l_max:.3} ms  (OLD live cost; A1 drops the snapshot_patch)");
     println!("changed slots / move  : mean {changed_mean:.0} (O(shell) ~{shell_area} vs O(resident) ~{warm_resident}, region vol {region_vol})");
-    println!("per-move re-pack drop  : {:.0}× cheaper core ({f_mean:.2} ms full → {i_mean:.3} ms incremental); {:.0}× live ({l_mean:.3} ms)", f_mean / i_mean.max(1e-6), f_mean / l_mean.max(1e-6));
+    println!("-----------------------------------------------------------------------------");
+    // The fixed-cap RAW arena the OLD path conceptually re-created + re-uploaded every move (the buffers
+    // `prepare_voxel_rt` rebuilt from scratch per generation): cap meta+aabb + the raw voxel arena.
+    let cap = cfg.max_resident_bricks;
+    let cap_buffer_bytes =
+        cap * (meta_b + aabb_b) + cap * dense_block_bytes; // ~60k · (80 + 4096) ≈ 240 MB raw arena
+    println!("A1 GPU UPLOAD bytes/move : mean {:.1} KB  max {:.1} KB  (queue_write_buffer of ONLY the {changed_mean:.0} changed slots: 48B meta + 32B aabb + 4KB raw block/dense)",
+        delta_bytes_mean / 1e3, delta_bytes_max as f64 / 1e3);
+    println!("OLD R2b full patch       : mean {:.1} MB/move  (create_buffer_init of the WHOLE contiguous R2b patch — every move)", full_buffer_mean / 1e6);
+    println!("fixed-cap raw arena      : {:.0} MB  (the buffers the OLD path RE-CREATED every generation; A1 allocates ONCE/epoch then queue_writes deltas)", cap_buffer_bytes as f64 / 1e6);
+    println!("A1 per-move upload share : {:.4}% of the fixed-cap arena ({:.1} KB / {:.0} MB) — delta is O(changed), NOT O(resident)/O(capacity)",
+        100.0 * delta_bytes_mean / cap_buffer_bytes as f64, delta_bytes_mean / 1e3, cap_buffer_bytes as f64 / 1e6);
+    println!("per-move re-pack drop  : {:.0}× cheaper core ({f_mean:.2} ms full → {i_mean:.3} ms incremental); + the full per-gen BLAS rebuild is gone on non-topology moves", f_mean / i_mean.max(1e-6));
+    println!("NOTE: A1-β raw arena trades R2b's voxel-VRAM win on the STREAMED path for the O(changed) upload (each dense block is a 4KB raw 10³ grid, not a bit-packed stream); R2b is recovered later (A4.4 persistent interner).");
     println!("=============================================================================");
 
     // The O(changed) win: the incremental per-move re-pack is a small fraction of the full pack.
     assert!(i_mean < f_mean * 0.5, "incremental re-pack must be well under the full pack (got incr {i_mean:.3} ms vs full {f_mean:.2} ms)");
     // And the changed-slot count is O(shell), not O(resident).
     assert!(changed_mean < warm_resident as f64, "changed slots must be O(changed), not O(resident)");
+    // THE A1 GATE: a steady-state move's GPU upload is a TINY fraction of the fixed-cap arena the OLD path
+    // re-created every generation — the per-move hitch fix (the delta is O(changed), no full-buffer re-upload).
+    assert!(
+        delta_bytes_mean < cap_buffer_bytes as f64 * 0.05,
+        "A1: per-move GPU upload ({:.1} KB) must be ≪ the fixed-cap arena ({:.0} MB) the OLD path re-created each gen",
+        delta_bytes_mean / 1e3,
+        cap_buffer_bytes as f64 / 1e6,
+    );
 }
 
 // ============================================================================================

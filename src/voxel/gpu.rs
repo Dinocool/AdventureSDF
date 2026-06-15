@@ -383,6 +383,13 @@ impl GpuBrickPatch {
             return meta.uniform_block();
         }
         let off = meta.dense_offset() as usize;
+        // STORAGE PLAN A1-β — RAW-ARENA dense brick: `index_bits == 0` (bit 31 clear ⇒ not uniform) marks a
+        // raw `u32`-per-cell block (the STREAMED fixed-block voxel arena), decoded as `voxels[off + cell]`
+        // directly with no palette indirection. Mirror of the WGSL `cell_block` raw branch. The R2b paletted
+        // decode (`index_bits >= 1`) serves the static `pack_brickmap`/`pack_resident_set` path.
+        if meta.index_bits() == 0 {
+            return BlockId(self.voxels[off + cell] as u16);
+        }
         let pb = meta.palette_base as usize;
         let id = decode_paletted_cell(&self.brick_palettes_u16_from(pb), meta.index_bits(), &self.voxels[off..], cell);
         BlockId(id)
@@ -1168,6 +1175,27 @@ pub fn finalize_patch_palette_and_lights(patch: &mut GpuBrickPatch, registry: &B
     }
     push_palette(patch, registry);
     finalize_lights(patch, found);
+}
+
+/// Build the Phase-2.5 NEE light list + alias table from a RESIDENT-BRICK slice WITHOUT a contiguous patch
+/// (storage plan A1 — the O(changed) streamed upload ships only a [`RepackDelta`], so there is no assembled
+/// `GpuBrickPatch` to gather from). When the registry has NO emitters (the common worldgen / Sponza case) this
+/// is FREE — it returns empty lists, so a non-emissive scene's per-generation light build costs nothing. When
+/// emitters DO exist (Cornell's ceiling panel, lava worldgen) it packs the resident set once to gather the
+/// air-exposed emissive faces (bounded by `MAX_VOXEL_LIGHTS`) — the same O(resident) cost the old contiguous
+/// path already paid every re-pack. The light list is derived through the SAME [`pack_resident_set`] tail
+/// (`finalize_lights`) so it can never drift from the static/full path.
+pub fn build_lights_from_entries(
+    entries: &[ResidentBrick<'_>],
+    registry: &BlockRegistry,
+) -> (Vec<GpuVoxelLight>, Vec<GpuAliasEntry>) {
+    if !registry.has_emitters() {
+        return (Vec::new(), Vec::new());
+    }
+    // Emissive scene: pack the resident set once to gather the air-exposed emissive faces through the SSOT
+    // (bounded + rare; the old contiguous path ran this every re-pack too).
+    let patch = pack_resident_set(entries, registry);
+    (patch.lights, patch.alias)
 }
 
 /// Gather every AIR-EXPOSED emissive voxel of one packed brick into `found` (Phase 2.5 NEE). A voxel is an
