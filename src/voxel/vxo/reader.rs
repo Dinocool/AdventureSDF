@@ -138,8 +138,9 @@ impl VxoFile {
 
     /// Decompress + parse a region body (sliced from `BRIK` by its `BIDX` entry) into a [`DecodedRegion`]
     /// (§B2.2 step 4). Branches on the EXPLICIT `dir.compression` byte ([`VXO_REGION_STORE`]/[`VXO_REGION_ZSTD`]),
-    /// NOT on length equality: STORE casts in place; zstd decodes (pure-Rust `ruzstd`) into a `brik_raw_len`
-    /// buffer.
+    /// NOT on length equality: STORE borrows the span directly (no decompress); zstd decodes (pure-Rust
+    /// `ruzstd`) into a `brik_raw_len` buffer. Either way `parse_region` then COPIES the entry/palette/index
+    /// fields out via unaligned reads (the region bytes aren't guaranteed 4/32-aligned) — see `decode_region_span`.
     pub fn decode_region(&self, dir: &VxoRegionDirEntry) -> anyhow::Result<DecodedRegion> {
         let start = dir.brik_offset as usize;
         let end = start + dir.brik_comp_len as usize;
@@ -154,8 +155,11 @@ impl VxoFile {
 /// `BIDX` entry addresses) into a [`DecodedRegion`] (`VXO_FORMAT.md` §B2.2 step 4) — the SHARED decode SSOT
 /// for BOTH the full-file [`VxoFile::decode_region`] (in-RAM `BRIK` slice) and the streamed
 /// [`super::source::VxoSource`] (an mmap slice). Branches on the EXPLICIT `dir.compression` byte
-/// ([`VXO_REGION_STORE`]/[`VXO_REGION_ZSTD`]), NOT on length equality: STORE parses the slice in place; zstd
-/// decodes (pure-Rust `ruzstd`) into a `brik_raw_len` buffer. Verifies the region header's coord matches the
+/// ([`VXO_REGION_STORE`]/[`VXO_REGION_ZSTD`]), NOT on length equality: STORE borrows the slice (no decompress);
+/// zstd decodes (pure-Rust `ruzstd`) into a `brik_raw_len` buffer. `parse_region` then COPIES the region's
+/// entry table + palette/index blobs out of that slice via UNALIGNED reads (`pod_read_unaligned`/`u32_prefix`
+/// into owned `Vec`s) — region bodies are concatenated without inter-region padding so the slice isn't
+/// guaranteed POD-aligned; it is NOT a zero-copy in-place cast. Verifies the region header's coord matches the
 /// `BIDX` key. Keeping this a free function over a `&[u8]` means the loader never copies the whole `BRIK`.
 pub fn decode_region_span(comp: &[u8], dir: &VxoRegionDirEntry) -> anyhow::Result<DecodedRegion> {
     let expected = IVec3::new(dir.region_coord[0], dir.region_coord[1], dir.region_coord[2]);

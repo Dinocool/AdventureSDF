@@ -122,6 +122,44 @@ fn gate2_streamed_brick_matches_static() {
     let _ = std::fs::remove_file(&path);
 }
 
+/// **Gate 2b — LOD-SWEEP brick parity (the coarse-LOD regression gate).** The streamed `VxoSource` must serve
+/// COARSE bricks by downsampling the streamed LOD0 data BIT-IDENTICALLY to `StaticVoxSource::brick(coord, lod)`
+/// at EVERY lod (the §B1.7 option-(a) parity FIX). This is the gate that would have caught the pre-fix BLOCKER
+/// (where `lod>0` read the LOD0 grid at the coarse coord ⇒ wrong-location/un-downsampled data): it sweeps
+/// `lod ∈ 0..=MAX_LOD` (+ one past, exercising the clamp) over a map of mixed solid/air bricks so the coarse
+/// cells downsample a mix of solid + air children (the dominant-block + solid-if-any reducer), and asserts
+/// bit-identity. On `731e2601` (pre-fix) the `lod>0` rows FAIL; after the fix every row matches.
+#[test]
+fn gate2b_lod_sweep_brick_matches_static() {
+    let map = build_map();
+    let reg = registry();
+    let path = write_store(&map, &reg, "gate2b");
+
+    let (vxo, vxo_reg) = VxoSource::open(&path).expect("open streamed VxoSource");
+    let stat = StaticVoxSource::new(&map);
+
+    // The coords that ACTUALLY span the pyramid: the LOD-`lod` coord covering each stored fine brick (so the
+    // coarse footprint genuinely aggregates that brick), plus absent neighbours + far air. We sweep every coord
+    // at every lod, mapping the fine coord down to the level grid (`fine.div_euclid(2^lod)`).
+    let fine_coords = coords_to_probe(&map);
+    for lod in 0..=crate::voxel::brickmap::MAX_LOD + 1 {
+        let scale = 1i32 << lod.min(crate::voxel::brickmap::MAX_LOD);
+        // Collect the level-grid coords (dedup so we don't re-probe the same coarse cell many times).
+        let mut level_coords: Vec<IVec3> = fine_coords
+            .iter()
+            .map(|c| IVec3::new(c.x.div_euclid(scale), c.y.div_euclid(scale), c.z.div_euclid(scale)))
+            .collect();
+        level_coords.sort_by_key(|c| (c.z, c.y, c.x));
+        level_coords.dedup();
+        for coord in &level_coords {
+            let want = stat.brick(*coord, lod, &reg);
+            let got = vxo.brick(*coord, lod, &vxo_reg);
+            assert_eq!(got, want, "streamed brick at {coord:?} lod {lod} must be bit-identical to the static source");
+        }
+    }
+    let _ = std::fs::remove_file(&path);
+}
+
 /// **Gate 3 — classify parity.** Build a 3×3×3 block of full bricks (interior + faces + corners) plus an
 /// absent region, write it, and assert `VxoSource::classify(coord, lod) == StaticVoxSource::classify(coord,
 /// lod)` for every probed coord/LOD — the surface-only enclosed-cull is preserved on the `.vxo` path.
@@ -146,8 +184,8 @@ fn gate3_classify_matches_static() {
     let (vxo, _vxo_reg) = VxoSource::open(&path).expect("open");
     let stat = StaticVoxSource::new(&map);
 
-    // Probe the whole block (incl. centre/faces/corners), the partial brick, and surrounding air, at LOD0 and a
-    // coarse LOD (both sources return Surface for coarse — no baked LODS).
+    // Probe the whole block (incl. centre/faces/corners), the partial brick, and surrounding air, at LOD0 and
+    // coarse LODs (coarse classify is demand-downsampled now, so it matches the static source's coarse cull).
     let mut probe: Vec<IVec3> = Vec::new();
     for z in -1..=3 {
         for y in -1..=3 {
@@ -159,23 +197,26 @@ fn gate3_classify_matches_static() {
     probe.push(IVec3::new(20, 20, 20));
     probe.push(IVec3::new(100, 0, 0));
 
-    // LOD0 parity is the meaningful gate: both sources serve the SAME LOD0 brick grid, so the enclosed-cull
-    // must agree brick-for-brick (Interior/Surface/Air). (Coarse-LOD classify genuinely DIFFERS by design:
-    // StaticVoxSource downsamples a coarse pyramid in RAM and can classify on the coarse grid, whereas the
-    // `.vxo` path defers LODS (§B1.7) and conservatively returns Surface for any lod>0 — asserted separately.)
-    for coord in &probe {
-        let want = stat.classify(*coord, 0);
-        let got = vxo.classify(*coord, 0);
-        assert_eq!(got, want, "LOD0 classify parity at {coord:?}");
+    // Classify parity at LOD0 AND coarse LODs: both sources serve a bit-identical brick grid (coarse via the
+    // shared downsample SSOT), so the enclosed-cull must agree brick-for-brick (Interior/Surface/Air) at every
+    // level — the §B2.5 parity is now full, not LOD0-only (coarse LODs are demand-downsampled, not deferred).
+    for &lod in &[0u32, 1, 2, 3] {
+        for coord in &probe {
+            let want = stat.classify(*coord, lod);
+            let got = vxo.classify(*coord, lod);
+            assert_eq!(got, want, "classify parity at {coord:?} lod {lod}");
+        }
     }
-    // Spot-check the cull actually fired: the centre is Interior, a face is Surface, outside is Air.
+    // Spot-check the cull actually fired at LOD0: the centre is Interior, a face is Surface, outside is Air.
     assert_eq!(vxo.classify(IVec3::new(1, 1, 1), 0), BrickClass::Interior, "buried centre ⇒ Interior");
     assert_eq!(vxo.classify(IVec3::new(1, 1, 0), 0), BrickClass::Surface, "face brick ⇒ Surface");
     assert_eq!(vxo.classify(IVec3::new(50, 50, 50), 0), BrickClass::Air, "absent ⇒ Air");
-    // Coarse-LOD (no baked LODS) is conservatively Surface for every coord — the documented §B2.5 behaviour.
-    for coord in &probe {
-        assert_eq!(vxo.classify(*coord, 2), BrickClass::Surface, "coarse-lod .vxo classify ⇒ Surface (no LODS)");
-    }
+    // Past MAX_LOD, classify clamps to a conservative Surface (mirrors StaticVoxSource's clamped-level guard).
+    assert_eq!(
+        vxo.classify(IVec3::new(0, 0, 0), crate::voxel::brickmap::MAX_LOD + 1),
+        stat.classify(IVec3::new(0, 0, 0), crate::voxel::brickmap::MAX_LOD + 1),
+        "past-MAX_LOD classify clamps like the static source"
+    );
     let _ = std::fs::remove_file(&path);
 }
 

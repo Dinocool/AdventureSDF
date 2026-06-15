@@ -335,44 +335,77 @@ impl BrickSource for StaticVoxSource {
 /// each into its coarse brick — so the cost is `O(source voxels)`, and over the whole pyramid the work is
 /// geometric (`Σ 1/8^k`), bounded by `8/7 ×` the fine map. The coarse brick `c` covers source bricks
 /// `[2c, 2c+2)` per axis; coarse voxel `v` (in `[0,8)`) aggregates source voxels `[2v, 2v+2)`.
+///
+/// Per coarse brick this routes through the [`downsample_children`] SSOT, so the in-RAM pyramid here and the
+/// on-demand coarse-brick synthesis in [`super::vxo::source::VxoSource`] are GUARANTEED bit-identical (one
+/// reducer, one octant layout — robust by construction). This map-level driver only gathers the 8 children of
+/// each coarse brick from the sparse source and hands them off.
 fn downsample_brickmap(fine: &BrickMap) -> BrickMap {
-    // Accumulate per coarse brick: the 512 coarse voxels' (count-map, best) tallies. Keyed by coarse coord.
-    let mut coarse_voxels: FxHashMap<IVec3, Box<[BlockId; BRICK_VOXELS]>> = FxHashMap::default();
-    // For each coarse voxel we need the dominant child block; tally children then resolve. To stay sparse +
-    // cheap we walk the FINE bricks and, for each solid fine voxel, bump the count for its coarse voxel.
-    let mut counts: FxHashMap<(IVec3, usize), FxHashMap<u16, u32>> = FxHashMap::default();
-    for (fc, brick) in fine.iter() {
-        // The coarse brick this fine brick contributes to: each axis halves (Euclidean for negatives), and the
-        // fine brick's 8 voxels map to coarse voxels [fc&1 ? 4 : 0 .. +4) along that axis.
-        let cc = IVec3::new(fc.x.div_euclid(2), fc.y.div_euclid(2), fc.z.div_euclid(2));
-        // The fine brick's offset (0 or 1) within its coarse brick, ×4 = the coarse-voxel base it writes into.
-        let base = IVec3::new(fc.x.rem_euclid(2), fc.y.rem_euclid(2), fc.z.rem_euclid(2)) * (BRICK_EDGE / 2);
-        for fz in 0..BRICK_EDGE {
-            for fy in 0..BRICK_EDGE {
-                for fx in 0..BRICK_EDGE {
-                    let b = brick.get(fx, fy, fz);
-                    if b.is_air() {
-                        continue;
-                    }
-                    // The coarse voxel this fine voxel falls in: base + fine/2.
-                    let cv = base + IVec3::new(fx / 2, fy / 2, fz / 2);
-                    let ci = voxel_index(cv.x, cv.y, cv.z);
-                    *counts.entry((cc, ci)).or_default().entry(b.0).or_insert(0) += 1;
-                }
+    // Every coarse brick that any source brick contributes to (a source brick `fc` feeds coarse `fc/2`).
+    let mut coarse_coords: rustc_hash::FxHashSet<IVec3> = rustc_hash::FxHashSet::default();
+    for (fc, _) in fine.iter() {
+        coarse_coords.insert(IVec3::new(fc.x.div_euclid(2), fc.y.div_euclid(2), fc.z.div_euclid(2)));
+    }
+    let mut out = BrickMap::new();
+    for cc in coarse_coords {
+        // Gather the 8 children of this coarse brick (octant `(ox,oy,oz)` ⇒ source brick `2cc + (ox,oy,oz)`).
+        let children = gather_children(cc, |c| fine.get(c).cloned());
+        out.insert(cc, downsample_children(&children));
+    }
+    out
+}
+
+/// Gather the 8 children of coarse brick `cc` (on the next-finer grid) via `fetch`, indexed by OCTANT:
+/// `children[ox + oy·2 + oz·4]` is the finer brick at `2·cc + (ox, oy, oz)` (or `None` if absent ⇒ all-air).
+/// The single octant-layout SSOT shared by the in-RAM pyramid ([`downsample_brickmap`]) and the streamed
+/// coarse-brick synthesis ([`super::vxo::source::VxoSource`]).
+pub(crate) fn gather_children(cc: IVec3, mut fetch: impl FnMut(IVec3) -> Option<Brick>) -> [Option<Brick>; 8] {
+    let mut children: [Option<Brick>; 8] = Default::default();
+    for oz in 0..2 {
+        for oy in 0..2 {
+            for ox in 0..2 {
+                let fc = IVec3::new(cc.x * 2 + ox, cc.y * 2 + oy, cc.z * 2 + oz);
+                children[(ox + oy * 2 + oz * 4) as usize] = fetch(fc);
             }
         }
     }
-    // Resolve each coarse voxel's dominant block (lowest-id tie-break) into its coarse brick array.
-    for ((cc, ci), tally) in &counts {
-        let block = dominant_block(tally);
-        let arr = coarse_voxels.entry(*cc).or_insert_with(|| Box::new([BlockId::AIR; BRICK_VOXELS]));
-        arr[*ci] = block;
+    children
+}
+
+/// Downsample one coarse brick from its 8 finer children by `2³` — the SHARED DOWNSAMPLE SSOT (`source.rs`):
+/// each coarse voxel `cv ∈ [0,8)³` aggregates the `2×2×2` finer voxels under it, SOLID iff ANY child voxel is
+/// solid, its block the DOMINANT (most-frequent) solid child with a LOWEST-[`BlockId`] tie-break (deterministic
+/// regardless of iteration order). `children[ox + oy·2 + oz·4]` is the finer brick at octant `(ox,oy,oz)` (the
+/// [`gather_children`] layout); `None` ⇒ that octant is all-air. The coarse voxel `cv` lives in octant
+/// `cv / 4`; within that child it covers finer voxels `[(cv % 4)·2, +2)` per axis. Both the in-RAM
+/// [`downsample_brickmap`] and the on-demand streamed pyramid call THIS, so a coarse `.vxo` brick is bit-for-bit
+/// the static-source coarse brick (the §B1.7 parity FIX).
+pub(crate) fn downsample_children(children: &[Option<Brick>; 8]) -> Brick {
+    let mut voxels = Box::new([BlockId::AIR; BRICK_VOXELS]);
+    for cz in 0..BRICK_EDGE {
+        for cy in 0..BRICK_EDGE {
+            for cx in 0..BRICK_EDGE {
+                // The child octant this coarse voxel falls in, and its `2³` finer-voxel base within that child.
+                let octant = (cx / 4 + (cy / 4) * 2 + (cz / 4) * 4) as usize;
+                let Some(child) = &children[octant] else { continue }; // absent octant ⇒ all-air
+                let base = IVec3::new((cx % 4) * 2, (cy % 4) * 2, (cz % 4) * 2);
+                // Tally the 2×2×2 finer solid blocks under this coarse voxel; resolve the dominant.
+                let mut tally: FxHashMap<u16, u32> = FxHashMap::default();
+                for dz in 0..2 {
+                    for dy in 0..2 {
+                        for dx in 0..2 {
+                            let b = child.get(base.x + dx, base.y + dy, base.z + dz);
+                            if !b.is_air() {
+                                *tally.entry(b.0).or_insert(0) += 1;
+                            }
+                        }
+                    }
+                }
+                voxels[voxel_index(cx, cy, cz)] = dominant_block(&tally);
+            }
+        }
     }
-    let mut out = BrickMap::new();
-    for (cc, arr) in coarse_voxels {
-        out.insert(cc, Brick::from_voxels(arr));
-    }
-    out
+    Brick::from_voxels(voxels)
 }
 
 /// The DOMINANT (most-frequent) block in a `block id → count` tally, tie-broken by the LOWEST [`BlockId`] so
