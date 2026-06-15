@@ -309,6 +309,39 @@ pub fn desired_clipmap(cam_world: [f32; 3], cfg: &StreamingConfig) -> FxHashMap<
     out
 }
 
+/// Decompose the clipmap SHELL `[lo, hi] \ hole` (inclusive boxes) into up to SIX DISJOINT, hole-free
+/// sub-boxes whose union is EXACTLY the shell — the SSOT used by [`desired_clipmap_surface`] to query the
+/// source's surface only over the shell, never the (ceded) hole interior. The standard "box minus a strictly
+/// interior centred-ish cuboid" split: peel the two X-end slabs (full Y,Z), then within the remaining X-band
+/// peel the two Y-end slabs (full Z), then within that the two Z-end slabs — so every shell brick lands in
+/// exactly one sub-box and no hole brick lands in any. `None` hole (LOD0) ⇒ the single full box. A degenerate
+/// empty slab (the hole touches a face) is simply not emitted. APPENDS to `out`.
+#[inline]
+fn shell_subboxes(lo: IVec3, hi: IVec3, hole: Option<(IVec3, IVec3)>, out: &mut Vec<(IVec3, IVec3)>) {
+    let Some((hlo, hhi)) = hole else {
+        out.push((lo, hi)); // LOD0: the solid inner box, no hole
+        return;
+    };
+    let push = |out: &mut Vec<(IVec3, IVec3)>, a: IVec3, b: IVec3| {
+        if a.x <= b.x && a.y <= b.y && a.z <= b.z {
+            out.push((a, b));
+        }
+    };
+    // X-end slabs (full Y, Z).
+    push(out, IVec3::new(lo.x, lo.y, lo.z), IVec3::new(hlo.x - 1, hi.y, hi.z));
+    push(out, IVec3::new(hhi.x + 1, lo.y, lo.z), IVec3::new(hi.x, hi.y, hi.z));
+    // Middle X-band [hlo.x, hhi.x]: peel the Y-end slabs (full Z).
+    let mx_lo = hlo.x.max(lo.x);
+    let mx_hi = hhi.x.min(hi.x);
+    push(out, IVec3::new(mx_lo, lo.y, lo.z), IVec3::new(mx_hi, hlo.y - 1, hi.z));
+    push(out, IVec3::new(mx_lo, hhi.y + 1, lo.z), IVec3::new(mx_hi, hi.y, hi.z));
+    // Middle X,Y-band: peel the Z-end slabs (this is all that remains around the hole's Z extent).
+    let my_lo = hlo.y.max(lo.y);
+    let my_hi = hhi.y.min(hi.y);
+    push(out, IVec3::new(mx_lo, my_lo, lo.z), IVec3::new(mx_hi, my_hi, hlo.z - 1));
+    push(out, IVec3::new(mx_lo, my_lo, hhi.z + 1), IVec3::new(mx_hi, my_hi, hi.z));
+}
+
 /// **SHELL-FIRST desired clipmap (D1d)** — the candidate surface keys to consider for residency, enumerated
 /// `Θ(H²)` DIRECTLY from the source's surface query instead of the `Θ(H³)` cube
 /// ([`desired_clipmap`]). This is the SSOT enumeration the live [`ResidencyManager::update`] uses.
@@ -345,26 +378,56 @@ pub fn desired_clipmap_surface(
     source: &dyn BrickSource,
 ) -> FxHashMap<BrickKey, ()> {
     let half = cfg.clip_half_bricks;
+    // PARALLEL over LODs (D1d): each level is independent (its `(coord, lod)` keys don't collide with another
+    // level's — the lod is in the key), and the source's `surface_bricks_in` is a pure `Sync` function, so we
+    // build each level's clipped candidate list on the compute pool and merge them serially. This parallelizes
+    // the per-column surface query (e.g. worldgen's 9 height taps × the shell columns), the bulk of the
+    // enumeration cost at clip_half 160. The merge order is irrelevant (the keys are a set). `get_or_init`:
+    // the running app already inited the pool; the headless harness/tests have none, so init a default.
+    use bevy::tasks::{ComputeTaskPool, ParallelSlice};
+    let lods: Vec<u32> = (0..=MAX_LOD).collect();
+    let pool = ComputeTaskPool::get_or_init(bevy::tasks::TaskPool::default);
+    let per_lod: Vec<Vec<BrickKey>> = lods
+        .par_chunk_map(pool, 1, |_, chunk| {
+            let mut keys: Vec<BrickKey> = Vec::new();
+            let mut candidates: Vec<IVec3> = Vec::new();
+            let mut subboxes: Vec<(IVec3, IVec3)> = Vec::with_capacity(6);
+            for &lod in chunk {
+                let (lo, hi) = level_box(cam_world, lod, half);
+                let hole = level_hole(cam_world, lod, half);
+                // SHELL DECOMPOSITION: `surface_bricks_in` over the FULL box would visit every column of the
+                // box — and for a coarse level the box is ~99% HOLE (ceded to the finer level), so the source
+                // would pay a per-column surface query for ~H³ hole-interior columns that are all clipped away.
+                // Instead split `level_box \ level_hole` into ≤6 DISJOINT hole-free slabs (`shell_subboxes`) and
+                // query ONLY those — so the source visits just the SHELL columns, never the hole interior. The
+                // post-clip below still box+hole-clips (a no-op for the disjoint slabs, kept as the safety net
+                // for a source whose `surface_bricks_in` over-yields at the slab edges).
+                subboxes.clear();
+                shell_subboxes(lo, hi, hole, &mut subboxes);
+                candidates.clear();
+                for &(slo, shi) in &subboxes {
+                    source.surface_bricks_in(slo, shi, lod, &mut candidates);
+                }
+                for &coord in &candidates {
+                    // BOX-CLIP exactly as the cube path: a candidate the source over-yielded outside the level
+                    // box — or inside the finer level's hole — is dropped, so the per-level tiling is identical.
+                    if !in_box(coord, lo, hi) {
+                        continue;
+                    }
+                    if let Some((hlo, hhi)) = hole
+                        && in_box(coord, hlo, hhi)
+                    {
+                        continue; // ceded to the finer level — no overlap
+                    }
+                    keys.push(BrickKey { coord, lod });
+                }
+            }
+            keys
+        });
     let mut out: FxHashMap<BrickKey, ()> = FxHashMap::default();
-    let mut candidates: Vec<IVec3> = Vec::new();
-    for lod in 0..=MAX_LOD {
-        let (lo, hi) = level_box(cam_world, lod, half);
-        let hole = level_hole(cam_world, lod, half);
-        // Ask the source for a conservative superset of the surface bricks in this level's box (Θ(H²)).
-        candidates.clear();
-        source.surface_bricks_in(lo, hi, lod, &mut candidates);
-        for &coord in &candidates {
-            // BOX-CLIP exactly as the cube path: a candidate the source over-yielded outside the level box —
-            // or inside the finer level's hole — is dropped, so the per-level tiling is bit-identical.
-            if !in_box(coord, lo, hi) {
-                continue;
-            }
-            if let Some((hlo, hhi)) = hole
-                && in_box(coord, hlo, hhi)
-            {
-                continue; // ceded to the finer level — no overlap
-            }
-            out.insert(BrickKey { coord, lod }, ());
+    for keys in per_lod {
+        for k in keys {
+            out.insert(k, ());
             if out.len() > MAX_CLIP_ENUMERATION {
                 // Defensive ceiling — now Θ(H²), so it does NOT bind at the shipping clip_half. A source whose
                 // surface query degenerated to the full box (the default) could still hit it; bail as before.
@@ -544,20 +607,54 @@ impl ResidencyManager {
         // to the surface SHELL below (NOT the clip VOLUME in `desired_clipmap`). So a far buried-interior / sky
         // brick — which `classify` prunes anyway — can never steal a slot from a near surface brick; the cap
         // bounds Θ(H²) surface, not Θ(H³) volume.
+        //
+        // PARALLEL classify (D1d): the un-memoized candidate set is large at clip_half 160 (the full Surface
+        // sheet across 8 LODs is millions of bricks — the surface enumeration is `Θ(H²)`-per-level but the
+        // constant is big), and `classify` is a PURE `Sync` function (no `self` mutation), so we classify the
+        // batch IN PARALLEL on the compute pool and merge the verdicts serially. The merge order doesn't matter:
+        // `pruned` is a set, and `surface_candidates` is re-sorted by world distance for the cap below. This is
+        // the single largest `update` cost (was the ~38 s single-threaded D1c hot spot); parallelizing it across
+        // the cores is the bulk of the D1d speedup, exactly correctness-preserving (deterministic per-key verdict).
+        use bevy::tasks::{ComputeTaskPool, ParallelSlice};
+        let to_classify: Vec<BrickKey> = desired
+            .keys()
+            .filter(|key| {
+                !self.resident.contains_key(key)
+                    && !self.queued.contains(key)
+                    && !self.empty.contains(key)
+                    && !self.pruned.contains(key)
+            })
+            .copied()
+            .collect();
         let mut surface_candidates: Vec<BrickKey> = Vec::new();
-        for key in desired.keys() {
-            if self.resident.contains_key(key)
-                || self.queued.contains(key)
-                || self.empty.contains(key)
-                || self.pruned.contains(key)
-            {
-                continue;
-            }
-            match source.classify(key.coord, key.lod) {
-                BrickClass::Surface => surface_candidates.push(*key),
-                BrickClass::Air | BrickClass::Interior => {
-                    // Provably unhittable — prune (memoized so we don't re-classify it every move).
-                    self.pruned.insert(*key);
+        if source.surface_bricks_are_exact() {
+            // EXACT-source fast path (D1d): `surface_bricks_in` already yields EXACTLY the `Surface` set (e.g.
+            // WorldgenSource — the candidate band IS classify's band), so re-classifying every candidate is pure
+            // redundant work (the ~38 s D1c hot spot was 9 height taps × every key, paid TWICE otherwise). Skip
+            // it: every candidate is a surface candidate. The set is bit-identical to classifying (proven by
+            // `worldgen_surface_bricks_in_equals_classify` + the D1d oracle), just without the second pass.
+            surface_candidates = to_classify;
+        } else {
+            // SUPERSET source: `surface_bricks_in` is a conservative superset (e.g. StaticVox yields occupied
+            // bricks incl. buried `Interior`), so classify each candidate in PARALLEL (a pure `Sync` fn) and
+            // keep only `Surface`. The merge order is irrelevant (pruned is a set; surface_candidates is
+            // re-sorted by distance for the cap below).
+            let pool = ComputeTaskPool::get_or_init(bevy::tasks::TaskPool::default);
+            let chunk = to_classify.len().div_ceil(pool.thread_num().max(1)).max(1);
+            let verdicts: Vec<(BrickKey, BrickClass)> = to_classify
+                .par_chunk_map(pool, chunk, |_, ks| {
+                    ks.iter().map(|&k| (k, source.classify(k.coord, k.lod))).collect::<Vec<_>>()
+                })
+                .into_iter()
+                .flatten()
+                .collect();
+            for (key, class) in verdicts {
+                match class {
+                    BrickClass::Surface => surface_candidates.push(key),
+                    BrickClass::Air | BrickClass::Interior => {
+                        // Provably unhittable — prune (memoized so we don't re-classify it every move).
+                        self.pruned.insert(key);
+                    }
                 }
             }
         }
@@ -1193,13 +1290,16 @@ mod tests {
             }
         }
         fn surface_bricks_in(&self, lo: IVec3, hi: IVec3, lod: u32, out: &mut Vec<IVec3>) {
-            const PAD: i32 = 1;
+            // Reuse the SHIPPING `WorldgenSource::surface_by_band` SSOT (classify's own non-Air ∧ non-Interior
+            // multiplicative predicate solved for the integer range), so the synthetic source mirrors the
+            // shipping source's exactness EXACTLY — the oracle's set-EQUALITY then validates that one band SSOT.
             let span = brick_span(lod) as f64;
             for bz in lo.z..=hi.z {
                 for bx in lo.x..=hi.x {
                     let (surf_min, surf_max) = self.surf_minmax(bx, bz, span);
-                    let by_lo = ((surf_min / span).floor() as i32 - 1 - PAD).max(lo.y);
-                    let by_hi = ((surf_max / span).floor() as i32 + PAD).min(hi.y);
+                    let (by_lo, by_hi) = WorldgenSource::surface_by_band(surf_min, surf_max, span);
+                    let by_lo = by_lo.max(lo.y);
+                    let by_hi = by_hi.min(hi.y);
                     for by in by_lo..=by_hi {
                         out.push(IVec3::new(bx, by, bz));
                     }
@@ -1228,6 +1328,41 @@ mod tests {
         let mut mgr = ResidencyManager::new();
         mgr.update(cam, cfg, src);
         mgr.queued.iter().copied().collect()
+    }
+
+    /// [`shell_subboxes`] decomposes `level_box \ level_hole` into DISJOINT sub-boxes whose union is EXACTLY
+    /// the shell — the property that lets [`desired_clipmap_surface`] query the source's surface ONLY over the
+    /// shell (never the ceded hole interior), which is what actually delivers the `Θ(H²)` cost. We verify it
+    /// brick-for-brick against the membership predicate ([`in_box`] of the box minus the hole) over a spread
+    /// of camera offsets + every LOD: the sub-boxes must (a) cover every shell brick exactly once and (b)
+    /// contain NO hole brick — so the union is the shell with no overlap and no leak.
+    #[test]
+    fn shell_subboxes_partition_the_shell_exactly() {
+        let half = 6;
+        for cam in [[0.5_f32, 0.5, 0.5], [7.4, 14.5, 17.7], [-7.05, -13.97, 6.04], [101.2, -50.7, 33.3]] {
+            for lod in 0..=MAX_LOD {
+                let (lo, hi) = level_box(cam, lod, half);
+                let hole = level_hole(cam, lod, half);
+                let mut subs = Vec::new();
+                shell_subboxes(lo, hi, hole, &mut subs);
+                // Count how many sub-boxes contain each brick of the full box; the shell ⇒ exactly 1, the hole
+                // ⇒ exactly 0. (Iterate the full box — small at half=6 — and check the partition.)
+                for z in lo.z..=hi.z {
+                    for y in lo.y..=hi.y {
+                        for x in lo.x..=hi.x {
+                            let c = IVec3::new(x, y, z);
+                            let in_hole = hole.is_some_and(|(hlo, hhi)| in_box(c, hlo, hhi));
+                            let cover = subs.iter().filter(|(a, b)| in_box(c, *a, *b)).count();
+                            if in_hole {
+                                assert_eq!(cover, 0, "hole brick {c:?} must be in NO sub-box (lod {lod}, cam {cam:?})");
+                            } else {
+                                assert_eq!(cover, 1, "shell brick {c:?} must be in EXACTLY one sub-box (lod {lod})");
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /// THE ORACLE: surface-first ≡ cube-then-classify, on cliff / thin-wall / LOD-seam / flat. Uses a

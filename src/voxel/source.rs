@@ -95,6 +95,26 @@ pub trait BrickSource: Sync {
         BrickClass::Surface
     }
 
+    /// **D1d — is [`surface_bricks_in`](Self::surface_bricks_in) EXACT (not merely a superset)?** When `true`,
+    /// the source GUARANTEES every coord it yields from `surface_bricks_in` would [`classify`](Self::classify)
+    /// as exactly [`BrickClass::Surface`] — so [`super::streaming::ResidencyManager::update`] may SKIP the
+    /// per-candidate `classify` re-confirm entirely (the candidates ARE the surface set). This removes the
+    /// redundant second pass for sources whose enumeration already computed the classify verdict
+    /// ([`WorldgenSource`]'s per-column band IS its classify band — same `column_surf_minmax` SSOT, so the
+    /// candidates are precisely the `Surface` bricks, never `Air`/`Interior`).
+    ///
+    /// DEFAULT = `false`: the candidate set is a conservative SUPERSET and `update` MUST `classify`-re-confirm
+    /// each (the safe contract — a source like [`super::source::StaticVoxSource`] yields occupied bricks
+    /// including buried `Interior` ones that the enclosed-cull classify still prunes). A source overrides this
+    /// to `true` ONLY when its `surface_bricks_in` is its `classify`-`Surface` set verbatim. The D1d oracle's
+    /// set-equality (`surface_bricks_in` filtered by `classify` == cube filtered by `classify`) plus this flag
+    /// being justified by a SHARED SSOT (the band) keeps it correct: skipping classify is then a NO-OP on the
+    /// resulting set, just faster.
+    #[inline]
+    fn surface_bricks_are_exact(&self) -> bool {
+        false
+    }
+
     /// **SHELL-FIRST ENUMERATION (D1d)** — yield a CONSERVATIVE SUPERSET of the bricks in the inclusive
     /// AABB `[lo, hi]` (on the LOD-`lod` brick grid) that [`classify`](Self::classify) could return
     /// [`BrickClass::Surface`] for. The whole point: the camera-following clipmap's resident set is the
@@ -214,25 +234,19 @@ impl BrickSource for WorldgenSource<'_> {
     /// XZ footprint, which already brackets CLIFFS: a steep slope's tall vertical wall of surface bricks
     /// between adjacent columns is covered because each column's taps reach one brick into its neighbours, so
     /// `surf_min`/`surf_max` of BOTH bordering columns span the cliff face). The vertical Surface range for a
-    /// column is then EXACTLY `classify`'s non-Air ∧ non-Interior `by`-band:
-    /// * non-Air     ⇔ `by·span < surf_max + span`      ⇔ `by <= floor((surf_max)/span)`            → `by_hi`,
-    /// * non-Interior⇔ `surf_min < (by+1)·span + span`  ⇔ `by >= floor((surf_min)/span) - 1`        → `by_lo`.
-    ///
-    /// We yield `by ∈ [by_lo, by_hi]` clamped to `[lo.y, hi.y]`, with a `+PAD`/`-PAD` (`PAD = 1`) safety
-    /// expansion: even though the band is derived from `classify`'s own formula (so it is already exact, not
-    /// merely a superset), the `±1` PAD absorbs any floating-point edge case at a brick boundary and keeps the
-    /// set a STRICT SUPERSET by construction — the downstream `classify` re-confirm prunes the pad's extra
-    /// rows for free. This is the property the D1d oracle test pins: the surface-first candidate set ⊇ every
-    /// `Surface` brick the full-cube path keeps (cliff, thin wall, LOD-seam, flat plane).
+    /// column is then EXACTLY `classify`'s non-Air ∧ non-Interior `by`-band (solved for the integer `by` range
+    /// in [`surface_by_band`](Self::surface_by_band) from the SAME `f64` quantities `classify` compares, so the
+    /// two agree brick-for-brick with NO rounding drift — the candidate set EQUALS the `Surface` set, not
+    /// merely a superset). This exactness is what lets [`surface_bricks_are_exact`](BrickSource::surface_bricks_are_exact)
+    /// return `true` (the residency then SKIPS the redundant per-candidate `classify` re-confirm), and the D1d
+    /// oracle test pins it: the surface-first candidate set == the cube path's `Surface` set on cliff / thin
+    /// wall / LOD-seam / flat.
     fn surface_bricks_in(&self, lo: IVec3, hi: IVec3, lod: u32, out: &mut Vec<IVec3>) {
-        const PAD: i32 = 1;
         let span = brick_span(lod) as f64;
         for bz in lo.z..=hi.z {
             for bx in lo.x..=hi.x {
                 let (surf_min, surf_max) = self.column_surf_minmax(bx, bz, span);
-                // The exact `classify` Surface band for this column (see the doc derivation), then padded.
-                let by_lo = (surf_min / span).floor() as i32 - 1 - PAD;
-                let by_hi = (surf_max / span).floor() as i32 + PAD;
+                let (by_lo, by_hi) = Self::surface_by_band(surf_min, surf_max, span);
                 let by_lo = by_lo.max(lo.y);
                 let by_hi = by_hi.min(hi.y);
                 for by in by_lo..=by_hi {
@@ -240,6 +254,55 @@ impl BrickSource for WorldgenSource<'_> {
                 }
             }
         }
+    }
+
+    /// `true` — worldgen's [`surface_bricks_in`](Self::surface_bricks_in) band IS its
+    /// [`classify`](Self::classify) `Surface` band EXACTLY (both from the shared
+    /// [`column_surf_minmax`](Self::column_surf_minmax) envelope; the `by`-band is `classify`'s OWN predicate
+    /// solved for the integer range in [`surface_by_band`](Self::surface_by_band)). Every yielded coord
+    /// classifies exactly `Surface` — never `Air`/`Interior` — so the residency may SKIP the redundant
+    /// per-candidate `classify` re-confirm. Pinned brick-for-brick by `worldgen_surface_bricks_in_equals_classify`.
+    #[inline]
+    fn surface_bricks_are_exact(&self) -> bool {
+        true
+    }
+}
+
+impl WorldgenSource<'_> {
+    /// The EXACT integer `by`-band `[by_lo, by_hi]` of LOD bricks (`span = brick_span(lod)`) a column with
+    /// height envelope `(surf_min, surf_max)` classifies as [`BrickClass::Surface`] — solved directly from
+    /// [`classify`](BrickSource::classify)'s float predicate so `surface_bricks_in` is EXACT (not a superset).
+    /// A brick `by` is `Surface` iff it is neither Air nor Interior:
+    /// * not **Air**      ⇔ `by·span < surf_max + span`     ⇔ `by < (surf_max + span)/span`,
+    /// * not **Interior** ⇔ `surf_min < (by+1)·span + span` ⇔ `by > surf_min/span - 2`.
+    ///
+    /// The bounds below seed from the closed-form `by ∈ ( surf_min/span − 2 , (surf_max + span)/span )` (open),
+    /// then SNAP each to satisfy `classify`'s EXACT MULTIPLICATIVE predicate (`by·span` compared to
+    /// `surf_max + span` / `surf_min`), NOT the division reformulation — so the band agrees with `classify`
+    /// bit-for-bit (a division `(surf_max+span)/span` is NOT bit-identical to the multiplication `by·span`, and
+    /// that 1-ULP drift would otherwise drop a boundary brick `classify` keeps, a render hole at an LOD seam).
+    /// Each snap converges in ≤1 step. `(by_lo, by_hi)` BEFORE the caller's level-box clamp; `by_lo > by_hi` ⇒
+    /// no surface brick in this column.
+    #[inline]
+    pub(crate) fn surface_by_band(surf_min: f64, surf_max: f64, span: f64) -> (i32, i32) {
+        // by_hi = largest integer with `by·span < surf_max + span` (classify's not-Air predicate, multiplicative).
+        let air_top = surf_max + span;
+        let mut by_hi = ((air_top) / span).floor() as i32; // seed
+        while (by_hi as f64) * span >= air_top {
+            by_hi -= 1; // too high — `by·span` reaches the Air threshold; step down
+        }
+        while ((by_hi + 1) as f64) * span < air_top {
+            by_hi += 1; // one more brick is still below the threshold (not-Air)
+        }
+        // by_lo = smallest integer with `surf_min < (by+1)·span + span` (classify's not-Interior, multiplicative).
+        let mut by_lo = (surf_min / span).floor() as i32 - 1; // seed
+        while surf_min >= ((by_lo + 1) as f64) * span + span {
+            by_lo += 1; // still Interior — `surf_min` is a full span above the brick top; step up
+        }
+        while surf_min < (by_lo as f64) * span + span {
+            by_lo -= 1; // the brick below is ALSO not-Interior — include it
+        }
+        (by_lo, by_hi)
     }
 }
 
@@ -868,6 +931,61 @@ mod tests {
             let via_src = src.brick(c, lod, &reg);
             let direct = voxelize_brick(c, lod, &layer, &lib, &reg, SEED);
             assert_eq!(via_src, direct, "WorldgenSource must equal voxelize_brick (SSOT pass-through)");
+        }
+    }
+
+    /// **D1d EXACTNESS GATE** — `WorldgenSource::surface_bricks_in` yields EXACTLY its `classify`-`Surface`
+    /// set, brick-for-brick, over a box: every coord it emits classifies `Surface`, AND every `Surface` brick
+    /// in the box is emitted. This is the invariant that justifies `surface_bricks_are_exact() == true` (the
+    /// residency skips the per-candidate `classify` re-confirm), so it must hold with NO off-by-one / float
+    /// drift. Checked over a spread of LODs (so coarse spans, where the band is several bricks tall, are
+    /// exercised) and a non-trivial XZ window of the real band-limited terrain (which includes slopes — the
+    /// cliff-ish case for the per-column band).
+    #[test]
+    fn worldgen_surface_bricks_in_equals_classify() {
+        let layer = HeightLayer::new(LayerId(0), HeightParams::default(), ErosionParams::default());
+        let lib = test_library();
+        let src = WorldgenSource::new(&layer, &lib, SEED);
+        for lod in [0u32, 1, 3, 5, 7] {
+            // A box around the surface at this LOD: find the surface brick-Y near the origin so the box straddles
+            // it, then take a 12×(tall)×12 brick window.
+            let span = brick_span(lod) as f64;
+            let h0 = layer.sample_world(0.0, 0.0, SEED).height as f64;
+            let cy = (h0 / span).floor() as i32;
+            let lo = IVec3::new(-6, cy - 8, -6);
+            let hi = IVec3::new(5, cy + 8, 5);
+            // The emitted candidate set.
+            let mut emitted: Vec<IVec3> = Vec::new();
+            src.surface_bricks_in(lo, hi, lod, &mut emitted);
+            let emitted: rustc_hash::FxHashSet<IVec3> = emitted.into_iter().collect();
+            // The ground-truth Surface set: classify EVERY brick in the box.
+            let mut classify_surface: rustc_hash::FxHashSet<IVec3> = rustc_hash::FxHashSet::default();
+            for z in lo.z..=hi.z {
+                for y in lo.y..=hi.y {
+                    for x in lo.x..=hi.x {
+                        let c = IVec3::new(x, y, z);
+                        if matches!(src.classify(c, lod), BrickClass::Surface) {
+                            classify_surface.insert(c);
+                        }
+                    }
+                }
+            }
+            // EXACT equality — no Air/Interior emitted (exactness ⇒ skip-classify is sound) and no Surface missed
+            // (no render hole). Diagnose the first divergence on either side.
+            for c in &emitted {
+                assert!(
+                    classify_surface.contains(c),
+                    "LOD{lod}: surface_bricks_in emitted {c:?} but classify says it is NOT Surface (exactness violated)"
+                );
+            }
+            for c in &classify_surface {
+                assert!(
+                    emitted.contains(c),
+                    "LOD{lod}: classify says {c:?} is Surface but surface_bricks_in did NOT emit it (a render hole)"
+                );
+            }
+            assert_eq!(emitted, classify_surface, "LOD{lod}: surface_bricks_in must EQUAL classify's Surface set");
+            assert!(!emitted.is_empty(), "LOD{lod}: the box straddles the surface, so the set is non-empty");
         }
     }
 
