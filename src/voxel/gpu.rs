@@ -637,6 +637,76 @@ impl VoxelInterner {
     }
 }
 
+/// **Storage plan R2 — a brick's haloed cells encoded as a tiny palette + bit-packed indices.** A dense brick
+/// touches only `k` distinct block ids (a strata band, a couple of surface materials); storing a
+/// `ceil(log2 k)`-bit INDEX per cell + a `k`-entry palette is far smaller than a `u32` id per cell.
+///
+/// `index_bits` is restricted to a POWER OF 2 in `{1,2,4,8,16}` (the smallest that fits `k`). Because each of
+/// those divides 32, a cell's index NEVER straddles a `u32` word boundary — so the GPU `dda_brick` decode is a
+/// single fetch + shift + mask (R2b), with no 2-word straddle path. The (small) cost is rounding `k=3` up to
+/// 2-bit etc.; the simplicity + the no-straddle guarantee are worth it. (R1's uniform brick is the degenerate
+/// `k=1` case and is handled separately — a dense brick here always has `k >= 2`.)
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PalettedBrick {
+    /// The distinct block ids, indexed by the packed indices (first-seen order). Length `k` (`>= 1`).
+    pub palette: Vec<u16>,
+    /// Bits per index ∈ `{1,2,4,8,16}` — the smallest power of 2 with `2^index_bits >= k`.
+    pub index_bits: u8,
+    /// The bit-packed index stream: `ceil(cells.len() * index_bits / 32)` `u32` words.
+    pub indices: Vec<u32>,
+}
+
+/// The smallest power-of-2 bit width in `{1,2,4,8,16}` that can index `k` distinct ids (`2^bits >= k`).
+fn pow2_index_bits(k: usize) -> u8 {
+    // ceil(log2 k) for k >= 2; k <= 1 still needs 1 bit (a single 0 index).
+    let needed = if k <= 1 { 1 } else { usize::BITS - (k - 1).leading_zeros() };
+    match needed {
+        0 | 1 => 1,
+        2 => 2,
+        3 | 4 => 4,
+        5..=8 => 8,
+        _ => 16,
+    }
+}
+
+/// Encode a brick's haloed `cells` (one block id per cell, as the packer produces them — `u16` zero-extended
+/// into `u32`) into a [`PalettedBrick`]. The inverse is [`decode_paletted_cell`]; the round-trip is exact.
+pub fn encode_paletted(cells: &[u32]) -> PalettedBrick {
+    let mut palette: Vec<u16> = Vec::new();
+    let mut id_to_idx: rustc_hash::FxHashMap<u16, u32> = rustc_hash::FxHashMap::default();
+    let mut locals: Vec<u32> = Vec::with_capacity(cells.len());
+    for &c in cells {
+        let id = c as u16;
+        let idx = *id_to_idx.entry(id).or_insert_with(|| {
+            let i = palette.len() as u32;
+            palette.push(id);
+            i
+        });
+        locals.push(idx);
+    }
+    let index_bits = pow2_index_bits(palette.len());
+    let bits = index_bits as usize;
+    let words = (cells.len() * bits).div_ceil(32);
+    let mut indices = vec![0u32; words];
+    let mask = if bits == 32 { u32::MAX } else { (1u32 << bits) - 1 };
+    for (i, &idx) in locals.iter().enumerate() {
+        let bit = i * bits;
+        // index_bits ∈ {1,2,4,8,16} all divide 32 ⇒ a cell never straddles a word ⇒ one word, one shift.
+        indices[bit / 32] |= (idx & mask) << (bit % 32);
+    }
+    PalettedBrick { palette, index_bits, indices }
+}
+
+/// Decode cell `i`'s block id from a paletted brick — the exact inverse of [`encode_paletted`]. The GPU
+/// `dda_brick` does this same single-word fetch + shift + mask (R2b); this is the CPU oracle for it.
+pub fn decode_paletted_cell(palette: &[u16], index_bits: u8, indices: &[u32], i: usize) -> u16 {
+    let bits = index_bits as usize;
+    let bit = i * bits;
+    let mask = if bits == 32 { u32::MAX } else { (1u32 << bits) - 1 };
+    let idx = (indices[bit / 32] >> (bit % 32)) & mask;
+    palette[idx as usize]
+}
+
 pub fn pack_resident_set(entries: &[ResidentBrick<'_>], registry: &BlockRegistry) -> GpuBrickPatch {
     let mut patch = GpuBrickPatch {
         aabbs: Vec::with_capacity(entries.len()),
@@ -1420,6 +1490,31 @@ mod tests {
         let offsets: std::collections::HashSet<u32> = patch.metas.iter().map(|m| m.dense_offset()).collect();
         assert_eq!(offsets.len(), 1, "four identical bricks dedup to one slice");
         assert_eq!(patch.voxels.len(), halo_cells(0), "the deduped voxel buffer holds exactly one haloed slice");
+    }
+
+    /// R2 (palette + bit-pack): encoding a brick's haloed cells then decoding each cell round-trips EXACTLY,
+    /// across a range of distinct-id counts `k` spanning every bit width (1/2/4/8/16); the chosen width is the
+    /// smallest power of 2 that fits `k`; and the packed stream is far smaller than the `u32`-per-cell baseline
+    /// (the storage win). `decode_paletted_cell` IS the CPU oracle the GPU `dda_brick` decode (R2b) must match.
+    #[test]
+    fn r2_paletted_brick_roundtrips_at_every_width() {
+        for (k, want_bits) in [(2usize, 1u8), (3, 2), (4, 2), (5, 4), (16, 4), (17, 8), (256, 8), (300, 16)] {
+            // `halo_cells(0)` cells cycling through `k` distinct ids (1..=k), so all k appear in the palette.
+            let cells: Vec<u32> = (0..halo_cells(0)).map(|i| ((i % k) + 1) as u32).collect();
+            let pb = encode_paletted(&cells);
+            assert_eq!(pb.index_bits, want_bits, "k={k} ⇒ {want_bits}-bit");
+            assert_eq!(pb.palette.len(), k, "k={k} distinct ids in the palette");
+            for (i, &c) in cells.iter().enumerate() {
+                assert_eq!(
+                    decode_paletted_cell(&pb.palette, pb.index_bits, &pb.indices, i) as u32,
+                    c,
+                    "cell {i} (k={k}) must decode to its original id"
+                );
+            }
+            let baseline = cells.len() * 4; // u32-per-cell
+            let packed = pb.indices.len() * 4 + pb.palette.len() * 2;
+            assert!(packed < baseline, "k={k}: packed {packed} B must beat the {baseline} B u32 baseline");
+        }
     }
 
     /// A core-uniform brick whose HALO DIFFERS (a same-block neighbour with a hole on the shared face) is NOT
