@@ -6,6 +6,20 @@
 use futures_lite::future::block_on;
 use wgpu::util::DeviceExt;
 
+/// A3 — a storage buffer holding ONE identity descriptor 0 (the whole test scene = the streamed-world
+/// degenerate case: identity transform, meta_base 0, all bases 0). `voxel_raytrace.wgsl`'s hit path now reads
+/// the descriptor table at group 0 binding 13, so EVERY rig that builds a group-0 scene bind group must supply
+/// it (bind it at `binding: 13`) or pipeline validation fails. With this single identity descriptor the shader
+/// is bit-identical-in-effect to the pre-A3 world-space march. Single SSOT for the test descriptor buffer.
+pub fn instance_descriptors_buffer(device: &wgpu::Device) -> wgpu::Buffer {
+    let descriptors = [adventure::voxel::gpu::GpuInstanceDescriptor::world_identity(0)];
+    device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("test_instance_descriptors"),
+        contents: bytemuck::cast_slice(&descriptors),
+        usage: wgpu::BufferUsages::STORAGE,
+    })
+}
+
 /// A UNIFORM buffer holding the default [`SkyUniformData`] (group 1 binding 11 of `voxel_raytrace.wgsl`).
 /// Every entry point that shades or bounces (`trace_one`, `restir_probe`, `raymarch_dlss`, …) now references
 /// the `Sky` uniform via `sky_radiance`, so wgpu's auto-derived group(1) layout includes binding 11 — the

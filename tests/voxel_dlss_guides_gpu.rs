@@ -270,6 +270,7 @@ fn dlss_guides_populated_where_voxels_hit() {
         cache: None,
     });
     let sky_buf = common::sky_uniform_buffer(&device);
+    let descriptors_buf = common::instance_descriptors_buffer(&device); // A3: one identity descriptor 0
     let scene_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("scene_bg"),
         layout: &pipeline.get_bind_group_layout(0),
@@ -279,6 +280,7 @@ fn dlss_guides_populated_where_voxels_hit() {
             wgpu::BindGroupEntry { binding: 2, resource: voxel_buf.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 3, resource: palette_buf.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 12, resource: brick_palettes_buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 13, resource: descriptors_buf.as_entire_binding() },
         ],
     });
     let view_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {

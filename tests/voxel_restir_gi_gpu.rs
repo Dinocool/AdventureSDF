@@ -242,6 +242,7 @@ fn run_probes(
         compilation_options: Default::default(),
         cache: None,
     });
+    let descriptors_buf = common::instance_descriptors_buffer(device); // A3: one identity descriptor 0
     let scene_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("restir_scene_bg"),
         layout: &pipeline.get_bind_group_layout(0),
@@ -251,6 +252,7 @@ fn run_probes(
             wgpu::BindGroupEntry { binding: 2, resource: voxel_buf.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 3, resource: palette_buf.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 12, resource: brick_palettes_buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 13, resource: descriptors_buf.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 8, resource: probe_buf.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 9, resource: reservoir_buf.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 10, resource: out_buf.as_entire_binding() },

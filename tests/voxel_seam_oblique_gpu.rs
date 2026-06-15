@@ -131,6 +131,7 @@ struct SeamScene {
     voxel_buf: wgpu::Buffer,
     palette_buf: wgpu::Buffer,
     brick_palettes_buf: wgpu::Buffer,
+    descriptors_buf: wgpu::Buffer, // A3: one identity descriptor 0
     // keep alive
     _aabb_buf: wgpu::Buffer,
     _blas: wgpu::Blas,
@@ -168,6 +169,8 @@ impl SeamScene {
             contents: bytemuck::cast_slice(&patch.brick_palettes),
             usage: wgpu::BufferUsages::STORAGE,
         });
+        // A3 — ONE identity descriptor 0 (the whole scene = the streamed-world degenerate case).
+        let descriptors_buf = common::instance_descriptors_buffer(&device);
 
         let size_desc = wgpu::BlasAABBGeometrySizeDescriptor {
             primitive_count: n,
@@ -234,6 +237,7 @@ impl SeamScene {
             voxel_buf,
             palette_buf,
             brick_palettes_buf,
+            descriptors_buf,
             _aabb_buf: aabb_buf,
             _blas: blas,
         }
@@ -268,6 +272,7 @@ impl SeamScene {
                 wgpu::BindGroupEntry { binding: 2, resource: self.voxel_buf.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 3, resource: self.palette_buf.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 12, resource: self.brick_palettes_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 13, resource: self.descriptors_buf.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 6, resource: ray_buf.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 7, resource: out_buf.as_entire_binding() },
             ],

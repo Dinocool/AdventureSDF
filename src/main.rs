@@ -102,10 +102,11 @@ fn wgpu_settings() -> WgpuSettings {
     // checksums/life/radiance/geometry/luminance/new_radiance/a/b/active_indices/count/dispatch) in one
     // pipeline layout = 14 storage buffers in a single shader stage. wgpu's default
     // `max_storage_buffers_per_shader_stage` is only 8, so raise it (desktop RTX/Vulkan GPUs support far more).
-    // Storage plan R2b added a 4th scene storage buffer (group 0 binding 12, `brick_palettes`), so the
-    // `world_cache_update` pipeline binds 4 scene + 11 cache buffers in one stage — raise the floor to 20.
+    // Storage plan R2b added a 4th scene storage buffer (group 0 binding 12, `brick_palettes`); A3 added a 5th
+    // (group 0 binding 13, the instance `descriptors`). So the `world_cache_update` pipeline binds 5 scene + 11
+    // cache + 2 NEE = 18 storage buffers in one stage — raise the floor to 22 for headroom.
     settings.limits.max_storage_buffers_per_shader_stage =
-        settings.limits.max_storage_buffers_per_shader_stage.max(20);
+        settings.limits.max_storage_buffers_per_shader_stage.max(22);
     // The cache decay/compaction passes use `@workgroup_size(1024)` (the prefix-sum scan width). wgpu's
     // default caps invocations-per-workgroup + workgroup_size_x at 256, so raise both to 1024.
     settings.limits.max_compute_invocations_per_workgroup =

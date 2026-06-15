@@ -46,8 +46,8 @@ use super::cornell::{build_cornell, build_cornell_with_edits};
 use super::gallery::{GALLERY_SCENES, load_gallery};
 use super::edits::{VoxelEdits, VoxelHit, pick_voxel};
 use super::gpu::{
-    GpuAliasEntry, GpuBrickAabb, GpuBrickMeta, GpuBrickPatch, GpuVoxelLight, build_lights_from_entries,
-    pack_brickmap, pack_resident_set,
+    GpuAliasEntry, GpuBrickAabb, GpuBrickMeta, GpuBrickPatch, GpuInstanceDescriptor, GpuVoxelLight,
+    build_lights_from_entries, pack_brickmap, pack_resident_set,
 };
 use super::incremental::{RepackDelta, ResidentPacker, SnapshotBuffers};
 use super::palette::{BlockId, BlockRegistry, CornellBlock};
@@ -1200,6 +1200,9 @@ struct SceneKeepAlive {
     _palette_buf: wgpu::Buffer,
     /// The per-brick palette buffer (R2b static path; a 1-word dummy on the raw streamed path). Keep-alive only.
     _brick_palettes_buf: wgpu::Buffer,
+    /// A3 — the per-instance DESCRIPTOR buffer (group 0 binding 13). For the streamed world it holds ONE identity
+    /// descriptor 0 (Stage 1) / one per CHUNK (Stage 3). Keep-alive only (the bind group's Arc references it).
+    _descriptors_buf: wgpu::Buffer,
     /// The number of BLAS primitives (== `capacity` for a streamed epoch, == `brick_count` for a static
     /// Snapshot) — the size the BLAS was created for, reused on a Delta's in-place BLAS rebuild.
     blas_primitives: u32,
@@ -1900,6 +1903,7 @@ fn init_voxel_rt(mut commands: Commands, render_device: Res<RenderDevice>) {
             storage_ro(2),  // voxel_indices (R2b bit-packed index stream)
             storage_ro(3),  // palette (block id → colour)
             storage_ro(12), // brick_palettes (R2b per-brick palettes)
+            storage_ro(13), // A3: instance descriptors (per-instance/per-chunk transform + base offsets)
         ],
     });
     let view_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -2603,6 +2607,16 @@ fn build_scene_full(
         contents: brick_palettes_bytes,
         usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
     });
+    // A3 Stage 1 — the per-instance DESCRIPTOR buffer. ONE identity descriptor 0 = the whole streamed/static
+    // world (meta_base 0, identity transform, all bases 0). With this single descriptor the shader hit path is
+    // bit-identical-in-effect to the pre-A3 world-space march (the regression gate). Stage 3 grows this to one
+    // identity descriptor per CHUNK (each carrying its slot base in `meta_base`).
+    let descriptors = [GpuInstanceDescriptor::world_identity(0)];
+    let descriptors_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("voxel_rt_instance_descriptors"),
+        contents: bytemuck::cast_slice(&descriptors),
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+    });
 
     let size_desc = wgpu::BlasAABBGeometrySizeDescriptor {
         primitive_count: blas_primitives,
@@ -2655,6 +2669,7 @@ fn build_scene_full(
             wgpu::BindGroupEntry { binding: 2, resource: voxel_buf.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 3, resource: palette_buf.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 12, resource: brick_palettes_buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 13, resource: descriptors_buf.as_entire_binding() },
         ],
     });
 
@@ -2670,6 +2685,7 @@ fn build_scene_full(
         voxel_buf,
         _palette_buf: palette_buf,
         _brick_palettes_buf: brick_palettes_buf,
+        _descriptors_buf: descriptors_buf,
         blas_primitives,
         streamed,
     });

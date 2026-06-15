@@ -289,6 +289,87 @@ fn pack_lod_bits(lod: u32, index_bits: u8) -> u32 {
     (lod & 0x7) | ((index_bits as u32 & 0x1F) << 3)
 }
 
+/// The [`GpuInstanceDescriptor::edit_base`] SENTINEL meaning "no per-instance edit overlay" — reserved for
+/// A3 (Phase-5 per-instance destruction). Descriptor 0 (the streamed world) always carries this.
+pub const INSTANCE_EDIT_NONE: u32 = 0xFFFF_FFFF;
+
+/// An IDENTITY 3×4 (row-major `mat3x4`) transform: rows `[1,0,0,0; 0,1,0,0; 0,0,1,0]`. The streamed world's
+/// descriptor 0 uses this for BOTH `object_from_world` and `world_from_object_rot`, so the hit path reduces to
+/// the pre-A3 world-space march (a no-op transform). Stored row-major (3 rows × 4 cols) to match the WGSL
+/// `mat3x4<f32>` column-major load (see `apply_3x4` in the shader, which reads it as 4 columns of 3 floats).
+pub const IDENTITY_3X4: [f32; 12] = [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0];
+
+/// **A3 — the per-instance descriptor (multi-instance TLAS + object-local DDA), `VOXEL_INSTANCING_PLAN` §2.2.**
+/// Indexed by the TLAS instance's `custom_index` (the WGSL `instance_custom_data`); resolves a candidate brick
+/// hit to its object's buffer slices + transform. 128 bytes (two 3×4 affines = 96 B + 8 u32 = 32 B),
+/// `bytemuck`-uploadable. The WGSL mirror packs the matrices as 6·`vec4<f32>` so the stride matches.
+///
+/// **Descriptor 0 = the streamed world (the degenerate identity case).** `object_from_world =
+/// world_from_object_rot = `[`IDENTITY_3X4`]`, all bases 0, `inv_scale = 1.0`, `edit_base = `[`INSTANCE_EDIT_NONE`]`,
+/// `mask = 0xff`. With descriptor 0 the new hit path is bit-identical-in-effect to the pre-A3 path:
+/// `metas[meta_base + primitive_index]` with `meta_base == 0` is just `metas[primitive_index]`, the ray
+/// transform is the identity, and the normal rotate-back is the identity. This degenerate property is the
+/// single most important correctness invariant of A3 (the Cornell/Sponza/worldgen pixel-identical gate).
+///
+/// A future `.vox` PROP appends a descriptor with a real `object_from_world` (world→object, to transform the
+/// ray into the prop's upright local space) + `world_from_object_rot` (object→world, to rotate the hit normal
+/// back to world) + non-zero `meta_base`/`voxel_base`/`palette_base` (offsets into the GLOBAL concatenated
+/// buffers). The machinery is built here from day one so props/rotation/COW need no second AS refactor — but
+/// A3 ships ONLY descriptor 0 (the world); real props are out of scope.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Pod, Zeroable)]
+pub struct GpuInstanceDescriptor {
+    /// 3×4 world→object affine (row-major). Transforms the WORLD ray INTO this object's local space
+    /// (`ro_l = M·[ro,1]`, `rd_l = mat3(M)·rd`). Identity for descriptor 0 (the world is already in world space).
+    pub object_from_world: [f32; 12],
+    /// 3×4 object→world (row-major), the rotation+translation that pushes the object-local hit NORMAL back to
+    /// world (`n_world = mat3(M)·n_local`). Identity for descriptor 0.
+    pub world_from_object_rot: [f32; 12],
+    /// Offset (in bricks) into the GLOBAL `metas`/`aabbs` for this object's first brick. The shader resolves the
+    /// committed brick as `metas[meta_base + primitive_index]`. 0 for descriptor 0 (the world IS the global
+    /// buffer). For a per-CHUNK world instance (Stage 3) this is the chunk's slot base.
+    pub meta_base: u32,
+    /// Offset (in `u32`s) into the GLOBAL `voxel_indices` arena for this object. 0 for descriptor 0 (the world's
+    /// per-brick `meta.voxel_offset` is already a global arena offset — see the Stage-3 note: the world keeps its
+    /// single fixed-cap arena, so `voxel_base == 0` and the meta carries the true offset).
+    pub voxel_base: u32,
+    /// Offset (in `u32`s) into the GLOBAL `brick_palettes` for this object's per-brick palettes. 0 for the
+    /// streamed world (its raw A1-β arena never indirects through `brick_palettes`).
+    pub palette_base: u32,
+    /// Local-`t` → world-`t` factor (`1.0` for a rigid / identity instance). The committed intersection distance
+    /// is `local_t · inv_scale` so the TLAS resolves the nearest hit ACROSS instances in world units. `1.0` for
+    /// descriptor 0.
+    pub inv_scale: f32,
+    /// Per-instance edit-overlay base, or [`INSTANCE_EDIT_NONE`] (reserved; unused in A3). [`INSTANCE_EDIT_NONE`]
+    /// for descriptor 0.
+    pub edit_base: u32,
+    /// The ray instance mask (`0xff` = all). Reserved for separating world / props / debris later. `0xff` for
+    /// descriptor 0.
+    pub mask: u32,
+    /// Pad to 80 bytes (16-aligned). Always zero.
+    pub _pad: [u32; 2],
+}
+
+impl GpuInstanceDescriptor {
+    /// The streamed world's descriptor 0 — the IDENTITY degenerate case (no transform, all bases 0). With this
+    /// descriptor the A3 hit path is bit-identical-in-effect to the pre-A3 world-space march. `meta_base` lets a
+    /// per-chunk world instance (Stage 3) select its slot range; pass 0 for the single-instance world (Stage 1).
+    #[inline]
+    pub fn world_identity(meta_base: u32) -> Self {
+        Self {
+            object_from_world: IDENTITY_3X4,
+            world_from_object_rot: IDENTITY_3X4,
+            meta_base,
+            voxel_base: 0,
+            palette_base: 0,
+            inv_scale: 1.0,
+            edit_base: INSTANCE_EDIT_NONE,
+            mask: 0xff,
+            _pad: [0; 2],
+        }
+    }
+}
+
 /// One palette entry: linear-RGBA albedo + linear-RGB emissive radiance. Indexed by `BlockId(i)`
 /// directly. 32 bytes (`rgba` 16 + `emissive` 16; `emissive.w` is unused pad). Emissive is the per-block
 /// glow the GI bounce treats as a light source — a non-zero `emissive` makes that block an emitter.
@@ -1713,6 +1794,29 @@ mod tests {
         assert_eq!(big.palette_base, big_pal, "palette_base = u32::MAX round-trips through the full u32");
         assert_eq!(big.lod(), 2);
         assert_eq!(big.index_bits(), 8);
+    }
+
+    #[test]
+    fn instance_descriptor_layout_and_identity() {
+        // A3 — the descriptor MUST be 128 bytes to match the WGSL `InstanceDescriptor` storage stride (two 3×4
+        // affines = 2·12 f32 = 96 B, plus 6 u32 scalars + 2 u32 pad = 32 B ⇒ 128 B; the WGSL mirror packs the
+        // same as 6·vec4 + 8·u32 = 128 B, 16-aligned). A size drift silently mis-indexes every hit's `meta_base`.
+        assert_eq!(std::mem::size_of::<GpuInstanceDescriptor>(), 128, "descriptor must be 128 bytes (WGSL match)");
+        assert_eq!(std::mem::align_of::<GpuInstanceDescriptor>(), 4, "POD descriptor is 4-byte aligned");
+        // Descriptor 0 = the streamed world: identity transform, all bases 0, rigid, no edits, full mask.
+        let d = GpuInstanceDescriptor::world_identity(0);
+        assert_eq!(d.object_from_world, IDENTITY_3X4, "world descriptor is identity (no ray transform)");
+        assert_eq!(d.world_from_object_rot, IDENTITY_3X4, "world descriptor is identity (no normal rotate)");
+        assert_eq!(d.meta_base, 0);
+        assert_eq!(d.voxel_base, 0);
+        assert_eq!(d.palette_base, 0);
+        assert_eq!(d.inv_scale, 1.0);
+        assert_eq!(d.edit_base, INSTANCE_EDIT_NONE);
+        assert_eq!(d.mask, 0xff);
+        // A per-chunk world instance (Stage 3) carries its slot base in `meta_base` but is otherwise identity.
+        let chunk = GpuInstanceDescriptor::world_identity(512);
+        assert_eq!(chunk.meta_base, 512);
+        assert_eq!(chunk.object_from_world, IDENTITY_3X4);
     }
 
     /// A fully-buried uniform brick (its 6/26 neighbours all the SAME solid block) collapses: the meta is

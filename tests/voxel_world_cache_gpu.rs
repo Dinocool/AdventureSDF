@@ -263,6 +263,7 @@ fn world_cache_converges_to_single_bounce_irradiance() {
         contents: bytemuck::cast_slice(&patch.brick_palettes),
         usage: wgpu::BufferUsages::STORAGE,
     });
+    let descriptors_buf = common::instance_descriptors_buffer(&device); // A3: one identity descriptor 0
 
     let size_desc = wgpu::BlasAABBGeometrySizeDescriptor {
         primitive_count: n,
@@ -411,6 +412,7 @@ fn world_cache_converges_to_single_bounce_irradiance() {
             storage_ro(2),
             storage_ro(3),
             storage_ro(12), // R2b per-brick palettes
+            storage_ro(13), // A3 instance descriptors
         ],
     });
     let view_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -487,6 +489,7 @@ fn world_cache_converges_to_single_bounce_irradiance() {
             wgpu::BindGroupEntry { binding: 2, resource: voxel_buf.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 3, resource: palette_buf.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 12, resource: brick_palettes_buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 13, resource: descriptors_buf.as_entire_binding() },
         ],
     });
     let view_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -752,9 +755,10 @@ const FLOOR_EMISSIVE: f32 = 0.5;
 #[test]
 fn cached_initial_reservoir_adds_albedo_times_cache() {
     // The fill passes bind 16 storage buffers in one stage (3 scene + 11 cache + query_out + dispatch); the
-    // energy probe adds ONE more (`energy_out` on group 0) → 17, over the convergence test's 16.
-    let Some((device, queue)) = common::headless_ray_query_device_with_storage_buffers(20) else {
-        eprintln!("no ray-query device with 17 storage buffers — skipping energy test");
+    // energy probe adds ONE more (`energy_out` on group 0) → 17, plus A3's descriptor table (group 0 binding
+    // 13) → 18 in this stage. Request 24 headroom (RTX supports far more) so the pipeline-layout limit clears.
+    let Some((device, queue)) = common::headless_ray_query_device_with_storage_buffers(24) else {
+        eprintln!("no ray-query device with ≥18 storage buffers — skipping energy test");
         return;
     };
 
@@ -861,6 +865,7 @@ fn cached_initial_reservoir_adds_albedo_times_cache() {
         contents: bytemuck::cast_slice(&patch.brick_palettes),
         usage: wgpu::BufferUsages::STORAGE,
     });
+    let descriptors_buf = common::instance_descriptors_buffer(&device); // A3: one identity descriptor 0
 
     let size_desc = wgpu::BlasAABBGeometrySizeDescriptor {
         primitive_count: n,
@@ -1032,6 +1037,7 @@ fn cached_initial_reservoir_adds_albedo_times_cache() {
             storage_ro(2),
             storage_ro(3),
             storage_ro(12), // R2b per-brick palettes
+            storage_ro(13), // A3 instance descriptors
             uniform(8),
             storage_rw(9),
         ],
@@ -1117,6 +1123,7 @@ fn cached_initial_reservoir_adds_albedo_times_cache() {
             wgpu::BindGroupEntry { binding: 2, resource: voxel_buf.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 3, resource: palette_buf.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 12, resource: brick_palettes_buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 13, resource: descriptors_buf.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 8, resource: energy_params_buf.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 9, resource: energy_out_buf.as_entire_binding() },
         ],
@@ -1462,6 +1469,7 @@ fn thin_wall_no_exterior_leak_with_clamp() {
         contents: bytemuck::cast_slice(&patch.brick_palettes),
         usage: wgpu::BufferUsages::STORAGE,
     });
+    let descriptors_buf = common::instance_descriptors_buffer(&device); // A3: one identity descriptor 0
 
     let size_desc = wgpu::BlasAABBGeometrySizeDescriptor {
         primitive_count: n,
@@ -1602,6 +1610,7 @@ fn thin_wall_no_exterior_leak_with_clamp() {
             storage_ro(2),
             storage_ro(3),
             storage_ro(12), // R2b per-brick palettes
+            storage_ro(13), // A3 instance descriptors
         ],
     });
     let view_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -1681,6 +1690,7 @@ fn thin_wall_no_exterior_leak_with_clamp() {
             wgpu::BindGroupEntry { binding: 2, resource: voxel_buf.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 3, resource: palette_buf.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 12, resource: brick_palettes_buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 13, resource: descriptors_buf.as_entire_binding() },
         ],
     });
     let view_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -2024,6 +2034,7 @@ fn run_box_fill(
         contents: bytemuck::cast_slice(&patch.brick_palettes),
         usage: wgpu::BufferUsages::STORAGE,
     });
+    let descriptors_buf = common::instance_descriptors_buffer(device); // A3: one identity descriptor 0
 
     let size_desc = wgpu::BlasAABBGeometrySizeDescriptor {
         primitive_count: n,
@@ -2164,6 +2175,7 @@ fn run_box_fill(
             storage_ro(2),
             storage_ro(3),
             storage_ro(12), // R2b per-brick palettes
+            storage_ro(13), // A3 instance descriptors
         ],
     });
     let view_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -2242,6 +2254,7 @@ fn run_box_fill(
             wgpu::BindGroupEntry { binding: 2, resource: voxel_buf.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 3, resource: palette_buf.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 12, resource: brick_palettes_buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 13, resource: descriptors_buf.as_entire_binding() },
         ],
     });
     let view_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -2634,6 +2647,7 @@ fn run_nee_fill(device: &wgpu::Device, queue: &wgpu::Queue, nee_on: bool, frames
         contents: bytemuck::cast_slice(&patch.brick_palettes),
         usage: wgpu::BufferUsages::STORAGE,
     });
+    let descriptors_buf = common::instance_descriptors_buffer(device); // A3: one identity descriptor 0
 
     let size_desc = wgpu::BlasAABBGeometrySizeDescriptor {
         primitive_count: n,
@@ -2774,6 +2788,7 @@ fn run_nee_fill(device: &wgpu::Device, queue: &wgpu::Queue, nee_on: bool, frames
             storage_ro(2),
             storage_ro(3),
             storage_ro(12), // R2b per-brick palettes
+            storage_ro(13), // A3 instance descriptors
         ],
     });
     let view_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -2849,6 +2864,7 @@ fn run_nee_fill(device: &wgpu::Device, queue: &wgpu::Queue, nee_on: bool, frames
             wgpu::BindGroupEntry { binding: 2, resource: voxel_buf.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 3, resource: palette_buf.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 12, resource: brick_palettes_buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 13, resource: descriptors_buf.as_entire_binding() },
         ],
     });
     let view_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {

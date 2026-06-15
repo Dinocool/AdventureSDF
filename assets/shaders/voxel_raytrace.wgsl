@@ -155,7 +155,44 @@ fn brick_aabb_epsilon(lod: u32) -> f32 {
 // emissive radiance (`.xyz`; `.w` pad). 32 bytes.
 struct Palette { rgba: vec4<f32>, emissive: vec4<f32> };
 
+// A3 — the per-instance DESCRIPTOR (multi-instance TLAS + object-local DDA). EXACT mirror of
+// `GpuInstanceDescriptor` in src/voxel/gpu.rs (80 bytes). Indexed by the candidate's `instance_custom_data`
+// (the TLAS instance's `custom_index`). `object_from_world`/`world_from_object_rot` are 3×4 affines stored
+// row-major as twelve f32 (loaded into a WGSL `mat3x4` = 4 columns × vec3 by `desc_*` below). Descriptor 0 (the
+// streamed world) is the IDENTITY degenerate case: both transforms identity, all bases 0, inv_scale 1 ⇒ the hit
+// path reduces to the pre-A3 world-space march. See PHASE_A_GPU_EXECUTION.md §A3.
+struct InstanceDescriptor {
+    // object_from_world (world→object), row-major 3×4 as 12 scalars.
+    ofw0: vec4<f32>, ofw1: vec4<f32>, ofw2: vec4<f32>,
+    // world_from_object_rot (object→world), row-major 3×4 as 12 scalars.
+    wfo0: vec4<f32>, wfo1: vec4<f32>, wfo2: vec4<f32>,
+    meta_base: u32,
+    voxel_base: u32,
+    palette_base: u32,
+    inv_scale: f32,
+    edit_base: u32,
+    mask: u32,
+    pad0: u32,
+    pad1: u32,
+};
+
+// Apply a row-major 3×4 affine (rows r0/r1/r2 = vec4 [a b c | t]) to a POINT: `M · [p, 1]`. For the identity
+// transform (descriptor 0) this returns `p` unchanged.
+fn affine_point(r0: vec4<f32>, r1: vec4<f32>, r2: vec4<f32>, p: vec3<f32>) -> vec3<f32> {
+    let h = vec4<f32>(p, 1.0);
+    return vec3<f32>(dot(r0, h), dot(r1, h), dot(r2, h));
+}
+
+// Apply the ROTATION (upper 3×3, the .xyz of each row) of a row-major 3×4 affine to a DIRECTION/normal (no
+// translation). For the identity transform (descriptor 0) this returns `v` unchanged.
+fn affine_dir(r0: vec4<f32>, r1: vec4<f32>, r2: vec4<f32>, v: vec3<f32>) -> vec3<f32> {
+    return vec3<f32>(dot(r0.xyz, v), dot(r1.xyz, v), dot(r2.xyz, v));
+}
+
 @group(0) @binding(0) var acc: acceleration_structure;
+// A3 — the per-instance descriptor table (group 0, binding 13). Indexed by `instance_custom_data`. For the
+// streamed world it holds ONE identity descriptor 0 (Stage 1) / one per CHUNK (Stage 3), all identity-transform.
+@group(0) @binding(13) var<storage, read> descriptors: array<InstanceDescriptor>;
 @group(0) @binding(1) var<storage, read> metas: array<BrickMeta>;
 // Storage plan R2b — the bit-packed INDEX STREAM (was a raw `u32`-per-cell id buffer). A dense brick's indices
 // begin at `metas[].voxel_offset`, are `metas[].index_bits()`-wide, and reference the per-brick palette below.
@@ -362,13 +399,23 @@ fn trace(ro: vec3<f32>, rd: vec3<f32>, t_min: f32, t_max: f32) -> TraceResult {
     // `generateIntersection` so the ray query culls far candidates, but the committed t/prim are NOT used.
     var best_t: f32 = t_max * 2.0;
     var best_prim: u32 = 0xffffffffu;
+    var best_inst: u32 = 0u; // A3: the winning candidate's descriptor index (for the object-space re-walk)
     loop {
         if (!rayQueryProceed(&rq)) { break; }
         let c = rayQueryGetCandidateIntersection(&rq);
         if (c.kind == RAY_QUERY_INTERSECTION_AABB) {
+            // A3 — resolve the candidate's INSTANCE DESCRIPTOR (the TLAS instance's custom_index). For the
+            // streamed world this is descriptor 0/per-chunk: identity transform, meta_base = the chunk's slot
+            // base. Transform the WORLD ray into OBJECT space (identity ⇒ ro_l==ro, rd_l==rd for the world) and
+            // resolve the GLOBAL brick index `prim = meta_base + primitive_index` (== primitive_index for the
+            // world). The DDA + slab then run in object space; the committed t is converted back to world.
+            let d = descriptors[c.instance_custom_data];
+            let ro_l = affine_point(d.ofw0, d.ofw1, d.ofw2, ro);
+            let rd_l = affine_dir(d.ofw0, d.ofw1, d.ofw2, rd);
+            let prim = d.meta_base + c.primitive_index;
             // The candidate carries the brick's primitive_index but NOT its t-range, so re-derive the
-            // ray/AABB entry & exit from the brick bounds, then DDA between them.
-            let m = metas[c.primitive_index];
+            // ray/AABB entry & exit from the brick bounds (in OBJECT space), then DDA between them.
+            let m = metas[prim];
             // Slab against the GROWN brick bounds (same overlap as the BLAS AABB — the seam fix). Using the
             // grown bounds keeps a face-grazing axis-parallel ray off the exact tangent plane (where the true
             // bounds give a 0·inf = NaN slab t), so it reliably enters the brick. `brick_span(meta_lod(m))` is the
@@ -377,18 +424,20 @@ fn trace(ro: vec3<f32>, rd: vec3<f32>, t_min: f32, t_max: f32) -> TraceResult {
             let eps = brick_aabb_epsilon(meta_lod(m)); // A4.2: relative-per-LOD grow
             let bmin = m.world_min - vec3<f32>(eps);
             let bmax = m.world_min + vec3<f32>(span + eps);
-            let inv = 1.0 / rd;
-            let ta = (bmin - ro) * inv;
-            let tb = (bmax - ro) * inv;
+            let inv = 1.0 / rd_l;
+            let ta = (bmin - ro_l) * inv;
+            let tb = (bmax - ro_l) * inv;
             let t_enter = max(max(min(ta.x, tb.x), min(ta.y, tb.y)), min(ta.z, tb.z));
             let t_exit  = min(min(max(ta.x, tb.x), max(ta.y, tb.y)), max(ta.z, tb.z));
-            if (t_enter <= t_exit && t_exit >= t_min) {
-                let bh = dda_brick(c.primitive_index, ro, rd, t_enter, t_exit);
+            // The slab t-range is in OBJECT space; the t_min/t_exit gate is against the WORLD t (× inv_scale).
+            if (t_enter <= t_exit && t_exit * d.inv_scale >= t_min) {
+                let bh = dda_brick(prim, ro_l, rd_l, t_enter, t_exit);
                 if (dh_found(bh)) {
-                    let ht = dh_t(bh);
+                    let ht = dh_t(bh) * d.inv_scale; // local-t → WORLD-t for the cross-instance nearest compare
                     if (ht < best_t) {
                         best_t = ht;
-                        best_prim = c.primitive_index;
+                        best_prim = prim;
+                        best_inst = c.instance_custom_data;
                     }
                     rayQueryGenerateIntersection(&rq, ht);
                 }
@@ -399,9 +448,13 @@ fn trace(ro: vec3<f32>, rd: vec3<f32>, t_min: f32, t_max: f32) -> TraceResult {
     let has_hit = best_prim != 0xffffffffu;
     // Re-walk the winning brick ONCE to recover the first-solid cell's id AND its entry-face normal from the
     // SAME DDA — so the colour and the shading normal are always the committed cell's (no boundary drift /
-    // sideways-normal seam). Called with a safe index on a miss; gated by `has_hit`.
+    // sideways-normal seam). Called with a safe index on a miss; gated by `has_hit`. A3: re-derive the winning
+    // descriptor + transform the ray into its object space; the recovered local normal is rotated back to world.
     let prim = select(0u, best_prim, has_hit);
-    let bh = brick_hit_at(prim, ro, rd);
+    let dwin = descriptors[best_inst];
+    let ro_w = affine_point(dwin.ofw0, dwin.ofw1, dwin.ofw2, ro);
+    let rd_w = affine_dir(dwin.ofw0, dwin.ofw1, dwin.ofw2, rd);
+    let bh = brick_hit_at(prim, ro_w, rd_w);
     let id = select(0u, dh_block(bh), has_hit);
     if (has_hit) {
         r.hit = select(0u, 1u, id != 0u);
@@ -410,7 +463,13 @@ fn trace(ro: vec3<f32>, rd: vec3<f32>, t_min: f32, t_max: f32) -> TraceResult {
         r.t = best_t;
         r.color = palette[id].rgba;
         r.emissive = palette[id].emissive.xyz;
-        r.normal = dh_normal(bh, rd);
+        // Rotate the object-local entry-face normal back to WORLD via the descriptor's object→world ROTATION.
+        // For the streamed world (identity) `affine_dir` returns the input components UNCHANGED (dot with the
+        // identity rows), so descriptor 0 is bit-identical to the pre-A3 `dh_normal(bh, rd)`. NO outer
+        // `normalize` (it would inject a sqrt/divide that could perturb the byte-identical world render); a
+        // PURE-ROTATION `world_from_object_rot` preserves the already-unit `dh_normal`, and a future scaled prop
+        // would carry a normalized rotation so the result stays unit.
+        r.normal = affine_dir(dwin.wfo0, dwin.wfo1, dwin.wfo2, dh_normal(bh, rd_w));
     } else {
         r.hit = 0u;
         r.block_id = 0u;
@@ -437,22 +496,29 @@ fn trace_occluded(ro: vec3<f32>, rd: vec3<f32>, t_min: f32, t_max: f32) -> bool 
         if (!rayQueryProceed(&rq)) { break; }
         let c = rayQueryGetCandidateIntersection(&rq);
         if (c.kind == RAY_QUERY_INTERSECTION_AABB) {
-            let m = metas[c.primitive_index];
+            // A3 — resolve the candidate's descriptor + transform the ray into object space (identity for the
+            // streamed world ⇒ unchanged) + the GLOBAL brick index. Same as `trace` but boolean-only.
+            let d = descriptors[c.instance_custom_data];
+            let ro_l = affine_point(d.ofw0, d.ofw1, d.ofw2, ro);
+            let rd_l = affine_dir(d.ofw0, d.ofw1, d.ofw2, rd);
+            let prim = d.meta_base + c.primitive_index;
+            let m = metas[prim];
             // Grown-bounds slab (matches the BLAS AABB overlap — the seam fix; see `trace`). `brick_span(meta_lod(m))`
             // is the clipmap span (a coarse brick covers 2^lod× more world).
             let span = brick_span(meta_lod(m));
             let eps = brick_aabb_epsilon(meta_lod(m)); // A4.2: relative-per-LOD grow
             let bmin = m.world_min - vec3<f32>(eps);
             let bmax = m.world_min + vec3<f32>(span + eps);
-            let inv = 1.0 / rd;
-            let ta = (bmin - ro) * inv;
-            let tb = (bmax - ro) * inv;
+            let inv = 1.0 / rd_l;
+            let ta = (bmin - ro_l) * inv;
+            let tb = (bmax - ro_l) * inv;
             let t_enter = max(max(min(ta.x, tb.x), min(ta.y, tb.y)), min(ta.z, tb.z));
             let t_exit  = min(min(max(ta.x, tb.x), max(ta.y, tb.y)), max(ta.z, tb.z));
-            if (t_enter <= t_exit && t_exit >= t_min) {
-                let bh = dda_brick(c.primitive_index, ro, rd, t_enter, t_exit);
-                if (dh_found(bh) && dh_t(bh) <= t_max) {
-                    rayQueryGenerateIntersection(&rq, dh_t(bh));
+            if (t_enter <= t_exit && t_exit * d.inv_scale >= t_min) {
+                let bh = dda_brick(prim, ro_l, rd_l, t_enter, t_exit);
+                let world_t = dh_t(bh) * d.inv_scale; // local-t → WORLD-t for the t_max occlusion gate
+                if (dh_found(bh) && world_t <= t_max) {
+                    rayQueryGenerateIntersection(&rq, world_t);
                 }
             }
         }

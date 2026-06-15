@@ -255,6 +255,8 @@ fn gpu_ray_query_hit_matches_cpu_ground_truth() {
         contents: bytemuck::cast_slice(&patch.brick_palettes),
         usage: wgpu::BufferUsages::STORAGE,
     });
+    // A3 — ONE identity descriptor 0 (the whole scene = the streamed-world degenerate case).
+    let descriptors_buf = common::instance_descriptors_buffer(&device);
 
     let size_desc = wgpu::BlasAABBGeometrySizeDescriptor {
         primitive_count: n,
@@ -324,6 +326,7 @@ fn gpu_ray_query_hit_matches_cpu_ground_truth() {
             wgpu::BindGroupEntry { binding: 2, resource: voxel_buf.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 3, resource: palette_buf.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 12, resource: brick_palettes_buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 13, resource: descriptors_buf.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 4, resource: ray_buf.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 5, resource: out_buf.as_entire_binding() },
         ],
@@ -606,6 +609,8 @@ fn gpu_mixed_lod_matches_cpu_ground_truth() {
         contents: bytemuck::cast_slice(&patch.brick_palettes),
         usage: wgpu::BufferUsages::STORAGE,
     });
+    // A3 — ONE identity descriptor 0 (the whole scene = the streamed-world degenerate case).
+    let descriptors_buf = common::instance_descriptors_buffer(&device);
 
     let size_desc = wgpu::BlasAABBGeometrySizeDescriptor {
         primitive_count: n,
@@ -673,6 +678,7 @@ fn gpu_mixed_lod_matches_cpu_ground_truth() {
             wgpu::BindGroupEntry { binding: 2, resource: voxel_buf.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 3, resource: palette_buf.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 12, resource: brick_palettes_buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 13, resource: descriptors_buf.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 4, resource: ray_buf.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 5, resource: out_buf.as_entire_binding() },
         ],

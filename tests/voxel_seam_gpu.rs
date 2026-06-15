@@ -204,6 +204,7 @@ fn gpu_continuous_wall_has_no_brick_seams() {
         compilation_options: Default::default(),
         cache: None,
     });
+    let descriptors_buf = common::instance_descriptors_buffer(&device); // A3: one identity descriptor 0
     let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: None,
         layout: &pipeline.get_bind_group_layout(0),
@@ -213,6 +214,7 @@ fn gpu_continuous_wall_has_no_brick_seams() {
             wgpu::BindGroupEntry { binding: 2, resource: voxel_buf.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 3, resource: palette_buf.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 12, resource: brick_palettes_buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 13, resource: descriptors_buf.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 4, resource: ray_buf.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 5, resource: out_buf.as_entire_binding() },
         ],
