@@ -196,6 +196,42 @@ fn round_trip_zstd_is_bit_identical() {
     round_trip(VxoCompression::Zstd(19));
 }
 
+/// **The Phase C transcoder VALIDATION GATE** (`examples/vox_to_vxo.rs`): a `.vxo` stamped at the corpus's
+/// **0.05 m** spacing round-trips bit-identically through the FULL-FILE [`VxoFile`] reader (NOT `VxoSource`,
+/// which asserts `voxel_size == VOXEL_SIZE = 0.2` and so couldn't open a 0.05 m asset until the D1 flip).
+/// Encode the known multi-region map at `voxel_size = 0.05`, read it back via `VxoFile`, and assert HEAD
+/// records 0.05 m AND every brick is bit-identical to the source — the property the `.vox → .vxo` transcode
+/// relies on (the on-disk spacing is just recorded; the grid is copied brick-for-brick).
+#[test]
+fn round_trip_at_0_05m_through_vxofile_is_bit_identical() {
+    let map = build_map();
+    let registry = registry();
+    let params = VxoHeadParams { voxel_size: 0.05, name: "transcode_0_05m".into(), ..Default::default() };
+
+    // STORE always; zstd too when the `vxo-encode` compressor is present (matches the converter's default).
+    #[cfg(feature = "vxo-encode")]
+    let comps = [VxoCompression::Store, VxoCompression::Zstd(19)];
+    #[cfg(not(feature = "vxo-encode"))]
+    let comps = [VxoCompression::Store];
+
+    for comp in comps {
+        let bytes = encode_vxo(&map, &registry, &params, comp).expect("encode_vxo at 0.05 m");
+        let file = VxoFile::parse(&bytes).expect("VxoFile parses a 0.05 m .vxo");
+
+        // HEAD records the stamped 0.05 m spacing (self-describing) — exact f32 (0.05 stored verbatim).
+        assert_eq!(file.head.voxel_size, 0.05, "HEAD.voxel_size records the stamped spacing");
+        assert_eq!(file.head.brick_count as usize, map.len(), "HEAD brick_count == map len");
+
+        // Every brick is bit-identical to the source map — the transcode round-trip property.
+        let read_map = read_back_map(&file);
+        assert_eq!(read_map.len(), map.len(), "read-back brick count == original");
+        for (coord, brick) in map.iter() {
+            let got = read_map.get(*coord).unwrap_or_else(|| panic!("brick {coord:?} missing after 0.05 m round-trip"));
+            assert_eq!(got, brick, "brick {coord:?} not bit-identical after 0.05 m round-trip");
+        }
+    }
+}
+
 /// Multiple regions are produced (the map straddles K=8 region boundaries incl. negatives), and the encoder
 /// buckets the eight test bricks into the expected distinct regions.
 #[test]

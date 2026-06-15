@@ -10,6 +10,14 @@ edition = "2024"
 name = "voxelize_scene"
 required-features = ["vxo-encode"]
 
+# The `.vox` → `.vxo` offline TRANSCODER (Phase C / Migration). It transcodes an existing baked `.vox` grid
+# into the native `.vxo` (load_vox → write_vxo); no re-voxelize. Needs `vxo-encode` for the default per-region
+# zstd compressor (same as `voxelize_scene`); `required-features` keeps a plain `cargo build --examples` from
+# pulling C `zstd-sys`.
+[[example]]
+name = "vox_to_vxo"
+required-features = ["vxo-encode"]
+
 [features]
 # Default dev build = fast incremental linking + voxel physics + DLSS Ray Reconstruction. So a plain
 # `cargo run` (or `cargo run --features editor`) gets walk-the-cubes physics AND the RR denoiser with no
