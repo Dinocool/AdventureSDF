@@ -42,7 +42,15 @@ fn sponza_is_the_default_scene() {
 /// palette. This uses `pack_brickmap` as a self-contained oracle (the live runtime instead STREAMS the loaded
 /// map through the clipmap via a `StaticVoxSource` — see `voxel_sponza_residency.rs`); here it just proves the
 /// asset is well-formed. No GPU needed — this is the CPU load assert.
+///
+/// LONG-RUNNING (~115 s): it loads + packs the full 16 MB shipped `sponza.vox` (33k bricks, 7.5M voxel cells).
+/// `#[ignore]`d so the default `cargo test` stays fast — this is an ASSET-INTEGRITY gate for the shipped
+/// Sponza bake, not a fast-path correctness unit. Its two distinct concerns are each covered elsewhere in the
+/// default suite: `load_vox` correctness by the lib test `voxel::vox::tests::sponza_loads_if_present`, and
+/// `pack` consistency (parallel buffers, populated palette) by the GPU rigs / residency tests that pack
+/// synthetic maps. Run it explicitly when touching the loader, packer, or re-baking the asset.
 #[test]
+#[ignore = "long-running (~115 s) asset-integrity check on the full sponza.vox; run with: TMP=D:\\tmp_test TEMP=D:\\tmp_test cargo test --test voxel_sponza_pack sponza_loads_and_packs_non_empty -- --ignored --nocapture"]
 fn sponza_loads_and_packs_non_empty() {
     let path = std::path::Path::new(SPONZA_VOX_PATH);
     if !path.exists() {
