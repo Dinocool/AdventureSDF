@@ -6,6 +6,31 @@ keeping the existing HW-RT + SHARC-style world-cache + ReSTIR + DLSS-RR GI **unc
 incremental-CPU clipmap fix because it is the only path to "extremely fast generation + near-unbounded view
 distance" the field actually achieves (Aokana, gvox_engine, GigaVoxels, Bonsai).
 
+## 2026-06 REFRAME (post Phase A/B/C/D1 — read this first; it updates the bottleneck framing below)
+Phases A (O(changed) upload + per-chunk BLAS + paletted slabs), B (`.vxo` streamed loader), the corpus
+conversion, C2/C3, and **D1 (the 0.05 m flip + 64 m reach + shell-first O(H²) enumeration)** have all LANDED.
+This changes WHICH part is the wall and re-orders the GPU work:
+- The old "58–103 ms hitch = CPU voxelize + full re-pack/re-upload" is **mostly fixed CPU-side**: A1 killed the
+  re-pack/upload (O(changed), ~140 KB/move); the per-brick voxelize is a **bounded drain** (D1c: 1.04 s cold-fill
+  over 874 frames, max 7.95 ms/frame — fine).
+- **The residual wall is the residency DECISION (`update`): the per-crossing ENUMERATE → classify → SORT.** D1d
+  shell-first cut it 38 s → 2.97 s, and the remaining ~3 s is **the A2 distance-cap SORT over ~6.7 M candidates**
+  (keep the nearest 400 k). User-confirmed 2026-06: "looks correct but pretty slow/unperformant."
+- **USER DECISION: do the full GPU-driven pivot regardless of perf — it is the CORRECT architecture, not
+  perf-gated ([[feedback-plan-to-best-practice]]).**
+- **NEW HEADLINE (the SOTA-gap audit's convergent #1 — two independent agents): the fully-GPU, readback-free
+  residency ENUMERATION + COMPACTION** (workgroup prefix-sum stream compaction + atomic sparse active-brick list +
+  GPU-written indirect dispatch — the **re-flora `contree/` build** + gvox_engine GPU allocator are working
+  references at `D:\tmp_test\re-flora`). This subsumes the cap-sort and the CPU enumeration entirely. The plan's
+  "CPU keeps only a coarse residency structure" is the INTERIM; the END STATE moves the enumeration/compaction to
+  GPU too (CPU keeps only the camera + clipmap params). The full readback-free pipeline = GPU classify/enumerate →
+  prefix-sum compact → GPU voxelize → write pool slots → fill AABBs, all in one submission, zero hot-path readback.
+- **Note: `MAX_LOD = 7`** now (the staging text below says 6 in places — stale; D1 set the 0.05 m / 64 m-reach
+  clipmap). The staging order is updated: **G0 instrument + the cheap cap-sort `select_nth` win (immediate
+  relief) → G1 GPU voxelize parity (the foundational de-risk, the pool needs it) → G2 GPU pool + GPU
+  enumeration/compaction (the readback-free pipeline, the headline) → G3 per-chunk BLAS → G6 3D-occupancy
+  enumeration → G7 GPU edit path.** See `VOXEL_PROGRAM.md` §"Committed roadmap" Phase G for the canonical list.
+
 ## Why (research synthesis — see also the survey in chat 2026-06)
 The render + GI stack is already SOTA-aligned. **Every** modern large-world voxel engine diverges from us in
 exactly one place — streaming — and that divergence is the literal cause of both reported bugs:
