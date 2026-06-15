@@ -960,7 +960,21 @@ fn bench_incremental_repack_vs_full() {
     println!("A1 per-move upload share : {:.4}% of the fixed-cap arena ({:.1} KB / {:.0} MB) — delta is O(changed), NOT O(resident)/O(capacity)",
         100.0 * delta_bytes_mean / cap_buffer_bytes as f64, delta_bytes_mean / 1e3, cap_buffer_bytes as f64 / 1e6);
     println!("per-move re-pack drop  : {:.0}× cheaper core ({f_mean:.2} ms full → {i_mean:.3} ms incremental); + the full per-gen BLAS rebuild is gone on non-topology moves", f_mean / i_mean.max(1e-6));
-    println!("NOTE: A1-β raw arena trades R2b's voxel-VRAM win on the STREAMED path for the O(changed) upload (each dense block is a 4KB raw 10³ grid, not a bit-packed stream); R2b is recovered later (A4.4 persistent interner).");
+    // A4.4 RESIDENT VRAM: the ACTUAL committed streamed-arena footprint (paletted index slabs + per-brick palette
+    // slabs, both sized to the live high-water + headroom) vs the pre-A4.4 raw arena. This is the storage win.
+    let snap = packer.snapshot_buffers(&registry);
+    let a44_index_mb = snap.indices.len() as f64 * 4.0 / 1e6;
+    let a44_palette_mb = snap.brick_palettes.len() as f64 * 4.0 / 1e6;
+    let a44_meta_aabb_mb = (snap.metas.len() * meta_b + snap.aabbs.len() * aabb_b) as f64 / 1e6;
+    let a44_total_mb = a44_index_mb + a44_palette_mb + a44_meta_aabb_mb;
+    println!(
+        "A4.4 RESIDENT VRAM       : {a44_total_mb:.1} MB (index slabs {a44_index_mb:.1} + palette slabs {a44_palette_mb:.2} + meta/aabb {a44_meta_aabb_mb:.1}) for {warm_resident} resident bricks",
+    );
+    println!(
+        "  vs pre-A4.4 raw arena  : {:.0} MB → {:.1}× smaller (paletted size-class slabs sized to actual content, not the 4 KB-raw/brick capacity reservation)",
+        cap_buffer_bytes as f64 / 1e6,
+        (cap_buffer_bytes as f64 / 1e6) / a44_total_mb.max(1e-6),
+    );
     println!("=============================================================================");
 
     // The O(changed) win: the incremental per-move re-pack is a small fraction of the full pack.
