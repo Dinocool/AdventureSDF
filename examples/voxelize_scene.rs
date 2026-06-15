@@ -59,7 +59,8 @@ const VOX_MODEL_MAX: i32 = 256;
 /// Default per-axis supersample count for area-averaged albedo (an `S×S×S` grid of texture taps over each
 /// voxel's surface footprint; `S=3` = 27 candidate taps, matching asset-gen's `supersample=3`). At fine voxel
 /// sizes a voxel covers many texels, so a single point sample aliases; averaging the footprint fixes it.
-/// Overridable per-bake with `--supersample <N>` (`N=1` reproduces the old single point sample).
+/// Overridable per-bake with `--supersample <N>` (`N=1` reproduces the old single sample LOCATION — now through
+/// the bilinear filter, so a strict improvement, not bit-identical to the old nearest-texel sample).
 const SUPERSAMPLE: usize = 3;
 
 fn main() -> anyhow::Result<()> {
@@ -1203,7 +1204,10 @@ fn sample_albedo(mesh: &Mesh, t: &Triangle, center: [f32; 3], half: f32, supersa
                 ];
                 let (col, near) = tap(p);
                 // On-footprint test: the projected triangle point must lie within the voxel box (padded by
-                // `tol`). This is exactly "the triangle's area clipped to the voxel box".
+                // `tol`). `closest_point_barycentric` clamps to the triangle, so a tap whose true projection is
+                // off-triangle but clamps to an edge point inside the box is still accepted — i.e. this is
+                // conservative-inclusive at the triangle edges (the accepted colour is a real on-triangle edge
+                // texel), an approximation of "the triangle's area clipped to the box", not an exact clip.
                 if (near[0] - center[0]).abs() <= half + tol
                     && (near[1] - center[1]).abs() <= half + tol
                     && (near[2] - center[2]).abs() <= half + tol
@@ -1481,8 +1485,10 @@ fn build_palette(pixels: &[([u8; 4], u32)], max_colors: usize) -> Vec<[u8; 4]> {
 }
 
 /// Deterministic weighted k-means over Lab points. Returns, per input point, its cluster id `0..k`. Seeding is
-/// **k-means++** driven by a FIXED-seed LCG (no entropy/time → byte-reproducible bake; mirrors asset-gen's
-/// `kmeans2(minit="++", seed=0)`), then **Lloyd** iterations to convergence (`KMEANS_EPS_SQ`) or
+/// **k-means++** driven by a FIXED-seed LCG (no entropy/time → byte-reproducible bake). Standard count-weighted
+/// Lab k-means clustering the DISTINCT-colour set weighted by count (per `TILED_VOXELIZER_PLAN` §C3.1) — a
+/// deliberate, spec-sanctioned departure from asset-gen's `kmeans2(minit="++", seed=0)`, which clusters
+/// UNWEIGHTED raw samples via scipy; this is not the same algorithm. Then **Lloyd** iterations to convergence (`KMEANS_EPS_SQ`) or
 /// `KMEANS_MAX_ITERS`. Assignment ties break to the lowest centroid index; an empty cluster keeps its previous
 /// centroid (it is simply dropped by the caller). `k` is assumed `< labs.len()` (the caller short-circuits the
 /// lossless ≤k case), so k-means++ always finds distinct enough seeds.
@@ -1651,10 +1657,11 @@ fn rgb_to_lab(rgb: [u8; 3]) -> [f32; 3] {
         if s > 0.04045 { ((s + 0.055) / 1.055).powf(2.4) } else { s / 12.92 }
     };
     let (r, g, b) = (lin(rgb[0]), lin(rgb[1]), lin(rgb[2]));
-    // linear sRGB → XYZ (D65), the standard matrix (matches asset-gen's `m`).
-    let x = 0.4124 * r + 0.3576 * g + 0.1805 * b;
-    let y = 0.2126 * r + 0.7152 * g + 0.0722 * b;
-    let z = 0.0193 * r + 0.1192 * g + 0.9505 * b;
+    // linear sRGB → XYZ (D65), the standard D65 sRGB→XYZ matrix (IEC 61966-2-1 full-precision coefficients;
+    // each row sums to its white-point component Xn/Yn/Zn, so linear white → exactly (Xn, Yn, Zn) → Lab(100,0,0)).
+    let x = 0.4124564 * r + 0.3575761 * g + 0.1804375 * b;
+    let y = 0.2126729 * r + 0.7151522 * g + 0.072175 * b;
+    let z = 0.0193339 * r + 0.119192 * g + 0.9503041 * b;
     // Normalize by the D65 white point.
     let (xn, yn, zn) = (x / 0.95047, y / 1.0, z / 1.08883);
     let eps = 216.0 / 24389.0;
@@ -2031,10 +2038,9 @@ f 1 3 4
         assert!(black[0].abs() < 0.01 && black[1].abs() < 0.01 && black[2].abs() < 0.01, "black → L*a*b* ≈ 0");
         let white = rgb_to_lab([255, 255, 255]);
         assert!((white[0] - 100.0).abs() < 0.1, "white → L ≈ 100 (got {})", white[0]);
-        // The asset-gen matrix rows don't sum EXACTLY to the white point (0.4124+0.3576+0.1805 = 0.9505 vs
-        // the 0.95047 Xn), so white's chroma is a hair off zero — neutral to within ~0.5 ΔE, which is correct
-        // for this standard truncated matrix.
-        assert!(white[1].abs() < 0.5 && white[2].abs() < 0.5, "white is ~neutral (a,b ≈ 0): {white:?}");
+        // The full-precision standard matrix rows sum EXACTLY to the white point (Xn=0.95047, Zn=1.08883), so
+        // linear white normalizes to (1,1,1) → Lab a,b are exactly zero (neutral).
+        assert!(white[1].abs() < 0.01 && white[2].abs() < 0.01, "white is neutral (a,b ≈ 0): {white:?}");
         // sRGB 128 → linear ≈ 0.2158 → Y ≈ 0.2158 → L ≈ 53.59 (the canonical mid-grey lightness).
         let grey = rgb_to_lab([128, 128, 128]);
         assert!((grey[0] - 53.59).abs() < 0.2, "mid-grey → L ≈ 53.6 (got {})", grey[0]);
