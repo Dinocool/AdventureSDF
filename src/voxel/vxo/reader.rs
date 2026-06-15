@@ -4,9 +4,9 @@
 //! [`VxoFile::open`]/[`VxoFile::parse`] read the file header + every chunk (HEAD/MATL/BIDX/BRIK), verify
 //! CRCs, and skip unknown chunks (the forward-compat rule, §B1.0). [`VxoFile::decode_region`] decompresses a
 //! region body → its `(entries, palette_blob, index_blob)` [`DecodedRegion`]; [`DecodedRegion::brick`]
-//! decodes one entry → a [`Brick`] (uniform via [`BRICK_UNIFORM_FLAG`]; dense via `decode_paletted_cell` over
-//! the 8³ core → `Brick::from_voxels`), reusing the EXACT `gpu.rs` decode SSOT so a read-back brick is
-//! bit-identical to the live-generated one (the round-trip gate, §B2.8).
+//! decodes one entry → a [`Brick`] (uniform via the dedicated [`BRICK_FLAG_UNIFORM`] bit; dense via
+//! `decode_paletted_cell` over the 8³ core → `Brick::from_voxels`), reusing the EXACT `gpu.rs` decode SSOT so a
+//! read-back brick is bit-identical to the live-generated one (the round-trip gate, §B2.8).
 //!
 //! This is the WHOLE-FILE reader (B-i). The streamed mmap `VxoSource` + LRU + `classify` + `BrickSource`
 //! impl are Phase B-ii (out of scope here).
@@ -137,18 +137,18 @@ impl VxoFile {
     }
 
     /// Decompress + parse a region body (sliced from `BRIK` by its `BIDX` entry) into a [`DecodedRegion`]
-    /// (§B2.2 step 4). STORE (`brik_raw_len == brik_comp_len`) casts in place; zstd decodes into a
-    /// `brik_raw_len` buffer.
+    /// (§B2.2 step 4). Branches on the EXPLICIT `dir.compression` byte ([`VXO_REGION_STORE`]/[`VXO_REGION_ZSTD`]),
+    /// NOT on length equality: STORE casts in place; zstd decodes (pure-Rust `ruzstd`) into a `brik_raw_len`
+    /// buffer.
     pub fn decode_region(&self, dir: &VxoRegionDirEntry) -> anyhow::Result<DecodedRegion> {
         let start = dir.brik_offset as usize;
         let end = start + dir.brik_comp_len as usize;
         anyhow::ensure!(end <= self.brik.len(), "vxo: region body overruns BRIK chunk");
         let comp = &self.brik[start..end];
-        // STORE iff comp_len == raw_len (the §B1.5 convention).
-        let raw: std::borrow::Cow<[u8]> = if dir.brik_comp_len == dir.brik_raw_len {
-            std::borrow::Cow::Borrowed(comp)
-        } else {
-            std::borrow::Cow::Owned(zstd_decompress(comp, dir.brik_raw_len as usize)?)
+        let raw: std::borrow::Cow<[u8]> = match dir.compression {
+            VXO_REGION_STORE => std::borrow::Cow::Borrowed(comp),
+            VXO_REGION_ZSTD => std::borrow::Cow::Owned(zstd_decompress(comp, dir.brik_raw_len as usize)?),
+            other => anyhow::bail!("vxo: region has unknown compression code {other} (expected 0=STORE, 1=zstd)"),
         };
         parse_region(&raw, IVec3::new(dir.region_coord[0], dir.region_coord[1], dir.region_coord[2]))
     }
@@ -265,7 +265,15 @@ fn u32_prefix(bytes: &[u8]) -> Vec<u32> {
     bytes.chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect()
 }
 
-/// zstd-decompress `comp` into a `raw_len`-byte buffer (§B1.9). Wraps `zstd::bulk::decompress`.
+/// zstd-decompress `comp` into a `raw_len`-byte buffer (§B1.9) via PURE-RUST `ruzstd` — the runtime decode path
+/// pulls NO C toolchain (matching the project's ktx2/`ruzstd` "no C toolchain" discipline; the C `zstd` crate is
+/// offline-encode-only, behind `vxo-encode`). `ruzstd` decodes standard zstd frames, so it reads exactly what the
+/// encoder's `zstd::bulk::compress` produces. `raw_len` preallocates the output (a size hint, not a hard bound).
 fn zstd_decompress(comp: &[u8], raw_len: usize) -> anyhow::Result<Vec<u8>> {
-    zstd::bulk::decompress(comp, raw_len).map_err(|e| anyhow::anyhow!("zstd decompress: {e}"))
+    use std::io::Read;
+    let mut decoder = ruzstd::decoding::StreamingDecoder::new(comp)
+        .map_err(|e| anyhow::anyhow!("vxo: ruzstd init: {e}"))?;
+    let mut out = Vec::with_capacity(raw_len);
+    decoder.read_to_end(&mut out).map_err(|e| anyhow::anyhow!("vxo: ruzstd decode: {e}"))?;
+    Ok(out)
 }

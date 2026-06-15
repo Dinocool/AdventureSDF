@@ -3,6 +3,13 @@ name = "adventure"
 version = "0.1.0"
 edition = "2024"
 
+# The offline voxelizer / `.vxo` encoder. Needs `vxo-encode` (the C `zstd` compress side) so its default
+# per-region-zstd `write_vxo` works; build it with `cargo run --example voxelize_scene --features vxo-encode ...`.
+# `required-features` keeps a plain `cargo build --examples` (default, no feature) from pulling C `zstd-sys`.
+[[example]]
+name = "voxelize_scene"
+required-features = ["vxo-encode"]
+
 [features]
 # Default dev build = fast incremental linking + voxel physics + DLSS Ray Reconstruction. So a plain
 # `cargo run` (or `cargo run --features editor`) gets walk-the-cubes physics AND the RR denoiser with no
@@ -68,6 +75,12 @@ physics = ["dep:rapier3d"]
 # `build.rs` copies the `nvngx_dlss*.dll` runtime next to the exe. Replaces the temporal-accum denoise
 # (which stays the non-dlss / non-RTX fallback). See memory `solari-gi-worktree` for the proven recipe.
 dlss = ["bevy/dlss"]
+# Offline `.vxo` ENCODE with per-region zstd compression. Pulls the C-backed `zstd` crate (`zstd-sys` →
+# `cc`/`pkg-config`), so it is OFF by default — the shipped library/runtime build (and `cargo build`/`clippy`
+# default) needs NO C toolchain. The RUNTIME reader always DECODES zstd with pure-Rust `ruzstd`; only PRODUCING a
+# zstd region body (`VxoCompression::Zstd`, the `voxelize_scene` example) needs this. Build the encoder example
+# with `--features vxo-encode`; without it, `write_vxo` can still `Store` (and the reader still decodes both).
+vxo-encode = ["dep:zstd"]
 
 [dependencies]
 # Pruned Bevy feature set: `default-features = false` then ONLY what this 3D + egui app
@@ -170,12 +183,19 @@ dot_vox = "5.2"
 # the file-read IO error + the `dot_vox` parse error behind one `anyhow::Error` so callers get a clean
 # `Result` without a bespoke error enum. Tiny, ubiquitous, no transitive weight.
 anyhow = "1"
-# Per-region compression for the native `.vxo` voxel asset format (`voxel::vxo`, Phase B-i). A RUNTIME dep:
-# `.vxo` is the engine-owned baked-scene transport, and each region-chunk is independently zstd'd (or STORE'd)
-# so the streamed loader decompresses only the regions a clipmap shell needs (`docs/VXO_FORMAT.md` §B1.9). zstd
-# decode is ~GB/s — the load path, not a hot trace path. Used by both the offline encoder (`write_vxo`, in the
-# `voxelize_scene` example) and the runtime reader, so compress/decompress share one SSOT.
-zstd = "0.13"
+# `.vxo` per-region zstd DECODE — pure-Rust `ruzstd` (matching Bevy's `zstd_rust` backend; NO C toolchain), a
+# RUNTIME dep. `.vxo` is the engine-owned baked-scene transport; each region-chunk is independently zstd'd (or
+# STORE'd) so the streamed loader decompresses only the regions a clipmap shell needs (`docs/VXO_FORMAT.md`
+# §B1.9). The RUNTIME reader (`voxel::vxo::reader`) decodes with `ruzstd` — decode is ~GB/s, the load path, not a
+# hot trace path — so the shipped library/runtime build pulls NO C `zstd-sys`/`cc`/`pkg-config`. (Also used by
+# the offline KTX2 voxelizer below; Cargo unifies the single dep.)
+ruzstd = "0.8"
+# `.vxo` per-region zstd COMPRESS — the C-backed `zstd` crate (`zstd-sys` → `cc`/`pkg-config`), needed ONLY by
+# the OFFLINE encoder (`write_vxo`'s `VxoCompression::Zstd`, used by the `voxelize_scene` example). OPTIONAL +
+# behind the `vxo-encode` feature so the DEFAULT library/runtime build needs NO C toolchain (the project's
+# pure-Rust discipline, cf. the ktx2/`ruzstd` notes). `ruzstd` decodes standard zstd frames, so what this
+# produces the runtime reader reads back. Confirm: `cargo tree` (default features) shows no `zstd-sys`.
+zstd = { version = "0.13", optional = true }
 
 [dev-dependencies]
 # spv-out: emit SPIR-V from naga in tests so we can inspect which opcode signed `%`
@@ -205,16 +225,15 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg",
 # KTX2/Basis base-colour TEXTURE DECODE for the offline voxelizer ONLY (`examples/voxelize_scene.rs`),
 # so Bistro Exterior bakes per-voxel albedo from its KTX2 textures (UASTC blocks + Zstd supercompression,
 # `KHR_texture_basisu`) instead of flat factors. `gltf`'s `image` feature can't decode KTX2, so we decode
-# it ourselves the same way Bevy's `bevy_image` does: `ktx2` parses the container/header/levels; `ruzstd`
-# (pure-Rust Zstd, matching Bevy's `zstd_rust` backend — no C toolchain) decompresses the supercompressed
-# level; `basis-universal` transcodes the UASTC 4×4 blocks to RGBA8. `serde_json` reads the raw glTF JSON
-# to map each texture → its `KHR_texture_basisu` KTX2 image and to STRIP the unsupported `extensionsRequired`
-# entry that otherwise makes `gltf::import` reject the file. ALL DEV-only — the shipped `.vox` runtime
-# loader never decodes textures, parses glTF/JSON, or links a Basis transcoder. Versions match `bevy_image`
-# (D:/bevy-fork): ktx2 0.5, basis-universal 0.3, ruzstd 0.8.
+# it ourselves the same way Bevy's `bevy_image` does: `ktx2` parses the container/header/levels; pure-Rust
+# `ruzstd` (a RUNTIME dep now — see `[dependencies]`, shared by the `.vxo` reader) decompresses the
+# supercompressed level; `basis-universal` transcodes the UASTC 4×4 blocks to RGBA8. `serde_json` reads the raw
+# glTF JSON to map each texture → its `KHR_texture_basisu` KTX2 image and to STRIP the unsupported
+# `extensionsRequired` entry that otherwise makes `gltf::import` reject the file. DEV-only here — the shipped
+# `.vox` runtime loader never decodes textures, parses glTF/JSON, or links a Basis transcoder. Versions match
+# `bevy_image` (D:/bevy-fork): ktx2 0.5, basis-universal 0.3.
 ktx2 = "0.5"
 basis-universal = "0.3"
-ruzstd = "0.8"
 serde_json = "1"
 # Parallel triangle rasterization in the offline voxelizer (`examples/voxelize_scene.rs`): the 13-axis SAT
 # overlap test + per-voxel albedo sample is embarrassingly parallel over triangles, so we fan it across all

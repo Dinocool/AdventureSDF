@@ -16,17 +16,30 @@ the `.vxo` reader (`src/voxel/vxo/`); `dot_vox`/`gltf`/`image` stay DEV/offline 
 
 These are read straight from the code and the storage plan; every layout decision below honours them.
 
-1. **`BRIK` body MUST be memcpy-decodable into the GPU arena** — NOT a re-encode. The resident VRAM form
+1. **`BRIK` stores the R2b encoding so a read-back brick is bit-identical + its packed `GpuBrickPatch` is
+   byte-identical** — NOT a literal memcpy of brick bodies into the GPU arena. The resident VRAM form
    (`src/voxel/gpu.rs`) is the **R2b per-brick triple**: a tiny per-brick palette (`brick_palettes: Vec<u32>`,
    the `k` distinct `u16` ids zero-extended), a bit-packed index stream (`voxels: Vec<u32>`,
    `index_bits ∈ {1,2,4,8,16}`), plus a 48-byte `GpuBrickMeta` and a 32-byte `GpuBrickAabb`. A uniform brick
-   (R1) emits NO index/palette bytes — its single id rides in the meta (`BRICK_UNIFORM_FLAG`). The on-disk
-   `BRIK` body stores **exactly the R2b `(palette, index_bits, indices)` triple per brick** (plus the uniform
-   flag + id), so loading is: decompress the region-chunk → the brick bodies are already in the resident
-   layout → the only per-brick work is recomputing the running `voxel_offset`/`palette_base`/`world_min`/AABB
-   from the destination arena slot (those are arena-relative, never stored). This matches
-   `VOXEL_STORAGE_PLAN.md` R5: "share R2's per-brick palette format between disk and VRAM so the loader
-   expands a brick with minimal transcode."
+   (R1) emits NO index/palette bytes — its single id rides in the meta's low 16 bits with the dedicated
+   `META_FLAG_UNIFORM` (A4.1; see constraint 1a below). **What B-i actually delivers (the honest property):** the
+   disk stores each brick's **8³ CORE** R2b-encoded; the loader decodes it to a `Brick`, and the packer
+   (`pack_one`) re-halos + re-encodes it from the resident set. So a streamed brick is a **bit-identical
+   `Brick`** and its **packed `GpuBrickPatch` is byte-identical** to a live one — the CORRECT `BrickSource`
+   contract — but loading is a decode-then-pack, NOT a raw memcpy of stored bodies into the arena (the running
+   `voxel_offset`/`palette_base`/`world_min`/AABB are arena-relative, recomputed at pack time, never stored).
+   This still honours `VOXEL_STORAGE_PLAN.md` R5 ("share R2's per-brick palette format between disk and VRAM so
+   the loader expands a brick with minimal transcode"): the disk and resident encodings are the same R2b form,
+   so the transcode is just the re-halo, not a format conversion.
+
+   **1a. Uniform discriminant — a DEDICATED flag bit, not bit-31 of an offset (A4.1).** `gpu.rs` RETIRED the
+   old `BRICK_UNIFORM_FLAG = 1<<31` of `voxel_offset` — it silently capped a real dense offset at `< 2^31` (a
+   corruption trap once the arena passes `2^31` `u32`s). The uniform marker now lives in a dedicated
+   `GpuBrickMeta.flags` word (`META_FLAG_UNIFORM = 1`). The `.vxo` disk form MIRRORS this: the uniform marker is
+   a dedicated `VxoBrickEntry.flags` bit (`BRICK_FLAG_UNIFORM = 1<<2`; bit0=surface, bit1=full are taken), so
+   `VxoBrickEntry.index_off` uses the FULL `u32` range for a dense brick's region-local offset. The encoder also
+   guards that each region's blob lengths/offsets fit `u32` (region-local ⇒ always true today, a robust-by-
+   construction backstop).
 
 2. **Pointer-free / fixed-layout / mmap-able.** Every chunk body is a flat, self-describing run of
    POD records addressed by byte offset from the chunk start — no in-file pointers, no `Box`, no relocation.
@@ -180,24 +193,30 @@ struct VxoRegionHeader {        // 32 B
 #[repr(C)] #[derive(Pod, Zeroable)]
 struct VxoBrickEntry {          // 32 B — one resident brick, decode-ready
     brick_coord:  [i32; 3],     // LOD0 brick coord (absolute, world grid)
-    // R1 uniform OR R2b dense, distinguished by the high bit of `index_off`:
-    index_off:    u32,          // if UNIFORM bit (1<<31) set: low 16 bits = the uniform BlockId.
-                                // else: REGION-LOCAL u32 offset into index_blob (bit31 clear ⇒ < 2^31, fine).
+    // R1 uniform OR R2b dense, distinguished by the dedicated BRICK_FLAG_UNIFORM bit in `flags` (A4.1):
+    index_off:    u32,          // if UNIFORM (flags & BRICK_FLAG_UNIFORM): low 16 bits = the uniform BlockId.
+                                // else: REGION-LOCAL u32 offset into index_blob — the FULL u32 range, no
+                                //   reserved high bit.
     palette_off:  u32,          // REGION-LOCAL u32 offset into palette_blob (dense only; 0 for uniform)
     index_bits:   u8,           // ∈ {1,2,4,8,16} (dense only; 0 for uniform)
     palette_len:  u8,           // k distinct ids (dense; ≤ 255 — a 10³ brick can't exceed that meaningfully;
                                 //   if a pathological brick needs >255, split index_bits=16 path, store k in
                                 //   a u16 via `_pad` — see note). 0 for uniform.
-    flags:        u8,           // bit0 = brick is on the asset's air-exposed surface (LITE/light-gather hint)
+    flags:        u8,           // bit0 = surface (LITE/light-gather hint); bit1 = fully-solid (classify cull);
+                                //   bit2 = BRICK_FLAG_UNIFORM (R1 collapse — the uniform discriminant)
     _pad0:        u8,
     _pad1:        u32,          // 0 → 32-B aligned
 }
 ```
 
-Critical: `index_off`/`palette_off` are **region-local** (base 0 within this region's blobs). The uniform flag
-re-uses the SAME `BRICK_UNIFORM_FLAG = 1<<31` convention as `gpu.rs` so the on-disk and in-VRAM uniform
-encodings are bit-compatible. `index_bits`/`palette_len`/the index stream are **byte-identical to
-`encode_paletted(cells)`** (`gpu.rs`) — the disk stores the R2b output verbatim, the memcpy-decode property.
+Critical: `index_off`/`palette_off` are **region-local** (base 0 within this region's blobs). **The uniform
+discriminant is a DEDICATED `flags` bit (`BRICK_FLAG_UNIFORM = 1<<2`), mirroring `gpu.rs`'s `META_FLAG_UNIFORM`
+(A4.1)** — NOT the old `1<<31`-of-`index_off` convention, which `gpu.rs` retired to free `voxel_offset` for the
+full `u32` range (a silent-corruption trap past `2^31`). So `index_off` uses the FULL `u32` for a dense brick's
+region-local offset; the encoder guards the blob lengths fit `u32` (region-local ⇒ always true, a backstop).
+`index_bits`/`palette_len`/the index stream are **byte-identical to `encode_paletted(cells)`** (`gpu.rs`) — the
+disk stores the R2b core output verbatim; the read-back `Brick` and its re-packed `GpuBrickPatch` are
+bit-/byte-identical to a live one (a decode-then-pack, see §0.1, not a raw memcpy).
 
 The cells stored per brick are the **haloed `10³` grid** (`halo_cells(0)`), exactly as `pack_one` produces
 (core + 1-cell neighbour border, AIR where absent). Storing the halo means the loaded brick is trace-ready with
@@ -248,17 +267,22 @@ mirrors `pack_brickmap`'s deterministic order):
 
 ```rust
 #[repr(C)] #[derive(Pod, Zeroable)]
-struct VxoRegionDirEntry {      // 32 B
+struct VxoRegionDirEntry {      // 48 B (32 + the explicit compression byte, padded to a 16-multiple)
     region_coord:   [i32; 3],   // the K-brick-grid region coord (the search key)
     brick_count:    u32,        // bricks in this region (preallocate the decode)
     brik_offset:    u64,        // byte offset of this region's chunk WITHIN the BRIK chunk body
     brik_comp_len:  u32,        // COMPRESSED byte length of the region chunk (the seek+read span)
-    brik_raw_len:   u32,        // DECOMPRESSED byte length (preallocate the zstd output; 0 ⇒ STORE/uncompressed)
+    brik_raw_len:   u32,        // DECOMPRESSED byte length (preallocate the decode output)
+    compression:    u8,         // EXPLICIT: 0 = STORE (uncompressed), 1 = zstd. The reader BRANCHES ON THIS,
+                                //   never on `comp_len == raw_len` (a zstd body can compress to exactly raw len).
+    _pad:           [u8; 15],   // 0 → 48-B (16-multiple) stride (the u64 forces 8-align; pad to a clean 16x).
 }
 ```
 
 - `brik_offset` + `brik_comp_len` = the exact `pread` span; `brik_raw_len` sizes the decompress buffer (or, if
-  `STORE`d, lets the loader mmap the slice directly — `brik_raw_len == brik_comp_len`). Mmap-ability (§0.2):
+  `compression == STORE`, lets the loader mmap the slice directly — `brik_raw_len == brik_comp_len`). The
+  STORE-vs-zstd choice is the EXPLICIT `compression` byte, NOT length equality (FIX 3 — length equality silently
+  corrupts when a zstd body happens to compress to exactly its raw length). Mmap-ability (§0.2):
   with a `STORE` (uncompressed) `BRIK` the whole file is `bytemuck`-castable and a region needs zero copy; with
   zstd, the region decompresses into a cached `Vec<u8>` (§B2).
 - The directory is small (`region_count × 32 B`; even a Bistro-scale scene with ~50k non-empty regions is
@@ -299,13 +323,19 @@ string blob for paths. Deferred entirely — the merge-into-world scenes (the ga
 
 ### B1.9 zstd wrapping + mmap
 
-- **Per-region zstd** (`zstd` crate, dev+runtime — it is a small pure-Rust-bindable C lib, acceptable as a
-  runtime dep since it is the load path, not a mesh/texture decoder). Each region-chunk in `BRIK` is compressed
-  independently; `BIDX` carries comp/raw lengths. Level ~`19` offline (size) is fine — decode speed is what
-  matters at runtime and zstd decode is ~GB/s.
-- **`STORE` mode** (flag in `format_version`/`flags` or `brik_raw_len == brik_comp_len` per region): no
-  compression ⇒ the region body is `bytemuck`-castable in place from an mmap of the file. Use for assets where
-  load latency trumps disk size (or for the round-trip test, which wants byte-identity without a zstd dep).
+- **Per-region zstd.** Each region-chunk in `BRIK` is compressed independently; `BIDX` carries comp/raw lengths
+  + the explicit `compression` code. Level ~`19` offline (size) is fine — decode speed is what matters at
+  runtime and zstd decode is ~GB/s.
+  - **DECODE = pure-Rust `ruzstd`, a RUNTIME dep** (matches the project's ktx2/`ruzstd` "no C toolchain"
+    discipline). The shipped library/runtime reader (`voxel::vxo::reader`) decodes with `ruzstd`, so the default
+    build pulls NO C `zstd-sys`/`cc`/`pkg-config` (FIX 2).
+  - **COMPRESS = C `zstd`, OFFLINE-ENCODE ONLY, behind the `vxo-encode` cargo feature.** Only the offline encoder
+    (`write_vxo`'s `VxoCompression::Zstd`, used by `examples/voxelize_scene.rs --features vxo-encode`) links the
+    C `zstd` crate. `ruzstd` decodes standard zstd frames, so what the C encoder produces the runtime reader
+    reads back. A default-feature `write_vxo(.., Zstd)` errors clearly (use `Store` or enable `vxo-encode`).
+- **`STORE` mode** (the explicit `compression == 0` per region): no compression ⇒ the region body is
+  `bytemuck`-castable in place from an mmap of the file. Use for assets where load latency trumps disk size (or
+  for the round-trip test, which wants byte-identity without a zstd-compress dep).
 - **Whole-file mmap:** `HEAD`/`MATL`/`BIDX` are read once eagerly (small); `BRIK` is read lazily per region.
   With `memmap2` (offline+runtime) the loader mmaps the file and either casts (`STORE`) or `zstd::decode` a
   region slice. The file is the durable store; the only RAM held is `HEAD`+`MATL`+`BIDX` + the decoded-region
@@ -360,8 +390,9 @@ For `lod == 0` (and `lod > 0` once `LODS` is wired; §B1.7):
    index: Vec<u32> }`. Insert into the LRU (evict the least-recently-used past a byte budget, §B2.2 budget).
 5. **Find the brick** within the region: the region's `entries` are sorted by `brick_coord`, binary-search for
    `local`. Absent ⇒ `Brick::uniform(AIR)`.
-6. **Decode the brick to a `Brick`** (the in-RAM CPU brick the residency stores): if the entry's `index_off`
-   has `BRICK_UNIFORM_FLAG` ⇒ `Brick::uniform(BlockId(low16))`. Else decode the haloed `10³` cells via
+6. **Decode the brick to a `Brick`** (the in-RAM CPU brick the residency stores): if the entry's `flags` has
+   `BRICK_FLAG_UNIFORM` (A4.1 dedicated bit) ⇒ `Brick::uniform(BlockId(index_off & 0xFFFF))`. Else decode the
+   `8³` core cells via
    `decode_paletted_cell(&region.palette[palette_off..], index_bits, &region.index[index_off..], cell)` for
    each core cell (the `8³` core — strip the halo when building the CPU `Brick`, since the packer re-halos from
    the resident set; OR, optimization, keep the halo and feed it through — see §B2.7) → `Brick::from_voxels`.
@@ -476,7 +507,8 @@ Two valid loader paths for the haloed `10³` body:
    `VxoSource::brick(coord, 0)` `== StaticVoxSource::new(&original_map).brick(coord, 0)` (both `Brick`
    `PartialEq`). And the packed `GpuBrickPatch` from the streamed set is byte-identical to one packed from the
    original map (reuse the `incremental` A/B fingerprint helper, `incremental/tests.rs`). This proves the
-   memcpy-decode property — the disk R2b body decodes to the exact resident layout.
+   delivered property — the disk R2b core decodes to a bit-identical `Brick` whose re-packed layout is
+   byte-identical (a decode-then-pack, §0.1; not a raw memcpy).
 3. **`classify` parity.** `VxoSource::classify == StaticVoxSource::classify` for the same geometry (the
    surface-only cull is preserved), so the Θ(H²) residency win holds for `.vxo` scenes.
 4. **Zero warnings, both feature builds** (the standing invariant) + the per-stage adversarial-review QA gate
@@ -584,9 +616,10 @@ forbidden). Gate: **non-edited assets only** (no COW hazard — `VOXEL_PROGRAM.m
 4. **`LITE`/`LODS` ship-vs-rebuild.** v1 rebuilds lights + coarse LODs in RAM at load (bounded by surface-only
    residency). Decide from the gallery-worst-case RAM measurement (B2 gate) whether streamed Bistro needs the
    pre-baked `LODS`/`LITE` chunks to stay under budget.
-5. **zstd as a runtime dep.** Acceptable (it is the load path, pure-C-bindable, ~GB/s decode), but confirm no
-   licensing/build friction on the Windows/Vulkan target; the `STORE` mode is the fallback if zstd is undesired
-   at runtime.
+5. **zstd dependency split (RESOLVED, FIX 2).** Runtime DECODE uses pure-Rust `ruzstd` (no C toolchain); the C
+   `zstd` crate (compress) is offline-encode-only behind the `vxo-encode` feature. The default library/runtime
+   build pulls no `zstd-sys`. `STORE` mode remains the zstd-free fallback. (Open only: whether very-large-scene
+   bake times want a faster compressor — irrelevant to the runtime.)
 6. **B3 SVDAG node format.** The exact per-region DAG node encoding (child-mask + variable vs fixed `u32`
    pointers) is sketched, not pinned — pin it when B3 starts, validated against a region round-trip
    (DAG-encode → decode → bit-identical `DecodedRegion`).
@@ -597,11 +630,12 @@ forbidden). Gate: **non-edited assets only** (no COW hazard — `VOXEL_PROGRAM.m
 
 - **Chunks:** `magic "VXO1"` + RIFF-style tagged/length-prefixed/skippable chunks: **HEAD** (self-describing
   `voxel_size`/bounds/anchor/K/counts), **MATL** (`u16`-keyed linear-RGBA + emissive material table, NO 256
-  cap), **BIDX** (the sorted region→`(brik_offset, comp_len, raw_len, brick_count)` directory — the piece that
-  makes region streaming possible), **BRIK** (per-region zstd'd blobs; each region = `VxoRegionHeader` +
-  `VxoBrickEntry[]` + region-local `palette_blob`/`index_blob`, the **R2b triple verbatim** so decode is a
-  memcpy into the GPU arena, NOT a re-encode); optional **LITE**/**LODS**/**INST** (sketched, deferred).
-- **BIDX design:** small eager-loaded sorted table (`32 B/region`, binary-searched by `(z,y,x)`), giving the
+  cap), **BIDX** (the sorted region→`(brik_offset, comp_len, raw_len, compression, brick_count)` directory — the
+  piece that makes region streaming possible), **BRIK** (per-region STORE/zstd blobs; each region =
+  `VxoRegionHeader` + `VxoBrickEntry[]` + region-local `palette_blob`/`index_blob`, the **R2b core triple
+  verbatim** so a read-back brick is bit-identical and its re-packed `GpuBrickPatch` byte-identical — a
+  decode-then-pack, NOT a raw memcpy); optional **LITE**/**LODS**/**INST** (sketched, deferred).
+- **BIDX design:** small eager-loaded sorted table (`48 B/region`, binary-searched by `(z,y,x)`), giving the
   exact `pread` span + decompress size per region — lazy per-region `BRIK` reads, never a whole-file expand.
 - **Streamed loader:** `VxoSource` = mmap'd file + `BIDX` + a byte-budgeted decoded-region LRU, implementing
   `BrickSource` (`brick`/`classify`) so it feeds the EXISTING `ResidencyManager` demand path — ONE residency

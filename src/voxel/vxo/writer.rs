@@ -4,14 +4,16 @@
 //! format: region-bucket the bricks by `brick_coord.div_euclid(K)`, per brick `encode_paletted` its **8³
 //! CORE** (§B2.7 resolution — NOT the halo: the loader re-halos from the resident set), intern identical
 //! cores WITHIN a region ([`VoxelInterner`], R3), and emit the `VxoBrickEntry` table + region-local
-//! `palette_blob`/`index_blob` + a [`VxoRegionHeader`]. R1 uniform bricks collapse to the entry's
-//! [`BRICK_UNIFORM_FLAG`] id (no palette/index bytes). Region bodies are STORE'd or per-region zstd'd
-//! (§B1.9); `BIDX` is sorted by `(z,y,x)`.
+//! `palette_blob`/`index_blob` + a [`VxoRegionHeader`]. R1 uniform bricks collapse to the entry's low-16-bit
+//! id with the dedicated [`BRICK_FLAG_UNIFORM`] discriminant (no palette/index bytes). Region bodies are
+//! STORE'd or per-region zstd'd (§B1.9); `BIDX` is sorted by `(z,y,x)`.
 //!
-//! The per-brick R2b `(palette, index_bits, indices)` triple is byte-identical to `gpu.rs`'s
-//! [`encode_paletted`] output — the disk stores the resident encoding verbatim (the memcpy-decode property,
-//! §0.1). The 8³-core choice keeps regions independently decodable AND the loaded `Brick` bit-identical to a
-//! live one (the round-trip gate, §B2.8).
+//! **What round-trips (the delivered property):** the disk stores each brick's **8³ CORE** R2b-encoded, and the
+//! loader decodes it back to a `Brick`; the packer (`pack_one`) then re-halos + re-encodes from the resident set.
+//! So the guarantee is a **bit-identical `Brick` + a byte-identical packed `GpuBrickPatch`** — NOT a raw memcpy
+//! of brick bodies into the GPU arena (the on-disk core is re-haloed/re-encoded at pack time, which is the
+//! CORRECT `BrickSource` contract). The 8³-core choice keeps regions independently decodable AND the loaded
+//! `Brick` bit-identical to a live one (the round-trip gate, §B2.8).
 
 use std::io::Write;
 
@@ -133,7 +135,8 @@ pub fn encode_vxo(
         let mut coords = regions.remove(rc).expect("region present");
         coords.sort_by_key(|c| (c.z, c.y, c.x));
         total_bricks += coords.len() as u64;
-        let raw = encode_region(*rc, &coords, map);
+        let raw = encode_region(*rc, &coords, map)?;
+        anyhow::ensure!(raw.len() as u64 <= u32::MAX as u64, "region {rc:?} body exceeds u32 byte length");
         let raw_len = raw.len() as u32;
         let stored = match comp {
             VxoCompression::Store => raw,
@@ -142,24 +145,30 @@ pub fn encode_vxo(
         let comp_len = stored.len() as u32;
         let offset = brik_body.len() as u64;
         brik_body.extend_from_slice(&stored);
+        let compression = match comp {
+            VxoCompression::Store => VXO_REGION_STORE,
+            VxoCompression::Zstd(_) => VXO_REGION_ZSTD,
+        };
         bidx.push(VxoRegionDirEntry {
             region_coord: [rc.x, rc.y, rc.z],
             brick_count: coords.len() as u32,
             brik_offset: offset,
             brik_comp_len: comp_len,
-            // STORE ⇒ raw_len == comp_len (the §B1.5 convention the reader uses to detect STORE).
             brik_raw_len: match comp {
                 VxoCompression::Store => comp_len,
                 VxoCompression::Zstd(_) => raw_len,
             },
+            // EXPLICIT compression discriminant (§B1.5) — the reader branches on THIS, never on length equality.
+            compression,
+            _pad: [0; 15],
         });
     }
     // BIDX sorted by (z,y,x) — the binary-search key (§B1.5).
     bidx.sort_by_key(|e| (e.region_coord[2], e.region_coord[1], e.region_coord[0]));
 
     // 3. Assemble the file: header + HEAD + MATL + BIDX + BRIK. The compression mode is signalled PER REGION
-    //    in BIDX (`brik_comp_len == brik_raw_len` ⇒ STORE), NOT in the file flags — so `flags` is just the
-    //    little-endian bit (bit1 = SVDAG is a B3 concern, never set by B-i).
+    //    by BIDX's EXPLICIT `compression` byte (STORE/zstd), NOT in the file flags and NOT inferred from length
+    //    equality — so `flags` is just the little-endian bit (bit1 = SVDAG is a B3 concern, never set by B-i).
     let flags = VXO_FLAG_LITTLE_ENDIAN;
     let mut out: Vec<u8> = Vec::with_capacity(64 + brik_body.len());
     write_file_header(&mut out, flags);
@@ -188,8 +197,9 @@ fn write_file_header(out: &mut Vec<u8>, flags: u16) {
     out.extend_from_slice(bytes_of(&header));
 }
 
-/// Frame one chunk: the 16-byte `VxoChunkHeader` (tag + `body_len` + body CRC32) then `body`, then zero-pad
-/// the body up to a 16-byte multiple (the pad is OUTSIDE `body_len`, §B1.0) so the next chunk starts aligned.
+/// Frame one chunk: the 32-byte `VxoChunkHeader` (tag + `body_len` + body CRC32, padded to a 16-multiple) then
+/// `body`, then zero-pad the body up to a 16-byte multiple (the pad is OUTSIDE `body_len`, §B1.0) so the next
+/// chunk starts 16-aligned.
 fn write_chunk(out: &mut Vec<u8>, tag: [u8; 4], body: &[u8]) {
     let header = VxoChunkHeader {
         tag,
@@ -286,7 +296,11 @@ fn build_bidx_body(bidx: &[VxoRegionDirEntry]) -> Vec<u8> {
 /// Encode ONE region's body (DECOMPRESSED): `VxoRegionHeader` then `[VxoBrickEntry; N]` then `palette_blob`
 /// then `index_blob` (§B1.3). Per brick: the **8³ core** is R1-collapsed to a uniform entry, else
 /// R2b-encoded + R3-interned WITHIN this region. The `is_full` bit is baked into the entry flags (§B2.5).
-fn encode_region(region_coord: IVec3, coords: &[IVec3], map: &BrickMap) -> Vec<u8> {
+///
+/// Returns an error if a dense brick's region-local `index_off`/`palette_off` overflows `u32` (the robust-by-
+/// construction backstop A4.1 mandates — region-local offsets always fit `u32` today, but the guard means a
+/// future too-large region is a HARD bake error, never a silent wrap).
+fn encode_region(region_coord: IVec3, coords: &[IVec3], map: &BrickMap) -> anyhow::Result<Vec<u8>> {
     let mut entries: Vec<VxoBrickEntry> = Vec::with_capacity(coords.len());
     let mut palette_blob: Vec<u32> = Vec::new();
     let mut index_blob: Vec<u32> = Vec::new();
@@ -304,16 +318,17 @@ fn encode_region(region_coord: IVec3, coords: &[IVec3], map: &BrickMap) -> Vec<u
             flags |= BRICK_FLAG_SURFACE;
         }
 
-        // R1 — UNIFORM core collapse: a single-block core stores its id in the entry, no palette/index bytes.
-        // (A uniform-AIR brick is never in the map — `insert` drops empties — so `uniform_block()` is solid.)
+        // R1 — UNIFORM core collapse: a single-block core stores its id in the entry's LOW 16 bits, the uniform
+        // discriminant rides in `flags` (A4.1: a dedicated bit, NOT bit-31 of `index_off`), no palette/index
+        // bytes. (A uniform-AIR brick is never in the map — `insert` drops empties — so `uniform_block()` is solid.)
         if let Some(block) = brick.uniform_block() {
             entries.push(VxoBrickEntry {
                 brick_coord: [coord.x, coord.y, coord.z],
-                index_off: BRICK_UNIFORM_FLAG | (block.0 as u32 & 0xFFFF),
+                index_off: block.0 as u32 & 0xFFFF,
                 palette_off: 0,
                 index_bits: 0,
                 palette_len: 0,
-                flags,
+                flags: flags | BRICK_FLAG_UNIFORM,
                 _pad0: 0,
                 _pad1: [0; 2],
             });
@@ -324,13 +339,20 @@ fn encode_region(region_coord: IVec3, coords: &[IVec3], map: &BrickMap) -> Vec<u
         // decodes these back into a `Brick` and the packer re-halos from the resident set, so the loaded
         // brick is bit-identical to a live one.
         let cells = core_cells(brick);
-        // Assert k ≤ 255 (the entry's u8 palette_len; §B1.3 — no shipping brick approaches it).
-        debug_assert!(distinct_count(&cells) <= 255, "a brick core needs ≤255 distinct ids for v1");
-        let layout = interner.intern_paletted(&mut index_blob, &mut palette_blob, &cells);
+        // The §B1.3 prealloc hint: `k` distinct ids, clamped into the entry's `u8` (k ≤ 255 — no shipping brick
+        // approaches it; the decode is bounded by `index_bits`, not this).
         let palette_len = palette_len_of(&cells);
+        let layout = interner.intern_paletted(&mut index_blob, &mut palette_blob, &cells);
+        // A4.1 robust-by-construction backstop: the region-local offsets are derived from the blob lengths, so a
+        // blob exceeding u32 would silently wrap on cast. Region-local ⇒ this never fires today, but a HARD error
+        // beats silent corruption if a future region grows past 4 Gi words.
+        anyhow::ensure!(
+            (index_blob.len() as u64) <= u32::MAX as u64 && (palette_blob.len() as u64) <= u32::MAX as u64,
+            "region {region_coord:?}: index/palette blob exceeds u32 word offset range (corruption backstop)"
+        );
         entries.push(VxoBrickEntry {
             brick_coord: [coord.x, coord.y, coord.z],
-            index_off: layout.voxel_offset, // bit31 clear (full u32 range, < 2^31) ⇒ not uniform
+            index_off: layout.voxel_offset, // full u32 region-local offset; the uniform discriminant is in `flags`
             palette_off: layout.palette_base,
             index_bits: layout.index_bits,
             palette_len,
@@ -358,7 +380,7 @@ fn encode_region(region_coord: IVec3, coords: &[IVec3], map: &BrickMap) -> Vec<u
     out.extend_from_slice(bytemuck::cast_slice(&entries));
     out.extend_from_slice(bytemuck::cast_slice(&palette_blob));
     out.extend_from_slice(bytemuck::cast_slice(&index_blob));
-    out
+    Ok(out)
 }
 
 /// The brick's 8³ CORE cells as `u32` block ids in `voxel_index` order (`+X` fastest, then `+Y`, then `+Z`)
@@ -394,8 +416,22 @@ fn distinct_count(cells: &[u32]) -> usize {
     seen.len()
 }
 
-/// zstd-compress `raw` at `level` (§B1.9). Wraps `zstd::bulk::compress`; an error is surfaced as
-/// `anyhow::Error` (a compression failure is a hard bake error).
+/// zstd-compress `raw` at `level` (§B1.9). Wraps the C-backed `zstd::bulk::compress`, which pulls a C toolchain
+/// (`zstd-sys`/`cc`) — so it is OFFLINE-ENCODE ONLY, behind the `vxo-encode` feature. The RUNTIME decode path
+/// uses pure-Rust `ruzstd` ([`super::reader`]), never C zstd, so the shipped library/runtime build needs no C
+/// toolchain. The `voxelize_scene` example enables `vxo-encode`; a default build that asks for `Zstd` without
+/// the feature gets a clear error (use `Store`, or enable `vxo-encode`).
+#[cfg(feature = "vxo-encode")]
 fn zstd_compress(raw: &[u8], level: i32) -> anyhow::Result<Vec<u8>> {
     zstd::bulk::compress(raw, level).map_err(|e| anyhow::anyhow!("zstd compress: {e}"))
+}
+
+/// Stub when `vxo-encode` is off: zstd COMPRESSION needs the C `zstd` crate (toolchain). The default build can
+/// still `Store` and (via pure-Rust `ruzstd`) DECODE zstd, but cannot PRODUCE a zstd region body.
+#[cfg(not(feature = "vxo-encode"))]
+fn zstd_compress(_raw: &[u8], _level: i32) -> anyhow::Result<Vec<u8>> {
+    anyhow::bail!(
+        "vxo: zstd region compression needs the `vxo-encode` feature (the offline encoder's C zstd). \
+         Use VxoCompression::Store, or build with --features vxo-encode."
+    )
 }

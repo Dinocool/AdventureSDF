@@ -43,17 +43,21 @@ pub const TAG_BRIK: [u8; 4] = *b"BRIK";
 /// `END ` sentinel chunk tag (optional).
 pub const TAG_END: [u8; 4] = *b"END ";
 
-/// The `VxoBrickEntry.index_off` high bit marking a UNIFORM brick — re-uses the SAME convention as
-/// `gpu.rs`'s former bit-31 flag (`VXO_FORMAT.md` §B1.3): when set, the low 16 bits of `index_off` hold the
-/// single uniform [`crate::voxel::palette::BlockId`]; the brick emits no palette/index bytes. Bit-compatible
-/// with the in-VRAM uniform encoding so the on-disk and resident uniform forms agree.
-pub const BRICK_UNIFORM_FLAG: u32 = 1 << 31;
-
 /// `VxoBrickEntry.flags` bit0: the brick is on the asset's air-exposed surface (LITE / light-gather hint).
 pub const BRICK_FLAG_SURFACE: u8 = 1 << 0;
 /// `VxoBrickEntry.flags` bit1: the brick is FULLY SOLID (every voxel solid). The conservative-enclosed-cull
 /// (`classify`) reads this WITHOUT decoding voxels — baked by the encoder from [`crate::voxel::brickmap::Brick::is_full`].
 pub const BRICK_FLAG_FULL: u8 = 1 << 1;
+/// `VxoBrickEntry.flags` bit2: the brick is UNIFORM (R1 collapse) — its single [`crate::voxel::palette::BlockId`]
+/// rides in the LOW 16 bits of `index_off`, and it emits NO palette/index bytes.
+///
+/// **A4.1 alignment — a DEDICATED discriminant bit, NOT bit-31 of `index_off`.** This mirrors the live VRAM
+/// SSOT `gpu.rs`'s `META_FLAG_UNIFORM` (a dedicated `GpuBrickMeta.flags` word): `gpu.rs` RETIRED the old
+/// `BRICK_UNIFORM_FLAG = 1<<31` of `voxel_offset` precisely because it silently capped a real dense offset at
+/// `< 2^31` (a silent-corruption trap the moment the arena passes `2^31` `u32`s). We make the disk form match:
+/// `index_off` uses the FULL `u32` range for a dense brick's region-local index-blob offset, and the uniform
+/// marker lives here in `flags`. (Surface = bit0, full = bit1 are taken, so uniform takes bit2.)
+pub const BRICK_FLAG_UNIFORM: u8 = 1 << 2;
 
 /// The 16-byte fixed file header (`VXO_FORMAT.md` §B1.0). Bytes: `magic[4] + format_version u16 + flags u16
 /// + header_crc32 u32 + _reserved u32`.
@@ -157,7 +161,14 @@ pub const MATL_FLAG_TINTABLE: u32 = 1 << 0;
 /// `MATL.flags` bit1: the block is an emitter (precomputed `any(emissive > 0)`).
 pub const MATL_FLAG_EMITTER: u32 = 1 << 1;
 
-/// `BIDX` — one sorted region-directory entry (`VXO_FORMAT.md` §B1.5). 32 bytes. The `BIDX` body is
+/// A [`VxoRegionDirEntry::compression`] value: the region body is STORED uncompressed (`bytemuck`-castable in
+/// place; `brik_comp_len == brik_raw_len`).
+pub const VXO_REGION_STORE: u8 = 0;
+/// A [`VxoRegionDirEntry::compression`] value: the region body is a per-region zstd frame (decode into a
+/// `brik_raw_len` buffer).
+pub const VXO_REGION_ZSTD: u8 = 1;
+
+/// `BIDX` — one sorted region-directory entry (`VXO_FORMAT.md` §B1.5). 48 bytes. The `BIDX` body is
 /// `entry_count: u32` + `_pad: u32` then `entry_count × VxoRegionDirEntry`, sorted by `(z, y, x)` so a coord
 /// → entry is an `O(log n)` binary search.
 #[repr(C)]
@@ -173,6 +184,14 @@ pub struct VxoRegionDirEntry {
     pub brik_comp_len: u32,
     /// DECOMPRESSED byte length (preallocate the zstd output; for STORE, `brik_raw_len == brik_comp_len`).
     pub brik_raw_len: u32,
+    /// EXPLICIT per-region compression: [`VXO_REGION_STORE`] (0) or [`VXO_REGION_ZSTD`] (1). The reader branches
+    /// on THIS, never on `brik_comp_len == brik_raw_len` — a zstd body can coincidentally compress to exactly its
+    /// raw length, so length-equality is an ambiguous (silently-corrupting) discriminant.
+    pub compression: u8,
+    /// Pad → 48-byte (16-multiple) stride. 0. (`brik_offset`'s `u64` forces 8-byte align, so adding the
+    /// `compression` byte to the formerly-32-byte entry rounds the natural `#[repr(C)]` size up; we pad to the
+    /// next clean 16-multiple — 48 — so a `[VxoRegionDirEntry]` body stays internally 16-aligned for `bytemuck`.)
+    pub _pad: [u8; 15],
 }
 
 /// `BRIK` region-chunk header (`VXO_FORMAT.md` §B1.3). 32 bytes. A decompressed region chunk is:
@@ -196,14 +215,15 @@ pub struct VxoRegionHeader {
 }
 
 /// `BRIK` per-brick entry (`VXO_FORMAT.md` §B1.3). 32 bytes — one resident brick, decode-ready. R1 uniform
-/// OR R2b dense, distinguished by [`BRICK_UNIFORM_FLAG`] in `index_off`.
+/// OR R2b dense, distinguished by the dedicated [`BRICK_FLAG_UNIFORM`] bit in `flags` (A4.1-aligned — NOT a
+/// stolen `index_off` high bit).
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Pod, Zeroable)]
 pub struct VxoBrickEntry {
     /// LOD0 brick coord (absolute, world grid).
     pub brick_coord: [i32; 3],
-    /// UNIFORM ([`BRICK_UNIFORM_FLAG`] set): low 16 bits = the uniform BlockId. Else: REGION-LOCAL `u32`
-    /// word offset into `index_blob` (bit31 clear ⇒ < 2^31).
+    /// UNIFORM ([`BRICK_FLAG_UNIFORM`] set in `flags`): low 16 bits = the uniform BlockId. Else: REGION-LOCAL
+    /// `u32` word offset into `index_blob` — the FULL `u32` range (no reserved high bit; A4.1).
     pub index_off: u32,
     /// REGION-LOCAL `u32` word offset into `palette_blob` (dense only; 0 for uniform).
     pub palette_off: u32,
@@ -221,10 +241,12 @@ pub struct VxoBrickEntry {
 }
 
 impl VxoBrickEntry {
-    /// True iff this entry is a collapsed UNIFORM brick (its id rides in `index_off`).
+    /// True iff this entry is a collapsed UNIFORM brick — reads the dedicated [`BRICK_FLAG_UNIFORM`] bit
+    /// (A4.1: no longer an `index_off` high bit), exactly as `gpu.rs`'s `GpuBrickMeta::is_uniform` reads its
+    /// dedicated `flags` word.
     #[inline]
     pub fn is_uniform(&self) -> bool {
-        self.index_off & BRICK_UNIFORM_FLAG != 0
+        self.flags & BRICK_FLAG_UNIFORM != 0
     }
 
     /// The single uniform BlockId raw value (low 16 bits of `index_off`). Meaningful only when
@@ -234,8 +256,8 @@ impl VxoBrickEntry {
         (self.index_off & 0xFFFF) as u16
     }
 
-    /// The region-local index-blob word offset of a DENSE brick (the full `index_off` — the uniform flag is
-    /// clear so it never aliases). Meaningless for a uniform brick.
+    /// The region-local index-blob word offset of a DENSE brick (the FULL `index_off` — the uniform discriminant
+    /// is in `flags`, so `index_off` never aliases). Meaningless for a uniform brick.
     #[inline]
     pub fn dense_index_off(&self) -> u32 {
         self.index_off
@@ -294,7 +316,7 @@ mod tests {
         assert_eq!(std::mem::size_of::<VxoChunkHeader>() % 16, 0, "chunk header is a 16-multiple (bodies aligned)");
         assert_eq!(std::mem::size_of::<VxoHead>(), 80, "HEAD POD prefix (§B1.1)");
         assert_eq!(std::mem::size_of::<VxoMaterial>(), 48, "MATL entry is 48 B (§B1.2)");
-        assert_eq!(std::mem::size_of::<VxoRegionDirEntry>(), 32, "BIDX entry is 32 B (§B1.5)");
+        assert_eq!(std::mem::size_of::<VxoRegionDirEntry>(), 48, "BIDX entry is 48 B (§B1.5, +compression byte)");
         assert_eq!(std::mem::size_of::<VxoRegionHeader>(), 32, "region header is 32 B (§B1.3)");
         assert_eq!(std::mem::size_of::<VxoBrickEntry>(), 32, "brick entry is 32 B (§B1.3)");
         // The records carry no 16-aligned member, so their natural `#[repr(C)]` align is ≤ 8 (the reader uses
@@ -325,21 +347,36 @@ mod tests {
         assert_eq!(crc32(b""), 0, "empty input ⇒ 0 (init ^ final-xor cancel)");
     }
 
-    /// The uniform-flag accessors round-trip a raw uniform id and never alias a dense offset's high bit.
+    /// The uniform discriminant lives in `flags` (A4.1), so a DENSE brick's `index_off` may use the FULL `u32`
+    /// range (incl. bit 31) WITHOUT being misread as uniform — the old `1<<31` trap is gone.
     #[test]
     fn uniform_flag_accessors() {
         let uni = VxoBrickEntry {
             brick_coord: [1, 2, 3],
-            index_off: BRICK_UNIFORM_FLAG | 7,
+            index_off: 7, // the uniform id rides in the low 16 bits; NO high-bit marker
             palette_off: 0,
             index_bits: 0,
             palette_len: 0,
-            flags: BRICK_FLAG_FULL,
+            flags: BRICK_FLAG_FULL | BRICK_FLAG_UNIFORM,
             _pad0: 0,
             _pad1: [0; 2],
         };
         assert!(uni.is_uniform());
         assert_eq!(uni.uniform_block_raw(), 7);
+
+        // A dense brick whose region-local offset HAS bit 31 set: must NOT be misread as uniform (the A4.1 fix).
+        let dense_high = VxoBrickEntry {
+            brick_coord: [0, 0, 0],
+            index_off: 1 << 31,
+            palette_off: 56,
+            index_bits: 4,
+            palette_len: 3,
+            flags: BRICK_FLAG_SURFACE,
+            _pad0: 0,
+            _pad1: [0; 2],
+        };
+        assert!(!dense_high.is_uniform(), "bit-31-of-index_off must NOT mark uniform (A4.1)");
+        assert_eq!(dense_high.dense_index_off(), 1 << 31);
 
         let dense = VxoBrickEntry {
             brick_coord: [0, 0, 0],

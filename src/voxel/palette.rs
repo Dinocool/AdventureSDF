@@ -218,6 +218,18 @@ impl BlockRegistry {
     /// RGBA + linear emissive, unlike `.vox`'s sRGB, so no conversion). `roughness`/`metallic`/`tintable`
     /// round-trip from the table. No worldgen-material bridge (a baked asset has no [`TerrainMatId`] chain).
     /// Robust to an empty table (no AIR entry ⇒ falls back to an AIR-only registry so callers never panic).
+    ///
+    /// **v1 write-reserved-but-not-rebuilt fields (§B1.2, an honest round-trip gap).** [`BlockDef`] has no field
+    /// for these, so three `VxoMaterial` members are NOT reconstructed into the rebuilt registry:
+    /// * `emissive.w` (the emissive_strength multiplier) — the writer stores `1.0` and `BlockDef::emissive` is the
+    ///   already-multiplied radiance, so a non-`1.0` strength is not separately recoverable. (v1 always writes
+    ///   `1.0`, so there is no loss today; a future per-block strength needs a `BlockDef` field + a `head_version`
+    ///   bump.)
+    /// * `MATL_FLAG_EMITTER` — recomputed from `emissive != 0` ([`Self::has_emitters`]/[`Self::emissive`]), the
+    ///   SAME SSOT the writer set it from, so reading the stored bit would be redundant. It stays on disk as a
+    ///   cheap pre-baked hint for a future fast-path loader.
+    /// * the per-block `name` — `MATL` has no name field, so `BlockDef::name` is rebuilt EMPTY (debug-only, not
+    ///   load-bearing for trace/GI).
     pub fn from_vxo_matl(mats: &[super::vxo::format::VxoMaterial]) -> Self {
         if mats.is_empty() {
             return Self::air_only();

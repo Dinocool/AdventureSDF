@@ -186,7 +186,11 @@ fn round_trip_store_is_bit_identical() {
     round_trip(VxoCompression::Store);
 }
 
-/// The zstd round-trip yields the same bit-identical result (per-region zstd, §B1.9).
+/// The zstd round-trip yields the same bit-identical result (per-region zstd, §B1.9): the C-zstd encoder
+/// (`vxo-encode`) compresses, the pure-Rust `ruzstd` runtime reader decodes — proving the two are
+/// frame-compatible. Gated on `vxo-encode` (PRODUCING a zstd body needs the C compressor); run the gate with
+/// `--features vxo-encode`.
+#[cfg(feature = "vxo-encode")]
 #[test]
 fn round_trip_zstd_is_bit_identical() {
     round_trip(VxoCompression::Zstd(19));
@@ -215,10 +219,10 @@ fn regions_bucket_by_k() {
     assert_eq!(keys, sorted, "BIDX must be sorted by (z,y,x)");
 }
 
-/// STORE region bodies carry `brik_raw_len == brik_comp_len` (the §B1.5 STORE convention); zstd bodies
-/// compress (raw > comp for the redundant uniform/dedup'd map, or at least raw != comp signalling decode).
+/// STORE region bodies carry `brik_raw_len == brik_comp_len` (the §B1.5 STORE convention) — this part needs no
+/// compressor and always runs.
 #[test]
-fn store_vs_zstd_lengths() {
+fn store_lengths() {
     let map = build_map();
     let reg = registry();
 
@@ -226,10 +230,115 @@ fn store_vs_zstd_lengths() {
     for e in &store.bidx {
         assert_eq!(e.brik_comp_len, e.brik_raw_len, "STORE region: comp_len == raw_len");
     }
+}
 
+/// zstd bodies record a raw length for the decode buffer (the redundant uniform/dedup'd map compresses). Gated
+/// on `vxo-encode` (needs the C compressor).
+#[cfg(feature = "vxo-encode")]
+#[test]
+fn zstd_lengths() {
+    let map = build_map();
+    let reg = registry();
     let z = VxoFile::parse(&encode_vxo(&map, &reg, &VxoHeadParams::default(), VxoCompression::Zstd(19)).unwrap()).unwrap();
     // At least one region is non-trivially sized; its raw length is recorded for the decode buffer.
     assert!(z.bidx.iter().all(|e| e.brik_raw_len > 0), "every region records a raw length");
+}
+
+/// STORE regions record the EXPLICIT compression code 0 (§B1.5 FIX 3) — so the reader branches on the code,
+/// never on `comp_len == raw_len` length equality. Always runs (STORE needs no compressor).
+#[test]
+fn store_compression_code_is_explicit() {
+    let map = build_map();
+    let reg = registry();
+    let store = VxoFile::parse(&encode_vxo(&map, &reg, &VxoHeadParams::default(), VxoCompression::Store).unwrap()).unwrap();
+    assert!(store.bidx.iter().all(|e| e.compression == VXO_REGION_STORE), "STORE regions carry code 0");
+}
+
+/// zstd regions record the EXPLICIT compression code 1 (§B1.5 FIX 3). Gated on `vxo-encode` (needs the C
+/// compressor to produce a zstd body).
+#[cfg(feature = "vxo-encode")]
+#[test]
+fn zstd_compression_code_is_explicit() {
+    let map = build_map();
+    let reg = registry();
+    let z = VxoFile::parse(&encode_vxo(&map, &reg, &VxoHeadParams::default(), VxoCompression::Zstd(19)).unwrap()).unwrap();
+    assert!(z.bidx.iter().all(|e| e.compression == VXO_REGION_ZSTD), "zstd regions carry code 1");
+}
+
+/// Querying an ABSENT region (via `VxoFile::region_entry`) and an absent brick coord within a present region
+/// (via `DecodedRegion::entry`) both return `None` — covers the binary-search helpers' miss path (B-ii relies
+/// on these returning AIR/None for the clipmap bound).
+#[test]
+fn absent_region_and_coord_return_none() {
+    let map = build_map();
+    let bytes = encode_vxo(&map, &registry(), &VxoHeadParams::default(), VxoCompression::Store).unwrap();
+    let file = VxoFile::parse(&bytes).expect("parse");
+
+    // A region the map never touches (way outside any inserted brick) has no BIDX entry.
+    assert!(file.region_entry(IVec3::new(1000, 1000, 1000)).is_none(), "absent region ⇒ None");
+
+    // A present region's `entry` returns None for a coord that buckets into it but was never inserted.
+    let present = region_of_brick(IVec3::new(0, 0, 0), file.region_edge_bricks());
+    let dir = file.region_entry(present).expect("region (0,0,0) is present");
+    let region = file.decode_region(dir).expect("decode");
+    // (0,0,0) and (1,2,3) ARE in this region; (7,7,7) buckets to it (K=8) but was never inserted.
+    assert!(region.entry(IVec3::new(0, 0, 0)).is_some(), "an inserted brick is found");
+    assert!(region.entry(IVec3::new(7, 7, 7)).is_none(), "an absent coord in a present region ⇒ None");
+}
+
+/// A uniform brick whose 10³ halo is ENTIRELY one block (it is fully surrounded by solid same-block neighbours)
+/// stays UNIFORM through `pack_brickmap` — so the packed-patch `is_uniform()` decode branch in the fingerprint
+/// is genuinely exercised on the round-trip (an edge uniform brick would re-expand to dense via its AIR halo).
+#[test]
+fn halo_buried_uniform_round_trips() {
+    let registry = registry();
+    let params = VxoHeadParams { name: "buried".into(), ..Default::default() };
+
+    // Build a 3×3×3 block of identical full-uniform bricks; the CENTRE brick's 10³ halo is all block 1, so the
+    // packer keeps it uniform.
+    let mut map = BrickMap::new();
+    for z in -1..=1 {
+        for y in -1..=1 {
+            for x in -1..=1 {
+                map.insert(IVec3::new(x, y, z), full_uniform_brick(1));
+            }
+        }
+    }
+
+    // Sanity: the centre brick IS uniform in the packed patch (the branch we want to cover).
+    let patch = pack_brickmap(&map, &registry);
+    let centre_origin = [0, 0, 0]; // brick (0,0,0)·BRICK_EDGE
+    let centre = patch
+        .metas
+        .iter()
+        .find(|m| m.voxel_origin == centre_origin)
+        .expect("centre brick packed");
+    assert!(centre.is_uniform(), "the fully-buried centre brick must stay uniform after pack (halo all solid)");
+
+    // Round-trip STORE (always) + zstd (only when the `vxo-encode` compressor is available): the centre stays
+    // uniform and every brick is bit-identical.
+    #[cfg(feature = "vxo-encode")]
+    let comps = [VxoCompression::Store, VxoCompression::Zstd(19)];
+    #[cfg(not(feature = "vxo-encode"))]
+    let comps = [VxoCompression::Store];
+    for comp in comps {
+        let bytes = encode_vxo(&map, &registry, &params, comp).expect("encode");
+        let file = VxoFile::parse(&bytes).expect("parse");
+        let read_map = read_back_map(&file);
+        assert_eq!(read_map.len(), map.len(), "buried-uniform read-back count");
+        for (coord, brick) in map.iter() {
+            let got = read_map.get(*coord).unwrap_or_else(|| panic!("brick {coord:?} missing"));
+            assert_eq!(got, brick, "buried-uniform brick {coord:?} not bit-identical");
+        }
+        // The read-back centre is still uniform when re-packed.
+        let read_patch = pack_brickmap(&read_map, &file.registry);
+        let read_centre = read_patch
+            .metas
+            .iter()
+            .find(|m| m.voxel_origin == centre_origin)
+            .expect("centre brick re-packed");
+        assert!(read_centre.is_uniform(), "centre stays uniform after round-trip");
+    }
 }
 
 /// A corrupted header CRC is rejected with a clear error (the integrity check, §B1.0).
