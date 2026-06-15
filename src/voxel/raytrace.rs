@@ -1185,11 +1185,45 @@ struct VoxelRtResources {
 /// deterministically. Storage plan A1: for a STREAMED epoch these are allocated ONCE at fixed capacity (with
 /// `COPY_DST` usage) and the per-generation `Delta` patches them in place via `queue_write_buffer`; the BLAS is
 /// rebuilt only on a topology change. A contiguous `Snapshot` (static scenes) re-creates them every generation.
-struct SceneKeepAlive {
+/// A3 Stage 3 — the SLOT-BAND CHUNK size: each chunk owns a contiguous band of `CHUNK_SLOTS` slot indices in
+/// the global capacity buffers, and one per-chunk BLAS over that band's AABBs (degenerate free slots in the
+/// band are non-candidates, so the per-band build is proportional to the band's LIVE bricks). On a streamed
+/// `Delta` only the chunks whose slots changed rebuild (O(changed chunks), not O(resident) — the per-move BLAS
+/// hitch fix's final piece).
+///
+/// **Why a SLOT-INDEX band, not a SPATIAL KxKxK region.** The A1 incremental packer claims slots from a flat
+/// free-list (a brick's slot is NOT a function of its world position — surface-only residency scatters a
+/// spatial region's bricks across arbitrary slots, and a fixed spatial-K³ band would need `chunks · K³` ≫
+/// `max_resident_bricks` slots, blowing the buffers up). Banding the SLOT space instead tiles the existing
+/// `[0, capacity)` slots with ZERO waste (every band slot is usable) AND needs no packer change. The world is
+/// descriptor-IDENTITY (no transform), so spatial grouping buys nothing — the band only partitions the BLAS
+/// REBUILD work. A changed slot's chunk is `slot / CHUNK_SLOTS`; its descriptor's `meta_base = chunk·CHUNK_SLOTS`
+/// and the shader resolves `metas[meta_base + primitive_index]` (Stage 2 pinned `primitive_index` is
+/// geometry-relative, so this lands on the global slot). K=8 brick-equivalent ⇒ 512 slots/band ⇒ ~118 bands at
+/// the 60k cap: a manageable TLAS instance count, a cheap 512-prim per-band build, and a delta typically touches
+/// 1–few bands.
+const CHUNK_SLOTS: u32 = 512; // 8³ "bricks" worth of slots per chunk band
+
+/// One slot-band chunk's BLAS + its slot range in the global buffers (A3 Stage 3). The BLAS reads its band as a
+/// SLICE of the shared `aabb_buf` via `primitive_offset = slot_base · 32`; `primitive_index` comes back
+/// geometry-relative (Stage 2), so the chunk's descriptor `meta_base = slot_base` resolves the global slot.
+struct ChunkBlas {
     blas: wgpu::Blas,
+    /// First global slot this chunk covers (== its descriptor's `meta_base`, == the `primitive_offset` brick).
+    slot_base: u32,
+    /// Number of slots (BLAS primitives) in this band (== [`CHUNK_SLOTS`] for full bands; the last band may be
+    /// short when `capacity` isn't a multiple of [`CHUNK_SLOTS`]).
+    prim_count: u32,
+}
+
+struct SceneKeepAlive {
+    /// A3 Stage 3 — one BLAS per SLOT-BAND CHUNK (was a single global BLAS). The TLAS has one identity instance
+    /// per chunk (`custom_index = chunk index → descriptor`). On a `Delta` only the chunks with a changed slot
+    /// rebuild.
+    chunks: Vec<ChunkBlas>,
     tlas: wgpu::Tlas,
-    /// The fixed-cap AABB buffer (BLAS_INPUT | STORAGE | COPY_DST) — the BLAS geometry the Delta patches at
-    /// `slot · 32`.
+    /// The fixed-cap AABB buffer (BLAS_INPUT | STORAGE | COPY_DST) — each chunk BLAS reads its band as a slice;
+    /// the Delta patches a changed slot's AABB at `slot · 32`.
     aabb_buf: wgpu::Buffer,
     /// The fixed-cap meta buffer (STORAGE | COPY_DST) — patched at `slot · 48`.
     meta_buf: wgpu::Buffer,
@@ -1200,12 +1234,9 @@ struct SceneKeepAlive {
     _palette_buf: wgpu::Buffer,
     /// The per-brick palette buffer (R2b static path; a 1-word dummy on the raw streamed path). Keep-alive only.
     _brick_palettes_buf: wgpu::Buffer,
-    /// A3 — the per-instance DESCRIPTOR buffer (group 0 binding 13). For the streamed world it holds ONE identity
-    /// descriptor 0 (Stage 1) / one per CHUNK (Stage 3). Keep-alive only (the bind group's Arc references it).
+    /// A3 — the per-CHUNK DESCRIPTOR buffer (group 0 binding 13): one identity descriptor per chunk, each with
+    /// `meta_base = chunk·CHUNK_SLOTS`. Keep-alive only (the bind group's Arc references it).
     _descriptors_buf: wgpu::Buffer,
-    /// The number of BLAS primitives (== `capacity` for a streamed epoch, == `brick_count` for a static
-    /// Snapshot) — the size the BLAS was created for, reused on a Delta's in-place BLAS rebuild.
-    blas_primitives: u32,
     /// True iff this scene is a STREAMED fixed-cap epoch (a `Delta` can patch it). False for a static contiguous
     /// `Snapshot` (every generation re-creates).
     streamed: bool,
@@ -2607,57 +2638,86 @@ fn build_scene_full(
         contents: brick_palettes_bytes,
         usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
     });
-    // A3 Stage 1 — the per-instance DESCRIPTOR buffer. ONE identity descriptor 0 = the whole streamed/static
-    // world (meta_base 0, identity transform, all bases 0). With this single descriptor the shader hit path is
-    // bit-identical-in-effect to the pre-A3 world-space march (the regression gate). Stage 3 grows this to one
-    // identity descriptor per CHUNK (each carrying its slot base in `meta_base`).
-    let descriptors = [GpuInstanceDescriptor::world_identity(0)];
+    // A3 Stage 3 — partition the `blas_primitives` slots into SLOT-BAND CHUNKS of `CHUNK_SLOTS` each. One BLAS
+    // per chunk (reading its band as a slice of the shared `aabb_buf` via `primitive_offset`), one identity TLAS
+    // instance per chunk (`custom_index = chunk index → descriptor`), one identity descriptor per chunk with
+    // `meta_base = chunk·CHUNK_SLOTS`. With every chunk identity-transform + meta_base = its band base, the
+    // shader resolves `metas[meta_base + primitive_index]` (Stage 2: primitive_index is geometry-relative) =
+    // the global slot — bit-identical-in-effect to the single-BLAS world. A streamed `Delta` later rebuilds
+    // ONLY the chunks whose slots changed (see `apply_delta`).
+    let chunk_count = blas_primitives.div_ceil(CHUNK_SLOTS).max(1);
+    let stride = core::mem::size_of::<GpuBrickAabb>() as wgpu::BufferAddress;
+    let mut descriptors: Vec<GpuInstanceDescriptor> = Vec::with_capacity(chunk_count as usize);
+    let mut chunks: Vec<ChunkBlas> = Vec::with_capacity(chunk_count as usize);
+    for c in 0..chunk_count {
+        let slot_base = c * CHUNK_SLOTS;
+        // The band's primitive count: CHUNK_SLOTS, or the short remainder for the last band; never 0 (a BLAS
+        // geometry needs ≥1 primitive — the AABB at a degenerate free slot is a non-candidate either way).
+        let prim_count = (blas_primitives - slot_base).clamp(1, CHUNK_SLOTS);
+        descriptors.push(GpuInstanceDescriptor::world_identity(slot_base));
+        let blas = device.create_blas(
+            &wgpu::CreateBlasDescriptor {
+                label: Some("voxel_rt_chunk_blas"),
+                flags: wgpu::AccelerationStructureFlags::PREFER_FAST_TRACE,
+                update_mode: wgpu::AccelerationStructureUpdateMode::Build,
+            },
+            wgpu::BlasGeometrySizeDescriptors::AABBs {
+                descriptors: vec![wgpu::BlasAABBGeometrySizeDescriptor {
+                    primitive_count: prim_count,
+                    flags: wgpu::AccelerationStructureGeometryFlags::OPAQUE,
+                }],
+            },
+        );
+        chunks.push(ChunkBlas { blas, slot_base, prim_count });
+    }
     let descriptors_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("voxel_rt_instance_descriptors"),
         contents: bytemuck::cast_slice(&descriptors),
         usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
     });
-
-    let size_desc = wgpu::BlasAABBGeometrySizeDescriptor {
-        primitive_count: blas_primitives,
-        flags: wgpu::AccelerationStructureGeometryFlags::OPAQUE,
-    };
-    let blas = device.create_blas(
-        &wgpu::CreateBlasDescriptor {
-            label: Some("voxel_rt_blas"),
-            flags: wgpu::AccelerationStructureFlags::PREFER_FAST_TRACE,
-            update_mode: wgpu::AccelerationStructureUpdateMode::Build,
-        },
-        wgpu::BlasGeometrySizeDescriptors::AABBs { descriptors: vec![size_desc.clone()] },
-    );
     let mut tlas = device.create_tlas(&wgpu::CreateTlasDescriptor {
         label: Some("voxel_rt_tlas"),
         flags: wgpu::AccelerationStructureFlags::PREFER_FAST_TRACE,
         update_mode: wgpu::AccelerationStructureUpdateMode::Build,
-        max_instances: 1,
+        max_instances: chunk_count,
     });
-    tlas[0] = Some(wgpu::TlasInstance::new(
-        &blas,
-        [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0],
-        0,
-        0xff,
-    ));
+    for (i, chunk) in chunks.iter().enumerate() {
+        // Identity transform (the streamed/static world is descriptor-identity); custom_index = the chunk index
+        // ⇒ descriptor `i` (meta_base = chunk's slot base).
+        tlas[i] = Some(wgpu::TlasInstance::new(
+            &chunk.blas,
+            [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0],
+            i as u32,
+            0xff,
+        ));
+    }
 
     let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
         label: Some("voxel_rt_build_accel"),
     });
-    encoder.build_acceleration_structures(
-        core::iter::once(&wgpu::BlasBuildEntry {
-            blas: &blas,
+    // Build every chunk BLAS over its band slice, then the TLAS once over all instances. The per-chunk
+    // size descriptors are materialized first so the geometry entries can borrow them for the build.
+    let sizes: Vec<wgpu::BlasAABBGeometrySizeDescriptor> = chunks
+        .iter()
+        .map(|chunk| wgpu::BlasAABBGeometrySizeDescriptor {
+            primitive_count: chunk.prim_count,
+            flags: wgpu::AccelerationStructureGeometryFlags::OPAQUE,
+        })
+        .collect();
+    let geos: Vec<_> = chunks
+        .iter()
+        .zip(sizes.iter())
+        .map(|(chunk, size)| wgpu::BlasBuildEntry {
+            blas: &chunk.blas,
             geometry: wgpu::BlasGeometries::AabbGeometries(vec![wgpu::BlasAabbGeometry {
-                size: &size_desc,
-                stride: core::mem::size_of::<GpuBrickAabb>() as wgpu::BufferAddress,
+                size,
+                stride,
                 aabb_buffer: &aabb_buf,
-                primitive_offset: 0,
+                primitive_offset: chunk.slot_base * stride as u32,
             }]),
-        }),
-        core::iter::once(&tlas),
-    );
+        })
+        .collect();
+    encoder.build_acceleration_structures(geos.iter(), core::iter::once(&tlas));
     render_queue.submit(core::iter::once(encoder.finish()));
 
     let scene_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -2678,7 +2738,7 @@ fn build_scene_full(
     resources.scene_bind_group = Some(scene_bind_group);
     resources.brick_count = brick_count;
     resources.scene = Some(SceneKeepAlive {
-        blas,
+        chunks,
         tlas,
         aabb_buf,
         meta_buf,
@@ -2686,7 +2746,6 @@ fn build_scene_full(
         _palette_buf: palette_buf,
         _brick_palettes_buf: brick_palettes_buf,
         _descriptors_buf: descriptors_buf,
-        blas_primitives,
         streamed,
     });
 }
@@ -2712,30 +2771,51 @@ fn apply_delta(
             render_queue.write_buffer(&scene.voxel_buf, cs.voxel_word_offset as u64 * 4, bytemuck::cast_slice(v));
         }
     }
-    // Rebuild the BLAS in place ONLY when the resident set's occupancy changed (an enter/drop moved/collapsed an
-    // AABB). A pure edit (rewrite of a brick's voxels, same coord/lod ⇒ same AABB) leaves the geometry untouched,
-    // so no BLAS rebuild is needed. The BLAS is rebuilt over the SAME capacity-sized aabb_buf (degenerate free
-    // slots are non-candidates), keeping the BLAS/TLAS handles + the bind group stable.
+    // A3 Stage 3 — rebuild ONLY the CHUNKS whose slots changed (O(changed chunks), not O(resident)). A pure
+    // edit (rewrite of a brick's voxels, same coord/lod ⇒ same AABB) leaves the geometry untouched, so no BLAS
+    // rebuild is needed at all. On a topology change (enter/drop moved/collapsed an AABB) only the affected slot
+    // bands rebuild — the per-move BLAS hitch fix's final piece. The TLAS is rebuilt over ALL chunk instances
+    // each time any chunk BLAS changes (a TLAS build is cheap; the bind group references the SAME TLAS handle,
+    // so it stays valid). Each chunk BLAS reads its band slice of the SAME aabb_buf (degenerate free slots are
+    // non-candidates) via `primitive_offset`.
     if delta.topology_changed {
-        let size_desc = wgpu::BlasAABBGeometrySizeDescriptor {
-            primitive_count: scene.blas_primitives,
-            flags: wgpu::AccelerationStructureGeometryFlags::OPAQUE,
-        };
+        // The set of chunks a changed slot touches: `slot / CHUNK_SLOTS`. Only these rebuild.
+        let mut dirty_chunks: FxHashSet<u32> = FxHashSet::default();
+        for cs in &delta.changed {
+            dirty_chunks.insert(cs.slot / CHUNK_SLOTS);
+        }
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("voxel_rt_delta_rebuild_accel"),
         });
-        encoder.build_acceleration_structures(
-            core::iter::once(&wgpu::BlasBuildEntry {
-                blas: &scene.blas,
+        // The dirty chunks + their size descriptors (materialized so the geometry entries can borrow them).
+        let dirty: Vec<&ChunkBlas> = scene
+            .chunks
+            .iter()
+            .filter(|chunk| dirty_chunks.contains(&(chunk.slot_base / CHUNK_SLOTS)))
+            .collect();
+        let sizes: Vec<wgpu::BlasAABBGeometrySizeDescriptor> = dirty
+            .iter()
+            .map(|chunk| wgpu::BlasAABBGeometrySizeDescriptor {
+                primitive_count: chunk.prim_count,
+                flags: wgpu::AccelerationStructureGeometryFlags::OPAQUE,
+            })
+            .collect();
+        let geos: Vec<_> = dirty
+            .iter()
+            .zip(sizes.iter())
+            .map(|(chunk, size)| wgpu::BlasBuildEntry {
+                blas: &chunk.blas,
                 geometry: wgpu::BlasGeometries::AabbGeometries(vec![wgpu::BlasAabbGeometry {
-                    size: &size_desc,
+                    size,
                     stride: aabb_stride,
                     aabb_buffer: &scene.aabb_buf,
-                    primitive_offset: 0,
+                    primitive_offset: chunk.slot_base * aabb_stride as u32,
                 }]),
-            }),
-            core::iter::once(&scene.tlas),
-        );
+            })
+            .collect();
+        // Rebuild the dirty chunk BLASes + the TLAS (which references every chunk BLAS, incl. the just-rebuilt
+        // ones). We only reach here on a topology change, so there is always ≥1 dirty chunk.
+        encoder.build_acceleration_structures(geos.iter(), core::iter::once(&scene.tlas));
         render_queue.submit(core::iter::once(encoder.finish()));
     }
 }

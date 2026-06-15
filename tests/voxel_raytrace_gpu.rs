@@ -770,3 +770,334 @@ fn gpu_mixed_lod_matches_cpu_ground_truth() {
 
     let _ = (&aabb_buf, &meta_buf, &voxel_buf, &palette_buf, &blas, &tlas);
 }
+
+/// **A3 Stage 3 acceptance — the 2-INSTANCE scene oracle (multi-instance TLAS + per-instance object-local DDA).**
+///
+/// Builds a TLAS with TWO instances: the streamed WORLD (descriptor 0, identity transform, meta_base 0) + a
+/// translated CUBE OBJECT (descriptor 1, a pure-translation `world_from_object`, meta_base = the world's slot
+/// count). Each instance is its own BLAS reading its SLICE of the single shared aabb_buf via `primitive_offset`
+/// (Stage 2 pinned that `primitive_index` is geometry-relative, so the descriptor's meta_base resolves the
+/// global brick). The cube's bricks live in OBJECT space (origin at the cube's local 0); the TLAS instance
+/// places it in the world, and the shader transforms the world ray into the cube's object space (via
+/// descriptor.object_from_world = the inverse translation), DDA-marches the cube's bricks, and commits the
+/// world-t. This proves the descriptor indirection + object-local DDA + world-t commit ACROSS instances —
+/// `VOXEL_INSTANCING_PLAN` §7 Phase-1 acceptance — the load-bearing multi-instance correctness gate.
+///
+/// The CPU oracle traces EACH instance independently (world in world space, cube in its object space with the
+/// ray pre-transformed) and asserts the GPU's nearest-across-instances hit matches.
+#[test]
+fn gpu_two_instance_world_plus_cube_matches_cpu() {
+    let Some((device, queue)) = common::headless_ray_query_device() else {
+        eprintln!("no ray-query device — skipping gpu_two_instance_world_plus_cube_matches_cpu");
+        return;
+    };
+
+    let reg = {
+        let lib = test_library();
+        BlockRegistry::from_biome_library(&lib)
+    };
+
+    // --- WORLD: a few LOD0 floor bricks (block 1) at coords (0..2, 0, 0..2), placed at the clipmap origin. ---
+    let world_brick = Brick::from_voxels(Box::new(
+        [BlockId(1); BRICK_EDGE as usize * BRICK_EDGE as usize * BRICK_EDGE as usize],
+    ));
+    let mut world_entries_owned: Vec<(IVec3, Brick)> = Vec::new();
+    for bz in 0..2 {
+        for bx in 0..2 {
+            world_entries_owned.push((IVec3::new(bx, 0, bz), world_brick.clone()));
+        }
+    }
+    let world_entries: Vec<ResidentBrick> =
+        world_entries_owned.iter().map(|(c, b)| ResidentBrick { coord: *c, brick: b, lod: 0 }).collect();
+    let world_patch = pack_resident_set(&world_entries, &reg);
+    let n_world = world_patch.brick_count() as u32;
+    assert!(n_world > 0, "world must have bricks");
+
+    // --- CUBE OBJECT: a single solid LOD0 brick (block 2) at OBJECT coord (0,0,0). Its world AABBs (in object
+    // space) are [0, 1.6)³. The TLAS instance translates it to `cube_t` in the world. ---
+    let cube_brick = Brick::from_voxels(Box::new(
+        [BlockId(2); BRICK_EDGE as usize * BRICK_EDGE as usize * BRICK_EDGE as usize],
+    ));
+    let cube_entries = vec![ResidentBrick { coord: IVec3::new(0, 0, 0), brick: &cube_brick, lod: 0 }];
+    let cube_patch = pack_resident_set(&cube_entries, &reg);
+    let n_cube = cube_patch.brick_count() as u32;
+    assert!(n_cube > 0, "cube must have bricks");
+
+    // Place the cube well away from the world floor (which spans world X/Z [0, 3.2)). Put it at X = 10 m so a
+    // ray down into X≈10 hits ONLY the cube and a ray down into X≈0.8 hits ONLY the world.
+    let cube_t = Vec3::new(10.0, 0.0, 0.0); // world_from_object translation
+    let span = BRICK_WORLD_SIZE; // 1.6 — the cube's object-local extent per axis
+
+    // --- Concatenate the world + cube into GLOBAL buffers. The cube's metas are REBASED so their voxel_offset /
+    // palette_base point past the world's slices (the descriptor's meta_base selects the cube's brick range; the
+    // voxel/palette bases are folded into the metas here so the Stage-1 shader's `voxel_indices[m.voxel_offset+…]`
+    // and `brick_palettes[m.palette_base+…]` address the concatenated buffers with no shader change). ---
+    let voxel_rebase = world_patch.voxels.len() as u32;
+    let pal_rebase = world_patch.brick_palettes.len() as u32;
+    let cube_metas_rebased: Vec<adventure::voxel::gpu::GpuBrickMeta> = cube_patch
+        .metas
+        .iter()
+        .map(|m| {
+            let mut m = *m;
+            if !m.is_uniform() {
+                m.voxel_offset = m.voxel_offset.wrapping_add(voxel_rebase);
+                m.palette_base = m.palette_base.wrapping_add(pal_rebase);
+            }
+            m
+        })
+        .collect();
+
+    let mut metas = world_patch.metas.clone();
+    metas.extend_from_slice(&cube_metas_rebased);
+    let mut aabbs = world_patch.aabbs.clone();
+    aabbs.extend_from_slice(&cube_patch.aabbs);
+    // CLONE the cube's voxel/palette slices into the concatenation (do NOT drain `cube_patch` — the CPU oracle
+    // below DDA-marches `cube_patch` in object space, so it still needs its own voxels/brick_palettes intact).
+    let mut voxels = world_patch.voxels.clone();
+    voxels.extend_from_slice(&cube_patch.voxels);
+    let mut brick_palettes = world_patch.brick_palettes.clone();
+    brick_palettes.extend_from_slice(&cube_patch.brick_palettes);
+    // The palette is the shared registry (both instances index it directly) — use the world's.
+    let palette = world_patch.palette.clone();
+
+    // --- Descriptors: 0 = world (identity, meta_base 0); 1 = cube (translation, meta_base = n_world). ---
+    // object_from_world for a pure translation `T` is `translate(-T)` (row-major 3×4): rows
+    // [1,0,0,-Tx; 0,1,0,-Ty; 0,0,1,-Tz]. world_from_object_rot is the rotation (identity here — pure translation,
+    // so the normal is unchanged in world). inv_scale = 1 (rigid). meta_base = n_world (the cube's slot base).
+    let object_from_world = [
+        1.0, 0.0, 0.0, -cube_t.x,
+        0.0, 1.0, 0.0, -cube_t.y,
+        0.0, 0.0, 1.0, -cube_t.z,
+    ];
+    let cube_desc = adventure::voxel::gpu::GpuInstanceDescriptor {
+        object_from_world,
+        world_from_object_rot: adventure::voxel::gpu::IDENTITY_3X4,
+        meta_base: n_world,
+        voxel_base: 0, // folded into the rebased cube metas
+        palette_base: 0, // folded into the rebased cube metas
+        inv_scale: 1.0,
+        edit_base: adventure::voxel::gpu::INSTANCE_EDIT_NONE,
+        mask: 0xff,
+        _pad: [0; 2],
+    };
+    let descriptors =
+        [adventure::voxel::gpu::GpuInstanceDescriptor::world_identity(0), cube_desc];
+
+    // --- Upload the global buffers. ---
+    let mk = |label, bytes: &[u8], extra| {
+        device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some(label),
+            contents: bytes,
+            usage: wgpu::BufferUsages::STORAGE | extra,
+        })
+    };
+    let aabb_buf = mk("ti_aabbs", bytemuck::cast_slice(&aabbs), wgpu::BufferUsages::BLAS_INPUT);
+    let meta_buf = mk("ti_metas", bytemuck::cast_slice(&metas), wgpu::BufferUsages::empty());
+    let voxel_buf = mk("ti_voxels", bytemuck::cast_slice(&voxels), wgpu::BufferUsages::empty());
+    let palette_buf = mk("ti_palette", bytemuck::cast_slice(&palette), wgpu::BufferUsages::empty());
+    let brick_palettes_buf =
+        mk("ti_brick_palettes", bytemuck::cast_slice(&brick_palettes), wgpu::BufferUsages::empty());
+    let descriptors_buf =
+        mk("ti_descriptors", bytemuck::cast_slice(&descriptors), wgpu::BufferUsages::empty());
+
+    // --- TWO BLASes over slices of the shared aabb_buf, and a 2-instance TLAS. ---
+    let stride = mem::size_of::<adventure::voxel::gpu::GpuBrickAabb>() as wgpu::BufferAddress;
+    let world_size = wgpu::BlasAABBGeometrySizeDescriptor {
+        primitive_count: n_world,
+        flags: wgpu::AccelerationStructureGeometryFlags::OPAQUE,
+    };
+    let cube_size = wgpu::BlasAABBGeometrySizeDescriptor {
+        primitive_count: n_cube,
+        flags: wgpu::AccelerationStructureGeometryFlags::OPAQUE,
+    };
+    let world_blas = device.create_blas(
+        &wgpu::CreateBlasDescriptor {
+            label: Some("ti_world_blas"),
+            flags: wgpu::AccelerationStructureFlags::PREFER_FAST_TRACE,
+            update_mode: wgpu::AccelerationStructureUpdateMode::Build,
+        },
+        wgpu::BlasGeometrySizeDescriptors::AABBs { descriptors: vec![world_size.clone()] },
+    );
+    let cube_blas = device.create_blas(
+        &wgpu::CreateBlasDescriptor {
+            label: Some("ti_cube_blas"),
+            flags: wgpu::AccelerationStructureFlags::PREFER_FAST_TRACE,
+            update_mode: wgpu::AccelerationStructureUpdateMode::Build,
+        },
+        wgpu::BlasGeometrySizeDescriptors::AABBs { descriptors: vec![cube_size.clone()] },
+    );
+    let mut tlas = device.create_tlas(&wgpu::CreateTlasDescriptor {
+        label: Some("ti_tlas"),
+        flags: wgpu::AccelerationStructureFlags::PREFER_FAST_TRACE,
+        update_mode: wgpu::AccelerationStructureUpdateMode::Build,
+        max_instances: 2,
+    });
+    // Instance 0 = world (identity transform, custom_index 0 → descriptor 0).
+    tlas[0] = Some(wgpu::TlasInstance::new(
+        &world_blas,
+        [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0],
+        0,
+        0xff,
+    ));
+    // Instance 1 = cube (world_from_object = translate(cube_t), custom_index 1 → descriptor 1).
+    tlas[1] = Some(wgpu::TlasInstance::new(
+        &cube_blas,
+        [1.0, 0.0, 0.0, cube_t.x, 0.0, 1.0, 0.0, cube_t.y, 0.0, 0.0, 1.0, cube_t.z],
+        1,
+        0xff,
+    ));
+
+    // --- Pipeline + bind groups (the production trace_one entry). ---
+    let ray_buf = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("ti_ray"),
+        size: mem::size_of::<RayUniform>() as u64,
+        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    let out_buf = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("ti_hit"),
+        size: mem::size_of::<GpuHit>() as u64,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        mapped_at_creation: false,
+    });
+    let read_buf = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("ti_read"),
+        size: mem::size_of::<GpuHit>() as u64,
+        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    let src = common::voxel_raytrace_shader_src();
+    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("voxel_raytrace"),
+        source: wgpu::ShaderSource::Wgsl(src.into()),
+    });
+    let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+        label: Some("trace_one"),
+        layout: None,
+        module: &shader,
+        entry_point: Some("trace_one"),
+        compilation_options: Default::default(),
+        cache: None,
+    });
+    let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: None,
+        layout: &pipeline.get_bind_group_layout(0),
+        entries: &[
+            wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::AccelerationStructure(&tlas) },
+            wgpu::BindGroupEntry { binding: 1, resource: meta_buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 2, resource: voxel_buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 3, resource: palette_buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 12, resource: brick_palettes_buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 13, resource: descriptors_buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 4, resource: ray_buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 5, resource: out_buf.as_entire_binding() },
+        ],
+    });
+    let light_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("ti_lighting"),
+        contents: bytemuck::bytes_of(&lighting_uniform()),
+        usage: wgpu::BufferUsages::UNIFORM,
+    });
+    let sky_buf = common::sky_uniform_buffer(&device);
+    let light_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("ti_lighting_bg"),
+        layout: &pipeline.get_bind_group_layout(1),
+        entries: &[
+            wgpu::BindGroupEntry { binding: 2, resource: light_buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 11, resource: sky_buf.as_entire_binding() },
+        ],
+    });
+
+    // Build BOTH BLASes (each over its slice of the shared aabb_buf via primitive_offset) + the 2-instance TLAS.
+    let mut build = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("ti_build") });
+    let build_entries = [
+        wgpu::BlasBuildEntry {
+            blas: &world_blas,
+            geometry: wgpu::BlasGeometries::AabbGeometries(vec![wgpu::BlasAabbGeometry {
+                size: &world_size,
+                stride,
+                aabb_buffer: &aabb_buf,
+                primitive_offset: 0, // world bricks occupy slots [0, n_world)
+            }]),
+        },
+        wgpu::BlasBuildEntry {
+            blas: &cube_blas,
+            geometry: wgpu::BlasGeometries::AabbGeometries(vec![wgpu::BlasAabbGeometry {
+                size: &cube_size,
+                stride,
+                aabb_buffer: &aabb_buf,
+                primitive_offset: n_world * stride as u32, // cube bricks occupy slots [n_world, …)
+            }]),
+        },
+    ];
+    build.build_acceleration_structures(build_entries.iter(), iter::once(&tlas));
+    queue.submit(Some(build.finish()));
+
+    let run_ray = |ro: Vec3, rd: Vec3| -> GpuHit {
+        let ray = RayUniform { origin: ro.into(), t_min: 0.0, dir: rd.normalize().into(), t_max: 100.0 };
+        queue.write_buffer(&ray_buf, 0, bytemuck::bytes_of(&ray));
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        {
+            let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: None, timestamp_writes: None });
+            cpass.set_pipeline(&pipeline);
+            cpass.set_bind_group(0, Some(&bind_group), &[]);
+            cpass.set_bind_group(1, Some(&light_bg), &[]);
+            cpass.dispatch_workgroups(1, 1, 1);
+        }
+        encoder.copy_buffer_to_buffer(&out_buf, 0, &read_buf, 0, mem::size_of::<GpuHit>() as u64);
+        queue.submit(Some(encoder.finish()));
+        let slice = read_buf.slice(..);
+        slice.map_async(wgpu::MapMode::Read, |r| r.expect("map failed"));
+        device.poll(wgpu::PollType::wait_indefinitely()).expect("poll failed");
+        let data = slice.get_mapped_range().unwrap();
+        let gpu: GpuHit = *bytemuck::from_bytes(&data);
+        drop(data);
+        read_buf.unmap();
+        gpu
+    };
+
+    // Ray A: straight DOWN into the WORLD floor (block 1) at world X≈0.8 (inside the world's [0,3.2) span,
+    // away from the cube at X=10). The CPU oracle is the world patch in WORLD space.
+    {
+        let ro = Vec3::new(span * 0.5, span + 2.0, span * 0.5);
+        let rd = Vec3::new(0.0, -1.0, 0.0);
+        let (cpu_id, cpu_t) = cpu_first_solid_packed(&world_patch, ro, rd, 100.0).expect("world ray must hit");
+        let gpu = run_ray(ro, rd);
+        eprintln!("[world] GPU hit={} id={} t={:.4} | CPU id={cpu_id} t={cpu_t:.4}", gpu.hit, gpu.block_id, gpu.t);
+        assert_eq!(gpu.hit, 1, "[world] must hit the floor");
+        assert_eq!(gpu.block_id, cpu_id, "[world] block id matches the descriptor-0 world DDA");
+        assert!((gpu.t - cpu_t).abs() <= VOXEL_SIZE + 1e-3, "[world] t {} vs CPU {}", gpu.t, cpu_t);
+    }
+
+    // Ray B: straight DOWN into the CUBE (block 2) at world (cube_t + half a brick). The GPU transforms the
+    // world ray into cube-object space; the CPU oracle does the SAME (subtract cube_t) then DDAs the cube patch
+    // in object space. World-t == object-t (pure translation), so they compare directly.
+    {
+        let ro = Vec3::new(cube_t.x + span * 0.5, cube_t.y + span + 2.0, cube_t.z + span * 0.5);
+        let rd = Vec3::new(0.0, -1.0, 0.0);
+        // CPU object-space ray = world ray shifted by -cube_t (the descriptor's object_from_world).
+        let ro_obj = ro - cube_t;
+        let (cpu_id, cpu_t) =
+            cpu_first_solid_packed(&cube_patch, ro_obj, rd, 100.0).expect("cube ray must hit");
+        let gpu = run_ray(ro, rd);
+        eprintln!("[cube] GPU hit={} id={} t={:.4} | CPU id={cpu_id} t={cpu_t:.4}", gpu.hit, gpu.block_id, gpu.t);
+        assert_eq!(gpu.hit, 1, "[cube] must hit the translated cube");
+        assert_eq!(gpu.block_id, cpu_id, "[cube] block id matches the descriptor-1 OBJECT-LOCAL DDA");
+        assert!((gpu.t - cpu_t).abs() <= VOXEL_SIZE + 1e-3, "[cube] world-t {} vs CPU object-t {}", gpu.t, cpu_t);
+        // The cube hit must NOT be the world block — proving the descriptor indirection selected the cube's
+        // slot range (meta_base = n_world), not the world's.
+        assert_eq!(gpu.block_id, 2, "[cube] the cube is block 2 (distinct from the world's block 1)");
+    }
+
+    // Ray C: a ray that would MISS the world but hits the cube — confirms the cube instance is independently
+    // reachable (the TLAS merges both instances). Fire down at X = cube centre, far outside the world span.
+    {
+        let ro = Vec3::new(cube_t.x + span * 0.5, 50.0, cube_t.z + span * 0.5);
+        let rd = Vec3::new(0.0, -1.0, 0.0);
+        let gpu = run_ray(ro, rd);
+        assert_eq!(gpu.hit, 1, "[cube-far] the distant cube is reachable via its TLAS instance");
+        assert_eq!(gpu.block_id, 2, "[cube-far] hits the cube (block 2)");
+    }
+
+    let _ = (&aabb_buf, &meta_buf, &voxel_buf, &palette_buf, &brick_palettes_buf, &world_blas, &cube_blas, &tlas);
+}

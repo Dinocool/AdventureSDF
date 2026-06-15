@@ -615,6 +615,216 @@ fn bench_blas_build_at_resident_count() {
     println!("=============================================================================");
 }
 
+/// **A3 Stage 3 deliverable — per-chunk BLAS rebuild is O(changed chunks), not O(resident).** Builds the
+/// resident set once into a capacity-sized AABB buffer, partitions it into `CHUNK_SLOTS`-slot bands (one BLAS
+/// per band), then times TWO rebuild paths at the same resident count:
+///   * MONOLITHIC — one BLAS over ALL `n` primitives (the pre-A3-Stage-3 behaviour: every topology delta
+///     rebuilt the whole BLAS) + the TLAS;
+///   * PER-CHUNK DIRTY — rebuild only the `DIRTY` band BLASes a typical streamed move touches (1–2 chunks ≈ the
+///     LOD0 face-slab a brick-step shifts) + the TLAS.
+///
+/// The per-chunk rebuild should be a small fraction of the monolithic rebuild — the final piece of the
+/// per-move BLAS-hitch fix (the BLAS rebuild now scales with the CHANGED chunks, not the resident count).
+#[test]
+#[ignore = "GPU perf harness; needs ray-query device + TMP=D:\\tmp_test; run with --ignored --nocapture"]
+fn bench_per_chunk_blas_rebuild_vs_monolithic() {
+    let Some((device, queue)) = common::headless_ray_query_device() else {
+        eprintln!("[skip] no ray-query device — per-chunk BLAS-rebuild timing skipped");
+        return;
+    };
+    // Must mirror src/voxel/raytrace.rs::CHUNK_SLOTS (the production band size).
+    const CHUNK_SLOTS: u32 = 512;
+
+    let (layer, lib, registry, label) = worldgen_stack();
+    let cfg = shipping_config();
+    let cam = origin_surface_cam(&layer);
+    let src = WorldgenSource::new(&layer, &lib, SEED);
+
+    let mut mgr = ResidencyManager::new();
+    mgr.update(cam, &cfg, &src);
+    let mut guard = 0;
+    while mgr.pending() > 0 {
+        mgr.drain_work(&cfg, &layer, &lib, &registry, SEED);
+        guard += 1;
+        assert!(guard < 5000);
+    }
+    let entries = mgr.resident_entries();
+    let patch = pack_resident_set(&entries, &registry);
+    let n = patch.brick_count() as u32;
+    assert!(n > 0, "no resident bricks");
+    let stride = core::mem::size_of::<GpuBrickAabb>() as wgpu::BufferAddress;
+
+    // The capacity-sized AABB buffer (the production fixed-cap arena tiles `[0, n)` here for the bench).
+    let aabb_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("pc_aabbs"),
+        contents: bytemuck::cast_slice(&patch.aabbs),
+        usage: wgpu::BufferUsages::BLAS_INPUT | wgpu::BufferUsages::STORAGE,
+    });
+
+    // --- MONOLITHIC: one BLAS over all n primitives + a 1-instance TLAS, rebuilt each iter. ---
+    let mono_size = wgpu::BlasAABBGeometrySizeDescriptor {
+        primitive_count: n,
+        flags: wgpu::AccelerationStructureGeometryFlags::OPAQUE,
+    };
+    let mono_blas = device.create_blas(
+        &wgpu::CreateBlasDescriptor {
+            label: Some("pc_mono_blas"),
+            flags: wgpu::AccelerationStructureFlags::PREFER_FAST_TRACE,
+            update_mode: wgpu::AccelerationStructureUpdateMode::Build,
+        },
+        wgpu::BlasGeometrySizeDescriptors::AABBs { descriptors: vec![mono_size.clone()] },
+    );
+    let mut mono_tlas = device.create_tlas(&wgpu::CreateTlasDescriptor {
+        label: Some("pc_mono_tlas"),
+        flags: wgpu::AccelerationStructureFlags::PREFER_FAST_TRACE,
+        update_mode: wgpu::AccelerationStructureUpdateMode::Build,
+        max_instances: 1,
+    });
+    mono_tlas[0] = Some(wgpu::TlasInstance::new(
+        &mono_blas,
+        [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0],
+        0,
+        0xff,
+    ));
+
+    // --- PER-CHUNK: one BLAS per CHUNK_SLOTS band + a chunk-count-instance TLAS. ---
+    let chunk_count = n.div_ceil(CHUNK_SLOTS).max(1);
+    struct Band {
+        blas: wgpu::Blas,
+        slot_base: u32,
+        prim_count: u32,
+    }
+    let bands: Vec<Band> = (0..chunk_count)
+        .map(|c| {
+            let slot_base = c * CHUNK_SLOTS;
+            let prim_count = (n - slot_base).clamp(1, CHUNK_SLOTS);
+            let blas = device.create_blas(
+                &wgpu::CreateBlasDescriptor {
+                    label: Some("pc_band_blas"),
+                    flags: wgpu::AccelerationStructureFlags::PREFER_FAST_TRACE,
+                    update_mode: wgpu::AccelerationStructureUpdateMode::Build,
+                },
+                wgpu::BlasGeometrySizeDescriptors::AABBs {
+                    descriptors: vec![wgpu::BlasAABBGeometrySizeDescriptor {
+                        primitive_count: prim_count,
+                        flags: wgpu::AccelerationStructureGeometryFlags::OPAQUE,
+                    }],
+                },
+            );
+            Band { blas, slot_base, prim_count }
+        })
+        .collect();
+    let mut chunk_tlas = device.create_tlas(&wgpu::CreateTlasDescriptor {
+        label: Some("pc_chunk_tlas"),
+        flags: wgpu::AccelerationStructureFlags::PREFER_FAST_TRACE,
+        update_mode: wgpu::AccelerationStructureUpdateMode::Build,
+        max_instances: chunk_count,
+    });
+    for (i, band) in bands.iter().enumerate() {
+        chunk_tlas[i] = Some(wgpu::TlasInstance::new(
+            &band.blas,
+            [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0],
+            i as u32,
+            0xff,
+        ));
+    }
+    // Build the per-chunk BLASes once (so the dirty-rebuild bench measures a re-build, not a cold build).
+    let cold_sizes: Vec<_> = bands
+        .iter()
+        .map(|b| wgpu::BlasAABBGeometrySizeDescriptor {
+            primitive_count: b.prim_count,
+            flags: wgpu::AccelerationStructureGeometryFlags::OPAQUE,
+        })
+        .collect();
+    {
+        let geos: Vec<_> = bands
+            .iter()
+            .zip(cold_sizes.iter())
+            .map(|(b, size)| wgpu::BlasBuildEntry {
+                blas: &b.blas,
+                geometry: wgpu::BlasGeometries::AabbGeometries(vec![wgpu::BlasAabbGeometry {
+                    size,
+                    stride,
+                    aabb_buffer: &aabb_buf,
+                    primitive_offset: b.slot_base * stride as u32,
+                }]),
+            })
+            .collect();
+        let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("pc_cold") });
+        enc.build_acceleration_structures(geos.iter(), core::iter::once(&chunk_tlas));
+        queue.submit(core::iter::once(enc.finish()));
+        device.poll(wgpu::PollType::wait_indefinitely()).expect("poll");
+    }
+
+    const ITERS: u32 = 8;
+    // (A) MONOLITHIC rebuild: the whole BLAS + TLAS.
+    let mut mono_times = Vec::new();
+    for _ in 0..ITERS {
+        let t = Instant::now();
+        let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("pc_mono") });
+        enc.build_acceleration_structures(
+            core::iter::once(&wgpu::BlasBuildEntry {
+                blas: &mono_blas,
+                geometry: wgpu::BlasGeometries::AabbGeometries(vec![wgpu::BlasAabbGeometry {
+                    size: &mono_size,
+                    stride,
+                    aabb_buffer: &aabb_buf,
+                    primitive_offset: 0,
+                }]),
+            }),
+            core::iter::once(&mono_tlas),
+        );
+        queue.submit(core::iter::once(enc.finish()));
+        device.poll(wgpu::PollType::wait_indefinitely()).expect("poll");
+        mono_times.push(t.elapsed());
+    }
+
+    // (B) PER-CHUNK DIRTY rebuild: rebuild only the first DIRTY chunks (a typical streamed move touches ~1–2
+    // bands) + the TLAS. We rebuild 2 dirty chunks to model a face-slab step that straddles a band boundary.
+    let dirty: Vec<&Band> = bands.iter().take(2.min(bands.len())).collect();
+    let dirty_sizes: Vec<_> = dirty
+        .iter()
+        .map(|b| wgpu::BlasAABBGeometrySizeDescriptor {
+            primitive_count: b.prim_count,
+            flags: wgpu::AccelerationStructureGeometryFlags::OPAQUE,
+        })
+        .collect();
+    let mut chunk_times = Vec::new();
+    for _ in 0..ITERS {
+        let t = Instant::now();
+        let geos: Vec<_> = dirty
+            .iter()
+            .zip(dirty_sizes.iter())
+            .map(|(b, size)| wgpu::BlasBuildEntry {
+                blas: &b.blas,
+                geometry: wgpu::BlasGeometries::AabbGeometries(vec![wgpu::BlasAabbGeometry {
+                    size,
+                    stride,
+                    aabb_buffer: &aabb_buf,
+                    primitive_offset: b.slot_base * stride as u32,
+                }]),
+            })
+            .collect();
+        let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("pc_dirty") });
+        enc.build_acceleration_structures(geos.iter(), core::iter::once(&chunk_tlas));
+        queue.submit(core::iter::once(enc.finish()));
+        device.poll(wgpu::PollType::wait_indefinitely()).expect("poll");
+        chunk_times.push(t.elapsed());
+    }
+
+    let (m_mean, _m_p50, m_p95, m_max) = stats_ms(&mono_times);
+    let (c_mean, _c_p50, c_p95, c_max) = stats_ms(&chunk_times);
+    println!("\n========== PER-CHUNK BLAS REBUILD vs MONOLITHIC — graph={label} ==========");
+    println!("resident bricks        : {n}  (chunks={chunk_count} of {CHUNK_SLOTS} slots each)");
+    println!("MONOLITHIC rebuild      : mean {m_mean:.3} p95 {m_p95:.3} max {m_max:.3} ms (all {n} prims + TLAS)");
+    println!("PER-CHUNK dirty rebuild : mean {c_mean:.3} p95 {c_p95:.3} max {c_max:.3} ms ({} dirty chunks + TLAS)", dirty.len());
+    if c_mean > 0.0 {
+        println!("SPEEDUP (mono / chunk)  : {:.1}×  (the BLAS rebuild is now O(changed chunks), not O(resident))", m_mean / c_mean);
+    }
+    println!("===============================================================================");
+    let _ = (&aabb_buf, &mono_blas, &mono_tlas, &chunk_tlas);
+}
+
 // ============================================================================================
 //  (5b) INCREMENTAL RE-PACK — the O(changed) per-move re-pack vs the O(resident) full pack (A/B).
 // ============================================================================================
