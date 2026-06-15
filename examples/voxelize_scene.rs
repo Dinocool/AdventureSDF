@@ -57,15 +57,23 @@ const DEFAULT_VOXEL_SIZE: f32 = 0.2;
 const VOX_MODEL_MAX: i32 = 256;
 
 fn main() -> anyhow::Result<()> {
-    let mut args = std::env::args().skip(1);
-    let out_path = args.next().map(PathBuf::from).unwrap_or_else(|| PathBuf::from("assets/models/sponza.vox"));
-    let voxel_size: f32 = args.next().and_then(|s| s.parse().ok()).unwrap_or(DEFAULT_VOXEL_SIZE);
+    // Positional args first (skipping any `--flag`s), then collect the flags. The CLI:
+    //   <out.{vox|vxo}> <voxel_metres> <in_mesh> <scale> [--store]
+    // An output ending `.vxo` selects the NEW native-format writer (`adventure::voxel::vxo::write_vxo`,
+    // Phase B-i); `.vox` keeps the legacy MagicaVoxel writer (interchange/debug only). `--store` (`.vxo` only)
+    // writes uncompressed region bodies instead of the default per-region zstd (`docs/VXO_FORMAT.md` §B1.9).
+    let raw_args: Vec<String> = std::env::args().skip(1).collect();
+    let store = raw_args.iter().any(|a| a == "--store");
+    let mut pos = raw_args.iter().filter(|a| !a.starts_with("--"));
+    let out_path = pos.next().map(PathBuf::from).unwrap_or_else(|| PathBuf::from("assets/models/sponza.vox"));
+    let voxel_size: f32 = pos.next().and_then(|s| s.parse().ok()).unwrap_or(DEFAULT_VOXEL_SIZE);
     // The input mesh path: an explicit 3rd arg, else the default Sponza glTF. Picked by extension (glTF / OBJ).
-    let in_path = args.next().map(PathBuf::from).unwrap_or_else(|| PathBuf::from("assets/models/src/Sponza.gltf"));
+    let in_path = pos.next().map(PathBuf::from).unwrap_or_else(|| PathBuf::from("assets/models/src/Sponza.gltf"));
     // Optional uniform scale (4th arg) applied to all positions AFTER loading. glTF carries unit scale in its
     // node transforms (Sponza's 0.008), but OBJ has none — some classic OBJ scenes are authored in cm/mm/other
     // (e.g. McGuire's Conference spans ~2700 units → needs ~0.01 to land in metres). Default 1.0 (no scale).
-    let scale: f32 = args.next().and_then(|s| s.parse().ok()).unwrap_or(1.0);
+    let scale: f32 = pos.next().and_then(|s| s.parse().ok()).unwrap_or(1.0);
+    let want_vxo = out_path.extension().and_then(|e| e.to_str()).is_some_and(|e| e.eq_ignore_ascii_case("vxo"));
 
     // 1. Load the mesh, dispatching on file extension (glTF / OBJ); a procedural fallback room when absent.
     let mut mesh = load_mesh(&in_path)?;
@@ -102,25 +110,56 @@ fn main() -> anyhow::Result<()> {
     let (palette, indices) = quantize(&grid);
     println!("palette: {} colours", palette.len());
 
-    // 4. Write the `.vox` (split into ≤256³ models if needed).
+    // 4. Write the baked artifact. Build the `DotVoxData` (the legacy interchange form + the bridge the `.vxo`
+    //    path re-bricks through). `.vox` writes it directly; `.vxo` re-bricks it into the engine `BrickMap` +
+    //    `BlockRegistry` (sharing the runtime loader's SSOT, so the `.vxo` carries exactly what the engine
+    //    loads) and emits the native region-streamed format.
     let data = build_dot_vox(&grid, &palette, &indices);
     let n_models = data.models.len();
     if let Some(parent) = out_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let mut file = std::fs::File::create(&out_path)?;
-    data.write_vox(&mut file)?;
-    println!(
-        "wrote {} ({} model{}, dims {}×{}×{}, {} solid voxels, {} palette colours)",
-        out_path.display(),
-        n_models,
-        if n_models == 1 { "" } else { "s" },
-        grid.dims[0],
-        grid.dims[1],
-        grid.dims[2],
-        grid.solid_count(),
-        palette.len()
-    );
+    if want_vxo {
+        write_vxo_output(&out_path, &data, voxel_size, store)?;
+        println!(
+            "wrote {} (.vxo native format, {}, voxel_size {voxel_size} m, dims {}×{}×{}, {} solid voxels, {} palette colours)",
+            out_path.display(),
+            if store { "STORE" } else { "zstd-19" },
+            grid.dims[0],
+            grid.dims[1],
+            grid.dims[2],
+            grid.solid_count(),
+            palette.len()
+        );
+    } else {
+        let mut file = std::fs::File::create(&out_path)?;
+        data.write_vox(&mut file)?;
+        println!(
+            "wrote {} ({} model{}, dims {}×{}×{}, {} solid voxels, {} palette colours)",
+            out_path.display(),
+            n_models,
+            if n_models == 1 { "" } else { "s" },
+            grid.dims[0],
+            grid.dims[1],
+            grid.dims[2],
+            grid.solid_count(),
+            palette.len()
+        );
+    }
+    Ok(())
+}
+
+/// Re-brick a built [`DotVoxData`] into the engine's `(BrickMap, BlockRegistry)` (via the SAME
+/// `adventure::voxel::vox::from_dot_vox` the runtime `.vox` loader uses) and write the native `.vxo`
+/// (`adventure::voxel::vxo::write_vxo`, Phase B-i). `store` selects uncompressed region bodies; otherwise
+/// default per-region zstd. `voxel_size` is recorded in `HEAD` (self-describing, `docs/VXO_FORMAT.md` §0.4).
+fn write_vxo_output(out_path: &Path, data: &DotVoxData, voxel_size: f32, store: bool) -> anyhow::Result<()> {
+    use adventure::voxel::vxo::{VxoCompression, VxoHeadParams, write_vxo};
+    let (map, registry) = adventure::voxel::vox::from_dot_vox(data);
+    let name = out_path.file_stem().and_then(|s| s.to_str()).unwrap_or("vxo").to_string();
+    let params = VxoHeadParams { voxel_size, name, ..Default::default() };
+    let comp = if store { VxoCompression::Store } else { VxoCompression::default() };
+    write_vxo(out_path, &map, &registry, &params, comp)?;
     Ok(())
 }
 

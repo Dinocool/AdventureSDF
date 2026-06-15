@@ -34,6 +34,7 @@ pub mod source;
 pub mod streaming;
 pub mod vox;
 pub mod voxelize;
+pub mod vxo;
 
 use bevy::math::IVec3;
 use bevy::prelude::*;

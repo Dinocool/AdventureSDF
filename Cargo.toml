@@ -170,6 +170,12 @@ dot_vox = "5.2"
 # the file-read IO error + the `dot_vox` parse error behind one `anyhow::Error` so callers get a clean
 # `Result` without a bespoke error enum. Tiny, ubiquitous, no transitive weight.
 anyhow = "1"
+# Per-region compression for the native `.vxo` voxel asset format (`voxel::vxo`, Phase B-i). A RUNTIME dep:
+# `.vxo` is the engine-owned baked-scene transport, and each region-chunk is independently zstd'd (or STORE'd)
+# so the streamed loader decompresses only the regions a clipmap shell needs (`docs/VXO_FORMAT.md` §B1.9). zstd
+# decode is ~GB/s — the load path, not a hot trace path. Used by both the offline encoder (`write_vxo`, in the
+# `voxelize_scene` example) and the runtime reader, so compress/decompress share one SSOT.
+zstd = "0.13"
 
 [dev-dependencies]
 # spv-out: emit SPIR-V from naga in tests so we can inspect which opcode signed `%`

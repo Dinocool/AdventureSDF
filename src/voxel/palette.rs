@@ -211,6 +211,31 @@ impl BlockRegistry {
         Self { blocks, mat_to_block: FxHashMap::default() }
     }
 
+    /// Build a registry from a `.vxo` `MATL` table (`super::vxo::format::VxoMaterial`) — the SSOT for a baked
+    /// `.vxo` static scene loaded by [`super::vxo`] (sibling to [`from_vox_palette`](Self::from_vox_palette),
+    /// which builds from a raw `.vox` sRGB palette). Entry `i` → `BlockId(i)` DIRECTLY (NO `+1` offset: the
+    /// `.vxo` table already includes entry 0 = AIR), with colours taken VERBATIM (the `.vxo` stores LINEAR
+    /// RGBA + linear emissive, unlike `.vox`'s sRGB, so no conversion). `roughness`/`metallic`/`tintable`
+    /// round-trip from the table. No worldgen-material bridge (a baked asset has no [`TerrainMatId`] chain).
+    /// Robust to an empty table (no AIR entry ⇒ falls back to an AIR-only registry so callers never panic).
+    pub fn from_vxo_matl(mats: &[super::vxo::format::VxoMaterial]) -> Self {
+        if mats.is_empty() {
+            return Self::air_only();
+        }
+        let blocks = mats
+            .iter()
+            .map(|m| BlockDef {
+                name: String::new(),
+                color: m.albedo,
+                roughness: m.roughness,
+                metal: m.metallic,
+                emissive: [m.emissive[0], m.emissive[1], m.emissive[2]],
+                tintable: m.flags & super::vxo::format::MATL_FLAG_TINTABLE != 0,
+            })
+            .collect();
+        Self { blocks, mat_to_block: FxHashMap::default() }
+    }
+
     /// An AIR-only registry — just the AIR block (id 0), no solid blocks. The empty starting point the GALLERY
     /// merge ([`super::gallery::load_gallery`]) extends one scene's palette at a time onto via
     /// [`extend_blocks_from`](Self::extend_blocks_from). No worldgen-material bridge (a merged static scene has
