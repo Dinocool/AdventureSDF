@@ -196,6 +196,11 @@ ruzstd = "0.8"
 # pure-Rust discipline, cf. the ktx2/`ruzstd` notes). `ruzstd` decodes standard zstd frames, so what this
 # produces the runtime reader reads back. Confirm: `cargo tree` (default features) shows no `zstd-sys`.
 zstd = { version = "0.13", optional = true }
+# `.vxo` region-streamed loader (`voxel::vxo::source::VxoSource`, Phase B-ii) — memory-maps the whole `.vxo`
+# file once and reads each region's compressed byte span LAZILY (a `pread`-equivalent slice of the mmap) only
+# when a clipmap shell demands it, so a 2.6 GB scene NEVER fully expands in RAM (`docs/VXO_FORMAT.md` §B2.2 /
+# §0.2). A RUNTIME dep: the streamed loader is the shipped load path. Pure Rust, no C toolchain.
+memmap2 = "0.9"
 
 [dev-dependencies]
 # spv-out: emit SPIR-V from naga in tests so we can inspect which opcode signed `%`

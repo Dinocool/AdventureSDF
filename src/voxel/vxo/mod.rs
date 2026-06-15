@@ -10,15 +10,21 @@
 //!   the region directory + per-region STORE/zstd bodies.
 //! * [`reader`] — the full-file [`reader::VxoFile`] reader: parse the chunks, decode a region → a
 //!   [`reader::DecodedRegion`], decode a brick entry → a bit-identical [`Brick`](super::brickmap::Brick).
+//! * [`source`] — **Phase B-ii**: the region-STREAMED [`source::VxoSource`] (an mmap'd file + a byte-budgeted
+//!   decoded-region LRU implementing [`BrickSource`](super::source::BrickSource)) + the merged-gallery
+//!   [`source::MergedSource`], feeding the EXISTING residency demand path.
 //!
-//! The streamed mmap `VxoSource`/LRU/`classify`/`BrickSource` (B-ii) and the SVDAG `BRIK` variant (B3) are
-//! OUT of scope for B-i. The round-trip acceptance gate (`VXO_FORMAT.md` §B2.8 gate 2) lives in `tests`.
+//! The SVDAG `BRIK` variant (B3) is OUT of scope. The round-trip acceptance gate (`VXO_FORMAT.md` §B2.8 gate
+//! 2) lives in `tests`; the B-ii streamed-source gates (round-trip via the streamed source, classify parity,
+//! LRU budget/eviction) live in [`source`]'s test module.
 
 pub mod format;
 pub mod reader;
+pub mod source;
 pub mod writer;
 
 pub use reader::{DecodedRegion, VxoFile};
+pub use source::{MergedSource, VxoSource};
 pub use writer::{VxoCompression, VxoHeadParams, write_vxo};
 
 #[cfg(test)]

@@ -103,6 +103,7 @@ dependencies = [
  "image",
  "ktx2",
  "libloading",
+ "memmap2",
  "naga",
  "naga_oil",
  "rapier3d",

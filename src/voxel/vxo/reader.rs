@@ -144,14 +144,27 @@ impl VxoFile {
         let start = dir.brik_offset as usize;
         let end = start + dir.brik_comp_len as usize;
         anyhow::ensure!(end <= self.brik.len(), "vxo: region body overruns BRIK chunk");
-        let comp = &self.brik[start..end];
-        let raw: std::borrow::Cow<[u8]> = match dir.compression {
-            VXO_REGION_STORE => std::borrow::Cow::Borrowed(comp),
-            VXO_REGION_ZSTD => std::borrow::Cow::Owned(zstd_decompress(comp, dir.brik_raw_len as usize)?),
-            other => anyhow::bail!("vxo: region has unknown compression code {other} (expected 0=STORE, 1=zstd)"),
-        };
-        parse_region(&raw, IVec3::new(dir.region_coord[0], dir.region_coord[1], dir.region_coord[2]))
+        // The compressed region span sliced out of the (in-RAM) BRIK body, decoded via the shared SSOT below
+        // (the streamed `VxoSource` feeds the SAME function a slice of its mmap, §B2.2).
+        decode_region_span(&self.brik[start..end], dir)
     }
+}
+
+/// Decode ONE region's compressed byte SPAN (`comp` = the exact `[brik_offset .. +brik_comp_len)` slice the
+/// `BIDX` entry addresses) into a [`DecodedRegion`] (`VXO_FORMAT.md` §B2.2 step 4) — the SHARED decode SSOT
+/// for BOTH the full-file [`VxoFile::decode_region`] (in-RAM `BRIK` slice) and the streamed
+/// [`super::source::VxoSource`] (an mmap slice). Branches on the EXPLICIT `dir.compression` byte
+/// ([`VXO_REGION_STORE`]/[`VXO_REGION_ZSTD`]), NOT on length equality: STORE parses the slice in place; zstd
+/// decodes (pure-Rust `ruzstd`) into a `brik_raw_len` buffer. Verifies the region header's coord matches the
+/// `BIDX` key. Keeping this a free function over a `&[u8]` means the loader never copies the whole `BRIK`.
+pub fn decode_region_span(comp: &[u8], dir: &VxoRegionDirEntry) -> anyhow::Result<DecodedRegion> {
+    let expected = IVec3::new(dir.region_coord[0], dir.region_coord[1], dir.region_coord[2]);
+    let raw: std::borrow::Cow<[u8]> = match dir.compression {
+        VXO_REGION_STORE => std::borrow::Cow::Borrowed(comp),
+        VXO_REGION_ZSTD => std::borrow::Cow::Owned(zstd_decompress(comp, dir.brik_raw_len as usize)?),
+        other => anyhow::bail!("vxo: region has unknown compression code {other} (expected 0=STORE, 1=zstd)"),
+    };
+    parse_region(&raw, expected)
 }
 
 impl DecodedRegion {
@@ -169,8 +182,20 @@ impl DecodedRegion {
     /// dense entry → decode the 8³ core via `decode_paletted_cell` (the `gpu.rs` SSOT) → `Brick::from_voxels`.
     /// Bit-identical to a live brick, since the disk stores the R2b core triple verbatim.
     pub fn brick(&self, entry: &VxoBrickEntry) -> Brick {
+        self.brick_remapped(entry, 0)
+    }
+
+    /// Decode brick `entry` to a [`Brick`], SHIFTING every SOLID voxel's [`BlockId`] by `block_shift` (AIR
+    /// stays AIR) — the merge remap (§B2.4): when several `.vxo` assets concatenate into ONE world brick map,
+    /// each asset's local `BlockId(b)` (`b ≥ 1`) must become merged id `b + block_shift` so two assets'
+    /// `BlockId(5)` don't collide. `block_shift = 0` is the identity (the verbatim [`Self::brick`] path), so a
+    /// single-asset load is bit-identical to a live brick (the round-trip gate). The shift is applied at decode
+    /// over the `8³` core (uniform: its single id; dense: each cell), the cheap "+base add" §B2.4 prescribes —
+    /// keeping the offset+rebase the [`super::source::MergedSource`] SSOT (this is just the per-cell arithmetic).
+    pub fn brick_remapped(&self, entry: &VxoBrickEntry, block_shift: u16) -> Brick {
         if entry.is_uniform() {
-            return Brick::uniform(BlockId(entry.uniform_block_raw()));
+            // A stored uniform brick is always SOLID (empty bricks are never written), so the shift always applies.
+            return Brick::uniform(BlockId(entry.uniform_block_raw() + block_shift));
         }
         let pb = entry.palette_off as usize;
         let off = entry.dense_index_off() as usize;
@@ -183,7 +208,10 @@ impl DecodedRegion {
             for y in 0..BRICK_EDGE {
                 for x in 0..BRICK_EDGE {
                     let i = voxel_index(x, y, z);
-                    voxels[i] = BlockId(decode_paletted_cell(&palette, entry.index_bits, index, i));
+                    let raw = decode_paletted_cell(&palette, entry.index_bits, index, i);
+                    // Shift only SOLID ids into the merged palette range; AIR (0) stays 0 (mirrors
+                    // `gallery::merge_brickmap_into`'s per-voxel remap so the merge SSOT is one rule).
+                    voxels[i] = if raw == BlockId::AIR.0 { BlockId::AIR } else { BlockId(raw + block_shift) };
                 }
             }
         }
@@ -191,8 +219,9 @@ impl DecodedRegion {
     }
 }
 
-/// Parse the `HEAD` body → `(VxoHead, name)` (§B1.1).
-fn parse_head(body: &[u8]) -> anyhow::Result<(VxoHead, String)> {
+/// Parse the `HEAD` body → `(VxoHead, name)` (§B1.1). `pub(crate)` so the streamed [`super::source::VxoSource`]
+/// reuses the EXACT chunk parsers (one SSOT for the framing).
+pub(crate) fn parse_head(body: &[u8]) -> anyhow::Result<(VxoHead, String)> {
     let n = std::mem::size_of::<VxoHead>();
     anyhow::ensure!(body.len() >= n, "vxo: HEAD body too short");
     let head: VxoHead = pod_read_unaligned(&body[0..n]);
@@ -203,8 +232,8 @@ fn parse_head(body: &[u8]) -> anyhow::Result<(VxoHead, String)> {
 }
 
 /// Parse the `MATL` body → a rebuilt [`BlockRegistry`] (§B1.2). `material_count: u32` + `_pad` then the
-/// `VxoMaterial` table.
-fn parse_matl(body: &[u8]) -> anyhow::Result<BlockRegistry> {
+/// `VxoMaterial` table. `pub(crate)` for the streamed [`super::source::VxoSource`] (shared parser).
+pub(crate) fn parse_matl(body: &[u8]) -> anyhow::Result<BlockRegistry> {
     anyhow::ensure!(body.len() >= 8, "vxo: MATL body too short");
     let count = u32::from_le_bytes([body[0], body[1], body[2], body[3]]) as usize;
     let table = &body[8..];
@@ -215,8 +244,8 @@ fn parse_matl(body: &[u8]) -> anyhow::Result<BlockRegistry> {
 }
 
 /// Parse the `BIDX` body → the region directory (§B1.5). `entry_count: u32` + `_pad` then the
-/// `VxoRegionDirEntry` table.
-fn parse_bidx(body: &[u8]) -> anyhow::Result<Vec<VxoRegionDirEntry>> {
+/// `VxoRegionDirEntry` table. `pub(crate)` for the streamed [`super::source::VxoSource`] (shared parser).
+pub(crate) fn parse_bidx(body: &[u8]) -> anyhow::Result<Vec<VxoRegionDirEntry>> {
     anyhow::ensure!(body.len() >= 8, "vxo: BIDX body too short");
     let count = u32::from_le_bytes([body[0], body[1], body[2], body[3]]) as usize;
     let table = &body[8..];
