@@ -25,7 +25,16 @@ use bevy::math::IVec3;
 use dot_vox::{DotVoxData, SceneNode};
 
 use super::brickmap::{BRICK_EDGE, Brick, BrickMap, BRICK_VOXELS, brick_coord_of_voxel, voxel_index};
-use super::palette::{BlockId, BlockRegistry};
+use super::palette::{BlockId, BlockRegistry, srgb_u8_to_linear};
+
+/// Calibration scale tying MagicaVoxel's `_emit · 2^_flux` emission to this engine's lumen-scale linear
+/// emissive radiance. Chosen `= 1.0` so the canonical default MagicaVoxel emitter — a pure-white voxel with
+/// `_emit = 1.0` and `_flux = 0` (strength `1.0`) — lands at linear emissive `[1,1,1]`, i.e. the SAME radiance
+/// as the Cornell light panel (`palette.rs::cornell` sets the light block to `[1,1,1]`). The engine's GI/NEE
+/// treats `BlockRegistry::emissive` as lumen-scale linear radiance (memory `solari-gi`), so a unit white
+/// emitter matching the reference Cornell light is the natural anchor; brighter MagicaVoxel emitters (higher
+/// `_flux`) scale up proportionally above it. One named const — never a scattered magic number.
+const EMISSIVE_SCALE: f32 = 1.0;
 
 /// One placed `.vox` voxel in WORLD-voxel space (Y-up, after the Z-up→Y-up swap + model placement), with
 /// its 1-based [`BlockId`] (palette index `+1`). The intermediate the loader collects before anchoring +
@@ -66,9 +75,60 @@ pub fn from_dot_vox(data: &DotVoxData) -> (BrickMap, BlockRegistry) {
 /// a LINEAR-RGBA colour. Falls back to the MagicaVoxel default palette only if the file carried none (a
 /// well-formed `.vox` always has 256 entries). The palette is index-aligned with voxel `i` (`Voxel.i` is the
 /// 0-based palette index after `dot_vox`'s 1→0 adjustment), so `BlockId(i+1)` matches voxel `i`.
+///
+/// MagicaVoxel stores emissive in the `MATL` chunk (`dot_vox` parses it into `data.materials`), keyed by the
+/// SAME palette index as the colour. After the base (colour-only) registry is built, [`apply_matl_emissive`]
+/// overlays each emissive material's radiance onto its block (`BlockId(mat.id + 1)`), so imported lamps light
+/// the GI/NEE stack (which already consumes `BlockRegistry::emissive`/`has_emitters`) with zero GI changes.
+/// `dot_vox` stays confined to this module — `palette.rs` never sees the offline crate (layering invariant).
 fn registry_from_palette(data: &DotVoxData) -> BlockRegistry {
     let colors: Vec<[u8; 4]> = data.palette.iter().map(|c| [c.r, c.g, c.b, c.a]).collect();
-    BlockRegistry::from_vox_palette(&colors)
+    let mut registry = BlockRegistry::from_vox_palette(&colors);
+    apply_matl_emissive(&mut registry, data);
+    registry
+}
+
+/// Overlay the `.vox` `MATL` emissive table onto an already-built [`BlockRegistry`] (the C2 step). For each
+/// material that is an emitter — `material_type() == Some("_emit")` OR `emission()` returns some `e > 0` —
+/// the emissive radiance is the voxel's OWN colour (an emitter glows in its hue, matching MagicaVoxel's
+/// `_emit` rendering) times the emission strength times [`EMISSIVE_SCALE`]:
+///
+/// ```text
+/// strength   = emission · 2^radiant_flux            // MagicaVoxel emission scale (its renderer's _emit·2^_flux)
+/// albedo_lin = srgb_u8_to_linear(palette[mat.id])   // the block's linear RGB (the loader's existing decode)
+/// emissive   = albedo_lin.rgb · strength · EMISSIVE_SCALE
+/// ```
+///
+/// `mat.id` is the palette index — the SAME index the colour map uses — so it lands on `BlockId(mat.id + 1)`
+/// (the `+1` of `palette` entry → block, [`from_vox_palette`](BlockRegistry::from_vox_palette)). Out-of-range
+/// ids (`>= 256`) are skipped here, and [`BlockRegistry::set_emissive`] additionally no-ops AIR / out-of-range
+/// blocks, so a malformed material id can never panic. The `_ldr` (low-dynamic-range) field is IGNORED: it is
+/// a display-dampening hack, not physical radiance, and GI wants the true emitted radiance for the bounce.
+fn apply_matl_emissive(registry: &mut BlockRegistry, data: &DotVoxData) {
+    for mat in &data.materials {
+        // Skip ids that can't index the 256-entry palette (defensive — set_emissive also guards).
+        if mat.id >= 256 {
+            continue;
+        }
+        // An emitter is flagged either by an explicit `_type == "_emit"` or a positive `_emit` strength.
+        let e = mat.emission().unwrap_or(0.0);
+        let is_emit = mat.material_type() == Some("_emit") || e > 0.0;
+        if !is_emit || e <= 0.0 {
+            continue;
+        }
+        // MagicaVoxel scales emission by 2^flux (flux is an integer-ish power exponent, default 0).
+        let strength = e * 2f32.powf(mat.radiant_flux().unwrap_or(0.0));
+        // The emitter's own colour (sRGB→linear, RGB only) — reuse the loader's single sRGB decode.
+        let c = data.palette[mat.id as usize];
+        let albedo = srgb_u8_to_linear([c.r, c.g, c.b, c.a]);
+        let emissive = [
+            albedo[0] * strength * EMISSIVE_SCALE,
+            albedo[1] * strength * EMISSIVE_SCALE,
+            albedo[2] * strength * EMISSIVE_SCALE,
+        ];
+        // Palette index → block id is the same `+1` as the colour map (palette entry i → BlockId(i+1)).
+        registry.set_emissive(BlockId(mat.id as u16 + 1), emissive);
+    }
 }
 
 /// The translation (corner offset) of each model, indexed by model id, derived from the scene graph. A
@@ -193,7 +253,33 @@ fn bricks_from_placed(placed: &[PlacedVoxel]) -> BrickMap {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use dot_vox::{Color, Model, Size, Voxel};
+    use dot_vox::{Color, Material, Model, Size, Voxel};
+
+    /// Build a `dot_vox::Material` for the in-memory `MATL` oracle: an `_emit` material at palette index `id`
+    /// with the given emission strength and flux exponent (the `_type`/`_emit`/`_flux` string properties
+    /// MagicaVoxel writes). Mirrors what `dot_vox` parses from a real `MATL` chunk.
+    fn emit_material(id: u32, emit: f32, flux: f32) -> Material {
+        let properties = [
+            ("_type".to_string(), "_emit".to_string()),
+            ("_emit".to_string(), emit.to_string()),
+            ("_flux".to_string(), flux.to_string()),
+        ]
+        .into_iter()
+        .collect();
+        Material { id, properties }
+    }
+
+    /// Like [`make_vox`] but with an explicit `MATL` material table — the C2 emissive oracle.
+    fn make_vox_with_materials(
+        size: (u32, u32, u32),
+        voxels: Vec<Voxel>,
+        colors: &[[u8; 4]],
+        materials: Vec<Material>,
+    ) -> DotVoxData {
+        let mut data = make_vox(size, voxels, colors);
+        data.materials = materials;
+        data
+    }
 
     /// A minimal in-memory `DotVoxData`: one model of `size`, the given voxels, and a palette built from
     /// `colors` (sRGB `u8` RGBA), padded to 256 with black so it's a well-formed `.vox`. No scene graph (the
@@ -339,5 +425,90 @@ mod tests {
         assert!(!map.is_empty(), "sponza must have solid bricks");
         assert!(map.len() < 5_000_000, "sponza brick count must be bounded: {}", map.len());
         assert!(reg.len() > 1, "sponza palette must be populated");
+    }
+
+    /// C2: a `MATL` `_emit` material lights its block. Palette entry 0 = an orange-ish colour, with an emissive
+    /// material `{ _type:_emit, _emit:0.8, _flux:2 }` → strength `0.8 · 2^2 = 3.2`. The loaded
+    /// `BlockRegistry::emissive(BlockId(1))` must be non-zero, PROPORTIONAL to `albedo_lin · 3.2 · EMISSIVE_SCALE`,
+    /// and TINTED by the palette colour (the emissive hue tracks the entry). A second non-emissive block stays
+    /// `[0,0,0]`, and `has_emitters()` flips true.
+    #[test]
+    fn matl_emissive_lights_block_proportional_and_tinted() {
+        let orange = [220u8, 120, 30, 255]; // palette idx 0 → BlockId(1), the emitter
+        let plain = [40u8, 40, 200, 255]; // palette idx 1 → BlockId(2), non-emissive
+        let voxels = vec![Voxel { x: 0, y: 0, z: 0, i: 0 }, Voxel { x: 1, y: 0, z: 0, i: 1 }];
+        let data = make_vox_with_materials(
+            (2, 1, 1),
+            voxels,
+            &[orange, plain],
+            vec![emit_material(0, 0.8, 2.0)],
+        );
+        let (_map, reg) = from_dot_vox(&data);
+
+        // The emitter's emissive equals its own linear colour × strength (0.8·2^2 = 3.2) × EMISSIVE_SCALE.
+        let strength = 0.8f32 * 2f32.powi(2); // 3.2
+        let albedo = srgb_u8_to_linear(orange);
+        let expected = [
+            albedo[0] * strength * EMISSIVE_SCALE,
+            albedo[1] * strength * EMISSIVE_SCALE,
+            albedo[2] * strength * EMISSIVE_SCALE,
+        ];
+        let got = reg.emissive(BlockId(1));
+        assert!(got != [0.0, 0.0, 0.0], "emitter block must be emissive: {got:?}");
+        for k in 0..3 {
+            assert!((got[k] - expected[k]).abs() < 1e-5, "emissive[{k}] {} != expected {} ", got[k], expected[k]);
+        }
+        // Tinted by the palette colour: the orange entry is red-dominant, so emissive red > green > blue.
+        assert!(got[0] > got[1] && got[1] > got[2], "emissive must track the orange palette hue: {got:?}");
+
+        // The non-emissive block stays dark, and the scene now reports emitters present.
+        assert_eq!(reg.emissive(BlockId(2)), [0.0, 0.0, 0.0], "non-emissive block stays dark");
+        assert!(reg.has_emitters(), "has_emitters flips true with an emitter present");
+    }
+
+    /// C2: a material with no `_emit` (or `_emit == 0`) leaves its block non-emissive, and a scene with only
+    /// such materials reports no emitters.
+    #[test]
+    fn matl_zero_or_absent_emit_is_not_emissive() {
+        let color = [200u8, 30, 20, 255];
+        let voxels = vec![Voxel { x: 0, y: 0, z: 0, i: 0 }];
+
+        // `_emit == 0` → not an emitter.
+        let zero = make_vox_with_materials((1, 1, 1), voxels.clone(), &[color], vec![emit_material(0, 0.0, 2.0)]);
+        let (_m, reg) = from_dot_vox(&zero);
+        assert_eq!(reg.emissive(BlockId(1)), [0.0, 0.0, 0.0], "_emit==0 is not emissive");
+        assert!(!reg.has_emitters(), "no emitters when _emit==0");
+
+        // A material with NO `_emit` property at all (a plain diffuse) → not an emitter.
+        let props = [("_type".to_string(), "_diffuse".to_string())].into_iter().collect();
+        let diffuse = make_vox_with_materials(
+            (1, 1, 1),
+            voxels,
+            &[color],
+            vec![Material { id: 0, properties: props }],
+        );
+        let (_m2, reg2) = from_dot_vox(&diffuse);
+        assert_eq!(reg2.emissive(BlockId(1)), [0.0, 0.0, 0.0], "diffuse (no _emit) is not emissive");
+        assert!(!reg2.has_emitters(), "no emitters for a diffuse-only scene");
+    }
+
+    /// C2: an out-of-range / malformed `mat.id` does NOT panic. An id `>= 256` (beyond the palette) and an id
+    /// referencing the AIR-mapped slot are both handled by the loader's `< 256` guard + `set_emissive`'s
+    /// no-op-on-out-of-range guard — the load completes and emits no spurious emitter.
+    #[test]
+    fn matl_out_of_range_id_does_not_panic() {
+        let color = [255u8, 255, 255, 255];
+        let voxels = vec![Voxel { x: 0, y: 0, z: 0, i: 0 }];
+        // id 999 is well past the 256-entry palette; id 300 too. Both must be skipped, no panic.
+        let data = make_vox_with_materials(
+            (1, 1, 1),
+            voxels,
+            &[color],
+            vec![emit_material(999, 1.0, 1.0), emit_material(300, 0.5, 0.0)],
+        );
+        let (_map, reg) = from_dot_vox(&data); // must not panic
+        // The real block stays non-emissive (the bogus ids never touched it), and no emitters were created.
+        assert_eq!(reg.emissive(BlockId(1)), [0.0, 0.0, 0.0], "out-of-range material must not light a block");
+        assert!(!reg.has_emitters(), "out-of-range emitter ids produce no emitters");
     }
 }
