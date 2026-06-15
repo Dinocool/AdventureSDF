@@ -137,8 +137,12 @@ emissive ✓ (`72260ff`), C3 CIELAB+area-avg ✓ (`f2f871f` + review fix `cd889e
 the roadmap). **Phase D1 (early partial flip, user-chosen ahead of C1):** D1a `VOXEL_SIZE`→0.05 + `clip_half`→160
 (64 m reach) + scale re-pin ✓ (`8ee9591`) + GI-blocker fix (production world-cache cell/bias made BRICK_WORLD_SIZE-
 relative) ✓ (`def8e62`); D1c benchmark ✓ (`cceec457`) — found the 64 m reach was *fiction* (O(H³) cube enumeration
-hit the 8 M ceiling, LOD0-only, ~38 s/crossing); **D1d shell-first O(H²) enumeration IN PROGRESS** (restores coarse
-LODs + kills the 38 s). worldgen + legacy scenes now render at 0.05 m.
+hit the 8 M ceiling, LOD0-only, ~38 s/crossing); **D1d shell-first O(H²) enumeration ✓ (`84b36112`, panel-verified
+AIRTIGHT)** — `surface_bricks_in` + the exact `surface_by_band` SSOT + skip-classify for worldgen; restores ALL 8
+coarse LODs at clip_half 160; cold `update` **38 s → 2.97 s (~13×)**, the residual ~3 s is the A2 distance-cap SORT
+over 6.7 M candidates (a next-lever: `select_nth` partial-select — Phase G's GPU enumeration eliminates it entirely).
+The early partial flip arc (D1a/c/d) is DONE + verified; worldgen + legacy scenes render at 0.05 m / 64 m reach.
+D2 screen-error LOD remains (roadmap).
 
 **NEXT after D1d:** the committed roadmap above — Phase G (GPU-driven pivot, headline = GPU enumeration/compaction)
 is the user-committed correct architecture; D2 screen-error LOD promoted alongside the flip; then GI 3.0 / C1 / the
