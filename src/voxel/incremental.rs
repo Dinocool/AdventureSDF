@@ -375,7 +375,7 @@ impl ResidentPacker {
                 if let Some(b) = st.arena_block {
                     self.quarantine_arena.push(b);
                 }
-                let meta = pb.meta(0);
+                let meta = pb.meta_uniform();
                 self.resident.insert(key, SlotState { slot: st.slot, arena_block: None });
                 let changed =
                     self.last_meta.get(&st.slot) != Some(&meta) || self.last_aabb.get(&st.slot) != Some(&pb.aabb);
@@ -402,7 +402,12 @@ impl ResidentPacker {
                     },
                 };
                 let word_offset = block * dense_block_u32() as u32;
-                let meta = pb.meta(word_offset);
+                // FIXED-ARENA shadow meta: the arena stores RAW haloed cells (NOT a paletted index stream — the
+                // R2b encode happens at `snapshot_patch` time, see that method), so this dense meta uses the
+                // arena `word_offset` as its offset with `index_bits = 0` / `palette_base = 0` as the RAW-ARENA
+                // marker. `snapshot_patch` reads only `is_uniform`/`voxel_origin`/`world_min`/`lod()` from the
+                // shadow and re-encodes from the raw `last_voxels`, so these two fields are inert here.
+                let meta = super::gpu::GpuBrickMeta::dense(pb.voxel_origin, word_offset, pb.world_min, pb.lod, 0, 0);
                 self.resident.insert(key, SlotState { slot: st.slot, arena_block: Some(block) });
                 let meta_changed =
                     self.last_meta.get(&st.slot) != Some(&meta) || self.last_aabb.get(&st.slot) != Some(&pb.aabb);
@@ -425,34 +430,6 @@ impl ResidentPacker {
         }
     }
 
-    /// Assemble the CURRENT full FIXED-CAPACITY GPU buffers (meta/aabb at fixed slot offsets, voxel arena at
-    /// fixed block offsets) from the packer's shadow state — the snapshot the render path uploads ONCE to
-    /// allocate the fixed-capacity buffers (then patches incrementally via [`RepackDelta`]). Unused slots carry
-    /// a zeroed meta + degenerate AABB; the voxel arena is zero-filled where no dense block lives. Lengths ==
-    /// [`capacity`](Self::capacity) / [`arena_capacity_u32`](Self::arena_capacity_u32). The `primitive_index`
-    /// of a resident brick == its slot in these buffers (the shader's `metas[primitive_index]` is unchanged).
-    pub fn snapshot_buffers(&self) -> (Vec<GpuBrickMeta>, Vec<GpuBrickAabb>, Vec<u32>) {
-        let cap = self.capacity() as usize;
-        let mut metas = vec![GpuBrickMeta::zeroed(); cap];
-        let mut aabbs = vec![degenerate_aabb(); cap];
-        let mut voxels = vec![0u32; self.arena_capacity_u32()];
-        for (&slot, meta) in &self.last_meta {
-            metas[slot as usize] = *meta;
-        }
-        for (&slot, aabb) in &self.last_aabb {
-            aabbs[slot as usize] = *aabb;
-        }
-        for st in self.resident.values() {
-            if let Some(block) = st.arena_block
-                && let Some(cells) = self.last_voxels.get(&st.slot)
-            {
-                let off = block as usize * dense_block_u32();
-                voxels[off..off + cells.len()].copy_from_slice(cells);
-            }
-        }
-        (metas, aabbs, voxels)
-    }
-
     /// Assemble a CONTIGUOUS [`GpuBrickPatch`] (resident bricks ONLY, in slot order, with re-based voxel
     /// offsets + palette + NEE lights) from the packer's shadow state — the shape `pack_resident_set` produces,
     /// so the existing render/upload/shader path consumes it unchanged. This is the live re-pack output: it is
@@ -473,6 +450,7 @@ impl ResidentPacker {
             aabbs: Vec::with_capacity(slots.len()),
             metas: Vec::with_capacity(slots.len()),
             voxels: Vec::with_capacity(slots.len() * dense_block_u32()),
+            brick_palettes: Vec::new(),
             palette: Vec::new(),
             lights: Vec::new(),
             alias: Vec::new(),
@@ -486,17 +464,30 @@ impl ResidentPacker {
             if meta.is_uniform() {
                 patch.metas.push(meta);
             } else {
-                // Re-base the dense voxel offset into the CONTIGUOUS output buffer (the arena offset is sparse),
-                // deduping identical haloed slices (R3) so a repeated brick shares one slice.
+                // R2b + R3 — re-encode the cached RAW haloed cells into a per-brick palette + bit-packed index
+                // stream in the CONTIGUOUS output buffers (the live shadow keeps raw cells; encoding happens here
+                // at snapshot time), deduping identical slices so a repeated brick shares one (index, palette)
+                // pair. `last_voxels` is RAW cells, so the encode is byte-identical to `pack_resident_set`'s.
                 let cells = self.last_voxels.get(&slot).expect("dense slot has a voxel shadow");
-                let voxel_offset = interner.intern(&mut patch.voxels, cells);
-                let rebased = super::gpu::GpuBrickMeta::dense(meta.voxel_origin, voxel_offset, meta.world_min, meta.lod);
+                let layout = interner.intern_paletted(&mut patch.voxels, &mut patch.brick_palettes, cells);
+                let rebased = super::gpu::GpuBrickMeta::dense(
+                    meta.voxel_origin,
+                    layout.voxel_offset,
+                    meta.world_min,
+                    meta.lod(),
+                    layout.index_bits,
+                    layout.palette_base,
+                );
                 patch.metas.push(rebased);
             }
         }
-        // Keep the voxel buffer non-empty for upload (mirrors `pack_resident_set`'s `ensure_voxels_nonempty`).
+        // Keep the index + palette buffers non-empty for upload (mirrors `pack_resident_set`'s
+        // `ensure_voxels_nonempty`).
         if patch.voxels.is_empty() {
             patch.voxels.push(0);
+        }
+        if patch.brick_palettes.is_empty() {
+            patch.brick_palettes.push(0);
         }
         // Palette + NEE light list — derived from the assembled buffers via the SHARED gpu tail (one SSOT).
         super::gpu::finalize_patch_palette_and_lights(&mut patch, registry);

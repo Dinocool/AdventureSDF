@@ -148,6 +148,12 @@ fn gpu_lighting_normals_and_shadows() {
         contents: bytemuck::cast_slice(&patch.palette),
         usage: wgpu::BufferUsages::STORAGE,
     });
+    // Storage plan R2b — the per-brick palettes the bit-packed index stream indirects through.
+    let brick_palettes_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("lit_palette_brick_palettes"),
+        contents: bytemuck::cast_slice(&patch.brick_palettes),
+        usage: wgpu::BufferUsages::STORAGE,
+    });
 
     let size_desc = wgpu::BlasAABBGeometrySizeDescriptor {
         primitive_count: n,
@@ -219,6 +225,7 @@ fn gpu_lighting_normals_and_shadows() {
             wgpu::BindGroupEntry { binding: 1, resource: meta_buf.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 2, resource: voxel_buf.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 3, resource: palette_buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 12, resource: brick_palettes_buf.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 4, resource: ray_buf.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 5, resource: out_buf.as_entire_binding() },
         ],

@@ -564,13 +564,14 @@ fn pack_resident_set_keeps_constant_grid_and_lod_span() {
     let entries = vec![ResidentBrick { coord: IVec3::new(2, -1, 3), brick: &solidb, lod }];
     let patch = pack_resident_set(&entries, &reg);
     assert_eq!(patch.brick_count(), 1);
-    assert_eq!(patch.metas[0].lod, lod);
-    // Constant haloed 10³ grid at every LOD (the clipmap scales the span, not the resolution).
-    assert_eq!(patch.voxels.len(), halo_cells(lod), "every LOD stores a haloed 10³ grid");
+    assert_eq!(patch.metas[0].lod(), lod);
+    // Constant haloed 10³ logical grid at every LOD (the clipmap scales the span, not the resolution). R2b: the
+    // stored INDEX stream is bit-packed (k=2 ⇒ 1-bit ⇒ ceil(1000/32) words), far smaller than 1000 raw u32.
     assert_eq!(halo_cells(lod), 10 * 10 * 10);
-    // Core cells are solid (the brick is packed verbatim — no erosion).
+    assert_eq!(patch.voxels.len(), halo_cells(lod).div_ceil(32), "1-bit index stream is ceil(1000/32) words");
+    // Core cells DECODE to solid (the brick is packed verbatim — no erosion).
     for x in 1..=BRICK_EDGE {
-        assert_eq!(patch.voxels[halo_index(x, x, x, lod)], 1, "core cell solid");
+        assert_eq!(patch.cell_block(&patch.metas[0], halo_index(x, x, x, lod)).0, 1, "core cell solid");
     }
     // world_min = coord · brick_span(lod).
     let span = brick_span(lod);

@@ -74,15 +74,15 @@ fn cpu_first_solid(map: &BrickMap, ro: Vec3, rd: Vec3, t_max: f32) -> Option<(Bl
 /// (commit only CORE cells) → `(block_id, hit_t)` or `None`. Mirrors `assets/shaders/voxel_raytrace.wgsl`.
 fn dda_brick_faithful(patch: &GpuBrickPatch, bi: usize, ro: Vec3, rd: Vec3) -> Option<(u32, f32)> {
     let m = &patch.metas[bi];
-    let core = lod_edge(m.lod);
+    let core = lod_edge(m.lod());
     let hedge = core + 2;
-    let csize = lod_voxel_size(m.lod);
+    let csize = lod_voxel_size(m.lod());
     let wmin = Vec3::from(m.world_min);
 
-    // Grown-AABB slab (same as the shader's trace candidate test). `brick_span(m.lod)` is the clipmap span
+    // Grown-AABB slab (same as the shader's trace candidate test). `brick_span(m.lod())` is the clipmap span
     // (Cornell is all LOD0, so this is BRICK_WORLD_SIZE here — but use the SSOT so it never drifts).
     let bmin = wmin - Vec3::splat(BRICK_AABB_EPSILON);
-    let bmax = wmin + Vec3::splat(brick_span(m.lod) + BRICK_AABB_EPSILON);
+    let bmax = wmin + Vec3::splat(brick_span(m.lod()) + BRICK_AABB_EPSILON);
     let inv = Vec3::new(1.0 / rd.x, 1.0 / rd.y, 1.0 / rd.z);
     let ta = (bmin - ro) * inv;
     let tb = (bmax - ro) * inv;
@@ -119,15 +119,9 @@ fn dda_brick_faithful(patch: &GpuBrickPatch, bi: usize, ro: Vec3, rd: Vec3) -> O
         pick(nz(rd.y), (csize * inv.y).abs()),
         pick(nz(rd.z), (csize * inv.z).abs()),
     );
-    let off = m.voxel_offset as usize;
-    // Storage plan R1: a UNIFORM brick has no voxel array — every haloed cell is its single block id.
-    let cell = |x: i32, y: i32, z: i32| {
-        if m.is_uniform() {
-            m.uniform_block().0 as u32
-        } else {
-            patch.voxels[off + (x + y * hedge + z * hedge * hedge) as usize]
-        }
-    };
+    // SSOT decode via `GpuBrickPatch::cell_block` (R2b) — uniform meta id or dense bit-packed index + palette,
+    // exactly as the GPU `cell_block` does (oracle can never drift from the shader).
+    let cell = |x: i32, y: i32, z: i32| patch.cell_block(m, (x + y * hedge + z * hedge * hedge) as usize).0 as u32;
     let mut t = t0;
     let lim = 3 * (BRICK_EDGE + 2);
     for _ in 0..lim {

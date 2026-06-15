@@ -5,28 +5,31 @@
 //!
 //! # Layout
 //!
-//! A patch is uploaded as three parallel GPU storage buffers plus a palette buffer:
+//! A patch is uploaded as parallel GPU storage buffers plus a palette buffer. **Storage plan R2b** packs each
+//! dense brick's haloed cells as a tiny per-brick palette + bit-packed indices (was a raw `u32`-per-cell id
+//! buffer); **R1** collapses fully-buried uniform bricks into the meta; **R3** dedups identical bricks.
 //!
 //! - **AABB buffer** (`Vec<GpuBrickAabb>`): one procedural AABB per resident brick, in world metres. This
 //!   is the BLAS geometry — `primitive_index` in the ray query indexes it. AABBs are the brick's world
 //!   bounds at its LOD (`brick_coord · brick_span(lod) .. +brick_span(lod)`); a coarse brick covers more
 //!   world (the clipmap span scales `2^lod`), so the AABB is NOT LOD-invariant.
-//! - **Brick directory** (`Vec<GpuBrickMeta>`): parallel to the AABB buffer (same index = same brick).
-//!   Each entry carries the brick's world-voxel origin and the offset (in `u32`s) into the voxel buffer
-//!   where its [`halo_cells`] block ids start. The shader, given `primitive_index`, reads this to locate
-//!   the brick's voxels and place them in world space.
-//! - **Voxel buffer** (`Vec<u32>`): every resident brick's HALOED grid block ids — a `(lod_edge+2)³` block
-//!   ([`halo_cells`]) with a 1-cell border on every side holding the adjacent NEIGHBOUR brick's boundary
-//!   voxels (AIR where the neighbour is absent), one [`BlockId`] per `u32` (zero-extended `u16`), in
-//!   [`halo_index`] order. Densely concatenated; a brick's slice begins at its directory `voxel_offset`.
-//!   The halo is the robust brick-SEAM fix: it lets the in-shader DDA always cross a real air→solid cell
-//!   boundary AT the true surface (even when the surface lies on a brick face), so the first-solid hit gets
-//!   the correct entry-face normal from EVERY angle — killing the thin dark seam lines at oblique views.
-//!   Cost: LOD0 stores `10³ = 1000` u32 vs the bare `8³ = 512` (~1.95×); a few MB at Cornell/patch scale.
+//! - **Brick directory** (`Vec<GpuBrickMeta>`, 48 B/brick): parallel to the AABB buffer (same index = same
+//!   brick). Each entry carries the brick's world-voxel origin, the offset into the INDEX-STREAM buffer, the
+//!   `palette_base` into `brick_palettes`, and the LOD + index bit width. The shader, given `primitive_index`,
+//!   reads this to locate + decode the brick's voxels (R1 uniform: the id rides in the meta directly).
+//! - **Index-stream buffer** (`Vec<u32>`, the `voxels` field): every DENSE brick's HALOED grid encoded as
+//!   `index_bits`-wide LOCAL PALETTE INDICES, bit-packed into `u32` words ([`encode_paletted`]). The haloed
+//!   grid is `(lod_edge+2)³` ([`halo_cells`]) with a 1-cell border holding the NEIGHBOUR brick's boundary
+//!   voxels (AIR where absent), in [`halo_index`] order. A brick's stream begins at its directory
+//!   `voxel_offset`; a uniform brick contributes nothing. The halo is the robust brick-SEAM fix (always crosses
+//!   a real air→solid boundary at the true surface, for the correct entry-face normal from every angle).
+//! - **Brick-palettes buffer** (`Vec<u32>`, R2b): every dense brick's `k` distinct block ids (one `u32` each),
+//!   starting at its meta's `palette_base`. The DDA decodes `id = brick_palettes[palette_base + local_index]`.
 //! - **Palette buffer** (`Vec<GpuPaletteColor>`): `BlockId(i)` → linear RGBA, indexed directly by block id.
 //!
 //! Every offset/stride below is derived from the [`brickmap`](super::brickmap) constants, so the brick
-//! geometry constants live in exactly one place.
+//! geometry constants live in exactly one place. [`GpuBrickPatch::cell_block`] is the CPU SSOT decode every
+//! ray-march oracle uses — it mirrors the WGSL `cell_block` EXACTLY, so the tests and the shader cannot drift.
 
 use bevy::math::IVec3;
 use bytemuck::{Pod, Zeroable};
@@ -118,47 +121,80 @@ pub struct GpuBrickAabb {
 pub const BRICK_UNIFORM_FLAG: u32 = 1u32 << 31;
 
 /// Per-brick metadata, parallel to the AABB buffer (index `i` describes the brick whose AABB is
-/// `aabbs[i]` and whose `primitive_index` in the ray query is `i`). 32 bytes, `bytemuck`-uploadable.
+/// `aabbs[i]` and whose `primitive_index` in the ray query is `i`). 48 bytes, `bytemuck`-uploadable.
+///
+/// **Storage plan R2b — the meta grew from 32 → 48 bytes** to carry the paletted-index decode parameters: a
+/// DENSE brick's `voxels` slice is now a BIT-PACKED INDEX STREAM (`encode_paletted(cells).indices`) into a tiny
+/// per-brick PALETTE (the distinct block ids) living in a SEPARATE `brick_palettes` buffer. The decode needs the
+/// palette base + the bit width, so two fields were added: `palette_base` and `index_bits` (packed into the
+/// spare high bits of `lod`). The +16 B/brick is dwarfed by the index-stream shrink (a strata brick's `10³`
+/// `u32` ids → `10³ · index_bits`-bit indices, 8–32× smaller). 48 bytes is 16-aligned (the `vec3` align), so
+/// the WGSL storage `array<BrickMeta>` stride matches with no implicit padding surprise.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Pod, Zeroable)]
 pub struct GpuBrickMeta {
     /// The brick's world-VOXEL origin (its local `(0,0,0)` corner in world voxel coordinates) =
     /// `brick_coord · BRICK_EDGE`. The shader maps a world position to a local voxel via this.
     pub voxel_origin: [i32; 3],
-    /// Offset (in `u32` elements) into the voxel buffer where this brick's voxel block ids begin — UNLESS the
-    /// [`BRICK_UNIFORM_FLAG`] high bit is set, in which case this is a UNIFORM brick (storage plan R1): no
-    /// voxel-array entries are emitted and the LOW 16 bits hold the single [`BlockId`] of the whole brick.
-    /// A DENSE brick stores [`halo_cells`]`(lod)` = `10³` ids (the `8³` core + 1-cell halo) at EVERY LOD (the
-    /// grid is a constant `8³`; only the world span scales), so its stride is LOD-independent and bit 31 is
-    /// always 0 (real offsets are `< 2^31`). Read via [`Self::is_uniform`] / [`Self::uniform_block`] /
-    /// [`Self::dense_offset`] — never compare the raw field.
+    /// Offset (in `u32` elements) into the voxel INDEX-STREAM buffer where this brick's bit-packed indices begin
+    /// — UNLESS the [`BRICK_UNIFORM_FLAG`] high bit is set, in which case this is a UNIFORM brick (storage plan
+    /// R1): no index entries are emitted and the LOW 16 bits hold the single [`BlockId`] of the whole brick.
+    /// A DENSE brick's index stream is `encode_paletted(cells).indices` (R2b); bit 31 is always 0 for it (real
+    /// offsets are `< 2^31`). Read via [`Self::is_uniform`] / [`Self::uniform_block`] / [`Self::dense_offset`] —
+    /// never compare the raw field.
     pub voxel_offset: u32,
     /// The brick's world-metre minimum corner (= `aabbs[i].min`), duplicated here so the shader's DDA has
     /// the brick origin without a second buffer fetch. `world_min = coord · brick_span(lod)`.
     pub world_min: [f32; 3],
-    /// The brick's LOD level. The grid is ALWAYS `8³` ([`lod_edge`]); the shader derives the per-cell world
-    /// size ([`brick_span`]`(lod) / 8 = VOXEL_SIZE · 2^lod`) + the brick span (`brick_span(lod)`) from this,
-    /// so a coarse brick is DDA-marched over the SAME `8³` grid covering `2^lod×` more world. Part of the
-    /// SSOT — uploader, shader, and tests agree on it.
-    pub lod: u32,
+    /// The brick's LOD level (bits 0-2, `lod ≤ MAX_LOD = 7`) PACKED with the R2b paletted INDEX BIT WIDTH in
+    /// bits 3-7 (the raw value ∈ `{1,2,4,8,16}`, so 5 bits suffice). Read via [`Self::lod`] / [`Self::index_bits`]
+    /// — never the raw field. (Uniform/freed metas carry `index_bits == 0`, which is meaningless for them.)
+    pub lod_and_bits: u32,
+    /// Storage plan R2b — the offset (in `u32` elements) into the `brick_palettes` buffer where this DENSE
+    /// brick's palette (its `k` distinct block ids, one `u32` each) begins. The decode is
+    /// `id = brick_palettes[palette_base + local_index]`. Meaningless (0) for a uniform/freed brick.
+    pub palette_base: u32,
+    /// Pad to 48 bytes (16-aligned, the WGSL `vec3` storage stride). Always zero.
+    pub _pad: [u32; 3],
 }
 
 impl GpuBrickMeta {
-    /// Build a DENSE-brick meta whose voxels begin at `voxel_offset` in the voxel buffer (bit 31 clear). The
-    /// non-uniform path the engine has always emitted — byte-identical to before storage plan R1.
+    /// Build a DENSE-brick meta (storage plan R2b): its bit-packed index stream begins at `voxel_offset` (bit 31
+    /// clear), its `index_bits`-wide indices reference the palette starting at `palette_base` in `brick_palettes`.
     #[inline]
-    pub fn dense(voxel_origin: [i32; 3], voxel_offset: u32, world_min: [f32; 3], lod: u32) -> Self {
+    pub fn dense(
+        voxel_origin: [i32; 3],
+        voxel_offset: u32,
+        world_min: [f32; 3],
+        lod: u32,
+        index_bits: u8,
+        palette_base: u32,
+    ) -> Self {
         debug_assert!(voxel_offset & BRICK_UNIFORM_FLAG == 0, "voxel offset must leave bit 31 free for the uniform flag");
-        Self { voxel_origin, voxel_offset, world_min, lod }
+        Self {
+            voxel_origin,
+            voxel_offset,
+            world_min,
+            lod_and_bits: pack_lod_bits(lod, index_bits),
+            palette_base,
+            _pad: [0; 3],
+        }
     }
 
-    /// Build a UNIFORM-brick meta (storage plan R1): the whole haloed `10³` grid is `block`, so NO voxel-array
+    /// Build a UNIFORM-brick meta (storage plan R1): the whole haloed `10³` grid is `block`, so NO index/palette
     /// entries are emitted — the block id is packed into the low 16 bits of `voxel_offset` with the
-    /// [`BRICK_UNIFORM_FLAG`] high bit set. The shader's DDA reads the id straight from the meta (no
-    /// `voxels[]` fetch). `block` must be a SOLID block (a uniform-air brick is empty and never resident).
+    /// [`BRICK_UNIFORM_FLAG`] high bit set. The shader's DDA reads the id straight from the meta (no buffer
+    /// fetch). `block` must be a SOLID block (a uniform-air brick is empty and never resident).
     #[inline]
     pub fn uniform(voxel_origin: [i32; 3], block: BlockId, world_min: [f32; 3], lod: u32) -> Self {
-        Self { voxel_origin, voxel_offset: BRICK_UNIFORM_FLAG | block.0 as u32, world_min, lod }
+        Self {
+            voxel_origin,
+            voxel_offset: BRICK_UNIFORM_FLAG | block.0 as u32,
+            world_min,
+            lod_and_bits: pack_lod_bits(lod, 0),
+            palette_base: 0,
+            _pad: [0; 3],
+        }
     }
 
     /// An ALL-ZERO meta for an UNUSED slot in the incremental fixed-capacity buffers (storage plan: the
@@ -168,10 +204,17 @@ impl GpuBrickMeta {
     /// arena's first word, not garbage). `Zeroable`-equivalent, written by name for clarity.
     #[inline]
     pub fn zeroed() -> Self {
-        Self { voxel_origin: [0; 3], voxel_offset: 0, world_min: [0.0; 3], lod: 0 }
+        Self {
+            voxel_origin: [0; 3],
+            voxel_offset: 0,
+            world_min: [0.0; 3],
+            lod_and_bits: 0,
+            palette_base: 0,
+            _pad: [0; 3],
+        }
     }
 
-    /// True iff this meta is a collapsed UNIFORM brick (no voxel array; block id in the low bits).
+    /// True iff this meta is a collapsed UNIFORM brick (no index/palette; block id in the low bits).
     #[inline]
     pub fn is_uniform(&self) -> bool {
         self.voxel_offset & BRICK_UNIFORM_FLAG != 0
@@ -184,12 +227,34 @@ impl GpuBrickMeta {
         BlockId((self.voxel_offset & 0xFFFF) as u16)
     }
 
-    /// The voxel-buffer start offset of a DENSE brick (bit 31 masked off — it is always 0 for a dense brick,
+    /// The index-stream start offset of a DENSE brick (bit 31 masked off — it is always 0 for a dense brick,
     /// so this equals the raw field, but masking keeps the accessor total). Meaningless for a uniform brick.
     #[inline]
     pub fn dense_offset(&self) -> u32 {
         self.voxel_offset & !BRICK_UNIFORM_FLAG
     }
+
+    /// The brick's LOD level (bits 0-2 of `lod_and_bits`).
+    #[inline]
+    pub fn lod(&self) -> u32 {
+        self.lod_and_bits & 0x7
+    }
+
+    /// The R2b paletted INDEX BIT WIDTH (bits 3-7 of `lod_and_bits`) ∈ `{1,2,4,8,16}`. Meaningless for a
+    /// uniform/freed brick (0).
+    #[inline]
+    pub fn index_bits(&self) -> u8 {
+        ((self.lod_and_bits >> 3) & 0x1F) as u8
+    }
+}
+
+/// Pack `lod` (bits 0-2, `≤ MAX_LOD = 7`) and the R2b `index_bits` (bits 3-7, ∈ `{0,1,2,4,8,16}`) into the
+/// meta's `lod_and_bits` field. SSOT for the bit layout (the WGSL `meta_lod` / `meta_index_bits` mirror it).
+#[inline]
+fn pack_lod_bits(lod: u32, index_bits: u8) -> u32 {
+    debug_assert!(lod <= 7, "lod must fit in 3 bits");
+    debug_assert!(index_bits <= 16, "index_bits must fit in 5 bits");
+    (lod & 0x7) | ((index_bits as u32 & 0x1F) << 3)
 }
 
 /// One palette entry: linear-RGBA albedo + linear-RGB emissive radiance. Indexed by `BlockId(i)`
@@ -264,8 +329,16 @@ pub struct GpuBrickPatch {
     pub aabbs: Vec<GpuBrickAabb>,
     /// Per-brick metadata, parallel to `aabbs`.
     pub metas: Vec<GpuBrickMeta>,
-    /// Concatenated per-voxel block ids (one `u32` each). `metas[i].voxel_offset` is brick `i`'s start.
+    /// Storage plan R2b — the concatenated BIT-PACKED INDEX STREAM: each DENSE brick contributes
+    /// `encode_paletted(cells).indices` (its `10³` cells as `index_bits`-wide local palette indices, packed into
+    /// `u32` words). `metas[i].voxel_offset` is brick `i`'s start word; `metas[i].index_bits()` the width;
+    /// `metas[i].palette_base` the start of its palette in [`Self::brick_palettes`]. (Was a raw `u32`-per-cell id
+    /// buffer pre-R2b.) A uniform brick contributes nothing (its id rides in the meta).
     pub voxels: Vec<u32>,
+    /// Storage plan R2b — the concatenated per-brick PALETTES: each DENSE brick contributes its `k` distinct
+    /// block ids (one `u32` each, first-seen order), starting at `metas[i].palette_base`. The DDA decodes
+    /// `id = brick_palettes[palette_base + local_index]`. A uniform brick contributes nothing.
+    pub brick_palettes: Vec<u32>,
     /// `BlockId(i)` → linear RGBA. Length == registry length.
     pub palette: Vec<GpuPaletteColor>,
     /// The EMISSIVE-VOXEL LIGHT LIST (Phase 2.5 NEE): one [`GpuVoxelLight`] per air-exposed emissive voxel in
@@ -298,10 +371,36 @@ impl GpuBrickPatch {
         self.metas.iter().filter(|m| m.is_uniform()).count()
     }
 
-    /// A device-free STORAGE-BYTES report for this packed patch (storage plan R1 measurement — the
-    /// benchmark-every-delivery number). Compares the AFTER layout (uniform bricks carry no voxel array) against
-    /// the pre-R1 BEFORE layout (EVERY brick expanded to a haloed `10³` `u32` array, the content-blind cost the
-    /// engine paid before this change). All numbers are CPU-computable from the patch — no GPU device needed.
+    /// The block id at HALOED-grid cell index `cell` of brick `meta` — the **CPU SSOT decode** the WGSL
+    /// `cell_block` mirrors EXACTLY (storage plan R2b). A UNIFORM brick returns its single id; a DENSE brick
+    /// decodes its bit-packed local palette index (`voxels[voxel_offset + bit/32] >> (bit%32) & mask`) then
+    /// indirects through its per-brick palette (`brick_palettes[palette_base + local]`). This is THE function
+    /// every CPU-side ray-march oracle (the GPU-vs-CPU correctness tests) must call to read a logical block id —
+    /// so the oracle and the production layout can never drift. `cell` is a [`halo_index`].
+    #[inline]
+    pub fn cell_block(&self, meta: &GpuBrickMeta, cell: usize) -> BlockId {
+        if meta.is_uniform() {
+            return meta.uniform_block();
+        }
+        let off = meta.dense_offset() as usize;
+        let pb = meta.palette_base as usize;
+        let id = decode_paletted_cell(&self.brick_palettes_u16_from(pb), meta.index_bits(), &self.voxels[off..], cell);
+        BlockId(id)
+    }
+
+    /// View the `brick_palettes` suffix starting at `base` as `u16`s (the stored ids are `u16` zero-extended into
+    /// `u32`). Internal helper for [`Self::cell_block`]; the decode only ever indexes the `≤k` entries the brick
+    /// uses, so the whole remaining suffix is a safe (over-)approximation of the brick's palette.
+    #[inline]
+    fn brick_palettes_u16_from(&self, base: usize) -> Vec<u16> {
+        self.brick_palettes[base..].iter().map(|&x| x as u16).collect()
+    }
+
+    /// A device-free STORAGE-BYTES report for this packed patch (storage plan measurement — the
+    /// benchmark-every-delivery number). Compares the AFTER layout (R1 uniform-collapse + R3 dedup + R2b
+    /// palette/bit-pack) against the content-blind BEFORE layout (EVERY brick expanded to a haloed `10³` `u32`
+    /// array — the cost the engine paid before any storage-plan work). All numbers are CPU-computable from the
+    /// patch — no GPU device needed.
     pub fn storage_report(&self) -> StorageReport {
         let bricks = self.brick_count();
         let uniform = self.uniform_brick_count();
@@ -310,9 +409,11 @@ impl GpuBrickPatch {
         let palette_bytes = self.palette.len() * std::mem::size_of::<GpuPaletteColor>();
         let light_bytes = self.lights.len() * std::mem::size_of::<GpuVoxelLight>()
             + self.alias.len() * std::mem::size_of::<GpuAliasEntry>();
-        // AFTER (R1): the actual emitted voxel buffer (uniform bricks contributed nothing).
+        // AFTER (R2b): the bit-packed INDEX STREAM (uniform bricks emit nothing; R3 dedups identical bricks).
         let voxel_bytes_after = self.voxels.len() * std::mem::size_of::<u32>();
-        // BEFORE (pre-R1): every brick expanded to a haloed 10³ array regardless of content.
+        // AFTER (R2b): the per-brick palettes (one u32 per distinct id per dense slice; R3-deduped).
+        let brick_palette_bytes = self.brick_palettes.len() * std::mem::size_of::<u32>();
+        // BEFORE: every brick expanded to a haloed 10³ `u32`-per-cell array regardless of content.
         let voxel_bytes_before = bricks * halo_cells(0) * std::mem::size_of::<u32>();
         StorageReport {
             bricks,
@@ -322,6 +423,7 @@ impl GpuBrickPatch {
             light_bytes,
             voxel_bytes_before,
             voxel_bytes_after,
+            brick_palette_bytes,
         }
     }
 }
@@ -342,10 +444,15 @@ pub struct StorageReport {
     pub palette_bytes: usize,
     /// NEE light-list + alias-table bytes. Unchanged by R1.
     pub light_bytes: usize,
-    /// Voxel buffer bytes BEFORE R1 (every brick a haloed `10³` `u32` array — content-blind).
+    /// Voxel buffer bytes BEFORE any storage-plan work (every brick a haloed `10³` `u32`-per-cell array —
+    /// content-blind).
     pub voxel_bytes_before: usize,
-    /// Voxel buffer bytes AFTER R1 (uniform bricks emit nothing — only dense surface bricks remain).
+    /// Index-stream buffer bytes AFTER R2b (uniform bricks emit nothing; dense bricks are bit-packed indices;
+    /// R3 dedups identical bricks).
     pub voxel_bytes_after: usize,
+    /// Per-brick PALETTE buffer bytes AFTER R2b (`brick_palettes.len() · 4`). Counted in the AFTER total only
+    /// (the BEFORE layout had no per-brick palette).
+    pub brick_palette_bytes: usize,
 }
 
 impl StorageReport {
@@ -361,9 +468,14 @@ impl StorageReport {
     pub fn total_vram_before(&self) -> usize {
         self.meta_aabb_bytes + self.palette_bytes + self.light_bytes + self.voxel_bytes_before
     }
-    /// Total resident VRAM estimate AFTER R1 (the single number each phase must reduce).
+    /// Total resident VRAM estimate AFTER R2b (the single number each phase must reduce) — includes the
+    /// per-brick palette buffer.
     pub fn total_vram_after(&self) -> usize {
-        self.meta_aabb_bytes + self.palette_bytes + self.light_bytes + self.voxel_bytes_after
+        self.meta_aabb_bytes
+            + self.palette_bytes
+            + self.light_bytes
+            + self.voxel_bytes_after
+            + self.brick_palette_bytes
     }
     /// The VRAM-reduction factor (`before / after`) — `1.0` when nothing collapsed.
     pub fn vram_reduction(&self) -> f64 {
@@ -389,12 +501,15 @@ pub fn pack_brickmap(map: &BrickMap, registry: &BlockRegistry) -> GpuBrickPatch 
         aabbs: Vec::with_capacity(coords.len()),
         metas: Vec::with_capacity(coords.len()),
         voxels: Vec::with_capacity(coords.len() * halo_cells(0)),
+        brick_palettes: Vec::new(),
         palette: Vec::with_capacity(registry.len()),
         lights: Vec::new(),
         alias: Vec::new(),
     };
     // The air-exposed emissive voxels found across all bricks — finalized into the NEE light list at the end.
     let mut found: Vec<EmissiveVoxel> = Vec::new();
+    // R3: dedup identical haloed slices so duplicate dense bricks share one (index-stream, palette) pair.
+    let mut interner = VoxelInterner::new();
 
     let h = halo_edge(0); // LOD0 haloed edge (= BRICK_EDGE + 2)
     for coord in coords {
@@ -421,27 +536,36 @@ pub fn pack_brickmap(map: &BrickMap, registry: &BlockRegistry) -> GpuBrickPatch 
             continue; // no voxel emit, no light gather (fully buried ⇒ no air-exposed emissive face)
         }
 
-        let voxel_offset = patch.voxels.len() as u32;
-        // LOD0 (full res) for the static patch packer — every brick keeps its 8³ core grid (+ halo).
-        patch.metas.push(GpuBrickMeta::dense(voxel_origin, voxel_offset, world_min, 0));
-
-        // Append the brick's voxels in HALOED-grid order (+X fastest, then +Y, then +Z): the haloed grid is
+        // Build the brick's HALOED-grid cells (+X fastest, then +Y, then +Z): the haloed grid is
         // `(BRICK_EDGE+2)³`, with halo index 0/`h-1` the border ring and core cells at `[1, BRICK_EDGE]`. The
         // border holds the NEIGHBOUR brick's adjacent voxel (read from the map via `voxel_block`; AIR where the
         // neighbour is absent), so the DDA sees a real air→solid crossing at the true surface. The brick's
         // world-voxel origin is `voxel_origin`; haloed local `(hx,hy,hz)` ↦ world voxel `origin + (h*-1)`.
+        let mut cells = Vec::with_capacity(halo_cells(0));
         for hz in 0..h {
             for hy in 0..h {
                 for hx in 0..h {
-                    debug_assert_eq!(patch.voxels.len() - voxel_offset as usize, halo_index(hx, hy, hz, 0));
+                    debug_assert_eq!(cells.len(), halo_index(hx, hy, hz, 0));
                     let wv = origin + IVec3::new(hx - 1, hy - 1, hz - 1);
-                    patch.voxels.push(map.voxel_block(wv).0 as u32);
+                    cells.push(map.voxel_block(wv).0 as u32);
                 }
             }
         }
+        // STORAGE PLAN R2b + R3 — encode the cells into a per-brick palette + bit-packed index stream (deduping
+        // an identical slice). The dense meta carries the index offset, palette base, and bit width.
+        let layout = interner.intern_paletted(&mut patch.voxels, &mut patch.brick_palettes, &cells);
+        patch.metas.push(GpuBrickMeta::dense(
+            voxel_origin,
+            layout.voxel_offset,
+            world_min,
+            0,
+            layout.index_bits,
+            layout.palette_base,
+        ));
         // Gather this brick's air-exposed emissive voxels into the NEE light list (Phase 2.5). Done AFTER the
-        // brick's voxels (incl. halo) are written, so face-exposure reads the just-packed haloed grid.
-        gather_lights_into(&mut found, &patch, registry, voxel_offset as usize, world_min, 0);
+        // brick's index stream + palette are written, so face-exposure decodes the just-packed haloed grid.
+        let meta = *patch.metas.last().expect("just pushed");
+        gather_lights_into(&mut found, &patch, registry, &meta);
     }
 
     ensure_voxels_nonempty(&mut patch);
@@ -450,16 +574,20 @@ pub fn pack_brickmap(map: &BrickMap, registry: &BlockRegistry) -> GpuBrickPatch 
     patch
 }
 
-/// Keep the voxel buffer NON-EMPTY for upload (storage plan R1 edge case). With uniform-brick collapse a patch
-/// whose every brick is uniform-incl-halo emits ZERO voxel-array entries; `wgpu::create_buffer_init` rejects a
-/// zero-sized storage buffer, so push a single unreferenced sentinel `0u32`. No `GpuBrickMeta` points at it
-/// (every uniform brick reads its id from the meta; every dense brick has its own slice at index 0+), so this
-/// is invisible to the trace and keeps every consumer's `cast_slice(&patch.voxels)` valid with no per-site
+/// Keep the index-stream AND the brick-palette buffers NON-EMPTY for upload (storage plan R1/R2b edge case).
+/// With uniform-brick collapse a patch whose every brick is uniform-incl-halo emits ZERO index entries AND zero
+/// brick-palette entries; `wgpu::create_buffer_init` rejects a zero-sized storage buffer, so push a single
+/// unreferenced sentinel `0u32` into each. No `GpuBrickMeta` points at them (every uniform brick reads its id
+/// from the meta; every dense brick has its own slice at index 0+), so they are invisible to the trace and keep
+/// every consumer's `cast_slice(&patch.voxels)` / `cast_slice(&patch.brick_palettes)` valid with no per-site
 /// guard. Only fires for the all-uniform degenerate case — a normal scene has dense surface bricks.
 #[inline]
 fn ensure_voxels_nonempty(patch: &mut GpuBrickPatch) {
     if patch.voxels.is_empty() {
         patch.voxels.push(0);
+    }
+    if patch.brick_palettes.is_empty() {
+        patch.brick_palettes.push(0);
     }
 }
 
@@ -512,19 +640,35 @@ pub struct PackedBrick {
 }
 
 impl PackedBrick {
-    /// The [`GpuBrickMeta`] for this brick once its dense voxels live at `dense_offset` in the voxel buffer
-    /// (ignored for a uniform brick, which packs its id into the meta). The SSOT meta builder both packers call
-    /// so the uniform-flag / offset rules are defined exactly once.
+    /// The UNIFORM [`GpuBrickMeta`] for this brick (its single id rides in the meta — no index/palette buffer).
+    /// Panics in debug if called on a dense brick. The SSOT uniform-meta builder both packers call.
     #[inline]
-    pub fn meta(&self, dense_offset: u32) -> GpuBrickMeta {
+    pub fn meta_uniform(&self) -> GpuBrickMeta {
         match &self.voxels {
             BrickVoxels::Uniform(block) => {
                 GpuBrickMeta::uniform(self.voxel_origin, *block, self.world_min, self.lod)
             }
             BrickVoxels::Dense(_) => {
-                GpuBrickMeta::dense(self.voxel_origin, dense_offset, self.world_min, self.lod)
+                debug_assert!(false, "meta_uniform called on a dense brick");
+                GpuBrickMeta::zeroed()
             }
         }
+    }
+
+    /// The DENSE [`GpuBrickMeta`] for this brick once its R2b paletted layout (index-stream offset, palette
+    /// base, bit width) is known — the caller owns the layout (a running offset for the full packer, a fixed
+    /// arena slot for the incremental one). The SSOT dense-meta builder both packers call so the
+    /// offset/palette/bit-width rules are defined exactly once.
+    #[inline]
+    pub fn meta_dense(&self, layout: DenseLayout) -> GpuBrickMeta {
+        GpuBrickMeta::dense(
+            self.voxel_origin,
+            layout.voxel_offset,
+            self.world_min,
+            self.lod,
+            layout.index_bits,
+            layout.palette_base,
+        )
     }
 }
 
@@ -612,8 +756,25 @@ pub fn build_by_key<'a>(entries: &[ResidentBrick<'a>]) -> std::collections::Hash
 /// set is small (the dedup ratio), so memory is bounded.
 #[derive(Default)]
 pub struct VoxelInterner {
-    /// Haloed slice content → the `voxel_offset` it was first written at.
-    seen: rustc_hash::FxHashMap<Box<[u32]>, u32>,
+    /// Haloed slice content → the R2b paletted layout it was first encoded into ([`DenseLayout`]). Keying on the
+    /// raw `cells` is correct: identical cells encode to an identical (palette, index-stream, bit-width) triple,
+    /// so two metas sharing a `DenseLayout` decode byte-identically — the COW-on-edit property is preserved (a
+    /// cut produces different cells → a fresh layout).
+    seen: rustc_hash::FxHashMap<Box<[u32]>, DenseLayout>,
+}
+
+/// The R2b GPU layout one DENSE brick's haloed cells resolve to: where its bit-packed index stream lives in the
+/// index buffer (`voxel_offset`), where its palette lives in `brick_palettes` (`palette_base`), and the index
+/// bit width (`index_bits`). Returned by [`VoxelInterner::intern_paletted`]; consumed straight into
+/// [`GpuBrickMeta::dense`]. The SSOT both packers + the live re-pack build a dense meta from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DenseLayout {
+    /// Start word of the brick's bit-packed index stream in the index buffer (`metas[].voxel_offset`).
+    pub voxel_offset: u32,
+    /// Start word of the brick's palette in `brick_palettes` (`metas[].palette_base`).
+    pub palette_base: u32,
+    /// The bit-packed index width ∈ `{1,2,4,8,16}` (`metas[].index_bits()`).
+    pub index_bits: u8,
 }
 
 impl VoxelInterner {
@@ -622,18 +783,30 @@ impl VoxelInterner {
         Self::default()
     }
 
-    /// Append `cells` to `buffer` and return its `voxel_offset` — UNLESS an identical slice was already
-    /// interned, in which case return the shared offset and append nothing. The returned offset always points
-    /// at a slice equal to `cells` (so a caller's subsequent read at that offset is valid).
-    pub fn intern(&mut self, buffer: &mut Vec<u32>, cells: &[u32]) -> u32 {
-        if let Some(&off) = self.seen.get(cells) {
-            return off;
+    /// Storage plan R2b — encode `cells` into a palette + bit-packed index stream ([`encode_paletted`]), append
+    /// the indices to `indices` and the palette to `palettes`, and return the [`DenseLayout`] (offsets + width)
+    /// — UNLESS an identical `cells` slice was already interned (R3 dedup), in which case return the SHARED
+    /// layout and append nothing to either buffer. The returned layout always references a (present) index
+    /// stream + palette equal to `encode_paletted(cells)`, so a caller's subsequent decode is valid.
+    pub fn intern_paletted(
+        &mut self,
+        indices: &mut Vec<u32>,
+        palettes: &mut Vec<u32>,
+        cells: &[u32],
+    ) -> DenseLayout {
+        if let Some(&layout) = self.seen.get(cells) {
+            return layout;
         }
-        let off = buffer.len() as u32;
-        debug_assert!(off & BRICK_UNIFORM_FLAG == 0, "voxel offset must leave bit 31 free for the uniform flag");
-        buffer.extend_from_slice(cells);
-        self.seen.insert(cells.into(), off);
-        off
+        let pb = encode_paletted(cells);
+        let voxel_offset = indices.len() as u32;
+        let palette_base = palettes.len() as u32;
+        debug_assert!(voxel_offset & BRICK_UNIFORM_FLAG == 0, "voxel offset must leave bit 31 free for the uniform flag");
+        debug_assert!(palette_base & BRICK_UNIFORM_FLAG == 0, "palette base must leave bit 31 free");
+        indices.extend_from_slice(&pb.indices);
+        palettes.extend(pb.palette.iter().map(|&id| id as u32));
+        let layout = DenseLayout { voxel_offset, palette_base, index_bits: pb.index_bits };
+        self.seen.insert(cells.into(), layout);
+        layout
     }
 }
 
@@ -712,6 +885,7 @@ pub fn pack_resident_set(entries: &[ResidentBrick<'_>], registry: &BlockRegistry
         aabbs: Vec::with_capacity(entries.len()),
         metas: Vec::with_capacity(entries.len()),
         voxels: Vec::with_capacity(entries.len() * halo_cells(0)),
+        brick_palettes: Vec::new(),
         palette: Vec::with_capacity(registry.len()),
         lights: Vec::new(),
         alias: Vec::new(),
@@ -725,7 +899,7 @@ pub fn pack_resident_set(entries: &[ResidentBrick<'_>], registry: &BlockRegistry
     // bricks, so the lod must be part of the key. A border whose neighbour is absent or at a DIFFERENT lod (a
     // shell boundary) falls back to AIR (the conservative pre-halo behaviour — no cross-LOD halo).
     let by_key = build_by_key(entries);
-    // R3: dedup identical haloed slices so duplicate dense bricks share one voxel slice (shader-invisible).
+    // R3: dedup identical haloed slices so duplicate dense bricks share one (index-stream, palette) pair.
     let mut interner = VoxelInterner::new();
 
     for e in entries {
@@ -735,17 +909,19 @@ pub fn pack_resident_set(entries: &[ResidentBrick<'_>], registry: &BlockRegistry
         patch.aabbs.push(pb.aabb);
         match &pb.voxels {
             BrickVoxels::Uniform(_) => {
-                // R1: no voxel-array emit, and no light gather — a uniform-incl-halo brick is fully buried (every
-                // face neighbour is the same solid block), so it exposes no emissive faces.
-                patch.metas.push(pb.meta(0));
+                // R1: no index/palette emit, and no light gather — a uniform-incl-halo brick is fully buried
+                // (every face neighbour is the same solid block), so it exposes no emissive faces.
+                patch.metas.push(pb.meta_uniform());
             }
             BrickVoxels::Dense(cells) => {
-                // R3: intern the haloed slice — an identical brick shares ONE slice. `intern` appends only on a
-                // first sighting and returns the shared offset on a hit, so the gather below always reads a
-                // (present) slice equal to `cells` at `voxel_offset` (its own world_min → its own lights).
-                let voxel_offset = interner.intern(&mut patch.voxels, cells);
-                patch.metas.push(pb.meta(voxel_offset));
-                gather_lights_into(&mut found, &patch, registry, voxel_offset as usize, pb.world_min, pb.lod);
+                // R3 + R2b: intern the haloed slice → an identical brick shares ONE (index-stream, palette) pair;
+                // a first sighting encodes `cells` into a per-brick palette + bit-packed indices. The gather
+                // below decodes the (present) layout at `palette_base`/`voxel_offset` (its own world_min →
+                // its own lights).
+                let layout = interner.intern_paletted(&mut patch.voxels, &mut patch.brick_palettes, cells);
+                patch.metas.push(pb.meta_dense(layout));
+                let meta = *patch.metas.last().expect("just pushed");
+                gather_lights_into(&mut found, &patch, registry, &meta);
             }
         }
     }
@@ -983,14 +1159,11 @@ pub fn finalize_patch_palette_and_lights(patch: &mut GpuBrickPatch, registry: &B
     // exist, snapshot the dense metas first (gather_lights_into borrows `patch` immutably, so collect the dense
     // brick params up front to avoid an aliasing borrow). A uniform brick exposes no faces → skipped.
     if registry.has_emitters() {
-        let dense: Vec<(usize, [f32; 3], u32)> = patch
-            .metas
-            .iter()
-            .filter(|m| !m.is_uniform())
-            .map(|m| (m.dense_offset() as usize, m.world_min, m.lod))
-            .collect();
-        for (offset, world_min, lod) in dense {
-            gather_lights_into(&mut found, patch, registry, offset, world_min, lod);
+        // Snapshot the dense metas up front (gather_lights_into borrows `patch` immutably; a uniform brick
+        // exposes no faces → skipped).
+        let dense: Vec<GpuBrickMeta> = patch.metas.iter().filter(|m| !m.is_uniform()).copied().collect();
+        for meta in &dense {
+            gather_lights_into(&mut found, patch, registry, meta);
         }
     }
     push_palette(patch, registry);
@@ -1008,17 +1181,23 @@ fn gather_lights_into(
     found: &mut Vec<EmissiveVoxel>,
     patch: &GpuBrickPatch,
     registry: &BlockRegistry,
-    voxel_offset: usize,
-    world_min: [f32; 3],
-    lod: u32,
+    meta: &GpuBrickMeta,
 ) {
+    let lod = meta.lod();
+    let world_min = meta.world_min;
     let cell = lod_voxel_size_pub(lod);
     let core = lod_edge(lod);
+    // Storage plan R2b — decode each haloed cell through the production SSOT `GpuBrickPatch::cell_block` (the
+    // bit-packed index + per-brick palette), the SAME path the GPU `cell_block` uses, so the light gather can
+    // never drift from the geometry the shader traces.
+    let decode = |cx: i32, cy: i32, cz: i32| -> u32 {
+        patch.cell_block(meta, halo_index(cx, cy, cz, lod)).0 as u32
+    };
     // Iterate the CORE cells (halo index [1, core]); the brick OWNS these (the halo ring is the neighbour's).
     for cz in 1..=core {
         for cy in 1..=core {
             for cx in 1..=core {
-                let id = BlockId(patch.voxels[voxel_offset + halo_index(cx, cy, cz, lod)] as u16);
+                let id = BlockId(decode(cx, cy, cz) as u16);
                 if id.is_air() {
                     continue;
                 }
@@ -1028,8 +1207,7 @@ fn gather_lights_into(
                 }
                 // Air-exposed iff any of the 6 face neighbours (in the haloed grid) is AIR.
                 let face = |dx: i32, dy: i32, dz: i32| -> bool {
-                    let nid = patch.voxels[voxel_offset + halo_index(cx + dx, cy + dy, cz + dz, lod)];
-                    nid == BlockId::AIR.0 as u32
+                    decode(cx + dx, cy + dy, cz + dz) == BlockId::AIR.0 as u32
                 };
                 let exposed = face(1, 0, 0)
                     || face(-1, 0, 0)
@@ -1111,9 +1289,15 @@ mod tests {
         (Brick::from_voxels(voxels), halo_index(x + 1, y + 1, z + 1, 0))
     }
 
-    /// Packing produces parallel AABB/meta arrays of length == brick count, a voxel buffer of
-    /// `brick_count · halo_cells(0)` u32s (each brick is a haloed `10³` grid), and a palette of
-    /// `registry.len()`. The per-brick voxel slice starts at the recorded offset and reproduces the brick's
+    /// Decode haloed cell `cell` of brick `m` as a `u32` — thin wrapper over the production SSOT
+    /// [`GpuBrickPatch::cell_block`] so these unit tests read logical ids the exact way the engine + the GPU
+    /// shader do (no parallel decode to drift).
+    fn decode_cell(patch: &GpuBrickPatch, m: &GpuBrickMeta, cell: usize) -> u32 {
+        patch.cell_block(m, cell).0 as u32
+    }
+
+    /// Packing produces parallel AABB/meta arrays of length == brick count, an R2b bit-packed index stream + a
+    /// per-brick palette buffer, and a global palette of `registry.len()`. Each dense brick DECODES back to its
     /// block ids in haloed-grid order.
     #[test]
     fn pack_layout_is_consistent() {
@@ -1127,18 +1311,22 @@ mod tests {
         let patch = pack_brickmap(&map, &reg);
         assert_eq!(patch.brick_count(), 2);
         assert_eq!(patch.aabbs.len(), patch.metas.len());
-        assert_eq!(patch.voxels.len(), 2 * halo_cells(0));
         assert_eq!(patch.palette.len(), reg.len());
+        // R2b — each brick has k=2 distinct ids (air + one solid) ⇒ 1-bit indices ⇒ 32 words/brick, and a 2-entry
+        // palette. The two bricks differ (solid pos/id), so they are NOT deduped: 2 × 32 index words, 2 × 2 palette.
+        assert_eq!(patch.metas[0].index_bits(), 1);
+        assert_eq!(patch.voxels.len(), 2 * halo_cells(0).div_ceil(32), "two 1-bit index streams");
+        assert_eq!(patch.brick_palettes.len(), 4, "two 2-entry per-brick palettes");
 
         // Deterministic order: sorted by (z,y,x) → brick (0,0,0) then (1,0,0).
         assert_eq!(patch.metas[0].voxel_origin, [0, 0, 0]);
         assert_eq!(patch.metas[1].voxel_origin, [BRICK_EDGE, 0, 0]);
-        assert_eq!(patch.metas[0].voxel_offset, 0);
-        assert_eq!(patch.metas[1].voxel_offset, halo_cells(0) as u32);
+        assert_eq!(patch.metas[0].voxel_offset, 0, "brick 0's index stream starts at 0");
+        assert_eq!(patch.metas[1].voxel_offset, halo_cells(0).div_ceil(32) as u32, "brick 1 follows brick 0's stream");
 
-        // The solid voxel of each brick lands at its haloed index within its slice, with the right id.
-        assert_eq!(patch.voxels[patch.metas[0].voxel_offset as usize + i0], 1);
-        assert_eq!(patch.voxels[patch.metas[1].voxel_offset as usize + i1], 2);
+        // The solid voxel of each brick DECODES to the right id at its haloed index.
+        assert_eq!(decode_cell(&patch, &patch.metas[0], i0), 1);
+        assert_eq!(decode_cell(&patch, &patch.metas[1], i1), 2);
 
         // AABB bounds match the LOD0 brick world extent GROWN by the seam epsilon (overlapping neighbours).
         assert_eq!(patch.aabbs[0], brick_aabb([0.0, 0.0, 0.0], 0));
@@ -1182,15 +1370,13 @@ mod tests {
         ];
         let patch = pack_resident_set(&entries, &reg);
         assert_eq!(patch.brick_count(), 2);
-        assert_eq!(patch.metas[0].lod, 0);
-        assert_eq!(patch.metas[0].voxel_offset, 0);
-        assert_eq!(patch.metas[1].voxel_offset, halo_cells(0) as u32);
-        assert_eq!(patch.voxels.len(), 2 * halo_cells(0));
-        // Brick 0 is uniform block 1 — every CORE cell reads 1 (halo cells may be 0 where no neighbour).
+        assert_eq!(patch.metas[0].lod(), 0);
+        assert_eq!(patch.metas[0].voxel_offset, 0, "first dense brick's index stream starts at 0");
+        // R2b — every CORE cell of brick 0 (uniform block 1, but bordered by air so it stays dense) DECODES to 1.
         for z in 1..=BRICK_EDGE {
             for y in 1..=BRICK_EDGE {
                 for x in 1..=BRICK_EDGE {
-                    assert_eq!(patch.voxels[halo_index(x, y, z, 0)], 1);
+                    assert_eq!(decode_cell(&patch, &patch.metas[0], halo_index(x, y, z, 0)), 1);
                 }
             }
         }
@@ -1207,14 +1393,13 @@ mod tests {
         let entries = vec![ResidentBrick { coord: IVec3::new(2, -1, 3), brick: &b, lod }];
         let patch = pack_resident_set(&entries, &reg);
         assert_eq!(patch.brick_count(), 1);
-        assert_eq!(patch.metas[0].lod, lod);
-        assert_eq!(patch.voxels.len(), halo_cells(lod), "every LOD stores a haloed 10³ grid");
+        assert_eq!(patch.metas[0].lod(), lod);
         assert_eq!(halo_cells(lod), 10 * 10 * 10);
-        // Core cells (halo index [1, BRICK_EDGE]) are solid; this lone brick has no neighbours → air border.
+        // Core cells (halo index [1, BRICK_EDGE]) DECODE to solid; this lone brick has no neighbours → air border.
         for z in 1..=BRICK_EDGE {
             for y in 1..=BRICK_EDGE {
                 for x in 1..=BRICK_EDGE {
-                    assert_eq!(patch.voxels[halo_index(x, y, z, lod)], 1, "core cell solid");
+                    assert_eq!(decode_cell(&patch, &patch.metas[0], halo_index(x, y, z, lod)), 1, "core cell solid");
                 }
             }
         }
@@ -1242,8 +1427,8 @@ mod tests {
         let patch = pack_resident_set(&entries, &reg);
         // Not eroded — the brick is packed as-is (one solid core voxel) at LOD5.
         assert_eq!(patch.brick_count(), 1);
-        assert_eq!(patch.metas[0].lod, 5);
-        assert_eq!(patch.voxels[halo_index(1, 1, 1, 5)], 1, "the lone solid voxel survives verbatim");
+        assert_eq!(patch.metas[0].lod(), 5);
+        assert_eq!(decode_cell(&patch, &patch.metas[0], halo_index(1, 1, 1, 5)), 1, "the lone solid voxel survives verbatim");
     }
 
     /// Packing is deterministic: same map → byte-identical buffers (the property the test oracle relies
@@ -1416,16 +1601,22 @@ mod tests {
     /// clear, offset readable). The Rust struct size is pinned so the WGSL mirror can't silently drift.
     #[test]
     fn meta_uniform_flag_roundtrips_without_growing() {
-        assert_eq!(std::mem::size_of::<GpuBrickMeta>(), 32, "meta must stay 32 bytes (WGSL byte-match)");
+        // R2b grew the meta to 48 bytes (16-aligned) to carry palette_base + the packed lod/index_bits.
+        assert_eq!(std::mem::size_of::<GpuBrickMeta>(), 48, "meta must be 48 bytes (WGSL byte-match)");
+        assert_eq!(std::mem::align_of::<GpuBrickMeta>(), 4, "POD meta is 4-byte aligned (vec3 is [i32;3])");
         let u = GpuBrickMeta::uniform([8, 0, -8], BlockId(1234), [1.6, 0.0, -1.6], 3);
         assert!(u.is_uniform());
         assert_eq!(u.uniform_block(), BlockId(1234));
         assert_eq!(u.voxel_origin, [8, 0, -8]);
-        assert_eq!(u.lod, 3);
+        assert_eq!(u.lod(), 3);
 
-        let d = GpuBrickMeta::dense([0, 0, 0], 5000, [0.0; 3], 0);
+        // R2b dense meta packs lod (bits 0-2) + index_bits (bits 3-7) into `lod_and_bits`, plus palette_base.
+        let d = GpuBrickMeta::dense([0, 0, 0], 5000, [0.0; 3], 5, 4, 777);
         assert!(!d.is_uniform(), "a dense brick must NOT be flagged uniform");
         assert_eq!(d.dense_offset(), 5000, "dense offset reads back unchanged (bit 31 clear)");
+        assert_eq!(d.lod(), 5, "lod round-trips through the packed field");
+        assert_eq!(d.index_bits(), 4, "index_bits round-trips through the packed field");
+        assert_eq!(d.palette_base, 777, "palette_base round-trips");
     }
 
     /// A fully-buried uniform brick (its 6/26 neighbours all the SAME solid block) collapses: the meta is
@@ -1455,8 +1646,15 @@ mod tests {
         assert!(center.is_uniform());
         assert_eq!(center.uniform_block(), block);
 
-        // Exactly the 26 dense surface bricks emit a haloed 10³ array each; the uniform brick emits nothing.
-        assert_eq!(patch.voxels.len(), 26 * halo_cells(0), "only the 26 dense bricks carry voxel arrays");
+        // The uniform center emits NO index/palette bytes; the 26 dense shell bricks each emit a bit-packed
+        // index stream (≤ raw). R2b: index bytes are FAR below the pre-storage-plan 27 × raw-10³ baseline.
+        let dense = patch.metas.iter().filter(|m| !m.is_uniform()).count();
+        assert_eq!(dense, 26, "26 dense shell bricks, 1 uniform center");
+        assert!(patch.voxels.len() < 26 * halo_cells(0), "the index stream is smaller than the raw 26×10³ layout");
+        // Every dense shell brick DECODES its core to the solid block (its exposed-face halo decodes to air).
+        for m in patch.metas.iter().filter(|m| !m.is_uniform()) {
+            assert_eq!(decode_cell(&patch, m, halo_index(4, 4, 4, 0)), block.0 as u32, "dense core decodes solid");
+        }
     }
 
     /// An ISOLATED uniform brick (no neighbours ⇒ AIR halo) is NOT collapsed — its boundary faces are exposed
@@ -1469,13 +1667,16 @@ mod tests {
         let patch = pack_resident_set(&entries, &reg);
         assert_eq!(patch.uniform_brick_count(), 0, "an air-haloed (surface) uniform brick must stay dense");
         assert!(!patch.metas[0].is_uniform());
-        assert_eq!(patch.voxels.len(), halo_cells(0), "a dense brick keeps its full haloed array");
+        // R2b — this dense brick is solid-core + air-halo ⇒ k=2 ⇒ 1-bit indices ⇒ ceil(1000/32) = 32 words.
+        assert_eq!(patch.metas[0].index_bits(), 1);
+        assert_eq!(patch.voxels.len(), halo_cells(0).div_ceil(32), "a dense brick's 1-bit index stream is 32 words");
+        assert_eq!(patch.brick_palettes.len(), 2, "its per-brick palette is [air, block]");
     }
 
-    /// R3 (brick dedup): four IDENTICAL isolated dense bricks share ONE voxel slice — their metas point at the
-    /// same `voxel_offset` and the voxel buffer holds a single haloed slice, not four. (Isolated ⇒ every halo
-    /// border is AIR ⇒ the four slices are byte-identical; they stay dense because that AIR halo ≠ the solid
-    /// core.) The win is shader-invisible: the trace addresses voxels purely through `voxel_offset`.
+    /// R3 (brick dedup): four IDENTICAL isolated dense bricks share ONE (index-stream, palette) pair — their
+    /// metas point at the same `voxel_offset` AND the same `palette_base`, and the buffers hold a single slice,
+    /// not four. (Isolated ⇒ every halo border is AIR ⇒ the four slices are byte-identical; they stay dense
+    /// because that AIR halo ≠ the solid core.) Shader-invisible: the trace addresses through `voxel_offset`.
     #[test]
     fn r3_dedups_identical_dense_bricks() {
         let reg = registry();
@@ -1488,8 +1689,12 @@ mod tests {
         assert_eq!(patch.brick_count(), 4);
         assert_eq!(patch.uniform_brick_count(), 0, "isolated solid bricks have AIR halos ⇒ dense, not R1-collapsed");
         let offsets: std::collections::HashSet<u32> = patch.metas.iter().map(|m| m.dense_offset()).collect();
-        assert_eq!(offsets.len(), 1, "four identical bricks dedup to one slice");
-        assert_eq!(patch.voxels.len(), halo_cells(0), "the deduped voxel buffer holds exactly one haloed slice");
+        let palette_bases: std::collections::HashSet<u32> = patch.metas.iter().map(|m| m.palette_base).collect();
+        assert_eq!(offsets.len(), 1, "four identical bricks dedup to one index slice");
+        assert_eq!(palette_bases.len(), 1, "and one shared palette");
+        // The deduped buffers hold exactly ONE brick's worth: a 1-bit (k=2) index stream + a 2-entry palette.
+        assert_eq!(patch.voxels.len(), halo_cells(0).div_ceil(32), "one deduped 1-bit index slice");
+        assert_eq!(patch.brick_palettes.len(), 2, "one deduped 2-entry palette");
     }
 
     /// R2 (palette + bit-pack): encoding a brick's haloed cells then decoding each cell round-trips EXACTLY,
@@ -1555,12 +1760,15 @@ mod tests {
         let patch = pack_brickmap(&map, &reg);
         assert_eq!(patch.brick_count(), 27);
         assert_eq!(patch.uniform_brick_count(), 1, "the buried center brick collapses");
-        assert_eq!(patch.voxels.len(), 26 * halo_cells(0));
+        // R2b — the 26 dense shell bricks emit bit-packed index streams (smaller than the raw 26×10³ layout);
+        // R3 dedups the identical shell faces, so the stream is well UNDER even 26 × the bit-packed size.
+        assert!(patch.voxels.len() < 26 * halo_cells(0), "dense shell is bit-packed (< raw 26×10³)");
+        assert!(!patch.brick_palettes.is_empty(), "dense shell bricks carry per-brick palettes");
     }
 
-    /// The storage report quantifies the R1 win: for the 3×3×3 solid block the 1 collapsed brick's 4 KB of
-    /// voxel array vanishes, so the AFTER voxel buffer is 26/27 of the BEFORE content-blind layout and the
-    /// reported VRAM reduction is `> 1`.
+    /// The storage report quantifies the COMBINED R1+R2b+R3 win: for the 3×3×3 solid block the 1 collapsed
+    /// brick costs 0 voxel bytes (R1), the 26 dense shell bricks are bit-packed (R2b) AND deduped (R3), so the
+    /// AFTER total is a small fraction of the BEFORE content-blind layout and the reduction factor is large.
     #[test]
     fn storage_report_quantifies_uniform_win() {
         let reg = registry();
@@ -1577,9 +1785,15 @@ mod tests {
         let rep = patch.storage_report();
         assert_eq!(rep.bricks, 27);
         assert_eq!(rep.uniform_bricks, 1);
-        assert_eq!(rep.voxel_bytes_before, 27 * halo_cells(0) * 4);
-        assert_eq!(rep.voxel_bytes_after, 26 * halo_cells(0) * 4, "the collapsed brick emits no voxel bytes");
-        assert!(rep.total_vram_after() < rep.total_vram_before(), "R1 reduces resident VRAM");
+        assert_eq!(rep.voxel_bytes_before, 27 * halo_cells(0) * 4, "BEFORE = content-blind 27 × raw 10³ u32");
+        // AFTER: bit-packed + R3-deduped index stream — FAR under the raw 26-dense-brick cost.
+        assert!(
+            rep.voxel_bytes_after < 26 * halo_cells(0) * 4,
+            "R2b+R3 index stream ({}) is far under the raw 26×10³ layout",
+            rep.voxel_bytes_after
+        );
+        assert!(rep.brick_palette_bytes > 0, "dense bricks carry per-brick palette bytes");
+        assert!(rep.total_vram_after() < rep.total_vram_before(), "the combined win reduces resident VRAM");
         assert!(rep.vram_reduction() > 1.0, "the reduction factor is > 1");
         assert!((rep.uniform_fraction() - 1.0 / 27.0).abs() < 1e-9);
     }
@@ -1593,12 +1807,15 @@ mod tests {
             aabbs: vec![brick_aabb([0.0; 3], 0)],
             metas: vec![GpuBrickMeta::uniform([0, 0, 0], BlockId(1), [0.0; 3], 0)],
             voxels: Vec::new(),
+            brick_palettes: Vec::new(),
             palette: Vec::new(),
             lights: Vec::new(),
             alias: Vec::new(),
         };
         ensure_voxels_nonempty(&mut patch);
-        assert_eq!(patch.voxels.len(), 1, "an all-uniform patch gets a single unreferenced sentinel voxel");
+        assert_eq!(patch.voxels.len(), 1, "an all-uniform patch gets a single unreferenced sentinel index word");
         assert_eq!(patch.voxels[0], 0);
+        assert_eq!(patch.brick_palettes.len(), 1, "and a single sentinel palette word");
+        assert_eq!(patch.brick_palettes[0], 0);
     }
 }

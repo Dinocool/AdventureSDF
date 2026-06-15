@@ -1063,7 +1063,7 @@ struct VoxelRtResources {
 struct SceneKeepAlive {
     _blas: wgpu::Blas,
     _tlas: wgpu::Tlas,
-    _buffers: [wgpu::Buffer; 4],
+    _buffers: [wgpu::Buffer; 5],
 }
 
 /// The PERSISTENT world-space radiance-cache GPU state (Phase 2.1): the 11 storage buffers + the `group(3)`
@@ -1748,9 +1748,10 @@ fn init_voxel_rt(mut commands: Commands, render_device: Res<RenderDevice>) {
                 ty: wgpu::BindingType::AccelerationStructure { vertex_return: false },
                 count: None,
             },
-            storage_ro(1),
-            storage_ro(2),
-            storage_ro(3),
+            storage_ro(1),  // metas
+            storage_ro(2),  // voxel_indices (R2b bit-packed index stream)
+            storage_ro(3),  // palette (block id → colour)
+            storage_ro(12), // brick_palettes (R2b per-brick palettes)
         ],
     });
     let view_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -2317,13 +2318,19 @@ fn prepare_voxel_rt(
         usage: wgpu::BufferUsages::STORAGE,
     });
     let voxel_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        label: Some("voxel_rt_voxels"),
+        label: Some("voxel_rt_voxel_indices"),
         contents: bytemuck::cast_slice(&patch.voxels),
         usage: wgpu::BufferUsages::STORAGE,
     });
     let palette_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("voxel_rt_palette"),
         contents: bytemuck::cast_slice(&patch.palette),
+        usage: wgpu::BufferUsages::STORAGE,
+    });
+    // Storage plan R2b — the per-brick palettes the bit-packed index stream indirects through.
+    let brick_palettes_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("voxel_rt_brick_palettes"),
+        contents: bytemuck::cast_slice(&patch.brick_palettes),
         usage: wgpu::BufferUsages::STORAGE,
     });
 
@@ -2377,6 +2384,7 @@ fn prepare_voxel_rt(
             wgpu::BindGroupEntry { binding: 1, resource: meta_buf.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 2, resource: voxel_buf.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 3, resource: palette_buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 12, resource: brick_palettes_buf.as_entire_binding() },
         ],
     });
 
@@ -2398,7 +2406,7 @@ fn prepare_voxel_rt(
     resources._keep = Some(SceneKeepAlive {
         _blas: blas,
         _tlas: tlas,
-        _buffers: [aabb_buf, meta_buf, voxel_buf, palette_buf],
+        _buffers: [aabb_buf, meta_buf, voxel_buf, palette_buf, brick_palettes_buf],
     });
     debug!("voxel-RT: built accel structures for patch gen {} — {n} bricks", patch_res.generation);
 }

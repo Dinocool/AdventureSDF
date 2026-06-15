@@ -249,6 +249,12 @@ fn gpu_ray_query_hit_matches_cpu_ground_truth() {
         contents: bytemuck::cast_slice(&patch.palette),
         usage: wgpu::BufferUsages::STORAGE,
     });
+    // Storage plan R2b — the per-brick palettes the bit-packed index stream indirects through.
+    let brick_palettes_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("brick_palette_brick_palettes"),
+        contents: bytemuck::cast_slice(&patch.brick_palettes),
+        usage: wgpu::BufferUsages::STORAGE,
+    });
 
     let size_desc = wgpu::BlasAABBGeometrySizeDescriptor {
         primitive_count: n,
@@ -317,6 +323,7 @@ fn gpu_ray_query_hit_matches_cpu_ground_truth() {
             wgpu::BindGroupEntry { binding: 1, resource: meta_buf.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 2, resource: voxel_buf.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 3, resource: palette_buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 12, resource: brick_palettes_buf.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 4, resource: ray_buf.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 5, resource: out_buf.as_entire_binding() },
         ],
@@ -434,7 +441,7 @@ fn cpu_first_solid_packed(patch: &GpuBrickPatch, ro: Vec3, rd: Vec3, t_max: f32)
     let mut best: Option<(u32, f32)> = None;
     for (bi, m) in patch.metas.iter().enumerate() {
         let bmin = Vec3::from(m.world_min);
-        let bmax = bmin + Vec3::splat(brick_span(m.lod)); // clipmap: coarse bricks span 2^lod× more world
+        let bmax = bmin + Vec3::splat(brick_span(m.lod())); // clipmap: coarse bricks span 2^lod× more world
         // Ray/AABB slab test → [t_enter, t_exit].
         let inv = Vec3::new(1.0 / rd.x, 1.0 / rd.y, 1.0 / rd.z);
         let ta = (bmin - ro) * inv;
@@ -446,7 +453,7 @@ fn cpu_first_solid_packed(patch: &GpuBrickPatch, ro: Vec3, rd: Vec3, t_max: f32)
         if t_enter > t_exit || t_exit < 0.0 || t_enter > t_max {
             continue;
         }
-        let lod = m.lod;
+        let lod = m.lod();
         let edge = lod_edge(lod);
         let csize = lod_voxel_size(lod);
         // Coarse-DDA exactly like dda_brick.
@@ -476,23 +483,17 @@ fn cpu_first_solid_packed(patch: &GpuBrickPatch, ro: Vec3, rd: Vec3, t_max: f32)
             pick(nz(rd.z), (csize * inv.z).abs()),
         );
         let mut t_cur = t0;
-        let off = m.voxel_offset as usize;
         for _ in 0..(3 * BRICK_EDGE) {
             if vox.x < 0 || vox.x >= edge || vox.y < 0 || vox.y >= edge || vox.z < 0 || vox.z >= edge {
                 break;
             }
-            // Storage plan R1: a UNIFORM brick carries NO voxel array — every cell is its single block id (read
-            // from the meta, exactly as the GPU `cell_block` does). A DENSE brick reads the HALOED grid
-            // (`(edge+2)³`, core cells at halo index [1, edge]); the core cell `vox` lives at haloed index
-            // `vox + 1` — mirror the shader's `cell_index` so this CPU oracle reads the SAME cell the GPU
-            // commits.
-            let id = if m.is_uniform() {
-                m.uniform_block().0 as u32
-            } else {
-                let hedge = edge + 2;
-                let idx = ((vox.x + 1) + (vox.y + 1) * hedge + (vox.z + 1) * hedge * hedge) as usize;
-                patch.voxels[off + idx]
-            };
+            // Read the cell via the production SSOT `GpuBrickPatch::cell_block` (storage plan R2b) — a UNIFORM
+            // brick returns its single meta id; a DENSE brick decodes the bit-packed index + per-brick palette,
+            // EXACTLY as the GPU `cell_block` does. The core cell `vox` lives at haloed index `vox + 1` (the
+            // `(edge+2)³` haloed grid, core cells at halo index [1, edge]).
+            let hedge = edge + 2;
+            let idx = ((vox.x + 1) + (vox.y + 1) * hedge + (vox.z + 1) * hedge * hedge) as usize;
+            let id = patch.cell_block(m, idx).0 as u32;
             if id != 0 {
                 if best.map(|(_, bt)| t_cur < bt).unwrap_or(true) {
                     best = Some((id, t_cur));
@@ -572,7 +573,7 @@ fn gpu_mixed_lod_matches_cpu_ground_truth() {
     let patch = pack_resident_set(&entries, &reg);
     assert!(!patch.is_empty());
     // Sanity: mixed LODs actually present in the packed metas.
-    let lods: std::collections::BTreeSet<u32> = patch.metas.iter().map(|m| m.lod).collect();
+    let lods: std::collections::BTreeSet<u32> = patch.metas.iter().map(|m| m.lod()).collect();
     assert!(lods.contains(&0) && lods.contains(&1) && lods.contains(&2), "mixed LODs packed: {lods:?}");
 
     let t_max = 100.0f32;
@@ -597,6 +598,12 @@ fn gpu_mixed_lod_matches_cpu_ground_truth() {
     let palette_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("mlod_palette"),
         contents: bytemuck::cast_slice(&patch.palette),
+        usage: wgpu::BufferUsages::STORAGE,
+    });
+    // Storage plan R2b — the per-brick palettes the bit-packed index stream indirects through.
+    let brick_palettes_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("mlod_palette_brick_palettes"),
+        contents: bytemuck::cast_slice(&patch.brick_palettes),
         usage: wgpu::BufferUsages::STORAGE,
     });
 
@@ -665,6 +672,7 @@ fn gpu_mixed_lod_matches_cpu_ground_truth() {
             wgpu::BindGroupEntry { binding: 1, resource: meta_buf.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 2, resource: voxel_buf.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 3, resource: palette_buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 12, resource: brick_palettes_buf.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 4, resource: ray_buf.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 5, resource: out_buf.as_entire_binding() },
         ],

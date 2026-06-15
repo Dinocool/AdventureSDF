@@ -288,11 +288,8 @@ fn core_cell(patch: &GpuBrickPatch, world_voxel: IVec3) -> Option<u32> {
     let meta = patch.metas.iter().find(|m| {
         m.voxel_origin == [origin.x, origin.y, origin.z]
     })?;
-    // Storage plan R1: a UNIFORM brick carries no voxel array — its single block id covers every core cell.
-    if meta.is_uniform() {
-        return Some(meta.uniform_block().0 as u32);
-    }
-    Some(patch.voxels[meta.voxel_offset as usize + idx])
+    // SSOT decode via `GpuBrickPatch::cell_block` (R2b): uniform meta id, or dense bit-packed index + palette.
+    Some(patch.cell_block(meta, idx).0 as u32)
 }
 
 /// The packed HALO-border cell of brick `brick_coord` that maps to world voxel `world_voxel` (which must lie
@@ -309,11 +306,8 @@ fn halo_cell_for_world_voxel(patch: &GpuBrickPatch, brick_coord: IVec3, world_vo
     let hz = local.z + 1;
     let idx = (hx + hy * HALO_EDGE + hz * HALO_EDGE * HALO_EDGE) as usize;
     let meta = patch.metas.iter().find(|m| m.voxel_origin == [origin.x, origin.y, origin.z])?;
-    // Storage plan R1: a UNIFORM brick carries no voxel array — every halo cell is its single block id too.
-    if meta.is_uniform() {
-        return Some(meta.uniform_block().0 as u32);
-    }
-    Some(patch.voxels[meta.voxel_offset as usize + idx])
+    // SSOT decode via `GpuBrickPatch::cell_block` (R2b): uniform meta id, or dense bit-packed index + palette.
+    Some(patch.cell_block(meta, idx).0 as u32)
 }
 
 // --- GPU re-trace -----------------------------------------------------------------------------------
@@ -387,6 +381,12 @@ impl GpuTracer {
             contents: bytemuck::cast_slice(&patch.palette),
             usage: wgpu::BufferUsages::STORAGE,
         });
+        // Storage plan R2b — the per-brick palettes the bit-packed index stream indirects through.
+        let brick_palettes_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("palette_brick_palettes"),
+            contents: bytemuck::cast_slice(&patch.brick_palettes),
+            usage: wgpu::BufferUsages::STORAGE,
+        });
 
         let size_desc = wgpu::BlasAABBGeometrySizeDescriptor {
             primitive_count: n,
@@ -453,6 +453,7 @@ impl GpuTracer {
                 wgpu::BindGroupEntry { binding: 1, resource: meta_buf.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 2, resource: voxel_buf.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 3, resource: palette_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 12, resource: brick_palettes_buf.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 4, resource: ray_buf.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 5, resource: out_buf.as_entire_binding() },
             ],

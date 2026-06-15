@@ -73,9 +73,9 @@ fn normal_from_axis(axis: i32, rd: Vec3) -> Vec3 {
 /// exposed-axis normal heuristic (lines ~210-239).
 fn dda_brick_faithful(patch: &GpuBrickPatch, bi: usize, ro: Vec3, rd: Vec3) -> Option<BrickHit> {
     let m = &patch.metas[bi];
-    let core = lod_edge(m.lod);
+    let core = lod_edge(m.lod());
     let hedge = core + 2;
-    let csize = lod_voxel_size(m.lod);
+    let csize = lod_voxel_size(m.lod());
     let wmin = Vec3::from(m.world_min);
 
     // Grown-AABB slab (same as the shader's trace candidate test) → t_enter/t_exit.
@@ -130,15 +130,10 @@ fn dda_brick_faithful(patch: &GpuBrickPatch, bi: usize, ro: Vec3, rd: Vec3) -> O
         0
     };
 
-    let off = m.voxel_offset as usize;
-    // Storage plan R1: a UNIFORM brick has no voxel array — every haloed cell is its single block id.
-    let cell = |x: i32, y: i32, z: i32| {
-        if m.is_uniform() {
-            m.uniform_block().0 as u32
-        } else {
-            patch.voxels[off + (x + y * hedge + z * hedge * hedge) as usize]
-        }
-    };
+    // Read a haloed cell via the production SSOT `GpuBrickPatch::cell_block` (storage plan R2b): a UNIFORM brick
+    // returns its single meta id; a DENSE brick decodes its bit-packed index + per-brick palette, EXACTLY as the
+    // GPU `cell_block` does (so this oracle can never drift from the shader).
+    let cell = |x: i32, y: i32, z: i32| patch.cell_block(m, (x + y * hedge + z * hedge * hedge) as usize).0 as u32;
 
     let mut found = false;
     let mut hit_t = -1.0f32;
@@ -275,9 +270,9 @@ fn trace_faithful(patch: &GpuBrickPatch, ro: Vec3, rd: Vec3, tie_eps: f32) -> Op
 /// shape but with `best_axis` = the crossed axis.
 fn dda_brick_crossed_axis(patch: &GpuBrickPatch, bi: usize, ro: Vec3, rd: Vec3) -> Option<BrickHit> {
     let m = &patch.metas[bi];
-    let core = lod_edge(m.lod);
+    let core = lod_edge(m.lod());
     let hedge = core + 2;
-    let csize = lod_voxel_size(m.lod);
+    let csize = lod_voxel_size(m.lod());
     let wmin = Vec3::from(m.world_min);
 
     let bmin = wmin - Vec3::splat(BRICK_AABB_EPSILON);
@@ -331,15 +326,10 @@ fn dda_brick_crossed_axis(patch: &GpuBrickPatch, bi: usize, ro: Vec3, rd: Vec3) 
         0
     };
 
-    let off = m.voxel_offset as usize;
-    // Storage plan R1: a UNIFORM brick has no voxel array — every haloed cell is its single block id.
-    let cell = |x: i32, y: i32, z: i32| {
-        if m.is_uniform() {
-            m.uniform_block().0 as u32
-        } else {
-            patch.voxels[off + (x + y * hedge + z * hedge * hedge) as usize]
-        }
-    };
+    // Read a haloed cell via the production SSOT `GpuBrickPatch::cell_block` (storage plan R2b): a UNIFORM brick
+    // returns its single meta id; a DENSE brick decodes its bit-packed index + per-brick palette, EXACTLY as the
+    // GPU `cell_block` does (so this oracle can never drift from the shader).
+    let cell = |x: i32, y: i32, z: i32| patch.cell_block(m, (x + y * hedge + z * hedge * hedge) as usize).0 as u32;
 
     let mut found = false;
     let mut hit_t = -1.0f32;
@@ -764,16 +754,14 @@ fn fix_edge_voxel_normal_is_camera_independent() {
 /// fully-buried cell (no air neighbour) returns zero → caller falls back (never visible).
 fn occupancy_gradient_normal(patch: &GpuBrickPatch, bi: usize, hit_vox: IVec3) -> Vec3 {
     let m = &patch.metas[bi];
-    let core = lod_edge(m.lod);
+    let core = lod_edge(m.lod());
     let hedge = core + 2;
-    let off = m.voxel_offset as usize;
+    // SSOT decode via `GpuBrickPatch::cell_block` (R2b); out-of-grid reads as air (absent-neighbour convention).
     let cell = |x: i32, y: i32, z: i32| -> u32 {
         if x < 0 || x >= hedge || y < 0 || y >= hedge || z < 0 || z >= hedge {
-            0 // outside the haloed grid reads as air (matches the halo's absent-neighbour convention)
-        } else if m.is_uniform() {
-            m.uniform_block().0 as u32 // storage plan R1: uniform brick, no voxel array
+            0
         } else {
-            patch.voxels[off + (x + y * hedge + z * hedge * hedge) as usize]
+            patch.cell_block(m, (x + y * hedge + z * hedge * hedge) as usize).0 as u32
         }
     };
     let mut g = Vec3::ZERO;
@@ -1024,14 +1012,14 @@ fn diagnose_swap_population() {
 /// quantity the gradient normal is built from). Used by the diagnostic only.
 fn count_exposed_faces(patch: &GpuBrickPatch, bi: usize, hit_vox: IVec3) -> u32 {
     let m = &patch.metas[bi];
-    let core = lod_edge(m.lod);
+    let core = lod_edge(m.lod());
     let hedge = core + 2;
-    let off = m.voxel_offset as usize;
+    // SSOT decode via `GpuBrickPatch::cell_block` (R2b); out-of-grid reads as air.
     let cell = |x: i32, y: i32, z: i32| -> u32 {
         if x < 0 || x >= hedge || y < 0 || y >= hedge || z < 0 || z >= hedge {
             0
         } else {
-            patch.voxels[off + (x + y * hedge + z * hedge * hedge) as usize]
+            patch.cell_block(m, (x + y * hedge + z * hedge * hedge) as usize).0 as u32
         }
     };
     let mut e = 0;

@@ -9,7 +9,7 @@
 
 use super::*;
 use crate::voxel::brickmap::{BRICK_EDGE, BRICK_VOXELS, Brick};
-use crate::voxel::gpu::{GpuBrickMeta, ResidentBrick, pack_resident_set};
+use crate::voxel::gpu::{GpuBrickMeta, ResidentBrick, decode_paletted_cell, halo_cells, pack_resident_set};
 use crate::voxel::palette::{BlockId, BlockRegistry};
 use crate::sdf_render::worldgen::biome::{
     BiomeDef, BiomeId, BiomeLibrary, StrataLayer, TerrainMatId, TerrainSurfaceMaterial,
@@ -76,24 +76,34 @@ fn meta_uniform(m: &GpuBrickMeta) -> Option<u16> {
     if m.is_uniform() { Some(m.uniform_block().0) } else { None }
 }
 
-/// Fingerprint every brick of a from-scratch `pack_resident_set`, keyed by `(voxel_origin, lod)` (a unique
-/// per-brick key independent of slot order).
-fn fingerprints_full(entries: &[ResidentBrick<'_>], reg: &BlockRegistry) -> std::collections::HashMap<([i32; 3], u32), Fingerprint> {
-    let patch = pack_resident_set(entries, reg);
+/// Fingerprint EVERY brick of a packed [`GpuBrickPatch`], keyed by `(voxel_origin, lod)` (a unique per-brick key
+/// independent of slot order). The ONE fingerprint function — both the from-scratch `pack_resident_set` and the
+/// live `snapshot_patch` produce a `GpuBrickPatch` in the SAME (R2b paletted) representation, so the A/B gate
+/// compares them through this single decode path (no dual raw-vs-paletted maintenance). R2b — each dense brick's
+/// bit-packed index stream is DECODED back to the raw haloed cells (the logical voxel content the gate compares),
+/// so a layout change can't mask a real divergence.
+fn fingerprints(patch: &crate::voxel::gpu::GpuBrickPatch) -> std::collections::HashMap<([i32; 3], u32), Fingerprint> {
     let mut out = std::collections::HashMap::new();
     for m in &patch.metas {
         let voxels = if m.is_uniform() {
             None
         } else {
             let off = m.dense_offset() as usize;
-            Some(patch.voxels[off..off + dense_block_u32()].to_vec())
+            let pb = m.palette_base as usize;
+            let bits = m.index_bits();
+            // The remaining palette buffer suffices: decode only ever indexes the ≤k entries this brick uses.
+            let palette: Vec<u16> = patch.brick_palettes[pb..].iter().map(|&x| x as u16).collect();
+            let cells: Vec<u32> = (0..halo_cells(m.lod()))
+                .map(|i| decode_paletted_cell(&palette, bits, &patch.voxels[off..], i) as u32)
+                .collect();
+            Some(cells)
         };
         out.insert(
-            (m.voxel_origin, m.lod),
+            (m.voxel_origin, m.lod()),
             Fingerprint {
                 voxel_origin: m.voxel_origin,
                 world_min: m.world_min,
-                lod: m.lod,
+                lod: m.lod(),
                 uniform: meta_uniform(m),
                 voxels,
             },
@@ -102,39 +112,16 @@ fn fingerprints_full(entries: &[ResidentBrick<'_>], reg: &BlockRegistry) -> std:
     out
 }
 
-/// Fingerprint every RESIDENT slot of a `ResidentPacker` snapshot (skipping unused/degenerate slots), keyed the
-/// same way. Mirrors `fingerprints_full` so the two are directly comparable.
+/// Fingerprint a from-scratch `pack_resident_set` of `entries`.
+fn fingerprints_full(entries: &[ResidentBrick<'_>], reg: &BlockRegistry) -> std::collections::HashMap<([i32; 3], u32), Fingerprint> {
+    fingerprints(&pack_resident_set(entries, reg))
+}
+
+/// Fingerprint the packer's LIVE re-pack output (`snapshot_patch`) — the EXACT `GpuBrickPatch` the render path
+/// uploads. Routing the A/B gate through the same upload path the engine ships means the test can never validate
+/// a representation that diverges from production.
 fn fingerprints_incremental(packer: &ResidentPacker, reg: &BlockRegistry) -> std::collections::HashMap<([i32; 3], u32), Fingerprint> {
-    let _ = reg;
-    let (metas, _aabbs, voxels) = packer.snapshot_buffers();
-    // Only slots that are actually resident carry a brick; an unused slot has a zeroed meta + degenerate AABB.
-    // We can't tell "zeroed meta of an unused slot" from "a real brick at voxel_origin [0,0,0] lod 0" by the
-    // meta alone, so derive the resident slot set from the packer's live map.
-    let resident_slots: std::collections::HashSet<u32> =
-        packer.resident.values().map(|s| s.slot).collect();
-    let mut out = std::collections::HashMap::new();
-    for (slot, m) in metas.iter().enumerate() {
-        if !resident_slots.contains(&(slot as u32)) {
-            continue;
-        }
-        let vox = if m.is_uniform() {
-            None
-        } else {
-            let off = m.dense_offset() as usize;
-            Some(voxels[off..off + dense_block_u32()].to_vec())
-        };
-        out.insert(
-            (m.voxel_origin, m.lod),
-            Fingerprint {
-                voxel_origin: m.voxel_origin,
-                world_min: m.world_min,
-                lod: m.lod,
-                uniform: meta_uniform(m),
-                voxels: vox,
-            },
-        );
-    }
-    out
+    fingerprints(&packer.snapshot_patch(reg))
 }
 
 fn assert_ab_equal(packer: &ResidentPacker, entries: &[ResidentBrick<'_>], reg: &BlockRegistry, label: &str) {
@@ -277,23 +264,10 @@ fn snapshot_patch_matches_full_pack() {
     assert_eq!(snap.palette, full.palette, "palette identical");
     assert_eq!(snap.lights.len(), full.lights.len(), "light count identical");
 
-    // Per-brick bytes match as a key→fingerprint mapping (slot/order differs, content does not).
-    type BrickFp = (Option<u16>, Option<Vec<u32>>);
-    fn fp_of(patch: &crate::voxel::gpu::GpuBrickPatch) -> std::collections::HashMap<([i32; 3], u32), BrickFp> {
-        let mut out = std::collections::HashMap::new();
-        for m in &patch.metas {
-            let v = if m.is_uniform() {
-                (Some(m.uniform_block().0), None)
-            } else {
-                let off = m.dense_offset() as usize;
-                (None, Some(patch.voxels[off..off + dense_block_u32()].to_vec()))
-            };
-            out.insert((m.voxel_origin, m.lod), v);
-        }
-        out
-    }
-    let ff = fp_of(&full);
-    let fs = fp_of(&snap);
+    // Per-brick bytes match as a key→fingerprint mapping (slot/order differs, content does not). Reuses the ONE
+    // shared `fingerprints` decode so this test and the completeness gate validate the same representation.
+    let ff = fingerprints(&full);
+    let fs = fingerprints(&snap);
     assert_eq!(ff.len(), fs.len());
     for (k, vfull) in &ff {
         assert_eq!(fs.get(k), Some(vfull), "brick {k:?} bytes differ between snapshot_patch and full pack");

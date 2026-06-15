@@ -36,25 +36,43 @@ const BRICK_AABB_EPSILON: f32 = VOXEL_SIZE * 1.0e-3;
 // spans 2^7 = 128× the LOD0 world extent — the clipmap's outer reach (~1.6 km half-extent at clip_half 8).
 const MAX_LOD: u32 = 7u;
 
-// One brick's metadata (parallel to the AABB / BLAS primitive array). 32 bytes — matches `GpuBrickMeta`.
-// The grid is ALWAYS 8³ (clipmap); the per-cell world size + the brick SPAN are DERIVED from `lod`, so a
-// coarse brick is DDA-marched over the SAME 8³ grid covering 2^lod× more world.
+// One brick's metadata (parallel to the AABB / BLAS primitive array). 48 bytes — matches `GpuBrickMeta`
+// (storage plan R2b grew it from 32 → 48 B to carry the paletted-index decode params). The grid is ALWAYS 8³
+// (clipmap); the per-cell world size + the brick SPAN are DERIVED from the LOD, so a coarse brick is DDA-marched
+// over the SAME 8³ grid covering 2^lod× more world.
 struct BrickMeta {
     voxel_origin: vec3<i32>,  // brick's world-VOXEL origin (= brick_coord · BRICK_EDGE)
-    voxel_offset: u32,        // DENSE: start of this brick's haloed 10³ block ids in `voxels`. UNIFORM (bit 31
-                              // set): no array — the single block id is the low 16 bits (storage plan R1).
+    voxel_offset: u32,        // DENSE: start word of this brick's bit-packed INDEX STREAM in `voxel_indices`.
+                              // UNIFORM (bit 31 set): no stream — the single block id is the low 16 bits (R1).
     world_min: vec3<f32>,     // brick's world-metre min corner (= coord · brick_span(lod))
-    lod: u32,                 // brick LOD level (0 = finest)
+    lod_and_bits: u32,        // bits 0-2: brick LOD level (0 = finest). bits 3-7: R2b index bit width ∈ {1,2,4,8,16}.
+    palette_base: u32,        // R2b: start word of this brick's palette in `brick_palettes` (dense only)
+    // Pad to a 48-byte stride (matches Rust `GpuBrickMeta`). SCALAR u32s (align 4) — a `vec3<u32>` here would be
+    // align-16 and land at offset 48, blowing the struct to 64 B and silently breaking the field layout.
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
 };
 
 // STORAGE PLAN R1 — the `voxel_offset` high bit marking a UNIFORM brick (its FULL haloed 10³ grid is ONE solid
-// block, so it carries NO per-voxel array). MUST mirror `BRICK_UNIFORM_FLAG` in src/voxel/gpu.rs. When set,
-// the DDA reads the block id straight from the meta (low 16 bits) — NO `voxels[]` fetch per step (strictly
+// block, so it carries NO index stream). MUST mirror `BRICK_UNIFORM_FLAG` in src/voxel/gpu.rs. When set,
+// the DDA reads the block id straight from the meta (low 16 bits) — NO buffer fetch per step (strictly
 // fewer memory ops); a fully-buried uniform brick is a couple of geometric DDA steps with zero loads. A DENSE
-// brick has bit 31 clear (real offsets are < 2^31) and is byte-identical to before R1.
+// brick has bit 31 clear (real offsets are < 2^31).
 const BRICK_UNIFORM_FLAG: u32 = 0x80000000u;
 
-// True iff brick meta `m` is a collapsed UNIFORM brick (no voxel array; block id in the low 16 bits).
+// The brick LOD level (bits 0-2 of `lod_and_bits`). Mirror of `GpuBrickMeta::lod`.
+fn meta_lod(m: BrickMeta) -> u32 {
+    return m.lod_and_bits & 0x7u;
+}
+
+// The R2b paletted INDEX BIT WIDTH ∈ {1,2,4,8,16} (bits 3-7 of `lod_and_bits`). Mirror of
+// `GpuBrickMeta::index_bits`. Meaningless for a uniform brick.
+fn meta_index_bits(m: BrickMeta) -> u32 {
+    return (m.lod_and_bits >> 3u) & 0x1Fu;
+}
+
+// True iff brick meta `m` is a collapsed UNIFORM brick (no index stream; block id in the low 16 bits).
 fn meta_is_uniform(m: BrickMeta) -> bool {
     return (m.voxel_offset & BRICK_UNIFORM_FLAG) != 0u;
 }
@@ -64,15 +82,24 @@ fn meta_uniform_block(m: BrickMeta) -> u32 {
     return m.voxel_offset & 0xFFFFu;
 }
 
-// The block id at HALOED-grid cell `(x,y,z)` of brick `m` — the SSOT read used by the DDA. A UNIFORM brick
-// returns its single id with NO memory access (every cell, core and halo, is that block by construction). A
-// DENSE brick reads `voxels[m.voxel_offset + cell_index(...)]` exactly as before R1 (byte-identical). Callers
-// pass only IN-BOUNDS cells; out-of-bounds is handled at the call site (treated as air for the normal scan).
+// The block id at HALOED-grid cell `(x,y,z)` of brick `m` — the SSOT read used by the DDA (storage plan R2b).
+// A UNIFORM brick returns its single id with NO memory access (every cell is that block by construction). A
+// DENSE brick decodes its bit-packed local palette index then indirects through the per-brick palette:
+//   bit  = cell_index · index_bits;   word = voxel_indices[voxel_offset + bit/32]
+//   local = (word >> (bit % 32)) & mask;   id = brick_palettes[palette_base + local]
+// index_bits ∈ {1,2,4,8,16} all divide 32 ⇒ a cell NEVER straddles a word ⇒ a SINGLE fetch + shift + mask
+// (no 2-word path). EXACT mirror of the CPU oracle `decode_paletted_cell` in src/voxel/gpu.rs. Callers pass
+// only IN-BOUNDS cells; out-of-bounds is handled at the call site (treated as air for the normal scan).
 fn cell_block(m: BrickMeta, x: i32, y: i32, z: i32, hedge: i32) -> u32 {
     if (meta_is_uniform(m)) {
         return meta_uniform_block(m);
     }
-    return voxels[m.voxel_offset + cell_index(x, y, z, hedge)];
+    let bits = meta_index_bits(m);
+    let bit = cell_index(x, y, z, hedge) * bits;
+    let word = voxel_indices[m.voxel_offset + bit / 32u];
+    let mask = select((1u << bits) - 1u, 0xFFFFFFFFu, bits == 32u);
+    let local = (word >> (bit % 32u)) & mask;
+    return brick_palettes[m.palette_base + local];
 }
 
 // The CORE grid edge (cells per axis) of a brick at LOD `lod`: a CONSTANT BRICK_EDGE (8) at every LOD — the
@@ -109,8 +136,13 @@ struct Palette { rgba: vec4<f32>, emissive: vec4<f32> };
 
 @group(0) @binding(0) var acc: acceleration_structure;
 @group(0) @binding(1) var<storage, read> metas: array<BrickMeta>;
-@group(0) @binding(2) var<storage, read> voxels: array<u32>;   // one BlockId per u32 (zero-extended u16)
+// Storage plan R2b — the bit-packed INDEX STREAM (was a raw `u32`-per-cell id buffer). A dense brick's indices
+// begin at `metas[].voxel_offset`, are `metas[].index_bits()`-wide, and reference the per-brick palette below.
+@group(0) @binding(2) var<storage, read> voxel_indices: array<u32>;
 @group(0) @binding(3) var<storage, read> palette: array<Palette>;
+// Storage plan R2b — the per-brick PALETTES (concatenated). A dense brick's palette (its `k` distinct block ids,
+// one `u32` each) begins at `metas[].palette_base`; `cell_block` indirects `brick_palettes[palette_base + local]`.
+@group(0) @binding(12) var<storage, read> brick_palettes: array<u32>;
 
 // --- shared tracer ----------------------------------------------------------------------------------
 
@@ -166,9 +198,9 @@ fn dh_normal(d: vec4<f32>, rd: vec3<f32>) -> vec3<f32> {
 // distance (the candidate uses the t) and the recovered shading data (colour + normal).
 fn dda_brick(prim: u32, ro: vec3<f32>, rd: vec3<f32>, t_enter: f32, t_exit: f32) -> vec4<f32> {
     let m = metas[prim];
-    let core = lod_edge(m.lod);        // CORE grid cells per axis at this brick's LOD
-    let hedge = core + 2;              // STORED grid edge (core + 1-cell halo border each side)
-    let csize = lod_cell_size(m.lod);  // world-metre size of one cell at this brick's LOD
+    let core = lod_edge(meta_lod(m));        // CORE grid cells per axis at this brick's LOD
+    let hedge = core + 2;                    // STORED grid edge (core + 1-cell halo border each side)
+    let csize = lod_cell_size(meta_lod(m));  // world-metre size of one cell at this brick's LOD
     // The haloed grid's world origin is ONE cell BEFORE the brick min (halo index 0 sits at world_min−csize),
     // so a ray entering the brick first traverses the halo cell that holds the NEIGHBOUR's voxel (AIR where
     // the neighbour is absent). This restores a real air→solid cell crossing AT the true surface even when the
@@ -217,8 +249,8 @@ fn dda_brick(prim: u32, ro: vec3<f32>, rd: vec3<f32>, t_enter: f32, t_exit: f32)
         if (oob || found) {
             break;
         }
-        // UNIFORM brick (storage plan R1): `cell_block` returns the single id with NO `voxels[]` fetch — fewer
-        // memory ops per step. DENSE brick: the byte-identical `voxels[m.voxel_offset + cell_index(...)]` read.
+        // UNIFORM brick (R1): `cell_block` returns the single id with NO buffer fetch — fewer memory ops per
+        // step. DENSE brick (R2b): one `voxel_indices[]` fetch + shift/mask + one `brick_palettes[]` indirection.
         let id = cell_block(m, vox.x, vox.y, vox.z, hedge);
         // A solid cell is a HIT only when it is a CORE cell (halo index in [1, core]); a solid HALO cell is the
         // neighbour's voxel — the neighbour brick owns it, so we don't commit it (we only marched it so the
@@ -283,7 +315,7 @@ fn dda_brick(prim: u32, ro: vec3<f32>, rd: vec3<f32>, t_enter: f32, t_exit: f32)
 // entry cell into `[0, edge)`, so the grown halo never adds a phantom cell.
 fn brick_hit_at(prim: u32, ro: vec3<f32>, rd: vec3<f32>) -> vec4<f32> {
     let m = metas[prim];
-    let span = brick_span(m.lod); // clipmap: a LOD-L brick spans 2^L× more world (NOT LOD-invariant)
+    let span = brick_span(meta_lod(m)); // clipmap: a LOD-L brick spans 2^L× more world (NOT LOD-invariant)
     let bmin = m.world_min - vec3<f32>(BRICK_AABB_EPSILON);
     let bmax = m.world_min + vec3<f32>(span + BRICK_AABB_EPSILON);
     let inv = 1.0 / rd;
@@ -317,9 +349,9 @@ fn trace(ro: vec3<f32>, rd: vec3<f32>, t_min: f32, t_max: f32) -> TraceResult {
             let m = metas[c.primitive_index];
             // Slab against the GROWN brick bounds (same overlap as the BLAS AABB — the seam fix). Using the
             // grown bounds keeps a face-grazing axis-parallel ray off the exact tangent plane (where the true
-            // bounds give a 0·inf = NaN slab t), so it reliably enters the brick. `brick_span(m.lod)` is the
+            // bounds give a 0·inf = NaN slab t), so it reliably enters the brick. `brick_span(meta_lod(m))` is the
             // clipmap span — a coarse brick covers 2^lod× more world (the AABB is NOT LOD-invariant).
-            let span = brick_span(m.lod);
+            let span = brick_span(meta_lod(m));
             let bmin = m.world_min - vec3<f32>(BRICK_AABB_EPSILON);
             let bmax = m.world_min + vec3<f32>(span + BRICK_AABB_EPSILON);
             let inv = 1.0 / rd;
@@ -383,9 +415,9 @@ fn trace_occluded(ro: vec3<f32>, rd: vec3<f32>, t_min: f32, t_max: f32) -> bool 
         let c = rayQueryGetCandidateIntersection(&rq);
         if (c.kind == RAY_QUERY_INTERSECTION_AABB) {
             let m = metas[c.primitive_index];
-            // Grown-bounds slab (matches the BLAS AABB overlap — the seam fix; see `trace`). `brick_span(m.lod)`
+            // Grown-bounds slab (matches the BLAS AABB overlap — the seam fix; see `trace`). `brick_span(meta_lod(m))`
             // is the clipmap span (a coarse brick covers 2^lod× more world).
-            let span = brick_span(m.lod);
+            let span = brick_span(meta_lod(m));
             let bmin = m.world_min - vec3<f32>(BRICK_AABB_EPSILON);
             let bmax = m.world_min + vec3<f32>(span + BRICK_AABB_EPSILON);
             let inv = 1.0 / rd;
@@ -826,7 +858,7 @@ fn debug_overlay_color(r: TraceResult, ro: vec3<f32>, rd: vec3<f32>, gi: vec3<f3
         // ray — i.e. we hit the inside/back of a voxel = the show-through bug).
         return select(vec3<f32>(0.0, 1.0, 0.0), vec3<f32>(1.0, 0.0, 0.0), dot(r.normal, rd) > 0.0);
     } else if (light.debug_view == 7u) {
-        return lod_color(metas[r.prim].lod);                     // LOD ring of the hit brick
+        return lod_color(meta_lod(metas[r.prim]));               // LOD ring of the hit brick
     }
     return r.color.rgb;
 }

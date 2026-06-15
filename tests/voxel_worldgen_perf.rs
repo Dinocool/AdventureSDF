@@ -821,25 +821,26 @@ fn clipmap_per_move_cost() {
 /// Pretty-print a [`StorageReport`] (storage plan R1 BEFORE/AFTER) under a label. The headline is the voxel
 /// buffer shrink + the total resident VRAM reduction the uniform-brick collapse claws back.
 fn print_storage_report(label: &str, rep: &StorageReport) {
-    println!("\n========== STORAGE BYTES (R1 uniform-brick collapse) — {label} ==========");
+    println!("\n========== STORAGE BYTES (R1 uniform + R3 dedup + R2b palette/bit-pack) — {label} ==========");
     println!(
         "resident bricks       : {} | uniform-collapsed {} ({:.1}%)",
         rep.bricks,
         rep.uniform_bricks,
         rep.uniform_fraction() * 100.0,
     );
-    println!("meta+AABB / palette   : {:.2} MB / {} B (unchanged by R1)", rep.meta_aabb_bytes as f64 / 1e6, rep.palette_bytes);
-    println!("light list + alias    : {:.2} MB (unchanged by R1)", rep.light_bytes as f64 / 1e6);
+    println!("meta+AABB / palette   : {:.2} MB / {} B (meta is now 48 B/brick)", rep.meta_aabb_bytes as f64 / 1e6, rep.palette_bytes);
+    println!("light list + alias    : {:.2} MB", rep.light_bytes as f64 / 1e6);
     println!(
-        "voxel buffer BEFORE   : {:.1} MB ({} bricks × 1000 × 4 B, content-blind)",
+        "index stream BEFORE   : {:.1} MB ({} bricks × 1000 × 4 B, content-blind raw u32/cell)",
         rep.voxel_bytes_before as f64 / 1e6,
         rep.bricks,
     );
     println!(
-        "voxel buffer AFTER    : {:.1} MB ({:.0} B/brick mean — uniform bricks cost 0)",
+        "index stream AFTER    : {:.1} MB ({:.0} B/brick mean — uniform=0, dense=bit-packed+deduped)",
         rep.voxel_bytes_after as f64 / 1e6,
         rep.voxel_bytes_per_brick_after(),
     );
+    println!("brick-palettes AFTER  : {:.2} MB (R2b per-brick palettes)", rep.brick_palette_bytes as f64 / 1e6);
     println!("-----------------------------------------------------------------------------");
     println!(
         "TOTAL VRAM est BEFORE : {:.1} MB   AFTER : {:.1} MB   ⇒ {:.2}× reduction",
@@ -927,8 +928,12 @@ fn solid_building_storage_collapses() {
     let interior = ((n - 2) * (n - 2) * (n - 2)) as usize;
     assert_eq!(rep.uniform_bricks, interior, "the fully-buried (n-2)³ interior collapses");
     assert!(rep.vram_reduction() > 1.0, "a solid building's buried interior must collapse (R1 win)");
-    // The buried interior pays ZERO voxel bytes — the AFTER voxel buffer is exactly the dense shell.
-    assert_eq!(rep.voxel_bytes_after, (rep.bricks - interior) * 1000 * 4, "only the dense shell carries voxel bytes");
+    // The buried interior pays ZERO bytes (R1); the dense shell is bit-packed (R2b, k=2 ⇒ 1-bit) AND R3-deduped
+    // (identical shell-face patterns share one slice), so the AFTER index stream is FAR under even the bit-packed
+    // per-shell-brick cost — and orders of magnitude under the content-blind raw 1000-u32/brick BEFORE layout.
+    let raw_shell = (rep.bricks - interior) * 1000 * 4;
+    assert!(rep.voxel_bytes_after < raw_shell, "R2b+R3 shell stream ({}) is far under the raw shell ({raw_shell})", rep.voxel_bytes_after);
+    assert!(rep.brick_palette_bytes > 0, "the dense shell bricks carry per-brick palettes");
 }
 
 /// **The worldgen-slice storage-bytes deliverable (storage plan R1).** Cold-fills the SHIPPING worldgen clipmap

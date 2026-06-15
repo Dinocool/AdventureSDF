@@ -181,7 +181,7 @@ fn emitter_patch(reg: &BlockRegistry) -> adventure::voxel::gpu::GpuBrickPatch {
 fn world_cache_converges_to_single_bounce_irradiance() {
     // The cache binds 3 scene storage buffers (group 0) + 12 cache storage buffers (group 3, including the
     // two test-only seed buffers) in one pipeline layout = 15 in a single stage; raise the limit accordingly.
-    let Some((device, queue)) = common::headless_ray_query_device_with_storage_buffers(18) else {
+    let Some((device, queue)) = common::headless_ray_query_device_with_storage_buffers(20) else {
         eprintln!("no ray-query device with 16 storage buffers — skipping world_cache test");
         return;
     };
@@ -255,6 +255,12 @@ fn world_cache_converges_to_single_bounce_irradiance() {
     let palette_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("wc_palette"),
         contents: bytemuck::cast_slice(&patch.palette),
+        usage: wgpu::BufferUsages::STORAGE,
+    });
+    // Storage plan R2b — the per-brick palettes the bit-packed index stream indirects through.
+    let brick_palettes_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("wc_palette_brick_palettes"),
+        contents: bytemuck::cast_slice(&patch.brick_palettes),
         usage: wgpu::BufferUsages::STORAGE,
     });
 
@@ -404,6 +410,7 @@ fn world_cache_converges_to_single_bounce_irradiance() {
             storage_ro(1),
             storage_ro(2),
             storage_ro(3),
+            storage_ro(12), // R2b per-brick palettes
         ],
     });
     let view_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -479,6 +486,7 @@ fn world_cache_converges_to_single_bounce_irradiance() {
             wgpu::BindGroupEntry { binding: 1, resource: meta_buf.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 2, resource: voxel_buf.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 3, resource: palette_buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 12, resource: brick_palettes_buf.as_entire_binding() },
         ],
     });
     let view_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -745,7 +753,7 @@ const FLOOR_EMISSIVE: f32 = 0.5;
 fn cached_initial_reservoir_adds_albedo_times_cache() {
     // The fill passes bind 16 storage buffers in one stage (3 scene + 11 cache + query_out + dispatch); the
     // energy probe adds ONE more (`energy_out` on group 0) → 17, over the convergence test's 16.
-    let Some((device, queue)) = common::headless_ray_query_device_with_storage_buffers(19) else {
+    let Some((device, queue)) = common::headless_ray_query_device_with_storage_buffers(20) else {
         eprintln!("no ray-query device with 17 storage buffers — skipping energy test");
         return;
     };
@@ -845,6 +853,12 @@ fn cached_initial_reservoir_adds_albedo_times_cache() {
     let palette_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("e_palette"),
         contents: bytemuck::cast_slice(&patch.palette),
+        usage: wgpu::BufferUsages::STORAGE,
+    });
+    // Storage plan R2b — the per-brick palettes the bit-packed index stream indirects through.
+    let brick_palettes_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("e_palette_brick_palettes"),
+        contents: bytemuck::cast_slice(&patch.brick_palettes),
         usage: wgpu::BufferUsages::STORAGE,
     });
 
@@ -1017,6 +1031,7 @@ fn cached_initial_reservoir_adds_albedo_times_cache() {
             storage_ro(1),
             storage_ro(2),
             storage_ro(3),
+            storage_ro(12), // R2b per-brick palettes
             uniform(8),
             storage_rw(9),
         ],
@@ -1101,6 +1116,7 @@ fn cached_initial_reservoir_adds_albedo_times_cache() {
             wgpu::BindGroupEntry { binding: 1, resource: meta_buf.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 2, resource: voxel_buf.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 3, resource: palette_buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 12, resource: brick_palettes_buf.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 8, resource: energy_params_buf.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 9, resource: energy_out_buf.as_entire_binding() },
         ],
@@ -1352,7 +1368,7 @@ const LEAK_VIEW_DIST: f32 = 15.0;
 
 #[test]
 fn thin_wall_no_exterior_leak_with_clamp() {
-    let Some((device, queue)) = common::headless_ray_query_device_with_storage_buffers(18) else {
+    let Some((device, queue)) = common::headless_ray_query_device_with_storage_buffers(20) else {
         eprintln!("no ray-query device with 16 storage buffers — skipping thin-wall leak test");
         return;
     };
@@ -1438,6 +1454,12 @@ fn thin_wall_no_exterior_leak_with_clamp() {
     let palette_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("lk_palette"),
         contents: bytemuck::cast_slice(&patch.palette),
+        usage: wgpu::BufferUsages::STORAGE,
+    });
+    // Storage plan R2b — the per-brick palettes the bit-packed index stream indirects through.
+    let brick_palettes_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("lk_palette_brick_palettes"),
+        contents: bytemuck::cast_slice(&patch.brick_palettes),
         usage: wgpu::BufferUsages::STORAGE,
     });
 
@@ -1579,6 +1601,7 @@ fn thin_wall_no_exterior_leak_with_clamp() {
             storage_ro(1),
             storage_ro(2),
             storage_ro(3),
+            storage_ro(12), // R2b per-brick palettes
         ],
     });
     let view_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -1657,6 +1680,7 @@ fn thin_wall_no_exterior_leak_with_clamp() {
             wgpu::BindGroupEntry { binding: 1, resource: meta_buf.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 2, resource: voxel_buf.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 3, resource: palette_buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 12, resource: brick_palettes_buf.as_entire_binding() },
         ],
     });
     let view_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -1994,6 +2018,12 @@ fn run_box_fill(
         contents: bytemuck::cast_slice(&patch.palette),
         usage: wgpu::BufferUsages::STORAGE,
     });
+    // Storage plan R2b — the per-brick palettes the bit-packed index stream indirects through.
+    let brick_palettes_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("mb_palette_brick_palettes"),
+        contents: bytemuck::cast_slice(&patch.brick_palettes),
+        usage: wgpu::BufferUsages::STORAGE,
+    });
 
     let size_desc = wgpu::BlasAABBGeometrySizeDescriptor {
         primitive_count: n,
@@ -2133,6 +2163,7 @@ fn run_box_fill(
             storage_ro(1),
             storage_ro(2),
             storage_ro(3),
+            storage_ro(12), // R2b per-brick palettes
         ],
     });
     let view_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -2210,6 +2241,7 @@ fn run_box_fill(
             wgpu::BindGroupEntry { binding: 1, resource: meta_buf.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 2, resource: voxel_buf.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 3, resource: palette_buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 12, resource: brick_palettes_buf.as_entire_binding() },
         ],
     });
     let view_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -2327,7 +2359,7 @@ fn run_box_fill(
 
 #[test]
 fn multibounce_exceeds_single_bounce_and_stays_bounded() {
-    let Some((device, queue)) = common::headless_ray_query_device_with_storage_buffers(18) else {
+    let Some((device, queue)) = common::headless_ray_query_device_with_storage_buffers(20) else {
         eprintln!("no ray-query device with 16 storage buffers — skipping multi-bounce test");
         return;
     };
@@ -2417,7 +2449,7 @@ fn multibounce_exceeds_single_bounce_and_stays_bounded() {
 ///     that the generous cap tracks unlimited FAR more tightly than the tight cap does.
 #[test]
 fn active_cell_cap_never_corrupts_and_is_noop_when_generous() {
-    let Some((device, queue)) = common::headless_ray_query_device_with_storage_buffers(18) else {
+    let Some((device, queue)) = common::headless_ray_query_device_with_storage_buffers(20) else {
         eprintln!("no ray-query device with 16 storage buffers — skipping active-cell-cap test");
         return;
     };
@@ -2596,6 +2628,12 @@ fn run_nee_fill(device: &wgpu::Device, queue: &wgpu::Queue, nee_on: bool, frames
         contents: bytemuck::cast_slice(&patch.palette),
         usage: wgpu::BufferUsages::STORAGE,
     });
+    // Storage plan R2b — the per-brick palettes the bit-packed index stream indirects through.
+    let brick_palettes_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("nv_palette_brick_palettes"),
+        contents: bytemuck::cast_slice(&patch.brick_palettes),
+        usage: wgpu::BufferUsages::STORAGE,
+    });
 
     let size_desc = wgpu::BlasAABBGeometrySizeDescriptor {
         primitive_count: n,
@@ -2735,6 +2773,7 @@ fn run_nee_fill(device: &wgpu::Device, queue: &wgpu::Queue, nee_on: bool, frames
             storage_ro(1),
             storage_ro(2),
             storage_ro(3),
+            storage_ro(12), // R2b per-brick palettes
         ],
     });
     let view_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -2809,6 +2848,7 @@ fn run_nee_fill(device: &wgpu::Device, queue: &wgpu::Queue, nee_on: bool, frames
             wgpu::BindGroupEntry { binding: 1, resource: meta_buf.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 2, resource: voxel_buf.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 3, resource: palette_buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 12, resource: brick_palettes_buf.as_entire_binding() },
         ],
     });
     let view_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -2921,7 +2961,7 @@ fn run_nee_fill(device: &wgpu::Device, queue: &wgpu::Queue, nee_on: bool, frames
 #[test]
 fn nee_matches_bounce_only_mean_with_lower_variance() {
     // 18 storage in one stage (3 scene + 13 cache incl. the 12/13 test seed + 15/16 NEE lights).
-    let Some((device, queue)) = common::headless_ray_query_device_with_storage_buffers(18) else {
+    let Some((device, queue)) = common::headless_ray_query_device_with_storage_buffers(20) else {
         eprintln!("no ray-query device with 18 storage buffers — skipping NEE variance test");
         return;
     };

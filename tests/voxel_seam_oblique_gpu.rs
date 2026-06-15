@@ -130,6 +130,7 @@ struct SeamScene {
     meta_buf: wgpu::Buffer,
     voxel_buf: wgpu::Buffer,
     palette_buf: wgpu::Buffer,
+    brick_palettes_buf: wgpu::Buffer,
     // keep alive
     _aabb_buf: wgpu::Buffer,
     _blas: wgpu::Blas,
@@ -159,6 +160,12 @@ impl SeamScene {
         let palette_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("seam_palette"),
             contents: bytemuck::cast_slice(&patch.palette),
+            usage: wgpu::BufferUsages::STORAGE,
+        });
+        // Storage plan R2b — the per-brick palettes the bit-packed index stream indirects through.
+        let brick_palettes_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("seam_brick_palettes"),
+            contents: bytemuck::cast_slice(&patch.brick_palettes),
             usage: wgpu::BufferUsages::STORAGE,
         });
 
@@ -226,6 +233,7 @@ impl SeamScene {
             meta_buf,
             voxel_buf,
             palette_buf,
+            brick_palettes_buf,
             _aabb_buf: aabb_buf,
             _blas: blas,
         }
@@ -259,6 +267,7 @@ impl SeamScene {
                 wgpu::BindGroupEntry { binding: 1, resource: self.meta_buf.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 2, resource: self.voxel_buf.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 3, resource: self.palette_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 12, resource: self.brick_palettes_buf.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 6, resource: ray_buf.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 7, resource: out_buf.as_entire_binding() },
             ],

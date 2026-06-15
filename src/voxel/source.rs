@@ -607,11 +607,12 @@ mod tests {
             ResidentBrick { coord: IVec3::new(1, 0, 0), brick: &b1, lod: 0 },
         ];
         let patch = pack_resident_set(&entries, &reg);
-        // Brick 0's +X halo ring (halo index hx == BRICK_EDGE+1 = 9) must read brick 1's core (block 2).
-        let off0 = patch.metas[0].voxel_offset as usize;
+        // Brick 0's +X halo ring (halo index hx == BRICK_EDGE+1 = 9) must DECODE to brick 1's core (block 2).
+        // Read via the SSOT `GpuBrickPatch::cell_block` (R2b) so the oracle decodes the same way the shader does.
+        let m0 = &patch.metas[0];
         for hz in 1..=BRICK_EDGE {
             for hy in 1..=BRICK_EDGE {
-                let cell = patch.voxels[off0 + halo_index(BRICK_EDGE + 1, hy, hz, 0)];
+                let cell = patch.cell_block(m0, halo_index(BRICK_EDGE + 1, hy, hz, 0)).0;
                 assert_eq!(cell, 2, "brick 0's +X halo reads the neighbour brick 1's core (block 2)");
             }
         }
