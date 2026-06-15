@@ -1520,11 +1520,18 @@ fn surfaces_dissimilar(p: vec3<f32>, n: vec3<f32>, op: vec3<f32>, on: vec3<f32>)
     let tangent_plane_distance = abs(dot(n, op - p));
     let view_dist = max(length(p - camera.cam_pos), 1.0e-3);
     // Solari thresholds (gbuffer_utils.wgsl:45 parity): reject if the neighbour is >0.3% of view-distance out
-    // of the tangent plane, or its normal is >90° away (`dot < 0`). At the worldgen/Cornell view distances the
-    // relative 0.003·view_dist threshold (≈cm) is well below the ≥0.4 m thin walls, so a far-side-of-a-thin-wall
-    // neighbour is already rejected; the world-cache thin-wall leak is handled at its source by the first-bounce
-    // cell-size clamp in `query_world_cache` (NOT here). Keep this exactly Solari — a tighter cone or an absolute
-    // floor would over-reject genuinely co-planar same-surface reuse and INCREASE boil.
+    // of the tangent plane, or its normal is >90° away (`dot < 0`).
+    //
+    // THIN-WALL CAVEAT (post-D1a 0.05 m flip — corrected, was stale): the thinnest production wall is now a
+    // 0.05 m voxel (Cornell WALL = 2 voxels = 0.1 m), NOT ">=0.4 m". The RELATIVE 0.003·view_dist tangent-plane
+    // threshold equals the 0.05 m voxel at view_dist ≈ 16.7 m, so BEYOND ~16.7 m (well within the new 64 m LOD0
+    // reach) a far-side-of-a-thin-wall neighbour is NOT rejected by this test → ReSTIR spatial reuse can leak GI
+    // across a thin wall at distance. The world-cache thin-wall leak is handled at its source by the first-bounce
+    // cell-size clamp in `query_world_cache`; this ReSTIR-reuse leak is a SEPARATE, currently-unguarded path.
+    // We deliberately do NOT blind-tune the canonical Solari threshold here — an absolute thin-wall cap risks
+    // over-rejecting genuinely co-planar same-surface reuse (INCREASING boil) and needs a MEASURED value (see
+    // the voxel-rt-gi-noise 2.2.1 lessons). Left as a documented follow-up:
+    // TODO(D-GI): thin-wall reuse leak at distance under the 64 m reach — needs a measured absolute threshold cap.
     return tangent_plane_distance / view_dist > 0.003 || dot(n, on) < 0.0;
 }
 
@@ -2096,11 +2103,12 @@ fn query_world_cache(world_position_in: vec3<f32>, world_normal: vec3<f32>, view
     var cell_size = wc_get_cell_size(world_position, view_position, rng);
 
     // FIRST-BOUNCE LIGHT-LEAK PREVENTION (Solari world_cache_query.wgsl:47-52, on-by-default node.rs:564).
-    // A bounce shorter than the distance-LOD cell straddles thin geometry (e.g. a cube face → adjacent 0.4 m
-    // floor, ray_t ~0.3-0.8 m) — the over-sized cell + tangent jitter then quantize the query onto the cell on
-    // the FAR side of the wall, reading exterior radiance into an interior face (the reported Cornell leak).
-    // Clamping back to the small base cell (0.15 m, fits inside the floor) makes the straddle impossible and
-    // shrinks the subsequent jitter amplitude (±0.5·cell_size). Robust-by-construction.
+    // A bounce shorter than the distance-LOD cell straddles thin geometry (e.g. a cube face → adjacent floor) —
+    // the over-sized cell + tangent jitter then quantize the query onto the cell on the FAR side of the wall,
+    // reading exterior radiance into an interior face (the reported Cornell leak). Clamping back to the small
+    // base cell (`wc.cell_base_size`, default `0.09375·BRICK_WORLD_SIZE` ≈ 0.0375 m at the 0.05 m flip — sized to
+    // fit INSIDE the 0.1 m Cornell wall) makes the straddle impossible and shrinks the subsequent jitter
+    // amplitude (±0.5·cell_size). Brick-relative / flip-proof. Robust-by-construction.
     if (ray_t < cell_size) {
         cell_size = wc.cell_base_size;
     }

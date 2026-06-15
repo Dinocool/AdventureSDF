@@ -117,8 +117,16 @@ fn desired_clipmap_all_levels_and_view_radius() {
     // 160 reaches 8192 m). Threshold derived from the consts so it tracks any future scale change.
     let view = region_half_extent_m(&cfg);
     assert!((view - cfg.clip_half_bricks as f32 * brick_span(MAX_LOD)).abs() < 1e-2);
-    let expect_view = cfg.clip_half_bricks as f32 * brick_span(MAX_LOD); // 409.6 m at clip_half 8, 0.05 m
-    assert!(view >= expect_view - 1e-2, "clipmap view radius == clip_half·brick_span(MAX_LOD) (got {view:.0} m)");
+    // INDEPENDENT "reaches far" floor (not a one-sided duplicate of the equality above): the PRODUCTION default
+    // clip_half (160) over the coarsest level must still reach a km-scale half-extent — at the 0.05 m flip that
+    // is 160·brick_span(MAX_LOD) = 160·0.4·128 = 8192 m. Derived wholly from the consts + the shipped Default, so
+    // it tracks any future scale change yet keeps real teeth: a regression that quietly shrank the reach (e.g. a
+    // dropped LOD level or a clip_half cut) would drop below this floor even though the equality above still held.
+    let prod_reach = region_half_extent_m(&StreamingConfig::default());
+    assert!(
+        prod_reach >= 8000.0,
+        "production clipmap reach must stay km-scale (clip_half·brick_span(MAX_LOD)); got {prod_reach:.0} m"
+    );
 }
 
 #[test]

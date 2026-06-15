@@ -1416,11 +1416,16 @@ fn thin_wall_no_exterior_leak_with_clamp() {
     // This is a pure CACHE-GRID leak test: every cache quantity (base cell, the X-bucket positions, the
     // short ray_t, the viewer distance) is sized RELATIVE to the cache cell, and the cell must stay a fixed
     // FRACTION of the (brick-scaled) scene for the bucket math to hold. At the 0.05 m flip the scene is 4×
-    // smaller, so we scale all these absolute world quantities by `BRICK_WORLD_SIZE / 1.6` (1.6 m = the old
-    // brick) — making the test SCALE-EQUIVALENT to the 0.2 m version it was tuned at (production base cell stays
-    // 0.15 m at the old brick; the LEAK MATH is about the cell:scene ratio, not the absolute metre value).
+    // smaller, so we scale the remaining absolute world quantities by `BRICK_WORLD_SIZE / 1.6` (1.6 m = the old
+    // brick) — making the test SCALE-EQUIVALENT to the 0.2 m version it was tuned at.
+    //
+    // ANTI-DIVERGENCE (the D1a review root cause): the clamp target `base_cell` is the PRODUCTION default
+    // (`WorldCacheUniformData::default().cell_base_size`), NOT a separately-scaled copy — so this leak gate
+    // exercises the value the shipped engine actually clamps to, and the two CANNOT drift apart again. The
+    // production default is itself `0.09375·BRICK_WORLD_SIZE` (= 0.15 m at the old brick), so the bucket math
+    // (cell = 0.15·scale) is unchanged; this just removes the duplicate metre constant.
     let scale = BRICK_WORLD_SIZE / 1.6; // 1.0 at the old 0.2 m brick, 0.25 at the 0.05 m flip
-    let base_cell = 0.15 * scale; // PRODUCTION base cell (0.15 m at the old brick): the clamp target
+    let base_cell = WorldCacheUniformData::default().cell_base_size; // PRODUCTION base cell = the clamp target
     let wc_defaults = WorldCacheUniformData {
         cell_base_size: base_cell,
         lod_scale: 15.0,
@@ -2523,11 +2528,12 @@ fn active_cell_cap_never_corrupts_and_is_noop_when_generous() {
     eprintln!("[active-cell-cap] unlimited floor luma={u_conv:.4} | generous-cap luma={g_conv:.4}");
     let g_rel = (g_conv - u_conv).abs() / u_conv.max(1e-6);
     assert!(
-        // 0.12 (was 0.06): the D1a 0.05 m flip shrank the cavity 4×, so the multi-bounce feed-forward's
-        // atomic-scheduling jitter is a relatively larger fraction of the (smaller) converged value — measured
-        // up to ~8% run-to-run here (worse under parallel-test GPU contention) vs ~2% at 0.2 m. Re-pinned above
-        // the MEASURED jitter; it still catches what it guards — a cap that WRONGLY BINDS drops active cells, a
-        // ≫12% change (not jitter).
+        // 0.12 (was 0.06): an EMPIRICAL re-pin, not a scale rationale. The cell count, the dispatch, and the
+        // converged-luma target are all scale-INVARIANT (the cache cell + cavity scale together with the brick),
+        // so the 0.05 m flip does not change the converged value — what changed is the MEASURED run-to-run
+        // atomic-scheduling jitter on the multi-bounce feed-forward path: up to ~8% here under parallel-test GPU
+        // contention (vs ~2% in isolation). Re-pinned above the measured jitter; it still catches what it guards
+        // — a cap that WRONGLY BINDS drops active cells, a ≫12% change (not jitter).
         g_rel < 0.12,
         "a cap ≥ the active count must track unlimited (identical dispatch, atomic jitter only): \
          unlimited={u_conv:.4} vs generous-cap={g_conv:.4} (rel {g_rel:.4})"

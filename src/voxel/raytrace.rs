@@ -41,7 +41,7 @@ use bevy::anti_alias::dlss::{
 #[cfg(feature = "dlss")]
 use bevy::core_pipeline::prepass::ViewPrepassTextures;
 
-use super::brickmap::BrickMap;
+use super::brickmap::{BRICK_WORLD_SIZE, BrickMap};
 use super::cornell::{build_cornell, build_cornell_with_edits};
 use super::gallery::{GALLERY_SCENES, load_gallery};
 use super::edits::{VoxelEdits, VoxelHit, pick_voxel};
@@ -1610,7 +1610,11 @@ impl Default for LightingUniformData {
             sun_direction: d.into(),
             sun_intensity: 1.0,
             sun_color: [1.0, 0.96, 0.9],
-            shadow_bias: 0.04,
+            // Brick-relative shadow/AO origin offset (FLIP-PROOF): `0.025·BRICK_WORLD_SIZE` = 0.04 m at the old
+            // 1.6 m brick (the pre-D1a absolute value), = 0.01 m now. A fixed 0.04 m offset is a 4× larger
+            // fraction of the now-0.05 m geometry → peter-panning / self-shadow loss; derived from the brick so
+            // it keeps the same RATIO to geometry across the VOXEL_SIZE flip. Runtime uniform (editor overrides).
+            shadow_bias: 0.025 * BRICK_WORLD_SIZE,
             ambient_color: [0.10, 0.13, 0.18],
             ao_radius: 1.0,
             ao_samples: 4,
@@ -1641,7 +1645,10 @@ impl LightingUniformData {
             sun_direction: sun.into(),
             sun_intensity: 0.5,
             sun_color: [1.0, 0.98, 0.95],
-            shadow_bias: 0.04,
+            // Brick-relative (FLIP-PROOF): `0.025·BRICK_WORLD_SIZE` = 0.04 m at the old 1.6 m brick (the pre-D1a
+            // value), = 0.01 m now. The Cornell wall is only 2 voxels = 0.1 m thick at the 0.05 m flip, so a
+            // fixed 0.04 m bias would push the shadow origin a large fraction of the wall and lose contact shadow.
+            shadow_bias: 0.025 * BRICK_WORLD_SIZE,
             ambient_color: [0.03, 0.03, 0.035],
             ao_radius: 0.6,
             ao_samples: 4,
@@ -1671,7 +1678,9 @@ impl LightingUniformData {
             sun_direction: sun.into(),
             sun_intensity: 3.2,
             sun_color: [1.0, 0.95, 0.85],
-            shadow_bias: 0.06,
+            // Brick-relative (FLIP-PROOF): `0.0375·BRICK_WORLD_SIZE` = 0.06 m at the old 1.6 m brick (the pre-D1a
+            // value, preserving this preset's wider terrain ratio), = 0.015 m now. Same RATIO to geometry as before.
+            shadow_bias: 0.0375 * BRICK_WORLD_SIZE,
             ambient_color: [0.06, 0.08, 0.11],
             ao_radius: 1.5,
             ao_samples: 4,
@@ -1707,7 +1716,9 @@ impl LightingUniformData {
             sun_direction: sun.into(),
             sun_intensity: 2.4,
             sun_color: [1.0, 0.94, 0.82], // warm midday sun
-            shadow_bias: 0.05,
+            // Brick-relative (FLIP-PROOF): `0.03125·BRICK_WORLD_SIZE` = 0.05 m at the old 1.6 m brick (the pre-D1a
+            // value, preserving this preset's ratio), = 0.0125 m now. Same RATIO to geometry across the flip.
+            shadow_bias: 0.03125 * BRICK_WORLD_SIZE,
             // A modest neutral-cool fill so the deep, sky-occluded interior still reads (the asset is roofed),
             // kept low enough that the sky-GI bounce — not a flat fill — is what shapes the arcades.
             ambient_color: [0.09, 0.10, 0.13],
@@ -1835,7 +1846,8 @@ pub struct VoxelRtSky {
 #[repr(C)]
 #[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct WorldCacheUniformData {
-    /// Size of a cache cell at the lowest LOD, in metres (Solari 0.15).
+    /// Size of a cache cell at the lowest LOD, in metres. Default is BRICK-RELATIVE
+    /// (`0.09375·BRICK_WORLD_SIZE`) so it tracks the VOXEL_SIZE flip; = Solari's 0.15 m at the old 1.6 m brick.
     pub cell_base_size: f32,
     /// How fast the cell LOD grows with camera distance (Solari 15.0).
     pub lod_scale: f32,
@@ -1892,7 +1904,13 @@ impl Default for WorldCacheUniformData {
     /// Solari's defaults (`world_cache_query.wgsl`). `frame_index`/`reset`/`view_*` are runtime-stamped, default 0.
     fn default() -> Self {
         Self {
-            cell_base_size: 0.15,
+            // Brick-relative base cache cell (FLIP-PROOF): `0.09375·BRICK_WORLD_SIZE` = 0.15 m at the old 1.6 m
+            // brick (Solari's 0.15 m default at the pre-D1a scale: 0.15/1.6 = 0.09375), = 0.0375 m now. This is
+            // the leak-guard clamp TARGET (`if (ray_t < cell_size) { cell_size = wc.cell_base_size; }`): it must
+            // fit INSIDE the thinnest production wall (Cornell WALL = 2 voxels = 0.1 m) so the clamped cell + its
+            // ±0.5·cell tangent jitter (here ±0.01875 m, total 0.0375 m) cannot straddle the wall. A fixed 0.15 m
+            // default would be 1.5× the now-0.1 m wall → the reported light leak. Runtime uniform (editor slider).
+            cell_base_size: 0.09375 * BRICK_WORLD_SIZE,
             lod_scale: 15.0,
             gi_ray_distance: 50.0,
             cell_lifetime: 10,
