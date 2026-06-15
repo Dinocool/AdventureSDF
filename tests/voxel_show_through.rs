@@ -178,7 +178,7 @@ fn cornell_rays_have_no_near_phantom_hits() {
     let patch = pack_brickmap(&map, &reg);
 
     // Eye outside the open −Z front, looking at the interior centre (≈ the editor framing).
-    let c = INTERIOR as f32 * 0.5 * VOXEL_SIZE; // interior centre per axis (≈4.8 m)
+    let c = INTERIOR as f32 * 0.5 * VOXEL_SIZE; // interior centre per axis (≈1.2 m at 0.05 m voxels)
     let target = Vec3::splat(c);
     let eye = Vec3::new(c, c + 1.5, -8.5);
     let fwd = (target - eye).normalize();

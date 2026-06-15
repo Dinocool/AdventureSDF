@@ -3,7 +3,7 @@
 //! The HW-RT path streams a brick set around the camera. A brick is ALWAYS `8³` voxels, but its WORLD SPAN
 //! scales with LOD ([`super::brickmap::brick_span`]`(L) = BRICK_WORLD_SIZE · 2^L`), so COARSER levels cover
 //! MORE world at the same resolution — a geometry-clipmap / GigaVoxels 3D-mipmap. This replaces the old
-//! dense-cube residency (every brick a fixed `1.6 m`, so coarse LOD added no coverage and view distance was
+//! dense-cube residency (every brick a fixed `0.4 m`, so coarse LOD added no coverage and view distance was
 //! hard-capped) with NESTED CLIPMAP SHELLS: LOD0 fills the inner cube, each coarser level is a thin SHELL
 //! that doubles the reach. Total view radius = `clip_half · BRICK_WORLD_SIZE · 2^MAX_LOD`.
 //!
@@ -76,14 +76,16 @@ pub struct StreamingConfig {
     /// on ITS grid ([`level_box`]), MINUS the footprint of the finer level below it ([`level_hole`]). Because
     /// each box snaps to the 2×-coarser grid, the levels tile EXACTLY — adjacent levels abut with NO overlap
     /// and NO gap (the union telescopes to the outermost box). The total view radius is
-    /// `clip_half · BRICK_WORLD_SIZE · 2^MAX_LOD`. Default 8 ⇒ a view half-extent of `8 · 1.6 · 2^7 ≈ 1640 m`
-    /// at bounded VRAM (`MAX_LOD+1` thin rectangular shells, not a dense cube). Use `>= 2` (below that the
-    /// nested annuli degenerate). Push it UP to move the LOD transitions farther out (fine detail reaches
-    /// farther), bounded by `max_resident_bricks`.
+    /// `clip_half · BRICK_WORLD_SIZE · 2^MAX_LOD`. Default 160 (D1a) ⇒ a view half-extent of
+    /// `160 · 0.4 · 2^7 = 8192 m` at bounded VRAM (`MAX_LOD+1` thin rectangular shells, not a dense cube), with
+    /// a LOD0 reach of `160 · 0.4 = 64 m`. This is ONE shared (UNIFORM) knob across all LODs — not a per-LOD
+    /// ring. Use `>= 2` (below that the nested annuli degenerate). Push it UP to move the LOD transitions farther
+    /// out (fine detail reaches farther), bounded by `max_resident_bricks`.
     pub clip_half_bricks: i32,
     /// Hard cap on resident bricks — a SAFETY bound so a mis-set `clip_half` can't blow VRAM. With the nested
     /// shells this should NOT bind (only NON-empty surface bricks are stored, a thin shell each level). If the
-    /// desired set exceeds it the farthest bricks are dropped (logged). Default 60_000.
+    /// desired set exceeds it the farthest bricks are dropped (logged). Default 400_000 (D1a) — PROVISIONAL,
+    /// pending the D1c benchmark: the ~O(H²) surface shell grows ~20× with the 64 m LOD0 reach the flip forces.
     pub max_resident_bricks: usize,
     /// Max bricks voxelized + enqueued→processed per `drain_work` call (per frame). Bounds the per-frame
     /// CPU cost of a big camera move; the rest carry in the queue to later frames. Default 256.
@@ -93,8 +95,10 @@ pub struct StreamingConfig {
 impl Default for StreamingConfig {
     fn default() -> Self {
         Self {
-            clip_half_bricks: 8,
-            max_resident_bricks: 60_000,
+            // D1a: 160 · 0.4 m = 64 m LOD0 reach; 160 · 0.4 · 2^7 = 8192 m total view (UNIFORM knob, all LODs).
+            clip_half_bricks: 160,
+            // D1a PROVISIONAL cap (pending the D1c benchmark): the surface shell grows ~20× with the 64 m reach.
+            max_resident_bricks: 400_000,
             max_bricks_per_frame: 256,
         }
     }
@@ -715,14 +719,16 @@ mod tests {
     }
 
     /// A LOD-`L` brick's containing camera coord scales with `brick_span(L)`: a fixed world position maps to
-    /// a coarser brick coord at coarser LODs (the per-level clipmap centres differ).
+    /// a coarser brick coord at coarser LODs (the per-level clipmap centres differ). Derived from the consts
+    /// (not hardcoded) so it tracks the VOXEL_SIZE flip.
     #[test]
     fn camera_brick_coord_scales_with_lod() {
-        // World position 5 m: LOD0 (span 1.6) → floor(5/1.6)=3; LOD1 (3.2) → 1; LOD2 (6.4) → 0.
+        // World position 5 m: LOD0 (span 0.4) → floor(5/0.4)=12; LOD1 (0.8) → 6; LOD2 (1.6) → 3.
         let w = [5.0, 5.0, 5.0];
-        assert_eq!(camera_brick_coord_lod(w, 0), IVec3::splat(3));
-        assert_eq!(camera_brick_coord_lod(w, 1), IVec3::splat(1));
-        assert_eq!(camera_brick_coord_lod(w, 2), IVec3::splat(0));
+        let expect = |lod: u32| IVec3::splat((5.0 / brick_span(lod)).floor() as i32);
+        assert_eq!(camera_brick_coord_lod(w, 0), expect(0));
+        assert_eq!(camera_brick_coord_lod(w, 1), expect(1));
+        assert_eq!(camera_brick_coord_lod(w, 2), expect(2));
         // camera_brick_coord is the LOD0 alias.
         assert_eq!(camera_brick_coord(w), camera_brick_coord_lod(w, 0));
     }
@@ -796,9 +802,9 @@ mod tests {
         assert_eq!(brick_lod(camera_brick_coord_lod(cam, 0), cam, &cfg), 0);
         // A LOD0 brick still inside the LOD0 box is LOD0.
         assert_eq!(brick_lod(IVec3::new(7, 0, 0), cam, &cfg), 0);
-        // Just past the LOD0 box (x=12 ∉ [-8, 9]): its world centre (~20 m) lands in the LOD1 annulus.
+        // Just past the LOD0 box (x=12 ∉ [-8, 9]): its world centre (~5 m at 0.4 m span) lands in the LOD1 annulus.
         assert_eq!(brick_lod(IVec3::new(12, 0, 0), cam, &cfg), 1);
-        // Far out (≈49 m) is a coarser level still.
+        // Far out (≈12 m) is a coarser level still.
         assert!(brick_lod(IVec3::new(30, 0, 0), cam, &cfg) >= 2);
         // Consistency: the level brick_lod reports is exactly the one that holds that point in desired_clipmap.
         let cfg_big = StreamingConfig { max_resident_bricks: usize::MAX, ..cfg };

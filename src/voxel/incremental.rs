@@ -1,7 +1,7 @@
 //! **Incremental, O(changed) re-pack of the resident brick set into FIXED-CAPACITY GPU buffers.**
 //!
 //! The full [`pack_resident_set`](super::gpu::pack_resident_set) rebuilds the whole AABB / meta / voxel buffer
-//! set on EVERY camera move (O(resident) ≈ 137 ms at the shipping `clip_half = 8`), then the render path
+//! set on EVERY camera move (O(resident); the per-move hitch grows with the shipping `clip_half`), then the render path
 //! recreates all GPU buffers + the BLAS/TLAS from scratch. That is the per-move hitch this module removes.
 //!
 //! # The model — a per-brick SLOT allocator over fixed-capacity buffers

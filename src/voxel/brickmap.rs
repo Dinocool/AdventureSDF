@@ -6,8 +6,8 @@
 //!
 //! ## Clipmap LOD: a brick is ALWAYS `8³` voxels; only its WORLD SPAN scales with LOD
 //! A LOD-`L` brick is `8³` voxels of edge [`lod_voxel_size`]`(L) = VOXEL_SIZE · 2^L`, so it spans
-//! [`brick_span`]`(L) = BRICK_WORLD_SIZE · 2^L` metres. LOD0 = a `1.6 m` brick of `0.2 m` voxels; LOD1 = a
-//! `3.2 m` brick of `0.4 m` voxels; … This is a true nested CLIPMAP (geometry-clipmaps / GigaVoxels 3D
+//! [`brick_span`]`(L) = BRICK_WORLD_SIZE · 2^L` metres. LOD0 = a `0.4 m` brick of `0.05 m` voxels; LOD1 = a
+//! `0.8 m` brick of `0.1 m` voxels; … This is a true nested CLIPMAP (geometry-clipmaps / GigaVoxels 3D
 //! mipmap): coarser levels cover MORE world at the SAME `8³` resolution, so view distance grows with `2^L`
 //! at bounded VRAM. DIFFERENT LODs are DIFFERENT coord grids — the same integer coord at two LODs is two
 //! different world bricks (`world_min(c, L) = c · brick_span(L)`). The voxelizer samples each LOD brick
@@ -28,17 +28,18 @@ pub const BRICK_EDGE: i32 = 8;
 /// Voxels per brick (`BRICK_EDGE³`).
 pub const BRICK_VOXELS: usize = (BRICK_EDGE * BRICK_EDGE * BRICK_EDGE) as usize;
 /// Edge length of one voxel, in world metres.
-pub const VOXEL_SIZE: f32 = 0.2;
-/// World-metre edge of a LOD0 brick (`BRICK_EDGE · VOXEL_SIZE` = 1.6 m). This is the FINEST brick span;
-/// a LOD-`L` brick spans [`brick_span`]`(L) = BRICK_WORLD_SIZE · 2^L`.
+pub const VOXEL_SIZE: f32 = 0.05;
+/// World-metre edge of a LOD0 brick (`BRICK_EDGE · VOXEL_SIZE` = 0.4 m). This is the FINEST brick span;
+/// a LOD-`L` brick spans [`brick_span`]`(L) = BRICK_WORLD_SIZE · 2^L`. DERIVED — never hardcode.
 pub const BRICK_WORLD_SIZE: f32 = BRICK_EDGE as f32 * VOXEL_SIZE;
 
 /// The maximum LOD level a brick can be stored at. A brick is ALWAYS [`BRICK_EDGE`]³ voxels at every LOD;
 /// only its world SPAN scales (`brick_span(L) = BRICK_WORLD_SIZE · 2^L`). MAX_LOD = 7 ⇒ the coarsest level
 /// covers `2^7 = 128×` the LOD0 span per axis, so a clipmap of `MAX_LOD+1 = 8` nested shells reaches a view
-/// radius of `clip_half · BRICK_WORLD_SIZE · 2^7` — e.g. `8 · 1.6 · 128 ≈ 1640 m` half-extent at
-/// `clip_half_bricks = 8` (~36× the old 45 m dense reach). The coarsest voxel is `0.2 · 2^7 = 25.6 m`,
-/// comfortably sub-pixel at >1 km, so no detail is wasted; each level stays a thin `(2·clip_half+1)³ − inner`
+/// radius of `clip_half · BRICK_WORLD_SIZE · 2^7` — e.g. `160 · 0.4 · 128 = 8192 m` half-extent at
+/// `clip_half_bricks = 160` (the D1a production default; LOD0 reach `160 · 0.4 = 64 m`). The coarsest voxel
+/// is `0.05 · 2^7 = 6.4 m`, comfortably sub-pixel at >1 km, so no detail is wasted; each level stays a thin
+/// `(2·clip_half+1)³ − inner`
 /// shell and the coarse shells are sparse, so the extra level costs few bricks. **If you change this, change
 /// the WGSL mirror `MAX_LOD` in `voxel_raytrace.wgsl` too** (the per-LOD `brick_span`/clamp must agree). The
 /// SSOT cap shared by streaming, packing, the shader, and the tests; LOD selection clamps here.

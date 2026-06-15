@@ -17,7 +17,7 @@ use bevy::math::IVec3;
 use super::super::format::VxoHead;
 use super::super::source::{MergedSource, VxoSource};
 use super::super::writer::{VxoCompression, VxoHeadParams, encode_vxo, write_vxo};
-use crate::voxel::brickmap::{BRICK_EDGE, BRICK_VOXELS, Brick, BrickMap};
+use crate::voxel::brickmap::{BRICK_EDGE, BRICK_VOXELS, Brick, BrickMap, VOXEL_SIZE};
 use crate::voxel::palette::{BlockId, BlockRegistry};
 use crate::voxel::source::{BrickClass, BrickSource, StaticVoxSource};
 
@@ -333,8 +333,11 @@ fn merged_source_offsets_and_remaps() {
 fn voxel_size_mismatch_is_rejected() {
     let map = build_map();
     let reg = registry();
-    // Encode with a deliberately-wrong voxel_size (0.05 m while the engine is 0.2 m).
-    let params = VxoHeadParams { voxel_size: 0.05, name: "wrongsize".into(), ..Default::default() };
+    // Encode with a deliberately-wrong voxel_size: derive it from VOXEL_SIZE (×2) so it can NEVER accidentally
+    // equal the engine's spacing across a flip (this test pre-D1 used 0.05 ≠ 0.2; post-flip 0.05 IS the engine
+    // spacing, so a literal would silently stop testing the mismatch path — the const-relative value is robust).
+    let wrong = VOXEL_SIZE * 2.0;
+    let params = VxoHeadParams { voxel_size: wrong, name: "wrongsize".into(), ..Default::default() };
     let bytes = encode_vxo(&map, &reg, &params, VxoCompression::Store).expect("encode");
     let path = temp_vxo("wrongsize");
     std::fs::write(&path, &bytes).expect("write bytes");

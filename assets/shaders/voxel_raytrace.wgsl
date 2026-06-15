@@ -19,10 +19,10 @@ enable wgpu_ray_query;
 // --- SSOT layout (mirrors src/voxel/gpu.rs) ---------------------------------------------------------
 
 // Brick geometry constants (mirror src/voxel/brickmap.rs). A brick is ALWAYS 8³ voxels; only its world span
-// scales with LOD (the clipmap). LOD0 = 8³ voxels of 0.2 m → a 1.6 m brick.
+// scales with LOD (the clipmap). LOD0 = 8³ voxels of 0.05 m → a 0.4 m brick.
 const BRICK_EDGE: i32 = 8;
-const VOXEL_SIZE: f32 = 0.2;
-// World-metre span of a LOD0 brick (= BRICK_EDGE · VOXEL_SIZE = 1.6 m). A LOD-L brick spans
+const VOXEL_SIZE: f32 = 0.05;
+// World-metre span of a LOD0 brick (= BRICK_EDGE · VOXEL_SIZE = 0.4 m). A LOD-L brick spans
 // brick_span(L) = BRICK_WORLD_SIZE · 2^L — see `brick_span` below (the clipmap SSOT mirror of brickmap.rs).
 const BRICK_WORLD_SIZE: f32 = f32(BRICK_EDGE) * VOXEL_SIZE;
 // A4.2 — the per-side AABB grow (the SEAM fix) is now RELATIVE-PER-LOD: a fixed FRACTION of the brick's
@@ -31,11 +31,11 @@ const BRICK_WORLD_SIZE: f32 = f32(BRICK_EDGE) * VOXEL_SIZE;
 // BLAS geometry), so a ray grazing a shared face/edge enters the brick instead of falling in the FP gap between
 // abutting AABBs. The DDA still reconstructs cells from the TRUE `world_min` and clamps into the real grid, so
 // the halo never adds phantom voxels. The grow scales with the (2^lod×-wider) coarse span, so it bridges the FP
-// slab-gap identically at every LOD / voxel size; at LOD0/0.2 m it equals the historical `VOXEL_SIZE·1e-3`.
+// slab-gap identically at every LOD / voxel size; at LOD0/0.05 m it equals the historical `VOXEL_SIZE·1e-3`.
 const BRICK_AABB_REL_EPS: f32 = 1.25e-4;
 
 // Max LOD level (mirrors src/voxel/brickmap.rs MAX_LOD = 7). A brick is 8³ at every LOD; the coarsest level
-// spans 2^7 = 128× the LOD0 world extent — the clipmap's outer reach (~1.6 km half-extent at clip_half 8).
+// spans 2^7 = 128× the LOD0 world extent — the clipmap's outer reach (~8.2 km half-extent at clip_half 160).
 const MAX_LOD: u32 = 7u;
 
 // One brick's metadata (parallel to the AABB / BLAS primitive array). 48 bytes — matches `GpuBrickMeta`

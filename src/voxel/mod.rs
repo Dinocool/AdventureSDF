@@ -1,4 +1,4 @@
-//! Voxel ray-tracing engine — **Stage 1**: voxelize the procedural worldgen into 0.2 m cubes and render
+//! Voxel ray-tracing engine — **Stage 1**: voxelize the procedural worldgen into 0.05 m cubes and render
 //! a small patch around the origin as flat-lit coloured cubes. The first visual proof of the
 //! voxelization + palette + terrain-height chain (the SDF/mesh-bake renderers were pruned in the
 //! voxel-RT rebuild; this is the seed of the replacement).
@@ -6,7 +6,7 @@
 //! PIPELINE (all CPU, Stage 1):
 //! 1. [`palette`] — a [`palette::BlockRegistry`] built from the worldgen [`BiomeLibrary`] palette
 //!    (`TerrainMatId → BlockId → colour`, one SSOT).
-//! 2. [`brickmap`] — a sparse [`brickmap::BrickMap`] of `8³` bricks (0.2 m voxels), empty bricks absent.
+//! 2. [`brickmap`] — a sparse [`brickmap::BrickMap`] of `8³` bricks (0.05 m voxels), empty bricks absent.
 //! 3. [`voxelize`] — [`voxelize::voxelize_brick`] samples the REAL [`HeightLayer::sample_world`] surface
 //!    + climate/strata materials per voxel.
 //! 4. [`VoxelPlugin`] — on startup, voxelize a bounded patch around the origin and spawn ONE shared cube
@@ -144,7 +144,7 @@ impl Plugin for VoxelPlugin {
         //
         // Reframe the editor orbit camera onto the patch in Update with a one-shot latch (the Startup-spawned
         // camera isn't queryable on the first frame, and worldgen frames the camera for km-scale terrain at
-        // distance 320, which would make the 0.2 m voxels invisible).
+        // distance 320, which would make the 0.05 m voxels invisible).
         app.add_systems(Update, reframe_camera_on_patch);
 
         // Stage 6 — voxel physics (the player walks the cubes). First-person: `P` drops you into the
@@ -321,7 +321,7 @@ pub struct SceneReframed(pub bool);
 /// One-shot: frame the editor orbit camera onto the current voxel scene. For [`VoxelScene::Cornell`] it
 /// frames the OPEN front of the static box (camera outside `-Z`, looking `+Z` so the box fills the view).
 /// For [`VoxelScene::Worldgen`] it frames the origin-surface patch (the original behaviour — runs after
-/// worldgen's own km-scale reframe, which is far too far for 0.2 m voxels). Latches via [`SceneReframed`] so
+/// worldgen's own km-scale reframe, which is far too far for 0.05 m voxels). Latches via [`SceneReframed`] so
 /// the user can move the camera freely afterward; the latch resets on a scene switch.
 #[allow(clippy::too_many_arguments)]
 fn reframe_camera_on_patch(
@@ -381,8 +381,8 @@ fn reframe_camera_on_patch(
         VoxelScene::Sponza => {
             // Sponza is a fixed, bounded building streamed through the SAME clipmap as worldgen (the `.vox`
             // loader anchors it floor-at-y=0, centred on X/Z). The baked Khronos Sponza is LARGE — it spans
-            // ~122 m along its long (X) axis, ~74 m in Z, and ~51 m tall — so the clipmap (≈1640 m view radius,
-            // 8 · 1.6 · 2^7) covers it fully and the bricks stream in from the StaticVoxSource. The right
+            // ~122 m along its long (X) axis, ~74 m in Z, and ~51 m tall — so the clipmap (≈8192 m view radius,
+            // 160 · 0.4 · 2^7) covers it fully and the bricks stream in from the StaticVoxSource. The right
             // interaction is the
             // FREE-FLY (FPS) camera — you stand INSIDE the nave looking down its long axis at the colonnade,
             // drapes, and lit floor (an orbit would put the eye outside the building). Seed the eye near the
@@ -481,7 +481,9 @@ mod tests {
         let registry = BlockRegistry::from_biome_library(&lib);
         let map = voxelize_patch(&layer, &lib, &registry, WORLDGEN_SLICE_SEED);
         assert!(!map.is_empty(), "the origin patch must contain terrain bricks");
-        // Bounded: the patch is ~32 m × band × 32 m of 1.6 m bricks — far fewer than a runaway count.
-        assert!(map.len() < 5000, "brick count {} should stay bounded for the small patch", map.len());
+        // Bounded: the patch is ~32 m × band × 32 m of 0.4 m bricks — far fewer than a runaway count. The flip
+        // to 0.05 m quartered the brick span, so the same fixed-WORLD-size patch holds ~16× more XZ brick
+        // columns (a surface sheet plus a shallow depth band) — the sanity ceiling scales with it.
+        assert!(map.len() < 200_000, "brick count {} should stay bounded for the small patch", map.len());
     }
 }

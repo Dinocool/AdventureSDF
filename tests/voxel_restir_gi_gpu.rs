@@ -337,7 +337,7 @@ fn emitter_scene() -> (BlockRegistry, LightingUniformData, [ProbePoint; N_PROBES
         ambient_color: [0.0, 0.0, 0.0], // sky-miss = 0 in BOTH estimators
         gi_rays: 32,
         gi_intensity: 1.0,
-        gi_bounce_dist: 40.0, // must comfortably reach the ceiling (~1.6 m up)
+        gi_bounce_dist: 40.0, // must comfortably reach the ceiling (~2.4 m up at the 0.05 m Cornell box)
         emissive_strength: 4.0,
         // (firefly clamping was discarded in Phase 2.2 — the probe estimator is the unbiased oracle, no clamp.)
         ..LightingUniformData::default()

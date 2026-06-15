@@ -31,7 +31,7 @@ use crate::voxel::palette::{BlockDef, BlockId, BlockRegistry};
 /// `bounds`/`brick_count`/`region_count` are computed from the map.
 #[derive(Clone, Debug)]
 pub struct VxoHeadParams {
-    /// Metres per LOD0 voxel the asset was baked at (e.g. `0.2` today, `0.05` after the D1 flip).
+    /// Metres per LOD0 voxel the asset was baked at (e.g. `0.05` post the D1 flip; legacy assets were `0.2`).
     pub voxel_size: f32,
     /// **K** — region edge in bricks (power of two; default [`DEFAULT_REGION_EDGE_BRICKS`] = 8).
     pub region_edge_bricks: u32,

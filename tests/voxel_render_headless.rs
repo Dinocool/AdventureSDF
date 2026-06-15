@@ -110,8 +110,8 @@ fn headless_render_shows_voxels() {
                 ..default()
             }),
     );
-    // A tight clipmap so the surface around the camera voxelizes in a handful of frames (the default
-    // clip_half-8 clipmap / 60k-brick cap would need many frames to drain). Inserted BEFORE Startup so
+    // A tight clipmap so the surface around the camera voxelizes in a handful of frames (the production
+    // Default clip_half-160 clipmap / 400k-brick cap would need many frames to drain). Inserted BEFORE Startup so
     // `init_voxel_rt_streaming` picks it up.
     app.insert_resource(StreamingConfig {
         clip_half_bricks: 4,

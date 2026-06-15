@@ -136,7 +136,7 @@ fn voxelize_region(
 
 /// CPU ground truth: DDA-march the brickmap along the world ray and return the FIRST solid voxel —
 /// `(block_id, world_voxel, world_t)`. Mirrors the shader's per-voxel stepping (centre-plane entry t),
-/// at world-voxel granularity (the shader walks the same 0.2 m grid). Returns `None` on a clean miss
+/// at world-voxel granularity (the shader walks the same `VOXEL_SIZE` grid). Returns `None` on a clean miss
 /// within `t_max`.
 fn cpu_first_solid(
     map: &BrickMap,
@@ -145,7 +145,7 @@ fn cpu_first_solid(
     t_max: f32,
 ) -> Option<(BlockId, IVec3, f32)> {
     let rd = rd.normalize();
-    // Standard world-grid 3D-DDA over 0.2 m voxels.
+    // Standard world-grid 3D-DDA over VOXEL_SIZE (0.05 m) voxels.
     let step = IVec3::new(rd.x.signum() as i32, rd.y.signum() as i32, rd.z.signum() as i32);
     let inv = Vec3::new(1.0 / rd.x, 1.0 / rd.y, 1.0 / rd.z);
     let mut vox = IVec3::new(
@@ -547,9 +547,10 @@ fn gpu_mixed_lod_matches_cpu_ground_truth() {
     // floor brick (block 1) fills each band's X cells; the LOD1 pillar brick gets a block-2 top half so a
     // coarse-cell read is observable. Each band is placed at an explicit GRID-ALIGNED coord range so the
     // bricks' world bounds (`coord · brick_span(lod)`) are exact (no rounding gaps).
-    //   LOD0: coords {0,1} → world X [0, 3.2)   (span 1.6)
-    //   LOD1: coords {2,3} → world X [6.4, 12.8) (span 3.2; pillar in coord 3 = [9.6, 12.8))
-    //   LOD2: coords {2,3} → world X [12.8, 25.6) (span 6.4)
+    // (world-X annotations at the 0.05 m flip; ranges = coord·brick_span(lod), derived in the asserts below):
+    //   LOD0: coords {0,1} → world X [0, 0.8)   (span 0.4)
+    //   LOD1: coords {2,3} → world X [1.6, 3.2)  (span 0.8; pillar in coord 3 = [2.4, 3.2))
+    //   LOD2: coords {2,3} → world X [3.2, 6.4)  (span 1.6)
     let mut entries_owned: Vec<(IVec3, Brick, u32)> = Vec::new();
     let solid_floor = |pillar: bool| {
         let mut v = Box::new([BlockId(1); BRICK_EDGE as usize * BRICK_EDGE as usize * BRICK_EDGE as usize]);
@@ -736,12 +737,12 @@ fn gpu_mixed_lod_matches_cpu_ground_truth() {
         gpu
     };
 
-    // Band world-X layout (the clipmap, grid-aligned coords): LOD0 coords {0,1} = X [0, 3.2); LOD1 coords
-    // {2,3} = X [6.4, 12.8) (pillar brick coord 3 = [9.6, 12.8)); LOD2 coords {2,3} = X [12.8, 25.6). Each
-    // band's bricks span their LOD's world height [0, brick_span(lod)) in Y/Z.
-    let s0 = BRICK_WORLD_SIZE; // 1.6
-    let s1 = brick_span(1); // 3.2
-    let s2 = brick_span(2); // 6.4
+    // Band world-X layout (the clipmap, grid-aligned coords; 0.05 m flip): LOD0 coords {0,1} = X [0, 0.8); LOD1
+    // coords {2,3} = X [1.6, 3.2) (pillar brick coord 3 = [2.4, 3.2)); LOD2 coords {2,3} = X [3.2, 6.4). Each
+    // band's bricks span their LOD's world height [0, brick_span(lod)) in Y/Z. All ray origins derive from these.
+    let s0 = BRICK_WORLD_SIZE; // 0.4
+    let s1 = brick_span(1); // 0.8
+    let s2 = brick_span(2); // 1.6
     let assert_matches = |label: &str, ro: Vec3, rd: Vec3| {
         let (cpu_id, cpu_t) =
             cpu_first_solid_packed(&patch, ro, rd, t_max).expect("CPU ray must hit a brick");
@@ -759,10 +760,10 @@ fn gpu_mixed_lod_matches_cpu_ground_truth() {
 
     // Ray 1: straight DOWN into the LOD0 band (full-res floor, block 1), from above its top (Y = s0).
     assert_matches("down_lod0", Vec3::new(s0 * 0.5, s0 + 2.0, s0 * 0.5), Vec3::new(0.0, -1.0, 0.0));
-    // Ray 2: straight DOWN into the LOD1 PILLAR brick (coord 3, world X [9.6, 12.8)): its top half (world Y
-    // [1.6, 3.2)) is block 2, marched on the LOD1 (0.4 m) coarse grid — the surface hit must be block 2.
+    // Ray 2: straight DOWN into the LOD1 PILLAR brick (coord 3, world X [2.4, 3.2)): its top half (world Y
+    // [0.4, 0.8)) is block 2, marched on the LOD1 (0.1 m) coarse grid — the surface hit must be block 2.
     assert_matches("down_lod1_pillar", Vec3::new(3.0 * s1 + s1 * 0.5, s1 + 2.0, s1 * 0.5), Vec3::new(0.0, -1.0, 0.0));
-    // Ray 3: straight DOWN into the LOD2 band (coord 2, world X [12.8, 19.2), 0.8 m coarse grid, block 1).
+    // Ray 3: straight DOWN into the LOD2 band (coord 2, world X [3.2, 4.8), 0.2 m coarse grid, block 1).
     assert_matches("down_lod2", Vec3::new(2.0 * s2 + s2 * 0.5, s2 + 2.0, s2 * 0.5), Vec3::new(0.0, -1.0, 0.0));
     // Ray 4: a horizontal ray skimming +X from before the LOD0 band, into the LOD0 floor — the nearest solid
     // hit (the first LOD0 brick's −X wall) must win the TLAS merge across mixed-LOD AABBs.
@@ -814,7 +815,7 @@ fn gpu_two_instance_world_plus_cube_matches_cpu() {
     assert!(n_world > 0, "world must have bricks");
 
     // --- CUBE OBJECT: a single solid LOD0 brick (block 2) at OBJECT coord (0,0,0). Its world AABBs (in object
-    // space) are [0, 1.6)³. The TLAS instance translates it to `cube_t` in the world. ---
+    // space) are [0, 0.4)³. The TLAS instance translates it to `cube_t` in the world. ---
     let cube_brick = Brick::from_voxels(Box::new(
         [BlockId(2); BRICK_EDGE as usize * BRICK_EDGE as usize * BRICK_EDGE as usize],
     ));
@@ -823,10 +824,10 @@ fn gpu_two_instance_world_plus_cube_matches_cpu() {
     let n_cube = cube_patch.brick_count() as u32;
     assert!(n_cube > 0, "cube must have bricks");
 
-    // Place the cube well away from the world floor (which spans world X/Z [0, 3.2)). Put it at X = 10 m so a
-    // ray down into X≈10 hits ONLY the cube and a ray down into X≈0.8 hits ONLY the world.
+    // Place the cube well away from the world floor (which spans world X/Z [0, 0.8) at the 0.05 m flip). Put it
+    // at X = 10 m so a ray down into X≈10 hits ONLY the cube and a ray down into X≈0.2 hits ONLY the world.
     let cube_t = Vec3::new(10.0, 0.0, 0.0); // world_from_object translation
-    let span = BRICK_WORLD_SIZE; // 1.6 — the cube's object-local extent per axis
+    let span = BRICK_WORLD_SIZE; // 0.4 — the cube's object-local extent per axis
 
     // --- Concatenate the world + cube into GLOBAL buffers. The cube's metas are REBASED so their voxel_offset /
     // palette_base point past the world's slices (the descriptor's meta_base selects the cube's brick range; the
@@ -1056,7 +1057,7 @@ fn gpu_two_instance_world_plus_cube_matches_cpu() {
         gpu
     };
 
-    // Ray A: straight DOWN into the WORLD floor (block 1) at world X≈0.8 (inside the world's [0,3.2) span,
+    // Ray A: straight DOWN into the WORLD floor (block 1) at world X≈0.2 (inside the world's [0,0.8) span,
     // away from the cube at X=10). The CPU oracle is the world patch in WORLD space.
     {
         let ro = Vec3::new(span * 0.5, span + 2.0, span * 0.5);

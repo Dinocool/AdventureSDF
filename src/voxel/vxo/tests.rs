@@ -197,8 +197,9 @@ fn round_trip_zstd_is_bit_identical() {
 }
 
 /// **The Phase C transcoder VALIDATION GATE** (`examples/vox_to_vxo.rs`): a `.vxo` stamped at the corpus's
-/// **0.05 m** spacing round-trips bit-identically through the FULL-FILE [`VxoFile`] reader (NOT `VxoSource`,
-/// which asserts `voxel_size == VOXEL_SIZE = 0.2` and so couldn't open a 0.05 m asset until the D1 flip).
+/// **0.05 m** spacing round-trips bit-identically through the FULL-FILE [`VxoFile`] reader (`VxoFile` records
+/// the on-disk spacing verbatim; `VxoSource` separately asserts `voxel_size == VOXEL_SIZE`, which 0.05 m now
+/// satisfies post-D1 — but this gate exercises the raw file reader, independent of the engine spacing).
 /// Encode the known multi-region map at `voxel_size = 0.05`, read it back via `VxoFile`, and assert HEAD
 /// records 0.05 m AND every brick is bit-identical to the source — the property the `.vox → .vxo` transcode
 /// relies on (the on-disk spacing is just recorded; the grid is copied brick-for-brick).

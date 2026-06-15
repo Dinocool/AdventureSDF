@@ -12,6 +12,18 @@ fn solid() -> BlockId {
     BlockId(1)
 }
 
+/// A box-FREE (x, z) world spawn for the player capsule inside the Cornell interior. The two interior floor
+/// boxes (`cornell::in_floor_box`) cover z∈[6, 34); the band z∈[34, INTERIOR) is clear of both, so a capsule
+/// footprint centred there can drop/walk without wedging on them. Returns the capsule-CENTRE world (x, z):
+/// x at the interior centre (the full +X lane is clear at this z), z at the clear-band centre. Derived from
+/// the const layout so it tracks the VOXEL_SIZE flip + any box-layout change.
+fn clear_back_lane() -> (f32, f32) {
+    let x = INTERIOR as f32 * VOXEL_SIZE * 0.5; // interior centre in X — the +X walk lane is clear here
+    // Clear-band centre in Z (between the boxes' far edge at voxel 34 and the back wall at voxel INTERIOR).
+    let z_voxel = (34 + INTERIOR) as f32 * 0.5;
+    (x, z_voxel * VOXEL_SIZE)
+}
+
 /// Build a brick from a per-voxel predicate (`true` = solid block 1, else air).
 fn brick_from<F: Fn(i32, i32, i32) -> bool>(f: F) -> Brick {
     let mut v = Box::new([BlockId::AIR; BRICK_VOXELS]);
@@ -120,8 +132,18 @@ fn character_rests_on_the_cornell_floor() {
 
     let ctrl = walk_controller();
     let dt = 1.0 / 60.0;
-    let cx = INTERIOR as f32 * VOXEL_SIZE * 0.5; // interior centre (≈4.8 m)
-    let mut feet = Vec3::new(cx, 3.0, cx);
+    // Spawn in the CLEAR BACK LANE, away from the two interior floor boxes. At the 0.05 m flip the box interior
+    // is only 2.4 m and the player capsule is a fixed 0.5 m wide × 1.8 m tall — large relative to the box — so
+    // the old box-CENTRE spawn now overlaps the tall/short floor boxes (`in_floor_box`: tall z∈[20,34), short
+    // z∈[6,22)). The band z∈[34, INTERIOR) is clear of both; spawn the capsule's footprint inside it.
+    let (sx, sz) = clear_back_lane();
+    // Drop from a height that keeps the 1.8 m-tall capsule INSIDE the box (interior ceiling at
+    // `INTERIOR·VOXEL_SIZE`): head = feet + 2·PLAYER_HALF.y must clear the ceiling. At 0.05 m the box interior
+    // is only 2.4 m tall, so the legacy 3.0 m drop started the player ABOVE the ceiling — derive a drop height
+    // that leaves a small gap below the ceiling. (At 0.2 m this resolves to a comfortable mid-box drop.)
+    let ceiling = INTERIOR as f32 * VOXEL_SIZE;
+    let drop_from = (ceiling - 2.0 * PLAYER_HALF.y - 0.1).max(0.3);
+    let mut feet = Vec3::new(sx, drop_from, sz);
     let mut vy = 0.0f32;
     for _ in 0..300 {
         // Ground probe → gravity integrate → move.
@@ -140,8 +162,8 @@ fn character_rests_on_the_cornell_floor() {
     assert!(feet.y > -0.25, "the character must NOT sink through the floor, got {}", feet.y);
 }
 
-/// Walking into the +X (green) wall must be blocked: the interior ends at x = 9.6 m, so the player's feet
-/// can't cross past `9.6 − half_x`.
+/// Walking into the +X (green) wall must be blocked: the interior ends at `INTERIOR·VOXEL_SIZE` m, so the
+/// player's feet can't cross past `interior_x − half_x`.
 #[test]
 fn character_is_blocked_by_a_wall() {
     let map = build_cornell_with_edits(&BlockRegistry::cornell(), &VoxelEdits::new());
@@ -150,14 +172,18 @@ fn character_is_blocked_by_a_wall() {
 
     let ctrl = walk_controller();
     let dt = 1.0 / 60.0;
-    let cx = INTERIOR as f32 * VOXEL_SIZE * 0.5;
-    let mut feet = Vec3::new(cx, 0.0, cx);
+    // Spawn in the clear back lane (see `clear_back_lane`) so the box-sized capsule isn't wedged on the
+    // interior floor boxes at the 0.05 m scale; start near the −X (red) wall so there is a long +X run to the
+    // +X (green) wall. The whole +X lane is clear of boxes at this z.
+    let (_, sz) = clear_back_lane();
+    let start_x = INTERIOR as f32 * VOXEL_SIZE * 0.25; // a quarter in — room to walk toward +X
+    let mut feet = Vec3::new(start_x, 0.0, sz);
     // Push hard toward +X (with a little down-pull to stay grounded) for plenty of steps.
     for _ in 0..400 {
         let desired = Vec3::new(WALK_SPEED * dt, -0.05, 0.0);
         feet = phys.move_character(&ctrl, feet, PLAYER_HALF, desired, dt).0;
     }
-    let interior_x = INTERIOR as f32 * VOXEL_SIZE; // 9.6 m
+    let interior_x = INTERIOR as f32 * VOXEL_SIZE; // 2.4 m at 0.05 m
     assert!(feet.x < interior_x - PLAYER_HALF.x + 0.05, "blocked before the +X wall, got x={}", feet.x);
-    assert!(feet.x > cx, "but the player did move toward +X, got x={}", feet.x);
+    assert!(feet.x > start_x, "but the player did move toward +X, got x={}", feet.x);
 }

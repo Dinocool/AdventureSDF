@@ -12,8 +12,8 @@
 //! the palette) and gathered into the SAME sparse [`BrickMap`] the renderer's resident-set packer consumes,
 //! so the Cornell path and the worldgen path share the exact GPU layout downstream.
 //!
-//! # Layout (voxel units; `VOXEL_SIZE` = 0.2 m)
-//! The interior is [`INTERIOR`]³ voxels (`48` → 9.6 m per side) spanning local voxel coords `[0, INTERIOR)`
+//! # Layout (voxel units; `VOXEL_SIZE` = 0.05 m)
+//! The interior is [`INTERIOR`]³ voxels (`48` → 2.4 m per side) spanning local voxel coords `[0, INTERIOR)`
 //! on each axis; walls are [`WALL`] voxels thick (`2`) in the shell just outside the interior. So the full
 //! box spans `[-WALL, INTERIOR + WALL)` in X and Y, and `[-WALL, INTERIOR + WALL)` in Z EXCEPT the front
 //! (`-Z`) which is open. The box's near-front face sits at `z = 0` (the open side faces `-Z`); the camera is
@@ -25,7 +25,7 @@ use super::brickmap::{BRICK_EDGE, BRICK_VOXELS, Brick, BrickMap, VOXEL_SIZE, bri
 use super::edits::VoxelEdits;
 use super::palette::{BlockId, BlockRegistry, CornellBlock};
 
-/// Interior edge of the box, in voxels (`48` → 9.6 m). Bounded + static.
+/// Interior edge of the box, in voxels (`48` → 2.4 m at 0.05 m voxels). Bounded + static.
 pub const INTERIOR: i32 = 48;
 /// Wall thickness, in voxels.
 pub const WALL: i32 = 2;
@@ -37,7 +37,7 @@ pub fn interior_center_world() -> [f32; 3] {
     [c, c, c]
 }
 
-/// The world-metre interior edge length (`INTERIOR · VOXEL_SIZE` = 9.6 m) — used to frame the camera.
+/// The world-metre interior edge length (`INTERIOR · VOXEL_SIZE` = 2.4 m at 0.05 m) — used to frame the camera.
 pub fn interior_extent_world() -> f32 {
     INTERIOR as f32 * VOXEL_SIZE
 }

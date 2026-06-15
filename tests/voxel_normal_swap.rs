@@ -93,7 +93,11 @@ fn dda_brick_faithful(patch: &GpuBrickPatch, bi: usize, ro: Vec3, rd: Vec3) -> O
 
     let gmin = wmin - Vec3::splat(csize);
     let t0 = t_enter.max(0.0);
-    let p_enter = ro + rd * (t0 + 1e-4);
+    // Entry nudge along the ray, RELATIVE to the cell size (`csize·5e-4` = the historical absolute `1e-4` at the
+    // old 0.2 m cell). An absolute `1e-4` is a 4× larger fraction of a 0.05 m cell after the flip, which tips the
+    // initial-voxel/`enter_axis` pick at a corner-grazing ray and produces spurious flat-face normal swaps in the
+    // crossed-axis diagnostic. Scaling it keeps the seed scale-equivalent (the codebase's relative-eps pattern).
+    let p_enter = ro + rd * (t0 + csize * 5.0e-4);
     let local = (p_enter - gmin) / csize;
     let mut vox = IVec3::new(local.x.floor() as i32, local.y.floor() as i32, local.z.floor() as i32);
     vox = vox.clamp(IVec3::ZERO, IVec3::splat(hedge - 1));
@@ -290,7 +294,11 @@ fn dda_brick_crossed_axis(patch: &GpuBrickPatch, bi: usize, ro: Vec3, rd: Vec3) 
 
     let gmin = wmin - Vec3::splat(csize);
     let t0 = t_enter.max(0.0);
-    let p_enter = ro + rd * (t0 + 1e-4);
+    // Entry nudge along the ray, RELATIVE to the cell size (`csize·5e-4` = the historical absolute `1e-4` at the
+    // old 0.2 m cell). An absolute `1e-4` is a 4× larger fraction of a 0.05 m cell after the flip, which tips the
+    // initial-voxel/`enter_axis` pick at a corner-grazing ray and produces spurious flat-face normal swaps in the
+    // crossed-axis diagnostic. Scaling it keeps the seed scale-equivalent (the codebase's relative-eps pattern).
+    let p_enter = ro + rd * (t0 + csize * 5.0e-4);
     let local = (p_enter - gmin) / csize;
     let mut vox = IVec3::new(local.x.floor() as i32, local.y.floor() as i32, local.z.floor() as i32);
     vox = vox.clamp(IVec3::ZERO, IVec3::splat(hedge - 1));
@@ -438,7 +446,7 @@ fn flat_face_normal_is_stable_across_camera_arc() {
     let map = build_cornell(&reg);
     let patch = pack_brickmap(&map, &reg);
 
-    let c = INTERIOR as f32 * 0.5 * VOXEL_SIZE; // interior centre per axis (≈4.8 m)
+    let c = INTERIOR as f32 * 0.5 * VOXEL_SIZE; // interior centre per axis (≈1.2 m at 0.05 m voxels)
     let target = Vec3::splat(c);
     let radius = 9.0f32;
     let eye_y = c + 1.5;
@@ -591,7 +599,7 @@ fn edge_voxel_normal_is_camera_independent() {
     map.insert(IVec3::ZERO, Brick::from_voxels(voxels));
     let patch = pack_brickmap(&map, &reg);
 
-    // Aim at the centre of the lip voxel's top face. Local (7,1,4) → world cell min = (7,1,4)·0.2.
+    // Aim at the centre of the lip voxel's top face. Local (7,1,4) → world cell min = (7,1,4)·VOXEL_SIZE.
     let target = Vec3::new(7.5, 2.0, 4.5) * VOXEL_SIZE;
     let mut normals = std::collections::BTreeSet::new();
     let mut samples = Vec::new();
@@ -644,8 +652,13 @@ fn diagnose_crossed_axis_residual_swaps() {
 
     let c = INTERIOR as f32 * 0.5 * VOXEL_SIZE;
     let target = Vec3::splat(c);
-    let radius = 9.0f32;
-    let eye_y = c + 1.5;
+    // Eye distance + height offset scale WITH the box (radius = 1.875·c, eye offset = 0.3125·c — the ratios at
+    // the old 9.6 m box). At the 0.05 m flip the box is 4× smaller, so a FIXED 9 m radius would put the eye far
+    // outside it (the box subtends a tiny angle, hits go grazing, and the crossed-axis heuristic trips a flat-
+    // face swap that does NOT occur when the box fills the frame). Brick-relative framing = identical ray
+    // geometry to the 0.2 m version this gate was tuned at.
+    let radius = 1.875 * c;
+    let eye_y = c + 0.3125 * c;
     let n = 64;
     let half_fov = 0.45f32;
     let arc_steps = 24;
@@ -873,7 +886,7 @@ fn fix_gradient_no_coplanar_disagreement() {
     let half_fov = 0.45f32;
     // A TRUE coplanar tie is two bricks committing the SAME surface position — Δt at FP scale, not a half
     // voxel (which catches genuinely-distinct surfaces at slightly different depths). Use a tight 1 mm
-    // window (≪ a 0.2 m voxel) so only real same-cell fights count, AND require the two hits resolve to the
+    // window (≪ a 0.05 m voxel) so only real same-cell fights count, AND require the two hits resolve to the
     // same WORLD voxel centre (the definitive "same surface" test).
     let tie = 1.0e-3;
     let mut ties = 0u32;

@@ -9,7 +9,7 @@
 //! production graph (the shipping `assets/worldgen/world.graph.ron`, falling back to the same
 //! `WorldGraph::default()` preset the engine boots with when the asset is absent), `load_biome_library_pub`,
 //! `BlockRegistry::from_biome_library` — and constructs a `ResidencyManager` with the SHIPPING
-//! `StreamingConfig` (radius 28 bricks, cap 60_000, 256 bricks/frame). Then it drives:
+//! `StreamingConfig` (the production Default — clip_half 160 bricks, cap 400_000, 256 bricks/frame). Then it drives:
 //!
 //!   * the INITIAL FILL: cold-stream the whole region from empty (`update` + repeated `drain_work` until the
 //!     queue empties), timing each stage and the per-brick voxelize cost;
@@ -109,9 +109,9 @@ fn worldgen_stack() -> (HeightLayer, adventure::sdf_render::worldgen::biome::Bio
     (layer, lib, registry, label)
 }
 
-/// The SHIPPING `StreamingConfig` the worldgen scene runs with (the `Default` — clip_half 8 bricks ⇒ a
-/// nested clipmap of `MAX_LOD+1` shells reaching ~820 m, cap 60_000 resident, 256 bricks/frame). The single
-/// SSOT knob the live path uses.
+/// The SHIPPING `StreamingConfig` the worldgen scene runs with (the `Default` — D1a: clip_half 160 bricks ⇒ a
+/// nested clipmap of `MAX_LOD+1` shells reaching 8192 m (64 m LOD0 reach), cap 400_000 resident (PROVISIONAL,
+/// pending the D1c benchmark), 256 bricks/frame). The single SSOT knob the live path uses.
 fn shipping_config() -> StreamingConfig {
     StreamingConfig::default()
 }

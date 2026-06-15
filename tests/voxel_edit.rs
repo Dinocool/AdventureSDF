@@ -32,7 +32,7 @@ fn solid(map: &BrickMap, v: IVec3) -> bool {
     map.voxel_is_solid(v)
 }
 
-/// Ground-truth world-grid DDA over 0.2 m voxels (independent of the production [`pick_voxel`]): returns the
+/// Ground-truth world-grid DDA over `VOXEL_SIZE` (0.05 m) voxels (independent of the production [`pick_voxel`]): returns the
 /// first solid voxel + its world-t along the ray. Mirrors the GPU shader's per-voxel stepping. Used to
 /// cross-check the production pick.
 fn cpu_first_solid(map: &BrickMap, ro: Vec3, rd: Vec3, t_max: f32) -> Option<(IVec3, f32)> {

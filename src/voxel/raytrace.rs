@@ -1202,9 +1202,9 @@ struct VoxelRtResources {
 /// descriptor-IDENTITY (no transform), so spatial grouping buys nothing — the band only partitions the BLAS
 /// REBUILD work. A changed slot's chunk is `slot / CHUNK_SLOTS`; its descriptor's `meta_base = chunk·CHUNK_SLOTS`
 /// and the shader resolves `metas[meta_base + primitive_index]` (Stage 2 pinned `primitive_index` is
-/// geometry-relative, so this lands on the global slot). K=8 brick-equivalent ⇒ 512 slots/band ⇒ ~118 bands at
-/// the 60k cap: a manageable TLAS instance count, a cheap 512-prim per-band build, and a delta typically touches
-/// 1–few bands.
+/// geometry-relative, so this lands on the global slot). K=8 brick-equivalent ⇒ 512 slots/band ⇒ ~782 bands at
+/// the D1a 400k cap (~118 at the old 60k): both a manageable TLAS instance count (far below the ~2^24 hardware
+/// instance limit), a cheap 512-prim per-band build, and a delta typically touches 1–few bands.
 const CHUNK_SLOTS: u32 = 512; // 8³ "bricks" worth of slots per chunk band
 
 /// One slot-band chunk's BLAS + its slot range in the global buffers (A3 Stage 3). The BLAS reads its band as a

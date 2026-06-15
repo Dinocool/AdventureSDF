@@ -86,14 +86,14 @@ pub fn halo_index(x: i32, y: i32, z: i32, lod: u32) -> usize {
 /// coarse brick by a relatively tinier fraction and risk re-opening the seam it exists to close. Making the
 /// grow proportional to the span bridges the FP slab-gap identically at every LOD and every voxel size (so it
 /// survives the Phase-D flip to 0.05 m, where an absolute `VOXEL_SIZE·1e-3` would quarter). `REL_EPS` is
-/// chosen so the LOD0/0.2 m grow EXACTLY equals the historical `VOXEL_SIZE · 1e-3` (`= brick_span(0)·REL_EPS`),
-/// so existing LOD0 renders are byte-identical.
+/// chosen so the LOD0 grow EXACTLY equals the historical `VOXEL_SIZE · 1e-3` (`= brick_span(0)·REL_EPS`,
+/// scale-independent), so LOD0 renders stay byte-identical across the flip.
 pub const BRICK_AABB_REL_EPS: f32 = 1.25e-4;
 
 /// The per-side BLAS-AABB grow (the seam-overlap fudge) for a brick at LOD `lod`, in world metres: a fixed
 /// FRACTION ([`BRICK_AABB_REL_EPS`]) of the brick's per-LOD world [`brick_span`]. SSOT shared by [`brick_aabb`]
 /// (the CPU AABB build) and the WGSL `brick_aabb_epsilon` (the in-shader slab grow) — the two MUST agree or
-/// the seam fix breaks. At LOD0/0.2 m this equals the historical absolute `VOXEL_SIZE · 1e-3`; at coarser LODs
+/// the seam fix breaks. At LOD0 this equals the historical absolute `VOXEL_SIZE · 1e-3`; at coarser LODs
 /// it grows `2^lod×` so the overlap stays the same FRACTION of the (wider) coarse brick.
 #[inline]
 pub fn brick_aabb_epsilon(lod: u32) -> f32 {
@@ -1557,8 +1557,8 @@ mod tests {
 
     /// A4.2 — the BLAS-AABB seam epsilon is RELATIVE-PER-LOD: a fixed fraction of the brick's per-LOD span, so
     /// it scales `2^lod×` with the (wider) coarse brick instead of staying an absolute world distance. The
-    /// LOD0/0.2 m grow is pinned EXACTLY to the historical `VOXEL_SIZE · 1e-3` (so existing LOD0 renders are
-    /// byte-identical), and each coarser LOD doubles it.
+    /// LOD0 grow is pinned EXACTLY to the historical `VOXEL_SIZE · 1e-3` (so existing LOD0 renders are
+    /// byte-identical across the flip), and each coarser LOD doubles it.
     #[test]
     fn brick_aabb_epsilon_is_relative_per_lod() {
         // LOD0 backward-compat: identical to the pre-A4.2 absolute constant.

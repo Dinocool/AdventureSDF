@@ -283,9 +283,14 @@ fn gpu_lighting_normals_and_shadows() {
 
     // Floor top is at world Y = S (one brick tall). The roof sits at by=4 (Y in [4S, 5S]).
     let floor_top = s;
+    // The down-probe must START IN THE GAP between the floor top (S) and the roof bottom (4S) so it hits the
+    // FLOOR, not the roof above it; the SHADOW ray then goes back UP and hits the roof. At the 0.05 m flip the
+    // gap shrank 4× (S = 0.4 m), so the legacy fixed `+2.0` m probe height now starts ABOVE the roof — derive
+    // the probe height from S to stay inside the gap (midway: 2.5·S, which is in [S, 4S] at any scale).
+    let probe_y = floor_top + 1.5 * s; // = 2.5·S, inside the floor-top..roof-bottom gap
 
     // --- 1. Normal of the floor top face: ray straight down onto the OPEN column (bx=2). ---
-    let lit_ground = Vec3::new(s * 2.5, floor_top + 2.0, s * 0.5);
+    let lit_ground = Vec3::new(s * 2.5, probe_y, s * 0.5);
     let lit = run_ray(lit_ground, Vec3::new(0.0, -1.0, 0.0));
     eprintln!("[lit_ground] hit={} id={} t={:.3} N={:?} shadowed={}", lit.hit, lit.block_id, lit.t, lit.normal, lit.shadowed);
     assert_eq!(lit.hit, 1, "lit-ground ray must hit the floor");
@@ -298,7 +303,7 @@ fn gpu_lighting_normals_and_shadows() {
     assert_eq!(lit.shadowed, 0, "open ground must be unshadowed (sun ray escapes to the sky)");
 
     // --- 2. Traced hard shadow: ray straight down onto the column UNDER the floating roof (bx=0). ---
-    let shadow_ground = Vec3::new(s * 0.5, floor_top + 2.0, s * 0.5);
+    let shadow_ground = Vec3::new(s * 0.5, probe_y, s * 0.5);
     let shadowed = run_ray(shadow_ground, Vec3::new(0.0, -1.0, 0.0));
     eprintln!(
         "[shadow_ground] hit={} id={} t={:.3} N={:?} shadowed={}",

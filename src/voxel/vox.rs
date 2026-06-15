@@ -9,7 +9,7 @@
 //! * a [`BlockRegistry`] from the `.vox` 256-entry palette — palette entry `i` (sRGB `u8` RGBA) becomes
 //!   `BlockId(i+1)` with the colour converted to LINEAR RGBA (matching every other registry colour), via
 //!   [`BlockRegistry::from_vox_palette`]; block `0` stays AIR.
-//! * a [`BrickMap`] of the SAME `8³`/0.2 m bricks the rest of the engine uses — each solid `.vox` voxel
+//! * a [`BrickMap`] of the SAME `8³`/0.05 m bricks the rest of the engine uses — each solid `.vox` voxel
 //!   writes its `BlockId` at the right brick coord + local voxel ([`voxel_index`]).
 //!
 //! ## Coordinate convention
@@ -49,7 +49,7 @@ struct PlacedVoxel {
 ///
 /// The palette becomes the registry (`BlockId(i+1)` ← palette entry `i`, sRGB→linear). Every solid voxel of
 /// every model is placed by its scene transform (Z-up→Y-up swapped), the assembled scene is anchored with
-/// its floor at `y = 0` and centred on X/Z, then written into the sparse `8³`/0.2 m bricks. Returns an error
+/// its floor at `y = 0` and centred on X/Z, then written into the sparse `8³`/0.05 m bricks. Returns an error
 /// if the file cannot be read or parsed (`dot_vox::load` yields a `String` error we wrap), or if it has no
 /// models. An all-empty model set yields an empty `BrickMap` (no solid voxels) but a populated registry.
 pub fn load_vox(path: impl AsRef<std::path::Path>) -> anyhow::Result<(BrickMap, BlockRegistry)> {

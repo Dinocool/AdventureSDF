@@ -151,7 +151,7 @@ fn pick_hits_first_solid_with_face() {
 
     // Ray from x = -2 m straight +X at the mid-height/depth of the brick. The brick's −X face is at world
     // x=0 → voxel 0. The first solid voxel is (0, vy, vz); the entry face is −X.
-    let mid = (BRICK_EDGE / 2) as f32 * VOXEL_SIZE; // ~0.8 m, inside the brick on Y/Z
+    let mid = (BRICK_EDGE / 2) as f32 * VOXEL_SIZE; // 0.2 m at 0.05 m voxels, inside the brick on Y/Z
     let origin = Vec3::new(-2.0, mid, mid);
     let hit = pick_voxel(&base, &e, origin, Vec3::X, 100.0).expect("ray must hit the wall");
     assert_eq!(hit.voxel.x, 0, "first solid voxel is the −X column at voxel x=0");
@@ -197,8 +197,11 @@ fn pick_hits_placed_voxel_in_empty_space() {
     // Place a single voxel at world voxel (10, 0, 0).
     e.place(IVec3::new(10, 0, 0), solid(4));
 
-    // Ray from x=-1 m straight +X at y,z inside that voxel's cell ([10,11)·0.2 = [2.0, 2.2) m → y,z ~0.1 m).
-    let origin = Vec3::new(-1.0, 0.1, 0.1);
+    // Ray from x=-1 m straight +X at y,z inside that voxel's cell. The placed voxel (10,0,0) occupies cell
+    // [0,1)·VOXEL_SIZE on Y and Z, so aim the ray at that cell's centre (0.5·VOXEL_SIZE) — derived from the
+    // const so it tracks the scale flip (at 0.2 m this was y,z≈0.1; at 0.05 m it is 0.025).
+    let cc = 0.5 * VOXEL_SIZE;
+    let origin = Vec3::new(-1.0, cc, cc);
     let hit = pick_voxel(&base, &e, origin, Vec3::X, 100.0).expect("must hit the placed voxel");
     assert_eq!(hit.voxel, IVec3::new(10, 0, 0));
     assert_eq!(hit.block, solid(4));
@@ -213,7 +216,7 @@ fn pick_top_face_from_above() {
     let base = solid_brick_map(IVec3::new(0, 0, 0), solid(1));
     let e = VoxelEdits::new();
     let mid = (BRICK_EDGE / 2) as f32 * VOXEL_SIZE;
-    let origin = Vec3::new(mid, 5.0, mid); // well above the 1.6 m-tall brick
+    let origin = Vec3::new(mid, 5.0, mid); // well above the 0.4 m-tall brick
     let hit = pick_voxel(&base, &e, origin, -Vec3::Y, 100.0).expect("downward ray hits the slab top");
     assert_eq!(hit.voxel.y, BRICK_EDGE - 1, "hits the topmost voxel row");
     assert_eq!(hit.normal, IVec3::new(0, 1, 0), "entry face is the +Y top face");

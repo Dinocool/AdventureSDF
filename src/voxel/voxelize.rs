@@ -257,9 +257,13 @@ mod tests {
         let wx = (cx as f64 + 0.5) * VOXEL_SIZE as f64;
         let wz = (cz as f64 + 0.5) * VOXEL_SIZE as f64;
         let h = layer.sample_world(wx, wz, SEED).height as f64;
-        let surf_voxel = (h / VOXEL_SIZE as f64).floor() as i32;
+        // The TOPMOST SOLID voxel: `voxel_block_at` samples the voxel CENTRE `(y+0.5)·VOXEL_SIZE`, so the
+        // highest solid voxel is the largest y with `(y+0.5)·v < h` ⇒ `y = floor(h/v - 0.5)`. (At the old
+        // 0.2 m a bare `floor(h/v)` happened to land solid; at 0.05 m it overshoots into the air voxel above —
+        // derive the topmost-solid index from the centre-sampling rule instead.)
+        let surf_voxel = (h / VOXEL_SIZE as f64 - 0.5).floor() as i32;
 
-        // Sample the surface block, a block ~2 m down (sub-surface), and ~10 m down (stone).
+        // Sample the surface block, a block ~2.5 m down (sub-surface), and ~10 m down (stone).
         let depth_voxels = |m: f64| surf_voxel - (m / VOXEL_SIZE as f64).round() as i32;
         let at_surface = voxel_block_at(IVec3::new(cx, depth_voxels(0.0), cz), &layer, &lib, &reg, SEED);
         let at_sub = voxel_block_at(IVec3::new(cx, depth_voxels(2.5), cz), &layer, &lib, &reg, SEED);
@@ -296,7 +300,7 @@ mod tests {
     fn coarse_lod_brick_is_in_place_mip() {
         let (lib, reg) = registry();
         let layer = test_layer();
-        // A LOD2 brick at coord (0, ?, 0): cell = 0.2·4 = 0.8 m, span = 1.6·4 = 6.4 m. Centre it on the
+        // A LOD2 brick at coord (0, ?, 0): cell = 0.05·4 = 0.2 m, span = 0.4·4 = 1.6 m. Centre it on the
         // surface Y band so it straddles the surface (non-trivial brick).
         let lod = 2u32;
         let cell = lod_voxel_size(lod) as f64;

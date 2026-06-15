@@ -65,7 +65,7 @@ fn scene_voxel(wv: IVec3) -> Option<BlockId> {
 }
 
 /// Build the synthetic static `BrickMap` from [`scene_voxel`] over its bounded extent — the stand-in for the
-/// loaded `sponza.vox` (a `BrickMap` of `0.2 m` voxels). Bounds chosen to cover the floor + column with slack.
+/// loaded `sponza.vox` (a `BrickMap` of `0.05 m` voxels). Bounds chosen to cover the floor + column with slack.
 fn static_scene_map() -> BrickMap {
     use std::collections::HashMap;
     let mut dense: HashMap<IVec3, Box<[BlockId; BRICK_VOXELS]>> = HashMap::new();

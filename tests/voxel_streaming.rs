@@ -94,11 +94,13 @@ fn coarse_lod_brick_is_in_place_mip() {
 
 #[test]
 fn camera_brick_coord_scales_with_lod() {
-    // World 5 m: LOD0 (span 1.6) → 3; LOD1 (3.2) → 1; LOD2 (6.4) → 0 — the per-level clipmap centres differ.
+    // World 5 m: LOD0 (span 0.4) → 12; LOD1 (0.8) → 6; LOD2 (1.6) → 3 — the per-level clipmap centres differ.
+    // Derived from `brick_span` (not hardcoded) so it tracks the VOXEL_SIZE flip.
     let w = [5.0_f32, 5.0, 5.0];
-    assert_eq!(camera_brick_coord_lod(w, 0), IVec3::splat(3));
-    assert_eq!(camera_brick_coord_lod(w, 1), IVec3::splat(1));
-    assert_eq!(camera_brick_coord_lod(w, 2), IVec3::splat(0));
+    let expect = |lod: u32| IVec3::splat((5.0 / brick_span(lod)).floor() as i32);
+    assert_eq!(camera_brick_coord_lod(w, 0), expect(0));
+    assert_eq!(camera_brick_coord_lod(w, 1), expect(1));
+    assert_eq!(camera_brick_coord_lod(w, 2), expect(2));
     assert_eq!(camera_brick_coord(w), camera_brick_coord_lod(w, 0));
 }
 
@@ -110,10 +112,13 @@ fn desired_clipmap_all_levels_and_view_radius() {
     for lod in 0..=MAX_LOD {
         assert!(d.keys().any(|k| k.lod == lod), "level {lod} present");
     }
-    // The total view radius is clip_half · brick_span(MAX_LOD) — a huge reach at bounded VRAM.
+    // The total view radius is clip_half · brick_span(MAX_LOD) — a huge reach at bounded VRAM. At this test's
+    // explicit clip_half=8 + the D1a 0.05 m flip that is 8·0.4·128 = 409.6 m (the production Default clip_half
+    // 160 reaches 8192 m). Threshold derived from the consts so it tracks any future scale change.
     let view = region_half_extent_m(&cfg);
     assert!((view - cfg.clip_half_bricks as f32 * brick_span(MAX_LOD)).abs() < 1e-2);
-    assert!(view > 1500.0, "clipmap view radius is >1.5 km at MAX_LOD=7 (got {view:.0} m)");
+    let expect_view = cfg.clip_half_bricks as f32 * brick_span(MAX_LOD); // 409.6 m at clip_half 8, 0.05 m
+    assert!(view >= expect_view - 1e-2, "clipmap view radius == clip_half·brick_span(MAX_LOD) (got {view:.0} m)");
 }
 
 #[test]
@@ -338,7 +343,7 @@ fn per_move_churn_is_o_shell_not_o_region() {
     }
     mgr.take_dirty();
 
-    // Nudge ONE LOD0 brick in +X (one brick_span(0) = 1.6 m). Count what enters (pending) + what drops.
+    // Nudge ONE LOD0 brick in +X (one brick_span(0) = 0.4 m). Count what enters (pending) + what drops.
     let span0 = brick_span(0);
     let cam1 = [cam0[0] + span0, surf, cam0[2]];
     let dropped = mgr.update(cam1, &cfg, &src);

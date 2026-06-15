@@ -15,7 +15,7 @@
 //! * [`WorldgenSource`] wraps `(layer, lib, seed)` and is a thin pass-through to [`super::voxelize::
 //!   voxelize_brick`] — the worldgen brick SSOT, NOT duplicated here. So worldgen residency is bit-identical
 //!   to before the refactor.
-//! * [`StaticVoxSource`] wraps a loaded fine [`BrickMap`] (the `0.2 m` Sponza voxels) and produces the same
+//! * [`StaticVoxSource`] wraps a loaded fine [`BrickMap`] (the `0.05 m` Sponza voxels) and produces the same
 //!   `(coord, lod)` brick the worldgen path would. To keep [`BrickSource::brick`] BOUNDED (sub-ms) at EVERY
 //!   LOD — the coarse footprint of a big asset like Sponza is `(2^L)³` fine voxels per coarse cell, so a
 //!   per-`brick()` brute scan was `O(512 · 8^L)` (seconds at LOD≥5) — `new` precomputes a MIP PYRAMID ONCE:
@@ -180,7 +180,7 @@ impl BrickSource for WorldgenSource<'_> {
 }
 
 /// The STATIC `.vox` brick source: produces a `(coord, lod)` brick from a loaded fine [`BrickMap`] (the
-/// `0.2 m` baked Sponza voxels, all at the LOD0 grid). Reproduces what [`super::voxelize::voxelize_brick`]
+/// `0.05 m` baked Sponza voxels, all at the LOD0 grid). Reproduces what [`super::voxelize::voxelize_brick`]
 /// does for worldgen, but reads the stored voxels (via a precomputed MIP PYRAMID) instead of sampling a
 /// surface:
 ///
@@ -660,8 +660,10 @@ mod tests {
     /// cost is paid ONCE, off the per-frame path; it is not what this guards.)
     #[test]
     fn coarse_static_brick_is_sub_millisecond() {
-        // A Sponza-scale fine map: a ~120 m × ~50 m × ~75 m solid-ish slab in 0.2 m voxels ⇒ ~600×250×370
-        // world voxels. Build a coarse but dense-enough box (a floor slab + walls) so the coarse footprints
+        // A Sponza-scale fine map: a ~600×256×370 voxel solid-ish slab (the test is in VOXEL units, so it is
+        // scale-invariant; at 0.05 m that is ~30 m × ~13 m × ~18 m, at the old 0.2 m it was ~120 m × ~50 m ×
+        // ~75 m — the voxel COUNT, not the world size, is what stresses the coarse extract).
+        // Build a coarse but dense-enough box (a floor slab + walls) so the coarse footprints
         // genuinely aggregate many fine voxels (the worst case for the OLD brute scan).
         let lo = IVec3::new(0, 0, 0);
         let hi = IVec3::new(600, 256, 370);
