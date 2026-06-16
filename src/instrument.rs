@@ -120,6 +120,16 @@ pub fn drain_gpu() -> HashMap<String, f32> {
     std::mem::take(&mut *gpu_sink().lock().unwrap())
 }
 
+/// A non-draining CLONE of the current per-tag GPU milliseconds — for a logger (e.g. the bench harness) that
+/// wants to read the latest per-pass times WITHOUT competing with the editor profiler's [`drain_gpu`]. Empty
+/// while disabled.
+pub fn peek_gpu() -> HashMap<String, f32> {
+    if !enabled() {
+        return HashMap::new();
+    }
+    gpu_sink().lock().unwrap().clone()
+}
+
 /// Cache of leaked tag strings so a dynamically-built tag (e.g. a panel title) can be used
 /// with [`span`], which needs a `&'static str`. One small leak per unique string, ever.
 static INTERNED: OnceLock<Mutex<HashMap<String, &'static str>>> = OnceLock::new();

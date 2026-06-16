@@ -63,6 +63,20 @@ pub fn install_bistro_bench(app: &mut App) {
     // Boot the GALLERY scene; with ADVENTURE_BENCH_BISTRO set, the streaming path loads Bistro alone at origin.
     app.insert_resource(crate::voxel::VoxelScene::Gallery);
 
+    // Turn on the lightweight CPU+GPU span instrumentation so the render world's per-pass GPU timestamp
+    // read-back (`instrument::record_gpu`) populates — `bench_diag` logs a non-draining peek each tick.
+    crate::instrument::set_enabled(true);
+
+    // ADVENTURE_CLIP_HALF=N overrides the clipmap half-extent (bricks). The default 160 ⇒ a 64 m LOD0 ring,
+    // which over a dense scene like Bistro means ~300k resident bricks (0.05 m detail 64 m out is invisible) and
+    // perpetual streaming churn. A smaller ring converges far faster + cheaper. Inserted before Startup so
+    // `init_voxel_rt_streaming` picks it up as the cfg override (the SSOT streaming knob).
+    if let Ok(n) = std::env::var("ADVENTURE_CLIP_HALF").unwrap_or_default().trim().parse::<i32>() {
+        let cfg = crate::voxel::streaming::StreamingConfig { clip_half_bricks: n, ..default() };
+        info!("bench: ADVENTURE_CLIP_HALF override → clip_half_bricks={n}");
+        app.insert_resource(cfg);
+    }
+
     let exit_at = std::env::var("ADVENTURE_EXIT_AFTER_SECS")
         .ok()
         .and_then(|s| s.parse::<f32>().ok());
@@ -91,8 +105,13 @@ pub fn install_bistro_bench(app: &mut App) {
     app.add_systems(Update, (sample_fps, fire_screenshot, report_at_exit, bench_diag));
     // ADVENTURE_DEBUG_VIEW=N forces the shader debug-view selector each frame (0=lit, 1=normals, 2=depth,
     // 3=albedo, 4=AO, 5=GI-only, 6=face-orient, 7=LOD). Albedo/normals bypass lighting — a raw geometry probe.
-    if std::env::var("ADVENTURE_DEBUG_VIEW").is_ok() {
-        app.add_systems(Update, force_debug_view);
+    // ADVENTURE_GI_RAYS=N forces the ReSTIR initial-candidate count (the p1 cost driver). Either triggers the
+    // per-frame lighting-override system.
+    if std::env::var("ADVENTURE_DEBUG_VIEW").is_ok()
+        || std::env::var("ADVENTURE_GI_RAYS").is_ok()
+        || std::env::var("ADVENTURE_WC").is_ok()
+    {
+        app.add_systems(Update, force_lighting_overrides);
     }
 }
 
@@ -129,6 +148,15 @@ fn bench_diag(
         "bench-diag t={:.1} cam=({:.1},{:.1},{:.1}) fwd=({:.2},{:.2},{:.2}) patch_gen={} resident_bricks={} {}",
         now, pos.x, pos.y, pos.z, fwd.x, fwd.y, fwd.z, pgen, resident, aabb_str
     );
+    // Per-pass GPU times (ms), populated by the render-world timestamp read-back. Sorted desc so the dominant
+    // pass is first. Only the world-cache passes are timestamped today; the rest show up once instrumented.
+    let mut gpu: Vec<(String, f32)> = crate::instrument::peek_gpu().into_iter().collect();
+    if !gpu.is_empty() {
+        gpu.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        let total: f32 = gpu.iter().map(|(_, ms)| *ms).sum();
+        let parts: Vec<String> = gpu.iter().map(|(k, ms)| format!("{k}={ms:.2}")).collect();
+        info!("bench-gpu t={:.1} sum={total:.2}ms | {}", now, parts.join(" "));
+    }
 }
 
 /// Parse `ADVENTURE_CAM="tx,ty,tz,dist,yaw,pitch"` into an [`SdfOrbitCamera`]. Returns `None` if unset or the
@@ -142,11 +170,21 @@ fn parse_adventure_cam() -> Option<(Vec3, Vec3)> {
     Some((Vec3::new(v[0], v[1], v[2]), Vec3::new(v[3], v[4], v[5])))
 }
 
-/// Force the shader debug-view selector from `ADVENTURE_DEBUG_VIEW` each frame (overrides the editor combo) so
-/// the bench can probe raw geometry (albedo/normals) independent of lighting/exposure.
-fn force_debug_view(mut lighting: ResMut<crate::voxel::raytrace::VoxelRtLighting>) {
+/// Force lighting-uniform overrides from env each frame (overrides the editor/preset values), so the bench can
+/// sweep knobs without rebuilding presets: `ADVENTURE_DEBUG_VIEW` (the debug-view selector — albedo/normals
+/// bypass lighting) and `ADVENTURE_GI_RAYS` (the ReSTIR initial-candidate count, the p1 cost driver).
+fn force_lighting_overrides(
+    mut lighting: ResMut<crate::voxel::raytrace::VoxelRtLighting>,
+    mut wc: ResMut<crate::voxel::raytrace::WorldCacheSettings>,
+) {
     if let Ok(v) = std::env::var("ADVENTURE_DEBUG_VIEW").unwrap_or_default().trim().parse::<u32>() {
         lighting.data.debug_view = v;
+    }
+    if let Ok(v) = std::env::var("ADVENTURE_GI_RAYS").unwrap_or_default().trim().parse::<u32>() {
+        lighting.data.gi_rays = v;
+    }
+    if let Ok(v) = std::env::var("ADVENTURE_WC").unwrap_or_default().trim().parse::<u32>() {
+        wc.data.use_world_cache = v;
     }
 }
 
