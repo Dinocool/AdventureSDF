@@ -1195,6 +1195,188 @@ fn bench_per_chunk_blas_rebuild_vs_monolithic() {
 }
 
 // ============================================================================================
+//  (5a) BLAS REFIT vs REBUILD per move — the realized `vox_blas_delta` win (in-place HAL Update).
+// ============================================================================================
+
+/// **The BLAS-refit deliverable — per-move in-place REFIT vs a full per-chunk REBUILD.** Warms the shipping
+/// clipmap, packs it into `CHUNK_SLOTS`-slot band BLASes (the production A3 layout), then times — over the same
+/// dirty chunks a typical streamed move touches — TWO ways to update the BLAS after the AABB band was rewritten:
+///
+///   * REBUILD — `update_mode = Build` (a fresh full BVH build of the dirty chunks each move); this is the cost
+///     before this change.
+///   * REFIT  — `update_mode = PreferUpdate` over an already-built handle ⇒ wgpu-core emits a HAL `Update`
+///     (`VK_BUILD_ACCELERATION_STRUCTURE_MODE_UPDATE_KHR`, src == dst): an in-place BVH refit. The fixed-cap pool
+///     keeps each chunk's primitive count constant, so the refit is always valid.
+///
+/// Also reports the AMORTIZED per-move cost of the live cadence: `(K refits + 1 rebuild) / (K+1)` with
+/// `K = BLAS_REFITS_BEFORE_REBUILD`, the realized steady-state `vox_blas_delta` cost the live path pays. Needs a
+/// ray-query device + `TMP/TEMP=D:\tmp_test`.
+#[test]
+#[ignore = "GPU perf harness; needs ray-query device + TMP=D:\\tmp_test; run with --ignored --nocapture"]
+fn bench_blas_refit_vs_rebuild_per_move() {
+    let Some((device, queue)) = common::headless_ray_query_device() else {
+        eprintln!("[skip] no ray-query device — BLAS refit-vs-rebuild timing skipped");
+        return;
+    };
+    // Mirror src/voxel/raytrace.rs::CHUNK_SLOTS and BLAS_REFITS_BEFORE_REBUILD (the production knobs).
+    const CHUNK_SLOTS: u32 = 512;
+    const K: u32 = 8; // BLAS_REFITS_BEFORE_REBUILD
+
+    let (layer, lib, registry, label) = worldgen_stack();
+    // A REPRESENTATIVE clipmap (not the 400k-cap shipping monster) so the warm completes quickly while still
+    // exercising a real multi-thousand-brick surface residency — the SAME sizing the live-cost bench uses. The
+    // per-move BLAS refit/rebuild cost depends on the DIRTY band size (CHUNK_SLOTS prims), not the total resident
+    // count, so a representative warm gives the same per-move numbers far faster.
+    let cfg = StreamingConfig { clip_half_bricks: 8, max_resident_bricks: 60_000, max_bricks_per_frame: 8192 };
+    let cam = origin_surface_cam(&layer);
+    let src = WorldgenSource::new(&layer, &lib, SEED);
+
+    let mut mgr = ResidencyManager::new();
+    mgr.update(cam, &cfg, &src);
+    let mut guard = 0;
+    while mgr.pending() > 0 {
+        mgr.drain_work(&cfg, &layer, &lib, &registry, SEED);
+        guard += 1;
+        assert!(guard < 20000);
+    }
+    let entries = mgr.resident_entries();
+    let patch = pack_resident_set(&entries, &registry);
+    let n = patch.brick_count() as u32;
+    assert!(n > 0, "no resident bricks");
+    let stride = core::mem::size_of::<GpuBrickAabb>() as wgpu::BufferAddress;
+
+    // The fixed-cap AABB arena (COPY_DST so each "move" can rewrite the dirty band before the refit).
+    let aabb_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("refit_perf_aabbs"),
+        contents: bytemuck::cast_slice(&patch.aabbs),
+        usage: wgpu::BufferUsages::BLAS_INPUT | wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+    });
+
+    let chunk_count = n.div_ceil(CHUNK_SLOTS).max(1);
+    // The dirty chunks a typical brick-step move touches (1–2 bands; model 2 straddling a boundary).
+    let n_dirty = 2u32.min(chunk_count);
+    let dirty_meta: Vec<(u32, u32)> = (0..n_dirty)
+        .map(|c| {
+            let slot_base = c * CHUNK_SLOTS;
+            let prim_count = (n - slot_base).clamp(1, CHUNK_SLOTS);
+            (slot_base, prim_count)
+        })
+        .collect();
+
+    // A helper: rewrite the dirty bands' AABBs (the per-move "the AABB buffer already changed" precondition) by
+    // nudging each by a tiny epsilon — a genuine value change, so the refit does real work (not a no-op Update).
+    let mut nudge = 0.0f32;
+    let rewrite_dirty_aabbs = |nudge: f32| {
+        for &(slot_base, prim_count) in &dirty_meta {
+            let mut band: Vec<GpuBrickAabb> = Vec::with_capacity(prim_count as usize);
+            for s in 0..prim_count {
+                let mut a = patch.aabbs[(slot_base + s) as usize];
+                a.min[0] += nudge;
+                a.max[0] += nudge;
+                band.push(a);
+            }
+            queue.write_buffer(&aabb_buf, slot_base as u64 * stride, bytemuck::cast_slice(&band));
+        }
+    };
+
+    // Build (once) the dirty-chunk BLASes for EACH arm under its own update_mode. The REFIT arm needs an already-
+    // built handle (so its subsequent builds are Updates); the REBUILD arm rebuilds a Build-mode handle each move.
+    let make_band_blas = |slot_base: u32, prim_count: u32, mode: wgpu::AccelerationStructureUpdateMode| {
+        let flags = wgpu::AccelerationStructureFlags::PREFER_FAST_TRACE
+            | wgpu::AccelerationStructureFlags::ALLOW_UPDATE;
+        let blas = device.create_blas(
+            &wgpu::CreateBlasDescriptor { label: Some("refit_perf_band"), flags, update_mode: mode },
+            wgpu::BlasGeometrySizeDescriptors::AABBs {
+                descriptors: vec![wgpu::BlasAABBGeometrySizeDescriptor {
+                    primitive_count: prim_count,
+                    flags: wgpu::AccelerationStructureGeometryFlags::OPAQUE,
+                }],
+            },
+        );
+        let _ = slot_base;
+        blas
+    };
+    let build_bands = |blases: &[wgpu::Blas]| {
+        let sizes: Vec<_> = dirty_meta
+            .iter()
+            .map(|&(_, prim_count)| wgpu::BlasAABBGeometrySizeDescriptor {
+                primitive_count: prim_count,
+                flags: wgpu::AccelerationStructureGeometryFlags::OPAQUE,
+            })
+            .collect();
+        let geos: Vec<_> = blases
+            .iter()
+            .zip(dirty_meta.iter())
+            .zip(sizes.iter())
+            .map(|((blas, &(slot_base, _)), size)| wgpu::BlasBuildEntry {
+                blas,
+                geometry: wgpu::BlasGeometries::AabbGeometries(vec![wgpu::BlasAabbGeometry {
+                    size,
+                    stride,
+                    aabb_buffer: &aabb_buf,
+                    primitive_offset: slot_base * stride as u32,
+                }]),
+            })
+            .collect();
+        let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("refit_perf_build") });
+        enc.build_acceleration_structures(geos.iter(), core::iter::empty::<&wgpu::Tlas>());
+        queue.submit(core::iter::once(enc.finish()));
+        device.poll(wgpu::PollType::wait_indefinitely()).expect("poll");
+    };
+
+    const ITERS: u32 = 16;
+
+    // (A) REBUILD per move: a fresh Build-mode handle each move (cold-build the dirty bands every time).
+    let mut rebuild_times = Vec::new();
+    for _ in 0..ITERS {
+        nudge += 0.001;
+        rewrite_dirty_aabbs(nudge);
+        let blases: Vec<_> = dirty_meta
+            .iter()
+            .map(|&(sb, pc)| make_band_blas(sb, pc, wgpu::AccelerationStructureUpdateMode::Build))
+            .collect();
+        let t = Instant::now();
+        build_bands(&blases);
+        rebuild_times.push(t.elapsed());
+    }
+
+    // (B) REFIT per move: ONE PreferUpdate handle per dirty band, built once (cold) then UPDATED each move.
+    let refit_blases: Vec<_> = dirty_meta
+        .iter()
+        .map(|&(sb, pc)| make_band_blas(sb, pc, wgpu::AccelerationStructureUpdateMode::PreferUpdate))
+        .collect();
+    // First build (wgpu-core deduces Build via built_index) — untimed warm.
+    rewrite_dirty_aabbs(nudge);
+    build_bands(&refit_blases);
+    let mut refit_times = Vec::new();
+    for _ in 0..ITERS {
+        nudge += 0.001;
+        rewrite_dirty_aabbs(nudge);
+        let t = Instant::now();
+        build_bands(&refit_blases); // already built ⇒ wgpu-core emits a HAL Update (in-place refit)
+        refit_times.push(t.elapsed());
+    }
+
+    let (rb_mean, _r50, rb_p95, rb_max) = stats_ms(&rebuild_times);
+    let (rf_mean, _f50, rf_p95, rf_max) = stats_ms(&refit_times);
+    // Amortized live cadence: K refits + 1 rebuild per (K+1) moves.
+    let amortized = (K as f64 * rf_mean + rb_mean) / (K as f64 + 1.0);
+
+    println!("\n========== BLAS REFIT vs REBUILD per move — graph={label} ==========");
+    println!("resident bricks        : {n}  (chunks={chunk_count} of {CHUNK_SLOTS} slots; {n_dirty} dirty/move)");
+    println!("REBUILD (Build)        : mean {rb_mean:.3} p95 {rb_p95:.3} max {rb_max:.3} ms  (full BVH build of the dirty bands)");
+    println!("REFIT   (PreferUpdate) : mean {rf_mean:.3} p95 {rf_p95:.3} max {rf_max:.3} ms  (in-place HAL Update)");
+    if rf_mean > 0.0 {
+        println!("SPEEDUP (rebuild/refit): {:.2}×  (the per-move BLAS cost when refitting instead of rebuilding)", rb_mean / rf_mean);
+    }
+    println!("AMORTIZED (K={K} cadence): {amortized:.3} ms/move  ({K} refits + 1 rebuild per {} moves) — the realized live vox_blas_delta cost", K + 1);
+    println!("===============================================================================");
+    // The realized win: a refit must be cheaper than a full rebuild (else the cadence is pointless).
+    assert!(rf_mean <= rb_mean, "refit ({rf_mean:.3} ms) must not exceed rebuild ({rb_mean:.3} ms)");
+    let _ = (&aabb_buf,);
+}
+
+// ============================================================================================
 //  (5b) INCREMENTAL RE-PACK — the O(changed) per-move re-pack vs the O(resident) full pack (A/B).
 // ============================================================================================
 
