@@ -662,16 +662,67 @@ fn stream_writer_lods_matches_encode_vxo() {
     // Feed the BASE LOD0 regions in (z,y,x) order (matches `encode_vxo`'s BRIK layout).
     feed_regions_in_order(&map, k, |rc, bricks| w.add_region(rc, bricks).expect("add_region"));
 
-    // Feed each COARSE level's regions in (z,y,x) order (matches `build_lods_body`'s per-level BRIK_L layout).
+    // Feed each COARSE level's regions through the SHARED `drive_coarse_lods` ordering SSOT — the SAME loop the
+    // full-RAM `build_lods_body` drives. Routing the STREAMING sink through `drive_coarse_lods` (not a local test
+    // helper) is what proves the SSOT yields byte-identical LODS on both writers (the Stage-0 gate), so this test
+    // exercises `drive_coarse_lods` on BOTH sinks.
     let pyramid = build_coarse_pyramid(&map);
-    for (i, level_map) in pyramid.iter().enumerate() {
-        let lod = (i + 1) as u32;
-        feed_regions_in_order(level_map, k, |rc, bricks| w.add_lod_region(lod, rc, bricks).expect("add_lod_region"));
-    }
+    super::writer::drive_coarse_lods(&pyramid, k, |lod, rc, bricks| w.add_lod_region(lod, rc, bricks))
+        .expect("drive_coarse_lods (streaming)");
     w.finish(&out).expect("finish stream write");
 
     let got = std::fs::read(&out).expect("read streamed LODS .vxo");
     assert_eq!(got, want, "streamed LODS .vxo must be byte-identical to encode_vxo");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// **Stage 0 — `max_lod == MAX_LOD` invariant + read-side clamp-no-op (Stage-2 reviewer finding).** For a baked
+/// NON-EMPTY asset (whether via the full-RAM `encode_vxo` or the bounded-RAM `VxoStreamWriter` routed through the
+/// shared `drive_coarse_lods` SSOT) `HEAD.max_lod` MUST equal `MAX_LOD`, so the read-side `coarse_level` clamp
+/// (`lod.min(max_lod)`) is a GUARANTEED no-op for every `lod ∈ 1..=MAX_LOD` — never diverging from
+/// `StaticVoxSource::level`, which always spans the full pyramid depth. We assert it on BOTH writer paths.
+#[test]
+fn baked_asset_max_lod_is_max_lod_and_clamp_is_noop() {
+    use crate::voxel::brickmap::MAX_LOD;
+
+    let map = filled_box_map(4);
+    let registry = registry();
+    let params = VxoHeadParams { name: "max_lod_invariant".into(), ..Default::default() };
+
+    // Path A: full-RAM `encode_vxo`.
+    let bytes = encode_vxo(&map, &registry, &params, VxoCompression::Store).expect("encode_vxo WITH LODS");
+    let file = VxoFile::parse(&bytes).expect("parse the LODS-baked .vxo");
+    assert!(file.has_lods(), "a non-empty baked asset carries a LODS pyramid");
+    assert_eq!(file.max_lod(), MAX_LOD, "encode_vxo: a baked non-empty asset has HEAD.max_lod == MAX_LOD");
+
+    // Path B: the streaming writer, coarse bake driven through the shared `drive_coarse_lods` SSOT.
+    let k = params.region_edge_bricks as i32;
+    let dir = std::env::temp_dir().join(format!("vxo_max_lod_inv_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("scratch dir");
+    let scratch = dir.join("brik.tmp");
+    let out = dir.join("max_lod.vxo");
+    let mut w = super::writer::VxoStreamWriter::new(params.clone(), &registry, VxoCompression::Store, &scratch)
+        .expect("open stream writer");
+    feed_regions_in_order(&map, k, |rc, bricks| w.add_region(rc, bricks).expect("add_region"));
+    let pyramid = build_coarse_pyramid(&map);
+    super::writer::drive_coarse_lods(&pyramid, k, |lod, rc, bricks| w.add_lod_region(lod, rc, bricks))
+        .expect("drive_coarse_lods");
+    w.finish(&out).expect("finish stream write");
+    let stream_file = VxoFile::parse(&std::fs::read(&out).expect("read streamed .vxo")).expect("parse streamed");
+    assert_eq!(
+        stream_file.max_lod(),
+        MAX_LOD,
+        "VxoStreamWriter: a baked non-empty asset has HEAD.max_lod == MAX_LOD"
+    );
+
+    // The read-side clamp `lod.min(max_lod)` is a GUARANTEED no-op for every requested coarse level — i.e. no
+    // coarse request in 1..=MAX_LOD is ever served the WRONG (collapsed) level grid (the StaticVoxSource parity).
+    for f in [&file, &stream_file] {
+        let max_lod = f.max_lod();
+        for lod in 1..=MAX_LOD {
+            assert_eq!(lod.min(max_lod), lod, "clamp must be a no-op for lod {lod} (max_lod {max_lod})");
+        }
+    }
     let _ = std::fs::remove_dir_all(&dir);
 }
 

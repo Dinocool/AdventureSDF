@@ -399,6 +399,16 @@ fn assemble_vxo_streaming(
             coords.iter().map(|&c| (c, map.get(c).expect("brick present"))).collect();
         writer.add_region(*rc, &region_bricks)?;
     }
+
+    // Bake the coarse-LOD pyramid (the LODS chunk) from the still-resident base map, driven through the SHARED
+    // `drive_coarse_lods` ordering SSOT so the tiled path's LODS bytes are byte-identical to the full-RAM
+    // `encode_vxo`/`build_lods_body` path. This is the Stage-0 BOUNDED (resident-map) producer — Stages 1-3 later
+    // SWAP it for a disk-spill / windowed-coarse producer feeding the SAME `add_lod_region` sink (no format/reader
+    // change). `build_coarse_pyramid` runs the full pyramid to MAX_LOD for a non-empty map, so `finish` satisfies
+    // the `max_lod == MAX_LOD` invariant by construction.
+    let pyramid = adventure::voxel::vxo::build_coarse_pyramid(&map);
+    adventure::voxel::vxo::drive_coarse_lods(&pyramid, k, |lod, rc, bricks| writer.add_lod_region(lod, rc, bricks))?;
+
     writer.finish(out_path)?;
     Ok(())
 }

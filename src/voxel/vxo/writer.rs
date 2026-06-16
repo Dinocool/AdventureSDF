@@ -205,7 +205,7 @@ pub fn encode_vxo(
 /// a baked coarse brick is BIT-IDENTICAL to a [`super::source::VxoSource`] demand-synthesized one (one reducer,
 /// one octant layout). Mirrors `StaticVoxSource::new`'s pyramid: stop at the first EMPTY level, cap at
 /// [`MAX_LOD`]. Returns a `Vec` of length `max_lod` (empty when LOD0 is empty — no LODS for an empty asset).
-pub(crate) fn build_coarse_pyramid(map: &BrickMap) -> Vec<BrickMap> {
+pub fn build_coarse_pyramid(map: &BrickMap) -> Vec<BrickMap> {
     let mut pyramid: Vec<BrickMap> = Vec::new();
     if map.is_empty() {
         return pyramid;
@@ -226,20 +226,26 @@ pub(crate) fn build_coarse_pyramid(map: &BrickMap) -> Vec<BrickMap> {
     pyramid
 }
 
-/// Assemble the `LODS` chunk body (`VXO_FORMAT.md` §B1.7) from the coarse `pyramid` (`pyramid[i]` = LOD `i+1`).
-/// Layout: [`VxoLodsHeader`] + `[VxoLodLevel; level_count]` table, then per level `L` (at the recorded
-/// `bidx_off`/`brik_off`) its `BIDX_L` (`[VxoRegionDirEntry]` sorted by `(z,y,x)`, `brik_offset` LEVEL-LOCAL)
-/// then `BRIK_L` (the concatenated level-`L` region bodies, each baked by the lod-parametrized
-/// [`encode_region_bricks`]). Every sub-section is padded to a 16-multiple so tables stay aligned. Each level
-/// buckets onto the COARSE grid via `region_of_brick(coarse_coord, k)` (same `K` for all levels in v1).
-fn build_lods_body(pyramid: &[BrickMap], ki: i32, comp: VxoCompression) -> anyhow::Result<Vec<u8>> {
-    let level_count = pyramid.len() as u32;
-    // 1. Per level: bucket into coarse regions, encode each region body, build the level-local BIDX_L + BRIK_L.
-    struct LevelBlobs {
-        bidx: Vec<VxoRegionDirEntry>,
-        brik: Vec<u8>,
-    }
-    let mut levels: Vec<LevelBlobs> = Vec::with_capacity(pyramid.len());
+/// The SHARED coarse-LOD bake ORDERING SSOT (`VXO_FORMAT.md` §B1.7) — the ONE region-bucket + region/intra-region
+/// `(z,y,x)` sort loop that BOTH `.vxo` writers drive their coarse bake through, so the on-disk LODS bytes are
+/// byte-identical regardless of which path produced them (the full-RAM [`build_lods_body`] vs. the bounded-RAM
+/// [`VxoStreamWriter::add_lod_region`] tiled path). It does ONLY ordering/bucketing — it NEVER touches the
+/// downsample reducer: the coarse bricks come pre-built in `pyramid` (via [`build_coarse_pyramid`] →
+/// `downsample_brickmap` → `downsample_children`), and this just decides the EMIT order.
+///
+/// For each level `L ∈ 1..=pyramid.len()` (`pyramid[i]` = LOD `i+1`), in level order, it buckets the level's
+/// bricks onto the COARSE grid via `region_of_brick(coord, ki)` (same `K` for all levels in v1), sorts the
+/// regions by `(z, y, x)`, sorts each region's bricks by `(z, y, x)` (the [`encode_region_bricks`] contract),
+/// and calls `emit(lod, region_coord, sorted_bricks)` once per non-empty region. `emit` does the actual
+/// encode/STORE-zstd + BIDX_L/BRIK_L accumulation (full-RAM path) or `add_lod_region` (streaming path).
+///
+/// `pub` + re-exported from `vxo::mod` so `examples/voxelize_scene.rs` (an external crate) can drive the tiled
+/// path's coarse bake through the identical ordering.
+pub fn drive_coarse_lods(
+    pyramid: &[BrickMap],
+    ki: i32,
+    mut emit: impl FnMut(u32, IVec3, &[(IVec3, &Brick)]) -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
     for (i, lmap) in pyramid.iter().enumerate() {
         let lod = (i + 1) as u32;
         let mut regions: FxHashMap<IVec3, Vec<IVec3>> = FxHashMap::default();
@@ -248,41 +254,69 @@ fn build_lods_body(pyramid: &[BrickMap], ki: i32, comp: VxoCompression) -> anyho
         }
         let mut region_coords: Vec<IVec3> = regions.keys().copied().collect();
         region_coords.sort_by_key(|c| (c.z, c.y, c.x));
-
-        let mut brik: Vec<u8> = Vec::new();
-        let mut bidx: Vec<VxoRegionDirEntry> = Vec::with_capacity(region_coords.len());
         for rc in &region_coords {
             let mut coords = regions.remove(rc).expect("region present");
             coords.sort_by_key(|c| (c.z, c.y, c.x));
-            let raw = encode_region(*rc, &coords, lmap, lod)?;
-            anyhow::ensure!(raw.len() as u64 <= u32::MAX as u64, "LOD{lod} region {rc:?} body exceeds u32 length");
-            let raw_len = raw.len() as u32;
-            let stored = match comp {
-                VxoCompression::Store => raw,
-                VxoCompression::Zstd(level) => zstd_compress(&raw, level)?,
-            };
-            let comp_len = stored.len() as u32;
-            let offset = brik.len() as u64; // LEVEL-LOCAL offset within this level's BRIK_L blob
-            brik.extend_from_slice(&stored);
-            let compression = match comp {
-                VxoCompression::Store => VXO_REGION_STORE,
-                VxoCompression::Zstd(_) => VXO_REGION_ZSTD,
-            };
-            bidx.push(VxoRegionDirEntry {
-                region_coord: [rc.x, rc.y, rc.z],
-                brick_count: coords.len() as u32,
-                brik_offset: offset,
-                brik_comp_len: comp_len,
-                brik_raw_len: match comp {
-                    VxoCompression::Store => comp_len,
-                    VxoCompression::Zstd(_) => raw_len,
-                },
-                compression,
-                _pad: [0; 15],
-            });
+            let bricks: Vec<(IVec3, &Brick)> =
+                coords.iter().map(|&c| (c, lmap.get(c).expect("coarse brick present in level map"))).collect();
+            emit(lod, *rc, &bricks)?;
         }
-        bidx.sort_by_key(|e| (e.region_coord[2], e.region_coord[1], e.region_coord[0]));
-        levels.push(LevelBlobs { bidx, brik });
+    }
+    Ok(())
+}
+
+/// Assemble the `LODS` chunk body (`VXO_FORMAT.md` §B1.7) from the coarse `pyramid` (`pyramid[i]` = LOD `i+1`).
+/// Layout: [`VxoLodsHeader`] + `[VxoLodLevel; level_count]` table, then per level `L` (at the recorded
+/// `bidx_off`/`brik_off`) its `BIDX_L` (`[VxoRegionDirEntry]` sorted by `(z,y,x)`, `brik_offset` LEVEL-LOCAL)
+/// then `BRIK_L` (the concatenated level-`L` region bodies, each baked by the lod-parametrized
+/// [`encode_region_bricks`]). Every sub-section is padded to a 16-multiple so tables stay aligned. Each level
+/// buckets onto the COARSE grid via `region_of_brick(coarse_coord, k)` (same `K` for all levels in v1).
+///
+/// Drives the SHARED [`drive_coarse_lods`] ordering SSOT (identical to the streaming path's coarse bake), with an
+/// `emit` closure that encodes each region body + accumulates the per-level BIDX_L/BRIK_L in RAM.
+fn build_lods_body(pyramid: &[BrickMap], ki: i32, comp: VxoCompression) -> anyhow::Result<Vec<u8>> {
+    let level_count = pyramid.len() as u32;
+    // 1. Per level: bucket into coarse regions, encode each region body, build the level-local BIDX_L + BRIK_L —
+    //    via the shared `drive_coarse_lods` ordering, so these bytes are identical to the streaming path's.
+    struct LevelBlobs {
+        bidx: Vec<VxoRegionDirEntry>,
+        brik: Vec<u8>,
+    }
+    let mut levels: Vec<LevelBlobs> = (0..pyramid.len()).map(|_| LevelBlobs { bidx: Vec::new(), brik: Vec::new() }).collect();
+    drive_coarse_lods(pyramid, ki, |lod, rc, bricks| {
+        let lvl = &mut levels[(lod - 1) as usize];
+        let raw = encode_region_bricks(rc, bricks, lod)?;
+        anyhow::ensure!(raw.len() as u64 <= u32::MAX as u64, "LOD{lod} region {rc:?} body exceeds u32 length");
+        let raw_len = raw.len() as u32;
+        let stored = match comp {
+            VxoCompression::Store => raw,
+            VxoCompression::Zstd(level) => zstd_compress(&raw, level)?,
+        };
+        let comp_len = stored.len() as u32;
+        let offset = lvl.brik.len() as u64; // LEVEL-LOCAL offset within this level's BRIK_L blob
+        lvl.brik.extend_from_slice(&stored);
+        let compression = match comp {
+            VxoCompression::Store => VXO_REGION_STORE,
+            VxoCompression::Zstd(_) => VXO_REGION_ZSTD,
+        };
+        lvl.bidx.push(VxoRegionDirEntry {
+            region_coord: [rc.x, rc.y, rc.z],
+            brick_count: bricks.len() as u32,
+            brik_offset: offset,
+            brik_comp_len: comp_len,
+            brik_raw_len: match comp {
+                VxoCompression::Store => comp_len,
+                VxoCompression::Zstd(_) => raw_len,
+            },
+            compression,
+            _pad: [0; 15],
+        });
+        Ok(())
+    })?;
+    // BIDX_L sorted by (z,y,x) — the binary-search key (§B1.5). `drive_coarse_lods` already emits in (z,y,x)
+    // region order, so this is a no-op, but keep it explicit to match the base BIDX invariant.
+    for lvl in &mut levels {
+        lvl.bidx.sort_by_key(|e| (e.region_coord[2], e.region_coord[1], e.region_coord[0]));
     }
 
     // 2. Lay out the body: header + table at the front, then each level's BIDX_L + BRIK_L (16-aligned). Compute
@@ -542,6 +576,19 @@ impl VxoStreamWriter {
         self.bidx.sort_by_key(|e| (e.region_coord[2], e.region_coord[1], e.region_coord[0]));
         // The deepest baked coarse level (0 ⇒ no LODS); recorded in HEAD.max_lod.
         let max_lod = self.lod_levels.len() as u32;
+        // INVARIANT (Stage-2 reviewer finding): when ANY coarse level is baked, the pyramid MUST run to the full
+        // `MAX_LOD` depth — `HEAD.max_lod` is set to `lod_levels.len()`, and the read-side `coarse_level` clamps a
+        // request to `max_lod`. If a caller shipped fewer levels, that clamp would DIVERGE from
+        // `StaticVoxSource::level` (which always spans `MAX_LOD`), serving the wrong coarse grid for the missing
+        // deep LODs. `build_coarse_pyramid` always runs to `MAX_LOD` for a non-empty map, so a correct caller
+        // (the shared SSOT) satisfies this by construction; assert it rather than emit a divergent asset.
+        if max_lod > 0 {
+            anyhow::ensure!(
+                max_lod == MAX_LOD,
+                "LODS bake: baked pyramid depth {max_lod} != MAX_LOD {MAX_LOD} — a partial pyramid diverges from \
+                 the runtime coarse-level clamp (feed every level 1..=MAX_LOD via build_coarse_pyramid)"
+            );
+        }
 
         // Flush + close the base write handle, then REOPEN the scratch read-only (the write handle from
         // `File::create` is write-only — reading from it errors on Windows). Do the same for each LOD scratch.
