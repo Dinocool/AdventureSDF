@@ -521,15 +521,170 @@ fn merged_source_offsets_and_remaps() {
     // Stage-2 coarse-read through the merge: the `lod` param threads through `MergedSource::brick` to the owning
     // asset, which reads its baked LODS pyramid (block_base-remapped). Asset A sits at the origin (its LOD0 AABB
     // contains the coarse coord (0,0,0)), so its coarse L1 brick is served: its one fine brick downsamples and
-    // the merged id is preserved. (Off-origin assets' coarse dispatch is a pre-existing MergedSource `asset_at`
-    // limitation — it tests the COARSE coord against the LOD0 AABB — and is out of Stage-2's per-asset-read scope;
-    // the per-asset `VxoSource::brick(coarse)` path itself is covered by gate2c above.)
+    // the merged id is preserved. (Off-origin assets' coarse dispatch — testing the COARSE coord against the
+    // asset's per-LOD-downsampled AABB — is covered by `merged_off_origin_coarse_matches_single_asset` below.)
     let ca = merged.brick(IVec3::new(0, 0, 0), 1, &merged_reg);
     assert!(!ca.is_empty(), "asset A's coarse L1 brick is non-empty (its one fine brick downsampled)");
     assert_eq!(ca.get(0, 0, 0), BlockId(1), "asset A coarse id stays merged id 1 (block_base applied to coarse)");
 
     let _ = std::fs::remove_file(&pa);
     let _ = std::fs::remove_file(&pb);
+}
+
+/// **Off-origin COARSE-LOD merge parity (the off-origin coarse-LOD regression gate).** An asset placed at a
+/// NON-ZERO LOD0 offset in a `MergedSource` must return the SAME coarse geometry as the SAME asset queried
+/// stand-alone at its local coord, at EVERY coarse LOD — `brick`, `classify`, AND `surface_bricks_in`.
+///
+/// This pins the off-origin coordinate UNIT-MISMATCH bug. Pre-fix, `MergedSource::asset_at`/`surface_bricks_in`
+/// tested the COARSE (level-`L`) coord against the asset's LOD0 placed AABB, and `VxoSource::brick`/`classify`/
+/// `surface_bricks_in` subtracted the raw LOD0 `offset_bricks` from a coarse coord. For an asset at LOD0 offset
+/// `O`, a level-`L` query sits at `≈ wc·2^-L` while the LOD0 AABB sits at `≈ O` — so the coarse query fell
+/// OUTSIDE the asset ⇒ no asset matched ⇒ AIR (the lost-far-LOD bug). The at-origin tests above never caught it
+/// because `0 >> L == 0` masks the mismatch.
+///
+/// REFERENCE (the "same asset at origin, shifted" oracle): the asset is also loaded stand-alone as a `VxoSource`
+/// at offset 0; the merged level-`L` query at world coord `wc` must equal the stand-alone query at
+/// `wc - O.div_euclid(2^L)` (the placement offset DOWNSAMPLED to level `L` — `offset_at_lod`). This equality is
+/// exact by construction: `MergedSource::brick(wc, L)` dispatches to the placed source which computes
+/// `local = wc - O.div_euclid(2^L)`, identical to the stand-alone source's `local = wc'` when `wc' = wc -
+/// O.div_euclid(2^L)`. The `block_base` is 0 here (single asset ⇒ palette_base 1 ⇒ shift 0), so the ids match
+/// directly. FAILS pre-fix (AIR ≠ the stand-alone solid brick at coarse L); passes after.
+#[test]
+fn merged_off_origin_coarse_matches_single_asset() {
+    use crate::voxel::brickmap::MAX_LOD;
+
+    // A multi-brick asset (so coarse levels genuinely downsample 8-children, not a single collapsed brick):
+    // a 4×4×4 block of bricks at the origin, mixing full + dense + air so classify exercises Surface/Interior.
+    let mut a = BrickMap::new();
+    for z in 0..4 {
+        for y in 0..4 {
+            for x in 0..4 {
+                let c = IVec3::new(x, y, z);
+                // A solid shell of full bricks with a dense interior — gives an Interior centre + Surface faces.
+                let brick = if x == 0 || y == 0 || z == 0 || x == 3 || y == 3 || z == 3 {
+                    Brick::uniform(BlockId(1))
+                } else {
+                    dense_brick(x * 7 + y * 13 + z * 17)
+                };
+                a.insert(c, brick);
+            }
+        }
+    }
+    let reg = registry();
+    let path = write_store(&a, &reg, "offorigin_asset");
+
+    // The OFF-ORIGIN placement: a large, DELIBERATELY-ODD offset (not a multiple of any small 2^L), so the
+    // pre-fix `coord - offset_bricks` / LOD0-AABB-test reads pure AIR at coarse LODs. The auto-spaced gallery
+    // offsets are arbitrary like this (derived from scene bounds), which is exactly what surfaced the bug.
+    let offset = IVec3::new(801, 0, 137);
+
+    // The asset stand-alone at the origin (the reference oracle) AND placed off-origin in a MergedSource.
+    let (single, single_reg) = VxoSource::open(&path).expect("open stand-alone reference");
+    let (placed, placed_reg) = VxoSource::open(&path).expect("open for merge");
+    let (merged, merged_reg) = MergedSource::new(vec![(placed, placed_reg, offset)]);
+    // Single asset ⇒ merged palette base 1 ⇒ block_base 0 ⇒ ids identical to the stand-alone source.
+    assert_eq!(merged_reg.len(), single_reg.len(), "single-asset merge preserves the palette");
+
+    // The world coords to probe: each stored brick's placed world coord, plus its absent neighbours, swept at
+    // every LOD. At level `L` the world coord is `(local_lod0 + offset)` downsampled to L; we probe the asset's
+    // full coarse footprint by mapping every stored LOD0 brick down to L and re-placing it.
+    // Sweep `lod ∈ 0..=MAX_LOD` (the served pyramid levels). PAST MAX_LOD the per-asset `classify` returns an
+    // UNCONDITIONAL conservative `Surface` (the clamp), while the merge applies the SPATIAL dispatch first — so a
+    // coord outside the (clamped) footprint legitimately differs (Air vs Surface). That clamp is already pinned
+    // by `stage2_tiny_asset_max_lod_clamp`; here we test the off-origin coarse DISPATCH over the real levels.
+    let stored: Vec<IVec3> = a.iter().map(|(c, _)| *c).collect();
+    let mut any_coarse_solid = false;
+    for lod in 0..=MAX_LOD {
+        let s = 1i32 << lod; // 2^lod (lod <= MAX_LOD)
+        let off_l = IVec3::new(offset.x.div_euclid(s), offset.y.div_euclid(s), offset.z.div_euclid(s));
+        // The level-`L` local coords this asset occupies (dedup the coarse cells), plus a 1-brick absent margin.
+        let mut local_coords: Vec<IVec3> = stored
+            .iter()
+            .map(|c| IVec3::new(c.x.div_euclid(s), c.y.div_euclid(s), c.z.div_euclid(s)))
+            .collect();
+        let base = local_coords.clone();
+        for c in base {
+            for d in [IVec3::X, IVec3::Y, IVec3::Z, -IVec3::X, -IVec3::Y, -IVec3::Z] {
+                local_coords.push(c + d);
+            }
+        }
+        local_coords.sort_by_key(|c| (c.z, c.y, c.x));
+        local_coords.dedup();
+
+        for &local in &local_coords {
+            let world = local + off_l; // the same coarse cell, placed off-origin
+            // brick parity: the merged off-origin coarse brick == the stand-alone coarse brick at the local coord.
+            let want_b = single.brick(local, lod, &single_reg);
+            let got_b = merged.brick(world, lod, &merged_reg);
+            assert_eq!(
+                got_b, want_b,
+                "merged off-origin brick at world {world:?} lod {lod} must equal the stand-alone brick at \
+                 local {local:?} (off-origin coarse-LOD fix)"
+            );
+            // classify parity: the per-asset enclosed-cull must survive the off-origin coarse dispatch.
+            let want_c = single.classify(local, lod);
+            let got_c = merged.classify(world, lod);
+            assert_eq!(
+                got_c, want_c,
+                "merged off-origin classify at world {world:?} lod {lod} must equal stand-alone at local {local:?}"
+            );
+            if lod >= 1 && !got_b.is_empty() {
+                any_coarse_solid = true;
+            }
+        }
+    }
+    // The whole point of the gate: SOME coarse-LOD brick of the off-origin asset is solid (pre-fix every coarse
+    // merged read was AIR, so this would never trip — the assert is the bug's tripwire even if the equalities
+    // above degenerated to AIR==AIR for a different reason).
+    assert!(
+        any_coarse_solid,
+        "the off-origin asset must yield NON-EMPTY coarse bricks through the merge (pre-fix bug: all AIR)"
+    );
+
+    // surface_bricks_in parity at a coarse LOD: the candidate set the merge yields for the off-origin asset
+    // must equal the stand-alone asset's candidate set SHIFTED by the per-lod offset. `MergedSource` first CLIPS
+    // the query box to the owning asset's per-lod bounds before delegating, so the oracle clips the stand-alone
+    // query to the SAME per-lod local bounds (the asset spans local LOD0 bricks `[0, 4)` ⇒ per-lod inclusive
+    // local bounds `[0.div_euclid(2^L), 3.div_euclid(2^L)]`). Pre-fix the merge's LOD0-AABB overlap yielded an
+    // EMPTY set here (the coarse query box never intersected the LOD0 bounds for an off-origin asset).
+    for lod in 1..=2u32 {
+        let s = 1i32 << lod;
+        let off_l = IVec3::new(offset.x.div_euclid(s), offset.y.div_euclid(s), offset.z.div_euclid(s));
+        // A wide coarse box around the asset's placed coarse footprint (intentionally larger than the asset).
+        let lo_local = IVec3::splat(-2);
+        let hi_local = IVec3::splat(4);
+        // The merge CLIPS the query to the owning asset's per-lod placed bounds before delegating; an ODD offset
+        // makes that coarse footprint a cell WIDER than the at-origin one (e.g. local LOD0 bricks 801..804 at L1
+        // map to coarse 400..402 — 3 cells, not 2). Clip the oracle query to the SAME bounds, computed in LOCAL
+        // coords exactly as `lod_bounds` does (placed inclusive bounds `[offset, offset+3]`, div_euclid by 2^L,
+        // minus the per-lod offset) — so we compare the merge's region-granular superset like-for-like.
+        let placed_last = offset + IVec3::splat(3); // inclusive LOD0 placed max (asset spans [0,4) local)
+        let alo = IVec3::new(offset.x.div_euclid(s), offset.y.div_euclid(s), offset.z.div_euclid(s)) - off_l;
+        let ahi = IVec3::new(
+            placed_last.x.div_euclid(s),
+            placed_last.y.div_euclid(s),
+            placed_last.z.div_euclid(s),
+        ) - off_l;
+        let clip_lo = lo_local.max(alo);
+        let clip_hi = hi_local.min(ahi);
+        let mut want: Vec<IVec3> = Vec::new();
+        single.surface_bricks_in(clip_lo, clip_hi, lod, &mut want);
+        let mut got: Vec<IVec3> = Vec::new();
+        merged.surface_bricks_in(lo_local + off_l, hi_local + off_l, lod, &mut got);
+        // Compare as sets (both clipped/over-yield identically; shift `got` back to local for the comparison).
+        let mut want_sorted = want.clone();
+        want_sorted.sort_by_key(|c| (c.z, c.y, c.x));
+        let mut got_local: Vec<IVec3> = got.iter().map(|c| *c - off_l).collect();
+        got_local.sort_by_key(|c| (c.z, c.y, c.x));
+        assert_eq!(
+            got_local, want_sorted,
+            "merged off-origin surface_bricks_in at lod {lod} must equal the stand-alone set shifted by the \
+             per-lod offset (off-origin coarse-LOD fix)"
+        );
+        assert!(!want_sorted.is_empty(), "the asset must yield coarse surface candidates at lod {lod}");
+    }
+
+    let _ = std::fs::remove_file(&path);
 }
 
 /// §B2.6 voxel_size reconciliation: a `.vxo` baked at a DIFFERENT `voxel_size` than the engine is rejected at

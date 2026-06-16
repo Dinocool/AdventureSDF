@@ -407,6 +407,27 @@ impl VxoSource {
         self.head.region_edge_bricks as i32
     }
 
+    /// This asset's placement offset expressed on the **LOD-`lod` brick grid** — the SSOT world→local merge
+    /// transform at coarse levels (the off-origin coarse-LOD FIX). The merge offset [`Self::offset_bricks`] is
+    /// in LOD0 brick coords, but a coarse read passes `coord` on the LOD-`lod` grid (`2^lod×` coarser —
+    /// [`super::super::streaming::camera_brick_coord_lod`]). A level-`L` brick is the `div_euclid(2)`-downsample
+    /// of its children L times over (the [`super::super::source::downsample_brickmap`]
+    /// `fc.div_euclid(2)` mapping, which composes to `fc.div_euclid(2^L)`), so the asset's LOD0 placement `O`
+    /// lands on the level-`L` grid at `O.div_euclid(2^L)`. Subtracting the RAW LOD0 `O` from a coarse `coord`
+    /// (the pre-fix bug) was wrong by `O - (O>>L)·2^L` for an off-origin asset — its coarse geometry fell
+    /// outside the asset and read as AIR. `div_euclid` (not `>>`) keeps the floor-toward-`-∞` convention for
+    /// NEGATIVE placements, matching `downsample_brickmap`. `lod` is clamped to [`MAX_LOD`] exactly as the
+    /// caller clamps the request, so the local coord grid agrees with the pyramid level actually read.
+    #[inline]
+    fn offset_at_lod(&self, lod: u32) -> IVec3 {
+        let s = 1i32 << lod.min(MAX_LOD); // 2^lod (lod <= MAX_LOD = 7 ⇒ no i32 overflow)
+        IVec3::new(
+            self.offset_bricks.x.div_euclid(s),
+            self.offset_bricks.y.div_euclid(s),
+            self.offset_bricks.z.div_euclid(s),
+        )
+    }
+
     /// Binary-search `bidx` (any level's directory, sorted by `(z,y,x)`) for `region_coord`; `None` ⇒ the
     /// region is absent (no entry ⇒ all-air at that level, the clipmap bound). Shared by the base LOD0 `BIDX`
     /// and each baked-coarse level's `BIDX_L`.
@@ -590,10 +611,13 @@ impl BrickSource for VxoSource {
     /// collapses to empty (solid-if-any keeps ≥ 1 solid voxel forever), so its pyramid spans the full
     /// `MAX_LOD + 1` levels and a request is clamped only past `MAX_LOD` — we MIRROR that with `lod.min(MAX_LOD)`.
     fn brick(&self, coord: IVec3, lod: u32, _registry: &BlockRegistry) -> Brick {
-        let local = coord - self.offset_bricks;
         // Clamp past MAX_LOD exactly as `StaticVoxSource::level` does (the pyramid of a non-empty finite map is
         // the full MAX_LOD+1 levels, so `level(lod) == lod.min(MAX_LOD)`).
         let lod = lod.min(MAX_LOD);
+        // World→local on the LOD-`lod` grid: subtract the offset DOWNSAMPLED to this level (`offset_at_lod`),
+        // NOT the raw LOD0 offset — `coord` is a coarse coord, so a LOD0 subtraction would miss an off-origin
+        // asset's coarse geometry (the off-origin coarse-LOD bug). At LOD0 `offset_at_lod == offset_bricks`.
+        let local = coord - self.offset_at_lod(lod);
         if lod == 0 {
             self.brick_lod0(local)
         } else if self.lods.is_some() {
@@ -627,7 +651,10 @@ impl BrickSource for VxoSource {
         if lod > MAX_LOD || (lod > 0 && self.lods.is_some() && lod > self.max_lod()) {
             return BrickClass::Surface;
         }
-        let here = coord - self.offset_bricks;
+        // World→local on the LOD-`lod` grid (off-origin coarse-LOD fix): the offset DOWNSAMPLED to this level,
+        // not the raw LOD0 offset. The 6 face-neighbours below are queried on the SAME level grid, so the same
+        // per-lod offset applies to them via `here + off`. At LOD0 `offset_at_lod == offset_bricks`.
+        let here = coord - self.offset_at_lod(lod);
         // The `is_full` of a brick at local coord `c`, level `lod`. The cheap baked path reads the
         // `BRICK_FLAG_FULL` bit straight from the level's entry table (no voxel decode); the no-LODS coarse
         // fallback downsamples. `None` ⇒ the brick is absent (all-air) in this asset.
@@ -717,10 +744,16 @@ impl BrickSource for VxoSource {
             return;
         };
         let k = self.region_edge();
-        // World brick coord -> local (offset-applied) coord: `local = coord - offset_bricks`. The box in LOCAL
-        // coords; intersect each present region's [r·K, r·K + K) local span with it, then shift back to world.
-        let lo_l = lo - self.offset_bricks;
-        let hi_l = hi - self.offset_bricks;
+        // World brick coord -> local (offset-applied) coord on the LOD-`lod` grid: `local = coord -
+        // offset_at_lod(lod)` — the offset DOWNSAMPLED to this level (off-origin coarse-LOD fix), since `lo`/`hi`
+        // and the level's `BIDX_L` region coords are both on the level-`lod` grid. Subtracting the raw LOD0
+        // offset (the pre-fix bug) shifted the box wrong for an off-origin asset at coarse levels, so its
+        // present regions never intersected the (mis-shifted) box and its coarse shell yielded NO candidates.
+        // The box in LOCAL coords; intersect each present region's [r·K, r·K + K) local span with it, then shift
+        // back to world by the SAME per-lod offset. At LOD0 `offset_at_lod == offset_bricks`.
+        let off = self.offset_at_lod(lod);
+        let lo_l = lo - off;
+        let hi_l = hi - off;
         for dir in bidx {
             let rc = IVec3::new(dir.region_coord[0], dir.region_coord[1], dir.region_coord[2]);
             let rlo = rc * k; // inclusive local brick min of this region
@@ -740,7 +773,7 @@ impl BrickSource for VxoSource {
             for z in az..=bz {
                 for y in ay..=by {
                     for x in ax..=bx {
-                        out.push(IVec3::new(x, y, z) + self.offset_bricks);
+                        out.push(IVec3::new(x, y, z) + off);
                     }
                 }
             }
@@ -846,18 +879,41 @@ impl MergedSource {
         (regions, bytes, coarse)
     }
 
-    /// The asset whose placed brick AABB contains `coord`, or `None` if `coord` is in no asset's extent. The
-    /// gallery guarantees disjoint placement (the caller spaces assets apart), so at most one asset matches —
-    /// the first containing asset is taken (deterministic by insertion order).
-    fn asset_at(&self, coord: IVec3) -> Option<&PlacedAsset> {
+    /// The asset whose placed brick AABB contains `coord` ON THE LOD-`lod` GRID, or `None` if `coord` is in no
+    /// asset's extent at that level. The gallery guarantees disjoint placement (the caller spaces assets apart),
+    /// so at most one asset matches — the first containing asset is taken (deterministic by insertion order).
+    ///
+    /// `coord` is on the LOD-`lod` brick grid (the residency passes coarse coords there — `2^lod×` coarser).
+    /// The stored `lo`/`hi` are LOD0 placed bounds, so they are DOWNSAMPLED to the level-`lod` grid before the
+    /// test ([`Self::lod_bounds`]) — the off-origin coarse-LOD FIX. The pre-fix code tested a COARSE coord
+    /// against the LOD0 AABB, so an off-origin asset (whose LOD0 bounds sit at large coords) never matched its
+    /// own much-smaller coarse coords ⇒ the dispatch returned no asset ⇒ AIR. At LOD0 the bounds are unchanged.
+    fn asset_at(&self, coord: IVec3, lod: u32) -> Option<&PlacedAsset> {
         self.assets.iter().find(|a| {
-            coord.x >= a.lo.x
-                && coord.y >= a.lo.y
-                && coord.z >= a.lo.z
-                && coord.x < a.hi.x
-                && coord.y < a.hi.y
-                && coord.z < a.hi.z
+            let (lo, hi) = Self::lod_bounds(a, lod);
+            coord.x >= lo.x
+                && coord.y >= lo.y
+                && coord.z >= lo.z
+                && coord.x <= hi.x
+                && coord.y <= hi.y
+                && coord.z <= hi.z
         })
+    }
+
+    /// A placed asset's INCLUSIVE brick AABB `[lo, hi]` on the LOD-`lod` grid: its LOD0 placed bounds
+    /// (`a.lo` inclusive, `a.hi` EXCLUSIVE) downsampled to level `lod`. A level-`L` brick `c` covers LOD0 region
+    /// `[c·2^L, (c+1)·2^L)`, so the asset (LOD0 bricks `[a.lo, a.hi)`) is touched by every level-`L` coord
+    /// `c ∈ [a.lo.div_euclid(2^L), (a.hi-1).div_euclid(2^L)]` (the last LOD0 brick is `a.hi-1` since `a.hi` is
+    /// exclusive). `div_euclid` floors toward `-∞` so a NEGATIVE-coord asset's bounds map correctly (matching
+    /// `downsample_brickmap`). `lod` clamped to [`MAX_LOD`]. Returns INCLUSIVE bounds (the dispatch + the
+    /// `surface_bricks_in` overlap both want inclusive). At LOD0 this is `(a.lo, a.hi - 1)`.
+    #[inline]
+    fn lod_bounds(a: &PlacedAsset, lod: u32) -> (IVec3, IVec3) {
+        let s = 1i32 << lod.min(MAX_LOD); // 2^lod
+        let lo = IVec3::new(a.lo.x.div_euclid(s), a.lo.y.div_euclid(s), a.lo.z.div_euclid(s));
+        let last = a.hi - IVec3::ONE; // inclusive LOD0 max (a.hi is exclusive)
+        let hi = IVec3::new(last.x.div_euclid(s), last.y.div_euclid(s), last.z.div_euclid(s));
+        (lo, hi)
     }
 }
 
@@ -866,7 +922,7 @@ impl BrickSource for MergedSource {
     /// brick (already offset + block-base remapped). No matching asset ⇒ `uniform(AIR)` (the merged-world
     /// clipmap bound).
     fn brick(&self, coord: IVec3, lod: u32, registry: &BlockRegistry) -> Brick {
-        match self.asset_at(coord) {
+        match self.asset_at(coord, lod) {
             Some(asset) => asset.source.brick(coord, lod, registry),
             None => Brick::uniform(BlockId::AIR),
         }
@@ -876,7 +932,7 @@ impl BrickSource for MergedSource {
     /// matching asset ⇒ `Air`. Because assets are placed DISJOINT (with a gap), a brick on one asset's edge has
     /// its outward neighbour absent within that asset ⇒ `Surface` — correct (no false `Interior` across a gap).
     fn classify(&self, coord: IVec3, lod: u32) -> BrickClass {
-        match self.asset_at(coord) {
+        match self.asset_at(coord, lod) {
             Some(asset) => asset.source.classify(coord, lod),
             None => BrickClass::Air,
         }
@@ -890,15 +946,21 @@ impl BrickSource for MergedSource {
     /// (`Θ(surface)`, no region decode), so the merge stays shell-first too.
     fn surface_bricks_in(&self, lo: IVec3, hi: IVec3, lod: u32, out: &mut Vec<IVec3>) {
         for asset in &self.assets {
-            // The overlap of this asset's placed bounds with the query box (asset bounds are [lo, hi) excl).
-            let ax = asset.lo.x.max(lo.x);
-            let ay = asset.lo.y.max(lo.y);
-            let az = asset.lo.z.max(lo.z);
-            let bx = (asset.hi.x - 1).min(hi.x);
-            let by = (asset.hi.y - 1).min(hi.y);
-            let bz = (asset.hi.z - 1).min(hi.z);
+            // The overlap of this asset's placed bounds with the query box, BOTH on the LOD-`lod` grid: the
+            // query box `[lo, hi]` is on the level-`lod` grid, so the asset's LOD0 placed bounds are downsampled
+            // to that level ([`Self::lod_bounds`], INCLUSIVE) before the overlap — the off-origin coarse-LOD FIX.
+            // The pre-fix code intersected the COARSE query box against the asset's LOD0 bounds, so an off-origin
+            // asset's much-smaller coarse box never overlapped its large LOD0 bounds ⇒ no coarse candidates ⇒ its
+            // far/coarse geometry never streamed in. At LOD0 `lod_bounds == (asset.lo, asset.hi - 1)`.
+            let (alo, ahi) = Self::lod_bounds(asset, lod);
+            let ax = alo.x.max(lo.x);
+            let ay = alo.y.max(lo.y);
+            let az = alo.z.max(lo.z);
+            let bx = ahi.x.min(hi.x);
+            let by = ahi.y.min(hi.y);
+            let bz = ahi.z.min(hi.z);
             if ax > bx || ay > by || az > bz {
-                continue; // this asset doesn't touch the query box
+                continue; // this asset doesn't touch the query box at this LOD
             }
             asset.source.surface_bricks_in(IVec3::new(ax, ay, az), IVec3::new(bx, by, bz), lod, out);
         }

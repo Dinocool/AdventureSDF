@@ -91,6 +91,11 @@ struct SlabArena {
     high_water: u32,
     /// The word capacity the last [`commit`](Self::commit) sized the GPU buffer to (grow detection).
     gpu_cap: u32,
+    /// A PRE-SIZED capacity floor (words) — the first [`commit`](Self::commit) sizes the GPU buffer to at least
+    /// this, so streaming a full resident shell fits WITHOUT a mid-load grow ([`reserve`](Self::reserve)). 0 = no
+    /// reserve (legacy behaviour: the buffer grows from the live high-water). A genuine overflow PAST the reserve
+    /// still grows safely (the grow path is unchanged) — the reserve only ensures a NORMAL load never triggers it.
+    reserved_floor: u32,
     /// Set when an alloc since the last commit exceeded `gpu_cap` — the next upload must re-snapshot.
     grew: bool,
 }
@@ -98,7 +103,17 @@ struct SlabArena {
 impl SlabArena {
     fn new(classes: Vec<u32>) -> Self {
         let n = classes.len();
-        Self { classes, free: vec![Vec::new(); n], high_water: 0, gpu_cap: 0, grew: false }
+        Self { classes, free: vec![Vec::new(); n], high_water: 0, gpu_cap: 0, reserved_floor: 0, grew: false }
+    }
+
+    /// PRE-SIZE the arena to an AGGREGATE capacity of `blocks · mean_words_per_block` words: raise the
+    /// [`reserved_floor`](Self::reserved_floor) so the FIRST [`commit`](Self::commit) sizes the GPU buffer large
+    /// enough for a full normal load, eliminating the mid-load GROW that would otherwise force a full O(capacity)
+    /// re-snapshot. `mean_words_per_block` is an AGGREGATE mean across the resident set (NOT a single block's class
+    /// — the floor is a total-pool capacity, so the mean is what bounds it, not the per-brick worst case). A later
+    /// overflow beyond this floor still grows — the reserve is a no-grow guarantee for the COMMON load only.
+    fn reserve(&mut self, blocks: u32, mean_words_per_block: u32) {
+        self.reserved_floor = self.reserved_floor.max(blocks.saturating_mul(mean_words_per_block));
     }
 
     /// The class index whose block size is the smallest `≥ words`.
@@ -133,11 +148,16 @@ impl SlabArena {
     }
 
     /// The buffer capacity (words) to allocate at the next snapshot: the live high-water + headroom (so a few
-    /// deltas can allocate before forcing a re-snapshot), with a small floor so an empty arena is still non-empty.
+    /// deltas can allocate before forcing a re-snapshot), with a small floor so an empty arena is still non-empty,
+    /// AND clamped up to the [`reserved_floor`](Self::reserved_floor) — the pre-sized capacity for a full normal
+    /// load — so the first snapshot is large enough to absorb the whole streamed shell without a mid-load grow.
     #[inline]
     fn capacity_u32(&self) -> usize {
         let hw = self.high_water as usize;
-        (hw * 2).max(hw + 8192).max(self.classes.last().copied().unwrap_or(1) as usize)
+        (hw * 2)
+            .max(hw + 8192)
+            .max(self.classes.last().copied().unwrap_or(1) as usize)
+            .max(self.reserved_floor as usize)
     }
 
     /// Commit a (re)allocation to [`capacity_u32`](Self::capacity_u32): record it as `gpu_cap` + clear `grew`.
@@ -156,6 +176,25 @@ impl SlabArena {
 fn index_slab_words(index_bits: u8) -> u32 {
     index_class_words(index_bits) as u32
 }
+
+/// **Pre-size estimate — the MEAN index-stream words a RESIDENT brick costs** (the index-arena pre-grow per
+/// brick; [`ResidentPacker::new`] → [`SlabArena::reserve`]). The reserve is an AGGREGATE pool capacity, so the
+/// figure that bounds it is the MEAN over the whole resident set, not a single brick's class. MEASURED on the
+/// A4.4 worldgen slice: the index arena settled at **6.4 MB / 10 k resident bricks ≈ 160 words/brick** (the mean
+/// over the dense/uniform mix — uniform bricks cost 0 index words, dense bricks 32–500 by their `index_bits`).
+/// We reserve at **192 words/brick = 1.2× that mean** for headroom against a denser-than-measured architectural
+/// load, so a full normal load fits the FIRST snapshot and never grows mid-load. A load whose mean exceeds this
+/// (a high-entropy `.vox` scene dominated by 16-bit bricks) still grows SAFELY past the reserve — the reserve only
+/// kills the COMMON-load grow-snapshots. NOTE the cost: the index GPU buffer is then committed at
+/// `max_resident_bricks · 192 · 4 B` regardless of the actual resident count — the `max_resident_bricks` cap is
+/// the documented VRAM safety bound, so sizing the buffer to it is consistent (a far-lower live residency simply
+/// leaves the pre-sized pool partly unused, vs. paying a 200 ms re-snapshot each time it would have grown).
+const RESERVE_INDEX_WORDS_PER_BRICK: u32 = 192;
+
+/// **Pre-size estimate — the MEAN per-brick PALETTE words a RESIDENT brick costs** (the palette-arena pre-grow per
+/// brick). MEASURED on the A4.4 worldgen slice: **0.41 MB / 10 k ≈ 10 words/brick**; we reserve **16 words/brick**
+/// (≈1.6× headroom; a high-registry `.vox` scene with larger per-brick palettes still grows safely past it).
+const RESERVE_PALETTE_WORDS_PER_BRICK: u32 = 16;
 
 /// A DEGENERATE BLAS AABB (min > max on every axis) for an UNUSED slot: the BLAS build never reports a
 /// candidate for it, so a freed slot is invisible to the trace. `primitive_index = slot` is preserved (the
@@ -377,12 +416,35 @@ impl ResidentPacker {
     /// and grows as bricks are slotted; the render path sizes the GPU index buffer to [`index_capacity_u32`](Self::index_capacity_u32)
     /// at each snapshot. `palette_stride` starts 0 and is set from the registry length on the first [`update`].
     pub fn new(max_resident_bricks: u32) -> Self {
+        // PRE-SIZE both arenas to the resident CAP so streaming a full shell fits the FIRST snapshot — no mid-load
+        // GROW re-snapshot (the ~200 ms `vox_pack_snapshot` spikes). This is the Tier-1 grow-snapshot fix.
+        Self::with_reserve(max_resident_bricks, true)
+    }
+
+    /// `new` WITHOUT the arena pre-size (the legacy grow-from-empty behaviour). Used by the grow-snapshot
+    /// benchmark to measure BEFORE (un-pre-sized) vs AFTER (pre-sized) — production always uses [`new`](Self::new).
+    #[doc(hidden)]
+    pub fn new_unreserved(max_resident_bricks: u32) -> Self {
+        Self::with_reserve(max_resident_bricks, false)
+    }
+
+    fn with_reserve(max_resident_bricks: u32, reserve: bool) -> Self {
         let index_classes: Vec<u32> = INDEX_CLASS_BITS.iter().map(|&b| index_class_words(b) as u32).collect();
+        let mut index_arena = SlabArena::new(index_classes);
+        let mut palette_arena = SlabArena::new(palette_classes());
+        if reserve {
+            // Derived from `max_resident_bricks` × the MEASURED MEAN per-brick words (see
+            // `RESERVE_INDEX_WORDS_PER_BRICK`/`RESERVE_PALETTE_WORDS_PER_BRICK`); a load denser than the mean still
+            // grows safely (the grow path is intact), so this kills the COMMON-load grow-snapshots without removing
+            // the safety net.
+            index_arena.reserve(max_resident_bricks, RESERVE_INDEX_WORDS_PER_BRICK);
+            palette_arena.reserve(max_resident_bricks, RESERVE_PALETTE_WORDS_PER_BRICK);
+        }
         Self {
             slots: SlotAllocator::new(max_resident_bricks),
             resident: FxHashMap::default(),
-            index_arena: SlabArena::new(index_classes),
-            palette_arena: SlabArena::new(palette_classes()),
+            index_arena,
+            palette_arena,
             palette_stride: 0,
             last_meta: FxHashMap::default(),
             last_aabb: FxHashMap::default(),
