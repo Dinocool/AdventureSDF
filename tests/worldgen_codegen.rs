@@ -114,6 +114,28 @@ fn main() {{
     validator.validate(&module).unwrap_or_else(|e| panic!("worldgen_gpu.wgsl library validation:\n{e:?}"));
 }
 
+/// The full GPU brick-VOXELIZE module (Stage 1b) composes + validates with NO GPU: the height library +
+/// the codegen'd `wg_eval_graph` + the `worldgen_voxelize.wgsl` library + its `voxelize_main` entry. This
+/// catches a WGSL typo in the voxelize library (climate/classify/strata/block-at port) on a CI box without
+/// an adapter — the GPU dispatch (`worldgen_gpu_voxelize_parity.rs`) skips there.
+#[test]
+fn voxelize_module_validates() {
+    use adventure::voxel::gpu_voxelize::voxelize_shader_src;
+    // The assembled module already concatenates both libraries + the codegen + the entry. Strip the leftover
+    // `#define_import_path` lines (the assembler already does, but be defensive) and feed it to the composer.
+    let g = mountains_plains_graph(MOUNTAINS_PLAINS_AMPLITUDE);
+    let source = voxelize_shader_src(&g, "assets/shaders");
+    let mut composer = Composer::default().with_capabilities(naga::valid::Capabilities::all());
+    let module = composer
+        .make_naga_module(NagaModuleDescriptor { source: &source, file_path: "worldgen_voxelize", ..Default::default() })
+        .unwrap_or_else(|e| panic!("worldgen_voxelize module must compose:\n{e}\n--- src ---\n{source}"));
+    let mut validator =
+        naga::valid::Validator::new(naga::valid::ValidationFlags::all(), naga::valid::Capabilities::all());
+    validator
+        .validate(&module)
+        .unwrap_or_else(|e| panic!("worldgen_voxelize validation:\n{e:?}\n--- src ---\n{source}"));
+}
+
 /// The two in-code presets (`default_terrain_graph`, `mountains_plains_graph`) codegen + validate.
 #[test]
 fn code_presets_validate() {

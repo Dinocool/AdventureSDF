@@ -47,6 +47,41 @@ pub const CLIMATE_OCTAVES: u32 = 4;
 const TEMPERATURE_SALT: u64 = 0x5417_1AB7_C0FF_EE01;
 const HUMIDITY_SALT: u64 = 0x9E37_79B9_7F4A_7C15;
 
+/// The climate-field knobs the GPU voxelizer needs to reproduce [`temperature`]/[`humidity`] bit-for-bit
+/// (within f32) — the FOLDED `u32` stream seeds + the fBm params + the `[0,1]` normalize divisor. Built by
+/// [`climate_gpu_params`] from the world seed; the SSOT both the CPU climate fields AND the GPU
+/// `worldgen_voxelize.wgsl` read, so the climate classification can't drift between them. The salts/fold
+/// stay private here (integer-exact); the GPU gets the already-folded `u32` seeds.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ClimateGpuParams {
+    /// `climate_seed(seed, TEMPERATURE_SALT)` — the temperature noise stream's u32 seed.
+    pub temp_seed: u32,
+    /// `climate_seed(seed, HUMIDITY_SALT)` — the humidity noise stream's u32 seed.
+    pub humid_seed: u32,
+    pub octaves: u32,
+    pub base_freq: f64,
+    pub lacunarity: f64,
+    pub gain: f64,
+    /// `climate_norm_bound()` — the geometric octave-amplitude sum the raw fBm is divided by.
+    pub norm_bound: f64,
+}
+
+/// The [`ClimateGpuParams`] for `world_seed` — the SSOT the GPU voxelizer uploads so its climate
+/// classification matches the CPU [`temperature`]/[`humidity`]/[`classify`] chain. Pure integer fold +
+/// the fixed climate knobs.
+pub fn climate_gpu_params(world_seed: u64) -> ClimateGpuParams {
+    let p = climate_fbm(climate_seed(world_seed, TEMPERATURE_SALT));
+    ClimateGpuParams {
+        temp_seed: climate_seed(world_seed, TEMPERATURE_SALT),
+        humid_seed: climate_seed(world_seed, HUMIDITY_SALT),
+        octaves: p.octaves,
+        base_freq: p.base_freq,
+        lacunarity: p.lacunarity,
+        gain: p.gain,
+        norm_bound: climate_norm_bound(),
+    }
+}
+
 /// fBm params for a climate field at `(base_freq, seed)`. Gain 0.5 / lacunarity 2.0 (the standard fBm
 /// rolloff); amplitude 1.0 since we normalize the raw `[-1,1]`-ish sum to `[0,1]` afterwards.
 fn climate_fbm(seed: u32) -> FbmParams {

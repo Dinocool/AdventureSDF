@@ -34,7 +34,7 @@ pub fn voxel_center_world(world_voxel: IVec3) -> [f64; 3] {
 /// depth of the surface take the surface-rule material (snow caps, cliff rock, flower / EMISSIVE lava +
 /// crystal patches); deeper voxels fall to the volumetric [`strata_material`] column (dug walls). One voxel
 /// edge ([`VOXEL_SIZE`]) — the exposed shell — so the glow sits on the surface, not buried under dirt.
-const SURFACE_SKIN_DEPTH: f64 = VOXEL_SIZE as f64;
+pub const SURFACE_SKIN_DEPTH: f64 = VOXEL_SIZE as f64;
 
 /// All the COLUMN-CONSTANT worldgen evaluation for one `(wx, wz)` ground column — the expensive 2D work
 /// (the `sample_world` fBm+erosion+biome graph eval, the surface gradient, and the climate biome lookups).

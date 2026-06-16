@@ -24,6 +24,9 @@ pub mod cornell;
 pub mod edits;
 pub mod gallery;
 pub mod gpu;
+/// Stage G1 — the GPU brick voxelizer (host side of `worldgen_voxelize.wgsl`): assemble the compute
+/// shader + flatten the worldgen library/registry/brick into its uniform. Correctness-only (not yet live).
+pub mod gpu_voxelize;
 pub mod incremental;
 pub mod palette;
 /// Stage 6 — voxel physics (the player walks the cubes). Feature-gated on `physics` (pulls `rapier3d`).
