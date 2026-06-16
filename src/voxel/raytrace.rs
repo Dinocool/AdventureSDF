@@ -615,19 +615,6 @@ fn stream_voxel_rt_residency(
         } else {
             None
         };
-        // Per-scene clipmap half-extent: the BOUNDED architectural models (Sponza / Gallery row) are at most
-        // ~200 m across, so the 160-brick (64 m LOD0, 8 km reach) default is hugely oversized — it would keep ~300k
-        // bricks resident over a dense scene and NEVER converge for a static camera (perpetual stream/repack/BLAS
-        // churn). A tight 24-brick clipmap (9.6 m LOD0, ~1.2 km reach over the coarse shells) converges in seconds
-        // to ~30k bricks WITH full-scene coverage, which is what makes the bounded scenes hit frame budget. WorldGEN
-        // (effectively infinite terrain) KEEPS the default reach. Only applied when clip_half is still the global
-        // default (160) so an explicit `StreamingConfig` override — e.g. the bench's ADVENTURE_CLIP_HALF — wins.
-        const BOUNDED_SCENE_CLIP_HALF: i32 = 24;
-        if matches!(*scene, VoxelScene::Sponza | VoxelScene::Gallery)
-            && streaming.cfg.clip_half_bricks == StreamingConfig::default().clip_half_bricks
-        {
-            streaming.cfg.clip_half_bricks = BOUNDED_SCENE_CLIP_HALF;
-        }
         match *scene {
             VoxelScene::Sponza => {
                 lighting.data = LightingUniformData::sponza();
@@ -1925,12 +1912,7 @@ impl LightingUniformData {
             ambient_color: [0.09, 0.10, 0.13],
             ao_radius: 1.2,
             ao_samples: 4,
-            // ReSTIR-correct INITIAL sampling: ONE candidate per pixel. The temporal+spatial reservoir reuse +
-            // the world-cache radiance (low-variance, multi-bounce) do the variance reduction — tracing many
-            // initial bounces per pixel every frame (the old 16) is brute force that defeats ReSTIR and was the
-            // single dominant GPU cost (restir_p1 ~35 ms at 16 → ~3 ms at 1 inside Bistro). Knobs-as-uniforms; the
-            // editor slider raises it for a still-frame reference shot.
-            gi_rays: 1,
+            gi_rays: 16, // a strong, low-variance colour-bleed signal for the GI measurement
             gi_intensity: 1.0,
             gi_bounce_dist: 48.0, // long enough to cross the ~30 m nave (wall→far-colonnade bounce)
             emissive_strength: 4.0, // Sponza has no baked emitters, but keep the knob at the open-world default
@@ -2128,12 +2110,7 @@ impl Default for WorldCacheUniformData {
             view_x: 0.0,
             view_y: 0.0,
             view_z: 0.0,
-            // 2.4 default: SHARC-style amortization — refresh at most this many active cache cells per frame
-            // (rotating window; the rest keep last frame's radiance and update next frame). The temporal blend
-            // makes the cache converge identically while bounding the per-frame `world_cache_update` bounce-trace
-            // cost, which was the dominant GI pass on a dense scene (measured ~10 ms/frame unbounded inside Bistro;
-            // ~0 at this cap). 4096 fully refreshes a Bistro-interior active set (~30k cells) every ~8 frames.
-            max_active_cells_per_frame: 4096,
+            max_active_cells_per_frame: 0, // 2.4 default: UNLIMITED (no behaviour change; cap is opt-in)
             light_count: 0,                // 2.5: stamped per frame from the packed light list (0 ⇒ NEE skipped)
             nee_enabled: 1,                // 2.5 default: NEE ON (the principled firefly/variance fix; A/B-gated)
             nee_samples: 1,                // 2.5 default: 1 shadow ray/cell/frame (the temporal blend averages)

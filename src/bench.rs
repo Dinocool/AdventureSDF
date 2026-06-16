@@ -110,7 +110,6 @@ pub fn install_bistro_bench(app: &mut App) {
     if std::env::var("ADVENTURE_DEBUG_VIEW").is_ok()
         || std::env::var("ADVENTURE_GI_RAYS").is_ok()
         || std::env::var("ADVENTURE_WC").is_ok()
-        || std::env::var("ADVENTURE_WC_CAP").is_ok()
     {
         app.add_systems(Update, force_lighting_overrides);
     }
@@ -186,9 +185,6 @@ fn force_lighting_overrides(
     }
     if let Ok(v) = std::env::var("ADVENTURE_WC").unwrap_or_default().trim().parse::<u32>() {
         wc.data.use_world_cache = v;
-    }
-    if let Ok(v) = std::env::var("ADVENTURE_WC_CAP").unwrap_or_default().trim().parse::<u32>() {
-        wc.data.max_active_cells_per_frame = v;
     }
 }
 
