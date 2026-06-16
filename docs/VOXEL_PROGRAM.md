@@ -152,10 +152,30 @@ Sponza/Sibenik/Conference into the world via `MergedSource`, bounded-RAM, replac
 + **`bistro.vxo` produced** (13.17 B cells, 354 M solids, 82.7 MB, <4 GiB bake) + added to the gallery →
 **the classic-scene corpus (Sponza/Sibenik/Conference/Bistro) is now complete + streamable in the world.**
 
-**NEXT:** the shared **GPU-driven residency/render pipeline** (Phase G, reframed — enumeration/compaction/pool/
-per-chunk BLAS) developed ON the static `.vxo` scenes (the `.vxo` region decode is the GPU "source", eventually
-readback-free) — this is what makes the gallery (and later worldgen) FAST; today it loads correctly but streams
-in slowly (the shared cost). Worldgen (the parked 3D-density-field technique decision + the SOTA double-check) and
-D2 screen-error LOD follow. Sequencing TBD with the user.
+**G2-pre LODS bake ✓ + the live-freeze TRACE (2026-06-16) — "streams in slowly" is now MEASURED.** The gallery
+load stutter has been instrumented (`info_span!` on the voxel-RT systems, `c76838c`) and traced on the live
+editor. Two of the three load costs are now FIXED, and the third is pinned:
+- ✅ **Coarse-LOD source** — was the headless cold-load OOM (demand-downsample, ~64,000 s / 26 GB). FIXED by
+  baking the coarse pyramid into the `.vxo` `LODS` chunk: format+writer+reader+read-path (Stages 1/2/0,
+  `a3d2f6a`/`6d42588`/`947f09c9`) + **all 4 corpus scenes re-baked with LODS incl. Bistro @354 M voxels via the
+  tiled path** (`14d8738f`). Live `vox_drain_source` now **23 ms** (was the freeze).
+- ✅ **Grow-snapshots** — slab-arena growth forced ~200 ms full re-snapshots mid-load. FIXED by pre-sizing the
+  arena to `max_resident_bricks` (`5aa64281`): grow-snapshots **6→0**, `vox_pack_snapshot` gone from the hotspots.
+- ✅ **Off-origin coarse dispatch** — Sibenik/Conference lost far-LOD geometry (LOD0-vs-coarse coord mismatch).
+  FIXED (`466d857d`, `offset_at_lod`/`lod_bounds` ÷2^L).
+- 🔜 **THE REMAINING LIVE FREEZE = `vox_pack_update`** (the CPU `ResidentPacker` incremental pack of the streaming
+  shell): **3.4 s/load, ~282 ms/call ×12** (the cold-load batch pack — A1/A4.4's O(changed) win is steady-state;
+  the cold fill still pays O(shell)), + `vox_blas_delta` 668 ms. This is the Phase-G target. **Near-term #146
+  Tier 2** = rayon two-phase `pack_one` split (Phase 1 `par_iter().map(pack_one)` pure → Phase 2 serial
+  `emit_changed_slot`, byte-identical) — cuts ~282 ms/call ~Ncores× WITHOUT the full GPU pivot. **Structural
+  #146 Tier 3 / Phase G** = readback-free GPU pack + BLAS (also kills `vox_blas_delta`).
+
+**NEXT (parallel tracks, trace-driven):**
+- **#146 Tier 2 — rayon `pack_one`** (runtime, `incremental.rs`/`gpu.rs`): the immediate live-freeze fix.
+- **#144 — constant-RAM bake Stages 1-3** (offline, `voxelize_scene.rs`/`writer.rs`): disk-spill base + windowed
+  coarse + flat-RSS gate + the scratch-location robustness fix (the bake defaulted scratch to the system drive C:
+  and filled it — `voxelize_scene.rs:232`). The user's memory-agnostic-bake directive; also a Phase-G prerequisite.
+- THEN **Phase G** (GPU pack/enumeration/compaction — supersedes Tier 2's CPU pack + `vox_blas_delta`) and **D2**
+  screen-error LOD. Worldgen (parked 3D-density-field decision) follows.
 
 **R2b reconciliation for A1 (IMPORTANT — the design doc predates R2b's final state):** R2b **removed `snapshot_buffers`** (the raw fixed-block arena) and made the per-brick voxel payload a **VARIABLE-size index stream** (`index_bits·1000/32` words: 32 for 1-bit … 500 for 16-bit). So A1's fixed-capacity O(changed) upload can no longer assume a 1000-u32 fixed block per slot. A1 must choose: **(a)** re-add a RAW fixed-block path + an `index_bits==0 ⇒ raw` shader decode branch (the doc's "A1-β" — keeps the fixed-block free-list + O(changed) `queue_write_buffer`, at the cost of R2's VRAM win on the *streamed* path; recover it later via the persistent-interner A4.4), or **(b)** a variable-size paletted index arena (keeps R2 VRAM, needs a non-fixed-block allocator). Recommend (a) first. The A1 agent reconciles against the post-R2b code, not the pre-R2b doc text.
