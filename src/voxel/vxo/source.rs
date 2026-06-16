@@ -369,6 +369,14 @@ impl VxoSource {
         (cache.map.len(), cache.bytes)
     }
 
+    /// The number of SYNTHESIZED coarse bricks currently memoized (`lod > 0`) — the demand-downsample footprint
+    /// (every coarse brick built so far, retained for the source's lifetime). A residency-profiling probe for the
+    /// coarse-LOD demand-downsample stage: paired with [`Self::cache_stats`] it shows how many transitive LOD0
+    /// regions the coarse synthesis touched.
+    pub fn coarse_memo_len(&self) -> usize {
+        self.cache.lock().expect("region cache lock").coarse.len()
+    }
+
     /// The LOD0 core brick at LOCAL (offset-applied) brick coord `local` (the streamed read path): bucket to the
     /// Euclidean region → `BIDX` binary-search (absent ⇒ `uniform(AIR)`) → region-cache lookup (miss ⇒ lazy
     /// mmap read + decode + LRU insert) → in-region brick binary-search (absent ⇒ `uniform(AIR)`) → decode via
@@ -652,6 +660,23 @@ impl MergedSource {
             }
         }
         Self::new(assets)
+    }
+
+    /// Aggregate decoded-region-LRU + coarse-memo stats across every placed asset:
+    /// `(decoded_regions, decoded_bytes, coarse_bricks)` — the SUM over assets of each asset's
+    /// [`VxoSource::cache_stats`] + [`VxoSource::coarse_memo_len`]. A residency-profiling probe (the streamed
+    /// gallery's RAM + demand-downsample footprint at a glance); pure read of the per-asset caches.
+    pub fn cache_stats(&self) -> (usize, usize, usize) {
+        let mut regions = 0usize;
+        let mut bytes = 0usize;
+        let mut coarse = 0usize;
+        for a in &self.assets {
+            let (r, b) = a.source.cache_stats();
+            regions += r;
+            bytes += b;
+            coarse += a.source.coarse_memo_len();
+        }
+        (regions, bytes, coarse)
     }
 
     /// The asset whose placed brick AABB contains `coord`, or `None` if `coord` is in no asset's extent. The
