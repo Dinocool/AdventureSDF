@@ -949,7 +949,7 @@ pub struct PalettedBrick {
 }
 
 /// The smallest power-of-2 bit width in `{1,2,4,8,16}` that can index `k` distinct ids (`2^bits >= k`).
-fn pow2_index_bits(k: usize) -> u8 {
+pub fn pow2_index_bits(k: usize) -> u8 {
     // ceil(log2 k) for k >= 2; k <= 1 still needs 1 bit (a single 0 index).
     let needed = if k <= 1 { 1 } else { usize::BITS - (k - 1).leading_zeros() };
     match needed {

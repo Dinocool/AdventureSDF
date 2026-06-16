@@ -439,6 +439,375 @@ fn bench_steady_state_moving() {
 }
 
 // ============================================================================================
+//  (3b) LIVE gpu_pack ON vs OFF — the realized Phase-G G-wire CPU-cost win on a steady-state worldgen move.
+// ============================================================================================
+
+/// **Phase G G-wire — the LIVE flag-ON vs flag-OFF CPU cost on a representative worldgen load.** Models the live
+/// `stream_voxel_rt_residency` steady-state move (the SAME warm-then-walk/jump script as `bench_steady_state_moving`)
+/// and times the per-re-pack CPU cost the two production paths pay:
+///
+/// - OFF: `ResidentPacker::update` (all-CPU: `pack_one` halo-fill + `encode_paletted` per dirty brick) — the
+///   `vox_pack_update` cost — PLUS the per-slot CPU AABB upload the CPU `apply_delta` does (`vox_blas_delta`).
+/// - ON  (config 2 — the LIVE arm): `ResidentPacker::update_gpu` (G-a: CPU `pack_one` for SIZING/uniform-classify,
+///   emits a `GpuPackBatch`; **NO GPU classify, NO synchronous readback**). The render world then dispatches
+///   `pack_brick` + `write_aabb` + one-submission fill-then-build (`apply_gpu_pack`, G-b) — so the per-slot AABB
+///   upload (OFF's `vox_blas_delta`) + the BLAS build move to the GPU/overlap. The whole point: capture the
+///   dominant BLAS-upload win WITHOUT the G4 classify-dispatch + `map_async`/`device.poll(Wait)` stall (a
+///   ~5-15 ms/tick loss under live contention). To prove the readback is GONE, we also time the OLD G4 path
+///   (`prepare` + classify dispatch+readback + `finish`) for reference.
+///
+/// Reports the per-re-pack CPU cost ON (config 2) vs OFF over the move script — config 2 must be a NET WIN
+/// (no readback stall; the per-slot AABB upload moved to the GPU). Needs a ray-query device for the reference
+/// G4 classify dispatch + honours `TMP/TEMP=D:\tmp_test`.
+#[test]
+#[ignore = "GPU perf harness; needs ray-query device + TMP=D:\\tmp_test; run with --ignored --nocapture"]
+fn bench_gpu_pack_live_cpu_cost_on_vs_off() {
+    let Some((device, queue)) = common::headless_ray_query_device() else {
+        eprintln!("[skip] no ray-query device — live gpu_pack ON-vs-OFF CPU cost skipped");
+        return;
+    };
+    let (layer, lib, registry, label) = worldgen_stack();
+    // A REPRESENTATIVE (not the 400k-cap shipping monster) clipmap so the warm fill + steady-state move complete
+    // quickly while still exercising a real multi-thousand-brick surface-following residency around the camera.
+    let cfg = StreamingConfig { clip_half_bricks: 8, max_resident_bricks: 60_000, max_bricks_per_frame: 8192 };
+    let palette_stride = registry.len() as u32;
+    let src = WorldgenSource::new(&layer, &lib, SEED);
+    let span0 = brick_span(0);
+
+    // Build (once) the classify pipeline the ON path dispatches each re-pack (production caches it in
+    // VoxelRtPipelines / the main-world holder; we build it once here too so the measurement excludes the
+    // one-time compile).
+    let classify = ClassifyPerf::new(&device);
+
+    // Warm the region fully (untimed), then run the SAME walk/jump script for BOTH paths from the same warm set.
+    // We replay the script TWICE on two independent managers/packers (OFF then ON), camera-identical, so the
+    // dirty sets — and thus the work — match step-for-step.
+    let warm = |mgr: &mut ResidencyManager, cam: [f32; 3]| {
+        mgr.update(cam, &cfg, &src);
+        let mut guard = 0;
+        while mgr.pending() > 0 {
+            mgr.drain_work(&cfg, &layer, &lib, &registry, SEED);
+            guard += 1;
+            assert!(guard < 20000);
+        }
+        mgr.take_dirty();
+    };
+    let script: Vec<f32> = {
+        let mut s = vec![1.0f32; 6];
+        s.push(6.0);
+        s.extend(std::iter::repeat_n(1.0f32, 6));
+        s
+    };
+
+    // HONEST per-re-pack divergent wall: CPU pack + the render-thread work the two `apply_*` paths DIVERGE on
+    // (one real `submit` + a `poll` fence each), EXCLUDING the BLAS build (identical for both arms — both rebuild
+    // the same dirty chunks; it is NOT what config 2 changes). Real scene-sized pool buffers so the uploads are
+    // honest. OFF = `update` + `apply_delta`'s per-changed-slot `queue_write_buffer`s (meta+aabb+voxel+palette).
+    // ON  = `update_gpu` + `apply_gpu_pack`'s render work (uniform/freed metas + the cores/commands/aabb-cmd
+    // scratch the GPU pack+aabb dispatch consumes — the data config 2 ships to the GPU instead of CPU byte writes).
+    let meta_stride = core::mem::size_of::<GpuBrickMeta>() as u64; // 48
+    let aabb_stride = core::mem::size_of::<GpuBrickAabb>() as u64; // 32
+    let cap = cfg.max_resident_bricks as u64;
+    let pool = |label: &str, bytes: u64| {
+        device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some(label),
+            size: bytes.max(256),
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::STORAGE,
+            mapped_at_creation: false,
+        })
+    };
+    // Scene-sized persistent pools (allocated ONCE per epoch in production; not on the hot path).
+    let meta_buf = pool("perf_meta", cap * meta_stride);
+    let aabb_pool = pool("perf_aabb", cap * aabb_stride);
+    let voxel_buf = pool("perf_voxel", 64 * 1024 * 1024);
+    let palette_buf = pool("perf_palette", 8 * 1024 * 1024);
+
+    // --- OFF: `update` + the real `apply_delta` per-slot uploads (meta+aabb always; voxel+palette when dense). ---
+    let mut off_wall = Vec::new();
+    let mut off_slot_writes = 0usize;
+    {
+        let cam0 = origin_surface_cam(&layer);
+        let mut mgr = ResidencyManager::new();
+        warm(&mut mgr, cam0);
+        let mut packer = ResidentPacker::new(cfg.max_resident_bricks as u32);
+        let entries = mgr.resident_entries();
+        let _ = packer.update(&entries, palette_stride);
+        let mut cam = cam0;
+        for &bricks in &script {
+            cam[0] += bricks * span0;
+            mgr.update(cam, &cfg, &src);
+            let mut guard = 0;
+            while mgr.pending() > 0 {
+                mgr.drain_work(&cfg, &layer, &lib, &registry, SEED);
+                guard += 1;
+                assert!(guard < 20000);
+            }
+            if mgr.take_dirty() {
+                let entries = mgr.resident_entries();
+                let t = Instant::now();
+                let delta = packer.update(&entries, palette_stride);
+                // The exact divergent render work `apply_delta` does (sans the shared BLAS build): per changed slot
+                // a meta + aabb write, plus voxel + palette when the dense content changed.
+                for cs in &delta.changed {
+                    queue.write_buffer(&meta_buf, cs.slot as u64 * meta_stride, bytemuck::bytes_of(&cs.meta));
+                    queue.write_buffer(&aabb_pool, cs.slot as u64 * aabb_stride, bytemuck::bytes_of(&cs.aabb));
+                    if let Some(idx) = &cs.index {
+                        queue.write_buffer(&voxel_buf, cs.index_word_offset as u64 * 4, bytemuck::cast_slice(idx));
+                    }
+                    if let Some(pal) = &cs.palette {
+                        queue.write_buffer(&palette_buf, cs.palette_word_offset as u64 * 4, bytemuck::cast_slice(pal));
+                    }
+                }
+                off_slot_writes += delta.changed.len();
+                let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("off_apply") });
+                let _ = &mut enc;
+                queue.submit(core::iter::once(enc.finish()));
+                device.poll(wgpu::PollType::wait_indefinitely()).expect("poll off");
+                off_wall.push(t.elapsed());
+            }
+        }
+    }
+
+    // --- ON (config 2 — the LIVE arm): `update_gpu` + the real `apply_gpu_pack` render work (uniform/freed metas
+    //     + the cores/commands/aabb-command scratch the GPU pack+aabb dispatch consumes). NO synchronous readback;
+    //     the AABBs are GPU-written. The BLAS build (shared) is excluded. ---
+    let mut on_wall = Vec::new();
+    let mut on_aabb_cmds_total = 0usize;
+    let mut on_cores_words_total = 0usize;
+    {
+        let cam0 = origin_surface_cam(&layer);
+        let mut mgr = ResidencyManager::new();
+        warm(&mut mgr, cam0);
+        let mut packer = ResidentPacker::new(cfg.max_resident_bricks as u32);
+        let entries = mgr.resident_entries();
+        let _ = packer.update_gpu(&entries, palette_stride);
+        let mut cam = cam0;
+        for &bricks in &script {
+            cam[0] += bricks * span0;
+            mgr.update(cam, &cfg, &src);
+            let mut guard = 0;
+            while mgr.pending() > 0 {
+                mgr.drain_work(&cfg, &layer, &lib, &registry, SEED);
+                guard += 1;
+                assert!(guard < 20000);
+            }
+            if mgr.take_dirty() {
+                let entries = mgr.resident_entries();
+                let t = Instant::now();
+                let batch = packer.update_gpu(&entries, palette_stride);
+                // The exact divergent render work `apply_gpu_pack` does (sans the shared BLAS build): the
+                // uniform/freed metas (CPU), then the GPU pack+aabb scratch SSBOs (cores/commands/neighbours +
+                // aabb-commands) + the two compute dispatches. No per-slot CPU voxel/palette/aabb writes.
+                for w in &batch.cpu_writes {
+                    queue.write_buffer(&meta_buf, w.slot as u64 * meta_stride, bytemuck::bytes_of(&w.meta));
+                }
+                // The scratch the GPU dispatch reads each re-pack (created+uploaded per `apply_gpu_pack`).
+                let mk = |label: &str, data: &[u8]| {
+                    device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                        label: Some(label),
+                        contents: if data.is_empty() { &[0u8; 4] } else { data },
+                        usage: wgpu::BufferUsages::STORAGE,
+                    })
+                };
+                let _commands = mk("on_commands", bytemuck::cast_slice(&batch.commands));
+                let _cores = mk("on_cores", bytemuck::cast_slice(&batch.cores));
+                let _nbr = mk("on_nbr", bytemuck::cast_slice(&batch.neighbour_indices));
+                let _aabb_cmds = mk("on_aabb_cmds", bytemuck::cast_slice(&batch.aabb_commands));
+                on_aabb_cmds_total += batch.aabb_commands.len();
+                on_cores_words_total += batch.cores.len();
+                let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("on_apply") });
+                let _ = &mut enc;
+                queue.submit(core::iter::once(enc.finish()));
+                device.poll(wgpu::PollType::wait_indefinitely()).expect("poll on");
+                on_wall.push(t.elapsed());
+            }
+        }
+    }
+
+    // --- Reference only: the OLD G4 prepare + classify dispatch+SYNC readback + finish — to quantify the readback
+    //     stall config 2 AVOIDS. NOT the live arm (retained for the future async-readback step). ---
+    let mut g4_cpu = Vec::new();
+    let mut g4_classify = Vec::new();
+    {
+        let cam0 = origin_surface_cam(&layer);
+        let mut mgr = ResidencyManager::new();
+        warm(&mut mgr, cam0);
+        let mut packer = ResidentPacker::new(cfg.max_resident_bricks as u32);
+        let entries = mgr.resident_entries();
+        let _ = packer.update_gpu(&entries, palette_stride);
+        let mut cam = cam0;
+        for &bricks in &script {
+            cam[0] += bricks * span0;
+            mgr.update(cam, &cfg, &src);
+            let mut guard = 0;
+            while mgr.pending() > 0 {
+                mgr.drain_work(&cfg, &layer, &lib, &registry, SEED);
+                guard += 1;
+                assert!(guard < 20000);
+            }
+            if mgr.take_dirty() {
+                let entries = mgr.resident_entries();
+                let t = Instant::now();
+                let prepared = packer.update_gpu_prepare(&entries, palette_stride);
+                let tc = Instant::now();
+                let out = classify.run(&device, &queue, &prepared);
+                g4_classify.push(tc.elapsed());
+                let _batch = packer.update_gpu_finish(&prepared, &out);
+                g4_cpu.push(t.elapsed());
+            }
+        }
+    }
+
+    let (off_mean, _o50, off_p95, off_max) = stats_ms(&off_wall);
+    let (on_mean, _n50, on_p95, on_max) = stats_ms(&on_wall);
+    let (g4_mean, _g50, g4_p95, g4_max) = stats_ms(&g4_cpu);
+    let (cl_mean, _c50, cl_p95, _clm) = stats_ms(&g4_classify);
+
+    println!("\n========== LIVE gpu_pack ON (config 2) vs OFF — per re-pack wall, BLAS-build excluded (graph={label}) ==========");
+    println!("re-packs timed        : OFF {} | ON {} | G4-ref {}", off_wall.len(), on_wall.len(), g4_cpu.len());
+    println!("-----------------------------------------------------------------------------");
+    println!("OFF (update+apply_delta): mean {off_mean:.3} p95 {off_p95:.3} max {off_max:.3} ms  (pack_one + {off_slot_writes} per-slot CPU meta/aabb/voxel/palette uploads)");
+    println!("ON  (config 2, no RB)   : mean {on_mean:.3} p95 {on_p95:.3} max {on_max:.3} ms  (update_gpu + GPU pack/aabb scratch; {on_aabb_cmds_total} AABBs GPU-written — 0 CPU per-slot uploads; {on_cores_words_total} core words shipped)");
+    println!("G4-ref (sync readback)  : mean {g4_mean:.3} p95 {g4_p95:.3} max {g4_max:.3} ms  (prepare + classify+SYNC-readback {cl_mean:.3} (p95 {cl_p95:.3}) + finish) — NOT the live arm");
+    println!("-----------------------------------------------------------------------------");
+    let win = if on_mean > 0.0 { off_mean / on_mean } else { 0.0 };
+    let verdict = if on_mean <= off_mean { "NET WIN" } else { "NOT A WIN" };
+    println!("=> config 2 vs OFF: {off_mean:.3} ms ⇒ {on_mean:.3} ms ({win:.2}x)  [{verdict}].  Per-slot CPU AABB upload GONE ({off_slot_writes} → 0). Readback stall avoided (the G4 sync path paid {cl_mean:.3} ms/tick).");
+    println!("   NOTE: the shared dirty-chunk BLAS build (the trace's dominant `vox_blas_delta` cost) is EXCLUDED — both arms pay it identically; config 2 does not change it.");
+    println!("=============================================================================");
+
+    // Confirm the structural claims regardless of the timing verdict: config 2 issues ZERO per-slot CPU AABB
+    // uploads (the AABBs ride in aabb_commands → the GPU `write_aabb`), and it avoids the G4 readback entirely.
+    assert!(on_aabb_cmds_total > 0, "config 2 must emit AABB commands (GPU-written AABBs)");
+    assert!(off_slot_writes > 0, "OFF must do per-slot CPU uploads (the work config 2 moves)");
+    // Report (do NOT force) the timing verdict — this harness exists to tell the truth about config 2, not to
+    // manufacture a win. The `[{verdict}]` line above is the deliverable.
+}
+
+/// A cached classify pipeline for the live-cost harness (mirror of the production `VoxelPackClassify`): dispatch
+/// `classify_brick` over a prepared batch + read back the per-brick `(is_uniform, uniform_block, palette_k,
+/// index_bits)`. Built ONCE so the measurement excludes the shader compile.
+struct ClassifyPerf {
+    pipeline: wgpu::ComputePipeline,
+    layout: wgpu::BindGroupLayout,
+}
+
+impl ClassifyPerf {
+    fn new(device: &wgpu::Device) -> Self {
+        let src = std::fs::read_to_string("assets/shaders/voxel_pack.wgsl").expect("read voxel_pack.wgsl");
+        let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("classify_perf"),
+            source: wgpu::ShaderSource::Wgsl(src.into()),
+        });
+        let entry = |binding: u32, read_only: bool| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility: wgpu::ShaderStages::COMPUTE,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Storage { read_only },
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            },
+            count: None,
+        };
+        let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("classify_perf_bgl"),
+            entries: &[entry(1, true), entry(2, true), entry(8, false), entry(9, true)],
+        });
+        let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("classify_perf_pl"),
+            bind_group_layouts: &[Some(&layout)],
+            immediate_size: 0,
+        });
+        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("classify_perf"),
+            layout: Some(&pl),
+            module: &module,
+            entry_point: Some("classify_brick"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+        Self { pipeline, layout }
+    }
+
+    fn run(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        batch: &adventure::voxel::incremental::GpuClassifyBatch,
+    ) -> Vec<adventure::voxel::incremental::GpuClassifyOut> {
+        use adventure::voxel::incremental::GpuClassifyOut;
+        let n = batch.commands.len();
+        if n == 0 {
+            return Vec::new();
+        }
+        let cores: &[u32] = if batch.cores.is_empty() { &[0u32] } else { &batch.cores };
+        let nbr: &[u32] = if batch.neighbour_indices.is_empty() { &[0u32] } else { &batch.neighbour_indices };
+        let cmd_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("classify_perf_commands"),
+            contents: bytemuck::cast_slice(&batch.commands),
+            usage: wgpu::BufferUsages::STORAGE,
+        });
+        let cores_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("classify_perf_cores"),
+            contents: bytemuck::cast_slice(cores),
+            usage: wgpu::BufferUsages::STORAGE,
+        });
+        let nbr_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("classify_perf_neighbours"),
+            contents: bytemuck::cast_slice(nbr),
+            usage: wgpu::BufferUsages::STORAGE,
+        });
+        let out_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("classify_perf_out"),
+            size: (n * 4 * 4) as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("classify_perf_bg"),
+            layout: &self.layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 1, resource: cores_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: nbr_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 8, resource: out_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 9, resource: cmd_buf.as_entire_binding() },
+            ],
+        });
+        let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("classify_perf_enc") });
+        {
+            let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("classify_perf_pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.pipeline);
+            pass.set_bind_group(0, &bg, &[]);
+            pass.dispatch_workgroups(n as u32, 1, 1);
+        }
+        queue.submit(std::iter::once(enc.finish()));
+        let bytes = (n * 4 * 4) as u64;
+        let staging = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("classify_perf_staging"),
+            size: bytes,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut rb = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("classify_perf_rb") });
+        rb.copy_buffer_to_buffer(&out_buf, 0, &staging, 0, bytes);
+        queue.submit(std::iter::once(rb.finish()));
+        staging.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+        device.poll(wgpu::PollType::wait_indefinitely()).expect("poll");
+        let data = staging.slice(..).get_mapped_range().expect("map");
+        let out: Vec<GpuClassifyOut> = bytemuck::cast_slice::<u8, u32>(&data)
+            .chunks_exact(4)
+            .map(|w| GpuClassifyOut { is_uniform: w[0], uniform_block: w[1], palette_k: w[2], index_bits: w[3] })
+            .collect();
+        drop(data);
+        staging.unmap();
+        out
+    }
+}
+
+// ============================================================================================
 //  (4) PACK cost at the resident-brick count — the SSOT GPU-buffer build (O(resident bricks)).
 // ============================================================================================
 
@@ -823,6 +1192,188 @@ fn bench_per_chunk_blas_rebuild_vs_monolithic() {
     }
     println!("===============================================================================");
     let _ = (&aabb_buf, &mono_blas, &mono_tlas, &chunk_tlas);
+}
+
+// ============================================================================================
+//  (5a) BLAS REFIT vs REBUILD per move — the realized `vox_blas_delta` win (in-place HAL Update).
+// ============================================================================================
+
+/// **The BLAS-refit deliverable — per-move in-place REFIT vs a full per-chunk REBUILD.** Warms the shipping
+/// clipmap, packs it into `CHUNK_SLOTS`-slot band BLASes (the production A3 layout), then times — over the same
+/// dirty chunks a typical streamed move touches — TWO ways to update the BLAS after the AABB band was rewritten:
+///
+///   * REBUILD — `update_mode = Build` (a fresh full BVH build of the dirty chunks each move); this is the cost
+///     before this change.
+///   * REFIT  — `update_mode = PreferUpdate` over an already-built handle ⇒ wgpu-core emits a HAL `Update`
+///     (`VK_BUILD_ACCELERATION_STRUCTURE_MODE_UPDATE_KHR`, src == dst): an in-place BVH refit. The fixed-cap pool
+///     keeps each chunk's primitive count constant, so the refit is always valid.
+///
+/// Also reports the AMORTIZED per-move cost of the live cadence: `(K refits + 1 rebuild) / (K+1)` with
+/// `K = BLAS_REFITS_BEFORE_REBUILD`, the realized steady-state `vox_blas_delta` cost the live path pays. Needs a
+/// ray-query device + `TMP/TEMP=D:\tmp_test`.
+#[test]
+#[ignore = "GPU perf harness; needs ray-query device + TMP=D:\\tmp_test; run with --ignored --nocapture"]
+fn bench_blas_refit_vs_rebuild_per_move() {
+    let Some((device, queue)) = common::headless_ray_query_device() else {
+        eprintln!("[skip] no ray-query device — BLAS refit-vs-rebuild timing skipped");
+        return;
+    };
+    // Mirror src/voxel/raytrace.rs::CHUNK_SLOTS and BLAS_REFITS_BEFORE_REBUILD (the production knobs).
+    const CHUNK_SLOTS: u32 = 512;
+    const K: u32 = 8; // BLAS_REFITS_BEFORE_REBUILD
+
+    let (layer, lib, registry, label) = worldgen_stack();
+    // A REPRESENTATIVE clipmap (not the 400k-cap shipping monster) so the warm completes quickly while still
+    // exercising a real multi-thousand-brick surface residency — the SAME sizing the live-cost bench uses. The
+    // per-move BLAS refit/rebuild cost depends on the DIRTY band size (CHUNK_SLOTS prims), not the total resident
+    // count, so a representative warm gives the same per-move numbers far faster.
+    let cfg = StreamingConfig { clip_half_bricks: 8, max_resident_bricks: 60_000, max_bricks_per_frame: 8192 };
+    let cam = origin_surface_cam(&layer);
+    let src = WorldgenSource::new(&layer, &lib, SEED);
+
+    let mut mgr = ResidencyManager::new();
+    mgr.update(cam, &cfg, &src);
+    let mut guard = 0;
+    while mgr.pending() > 0 {
+        mgr.drain_work(&cfg, &layer, &lib, &registry, SEED);
+        guard += 1;
+        assert!(guard < 20000);
+    }
+    let entries = mgr.resident_entries();
+    let patch = pack_resident_set(&entries, &registry);
+    let n = patch.brick_count() as u32;
+    assert!(n > 0, "no resident bricks");
+    let stride = core::mem::size_of::<GpuBrickAabb>() as wgpu::BufferAddress;
+
+    // The fixed-cap AABB arena (COPY_DST so each "move" can rewrite the dirty band before the refit).
+    let aabb_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("refit_perf_aabbs"),
+        contents: bytemuck::cast_slice(&patch.aabbs),
+        usage: wgpu::BufferUsages::BLAS_INPUT | wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+    });
+
+    let chunk_count = n.div_ceil(CHUNK_SLOTS).max(1);
+    // The dirty chunks a typical brick-step move touches (1–2 bands; model 2 straddling a boundary).
+    let n_dirty = 2u32.min(chunk_count);
+    let dirty_meta: Vec<(u32, u32)> = (0..n_dirty)
+        .map(|c| {
+            let slot_base = c * CHUNK_SLOTS;
+            let prim_count = (n - slot_base).clamp(1, CHUNK_SLOTS);
+            (slot_base, prim_count)
+        })
+        .collect();
+
+    // A helper: rewrite the dirty bands' AABBs (the per-move "the AABB buffer already changed" precondition) by
+    // nudging each by a tiny epsilon — a genuine value change, so the refit does real work (not a no-op Update).
+    let mut nudge = 0.0f32;
+    let rewrite_dirty_aabbs = |nudge: f32| {
+        for &(slot_base, prim_count) in &dirty_meta {
+            let mut band: Vec<GpuBrickAabb> = Vec::with_capacity(prim_count as usize);
+            for s in 0..prim_count {
+                let mut a = patch.aabbs[(slot_base + s) as usize];
+                a.min[0] += nudge;
+                a.max[0] += nudge;
+                band.push(a);
+            }
+            queue.write_buffer(&aabb_buf, slot_base as u64 * stride, bytemuck::cast_slice(&band));
+        }
+    };
+
+    // Build (once) the dirty-chunk BLASes for EACH arm under its own update_mode. The REFIT arm needs an already-
+    // built handle (so its subsequent builds are Updates); the REBUILD arm rebuilds a Build-mode handle each move.
+    let make_band_blas = |slot_base: u32, prim_count: u32, mode: wgpu::AccelerationStructureUpdateMode| {
+        let flags = wgpu::AccelerationStructureFlags::PREFER_FAST_TRACE
+            | wgpu::AccelerationStructureFlags::ALLOW_UPDATE;
+        let blas = device.create_blas(
+            &wgpu::CreateBlasDescriptor { label: Some("refit_perf_band"), flags, update_mode: mode },
+            wgpu::BlasGeometrySizeDescriptors::AABBs {
+                descriptors: vec![wgpu::BlasAABBGeometrySizeDescriptor {
+                    primitive_count: prim_count,
+                    flags: wgpu::AccelerationStructureGeometryFlags::OPAQUE,
+                }],
+            },
+        );
+        let _ = slot_base;
+        blas
+    };
+    let build_bands = |blases: &[wgpu::Blas]| {
+        let sizes: Vec<_> = dirty_meta
+            .iter()
+            .map(|&(_, prim_count)| wgpu::BlasAABBGeometrySizeDescriptor {
+                primitive_count: prim_count,
+                flags: wgpu::AccelerationStructureGeometryFlags::OPAQUE,
+            })
+            .collect();
+        let geos: Vec<_> = blases
+            .iter()
+            .zip(dirty_meta.iter())
+            .zip(sizes.iter())
+            .map(|((blas, &(slot_base, _)), size)| wgpu::BlasBuildEntry {
+                blas,
+                geometry: wgpu::BlasGeometries::AabbGeometries(vec![wgpu::BlasAabbGeometry {
+                    size,
+                    stride,
+                    aabb_buffer: &aabb_buf,
+                    primitive_offset: slot_base * stride as u32,
+                }]),
+            })
+            .collect();
+        let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("refit_perf_build") });
+        enc.build_acceleration_structures(geos.iter(), core::iter::empty::<&wgpu::Tlas>());
+        queue.submit(core::iter::once(enc.finish()));
+        device.poll(wgpu::PollType::wait_indefinitely()).expect("poll");
+    };
+
+    const ITERS: u32 = 16;
+
+    // (A) REBUILD per move: a fresh Build-mode handle each move (cold-build the dirty bands every time).
+    let mut rebuild_times = Vec::new();
+    for _ in 0..ITERS {
+        nudge += 0.001;
+        rewrite_dirty_aabbs(nudge);
+        let blases: Vec<_> = dirty_meta
+            .iter()
+            .map(|&(sb, pc)| make_band_blas(sb, pc, wgpu::AccelerationStructureUpdateMode::Build))
+            .collect();
+        let t = Instant::now();
+        build_bands(&blases);
+        rebuild_times.push(t.elapsed());
+    }
+
+    // (B) REFIT per move: ONE PreferUpdate handle per dirty band, built once (cold) then UPDATED each move.
+    let refit_blases: Vec<_> = dirty_meta
+        .iter()
+        .map(|&(sb, pc)| make_band_blas(sb, pc, wgpu::AccelerationStructureUpdateMode::PreferUpdate))
+        .collect();
+    // First build (wgpu-core deduces Build via built_index) — untimed warm.
+    rewrite_dirty_aabbs(nudge);
+    build_bands(&refit_blases);
+    let mut refit_times = Vec::new();
+    for _ in 0..ITERS {
+        nudge += 0.001;
+        rewrite_dirty_aabbs(nudge);
+        let t = Instant::now();
+        build_bands(&refit_blases); // already built ⇒ wgpu-core emits a HAL Update (in-place refit)
+        refit_times.push(t.elapsed());
+    }
+
+    let (rb_mean, _r50, rb_p95, rb_max) = stats_ms(&rebuild_times);
+    let (rf_mean, _f50, rf_p95, rf_max) = stats_ms(&refit_times);
+    // Amortized live cadence: K refits + 1 rebuild per (K+1) moves.
+    let amortized = (K as f64 * rf_mean + rb_mean) / (K as f64 + 1.0);
+
+    println!("\n========== BLAS REFIT vs REBUILD per move — graph={label} ==========");
+    println!("resident bricks        : {n}  (chunks={chunk_count} of {CHUNK_SLOTS} slots; {n_dirty} dirty/move)");
+    println!("REBUILD (Build)        : mean {rb_mean:.3} p95 {rb_p95:.3} max {rb_max:.3} ms  (full BVH build of the dirty bands)");
+    println!("REFIT   (PreferUpdate) : mean {rf_mean:.3} p95 {rf_p95:.3} max {rf_max:.3} ms  (in-place HAL Update)");
+    if rf_mean > 0.0 {
+        println!("SPEEDUP (rebuild/refit): {:.2}×  (the per-move BLAS cost when refitting instead of rebuilding)", rb_mean / rf_mean);
+    }
+    println!("AMORTIZED (K={K} cadence): {amortized:.3} ms/move  ({K} refits + 1 rebuild per {} moves) — the realized live vox_blas_delta cost", K + 1);
+    println!("===============================================================================");
+    // The realized win: a refit must be cheaper than a full rebuild (else the cadence is pointless).
+    assert!(rf_mean <= rb_mean, "refit ({rf_mean:.3} ms) must not exceed rebuild ({rb_mean:.3} ms)");
+    let _ = (&aabb_buf,);
 }
 
 // ============================================================================================

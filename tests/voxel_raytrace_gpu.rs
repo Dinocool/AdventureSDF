@@ -1102,3 +1102,317 @@ fn gpu_two_instance_world_plus_cube_matches_cpu() {
 
     let _ = (&aabb_buf, &meta_buf, &voxel_buf, &palette_buf, &brick_palettes_buf, &world_blas, &cube_blas, &tlas);
 }
+
+/// **The BLAS-REFIT streaming oracle** (the safety net for the `vox_blas_delta` in-place-refit win).
+///
+/// Builds a fixed-capacity AABB pool (the real terrain bricks + spare degenerate free slots, exactly like the
+/// live pool) into a single BLAS created with `PreferUpdate | ALLOW_UPDATE`, then drives a STREAMING SEQUENCE:
+///
+///   build (first build → wgpu-core auto-deduces `Build`) → refit → refit → … → periodic full rebuild → refit …
+///
+/// Each "move" translates the WHOLE scene by a whole number of bricks (so `voxel_origin` / `world_min` / the
+/// AABB corners all shift by an exact voxel count — the relative geometry is bit-identical), rewrites the meta +
+/// AABB pool, and rebuilds the SAME BLAS handle. Because `update_mode = PreferUpdate` and the handle was already
+/// built, wgpu-core emits a HAL `Update` (`VK_BUILD_ACCELERATION_STRUCTURE_MODE_UPDATE_KHR`, src == dst) — an
+/// in-place refit. On the [`BLAS_REFITS_BEFORE_REBUILD`]-th step we RECREATE the handle (mirroring `apply_delta`'s
+/// periodic-rebuild tick) so its next build is a fresh full `Build`, then resume refitting.
+///
+/// After EVERY step the same downward ray (shifted by the same offset) is traced and asserted against the CPU
+/// ground truth read from the (shifted) packed patch. A stale or incorrect refit AS — wrong `src`/`dst`, a missed
+/// `ALLOW_UPDATE`, or the wgpu-core patch mishandling `Update` — would leave the BLAS describing the OLD geometry
+/// and the GPU hit (block id / world-t) would diverge from the CPU oracle, failing this test. The whole-brick
+/// translation guarantees the surface is always reachable, so a clean miss is itself a failure.
+const REFIT_BLAS_REFITS_BEFORE_REBUILD: u32 = 8; // mirror of raytrace::BLAS_REFITS_BEFORE_REBUILD (private)
+
+#[test]
+fn gpu_refit_sequence_matches_cpu_ground_truth() {
+    let Some((device, queue)) = common::headless_ray_query_device() else {
+        eprintln!("no ray-query device — skipping gpu_refit_sequence_matches_cpu_ground_truth");
+        return;
+    };
+
+    let layer = test_layer();
+    let lib = test_library();
+    let reg = BlockRegistry::from_biome_library(&lib);
+
+    // A small region around the origin surface, packed once (the geometry we will translate each step).
+    let surf_h = layer.sample_world(0.0, 0.0, SEED).height;
+    let surf_vy = (surf_h / VOXEL_SIZE).floor() as i32;
+    let span = BRICK_EDGE;
+    let vmin = IVec3::new(-span, surf_vy - 2 * BRICK_EDGE, -span);
+    let vmax = IVec3::new(span, surf_vy + BRICK_EDGE, span);
+    let map = voxelize_region(vmin, vmax, &layer, &lib, &reg);
+    assert!(!map.is_empty(), "the region must contain terrain bricks");
+    let base = pack_brickmap(&map, &reg);
+    let n = base.brick_count() as u32;
+    assert!(n > 0);
+
+    let t_max = 100.0f32;
+    let aabb_stride = mem::size_of::<adventure::voxel::gpu::GpuBrickAabb>() as wgpu::BufferAddress;
+
+    // Fixed-capacity pool: the n real bricks + spare degenerate free slots (their AABBs collapsed to a point, so
+    // they are never ray candidates). The BLAS primitive count is `cap` for EVERY build — constant across refits,
+    // which is exactly what makes the in-place Update legal (the live fixed-cap pool's invariant).
+    let cap = n + 16;
+    let degenerate = adventure::voxel::gpu::GpuBrickAabb { min: [0.0; 3], max: [0.0; 3], _pad: [0.0; 2] };
+
+    // Translate the packed patch by `delta_bricks` whole bricks along +X (voxel_origin / world_min / aabb shift by
+    // an exact voxel count; the relative geometry — hence the hit answer for a correspondingly-shifted ray — is
+    // unchanged). Returns the padded (cap-length) aabb + meta byte blobs for the pool.
+    let shifted_pool = |delta_bricks: i32| -> (Vec<u8>, Vec<u8>) {
+        let dv = delta_bricks * BRICK_EDGE; // voxel offset
+        let dw = delta_bricks as f32 * BRICK_WORLD_SIZE; // world-metre offset
+        let mut aabbs = Vec::with_capacity(cap as usize);
+        let mut metas = Vec::with_capacity(cap as usize);
+        for i in 0..n as usize {
+            let mut a = base.aabbs[i];
+            a.min[0] += dw;
+            a.max[0] += dw;
+            aabbs.push(a);
+            let mut m = base.metas[i];
+            m.voxel_origin[0] += dv;
+            m.world_min[0] += dw;
+            metas.push(m);
+        }
+        for _ in n..cap {
+            aabbs.push(degenerate);
+            metas.push(base.metas[0]); // never traced (free slot's AABB is degenerate)
+        }
+        (bytemuck::cast_slice(&aabbs).to_vec(), bytemuck::cast_slice(&metas).to_vec())
+    };
+
+    // Persistent COPY_DST pool buffers (rewritten per move, like the live `scene.aabb_buf` / `scene.meta_buf`).
+    let (a0, m0) = shifted_pool(0);
+    let aabb_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("refit_aabbs"),
+        contents: &a0,
+        usage: wgpu::BufferUsages::BLAS_INPUT | wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+    });
+    let meta_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("refit_metas"),
+        contents: &m0,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+    });
+    let voxel_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("refit_voxels"),
+        contents: bytemuck::cast_slice(&base.voxels),
+        usage: wgpu::BufferUsages::STORAGE,
+    });
+    let palette_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("refit_palette"),
+        contents: bytemuck::cast_slice(&base.palette),
+        usage: wgpu::BufferUsages::STORAGE,
+    });
+    let brick_palettes_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("refit_brick_palettes"),
+        contents: bytemuck::cast_slice(&base.brick_palettes),
+        usage: wgpu::BufferUsages::STORAGE,
+    });
+    let descriptors_buf = common::instance_descriptors_buffer(&device);
+
+    let size_desc = wgpu::BlasAABBGeometrySizeDescriptor {
+        primitive_count: cap,
+        flags: wgpu::AccelerationStructureGeometryFlags::OPAQUE,
+    };
+    // The single mutable AS handle (recreated only on the periodic-rebuild tick) — created PreferUpdate + ALLOW_UPDATE.
+    let make_blas = || {
+        device.create_blas(
+            &wgpu::CreateBlasDescriptor {
+                label: Some("refit_blas"),
+                flags: wgpu::AccelerationStructureFlags::PREFER_FAST_TRACE
+                    | wgpu::AccelerationStructureFlags::ALLOW_UPDATE,
+                update_mode: wgpu::AccelerationStructureUpdateMode::PreferUpdate,
+            },
+            wgpu::BlasGeometrySizeDescriptors::AABBs { descriptors: vec![size_desc.clone()] },
+        )
+    };
+    let mut blas = make_blas();
+    let mut tlas = device.create_tlas(&wgpu::CreateTlasDescriptor {
+        label: Some("refit_tlas"),
+        flags: wgpu::AccelerationStructureFlags::PREFER_FAST_TRACE,
+        update_mode: wgpu::AccelerationStructureUpdateMode::Build,
+        max_instances: 1,
+    });
+    tlas[0] = Some(wgpu::TlasInstance::new(
+        &blas,
+        [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0],
+        0,
+        0xff,
+    ));
+
+    let ray_buf = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("ray"),
+        size: mem::size_of::<RayUniform>() as u64,
+        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    let out_buf = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("hit"),
+        size: mem::size_of::<GpuHit>() as u64,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        mapped_at_creation: false,
+    });
+    let read_buf = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("read"),
+        size: mem::size_of::<GpuHit>() as u64,
+        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+
+    let src = common::voxel_raytrace_shader_src();
+    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("voxel_raytrace"),
+        source: wgpu::ShaderSource::Wgsl(src.into()),
+    });
+    let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+        label: Some("trace_one"),
+        layout: None,
+        module: &shader,
+        entry_point: Some("trace_one"),
+        compilation_options: Default::default(),
+        cache: None,
+    });
+    let light_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("lighting"),
+        contents: bytemuck::bytes_of(&lighting_uniform()),
+        usage: wgpu::BufferUsages::UNIFORM,
+    });
+    let sky_buf = common::sky_uniform_buffer(&device);
+    let light_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("lighting_bg"),
+        layout: &pipeline.get_bind_group_layout(1),
+        entries: &[
+            wgpu::BindGroupEntry { binding: 2, resource: light_buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 11, resource: sky_buf.as_entire_binding() },
+        ],
+    });
+
+    // (Re)build the BLAS over the current pool + the TLAS, in one submission. `rebuild_handle` = recreate the AS
+    // first (forces a fresh full `Build`); otherwise the existing PreferUpdate handle Updates in place after its
+    // first build. The TLAS instance is re-pointed when the handle changes (mirrors `apply_delta`).
+    let build_accel = |blas: &wgpu::Blas, tlas: &wgpu::Tlas| {
+        let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("refit_build") });
+        enc.build_acceleration_structures(
+            iter::once(&wgpu::BlasBuildEntry {
+                blas,
+                geometry: wgpu::BlasGeometries::AabbGeometries(vec![wgpu::BlasAabbGeometry {
+                    size: &size_desc,
+                    stride: aabb_stride,
+                    aabb_buffer: &aabb_buf,
+                    primitive_offset: 0,
+                }]),
+            }),
+            iter::once(tlas),
+        );
+        queue.submit(Some(enc.finish()));
+    };
+
+    let run_ray = |bg: &wgpu::BindGroup, ro: Vec3, rd: Vec3| -> GpuHit {
+        let ray = RayUniform { origin: ro.into(), t_min: 0.0, dir: rd.into(), t_max };
+        queue.write_buffer(&ray_buf, 0, bytemuck::bytes_of(&ray));
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        {
+            let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: None,
+                timestamp_writes: None,
+            });
+            cpass.set_pipeline(&pipeline);
+            cpass.set_bind_group(0, Some(bg), &[]);
+            cpass.set_bind_group(1, Some(&light_bg), &[]);
+            cpass.dispatch_workgroups(1, 1, 1);
+        }
+        encoder.copy_buffer_to_buffer(&out_buf, 0, &read_buf, 0, mem::size_of::<GpuHit>() as u64);
+        queue.submit(Some(encoder.finish()));
+        let slice = read_buf.slice(..);
+        slice.map_async(wgpu::MapMode::Read, |r| r.expect("map failed"));
+        device.poll(wgpu::PollType::wait_indefinitely()).expect("poll failed");
+        let data = slice.get_mapped_range().unwrap();
+        let gpu: GpuHit = *bytemuck::from_bytes(&data);
+        drop(data);
+        read_buf.unmap();
+        gpu
+    };
+
+    // Bind group references the (possibly recreated) TLAS, so rebuild it after a handle swap.
+    let make_bg = |tlas: &wgpu::Tlas| {
+        device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &pipeline.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::AccelerationStructure(tlas) },
+                wgpu::BindGroupEntry { binding: 1, resource: meta_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: voxel_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: palette_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 12, resource: brick_palettes_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 13, resource: descriptors_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 4, resource: ray_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 5, resource: out_buf.as_entire_binding() },
+            ],
+        })
+    };
+
+    // The downward ray over the (translated) origin column, plus its CPU oracle, at brick-offset `delta_bricks`.
+    let assert_step = |label: &str, delta_bricks: i32, bg: &wgpu::BindGroup| {
+        let dw = delta_bricks as f32 * BRICK_WORLD_SIZE;
+        let ro = Vec3::new(BRICK_WORLD_SIZE * 0.5 + dw, surf_h + 5.0, BRICK_WORLD_SIZE * 0.5);
+        let rd = Vec3::new(0.0, -1.0, 0.0);
+        // CPU oracle over the SHIFTED packed patch (shift base.metas' world_min/voxel_origin by the same offset).
+        let mut shifted = base.clone();
+        for m in shifted.metas.iter_mut() {
+            m.voxel_origin[0] += delta_bricks * BRICK_EDGE;
+            m.world_min[0] += dw;
+        }
+        let (cpu_id, cpu_t) =
+            cpu_first_solid_packed(&shifted, ro, rd, t_max).expect("CPU ray must hit the shifted surface");
+        let gpu = run_ray(bg, ro, rd);
+        eprintln!("[{label}] dx={delta_bricks}br GPU hit={} id={} t={:.4} | CPU id={cpu_id} t={cpu_t:.4}", gpu.hit, gpu.block_id, gpu.t);
+        assert_eq!(gpu.hit, 1, "[{label}] GPU ray must hit (CPU did at t={cpu_t:.3})");
+        assert_eq!(gpu.block_id, cpu_id, "[{label}] block id must match CPU after refit");
+        assert!(
+            (gpu.t - cpu_t).abs() <= VOXEL_SIZE + 1e-3,
+            "[{label}] GPU hit-t {} must match CPU hit-t {} within one voxel after refit",
+            gpu.t,
+            cpu_t
+        );
+    };
+
+    // Step 0: FIRST build (PreferUpdate handle, `built_index` None ⇒ wgpu-core full Build).
+    build_accel(&blas, &tlas);
+    let mut bg = make_bg(&tlas);
+    assert_step("build", 0, &bg);
+
+    // Steps 1..=12: each translates the scene by one more brick, rewrites the pool, and rebuilds. Steps that are
+    // NOT the periodic-rebuild tick are in-place REFITS (Update); the tick recreates the handle (full Build). 12
+    // steps crosses the K=8 cadence at least once, exercising refit → … → rebuild → refit.
+    let mut refits_since_rebuild: u32 = 0;
+    for step in 1..=12i32 {
+        let (a, m) = shifted_pool(step);
+        queue.write_buffer(&aabb_buf, 0, &a);
+        queue.write_buffer(&meta_buf, 0, &m);
+
+        let periodic_rebuild = refits_since_rebuild >= REFIT_BLAS_REFITS_BEFORE_REBUILD;
+        if periodic_rebuild {
+            blas = make_blas(); // fresh handle ⇒ next build is a full Build
+            refits_since_rebuild = 0;
+            tlas[0] = Some(wgpu::TlasInstance::new(
+                &blas,
+                [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0],
+                0,
+                0xff,
+            ));
+        } else {
+            refits_since_rebuild += 1;
+        }
+        build_accel(&blas, &tlas);
+        if periodic_rebuild {
+            bg = make_bg(&tlas); // the TLAS handle is unchanged, but the instance now points at a new BLAS
+        }
+        let label = if periodic_rebuild { "rebuild" } else { "refit" };
+        assert_step(label, step, &bg);
+    }
+
+    // Sanity: we actually crossed the periodic-rebuild boundary at least once over the 12 steps.
+    assert!(12 > REFIT_BLAS_REFITS_BEFORE_REBUILD as i32, "the sequence must exercise a periodic rebuild");
+
+    let _ = (&voxel_buf, &palette_buf, &brick_palettes_buf, &meta_buf, &aabb_buf, &blas, &tlas, &bg);
+}

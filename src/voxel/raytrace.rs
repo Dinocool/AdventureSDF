@@ -49,7 +49,9 @@ use super::gpu::{
     GpuAliasEntry, GpuBrickAabb, GpuBrickMeta, GpuBrickPatch, GpuInstanceDescriptor, GpuVoxelLight,
     build_lights_from_entries, pack_brickmap, pack_resident_set,
 };
-use super::incremental::{RepackDelta, ResidentPacker, SnapshotBuffers};
+use super::incremental::{
+    GpuClassifyBatch, GpuClassifyOut, GpuPackBatch, RepackDelta, ResidentPacker, SnapshotBuffers,
+};
 use super::palette::{BlockId, BlockRegistry, CornellBlock};
 use super::source::{BrickSource, StaticVoxSource, WorldgenSource};
 use super::streaming::{BrickKey, ResidencyManager, StreamingConfig, camera_brick_coord, region_half_extent_m};
@@ -70,12 +72,19 @@ use crate::sdf_render::worldgen::{WorldBiomeShapes, WorldGraph};
 #[derive(Resource, Clone, Copy, Debug, ExtractResource)]
 pub struct VoxelRtToggle {
     pub enabled: bool,
+    /// **Phase G Stage G-a A/B flag.** When `true`, the streamed producer emits a GPU PACK batch
+    /// ([`ResidentPacker::update_gpu`]) and the render world encodes the bricks on the GPU
+    /// (`assets/shaders/voxel_pack.wgsl`) instead of the CPU `ResidentPacker::update` + `apply_delta`. OFF by
+    /// default — the whole GPU path is exercised only by the parity gate (`tests/voxel_gpu_pack_parity.rs`) +
+    /// an explicit toggle until it is trusted live. The CPU path is the byte SSOT the GPU path is proven against.
+    pub gpu_pack: bool,
 }
 
 impl Default for VoxelRtToggle {
     fn default() -> Self {
-        // HW-RT is the default (and only) renderer now — on at startup.
-        Self { enabled: true }
+        // HW-RT is the default (and only) renderer now — on at startup. The GPU pack is OFF by default (G-a is
+        // A/B-gated until its parity test is trusted live).
+        Self { enabled: true, gpu_pack: false }
     }
 }
 
@@ -99,6 +108,14 @@ pub enum VoxelRtUpload {
     /// fixed-cap buffers (meta/aabb at `slot · stride`, the raw dense block at `voxel_word_offset`). Rebuild the
     /// BLAS iff `delta.topology_changed`. Carries the FULL light list for the generation (NEE is not per-slot).
     Delta { delta: RepackDelta, brick_count: u32, lights: Vec<GpuVoxelLight>, alias: Vec<GpuAliasEntry> },
+    /// **Phase G Stage G-a — the GPU PACK upload (A/B-gated, OFF by default).** The incremental successor to
+    /// [`Delta`](Self::Delta): the CPU did the ALLOCATION ([`ResidentPacker::update_gpu`]) and shipped a
+    /// [`GpuPackBatch`]; the render world `queue_write_buffer`s the uniform/freed metas + every AABB (the
+    /// `cpu_writes`) and DISPATCHES `voxel_pack` over `batch.commands` (reading the uploaded cores) to encode the
+    /// dense bricks' index/palette/meta on the GPU — byte-identical to what the CPU `Delta` path would write
+    /// (pinned by `tests/voxel_gpu_pack_parity.rs`). Rebuild the BLAS iff `batch.topology_changed`. Like `Delta`,
+    /// only the epoch start ships a `StreamSnapshot`; this carries the FULL light list for the generation.
+    GpuPack { batch: GpuPackBatch, brick_count: u32, lights: Vec<GpuVoxelLight>, alias: Vec<GpuAliasEntry> },
 }
 
 impl VoxelRtUpload {
@@ -110,6 +127,8 @@ impl VoxelRtUpload {
             // A Delta never starts an epoch, so it always has a prior StreamSnapshot's buffers to patch — even an
             // all-freed delta still patches (collapsing slots to degenerate) and must not be skipped.
             VoxelRtUpload::Delta { .. } => false,
+            // A GpuPack (like Delta) patches a prior epoch's buffers — never starts one — so never "empty".
+            VoxelRtUpload::GpuPack { .. } => false,
         }
     }
 }
@@ -145,7 +164,7 @@ impl VoxelRtPatch {
     pub fn storage_report(&self) -> Option<super::gpu::StorageReport> {
         match &self.upload {
             VoxelRtUpload::Snapshot(p) => Some(p.storage_report()),
-            VoxelRtUpload::StreamSnapshot { .. } | VoxelRtUpload::Delta { .. } => None,
+            VoxelRtUpload::StreamSnapshot { .. } | VoxelRtUpload::Delta { .. } | VoxelRtUpload::GpuPack { .. } => None,
         }
     }
 }
@@ -270,6 +289,8 @@ impl Plugin for VoxelRtPlugin {
             .init_resource::<WorldCacheSettings>()
             .init_resource::<VoxelEdits>()
             .init_resource::<VoxelEditBrush>()
+            // Phase G G-wire — the main-world GPU-classify pipeline holder (built lazily on first live gpu_pack).
+            .init_resource::<VoxelPackClassifyState>()
             .add_plugins(ExtractResourcePlugin::<VoxelRtToggle>::default())
             .add_plugins(ExtractResourcePlugin::<VoxelRtPatch>::default())
             .add_plugins(ExtractResourcePlugin::<VoxelRtLighting>::default())
@@ -404,12 +425,24 @@ fn init_voxel_rt_streaming(
 fn stream_voxel_rt_residency(
     scene: Res<VoxelScene>,
     edits: Res<VoxelEdits>,
+    toggle: Res<VoxelRtToggle>,
     mut streaming: ResMut<VoxelRtStreaming>,
     mut patch_res: ResMut<VoxelRtPatch>,
     mut lighting: ResMut<VoxelRtLighting>,
     mut sky: ResMut<VoxelRtSky>,
     cam: Query<&GlobalTransform, With<SdfCamera>>,
+    // Phase G — the main-world device/queue (THIS fork keeps them in the main world, `bevy_render/src/settings.rs`)
+    // + the lazily-built classify pipeline. `Option` because the render device is created asynchronously and is
+    // absent on the first Startup ticks. RETAINED for the FUTURE async-readback step (the G4 classify path); the
+    // current live `gpu_pack` arm is "config 2" (G-a `update_gpu` + G-b `apply_gpu_pack`, NO readback) and does NOT
+    // touch them — hence the `_` bindings keep the resources required/warm without an unused-variable warning.
+    _render_device: Option<Res<RenderDevice>>,
+    _render_queue: Option<Res<RenderQueue>>,
+    _classify: ResMut<VoxelPackClassifyState>,
 ) {
+    // Phase G Stage G-a A/B flag (OFF by default): when set, the streamed re-pack emits a GPU PACK batch
+    // (`update_gpu`) the render world encodes on the GPU, instead of the all-CPU `update` + `apply_delta`.
+    let gpu_pack = toggle.gpu_pack;
     // Main-thread residency span — names this system in a chrome trace (Bevy's automatic per-system spans are
     // `trace`-level and dropped by the global `info` EnvFilter, so the heavy voxel work was otherwise invisible).
     // The child spans below (classify / drain / re-pack) split the cost so a capture names the exact culprit.
@@ -744,6 +777,60 @@ fn stream_voxel_rt_residency(
         // registry has no emitters — the common worldgen/Sponza case). The packer is `Some` for every streamed
         // scene (set on the switch); the `None` arm is a defensive first-tick fallback to a contiguous Snapshot.
         let upload = match packer.as_mut() {
+            // Phase G G-wire — the LIVE GPU PACK path (A/B-gated). The G4 split removes the CPU `pack_one`: the CPU
+            // `update_gpu_prepare` builds the deduped cores + 27-neighbour table + one classify command per dirty
+            // key (NO `pack_one`), the GPU `classify_brick` decides uniform/dense + the palette size class, the CPU
+            // reads it back and `update_gpu_finish` runs ONLY the cheap `SlabArena` allocation → the `GpuPackBatch`.
+            // The render world then dispatches `pack_brick`+`write_aabb` + fill-then-build (`apply_gpu_pack`). The
+            // epoch start / a grow still ships a `StreamSnapshot` (allocate the fixed-cap buffers once — not the hot
+            // path). Byte-identical to the CPU `Delta` path (the parity + render-identity gates). If the render
+            // device/queue are not yet available (the first Startup ticks, before the async device lands), fall back
+            // to the CPU-classify `update_gpu` so the path never stalls — it converges to the same allocation.
+            Some(p) if gpu_pack => {
+                // STREAMSNAPSHOT STAYS CPU. The FIRST pack of a streamed epoch ships a `StreamSnapshot` — a CPU
+                // `pack_one` of the whole initial resident set (a one-time cold-fill, NOT the trace's bulk). It MUST
+                // go through the CPU `update_gpu` (which keeps the raw-cell `last_voxels` shadow `snapshot_buffers`
+                // re-encodes). The arena is pre-sized (#146 Tier-1) so NO mid-stream grow-snapshot happens → the
+                // only snapshot is this first one. (A grow PAST the reserve still works — handled below by
+                // re-deriving `last_voxels` before snapshotting.)
+                let want_snapshot = !*epoch_snapshotted;
+                // Phase G — the LIVE gpu_pack path = "config 2" (G-a + G-b, NO READBACK). The CPU `update_gpu` does
+                // the (Tier-2-parallel) `pack_one` for SIZING/uniform-classify and emits a `GpuPackBatch`; the render
+                // world then dispatches `pack_brick` + `write_aabb` + one-submission fill-then-build (`apply_gpu_pack`).
+                // This captures the dominant `vox_blas_delta` BLAS/AABB-upload win (the ~668 ms/load that G-b moves to
+                // the GPU) WITHOUT the G4 classify dispatch + synchronous readback (`map_async` + `device.poll(Wait)`),
+                // which is a ~5-15 ms/tick stall under live GPU contention → a net LOSS on small steady-state deltas.
+                // The G4 `update_gpu_prepare`/classify/`update_gpu_finish` code is retained intact (incl. the
+                // `VoxelPackClassify` pipeline + the held device/queue/`classify` resources) as the basis for the
+                // FUTURE ASYNC-readback step — it is simply not on the live arm.
+                let batch = {
+                    let _su = info_span!("vox_pack_update_gpu").entered();
+                    p.update_gpu(&entries, active_registry.len() as u32)
+                };
+                let (lights, alias) = build_lights_from_entries(&entries, active_registry);
+                let brick_count = p.resident_count() as u32;
+                if want_snapshot || p.grew() {
+                    // A GROW past the pre-sized reserve forces a SECOND snapshot AFTER G4 ticks dropped some slots'
+                    // `last_voxels`. Restore the raw-cell shadow (re-`pack_one` the resident dense set) so the
+                    // snapshot is byte-correct. No-op on the first pack (every slot still has its CPU-path shadow).
+                    if !want_snapshot {
+                        let _rb = info_span!("vox_pack_repopulate_shadow").entered();
+                        p.repopulate_last_voxels(&entries);
+                    }
+                    let buffers = {
+                        let _ss = info_span!("vox_pack_snapshot").entered();
+                        p.snapshot_buffers(active_registry)
+                    };
+                    *epoch_snapshotted = true;
+                    VoxelRtUpload::StreamSnapshot { buffers, lights, alias }
+                } else if !batch.is_empty() {
+                    VoxelRtUpload::GpuPack { batch, brick_count, lights, alias }
+                } else {
+                    *worldgen_dirty_pending = false;
+                    *worldgen_frames_since_pack = 0;
+                    return;
+                }
+            }
             Some(p) => {
                 let delta = {
                     let _su = info_span!("vox_pack_update").entered();
@@ -776,6 +863,7 @@ fn stream_voxel_rt_residency(
         let (n, v) = match &upload {
             VoxelRtUpload::StreamSnapshot { buffers, .. } => (buffers.brick_count as usize, buffers.indices.len()),
             VoxelRtUpload::Delta { brick_count, delta, .. } => (*brick_count as usize, delta.changed.len()),
+            VoxelRtUpload::GpuPack { brick_count, batch, .. } => (*brick_count as usize, batch.commands.len()),
             VoxelRtUpload::Snapshot(p) => (p.brick_count(), p.voxels.len()),
         };
         patch_res.upload = upload;
@@ -1110,6 +1198,16 @@ struct VoxelRtPipelines {
     wc_compact_write_active: wgpu::ComputePipeline,
     wc_update: wgpu::ComputePipeline,
     wc_blend: wgpu::ComputePipeline,
+    /// **Phase G Stage G-a — the GPU PACK compute pipeline** (`voxel_pack.wgsl::pack_brick`) + its dedicated
+    /// bind-group layout (commands + cores read-only; voxel/palette/meta read_write). Dispatched ONLY in the
+    /// `GpuPack` upload arm (one workgroup per dirty dense brick) when the `gpu_pack` A/B flag is on.
+    pack: wgpu::ComputePipeline,
+    pack_layout: wgpu::BindGroupLayout,
+    /// **Phase G Stage G-b — the GPU AABB-write pipeline** (`voxel_pack.wgsl::write_aabb`) + its dedicated
+    /// bind-group layout (aabb_commands read-only @0; aabb_buf read_write @1). One INVOCATION per changed slot;
+    /// dispatched in the SAME encoder as the pack + the BLAS build (fill-then-build) in the `GpuPack` arm.
+    pack_aabb: wgpu::ComputePipeline,
+    pack_aabb_layout: wgpu::BindGroupLayout,
     /// The composite shader module + its bind-group layout + sampler. The composite render pipeline is
     /// built lazily (and cached) once the live view-target format is known.
     composite_module: wgpu::ShaderModule,
@@ -1283,6 +1381,17 @@ struct VoxelRtResources {
 /// instance limit), a cheap 512-prim per-band build, and a delta typically touches 1–few bands.
 const CHUNK_SLOTS: u32 = 512; // 8³ "bricks" worth of slots per chunk band
 
+/// Periodic-rebuild cadence for a chunk BLAS on the streamed live path: after this many in-place refits
+/// (`PreferUpdate`) the next dirty-chunk build is forced to a full `Build` (and the counter resets). A hardware
+/// BVH `Update` (`VK_BUILD_ACCELERATION_STRUCTURE_MODE_UPDATE_KHR`) keeps the spatial split topology from the
+/// original build and only adjusts node AABBs, so after many topology changes the tree's traversal quality
+/// drifts (overlapping/loose nodes). A full rebuild restores an optimal split. This mirrors the
+/// `sdf-bvh-incremental-refit` philosophy (refit cheaply, rebuild occasionally), but unlike the CPU SDF BVH —
+/// whose refit is a *conservative correct superset* needing no idle rebuild — a GPU AS refit measurably loses
+/// trace efficiency, so we rebuild on a cadence. `8` keeps the amortized cost dominated by cheap refits
+/// (≈7/8 refit + 1/8 rebuild) while bounding quality drift to a handful of moves.
+const BLAS_REFITS_BEFORE_REBUILD: u32 = 8;
+
 /// One slot-band chunk's BLAS + its slot range in the global buffers (A3 Stage 3). The BLAS reads its band as a
 /// SLICE of the shared `aabb_buf` via `primitive_offset = slot_base · 32`; `primitive_index` comes back
 /// geometry-relative (Stage 2), so the chunk's descriptor `meta_base = slot_base` resolves the global slot.
@@ -1293,6 +1402,12 @@ struct ChunkBlas {
     /// Number of slots (BLAS primitives) in this band (== [`CHUNK_SLOTS`] for full bands; the last band may be
     /// short when `capacity` isn't a multiple of [`CHUNK_SLOTS`]).
     prim_count: u32,
+    /// How many times this chunk's BLAS has been REFIT (`PreferUpdate`) since its last full `Build`. Drives the
+    /// periodic-rebuild cadence ([`BLAS_REFITS_BEFORE_REBUILD`]) — a hardware BVH refit reuses the spatial split
+    /// from the original build, so traversal quality degrades as the AABBs drift; a periodic rebuild restores it.
+    /// `0` immediately after a full build (incl. the first build in `build_scene_full`). The fixed-cap pool keeps
+    /// `prim_count` constant for the chunk's life, so a refit is always primitive-count-stable and valid.
+    refits_since_rebuild: u32,
 }
 
 struct SceneKeepAlive {
@@ -2256,6 +2371,78 @@ fn init_voxel_rt(mut commands: Commands, render_device: Res<RenderDevice>) {
     let wc_update = mk_wc("voxel_rt_wc_update", "world_cache_update", &world_cache_update_pl);
     let wc_blend = mk_wc("voxel_rt_wc_blend", "world_cache_blend", &world_cache_update_pl);
 
+    // --- Phase G Stage G-a — the GPU PACK pipeline (A/B-gated) ---
+    // `assets/shaders/voxel_pack.wgsl` (`pack_brick`): one workgroup per dirty dense brick, halo-fills + paletted-
+    // encodes + writes its index/palette/meta into the EXISTING pool buffers (bound read_write). Its own dedicated
+    // bind group layout (commands + cores read-only; voxel/palette/meta read_write) — bound only during the
+    // `GpuPack` upload arm, never in the trace passes. Built unconditionally (the module is tiny); only used when
+    // the `gpu_pack` flag is on.
+    let pack_src = std::fs::read_to_string("assets/shaders/voxel_pack.wgsl").expect("read voxel_pack.wgsl");
+    let pack_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("voxel_pack"),
+        source: wgpu::ShaderSource::Wgsl(pack_src.into()),
+    });
+    let pack_storage = |binding: u32, read_only: bool| wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::COMPUTE,
+        ty: wgpu::BindingType::Buffer {
+            ty: wgpu::BufferBindingType::Storage { read_only },
+            has_dynamic_offset: false,
+            min_binding_size: None,
+        },
+        count: None,
+    };
+    let pack_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("voxel_rt_pack_layout"),
+        entries: &[
+            pack_storage(0, true),  // commands
+            pack_storage(1, true),  // cores (deduped pool)
+            pack_storage(2, true),  // neighbour_indices (27 per command)
+            pack_storage(3, false), // voxel_buf (index stream)
+            pack_storage(4, false), // brick_palettes_buf
+            pack_storage(5, false), // meta_buf
+        ],
+    });
+    let pack_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("voxel_rt_pack_pl"),
+        bind_group_layouts: &[Some(&pack_layout)],
+        immediate_size: 0,
+    });
+    let pack = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+        label: Some("voxel_rt_pack"),
+        layout: Some(&pack_pl),
+        module: &pack_module,
+        entry_point: Some("pack_brick"),
+        compilation_options: Default::default(),
+        cache: None,
+    });
+
+    // --- Phase G Stage G-b — the GPU AABB-write pipeline (A/B-gated, same module) ---
+    // `voxel_pack.wgsl::write_aabb`: one invocation per changed slot, writes `aabb_buf[slot]` (resident →
+    // `brick_aabb`, freed → `degenerate_aabb`). Its own bind group (binding 6 = aabb_buf read_write, binding 7 =
+    // aabb_commands read-only — the WGSL hard-codes those binding numbers in the shared `@group(0)`). Dispatched
+    // in the SAME encoder as the pack + the BLAS build in the `GpuPack` arm (fill-then-build, one submission).
+    let pack_aabb_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("voxel_rt_pack_aabb_layout"),
+        entries: &[
+            pack_storage(6, false), // aabb_buf (read_write)
+            pack_storage(7, true),  // aabb_commands (read-only)
+        ],
+    });
+    let pack_aabb_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("voxel_rt_pack_aabb_pl"),
+        bind_group_layouts: &[Some(&pack_aabb_layout)],
+        immediate_size: 0,
+    });
+    let pack_aabb = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+        label: Some("voxel_rt_pack_aabb"),
+        layout: Some(&pack_aabb_pl),
+        module: &pack_module,
+        entry_point: Some("write_aabb"),
+        compilation_options: Default::default(),
+        cache: None,
+    });
+
     let composite_src =
         std::fs::read_to_string("assets/shaders/voxel_rt_composite.wgsl").expect("read voxel_rt_composite.wgsl");
     let composite_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -2318,6 +2505,10 @@ fn init_voxel_rt(mut commands: Commands, render_device: Res<RenderDevice>) {
         wc_compact_write_active,
         wc_update,
         wc_blend,
+        pack,
+        pack_layout,
+        pack_aabb,
+        pack_aabb_layout,
         composite_module,
         composite_layout,
         composite_sampler,
@@ -2671,7 +2862,7 @@ fn prepare_voxel_rt(
                 );
                 return;
             }
-            let Some(scene) = resources.scene.as_ref() else {
+            let Some(scene) = resources.scene.as_mut() else {
                 return; // no buffers to patch — keep old (defensive)
             };
             if !scene.streamed {
@@ -2693,10 +2884,67 @@ fn prepare_voxel_rt(
                 brick_count,
             );
         }
+        VoxelRtUpload::GpuPack { batch, brick_count, lights, alias } => {
+            // Phase G Stage G-a — the GPU PACK arm (A/B-gated). Like `Delta` but the dense bricks' index/palette/
+            // meta are encoded by the `voxel_pack` compute dispatch (the CPU only wrote the uniform/freed metas +
+            // the AABBs). Same epoch-existence guards as `Delta`.
+            if resources.built_epoch != Some(patch_res.epoch) {
+                debug!(
+                    "voxel-RT G-a: GpuPack for epoch {} but built epoch is {:?} — skipping (await snapshot)",
+                    patch_res.epoch, resources.built_epoch
+                );
+                return;
+            }
+            let Some(scene) = resources.scene.as_ref() else {
+                return;
+            };
+            if !scene.streamed {
+                return;
+            }
+            let _s = info_span!("vox_gpu_pack").entered();
+            apply_gpu_pack(device, &render_queue, &pipelines, scene, batch);
+            resources.world_cache_lights = Some(WorldCacheLights::from_lists(device, lights, alias));
+            resources.brick_count = *brick_count;
+            debug!(
+                "voxel-RT G-a: GpuPack epoch {} gen {} — {} dense commands, {} cpu writes, topology_changed={}, {} bricks",
+                patch_res.epoch,
+                patch_res.generation,
+                batch.commands.len(),
+                batch.cpu_writes.len(),
+                batch.topology_changed,
+                brick_count,
+            );
+        }
     }
 
     resources.built_generation = Some(patch_res.generation);
     resources.built_epoch = Some(patch_res.epoch);
+}
+
+/// Create one chunk BLAS (A3 Stage 3 slot-band) sized for `prim_count` AABB primitives. The single SSOT for the
+/// chunk BLAS descriptor, shared by [`build_scene_full`]'s initial creation and [`apply_delta`]'s periodic full
+/// rebuild (which recreates the handle to force a fresh `built_index = None` ⇒ a full `Build`).
+///
+/// `update_mode = PreferUpdate` + `ALLOW_UPDATE`: this lets a per-move delta REFIT the BLAS in place (the
+/// `vox_blas_delta` win) instead of a full rebuild. wgpu-core auto-deduces the FIRST build over a given handle
+/// to a full `Build` (its `built_index` is None) and Updates on every subsequent build over that same handle.
+/// `ALLOW_UPDATE` sets the Vulkan flag at build time, which an Update later requires. `PREFER_FAST_TRACE` keeps
+/// the trace-optimized build.
+fn create_chunk_blas(device: &wgpu::Device, prim_count: u32) -> wgpu::Blas {
+    device.create_blas(
+        &wgpu::CreateBlasDescriptor {
+            label: Some("voxel_rt_chunk_blas"),
+            flags: wgpu::AccelerationStructureFlags::PREFER_FAST_TRACE
+                | wgpu::AccelerationStructureFlags::ALLOW_UPDATE,
+            update_mode: wgpu::AccelerationStructureUpdateMode::PreferUpdate,
+        },
+        wgpu::BlasGeometrySizeDescriptors::AABBs {
+            descriptors: vec![wgpu::BlasAABBGeometrySizeDescriptor {
+                primitive_count: prim_count,
+                flags: wgpu::AccelerationStructureGeometryFlags::OPAQUE,
+            }],
+        },
+    )
 }
 
 /// (Re)allocate the full scene GPU objects (storage plan A1): the AABB/meta/voxel/palette/brick-palette buffers
@@ -2762,20 +3010,8 @@ fn build_scene_full(
         // geometry needs ≥1 primitive — the AABB at a degenerate free slot is a non-candidate either way).
         let prim_count = (blas_primitives - slot_base).clamp(1, CHUNK_SLOTS);
         descriptors.push(GpuInstanceDescriptor::world_identity(slot_base));
-        let blas = device.create_blas(
-            &wgpu::CreateBlasDescriptor {
-                label: Some("voxel_rt_chunk_blas"),
-                flags: wgpu::AccelerationStructureFlags::PREFER_FAST_TRACE,
-                update_mode: wgpu::AccelerationStructureUpdateMode::Build,
-            },
-            wgpu::BlasGeometrySizeDescriptors::AABBs {
-                descriptors: vec![wgpu::BlasAABBGeometrySizeDescriptor {
-                    primitive_count: prim_count,
-                    flags: wgpu::AccelerationStructureGeometryFlags::OPAQUE,
-                }],
-            },
-        );
-        chunks.push(ChunkBlas { blas, slot_base, prim_count });
+        let blas = create_chunk_blas(device, prim_count);
+        chunks.push(ChunkBlas { blas, slot_base, prim_count, refits_since_rebuild: 0 });
     }
     let descriptors_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("voxel_rt_instance_descriptors"),
@@ -2864,10 +3100,18 @@ fn build_scene_full(
 /// rebuilt IN PLACE over the SAME aabb_buf (the same wgpu BLAS handle, so the bind group — which references the
 /// TLAS, which references the BLAS — stays valid) + the TLAS rebuilt; a pure meta/voxel edit (no enter/drop)
 /// needs no BLAS work (the AABBs didn't move).
+///
+/// **BLAS refit (the `vox_blas_delta` win):** each dirty chunk's AABB band was already rewritten in the shared
+/// `aabb_buf` and the slot count is fixed-cap stable, so on a topology change we REFIT the chunk's BLAS in place
+/// (`PreferUpdate` ⇒ wgpu-core emits a HAL `Update`) instead of a full rebuild — far cheaper. Three cases force a
+/// full `Build` instead: (a) the chunk's FIRST build (handled transparently by wgpu-core via `built_index`), and
+/// (c) every [`BLAS_REFITS_BEFORE_REBUILD`] refits we recreate the BLAS handle (fresh `built_index` ⇒ Build) to
+/// refresh BVH traversal quality, which a long run of refits degrades. (b) A genuine primitive-count change can't
+/// happen here — the fixed-cap pool keeps each chunk's `prim_count` constant for its lifetime.
 fn apply_delta(
     device: &wgpu::Device,
     render_queue: &RenderQueue,
-    scene: &SceneKeepAlive,
+    scene: &mut SceneKeepAlive,
     delta: &RepackDelta,
 ) {
     let meta_stride = core::mem::size_of::<GpuBrickMeta>() as u64; // 48
@@ -2894,15 +3138,343 @@ fn apply_delta(
     // so it stays valid). Each chunk BLAS reads its band slice of the SAME aabb_buf (degenerate free slots are
     // non-candidates) via `primitive_offset`.
     if delta.topology_changed {
-        // The set of chunks a changed slot touches: `slot / CHUNK_SLOTS`. Only these rebuild.
-        let mut dirty_chunks: FxHashSet<u32> = FxHashSet::default();
+        // The set of CHUNK INDICES a changed slot touches: `slot / CHUNK_SLOTS`. Only these rebuild/refit.
+        let mut dirty_chunk_ids: FxHashSet<u32> = FxHashSet::default();
         for cs in &delta.changed {
-            dirty_chunks.insert(cs.slot / CHUNK_SLOTS);
+            dirty_chunk_ids.insert(cs.slot / CHUNK_SLOTS);
         }
+
+        // Pass 1 (mutate `scene.chunks` / `scene.tlas`): for each dirty chunk decide REFIT vs full REBUILD and
+        // advance its refit counter. On the periodic-rebuild tick, recreate the BLAS handle (fresh `built_index`
+        // ⇒ wgpu-core emits a full `Build`) and re-point its TLAS instance at the new handle, then reset the
+        // counter. Otherwise it's a refit (`PreferUpdate` over the existing handle) — bump the counter. The
+        // chunk index == the chunk's position in `scene.chunks` and its TLAS instance index (both built in band
+        // order in `build_scene_full`), so `slot_base / CHUNK_SLOTS` indexes all three consistently.
+        let mut dirty_indices: Vec<usize> = Vec::with_capacity(dirty_chunk_ids.len());
+        for (i, chunk) in scene.chunks.iter_mut().enumerate() {
+            let chunk_id = chunk.slot_base / CHUNK_SLOTS;
+            if !dirty_chunk_ids.contains(&chunk_id) {
+                continue;
+            }
+            dirty_indices.push(i);
+            if chunk.refits_since_rebuild >= BLAS_REFITS_BEFORE_REBUILD {
+                // Periodic full rebuild: recreate the handle to force a fresh `Build` and restore BVH quality.
+                chunk.blas = create_chunk_blas(device, chunk.prim_count);
+                chunk.refits_since_rebuild = 0;
+                // Re-point this chunk's TLAS instance (same identity transform, same custom_index = chunk index)
+                // at the new BLAS handle so the rebuilt TLAS references the live AS.
+                scene.tlas[i] = Some(wgpu::TlasInstance::new(
+                    &chunk.blas,
+                    [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0],
+                    i as u32,
+                    0xff,
+                ));
+            } else {
+                // Refit in place over the existing handle (wgpu-core Updates once the handle has been built once;
+                // the chunk's very first build is auto-deduced to `Build` by wgpu-core, leaving this counter at 0).
+                chunk.refits_since_rebuild += 1;
+            }
+        }
+
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("voxel_rt_delta_rebuild_accel"),
         });
-        // The dirty chunks + their size descriptors (materialized so the geometry entries can borrow them).
+        // Pass 2 (immutable borrow): build the dirty chunk BLASes (mode auto-chosen by wgpu-core from each BLAS's
+        // PreferUpdate + `built_index`) + the TLAS. The size descriptors are materialized first so the geometry
+        // entries can borrow them.
+        let dirty: Vec<&ChunkBlas> = dirty_indices.iter().map(|&i| &scene.chunks[i]).collect();
+        let sizes: Vec<wgpu::BlasAABBGeometrySizeDescriptor> = dirty
+            .iter()
+            .map(|chunk| wgpu::BlasAABBGeometrySizeDescriptor {
+                primitive_count: chunk.prim_count,
+                flags: wgpu::AccelerationStructureGeometryFlags::OPAQUE,
+            })
+            .collect();
+        let geos: Vec<_> = dirty
+            .iter()
+            .zip(sizes.iter())
+            .map(|(chunk, size)| wgpu::BlasBuildEntry {
+                blas: &chunk.blas,
+                geometry: wgpu::BlasGeometries::AabbGeometries(vec![wgpu::BlasAabbGeometry {
+                    size,
+                    stride: aabb_stride,
+                    aabb_buffer: &scene.aabb_buf,
+                    primitive_offset: chunk.slot_base * aabb_stride as u32,
+                }]),
+            })
+            .collect();
+        // Build the dirty chunk BLASes + the TLAS (which references every chunk BLAS, incl. the just-rebuilt
+        // ones). We only reach here on a topology change, so there is always ≥1 dirty chunk.
+        encoder.build_acceleration_structures(geos.iter(), core::iter::once(&scene.tlas));
+        render_queue.submit(core::iter::once(encoder.finish()));
+    }
+}
+
+/// **Phase G G-wire — the main-world GPU CLASSIFY pipeline** (`voxel_pack.wgsl::classify_brick`). Built ONCE,
+/// lazily, the first time the live `gpu_pack` path runs a re-pack (the `RenderDevice` is a MAIN-WORLD resource in
+/// this fork — `bevy_render/src/settings.rs` — so the main-world residency system can dispatch classify + read it
+/// back without crossing to the render world). Holds its own bind-group layout + pipeline. The heavy `pack_brick`/
+/// `write_aabb`/BLAS still run in the render world (`apply_gpu_pack`); only the cheap classify round-trip — whose
+/// readback the CPU `update_gpu_finish` allocation needs — runs here. Mirrors the test rig `run_classify`.
+///
+/// RETAINED but NOT on the live arm: the live `gpu_pack` path is now "config 2" (G-a `update_gpu` + G-b
+/// `apply_gpu_pack`, NO readback). This G4 classify pipeline + its `run` synchronous round-trip are kept intact
+/// as the basis for the FUTURE async-readback step, hence `#[allow(dead_code)]`.
+#[allow(dead_code)]
+struct VoxelPackClassify {
+    pipeline: wgpu::ComputePipeline,
+    layout: wgpu::BindGroupLayout,
+}
+
+/// Main-world holder for the lazily-built [`VoxelPackClassify`] pipeline. Starts `None`; the first live
+/// `gpu_pack` re-pack builds it from the (by-then-available) main-world `RenderDevice`. `init_resource`-able
+/// (Default = `None`) so it can be registered without a device at Startup.
+#[derive(Resource, Default)]
+#[allow(dead_code)] // The inner pipeline is only built by the (retained-for-future) G4 async-readback arm.
+struct VoxelPackClassifyState(Option<VoxelPackClassify>);
+
+#[allow(dead_code)] // RETAINED for the future async-readback step; the live arm is config 2 (no readback).
+impl VoxelPackClassify {
+    /// Build the classify pipeline from the main-world device. The bind group is `classify_brick`'s subset of the
+    /// shared `voxel_pack.wgsl` `@group(0)`: cores@1 + neighbour_indices@2 (read-only), classify_out@8 (read_write),
+    /// classify_commands@9 (read-only) — the SAME bindings the parity test's `run_classify` uses.
+    fn new(device: &wgpu::Device) -> Self {
+        let src = std::fs::read_to_string("assets/shaders/voxel_pack.wgsl").expect("read voxel_pack.wgsl");
+        let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("voxel_pack_classify"),
+            source: wgpu::ShaderSource::Wgsl(src.into()),
+        });
+        let entry = |binding: u32, read_only: bool| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility: wgpu::ShaderStages::COMPUTE,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Storage { read_only },
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            },
+            count: None,
+        };
+        let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("voxel_rt_classify_layout"),
+            entries: &[entry(1, true), entry(2, true), entry(8, false), entry(9, true)],
+        });
+        let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("voxel_rt_classify_pl"),
+            bind_group_layouts: &[Some(&layout)],
+            immediate_size: 0,
+        });
+        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("voxel_rt_classify"),
+            layout: Some(&pl),
+            module: &module,
+            entry_point: Some("classify_brick"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+        Self { pipeline, layout }
+    }
+
+    /// **Phase G G4 — dispatch `classify_brick` over `batch` and read back the per-brick [`GpuClassifyOut`]** (one
+    /// workgroup per dirty key, reading the prepared deduped cores + neighbour table). This is the GPU round-trip
+    /// the G4 win trades the CPU `pack_one` for: the CPU `update_gpu_prepare` built the cores/neighbours/commands;
+    /// the GPU classifies (uniform/dense + palette size class); the CPU `update_gpu_finish` allocates from the
+    /// readback — NO CPU `pack_one` on the dirty bricks. The readback is a synchronous `map_async` + blocking
+    /// `device.poll(Wait)` (the same stall the perf harness measures) — acceptable on the amortized re-pack tick.
+    fn run(&self, device: &wgpu::Device, queue: &RenderQueue, batch: &GpuClassifyBatch) -> Vec<GpuClassifyOut> {
+        let n = batch.commands.len();
+        if n == 0 {
+            return Vec::new();
+        }
+        let cores_data: &[u32] = if batch.cores.is_empty() { &[0u32] } else { &batch.cores };
+        let nbr_data: &[u32] = if batch.neighbour_indices.is_empty() { &[0u32] } else { &batch.neighbour_indices };
+        let cmd_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("voxel_rt_classify_commands"),
+            contents: bytemuck::cast_slice(&batch.commands),
+            usage: wgpu::BufferUsages::STORAGE,
+        });
+        let cores_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("voxel_rt_classify_cores"),
+            contents: bytemuck::cast_slice(cores_data),
+            usage: wgpu::BufferUsages::STORAGE,
+        });
+        let nbr_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("voxel_rt_classify_neighbours"),
+            contents: bytemuck::cast_slice(nbr_data),
+            usage: wgpu::BufferUsages::STORAGE,
+        });
+        let out_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("voxel_rt_classify_out"),
+            size: (n * 4 * 4) as u64, // 4 u32 / brick
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("voxel_rt_classify_bg"),
+            layout: &self.layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 1, resource: cores_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: nbr_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 8, resource: out_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 9, resource: cmd_buf.as_entire_binding() },
+            ],
+        });
+        let mut encoder =
+            device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("voxel_rt_classify_enc") });
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("voxel_rt_classify_pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.pipeline);
+            pass.set_bind_group(0, &bg, &[]);
+            pass.dispatch_workgroups(n as u32, 1, 1);
+        }
+        queue.submit(core::iter::once(encoder.finish()));
+
+        // Read the classify output back (synchronous map + blocking poll).
+        let bytes = (n * 4 * 4) as u64;
+        let staging = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("voxel_rt_classify_staging"),
+            size: bytes,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut rb =
+            device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("voxel_rt_classify_rb") });
+        rb.copy_buffer_to_buffer(&out_buf, 0, &staging, 0, bytes);
+        queue.submit(core::iter::once(rb.finish()));
+        staging.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+        device.poll(wgpu::PollType::wait_indefinitely()).expect("poll classify readback");
+        let data = staging.slice(..).get_mapped_range().expect("map classify staging");
+        let out: Vec<GpuClassifyOut> = bytemuck::cast_slice::<u8, u32>(&data)
+            .chunks_exact(4)
+            .map(|w| GpuClassifyOut { is_uniform: w[0], uniform_block: w[1], palette_k: w[2], index_bits: w[3] })
+            .collect();
+        drop(data);
+        staging.unmap();
+        out
+    }
+}
+
+/// **Phase G Stage G-b — apply a [`GpuPackBatch`]** to the persistent fixed-cap scene buffers (the A/B-gated
+/// GPU successor to [`apply_delta`]). The CPU did the allocation; here, in ONE command encoder / ONE submission
+/// (fill-then-build — readback-free): (1) `queue_write_buffer` the uniform/freed slots' **metas** only (the AABB
+/// is no longer CPU-written — G-b moved it to the GPU), (2) a compute pass that dispatches `pack_brick` (one
+/// workgroup per dirty dense brick → voxel/palette/meta) **and** `write_aabb` (one invocation per changed slot →
+/// `aabb_buf`, the SAME box `brick_aabb`/`degenerate_aabb` would), then (3) on a topology change rebuild ONLY the
+/// dirty chunk BLASes reading that SAME `aabb_buf` (lifted from [`apply_delta`]) — all in the SAME `encoder`, so
+/// the GPU-written AABBs are visible to the build (the fork executes the build over the buffer's submission-time
+/// contents). The per-slot CPU AABB upload (G-a's `vox_blas_delta` cost) is GONE. Byte-identical to the CPU
+/// `Delta` path (pinned by `tests/voxel_gpu_pack_parity.rs` — meta/voxel/palette AND `aabb_buf`).
+fn apply_gpu_pack(
+    device: &wgpu::Device,
+    render_queue: &RenderQueue,
+    pipelines: &VoxelRtPipelines,
+    scene: &SceneKeepAlive,
+    batch: &GpuPackBatch,
+) {
+    let meta_stride = core::mem::size_of::<GpuBrickMeta>() as u64; // 48
+    let aabb_stride = core::mem::size_of::<GpuBrickAabb>() as u64; // 32
+
+    // (1) CPU META writes — uniform/freed slots only (a dense slot's meta is GPU-written). The AABB is NEVER
+    //     CPU-written now (G-b): EVERY changed slot's AABB rides in `batch.aabb_commands` → the `write_aabb` pass.
+    for w in &batch.cpu_writes {
+        render_queue.write_buffer(&scene.meta_buf, w.slot as u64 * meta_stride, bytemuck::bytes_of(&w.meta));
+    }
+
+    // The whole GPU side runs in ONE encoder: pack + aabb compute passes, then (on topology change) the BLAS
+    // build reading the just-filled `aabb_buf`. One `submit` at the end. Scratch SSBOs (commands/cores/neighbours/
+    // aabb-commands) are created here and kept alive until `encoder.finish()`/`submit` — wgpu retains the
+    // referenced resources for the submission, and they drop after.
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("voxel_rt_gpu_pack"),
+    });
+
+    // (2a) The DENSE-pack scratch + bind group (only when there are dense commands). Held in this scope so the
+    //      buffers outlive the compute pass that references them.
+    let pack_scratch = (!batch.commands.is_empty()).then(|| {
+        let commands_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("voxel_rt_pack_commands"),
+            contents: bytemuck::cast_slice(&batch.commands),
+            usage: wgpu::BufferUsages::STORAGE,
+        });
+        let cores_data: &[u32] = if batch.cores.is_empty() { &[0u32] } else { &batch.cores };
+        let cores_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("voxel_rt_pack_cores"),
+            contents: bytemuck::cast_slice(cores_data),
+            usage: wgpu::BufferUsages::STORAGE,
+        });
+        let nbr_data: &[u32] = if batch.neighbour_indices.is_empty() { &[0u32] } else { &batch.neighbour_indices };
+        let nbr_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("voxel_rt_pack_neighbours"),
+            contents: bytemuck::cast_slice(nbr_data),
+            usage: wgpu::BufferUsages::STORAGE,
+        });
+        let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("voxel_rt_pack_bg"),
+            layout: &pipelines.pack_layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: commands_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: cores_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: nbr_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: scene.voxel_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 4, resource: scene.brick_palettes_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 5, resource: scene.meta_buf.as_entire_binding() },
+            ],
+        });
+        // Keep the buffers alive alongside the bind group.
+        (bg, commands_buf, cores_buf, nbr_buf)
+    });
+
+    // (2b) The AABB-pass scratch + bind group (only when there are aabb commands). One invocation per changed slot.
+    let aabb_scratch = (!batch.aabb_commands.is_empty()).then(|| {
+        let aabb_cmd_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("voxel_rt_pack_aabb_commands"),
+            contents: bytemuck::cast_slice(&batch.aabb_commands),
+            usage: wgpu::BufferUsages::STORAGE,
+        });
+        let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("voxel_rt_pack_aabb_bg"),
+            layout: &pipelines.pack_aabb_layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 6, resource: scene.aabb_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 7, resource: aabb_cmd_buf.as_entire_binding() },
+            ],
+        });
+        (bg, aabb_cmd_buf)
+    });
+
+    // (2c) ONE compute pass: dispatch the dense pack THEN the AABB write (both into the persistent pool buffers).
+    if pack_scratch.is_some() || aabb_scratch.is_some() {
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("voxel_rt_gpu_pack_pass"),
+            timestamp_writes: None,
+        });
+        if let Some((bg, ..)) = &pack_scratch {
+            pass.set_pipeline(&pipelines.pack);
+            pass.set_bind_group(0, bg, &[]);
+            pass.dispatch_workgroups(batch.commands.len() as u32, 1, 1);
+        }
+        if let Some((bg, _)) = &aabb_scratch {
+            pass.set_pipeline(&pipelines.pack_aabb);
+            pass.set_bind_group(0, bg, &[]);
+            // workgroup_size(64); one invocation per command.
+            pass.dispatch_workgroups((batch.aabb_commands.len() as u32).div_ceil(64), 1, 1);
+        }
+    }
+
+    // (3) BLAS — on a topology change rebuild ONLY the dirty chunk bands (lifted from `apply_delta`), in the SAME
+    //     encoder AFTER the compute pass that filled `aabb_buf`. The build reads the just-GPU-written AABBs (the
+    //     fork executes the build over the buffer's submission-time contents — fill-then-build). The dirty chunks
+    //     are those any aabb command OR pack command touched (an entered/dropped/uniform-toggled/moved slot).
+    if batch.topology_changed {
+        let mut dirty_chunks: FxHashSet<u32> = FxHashSet::default();
+        for w in &batch.aabb_commands {
+            dirty_chunks.insert(w.slot / CHUNK_SLOTS);
+        }
+        for c in &batch.commands {
+            dirty_chunks.insert(c.slot / CHUNK_SLOTS);
+        }
         let dirty: Vec<&ChunkBlas> = scene
             .chunks
             .iter()
@@ -2928,11 +3500,15 @@ fn apply_delta(
                 }]),
             })
             .collect();
-        // Rebuild the dirty chunk BLASes + the TLAS (which references every chunk BLAS, incl. the just-rebuilt
-        // ones). We only reach here on a topology change, so there is always ≥1 dirty chunk.
-        encoder.build_acceleration_structures(geos.iter(), core::iter::once(&scene.tlas));
-        render_queue.submit(core::iter::once(encoder.finish()));
+        if !geos.is_empty() {
+            encoder.build_acceleration_structures(geos.iter(), core::iter::once(&scene.tlas));
+        }
     }
+
+    // ONE submission: the compute fill + the BLAS build together (fill-then-build).
+    render_queue.submit(core::iter::once(encoder.finish()));
+    drop(pack_scratch);
+    drop(aabb_scratch);
 }
 
 /// The objects the per-frame world-cache dispatch needs, built before the compute pass opens (so they can be
@@ -4073,6 +4649,11 @@ mod tests {
             .init_resource::<VoxelRtPatch>()
             .init_resource::<VoxelRtLighting>()
             .init_resource::<VoxelRtSky>()
+            // The system reads the A/B toggle (default OFF) ...
+            .init_resource::<VoxelRtToggle>()
+            // ... and (Phase G G-wire) the lazily-built GPU-classify holder (None here; the gpu_pack flag is
+            // OFF so it is never touched, but the param is still required so the system can be scheduled).
+            .init_resource::<VoxelPackClassifyState>()
             .insert_resource(latched_missing_sponza_streaming())
             .add_systems(Update, stream_voxel_rt_residency);
         // A real camera so `cam.single()` SUCCEEDS and execution reaches the Sponza streaming arm — this is what

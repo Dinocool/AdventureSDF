@@ -8,7 +8,9 @@
 use bevy::prelude::*;
 use bevy_egui::egui;
 
-use crate::voxel::raytrace::{LightingUniformData, SkyUniformData, VoxelRtLighting, VoxelRtSky};
+use crate::voxel::raytrace::{
+    LightingUniformData, SkyUniformData, VoxelRtLighting, VoxelRtSky, VoxelRtToggle,
+};
 
 /// Labels for `LightingUniformData.debug_view` (index == the u32 value the shader branches on).
 const DEBUG_LABELS: [&str; 8] = [
@@ -305,6 +307,26 @@ pub fn render_gi_panel(world: &mut World, ui: &mut egui::Ui) {
                     }
                 }
             });
+    }
+
+    // Phase G G-wire — the GPU-pack A/B toggle. OFF by default; flip it ON to A/B the LIVE flag-ON production path
+    // (the streamed re-pack drives the GPU classify → readback → GPU pack/AABB → fill-then-build BLAS instead of the
+    // all-CPU `update` + `apply_delta`). Byte- and render-identical to the CPU path (the parity + render-identity
+    // gates). The user confirms the live win by toggling this ON in-editor; the default stays OFF.
+    {
+        ui.separator();
+        ui.label(egui::RichText::new("Streaming / brick pack").strong());
+        if let Some(mut toggle) = world.get_resource_mut::<VoxelRtToggle>() {
+            ui.checkbox(&mut toggle.gpu_pack, "GPU pack (off = CPU pack + apply_delta)");
+            ui.label(
+                egui::RichText::new(
+                    "GPU pack: the streamed re-pack runs on the GPU (classify → pack/AABB → fill-then-build) \
+                     instead of the CPU. Render-identical; moves vox_pack_update + vox_blas_delta off the CPU.",
+                )
+                .weak()
+                .size(11.0),
+            );
+        }
     }
 
     // DLSS Ray Reconstruction controls (only when built with `--features dlss`). RR denoises + upscales the
