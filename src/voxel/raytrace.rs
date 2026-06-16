@@ -525,7 +525,21 @@ fn stream_voxel_rt_residency(
             && streaming.gallery_vxo.is_none()
             && streaming.gallery.is_none()
         {
-            let placements = vxo_gallery_placements(GALLERY_SCENES);
+            // BENCH HARNESS (`ADVENTURE_BENCH_BISTRO=1`, dev-only): instead of the 4-scene corpus, build the
+            // MergedSource from JUST `bistro.vxo` at offset (0,0,0) so Bistro sits at the world origin (centred
+            // X/Z, floor y=0) — a deterministic single-scene FPS benchmark target. The normal gallery path runs
+            // when the env is unset. See `bistro_bench_placements`.
+            let bench_bistro = std::env::var("ADVENTURE_BENCH_BISTRO").is_ok();
+            let placements = if bench_bistro {
+                let p = super::gallery::bistro_bench_placements();
+                info!(
+                    "voxel-RT: ADVENTURE_BENCH_BISTRO set — loading Bistro ALONE at origin ({} placement)",
+                    p.len()
+                );
+                p
+            } else {
+                vxo_gallery_placements(GALLERY_SCENES)
+            };
             if placements.is_empty() {
                 // No `.vxo` baked — fall back to the legacy full-RAM `.vox` merge so the gallery still loads.
                 warn!(
@@ -1381,17 +1395,6 @@ struct VoxelRtResources {
 /// instance limit), a cheap 512-prim per-band build, and a delta typically touches 1–few bands.
 const CHUNK_SLOTS: u32 = 512; // 8³ "bricks" worth of slots per chunk band
 
-/// Periodic-rebuild cadence for a chunk BLAS on the streamed live path: after this many in-place refits
-/// (`PreferUpdate`) the next dirty-chunk build is forced to a full `Build` (and the counter resets). A hardware
-/// BVH `Update` (`VK_BUILD_ACCELERATION_STRUCTURE_MODE_UPDATE_KHR`) keeps the spatial split topology from the
-/// original build and only adjusts node AABBs, so after many topology changes the tree's traversal quality
-/// drifts (overlapping/loose nodes). A full rebuild restores an optimal split. This mirrors the
-/// `sdf-bvh-incremental-refit` philosophy (refit cheaply, rebuild occasionally), but unlike the CPU SDF BVH —
-/// whose refit is a *conservative correct superset* needing no idle rebuild — a GPU AS refit measurably loses
-/// trace efficiency, so we rebuild on a cadence. `8` keeps the amortized cost dominated by cheap refits
-/// (≈7/8 refit + 1/8 rebuild) while bounding quality drift to a handful of moves.
-const BLAS_REFITS_BEFORE_REBUILD: u32 = 8;
-
 /// One slot-band chunk's BLAS + its slot range in the global buffers (A3 Stage 3). The BLAS reads its band as a
 /// SLICE of the shared `aabb_buf` via `primitive_offset = slot_base · 32`; `primitive_index` comes back
 /// geometry-relative (Stage 2), so the chunk's descriptor `meta_base = slot_base` resolves the global slot.
@@ -1402,12 +1405,6 @@ struct ChunkBlas {
     /// Number of slots (BLAS primitives) in this band (== [`CHUNK_SLOTS`] for full bands; the last band may be
     /// short when `capacity` isn't a multiple of [`CHUNK_SLOTS`]).
     prim_count: u32,
-    /// How many times this chunk's BLAS has been REFIT (`PreferUpdate`) since its last full `Build`. Drives the
-    /// periodic-rebuild cadence ([`BLAS_REFITS_BEFORE_REBUILD`]) — a hardware BVH refit reuses the spatial split
-    /// from the original build, so traversal quality degrades as the AABBs drift; a periodic rebuild restores it.
-    /// `0` immediately after a full build (incl. the first build in `build_scene_full`). The fixed-cap pool keeps
-    /// `prim_count` constant for the chunk's life, so a refit is always primitive-count-stable and valid.
-    refits_since_rebuild: u32,
 }
 
 struct SceneKeepAlive {
@@ -2825,6 +2822,29 @@ fn prepare_voxel_rt(
             // ships whole.
             let _s = info_span!("vox_blas_build").entered();
             let capacity = buffers.metas.len() as u32;
+            // DIAGNOSTIC: world-space bbox of the NON-degenerate (live) packed AABBs that actually feed the BLAS.
+            // If this disagrees with the residency AABB / camera, the GPU geometry is mis-placed (the empty-view
+            // root cause). Cheap one-shot per re-pack.
+            {
+                let mut lo = [f32::INFINITY; 3];
+                let mut hi = [f32::NEG_INFINITY; 3];
+                let mut live = 0u32;
+                for a in &buffers.aabbs {
+                    if a.min[0] <= a.max[0] {
+                        live += 1;
+                        for k in 0..3 {
+                            lo[k] = lo[k].min(a.min[k]);
+                            hi[k] = hi[k].max(a.max[k]);
+                        }
+                    }
+                }
+                debug!(
+                    "vox-diag StreamSnapshot gen {} epoch {}: cap {capacity}, {live} live AABBs, gpu_aabb=[{:.1},{:.1},{:.1}]..[{:.1},{:.1},{:.1}], first_meta_world_min={:?}",
+                    patch_res.generation, patch_res.epoch,
+                    lo[0], lo[1], lo[2], hi[0], hi[1], hi[2],
+                    buffers.metas.iter().find(|m| m.world_min != [0.0; 3]).map(|m| m.world_min),
+                );
+            }
             build_scene_full(
                 device,
                 &render_queue,
@@ -2922,21 +2942,22 @@ fn prepare_voxel_rt(
 }
 
 /// Create one chunk BLAS (A3 Stage 3 slot-band) sized for `prim_count` AABB primitives. The single SSOT for the
-/// chunk BLAS descriptor, shared by [`build_scene_full`]'s initial creation and [`apply_delta`]'s periodic full
-/// rebuild (which recreates the handle to force a fresh `built_index = None` ⇒ a full `Build`).
+/// chunk BLAS descriptor, shared by [`build_scene_full`]'s initial creation and [`apply_delta`]'s dirty-chunk
+/// rebuild (which recreates the handle ⇒ a fresh full `Build`).
 ///
-/// `update_mode = PreferUpdate` + `ALLOW_UPDATE`: this lets a per-move delta REFIT the BLAS in place (the
-/// `vox_blas_delta` win) instead of a full rebuild. wgpu-core auto-deduces the FIRST build over a given handle
-/// to a full `Build` (its `built_index` is None) and Updates on every subsequent build over that same handle.
-/// `ALLOW_UPDATE` sets the Vulkan flag at build time, which an Update later requires. `PREFER_FAST_TRACE` keeps
-/// the trace-optimized build.
+/// `update_mode = Build`, NO `ALLOW_UPDATE`: a dirty chunk is ALWAYS fully rebuilt, never refit. Refit (`Update`)
+/// is only valid for a *small deformation* of EXISTING primitives — but in this fixed-cap pool every BLAS-visible
+/// change is a slot crossing the degenerate↔real boundary (a brick ENTER or DROP; a re-voxelize keeps the same
+/// coord/lod ⇒ identical AABB ⇒ no BLAS work, and a LOD change is a drop+enter on *different* slots). Updating a
+/// BVH across a degenerate→real activation produces a CORRUPT acceleration structure (the streamed bricks become
+/// invisible — the empty-Bistro bug), so refit is never both valid AND useful here. Dropping `ALLOW_UPDATE` also
+/// lets the builder pick a higher-quality (non-update-reserved) split. `PREFER_FAST_TRACE` keeps it trace-optimized.
 fn create_chunk_blas(device: &wgpu::Device, prim_count: u32) -> wgpu::Blas {
     device.create_blas(
         &wgpu::CreateBlasDescriptor {
             label: Some("voxel_rt_chunk_blas"),
-            flags: wgpu::AccelerationStructureFlags::PREFER_FAST_TRACE
-                | wgpu::AccelerationStructureFlags::ALLOW_UPDATE,
-            update_mode: wgpu::AccelerationStructureUpdateMode::PreferUpdate,
+            flags: wgpu::AccelerationStructureFlags::PREFER_FAST_TRACE,
+            update_mode: wgpu::AccelerationStructureUpdateMode::Build,
         },
         wgpu::BlasGeometrySizeDescriptors::AABBs {
             descriptors: vec![wgpu::BlasAABBGeometrySizeDescriptor {
@@ -3011,7 +3032,7 @@ fn build_scene_full(
         let prim_count = (blas_primitives - slot_base).clamp(1, CHUNK_SLOTS);
         descriptors.push(GpuInstanceDescriptor::world_identity(slot_base));
         let blas = create_chunk_blas(device, prim_count);
-        chunks.push(ChunkBlas { blas, slot_base, prim_count, refits_since_rebuild: 0 });
+        chunks.push(ChunkBlas { blas, slot_base, prim_count });
     }
     let descriptors_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("voxel_rt_instance_descriptors"),
@@ -3101,13 +3122,11 @@ fn build_scene_full(
 /// TLAS, which references the BLAS — stays valid) + the TLAS rebuilt; a pure meta/voxel edit (no enter/drop)
 /// needs no BLAS work (the AABBs didn't move).
 ///
-/// **BLAS refit (the `vox_blas_delta` win):** each dirty chunk's AABB band was already rewritten in the shared
-/// `aabb_buf` and the slot count is fixed-cap stable, so on a topology change we REFIT the chunk's BLAS in place
-/// (`PreferUpdate` ⇒ wgpu-core emits a HAL `Update`) instead of a full rebuild — far cheaper. Three cases force a
-/// full `Build` instead: (a) the chunk's FIRST build (handled transparently by wgpu-core via `built_index`), and
-/// (c) every [`BLAS_REFITS_BEFORE_REBUILD`] refits we recreate the BLAS handle (fresh `built_index` ⇒ Build) to
-/// refresh BVH traversal quality, which a long run of refits degrades. (b) A genuine primitive-count change can't
-/// happen here — the fixed-cap pool keeps each chunk's `prim_count` constant for its lifetime.
+/// **Per-chunk REBUILD (the `vox_blas_delta` win):** instead of rebuilding ONE BLAS over all resident bricks on
+/// every stream-in, only the CHUNKS whose slots changed rebuild (O(dirty chunks), not O(resident)). Each dirty
+/// chunk is FULLY rebuilt (never refit) — see [`create_chunk_blas`] for why `Update` is unsound here (every dirty
+/// slot crossed degenerate↔real, which a BVH update corrupts). The fixed-cap pool keeps each chunk's `prim_count`
+/// constant for its lifetime, so the rebuild is always primitive-count-stable.
 fn apply_delta(
     device: &wgpu::Device,
     render_queue: &RenderQueue,
@@ -3138,18 +3157,19 @@ fn apply_delta(
     // so it stays valid). Each chunk BLAS reads its band slice of the SAME aabb_buf (degenerate free slots are
     // non-candidates) via `primitive_offset`.
     if delta.topology_changed {
-        // The set of CHUNK INDICES a changed slot touches: `slot / CHUNK_SLOTS`. Only these rebuild/refit.
+        // The set of CHUNK INDICES a changed slot touches: `slot / CHUNK_SLOTS`. Only these rebuild.
         let mut dirty_chunk_ids: FxHashSet<u32> = FxHashSet::default();
         for cs in &delta.changed {
             dirty_chunk_ids.insert(cs.slot / CHUNK_SLOTS);
         }
 
-        // Pass 1 (mutate `scene.chunks` / `scene.tlas`): for each dirty chunk decide REFIT vs full REBUILD and
-        // advance its refit counter. On the periodic-rebuild tick, recreate the BLAS handle (fresh `built_index`
-        // ⇒ wgpu-core emits a full `Build`) and re-point its TLAS instance at the new handle, then reset the
-        // counter. Otherwise it's a refit (`PreferUpdate` over the existing handle) — bump the counter. The
-        // chunk index == the chunk's position in `scene.chunks` and its TLAS instance index (both built in band
-        // order in `build_scene_full`), so `slot_base / CHUNK_SLOTS` indexes all three consistently.
+        // Pass 1 (mutate `scene.chunks` / `scene.tlas`): FULLY REBUILD each dirty chunk. We recreate the BLAS
+        // handle (fresh `built_index = None` ⇒ wgpu-core emits a full `Build`, never an `Update`) and re-point its
+        // TLAS instance at the new handle. Rebuild — not refit — is mandatory: every dirty slot here crossed the
+        // degenerate↔real boundary (a brick ENTER or DROP), and a BVH `Update` across a degenerate→real activation
+        // corrupts the structure (streamed bricks go invisible — see `create_chunk_blas`). The chunk index == the
+        // chunk's position in `scene.chunks` and its TLAS instance index (both built in band order in
+        // `build_scene_full`), so `slot_base / CHUNK_SLOTS` indexes all three consistently.
         let mut dirty_indices: Vec<usize> = Vec::with_capacity(dirty_chunk_ids.len());
         for (i, chunk) in scene.chunks.iter_mut().enumerate() {
             let chunk_id = chunk.slot_base / CHUNK_SLOTS;
@@ -3157,31 +3177,22 @@ fn apply_delta(
                 continue;
             }
             dirty_indices.push(i);
-            if chunk.refits_since_rebuild >= BLAS_REFITS_BEFORE_REBUILD {
-                // Periodic full rebuild: recreate the handle to force a fresh `Build` and restore BVH quality.
-                chunk.blas = create_chunk_blas(device, chunk.prim_count);
-                chunk.refits_since_rebuild = 0;
-                // Re-point this chunk's TLAS instance (same identity transform, same custom_index = chunk index)
-                // at the new BLAS handle so the rebuilt TLAS references the live AS.
-                scene.tlas[i] = Some(wgpu::TlasInstance::new(
-                    &chunk.blas,
-                    [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0],
-                    i as u32,
-                    0xff,
-                ));
-            } else {
-                // Refit in place over the existing handle (wgpu-core Updates once the handle has been built once;
-                // the chunk's very first build is auto-deduced to `Build` by wgpu-core, leaving this counter at 0).
-                chunk.refits_since_rebuild += 1;
-            }
+            chunk.blas = create_chunk_blas(device, chunk.prim_count);
+            // Re-point this chunk's TLAS instance (same identity transform, same custom_index = chunk index) at
+            // the new BLAS handle so the rebuilt TLAS references the live AS.
+            scene.tlas[i] = Some(wgpu::TlasInstance::new(
+                &chunk.blas,
+                [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0],
+                i as u32,
+                0xff,
+            ));
         }
 
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("voxel_rt_delta_rebuild_accel"),
         });
-        // Pass 2 (immutable borrow): build the dirty chunk BLASes (mode auto-chosen by wgpu-core from each BLAS's
-        // PreferUpdate + `built_index`) + the TLAS. The size descriptors are materialized first so the geometry
-        // entries can borrow them.
+        // Pass 2 (immutable borrow): build the dirty chunk BLASes (each handle is freshly recreated above ⇒ a full
+        // `Build`) + the TLAS. The size descriptors are materialized first so the geometry entries can borrow them.
         let dirty: Vec<&ChunkBlas> = dirty_indices.iter().map(|&i| &scene.chunks[i]).collect();
         let sizes: Vec<wgpu::BlasAABBGeometrySizeDescriptor> = dirty
             .iter()

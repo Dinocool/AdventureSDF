@@ -243,5 +243,39 @@ fn main() {
         );
     }
 
+    // Wall-clock self-exit: `ADVENTURE_EXIT_AFTER_SECS=N` quits N seconds after launch (cleaner than a
+    // frame count when fps varies during streaming). Pairs with the trace rig below for a bounded run.
+    if let Some(secs) = std::env::var("ADVENTURE_EXIT_AFTER_SECS")
+        .ok()
+        .and_then(|s| s.parse::<f32>().ok())
+    {
+        app.add_systems(Update, move |time: Res<Time>, mut exit: MessageWriter<AppExit>| {
+            if time.elapsed_secs() >= secs {
+                exit.write(AppExit::Success);
+            }
+        });
+    }
+
+    // Self-contained TRACE RIG: `ADVENTURE_TRACE_RIG=1` starts chrome capture at launch and boots the
+    // GALLERY (the streamed merged corpus). Paired with `ADVENTURE_EXIT_AFTER_SECS=N` (clean self-exit ⇒
+    // the FlushGuard drops ⇒ the trace flushes to trace-*.json), this gives a profiler-free, self-
+    // terminating run that captures the live load + the steady-state HW-RT raymarch — no manual F6/quit.
+    #[cfg(feature = "editor")]
+    if std::env::var("ADVENTURE_TRACE_RIG").is_ok() {
+        adventure::editor::chrome_trace::set_capturing(true);
+        app.insert_resource(adventure::voxel::VoxelScene::Gallery);
+    }
+
+    // BISTRO FPS BENCH HARNESS (`ADVENTURE_BENCH_BISTRO=1`, editor-only, additive). Measures the steady-state
+    // interior raymarch FPS — the gate for the "165 FPS" perf goal. Pairs with `ADVENTURE_EXIT_AFTER_SECS=N`
+    // (clean self-exit) + `ADVENTURE_CAM="tx,ty,tz,dist,yaw,pitch"` (a fixed interior view). It (a) boots the
+    // GALLERY scene — which, with the env set, loads Bistro ALONE at origin (see raytrace::stream_voxel_rt_
+    // residency); (b) pins the camera; (c) averages the smoothed FPS over the last ~5 s before exit + logs a
+    // `BENCH RESULT:` line; (d) saves one PNG of the final frame to D:/tmp_test/bistro_bench.png.
+    #[cfg(feature = "editor")]
+    if std::env::var("ADVENTURE_BENCH_BISTRO").is_ok() {
+        adventure::bench::install_bistro_bench(&mut app);
+    }
+
     app.run();
 }

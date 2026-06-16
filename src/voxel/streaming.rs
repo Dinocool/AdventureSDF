@@ -39,7 +39,7 @@
 //! the nearest-solid-hit DDA commit the nearest surface across the LOD step. See the seam discussion in
 //! [`super::gpu::pack_resident_set`].
 
-use bevy::math::IVec3;
+use bevy::math::{IVec3, Vec3};
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use super::brickmap::{Brick, MAX_LOD, brick_span};
@@ -529,6 +529,21 @@ impl ResidencyManager {
             }
         }
         counts
+    }
+
+    /// World-space AABB enclosing all resident bricks (`min`, `max`), or `None` if none are resident.
+    /// Each brick spans `brick_span(lod)` m from `coord · brick_span(lod)`. Diagnostic: tells us WHERE the
+    /// streamed geometry actually sits in world space (so a bench camera can be aimed at it). `O(resident)`.
+    pub fn resident_world_aabb(&self) -> Option<(Vec3, Vec3)> {
+        let mut min = Vec3::splat(f32::INFINITY);
+        let mut max = Vec3::splat(f32::NEG_INFINITY);
+        for k in self.resident.keys() {
+            let span = brick_span(k.lod);
+            let lo = k.coord.as_vec3() * span;
+            min = min.min(lo);
+            max = max.max(lo + Vec3::splat(span));
+        }
+        if min.x.is_finite() { Some((min, max)) } else { None }
     }
 
     /// True iff `key` is currently resident (a non-empty brick is stored for it).

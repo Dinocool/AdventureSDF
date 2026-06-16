@@ -205,6 +205,21 @@ pub fn vxo_gallery_placements(scenes: &[GalleryEntry]) -> Vec<(std::path::PathBu
     placements
 }
 
+/// BENCH HARNESS placement list (dev-only, `ADVENTURE_BENCH_BISTRO=1`): JUST `bistro.vxo` placed at offset
+/// (0,0,0) so Bistro sits at the world origin (the `.vxo` is already floor-anchored y=0 + X/Z-centred, so a
+/// zero offset leaves it centred at origin). A single-entry [`MergedSource::open_paths`] input — the FPS
+/// benchmark target. Returns the Bistro row from [`GALLERY_SCENES`] with an explicit zero offset; empty (with a
+/// warn) if Bistro isn't in the table (so the caller falls back exactly like an absent asset, never panics).
+pub fn bistro_bench_placements() -> Vec<(std::path::PathBuf, IVec3)> {
+    match GALLERY_SCENES.iter().find(|e| e.label == "Bistro") {
+        Some(entry) => vec![(std::path::PathBuf::from(entry.vxo_path), IVec3::ZERO)],
+        None => {
+            warn!("bench: no 'Bistro' entry in GALLERY_SCENES — ADVENTURE_BENCH_BISTRO has nothing to load");
+            Vec::new()
+        }
+    }
+}
+
 /// One already-loaded gallery scene ready to merge: its loaded [`BrickMap`] + [`BlockRegistry`], its placement
 /// offset (`None` = auto-space), and a label for logging. The unit [`merge_scenes`] operates on — decoupled
 /// from disk so the merge is testable with synthetic maps (no `.vox` files needed).
