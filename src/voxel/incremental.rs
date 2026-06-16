@@ -38,12 +38,13 @@
 //! MAPPING, not raw slot order.
 
 use bevy::math::IVec3;
+use rayon::prelude::*;
 use rustc_hash::FxHashMap;
 
 use super::brickmap::Brick;
 use super::gpu::{
-    BrickVoxels, GpuBrickAabb, GpuBrickMeta, GpuPaletteColor, PackedBrick, ResidentBrick, encode_paletted,
-    halo_cells, pack_one,
+    BrickVoxels, GpuBrickAabb, GpuBrickMeta, GpuPaletteColor, PackedBrick, PalettedBrick, ResidentBrick,
+    encode_paletted, halo_cells, pack_one,
 };
 use super::streaming::BrickKey;
 
@@ -552,6 +553,19 @@ impl ResidentPacker {
     /// never O(resident). The CALLER uploads only `delta.changed` via `queue_write_buffer`. `palette_stride` is the
     /// packing registry's length (which bounds a brick's `k`) — used for the `k ≤ palette_stride` debug invariant.
     pub fn update(&mut self, entries: &[ResidentBrick<'_>], palette_stride: u32) -> RepackDelta {
+        self.update_inner(entries, palette_stride, true)
+    }
+
+    /// [`update`](Self::update) with the Phase-1 re-pack forced SERIAL (no rayon) — production always uses the
+    /// PARALLEL `update`. Exposed ONLY for the parallel-vs-serial pack benchmark (`examples/g2_pack_parallel.rs`)
+    /// to measure the speed-up; the two paths emit byte-identical deltas (Phase 1 is a pure map; the
+    /// order-dependent Phase 2 fold is serial + identical in both).
+    #[doc(hidden)]
+    pub fn update_serial(&mut self, entries: &[ResidentBrick<'_>], palette_stride: u32) -> RepackDelta {
+        self.update_inner(entries, palette_stride, false)
+    }
+
+    fn update_inner(&mut self, entries: &[ResidentBrick<'_>], palette_stride: u32, parallel: bool) -> RepackDelta {
         debug_assert!(
             self.palette_stride == 0 || self.palette_stride == palette_stride,
             "palette_stride must be constant within an epoch ({} → {palette_stride})",
@@ -650,11 +664,36 @@ impl ResidentPacker {
         // on it).
         let mut dirty_keys: Vec<BrickKey> = dirty.keys().copied().collect();
         dirty_keys.sort_by_key(|k| (k.lod, k.coord.z, k.coord.y, k.coord.x));
-        for key in dirty_keys {
-            let Some(&brick) = new_by_key.get(&key) else { continue };
+
+        // PHASE 1 (PARALLEL) — the expensive, embarrassingly-parallel part: for each dirty key, build its
+        // `PackedBrick` via the SSOT `pack_one` (the halo-fill) AND, for a dense brick, its R2b paletted
+        // encoding (`encode_paletted`). Both are PURE functions of `(key, brick, by_key)` — they read only the
+        // shared immutable maps and own no packer state — so rayon over `by_key` is sound and produces the SAME
+        // bytes as the serial path. The results are gathered in the EXACT `dirty_keys` order (par_iter over an
+        // ordered slice + `.collect()` preserves order; the serial fallback maps in the same order), so Phase 2
+        // below consumes them in the identical deterministic sequence — byte-identity + free-list/patch-order
+        // determinism hold regardless of `parallel`.
+        let pack = |key: BrickKey| -> Option<(BrickKey, PackedBrick, Option<PalettedBrick>)> {
+            let &brick = new_by_key.get(&key)?;
             let e = ResidentBrick { coord: key.coord, brick, lod: key.lod };
             let pb = pack_one(&e, &by_key);
-            self.emit_changed_slot(key, &pb, &mut delta);
+            let enc = match &pb.voxels {
+                BrickVoxels::Dense(cells) => Some(encode_paletted(cells)),
+                BrickVoxels::Uniform(_) => None,
+            };
+            Some((key, pb, enc))
+        };
+        let packed: Vec<(BrickKey, PackedBrick, Option<PalettedBrick>)> = if parallel {
+            dirty_keys.par_iter().filter_map(|&key| pack(key)).collect()
+        } else {
+            dirty_keys.iter().filter_map(|&key| pack(key)).collect()
+        };
+
+        // PHASE 2 (SERIAL, UNCHANGED ORDER) — fold the pre-packed results into the packer's mutable state
+        // (arena alloc/free, the resident/shadow maps, `delta.changed` pushes) IN THE SAME SORTED KEY ORDER. All
+        // order-dependent mutation (free-list LIFO, deterministic patch order) stays serial here.
+        for (key, pb, enc) in &packed {
+            self.emit_changed_slot(*key, pb, enc.as_ref(), &mut delta);
         }
 
         delta.topology_changed = topology_changed;
@@ -663,11 +702,19 @@ impl ResidentPacker {
 
     /// Write `pb`'s bytes into `key`'s slot, allocating/freeing/re-classing its index slab as the dense/uniform
     /// classification (and the dense brick's `index_bits` size class) changed, and push a [`ChangedSlot`] iff the
-    /// bytes actually differ from the slot's shadow. The dense path RE-ENCODES the brick's haloed cells into a
-    /// per-brick palette + bit-packed index stream ([`encode_paletted`], A4.4) and writes them into their index +
-    /// palette size-class slabs — the SAME (palette, indices) bytes `snapshot_buffers` reproduces from the raw
-    /// `last_voxels` shadow (the byte-identity gate). `last_voxels` keeps RAW cells so the re-encode is exact.
-    fn emit_changed_slot(&mut self, key: BrickKey, pb: &PackedBrick, delta: &mut RepackDelta) {
+    /// bytes actually differ from the slot's shadow. The dense path uses the PRE-COMPUTED `enc` (the brick's
+    /// haloed cells already encoded into a per-brick palette + bit-packed index stream by [`encode_paletted`],
+    /// A4.4, in the PARALLEL Phase 1 of [`update`](Self::update)) and writes them into their index + palette
+    /// size-class slabs — the SAME (palette, indices) bytes `snapshot_buffers` reproduces from the raw
+    /// `last_voxels` shadow (the byte-identity gate). `last_voxels` keeps RAW cells so a fresh re-encode is exact.
+    /// `enc` MUST be `Some` for a dense `pb` and `None` for a uniform one (Phase 1 pairs them by `pb.voxels`).
+    fn emit_changed_slot(
+        &mut self,
+        key: BrickKey,
+        pb: &PackedBrick,
+        enc: Option<&PalettedBrick>,
+        delta: &mut RepackDelta,
+    ) {
         let st = *self.resident.get(&key).expect("dirty key is resident");
         match &pb.voxels {
             BrickVoxels::Uniform(_) => {
@@ -696,9 +743,10 @@ impl ResidentPacker {
                 }
             }
             BrickVoxels::Dense(cells) => {
-                // Encode the haloed cells → per-brick palette + bit-packed index stream. `index_bits` picks the
-                // index class; `k = palette.len()` picks the palette class (≤ palette_stride = registry length).
-                let enc = encode_paletted(cells);
+                // The haloed cells → per-brick palette + bit-packed index stream were encoded in Phase 1 (the
+                // parallel pass). `index_bits` picks the index class; `k = palette.len()` picks the palette class
+                // (≤ palette_stride = registry length).
+                let enc = enc.expect("dense brick must carry its pre-computed paletted encoding");
                 let k = enc.palette.len() as u32;
                 debug_assert!(
                     k <= self.palette_stride,
@@ -754,7 +802,10 @@ impl ResidentPacker {
                     // The index + palette blocks are (re-)written exactly when the brick's content changed (a moved
                     // slab — class change / uniform→dense — implies new content, so `voxels_changed` covers it).
                     let (index, palette) = if voxels_changed {
-                        (Some(enc.indices), Some(enc.palette.into_iter().map(|id| id as u32).collect::<Vec<u32>>()))
+                        (
+                            Some(enc.indices.clone()),
+                            Some(enc.palette.iter().map(|&id| id as u32).collect::<Vec<u32>>()),
+                        )
                     } else {
                         (None, None)
                     };

@@ -209,6 +209,11 @@ zstd = { version = "0.13", optional = true }
 # when a clipmap shell demands it, so a 2.6 GB scene NEVER fully expands in RAM (`docs/VXO_FORMAT.md` §B2.2 /
 # §0.2). A RUNTIME dep: the streamed loader is the shipped load path. Pure Rust, no C toolchain.
 memmap2 = "0.9"
+# Data-parallelism for the streaming pack hot path: `voxel::incremental::ResidentPacker::update` Phase 1 fans the
+# pure per-brick `pack_one` halo-fill + `encode_paletted` across all cores (the serial Phase 2 then folds the
+# pre-packed results into the arena/shadow state in deterministic order — byte-identical to the serial pack). Also
+# used by the offline voxelizer example (`examples/voxelize_scene.rs`).
+rayon = "1"
 
 [dev-dependencies]
 # spv-out: emit SPIR-V from naga in tests so we can inspect which opcode signed `%`
@@ -248,10 +253,6 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg",
 ktx2 = "0.5"
 basis-universal = "0.3"
 serde_json = "1"
-# Parallel triangle rasterization in the offline voxelizer (`examples/voxelize_scene.rs`): the 13-axis SAT
-# overlap test + per-voxel albedo sample is embarrassingly parallel over triangles, so we fan it across all
-# cores. DEV-only — the shipped runtime `.vox` loader does no voxelization.
-rayon = "1"
 # OBJ + MTL loader for the offline voxelizer (`examples/voxelize_scene.rs`): load classic OBJ scenes
 # (Sibenik, San Miguel, the OBJ Sponza variants) into the SAME `Mesh` the glTF path builds, picked by file
 # extension. `tobj` reads positions/indices/UVs + the `.mtl` material (diffuse `Kd` base colour + `map_Kd`
