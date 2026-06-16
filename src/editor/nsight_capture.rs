@@ -12,8 +12,6 @@
 
 use bevy::prelude::*;
 
-use super::notifications::Notifications;
-
 pub struct NsightCapturePlugin;
 
 impl Plugin for NsightCapturePlugin {
@@ -22,15 +20,15 @@ impl Plugin for NsightCapturePlugin {
     }
 }
 
-/// F11 → toast + log that an Nsight GPU-Trace capture was triggered. This does NOT perform
-/// the capture (Nsight's injected layer does, watching the same key); it only confirms the
-/// trigger in-editor, since the app can't observe Nsight's out-of-process export.
-fn acknowledge_on_f11(keyboard: Res<ButtonInput<KeyCode>>, mut notes: ResMut<Notifications>) {
+/// F11 → log that an Nsight GPU-Trace capture was triggered. This does NOT perform the capture
+/// (Nsight's injected layer does, watching the same key); it only confirms the trigger in the
+/// editor log, since the app can't observe Nsight's out-of-process export. (The toast that used
+/// the now-pruned `notifications` panel was dropped — the log line is the acknowledgement.)
+fn acknowledge_on_f11(keyboard: Res<ButtonInput<KeyCode>>) {
     if keyboard.just_pressed(KeyCode::F11) {
         info!(
             "Nsight GPU-Trace: F11 trigger pressed — capturing the live frame and exporting \
              to .soul/ngfx (run rdoc/scripts/ngfx/parse.py for perf.json)."
         );
-        notes.info("GPU-Trace capture triggered (F11) — exporting to .soul/ngfx\u{2026}");
     }
 }
