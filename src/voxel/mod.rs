@@ -116,14 +116,15 @@ impl VoxelScene {
         matches!(self, VoxelScene::Worldgen)
     }
 
-    /// The next scene in the **`V`**-key cycle: Sponza → Cornell → Worldgen → Gallery → Sponza. The SSOT for the
-    /// cycle order, shared by the keyboard toggle and (for parity) any other caller that wants "advance the
-    /// scene".
+    /// The next scene in the **`V`**-key cycle: Sponza → Cornell → Gallery → Sponza. The SSOT for the cycle order,
+    /// shared by the keyboard toggle and (for parity) any other caller that wants "advance the scene". **Worldgen
+    /// is SHELVED (2026-06) and excluded from the cycle** — the variant still exists (reachable programmatically /
+    /// for when worldgen un-shelves) but `V` skips it; a current Worldgen scene advances to Gallery.
     #[inline]
     pub fn next(self) -> Self {
         match self {
             VoxelScene::Sponza => VoxelScene::Cornell,
-            VoxelScene::Cornell => VoxelScene::Worldgen,
+            VoxelScene::Cornell => VoxelScene::Gallery,
             VoxelScene::Worldgen => VoxelScene::Gallery,
             VoxelScene::Gallery => VoxelScene::Sponza,
         }
