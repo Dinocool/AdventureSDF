@@ -144,8 +144,18 @@ over 6.7 M candidates (a next-lever: `select_nth` partial-select — Phase G's G
 The early partial flip arc (D1a/c/d) is DONE + verified; worldgen + legacy scenes render at 0.05 m / 64 m reach.
 D2 screen-error LOD remains (roadmap).
 
-**NEXT after D1d:** the committed roadmap above — Phase G (GPU-driven pivot, headline = GPU enumeration/compaction)
-is the user-committed correct architecture; D2 screen-error LOD promoted alongside the flip; then GI 3.0 / C1 / the
-storage tail. Sequencing of the roadmap items TBD with the user.
+**REFOCUS (user 2026-06): worldgen SHELVED; priority = load the large classic scenes INTO THE WORLD; render/stream
+techniques are SHARED with terrain (see `refocus-large-scene-load` memory).** Landed since: **G0** cap-select
+`select_nth` (`07d5aeaf`, cold update 2.97→1.56 s); **streamed `.vxo` gallery wired live** (`0bc9262`,
+Sponza/Sibenik/Conference into the world via `MergedSource`, bounded-RAM, replacing the full-RAM `.vox` path);
+**C1 tiled out-of-core voxelizer** (`5f8605b2`, panel-verified ORACLE AIRTIGHT via a 2000-case differential fuzz)
++ **`bistro.vxo` produced** (13.17 B cells, 354 M solids, 82.7 MB, <4 GiB bake) + added to the gallery →
+**the classic-scene corpus (Sponza/Sibenik/Conference/Bistro) is now complete + streamable in the world.**
+
+**NEXT:** the shared **GPU-driven residency/render pipeline** (Phase G, reframed — enumeration/compaction/pool/
+per-chunk BLAS) developed ON the static `.vxo` scenes (the `.vxo` region decode is the GPU "source", eventually
+readback-free) — this is what makes the gallery (and later worldgen) FAST; today it loads correctly but streams
+in slowly (the shared cost). Worldgen (the parked 3D-density-field technique decision + the SOTA double-check) and
+D2 screen-error LOD follow. Sequencing TBD with the user.
 
 **R2b reconciliation for A1 (IMPORTANT — the design doc predates R2b's final state):** R2b **removed `snapshot_buffers`** (the raw fixed-block arena) and made the per-brick voxel payload a **VARIABLE-size index stream** (`index_bits·1000/32` words: 32 for 1-bit … 500 for 16-bit). So A1's fixed-capacity O(changed) upload can no longer assume a 1000-u32 fixed block per slot. A1 must choose: **(a)** re-add a RAW fixed-block path + an `index_bits==0 ⇒ raw` shader decode branch (the doc's "A1-β" — keeps the fixed-block free-list + O(changed) `queue_write_buffer`, at the cost of R2's VRAM win on the *streamed* path; recover it later via the persistent-interner A4.4), or **(b)** a variable-size paletted index arena (keeps R2 VRAM, needs a non-fixed-block allocator). Recommend (a) first. The A1 agent reconciles against the post-R2b code, not the pre-R2b doc text.
