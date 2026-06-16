@@ -10,7 +10,7 @@ import sys
 import os
 
 sys.path.insert(0, os.path.dirname(__file__))
-from _lib import trace_arg, processor, SELF_TIME_CTE
+from _lib import trace_arg, processor, SELF_TIME_CTE, resolved_name
 
 path = trace_arg()
 if not path:
@@ -28,11 +28,13 @@ for r in q(SELF_TIME_CTE.format(where="") + """
 SELECT name, count(*) n, sum(self_dur)/1e6 self_ms, sum(dur)/1e6 total_ms
 FROM self GROUP BY name ORDER BY self_ms DESC LIMIT 25
 """):
-    print(f"  {r.self_ms:10.1f}ms self | {r.total_ms:10.1f}ms tot | n={r.n:7d} | {r.name[:70]}")
+    nm = r.name if r.name is not None else "?"
+    print(f"  {r.self_ms:10.1f}ms self | {r.total_ms:10.1f}ms tot | n={r.n:7d} | {nm[:70]}")
 
 print("\n=== TOP 20 by TOTAL time ===")
-for r in q("""
-SELECT name, count(*) n, sum(dur)/1e6 total_ms, avg(dur)/1e3 avg_us
+for r in q(f"""
+SELECT {resolved_name('slice')} name, count(*) n, sum(dur)/1e6 total_ms, avg(dur)/1e3 avg_us
 FROM slice GROUP BY name ORDER BY total_ms DESC LIMIT 20
 """):
-    print(f"  {r.total_ms:10.1f}ms tot | avg {r.avg_us:9.1f}us | n={r.n:7d} | {r.name[:70]}")
+    nm = r.name if r.name is not None else "?"
+    print(f"  {r.total_ms:10.1f}ms tot | avg {r.avg_us:9.1f}us | n={r.n:7d} | {nm[:70]}")

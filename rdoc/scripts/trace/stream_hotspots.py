@@ -7,7 +7,7 @@ via a per-thread (pid,tid) stack, computing self-time (a span's dur minus its ch
 
     python rdoc/scripts/trace/stream_hotspots.py <trace.json> [--frames] [--skip-us=N]
 
---frames also reports the `update: ` per-frame duration distribution + slowest frames.
+--frames also reports the per-frame (`update`) duration distribution + slowest frames.
 --skip-us=N ignores all events with ts < N (drop startup/loading frames; bevy ts is µs,
 so --skip-us=5000000 skips the first 5 seconds). Also reports each span's MAX single
 occurrence + occurrences-after-skip, so a steady per-frame cost is distinguishable from a
@@ -28,14 +28,13 @@ def main():
         if fl.startswith("--skip-us="):
             skip_us = float(fl.split("=", 1)[1])
     if not args:
-        # newest trace-*.json in repo root
-        import glob
-        repo = r"D:\Projects\bevy-setup\.claude\worktrees\gpu-sdf-bake"
-        cands = glob.glob(os.path.join(repo, "trace-*.json"))
-        if not cands:
+        # newest trace-*.json in the CURRENT worktree (shared with the perfetto scripts).
+        sys.path.insert(0, os.path.dirname(__file__))
+        from _lib import newest_trace
+        path = newest_trace()
+        if not path:
             print("no trace-*.json found (pass one as argv)")
             return
-        path = max(cands, key=os.path.getmtime)
     else:
         path = args[0]
     print(f"=== streaming hotspots: {os.path.basename(path)} ===")
@@ -69,7 +68,15 @@ def main():
             ph = e.get("ph")
             if ph == "B":
                 key = (e.get("pid"), e.get("tid"))
-                stacks[key].append([e.get("name", "?"), e.get("ts", 0.0), 0.0])
+                name = e.get("name", "?")
+                # Bevy names every system/function span `function_scope`; the real name is in
+                # args.message. Resolve it here so the aggregate is per-system, not one giant
+                # function_scope bucket.
+                if name == "function_scope":
+                    msg = (e.get("args") or {}).get("message")
+                    if msg:
+                        name = msg
+                stacks[key].append([name, e.get("ts", 0.0), 0.0])
                 n_events += 1
             elif ph == "E":
                 key = (e.get("pid"), e.get("tid"))
@@ -92,7 +99,7 @@ def main():
                 a[2] += 1
                 if self_dur > a[3]:
                     a[3] = self_dur
-                if want_frames and name == "update: ":
+                if want_frames and name in ("update", "update: "):
                     frames.append(dur)
 
     print(f"  parsed {n_events} B/E events ({n_bad} unparseable lines)\n")
@@ -109,7 +116,7 @@ def main():
         frames.sort()
         n = len(frames)
         avg = sum(frames) / n
-        print(f"\n=== frames (update:): n={n} avg={avg:.0f}us "
+        print(f"\n=== frames (update): n={n} avg={avg:.0f}us "
               f"p50={frames[n//2]:.0f}us p99={frames[min(n-1, n*99//100)]:.0f}us "
               f"max={frames[-1]:.0f}us ===")
 

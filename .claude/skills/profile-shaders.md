@@ -14,7 +14,7 @@ texture / L2 / DRAM). I can run this whole flow myself — no GUI, no out-file d
 | **Which pass is slow + what's it bound on?** (headless, fixed frame N) | Nsight GPU Trace → `perf.json` | **me** (`capture.ps1` + `parse.py`) |
 | Same, but **the live editor frame** the user is looking at | launch under Nsight (F11 trigger) → `perf.json` | user presses F11; **me** reads `perf.json` |
 | Per-WGSL-line cost inside a hot shader | the `.ngfx-gputrace` binary, in Nsight UI | user (UI deep-dive) |
-| Which CPU system / render-graph node costs most? | `trace-*.json` (F6) | me (`rdoc/scripts/trace/`) |
+| Which CPU system / render-graph node costs most? + per-frame hitch / freeze breakdown | `trace-*.json` (F6) | me (`rdoc/scripts/trace/`) — **see `analyze-chrome-trace`** |
 | Inspect a single frame's textures / UBOs / disasm | `.rdc` RenderDoc capture | see `analyze-rdoc` (optional) |
 
 There are **two ways into the same `perf.json` loop**: the headless `capture.ps1` (a fresh
