@@ -891,6 +891,42 @@ impl ResidentPacker {
         self.index_arena.grew || self.palette_arena.grew
     }
 
+    /// **Stage G-wire — repopulate the raw-cell shadow (`last_voxels`) for EVERY resident dense slot from `entries`.**
+    /// The GPU-classify path ([`update_gpu_finish`](Self::update_gpu_finish)) DROPS `last_voxels` for the bricks it
+    /// packs (the GPU owns those bytes; the CPU never built the cells). [`snapshot_buffers`](Self::snapshot_buffers)
+    /// re-encodes `last_voxels` to fill the dense pool, so it would emit ZERO voxel/palette for any GPU-packed slot.
+    /// In the live flow that is harmless — the ONLY snapshot is the FIRST pack of an epoch, which runs the CPU
+    /// [`update_gpu`](Self::update_gpu) path (cells kept), BEFORE any GPU `finish` drops them. But a later GROW past
+    /// the pre-sized reserve ([`grew`](Self::grew)) would force a SECOND snapshot AFTER GPU finishes ran. This method
+    /// restores the shadow for that rare case: it re-`pack_one`s every resident dense brick (the SSOT halo-fill — the
+    /// SAME bytes the GPU pack wrote) so the subsequent `snapshot_buffers` is byte-correct again. O(resident) — paid
+    /// ONLY on a grow (never on the steady-state delta ticks), so it does not cost the G4 win. `entries` must be the
+    /// CURRENT resident set (the one the just-run `update_gpu_finish` reconciled toward), so every resident key is
+    /// present in the rebuilt `by_key`.
+    pub fn repopulate_last_voxels(&mut self, entries: &[ResidentBrick<'_>]) {
+        let new_by_key: FxHashMap<BrickKey, &Brick> =
+            entries.iter().map(|e| (BrickKey { coord: e.coord, lod: e.lod }, e.brick)).collect();
+        let by_key = build_by_key(entries);
+        // Re-pack every resident DENSE slot whose raw-cell shadow is missing (a GPU-packed slot). A uniform slot has
+        // no `last_voxels` entry by design (its id rides in the meta); a dense slot the CPU path packed still has it.
+        let dense_keys: Vec<(BrickKey, u32)> = self
+            .resident
+            .iter()
+            .filter_map(|(&k, st)| st.dense.map(|_| (k, st.slot)))
+            .collect();
+        for (key, slot) in dense_keys {
+            if self.last_voxels.contains_key(&slot) {
+                continue; // already valid (a CPU-path slot) — nothing to restore
+            }
+            let Some(&brick) = new_by_key.get(&key) else { continue };
+            let e = ResidentBrick { coord: key.coord, brick, lod: key.lod };
+            let pb = pack_one(&e, &by_key);
+            if let BrickVoxels::Dense(cells) = &pb.voxels {
+                self.last_voxels.insert(slot, cells.clone());
+            }
+        }
+    }
+
     /// Mark `keys` as REWRITTEN (an edit / dig re-source replaced their voxels in place): they re-pack on the
     /// next [`update`](Self::update) even though they neither entered nor dropped. Mirrors the manager's
     /// `requeue_keys` so the edit/dig path stays incremental (only the affected bricks + their 26-neighbourhood

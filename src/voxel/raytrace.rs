@@ -49,7 +49,9 @@ use super::gpu::{
     GpuAliasEntry, GpuBrickAabb, GpuBrickMeta, GpuBrickPatch, GpuInstanceDescriptor, GpuVoxelLight,
     build_lights_from_entries, pack_brickmap, pack_resident_set,
 };
-use super::incremental::{GpuPackBatch, RepackDelta, ResidentPacker, SnapshotBuffers};
+use super::incremental::{
+    GpuClassifyBatch, GpuClassifyOut, GpuPackBatch, RepackDelta, ResidentPacker, SnapshotBuffers,
+};
 use super::palette::{BlockId, BlockRegistry, CornellBlock};
 use super::source::{BrickSource, StaticVoxSource, WorldgenSource};
 use super::streaming::{BrickKey, ResidencyManager, StreamingConfig, camera_brick_coord, region_half_extent_m};
@@ -287,6 +289,8 @@ impl Plugin for VoxelRtPlugin {
             .init_resource::<WorldCacheSettings>()
             .init_resource::<VoxelEdits>()
             .init_resource::<VoxelEditBrush>()
+            // Phase G G-wire — the main-world GPU-classify pipeline holder (built lazily on first live gpu_pack).
+            .init_resource::<VoxelPackClassifyState>()
             .add_plugins(ExtractResourcePlugin::<VoxelRtToggle>::default())
             .add_plugins(ExtractResourcePlugin::<VoxelRtPatch>::default())
             .add_plugins(ExtractResourcePlugin::<VoxelRtLighting>::default())
@@ -427,6 +431,12 @@ fn stream_voxel_rt_residency(
     mut lighting: ResMut<VoxelRtLighting>,
     mut sky: ResMut<VoxelRtSky>,
     cam: Query<&GlobalTransform, With<SdfCamera>>,
+    // Phase G G-wire — the main-world device/queue (THIS fork keeps them in the main world,
+    // `bevy_render/src/settings.rs`) + the lazily-built classify pipeline. `Option` because the render device is
+    // created asynchronously and is absent on the first Startup ticks. Only the live `gpu_pack` path touches them.
+    render_device: Option<Res<RenderDevice>>,
+    render_queue: Option<Res<RenderQueue>>,
+    mut classify: ResMut<VoxelPackClassifyState>,
 ) {
     // Phase G Stage G-a A/B flag (OFF by default): when set, the streamed re-pack emits a GPU PACK batch
     // (`update_gpu`) the render world encodes on the GPU, instead of the all-CPU `update` + `apply_delta`.
@@ -765,18 +775,58 @@ fn stream_voxel_rt_residency(
         // registry has no emitters — the common worldgen/Sponza case). The packer is `Some` for every streamed
         // scene (set on the switch); the `None` arm is a defensive first-tick fallback to a contiguous Snapshot.
         let upload = match packer.as_mut() {
-            // Phase G Stage G-a — the GPU PACK path (A/B-gated). The CPU does the SAME allocation (`update_gpu`)
-            // but the dense bricks' index/palette/meta are encoded on the GPU. The epoch start / a grow still
-            // ships a `StreamSnapshot` (allocate the fixed-cap buffers once — not the hot path); every later
-            // re-pack ships a `GpuPack` batch. Byte-identical to the CPU `Delta` path (the parity gate).
+            // Phase G G-wire — the LIVE GPU PACK path (A/B-gated). The G4 split removes the CPU `pack_one`: the CPU
+            // `update_gpu_prepare` builds the deduped cores + 27-neighbour table + one classify command per dirty
+            // key (NO `pack_one`), the GPU `classify_brick` decides uniform/dense + the palette size class, the CPU
+            // reads it back and `update_gpu_finish` runs ONLY the cheap `SlabArena` allocation → the `GpuPackBatch`.
+            // The render world then dispatches `pack_brick`+`write_aabb` + fill-then-build (`apply_gpu_pack`). The
+            // epoch start / a grow still ships a `StreamSnapshot` (allocate the fixed-cap buffers once — not the hot
+            // path). Byte-identical to the CPU `Delta` path (the parity + render-identity gates). If the render
+            // device/queue are not yet available (the first Startup ticks, before the async device lands), fall back
+            // to the CPU-classify `update_gpu` so the path never stalls — it converges to the same allocation.
             Some(p) if gpu_pack => {
-                let batch = {
+                // The G4 path is reachable ONLY once the render device/queue have landed (async; absent on the very
+                // first Startup ticks). When they're not yet ready, the CPU `update_gpu` runs (same allocation).
+                let device_ready = render_device.is_some() && render_queue.is_some();
+                // STREAMSNAPSHOT STAYS CPU (G-wire item #2). The FIRST pack of a streamed epoch ships a
+                // `StreamSnapshot` — a CPU `pack_one` of the whole initial resident set (a one-time cold-fill, NOT
+                // the trace's bulk). It MUST go through the CPU `update_gpu` (which keeps the raw-cell `last_voxels`
+                // shadow `snapshot_buffers` re-encodes), BEFORE any GPU `update_gpu_finish` drops `last_voxels`.
+                // Subsequent moves ship G4 GpuPack deltas. The arena is pre-sized (#146 Tier-1) so NO mid-stream
+                // grow-snapshot happens → the only snapshot is this first one, while `last_voxels` is valid. (A grow
+                // PAST the reserve still works — handled below by re-deriving `last_voxels` before snapshotting.)
+                let want_snapshot = !*epoch_snapshotted;
+                let use_g4 = device_ready && !want_snapshot;
+                let batch = if use_g4 {
+                    let rd = render_device.as_deref().expect("device_ready");
+                    let rq = render_queue.as_deref().expect("device_ready");
+                    let pipeline = classify.0.get_or_insert_with(|| VoxelPackClassify::new(rd.wgpu_device()));
+                    let prepared = {
+                        let _su = info_span!("vox_pack_classify_prepare").entered();
+                        p.update_gpu_prepare(&entries, active_registry.len() as u32)
+                    };
+                    let classify_out = {
+                        let _cd = info_span!("vox_pack_classify_dispatch").entered();
+                        pipeline.run(rd.wgpu_device(), rq, &prepared)
+                    };
+                    let _sf = info_span!("vox_pack_classify_finish").entered();
+                    p.update_gpu_finish(&prepared, &classify_out)
+                } else {
+                    // The first/cold pack (snapshot) + the device-not-ready fallback: CPU classify (keeps the
+                    // `last_voxels` shadow). Byte-identical allocation to G4 (the parity gate covers both).
                     let _su = info_span!("vox_pack_update_gpu").entered();
                     p.update_gpu(&entries, active_registry.len() as u32)
                 };
                 let (lights, alias) = build_lights_from_entries(&entries, active_registry);
                 let brick_count = p.resident_count() as u32;
-                if !*epoch_snapshotted || p.grew() {
+                if want_snapshot || p.grew() {
+                    // A GROW past the pre-sized reserve forces a SECOND snapshot AFTER G4 ticks dropped some slots'
+                    // `last_voxels`. Restore the raw-cell shadow (re-`pack_one` the resident dense set) so the
+                    // snapshot is byte-correct. No-op on the first pack (every slot still has its CPU-path shadow).
+                    if !want_snapshot {
+                        let _rb = info_span!("vox_pack_repopulate_shadow").entered();
+                        p.repopulate_last_voxels(&entries);
+                    }
                     let buffers = {
                         let _ss = info_span!("vox_pack_snapshot").entered();
                         p.snapshot_buffers(active_registry)
@@ -3100,6 +3150,145 @@ fn apply_delta(
     }
 }
 
+/// **Phase G G-wire — the main-world GPU CLASSIFY pipeline** (`voxel_pack.wgsl::classify_brick`). Built ONCE,
+/// lazily, the first time the live `gpu_pack` path runs a re-pack (the `RenderDevice` is a MAIN-WORLD resource in
+/// this fork — `bevy_render/src/settings.rs` — so the main-world residency system can dispatch classify + read it
+/// back without crossing to the render world). Holds its own bind-group layout + pipeline. The heavy `pack_brick`/
+/// `write_aabb`/BLAS still run in the render world (`apply_gpu_pack`); only the cheap classify round-trip — whose
+/// readback the CPU `update_gpu_finish` allocation needs — runs here. Mirrors the test rig `run_classify`.
+struct VoxelPackClassify {
+    pipeline: wgpu::ComputePipeline,
+    layout: wgpu::BindGroupLayout,
+}
+
+/// Main-world holder for the lazily-built [`VoxelPackClassify`] pipeline. Starts `None`; the first live
+/// `gpu_pack` re-pack builds it from the (by-then-available) main-world `RenderDevice`. `init_resource`-able
+/// (Default = `None`) so it can be registered without a device at Startup.
+#[derive(Resource, Default)]
+struct VoxelPackClassifyState(Option<VoxelPackClassify>);
+
+impl VoxelPackClassify {
+    /// Build the classify pipeline from the main-world device. The bind group is `classify_brick`'s subset of the
+    /// shared `voxel_pack.wgsl` `@group(0)`: cores@1 + neighbour_indices@2 (read-only), classify_out@8 (read_write),
+    /// classify_commands@9 (read-only) — the SAME bindings the parity test's `run_classify` uses.
+    fn new(device: &wgpu::Device) -> Self {
+        let src = std::fs::read_to_string("assets/shaders/voxel_pack.wgsl").expect("read voxel_pack.wgsl");
+        let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("voxel_pack_classify"),
+            source: wgpu::ShaderSource::Wgsl(src.into()),
+        });
+        let entry = |binding: u32, read_only: bool| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility: wgpu::ShaderStages::COMPUTE,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Storage { read_only },
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            },
+            count: None,
+        };
+        let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("voxel_rt_classify_layout"),
+            entries: &[entry(1, true), entry(2, true), entry(8, false), entry(9, true)],
+        });
+        let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("voxel_rt_classify_pl"),
+            bind_group_layouts: &[Some(&layout)],
+            immediate_size: 0,
+        });
+        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("voxel_rt_classify"),
+            layout: Some(&pl),
+            module: &module,
+            entry_point: Some("classify_brick"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+        Self { pipeline, layout }
+    }
+
+    /// **Phase G G4 — dispatch `classify_brick` over `batch` and read back the per-brick [`GpuClassifyOut`]** (one
+    /// workgroup per dirty key, reading the prepared deduped cores + neighbour table). This is the GPU round-trip
+    /// the G4 win trades the CPU `pack_one` for: the CPU `update_gpu_prepare` built the cores/neighbours/commands;
+    /// the GPU classifies (uniform/dense + palette size class); the CPU `update_gpu_finish` allocates from the
+    /// readback — NO CPU `pack_one` on the dirty bricks. The readback is a synchronous `map_async` + blocking
+    /// `device.poll(Wait)` (the same stall the perf harness measures) — acceptable on the amortized re-pack tick.
+    fn run(&self, device: &wgpu::Device, queue: &RenderQueue, batch: &GpuClassifyBatch) -> Vec<GpuClassifyOut> {
+        let n = batch.commands.len();
+        if n == 0 {
+            return Vec::new();
+        }
+        let cores_data: &[u32] = if batch.cores.is_empty() { &[0u32] } else { &batch.cores };
+        let nbr_data: &[u32] = if batch.neighbour_indices.is_empty() { &[0u32] } else { &batch.neighbour_indices };
+        let cmd_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("voxel_rt_classify_commands"),
+            contents: bytemuck::cast_slice(&batch.commands),
+            usage: wgpu::BufferUsages::STORAGE,
+        });
+        let cores_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("voxel_rt_classify_cores"),
+            contents: bytemuck::cast_slice(cores_data),
+            usage: wgpu::BufferUsages::STORAGE,
+        });
+        let nbr_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("voxel_rt_classify_neighbours"),
+            contents: bytemuck::cast_slice(nbr_data),
+            usage: wgpu::BufferUsages::STORAGE,
+        });
+        let out_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("voxel_rt_classify_out"),
+            size: (n * 4 * 4) as u64, // 4 u32 / brick
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("voxel_rt_classify_bg"),
+            layout: &self.layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 1, resource: cores_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: nbr_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 8, resource: out_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 9, resource: cmd_buf.as_entire_binding() },
+            ],
+        });
+        let mut encoder =
+            device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("voxel_rt_classify_enc") });
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("voxel_rt_classify_pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.pipeline);
+            pass.set_bind_group(0, &bg, &[]);
+            pass.dispatch_workgroups(n as u32, 1, 1);
+        }
+        queue.submit(core::iter::once(encoder.finish()));
+
+        // Read the classify output back (synchronous map + blocking poll).
+        let bytes = (n * 4 * 4) as u64;
+        let staging = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("voxel_rt_classify_staging"),
+            size: bytes,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut rb =
+            device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("voxel_rt_classify_rb") });
+        rb.copy_buffer_to_buffer(&out_buf, 0, &staging, 0, bytes);
+        queue.submit(core::iter::once(rb.finish()));
+        staging.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+        device.poll(wgpu::PollType::wait_indefinitely()).expect("poll classify readback");
+        let data = staging.slice(..).get_mapped_range().expect("map classify staging");
+        let out: Vec<GpuClassifyOut> = bytemuck::cast_slice::<u8, u32>(&data)
+            .chunks_exact(4)
+            .map(|w| GpuClassifyOut { is_uniform: w[0], uniform_block: w[1], palette_k: w[2], index_bits: w[3] })
+            .collect();
+        drop(data);
+        staging.unmap();
+        out
+    }
+}
+
 /// **Phase G Stage G-b — apply a [`GpuPackBatch`]** to the persistent fixed-cap scene buffers (the A/B-gated
 /// GPU successor to [`apply_delta`]). The CPU did the allocation; here, in ONE command encoder / ONE submission
 /// (fill-then-build — readback-free): (1) `queue_write_buffer` the uniform/freed slots' **metas** only (the AABB
@@ -4393,6 +4582,11 @@ mod tests {
             .init_resource::<VoxelRtPatch>()
             .init_resource::<VoxelRtLighting>()
             .init_resource::<VoxelRtSky>()
+            // The system reads the A/B toggle (default OFF) ...
+            .init_resource::<VoxelRtToggle>()
+            // ... and (Phase G G-wire) the lazily-built GPU-classify holder (None here; the gpu_pack flag is
+            // OFF so it is never touched, but the param is still required so the system can be scheduled).
+            .init_resource::<VoxelPackClassifyState>()
             .insert_resource(latched_missing_sponza_streaming())
             .add_systems(Update, stream_voxel_rt_residency);
         // A real camera so `cam.single()` SUCCEEDS and execution reaches the Sponza streaming arm — this is what
