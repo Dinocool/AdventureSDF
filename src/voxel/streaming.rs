@@ -69,6 +69,12 @@ pub struct BrickKey {
 /// the real, much tighter bound). At `clip_half = 26` the uncapped tiling is well under this.
 pub const MAX_CLIP_ENUMERATION: usize = 8_000_000;
 
+/// Max LOD levels the keep-old-until-revealed REFINE coverage check ([`ResidencyManager::safe_to_drop`])
+/// descends. Smooth camera motion / zoom transitions a region one level per frame; this bounds the rare
+/// multi-level case (fast zoom) so the check stays cheap (≤ `8^cap` leaf probes, pruned at each desired brick).
+/// A refine deeper than this in a single update is a teleport-scale change, which re-streams via the move reset.
+const REFINE_DESCENT_CAP: u32 = 5;
+
 /// Tunable clipmap streaming knobs. Plain `Copy` data so it can be a Bevy resource or a test literal.
 #[derive(Clone, Copy, Debug, bevy::prelude::Resource)]
 pub struct StreamingConfig {
@@ -564,6 +570,68 @@ impl ResidencyManager {
         self.dirty
     }
 
+    /// For a resident brick `k` that has LEFT the desired clipmap, is it safe to DROP now WITHOUT leaving a
+    /// visible hole? Keep-old-until-revealed at per-brick LOD granularity (the fix for "evict-before-load gaps
+    /// under camera motion"): `k` may be dropped ONLY once its world region is covered by RESIDENT bricks in the
+    /// new desired set (or has left the clipmap entirely).
+    /// * **Coarsened** (region moved into a coarser shell — camera receding): a coarser ANCESTOR now covers it.
+    ///   Walk up the parent chain to the first DESIRED ancestor; droppable once that ancestor is RESIDENT.
+    /// * **Refined** (region moved into a finer shell — camera approaching, possibly by MORE than one level on a
+    ///   fast zoom): finer DESCENDANTS now cover it. Descend (bounded by [`REFINE_DESCENT_CAP`]) and require every
+    ///   desired descendant covering `k`'s region to be RESIDENT.
+    /// * **Region left the clipmap entirely** (no desired ancestor or descendant): drop immediately.
+    ///
+    /// The replacements are enqueued by this same `update` (desired-but-not-resident), so they load over the next
+    /// frame(s); the FOLLOWING `update` then sees them resident and drops `k` — ~1 frame of harmless coarse/fine
+    /// overlap instead of a gap.
+    fn safe_to_drop(&self, k: &BrickKey, desired: &FxHashMap<BrickKey, ()>) -> bool {
+        // Coarsened (possibly multi-level): the first DESIRED ancestor covers k's whole region ⇒ droppable once
+        // that ancestor is resident.
+        let mut anc = BrickKey { coord: k.coord.div_euclid(IVec3::splat(2)), lod: k.lod + 1 };
+        while anc.lod <= MAX_LOD {
+            if desired.contains_key(&anc) {
+                return self.resident.contains_key(&anc);
+            }
+            anc = BrickKey { coord: anc.coord.div_euclid(IVec3::splat(2)), lod: anc.lod + 1 };
+        }
+        // Otherwise the region refined to a FINER LOD (or left the clipmap): every DESIRED brick inside k's
+        // region must be RESIDENT before we drop k.
+        self.region_replacement_resident(k.coord, k.lod, desired, REFINE_DESCENT_CAP)
+    }
+
+    /// Recursive REFINE-coverage check: is the world region of brick `(coord, lod)` already covered by RESIDENT
+    /// bricks of the `desired` set (at this LOD or finer)? Pruned at each desired brick; descends into the 8
+    /// children only where this LOD is not itself desired. A sub-region that is NOT desired at all (left the
+    /// clipmap / non-surface there) needs no coverage ⇒ true. `depth` bounds the descent so a teleport-scale
+    /// multi-level refine can't blow up (a teleport re-streams via the move `reset`).
+    fn region_replacement_resident(
+        &self,
+        coord: IVec3,
+        lod: u32,
+        desired: &FxHashMap<BrickKey, ()>,
+        depth: u32,
+    ) -> bool {
+        let key = BrickKey { coord, lod };
+        if desired.contains_key(&key) {
+            return self.resident.contains_key(&key);
+        }
+        if lod == 0 || depth == 0 {
+            return true;
+        }
+        let base = coord * IVec3::splat(2);
+        for dz in 0..2 {
+            for dy in 0..2 {
+                for dx in 0..2 {
+                    if !self.region_replacement_resident(base + IVec3::new(dx, dy, dz), lod - 1, desired, depth - 1)
+                    {
+                        return false;
+                    }
+                }
+            }
+        }
+        true
+    }
+
     /// Reconcile the resident set toward the desired CLIPMAP around the camera at world position `cam_world`:
     /// * DROP every resident brick no longer in the desired clipmap (a shell shifted / the camera moved) —
     ///   marks dirty.
@@ -596,10 +664,19 @@ impl ResidencyManager {
         // killing the 38 s/crossing classify (was 9 taps × 8 M keys; now 9 taps × Θ(H²) candidates).
         let desired = desired_clipmap_surface(cam_world, cfg, source);
 
-        // Drop resident bricks that left the clipmap.
+        // Drop resident bricks that left the clipmap — KEEP-OLD-UNTIL-REVEALED at per-brick LOD granularity. A
+        // brick whose region merely switched LOD (a shell shifted under camera motion) is RETAINED until its
+        // replacement LOD is RESIDENT, so the transition never leaves a temporary HOLE — the old, slightly-stale
+        // LOD keeps rendering until the new one lands (then it drops, ~1 frame of harmless overlap). A brick whose
+        // region left the clipmap ENTIRELY (no replacement LOD is even desired — the camera moved away) drops
+        // immediately: nothing should render there. See [`Self::safe_to_drop`].
         let mut dropped = 0usize;
-        let to_drop: Vec<BrickKey> =
-            self.resident.keys().filter(|k| !desired.contains_key(*k)).copied().collect();
+        let to_drop: Vec<BrickKey> = self
+            .resident
+            .keys()
+            .filter(|k| !desired.contains_key(*k) && self.safe_to_drop(k, &desired))
+            .copied()
+            .collect();
         for k in to_drop {
             self.resident.remove(&k);
             dropped += 1;
@@ -1025,6 +1102,61 @@ mod tests {
         }
     }
 
+    /// KEEP-OLD-UNTIL-REVEALED (no evict-before-load gap): a resident brick that left the desired clipmap because
+    /// its region switched LOD is retained until the replacement LOD is RESIDENT — `safe_to_drop` returns false
+    /// while the replacement is merely DESIRED, true once it is resident, and true immediately when the region
+    /// left the clipmap entirely.
+    #[test]
+    fn safe_to_drop_keeps_old_lod_until_replacement_resident() {
+        use super::super::palette::BlockId;
+        let solid = || Brick::uniform(BlockId::AIR); // contents are irrelevant — safe_to_drop reads only residency
+        let mut mgr = ResidencyManager::new();
+
+        // --- Coarsening: a fine LOD0 brick whose region now wants the PARENT (lod1, coord 2/2 = 1). ---
+        let fine = BrickKey { coord: IVec3::new(2, 0, 0), lod: 0 };
+        let parent = BrickKey { coord: IVec3::new(1, 0, 0), lod: 1 };
+        mgr.resident.insert(fine, solid());
+        let mut want_parent: FxHashMap<BrickKey, ()> = FxHashMap::default();
+        want_parent.insert(parent, ());
+        assert!(!mgr.safe_to_drop(&fine, &want_parent), "retain the fine LOD until its coarse replacement is resident");
+        mgr.resident.insert(parent, solid());
+        assert!(mgr.safe_to_drop(&fine, &want_parent), "drop the fine LOD once the coarse replacement is resident");
+
+        // --- Region left the clipmap entirely (no parent / child desired) ⇒ drop immediately. ---
+        let gone = BrickKey { coord: IVec3::new(99, 0, 0), lod: 0 };
+        mgr.resident.insert(gone, solid());
+        assert!(mgr.safe_to_drop(&gone, &want_parent), "drop when the region left the clipmap (no replacement desired)");
+
+        // --- Refining: a coarse LOD1 brick whose region now wants its 8 CHILDREN at lod0. ---
+        let coarse = BrickKey { coord: IVec3::new(5, 0, 0), lod: 1 };
+        mgr.resident.insert(coarse, solid());
+        let mut want_children: FxHashMap<BrickKey, ()> = FxHashMap::default();
+        let base = coarse.coord * IVec3::splat(2);
+        for dz in 0..2 {
+            for dy in 0..2 {
+                for dx in 0..2 {
+                    want_children.insert(BrickKey { coord: base + IVec3::new(dx, dy, dz), lod: 0 }, ());
+                }
+            }
+        }
+        assert!(!mgr.safe_to_drop(&coarse, &want_children), "retain the coarse LOD until ALL finer children are resident");
+        // Make all but one child resident — still must NOT drop (one child still a gap).
+        let mut first = true;
+        for key in want_children.keys().copied().collect::<Vec<_>>() {
+            if first {
+                first = false;
+                continue;
+            }
+            mgr.resident.insert(key, solid());
+        }
+        assert!(!mgr.safe_to_drop(&coarse, &want_children), "retain while ANY finer child is still missing");
+        // Resident-fill the last child → now safe to drop.
+        for key in want_children.keys().copied().collect::<Vec<_>>() {
+            mgr.resident.insert(key, solid());
+        }
+        assert!(mgr.safe_to_drop(&coarse, &want_children), "drop the coarse LOD once every finer child is resident");
+    }
+
     /// A test [`BrickSource`] that classifies EVERY brick as [`BrickClass::Surface`] (the default), so
     /// `ResidencyManager::update`'s classify split keeps all desired keys as surface candidates — letting the
     /// A2 surface cap be exercised directly (every desired brick competes for a slot). `brick` is never called
@@ -1100,9 +1232,10 @@ mod tests {
         assert_eq!(mgr.capped_total, 0, "the cap never binds — nothing surface to drop");
     }
 
-    /// Residency reconciliation: a simulated camera move enters new bricks (enqueued, then voxelized into
-    /// resident) and drops exited ones; empty (sky) bricks are skipped; the keep-old invariant holds (the
-    /// set isn't dirty until a revealing batch lands). Resident bricks always lie within the clipmap.
+    /// Residency reconciliation under camera motion, with KEEP-OLD-UNTIL-REVEALED: a move enqueues the new/
+    /// replacement LODs without dropping the superseded ones (no evict-before-load hole); the superseded bricks
+    /// drop only on a LATER update, once their replacement LOD has been voxelized resident. After convergence
+    /// every resident brick again lies within its level's clipmap shell (no stale leftovers).
     #[test]
     fn residency_updates_as_camera_moves() {
         let layer = test_layer();
@@ -1122,19 +1255,60 @@ mod tests {
         mgr.drain_work(&cfg, &layer, &lib, &reg, SEED);
         assert!(mgr.is_dirty(), "voxelizing real terrain bricks reveals new geometry → dirty");
         assert!(mgr.take_dirty());
-        assert!(mgr.resident_count() > 0, "some non-empty bricks resident");
+        // Snapshot the pre-move resident set + the centre of every region it covers (each must stay covered).
+        let resident_before: Vec<BrickKey> = mgr.resident.keys().copied().collect();
+        let centre_of = |k: &BrickKey| {
+            let s = brick_span(k.lod);
+            [(k.coord.x as f32 + 0.5) * s, (k.coord.y as f32 + 0.5) * s, (k.coord.z as f32 + 0.5) * s]
+        };
+        let covered_pts: Vec<[f32; 3]> = resident_before.iter().map(centre_of).collect();
+        assert!(!covered_pts.is_empty(), "some non-empty bricks resident");
 
-        // Move the camera +5 m in X (crosses a few LOD0 bricks). New bricks enter, far ones drop.
+        // True iff world point `p` lies inside SOME brick's AABB in `keys` (its LOD-sized cell). The geometric
+        // "is this region covered / still in the clipmap" predicate, independent of `safe_to_drop`'s internals.
+        let point_in = |keys: &[BrickKey], p: [f32; 3]| {
+            keys.iter().any(|k| {
+                let s = brick_span(k.lod);
+                let lo = [k.coord.x as f32 * s, k.coord.y as f32 * s, k.coord.z as f32 * s];
+                (0..3).all(|i| p[i] >= lo[i] && p[i] < lo[i] + s)
+            })
+        };
+
+        // Move the camera +5 m in X. Keep-old-until-revealed: bricks whose regions merely changed LOD are
+        // RETAINED — the first update only ENQUEUES their replacements; it must leave NO hole.
         let cam1 = [5.0_f32, surf, 0.0];
+        mgr.update(cam1, &cfg, &src);
+        assert!(mgr.pending() > 0, "the move enqueues the replacement LODs");
+        // NO-GAP INVARIANT: every point covered before the move that is STILL inside the clipmap (desired at
+        // cam1 at some LOD) must STILL be covered by a resident brick — the old LOD is retained until its
+        // replacement is revealed, so the region never becomes a hole. (Replacements aren't drained yet.)
+        // Coverage is defined over the SURFACE set the system actually streams (not the full geometric tiling —
+        // a point that is non-surface at the finer desired LOD is correct sparsity, not a hole).
+        // Coverage is defined over the SURFACE set the system actually streams (a point that is non-surface at
+        // the finer desired LOD is correct sparsity, not a hole).
+        let desired_keys: Vec<BrickKey> = desired_clipmap_surface(cam1, &cfg, &src).keys().copied().collect();
+        let resident_keys: Vec<BrickKey> = mgr.resident.keys().copied().collect();
+        let _ = &resident_before; // (kept above only to derive the covered-region centres)
+        for &p in &covered_pts {
+            if point_in(&desired_keys, p) {
+                assert!(
+                    point_in(&resident_keys, p),
+                    "a surface region still in the clipmap became a HOLE before its replacement loaded (evict-before-load) at p={p:?}"
+                );
+            }
+        }
+
+        mgr.drain_work(&cfg, &layer, &lib, &reg, SEED); // reveal the replacement LODs
+        // Now the replacements are resident, so the superseded LODs become safe to drop on the next update.
         let dropped = mgr.update(cam1, &cfg, &src);
-        assert!(dropped > 0, "moving away drops the bricks left behind");
+        assert!(dropped > 0, "once the replacements are revealed, the superseded LODs drop");
         mgr.drain_work(&cfg, &layer, &lib, &reg, SEED);
-        // Every resident brick lies within its level's clipmap shell around the new camera.
-        // The snapped box has half-extent up to `half + 1` (snap_even_odd can extend one side by one brick).
+        // Converged: every resident brick lies within its level's clipmap shell around the camera (no stale
+        // leftovers). The snapped box half-extent can extend one brick (snap_even_odd), hence `half + 1`.
         let half = cfg.clip_half_bricks;
         for e in mgr.resident_entries() {
             let cam_l = camera_brick_coord_lod(cam1, e.lod);
-            assert!(cheby(e.coord, cam_l) <= half + 1, "resident bricks stay in the clipmap");
+            assert!(cheby(e.coord, cam_l) <= half + 1, "resident bricks stay in the clipmap once converged");
         }
     }
 
