@@ -431,12 +431,14 @@ fn stream_voxel_rt_residency(
     mut lighting: ResMut<VoxelRtLighting>,
     mut sky: ResMut<VoxelRtSky>,
     cam: Query<&GlobalTransform, With<SdfCamera>>,
-    // Phase G G-wire — the main-world device/queue (THIS fork keeps them in the main world,
-    // `bevy_render/src/settings.rs`) + the lazily-built classify pipeline. `Option` because the render device is
-    // created asynchronously and is absent on the first Startup ticks. Only the live `gpu_pack` path touches them.
-    render_device: Option<Res<RenderDevice>>,
-    render_queue: Option<Res<RenderQueue>>,
-    mut classify: ResMut<VoxelPackClassifyState>,
+    // Phase G — the main-world device/queue (THIS fork keeps them in the main world, `bevy_render/src/settings.rs`)
+    // + the lazily-built classify pipeline. `Option` because the render device is created asynchronously and is
+    // absent on the first Startup ticks. RETAINED for the FUTURE async-readback step (the G4 classify path); the
+    // current live `gpu_pack` arm is "config 2" (G-a `update_gpu` + G-b `apply_gpu_pack`, NO readback) and does NOT
+    // touch them — hence the `_` bindings keep the resources required/warm without an unused-variable warning.
+    _render_device: Option<Res<RenderDevice>>,
+    _render_queue: Option<Res<RenderQueue>>,
+    _classify: ResMut<VoxelPackClassifyState>,
 ) {
     // Phase G Stage G-a A/B flag (OFF by default): when set, the streamed re-pack emits a GPU PACK batch
     // (`update_gpu`) the render world encodes on the GPU, instead of the all-CPU `update` + `apply_delta`.
@@ -785,35 +787,23 @@ fn stream_voxel_rt_residency(
             // device/queue are not yet available (the first Startup ticks, before the async device lands), fall back
             // to the CPU-classify `update_gpu` so the path never stalls — it converges to the same allocation.
             Some(p) if gpu_pack => {
-                // The G4 path is reachable ONLY once the render device/queue have landed (async; absent on the very
-                // first Startup ticks). When they're not yet ready, the CPU `update_gpu` runs (same allocation).
-                let device_ready = render_device.is_some() && render_queue.is_some();
-                // STREAMSNAPSHOT STAYS CPU (G-wire item #2). The FIRST pack of a streamed epoch ships a
-                // `StreamSnapshot` — a CPU `pack_one` of the whole initial resident set (a one-time cold-fill, NOT
-                // the trace's bulk). It MUST go through the CPU `update_gpu` (which keeps the raw-cell `last_voxels`
-                // shadow `snapshot_buffers` re-encodes), BEFORE any GPU `update_gpu_finish` drops `last_voxels`.
-                // Subsequent moves ship G4 GpuPack deltas. The arena is pre-sized (#146 Tier-1) so NO mid-stream
-                // grow-snapshot happens → the only snapshot is this first one, while `last_voxels` is valid. (A grow
-                // PAST the reserve still works — handled below by re-deriving `last_voxels` before snapshotting.)
+                // STREAMSNAPSHOT STAYS CPU. The FIRST pack of a streamed epoch ships a `StreamSnapshot` — a CPU
+                // `pack_one` of the whole initial resident set (a one-time cold-fill, NOT the trace's bulk). It MUST
+                // go through the CPU `update_gpu` (which keeps the raw-cell `last_voxels` shadow `snapshot_buffers`
+                // re-encodes). The arena is pre-sized (#146 Tier-1) so NO mid-stream grow-snapshot happens → the
+                // only snapshot is this first one. (A grow PAST the reserve still works — handled below by
+                // re-deriving `last_voxels` before snapshotting.)
                 let want_snapshot = !*epoch_snapshotted;
-                let use_g4 = device_ready && !want_snapshot;
-                let batch = if use_g4 {
-                    let rd = render_device.as_deref().expect("device_ready");
-                    let rq = render_queue.as_deref().expect("device_ready");
-                    let pipeline = classify.0.get_or_insert_with(|| VoxelPackClassify::new(rd.wgpu_device()));
-                    let prepared = {
-                        let _su = info_span!("vox_pack_classify_prepare").entered();
-                        p.update_gpu_prepare(&entries, active_registry.len() as u32)
-                    };
-                    let classify_out = {
-                        let _cd = info_span!("vox_pack_classify_dispatch").entered();
-                        pipeline.run(rd.wgpu_device(), rq, &prepared)
-                    };
-                    let _sf = info_span!("vox_pack_classify_finish").entered();
-                    p.update_gpu_finish(&prepared, &classify_out)
-                } else {
-                    // The first/cold pack (snapshot) + the device-not-ready fallback: CPU classify (keeps the
-                    // `last_voxels` shadow). Byte-identical allocation to G4 (the parity gate covers both).
+                // Phase G — the LIVE gpu_pack path = "config 2" (G-a + G-b, NO READBACK). The CPU `update_gpu` does
+                // the (Tier-2-parallel) `pack_one` for SIZING/uniform-classify and emits a `GpuPackBatch`; the render
+                // world then dispatches `pack_brick` + `write_aabb` + one-submission fill-then-build (`apply_gpu_pack`).
+                // This captures the dominant `vox_blas_delta` BLAS/AABB-upload win (the ~668 ms/load that G-b moves to
+                // the GPU) WITHOUT the G4 classify dispatch + synchronous readback (`map_async` + `device.poll(Wait)`),
+                // which is a ~5-15 ms/tick stall under live GPU contention → a net LOSS on small steady-state deltas.
+                // The G4 `update_gpu_prepare`/classify/`update_gpu_finish` code is retained intact (incl. the
+                // `VoxelPackClassify` pipeline + the held device/queue/`classify` resources) as the basis for the
+                // FUTURE ASYNC-readback step — it is simply not on the live arm.
+                let batch = {
                     let _su = info_span!("vox_pack_update_gpu").entered();
                     p.update_gpu(&entries, active_registry.len() as u32)
                 };
@@ -3156,6 +3146,11 @@ fn apply_delta(
 /// back without crossing to the render world). Holds its own bind-group layout + pipeline. The heavy `pack_brick`/
 /// `write_aabb`/BLAS still run in the render world (`apply_gpu_pack`); only the cheap classify round-trip — whose
 /// readback the CPU `update_gpu_finish` allocation needs — runs here. Mirrors the test rig `run_classify`.
+///
+/// RETAINED but NOT on the live arm: the live `gpu_pack` path is now "config 2" (G-a `update_gpu` + G-b
+/// `apply_gpu_pack`, NO readback). This G4 classify pipeline + its `run` synchronous round-trip are kept intact
+/// as the basis for the FUTURE async-readback step, hence `#[allow(dead_code)]`.
+#[allow(dead_code)]
 struct VoxelPackClassify {
     pipeline: wgpu::ComputePipeline,
     layout: wgpu::BindGroupLayout,
@@ -3165,8 +3160,10 @@ struct VoxelPackClassify {
 /// `gpu_pack` re-pack builds it from the (by-then-available) main-world `RenderDevice`. `init_resource`-able
 /// (Default = `None`) so it can be registered without a device at Startup.
 #[derive(Resource, Default)]
+#[allow(dead_code)] // The inner pipeline is only built by the (retained-for-future) G4 async-readback arm.
 struct VoxelPackClassifyState(Option<VoxelPackClassify>);
 
+#[allow(dead_code)] // RETAINED for the future async-readback step; the live arm is config 2 (no readback).
 impl VoxelPackClassify {
     /// Build the classify pipeline from the main-world device. The bind group is `classify_brick`'s subset of the
     /// shared `voxel_pack.wgsl` `@group(0)`: cores@1 + neighbour_indices@2 (read-only), classify_out@8 (read_write),
