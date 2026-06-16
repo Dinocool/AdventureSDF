@@ -410,6 +410,10 @@ fn stream_voxel_rt_residency(
     mut sky: ResMut<VoxelRtSky>,
     cam: Query<&GlobalTransform, With<SdfCamera>>,
 ) {
+    // Main-thread residency span — names this system in a chrome trace (Bevy's automatic per-system spans are
+    // `trace`-level and dropped by the global `info` EnvFilter, so the heavy voxel work was otherwise invisible).
+    // The child spans below (classify / drain / re-pack) split the cost so a capture names the exact culprit.
+    let _span = info_span!("vox_stream_residency").entered();
     // --- Static Cornell scene: build the resident set once, re-baking ONLY when the edit delta changes. ---
     if scene.is_cornell() {
         // Re-pack on the first Cornell tick AND whenever a build/destroy edit bumps the delta generation. The
@@ -700,7 +704,10 @@ fn stream_voxel_rt_residency(
     // are unchanged. `update` takes the source so its classify FILTER can prune non-surface bricks at enqueue.
     let cam_changed = *last_cam_brick != Some(cam_brick);
     if cam_changed {
-        let dropped = manager.update(cam_world, cfg, source);
+        let dropped = {
+            let _s = info_span!("vox_residency_classify").entered();
+            manager.update(cam_world, cfg, source)
+        };
         *last_cam_brick = Some(cam_brick);
         if dropped > 0 {
             debug!("voxel streaming: dropped {dropped} bricks left behind by camera move");
@@ -709,7 +716,10 @@ fn stream_voxel_rt_residency(
         return; // nothing to do this frame
     }
 
-    manager.drain_work_from(cfg, source, active_registry, &edits);
+    {
+        let _s = info_span!("vox_drain_source").entered();
+        manager.drain_work_from(cfg, source, active_registry, &edits);
+    }
 
     // AMORTIZE the O(resident) re-pack (pack_resident_set ~60 ms + the full BLAS rebuild): accumulate "resident
     // set changed" and pack only on a SETTLE (queue drained) OR every WORLDGEN_REPACK_INTERVAL frames during a
@@ -723,6 +733,7 @@ fn stream_voxel_rt_residency(
     *worldgen_frames_since_pack = worldgen_frames_since_pack.saturating_add(1);
     let settled = manager.pending() == 0;
     if *worldgen_dirty_pending && (settled || *worldgen_frames_since_pack >= WORLDGEN_REPACK_INTERVAL) {
+        let _s = info_span!("vox_repack").entered();
         let entries = manager.resident_entries();
         // STORAGE PLAN A1 — the O(changed) GPU upload. `update` re-`pack_one`s ONLY the entered/dropped bricks +
         // their resident 26-neighbourhood (the halo dependency) and returns the [`RepackDelta`]. The FIRST re-pack
@@ -734,7 +745,10 @@ fn stream_voxel_rt_residency(
         // scene (set on the switch); the `None` arm is a defensive first-tick fallback to a contiguous Snapshot.
         let upload = match packer.as_mut() {
             Some(p) => {
-                let delta = p.update(&entries, active_registry.len() as u32);
+                let delta = {
+                    let _su = info_span!("vox_pack_update").entered();
+                    p.update(&entries, active_registry.len() as u32)
+                };
                 let (lights, alias) = build_lights_from_entries(&entries, active_registry);
                 let brick_count = p.resident_count() as u32;
                 // A4.4: the index slab arena GROWS on overflow — a grow re-allocates the GPU index buffer, so the
@@ -742,7 +756,10 @@ fn stream_voxel_rt_residency(
                 // `update`'s allocations and cleared by `snapshot_buffers`.
                 if !*epoch_snapshotted || p.grew() {
                     // First pack of this epoch (or a grow): snapshot the fixed-cap buffers (allocate once / resize).
-                    let buffers = p.snapshot_buffers(active_registry);
+                    let buffers = {
+                        let _ss = info_span!("vox_pack_snapshot").entered();
+                        p.snapshot_buffers(active_registry)
+                    };
                     *epoch_snapshotted = true;
                     VoxelRtUpload::StreamSnapshot { buffers, lights, alias }
                 } else if !delta.is_empty() {
@@ -2582,10 +2599,14 @@ fn prepare_voxel_rt(
     if resources.built_generation == Some(patch_res.generation) {
         return; // already applied this generation — keep the current scene
     }
+    // Render-world AS-build span — names the BLAS (re)build cost in a chrome trace. `vox_blas_build` is the full
+    // BLAS rebuild (Snapshot / StreamSnapshot); `vox_blas_delta` the incremental slot patch.
+    let _span = info_span!("vox_prepare_rt").entered();
     let device = render_device.wgpu_device();
 
     match &patch_res.upload {
         VoxelRtUpload::Snapshot(patch) => {
+            let _s = info_span!("vox_blas_build").entered();
             // STATIC contiguous R2b patch: (re)allocate all buffers + a single BLAS over `brick_count`
             // primitives. `brick_palettes` is the real R2b per-brick palette buffer.
             build_scene_full(
@@ -2611,6 +2632,7 @@ fn prepare_voxel_rt(
             // voxel buffer holds the bit-packed INDEX slabs and `brick_palettes` the real per-brick palettes (the
             // streamed path now uses the same paletted `cell_block` decode as the static path). The light list
             // ships whole.
+            let _s = info_span!("vox_blas_build").entered();
             let capacity = buffers.metas.len() as u32;
             build_scene_full(
                 device,
@@ -2655,6 +2677,7 @@ fn prepare_voxel_rt(
             if !scene.streamed {
                 return; // a static Snapshot scene can't take a Delta (shouldn't happen — defensive)
             }
+            let _s = info_span!("vox_blas_delta").entered();
             apply_delta(device, &render_queue, scene, delta);
             // The buffers were patched in place; the bind group (which references the SAME TLAS/meta/voxel/palette
             // handles) is unchanged. Rebuild the NEE light list (it follows the resident set's emissive surface).
