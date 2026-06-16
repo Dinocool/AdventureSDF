@@ -228,13 +228,48 @@ fn run_tiled_bake(
         ceil_div(dims[0], tile_edge).max(1),
     );
 
-    // Run-unique scratch subdir.
-    let root = scratch_root.unwrap_or_else(std::env::temp_dir);
+    // Scratch-location robustness fix: NEVER silently default to the SYSTEM drive (C: via `std::env::temp_dir`).
+    // A 354 M-voxel Bistro bake spills GBs of `.fin`/`.spill`/`.brik.tmp` scratch; defaulting to C: filled the
+    // system drive to 0 and failed the bake + the harness. Resolution priority:
+    //   1. an explicit `--scratch <dir>` (the caller's choice — highest);
+    //   2. else an EXPLICITLY-SET `TMP`/`TEMP` env var (honors `TMP=D:\tmp_test` for tests/CI), via `temp_dir()`;
+    //   3. else the OUTPUT file's PARENT directory (same drive as the `.vxo` — bounded by the output's free space,
+    //      and the scratch high-water is comparable to the output, so this is the safe default).
+    let root = resolve_scratch_root(scratch_root, out_path);
     let unique = format!("voxelize_tiled_{}_{}", std::process::id(), std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0));
     let scratch = root.join(unique);
     std::fs::create_dir_all(&scratch)?;
     println!("tiled scratch: {}", scratch.display());
+
+    // Fail-fast if the scratch drive lacks the (estimated) free space the bake needs — never start a bake that
+    // will fill the drive and fail mid-way. The estimate is conservative; an inaccurate probe degrades to a
+    // WARNING (never a false block), since a missing free-space query must not stop an otherwise-valid bake.
+    let need_bytes = estimate_scratch_bytes(dims);
+    match free_space_bytes(&scratch) {
+        Some(free) if free < need_bytes => {
+            // Clean up the just-created dir before bailing.
+            let _ = std::fs::remove_dir_all(&scratch);
+            anyhow::bail!(
+                "tiled bake: scratch drive at {} has {:.1} GiB free but the bake is estimated to need ~{:.1} GiB \
+                 (grid {}×{}×{}). Point --scratch at a drive with more space (e.g. --scratch D:/tmp_test).",
+                root.display(),
+                free as f64 / (1024.0 * 1024.0 * 1024.0),
+                need_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
+                dims[0], dims[1], dims[2],
+            );
+        }
+        Some(free) => println!(
+            "  scratch free space: {:.1} GiB (estimated need ~{:.1} GiB)",
+            free as f64 / (1024.0 * 1024.0 * 1024.0),
+            need_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
+        ),
+        None => eprintln!(
+            "  WARNING: could not query free space at {} — proceeding (estimated need ~{:.1} GiB)",
+            root.display(),
+            need_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
+        ),
+    }
 
     let grid = tiled::TileGrid::new(dims, tile_edge, scratch.clone());
 
@@ -272,6 +307,77 @@ fn run_tiled_bake(
             Err(e)
         }
     }
+}
+
+/// Resolve the scratch ROOT directory (the parent under which the run-unique subdir is created), per the
+/// robustness fix: explicit `--scratch` > an explicitly-set `TMP`/`TEMP` env var > the OUTPUT file's parent
+/// directory. NEVER falls through to the bare system temp dir (the C:-fill bug). The output parent guarantees
+/// scratch lands on the SAME drive as the `.vxo` (its free space is the natural bound for the spill high-water).
+fn resolve_scratch_root(scratch_arg: Option<PathBuf>, out_path: &Path) -> PathBuf {
+    if let Some(s) = scratch_arg {
+        return s;
+    }
+    // An EXPLICITLY-set TMP/TEMP (e.g. `TMP=D:\tmp_test`) is an intentional redirect — honor it via `temp_dir()`
+    // (which reads TMP then TEMP on Windows, TMPDIR on Unix). We only treat it as set if the var is non-empty.
+    let tmp_set = ["TMP", "TEMP", "TMPDIR"]
+        .iter()
+        .any(|v| std::env::var_os(v).is_some_and(|s| !s.is_empty()));
+    if tmp_set {
+        return std::env::temp_dir();
+    }
+    // Default: the output file's parent (same drive as the .vxo). Absolute-ize a bare filename to its CWD.
+    let parent = out_path.parent().filter(|p| !p.as_os_str().is_empty());
+    match parent {
+        Some(p) => p.to_path_buf(),
+        None => std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+    }
+}
+
+/// A CONSERVATIVE estimate of the peak scratch bytes a tiled bake needs, from the grid dimensions. The dominant
+/// scratch is the per-tile `.fin` (12 B/solid) + the per-region `.spill` (16 B/solid) + the assembled `.brik.tmp`
+/// (the compressed region bodies). We don't know the solid count up front, so bound it by a SURFACE estimate:
+/// a closed scene's solid surface is `O(face area)` ≈ the largest two axes' product times a small shell depth.
+/// We budget `~6 × max_face_area` solids × ~48 B aggregate scratch/solid, with a 256 MiB floor — generous
+/// enough to avoid false blocks on small scenes, tight enough to catch "C: has 0.5 GiB, Bistro needs ~30 GiB".
+fn estimate_scratch_bytes(dims: [i32; 3]) -> u64 {
+    let mut d = [dims[0] as u64, dims[1] as u64, dims[2] as u64];
+    d.sort_unstable();
+    // Largest two axes ⇒ the dominant face; ×6 faces ×~2 shell depth ≈ surface solids upper bound.
+    let face = d[1].saturating_mul(d[2]);
+    let surface_solids = face.saturating_mul(12);
+    let bytes_per_solid = 48u64; // .fin (12) + .spill (16) + assembled brik body (~20, post-zstd)
+    surface_solids.saturating_mul(bytes_per_solid).max(256 * 1024 * 1024)
+}
+
+/// Free bytes available on the volume containing `path` (Windows `GetDiskFreeSpaceExW`; Unix `statvfs`).
+/// `None` if the query fails (the caller degrades to a warning, never a false block).
+#[cfg(target_os = "windows")]
+fn free_space_bytes(path: &Path) -> Option<u64> {
+    use std::os::windows::ffi::OsStrExt as _;
+    // A wide, NUL-terminated path. `GetDiskFreeSpaceExW` accepts a directory; the dir was just created.
+    let wide: Vec<u16> = path.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+    unsafe extern "system" {
+        fn GetDiskFreeSpaceExW(
+            directory: *const u16,
+            free_bytes_available_to_caller: *mut u64,
+            total_number_of_bytes: *mut u64,
+            total_number_of_free_bytes: *mut u64,
+        ) -> i32;
+    }
+    let mut avail: u64 = 0;
+    // SAFETY: `wide` is a valid NUL-terminated UTF-16 path; the out-pointer is a stack `u64`; passing null for the
+    // two totals we don't need is permitted by the API.
+    let ok = unsafe {
+        GetDiskFreeSpaceExW(wide.as_ptr(), &mut avail, std::ptr::null_mut(), std::ptr::null_mut())
+    };
+    (ok != 0).then_some(avail)
+}
+
+#[cfg(not(target_os = "windows"))]
+fn free_space_bytes(_path: &Path) -> Option<u64> {
+    // No std free-space API; degrade to a warning (the Windows path is the one that matters for this corpus, and
+    // the `libc::statvfs` path would add a dev-dep for a non-target platform). Returning `None` ⇒ proceed-warn.
+    None
 }
 
 /// Recursive byte size of a directory (the scratch high-water report). Best-effort; ignores unreadable entries.
@@ -315,11 +421,12 @@ fn assemble_vxo_streaming(
     out_path: &Path,
     store: bool,
 ) -> anyhow::Result<()> {
-    use adventure::voxel::brickmap::{BRICK_EDGE, Brick, BrickMap, brick_coord_of_voxel, voxel_index};
     use adventure::voxel::palette::{BlockId, BlockRegistry};
-    use adventure::voxel::vxo::{VxoCompression, VxoHeadParams, VxoStreamWriter, region_of_brick};
+    use adventure::voxel::vxo::{
+        RegionSpillPool, VxoCompression, VxoHeadParams, VxoStreamWriter, assemble_base, spill_voxel,
+        windowed_coarse,
+    };
     use bevy::math::IVec3;
-    use rustc_hash::FxHashMap;
 
     let (dx, dy) = (grid.dims[0] as usize, grid.dims[1] as usize);
     let delin = |gi: usize| -> (i32, i32, i32) {
@@ -354,60 +461,53 @@ fn assemble_vxo_streaming(
     // bar the anchor). Applied to every solid so the tiled .vxo aligns with the rest of the gallery.
     let shift = IVec3::new(-(lo[0] + hi[0]) / 2, -lo[1], -(lo[2] + hi[2]) / 2);
 
-    // --- Pass 2: emit. Map each solid → anchored world voxel → brick; quantize once per distinct albedo. ---
+    // --- Pass 2 (CONSTANT-RAM, Stages 1+2): SPILL each solid → per-region disk file, then assemble one region
+    // at a time + windowed coarse. The whole LOD0 surface BrickMap is NEVER resident — peak RAM is the palette +
+    // the spill writer pool + one region's bricks + an O(region-count) coord set (constant in surface size). ---
     let k = VxoHeadParams::default().region_edge_bricks as i32;
     let mut nearest_cache: HashMap<[u8; 4], u8> = HashMap::new();
-    // Sparse per-brick dense arrays (only non-empty bricks materialize — surface-bounded residency).
-    let mut bricks: FxHashMap<IVec3, Box<[BlockId; (BRICK_EDGE * BRICK_EDGE * BRICK_EDGE) as usize]>> =
-        FxHashMap::default();
+
+    // Spill pass: route every solid voxel to its owning region's spill file (anchored world-voxel → brick →
+    // region). `spill_voxel` computes the owning brick + local index; the pool's LRU bounds open handles.
+    let mut base = RegionSpillPool::new(&grid.scratch, "base", k);
+    let mut spill_err: Option<std::io::Error> = None;
     tiled::stream_final(grid, final_ids, |gi, rgba| {
         let pal = *nearest_cache.entry(rgba).or_insert_with(|| nearest_palette_lab(&palette_lab, rgba));
         let block = BlockId(pal as u16 + 1); // 1-based; 0 = air
         let (x, y, z) = delin(gi);
         let w = IVec3::new(x, y, z) + shift;
-        let bc = brick_coord_of_voxel(w);
-        let local = w - bc * BRICK_EDGE;
-        let arr = bricks.entry(bc).or_insert_with(|| Box::new([BlockId::AIR; (BRICK_EDGE * BRICK_EDGE * BRICK_EDGE) as usize]));
-        arr[voxel_index(local.x, local.y, local.z)] = block;
+        // The spill writes are infallible disk appends; surface a write error by panicking inside the closure is
+        // not ideal, so collect into a Result via a small wrapper. `stream_final` takes `FnMut(_, _)` (no Result),
+        // so we stash the first error and bail after.
+        if let Err(e) = spill_voxel(&mut base, w, block) {
+            spill_err = Some(e);
+        }
     })?;
-
-    // Build the BrickMap (uniform-collapse + occupancy via the SSOT Brick::from_voxels), then region-bucket and
-    // stream-write. The BrickMap here is the surface-bounded resident set (bounded by SURFACE, not volume).
-    let mut map = BrickMap::new();
-    for (coord, arr) in bricks {
-        map.insert(coord, Brick::from_voxels(arr));
+    if let Some(e) = spill_err.take() {
+        return Err(e.into());
     }
-
-    // Region-bucket the bricks (sorted (z,y,x) within a region; regions fed in (z,y,x) order so the streamed
-    // BRIK body is deterministic).
-    let mut regions: FxHashMap<IVec3, Vec<IVec3>> = FxHashMap::default();
-    for (&coord, _) in map.iter() {
-        regions.entry(region_of_brick(coord, k)).or_default().push(coord);
-    }
-    let mut region_coords: Vec<IVec3> = regions.keys().copied().collect();
-    region_coords.sort_by_key(|c| (c.z, c.y, c.x));
+    base.flush_all()?;
 
     let name = out_path.file_stem().and_then(|s| s.to_str()).unwrap_or("vxo").to_string();
     let params = VxoHeadParams { voxel_size, name, ..Default::default() };
     let comp = if store { VxoCompression::Store } else { VxoCompression::default() };
     let scratch_brik = grid.scratch.join("assembly.brik.tmp");
     let mut writer = VxoStreamWriter::new(params, &registry, comp, &scratch_brik)?;
-    for rc in &region_coords {
-        let mut coords = regions.remove(rc).expect("region present");
-        coords.sort_by_key(|c| (c.z, c.y, c.x));
-        let region_bricks: Vec<(IVec3, &Brick)> =
-            coords.iter().map(|&c| (c, map.get(c).expect("brick present"))).collect();
-        writer.add_region(*rc, &region_bricks)?;
-    }
 
-    // Bake the coarse-LOD pyramid (the LODS chunk) from the still-resident base map, driven through the SHARED
-    // `drive_coarse_lods` ordering SSOT so the tiled path's LODS bytes are byte-identical to the full-RAM
-    // `encode_vxo`/`build_lods_body` path. This is the Stage-0 BOUNDED (resident-map) producer — Stages 1-3 later
-    // SWAP it for a disk-spill / windowed-coarse producer feeding the SAME `add_lod_region` sink (no format/reader
-    // change). `build_coarse_pyramid` runs the full pyramid to MAX_LOD for a non-empty map, so `finish` satisfies
-    // the `max_lod == MAX_LOD` invariant by construction.
-    let pyramid = adventure::voxel::vxo::build_coarse_pyramid(&map);
-    adventure::voxel::vxo::drive_coarse_lods(&pyramid, k, |lod, rc, bricks| writer.add_lod_region(lod, rc, bricks))?;
+    // Stage 1: assemble the base LOD0 regions one at a time (read spill → group into bricks → add_region → drop
+    // → delete), re-spilling each region's bricks onto the COARSE grid for the windowed downsample.
+    let mut coarse_l0 = RegionSpillPool::new(&grid.scratch, "coarse_l0", k);
+    let base_bricks = assemble_base(&base, &mut coarse_l0, &mut writer)?;
+    base.delete_all();
+
+    // Stage 2: windowed constant-RAM coarse pyramid — each level built from the finer level's spills via the
+    // EXACT `gather_children`/`downsample_children` SSOT, fed to `add_lod_region` (byte-identical to the full-RAM
+    // `encode_vxo`/`build_lods_body` path). `coarse_l0` enters as the LOD0 bricks on the coarse grid.
+    if base_bricks > 0 {
+        windowed_coarse(coarse_l0, &grid.scratch, k, &mut writer)?;
+    } else {
+        coarse_l0.delete_all();
+    }
 
     writer.finish(out_path)?;
     Ok(())
