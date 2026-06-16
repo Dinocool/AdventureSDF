@@ -51,7 +51,7 @@ use bytemuck::pod_read_unaligned;
 use rustc_hash::FxHashMap;
 
 use super::format::*;
-use super::reader::{DecodedRegion, decode_region_span, parse_bidx, parse_head, parse_matl};
+use super::reader::{DecodedRegion, decode_region_span, parse_bidx, parse_head, parse_lods, parse_matl};
 use crate::voxel::brickmap::{BRICK_EDGE, Brick, MAX_LOD, VOXEL_SIZE};
 use crate::voxel::palette::{BlockId, BlockRegistry};
 use crate::voxel::source::{BrickClass, BrickSource, downsample_children, gather_children};
@@ -61,15 +61,21 @@ use crate::voxel::source::{BrickClass, BrickSource, downsample_children, gather_
 /// whole expanded scene. The budget bounds `RAM_peak ≈ HEAD/MATL/BIDX + this + the resident-set mirror`.
 pub const DEFAULT_DECODED_REGION_BUDGET: usize = 256 * 1024 * 1024;
 
-/// The byte-budgeted decoded-region LRU (`VXO_FORMAT.md` §B2.2). Maps a K-brick-grid region coord to its
-/// decoded [`DecodedRegion`] (entries + region-local palette/index blobs), tracking a monotonic "last touched"
-/// tick per region so eviction drops the least-recently-used once `bytes` exceeds `budget`. Regions are
-/// [`Arc`]'d so [`VxoSource::brick`] can clone the handle out and drop the cache lock before decoding the
+/// The byte-budgeted decoded-region LRU (`VXO_FORMAT.md` §B2.2). Maps a `(lod, K-brick-grid region coord)` key
+/// to its decoded [`DecodedRegion`] (entries + region-local palette/index blobs), tracking a monotonic "last
+/// touched" tick per region so eviction drops the least-recently-used once `bytes` exceeds `budget`. Regions
+/// are [`Arc`]'d so [`VxoSource::brick`] can clone the handle out and drop the cache lock before decoding the
 /// brick (a parallel drain holds the region across the release). This is a pure memoization — it never changes
 /// what `brick()` returns, only how fast.
+///
+/// **The key carries the `lod` (gotcha #2):** base (LOD0) and baked-coarse (`lod > 0`) regions SHARE region
+/// coords — region `(0,0,0)` exists at every level — and decode from DIFFERENT byte spans (the base `BRIK` vs.
+/// each level's `BRIK_L`). Keying by coord ALONE would collide a coarse region with the base region of the
+/// same coord and serve the WRONG bricks (a silent-corruption trap). `(lod, region_coord)` keeps every level's
+/// regions in their own cache namespace.
 struct RegionCache {
-    /// `region_coord -> (decoded region, last-touched tick)`.
-    map: FxHashMap<IVec3, (Arc<DecodedRegion>, u64)>,
+    /// `(lod, region_coord) -> (decoded region, last-touched tick)`.
+    map: FxHashMap<(u32, IVec3), (Arc<DecodedRegion>, u64)>,
     /// Sum of every cached region's decoded byte size (the eviction budget is measured against this).
     bytes: usize,
     /// The eviction budget in bytes; `bytes` is kept `<= budget` after each insert (a single oversized region
@@ -107,34 +113,35 @@ impl RegionCache {
             + region.index_blob.len() * 4
     }
 
-    /// A cached region (bumping its last-touched tick), or `None` on a miss.
-    fn get(&mut self, region_coord: IVec3) -> Option<Arc<DecodedRegion>> {
+    /// A cached region (bumping its last-touched tick), or `None` on a miss. `key` is `(lod, region_coord)`.
+    fn get(&mut self, key: (u32, IVec3)) -> Option<Arc<DecodedRegion>> {
         self.tick += 1;
         let tick = self.tick;
-        let (region, last) = self.map.get_mut(&region_coord)?;
+        let (region, last) = self.map.get_mut(&key)?;
         *last = tick;
         Some(Arc::clone(region))
     }
 
     /// Insert a freshly-decoded region, then EVICT least-recently-used regions until `bytes <= budget`. Returns
-    /// the inserted `Arc` handle (so the caller serves this demand without a second lookup).
-    fn insert(&mut self, region_coord: IVec3, region: Arc<DecodedRegion>) -> Arc<DecodedRegion> {
+    /// the inserted `Arc` handle (so the caller serves this demand without a second lookup). `key` is
+    /// `(lod, region_coord)`.
+    fn insert(&mut self, key: (u32, IVec3), region: Arc<DecodedRegion>) -> Arc<DecodedRegion> {
         self.tick += 1;
         let sz = Self::region_bytes(&region);
         // Replace any stale entry's bytes (a re-decode of the same region — shouldn't happen with the get-first
         // path, but keep the accounting exact rather than double-count).
-        if let Some((old, _)) = self.map.insert(region_coord, (Arc::clone(&region), self.tick)) {
+        if let Some((old, _)) = self.map.insert(key, (Arc::clone(&region), self.tick)) {
             self.bytes -= Self::region_bytes(&old);
         }
         self.bytes += sz;
-        self.evict_to_budget(region_coord);
+        self.evict_to_budget(key);
         region
     }
 
     /// Evict the least-recently-touched regions until `bytes <= budget`. NEVER evicts `keep` (the region just
     /// inserted + about to be served) so a single demand always succeeds even if its region alone exceeds the
-    /// budget. Stops when nothing else is evictable.
-    fn evict_to_budget(&mut self, keep: IVec3) {
+    /// budget. Stops when nothing else is evictable. `keep` is the `(lod, region_coord)` key.
+    fn evict_to_budget(&mut self, keep: (u32, IVec3)) {
         while self.bytes > self.budget {
             // Find the LRU victim (lowest tick), excluding `keep`.
             let victim = self
@@ -149,6 +156,35 @@ impl RegionCache {
             }
         }
     }
+}
+
+/// One baked coarse-LOD level's directory VIEW into the mmap'd `LODS` chunk (`VXO_FORMAT.md` §B1.7) — the
+/// streamed analogue of [`super::reader::VxoLodsLevel`], holding the level's `BIDX_L` directory + the ABSOLUTE
+/// mmap byte range of its `BRIK_L` blob (so a coarse region body is sliced straight off the mmap). `lod ==
+/// index + 1` in [`VxoSource::lods`] (the 0-based vec position is `L - 1`).
+struct LodLevelView {
+    /// The pyramid LOD this level describes (`1..=max_lod`).
+    lod: u32,
+    /// The level's region directory on the COARSE grid (sorted by `(z,y,x)` — binary-searched on lookup).
+    /// A region's `brik_offset` is LEVEL-LOCAL within `BRIK_L` (relative to `brik_l_start`).
+    bidx_l: Vec<VxoRegionDirEntry>,
+    /// ABSOLUTE byte offset of this level's `BRIK_L` blob within the mmap (`lods_body_start + level.brik_off`).
+    /// A region body lives at `brik_l_start + dir.brik_offset`.
+    brik_l_start: usize,
+    /// Byte length of this level's `BRIK_L` blob (the seek bound for the level's region bodies).
+    brik_l_len: usize,
+}
+
+/// The eager-parse result of [`VxoSource::parse_eager`] — the small chunks read up-front + the lazily-read
+/// `BRIK`/`LODS` byte ranges. A named struct (over a 7-tuple) so the LODS additions don't make the call site
+/// positional-soup.
+struct EagerParse {
+    head: VxoHead,
+    bidx: Vec<VxoRegionDirEntry>,
+    brik_body_start: usize,
+    brik_body_len: usize,
+    lods: Option<Vec<LodLevelView>>,
+    registry: BlockRegistry,
 }
 
 /// A memory-mapped `.vxo` file exposed as a STREAMED [`BrickSource`] (`VXO_FORMAT.md` §B2.1) — the read side
@@ -168,6 +204,14 @@ pub struct VxoSource {
     head: VxoHead,
     /// The sorted region directory (eager — it IS the spatial index; small even at Bistro scale).
     bidx: Vec<VxoRegionDirEntry>,
+    /// The BAKED coarse-LOD pyramid directories (`VXO_FORMAT.md` §B1.7), one [`LodLevelView`] per `L ∈
+    /// 1..=max_lod` (`lods[L-1]` is LOD `L`). `None` ⇒ the file has NO `LODS` chunk ⇒ coarse bricks are
+    /// demand-DOWNSAMPLED (the forward-compat fallback, §B1.7 option (a)). `Some` ⇒ a coarse read is an O(1)
+    /// directory lookup off the mmap (option (b), the Stage-2 freeze fix). `lods.len() == HEAD.max_lod`. Each
+    /// [`LodLevelView`] holds its `BRIK_L` blob's ABSOLUTE mmap offset (`brik_l_start`), already rebased from the
+    /// LODS-body-local offsets at parse time — so the LODS-body byte offset itself isn't retained past parse (the
+    /// rebased per-level start is the SSOT for a coarse region read, with no per-read offset arithmetic).
+    lods: Option<Vec<LodLevelView>>,
     /// The decoded-region LRU (§B2.2) behind a `Mutex` (pure memoization; the contract stays pure + `Sync`).
     cache: Mutex<RegionCache>,
     /// The merge OFFSET in LOD0 brick coords (§B2.4): added to incoming world brick coords' inverse —
@@ -205,40 +249,40 @@ impl VxoSource {
         // every region slice we cast from it.
         let mmap = unsafe { memmap2::Mmap::map(&file) }
             .map_err(|e| anyhow::anyhow!("vxo: mmap {}: {e}", path.display()))?;
-        let (head, bidx, brik_body_start, brik_body_len, registry) = Self::parse_eager(&mmap)?;
+        let parsed = Self::parse_eager(&mmap)?;
 
         // §B2.6 voxel_size reconciliation: assert-equal (NO silent rescale — the D1 flip + re-bake is one
         // atomic step; a mismatch between flip and re-bake is a BUILD error, not a silently-wrong scene).
         anyhow::ensure!(
-            head.voxel_size == VOXEL_SIZE,
+            parsed.head.voxel_size == VOXEL_SIZE,
             "vxo: asset '{}' baked at {} m/voxel; engine VOXEL_SIZE is {} m — rebake the asset or flip the \
              engine (no silent rescale)",
             path.display(),
-            head.voxel_size,
+            parsed.head.voxel_size,
             VOXEL_SIZE
         );
 
         let source = Self {
             mmap,
-            brik_body_start,
-            brik_body_len,
-            head,
-            bidx,
+            brik_body_start: parsed.brik_body_start,
+            brik_body_len: parsed.brik_body_len,
+            head: parsed.head,
+            bidx: parsed.bidx,
+            lods: parsed.lods,
             cache: Mutex::new(RegionCache::new(budget)),
             offset_bricks: IVec3::ZERO,
             block_base: 0,
         };
-        Ok((source, registry))
+        Ok((source, parsed.registry))
     }
 
-    /// Parse the eager chunks (HEAD/MATL/BIDX) + locate the `BRIK` body byte range, off the mmapped file image
-    /// — reusing the EXACT B-i chunk framing + parsers ([`parse_head`]/[`parse_matl`]/[`parse_bidx`]), so the
-    /// streamed loader and the full-file [`super::reader::VxoFile`] agree on the format (one SSOT). Does NOT
-    /// copy `BRIK` (the whole point — it's read lazily per region). Verifies the header + chunk CRCs and skips
-    /// unknown chunks (the §B1.0 forward-compat rule). Returns `(head, bidx, brik_start, brik_len, registry)`.
-    fn parse_eager(
-        bytes: &[u8],
-    ) -> anyhow::Result<(VxoHead, Vec<VxoRegionDirEntry>, usize, usize, BlockRegistry)> {
+    /// Parse the eager chunks (HEAD/MATL/BIDX + the optional baked `LODS` pyramid) + locate the `BRIK` body byte
+    /// range, off the mmapped file image — reusing the EXACT B-i chunk framing + parsers
+    /// ([`parse_head`]/[`parse_matl`]/[`parse_bidx`]/[`parse_lods`]), so the streamed loader and the full-file
+    /// [`super::reader::VxoFile`] agree on the format (one SSOT). Does NOT copy `BRIK` / the `LODS` `BRIK_L`
+    /// blobs (the whole point — they're read lazily per region). Verifies the header + chunk CRCs and skips
+    /// unknown chunks (the §B1.0 forward-compat rule).
+    fn parse_eager(bytes: &[u8]) -> anyhow::Result<EagerParse> {
         anyhow::ensure!(bytes.len() >= 16, "vxo: file shorter than the 16-byte header");
         let fh: VxoFileHeader = pod_read_unaligned(&bytes[0..16]);
         anyhow::ensure!(fh.magic == VXO_MAGIC, "vxo: bad magic {:?} (expected VXO1)", fh.magic);
@@ -257,6 +301,9 @@ impl VxoSource {
         let mut registry: Option<BlockRegistry> = None;
         let mut bidx: Option<Vec<VxoRegionDirEntry>> = None;
         let mut brik: Option<(usize, usize)> = None; // (body_start, body_len) — NOT copied
+        // The OPTIONAL baked coarse pyramid: the parsed per-level views (each holding the ABSOLUTE mmap offset of
+        // its `BRIK_L`, so region bodies are sliced lazily off the mmap, never copied).
+        let mut lods: Option<Vec<LodLevelView>> = None;
 
         let ch_hdr = std::mem::size_of::<VxoChunkHeader>();
         let mut pos = std::mem::size_of::<VxoFileHeader>();
@@ -275,6 +322,24 @@ impl VxoSource {
                 TAG_BIDX => bidx = Some(parse_bidx(body)?),
                 // BRIK: record the body byte RANGE only — region bodies are read lazily off the mmap (§B2.2).
                 TAG_BRIK => brik = Some((body_start, body_len)),
+                // LODS (OPTIONAL, §B1.7): parse the per-level directories via the SHARED `parse_lods` SSOT, then
+                // re-base each level's offsets onto the ABSOLUTE mmap (the parser's offsets are LODS-body-local).
+                // Record `body_start` so a coarse region body is sliced straight off the mmap (no copy).
+                TAG_LODS => {
+                    let parsed = parse_lods(body)?;
+                    let views = parsed
+                        .levels
+                        .into_iter()
+                        .map(|lvl| LodLevelView {
+                            lod: lvl.lod,
+                            bidx_l: lvl.bidx_l,
+                            // `brik_l_off` is relative to the LODS BODY START; rebase onto the mmap.
+                            brik_l_start: body_start + lvl.brik_l_off,
+                            brik_l_len: lvl.brik_l_len,
+                        })
+                        .collect();
+                    lods = Some(views);
+                }
                 TAG_END => break,
                 _ => { /* unknown chunk — skip (forward compat, §B1.0) */ }
             }
@@ -300,7 +365,25 @@ impl VxoSource {
             "vxo: region_edge_bricks {} must be a power of two > 0 (file corrupt)",
             head.region_edge_bricks
         );
-        Ok((head, bidx, brik_start, brik_len, registry))
+
+        // Cross-check HEAD.max_lod against the LODS pyramid depth (the writer sets both from the same `max_lod`;
+        // a mismatch is a corrupt/inconsistent file), mirroring the full-file `VxoFile::parse` check. With no
+        // LODS chunk, HEAD.max_lod MUST be 0 (the §B1.7 no-pyramid convention).
+        match &lods {
+            Some(views) => anyhow::ensure!(
+                head.max_lod as usize == views.len(),
+                "vxo: HEAD.max_lod {} != LODS level count {} (inconsistent pyramid)",
+                head.max_lod,
+                views.len()
+            ),
+            None => anyhow::ensure!(
+                head.max_lod == 0,
+                "vxo: HEAD.max_lod {} but no LODS chunk (inconsistent — a baked pyramid is missing)",
+                head.max_lod
+            ),
+        }
+
+        Ok(EagerParse { head, bidx, brik_body_start: brik_start, brik_body_len: brik_len, lods, registry })
     }
 
     /// Place this source at a LOD0-brick `offset` in a merged world, shifting its solid `BlockId`s by
@@ -324,41 +407,73 @@ impl VxoSource {
         self.head.region_edge_bricks as i32
     }
 
-    /// Binary-search the `BIDX` directory for `region_coord` (sorted by `(z,y,x)`); `None` ⇒ the region is
-    /// absent (no `BIDX` entry ⇒ all-air, the clipmap bound).
-    fn region_entry(&self, region_coord: IVec3) -> Option<&VxoRegionDirEntry> {
+    /// Binary-search `bidx` (any level's directory, sorted by `(z,y,x)`) for `region_coord`; `None` ⇒ the
+    /// region is absent (no entry ⇒ all-air at that level, the clipmap bound). Shared by the base LOD0 `BIDX`
+    /// and each baked-coarse level's `BIDX_L`.
+    fn region_entry_in(bidx: &[VxoRegionDirEntry], region_coord: IVec3) -> Option<&VxoRegionDirEntry> {
         let key = (region_coord.z, region_coord.y, region_coord.x);
-        self.bidx
-            .binary_search_by_key(&key, |e| (e.region_coord[2], e.region_coord[1], e.region_coord[0]))
+        bidx.binary_search_by_key(&key, |e| (e.region_coord[2], e.region_coord[1], e.region_coord[0]))
             .ok()
-            .map(|i| &self.bidx[i])
+            .map(|i| &bidx[i])
     }
 
-    /// The decoded region for `region_coord` — a cache HIT clones the `Arc`; a MISS reads the region's
-    /// compressed span off the mmap, decodes it via the shared [`decode_region_span`] SSOT, inserts it into the
-    /// LRU (evicting past the budget), and serves it. `Ok(None)` iff the region is absent from `BIDX` (all-air).
-    /// The decode + cache is a pure memoization: the same region always yields the same bytes.
-    fn decoded_region(&self, region_coord: IVec3) -> anyhow::Result<Option<Arc<DecodedRegion>>> {
+    /// The deepest BAKED coarse level (`HEAD.max_lod`; `0` ⇒ no `LODS` chunk). A coarse read deeper than this
+    /// clamps to this level (gotcha #4 — a tiny asset's pyramid collapsed early; its deepest level IS the answer
+    /// for every coarser `L`, mirroring [`StaticVoxSource::level`](super::super::source::StaticVoxSource)).
+    #[inline]
+    fn max_lod(&self) -> u32 {
+        self.head.max_lod
+    }
+
+    /// The baked-coarse [`LodLevelView`] that SERVES a request for `lod > 0`, or `None` if there is no `LODS`
+    /// chunk. CLAMPS `lod` to `max_lod` (gotcha #4): for `max_lod < lod <= MAX_LOD` the deepest baked level is
+    /// the answer (the collapsed-asset case). Panics never — `lod` is pre-clamped to `MAX_LOD` by the caller and
+    /// `1 <= max_lod` whenever `lods.is_some()` (a baked pyramid has ≥ 1 level).
+    fn coarse_level(&self, lod: u32) -> Option<&LodLevelView> {
+        let levels = self.lods.as_ref()?;
+        let max = self.max_lod();
+        debug_assert!(max as usize == levels.len() && lod >= 1);
+        let clamped = lod.min(max); // gotcha #4: clamp to the deepest baked level
+        levels.get((clamped - 1) as usize)
+    }
+
+    /// The decoded region for `region_coord` at pyramid `lod` — a cache HIT (keyed by `(lod, region_coord)`,
+    /// gotcha #2) clones the `Arc`; a MISS resolves the directory entry in `bidx`, reads the region's compressed
+    /// span off the mmap at `brik_base + dir.brik_offset` (bounded by `[brik_base, brik_base + span_bound)`),
+    /// decodes it via the shared [`decode_region_span`] SSOT (verifying the body's baked `lod`), inserts it into
+    /// the `(lod, region)` LRU (evicting past the budget), and serves it. `Ok(None)` iff the region is absent
+    /// from `bidx` (all-air). Pure memoization: the same `(lod, region)` always yields the same bytes.
+    ///
+    /// `bidx`/`brik_base`/`span_bound` select the LEVEL's byte layout: LOD0 ⇒ (`self.bidx`, `brik_body_start`,
+    /// `brik_body_len`); coarse `L` ⇒ (`level.bidx_l`, `level.brik_l_start`, `level.brik_l_len`).
+    fn decoded_region(
+        &self,
+        lod: u32,
+        region_coord: IVec3,
+        bidx: &[VxoRegionDirEntry],
+        brik_base: usize,
+        span_bound: usize,
+    ) -> anyhow::Result<Option<Arc<DecodedRegion>>> {
         // Fast path: a cache hit under the lock (bumps the LRU tick), released before any decode.
-        if let Some(region) = self.cache.lock().expect("region cache lock").get(region_coord) {
+        if let Some(region) = self.cache.lock().expect("region cache lock").get((lod, region_coord)) {
             return Ok(Some(region));
         }
-        // Miss: resolve the BIDX span (absent ⇒ all-air).
-        let Some(dir) = self.region_entry(region_coord) else {
+        // Miss: resolve the directory span (absent ⇒ all-air).
+        let Some(dir) = Self::region_entry_in(bidx, region_coord) else {
             return Ok(None);
         };
-        let start = self.brik_body_start + dir.brik_offset as usize;
+        let start = brik_base + dir.brik_offset as usize;
         let end = start + dir.brik_comp_len as usize;
         anyhow::ensure!(
-            dir.brik_offset as usize + dir.brik_comp_len as usize <= self.brik_body_len
-                && end <= self.mmap.len(),
-            "vxo: region {region_coord:?} span overruns the BRIK body"
+            dir.brik_offset as usize + dir.brik_comp_len as usize <= span_bound && end <= self.mmap.len(),
+            "vxo: L{lod} region {region_coord:?} span overruns its BRIK body"
         );
         // Decode OUTSIDE the lock (zstd decode of one region; a parallel drain decodes different regions
         // concurrently), then insert. A benign race where two threads decode the same region just inserts the
-        // identical bytes twice — observationally transparent.
-        let region = Arc::new(decode_region_span(&self.mmap[start..end], dir, 0)?);
-        let region = self.cache.lock().expect("region cache lock").insert(region_coord, region);
+        // identical bytes twice — observationally transparent. The body's baked `lod` is verified by
+        // `decode_region_span` against `lod` (base/coarse mix-up guard, gotcha #1).
+        let region = Arc::new(decode_region_span(&self.mmap[start..end], dir, lod)?);
+        let region = self.cache.lock().expect("region cache lock").insert((lod, region_coord), region);
         Ok(Some(region))
     }
 
@@ -377,22 +492,46 @@ impl VxoSource {
         self.cache.lock().expect("region cache lock").coarse.len()
     }
 
-    /// The LOD0 core brick at LOCAL (offset-applied) brick coord `local` (the streamed read path): bucket to the
-    /// Euclidean region → `BIDX` binary-search (absent ⇒ `uniform(AIR)`) → region-cache lookup (miss ⇒ lazy
-    /// mmap read + decode + LRU insert) → in-region brick binary-search (absent ⇒ `uniform(AIR)`) → decode via
-    /// [`DecodedRegion::brick_remapped`] (block_base-shifted for the merge). A decode error ⇒ `uniform(AIR)`
-    /// (the open-time CRC check would already have failed a genuinely corrupt file, so a runtime miss is the
-    /// absent case). This is the LOD0 leaf of the coarse pyramid recursion.
-    fn brick_lod0(&self, local: IVec3) -> Brick {
+    /// The core brick at LOCAL (offset-applied) brick coord `local`, level `lod`, reading the level's own
+    /// directory + `BRIK` layout (`bidx`/`brik_base`/`span_bound`): bucket `local` to the level's Euclidean
+    /// region grid → directory binary-search (absent ⇒ `uniform(AIR)`) → region-cache lookup (miss ⇒ lazy mmap
+    /// read + decode + `(lod, region)` LRU insert) → in-region brick binary-search (absent ⇒ `uniform(AIR)`) →
+    /// decode via [`DecodedRegion::brick_remapped`] (block_base-shifted for the merge). A decode error ⇒
+    /// `uniform(AIR)` (the open-time CRC check would already have failed a genuinely corrupt file, so a runtime
+    /// miss is the absent case). LOD0 and each baked-coarse level share this one path — only the level table
+    /// + byte base differ (one SSOT for the in-region lookup, no per-level drift).
+    fn brick_at_level(
+        &self,
+        local: IVec3,
+        lod: u32,
+        bidx: &[VxoRegionDirEntry],
+        brik_base: usize,
+        span_bound: usize,
+    ) -> Brick {
         let k = self.region_edge();
         let region = IVec3::new(local.x.div_euclid(k), local.y.div_euclid(k), local.z.div_euclid(k));
-        let Ok(Some(decoded)) = self.decoded_region(region) else {
+        let Ok(Some(decoded)) = self.decoded_region(lod, region, bidx, brik_base, span_bound) else {
             return Brick::uniform(BlockId::AIR);
         };
         match decoded.entry(local) {
             Some(entry) => decoded.brick_remapped(entry, self.block_base),
             None => Brick::uniform(BlockId::AIR), // a coord that buckets here but was never stored ⇒ air
         }
+    }
+
+    /// The LOD0 core brick at LOCAL brick coord `local` — the LOD0 specialization of [`Self::brick_at_level`]
+    /// (the base `BRIK` table). Also the LOD0 leaf of the demand-downsample fallback recursion ([`Self::coarse_brick`]).
+    fn brick_lod0(&self, local: IVec3) -> Brick {
+        self.brick_at_level(local, 0, &self.bidx, self.brik_body_start, self.brik_body_len)
+    }
+
+    /// The BAKED coarse brick at LOCAL brick coord `local`, level `lod > 0` — reads the `LODS` pyramid directly
+    /// (§B1.7 option (b), the Stage-2 freeze fix). Resolves the serving [`LodLevelView`] (clamping past
+    /// `max_lod`, gotcha #4), then defers to [`Self::brick_at_level`] over the LEVEL'S `BIDX_L`/`BRIK_L` — an
+    /// O(1) directory lookup, NOT the recursive demand-downsample. The CALLER must have checked `lods.is_some()`.
+    fn brick_coarse_baked(&self, local: IVec3, lod: u32) -> Brick {
+        let level = self.coarse_level(lod).expect("brick_coarse_baked called without a LODS pyramid");
+        self.brick_at_level(local, level.lod, &level.bidx_l, level.brik_l_start, level.brik_l_len)
     }
 
     /// Synthesize the COARSE brick at LOCAL (offset-applied) brick coord `local`, level `lod > 0`, by
@@ -439,13 +578,17 @@ impl BrickSource for VxoSource {
     ///   bound) → region-cache lookup (miss ⇒ lazy mmap read + decode + LRU insert) → in-region brick
     ///   binary-search (absent ⇒ `uniform(AIR)`) → decode via the B-i [`DecodedRegion::brick_remapped`] SSOT
     ///   (block_base-shifted for the merge), so a stand-alone load is bit-identical to a live brick.
-    /// * **Coarse `lod > 0`:** SERVED by DOWNSAMPLING the streamed LOD0 data (§B1.7 OPTION (a)) — a coarse brick
-    ///   is the recursive, memoized [`Self::coarse_brick`] downsample of its 8 children at `lod-1`, recursing to
-    ///   LOD0, through the SHARED [`downsample_children`] reducer. `StaticVoxSource` builds the same pyramid
-    ///   level-by-level from a non-empty finite map, which never collapses to empty (solid-if-any keeps ≥ 1 solid
-    ///   voxel forever), so its pyramid spans the full `MAX_LOD + 1` levels and a request is clamped only past
-    ///   `MAX_LOD` — we MIRROR that with `lod.min(MAX_LOD)`. (The baked-`LODS` optimization, §B1.7 option (b),
-    ///   stays deferred; demand-downsampling transiently streams the coarse shell's LOD0 footprint — the v1 cost.)
+    /// * **Coarse `lod > 0` WITH a baked `LODS` pyramid (§B1.7 OPTION (b), the Stage-2 fix):** an O(1) directory
+    ///   lookup into the level's `BIDX_L`/`BRIK_L` via [`Self::brick_coarse_baked`] — bit-identical to the
+    ///   demand path because the writer baked the pyramid through the SAME `downsample_brickmap` SSOT. A request
+    ///   deeper than `max_lod` clamps to the deepest baked level (gotcha #4).
+    /// * **Coarse `lod > 0` WITHOUT `LODS` (forward-compat fallback, OPTION (a)):** SERVED by DOWNSAMPLING the
+    ///   streamed LOD0 data — the recursive, memoized [`Self::coarse_brick`] downsample of its 8 children at
+    ///   `lod-1`, recursing to LOD0, through the SHARED [`downsample_children`] reducer.
+    ///
+    /// `StaticVoxSource` builds the same pyramid level-by-level from a non-empty finite map, which never
+    /// collapses to empty (solid-if-any keeps ≥ 1 solid voxel forever), so its pyramid spans the full
+    /// `MAX_LOD + 1` levels and a request is clamped only past `MAX_LOD` — we MIRROR that with `lod.min(MAX_LOD)`.
     fn brick(&self, coord: IVec3, lod: u32, _registry: &BlockRegistry) -> Brick {
         let local = coord - self.offset_bricks;
         // Clamp past MAX_LOD exactly as `StaticVoxSource::level` does (the pyramid of a non-empty finite map is
@@ -453,7 +596,11 @@ impl BrickSource for VxoSource {
         let lod = lod.min(MAX_LOD);
         if lod == 0 {
             self.brick_lod0(local)
+        } else if self.lods.is_some() {
+            // Baked pyramid present ⇒ O(1) LODS read (the freeze fix). `brick_coarse_baked` clamps past max_lod.
+            self.brick_coarse_baked(local, lod)
         } else {
+            // No LODS ⇒ demand-downsample (forward-compat fallback).
             (*self.coarse_brick(local, lod)).clone()
         }
     }
@@ -461,37 +608,46 @@ impl BrickSource for VxoSource {
     /// The SAME conservative enclosed-cull as [`StaticVoxSource::classify`](super::super::source::StaticVoxSource)
     /// (§B2.5) at EVERY LOD, so the surface-only Θ(H²) residency holds for `.vxo` scenes. A brick is `Interior`
     /// (prunable) iff it is fully solid AND all 6 face-neighbours are fully solid; else `Surface`; an absent
-    /// region/brick ⇒ `Air`. Now that coarse bricks are SYNTHESIZED by downsampling ([`Self::coarse_brick`],
-    /// bit-identical to the static pyramid), the coarse `is_full`/cull is derived from the synthesized coarse
-    /// brick — so classify matches `StaticVoxSource::classify` at coarse LODs too (full parity, not the old
-    /// conservative `Surface`). `lod > MAX_LOD` clamps to `MAX_LOD` (mirroring `StaticVoxSource::level`).
+    /// region/brick ⇒ `Air`. The coarse `is_full`/cull is bit-identical to the static pyramid (one downsample
+    /// SSOT), so classify matches `StaticVoxSource::classify` at coarse LODs too (full parity).
     ///
-    /// At LOD0 the `is_full` answer is the BAKED [`BRICK_FLAG_FULL`] bit in the entry table (cheap — no voxel
-    /// decode; the entries alone answer it). At coarse LODs it reads the synthesized brick's
-    /// [`Brick::is_full`](crate::voxel::brickmap::Brick::is_full); synthesizing the coarse brick already streams
-    /// its LOD0 footprint, so the cost is folded into the demand-downsample the residency runs anyway.
+    /// `is_full` reads the cheap BAKED [`BRICK_FLAG_FULL`] bit from the entry table — at LOD0 from the base
+    /// `BRIK` directory, and at coarse LODs WITH a `LODS` pyramid from the level's `BIDX_L` entry table (no
+    /// voxel decode either way, the Stage-2 fix). WITHOUT `LODS`, coarse `is_full` falls back to the
+    /// demand-synthesized brick's [`Brick::is_full`](crate::voxel::brickmap::Brick::is_full).
+    ///
+    /// A request past the deepest level (`lod > MAX_LOD`, OR `lod > max_lod` for a baked-but-collapsed asset)
+    /// is CLAMPED — its coord grid ≠ the served level grid — so the static source returns `Surface` (never
+    /// prune); we mirror that.
     fn classify(&self, coord: IVec3, lod: u32) -> BrickClass {
-        // A request past the deepest pyramid level is CLAMPED (its coord grid ≠ the level grid), so the static
-        // source returns `Surface` (never prune) — mirror that for `lod > MAX_LOD` (the only clamped case for a
-        // non-empty finite asset, whose pyramid spans the full MAX_LOD+1 levels).
-        if lod > MAX_LOD {
+        // Past the engine's deepest pyramid level ⇒ the static source clamps + returns Surface (the coord grid
+        // ≠ the level grid). Mirror it. For a BAKED-but-collapsed asset, a request deeper than `max_lod` is the
+        // same clamped case — the LODS branch below would read the deepest level's entries on the WRONG (finer)
+        // coord grid, so short-circuit to Surface here to keep parity with StaticVoxSource::classify's clamp.
+        if lod > MAX_LOD || (lod > 0 && self.lods.is_some() && lod > self.max_lod()) {
             return BrickClass::Surface;
         }
         let here = coord - self.offset_bricks;
-        // The `is_full` of a brick at local coord `c`, level `lod`. LOD0: the baked flag from the entry table
-        // (no voxel decode). Coarse: the synthesized brick's occupancy (bit-identical to the static pyramid).
-        // `None` ⇒ the brick is absent (all-air) in this asset.
+        // The `is_full` of a brick at local coord `c`, level `lod`. The cheap baked path reads the
+        // `BRICK_FLAG_FULL` bit straight from the level's entry table (no voxel decode); the no-LODS coarse
+        // fallback downsamples. `None` ⇒ the brick is absent (all-air) in this asset.
         let is_full = |c: IVec3| -> Option<bool> {
-            if lod == 0 {
+            let baked = |lod: u32, bidx: &[VxoRegionDirEntry], brik_base: usize, span_bound: usize| {
                 let k = self.region_edge();
                 let region = IVec3::new(c.x.div_euclid(k), c.y.div_euclid(k), c.z.div_euclid(k));
-                let decoded = self.decoded_region(region).ok()??;
+                let decoded = self.decoded_region(lod, region, bidx, brik_base, span_bound).ok()??;
                 let entry = decoded.entry(c)?;
                 Some(entry.flags & BRICK_FLAG_FULL != 0)
+            };
+            if lod == 0 {
+                baked(0, &self.bidx, self.brik_body_start, self.brik_body_len)
+            } else if let Some(level) = self.coarse_level(lod) {
+                // Baked coarse: the `is_full` flag from the level's entry table (cheap, no decode of voxels).
+                baked(level.lod, &level.bidx_l, level.brik_l_start, level.brik_l_len)
             } else {
+                // No LODS ⇒ demand-downsample, then report the synthesized brick's fullness. A wholly-air brick
+                // is the "absent" case (mirrors the static pyramid's unstored empty bricks ⇒ Air).
                 let b = self.coarse_brick(c, lod);
-                // A wholly-air synthesized brick is the "absent" case (mirrors the static pyramid's unstored
-                // empty bricks ⇒ `map.get == None` ⇒ Air); otherwise report its fullness.
                 (!b.is_empty()).then(|| b.is_full())
             }
         };
@@ -530,16 +686,27 @@ impl BrickSource for VxoSource {
     /// in-RAM `BIDX` + computes coord ranges) — so the residency narrows the cube to the shell BEFORE paying
     /// any region decode.
     ///
-    /// **Coarse `lod > 0` falls back to the FULL BOX** (the trait default): the region grid is on the LOD0
-    /// brick grid, so it does not map 1:1 to a coarse coord, and the coarse pyramid is demand-SYNTHESIZED
-    /// (no coarse region directory to intersect). The box fallback is a correct superset; the coarse shells
-    /// are thin and bounded by the empty-memo, and a baked-`LODS` directory (§B1.7 option (b)) would let this
-    /// narrow at coarse LODs too once it lands. (No `.vxo` scene is wired into the live residency yet — the
-    /// scene-switch is deferred to Phase C/D, see the module doc — so the LOD0 superset is the path exercised
-    /// by the §B2.8 gate today.)
+    /// **Coarse `lod > 0` WITH a baked `LODS` pyramid (the Stage-2 narrowing):** the SAME region-intersection,
+    /// but over the LEVEL's `BIDX_L` instead of the base `BIDX` — each coarse level has its OWN region directory
+    /// on its OWN coord grid (a level-`L` region is `K³` level-`L` bricks), so the candidate set narrows to
+    /// `Θ(surface)` at coarse LODs too (no decode). A request deeper than `max_lod` is a CLAMPED level (grid ≠
+    /// the `lod` grid), so — like [`StaticVoxSource::surface_bricks_in`] — it falls back to the FULL BOX.
+    /// **Coarse `lod > 0` WITHOUT `LODS` falls back to the FULL BOX** (the trait default): no coarse region
+    /// directory to intersect (the pyramid is demand-synthesized) — a correct superset, bounded by the empty-memo.
     fn surface_bricks_in(&self, lo: IVec3, hi: IVec3, lod: u32, out: &mut Vec<IVec3>) {
-        if lod != 0 {
-            // Coarse: no region directory on the coarse grid — full box (correct superset; empty-memo bounds it).
+        // Pick the region directory for this level: LOD0 ⇒ base BIDX; coarse-with-LODS ⇒ the level's BIDX_L
+        // (only when `lod <= max_lod` — a clamped level's grid ≠ the requested grid). Else (no LODS coarse, or
+        // a clamped coarse level) there is no directory on this coord grid ⇒ full-box fallback.
+        let bidx: Option<&[VxoRegionDirEntry]> = if lod == 0 {
+            Some(&self.bidx)
+        } else if lod <= self.max_lod() {
+            // `coarse_level` clamps, but `lod <= max_lod` here so it returns the EXACT level (grid matches).
+            self.coarse_level(lod).map(|lvl| lvl.bidx_l.as_slice())
+        } else {
+            None
+        };
+        let Some(bidx) = bidx else {
+            // Full box (correct superset; the empty-memo / wholly-outside reject bounds it downstream).
             for z in lo.z..=hi.z {
                 for y in lo.y..=hi.y {
                     for x in lo.x..=hi.x {
@@ -548,13 +715,13 @@ impl BrickSource for VxoSource {
                 }
             }
             return;
-        }
+        };
         let k = self.region_edge();
         // World brick coord -> local (offset-applied) coord: `local = coord - offset_bricks`. The box in LOCAL
         // coords; intersect each present region's [r·K, r·K + K) local span with it, then shift back to world.
         let lo_l = lo - self.offset_bricks;
         let hi_l = hi - self.offset_bricks;
-        for dir in &self.bidx {
+        for dir in bidx {
             let rc = IVec3::new(dir.region_coord[0], dir.region_coord[1], dir.region_coord[2]);
             let rlo = rc * k; // inclusive local brick min of this region
             let rhi = rlo + IVec3::splat(k - 1); // inclusive local brick max

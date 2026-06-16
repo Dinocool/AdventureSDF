@@ -380,7 +380,9 @@ pub(crate) fn parse_bidx(body: &[u8]) -> anyhow::Result<Vec<VxoRegionDirEntry>> 
 /// region_count]`) + its `BRIK_L` blob. This reads the header + table + each level's `BIDX_L`; the `BRIK_L`
 /// blobs stay in the caller-held body bytes, sliced on demand by [`VxoFile::decode_lod_region`]. Verifies each
 /// level's `lod == level_idx + 1` (1-based) and that every recorded offset/length stays inside the body.
-fn parse_lods(body: &[u8]) -> anyhow::Result<VxoLods> {
+/// `pub(crate)` so the streamed [`super::source::VxoSource`] reuses the EXACT LODS parser (one SSOT for the
+/// directory layout) on its mmap'd LODS chunk body.
+pub(crate) fn parse_lods(body: &[u8]) -> anyhow::Result<VxoLods> {
     let hn = std::mem::size_of::<VxoLodsHeader>();
     anyhow::ensure!(body.len() >= hn, "vxo: LODS body shorter than its header");
     let header: VxoLodsHeader = pod_read_unaligned(&body[0..hn]);
