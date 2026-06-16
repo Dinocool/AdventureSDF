@@ -186,6 +186,61 @@ fn round_trip_store_is_bit_identical() {
     round_trip(VxoCompression::Store);
 }
 
+/// **C1.7 streaming-write parity:** the bounded-RAM [`VxoStreamWriter`] (region bodies streamed to a scratch
+/// file, BIDX assembled at finish) produces a file BYTE-IDENTICAL to the full-RAM [`encode_vxo`] when fed the
+/// SAME regions in the SAME `(z,y,x)` order. This proves the out-of-core assembly path emits a valid, identical
+/// `.vxo` — so the tiled bake's streamed write is correct by construction (same encoder per region, same chunk
+/// framing + CRC, just a different RAM profile). Both STORE and (when available) zstd.
+#[test]
+fn stream_writer_matches_encode_vxo_byte_for_byte() {
+    let map = build_map();
+    let registry = registry();
+    let params = VxoHeadParams { name: "stream_parity".into(), ..Default::default() };
+
+    #[cfg(feature = "vxo-encode")]
+    let comps = [VxoCompression::Store, VxoCompression::Zstd(19)];
+    #[cfg(not(feature = "vxo-encode"))]
+    let comps = [VxoCompression::Store];
+
+    let k = params.region_edge_bricks as i32;
+    let dir = std::env::temp_dir().join(format!("vxo_stream_parity_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("scratch dir");
+
+    for (ci, comp) in comps.into_iter().enumerate() {
+        // The full-RAM reference image.
+        let want = encode_vxo(&map, &registry, &params, comp).expect("encode_vxo reference");
+
+        // Bucket bricks into regions, feed the streaming writer in (z,y,x) region order — the exact order
+        // `encode_vxo` lays out the BRIK body, so the bytes (incl. offsets) coincide.
+        let mut regions: std::collections::BTreeMap<(i32, i32, i32), Vec<IVec3>> = Default::default();
+        for (coord, _) in map.iter() {
+            let r = region_of_brick(*coord, k);
+            regions.entry((r.z, r.y, r.x)).or_default().push(*coord);
+        }
+        let scratch = dir.join(format!("brik_{ci}.tmp"));
+        let out = dir.join(format!("stream_{ci}.vxo"));
+        let mut w = super::writer::VxoStreamWriter::new(params.clone(), &registry, comp, &scratch)
+            .expect("open stream writer");
+        for ((rz, ry, rx), mut coords) in regions {
+            coords.sort_by_key(|c| (c.z, c.y, c.x));
+            let bricks: Vec<(IVec3, &Brick)> =
+                coords.iter().map(|&c| (c, map.get(c).expect("brick"))).collect();
+            w.add_region(IVec3::new(rx, ry, rz), &bricks).expect("add_region");
+        }
+        w.finish(&out).expect("finish stream write");
+
+        let got = std::fs::read(&out).expect("read streamed .vxo");
+        assert_eq!(got, want, "streamed .vxo must be byte-identical to encode_vxo (comp {comp:?})");
+        // The scratch BRIK file is removed on success.
+        assert!(!scratch.exists(), "scratch BRIK file removed on success");
+        // And the streamed file round-trips through the reader (it is a valid .vxo).
+        let file = VxoFile::parse(&got).expect("streamed .vxo parses");
+        let read_map = read_back_map(&file);
+        assert_eq!(read_map.len(), map.len(), "streamed read-back brick count == original");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// The zstd round-trip yields the same bit-identical result (per-region zstd, §B1.9): the C-zstd encoder
 /// (`vxo-encode`) compresses, the pure-Rust `ruzstd` runtime reader decodes — proving the two are
 /// frame-compatible. Gated on `vxo-encode` (PRODUCING a zstd body needs the C compressor); run the gate with

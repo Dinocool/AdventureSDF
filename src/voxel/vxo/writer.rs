@@ -179,6 +179,215 @@ pub fn encode_vxo(
     Ok(out)
 }
 
+// ============================================================================================
+// Bounded-RAM STREAMING writer (Phase C1.7 — the out-of-core `.vxo` assembly)
+// ============================================================================================
+
+/// A bounded-RAM, region-at-a-time `.vxo` writer for the OUT-OF-CORE tiled voxelizer (C1.7). Where
+/// [`encode_vxo`] builds the WHOLE byte image in RAM (every region body concatenated into one `Vec<u8>` —
+/// untenable for a Bistro-scale BRIK chunk of many GB), this streams each region's compressed body straight
+/// to a scratch file as it is produced, holding in RAM only the small `BIDX` directory (O(regions) × 48 B)
+/// and one region's bricks at a time. At [`finish`](Self::finish) it writes the final file in the spec order
+/// (file header, HEAD, MATL, BIDX, BRIK) by writing the header/HEAD/MATL/BIDX — now that the BRIK offsets and
+/// counts are known — and then COPYING the scratch BRIK body in fixed-size chunks (so the assembly is
+/// bounded-RAM too, never loading the whole BRIK at once).
+///
+/// USAGE: `new(params, registry, comp)` → `add_region(region_coord, sorted_bricks)` per non-empty region →
+/// `finish(out_path)`. Regions may be added in any order; `BIDX` is sorted by `(z,y,x)` at finish, and the
+/// caller is expected to feed them in a deterministic order (the tiled voxelizer does — region-id order) so
+/// the BRIK body layout is byte-reproducible. The bricks WITHIN a region MUST be pre-sorted by `(z,y,x)`
+/// (same contract as [`encode_region_bricks`]).
+///
+/// The MATL chunk is built eagerly from `registry` (it is small + known up-front). The scratch BRIK file lives
+/// next to the output (a sibling `*.brik.tmp`) and is deleted on success; on an error it is left for debugging.
+pub struct VxoStreamWriter {
+    params: VxoHeadParams,
+    comp: VxoCompression,
+    /// The MATL chunk body (built once from the registry up-front).
+    matl_body: Vec<u8>,
+    /// The scratch file accumulating the (compressed) BRIK region bodies in add order.
+    brik_scratch_path: std::path::PathBuf,
+    brik_scratch: std::io::BufWriter<std::fs::File>,
+    /// Running byte offset within the BRIK body (== bytes written to the scratch).
+    brik_offset: u64,
+    /// The region directory, accumulated in RAM (small: O(regions)).
+    bidx: Vec<VxoRegionDirEntry>,
+    /// Solid-extent bounds in LOD0 world voxels (accumulated across all added bricks).
+    bounds_min: IVec3,
+    bounds_max: IVec3,
+    /// Total non-empty bricks added.
+    total_bricks: u64,
+}
+
+impl VxoStreamWriter {
+    /// Open a streaming writer. `brik_scratch_path` is the scratch file for the BRIK body (caller-chosen so it
+    /// can live under the run's scratch dir); it is created/truncated now and removed by [`finish`](Self::finish)
+    /// on success. `registry` is captured into the MATL chunk immediately.
+    pub fn new(
+        params: VxoHeadParams,
+        registry: &BlockRegistry,
+        comp: VxoCompression,
+        brik_scratch_path: impl AsRef<std::path::Path>,
+    ) -> anyhow::Result<Self> {
+        let k = params.region_edge_bricks;
+        anyhow::ensure!(
+            k.is_power_of_two() && k > 0,
+            "region_edge_bricks (K={k}) must be a positive power of two"
+        );
+        let brik_scratch_path = brik_scratch_path.as_ref().to_path_buf();
+        if let Some(parent) = brik_scratch_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let file = std::fs::File::create(&brik_scratch_path)?;
+        Ok(Self {
+            matl_body: build_matl_body(registry),
+            params,
+            comp,
+            brik_scratch_path,
+            brik_scratch: std::io::BufWriter::new(file),
+            brik_offset: 0,
+            bidx: Vec::new(),
+            bounds_min: IVec3::splat(i32::MAX),
+            bounds_max: IVec3::splat(i32::MIN),
+            total_bricks: 0,
+        })
+    }
+
+    /// Encode + append ONE region's body. `bricks` is the region's `(brick_coord, brick)` pairs, which MUST be
+    /// pre-sorted by `(z,y,x)` (the [`encode_region_bricks`] contract). An empty `bricks` slice is ignored (a
+    /// region with no bricks has no directory entry — the sparse-absent convention). Updates the BIDX directory,
+    /// the BRIK offset, the brick count, and the solid bounds.
+    pub fn add_region(&mut self, region_coord: IVec3, bricks: &[(IVec3, &Brick)]) -> anyhow::Result<()> {
+        use std::io::Write as _;
+        if bricks.is_empty() {
+            return Ok(());
+        }
+        let raw = encode_region_bricks(region_coord, bricks)?;
+        anyhow::ensure!(raw.len() as u64 <= u32::MAX as u64, "region {region_coord:?} body exceeds u32 byte length");
+        let raw_len = raw.len() as u32;
+        let stored = match self.comp {
+            VxoCompression::Store => raw,
+            VxoCompression::Zstd(level) => zstd_compress(&raw, level)?,
+        };
+        let comp_len = stored.len() as u32;
+        let offset = self.brik_offset;
+        self.brik_scratch.write_all(&stored)?;
+        self.brik_offset += stored.len() as u64;
+        let compression = match self.comp {
+            VxoCompression::Store => VXO_REGION_STORE,
+            VxoCompression::Zstd(_) => VXO_REGION_ZSTD,
+        };
+        self.bidx.push(VxoRegionDirEntry {
+            region_coord: [region_coord.x, region_coord.y, region_coord.z],
+            brick_count: bricks.len() as u32,
+            brik_offset: offset,
+            brik_comp_len: comp_len,
+            brik_raw_len: match self.comp {
+                VxoCompression::Store => comp_len,
+                VxoCompression::Zstd(_) => raw_len,
+            },
+            compression,
+            _pad: [0; 15],
+        });
+        self.total_bricks += bricks.len() as u64;
+        for &(coord, _) in bricks {
+            self.bounds_min = self.bounds_min.min(coord * BRICK_EDGE);
+            self.bounds_max = self.bounds_max.max((coord + IVec3::ONE) * BRICK_EDGE);
+        }
+        Ok(())
+    }
+
+    /// Finalize: flush the scratch BRIK, then write the final `.vxo` at `out_path` in spec order (file header +
+    /// HEAD + MATL + BIDX + BRIK). The header/HEAD/MATL/BIDX are written from RAM (all small); the BRIK chunk
+    /// header is written, then the scratch body is COPIED in fixed 4 MiB chunks (bounded-RAM) followed by the
+    /// 16-byte body-alignment pad. The scratch file is removed on success. Consumes `self`.
+    pub fn finish(mut self, out_path: impl AsRef<std::path::Path>) -> anyhow::Result<()> {
+        use std::io::{Read as _, Seek as _, Write as _};
+
+        // Degenerate empty asset ⇒ zeroed bounds (matches `encode_vxo`).
+        if self.bidx.is_empty() {
+            self.bounds_min = IVec3::ZERO;
+            self.bounds_max = IVec3::ZERO;
+        }
+        // BIDX sorted by (z,y,x) — the binary-search key (§B1.5). The BRIK body layout is the ADD order (the
+        // caller feeds regions deterministically), but the directory is sorted for lookup; each entry already
+        // carries its own `brik_offset`, so re-sorting the directory does not move the body.
+        self.bidx.sort_by_key(|e| (e.region_coord[2], e.region_coord[1], e.region_coord[0]));
+
+        // Flush + close the write handle, then REOPEN the scratch read-only (the write handle from
+        // `File::create` is write-only — reading from it errors on Windows).
+        self.brik_scratch.flush()?;
+        drop(self.brik_scratch.into_inner()?);
+        let mut scratch = std::fs::File::open(&self.brik_scratch_path)?;
+        scratch.seek(std::io::SeekFrom::Start(0))?;
+
+        let out_path = out_path.as_ref();
+        if let Some(parent) = out_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let mut out = std::io::BufWriter::new(std::fs::File::create(out_path)?);
+
+        // 1. file header + HEAD + MATL + BIDX (all small, built in RAM).
+        let mut prefix: Vec<u8> = Vec::new();
+        write_file_header(&mut prefix, VXO_FLAG_LITTLE_ENDIAN);
+        write_chunk(
+            &mut prefix,
+            TAG_HEAD,
+            &build_head_body(&self.params, self.bounds_min, self.bounds_max, self.total_bricks, self.bidx.len() as u32),
+        );
+        write_chunk(&mut prefix, TAG_MATL, &self.matl_body);
+        write_chunk(&mut prefix, TAG_BIDX, &build_bidx_body(&self.bidx));
+        out.write_all(&prefix)?;
+
+        // 2. The BRIK chunk: its 32-byte header (body_len = the scratch length, body CRC over the streamed
+        //    body), then the scratch body copied in bounded-RAM chunks, then the 16-byte alignment pad. The
+        //    body CRC is computed in the SAME streaming pass (a running CRC32 over the copied chunks) so we
+        //    never need the whole BRIK resident.
+        let body_len = self.brik_offset;
+        // We must write the chunk header (which carries body_crc32) BEFORE the body — but the CRC needs the
+        // body. So compute the CRC in a first streaming pass, then a second copy pass. Two sequential reads of
+        // a scratch file are cheap vs. holding the multi-GB body in RAM.
+        let mut crc_buf = vec![0u8; 4 * 1024 * 1024];
+        let mut crc = Crc32Stream::new();
+        loop {
+            let n = scratch.read(&mut crc_buf)?;
+            if n == 0 {
+                break;
+            }
+            crc.update(&crc_buf[..n]);
+        }
+        let body_crc32 = crc.finalize();
+        let brik_header = VxoChunkHeader {
+            tag: TAG_BRIK,
+            _pad0: 0,
+            body_len,
+            body_crc32,
+            _pad1: [0; 3],
+        };
+        out.write_all(bytes_of(&brik_header))?;
+        // Second pass: copy the body.
+        scratch.seek(std::io::SeekFrom::Start(0))?;
+        let mut copy_buf = crc_buf; // reuse the 4 MiB buffer
+        loop {
+            let n = scratch.read(&mut copy_buf)?;
+            if n == 0 {
+                break;
+            }
+            out.write_all(&copy_buf[..n])?;
+        }
+        // The trailing 16-byte body-alignment pad (OUTSIDE body_len, §B1.0).
+        let pad = align16(body_len) - body_len;
+        out.write_all(&vec![0u8; pad as usize])?;
+        out.flush()?;
+        drop(out);
+
+        // Success: remove the scratch BRIK file.
+        drop(scratch);
+        let _ = std::fs::remove_file(&self.brik_scratch_path);
+        Ok(())
+    }
+}
+
 /// Write the 16-byte file header (`VxoFileHeader`) with the magic + version + `flags`, computing the
 /// header CRC32 over the first 8 bytes (`VXO_FORMAT.md` §B1.0).
 fn write_file_header(out: &mut Vec<u8>, flags: u16) {
@@ -293,22 +502,38 @@ fn build_bidx_body(bidx: &[VxoRegionDirEntry]) -> Vec<u8> {
     body
 }
 
+/// Encode ONE region's body (DECOMPRESSED) from a `&BrickMap` — looks up each `coord`'s brick and forwards
+/// to [`encode_region_bricks`]. The full-RAM [`encode_vxo`] path uses this; the bounded-RAM streaming writer
+/// ([`VxoStreamWriter`]) calls [`encode_region_bricks`] directly from disk-loaded bricks (no resident map).
+fn encode_region(region_coord: IVec3, coords: &[IVec3], map: &BrickMap) -> anyhow::Result<Vec<u8>> {
+    let bricks: Vec<(IVec3, &Brick)> =
+        coords.iter().map(|&c| (c, map.get(c).expect("region coord present in map"))).collect();
+    encode_region_bricks(region_coord, &bricks)
+}
+
 /// Encode ONE region's body (DECOMPRESSED): `VxoRegionHeader` then `[VxoBrickEntry; N]` then `palette_blob`
 /// then `index_blob` (§B1.3). Per brick: the **8³ core** is R1-collapsed to a uniform entry, else
 /// R2b-encoded + R3-interned WITHIN this region. The `is_full` bit is baked into the entry flags (§B2.5).
 ///
+/// `bricks` is the region's `(brick_coord, brick)` pairs, which the caller MUST pass sorted by `(z,y,x)`
+/// (so the entry table is binary-searchable on decode + the bake is deterministic). Taking bricks BY VALUE-REF
+/// (not via a `&BrickMap`) lets the streaming out-of-core writer feed bricks straight from disk tiles without
+/// a resident map (the bounded-RAM C1 path).
+///
 /// Returns an error if a dense brick's region-local `index_off`/`palette_off` overflows `u32` (the robust-by-
 /// construction backstop A4.1 mandates — region-local offsets always fit `u32` today, but the guard means a
 /// future too-large region is a HARD bake error, never a silent wrap).
-fn encode_region(region_coord: IVec3, coords: &[IVec3], map: &BrickMap) -> anyhow::Result<Vec<u8>> {
-    let mut entries: Vec<VxoBrickEntry> = Vec::with_capacity(coords.len());
+pub(crate) fn encode_region_bricks(
+    region_coord: IVec3,
+    bricks: &[(IVec3, &Brick)],
+) -> anyhow::Result<Vec<u8>> {
+    let mut entries: Vec<VxoBrickEntry> = Vec::with_capacity(bricks.len());
     let mut palette_blob: Vec<u32> = Vec::new();
     let mut index_blob: Vec<u32> = Vec::new();
     // R3 dedup WITHIN this region only (regions stay independently decompressible, §B1.3 note).
     let mut interner = VoxelInterner::new();
 
-    for &coord in coords {
-        let brick = map.get(coord).expect("region coord present in map");
+    for &(coord, brick) in bricks {
         let mut flags = 0u8;
         // §B2.5: bake the conservative-cull bits without storing voxels — surface unless fully solid; full
         // bricks are prunable when their neighbours are full too (the classify reads this).

@@ -96,6 +96,42 @@ bench wants optimized timings).
 | `d1c_scaling.rs` | **D1c de-risk + D1d shell-first re-measure** — 64 m@0.05 m reach/perf scaling at the PRODUCTION `StreamingConfig::default()` (clip_half 160). A FAST single-pass version of the `voxel_worldgen_perf` benches. Reports BOTH the OLD cube `desired_clipmap` (section A: enumeration-ceiling truncation, LOD0-only, the 38 s classify) AND the NEW D1d shell-first `desired_clipmap_surface` (section A': every LOD enumerates, ms enumerate) so the fix is visible side-by-side; plus the per-LOD distribution, classify split, single-`update` wall (now D1d shell-first), steady-state resident count, full-pack wall, and A4.4 resident VRAM. NB: it still runs the slow OLD cube baseline + full pack for the side-by-side, so it takes minutes — use `d1d_shellfirst.rs` for a quick shell-first-only number. | `TMP=D:/tmp_test TEMP=D:/tmp_test cargo run --release --no-default-features --features fast,physics --example d1c_scaling` | prints the D1c/D1d table (cube path still hits-ceiling 8 M / LOD0-only; D1d shell-first enumerates all 8 LODs, update drops 38 s → ~3 s; ≈ 143 k resident / 40.5 MB VRAM) |
 | `d1d_shellfirst.rs` | **D1d shell-first re-measure (fast)** — times ONLY the NEW `desired_clipmap_surface` + a single cold `ResidencyManager::update` at clip_half 160, SKIPPING the slow cube baseline + full pack `d1c_scaling` runs, so the shell-first number is seconds not minutes. Reports the per-LOD candidate distribution (all 8 LODs now present) + the cold-update wall. | `cargo run --release --no-default-features --features fast,physics --example d1d_shellfirst` | ≈ 6.7 M candidates / all 8 LODs / cold update ~3 s (was 38 s on the cube path) |
 
+### Offline voxelizer — the tiled out-of-core bake (C1) + the Bistro deliverable
+
+The `voxelize_scene` example bakes a classic mesh scene into a `.vox`/`.vxo`. The default (monolithic) path
+needs the whole AABB resident; the **`--tiled`** path (Phase C1, `docs/TILED_VOXELIZER_PLAN.md`) is the
+bounded-RAM out-of-core voxelizer — disk-backed tiles + a union-find enclosure flood + a streaming `.vxo`
+write — required for huge scenes (Bistro-Exterior @0.05 m, a ~13 B-cell AABB). Its CPU gates run in the
+default suite (the example's `#[cfg(test)]`): the cell-for-cell oracle vs the monolithic `solid_fill`,
+determinism across `TILE_EDGE`, the bounded-RAM probe, and the no-regression single-tile cases. They are fast
+and need no asset.
+
+**The Bistro `.vxo` bake (the long, asset-gated deliverable run).** `assets/models/bistro.vxo` is baked from
+the gitignored qian-o Bistro-Exterior glTF via the tiled path. It is a multi-minute, multi-GB-disk run (NOT a
+default-suite test — it produces a shipped asset). The exact step:
+
+```sh
+# Bistro-Exterior @0.05 m → assets/models/bistro.vxo via the tiled out-of-core voxelizer.
+# ~5 min wall-clock; scratch high-water ~5.2 GiB on D:\ (deleted on success); peak RAM < 4 GiB.
+TMP=D:/tmp_test TEMP=D:/tmp_test cargo run --release --example voxelize_scene --features vxo-encode -- \
+  assets/models/bistro.vxo 0.05 \
+  assets/models/src/_gltfassets/Bistro/BistroExterior.gltf 1.0 \
+  --tiled --tile-edge 128 --scratch D:/tmp_test
+```
+
+Reported on the reference run: grid `3479×1025×3692` = 13.17 B AABB cells, **354 M solid voxels**, ~159 s
+flood+fill + ~124 s streamed assembly, 83 MB `.vxo` (1.21 M bricks / 8061 regions, bounds anchored y=0). The
+`--scratch` dir holds the disk tiles + the streamed BRIK temp; it is deleted on success, LEFT + logged on
+failure. After baking, validate the artifact (asset-gated, `#[ignore]`d):
+
+```sh
+cargo test --example voxelize_scene --features vxo-encode -- --ignored bistro_vxo_parses --nocapture
+```
+
+(The gallery's `Bistro` row in `GALLERY_SCENES` prefers this region-streamed `.vxo`; the legacy full-RAM
+`.vox` is too large to load.) The same `--tiled` path bakes any scene — drop `--tiled --scratch …` onto the
+normal positional CLI; without `--tiled` the monolithic path is unchanged.
+
 ### Lib crate (`src/**`, `#[cfg(test)]`)
 
 These four are `#[ignore]`d in the lib build (`cargo test --lib` reports `4 ignored`):

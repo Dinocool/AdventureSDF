@@ -277,10 +277,17 @@ pub fn align16(n: u64) -> u64 {
 /// is the SSOT both the writer (computes the stored value) and the reader (verifies) call, so they can never
 /// disagree on the polynomial / bit order.
 pub fn crc32(bytes: &[u8]) -> u32 {
-    // The reflected CRC-32 table, built once on first use (256 entries; cheap, deterministic).
+    let mut c = Crc32Stream::new();
+    c.update(bytes);
+    c.finalize()
+}
+
+/// The reflected CRC-32 table, built once on first use (256 entries; cheap, deterministic). Shared by the
+/// one-shot [`crc32`] and the streaming [`Crc32Stream`] so they can never disagree on polynomial/bit-order.
+fn crc32_table() -> &'static [u32; 256] {
     use std::sync::OnceLock;
     static TABLE: OnceLock<[u32; 256]> = OnceLock::new();
-    let table = TABLE.get_or_init(|| {
+    TABLE.get_or_init(|| {
         let mut t = [0u32; 256];
         let mut i = 0usize;
         while i < 256 {
@@ -294,12 +301,38 @@ pub fn crc32(bytes: &[u8]) -> u32 {
             i += 1;
         }
         t
-    });
-    let mut crc = 0xFFFF_FFFFu32;
-    for &b in bytes {
-        crc = table[((crc ^ b as u32) & 0xFF) as usize] ^ (crc >> 8);
+    })
+}
+
+/// A STREAMING CRC-32 over the same reflected IEEE polynomial as [`crc32`] — for chunk bodies too large to
+/// hold in RAM (the out-of-core `.vxo` BRIK body, `writer::VxoStreamWriter`). Feed bytes via [`update`](Self::update)
+/// in any chunking; [`finalize`](Self::finalize) yields a value IDENTICAL to `crc32(whole_input)`.
+pub struct Crc32Stream {
+    state: u32,
+}
+
+impl Crc32Stream {
+    /// A fresh CRC accumulator (pre-final-xor init state `0xFFFFFFFF`).
+    pub fn new() -> Self {
+        Self { state: 0xFFFF_FFFF }
     }
-    crc ^ 0xFFFF_FFFF
+    /// Fold `bytes` into the running CRC (chunk size irrelevant — the result is split-independent).
+    pub fn update(&mut self, bytes: &[u8]) {
+        let table = crc32_table();
+        for &b in bytes {
+            self.state = table[((self.state ^ b as u32) & 0xFF) as usize] ^ (self.state >> 8);
+        }
+    }
+    /// The final CRC-32 (applies the trailing xor); consumes the accumulator.
+    pub fn finalize(self) -> u32 {
+        self.state ^ 0xFFFF_FFFF
+    }
+}
+
+impl Default for Crc32Stream {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 #[cfg(test)]

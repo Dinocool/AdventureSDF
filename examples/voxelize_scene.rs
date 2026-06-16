@@ -71,22 +71,27 @@ fn main() -> anyhow::Result<()> {
     // writes uncompressed region bodies instead of the default per-region zstd (`docs/VXO_FORMAT.md` §B1.9).
     let raw_args: Vec<String> = std::env::args().skip(1).collect();
     let store = raw_args.iter().any(|a| a == "--store");
+    // `--tiled`: route `.vxo` output through the bounded-RAM OUT-OF-CORE tiled voxelizer (C1) instead of the
+    // monolithic grid `voxelize`+`solid_fill`. Required for huge scenes (Bistro @0.05 m). `--scratch <dir>` sets
+    // the disk-tile scratch root (default a run-unique subdir under the temp dir, honoring `D:\tmp_test`);
+    // `--tile-edge <N>` overrides the tile size (default 128, the RAM/scratch knob, §C1.1).
+    let tiled = raw_args.iter().any(|a| a == "--tiled");
+    let flag_val = |name: &str| -> Option<String> {
+        raw_args.iter().position(|a| a == name).and_then(|p| raw_args.get(p + 1)).cloned()
+    };
     // `--supersample <N>`: per-axis area-average tap count for albedo (default SUPERSAMPLE; N=1 = point sample).
-    let supersample = raw_args
-        .iter()
-        .position(|a| a == "--supersample")
-        .and_then(|p| raw_args.get(p + 1))
-        .and_then(|s| s.parse::<usize>().ok())
-        .map(|n| n.max(1))
-        .unwrap_or(SUPERSAMPLE);
-    // Positional args skip flags AND the flag VALUE that follows `--supersample` (so it isn't mistaken for one).
+    let supersample = flag_val("--supersample").and_then(|s| s.parse::<usize>().ok()).map(|n| n.max(1)).unwrap_or(SUPERSAMPLE);
+    let tile_edge: i32 = flag_val("--tile-edge").and_then(|s| s.parse().ok()).unwrap_or(tiled::DEFAULT_TILE_EDGE);
+    let scratch_arg = flag_val("--scratch").map(PathBuf::from);
+    // Positional args skip flags AND the VALUE that follows a value-taking flag (so it isn't mistaken for one).
+    let value_flags = ["--supersample", "--tile-edge", "--scratch"];
     let mut skip_next = false;
     let mut pos = raw_args.iter().filter(|a| {
         if skip_next {
             skip_next = false;
             return false;
         }
-        if *a == "--supersample" {
+        if value_flags.contains(&a.as_str()) {
             skip_next = true;
             return false;
         }
@@ -115,6 +120,13 @@ fn main() -> anyhow::Result<()> {
         println!("applied uniform scale {scale} to {} triangles", mesh.triangles.len());
     }
     println!("mesh: {} triangles, {} textures", mesh.triangles.len(), mesh.textures.len());
+
+    // OUT-OF-CORE tiled path (C1): for `.vxo` output with `--tiled`, run the bounded-RAM tiled voxelizer +
+    // streaming `.vxo` assembly, bypassing the monolithic grid entirely. Required for huge scenes.
+    if tiled {
+        anyhow::ensure!(want_vxo, "--tiled requires a `.vxo` output (the streaming assembly targets .vxo)");
+        return run_tiled_bake(&mesh, voxel_size, supersample, tile_edge, scratch_arg, &out_path, store);
+    }
 
     // 2. Surface-voxelize (rayon-parallel rasterization; the dominant cost at fine voxel sizes — timed so a
     // bake self-reports where the wall-clock goes).
@@ -188,6 +200,206 @@ fn write_vxo_output(out_path: &Path, data: &DotVoxData, voxel_size: f32, store: 
     let params = VxoHeadParams { voxel_size, name, ..Default::default() };
     let comp = if store { VxoCompression::Store } else { VxoCompression::default() };
     write_vxo(out_path, &map, &registry, &params, comp)?;
+    Ok(())
+}
+
+/// Drive the OUT-OF-CORE tiled bake (C1) end-to-end: compute the shared grid geometry, create a RUN-UNIQUE
+/// scratch subdir (under `--scratch` or the temp dir, honoring `D:\tmp_test`), run the disk-tiled flood +
+/// union-find ([`tiled::bake_tiled`]), STREAM-assemble the `.vxo` ([`assemble_vxo_streaming`]), and clean up.
+/// Scratch lifetime (§C1.10): the run-unique subdir is DELETED on success, LEFT + LOGGED on failure for
+/// debugging. Reports wall-clock + scratch high-water (the perf gate, memory `feedback-benchmark-deliveries`).
+fn run_tiled_bake(
+    mesh: &Mesh,
+    voxel_size: f32,
+    supersample: usize,
+    tile_edge: i32,
+    scratch_root: Option<PathBuf>,
+    out_path: &Path,
+    store: bool,
+) -> anyhow::Result<()> {
+    let Some((origin, dims)) = grid_geometry(mesh, voxel_size) else {
+        anyhow::bail!("tiled bake: the mesh has no geometry");
+    };
+    let total_cells = (dims[0] as i64) * (dims[1] as i64) * (dims[2] as i64);
+    let ceil_div = |n: i32, d: i32| (n + d - 1) / d;
+    println!(
+        "tiled bake: grid {}×{}×{} = {} cells, tile_edge {tile_edge} (~{} tiles/axis)",
+        dims[0], dims[1], dims[2], total_cells,
+        ceil_div(dims[0], tile_edge).max(1),
+    );
+
+    // Run-unique scratch subdir.
+    let root = scratch_root.unwrap_or_else(std::env::temp_dir);
+    let unique = format!("voxelize_tiled_{}_{}", std::process::id(), std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0));
+    let scratch = root.join(unique);
+    std::fs::create_dir_all(&scratch)?;
+    println!("tiled scratch: {}", scratch.display());
+
+    let grid = tiled::TileGrid::new(dims, tile_edge, scratch.clone());
+
+    // The bake + assembly, capturing any error so the scratch is left for debugging on failure.
+    let result = (|| -> anyhow::Result<usize> {
+        let t_bake = std::time::Instant::now();
+        let (total_solid, final_ids) = tiled::bake_tiled(&grid, mesh, origin, voxel_size, supersample)?;
+        println!(
+            "  tiled flood + fill: {} solid voxels across {} non-empty tiles ({:.2}s)",
+            total_solid, final_ids.len(), t_bake.elapsed().as_secs_f32()
+        );
+        let t_asm = std::time::Instant::now();
+        assemble_vxo_streaming(&grid, &final_ids, voxel_size, out_path, store)?;
+        println!("  streamed .vxo assembly ({:.2}s)", t_asm.elapsed().as_secs_f32());
+        Ok(total_solid)
+    })();
+
+    match result {
+        Ok(total_solid) => {
+            // Scratch high-water (the disk-tile footprint) before cleanup, for the perf report.
+            let high_water = dir_size(&scratch).unwrap_or(0);
+            let _ = std::fs::remove_dir_all(&scratch);
+            println!(
+                "wrote {} (.vxo tiled out-of-core, {}, voxel_size {voxel_size} m, dims {}×{}×{}, {} solid voxels; \
+                 scratch high-water {:.1} MiB, removed)",
+                out_path.display(),
+                if store { "STORE" } else { "zstd-19" },
+                dims[0], dims[1], dims[2], total_solid,
+                high_water as f64 / (1024.0 * 1024.0),
+            );
+            Ok(())
+        }
+        Err(e) => {
+            eprintln!("tiled bake FAILED: {e:#}. Scratch left for debugging at {}", scratch.display());
+            Err(e)
+        }
+    }
+}
+
+/// Recursive byte size of a directory (the scratch high-water report). Best-effort; ignores unreadable entries.
+fn dir_size(dir: &Path) -> std::io::Result<u64> {
+    let mut total = 0u64;
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let md = entry.metadata()?;
+        if md.is_dir() {
+            total += dir_size(&entry.path()).unwrap_or(0);
+        } else {
+            total += md.len();
+        }
+    }
+    Ok(total)
+}
+
+/// STREAMING tiled `.vxo` assembly (C1.7): build the CIELAB palette + write the `.vxo` region-by-region from
+/// the finalized DISK tiles, never holding the whole grid (or the whole `.vxo` image) in RAM. Two streaming
+/// passes over the finalized tiles (`tiled::stream_final`):
+///
+/// 1. **Palette pass** — accumulate the distinct-albedo `counts` (bounded by texture content, not solid count)
+///    AND the solid-extent bounds in grid-voxel space. Build the ≤255 CIELAB k-means palette (reusing C3's
+///    [`build_palette`]) and the `BlockRegistry` (`BlockId(i+1)` ← palette entry `i`, the `.vox` convention).
+/// 2. **Emit pass** — for each finalized tile, map every solid cell's grid coord → ANCHORED world-voxel coord
+///    (floor at y=0, centred X/Z — the SAME anchor `vox.rs::bricks_from_placed` applies, so the tiled `.vxo`
+///    lands in the gallery exactly like every other asset; the Z-up↔Y-up swaps cancel so grid↔world is identity
+///    up to the anchor), bucket into the owning `8³` brick, and — when a brick's last cell across the stream is
+///    seen — finalize it. Bricks are flushed REGION-BY-REGION in `(z,y,x)` order to the [`VxoStreamWriter`].
+///
+/// To stay bounded-RAM AND emit whole regions, the emit pass buckets ALL solids into a `region → bricks` map
+/// keyed by region coord, but only the SPARSE solid bricks are materialized (one `[BlockId; 512]` per non-empty
+/// brick) — O(solid bricks), the same residency the engine itself holds. For a Bistro-scale bake this is the
+/// surface-shell brick set (millions of bricks × 512 B is ~GB-scale but bounded by SURFACE, not volume), and
+/// the writer streams each region's compressed body straight to the scratch `.brik` file. (A future refinement
+/// could page bricks by region to disk too; the surface-bounded set is acceptable for the current corpus.)
+fn assemble_vxo_streaming(
+    grid: &tiled::TileGrid,
+    final_ids: &[usize],
+    voxel_size: f32,
+    out_path: &Path,
+    store: bool,
+) -> anyhow::Result<()> {
+    use adventure::voxel::brickmap::{BRICK_EDGE, Brick, BrickMap, brick_coord_of_voxel, voxel_index};
+    use adventure::voxel::palette::{BlockId, BlockRegistry};
+    use adventure::voxel::vxo::{VxoCompression, VxoHeadParams, VxoStreamWriter, region_of_brick};
+    use bevy::math::IVec3;
+    use rustc_hash::FxHashMap;
+
+    let (dx, dy) = (grid.dims[0] as usize, grid.dims[1] as usize);
+    let delin = |gi: usize| -> (i32, i32, i32) {
+        let z = (gi / (dx * dy)) as i32;
+        let r = gi % (dx * dy);
+        ((r % dx) as i32, (r / dx) as i32, z)
+    };
+
+    // --- Pass 1: distinct-albedo counts + solid bounds (grid-voxel space). ---
+    let mut counts: HashMap<[u8; 4], u32> = HashMap::new();
+    let mut lo = [i32::MAX; 3];
+    let mut hi = [i32::MIN; 3];
+    tiled::stream_final(grid, final_ids, |gi, rgba| {
+        *counts.entry(rgba).or_insert(0) += 1;
+        let (x, y, z) = delin(gi);
+        lo = [lo[0].min(x), lo[1].min(y), lo[2].min(z)];
+        hi = [hi[0].max(x), hi[1].max(y), hi[2].max(z)];
+    })?;
+    if lo[0] == i32::MAX {
+        anyhow::bail!("tiled .vxo: no solid voxels to assemble");
+    }
+    let mut pixels: Vec<([u8; 4], u32)> = counts.into_iter().collect();
+    pixels.sort_unstable();
+    let palette = build_palette(&pixels, MAX_PALETTE);
+    let palette_lab: Vec<[f32; 3]> = palette.iter().map(|c| rgb_to_lab([c[0], c[1], c[2]])).collect();
+    // The registry: 256-padded sRGB palette → BlockRegistry (BlockId(i+1) ← palette entry i, the .vox rule).
+    let mut vox_palette = palette.clone();
+    vox_palette.resize(256, [0, 0, 0, 255]);
+    let registry: BlockRegistry = BlockRegistry::from_vox_palette(&vox_palette);
+
+    // The anchor shift (floor y=0, centre X/Z) — IDENTICAL to vox.rs::bricks_from_placed (grid↔world identity
+    // bar the anchor). Applied to every solid so the tiled .vxo aligns with the rest of the gallery.
+    let shift = IVec3::new(-(lo[0] + hi[0]) / 2, -lo[1], -(lo[2] + hi[2]) / 2);
+
+    // --- Pass 2: emit. Map each solid → anchored world voxel → brick; quantize once per distinct albedo. ---
+    let k = VxoHeadParams::default().region_edge_bricks as i32;
+    let mut nearest_cache: HashMap<[u8; 4], u8> = HashMap::new();
+    // Sparse per-brick dense arrays (only non-empty bricks materialize — surface-bounded residency).
+    let mut bricks: FxHashMap<IVec3, Box<[BlockId; (BRICK_EDGE * BRICK_EDGE * BRICK_EDGE) as usize]>> =
+        FxHashMap::default();
+    tiled::stream_final(grid, final_ids, |gi, rgba| {
+        let pal = *nearest_cache.entry(rgba).or_insert_with(|| nearest_palette_lab(&palette_lab, rgba));
+        let block = BlockId(pal as u16 + 1); // 1-based; 0 = air
+        let (x, y, z) = delin(gi);
+        let w = IVec3::new(x, y, z) + shift;
+        let bc = brick_coord_of_voxel(w);
+        let local = w - bc * BRICK_EDGE;
+        let arr = bricks.entry(bc).or_insert_with(|| Box::new([BlockId::AIR; (BRICK_EDGE * BRICK_EDGE * BRICK_EDGE) as usize]));
+        arr[voxel_index(local.x, local.y, local.z)] = block;
+    })?;
+
+    // Build the BrickMap (uniform-collapse + occupancy via the SSOT Brick::from_voxels), then region-bucket and
+    // stream-write. The BrickMap here is the surface-bounded resident set (bounded by SURFACE, not volume).
+    let mut map = BrickMap::new();
+    for (coord, arr) in bricks {
+        map.insert(coord, Brick::from_voxels(arr));
+    }
+
+    // Region-bucket the bricks (sorted (z,y,x) within a region; regions fed in (z,y,x) order so the streamed
+    // BRIK body is deterministic).
+    let mut regions: FxHashMap<IVec3, Vec<IVec3>> = FxHashMap::default();
+    for (&coord, _) in map.iter() {
+        regions.entry(region_of_brick(coord, k)).or_default().push(coord);
+    }
+    let mut region_coords: Vec<IVec3> = regions.keys().copied().collect();
+    region_coords.sort_by_key(|c| (c.z, c.y, c.x));
+
+    let name = out_path.file_stem().and_then(|s| s.to_str()).unwrap_or("vxo").to_string();
+    let params = VxoHeadParams { voxel_size, name, ..Default::default() };
+    let comp = if store { VxoCompression::Store } else { VxoCompression::default() };
+    let scratch_brik = grid.scratch.join("assembly.brik.tmp");
+    let mut writer = VxoStreamWriter::new(params, &registry, comp, &scratch_brik)?;
+    for rc in &region_coords {
+        let mut coords = regions.remove(rc).expect("region present");
+        coords.sort_by_key(|c| (c.z, c.y, c.x));
+        let region_bricks: Vec<(IVec3, &Brick)> =
+            coords.iter().map(|&c| (c, map.get(c).expect("brick present"))).collect();
+        writer.add_region(*rc, &region_bricks)?;
+    }
+    writer.finish(out_path)?;
     Ok(())
 }
 
@@ -966,11 +1178,11 @@ impl Grid {
     }
 }
 
-/// Surface-voxelize the mesh: for every triangle, conservatively rasterize into each voxel it overlaps
-/// (triangle–AABB SAT), marking it solid and recording the albedo of the triangle point nearest the voxel
-/// centre. The result is a SHELL (the visible surface), which is what we render + measure GI on.
-fn voxelize(mesh: &Mesh, voxel_size: f32, supersample: usize) -> Grid {
-    // AABB of all triangle vertices.
+/// The grid GEOMETRY for a mesh at `voxel_size`: the world-space `origin` (the AABB min minus one padding
+/// voxel) + the integer `dims`. A pure function of the mesh AABB + voxel size, factored out so the monolithic
+/// [`voxelize`] AND the tiled bake ([`tiled`]) compute the SAME grid frame (identical origin/dims ⇒ identical
+/// cell indices ⇒ the oracle can compare cell-for-cell). Returns `None` for an empty mesh.
+fn grid_geometry(mesh: &Mesh, voxel_size: f32) -> Option<([f32; 3], [i32; 3])> {
     let mut lo = [f32::INFINITY; 3];
     let mut hi = [f32::NEG_INFINITY; 3];
     for t in &mesh.triangles {
@@ -982,8 +1194,7 @@ fn voxelize(mesh: &Mesh, voxel_size: f32, supersample: usize) -> Grid {
         }
     }
     if !lo[0].is_finite() {
-        // No geometry — return a 1³ empty grid.
-        return Grid::new([1, 1, 1]);
+        return None;
     }
     // Pad one voxel so surface triangles on the boundary still have a cell.
     let origin = [lo[0] - voxel_size, lo[1] - voxel_size, lo[2] - voxel_size];
@@ -991,6 +1202,24 @@ fn voxelize(mesh: &Mesh, voxel_size: f32, supersample: usize) -> Grid {
         (((hi[0] - lo[0]) / voxel_size).ceil() as i32 + 3).max(1),
         (((hi[1] - lo[1]) / voxel_size).ceil() as i32 + 3).max(1),
         (((hi[2] - lo[2]) / voxel_size).ceil() as i32 + 3).max(1),
+    ];
+    Some((origin, dims))
+}
+
+/// Surface-voxelize the mesh: for every triangle, conservatively rasterize into each voxel it overlaps
+/// (triangle–AABB SAT), marking it solid and recording the albedo of the triangle point nearest the voxel
+/// centre. The result is a SHELL (the visible surface), which is what we render + measure GI on.
+fn voxelize(mesh: &Mesh, voxel_size: f32, supersample: usize) -> Grid {
+    let Some((origin, dims)) = grid_geometry(mesh, voxel_size) else {
+        // No geometry — return a 1³ empty grid.
+        return Grid::new([1, 1, 1]);
+    };
+    // AABB recovered from origin (origin = lo - voxel_size) for the guard's diagnostic.
+    let lo = [origin[0] + voxel_size, origin[1] + voxel_size, origin[2] + voxel_size];
+    let hi = [
+        lo[0] + (dims[0] - 3).max(0) as f32 * voxel_size,
+        lo[1] + (dims[1] - 3).max(0) as f32 * voxel_size,
+        lo[2] + (dims[2] - 3).max(0) as f32 * voxel_size,
     ];
     // Guard: the occupancy bitset + the flood-fill's `exterior` bitset are each `total/8` bytes (1 bit/cell)
     // — the only AABB-volume cost now (the albedo is sparse). So the ceiling is generous: 16 G cells ⇒ ~2 GB
@@ -1010,15 +1239,36 @@ fn voxelize(mesh: &Mesh, voxel_size: f32, supersample: usize) -> Grid {
     );
     let mut grid = Grid::new(dims);
 
-    let half = voxel_size * 0.5;
     let dims = grid.dims; // Copy [i32;3] — captured by the parallel closures so they don't borrow `grid`.
-    // Rasterize triangles into voxels IN PARALLEL: the 13-axis SAT overlap test + the per-voxel albedo sample
-    // is the hot path and is independent per triangle, so fan it across all cores with rayon. Each triangle
-    // returns its solid (cell-index, albedo) list; the lists are merged below in triangle order so the
-    // original "first triangle to claim a cell keeps its albedo" rule still holds deterministically — parallel
-    // writes into the shared grid couldn't preserve that ordering (and would race), so we don't try.
-    let per_tri: Vec<Vec<(usize, [u8; 4])>> = mesh
-        .triangles
+    // Rasterize triangles into voxels IN PARALLEL (the shared surface SAT, also used by the tiled bake), then
+    // first-writer-wins merge in triangle order into the dense grid.
+    let per_tri = surface_scatter(mesh, origin, voxel_size, dims, supersample);
+    for cells in &per_tri {
+        for &(i, albedo) in cells {
+            if !grid.is_solid(i) {
+                grid.set_solid(i, albedo);
+            }
+        }
+    }
+    grid
+}
+
+/// The shared SURFACE SAT pass: rasterize every triangle into the voxels it conservatively overlaps and sample
+/// its area-averaged albedo, returning the per-triangle `(global_cell_index, albedo)` lists IN TRIANGLE ORDER.
+/// Factored out of [`voxelize`] so the monolithic grid build AND the tiled out-of-core bake ([`tiled`]) run the
+/// IDENTICAL occupancy + albedo computation — the conservative SAT is the occupancy SSOT (C1 changes only HOW
+/// the result is stored/flooded at scale, never the SAT). The lists are returned (not merged) so each caller
+/// applies its own first-writer-wins merge in triangle order (the deterministic "first triangle to claim a cell
+/// keeps its albedo" rule) — parallel writes into a shared store couldn't preserve that ordering.
+fn surface_scatter(
+    mesh: &Mesh,
+    origin: [f32; 3],
+    voxel_size: f32,
+    dims: [i32; 3],
+    supersample: usize,
+) -> Vec<Vec<(usize, [u8; 4])>> {
+    let half = voxel_size * 0.5;
+    mesh.triangles
         .par_iter()
         .map(|t| {
             // Triangle voxel-AABB (clamped to the grid), expanded by ONE cell each side BEFORE clamping. A
@@ -1061,16 +1311,7 @@ fn voxelize(mesh: &Mesh, voxel_size: f32, supersample: usize) -> Grid {
             }
             cells
         })
-        .collect();
-    // First-writer-wins merge in triangle order (matches the original single-threaded semantics).
-    for cells in &per_tri {
-        for &(i, albedo) in cells {
-            if !grid.is_solid(i) {
-                grid.set_solid(i, albedo);
-            }
-        }
-    }
-    grid
+        .collect()
 }
 
 /// Fill ENCLOSED interiors solid (always-on): a destructible voxel object must be solid inside so a cut reveals
@@ -1811,6 +2052,1029 @@ fn build_scene_graph(models: &[Model], corners: &[[i32; 3]]) -> Vec<SceneNode> {
     scenes
 }
 
+// ============================================================================================
+// C1 — Tiled bounded-RAM out-of-core voxelizer (union-find enclosure flood, disk-backed tiles)
+// ============================================================================================
+//
+// `docs/TILED_VOXELIZER_PLAN.md` §C1. The monolithic `solid_fill` needs the whole AABB resident (occupancy +
+// exterior bitsets + a flood frontier) — multi-GB-to-tens-of-GB for Bistro-Exterior @0.05 m. The tiled path
+// computes the IDENTICAL solid/air classification under a bounded RAM budget by:
+//   1. Routing the shared surface SAT ([`surface_scatter`]) to per-tile disk `.occ`/`.alb` files (only
+//      non-empty tiles get a file — the sparse-absent convention).
+//   2. Per-tile LOCAL air flood → label air components, record each component's 6-face footprint +
+//      global-boundary touch; file-less tiles = one all-air component touching all 6 faces.
+//   3. UNION-FIND across shared tile faces (stream the two adjacent face label images, union matching air-air
+//      cells) + propagate "exterior" from a synthetic OUTSIDE node seeded by every global-boundary component.
+//   4. FILL pass: air whose component root is NOT exterior → solid (a fully-buried file-less tile → a 1-flag
+//      uniform-solid marker). Interior albedo via per-tile nearest-surface + 1-voxel halo exchange.
+//
+// DETERMINISM: tile order (linear id), prefix sums, union-by-rank tie-breaks, and face iteration are fixed
+// functions of tile ids, so the partition (and thus the solid mask) is byte-reproducible.
+//
+// This module is a self-contained sub-pipeline of the offline voxelizer; it shares the surface SAT + the
+// `solid_fill` RULE with the monolithic path (the oracle test proves cell-for-cell equality) and feeds the
+// streaming `.vxo` assembly (`adventure::voxel::vxo::VxoStreamWriter`, bounded-RAM region-by-region write).
+mod tiled {
+    use std::collections::VecDeque;
+    use std::io::Write;
+    use std::path::{Path, PathBuf};
+
+    use super::{Mesh, surface_scatter};
+
+    /// Default tile edge in voxels (`TILE_EDGE`). At `T=128`: a `T³/8 = 256 KiB` occupancy + a `T³·1 = 2 MiB`
+    /// `u8` component-label scratch per resident tile — a few resident tiles is well under the budget; the
+    /// persistent per-tile component tables + union-find are O(total components) ≪ O(volume). Tunable via
+    /// `--tile-edge` for the bounded-RAM/scratch trade (bigger = fewer faces/seams + more sequential I/O, more
+    /// RAM per tile). See `TILED_VOXELIZER_PLAN.md` §C1.1.
+    pub const DEFAULT_TILE_EDGE: i32 = 128;
+
+    /// A solid (non-air) face cell sentinel in a disk face-label image — distinguishes "no air component here"
+    /// from an actual `u16` component id. Air pockets per tile are far below `u16::MAX` on real geometry; the
+    /// local flood asserts the bound (never silently wraps, §C1.10).
+    const FACE_SOLID: u16 = u16::MAX;
+
+    /// The 6 axis-neighbour offsets (the 6-connected flood relation), in a FIXED order so the flood + the face
+    /// stitch are deterministic.
+    const N6: [(i32, i32, i32); 6] =
+        [(1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, -1, 0), (0, 0, 1), (0, 0, -1)];
+
+    /// The 6 tile faces, indexed `0..6`: `[+X, -X, +Y, -Y, +Z, -Z]` (matching [`N6`]). The face a component
+    /// touches is recorded as a bit in the component table; the stitch pairs a tile's `+axis` face with its
+    /// neighbour's `-axis` face.
+    const FACE_PX: usize = 0;
+    const FACE_NX: usize = 1;
+    const FACE_PY: usize = 2;
+    const FACE_NY: usize = 3;
+    const FACE_PZ: usize = 4;
+    const FACE_NZ: usize = 5;
+
+    /// The tiling geometry over the grid AABB: grid `dims`, the cubic `tile_edge` `T`, the per-axis tile counts,
+    /// and the scratch directory holding the disk tiles. A pure function of `(dims, tile_edge)` — the SSOT for
+    /// tile addressing, so every pass agrees on tile ids + extents.
+    pub struct TileGrid {
+        pub dims: [i32; 3],
+        pub tile_edge: i32,
+        pub tnx: i32,
+        pub tny: i32,
+        pub tnz: i32,
+        pub scratch: PathBuf,
+    }
+
+    impl TileGrid {
+        pub fn new(dims: [i32; 3], tile_edge: i32, scratch: PathBuf) -> Self {
+            let t = tile_edge.max(1);
+            let tnx = dims[0].div_euclid(t) + i32::from(dims[0].rem_euclid(t) != 0);
+            let tny = dims[1].div_euclid(t) + i32::from(dims[1].rem_euclid(t) != 0);
+            let tnz = dims[2].div_euclid(t) + i32::from(dims[2].rem_euclid(t) != 0);
+            Self { dims, tile_edge: t, tnx: tnx.max(1), tny: tny.max(1), tnz: tnz.max(1), scratch }
+        }
+
+        /// Total number of tiles (the union-find / component-table index space).
+        pub fn tile_count(&self) -> usize {
+            (self.tnx as usize) * (self.tny as usize) * (self.tnz as usize)
+        }
+
+        /// Tile linear id `tx + ty·tnx + tz·tnx·tny` (X-fastest, same convention as the grid index).
+        #[inline]
+        pub fn tile_id(&self, tx: i32, ty: i32, tz: i32) -> usize {
+            (tx as usize) + (ty as usize) * (self.tnx as usize) + (tz as usize) * (self.tnx as usize) * (self.tny as usize)
+        }
+
+        /// The `(tx,ty,tz)` of a tile id (inverse of [`tile_id`](Self::tile_id)).
+        #[inline]
+        pub fn tile_xyz(&self, id: usize) -> (i32, i32, i32) {
+            let txy = (self.tnx as usize) * (self.tny as usize);
+            let tz = id / txy;
+            let r = id % txy;
+            ((r % self.tnx as usize) as i32, (r / self.tnx as usize) as i32, tz as i32)
+        }
+
+        /// The tile owning a grid cell `(x,y,z)` (floor-division by `T`).
+        #[inline]
+        pub fn tile_of(&self, x: i32, y: i32, z: i32) -> (i32, i32, i32) {
+            (x / self.tile_edge, y / self.tile_edge, z / self.tile_edge)
+        }
+
+        /// The clamped voxel EXTENT of tile `(tx,ty,tz)` — partial at the grid edge.
+        #[inline]
+        pub fn tile_extent(&self, tx: i32, ty: i32, tz: i32) -> [i32; 3] {
+            [
+                (self.dims[0] - tx * self.tile_edge).min(self.tile_edge),
+                (self.dims[1] - ty * self.tile_edge).min(self.tile_edge),
+                (self.dims[2] - tz * self.tile_edge).min(self.tile_edge),
+            ]
+        }
+
+        /// GLOBAL cell index of local `(lx,ly,lz)` within tile `(tx,ty,tz)` (the grid's `x + y·dx + z·dx·dy`).
+        #[inline]
+        pub fn global_index(&self, tx: i32, ty: i32, tz: i32, lx: i32, ly: i32, lz: i32) -> usize {
+            let (dx, dy) = (self.dims[0] as usize, self.dims[1] as usize);
+            let gx = (tx * self.tile_edge + lx) as usize;
+            let gy = (ty * self.tile_edge + ly) as usize;
+            let gz = (tz * self.tile_edge + lz) as usize;
+            gx + gy * dx + gz * dx * dy
+        }
+
+        fn occ_path(&self, id: usize) -> PathBuf {
+            self.scratch.join(format!("tile_{id}.occ"))
+        }
+        fn alb_path(&self, id: usize) -> PathBuf {
+            self.scratch.join(format!("tile_{id}.alb"))
+        }
+        fn face_path(&self, id: usize, face: usize) -> PathBuf {
+            self.scratch.join(format!("tile_{id}.face{face}"))
+        }
+    }
+
+    /// A local occupancy bitset over a tile's clamped extent (X-fastest local index). The only large per-tile
+    /// RAM buffer alongside the `u8` component-label scratch.
+    struct TileOcc {
+        ext: [i32; 3],
+        bits: Vec<u64>,
+    }
+
+    impl TileOcc {
+        fn new(ext: [i32; 3]) -> Self {
+            let n = (ext[0] as usize) * (ext[1] as usize) * (ext[2] as usize);
+            Self { ext, bits: vec![0u64; n.div_ceil(64)] }
+        }
+        #[inline]
+        fn local_index(&self, lx: i32, ly: i32, lz: i32) -> usize {
+            (lx as usize) + (ly as usize) * (self.ext[0] as usize) + (lz as usize) * (self.ext[0] as usize) * (self.ext[1] as usize)
+        }
+        #[inline]
+        fn get(&self, i: usize) -> bool {
+            (self.bits[i >> 6] >> (i & 63)) & 1 != 0
+        }
+        #[inline]
+        fn set(&mut self, i: usize) {
+            self.bits[i >> 6] |= 1u64 << (i & 63);
+        }
+        fn count(&self) -> usize {
+            (self.ext[0] as usize) * (self.ext[1] as usize) * (self.ext[2] as usize)
+        }
+    }
+
+    /// One tile-local air component: the 6-face touch bitmask + whether it touches the GLOBAL grid boundary
+    /// (open air → exterior seed). Tiny (2 bytes) × O(components) — the only persistent per-component RAM.
+    #[derive(Clone, Copy, Default)]
+    struct Component {
+        touches_face: u8,
+        touches_boundary: bool,
+    }
+
+    /// A path-compressed, union-by-rank disjoint-set over `[0, n)` PLUS a synthetic OUTSIDE node at index `n`.
+    /// Air components are unioned across shared tile faces; OUTSIDE is unioned with every global-boundary
+    /// component, so `find(c) == find(OUTSIDE)` ⇔ component `c` is exterior-reachable. Deterministic: union-by-
+    /// rank ties break to the lower index, so the forest is a fixed function of the union order (which is itself
+    /// a fixed function of tile ids).
+    struct UnionFind {
+        parent: Vec<u32>,
+        rank: Vec<u8>,
+    }
+
+    impl UnionFind {
+        fn new(n: usize) -> Self {
+            // n components + 1 OUTSIDE node.
+            let total = n + 1;
+            Self { parent: (0..total as u32).collect(), rank: vec![0u8; total] }
+        }
+        fn outside(&self) -> u32 {
+            (self.parent.len() - 1) as u32
+        }
+        fn find(&mut self, mut x: u32) -> u32 {
+            // Iterative find with full path compression.
+            let mut root = x;
+            while self.parent[root as usize] != root {
+                root = self.parent[root as usize];
+            }
+            while self.parent[x as usize] != root {
+                let next = self.parent[x as usize];
+                self.parent[x as usize] = root;
+                x = next;
+            }
+            root
+        }
+        fn union(&mut self, a: u32, b: u32) {
+            let (ra, rb) = (self.find(a), self.find(b));
+            if ra == rb {
+                return;
+            }
+            // Union by rank; equal ranks attach the HIGHER index under the LOWER (deterministic tie-break).
+            let (lo, hi) = if self.rank[ra as usize] < self.rank[rb as usize] {
+                (rb, ra) // attach ra under rb
+            } else if self.rank[ra as usize] > self.rank[rb as usize] {
+                (ra, rb) // attach rb under ra
+            } else {
+                // Equal rank: lower index becomes the root, the other's rank bumps.
+                let (root, child) = if ra < rb { (ra, rb) } else { (rb, ra) };
+                self.parent[child as usize] = root;
+                self.rank[root as usize] += 1;
+                return;
+            };
+            self.parent[hi as usize] = lo;
+        }
+    }
+
+    /// The result of the surface scatter: which tiles got a disk file (sorted) + the global surface albedo
+    /// `counts` are NOT held here (the assembly rebuilds the palette by streaming the finalized tiles). We keep
+    /// only the per-tile presence so the later passes know which tiles have files.
+    struct ScatterResult {
+        /// `has_file[id]` — true iff tile `id` got an `.occ` file in the surface pass.
+        has_file: Vec<bool>,
+    }
+
+    /// Surface pass: run the shared SAT ([`surface_scatter`]) and ROUTE its `(global_cell, albedo)` output to
+    /// per-tile disk `.occ`/`.alb` files, first-writer-wins per cell in TRIANGLE order (the monolithic rule,
+    /// now tile-local). Returns which tiles got a file. Bounded RAM: the per-tile buffers are flushed to disk;
+    /// only the (sparse) surface cells are held transiently in the merge.
+    fn scatter_surface(
+        grid: &TileGrid,
+        mesh: &Mesh,
+        origin: [f32; 3],
+        voxel_size: f32,
+        supersample: usize,
+    ) -> std::io::Result<ScatterResult> {
+        let n_tiles = grid.tile_count();
+        // The parallel per-triangle surface lists (triangle order preserved by the Vec-of-Vec).
+        let per_tri = surface_scatter(mesh, origin, voxel_size, grid.dims, supersample);
+
+        // Per-tile in-RAM accumulators: a local occupancy bitset + a first-writer albedo map (local_index →
+        // rgba). Only NON-EMPTY tiles allocate. The serial first-writer merge in triangle order keeps the same
+        // deterministic albedo rule as the monolithic path.
+        let mut tile_occ: Vec<Option<TileOcc>> = (0..n_tiles).map(|_| None).collect();
+        let mut tile_alb: Vec<std::collections::BTreeMap<u32, [u8; 4]>> =
+            (0..n_tiles).map(|_| std::collections::BTreeMap::new()).collect();
+        let (dx, dy) = (grid.dims[0] as usize, grid.dims[1] as usize);
+        for cells in &per_tri {
+            for &(gi, albedo) in cells {
+                // Delinearize the global index → (x,y,z) → tile + local.
+                let z = (gi / (dx * dy)) as i32;
+                let r = gi % (dx * dy);
+                let x = (r % dx) as i32;
+                let y = (r / dx) as i32;
+                let (tx, ty, tz) = grid.tile_of(x, y, z);
+                let id = grid.tile_id(tx, ty, tz);
+                let ext = grid.tile_extent(tx, ty, tz);
+                let occ = tile_occ[id].get_or_insert_with(|| TileOcc::new(ext));
+                let (lx, ly, lz) = (x - tx * grid.tile_edge, y - ty * grid.tile_edge, z - tz * grid.tile_edge);
+                let li = occ.local_index(lx, ly, lz) as u32;
+                // First-writer-wins per cell (triangle order): only set if not already solid in this tile.
+                let lidx = occ.local_index(lx, ly, lz);
+                if !occ.get(lidx) {
+                    occ.set(lidx);
+                    tile_alb[id].insert(li, albedo);
+                }
+            }
+        }
+
+        // Flush each non-empty tile to disk (.occ = the raw bitset words; .alb = sorted (local_index, rgba)).
+        let mut has_file = vec![false; n_tiles];
+        for id in 0..n_tiles {
+            if let Some(occ) = &tile_occ[id] {
+                write_occ(&grid.occ_path(id), occ)?;
+                write_alb(&grid.alb_path(id), &tile_alb[id])?;
+                has_file[id] = true;
+            }
+        }
+        Ok(ScatterResult { has_file })
+    }
+
+    /// Write a tile's occupancy bitset to disk: extent header (`3 × i32`) then the `u64` words (LE).
+    fn write_occ(path: &Path, occ: &TileOcc) -> std::io::Result<()> {
+        let mut f = std::io::BufWriter::new(std::fs::File::create(path)?);
+        for a in occ.ext {
+            f.write_all(&a.to_le_bytes())?;
+        }
+        for w in &occ.bits {
+            f.write_all(&w.to_le_bytes())?;
+        }
+        f.flush()
+    }
+
+    /// Read a tile's occupancy bitset from disk.
+    fn read_occ(path: &Path) -> std::io::Result<TileOcc> {
+        let bytes = std::fs::read(path)?;
+        let mut ext = [0i32; 3];
+        for (a, slot) in ext.iter_mut().enumerate() {
+            *slot = i32::from_le_bytes(bytes[a * 4..a * 4 + 4].try_into().unwrap());
+        }
+        let n = (ext[0] as usize) * (ext[1] as usize) * (ext[2] as usize);
+        let words = n.div_ceil(64);
+        let mut bits = vec![0u64; words];
+        let off = 12;
+        for (w, slot) in bits.iter_mut().enumerate() {
+            let b = off + w * 8;
+            *slot = u64::from_le_bytes(bytes[b..b + 8].try_into().unwrap());
+        }
+        Ok(TileOcc { ext, bits })
+    }
+
+    /// Write a tile's surface albedo as sorted `(local_index:u32, rgba:[u8;4])` runs.
+    fn write_alb(path: &Path, alb: &std::collections::BTreeMap<u32, [u8; 4]>) -> std::io::Result<()> {
+        let mut f = std::io::BufWriter::new(std::fs::File::create(path)?);
+        for (&li, rgba) in alb {
+            f.write_all(&li.to_le_bytes())?;
+            f.write_all(rgba)?;
+        }
+        f.flush()
+    }
+
+    /// Read a tile's surface albedo back into a map (local_index → rgba).
+    fn read_alb(path: &Path) -> std::io::Result<std::collections::HashMap<u32, [u8; 4]>> {
+        let mut out = std::collections::HashMap::new();
+        match std::fs::read(path) {
+            Ok(bytes) => {
+                let mut i = 0;
+                while i + 8 <= bytes.len() {
+                    let li = u32::from_le_bytes(bytes[i..i + 4].try_into().unwrap());
+                    let rgba = [bytes[i + 4], bytes[i + 5], bytes[i + 6], bytes[i + 7]];
+                    out.insert(li, rgba);
+                    i += 8;
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
+        Ok(out)
+    }
+
+    /// Label a tile's AIR cells into 6-connected components (scan-order deterministic BFS): returns the `u16`
+    /// per-cell label array (local-index order; solid cells get [`FACE_SOLID`]) and the component count. Guards
+    /// the `u16` component bound (§C1.10) — a pathological air-pocket explosion is a HARD error, never a wrap.
+    fn label_tile(occ: &TileOcc) -> (Vec<u16>, u32) {
+        let n = occ.count();
+        let mut label = vec![FACE_SOLID; n];
+        let [ex, ey, ez] = occ.ext;
+        let mut next: u16 = 0;
+        let mut q: VecDeque<(i32, i32, i32)> = VecDeque::new();
+        // Scan in local index order so the component ids are a fixed function of the occupancy (deterministic).
+        for lz in 0..ez {
+            for ly in 0..ey {
+                for lx in 0..ex {
+                    let i = occ.local_index(lx, ly, lz);
+                    if occ.get(i) || label[i] != FACE_SOLID {
+                        continue; // solid, or already labelled air
+                    }
+                    let comp = next;
+                    next = next.checked_add(1).unwrap_or_else(|| {
+                        panic!(
+                            "tiled flood: tile air components exceeded u16::MAX ({}³ extent) — widen the label \
+                             type (TILED_VOXELIZER_PLAN §C1.10); practically unreachable on real geometry",
+                            occ.tile_edge_hint()
+                        )
+                    });
+                    label[i] = comp;
+                    q.push_back((lx, ly, lz));
+                    while let Some((cx, cy, cz)) = q.pop_front() {
+                        for (ox, oy, oz) in N6 {
+                            let (nx, ny, nz) = (cx + ox, cy + oy, cz + oz);
+                            if nx < 0 || ny < 0 || nz < 0 || nx >= ex || ny >= ey || nz >= ez {
+                                continue;
+                            }
+                            let ni = occ.local_index(nx, ny, nz);
+                            if !occ.get(ni) && label[ni] == FACE_SOLID {
+                                label[ni] = comp;
+                                q.push_back((nx, ny, nz));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        (label, next as u32)
+    }
+
+    impl TileOcc {
+        /// A coarse extent hint for the overflow panic message (max extent axis).
+        fn tile_edge_hint(&self) -> i32 {
+            self.ext[0].max(self.ext[1]).max(self.ext[2])
+        }
+    }
+
+    /// Per-tile face image: for each of the 6 faces, the in-face `(v,w)` air-component labels (or [`FACE_SOLID`]),
+    /// written to disk so the stitch can stream adjacent pairs without re-flooding. The face's in-face dims are
+    /// implied by the tile extent + which axis the face is on. Layout per face file: `2 × i32` (the in-face
+    /// dims `(w0, w1)`) then `w0*w1 × u16` labels (row-major, w0 fastest).
+    fn write_face_images(grid: &TileGrid, id: usize, occ: &TileOcc, label: &[u16]) -> std::io::Result<()> {
+        let [ex, ey, ez] = occ.ext;
+        // For each face: (in-face dim0, in-face dim1) and a closure mapping in-face (a,b) → local (lx,ly,lz).
+        // +X/-X faces span (y,z); +Y/-Y span (x,z); +Z/-Z span (x,y).
+        let faces: [(usize, i32, i32, [i32; 1]); 6] = [
+            (FACE_PX, ey, ez, [ex - 1]),
+            (FACE_NX, ey, ez, [0]),
+            (FACE_PY, ex, ez, [ey - 1]),
+            (FACE_NY, ex, ez, [0]),
+            (FACE_PZ, ex, ey, [ez - 1]),
+            (FACE_NZ, ex, ey, [0]),
+        ];
+        for (face, d0, d1, fixed) in faces {
+            let mut buf: Vec<u8> = Vec::with_capacity(8 + (d0 as usize) * (d1 as usize) * 2);
+            buf.extend_from_slice(&d0.to_le_bytes());
+            buf.extend_from_slice(&d1.to_le_bytes());
+            for b in 0..d1 {
+                for a in 0..d0 {
+                    let (lx, ly, lz) = match face {
+                        FACE_PX | FACE_NX => (fixed[0], a, b),
+                        FACE_PY | FACE_NY => (a, fixed[0], b),
+                        _ => (a, b, fixed[0]),
+                    };
+                    let li = occ.local_index(lx, ly, lz);
+                    let lab = label[li];
+                    buf.extend_from_slice(&lab.to_le_bytes());
+                }
+            }
+            std::fs::write(grid.face_path(id, face), &buf)?;
+        }
+        Ok(())
+    }
+
+    /// Read a tile's face image `(dims, labels)`; a missing file (a file-less tile) is the all-air face — the
+    /// caller handles that separately (it never writes face images for file-less tiles).
+    fn read_face_image(grid: &TileGrid, id: usize, face: usize) -> std::io::Result<(i32, i32, Vec<u16>)> {
+        let bytes = std::fs::read(grid.face_path(id, face))?;
+        let d0 = i32::from_le_bytes(bytes[0..4].try_into().unwrap());
+        let d1 = i32::from_le_bytes(bytes[4..8].try_into().unwrap());
+        let mut labels = Vec::with_capacity((d0 as usize) * (d1 as usize));
+        let mut i = 8;
+        while i + 2 <= bytes.len() {
+            labels.push(u16::from_le_bytes(bytes[i..i + 2].try_into().unwrap()));
+            i += 2;
+        }
+        Ok((d0, d1, labels))
+    }
+
+    /// The full enclosure classification: surface scatter (done by the caller) → per-tile local flood (build
+    /// the component table + face images + boundary seeds + the `component_base` prefix sum) → union-find across
+    /// shared faces → exterior closure. Returns the per-tile component base + the union-find with exterior
+    /// resolved, so the fill pass can classify each air cell. Bounded RAM throughout (one tile resident at a time).
+    struct Classification {
+        component_base: Vec<u32>,
+        uf: UnionFind,
+        exterior_root: Vec<bool>,
+    }
+
+    /// Build the per-tile components: flood each tile, write its face images, record the component table +
+    /// boundary seeds, and assign the `component_base` prefix sum (deterministic tile-id order). A file-less
+    /// tile contributes ONE all-air component touching all 6 faces (+ boundary if on the grid edge) — §C1.5.
+    fn build_components(
+        grid: &TileGrid,
+        scatter: &ScatterResult,
+    ) -> std::io::Result<(Vec<u32>, Vec<u32>, Vec<Component>)> {
+        let n_tiles = grid.tile_count();
+        let mut component_base = vec![0u32; n_tiles];
+        let mut component_count = vec![0u32; n_tiles];
+        let mut components: Vec<Component> = Vec::new();
+        let mut base: u32 = 0;
+        for id in 0..n_tiles {
+            let (tx, ty, tz) = grid.tile_xyz(id);
+            // Which faces lie on the GLOBAL grid boundary (open air outside).
+            let on_boundary = |face: usize| -> bool {
+                match face {
+                    FACE_PX => tx == grid.tnx - 1,
+                    FACE_NX => tx == 0,
+                    FACE_PY => ty == grid.tny - 1,
+                    FACE_NY => ty == 0,
+                    FACE_PZ => tz == grid.tnz - 1,
+                    _ => tz == 0,
+                }
+            };
+            component_base[id] = base;
+            if scatter.has_file[id] {
+                let occ = read_occ(&grid.occ_path(id))?;
+                let (label, c_tile) = label_tile(&occ);
+                write_face_images(grid, id, &occ, &label)?;
+                // Build the component table from the labels: per component, the face-touch bitmask + boundary.
+                let mut table = vec![Component::default(); c_tile as usize];
+                let [ex, ey, ez] = occ.ext;
+                // Scan the 6 faces, OR-ing each air cell's component's touch bit + boundary seed.
+                let mark = |face: usize, lx: i32, ly: i32, lz: i32, table: &mut Vec<Component>| {
+                    let li = occ.local_index(lx, ly, lz);
+                    let lab = label[li];
+                    if lab != FACE_SOLID {
+                        let c = &mut table[lab as usize];
+                        c.touches_face |= 1 << face;
+                        if on_boundary(face) {
+                            c.touches_boundary = true;
+                        }
+                    }
+                };
+                for b in 0..ez {
+                    for a in 0..ey {
+                        mark(FACE_PX, ex - 1, a, b, &mut table);
+                        mark(FACE_NX, 0, a, b, &mut table);
+                    }
+                }
+                for b in 0..ez {
+                    for a in 0..ex {
+                        mark(FACE_PY, a, ey - 1, b, &mut table);
+                        mark(FACE_NY, a, 0, b, &mut table);
+                    }
+                }
+                for b in 0..ey {
+                    for a in 0..ex {
+                        mark(FACE_PZ, a, b, ez - 1, &mut table);
+                        mark(FACE_NZ, a, b, 0, &mut table);
+                    }
+                }
+                component_count[id] = c_tile;
+                components.extend(table);
+                base += c_tile;
+            } else {
+                // File-less tile: one all-air component touching all 6 faces; boundary if ANY face is on the edge.
+                let touches_boundary = (0..6).any(on_boundary);
+                components.push(Component { touches_face: 0b0011_1111, touches_boundary });
+                component_count[id] = 1;
+                base += 1;
+            }
+        }
+        Ok((component_base, component_count, components))
+    }
+
+    /// Stitch tiles across shared faces with the union-find, then propagate exterior from the synthetic OUTSIDE
+    /// node (seeded by every global-boundary component). Streams the two adjacent face label images per internal
+    /// face (file-less tiles use their single all-air component). Returns the resolved [`Classification`].
+    fn stitch_and_close(
+        grid: &TileGrid,
+        component_base: &[u32],
+        component_count: &[u32],
+        components: &[Component],
+    ) -> std::io::Result<Classification> {
+        let total: usize = component_count.iter().map(|&c| c as usize).sum();
+        let mut uf = UnionFind::new(total);
+        let outside = uf.outside();
+
+        // Seed OUTSIDE with every global-boundary component (exterior = the closure of these).
+        for (id, &cnt) in component_count.iter().enumerate() {
+            let cbase = component_base[id];
+            for c in 0..cnt {
+                if components[(cbase + c) as usize].touches_boundary {
+                    uf.union(cbase + c, outside);
+                }
+            }
+        }
+
+        // For a tile face cell, resolve its air component global node id (or None if solid). A file-less tile is
+        // all-air component 0; a tiled-with-file tile reads its persisted face image.
+        // We stream internal faces in tile-id order; for each tile, its +X/+Y/+Z neighbour (the negative side is
+        // covered by the neighbour's positive iteration).
+        for id in 0..grid.tile_count() {
+            let (tx, ty, tz) = grid.tile_xyz(id);
+            // +X neighbour.
+            if tx + 1 < grid.tnx {
+                stitch_face(grid, &mut uf, component_base, component_count, components, id, FACE_PX, grid.tile_id(tx + 1, ty, tz), FACE_NX)?;
+            }
+            if ty + 1 < grid.tny {
+                stitch_face(grid, &mut uf, component_base, component_count, components, id, FACE_PY, grid.tile_id(tx, ty + 1, tz), FACE_NY)?;
+            }
+            if tz + 1 < grid.tnz {
+                stitch_face(grid, &mut uf, component_base, component_count, components, id, FACE_PZ, grid.tile_id(tx, ty, tz + 1), FACE_NZ)?;
+            }
+        }
+
+        // Resolve exterior: a component is exterior iff its root == find(OUTSIDE). Precompute per ROOT so the
+        // fill pass is O(1) per cell.
+        let out_root = uf.find(outside);
+        let mut exterior_root = vec![false; uf.parent.len()];
+        for node in 0..total as u32 {
+            if uf.find(node) == out_root {
+                exterior_root[uf.find(node) as usize] = true;
+            }
+        }
+        exterior_root[out_root as usize] = true;
+
+        Ok(Classification { component_base: component_base.to_vec(), uf, exterior_root })
+    }
+
+    /// Union the air-air matching cells of tile `a`'s `face_a` with tile `b`'s `face_b` (the opposite axis face).
+    /// A file-less tile's face is its single all-air component (base + 0) for every in-face cell.
+    #[allow(clippy::too_many_arguments)]
+    fn stitch_face(
+        grid: &TileGrid,
+        uf: &mut UnionFind,
+        component_base: &[u32],
+        component_count: &[u32],
+        _components: &[Component],
+        a: usize,
+        face_a: usize,
+        b: usize,
+        face_b: usize,
+    ) -> std::io::Result<()> {
+        // Load each side's face labels as (d0, d1, labels) — or None for a file-less tile (all-air comp 0).
+        let load = |id: usize, face: usize| -> std::io::Result<Option<(i32, i32, Vec<u16>)>> {
+            if component_count[id] == 1 && !grid.occ_path(id).exists() {
+                // File-less tile: no face image on disk; its whole face is air component 0.
+                Ok(None)
+            } else {
+                Ok(Some(read_face_image(grid, id, face)?))
+            }
+        };
+        let fa = load(a, face_a)?;
+        let fb = load(b, face_b)?;
+        // The shared face's in-face dims must match (same (v,w) lattice across the boundary). For two
+        // file-less or one-file/one-fileless pairing, take the dims from whichever side has them.
+        let (d0, d1) = match (&fa, &fb) {
+            (Some((d0, d1, _)), _) => (*d0, *d1),
+            (_, Some((d0, d1, _))) => (*d0, *d1),
+            (None, None) => {
+                // Both file-less: the whole shared face is air↔air, union their single components.
+                uf.union(component_base[a], component_base[b]);
+                return Ok(());
+            }
+        };
+        for w in 0..d1 {
+            for v in 0..d0 {
+                let idx = (v + w * d0) as usize;
+                let la = match &fa {
+                    Some((_, _, labels)) => labels[idx],
+                    None => 0, // file-less: comp 0 (air)
+                };
+                let lb = match &fb {
+                    Some((_, _, labels)) => labels[idx],
+                    None => 0,
+                };
+                if la != FACE_SOLID && lb != FACE_SOLID {
+                    uf.union(component_base[a] + la as u32, component_base[b] + lb as u32);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Run the full classification (build components → stitch → close). Surface scatter must already be done.
+    fn classify(grid: &TileGrid, scatter: &ScatterResult) -> std::io::Result<Classification> {
+        let (component_base, component_count, components) = build_components(grid, scatter)?;
+        stitch_and_close(grid, &component_base, &component_count, &components)
+    }
+
+    /// Whether a given air cell is EXTERIOR (open) under the classification — `exterior_root[find(node)]`. For a
+    /// file-less tile every air cell is component 0.
+    impl Classification {
+        fn is_exterior(&mut self, tile_id: usize, comp: u16) -> bool {
+            let node = self.component_base[tile_id] + comp as u32;
+            let root = self.uf.find(node);
+            self.exterior_root[root as usize]
+        }
+    }
+
+    /// A finalized tile's solid cells, streamed to the assembly: its tile coords + the per-solid-cell global
+    /// index + albedo. The fill pass produces these lazily (one tile at a time) so the assembly never holds the
+    /// whole grid resident.
+    pub struct FinalTile {
+        pub id: usize,
+        /// `(global_cell_index, rgba)` for every SOLID cell in this tile (surface + enclosed-fill), sorted by
+        /// global index (deterministic).
+        pub solids: Vec<(usize, [u8; 4])>,
+    }
+
+    /// The FILL pass over one tile: load `.occ` (or treat a file-less tile as all-air), recompute the local
+    /// labeling, classify each air cell (enclosed → solid with nearest-surface albedo), and return the tile's
+    /// finalized solid cells. A file-less ENCLOSED tile becomes a uniform-solid block (every cell solid). The
+    /// interior albedo is a per-tile nearest-surface BFS seeded by the tile's surface cells PLUS a 1-voxel halo
+    /// imported from the 6 neighbour tiles' shared faces (§C1.6 option A).
+    fn fill_tile(grid: &TileGrid, scatter: &ScatterResult, cls: &mut Classification, id: usize) -> std::io::Result<FinalTile> {
+        let (tx, ty, tz) = grid.tile_xyz(id);
+        let ext = grid.tile_extent(tx, ty, tz);
+        let [ex, ey, ez] = ext;
+        let n = (ex as usize) * (ey as usize) * (ez as usize);
+
+        if !scatter.has_file[id] {
+            // File-less tile: one all-air component. If it is exterior → all air (no solids); else uniform solid.
+            if cls.is_exterior(id, 0) {
+                return Ok(FinalTile { id, solids: Vec::new() });
+            }
+            // Enclosed buried tile → uniform solid. Colour = the halo-imported nearest surface colour (or a
+            // neutral grey if utterly surrounded by other buried tiles — interiors are cosmetic, §C1.6).
+            let halo = import_halo_albedo(grid, scatter, id, ext)?;
+            let fill_col = halo.values().next().copied().unwrap_or([128, 128, 128, 255]);
+            let mut solids = Vec::with_capacity(n);
+            for lz in 0..ez {
+                for ly in 0..ey {
+                    for lx in 0..ex {
+                        solids.push((grid.global_index(tx, ty, tz, lx, ly, lz), fill_col));
+                    }
+                }
+            }
+            solids.sort_unstable_by_key(|&(gi, _)| gi);
+            return Ok(FinalTile { id, solids });
+        }
+
+        let occ = read_occ(&grid.occ_path(id))?;
+        let (label, _c) = label_tile(&occ);
+        let surf_alb = read_alb(&grid.alb_path(id))?;
+
+        // Decide solid vs air per cell: occupied → solid (surface); air whose component is NOT exterior →
+        // enclosed solid. Build the SOLID mask + seed the interior-colour BFS from surface cells + the halo.
+        let mut solid = vec![false; n];
+        let mut color = vec![[0u8; 4]; n];
+        for lz in 0..ez {
+            for ly in 0..ey {
+                for lx in 0..ex {
+                    let li = occ.local_index(lx, ly, lz);
+                    if occ.get(li) {
+                        solid[li] = true;
+                        color[li] = surf_alb.get(&(li as u32)).copied().unwrap_or([128, 128, 128, 255]);
+                    } else {
+                        let comp = label[li];
+                        debug_assert!(comp != FACE_SOLID, "air cell must have an air component");
+                        if !cls.is_exterior(id, comp) {
+                            solid[li] = true; // enclosed → solid (colour assigned by the BFS below)
+                        }
+                    }
+                }
+            }
+        }
+        // Import the 1-voxel halo colours from neighbour faces (so colour propagates across tile seams): a halo
+        // entry colours a boundary solid cell ONLY where this tile's own surface didn't already colour it.
+        let halo = import_halo_albedo(grid, scatter, id, ext)?;
+        for (li, col) in halo {
+            let li = li as usize;
+            if solid[li] && color[li] == [0u8; 4] {
+                color[li] = col;
+            }
+        }
+        // Multi-source 6-connected BFS over the ENCLOSED solids, colouring each newly-filled cell with its
+        // nearest surface colour. Re-seed deterministically: surface+halo seeds sorted by local index (so the
+        // BFS frontier order — and thus tie-broken interior colours — is independent of map iteration order).
+        let mut seeds: Vec<usize> = (0..n).filter(|&li| solid[li] && color[li] != [0u8; 4]).collect();
+        seeds.sort_unstable();
+        let mut q2: VecDeque<usize> = seeds.into_iter().collect();
+        let mut visited = vec![false; n];
+        for &li in q2.iter() {
+            visited[li] = true;
+        }
+        while let Some(li) = q2.pop_front() {
+            let (lx, ly, lz) = local_xyz(li, ext);
+            let src = color[li];
+            for (ox, oy, oz) in N6 {
+                let (nx, ny, nz) = (lx + ox, ly + oy, lz + oz);
+                if nx < 0 || ny < 0 || nz < 0 || nx >= ex || ny >= ey || nz >= ez {
+                    continue;
+                }
+                let ni = occ.local_index(nx, ny, nz);
+                if solid[ni] && !visited[ni] {
+                    visited[ni] = true;
+                    if color[ni] == [0u8; 4] {
+                        color[ni] = src;
+                    }
+                    q2.push_back(ni);
+                }
+            }
+        }
+
+        // Emit the finalized solids (sorted by global index). Any enclosed cell the BFS never coloured (a tile
+        // with NO surface seed at all but enclosed by neighbours) gets the neutral fallback — cosmetic.
+        let mut solids = Vec::new();
+        for lz in 0..ez {
+            for ly in 0..ey {
+                for lx in 0..ex {
+                    let li = occ.local_index(lx, ly, lz);
+                    if solid[li] {
+                        let col = if color[li] == [0u8; 4] { [128, 128, 128, 255] } else { color[li] };
+                        solids.push((grid.global_index(tx, ty, tz, lx, ly, lz), col));
+                    }
+                }
+            }
+        }
+        solids.sort_unstable_by_key(|&(gi, _)| gi);
+        Ok(FinalTile { id, solids })
+    }
+
+    /// Local `(lx,ly,lz)` of a local index within a `[ex,ey,ez]` tile extent.
+    #[inline]
+    fn local_xyz(li: usize, ext: [i32; 3]) -> (i32, i32, i32) {
+        let (ex, ey) = (ext[0] as usize, ext[1] as usize);
+        let lz = li / (ex * ey);
+        let r = li % (ex * ey);
+        ((r % ex) as i32, (r / ex) as i32, lz as i32)
+    }
+
+    /// Import the 1-voxel halo surface colours from the 6 neighbour tiles' SHARED faces: for each face, read the
+    /// neighbour's opposite-face surface albedo (if it has a file) and map it to THIS tile's boundary local
+    /// cell. Returns `local_index → rgba` halo colours (a seed source for the interior-colour BFS). Bounded: a
+    /// face is T² entries. (§C1.6 option A — colour-only; never affects occupancy.)
+    fn import_halo_albedo(
+        grid: &TileGrid,
+        scatter: &ScatterResult,
+        id: usize,
+        ext: [i32; 3],
+    ) -> std::io::Result<std::collections::HashMap<u32, [u8; 4]>> {
+        let (tx, ty, tz) = grid.tile_xyz(id);
+        let [ex, ey, ez] = ext;
+        let mut halo: std::collections::HashMap<u32, [u8; 4]> = std::collections::HashMap::new();
+        // For each of the 6 neighbours that exists + has a file, pull its boundary surface colours onto our face.
+        let neighbours: [(i32, i32, i32, usize); 6] = [
+            (tx + 1, ty, tz, FACE_PX),
+            (tx - 1, ty, tz, FACE_NX),
+            (tx, ty + 1, tz, FACE_PY),
+            (tx, ty - 1, tz, FACE_NY),
+            (tx, ty, tz + 1, FACE_PZ),
+            (tx, ty, tz - 1, FACE_NZ),
+        ];
+        for (nx, ny, nz, my_face) in neighbours {
+            if nx < 0 || ny < 0 || nz < 0 || nx >= grid.tnx || ny >= grid.tny || nz >= grid.tnz {
+                continue;
+            }
+            let nid = grid.tile_id(nx, ny, nz);
+            if !scatter.has_file[nid] {
+                continue; // a file-less neighbour has no surface to import
+            }
+            let nalb = read_alb(&grid.alb_path(nid))?;
+            if nalb.is_empty() {
+                continue;
+            }
+            let nocc = read_occ(&grid.occ_path(nid))?;
+            let [nex, ney, nez] = nocc.ext;
+            // The neighbour's OPPOSITE face touching ours: if my_face is +X, the neighbour's −X face (its lx=0)
+            // maps to my +X boundary (my lx=ex-1), same (y,z) in-face coord.
+            match my_face {
+                FACE_PX => {
+                    for b in 0..ez.min(nez) {
+                        for a in 0..ey.min(ney) {
+                            let nli = nocc.local_index(0, a, b) as u32;
+                            if let Some(&c) = nalb.get(&nli) {
+                                let mli = (ex - 1) as usize + (a as usize) * (ex as usize) + (b as usize) * (ex as usize) * (ey as usize);
+                                halo.entry(mli as u32).or_insert(c);
+                            }
+                        }
+                    }
+                }
+                FACE_NX => {
+                    for b in 0..ez.min(nez) {
+                        for a in 0..ey.min(ney) {
+                            let nli = nocc.local_index(nex - 1, a, b) as u32;
+                            if let Some(&c) = nalb.get(&nli) {
+                                let mli = (a as usize) * (ex as usize) + (b as usize) * (ex as usize) * (ey as usize);
+                                halo.entry(mli as u32).or_insert(c);
+                            }
+                        }
+                    }
+                }
+                FACE_PY => {
+                    for b in 0..ez.min(nez) {
+                        for a in 0..ex.min(nex) {
+                            let nli = nocc.local_index(a, 0, b) as u32;
+                            if let Some(&c) = nalb.get(&nli) {
+                                let mli = (a as usize) + ((ey - 1) as usize) * (ex as usize) + (b as usize) * (ex as usize) * (ey as usize);
+                                halo.entry(mli as u32).or_insert(c);
+                            }
+                        }
+                    }
+                }
+                FACE_NY => {
+                    for b in 0..ez.min(nez) {
+                        for a in 0..ex.min(nex) {
+                            let nli = nocc.local_index(a, ney - 1, b) as u32;
+                            if let Some(&c) = nalb.get(&nli) {
+                                let mli = (a as usize) + (b as usize) * (ex as usize) * (ey as usize);
+                                halo.entry(mli as u32).or_insert(c);
+                            }
+                        }
+                    }
+                }
+                FACE_PZ => {
+                    for b in 0..ey.min(ney) {
+                        for a in 0..ex.min(nex) {
+                            let nli = nocc.local_index(a, b, 0) as u32;
+                            if let Some(&c) = nalb.get(&nli) {
+                                let mli = (a as usize) + (b as usize) * (ex as usize) + ((ez - 1) as usize) * (ex as usize) * (ey as usize);
+                                halo.entry(mli as u32).or_insert(c);
+                            }
+                        }
+                    }
+                }
+                _ => {
+                    for b in 0..ey.min(ney) {
+                        for a in 0..ex.min(nex) {
+                            let nli = nocc.local_index(a, b, nez - 1) as u32;
+                            if let Some(&c) = nalb.get(&nli) {
+                                let mli = (a as usize) + (b as usize) * (ex as usize);
+                                halo.entry(mli as u32).or_insert(c);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Ok(halo)
+    }
+
+    /// The full tiled bake: surface scatter → classify → FILL each tile, persisting every finalized tile's solid
+    /// cells to a `tile_{id}.fin` disk file (one tile at a time, bounded RAM). Tiles are processed in tile-id
+    /// order (deterministic). Returns the total solid count + the sorted ids of the tiles that produced solids,
+    /// so the assembly can STREAM them (twice: once to build the palette, once to emit) without re-running the
+    /// flood. This is the bounded-RAM entry point the offline tool + the gates call.
+    pub fn bake_tiled(
+        grid: &TileGrid,
+        mesh: &Mesh,
+        origin: [f32; 3],
+        voxel_size: f32,
+        supersample: usize,
+    ) -> anyhow::Result<(usize, Vec<usize>)> {
+        let scatter = scatter_surface(grid, mesh, origin, voxel_size, supersample)?;
+        let mut cls = classify(grid, &scatter)?;
+        let mut total = 0usize;
+        let mut final_ids: Vec<usize> = Vec::new();
+        for id in 0..grid.tile_count() {
+            let ft = fill_tile(grid, &scatter, &mut cls, id)?;
+            if !ft.solids.is_empty() {
+                total += ft.solids.len();
+                write_final(&grid.fin_path(ft.id), &ft.solids)?;
+                final_ids.push(ft.id);
+            }
+        }
+        Ok((total, final_ids))
+    }
+
+    impl TileGrid {
+        fn fin_path(&self, id: usize) -> PathBuf {
+            self.scratch.join(format!("tile_{id}.fin"))
+        }
+    }
+
+    /// Write a finalized tile's solids as `(global_index:u64, rgba:[u8;4])` runs (sorted by global index).
+    fn write_final(path: &Path, solids: &[(usize, [u8; 4])]) -> std::io::Result<()> {
+        let mut f = std::io::BufWriter::new(std::fs::File::create(path)?);
+        for &(gi, rgba) in solids {
+            f.write_all(&(gi as u64).to_le_bytes())?;
+            f.write_all(&rgba)?;
+        }
+        f.flush()
+    }
+
+    /// Stream every solid cell of the finalized tiles `ids` (in id order) to `f` as `(global_index, rgba)`,
+    /// reading one `.fin` file at a time (bounded RAM). The assembly calls this twice — palette build + emit.
+    pub fn stream_final<F: FnMut(usize, [u8; 4])>(grid: &TileGrid, ids: &[usize], mut f: F) -> std::io::Result<()> {
+        for &id in ids {
+            let bytes = std::fs::read(grid.fin_path(id))?;
+            let mut i = 0;
+            while i + 12 <= bytes.len() {
+                let gi = u64::from_le_bytes(bytes[i..i + 8].try_into().unwrap()) as usize;
+                let rgba = [bytes[i + 8], bytes[i + 9], bytes[i + 10], bytes[i + 11]];
+                f(gi, rgba);
+                i += 12;
+            }
+        }
+        Ok(())
+    }
+
+    /// TEST-ONLY: run the tiled enclosure flood (scatter → classify → fill) over an EXPLICIT surface occupancy
+    /// `surface[global_index]` (the bitset a real mesh's SAT would produce), bypassing the mesh scatter so the
+    /// oracle can construct the exact hard cases (cracks crossing tiles, S-tunnels, buried tiles, twin cavities)
+    /// directly. Returns the global-cell index set of EVERY solid cell after fill — the classification the
+    /// oracle compares CELL-FOR-CELL against the monolithic `solid_fill`. Writes/cleans its own scratch under
+    /// `scratch`.
+    #[cfg(test)]
+    pub fn classify_from_surface(
+        dims: [i32; 3],
+        tile_edge: i32,
+        scratch: PathBuf,
+        surface: &[bool],
+    ) -> std::io::Result<std::collections::HashSet<usize>> {
+        std::fs::create_dir_all(&scratch)?;
+        let grid = TileGrid::new(dims, tile_edge, scratch.clone());
+        // Scatter the explicit surface into per-tile .occ/.alb files (a single uniform albedo — colour is
+        // irrelevant to the enclosure classification the oracle checks).
+        let n_tiles = grid.tile_count();
+        let mut tile_occ: Vec<Option<TileOcc>> = (0..n_tiles).map(|_| None).collect();
+        let (dx, dy) = (dims[0] as usize, dims[1] as usize);
+        for (gi, &is_solid) in surface.iter().enumerate() {
+            if !is_solid {
+                continue;
+            }
+            let z = (gi / (dx * dy)) as i32;
+            let r = gi % (dx * dy);
+            let x = (r % dx) as i32;
+            let y = (r / dx) as i32;
+            let (tx, ty, tz) = grid.tile_of(x, y, z);
+            let id = grid.tile_id(tx, ty, tz);
+            let ext = grid.tile_extent(tx, ty, tz);
+            let occ = tile_occ[id].get_or_insert_with(|| TileOcc::new(ext));
+            let li = occ.local_index(x - tx * grid.tile_edge, y - ty * grid.tile_edge, z - tz * grid.tile_edge);
+            occ.set(li);
+        }
+        let mut has_file = vec![false; n_tiles];
+        for id in 0..n_tiles {
+            if let Some(occ) = &tile_occ[id] {
+                write_occ(&grid.occ_path(id), occ)?;
+                write_alb(&grid.alb_path(id), &std::collections::BTreeMap::new())?;
+                has_file[id] = true;
+            }
+        }
+        let scatter = ScatterResult { has_file };
+        let mut cls = classify(&grid, &scatter)?;
+        let mut solids = std::collections::HashSet::new();
+        for id in 0..grid.tile_count() {
+            let ft = fill_tile(&grid, &scatter, &mut cls, id)?;
+            for (gi, _) in ft.solids {
+                solids.insert(gi);
+            }
+        }
+        let _ = std::fs::remove_dir_all(&scratch);
+        Ok(solids)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2218,5 +3482,480 @@ f 1 3 4
         // Halfway between the two centres (u = 0.5) → average grey (~128).
         let mid = tex.sample(0.5, 0.5)[0];
         assert!((mid as i32 - 128).abs() <= 1, "midway between texels → bilinear average (~128, got {mid})");
+    }
+
+    // ----------------------------------------------------------------------------------------
+    // C1 — tiled out-of-core voxelizer gates (oracle / determinism / bounded-RAM / no-regression)
+    // ----------------------------------------------------------------------------------------
+
+    /// The MONOLITHIC oracle's solid set over an EXPLICIT surface occupancy: build a `Grid` with exactly
+    /// `surface` set solid, run the production `solid_fill`, and return the global-cell index set of every solid
+    /// cell. The tiled path's [`tiled::classify_from_surface`] must reproduce this CELL-FOR-CELL. Decoupling the
+    /// occupancy from a mesh lets the oracle construct the hard cases (cracks, S-tunnels, buried tiles) exactly.
+    fn monolithic_solid_set(dims: [i32; 3], surface: &[bool]) -> std::collections::HashSet<usize> {
+        let mut g = Grid::new(dims);
+        for (gi, &s) in surface.iter().enumerate() {
+            if s {
+                g.set_solid(gi, [200, 100, 50, 255]);
+            }
+        }
+        solid_fill(&mut g);
+        // The solid set = every cell whose occupancy bit is now set.
+        let total = (dims[0] as usize) * (dims[1] as usize) * (dims[2] as usize);
+        (0..total).filter(|&i| g.is_solid(i)).collect()
+    }
+
+    /// Run the tiled flood over `surface` at `tile_edge` and assert the solid set is CELL-FOR-CELL identical to
+    /// the monolithic oracle. Returns the (shared) solid set for further assertions.
+    fn assert_oracle_match(
+        name: &str,
+        dims: [i32; 3],
+        surface: &[bool],
+        tile_edge: i32,
+    ) -> std::collections::HashSet<usize> {
+        let oracle = monolithic_solid_set(dims, surface);
+        let scratch = std::env::temp_dir().join(format!(
+            "voxelize_oracle_{name}_{}_{}",
+            std::process::id(),
+            tile_edge
+        ));
+        let tiled_set =
+            tiled::classify_from_surface(dims, tile_edge, scratch, surface).expect("tiled classify");
+        // Cell-for-cell: same cardinality AND same membership (a symmetric-difference would be a wrong enclosure).
+        assert_eq!(
+            tiled_set.len(),
+            oracle.len(),
+            "{name}: tiled solid count {} != oracle {} (TILE_EDGE={tile_edge})",
+            tiled_set.len(),
+            oracle.len()
+        );
+        let diff: Vec<usize> = oracle.symmetric_difference(&tiled_set).copied().collect();
+        assert!(
+            diff.is_empty(),
+            "{name}: tiled flood differs from the monolithic oracle at {} cells (TILE_EDGE={tile_edge}); \
+             first divergent global index {:?}",
+            diff.len(),
+            diff.first()
+        );
+        oracle
+    }
+
+    /// A linear index helper for the hard-case scene builders.
+    fn gidx(dims: [i32; 3], x: i32, y: i32, z: i32) -> usize {
+        (x as usize) + (y as usize) * (dims[0] as usize) + (z as usize) * (dims[0] as usize) * (dims[1] as usize)
+    }
+
+    /// **THE ORACLE GATE (§C1.9.1): the tiled flood is CELL-FOR-CELL identical to the monolithic `solid_fill`**,
+    /// over all four hard cases, with a SMALL `TILE_EDGE` so each scene spans many tiles (the union-find stitch
+    /// is exercised, not just the per-tile local flood). The cases:
+    ///  (a) a SEALED box (enclosed → its cavity fills) vs the same box with a 1-voxel crack to the boundary whose
+    ///      leak path CROSSES ≥2 tiles (open → stays air) — this is the union-find-stitch proof.
+    ///  (b) a cavity reachable only via a long S-tunnel spanning many tiles (transitive exterior across tiles).
+    ///  (c) a fully-buried FILE-LESS tile (no surface) that is ENCLOSED → uniform-solid, AND one that is exterior
+    ///      → air (the file-less-tile component-enumeration guard).
+    ///  (d) two adjacent INDEPENDENT cavities (distinct union-find sets, both enclosed).
+    /// Each is checked at `TILE_EDGE` 8 AND 16 (different tilings of the same scene → same answer).
+    #[test]
+    fn tiled_flood_matches_monolithic_oracle_on_hard_cases() {
+        for &t in &[8i32, 16] {
+            // ---- (a) sealed box vs a box with a ≥2-tile crack. A 30³ grid; a hollow box shell spanning the
+            // middle so its walls + the crack cross several tile boundaries at T=8. ----
+            let dims = [30, 30, 30];
+            let n = (dims[0] * dims[1] * dims[2]) as usize;
+            let in_box = |x: i32, y: i32, z: i32| (5..=24).contains(&x) && (5..=24).contains(&y) && (5..=24).contains(&z);
+            let on_shell = |x: i32, y: i32, z: i32| {
+                in_box(x, y, z) && (x == 5 || x == 24 || y == 5 || y == 24 || z == 5 || z == 24)
+            };
+            // Sealed: the full shell. Its interior (6..23)³ is one enclosed cavity → fills solid.
+            let mut sealed = vec![false; n];
+            for z in 0..dims[2] {
+                for y in 0..dims[1] {
+                    for x in 0..dims[0] {
+                        if on_shell(x, y, z) {
+                            sealed[gidx(dims, x, y, z)] = true;
+                        }
+                    }
+                }
+            }
+            let sealed_set = assert_oracle_match("sealed_box", dims, &sealed, t);
+            // The cavity centre IS filled in the sealed case (enclosed).
+            assert!(sealed_set.contains(&gidx(dims, 15, 15, 15)), "sealed box: the enclosed cavity fills solid");
+
+            // Cracked: remove a 1-voxel-wide COLUMN of the -X wall AND carve an air channel from that hole out to
+            // the grid boundary (x: 0..5 at the same (y,z)), so the leak path runs x=0→24 — crossing tiles
+            // x∈{0..7},{8..15},{16..23},{24..} at T=8 (≥2 tiles). The cavity now reaches outside → stays air.
+            let mut cracked = sealed.clone();
+            let (cy, cz) = (15, 15);
+            // Poke the wall hole at (5,cy,cz) and ensure the channel (0..=4, cy, cz) is air (it already is —
+            // nothing was solid there). Removing the shell voxel at x=5 opens the cavity to the air channel,
+            // which runs to x=0 (the grid boundary) → exterior.
+            cracked[gidx(dims, 5, cy, cz)] = false;
+            let cracked_set = assert_oracle_match("cracked_box", dims, &cracked, t);
+            assert!(
+                !cracked_set.contains(&gidx(dims, 15, 15, 15)),
+                "cracked box: the cavity leaks to the boundary across ≥2 tiles → stays air"
+            );
+
+            // ---- (b) an S-tunnel: an enclosed pocket connected to the outside ONLY by a long thin air channel
+            // that snakes across many tiles. We carve the channel out of an otherwise-solid SLAB so the only air
+            // is the tunnel + the pocket; the pocket is therefore exterior (reaches the boundary via the S). ----
+            let sdims = [24, 9, 5];
+            let sn = (sdims[0] * sdims[1] * sdims[2]) as usize;
+            let mut slab = vec![true; sn]; // start fully solid
+            // Carve an S-shaped 1-voxel air tunnel at z=2: go +X along y=2, up to y=6, back -X, reaching x=0.
+            let carve = |v: &mut [bool], x: i32, y: i32, z: i32| v[gidx(sdims, x, y, z)] = false;
+            for x in 0..=20 {
+                carve(&mut slab, x, 2, 2);
+            }
+            for y in 2..=6 {
+                carve(&mut slab, 20, y, 2);
+            }
+            for x in 0..=20 {
+                carve(&mut slab, x, 6, 2);
+            }
+            // The tunnel reaches x=0 at both ends (the grid boundary) → all carved air is exterior. The oracle
+            // must keep EXACTLY the carved cells air; the tiled path must agree across the many tiles the S spans.
+            let s_set = assert_oracle_match("s_tunnel", sdims, &slab, t);
+            assert!(!s_set.contains(&gidx(sdims, 10, 2, 2)), "S-tunnel: the channel stays air (reaches boundary)");
+            assert!(s_set.contains(&gidx(sdims, 10, 4, 2)), "S-tunnel: the solid between the channel arms stays solid");
+
+            // ---- (c) a fully-buried FILE-LESS tile. A grid ≥ 3 tiles per axis; fill the MIDDLE region solid as
+            // a shell around a tile-sized buried cavity that has NO surface inside it (so its tile is file-less),
+            // enclosed → must become uniform solid. Plus a file-less tile OUTSIDE the solid → exterior → air. ----
+            // Use T=8 specific geometry: a 24³ grid = 3×3×3 tiles. Make tile (1,1,1) [coords 8..16] fully buried:
+            // surround it with a solid shell one voxel thick just outside the tile, leaving the tile's interior
+            // (8..16)³ entirely air with no surface → file-less. It is enclosed → fills solid.
+            if t == 8 {
+                let bdims = [24, 24, 24];
+                let bn = (bdims[0] * bdims[1] * bdims[2]) as usize;
+                let mut buried = vec![false; bn];
+                // A solid shell on the faces just outside tile (1,1,1): the planes x=7,x=16,y=7,y=16,z=7,z=16
+                // over the 7..=16 cube → encloses the 8..15 cube (the file-less middle tile) with no interior
+                // surface. (The shell voxels live in neighbouring tiles, so the middle tile has NO file.)
+                for z in 7..=16 {
+                    for y in 7..=16 {
+                        for x in 7..=16 {
+                            let on = x == 7 || x == 16 || y == 7 || y == 16 || z == 7 || z == 16;
+                            if on {
+                                buried[gidx(bdims, x, y, z)] = true;
+                            }
+                        }
+                    }
+                }
+                let bset = assert_oracle_match("buried_fileless_tile", bdims, &buried, 8);
+                // The buried file-less tile's centre is enclosed → solid.
+                assert!(bset.contains(&gidx(bdims, 12, 12, 12)), "buried file-less tile: enclosed → uniform solid");
+                // A far-away file-less tile (e.g. tile (0,0,0) corner away from the shell) is exterior → air.
+                assert!(!bset.contains(&gidx(bdims, 1, 1, 1)), "a far file-less tile is exterior → stays air");
+            }
+
+            // ---- (d) two adjacent INDEPENDENT cavities (distinct union-find sets, both enclosed). Two sealed
+            // boxes side by side sharing a solid wall; each cavity fills independently. ----
+            let ddims = [20, 12, 12];
+            let dn = (ddims[0] * ddims[1] * ddims[2]) as usize;
+            let mut twin = vec![false; dn];
+            // Box A shell over x:2..=8, box B shell over x:11..=17, both y,z:2..=9. The wall at x=8..11 region
+            // separates them; each interior is its own enclosed cavity.
+            let shell = |v: &mut [bool], x0: i32, x1: i32| {
+                for z in 2..=9 {
+                    for y in 2..=9 {
+                        for x in x0..=x1 {
+                            let on = x == x0 || x == x1 || y == 2 || y == 9 || z == 2 || z == 9;
+                            if on {
+                                v[gidx(ddims, x, y, z)] = true;
+                            }
+                        }
+                    }
+                }
+            };
+            shell(&mut twin, 2, 8);
+            shell(&mut twin, 11, 17);
+            let tset = assert_oracle_match("twin_cavities", ddims, &twin, t);
+            assert!(tset.contains(&gidx(ddims, 5, 5, 5)), "twin cavities: cavity A fills");
+            assert!(tset.contains(&gidx(ddims, 14, 5, 5)), "twin cavities: cavity B fills");
+            // The gap between them (x=9,10 at the boxes' mid-height) is OUTSIDE both shells → exterior → air.
+            assert!(!tset.contains(&gidx(ddims, 9, 5, 0)), "the space outside both boxes stays air");
+        }
+    }
+
+    /// **DETERMINISM (§C1.9.2): the tiled solid mask is reproducible** — the same scene baked twice yields the
+    /// identical solid set, AND two DIFFERENT `TILE_EDGE`s yield the identical solid set (the partition is a
+    /// fixed function of tile ids, independent of the tiling granularity).
+    #[test]
+    fn tiled_flood_is_deterministic_across_tile_edges() {
+        // A mixed scene: a sealed box (enclosed cavity) + a separate open shell (a cavity reaching the boundary).
+        let dims = [28, 20, 20];
+        let n = (dims[0] * dims[1] * dims[2]) as usize;
+        let mut surface = vec![false; n];
+        // Sealed box shell at x:2..=10, y,z:2..=10.
+        for z in 2..=10 {
+            for y in 2..=10 {
+                for x in 2..=10 {
+                    if x == 2 || x == 10 || y == 2 || y == 10 || z == 2 || z == 10 {
+                        surface[gidx(dims, x, y, z)] = true;
+                    }
+                }
+            }
+        }
+        // Open shell at x:14..=22 with a hole in the +X-most wall opening to the boundary side.
+        for z in 2..=10 {
+            for y in 2..=10 {
+                for x in 14..=22 {
+                    if x == 14 || x == 22 || y == 2 || y == 10 || z == 2 || z == 10 {
+                        surface[gidx(dims, x, y, z)] = true;
+                    }
+                }
+            }
+        }
+        surface[gidx(dims, 22, 6, 6)] = false; // poke the +X wall → that cavity leaks out
+
+        let bake = |t: i32, tag: &str| {
+            let scratch = std::env::temp_dir().join(format!("voxelize_det_{tag}_{}", std::process::id()));
+            tiled::classify_from_surface(dims, t, scratch, &surface).expect("tiled classify")
+        };
+        let a8 = bake(8, "a8");
+        let b8 = bake(8, "b8");
+        assert_eq!(a8, b8, "same scene + same TILE_EDGE → identical solid mask (reproducible)");
+        let a16 = bake(16, "a16");
+        assert_eq!(a8, a16, "two different TILE_EDGEs → identical solid mask (granularity-independent)");
+        // And it matches the monolithic oracle (the classification is correct, not just self-consistent).
+        let oracle = monolithic_solid_set(dims, &surface);
+        assert_eq!(a8, oracle, "the deterministic tiled mask equals the monolithic oracle");
+    }
+
+    /// **BOUNDED RAM (§C1.9.3): a large-AABB SPARSE scene bakes through the tiled path with a peak-RSS probe
+    /// under the budget.** The synthetic scene is a big hollow box (a large AABB, sparse surface) at a fine grid
+    /// so it spans MANY tiles; the tiled path holds only one tile's working set + the (small) union-find at a
+    /// time, so peak RAM stays well under 4 GiB regardless of the AABB volume. (Bistro adds the real asset when
+    /// present — that bake is documented in `docs/TESTING.md` as a separate long run; this unit test always runs.)
+    #[test]
+    fn tiled_bake_bounded_ram_on_large_sparse_scene() {
+        // 200³ = 8 M cells; a hollow box shell (sparse) → ~240 K surface cells. At T=32 that is ~7³ tiles. The
+        // dense monolithic occupancy would be 1 MB here (small), but the POINT is the tiled path's peak is a few
+        // tiles (32³ bits = 4 KiB occ + 32 KiB label each) + union-find (a few hundred components) — KB-scale
+        // working set independent of the 8 M-cell volume.
+        let dims = [200, 200, 200];
+        let n = (dims[0] * dims[1] * dims[2]) as usize;
+        let mut surface = vec![false; n];
+        for z in 10..=189 {
+            for y in 10..=189 {
+                for x in 10..=189 {
+                    if x == 10 || x == 189 || y == 10 || y == 189 || z == 10 || z == 189 {
+                        surface[gidx(dims, x, y, z)] = true;
+                    }
+                }
+            }
+        }
+        let rss_before = peak_rss_bytes();
+        let scratch = std::env::temp_dir().join(format!("voxelize_ram_{}", std::process::id()));
+        let solids = tiled::classify_from_surface(dims, 32, scratch, &surface).expect("tiled classify");
+        let rss_after = peak_rss_bytes();
+        // The box is sealed → its whole interior fills: solids ≈ the full 180³ cube.
+        assert!(solids.len() > 5_000_000, "the sealed large box fills its interior solid (got {})", solids.len());
+        // Peak RSS budget. The probe is the process peak; we assert the DELTA stays well under the 4 GiB budget
+        // (the absolute peak includes the test harness baseline). The surface bitset the test itself holds (8 M
+        // bools = 8 MB) + the solid HashSet (~5 M usizes ≈ 40 MB) dominate here, NOT the tiled working set.
+        let budget = 4u64 * 1024 * 1024 * 1024;
+        if let (Some(before), Some(after)) = (rss_before, rss_after) {
+            assert!(after < budget, "peak RSS {after} bytes exceeds the 4 GiB budget");
+            eprintln!(
+                "tiled bounded-RAM: peak RSS {:.1} MiB (delta {:.1} MiB over the bake), budget 4096 MiB",
+                after as f64 / (1024.0 * 1024.0),
+                (after.saturating_sub(before)) as f64 / (1024.0 * 1024.0),
+            );
+        } else {
+            eprintln!("tiled bounded-RAM: peak-RSS probe unavailable on this platform — correctness still checked");
+        }
+    }
+
+    /// Best-effort PEAK resident-set bytes for THIS process (the bounded-RAM probe). Windows: `GetProcessMemoryInfo`
+    /// `PeakWorkingSetSize`. Other platforms return `None` (the test then skips the RSS assertion, keeping the
+    /// correctness check). No external crate — a tiny `windows-sys`-free FFI to `psapi`.
+    fn peak_rss_bytes() -> Option<u64> {
+        #[cfg(windows)]
+        {
+            // PROCESS_MEMORY_COUNTERS: cb, PageFaultCount, PeakWorkingSetSize, WorkingSetSize, ...
+            #[repr(C)]
+            struct ProcessMemoryCounters {
+                cb: u32,
+                page_fault_count: u32,
+                peak_working_set_size: usize,
+                working_set_size: usize,
+                quota_peak_paged_pool_usage: usize,
+                quota_paged_pool_usage: usize,
+                quota_peak_non_paged_pool_usage: usize,
+                quota_non_paged_pool_usage: usize,
+                pagefile_usage: usize,
+                peak_pagefile_usage: usize,
+            }
+            unsafe extern "system" {
+                fn GetCurrentProcess() -> isize;
+                fn K32GetProcessMemoryInfo(process: isize, counters: *mut ProcessMemoryCounters, cb: u32) -> i32;
+            }
+            let mut pmc: ProcessMemoryCounters = unsafe { std::mem::zeroed() };
+            pmc.cb = std::mem::size_of::<ProcessMemoryCounters>() as u32;
+            let ok = unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), &mut pmc, pmc.cb) };
+            if ok != 0 { Some(pmc.peak_working_set_size as u64) } else { None }
+        }
+        #[cfg(not(windows))]
+        {
+            None
+        }
+    }
+
+    /// **NO REGRESSION (§C1.9.4): small scenes bake the SAME through the tiled path with a LARGE `TILE_EDGE` (a
+    /// single tile = the degenerate case == today).** Routes the existing `solid_fill_closes_enclosed_but_keeps_
+    /// open_air` scene through the tiled flood at a tile edge ≥ the grid extent (one tile) and asserts the solid
+    /// set equals the monolithic oracle — the degenerate single-tile case must reproduce the monolithic path.
+    #[test]
+    fn tiled_single_tile_matches_monolithic_small_scene() {
+        // The 5³ enclosed-cavity scene from `solid_fill_closes_enclosed_but_keeps_open_air`, as a surface bitset.
+        let dims = [5, 5, 5];
+        let build = |open_face: bool| {
+            let n = (dims[0] * dims[1] * dims[2]) as usize;
+            let mut s = vec![false; n];
+            for z in 1..=3 {
+                for y in 1..=3 {
+                    for x in 1..=3 {
+                        if x == 1 || x == 3 || y == 1 || y == 3 || z == 1 || z == 3 {
+                            if open_face && (x, y, z) == (2, 1, 2) {
+                                continue;
+                            }
+                            s[gidx(dims, x, y, z)] = true;
+                        }
+                    }
+                }
+            }
+            s
+        };
+        // A LARGE tile edge (≥5) ⇒ one tile ⇒ the degenerate (monolithic-equivalent) case.
+        for big in [5i32, 64] {
+            let closed = assert_oracle_match("small_closed", dims, &build(false), big);
+            assert!(closed.contains(&gidx(dims, 2, 2, 2)), "closed shell: the cavity fills (single-tile)");
+            let open = assert_oracle_match("small_open", dims, &build(true), big);
+            assert!(!open.contains(&gidx(dims, 2, 2, 2)), "open shell: the cavity stays air (single-tile)");
+        }
+    }
+
+    /// **No-regression for the fallback room (§C1.9.4):** the procedural room baked through the FULL tiled bake
+    /// (mesh → tiled scatter → flood → fill → solids) with a large single tile produces the SAME solid set as the
+    /// monolithic `voxelize` + `solid_fill`. Exercises the real mesh-scatter path (not just the explicit-surface
+    /// oracle helper), proving the tiled surface scatter matches the monolithic surface SAT cell-for-cell.
+    #[test]
+    fn tiled_full_bake_matches_monolithic_on_fallback_room() {
+        let mesh = fallback_room();
+        let voxel = 1.0;
+        let (origin, dims) = grid_geometry(&mesh, voxel).expect("room has geometry");
+
+        // Monolithic: voxelize + solid_fill → solid set.
+        let mut mono = voxelize(&mesh, voxel, SUPERSAMPLE);
+        solid_fill(&mut mono);
+        let total = (dims[0] as usize) * (dims[1] as usize) * (dims[2] as usize);
+        let mono_set: std::collections::HashSet<usize> = (0..total).filter(|&i| mono.is_solid(i)).collect();
+
+        // Tiled FULL bake (mesh scatter included) with a single big tile.
+        let big = dims[0].max(dims[1]).max(dims[2]) + 1;
+        let scratch = std::env::temp_dir().join(format!("voxelize_room_full_{}", std::process::id()));
+        std::fs::create_dir_all(&scratch).expect("scratch");
+        let grid = tiled::TileGrid::new(dims, big, scratch.clone());
+        let (_total, final_ids) =
+            tiled::bake_tiled(&grid, &mesh, origin, voxel, SUPERSAMPLE).expect("tiled bake");
+        let mut tiled_set = std::collections::HashSet::new();
+        tiled::stream_final(&grid, &final_ids, |gi, _| {
+            tiled_set.insert(gi);
+        })
+        .expect("stream final");
+        let _ = std::fs::remove_dir_all(&scratch);
+
+        assert_eq!(
+            tiled_set.len(),
+            mono_set.len(),
+            "tiled full bake solid count {} != monolithic {}",
+            tiled_set.len(),
+            mono_set.len()
+        );
+        assert!(
+            mono_set.symmetric_difference(&tiled_set).next().is_none(),
+            "tiled full bake (mesh→scatter→flood) differs from monolithic voxelize+solid_fill on the room"
+        );
+    }
+
+    /// **End-to-end tiled `.vxo`:** the room baked through the FULL tiled out-of-core pipeline (mesh → tiled
+    /// flood → STREAMING `.vxo` assembly) writes a valid `.vxo` that parses through the engine reader with a
+    /// non-empty brick set whose decoded solids match the bake's solid count. Proves the streaming assembly
+    /// (`assemble_vxo_streaming` + `VxoStreamWriter`) emits a loadable artifact, not just a correct mask.
+    #[test]
+    fn tiled_vxo_end_to_end_parses_and_round_trips() {
+        use adventure::voxel::brickmap::BRICK_EDGE;
+        use adventure::voxel::vxo::VxoFile;
+
+        let mesh = fallback_room();
+        let voxel = 0.5;
+        let (origin, dims) = grid_geometry(&mesh, voxel).expect("room geometry");
+        let scratch = std::env::temp_dir().join(format!("voxelize_vxo_e2e_{}", std::process::id()));
+        std::fs::create_dir_all(&scratch).expect("scratch");
+        let grid = tiled::TileGrid::new(dims, 16, scratch.clone());
+        let (total_solid, final_ids) =
+            tiled::bake_tiled(&grid, &mesh, origin, voxel, SUPERSAMPLE).expect("tiled bake");
+        assert!(total_solid > 0, "the room bakes solid voxels");
+
+        let out = scratch.join("room.vxo");
+        // STORE so the test doesn't require the zstd compressor to be present at parse-decode (still uses the
+        // streaming writer + region framing).
+        assemble_vxo_streaming(&grid, &final_ids, voxel, &out, true).expect("assemble .vxo");
+
+        let bytes = std::fs::read(&out).expect("read .vxo");
+        let file = VxoFile::parse(&bytes).expect("the tiled .vxo parses");
+        assert!(file.head.brick_count > 0, "the .vxo has bricks");
+        assert_eq!(file.head.voxel_size, voxel, "HEAD records the bake spacing");
+        // Decode every region's bricks and count solids — must equal the bake's solid count (the assembly is
+        // lossless: every solid cell lands in exactly one brick voxel).
+        let mut decoded_solids = 0usize;
+        for dir in &file.bidx {
+            let region = file.decode_region(dir).expect("decode region");
+            for entry in &region.entries {
+                let brick = region.brick(entry);
+                for z in 0..BRICK_EDGE {
+                    for y in 0..BRICK_EDGE {
+                        for x in 0..BRICK_EDGE {
+                            if brick.is_solid(x, y, z) {
+                                decoded_solids += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(decoded_solids, total_solid, "the .vxo decodes exactly the baked solid voxels");
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    /// **Bistro `.vxo` validation (optional asset; `#[ignore]`d — explicit run only).** If `assets/models/
+    /// bistro.vxo` exists (baked via the tiled path — see `docs/TESTING.md`), it PARSES through the engine
+    /// reader with the expected 0.05 m spacing + a large brick set, and a sampling of its regions decode without
+    /// error. This is the post-bake smoke for the shipped Bistro deliverable. Run:
+    /// `cargo test --example voxelize_scene --features vxo-encode -- --ignored bistro_vxo_parses`.
+    #[test]
+    #[ignore = "validates the baked assets/models/bistro.vxo when present; run explicitly"]
+    fn bistro_vxo_parses() {
+        use adventure::voxel::vxo::VxoFile;
+        let path = Path::new("assets/models/bistro.vxo");
+        if !path.exists() {
+            eprintln!("SKIP bistro_vxo_parses: {} not present", path.display());
+            return;
+        }
+        let bytes = std::fs::read(path).expect("read bistro.vxo");
+        let file = VxoFile::parse(&bytes).expect("bistro.vxo parses");
+        assert_eq!(file.head.voxel_size, 0.05, "Bistro baked at 0.05 m");
+        assert!(file.head.brick_count > 100_000, "Bistro has a large brick set (got {})", file.head.brick_count);
+        // Decode the first few regions to prove the bodies are well-formed.
+        for dir in file.bidx.iter().take(8) {
+            let region = file.decode_region(dir).expect("region decodes");
+            assert!(!region.entries.is_empty(), "a Bistro region has bricks");
+        }
+        eprintln!(
+            "bistro.vxo: {} bricks, {} regions, bounds {:?}..{:?}",
+            file.head.brick_count, file.head.region_count, file.head.bounds_min, file.head.bounds_max
+        );
     }
 }

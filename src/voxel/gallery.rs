@@ -92,8 +92,16 @@ pub const GALLERY_SCENES: &[GalleryEntry] = &[
         offset: None,
         label: "Conference",
     },
+    GalleryEntry {
+        // Bistro-Exterior @0.05 m, baked via the C1 tiled out-of-core voxelizer (the only path that fits its
+        // ~13 B-cell AABB under the RAM budget — see `docs/TILED_VOXELIZER_PLAN.md` §C1 + `docs/TESTING.md`).
+        // The legacy full-RAM `.vox` is too large to load; the gallery prefers the region-streamed `.vxo`.
+        vox_path: "assets/models/bistro.vox",
+        vxo_path: "assets/models/bistro.vxo",
+        offset: None,
+        label: "Bistro",
+    },
     // Roadmap (uncomment as each is baked — auto-spaced +X with a gap, no offset math needed):
-    // GalleryEntry { vox_path: "…/bistro.vox", vxo_path: "…/bistro.vxo", offset: None, label: "Bistro" },
     // GalleryEntry { vox_path: "…/san_miguel.vox", vxo_path: "…/san_miguel.vxo", offset: None, label: "San Miguel" },
 ];
 

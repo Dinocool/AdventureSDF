@@ -25,7 +25,7 @@ pub mod writer;
 
 pub use reader::{DecodedRegion, VxoFile};
 pub use source::{MergedSource, VxoSource};
-pub use writer::{VxoCompression, VxoHeadParams, write_vxo};
+pub use writer::{VxoCompression, VxoHeadParams, VxoStreamWriter, region_of_brick, write_vxo};
 
 #[cfg(test)]
 mod tests;
