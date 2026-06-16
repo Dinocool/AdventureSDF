@@ -40,6 +40,8 @@ pub const TAG_MATL: [u8; 4] = *b"MATL";
 pub const TAG_BIDX: [u8; 4] = *b"BIDX";
 /// `BRIK` chunk tag — the concatenation of all region-chunk bodies (REQUIRED).
 pub const TAG_BRIK: [u8; 4] = *b"BRIK";
+/// `LODS` chunk tag — the baked coarse-LOD pyramid (OPTIONAL; `VXO_FORMAT.md` §B1.7).
+pub const TAG_LODS: [u8; 4] = *b"LODS";
 /// `END ` sentinel chunk tag (optional).
 pub const TAG_END: [u8; 4] = *b"END ";
 
@@ -264,6 +266,45 @@ impl VxoBrickEntry {
     }
 }
 
+/// `LODS` body header (`VXO_FORMAT.md` §B1.7). 16 bytes, 16-aligned. The flat POD prefix of the `LODS`
+/// chunk body; the `[VxoLodLevel; level_count]` table follows immediately, then each level's BIDX_L + BRIK_L
+/// sub-sections at the offsets the table records (all offsets are byte offsets FROM THE LODS BODY START).
+///
+/// `LODS` is the BAKED coarse-LOD pyramid: one entry per LOD level `L ∈ 1..=max_lod`, where level-`L` bricks
+/// are the LOD0 [`BrickMap`](crate::voxel::brickmap::BrickMap) downsampled `L` times through the
+/// `source::downsample_brickmap` SSOT — so a baked coarse brick is bit-identical to a demand-synthesized one.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Pod, Zeroable)]
+pub struct VxoLodsHeader {
+    /// The deepest baked level (== `level_count`; a tiny asset collapses early so `max_lod < brickmap::MAX_LOD`).
+    pub max_lod: u32,
+    /// Number of [`VxoLodLevel`] entries in the table (one per `L ∈ 1..=max_lod`, so `level_count == max_lod`).
+    pub level_count: u32,
+    /// Pad → 16-byte header (16-aligned). 0.
+    pub _pad: [u32; 2],
+}
+
+/// `LODS` per-level table entry (`VXO_FORMAT.md` §B1.7). 32 bytes, 16-aligned. One per baked LOD level; the
+/// table sits at the head of the `LODS` body (right after [`VxoLodsHeader`]). Each level reuses the base
+/// [`VxoRegionDirEntry`]/[`VxoRegionHeader`]/[`VxoBrickEntry`] records verbatim — only the framing differs.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Pod, Zeroable)]
+pub struct VxoLodLevel {
+    /// The pyramid LOD this entry describes (`1..=max_lod`; verified == the 1-based table index on decode).
+    pub lod: u32,
+    /// Non-empty coarse regions at this level (== the level's `BIDX_L` entry count).
+    pub region_count: u32,
+    /// Byte offset of this level's `BIDX_L` (`[VxoRegionDirEntry; region_count]`, sorted by `(z,y,x)`),
+    /// relative to the LODS BODY START.
+    pub bidx_off: u64,
+    /// Byte offset of this level's `BRIK_L` (the concatenated level-`L` region bodies) relative to the LODS
+    /// BODY START. A region's `VxoRegionDirEntry.brik_offset` is relative to THIS base (region-local within the
+    /// level's blob — mirroring how the base BIDX `brik_offset` is relative to the BRIK chunk body start).
+    pub brik_off: u64,
+    /// Byte length of this level's `BRIK_L` blob (the seek bound for the level's region bodies).
+    pub brik_len: u64,
+}
+
 /// Round `n` UP to the next multiple of 16 — the in-body chunk pad (`VXO_FORMAT.md` §B1.0: bodies are padded
 /// to a 16-B multiple with zeros, the pad OUTSIDE `body_len`).
 #[inline]
@@ -352,6 +393,8 @@ mod tests {
         assert_eq!(std::mem::size_of::<VxoRegionDirEntry>(), 48, "BIDX entry is 48 B (§B1.5, +compression byte)");
         assert_eq!(std::mem::size_of::<VxoRegionHeader>(), 32, "region header is 32 B (§B1.3)");
         assert_eq!(std::mem::size_of::<VxoBrickEntry>(), 32, "brick entry is 32 B (§B1.3)");
+        assert_eq!(std::mem::size_of::<VxoLodsHeader>(), 16, "LODS header is 16 B (§B1.7)");
+        assert_eq!(std::mem::size_of::<VxoLodLevel>(), 32, "LODS level entry is 32 B (§B1.7)");
         // The records carry no 16-aligned member, so their natural `#[repr(C)]` align is ≤ 8 (the reader uses
         // unaligned reads / element copies, so this is fine). What matters is the spec's REAL invariant: each
         // record's SIZE is a clean multiple of 16 so a `[T]` body stays internally aligned and the framing
@@ -360,6 +403,8 @@ mod tests {
         assert_eq!(std::mem::size_of::<VxoRegionDirEntry>() % 16, 0, "BIDX stride is a 16-multiple");
         assert_eq!(std::mem::size_of::<VxoBrickEntry>() % 16, 0, "BRIK entry stride is a 16-multiple");
         assert_eq!(std::mem::size_of::<VxoHead>() % 16, 0, "HEAD prefix is a 16-multiple");
+        assert_eq!(std::mem::size_of::<VxoLodsHeader>() % 16, 0, "LODS header is a 16-multiple");
+        assert_eq!(std::mem::size_of::<VxoLodLevel>() % 16, 0, "LODS level stride is a 16-multiple");
     }
 
     /// `align16` rounds up to the next 16-multiple (and is a no-op on an already-aligned value).

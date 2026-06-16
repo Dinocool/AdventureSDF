@@ -542,7 +542,7 @@ fn in_box_incl(coord: IVec3, lo: IVec3, hi: IVec3) -> bool {
 /// on-demand coarse-brick synthesis in [`super::vxo::source::VxoSource`] are GUARANTEED bit-identical (one
 /// reducer, one octant layout — robust by construction). This map-level driver only gathers the 8 children of
 /// each coarse brick from the sparse source and hands them off.
-fn downsample_brickmap(fine: &BrickMap) -> BrickMap {
+pub(crate) fn downsample_brickmap(fine: &BrickMap) -> BrickMap {
     // Every coarse brick that any source brick contributes to (a source brick `fc` feeds coarse `fc/2`).
     let mut coarse_coords: rustc_hash::FxHashSet<IVec3> = rustc_hash::FxHashSet::default();
     for (fc, _) in fine.iter() {

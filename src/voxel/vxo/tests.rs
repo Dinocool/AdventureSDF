@@ -12,7 +12,7 @@ use std::collections::HashMap;
 use bevy::math::IVec3;
 
 use super::format::*;
-use super::writer::{VxoCompression, VxoHeadParams, encode_vxo, region_of_brick};
+use super::writer::{VxoCompression, VxoHeadParams, build_coarse_pyramid, encode_vxo, region_of_brick};
 use super::reader::VxoFile;
 use crate::voxel::brickmap::{BRICK_EDGE, BRICK_VOXELS, Brick, BrickMap};
 use crate::voxel::gpu::{GpuBrickPatch, decode_paletted_cell, halo_cells, pack_brickmap};
@@ -195,7 +195,11 @@ fn round_trip_store_is_bit_identical() {
 fn stream_writer_matches_encode_vxo_byte_for_byte() {
     let map = build_map();
     let registry = registry();
-    let params = VxoHeadParams { name: "stream_parity".into(), ..Default::default() };
+    // Disable the baked LODS pyramid for this byte-for-byte parity: `encode_vxo` would append a LODS chunk
+    // from the resident map, but this test drives the streaming writer with ONLY `add_region` (no coarse
+    // `add_lod_region` calls — that's the Stage-3 caller's job), so to compare the two paths byte-for-byte both
+    // must omit LODS. (The streaming LODS bake is covered separately via `add_lod_region`.)
+    let params = VxoHeadParams { name: "stream_parity".into(), bake_lods: false, ..Default::default() };
 
     #[cfg(feature = "vxo-encode")]
     let comps = [VxoCompression::Store, VxoCompression::Zstd(19)];
@@ -469,4 +473,231 @@ fn unknown_chunk_is_skipped() {
     // It still parses (the unknown chunk is skipped) and the bricks still round-trip.
     let file = VxoFile::parse(&bytes).expect("unknown trailing chunk must be skipped");
     assert_eq!(file.head.brick_count as usize, map.len());
+}
+
+// ================================================================================================
+// Stage 1 — the baked `LODS` coarse-LOD pyramid (`VXO_FORMAT.md` §B1.7) parity gate.
+// ================================================================================================
+
+/// A dense brick FILLED solid with a deterministic mix of two blocks (so it is NOT uniform and its
+/// downsample exercises the dominant-block reducer) — every voxel solid, so the box has no air holes and
+/// downsampling stays non-empty across many levels.
+fn filled_brick(seed: i32) -> Brick {
+    let mut v = Box::new([BlockId::AIR; BRICK_VOXELS]);
+    for z in 0..BRICK_EDGE {
+        for y in 0..BRICK_EDGE {
+            for x in 0..BRICK_EDGE {
+                let i = (x + y * BRICK_EDGE + z * BRICK_EDGE * BRICK_EDGE) as usize;
+                // Two solid blocks in a checker-ish pattern (never AIR) so the brick is dense, full, and its
+                // coarse aggregate has a well-defined dominant block.
+                v[i] = if (x + y + z + seed).rem_euclid(3) == 0 { BlockId(1) } else { BlockId(2) };
+            }
+        }
+    }
+    Brick::from_voxels(v)
+}
+
+/// A SOLID box of `edge × edge × edge` LOD0 bricks (origin at the brick grid origin), each filled (dense).
+/// `edge = 4` ⇒ the pyramid is non-empty for several levels (4→2→1 bricks, then a single coarse brick keeps
+/// downsampling non-empty) so it CAPS at `MAX_LOD` — a good multi-level parity subject.
+fn filled_box_map(edge: i32) -> BrickMap {
+    let mut map = BrickMap::new();
+    for z in 0..edge {
+        for y in 0..edge {
+            for x in 0..edge {
+                map.insert(IVec3::new(x, y, z), filled_brick(x * 7 + y * 13 + z * 17));
+            }
+        }
+    }
+    map
+}
+
+/// **Stage 1 PARITY GATE (§B1.7): a baked `LODS` coarse brick is BIT-IDENTICAL to the demand-synthesized one.**
+/// Bake a multi-level map WITH `LODS` (STORE — no zstd dep), parse it, then for EVERY level `L∈1..=max_lod` and
+/// EVERY present coarse brick coord assert the decoded coarse [`Brick`] equals the corresponding brick from the
+/// in-RAM `downsample_brickmap`-chained pyramid (`build_coarse_pyramid`, the same SSOT the bake uses). Also
+/// asserts `HEAD.max_lod` == the deepest non-empty level and the three-base region decode is correct.
+#[test]
+fn lods_baked_pyramid_is_bit_identical_to_demand() {
+    let map = filled_box_map(4);
+    let registry = registry();
+    let params = VxoHeadParams { name: "lods_parity".into(), ..Default::default() };
+
+    // The in-RAM reference pyramid (pyramid[i] = LOD i+1) — the SSOT the bake reuses.
+    let pyramid = build_coarse_pyramid(&map);
+    let max_lod = pyramid.len() as u32;
+    assert!(max_lod >= 3, "the filled box must bake several coarse levels (got {max_lod})");
+
+    let bytes = encode_vxo(&map, &registry, &params, VxoCompression::Store).expect("encode_vxo WITH LODS");
+    let file = VxoFile::parse(&bytes).expect("parse the LODS-baked .vxo");
+
+    // The file carries a LODS pyramid, and HEAD.max_lod == the deepest non-empty level.
+    assert!(file.has_lods(), "bake_lods=true ⇒ a LODS chunk is present");
+    assert_eq!(file.max_lod(), max_lod, "HEAD.max_lod == deepest non-empty pyramid level");
+    let lods = file.lods().expect("LODS parsed");
+    assert_eq!(lods.levels.len() as u32, max_lod, "one LODS level per L∈1..=max_lod");
+
+    let k = file.region_edge_bricks();
+    for (i, level_map) in pyramid.iter().enumerate() {
+        let lod = (i + 1) as u32;
+        // The parsed level table entry records the matching lod.
+        assert_eq!(lods.levels[i].lod, lod, "LODS level[{i}].lod == {lod}");
+
+        // Bucket the reference level's bricks by coarse region; decode each region from the baked LODS and
+        // assert bit-identity per coarse coord.
+        let mut want_count = 0usize;
+        let mut by_region: std::collections::HashMap<[i32; 3], Vec<IVec3>> = std::collections::HashMap::new();
+        for (coord, _brick) in level_map.iter() {
+            want_count += 1;
+            let rc = region_of_brick(*coord, k);
+            by_region.entry([rc.x, rc.y, rc.z]).or_default().push(*coord);
+        }
+
+        let mut decoded_count = 0usize;
+        for (rc_arr, coords) in &by_region {
+            let rc = IVec3::new(rc_arr[0], rc_arr[1], rc_arr[2]);
+            let region = file
+                .decode_lod_region(i, rc)
+                .unwrap_or_else(|| panic!("LOD{lod} region {rc:?} absent in LODS"))
+                .unwrap_or_else(|e| panic!("LOD{lod} region {rc:?} decode failed: {e}"));
+            // The decoded region body's header carries the right lod (verified inside parse_region too).
+            for &coord in coords {
+                let entry = region
+                    .entry(coord)
+                    .unwrap_or_else(|| panic!("LOD{lod} coarse brick {coord:?} missing from its region"));
+                let got = region.brick(entry);
+                let want = level_map.get(coord).expect("reference coarse brick present");
+                assert_eq!(&got, want, "LOD{lod} coarse brick {coord:?} not bit-identical to the demand pyramid");
+                decoded_count += 1;
+            }
+        }
+        assert_eq!(decoded_count, want_count, "LOD{lod}: every reference coarse brick was decoded");
+    }
+}
+
+/// **Stage 1 forward-compat: a `bake_lods=false` file has NO `LODS` chunk** (today's behaviour / the Stage-2
+/// fallback). The same map encodes without a pyramid, parses fine, `has_lods()==false`, `max_lod()==0`, and the
+/// base bricks still round-trip.
+#[test]
+fn no_lods_when_disabled_parses_and_round_trips() {
+    let map = filled_box_map(4);
+    let registry = registry();
+    let params = VxoHeadParams { name: "no_lods".into(), bake_lods: false, ..Default::default() };
+
+    let bytes = encode_vxo(&map, &registry, &params, VxoCompression::Store).expect("encode_vxo WITHOUT LODS");
+    let file = VxoFile::parse(&bytes).expect("parse the no-LODS .vxo");
+    assert!(!file.has_lods(), "bake_lods=false ⇒ no LODS chunk");
+    assert_eq!(file.max_lod(), 0, "HEAD.max_lod == 0 when no pyramid is baked");
+    assert!(file.lods().is_none(), "no parsed LODS directory");
+
+    // The base LOD0 bricks still round-trip bit-identically.
+    let read_map = read_back_map(&file);
+    assert_eq!(read_map.len(), map.len(), "no-LODS read-back brick count == original");
+    for (coord, brick) in map.iter() {
+        let got = read_map.get(*coord).unwrap_or_else(|| panic!("brick {coord:?} missing"));
+        assert_eq!(got, brick, "no-LODS base brick {coord:?} not bit-identical");
+    }
+}
+
+/// **Gotcha #4 — `max_lod` is the deepest NON-EMPTY level, capped at `MAX_LOD`.** A tiny single-brick map
+/// collapses to one coarse brick almost immediately, but a single coarse brick still downsamples to a (smaller)
+/// non-empty coarse brick, so the pyramid runs to the `MAX_LOD` cap. Assert the baked `HEAD.max_lod` equals the
+/// in-RAM pyramid depth (the SSOT), and that it never exceeds `MAX_LOD`.
+#[test]
+fn lods_max_lod_tracks_deepest_nonempty_level() {
+    use crate::voxel::brickmap::MAX_LOD;
+    // A single dense brick at the origin.
+    let mut map = BrickMap::new();
+    map.insert(IVec3::new(0, 0, 0), filled_brick(0));
+
+    let pyramid = build_coarse_pyramid(&map);
+    let depth = pyramid.len() as u32;
+    assert!(depth <= MAX_LOD, "pyramid depth {depth} must not exceed MAX_LOD {MAX_LOD}");
+
+    let registry = registry();
+    let params = VxoHeadParams { name: "tiny_lods".into(), ..Default::default() };
+    let bytes = encode_vxo(&map, &registry, &params, VxoCompression::Store).expect("encode tiny LODS");
+    let file = VxoFile::parse(&bytes).expect("parse tiny LODS");
+    assert_eq!(file.max_lod(), depth, "HEAD.max_lod == in-RAM pyramid depth (deepest non-empty)");
+    assert_eq!(file.max_lod(), MAX_LOD, "a single solid brick downsamples non-empty to the MAX_LOD cap");
+
+    // And the single coarse brick at each level is bit-identical to the demand pyramid.
+    let k = file.region_edge_bricks();
+    for (i, level_map) in pyramid.iter().enumerate() {
+        for (coord, want) in level_map.iter() {
+            let rc = region_of_brick(*coord, k);
+            let region = file
+                .decode_lod_region(i, rc)
+                .unwrap_or_else(|| panic!("L{} region {rc:?} absent", i + 1))
+                .expect("decode");
+            let entry = region.entry(*coord).expect("coarse brick present");
+            assert_eq!(&region.brick(entry), want, "tiny-map coarse brick {coord:?} parity");
+        }
+    }
+}
+
+/// **Stage 1 streaming-writer LODS parity:** the bounded-RAM [`super::writer::VxoStreamWriter`] fed the SAME
+/// base regions (`add_region`) AND coarse regions (`add_lod_region`) in `(z,y,x)` order as `encode_vxo` lays
+/// them out produces a BYTE-IDENTICAL `.vxo` (including the appended LODS chunk). This proves the streaming
+/// LODS bake (`add_lod_region`/`finish`) is correct by construction — same encoder per region, same framing.
+#[test]
+fn stream_writer_lods_matches_encode_vxo() {
+    let map = filled_box_map(4);
+    let registry = registry();
+    let params = VxoHeadParams { name: "stream_lods".into(), ..Default::default() };
+
+    let want = encode_vxo(&map, &registry, &params, VxoCompression::Store).expect("encode_vxo WITH LODS");
+    // It really did bake a pyramid (else this test would trivially pass against a no-LODS file).
+    assert!(VxoFile::parse(&want).unwrap().has_lods(), "reference must carry LODS");
+
+    let k = params.region_edge_bricks as i32;
+    let dir = std::env::temp_dir().join(format!("vxo_stream_lods_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("scratch dir");
+    let scratch = dir.join("brik.tmp");
+    let out = dir.join("stream_lods.vxo");
+
+    let mut w = super::writer::VxoStreamWriter::new(params.clone(), &registry, VxoCompression::Store, &scratch)
+        .expect("open stream writer");
+
+    // Feed the BASE LOD0 regions in (z,y,x) order (matches `encode_vxo`'s BRIK layout).
+    feed_regions_in_order(&map, k, |rc, bricks| w.add_region(rc, bricks).expect("add_region"));
+
+    // Feed each COARSE level's regions in (z,y,x) order (matches `build_lods_body`'s per-level BRIK_L layout).
+    let pyramid = build_coarse_pyramid(&map);
+    for (i, level_map) in pyramid.iter().enumerate() {
+        let lod = (i + 1) as u32;
+        feed_regions_in_order(level_map, k, |rc, bricks| w.add_lod_region(lod, rc, bricks).expect("add_lod_region"));
+    }
+    w.finish(&out).expect("finish stream write");
+
+    let got = std::fs::read(&out).expect("read streamed LODS .vxo");
+    assert_eq!(got, want, "streamed LODS .vxo must be byte-identical to encode_vxo");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Bucket `map`'s bricks into K=`k` regions and invoke `feed(region_coord, sorted_bricks)` for each region in
+/// `(z,y,x)` region order with the region's bricks pre-sorted by `(z,y,x)` — the exact order `encode_vxo`
+/// (and `build_lods_body`) emit, so a streamed writer fed this way matches byte-for-byte.
+fn feed_regions_in_order(map: &BrickMap, k: i32, mut feed: impl FnMut(IVec3, &[(IVec3, &Brick)])) {
+    let mut regions: std::collections::BTreeMap<(i32, i32, i32), Vec<IVec3>> = Default::default();
+    for (coord, _) in map.iter() {
+        let r = region_of_brick(*coord, k);
+        regions.entry((r.z, r.y, r.x)).or_default().push(*coord);
+    }
+    for ((rz, ry, rx), mut coords) in regions {
+        coords.sort_by_key(|c| (c.z, c.y, c.x));
+        let bricks: Vec<(IVec3, &Brick)> = coords.iter().map(|&c| (c, map.get(c).expect("brick"))).collect();
+        feed(IVec3::new(rx, ry, rz), &bricks);
+    }
+}
+
+/// The two new `LODS` POD structs hold their pinned sizes (the SSOT size guard also lives in `format.rs`'s
+/// `record_sizes_match_spec`; this re-asserts from the `tests.rs` side so the gate is co-located with the
+/// round-trip).
+#[test]
+fn lods_struct_sizes() {
+    assert_eq!(std::mem::size_of::<VxoLodsHeader>(), 16, "LODS header is 16 B (§B1.7)");
+    assert_eq!(std::mem::size_of::<VxoLodLevel>(), 32, "LODS level entry is 32 B (§B1.7)");
+    assert_eq!(std::mem::size_of::<VxoLodsHeader>() % 16, 0, "LODS header is a 16-multiple");
+    assert_eq!(std::mem::size_of::<VxoLodLevel>() % 16, 0, "LODS level stride is a 16-multiple");
 }

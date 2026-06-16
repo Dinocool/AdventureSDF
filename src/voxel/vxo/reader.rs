@@ -34,6 +34,12 @@ pub struct VxoFile {
     pub bidx: Vec<VxoRegionDirEntry>,
     /// The whole `BRIK` chunk body (the concatenation of all region bodies).
     brik: Vec<u8>,
+    /// The parsed `LODS` coarse-LOD directory (per-level `BIDX_L` + `BRIK_L` spans), or `None` for a file with
+    /// no baked pyramid (the forward-compat fallback, §B1.7).
+    lods: Option<VxoLods>,
+    /// The whole `LODS` chunk body (held so [`Self::decode_lod_region`] can slice a level's region span by the
+    /// three-base offset). Empty when there is no `LODS` chunk.
+    lods_body: Vec<u8>,
 }
 
 /// A decompressed region (`VXO_FORMAT.md` §B1.3): its brick entry table + region-local palette/index blobs.
@@ -81,6 +87,8 @@ impl VxoFile {
         let mut registry: Option<BlockRegistry> = None;
         let mut bidx: Option<Vec<VxoRegionDirEntry>> = None;
         let mut brik: Option<Vec<u8>> = None;
+        let mut lods: Option<VxoLods> = None;
+        let mut lods_body: Vec<u8> = Vec::new();
 
         // Loop the chunks: parse a known tag, else skip body_len (rounded up to 16) — the §B1.0 reader rule.
         let ch_hdr = std::mem::size_of::<VxoChunkHeader>();
@@ -100,6 +108,12 @@ impl VxoFile {
                 TAG_MATL => registry = Some(parse_matl(body)?),
                 TAG_BIDX => bidx = Some(parse_bidx(body)?),
                 TAG_BRIK => brik = Some(body.to_vec()),
+                TAG_LODS => {
+                    // The OPTIONAL baked coarse-LOD pyramid (§B1.7). Hold the whole body so a level's region
+                    // span can be sliced by the three-base offset on demand (`decode_lod_region`).
+                    lods = Some(parse_lods(body)?);
+                    lods_body = body.to_vec();
+                }
                 TAG_END => break,
                 _ => { /* unknown chunk — skip (forward compat, §B1.0) */ }
             }
@@ -118,7 +132,17 @@ impl VxoFile {
             head.brick_edge,
             BRICK_EDGE
         );
-        Ok(Self { head, name, registry, bidx, brik })
+        // Cross-check: if `LODS` parsed, HEAD.max_lod must agree with the pyramid depth (the writer sets both
+        // from the same `max_lod`); a mismatch is a corrupt/inconsistent file.
+        if let Some(l) = &lods {
+            anyhow::ensure!(
+                head.max_lod == l.max_lod,
+                "vxo: HEAD.max_lod {} != LODS.max_lod {} (inconsistent pyramid)",
+                head.max_lod,
+                l.max_lod
+            );
+        }
+        Ok(Self { head, name, registry, bidx, brik, lods, lods_body })
     }
 
     /// The region edge **K** (bricks per region axis).
@@ -147,8 +171,96 @@ impl VxoFile {
         anyhow::ensure!(end <= self.brik.len(), "vxo: region body overruns BRIK chunk");
         // The compressed region span sliced out of the (in-RAM) BRIK body, decoded via the shared SSOT below
         // (the streamed `VxoSource` feeds the SAME function a slice of its mmap, §B2.2).
-        decode_region_span(&self.brik[start..end], dir)
+        decode_region_span(&self.brik[start..end], dir, 0)
     }
+
+    /// The deepest BAKED coarse-LOD level (`HEAD.max_lod`; 0 ⇒ no `LODS` chunk). A demand-downsample of a
+    /// coarse brick deeper than this clamps to this level (the §B1.7 tiny-asset early-collapse).
+    #[inline]
+    pub fn max_lod(&self) -> u32 {
+        self.head.max_lod
+    }
+
+    /// True iff this file carries a baked `LODS` coarse-LOD pyramid (`VXO_FORMAT.md` §B1.7) — `false` is the
+    /// forward-compat fallback (the loader demand-downsamples). Equivalent to `lods.is_some()`.
+    #[inline]
+    pub fn has_lods(&self) -> bool {
+        self.lods.is_some()
+    }
+
+    /// The parsed `LODS` directory (per-level `BIDX_L` + `BRIK_L` offsets), or `None` if the file has no `LODS`
+    /// chunk. The level table is 0-indexed (`levels[i]` describes LOD `i+1`).
+    #[inline]
+    pub fn lods(&self) -> Option<&VxoLods> {
+        self.lods.as_ref()
+    }
+
+    /// Look up a coarse region's `BIDX_L` entry at pyramid level `level_idx` (0-based: `level_idx = L-1` for
+    /// LOD `L`) by its coarse-grid coord, via binary search on the `(z,y,x)` key. `None` if there is no `LODS`
+    /// chunk, the level is out of range, or the region is absent at that level.
+    pub fn lod_region_entry(&self, level_idx: usize, region_coord: IVec3) -> Option<&VxoRegionDirEntry> {
+        let level = self.lods.as_ref()?.levels.get(level_idx)?;
+        let key = (region_coord.z, region_coord.y, region_coord.x);
+        level
+            .bidx_l
+            .binary_search_by_key(&key, |e| (e.region_coord[2], e.region_coord[1], e.region_coord[0]))
+            .ok()
+            .map(|i| &level.bidx_l[i])
+    }
+
+    /// Decode a coarse region's bricks from the baked `LODS` pyramid (`VXO_FORMAT.md` §B1.7). `level_idx` is
+    /// 0-based (`level_idx = L-1` for LOD `L`); `region_coord` is the region on the COARSE grid. The region body
+    /// lives at the THREE-BASE offset `lods_body_start + level.brik_off + dir.brik_offset` (the level-local
+    /// `brik_offset` is relative to the level's `BRIK_L` blob, which is itself at `brik_off` within the LODS
+    /// body — gotcha #3). Reuses the shared [`decode_region_span`] SSOT, verifying the region body's header
+    /// carries the matching `lod = level_idx + 1`. `None` if there is no `LODS`, or the level/region is absent.
+    pub fn decode_lod_region(
+        &self,
+        level_idx: usize,
+        region_coord: IVec3,
+    ) -> Option<anyhow::Result<DecodedRegion>> {
+        let lods = self.lods.as_ref()?;
+        let level = lods.levels.get(level_idx)?;
+        let dir = self.lod_region_entry(level_idx, region_coord)?;
+        // THREE-BASE absolute span within the LODS body (gotcha #3): the level's BRIK_L base (`brik_l_off`,
+        // relative to the LODS body start) + the region's level-local `brik_offset`.
+        let start = level.brik_l_off + dir.brik_offset as usize;
+        let end = start + dir.brik_comp_len as usize;
+        let body = &self.lods_body;
+        if end > body.len() {
+            return Some(Err(anyhow::anyhow!(
+                "vxo: LODS L{} region {region_coord:?} body overruns the LODS chunk",
+                level.lod
+            )));
+        }
+        Some(decode_region_span(&body[start..end], dir, level.lod))
+    }
+}
+
+/// A parsed `LODS` directory (`VXO_FORMAT.md` §B1.7): one [`VxoLodsLevel`] per baked level (`levels[i]` is LOD
+/// `i+1`), each holding the level's decoded `BIDX_L` directory + the level's `BRIK_L` byte span (offsets
+/// relative to the LODS BODY START). The level region bodies are decoded on demand via
+/// [`VxoFile::decode_lod_region`] (reusing the base [`decode_region_span`] SSOT).
+#[derive(Clone, Debug)]
+pub struct VxoLods {
+    /// The deepest baked level (`== levels.len()`; mirrors `HEAD.max_lod`).
+    pub max_lod: u32,
+    /// One entry per LOD `L ∈ 1..=max_lod` (0-indexed: `levels[i]` is LOD `i+1`).
+    pub levels: Vec<VxoLodsLevel>,
+}
+
+/// One baked coarse-LOD level's decoded directory (`VXO_FORMAT.md` §B1.7): its `lod`, the `BIDX_L` region
+/// directory (sorted by `(z,y,x)`), and the byte span of the level's `BRIK_L` blob within the LODS body.
+#[derive(Clone, Debug)]
+pub struct VxoLodsLevel {
+    /// The pyramid LOD this level describes (`1..=max_lod`; verified `== level_idx + 1` on parse).
+    pub lod: u32,
+    /// The level's region directory (`brik_offset` is level-local within `BRIK_L`).
+    pub bidx_l: Vec<VxoRegionDirEntry>,
+    /// Byte offset of the level's `BRIK_L` blob relative to the LODS BODY START (the first of the three bases).
+    pub brik_l_off: usize,
+    /// Byte length of the level's `BRIK_L` blob.
+    pub brik_l_len: usize,
 }
 
 /// Decode ONE region's compressed byte SPAN (`comp` = the exact `[brik_offset .. +brik_comp_len)` slice the
@@ -161,14 +273,18 @@ impl VxoFile {
 /// into owned `Vec`s) — region bodies are concatenated without inter-region padding so the slice isn't
 /// guaranteed POD-aligned; it is NOT a zero-copy in-place cast. Verifies the region header's coord matches the
 /// `BIDX` key. Keeping this a free function over a `&[u8]` means the loader never copies the whole `BRIK`.
-pub fn decode_region_span(comp: &[u8], dir: &VxoRegionDirEntry) -> anyhow::Result<DecodedRegion> {
+pub fn decode_region_span(
+    comp: &[u8],
+    dir: &VxoRegionDirEntry,
+    expected_lod: u32,
+) -> anyhow::Result<DecodedRegion> {
     let expected = IVec3::new(dir.region_coord[0], dir.region_coord[1], dir.region_coord[2]);
     let raw: std::borrow::Cow<[u8]> = match dir.compression {
         VXO_REGION_STORE => std::borrow::Cow::Borrowed(comp),
         VXO_REGION_ZSTD => std::borrow::Cow::Owned(zstd_decompress(comp, dir.brik_raw_len as usize)?),
         other => anyhow::bail!("vxo: region has unknown compression code {other} (expected 0=STORE, 1=zstd)"),
     };
-    parse_region(&raw, expected)
+    parse_region(&raw, expected, expected_lod)
 }
 
 impl DecodedRegion {
@@ -258,9 +374,60 @@ pub(crate) fn parse_bidx(body: &[u8]) -> anyhow::Result<Vec<VxoRegionDirEntry>> 
     Ok(cast_prefix::<VxoRegionDirEntry>(table, count))
 }
 
+/// Parse the `LODS` body → the [`VxoLods`] coarse-LOD directory (`VXO_FORMAT.md` §B1.7). The body is
+/// [`VxoLodsHeader`] + a `[VxoLodLevel; level_count]` table, then per level `L` (at the table's
+/// `bidx_off`/`brik_off`, both relative to the LODS BODY START) the level's `BIDX_L` (`[VxoRegionDirEntry;
+/// region_count]`) + its `BRIK_L` blob. This reads the header + table + each level's `BIDX_L`; the `BRIK_L`
+/// blobs stay in the caller-held body bytes, sliced on demand by [`VxoFile::decode_lod_region`]. Verifies each
+/// level's `lod == level_idx + 1` (1-based) and that every recorded offset/length stays inside the body.
+fn parse_lods(body: &[u8]) -> anyhow::Result<VxoLods> {
+    let hn = std::mem::size_of::<VxoLodsHeader>();
+    anyhow::ensure!(body.len() >= hn, "vxo: LODS body shorter than its header");
+    let header: VxoLodsHeader = pod_read_unaligned(&body[0..hn]);
+    let level_count = header.level_count as usize;
+    anyhow::ensure!(
+        header.max_lod as usize == level_count,
+        "vxo: LODS max_lod {} != level_count {level_count} (§B1.7: one entry per L∈1..=max_lod)",
+        header.max_lod
+    );
+    let lstride = std::mem::size_of::<VxoLodLevel>();
+    let table_end = hn + level_count * lstride;
+    anyhow::ensure!(table_end <= body.len(), "vxo: LODS level table truncated ({level_count} levels)");
+    let table = cast_prefix::<VxoLodLevel>(&body[hn..table_end], level_count);
+
+    let dstride = std::mem::size_of::<VxoRegionDirEntry>();
+    let mut levels: Vec<VxoLodsLevel> = Vec::with_capacity(level_count);
+    for (i, lvl) in table.iter().enumerate() {
+        let expect_lod = (i + 1) as u32;
+        anyhow::ensure!(
+            lvl.lod == expect_lod,
+            "vxo: LODS level[{i}].lod {} != expected {expect_lod} (1-based table index)",
+            lvl.lod
+        );
+        let bidx_off = lvl.bidx_off as usize;
+        let region_count = lvl.region_count as usize;
+        let bidx_end = bidx_off + region_count * dstride;
+        anyhow::ensure!(
+            bidx_end <= body.len(),
+            "vxo: LODS L{expect_lod} BIDX_L overruns the body (need {bidx_end}, have {})",
+            body.len()
+        );
+        let bidx_l = cast_prefix::<VxoRegionDirEntry>(&body[bidx_off..bidx_end], region_count);
+        let brik_l_off = lvl.brik_off as usize;
+        let brik_l_len = lvl.brik_len as usize;
+        anyhow::ensure!(
+            brik_l_off + brik_l_len <= body.len(),
+            "vxo: LODS L{expect_lod} BRIK_L overruns the body (off {brik_l_off} + len {brik_l_len} > {})",
+            body.len()
+        );
+        levels.push(VxoLodsLevel { lod: lvl.lod, bidx_l, brik_l_off, brik_l_len });
+    }
+    Ok(VxoLods { max_lod: header.max_lod, levels })
+}
+
 /// Parse a decompressed region body → a [`DecodedRegion`] (§B1.3). Verifies the header's region coord against
 /// the `BIDX` key.
-fn parse_region(raw: &[u8], expected_coord: IVec3) -> anyhow::Result<DecodedRegion> {
+fn parse_region(raw: &[u8], expected_coord: IVec3, expected_lod: u32) -> anyhow::Result<DecodedRegion> {
     let hn = std::mem::size_of::<VxoRegionHeader>();
     anyhow::ensure!(raw.len() >= hn, "vxo: region body shorter than its header");
     let header: VxoRegionHeader = pod_read_unaligned(&raw[0..hn]);
@@ -268,6 +435,13 @@ fn parse_region(raw: &[u8], expected_coord: IVec3) -> anyhow::Result<DecodedRegi
     anyhow::ensure!(
         coord == expected_coord,
         "vxo: region header coord {coord:?} != BIDX key {expected_coord:?} (corrupt)"
+    );
+    // Verify the region's LOD matches the chunk it came from (base BRIK = 0; LODS level-`L` = `L`) — a
+    // coarse/base mix-up (gotcha #1) is caught here, never silently decoded into the wrong pyramid level.
+    anyhow::ensure!(
+        header.lod == expected_lod,
+        "vxo: region {coord:?} header lod {} != expected lod {expected_lod} (base/coarse mix-up)",
+        header.lod
     );
     let n = header.brick_count as usize;
     let estride = std::mem::size_of::<VxoBrickEntry>();

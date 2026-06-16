@@ -300,17 +300,39 @@ region brings in its lights (merged into the resident `lights`/`alias`, capped a
 Deferred: v1 loader rebuilds lights from the resident bricks (the existing path), correctness-first; `LITE` is
 a later load-time optimization. (`VOXEL_INSTANCING_PLAN.md §1.5`.)
 
-### B1.7 `LODS` — coarse mip pyramid (OPTIONAL, sketch — defer)
+### B1.7 `LODS` — coarse mip pyramid (IMPLEMENTED — Stage 1, the gallery-freeze fix)
 
-The pre-baked coarse-LOD bricks so far shells don't downsample at load (today `StaticVoxSource::new` builds the
-`MAX_LOD+1` pyramid in RAM at load — fine for one Sponza, too heavy for streamed Bistro). Body = `max_lod: u32`
-then, per level `L ∈ 1..=max_lod`: a `(BIDX_L, BRIK_L)` pair in the SAME region+entry layout as §B1.3/B1.5 but
-on level-`L`'s coarser brick grid (each coarse brick = the `solid-if-any + dominant-block` downsample,
-`source.rs` `downsample_brickmap` — bake it offline). The loader's `BrickSource::brick(coord, L>0)` then reads
-the `LODS` region for level `L` instead of downsampling. Deferred: v1 loader either (a) only serves LOD0 from
-`.vxo` and downsamples coarse LODs in RAM from the loaded LOD0 regions (bounded because residency is
-surface-only), or (b) for very large scenes, ships `LODS` so coarse shells stream too. Decide at B2 from the
-gallery-worst-case RAM measurement.
+> **WHY it is no longer deferred.** At 0.05 m / 64 m reach (D1), the demand-downsample fallback became
+> **unbounded**: `VxoSource::surface_bricks_in` falls back to the full box at `lod > 0` (no coarse directory),
+> and each coarse `classify`/`brick` recursively downsamples `2^(3L)` LOD0 bricks (a LOD7 brick = 128³ ≈ 2.1M)
+> — a measured ~64,000 s + 26 GB OOM on the cold gallery load (`examples/g2_gallery_profile.rs`). Baking the
+> pyramid offline turns each coarse read into an O(1) directory lookup. (Memory `g2-redirect-baked-coarse-lods`.)
+
+The pre-baked coarse-LOD bricks so far shells don't downsample at load. **Body layout (as implemented,
+`src/voxel/vxo/format.rs`):**
+
+- `VxoLodsHeader` (16 B): `max_lod: u32` (deepest baked level = `level_count`), `level_count: u32`, `_pad`.
+- `[VxoLodLevel; level_count]` (32 B each) table at the head of the body: `lod` (1-based, verified == index),
+  `region_count`, `bidx_off`/`brik_off`/`brik_len` — **byte offsets relative to the LODS body start**.
+- then, per level `L ∈ 1..=max_lod` (each sub-section 16-padded): `BIDX_L` (`[VxoRegionDirEntry]` sorted by
+  `(z,y,x)`, each entry's `brik_offset` **level-local** within `BRIK_L`) then `BRIK_L` (the concatenated
+  level-`L` region bodies, each `VxoRegionHeader{lod:L}` + `[VxoBrickEntry]` + palette/index blobs — the SAME
+  §B1.3 region layout, STORE/zstd identically). A level-`L` region body lives at `lods_body_start +
+  level.brik_off + dir.brik_offset` (the three-base offset).
+
+**The bit-identity invariant.** Each coarse brick = `downsample_children` of the previous level (the chain
+`pyramid[L] = downsample_brickmap(pyramid[L-1])`, `writer::build_coarse_pyramid`), the SAME reducer the demand
+path (`VxoSource::coarse_brick` → `gather_children`/`downsample_children`) and `StaticVoxSource::new` use — so a
+baked coarse brick is **bit-identical** to a demand-synthesized one. The dominant-block reduce is NOT
+associative, so the bake MUST chain level-from-previous (never a flat LOD0→L reduction); the round-trip parity
+test + the `gate2b` demand-parity sweep pin this. Bake stops at the first empty level, caps at `MAX_LOD`.
+
+Both writers emit it: the full-RAM `encode_vxo` (`build_lods_body`) and the bounded-RAM `VxoStreamWriter`
+(`add_lod_region` per level → per-level scratch `*.lodL.brik.tmp`, streamed in `finish` — only header+table+
+`BIDX_L` held in RAM, `BRIK_L` streams). Default-on (`VxoHeadParams.bake_lods`); `--no-lods` keeps the old
+demand path (Stage-2 fallback for assets without a `LODS` chunk). **Stage 2** wires
+`VxoSource::brick(coord, L>0)` / `surface_bricks_in(L>0)` / `classify` to read `LODS` instead of synthesizing;
+**Stage 3** re-bakes the corpus + the perf gate.
 
 ### B1.8 `INST` — scene of instances (OPTIONAL, sketch — defer to the instancing track)
 

@@ -357,7 +357,7 @@ impl VxoSource {
         // Decode OUTSIDE the lock (zstd decode of one region; a parallel drain decodes different regions
         // concurrently), then insert. A benign race where two threads decode the same region just inserts the
         // identical bytes twice — observationally transparent.
-        let region = Arc::new(decode_region_span(&self.mmap[start..end], dir)?);
+        let region = Arc::new(decode_region_span(&self.mmap[start..end], dir, 0)?);
         let region = self.cache.lock().expect("region cache lock").insert(region_coord, region);
         Ok(Some(region))
     }
