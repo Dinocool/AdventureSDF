@@ -21,10 +21,12 @@
 pub mod format;
 pub mod reader;
 pub mod source;
+pub mod spill;
 pub mod writer;
 
 pub use reader::{DecodedRegion, VxoFile};
 pub use source::{MergedSource, VxoSource};
+pub use spill::{RegionSpillPool, assemble_base, spill_voxel, windowed_coarse};
 pub use writer::{
     VxoCompression, VxoHeadParams, VxoStreamWriter, build_coarse_pyramid, drive_coarse_lods, region_of_brick,
     write_vxo,

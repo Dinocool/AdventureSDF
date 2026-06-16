@@ -752,3 +752,135 @@ fn lods_struct_sizes() {
     assert_eq!(std::mem::size_of::<VxoLodsHeader>() % 16, 0, "LODS header is a 16-multiple");
     assert_eq!(std::mem::size_of::<VxoLodLevel>() % 16, 0, "LODS level stride is a 16-multiple");
 }
+
+// ============================================================================================
+// Stages 1+2 — constant-RAM disk-spill base + windowed coarse PARITY gate (the byte-identity proof)
+// ============================================================================================
+
+/// Bake `map` through the CONSTANT-RAM disk-spill producer (`spill::RegionSpillPool` → `assemble_base` →
+/// `windowed_coarse` → `VxoStreamWriter::finish`) and return the produced `.vxo` bytes. This is the EXACT path
+/// `examples/voxelize_scene.rs::assemble_vxo_streaming` drives — so a byte-match against `encode_vxo` proves the
+/// spill base completeness AND the windowed coarse cross-region gather are bit-identical to the resident bake.
+fn bake_via_spill(map: &BrickMap, registry: &BlockRegistry, params: &VxoHeadParams, comp: VxoCompression) -> Vec<u8> {
+    use crate::voxel::brickmap::BRICK_EDGE;
+    use crate::voxel::vxo::spill::{RegionSpillPool, assemble_base, spill_voxel, windowed_coarse};
+
+    let k = params.region_edge_bricks as i32;
+    let dir = std::env::temp_dir().join(format!("vxo_spill_parity_{}_{}", std::process::id(), rand_suffix()));
+    std::fs::create_dir_all(&dir).expect("scratch dir");
+    let out = dir.join("spill.vxo");
+    let scratch_brik = dir.join("assembly.brik.tmp");
+
+    // 1. Spill every SOLID voxel of `map` to its per-region file (the production spill pass over a stream of
+    //    solids — here driven from the resident map, but the spill pool never holds the whole map).
+    let mut base = RegionSpillPool::new(&dir, "base", k);
+    for (coord, brick) in map.iter() {
+        for z in 0..BRICK_EDGE {
+            for y in 0..BRICK_EDGE {
+                for x in 0..BRICK_EDGE {
+                    let b = brick.get(x, y, z);
+                    if !b.is_air() {
+                        let w = *coord * BRICK_EDGE + IVec3::new(x, y, z);
+                        spill_voxel(&mut base, w, b).expect("spill voxel");
+                    }
+                }
+            }
+        }
+    }
+    base.flush_all().expect("flush base");
+
+    let mut writer = super::writer::VxoStreamWriter::new(params.clone(), registry, comp, &scratch_brik)
+        .expect("open stream writer");
+    let mut coarse_l0 = RegionSpillPool::new(&dir, "coarse_l0", k);
+    let base_bricks = assemble_base(&base, &mut coarse_l0, &mut writer).expect("assemble base");
+    base.delete_all();
+    if base_bricks > 0 {
+        windowed_coarse(coarse_l0, &dir, k, &mut writer).expect("windowed coarse");
+    } else {
+        coarse_l0.delete_all();
+    }
+    writer.finish(&out).expect("finish");
+
+    let bytes = std::fs::read(&out).expect("read spill .vxo");
+    let _ = std::fs::remove_dir_all(&dir);
+    bytes
+}
+
+/// A cheap per-call unique suffix (a nanosecond clock XOR a monotonic counter) so concurrent test scratch dirs
+/// never collide (cargo runs tests in parallel threads of one process — a clock alone can repeat under fast
+/// scheduling, so fold in a process-global counter too).
+fn rand_suffix() -> u128 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed) as u128;
+    let t = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    t ^ (n << 96)
+}
+
+/// **Stages 1+2 parity (the byte-identity gate):** the constant-RAM disk-spill bake produces a `.vxo`
+/// BIT-IDENTICAL to the resident `encode_vxo`/`build_coarse_pyramid` bake for the SAME map — pinning both the
+/// base-region completeness (Stage 1) and the windowed coarse cross-region gather (Stage 2). Run on the
+/// multi-region/negative-coord `build_map()` so the Euclidean bucketing + intra-region dedup are exercised.
+#[test]
+fn spill_bake_matches_resident_encode() {
+    let map = build_map();
+    let registry = registry();
+    let params = VxoHeadParams { name: "spill_parity".into(), ..Default::default() };
+
+    let want = encode_vxo(&map, &registry, &params, VxoCompression::Store).expect("encode_vxo (resident)");
+    assert!(VxoFile::parse(&want).unwrap().has_lods(), "reference must carry a LODS pyramid");
+    let got = bake_via_spill(&map, &registry, &params, VxoCompression::Store);
+    assert_eq!(got, want, "disk-spill bake must be byte-identical to the resident encode_vxo");
+}
+
+/// Same parity gate over a SOLID filled box (every coarse level non-empty → the pyramid caps at MAX_LOD), so the
+/// windowed coarse runs its FULL depth and every level's cross-region gather is exercised.
+#[test]
+fn spill_bake_matches_resident_filled_box() {
+    let map = filled_box_map(4);
+    let registry = registry();
+    let params = VxoHeadParams { name: "spill_box".into(), ..Default::default() };
+    let want = encode_vxo(&map, &registry, &params, VxoCompression::Store).expect("encode_vxo (resident)");
+    let got = bake_via_spill(&map, &registry, &params, VxoCompression::Store);
+    assert_eq!(got, want, "disk-spill bake (filled box) must be byte-identical to encode_vxo");
+}
+
+/// **Boundary-straddle pin (the hardest correctness point):** surface bricks placed so a COARSE region's
+/// high-face coarse bricks have their `2·cc+1` children in the ADJACENT finer region. With K=8, finer brick
+/// coords K-1 (=7) and K (=8) sit in finer regions 0 and 1; their parent coarse brick (7/2=3 and 8/2=4) — and
+/// crucially the coarse brick at 3, whose children are finer bricks 6 and 7 (both region 0), vs coarse brick 4,
+/// whose children are 8 and 9 (region 1). To force a coarse brick whose TWO children straddle the finer-region
+/// boundary we use finer bricks at coords that map a single coarse brick onto children in two regions: a coarse
+/// region boundary at coarse-brick 4 means children 8,9; but the straddle case is a coarse brick at the EDGE of
+/// the finer window. We build a slab spanning finer x ∈ {6,7,8,9} so coarse bricks 3 (children 6,7) and 4
+/// (children 8,9) both materialize, AND the coarse REGION boundary (coarse brick 8 = finer 16,17) is crossed by
+/// extending to finer x=15,16,17 — exercising the windowed load of two finer regions for one coarse region.
+#[test]
+fn spill_bake_matches_resident_on_region_boundary_straddle() {
+    let registry = registry();
+    let params = VxoHeadParams { name: "spill_straddle".into(), ..Default::default() };
+
+    // A thin slab of dense surface bricks straddling the finer-region boundary at brick x=8 (region 0|1) AND the
+    // COARSE-region boundary at coarse brick x=8 (i.e. finer bricks x=16,17). Coords chosen so several coarse
+    // bricks gather children from TWO finer regions.
+    let mut map = BrickMap::new();
+    let xs = [6, 7, 8, 9, 14, 15, 16, 17];
+    for &x in &xs {
+        for y in 0..3 {
+            for z in 0..3 {
+                // Coords ≡ K-1 (7,15) and ≡ 0 (8,16) across boundaries are present (the pin from the plan).
+                map.insert(IVec3::new(x, y, z), dense_brick(x * 7 + y * 13 + z * 17));
+            }
+        }
+    }
+
+    let want = encode_vxo(&map, &registry, &params, VxoCompression::Store).expect("encode_vxo (resident)");
+    let got = bake_via_spill(&map, &registry, &params, VxoCompression::Store);
+    assert_eq!(
+        got, want,
+        "boundary-straddle: windowed cross-region coarse gather must be byte-identical to the resident bake"
+    );
+}
