@@ -41,12 +41,141 @@ use bevy::math::IVec3;
 use rayon::prelude::*;
 use rustc_hash::FxHashMap;
 
-use super::brickmap::Brick;
+use super::brickmap::{BRICK_EDGE, BRICK_VOXELS, Brick};
 use super::gpu::{
     BrickVoxels, GpuBrickAabb, GpuBrickMeta, GpuPaletteColor, PackedBrick, PalettedBrick, ResidentBrick,
-    encode_paletted, halo_cells, pack_one,
+    build_by_key, encode_paletted, halo_cells, pack_one, pow2_index_bits,
 };
 use super::streaming::BrickKey;
+
+/// **Stage G-a — the per-dirty-DENSE-brick GPU PACK command.** Emitted by [`ResidentPacker::update_gpu`]
+/// instead of the packed bytes: it names the slot + the alloc offsets the CPU claimed and points at the brick's
+/// 27 same-LOD cores (the brick + its 26 neighbours) the GPU halo-fill reads. `assets/shaders/voxel_pack.wgsl`
+/// (`pack_brick`) consumes one per workgroup and writes the bit-packed index stream / palette / meta itself —
+/// byte-identical to what [`emit_changed_slot`](ResidentPacker::emit_changed_slot) would have written on the CPU.
+/// `#[repr(C)]` + `bytemuck`-uploadable; field order/size MUST match the WGSL `PackCommand` (16 u32 / 64 B).
+/// A FLAT 16-u32 (64 B) record — NO `[f32;3]`/vec3 fields, because the WGSL `vec3` 16-byte alignment would
+/// silently pad the `array<PackCommand>` stride and misalign it against this tightly-packed `#[repr(C)]`. Every
+/// field is a scalar so the Rust struct and the WGSL `PackCommand` agree on a 64-B stride field-for-field.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct GpuPackCommand {
+    /// Brick world-voxel origin (`coord · BRICK_EDGE`) — written into the meta verbatim.
+    pub origin_x: i32,
+    pub origin_y: i32,
+    pub origin_z: i32,
+    /// The slot (= `primitive_index`); the meta lands at `meta_buf[slot·12]` (48 B).
+    pub slot: u32,
+    /// Brick world-min corner — written into the meta verbatim.
+    pub world_min_x: f32,
+    pub world_min_y: f32,
+    pub world_min_z: f32,
+    /// Start `u32` of this brick's index stream in `voxel_buf` (= `meta.voxel_offset`).
+    pub index_word_offset: u32,
+    /// Brick LOD (bits 0-2 of the packed `lod_and_bits`).
+    pub lod: u32,
+    /// The R2b index bit width ∈ `{1,2,4,8,16}` (the CPU resolved it from the palette size up front).
+    pub index_bits: u32,
+    /// Start `u32` of this brick's palette in `brick_palettes_buf` (= `meta.palette_base`).
+    pub palette_word_offset: u32,
+    /// Base index into the per-command 27-entry NEIGHBOUR TABLE (`neighbour_indices`): this command's neighbour
+    /// slot `n`'s entry is `neighbour_indices[neighbour_base + n]`, a CORE-POOL index (in `BRICK_VOXELS`-cell
+    /// units) into `cores`, or [`NEIGHBOUR_ABSENT`] when that neighbour is not resident (the halo reads AIR).
+    /// Each resident core lives ONCE in the pool (deduped across all 27-neighbourhoods), so the upload is
+    /// O(resident cores)·512 — NOT O(commands·27)·512 (the naive per-command duplication).
+    pub neighbour_base: u32,
+    pub _pad0: u32,
+    pub _pad1: u32,
+    pub _pad2: u32,
+}
+
+/// A [`GpuPackCommand`] neighbour-table entry meaning "this neighbour is absent" (its halo cells read AIR). Any
+/// value `≥` the core-pool length works; `u32::MAX` is the unambiguous sentinel the WGSL tests against.
+pub const NEIGHBOUR_ABSENT: u32 = 0xFFFF_FFFF;
+
+/// **Stage G-a — the GPU-pack output of one [`ResidentPacker::update_gpu`].** The CPU did the allocation; this
+/// carries everything the render world needs to (a) `queue_write_buffer` the slots that need NO GPU encode
+/// (uniform + freed bricks: meta + AABB, exactly the [`RepackDelta`] path) and the dense bricks' AABBs (the
+/// AABB write stays CPU for G-a), and (b) dispatch `voxel_pack` over `commands` (reading `cores`) to encode the
+/// dense bricks' index/palette/meta. The two together reconstruct the SAME buffer state the all-CPU
+/// `update`+`apply_delta` would — pinned by `tests/voxel_gpu_pack_parity.rs`.
+#[derive(Clone, Debug, Default)]
+pub struct GpuPackBatch {
+    /// Per dirty DENSE brick: the pack command the shader consumes (one workgroup each).
+    pub commands: Vec<GpuPackCommand>,
+    /// The DEDUPED core pool: each DISTINCT resident brick referenced by any command (as the centre OR a
+    /// neighbour) contributes its `8³` core ONCE, as 512 `u32` in [`super::brickmap::voxel_index`] order. Core
+    /// `i`'s voxel is `cores[i·512 + voxel_index(x,y,z)]`. Uploaded to the scratch cores SSBO. O(resident cores)
+    /// — not O(commands·27) (each brick is a neighbour of up to 26 others; deduping kills that 27× blow-up).
+    pub cores: Vec<u32>,
+    /// The per-command 27-entry NEIGHBOUR TABLE (concatenated, `command·27 + nslot`): each entry is a core-pool
+    /// index (into `cores`, in 512-cell units) or [`NEIGHBOUR_ABSENT`]. Slot 13 (`neighbour_base + 13`) is the
+    /// command's own brick. Uploaded to a scratch SSBO the shader indexes via `command.neighbour_base`.
+    pub neighbour_indices: Vec<u32>,
+    /// Slots needing NO GPU encode — uniform bricks (id rides in the meta), freed slots (zeroed/degenerate), and
+    /// the AABB of every changed slot (dense AABBs included — the AABB write is CPU for G-a). Each entry is
+    /// `queue_write_buffer`d exactly as the [`RepackDelta`] meta/aabb path. A DENSE entry carries `meta:None`
+    /// (the shader writes its meta) but always its `aabb`. A UNIFORM/freed entry carries both.
+    pub cpu_writes: Vec<GpuCpuWrite>,
+    /// True iff the resident brick SET changed (the BLAS/TLAS rebuild signal) — same meaning as
+    /// [`RepackDelta::topology_changed`].
+    pub topology_changed: bool,
+}
+
+impl GpuPackBatch {
+    /// True iff nothing changed (no command, no CPU write).
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.commands.is_empty() && self.cpu_writes.is_empty()
+    }
+}
+
+/// One CPU-side buffer write the GPU-pack batch carries: the AABB at `slot`, plus (for uniform/freed slots) the
+/// meta. A DENSE slot's meta is written by the shader, so `meta` is `None` there; its AABB is still CPU-written.
+#[derive(Clone, Copy, Debug)]
+pub struct GpuCpuWrite {
+    /// The slot (= `primitive_index`) this patches.
+    pub slot: u32,
+    /// The AABB to `queue_write_buffer` at `slot · 32` (always written — the AABB stays CPU for G-a).
+    pub aabb: GpuBrickAabb,
+    /// `Some` for a UNIFORM or FREED slot (the shader does not touch its meta): the 48-B meta to write at
+    /// `slot · 48`. `None` for a DENSE slot (the shader writes its meta).
+    pub meta: Option<GpuBrickMeta>,
+}
+
+/// The 27-neighbour slot index of a `(dx,dy,dz)` offset, each ∈ `{-1,0,1}` — `(dz+1)·9 + (dy+1)·3 + (dx+1)`.
+/// Slot 13 is the centre. SSOT shared by the CPU command builder + the WGSL `pack_brick` (which recomputes it).
+#[inline]
+fn neighbour_slot(dx: i32, dy: i32, dz: i32) -> u32 {
+    ((dz + 1) * 9 + (dy + 1) * 3 + (dx + 1)) as u32
+}
+
+/// Extract a brick's `8³` core as 512 `u32` block ids, in [`super::brickmap::voxel_index`] order (+X fastest).
+/// The raw core data the GPU halo-fill reads (the CPU never packs the bytes in the GPU path). Mirror of the
+/// inner read `pack_one` does (`brick.get(cx,cy,cz)`), so the GPU produces the same haloed cells.
+/// The number of DISTINCT block ids in a brick's haloed `cells` — the palette size `k` that picks the index +
+/// palette size class. Equals `encode_paletted(cells).palette.len()` (first-seen ORDER doesn't change the SET),
+/// computed here without building the bit-packed stream (the GPU does that). The size classes (`pow2_index_bits`
+/// + `palette_classes`) depend only on `k`, so this is the only palette fact the CPU allocator needs.
+fn distinct_count(cells: &[u32]) -> u32 {
+    let mut seen: rustc_hash::FxHashSet<u32> = rustc_hash::FxHashSet::default();
+    for &c in cells {
+        seen.insert(c & 0xFFFF); // ids are u16 zero-extended (mirror `encode_paletted`'s `c as u16`)
+    }
+    seen.len() as u32
+}
+
+fn extract_core(brick: &Brick) -> [u32; BRICK_VOXELS] {
+    let mut core = [0u32; BRICK_VOXELS];
+    for z in 0..BRICK_EDGE {
+        for y in 0..BRICK_EDGE {
+            for x in 0..BRICK_EDGE {
+                core[(x + y * BRICK_EDGE + z * BRICK_EDGE * BRICK_EDGE) as usize] = brick.get(x, y, z).0 as u32;
+            }
+        }
+    }
+    core
+}
 
 /// The fixed number of `u32`s a DENSE brick's RAW haloed `10³` grid occupies (one `u32` id per cell). CONSTANT at
 /// every LOD ([`halo_cells`]`(0) == halo_cells(lod)`). The packer's per-slot SHADOW (`last_voxels`) stores cells
@@ -818,6 +947,293 @@ impl ResidentPacker {
                         palette,
                         palette_word_offset: palette_offset,
                     });
+                }
+            }
+        }
+    }
+
+    /// **Stage G-a — the GPU-pack producer.** Runs the IDENTICAL dirty-set + allocation as [`update`](Self::update)
+    /// (drop/enter/rewrite → 26-neighbourhood expansion → per-dirty re-classify, the slot/arena claim+free with
+    /// quarantine, the shadow byte-compare so an unchanged brick costs nothing) — but instead of packing the bytes
+    /// on the CPU it emits a [`GpuPackBatch`]: per dirty DENSE brick a [`GpuPackCommand`] + its 27 same-LOD cores
+    /// (for the GPU halo-fill), and per uniform/freed slot (plus every dense AABB) a [`GpuCpuWrite`]. The GPU
+    /// shader (`assets/shaders/voxel_pack.wgsl`) then writes the index/palette/meta byte-identically to what
+    /// [`emit_changed_slot`](Self::emit_changed_slot) would have. The shadow (`last_meta`/`last_aabb`/`last_voxels`)
+    /// is kept EXACTLY consistent with the CPU path, so a later [`snapshot_buffers`](Self::snapshot_buffers) (the
+    /// grow / fresh-epoch path) is byte-identical regardless of which path ran. The A/B flag (`gpu_pack`) selects
+    /// this vs [`update`](Self::update); OFF by default — only the parity gate + an explicit toggle exercise it.
+    pub fn update_gpu(&mut self, entries: &[ResidentBrick<'_>], palette_stride: u32) -> GpuPackBatch {
+        debug_assert!(
+            self.palette_stride == 0 || self.palette_stride == palette_stride,
+            "palette_stride must be constant within an epoch ({} → {palette_stride})",
+            self.palette_stride,
+        );
+        self.palette_stride = palette_stride;
+        // (1) Deferred-free: release last update's quarantined slots/blocks BEFORE claiming this update's — the
+        //     SAME order as `update_inner` so the free-list LIFO (and thus the allocated offsets) match.
+        for s in self.quarantine_slots.drain(..) {
+            self.slots.release(s);
+        }
+        for (off, bits) in std::mem::take(&mut self.quarantine_index) {
+            self.index_arena.free_block(off, index_slab_words(bits));
+        }
+        for (off, k) in std::mem::take(&mut self.quarantine_palette) {
+            self.palette_arena.free_block(off, k);
+        }
+
+        let new_by_key: FxHashMap<BrickKey, &Brick> =
+            entries.iter().map(|e| (BrickKey { coord: e.coord, lod: e.lod }, e.brick)).collect();
+        let by_key = build_by_key(entries);
+
+        let mut batch = GpuPackBatch::default();
+        let mut topology_changed = false;
+        let mut dirty: FxHashMap<BrickKey, ()> = FxHashMap::default();
+
+        // (2a) DROP keys no longer resident — collapse to degenerate/zeroed (a CPU write), dirty neighbours.
+        let live_keys: Vec<BrickKey> = self.resident.keys().copied().collect();
+        for key in live_keys {
+            if new_by_key.contains_key(&key) {
+                continue;
+            }
+            let st = self.resident.remove(&key).expect("key from live set");
+            batch.cpu_writes.push(GpuCpuWrite {
+                slot: st.slot,
+                aabb: degenerate_aabb(),
+                meta: Some(GpuBrickMeta::zeroed()),
+            });
+            self.quarantine_slots.push(st.slot);
+            self.last_meta.insert(st.slot, GpuBrickMeta::zeroed());
+            self.last_aabb.insert(st.slot, degenerate_aabb());
+            self.last_voxels.remove(&st.slot);
+            if let Some(d) = st.dense {
+                self.quarantine_index.push((d.index_offset, d.index_bits));
+                self.quarantine_palette.push((d.palette_offset, d.palette_k));
+            }
+            topology_changed = true;
+            for nbr in neighbourhood_26(key) {
+                if new_by_key.contains_key(&nbr) {
+                    dirty.insert(nbr, ());
+                }
+            }
+        }
+
+        // (2b) ENTER keys not yet resident — claim a slot (so the expansion sees it), seed dirty.
+        for e in entries {
+            let key = BrickKey { coord: e.coord, lod: e.lod };
+            if self.resident.contains_key(&key) {
+                continue;
+            }
+            let Some(slot) = self.slots.claim() else {
+                continue;
+            };
+            self.resident.insert(key, SlotState { slot, dense: None });
+            dirty.insert(key, ());
+            topology_changed = true;
+        }
+
+        // (2c) Explicitly-rewritten keys.
+        for key in std::mem::take(&mut self.pending_rewrites) {
+            if new_by_key.contains_key(&key) {
+                dirty.insert(key, ());
+            }
+        }
+
+        // (3) EXPAND by the resident 26-neighbourhood (halo dependency).
+        let seeds: Vec<BrickKey> = dirty.keys().copied().collect();
+        for key in seeds {
+            for nbr in neighbourhood_26(key) {
+                if new_by_key.contains_key(&nbr) {
+                    dirty.insert(nbr, ());
+                }
+            }
+        }
+
+        // (4) Re-pack each dirty key against the NEW map, in the SAME deterministic order as `update_inner` so the
+        //     free-list/alloc offsets (and thus the emitted commands) are reproducible.
+        let mut dirty_keys: Vec<BrickKey> = dirty.keys().copied().collect();
+        dirty_keys.sort_by_key(|k| (k.lod, k.coord.z, k.coord.y, k.coord.x));
+
+        // PHASE 1 (PARALLEL) — pure per-key `pack_one` (the SSOT halo-fill + R1 uniform-incl-halo decision). We
+        // DON'T `encode_paletted` here (the GPU does the encode); we only need the dense/uniform classification +
+        // the palette size `k` to pick the index/palette size class. `k` is computed from the haloed cells'
+        // distinct-id count (the SAME count `encode_paletted` produces — first-seen order doesn't affect the SET).
+        let pack = |key: BrickKey| -> Option<(BrickKey, PackedBrick, Option<u32>)> {
+            let &brick = new_by_key.get(&key)?;
+            let e = ResidentBrick { coord: key.coord, brick, lod: key.lod };
+            let pb = pack_one(&e, &by_key);
+            let k = match &pb.voxels {
+                BrickVoxels::Dense(cells) => Some(distinct_count(cells)),
+                BrickVoxels::Uniform(_) => None,
+            };
+            Some((key, pb, k))
+        };
+        let packed: Vec<(BrickKey, PackedBrick, Option<u32>)> =
+            dirty_keys.par_iter().filter_map(|&key| pack(key)).collect();
+
+        // PHASE 2 (SERIAL) — fold into the mutable allocator state IN THE SAME ORDER, emitting GPU commands + CPU
+        // writes. Order-dependent mutation (free-list LIFO, command order) stays serial here.
+        let _ = &by_key; // Phase 1's `pack_one` read it for halos; Phase 2 resolves cores via `new_by_key`.
+        // The DEDUPED core pool index: a resident brick's core lands in `batch.cores` ONCE, the first time any
+        // command references it (as centre or neighbour). Shared across all commands so each brick is uploaded
+        // once, not once per command that neighbours it.
+        let mut core_index: FxHashMap<BrickKey, u32> = FxHashMap::default();
+        for (key, pb, k) in &packed {
+            self.emit_pack_command(*key, pb, *k, &new_by_key, &mut core_index, &mut batch);
+        }
+
+        batch.topology_changed = topology_changed;
+        batch
+    }
+
+    /// Intern `key`'s brick into the deduped core pool, returning its core-pool index (in `BRICK_VOXELS` units).
+    /// Uploads the `8³` core ONCE on first sight. `NEIGHBOUR_ABSENT` is returned by the CALLER for an absent key
+    /// (this is only called for resident keys).
+    fn intern_core(
+        cores: &mut Vec<u32>,
+        core_index: &mut FxHashMap<BrickKey, u32>,
+        key: BrickKey,
+        brick: &Brick,
+    ) -> u32 {
+        if let Some(&idx) = core_index.get(&key) {
+            return idx;
+        }
+        let idx = (cores.len() / BRICK_VOXELS) as u32;
+        cores.extend_from_slice(&extract_core(brick));
+        core_index.insert(key, idx);
+        idx
+    }
+
+    /// Allocate `key`'s slot's index/palette slabs (as the dense/uniform classification + the index/palette size
+    /// class changed) and emit either a [`GpuPackCommand`] (dense) or a [`GpuCpuWrite`] (uniform) into `batch`,
+    /// updating the shadow EXACTLY as [`emit_changed_slot`](Self::emit_changed_slot) does — so the GPU path and
+    /// the CPU path converge to byte-identical shadow/buffer state. `k` is the dense brick's distinct-id count
+    /// (`None` for uniform). Skips emission when the brick's bytes match the slot's shadow (the no-change fast
+    /// path — same as the CPU path), but ALWAYS keeps the shadow current.
+    fn emit_pack_command(
+        &mut self,
+        key: BrickKey,
+        pb: &PackedBrick,
+        k: Option<u32>,
+        new_by_key: &FxHashMap<BrickKey, &Brick>,
+        core_index: &mut FxHashMap<BrickKey, u32>,
+        batch: &mut GpuPackBatch,
+    ) {
+        let st = *self.resident.get(&key).expect("dirty key is resident");
+        match &pb.voxels {
+            BrickVoxels::Uniform(_) => {
+                if let Some(d) = st.dense {
+                    self.quarantine_index.push((d.index_offset, d.index_bits));
+                    self.quarantine_palette.push((d.palette_offset, d.palette_k));
+                }
+                let meta = pb.meta_uniform();
+                self.resident.insert(key, SlotState { slot: st.slot, dense: None });
+                let changed =
+                    self.last_meta.get(&st.slot) != Some(&meta) || self.last_aabb.get(&st.slot) != Some(&pb.aabb);
+                self.last_meta.insert(st.slot, meta);
+                self.last_aabb.insert(st.slot, pb.aabb);
+                self.last_voxels.remove(&st.slot);
+                if changed {
+                    batch.cpu_writes.push(GpuCpuWrite { slot: st.slot, aabb: pb.aabb, meta: Some(meta) });
+                }
+            }
+            BrickVoxels::Dense(cells) => {
+                let k = k.expect("dense brick must carry its distinct-id count");
+                let index_bits = pow2_index_bits(k as usize);
+                debug_assert!(
+                    k <= self.palette_stride,
+                    "brick palette k={k} exceeds registry length palette_stride={}",
+                    self.palette_stride,
+                );
+                let index_offset = match st.dense {
+                    Some(d) if d.index_bits == index_bits => d.index_offset,
+                    Some(d) => {
+                        self.quarantine_index.push((d.index_offset, d.index_bits));
+                        self.index_arena.alloc(index_slab_words(index_bits))
+                    }
+                    None => self.index_arena.alloc(index_slab_words(index_bits)),
+                };
+                let palette_offset = match st.dense {
+                    Some(d) if self.palette_arena.class_of(d.palette_k) == self.palette_arena.class_of(k) => {
+                        d.palette_offset
+                    }
+                    Some(d) => {
+                        self.quarantine_palette.push((d.palette_offset, d.palette_k));
+                        self.palette_arena.alloc(k)
+                    }
+                    None => self.palette_arena.alloc(k),
+                };
+                let meta = GpuBrickMeta::dense(
+                    pb.voxel_origin,
+                    index_offset,
+                    pb.world_min,
+                    pb.lod,
+                    index_bits,
+                    palette_offset,
+                );
+                self.resident.insert(
+                    key,
+                    SlotState {
+                        slot: st.slot,
+                        dense: Some(DenseSlot { index_offset, index_bits, palette_offset, palette_k: k }),
+                    },
+                );
+                let meta_changed =
+                    self.last_meta.get(&st.slot) != Some(&meta) || self.last_aabb.get(&st.slot) != Some(&pb.aabb);
+                let voxels_changed = self.last_voxels.get(&st.slot) != Some(cells);
+                self.last_meta.insert(st.slot, meta);
+                self.last_aabb.insert(st.slot, pb.aabb);
+                if voxels_changed {
+                    self.last_voxels.insert(st.slot, cells.clone());
+                }
+                if meta_changed || voxels_changed {
+                    // The AABB is CPU-written (G-a); the meta + index + palette are GPU-written. We always emit the
+                    // dense AABB CPU write; we emit a GPU command ONLY when the voxel CONTENT changed (a meta-only
+                    // change — e.g. a slot moved with identical content, which `voxels_changed` covers — implies
+                    // content change, so a pure meta-only-change can't reach the dense branch without new content).
+                    batch.cpu_writes.push(GpuCpuWrite { slot: st.slot, aabb: pb.aabb, meta: None });
+                    if voxels_changed {
+                        // Build the 27-entry NEIGHBOUR TABLE (the brick + its 26 same-LOD neighbours) for the GPU
+                        // halo-fill, interning each resident core into the DEDUPED pool (uploaded once). An absent
+                        // neighbour → NEIGHBOUR_ABSENT (the halo reads AIR — mirror of `neighbour_border_cell`).
+                        let neighbour_base = batch.neighbour_indices.len() as u32;
+                        for dz in -1..=1 {
+                            for dy in -1..=1 {
+                                for dx in -1..=1 {
+                                    let nslot = neighbour_slot(dx, dy, dz);
+                                    debug_assert_eq!(
+                                        batch.neighbour_indices.len(),
+                                        neighbour_base as usize + nslot as usize
+                                    );
+                                    let nkey =
+                                        BrickKey { coord: key.coord + IVec3::new(dx, dy, dz), lod: key.lod };
+                                    let entry = match new_by_key.get(&nkey) {
+                                        Some(&brick) => {
+                                            Self::intern_core(&mut batch.cores, core_index, nkey, brick)
+                                        }
+                                        None => NEIGHBOUR_ABSENT,
+                                    };
+                                    batch.neighbour_indices.push(entry);
+                                }
+                            }
+                        }
+                        batch.commands.push(GpuPackCommand {
+                            origin_x: pb.voxel_origin[0],
+                            origin_y: pb.voxel_origin[1],
+                            origin_z: pb.voxel_origin[2],
+                            slot: st.slot,
+                            world_min_x: pb.world_min[0],
+                            world_min_y: pb.world_min[1],
+                            world_min_z: pb.world_min[2],
+                            index_word_offset: index_offset,
+                            lod: pb.lod,
+                            index_bits: index_bits as u32,
+                            palette_word_offset: palette_offset,
+                            neighbour_base,
+                            _pad0: 0,
+                            _pad1: 0,
+                            _pad2: 0,
+                        });
+                    }
                 }
             }
         }

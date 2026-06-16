@@ -49,7 +49,7 @@ use super::gpu::{
     GpuAliasEntry, GpuBrickAabb, GpuBrickMeta, GpuBrickPatch, GpuInstanceDescriptor, GpuVoxelLight,
     build_lights_from_entries, pack_brickmap, pack_resident_set,
 };
-use super::incremental::{RepackDelta, ResidentPacker, SnapshotBuffers};
+use super::incremental::{GpuPackBatch, RepackDelta, ResidentPacker, SnapshotBuffers};
 use super::palette::{BlockId, BlockRegistry, CornellBlock};
 use super::source::{BrickSource, StaticVoxSource, WorldgenSource};
 use super::streaming::{BrickKey, ResidencyManager, StreamingConfig, camera_brick_coord, region_half_extent_m};
@@ -70,12 +70,19 @@ use crate::sdf_render::worldgen::{WorldBiomeShapes, WorldGraph};
 #[derive(Resource, Clone, Copy, Debug, ExtractResource)]
 pub struct VoxelRtToggle {
     pub enabled: bool,
+    /// **Phase G Stage G-a A/B flag.** When `true`, the streamed producer emits a GPU PACK batch
+    /// ([`ResidentPacker::update_gpu`]) and the render world encodes the bricks on the GPU
+    /// (`assets/shaders/voxel_pack.wgsl`) instead of the CPU `ResidentPacker::update` + `apply_delta`. OFF by
+    /// default — the whole GPU path is exercised only by the parity gate (`tests/voxel_gpu_pack_parity.rs`) +
+    /// an explicit toggle until it is trusted live. The CPU path is the byte SSOT the GPU path is proven against.
+    pub gpu_pack: bool,
 }
 
 impl Default for VoxelRtToggle {
     fn default() -> Self {
-        // HW-RT is the default (and only) renderer now — on at startup.
-        Self { enabled: true }
+        // HW-RT is the default (and only) renderer now — on at startup. The GPU pack is OFF by default (G-a is
+        // A/B-gated until its parity test is trusted live).
+        Self { enabled: true, gpu_pack: false }
     }
 }
 
@@ -99,6 +106,14 @@ pub enum VoxelRtUpload {
     /// fixed-cap buffers (meta/aabb at `slot · stride`, the raw dense block at `voxel_word_offset`). Rebuild the
     /// BLAS iff `delta.topology_changed`. Carries the FULL light list for the generation (NEE is not per-slot).
     Delta { delta: RepackDelta, brick_count: u32, lights: Vec<GpuVoxelLight>, alias: Vec<GpuAliasEntry> },
+    /// **Phase G Stage G-a — the GPU PACK upload (A/B-gated, OFF by default).** The incremental successor to
+    /// [`Delta`](Self::Delta): the CPU did the ALLOCATION ([`ResidentPacker::update_gpu`]) and shipped a
+    /// [`GpuPackBatch`]; the render world `queue_write_buffer`s the uniform/freed metas + every AABB (the
+    /// `cpu_writes`) and DISPATCHES `voxel_pack` over `batch.commands` (reading the uploaded cores) to encode the
+    /// dense bricks' index/palette/meta on the GPU — byte-identical to what the CPU `Delta` path would write
+    /// (pinned by `tests/voxel_gpu_pack_parity.rs`). Rebuild the BLAS iff `batch.topology_changed`. Like `Delta`,
+    /// only the epoch start ships a `StreamSnapshot`; this carries the FULL light list for the generation.
+    GpuPack { batch: GpuPackBatch, brick_count: u32, lights: Vec<GpuVoxelLight>, alias: Vec<GpuAliasEntry> },
 }
 
 impl VoxelRtUpload {
@@ -110,6 +125,8 @@ impl VoxelRtUpload {
             // A Delta never starts an epoch, so it always has a prior StreamSnapshot's buffers to patch — even an
             // all-freed delta still patches (collapsing slots to degenerate) and must not be skipped.
             VoxelRtUpload::Delta { .. } => false,
+            // A GpuPack (like Delta) patches a prior epoch's buffers — never starts one — so never "empty".
+            VoxelRtUpload::GpuPack { .. } => false,
         }
     }
 }
@@ -145,7 +162,7 @@ impl VoxelRtPatch {
     pub fn storage_report(&self) -> Option<super::gpu::StorageReport> {
         match &self.upload {
             VoxelRtUpload::Snapshot(p) => Some(p.storage_report()),
-            VoxelRtUpload::StreamSnapshot { .. } | VoxelRtUpload::Delta { .. } => None,
+            VoxelRtUpload::StreamSnapshot { .. } | VoxelRtUpload::Delta { .. } | VoxelRtUpload::GpuPack { .. } => None,
         }
     }
 }
@@ -404,12 +421,16 @@ fn init_voxel_rt_streaming(
 fn stream_voxel_rt_residency(
     scene: Res<VoxelScene>,
     edits: Res<VoxelEdits>,
+    toggle: Res<VoxelRtToggle>,
     mut streaming: ResMut<VoxelRtStreaming>,
     mut patch_res: ResMut<VoxelRtPatch>,
     mut lighting: ResMut<VoxelRtLighting>,
     mut sky: ResMut<VoxelRtSky>,
     cam: Query<&GlobalTransform, With<SdfCamera>>,
 ) {
+    // Phase G Stage G-a A/B flag (OFF by default): when set, the streamed re-pack emits a GPU PACK batch
+    // (`update_gpu`) the render world encodes on the GPU, instead of the all-CPU `update` + `apply_delta`.
+    let gpu_pack = toggle.gpu_pack;
     // Main-thread residency span — names this system in a chrome trace (Bevy's automatic per-system spans are
     // `trace`-level and dropped by the global `info` EnvFilter, so the heavy voxel work was otherwise invisible).
     // The child spans below (classify / drain / re-pack) split the cost so a capture names the exact culprit.
@@ -744,6 +765,32 @@ fn stream_voxel_rt_residency(
         // registry has no emitters — the common worldgen/Sponza case). The packer is `Some` for every streamed
         // scene (set on the switch); the `None` arm is a defensive first-tick fallback to a contiguous Snapshot.
         let upload = match packer.as_mut() {
+            // Phase G Stage G-a — the GPU PACK path (A/B-gated). The CPU does the SAME allocation (`update_gpu`)
+            // but the dense bricks' index/palette/meta are encoded on the GPU. The epoch start / a grow still
+            // ships a `StreamSnapshot` (allocate the fixed-cap buffers once — not the hot path); every later
+            // re-pack ships a `GpuPack` batch. Byte-identical to the CPU `Delta` path (the parity gate).
+            Some(p) if gpu_pack => {
+                let batch = {
+                    let _su = info_span!("vox_pack_update_gpu").entered();
+                    p.update_gpu(&entries, active_registry.len() as u32)
+                };
+                let (lights, alias) = build_lights_from_entries(&entries, active_registry);
+                let brick_count = p.resident_count() as u32;
+                if !*epoch_snapshotted || p.grew() {
+                    let buffers = {
+                        let _ss = info_span!("vox_pack_snapshot").entered();
+                        p.snapshot_buffers(active_registry)
+                    };
+                    *epoch_snapshotted = true;
+                    VoxelRtUpload::StreamSnapshot { buffers, lights, alias }
+                } else if !batch.is_empty() {
+                    VoxelRtUpload::GpuPack { batch, brick_count, lights, alias }
+                } else {
+                    *worldgen_dirty_pending = false;
+                    *worldgen_frames_since_pack = 0;
+                    return;
+                }
+            }
             Some(p) => {
                 let delta = {
                     let _su = info_span!("vox_pack_update").entered();
@@ -776,6 +823,7 @@ fn stream_voxel_rt_residency(
         let (n, v) = match &upload {
             VoxelRtUpload::StreamSnapshot { buffers, .. } => (buffers.brick_count as usize, buffers.indices.len()),
             VoxelRtUpload::Delta { brick_count, delta, .. } => (*brick_count as usize, delta.changed.len()),
+            VoxelRtUpload::GpuPack { brick_count, batch, .. } => (*brick_count as usize, batch.commands.len()),
             VoxelRtUpload::Snapshot(p) => (p.brick_count(), p.voxels.len()),
         };
         patch_res.upload = upload;
@@ -1110,6 +1158,11 @@ struct VoxelRtPipelines {
     wc_compact_write_active: wgpu::ComputePipeline,
     wc_update: wgpu::ComputePipeline,
     wc_blend: wgpu::ComputePipeline,
+    /// **Phase G Stage G-a — the GPU PACK compute pipeline** (`voxel_pack.wgsl::pack_brick`) + its dedicated
+    /// bind-group layout (commands + cores read-only; voxel/palette/meta read_write). Dispatched ONLY in the
+    /// `GpuPack` upload arm (one workgroup per dirty dense brick) when the `gpu_pack` A/B flag is on.
+    pack: wgpu::ComputePipeline,
+    pack_layout: wgpu::BindGroupLayout,
     /// The composite shader module + its bind-group layout + sampler. The composite render pipeline is
     /// built lazily (and cached) once the live view-target format is known.
     composite_module: wgpu::ShaderModule,
@@ -2256,6 +2309,52 @@ fn init_voxel_rt(mut commands: Commands, render_device: Res<RenderDevice>) {
     let wc_update = mk_wc("voxel_rt_wc_update", "world_cache_update", &world_cache_update_pl);
     let wc_blend = mk_wc("voxel_rt_wc_blend", "world_cache_blend", &world_cache_update_pl);
 
+    // --- Phase G Stage G-a — the GPU PACK pipeline (A/B-gated) ---
+    // `assets/shaders/voxel_pack.wgsl` (`pack_brick`): one workgroup per dirty dense brick, halo-fills + paletted-
+    // encodes + writes its index/palette/meta into the EXISTING pool buffers (bound read_write). Its own dedicated
+    // bind group layout (commands + cores read-only; voxel/palette/meta read_write) — bound only during the
+    // `GpuPack` upload arm, never in the trace passes. Built unconditionally (the module is tiny); only used when
+    // the `gpu_pack` flag is on.
+    let pack_src = std::fs::read_to_string("assets/shaders/voxel_pack.wgsl").expect("read voxel_pack.wgsl");
+    let pack_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("voxel_pack"),
+        source: wgpu::ShaderSource::Wgsl(pack_src.into()),
+    });
+    let pack_storage = |binding: u32, read_only: bool| wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::COMPUTE,
+        ty: wgpu::BindingType::Buffer {
+            ty: wgpu::BufferBindingType::Storage { read_only },
+            has_dynamic_offset: false,
+            min_binding_size: None,
+        },
+        count: None,
+    };
+    let pack_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("voxel_rt_pack_layout"),
+        entries: &[
+            pack_storage(0, true),  // commands
+            pack_storage(1, true),  // cores (deduped pool)
+            pack_storage(2, true),  // neighbour_indices (27 per command)
+            pack_storage(3, false), // voxel_buf (index stream)
+            pack_storage(4, false), // brick_palettes_buf
+            pack_storage(5, false), // meta_buf
+        ],
+    });
+    let pack_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("voxel_rt_pack_pl"),
+        bind_group_layouts: &[Some(&pack_layout)],
+        immediate_size: 0,
+    });
+    let pack = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+        label: Some("voxel_rt_pack"),
+        layout: Some(&pack_pl),
+        module: &pack_module,
+        entry_point: Some("pack_brick"),
+        compilation_options: Default::default(),
+        cache: None,
+    });
+
     let composite_src =
         std::fs::read_to_string("assets/shaders/voxel_rt_composite.wgsl").expect("read voxel_rt_composite.wgsl");
     let composite_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -2318,6 +2417,8 @@ fn init_voxel_rt(mut commands: Commands, render_device: Res<RenderDevice>) {
         wc_compact_write_active,
         wc_update,
         wc_blend,
+        pack,
+        pack_layout,
         composite_module,
         composite_layout,
         composite_sampler,
@@ -2693,6 +2794,37 @@ fn prepare_voxel_rt(
                 brick_count,
             );
         }
+        VoxelRtUpload::GpuPack { batch, brick_count, lights, alias } => {
+            // Phase G Stage G-a — the GPU PACK arm (A/B-gated). Like `Delta` but the dense bricks' index/palette/
+            // meta are encoded by the `voxel_pack` compute dispatch (the CPU only wrote the uniform/freed metas +
+            // the AABBs). Same epoch-existence guards as `Delta`.
+            if resources.built_epoch != Some(patch_res.epoch) {
+                debug!(
+                    "voxel-RT G-a: GpuPack for epoch {} but built epoch is {:?} — skipping (await snapshot)",
+                    patch_res.epoch, resources.built_epoch
+                );
+                return;
+            }
+            let Some(scene) = resources.scene.as_ref() else {
+                return;
+            };
+            if !scene.streamed {
+                return;
+            }
+            let _s = info_span!("vox_gpu_pack").entered();
+            apply_gpu_pack(device, &render_queue, &pipelines, scene, batch);
+            resources.world_cache_lights = Some(WorldCacheLights::from_lists(device, lights, alias));
+            resources.brick_count = *brick_count;
+            debug!(
+                "voxel-RT G-a: GpuPack epoch {} gen {} — {} dense commands, {} cpu writes, topology_changed={}, {} bricks",
+                patch_res.epoch,
+                patch_res.generation,
+                batch.commands.len(),
+                batch.cpu_writes.len(),
+                batch.topology_changed,
+                brick_count,
+            );
+        }
     }
 
     resources.built_generation = Some(patch_res.generation);
@@ -2932,6 +3064,124 @@ fn apply_delta(
         // ones). We only reach here on a topology change, so there is always ≥1 dirty chunk.
         encoder.build_acceleration_structures(geos.iter(), core::iter::once(&scene.tlas));
         render_queue.submit(core::iter::once(encoder.finish()));
+    }
+}
+
+/// **Phase G Stage G-a — apply a [`GpuPackBatch`]** to the persistent fixed-cap scene buffers (the A/B-gated
+/// GPU successor to [`apply_delta`]). The CPU did the allocation; here: (1) `queue_write_buffer` the `cpu_writes`
+/// — the uniform/freed slots' metas + every changed slot's AABB (the AABB stays CPU for G-a; the dense bricks'
+/// meta + index + palette are GPU-written by the shader), (2) upload the per-command scratch + the 27-core
+/// scratch, (3) dispatch `voxel_pack` (one workgroup per dirty dense brick) into the SAME pool buffers, and
+/// (4) rebuild ONLY the dirty chunk BLASes on a topology change (lifted from [`apply_delta`]). Byte-identical to
+/// the CPU `Delta` path (pinned by `tests/voxel_gpu_pack_parity.rs`), so the trace/GI/shader are unchanged.
+fn apply_gpu_pack(
+    device: &wgpu::Device,
+    render_queue: &RenderQueue,
+    pipelines: &VoxelRtPipelines,
+    scene: &SceneKeepAlive,
+    batch: &GpuPackBatch,
+) {
+    let meta_stride = core::mem::size_of::<GpuBrickMeta>() as u64; // 48
+    let aabb_stride = core::mem::size_of::<GpuBrickAabb>() as u64; // 32
+    // (1) CPU writes — the AABB always (G-a keeps it CPU); the meta only for uniform/freed slots (a dense slot's
+    //     meta is written by the shader). Mirrors `apply_delta`'s meta/aabb writes for the non-GPU-encoded slots.
+    for w in &batch.cpu_writes {
+        render_queue.write_buffer(&scene.aabb_buf, w.slot as u64 * aabb_stride, bytemuck::bytes_of(&w.aabb));
+        if let Some(meta) = &w.meta {
+            render_queue.write_buffer(&scene.meta_buf, w.slot as u64 * meta_stride, bytemuck::bytes_of(meta));
+        }
+    }
+
+    // (2)+(3) GPU encode — upload the command + core scratch SSBOs, then dispatch `pack_brick` over the commands
+    //         (one workgroup each) into voxel_buf / brick_palettes_buf / meta_buf. Skipped when there are no dense
+    //         commands this generation (an all-uniform/all-freed delta — the CPU writes above did everything).
+    if !batch.commands.is_empty() {
+        let commands_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("voxel_rt_pack_commands"),
+            contents: bytemuck::cast_slice(&batch.commands),
+            usage: wgpu::BufferUsages::STORAGE,
+        });
+        let cores_data: &[u32] = if batch.cores.is_empty() { &[0u32] } else { &batch.cores };
+        let cores_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("voxel_rt_pack_cores"),
+            contents: bytemuck::cast_slice(cores_data),
+            usage: wgpu::BufferUsages::STORAGE,
+        });
+        let nbr_data: &[u32] = if batch.neighbour_indices.is_empty() { &[0u32] } else { &batch.neighbour_indices };
+        let nbr_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("voxel_rt_pack_neighbours"),
+            contents: bytemuck::cast_slice(nbr_data),
+            usage: wgpu::BufferUsages::STORAGE,
+        });
+        let pack_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("voxel_rt_pack_bg"),
+            layout: &pipelines.pack_layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: commands_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: cores_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: nbr_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: scene.voxel_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 4, resource: scene.brick_palettes_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 5, resource: scene.meta_buf.as_entire_binding() },
+            ],
+        });
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("voxel_rt_gpu_pack"),
+        });
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("voxel_rt_gpu_pack_pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&pipelines.pack);
+            pass.set_bind_group(0, &pack_bg, &[]);
+            pass.dispatch_workgroups(batch.commands.len() as u32, 1, 1);
+        }
+        render_queue.submit(core::iter::once(encoder.finish()));
+    }
+
+    // (4) BLAS — rebuild ONLY the dirty chunk bands on a topology change (lifted from `apply_delta`). The dirty
+    //     chunks are those any CPU write OR pack command touched (an entered/dropped/uniform-toggled slot).
+    if batch.topology_changed {
+        let mut dirty_chunks: FxHashSet<u32> = FxHashSet::default();
+        for w in &batch.cpu_writes {
+            dirty_chunks.insert(w.slot / CHUNK_SLOTS);
+        }
+        for c in &batch.commands {
+            dirty_chunks.insert(c.slot / CHUNK_SLOTS);
+        }
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("voxel_rt_gpu_pack_rebuild_accel"),
+        });
+        let dirty: Vec<&ChunkBlas> = scene
+            .chunks
+            .iter()
+            .filter(|chunk| dirty_chunks.contains(&(chunk.slot_base / CHUNK_SLOTS)))
+            .collect();
+        let sizes: Vec<wgpu::BlasAABBGeometrySizeDescriptor> = dirty
+            .iter()
+            .map(|chunk| wgpu::BlasAABBGeometrySizeDescriptor {
+                primitive_count: chunk.prim_count,
+                flags: wgpu::AccelerationStructureGeometryFlags::OPAQUE,
+            })
+            .collect();
+        let geos: Vec<_> = dirty
+            .iter()
+            .zip(sizes.iter())
+            .map(|(chunk, size)| wgpu::BlasBuildEntry {
+                blas: &chunk.blas,
+                geometry: wgpu::BlasGeometries::AabbGeometries(vec![wgpu::BlasAabbGeometry {
+                    size,
+                    stride: aabb_stride,
+                    aabb_buffer: &scene.aabb_buf,
+                    primitive_offset: chunk.slot_base * aabb_stride as u32,
+                }]),
+            })
+            .collect();
+        if !geos.is_empty() {
+            encoder.build_acceleration_structures(geos.iter(), core::iter::once(&scene.tlas));
+            render_queue.submit(core::iter::once(encoder.finish()));
+        }
     }
 }
 

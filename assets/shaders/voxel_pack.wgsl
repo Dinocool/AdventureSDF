@@ -1,0 +1,249 @@
+// **Phase G Stage G-a — the GPU brick PACK** (docs/PHASE_G_GALLERY_PLAN.md §"Stage G-a").
+//
+// Moves the PURE per-brick pack — `pack_one`'s halo-fill + `encode_paletted` + the buffer-write of the
+// bit-packed index stream / per-brick palette / `GpuBrickMeta` — off the CPU and onto the GPU. The CPU keeps
+// ALLOCATION (the slot/arena claim, the dirty-set + 26-neighbourhood expansion); this shader only encodes the
+// bytes the CPU `ResidentPacker` would have written, BYTE-IDENTICALLY.
+//
+// ## The byte SSOT this shader mirrors EXACTLY (src/voxel/gpu.rs)
+// - `halo_index(x,y,z)` — the haloed-grid cell layout (+X fastest, then +Y, then +Z, at edge 10).
+// - `pack_one` — the dense halo-fill: core from the brick, the 1-cell border from the SAME-LOD neighbour
+//   (AIR where absent), in `halo_index` order.
+// - `neighbour_border_cell` — which neighbour owns an out-of-core cell (`div_euclid`/`rem_euclid` on edge 8).
+// - `encode_paletted` — first-seen palette + `pow2_index_bits` bit-packing into `u32` words.
+// - `GpuBrickMeta::dense` (48 B) — the meta layout written into `meta_buf` at `slot·12` u32s.
+// If ANY of these drifts the headless byte-equality gate (`tests/voxel_gpu_pack_parity.rs`) fails — that test
+// is the make-or-break anchor.
+//
+// ## The palette-ORDER risk + its mitigation (the hardest part)
+// `encode_paletted` appends palette ids in CELL-ITERATION order (first-seen). A naive parallel encode would
+// permute the palette → different bytes (decodes to the same ids, but FAILS the byte gate). So the
+// palette-build step here is SERIAL within the workgroup: invocation 0 walks all 1000 haloed cells in exact
+// `halo_index` order, building the palette + the per-cell local-index map in workgroup shared memory. Only
+// AFTER that (a workgroup barrier) do all invocations bit-pack the local indices in parallel. Order-identical
+// to the CPU by construction.
+//
+// ## Layout
+// One WORKGROUP per dirty DENSE brick (a uniform / freed brick needs no GPU encode — the CPU emits its meta
+// straight, identical to the Delta arm). Each command names its slot + alloc offsets and points at the 27
+// `8³` neighbour cores (the brick + its 26 neighbours) the halo reads, with a presence bit per neighbour.
+
+// The brick edge (mirror of BRICK_EDGE in src/voxel/brickmap.rs). 8³ = 512 voxels per core.
+const BRICK_EDGE: i32 = 8;
+const CORE_CELLS: u32 = 512u;       // BRICK_EDGE³
+// The haloed edge (= BRICK_EDGE + 2) and cell count (mirror of halo_edge/halo_cells in src/voxel/gpu.rs).
+const HALO_EDGE: i32 = 10;
+const HALO_CELLS: u32 = 1000u;      // HALO_EDGE³
+// The 27 neighbour slots: index = (dz+1)*9 + (dy+1)*3 + (dx+1), dx,dy,dz ∈ {-1,0,1}. Slot 13 is the centre.
+const NEIGHBOUR_COUNT: u32 = 27u;
+// Mirror of META_FLAG_UNIFORM in src/voxel/gpu.rs (unused here — every command is dense — kept for clarity).
+const META_FLAG_UNIFORM: u32 = 1u;
+
+// One per-brick PACK command — a FLAT 16-u32 (64 B) record (NO `vec3`, whose 16-byte WGSL alignment would
+// silently insert padding and misalign the `array<PackCommand>` stride against the tightly-packed Rust
+// `#[repr(C)]`). Every field is a scalar `u32`/`i32`, so the WGSL stride is exactly 64 B = the Rust struct.
+// Mirrors `GpuPackCommand` in src/voxel/incremental.rs FIELD-FOR-FIELD (the byte producer of this struct).
+struct PackCommand {
+    origin_x: i32,                  // brick world-voxel origin x (= coord.x · BRICK_EDGE)
+    origin_y: i32,
+    origin_z: i32,
+    slot: u32,                      // the slot (= primitive_index); meta lands at meta_buf[slot·12]
+    world_min_x: f32,               // brick world-min corner
+    world_min_y: f32,
+    world_min_z: f32,
+    index_word_offset: u32,         // start u32 of this brick's index stream in voxel_buf
+    lod: u32,                       // brick LOD (bits 0-2 of the packed lod_and_bits)
+    index_bits: u32,                // the R2b bit width ∈ {1,2,4,8,16} (the CPU pre-computed it)
+    palette_word_offset: u32,       // start u32 of this brick's palette in brick_palettes_buf
+    neighbour_base: u32,            // base into `neighbour_indices` for this command's 27-entry table
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
+}
+
+// NEIGHBOUR_ABSENT — a `neighbour_indices` entry meaning the neighbour is not resident (halo → AIR). Mirror of
+// `NEIGHBOUR_ABSENT` in src/voxel/incremental.rs.
+const NEIGHBOUR_ABSENT: u32 = 0xFFFFFFFFu;
+
+@group(0) @binding(0) var<storage, read> commands: array<PackCommand>;
+// The DEDUPED core pool: each distinct resident brick's `8³` core ONCE (512 u32, voxel_index order). Core `i`'s
+// voxel is `cores[i·512 + voxel_index]`.
+@group(0) @binding(1) var<storage, read> cores: array<u32>;
+// The per-command 27-entry NEIGHBOUR TABLE (`command.neighbour_base + nslot`): a CORE-POOL index into `cores`,
+// or NEIGHBOUR_ABSENT. Slot 13 is the command's own brick. This is the dedup indirection that avoids uploading
+// each brick once per command that neighbours it.
+@group(0) @binding(2) var<storage, read> neighbour_indices: array<u32>;
+// The EXISTING pool buffers (bound read_write for this pass): the bit-packed index stream, the per-brick
+// palettes, and the 48-B meta directory (as a flat u32 array — meta `slot` lands at `meta_buf[slot·12]`).
+@group(0) @binding(3) var<storage, read_write> voxel_buf: array<u32>;
+@group(0) @binding(4) var<storage, read_write> brick_palettes_buf: array<u32>;
+@group(0) @binding(5) var<storage, read_write> meta_buf: array<u32>;
+
+// Workgroup shared state for ONE brick's pack.
+// `halo` — the 1000 haloed cells (block ids), in halo_index order (filled in parallel from the cores).
+var<workgroup> halo: array<u32, 1000>;
+// `local` — per-cell local palette index (filled SERIALLY by invocation 0, first-seen order).
+var<workgroup> local_idx: array<u32, 1000>;
+// `palette` — the brick's first-seen distinct ids; `palette_len` how many (k). Built serially by invocation 0.
+var<workgroup> palette: array<u32, 1000>;
+var<workgroup> palette_len: u32;
+
+const WG_SIZE: u32 = 256u;
+
+// Linear cell index in the haloed grid (mirror of `halo_index` / WGSL `cell_index`): +X fastest, then +Y, +Z.
+fn halo_index(x: i32, y: i32, z: i32) -> i32 {
+    return x + y * HALO_EDGE + z * HALO_EDGE * HALO_EDGE;
+}
+
+// Linear voxel index in an 8³ core (mirror of `voxel_index` in src/voxel/brickmap.rs): +X fastest.
+fn voxel_index(x: i32, y: i32, z: i32) -> u32 {
+    return u32(x + y * BRICK_EDGE + z * BRICK_EDGE * BRICK_EDGE);
+}
+
+// Euclidean div/rem on edge 8 for the tiny range cc ∈ [-1, 8] (the halo border) — mirror of the CPU's
+// `cc.div_euclid(8)` / `cc.rem_euclid(8)` exactly over that range. cc=-1 → (div -1, rem 7); cc∈[0,7] → (0, cc);
+// cc=8 → (1, 0). Branch-explicit so it can never diverge from the CPU integer semantics.
+fn nbr_off(cc: i32) -> i32 {
+    if (cc < 0) { return -1; }
+    if (cc >= BRICK_EDGE) { return 1; }
+    return 0;
+}
+fn nbr_local(cc: i32) -> i32 {
+    if (cc < 0) { return BRICK_EDGE - 1; } // -1 → 7
+    if (cc >= BRICK_EDGE) { return 0; }    // 8 → 0
+    return cc;
+}
+
+// The smallest power-of-2 bit width in {1,2,4,8,16} that indexes k ids — mirror of `pow2_index_bits`.
+// (Only used as an assert mirror; the CPU passes the already-resolved `index_bits` in the command.)
+fn pow2_index_bits(k: u32) -> u32 {
+    if (k <= 2u) { return 1u; }
+    if (k <= 4u) { return 2u; }
+    if (k <= 16u) { return 4u; }
+    if (k <= 256u) { return 8u; }
+    return 16u;
+}
+
+@compute @workgroup_size(256)
+fn pack_brick(
+    @builtin(workgroup_id) wg: vec3<u32>,
+    @builtin(local_invocation_id) lid: vec3<u32>,
+) {
+    let cmd_idx = wg.x;
+    if (cmd_idx >= arrayLength(&commands)) {
+        return;
+    }
+    let cmd = commands[cmd_idx];
+    let li = lid.x;
+
+    // (1) HALO FILL — reproduce `pack_one`'s dense fill: walk the haloed grid in halo_index order; a core cell
+    //     (local coord in [0,8)) reads the centre core; a border cell reads the owning same-LOD neighbour core,
+    //     or AIR (block 0) when that neighbour is absent. Parallel over the 1000 cells (pure per-cell function).
+    for (var cell = li; cell < HALO_CELLS; cell = cell + WG_SIZE) {
+        // Decode the haloed local coord (hx,hy,hz) from the linear `cell` (inverse of halo_index).
+        let hz = i32(cell) / (HALO_EDGE * HALO_EDGE);
+        let rem = i32(cell) % (HALO_EDGE * HALO_EDGE);
+        let hy = rem / HALO_EDGE;
+        let hx = rem % HALO_EDGE;
+        // Core-local coord (the halo border ring is the -1 / 8 shell). `pack_one` uses cc = h - 1.
+        let cx = hx - 1;
+        let cy = hy - 1;
+        let cz = hz - 1;
+        let in_core = (cx >= 0 && cx < BRICK_EDGE) && (cy >= 0 && cy < BRICK_EDGE) && (cz >= 0 && cz < BRICK_EDGE);
+        var block: u32 = 0u; // AIR default (BlockId::AIR == 0)
+        if (in_core) {
+            // The centre core is neighbour slot 13 = (0+1)*9 + (0+1)*3 + (0+1).
+            let core = neighbour_indices[cmd.neighbour_base + 13u];
+            block = cores[core * CORE_CELLS + voxel_index(cx, cy, cz)];
+        } else {
+            // Resolve the owning same-LOD neighbour (mirror of `neighbour_border_cell`).
+            let dx = nbr_off(cx);
+            let dy = nbr_off(cy);
+            let dz = nbr_off(cz);
+            let nslot = u32((dz + 1) * 9 + (dy + 1) * 3 + (dx + 1));
+            let core = neighbour_indices[cmd.neighbour_base + nslot];
+            if (core != NEIGHBOUR_ABSENT) {
+                let lx = nbr_local(cx);
+                let ly = nbr_local(cy);
+                let lz = nbr_local(cz);
+                block = cores[core * CORE_CELLS + voxel_index(lx, ly, lz)];
+            }
+            // else: neighbour absent (or a shell boundary) → AIR, the conservative pre-halo behaviour.
+        }
+        halo[cell] = block;
+    }
+    workgroupBarrier();
+
+    // (2) SERIAL PALETTE BUILD — invocation 0 walks all 1000 cells in halo_index order, building the first-seen
+    //     palette + the per-cell local-index map. Order-identical to `encode_paletted` by construction (this is
+    //     the palette-order mitigation: a parallel build would permute first-seen order → wrong bytes).
+    if (li == 0u) {
+        var k: u32 = 0u;
+        for (var cell = 0u; cell < HALO_CELLS; cell = cell + 1u) {
+            let id = halo[cell];
+            // Linear scan for `id` in the palette built so far (k is tiny — a strata band is 2–8 ids).
+            var found: i32 = -1;
+            for (var p = 0u; p < k; p = p + 1u) {
+                if (palette[p] == id) {
+                    found = i32(p);
+                    break;
+                }
+            }
+            if (found < 0) {
+                palette[k] = id;
+                local_idx[cell] = k;
+                k = k + 1u;
+            } else {
+                local_idx[cell] = u32(found);
+            }
+        }
+        palette_len = k;
+    }
+    workgroupBarrier();
+
+    // (3) BIT-PACK the local indices into voxel_buf, in parallel. index_bits ∈ {1,2,4,8,16} all divide 32, so a
+    //     cell's index never straddles a word boundary — but two cells CAN share a word, so we accumulate per
+    //     32-bit WORD (one invocation per word) to avoid a read-modify-write race. Mirror of `encode_paletted`'s
+    //     pack loop: `indices[bit/32] |= (idx & mask) << (bit % 32)`.
+    let bits = cmd.index_bits;
+    let cells_per_word = 32u / bits;
+    let total_words = (HALO_CELLS * bits + 31u) / 32u; // = ceil(1000·bits / 32) — same as encode_paletted's `words`
+    let mask = select((1u << bits) - 1u, 0xFFFFFFFFu, bits == 32u);
+    for (var w = li; w < total_words; w = w + WG_SIZE) {
+        var word: u32 = 0u;
+        let first_cell = w * cells_per_word;
+        for (var j = 0u; j < cells_per_word; j = j + 1u) {
+            let cell = first_cell + j;
+            if (cell < HALO_CELLS) {
+                let idx = local_idx[cell] & mask;
+                word = word | (idx << (j * bits));
+            }
+        }
+        voxel_buf[cmd.index_word_offset + w] = word;
+    }
+
+    // (4) PALETTE WRITE — the k distinct ids (one u32 each), first-seen order, into brick_palettes_buf.
+    let k = palette_len;
+    for (var p = li; p < k; p = p + WG_SIZE) {
+        brick_palettes_buf[cmd.palette_word_offset + p] = palette[p];
+    }
+
+    // (5) META WRITE — the 48-B GpuBrickMeta::dense, as 12 u32 at meta_buf[slot·12]. Field order MUST match
+    //     `#[repr(C)] GpuBrickMeta`: voxel_origin[3], voxel_offset, world_min[3], lod_and_bits, palette_base,
+    //     flags, _pad[2]. `lod_and_bits = (lod & 7) | ((index_bits & 0x1F) << 3)` (mirror of `pack_lod_bits`).
+    if (li == 0u) {
+        let base = cmd.slot * 12u;
+        meta_buf[base + 0u] = bitcast<u32>(cmd.origin_x);
+        meta_buf[base + 1u] = bitcast<u32>(cmd.origin_y);
+        meta_buf[base + 2u] = bitcast<u32>(cmd.origin_z);
+        meta_buf[base + 3u] = cmd.index_word_offset;                       // voxel_offset
+        meta_buf[base + 4u] = bitcast<u32>(cmd.world_min_x);
+        meta_buf[base + 5u] = bitcast<u32>(cmd.world_min_y);
+        meta_buf[base + 6u] = bitcast<u32>(cmd.world_min_z);
+        meta_buf[base + 7u] = (cmd.lod & 0x7u) | ((cmd.index_bits & 0x1Fu) << 3u); // lod_and_bits
+        meta_buf[base + 8u] = cmd.palette_word_offset;                     // palette_base
+        meta_buf[base + 9u] = 0u;                                          // flags (0 = dense)
+        meta_buf[base + 10u] = 0u;                                         // _pad[0]
+        meta_buf[base + 11u] = 0u;                                         // _pad[1]
+    }
+}

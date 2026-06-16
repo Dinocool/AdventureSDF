@@ -111,6 +111,15 @@ fn voxel_raytrace_wgsl_validates() {
 }
 
 #[test]
+fn voxel_pack_wgsl_validates() {
+    // Phase G Stage G-a — the GPU brick PACK compute shader (`pack_brick`). Fully self-contained (no `#import`,
+    // no shader-defs): one workgroup per dirty dense brick, halo-fill + serial palette build + parallel bit-pack
+    // into the pool buffers. Validating here catches a WGSL typo / a workgroup-array overflow without a GPU.
+    let path = Path::new("assets/shaders/voxel_pack.wgsl");
+    validate_entry(path).unwrap_or_else(|e| panic!("{e}"));
+}
+
+#[test]
 fn voxel_rt_composite_wgsl_validates() {
     // The composite + the DLSS-RR `fs_resolve_dlss` resolve pass (multi-target colour+motion + frag_depth).
     let path = Path::new("assets/shaders/voxel_rt_composite.wgsl");
