@@ -621,3 +621,60 @@ fn dropped_slot_is_quarantined_then_reused() {
     packer.update(&e2, reg.len() as u32);
     assert_eq!(packer.resident_count(), 4);
 }
+
+/// **TIER-1 pre-size gate.** Streaming a load in `max_bricks_per_frame`-sized batches the way the production
+/// `stream_voxel_rt_residency` does: the UN-pre-sized packer ([`ResidentPacker::new_unreserved`]) overflows its
+/// arena repeatedly mid-load and `grew()`s (forcing the ~200 ms re-snapshots), while the PRE-SIZED packer
+/// ([`ResidentPacker::new`], the production constructor) reserves to the cap up front and `grew()`s ZERO times
+/// after its first snapshot — for the SAME load. This is the regression gate for the grow-snapshot fix.
+#[test]
+fn presized_arena_eliminates_mid_load_grows() {
+    let reg = registry();
+    // A small cap so the test is fast but the reserve still covers the corpus (cap ≥ corpus so the cap path is
+    // exercised, not the slot-capacity drop path).
+    let cap = 8192u32;
+    let batch = 256usize;
+    // A dense cube of patterned bricks (each non-uniform, so it allocates index + palette slabs).
+    let corpus: Vec<(IVec3, Brick)> = {
+        let edge = 16i32; // 16³ = 4096 dense bricks
+        let mut v = Vec::new();
+        for z in 0..edge {
+            for y in 0..edge {
+                for x in 0..edge {
+                    v.push((IVec3::new(x, y, z), patterned_brick(x * 31 + y * 17 + z * 11)));
+                }
+            }
+        }
+        v
+    };
+
+    // Drive a packer through the corpus in batches, mirroring the production update→{snapshot|grow|delta} loop.
+    // Returns the number of GROW-snapshots (a `grew()` AFTER the epoch's first snapshot).
+    fn drive(packer: &mut ResidentPacker, corpus: &[(IVec3, Brick)], reg: &BlockRegistry, batch: usize) -> u32 {
+        let mut resident: Vec<(IVec3, Brick)> = Vec::new();
+        let mut epoch_snapshotted = false;
+        let mut grows = 0u32;
+        let mut next = 0usize;
+        while next < corpus.len() {
+            let end = (next + batch).min(corpus.len());
+            resident.extend_from_slice(&corpus[next..end]);
+            next = end;
+            let entries: Vec<ResidentBrick> =
+                resident.iter().map(|(c, b)| ResidentBrick { coord: *c, brick: b, lod: 0 }).collect();
+            packer.update(&entries, reg.len() as u32);
+            if !epoch_snapshotted || packer.grew() {
+                if epoch_snapshotted && packer.grew() {
+                    grows += 1; // a mid-load grow-snapshot
+                }
+                packer.snapshot_buffers(reg);
+                epoch_snapshotted = true;
+            }
+        }
+        grows
+    }
+
+    let before = drive(&mut ResidentPacker::new_unreserved(cap), &corpus, &reg, batch);
+    let after = drive(&mut ResidentPacker::new(cap), &corpus, &reg, batch);
+    assert!(before > 0, "the un-pre-sized arena must grow mid-load (else the test corpus is too small to be a gate)");
+    assert_eq!(after, 0, "the pre-sized arena must NOT grow mid-load for a normal load (got {after} grows)");
+}
