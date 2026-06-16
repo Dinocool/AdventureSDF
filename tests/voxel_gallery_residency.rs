@@ -18,11 +18,12 @@ use bevy::math::IVec3;
 
 use adventure::voxel::brickmap::{BRICK_EDGE, BRICK_VOXELS, Brick, BrickMap, brick_coord_of_voxel, voxel_index};
 use adventure::voxel::edits::VoxelEdits;
-use adventure::voxel::gallery::{LoadedScene, merge_scenes};
+use adventure::voxel::gallery::{GALLERY_SCENES, LoadedScene, merge_scenes, vxo_gallery_placements};
 use adventure::voxel::gpu::pack_resident_set;
 use adventure::voxel::palette::{BlockId, BlockRegistry};
 use adventure::voxel::source::{BrickSource, StaticVoxSource};
 use adventure::voxel::streaming::{ResidencyManager, StreamingConfig};
+use adventure::voxel::vxo::MergedSource;
 
 /// A registry with `n` solid blocks (the per-scene `.vox`-style palette stand-in). `from_vox_palette` mirrors
 /// what `load_vox` builds: AIR + one opaque block per palette colour.
@@ -219,4 +220,72 @@ fn merged_map_streams_through_clipmap_and_sources_from_merge() {
     assert!(patch.brick_count() > 0, "the merged scene packs a non-empty resident set");
     assert_eq!(patch.palette.len(), reg.len(), "the packed palette mirrors the MERGED registry");
     assert!(patch.voxels.contains(&1), "the packed voxels contain scene A's merged block id 1");
+}
+
+/// **The LIVE streamed gallery path** (the `.vxo` wiring): the SHIPPED [`GALLERY_SCENES`] table maps to its
+/// `.vxo` siblings, auto-spaces them along +X ([`vxo_gallery_placements`]), and merges them into ONE
+/// [`MergedSource`] ([`MergedSource::open_paths`]) — the EXACT call sequence `raytrace.rs` runs on the Gallery
+/// switch. That `MergedSource` (a [`BrickSource`]) streams through the SAME [`ResidencyManager`] clipmap, and
+/// the decoded-region LRU keeps it BOUNDED-RAM (it never expands the whole scene). This gates the user goal:
+/// the classic scenes LOADED + streamed from `.vxo` at 0.05 m via the shared residency.
+///
+/// SKIPS (passes) if the `.vxo` corpus isn't baked in this checkout — the placement list is empty, exactly the
+/// signal the live path uses to fall back to the legacy `.vox` merge (covered by the synthetic tests above).
+///
+/// `#[ignore]`d (run with `--ignored`): it streams the REAL multi-MB Sponza `.vxo` through the full clipmap at
+/// 0.05 m, which demand-downsamples the coarse shells (the EXPECTED Phase-G shared-pipeline cost) and takes
+/// minutes — too slow for the default suite. It is the on-demand ASSET-INTEGRITY + live-wiring gate; the fast
+/// synthetic tests above + the streamed-source unit tests cover the logic in the default run.
+#[test]
+#[ignore = "streams the real Sponza `.vxo` through the clipmap (minutes at 0.05 m); run with --ignored"]
+fn shipped_vxo_gallery_streams_through_residency_bounded_ram() {
+    let placements = vxo_gallery_placements(GALLERY_SCENES);
+    if placements.is_empty() {
+        eprintln!("no gallery `.vxo` baked in this checkout — skipping the streamed-residency gate");
+        return;
+    }
+
+    // Build the merged streamed source EXACTLY as the Gallery switch does (path-map → placements → merge).
+    let (merged, reg): (MergedSource, BlockRegistry) = MergedSource::open_paths(&placements);
+    assert!(reg.len() > 1, "the merged `.vxo` registry concatenates the assets' palettes (not AIR-only)");
+
+    // Stream it through the SAME clipmap residency Sponza/worldgen use — a MergedSource is a drop-in BrickSource.
+    // Camera near the first asset (Sponza anchors at the origin like standalone Sponza), a small clip so the
+    // drain is bounded for the test. The first asset's −X bound sits at brick column 0 (auto-spaced from 0).
+    let edits = VoxelEdits::new();
+    let cfg = StreamingConfig { clip_half_bricks: 4, max_resident_bricks: 1_000_000, max_bricks_per_frame: 1_000_000 };
+    let mut mgr = ResidencyManager::new();
+    // Sponza is large; put the eye a couple of metres up inside its −X end so a populated shell streams in.
+    let cam = [1.0_f32, 2.0, 1.0];
+    mgr.update(cam, &cfg, &merged);
+    assert!(mgr.pending() > 0, "entering the merged `.vxo` clipmap enqueues work (the asset streams in)");
+    let mut drains = 0;
+    while mgr.pending() > 0 && drains < 64 {
+        mgr.drain_work_from(&cfg, &merged, &reg, &edits);
+        drains += 1;
+    }
+    assert!(mgr.resident_count() > 0, "the streamed `.vxo` gallery streams in resident bricks via residency");
+
+    // Every resident LOD0 brick equals the MergedSource brick at its key (the residency stored exactly what the
+    // streamed source produced) — the gallery sources from the `.vxo` merge, not the legacy `.vox` map.
+    for e in mgr.resident_entries() {
+        if e.lod != 0 {
+            continue;
+        }
+        assert_eq!(
+            *e.brick,
+            merged.brick(e.coord, 0, &reg),
+            "resident LOD0 brick {:?} must equal MergedSource::brick over the streamed `.vxo` gallery",
+            e.coord
+        );
+    }
+
+    // BOUNDED-RAM proof: the decoded-region LRU never expanded the whole scene. The merged registry is on the
+    // order of a few hundred colours, NOT the millions of bricks a full-RAM pyramid would hold. (The per-asset
+    // LRU byte cap is asserted directly in the streamed-source unit tests; here we assert the live merged path
+    // packs a non-empty resident set whose palette mirrors the streamed registry — it routed through residency.)
+    let entries = mgr.resident_entries();
+    let patch = pack_resident_set(&entries, &reg);
+    assert!(patch.brick_count() > 0, "the streamed `.vxo` gallery packs a non-empty resident set");
+    assert_eq!(patch.palette.len(), reg.len(), "the packed palette mirrors the streamed merged registry");
 }

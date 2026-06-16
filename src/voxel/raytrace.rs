@@ -43,7 +43,7 @@ use bevy::core_pipeline::prepass::ViewPrepassTextures;
 
 use super::brickmap::{BRICK_WORLD_SIZE, BrickMap};
 use super::cornell::{build_cornell, build_cornell_with_edits};
-use super::gallery::{GALLERY_SCENES, load_gallery};
+use super::gallery::{GALLERY_SCENES, load_gallery, vxo_gallery_placements};
 use super::edits::{VoxelEdits, VoxelHit, pick_voxel};
 use super::gpu::{
     GpuAliasEntry, GpuBrickAabb, GpuBrickMeta, GpuBrickPatch, GpuInstanceDescriptor, GpuVoxelLight,
@@ -54,6 +54,7 @@ use super::palette::{BlockId, BlockRegistry, CornellBlock};
 use super::source::{BrickSource, StaticVoxSource, WorldgenSource};
 use super::streaming::{BrickKey, ResidencyManager, StreamingConfig, camera_brick_coord, region_half_extent_m};
 use super::vox::load_vox;
+use super::vxo::MergedSource;
 use super::{VoxelScene, build_height_layer_pub, load_biome_library_pub};
 use crate::sdf_render::SdfCamera;
 use crate::sdf_render::worldgen::WORLDGEN_SLICE_SEED;
@@ -183,8 +184,16 @@ pub struct VoxelRtStreaming {
     /// The Gallery's [`StaticVoxSource`] — its MIP PYRAMID over the MERGED multi-scene map, built ONCE on the
     /// Gallery switch and reused every frame (NOT per-frame in the drain — the same build-once rule as
     /// [`sponza_source`](Self::sponza_source), so the merged row never re-downsamples per streaming frame).
-    /// `None` off Gallery (freed on a switch away).
+    /// `None` off Gallery (freed on a switch away). This is the LEGACY full-RAM fallback — used only when no
+    /// `.vxo` asset is present (see [`gallery_vxo`](Self::gallery_vxo)).
     gallery_source: Option<StaticVoxSource>,
+    /// The STREAMED Gallery source — a [`MergedSource`] over the per-asset `.vxo` files (`docs/VXO_FORMAT.md`
+    /// §B2.4) + its concatenated [`BlockRegistry`]. The PREFERRED live gallery path: each `.vxo` is region-
+    /// STREAMED (bounded-RAM — only demanded regions decode, an LRU caps RAM), NOT a full-RAM `StaticVoxSource`
+    /// mip pyramid. Built ONCE on the Gallery switch (open + merge several `.vxo` headers; bricks stream lazily
+    /// per shell demand) and reused every frame. `None` off Gallery, OR when no `.vxo` is baked (then the legacy
+    /// [`gallery_source`](Self::gallery_source) over the `.vox` merge is used instead — the fallback).
+    gallery_vxo: Option<(MergedSource, BlockRegistry)>,
     /// Which scene the last packed patch was built for. `None` until the first pack; on a scene switch this
     /// differs from the live [`VoxelScene`], triggering a one-shot re-pack of the new scene.
     packed_scene: Option<VoxelScene>,
@@ -373,6 +382,7 @@ fn init_voxel_rt_streaming(
         sponza_source: None,
         gallery: None,
         gallery_source: None,
+        gallery_vxo: None,
         packed_scene: None,
         packed_edit_gen: None,
         worldgen_dirty_pending: false,
@@ -467,21 +477,42 @@ fn stream_voxel_rt_residency(
                 ),
             }
         }
-        // On the Gallery switch, load + MERGE the data-driven scene row ONCE + cache it (mirrors the Sponza
-        // `.vox` cache). `load_gallery` never FAILS — absent assets are skipped with a warn — so this is always
-        // `Some`; an empty merged map (no scene baked) is treated as "nothing to stream" below, exactly like a
-        // missing Sponza asset (Cornell fallback), so the engine still renders + never panics.
-        if matches!(*scene, VoxelScene::Gallery) && streaming.gallery.is_none() {
-            streaming.gallery = Some(load_gallery(GALLERY_SCENES));
+        // On the Gallery switch, build the gallery source ONCE + cache it (mirrors the Sponza `.vox` cache).
+        // PREFER the STREAMED `.vxo` path (bounded-RAM — each asset region-streams through a `MergedSource`,
+        // §B2.4): open + merge every present `.vxo` (auto-spaced along +X by `vxo_gallery_placements`, absent
+        // ones skipped with a warn). If NO `.vxo` is present (a fresh checkout), FALL BACK to the legacy
+        // full-RAM `.vox` merge (`load_gallery`) so the scene still loads. Neither path FAILS — absent assets
+        // are skipped — so an all-absent gallery yields an empty map ⇒ "nothing to stream" (Cornell fallback)
+        // below, exactly like a missing Sponza asset (the engine still renders + never panics).
+        if matches!(*scene, VoxelScene::Gallery)
+            && streaming.gallery_vxo.is_none()
+            && streaming.gallery.is_none()
+        {
+            let placements = vxo_gallery_placements(GALLERY_SCENES);
+            if placements.is_empty() {
+                // No `.vxo` baked — fall back to the legacy full-RAM `.vox` merge so the gallery still loads.
+                warn!(
+                    "voxel-RT: no gallery `.vxo` present — falling back to the legacy full-RAM `.vox` merge \
+                     (re-bake the corpus to `.vxo` for bounded-RAM streaming)"
+                );
+                streaming.gallery = Some(load_gallery(GALLERY_SCENES));
+            } else {
+                let (merged, registry) = MergedSource::open_paths(&placements);
+                info!(
+                    "voxel-RT: streaming the GALLERY from {} `.vxo` asset(s) via MergedSource (bounded-RAM)",
+                    placements.len()
+                );
+                streaming.gallery_vxo = Some((merged, registry));
+            }
         }
-        // A static `.vox`-backed scene whose merged/loaded map is MISSING or EMPTY (the asset(s) aren't baked):
+        // A static `.vox`/`.vxo`-backed scene whose source is MISSING or EMPTY (the asset(s) aren't baked):
         // pack a static Cornell box this frame so the engine still renders + never panics, latch
         // packed_scene = *scene (so we don't re-pack every frame), and bail out of the streaming path for this
         // scene until the asset exists / the scene changes. Sponza: `sponza == None` (load failed). Gallery:
-        // the merge produced an empty map (no rows loaded).
+        // NEITHER the streamed `.vxo` MergedSource NOR the legacy `.vox` merge produced anything (no rows baked).
         let static_map_missing = match *scene {
             VoxelScene::Sponza => streaming.sponza.is_none(),
-            VoxelScene::Gallery => streaming.gallery.as_ref().is_none_or(|(map, _)| map.is_empty()),
+            VoxelScene::Gallery => gallery_source_missing(&streaming),
             _ => false,
         };
         if static_map_missing {
@@ -525,7 +556,10 @@ fn stream_voxel_rt_residency(
         } else {
             None
         };
-        streaming.gallery_source = if matches!(*scene, VoxelScene::Gallery) {
+        // Build the LEGACY `.vox` mip pyramid ONLY for the fallback path (no `.vxo` present): when the streamed
+        // `.vxo` MergedSource is the live source, the `.vox` merge isn't loaded and this stays `None` (the
+        // MergedSource serves the residency directly — bounded-RAM, no full-RAM pyramid).
+        streaming.gallery_source = if matches!(*scene, VoxelScene::Gallery) && streaming.gallery_vxo.is_none() {
             streaming.gallery.as_ref().map(|(map, _)| StaticVoxSource::new(map))
         } else {
             None
@@ -537,12 +571,18 @@ fn stream_voxel_rt_residency(
                 info!("voxel-RT: switched to SPONZA scene — streaming the baked .vox through the clipmap");
             }
             VoxelScene::Gallery => {
-                // The gallery is a row of baked scenes (Sponza et al.) under the same open-sky GI preset Sponza
-                // uses — the row is a GI/LOD COMPARISON, so all scenes share one lighting/sky so differences read
-                // as scene-geometry, not lighting. Knobs-as-uniforms; the editor overrides afterward.
+                // The gallery is a row of baked ARCHITECTURAL scenes (Sponza / Sibenik / Conference) under the
+                // same open-sky GI preset Sponza uses — the row is a GI/LOD COMPARISON, so all scenes share one
+                // lighting/sky so differences read as scene-geometry, not lighting. The Sponza preset (a raking
+                // sun + a bright open sky) makes the architecture visible (colonnades, vaults, soft fill). Set
+                // ONLY on the switch — knobs-as-uniforms; the editor overrides afterward without being clobbered.
                 lighting.data = LightingUniformData::sponza();
                 sky.data = SkyUniformData::sponza();
-                info!("voxel-RT: switched to GALLERY scene — streaming the MERGED multi-.vox row through the clipmap");
+                let streamed = streaming.gallery_vxo.is_some();
+                info!(
+                    "voxel-RT: switched to GALLERY scene — streaming the MERGED row through the clipmap ({})",
+                    if streamed { "bounded-RAM `.vxo` MergedSource" } else { "legacy full-RAM `.vox` merge" }
+                );
             }
             _ => {
                 lighting.data = LightingUniformData::worldgen();
@@ -561,7 +601,7 @@ fn stream_voxel_rt_residency(
     // exists / the scene changes. Worldgen is unaffected (it has no static-map dependency).
     let static_map_missing = match *scene {
         VoxelScene::Sponza => streaming.sponza.is_none(),
-        VoxelScene::Gallery => streaming.gallery.as_ref().is_none_or(|(map, _)| map.is_empty()),
+        VoxelScene::Gallery => gallery_source_missing(&streaming),
         _ => false,
     };
     if static_map_missing {
@@ -611,6 +651,7 @@ fn stream_voxel_rt_residency(
         sponza_source,
         gallery,
         gallery_source,
+        gallery_vxo,
         worldgen_dirty_pending,
         worldgen_frames_since_pack,
         last_cam_brick,
@@ -636,12 +677,19 @@ fn stream_voxel_rt_residency(
             (src, vox_registry)
         }
         VoxelScene::Gallery => {
-            // The MERGED multi-scene map + its concatenated registry + the prebuilt source are ready by here
-            // (the source's pyramid over the whole row was built ONCE on the switch; the empty-merge case
-            // returned above). Reuse the CACHED source — never re-merge / re-downsample per frame.
-            let (_, vox_registry) = gallery.as_ref().expect("gallery map merged before streaming");
-            let src = gallery_source.as_ref().expect("gallery source built on the switch");
-            (src, vox_registry)
+            // PREFER the STREAMED `.vxo` MergedSource (bounded-RAM, §B2.4): each asset region-streams through
+            // the SAME residency demand path — `MergedSource` impls `BrickSource`, so it's a drop-in source
+            // (its concatenated registry is the active palette). It was built ONCE on the switch; the residency
+            // pulls bricks lazily per shell demand (no full-RAM mip pyramid). Fall back to the legacy `.vox`
+            // `StaticVoxSource` ONLY when no `.vxo` was present (the empty-everything case returned above).
+            match gallery_vxo.as_ref() {
+                Some((merged, merged_registry)) => (merged as &dyn BrickSource, merged_registry),
+                None => {
+                    let (_, vox_registry) = gallery.as_ref().expect("gallery `.vox` merged before streaming");
+                    let src = gallery_source.as_ref().expect("gallery `.vox` source built on the switch");
+                    (src as &dyn BrickSource, vox_registry)
+                }
+            }
         }
         _ => (&worldgen_source, registry),
     };
@@ -725,6 +773,17 @@ fn stream_voxel_rt_residency(
             manager.pending()
         );
     }
+}
+
+/// True iff the GALLERY scene has NO streamable source — NEITHER the streamed `.vxo` [`MergedSource`] NOR a
+/// non-empty legacy `.vox` merge is available (no gallery asset baked in this checkout). The SSOT the switch +
+/// the latched never-panic guard consult to decide the Cornell fallback vs. the streaming path. When this is
+/// `false`, exactly one of the two gallery sources is live (the `.vxo` MergedSource is preferred; the `.vox`
+/// `StaticVoxSource` is the fallback) and the source-selection block can `expect` it.
+fn gallery_source_missing(streaming: &VoxelRtStreaming) -> bool {
+    let vxo_missing = streaming.gallery_vxo.is_none();
+    let vox_missing = streaming.gallery.as_ref().is_none_or(|(map, _)| map.is_empty());
+    vxo_missing && vox_missing
 }
 
 /// The resident clipmap keys an edit-delta change INVALIDATES: for each overridden world voxel, the LOD0
@@ -3965,6 +4024,7 @@ mod tests {
             sponza_source: None,
             gallery: None,
             gallery_source: None,
+            gallery_vxo: None,
             packed_scene: Some(VoxelScene::Sponza), // already latched on the switch frame
             packed_edit_gen: Some(0),
             worldgen_dirty_pending: false,

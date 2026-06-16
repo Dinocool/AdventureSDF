@@ -53,7 +53,14 @@ pub const GALLERY_GAP_BRICKS: i32 = 8;
 #[derive(Clone, Copy, Debug)]
 pub struct GalleryEntry {
     /// Path to the baked `.vox` (relative to the crate root, like [`super::raytrace::SPONZA_VOX_PATH`]).
+    /// Used by the LEGACY full-RAM merge ([`load_gallery`]) — kept as the import side + the fallback when no
+    /// `.vxo` is present.
     pub vox_path: &'static str,
+    /// Path to the STREAMED `.vxo` sibling (the region-streamed, bounded-RAM form of the same asset, baked at
+    /// 0.05 m). The LIVE gallery prefers this — opened via [`super::vxo::VxoSource`] + merged into one
+    /// [`super::vxo::MergedSource`] (see [`vxo_gallery_placements`]). Absent on disk ⇒ skipped with a warn,
+    /// exactly like an absent `.vox` (a fresh checkout with no `.vxo` falls back to the `.vox` path).
+    pub vxo_path: &'static str,
     /// Explicit LOD0-brick placement offset, or `None` to auto-space along +X past the previous scene.
     pub offset: Option<IVec3>,
     /// A short human label (for logging / a future per-scene UI marker). Not load-bearing for the merge.
@@ -67,12 +74,27 @@ pub struct GalleryEntry {
 /// [`GALLERY_GAP_BRICKS`] aisle, so adding a row is a one-liner — no offset math by hand. Absent assets are
 /// skipped with a `warn!` at load (never a panic), so an un-baked row simply doesn't appear in the merge.
 pub const GALLERY_SCENES: &[GalleryEntry] = &[
-    GalleryEntry { vox_path: super::raytrace::SPONZA_VOX_PATH, offset: None, label: "Sponza" },
-    GalleryEntry { vox_path: "assets/models/sibenik.vox", offset: None, label: "Sibenik" },
-    GalleryEntry { vox_path: "assets/models/conference.vox", offset: None, label: "Conference" },
+    GalleryEntry {
+        vox_path: super::raytrace::SPONZA_VOX_PATH,
+        vxo_path: "assets/models/sponza.vxo",
+        offset: None,
+        label: "Sponza",
+    },
+    GalleryEntry {
+        vox_path: "assets/models/sibenik.vox",
+        vxo_path: "assets/models/sibenik.vxo",
+        offset: None,
+        label: "Sibenik",
+    },
+    GalleryEntry {
+        vox_path: "assets/models/conference.vox",
+        vxo_path: "assets/models/conference.vxo",
+        offset: None,
+        label: "Conference",
+    },
     // Roadmap (uncomment as each is baked — auto-spaced +X with a gap, no offset math needed):
-    // GalleryEntry { vox_path: "assets/models/bistro.vox", offset: None, label: "Bistro" }, // needs #126 KTX2
-    // GalleryEntry { vox_path: "assets/models/san_miguel.vox", offset: None, label: "San Miguel" },
+    // GalleryEntry { vox_path: "…/bistro.vox", vxo_path: "…/bistro.vxo", offset: None, label: "Bistro" },
+    // GalleryEntry { vox_path: "…/san_miguel.vox", vxo_path: "…/san_miguel.vxo", offset: None, label: "San Miguel" },
 ];
 
 /// Load every entry in `scenes`, SHIFT each into a non-overlapping side-by-side region, and MERGE into ONE
@@ -114,6 +136,65 @@ pub fn load_gallery(scenes: &[GalleryEntry]) -> (BrickMap, BlockRegistry) {
         }
     }
     merge_scenes(loaded)
+}
+
+/// Compute the STREAMED `.vxo` gallery placement list `&[(vxo_path, +X brick offset)]` — the input to
+/// [`super::vxo::MergedSource::open_paths`], which loads each `.vxo` region-streamed (bounded-RAM) instead of
+/// the legacy full-RAM `.vox` merge ([`load_gallery`]). The OFFSETS auto-space the assets along +X exactly like
+/// [`merge_scenes`] auto-spaces the `.vox` maps: each asset is placed so its −X brick bound lands at the running
+/// cursor, and the cursor advances past its +X bound plus [`GALLERY_GAP_BRICKS`]. The per-asset brick WIDTH is
+/// read from each `.vxo`'s `HEAD.bounds` (no region decode — only the eager header), so the spacing is a pure
+/// function of the baked bounds, matching the `.vox` auto-spacer's "place past the previous scene + a gap".
+///
+/// A `.vxo` ABSENT on disk (or that fails to open) is SKIPPED with a `warn!` and does NOT advance the cursor —
+/// mirroring [`load_gallery`]'s absent-`.vox` skip — so a partially-baked gallery still streams the assets that
+/// exist (never a panic). An EMPTY return (no `.vxo` present) signals the caller to fall back to the legacy
+/// `.vox` path. Pure + deterministic (open + bounds arithmetic only).
+pub fn vxo_gallery_placements(scenes: &[GalleryEntry]) -> Vec<(std::path::PathBuf, IVec3)> {
+    use super::vxo::VxoSource;
+
+    let mut placements: Vec<(std::path::PathBuf, IVec3)> = Vec::with_capacity(scenes.len());
+    // The +X auto-spacing cursor in LOD0 brick coords — the next free brick column past everything placed so
+    // far. Starts at 0 (the first asset anchors at the origin), identical to `merge_scenes`.
+    let mut x_cursor_bricks = 0i32;
+
+    for entry in scenes {
+        // Open the `.vxo` only to read its eager HEAD (bounds) — a missing/invalid asset is skipped with a warn
+        // (no panic), exactly like a missing `.vox` in `load_gallery`. We re-open it inside `MergedSource` so the
+        // streamed source owns its own mmap; this open is short-lived (header parse only, no region decode).
+        let head = match VxoSource::open(entry.vxo_path) {
+            Ok((source, _registry)) => *source.head(),
+            Err(e) => {
+                warn!(
+                    "gallery: skipping streamed '{}' ({}): {e} — bake it via \
+                     `cargo run --example voxelize_scene` (or the `.vox` fallback path will be used)",
+                    entry.label, entry.vxo_path
+                );
+                continue;
+            }
+        };
+
+        // The asset's LOCAL (un-offset) inclusive LOD0 brick-coord X span, derived from `HEAD.bounds` the SAME
+        // way `MergedSource::new` does: bounds are LOD0 world VOXELS; convert to bricks via Euclidean floor, and
+        // the exclusive max maps to the last inclusive voxel's brick.
+        let bmin = IVec3::from_array(head.bounds_min);
+        let bmax = IVec3::from_array(head.bounds_max);
+        let lo_x = bmin.x.div_euclid(BRICK_EDGE);
+        let hi_x = (bmax.x - 1).div_euclid(BRICK_EDGE);
+
+        // Place this asset's −X bound at the cursor (auto-space), or honour an explicit offset. Either way we
+        // advance the cursor past the PLACED +X bound + the gap so the next asset clears it. Y/Z are left where
+        // the bake anchored them (offset 0) — the `.vxo` is floor/centre-anchored just like the `.vox` loader.
+        let offset = match entry.offset {
+            Some(o) => o,
+            None => IVec3::new(x_cursor_bricks - lo_x, 0, 0),
+        };
+        let placed_hi_x = hi_x + offset.x;
+        x_cursor_bricks = placed_hi_x + 1 + GALLERY_GAP_BRICKS;
+
+        placements.push((std::path::PathBuf::from(entry.vxo_path), offset));
+    }
+    placements
 }
 
 /// One already-loaded gallery scene ready to merge: its loaded [`BrickMap`] + [`BlockRegistry`], its placement
@@ -359,12 +440,36 @@ mod tests {
     #[test]
     fn load_gallery_skips_missing_assets() {
         let scenes = [
-            GalleryEntry { vox_path: "assets/models/__does_not_exist_a.vox", offset: None, label: "MissingA" },
-            GalleryEntry { vox_path: "assets/models/__does_not_exist_b.vox", offset: None, label: "MissingB" },
+            GalleryEntry { vox_path: "assets/models/__does_not_exist_a.vox", vxo_path: "assets/models/__does_not_exist_a.vxo", offset: None, label: "MissingA" },
+            GalleryEntry { vox_path: "assets/models/__does_not_exist_b.vox", vxo_path: "assets/models/__does_not_exist_b.vxo", offset: None, label: "MissingB" },
         ];
         let (map, reg) = load_gallery(&scenes);
         assert!(map.is_empty(), "all rows missing ⇒ empty merged map (no panic)");
         assert_eq!(reg.len(), 1, "only AIR in the merged registry when nothing loaded");
+    }
+
+    /// `vxo_gallery_placements` SKIPS absent `.vxo` assets (no panic) and returns an EMPTY list when none exist —
+    /// the signal the live path uses to fall back to the legacy `.vox` merge. (With the corpus baked in this
+    /// checkout the shipped table yields 3 placements; absent everywhere it's empty — both are non-panicking.)
+    #[test]
+    fn vxo_placements_skip_absent_and_signal_fallback() {
+        let missing = [
+            GalleryEntry { vox_path: "x.vox", vxo_path: "assets/models/__nope_a.vxo", offset: None, label: "A" },
+            GalleryEntry { vox_path: "y.vox", vxo_path: "assets/models/__nope_b.vxo", offset: None, label: "B" },
+        ];
+        assert!(
+            vxo_gallery_placements(&missing).is_empty(),
+            "all `.vxo` absent ⇒ empty placement list (caller falls back to the `.vox` path) — no panic"
+        );
+
+        // The shipped table is auto-spaced: every placement's +X offset is non-decreasing (assets march along +X
+        // past the previous one). This holds whether or not the assets are baked (absent ones are simply skipped).
+        let placed = vxo_gallery_placements(GALLERY_SCENES);
+        let mut last_x = i32::MIN;
+        for (_path, off) in &placed {
+            assert!(off.x >= last_x, "auto-spaced placements march monotonically along +X");
+            last_x = off.x;
+        }
     }
 
     /// The shipped `GALLERY_SCENES` table is well-formed and loads through `load_gallery` without panicking
