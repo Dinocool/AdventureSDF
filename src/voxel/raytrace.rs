@@ -1163,6 +1163,11 @@ struct VoxelRtPipelines {
     /// `GpuPack` upload arm (one workgroup per dirty dense brick) when the `gpu_pack` A/B flag is on.
     pack: wgpu::ComputePipeline,
     pack_layout: wgpu::BindGroupLayout,
+    /// **Phase G Stage G-b — the GPU AABB-write pipeline** (`voxel_pack.wgsl::write_aabb`) + its dedicated
+    /// bind-group layout (aabb_commands read-only @0; aabb_buf read_write @1). One INVOCATION per changed slot;
+    /// dispatched in the SAME encoder as the pack + the BLAS build (fill-then-build) in the `GpuPack` arm.
+    pack_aabb: wgpu::ComputePipeline,
+    pack_aabb_layout: wgpu::BindGroupLayout,
     /// The composite shader module + its bind-group layout + sampler. The composite render pipeline is
     /// built lazily (and cached) once the live view-target format is known.
     composite_module: wgpu::ShaderModule,
@@ -2355,6 +2360,32 @@ fn init_voxel_rt(mut commands: Commands, render_device: Res<RenderDevice>) {
         cache: None,
     });
 
+    // --- Phase G Stage G-b — the GPU AABB-write pipeline (A/B-gated, same module) ---
+    // `voxel_pack.wgsl::write_aabb`: one invocation per changed slot, writes `aabb_buf[slot]` (resident →
+    // `brick_aabb`, freed → `degenerate_aabb`). Its own bind group (binding 6 = aabb_buf read_write, binding 7 =
+    // aabb_commands read-only — the WGSL hard-codes those binding numbers in the shared `@group(0)`). Dispatched
+    // in the SAME encoder as the pack + the BLAS build in the `GpuPack` arm (fill-then-build, one submission).
+    let pack_aabb_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("voxel_rt_pack_aabb_layout"),
+        entries: &[
+            pack_storage(6, false), // aabb_buf (read_write)
+            pack_storage(7, true),  // aabb_commands (read-only)
+        ],
+    });
+    let pack_aabb_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("voxel_rt_pack_aabb_pl"),
+        bind_group_layouts: &[Some(&pack_aabb_layout)],
+        immediate_size: 0,
+    });
+    let pack_aabb = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+        label: Some("voxel_rt_pack_aabb"),
+        layout: Some(&pack_aabb_pl),
+        module: &pack_module,
+        entry_point: Some("write_aabb"),
+        compilation_options: Default::default(),
+        cache: None,
+    });
+
     let composite_src =
         std::fs::read_to_string("assets/shaders/voxel_rt_composite.wgsl").expect("read voxel_rt_composite.wgsl");
     let composite_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -2419,6 +2450,8 @@ fn init_voxel_rt(mut commands: Commands, render_device: Res<RenderDevice>) {
         wc_blend,
         pack,
         pack_layout,
+        pack_aabb,
+        pack_aabb_layout,
         composite_module,
         composite_layout,
         composite_sampler,
@@ -3067,13 +3100,16 @@ fn apply_delta(
     }
 }
 
-/// **Phase G Stage G-a — apply a [`GpuPackBatch`]** to the persistent fixed-cap scene buffers (the A/B-gated
-/// GPU successor to [`apply_delta`]). The CPU did the allocation; here: (1) `queue_write_buffer` the `cpu_writes`
-/// — the uniform/freed slots' metas + every changed slot's AABB (the AABB stays CPU for G-a; the dense bricks'
-/// meta + index + palette are GPU-written by the shader), (2) upload the per-command scratch + the 27-core
-/// scratch, (3) dispatch `voxel_pack` (one workgroup per dirty dense brick) into the SAME pool buffers, and
-/// (4) rebuild ONLY the dirty chunk BLASes on a topology change (lifted from [`apply_delta`]). Byte-identical to
-/// the CPU `Delta` path (pinned by `tests/voxel_gpu_pack_parity.rs`), so the trace/GI/shader are unchanged.
+/// **Phase G Stage G-b — apply a [`GpuPackBatch`]** to the persistent fixed-cap scene buffers (the A/B-gated
+/// GPU successor to [`apply_delta`]). The CPU did the allocation; here, in ONE command encoder / ONE submission
+/// (fill-then-build — readback-free): (1) `queue_write_buffer` the uniform/freed slots' **metas** only (the AABB
+/// is no longer CPU-written — G-b moved it to the GPU), (2) a compute pass that dispatches `pack_brick` (one
+/// workgroup per dirty dense brick → voxel/palette/meta) **and** `write_aabb` (one invocation per changed slot →
+/// `aabb_buf`, the SAME box `brick_aabb`/`degenerate_aabb` would), then (3) on a topology change rebuild ONLY the
+/// dirty chunk BLASes reading that SAME `aabb_buf` (lifted from [`apply_delta`]) — all in the SAME `encoder`, so
+/// the GPU-written AABBs are visible to the build (the fork executes the build over the buffer's submission-time
+/// contents). The per-slot CPU AABB upload (G-a's `vox_blas_delta` cost) is GONE. Byte-identical to the CPU
+/// `Delta` path (pinned by `tests/voxel_gpu_pack_parity.rs` — meta/voxel/palette AND `aabb_buf`).
 fn apply_gpu_pack(
     device: &wgpu::Device,
     render_queue: &RenderQueue,
@@ -3083,19 +3119,24 @@ fn apply_gpu_pack(
 ) {
     let meta_stride = core::mem::size_of::<GpuBrickMeta>() as u64; // 48
     let aabb_stride = core::mem::size_of::<GpuBrickAabb>() as u64; // 32
-    // (1) CPU writes — the AABB always (G-a keeps it CPU); the meta only for uniform/freed slots (a dense slot's
-    //     meta is written by the shader). Mirrors `apply_delta`'s meta/aabb writes for the non-GPU-encoded slots.
+
+    // (1) CPU META writes — uniform/freed slots only (a dense slot's meta is GPU-written). The AABB is NEVER
+    //     CPU-written now (G-b): EVERY changed slot's AABB rides in `batch.aabb_commands` → the `write_aabb` pass.
     for w in &batch.cpu_writes {
-        render_queue.write_buffer(&scene.aabb_buf, w.slot as u64 * aabb_stride, bytemuck::bytes_of(&w.aabb));
-        if let Some(meta) = &w.meta {
-            render_queue.write_buffer(&scene.meta_buf, w.slot as u64 * meta_stride, bytemuck::bytes_of(meta));
-        }
+        render_queue.write_buffer(&scene.meta_buf, w.slot as u64 * meta_stride, bytemuck::bytes_of(&w.meta));
     }
 
-    // (2)+(3) GPU encode — upload the command + core scratch SSBOs, then dispatch `pack_brick` over the commands
-    //         (one workgroup each) into voxel_buf / brick_palettes_buf / meta_buf. Skipped when there are no dense
-    //         commands this generation (an all-uniform/all-freed delta — the CPU writes above did everything).
-    if !batch.commands.is_empty() {
+    // The whole GPU side runs in ONE encoder: pack + aabb compute passes, then (on topology change) the BLAS
+    // build reading the just-filled `aabb_buf`. One `submit` at the end. Scratch SSBOs (commands/cores/neighbours/
+    // aabb-commands) are created here and kept alive until `encoder.finish()`/`submit` — wgpu retains the
+    // referenced resources for the submission, and they drop after.
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("voxel_rt_gpu_pack"),
+    });
+
+    // (2a) The DENSE-pack scratch + bind group (only when there are dense commands). Held in this scope so the
+    //      buffers outlive the compute pass that references them.
+    let pack_scratch = (!batch.commands.is_empty()).then(|| {
         let commands_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("voxel_rt_pack_commands"),
             contents: bytemuck::cast_slice(&batch.commands),
@@ -3113,7 +3154,7 @@ fn apply_gpu_pack(
             contents: bytemuck::cast_slice(nbr_data),
             usage: wgpu::BufferUsages::STORAGE,
         });
-        let pack_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("voxel_rt_pack_bg"),
             layout: &pipelines.pack_layout,
             entries: &[
@@ -3125,34 +3166,59 @@ fn apply_gpu_pack(
                 wgpu::BindGroupEntry { binding: 5, resource: scene.meta_buf.as_entire_binding() },
             ],
         });
-        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("voxel_rt_gpu_pack"),
+        // Keep the buffers alive alongside the bind group.
+        (bg, commands_buf, cores_buf, nbr_buf)
+    });
+
+    // (2b) The AABB-pass scratch + bind group (only when there are aabb commands). One invocation per changed slot.
+    let aabb_scratch = (!batch.aabb_commands.is_empty()).then(|| {
+        let aabb_cmd_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("voxel_rt_pack_aabb_commands"),
+            contents: bytemuck::cast_slice(&batch.aabb_commands),
+            usage: wgpu::BufferUsages::STORAGE,
         });
-        {
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("voxel_rt_gpu_pack_pass"),
-                timestamp_writes: None,
-            });
+        let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("voxel_rt_pack_aabb_bg"),
+            layout: &pipelines.pack_aabb_layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 6, resource: scene.aabb_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 7, resource: aabb_cmd_buf.as_entire_binding() },
+            ],
+        });
+        (bg, aabb_cmd_buf)
+    });
+
+    // (2c) ONE compute pass: dispatch the dense pack THEN the AABB write (both into the persistent pool buffers).
+    if pack_scratch.is_some() || aabb_scratch.is_some() {
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("voxel_rt_gpu_pack_pass"),
+            timestamp_writes: None,
+        });
+        if let Some((bg, ..)) = &pack_scratch {
             pass.set_pipeline(&pipelines.pack);
-            pass.set_bind_group(0, &pack_bg, &[]);
+            pass.set_bind_group(0, bg, &[]);
             pass.dispatch_workgroups(batch.commands.len() as u32, 1, 1);
         }
-        render_queue.submit(core::iter::once(encoder.finish()));
+        if let Some((bg, _)) = &aabb_scratch {
+            pass.set_pipeline(&pipelines.pack_aabb);
+            pass.set_bind_group(0, bg, &[]);
+            // workgroup_size(64); one invocation per command.
+            pass.dispatch_workgroups((batch.aabb_commands.len() as u32).div_ceil(64), 1, 1);
+        }
     }
 
-    // (4) BLAS — rebuild ONLY the dirty chunk bands on a topology change (lifted from `apply_delta`). The dirty
-    //     chunks are those any CPU write OR pack command touched (an entered/dropped/uniform-toggled slot).
+    // (3) BLAS — on a topology change rebuild ONLY the dirty chunk bands (lifted from `apply_delta`), in the SAME
+    //     encoder AFTER the compute pass that filled `aabb_buf`. The build reads the just-GPU-written AABBs (the
+    //     fork executes the build over the buffer's submission-time contents — fill-then-build). The dirty chunks
+    //     are those any aabb command OR pack command touched (an entered/dropped/uniform-toggled/moved slot).
     if batch.topology_changed {
         let mut dirty_chunks: FxHashSet<u32> = FxHashSet::default();
-        for w in &batch.cpu_writes {
+        for w in &batch.aabb_commands {
             dirty_chunks.insert(w.slot / CHUNK_SLOTS);
         }
         for c in &batch.commands {
             dirty_chunks.insert(c.slot / CHUNK_SLOTS);
         }
-        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("voxel_rt_gpu_pack_rebuild_accel"),
-        });
         let dirty: Vec<&ChunkBlas> = scene
             .chunks
             .iter()
@@ -3180,9 +3246,13 @@ fn apply_gpu_pack(
             .collect();
         if !geos.is_empty() {
             encoder.build_acceleration_structures(geos.iter(), core::iter::once(&scene.tlas));
-            render_queue.submit(core::iter::once(encoder.finish()));
         }
     }
+
+    // ONE submission: the compute fill + the BLAS build together (fill-then-build).
+    render_queue.submit(core::iter::once(encoder.finish()));
+    drop(pack_scratch);
+    drop(aabb_scratch);
 }
 
 /// The objects the per-frame world-cache dispatch needs, built before the compute pass opens (so they can be

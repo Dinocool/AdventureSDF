@@ -28,6 +28,21 @@
 // straight, identical to the Delta arm). Each command names its slot + alloc offsets and points at the 27
 // `8³` neighbour cores (the brick + its 26 neighbours) the halo reads, with a presence bit per neighbour.
 
+// **Phase G Stage G-b — the GPU AABB write** (docs/PHASE_G_GALLERY_PLAN.md §"Stage G-b").
+//
+// G-a wrote each slot's BLAS AABB on the CPU (a per-slot `queue_write_buffer` into `aabb_buf`, lifted from the
+// `Delta` arm — the `vox_blas_delta` cost). G-b moves that write to the GPU so the AABB fill can run in the SAME
+// submission as the BLAS build (fill-then-build, readback-free), eliminating the per-slot CPU upload entirely.
+// A SECOND, lightweight entry point `write_aabb` (one INVOCATION per changed slot, NOT one workgroup) consumes an
+// `aabb_commands` array covering EVERY changed slot — dense, uniform, AND freed — and writes `aabb_buf[slot]`:
+//   - a RESIDENT slot (dense or uniform) → `brick_aabb(world_min, lod)` (the epsilon-grown box),
+//   - a FREED slot → `degenerate_aabb()` (min > max, a BLAS non-candidate).
+// The per-brick `pack_brick` workgroups (dense encode) do NOT touch the AABB; the dedicated AABB pass owns every
+// slot's box, so the CPU `aabb` upload is gone. The `brick_aabb` / `degenerate_aabb` / `brick_aabb_epsilon` math
+// below MIRRORS src/voxel/gpu.rs (`brick_aabb`/`brick_aabb_epsilon`/`BRICK_AABB_REL_EPS`) + src/voxel/
+// incremental.rs (`degenerate_aabb`) EXACTLY — the G-b byte-equality gate (`tests/voxel_gpu_pack_parity.rs`)
+// asserts `aabb_buf` byte-equal to the CPU `SnapshotBuffers.aabbs`, freed slots included.
+
 // The brick edge (mirror of BRICK_EDGE in src/voxel/brickmap.rs). 8³ = 512 voxels per core.
 const BRICK_EDGE: i32 = 8;
 const CORE_CELLS: u32 = 512u;       // BRICK_EDGE³
@@ -65,6 +80,39 @@ struct PackCommand {
 // `NEIGHBOUR_ABSENT` in src/voxel/incremental.rs.
 const NEIGHBOUR_ABSENT: u32 = 0xFFFFFFFFu;
 
+// **Stage G-b — one per-CHANGED-slot AABB command** (mirrors `GpuAabbCommand` in src/voxel/incremental.rs
+// FIELD-FOR-FIELD). A FLAT 8-u32 (32 B) record — every field a scalar (no `vec3`, whose 16-byte WGSL alignment
+// would pad the array stride against the tightly-packed Rust `#[repr(C)]`). `flag = 1` → resident (write the
+// epsilon-grown `brick_aabb(world_min, lod)`); `flag = 0` → freed (write `degenerate_aabb()`).
+struct AabbCommand {
+    slot: u32,                      // the slot (= primitive_index); the AABB lands at aabb_buf[slot·8] (32 B)
+    lod: u32,                       // brick LOD (only read when resident; selects the per-LOD span + epsilon)
+    flag: u32,                      // 1 = resident (real box), 0 = freed (degenerate box)
+    _pad0: u32,
+    world_min_x: f32,               // brick world-min corner (only read when resident)
+    world_min_y: f32,
+    world_min_z: f32,
+    _pad1: u32,
+}
+
+// --- Stage G-b AABB math — EXACT mirror of src/voxel/gpu.rs (`brick_span`/`brick_aabb_epsilon`/`brick_aabb`) +
+//     the WGSL constants in voxel_raytrace.wgsl. MUST agree with both or the seam fix / byte gate breaks. ---
+const VOXEL_SIZE: f32 = 0.05;
+const BRICK_WORLD_SIZE: f32 = f32(BRICK_EDGE) * VOXEL_SIZE; // = 0.4 m (LOD0 brick span)
+const BRICK_AABB_REL_EPS: f32 = 1.25e-4;                   // mirror of gpu.rs::BRICK_AABB_REL_EPS
+const MAX_LOD_PACK: u32 = 7u;                              // = brickmap.rs MAX_LOD / voxel_raytrace.wgsl MAX_LOD
+
+// The world-metre SPAN of a brick at LOD `lod`: BRICK_WORLD_SIZE · 2^lod (mirror of gpu.rs/brickmap.rs
+// `brick_span`, which clamps `lod.min(MAX_LOD)`). The clamp MUST match (MAX_LOD = 7) or a `lod > 7` brick's box
+// would diverge from the CPU `brick_aabb` and fail the byte-equality gate.
+fn brick_span(lod: u32) -> f32 {
+    return BRICK_WORLD_SIZE * f32(1u << min(lod, MAX_LOD_PACK));
+}
+// The per-side BLAS-AABB grow (the seam-overlap fudge), in world metres (mirror of gpu.rs::brick_aabb_epsilon).
+fn brick_aabb_epsilon(lod: u32) -> f32 {
+    return brick_span(lod) * BRICK_AABB_REL_EPS;
+}
+
 @group(0) @binding(0) var<storage, read> commands: array<PackCommand>;
 // The DEDUPED core pool: each distinct resident brick's `8³` core ONCE (512 u32, voxel_index order). Core `i`'s
 // voxel is `cores[i·512 + voxel_index]`.
@@ -78,6 +126,12 @@ const NEIGHBOUR_ABSENT: u32 = 0xFFFFFFFFu;
 @group(0) @binding(3) var<storage, read_write> voxel_buf: array<u32>;
 @group(0) @binding(4) var<storage, read_write> brick_palettes_buf: array<u32>;
 @group(0) @binding(5) var<storage, read_write> meta_buf: array<u32>;
+// Stage G-b — the AABB pass's bindings (its OWN pipeline/bind-group; `pack_brick` ignores these). `aabb_buf` is
+// the BLAS-input AABB buffer (8 u32 / 32 B per slot: min[3] @ words 0-2, max[3] @ words 3-5, _pad @ words 6-7 —
+// the `#[repr(C)] GpuBrickAabb` layout); `aabb_commands` is the per-changed-slot command list `write_aabb`
+// consumes (one invocation each).
+@group(0) @binding(6) var<storage, read_write> aabb_buf: array<u32>;
+@group(0) @binding(7) var<storage, read> aabb_commands: array<AabbCommand>;
 
 // Workgroup shared state for ONE brick's pack.
 // `halo` — the 1000 haloed cells (block ids), in halo_index order (filled in parallel from the cores).
@@ -246,4 +300,41 @@ fn pack_brick(
         meta_buf[base + 10u] = 0u;                                         // _pad[0]
         meta_buf[base + 11u] = 0u;                                         // _pad[1]
     }
+}
+
+// **Stage G-b — the GPU AABB write.** One INVOCATION per changed slot (NOT one workgroup): write `aabb_buf[slot]`
+// (8 u32 / 32 B). A RESIDENT slot (`flag == 1`) gets the epsilon-grown `brick_aabb(world_min, lod)` (the SAME box
+// `src/voxel/gpu.rs::brick_aabb` builds — `[world_min - eps, world_min + span + eps]`); a FREED slot (`flag == 0`)
+// gets `degenerate_aabb()` (min = +1e30, max = -1e30 — a BLAS non-candidate; mirror of incremental.rs). This
+// dedicated pass owns EVERY changed slot's box, so the per-slot CPU `queue_write_buffer(aabb)` upload is gone.
+@compute @workgroup_size(64)
+fn write_aabb(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    if (i >= arrayLength(&aabb_commands)) {
+        return;
+    }
+    let c = aabb_commands[i];
+    let base = c.slot * 8u; // 32 B = 8 u32 per slot
+    if (c.flag == 0u) {
+        // degenerate_aabb(): min > max on every axis (mirror of src/voxel/incremental.rs::degenerate_aabb).
+        let big = bitcast<u32>(1.0e30);
+        let neg = bitcast<u32>(-1.0e30);
+        aabb_buf[base + 0u] = big; // min.x
+        aabb_buf[base + 1u] = big; // min.y
+        aabb_buf[base + 2u] = big; // min.z
+        aabb_buf[base + 3u] = neg; // max.x
+        aabb_buf[base + 4u] = neg; // max.y
+        aabb_buf[base + 5u] = neg; // max.z
+    } else {
+        let eps = brick_aabb_epsilon(c.lod);
+        let span = brick_span(c.lod);
+        aabb_buf[base + 0u] = bitcast<u32>(c.world_min_x - eps);        // min.x
+        aabb_buf[base + 1u] = bitcast<u32>(c.world_min_y - eps);        // min.y
+        aabb_buf[base + 2u] = bitcast<u32>(c.world_min_z - eps);        // min.z
+        aabb_buf[base + 3u] = bitcast<u32>(c.world_min_x + span + eps); // max.x
+        aabb_buf[base + 4u] = bitcast<u32>(c.world_min_y + span + eps); // max.y
+        aabb_buf[base + 5u] = bitcast<u32>(c.world_min_z + span + eps); // max.z
+    }
+    aabb_buf[base + 6u] = 0u; // _pad[0]
+    aabb_buf[base + 7u] = 0u; // _pad[1]
 }

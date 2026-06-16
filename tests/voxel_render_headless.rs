@@ -431,3 +431,187 @@ fn worldgen_voxelizes_emissive_terrain_into_palette() {
         "the emissive voxel {local:?} must sit inside its brick"
     );
 }
+
+/// **Phase G Stage G-b — the render PIXEL-IDENTITY gate** (docs/PHASE_G_GALLERY_PLAN.md §"Stage G-b").
+///
+/// Renders the SAME deterministic worldgen scene twice — once on the CPU path (`gpu_pack = false`: `update` +
+/// `apply_delta`, CPU AABB upload) and once on the GPU path (`gpu_pack = true`: `update_gpu` + `apply_gpu_pack`,
+/// the GPU `voxel_pack` encode + the GPU `write_aabb` + the fill-then-build BLAS) — and asserts the two readback
+/// images MATCH. This proves the acceleration structure built over the GPU-WRITTEN AABBs is correct: if the BLAS
+/// built over stale/zero AABBs (a fill-then-build ordering bug — the build executing before the compute fill
+/// landed), geometry would be MISSING → huge regions would diverge by large magnitudes → this fails. The parity
+/// gate (`voxel_gpu_pack_parity`) already pins the pool/AABB BYTES equal; this pins the rendered RESULT, closing
+/// the loop end-to-end (the BLAS topology over those bytes is right).
+///
+/// **What is compared (and why not raw bytes).** The two runs are separate Bevy `App` instances and the full GI
+/// path (ReSTIR temporal accumulation + the per-frame world cache) is NOT bit-reproducible across two independent
+/// run sequences — the async readback can even latch a slightly different point in the temporal-convergence
+/// sequence, so a BAND of already-terrain pixels can differ by a few LSBs run-to-run (max byte delta ~13, means
+/// identical) EVEN WHEN THE GEOMETRY IS IDENTICAL. Raw byte-identity is therefore flaky regardless of
+/// correctness. What a fill-then-build bug (the BLAS built over stale/zero GPU AABBs) actually changes is the
+/// GEOMETRY SILHOUETTE — WHICH pixels are terrain vs sky — because missing bricks turn terrain pixels into sky
+/// (huge silhouette change). A temporal phase only re-shades pixels that are terrain in BOTH frames. So we
+/// compare the TERRAIN/SKY MASK (phase-invariant) and assert it matches to within a tiny fraction, plus assert
+/// both frames are valid lit renders. This directly tests "the AS over the GPU-written AABBs places the same
+/// geometry on screen" while being immune to GI rounding noise.
+#[test]
+fn gpu_pack_render_pixel_identical_to_cpu() {
+    if common::headless_ray_query_device().is_none() {
+        eprintln!("no ray-query device — skipping gpu_pack_render_pixel_identical_to_cpu");
+        return;
+    }
+    let cpu_frame = render_worldgen_frame(false);
+    let gpu_frame = render_worldgen_frame(true);
+    assert_eq!(cpu_frame.len(), gpu_frame.len(), "CPU vs GPU-pack readback length differs");
+
+    // Classify every pixel terrain (blue NOT the dominant channel — the lit terrain palette) vs sky/clear (blue-
+    // dominant gradient). Identical classifier to `headless_render_shows_voxels`. Returns (mask, terrain_count).
+    let padded_row = bevy::render::renderer::RenderDevice::align_copy_bytes_per_row((W * 4) as usize);
+    let unpadded_row = (W * 4) as usize;
+    let terrain_mask = |bytes: &[u8]| -> (Vec<bool>, usize) {
+        let mut mask = vec![false; (W * H) as usize];
+        let mut count = 0usize;
+        for y in 0..H as usize {
+            let row = &bytes[y * padded_row..y * padded_row + unpadded_row];
+            for x in 0..W as usize {
+                let p = &row[x * 4..x * 4 + 4];
+                let (r, g, b) = (p[0], p[1], p[2]);
+                let blue_dominant = b >= r && b >= g;
+                let magenta_ish = r > 150 && b > 150 && g < r.min(b);
+                let is_terrain = !blue_dominant && !magenta_ish;
+                mask[y * W as usize + x] = is_terrain;
+                if is_terrain {
+                    count += 1;
+                }
+            }
+        }
+        (mask, count)
+    };
+    let (cpu_mask, cpu_terrain) = terrain_mask(&cpu_frame);
+    let (gpu_mask, gpu_terrain) = terrain_mask(&gpu_frame);
+
+    let mask_diff = cpu_mask.iter().zip(gpu_mask.iter()).filter(|(a, b)| a != b).count();
+    let total_px = (W * H) as usize;
+    let mask_diff_frac = mask_diff as f64 / total_px as f64;
+    let cpu_frac = cpu_terrain as f64 / total_px as f64;
+    let gpu_frac = gpu_terrain as f64 / total_px as f64;
+    eprintln!(
+        "[gpu-pack-render] terrain silhouette: CPU={:.3} GPU={:.3} ; mask mismatch {mask_diff} px ({:.4}%)",
+        cpu_frac,
+        gpu_frac,
+        100.0 * mask_diff_frac
+    );
+
+    // (a) Both frames are valid renders with a meaningful amount of terrain on screen (a black/empty frame, or a
+    //     frame whose geometry is entirely missing, would have ~0 terrain — caught here).
+    assert!(
+        cpu_frac > 0.10 && gpu_frac > 0.10,
+        "a frame has too little terrain (CPU={cpu_frac:.3}, GPU={gpu_frac:.3}) — geometry missing on one path"
+    );
+    // (b) The terrain SILHOUETTE matches: a fill-then-build ordering bug (BLAS over stale/zero AABBs) would drop
+    //     bricks → flip a large region of terrain pixels to sky → a large mask mismatch. Phase-invariant (a
+    //     temporal-convergence phase only re-shades pixels terrain in BOTH frames, never flips terrain↔sky).
+    assert!(
+        mask_diff_frac < 0.01,
+        "terrain/sky silhouette diverges by {:.3}% of pixels — the AS over the GPU-written AABBs places \
+         DIFFERENT geometry than the CPU path (likely a fill-then-build ordering bug: the BLAS built before the \
+         GPU AABB fill landed → missing bricks)",
+        100.0 * mask_diff_frac
+    );
+}
+
+/// Boot the headless worldgen render app with `VoxelRtToggle.gpu_pack = gpu_pack`, run a fixed number of frames,
+/// and return the latest readback bytes (raw row-padded `Rgba8UnormSrgb`). The CPU and GPU paths share EVERYTHING
+/// else (seed, camera, clipmap, frame count) so the only difference is HOW the pool/AABB/BLAS are written — the
+/// rendered result must match. Factored from `headless_render_shows_voxels`'s setup.
+fn render_worldgen_frame(gpu_pack: bool) -> Vec<u8> {
+    let layer = default_layer();
+    let surface_y = layer.sample_world(0.0, 0.0, WORLDGEN_SLICE_SEED).height;
+    let target = Vec3::new(0.0, surface_y, 0.0);
+    let yaw = 0.7f32;
+    let pitch = 0.45f32;
+    let distance = 9.0f32;
+    let cam_pos = target
+        + Vec3::new(
+            distance * yaw.cos() * pitch.cos(),
+            distance * pitch.sin(),
+            distance * yaw.sin() * pitch.cos(),
+        );
+
+    let latest = LatestFrame(Arc::new(Mutex::new(None)));
+
+    let mut app = App::new();
+    app.add_plugins(
+        DefaultPlugins
+            .set(WindowPlugin {
+                primary_window: None,
+                exit_condition: ExitCondition::DontExit,
+                ..default()
+            })
+            .disable::<WinitPlugin>()
+            .set(RenderPlugin {
+                render_creation: RenderCreation::Automatic(Box::new(rt_wgpu_settings())),
+                ..default()
+            }),
+    );
+    app.insert_resource(StreamingConfig {
+        clip_half_bricks: 4,
+        max_resident_bricks: 30_000,
+        max_bricks_per_frame: 8192,
+    });
+    app.init_resource::<HeightParams>()
+        .init_resource::<ErosionParams>()
+        .init_resource::<WorldGraph>()
+        .init_resource::<WorldBiomeShapes>();
+    app.add_plugins(VoxelRtPlugin);
+    app.insert_resource(VoxelScene::Worldgen);
+    // The A/B flag under test: flip the gpu_pack path on/off (HW-RT itself stays on for both).
+    app.insert_resource(VoxelRtToggle { enabled: true, gpu_pack });
+
+    app.insert_resource(latest.clone());
+    app.insert_resource(ClearColor(Color::srgb(0.9, 0.0, 0.9)));
+
+    let image_handle = {
+        let mut images = app.world_mut().resource_mut::<Assets<Image>>();
+        let mut image = Image::new_target_texture(W, H, TextureFormat::Rgba8UnormSrgb, None);
+        image.texture_descriptor.usage |= TextureUsages::COPY_SRC;
+        images.add(image)
+    };
+
+    app.world_mut().spawn((
+        Camera3d::default(),
+        RenderTarget::Image(image_handle.clone().into()),
+        bevy::camera::Hdr,
+        Msaa::Off,
+        Transform::from_translation(cam_pos).looking_at(target, Vec3::Y),
+        SdfCamera,
+        Name::new("Headless RT Camera"),
+    ));
+
+    let sink = latest.0.clone();
+    app.world_mut()
+        .spawn(Readback::texture(image_handle.clone()))
+        .observe(move |event: On<ReadbackComplete>| {
+            *sink.lock().unwrap() = Some(event.data.clone());
+        });
+
+    app.finish();
+    app.cleanup();
+    for _ in 0..24 {
+        app.update();
+    }
+
+    // Sanity: voxels actually voxelized (so the comparison is meaningful, not two empty frames).
+    let patch = app.world().resource::<VoxelRtPatch>();
+    assert!(
+        !patch.upload.is_empty(),
+        "the streamed brick set must be non-empty (gpu_pack={gpu_pack}) — got 0 bricks"
+    );
+
+    latest
+        .0
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("the render target must have been read back at least once")
+}

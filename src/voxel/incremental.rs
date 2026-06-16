@@ -93,6 +93,70 @@ pub struct GpuPackCommand {
 /// value `≥` the core-pool length works; `u32::MAX` is the unambiguous sentinel the WGSL tests against.
 pub const NEIGHBOUR_ABSENT: u32 = 0xFFFF_FFFF;
 
+/// **Stage G-b — the per-CHANGED-slot GPU AABB command.** Emitted by [`ResidentPacker::update_gpu`] for EVERY
+/// slot whose AABB changed this generation — dense, uniform, AND freed — so the GPU AABB pass
+/// (`assets/shaders/voxel_pack.wgsl::write_aabb`, one invocation each) writes `aabb_buf[slot]` itself, byte-
+/// identically to [`brick_aabb`](super::gpu::brick_aabb) / [`degenerate_aabb`]. This moves the AABB write off the
+/// CPU (G-a's per-slot `queue_write_buffer` — the `vox_blas_delta` cost) so the fill can run in the SAME
+/// submission as the BLAS build (fill-then-build). `flag = 1` → resident (write the epsilon-grown box from
+/// `world_min`/`lod`); `flag = 0` → freed (write the degenerate box). `#[repr(C)]` + `bytemuck`-uploadable; field
+/// order/size MUST match the WGSL `AabbCommand` (8 u32 / 32 B). A FLAT scalar record (NO `[f32;3]`/vec3) so the
+/// Rust struct and the WGSL `AabbCommand` agree on a 32-B stride field-for-field (same vec3-padding hazard as
+/// [`GpuPackCommand`]).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct GpuAabbCommand {
+    /// The slot (= `primitive_index`); the AABB lands at `aabb_buf[slot · 8]` (32 B).
+    pub slot: u32,
+    /// Brick LOD (only read when `flag == 1`) — selects the per-LOD span + epsilon.
+    pub lod: u32,
+    /// `1` = resident (write the real epsilon-grown box); `0` = freed (write the degenerate box).
+    pub flag: u32,
+    pub _pad0: u32,
+    /// Brick world-min corner (only read when `flag == 1`).
+    pub world_min_x: f32,
+    pub world_min_y: f32,
+    pub world_min_z: f32,
+    pub _pad1: u32,
+}
+
+/// `GpuAabbCommand::flag` for a RESIDENT slot (write the real epsilon-grown `brick_aabb`).
+const AABB_FLAG_RESIDENT: u32 = 1;
+/// `GpuAabbCommand::flag` for a FREED slot (write `degenerate_aabb`).
+const AABB_FLAG_FREED: u32 = 0;
+
+impl GpuAabbCommand {
+    /// A RESIDENT slot's AABB command (the GPU writes `brick_aabb(world_min, lod)`).
+    #[inline]
+    fn resident(slot: u32, world_min: [f32; 3], lod: u32) -> Self {
+        Self {
+            slot,
+            lod,
+            flag: AABB_FLAG_RESIDENT,
+            _pad0: 0,
+            world_min_x: world_min[0],
+            world_min_y: world_min[1],
+            world_min_z: world_min[2],
+            _pad1: 0,
+        }
+    }
+
+    /// A FREED slot's AABB command (the GPU writes `degenerate_aabb()`).
+    #[inline]
+    fn freed(slot: u32) -> Self {
+        Self {
+            slot,
+            lod: 0,
+            flag: AABB_FLAG_FREED,
+            _pad0: 0,
+            world_min_x: 0.0,
+            world_min_y: 0.0,
+            world_min_z: 0.0,
+            _pad1: 0,
+        }
+    }
+}
+
 /// **Stage G-a — the GPU-pack output of one [`ResidentPacker::update_gpu`].** The CPU did the allocation; this
 /// carries everything the render world needs to (a) `queue_write_buffer` the slots that need NO GPU encode
 /// (uniform + freed bricks: meta + AABB, exactly the [`RepackDelta`] path) and the dense bricks' AABBs (the
@@ -112,35 +176,39 @@ pub struct GpuPackBatch {
     /// index (into `cores`, in 512-cell units) or [`NEIGHBOUR_ABSENT`]. Slot 13 (`neighbour_base + 13`) is the
     /// command's own brick. Uploaded to a scratch SSBO the shader indexes via `command.neighbour_base`.
     pub neighbour_indices: Vec<u32>,
-    /// Slots needing NO GPU encode — uniform bricks (id rides in the meta), freed slots (zeroed/degenerate), and
-    /// the AABB of every changed slot (dense AABBs included — the AABB write is CPU for G-a). Each entry is
-    /// `queue_write_buffer`d exactly as the [`RepackDelta`] meta/aabb path. A DENSE entry carries `meta:None`
-    /// (the shader writes its meta) but always its `aabb`. A UNIFORM/freed entry carries both.
+    /// Slots whose META the GPU does NOT write — uniform bricks (id rides in the meta) + freed slots (zeroed).
+    /// Each is `queue_write_buffer`d into `meta_buf` at `slot · 48` exactly as the [`RepackDelta`] meta path. A
+    /// DENSE slot is NOT here (the shader writes its meta). **Stage G-b: the AABB is NO LONGER carried here** —
+    /// EVERY changed slot's AABB (dense/uniform/freed) is written GPU-side from [`Self::aabb_commands`], so the
+    /// per-slot CPU AABB upload is gone.
     pub cpu_writes: Vec<GpuCpuWrite>,
+    /// **Stage G-b** — per CHANGED slot (dense/uniform/freed) a [`GpuAabbCommand`] the GPU AABB pass
+    /// (`voxel_pack.wgsl::write_aabb`) consumes to write `aabb_buf[slot]` itself (resident → `brick_aabb`,
+    /// freed → `degenerate_aabb`). Replaces G-a's per-slot CPU AABB `queue_write_buffer`; runs in the SAME
+    /// submission as the BLAS build (fill-then-build). Byte-equal to the CPU `SnapshotBuffers.aabbs` (the gate).
+    pub aabb_commands: Vec<GpuAabbCommand>,
     /// True iff the resident brick SET changed (the BLAS/TLAS rebuild signal) — same meaning as
     /// [`RepackDelta::topology_changed`].
     pub topology_changed: bool,
 }
 
 impl GpuPackBatch {
-    /// True iff nothing changed (no command, no CPU write).
+    /// True iff nothing changed (no command, no CPU write, no AABB command).
     #[inline]
     pub fn is_empty(&self) -> bool {
-        self.commands.is_empty() && self.cpu_writes.is_empty()
+        self.commands.is_empty() && self.cpu_writes.is_empty() && self.aabb_commands.is_empty()
     }
 }
 
-/// One CPU-side buffer write the GPU-pack batch carries: the AABB at `slot`, plus (for uniform/freed slots) the
-/// meta. A DENSE slot's meta is written by the shader, so `meta` is `None` there; its AABB is still CPU-written.
+/// One CPU-side META write the GPU-pack batch carries (Stage G-b: META only — the AABB moved to
+/// [`GpuAabbCommand`]). Emitted for a UNIFORM or FREED slot (the shader does not touch its meta): the 48-B meta to
+/// `queue_write_buffer` at `slot · 48`. A DENSE slot is never here (the shader writes its meta).
 #[derive(Clone, Copy, Debug)]
 pub struct GpuCpuWrite {
     /// The slot (= `primitive_index`) this patches.
     pub slot: u32,
-    /// The AABB to `queue_write_buffer` at `slot · 32` (always written — the AABB stays CPU for G-a).
-    pub aabb: GpuBrickAabb,
-    /// `Some` for a UNIFORM or FREED slot (the shader does not touch its meta): the 48-B meta to write at
-    /// `slot · 48`. `None` for a DENSE slot (the shader writes its meta).
-    pub meta: Option<GpuBrickMeta>,
+    /// The 48-B meta to write at `slot · 48`.
+    pub meta: GpuBrickMeta,
 }
 
 /// The 27-neighbour slot index of a `(dx,dy,dz)` offset, each ∈ `{-1,0,1}` — `(dz+1)·9 + (dy+1)·3 + (dx+1)`.
@@ -996,11 +1064,9 @@ impl ResidentPacker {
                 continue;
             }
             let st = self.resident.remove(&key).expect("key from live set");
-            batch.cpu_writes.push(GpuCpuWrite {
-                slot: st.slot,
-                aabb: degenerate_aabb(),
-                meta: Some(GpuBrickMeta::zeroed()),
-            });
+            // The meta is CPU-written (zeroed); the AABB is GPU-written (degenerate) via an aabb command.
+            batch.cpu_writes.push(GpuCpuWrite { slot: st.slot, meta: GpuBrickMeta::zeroed() });
+            batch.aabb_commands.push(GpuAabbCommand::freed(st.slot));
             self.quarantine_slots.push(st.slot);
             self.last_meta.insert(st.slot, GpuBrickMeta::zeroed());
             self.last_aabb.insert(st.slot, degenerate_aabb());
@@ -1133,7 +1199,9 @@ impl ResidentPacker {
                 self.last_aabb.insert(st.slot, pb.aabb);
                 self.last_voxels.remove(&st.slot);
                 if changed {
-                    batch.cpu_writes.push(GpuCpuWrite { slot: st.slot, aabb: pb.aabb, meta: Some(meta) });
+                    // Meta is CPU-written (uniform id rides in it); the AABB is GPU-written via an aabb command.
+                    batch.cpu_writes.push(GpuCpuWrite { slot: st.slot, meta });
+                    batch.aabb_commands.push(GpuAabbCommand::resident(st.slot, pb.world_min, pb.lod));
                 }
             }
             BrickVoxels::Dense(cells) => {
@@ -1186,11 +1254,11 @@ impl ResidentPacker {
                     self.last_voxels.insert(st.slot, cells.clone());
                 }
                 if meta_changed || voxels_changed {
-                    // The AABB is CPU-written (G-a); the meta + index + palette are GPU-written. We always emit the
-                    // dense AABB CPU write; we emit a GPU command ONLY when the voxel CONTENT changed (a meta-only
-                    // change — e.g. a slot moved with identical content, which `voxels_changed` covers — implies
-                    // content change, so a pure meta-only-change can't reach the dense branch without new content).
-                    batch.cpu_writes.push(GpuCpuWrite { slot: st.slot, aabb: pb.aabb, meta: None });
+                    // Stage G-b: the meta + index + palette are GPU-written (the `pack_brick` command); the AABB
+                    // too (a GPU `write_aabb` command). We emit the AABB command whenever the meta changed (the
+                    // AABB is a pure function of `world_min`/`lod`, which live in the meta); the pack command ONLY
+                    // when the voxel CONTENT changed (a meta-only move with identical content needs no re-encode).
+                    batch.aabb_commands.push(GpuAabbCommand::resident(st.slot, pb.world_min, pb.lod));
                     if voxels_changed {
                         // Build the 27-entry NEIGHBOUR TABLE (the brick + its 26 same-LOD neighbours) for the GPU
                         // halo-fill, interning each resident core into the DEDUPED pool (uploaded once). An absent
