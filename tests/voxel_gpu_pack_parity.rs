@@ -16,7 +16,9 @@
 
 use adventure::voxel::brickmap::{BRICK_EDGE, BRICK_VOXELS, Brick};
 use adventure::voxel::gpu::{GpuBrickMeta, GpuBrickPatch, ResidentBrick, halo_cells};
-use adventure::voxel::incremental::{GpuPackBatch, ResidentPacker, SnapshotBuffers, index_class_words};
+use adventure::voxel::incremental::{
+    GpuClassifyBatch, GpuClassifyOut, GpuPackBatch, ResidentPacker, SnapshotBuffers, index_class_words,
+};
 use adventure::voxel::palette::{BlockId, BlockRegistry};
 use adventure::sdf_render::worldgen::biome::{
     BiomeDef, BiomeId, BiomeLibrary, StrataLayer, TerrainMatId, TerrainSurfaceMaterial,
@@ -88,6 +90,117 @@ fn cpu_snapshot(entries: &[ResidentBrick<'_>], reg: &BlockRegistry) -> SnapshotB
 fn gpu_batch(entries: &[ResidentBrick<'_>], reg: &BlockRegistry) -> GpuPackBatch {
     let mut packer = ResidentPacker::new(4096);
     packer.update_gpu(entries, reg.len() as u32)
+}
+
+/// **Stage G4 — the GPU-CLASSIFY-driven batch.** Drive a fresh packer through `update_gpu_prepare`, dispatch the
+/// REAL `classify_brick` shader on the GPU, read back the per-brick `(is_uniform, index_bits, palette_k)`, then
+/// `update_gpu_finish` — the production G4 flow (NO CPU `pack_one`). The resulting [`GpuPackBatch`] MUST be the same
+/// allocation the CPU-classify [`gpu_batch`] produces (the alloc is a deterministic function of the classification),
+/// so feeding it to `run_gpu_pack` yields byte-identical pool buffers vs the CPU snapshot — the proof that moving
+/// the classification to the GPU did NOT change the output, only WHO computes the sizes.
+fn gpu_batch_g4(device: &wgpu::Device, queue: &wgpu::Queue, entries: &[ResidentBrick<'_>], reg: &BlockRegistry) -> GpuPackBatch {
+    let mut packer = ResidentPacker::new(4096);
+    let prepared = packer.update_gpu_prepare(entries, reg.len() as u32);
+    let classify_out = run_classify(device, queue, &prepared);
+    packer.update_gpu_finish(&prepared, &classify_out)
+}
+
+/// Dispatch the REAL `classify_brick` entry point over a [`GpuClassifyBatch`] (one workgroup per dirty key, reading
+/// the prepared deduped cores + neighbour table) and read back the `classify_out` buffer (4 u32 / brick) as
+/// [`GpuClassifyOut`]s. This is the round-trip G4 introduces — its cost is what the measurement weighs.
+fn run_classify(device: &wgpu::Device, queue: &wgpu::Queue, batch: &GpuClassifyBatch) -> Vec<GpuClassifyOut> {
+    let n = batch.commands.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    // The classify pass reads its OWN `ClassifyCommand` (4 u32 / 16 B) at binding 9 (NOT the 60-B PackCommand @0),
+    // so the upload is a straight `bytemuck` cast of the `GpuClassifyCommand` slice — no stride confusion.
+    let cores_data: &[u32] = if batch.cores.is_empty() { &[0u32] } else { &batch.cores };
+    let nbr_data: &[u32] = if batch.neighbour_indices.is_empty() { &[0u32] } else { &batch.neighbour_indices };
+
+    let cmd_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("classify_commands"),
+        contents: bytemuck::cast_slice(&batch.commands),
+        usage: wgpu::BufferUsages::STORAGE,
+    });
+    let cores_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("classify_cores"),
+        contents: bytemuck::cast_slice(cores_data),
+        usage: wgpu::BufferUsages::STORAGE,
+    });
+    let nbr_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("classify_neighbours"),
+        contents: bytemuck::cast_slice(nbr_data),
+        usage: wgpu::BufferUsages::STORAGE,
+    });
+    let out_buf = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("classify_out"),
+        size: (n * 4 * 4) as u64, // 4 u32 / brick
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+
+    let src = std::fs::read_to_string("assets/shaders/voxel_pack.wgsl").expect("read voxel_pack.wgsl");
+    let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("voxel_pack"),
+        source: wgpu::ShaderSource::Wgsl(src.into()),
+    });
+    let entry = |binding: u32, read_only: bool| wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::COMPUTE,
+        ty: wgpu::BindingType::Buffer {
+            ty: wgpu::BufferBindingType::Storage { read_only },
+            has_dynamic_offset: false,
+            min_binding_size: None,
+        },
+        count: None,
+    };
+    // cores@1, neighbour_indices@2 (read-only), classify_out@8 (read_write), classify_commands@9 (read-only).
+    let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("classify_bgl"),
+        entries: &[entry(1, true), entry(2, true), entry(8, false), entry(9, true)],
+    });
+    let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("classify_pl"),
+        bind_group_layouts: &[Some(&layout)],
+        immediate_size: 0,
+    });
+    let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+        label: Some("classify_pipeline"),
+        layout: Some(&pl),
+        module: &module,
+        entry_point: Some("classify_brick"),
+        compilation_options: Default::default(),
+        cache: None,
+    });
+    let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("classify_bg"),
+        layout: &layout,
+        entries: &[
+            wgpu::BindGroupEntry { binding: 1, resource: cores_buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 2, resource: nbr_buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 8, resource: out_buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 9, resource: cmd_buf.as_entire_binding() },
+        ],
+    });
+    let mut encoder =
+        device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("classify_enc") });
+    {
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("classify_pass"),
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(&pipeline);
+        pass.set_bind_group(0, &bg, &[]);
+        pass.dispatch_workgroups(n as u32, 1, 1);
+    }
+    queue.submit(std::iter::once(encoder.finish()));
+
+    let words = readback_u32(device, queue, &out_buf, n * 4);
+    words
+        .chunks_exact(4)
+        .map(|w| GpuClassifyOut { is_uniform: w[0], uniform_block: w[1], palette_k: w[2], index_bits: w[3] })
+        .collect()
 }
 
 /// Run the GPU pack: zero-init the pool buffers to the CPU snapshot's sizes (the allocations match), apply the
@@ -351,8 +464,32 @@ fn assert_byte_identical(
     reg: &BlockRegistry,
     label: &str,
 ) {
+    assert_byte_identical_with(device, queue, entries, reg, label, false);
+}
+
+/// The G4 variant: drive the byte-identity gate through the GPU-CLASSIFY path (`update_gpu_prepare` → real
+/// `classify_brick` dispatch → readback → `update_gpu_finish`) instead of the CPU-classify `update_gpu`. Proves the
+/// pool is byte-identical when the classification comes from the GPU (no CPU `pack_one`) — the G4 correctness proof.
+fn assert_byte_identical_g4(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    entries: &[ResidentBrick<'_>],
+    reg: &BlockRegistry,
+    label: &str,
+) {
+    assert_byte_identical_with(device, queue, entries, reg, label, true);
+}
+
+fn assert_byte_identical_with(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    entries: &[ResidentBrick<'_>],
+    reg: &BlockRegistry,
+    label: &str,
+    g4: bool,
+) {
     let cpu = cpu_snapshot(entries, reg);
-    let batch = gpu_batch(entries, reg);
+    let batch = if g4 { gpu_batch_g4(device, queue, entries, reg) } else { gpu_batch(entries, reg) };
     let gpu = run_gpu_pack(device, queue, &batch, &cpu);
 
     // (1) META byte-equal over the whole capacity buffer (a permuted field / wrong lod_and_bits packing fails).
@@ -693,4 +830,333 @@ fn gpu_pack_byte_identical_to_cpu_snapshot() {
             owned.iter().map(|(c, b)| ResidentBrick { coord: *c, brick: b, lod: 3 }).collect();
         assert_byte_identical(&device, &queue, &entries, &reg, "D: dense 2³ at LOD 3");
     }
+}
+
+/// One parity fixture: the owned bricks + their LOD + a label.
+type Fixture = (Vec<(IVec3, Brick)>, u32, &'static str);
+
+/// The four parity fixtures — shared by the CPU-classify gate above and the G4 GPU-classify gate below, so both
+/// prove byte-identity over the SAME battery (dense, uniform core, isolated, LOD 3).
+fn parity_fixtures() -> Vec<Fixture> {
+    let dense3 = |seed_lod: i32, n: u16| {
+        let mut owned: Vec<(IVec3, Brick)> = Vec::new();
+        for z in 0..3 {
+            for y in 0..3 {
+                for x in 0..3 {
+                    owned.push((IVec3::new(x, y, z), multi_brick(x * 11 + y * 7 + z * 3 + seed_lod, n)));
+                }
+            }
+        }
+        owned.sort_by_key(|(c, _)| (c.z, c.y, c.x));
+        owned
+    };
+    let mut uniform5: Vec<(IVec3, Brick)> = Vec::new();
+    for z in 0..5 {
+        for y in 0..5 {
+            for x in 0..5 {
+                uniform5.push((IVec3::new(x, y, z), Brick::uniform(BlockId(1))));
+            }
+        }
+    }
+    uniform5.sort_by_key(|(c, _)| (c.z, c.y, c.x));
+    let isolated = vec![(IVec3::new(5, 5, 5), multi_brick(42, 4))];
+    let mut lod3: Vec<(IVec3, Brick)> = Vec::new();
+    for z in 0..2 {
+        for y in 0..2 {
+            for x in 0..2 {
+                lod3.push((IVec3::new(x, y, z), multi_brick(x * 5 + y * 9 + z, 3)));
+            }
+        }
+    }
+    lod3.sort_by_key(|(c, _)| (c.z, c.y, c.x));
+    vec![
+        (dense3(0, 5), 0, "A: dense 3³ multi-material"),
+        (uniform5, 0, "B: uniform core + dense shell"),
+        (isolated, 0, "C: isolated brick (all-AIR halo)"),
+        (lod3, 3, "D: dense 2³ at LOD 3"),
+    ]
+}
+
+/// **Stage G4 — the byte-identity gate through the GPU-CLASSIFY path.** The make-or-break G4 proof: drive each
+/// fixture through `update_gpu_prepare` → the REAL `classify_brick` dispatch → readback → `update_gpu_finish` (NO
+/// CPU `pack_one`), then run the GPU pack and assert the pool is byte-identical to the CPU snapshot. If the GPU
+/// classification (is_uniform / palette_k / index_bits) drifted from the CPU `pack_one`, the alloc would differ and
+/// the buffers would diverge — this catches it. Proves G4 changed only WHO computes the sizes, not the output.
+#[test]
+fn gpu_pack_g4_classify_byte_identical_to_cpu_snapshot() {
+    let Some((device, queue)) = common::headless_device(wgpu::Features::empty()) else {
+        eprintln!("[skip] no GPU adapter — voxel G4 GPU-classify parity skipped");
+        return;
+    };
+    let reg = registry();
+    for (owned, lod, label) in parity_fixtures() {
+        let entries: Vec<ResidentBrick> =
+            owned.iter().map(|(c, b)| ResidentBrick { coord: *c, brick: b, lod }).collect();
+        assert_byte_identical_g4(&device, &queue, &entries, &reg, label);
+    }
+}
+
+/// **Stage G4 — the perf measurement (the key risk).** Compares, over a 16³ = 4096 dense-brick cold fill, the
+/// BASELINE CPU cost (`update`, the all-CPU pack — `pack_one` + `encode_paletted` for every brick), the G-b
+/// GPU-pack CPU cost (`update_gpu`, which STILL `pack_one`s for the classification — the break-even), and the G4
+/// GPU-classify CPU cost (`update_gpu_prepare` + `update_gpu_finish`, NO `pack_one`) plus the GPU `classify_brick`
+/// dispatch + the readback/sync round-trip (the cost G4 introduces).
+///
+/// The win is `pack_one` GONE from the CPU; the risk is the readback sync. Reports all of them — plus a
+/// production-shaped ~512-brick incremental case — so the recommendation is concrete. `#[ignore]`d (a measurement)
+/// — run with `--ignored --nocapture`.
+#[test]
+#[ignore = "perf measurement — run with: cargo test --test voxel_gpu_pack_parity gpu_pack_g4_cpu_cost -- --ignored --nocapture"]
+fn gpu_pack_g4_cpu_cost() {
+    let Some((device, queue)) = common::headless_device(wgpu::Features::empty()) else {
+        eprintln!("[skip] no GPU adapter — G4 perf measurement skipped");
+        return;
+    };
+    let reg = registry();
+    let edge = 16i32;
+    let mut owned: Vec<(IVec3, Brick)> = Vec::new();
+    for z in 0..edge {
+        for y in 0..edge {
+            for x in 0..edge {
+                owned.push((IVec3::new(x, y, z), multi_brick(x * 31 + y * 17 + z * 11, 5)));
+            }
+        }
+    }
+    owned.sort_by_key(|(c, _)| (c.z, c.y, c.x));
+    let entries: Vec<ResidentBrick> =
+        owned.iter().map(|(c, b)| ResidentBrick { coord: *c, brick: b, lod: 0 }).collect();
+
+    // BASELINE — the all-CPU pack.
+    let mut cpu = ResidentPacker::new(8192);
+    let t = std::time::Instant::now();
+    let delta = cpu.update(&entries, reg.len() as u32);
+    let cpu_ms = t.elapsed().as_secs_f64() * 1e3;
+
+    // G-b — the CPU-classify GPU-pack producer (STILL runs pack_one for the classification).
+    let mut gb = ResidentPacker::new(8192);
+    let t = std::time::Instant::now();
+    let gb_batch = gb.update_gpu(&entries, reg.len() as u32);
+    let gb_ms = t.elapsed().as_secs_f64() * 1e3;
+
+    // G4 — prepare (NO pack_one) + classify dispatch + readback + finish.
+    let mut g4 = ResidentPacker::new(8192);
+    let t = std::time::Instant::now();
+    let prepared = g4.update_gpu_prepare(&entries, reg.len() as u32);
+    let prepare_ms = t.elapsed().as_secs_f64() * 1e3;
+
+    // WARM UP — the FIRST classify dispatch pays the one-time shader-module COMPILE + pipeline CREATE (which in
+    // production is built ONCE at startup, cached in `VoxelRtPipelines`, NOT per re-pack). Time the WARM round-trip
+    // (dispatch + map_async + device.poll(Wait)) so the measurement reflects the live per-re-pack cost, not the
+    // cold compile. Average a few iterations to smooth GPU-queue jitter.
+    let classify_out = run_classify(&device, &queue, &prepared); // warm-up (compiles the pipeline)
+    let iters = 8;
+    let t = std::time::Instant::now();
+    for _ in 0..iters {
+        let _ = run_classify(&device, &queue, &prepared);
+    }
+    let readback_ms = (t.elapsed().as_secs_f64() * 1e3) / iters as f64;
+
+    let t = std::time::Instant::now();
+    let g4_batch = g4.update_gpu_finish(&prepared, &classify_out);
+    let finish_ms = t.elapsed().as_secs_f64() * 1e3;
+    let g4_cpu_ms = prepare_ms + finish_ms; // the CPU-side cost of the G4 path (no pack_one)
+
+    // ISOLATED PURE-SYNC cost — the marginal GPU→CPU round-trip G4 ADDS over G-b: pipeline + cores/nbr/out buffers
+    // built ONCE (production caches them; the cores buffer the PACK pass uploads anyway), then time ONLY
+    // dispatch + submit + map_async + device.poll(Wait) (the actual stall). This is the number the stall question
+    // hinges on (NOT the buffer-create churn the naive `run_classify` loop above includes).
+    let sync_ms = measure_pure_classify_sync(&device, &queue, &prepared, 16);
+
+    eprintln!(
+        "[g4-perf] cold fill {} bricks:\n  \
+         BASELINE  update (all-CPU)        {:.2} ms ({} changed)\n  \
+         G-b       update_gpu (pack_one)   {:.2} ms ({} dense cmds, {} cpu writes)\n  \
+         G4        prepare+finish (CPU)    {:.2} ms (prepare {:.2} + finish {:.2}) ({} dense cmds)\n  \
+         G4        classify dispatch+read  {:.2} ms (warm GPU→CPU sync round-trip, UPPER bound: re-creates the\n  \
+         {:>34}pipeline+scratch each call, which production caches/reuses)\n  \
+         => G4 CPU pack-related cost {:.2} ms vs G-b {:.2} ms (pack_one removed); readback {:.2} ms",
+        entries.len(),
+        cpu_ms,
+        delta.changed.len(),
+        gb_ms,
+        gb_batch.commands.len(),
+        gb_batch.cpu_writes.len(),
+        g4_cpu_ms,
+        prepare_ms,
+        finish_ms,
+        g4_batch.commands.len(),
+        readback_ms,
+        "",
+        g4_cpu_ms,
+        gb_ms,
+        readback_ms,
+    );
+    eprintln!("  G4        PURE classify sync       {sync_ms:.3} ms (pipeline+buffers cached; dispatch+submit+poll only)");
+    // Sanity: the two paths agree on the dense command count (same classification).
+    assert_eq!(g4_batch.commands.len(), gb_batch.commands.len(), "G4 and G-b must classify the same dense set");
+
+    // PRODUCTION-REPRESENTATIVE incremental re-pack: a camera brick-crossing dirties a SHELL BAND, not a 4096-brick
+    // cold fill (which routes through `snapshot_buffers` on the CPU, not the GPU pack). Measure a ~512-brick dirty
+    // set so the report reflects the LIVE per-re-pack cost the classify+readback actually pays.
+    let small_edge = 8i32; // 512 bricks
+    let mut small_owned: Vec<(IVec3, Brick)> = Vec::new();
+    for z in 0..small_edge {
+        for y in 0..small_edge {
+            for x in 0..small_edge {
+                small_owned.push((IVec3::new(x, y, z), multi_brick(x * 31 + y * 17 + z * 11, 5)));
+            }
+        }
+    }
+    small_owned.sort_by_key(|(c, _)| (c.z, c.y, c.x));
+    let small_entries: Vec<ResidentBrick> =
+        small_owned.iter().map(|(c, b)| ResidentBrick { coord: *c, brick: b, lod: 0 }).collect();
+    let mut g4s = ResidentPacker::new(8192);
+    let t = std::time::Instant::now();
+    let prepared_s = g4s.update_gpu_prepare(&small_entries, reg.len() as u32);
+    let prep_s_ms = t.elapsed().as_secs_f64() * 1e3;
+    let sync_s_ms = measure_pure_classify_sync(&device, &queue, &prepared_s, 16);
+    eprintln!(
+        "[g4-perf] incremental ~{} bricks (production-shaped): prepare {:.2} ms (CPU, no pack_one) + classify \
+         sync {:.3} ms (GPU dispatch+readback)",
+        small_entries.len(),
+        prep_s_ms,
+        sync_s_ms,
+    );
+}
+
+/// Measure the ISOLATED per-re-pack GPU→CPU classify round-trip: build the classify pipeline + the cores/neighbour/
+/// out/staging buffers ONCE (as production would — the cores buffer is the SAME one the pack pass uploads), then
+/// time `iters` rounds of dispatch + submit + `map_async` + `device.poll(Wait)` + a fresh map. Returns the mean ms
+/// — the marginal stall G4 adds (the readback payload is tiny: 4 u32 / brick).
+fn measure_pure_classify_sync(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    batch: &GpuClassifyBatch,
+    iters: u32,
+) -> f64 {
+    let n = batch.commands.len();
+    if n == 0 {
+        return 0.0;
+    }
+    let cmd_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("sync_cmds"),
+        contents: bytemuck::cast_slice(&batch.commands),
+        usage: wgpu::BufferUsages::STORAGE,
+    });
+    let cores_data: &[u32] = if batch.cores.is_empty() { &[0u32] } else { &batch.cores };
+    let nbr_data: &[u32] = if batch.neighbour_indices.is_empty() { &[0u32] } else { &batch.neighbour_indices };
+    let cores_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("sync_cores"),
+        contents: bytemuck::cast_slice(cores_data),
+        usage: wgpu::BufferUsages::STORAGE,
+    });
+    let nbr_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("sync_nbr"),
+        contents: bytemuck::cast_slice(nbr_data),
+        usage: wgpu::BufferUsages::STORAGE,
+    });
+    let out_buf = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("sync_out"),
+        size: (n * 4 * 4) as u64,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        mapped_at_creation: false,
+    });
+    let staging = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("sync_staging"),
+        size: (n * 4 * 4) as u64,
+        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+        mapped_at_creation: false,
+    });
+    let src = std::fs::read_to_string("assets/shaders/voxel_pack.wgsl").expect("read voxel_pack.wgsl");
+    let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("voxel_pack"),
+        source: wgpu::ShaderSource::Wgsl(src.into()),
+    });
+    let entry = |binding: u32, read_only: bool| wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::COMPUTE,
+        ty: wgpu::BindingType::Buffer {
+            ty: wgpu::BufferBindingType::Storage { read_only },
+            has_dynamic_offset: false,
+            min_binding_size: None,
+        },
+        count: None,
+    };
+    let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("sync_bgl"),
+        entries: &[entry(1, true), entry(2, true), entry(8, false), entry(9, true)],
+    });
+    let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("sync_pl"),
+        bind_group_layouts: &[Some(&layout)],
+        immediate_size: 0,
+    });
+    let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+        label: Some("sync_pipeline"),
+        layout: Some(&pl),
+        module: &module,
+        entry_point: Some("classify_brick"),
+        compilation_options: Default::default(),
+        cache: None,
+    });
+    let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("sync_bg"),
+        layout: &layout,
+        entries: &[
+            wgpu::BindGroupEntry { binding: 1, resource: cores_buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 2, resource: nbr_buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 8, resource: out_buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 9, resource: cmd_buf.as_entire_binding() },
+        ],
+    });
+    // Warm up once (prime the pipeline + queue), then time the steady-state round-trip.
+    let run = |bytes: u64| {
+        let mut encoder =
+            device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("sync_enc") });
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("sync_pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&pipeline);
+            pass.set_bind_group(0, &bg, &[]);
+            pass.dispatch_workgroups(n as u32, 1, 1);
+        }
+        encoder.copy_buffer_to_buffer(&out_buf, 0, &staging, 0, bytes);
+        queue.submit(std::iter::once(encoder.finish()));
+        staging.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+        device.poll(wgpu::PollType::wait_indefinitely()).expect("poll");
+        staging.unmap();
+    };
+    // Dispatch-only (NO copy/map) timing — submit the classify then poll(Wait). Isolates the GPU classify COMPUTE
+    // cost from the readback copy+map, so we can see whether the stall is the sync or the dispatch itself.
+    let run_dispatch_only = || {
+        let mut encoder =
+            device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("sync_enc_d") });
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("sync_pass_d"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&pipeline);
+            pass.set_bind_group(0, &bg, &[]);
+            pass.dispatch_workgroups(n as u32, 1, 1);
+        }
+        queue.submit(std::iter::once(encoder.finish()));
+        device.poll(wgpu::PollType::wait_indefinitely()).expect("poll");
+    };
+    let bytes = (n * 4 * 4) as u64;
+    run(bytes); // warm-up
+    let t = std::time::Instant::now();
+    for _ in 0..iters {
+        run(bytes);
+    }
+    let full = (t.elapsed().as_secs_f64() * 1e3) / iters as f64;
+    let t = std::time::Instant::now();
+    for _ in 0..iters {
+        run_dispatch_only();
+    }
+    let dispatch = (t.elapsed().as_secs_f64() * 1e3) / iters as f64;
+    eprintln!("  G4        classify DISPATCH-only    {dispatch:.3} ms (compute+poll, no copy/map — the GPU compute cost)");
+    full
 }

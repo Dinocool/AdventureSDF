@@ -53,10 +53,10 @@ use super::streaming::BrickKey;
 /// 27 same-LOD cores (the brick + its 26 neighbours) the GPU halo-fill reads. `assets/shaders/voxel_pack.wgsl`
 /// (`pack_brick`) consumes one per workgroup and writes the bit-packed index stream / palette / meta itself —
 /// byte-identical to what [`emit_changed_slot`](ResidentPacker::emit_changed_slot) would have written on the CPU.
-/// `#[repr(C)]` + `bytemuck`-uploadable; field order/size MUST match the WGSL `PackCommand` (16 u32 / 64 B).
-/// A FLAT 16-u32 (64 B) record — NO `[f32;3]`/vec3 fields, because the WGSL `vec3` 16-byte alignment would
+/// `#[repr(C)]` + `bytemuck`-uploadable; field order/size MUST match the WGSL `PackCommand` (15 u32 / 60 B).
+/// A FLAT 15-u32 (60 B) record — NO `[f32;3]`/vec3 fields, because the WGSL `vec3` 16-byte alignment would
 /// silently pad the `array<PackCommand>` stride and misalign it against this tightly-packed `#[repr(C)]`. Every
-/// field is a scalar so the Rust struct and the WGSL `PackCommand` agree on a 64-B stride field-for-field.
+/// field is a scalar so the Rust struct and the WGSL `PackCommand` agree on a 60-B stride field-for-field.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct GpuPackCommand {
@@ -118,6 +118,50 @@ pub struct GpuAabbCommand {
     pub world_min_y: f32,
     pub world_min_z: f32,
     pub _pad1: u32,
+}
+
+/// **Stage G4 — the per-dirty-brick GPU CLASSIFY command.** Emitted by [`ResidentPacker::update_gpu_prepare`] for
+/// EVERY dirty key (uniform OR dense — the CPU does not yet know which; that is what the GPU decides). It points at
+/// the brick's 27 same-LOD cores (the brick + its 26 neighbours) the GPU halo-fill reads — the SAME deduped core
+/// pool + neighbour table the later `pack_brick` consumes. The GPU (`voxel_pack.wgsl::classify_brick`, one workgroup
+/// each) halo-fills then writes a [`GpuClassifyOut`] the CPU reads back to drive the `SlabArena` allocation WITHOUT
+/// the CPU `pack_one` (the G4 win). A FLAT 4-u32 (16 B) record — `neighbour_base` + padding (scalar-only, same
+/// vec3-padding hazard as [`GpuPackCommand`]). `#[repr(C)]` + `bytemuck`; field order/size MUST match the WGSL
+/// `ClassifyCommand` (which reads `commands[cmd_idx].neighbour_base` — see below).
+///
+/// NOTE the WGSL `classify_brick` shares the `PackCommand` binding (`@group(0) @binding(0)`), so the classify pass
+/// uploads a `GpuPackCommand`-shaped buffer too — but only `neighbour_base` is meaningful at classify time (the
+/// offsets/bits are unknown until AFTER the readback). [`GpuClassifyCommand`] is the CPU-side carrier of just the
+/// `neighbour_base` per dirty key (uploaded as a `GpuPackCommand` with the not-yet-known fields zeroed).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct GpuClassifyCommand {
+    /// Base index into the per-command 27-entry NEIGHBOUR TABLE ([`GpuPackBatch::neighbour_indices`]); identical
+    /// meaning to [`GpuPackCommand::neighbour_base`]. The classify halo-fill reads `neighbour_indices[base + n]`.
+    pub neighbour_base: u32,
+    pub _pad0: u32,
+    pub _pad1: u32,
+    pub _pad2: u32,
+}
+
+/// **Stage G4 — the per-dirty-brick GPU CLASSIFY output.** One per [`GpuClassifyCommand`], written by
+/// `voxel_pack.wgsl::classify_brick` and read back by [`ResidentPacker::update_gpu_finish`]. Carries the CHEAP
+/// per-brick classification the [`SlabArena`] allocation needs — the dense/uniform decision + the uniform id + the
+/// palette size class — computed on the GPU from the haloed brick so the CPU stops `pack_one`'ing. A FLAT 4-u32
+/// (16 B) record; field order/size MUST match the WGSL `classify_out` words (see `classify_brick`). Because these
+/// are a DETERMINISTIC function of the haloed brick, they EQUAL what the CPU `pack_one`+`encode_paletted` would
+/// compute → the alloc is byte-identical → the pool is byte-identical (the parity gate is unchanged).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct GpuClassifyOut {
+    /// `1` = uniform-incl-halo (the brick + its halo are one solid block); `0` = dense.
+    pub is_uniform: u32,
+    /// The single solid block id (only when `is_uniform == 1`; `0` when dense).
+    pub uniform_block: u32,
+    /// The distinct-id count of the haloed cells (the palette size class; `0` when uniform).
+    pub palette_k: u32,
+    /// `pow2_index_bits(palette_k) ∈ {1,2,4,8,16}` (the index size class; `0` when uniform).
+    pub index_bits: u32,
 }
 
 /// `GpuAabbCommand::flag` for a RESIDENT slot (write the real epsilon-grown `brick_aabb`).
@@ -200,6 +244,59 @@ impl GpuPackBatch {
     }
 }
 
+/// **Stage G4 — the CLASSIFY-pass batch** ([`ResidentPacker::update_gpu_prepare`]). Carries everything the GPU
+/// classify needs (the deduped core pool + the per-dirty-key 27-neighbour table + one [`GpuClassifyCommand`] per
+/// dirty key), so the render world can dispatch `classify_brick` and read back the per-brick `(is_uniform,
+/// index_bits, palette_k)`. The render world then calls [`ResidentPacker::update_gpu_finish`] with the readback to
+/// run the `SlabArena` allocation (NO CPU `pack_one`) and produce the final [`GpuPackBatch`].
+///
+/// The `cores` + `neighbour_indices` here are the SAME the final pack consumes: a dense pack command reuses the
+/// classify command's `neighbour_base` (the GPU pack halo-fills from the identical neighbour table), so the pool is
+/// built ONCE in prepare, not twice. `command_count == commands.len()` is the number of `GpuClassifyOut` the
+/// readback returns (one per dirty key, in `dirty_keys` order).
+#[derive(Clone, Debug, Default)]
+pub struct GpuClassifyBatch {
+    /// One per dirty key (uniform OR dense), in the deterministic `dirty_keys` order. The GPU classify dispatches
+    /// one workgroup per entry; the readback returns one [`GpuClassifyOut`] per entry in this order.
+    pub commands: Vec<GpuClassifyCommand>,
+    /// The DEDUPED core pool (same meaning as [`GpuPackBatch::cores`]) — each distinct resident brick's `8³` core
+    /// ONCE. Built for the classify halo-fill; REUSED by the final pack (same pool).
+    pub cores: Vec<u32>,
+    /// The per-command 27-entry NEIGHBOUR TABLE (same meaning as [`GpuPackBatch::neighbour_indices`]). Built for
+    /// classify; REUSED by the final pack (a dense pack command points at the same `neighbour_base`).
+    pub neighbour_indices: Vec<u32>,
+}
+
+impl GpuClassifyBatch {
+    /// True iff there is nothing to classify (no dirty key this generation).
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.commands.is_empty()
+    }
+}
+
+/// **Stage G4 — the deferred state [`update_gpu_prepare`] stashes for [`update_gpu_finish`].** The prepare phase did
+/// the dirty-set/expansion + the drop/enter bookkeeping + the deduped core pool, but DEFERRED the per-dirty-key
+/// allocation to after the GPU classify readback. This holds the ordered dirty keys + the already-emitted freed-slot
+/// CPU/AABB writes + the topology flag so `finish` can resume the allocation exactly where prepare left off. Held on
+/// the packer (one prepare must be followed by one finish before the next prepare).
+#[derive(Clone, Debug, Default)]
+struct PendingClassify {
+    /// The dirty keys in the SAME order as the classify commands (`commands[i]` classifies `dirty_keys[i]`).
+    dirty_keys: Vec<BrickKey>,
+    /// The FREED-slot CPU meta writes prepare already emitted (drops — they need no classification).
+    freed_cpu_writes: Vec<GpuCpuWrite>,
+    /// The FREED-slot AABB commands prepare already emitted (drops → degenerate).
+    freed_aabb_commands: Vec<GpuAabbCommand>,
+    /// The per-command `neighbour_base` (= `i·27`), so `finish` reuses the classify neighbour table for the pack
+    /// command of a dense brick WITHOUT rebuilding the pool.
+    neighbour_bases: Vec<u32>,
+    /// The topology-changed flag accumulated during prepare (drops + enters).
+    topology_changed: bool,
+    /// True while a prepare is awaiting its finish (debug guard against an out-of-order call).
+    active: bool,
+}
+
 /// One CPU-side META write the GPU-pack batch carries (Stage G-b: META only — the AABB moved to
 /// [`GpuAabbCommand`]). Emitted for a UNIFORM or FREED slot (the shader does not touch its meta): the 48-B meta to
 /// `queue_write_buffer` at `slot · 48`. A DENSE slot is never here (the shader writes its meta).
@@ -216,6 +313,59 @@ pub struct GpuCpuWrite {
 #[inline]
 fn neighbour_slot(dx: i32, dy: i32, dz: i32) -> u32 {
     ((dz + 1) * 9 + (dy + 1) * 3 + (dx + 1)) as u32
+}
+
+/// The CHEAP per-brick GEOMETRY (a pure function of `key` — NO halo, NO neighbour reads): the AABB, the world-voxel
+/// origin, the world-min corner. Recomputed in the Stage-G4 GPU-classify path (where the CPU has no [`PackedBrick`]
+/// because it never ran `pack_one`), identically to the fields [`pack_one`] fills. SSOT for both producers.
+struct BrickGeom {
+    aabb: GpuBrickAabb,
+    voxel_origin: [i32; 3],
+    world_min: [f32; 3],
+}
+
+impl BrickGeom {
+    fn of(key: BrickKey) -> Self {
+        let coord = key.coord;
+        let span = super::brickmap::brick_span(key.lod);
+        let world_min = [coord.x as f32 * span, coord.y as f32 * span, coord.z as f32 * span];
+        let voxel_origin = [coord.x * BRICK_EDGE, coord.y * BRICK_EDGE, coord.z * BRICK_EDGE];
+        Self { aabb: super::gpu::brick_aabb(world_min, key.lod), voxel_origin, world_min }
+    }
+}
+
+/// The CHEAP per-brick CLASSIFICATION the [`SlabArena`] allocation needs — the dense/uniform decision + (dense) the
+/// palette size class. Produced EITHER by the CPU [`pack_one`] (the [`update_gpu`](ResidentPacker::update_gpu) path)
+/// OR by the GPU classify pass + readback ([`update_gpu_finish`](ResidentPacker::update_gpu_finish), the Stage-G4
+/// win — no CPU `pack_one`). The Phase-2 emit ([`emit_pack_command`](ResidentPacker::emit_pack_command)) is driven by
+/// this, so the two producers converge to byte-identical allocations (the parity gate proves it).
+#[derive(Clone, Copy, Debug)]
+enum Classification {
+    /// A uniform-incl-halo brick: its single solid block id (rides in the meta — no index/palette block).
+    Uniform(super::palette::BlockId),
+    /// A dense brick: its distinct-id count `k` (the palette size class; `index_bits = pow2_index_bits(k)`).
+    Dense { palette_k: u32 },
+}
+
+impl Classification {
+    /// The GPU classify readback ([`GpuClassifyOut`]) → a [`Classification`]. The byte-identity proof: the GPU
+    /// computed `(is_uniform, uniform_block, palette_k)` as a deterministic function of the SAME haloed brick
+    /// `pack_one` builds, so this equals the CPU `pack_one`'s classification.
+    fn from_gpu(out: &GpuClassifyOut) -> Self {
+        if out.is_uniform != 0 {
+            Classification::Uniform(super::palette::BlockId(out.uniform_block as u16))
+        } else {
+            Classification::Dense { palette_k: out.palette_k }
+        }
+    }
+
+    /// The CPU [`pack_one`] result → a [`Classification`] (the [`update_gpu`](ResidentPacker::update_gpu) path).
+    fn from_packed(pb: &PackedBrick) -> Self {
+        match &pb.voxels {
+            BrickVoxels::Uniform(block) => Classification::Uniform(*block),
+            BrickVoxels::Dense(cells) => Classification::Dense { palette_k: distinct_count(cells) },
+        }
+    }
 }
 
 /// Extract a brick's `8³` core as 512 `u32` block ids, in [`super::brickmap::voxel_index`] order (+X fastest).
@@ -607,6 +757,10 @@ pub struct ResidentPacker {
     quarantine_index: Vec<(u32, u8)>,
     /// Freed palette blocks `(word_offset, k)` — returned to their palette size-class free-list next update.
     quarantine_palette: Vec<(u32, u32)>,
+    /// **Stage G4** — the deferred state a [`update_gpu_prepare`](Self::update_gpu_prepare) stashes for the matching
+    /// [`update_gpu_finish`](Self::update_gpu_finish) (the GPU-classify split of [`update_gpu`](Self::update_gpu)).
+    /// `active == false` outside a prepare/finish pair.
+    pending_classify: PendingClassify,
 }
 
 impl ResidentPacker {
@@ -651,6 +805,7 @@ impl ResidentPacker {
             quarantine_slots: Vec::new(),
             quarantine_index: Vec::new(),
             quarantine_palette: Vec::new(),
+            pending_classify: PendingClassify::default(),
         }
     }
 
@@ -1143,11 +1298,179 @@ impl ResidentPacker {
         // command references it (as centre or neighbour). Shared across all commands so each brick is uploaded
         // once, not once per command that neighbours it.
         let mut core_index: FxHashMap<BrickKey, u32> = FxHashMap::default();
-        for (key, pb, k) in &packed {
-            self.emit_pack_command(*key, pb, *k, &new_by_key, &mut core_index, &mut batch);
+        for (key, pb, _k) in &packed {
+            let class = Classification::from_packed(pb);
+            let geom = BrickGeom { aabb: pb.aabb, voxel_origin: pb.voxel_origin, world_min: pb.world_min };
+            let cells = match &pb.voxels {
+                BrickVoxels::Dense(c) => Some(c),
+                BrickVoxels::Uniform(_) => None,
+            };
+            self.emit_pack_command(*key, class, &geom, cells, None, &new_by_key, &mut core_index, &mut batch);
         }
 
         batch.topology_changed = topology_changed;
+        batch
+    }
+
+    /// **Stage G4 — the GPU-classify PREPARE phase** (the split of [`update_gpu`](Self::update_gpu) that removes the
+    /// CPU `pack_one`). Runs the IDENTICAL dirty-set + drop/enter/rewrite + 26-neighbourhood expansion as
+    /// [`update_gpu`](Self::update_gpu) — but does **NOT** run `pack_one`. Instead it builds, for EVERY dirty key (it
+    /// does not yet know dense vs uniform — that is what the GPU decides), the deduped core pool + the 27-neighbour
+    /// table + one [`GpuClassifyCommand`], and stashes the ordered dirty keys + the freed-slot writes in
+    /// [`PendingClassify`]. The render world dispatches `classify_brick`, reads back the per-brick
+    /// [`GpuClassifyOut`], and calls [`update_gpu_finish`](Self::update_gpu_finish) to run the `SlabArena` allocation
+    /// (the cheap part) and emit the final [`GpuPackBatch`]. The classification is a deterministic function of the
+    /// haloed brick, so the alloc — and thus the pool — is byte-identical to the CPU path (the parity gate).
+    ///
+    /// MUST be paired with exactly one [`update_gpu_finish`](Self::update_gpu_finish) before the next prepare (the
+    /// pending state + the mid-flight allocator quarantine assume one in-flight prepare). The deferred-free at the
+    /// top mirrors [`update`](Self::update)/[`update_gpu`](Self::update_gpu) so the free-list LIFO (and the offsets)
+    /// match. `palette_stride` is the registry length (the `k ≤ palette_stride` invariant).
+    pub fn update_gpu_prepare(&mut self, entries: &[ResidentBrick<'_>], palette_stride: u32) -> GpuClassifyBatch {
+        debug_assert!(!self.pending_classify.active, "update_gpu_prepare called twice without an update_gpu_finish");
+        debug_assert!(
+            self.palette_stride == 0 || self.palette_stride == palette_stride,
+            "palette_stride must be constant within an epoch ({} → {palette_stride})",
+            self.palette_stride,
+        );
+        self.palette_stride = palette_stride;
+        // (1) Deferred-free — release last update's quarantined slots/blocks BEFORE claiming this update's.
+        for s in self.quarantine_slots.drain(..) {
+            self.slots.release(s);
+        }
+        for (off, bits) in std::mem::take(&mut self.quarantine_index) {
+            self.index_arena.free_block(off, index_slab_words(bits));
+        }
+        for (off, k) in std::mem::take(&mut self.quarantine_palette) {
+            self.palette_arena.free_block(off, k);
+        }
+
+        let new_by_key: FxHashMap<BrickKey, &Brick> =
+            entries.iter().map(|e| (BrickKey { coord: e.coord, lod: e.lod }, e.brick)).collect();
+
+        let mut pending = PendingClassify::default();
+        let mut dirty: FxHashMap<BrickKey, ()> = FxHashMap::default();
+
+        // (2a) DROP keys no longer resident — collapse to degenerate/zeroed (a CPU write), dirty neighbours. No
+        //      classification needed (a freed slot has no brick); emitted straight into `pending.freed_*`.
+        let live_keys: Vec<BrickKey> = self.resident.keys().copied().collect();
+        for key in live_keys {
+            if new_by_key.contains_key(&key) {
+                continue;
+            }
+            let st = self.resident.remove(&key).expect("key from live set");
+            pending.freed_cpu_writes.push(GpuCpuWrite { slot: st.slot, meta: GpuBrickMeta::zeroed() });
+            pending.freed_aabb_commands.push(GpuAabbCommand::freed(st.slot));
+            self.quarantine_slots.push(st.slot);
+            self.last_meta.insert(st.slot, GpuBrickMeta::zeroed());
+            self.last_aabb.insert(st.slot, degenerate_aabb());
+            self.last_voxels.remove(&st.slot);
+            if let Some(d) = st.dense {
+                self.quarantine_index.push((d.index_offset, d.index_bits));
+                self.quarantine_palette.push((d.palette_offset, d.palette_k));
+            }
+            pending.topology_changed = true;
+            for nbr in neighbourhood_26(key) {
+                if new_by_key.contains_key(&nbr) {
+                    dirty.insert(nbr, ());
+                }
+            }
+        }
+
+        // (2b) ENTER keys not yet resident — claim a slot (so the expansion sees it), seed dirty.
+        for e in entries {
+            let key = BrickKey { coord: e.coord, lod: e.lod };
+            if self.resident.contains_key(&key) {
+                continue;
+            }
+            let Some(slot) = self.slots.claim() else {
+                continue;
+            };
+            self.resident.insert(key, SlotState { slot, dense: None });
+            dirty.insert(key, ());
+            pending.topology_changed = true;
+        }
+
+        // (2c) Explicitly-rewritten keys.
+        for key in std::mem::take(&mut self.pending_rewrites) {
+            if new_by_key.contains_key(&key) {
+                dirty.insert(key, ());
+            }
+        }
+
+        // (3) EXPAND by the resident 26-neighbourhood (halo dependency).
+        let seeds: Vec<BrickKey> = dirty.keys().copied().collect();
+        for key in seeds {
+            for nbr in neighbourhood_26(key) {
+                if new_by_key.contains_key(&nbr) {
+                    dirty.insert(nbr, ());
+                }
+            }
+        }
+
+        // (4) The deterministic dirty order (same as `update_inner`/`update_gpu`) — `commands[i]` classifies
+        //     `dirty_keys[i]`, so the readback order matches.
+        let mut dirty_keys: Vec<BrickKey> = dirty.keys().copied().collect();
+        dirty_keys.sort_by_key(|k| (k.lod, k.coord.z, k.coord.y, k.coord.x));
+
+        // (5) Build the deduped core pool + the 27-neighbour table + a classify command FOR EVERY dirty key (the
+        //     GPU needs the halo for the classification; the table is REUSED by the final pack — see `finish`).
+        let mut classify = GpuClassifyBatch::default();
+        let mut core_index: FxHashMap<BrickKey, u32> = FxHashMap::default();
+        // `build_neighbour_table` appends to a `GpuPackBatch`'s cores/neighbour_indices; classify uses the same
+        // shape, so build into a scratch `GpuPackBatch` then move the pools across (no duplication of the SSOT).
+        let mut scratch = GpuPackBatch::default();
+        for &key in &dirty_keys {
+            let base = scratch.neighbour_indices.len() as u32;
+            Self::build_neighbour_table(key, base, &new_by_key, &mut core_index, &mut scratch);
+            classify.commands.push(GpuClassifyCommand { neighbour_base: base, _pad0: 0, _pad1: 0, _pad2: 0 });
+            pending.neighbour_bases.push(base);
+        }
+        classify.cores = scratch.cores;
+        classify.neighbour_indices = scratch.neighbour_indices;
+
+        pending.dirty_keys = dirty_keys;
+        pending.active = true;
+        self.pending_classify = pending;
+        classify
+    }
+
+    /// **Stage G4 — the GPU-classify FINISH phase.** Consumes the GPU `classify_brick` readback (`classify_out`, one
+    /// [`GpuClassifyOut`] per [`GpuClassifyBatch::commands`] entry, in `dirty_keys` order) + the
+    /// [`GpuClassifyBatch`] from the matching [`update_gpu_prepare`](Self::update_gpu_prepare) (whose core pool +
+    /// neighbour table the final pack REUSES). Runs the EXACT Phase-2 serial allocation [`update_gpu`](Self::update_gpu)
+    /// would — but the dense/uniform decision + the palette size class come from the GPU classification, NOT a CPU
+    /// `pack_one` (the G4 win: no `pack_one` on the dirty bricks). Emits the byte-identical [`GpuPackBatch`] the
+    /// render world dispatches `pack_brick` + `write_aabb` over.
+    pub fn update_gpu_finish(&mut self, prepared: &GpuClassifyBatch, classify_out: &[GpuClassifyOut]) -> GpuPackBatch {
+        debug_assert!(self.pending_classify.active, "update_gpu_finish called without a matching update_gpu_prepare");
+        debug_assert_eq!(
+            classify_out.len(),
+            self.pending_classify.dirty_keys.len(),
+            "classify readback length must equal the prepared dirty-key count",
+        );
+        let pending = std::mem::take(&mut self.pending_classify);
+
+        let mut batch = GpuPackBatch {
+            // The final pack REUSES the prepared core pool + neighbour table (the classify pass + the pack pass index
+            // the IDENTICAL table; a dense pack command points at the same `neighbour_base`).
+            cores: prepared.cores.clone(),
+            neighbour_indices: prepared.neighbour_indices.clone(),
+            cpu_writes: pending.freed_cpu_writes,
+            aabb_commands: pending.freed_aabb_commands,
+            topology_changed: pending.topology_changed,
+            ..Default::default()
+        };
+
+        // `new_by_key`/`core_index` are unused on the GPU path (the table is prebuilt) — pass empty placeholders.
+        let new_by_key: FxHashMap<BrickKey, &Brick> = FxHashMap::default();
+        let mut core_index: FxHashMap<BrickKey, u32> = FxHashMap::default();
+        for (i, &key) in pending.dirty_keys.iter().enumerate() {
+            let class = Classification::from_gpu(&classify_out[i]);
+            let geom = BrickGeom::of(key);
+            let base = pending.neighbour_bases[i];
+            self.emit_pack_command(key, class, &geom, None, Some(base), &new_by_key, &mut core_index, &mut batch);
+        }
         batch
     }
 
@@ -1171,41 +1494,50 @@ impl ResidentPacker {
 
     /// Allocate `key`'s slot's index/palette slabs (as the dense/uniform classification + the index/palette size
     /// class changed) and emit either a [`GpuPackCommand`] (dense) or a [`GpuCpuWrite`] (uniform) into `batch`,
-    /// updating the shadow EXACTLY as [`emit_changed_slot`](Self::emit_changed_slot) does — so the GPU path and
-    /// the CPU path converge to byte-identical shadow/buffer state. `k` is the dense brick's distinct-id count
-    /// (`None` for uniform). Skips emission when the brick's bytes match the slot's shadow (the no-change fast
-    /// path — same as the CPU path), but ALWAYS keeps the shadow current.
+    /// updating the shadow EXACTLY as [`emit_changed_slot`](Self::emit_changed_slot) does — so BOTH the
+    /// CPU-classified [`update_gpu`](Self::update_gpu) AND the GPU-classified [`update_gpu_finish`](Self::update_gpu_finish)
+    /// paths converge to byte-identical shadow/buffer state.
+    ///
+    /// Driven by the [`Classification`] (dense/uniform + the palette size class) — produced by the CPU `pack_one`
+    /// OR the GPU classify readback — plus the cheap [`BrickGeom`] (a pure function of `key`). `cells` is `Some` ONLY
+    /// on the CPU path (the haloed cells, for the `last_voxels` shadow + the `voxels_changed` byte-compare); on the
+    /// GPU path it is `None` (the CPU never built them) and the dense brick is conservatively treated as changed
+    /// (`force_voxels_changed`) — a redundant re-pack is still byte-identical, never wrong. `prebuilt_base` is the
+    /// GPU path's already-built 27-neighbour table base (built in `prepare`); `None` ⇒ build it lazily here (CPU).
+    #[allow(clippy::too_many_arguments)]
     fn emit_pack_command(
         &mut self,
         key: BrickKey,
-        pb: &PackedBrick,
-        k: Option<u32>,
+        class: Classification,
+        geom: &BrickGeom,
+        cells: Option<&Vec<u32>>,
+        prebuilt_base: Option<u32>,
         new_by_key: &FxHashMap<BrickKey, &Brick>,
         core_index: &mut FxHashMap<BrickKey, u32>,
         batch: &mut GpuPackBatch,
     ) {
+        let lod = key.lod;
         let st = *self.resident.get(&key).expect("dirty key is resident");
-        match &pb.voxels {
-            BrickVoxels::Uniform(_) => {
+        match class {
+            Classification::Uniform(block) => {
                 if let Some(d) = st.dense {
                     self.quarantine_index.push((d.index_offset, d.index_bits));
                     self.quarantine_palette.push((d.palette_offset, d.palette_k));
                 }
-                let meta = pb.meta_uniform();
+                let meta = GpuBrickMeta::uniform(geom.voxel_origin, block, geom.world_min, lod);
                 self.resident.insert(key, SlotState { slot: st.slot, dense: None });
                 let changed =
-                    self.last_meta.get(&st.slot) != Some(&meta) || self.last_aabb.get(&st.slot) != Some(&pb.aabb);
+                    self.last_meta.get(&st.slot) != Some(&meta) || self.last_aabb.get(&st.slot) != Some(&geom.aabb);
                 self.last_meta.insert(st.slot, meta);
-                self.last_aabb.insert(st.slot, pb.aabb);
+                self.last_aabb.insert(st.slot, geom.aabb);
                 self.last_voxels.remove(&st.slot);
                 if changed {
                     // Meta is CPU-written (uniform id rides in it); the AABB is GPU-written via an aabb command.
                     batch.cpu_writes.push(GpuCpuWrite { slot: st.slot, meta });
-                    batch.aabb_commands.push(GpuAabbCommand::resident(st.slot, pb.world_min, pb.lod));
+                    batch.aabb_commands.push(GpuAabbCommand::resident(st.slot, geom.world_min, lod));
                 }
             }
-            BrickVoxels::Dense(cells) => {
-                let k = k.expect("dense brick must carry its distinct-id count");
+            Classification::Dense { palette_k: k } => {
                 let index_bits = pow2_index_bits(k as usize);
                 debug_assert!(
                     k <= self.palette_stride,
@@ -1231,10 +1563,10 @@ impl ResidentPacker {
                     None => self.palette_arena.alloc(k),
                 };
                 let meta = GpuBrickMeta::dense(
-                    pb.voxel_origin,
+                    geom.voxel_origin,
                     index_offset,
-                    pb.world_min,
-                    pb.lod,
+                    geom.world_min,
+                    lod,
                     index_bits,
                     palette_offset,
                 );
@@ -1246,54 +1578,56 @@ impl ResidentPacker {
                     },
                 );
                 let meta_changed =
-                    self.last_meta.get(&st.slot) != Some(&meta) || self.last_aabb.get(&st.slot) != Some(&pb.aabb);
-                let voxels_changed = self.last_voxels.get(&st.slot) != Some(cells);
+                    self.last_meta.get(&st.slot) != Some(&meta) || self.last_aabb.get(&st.slot) != Some(&geom.aabb);
+                // CPU path: byte-compare the cells against the shadow. GPU path (`cells == None`): the CPU never
+                // built the cells, so conservatively re-pack (the GPU produces byte-identical bytes regardless).
+                let voxels_changed = match cells {
+                    Some(c) => self.last_voxels.get(&st.slot) != Some(c),
+                    None => true,
+                };
                 self.last_meta.insert(st.slot, meta);
-                self.last_aabb.insert(st.slot, pb.aabb);
-                if voxels_changed {
-                    self.last_voxels.insert(st.slot, cells.clone());
+                self.last_aabb.insert(st.slot, geom.aabb);
+                match cells {
+                    // CPU path: keep the raw-cell shadow current (the `snapshot_buffers` re-encode source).
+                    Some(c) if voxels_changed => {
+                        self.last_voxels.insert(st.slot, c.clone());
+                    }
+                    // GPU path: the CPU has no cells. Drop any stale shadow so a later `snapshot_buffers` does NOT
+                    // re-encode a wrong (old-CPU-path) block for this slot — the GPU pack owns the bytes now (the
+                    // GPU-path snapshot fills dense blocks GPU-side, see `snapshot_buffers_gpu`).
+                    None => {
+                        self.last_voxels.remove(&st.slot);
+                    }
+                    _ => {}
                 }
                 if meta_changed || voxels_changed {
                     // Stage G-b: the meta + index + palette are GPU-written (the `pack_brick` command); the AABB
                     // too (a GPU `write_aabb` command). We emit the AABB command whenever the meta changed (the
                     // AABB is a pure function of `world_min`/`lod`, which live in the meta); the pack command ONLY
                     // when the voxel CONTENT changed (a meta-only move with identical content needs no re-encode).
-                    batch.aabb_commands.push(GpuAabbCommand::resident(st.slot, pb.world_min, pb.lod));
+                    batch.aabb_commands.push(GpuAabbCommand::resident(st.slot, geom.world_min, lod));
                     if voxels_changed {
-                        // Build the 27-entry NEIGHBOUR TABLE (the brick + its 26 same-LOD neighbours) for the GPU
-                        // halo-fill, interning each resident core into the DEDUPED pool (uploaded once). An absent
-                        // neighbour → NEIGHBOUR_ABSENT (the halo reads AIR — mirror of `neighbour_border_cell`).
-                        let neighbour_base = batch.neighbour_indices.len() as u32;
-                        for dz in -1..=1 {
-                            for dy in -1..=1 {
-                                for dx in -1..=1 {
-                                    let nslot = neighbour_slot(dx, dy, dz);
-                                    debug_assert_eq!(
-                                        batch.neighbour_indices.len(),
-                                        neighbour_base as usize + nslot as usize
-                                    );
-                                    let nkey =
-                                        BrickKey { coord: key.coord + IVec3::new(dx, dy, dz), lod: key.lod };
-                                    let entry = match new_by_key.get(&nkey) {
-                                        Some(&brick) => {
-                                            Self::intern_core(&mut batch.cores, core_index, nkey, brick)
-                                        }
-                                        None => NEIGHBOUR_ABSENT,
-                                    };
-                                    batch.neighbour_indices.push(entry);
-                                }
+                        // The 27-entry NEIGHBOUR TABLE (the brick + its 26 same-LOD neighbours) for the GPU
+                        // halo-fill. On the GPU path it is ALREADY built (in `prepare`) — reuse `prebuilt_base`.
+                        // On the CPU path build it lazily, interning each resident core into the DEDUPED pool.
+                        let neighbour_base = match prebuilt_base {
+                            Some(base) => base,
+                            None => {
+                                let base = batch.neighbour_indices.len() as u32;
+                                Self::build_neighbour_table(key, base, new_by_key, core_index, batch);
+                                base
                             }
-                        }
+                        };
                         batch.commands.push(GpuPackCommand {
-                            origin_x: pb.voxel_origin[0],
-                            origin_y: pb.voxel_origin[1],
-                            origin_z: pb.voxel_origin[2],
+                            origin_x: geom.voxel_origin[0],
+                            origin_y: geom.voxel_origin[1],
+                            origin_z: geom.voxel_origin[2],
                             slot: st.slot,
-                            world_min_x: pb.world_min[0],
-                            world_min_y: pb.world_min[1],
-                            world_min_z: pb.world_min[2],
+                            world_min_x: geom.world_min[0],
+                            world_min_y: geom.world_min[1],
+                            world_min_z: geom.world_min[2],
                             index_word_offset: index_offset,
-                            lod: pb.lod,
+                            lod,
                             index_bits: index_bits as u32,
                             palette_word_offset: palette_offset,
                             neighbour_base,
@@ -1302,6 +1636,33 @@ impl ResidentPacker {
                             _pad2: 0,
                         });
                     }
+                }
+            }
+        }
+    }
+
+    /// Build the 27-entry NEIGHBOUR TABLE for `key` at `base` (= `batch.neighbour_indices.len()` on entry), interning
+    /// each resident core into the DEDUPED pool (uploaded once); an absent neighbour → [`NEIGHBOUR_ABSENT`] (the halo
+    /// reads AIR — mirror of `neighbour_border_cell`). The SSOT both the lazy CPU emit + the Stage-G4 `prepare` use,
+    /// so the classify pass and the pack pass index the IDENTICAL table.
+    fn build_neighbour_table(
+        key: BrickKey,
+        base: u32,
+        new_by_key: &FxHashMap<BrickKey, &Brick>,
+        core_index: &mut FxHashMap<BrickKey, u32>,
+        batch: &mut GpuPackBatch,
+    ) {
+        for dz in -1..=1 {
+            for dy in -1..=1 {
+                for dx in -1..=1 {
+                    let nslot = neighbour_slot(dx, dy, dz);
+                    debug_assert_eq!(batch.neighbour_indices.len(), base as usize + nslot as usize);
+                    let nkey = BrickKey { coord: key.coord + IVec3::new(dx, dy, dz), lod: key.lod };
+                    let entry = match new_by_key.get(&nkey) {
+                        Some(&brick) => Self::intern_core(&mut batch.cores, core_index, nkey, brick),
+                        None => NEIGHBOUR_ABSENT,
+                    };
+                    batch.neighbour_indices.push(entry);
                 }
             }
         }

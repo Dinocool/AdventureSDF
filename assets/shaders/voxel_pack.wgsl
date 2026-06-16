@@ -54,9 +54,9 @@ const NEIGHBOUR_COUNT: u32 = 27u;
 // Mirror of META_FLAG_UNIFORM in src/voxel/gpu.rs (unused here — every command is dense — kept for clarity).
 const META_FLAG_UNIFORM: u32 = 1u;
 
-// One per-brick PACK command — a FLAT 16-u32 (64 B) record (NO `vec3`, whose 16-byte WGSL alignment would
+// One per-brick PACK command — a FLAT 15-u32 (60 B) record (NO `vec3`, whose 16-byte WGSL alignment would
 // silently insert padding and misalign the `array<PackCommand>` stride against the tightly-packed Rust
-// `#[repr(C)]`). Every field is a scalar `u32`/`i32`, so the WGSL stride is exactly 64 B = the Rust struct.
+// `#[repr(C)]`). Every field is a scalar `u32`/`i32`, so the WGSL stride is exactly 60 B = the Rust struct.
 // Mirrors `GpuPackCommand` in src/voxel/incremental.rs FIELD-FOR-FIELD (the byte producer of this struct).
 struct PackCommand {
     origin_x: i32,                  // brick world-voxel origin x (= coord.x · BRICK_EDGE)
@@ -132,6 +132,21 @@ fn brick_aabb_epsilon(lod: u32) -> f32 {
 // consumes (one invocation each).
 @group(0) @binding(6) var<storage, read_write> aabb_buf: array<u32>;
 @group(0) @binding(7) var<storage, read> aabb_commands: array<AabbCommand>;
+// **Stage G4 — the classify pass output.** One [`ClassifyOut`] (4 u32 / 16 B) per `commands` entry, written by
+// `classify_brick` (its OWN pipeline/bind-group — `pack_brick`/`write_aabb` ignore it). The CPU reads this back to
+// drive the EXISTING `SlabArena` allocation WITHOUT the CPU `pack_one` (that is the G4 win). Mirrors `GpuClassifyOut`
+// in src/voxel/incremental.rs FIELD-FOR-FIELD (4 u32). Bound at its own group(0)/binding(8).
+@group(0) @binding(8) var<storage, read_write> classify_out: array<u32>;
+// **Stage G4 — the classify command list.** One [`ClassifyCommand`] (4 u32 / 16 B) per dirty brick — its OWN binding
+// (NOT the `PackCommand` @0, whose 15-u32/60-B stride differs), so `classify_brick` reads a clean `neighbour_base`
+// without the pack-command stride. Mirrors `GpuClassifyCommand` in src/voxel/incremental.rs FIELD-FOR-FIELD.
+struct ClassifyCommand {
+    neighbour_base: u32,            // base into `neighbour_indices` for this command's 27-entry table
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
+}
+@group(0) @binding(9) var<storage, read> classify_commands: array<ClassifyCommand>;
 
 // Workgroup shared state for ONE brick's pack.
 // `halo` — the 1000 haloed cells (block ids), in halo_index order (filled in parallel from the cores).
@@ -178,21 +193,12 @@ fn pow2_index_bits(k: u32) -> u32 {
     return 16u;
 }
 
-@compute @workgroup_size(256)
-fn pack_brick(
-    @builtin(workgroup_id) wg: vec3<u32>,
-    @builtin(local_invocation_id) lid: vec3<u32>,
-) {
-    let cmd_idx = wg.x;
-    if (cmd_idx >= arrayLength(&commands)) {
-        return;
-    }
-    let cmd = commands[cmd_idx];
-    let li = lid.x;
-
-    // (1) HALO FILL — reproduce `pack_one`'s dense fill: walk the haloed grid in halo_index order; a core cell
-    //     (local coord in [0,8)) reads the centre core; a border cell reads the owning same-LOD neighbour core,
-    //     or AIR (block 0) when that neighbour is absent. Parallel over the 1000 cells (pure per-cell function).
+// **The SHARED halo-fill** — reproduce `pack_one`'s dense fill into the workgroup `halo` array: walk the haloed
+// grid in halo_index order; a core cell (local coord in [0,8)) reads the centre core; a border cell reads the
+// owning same-LOD neighbour core, or AIR (block 0) when that neighbour is absent. Parallel over the 1000 cells
+// (pure per-cell function). The SINGLE halo SSOT both `pack_brick` and `classify_brick` call — so the G4 classify
+// can NEVER drift from the pack (they fill IDENTICAL cells, by construction). Caller barriers AFTER this.
+fn fill_halo(neighbour_base: u32, li: u32) {
     for (var cell = li; cell < HALO_CELLS; cell = cell + WG_SIZE) {
         // Decode the haloed local coord (hx,hy,hz) from the linear `cell` (inverse of halo_index).
         let hz = i32(cell) / (HALO_EDGE * HALO_EDGE);
@@ -207,7 +213,7 @@ fn pack_brick(
         var block: u32 = 0u; // AIR default (BlockId::AIR == 0)
         if (in_core) {
             // The centre core is neighbour slot 13 = (0+1)*9 + (0+1)*3 + (0+1).
-            let core = neighbour_indices[cmd.neighbour_base + 13u];
+            let core = neighbour_indices[neighbour_base + 13u];
             block = cores[core * CORE_CELLS + voxel_index(cx, cy, cz)];
         } else {
             // Resolve the owning same-LOD neighbour (mirror of `neighbour_border_cell`).
@@ -215,7 +221,7 @@ fn pack_brick(
             let dy = nbr_off(cy);
             let dz = nbr_off(cz);
             let nslot = u32((dz + 1) * 9 + (dy + 1) * 3 + (dx + 1));
-            let core = neighbour_indices[cmd.neighbour_base + nslot];
+            let core = neighbour_indices[neighbour_base + nslot];
             if (core != NEIGHBOUR_ABSENT) {
                 let lx = nbr_local(cx);
                 let ly = nbr_local(cy);
@@ -226,6 +232,23 @@ fn pack_brick(
         }
         halo[cell] = block;
     }
+}
+
+@compute @workgroup_size(256)
+fn pack_brick(
+    @builtin(workgroup_id) wg: vec3<u32>,
+    @builtin(local_invocation_id) lid: vec3<u32>,
+) {
+    let cmd_idx = wg.x;
+    if (cmd_idx >= arrayLength(&commands)) {
+        return;
+    }
+    let cmd = commands[cmd_idx];
+    let li = lid.x;
+
+    // (1) HALO FILL — the shared SSOT fill (see `fill_halo`). A pack command is ALWAYS dense (the CPU emits a
+    //     pack command only for a dense brick whose voxels changed), so this always proceeds to encode.
+    fill_halo(cmd.neighbour_base, li);
     workgroupBarrier();
 
     // (2) SERIAL PALETTE BUILD — invocation 0 walks all 1000 cells in halo_index order, building the first-seen
@@ -337,4 +360,87 @@ fn write_aabb(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
     aabb_buf[base + 6u] = 0u; // _pad[0]
     aabb_buf[base + 7u] = 0u; // _pad[1]
+}
+
+// **Stage G4 — the GPU CLASSIFY pass.** One WORKGROUP per `commands` entry (the SAME per-dirty-brick command list
+// `pack_brick` consumes, but emitted for EVERY dirty key — uniform OR dense — so the GPU classifies them all). It
+// does the SAME shared `fill_halo` as `pack_brick`, then computes the per-brick `(is_uniform, uniform_block,
+// palette_k, index_bits)` — the CHEAP classification the CPU `SlabArena` allocation needs — WITHOUT bit-packing.
+// The CPU reads `classify_out` back and feeds the sizes into the existing `SlabArena` alloc, so the CPU no longer
+// runs `pack_one` (the G4 win). Because the sizes are a DETERMINISTIC function of the haloed brick, the GPU
+// computes EXACTLY the sizes a CPU `pack_one`+`encode_paletted` would → the pool stays BYTE-IDENTICAL (the parity
+// gate is unchanged). `classify_out[cmd_idx·4]` is the 4-u32 `GpuClassifyOut` (mirror of src/voxel/incremental.rs):
+//   word 0 = is_uniform (1 = uniform-incl-halo, 0 = dense),
+//   word 1 = uniform_block (the single solid id when uniform; 0 when dense),
+//   word 2 = palette_k (distinct-id count of the haloed cells; the palette size class — 0 when uniform),
+//   word 3 = index_bits ∈ {1,2,4,8,16} (= pow2_index_bits(palette_k); 0 when uniform).
+//
+// ## Classification math — EXACT mirror of the CPU SSOT (src/voxel/gpu.rs)
+// - `uniform_incl_halo_block`: the brick is uniform-incl-halo IFF every one of the 1000 haloed cells equals a
+//   SINGLE NON-AIR id. (The CPU requires the CORE to be one solid block AND all halo border cells to equal it;
+//   since the core is the 512 interior cells and the border the remaining 488, "all 1000 equal a non-AIR id" is
+//   exactly that — a SINGLE robust-by-construction test over the same haloed cells, no separate core/border scan.)
+// - `distinct_count` / `encode_paletted` palette size: the count of DISTINCT ids over the 1000 cells (first-seen
+//   ORDER is irrelevant to the COUNT — the alloc only needs the size class, not the order; the order is reproduced
+//   later by `pack_brick`'s serial palette build, which the byte gate pins).
+// - `pow2_index_bits`: the smallest width in {1,2,4,8,16} that indexes `k` ids (the WGSL `pow2_index_bits` above).
+//
+// Serial within the workgroup (invocation 0) — the same first-seen scan `pack_brick`'s palette build does, reused
+// here only to COUNT distinct ids (we discard the per-cell map). `k` is tiny (a strata band is 2–8 ids), so the
+// linear scan is cheap; one workgroup per brick keeps it parallel ACROSS bricks.
+@compute @workgroup_size(256)
+fn classify_brick(
+    @builtin(workgroup_id) wg: vec3<u32>,
+    @builtin(local_invocation_id) lid: vec3<u32>,
+) {
+    let cmd_idx = wg.x;
+    if (cmd_idx >= arrayLength(&classify_commands)) {
+        return;
+    }
+    let cmd = classify_commands[cmd_idx];
+    let li = lid.x;
+
+    // (1) HALO FILL — the SAME shared SSOT fill `pack_brick` uses (so classify can never disagree with pack).
+    fill_halo(cmd.neighbour_base, li);
+    workgroupBarrier();
+
+    // (2) SERIAL CLASSIFY — invocation 0 walks all 1000 cells once: (a) the uniform-incl-halo test (all cells one
+    //     non-AIR id), and (b) the first-seen distinct-id COUNT (palette_k). Mirrors the CPU SSOT exactly.
+    if (li == 0u) {
+        let first = halo[0];
+        var all_equal = true;
+        // First-seen palette, reused only to COUNT k (order discarded — the alloc needs the size class only).
+        var k: u32 = 0u;
+        for (var cell = 0u; cell < HALO_CELLS; cell = cell + 1u) {
+            let id = halo[cell];
+            if (id != first) {
+                all_equal = false;
+            }
+            var found = false;
+            for (var p = 0u; p < k; p = p + 1u) {
+                if (palette[p] == id) {
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) {
+                palette[k] = id;
+                k = k + 1u;
+            }
+        }
+        // Uniform-incl-halo IFF all 1000 cells equal a SINGLE NON-AIR id (BlockId::AIR == 0). Else DENSE.
+        let is_uniform = all_equal && (first != 0u);
+        let base = cmd_idx * 4u;
+        if (is_uniform) {
+            classify_out[base + 0u] = 1u;     // is_uniform
+            classify_out[base + 1u] = first;  // uniform_block (the single solid id)
+            classify_out[base + 2u] = 0u;     // palette_k (unused for uniform)
+            classify_out[base + 3u] = 0u;     // index_bits (unused for uniform)
+        } else {
+            classify_out[base + 0u] = 0u;             // is_uniform = dense
+            classify_out[base + 1u] = 0u;             // uniform_block (unused for dense)
+            classify_out[base + 2u] = k;              // palette_k (distinct-id count)
+            classify_out[base + 3u] = pow2_index_bits(k); // index_bits ∈ {1,2,4,8,16}
+        }
+    }
 }
