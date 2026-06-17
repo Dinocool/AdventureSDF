@@ -311,6 +311,80 @@ fn paged_front_end_drive_renders_like_eager() {
     assert!(live_metas > 0, "paged pool has zero live metas (blank)");
 }
 
+/// **MULTI-ASSET paged drive (the gallery reproduction).** Two copies of the scene placed at DIFFERENT +X
+/// offsets in one `MergedSource` (exactly the gallery's per-asset offset layout the single-asset gate never
+/// exercises). Drive the REAL front end over the REAL pager with the camera AT THE FAR asset, then assert the
+/// FAR asset's bricks are LIVE in the pool (non-degenerate). If only the near/first asset packs, this fails —
+/// localizing the "gallery renders only Sponza" bug to the front-end/pager pack (NOT the BLAS sweep, which this
+/// gate doesn't run).
+#[test]
+fn paged_front_end_multi_asset_far_asset_packs() {
+    let Some((device, queue)) = common::headless_compute_device_with_storage(512, 48) else {
+        eprintln!("[skip] no GPU adapter — multi-asset paged drive skipped");
+        return;
+    };
+
+    let map = scene();
+    let reg = registry();
+
+    // Write the scene once, open it TWICE, place at ZERO and at +40 bricks in X (disjoint, like the gallery).
+    let dir = std::env::temp_dir().join("vrt_paged_multi");
+    std::fs::create_dir_all(&dir).expect("mk tmp dir");
+    let path = dir.join("paged_multi.vxo");
+    let params = VxoHeadParams { name: "paged_multi".into(), ..Default::default() };
+    write_vxo(&path, &map, &reg, &params, VxoCompression::Store).expect("write_vxo");
+    let far_off = IVec3::new(40, 0, 0);
+    let (a0, r0) = VxoSource::open(&path).expect("open a0");
+    let (a1, r1) = VxoSource::open(&path).expect("open a1");
+    let (merged, _mreg) = MergedSource::new(vec![(a0, r0, IVec3::ZERO), (a1, r1, far_off)]);
+    let source = std::sync::Arc::new(merged);
+
+    let clip_half = 8i32;
+    let max_resident = 16384u32;
+    let span0 = brick_span(0);
+    // Camera at the NEAR asset (origin) — the gallery START condition. The far asset (+40 bricks) is out of LOD0
+    // reach (clip_half=8) and must enter via a COARSE shell, exactly like Sibenik/Conference at the gallery start.
+    let cam = [0.5 * span0, 1.5 * span0, 0.5 * span0];
+
+    let mut pager = StreamedResidencyPager::new(&device, &queue, source, 1, clip_half, max_resident);
+    let pool = make_pool(&device, max_resident);
+    let mut fe = GpuResidencyFrontEnd::new(&device, clip_half, max_resident);
+
+    let mut bound = false;
+    for _ in 0..48 {
+        pager.update(&queue, cam);
+        if pager.take_needs_rebind() || !bound {
+            let occ = pager.occupancy();
+            let occ_owned = GpuResidencyBuffers {
+                header: occ.header.clone(),
+                entries: occ.entries.clone(),
+                table_size: occ.table_size,
+            };
+            let core_owned = pager.core_buffers();
+            fe.rebind_pool(&device, &queue, &occ_owned, &core_owned, &pool.meta, &pool.voxel, &pool.palette, &pool.aabb);
+            bound = true;
+        }
+        let _prev = fe.poll_change_count(&device);
+        let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("paged_multi_frame") });
+        fe.record_frame(&queue, &mut enc, cam);
+        queue.submit(std::iter::once(enc.finish()));
+        fe.advance_ring();
+    }
+
+    let (live, origin, _degen) = aabb_stats(&device, &queue, &pool);
+    let set = live_brick_set(&device, &queue, &pool);
+    // Split the live set by world_min.x into near (asset 0, x≈0) and far (asset 1, x≈40 bricks).
+    let far_min_x = 30.0 * span0; // asset 1 starts at brick +30 after the +40 offset shifts [-10,10]→[30,50]
+    let near = set.iter().filter(|(_, w)| f32::from_bits(w[0]) < far_min_x).count();
+    let far = set.iter().filter(|(_, w)| f32::from_bits(w[0]) >= far_min_x).count();
+    eprintln!(
+        "[multi] cam@near(origin): {live} live AABBs ({origin} origin) | near-asset bricks={near} far-asset(coarse) bricks={far}",
+    );
+    assert_eq!(origin, 0, "multi-asset: {origin} origin-collapsed AABBs");
+    assert!(near > 0, "NEAR asset packed zero bricks (sanity)");
+    assert!(far > 0, "FAR asset packed ZERO live bricks at COARSE LOD from the start camera — the gallery 'only first asset' bug");
+}
+
 // --- occupancy probe over a read-back paged occupancy entries table (WGSL is_occupied mirror) -------------
 
 const SECTOR_EDGE: i32 = 4;

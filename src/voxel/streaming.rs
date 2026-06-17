@@ -110,10 +110,18 @@ impl Default for StreamingConfig {
         Self {
             // D1a: 160 · 0.4 m = 64 m LOD0 reach; 160 · 0.4 · 2^7 = 8192 m total view (UNIFORM knob, all LODs).
             clip_half_bricks: 160,
-            // MEASURED (D1c): the origin-surface cold fill settles to 143_013 resident bricks (40.5 MB VRAM),
-            // so 400_000 holds it with ~2.8× headroom. The cap is NOT the bottleneck — the 38 s/`update` CPU
-            // classify is (see the field doc + the GPU-voxel-worldgen pivot).
-            max_resident_bricks: 400_000,
+            // Sized to hold a full LOD-distributed VIEW of the dense classic scenes, not just worldgen. Worldgen's
+            // origin cold fill settles to ~143k bricks, but the baked architectural scenes need far more: a live
+            // PAGED-DIAG of Bistro at the camera measured cand=566_691 SURFACE bricks in the clipmap shell
+            // (desired=869_894) — at 400_000 the pool maxed out and only the nearest ~386k rendered (the
+            // "scattered/partial" symptom; the gallery showed only the nearest scene for the same reason). 900_000
+            // holds Bistro's surface with headroom and is the LARGEST value that keeps the per-arena buffers under
+            // wgpu's ~2 GiB single-storage-buffer limit: the index arena is `max_resident · 512 · 4 B` = 1.84 GiB,
+            // and the paged core store is capped at `MAX_CORE_BUFFER_CORES = 900_000`, so the two ceilings agree.
+            // Buffers are committed at capacity, so this reserves ~3.7 GiB VRAM regardless of the live count — fine
+            // on the target dGPU; if a tighter budget is needed, screen-error LOD admission (the SOTA follow-up)
+            // shrinks the resident set instead of growing the pool.
+            max_resident_bricks: 900_000,
             max_bricks_per_frame: 256,
         }
     }
