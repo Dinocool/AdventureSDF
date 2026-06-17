@@ -839,3 +839,462 @@ fn diff_drop_apply(@builtin(global_invocation_id) gid: vec3<u32>) {
     let d = atomicAdd(&drop_count, 1u);
     drop_list[d] = vec4<i32>(coord.x, coord.y, coord.z, i32(lod));
 }
+
+// =====================================================================================================
+//  G-c.2b — PASS D: the GPU PACK-COMMAND BUILD + the GPU SLAB ALLOCATOR (docs/PHASE_G_GC_PLAN.md §1 Pass D,
+//  §2.3, §2.4). From `enter_list`/`drop_list` + `slot_table` (Pass C output), GPU-build the SAME
+//  `PackCommand`/`AabbCommand`/`ClassifyCommand`/uniform-meta buffers the LANDED `voxel_pack.wgsl`
+//  (`pack_brick`/`write_aabb`/`classify_brick`) consumes — so the GPU-built commands replace the CPU
+//  `ResidentPacker::update_gpu` driver. The SSOT this MIRRORS bit-for-bit is `src/voxel/incremental.rs`
+//  (`update_gpu`/`emit_pack_command`/`build_neighbour_table`/`neighbourhood_26` + the `SlabArena` index/palette
+//  size-class allocators). Where the CPU is SERIAL (free-list LIFO + slab bump order), the GPU is PARALLEL, so
+//  the SLOT and SLAB OFFSETS differ in order — but each resident key's CONTENT (decoded via the SSOT
+//  `cell_block`) and the rendered RESULT are IDENTICAL. The gate is per-KEY content parity + ray-HIT parity, NOT
+//  per-slot byte identity (see `tests/voxel_gpu_residency_pack_parity.rs`).
+//
+//  ## The dependency chain (why Pass D is SPLIT around the classify pass)
+//  The CPU does, per dirty brick, classify → slab-alloc → emit. On the GPU the classify is `classify_brick`
+//  (LANDED, in `voxel_pack.wgsl`), which needs the per-command 27-neighbour TABLE. The slab alloc + the final
+//  PackCommand (which carries the slab offsets) need the classify result. So Pass D is THREE GPU sub-passes
+//  around the landed classify:
+//    * Pass D1 (`pack_build_dirty`)      — from enter/drop lists, build the DEDUPED dirty key set (the
+//      entered/dropped keys' resident SAME-LOD 26-neighbourhood ∪ the entered keys themselves — the halo
+//      dependency, mirror of `neighbourhood_26` + the §3 expansion), each tagged with its slot (from
+//      `slot_table`). Append to `dirty_list`/`dirty_count` + `atomicMax` the classify dispatch.
+//    * Pass D2 (`pack_build_neighbours`) — per dirty key, build its 27-entry neighbour table into
+//      `neighbour_indices` (core-pool index per neighbour via `core_table`, or NEIGHBOUR_ABSENT) AND emit one
+//      `classify_command` (its `neighbour_base`). Mirror of `build_neighbour_table`.
+//      [classify_brick runs here — LANDED `voxel_pack.wgsl`, `record_indirect` over the classify dispatch.]
+//    * Pass D3 (`pack_build_commands`)   — per dirty key, read `classify_out`: a DENSE brick atomically
+//      allocates an index slab (its `index_bits` size class) + a palette slab (the power-of-2 ladder) from the
+//      GPU slab allocators, emits a `PackCommand` (the GPU slab offsets) + a resident `AabbCommand` +
+//      `atomicMax` the pack/aabb dispatches; a UNIFORM brick GPU-writes its 48-B meta straight + a resident
+//      `AabbCommand`. Mirror of `emit_pack_command`. Drops are handled in Pass D0 (degenerate meta + AABB).
+//    * Pass D0 (`pack_build_drops`)      — per `drop_list` key, GPU-write its slot's ZEROED meta + a freed
+//      (degenerate) `AabbCommand` + `atomicMax` the aabb dispatch. Mirror of `update_gpu`'s drop loop.
+//
+//  ## The GPU SLAB ALLOCATOR (§2.3) — bump + per-class free-list, fixed-cap pre-sized
+//  `index_slab_ctrl`/`palette_slab_ctrl` are per-size-class bump high-waters + free-list rings, replacing the
+//  CPU `SlabArena`. An alloc takes the smallest class ≥ the request, popping the class free-list first (LIFO,
+//  mirror of `SlabArena::alloc`) else bumping the class high-water; a release (on a re-class / drop) pushes to
+//  the class free-list. The 5 INDEX classes are `index_class_words({1,2,4,8,16})` = {32,63,125,250,500}; the 16
+//  PALETTE classes are the power-of-2 ladder {2,4,…,65536}. Pre-sized to `max_resident` × the RESERVE_* means so
+//  a normal load never overflows (the §2.3 fixed-cap pool).
+
+// =====================================================================================================
+//  Pack-command structs — MIRROR `voxel_pack.wgsl` / `src/voxel/incremental.rs` FIELD-FOR-FIELD (so the GPU
+//  emits the IDENTICAL records the landed pack/aabb/classify passes consume).
+// =====================================================================================================
+
+const NEIGHBOUR_ABSENT: u32 = 0xFFFFFFFFu;
+const NEIGHBOUR_COUNT: u32 = 27u;     // the 27-entry neighbour table per command (brick + its 26 neighbours)
+const BRICK_EDGE_D: i32 = 8;
+const BRICK_VOXELS_D: u32 = 512u;     // BRICK_EDGE³ — one core's u32 count
+const META_WORDS: u32 = 12u;          // 48-B GpuBrickMeta = 12 u32
+const META_FLAG_UNIFORM: u32 = 1u;
+
+// 60-B PackCommand (15 u32) — mirror of `voxel_pack.wgsl::PackCommand` / `GpuPackCommand`.
+struct PackCommandD {
+    origin_x: i32,
+    origin_y: i32,
+    origin_z: i32,
+    slot: u32,
+    world_min_x: f32,
+    world_min_y: f32,
+    world_min_z: f32,
+    index_word_offset: u32,
+    lod: u32,
+    index_bits: u32,
+    palette_word_offset: u32,
+    neighbour_base: u32,
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
+}
+
+// 32-B AabbCommand (8 u32) — mirror of `voxel_pack.wgsl::AabbCommand` / `GpuAabbCommand`.
+struct AabbCommandD {
+    slot: u32,
+    lod: u32,
+    flag: u32, // 1 = resident, 0 = freed
+    _pad0: u32,
+    world_min_x: f32,
+    world_min_y: f32,
+    world_min_z: f32,
+    _pad1: u32,
+}
+
+// 16-B ClassifyCommand (4 u32) — mirror of `voxel_pack.wgsl::ClassifyCommand` / `GpuClassifyCommand`.
+struct ClassifyCommandD {
+    neighbour_base: u32,
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
+}
+
+// =====================================================================================================
+//  Pass D bindings (24+). The CORE STORE (§2.4): `core_table` is a `(coord,lod) -> core-pool index` hash (same
+//  FNV-1a family as `slot_table`, 5-word stride [x,y,z,lod,core_index]), `cores` the deduped 8³ cores. Built per
+//  region CPU-side (the test builds it from the scene's occupied keys). The DENSE-brick output buffers
+//  (`pack_commands`/`aabb_commands`/`classify_commands`/`neighbour_indices`/`meta_buf`) are the SAME the landed
+//  pack passes read. `pack_dispatch`/`aabb_dispatch`/`classify_dispatch` are `atomicMax`-built (x,1,1) indirect
+//  dispatches so E/F/G `record_indirect`.
+// =====================================================================================================
+
+struct PackConfigD {
+    core_table_size: u32,   // power of two (probe mask = size - 1)
+    max_resident: u32,
+    _pad0: u32,
+    _pad1: u32,
+}
+@group(0) @binding(24) var<uniform> pack_cfg: PackConfigD;
+@group(0) @binding(25) var<storage, read> core_table: array<u32>;        // 5 u32/slot: [x,y,z,lod,core_index]
+@group(0) @binding(26) var<storage, read> cores: array<u32>;             // deduped 8³ cores (512 u32 each)
+
+// The DEDUPED, slot-tagged DIRTY key list (Pass D1 output) — each entry (x,y,z,lod) + its slot in a parallel
+// `dirty_slot` array. Pass D2 builds its neighbour table; Pass D3 emits its command after the classify.
+@group(0) @binding(27) var<storage, read_write> dirty_count: atomic<u32>;
+@group(0) @binding(28) var<storage, read_write> dirty_list: array<vec4<i32>>;
+@group(0) @binding(29) var<storage, read_write> dirty_slot: array<u32>;
+// The dirty-dedup hash (4 u32/slot [x,y,z,lod]; lod==EMPTY_LOD ⇒ free), CAS-claimed in Pass D1.
+@group(0) @binding(30) var<storage, read_write> dirty_flag: array<atomic<u32>>;
+
+// Pack/aabb/classify command output buffers (the LANDED pack passes' inputs) + their atomic counts + indirect
+// dispatches. `neighbour_indices` is the per-command 27-entry table (concatenated).
+@group(0) @binding(31) var<storage, read_write> pack_count: atomic<u32>;
+@group(0) @binding(32) var<storage, read_write> pack_commands: array<PackCommandD>;
+@group(0) @binding(33) var<storage, read_write> aabb_count: atomic<u32>;
+@group(0) @binding(34) var<storage, read_write> aabb_commands: array<AabbCommandD>;
+@group(0) @binding(35) var<storage, read_write> classify_commands: array<ClassifyCommandD>;
+@group(0) @binding(36) var<storage, read_write> neighbour_indices: array<u32>;
+@group(0) @binding(37) var<storage, read_write> meta_buf: array<u32>;    // 12 u32/slot (48 B GpuBrickMeta)
+@group(0) @binding(38) var<storage, read_write> pack_dispatch: array<atomic<u32>>;    // [x,1,1]
+@group(0) @binding(39) var<storage, read_write> aabb_dispatch: array<atomic<u32>>;    // [x,1,1]
+@group(0) @binding(40) var<storage, read_write> classify_dispatch: array<atomic<u32>>;// [x,1,1]
+
+// The GPU slab allocators (§2.3) — EXACT mirror of the CPU `SlabArena` (incremental.rs): ONE shared bump
+// high-water per pool (classes INTERLEAVE in allocation order, NOT per-class fixed regions) + a per-class
+// free-list ring (LIFO). Layout of `*_slab_ctrl`:
+//   ctrl[0]            = the shared bump high-water (WORDS).
+//   ctrl[1 + cls*2]    = free_head[cls], ctrl[2 + cls*2] = free_tail[cls] (a freed slab pushes free_tail++).
+// `*_slab_free[cls*max_resident + (i % max_resident)]` = a freed word-offset of class `cls`. An alloc takes the
+// smallest class ≥ the request: pop the class free-list (tail-1, LIFO — `SlabArena::alloc` pops `free[cls]`)
+// else `atomicAdd(shared_high_water, class_words)`. NO per-class base (the CPU bumps a single shared
+// `high_water`), so the pool is sized to the AGGREGATE reserve (the RESERVE_* means), not per-class × cap.
+// `index_class_words`/`palette_classes` MUST match `src/voxel/incremental.rs`.
+const INDEX_CLASSES: u32 = 5u;
+const PALETTE_CLASSES: u32 = 16u;
+@group(0) @binding(41) var<storage, read_write> index_slab_ctrl: array<atomic<u32>>;   // [hw, (head,tail)×5]
+@group(0) @binding(42) var<storage, read_write> index_slab_free: array<u32>;
+@group(0) @binding(43) var<storage, read_write> palette_slab_ctrl: array<atomic<u32>>; // [hw, (head,tail)×16]
+@group(0) @binding(44) var<storage, read_write> palette_slab_free: array<u32>;
+@group(0) @binding(45) var<storage, read> index_pool_base: array<u32>;   // [0] = the index pool's word base
+@group(0) @binding(46) var<storage, read> palette_pool_base: array<u32>; // [0] = the palette pool's word base
+
+// --- core_table lookup (key -> deduped core-pool index, or NEIGHBOUR_ABSENT) ---
+fn core_lookup(coord: vec3<i32>, lod: u32) -> u32 {
+    let size = pack_cfg.core_table_size;
+    if (size == 0u) {
+        return NEIGHBOUR_ABSENT;
+    }
+    let mask = size - 1u;
+    var slot = hash_key(coord, lod) & mask;
+    for (var i = 0u; i < size; i = i + 1u) {
+        let base = slot * 5u;
+        let e_lod = core_table[base + 3u];
+        if (e_lod == EMPTY_LOD) {
+            return NEIGHBOUR_ABSENT;
+        }
+        if (e_lod == lod
+            && bitcast<i32>(core_table[base + 0u]) == coord.x
+            && bitcast<i32>(core_table[base + 1u]) == coord.y
+            && bitcast<i32>(core_table[base + 2u]) == coord.z) {
+            return core_table[base + 4u];
+        }
+        slot = (slot + 1u) & mask;
+    }
+    return NEIGHBOUR_ABSENT;
+}
+
+// --- the GPU SLAB ALLOCATOR (§2.3) — mirror of `SlabArena::alloc` (pop class free-list LIFO, else bump). ---
+// The 5 INDEX size classes in WORDS — `index_class_words({1,2,4,8,16})` (incremental.rs). MUST match exactly.
+fn index_class_words_d(cls: u32) -> u32 {
+    // ceil(1000 * bits / 32) for bits ∈ {1,2,4,8,16} = {32,63,125,250,500}.
+    switch (cls) {
+        case 0u: { return 32u; }
+        case 1u: { return 63u; }
+        case 2u: { return 125u; }
+        case 3u: { return 250u; }
+        default: { return 500u; }
+    }
+}
+// index_bits ∈ {1,2,4,8,16} -> class index 0..4.
+fn index_bits_class(index_bits: u32) -> u32 {
+    switch (index_bits) {
+        case 1u: { return 0u; }
+        case 2u: { return 1u; }
+        case 4u: { return 2u; }
+        case 8u: { return 3u; }
+        default: { return 4u; }
+    }
+}
+// The PALETTE power-of-2 ladder class for `k` distinct ids: smallest 2^(cls+1) >= k (classes {2,4,…,65536}).
+fn palette_class_of(k: u32) -> u32 {
+    for (var cls = 0u; cls < PALETTE_CLASSES; cls = cls + 1u) {
+        if ((1u << (cls + 1u)) >= k) {
+            return cls;
+        }
+    }
+    return PALETTE_CLASSES - 1u;
+}
+
+// Allocate one INDEX slab of `index_bits`'s class: pop the class free-list (LIFO) else bump the SHARED
+// high-water by the class size. Returns the WORD offset (pool base + bump). Mirror of `SlabArena::alloc`.
+fn alloc_index_slab(index_bits: u32) -> u32 {
+    let cls = index_bits_class(index_bits);
+    let head = atomicLoad(&index_slab_ctrl[1u + cls * 2u]);
+    let tail = atomicLoad(&index_slab_ctrl[2u + cls * 2u]);
+    if (head < tail) {
+        // Pop LIFO: claim the slot at tail-1 (atomicSub the class free tail).
+        let t = atomicSub(&index_slab_ctrl[2u + cls * 2u], 1u) - 1u;
+        return index_slab_free[cls * pack_cfg.max_resident + (t % pack_cfg.max_resident)];
+    }
+    let off = atomicAdd(&index_slab_ctrl[0u], index_class_words_d(cls)); // shared bump
+    return index_pool_base[0] + off;
+}
+
+// Allocate one PALETTE slab of `k`'s class: pop the class free-list else bump the shared high-water. Mirror
+// of `SlabArena::alloc` (the palette ladder class size = 2^(cls+1)).
+fn alloc_palette_slab(k: u32) -> u32 {
+    let cls = palette_class_of(k);
+    let head = atomicLoad(&palette_slab_ctrl[1u + cls * 2u]);
+    let tail = atomicLoad(&palette_slab_ctrl[2u + cls * 2u]);
+    if (head < tail) {
+        let t = atomicSub(&palette_slab_ctrl[2u + cls * 2u], 1u) - 1u;
+        return palette_slab_free[cls * pack_cfg.max_resident + (t % pack_cfg.max_resident)];
+    }
+    let words = 1u << (cls + 1u); // 2^(cls+1)
+    let off = atomicAdd(&palette_slab_ctrl[0u], words); // shared bump
+    return palette_pool_base[0] + off;
+}
+
+// --- per-brick GEOMETRY (mirror of `BrickGeom::of` / brickmap `brick_span`) — pure function of the key. ---
+fn brick_span_d(lod: u32) -> f32 {
+    return f32(BRICK_EDGE_D) * 0.05 * f32(1u << min(lod, MAX_LOD)); // 0.05 = VOXEL_SIZE
+}
+
+// Write the 48-B UNIFORM meta for `slot` (mirror of `GpuBrickMeta::uniform`): id in low 16b of voxel_offset,
+// META_FLAG_UNIFORM in flags. `lod_and_bits = (lod & 7) | (0 << 3)` (index_bits 0 for uniform).
+fn write_uniform_meta(slot: u32, coord: vec3<i32>, lod: u32, block: u32) {
+    let base = slot * META_WORDS;
+    let span = brick_span_d(lod);
+    meta_buf[base + 0u] = bitcast<u32>(coord.x * BRICK_EDGE_D);
+    meta_buf[base + 1u] = bitcast<u32>(coord.y * BRICK_EDGE_D);
+    meta_buf[base + 2u] = bitcast<u32>(coord.z * BRICK_EDGE_D);
+    meta_buf[base + 3u] = block & 0xFFFFu;                       // voxel_offset = uniform id
+    meta_buf[base + 4u] = bitcast<u32>(f32(coord.x) * span);     // world_min
+    meta_buf[base + 5u] = bitcast<u32>(f32(coord.y) * span);
+    meta_buf[base + 6u] = bitcast<u32>(f32(coord.z) * span);
+    meta_buf[base + 7u] = lod & 0x7u;                            // lod_and_bits (index_bits = 0)
+    meta_buf[base + 8u] = 0u;                                    // palette_base
+    meta_buf[base + 9u] = META_FLAG_UNIFORM;                     // flags
+    meta_buf[base + 10u] = 0u;
+    meta_buf[base + 11u] = 0u;
+}
+
+// Write the 48-B ZEROED meta for a freed `slot` (mirror of `GpuBrickMeta::zeroed`).
+fn write_zeroed_meta(slot: u32) {
+    let base = slot * META_WORDS;
+    for (var w = 0u; w < META_WORDS; w = w + 1u) {
+        meta_buf[base + w] = 0u;
+    }
+}
+
+// **Pass D0 — DROPS.** One invocation per `drop_list` key: GPU-write its slot's ZEROED meta + a FREED
+// (degenerate) AABB command. The slot was released to the quarantine by Pass C2b; its slot id is no longer in
+// the slot_table, so we recover it from `dirty_slot`? No — drops carry no dirty entry. The drop's slot was the
+// table slot Pass C2b cleared; we re-derive nothing — instead Pass C2b ALSO records the freed slot here. To keep
+// Pass C unchanged we instead pass the freed slot via `drop_list.w`? The CPU path knows the slot. SIMPLER: the
+// drop's meta is zeroed by re-using the quarantine ring (the slots Pass C2b pushed). One invocation per
+// quarantine entry pushed THIS frame.
+@compute @workgroup_size(64)
+fn pack_build_drops(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    if (i >= atomicLoad(&drop_count)) {
+        return;
+    }
+    // The drop's slot is the quarantine entry pushed by Pass C2b in the SAME order (drop i -> quarantine i,
+    // both atomic-appended in `diff_drop_apply`). The quarantine head is 0 at this point (Pass A reset it; this
+    // frame's pushes start at 0), so quarantine_ring[i] is drop i's slot.
+    let cap = diff_cfg.max_resident;
+    let slot = quarantine_ring[i % cap];
+    write_zeroed_meta(slot);
+    let a = atomicAdd(&aabb_count, 1u);
+    aabb_commands[a] = AabbCommandD(slot, 0u, 0u, 0u, 0.0, 0.0, 0.0, 0u);
+    atomicMax(&aabb_dispatch[0], (a + 1u + 63u) / 64u); // workgroup_size 64 for write_aabb
+}
+
+// **Pass D1 — build the DEDUPED dirty key set.** One invocation per (enter ∪ drop) key. The dirty set =
+// {entered keys} ∪ {resident SAME-LOD 26-neighbours of each entered/dropped key} (the halo dependency). A
+// resident key is dirty iff it is in the slot_table (so we can carry its slot). Dedup via the `dirty_flag` CAS
+// hash; the winner appends to `dirty_list`/`dirty_slot` + atomicMax the classify dispatch. (The seed itself: an
+// ENTERED key is resident — add it; a DROPPED key is NOT resident — only its resident neighbours matter.)
+//
+// SCOPE (G-c.2b): this is the FIRST-ORDER expansion (entered keys + their/dropped keys' 26-ring). It is EXACT
+// for the COLD-FILL gate (`tests/voxel_gpu_residency_pack_parity.rs` drives one B/C/D+pack round over a known
+// scene → every key is ENTERED → dirty = the whole resident set, the neighbours adding nothing new), which is
+// the per-KEY content + ray-HIT parity proof. The CPU `update_gpu` (step 3) ALSO expands a dropped-key
+// NEIGHBOUR by its OWN neighbours (a second-order ring); that only matters across MULTI-round dynamic moves
+// (drop a brick → its neighbour's halo flips → that neighbour's OWN neighbours' halos are unaffected, so the
+// second-order ring is a conservative re-pack, never a CORRECTNESS gap for a single round) — wiring the full
+// multi-round closure + its idempotency is the NEXT stage G-c.3 (convergence), per the design.
+fn try_mark_dirty(coord: vec3<i32>, lod: u32) {
+    let slot = slot_lookup(coord, lod);
+    if (slot == SLOT_ABSENT) {
+        return; // only RESIDENT keys are re-packed (a dropped key has no slot / no command)
+    }
+    // CAS-claim the dirty-dedup hash so each resident key is emitted ONCE even when reached from many seeds.
+    let size = diff_cfg.slot_table_size; // dirty_flag is sized = slot_table_size (>= resident set)
+    let mask = size - 1u;
+    var t = hash_key(coord, lod) & mask;
+    for (var p = 0u; p < size; p = p + 1u) {
+        let base = t * 4u;
+        let e_lod = atomicLoad(&dirty_flag[base + 3u]);
+        if (e_lod == lod
+            && bitcast<i32>(atomicLoad(&dirty_flag[base + 0u])) == coord.x
+            && bitcast<i32>(atomicLoad(&dirty_flag[base + 1u])) == coord.y
+            && bitcast<i32>(atomicLoad(&dirty_flag[base + 2u])) == coord.z) {
+            return; // already claimed by this exact key
+        }
+        let prev = atomicCompareExchangeWeak(&dirty_flag[base + 3u], EMPTY_LOD, lod);
+        if (prev.exchanged) {
+            atomicStore(&dirty_flag[base + 0u], bitcast<u32>(coord.x));
+            atomicStore(&dirty_flag[base + 1u], bitcast<u32>(coord.y));
+            atomicStore(&dirty_flag[base + 2u], bitcast<u32>(coord.z));
+            let d = atomicAdd(&dirty_count, 1u);
+            dirty_list[d] = vec4<i32>(coord.x, coord.y, coord.z, i32(lod));
+            dirty_slot[d] = slot;
+            atomicMax(&classify_dispatch[0], d + 1u); // 1 workgroup per dirty key (classify_brick)
+            return;
+        }
+        // CAS failed: a DIFFERENT key owns this slot — probe on.
+        t = (t + 1u) & mask;
+    }
+}
+
+@compute @workgroup_size(64)
+fn pack_build_dirty(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let n_enter = atomicLoad(&enter_count);
+    let n_drop = atomicLoad(&drop_count);
+    let i = gid.x;
+    if (i >= n_enter + n_drop) {
+        return;
+    }
+    var coord: vec3<i32>;
+    var lod: u32;
+    var is_enter: bool;
+    if (i < n_enter) {
+        let k = enter_list[i];
+        coord = vec3<i32>(k.x, k.y, k.z);
+        lod = u32(k.w);
+        is_enter = true;
+    } else {
+        let k = drop_list[i - n_enter];
+        coord = vec3<i32>(k.x, k.y, k.z);
+        lod = u32(k.w);
+        is_enter = false;
+    }
+    // The entered key itself is resident ⇒ dirty.
+    if (is_enter) {
+        try_mark_dirty(coord, lod);
+    }
+    // Its (and a dropped key's) resident SAME-LOD 26-neighbours' halos read this brick's core ⇒ dirty them.
+    for (var dz = -1; dz <= 1; dz = dz + 1) {
+        for (var dy = -1; dy <= 1; dy = dy + 1) {
+            for (var dx = -1; dx <= 1; dx = dx + 1) {
+                if (dx == 0 && dy == 0 && dz == 0) {
+                    continue;
+                }
+                try_mark_dirty(coord + vec3<i32>(dx, dy, dz), lod);
+            }
+        }
+    }
+}
+
+// **Pass D2 — build the 27-neighbour table + the classify command** per dirty key. `neighbour_base = i*27`
+// (the table is laid out command-major, mirror of `build_neighbour_table`). Slot 13 is the brick itself.
+@compute @workgroup_size(64)
+fn pack_build_neighbours(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    if (i >= atomicLoad(&dirty_count)) {
+        return;
+    }
+    let k = dirty_list[i];
+    let coord = vec3<i32>(k.x, k.y, k.z);
+    let lod = u32(k.w);
+    let base = i * NEIGHBOUR_COUNT;
+    for (var dz = -1; dz <= 1; dz = dz + 1) {
+        for (var dy = -1; dy <= 1; dy = dy + 1) {
+            for (var dx = -1; dx <= 1; dx = dx + 1) {
+                let nslot = u32((dz + 1) * 9 + (dy + 1) * 3 + (dx + 1));
+                let nbr = coord + vec3<i32>(dx, dy, dz);
+                // CRITICAL: the halo reads only RESIDENT same-LOD neighbours (mirror of `build_neighbour_table`'s
+                // `new_by_key.get(&nkey)` over the RESIDENT set — NOT every OCCUPIED brick). A face-culled
+                // INTERIOR neighbour is occupied in the core store but NOT resident, so its halo contribution is
+                // AIR (NEIGHBOUR_ABSENT). Gate on the slot_table (residency), THEN resolve the core via the store.
+                if (slot_lookup(nbr, lod) != SLOT_ABSENT) {
+                    neighbour_indices[base + nslot] = core_lookup(nbr, lod);
+                } else {
+                    neighbour_indices[base + nslot] = NEIGHBOUR_ABSENT;
+                }
+            }
+        }
+    }
+    classify_commands[i] = ClassifyCommandD(base, 0u, 0u, 0u);
+}
+
+// **Pass D3 — emit the per-dirty-key COMMAND from the classify result.** Reads `classify_out[i]` (LANDED
+// `classify_brick` output, 4 u32: is_uniform, uniform_block, palette_k, index_bits). DENSE ⇒ alloc the GPU index
+// + palette slabs, emit a PackCommand (the slab offsets) + a resident AabbCommand. UNIFORM ⇒ GPU-write the meta
+// straight + a resident AabbCommand. Mirror of `emit_pack_command`. `classify_out` is bound at the SAME binding
+// as `voxel_pack.wgsl::classify_out` (binding 47 here) so the pass reads it without a readback.
+@group(0) @binding(47) var<storage, read> classify_out: array<u32>;
+@compute @workgroup_size(64)
+fn pack_build_commands(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    if (i >= atomicLoad(&dirty_count)) {
+        return;
+    }
+    let k = dirty_list[i];
+    let coord = vec3<i32>(k.x, k.y, k.z);
+    let lod = u32(k.w);
+    let slot = dirty_slot[i];
+    let base = i * 4u;
+    let is_uniform = classify_out[base + 0u];
+    let span = brick_span_d(lod);
+    let world_min = vec3<f32>(f32(coord.x) * span, f32(coord.y) * span, f32(coord.z) * span);
+
+    // Every resident brick gets a resident AABB command (the AABB is a pure function of world_min/lod).
+    let a = atomicAdd(&aabb_count, 1u);
+    aabb_commands[a] = AabbCommandD(slot, lod, 1u, 0u, world_min.x, world_min.y, world_min.z, 0u);
+    atomicMax(&aabb_dispatch[0], (a + 1u + 63u) / 64u);
+
+    if (is_uniform != 0u) {
+        // UNIFORM — GPU-write the meta straight (the landed pack_brick never touches a uniform slot).
+        write_uniform_meta(slot, coord, lod, classify_out[base + 1u]);
+        return;
+    }
+    // DENSE — alloc the GPU slabs + emit a PackCommand (pack_brick fills the index/palette/meta).
+    let palette_k = classify_out[base + 2u];
+    let index_bits = classify_out[base + 3u];
+    let index_off = alloc_index_slab(index_bits);
+    let palette_off = alloc_palette_slab(palette_k);
+    let p = atomicAdd(&pack_count, 1u);
+    pack_commands[p] = PackCommandD(
+        coord.x * BRICK_EDGE_D, coord.y * BRICK_EDGE_D, coord.z * BRICK_EDGE_D, slot,
+        world_min.x, world_min.y, world_min.z,
+        index_off, lod, index_bits, palette_off,
+        i * NEIGHBOUR_COUNT, 0u, 0u, 0u,
+    );
+    atomicMax(&pack_dispatch[0], p + 1u); // 1 workgroup per dense pack command (pack_brick)
+}

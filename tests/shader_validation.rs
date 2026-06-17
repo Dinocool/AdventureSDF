@@ -123,6 +123,19 @@ fn voxel_pack_wgsl_validates() {
 }
 
 #[test]
+fn voxel_residency_wgsl_validates() {
+    // Phase G "G-c" — the GPU-driven residency front end: the occupancy helper (G-c.0), the clipmap
+    // enumerate + face-cull (G-c.1, Pass B0/B), the residency diff (G-c.2a, Pass C), AND the pack-command
+    // build + GPU slab allocator (G-c.2b, Pass D0/D1/D2/D3). Fully self-contained (no `#import`, no
+    // shader-defs). Validating here catches a WGSL typo / workgroup-array overflow without a GPU — every entry
+    // point (`residency_parity`/`prepare_shell_dispatch`/`enumerate_shells`/`build_present_flag`/
+    // `diff_release_quarantine`/`diff_enter_scan`/`diff_drop_mark`/`diff_drop_apply`/`pack_build_drops`/
+    // `pack_build_dirty`/`pack_build_neighbours`/`pack_build_commands`) is compiled.
+    let path = Path::new("assets/shaders/voxel_residency.wgsl");
+    validate_entry(path).unwrap_or_else(|e| panic!("{e}"));
+}
+
+#[test]
 fn voxel_rt_composite_wgsl_validates() {
     // The composite + the DLSS-RR `fs_resolve_dlss` resolve pass (multi-target colour+motion + frag_depth).
     let path = Path::new("assets/shaders/voxel_rt_composite.wgsl");

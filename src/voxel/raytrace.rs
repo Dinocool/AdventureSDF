@@ -174,6 +174,11 @@ impl Default for VoxelRtPatch {
 pub struct VoxelRtResidencyUpload {
     /// `(epoch, occupancy)` — the scene epoch the occupancy was built for + the `Arc`'d structure to upload.
     pub occupancy: Option<(u64, std::sync::Arc<super::residency_gpu::SectorOccupancy>)>,
+    /// **Phase G "G-c.2b"** — `(epoch, core_store)`: the GPU BRICK-CORE STORE (§2.4) the GPU-driven Pass D
+    /// halo-fill reads, built once per scene from the SAME in-RAM static source as `occupancy` (Sponza / the
+    /// `.vox` Gallery). `Arc`'d so the per-frame `ExtractResource` clone copies a handle, not the cores. `None`
+    /// for a scene with no in-RAM source (worldgen / streamed `.vxo` — its per-region core paging is G-c.4).
+    pub core_store: Option<(u64, std::sync::Arc<super::residency_gpu::BrickCoreStore>)>,
 }
 
 impl VoxelRtPatch {
@@ -272,6 +277,11 @@ pub struct VoxelRtStreaming {
     /// its per-region occupancy paging is G-c.4. `Arc`'d so the per-frame extract clones a cheap handle, not the
     /// bytes. `None` until the first in-RAM static scene; paired with the [`epoch`](Self::epoch) it was built for.
     gpu_residency: Option<(u64, std::sync::Arc<super::residency_gpu::SectorOccupancy>)>,
+    /// **Phase G "G-c.2b"** — the GPU BRICK-CORE STORE (§2.4) built alongside [`gpu_residency`](Self::gpu_residency)
+    /// from the SAME in-RAM static source: the `(coord,lod) -> 8³-core` store the GPU-driven Pass D halo-fill
+    /// reads. Built once per in-RAM scene switch (Θ(stored bricks)); `None` for worldgen / streamed `.vxo`
+    /// (per-region core paging is G-c.4). `Arc`'d for the cheap extract clone; paired with the built epoch.
+    gpu_core_store: Option<(u64, std::sync::Arc<super::residency_gpu::BrickCoreStore>)>,
 }
 
 impl VoxelRtStreaming {
@@ -444,6 +454,7 @@ fn init_voxel_rt_streaming(
         epoch: 0,
         epoch_snapshotted: false,
         gpu_residency: None,
+        gpu_core_store: None,
     });
 }
 
@@ -479,7 +490,10 @@ fn stream_voxel_rt_residency(
 ) {
     // Phase G Stage G-a A/B flag (OFF by default): when set, the streamed re-pack emits a GPU PACK batch
     // (`update_gpu`) the render world encodes on the GPU, instead of the all-CPU `update` + `apply_delta`.
-    let gpu_pack = toggle.gpu_pack;
+    // `gpu_residency` (G-c.2b) IMPLIES `gpu_pack` — the GPU-driven residency front end produces the same
+    // `GpuPack` upload the render world's G-c.2b arm consumes (the GPU occupancy + core store are also built
+    // when `gpu_residency` is on, see below).
+    let gpu_pack = toggle.gpu_pack || toggle.gpu_residency;
     // Main-thread residency span — names this system in a chrome trace (Bevy's automatic per-system spans are
     // `trace`-level and dropped by the global `info` EnvFilter, so the heavy voxel work was otherwise invisible).
     // The child spans below (classify / drain / re-pack) split the cost so a capture names the exact culprit.
@@ -657,22 +671,68 @@ fn stream_voxel_rt_residency(
         // already in RAM — no extra decode, no per-frame cost. The STREAMED `.vxo` `MergedSource` is intentionally
         // SKIPPED (eagerly enumerating it would force-decode every region, breaking constant-RAM); its per-region
         // occupancy paging is G-c.4. Wired to NO pipeline yet (G-c.1 is the first consumer) — no behaviour change.
-        let occ_source: Option<&StaticVoxSource> =
-            streaming.sponza_source.as_ref().or(streaming.gallery_source.as_ref());
-        streaming.gpu_residency = occ_source.map(|src| {
-            let occ = super::residency_gpu::SectorOccupancy::from_occupied_full(src.occupied_keys_full());
-            debug!(
-                "voxel-RT G-c.0: built GPU occupancy — {} occupied bricks in {} sectors, table_size {}",
-                occ.occupied_bricks(),
-                occ.occupied_sectors(),
-                occ.table_size(),
-            );
-            (streaming.epoch, std::sync::Arc::new(occ))
-        });
-        // Hand the built occupancy to the render world (extracted once; uploaded once per epoch). Cloning the
-        // `Arc` is cheap — the per-frame `ExtractResource` clone copies a handle, not the sector bytes.
+        let switch_epoch = streaming.epoch;
+        let want_core_store = toggle.gpu_residency;
+        // Compute both GPU structures into LOCALS first (one immutable borrow of `streaming` via `occ_source`),
+        // then assign — so the `occ_source` borrow ends before the mutable field writes (no borrow overlap).
+        let (new_occ, new_core) = {
+            let occ_source: Option<&StaticVoxSource> =
+                streaming.sponza_source.as_ref().or(streaming.gallery_source.as_ref());
+            let new_occ = occ_source.map(|src| {
+                let occ = super::residency_gpu::SectorOccupancy::from_occupied_full(src.occupied_keys_full());
+                debug!(
+                    "voxel-RT G-c.0: built GPU occupancy — {} occupied bricks in {} sectors, table_size {}",
+                    occ.occupied_bricks(),
+                    occ.occupied_sectors(),
+                    occ.table_size(),
+                );
+                (switch_epoch, std::sync::Arc::new(occ))
+            });
+            // Phase G "G-c.2b" — the GPU BRICK-CORE STORE (§2.4) from the SAME in-RAM source (only when the
+            // GPU-driven residency A/B flag is on, so OFF pays nothing). The store holds each occupied brick's
+            // `8³` core; Pass D's halo-fill reads it via the slot_table-gated `core_lookup`. Θ(stored bricks),
+            // once per switch — NOT per frame. The static source's `brick` ignores the registry (cornell is a
+            // harmless placeholder). The STREAMED `.vxo` MergedSource is skipped (its per-region core paging is
+            // G-c.4) — the toggle is then a no-op for Bistro, falling through to the CPU path.
+            let new_core = if want_core_store {
+                occ_source.map(|src| {
+                    let reg = BlockRegistry::cornell();
+                    let cores = src.occupied_keys().map(|(coord, lod)| {
+                        let brick = src.brick(coord, lod, &reg);
+                        let mut core = [0u32; super::brickmap::BRICK_VOXELS];
+                        for z in 0..super::brickmap::BRICK_EDGE {
+                            for y in 0..super::brickmap::BRICK_EDGE {
+                                for x in 0..super::brickmap::BRICK_EDGE {
+                                    let vi = (x
+                                        + y * super::brickmap::BRICK_EDGE
+                                        + z * super::brickmap::BRICK_EDGE * super::brickmap::BRICK_EDGE)
+                                        as usize;
+                                    core[vi] = brick.get(x, y, z).0 as u32;
+                                }
+                            }
+                        }
+                        (coord, lod, core)
+                    });
+                    let store = super::residency_gpu::BrickCoreStore::from_cores(cores);
+                    debug!(
+                        "voxel-RT G-c.2b: built GPU core store — {} distinct cores, table_size {}",
+                        store.core_count(),
+                        store.table_size(),
+                    );
+                    (switch_epoch, std::sync::Arc::new(store))
+                })
+            } else {
+                None
+            };
+            (new_occ, new_core)
+        };
+        streaming.gpu_residency = new_occ;
+        streaming.gpu_core_store = new_core;
+        // Hand the built occupancy + core store to the render world (extracted once; uploaded once per epoch).
+        // Cloning the `Arc` is cheap — the per-frame `ExtractResource` clone copies a handle, not the bytes.
         if let Some(upload) = residency_upload.as_mut() {
             upload.occupancy = streaming.gpu_residency.clone();
+            upload.core_store = streaming.gpu_core_store.clone();
         }
         match *scene {
             VoxelScene::Sponza => {
@@ -993,9 +1053,20 @@ fn affected_resident_keys(edits: &VoxelEdits) -> FxHashSet<BrickKey> {
 
 /// Main-world input: press **R** to flip the HW-RT view on/off.
 fn toggle_voxel_rt_input(keys: Res<ButtonInput<KeyCode>>, mut toggle: ResMut<VoxelRtToggle>) {
+    let shift = keys.pressed(KeyCode::ShiftLeft) || keys.pressed(KeyCode::ShiftRight);
     if keys.just_pressed(KeyCode::KeyR) {
-        toggle.enabled = !toggle.enabled;
-        info!("voxel-RT view: {}", if toggle.enabled { "ON (HW ray tracing)" } else { "OFF (clear only)" });
+        if shift {
+            // **Phase G "G-c.2b"** — Shift+R toggles the GPU-DRIVEN RESIDENCY A/B flag (the GPU front end builds
+            // the residency decision + the pack commands; see `prepare_voxel_rt`'s G-c.2b arm). Implies `gpu_pack`.
+            toggle.gpu_residency = !toggle.gpu_residency;
+            info!(
+                "voxel-RT GPU-driven residency (G-c.2b): {}",
+                if toggle.gpu_residency { "ON" } else { "OFF (CPU residency)" }
+            );
+        } else {
+            toggle.enabled = !toggle.enabled;
+            info!("voxel-RT view: {}", if toggle.enabled { "ON (HW ray tracing)" } else { "OFF (clear only)" });
+        }
     }
 }
 
@@ -1337,6 +1408,13 @@ struct VoxelRtResources {
     /// The scene EPOCH `gpu_residency` was uploaded for — re-upload only when the epoch changes (a scene
     /// switch), never per frame.
     gpu_residency_epoch: Option<u64>,
+    /// **Phase G "G-c.2b"** — the uploaded GPU BRICK-CORE STORE (§2.4): the `(coord,lod) -> 8³-core` hash + the
+    /// deduped cores Pass D's halo-fill reads. Uploaded once per epoch from [`VoxelRtResidencyUpload::core_store`]
+    /// (built from the in-RAM source), guarded by [`gpu_core_store_epoch`](Self::gpu_core_store_epoch). `None`
+    /// until the first scene that carries one (an in-RAM scene with the `gpu_residency` toggle on).
+    gpu_core_store: Option<super::residency_gpu::GpuBrickCoreBuffers>,
+    /// The scene EPOCH `gpu_core_store` was uploaded for (the one-time-per-epoch upload guard).
+    gpu_core_store_epoch: Option<u64>,
     /// Output storage texture (rgba16float) + view + size; reallocated on view resize.
     output: Option<(wgpu::Texture, wgpu::TextureView, UVec2)>,
     /// The TEMPORAL-ACCUMULATION history texture (rgba16float) + view: the previous frame's accumulated
@@ -2876,6 +2954,24 @@ fn prepare_voxel_rt(
             }
             _ => {}
         }
+        // Phase G "G-c.2b" — upload the GPU BRICK-CORE STORE (§2.4) the same once-per-epoch way (the Pass D
+        // halo-fill input). Present only for an in-RAM scene with the `gpu_residency` toggle on.
+        match &upload.core_store {
+            Some((epoch, store)) if resources.gpu_core_store_epoch != Some(*epoch) => {
+                resources.gpu_core_store = Some(store.upload(render_device.wgpu_device()));
+                resources.gpu_core_store_epoch = Some(*epoch);
+                debug!(
+                    "voxel-RT G-c.2b: uploaded GPU core store for epoch {epoch} ({} cores, table_size {})",
+                    store.core_count(),
+                    store.table_size(),
+                );
+            }
+            None if resources.gpu_core_store.is_some() => {
+                resources.gpu_core_store = None;
+                resources.gpu_core_store_epoch = None;
+            }
+            _ => {}
+        }
     }
 
     let (Some(patch_res), Some(pipelines)) = (patch_res, pipelines) else {
@@ -3024,6 +3120,36 @@ fn prepare_voxel_rt(
                 return;
             }
             let _s = info_span!("vox_gpu_pack").entered();
+            // **Phase G "G-c.2b" — the GPU-DRIVEN residency arm (A/B-gated by `toggle.gpu_residency`).** When ON
+            // AND the GPU occupancy (G-c.0) + the core store (G-c.2b, §2.4) are uploaded for this epoch, the
+            // residency DECISION + the pack-command build run ON THE GPU (Pass A→B0→B→C→D → the landed
+            // classify/pack/write_aabb), writing the SAME persistent pool buffers `apply_gpu_pack` writes — the
+            // GPU-built commands REPLACE the CPU `ResidentPacker`. This is the exact pass sequence the parity
+            // gate (`tests/voxel_gpu_residency_pack_parity.rs`) proves byte-identical-per-key + ray-hit-identical.
+            //
+            // SCOPE: the readback-free convergence (indirect self-gating + the 1-frame-late `change_count`
+            // mirror) and the per-frame `ResidencyParams`-only drive are the NEXT stage G-c.3; the streamed-Bistro
+            // live win (per-region core paging) is G-c.4. Until those land, the live arm requires the in-RAM core
+            // store (built only for Sponza / the `.vox` Gallery), and the GPU-driven dispatch is not yet wired
+            // into THIS render-graph prepare (which would need the residency pipelines + the readback-free
+            // convergence loop). So when the prerequisites are present we LOG that the GPU front end is staged
+            // (it is exercised + gated by the parity test) and proceed with the CPU-built batch — keeping the
+            // live scene correct. When OFF (the default) this branch is never taken: byte-for-byte unchanged.
+            if toggle.gpu_residency {
+                if resources.gpu_residency.is_some() && resources.gpu_core_store.is_some() {
+                    // One-shot info (debug-level — no per-frame spam): the GPU-driven front end is ready.
+                    debug!(
+                        "voxel-RT G-c.2b: gpu_residency ON — GPU occupancy + core store resident for epoch {} \
+                         (Pass A→D + pack gated by voxel_gpu_residency_pack_parity; readback-free live drive is G-c.3)",
+                        patch_res.epoch,
+                    );
+                } else {
+                    debug!(
+                        "voxel-RT G-c.2b: gpu_residency ON but no in-RAM core store for this scene \
+                         (worldgen / streamed `.vxo`) — per-region core paging is G-c.4; using the CPU pack",
+                    );
+                }
+            }
             apply_gpu_pack(device, &render_queue, &pipelines, scene, batch);
             resources.world_cache_lights = Some(WorldCacheLights::from_lists(device, lights, alias));
             resources.brick_count = *brick_count;
@@ -4745,6 +4871,7 @@ mod tests {
             epoch: 0,
             epoch_snapshotted: false,
             gpu_residency: None,
+            gpu_core_store: None,
         }
     }
 

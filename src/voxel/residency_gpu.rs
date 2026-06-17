@@ -490,6 +490,106 @@ pub struct GpuResidencyBuffers {
     pub table_size: u32,
 }
 
+/// **Phase G "G-c.2b"** — the GPU BRICK-CORE STORE (`docs/PHASE_G_GC_PLAN.md` §2.4): a `(coord,lod) ->
+/// deduped-core-index` open-addressing HASH (same FNV-1a family as [`brick_key_hash`], 5-word stride
+/// `[x,y,z,lod,core_index]`) PLUS the deduped `8³` cores (512 `u32` each, [`super::brickmap::voxel_index`]
+/// order). Pass D's `core_lookup` (in `voxel_residency.wgsl`) probes this to build the per-command 27-neighbour
+/// table the GPU halo-fill reads — the GPU analogue of the CPU `update_gpu`'s deduped core pool, but PERSISTENT
+/// (built once per scene from the in-RAM static source, NOT per re-pack). The §5 per-region paging from a
+/// streamed `.vxo` is G-c.4; here it is built whole from a [`super::source::StaticVoxSource`]'s occupied keys
+/// (the same in-RAM source the [`SectorOccupancy`] is built from), so the live in-RAM scenes (Sponza / the
+/// `.vox` Gallery) have a complete core store for the GPU-driven pack.
+#[derive(Clone, Debug, Default)]
+pub struct BrickCoreStore {
+    /// The `(coord,lod) -> core_index` open-addressing table (5 `u32`/slot; `lod == `[`EMPTY_LOD`] ⇒ free).
+    table: Vec<u32>,
+    /// `table.len()/5` as a power of two (the probe mask).
+    table_size: u32,
+    /// The deduped cores: core `i` is `cores[i·512 .. i·512+512]` (`8³` block ids, voxel-index order).
+    cores: Vec<u32>,
+}
+
+impl BrickCoreStore {
+    /// Build from an explicit `(coord, lod, core)` iterator (each `core` is the brick's `8³` block ids in
+    /// [`super::brickmap::voxel_index`] order). Each DISTINCT key gets ONE core slot; the hash is sized to ~0.5
+    /// load factor. A key appearing twice keeps its first core (dedup by key).
+    pub fn from_cores(items: impl IntoIterator<Item = (IVec3, u32, [u32; super::brickmap::BRICK_VOXELS])>) -> Self {
+        use rustc_hash::FxHashMap;
+        let collected: Vec<(IVec3, u32, [u32; super::brickmap::BRICK_VOXELS])> = items.into_iter().collect();
+        let mut seen: FxHashMap<(IVec3, u32), u32> = FxHashMap::default();
+        let mut cores: Vec<u32> = Vec::with_capacity(collected.len() * super::brickmap::BRICK_VOXELS);
+        let mut keys: Vec<(IVec3, u32, u32)> = Vec::with_capacity(collected.len());
+        for (coord, lod, core) in collected {
+            if seen.contains_key(&(coord, lod)) {
+                continue;
+            }
+            let idx = (cores.len() / super::brickmap::BRICK_VOXELS) as u32;
+            cores.extend_from_slice(&core);
+            seen.insert((coord, lod), idx);
+            keys.push((coord, lod, idx));
+        }
+        let table_size = ((keys.len() * 2).max(2)).next_power_of_two() as u32;
+        let mut table = vec![0u32; table_size as usize * 5];
+        for s in table.chunks_exact_mut(5) {
+            s[3] = EMPTY_LOD;
+        }
+        let mask = table_size - 1;
+        for (coord, lod, idx) in keys {
+            let mut s = (brick_key_hash(coord, lod) & mask) as usize;
+            while table[s * 5 + 3] != EMPTY_LOD {
+                s = (s + 1) & (mask as usize);
+            }
+            table[s * 5] = coord.x as u32;
+            table[s * 5 + 1] = coord.y as u32;
+            table[s * 5 + 2] = coord.z as u32;
+            table[s * 5 + 3] = lod;
+            table[s * 5 + 4] = idx;
+        }
+        if cores.is_empty() {
+            cores.push(0); // a non-empty buffer (no resident bricks)
+        }
+        Self { table, table_size, cores }
+    }
+
+    /// The hash slot count (a power of two) — the WGSL `PackConfigD.core_table_size`.
+    pub fn table_size(&self) -> u32 {
+        self.table_size
+    }
+
+    /// Number of distinct cores stored.
+    pub fn core_count(&self) -> usize {
+        self.cores.len() / super::brickmap::BRICK_VOXELS
+    }
+
+    /// Upload the two PERSISTENT storage buffers (the `core_table` + the `cores`). One-time per scene.
+    pub fn upload(&self, device: &wgpu::Device) -> GpuBrickCoreBuffers {
+        use wgpu::util::DeviceExt;
+        let table = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("voxel_core_table"),
+            contents: bytemuck::cast_slice(&self.table),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        });
+        let cores = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("voxel_cores"),
+            contents: bytemuck::cast_slice(&self.cores),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        });
+        GpuBrickCoreBuffers { table, cores, table_size: self.table_size }
+    }
+}
+
+/// The uploaded GPU core-store buffers — held PERSISTENTLY in `VoxelRtResources` (G-c.2b). `table` is the
+/// `(coord,lod) -> core-index` hash; `cores` the deduped `8³` cores. `table_size` is cached for the
+/// `PackConfigD.core_table_size` uniform.
+pub struct GpuBrickCoreBuffers {
+    /// The `(coord,lod) -> core_index` hash (5 `u32`/slot).
+    pub table: wgpu::Buffer,
+    /// The deduped `8³` cores (512 `u32`/core).
+    pub cores: wgpu::Buffer,
+    /// The hash slot count (a power of two).
+    pub table_size: u32,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
