@@ -90,11 +90,11 @@ impl Default for VoxelRtToggle {
     fn default() -> Self {
         // HW-RT is the default (and only) renderer now — on at startup. GPU pack + the readback-free GPU
         // residency FRONT END are both ON by default: the front end moves the residency gather + pack + BLAS
-        // build fully onto the GPU (eliminating the CPU `vox_pack_update`/`vox_blas_delta` load-time hitches),
-        // and is proven live on Sponza + the (eager, in-RAM) Gallery. It drives ONLY streamed scenes with a
-        // valid camera (a static scene like Cornell skips it → CPU path). The DEMAND-PAGED stores
-        // (`ADVENTURE_GPU_PAGED_DRIVE`, for out-of-RAM scenes like Bistro) stay env-gated OFF — this default
-        // uses the eager full in-RAM stores. `gpu_residency` IMPLIES `gpu_pack`.
+        // build fully onto the GPU (eliminating the CPU `vox_pack_update`/`vox_blas_delta` load-time hitches).
+        // It drives ONLY streamed scenes with a valid camera (a static scene like Cornell skips it → CPU path).
+        // Every `.vxo`-backed scene (Sponza + the multi-asset Gallery + the streamed Bistro) is driven by the
+        // unified DEMAND-PAGED store ([`StreamedResidencyPager`]) — no env gate; a `.vox` eager fallback exists
+        // only when a scene's `.vxo` is absent. `gpu_residency` IMPLIES `gpu_pack`.
         Self { enabled: true, gpu_pack: true, gpu_residency: true }
     }
 }
@@ -261,15 +261,18 @@ pub struct VoxelRtStreaming {
     /// Gallery switch and reused every frame (NOT per-frame in the drain — the same build-once rule as
     /// [`sponza_source`](Self::sponza_source), so the merged row never re-downsamples per streaming frame).
     /// `None` off Gallery (freed on a switch away). This is the LEGACY full-RAM fallback — used only when no
-    /// `.vxo` asset is present (see [`gallery_vxo`](Self::gallery_vxo)).
+    /// `.vxo` asset is present (see [`streamed_vxo`](Self::streamed_vxo)).
     gallery_source: Option<StaticVoxSource>,
-    /// The STREAMED Gallery source — a [`MergedSource`] over the per-asset `.vxo` files (`docs/VXO_FORMAT.md`
-    /// §B2.4) + its concatenated [`BlockRegistry`]. The PREFERRED live gallery path: each `.vxo` is region-
-    /// STREAMED (bounded-RAM — only demanded regions decode, an LRU caps RAM), NOT a full-RAM `StaticVoxSource`
-    /// mip pyramid. Built ONCE on the Gallery switch (open + merge several `.vxo` headers; bricks stream lazily
-    /// per shell demand) and reused every frame. `None` off Gallery, OR when no `.vxo` is baked (then the legacy
-    /// [`gallery_source`](Self::gallery_source) over the `.vox` merge is used instead — the fallback).
-    gallery_vxo: Option<(std::sync::Arc<MergedSource>, BlockRegistry)>,
+    /// The STREAMED `.vxo` source for the live scene — a [`MergedSource`] over one or more per-asset `.vxo` files
+    /// (`docs/VXO_FORMAT.md` §B2.4) + its concatenated [`BlockRegistry`]. The PREFERRED live path for EVERY
+    /// `.vxo`-backed scene: **Sponza** (a single asset at the origin), the multi-asset **Gallery** (auto-spaced
+    /// along +X), and the streamed **Bistro**. Each `.vxo` is region-STREAMED (bounded-RAM — only demanded regions
+    /// decode, an LRU caps RAM), driving the demand-paged GPU residency front end (`StreamedResidencyPager`) — NOT
+    /// a full-RAM `StaticVoxSource` mip pyramid. Built ONCE on the scene switch (open + merge the `.vxo` headers;
+    /// bricks stream lazily per shell demand) and reused every frame. `None` for a non-`.vxo` scene (worldgen) OR
+    /// when the scene's `.vxo`(s) are absent (then the legacy [`gallery_source`](Self::gallery_source) /
+    /// [`sponza_source`](Self::sponza_source) `.vox` eager path is used instead — the fallback).
+    streamed_vxo: Option<(std::sync::Arc<MergedSource>, BlockRegistry)>,
     /// Which scene the last packed patch was built for. `None` until the first pack; on a scene switch this
     /// differs from the live [`VoxelScene`], triggering a one-shot re-pack of the new scene.
     packed_scene: Option<VoxelScene>,
@@ -340,6 +343,11 @@ const WORLDGEN_REPACK_INTERVAL: u32 = 6;
 /// working directory (matching how `biomes.ron` is read), so headless tests run from the crate root resolve
 /// it too. The single SSOT for the Sponza asset location (the editor scene-selector path table points here).
 pub const SPONZA_VOX_PATH: &str = "assets/models/sponza.vox";
+
+/// Asset path of the baked Sponza `.vxo` — the region-streamed (bounded-RAM) sibling of [`SPONZA_VOX_PATH`], the
+/// PREFERRED live Sponza source: a single asset placed at the world origin in a [`MergedSource`], driving the
+/// unified demand-paged GPU residency path. Absent on disk ⇒ the legacy full-RAM `.vox` eager path is used.
+pub const SPONZA_VXO_PATH: &str = "assets/models/sponza.vxo";
 
 /// Stage-2 plugin: builds the patch in the main world, registers extraction, and wires the render-world
 /// resources + the [`Core3d`] raymarch pass. Added in `main.rs` alongside [`super::VoxelPlugin`].
@@ -479,7 +487,7 @@ fn init_voxel_rt_streaming(
         sponza_source: None,
         gallery: None,
         gallery_source: None,
-        gallery_vxo: None,
+        streamed_vxo: None,
         packed_scene: None,
         packed_edit_gen: None,
         worldgen_dirty_pending: false,
@@ -590,14 +598,32 @@ fn stream_voxel_rt_residency(
     // only on the SWITCH so a later edit doesn't clobber a user's tweaks). For Sponza we lazily load + cache
     // the `.vox` here; a load failure falls back to a static Cornell pack so the engine never panics.
     if streaming.packed_scene != Some(*scene) {
-        // On the Sponza switch, ensure the `.vox` is loaded + cached (once). A failure leaves the cache empty.
-        if matches!(*scene, VoxelScene::Sponza) && streaming.sponza.is_none() {
-            match load_vox(SPONZA_VOX_PATH) {
-                Ok(loaded) => streaming.sponza = Some(loaded),
-                Err(e) => error!(
-                    "voxel-RT: could not load {SPONZA_VOX_PATH}: {e} — falling back to the Cornell box \
-                     (bake Sponza via `cargo run --example voxelize_scene`)"
-                ),
+        // On the Sponza switch, build the live source ONCE. PREFER the streamed `.vxo` (bounded-RAM — the unified
+        // demand-paged GPU residency path): a SINGLE asset placed at the world origin in a `MergedSource`. If the
+        // `.vxo` is absent (a fresh checkout), FALL BACK to the legacy full-RAM `.vox` eager path so Sponza still
+        // loads. A load failure on either leaves both caches empty (the Cornell fallback below).
+        if matches!(*scene, VoxelScene::Sponza)
+            && streaming.streamed_vxo.is_none()
+            && streaming.sponza.is_none()
+        {
+            if std::path::Path::new(SPONZA_VXO_PATH).exists() {
+                let placements = vec![(std::path::PathBuf::from(SPONZA_VXO_PATH), IVec3::ZERO)];
+                let (merged, registry) = MergedSource::open_paths(&placements);
+                if merged.placed_assets().is_empty() {
+                    error!("voxel-RT: {SPONZA_VXO_PATH} opened no assets — falling back to the `.vox` eager path");
+                } else {
+                    info!("voxel-RT: streaming SPONZA from `{SPONZA_VXO_PATH}` via MergedSource (bounded-RAM)");
+                    streaming.streamed_vxo = Some((std::sync::Arc::new(merged), registry));
+                }
+            }
+            if streaming.streamed_vxo.is_none() {
+                match load_vox(SPONZA_VOX_PATH) {
+                    Ok(loaded) => streaming.sponza = Some(loaded),
+                    Err(e) => error!(
+                        "voxel-RT: could not load {SPONZA_VOX_PATH}: {e} — falling back to the Cornell box \
+                         (bake Sponza via `cargo run --example voxelize_scene`)"
+                    ),
+                }
             }
         }
         // On the Gallery switch, build the gallery source ONCE + cache it (mirrors the Sponza `.vox` cache).
@@ -608,7 +634,7 @@ fn stream_voxel_rt_residency(
         // are skipped — so an all-absent gallery yields an empty map ⇒ "nothing to stream" (Cornell fallback)
         // below, exactly like a missing Sponza asset (the engine still renders + never panics).
         if matches!(*scene, VoxelScene::Gallery)
-            && streaming.gallery_vxo.is_none()
+            && streaming.streamed_vxo.is_none()
             && streaming.gallery.is_none()
         {
             // BENCH HARNESS (`ADVENTURE_BENCH_BISTRO=1`, dev-only): instead of the 4-scene corpus, build the
@@ -639,7 +665,7 @@ fn stream_voxel_rt_residency(
                     "voxel-RT: streaming the GALLERY from {} `.vxo` asset(s) via MergedSource (bounded-RAM)",
                     placements.len()
                 );
-                streaming.gallery_vxo = Some((std::sync::Arc::new(merged), registry));
+                streaming.streamed_vxo = Some((std::sync::Arc::new(merged), registry));
             }
         }
         // A static `.vox`/`.vxo`-backed scene whose source is MISSING or EMPTY (the asset(s) aren't baked):
@@ -648,7 +674,7 @@ fn stream_voxel_rt_residency(
         // scene until the asset exists / the scene changes. Sponza: `sponza == None` (load failed). Gallery:
         // NEITHER the streamed `.vxo` MergedSource NOR the legacy `.vox` merge produced anything (no rows baked).
         let static_map_missing = match *scene {
-            VoxelScene::Sponza => streaming.sponza.is_none(),
+            VoxelScene::Sponza => streaming.streamed_vxo.is_none() && streaming.sponza.is_none(),
             VoxelScene::Gallery => gallery_source_missing(&streaming),
             _ => false,
         };
@@ -696,7 +722,7 @@ fn stream_voxel_rt_residency(
         // Build the LEGACY `.vox` mip pyramid ONLY for the fallback path (no `.vxo` present): when the streamed
         // `.vxo` MergedSource is the live source, the `.vox` merge isn't loaded and this stays `None` (the
         // MergedSource serves the residency directly — bounded-RAM, no full-RAM pyramid).
-        streaming.gallery_source = if matches!(*scene, VoxelScene::Gallery) && streaming.gallery_vxo.is_none() {
+        streaming.gallery_source = if matches!(*scene, VoxelScene::Gallery) && streaming.streamed_vxo.is_none() {
             streaming.gallery.as_ref().map(|(map, _)| StaticVoxSource::new(map))
         } else {
             None
@@ -768,14 +794,12 @@ fn stream_voxel_rt_residency(
         if let Some(upload) = residency_upload.as_mut() {
             upload.occupancy = streaming.gpu_residency.clone();
             upload.core_store = streaming.gpu_core_store.clone();
-            // Phase G "G-c.4-paging" — hand the live STREAMED `.vxo` MergedSource (Bistro / the `.vxo` Gallery) to
-            // the render world for the region prefetcher. ONLY the streamed `.vxo` path (not the in-RAM `.vox`
-            // fallback / Sponza, which use the eager occupancy/core above). `Arc` clone — a cheap handle, not a copy.
-            upload.streamed_source = if matches!(*scene, VoxelScene::Gallery) {
-                streaming.gallery_vxo.as_ref().map(|(src, _)| (switch_epoch, std::sync::Arc::clone(src)))
-            } else {
-                None
-            };
+            // Phase G "G-c.4-paging" — hand the live STREAMED `.vxo` MergedSource (Sponza / the multi-asset Gallery /
+            // Bistro) to the render world for the region prefetcher: the unified demand-paged GPU residency path.
+            // `Some` for ANY `.vxo`-backed scene; `None` for the `.vox` eager fallback / worldgen (which use the
+            // eager occupancy/core above). `Arc` clone — a cheap handle, not a copy.
+            upload.streamed_source =
+                streaming.streamed_vxo.as_ref().map(|(src, _)| (switch_epoch, std::sync::Arc::clone(src)));
         }
         match *scene {
             VoxelScene::Sponza => {
@@ -791,7 +815,7 @@ fn stream_voxel_rt_residency(
                 // ONLY on the switch — knobs-as-uniforms; the editor overrides afterward without being clobbered.
                 lighting.data = LightingUniformData::sponza();
                 sky.data = SkyUniformData::sponza();
-                let streamed = streaming.gallery_vxo.is_some();
+                let streamed = streaming.streamed_vxo.is_some();
                 info!(
                     "voxel-RT: switched to GALLERY scene — streaming the MERGED row through the clipmap ({})",
                     if streamed { "bounded-RAM `.vxo` MergedSource" } else { "legacy full-RAM `.vox` merge" }
@@ -813,7 +837,7 @@ fn stream_voxel_rt_residency(
     // stream: the Cornell fallback is already packed and stays valid, so just bail every frame until the asset
     // exists / the scene changes. Worldgen is unaffected (it has no static-map dependency).
     let static_map_missing = match *scene {
-        VoxelScene::Sponza => streaming.sponza.is_none(),
+        VoxelScene::Sponza => streaming.streamed_vxo.is_none() && streaming.sponza.is_none(),
         VoxelScene::Gallery => gallery_source_missing(&streaming),
         _ => false,
     };
@@ -876,15 +900,14 @@ fn stream_voxel_rt_residency(
     // AND it has a residency store bound for THIS epoch:
     //   * EAGER store — built ONLY for the IN-RAM static scenes (Sponza / the legacy `.vox` Gallery): both
     //     `gpu_residency` + `gpu_core_store` are `Some` for the current epoch (see the G-c.0/2b build on the switch).
-    //   * PAGED store — the STREAMED `.vxo` path (the default Gallery / Bistro) carries NO eager store; its
-    //     demand-paged drive is OPT-IN behind `ADVENTURE_GPU_PAGED_DRIVE` (KNOWN-FAILING render today, so OFF by
-    //     default). Without the env set, the streamed front end does NOT drive → the CPU pack MUST keep packing.
-    // So for the default streamed `.vxo` Gallery, `front_end_will_drive == false` and the CPU re-pack streams the
-    // whole scene in (as it did before the gate). The eager in-RAM scenes keep the gate's spike-reduction.
+    //   * PAGED store — the STREAMED `.vxo` path (Sponza / the multi-asset Gallery / Bistro) carries NO eager store;
+    //     its demand-paged drive is the LIVE path (no env gate). When a streamed `.vxo` source exists for this epoch
+    //     the front end drives it, so after the one-time StreamSnapshot the CPU re-pack is skipped (the GPU owns it).
+    // The one-time StreamSnapshot (allocate pool + BLAS topology) still runs on the CPU regardless (gated below on
+    // `epoch_snapshotted`), so the front end always has a pool to write.
     let eager_store_ready = streaming.gpu_residency.as_ref().is_some_and(|(e, _)| *e == streaming.epoch)
         && streaming.gpu_core_store.as_ref().is_some_and(|(e, _)| *e == streaming.epoch);
-    let paged_drive_ready =
-        std::env::var("ADVENTURE_GPU_PAGED_DRIVE").is_ok() && streaming.gallery_vxo.is_some();
+    let paged_drive_ready = streaming.streamed_vxo.is_some();
     let front_end_will_drive = toggle.gpu_residency && (eager_store_ready || paged_drive_ready);
     let VoxelRtStreaming {
         manager,
@@ -897,7 +920,7 @@ fn stream_voxel_rt_residency(
         sponza_source,
         gallery,
         gallery_source,
-        gallery_vxo,
+        streamed_vxo,
         worldgen_dirty_pending,
         worldgen_frames_since_pack,
         last_cam_brick,
@@ -914,29 +937,24 @@ fn stream_voxel_rt_residency(
     // whose palette this scene's bricks index travels alongside (drain + pack must agree on it).
     let worldgen_source = WorldgenSource::new(layer, lib, *seed);
     let (source, active_registry): (&dyn BrickSource, &BlockRegistry) = match scene_now {
-        VoxelScene::Sponza => {
-            // Map + palette + the prebuilt source are ready by here (the source's pyramid was built ONCE on the
-            // switch; the missing-asset case returned above). Reuse the CACHED source — never rebuild the
-            // pyramid per frame (that was the load-lag root cause).
-            let (_, vox_registry) = sponza.as_ref().expect("sponza map loaded before streaming");
-            let src = sponza_source.as_ref().expect("sponza source built on the switch");
-            (src, vox_registry)
-        }
-        VoxelScene::Gallery => {
-            // PREFER the STREAMED `.vxo` MergedSource (bounded-RAM, §B2.4): each asset region-streams through
-            // the SAME residency demand path — `MergedSource` impls `BrickSource`, so it's a drop-in source
-            // (its concatenated registry is the active palette). It was built ONCE on the switch; the residency
-            // pulls bricks lazily per shell demand (no full-RAM mip pyramid). Fall back to the legacy `.vox`
-            // `StaticVoxSource` ONLY when no `.vxo` was present (the empty-everything case returned above).
-            match gallery_vxo.as_ref() {
-                Some((merged, merged_registry)) => (merged.as_ref() as &dyn BrickSource, merged_registry),
-                None => {
-                    let (_, vox_registry) = gallery.as_ref().expect("gallery `.vox` merged before streaming");
-                    let src = gallery_source.as_ref().expect("gallery `.vox` source built on the switch");
-                    (src as &dyn BrickSource, vox_registry)
-                }
+        // The `.vxo`-backed scenes (Sponza + the multi-asset Gallery) share ONE path: PREFER the streamed
+        // `MergedSource` (bounded-RAM, §B2.4 — each asset region-streams through the SAME residency demand path;
+        // `MergedSource` impls `BrickSource`, so it's a drop-in source, its concatenated registry the active
+        // palette), built ONCE on the switch. FALL BACK to the legacy `.vox` `StaticVoxSource` mip pyramid only
+        // when no `.vxo` was present (the empty-everything case returned above). Never rebuilt per frame.
+        VoxelScene::Sponza | VoxelScene::Gallery => match streamed_vxo.as_ref() {
+            Some((merged, merged_registry)) => (merged.as_ref() as &dyn BrickSource, merged_registry),
+            None if matches!(scene_now, VoxelScene::Sponza) => {
+                let (_, vox_registry) = sponza.as_ref().expect("sponza map loaded before streaming");
+                let src = sponza_source.as_ref().expect("sponza source built on the switch");
+                (src as &dyn BrickSource, vox_registry)
             }
-        }
+            None => {
+                let (_, vox_registry) = gallery.as_ref().expect("gallery `.vox` merged before streaming");
+                let src = gallery_source.as_ref().expect("gallery `.vox` source built on the switch");
+                (src as &dyn BrickSource, vox_registry)
+            }
+        },
         _ => (&worldgen_source, registry),
     };
 
@@ -1112,7 +1130,7 @@ fn stream_voxel_rt_residency(
 /// `false`, exactly one of the two gallery sources is live (the `.vxo` MergedSource is preferred; the `.vox`
 /// `StaticVoxSource` is the fallback) and the source-selection block can `expect` it.
 fn gallery_source_missing(streaming: &VoxelRtStreaming) -> bool {
-    let vxo_missing = streaming.gallery_vxo.is_none();
+    let vxo_missing = streaming.streamed_vxo.is_none();
     let vox_missing = streaming.gallery.as_ref().is_none_or(|(map, _)| map.is_empty());
     vxo_missing && vox_missing
 }
@@ -3617,12 +3635,11 @@ fn drive_gpu_residency_front_end(
     //    DEMAND-PAGED here by the prefetcher (the streamed source is extracted from the main world). Build/maintain
     //    the pager for the live epoch; running its per-frame `update` pages the clipmap-covering present regions
     //    in/out (camera-driven, constant-RAM, readback-free) BEFORE the front end records its frame.
-    // The streamed front-end DRIVE is opt-in (KNOWN-FAILING render — see the gate below); only build the pager when
-    // it is enabled, so the default streamed path pays nothing (no cold-fill) and falls back to the correct CPU pack.
-    let paged_drive_enabled = std::env::var("ADVENTURE_GPU_PAGED_DRIVE").is_ok();
-    let streamed_source = paged_drive_enabled
-        .then(|| upload.and_then(|u| u.streamed_source.as_ref()).filter(|(e, _)| *e == params.epoch))
-        .flatten();
+    // The paged GPU drive is the LIVE path for every `.vxo`-backed scene (Sponza + the multi-asset Gallery + the
+    // streamed Bistro) — no env gate. When the scene carries a streamed source for this epoch, build/maintain the
+    // pager so the front end drives off the demand-paged occupancy/cores (constant-RAM, readback-free).
+    let streamed_source =
+        upload.and_then(|u| u.streamed_source.as_ref()).filter(|(e, _)| *e == params.epoch);
     if let Some((epoch, src)) = streamed_source {
         // (Re)build the pager on an epoch change (a fresh streamed scene). The front-end pool must be ready first
         // (we still rebind it below); building the pager early is fine — it only reads the source directories +
@@ -3652,16 +3669,10 @@ fn drive_gpu_residency_front_end(
         && resources.gpu_core_store.is_some()
         && resources.gpu_residency_epoch == Some(params.epoch)
         && resources.gpu_core_store_epoch == Some(params.epoch);
-    // **Phase G "G-c.4-paging" — KNOWN-FAILING streamed DRIVE, opt-in.** The prefetcher + paged stores are built
-    // + parity/unit-tested correct (occupancy + cores bit-identical to the eager oracle), but when the LIVE front
-    // end is DRIVEN by them it does NOT render the streamed Bistro correctly (it enters the full pool without
-    // face-culling and never converges → all-origin AABBs → a BLANK trace; see the report). The eager IN-RAM path
-    // (Sponza / `.vox` Gallery) renders + converges fine. So the streamed front-end drive is GATED OFF by default
-    // (the CPU pack renders streamed scenes correctly); `ADVENTURE_GPU_PAGED_DRIVE=1` opts INTO the experimental
-    // drive for further GPU-capture debugging. The eager drive is unaffected. (`paged_drive_enabled` is computed
-    // above where the pager build is gated on it.)
-    let have_paged =
-        paged_drive_enabled && resources.streamed_pager.as_ref().map(|p| p.epoch()) == Some(params.epoch);
+    // **Phase G "G-c.4-paging" — the LIVE streamed DRIVE.** The prefetcher pages the demand occupancy + cores
+    // (constant-RAM, readback-free); the front end face-culls + packs against them exactly as it does the eager
+    // in-RAM stores. Active whenever the pager is built for this epoch (a `.vxo`-backed scene).
+    let have_paged = resources.streamed_pager.as_ref().map(|p| p.epoch()) == Some(params.epoch);
     if !have_eager && !have_paged {
         return false;
     }
@@ -5205,7 +5216,7 @@ mod tests {
             sponza_source: None,
             gallery: None,
             gallery_source: None,
-            gallery_vxo: None,
+            streamed_vxo: None,
             packed_scene: Some(VoxelScene::Sponza), // already latched on the switch frame
             packed_edit_gen: Some(0),
             worldgen_dirty_pending: false,

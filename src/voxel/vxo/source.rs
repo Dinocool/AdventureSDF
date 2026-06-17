@@ -528,6 +528,28 @@ impl VxoSource {
         self.region_edge()
     }
 
+    /// **The world↔local SSOT** — this asset's LOCAL region coord (on the LOD-`lod` grid) that OWNS world brick
+    /// `world`. Combines the single offset transform ([`Self::offset_at_lod`]) with the Euclidean region bucket,
+    /// so EVERY consumer (the occupancy build, the prefetcher's `desired` set, and the core-fetch region resolve)
+    /// derives a region coord through ONE function — a non-zero / negative placement can never desync them (the
+    /// off-origin-offset paged-blank class is correct by construction). `world` is on the LOD-`lod` brick grid.
+    #[inline]
+    pub fn region_of_world(&self, lod: u32, world: IVec3) -> IVec3 {
+        let local = world - self.offset_at_lod(lod);
+        let k = self.region_edge();
+        IVec3::new(local.x.div_euclid(k), local.y.div_euclid(k), local.z.div_euclid(k))
+    }
+
+    /// **The world↔local SSOT (prefetcher entry)** — the PRESENT region coords whose `K³`-brick span intersects
+    /// the WORLD brick AABB `[world_lo, world_hi]` (inclusive), +1-brick padded for halo coverage. Maps world→local
+    /// via the SAME [`Self::offset_at_lod`] transform [`Self::region_of_world`] uses, then delegates to
+    /// [`Self::present_regions_in`]. The prefetcher calls THIS (never subtracting the offset itself) so the world→
+    /// local mapping has a single home. Returned coords are LOCAL region coords on the served grid.
+    pub fn present_world_regions_in(&self, lod: u32, world_lo: IVec3, world_hi: IVec3, out: &mut Vec<IVec3>) {
+        let off = self.offset_at_lod(lod);
+        self.present_regions_in(lod, world_lo - off, world_hi - off, out);
+    }
+
     /// **Phase G "G-c.4-paging"** — the level table selector for a given `lod`: `(bidx, brik_base, span_bound,
     /// served_lod)` — the exact arguments [`Self::decoded_region`] needs for that level. `None` iff `lod > 0`
     /// without a `LODS` pyramid (the streamed Bistro is baked WITH a pyramid, so a present-coarse-region directory

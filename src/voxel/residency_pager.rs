@@ -185,11 +185,10 @@ impl StreamedResidencyPager {
                 if lo.x > hi.x || lo.y > hi.y || lo.z > hi.z {
                     continue; // this asset doesn't touch the clipmap box at this LOD
                 }
-                let off = asset.source.offset_at_lod_pub(lod);
-                let llo = lo - off;
-                let lhi = hi - off;
+                // World→local + region-bucket through the asset's SSOT (no offset math here) so the desired set,
+                // the occupancy build, and the core-fetch resolve all agree for any (off-origin) placement.
                 scratch.clear();
-                asset.source.present_regions_in(lod, llo, lhi, &mut scratch);
+                asset.source.present_world_regions_in(lod, lo, hi, &mut scratch);
                 for &rc in &scratch {
                     desired.insert((ai, lod, rc));
                 }
@@ -383,7 +382,6 @@ impl StreamedResidencyPager {
     /// Apply the per-crossing core DELTA to the GPU store: EVICT the 1→0 keys, INSERT the 0→1 keys (decoding each
     /// core lazily). Θ(delta) — NOT Θ(all resident). The insert may gracefully drop at the bounded-buffer ceiling.
     fn flush_cores(&mut self, queue: &wgpu::Queue, pending_insert: &[(IVec3, u32)], pending_evict: &[(IVec3, u32)]) {
-        let k = self.source.placed_assets().first().map(|a| a.source.region_edge_pub()).unwrap_or(8);
         // Filter the delta by the FINAL refcount so a key that churned 0→1→0 (or 1→0→1) within this crossing
         // resolves to its true end state (insert iff still required; evict iff truly gone) — order-independent.
         let inserts: Vec<(IVec3, u32)> =
@@ -400,8 +398,9 @@ impl StreamedResidencyPager {
             |world, lod| {
                 let ai = *key_asset.get(&(world, lod))?;
                 let asset = &source.placed_assets()[ai];
-                let local = world - asset.source.offset_at_lod_pub(lod);
-                let region_coord = IVec3::new(local.x.div_euclid(k), local.y.div_euclid(k), local.z.div_euclid(k));
+                // Resolve the owning region through the asset's world↔local SSOT (same transform as the desired
+                // set + occupancy), so a non-zero placement maps the core to the SAME region the prefetcher paged.
+                let region_coord = asset.source.region_of_world(lod, world);
                 let region = decoded.get(&(ai, lod, region_coord))?;
                 asset.source.core_at_world(lod, world, region)
             },
