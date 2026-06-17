@@ -846,9 +846,6 @@ fn gather_gi(n: vec3<f32>, p: vec3<f32>, seed_base: u32) -> vec3<f32> {
     // const (the `gi_rays` uniform was removed — ReSTIR's correct initial count is always 1); a high fixed
     // count keeps the oracle reference low-variance.
     let rays = 32u;
-    if (light.gi_intensity <= 0.0) {
-        return vec3<f32>(0.0);
-    }
     let origin = p + n * light.shadow_bias;
     let basis = onb(n);
     let tang = basis[0];
@@ -1561,10 +1558,6 @@ fn restir_p1_core(n: vec3<f32>, p: vec3<f32>, pix: vec2<u32>, temporal_base: vec
     let vp = vec2<u32>(restir_params.viewport_x, restir_params.viewport_y);
     let idx = pix.y * vp.x + pix.x;
     surfaces_cur[idx] = PixelSurface(p, 1.0, n, 0.0); // this pixel's receiver surface (for neighbours/next frame)
-    if (light.gi_intensity <= 0.0) {
-        reservoirs_b[idx] = empty_reservoir();
-        return;
-    }
     var rng = seed;
     let brdf = vec3<f32>(1.0); // receiver albedo factored out (applied by the caller)
 
@@ -1638,10 +1631,6 @@ fn restir_p1_core(n: vec3<f32>, p: vec3<f32>, pix: vec2<u32>, temporal_base: vec
 fn restir_p2_core(n: vec3<f32>, p: vec3<f32>, pix: vec2<u32>, seed: u32) -> vec3<f32> {
     let vp = vec2<u32>(restir_params.viewport_x, restir_params.viewport_y);
     let idx = pix.y * vp.x + pix.x;
-    if (light.gi_intensity <= 0.0) {
-        reservoirs_a[idx] = empty_reservoir();
-        return vec3<f32>(0.0);
-    }
     // Offset the rng so the spatial disk taps decorrelate from pass 1's candidate/temporal stream.
     var rng = seed ^ 0xA511E9B3u;
     let brdf = vec3<f32>(1.0); // receiver albedo factored out (applied by the caller)
