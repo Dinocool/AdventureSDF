@@ -530,14 +530,17 @@ fn index_slab_words(index_bits: u8) -> u32 {
 /// figure that bounds it is the MEAN over the whole resident set, not a single brick's class. MEASURED on the
 /// A4.4 worldgen slice: the index arena settled at **6.4 MB / 10 k resident bricks ≈ 160 words/brick** (the mean
 /// over the dense/uniform mix — uniform bricks cost 0 index words, dense bricks 32–500 by their `index_bits`).
-/// We reserve at **192 words/brick = 1.2× that mean** for headroom against a denser-than-measured architectural
-/// load, so a full normal load fits the FIRST snapshot and never grows mid-load. A load whose mean exceeds this
-/// (a high-entropy `.vox` scene dominated by 16-bit bricks) still grows SAFELY past the reserve — the reserve only
-/// kills the COMMON-load grow-snapshots. NOTE the cost: the index GPU buffer is then committed at
-/// `max_resident_bricks · 192 · 4 B` regardless of the actual resident count — the `max_resident_bricks` cap is
-/// the documented VRAM safety bound, so sizing the buffer to it is consistent (a far-lower live residency simply
-/// leaves the pre-sized pool partly unused, vs. paying a 200 ms re-snapshot each time it would have grown).
-const RESERVE_INDEX_WORDS_PER_BRICK: u32 = 192;
+/// We reserve at the **largest index class (500 words, `index_bits = 16`), rounded to 512** so the pool is sized
+/// correct-by-construction for ANY brick mix: every dense brick costs ≤ 500 ≤ 512 index words, so a converged set
+/// of `max_resident` bricks NEVER overflows `max_resident · 512` — true for the CPU grow path AND, critically, for
+/// the FIXED (no-grow) GPU residency FRONT END pool (`residency_front_end.rs`), which binds this buffer once and
+/// writes the whole GPU-decided set into it. A dense scene like Bistro at clip_half=160 converges to ~517 index
+/// words/brick (essentially ALL 16-bit bricks) — at the old 192-word reserve the front end's index slab high-water
+/// (~198 M words) overflowed the 76.8 M pool 2.6× ⇒ out-of-bounds GPU writes ⇒ corruption. 512 bounds it by
+/// construction. NOTE the cost: the index GPU buffer is committed at `max_resident_bricks · 512 · 4 B` (the
+/// `max_resident_bricks` cap is the documented VRAM safety bound) regardless of the live count; a low-entropy scene
+/// simply leaves the pre-sized pool partly unused. (Was 192 ≈ the MEASURED MEAN — too small for a worst-case mix.)
+const RESERVE_INDEX_WORDS_PER_BRICK: u32 = 512;
 
 /// **Pre-size estimate — the MEAN per-brick PALETTE words a RESIDENT brick costs** (the palette-arena pre-grow per
 /// brick). MEASURED on the A4.4 worldgen slice: **0.41 MB / 10 k ≈ 10 words/brick**; we reserve **16 words/brick**
