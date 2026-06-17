@@ -266,19 +266,21 @@ pub fn render_gi_panel(world: &mut World, ui: &mut egui::Ui) {
                         .size(11.0),
                     );
 
-                    // SOFT per-frame active-cell cap (Phase 2.4). 0 = UNLIMITED (default — no behaviour change);
-                    // > 0 bounds the update/blend dispatch to N cells/frame (lower steady GPU cost, slower fill).
+                    // STOCHASTIC per-frame active-cell soft cap (Solari's 40000, the default). 0 = UNLIMITED;
+                    // > 0 keeps each cell with Bernoulli probability cap/active_count (lower steady GPU cost).
                     ui.separator();
                     ui.label(egui::RichText::new("Per-frame active-cell cap").strong());
                     ui.add(
                         egui::Slider::new(&mut d.max_active_cells_per_frame, 0..=131_072)
-                            .text("max active cells / frame (0 = unlimited)"),
+                            .text("avg active cells / frame (0 = unlimited)"),
                     );
                     ui.label(
                         egui::RichText::new(
-                            "0 = unlimited (every active cell updates each frame — default). > 0 caps the \
-                             update/blend dispatch to N cells/frame: lower, steadier GPU cost but a slower \
-                             cache fill (skipped cells keep last radiance, refresh next frame — never cleared).",
+                            "0 = unlimited (every active cell updates each frame). > 0 = stochastic soft cap \
+                             (Solari 40000, the default): each cell updates with probability cap/active_count, so \
+                             ~N cells refresh per frame — a random subset the temporal blend integrates to the \
+                             same converged GI. Lower, steadier GPU cost; skipped cells keep last radiance \
+                             (never cleared). No starvation (equal per-frame chance for every cell).",
                         )
                         .weak()
                         .size(11.0),

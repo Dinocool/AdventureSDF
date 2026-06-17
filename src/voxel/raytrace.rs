@@ -2066,13 +2066,15 @@ pub struct WorldCacheUniformData {
     pub view_y: f32,
     /// Camera world position (Z), stamped by the render pass.
     pub view_z: f32,
-    /// Phase 2.4 SOFT per-frame active-cell cap (knobs-as-uniforms). `0` (the default) = UNLIMITED — every
-    /// active cell is updated + blended each frame, exactly the pre-2.4 behaviour (byte-identical GPU tests).
-    /// When `> 0`, `compact_write_active` clamps the indirect update/blend dispatch to `ceil(N/64)` workgroups
-    /// AND the update/blend entries early-out for `active_index >= N`, so at most `N` active cells are processed
-    /// this frame; the rest keep their last radiance + life and are picked up next frame as they stay alive.
-    /// NEVER corrupts the cache (skipped cells are untouched, not cleared). Trade: lower steady GPU cost vs a
-    /// slower cache fill (more frames to converge). OFF by default.
+    /// STOCHASTIC per-frame active-cell soft cap (knobs-as-uniforms; Solari's `WORLD_CACHE_CELL_UPDATES_SOFT_CAP
+    /// = 40000`, the default here). `0` = UNLIMITED — every active cell is updated + blended each frame. When
+    /// `> 0`, the indirect dispatch covers the FULL active count (uncapped, like Solari `node.rs`) and each
+    /// cell's update + blend thread keeps itself with Bernoulli probability `cap / active_count`
+    /// (`wc_skip_this_frame`), so on average `cap` cells are refreshed per frame — a RANDOM subset, not a fixed
+    /// window. The temporal blend (`max_temporal_samples`) integrates the random subset over frames to the SAME
+    /// converged radiance as the unlimited pass. No per-cell starvation (every cell has equal per-frame survival
+    /// probability); NEVER corrupts the cache (skipped cells are untouched, not cleared). Bounds the per-frame
+    /// update-ray count at large active sets (e.g. Bistro) where the unlimited pass dwarfs the reference.
     pub max_active_cells_per_frame: u32,
     /// Phase 2.5 NEE: number of emissive-voxel lights in the bound light list (`0` ⇒ NEE skipped — no emitters).
     /// Stamped by the render pass from the packed patch's `lights.len()`; never a user knob.
@@ -2110,7 +2112,7 @@ impl Default for WorldCacheUniformData {
             view_x: 0.0,
             view_y: 0.0,
             view_z: 0.0,
-            max_active_cells_per_frame: 0, // 2.4 default: UNLIMITED (no behaviour change; cap is opt-in)
+            max_active_cells_per_frame: 40000, // Solari WORLD_CACHE_CELL_UPDATES_SOFT_CAP — stochastic Bernoulli gate
             light_count: 0,                // 2.5: stamped per frame from the packed light list (0 ⇒ NEE skipped)
             nee_enabled: 1,                // 2.5 default: NEE ON (the principled firefly/variance fix; A/B-gated)
             nee_samples: 1,                // 2.5 default: 1 shadow ray/cell/frame (the temporal blend averages)
