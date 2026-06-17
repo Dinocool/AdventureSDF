@@ -204,3 +204,57 @@ the first" test.
 **Extends prior docs:** `PHASE_G_GALLERY_PLAN.md:54-60` (G-c named), `GPU_VOXEL_WORLDGEN_PLAN.md:26-27,59,107` (readback-free
 pipeline + no-indirect-AS + "CPU keeps only camera/clip"), `VOXEL_LARGE_SCENE_PLAN.md:130-167` (surface-only Θ(H²) residency),
 `CONSTANT_RAM_BAKE_PLAN.md` (per-region paging spine), `incremental.rs:51-165` + `voxel_pack.wgsl` (the GPU interface Pass D targets).
+
+## 8. G-c.4-paging — file-level implementation (locked spec)
+
+> The streamed-Bistro close-out. Grounded in: re-flora camera-first chunk paging (`pop_nearest_to(camera_position)`,
+> no per-frame readback); VoxelNotes sector-mask occupancy (`:291`) + dirty→upload (`:431`); GigaVoxels brick-cache+LRU
+> — but the dealloc signal comes from the CPU coarse-region residency (camera-driven), NOT a GPU→CPU request readback
+> (VoxelNotes `:326` leaves that an open TODO; we sidestep it). Occupancy rebuilds whole per crossing (cheap, ~few MB);
+> cores are incremental free-list (a whole rebuild = ~300MB/crossing, forbidden). Both bounded by the clipmap-covering
+> present-region set → constant-RAM, readback-free.
+
+### 8.1 Coarse region prefetcher (the new driver — region paging is no longer fine-residency-driven)
+- `VxoSource` accessors (src/voxel/vxo/source.rs): the per-LOD present-region directory is `self.bidx` (LOD0) /
+  `coarse_level(lod).bidx_l` (L>0, requires `lods.is_some()` — the baked Bistro has LODS). `VxoRegionDirEntry.region_coord:[i32;3]`,
+  `region_of_brick(b,k)=b.div_euclid(k)`, `k=DEFAULT_REGION_EDGE_BRICKS=8`, `offset_at_lod(lod)` maps world↔local.
+  Add: `present_regions_in(lod, local_lo, local_hi, out:&mut Vec<IVec3>)` — iterate the level dir, keep region_coords whose
+  region ∩ [region_of_brick(local_lo), region_of_brick(local_hi)] (PAD the AABB by +1 brick each side so 26-halo neighbours'
+  regions are covered — the core-coverage invariant). And `decode_region_pub(lod, region_coord) -> Option<Arc<DecodedRegion>>`
+  (wraps `decoded_region` with the per-lod bidx/brik_base/span_bound; decodes+caches). Plus `MergedSource` iterates `assets`,
+  per asset works in LOCAL coords (`world - offset_at_lod(lod)`).
+- Prefetcher (new system, runs in `prepare_voxel_rt` before the front-end drive, camera-driven): for lod 0..=MAX_LOD,
+  `level_box_pub(cam, lod, clip_half)` → world brick AABB; per PlacedAsset → local AABB → `present_regions_in` → the
+  resident region set keyed `(asset, lod, region_coord)`. On a set CHANGE (region crossing — infrequent): newly-covered →
+  `decode_region_pub` + upload; uncovered → evict.
+
+### 8.2 Growable occupancy (rebuild-whole from resident regions; cheap)
+- On resident-set change, rebuild `SectorOccupancy::from_occupied_full` over ALL resident regions' bricks (DecodedRegion
+  entries → world `(coord,lod,is_full)` via `+offset_at_lod`); re-upload `entries` (queue_write_buffer). Pre-size the GPU
+  `entries` buffer generously (whole-Bistro sector estimate from `head` brick counts) so no realloc/rebind; occupancy is
+  ~few MB so a per-crossing whole re-upload is cheap. Accumulating is unnecessary — rebuild-from-resident is simpler + correct.
+
+### 8.3 Demand-paged core store (incremental free-list; GigaVoxels brick-cache, CPU-coverage dealloc)
+- Make `BrickCoreStore` MUTABLE: fixed-cap `cores` buffer (cap = region-budget bricks × 512 u32) + a `free_slots` stack +
+  the mutable `(coord,lod)→core_index` hash (fixed-cap). `upload_region(region, world_coords)`: per brick claim a free slot,
+  write core to `cores[slot]`, insert hash; `queue_write_buffer` the new cores + touched hash slots; record `region→[slots]`.
+  `evict_region(region)`: push its `[slots]` to `free_slots`, mark its hash entries EMPTY + re-upload those slots (cores not
+  cleared — reused). 
+- COVERAGE INVARIANT: the prefetcher pages exactly the clipmap-covering present regions (PADDED +1 brick), and the GPU
+  enumerate only ENTERS bricks with `level_resident` (inside the clipmap) → every enterable brick + its 26-halo has its core
+  resident. Bounded: resident region set ≈ clipmap surface; cap the `cores` buffer to that footprint (constant-RAM). Mirror
+  the RegionCache lifecycle (upload on decode, evict on drop) so the GPU store ≤ the CPU RegionCache budget.
+
+### 8.4 Integration (src/voxel/raytrace.rs) + gates
+- Run the prefetcher in `prepare_voxel_rt` (camera-driven) for the live `MergedSource`; maintain the streamed occupancy +
+  core buffers in `VoxelRtResources`; rebind the front-end bind group on realloc. REMOVE the `gpu_residency &&
+  gpu_core_store.is_some()` fallback → the prefetcher provides the stores for streamed scenes → the GPU front end drives Bistro.
+  The G-c.4 per-frame drive + change_count mirror are unchanged, now fed the streamed stores.
+- GATES: (1) core-store insert/evict UNIT test (free-list: no leak/double-free; evicted keys absent; coverage holds).
+  (2) PAGED-source parity test — prefetcher + GPU front end over a small streamed `.vxo` across a camera sequence == CPU
+  ResidentPacker (occupancy + per-key content + ray-hits). (3) Bistro bench clip_half=160 toggle on vs off: no 317ms freeze,
+  converges to idle, ceiling FPS, correct COMPLETE screenshot (no holes = invariant proof). (4) all suites + lib green, toggle
+  off byte-unchanged, constant-RAM (bounded resident region count), zero warnings.
+- RISKS: the cores free-list eviction (coverage invariant + no leak — the unit test gates it); the +1-brick halo pad; the
+  per-LOD merge offset (`offset_at_lod`); occupancy buffer pre-size to avoid realloc. The crossing-rebuild of occupancy is a
+  small transient (~MB), replacing the 317ms classify freeze; incremental-occupancy is a later polish if it shows.
