@@ -1,5 +1,18 @@
 # Unified All-GPU Voxel Residency / Streaming — Design of Record
 
+> ## ⟶ FINAL TARGET (4+1 directives — these SUPERSEDE/EXTEND the body below)
+> The body was written before these directives; where it talks about "routing in-RAM scenes through
+> the pager" or preserving a CPU pack, read it through this lens — the target is *simpler* than the body assumes.
+>
+> 1. **One GPU-driven residency path** for every scene (enumerate → diff → pack → AABB → BLAS, readback-free, fixed-cap pool + GPU page/slot table).
+> 2. **`.vxo`-only** — delete `.vox` loading + the legacy full-RAM `.vox` merge + the "no `.vxo` → fall back" branch. Every *file-backed* scene loads `.vxo` (corpus converted in #139; verify a `.vxo` exists for every shipped scene, esp. Sponza, BEFORE deleting `.vox`).
+> 3. **No CPU residency/pack pipeline** — delete `ResidencyManager`, `ResidentPacker` (`pack_one`/`update`/`update_gpu`/`apply_delta` + the SlabArena CPU side), the CPU classify, and the StreamSnapshot CPU cold-fill. CPU keeps ONLY: `.vxo` byte IO, command submission, and the one-time pool BUFFER allocation (empty + degenerate AABBs — the GPU cold-fills it).
+> 4. **No CPU NEE/light bake** — build the emissive-voxel light list GPU-side from the resident emissive voxels (GPU compaction → light buffer; Solari-style light tiles, GPU-built). NO CPU emitter enumeration / no per-epoch CPU light bake. (Net-new GPU work.)
+>
+> **+1 — MUST SCALE TO WORLDGEN (design constraint, do NOT build worldgen here):** the same path must serve a full procedural world with every clipmap shell filled, at full perf. Therefore: **(a)** keep the `BrickSource`/producer abstraction clean — `.vxo`-only means file-backed scenes; worldgen is a *procedural* producer (no file) feeding the SAME pool/residency, NOT a special case; the pool brick format is the SSOT both feed. **(b)** Leave room for a **GPU producer** — `.vxo` = disk memcpy, worldgen = GPU generation into pool slots (the approved GPU-worldgen pivot; not built here, but the residency design must not preclude it). **(c)** Be robust under **sustained motion / never-converging residency** — worldgen never settles to idle, so the BLAS-rebuild sweep + `change_count` convergence gating must handle residency changing every frame (the windowed-cursor stale-BLAS hazard the audit flagged must not leave far chunks stale under continuous flight). Two axes are separate: residency throughput (this doc) vs raymarch trace perf (occupancy-bound; out of scope here).
+>
+> **Sequencing (critical):** the GPU path is the only thing that can be deleted-toward, but it is NOT yet working for all scenes (paged-blank on non-zero offset / the BLAS sweep). The CPU pack is the only currently-rendering path. So: **fix the GPU drive → make it universal (all `.vxo`, lights GPU-side, robust under motion) → ONLY THEN delete `.vox` + the CPU pipeline + the CPU light bake + eager + env gate.** Delete last, never first.
+
 > **Mandate (non-negotiable, from the user):** there must be exactly **ONE** residency/streaming
 > path — fully GPU-driven, readback-free, scalable — for **EVERY** scene. NO dual store. Today there
 > are two: an **EAGER** in-RAM store (built whole at scene-switch; the only currently-*working* GPU
