@@ -1535,11 +1535,19 @@ struct VoxelRtResources {
     /// Rebuilding ALL of them (≈100k+ live primitives) in ONE frame's `build_acceleration_structures` overruns the
     /// AABB-BLAS build throughput of the ray-query backend and silently yields a non-tracing TLAS (the clip_half-
     /// dependent blank: renders at small clip_half, black past ~60-100k live prims). So the rebuild is SPREAD across
-    /// frames: each frame rebuilds a bounded WINDOW of chunks starting at this cursor, advancing it until the whole
-    /// chunk set has been rebuilt since the last residency change (then it idles). The CPU `apply_delta` never hit
-    /// this because it rebuilds only the few dirty chunks per move; the GPU front end's whole-set rebuild needs the
-    /// same throttling. `usize::MAX` ⇒ no rebuild pending (converged + fully rebuilt).
+    /// frames: each frame rebuilds a bounded WINDOW of chunks starting at this cursor, which ROLLS continuously
+    /// (wrapping at the chunk count) so that — under SUSTAINED MOTION / never-converging residency (a multi-asset
+    /// gallery or worldgen flight where residency changes every frame) — every chunk is still revisited and
+    /// rebuilt within one cycle. (The earlier reset-to-0-on-every-change stalled the cursor in the first window
+    /// forever when residency never settled, so only the lowest slots — the first-entered, nearest asset — ever
+    /// got a real BLAS; far assets in higher slots stayed degenerate ⇒ invisible.) The CPU `apply_delta` never hit
+    /// this because it rebuilds only the few dirty chunks per move.
     blas_rebuild_cursor: usize,
+    /// **Phase G "G-c.4" — the rolling-sweep convergence guard.** Chunks rebuilt CONSECUTIVELY since the last
+    /// residency change (`rebuild_as`); reset to 0 on every change. Once it reaches the chunk count a full pass has
+    /// completed with no change in flight, so the sweep IDLES (no per-frame AS work on a converged static camera).
+    /// Under continuous change it stays below the chunk count, so the rolling cursor keeps sweeping every chunk.
+    blas_clean_streak: usize,
     /// **Phase G "G-c.4-paging"** — the STREAMED `.vxo` region PREFETCHER + its demand-paged GPU occupancy / core
     /// store (`residency_pager.rs` §8). Present only for the live STREAMED scene (Bistro / the `.vxo` Gallery),
     /// built from the extracted [`VoxelRtResidencyUpload::streamed_source`] on the scene/epoch switch. Each frame
@@ -3823,24 +3831,32 @@ fn drive_gpu_residency_front_end(
     //     ONE frame silently yields a NON-TRACING TLAS (the clip_half-dependent blank: renders at small clip_half,
     //     black past ~60-100k live prims; NO validation error). The CPU `apply_delta` never hit this because it
     //     rebuilds only the FEW dirty chunks per move — a small per-frame build. So the GPU front end's whole-set
-    //     rebuild is SPREAD across frames: each frame rebuilds a bounded WINDOW of chunks from a persistent cursor,
-    //     re-pointing+building only those, then rebuilds the TLAS over ALL instances (a TLAS build of all instances
-    //     is cheap + proven fine — the CPU path does it every dirty frame). When residency changes (`rebuild_as`),
-    //     the cursor resets to 0 to re-sweep; once it passes the last chunk the sweep idles (no per-frame AS work).
-    // `aabb_buf` is the converged GPU-written set (stable across the sweep), so windowed builds across frames
-    // assemble a correct, complete TLAS without any single oversized build.
+    //     rebuild is SPREAD across frames: each frame rebuilds a bounded WINDOW of chunks from a persistent cursor
+    //     that ROLLS continuously (wrapping at the chunk count), re-pointing+building only those, then rebuilds the
+    //     TLAS over ALL instances (a TLAS build of all instances is cheap + proven fine — the CPU path does it every
+    //     dirty frame). **The cursor must NOT reset to 0 on every change** — under sustained motion / never-
+    //     converging residency (the multi-asset gallery, worldgen flight) `rebuild_as` is true EVERY frame, so a
+    //     reset-to-0 stalls the window in the first chunks forever and only the lowest slots (the first-entered,
+    //     nearest asset) ever get a real BLAS — far assets in higher slots stay degenerate ⇒ invisible. Instead the
+    //     cursor rolls and wraps so every chunk is revisited within one cycle; a `blas_clean_streak` (chunks rebuilt
+    //     since the last change) lets the sweep IDLE once a full pass completes with no change in flight (a converged
+    //     static camera does no per-frame AS work).
+    // `aabb_buf` is the GPU-written set; a brick that activates mid-sweep shows within one cursor cycle (a few
+    // frames), and the rolling windowed builds assemble a correct, complete TLAS without any single oversized build.
     {
         let n_chunks = resources.scene.as_ref().map(|s| s.chunks.len()).unwrap_or(0);
         if rebuild_as {
-            resources.blas_rebuild_cursor = 0; // residency changed — start a fresh full sweep
+            resources.blas_clean_streak = 0; // residency changed — a fresh full pass is needed to cover it
         }
         // The per-frame window: bounded so each frame's BLAS build stays well under the backend's whole-set overrun
         // threshold (≈60k live prims observed). 48 chunks × 512 slots = 24576 slot-prims/frame, comfortably safe.
         const BLAS_REBUILD_WINDOW: usize = 48;
-        if resources.blas_rebuild_cursor < n_chunks {
+        // Sweep while a full clean pass hasn't completed since the last change (so a converged camera idles, but a
+        // never-converging stream keeps rolling). The cursor wraps independently, so coverage is complete either way.
+        if n_chunks > 0 && resources.blas_clean_streak < n_chunks {
             let _b = info_span!("vox_blas_residency").entered();
             let aabb_stride = core::mem::size_of::<GpuBrickAabb>() as u64;
-            let start = resources.blas_rebuild_cursor;
+            let start = resources.blas_rebuild_cursor % n_chunks;
             let end = (start + BLAS_REBUILD_WINDOW).min(n_chunks);
             let scene = resources.scene.as_mut().expect("n_chunks > 0");
             // Pass 1 (mutate): recreate THIS WINDOW's chunk BLAS handles (full Build) + re-point their TLAS instances.
@@ -3883,7 +3899,13 @@ fn drive_gpu_residency_front_end(
             });
             encoder.build_acceleration_structures(geos.iter(), core::iter::once(&scene.tlas));
             render_queue.submit(core::iter::once(encoder.finish()));
-            resources.blas_rebuild_cursor = end;
+            // Roll the cursor (wrap at the chunk count) so the NEXT frame's window covers the following chunks, and
+            // over successive frames every chunk is revisited. Count this window toward the clean streak ONLY on a
+            // no-change frame — so the idle gate requires a FULL pass with no residency change in flight.
+            resources.blas_rebuild_cursor = if end >= n_chunks { 0 } else { end };
+            if !rebuild_as {
+                resources.blas_clean_streak = (resources.blas_clean_streak + (end - start)).min(n_chunks);
+            }
         }
     }
 
