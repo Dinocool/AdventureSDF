@@ -888,31 +888,6 @@ fn gather_gi(n: vec3<f32>, p: vec3<f32>, seed_base: u32) -> vec3<f32> {
     return (acc_rad / f32(rays)) * light.gi_intensity;
 }
 
-// Compose the FINAL surface colour at the primary hit: direct lighting (with traced AO on the ambient
-// fill) + single-bounce indirect GI (× receiver albedo) + the surface's OWN emissive glow. `albedo` is the
-// palette colour, `n` the face normal, `p` the world hit point, `emissive` the palette emissive radiance.
-// Output is LINEAR HDR — Bevy tonemaps downstream.
-fn shade(albedo: vec3<f32>, n: vec3<f32>, p: vec3<f32>, emissive: vec3<f32>, seed: u32) -> vec3<f32> {
-    let origin = p + n * light.shadow_bias;
-    let to_sun = -light.sun_direction;
-    let ndotl = max(dot(n, to_sun), 0.0);
-    var shadow = 1.0;
-    if (ndotl > 0.0) {
-        if (trace_occluded(origin, to_sun, 0.0, 1.0e4)) {
-            shadow = 0.0;
-        }
-    }
-    let direct = light.sun_color * (light.sun_intensity * ndotl * shadow);
-    // Indirect single-bounce GI: gathered irradiance × this surface's albedo (Lambertian reflection).
-    let indirect = gather_gi(n, p, seed) * albedo;
-    // The surface's own emissive glow (so an emitter block visibly lights up, not just its neighbours).
-    let glow = emissive * light.emissive_strength;
-    // No flat ambient term: ambient/sky fill comes from GI bounces (bounce_sky on a miss) + multi-bounce,
-    // matching Solari (which has no ambient/AO in its lit equation). Occluded areas going dark is correct —
-    // the old `albedo * ambient_color * ao` double-counted the indirect light.
-    return albedo * direct + indirect + glow;
-}
-
 // Distinct, high-contrast colour per LOD ring for the LOD debug view (`debug_view == 7`). Cycles a small
 // palette so adjacent rings always contrast: LOD 0 (finest, native) = green, rising green→yellow→orange→red
 // →magenta→blue→cyan→grey for progressively coarser rings. The instrument for validating clipmap/LOD-ring
@@ -931,10 +906,9 @@ fn lod_color(lod: u32) -> vec3<f32> {
     return pal[min(lod, 7u)];
 }
 
-// SSOT for the debug-view overlay colour (`debug_view` 1..7), shared by `raymarch`, `restir_p2`, and
-// `restir_dlss_p2` so the three entries can NEVER disagree on a debug mode. `gi` is the caller's own GI-only
-// estimate (the forward `gather_gi` for `raymarch`, the reservoir estimate `restir_p2_core` for the ReSTIR
-// entries) — used only for `debug_view == 5`. Returns black on a miss.
+// SSOT for the debug-view overlay colour (`debug_view` 1..7), shared by `restir_p2` and `restir_dlss_p2` so
+// the two entries can NEVER disagree on a debug mode. `gi` is the caller's own GI-only estimate (the reservoir
+// estimate `restir_p2_core` for the ReSTIR entries) — used only for `debug_view == 5`. Returns black on a miss.
 fn debug_overlay_color(r: TraceResult, ro: vec3<f32>, rd: vec3<f32>, gi: vec3<f32>) -> vec3<f32> {
     if (r.hit == 0u) { return vec3<f32>(0.0); }
     let p = ro + rd * r.t;
@@ -959,71 +933,9 @@ fn debug_overlay_color(r: TraceResult, ro: vec3<f32>, rd: vec3<f32>, gi: vec3<f3
     return r.color.rgb;
 }
 
-@compute @workgroup_size(8, 8, 1)
-fn raymarch(@builtin(global_invocation_id) gid: vec3<u32>) {
-    if (gid.x >= camera.viewport.x || gid.y >= camera.viewport.y) { return; }
-    // Pixel centre → NDC. Bevy/wgpu clip space: x∈[-1,1] right, y∈[-1,1] UP (flip the texel row).
-    let uv = (vec2<f32>(f32(gid.x), f32(gid.y)) + 0.5) / vec2<f32>(camera.viewport);
-    let ndc = vec2<f32>(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0);
-    // Unproject the NEAR plane to get a finite world point on the ray. Bevy uses an INFINITE-far reverse-Z
-    // perspective (near at z=1, far at z=0 → infinity), so unprojecting z=0 yields w=0 → a NaN point and
-    // every ray misses. The near plane (z=1) always unprojects to a finite point; the ray direction from the
-    // camera through it is identical to the true primary-ray direction.
-    let near = camera.world_from_clip * vec4<f32>(ndc, 1.0, 1.0);
-    let world_near = near.xyz / near.w;
-    let ro = camera.cam_pos;
-    let rd = normalize(world_near - ro);
-
-    let r = trace(ro, rd, 0.0, camera.t_max);
-
-    // --- Debug overlays (RAW output, no temporal accumulation, so they stay crisp under motion) ----------
-    if (light.debug_view != 0u) {
-        let dpx = vec2<i32>(i32(gid.x), i32(gid.y));
-        var gi = vec3<f32>(0.0);
-        if (r.hit != 0u && light.debug_view == 5u) {
-            let p = ro + rd * r.t;
-            let origin = p + r.normal * light.shadow_bias;
-            let seed = (gid.x * 1973u + gid.y * 9277u + light.frame_index * 26699u) | 1u;
-            gi = gather_gi(r.normal, origin, seed);                         // GI-only = forward gather
-        }
-        textureStore(out_tex, dpx, vec4<f32>(debug_overlay_color(r, ro, rd, gi), 1.0));
-        return;
-    }
-
-    var color: vec4<f32>;
-    if (r.hit != 0u) {
-        // Hit: physically-plausible DIRECT lighting (Lambert sun + traced hard shadow + traced AO over the
-        // palette albedo), fully opaque (replaces the view). Linear HDR — Bevy tonemaps downstream.
-        let p = ro + rd * r.t;
-        // Per-pixel + per-frame seed for the GI bounce-direction hash (decorrelates noise spatially and
-        // animates it across frames so a future temporal accumulator can average it out).
-        let seed = (gid.x * 1973u + gid.y * 9277u + light.frame_index * 26699u) | 1u;
-        let lit = shade(r.color.rgb, r.normal, p, r.emissive, seed);
-        color = vec4<f32>(lit, 1.0);
-    } else {
-        // Miss: the procedural sky (`sky_radiance`, the SINGLE sky SSOT), fully opaque. This makes the HW-RT
-        // view a complete renderer (no cube crutch to show through) AND lets the headless oracle distinguish
-        // "rays ran but missed" (sky) from "the composite never ran" (clear colour). Linear-space — tonemapped.
-        color = vec4<f32>(sky_radiance(rd), 1.0);
-    }
-
-    // --- Temporal accumulation (denoise the per-frame GI noise) ---------------------------------------
-    // Blend this frame's shaded colour into the running history mean. `accum_weight` is 1/sample_count: the
-    // renderer holds it at 1.0 on the frame the camera moves (full reset — show the fresh frame), then ramps
-    // it down (1/2, 1/3, …) while the camera is still, so the displayed value converges to the average of all
-    // frames since the last move. Because the GI bounce directions are decorrelated by `frame_index`, that
-    // average is a Monte-Carlo estimate whose variance falls ~1/n → the sparkle vanishes over a few dozen
-    // frames. RGB only (alpha is the hit mask, kept from the current frame). The history is the PREVIOUS
-    // accumulated output, copied back after this pass by the render system.
-    let prev = textureSampleLevel(history_tex, history_sampler, uv, 0.0).rgb;
-    let w = clamp(camera.accum_weight, 0.0, 1.0);
-    let accumulated = mix(prev, color.rgb, w);
-    textureStore(out_tex, vec2<i32>(i32(gid.x), i32(gid.y)), vec4<f32>(accumulated, color.a));
-}
-
-// --- DLSS Ray Reconstruction entry point ------------------------------------------------------------
-// (Stage 4c.) When built with `--features dlss`, the renderer runs THIS entry instead of `raymarch`. It
-// writes the per-pixel inputs DLSS-RR consumes:
+// --- DLSS Ray Reconstruction guide bindings ---------------------------------------------------------
+// (Stage 4c.) When built with `--features dlss`, the live ReSTIR DLSS pass (`restir_dlss_p2`) writes the
+// per-pixel inputs DLSS-RR consumes:
 //   * out_tex (the HDR view colour → DLSS `color`) — the FULL noisy LIT colour (albedo × lighting + glow).
 //     DLSS-RR DEMODULATES internally using the albedo guides below, denoises the lighting, then re-modulates;
 //     so we pass the full radiance, NOT a pre-divided signal. This matches the validated Solari contract
@@ -1031,12 +943,12 @@ fn raymarch(@builtin(global_invocation_id) gid: vec3<u32>) {
 //   * diffuse_albedo   (rgba8)   — the voxel palette albedo (DLSS's demodulation guide)
 //   * specular_albedo  (rgba8)   — a tiny dielectric F0 floor for these matte diffuse voxels (~non-specular)
 //   * normal_roughness (rgba16f) — world-space face normal (xyz) + perceptual roughness (w ≈ 1.0, matte)
-//   * out_dlss_depth   (r32f)    — the raymarch hit's reverse-Z clip depth (matches Bevy's depth prepass)
+//   * out_dlss_depth   (r32f)    — the trace hit's reverse-Z clip depth (matches Bevy's depth prepass)
 //   * out_dlss_motion  (rg16f)   — screen-space motion: this pixel's hit reprojected into the PREVIOUS frame
-// There is NO temporal accumulation here — DLSS-RR IS the denoiser. The guides are written by THIS compute;
-// the resolve render pass (`resolve_dlss` in voxel_rt_composite.wgsl) copies depth+motion into the
+// There is NO temporal accumulation here — DLSS-RR IS the denoiser. The guides are written by the ReSTIR DLSS
+// pass; the resolve render pass (`resolve_dlss` in voxel_rt_composite.wgsl) copies depth+motion into the
 // RENDER-ATTACHMENT-only prepass textures (which compute can't storage-write) and the colour into the view
-// target. `shade` (the non-dlss composer) is reused verbatim for the colour, so the lit look is identical.
+// target.
 @group(1) @binding(5) var out_diffuse_albedo: texture_storage_2d<rgba8unorm, write>;
 @group(1) @binding(6) var out_specular_albedo: texture_storage_2d<rgba8unorm, write>;
 @group(1) @binding(7) var out_normal_roughness: texture_storage_2d<rgba16float, write>;
@@ -1057,72 +969,6 @@ struct DlssCamera {
     motion_cur: mat4x4<f32>,
 };
 @group(1) @binding(10) var<uniform> dlss_cam: DlssCamera;
-
-@compute @workgroup_size(8, 8, 1)
-fn raymarch_dlss(@builtin(global_invocation_id) gid: vec3<u32>) {
-    if (gid.x >= camera.viewport.x || gid.y >= camera.viewport.y) { return; }
-    let px = vec2<i32>(i32(gid.x), i32(gid.y));
-    let uv = (vec2<f32>(f32(gid.x), f32(gid.y)) + 0.5) / vec2<f32>(camera.viewport);
-    let ndc = vec2<f32>(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0);
-    let near = camera.world_from_clip * vec4<f32>(ndc, 1.0, 1.0);
-    let world_near = near.xyz / near.w;
-    let ro = camera.cam_pos;
-    let rd = normalize(world_near - ro);
-
-    let r = trace(ro, rd, 0.0, camera.t_max);
-    if (r.hit != 0u) {
-        let p = ro + rd * r.t;
-        let seed = (gid.x * 1973u + gid.y * 9277u + light.frame_index * 26699u) | 1u;
-        // FULL noisy lit colour (same `shade` as the non-dlss path) → DLSS demodulates with the albedo guide.
-        let lit = shade(r.color.rgb, r.normal, p, r.emissive, seed);
-        textureStore(out_tex, px, vec4<f32>(lit, 1.0));
-        textureStore(out_diffuse_albedo, px, vec4<f32>(r.color.rgb, 1.0));
-        // Matte diffuse voxels: a tiny dielectric specular floor (F0 ≈ 0.04), near-black so DLSS treats
-        // them as non-specular. Keeps the specular guide valid (all-black confuses some DLSS paths).
-        textureStore(out_specular_albedo, px, vec4<f32>(vec3<f32>(0.04), 1.0));
-        textureStore(out_normal_roughness, px, vec4<f32>(r.normal, 1.0));
-
-        // True reverse-Z clip depth of the hit (JITTERED, matching Bevy's jittered reverse-Z depth prepass).
-        let depth_clip = dlss_cam.depth_clip_from_world * vec4<f32>(p, 1.0);
-        textureStore(out_dlss_depth, px, vec4<f32>(depth_clip.z / depth_clip.w, 0.0, 0.0, 0.0));
-
-        // Screen-space motion = where this hit point WAS vs IS, from the UN-JITTERED matrices (geometry motion
-        // only; DLSS adds the jitter offset itself). `(cur − prev)·(0.5,−0.5)` matches Bevy's prepass; the DLSS
-        // node's motion_vector_scale = −render_res converts the UV delta to pixels. ~0 for a static frame.
-        let prev_clip = dlss_cam.motion_prev * vec4<f32>(p, 1.0);
-        let cur_clip = dlss_cam.motion_cur * vec4<f32>(p, 1.0);
-        let prev_ndc = prev_clip.xy / prev_clip.w;
-        let cur_ndc = cur_clip.xy / cur_clip.w;
-        let motion = (cur_ndc - prev_ndc) * vec2<f32>(0.5, -0.5);
-        textureStore(out_dlss_motion, px, vec4<f32>(motion, 0.0, 0.0));
-    } else {
-        // Miss: the procedural sky (`sky_radiance`) into the colour, far depth (0 in reverse-Z), no motion, no
-        // albedo (so DLSS doesn't re-modulate sky with a stale albedo), default normal.
-        textureStore(out_tex, px, vec4<f32>(sky_radiance(rd), 1.0));
-        textureStore(out_diffuse_albedo, px, vec4<f32>(1.0, 1.0, 1.0, 1.0));
-        textureStore(out_specular_albedo, px, vec4<f32>(vec3<f32>(0.0), 1.0));
-        textureStore(out_normal_roughness, px, vec4<f32>(0.0, 0.0, 0.0, 1.0));
-        textureStore(out_dlss_depth, px, vec4<f32>(0.0, 0.0, 0.0, 0.0));
-        textureStore(out_dlss_motion, px, vec4<f32>(0.0, 0.0, 0.0, 0.0));
-    }
-
-    // Debug overlay (forward DLSS path): override the colour AFTER the guides; albedo = debug colour so
-    // DLSS-RR passes it through ~unchanged, depth/normal/motion stay real for stable reprojection. Shared
-    // `debug_overlay_color` SSOT; GI-only uses the forward `gather_gi` estimator (matches `raymarch`).
-    if (light.debug_view != 0u) {
-        var gi = vec3<f32>(0.0);
-        if (r.hit != 0u && light.debug_view == 5u) {
-            let p = ro + rd * r.t;
-            let origin = p + r.normal * light.shadow_bias;
-            let seed = (gid.x * 1973u + gid.y * 9277u + light.frame_index * 26699u) | 1u;
-            gi = gather_gi(r.normal, origin, seed);
-        }
-        let dbg = debug_overlay_color(r, ro, rd, gi);
-        textureStore(out_tex, px, vec4<f32>(dbg, 1.0));
-        textureStore(out_diffuse_albedo, px, vec4<f32>(dbg, 1.0));
-        textureStore(out_specular_albedo, px, vec4<f32>(vec3<f32>(0.0), 1.0));
-    }
-}
 
 // ====================================================================================================
 // ReSTIR GI — reservoir-based spatiotemporal resampling of the single-bounce diffuse GI (Ouyang 2021 /

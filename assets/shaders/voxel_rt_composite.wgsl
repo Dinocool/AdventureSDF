@@ -38,7 +38,7 @@ fn fs_composite(in: VsOut) -> @location(0) vec4<f32> {
 // (written via `@builtin(frag_depth)`) and the MOTION-VECTOR prepass texture (colour attachment). It also
 // REPLACES the HDR view target with the full lit colour (attachment 0, no blend — DLSS reads it as `color`).
 //
-// Inputs are the storage textures the `raymarch_dlss` compute filled (sampled by the SAME fullscreen UV):
+// Inputs are the storage textures the `restir_dlss_p2` compute filled (sampled by the SAME fullscreen UV):
 @group(0) @binding(2) var dlss_color_tex: texture_2d<f32>;
 @group(0) @binding(3) var dlss_depth_tex: texture_2d<f32>;
 @group(0) @binding(4) var dlss_motion_tex: texture_2d<f32>;

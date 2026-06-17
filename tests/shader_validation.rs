@@ -99,7 +99,7 @@ fn sdf_brick_bake_wgsl_validates() {
 
 #[test]
 fn voxel_raytrace_wgsl_validates() {
-    // The HW-RT voxel raymarch (+ the DLSS-RR `raymarch_dlss` entry point added in Stage 4c + the Phase-2.1
+    // The HW-RT voxel ReSTIR GI passes (+ the DLSS-RR ReSTIR entry points added in Stage 4c + the Phase-2.1
     // world-cache passes). Fully self-contained (no `#import`), but uses `enable wgpu_ray_query` + the
     // `ray_query` types, so it needs the full-capability composer (which the device + runtime also use).
     // The world-cache section is parameterised by the `#{WORLD_CACHE_SIZE}` hash-table-size def (a small
