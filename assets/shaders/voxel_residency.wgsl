@@ -705,9 +705,15 @@ fn safe_to_drop(coord: vec3<i32>, lod: u32) -> bool {
     return region_replacement_resident(coord, lod, diff_cfg.refine_descent_cap);
 }
 
-// --- Pass A — release the previous frame's quarantine into the free-list, then clear per-frame counters ---
+// --- Pass A — release the previous frame's quarantine into the free-list, then clear the DIFF per-frame counts.
 // Run as ONE invocation (single-threaded) so the head/tail arithmetic is race-free; the quarantine is small
 // (≤ one frame's drops). Mirrors `ResidentPacker::update`'s top-of-frame quarantine drain (incremental.rs:755).
+//
+// SCOPE: this pass touches ONLY the DIFF-scoped state (quarantine, free-list, enter/drop counts) — the SAME set
+// the G-c.2a diff gate binds (bindings ≤ 23). The pack-tail dispatch SEEDING + the enumerate/pack counts live in
+// the separate `seed_frame` pass below, so a diff-ONLY driver (the diff parity gate) need not bind the pack
+// buffers. The full G-c.3 frame runs `seed_frame` + `diff_release_quarantine` + `clear_per_frame_hashes` at the
+// top of every frame.
 @compute @workgroup_size(1)
 fn diff_release_quarantine() {
     let q_head = atomicLoad(&quarantine_ctrl[0]);
@@ -726,6 +732,70 @@ fn diff_release_quarantine() {
     // Clear the per-frame enter/drop counts.
     atomicStore(&enter_count, 0u);
     atomicStore(&drop_count, 0u);
+}
+
+// --- Pass A0 (`seed_frame`) — clear the enumerate/pack per-frame COUNTS + SEED the GPU-written indirect dispatch
+//     buffers to `(0, 1, 1)` (the G-c.3 self-gating zero). ---
+// Run as ONE invocation at the TOP of a full G-c.3 frame (before B0/B/C/D), so a persistent-buffer multi-frame
+// drive needs NO host re-zero of any count or dispatch between frames.
+//
+// **G-c.3 self-gating (docs/PHASE_G_GC_PLAN.md §3.1):** every GPU-written dispatch-indirect buffer is seeded to
+// `(0,1,1)` here; Passes B0/B/D then `atomicMax` each dispatch's X up to the work they actually find. So on a
+// CONVERGED frame (0 enter + 0 drop ⇒ 0 dirty keys ⇒ 0 pack/aabb/classify commands) the dispatch buffers STAY
+// `(0,1,1)`, and the `record_indirect` pack tail (classify_brick / pack_brick / write_aabb) launches ZERO
+// workgroups at ~0 GPU cost — NO CPU branch, NO readback. Seeded on the GPU timeline (re-flora warns NEVER on the
+// host, surface/mod.rs:624-629), so the whole front end is one readback-free dependency chain, idempotent for a
+// static camera: same `ResidencyParams` ⇒ same candidate set ⇒ 0 enter + 0 drop ⇒ change_count == 0 ⇒ idle tail.
+@compute @workgroup_size(1)
+fn seed_frame() {
+    atomicStore(&shell_count, 0u);
+    atomicStore(&candidate_count, 0u);
+    atomicStore(&desired_count, 0u);
+    atomicStore(&dirty_count, 0u);
+    atomicStore(&pack_count, 0u);
+    atomicStore(&aabb_count, 0u);
+    atomicStore(&shell_dispatch[0], 0u);
+    atomicStore(&shell_dispatch[1], 1u);
+    atomicStore(&shell_dispatch[2], 1u);
+    atomicStore(&classify_dispatch[0], 0u);
+    atomicStore(&classify_dispatch[1], 1u);
+    atomicStore(&classify_dispatch[2], 1u);
+    atomicStore(&pack_dispatch[0], 0u);
+    atomicStore(&pack_dispatch[1], 1u);
+    atomicStore(&pack_dispatch[2], 1u);
+    atomicStore(&aabb_dispatch[0], 0u);
+    atomicStore(&aabb_dispatch[1], 1u);
+    atomicStore(&aabb_dispatch[2], 1u);
+}
+
+// --- Pass A2 — parallel clear of the per-frame HASHES (present_flag + dirty_flag) + the change_count signal. ---
+// `present_flag` and `dirty_flag` are open-addressing hashes rebuilt every frame, so their `lod` words must be
+// reset to EMPTY_LOD at the top of the frame. They are too large for the single-threaded Pass A, so this is a
+// SEPARATE parallel pass (one invocation per MAX(present, dirty) slot). It ALSO zeroes `change_count` (the G-c.4
+// mirror signal) on invocation 0 so a stale value never leaks into the out-of-band read. GPU-timeline, readback-
+// free — the persistent-buffer drive calls this each frame instead of re-uploading zeroed hashes from the host.
+@compute @workgroup_size(64)
+fn clear_per_frame_hashes(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    if (i == 0u) {
+        atomicStore(&change_count, 0u);
+    }
+    if (i < diff_cfg.present_size) {
+        atomicStore(&present_flag[i * PRESENT_WORDS + 3u], EMPTY_LOD);
+    }
+    // dirty_flag is sized = slot_table_size (>= resident set); its stride is 4 words ([x,y,z,lod]).
+    if (i < diff_cfg.slot_table_size) {
+        atomicStore(&dirty_flag[i * 4u + 3u], EMPTY_LOD);
+    }
+}
+
+// --- Pass C-tail — publish the change_count signal (G-c.4's non-blocking, 1-frame-late CPU mirror reads this). ---
+// `change_count = enter_count + drop_count` is the idempotency signal. A dedicated single-invocation pass writes
+// it into the `change_count` buffer AFTER Pass C1/C2 so a `COPY_SRC` staging copy + `map_async` (built but NOT
+// wired to gate the AS build here — that is G-c.4) can read it out-of-band. Static camera ⇒ change_count == 0.
+@compute @workgroup_size(1)
+fn write_change_count() {
+    atomicStore(&change_count, atomicLoad(&enter_count) + atomicLoad(&drop_count));
 }
 
 // **Pass C1 — enter scan.** One invocation per candidate (the surface resident-target set). If `slot_table[key]`
@@ -1259,6 +1329,12 @@ fn pack_build_neighbours(@builtin(global_invocation_id) gid: vec3<u32>) {
 // straight + a resident AabbCommand. Mirror of `emit_pack_command`. `classify_out` is bound at the SAME binding
 // as `voxel_pack.wgsl::classify_out` (binding 47 here) so the pass reads it without a readback.
 @group(0) @binding(47) var<storage, read> classify_out: array<u32>;
+
+// **G-c.3 — the change_count signal buffer** (`docs/PHASE_G_GC_PLAN.md` §3.1). A single-`u32` storage buffer the
+// `write_change_count` pass publishes `enter_count + drop_count` into, and `clear_per_frame_hashes` zeroes at the
+// top of the frame. G-c.4's non-blocking 1-frame-late CPU mirror will `map_async` a `COPY_SRC` staging copy of it
+// to decide whether to RECORD the AS build (no indirect AS on the fork). NOT wired to gate the AS build here.
+@group(0) @binding(48) var<storage, read_write> change_count: atomic<u32>;
 @compute @workgroup_size(64)
 fn pack_build_commands(@builtin(global_invocation_id) gid: vec3<u32>) {
     let i = gid.x;
