@@ -88,11 +88,14 @@ pub struct VoxelRtToggle {
 
 impl Default for VoxelRtToggle {
     fn default() -> Self {
-        // HW-RT is the default (and only) renderer now — on at startup. GPU pack is ON by default — the
-        // GPU-driven re-pack (config 2: `update_gpu` + `apply_gpu_pack`, no readback) is trusted live
-        // (Sponza + Gallery confirmed correct). The GPU residency diff front end stays OFF by default
-        // (A/B-gated until its parity tests are trusted live on the streamed path).
-        Self { enabled: true, gpu_pack: true, gpu_residency: false }
+        // HW-RT is the default (and only) renderer now — on at startup. GPU pack + the readback-free GPU
+        // residency FRONT END are both ON by default: the front end moves the residency gather + pack + BLAS
+        // build fully onto the GPU (eliminating the CPU `vox_pack_update`/`vox_blas_delta` load-time hitches),
+        // and is proven live on Sponza + the (eager, in-RAM) Gallery. It drives ONLY streamed scenes with a
+        // valid camera (a static scene like Cornell skips it → CPU path). The DEMAND-PAGED stores
+        // (`ADVENTURE_GPU_PAGED_DRIVE`, for out-of-RAM scenes like Bistro) stay env-gated OFF — this default
+        // uses the eager full in-RAM stores. `gpu_residency` IMPLIES `gpu_pack`.
+        Self { enabled: true, gpu_pack: true, gpu_residency: true }
     }
 }
 
