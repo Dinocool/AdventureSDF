@@ -869,6 +869,23 @@ fn stream_voxel_rt_residency(
     // light gather) and the pack below use that registry — never the worldgen one — or the colours would be
     // wrong.
     let scene_now = *scene;
+    // CPU-PACK GATE INPUT — will the readback-free GPU residency FRONT END actually OWN streaming this epoch?
+    // The gate below skips the CPU re-pack ONLY when the front end genuinely drives, so it must mirror exactly the
+    // render-world `drive_gpu_residency_front_end` decision (else the CPU pack is cut off while NOTHING streams —
+    // the partial-load regression, see commit 25f56074). The front end drives this scene iff `gpu_residency` is on
+    // AND it has a residency store bound for THIS epoch:
+    //   * EAGER store — built ONLY for the IN-RAM static scenes (Sponza / the legacy `.vox` Gallery): both
+    //     `gpu_residency` + `gpu_core_store` are `Some` for the current epoch (see the G-c.0/2b build on the switch).
+    //   * PAGED store — the STREAMED `.vxo` path (the default Gallery / Bistro) carries NO eager store; its
+    //     demand-paged drive is OPT-IN behind `ADVENTURE_GPU_PAGED_DRIVE` (KNOWN-FAILING render today, so OFF by
+    //     default). Without the env set, the streamed front end does NOT drive → the CPU pack MUST keep packing.
+    // So for the default streamed `.vxo` Gallery, `front_end_will_drive == false` and the CPU re-pack streams the
+    // whole scene in (as it did before the gate). The eager in-RAM scenes keep the gate's spike-reduction.
+    let eager_store_ready = streaming.gpu_residency.as_ref().is_some_and(|(e, _)| *e == streaming.epoch)
+        && streaming.gpu_core_store.as_ref().is_some_and(|(e, _)| *e == streaming.epoch);
+    let paged_drive_ready =
+        std::env::var("ADVENTURE_GPU_PAGED_DRIVE").is_ok() && streaming.gallery_vxo.is_some();
+    let front_end_will_drive = toggle.gpu_residency && (eager_store_ready || paged_drive_ready);
     let VoxelRtStreaming {
         manager,
         cfg,
@@ -958,15 +975,21 @@ fn stream_voxel_rt_residency(
     *worldgen_frames_since_pack = worldgen_frames_since_pack.saturating_add(1);
     let settled = manager.pending() == 0;
     // CPU-PACK GATE (audit finding / trace-confirmed: `vox_pack_update_gpu` ~3.79 s over 38 calls on a Gallery
-    // load). When the readback-free GPU residency front end drives this scene, the GPU owns residency AND the
+    // load). When the readback-free GPU residency front end DRIVES this scene, the GPU owns residency AND the
     // pool, so this CPU re-pack would only produce an upload the render world SKIPS (`front_end_active` gates the
-    // apply) — pure wasted work + the streaming spikes. Skip it once the epoch's pool is allocated. The one-time
-    // StreamSnapshot MUST still run on the CPU (it allocates the fixed-cap pool + BLAS topology + initial NEE
-    // lights that the front end writes INTO), so `!epoch_snapshotted` keeps that first pack. The cheap source
-    // drain above still runs (keeps the resident-set mirror warm for stats / a toggle-off flip).
-    // FOLLOW-UP: NEE lights are built only at the snapshot here; emitters that stream in AFTER the cold-fill won't
-    // refresh the light list until front-end light derivation lands. Fine for the Gallery (scenes cold-fill ~fully).
-    let front_end_drives = toggle.gpu_residency && *epoch_snapshotted;
+    // apply) — pure wasted work + the streaming spikes. So skip it ONLY once two things hold:
+    //   1. the front end will ACTUALLY drive this scene (`front_end_will_drive`, computed above — mirrors the
+    //      render-world `drive_gpu_residency_front_end` decision: `gpu_residency` on AND an eager OR paged store
+    //      bound for this epoch). For the default streamed `.vxo` Gallery this is FALSE (no eager store + paged
+    //      drive opt-in), so the CPU pack keeps streaming the whole scene in — fixing the partial-load regression.
+    //   2. the epoch's pool is already allocated (`epoch_snapshotted`) — the one-time StreamSnapshot MUST still run
+    //      on the CPU (it allocates the fixed-cap pool + BLAS topology + initial NEE lights the front end writes
+    //      INTO), so `!epoch_snapshotted` always keeps that first pack.
+    // The cheap source drain above still runs (keeps the resident-set mirror warm for stats / a toggle-off flip).
+    // FOLLOW-UP: when the front end DOES drive (eager in-RAM scenes today), NEE lights are built only at the
+    // snapshot; emitters that stream in AFTER the cold-fill won't refresh the light list until front-end light
+    // derivation lands. Fine for those scenes (they cold-fill ~fully).
+    let front_end_drives = front_end_will_drive && *epoch_snapshotted;
     if *worldgen_dirty_pending
         && (settled || *worldgen_frames_since_pack >= WORLDGEN_REPACK_INTERVAL)
         && !front_end_drives
