@@ -575,14 +575,13 @@ fn trace_one() {
         if (trace_occluded(origin, to_sun, 0.0, 1.0e4)) {
             shadowed = 1u;
         }
-        // Direct term (AO-modulated ambient + shadowed sun), the indirect single-bounce GI (× albedo), and
-        // the surface's own emissive glow — separated so the GI oracle can assert each independently. A fixed
-        // seed keeps the headless GI estimate reproducible.
+        // Direct term (shadowed sun only — NO flat ambient, matching the live `shade`), the indirect
+        // single-bounce GI (× albedo), and the surface's own emissive glow — separated so the GI oracle can
+        // assert each independently. A fixed seed keeps the headless GI estimate reproducible.
         let ndotl = max(dot(r.normal, to_sun), 0.0);
         var shadow = 1.0;
         if (shadowed == 1u) { shadow = 0.0; }
-        let ao = ambient_occlusion(origin, r.normal);
-        direct = r.color.rgb * (light.ambient_color * ao + light.sun_color * (light.sun_intensity * ndotl * shadow));
+        direct = r.color.rgb * (light.sun_color * (light.sun_intensity * ndotl * shadow));
         indirect = gather_gi(r.normal, p, 12345u) * r.color.rgb;
         emissive_out = r.emissive * light.emissive_strength;
     }
@@ -785,7 +784,11 @@ fn direct_lighting(albedo: vec3<f32>, n: vec3<f32>, p: vec3<f32>) -> vec3<f32> {
         }
     }
     let direct = light.sun_color * (light.sun_intensity * ndotl * shadow);
-    return albedo * (light.ambient_color + direct);
+    // No flat ambient_color: the fill light at this (bounce-)hit comes from the sun + the surface's own
+    // emissive + further bounces, matching Solari. Adding a flat ambient here double-counted the indirect/sky
+    // term AND polluted the world cache (this feeds world_cache_update + gather_gi bounce hits → compounded
+    // across bounces). Occluded points correctly go dark.
+    return albedo * direct;
 }
 
 // The sky radiance a MISSED diffuse bounce returns (a bounce that escapes to open sky), scaled by
@@ -902,14 +905,15 @@ fn shade(albedo: vec3<f32>, n: vec3<f32>, p: vec3<f32>, emissive: vec3<f32>, see
             shadow = 0.0;
         }
     }
-    let ao = ambient_occlusion(origin, n);
-    let ambient = light.ambient_color * ao;
     let direct = light.sun_color * (light.sun_intensity * ndotl * shadow);
     // Indirect single-bounce GI: gathered irradiance × this surface's albedo (Lambertian reflection).
     let indirect = gather_gi(n, p, seed) * albedo;
     // The surface's own emissive glow (so an emitter block visibly lights up, not just its neighbours).
     let glow = emissive * light.emissive_strength;
-    return albedo * (ambient + direct) + indirect + glow;
+    // No flat ambient term: ambient/sky fill comes from GI bounces (bounce_sky on a miss) + multi-bounce,
+    // matching Solari (which has no ambient/AO in its lit equation). Occluded areas going dark is correct —
+    // the old `albedo * ambient_color * ao` double-counted the indirect light.
+    return albedo * direct + indirect + glow;
 }
 
 // Distinct, high-contrast colour per LOD ring for the LOD debug view (`debug_view == 7`). Cycles a small
@@ -1709,12 +1713,11 @@ fn shade_restir_p2(albedo: vec3<f32>, n: vec3<f32>, p: vec3<f32>, emissive: vec3
             shadow = 0.0;
         }
     }
-    let ao = ambient_occlusion(origin, n);
-    let ambient = light.ambient_color * ao;
     let direct = light.sun_color * (light.sun_intensity * ndotl * shadow);
     let indirect = restir_p2_core(n, p, pix, seed) * albedo;
     let glow = emissive * light.emissive_strength;
-    return albedo * (ambient + direct) + indirect + glow;
+    // No flat ambient (see `shade`): the ReSTIR GI provides the fill; occluded → dark, matching Solari.
+    return albedo * direct + indirect + glow;
 }
 
 // Screen-space reprojection: the previous-frame pixel that the world point `p` projected to, using the
