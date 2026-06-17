@@ -177,7 +177,7 @@ fn readback_u32(device: &wgpu::Device, queue: &wgpu::Queue, buf: &wgpu::Buffer, 
 /// the shader reads (24 B / 16 B). A drift here would silently mis-stride the GPU read — catch it explicitly.
 #[test]
 fn gpu_struct_strides_match_wgsl() {
-    assert_eq!(std::mem::size_of::<GpuSectorEntry>(), 24, "SectorEntry must be 6×u32 = 24 B");
+    assert_eq!(std::mem::size_of::<GpuSectorEntry>(), 32, "SectorEntry must be 8×u32 = 32 B");
     assert_eq!(std::mem::size_of::<GpuResidencyHeader>(), 16, "ResidencyHeader must be 4×u32 = 16 B");
     assert_eq!(std::mem::size_of::<QueryKey>(), 16, "QueryKey must be 4×u32 = 16 B");
 }

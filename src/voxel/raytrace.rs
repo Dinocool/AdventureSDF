@@ -654,7 +654,7 @@ fn stream_voxel_rt_residency(
         let occ_source: Option<&StaticVoxSource> =
             streaming.sponza_source.as_ref().or(streaming.gallery_source.as_ref());
         streaming.gpu_residency = occ_source.map(|src| {
-            let occ = super::residency_gpu::SectorOccupancy::from_occupied(src.occupied_keys());
+            let occ = super::residency_gpu::SectorOccupancy::from_occupied_full(src.occupied_keys_full());
             debug!(
                 "voxel-RT G-c.0: built GPU occupancy — {} occupied bricks in {} sectors, table_size {}",
                 occ.occupied_bricks(),

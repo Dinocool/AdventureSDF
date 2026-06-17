@@ -75,6 +75,45 @@ pub fn headless_device(required: wgpu::Features) -> Option<(wgpu::Device, wgpu::
     .ok()
 }
 
+/// A headless wgpu device (no special features) whose compute-workgroup limits are RAISED so a pipeline using
+/// `@workgroup_size` larger than wgpu's default 256 can be created — mirroring the renderer's `wgpu_settings()`
+/// bump (`max_compute_invocations_per_workgroup` / `max_compute_workgroup_size_x` to 1024). The G-c.1 enumerate
+/// pass dispatches one 8³ = 512-thread workgroup per solid WG-cell, so its parity test needs this. Returns
+/// `None` (caller skips) if no adapter is present or it can't reach the requested invocation limit.
+pub fn headless_device_with_compute_limits(min_invocations: u32) -> Option<(wgpu::Device, wgpu::Queue)> {
+    let instance = wgpu::Instance::default();
+    let adapter = block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+        power_preference: wgpu::PowerPreference::HighPerformance,
+        force_fallback_adapter: false,
+        compatible_surface: None,
+        ..Default::default()
+    }))
+    .ok()?;
+    let info = adapter.get_info();
+    eprintln!(
+        "GPU adapter: name={:?} backend={:?} device_type={:?}",
+        info.name, info.backend, info.device_type
+    );
+    if adapter.limits().max_compute_invocations_per_workgroup < min_invocations {
+        eprintln!(
+            "adapter max_compute_invocations_per_workgroup {} < {min_invocations} — skipping",
+            adapter.limits().max_compute_invocations_per_workgroup
+        );
+        return None;
+    }
+    let mut limits = wgpu::Limits::default();
+    limits.max_compute_invocations_per_workgroup =
+        limits.max_compute_invocations_per_workgroup.max(min_invocations);
+    limits.max_compute_workgroup_size_x = limits.max_compute_workgroup_size_x.max(min_invocations);
+    block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+        label: Some("sdf_test_device_compute_limits"),
+        required_features: wgpu::Features::empty(),
+        required_limits: limits,
+        ..Default::default()
+    }))
+    .ok()
+}
+
 /// A headless wgpu device with `EXPERIMENTAL_RAY_QUERY` enabled (AABB-BLAS `ray_query`), mirroring the
 /// device setup in `D:/spike-aabb`: the experimental feature flag, the minimum acceleration-structure
 /// limits, and `ExperimentalFeatures::enabled()` (which wgpu-trunk requires at device creation for the

@@ -104,12 +104,16 @@ pub fn sector_hash(sector: IVec3, lod: u32) -> u32 {
     h
 }
 
-/// One sector record in the GPU open-addressing hash table. `lod == `[`EMPTY_LOD`] marks a FREE slot. 24 bytes,
-/// `bytemuck`-uploadable. The WGSL mirror reads the same 6 `u32` stride.
+/// One sector record in the GPU open-addressing hash table. `lod == `[`EMPTY_LOD`] marks a FREE slot. 32 bytes,
+/// `bytemuck`-uploadable. The WGSL mirror reads the same 8 `u32` stride.
 ///
-/// `mask_lo`/`mask_hi` are the low/high 32 bits of the 64-bit alloc mask — bit `b` (`= `[`sector_bit_index`])
-/// is set ⇔ the `(sector·SECTOR_EDGE + local, lod)` brick is occupied. Split as `2×u32` because WGSL storage
-/// buffers have no `u64`.
+/// `mask_lo`/`mask_hi` are the low/high 32 bits of the 64-bit OCCUPANCY (presence) mask — bit `b`
+/// (`= `[`sector_bit_index`]) is set ⇔ the `(sector·SECTOR_EDGE + local, lod)` brick is OCCUPIED (present).
+/// `full_lo`/`full_hi` are the same split of the 64-bit FULL mask — bit `b` set ⇔ that brick is present AND
+/// fully solid ([`Brick::is_full`](super::brickmap::Brick::is_full)). The face-cull (Pass B / G-c.1) needs BOTH
+/// to mirror [`super::source::BrickSource::classify`] EXACTLY: `Interior` (occluded) iff the brick AND all 6
+/// face-neighbours are FULL, so a present-but-PARTIAL brick is always `Surface`. Masks split as `2×u32` because
+/// WGSL storage buffers have no `u64`. `full ⊆ occupancy` by construction (a brick is full only if present).
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Pod, Zeroable)]
 pub struct GpuSectorEntry {
@@ -119,10 +123,14 @@ pub struct GpuSectorEntry {
     pub sector_z: i32,
     /// The LOD level this sector lives at (`0..=MAX_LOD`), or [`EMPTY_LOD`] for a free slot.
     pub lod: u32,
-    /// Low 32 bits of the 64-bit occupancy mask.
+    /// Low 32 bits of the 64-bit OCCUPANCY (presence) mask.
     pub mask_lo: u32,
-    /// High 32 bits of the 64-bit occupancy mask.
+    /// High 32 bits of the 64-bit OCCUPANCY (presence) mask.
     pub mask_hi: u32,
+    /// Low 32 bits of the 64-bit FULL (fully-solid) mask — a subset of the occupancy mask.
+    pub full_lo: u32,
+    /// High 32 bits of the 64-bit FULL (fully-solid) mask — a subset of the occupancy mask.
+    pub full_hi: u32,
 }
 
 /// The small uniform/header the WGSL helper needs to address the table: the slot count (a power of two, so the
@@ -143,6 +151,11 @@ pub trait OccupancyOracle {
     /// True iff the brick at `(coord, lod)` is occupied (present in the source's brick set at that LOD).
     fn is_occupied(&self, coord: IVec3, lod: u32) -> bool;
 
+    /// True iff the brick at `(coord, lod)` is present AND FULLY SOLID
+    /// ([`Brick::is_full`](super::brickmap::Brick::is_full)) — the input the GPU face-cull needs to reproduce
+    /// [`BrickSource::classify`]'s `Interior` test. `false` for an absent or partial brick.
+    fn is_full(&self, coord: IVec3, lod: u32) -> bool;
+
     /// The CANDIDATE bricks (a SUPERSET of the occupied set) intersecting the inclusive brick-coord box
     /// `[lo, hi]` at `lod` — the build enumerates these and keeps the [`is_occupied`](Self::is_occupied) ones.
     /// For a [`BrickSource`] this is `surface_bricks_in` (the sparse stored set clipped to the box), so the
@@ -156,6 +169,18 @@ impl<S: BrickSource + ?Sized> OccupancyOracle for S {
     #[inline]
     fn is_occupied(&self, coord: IVec3, lod: u32) -> bool {
         self.classify(coord, lod) != BrickClass::Air
+    }
+
+    /// PRESENCE-ONLY conservative full bit: the generic [`BrickSource`] cannot report a brick's `is_full`
+    /// without voxelizing it (and the trait carries no registry), so this returns `false` — i.e.
+    /// [`from_oracle`](SectorOccupancy::from_oracle) builds a presence-only occupancy with an all-zero FULL
+    /// mask (no brick is `Interior`-eligible). That is correct but CONSERVATIVE for the face-cull (it never
+    /// culls a buried brick). The exact-`classify` producers — the live [`StaticVoxSource`] build and the
+    /// enumerate-parity gate — use [`StaticVoxSource::occupied_keys_full`](super::source::StaticVoxSource::occupied_keys_full)
+    /// → [`from_occupied_full`](SectorOccupancy::from_occupied_full), which carries the real per-brick `is_full`.
+    #[inline]
+    fn is_full(&self, _coord: IVec3, _lod: u32) -> bool {
+        false
     }
 
     #[inline]
@@ -180,28 +205,45 @@ pub struct SectorOccupancy {
 }
 
 impl SectorOccupancy {
-    /// Build the sparse sector tables from an explicit set of occupied `(coord, lod)` bricks. The lower-level
-    /// SSOT both [`from_oracle`](Self::from_oracle) and the parity test feed — so the test can build from a
-    /// known map without a [`BrickSource`]. Sectors are accumulated into a temporary `(sector, lod) -> mask`
-    /// map, then laid into a power-of-two open-addressing table sized for [`LOAD_FACTOR`].
+    /// Build the sparse sector tables from an explicit set of occupied `(coord, lod)` bricks, with NO `full`
+    /// information — every brick's FULL bit is left 0 (treated as PARTIAL). A presence-only convenience for
+    /// callers that only query [`is_occupied`](Self::is_occupied) / [`sector_any_occupied`](Self::sector_any_occupied)
+    /// (those ignore the full mask). With an all-zero full mask the face-cull would never classify any brick
+    /// `Interior` (every present brick is `Surface`) — so callers that need exact [`classify`](super::source::BrickSource::classify)
+    /// parity MUST instead use [`from_occupied_full`](Self::from_occupied_full) with the per-brick `is_full` flag.
     pub fn from_occupied(occupied: impl IntoIterator<Item = (IVec3, u32)>) -> Self {
+        Self::from_occupied_full(occupied.into_iter().map(|(c, l)| (c, l, false)))
+    }
+
+    /// Build the sparse sector tables from an explicit set of `(coord, lod, is_full)` bricks — the FULL SSOT
+    /// both [`from_oracle`](Self::from_oracle) and the parity test feed. `is_full` is the brick's
+    /// [`Brick::is_full`](super::brickmap::Brick::is_full): set its bit in the FULL mask too, so the GPU
+    /// face-cull can reproduce [`classify`](super::source::BrickSource::classify)'s `Interior` test (fully-solid
+    /// brick + fully-solid 6 face-neighbours) EXACTLY. Sectors are accumulated into a temporary
+    /// `(sector, lod) -> (occ_mask, full_mask)` map, then laid into a power-of-two open-addressing table sized
+    /// for [`LOAD_FACTOR`]. A brick passed `is_full == true` is ALSO marked occupied (full ⊆ occupancy).
+    pub fn from_occupied_full(occupied: impl IntoIterator<Item = (IVec3, u32, bool)>) -> Self {
         use rustc_hash::FxHashMap;
-        let mut masks: FxHashMap<(IVec3, u32), u64> = FxHashMap::default();
-        for (coord, lod) in occupied {
+        let mut masks: FxHashMap<(IVec3, u32), (u64, u64)> = FxHashMap::default();
+        for (coord, lod, is_full) in occupied {
             debug_assert!(lod <= MAX_LOD, "occupancy lod {lod} exceeds MAX_LOD {MAX_LOD}");
             let (sector, local) = split_sector(coord);
             let bit = sector_bit_index(local);
-            *masks.entry((sector, lod)).or_insert(0) |= 1u64 << bit;
+            let e = masks.entry((sector, lod)).or_insert((0, 0));
+            e.0 |= 1u64 << bit; // occupancy (presence)
+            if is_full {
+                e.1 |= 1u64 << bit; // full (fully solid)
+            }
         }
         Self::from_sector_masks(masks)
     }
 
-    /// Lay a `(sector, lod) -> mask` map into the power-of-two open-addressing table (linear probing on
-    /// [`sector_hash`]). An EMPTY table (no occupied sectors) is still given ONE empty slot so the GPU buffer is
-    /// non-zero-length + every probe immediately misses (every `is_occupied` ⇒ false).
-    fn from_sector_masks(masks: rustc_hash::FxHashMap<(IVec3, u32), u64>) -> Self {
+    /// Lay a `(sector, lod) -> (occ_mask, full_mask)` map into the power-of-two open-addressing table (linear
+    /// probing on [`sector_hash`]). An EMPTY table (no occupied sectors) is still given ONE empty slot so the
+    /// GPU buffer is non-zero-length + every probe immediately misses (every `is_occupied` ⇒ false).
+    fn from_sector_masks(masks: rustc_hash::FxHashMap<(IVec3, u32), (u64, u64)>) -> Self {
         let n = masks.len();
-        let occupied_bricks: u64 = masks.values().map(|m| m.count_ones() as u64).sum();
+        let occupied_bricks: u64 = masks.values().map(|(occ, _)| occ.count_ones() as u64).sum();
         // table_size = next power of two of n / LOAD_FACTOR, at least 1.
         let target = ((n as f64) / LOAD_FACTOR).ceil() as usize;
         let table_size = target.max(1).next_power_of_two();
@@ -213,11 +255,13 @@ impl SectorOccupancy {
                 lod: EMPTY_LOD,
                 mask_lo: 0,
                 mask_hi: 0,
+                full_lo: 0,
+                full_hi: 0,
             };
             table_size
         ];
         let mask_bits = (table_size - 1) as u32;
-        for ((sector, lod), mask) in masks {
+        for ((sector, lod), (occ, full)) in masks {
             let mut slot = (sector_hash(sector, lod) & mask_bits) as usize;
             // Linear probe to the first free slot (the table is < 100% full by construction, so this terminates).
             while entries[slot].lod != EMPTY_LOD {
@@ -228,8 +272,10 @@ impl SectorOccupancy {
                 sector_y: sector.y,
                 sector_z: sector.z,
                 lod,
-                mask_lo: mask as u32,
-                mask_hi: (mask >> 32) as u32,
+                mask_lo: occ as u32,
+                mask_hi: (occ >> 32) as u32,
+                full_lo: full as u32,
+                full_hi: (full >> 32) as u32,
             };
         }
         Self { entries, table_size: table_size as u32, occupied_bricks }
@@ -242,7 +288,7 @@ impl SectorOccupancy {
     /// runs ONCE at scene-load (or per `.vxo` region) — not per frame.
     pub fn from_oracle<O: OccupancyOracle + ?Sized>(oracle: &O, bounds: impl Fn(u32) -> (IVec3, IVec3)) -> Self {
         use rustc_hash::FxHashMap;
-        let mut masks: FxHashMap<(IVec3, u32), u64> = FxHashMap::default();
+        let mut masks: FxHashMap<(IVec3, u32), (u64, u64)> = FxHashMap::default();
         let mut candidates: Vec<IVec3> = Vec::new();
         for lod in 0..=MAX_LOD {
             let (lo, hi) = bounds(lod);
@@ -255,61 +301,100 @@ impl SectorOccupancy {
                 if oracle.is_occupied(coord, lod) {
                     let (sector, local) = split_sector(coord);
                     let bit = sector_bit_index(local);
-                    *masks.entry((sector, lod)).or_insert(0) |= 1u64 << bit;
+                    let e = masks.entry((sector, lod)).or_insert((0, 0));
+                    e.0 |= 1u64 << bit;
+                    if oracle.is_full(coord, lod) {
+                        e.1 |= 1u64 << bit;
+                    }
                 }
             }
         }
         Self::from_sector_masks(masks)
     }
 
-    /// The CPU mirror of the WGSL `is_occupied` — the SSOT the parity gate asserts GPU == CPU against. Hash the
-    /// brick's sector, linear-probe the table for a matching `(sector, lod)` slot, and test the brick's bit.
-    /// A free slot before a match ⇒ the sector is absent ⇒ NOT occupied (the probe terminates at the first free
-    /// slot, exactly as the build placed entries). Bounded by the table size (no infinite loop on a full miss
-    /// because the table is never 100% full).
-    pub fn is_occupied(&self, coord: IVec3, lod: u32) -> bool {
+    /// Probe the table for `(sector, lod)` and return its `(occupancy, full)` 64-bit masks, or `(0, 0)` if the
+    /// sector is absent — the SINGLE fetch every CPU query below derives from (the SSOT mirror of the WGSL
+    /// `sector_masks`). Hash the sector, linear-probe to the first matching slot; a free slot before a match ⇒
+    /// the sector is absent. Bounded by the table size (the build keeps it < 100% full, so an absent key always
+    /// hits a free slot first).
+    #[inline]
+    fn sector_masks(&self, sector: IVec3, lod: u32) -> (u64, u64) {
         if self.table_size == 0 {
-            return false;
+            return (0, 0);
         }
-        let (sector, local) = split_sector(coord);
-        let bit = sector_bit_index(local);
         let mask_bits = self.table_size - 1;
         let mut slot = (sector_hash(sector, lod) & mask_bits) as usize;
-        // Probe at most `table_size` slots — a full pass means the sector is absent (defensive; the build keeps
-        // the table < 100% full, so a free slot is always hit first for an absent key).
         for _ in 0..self.table_size {
             let e = &self.entries[slot];
             if e.lod == EMPTY_LOD {
-                return false; // first free slot ⇒ key absent
+                return (0, 0); // first free slot ⇒ key absent
             }
             if e.lod == lod && e.sector_x == sector.x && e.sector_y == sector.y && e.sector_z == sector.z {
-                let mask = (e.mask_lo as u64) | ((e.mask_hi as u64) << 32);
-                return (mask >> bit) & 1 != 0;
+                let occ = (e.mask_lo as u64) | ((e.mask_hi as u64) << 32);
+                let full = (e.full_lo as u64) | ((e.full_hi as u64) << 32);
+                return (occ, full);
             }
             slot = (slot + 1) & (mask_bits as usize);
         }
-        false
+        (0, 0)
+    }
+
+    /// The CPU mirror of the WGSL `is_occupied` — the SSOT the parity gate asserts GPU == CPU against. Test the
+    /// brick's presence bit in its sector's occupancy mask.
+    pub fn is_occupied(&self, coord: IVec3, lod: u32) -> bool {
+        let (sector, local) = split_sector(coord);
+        let bit = sector_bit_index(local);
+        let (occ, _full) = self.sector_masks(sector, lod);
+        (occ >> bit) & 1 != 0
+    }
+
+    /// The CPU mirror of the WGSL `is_full` — the brick is present AND fully solid. Test the brick's bit in its
+    /// sector's FULL mask. The face-cull (Pass B / [`classify_surface`](Self::classify_surface)) input.
+    pub fn is_full(&self, coord: IVec3, lod: u32) -> bool {
+        let (sector, local) = split_sector(coord);
+        let bit = sector_bit_index(local);
+        let (_occ, full) = self.sector_masks(sector, lod);
+        (full >> bit) & 1 != 0
+    }
+
+    /// The CPU mirror of the GPU Pass-B **6-face occlusion cull** — the SSOT the enumerate-parity gate asserts
+    /// GPU == CPU == [`StaticVoxSource::classify`](super::source::StaticVoxSource::classify) against. Returns
+    /// `true` iff `(coord, lod)` is a SURFACE brick: present, AND NOT fully occluded (NOT [`is_full`](Self::is_full)
+    /// itself, OR at least one of its 6 same-LOD face-neighbours is not `is_full`). EXACTLY reproduces
+    /// `classify == Surface` for any non-empty static scene (where every LOD maps 1:1 to a built pyramid level):
+    /// * absent ⇒ `false` (`classify` ⇒ `Air`),
+    /// * present & !full ⇒ `true` (`classify` ⇒ `Surface`, an internal air voxel exposes a face),
+    /// * present & full & some face-neighbour !full ⇒ `true` (an exposed face),
+    /// * present & full & all 6 face-neighbours full ⇒ `false` (`classify` ⇒ `Interior`, fully buried).
+    pub fn classify_surface(&self, coord: IVec3, lod: u32) -> bool {
+        if !self.is_occupied(coord, lod) {
+            return false; // absent ⇒ Air
+        }
+        if !self.is_full(coord, lod) {
+            return true; // present but partial ⇒ an internal air voxel exposes a face ⇒ Surface
+        }
+        // Fully solid: Surface iff ANY of the 6 face-neighbours is not fully solid (an exposed face); else Interior.
+        const N6: [IVec3; 6] = [
+            IVec3::new(1, 0, 0),
+            IVec3::new(-1, 0, 0),
+            IVec3::new(0, 1, 0),
+            IVec3::new(0, -1, 0),
+            IVec3::new(0, 0, 1),
+            IVec3::new(0, 0, -1),
+        ];
+        for off in N6 {
+            if !self.is_full(coord + off, lod) {
+                return true; // a non-full / absent neighbour ⇒ this face is exposed ⇒ Surface
+            }
+        }
+        false // all 6 face-neighbours full ⇒ no exposed face ⇒ Interior
     }
 
     /// The coarse "is ANY brick in this sector occupied?" — the §1 Pass B0 occupancy test, from the SAME fetch
-    /// as `is_occupied` (`mask != 0`). `sector` is the sector coord (`coord.div_euclid(SECTOR_EDGE)`).
+    /// as `is_occupied` (`occ != 0`). `sector` is the sector coord (`coord.div_euclid(SECTOR_EDGE)`).
     pub fn sector_any_occupied(&self, sector: IVec3, lod: u32) -> bool {
-        if self.table_size == 0 {
-            return false;
-        }
-        let mask_bits = self.table_size - 1;
-        let mut slot = (sector_hash(sector, lod) & mask_bits) as usize;
-        for _ in 0..self.table_size {
-            let e = &self.entries[slot];
-            if e.lod == EMPTY_LOD {
-                return false;
-            }
-            if e.lod == lod && e.sector_x == sector.x && e.sector_y == sector.y && e.sector_z == sector.z {
-                return e.mask_lo != 0 || e.mask_hi != 0;
-            }
-            slot = (slot + 1) & (mask_bits as usize);
-        }
-        false
+        let (occ, _full) = self.sector_masks(sector, lod);
+        occ != 0
     }
 
     /// The GPU header (the table size the WGSL probe masks with).
@@ -455,4 +540,90 @@ mod tests {
         assert!(!occ.is_occupied(IVec3::ZERO, 0));
         assert!(!occ.sector_any_occupied(IVec3::ZERO, 0));
     }
+
+    /// **G-c.1 — the CPU face-cull SSOT (`classify_surface`) reproduces `StaticVoxSource::classify == Surface`
+    /// EXACTLY**, including partial (non-full) bricks and the buried-Interior cull. Build a small map with a
+    /// fully-solid 3×3×3 block (its centre brick is Interior — full + 6 full neighbours), a PARTIAL surface
+    /// brick (one air voxel ⇒ always Surface even when surrounded), and isolated bricks; then assert
+    /// `occ.classify_surface == (source.classify == Surface)` over a dense sample at every LOD.
+    #[test]
+    fn classify_surface_matches_static_source_classify() {
+        use crate::voxel::brickmap::{BRICK_EDGE, Brick, BrickMap};
+        use crate::voxel::palette::BlockId;
+        use crate::voxel::source::{BrickClass, BrickSource, StaticVoxSource};
+
+        let full = |id: u16| {
+            let mut v = Box::new([BlockId::AIR; BRICK_VOXELS_LOCAL]);
+            for c in v.iter_mut() {
+                *c = BlockId(id);
+            }
+            Brick::from_voxels(v)
+        };
+        // A brick with exactly one interior air voxel — NOT full, so classify is always Surface.
+        let partial = |id: u16| {
+            let mut v = Box::new([BlockId(id); BRICK_VOXELS_LOCAL]);
+            v[0] = BlockId::AIR;
+            Brick::from_voxels(v)
+        };
+        let mut map = BrickMap::new();
+        // Fully-solid 3×3×3 ⇒ centre (1,1,1) is Interior (full + 6 full face-neighbours); the 26 shell bricks
+        // are Surface (each has ≥1 non-full / absent face-neighbour).
+        for z in 0..3 {
+            for y in 0..3 {
+                for x in 0..3 {
+                    map.insert(IVec3::new(x, y, z), full(1));
+                }
+            }
+        }
+        // A PARTIAL brick fully surrounded (a +6 of full neighbours), elsewhere: occupancy-occluded, but
+        // classify ⇒ Surface because the brick itself is NOT full — the partial-overrides-occlusion path.
+        let p = IVec3::new(9, 9, 9); // within the dense sample box below; isolated from the 3×3×3 block
+        map.insert(p, partial(2));
+        for off in [
+            IVec3::new(1, 0, 0),
+            IVec3::new(-1, 0, 0),
+            IVec3::new(0, 1, 0),
+            IVec3::new(0, -1, 0),
+            IVec3::new(0, 0, 1),
+            IVec3::new(0, 0, -1),
+        ] {
+            map.insert(p + off, full(5));
+        }
+        map.insert(IVec3::new(5, 6, 7), full(3)); // isolated ⇒ Surface
+        map.insert(IVec3::new(-3, 1, 4), full(4)); // negative-coord sector ⇒ Surface
+        let _ = BRICK_EDGE;
+
+        let source = StaticVoxSource::new(&map);
+        let occ = SectorOccupancy::from_occupied_full(source.occupied_keys_full());
+
+        let mut surface_seen = 0usize;
+        let mut interior_seen = 0usize;
+        for lod in 0..=MAX_LOD {
+            for z in -5..=11 {
+                for y in -5..=11 {
+                    for x in -5..=11 {
+                        let c = IVec3::new(x, y, z);
+                        let class = source.classify(c, lod);
+                        let want = class == BrickClass::Surface;
+                        if want {
+                            surface_seen += 1;
+                        }
+                        if class == BrickClass::Interior {
+                            interior_seen += 1;
+                        }
+                        assert_eq!(
+                            occ.classify_surface(c, lod),
+                            want,
+                            "classify_surface({c:?}@{lod}) disagreed with StaticVoxSource::classify ({class:?})"
+                        );
+                    }
+                }
+            }
+        }
+        assert!(surface_seen > 0, "the sample must contain Surface bricks");
+        assert!(interior_seen > 0, "the fully-solid block (with the centre swapped) must still yield Interior");
+    }
+
+    /// `BRICK_VOXELS` re-exported locally for the test brick builders.
+    const BRICK_VOXELS_LOCAL: usize = crate::voxel::brickmap::BRICK_VOXELS;
 }

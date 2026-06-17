@@ -173,6 +173,16 @@ fn level_box(cam_world: [f32; 3], lod: u32, half: i32) -> (IVec3, IVec3) {
     (IVec3::new(lx, ly, lz), IVec3::new(hx, hy, hz))
 }
 
+/// **Phase G "G-c.1"** — the PUBLIC accessor for the per-LOD [`level_box`] (the clipmap SSOT), so the GPU
+/// enumerate path ([`super::residency_gpu`] / `voxel_residency.wgsl`) can build its `ResidencyParams` uniform
+/// from the SAME tiling the CPU residency uses. Returns the inclusive `(lo, hi)` brick-coord box of level `lod`
+/// around the camera at `cam_world`, half-extent `half`. The GPU ports the identical snap (`& !1`/`| 1`) +
+/// `level_hole` math from this box, so GPU == CPU bit-for-bit.
+#[inline]
+pub fn level_box_pub(cam_world: [f32; 3], lod: u32, half: i32) -> (IVec3, IVec3) {
+    level_box(cam_world, lod, half)
+}
+
 /// The INCLUSIVE AABB (on grid `lod`) that level `lod` cedes to the FINER level `lod - 1`: the finer level's
 /// [`level_box`] footprint expressed on THIS grid (downsampled by 2). Because the finer box is
 /// `[even, odd]`-snapped, the downsample is EXACT — `[flo/2, (fhi-1)/2]` are whole coarse bricks, and their
@@ -313,6 +323,25 @@ pub fn desired_clipmap(cam_world: [f32; 3], cfg: &StreamingConfig) -> FxHashMap<
         }
     }
     out
+}
+
+/// **Phase G "G-c.1"** — the PUBLIC CPU SURFACE-set ORACLE the GPU enumerate-parity gate
+/// (`tests/voxel_gpu_enumerate_parity.rs`) asserts the GPU `candidate_list` equals EXACTLY: the
+/// `(coord, lod)` bricks in the desired clipmap TILING ([`desired_clipmap`]) that [`BrickSource::classify`]
+/// marks [`BrickClass::Surface`]. This is the ground-truth resident surface set (the same predicate the live
+/// [`ResidencyManager::update`] keeps resident, and what the GPU Pass B produces via `level_resident` + the
+/// 6-face cull). Identical to the private `cube_surface_set` test oracle, exposed for the GPU-vs-CPU gate.
+/// Use a small `clip_half` so the cube enumeration does not bail at [`MAX_CLIP_ENUMERATION`].
+pub fn desired_clipmap_surface_classified(
+    cam_world: [f32; 3],
+    cfg: &StreamingConfig,
+    source: &dyn BrickSource,
+) -> FxHashSet<BrickKey> {
+    desired_clipmap(cam_world, cfg)
+        .keys()
+        .filter(|k| matches!(source.classify(k.coord, k.lod), BrickClass::Surface))
+        .copied()
+        .collect()
 }
 
 /// Decompose the clipmap SHELL `[lo, hi] \ hole` (inclusive boxes) into up to SIX DISJOINT, hole-free

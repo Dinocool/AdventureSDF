@@ -421,6 +421,20 @@ impl StaticVoxSource {
             .flat_map(|(lod, map)| map.iter().map(move |(coord, _)| (*coord, lod as u32)))
     }
 
+    /// **Phase G "G-c.1"** — like [`occupied_keys`](Self::occupied_keys) but ALSO yields each brick's
+    /// `is_full()` flag (`(coord, lod, is_full)`). The GPU enumerate/face-cull (Pass B) needs BOTH the
+    /// presence bit AND the fully-solid bit to mirror [`StaticVoxSource::classify`] EXACTLY: a brick is
+    /// `Interior` (occluded, dropped) ONLY when it is fully solid AND all 6 same-LOD face-neighbours are fully
+    /// solid; a present-but-PARTIAL brick is always `Surface` regardless of its neighbours. So the GPU
+    /// occupancy stores a `full` mask beside the presence mask, populated from this — keeping GPU == CPU
+    /// `classify` exact even for partial surface bricks. Same Θ(stored bricks) walk of the pyramid keys.
+    pub fn occupied_keys_full(&self) -> impl Iterator<Item = (IVec3, u32, bool)> + '_ {
+        self.pyramid
+            .iter()
+            .enumerate()
+            .flat_map(|(lod, map)| map.iter().map(move |(coord, brick)| (*coord, lod as u32, brick.is_full())))
+    }
+
     /// True iff the world-voxel AABB `[wmin, wmax)` (in `pyramid[level]`'s own voxel coords) cannot contain
     /// any solid voxel of that level (so the brick covering it is air). Cheap conservative reject using the
     /// precomputed per-level bounds.
