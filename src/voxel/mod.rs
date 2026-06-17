@@ -41,6 +41,10 @@ pub mod residency_gpu;
 /// pipeline proven in `tests/voxel_gpu_residency_converge.rs`). Drives the residency DECISION + pack + AABB-fill
 /// on the GPU into the live scene pool, gated by the non-blocking change_count mirror. See `PHASE_G_GC_PLAN.md` §1/§3/§4.
 pub mod residency_front_end;
+/// Phase G "G-c.4-paging" — the STREAMED `.vxo` region PREFETCHER + the demand-paged GPU occupancy / core store
+/// that drive the GPU residency front end over a region-paged `.vxo` (Bistro), constant-RAM + readback-free. See
+/// `PHASE_G_GC_PLAN.md` §8.
+pub mod residency_pager;
 pub mod source;
 pub mod streaming;
 pub mod vox;

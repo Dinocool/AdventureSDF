@@ -179,6 +179,12 @@ pub struct VoxelRtResidencyUpload {
     /// `.vox` Gallery). `Arc`'d so the per-frame `ExtractResource` clone copies a handle, not the cores. `None`
     /// for a scene with no in-RAM source (worldgen / streamed `.vxo` — its per-region core paging is G-c.4).
     pub core_store: Option<(u64, std::sync::Arc<super::residency_gpu::BrickCoreStore>)>,
+    /// **Phase G "G-c.4-paging" (§8.4)** — `(epoch, MergedSource)`: the live STREAMED `.vxo` source for the
+    /// region prefetcher. Carried (cheap `Arc`) to the render world so [`prepare_voxel_rt`]'s prefetcher can,
+    /// camera-driven, page the present regions ∩ clipmap into the GROWABLE occupancy + the DEMAND-PAGED core store
+    /// — the path that drives the streamed Bistro on the GPU front end (no eager whole-scene build → constant-RAM).
+    /// `None` for an in-RAM scene (which uses the eager `occupancy`/`core_store` above) or worldgen.
+    pub streamed_source: Option<(u64, std::sync::Arc<MergedSource>)>,
 }
 
 /// **Phase G "G-c.4"** — the main→render-world per-frame hand-off for the LIVE GPU residency front end
@@ -258,7 +264,7 @@ pub struct VoxelRtStreaming {
     /// mip pyramid. Built ONCE on the Gallery switch (open + merge several `.vxo` headers; bricks stream lazily
     /// per shell demand) and reused every frame. `None` off Gallery, OR when no `.vxo` is baked (then the legacy
     /// [`gallery_source`](Self::gallery_source) over the `.vox` merge is used instead — the fallback).
-    gallery_vxo: Option<(MergedSource, BlockRegistry)>,
+    gallery_vxo: Option<(std::sync::Arc<MergedSource>, BlockRegistry)>,
     /// Which scene the last packed patch was built for. `None` until the first pack; on a scene switch this
     /// differs from the live [`VoxelScene`], triggering a one-shot re-pack of the new scene.
     packed_scene: Option<VoxelScene>,
@@ -638,7 +644,7 @@ fn stream_voxel_rt_residency(
                     "voxel-RT: streaming the GALLERY from {} `.vxo` asset(s) via MergedSource (bounded-RAM)",
                     placements.len()
                 );
-                streaming.gallery_vxo = Some((merged, registry));
+                streaming.gallery_vxo = Some((std::sync::Arc::new(merged), registry));
             }
         }
         // A static `.vox`/`.vxo`-backed scene whose source is MISSING or EMPTY (the asset(s) aren't baked):
@@ -767,6 +773,14 @@ fn stream_voxel_rt_residency(
         if let Some(upload) = residency_upload.as_mut() {
             upload.occupancy = streaming.gpu_residency.clone();
             upload.core_store = streaming.gpu_core_store.clone();
+            // Phase G "G-c.4-paging" — hand the live STREAMED `.vxo` MergedSource (Bistro / the `.vxo` Gallery) to
+            // the render world for the region prefetcher. ONLY the streamed `.vxo` path (not the in-RAM `.vox`
+            // fallback / Sponza, which use the eager occupancy/core above). `Arc` clone — a cheap handle, not a copy.
+            upload.streamed_source = if matches!(*scene, VoxelScene::Gallery) {
+                streaming.gallery_vxo.as_ref().map(|(src, _)| (switch_epoch, std::sync::Arc::clone(src)))
+            } else {
+                None
+            };
         }
         match *scene {
             VoxelScene::Sponza => {
@@ -903,7 +917,7 @@ fn stream_voxel_rt_residency(
             // pulls bricks lazily per shell demand (no full-RAM mip pyramid). Fall back to the legacy `.vox`
             // `StaticVoxSource` ONLY when no `.vxo` was present (the empty-everything case returned above).
             match gallery_vxo.as_ref() {
-                Some((merged, merged_registry)) => (merged as &dyn BrickSource, merged_registry),
+                Some((merged, merged_registry)) => (merged.as_ref() as &dyn BrickSource, merged_registry),
                 None => {
                     let (_, vox_registry) = gallery.as_ref().expect("gallery `.vox` merged before streaming");
                     let src = gallery_source.as_ref().expect("gallery `.vox` source built on the switch");
@@ -1476,6 +1490,13 @@ struct VoxelRtResources {
     /// The `(epoch)` the front end is currently bound to (matched against the live `gpu_residency_epoch`); a change
     /// triggers a `rebind_pool` (new scene pool + occupancy/core store). `None` ⇒ not bound (cold).
     gpu_front_end_epoch: Option<u64>,
+    /// **Phase G "G-c.4-paging"** — the STREAMED `.vxo` region PREFETCHER + its demand-paged GPU occupancy / core
+    /// store (`residency_pager.rs` §8). Present only for the live STREAMED scene (Bistro / the `.vxo` Gallery),
+    /// built from the extracted [`VoxelRtResidencyUpload::streamed_source`] on the scene/epoch switch. Each frame
+    /// the prefetcher pages the clipmap-covering present regions in/out (camera-driven, constant-RAM,
+    /// readback-free), and the front end binds to ITS occupancy + core buffers (not the eager in-RAM ones). `None`
+    /// for an in-RAM scene (Sponza / `.vox` Gallery — which use the eager `gpu_residency`/`gpu_core_store`).
+    streamed_pager: Option<super::residency_pager::StreamedResidencyPager>,
     /// Output storage texture (rgba16float) + view + size; reallocated on view resize.
     output: Option<(wgpu::Texture, wgpu::TextureView, UVec2)>,
     /// The TEMPORAL-ACCUMULATION history texture (rgba16float) + view: the previous frame's accumulated
@@ -3051,6 +3072,7 @@ fn prepare_voxel_rt(
         &render_queue,
         &mut resources,
         residency_params.as_deref(),
+        residency_upload.as_deref(),
     );
 
     let (Some(patch_res), Some(pipelines)) = (patch_res, pipelines) else {
@@ -3702,6 +3724,7 @@ fn drive_gpu_residency_front_end(
     render_queue: &RenderQueue,
     resources: &mut VoxelRtResources,
     params: Option<&VoxelRtResidencyParams>,
+    upload: Option<&VoxelRtResidencyUpload>,
 ) -> bool {
     if !toggle.enabled || !toggle.gpu_residency {
         // Toggle off: ensure the front end is unbound so a later flip-on cold-rebinds against the current scene.
@@ -3709,22 +3732,71 @@ fn drive_gpu_residency_front_end(
             fe.unbind();
             resources.gpu_front_end_epoch = None;
         }
+        resources.streamed_pager = None; // drop the pager so a flip-on rebuilds it against the current scene
         return false;
     }
     // Need a valid camera + a GPU-residency-eligible streamed scene this frame.
     let Some(params) = params.filter(|p| p.valid) else {
         return false;
     };
-    // Need the per-epoch occupancy + core store uploaded (built only for in-RAM scenes today; streamed `.vxo`
-    // per-region paging is the remaining piece). Without them the GPU front end cannot face-cull / halo-fill.
-    let (Some(_), Some(_)) = (resources.gpu_residency.as_ref(), resources.gpu_core_store.as_ref()) else {
-        return false;
-    };
-    // The occupancy/core epoch MUST match the live camera's epoch (a scene switch in flight — wait for the upload
-    // to catch up; otherwise we'd face-cull the new camera against the old scene's occupancy).
-    if resources.gpu_residency_epoch != Some(params.epoch) || resources.gpu_core_store_epoch != Some(params.epoch) {
+    let device = render_device.wgpu_device();
+    let queue = render_queue.0.as_ref();
+
+    // **Phase G "G-c.4-paging" (§8.4)** — pick the residency-store SOURCE for this epoch:
+    //  * an in-RAM scene (Sponza / `.vox` Gallery) carries the EAGER `gpu_residency`/`gpu_core_store` (G-c.0/2b);
+    //  * a STREAMED `.vxo` scene (Bistro / the `.vxo` Gallery) carries NO eager store — its occupancy + cores are
+    //    DEMAND-PAGED here by the prefetcher (the streamed source is extracted from the main world). Build/maintain
+    //    the pager for the live epoch; running its per-frame `update` pages the clipmap-covering present regions
+    //    in/out (camera-driven, constant-RAM, readback-free) BEFORE the front end records its frame.
+    // The streamed front-end DRIVE is opt-in (KNOWN-FAILING render — see the gate below); only build the pager when
+    // it is enabled, so the default streamed path pays nothing (no cold-fill) and falls back to the correct CPU pack.
+    let paged_drive_enabled = std::env::var("ADVENTURE_GPU_PAGED_DRIVE").is_ok();
+    let streamed_source = paged_drive_enabled
+        .then(|| upload.and_then(|u| u.streamed_source.as_ref()).filter(|(e, _)| *e == params.epoch))
+        .flatten();
+    if let Some((epoch, src)) = streamed_source {
+        // (Re)build the pager on an epoch change (a fresh streamed scene). The front-end pool must be ready first
+        // (we still rebind it below); building the pager early is fine — it only reads the source directories +
+        // allocates its own GPU stores.
+        let stale = resources.streamed_pager.as_ref().map(|p| p.epoch()) != Some(*epoch);
+        if stale {
+            resources.streamed_pager = Some(super::residency_pager::StreamedResidencyPager::new(
+                device,
+                queue,
+                std::sync::Arc::clone(src),
+                *epoch,
+                params.clip_half_bricks,
+                params.max_resident.max(1),
+            ));
+            resources.gpu_front_end_epoch = None; // force a rebind against the new pager stores
+            info!("voxel-RT G-c.4-paging: built the streamed region prefetcher for epoch {epoch}");
+        }
+    } else if resources.streamed_pager.is_some() {
+        // Switched away from a streamed scene — drop the pager (free its GPU stores).
+        resources.streamed_pager = None;
+        resources.gpu_front_end_epoch = None;
+    }
+
+    // The residency stores must be available for the live epoch — EITHER the eager in-RAM upload OR the streamed
+    // pager. Without either the GPU front end cannot face-cull / halo-fill, so wait (an in-flight scene switch).
+    let have_eager = resources.gpu_residency.is_some()
+        && resources.gpu_core_store.is_some()
+        && resources.gpu_residency_epoch == Some(params.epoch)
+        && resources.gpu_core_store_epoch == Some(params.epoch);
+    // **Phase G "G-c.4-paging" — KNOWN-FAILING streamed DRIVE, opt-in.** The prefetcher + paged stores are built
+    // + parity/unit-tested correct (occupancy + cores bit-identical to the eager oracle), but when the LIVE front
+    // end is DRIVEN by them it does NOT render the streamed Bistro correctly (it enters the full pool without
+    // face-culling and never converges → all-origin AABBs → a BLANK trace; see the report). The eager IN-RAM path
+    // (Sponza / `.vox` Gallery) renders + converges fine. So the streamed front-end drive is GATED OFF by default
+    // (the CPU pack renders streamed scenes correctly); `ADVENTURE_GPU_PAGED_DRIVE=1` opts INTO the experimental
+    // drive for further GPU-capture debugging. The eager drive is unaffected. (`paged_drive_enabled` is computed
+    // above where the pager build is gated on it.)
+    let have_paged =
+        paged_drive_enabled && resources.streamed_pager.as_ref().map(|p| p.epoch()) == Some(params.epoch);
+    if !have_eager && !have_paged {
         return false;
     }
+
     // The scene pool must be allocated + streamed for this epoch (a StreamSnapshot builds the BLAS topology the
     // front end writes into — it cannot create chunks). Wait for it.
     let Some(scene) = resources.scene.as_ref() else {
@@ -3734,7 +3806,25 @@ fn drive_gpu_residency_front_end(
         return false;
     }
 
-    let device = render_device.wgpu_device();
+    // Run the prefetcher this frame (streamed path only): page the clipmap-covering present regions in/out. On a
+    // crossing it rebuilds the whole occupancy (~MB) + incrementally pages cores — the constant-RAM, readback-free
+    // replacement for the 317 ms CPU classify. A `take_needs_rebind` after construction forces the front-end
+    // rebind below to bind the pager's freshly-allocated stores.
+    if have_paged {
+        let pager = resources.streamed_pager.as_mut().expect("checked have_paged");
+        let _p = info_span!("vox_residency_prefetch").entered();
+        let crossed = pager.update(queue, params.cam_world);
+        if crossed {
+            debug!(
+                "voxel-RT G-c.4-paging: region crossing — {} resident regions, {} resident cores",
+                pager.resident_region_count(),
+                pager.resident_core_count()
+            );
+        }
+        if pager.take_needs_rebind() {
+            resources.gpu_front_end_epoch = None; // bind the pager's stores into the front end below
+        }
+    }
 
     // Lazily build the persistent front end (once). Its pool buffers are (re)bound below; the slot table / slab
     // allocators / dispatch buffers persist across frames here.
@@ -3750,19 +3840,54 @@ fn drive_gpu_residency_front_end(
         );
     }
 
-    // (Re)bind the front end to the CURRENT scene pool + per-epoch occupancy/core store on an epoch change (a
-    // scene switch / fresh stream). Cold-resets the persistent diff state so the new scene streams in clean.
+    // (Re)bind the front end to the CURRENT scene pool + the residency stores (eager OR paged) on an epoch change
+    // (a scene switch / fresh stream) or when the pager's stores were just (re)allocated. Cold-resets the
+    // persistent diff state so the new scene streams in clean.
     if resources.gpu_front_end_epoch != Some(params.epoch) {
-        // Split the borrows: the immutable occupancy/core/scene refs vs the mutable front end.
-        let occ = resources.gpu_residency.as_ref().expect("checked above");
-        let core = resources.gpu_core_store.as_ref().expect("checked above");
+        // Resolve the occupancy + core buffers: the streamed pager's (preferred for a streamed scene) or the eager
+        // in-RAM upload's. Both expose the SAME `GpuResidencyBuffers` / `GpuBrickCoreBuffers` shape — the front end
+        // is store-agnostic. The pager's `core_buffers()` is a cheap cloned-handle view (the store keeps writing
+        // the SAME buffers the bind group references).
         let scene = resources.scene.as_ref().expect("checked above");
         let meta = scene.meta_buf.clone();
         let voxel = scene.voxel_buf.clone();
         let palettes = scene.brick_palettes_buf.clone();
         let aabb = scene.aabb_buf.clone();
+        // Build OWNED buffer-handle copies (the `wgpu::Buffer`s are cheap `Arc`-backed clones) so the immutable
+        // borrow of `resources`'s stores ends before the mutable front-end borrow (no overlap). Both the pager's
+        // and the eager upload's stores expose the SAME `GpuResidencyBuffers`/`GpuBrickCoreBuffers` shape.
+        let (occ_owned, core_owned): (
+            super::residency_gpu::GpuResidencyBuffers,
+            super::residency_gpu::GpuBrickCoreBuffers,
+        ) = if have_paged {
+            let pager = resources.streamed_pager.as_ref().expect("checked have_paged");
+            let o = pager.occupancy();
+            (
+                super::residency_gpu::GpuResidencyBuffers {
+                    header: o.header.clone(),
+                    entries: o.entries.clone(),
+                    table_size: o.table_size,
+                },
+                pager.core_buffers(),
+            )
+        } else {
+            let o = resources.gpu_residency.as_ref().expect("have_eager");
+            let c = resources.gpu_core_store.as_ref().expect("have_eager");
+            (
+                super::residency_gpu::GpuResidencyBuffers {
+                    header: o.header.clone(),
+                    entries: o.entries.clone(),
+                    table_size: o.table_size,
+                },
+                super::residency_gpu::GpuBrickCoreBuffers {
+                    table: c.table.clone(),
+                    cores: c.cores.clone(),
+                    table_size: c.table_size,
+                },
+            )
+        };
         let fe = resources.gpu_front_end.as_mut().expect("just built");
-        fe.rebind_pool(device, render_queue.0.as_ref(), occ, core, &meta, &voxel, &palettes, &aabb);
+        fe.rebind_pool(device, queue, &occ_owned, &core_owned, &meta, &voxel, &palettes, &aabb);
         resources.gpu_front_end_epoch = Some(params.epoch);
         info!("voxel-RT G-c.4: bound the GPU front end to the live scene pool for epoch {}", params.epoch);
     }

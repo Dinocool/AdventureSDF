@@ -441,6 +441,56 @@ impl SectorOccupancy {
         });
         GpuResidencyBuffers { header: header_buf, entries: entries_buf, table_size: self.table_size }
     }
+
+    /// **Phase G "G-c.4-paging" (§8.2)** — upload into a PRE-SIZED `entries` buffer (`entries_capacity` slots),
+    /// for the GROWABLE streamed occupancy rebuilt-whole each region crossing. The `entries` GPU buffer is created
+    /// once at `entries_capacity` (a whole-scene sector estimate) and re-written in place via `queue_write_buffer`
+    /// on each rebuild — so a per-crossing whole re-upload costs no realloc/rebind (the consumer's bind group stays
+    /// valid). Asserts `table_size <= entries_capacity` (the pre-size must cover the densest resident set; the
+    /// caller sizes it from the scene's brick counts). Returns the buffers holder; subsequent rebuilds call
+    /// [`Self::reupload_into`].
+    pub fn upload_presized(&self, device: &wgpu::Device, queue: &wgpu::Queue, entries_capacity: u32) -> GpuResidencyBuffers {
+        assert!(
+            self.table_size <= entries_capacity,
+            "occupancy table_size {} exceeds pre-sized capacity {entries_capacity}",
+            self.table_size
+        );
+        let header_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("voxel_residency_header"),
+            size: std::mem::size_of::<GpuResidencyHeader>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        // Allocate the full capacity once; write the live `table_size` slots, leave the tail EMPTY (uninitialised
+        // bytes are never probed — the probe masks with `table_size - 1 < entries_capacity`).
+        let entries_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("voxel_residency_entries"),
+            size: (entries_capacity as u64) * std::mem::size_of::<GpuSectorEntry>() as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let mut buffers = GpuResidencyBuffers { header: header_buf, entries: entries_buf, table_size: self.table_size };
+        // Initial contents via the one write SSOT.
+        self.reupload_into(queue, &mut buffers, entries_capacity);
+        buffers
+    }
+
+    /// **Phase G "G-c.4-paging" (§8.2)** — re-write the header + entries of a pre-sized [`GpuResidencyBuffers`] in
+    /// place (the per-crossing whole rebuild). Asserts the new `table_size` fits the buffer's capacity (the caller
+    /// pre-sizes generously); writes the `table_size` live slots, then updates the holder's cached `table_size`.
+    /// `queue_write_buffer` is a GPU-timeline copy — no host stall, no rebind. The unused tail slots are NOT
+    /// rewritten (never probed); a SHRINK leaves stale entries in the tail beyond `table_size` — harmless, the
+    /// probe never reaches them (it masks with the NEW `table_size - 1`).
+    pub fn reupload_into(&self, queue: &wgpu::Queue, buffers: &mut GpuResidencyBuffers, entries_capacity: u32) {
+        assert!(
+            self.table_size <= entries_capacity,
+            "occupancy rebuild table_size {} exceeds pre-sized capacity {entries_capacity}",
+            self.table_size
+        );
+        queue.write_buffer(&buffers.header, 0, bytemuck::bytes_of(&self.header()));
+        queue.write_buffer(&buffers.entries, 0, bytemuck::cast_slice(&self.entries));
+        buffers.table_size = self.table_size;
+    }
 }
 
 /// **Phase G "G-c.2a"** — the 32-bit hash of a BRICK key `(coord, lod)` for the GPU residency-diff hashes
@@ -588,6 +638,336 @@ pub struct GpuBrickCoreBuffers {
     pub cores: wgpu::Buffer,
     /// The hash slot count (a power of two).
     pub table_size: u32,
+}
+
+/// `u32` words per `8³` brick core (= [`super::brickmap::BRICK_VOXELS`] = 512).
+const CORE_WORDS: usize = super::brickmap::BRICK_VOXELS;
+
+/// The TOMBSTONE marker stored in a deleted slot's `lod` field, distinct from both [`EMPTY_LOD`] (a free slot the
+/// WGSL probe STOPS at) and any real lod (`0..=MAX_LOD`). The unchanged WGSL `core_lookup` treats a tombstone as
+/// "occupied, no match" — it SKIPS it and CONTINUES the probe (it only stops at `EMPTY_LOD`) — so deleting a key
+/// by tombstoning its slot NEVER truncates another key's probe chain. New inserts may reuse a tombstone slot. This
+/// is the standard open-addressing deletion fix, with NO WGSL change (the probe semantics are identical).
+const TOMBSTONE_LOD: u32 = EMPTY_LOD - 1;
+
+/// **Phase G "G-c.4-paging" (§8.3)** — the DEMAND-PAGED GPU BRICK-CORE STORE: the mutable, incremental successor
+/// to the immutable [`BrickCoreStore`], mirroring the `VxoSource` `RegionCache` lifecycle (upload-on-decode,
+/// evict-on-drop) so the GPU store ≤ the CPU region LRU budget (constant-RAM). It OWNS the two GPU buffers the
+/// unchanged WGSL `core_lookup` reads (the SAME [`GpuBrickCoreBuffers`] layout: a `(coord,lod) -> core_index`
+/// open-addressing hash + the `8³` cores), plus a CPU mirror of the hash + a free-slot stack so an
+/// [`Self::upload_region`] / [`Self::evict_region`] writes ONLY the touched slots via `queue_write_buffer`
+/// (no whole rebuild — a whole Bistro rebuild is ~300 MB/crossing, FORBIDDEN).
+///
+/// ## Free-list deletion correctness (the open-addressing trap)
+/// Deletion uses a [`TOMBSTONE_LOD`] sentinel (not [`EMPTY_LOD`]) so a removed key never breaks another key's
+/// linear-probe chain (see [`TOMBSTONE_LOD`]). A core SLOT freed on eviction goes back on [`Self::free_cores`]
+/// and may be reused by a later insert; its bytes are NOT cleared (overwritten on reuse). The COVERAGE INVARIANT
+/// (§8.3): the prefetcher pages exactly the clipmap-covering present regions PADDED +1 brick, and the GPU
+/// enumerate only ENTERS bricks with `level_resident` (inside the clipmap) — so every enterable brick + its
+/// 26-halo has its core resident here. Bounded: `core_cap` caps the cores buffer to the resident-region footprint.
+pub struct PagedBrickCoreStore {
+    /// The GPU `(coord,lod) -> core_index` hash (5 `u32`/slot). `lod == `[`EMPTY_LOD`] free, `== `[`TOMBSTONE_LOD`]
+    /// deleted-but-probe-through. A power-of-two `table_size`. Written incrementally per touched slot.
+    table_buf: wgpu::Buffer,
+    /// The GPU cores buffer (`CORE_WORDS` `u32`/core), capacity `core_cap` cores. Written per inserted slot.
+    cores_buf: wgpu::Buffer,
+    /// `table_size` (power of two) — the WGSL `core_table_size`.
+    table_size: u32,
+    /// Max distinct cores (= the resident-region brick footprint). The free-list never exceeds this.
+    core_cap: u32,
+    /// CPU mirror of the GPU hash table (`table_size * 5` u32), so an insert/evict computes the touched slot index
+    /// + probe chain on the CPU, then `queue_write_buffer`s just that slot. Kept bit-identical to the GPU buffer.
+    table: Vec<u32>,
+    /// `(coord, lod) -> (table_slot, core_index)` — the live keys' table slot + core slot (the CPU index the
+    /// incremental insert/evict drive). One entry per resident brick.
+    keys: rustc_hash::FxHashMap<(IVec3, u32), (u32, u32)>,
+    /// The free CORE slots (a LIFO stack of `core_index`es), refilled on eviction. Empty ⇒ at capacity.
+    free_cores: Vec<u32>,
+    /// `region key -> the (coord,lod) brick keys it paged in` — so [`Self::evict_region`] removes exactly this
+    /// region's keys. A brick present in TWO paged regions (shouldn't happen — regions partition the brick grid,
+    /// but a +1 halo pad can re-page a neighbour region holding the SAME brick) is REFERENCE-COUNTED via
+    /// [`Self::refcount`] so the last evictor frees it.
+    region_keys: rustc_hash::FxHashMap<(usize, u32, IVec3), Vec<(IVec3, u32)>>,
+    /// Per-key reference count (how many resident regions paged it) — a brick freed only when its count hits 0.
+    refcount: rustc_hash::FxHashMap<(IVec3, u32), u32>,
+}
+
+impl PagedBrickCoreStore {
+    /// Build an EMPTY paged store + its GPU buffers, sized for `core_cap` resident cores (the resident-region
+    /// brick footprint) and a `table_size = next_pow2(2 * core_cap)` hash (≤ 0.5 load factor). All table slots
+    /// start [`EMPTY_LOD`]; every core slot is free. `core_cap` is clamped to ≥ 1 (a non-empty buffer).
+    pub fn new(device: &wgpu::Device, queue: &wgpu::Queue, core_cap: u32) -> Self {
+        let core_cap = core_cap.max(1);
+        let table_size = ((core_cap as usize * 2).max(2)).next_power_of_two() as u32;
+        let mut table = vec![0u32; table_size as usize * 5];
+        for s in table.chunks_exact_mut(5) {
+            s[3] = EMPTY_LOD;
+        }
+        let table_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("voxel_paged_core_table"),
+            size: (table_size as u64) * 5 * 4,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let cores_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("voxel_paged_cores"),
+            size: (core_cap as u64) * CORE_WORDS as u64 * 4,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        queue.write_buffer(&table_buf, 0, bytemuck::cast_slice(&table));
+        // free_cores: all slots free, LIFO so the first claim is slot 0 (deterministic for the parity test).
+        let free_cores: Vec<u32> = (0..core_cap).rev().collect();
+        Self {
+            table_buf,
+            cores_buf,
+            table_size,
+            core_cap,
+            table,
+            keys: rustc_hash::FxHashMap::default(),
+            free_cores,
+            region_keys: rustc_hash::FxHashMap::default(),
+            refcount: rustc_hash::FxHashMap::default(),
+        }
+    }
+
+    /// The hash slot count (power of two) — the WGSL `core_table_size`.
+    #[inline]
+    pub fn table_size(&self) -> u32 {
+        self.table_size
+    }
+
+    /// Number of distinct cores currently resident (live keys).
+    #[inline]
+    pub fn resident_cores(&self) -> usize {
+        self.keys.len()
+    }
+
+    /// The core-slot CAPACITY (the bounded-buffer ceiling) — the constant-RAM bound the gates assert against.
+    #[inline]
+    pub fn core_cap(&self) -> u32 {
+        self.core_cap
+    }
+
+    /// A [`GpuBrickCoreBuffers`]-shaped VIEW for binding (the front end's `rebind_pool` consumes this). The buffers
+    /// are CLONED handles (cheap `Arc`) so the store keeps writing the SAME buffers the bind group references.
+    pub fn buffers(&self) -> GpuBrickCoreBuffers {
+        GpuBrickCoreBuffers {
+            table: self.table_buf.clone(),
+            cores: self.cores_buf.clone(),
+            table_size: self.table_size,
+        }
+    }
+
+    /// Probe the CPU table for `key`'s LIVE slot (matching `(x,y,z,lod)`), or `None` if absent. Stops at the first
+    /// [`EMPTY_LOD`] (matching the WGSL); SKIPS tombstones (continues). Bounded by `table_size`.
+    fn find_slot(&self, coord: IVec3, lod: u32) -> Option<u32> {
+        let mask = self.table_size - 1;
+        let mut slot = brick_key_hash(coord, lod) & mask;
+        for _ in 0..self.table_size {
+            let base = slot as usize * 5;
+            let e_lod = self.table[base + 3];
+            if e_lod == EMPTY_LOD {
+                return None;
+            }
+            if e_lod == lod
+                && self.table[base] == coord.x as u32
+                && self.table[base + 1] == coord.y as u32
+                && self.table[base + 2] == coord.z as u32
+            {
+                return Some(slot);
+            }
+            slot = (slot + 1) & mask;
+        }
+        None
+    }
+
+    /// Find the slot to INSERT `key` into: the first EMPTY or TOMBSTONE slot on its probe chain (reusing a
+    /// tombstone). Panics if the table is full (the caller sizes `table_size` ≥ 2× `core_cap`, so with ≤ `core_cap`
+    /// live keys it never fills — an invariant, not a runtime case).
+    fn insert_slot(&self, coord: IVec3, lod: u32) -> u32 {
+        let mask = self.table_size - 1;
+        let mut slot = brick_key_hash(coord, lod) & mask;
+        for _ in 0..self.table_size {
+            let e_lod = self.table[slot as usize * 5 + 3];
+            if e_lod == EMPTY_LOD || e_lod == TOMBSTONE_LOD {
+                return slot;
+            }
+            slot = (slot + 1) & mask;
+        }
+        panic!("paged core table full (table_size {} <= live keys) — core_cap mis-sized", self.table_size)
+    }
+
+    /// Write one table slot's 5 words to the GPU (the incremental dirty write).
+    fn flush_table_slot(&self, queue: &wgpu::Queue, slot: u32) {
+        let base = slot as usize * 5;
+        queue.write_buffer(&self.table_buf, base as u64 * 4, bytemuck::cast_slice(&self.table[base..base + 5]));
+    }
+
+    /// **Insert ONE brick core** `(coord, lod)` (idempotent: a re-insert of a live key just bumps its refcount).
+    /// Claims a free core slot, writes the core to `cores[slot]`, inserts the hash entry, and `queue_write_buffer`s
+    /// the touched table slot + the core. Returns the `core_index`, or `None` if the store is AT CAPACITY (the
+    /// free-list is empty) — a graceful far-detail drop (the caller's cap is the bounded-buffer ceiling, so an
+    /// over-full crossing simply leaves the excess bricks core-absent rather than crashing; the GPU `core_lookup`
+    /// then returns ABSENT for them, identical to an un-paged halo neighbour). Caller batches via the public paths.
+    fn insert_brick(&mut self, queue: &wgpu::Queue, coord: IVec3, lod: u32, core: &[u32; CORE_WORDS]) -> Option<u32> {
+        let key = (coord, lod);
+        if let Some(&(_, idx)) = self.keys.get(&key) {
+            *self.refcount.entry(key).or_insert(0) += 1;
+            return Some(idx); // already resident — share it (a +1-halo region re-page)
+        }
+        let core_index = self.free_cores.pop()?; // None ⇒ at capacity (graceful drop)
+        // Write the core.
+        queue.write_buffer(
+            &self.cores_buf,
+            core_index as u64 * CORE_WORDS as u64 * 4,
+            bytemuck::cast_slice(core),
+        );
+        // Insert the hash entry.
+        let slot = self.insert_slot(coord, lod);
+        let base = slot as usize * 5;
+        self.table[base] = coord.x as u32;
+        self.table[base + 1] = coord.y as u32;
+        self.table[base + 2] = coord.z as u32;
+        self.table[base + 3] = lod;
+        self.table[base + 4] = core_index;
+        self.flush_table_slot(queue, slot);
+        self.keys.insert(key, (slot, core_index));
+        self.refcount.insert(key, 1);
+        Some(core_index)
+    }
+
+    /// **Evict ONE brick** `(coord, lod)`: decrement its refcount; on reaching 0, tombstone its table slot (so a
+    /// probe chain stays intact), free its core slot, and remove the CPU index. A double-evict of an absent key is
+    /// a no-op (defensive). Writes the tombstoned table slot to the GPU.
+    fn evict_brick(&mut self, queue: &wgpu::Queue, coord: IVec3, lod: u32) {
+        let key = (coord, lod);
+        let Some(rc) = self.refcount.get_mut(&key) else {
+            return; // not resident
+        };
+        *rc -= 1;
+        if *rc > 0 {
+            return; // still referenced by another paged region
+        }
+        self.refcount.remove(&key);
+        let Some((slot, core_index)) = self.keys.remove(&key) else {
+            return;
+        };
+        let base = slot as usize * 5;
+        self.table[base + 3] = TOMBSTONE_LOD; // probe-through marker (NOT EMPTY — preserves other chains)
+        self.flush_table_slot(queue, slot);
+        self.free_cores.push(core_index); // reuse the core slot later (bytes left stale, overwritten on reuse)
+    }
+
+    /// **Page IN a region's bricks** (§8.3): insert each `(world_coord, lod, core)` brick, recording the region's
+    /// key list so [`Self::evict_region`] can drop exactly them. `region` is keyed `(asset, lod, region_coord)`.
+    /// Idempotent for a region already paged (re-records its keys, bumping their refcounts — the caller pages a
+    /// region once and evicts once, so this is the defensive path). Bricks are supplied by the caller's
+    /// `VxoSource::for_each_region_brick` (world coords + cores).
+    pub fn upload_region(
+        &mut self,
+        queue: &wgpu::Queue,
+        region: (usize, u32, IVec3),
+        bricks: &[(IVec3, u32, [u32; CORE_WORDS])],
+    ) {
+        let mut keys = Vec::with_capacity(bricks.len());
+        for (coord, lod, core) in bricks {
+            if self.insert_brick(queue, *coord, *lod, core).is_some() {
+                keys.push((*coord, *lod));
+            }
+        }
+        self.region_keys.insert(region, keys);
+    }
+
+    /// **Page OUT a region** (§8.3): evict every brick this region paged in (refcount-decremented; freed at 0).
+    /// A region never paged is a no-op. Mirrors `RegionCache` eviction so the GPU store ≤ the CPU LRU budget.
+    pub fn evict_region(&mut self, queue: &wgpu::Queue, region: (usize, u32, IVec3)) {
+        let Some(keys) = self.region_keys.remove(&region) else {
+            return;
+        };
+        for (coord, lod) in keys {
+            self.evict_brick(queue, coord, lod);
+        }
+    }
+
+    /// The set of region keys currently paged in (for the constant-RAM / coverage assertions in the gates).
+    pub fn resident_region_count(&self) -> usize {
+        self.region_keys.len()
+    }
+
+    /// **Phase G "G-c.4-paging" (§8.3)** — sync the resident core SET to exactly `desired` (a per-brick set diff,
+    /// for the SURFACE-shell core paging where the desired cores span bricks across regions, NOT whole regions).
+    /// Inserts the cores newly in `desired`, evicts the ones no longer in it. `desired` maps `(coord,lod)` → its
+    /// `8³` core. This is the brick-granular alternative to [`Self::upload_region`]/[`Self::evict_region`] (use one
+    /// or the other per store — the pager uses this). Bounded by `desired.len()` ≤ `core_cap` (asserted via the
+    /// free-list). Each brick is reference-count-1 in this mode (a `(coord,lod)` is unique in the desired set).
+    pub fn sync_to(
+        &mut self,
+        queue: &wgpu::Queue,
+        desired: &rustc_hash::FxHashMap<(IVec3, u32), [u32; CORE_WORDS]>,
+    ) {
+        self.sync_to_keys(queue, &desired.keys().copied().collect(), |c, l| desired.get(&(c, l)).copied());
+    }
+
+    /// **Phase G "G-c.4-paging" (§8.3)** — INCREMENTAL set-diff sync to a desired KEY set, decoding a new key's
+    /// core LAZILY via `fetch` ONLY when it is NOT already resident. This is the perf-critical path: a crossing
+    /// re-derives the desired surface+halo KEY set (cheap — hash probes, no voxel decode) and decodes cores ONLY
+    /// for the keys that newly entered (avoiding the per-crossing whole re-decode of every surface core, which
+    /// re-introduced the freeze). Evicts resident keys no longer desired. `fetch(coord,lod) -> Option<core>` ⇒
+    /// `None` skips (absent brick); a full store ⇒ the insert gracefully drops (the bounded-buffer ceiling).
+    pub fn sync_to_keys(
+        &mut self,
+        queue: &wgpu::Queue,
+        desired: &rustc_hash::FxHashSet<(IVec3, u32)>,
+        mut fetch: impl FnMut(IVec3, u32) -> Option<[u32; CORE_WORDS]>,
+    ) {
+        // Evict the resident keys no longer desired.
+        let to_evict: Vec<(IVec3, u32)> = self.keys.keys().filter(|k| !desired.contains(k)).copied().collect();
+        for (coord, lod) in to_evict {
+            self.refcount.insert((coord, lod), 1); // set-diff mode: each key held once
+            self.evict_brick(queue, coord, lod);
+        }
+        // Insert the desired keys not yet resident — decode the core ONLY now (lazy, incremental).
+        for &(coord, lod) in desired {
+            if !self.keys.contains_key(&(coord, lod))
+                && let Some(core) = fetch(coord, lod)
+            {
+                let _ = self.insert_brick(queue, coord, lod, &core);
+            }
+        }
+    }
+
+    /// **Phase G "G-c.4-paging" (§8.3)** — apply an explicit per-crossing core DELTA (Θ(delta), NOT Θ(all)): EVICT
+    /// each key in `evict` (tombstone its slot, free its core), then INSERT each key in `insert` (decode its core
+    /// LAZILY via `fetch`; a None ⇒ skip; a full store ⇒ graceful drop at the bounded-buffer ceiling). This is the
+    /// perf-critical path the prefetcher uses — it touches only the bricks that crossed the clipmap edge this
+    /// frame, never re-scanning the whole resident shell. Each key is reference-count-1 in this mode.
+    pub fn apply_delta(
+        &mut self,
+        queue: &wgpu::Queue,
+        insert: &[(IVec3, u32)],
+        evict: &[(IVec3, u32)],
+        mut fetch: impl FnMut(IVec3, u32) -> Option<[u32; CORE_WORDS]>,
+    ) {
+        for &(coord, lod) in evict {
+            if self.keys.contains_key(&(coord, lod)) {
+                self.refcount.insert((coord, lod), 1); // set-diff mode: each key held once
+                self.evict_brick(queue, coord, lod);
+            }
+        }
+        for &(coord, lod) in insert {
+            if !self.keys.contains_key(&(coord, lod))
+                && let Some(core) = fetch(coord, lod)
+            {
+                let _ = self.insert_brick(queue, coord, lod, &core);
+            }
+        }
+    }
+
+    /// Whether `(coord, lod)` has a resident core (the coverage-invariant probe for the unit test).
+    pub fn contains(&self, coord: IVec3, lod: u32) -> bool {
+        self.find_slot(coord, lod).is_some()
+    }
 }
 
 #[cfg(test)]

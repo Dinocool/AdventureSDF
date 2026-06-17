@@ -513,6 +513,119 @@ impl VxoSource {
         self.cache.lock().expect("region cache lock").coarse.len()
     }
 
+    /// **Phase G "G-c.4-paging"** — this asset's placement offset on the LOD-`lod` brick grid (the world→local
+    /// merge transform), public so the prefetcher ([`crate::voxel::raytrace`]) can map a world clipmap brick AABB
+    /// into this asset's LOCAL coord space. See [`Self::offset_at_lod`] for the off-origin coarse-LOD derivation.
+    #[inline]
+    pub fn offset_at_lod_pub(&self, lod: u32) -> IVec3 {
+        self.offset_at_lod(lod)
+    }
+
+    /// **Phase G "G-c.4-paging"** — the region edge **K** (bricks per region axis), public for the prefetcher's
+    /// `region_of_brick(b, k)` bucketing (`k = `[`super::format::DEFAULT_REGION_EDGE_BRICKS`]` = 8`).
+    #[inline]
+    pub fn region_edge_pub(&self) -> i32 {
+        self.region_edge()
+    }
+
+    /// **Phase G "G-c.4-paging"** — the level table selector for a given `lod`: `(bidx, brik_base, span_bound,
+    /// served_lod)` — the exact arguments [`Self::decoded_region`] needs for that level. `None` iff `lod > 0`
+    /// without a `LODS` pyramid (the streamed Bistro is baked WITH a pyramid, so a present-coarse-region directory
+    /// exists at every served level), OR a clamped-coarse level (grid mismatch). `served_lod` is the baked level a
+    /// coarse request resolves to (clamped to `max_lod` for a collapsed asset, gotcha #4); the caller keys the
+    /// region cache by it. LOD0 ⇒ `(self.bidx, brik_body_start, brik_body_len, 0)`.
+    fn level_layout(&self, lod: u32) -> Option<(&[VxoRegionDirEntry], usize, usize, u32)> {
+        if lod == 0 {
+            return Some((&self.bidx, self.brik_body_start, self.brik_body_len, 0));
+        }
+        // A coarse request needs a baked level whose coord grid equals the requested grid: only `lod <= max_lod`
+        // (a deeper request is a clamped level — grid mismatch — so the prefetcher skips it, matching the residency
+        // which never ENTERS a clamped-coarse brick on a grid that has no directory).
+        if self.lods.is_none() || lod > self.max_lod() {
+            return None;
+        }
+        let level = self.coarse_level(lod)?;
+        Some((&level.bidx_l, level.brik_l_start, level.brik_l_len, level.lod))
+    }
+
+    /// **Phase G "G-c.4-paging" (§8.1)** — the PRESENT region coords (on the LOD-`lod` grid) whose `K³`-brick span
+    /// intersects the LOCAL brick AABB `[local_lo, local_hi]` (inclusive), PADDED by `+1` brick each side so the
+    /// 26-halo neighbours of every enterable brick are covered (the core-coverage invariant). Reads ONLY the
+    /// in-RAM directory (`BIDX` / `BIDX_L`) — no region decode — so the prefetcher computes the resident-region set
+    /// camera-driven, readback-free. Empty (yields nothing) for a `lod` with no present-coarse directory (no `LODS`
+    /// / a clamped level). `local_*` are LOCAL (offset-applied) coords on the LOD-`lod` grid.
+    pub fn present_regions_in(&self, lod: u32, local_lo: IVec3, local_hi: IVec3, out: &mut Vec<IVec3>) {
+        let Some((bidx, _, _, _)) = self.level_layout(lod) else {
+            return;
+        };
+        let k = self.region_edge();
+        // PAD the local brick AABB by +1 each side, THEN bucket to the region grid — so a region holding any
+        // brick that is the 26-halo neighbour of an enterable brick in [lo, hi] is paged (the invariant §8.3).
+        let plo = local_lo - IVec3::ONE;
+        let phi = local_hi + IVec3::ONE;
+        let rlo = IVec3::new(plo.x.div_euclid(k), plo.y.div_euclid(k), plo.z.div_euclid(k));
+        let rhi = IVec3::new(phi.x.div_euclid(k), phi.y.div_euclid(k), phi.z.div_euclid(k));
+        // The directory is sorted by (z,y,x); iterate it (small — the spatial index) and keep present regions whose
+        // coord lies in the padded region box. (Iterating the directory, not the box volume, keeps this Θ(present
+        // regions in the directory), and the directory is already bounded by the shell the residency demands.)
+        for dir in bidx {
+            let rc = IVec3::new(dir.region_coord[0], dir.region_coord[1], dir.region_coord[2]);
+            if rc.x >= rlo.x && rc.x <= rhi.x && rc.y >= rlo.y && rc.y <= rhi.y && rc.z >= rlo.z && rc.z <= rhi.z {
+                out.push(rc);
+            }
+        }
+    }
+
+    /// **Phase G "G-c.4-paging" (§8.1)** — decode + cache the region at `(lod, region_coord)` (LOCAL region coord
+    /// on the LOD-`lod` grid), public wrapper over [`Self::decoded_region`] that resolves the per-lod
+    /// `bidx`/`brik_base`/`span_bound` from [`Self::level_layout`]. `Ok(None)` iff the region is ABSENT from the
+    /// directory (all-air) or the level has no directory on this grid. The decode is MEMOIZED in the region LRU
+    /// (so a re-page is a cache hit), and the LRU bounds RAM (constant-RAM spine). The returned region's `entries`
+    /// carry LOCAL brick coords on the served grid; the caller adds [`Self::offset_at_lod_pub`] to get world coords.
+    pub fn decode_region_pub(&self, lod: u32, region_coord: IVec3) -> Option<Arc<DecodedRegion>> {
+        let (bidx, brik_base, span_bound, served_lod) = self.level_layout(lod)?;
+        // Key the cache by the SERVED level (clamped) so a coarse read shares the right namespace (gotcha #2).
+        self.decoded_region(served_lod, region_coord, bidx, brik_base, span_bound).ok().flatten()
+    }
+
+    /// **Phase G "G-c.4-paging" (§8.2)** — invoke `f(world_coord, lod, is_full)` per present brick of `region`
+    /// (the cheap PRESENCE + FULL bit pass for the occupancy rebuild — NO voxel decode, just the baked
+    /// `BRICK_FLAG_FULL` bit). `world_coord` = LOCAL entry coord + [`Self::offset_at_lod_pub`]. The single SSOT for
+    /// "what bricks (and their full bits) does this region hold?".
+    pub fn for_each_region_brick_occ(&self, lod: u32, region: &DecodedRegion, mut f: impl FnMut(IVec3, u32, bool)) {
+        let off = self.offset_at_lod(lod);
+        for entry in &region.entries {
+            let local = IVec3::new(entry.brick_coord[0], entry.brick_coord[1], entry.brick_coord[2]);
+            f(local + off, lod, entry.flags & BRICK_FLAG_FULL != 0);
+        }
+    }
+
+    /// Decode one [`VxoBrickEntry`]'s `8³` core into [`crate::voxel::brickmap::voxel_index`]-order block ids
+    /// (block_base-shifted for the merge, so the GPU halo-fill reads merged ids). The single brick-core SSOT for
+    /// the surface-shell core paging (§8.3). `pub(crate)` helper over [`DecodedRegion::brick_remapped`].
+    fn core_of_entry(&self, region: &DecodedRegion, entry: &super::format::VxoBrickEntry) -> [u32; crate::voxel::brickmap::BRICK_VOXELS] {
+        let brick = region.brick_remapped(entry, self.block_base);
+        let mut core = [0u32; crate::voxel::brickmap::BRICK_VOXELS];
+        for z in 0..BRICK_EDGE {
+            for y in 0..BRICK_EDGE {
+                for x in 0..BRICK_EDGE {
+                    core[crate::voxel::brickmap::voxel_index(x, y, z)] = brick.get(x, y, z).0 as u32;
+                }
+            }
+        }
+        core
+    }
+
+    /// **Phase G "G-c.4-paging" (§8.3)** — the `8³` core for a single WORLD brick coord `world` at `lod`, read from
+    /// `region` (the brick's owning decoded region). `None` iff the brick is absent from the region (all-air). Used
+    /// to page exactly the SURFACE-shell + halo cores (NOT every region brick), keeping the GPU core store bounded
+    /// to the Θ(H²) surface footprint. `region` MUST be `world`'s owning region (the caller resolves it).
+    pub fn core_at_world(&self, lod: u32, world: IVec3, region: &DecodedRegion) -> Option<[u32; crate::voxel::brickmap::BRICK_VOXELS]> {
+        let local = world - self.offset_at_lod(lod);
+        let entry = region.entry(local)?;
+        Some(self.core_of_entry(region, entry))
+    }
+
     /// The core brick at LOCAL (offset-applied) brick coord `local`, level `lod`, reading the level's own
     /// directory + `BRIK` layout (`bidx`/`brik_base`/`span_bound`): bucket `local` to the level's Euclidean
     /// region grid → directory binary-search (absent ⇒ `uniform(AIR)`) → region-cache lookup (miss ⇒ lazy mmap
@@ -794,9 +907,9 @@ pub struct MergedSource {
 }
 
 /// One placed asset in a [`MergedSource`]: the streamed source + its placed brick-coord AABB (the dispatch key).
-struct PlacedAsset {
+pub struct PlacedAsset {
     /// The streamed source, already offset + block-base remapped.
-    source: VxoSource,
+    pub source: VxoSource,
     /// Inclusive-exclusive placed LOD0 brick-coord bounds `[lo, hi)` — `coord` falls in this asset iff inside.
     lo: IVec3,
     hi: IVec3,
@@ -877,6 +990,22 @@ impl MergedSource {
             coarse += a.source.coarse_memo_len();
         }
         (regions, bytes, coarse)
+    }
+
+    /// **Phase G "G-c.4-paging" (§8.1)** — the placed assets, for the prefetcher to page each asset's regions in
+    /// LOCAL coords. Each [`PlacedAsset`] carries its [`VxoSource`] (already offset + block-base remapped) + its
+    /// LOD0-brick placement bounds; the prefetcher maps the world clipmap AABB into the asset's local grid via
+    /// [`VxoSource::offset_at_lod_pub`] and intersects with [`Self::lod_bounds`].
+    pub fn placed_assets(&self) -> &[PlacedAsset] {
+        &self.assets
+    }
+
+    /// **Phase G "G-c.4-paging"** — the inclusive placed brick AABB `[lo, hi]` of asset index `i` on the LOD-`lod`
+    /// grid (its LOD0 bounds downsampled to the level), for the prefetcher's per-asset clip-against-bounds. See
+    /// [`Self::lod_bounds`]. Panics if `i` is out of range (a programming error — the caller iterates
+    /// [`Self::placed_assets`]).
+    pub fn asset_lod_bounds(&self, i: usize, lod: u32) -> (IVec3, IVec3) {
+        Self::lod_bounds(&self.assets[i], lod)
     }
 
     /// The asset whose placed brick AABB contains `coord` ON THE LOD-`lod` GRID, or `None` if `coord` is in no
