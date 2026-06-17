@@ -443,6 +443,41 @@ impl SectorOccupancy {
     }
 }
 
+/// **Phase G "G-c.2a"** — the 32-bit hash of a BRICK key `(coord, lod)` for the GPU residency-diff hashes
+/// (`slot_table` + `present_flag`). The SAME FNV-1a + avalanche family as [`sector_hash`], but over the brick
+/// coord directly (the brick coord IS the key — no sector split). The SSOT shared by the CPU reference (the
+/// parity test's slot-table / present-flag oracle) and the WGSL `hash_key` — they MUST compute the SAME hash so
+/// a GPU probe walks the SAME slot sequence. `wrapping` u32 to be bit-identical to the WGSL modular u32.
+#[inline]
+pub fn brick_key_hash(coord: IVec3, lod: u32) -> u32 {
+    let mut h: u32 = 2166136261;
+    for w in [coord.x as u32, coord.y as u32, coord.z as u32, lod] {
+        h ^= w;
+        h = h.wrapping_mul(16777619);
+        h ^= h >> 15;
+        h = h.wrapping_mul(2654435761);
+        h ^= h >> 13;
+    }
+    h
+}
+
+/// **Phase G "G-c.2a"** — the GPU residency-diff (Pass C) config uniform — MUST match the WGSL `DiffConfig`
+/// (4×u32 / 16 B). `slot_table_size`/`present_size` are powers of two (the WGSL probe masks with `size - 1`);
+/// `max_resident` is the free-list ring capacity (= the `ResidentPacker` slot capacity, `incremental.rs:580`);
+/// `refine_descent_cap` is the keep-old-until-revealed refine bound (`REFINE_DESCENT_CAP`, `streaming.rs:76`).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Pod, Zeroable)]
+pub struct GpuResidencyDiffConfig {
+    /// Slot-table hash slot count (a power of two).
+    pub slot_table_size: u32,
+    /// Present-flag hash slot count (a power of two).
+    pub present_size: u32,
+    /// Free-list ring capacity (= max resident bricks).
+    pub max_resident: u32,
+    /// The keep-old-until-revealed refine descent cap (`REFINE_DESCENT_CAP` = 5).
+    pub refine_descent_cap: u32,
+}
+
 /// The uploaded GPU occupancy buffers — held PERSISTENTLY in `VoxelRtResources` (G-c.0: bound to no pipeline;
 /// the G-c.1 enumerate pass binds them). `header` is a UNIFORM (table size); `entries` is the STORAGE sector
 /// hash. `table_size` is cached for the consumer to size its probe mask without reading the buffer back.

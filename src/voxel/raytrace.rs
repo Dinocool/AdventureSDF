@@ -78,13 +78,19 @@ pub struct VoxelRtToggle {
     /// default — the whole GPU path is exercised only by the parity gate (`tests/voxel_gpu_pack_parity.rs`) +
     /// an explicit toggle until it is trusted live. The CPU path is the byte SSOT the GPU path is proven against.
     pub gpu_pack: bool,
+    /// **Phase G Stage G-c.2a A/B flag.** When `true`, the GPU residency DIFF (Pass C — `voxel_residency.wgsl`
+    /// `diff_*` entries) would drive enter/drop decisions + the GPU resident `slot_table` instead of the CPU
+    /// `ResidencyManager`/`ResidentPacker` slot allocation. OFF by default — G-c.2a wires NO live consumer (the
+    /// pack still comes from the CPU path); Pass C runs ONLY in the parity gate
+    /// (`tests/voxel_gpu_residency_diff_parity.rs`). The live path is UNCHANGED when off.
+    pub gpu_residency: bool,
 }
 
 impl Default for VoxelRtToggle {
     fn default() -> Self {
-        // HW-RT is the default (and only) renderer now — on at startup. The GPU pack is OFF by default (G-a is
-        // A/B-gated until its parity test is trusted live).
-        Self { enabled: true, gpu_pack: false }
+        // HW-RT is the default (and only) renderer now — on at startup. The GPU pack + GPU residency diff are OFF
+        // by default (A/B-gated until their parity tests are trusted live).
+        Self { enabled: true, gpu_pack: false, gpu_residency: false }
     }
 }
 

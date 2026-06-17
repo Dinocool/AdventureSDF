@@ -632,7 +632,7 @@ fn render_worldgen_frame(gpu_pack: bool) -> Vec<u8> {
     disable_dlss_for_headless(&mut app); // #134 — force the readback-capturable non-DLSS path (dlss build only).
     app.insert_resource(VoxelScene::Worldgen);
     // The A/B flag under test: flip the gpu_pack path on/off (HW-RT itself stays on for both).
-    app.insert_resource(VoxelRtToggle { enabled: true, gpu_pack });
+    app.insert_resource(VoxelRtToggle { enabled: true, gpu_pack, ..Default::default() });
 
     app.insert_resource(latest.clone());
     app.insert_resource(ClearColor(Color::srgb(0.9, 0.0, 0.9)));

@@ -114,6 +114,55 @@ pub fn headless_device_with_compute_limits(min_invocations: u32) -> Option<(wgpu
     .ok()
 }
 
+/// A headless wgpu (no special features) compute device that RAISES BOTH the compute-workgroup invocation
+/// limits (to `min_invocations`, like [`headless_device_with_compute_limits`]) AND
+/// `max_storage_buffers_per_shader_stage` (to `min_storage_buffers`, wgpu's default is 8). The G-c.2a GPU
+/// residency-diff pass (`voxel_residency.wgsl` `diff_*` entries) binds ~21 storage buffers in one stage —
+/// far over the default — so its parity rig needs this. Returns `None` (caller skips) if no adapter or it can't
+/// reach the requested limits.
+pub fn headless_compute_device_with_storage(
+    min_invocations: u32,
+    min_storage_buffers: u32,
+) -> Option<(wgpu::Device, wgpu::Queue)> {
+    let instance = wgpu::Instance::default();
+    let adapter = block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+        power_preference: wgpu::PowerPreference::HighPerformance,
+        force_fallback_adapter: false,
+        compatible_surface: None,
+        ..Default::default()
+    }))
+    .ok()?;
+    let info = adapter.get_info();
+    eprintln!("GPU adapter: name={:?} backend={:?} device_type={:?}", info.name, info.backend, info.device_type);
+    if adapter.limits().max_compute_invocations_per_workgroup < min_invocations {
+        eprintln!(
+            "adapter max_compute_invocations_per_workgroup {} < {min_invocations} — skipping",
+            adapter.limits().max_compute_invocations_per_workgroup
+        );
+        return None;
+    }
+    if adapter.limits().max_storage_buffers_per_shader_stage < min_storage_buffers {
+        eprintln!(
+            "adapter max_storage_buffers_per_shader_stage {} < {min_storage_buffers} — skipping",
+            adapter.limits().max_storage_buffers_per_shader_stage
+        );
+        return None;
+    }
+    let mut limits = wgpu::Limits::default();
+    limits.max_compute_invocations_per_workgroup =
+        limits.max_compute_invocations_per_workgroup.max(min_invocations);
+    limits.max_compute_workgroup_size_x = limits.max_compute_workgroup_size_x.max(min_invocations);
+    limits.max_storage_buffers_per_shader_stage =
+        limits.max_storage_buffers_per_shader_stage.max(min_storage_buffers);
+    block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+        label: Some("voxel_diff_test_device"),
+        required_features: wgpu::Features::empty(),
+        required_limits: limits,
+        ..Default::default()
+    }))
+    .ok()
+}
+
 /// A headless wgpu device with `EXPERIMENTAL_RAY_QUERY` enabled (AABB-BLAS `ray_query`), mirroring the
 /// device setup in `D:/spike-aabb`: the experimental feature flag, the minimum acceleration-structure
 /// limits, and `ExperimentalFeatures::enabled()` (which wgpu-trunk requires at device creation for the

@@ -119,6 +119,10 @@ fn gpu_candidate_set(
     // Pass B outputs: the surface candidate count + list.
     let cand_count = buf_init(device, "cand_count", bytemuck::bytes_of(&0u32), storage_usage());
     let cand_list = storage_buf(device, "cand_list", (cap * 16) as u64); // vec4<i32> = 16 B
+    // G-c.2a — Pass B also emits the DESIRED (occupied-in-shell) set at bindings 10/11. This gate only checks the
+    // SURFACE `candidate_list`, but `enumerate_shells` now writes both, so bind real buffers for them.
+    let desired_count = buf_init(device, "desired_count", bytemuck::bytes_of(&0u32), storage_usage());
+    let desired_list = storage_buf(device, "desired_list", (cap * 16) as u64);
 
     let src = std::fs::read_to_string("assets/shaders/voxel_residency.wgsl")
         .expect("read voxel_residency.wgsl");
@@ -147,6 +151,8 @@ fn gpu_candidate_set(
             storage_entry(7, false),
             storage_entry(8, false),
             storage_entry(9, false),
+            storage_entry(10, false),
+            storage_entry(11, false),
         ],
     });
     let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -186,6 +192,8 @@ fn gpu_candidate_set(
                 bind(7, slot7),
                 bind(8, &cand_count),
                 bind(9, &cand_list),
+                bind(10, &desired_count),
+                bind(11, &desired_list),
             ],
         })
     };
@@ -348,8 +356,10 @@ fn representative_scene() -> BrickMap {
 fn gpu_enumerate_matches_cpu_surface_oracle() {
     // The enumerate pass dispatches 8³ = 512-thread workgroups, above wgpu's default 256 — request the raised
     // compute limit (the renderer bumps the same in `wgpu_settings()`).
-    let Some((device, queue)) = common::headless_device_with_compute_limits(512) else {
-        eprintln!("[skip] no GPU adapter (or compute limit too low) — voxel GPU enumerate parity skipped");
+    // G-c.2a — `enumerate_shells` now also emits the desired list (bindings 10/11), so the layout binds 10
+    // storage buffers — over wgpu's default 8. Raise the storage-buffer limit alongside the 512-wide compute.
+    let Some((device, queue)) = common::headless_compute_device_with_storage(512, 12) else {
+        eprintln!("[skip] no GPU adapter (or limits too low) — voxel GPU enumerate parity skipped");
         return;
     };
 
