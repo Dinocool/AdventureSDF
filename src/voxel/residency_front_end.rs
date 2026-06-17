@@ -810,6 +810,103 @@ impl GpuResidencyFrontEnd {
     pub fn advance_ring(&mut self) {
         self.ring = 1 - self.ring;
     }
+
+    /// **Diagnostic ONLY** — the resident-pool capacity (`max_resident`), for the paged-drive diagnostic log line.
+    pub fn max_resident_diag(&self) -> u32 {
+        self.max_resident
+    }
+
+    /// **Diagnostic ONLY** (blocking) — the index + palette slab high-water marks (WORDS used) vs the pool reserve.
+    /// An overflow (high-water > the live scene pool's word capacity) ⇒ the GPU slab allocator wrote out of bounds.
+    pub fn diag_slab_highwater(&self, device: &wgpu::Device, queue: &wgpu::Queue) -> (u32, u32) {
+        let rb = |b: &wgpu::Buffer| -> u32 {
+            let staging = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("res_diag_slab_rb"),
+                size: 4,
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+            });
+            let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("res_diag_slab") });
+            enc.copy_buffer_to_buffer(b, 0, &staging, 0, 4);
+            queue.submit(core::iter::once(enc.finish()));
+            let _ = device.poll(wgpu::PollType::wait_indefinitely());
+            staging.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+            let _ = device.poll(wgpu::PollType::wait_indefinitely());
+            let v = match staging.slice(..).get_mapped_range() {
+                Ok(d) => u32::from_le_bytes([d[0], d[1], d[2], d[3]]),
+                Err(_) => u32::MAX,
+            };
+            staging.unmap();
+            v
+        };
+        (rb(&self.index_slab_ctrl), rb(&self.palette_slab_ctrl))
+    }
+
+    /// **Diagnostic ONLY** (blocking) — read back the per-frame counts (aabb_count, pack_count, enter, drop, change)
+    /// after a recorded frame. Localizes whether Pass B/C/D produced work. Returns (aabb, pack, cand, desired, change).
+    pub fn diag_counts(&self, device: &wgpu::Device, queue: &wgpu::Queue) -> (u32, u32, u32, u32, u32) {
+        let rb = |b: &wgpu::Buffer| -> u32 {
+            let staging = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("res_diag_cnt_rb"),
+                size: 4,
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+            });
+            let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("res_diag_cnt") });
+            enc.copy_buffer_to_buffer(b, 0, &staging, 0, 4);
+            queue.submit(core::iter::once(enc.finish()));
+            let _ = device.poll(wgpu::PollType::wait_indefinitely());
+            staging.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+            let _ = device.poll(wgpu::PollType::wait_indefinitely());
+            let v = match staging.slice(..).get_mapped_range() {
+                Ok(d) => u32::from_le_bytes([d[0], d[1], d[2], d[3]]),
+                Err(_) => u32::MAX,
+            };
+            staging.unmap();
+            v
+        };
+        (
+            rb(&self.aabb_count),
+            rb(&self.pack_count),
+            rb(&self.cand_count),
+            rb(&self.desired_count),
+            rb(&self.change_count_buf),
+        )
+    }
+
+    /// **Diagnostic ONLY** (blocking readback — never on the hot path). The number of LIVE slots in the persistent
+    /// slot table (resident `(coord,lod)` keys), read back by mapping the slot-table buffer. Used by the paged-drive
+    /// diagnostic gate to confirm the front end converges (and is not entering the full pool). Blocks the queue.
+    pub fn diag_resident_count(&self, device: &wgpu::Device, queue: &wgpu::Queue) -> u32 {
+        let words = self.slot_table_size as usize * 5;
+        let size = (words * 4) as u64;
+        let staging = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("res_diag_slot_rb"),
+            size,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("res_diag_rb") });
+        enc.copy_buffer_to_buffer(&self.slot_table_buf, 0, &staging, 0, size);
+        queue.submit(core::iter::once(enc.finish()));
+        let _ = device.poll(wgpu::PollType::wait_indefinitely());
+        staging.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+        let _ = device.poll(wgpu::PollType::wait_indefinitely());
+        let data = match staging.slice(..).get_mapped_range() {
+            Ok(d) => d,
+            Err(_) => return u32::MAX,
+        };
+        let words_u32: &[u32] = bytemuck::cast_slice(&data);
+        let mut live = 0u32;
+        for s in words_u32.chunks_exact(5) {
+            if s[3] != EMPTY_LOD {
+                live += 1;
+            }
+        }
+        drop(data);
+        staging.unmap();
+        live
+    }
 }
 
 // =========================================================================================================

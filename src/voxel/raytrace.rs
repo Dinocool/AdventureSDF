@@ -1490,6 +1490,16 @@ struct VoxelRtResources {
     /// The `(epoch)` the front end is currently bound to (matched against the live `gpu_residency_epoch`); a change
     /// triggers a `rebind_pool` (new scene pool + occupancy/core store). `None` ⇒ not bound (cold).
     gpu_front_end_epoch: Option<u64>,
+    /// **Phase G "G-c.4" — the SPREAD chunk-BLAS rebuild cursor (the streamed-blank fix).** When the GPU front end's
+    /// residency changes, ALL chunk BLASes must be rebuilt from the GPU-written `aabb_buf` (full Build, never refit).
+    /// Rebuilding ALL of them (≈100k+ live primitives) in ONE frame's `build_acceleration_structures` overruns the
+    /// AABB-BLAS build throughput of the ray-query backend and silently yields a non-tracing TLAS (the clip_half-
+    /// dependent blank: renders at small clip_half, black past ~60-100k live prims). So the rebuild is SPREAD across
+    /// frames: each frame rebuilds a bounded WINDOW of chunks starting at this cursor, advancing it until the whole
+    /// chunk set has been rebuilt since the last residency change (then it idles). The CPU `apply_delta` never hit
+    /// this because it rebuilds only the few dirty chunks per move; the GPU front end's whole-set rebuild needs the
+    /// same throttling. `usize::MAX` ⇒ no rebuild pending (converged + fully rebuilt).
+    blas_rebuild_cursor: usize,
     /// **Phase G "G-c.4-paging"** — the STREAMED `.vxo` region PREFETCHER + its demand-paged GPU occupancy / core
     /// store (`residency_pager.rs` §8). Present only for the live STREAMED scene (Bistro / the `.vxo` Gallery),
     /// built from the extracted [`VoxelRtResidencyUpload::streamed_source`] on the scene/epoch switch. Each frame
@@ -3181,6 +3191,19 @@ fn prepare_voxel_rt(
                 );
                 return;
             }
+            // **Phase G "G-c.4" — when the LIVE GPU front end drove this frame** (`front_end_active`), it OWNS the
+            // scene pool (it wrote meta/voxel/palette/aabb + rebuilt the dirty BLASes in its own encoder, from the
+            // GPU-decided residency). The CPU `apply_delta` would DOUBLE-WRITE the pool with the CPU `ResidentPacker`'s
+            // DIFFERENT slot decisions + rebuild the BLASes from CPU AABBs — clobbering the GPU geometry (the blank
+            // streamed-Bistro bug). Skip it (mirror of the `GpuPack` arm's guard); refresh the lights + bookkeeping
+            // only. The GPU front end is the sole pool writer once it is the live driver.
+            if front_end_active {
+                resources.world_cache_lights = Some(WorldCacheLights::from_lists(device, lights, alias));
+                resources.brick_count = *brick_count;
+                resources.built_generation = Some(patch_res.generation);
+                resources.built_epoch = Some(patch_res.epoch);
+                return;
+            }
             let Some(scene) = resources.scene.as_mut() else {
                 return; // no buffers to patch — keep old (defensive)
             };
@@ -3324,10 +3347,14 @@ fn build_scene_full(
     streamed: bool,
 ) {
     // COPY_DST on every patchable buffer so the streamed Delta path can `queue_write_buffer` changed slots (A1).
+    // COPY_SRC so a diagnostic / readback gate can map the GPU-written AABBs (cheap; no behaviour change).
     let aabb_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("voxel_rt_aabbs"),
         contents: aabb_bytes,
-        usage: wgpu::BufferUsages::BLAS_INPUT | wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        usage: wgpu::BufferUsages::BLAS_INPUT
+            | wgpu::BufferUsages::STORAGE
+            | wgpu::BufferUsages::COPY_DST
+            | wgpu::BufferUsages::COPY_SRC,
     });
     let meta_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("voxel_rt_metas"),
@@ -3912,52 +3939,169 @@ fn drive_gpu_residency_front_end(
 
     let _span = info_span!("vox_gpu_residency_live").entered();
 
-    // ONE encoder: the front-end pipeline (Pass A→D + classify/pack/write_aabb) THEN the dirty-chunk BLAS rebuild
-    // reading the just-written aabb_buf (fill-then-build) — one submit closes it.
-    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-        label: Some("voxel_rt_gpu_residency_live"),
-    });
+    // SUBMIT 1 — the front-end pipeline (Pass A→D + classify/pack/write_aabb) writing the live scene pool. The AS
+    // build is a SEPARATE submit below (NOT fill-then-build in one encoder): the BLAS reads `aabb_buf` as
+    // BLAS_INPUT, which the just-recorded `write_aabb` wrote as a STORAGE buffer in the SAME pass chain — wgpu's
+    // automatic hazard tracking does NOT insert a barrier between a compute STORAGE write and an
+    // acceleration-structure BUILD read in one encoder (a known gap), so a same-encoder build can read STALE
+    // `aabb_buf`. Splitting the submits forces the write to complete + be visible before the build (the same shape
+    // the CPU `apply_delta` uses — `queue_write_buffer` then a separate build encoder).
     {
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("voxel_rt_gpu_residency_live"),
+        });
         let fe = resources.gpu_front_end.as_mut().expect("built");
         let _r = info_span!("vox_residency_front_end").entered();
         fe.record_frame(render_queue.0.as_ref(), &mut encoder, params.cam_world);
+        render_queue.submit(core::iter::once(encoder.finish()));
     }
 
-    // First-shippable AS build: rebuild ALL chunk BLASes + the TLAS reading the GPU-written aabb_buf, but ONLY
-    // when the mirror says the residency changed (or on the first bound frame). A converged static camera skips
-    // this entirely (the mirror reads 0) — the idle path.
-    if rebuild_as {
-        let _b = info_span!("vox_blas_residency").entered();
-        let scene = resources.scene.as_ref().expect("checked above");
-        let aabb_stride = core::mem::size_of::<GpuBrickAabb>() as u64;
-        let sizes: Vec<wgpu::BlasAABBGeometrySizeDescriptor> = scene
-            .chunks
-            .iter()
-            .map(|chunk| wgpu::BlasAABBGeometrySizeDescriptor {
-                primitive_count: chunk.prim_count,
-                flags: wgpu::AccelerationStructureGeometryFlags::OPAQUE,
-            })
-            .collect();
-        let geos: Vec<_> = scene
-            .chunks
-            .iter()
-            .zip(sizes.iter())
-            .map(|(chunk, size)| wgpu::BlasBuildEntry {
-                blas: &chunk.blas,
-                geometry: wgpu::BlasGeometries::AabbGeometries(vec![wgpu::BlasAabbGeometry {
-                    size,
-                    stride: aabb_stride,
-                    aabb_buffer: &scene.aabb_buf,
-                    primitive_offset: chunk.slot_base * aabb_stride as u32,
-                }]),
-            })
-            .collect();
-        if !geos.is_empty() {
+    // SUBMIT 2 — rebuild the chunk BLASes + the TLAS reading the now-committed `aabb_buf`, SPREAD across frames.
+    //
+    // **CRITICAL — full REBUILD, never refit, and THROTTLED (the streamed-Bistro blank-render root cause).** Each
+    // chunk BLAS is first built (by the StreamSnapshot `build_scene_full`) with the CPU's tiny cold-fill set REAL +
+    // the rest DEGENERATE. The GPU front end then ACTIVATES many of those degenerate slots (writes real AABBs as it
+    // streams in the surface set). Two things break a naive rebuild:
+    //  1. **Refit corruption** — re-`build_acceleration_structures` over the SAME `chunk.blas` handle makes wgpu-core
+    //     emit a BVH `Update` (refit); a refit across a degenerate→real activation CORRUPTS the structure (streamed
+    //     bricks go invisible — see `create_chunk_blas`'s contract + `voxel-rt-blas-refit-corruption`). So we RECREATE
+    //     each chunk's BLAS handle (`built_index = None` ⇒ a full `Build`) + re-point its TLAS instance.
+    //  2. **Whole-set build overrun** — rebuilding ALL chunk BLASes (≈100k+ real primitives past clip_half ~48) in
+    //     ONE frame silently yields a NON-TRACING TLAS (the clip_half-dependent blank: renders at small clip_half,
+    //     black past ~60-100k live prims; NO validation error). The CPU `apply_delta` never hit this because it
+    //     rebuilds only the FEW dirty chunks per move — a small per-frame build. So the GPU front end's whole-set
+    //     rebuild is SPREAD across frames: each frame rebuilds a bounded WINDOW of chunks from a persistent cursor,
+    //     re-pointing+building only those, then rebuilds the TLAS over ALL instances (a TLAS build of all instances
+    //     is cheap + proven fine — the CPU path does it every dirty frame). When residency changes (`rebuild_as`),
+    //     the cursor resets to 0 to re-sweep; once it passes the last chunk the sweep idles (no per-frame AS work).
+    // `aabb_buf` is the converged GPU-written set (stable across the sweep), so windowed builds across frames
+    // assemble a correct, complete TLAS without any single oversized build.
+    {
+        let n_chunks = resources.scene.as_ref().map(|s| s.chunks.len()).unwrap_or(0);
+        if rebuild_as {
+            resources.blas_rebuild_cursor = 0; // residency changed — start a fresh full sweep
+        }
+        // The per-frame window: bounded so each frame's BLAS build stays well under the backend's whole-set overrun
+        // threshold (≈60k live prims observed). 48 chunks × 512 slots = 24576 slot-prims/frame, comfortably safe.
+        const BLAS_REBUILD_WINDOW: usize = 48;
+        if resources.blas_rebuild_cursor < n_chunks {
+            let _b = info_span!("vox_blas_residency").entered();
+            let aabb_stride = core::mem::size_of::<GpuBrickAabb>() as u64;
+            let start = resources.blas_rebuild_cursor;
+            let end = (start + BLAS_REBUILD_WINDOW).min(n_chunks);
+            let scene = resources.scene.as_mut().expect("n_chunks > 0");
+            // Pass 1 (mutate): recreate THIS WINDOW's chunk BLAS handles (full Build) + re-point their TLAS instances.
+            for i in start..end {
+                let chunk = &mut scene.chunks[i];
+                chunk.blas = create_chunk_blas(device, chunk.prim_count);
+                scene.tlas[i] = Some(wgpu::TlasInstance::new(
+                    &scene.chunks[i].blas,
+                    [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0],
+                    i as u32,
+                    0xff,
+                ));
+            }
+            // Pass 2 (immutable borrow): build THIS WINDOW's BLASes + the TLAS over ALL instances. The non-window
+            // chunks keep their already-built BLASes (built in a prior frame or the StreamSnapshot) — the TLAS
+            // references them validly (a built BLAS persists across submits).
+            let scene = resources.scene.as_ref().expect("n_chunks > 0");
+            let sizes: Vec<wgpu::BlasAABBGeometrySizeDescriptor> = scene.chunks[start..end]
+                .iter()
+                .map(|chunk| wgpu::BlasAABBGeometrySizeDescriptor {
+                    primitive_count: chunk.prim_count,
+                    flags: wgpu::AccelerationStructureGeometryFlags::OPAQUE,
+                })
+                .collect();
+            let geos: Vec<_> = scene.chunks[start..end]
+                .iter()
+                .zip(sizes.iter())
+                .map(|(chunk, size)| wgpu::BlasBuildEntry {
+                    blas: &chunk.blas,
+                    geometry: wgpu::BlasGeometries::AabbGeometries(vec![wgpu::BlasAabbGeometry {
+                        size,
+                        stride: aabb_stride,
+                        aabb_buffer: &scene.aabb_buf,
+                        primitive_offset: chunk.slot_base * aabb_stride as u32,
+                    }]),
+                })
+                .collect();
+            let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("voxel_rt_gpu_residency_blas"),
+            });
             encoder.build_acceleration_structures(geos.iter(), core::iter::once(&scene.tlas));
+            render_queue.submit(core::iter::once(encoder.finish()));
+            resources.blas_rebuild_cursor = end;
         }
     }
 
-    render_queue.submit(core::iter::once(encoder.finish()));
+    // **Diagnostic** (env-gated, blocking — dev only): every ~64 frames dump the front end's resident count + the
+    // live scene aabb_buf stats (live / origin-collapsed / degenerate). Localizes the paged-drive blank: a resident
+    // count climbing toward `max_resident` ⇒ over-enumeration; all-origin AABBs ⇒ the pack tail wrote degenerate.
+    if std::env::var("ADVENTURE_PAGED_DIAG").is_ok() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static FRAME: AtomicU64 = AtomicU64::new(0);
+        let n = FRAME.fetch_add(1, Ordering::Relaxed);
+        if n < 6 || n % 64 == 0 {
+            let fe = resources.gpu_front_end.as_ref().expect("built");
+            let resident = fe.diag_resident_count(device, queue);
+            let (a_cnt, p_cnt, c_cnt, d_cnt, chg) = fe.diag_counts(device, queue);
+            let (idx_hw, pal_hw) = fe.diag_slab_highwater(device, queue);
+            let max_resident_diag = fe.max_resident_diag();
+            let (idx_cap, pal_cap) = {
+                let s = resources.scene.as_ref().expect("checked above");
+                (s.voxel_buf.size() / 4, s.brick_palettes_buf.size() / 4)
+            };
+            // Read back the LIVE scene aabb_buf (now COPY_SRC): how many live / origin-collapsed / degenerate.
+            let scene = resources.scene.as_ref().expect("checked above");
+            let staging = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("paged_diag_aabb_rb"),
+                size: scene.aabb_buf.size(),
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+            });
+            let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("paged_diag_rb") });
+            enc.copy_buffer_to_buffer(&scene.aabb_buf, 0, &staging, 0, scene.aabb_buf.size());
+            render_queue.submit(core::iter::once(enc.finish()));
+            let _ = device.poll(wgpu::PollType::wait_indefinitely());
+            staging.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+            let _ = device.poll(wgpu::PollType::wait_indefinitely());
+            let (mut live, mut origin, mut degen) = (0u64, 0u64, 0u64);
+            let mut bad = 0u64; // NaN / inf AABBs (would corrupt the BVH)
+            let mut lo = [f32::INFINITY; 3];
+            let mut hi = [f32::NEG_INFINITY; 3];
+            if let Ok(data) = staging.slice(..).get_mapped_range() {
+                let aabbs: &[GpuBrickAabb] = bytemuck::cast_slice(&data);
+                for a in aabbs {
+                    let any_bad = a.min.iter().chain(a.max.iter()).any(|v| !v.is_finite());
+                    if any_bad {
+                        bad += 1;
+                    } else if a.min[0] > a.max[0] || a.min[1] > a.max[1] || a.min[2] > a.max[2] {
+                        degen += 1;
+                    } else {
+                        live += 1;
+                        if a.min == [0.0; 3] && a.max == [0.0; 3] {
+                            origin += 1;
+                        }
+                        for k in 0..3 {
+                            lo[k] = lo[k].min(a.min[k]);
+                            hi[k] = hi[k].max(a.max[k]);
+                        }
+                    }
+                }
+                drop(data);
+                staging.unmap();
+            }
+            let line = format!(
+                "PAGED-DIAG frame {n}: fe_resident={resident}/{max_resident_diag} rebuild_as={rebuild_as} prev_change={prev_change:?} | counts aabb={a_cnt} pack={p_cnt} cand={c_cnt} desired={d_cnt} change={chg} | scene_aabb live={live} origin={origin} degen={degen} bad={bad} bbox=[{:.1},{:.1},{:.1}]..[{:.1},{:.1},{:.1}] | slab idx_hw={idx_hw}/{idx_cap} pal_hw={pal_hw}/{pal_cap}\n",
+                lo[0], lo[1], lo[2], hi[0], hi[1], hi[2]
+            );
+            info!("{}", line.trim_end());
+            use std::io::Write;
+            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("D:/tmp_test/paged_diag.txt") {
+                let _ = f.write_all(line.as_bytes());
+            }
+        }
+    }
 
     // Advance the staging ring so the NEXT frame's poll reads THIS frame's change_count copy.
     resources.gpu_front_end.as_mut().expect("built").advance_ring();
