@@ -48,16 +48,20 @@ plain `cargo test --lib` (which includes the soul_scene/assets round-trip tests)
 temp. If you must run the whole thing in one shot, the soul_scene/assets round-trip tests are the
 ones to watch.
 
-### Known pre-existing skip — issue #134 (DLSS default feature)
+### Issue #134 (DLSS default feature) — FIXED
 
-`tests/voxel_cornell_headless.rs::headless_cornell_colours_and_bleed` **panics under the default
-feature set** with `"DlssProjectId was not added"`. `dlss` is a *default* feature
-(`default = ["fast", "physics", "dlss"]` in `Cargo.toml`), and the headless Bevy `App` the rig boots
-does not install the `DlssProjectId` resource the dlss plugin expects. This is tracked as **issue
-#134** and is **left as-is** (not in scope for this pass). It is the one known default-suite failure;
-the Cornell GI correctness it covers is also exercised by `voxel_gi_gpu.rs` (the GI math on single
-rays) and `voxel_render_headless.rs` (the composite reaching the screen). To run the Cornell rig in
-isolation, build without the dlss feature once #134 is closed.
+`dlss` is a *default* feature (`default = ["fast", "physics", "dlss"]` in `Cargo.toml`). With it on,
+`bevy/dlss`'s `DlssInitPlugin` (inside `DefaultPlugins`) panics at device-init time —
+`"DlssProjectId was not added to the App before DlssInitPlugin"` — unless a `DlssProjectId` resource
+is inserted first (the real app does this in `src/main.rs`). Previously the full-App GPU rigs that did
+NOT insert it (`voxel_cornell_headless`, `voxel_temporal_gpu`) failed the default `cargo test`.
+
+**Fixed:** all three full-App rigs (`voxel_cornell_headless`, `voxel_temporal_gpu`,
+`voxel_render_headless`) now boot through the shared `common::HeadlessRender` harness, whose
+constructor (`HeadlessRender::new`) ALWAYS inserts the test `DlssProjectId` before `DefaultPlugins`
+and forces the readback-capturable non-DLSS path. Because that is the only way to build the headless
+render app, the panic is structurally impossible to reintroduce. **`cargo test` now passes under the
+default feature set with no special flags.**
 
 ---
 
@@ -159,7 +163,8 @@ For the record, so a future pass doesn't mistakenly ignore them:
   vectors; the CI gate for shared-seed multiplayer). The `print_reference_vectors` *generator* in
   the same file is the only ignored member.
 - **GPU oracle rigs** — `voxel_raytrace_gpu`, `voxel_render_headless`, `voxel_cornell_headless`
-  (see #134), `voxel_gi_gpu`, `voxel_restir_gi_gpu`, `voxel_world_cache_gpu`, `voxel_lighting_gpu`,
+  (the three full-App rigs share `common::HeadlessRender`; #134 fixed), `voxel_gi_gpu`,
+  `voxel_restir_gi_gpu`, `voxel_world_cache_gpu`, `voxel_lighting_gpu`,
   `voxel_temporal_gpu`, `voxel_seam_gpu`, `voxel_seam_oblique_gpu`, `voxel_dlss_guides_gpu`,
   `voxel_normal_swap`, `voxel_show_through`, `voxel_primitive_offset`, `worldgen_gpu_parity`,
   `voxel_edit`. These build small **synthetic** scenes and assert GPU-vs-CPU ground truth; they skip

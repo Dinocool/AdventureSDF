@@ -15,113 +15,23 @@
 //! Skips cleanly (no failure) on a box without an `EXPERIMENTAL_RAY_QUERY` Vulkan adapter, mirroring the
 //! other GPU rigs.
 
-use std::sync::{Arc, Mutex};
-
-use bevy::camera::RenderTarget;
 use bevy::prelude::*;
-use bevy::render::RenderPlugin;
-use bevy::render::gpu_readback::{Readback, ReadbackComplete};
-use bevy::render::render_resource::{TextureFormat, TextureUsages, WgpuFeatures};
-use bevy::render::settings::{RenderCreation, WgpuSettings};
-use bevy::window::ExitCondition;
-use bevy::winit::WinitPlugin;
 
-use adventure::sdf_render::SdfCamera;
 use adventure::sdf_render::worldgen::layers::erosion::ErosionParams;
 use adventure::sdf_render::worldgen::layers::height::{HeightLayer, HeightParams};
 use adventure::sdf_render::worldgen::{
     WORLDGEN_SLICE_SEED, WorldBiomeShapes, WorldGraph,
 };
 use adventure::voxel::VoxelScene;
-use adventure::voxel::raytrace::{VoxelRtPatch, VoxelRtPlugin, VoxelRtToggle};
+use adventure::voxel::raytrace::{VoxelRtPatch, VoxelRtToggle};
 use adventure::voxel::streaming::StreamingConfig;
 
 mod common;
+use common::HeadlessRender;
 
 /// Offscreen render-target dimensions. Small + square keeps the readback cheap and deterministic.
 const W: u32 = 256;
 const H: u32 = 256;
-
-/// The CPU-side latest readback of the render target (raw `Rgba8UnormSrgb` bytes, row-padded by the GPU
-/// copy). Filled by the `ReadbackComplete` observer in the render-driven app; read by the test thread after
-/// the frames run.
-#[derive(Resource, Clone)]
-struct LatestFrame(Arc<Mutex<Option<Vec<u8>>>>);
-
-/// wgpu settings enabling AABB-BLAS `ray_query` — the SAME feature the app's `main.rs` requests. Bevy 0.19
-/// enables `ExperimentalFeatures` at device creation unconditionally, so this flag is all that's needed.
-fn rt_wgpu_settings() -> WgpuSettings {
-    WgpuSettings {
-        features: WgpuFeatures::EXPERIMENTAL_RAY_QUERY,
-        ..default()
-    }
-}
-
-/// #134 fix — insert the DLSS project UUID the `dlss`-build `DlssInitPlugin` REQUIRES before `DefaultPlugins`.
-/// On the default feature set (`dlss` on) `bevy/dlss` registers `DlssInitPlugin`, which panics at device-init
-/// time unless a `DlssProjectId` resource is already present (mirrors `src/main.rs`). A no-op without `dlss`.
-/// Must be called BEFORE `app.add_plugins(DefaultPlugins…)`.
-#[cfg(feature = "dlss")]
-fn insert_dlss_project_id(app: &mut App) {
-    app.insert_resource(bevy::anti_alias::dlss::DlssProjectId(
-        bevy::asset::uuid::uuid!("b4f1d2c8-3a7e-4d92-9f60-7c5e1a8b3d04"),
-    ));
-}
-#[cfg(not(feature = "dlss"))]
-fn insert_dlss_project_id(_app: &mut App) {}
-
-/// #134 fix — force the NON-DLSS render path for the headless rigs (dlss build only). DLSS-RR resolves into a
-/// swapchain-shaped output the offscreen `Readback` does not capture, so with RR attached the readback reads an
-/// all-zero (black) frame and every render-correctness assert fails. Setting `DlssSettings.enabled = false`
-/// makes `sync_dlss_camera` never attach the `Dlss` component → the temporal-accumulation fallback writes the
-/// offscreen target the readback DOES capture (the SAME path the non-dlss build always uses, so the rig tests
-/// the same composite either way). A no-op without `dlss`. Call AFTER `app.add_plugins(VoxelRtPlugin)` so it
-/// overrides the plugin's `init_resource` default.
-#[cfg(feature = "dlss")]
-fn disable_dlss_for_headless(app: &mut App) {
-    app.insert_resource(adventure::voxel::raytrace::DlssSettings {
-        enabled: false,
-        mode: bevy::anti_alias::dlss::DlssPerfQualityMode::Quality,
-    });
-}
-#[cfg(not(feature = "dlss"))]
-fn disable_dlss_for_headless(_app: &mut App) {}
-
-/// Pump frames until the latest read-back frame is meaningfully LIT (a non-trivial centre mean luma — the
-/// terrain actually rendered), capped at a generous budget, then return the latched bytes. The STREAMING
-/// worldgen scene takes a variable number of frames to: stream + voxelize the region around the camera,
-/// re-pack + extract the patch, build the BLAS/TLAS, raymarch + composite, and finally land the async readback
-/// (a few frames deep). A FIXED frame count is fragile — its tail can latch a stale warm-up (black) readback
-/// before the surface is resident + lit (the D1a 0.05 m / wider clipmap made the old fixed-24 budget too small,
-/// #134). Pump-until-lit mirrors `voxel_cornell_headless` and is robust to readback latency. Returns the lit
-/// bytes, or the last bytes seen (so the caller's asserts produce a meaningful diagnostic on a genuine failure).
-fn pump_until_lit(app: &mut App, latest: &LatestFrame) -> Vec<u8> {
-    let unpadded_row = (W * 4) as usize;
-    let padded_row = bevy::render::renderer::RenderDevice::align_copy_bytes_per_row(unpadded_row);
-    let mut last = Vec::new();
-    for _ in 0..120 {
-        app.update();
-        if let Some(b) = latest.0.lock().unwrap().clone()
-            && b.len() >= padded_row * H as usize
-        {
-            // Mean luma over the centre of the frame — non-trivial once the terrain has actually rendered.
-            let mut sum = 0.0f32;
-            let mut n = 0.0f32;
-            for y in (H as usize / 4)..(H as usize * 3 / 4) {
-                for x in (W as usize / 4)..(W as usize * 3 / 4) {
-                    let p = &b[y * padded_row + x * 4..y * padded_row + x * 4 + 4];
-                    sum += 0.2126 * p[0] as f32 + 0.7152 * p[1] as f32 + 0.0722 * p[2] as f32;
-                    n += 1.0;
-                }
-            }
-            last = b;
-            if sum / n > 10.0 {
-                break;
-            }
-        }
-    }
-    last
-}
 
 /// Build a `HeightLayer` from the default worldgen resources — the same direct-construction path the voxel
 /// modules use — so the test can find the origin surface height to frame the camera.
@@ -133,121 +43,76 @@ fn default_layer() -> HeightLayer {
     adventure::voxel::build_height_layer_pub(&height, &erosion, &graph, &shapes)
 }
 
-#[test]
-fn headless_render_shows_voxels() {
-    // Probe for a ray-query-capable adapter first; skip cleanly if absent (CI box without RT).
-    if common::headless_ray_query_device().is_none() {
-        eprintln!("no ray-query device — skipping headless_render_shows_voxels");
-        return;
-    }
-
-    // Camera framing: look at the origin-column surface from a fixed, close distance so the surface bricks
-    // sit comfortably INSIDE the streaming residency region (which is centred on the camera). Deterministic
-    // — fixed seed, fixed transform.
+/// The deterministic camera framing for the streamed-worldgen rigs: look down at the origin-column surface
+/// from ~9 m, gently above + at a fixed yaw/pitch, so the surface bricks sit well INSIDE the camera-centred
+/// streaming residency region. Shared by both worldgen render tests so they frame the SAME view.
+fn worldgen_camera() -> (Vec3, Vec3) {
     let layer = default_layer();
     let surface_y = layer.sample_world(0.0, 0.0, WORLDGEN_SLICE_SEED).height;
     let target = Vec3::new(0.0, surface_y, 0.0);
-    // Close in (~9 m), gently above, looking down at the surface so the looked-at terrain sits well INSIDE
-    // the streaming residency region (which is centred on the camera) — otherwise the surface at the target
-    // is never resident and every ray misses into sky.
-    let yaw = 0.7f32;
-    let pitch = 0.45f32;
-    let distance = 9.0f32;
+    let (yaw, pitch, distance) = (0.7f32, 0.45f32, 9.0f32);
     let cam_pos = target
         + Vec3::new(
             distance * yaw.cos() * pitch.cos(),
             distance * pitch.sin(),
             distance * yaw.sin() * pitch.cos(),
         );
+    (cam_pos, target)
+}
 
-    let latest = LatestFrame(Arc::new(Mutex::new(None)));
-
-    let mut app = App::new();
-    // #134 — with default features (`dlss`), `bevy/dlss`'s `DlssInitPlugin` (inside `DefaultPlugins`) PANICS unless
-    // a `DlssProjectId` is present BEFORE it runs. The app's `main.rs` inserts one; the headless rigs must too, or
-    // the test dies before a single frame. Insert it BEFORE `DefaultPlugins` (gated to the `dlss` build only).
-    insert_dlss_project_id(&mut app);
-    app.add_plugins(
-        DefaultPlugins
-            .set(WindowPlugin {
-                primary_window: None,
-                exit_condition: ExitCondition::DontExit,
-                ..default()
-            })
-            .disable::<WinitPlugin>()
-            .set(RenderPlugin {
-                render_creation: RenderCreation::Automatic(Box::new(rt_wgpu_settings())),
-                ..default()
-            }),
-    );
-    // A tight clipmap so the surface around the camera voxelizes in a handful of frames (the production
-    // Default clip_half-160 clipmap / 400k-brick cap would need many frames to drain). Inserted BEFORE Startup so
-    // `init_voxel_rt_streaming` picks it up.
-    app.insert_resource(StreamingConfig {
+/// Wire the streamed-worldgen scene into a freshly-built [`HeadlessRender`]: a tight clipmap so the surface
+/// voxelizes in a handful of frames (the production clip_half-160 / 400k cap would need many), the worldgen
+/// sampling resources the streaming reads, and the explicit `Worldgen` scene select (the engine now boots
+/// Cornell). The camera is the SHARED [`worldgen_camera`] framing. Shared by both worldgen render rigs.
+fn setup_worldgen(hr: &mut HeadlessRender, toggle: VoxelRtToggle) {
+    // A tight clipmap so the surface around the camera voxelizes in a handful of frames. Inserted BEFORE
+    // Startup so `init_voxel_rt_streaming` picks it up.
+    hr.app.insert_resource(StreamingConfig {
         clip_half_bricks: 4,
         max_resident_bricks: 30_000,
         max_bricks_per_frame: 8192,
     });
-    // Worldgen sampling resources the voxel streaming reads (the app gets these from SdfScenePlugin; the test
-    // inserts the defaults directly to stay minimal).
-    app.init_resource::<HeightParams>()
+    // Worldgen sampling resources the voxel streaming reads (the app gets these from SdfScenePlugin; the
+    // test inserts the defaults directly to stay minimal).
+    hr.app
+        .init_resource::<HeightParams>()
         .init_resource::<ErosionParams>()
         .init_resource::<WorldGraph>()
         .init_resource::<WorldBiomeShapes>();
-    app.add_plugins(VoxelRtPlugin);
-    disable_dlss_for_headless(&mut app); // #134 — force the readback-capturable non-DLSS path (dlss build only).
-    // This rig validates the STREAMING WORLDGEN path, so select it explicitly (the engine now defaults to
-    // the static Cornell box). The dedicated `voxel_cornell_headless` rig covers the Cornell scene.
-    app.insert_resource(VoxelScene::Worldgen);
-    // HW-RT is the default renderer now — assert that, then keep it on for the render.
-    assert!(
-        app.world().resource::<VoxelRtToggle>().enabled,
-        "VoxelRtToggle must default ON (HW-RT is the default renderer)"
-    );
+    hr.app.insert_resource(VoxelScene::Worldgen);
+    hr.app.insert_resource(toggle);
+    hr.app.insert_resource(ClearColor(Color::srgb(0.9, 0.0, 0.9))); // a garish magenta — must NOT survive.
 
-    app.insert_resource(latest.clone());
-    app.insert_resource(ClearColor(Color::srgb(0.9, 0.0, 0.9))); // a garish magenta — must NOT survive.
+    let (cam_pos, target) = worldgen_camera();
+    hr.spawn_camera(cam_pos, target, "Headless RT Camera");
+}
 
-    // The offscreen render target image (readable: TEXTURE_BINDING | COPY_SRC | RENDER_ATTACHMENT).
-    let image_handle = {
-        let mut images = app.world_mut().resource_mut::<Assets<Image>>();
-        let mut image = Image::new_target_texture(W, H, TextureFormat::Rgba8UnormSrgb, None);
-        image.texture_descriptor.usage |= TextureUsages::COPY_SRC;
-        images.add(image)
+#[test]
+fn headless_render_shows_voxels() {
+    // Boots the shared headless render app (#134 DLSS fix lives in the harness); skips cleanly without a
+    // ray-query device.
+    let Some(mut hr) = HeadlessRender::new(W, H) else {
+        eprintln!("no ray-query device — skipping headless_render_shows_voxels");
+        return;
     };
 
-    // The camera: offscreen target, SdfCamera (so streaming follows it), Hdr (linear Rgba16Float main
-    // texture + tonemapping, matching the app's editor camera), MSAA off.
-    app.world_mut().spawn((
-        Camera3d::default(),
-        RenderTarget::Image(image_handle.clone().into()),
-        bevy::camera::Hdr,
-        Msaa::Off,
-        Transform::from_translation(cam_pos).looking_at(target, Vec3::Y),
-        SdfCamera,
-        Name::new("Headless RT Camera"),
-    ));
+    // HW-RT is the default renderer — assert that, then wire the STREAMING WORLDGEN scene (the dedicated
+    // `voxel_cornell_headless` rig covers the static Cornell box).
+    assert!(
+        hr.app.world().resource::<VoxelRtToggle>().enabled,
+        "VoxelRtToggle must default ON (HW-RT is the default renderer)"
+    );
+    setup_worldgen(&mut hr, VoxelRtToggle { enabled: true, ..Default::default() });
 
-    // Read the render-target image back every frame; stash the latest bytes for the test thread.
-    let sink = latest.0.clone();
-    app.world_mut()
-        .spawn(Readback::texture(image_handle.clone()))
-        .observe(move |event: On<ReadbackComplete>| {
-            *sink.lock().unwrap() = Some(event.data.clone());
-        });
-
-    // Manual update loops must `finish` + `cleanup` the plugins first (this is what `App::run` does): it
-    // unpacks the async-created `RenderDevice` into the main world. Without it, the PBR main-world systems
-    // (`no_automatic_skin_batching` etc.) panic on a missing `RenderDevice` on the first frame.
-    app.finish();
-    app.cleanup();
-
-    // Pump frames until the streamed terrain is resident, built, composited, and the async readback lands
-    // LIT (robust to readback latency — see `pump_until_lit`; a fixed budget was too small post-D1a, #134).
-    let bytes = pump_until_lit(&mut app, &latest);
+    // Manual update loops must `finish` + `cleanup` the plugins first (unpacks the async `RenderDevice` into
+    // the main world); the harness does both. Then pump frames until the streamed terrain is resident, built,
+    // composited, and the async readback lands LIT (robust to readback latency — a fixed budget was too small
+    // post-D1a, #134).
+    hr.finalize();
+    let bytes = hr.pump_until_lit(120, 10.0);
 
     // Sanity: the streamed patch actually has resident bricks (the surface near the camera voxelized).
-    let patch = app.world().resource::<VoxelRtPatch>();
+    let patch = hr.app.world().resource::<VoxelRtPatch>();
     assert!(
         !patch.upload.is_empty(),
         "the streamed brick set must be non-empty (surface near the camera voxelized) — got 0 bricks"
@@ -258,7 +123,7 @@ fn headless_render_shows_voxels() {
 
     // The GPU copy pads each row up to COPY_BYTES_PER_ROW_ALIGNMENT (256). Recover the real pixels per row.
     let unpadded_row = (W * 4) as usize;
-    let padded_row = bevy::render::renderer::RenderDevice::align_copy_bytes_per_row(unpadded_row);
+    let padded_row = hr.padded_row();
     assert!(
         bytes.len() >= padded_row * H as usize,
         "readback too small: {} bytes < {} expected",
@@ -588,86 +453,16 @@ fn gpu_pack_render_pixel_identical_to_cpu() {
 /// else (seed, camera, clipmap, frame count) so the only difference is HOW the pool/AABB/BLAS are written — the
 /// rendered result must match. Factored from `headless_render_shows_voxels`'s setup.
 fn render_worldgen_frame(gpu_pack: bool) -> Vec<u8> {
-    let layer = default_layer();
-    let surface_y = layer.sample_world(0.0, 0.0, WORLDGEN_SLICE_SEED).height;
-    let target = Vec3::new(0.0, surface_y, 0.0);
-    let yaw = 0.7f32;
-    let pitch = 0.45f32;
-    let distance = 9.0f32;
-    let cam_pos = target
-        + Vec3::new(
-            distance * yaw.cos() * pitch.cos(),
-            distance * pitch.sin(),
-            distance * yaw.sin() * pitch.cos(),
-        );
-
-    let latest = LatestFrame(Arc::new(Mutex::new(None)));
-
-    let mut app = App::new();
-    // #134 — see `headless_render_shows_voxels`: insert `DlssProjectId` BEFORE `DefaultPlugins` (dlss build only).
-    insert_dlss_project_id(&mut app);
-    app.add_plugins(
-        DefaultPlugins
-            .set(WindowPlugin {
-                primary_window: None,
-                exit_condition: ExitCondition::DontExit,
-                ..default()
-            })
-            .disable::<WinitPlugin>()
-            .set(RenderPlugin {
-                render_creation: RenderCreation::Automatic(Box::new(rt_wgpu_settings())),
-                ..default()
-            }),
-    );
-    app.insert_resource(StreamingConfig {
-        clip_half_bricks: 4,
-        max_resident_bricks: 30_000,
-        max_bricks_per_frame: 8192,
-    });
-    app.init_resource::<HeightParams>()
-        .init_resource::<ErosionParams>()
-        .init_resource::<WorldGraph>()
-        .init_resource::<WorldBiomeShapes>();
-    app.add_plugins(VoxelRtPlugin);
-    disable_dlss_for_headless(&mut app); // #134 — force the readback-capturable non-DLSS path (dlss build only).
-    app.insert_resource(VoxelScene::Worldgen);
+    // The caller (`gpu_pack_render_pixel_identical_to_cpu`) already probed for the device, so `new` succeeds.
+    let mut hr = HeadlessRender::new(W, H).expect("ray-query device (caller probed)");
     // The A/B flag under test: flip the gpu_pack path on/off (HW-RT itself stays on for both).
-    app.insert_resource(VoxelRtToggle { enabled: true, gpu_pack, ..Default::default() });
-
-    app.insert_resource(latest.clone());
-    app.insert_resource(ClearColor(Color::srgb(0.9, 0.0, 0.9)));
-
-    let image_handle = {
-        let mut images = app.world_mut().resource_mut::<Assets<Image>>();
-        let mut image = Image::new_target_texture(W, H, TextureFormat::Rgba8UnormSrgb, None);
-        image.texture_descriptor.usage |= TextureUsages::COPY_SRC;
-        images.add(image)
-    };
-
-    app.world_mut().spawn((
-        Camera3d::default(),
-        RenderTarget::Image(image_handle.clone().into()),
-        bevy::camera::Hdr,
-        Msaa::Off,
-        Transform::from_translation(cam_pos).looking_at(target, Vec3::Y),
-        SdfCamera,
-        Name::new("Headless RT Camera"),
-    ));
-
-    let sink = latest.0.clone();
-    app.world_mut()
-        .spawn(Readback::texture(image_handle.clone()))
-        .observe(move |event: On<ReadbackComplete>| {
-            *sink.lock().unwrap() = Some(event.data.clone());
-        });
-
-    app.finish();
-    app.cleanup();
+    setup_worldgen(&mut hr, VoxelRtToggle { enabled: true, gpu_pack, ..Default::default() });
+    hr.finalize();
     // Pump-until-lit (robust to readback latency — both A/B runs use the SAME budget so the comparison is fair).
-    let bytes = pump_until_lit(&mut app, &latest);
+    let bytes = hr.pump_until_lit(120, 10.0);
 
     // Sanity: voxels actually voxelized (so the comparison is meaningful, not two empty frames).
-    let patch = app.world().resource::<VoxelRtPatch>();
+    let patch = hr.app.world().resource::<VoxelRtPatch>();
     assert!(
         !patch.upload.is_empty(),
         "the streamed brick set must be non-empty (gpu_pack={gpu_pack}) — got 0 bricks"

@@ -12,8 +12,7 @@
 //!
 //! Skips cleanly when no GPU adapter is present (plain compute — no special features).
 
-use adventure::voxel::brickmap::{BRICK_EDGE, Brick, BrickMap, MAX_LOD, brick_span};
-use adventure::voxel::palette::BlockId;
+use adventure::voxel::brickmap::{BrickMap, MAX_LOD, brick_span};
 use adventure::voxel::residency_gpu::SectorOccupancy;
 use adventure::voxel::source::StaticVoxSource;
 use adventure::voxel::streaming::{
@@ -302,49 +301,13 @@ fn readback_bytes(device: &wgpu::Device, queue: &wgpu::Queue, buf: &wgpu::Buffer
     data
 }
 
-/// A representative static scene: a hollow box shell + a partly-solid slab + an isolated cluster, spanning
-/// enough bricks that several LOD shells thread through it (so the coarse-LOD enumeration + the cross-LOD
-/// hole-clip are exercised) AND spanning NEGATIVE coords (the clipmap reaches both signs). All bricks fully
-/// solid except the slab top layer (PARTIAL bricks ⇒ always Surface), so both the `is_full`/Interior cull and
-/// the partial-overrides-occlusion path are present.
+/// A representative static scene: a partly-solid slab + a tall pillar + an isolated cluster, spanning enough
+/// bricks that several LOD shells thread through it (so the coarse-LOD enumeration + the cross-LOD hole-clip
+/// are exercised) AND spanning NEGATIVE coords (the clipmap reaches both signs). All bricks fully solid except
+/// the slab top layer (PARTIAL bricks ⇒ always Surface), so both the `is_full`/Interior cull and the
+/// partial-overrides-occlusion path are present. Shared SSOT — see [`common::slab_pillar_cluster_scene`].
 fn representative_scene() -> BrickMap {
-    let mut map = BrickMap::new();
-    let n = (BRICK_EDGE * BRICK_EDGE * BRICK_EDGE) as usize;
-    let full = |id: u16| {
-        let mut v = Box::new([BlockId::AIR; (BRICK_EDGE * BRICK_EDGE * BRICK_EDGE) as usize]);
-        v.iter_mut().for_each(|c| *c = BlockId(id));
-        Brick::from_voxels(v)
-    };
-    let partial = |id: u16| {
-        let mut v = Box::new([BlockId(id); (BRICK_EDGE * BRICK_EDGE * BRICK_EDGE) as usize]);
-        v[0] = BlockId::AIR; // one interior air voxel ⇒ never `is_full` ⇒ always Surface
-        Brick::from_voxels(v)
-    };
-    let _ = n;
-
-    // A solid 6×3×6 ground slab straddling the origin into negative coords; the TOP layer is partial (exposed),
-    // the bottom layers full (so interior bricks are buried ⇒ Interior).
-    for z in -3..3 {
-        for x in -3..3 {
-            for y in 0..3 {
-                let brick = if y == 2 { partial(2) } else { full(1) };
-                map.insert(IVec3::new(x, y, z), brick);
-            }
-        }
-    }
-    // A taller pillar so the surface threads up through finer→coarser shells (LOD-seam crossings).
-    for y in 3..10 {
-        map.insert(IVec3::new(0, y, 0), full(3));
-    }
-    // An isolated cluster off in +X to exercise a far shell at a positive offset.
-    for z in 0..2 {
-        for y in 0..2 {
-            for x in 0..2 {
-                map.insert(IVec3::new(15 + x, 4 + y, 15 + z), full(4));
-            }
-        }
-    }
-    map
+    common::slab_pillar_cluster_scene()
 }
 
 /// **THE GATE — GPU enumerate + face-cull ≡ the CPU surface oracle, EXACTLY**, over several camera positions

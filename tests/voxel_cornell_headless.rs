@@ -18,64 +18,27 @@
 //! Skips cleanly (no failure) on a box without an `EXPERIMENTAL_RAY_QUERY` Vulkan adapter, like the other
 //! GPU rigs.
 
-use std::sync::{Arc, Mutex};
-
-use bevy::camera::RenderTarget;
 use bevy::prelude::*;
-use bevy::render::RenderPlugin;
-use bevy::render::gpu_readback::{Readback, ReadbackComplete};
-use bevy::render::render_resource::{TextureFormat, TextureUsages, WgpuFeatures};
-use bevy::render::settings::{RenderCreation, WgpuSettings};
-use bevy::window::ExitCondition;
-use bevy::winit::WinitPlugin;
 
-use adventure::sdf_render::SdfCamera;
 use adventure::voxel::VoxelScene;
 use adventure::voxel::cornell::{interior_center_world, interior_extent_world};
-use adventure::voxel::raytrace::{VoxelRtPatch, VoxelRtPlugin, VoxelRtToggle};
+use adventure::voxel::raytrace::{VoxelRtPatch, VoxelRtToggle};
 
 mod common;
+use common::HeadlessRender;
 
 /// Offscreen render-target dimensions. Small + square keeps the readback cheap and deterministic.
 const W: u32 = 256;
 const H: u32 = 256;
 
-/// CPU-side latest readback of the render target (raw `Rgba8UnormSrgb` bytes, row-padded by the GPU copy).
-#[derive(Resource, Clone)]
-struct LatestFrame(Arc<Mutex<Option<Vec<u8>>>>);
-
-/// wgpu settings enabling AABB-BLAS `ray_query` — the same feature `main.rs` requests.
-fn rt_wgpu_settings() -> WgpuSettings {
-    WgpuSettings { features: WgpuFeatures::EXPERIMENTAL_RAY_QUERY, ..default() }
-}
-
-/// One read-back RGB pixel at `(x, y)`.
-fn px(bytes: &[u8], padded_row: usize, x: usize, y: usize) -> (f32, f32, f32) {
-    let row = &bytes[y * padded_row..];
-    (row[x * 4] as f32, row[x * 4 + 1] as f32, row[x * 4 + 2] as f32)
-}
-
-/// Average RGB over a rectangular screen region `[x0,x1) × [y0,y1)` (returns linear-ish 0..255 means).
-fn region_mean(bytes: &[u8], padded_row: usize, x0: usize, x1: usize, y0: usize, y1: usize) -> (f32, f32, f32) {
-    let (mut r, mut g, mut b, mut n) = (0.0, 0.0, 0.0, 0.0);
-    for y in y0..y1 {
-        for x in x0..x1 {
-            let (pr, pg, pb) = px(bytes, padded_row, x, y);
-            r += pr;
-            g += pg;
-            b += pb;
-            n += 1.0;
-        }
-    }
-    (r / n, g / n, b / n)
-}
-
 #[test]
 fn headless_cornell_colours_and_bleed() {
-    if common::headless_ray_query_device().is_none() {
+    // Boots the shared headless render app (#134 DLSS fix lives in the harness); skips cleanly without a
+    // ray-query device.
+    let Some(mut hr) = HeadlessRender::new(W, H) else {
         eprintln!("no ray-query device — skipping headless_cornell_colours_and_bleed");
         return;
-    }
+    };
 
     // Frame the OPEN front (−Z) of the static box, looking +Z so the box fills the view. The camera sits
     // back along −Z from the interior centre by ~1.1× the interior extent (close enough that the walls fill
@@ -88,101 +51,37 @@ fn headless_cornell_colours_and_bleed() {
     let target = Vec3::new(cx, cy + extent * 0.12, cz);
     let cam_pos = Vec3::new(cx + extent * 0.06, cy, cz - extent * 1.15);
 
-    let latest = LatestFrame(Arc::new(Mutex::new(None)));
-
-    let mut app = App::new();
-    app.add_plugins(
-        DefaultPlugins
-            .set(WindowPlugin {
-                primary_window: None,
-                exit_condition: ExitCondition::DontExit,
-                ..default()
-            })
-            .disable::<WinitPlugin>()
-            .set(RenderPlugin {
-                render_creation: RenderCreation::Automatic(Box::new(rt_wgpu_settings())),
-                ..default()
-            }),
-    );
-    app.add_plugins(VoxelRtPlugin);
-
     // This rig validates the static CORNELL scene. The engine now boots into the large streamed Worldgen
     // scene by default (Phase 2.6 — the primary GI showcase); Cornell stays reachable via the `V` toggle and
     // is the correctness anchor. Select it explicitly here (it is no longer the boot default).
-    app.insert_resource(VoxelScene::Cornell);
-    assert!(app.world().resource::<VoxelRtToggle>().enabled, "HW-RT must default ON");
+    hr.app.insert_resource(VoxelScene::Cornell);
+    assert!(hr.app.world().resource::<VoxelRtToggle>().enabled, "HW-RT must default ON");
+    hr.app.insert_resource(ClearColor(Color::srgb(0.9, 0.0, 0.9))); // garish magenta — must NOT survive.
 
-    app.insert_resource(latest.clone());
-    app.insert_resource(ClearColor(Color::srgb(0.9, 0.0, 0.9))); // garish magenta — must NOT survive.
-
-    let image_handle = {
-        let mut images = app.world_mut().resource_mut::<Assets<Image>>();
-        let mut image = Image::new_target_texture(W, H, TextureFormat::Rgba8UnormSrgb, None);
-        image.texture_descriptor.usage |= TextureUsages::COPY_SRC;
-        images.add(image)
-    };
-
-    app.world_mut().spawn((
-        Camera3d::default(),
-        RenderTarget::Image(image_handle.clone().into()),
-        bevy::camera::Hdr,
-        Msaa::Off,
-        Transform::from_translation(cam_pos).looking_at(target, Vec3::Y),
-        SdfCamera,
-        Name::new("Headless Cornell Camera"),
-    ));
-
-    let sink = latest.0.clone();
-    app.world_mut()
-        .spawn(Readback::texture(image_handle.clone()))
-        .observe(move |event: On<ReadbackComplete>| {
-            *sink.lock().unwrap() = Some(event.data.clone());
-        });
-
-    app.finish();
-    app.cleanup();
+    hr.spawn_camera(cam_pos, target, "Headless Cornell Camera");
+    hr.finalize();
 
     let unpadded_row = (W * 4) as usize;
-    let padded_row = bevy::render::renderer::RenderDevice::align_copy_bytes_per_row(unpadded_row);
+    let padded_row = hr.padded_row();
 
     // The Cornell box is static + tiny: it packs on the first streaming tick, the BLAS/TLAS builds once, then
     // the composite + readback run. The GPU readback pipeline is a few frames deep and lands ASYNCHRONOUSLY,
     // so rather than a fixed frame count (whose tail can latch a stale warmup readback) we PUMP frames until
     // the latest read-back frame is meaningfully LIT (a non-trivial mean luma — the box rendered), capped at
     // a generous budget. This is robust to readback latency without weakening any colour assertion below.
-    let mut bytes = Vec::new();
-    let mut lit = false;
-    for _ in 0..120 {
-        app.update();
-        if let Some(b) = latest.0.lock().unwrap().clone()
-            && b.len() >= padded_row * H as usize
-        {
-            // Mean luma over the centre of the frame — non-trivial once the box has actually rendered.
-            let mut sum = 0.0f32;
-            let mut n = 0.0f32;
-            for y in (H as usize / 4)..(H as usize * 3 / 4) {
-                for x in (W as usize / 4)..(W as usize * 3 / 4) {
-                    let (r, g, bl) = px(&b, padded_row, x, y);
-                    sum += 0.2126 * r + 0.7152 * g + 0.0722 * bl;
-                    n += 1.0;
-                }
-            }
-            if sum / n > 10.0 {
-                bytes = b;
-                lit = true;
-                break;
-            }
-        }
-    }
+    let bytes = hr.pump_until_lit(120, 10.0);
+    let lit = !bytes.is_empty() && hr.centre_mean_luma(&bytes) > 10.0;
 
     // The static patch is resident (the box voxelized).
-    let patch = app.world().resource::<VoxelRtPatch>();
+    let patch = hr.app.world().resource::<VoxelRtPatch>();
     assert!(!patch.upload.is_empty(), "the static Cornell brick set must be non-empty");
     assert!(lit, "the Cornell box never rendered a lit frame within the frame budget");
     assert!(bytes.len() >= padded_row * H as usize, "readback too small");
 
     let w = W as usize;
     let h = H as usize;
+    // The shared row-padded readback helpers (same signatures as the old in-file ones).
+    use common::{px, region_mean};
 
     // --- Region means ---------------------------------------------------------------------------------
     // Camera looks +Z (up +Y). With Bevy's right-handed `looking_at`, the camera's local +X (screen-right)
