@@ -536,6 +536,60 @@ impl HeadlessRender {
     }
 }
 
+// ===========================================================================================
+// Shared synthetic-scene builders for the CPU/GPU residency + enumerate parity rigs.
+// ===========================================================================================
+
+use adventure::voxel::brickmap::{BRICK_EDGE, Brick, BrickMap};
+use adventure::voxel::palette::BlockId;
+use bevy::math::IVec3;
+
+const BRICK_VOXELS: usize = (BRICK_EDGE * BRICK_EDGE * BRICK_EDGE) as usize;
+
+/// A fully-solid brick of block `id` (every voxel set). `is_full` ⇒ Interior when buried.
+pub fn full_brick(id: u16) -> Brick {
+    let mut v = Box::new([BlockId(id); BRICK_VOXELS]);
+    // (Start from the requested id; AIR base would be identical after the fill, but this is the SSOT form.)
+    v.iter_mut().for_each(|c| *c = BlockId(id));
+    Brick::from_voxels(v)
+}
+
+/// A nearly-solid brick of block `id` with ONE interior air voxel — so it is never `is_full`, hence always
+/// classified Surface (exposed) regardless of neighbours. The parity rigs use this for exposed top layers.
+pub fn partial_brick(id: u16) -> Brick {
+    let mut v = Box::new([BlockId(id); BRICK_VOXELS]);
+    v[0] = BlockId::AIR;
+    Brick::from_voxels(v)
+}
+
+/// **The shared "representative" parity scene** (`voxel_gpu_enumerate_parity` ≡ `voxel_gpu_residency_diff_parity`
+/// used byte-identical copies of this). A solid 6×3×6 ground slab straddling the origin into negative coords
+/// (top layer partial/exposed, lower layers full/buried ⇒ Interior), a tall pillar threading the surface up
+/// through finer→coarser shells (LOD-seam crossings), and an isolated +X cluster exercising a far positive
+/// shell. Exercises Surface/Interior classification, negative coords, and shell crossings in one scene.
+pub fn slab_pillar_cluster_scene() -> BrickMap {
+    let mut map = BrickMap::new();
+    for z in -3..3 {
+        for x in -3..3 {
+            for y in 0..3 {
+                let brick = if y == 2 { partial_brick(2) } else { full_brick(1) };
+                map.insert(IVec3::new(x, y, z), brick);
+            }
+        }
+    }
+    for y in 3..10 {
+        map.insert(IVec3::new(0, y, 0), full_brick(3));
+    }
+    for z in 0..2 {
+        for y in 0..2 {
+            for x in 0..2 {
+                map.insert(IVec3::new(15 + x, 4 + y, 15 + z), full_brick(4));
+            }
+        }
+    }
+    map
+}
+
 /// One read-back RGB pixel at `(x, y)` given the row-padding stride.
 pub fn px(bytes: &[u8], padded_row: usize, x: usize, y: usize) -> (f32, f32, f32) {
     let row = &bytes[y * padded_row..];

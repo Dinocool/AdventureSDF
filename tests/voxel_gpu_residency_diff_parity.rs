@@ -32,9 +32,9 @@
 //!
 //! Skips cleanly when no GPU adapter (or its compute limit is too low for the 512-wide enumerate workgroup).
 
-use adventure::voxel::brickmap::{BRICK_EDGE, Brick, BrickMap, MAX_LOD, brick_span};
+use adventure::voxel::brickmap::{BrickMap, MAX_LOD, brick_span};
 use adventure::voxel::edits::VoxelEdits;
-use adventure::voxel::palette::{BlockId, BlockRegistry};
+use adventure::voxel::palette::BlockRegistry;
 use adventure::voxel::residency_gpu::{GpuResidencyDiffConfig, SectorOccupancy, brick_key_hash};
 use adventure::voxel::source::StaticVoxSource;
 use adventure::voxel::streaming::{
@@ -478,38 +478,10 @@ fn cpu_resident_set(mgr: &ResidencyManager) -> HashSet<(IVec3, u32)> {
 // =========================================================================================================
 
 /// A representative static scene with full + partial bricks, a tall pillar threading LOD shells, an isolated
-/// far cluster, and negative-coord geometry. (Same shape as the G-c.1 enumerate-parity scene.)
+/// far cluster, and negative-coord geometry. Shared SSOT — see [`common::slab_pillar_cluster_scene`] (the
+/// G-c.1 enumerate-parity rig uses the same scene).
 fn representative_scene() -> BrickMap {
-    let mut map = BrickMap::new();
-    let full = |id: u16| {
-        let mut v = Box::new([BlockId::AIR; (BRICK_EDGE * BRICK_EDGE * BRICK_EDGE) as usize]);
-        v.iter_mut().for_each(|c| *c = BlockId(id));
-        Brick::from_voxels(v)
-    };
-    let partial = |id: u16| {
-        let mut v = Box::new([BlockId(id); (BRICK_EDGE * BRICK_EDGE * BRICK_EDGE) as usize]);
-        v[0] = BlockId::AIR;
-        Brick::from_voxels(v)
-    };
-    for z in -3..3 {
-        for x in -3..3 {
-            for y in 0..3 {
-                let brick = if y == 2 { partial(2) } else { full(1) };
-                map.insert(IVec3::new(x, y, z), brick);
-            }
-        }
-    }
-    for y in 3..10 {
-        map.insert(IVec3::new(0, y, 0), full(3));
-    }
-    for z in 0..2 {
-        for y in 0..2 {
-            for x in 0..2 {
-                map.insert(IVec3::new(15 + x, 4 + y, 15 + z), full(4));
-            }
-        }
-    }
-    map
+    common::slab_pillar_cluster_scene()
 }
 
 fn registry() -> BlockRegistry {
