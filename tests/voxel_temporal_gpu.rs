@@ -13,33 +13,17 @@
 //! temporal noise is MUCH lower than the early window's: a still camera's displayed pixels barely change once
 //! the running mean has settled. Skips cleanly without a ray-query adapter.
 
-use std::sync::{Arc, Mutex};
-
-use bevy::camera::RenderTarget;
 use bevy::prelude::*;
-use bevy::render::RenderPlugin;
-use bevy::render::gpu_readback::{Readback, ReadbackComplete};
-use bevy::render::render_resource::{TextureFormat, TextureUsages, WgpuFeatures};
-use bevy::render::settings::{RenderCreation, WgpuSettings};
-use bevy::window::ExitCondition;
-use bevy::winit::WinitPlugin;
 
-use adventure::sdf_render::SdfCamera;
 use adventure::voxel::VoxelScene;
 use adventure::voxel::cornell::{interior_center_world, interior_extent_world};
-use adventure::voxel::raytrace::{VoxelRtPatch, VoxelRtPlugin};
+use adventure::voxel::raytrace::VoxelRtPatch;
 
 mod common;
+use common::HeadlessRender;
 
 const W: u32 = 192;
 const H: u32 = 192;
-
-#[derive(Resource, Clone)]
-struct LatestFrame(Arc<Mutex<Option<Vec<u8>>>>);
-
-fn rt_wgpu_settings() -> WgpuSettings {
-    WgpuSettings { features: WgpuFeatures::EXPERIMENTAL_RAY_QUERY, ..default() }
-}
 
 /// Mean per-pixel temporal standard deviation (luma) across a window of consecutive frames, over the lit
 /// interior region of the frame. Higher = noisier (more sparkle frame-to-frame).
@@ -75,90 +59,34 @@ fn temporal_noise(frames: &[Vec<u8>], padded_row: usize) -> f32 {
 
 #[test]
 fn temporal_accumulation_reduces_gi_noise() {
-    if common::headless_ray_query_device().is_none() {
+    // Boots the shared headless render app (#134 DLSS fix lives in the harness); skips cleanly without a
+    // ray-query device.
+    let Some(mut hr) = HeadlessRender::new(W, H) else {
         eprintln!("no ray-query device — skipping temporal_accumulation_reduces_gi_noise");
         return;
-    }
+    };
 
     let [cx, cy, cz] = interior_center_world();
     let extent = interior_extent_world();
     let target = Vec3::new(cx, cy + extent * 0.12, cz);
     let cam_pos = Vec3::new(cx + extent * 0.06, cy, cz - extent * 1.15);
 
-    let latest = LatestFrame(Arc::new(Mutex::new(None)));
-
-    let mut app = App::new();
-    app.add_plugins(
-        DefaultPlugins
-            .set(WindowPlugin {
-                primary_window: None,
-                exit_condition: ExitCondition::DontExit,
-                ..default()
-            })
-            .disable::<WinitPlugin>()
-            .set(RenderPlugin {
-                render_creation: RenderCreation::Automatic(Box::new(rt_wgpu_settings())),
-                ..default()
-            }),
-    );
-    app.add_plugins(VoxelRtPlugin);
     // This rig renders the static CORNELL box. The engine now boots into the large streamed Worldgen scene by
     // default (Phase 2.6); select Cornell explicitly (it is the `V`-toggle correctness anchor).
-    app.insert_resource(VoxelScene::Cornell);
-
-    app.insert_resource(latest.clone());
-    app.insert_resource(ClearColor(Color::srgb(0.0, 0.0, 0.0)));
-
-    let image_handle = {
-        let mut images = app.world_mut().resource_mut::<Assets<Image>>();
-        let mut image = Image::new_target_texture(W, H, TextureFormat::Rgba8UnormSrgb, None);
-        image.texture_descriptor.usage |= TextureUsages::COPY_SRC;
-        images.add(image)
-    };
+    hr.app.insert_resource(VoxelScene::Cornell);
+    hr.app.insert_resource(ClearColor(Color::srgb(0.0, 0.0, 0.0)));
 
     // A perfectly STILL camera — the accumulator must converge.
-    app.world_mut().spawn((
-        Camera3d::default(),
-        RenderTarget::Image(image_handle.clone().into()),
-        bevy::camera::Hdr,
-        Msaa::Off,
-        Transform::from_translation(cam_pos).looking_at(target, Vec3::Y),
-        SdfCamera,
-        Name::new("Temporal Cornell Camera"),
-    ));
+    hr.spawn_camera(cam_pos, target, "Temporal Cornell Camera");
+    hr.finalize();
 
-    let sink = latest.0.clone();
-    app.world_mut()
-        .spawn(Readback::texture(image_handle.clone()))
-        .observe(move |event: On<ReadbackComplete>| {
-            *sink.lock().unwrap() = Some(event.data.clone());
-        });
-
-    app.finish();
-    app.cleanup();
-
-    let unpadded_row = (W * 4) as usize;
-    let padded_row = bevy::render::renderer::RenderDevice::align_copy_bytes_per_row(unpadded_row);
+    let padded_row = hr.padded_row();
 
     // Pump frames and snapshot each distinct read-back frame. The readback is a few frames deep + async, so
     // we dedup identical consecutive snapshots and collect a long sequence to span the accumulation ramp.
-    let mut frames: Vec<Vec<u8>> = Vec::new();
-    let mut last: Option<Vec<u8>> = None;
-    for _ in 0..240 {
-        app.update();
-        if let Some(b) = latest.0.lock().unwrap().clone()
-            && b.len() >= padded_row * H as usize
-            && last.as_ref() != Some(&b)
-        {
-            last = Some(b.clone());
-            frames.push(b);
-        }
-        if frames.len() >= 80 {
-            break;
-        }
-    }
+    let frames = hr.collect_distinct_frames(240, 80);
 
-    let patch = app.world().resource::<VoxelRtPatch>();
+    let patch = hr.app.world().resource::<VoxelRtPatch>();
     assert!(!patch.upload.is_empty(), "the static Cornell brick set must be non-empty");
     assert!(
         frames.len() >= 30,
