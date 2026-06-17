@@ -1766,8 +1766,12 @@ pub struct LightingUniformData {
     /// Number of AO rays in the hemisphere (0 disables AO → `ao = 1`).
     pub ao_samples: u32,
     // --- GI knobs (single-bounce diffuse GI + emissive lights). All runtime uniforms. ---
-    /// Number of cosine-sampled diffuse bounce rays per pixel (0 disables GI). Capped in-shader.
-    pub gi_rays: u32,
+    /// Was `gi_rays` (the per-pixel initial RIS-candidate count). REMOVED: the ReSTIR-correct initial sample
+    /// count is ALWAYS 1 (the effective sample count is built by temporal + spatial reservoir reuse, not a
+    /// per-pixel loop — that is what ReSTIR is). A >1 loop only inflated register pressure on the
+    /// occupancy-bound raymarch pass with no converged-quality gain. Kept as a `u32` pad so the struct stays
+    /// EXACTLY 80 bytes (same offsets, no UBO re-layout). GI is disabled by `gi_intensity <= 0.0`.
+    pub _pad0: u32,
     /// Scalar multiplier on the accumulated indirect irradiance (artistic GI strength).
     pub gi_intensity: f32,
     /// Max world-metre distance a diffuse bounce ray travels before it counts as a sky/ambient miss.
@@ -1806,7 +1810,7 @@ impl Default for LightingUniformData {
             ambient_color: [0.10, 0.13, 0.18],
             ao_radius: 1.0,
             ao_samples: 4,
-            gi_rays: 8,
+            _pad0: 0, // was gi_rays (removed — ReSTIR initial count is always 1)
             gi_intensity: 1.0,
             // Open-world default: a bounce reaches far enough to hit distant terrain (and otherwise returns the
             // procedural sky), so GI is plausible outside a closed box. `cornell()` keeps its own tuned value,
@@ -1822,7 +1826,7 @@ impl Default for LightingUniformData {
 
 impl LightingUniformData {
     /// Lighting tuned for the static Cornell box: the EMISSIVE ceiling panel is the dominant light (the box
-    /// is closed, so the sun can't fill it). High `gi_rays` for clear colour bleed off the red/green walls,
+    /// is closed, so the sun can't fill it). ReSTIR resampling gives clear colour bleed off the red/green walls,
     /// a strong `emissive_strength` so the panel lights the room, a faint neutral ambient so surfaces aren't
     /// fully black before GI converges, and a weak sun angled IN through the open front (−Z) to shape soft
     /// shadows. All runtime uniforms (knobs-as-uniforms) — an editor panel can still override any of them.
@@ -1840,7 +1844,7 @@ impl LightingUniformData {
             ambient_color: [0.03, 0.03, 0.035],
             ao_radius: 0.6,
             ao_samples: 4,
-            gi_rays: 16,
+            _pad0: 0, // was gi_rays (removed — ReSTIR initial count is always 1)
             gi_intensity: 1.0,
             gi_bounce_dist: 24.0,
             emissive_strength: 6.0,
@@ -1872,7 +1876,7 @@ impl LightingUniformData {
             ambient_color: [0.06, 0.08, 0.11],
             ao_radius: 1.5,
             ao_samples: 4,
-            gi_rays: 8,
+            _pad0: 0, // was gi_rays (removed — ReSTIR initial count is always 1)
             gi_intensity: 1.0,
             gi_bounce_dist: 96.0,
             emissive_strength: 4.0,
@@ -1888,7 +1892,7 @@ impl LightingUniformData {
     /// directly-lit floor and the coloured drapes then bounce a MEASURABLE indirect signal up into the shaded
     /// arcades (single-bounce floor→arch fill + multi-bounce colour bleed off the red/green hangings) — the
     /// whole reason this scene exists. The values are picked for a strong, clearly-attributable GI signal:
-    /// a bright sun (direct lighting that drives a strong first bounce), plenty of GI rays for low-variance
+    /// a bright sun (direct lighting that drives a strong first bounce), ReSTIR resampling for low-variance
     /// colour bleed, a long-enough `gi_bounce_dist` to cross the ~30 m nave so a bounce off one wall reaches
     /// the far colonnade, and only a faint neutral ambient (so the GI — not a flat fill — is what lights the
     /// shadowed arcades). The sky ([`SkyUniformData::sponza`]) supplies the open-roof ambient + sky-GI a
@@ -1912,7 +1916,7 @@ impl LightingUniformData {
             ambient_color: [0.09, 0.10, 0.13],
             ao_radius: 1.2,
             ao_samples: 4,
-            gi_rays: 16, // a strong, low-variance colour-bleed signal for the GI measurement
+            _pad0: 0, // was gi_rays (removed — ReSTIR initial count is always 1)
             gi_intensity: 1.0,
             gi_bounce_dist: 48.0, // long enough to cross the ~30 m nave (wall→far-colonnade bounce)
             emissive_strength: 4.0, // Sponza has no baked emitters, but keep the knob at the open-world default

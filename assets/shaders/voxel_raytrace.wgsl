@@ -657,7 +657,7 @@ struct CameraUniform {
 //   sun_direction (12) + sun_intensity (4)
 //   sun_color     (12) + shadow_bias    (4)   — bias = normal-offset epsilon for the shadow/AO ray origin
 //   ambient_color (12) + ao_radius      (4)   — ao_radius = AO ray length in world metres
-//   ao_samples    (4)  + gi_rays (4) + gi_intensity (4) + gi_bounce_dist (4)
+//   ao_samples    (4)  + _pad0 (4) + gi_intensity (4) + gi_bounce_dist (4)
 //   emissive_strength (4) + frame_index (4) + debug_view (4) + _pad (4)
 struct LightingUniform {
     sun_direction: vec3<f32>,  // normalized direction the sunlight travels (points away from the sun)
@@ -667,7 +667,7 @@ struct LightingUniform {
     ambient_color: vec3<f32>,  // linear RGB sky/ambient fill
     ao_radius: f32,            // AO ray length in world metres
     ao_samples: u32,           // number of AO rays in the hemisphere (0 disables AO → ao = 1)
-    gi_rays: u32,              // cosine-sampled diffuse bounce rays per pixel (0 disables GI)
+    _pad0: u32,                // was gi_rays (removed — ReSTIR's correct initial count is always 1); keeps the 80 B layout
     gi_intensity: f32,         // scalar multiplier on accumulated indirect irradiance
     gi_bounce_dist: f32,       // max world-metre length of a diffuse bounce ray (miss past it = sky)
     emissive_strength: f32,    // scalar multiplier on every block's palette emissive
@@ -826,7 +826,7 @@ fn radical_inverse_vdc(bits_in: u32) -> f32 {
     return f32(bits) * 2.3283064365386963e-10; // / 2^32
 }
 
-// Single-bounce diffuse GLOBAL ILLUMINATION at a surface hit. Cosine-sample `gi_rays` directions in the
+// Single-bounce diffuse GLOBAL ILLUMINATION at a surface hit. Cosine-sample a fixed (high-spp) set of directions in the
 // hemisphere about the face normal `n` (Frisvad ONB + concentric cosine mapping), trace each as a bounce
 // ray on the SAME TLAS, and gather incoming radiance:
 //   * bounce HIT  → that surface's direct lighting (albedo × (ambient + sun·N'·shadow)) PLUS its emissive
@@ -837,8 +837,13 @@ fn radical_inverse_vdc(bits_in: u32) -> f32 {
 // of the receiving surface — the caller multiplies by the receiver albedo). `seed_base` decorrelates the
 // per-ray hash. Structured so a ReSTIR reservoir can later replace the plain mean without touching callers.
 fn gather_gi(n: vec3<f32>, p: vec3<f32>, seed_base: u32) -> vec3<f32> {
-    let rays = min(light.gi_rays, 32u);
-    if (rays == 0u || light.gi_intensity <= 0.0) {
+    // High-spp forward cosine-mean: this is the LEGACY non-ReSTIR forward GI estimator used by the debug
+    // GI-only view and the headless probe ORACLE (the low-variance reference the ReSTIR estimator is asserted
+    // to converge to). The live ReSTIR path (`restir_p1_core`) does NOT use this. The sample count is a local
+    // const (the `gi_rays` uniform was removed — ReSTIR's correct initial count is always 1); a high fixed
+    // count keeps the oracle reference low-variance.
+    let rays = 32u;
+    if (light.gi_intensity <= 0.0) {
         return vec3<f32>(0.0);
     }
     let origin = p + n * light.shadow_bias;
@@ -1454,7 +1459,7 @@ fn restir_probe(@builtin(global_invocation_id) gid: vec3<u32>) {
     out.irradiance = restir_resolve_irradiance(canonical, pos, n);
     out.confidence = canonical.confidence_weight;
     out.ucw = canonical.unbiased_contribution_weight;
-    // Reference: the established cosine-mean GI estimator at this probe (high gi_rays driven by the harness).
+    // Reference: the established cosine-mean GI estimator at this probe (fixed high-spp inside `gather_gi`).
     out.reference = gather_gi(n, pos, (i * 2654435761u + probe_params.frame_index * 40503u) | 1u);
     // Per-FRAME slot so the harness reads the whole convergence history back in one map.
     probe_out[probe_params.frame_index * probe_params.n_probes + i] = out;
@@ -1552,21 +1557,19 @@ fn restir_p1_core(n: vec3<f32>, p: vec3<f32>, pix: vec2<u32>, temporal_base: vec
     let vp = vec2<u32>(restir_params.viewport_x, restir_params.viewport_y);
     let idx = pix.y * vp.x + pix.x;
     surfaces_cur[idx] = PixelSurface(p, 1.0, n, 0.0); // this pixel's receiver surface (for neighbours/next frame)
-    if (light.gi_rays == 0u || light.gi_intensity <= 0.0) {
+    if (light.gi_intensity <= 0.0) {
         reservoirs_b[idx] = empty_reservoir();
         return;
     }
     var rng = seed;
     let brdf = vec3<f32>(1.0); // receiver albedo factored out (applied by the caller)
 
-    // INITIAL RIS over `gi_rays` LOW-DISCREPANCY candidates (same per-pixel sample budget as the legacy
-    // `gather_gi`): cuts the per-pixel variance ~1/M so each frame is smooth. The candidates are a stratified
-    // Hammersley set with a per-pixel/frame Cranley–Patterson rotation (NOT independent white noise) — that is
-    // the lever that kills the residual DLAA boil (steadier emitter-catch fraction → less per-frame count
-    // variance for the cap-8 temporal reservoir to fight). Same-surface merges (Jacobian = 1). Counts as ONE
-    // frame (confidence 1) so the temporal reuse below stays strong. `rng` still drives the merge's stochastic
-    // selection; the LD directions are deterministic given (pixel, frame).
-    let m = min(light.gi_rays, 32u);
+    // ONE initial RIS candidate — a SINGLE first bounce (canonical ReSTIR / Solari `sample_gi`). The effective
+    // sample count is built by the temporal + spatial reservoir REUSE below, NOT by a per-pixel RIS loop: that
+    // is what ReSTIR is. Tracing exactly one bounce here (vs the old `gi_rays`-deep inlined trace/shade tree)
+    // collapses the register pressure that bound this occupancy-limited pass — same converged GI, far higher
+    // occupancy. The candidate counts as ONE frame (confidence 1) so the temporal reuse stays strong. The LD
+    // direction is deterministic given (pixel, frame); `rng` drives the merges' stochastic selection.
     let rot = vec2<f32>(rand01(seed * 2u + 1u), rand01(seed * 2u + 2u));
     // A/B gate (2.2): when `wc.use_world_cache` is on (default), the bounce-HIT radiance is read from the
     // world-space radiance cache (pre-accumulated → low variance, multi-bounce in 2.3) instead of a fresh
@@ -1577,19 +1580,9 @@ fn restir_p1_core(n: vec3<f32>, p: vec3<f32>, pix: vec2<u32>, temporal_base: vec
     let use_cache = wc.use_world_cache != 0u;
     var res: Reservoir;
     if (use_cache) {
-        res = reservoir_from_bounce_cached(p, n, ld_uniform_hemisphere(n, 0u, m, rot), &rng);
+        res = reservoir_from_bounce_cached(p, n, ld_uniform_hemisphere(n, 0u, 1u, rot), &rng);
     } else {
-        res = reservoir_from_bounce(p, n, ld_uniform_hemisphere(n, 0u, m, rot));
-    }
-    for (var i = 1u; i < m; i = i + 1u) {
-        var cand: Reservoir;
-        if (use_cache) {
-            cand = reservoir_from_bounce_cached(p, n, ld_uniform_hemisphere(n, i, m, rot), &rng);
-        } else {
-            cand = reservoir_from_bounce(p, n, ld_uniform_hemisphere(n, i, m, rot));
-        }
-        let merged = merge_reservoirs(res, p, n, brdf, cand, p, n, brdf, &rng);
-        res = merged.merged_reservoir;
+        res = reservoir_from_bounce(p, n, ld_uniform_hemisphere(n, 0u, 1u, rot));
     }
     res.confidence_weight = 1.0;
 
@@ -1641,7 +1634,7 @@ fn restir_p1_core(n: vec3<f32>, p: vec3<f32>, pix: vec2<u32>, temporal_base: vec
 fn restir_p2_core(n: vec3<f32>, p: vec3<f32>, pix: vec2<u32>, seed: u32) -> vec3<f32> {
     let vp = vec2<u32>(restir_params.viewport_x, restir_params.viewport_y);
     let idx = pix.y * vp.x + pix.x;
-    if (light.gi_rays == 0u || light.gi_intensity <= 0.0) {
+    if (light.gi_intensity <= 0.0) {
         reservoirs_a[idx] = empty_reservoir();
         return vec3<f32>(0.0);
     }

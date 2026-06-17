@@ -172,16 +172,14 @@ fn parse_adventure_cam() -> Option<(Vec3, Vec3)> {
 
 /// Force lighting-uniform overrides from env each frame (overrides the editor/preset values), so the bench can
 /// sweep knobs without rebuilding presets: `ADVENTURE_DEBUG_VIEW` (the debug-view selector — albedo/normals
-/// bypass lighting) and `ADVENTURE_GI_RAYS` (the ReSTIR initial-candidate count, the p1 cost driver).
+/// bypass lighting) and `ADVENTURE_WC` (world-cache on/off). (The old `ADVENTURE_GI_RAYS` knob is gone — the
+/// ReSTIR initial-candidate count is always 1, built up by temporal + spatial reuse.)
 fn force_lighting_overrides(
     mut lighting: ResMut<crate::voxel::raytrace::VoxelRtLighting>,
     mut wc: ResMut<crate::voxel::raytrace::WorldCacheSettings>,
 ) {
     if let Ok(v) = std::env::var("ADVENTURE_DEBUG_VIEW").unwrap_or_default().trim().parse::<u32>() {
         lighting.data.debug_view = v;
-    }
-    if let Ok(v) = std::env::var("ADVENTURE_GI_RAYS").unwrap_or_default().trim().parse::<u32>() {
-        lighting.data.gi_rays = v;
     }
     if let Ok(v) = std::env::var("ADVENTURE_WC").unwrap_or_default().trim().parse::<u32>() {
         wc.data.use_world_cache = v;

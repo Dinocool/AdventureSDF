@@ -201,7 +201,6 @@ fn world_cache_converges_to_single_bounce_irradiance() {
     let light = LightingUniformData {
         sun_direction: [0.0, 1.0, 0.0],
         ambient_color: [0.0, 0.0, 0.0],
-        gi_rays: 1,
         gi_intensity: 1.0,
         gi_bounce_dist: 40.0,
         emissive_strength: 4.0,
@@ -784,7 +783,6 @@ fn cached_initial_reservoir_adds_albedo_times_cache() {
     let light = LightingUniformData {
         sun_direction: [0.0, 1.0, 0.0],
         ambient_color: [0.0, 0.0, 0.0],
-        gi_rays: 1,
         gi_intensity: 1.0,
         gi_bounce_dist: 40.0,
         emissive_strength: 4.0,
@@ -1397,7 +1395,6 @@ fn thin_wall_no_exterior_leak_with_clamp() {
     let light = LightingUniformData {
         sun_direction: [0.0, 1.0, 0.0],
         ambient_color: [0.0, 0.0, 0.0],
-        gi_rays: 1,
         gi_intensity: 1.0,
         gi_bounce_dist: 40.0,
         emissive_strength: 4.0,
@@ -1965,7 +1962,6 @@ fn run_box_fill(
     let light = LightingUniformData {
         sun_direction: [0.0, 1.0, 0.0],
         ambient_color: [0.0, 0.0, 0.0],
-        gi_rays: 1,
         gi_intensity: 1.0,
         gi_bounce_dist: 40.0,
         emissive_strength: 4.0,
@@ -2612,7 +2608,6 @@ fn run_nee_fill(device: &wgpu::Device, queue: &wgpu::Queue, nee_on: bool, frames
     let light = LightingUniformData {
         sun_direction: [0.0, 1.0, 0.0],
         ambient_color: [0.0, 0.0, 0.0],
-        gi_rays: 1,
         gi_intensity: 1.0,
         gi_bounce_dist: 40.0,
         emissive_strength: 4.0,

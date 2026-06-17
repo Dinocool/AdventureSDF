@@ -335,7 +335,6 @@ fn emitter_scene() -> (BlockRegistry, LightingUniformData, [ProbePoint; N_PROBES
     let l = LightingUniformData {
         sun_direction: [0.0, 1.0, 0.0], // travels up ⇒ no direct light on the +Y floor
         ambient_color: [0.0, 0.0, 0.0], // sky-miss = 0 in BOTH estimators
-        gi_rays: 32,
         gi_intensity: 1.0,
         gi_bounce_dist: 40.0, // must comfortably reach the ceiling (~2.4 m up at the 0.05 m Cornell box)
         emissive_strength: 4.0,

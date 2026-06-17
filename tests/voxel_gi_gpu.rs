@@ -291,13 +291,13 @@ fn luma(c: [f32; 3]) -> f32 {
     0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2]
 }
 
-/// A lighting uniform with the sun straight DOWN and GI configured. `gi_rays == 0` disables GI (the
-/// GI-off baseline); a high ray count drives down the Monte-Carlo noise for stable assertions.
-fn light_with_gi(gi_rays: u32) -> LightingUniformData {
+/// A lighting uniform with the sun straight DOWN and GI configured. `gi_intensity == 0.0` disables GI (the
+/// GI-off baseline); the forward `gather_gi` oracle (which this rig exercises) uses a fixed high internal spp
+/// to drive down the Monte-Carlo noise for stable assertions, so the GI-on case just sets a non-zero intensity.
+fn light_with_gi(gi_intensity: f32) -> LightingUniformData {
     LightingUniformData {
         sun_direction: [0.0, -1.0, 0.0], // straight down
-        gi_rays,
-        gi_intensity: 1.0,
+        gi_intensity,
         gi_bounce_dist: 20.0,
         ..Default::default()
     }
@@ -353,8 +353,8 @@ fn gi_indirect_fills_shadow() {
     let centre = Vec3::new(s * 0.5, floor_top + 1.0, s * 0.5); // under the roof
     let down = Vec3::new(0.0, -1.0, 0.0);
 
-    let off = run(&light_with_gi(0), &dark_sky(), centre, down);
-    let on = run(&light_with_gi(64), &dark_sky(), centre, down);
+    let off = run(&light_with_gi(0.0), &dark_sky(), centre, down);
+    let on = run(&light_with_gi(1.0), &dark_sky(), centre, down);
 
     eprintln!(
         "[shadow-fill] hit={} shadowed={} direct={:?} indirect(off)={:?} indirect(on)={:?}",
@@ -418,7 +418,7 @@ fn gi_colour_bleed() {
     // Tilt the sun so it travels toward -X/-Y: toward-sun then has a +X component, lighting the red wall's
     // +X face (the face that bounces onto the near floor). A straight-down sun leaves that vertical face
     // unlit, so it would bounce nothing — the bleed needs a LIT red surface.
-    let mut l = light_with_gi(64);
+    let mut l = light_with_gi(1.0);
     l.sun_direction = Vec3::new(-0.7, -0.7, 0.0).normalize().into();
     let near_hit = run(&l, &dark_sky(), near, down);
     let far_hit = run(&l, &dark_sky(), far, down);
@@ -493,7 +493,7 @@ fn gi_emissive_illuminates() {
 
     // Sun BELOW the horizon (pointing UP) and zero ambient, so direct sun + sky contribute nothing to the
     // floor — the entire indirect signal is the emitter's glow.
-    let mut l = light_with_gi(64);
+    let mut l = light_with_gi(1.0);
     l.sun_direction = [0.0, 1.0, 0.0]; // travels upward ⇒ toward-sun points down ⇒ no light on +Y floor
     l.ambient_color = [0.0, 0.0, 0.0];
     l.emissive_strength = 4.0;
@@ -567,7 +567,7 @@ fn open_scene_bounce_miss_returns_sky() {
 
     // Sun BELOW the floor (travels upward) + ambient zeroed, so the only indirect energy is the sky a bounce
     // escapes to (no direct, no voxel-bounce colour — the floor is neutral grey).
-    let mut l = light_with_gi(64);
+    let mut l = light_with_gi(1.0);
     l.sun_direction = [0.0, 1.0, 0.0];
     l.ambient_color = [0.0, 0.0, 0.0];
 

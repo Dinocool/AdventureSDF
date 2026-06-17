@@ -86,7 +86,8 @@ pub fn render_gi_panel(world: &mut World, ui: &mut egui::Ui) {
 
         ui.separator();
         ui.label(egui::RichText::new("Global illumination").strong());
-        ui.add(egui::Slider::new(&mut d.gi_rays, 0..=32).text("GI rays / px"));
+        // No "GI rays / px" slider: the ReSTIR initial-candidate count is always 1 (the effective sample count
+        // is built by temporal + spatial reservoir reuse). Set GI intensity to 0 to disable GI.
         ui.add(egui::Slider::new(&mut d.gi_intensity, 0.0..=4.0).text("GI intensity"));
         ui.add(egui::Slider::new(&mut d.gi_bounce_dist, 1.0..=64.0).text("bounce dist (m)"));
         ui.add(egui::Slider::new(&mut d.emissive_strength, 0.0..=16.0).text("emissive strength"));
