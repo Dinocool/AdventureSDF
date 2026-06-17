@@ -91,6 +91,14 @@ pub fn install_bistro_bench(app: &mut App) {
             gpu_pack: false,
             gpu_residency: true,
         });
+    } else {
+        // A-side baseline: the pure CPU residency + CPU pack path. Set EXPLICITLY (not via the live default,
+        // which is now `gpu_pack: true`) so the A/B comparison measures CPU-pack vs the GPU residency front end.
+        app.insert_resource(crate::voxel::raytrace::VoxelRtToggle {
+            enabled: true,
+            gpu_pack: false,
+            gpu_residency: false,
+        });
     }
 
     // Turn on the lightweight CPU+GPU span instrumentation so the render world's per-pass GPU timestamp

@@ -74,9 +74,9 @@ pub struct VoxelRtToggle {
     pub enabled: bool,
     /// **Phase G Stage G-a A/B flag.** When `true`, the streamed producer emits a GPU PACK batch
     /// ([`ResidentPacker::update_gpu`]) and the render world encodes the bricks on the GPU
-    /// (`assets/shaders/voxel_pack.wgsl`) instead of the CPU `ResidentPacker::update` + `apply_delta`. OFF by
-    /// default — the whole GPU path is exercised only by the parity gate (`tests/voxel_gpu_pack_parity.rs`) +
-    /// an explicit toggle until it is trusted live. The CPU path is the byte SSOT the GPU path is proven against.
+    /// (`assets/shaders/voxel_pack.wgsl`) instead of the CPU `ResidentPacker::update` + `apply_delta`. ON by
+    /// default — trusted live (Sponza + Gallery confirmed correct); the CPU path remains the byte SSOT the GPU
+    /// path is proven against (`tests/voxel_gpu_pack_parity.rs`), reachable by un-ticking the editor toggle.
     pub gpu_pack: bool,
     /// **Phase G Stage G-c.2a A/B flag.** When `true`, the GPU residency DIFF (Pass C — `voxel_residency.wgsl`
     /// `diff_*` entries) would drive enter/drop decisions + the GPU resident `slot_table` instead of the CPU
@@ -88,9 +88,11 @@ pub struct VoxelRtToggle {
 
 impl Default for VoxelRtToggle {
     fn default() -> Self {
-        // HW-RT is the default (and only) renderer now — on at startup. The GPU pack + GPU residency diff are OFF
-        // by default (A/B-gated until their parity tests are trusted live).
-        Self { enabled: true, gpu_pack: false, gpu_residency: false }
+        // HW-RT is the default (and only) renderer now — on at startup. GPU pack is ON by default — the
+        // GPU-driven re-pack (config 2: `update_gpu` + `apply_gpu_pack`, no readback) is trusted live
+        // (Sponza + Gallery confirmed correct). The GPU residency diff front end stays OFF by default
+        // (A/B-gated until its parity tests are trusted live on the streamed path).
+        Self { enabled: true, gpu_pack: true, gpu_residency: false }
     }
 }
 
