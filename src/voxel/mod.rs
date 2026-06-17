@@ -33,6 +33,10 @@ pub mod palette;
 #[cfg(feature = "physics")]
 pub mod physics;
 pub mod raytrace;
+/// Phase G "G-c.0" — the GPU-resident sparse brick OCCUPANCY structure (the face-cull input for the
+/// GPU-driven readback-free streaming front end). Built + uploaded from the static `.vxo`/merged source;
+/// wired to NO pipeline yet (no behaviour change). See `docs/PHASE_G_GC_PLAN.md` §2.2.
+pub mod residency_gpu;
 pub mod source;
 pub mod streaming;
 pub mod vox;

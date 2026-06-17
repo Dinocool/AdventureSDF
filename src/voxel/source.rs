@@ -405,6 +405,22 @@ impl StaticVoxSource {
         (lod as usize).min(self.pyramid.len() - 1)
     }
 
+    /// **Phase G "G-c.0"** — iterate the source's OCCUPIED brick set as `(coord, lod)` keys across EVERY built
+    /// pyramid level (`0..pyramid.len()`). A key is occupied iff it is PRESENT in that level's [`BrickMap`] —
+    /// exactly the bricks `classify` returns non-[`BrickClass::Air`] for (an absent brick is `Air`; a present
+    /// one is `Surface`/`Interior`). So this is the SAME occupied set the GPU occupancy
+    /// ([`crate::voxel::residency_gpu::SectorOccupancy`]) must mirror, enumerated in Θ(stored bricks) (no volume
+    /// scan): the pyramid already holds the whole static scene in RAM, so this is a free walk of its keys. The
+    /// CLAMPED coarse levels (`lod > pyramid.len()-1`) are NOT enumerated — their coord grid ≠ the level grid
+    /// (just as `surface_bricks_in` / `classify` treat them), so the occupancy is built only on the levels whose
+    /// coords map 1:1 to a stored brick, keeping GPU == CPU parity exact.
+    pub fn occupied_keys(&self) -> impl Iterator<Item = (IVec3, u32)> + '_ {
+        self.pyramid
+            .iter()
+            .enumerate()
+            .flat_map(|(lod, map)| map.iter().map(move |(coord, _)| (*coord, lod as u32)))
+    }
+
     /// True iff the world-voxel AABB `[wmin, wmax)` (in `pyramid[level]`'s own voxel coords) cannot contain
     /// any solid voxel of that level (so the brick covering it is air). Cheap conservative reject using the
     /// precomputed per-level bounds.

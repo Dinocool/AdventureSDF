@@ -156,6 +156,20 @@ impl Default for VoxelRtPatch {
     }
 }
 
+/// **Phase G "G-c.0"** — the main→render-world hand-off for the GPU-resident sparse brick OCCUPANCY
+/// (`docs/PHASE_G_GC_PLAN.md` §2.2). Built ONCE per scene switch in the main world (from the in-RAM static
+/// source's occupied set) and carried here as a cheap `Arc` so the per-frame `ExtractResource` clone copies a
+/// handle, NOT the bytes. The render world (`prepare_voxel_rt`) uploads it into [`VoxelRtResources`] only when
+/// its `epoch` differs from the last-uploaded epoch — a one-time per-scene GPU upload, NO per-frame cost. G-c.0
+/// binds the uploaded buffers to NO pipeline (the G-c.1 enumerate pass is the first consumer), so this is a
+/// pure additive resource with no behaviour change. `None` ⇒ no in-RAM static occupancy this scene (worldgen /
+/// the streamed `.vxo` Bistro path — its per-region occupancy is G-c.4).
+#[derive(Resource, Clone, ExtractResource, Default)]
+pub struct VoxelRtResidencyUpload {
+    /// `(epoch, occupancy)` — the scene epoch the occupancy was built for + the `Arc`'d structure to upload.
+    pub occupancy: Option<(u64, std::sync::Arc<super::residency_gpu::SectorOccupancy>)>,
+}
+
 impl VoxelRtPatch {
     /// A device-free [`StorageReport`](super::gpu::StorageReport) of the current upload, for the editor VRAM
     /// panel. Only the contiguous static `Snapshot` (R2b) carries one — the streamed raw-arena
@@ -244,6 +258,14 @@ pub struct VoxelRtStreaming {
     /// re-pack of a streamed epoch ships a snapshot (allocate fixed-cap buffers); subsequent re-packs ship a
     /// [`VoxelRtUpload::Delta`]. Reset to `false` on every scene switch.
     epoch_snapshotted: bool,
+    /// **Phase G "G-c.0"** — the GPU-resident sparse brick OCCUPANCY built ONCE per scene switch from the live
+    /// IN-RAM static source's occupied brick set (the face-cull input for the GPU-driven enumerate front end;
+    /// `docs/PHASE_G_GC_PLAN.md` §2.2). Built here (not per frame) for the in-RAM [`StaticVoxSource`] scenes
+    /// (Sponza / the legacy `.vox` Gallery merge) — Θ(stored bricks), no extra decode. The STREAMED `.vxo`
+    /// `MergedSource` (Bistro) is NOT built eagerly (it would force-decode every region, breaking constant-RAM);
+    /// its per-region occupancy paging is G-c.4. `Arc`'d so the per-frame extract clones a cheap handle, not the
+    /// bytes. `None` until the first in-RAM static scene; paired with the [`epoch`](Self::epoch) it was built for.
+    gpu_residency: Option<(u64, std::sync::Arc<super::residency_gpu::SectorOccupancy>)>,
 }
 
 impl VoxelRtStreaming {
@@ -291,7 +313,11 @@ impl Plugin for VoxelRtPlugin {
             .init_resource::<VoxelEditBrush>()
             // Phase G G-wire — the main-world GPU-classify pipeline holder (built lazily on first live gpu_pack).
             .init_resource::<VoxelPackClassifyState>()
+            // Phase G "G-c.0" — the GPU occupancy hand-off (built once per scene in the main world, uploaded
+            // once per epoch in the render world; bound to no pipeline yet).
+            .init_resource::<VoxelRtResidencyUpload>()
             .add_plugins(ExtractResourcePlugin::<VoxelRtToggle>::default())
+            .add_plugins(ExtractResourcePlugin::<VoxelRtResidencyUpload>::default())
             .add_plugins(ExtractResourcePlugin::<VoxelRtPatch>::default())
             .add_plugins(ExtractResourcePlugin::<VoxelRtLighting>::default())
             .add_plugins(ExtractResourcePlugin::<VoxelRtSky>::default())
@@ -411,6 +437,7 @@ fn init_voxel_rt_streaming(
         packer: None,
         epoch: 0,
         epoch_snapshotted: false,
+        gpu_residency: None,
     });
 }
 
@@ -430,6 +457,10 @@ fn stream_voxel_rt_residency(
     mut patch_res: ResMut<VoxelRtPatch>,
     mut lighting: ResMut<VoxelRtLighting>,
     mut sky: ResMut<VoxelRtSky>,
+    // Phase G "G-c.0" — the GPU occupancy hand-off to the render world (set on a scene switch, extracted once).
+    // `Option` so the system never panics when the resource is absent (e.g. a unit-test app that adds only the
+    // streaming system without the full plugin) — it just skips publishing the occupancy there.
+    mut residency_upload: Option<ResMut<VoxelRtResidencyUpload>>,
     cam: Query<&GlobalTransform, With<SdfCamera>>,
     // Phase G — the main-world device/queue (THIS fork keeps them in the main world, `bevy_render/src/settings.rs`)
     // + the lazily-built classify pipeline. `Option` because the render device is created asynchronously and is
@@ -615,6 +646,28 @@ fn stream_voxel_rt_residency(
         } else {
             None
         };
+        // Phase G "G-c.0" — build the GPU-resident sparse OCCUPANCY ONCE here, from whichever IN-RAM static
+        // source is now live (Sponza, or the legacy `.vox` Gallery merge). Θ(stored bricks) over the pyramid keys
+        // already in RAM — no extra decode, no per-frame cost. The STREAMED `.vxo` `MergedSource` is intentionally
+        // SKIPPED (eagerly enumerating it would force-decode every region, breaking constant-RAM); its per-region
+        // occupancy paging is G-c.4. Wired to NO pipeline yet (G-c.1 is the first consumer) — no behaviour change.
+        let occ_source: Option<&StaticVoxSource> =
+            streaming.sponza_source.as_ref().or(streaming.gallery_source.as_ref());
+        streaming.gpu_residency = occ_source.map(|src| {
+            let occ = super::residency_gpu::SectorOccupancy::from_occupied(src.occupied_keys());
+            debug!(
+                "voxel-RT G-c.0: built GPU occupancy — {} occupied bricks in {} sectors, table_size {}",
+                occ.occupied_bricks(),
+                occ.occupied_sectors(),
+                occ.table_size(),
+            );
+            (streaming.epoch, std::sync::Arc::new(occ))
+        });
+        // Hand the built occupancy to the render world (extracted once; uploaded once per epoch). Cloning the
+        // `Arc` is cheap — the per-frame `ExtractResource` clone copies a handle, not the sector bytes.
+        if let Some(upload) = residency_upload.as_mut() {
+            upload.occupancy = streaming.gpu_residency.clone();
+        }
         match *scene {
             VoxelScene::Sponza => {
                 lighting.data = LightingUniformData::sponza();
@@ -1268,6 +1321,16 @@ struct VoxelRtResources {
     /// matches PATCHES the existing buffers; a new epoch (or a `Snapshot`) REALLOCATES them. `None` until the
     /// first scene is built.
     built_epoch: Option<u64>,
+    /// **Phase G "G-c.0"** — the GPU-resident sparse brick OCCUPANCY (the face-cull input for the GPU-driven
+    /// enumerate front end, `docs/PHASE_G_GC_PLAN.md` §2.2). Built once per scene from the static source's
+    /// occupied brick set + uploaded here (header + sector-hash storage buffers). G-c.0 binds it to NO pipeline
+    /// — the G-c.1 enumerate pass is the first consumer. `gpu_residency_epoch` guards the one-time per-epoch
+    /// upload so it never rebuilds per frame (zero per-frame cost — no behaviour change). `None` until the first
+    /// scene whose extracted patch carries an occupancy upload.
+    gpu_residency: Option<super::residency_gpu::GpuResidencyBuffers>,
+    /// The scene EPOCH `gpu_residency` was uploaded for — re-upload only when the epoch changes (a scene
+    /// switch), never per frame.
+    gpu_residency_epoch: Option<u64>,
     /// Output storage texture (rgba16float) + view + size; reallocated on view resize.
     output: Option<(wgpu::Texture, wgpu::TextureView, UVec2)>,
     /// The TEMPORAL-ACCUMULATION history texture (rgba16float) + view: the previous frame's accumulated
@@ -2781,7 +2844,34 @@ fn prepare_voxel_rt(
     mut resources: ResMut<VoxelRtResources>,
     render_device: Res<RenderDevice>,
     render_queue: Res<RenderQueue>,
+    // Phase G "G-c.0" — the GPU occupancy extracted from the main world (built once per scene).
+    residency_upload: Option<Res<VoxelRtResidencyUpload>>,
 ) {
+    // Phase G "G-c.0" — upload the GPU-resident sparse OCCUPANCY ONCE per scene epoch (not per frame, not gated
+    // on the toggle/patch). Built in the main world; here it becomes two PERSISTENT storage buffers on
+    // `VoxelRtResources`, bound to NO pipeline yet (the G-c.1 enumerate pass is the first consumer). Re-uploaded
+    // only when the epoch changes (a scene switch), so a static scene pays nothing per frame — no behaviour change.
+    if let Some(upload) = residency_upload.as_ref() {
+        match &upload.occupancy {
+            Some((epoch, occ)) if resources.gpu_residency_epoch != Some(*epoch) => {
+                resources.gpu_residency = Some(occ.upload(render_device.wgpu_device()));
+                resources.gpu_residency_epoch = Some(*epoch);
+                debug!(
+                    "voxel-RT G-c.0: uploaded GPU occupancy for epoch {epoch} ({} sectors, table_size {})",
+                    occ.occupied_sectors(),
+                    occ.table_size(),
+                );
+            }
+            // A scene with NO in-RAM occupancy (worldgen / streamed `.vxo`): drop any stale buffers so VRAM
+            // isn't held across a switch away. (Cheap — only on the epoch-change frame.)
+            None if resources.gpu_residency.is_some() => {
+                resources.gpu_residency = None;
+                resources.gpu_residency_epoch = None;
+            }
+            _ => {}
+        }
+    }
+
     let (Some(patch_res), Some(pipelines)) = (patch_res, pipelines) else {
         return;
     };
@@ -4648,6 +4738,7 @@ mod tests {
             packer: None,
             epoch: 0,
             epoch_snapshotted: false,
+            gpu_residency: None,
         }
     }
 
