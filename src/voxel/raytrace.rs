@@ -181,6 +181,27 @@ pub struct VoxelRtResidencyUpload {
     pub core_store: Option<(u64, std::sync::Arc<super::residency_gpu::BrickCoreStore>)>,
 }
 
+/// **Phase G "G-c.4"** — the main→render-world per-frame hand-off for the LIVE GPU residency front end
+/// (`docs/PHASE_G_GC_PLAN.md` §1, §5): the ONLY per-frame CPU→GPU residency traffic. Carries the live camera
+/// world position + the clip half-extent (the `ResidencyParams` inputs) + the scene epoch + max_resident, so the
+/// render-world [`prepare_voxel_rt`] can drive the GPU front end against the live pool WITHOUT any CPU residency
+/// classify. Populated EVERY frame in the main world (cheap — three floats + two ints) and extracted; consumed
+/// only when `toggle.gpu_residency` is on and the front end is bound. `valid == false` ⇒ no camera / no
+/// GPU-residency-eligible scene this frame (skip the GPU front-end drive).
+#[derive(Resource, Clone, Copy, ExtractResource, Default)]
+pub struct VoxelRtResidencyParams {
+    /// The live camera world position (the per-LOD clipmap centre).
+    pub cam_world: [f32; 3],
+    /// The clipmap half-extent in bricks (`StreamingConfig::clip_half_bricks` — the FULL clip_half=160 reach).
+    pub clip_half_bricks: i32,
+    /// The streamed-scene epoch this camera belongs to (matched against the front end's bound epoch).
+    pub epoch: u64,
+    /// The resident-set capacity (`StreamingConfig::max_resident_bricks`) — the front-end pool capacity.
+    pub max_resident: u32,
+    /// True iff a camera exists AND the live scene is a GPU-residency-eligible streamed scene this frame.
+    pub valid: bool,
+}
+
 impl VoxelRtPatch {
     /// A device-free [`StorageReport`](super::gpu::StorageReport) of the current upload, for the editor VRAM
     /// panel. Only the contiguous static `Snapshot` (R2b) carries one — the streamed raw-arena
@@ -332,8 +353,12 @@ impl Plugin for VoxelRtPlugin {
             // Phase G "G-c.0" — the GPU occupancy hand-off (built once per scene in the main world, uploaded
             // once per epoch in the render world; bound to no pipeline yet).
             .init_resource::<VoxelRtResidencyUpload>()
+            // Phase G "G-c.4" — the LIVE per-frame residency params (camera + clip_half), the only per-frame
+            // CPU→GPU residency traffic for the GPU-driven front end.
+            .init_resource::<VoxelRtResidencyParams>()
             .add_plugins(ExtractResourcePlugin::<VoxelRtToggle>::default())
             .add_plugins(ExtractResourcePlugin::<VoxelRtResidencyUpload>::default())
+            .add_plugins(ExtractResourcePlugin::<VoxelRtResidencyParams>::default())
             .add_plugins(ExtractResourcePlugin::<VoxelRtPatch>::default())
             .add_plugins(ExtractResourcePlugin::<VoxelRtLighting>::default())
             .add_plugins(ExtractResourcePlugin::<VoxelRtSky>::default())
@@ -478,6 +503,9 @@ fn stream_voxel_rt_residency(
     // `Option` so the system never panics when the resource is absent (e.g. a unit-test app that adds only the
     // streaming system without the full plugin) — it just skips publishing the occupancy there.
     mut residency_upload: Option<ResMut<VoxelRtResidencyUpload>>,
+    // Phase G "G-c.4" — the LIVE per-frame residency params output (camera + clip_half) for the GPU-driven front
+    // end. `Option` so a unit-test app without the resource never panics.
+    mut residency_params: Option<ResMut<VoxelRtResidencyParams>>,
     cam: Query<&GlobalTransform, With<SdfCamera>>,
     // Phase G — the main-world device/queue (THIS fork keeps them in the main world, `bevy_render/src/settings.rs`)
     // + the lazily-built classify pipeline. `Option` because the render device is created asynchronously and is
@@ -494,6 +522,12 @@ fn stream_voxel_rt_residency(
     // `GpuPack` upload the render world's G-c.2b arm consumes (the GPU occupancy + core store are also built
     // when `gpu_residency` is on, see below).
     let gpu_pack = toggle.gpu_pack || toggle.gpu_residency;
+    // Phase G "G-c.4" — invalidate the live residency params by default; the streamed arm below re-validates them
+    // once a camera + streamed scene are known this frame. So a Cornell / static-missing / no-camera frame leaves
+    // `valid == false` (the render world skips the GPU front-end drive), never a stale camera.
+    if let Some(rp) = residency_params.as_mut() {
+        rp.valid = false;
+    }
     // Main-thread residency span — names this system in a chrome trace (Bevy's automatic per-system spans are
     // `trace`-level and dropped by the global `info` EnvFilter, so the heavy voxel work was otherwise invisible).
     // The child spans below (classify / drain / re-pack) split the cost so a capture names the exact culprit.
@@ -785,6 +819,22 @@ fn stream_voxel_rt_residency(
     // The LOD0 brick the camera sits in — the FINEST clipmap boundary, so it crosses whenever ANY level's
     // shell could shift (a coarse boundary is `2^L×` farther apart, so a LOD0 crossing strictly implies it).
     let cam_brick = camera_brick_coord(cam_world);
+
+    // Phase G "G-c.4" — publish the LIVE per-frame residency params (camera + clip_half) for the GPU-driven
+    // front end. This is the ONLY per-frame CPU→GPU residency traffic (the §5 boundary). Written EVERY frame for a
+    // streamed scene (cheap); the render world consumes it only when `toggle.gpu_residency` is on AND the front
+    // end is bound to this epoch's occupancy/core store. `valid` is true here (we have a camera + a streamed
+    // scene). The render-world drive REPLACES the CPU classify when on; the CPU path below still runs to keep the
+    // resident-set mirror warm (stats / lights / a toggle-off flip), but does NOT block the GPU drive.
+    if let Some(rp) = residency_params.as_mut() {
+        **rp = VoxelRtResidencyParams {
+            cam_world,
+            clip_half_bricks: streaming.cfg.clip_half_bricks,
+            epoch: streaming.epoch,
+            max_resident: streaming.cfg.max_resident_bricks as u32,
+            valid: true,
+        };
+    }
 
     // An EDIT (build/destroy) re-queues exactly the affected resident bricks so the change re-sources +
     // re-packs LOCALLY (it ADAPTS — the resident set, GI reservoirs, and world cache all stay; never a full
@@ -1415,6 +1465,17 @@ struct VoxelRtResources {
     gpu_core_store: Option<super::residency_gpu::GpuBrickCoreBuffers>,
     /// The scene EPOCH `gpu_core_store` was uploaded for (the one-time-per-epoch upload guard).
     gpu_core_store_epoch: Option<u64>,
+    /// **Phase G "G-c.4"** — the LIVE GPU-driven residency FRONT END (`residency_front_end.rs`). Built once
+    /// (lazily, on the first `gpu_residency`-on frame with a device), it holds the persistent residency-decision
+    /// state (slot table / free-list / quarantine / slab allocators / indirect dispatch buffers) and drives the
+    /// whole readback-free pipeline (Pass A→D + classify/pack/write_aabb) into the LIVE scene pool each frame.
+    /// `rebind_pool` re-points it at the current scene's pool + the per-epoch occupancy/core store on a switch.
+    /// `None` until the toggle first flips on; once built it persists (the slot table survives toggle flips, but a
+    /// rebind cold-resets it). The pool it writes IS the `scene`'s buffers — the renderer/GI/ReSTIR see the result.
+    gpu_front_end: Option<super::residency_front_end::GpuResidencyFrontEnd>,
+    /// The `(epoch)` the front end is currently bound to (matched against the live `gpu_residency_epoch`); a change
+    /// triggers a `rebind_pool` (new scene pool + occupancy/core store). `None` ⇒ not bound (cold).
+    gpu_front_end_epoch: Option<u64>,
     /// Output storage texture (rgba16float) + view + size; reallocated on view resize.
     output: Option<(wgpu::Texture, wgpu::TextureView, UVec2)>,
     /// The TEMPORAL-ACCUMULATION history texture (rgba16float) + view: the previous frame's accumulated
@@ -2921,6 +2982,7 @@ impl Default for RestirSettings {
 /// place (the buffers persist across the epoch), which is safe because the packer QUARANTINES freed slots for a
 /// generation (a slot freed this update isn't reused until the next), so an in-flight frame never sees a slot's
 /// bytes overwritten by a different brick mid-flight.
+#[allow(clippy::too_many_arguments)]
 fn prepare_voxel_rt(
     toggle: Res<VoxelRtToggle>,
     patch_res: Option<Res<VoxelRtPatch>>,
@@ -2930,6 +2992,8 @@ fn prepare_voxel_rt(
     render_queue: Res<RenderQueue>,
     // Phase G "G-c.0" — the GPU occupancy extracted from the main world (built once per scene).
     residency_upload: Option<Res<VoxelRtResidencyUpload>>,
+    // Phase G "G-c.4" — the LIVE per-frame residency params (camera + clip_half) for the GPU-driven front end.
+    residency_params: Option<Res<VoxelRtResidencyParams>>,
 ) {
     // Phase G "G-c.0" — upload the GPU-resident sparse OCCUPANCY ONCE per scene epoch (not per frame, not gated
     // on the toggle/patch). Built in the main world; here it becomes two PERSISTENT storage buffers on
@@ -2973,6 +3037,21 @@ fn prepare_voxel_rt(
             _ => {}
         }
     }
+
+    // Phase G "G-c.4" — drive the LIVE GPU residency FRONT END (readback-free) when `gpu_residency` is on. This
+    // runs BEFORE the CPU patch apply + is INDEPENDENT of the patch generation (the camera moves every frame, and
+    // convergence needs per-frame frames even when the CPU patch gen hasn't bumped). It needs the scene POOL to
+    // already be allocated (a StreamSnapshot does that on epoch start — the front end writes into it, it can't
+    // build the BLAS chunk topology), the per-epoch occupancy + core store, and a valid camera. When it actively
+    // drives this epoch, the CPU `apply_gpu_pack` arm below is SKIPPED (the GPU front end owns the pool — no double
+    // write). Returns `true` iff the front end is the live driver this frame.
+    let front_end_active = drive_gpu_residency_front_end(
+        &toggle,
+        &render_device,
+        &render_queue,
+        &mut resources,
+        residency_params.as_deref(),
+    );
 
     let (Some(patch_res), Some(pipelines)) = (patch_res, pipelines) else {
         return;
@@ -3135,20 +3214,26 @@ fn prepare_voxel_rt(
             // convergence loop). So when the prerequisites are present we LOG that the GPU front end is staged
             // (it is exercised + gated by the parity test) and proceed with the CPU-built batch — keeping the
             // live scene correct. When OFF (the default) this branch is never taken: byte-for-byte unchanged.
+            // **Phase G "G-c.4" — when the LIVE GPU front end drove this frame** (`front_end_active`), it OWNS the
+            // scene pool (it wrote meta/voxel/palette/aabb + rebuilt the dirty BLASes in its own encoder). Skip the
+            // CPU `apply_gpu_pack` entirely so we never DOUBLE-write the pool (the CPU batch would clobber the
+            // GPU-decided residency). We still refresh the lights from the CPU mirror (cheap, and the GI/NEE light
+            // list is not yet GPU-driven) + record the brick_count, but the geometry is the GPU front end's.
+            if front_end_active {
+                resources.world_cache_lights = Some(WorldCacheLights::from_lists(device, lights, alias));
+                resources.brick_count = *brick_count;
+                resources.built_generation = Some(patch_res.generation);
+                resources.built_epoch = Some(patch_res.epoch);
+                return;
+            }
             if toggle.gpu_residency {
-                if resources.gpu_residency.is_some() && resources.gpu_core_store.is_some() {
-                    // One-shot info (debug-level — no per-frame spam): the GPU-driven front end is ready.
-                    debug!(
-                        "voxel-RT G-c.2b: gpu_residency ON — GPU occupancy + core store resident for epoch {} \
-                         (Pass A→D + pack gated by voxel_gpu_residency_pack_parity; readback-free live drive is G-c.3)",
-                        patch_res.epoch,
-                    );
-                } else {
-                    debug!(
-                        "voxel-RT G-c.2b: gpu_residency ON but no in-RAM core store for this scene \
-                         (worldgen / streamed `.vxo`) — per-region core paging is G-c.4; using the CPU pack",
-                    );
-                }
+                // gpu_residency ON but the front end did NOT drive (no in-RAM occupancy/core store for this scene —
+                // worldgen / streamed `.vxo`, whose per-region GPU paging is the remaining G-c.4 piece). Fall back to
+                // the CPU pack so the live scene stays correct.
+                debug!(
+                    "voxel-RT G-c.4: gpu_residency ON but the GPU front end is not bound for this scene \
+                     (no in-RAM occupancy/core store — streamed `.vxo` per-region paging pending) — using the CPU pack",
+                );
             }
             apply_gpu_pack(device, &render_queue, &pipelines, scene, batch);
             resources.world_cache_lights = Some(WorldCacheLights::from_lists(device, lights, alias));
@@ -3593,6 +3678,165 @@ impl VoxelPackClassify {
         staging.unmap();
         out
     }
+}
+
+/// **Phase G "G-c.4" — drive the LIVE readback-free GPU residency front end** (`docs/PHASE_G_GC_PLAN.md` §1/§3/§4).
+///
+/// Runs every frame when `gpu_residency` is ON, the per-epoch occupancy + core store are uploaded, the scene pool
+/// is allocated + streamed, and a valid camera exists. It (lazily) builds + (re)binds the persistent front end to
+/// the live scene pool, then in ONE encoder records the whole readback-free pipeline (Pass A→D + the landed
+/// classify/pack/write_aabb tail, all `record_indirect`) writing the LIVE `meta/voxel/brick_palettes/aabb` pool
+/// the renderer/GI/ReSTIR consume, then — gated by the non-blocking 1-frame-late `change_count` mirror (§3.1) —
+/// rebuilds the dirty-chunk BLASes + TLAS reading the just-GPU-written `aabb_buf` (fill-then-build, same encoder /
+/// same submit). A converged static camera reads `change_count == 0` (one frame late) → skips the AS rebuild →
+/// fully idle.
+///
+/// **First shippable (§4):** rebuild ALL chunks when the mirror reports change (or on the first bound frame, when
+/// the mirror has no prior value). Correct + simple; costs only on real-change frames. The GPU `chunk_dirty_mask`
+/// optimization is deferred.
+///
+/// Returns `true` iff the front end DROVE the pool this frame (so the caller skips the CPU `apply_gpu_pack`).
+fn drive_gpu_residency_front_end(
+    toggle: &VoxelRtToggle,
+    render_device: &RenderDevice,
+    render_queue: &RenderQueue,
+    resources: &mut VoxelRtResources,
+    params: Option<&VoxelRtResidencyParams>,
+) -> bool {
+    if !toggle.enabled || !toggle.gpu_residency {
+        // Toggle off: ensure the front end is unbound so a later flip-on cold-rebinds against the current scene.
+        if let Some(fe) = resources.gpu_front_end.as_mut().filter(|fe| fe.is_bound()) {
+            fe.unbind();
+            resources.gpu_front_end_epoch = None;
+        }
+        return false;
+    }
+    // Need a valid camera + a GPU-residency-eligible streamed scene this frame.
+    let Some(params) = params.filter(|p| p.valid) else {
+        return false;
+    };
+    // Need the per-epoch occupancy + core store uploaded (built only for in-RAM scenes today; streamed `.vxo`
+    // per-region paging is the remaining piece). Without them the GPU front end cannot face-cull / halo-fill.
+    let (Some(_), Some(_)) = (resources.gpu_residency.as_ref(), resources.gpu_core_store.as_ref()) else {
+        return false;
+    };
+    // The occupancy/core epoch MUST match the live camera's epoch (a scene switch in flight — wait for the upload
+    // to catch up; otherwise we'd face-cull the new camera against the old scene's occupancy).
+    if resources.gpu_residency_epoch != Some(params.epoch) || resources.gpu_core_store_epoch != Some(params.epoch) {
+        return false;
+    }
+    // The scene pool must be allocated + streamed for this epoch (a StreamSnapshot builds the BLAS topology the
+    // front end writes into — it cannot create chunks). Wait for it.
+    let Some(scene) = resources.scene.as_ref() else {
+        return false;
+    };
+    if !scene.streamed || resources.built_epoch != Some(params.epoch) {
+        return false;
+    }
+
+    let device = render_device.wgpu_device();
+
+    // Lazily build the persistent front end (once). Its pool buffers are (re)bound below; the slot table / slab
+    // allocators / dispatch buffers persist across frames here.
+    if resources.gpu_front_end.is_none() {
+        let half = params.clip_half_bricks;
+        let max_resident = params.max_resident.max(1);
+        resources.gpu_front_end =
+            Some(super::residency_front_end::GpuResidencyFrontEnd::new(device, half, max_resident));
+        resources.gpu_front_end_epoch = None; // force a rebind below
+        info!(
+            "voxel-RT G-c.4: built the LIVE GPU residency front end (clip_half {} bricks, max_resident {})",
+            half, max_resident
+        );
+    }
+
+    // (Re)bind the front end to the CURRENT scene pool + per-epoch occupancy/core store on an epoch change (a
+    // scene switch / fresh stream). Cold-resets the persistent diff state so the new scene streams in clean.
+    if resources.gpu_front_end_epoch != Some(params.epoch) {
+        // Split the borrows: the immutable occupancy/core/scene refs vs the mutable front end.
+        let occ = resources.gpu_residency.as_ref().expect("checked above");
+        let core = resources.gpu_core_store.as_ref().expect("checked above");
+        let scene = resources.scene.as_ref().expect("checked above");
+        let meta = scene.meta_buf.clone();
+        let voxel = scene.voxel_buf.clone();
+        let palettes = scene.brick_palettes_buf.clone();
+        let aabb = scene.aabb_buf.clone();
+        let fe = resources.gpu_front_end.as_mut().expect("just built");
+        fe.rebind_pool(device, render_queue.0.as_ref(), occ, core, &meta, &voxel, &palettes, &aabb);
+        resources.gpu_front_end_epoch = Some(params.epoch);
+        info!("voxel-RT G-c.4: bound the GPU front end to the live scene pool for epoch {}", params.epoch);
+    }
+
+    // Overflow guard: if this camera's shell WG-cell union / per-frame dispatch would exceed the front end's
+    // transient list capacity or the 65535-workgroup 1D dispatch limit, SKIP the GPU drive this frame (CPU
+    // fallback) rather than submit an invalid dispatch. For the in-RAM scenes bound today this never trips.
+    if resources.gpu_front_end.as_ref().expect("built").would_overflow(params.cam_world) {
+        debug!("voxel-RT G-c.4: residency front-end list/dispatch would overflow for this camera — CPU fallback this frame");
+        return false;
+    }
+
+    // The non-blocking 1-frame-late change_count mirror (§3.1): read the PREVIOUS frame's change_count out of
+    // band. `None` (first bound frame / not yet ready) ⇒ treat as CHANGED (record the AS build — harmless). `0` ⇒
+    // converged → skip the AS rebuild (idle). `>0` ⇒ residency changed → rebuild the dirty chunks.
+    let prev_change = resources
+        .gpu_front_end
+        .as_mut()
+        .expect("built")
+        .poll_change_count(device);
+    let rebuild_as = prev_change.map(|c| c > 0).unwrap_or(true);
+
+    let _span = info_span!("vox_gpu_residency_live").entered();
+
+    // ONE encoder: the front-end pipeline (Pass A→D + classify/pack/write_aabb) THEN the dirty-chunk BLAS rebuild
+    // reading the just-written aabb_buf (fill-then-build) — one submit closes it.
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("voxel_rt_gpu_residency_live"),
+    });
+    {
+        let fe = resources.gpu_front_end.as_mut().expect("built");
+        let _r = info_span!("vox_residency_front_end").entered();
+        fe.record_frame(render_queue.0.as_ref(), &mut encoder, params.cam_world);
+    }
+
+    // First-shippable AS build: rebuild ALL chunk BLASes + the TLAS reading the GPU-written aabb_buf, but ONLY
+    // when the mirror says the residency changed (or on the first bound frame). A converged static camera skips
+    // this entirely (the mirror reads 0) — the idle path.
+    if rebuild_as {
+        let _b = info_span!("vox_blas_residency").entered();
+        let scene = resources.scene.as_ref().expect("checked above");
+        let aabb_stride = core::mem::size_of::<GpuBrickAabb>() as u64;
+        let sizes: Vec<wgpu::BlasAABBGeometrySizeDescriptor> = scene
+            .chunks
+            .iter()
+            .map(|chunk| wgpu::BlasAABBGeometrySizeDescriptor {
+                primitive_count: chunk.prim_count,
+                flags: wgpu::AccelerationStructureGeometryFlags::OPAQUE,
+            })
+            .collect();
+        let geos: Vec<_> = scene
+            .chunks
+            .iter()
+            .zip(sizes.iter())
+            .map(|(chunk, size)| wgpu::BlasBuildEntry {
+                blas: &chunk.blas,
+                geometry: wgpu::BlasGeometries::AabbGeometries(vec![wgpu::BlasAabbGeometry {
+                    size,
+                    stride: aabb_stride,
+                    aabb_buffer: &scene.aabb_buf,
+                    primitive_offset: chunk.slot_base * aabb_stride as u32,
+                }]),
+            })
+            .collect();
+        if !geos.is_empty() {
+            encoder.build_acceleration_structures(geos.iter(), core::iter::once(&scene.tlas));
+        }
+    }
+
+    render_queue.submit(core::iter::once(encoder.finish()));
+
+    // Advance the staging ring so the NEXT frame's poll reads THIS frame's change_count copy.
+    resources.gpu_front_end.as_mut().expect("built").advance_ring();
+    true
 }
 
 /// **Phase G Stage G-b — apply a [`GpuPackBatch`]** to the persistent fixed-cap scene buffers (the A/B-gated

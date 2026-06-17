@@ -55,13 +55,43 @@ struct BistroBench {
     shot_fired: bool,
     /// Whether the final `BENCH RESULT:` line has been logged already (fire-once latch).
     reported: bool,
+    /// **G-c.4** — the MAX frame-time (ms) seen inside the steady-state window (the HITCH metric: a classify
+    /// freeze on a brick crossing shows up here as a 100+ ms spike that the avg-FPS hides). 0 ⇒ no samples yet.
+    max_frame_ms: f64,
+    /// **G-c.4** — the scripted MOVING-camera fly-through (`ADVENTURE_CAM_PATH="x0,y0,z0,lx,ly,lz; …"` of ≥2
+    /// keyframe eye+look_at points). The camera lerps across them over the run so it CROSSES brick boundaries
+    /// (the only way to surface the classify freeze — a static pin can't). `None` ⇒ use the fixed `ADVENTURE_CAM`.
+    cam_path: Option<Vec<(Vec3, Vec3)>>,
 }
 
 /// Install the Bistro bench: boot the gallery (⇒ Bistro-alone via the env), pin the camera from
 /// `ADVENTURE_CAM`, and add the per-frame sampler / screenshot / report systems. Editor build only.
 pub fn install_bistro_bench(app: &mut App) {
-    // Boot the GALLERY scene; with ADVENTURE_BENCH_BISTRO set, the streaming path loads Bistro alone at origin.
-    app.insert_resource(crate::voxel::VoxelScene::Gallery);
+    // Boot the bench scene. Default GALLERY (⇒ Bistro alone at origin, the streamed `.vxo` path). `ADVENTURE_
+    // BENCH_SCENE=sponza` instead boots the IN-RAM `.vox` Sponza — the scene whose occupancy + core store the
+    // GPU front end CAN bind today (the streamed `.vxo` per-region paging is the remaining piece). Used to
+    // validate the live GPU-driven drive end-to-end (no classify freeze + convergence) on the in-RAM path.
+    let scene = match std::env::var("ADVENTURE_BENCH_SCENE").ok().as_deref() {
+        Some("sponza") => {
+            info!("bench: ADVENTURE_BENCH_SCENE=sponza — booting the IN-RAM .vox Sponza (GPU-residency-bindable)");
+            crate::voxel::VoxelScene::Sponza
+        }
+        _ => crate::voxel::VoxelScene::Gallery,
+    };
+    app.insert_resource(scene);
+
+    // **G-c.4** — `ADVENTURE_GPU_RESIDENCY=1` flips on the GPU-driven readback-free residency front end (the
+    // A/B toggle). When set, the residency DECISION + pack + AABB-fill + BLAS rebuild all run on the GPU each
+    // frame, eliminating the CPU `vox_residency_classify` freeze (the whole point of the A/B). Inserted as the
+    // initial `VoxelRtToggle` so it is on from the first streamed frame. Unset ⇒ the CPU path (the A side).
+    if std::env::var("ADVENTURE_GPU_RESIDENCY").is_ok() {
+        info!("bench: ADVENTURE_GPU_RESIDENCY set — GPU-driven residency front end ON (readback-free)");
+        app.insert_resource(crate::voxel::raytrace::VoxelRtToggle {
+            enabled: true,
+            gpu_pack: false,
+            gpu_residency: true,
+        });
+    }
 
     // Turn on the lightweight CPU+GPU span instrumentation so the render world's per-pass GPU timestamp
     // read-back (`instrument::record_gpu`) populates — `bench_diag` logs a non-draining peek each tick.
@@ -87,20 +117,27 @@ pub fn install_bistro_bench(app: &mut App) {
         );
     }
 
+    // **G-c.4** — the MOVING-camera fly-through takes priority over the fixed pin: a static pin can't surface the
+    // classify freeze (no brick crossings). `ADVENTURE_CAM_PATH` is `;`-separated keyframes, each six floats
+    // `ex,ey,ez,lx,ly,lz` (eye + look_at); the camera lerps across them over the whole run.
+    let cam_path = parse_adventure_cam_path();
     let cam = parse_adventure_cam();
-    if let Some((eye, look)) = cam {
+    if let Some(path) = &cam_path {
+        info!("bench: ADVENTURE_CAM_PATH set — {} keyframe(s), MOVING fly-through (crosses brick boundaries)", path.len());
+        app.add_systems(Update, pin_bench_camera);
+    } else if let Some((eye, look)) = cam {
         info!(
-            "bench: ADVENTURE_CAM eye=({:.1},{:.1},{:.1}) look_at=({:.1},{:.1},{:.1})",
+            "bench: ADVENTURE_CAM eye=({:.1},{:.1},{:.1}) look_at=({:.1},{:.1},{:.1}) (STATIC pin)",
             eye.x, eye.y, eye.z, look.x, look.y, look.z
         );
         app.add_systems(Update, pin_bench_camera);
     } else {
         warn!(
-            "bench: ADVENTURE_CAM not set / unparseable (want \"eye_x,eye_y,eye_z,look_x,look_y,look_z\") — \
-             using the default orbit view, which likely is NOT inside Bistro."
+            "bench: neither ADVENTURE_CAM_PATH nor ADVENTURE_CAM set — using the default orbit view, which likely \
+             is NOT inside Bistro (and won't move, so it can't surface a classify freeze)."
         );
     }
-    app.insert_resource(BistroBench { exit_at, cam, ..default() });
+    app.insert_resource(BistroBench { exit_at, cam, cam_path, ..default() });
 
     app.add_systems(Update, (sample_fps, fire_screenshot, report_at_exit, bench_diag));
     // ADVENTURE_DEBUG_VIEW=N forces the shader debug-view selector each frame (0=lit, 1=normals, 2=depth,
@@ -159,8 +196,8 @@ fn bench_diag(
     }
 }
 
-/// Parse `ADVENTURE_CAM="tx,ty,tz,dist,yaw,pitch"` into an [`SdfOrbitCamera`]. Returns `None` if unset or the
-/// six comma-separated floats don't parse.
+/// Parse `ADVENTURE_CAM="ex,ey,ez,lx,ly,lz"` into an `(eye, look_at)` pair. Returns `None` if unset or the six
+/// comma-separated floats don't parse.
 fn parse_adventure_cam() -> Option<(Vec3, Vec3)> {
     let raw = std::env::var("ADVENTURE_CAM").ok()?;
     let v: Vec<f32> = raw.split(',').filter_map(|s| s.trim().parse::<f32>().ok()).collect();
@@ -168,6 +205,22 @@ fn parse_adventure_cam() -> Option<(Vec3, Vec3)> {
         return None;
     }
     Some((Vec3::new(v[0], v[1], v[2]), Vec3::new(v[3], v[4], v[5])))
+}
+
+/// **G-c.4** — parse `ADVENTURE_CAM_PATH="ex,ey,ez,lx,ly,lz; …"` into a list of `(eye, look_at)` keyframes (each
+/// segment six comma-separated floats, segments `;`-separated). Returns `None` if unset or fewer than 2 valid
+/// keyframes (a single keyframe can't move). The fly-through lerps across these over the run so the camera
+/// CROSSES brick boundaries — the only way to exercise enter/drop + surface the CPU classify freeze.
+fn parse_adventure_cam_path() -> Option<Vec<(Vec3, Vec3)>> {
+    let raw = std::env::var("ADVENTURE_CAM_PATH").ok()?;
+    let frames: Vec<(Vec3, Vec3)> = raw
+        .split(';')
+        .filter_map(|seg| {
+            let v: Vec<f32> = seg.split(',').filter_map(|s| s.trim().parse::<f32>().ok()).collect();
+            (v.len() == 6).then(|| (Vec3::new(v[0], v[1], v[2]), Vec3::new(v[3], v[4], v[5])))
+        })
+        .collect();
+    (frames.len() >= 2).then_some(frames)
 }
 
 /// Force lighting-uniform overrides from env each frame (overrides the editor/preset values), so the bench can
@@ -189,8 +242,26 @@ fn force_lighting_overrides(
 /// Pin the [`SdfCamera`] transform to the bench [`SdfOrbitCamera`] EVERY frame. The editor's `orbit_camera`
 /// only runs while the pointer is over the viewport (input-gated), so during a headless auto-run it wouldn't
 /// apply the view — we write it directly here so the interior view is deterministic + drift-free.
-fn pin_bench_camera(bench: Res<BistroBench>, mut cam: Query<&mut Transform, With<SdfCamera>>) {
-    let Some((eye, look)) = bench.cam else { return };
+fn pin_bench_camera(time: Res<Time>, bench: Res<BistroBench>, mut cam: Query<&mut Transform, With<SdfCamera>>) {
+    // **G-c.4** — a MOVING fly-through (cam_path) takes priority: lerp the eye+look_at across the keyframes over
+    // the whole run so the camera continuously crosses brick boundaries (exercises enter/drop). A static `cam`
+    // pin is the fallback.
+    let (eye, look) = if let Some(path) = &bench.cam_path {
+        let dur = bench.exit_at.unwrap_or(20.0).max(0.001);
+        // Normalized [0,1) progress through the run, mapped onto the (n-1) segments; lerp within the segment.
+        let prog = (time.elapsed_secs() / dur).clamp(0.0, 0.99999);
+        let segs = (path.len() - 1) as f32;
+        let f = prog * segs;
+        let i = (f.floor() as usize).min(path.len() - 2);
+        let local = f - i as f32;
+        let (e0, l0) = path[i];
+        let (e1, l1) = path[i + 1];
+        (e0.lerp(e1, local), l0.lerp(l1, local))
+    } else if let Some((eye, look)) = bench.cam {
+        (eye, look)
+    } else {
+        return;
+    };
     let view = Transform::from_translation(eye).looking_at(look, Vec3::Y);
     for mut t in &mut cam {
         *t = view;
@@ -211,6 +282,16 @@ fn sample_fps(time: Res<Time>, diagnostics: Res<DiagnosticsStore>, mut bench: Re
     {
         bench.fps_sum += fps;
         bench.fps_samples += 1;
+    }
+    // **G-c.4** — the HITCH metric: the MAX raw (un-smoothed) frame-time inside the steady-state window. A
+    // classify freeze on a brick crossing shows here as a 100+ ms spike that the smoothed avg-FPS hides; the
+    // GPU-driven path must keep this bounded (no 100+ ms hitch).
+    if let Some(ft_ms) = diagnostics
+        .get(&FrameTimeDiagnosticsPlugin::FRAME_TIME)
+        .and_then(|d| d.value())
+        .filter(|&ft| ft > bench.max_frame_ms)
+    {
+        bench.max_frame_ms = ft_ms;
     }
 }
 
@@ -241,7 +322,7 @@ fn report_at_exit(time: Res<Time>, mut bench: ResMut<BistroBench>) {
     let avg_fps = bench.fps_sum / bench.fps_samples as f64;
     let frame_time_ms = if avg_fps > 0.0 { 1000.0 / avg_fps } else { f64::INFINITY };
     info!(
-        "BENCH RESULT: bistro-interior avg_fps={:.1} frame_time_ms={:.3} (over {} frames)",
-        avg_fps, frame_time_ms, bench.fps_samples
+        "BENCH RESULT: bistro-interior avg_fps={:.1} frame_time_ms={:.3} max_frame_ms={:.1} (over {} frames)",
+        avg_fps, frame_time_ms, bench.max_frame_ms, bench.fps_samples
     );
 }

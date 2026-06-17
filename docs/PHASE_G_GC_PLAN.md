@@ -152,9 +152,38 @@ adversarial reviewers → parity + perf + 3 zero-warning builds (`PHASE_G_GALLER
   recording; delete per-frame CPU command-building. *Gate:* static hold converges to idle (trace shows no `vox_blas_*`/pack
   work); pixel-identical to G-c.2; a shell-shift fly-through asserts no LOD-seam holes. *Bench:* fly-through max frame bounded
   (the GI/render budget, not 445 ms) AND static idle — the deliverable.
-- **G-c.4 (optional) — GPU `chunk_dirty_mask` + demand-driven region occupancy paging.** Replace "rebuild all on change" with
-  the GPU dirty-chunk mask + out-of-band mirror; wire per-region occupancy upload to the `VxoSource` LRU. Only if the bench
-  shows change-frame BLAS cost or paging stalls.
+- **G-c.4 — LIVE render-graph drive + change_count mirror + bench (LANDED).** The proven readback-free front end
+  (`tests/voxel_gpu_residency_converge.rs` `GpuFrontEnd`) is ported to production `src/voxel/residency_front_end.rs`
+  (`GpuResidencyFrontEnd`) with EXTERNAL pool buffers (the live scene's `meta/voxel/brick_palettes/aabb`), a caller's-encoder
+  `record_frame` (so the dirty-chunk BLAS rides the same submit, fill-then-build), and the non-blocking 1-frame-late
+  `change_count` staging-ring mirror (`poll_change_count`/`advance_ring`). Driven live in `raytrace.rs`
+  `drive_gpu_residency_front_end` (per-frame, behind `gpu_residency`, INDEPENDENT of the CPU patch generation):
+  poll mirror → record front-end frame into the live pool → (if `change_count>0` or first bound frame) rebuild ALL dirty
+  chunk BLASes + TLAS from the GPU-written `aabb_buf` → one submit → advance ring. The CPU `apply_gpu_pack` arm is SKIPPED
+  when the front end drove (no double-write); toggle OFF is byte-unchanged. Camera + clip_half cross via the new per-frame
+  `VoxelRtResidencyParams` extract (the only per-frame CPU→GPU residency traffic). Bench: `ADVENTURE_GPU_RESIDENCY=1`,
+  `ADVENTURE_CAM_PATH` moving fly-through, `max_frame_ms` (hitch) reported. **VALIDATED on the IN-RAM path (Sponza):** front
+  end builds + binds to the live pool, renders the correct Sponza atrium (GI-lit, banners), `max_frame_ms` 18–23 ms (vs the
+  CPU path's ~317 ms classify freeze), and a static hold CONVERGES to idle (patch_gen/resident flat after settle; the mirror
+  gates the AS build off).
+
+  **REMAINING (the streamed-`.vxo` Bistro goal):** the `MergedSource`/`VxoSource` Bistro is region-paged from disk, so its
+  occupancy + core store are NOT GPU-resident (G-c.0 deferred the eager build to preserve constant-RAM; a whole-scene core
+  store is ~GBs for Bistro — it MUST be demand-paged). The live drive correctly FALLS BACK to the CPU pack for Bistro today
+  (graceful, gated on `gpu_residency && gpu_core_store.is_some()`), so the Bistro `max_frame_ms` still shows the classify
+  freeze. The remaining piece is **per-region occupancy + core paging** wired to the `VxoSource` `RegionCache` LRU:
+  * **Occupancy (small, ~1 bit/brick, do this FIRST):** a GROWABLE GPU sector hash (a mutable `SectorOccupancy` whose
+    `entries` buffer is `COPY_DST` and re-uploaded incrementally). On a `decoded_region`, OR each brick's occ/full bit into
+    its sector mask + upload the touched sectors; on LRU eviction, the occupancy STAYS (it is tiny + the clipmap re-demands
+    it) — i.e. occupancy is a one-way accumulating index of EVER-SEEN sectors (a few MB for all of Bistro), built lazily as
+    the camera reveals regions. No eviction needed.
+  * **Core store (large, MUST evict):** the cores are only needed transiently to PACK a newly-entered brick's halo. Demand-page
+    them keyed by `(coord,lod)` with an LRU bounded to ~the resident-set footprint, uploaded on region decode, evicted on
+    region drop. The live pool already holds the packed resident cores, so the core store only spans the in-flight enter set.
+  * Both upload from `VxoSource::decoded_region` (the single region-decode hook) and are bounded by the existing region LRU —
+    constant-RAM preserved (one region's bricks at a time, no whole-scene decode).
+- **G-c.4+ (optional) — GPU `chunk_dirty_mask`.** Replace "rebuild ALL dirty chunks on change" with the GPU-written
+  per-chunk dirty mask gating per-band BLAS rebuilds. Only if the bench shows change-frame BLAS cost.
 
 ## 7. Critical files + risks
 

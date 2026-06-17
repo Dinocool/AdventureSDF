@@ -37,6 +37,10 @@ pub mod raytrace;
 /// GPU-driven readback-free streaming front end). Built + uploaded from the static `.vxo`/merged source;
 /// wired to NO pipeline yet (no behaviour change). See `docs/PHASE_G_GC_PLAN.md` §2.2.
 pub mod residency_gpu;
+/// Phase G "G-c.4" — the LIVE readback-free GPU residency FRONT END (the production home of the GPU-driven
+/// pipeline proven in `tests/voxel_gpu_residency_converge.rs`). Drives the residency DECISION + pack + AABB-fill
+/// on the GPU into the live scene pool, gated by the non-blocking change_count mirror. See `PHASE_G_GC_PLAN.md` §1/§3/§4.
+pub mod residency_front_end;
 pub mod source;
 pub mod streaming;
 pub mod vox;
