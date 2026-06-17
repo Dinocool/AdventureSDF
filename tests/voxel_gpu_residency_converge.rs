@@ -82,9 +82,14 @@ struct ResidencyParams {
     levels: [LevelParams; LODS],
     clip_half_bricks: i32,
     total_cells: u32,
-    _pad0: u32,
+    hist_scale: f32,
     _pad1: u32,
+    cam_world: [f32; 3],
+    _pad2: u32,
 }
+
+/// Enter-cap distance histogram buckets — MUST equal `HIST_BUCKETS` in `voxel_residency.wgsl`.
+const HIST_BUCKETS: u32 = 4096;
 
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -131,7 +136,16 @@ fn build_params(cam: [f32; 3], half: i32) -> ResidencyParams {
         };
         offset += count;
     }
-    ResidencyParams { levels, clip_half_bricks: half, total_cells: offset, _pad0: 0, _pad1: 0 }
+    let max_dist = (half.max(1) as f32) * brick_span(MAX_LOD) * 3.0_f32.sqrt();
+    ResidencyParams {
+        levels,
+        clip_half_bricks: half,
+        total_cells: offset,
+        hist_scale: HIST_BUCKETS as f32 / max_dist,
+        _pad1: 0,
+        cam_world: cam,
+        _pad2: 0,
+    }
 }
 
 // =========================================================================================================
@@ -253,6 +267,9 @@ struct GpuFrontEnd {
     index_slab_free: wgpu::Buffer,
     palette_slab_ctrl: wgpu::Buffer,
     palette_slab_free: wgpu::Buffer,
+    slab_state: wgpu::Buffer,
+    enter_hist: wgpu::Buffer,
+    enter_cap: wgpu::Buffer,
 
     // --- the change_count signal + its mappable staging mirror (G-c.4 reads this out-of-band) ---
     change_count_buf: wgpu::Buffer,
@@ -273,6 +290,8 @@ struct GpuFrontEnd {
     p_present: wgpu::ComputePipeline,
     p_mark: wgpu::ComputePipeline,
     p_apply: wgpu::ComputePipeline,
+    p_cap_hist: wgpu::ComputePipeline,
+    p_cap_compute: wgpu::ComputePipeline,
     p_enter: wgpu::ComputePipeline,
     p_chg: wgpu::ComputePipeline,
     p_d_dirty: wgpu::ComputePipeline,
@@ -390,6 +409,10 @@ impl GpuFrontEnd {
         let palette_ctrl_init = vec![0u32; 1 + 16 * 2];
         let palette_slab_ctrl = buf_init(&device, "palette_slab_ctrl", bytemuck::cast_slice(&palette_ctrl_init), storage_usage());
         let palette_slab_free = storage_buf(&device, "palette_slab_free", (16 * max_resident as u64) * 4);
+        // G-c.4: the GPU DenseSlot table (slab reuse/free on re-pack) + the enter-cap histogram/cut.
+        let slab_state = storage_buf(&device, "slab_state", (max_resident as u64) * 4 * 4);
+        let enter_hist = storage_buf(&device, "enter_hist", (HIST_BUCKETS as u64) * 4);
+        let enter_cap = buf_init(&device, "enter_cap", bytemuck::cast_slice(&[HIST_BUCKETS, 0u32]), storage_usage());
 
         // the change_count signal + mappable staging mirror (G-c.4's out-of-band read).
         let change_count_buf = buf_init(&device, "change_count", bytemuck::bytes_of(&0u32), storage_usage());
@@ -441,6 +464,9 @@ impl GpuFrontEnd {
         entries.push(storage_entry(46, true));
         entries.push(storage_entry(47, true));
         entries.push(storage_entry(48, false));
+        entries.push(storage_entry(49, false)); // slab_state
+        entries.push(storage_entry(50, false)); // enter_hist
+        entries.push(storage_entry(51, false)); // enter_cap
         let res_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("res_bgl"),
             entries: &entries,
@@ -468,6 +494,8 @@ impl GpuFrontEnd {
         let p_present = mk_res("build_present_flag");
         let p_mark = mk_res("diff_drop_mark");
         let p_apply = mk_res("diff_drop_apply");
+        let p_cap_hist = mk_res("enter_cap_histogram");
+        let p_cap_compute = mk_res("enter_cap_compute");
         let p_enter = mk_res("diff_enter_scan");
         let p_chg = mk_res("write_change_count");
         let p_d_dirty = mk_res("pack_build_dirty");
@@ -614,6 +642,9 @@ impl GpuFrontEnd {
             index_slab_free,
             palette_slab_ctrl,
             palette_slab_free,
+            slab_state,
+            enter_hist,
+            enter_cap,
             change_count_buf,
             change_staging,
             dummy_in,
@@ -628,6 +659,8 @@ impl GpuFrontEnd {
             p_present,
             p_mark,
             p_apply,
+            p_cap_hist,
+            p_cap_compute,
             p_enter,
             p_chg,
             p_d_dirty,
@@ -699,6 +732,9 @@ impl GpuFrontEnd {
                 bind(46, &self.palette_pool_base),
                 bind(47, &self.classify_out),
                 bind(48, &self.change_count_buf),
+                bind(49, &self.slab_state),
+                bind(50, &self.enter_hist),
+                bind(51, &self.enter_cap),
             ],
         })
     }
@@ -739,6 +775,9 @@ impl GpuFrontEnd {
         compute(&mut enc, &self.p_present, &bg, (self.list_cap as u32).div_ceil(64).max(1));
         compute(&mut enc, &self.p_mark, &bg, self.slot_table_size.div_ceil(64).max(1));
         compute(&mut enc, &self.p_apply, &bg, self.slot_table_size.div_ceil(64).max(1));
+        // Enter-cap (nearest-priority): histogram → cut → capped enter.
+        compute(&mut enc, &self.p_cap_hist, &bg, (self.list_cap as u32).div_ceil(64).max(1));
+        compute(&mut enc, &self.p_cap_compute, &bg, 1);
         compute(&mut enc, &self.p_enter, &bg, (self.list_cap as u32).div_ceil(64).max(1));
         // publish change_count (= enter + drop).
         compute(&mut enc, &self.p_chg, &bg, 1);

@@ -25,7 +25,6 @@ use adventure::voxel::source::{BrickSource, StaticVoxSource};
 use adventure::voxel::vxo::writer::{VxoCompression, VxoHeadParams, write_vxo};
 use adventure::voxel::vxo::{MergedSource, VxoSource};
 use bevy::math::IVec3;
-use bytemuck::Zeroable;
 
 #[path = "common/mod.rs"]
 mod common;

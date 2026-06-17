@@ -61,8 +61,12 @@ struct ResidencyParams {
     levels: [LevelParams; LODS],
     clip_half_bricks: i32,
     total_cells: u32,
-    _pad0: u32,
+    /// ENTER-CAP: candidate distance → histogram bucket = `floor(dist * hist_scale)`.
+    hist_scale: f32,
     _pad1: u32,
+    /// ENTER-CAP: the camera world position (the nearest-priority distance rank centre).
+    cam_world: [f32; 3],
+    _pad2: u32,
 }
 
 #[repr(C)]
@@ -113,8 +117,24 @@ fn build_params(cam: [f32; 3], half: i32) -> ResidencyParams {
         };
         offset += count;
     }
-    ResidencyParams { levels, clip_half_bricks: half, total_cells: offset, _pad0: 0, _pad1: 0 }
+    // ENTER-CAP histogram scale: span the worst-case candidate distance (the coarsest LOD's level box corner,
+    // `clip_half` bricks out on each axis ⇒ the box DIAGONAL) across `HIST_BUCKETS` buckets. `brick_span(MAX_LOD)`
+    // is the coarsest brick edge in metres; a small +1 guard avoids a zero scale at half==0.
+    let max_dist = (half.max(1) as f32) * brick_span(MAX_LOD) * 3.0_f32.sqrt();
+    let hist_scale = HIST_BUCKETS as f32 / max_dist;
+    ResidencyParams {
+        levels,
+        clip_half_bricks: half,
+        total_cells: offset,
+        hist_scale,
+        _pad1: 0,
+        cam_world: cam,
+        _pad2: 0,
+    }
 }
+
+/// Enter-cap distance histogram buckets — MUST equal `HIST_BUCKETS` in `voxel_residency.wgsl`.
+const HIST_BUCKETS: u32 = 4096;
 
 /// The maximum `total_cells` (shell WG-cells across all LODs) the front end's `shell_idx`/list buffers are sized
 /// for, AND the candidate/enter/drop/pack/aabb list capacity. It bounds the transient per-frame work, NOT the
@@ -123,8 +143,15 @@ fn build_params(cam: [f32; 3], half: i32) -> ResidencyParams {
 /// well under this. **Capped so the derived `present_size = next_pow2(2·LIST_CAP)` clear dispatch stays within the
 /// 65535-workgroup 1D limit:** `present_size ≤ 2^21` ⇒ `present_size/64 = 32768 ≤ 65535`. The residency passes
 /// index `gid.x` LINEARLY (no 2D fold), so every per-frame dispatch MUST be `≤ 65535` workgroups — the binding
-/// constraint here. 600_000 ⇒ `present_size = 2^21`, `slot_table` clear `= 2^20/64 = 16384`, list `= 9375` WGs.
-const LIST_CAP: usize = 600_000;
+/// constraint here. 1_000_000 ⇒ `present_size = next_pow2(2M) = 2^21`, list clear `= 1M/64 = 15625` WGs.
+///
+/// **Sized to fit the FULL per-frame DESIRED + CANDIDATE sets at the widest clip_half (160, Bistro).** At
+/// clip_half=160 the Bistro `desired` (occupied-in-shell superset) measures ~870k and `cand` (surface) ~615k.
+/// `desired_list`/`cand_list` MUST hold the WHOLE set — if `desired` overflows this cap, `build_present_flag`
+/// (which runs over `LIST_CAP` invocations) never registers the tail of the desired set, so the resident bricks
+/// beyond the cap fail `present_contains`, get DROPPED, and re-enter next frame ⇒ permanent THRASH (the G-c.4 BUG-2
+/// non-convergence). 1M covers both with headroom while keeping `present_size = 2^21` (clear dispatch 32768 WGs).
+const LIST_CAP: usize = 1_000_000;
 
 // =========================================================================================================
 //  The persistent live front end.
@@ -191,6 +218,14 @@ pub struct GpuResidencyFrontEnd {
     index_slab_free: wgpu::Buffer,
     palette_slab_ctrl: wgpu::Buffer,
     palette_slab_free: wgpu::Buffer,
+    /// The GPU `DenseSlot` table (binding 49): per resident slot, its current dense slab offsets + size selectors
+    /// `[index_off, index_bits, palette_off, palette_k]` — read+updated by Pass D3/D0 to REUSE-in-place / FREE the
+    /// OLD slab on re-pack/drop (the bound on the slab high-water). Mirror of the CPU `SlotState::dense`.
+    slab_state: wgpu::Buffer,
+    /// ENTER-CAP (binding 50): the per-frame candidate distance histogram (`HIST_BUCKETS` u32, cleared each frame).
+    enter_hist: wgpu::Buffer,
+    /// ENTER-CAP (binding 51): `[cut_bucket, room]` — the nearest-priority admission cut (computed each frame).
+    enter_cap: wgpu::Buffer,
 
     // --- the change_count signal + its mappable staging ring (the non-blocking 1-frame-late mirror) ---
     change_count_buf: wgpu::Buffer,
@@ -214,6 +249,8 @@ pub struct GpuResidencyFrontEnd {
     p_present: wgpu::ComputePipeline,
     p_mark: wgpu::ComputePipeline,
     p_apply: wgpu::ComputePipeline,
+    p_cap_hist: wgpu::ComputePipeline,
+    p_cap_compute: wgpu::ComputePipeline,
     p_enter: wgpu::ComputePipeline,
     p_chg: wgpu::ComputePipeline,
     p_d_dirty: wgpu::ComputePipeline,
@@ -325,6 +362,11 @@ impl GpuResidencyFrontEnd {
         let palette_ctrl_init = vec![0u32; 1 + 16 * 2];
         let palette_slab_ctrl = buf_init(device, "res_palette_slab_ctrl", bytemuck::cast_slice(&palette_ctrl_init), storage_usage());
         let palette_slab_free = storage_buf(device, "res_palette_slab_free", (16 * max_resident as u64) * 4);
+        // The GPU DenseSlot table — 4 u32 / slot, all 0 (no slot has a dense slab yet).
+        let slab_state = storage_buf(device, "res_slab_state", (max_resident as u64) * 4 * 4);
+        // ENTER-CAP — the candidate distance histogram + the `[cut_bucket, room]` cut.
+        let enter_hist = storage_buf(device, "res_enter_hist", (HIST_BUCKETS as u64) * 4);
+        let enter_cap = buf_init(device, "res_enter_cap", bytemuck::cast_slice(&[HIST_BUCKETS, 0u32]), storage_usage());
 
         // the change_count signal + a 2-deep mappable staging ring (the non-blocking mirror).
         let change_count_buf = buf_init(device, "res_change_count", bytemuck::bytes_of(&0u32), storage_usage());
@@ -380,6 +422,9 @@ impl GpuResidencyFrontEnd {
         entries.push(storage_entry(46, true));
         entries.push(storage_entry(47, true));
         entries.push(storage_entry(48, false));
+        entries.push(storage_entry(49, false)); // slab_state (GPU DenseSlot table — read+write in Pass D3/D0)
+        entries.push(storage_entry(50, false)); // enter_hist (enter-cap distance histogram)
+        entries.push(storage_entry(51, false)); // enter_cap ([cut_bucket, room])
         let res_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("res_live_bgl"),
             entries: &entries,
@@ -407,6 +452,8 @@ impl GpuResidencyFrontEnd {
         let p_present = mk_res("build_present_flag");
         let p_mark = mk_res("diff_drop_mark");
         let p_apply = mk_res("diff_drop_apply");
+        let p_cap_hist = mk_res("enter_cap_histogram");
+        let p_cap_compute = mk_res("enter_cap_compute");
         let p_enter = mk_res("diff_enter_scan");
         let p_chg = mk_res("write_change_count");
         let p_d_dirty = mk_res("pack_build_dirty");
@@ -519,6 +566,9 @@ impl GpuResidencyFrontEnd {
             index_slab_free,
             palette_slab_ctrl,
             palette_slab_free,
+            slab_state,
+            enter_hist,
+            enter_cap,
             change_count_buf,
             change_staging,
             ring: 0,
@@ -534,6 +584,8 @@ impl GpuResidencyFrontEnd {
             p_present,
             p_mark,
             p_apply,
+            p_cap_hist,
+            p_cap_compute,
             p_enter,
             p_chg,
             p_d_dirty,
@@ -648,6 +700,9 @@ impl GpuResidencyFrontEnd {
         queue.write_buffer(&self.index_slab_ctrl, 0, bytemuck::cast_slice(&index_ctrl_init));
         let palette_ctrl_init = vec![0u32; 1 + 16 * 2];
         queue.write_buffer(&self.palette_slab_ctrl, 0, bytemuck::cast_slice(&palette_ctrl_init));
+        // Zero the GPU DenseSlot table (no slot has a dense slab in a freshly cold-started scene).
+        let slab_state_init = vec![0u32; self.max_resident as usize * 4];
+        queue.write_buffer(&self.slab_state, 0, bytemuck::cast_slice(&slab_state_init));
         queue.write_buffer(&self.change_count_buf, 0, bytemuck::bytes_of(&0u32));
     }
 
@@ -715,6 +770,9 @@ impl GpuResidencyFrontEnd {
                 bind(46, &self.palette_pool_base),
                 bind(47, &self.classify_out),
                 bind(48, &self.change_count_buf),
+                bind(49, &self.slab_state),
+                bind(50, &self.enter_hist),
+                bind(51, &self.enter_cap),
             ],
         })
     }
@@ -754,6 +812,10 @@ impl GpuResidencyFrontEnd {
         compute(enc, &self.p_present, bg, list_wgs);
         compute(enc, &self.p_mark, bg, self.slot_table_size.div_ceil(64).max(1));
         compute(enc, &self.p_apply, bg, self.slot_table_size.div_ceil(64).max(1));
+        // Enter-cap (BUG-2 nearest-priority): build the candidate distance histogram, compute the cut bucket from
+        // the live pool room, THEN enter only the nearest-`room` candidates (≤ pool cap, stable ⇒ converges).
+        compute(enc, &self.p_cap_hist, bg, list_wgs);
+        compute(enc, &self.p_cap_compute, bg, 1);
         compute(enc, &self.p_enter, bg, list_wgs);
         // publish change_count (= enter + drop).
         compute(enc, &self.p_chg, bg, 1);

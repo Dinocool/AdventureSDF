@@ -260,8 +260,10 @@ struct ResidencyParams {
     levels: array<LevelParams, 8>, // index = lod, 0..=MAX_LOD
     clip_half_bricks: i32,
     total_cells: u32,              // Σ_lod cell_count — the Pass B0 dispatch invocation count
-    _pad0: u32,
+    hist_scale: f32,              // ENTER-CAP: candidate distance → histogram bucket = floor(dist * hist_scale)
     _pad1: u32,
+    cam_world: vec3<f32>,         // ENTER-CAP: the camera world position (for the nearest-priority distance rank)
+    _pad2: u32,
 }
 
 // --- clipmap math (SSOT port of streaming.rs) ---
@@ -521,6 +523,28 @@ const PRESENT_WORDS: u32 = 4u;
 @group(0) @binding(20) var<storage, read_write> enter_list: array<vec4<i32>>;
 @group(0) @binding(21) var<storage, read_write> drop_count: atomic<u32>;
 @group(0) @binding(22) var<storage, read_write> drop_list: array<vec4<i32>>;
+
+// **ENTER-CAP (G-c.4 BUG-2 fix) — the NEAREST-priority admission cap (mirror of streaming.rs:783-806).** When
+// the surface candidate set exceeds the free pool room, the CPU keeps the NEAREST `room` candidates by world
+// distance and drops the farthest, so a static camera converges to a STABLE nearest set. The GPU mirror is a
+// per-frame DISTANCE HISTOGRAM + a prefix-sum cut radius: a candidate enters iff its distance bucket is strictly
+// below the cut bucket `enter_cap[0]` (the largest bucket whose cumulative candidate count ≤ `room`). Same
+// candidates ⇒ same histogram ⇒ same cut ⇒ same admitted set ⇒ change→0 (converges) AND ≤ room (never overfills
+// the pool). `enter_hist[b]` = candidate count in bucket b; `enter_cap = [cut_bucket, room]`.
+const HIST_BUCKETS: u32 = 4096u;
+@group(0) @binding(50) var<storage, read_write> enter_hist: array<atomic<u32>>;
+@group(0) @binding(51) var<storage, read_write> enter_cap: array<u32>; // [cut_bucket, room]
+
+// The world-distance of candidate `(coord,lod)`'s CENTRE to the camera (SSOT mirror of `brick_world_dist`).
+fn cand_world_dist(coord: vec3<i32>, lod: u32) -> f32 {
+    let span = brick_span_d(lod);
+    let c = (vec3<f32>(coord) + vec3<f32>(0.5)) * span - params.cam_world;
+    return sqrt(dot(c, c));
+}
+// The histogram bucket of a candidate distance (clamped to the last bucket).
+fn dist_bucket(dist: f32) -> u32 {
+    return min(u32(max(dist, 0.0) * params.hist_scale), HIST_BUCKETS - 1u);
+}
 
 // The 32-bit hash of a brick key `(coord, lod)` — the SAME FNV-1a + avalanche family as `hash_sector`, over the
 // four key words (the brick coord IS the key here, no sector split). SSOT mirror of the Rust `brick_key_hash`.
@@ -787,6 +811,10 @@ fn clear_per_frame_hashes(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (i < diff_cfg.slot_table_size) {
         atomicStore(&dirty_flag[i * 4u + 3u], EMPTY_LOD);
     }
+    // Clear the enter-cap distance histogram (rebuilt each frame from this frame's candidates).
+    if (i < HIST_BUCKETS) {
+        atomicStore(&enter_hist[i], 0u);
+    }
 }
 
 // --- Pass C-tail — publish the change_count signal (G-c.4's non-blocking, 1-frame-late CPU mirror reads this). ---
@@ -798,10 +826,53 @@ fn write_change_count() {
     atomicStore(&change_count, atomicLoad(&enter_count) + atomicLoad(&drop_count));
 }
 
+// **Pass C-cap.A — build the candidate distance HISTOGRAM** (BUG-2 nearest-priority cap). One invocation per
+// candidate; bins the NON-resident candidates (only those can enter, mirror of the CPU `to_classify` filter that
+// excludes the resident set) by world distance. The histogram drives the cut radius (Pass C-cap.B).
+@compute @workgroup_size(64)
+fn enter_cap_histogram(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    if (i >= atomicLoad(&candidate_count)) {
+        return;
+    }
+    let k = candidate_list[i];
+    let coord = vec3<i32>(k.x, k.y, k.z);
+    let lod = u32(k.w);
+    if (is_resident(coord, lod)) {
+        return; // resident candidates never enter and never count against `room` (CPU excludes them)
+    }
+    atomicAdd(&enter_hist[dist_bucket(cand_world_dist(coord, lod))], 1u);
+}
+
+// **Pass C-cap.B — compute the CUT bucket from the histogram + the live pool room** (single invocation). `room` =
+// the free-list slots available THIS frame (`tail - head`, = CPU `budget - already_resident`). The cut bucket is
+// the LARGEST `b` whose cumulative candidate count `Σ_{<b} hist` ≤ `room` — admit buckets strictly below it. This
+// keeps ≤ `room` nearest candidates (never overfills the pool) and is DETERMINISTIC (same hist ⇒ same cut), so a
+// static camera converges. Mirror of `surface_candidates.select_nth_unstable_by(room, dist)` (streaming.rs:798).
+@compute @workgroup_size(1)
+fn enter_cap_compute() {
+    let head = atomicLoad(&free_ctrl[0]);
+    let tail = atomicLoad(&free_ctrl[1]);
+    let room = select(0u, tail - head, tail > head);
+    var acc = 0u;
+    var cut = HIST_BUCKETS; // default: no cut (all candidates fit)
+    for (var b = 0u; b < HIST_BUCKETS; b = b + 1u) {
+        let next = acc + atomicLoad(&enter_hist[b]);
+        if (next > room) {
+            cut = b; // bucket b would overflow `room` ⇒ admit only buckets strictly below b
+            break;
+        }
+        acc = next;
+    }
+    enter_cap[0] = cut;
+    enter_cap[1] = room;
+}
+
 // **Pass C1 — enter scan.** One invocation per candidate (the surface resident-target set). If `slot_table[key]`
-// is absent, claim a free slot (atomic pop the free-list ring), insert the key→slot into the slot table, and
-// atomic-append to `enter_list` (+ `enter_count`). Mirrors design §1 Pass C1 + `ResidencyManager::update`'s
-// "enqueue desired-but-not-resident" + `SlotAllocator::claim` (incremental.rs:595).
+// is absent AND its distance bucket is within the cut (BUG-2 nearest cap), claim a free slot (atomic pop the
+// free-list ring), insert the key→slot into the slot table, and atomic-append to `enter_list` (+ `enter_count`).
+// Mirrors design §1 Pass C1 + `ResidencyManager::update`'s "enqueue desired-but-not-resident" +
+// `SlotAllocator::claim` (incremental.rs:595) + the nearest-`room` cap (streaming.rs:783-806).
 @compute @workgroup_size(64)
 fn diff_enter_scan(@builtin(global_invocation_id) gid: vec3<u32>) {
     let i = gid.x;
@@ -813,6 +884,11 @@ fn diff_enter_scan(@builtin(global_invocation_id) gid: vec3<u32>) {
     let lod = u32(k.w);
     if (is_resident(coord, lod)) {
         return; // already resident — no change
+    }
+    // NEAREST-priority cap: skip candidates at/after the cut bucket (the farthest, beyond `room`) — keeps the
+    // nearest `room`, deterministic + stable ⇒ converges. (cut == HIST_BUCKETS ⇒ everything fits, no cap.)
+    if (dist_bucket(cand_world_dist(coord, lod)) >= enter_cap[0]) {
+        return;
     }
     // Claim a free slot: atomically advance the free-list head ring index, read the slot id at that index.
     let cap = diff_cfg.max_resident;
@@ -1061,6 +1137,17 @@ const PALETTE_CLASSES: u32 = 16u;
 @group(0) @binding(45) var<storage, read> index_pool_base: array<u32>;   // [0] = the index pool's word base
 @group(0) @binding(46) var<storage, read> palette_pool_base: array<u32>; // [0] = the palette pool's word base
 
+// **The GPU `DenseSlot` table (G-c.4 slab-reuse fix)** — the exact analogue of the CPU `SlotState::dense`
+// (`incremental.rs`). Per RESIDENT slot, the slab offsets + size selectors of its CURRENTLY-PACKED dense block:
+//   slab_state[slot*4 + 0] = index word offset (the slab `voxel_offset`),
+//   slab_state[slot*4 + 1] = index_bits ∈ {1,2,4,8,16}  (0 ⇒ this slot has NO dense slab: fresh/uniform/freed),
+//   slab_state[slot*4 + 2] = palette word offset,
+//   slab_state[slot*4 + 3] = palette_k (distinct-id count the palette slab was sized for; 0 ⇒ no palette slab).
+// Pass D3/D0 read this BEFORE (re)packing/dropping a slot to REUSE-in-place (same class) or FREE the OLD slab
+// (the bound on the slab high-water), then write the slot's NEW state. SSOT mirror: `update_inner`'s
+// reuse-iff-class-matches-else-quarantine-and-realloc (incremental.rs:1144-1165) + the drop free (1001-1008).
+@group(0) @binding(49) var<storage, read_write> slab_state: array<u32>;  // 4 u32 / slot
+
 // --- core_table lookup (key -> deduped core-pool index, or NEIGHBOUR_ABSENT) ---
 fn core_lookup(coord: vec3<i32>, lod: u32) -> u32 {
     let size = pack_cfg.core_table_size;
@@ -1122,12 +1209,19 @@ fn palette_class_of(k: u32) -> u32 {
 // high-water by the class size. Returns the WORD offset (pool base + bump). Mirror of `SlabArena::alloc`.
 fn alloc_index_slab(index_bits: u32) -> u32 {
     let cls = index_bits_class(index_bits);
-    let head = atomicLoad(&index_slab_ctrl[1u + cls * 2u]);
-    let tail = atomicLoad(&index_slab_ctrl[2u + cls * 2u]);
-    if (head < tail) {
-        // Pop LIFO: claim the slot at tail-1 (atomicSub the class free tail).
-        let t = atomicSub(&index_slab_ctrl[2u + cls * 2u], 1u) - 1u;
-        return index_slab_free[cls * pack_cfg.max_resident + (t % pack_cfg.max_resident)];
+    // Pop LIFO RACE-SAFELY via a CAS loop on the class free TAIL (NO speculative atomicSub — that underflows when
+    // the list is empty and multiple poppers race, handing out bogus offsets). Read the tail; if > 0 try to CAS it
+    // to tail-1 (claim slot tail-1); retry on contention; fall through to the shared bump when the list is empty.
+    loop {
+        let tail = atomicLoad(&index_slab_ctrl[2u + cls * 2u]);
+        if (tail == 0u) {
+            break; // empty free-list ⇒ bump the shared high-water
+        }
+        let r = atomicCompareExchangeWeak(&index_slab_ctrl[2u + cls * 2u], tail, tail - 1u);
+        if (r.exchanged) {
+            let t = tail - 1u;
+            return index_slab_free[cls * pack_cfg.max_resident + (t % pack_cfg.max_resident)];
+        }
     }
     let off = atomicAdd(&index_slab_ctrl[0u], index_class_words_d(cls)); // shared bump
     return index_pool_base[0] + off;
@@ -1137,15 +1231,39 @@ fn alloc_index_slab(index_bits: u32) -> u32 {
 // of `SlabArena::alloc` (the palette ladder class size = 2^(cls+1)).
 fn alloc_palette_slab(k: u32) -> u32 {
     let cls = palette_class_of(k);
-    let head = atomicLoad(&palette_slab_ctrl[1u + cls * 2u]);
-    let tail = atomicLoad(&palette_slab_ctrl[2u + cls * 2u]);
-    if (head < tail) {
-        let t = atomicSub(&palette_slab_ctrl[2u + cls * 2u], 1u) - 1u;
-        return palette_slab_free[cls * pack_cfg.max_resident + (t % pack_cfg.max_resident)];
+    // Pop LIFO race-safely via a CAS loop (see `alloc_index_slab` — no speculative atomicSub underflow).
+    loop {
+        let tail = atomicLoad(&palette_slab_ctrl[2u + cls * 2u]);
+        if (tail == 0u) {
+            break;
+        }
+        let r = atomicCompareExchangeWeak(&palette_slab_ctrl[2u + cls * 2u], tail, tail - 1u);
+        if (r.exchanged) {
+            let t = tail - 1u;
+            return palette_slab_free[cls * pack_cfg.max_resident + (t % pack_cfg.max_resident)];
+        }
     }
     let words = 1u << (cls + 1u); // 2^(cls+1)
     let off = atomicAdd(&palette_slab_ctrl[0u], words); // shared bump
     return palette_pool_base[0] + off;
+}
+
+// Free one INDEX slab back to its class free-list (the GPU port of `SlabArena::free_block`): push the word
+// offset onto the class ring and advance the class free TAIL. The matching `alloc_index_slab` pops it LIFO.
+// This is what BOUNDS the index slab high-water under re-pack churn — a re-packed brick frees its OLD slab so
+// the bump high-water never grows past the live reserve (CPU `update_gpu`'s quarantine→`free_block` SSOT).
+fn free_index_slab(off: u32, index_bits: u32) {
+    let cls = index_bits_class(index_bits);
+    let t = atomicAdd(&index_slab_ctrl[2u + cls * 2u], 1u); // append at the class free TAIL
+    index_slab_free[cls * pack_cfg.max_resident + (t % pack_cfg.max_resident)] = off;
+}
+
+// Free one PALETTE slab back to its class free-list (mirror of `SlabArena::free_block`). `k` is the palette
+// word COUNT the slab was allocated for (it picks the same class `alloc_palette_slab(k)` used).
+fn free_palette_slab(off: u32, k: u32) {
+    let cls = palette_class_of(k);
+    let t = atomicAdd(&palette_slab_ctrl[2u + cls * 2u], 1u);
+    palette_slab_free[cls * pack_cfg.max_resident + (t % pack_cfg.max_resident)] = off;
 }
 
 // --- per-brick GEOMETRY (mirror of `BrickGeom::of` / brickmap `brick_span`) — pure function of the key. ---
@@ -1198,6 +1316,17 @@ fn pack_build_drops(@builtin(global_invocation_id) gid: vec3<u32>) {
     // frame's pushes start at 0), so quarantine_ring[i] is drop i's slot.
     let cap = diff_cfg.max_resident;
     let slot = quarantine_ring[i % cap];
+    // FREE the dropped slot's dense slab back to the free-lists BEFORE zeroing its state (mirror of the CPU drop's
+    // quarantine push, incremental.rs:1001-1008) — else a dropped brick's slab leaks the high-water forever.
+    let sbase = slot * 4u;
+    if (slab_state[sbase + 1u] != 0u) {
+        free_index_slab(slab_state[sbase + 0u], slab_state[sbase + 1u]);
+        free_palette_slab(slab_state[sbase + 2u], slab_state[sbase + 3u]);
+    }
+    slab_state[sbase + 0u] = 0u;
+    slab_state[sbase + 1u] = 0u;
+    slab_state[sbase + 2u] = 0u;
+    slab_state[sbase + 3u] = 0u;
     write_zeroed_meta(slot);
     let a = atomicAdd(&aabb_count, 1u);
     aabb_commands[a] = AabbCommandD(slot, 0u, 0u, 0u, 0.0, 0.0, 0.0, 0u);
@@ -1355,16 +1484,52 @@ fn pack_build_commands(@builtin(global_invocation_id) gid: vec3<u32>) {
     aabb_commands[a] = AabbCommandD(slot, lod, 1u, 0u, world_min.x, world_min.y, world_min.z, 0u);
     atomicMax(&aabb_dispatch[0], (a + 1u + 63u) / 64u);
 
+    // The slot's CURRENTLY-PACKED dense slab state (its previous frame's allocation), 0/0/0/0 if it has none
+    // (fresh-entered, previously-uniform, or freed). The SSOT for reuse-or-free below (mirror of `SlotState`).
+    let sbase = slot * 4u;
+    let old_index_bits = slab_state[sbase + 1u];
+    let old_palette_k = slab_state[sbase + 3u];
+    let had_dense = old_index_bits != 0u;
+
     if (is_uniform != 0u) {
-        // UNIFORM — GPU-write the meta straight (the landed pack_brick never touches a uniform slot).
+        // UNIFORM — GPU-write the meta straight (the landed pack_brick never touches a uniform slot). If this slot
+        // was DENSE before (dense→uniform re-pack), FREE its old slabs back to the free-lists (else they leak).
+        if (had_dense) {
+            free_index_slab(slab_state[sbase + 0u], old_index_bits);
+            free_palette_slab(slab_state[sbase + 2u], old_palette_k);
+        }
+        slab_state[sbase + 0u] = 0u;
+        slab_state[sbase + 1u] = 0u; // no dense slab now
+        slab_state[sbase + 2u] = 0u;
+        slab_state[sbase + 3u] = 0u;
         write_uniform_meta(slot, coord, lod, classify_out[base + 1u]);
         return;
     }
-    // DENSE — alloc the GPU slabs + emit a PackCommand (pack_brick fills the index/palette/meta).
+    // DENSE — REUSE the existing slab in place iff its size class already matches (no churn / no high-water bump,
+    // mirror of `update_inner`'s reuse-iff-class-matches), ELSE free the old slab and claim a new one. This is what
+    // BOUNDS the slab high-water: a re-pack that keeps the same class allocates NOTHING; a class change frees-then-
+    // allocs (net zero growth). Only a genuine NEW resident brick bumps the high-water — bounded by `max_resident`.
     let palette_k = classify_out[base + 2u];
     let index_bits = classify_out[base + 3u];
-    let index_off = alloc_index_slab(index_bits);
-    let palette_off = alloc_palette_slab(palette_k);
+    var index_off: u32;
+    if (had_dense && old_index_bits == index_bits) {
+        index_off = slab_state[sbase + 0u]; // same INDEX class ⇒ reuse in place (1:1 class↔index_bits)
+    } else {
+        if (had_dense) { free_index_slab(slab_state[sbase + 0u], old_index_bits); }
+        index_off = alloc_index_slab(index_bits);
+    }
+    var palette_off: u32;
+    if (had_dense && palette_class_of(old_palette_k) == palette_class_of(palette_k)) {
+        palette_off = slab_state[sbase + 2u]; // same PALETTE class ⇒ reuse in place
+    } else {
+        if (had_dense) { free_palette_slab(slab_state[sbase + 2u], old_palette_k); }
+        palette_off = alloc_palette_slab(palette_k);
+    }
+    // Record the slot's NEW dense state for the next re-pack's reuse/free decision.
+    slab_state[sbase + 0u] = index_off;
+    slab_state[sbase + 1u] = index_bits;
+    slab_state[sbase + 2u] = palette_off;
+    slab_state[sbase + 3u] = palette_k;
     let p = atomicAdd(&pack_count, 1u);
     pack_commands[p] = PackCommandD(
         coord.x * BRICK_EDGE_D, coord.y * BRICK_EDGE_D, coord.z * BRICK_EDGE_D, slot,

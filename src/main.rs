@@ -105,8 +105,13 @@ fn wgpu_settings() -> WgpuSettings {
     // Storage plan R2b added a 4th scene storage buffer (group 0 binding 12, `brick_palettes`); A3 added a 5th
     // (group 0 binding 13, the instance `descriptors`). So the `world_cache_update` pipeline binds 5 scene + 11
     // cache + 2 NEE = 18 storage buffers in one stage — raise the floor to 22 for headroom.
+    //
+    // G-c.4 paged residency FRONT END: its comprehensive residency bind-group layout
+    // (`residency_front_end.rs`) binds 48 storage buffers in ONE compute stage (Pass A–D + the slab allocators +
+    // the GPU DenseSlot table + the enter-cap histogram/cut). The live paged drive creates this layout on the
+    // render device, so the floor must clear 48 (the headless residency gates request exactly 48 too).
     settings.limits.max_storage_buffers_per_shader_stage =
-        settings.limits.max_storage_buffers_per_shader_stage.max(22);
+        settings.limits.max_storage_buffers_per_shader_stage.max(48);
     // The cache decay/compaction passes use `@workgroup_size(1024)` (the prefix-sum scan width). wgpu's
     // default caps invocations-per-workgroup + workgroup_size_x at 256, so raise both to 1024.
     settings.limits.max_compute_invocations_per_workgroup =

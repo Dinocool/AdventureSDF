@@ -73,9 +73,14 @@ struct ResidencyParams {
     levels: [LevelParams; LODS],
     clip_half_bricks: i32,
     total_cells: u32,
-    _pad0: u32,
+    hist_scale: f32,
     _pad1: u32,
+    cam_world: [f32; 3],
+    _pad2: u32,
 }
+
+/// Enter-cap distance histogram buckets — MUST equal `HIST_BUCKETS` in `voxel_residency.wgsl`.
+const HIST_BUCKETS: u32 = 4096;
 
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -122,7 +127,16 @@ fn build_params(cam: [f32; 3], half: i32) -> ResidencyParams {
         };
         offset += count;
     }
-    ResidencyParams { levels, clip_half_bricks: half, total_cells: offset, _pad0: 0, _pad1: 0 }
+    let max_dist = (half.max(1) as f32) * brick_span(MAX_LOD) * 3.0_f32.sqrt();
+    ResidencyParams {
+        levels,
+        clip_half_bricks: half,
+        total_cells: offset,
+        hist_scale: HIST_BUCKETS as f32 / max_dist,
+        _pad1: 0,
+        cam_world: cam,
+        _pad2: 0,
+    }
 }
 
 // =========================================================================================================
@@ -378,6 +392,11 @@ impl GpuDrive {
         let palette_pool_base =
             buf_init(&device, "palette_pool_base", bytemuck::cast_slice(&[0u32]), wgpu::BufferUsages::STORAGE);
         let _ = index_class_words; // (the per-class word sizes live in the WGSL `index_class_words_d` SSOT)
+        // G-c.4: the GPU DenseSlot table + the enter-cap histogram/cut (cold-fill: never frees / never caps, but
+        // the shared enter/D3/D0 passes now reference these bindings, so they must be present).
+        let slab_state = storage_buf(&device, "slab_state", (max_resident as u64) * 4 * 4);
+        let enter_hist = storage_buf(&device, "enter_hist", (HIST_BUCKETS as u64) * 4);
+        let enter_cap = buf_init(&device, "enter_cap", bytemuck::cast_slice(&[HIST_BUCKETS, 0u32]), storage_usage());
 
         // --- the residency shader (Pass A–D) + the pack shader (classify/pack/write_aabb) ---
         let res_src = std::fs::read_to_string("assets/shaders/voxel_residency.wgsl").expect("read residency");
@@ -444,6 +463,9 @@ impl GpuDrive {
                 storage_entry(45, true),  // index_class_base
                 storage_entry(46, true),  // palette_class_base
                 storage_entry(47, true),  // classify_out
+                storage_entry(49, false), // slab_state
+                storage_entry(50, false), // enter_hist
+                storage_entry(51, false), // enter_cap
             ],
         });
         let res_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -536,6 +558,9 @@ impl GpuDrive {
                     bind(45, &index_pool_base),
                     bind(46, &palette_pool_base),
                     bind(47, &classify_out),
+                    bind(49, &slab_state),
+                    bind(50, &enter_hist),
+                    bind(51, &enter_cap),
                 ]
             };
         }

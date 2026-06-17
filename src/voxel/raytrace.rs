@@ -4041,7 +4041,7 @@ fn drive_gpu_residency_front_end(
         use std::sync::atomic::{AtomicU64, Ordering};
         static FRAME: AtomicU64 = AtomicU64::new(0);
         let n = FRAME.fetch_add(1, Ordering::Relaxed);
-        if n < 6 || n % 64 == 0 {
+        if n < 6 || n.is_multiple_of(64) {
             let fe = resources.gpu_front_end.as_ref().expect("built");
             let resident = fe.diag_resident_count(device, queue);
             let (a_cnt, p_cnt, c_cnt, d_cnt, chg) = fe.diag_counts(device, queue);
@@ -4091,8 +4091,10 @@ fn drive_gpu_residency_front_end(
                 drop(data);
                 staging.unmap();
             }
+            let blas_cursor = resources.blas_rebuild_cursor;
+            let blas_n_chunks = resources.scene.as_ref().map(|s| s.chunks.len()).unwrap_or(0);
             let line = format!(
-                "PAGED-DIAG frame {n}: fe_resident={resident}/{max_resident_diag} rebuild_as={rebuild_as} prev_change={prev_change:?} | counts aabb={a_cnt} pack={p_cnt} cand={c_cnt} desired={d_cnt} change={chg} | scene_aabb live={live} origin={origin} degen={degen} bad={bad} bbox=[{:.1},{:.1},{:.1}]..[{:.1},{:.1},{:.1}] | slab idx_hw={idx_hw}/{idx_cap} pal_hw={pal_hw}/{pal_cap}\n",
+                "PAGED-DIAG frame {n}: fe_resident={resident}/{max_resident_diag} rebuild_as={rebuild_as} prev_change={prev_change:?} | counts aabb={a_cnt} pack={p_cnt} cand={c_cnt} desired={d_cnt} change={chg} | scene_aabb live={live} origin={origin} degen={degen} bad={bad} bbox=[{:.1},{:.1},{:.1}]..[{:.1},{:.1},{:.1}] | slab idx_hw={idx_hw}/{idx_cap} pal_hw={pal_hw}/{pal_cap} | blas_cursor={blas_cursor}/{blas_n_chunks}\n",
                 lo[0], lo[1], lo[2], hi[0], hi[1], hi[2]
             );
             info!("{}", line.trim_end());

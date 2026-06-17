@@ -77,9 +77,14 @@ struct ResidencyParams {
     levels: [LevelParams; LODS],
     clip_half_bricks: i32,
     total_cells: u32,
-    _pad0: u32,
+    hist_scale: f32,
     _pad1: u32,
+    cam_world: [f32; 3],
+    _pad2: u32,
 }
+
+/// Enter-cap distance histogram buckets — MUST equal `HIST_BUCKETS` in `voxel_residency.wgsl`.
+const HIST_BUCKETS: u32 = 4096;
 
 fn build_params(cam: [f32; 3], cfg: &StreamingConfig) -> ResidencyParams {
     let half = cfg.clip_half_bricks;
@@ -109,7 +114,16 @@ fn build_params(cam: [f32; 3], cfg: &StreamingConfig) -> ResidencyParams {
         };
         offset += count;
     }
-    ResidencyParams { levels, clip_half_bricks: half, total_cells: offset, _pad0: 0, _pad1: 0 }
+    let max_dist = (half.max(1) as f32) * brick_span(MAX_LOD) * 3.0_f32.sqrt();
+    ResidencyParams {
+        levels,
+        clip_half_bricks: half,
+        total_cells: offset,
+        hist_scale: HIST_BUCKETS as f32 / max_dist,
+        _pad1: 0,
+        cam_world: cam,
+        _pad2: 0,
+    }
 }
 
 // =========================================================================================================
@@ -218,6 +232,7 @@ impl GpuDiff {
                 storage_entry(21, false),// drop_count
                 storage_entry(22, false),// drop_list
                 storage_entry(23, false),// drop_decision
+                storage_entry(51, false),// enter_cap (G-c.4 nearest cap; default = no cap in this gate)
             ],
         });
         let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -294,6 +309,9 @@ impl GpuDiff {
         let drop_count = buf_init(device, "drop_count", bytemuck::bytes_of(&0u32), storage_usage());
         let drop_list = storage_buf(device, "drop_list", (self.cand_cap * 16) as u64);
         let drop_decision = storage_buf(device, "drop_decision", (self.slot_table_size as u64) * 4);
+        // G-c.4 enter-cap: this gate does NOT run the cap passes, so seed `enter_cap = [HIST_BUCKETS, 0]` ⇒ no cap
+        // (the enter scan admits every candidate, exactly as before) while the shared `diff_enter_scan` still binds it.
+        let enter_cap = buf_init(device, "enter_cap", bytemuck::cast_slice(&[HIST_BUCKETS, 0u32]), storage_usage());
 
         let dummy_in = buf_init(device, "dummy_in", bytemuck::cast_slice(&[0u32; 4]), wgpu::BufferUsages::STORAGE);
         let dummy_out = storage_buf(device, "dummy_out", 16);
@@ -328,6 +346,7 @@ impl GpuDiff {
                     bind(21, &drop_count),
                     bind(22, &drop_list),
                     bind(23, &drop_decision),
+                    bind(51, &enter_cap),
                 ],
             })
         };
