@@ -957,7 +957,20 @@ fn stream_voxel_rt_residency(
     }
     *worldgen_frames_since_pack = worldgen_frames_since_pack.saturating_add(1);
     let settled = manager.pending() == 0;
-    if *worldgen_dirty_pending && (settled || *worldgen_frames_since_pack >= WORLDGEN_REPACK_INTERVAL) {
+    // CPU-PACK GATE (audit finding / trace-confirmed: `vox_pack_update_gpu` ~3.79 s over 38 calls on a Gallery
+    // load). When the readback-free GPU residency front end drives this scene, the GPU owns residency AND the
+    // pool, so this CPU re-pack would only produce an upload the render world SKIPS (`front_end_active` gates the
+    // apply) — pure wasted work + the streaming spikes. Skip it once the epoch's pool is allocated. The one-time
+    // StreamSnapshot MUST still run on the CPU (it allocates the fixed-cap pool + BLAS topology + initial NEE
+    // lights that the front end writes INTO), so `!epoch_snapshotted` keeps that first pack. The cheap source
+    // drain above still runs (keeps the resident-set mirror warm for stats / a toggle-off flip).
+    // FOLLOW-UP: NEE lights are built only at the snapshot here; emitters that stream in AFTER the cold-fill won't
+    // refresh the light list until front-end light derivation lands. Fine for the Gallery (scenes cold-fill ~fully).
+    let front_end_drives = toggle.gpu_residency && *epoch_snapshotted;
+    if *worldgen_dirty_pending
+        && (settled || *worldgen_frames_since_pack >= WORLDGEN_REPACK_INTERVAL)
+        && !front_end_drives
+    {
         let _s = info_span!("vox_repack").entered();
         let entries = manager.resident_entries();
         // STORAGE PLAN A1 — the O(changed) GPU upload. `update` re-`pack_one`s ONLY the entered/dropped bricks +
