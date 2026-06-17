@@ -132,6 +132,13 @@ fn brick_aabb_epsilon(lod: u32) -> f32 {
 // consumes (one invocation each).
 @group(0) @binding(6) var<storage, read_write> aabb_buf: array<u32>;
 @group(0) @binding(7) var<storage, read> aabb_commands: array<AabbCommand>;
+// **Dirty-chunk bitmask (the per-frame AS-rebuild driver).** One BIT per BLAS chunk (a slot-band of `CHUNK_SLOTS`
+// slots — `chunk = slot / CHUNK_SLOTS`). `write_aabb` atomically sets the bit for every CHANGED slot's chunk, so
+// the CPU reads back this tiny mask (1-frame-late, like `change_count`) and rebuilds ONLY the chunks that actually
+// changed this frame — not a blind sweep of the whole (mostly-empty) pool. `CHUNK_SLOTS` MUST match
+// `raytrace.rs::CHUNK_SLOTS`. Bound only to the `write_aabb` pipeline (its own bind group).
+const CHUNK_SLOTS: u32 = 512u;
+@group(0) @binding(10) var<storage, read_write> dirty_chunk: array<atomic<u32>>;
 // **Stage G4 — the classify pass output.** One [`ClassifyOut`] (4 u32 / 16 B) per `commands` entry, written by
 // `classify_brick` (its OWN pipeline/bind-group — `pack_brick`/`write_aabb` ignore it). The CPU reads this back to
 // drive the EXISTING `SlabArena` allocation WITHOUT the CPU `pack_one` (that is the G4 win). Mirrors `GpuClassifyOut`
@@ -330,9 +337,10 @@ fn pack_brick(
 // `src/voxel/gpu.rs::brick_aabb` builds — `[world_min - eps, world_min + span + eps]`); a FREED slot (`flag == 0`)
 // gets `degenerate_aabb()` (min = +1e30, max = -1e30 — a BLAS non-candidate; mirror of incremental.rs). This
 // dedicated pass owns EVERY changed slot's box, so the per-slot CPU `queue_write_buffer(aabb)` upload is gone.
-@compute @workgroup_size(64)
-fn write_aabb(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let i = gid.x;
+// The shared per-slot AABB write (no dirty-chunk side effect — used by BOTH entry points). Factored so the
+// `write_aabb` entry (the CPU-pack `apply_gpu_pack` path, which does its own dirty-chunk rebuild) does NOT
+// reference the dirty-chunk binding, while `write_aabb_dirty` (the LIVE front end) adds the mask write.
+fn write_aabb_slot(i: u32) {
     if (i >= arrayLength(&aabb_commands)) {
         return;
     }
@@ -360,6 +368,26 @@ fn write_aabb(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
     aabb_buf[base + 6u] = 0u; // _pad[0]
     aabb_buf[base + 7u] = 0u; // _pad[1]
+}
+
+// CPU-pack path (`apply_gpu_pack`): plain AABB write — it rebuilds its dirty chunks from the CPU-side batch, so
+// it needs no dirty-chunk mask (and its pipeline layout has only bindings 6+7).
+@compute @workgroup_size(64)
+fn write_aabb(@builtin(global_invocation_id) gid: vec3<u32>) {
+    write_aabb_slot(gid.x);
+}
+
+// LIVE GPU front end (`GpuResidencyFrontEnd`): same AABB write PLUS mark this slot's BLAS chunk dirty, so the CPU
+// rebuilds exactly the changed chunks this frame (resident OR freed — a drop must rebuild its chunk too, else the
+// stale AABB lingers / aliases a reused slot ⇒ black square). Its pipeline layout adds binding 10.
+@compute @workgroup_size(64)
+fn write_aabb_dirty(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    if (i < arrayLength(&aabb_commands)) {
+        let chunk = aabb_commands[i].slot / CHUNK_SLOTS;
+        atomicOr(&dirty_chunk[chunk / 32u], 1u << (chunk % 32u));
+    }
+    write_aabb_slot(i);
 }
 
 // **Stage G4 — the GPU CLASSIFY pass.** One WORKGROUP per `commands` entry (the SAME per-dirty-brick command list

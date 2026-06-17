@@ -1530,24 +1530,16 @@ struct VoxelRtResources {
     /// The `(epoch)` the front end is currently bound to (matched against the live `gpu_residency_epoch`); a change
     /// triggers a `rebind_pool` (new scene pool + occupancy/core store). `None` ⇒ not bound (cold).
     gpu_front_end_epoch: Option<u64>,
-    /// **Phase G "G-c.4" — the SPREAD chunk-BLAS rebuild cursor (the streamed-blank fix).** When the GPU front end's
-    /// residency changes, ALL chunk BLASes must be rebuilt from the GPU-written `aabb_buf` (full Build, never refit).
-    /// Rebuilding ALL of them (≈100k+ live primitives) in ONE frame's `build_acceleration_structures` overruns the
-    /// AABB-BLAS build throughput of the ray-query backend and silently yields a non-tracing TLAS (the clip_half-
-    /// dependent blank: renders at small clip_half, black past ~60-100k live prims). So the rebuild is SPREAD across
-    /// frames: each frame rebuilds a bounded WINDOW of chunks starting at this cursor, which ROLLS continuously
-    /// (wrapping at the chunk count) so that — under SUSTAINED MOTION / never-converging residency (a multi-asset
-    /// gallery or worldgen flight where residency changes every frame) — every chunk is still revisited and
-    /// rebuilt within one cycle. (The earlier reset-to-0-on-every-change stalled the cursor in the first window
-    /// forever when residency never settled, so only the lowest slots — the first-entered, nearest asset — ever
-    /// got a real BLAS; far assets in higher slots stayed degenerate ⇒ invisible.) The CPU `apply_delta` never hit
-    /// this because it rebuilds only the few dirty chunks per move.
-    blas_rebuild_cursor: usize,
-    /// **Phase G "G-c.4" — the rolling-sweep convergence guard.** Chunks rebuilt CONSECUTIVELY since the last
-    /// residency change (`rebuild_as`); reset to 0 on every change. Once it reaches the chunk count a full pass has
-    /// completed with no change in flight, so the sweep IDLES (no per-frame AS work on a converged static camera).
-    /// Under continuous change it stays below the chunk count, so the rolling cursor keeps sweeping every chunk.
-    blas_clean_streak: usize,
+    /// **Phase G "G-c.4" — the TARGETED chunk-BLAS rebuild set (the reference-aligned AS update).** The GPU front
+    /// end marks, per frame, which slots it changed (enters + drops); `write_aabb` ORs each changed slot's CHUNK
+    /// (`slot / CHUNK_SLOTS`) into a tiny GPU dirty bitmask, read back 1-frame-late
+    /// ([`GpuResidencyFrontEnd::poll_dirty_chunks`]). Those chunk indices accumulate here, and each frame a bounded
+    /// WINDOW of them is rebuilt (full Build, never refit) + the TLAS rebuilt over all instances. This rebuilds ONLY
+    /// the chunks that actually changed — like the CPU `apply_delta` / re-flora — instead of a blind sweep of the
+    /// (mostly-empty) pool, so a moving camera's transitions land within ~1 frame (no stale-BLAS holes / black
+    /// squares from a slot reused under a not-yet-rebuilt chunk). The WINDOW bounds the per-frame build so the cold-
+    /// fill's large initial dirty set can't overrun the backend's whole-set AABB-BLAS build limit (~60k prims).
+    pending_blas_chunks: std::collections::BTreeSet<usize>,
     /// **Phase G "G-c.4-paging"** — the STREAMED `.vxo` region PREFETCHER + its demand-paged GPU occupancy / core
     /// store (`residency_pager.rs` §8). Present only for the live STREAMED scene (Bistro / the `.vxo` Gallery),
     /// built from the extracted [`VoxelRtResidencyUpload::streamed_source`] on the scene/epoch switch. Each frame
@@ -3777,6 +3769,9 @@ fn drive_gpu_residency_front_end(
         let fe = resources.gpu_front_end.as_mut().expect("just built");
         fe.rebind_pool(device, queue, &occ_owned, &core_owned, &meta, &voxel, &palettes, &aabb);
         resources.gpu_front_end_epoch = Some(params.epoch);
+        // Fresh pool/chunks for this epoch — drop any stale dirty-chunk indices from the previous scene. The cold
+        // re-stream re-marks every chunk it touches, so the new scene's BLAS rebuilds from scratch correctly.
+        resources.pending_blas_chunks.clear();
         info!("voxel-RT G-c.4: bound the GPU front end to the live scene pool for epoch {}", params.epoch);
     }
 
@@ -3788,15 +3783,14 @@ fn drive_gpu_residency_front_end(
         return false;
     }
 
-    // The non-blocking 1-frame-late change_count mirror (§3.1): read the PREVIOUS frame's change_count out of
-    // band. `None` (first bound frame / not yet ready) ⇒ treat as CHANGED (record the AS build — harmless). `0` ⇒
-    // converged → skip the AS rebuild (idle). `>0` ⇒ residency changed → rebuild the dirty chunks.
-    let prev_change = resources
-        .gpu_front_end
-        .as_mut()
-        .expect("built")
-        .poll_change_count(device);
-    let rebuild_as = prev_change.map(|c| c > 0).unwrap_or(true);
+    // The non-blocking 1-frame-late mirrors (§3.1), read BEFORE recording this frame (they share the staging ring
+    // `advance_ring` flips below). `change_count` is kept for the diagnostic; the DIRTY-CHUNK mask is what drives
+    // the AS rebuild — the PREVIOUS frame's changed chunks (enters + drops). Accumulate them into the pending set so
+    // a bounded window is rebuilt below; a chunk a moving camera touched is rebuilt within ~1 frame.
+    let prev_change = resources.gpu_front_end.as_mut().expect("built").poll_change_count(device);
+    if let Some(chunks) = resources.gpu_front_end.as_ref().expect("built").poll_dirty_chunks(device) {
+        resources.pending_blas_chunks.extend(chunks.into_iter().map(|c| c as usize));
+    }
 
     let _span = info_span!("vox_gpu_residency_live").entered();
 
@@ -3817,50 +3811,39 @@ fn drive_gpu_residency_front_end(
         render_queue.submit(core::iter::once(encoder.finish()));
     }
 
-    // SUBMIT 2 — rebuild the chunk BLASes + the TLAS reading the now-committed `aabb_buf`, SPREAD across frames.
+    // SUBMIT 2 — rebuild ONLY the DIRTY chunk BLASes (the ones the GPU front end changed last frame) + the TLAS,
+    // reading the now-committed `aabb_buf`. This is the reference-aligned targeted update (like the CPU `apply_delta`
+    // / re-flora), NOT a blind sweep of the whole (mostly-empty) pool.
     //
-    // **CRITICAL — full REBUILD, never refit, and THROTTLED (the streamed-Bistro blank-render root cause).** Each
-    // chunk BLAS is first built (by the StreamSnapshot `build_scene_full`) with the CPU's tiny cold-fill set REAL +
-    // the rest DEGENERATE. The GPU front end then ACTIVATES many of those degenerate slots (writes real AABBs as it
-    // streams in the surface set). Two things break a naive rebuild:
+    // **Two hazards it threads:**
     //  1. **Refit corruption** — re-`build_acceleration_structures` over the SAME `chunk.blas` handle makes wgpu-core
-    //     emit a BVH `Update` (refit); a refit across a degenerate→real activation CORRUPTS the structure (streamed
-    //     bricks go invisible — see `create_chunk_blas`'s contract + `voxel-rt-blas-refit-corruption`). So we RECREATE
-    //     each chunk's BLAS handle (`built_index = None` ⇒ a full `Build`) + re-point its TLAS instance.
-    //  2. **Whole-set build overrun** — rebuilding ALL chunk BLASes (≈100k+ real primitives past clip_half ~48) in
-    //     ONE frame silently yields a NON-TRACING TLAS (the clip_half-dependent blank: renders at small clip_half,
-    //     black past ~60-100k live prims; NO validation error). The CPU `apply_delta` never hit this because it
-    //     rebuilds only the FEW dirty chunks per move — a small per-frame build. So the GPU front end's whole-set
-    //     rebuild is SPREAD across frames: each frame rebuilds a bounded WINDOW of chunks from a persistent cursor
-    //     that ROLLS continuously (wrapping at the chunk count), re-pointing+building only those, then rebuilds the
-    //     TLAS over ALL instances (a TLAS build of all instances is cheap + proven fine — the CPU path does it every
-    //     dirty frame). **The cursor must NOT reset to 0 on every change** — under sustained motion / never-
-    //     converging residency (the multi-asset gallery, worldgen flight) `rebuild_as` is true EVERY frame, so a
-    //     reset-to-0 stalls the window in the first chunks forever and only the lowest slots (the first-entered,
-    //     nearest asset) ever get a real BLAS — far assets in higher slots stay degenerate ⇒ invisible. Instead the
-    //     cursor rolls and wraps so every chunk is revisited within one cycle; a `blas_clean_streak` (chunks rebuilt
-    //     since the last change) lets the sweep IDLE once a full pass completes with no change in flight (a converged
-    //     static camera does no per-frame AS work).
-    // `aabb_buf` is the GPU-written set; a brick that activates mid-sweep shows within one cursor cycle (a few
-    // frames), and the rolling windowed builds assemble a correct, complete TLAS without any single oversized build.
+    //     emit a BVH `Update` (refit); a refit across a degenerate→real activation CORRUPTS the structure (see
+    //     `create_chunk_blas`'s contract + `voxel-rt-blas-refit-corruption`). So we RECREATE each dirty chunk's BLAS
+    //     handle (a full `Build`) + re-point its TLAS instance.
+    //  2. **Whole-set build overrun** — building too many chunk BLASes (≈60k+ prims) in ONE
+    //     `build_acceleration_structures` silently yields a NON-TRACING TLAS. So the per-frame rebuild is bounded by
+    //     `BLAS_REBUILD_WINDOW`; a moving camera dirties only a few chunks/frame (rebuilt immediately, so transitions
+    //     land within ~1 frame — no stale-BLAS holes / black squares), and the cold-fill's large initial dirty set
+    //     drains over a few frames under the cap. The TLAS is rebuilt over ALL instances each time (cheap; the
+    //     untouched chunks keep their already-built BLASes — a built BLAS persists across submits).
     {
         let n_chunks = resources.scene.as_ref().map(|s| s.chunks.len()).unwrap_or(0);
-        if rebuild_as {
-            resources.blas_clean_streak = 0; // residency changed — a fresh full pass is needed to cover it
-        }
-        // The per-frame window: bounded so each frame's BLAS build stays well under the backend's whole-set overrun
-        // threshold (≈60k live prims observed). 48 chunks × 512 slots = 24576 slot-prims/frame, comfortably safe.
-        const BLAS_REBUILD_WINDOW: usize = 48;
-        // Sweep while a full clean pass hasn't completed since the last change (so a converged camera idles, but a
-        // never-converging stream keeps rolling). The cursor wraps independently, so coverage is complete either way.
-        if n_chunks > 0 && resources.blas_clean_streak < n_chunks {
+        // Bound the per-frame build well under the backend's whole-set overrun threshold (≈60k prims ≈ 117 chunks ×
+        // 512 slots). 64 chunks × 512 = 32768 prims/frame, comfortably safe.
+        const BLAS_REBUILD_WINDOW: usize = 64;
+        // Drop any stale out-of-range indices (e.g. a shrunk pool), then drain up to WINDOW dirty chunks this frame.
+        resources.pending_blas_chunks.retain(|&i| i < n_chunks);
+        if n_chunks > 0 && !resources.pending_blas_chunks.is_empty() {
             let _b = info_span!("vox_blas_residency").entered();
             let aabb_stride = core::mem::size_of::<GpuBrickAabb>() as u64;
-            let start = resources.blas_rebuild_cursor % n_chunks;
-            let end = (start + BLAS_REBUILD_WINDOW).min(n_chunks);
+            let todo: Vec<usize> =
+                resources.pending_blas_chunks.iter().copied().take(BLAS_REBUILD_WINDOW).collect();
+            for i in &todo {
+                resources.pending_blas_chunks.remove(i);
+            }
+            // Pass 1 (mutate): recreate the dirty chunks' BLAS handles (full Build) + re-point their TLAS instances.
             let scene = resources.scene.as_mut().expect("n_chunks > 0");
-            // Pass 1 (mutate): recreate THIS WINDOW's chunk BLAS handles (full Build) + re-point their TLAS instances.
-            for i in start..end {
+            for &i in &todo {
                 let chunk = &mut scene.chunks[i];
                 chunk.blas = create_chunk_blas(device, chunk.prim_count);
                 scene.tlas[i] = Some(wgpu::TlasInstance::new(
@@ -3870,27 +3853,25 @@ fn drive_gpu_residency_front_end(
                     0xff,
                 ));
             }
-            // Pass 2 (immutable borrow): build THIS WINDOW's BLASes + the TLAS over ALL instances. The non-window
-            // chunks keep their already-built BLASes (built in a prior frame or the StreamSnapshot) — the TLAS
-            // references them validly (a built BLAS persists across submits).
+            // Pass 2 (immutable borrow): build the dirty BLASes + the TLAS over ALL instances.
             let scene = resources.scene.as_ref().expect("n_chunks > 0");
-            let sizes: Vec<wgpu::BlasAABBGeometrySizeDescriptor> = scene.chunks[start..end]
+            let sizes: Vec<wgpu::BlasAABBGeometrySizeDescriptor> = todo
                 .iter()
-                .map(|chunk| wgpu::BlasAABBGeometrySizeDescriptor {
-                    primitive_count: chunk.prim_count,
+                .map(|&i| wgpu::BlasAABBGeometrySizeDescriptor {
+                    primitive_count: scene.chunks[i].prim_count,
                     flags: wgpu::AccelerationStructureGeometryFlags::OPAQUE,
                 })
                 .collect();
-            let geos: Vec<_> = scene.chunks[start..end]
+            let geos: Vec<_> = todo
                 .iter()
                 .zip(sizes.iter())
-                .map(|(chunk, size)| wgpu::BlasBuildEntry {
-                    blas: &chunk.blas,
+                .map(|(&i, size)| wgpu::BlasBuildEntry {
+                    blas: &scene.chunks[i].blas,
                     geometry: wgpu::BlasGeometries::AabbGeometries(vec![wgpu::BlasAabbGeometry {
                         size,
                         stride: aabb_stride,
                         aabb_buffer: &scene.aabb_buf,
-                        primitive_offset: chunk.slot_base * aabb_stride as u32,
+                        primitive_offset: scene.chunks[i].slot_base * aabb_stride as u32,
                     }]),
                 })
                 .collect();
@@ -3899,13 +3880,6 @@ fn drive_gpu_residency_front_end(
             });
             encoder.build_acceleration_structures(geos.iter(), core::iter::once(&scene.tlas));
             render_queue.submit(core::iter::once(encoder.finish()));
-            // Roll the cursor (wrap at the chunk count) so the NEXT frame's window covers the following chunks, and
-            // over successive frames every chunk is revisited. Count this window toward the clean streak ONLY on a
-            // no-change frame — so the idle gate requires a FULL pass with no residency change in flight.
-            resources.blas_rebuild_cursor = if end >= n_chunks { 0 } else { end };
-            if !rebuild_as {
-                resources.blas_clean_streak = (resources.blas_clean_streak + (end - start)).min(n_chunks);
-            }
         }
     }
 
@@ -3966,10 +3940,10 @@ fn drive_gpu_residency_front_end(
                 drop(data);
                 staging.unmap();
             }
-            let blas_cursor = resources.blas_rebuild_cursor;
+            let blas_pending = resources.pending_blas_chunks.len();
             let blas_n_chunks = resources.scene.as_ref().map(|s| s.chunks.len()).unwrap_or(0);
             let line = format!(
-                "PAGED-DIAG frame {n}: fe_resident={resident}/{max_resident_diag} rebuild_as={rebuild_as} prev_change={prev_change:?} | counts aabb={a_cnt} pack={p_cnt} cand={c_cnt} desired={d_cnt} change={chg} | scene_aabb live={live} origin={origin} degen={degen} bad={bad} bbox=[{:.1},{:.1},{:.1}]..[{:.1},{:.1},{:.1}] | slab idx_hw={idx_hw}/{idx_cap} pal_hw={pal_hw}/{pal_cap} | blas_cursor={blas_cursor}/{blas_n_chunks}\n",
+                "PAGED-DIAG frame {n}: fe_resident={resident}/{max_resident_diag} prev_change={prev_change:?} | counts aabb={a_cnt} pack={p_cnt} cand={c_cnt} desired={d_cnt} change={chg} | scene_aabb live={live} origin={origin} degen={degen} bad={bad} bbox=[{:.1},{:.1},{:.1}]..[{:.1},{:.1},{:.1}] | slab idx_hw={idx_hw}/{idx_cap} pal_hw={pal_hw}/{pal_cap} | blas_pending={blas_pending}/{blas_n_chunks}\n",
                 lo[0], lo[1], lo[2], hi[0], hi[1], hi[2]
             );
             info!("{}", line.trim_end());

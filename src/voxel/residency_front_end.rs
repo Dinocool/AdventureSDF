@@ -33,6 +33,10 @@ use super::streaming::{camera_brick_coord_lod, level_box_pub};
 const LODS: usize = (MAX_LOD + 1) as usize;
 /// The WG-cell edge in bricks (one shell cell is `WG_CELL³` bricks) — mirrors `enumerate_shells`'s `@workgroup_size(512)`.
 const WG_CELL: i32 = 8;
+/// Slots per BLAS chunk (a slot-band) — MUST equal `raytrace.rs::CHUNK_SLOTS` and `voxel_pack.wgsl`'s `CHUNK_SLOTS`.
+/// The per-frame dirty-chunk mask `write_aabb` fills (one bit per `chunk = slot / CHUNK_SLOTS`) drives the CPU's
+/// targeted BLAS rebuild — only the chunks that actually changed, not a blind sweep.
+const CHUNK_SLOTS: u32 = 512;
 /// Keep-old-until-revealed refine descent cap — MUST equal `streaming.rs`'s private `REFINE_DESCENT_CAP`.
 const REFINE_DESCENT_CAP: u32 = 5;
 /// Hash empty-slot sentinel (`lod == EMPTY_LOD` ⇒ free), shared with the WGSL.
@@ -230,6 +234,17 @@ pub struct GpuResidencyFrontEnd {
     // --- the change_count signal + its mappable staging ring (the non-blocking 1-frame-late mirror) ---
     change_count_buf: wgpu::Buffer,
     change_staging: Vec<wgpu::Buffer>,
+
+    // --- the per-frame DIRTY-CHUNK bitmask (the targeted AS-rebuild driver) + its mappable staging ring ---
+    /// One bit per BLAS chunk (`chunk = slot / CHUNK_SLOTS`); `write_aabb` atomically sets the bit for every
+    /// changed slot's chunk. Cleared each frame, copied to the staging ring, read back 1-frame-late so the CPU
+    /// rebuilds ONLY the chunks that changed (not a blind sweep of the mostly-empty pool).
+    dirty_chunk_buf: wgpu::Buffer,
+    dirty_chunk_staging: Vec<wgpu::Buffer>,
+    /// `ceil(n_chunks / 32)` — the u32 word count of the dirty-chunk mask.
+    dirty_mask_words: u32,
+    /// `ceil(max_resident / CHUNK_SLOTS)` — the number of BLAS chunks (the mask's bit count upper bound).
+    n_chunks: u32,
     /// Round-robin staging index; `frame_parity` selects which ring slot this frame copies into and which the
     /// caller maps (the previous frame's). 2-deep so the map never aliases an in-flight copy.
     ring: usize,
@@ -381,6 +396,22 @@ impl GpuResidencyFrontEnd {
             })
             .collect();
 
+        // the per-frame DIRTY-CHUNK bitmask + its 2-deep mappable staging ring (1-frame-late, like change_count).
+        let n_chunks = max_resident.div_ceil(CHUNK_SLOTS).max(1);
+        let dirty_mask_words = n_chunks.div_ceil(32).max(1);
+        let dirty_chunk_buf =
+            buf_init(device, "res_dirty_chunk", bytemuck::cast_slice(&vec![0u32; dirty_mask_words as usize]), storage_usage());
+        let dirty_chunk_staging: Vec<wgpu::Buffer> = (0..2)
+            .map(|i| {
+                device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some(if i == 0 { "res_dirty_chunk_staging0" } else { "res_dirty_chunk_staging1" }),
+                    size: (dirty_mask_words as u64) * 4,
+                    usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                    mapped_at_creation: false,
+                })
+            })
+            .collect();
+
         let dummy_in = buf_init(device, "res_dummy_in", bytemuck::cast_slice(&[0u32; 4]), wgpu::BufferUsages::STORAGE);
         let dummy_out = storage_buf(device, "res_dummy_out", 16);
         let dummy_dispatch = storage_buf(device, "res_dummy_dispatch", 16);
@@ -505,7 +536,7 @@ impl GpuResidencyFrontEnd {
         });
         let aabb_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("res_aabb_bgl"),
-            entries: &[storage_entry(6, false), storage_entry(7, true)],
+            entries: &[storage_entry(6, false), storage_entry(7, true), storage_entry(10, false)],
         });
         let aabb_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("res_aabb_pl"),
@@ -513,10 +544,10 @@ impl GpuResidencyFrontEnd {
             immediate_size: 0,
         });
         let p_aabb = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("write_aabb"),
+            label: Some("write_aabb_dirty"),
             layout: Some(&aabb_pl),
             module: &pack_module,
-            entry_point: Some("write_aabb"),
+            entry_point: Some("write_aabb_dirty"),
             compilation_options: Default::default(),
             cache: None,
         });
@@ -571,6 +602,10 @@ impl GpuResidencyFrontEnd {
             enter_cap,
             change_count_buf,
             change_staging,
+            dirty_chunk_buf,
+            dirty_chunk_staging,
+            dirty_mask_words,
+            n_chunks,
             ring: 0,
             dummy_in,
             dummy_out,
@@ -655,7 +690,7 @@ impl GpuResidencyFrontEnd {
         let aabb_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("res_aabb_bg"),
             layout: &self.aabb_bgl,
-            entries: &[bind(6, aabb), bind(7, &self.aabb_commands)],
+            entries: &[bind(6, aabb), bind(7, &self.aabb_commands), bind(10, &self.dirty_chunk_buf)],
         });
         self.bound = Some(BoundScene { res_bg, res_bg_b0, cls_bg, pack_bg, aabb_bg, params_buf });
     }
@@ -792,6 +827,9 @@ impl GpuResidencyFrontEnd {
         // skips the GPU drive for this frame — here we still record but the B0 dispatch is clamped by its own
         // bound check, so an overflow can't corrupt past the buffer (it just under-enumerates the farthest cells).
         queue.write_buffer(&bound.params_buf, 0, bytemuck::bytes_of(&params));
+        // Clear the per-frame dirty-chunk mask BEFORE the passes run (queue writes are ordered before this encoder's
+        // submit), so `write_aabb`'s atomicOrs accumulate only THIS frame's changed chunks.
+        queue.write_buffer(&self.dirty_chunk_buf, 0, bytemuck::cast_slice(&vec![0u32; self.dirty_mask_words as usize]));
 
         let clear_wgs = self.slot_table_size.max(self.present_size).div_ceil(64).max(1);
         let list_wgs = (LIST_CAP as u32).div_ceil(64).max(1);
@@ -830,6 +868,8 @@ impl GpuResidencyFrontEnd {
 
         // Copy change_count into THIS frame's staging-ring slot (the next poll reads the OTHER slot — last frame).
         enc.copy_buffer_to_buffer(&self.change_count_buf, 0, &self.change_staging[self.ring], 0, 4);
+        // Likewise mirror the per-frame dirty-chunk mask (read back 1-frame-late by `poll_dirty_chunks`).
+        enc.copy_buffer_to_buffer(&self.dirty_chunk_buf, 0, &self.dirty_chunk_staging[self.ring], 0, (self.dirty_mask_words as u64) * 4);
 
         params.total_cells
     }
@@ -867,8 +907,53 @@ impl GpuResidencyFrontEnd {
         }
     }
 
+    /// Read the PREVIOUS frame's DIRTY-CHUNK mask out-of-band (non-blocking, 1-frame-late — same ring discipline as
+    /// [`poll_change_count`](Self::poll_change_count)) and return the chunk indices that changed. The caller rebuilds
+    /// EXACTLY those chunks' BLASes (not a blind sweep). `None` on the first frame (no prior copy) or if the map
+    /// isn't ready yet — the caller then leaves its pending set unchanged (no chunks newly dirtied this poll).
+    ///
+    /// Call ONCE per frame, BEFORE `record_frame`, paired with [`poll_change_count`](Self::poll_change_count) (they
+    /// share the staging ring; [`advance_ring`](Self::advance_ring) advances both).
+    pub fn poll_dirty_chunks(&self, device: &wgpu::Device) -> Option<Vec<u32>> {
+        let read_slot = 1 - self.ring;
+        let staging = &self.dirty_chunk_staging[read_slot];
+        let (tx, rx) = std::sync::mpsc::channel();
+        staging.slice(..).map_async(wgpu::MapMode::Read, move |r| {
+            let _ = tx.send(r.is_ok());
+        });
+        let _ = device.poll(wgpu::PollType::wait_indefinitely());
+        match rx.try_recv() {
+            Ok(true) => {
+                let out = match staging.slice(..).get_mapped_range() {
+                    Ok(d) => {
+                        let words: &[u32] = bytemuck::cast_slice(&d);
+                        let mut chunks = Vec::new();
+                        for (wi, &w) in words.iter().enumerate() {
+                            if w == 0 {
+                                continue;
+                            }
+                            for b in 0..32u32 {
+                                if w & (1 << b) != 0 {
+                                    let chunk = wi as u32 * 32 + b;
+                                    if chunk < self.n_chunks {
+                                        chunks.push(chunk);
+                                    }
+                                }
+                            }
+                        }
+                        Some(chunks)
+                    }
+                    Err(_) => None,
+                };
+                staging.unmap();
+                out
+            }
+            _ => None,
+        }
+    }
+
     /// Advance the staging ring after this frame's `record_frame` (toggle which slot the next frame writes / the
-    /// next poll reads). Call AFTER `record_frame` for this frame.
+    /// next poll reads). Call AFTER `record_frame` for this frame. Shared by the change_count + dirty-chunk mirrors.
     pub fn advance_ring(&mut self) {
         self.ring = 1 - self.ring;
     }
