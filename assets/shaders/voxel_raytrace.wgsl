@@ -1943,10 +1943,11 @@ struct WorldCacheUniform {
     view_x: f32,
     view_y: f32,
     view_z: f32,
-    // Phase 2.4 SOFT per-frame active-cell cap. 0 (default) = UNLIMITED (every active cell updated+blended each
-    // frame — the pre-2.4 behaviour). When > 0, `compact_write_active` clamps the indirect dispatch to ceil(N/64)
-    // workgroups AND the update/blend entries early-out for active_index >= N, so at most N cells are processed
-    // this frame; the rest keep their last radiance+life and update next frame. Never corrupts the cache.
+    // STOCHASTIC per-frame active-cell soft cap (Solari's value 40000). 0 = UNLIMITED (every active cell
+    // updated+blended each frame). When > 0, the dispatch covers the FULL active count and each cell's
+    // update+blend thread keeps itself with Bernoulli probability `cap / active_count` (`wc_skip_this_frame`),
+    // so ~cap cells are refreshed each frame — a RANDOM subset the temporal blend integrates to the same
+    // converged radiance. No starvation (equal per-frame survival probability); never corrupts the cache.
     max_active_cells_per_frame: u32,
     // Phase 2.5 NEE: number of emissive-voxel lights in `voxel_lights` (0 ⇒ NEE skipped — no emitters; the
     // light buffers are bound 1-long dummies, never indexed). Stamped by the render pass from the packed list.
@@ -1965,26 +1966,25 @@ fn wc_view_position() -> vec3<f32> {
     return vec3<f32>(wc.view_x, wc.view_y, wc.view_z);
 }
 
-// SOFT per-frame active-cell cap (Phase 2.4): the number of active cells to actually update+blend THIS frame.
-// `max_active_cells_per_frame == 0` (default) ⇒ unlimited (the full active count). Otherwise the smaller of the
-// two — at most N cells are processed, the rest keep their last radiance+life and are picked up next frame as
-// they stay alive. Used both to clamp the indirect dispatch (`compact_write_active`) and to bound the
-// update/blend entries, so the two agree (no thread runs past the dispatched range, no dispatched thread skips).
-fn wc_capped_count(active_cell_count: u32) -> u32 {
-    if (wc.max_active_cells_per_frame == 0u) {
-        return active_cell_count;
+// STOCHASTIC per-frame active-cell soft cap (Solari `world_cache_update.wgsl` gate, ports lines 37/52/71). The
+// indirect dispatch covers the FULL active count; each active cell's update+blend thread independently keeps
+// itself with Bernoulli probability `cap / active_count`, so on AVERAGE `cap` cells are refreshed each frame —
+// a RANDOM subset, not a fixed window. The temporal blend (`max_temporal_samples`) integrates the random subset
+// over frames to the SAME converged radiance as the unlimited pass (no per-cell starvation: every cell has the
+// same survival probability every frame). `max_active_cells_per_frame == 0` (default) ⇒ unlimited (the gate is
+// skipped — every active cell processed, the pre-cap behaviour). When `cap >= active_count` the ratio ≥ 1 so
+// nothing is dropped (a clean no-op). Returns `true` when this cell should be SKIPPED this frame.
+//
+// Both `world_cache_update` and `world_cache_blend` call this with the SAME per-cell seed (cell_index + frame),
+// so they make the IDENTICAL keep/skip decision — blend folds exactly the samples update refreshed (a skipped
+// cell's `new_radiance` slot is stale, so blending it would re-fold an old sample; skipping both keeps them in
+// lock-step, the skipped cell's `world_cache_radiance` untouched — never corrupted).
+fn wc_skip_this_frame(cell_index: u32, active_cell_count: u32) -> bool {
+    if (wc.max_active_cells_per_frame == 0u || active_cell_count == 0u) {
+        return false;
     }
-    return min(active_cell_count, wc.max_active_cells_per_frame);
-}
-
-// The rotating START index for the soft cap's per-frame window (Phase 2.4). When the cap BINDS (capped <
-// count) the window of `capped` cells advances by `capped` every frame, so every active cell is serviced
-// within ceil(count/capped) frames — NO permanent starvation (without this, the cap processed the first N
-// compacted cells forever and starved the rest into dark patches). At cap 0 / cap >= count the start is
-// always 0 (`frame_index * count` is a multiple of count), i.e. the full set, unchanged.
-fn wc_window_start(active_cell_count: u32) -> u32 {
-    if (active_cell_count == 0u) { return 0u; }
-    return (wc.frame_index * wc_capped_count(active_cell_count)) % active_cell_count;
+    var rng = (cell_index * 9781u + wc.frame_index * 26699u) | 1u;
+    return rand_next(&rng) >= f32(wc.max_active_cells_per_frame) / f32(active_cell_count);
 }
 
 @group(3) @binding(0) var<uniform> wc: WorldCacheUniform;
@@ -2229,11 +2229,10 @@ fn world_cache_compact_write_active(
     if (thread_index == 1023u && workgroup_id.x == (WORLD_CACHE_SIZE / 1024u) - 1u) {
         let active_cell_count = compacted_index + u32(cell_active);
         world_cache_active_cells_count = active_cell_count;
-        // SOFT per-frame cap (Phase 2.4): when `max_active_cells_per_frame > 0`, only the FIRST N cells of the
-        // compacted list are dispatched this frame (ceil(N/64) workgroups); the rest stay alive (their life is
-        // untouched here) and are processed next frame. 0 = unlimited (dispatch ceil(count/64), the default).
-        let dispatched = wc_capped_count(active_cell_count);
-        world_cache_active_cells_dispatch = vec3<u32>((dispatched + 63u) / 64u, 1u, 1u);
+        // Dispatch the FULL active count (ceil(count/64) workgroups), uncapped — Solari `node.rs:307-330`. The
+        // STOCHASTIC soft cap (`wc_skip_this_frame`) gates INSIDE the update/blend kernels per cell, so the
+        // dispatch must cover every active cell for the Bernoulli gate to draw from the whole set.
+        world_cache_active_cells_dispatch = vec3<u32>((active_cell_count + 63u) / 64u, 1u, 1u);
     }
 }
 
@@ -2390,16 +2389,15 @@ fn wc_bounce_emitter_mis(n: vec3<f32>, hit_t: f32, dir: vec3<f32>) -> f32 {
 // (returns 0, fills over the next frames). BOUNDED by construction — see the energy note below.
 @compute @workgroup_size(64, 1, 1)
 fn world_cache_update(@builtin(global_invocation_id) active_cell_id: vec3<u32>) {
-    // Bound by the SOFT cap (Phase 2.4): the clamped indirect dispatch already trims whole workgroups, but
-    // ceil(N/64) can over-launch the last workgroup, so re-bound here so cells past N keep their last radiance
-    // this frame (untouched — never corrupted) and are picked up next frame. Default (cap 0) == active count.
-    if (active_cell_id.x >= wc_capped_count(world_cache_active_cells_count)) { return; }
-    // ROTATE the per-frame window (Phase 2.4 cap fix): the dispatch slot maps to active cell
-    // `(window_start + slot) mod count`, the window advancing each frame so EVERY cell is serviced over time
-    // (no starvation). `new_radiance[active_cell_id.x]` stays the transient scratch slot (written here, read in
-    // `world_cache_blend` THIS frame at the same slot). Cap 0 ⇒ window_start 0 ⇒ unchanged full pass.
-    let ai = (wc_window_start(world_cache_active_cells_count) + active_cell_id.x) % world_cache_active_cells_count;
-    let cell_index = world_cache_active_cell_indices[ai];
+    // The dispatch is ceil(count/64) workgroups, so re-bound here: the last workgroup can over-launch threads
+    // past the active count — those keep nothing (no slot) and must early-out.
+    if (active_cell_id.x >= world_cache_active_cells_count) { return; }
+    let cell_index = world_cache_active_cell_indices[active_cell_id.x];
+    // STOCHASTIC soft cap (Solari gate): keep this cell with probability `cap / active_count`. Skipped cells
+    // keep their last radiance+life untouched (never corrupted); the temporal blend integrates the random
+    // subset to the same converged radiance. `world_cache_blend` makes the IDENTICAL decision (same cell+frame
+    // seed) so it folds exactly the cells refreshed here. Cap 0 (default) ⇒ never skips (full pass).
+    if (wc_skip_this_frame(cell_index, world_cache_active_cells_count)) { return; }
     let geo = world_cache_geometry[cell_index];
     var rng = (cell_index * 9781u + wc.frame_index * 26699u) | 1u;
 
@@ -2460,14 +2458,13 @@ fn world_cache_update(@builtin(global_invocation_id) active_cell_id: vec3<u32>) 
 // Ported from Solari blend_new_samples.
 @compute @workgroup_size(64, 1, 1)
 fn world_cache_blend(@builtin(global_invocation_id) active_cell_id: vec3<u32>) {
-    // Same SOFT-cap bound as `world_cache_update` (Phase 2.4): blend EXACTLY the cells the update pass refreshed
-    // this frame. A capped cell's `new_radiance` slot is stale, so blending it would re-fold an old sample — so
-    // we skip it here too; its `world_cache_radiance` keeps last frame's value untouched (no corruption).
-    if (active_cell_id.x >= wc_capped_count(world_cache_active_cells_count)) { return; }
-    // SAME rotating window as `world_cache_update` (same frame ⇒ same `wc_window_start`), so blend processes
-    // EXACTLY the cell the update pass just refreshed at this dispatch slot.
-    let ai = (wc_window_start(world_cache_active_cells_count) + active_cell_id.x) % world_cache_active_cells_count;
-    let cell_index = world_cache_active_cell_indices[ai];
+    // Same full-count bound as `world_cache_update`: early-out threads the last workgroup over-launched.
+    if (active_cell_id.x >= world_cache_active_cells_count) { return; }
+    let cell_index = world_cache_active_cell_indices[active_cell_id.x];
+    // SAME stochastic soft cap as `world_cache_update` — identical cell+frame seed ⇒ identical keep/skip
+    // decision, so blend folds EXACTLY the cells update refreshed. A skipped cell's `new_radiance` slot is
+    // stale; skipping the blend too leaves its `world_cache_radiance` untouched (no re-fold, no corruption).
+    if (wc_skip_this_frame(cell_index, world_cache_active_cells_count)) { return; }
 
     let old_radiance = world_cache_radiance[cell_index];
     let new_radiance = world_cache_active_cells_new_radiance[active_cell_id.x];
