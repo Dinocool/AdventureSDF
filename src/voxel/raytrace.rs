@@ -5022,6 +5022,9 @@ fn voxel_rt_pass(
         cpass.set_bind_group(0, scene_bg, &[]);
         // World-cache passes FIRST (decay → compact ×3 → update → blend), sharing scene group 0. They set
         // groups 1/2/3 themselves; the live raymarch/restir below rebinds groups 1/2 to the view + reservoirs.
+        // Debug groups (no-op for execution) split the lumped `voxel_rt_raymarch` marker into per-kernel
+        // sub-markers so Nsight/perf.json attributes occupancy + time to cache vs restir_p1 vs restir_p2.
+        cpass.push_debug_group("gi_world_cache");
         dispatch_world_cache_passes(
             &mut cpass,
             &pipelines,
@@ -5029,6 +5032,7 @@ fn voxel_rt_pass(
             #[cfg(feature = "editor")]
             gpu_timer.as_ref(),
         );
+        cpass.pop_debug_group();
         cpass.set_bind_group(1, &view_bg, &[]);
         let groups = (viewport.x.div_ceil(8), viewport.y.div_ceil(8), 1);
         // GI dispatch grid — half-res when gi_half_res (the GI passes p1 + gi_spatial run here; the shade p2 is
@@ -5060,8 +5064,10 @@ fn voxel_rt_pass(
                 t.begin(&mut cpass, 4);
             }
             // Pass 1 (GI candidate + temporal) at the GI res (half when gi_half_res).
+            cpass.push_debug_group("gi_restir_p1");
             cpass.set_pipeline(&pipelines.restir_p1);
             cpass.dispatch_workgroups(gi_groups.0, gi_groups.1, gi_groups.2);
+            cpass.pop_debug_group();
             // GI spatial pass → POST-SPATIAL final reservoirs (reservoirs_a): half-res (at half-res) AND the
             // full-res spatial-average filter (the shade averages these post-spatial finals to kill the boil).
             if restir_settings.gi_half_res {
@@ -5073,8 +5079,10 @@ fn voxel_rt_pass(
                 t.end(&mut cpass, 4); // restir p1
                 t.begin(&mut cpass, 5); // restir p2
             }
+            cpass.push_debug_group("gi_restir_p2");
             cpass.set_pipeline(&pipelines.restir_p2);
             cpass.dispatch_workgroups(groups.0, groups.1, groups.2);
+            cpass.pop_debug_group();
             #[cfg(feature = "editor")]
             if let Some(t) = gpu_timer.as_ref() {
                 t.end(&mut cpass, 5); // restir p2

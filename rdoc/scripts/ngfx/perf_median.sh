@@ -11,12 +11,15 @@
 # run whose resident_bricks didn't reach the converged max (capture fired before the world finished loading).
 set -u
 LABEL="${1:-run}"; N="${2:-5}"; FRAMES="${3:-2400}"; CAM="${4:--0.48,9.59,0.33,0.29,8.96,0.36}"
+# Which marker to report (substring match, lowercased). Debug groups split the GI marker into
+# gi_world_cache / gi_restir_p1 / gi_restir_p2 — pass e.g. "gi_restir_p1" to target the dominant kernel.
+MARKER="${5:-gi_restir_p1}"; export MARKER
 TMP=$(mktemp -d); TIMES=(); OCCS=(); RESIDS=()
 for i in $(seq 1 "$N"); do
   powershell -NoProfile -Command "Get-Process | Where-Object { \$_.Name -eq 'adventure' } | Stop-Process -Force -ErrorAction SilentlyContinue" >/dev/null 2>&1
   powershell -ExecutionPolicy Bypass -File rdoc/scripts/ngfx/capture.ps1 -Light -Frames "$FRAMES" -Cam "$CAM" > "$TMP/log$i.txt" 2>&1
   python rdoc/scripts/ngfx/parse.py .soul/ngfx >/dev/null 2>&1
-  read -r T O < <(python -c "import json;d=json.load(open('.soul/ngfx/perf.json'));p=[x for x in d['passes'] if 'raymarch' in x['pass'].lower()][0];print(p['gpu_time_us'],p['cs_warp_occupancy_pct'])")
+  read -r T O < <(python -c "import json,os;d=json.load(open('.soul/ngfx/perf.json'));m=os.environ['MARKER'];p=[x for x in d['passes'] if x['pass'].lower().endswith(m) or x['pass'].lower()==m][0];print(p['gpu_time_us'],p['cs_warp_occupancy_pct'])")
   R=$(grep -oE "resident_bricks=[0-9]+" "$TMP/log$i.txt" | tail -1 | grep -oE "[0-9]+"); R="${R:-0}"
   TIMES+=("$T"); OCCS+=("$O"); RESIDS+=("$R")
   # %s for the floats (avoids printf locale 'invalid number' on some shells); python rounds in the summary.
