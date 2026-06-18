@@ -230,25 +230,20 @@ fn gi_sponza_blotch() {
         );
     };
 
-    // Screen-probe GI (P1/P2) vs the M4 per-pixel reference. Validate: probe luma ≈ M4 luma (energy correct, not
-    // biased) + blotch. Temporal OFF here (P1/P2) — single-frame probe variance ≥ M1; the win is the SH low-pass
-    // + (P3) temporal. M4 = the boil-free reference (~0.036).
-    // Half-res ReSTIR GI vs the full-res reference (both M4). Half-res traces ¼ the GI bounces; the full-res
-    // shade reservoir-resolve-gathers. Target: blotch ≤ full-res at the reduced trace cost.
-    let set = |hr: &mut HeadlessRender, half: bool, m: u32| {
+    // Per-pixel ReSTIR GI blotch vs the M (gi_initial_samples) knob. M1 = the shipping single-bounce default,
+    // M4/M8 = more fresh candidates/frame (cuts per-frame variance ~1/M at M× the bounce cost). Diagnostic print
+    // (no asserts) — the regression GUARDS live in gi_boil_meter_cornell*. The camera-jitter boil (the dominant
+    // term live under DLSS-RR) is fixed in the renderer, not here; this measures the raw pre-RR per-pixel signal.
+    let set = |hr: &mut HeadlessRender, m: u32| {
         *hr.app.world_mut().resource_mut::<RestirSettings>() = RestirSettings::default();
-        let mut r = hr.app.world_mut().resource_mut::<RestirSettings>();
-        r.gi_half_res = half;
-        r.gi_initial_samples = m;
+        hr.app.world_mut().resource_mut::<RestirSettings>().gi_initial_samples = m;
     };
-    set(&mut hr, false, 4);
-    report(&mut hr, "full-res M4 (reference)");
-    set(&mut hr, true, 4);
-    report(&mut hr, "HALF-res M4");
-    set(&mut hr, true, 8);
-    report(&mut hr, "HALF-res M8");
-    set(&mut hr, false, 1);
-    report(&mut hr, "full-res M1");
+    set(&mut hr, 1);
+    report(&mut hr, "M1 (default)");
+    set(&mut hr, 4);
+    report(&mut hr, "M4");
+    set(&mut hr, 8);
+    report(&mut hr, "M8");
 }
 
 /// **Probe SPATIAL diagnostic** — the aggregate CoV/luma metric is blind to spatial correctness (a flat/wrong GI
@@ -463,6 +458,54 @@ fn gi_boil_meter_cornell() {
     // headroom over the measured value + run-to-run ~±2 % noise) so it guards without flaking. Tighten if the
     // boil is reduced further (e.g. once ReSTIR DI lands).
     assert!(stats.mean_cov < 0.30, "GI boil regressed: mean_CoV {:.4} exceeds the 0.30 ceiling", stats.mean_cov);
+}
+
+/// **Spatial-reuse UNBIASEDNESS gate.** Our screen-space spatial reuse (`restir_p2_core`) is a hand-derived
+/// defensive/pairwise-MIS estimator (RTXDI Algo 7), NOT a literal port of Solari's single-neighbour
+/// `merge_reservoirs` — so its `mis_m_factor` confidence attenuation + the `1/n` debias are the one place a
+/// systematic bias could hide (flagged by the GI correctness audit). A CORRECT estimator changes only the
+/// VARIANCE, never the expected value: reusing neighbours' radiance is unbiased on a smooth GI field. So the
+/// GI-only MEAN must be invariant to `spatial_samples`. A debias bug would make the mean grow/shrink as
+/// neighbours are added. We sweep 0 (temporal-only baseline) → 4 (default) → 8 and assert the mean holds.
+#[test]
+fn gi_spatial_reuse_is_unbiased() {
+    let Some(mut hr) = HeadlessRender::new(W, H) else {
+        eprintln!("no ray-query device — skipping gi_spatial_reuse_is_unbiased");
+        return;
+    };
+    let [cx, cy, cz] = interior_center_world();
+    let extent = interior_extent_world();
+    let target = Vec3::new(cx, cy + extent * 0.12, cz);
+    let cam_pos = Vec3::new(cx + extent * 0.06, cy, cz - extent * 1.15);
+    hr.app.insert_resource(VoxelScene::Cornell);
+    hr.spawn_camera(cam_pos, target, "Spatial Unbiased Camera");
+    hr.finalize();
+    set_gi_only(&mut hr);
+
+    // Mean GI luma at a given spatial-search budget (cache/temporal held at default, so the comparison isolates
+    // the spatial estimator). spatial_samples=0 ⇒ no neighbour merge ⇒ the temporal/initial-only baseline.
+    let measure_mean = |hr: &mut HeadlessRender, samples: u32| -> f32 {
+        *hr.app.world_mut().resource_mut::<RestirSettings>() = RestirSettings::default();
+        hr.app.world_mut().resource_mut::<RestirSettings>().spatial_samples = samples;
+        warm_and_measure(hr, WARMUP, MEASURE).mean_luma
+    };
+    let m0 = measure_mean(&mut hr, 0);
+    let m4 = measure_mean(&mut hr, 4);
+    let m8 = measure_mean(&mut hr, 8);
+    eprintln!("[SPATIAL-UNBIASED] no-spatial={m0:.2} spatial4={m4:.2} spatial8={m8:.2}");
+
+    assert!(m0 > 4.0, "baseline GI too dark ({m0:.2}) — rig misframed/dark");
+    // Allow legit minor spatial bias (dissimilarity reject + bounded confidence near corners) + ~±2% run noise,
+    // but a SYSTEMATIC debias error would blow past this. >15% mean drift vs the no-spatial baseline = bias bug.
+    for (label, m) in [("4", m4), ("8", m8)] {
+        let drift = (m - m0).abs() / m0;
+        assert!(
+            drift < 0.15,
+            "spatial_samples={label} shifted the GI mean {:.1}% (spatial={m:.2} vs no-spatial={m0:.2}) — \
+             the pairwise-MIS estimator is biased w.r.t. neighbour count",
+            drift * 100.0,
+        );
+    }
 }
 
 /// **Sun-lit boil baseline** — the OTHER boil axis. Cornell with the emissive ceiling OFF and the SUN angled

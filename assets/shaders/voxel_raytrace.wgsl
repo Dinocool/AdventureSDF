@@ -1057,11 +1057,10 @@ fn raymarch(@builtin(global_invocation_id) gid: vec3<u32>) {
 // the final `Rg16Float` PREPASS motion texture via a render attachment (no storage requirement there).
 @group(1) @binding(9) var out_dlss_motion: texture_storage_2d<rgba16float, write>;
 
-// DLSS camera matrices. `depth_clip_from_world` is JITTERED (matches Bevy's jittered reverse-Z depth prepass
-// — used only for the depth write). `motion_cur`/`motion_prev` are UN-JITTERED clip_from_world for the
-// PREVIOUS and CURRENT frame: the motion vector must encode GEOMETRY/camera motion only, because DLSS is
-// given the sub-pixel jitter offset separately (via the TemporalJitter component) and resolves it itself.
-// Differencing jittered matrices would double-count the jitter → a per-frame sub-pixel "shake" (the bug).
+// DLSS camera matrices. The render is UN-jittered (this voxel renderer disables jitter — see
+// `voxel_rt_dlss_pass`), so all three are the same un-jittered clip_from_world: `depth_clip_from_world` for the
+// depth-guide write, `motion_prev`/`motion_cur` for the motion vector (geometry motion only → exactly zero for a
+// static camera). `camera.world_from_clip` is likewise un-jittered, so the primary ray IS the GI/DI receiver.
 struct DlssCamera {
     depth_clip_from_world: mat4x4<f32>,
     motion_prev: mat4x4<f32>,
@@ -1093,7 +1092,7 @@ fn raymarch_dlss(@builtin(global_invocation_id) gid: vec3<u32>) {
         textureStore(out_specular_albedo, px, vec4<f32>(vec3<f32>(0.04), 1.0));
         textureStore(out_normal_roughness, px, vec4<f32>(r.normal, 1.0));
 
-        // True reverse-Z clip depth of the hit (JITTERED, matching Bevy's jittered reverse-Z depth prepass).
+        // True reverse-Z clip depth of the hit (un-jittered — this renderer disables camera jitter).
         let depth_clip = dlss_cam.depth_clip_from_world * vec4<f32>(p, 1.0);
         textureStore(out_dlss_depth, px, vec4<f32>(depth_clip.z / depth_clip.w, 0.0, 0.0, 0.0));
 
@@ -1784,21 +1783,7 @@ fn di_p2_core(n: vec3<f32>, p: vec3<f32>, pix: vec2<u32>, seed: u32) -> vec3<f32
     // frame-to-frame → boil (measured: with spatial, DI CoV ~0.26; temporal-only collapses it). The temporal
     // reservoir alone accumulates enough effective samples for a stable per-pixel light. (`spatial_samples`
     // still drives the GI pass.) A discrete-light-aware spatial scheme (light-tile presampling) is the upgrade.
-    let DI_SPATIAL = 0u;
-    for (var s = 0u; s < DI_SPATIAL; s = s + 1u) {
-        let off = sample_disk(restir_params.spatial_radius, &rng);
-        let npix = vec2<i32>(pix) + vec2<i32>(i32(round(off.x)), i32(round(off.y)));
-        if (npix.x < 0 || npix.y < 0 || npix.x >= i32(vp.x) || npix.y >= i32(vp.y)) { continue; }
-        let nidx = u32(npix.y) * vp.x + u32(npix.x);
-        if (nidx == idx) { continue; }
-        let nsurf = surfaces_cur[nidx];
-        if (nsurf.valid > 0.5 && !surfaces_dissimilar(p, n, nsurf.world_position, nsurf.world_normal)) {
-            var nres = di_reservoirs_b[nidx];
-            nres.confidence_weight = min(nres.confidence_weight, restir_params.di_confidence_cap);
-            res = di_merge(res, p, n, nres, nsurf.world_position, nsurf.world_normal, &rng).reservoir;
-            break;
-        }
-    }
+    // No spatial DI merge here (deliberately — see above). The temporal reservoir is the whole estimate.
     if (restir_isnan(res.unbiased_contribution_weight) || restir_isinf(res.unbiased_contribution_weight)) {
         res.unbiased_contribution_weight = 0.0;
     }
@@ -2417,6 +2402,9 @@ fn restir_gi_gather(n: vec3<f32>, p: vec3<f32>, pix: vec2<u32>) -> vec3<f32> {
 // Like `shade`, but the indirect term comes from pass 2's reservoir resolve (`restir_p2_core`) instead of
 // `gather_gi`. Direct sun + AO + emissive glow are unchanged. Called from the pass-2 entries only (pass 1 has
 // already filled the reservoir + surface for this pixel this frame).
+// Shade a primary hit: sun direct + shadow + diffuse-indirect (ReSTIR GI / probes) + ReSTIR DI + emissive glow,
+// all at the hit `(n, p)`, modulated by `albedo`. The primary ray is un-jittered on both paths, so the receiver
+// is a stable per-pixel point (no jitter wander → no boil; DLSS-RR runs as a denoiser).
 fn shade_restir_p2(albedo: vec3<f32>, n: vec3<f32>, p: vec3<f32>, emissive: vec3<f32>, pix: vec2<u32>, seed: u32) -> vec3<f32> {
     let origin = p + n * light.shadow_bias;
     let to_sun = -light.sun_direction;
@@ -2475,7 +2463,8 @@ fn restir_primary_ray_vp(gid: vec3<u32>, vp: vec2<u32>, offset: vec2<f32>) -> ar
     return array<vec3<f32>, 2>(camera.cam_pos, normalize(world_near - camera.cam_pos));
 }
 
-// Shared primary-ray setup for the full-res ReSTIR entries (pixel centre, full viewport).
+// Shared primary-ray setup for the full-res ReSTIR entries (pixel centre, full viewport). Un-jittered on both
+// paths (the DLSS path disables jitter), so the primary hit is a stable per-pixel point — it IS the GI/DI receiver.
 fn restir_primary_ray(gid: vec3<u32>) -> array<vec3<f32>, 2> {
     return restir_primary_ray_vp(gid, camera.viewport, vec2<f32>(0.5));
 }
@@ -2520,6 +2509,8 @@ fn restir_p1(@builtin(global_invocation_id) gid: vec3<u32>) {
 // then reservoir-resolve-gathers these. Re-traces the (jittered) half-res primary to recover this pixel's n/p.
 @compute @workgroup_size(8, 8, 1)
 fn restir_gi_spatial(@builtin(global_invocation_id) gid: vec3<u32>) {
+    // Runs for half-res GI (writes half-res reservoirs_a) AND the full-res spatial-average filter (writes full-res
+    // reservoirs_a so the shade can average the POST-SPATIAL finals). `gi_vp()` = half or full accordingly.
     if (restir_params.gi_half == 0u) { return; }
     let vp = gi_vp();
     if (gid.x >= vp.x || gid.y >= vp.y) { return; }
@@ -2545,6 +2536,8 @@ fn restir_dlss_p1(@builtin(global_invocation_id) gid: vec3<u32>) {
     reservoirs_b[idx] = empty_reservoir();
     di_reservoirs_b[idx] = di_empty();
     surfaces_cur[idx] = PixelSurface(vec3<f32>(0.0), 0.0, vec3<f32>(0.0), 0.0);
+    // Un-jittered primary ray (the render disables jitter) → stable per-pixel receiver. Half-res still rotates the
+    // in-pixel sample across frames to recover detail (half-res is a non-RR knob).
     let off = select(vec2<f32>(0.5), half_res_jitter(light.frame_index), restir_params.gi_half != 0u);
     let ray = restir_primary_ray_vp(gid, vp, off);
     let r = trace(ray[0], ray[1], 0.0, camera.t_max);
@@ -2572,8 +2565,9 @@ fn restir_dlss_p1(@builtin(global_invocation_id) gid: vec3<u32>) {
 fn restir_p2(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (gid.x >= camera.viewport.x || gid.y >= camera.viewport.y) { return; }
     let idx = gid.y * camera.viewport.x + gid.x;
-    // Under half-res GI, `reservoirs_a` holds the HALF-res finals (written by `restir_gi_spatial`); the full-res
-    // shade only READS them via the gather, so must NOT clear them here (the full-res idx range overlaps).
+    // Under half-res GI OR the full-res spatial-average filter, `reservoirs_a` holds the POST-SPATIAL finals
+    // (written by `restir_gi_spatial`); the full-res shade only READS them (gather/average), so must NOT clear
+    // them here (the idx range overlaps). Only clear when restir_p2 itself owns the per-pixel final write.
     if (restir_params.gi_half == 0u) {
         reservoirs_a[idx] = empty_reservoir(); // default for misses / debug; overwritten for lit hits
         di_reservoirs_a[idx] = di_empty();
@@ -2636,13 +2630,14 @@ fn restir_dlss_p2(@builtin(global_invocation_id) gid: vec3<u32>) {
         di_reservoirs_a[idx] = di_empty();
     }
     let px = vec2<i32>(i32(gid.x), i32(gid.y));
-    let ray = restir_primary_ray(gid);
+    let ray = restir_primary_ray(gid); // un-jittered (jitter disabled) — gbuffer/depth/albedo + lighting receiver
     let ro = ray[0];
     let rd = ray[1];
     let r = trace(ro, rd, 0.0, camera.t_max);
     if (r.hit != 0u) {
         let p = ro + rd * r.t;
         let seed = (gid.x * 1973u + gid.y * 9277u + light.frame_index * 26699u) | 1u;
+        // Un-jittered primary hit = a stable per-pixel point → all lighting (direct + GI + DI) is jitter-free.
         let lit = shade_restir_p2(r.color.rgb, r.normal, p, r.emissive, gid.xy, seed);
         textureStore(out_tex, px, vec4<f32>(lit, 1.0));
         textureStore(out_diffuse_albedo, px, vec4<f32>(r.color.rgb, 1.0));
@@ -2653,8 +2648,8 @@ fn restir_dlss_p2(@builtin(global_invocation_id) gid: vec3<u32>) {
         // an inconsistent signal. 0 makes the guide match the actual diffuse-only color: color/albedo = lighting.
         textureStore(out_specular_albedo, px, vec4<f32>(vec3<f32>(0.0), 1.0));
         textureStore(out_normal_roughness, px, vec4<f32>(r.normal, 1.0)); // roughness 1.0 (.w): fully diffuse
-        // Depth JITTERED (matches the jittered depth prepass); motion UN-JITTERED (geometry only — DLSS adds
-        // the jitter), `(cur − prev)·(0.5,−0.5)`. Jittered motion would double-count jitter ⇒ a sub-pixel shake.
+        // Depth + motion are both UN-jittered (this renderer disables camera jitter): motion `(cur−prev)·(0.5,−0.5)`
+        // ⇒ exactly zero for a static camera; depth is the reverse-Z `z/w` of the same un-jittered hit.
         let depth_clip = dlss_cam.depth_clip_from_world * vec4<f32>(p, 1.0);
         textureStore(out_dlss_depth, px, vec4<f32>(depth_clip.z / depth_clip.w, 0.0, 0.0, 0.0));
         let prev_clip = dlss_cam.motion_prev * vec4<f32>(p, 1.0);

@@ -3235,9 +3235,10 @@ impl Default for RestirSettings {
             di_enabled: true,
             di_confidence_cap: 20.0,
             di_initial_samples: 8,
-            // GI 6.0 initial GI samples (M): RIS-merge 4 bounces/frame — cuts the Sponza blotch ~34%, the big lever
-            // for under-sampled scenes. M× the bounce cost; a live slider — raise to 8/16 for cleaner GI.
-            gi_initial_samples: 4,
+            // GI 6.0 initial GI samples (M): canonical single-bounce ReSTIR (M=1). M>1 cuts per-frame variance
+            // ~1/M but the REAL boil source was camera jitter (now off), not sample count — so M=1 is the right
+            // default (1× bounce cost). Still a live slider: raise to 4/8 if a scene wants cleaner GI for the cost.
+            gi_initial_samples: 1,
             // Screen-probe GI (off by default during bring-up; the A/B knob). 16px grid, 8×8 octa = 64 dirs/probe.
             screen_probes: false,
             probe_size: 16,
@@ -5037,7 +5038,8 @@ fn voxel_rt_pass(
             // Pass 1 (GI candidate + temporal) at the GI res (half when gi_half_res).
             cpass.set_pipeline(&pipelines.restir_p1);
             cpass.dispatch_workgroups(gi_groups.0, gi_groups.1, gi_groups.2);
-            // Half-res only: the GI spatial pass (full final reservoirs at half-res) before the full-res shade.
+            // GI spatial pass → POST-SPATIAL final reservoirs (reservoirs_a): half-res (at half-res) AND the
+            // full-res spatial-average filter (the shade averages these post-spatial finals to kill the boil).
             if restir_settings.gi_half_res {
                 cpass.set_pipeline(&pipelines.restir_gi_spatial);
                 cpass.dispatch_workgroups(gi_groups.0, gi_groups.1, gi_groups.2);
@@ -5163,10 +5165,9 @@ fn prepare_voxel_rt_dlss_textures(
 }
 
 /// DLSS camera uniform (WGSL `DlssCamera`, group 1 binding 10). 192 bytes.
-/// `depth_clip_from_world` is the JITTERED projection (matches Bevy's jittered reverse-Z depth prepass — used
-/// only for the depth write). `motion_prev`/`motion_cur` are the UN-JITTERED previous/current clip_from_world:
-/// the motion vector must be geometry motion only, because the DLSS node is given the sub-pixel jitter offset
-/// separately and resolves it itself. (Differencing jittered matrices double-counts the jitter → camera shake.)
+/// The render is un-jittered (see `voxel_rt_dlss_pass`), so all three are the same un-jittered clip_from_world:
+/// `depth_clip_from_world` for the depth-guide write, `motion_prev`/`motion_cur` for the motion vectors (geometry
+/// motion only; a static camera → exactly zero). Kept as three fields for the WGSL `DlssCamera` layout / clarity.
 #[cfg(feature = "dlss")]
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -5218,14 +5219,13 @@ fn voxel_rt_dlss_pass(
     let (extracted_view, target, rr_textures, prepass, mut temporal_jitter, resolution_override) =
         view.into_inner();
 
-    // DEBUG (RR boil bisection): `ADVENTURE_NO_JITTER=1` zeroes the temporal jitter for THIS frame — BEFORE our
-    // jitter_projection below AND before the DLSS-RR node reads `temporal_jitter.offset` (we run earlier in the
-    // frame), so the render is un-jittered AND RR is told a zero offset (consistent). If the "boils even when
-    // static under RR" symptom DISAPPEARS with this set, the jitter apply/report contract is the culprit; if it
-    // persists, RR is exposing the GI reservoir's residual temporal wobble (not a jitter bug). Off by default.
-    if std::env::var("ADVENTURE_NO_JITTER").as_deref() == Ok("1") {
-        temporal_jitter.offset = Vec2::ZERO;
-    }
+    // NO camera jitter on this voxel renderer: a sub-pixel shift makes the primary ray hit a DIFFERENT voxel
+    // (different albedo/normal) each frame, which DLSS-RR shimmers into boil instead of resolving (jitter is for
+    // super-sampling smooth detail, not hard voxel edges). So we render un-jittered and run RR as a denoiser.
+    // Bevy's jitter system still writes `TemporalJitter.offset` (it's required by the `Dlss` component) and the
+    // DLSS-RR node reads it for `jitter_offset` — so we MUST zero it here, BEFORE the node runs (we're earlier in
+    // the frame), to keep the render and the reported offset consistent (both zero).
+    temporal_jitter.offset = Vec2::ZERO;
 
     // The DLSS-RR node needs depth + motion prepass textures; if they aren't present this frame, bail (the
     // node would also skip). Both have RENDER_ATTACHMENT usage (we write them via the resolve render pass).
@@ -5359,21 +5359,15 @@ fn voxel_rt_dlss_pass(
     resources.frame_index = resources.frame_index.wrapping_add(1);
     let frame_index = resources.frame_index;
 
-    // Camera basis for primary rays — using the JITTERED projection (TemporalJitter perturbs clip space; DLSS
-    // expects the jittered camera + the jitter_offset to resolve). Mirror `prepare_view_uniforms`: jitter the
-    // projection over the RENDER-resolution viewport.
+    // Camera basis for primary rays. NO jitter (zeroed above), so one un-jittered projection serves everything:
+    // the primary ray, the depth-guide write, and the motion vectors. The primary hit IS the GI/DI receiver — no
+    // separate stable trace needed once jitter is gone.
     let world_from_view = extracted_view.world_from_view.to_matrix();
-    let mut clip_from_view = extracted_view.clip_from_view;
-    temporal_jitter.jitter_projection(&mut clip_from_view, render_res.as_vec2());
+    let clip_from_view = extracted_view.clip_from_view;
     let world_from_clip = world_from_view * clip_from_view.inverse();
     let cam_pos = extracted_view.world_from_view.translation();
-    let clip_from_world = clip_from_view * world_from_view.inverse();
-    let clip_from_world_arr = clip_from_world.to_cols_array_2d(); // JITTERED — depth write only
-    // UN-jittered current clip_from_world: motion vectors must exclude the jitter (DLSS resolves it itself),
-    // and this is also the stable matrix the ReSTIR reset move-test compares.
-    let view_proj_unjittered =
-        (extracted_view.clip_from_view * world_from_view.inverse()).to_cols_array_2d();
-    let motion_prev = resources.dlss_prev_clip_from_world.unwrap_or(view_proj_unjittered);
+    let clip_from_world_arr = (clip_from_view * world_from_view.inverse()).to_cols_array_2d();
+    let motion_prev = resources.dlss_prev_clip_from_world.unwrap_or(clip_from_world_arr);
 
     let cam_uniform = CameraUniformData {
         world_from_clip: world_from_clip.to_cols_array_2d(),
@@ -5405,14 +5399,14 @@ fn voxel_rt_dlss_pass(
     let dlss_cam = DlssCameraData {
         depth_clip_from_world: clip_from_world_arr,
         motion_prev,
-        motion_cur: view_proj_unjittered,
+        motion_cur: clip_from_world_arr,
     };
     let dlss_cam_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("voxel_rt_dlss_cam"),
         contents: bytemuck::bytes_of(&dlss_cam),
         usage: wgpu::BufferUsages::UNIFORM,
     });
-    resources.dlss_prev_clip_from_world = Some(view_proj_unjittered);
+    resources.dlss_prev_clip_from_world = Some(clip_from_world_arr);
 
     // ReSTIR reset: ONLY a render-resolution change or the first frame fully clears the reservoirs. Camera
     // motion is handled by motion-vector reprojection, and — deliberately — a GEOMETRY EDIT does NOT reset:
@@ -5424,7 +5418,7 @@ fn voxel_rt_dlss_pass(
         None => true,
         Some((r, _vp, _g)) => r != render_res,
     };
-    resources.dlss_restir_prev = Some((render_res, view_proj_unjittered, built_gen));
+    resources.dlss_restir_prev = Some((render_res, clip_from_world_arr, built_gen));
 
     let color_view = &resources.dlss_color.as_ref().expect("just allocated").1;
     let depth_view = &resources.dlss_depth.as_ref().expect("just allocated").1;
@@ -5618,7 +5612,7 @@ fn voxel_rt_dlss_pass(
             }
             cpass.set_pipeline(&pipelines.restir_dlss_p1);
             cpass.dispatch_workgroups(gi_groups.0, gi_groups.1, gi_groups.2);
-            // Half-res only: GI spatial pass (half-res final reservoirs) before the full-res shade.
+            // GI spatial pass → post-spatial final reservoirs: half-res AND the full-res spatial-average filter.
             if restir_settings.gi_half_res {
                 cpass.set_pipeline(&pipelines.restir_gi_spatial_dlss);
                 cpass.dispatch_workgroups(gi_groups.0, gi_groups.1, gi_groups.2);
