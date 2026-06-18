@@ -31,7 +31,13 @@ param(
   # (e.g. inside the Sponza atrium) instead of the cheap default boot camera. Six comma-separated floats
   # "ex,ey,ez,lx,ly,lz" (eye + look_at) — grab them by pressing F8 in the editor. Activates the bench harness
   # (`ADVENTURE_BENCH_BISTRO=1`) booting the in-RAM Sponza (`ADVENTURE_BENCH_SCENE=sponza`) with the pin.
-  [string]$Cam = ""
+  [string]$Cam = "",
+  # -Light: drop the per-WGSL-line SM sampling profiler (`--real-time-shader-profiler`). That sampler floods the
+  # trace with per-sample timestamps and OVERFLOWS the buffer on a heavy (8-11ms) pass → "Timestamp overflow,
+  # trace may be missing data" → wildly noisy gpu_time (±30% run-to-run). Throughput + occupancy + per-pass time
+  # (metric-set 0 / the REGIMES export) do NOT need it. Use -Light for stable AUTONOMOUS A/B perf tuning; omit it
+  # only when you specifically want the per-line shader-source export (a GUI step anyway).
+  [switch]$Light
 )
 $ErrorActionPreference = "Stop"
 
@@ -67,20 +73,24 @@ if ($Cam) {
 }
 
 # Lock GPU clocks to base for repeatable numbers; metric-set 0 = Throughput Metrics.
-& $ngfx.FullName `
-  --activity "GPU Trace Profiler" `
-  --exe $exePath `
-  --dir $proj `
-  --output-dir $outAbs `
-  --env $envStr `
-  --start-after-frames $Frames `
-  --limit-to-frames 1 `
-  --auto-export `
-  --real-time-shader-profiler `
-  --set-gpu-clocks base `
-  --metric-set-id 0 `
-  --collect-screenshot 1 `
-  --no-timeout
+$ngfxArgs = @(
+  "--activity", "GPU Trace Profiler",
+  "--exe", $exePath,
+  "--dir", $proj,
+  "--output-dir", $outAbs,
+  "--env", $envStr,
+  "--start-after-frames", $Frames,
+  "--limit-to-frames", "1",
+  "--auto-export",
+  "--set-gpu-clocks", "base",
+  "--metric-set-id", "0",
+  "--collect-screenshot", "1",
+  "--no-timeout"
+)
+# Per-WGSL-line sampler ON unless -Light (it overflows the timestamp buffer on heavy passes → noisy timing).
+if (-not $Light) { $ngfxArgs += "--real-time-shader-profiler" }
+else { Write-Host "light: per-line shader profiler OFF (stable throughput/occupancy timing for A/B)" }
+& $ngfx.FullName @ngfxArgs
 
 Write-Host ""
 Write-Host "Capture finished. Exported files:"

@@ -113,9 +113,22 @@ at `cs_warps_active 1.98%`, all pipes <5%, texture stall 0.06% → purely **occu
 
 ### The A/B measurement loop
 1. Fix a camera/scene (deterministic frame). 2. Capture + parse → baseline `perf.json`.
-3. Make the shader change + rebuild. 4. Re-capture → diff `gpu_time_us` + throughputs +
-step/inst counts per pass. `--set-gpu-clocks base` (in `capture.ps1`) locks clocks so numbers
-are comparable across runs.
+3. Make the shader change (wgsl is **runtime-loaded** — no rebuild needed for shader-only edits).
+4. Re-capture → diff `gpu_time_us` + throughputs + step/inst counts per pass. `--set-gpu-clocks base`
+(in `capture.ps1`) locks clocks so numbers are comparable across runs.
+
+**NOISE CONTROL (learned the hard way — single captures are NOT reliable for fine A/B):**
+- Use **`capture.ps1 -Light`** — drops the per-line `--real-time-shader-profiler`, which overflows the
+  timestamp buffer on a heavy (8-11ms) pass ("Timestamp overflow, trace may be missing data") and makes
+  `gpu_time` swing **±30%** run-to-run. `-Light` keeps throughput/occupancy/per-pass-time (metric-set 0) and
+  is stable (±1-2%). Only omit `-Light` for the per-WGSL-line shader-source export (a GUI step).
+- **Capture PAST world-load.** At low `-Frames` the streamed scene (Sponza) isn't resident → the capture
+  undercounts. The bench logs `resident_bricks=N`; it must reach its converged max (34347 for the in-RAM
+  Sponza) before the capture frame. `-Frames 2400` ≈ load-complete for Sponza at the F8 atrium pin.
+- **Median-of-N**: even loaded + `-Light`, the stochastic GI does different per-frame work (time spread
+  ±15%). Use `rdoc/scripts/ngfx/perf_median.sh <label> [N] [Frames] [Cam]` — it runs N independent captures,
+  verifies `resident_bricks` converged each run, and reports the MEDIAN time + occupancy. **Occupancy is the
+  more stable + meaningful metric** (it IS the limiter here); weight it over the noisier `gpu_time`.
 
 ### Per-WGSL-line cost — source mapping WORKS (with decoupled_naga); export is one GUI click
 With the `shader-debug` build (now incl. `decoupled_naga`, see prereq 3) the `.ngfx-gputrace`
