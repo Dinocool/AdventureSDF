@@ -1479,6 +1479,8 @@ struct VoxelRtPipelines {
     #[cfg(feature = "dlss")]
     restir_dlss_p2: wgpu::ComputePipeline,
     #[cfg(feature = "dlss")]
+    restir_gi_spatial_dlss: wgpu::ComputePipeline,
+    #[cfg(feature = "dlss")]
     dlss_view_layout: wgpu::BindGroupLayout,
     #[cfg(feature = "dlss")]
     dlss_resolve_layout: wgpu::BindGroupLayout,
@@ -2827,6 +2829,7 @@ fn init_voxel_rt(mut commands: Commands, render_device: Res<RenderDevice>) {
         restir_dlss_p1,
         restir_dlss_p2,
         probe_trace_dlss,
+        restir_gi_spatial_dlss,
         dlss_view_layout,
         dlss_resolve_layout,
     ) = init_dlss_pipelines(
@@ -2893,6 +2896,8 @@ fn init_voxel_rt(mut commands: Commands, render_device: Res<RenderDevice>) {
         #[cfg(feature = "dlss")]
         restir_dlss_p2,
         #[cfg(feature = "dlss")]
+        restir_gi_spatial_dlss,
+        #[cfg(feature = "dlss")]
         dlss_view_layout,
         #[cfg(feature = "dlss")]
         dlss_resolve_layout,
@@ -2915,6 +2920,7 @@ fn init_dlss_pipelines(
     raymarch_module: &wgpu::ShaderModule,
     composite_module: &wgpu::ShaderModule,
 ) -> (
+    wgpu::ComputePipeline,
     wgpu::ComputePipeline,
     wgpu::ComputePipeline,
     wgpu::ComputePipeline,
@@ -3008,6 +3014,14 @@ fn init_dlss_pipelines(
         compilation_options: Default::default(),
         cache: None,
     });
+    let restir_gi_spatial_dlss = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+        label: Some("voxel_rt_restir_gi_spatial_dlss"),
+        layout: Some(&dlss_restir_pl),
+        module: raymarch_module,
+        entry_point: Some("restir_gi_spatial"),
+        compilation_options: Default::default(),
+        cache: None,
+    });
 
     let sampled = |binding: u32| wgpu::BindGroupLayoutEntry {
         binding,
@@ -3039,6 +3053,7 @@ fn init_dlss_pipelines(
         restir_dlss_p1,
         restir_dlss_p2,
         probe_trace_dlss,
+        restir_gi_spatial_dlss,
         dlss_view_layout,
         dlss_resolve_layout,
     )
@@ -5446,6 +5461,12 @@ fn voxel_rt_dlss_pass(
     // Scale the spatial-reuse radius by the upscale factor so it covers a constant WORLD/output area at
     // upscaling DLSS modes (the knob is in output pixels; the dispatch is at render_res). At DLAA this is 1.0.
     let upscale = full.x as f32 / render_res.x.max(1) as f32;
+    let dlss_gi_half = restir_settings.gi_half_res;
+    let dlss_gi_dim = if dlss_gi_half {
+        UVec2::new(render_res.x.div_ceil(2), render_res.y.div_ceil(2))
+    } else {
+        render_res
+    };
     let restir_params = RestirParamsData {
         reset: u32::from(reset_restir),
         frame_index,
@@ -5458,11 +5479,10 @@ fn voxel_rt_dlss_pass(
         di_confidence_cap: restir_settings.di_confidence_cap,
         di_initial_samples: restir_settings.di_initial_samples,
         gi_initial_samples: restir_settings.gi_initial_samples,
-        // Half-res GI is wired on the non-DLSS path first (headless-validated); DLSS path follows once the
-        // resolve is proven. Keep it 0 here so the DLSS shade never gathers unfilled half-res reservoirs.
-        gi_half: 0,
-        gi_half_x: render_res.x,
-        gi_half_y: render_res.y,
+        // Half-res GI at render_res/2 (the GI passes index reservoirs here; the full-res shade gathers them).
+        gi_half: u32::from(dlss_gi_half),
+        gi_half_x: dlss_gi_dim.x,
+        gi_half_y: dlss_gi_dim.y,
         _pad2: 0,
         _pad3: 0,
     };
@@ -5572,6 +5592,13 @@ fn voxel_rt_dlss_pass(
         );
         cpass.set_bind_group(1, &view_bg, &[]);
         let groups = (render_res.x.div_ceil(8), render_res.y.div_ceil(8), 1);
+        // GI dispatch grid — half-res when gi_half_res (p1 + gi_spatial run here; the shade p2 stays full-res).
+        let gi_dim = if restir_settings.gi_half_res {
+            UVec2::new(render_res.x.div_ceil(2), render_res.y.div_ceil(2))
+        } else {
+            render_res
+        };
+        let gi_groups = (gi_dim.x.div_ceil(8), gi_dim.y.div_ceil(8), 1);
         if use_restir {
             // Two-pass ReSTIR: pass 1 (initial + reprojected temporal → reservoirs_b + surface) then pass 2
             // (same-frame spatial → reservoirs_a + shade → out_tex + DLSS guides), back-to-back. The intra-pass
@@ -5590,7 +5617,12 @@ fn voxel_rt_dlss_pass(
                 t.begin(&mut cpass, 4);
             }
             cpass.set_pipeline(&pipelines.restir_dlss_p1);
-            cpass.dispatch_workgroups(groups.0, groups.1, groups.2);
+            cpass.dispatch_workgroups(gi_groups.0, gi_groups.1, gi_groups.2);
+            // Half-res only: GI spatial pass (half-res final reservoirs) before the full-res shade.
+            if restir_settings.gi_half_res {
+                cpass.set_pipeline(&pipelines.restir_gi_spatial_dlss);
+                cpass.dispatch_workgroups(gi_groups.0, gi_groups.1, gi_groups.2);
+            }
             #[cfg(feature = "editor")]
             if let Some(t) = gpu_timer.as_ref() {
                 t.end(&mut cpass, 4); // restir p1

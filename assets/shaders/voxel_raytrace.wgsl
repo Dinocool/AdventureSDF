@@ -2539,21 +2539,25 @@ fn restir_gi_spatial(@builtin(global_invocation_id) gid: vec3<u32>) {
 // camera motion (disocclusions caught by the dissimilarity reject).
 @compute @workgroup_size(8, 8, 1)
 fn restir_dlss_p1(@builtin(global_invocation_id) gid: vec3<u32>) {
-    if (gid.x >= camera.viewport.x || gid.y >= camera.viewport.y) { return; }
-    let idx = gid.y * camera.viewport.x + gid.x;
+    let vp = gi_vp(); // half-res when gi_half
+    if (gid.x >= vp.x || gid.y >= vp.y) { return; }
+    let idx = gid.y * vp.x + gid.x;
     reservoirs_b[idx] = empty_reservoir();
     di_reservoirs_b[idx] = di_empty();
     surfaces_cur[idx] = PixelSurface(vec3<f32>(0.0), 0.0, vec3<f32>(0.0), 0.0);
-    let ray = restir_primary_ray(gid);
+    let off = select(vec2<f32>(0.5), half_res_jitter(light.frame_index), restir_params.gi_half != 0u);
+    let ray = restir_primary_ray_vp(gid, vp, off);
     let r = trace(ray[0], ray[1], 0.0, camera.t_max);
     if (r.hit != 0u) {
         let p = ray[0] + ray[1] * r.t;
         let seed = (gid.x * 1973u + gid.y * 9277u + light.frame_index * 26699u) | 1u;
-        let temporal_base = reproject_pixel(p, dlss_cam.motion_prev, camera.viewport);
+        let temporal_base = reproject_pixel(p, dlss_cam.motion_prev, vp);
         if (probe_params.enabled == 0u) {
             restir_p1_core(r.normal, p, gid.xy, temporal_base, seed);
         }
-        di_p1_core(r.normal, p, gid.xy, temporal_base, seed);
+        if (restir_params.gi_half == 0u) {
+            di_p1_core(r.normal, p, gid.xy, temporal_base, seed);
+        }
     }
 }
 
@@ -2625,8 +2629,12 @@ fn restir_p2(@builtin(global_invocation_id) gid: vec3<u32>) {
 fn restir_dlss_p2(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (gid.x >= camera.viewport.x || gid.y >= camera.viewport.y) { return; }
     let idx = gid.y * camera.viewport.x + gid.x;
-    reservoirs_a[idx] = empty_reservoir();
-    di_reservoirs_a[idx] = di_empty();
+    // Under half-res GI, `reservoirs_a` holds the HALF-res finals (from `restir_gi_spatial`); the full-res shade
+    // only READS them via the gather, so must NOT clear them (the full-res idx range overlaps the half-res).
+    if (restir_params.gi_half == 0u) {
+        reservoirs_a[idx] = empty_reservoir();
+        di_reservoirs_a[idx] = di_empty();
+    }
     let px = vec2<i32>(i32(gid.x), i32(gid.y));
     let ray = restir_primary_ray(gid);
     let ro = ray[0];
@@ -2688,6 +2696,8 @@ fn restir_dlss_p2(@builtin(global_invocation_id) gid: vec3<u32>) {
                 let seed = (gid.x * 1973u + gid.y * 9277u + light.frame_index * 26699u) | 1u;
                 if (probe_params.enabled != 0u) {
                     gi = screen_probe_integrate(r.normal, p, length(camera.cam_pos - p), gid.xy);
+                } else if (restir_params.gi_half != 0u) {
+                    gi = restir_gi_gather(r.normal, p, gid.xy);
                 } else {
                     gi = restir_p2_core(r.normal, p, gid.xy, seed);
                 }
