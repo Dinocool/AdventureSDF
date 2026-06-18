@@ -1538,10 +1538,9 @@ struct RestirParams {
     di_enabled: u32,
     di_confidence_cap: f32,
     di_initial_samples: u32,
-    // GI 6.0: INITIAL RIS candidate count per pixel per frame (M). 1 = canonical single-bounce ReSTIR; >1
-    // traces M bounces and RIS-merges them BEFORE the temporal/spatial reuse → the per-frame estimate variance
-    // drops ~1/M directly. Costs M× the GI bounce trace. The fix for severely under-sampled scenes (Sponza).
-    gi_initial_samples: u32,
+    // (vestigial) was the M>1 initial-RIS candidate count; restir_p1 is now straight-line M=1 (camera jitter,
+    // not low M, was the boil cause — the M-loop's live state pinned p1 occupancy). Kept as padding for layout.
+    _pad_gi: u32,
     // Half-resolution GI: `gi_half` = 1 → restir_p1 + the GI spatial pass run at (gi_half_x, gi_half_y) =
     // render_res/2; the full-res shade reservoir-resolve-gathers the half-res finals. The GI cores index
     // reservoirs at the half-res dims when this is set; DI/shade stay full-res (viewport_*).
@@ -1922,65 +1921,32 @@ fn restir_p1_core(n: vec3<f32>, p: vec3<f32>, pix: vec2<u32>, temporal_base: vec
     // query-driven fill). When off, the FRESH `reservoir_from_bounce` path runs — identical to pre-2.2
     // behaviour (minus the now-removed firefly clamp), and no query marks any cell alive, so the cache stays
     // idle (update/blend no-op) exactly like Phase 2.1. The LD direction stratifies the sampling either way.
-    // GI 6.0: trace `gi_initial_samples` (M) candidates and combine them into ONE initial reservoir with a
-    // CHEAP same-receiver streaming RIS. M>1 cuts the per-frame estimate variance — the direct fix for severely
-    // under-sampled scenes (Sponza: 1-spp GI fine_CoV ~0.7) — BEFORE the temporal/spatial reuse.
-    //
-    // This is `merge_reservoirs` ALGEBRAICALLY SPECIALISED to the same receiver, NOT a different one: there the
-    // shift Jacobian is identically 1 and the "other receiver" target evals equal the canonical ones, so the
-    // GRIS reuse merge (4 target evals + 2 Jacobians + 2 balance heuristics + a full second reservoir's live
-    // state per candidate) collapses to — carrying the selected target `sel_tf` across iterations — exactly ONE
-    // new target eval and a scalar reservoir update per candidate. The result is BIT-FOR-BIT the confidence-
-    // weighted balance-heuristic combine `merge_reservoirs` would produce (the accumulated confidence `c` weights
-    // the running estimate vs. the fresh candidate: m_canon = c/(c+1), m_cand = 1/(c+1)), so it keeps that
-    // merge's lower variance — but at a fraction of the ALU AND, decisively, far less live register state. This
-    // pass is occupancy/register-pressure bound, so the naive merge-based loop cost SUPER-linearly in M; this
-    // makes the per-candidate cost ~free, leaving only the irreducible M× bounce trace. Confidence accumulates to
-    // M (the reservoir's true effective sample count) so the temporal reuse leans on this low-variance fresh
-    // estimate, not the correlated history — that confidence (not 1) is what carries the variance win downstream.
+    // GI initial reservoir: ONE fresh bounce (M=1 canonical ReSTIR). An M>1 same-receiver streaming-RIS loop
+    // used to combine M candidates here, but it's removed: this pass is occupancy/register-pressure bound and
+    // the loop held a reservoir + the merge state live ACROSS the heavy bounce trace, pinning restir_p1's
+    // occupancy (the dominant GI kernel) — and the memory established CAMERA JITTER (now disabled), not a low
+    // sample count, was the boil source M was masking. Straight-line M=1 measured −22% time / +6pt occupancy on
+    // restir_p1 (Sponza atrium, Nsight). The temporal + spatial reservoir reuse builds the effective sample count.
     let use_cache = wc.use_world_cache != 0u;
     let drop_emissive = restir_params.di_enabled != 0u && wc.light_count != 0u;
-    let m = max(restir_params.gi_initial_samples, 1u);
-    var res = empty_reservoir();
-    var sel_tf = 0.0; // luminance target of res's currently-selected sample, carried across iterations
-    for (var i = 0u; i < m; i = i + 1u) {
-        let dir = ld_uniform_hemisphere(n, i, m, rot);
-        var cand: Reservoir;
-        if (use_cache) {
-            cand = reservoir_from_bounce_cached(p, n, dir, drop_emissive, &rng);
-        } else {
-            cand = reservoir_from_bounce(p, n, dir);
-        }
-        // Candidate target = luminance(L_o · cosθ) (brdf = 1: receiver albedo applied by the caller, the resolve
-        // carries 1/π). Source weight = 1/pdf = 2π (`unbiased_contribution_weight`).
-        let cwi = normalize(cand.sample_point_world_position - p);
-        let cand_tf = restir_luminance(cand.radiance * saturate(dot(cwi, n)));
-        if (i == 0u) {
-            res.sample_point_world_position = cand.sample_point_world_position;
-            res.sample_point_world_normal = cand.sample_point_world_normal;
-            res.radiance = cand.radiance;
-            res.confidence_weight = 1.0;
-            res.weight_sum = cand_tf * cand.unbiased_contribution_weight;
-            res.unbiased_contribution_weight = cand.unbiased_contribution_weight; // = wsum/tf = 2π
-            sel_tf = cand_tf;
-        } else {
-            let c = res.confidence_weight;
-            let canon_w = (c / (c + 1.0)) * sel_tf * res.unbiased_contribution_weight;
-            let other_w = (1.0 / (c + 1.0)) * cand_tf * cand.unbiased_contribution_weight;
-            let wsum = canon_w + other_w;
-            res.confidence_weight = c + 1.0;
-            res.weight_sum = wsum;
-            if (rand_next(&rng) < other_w / max(wsum, 1e-12)) {
-                res.sample_point_world_position = cand.sample_point_world_position;
-                res.sample_point_world_normal = cand.sample_point_world_normal;
-                res.radiance = cand.radiance;
-                sel_tf = cand_tf;
-            }
-            // ucw W = weight_sum / target(selected) ⇒ `radiance · W · cosθ / π` is an unbiased irradiance
-            // estimate; 0 if the selected target is 0 (all-black / back-facing) — a correct zero contribution.
-            res.unbiased_contribution_weight = select(0.0, wsum / sel_tf, sel_tf > 0.0);
-        }
+    // M=1 straight-line GI candidate: trace ONE bounce and build `res` DIRECTLY from it, so no reservoir/merge
+    // state is held live ACROSS the heavy bounce trace — that overlapping live state pinned restir_p1's
+    // occupancy (the dominant, lowest-occupancy GI kernel). The old M>1 streaming-RIS loop is removed: the
+    // memory established CAMERA JITTER (now disabled), not a low sample count, was the boil source, so M=1 is the
+    // shipping default and `gi_initial_samples` no longer drives a per-frame candidate count.
+    let dir = ld_uniform_hemisphere(n, 0u, 1u, rot);
+    var res: Reservoir;
+    if (use_cache) {
+        res = reservoir_from_bounce_cached(p, n, dir, drop_emissive, &rng);
+    } else {
+        res = reservoir_from_bounce(p, n, dir);
     }
+    // RIS source weight for one uniform-hemisphere sample: ucw = 1/pdf = 2π (set by the bounce fn); target =
+    // luminance(L_o·cosθ) (brdf = 1; receiver albedo + 1/π applied by the resolve); weight_sum = target·ucw;
+    // confidence_weight = 1 (one fresh frame). The temporal reuse below leans on this fresh estimate.
+    let cwi = normalize(res.sample_point_world_position - p);
+    res.confidence_weight = 1.0;
+    res.weight_sum = restir_luminance(res.radiance * saturate(dot(cwi, n))) * res.unbiased_contribution_weight;
 
     // TEMPORAL reuse. CRUCIAL: read a PERMUTED previous-frame neighbour, NOT this pixel's own previous
     // reservoir — same-pixel feedback freezes each pixel onto an early sample (grain that fades in); the

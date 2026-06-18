@@ -150,7 +150,6 @@ pub fn render_gi_panel(world: &mut World, ui: &mut egui::Ui) {
                 ui.add(egui::Slider::new(&mut s.spatial_samples, 0..=8).text("spatial search taps"));
                 ui.add(egui::Slider::new(&mut s.spatial_radius, 1.0..=48.0).text("spatial radius (px)"));
                 ui.add(egui::Slider::new(&mut s.confidence_cap, 1.0..=32.0).text("history cap (frames)"));
-                ui.add(egui::Slider::new(&mut s.gi_initial_samples, 1..=16).text("GI initial samples / frame (M)"));
                 // 0 = uncapped (pure Solari); >0 caps the dissimilarity view-distance → absolute tangent reject
                 // beyond it, closing far thin-wall GI leaks. Raise toward off if it adds boil on slopes/terrain.
                 ui.add(egui::Slider::new(&mut s.gi_dissim_cap_dist, 0.0..=80.0).text("thin-wall reject cap dist (m, 0=off)"));

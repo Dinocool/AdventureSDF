@@ -3151,7 +3151,7 @@ struct RestirParamsData {
     di_enabled: u32,
     di_confidence_cap: f32,
     di_initial_samples: u32,
-    gi_initial_samples: u32,
+    _pad_gi: u32, // was gi_initial_samples (M); restir_p1 is now straight-line M=1 — kept as layout padding
     gi_half: u32,
     gi_half_x: u32,
     gi_half_y: u32,
@@ -3197,9 +3197,6 @@ pub struct RestirSettings {
     pub di_confidence_cap: f32,
     /// DI initial RIS candidates drawn per pixel per frame (Solari 8).
     pub di_initial_samples: u32,
-    /// GI 6.0: INITIAL GI bounce candidates per pixel per frame (M). 1 = canonical single-bounce ReSTIR; >1 cuts
-    /// the per-frame estimate variance ~1/M (the fix for under-sampled scenes like Sponza) at M× the bounce cost.
-    pub gi_initial_samples: u32,
     /// gi_mode: `true` = Lumen-style screen-space radiance probes drive diffuse GI; `false` = per-pixel ReSTIR.
     pub screen_probes: bool,
     /// Probe grid spacing in pixels (1 probe per `probe_size`² pixels). 16 = Lumen default.
@@ -3248,10 +3245,6 @@ impl Default for RestirSettings {
             di_enabled: true,
             di_confidence_cap: 20.0,
             di_initial_samples: 8,
-            // GI 6.0 initial GI samples (M): canonical single-bounce ReSTIR (M=1). M>1 cuts per-frame variance
-            // ~1/M but the REAL boil source was camera jitter (now off), not sample count — so M=1 is the right
-            // default (1× bounce cost). Still a live slider: raise to 4/8 if a scene wants cleaner GI for the cost.
-            gi_initial_samples: 1,
             // Screen-probe GI (off by default during bring-up; the A/B knob). 16px grid, 8×8 octa = 64 dirs/probe.
             screen_probes: false,
             probe_size: 16,
@@ -4914,7 +4907,7 @@ fn voxel_rt_pass(
         di_enabled: u32::from(restir_settings.di_enabled),
         di_confidence_cap: restir_settings.di_confidence_cap,
         di_initial_samples: restir_settings.di_initial_samples,
-        gi_initial_samples: restir_settings.gi_initial_samples,
+        _pad_gi: 0,
         gi_half: u32::from(gi_half),
         gi_half_x: gi_half_dims.x,
         gi_half_y: gi_half_dims.y,
@@ -5509,7 +5502,7 @@ fn voxel_rt_dlss_pass(
         di_enabled: u32::from(restir_settings.di_enabled),
         di_confidence_cap: restir_settings.di_confidence_cap,
         di_initial_samples: restir_settings.di_initial_samples,
-        gi_initial_samples: restir_settings.gi_initial_samples,
+        _pad_gi: 0,
         // Half-res GI at render_res/2 (the GI passes index reservoirs here; the full-res shade gathers them).
         gi_half: u32::from(dlss_gi_half),
         gi_half_x: dlss_gi_dim.x,

@@ -17,7 +17,13 @@ MARKER="${5:-gi_restir_p1}"; export MARKER
 TMP=$(mktemp -d); TIMES=(); OCCS=(); RESIDS=()
 for i in $(seq 1 "$N"); do
   powershell -NoProfile -Command "Get-Process | Where-Object { \$_.Name -eq 'adventure' } | Stop-Process -Force -ErrorAction SilentlyContinue" >/dev/null 2>&1
+  rm -rf .soul/ngfx/BASE   # stale exports from a FAILED capture would otherwise be re-parsed as fake results
   powershell -ExecutionPolicy Bypass -File rdoc/scripts/ngfx/capture.ps1 -Light -Frames "$FRAMES" -Cam "$CAM" > "$TMP/log$i.txt" 2>&1
+  # The static exe is REQUIRED: a default (fast/dynamic_linking) build can't be injected → ngfx prints
+  # "Failed to connect". Catch it loudly instead of silently parsing stale/empty exports.
+  if grep -qiE "Failed to connect|TARGET ERROR" "$TMP/log$i.txt"; then
+    echo "  $LABEL run $i/$N: CAPTURE FAILED (attach/counter error — rebuild static: cargo build --no-default-features --features editor,shader-debug)"; rm -rf "$TMP"; exit 2
+  fi
   python rdoc/scripts/ngfx/parse.py .soul/ngfx >/dev/null 2>&1
   read -r T O < <(python -c "import json,os;d=json.load(open('.soul/ngfx/perf.json'));m=os.environ['MARKER'];p=[x for x in d['passes'] if x['pass'].lower().endswith(m) or x['pass'].lower()==m][0];print(p['gpu_time_us'],p['cs_warp_occupancy_pct'])")
   R=$(grep -oE "resident_bricks=[0-9]+" "$TMP/log$i.txt" | tail -1 | grep -oE "[0-9]+"); R="${R:-0}"

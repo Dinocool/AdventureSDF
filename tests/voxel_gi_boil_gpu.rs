@@ -230,20 +230,19 @@ fn gi_sponza_blotch() {
         );
     };
 
-    // Per-pixel ReSTIR GI blotch vs the M (gi_initial_samples) knob. M1 = the shipping single-bounce default,
-    // M4/M8 = more fresh candidates/frame (cuts per-frame variance ~1/M at M× the bounce cost). Diagnostic print
-    // (no asserts) — the regression GUARDS live in gi_boil_meter_cornell*. The camera-jitter boil (the dominant
-    // term live under DLSS-RR) is fixed in the renderer, not here; this measures the raw pre-RR per-pixel signal.
-    let set = |hr: &mut HeadlessRender, m: u32| {
+    // Per-pixel ReSTIR GI blotch vs the spatial-reuse tap count (the live variance lever now that GI is
+    // straight-line M=1 — the camera-jitter boil that M used to mask is fixed in the renderer). Diagnostic print
+    // (no asserts) — the regression GUARDS live in gi_boil_meter_cornell* + gi_spatial_reuse_is_unbiased.
+    let set = |hr: &mut HeadlessRender, taps: u32| {
         *hr.app.world_mut().resource_mut::<RestirSettings>() = RestirSettings::default();
-        hr.app.world_mut().resource_mut::<RestirSettings>().gi_initial_samples = m;
+        hr.app.world_mut().resource_mut::<RestirSettings>().spatial_samples = taps;
     };
-    set(&mut hr, 1);
-    report(&mut hr, "M1 (default)");
+    set(&mut hr, 0);
+    report(&mut hr, "spatial 0 (temporal only)");
     set(&mut hr, 4);
-    report(&mut hr, "M4");
+    report(&mut hr, "spatial 4 (default)");
     set(&mut hr, 8);
-    report(&mut hr, "M8");
+    report(&mut hr, "spatial 8");
 }
 
 /// **Probe SPATIAL diagnostic** — the aggregate CoV/luma metric is blind to spatial correctness (a flat/wrong GI
@@ -342,21 +341,6 @@ fn gi_blotch_sweep() {
     *hr.app.world_mut().resource_mut::<RestirSettings>() = RestirSettings::default();
     hr.app.world_mut().resource_mut::<RestirSettings>().confidence_cap = 24.0;
     report(&mut hr, "cap 24 (spatial 4)");
-
-    // ENERGY CHECK: vary M (gi_initial_samples) on this LOW-variance converging scene and report the per-pixel
-    // temporal-mean LUMA. The M-candidate RIS merge is the canonical unbiased Solari merge, so the luma must stay
-    // ~M-stable here (any drift with M would flag an over-count bug). Contrast with Sponza, where luma RISES with M
-    // because M=1 under-converges the bright bounce directions — that rise is accuracy, not bias.
-    let report_luma = |hr: &mut HeadlessRender, label: &str| {
-        let frames = collect_sunlit(hr, 90, long);
-        let s = boil_stats(&frames, pr, W as usize, H as usize, 4.0, 250.0);
-        eprintln!("[BLOTCH-M {label:20}] frames={} luma={:.2} blotch_CoV={:.4}", frames.len(), s.mean_luma, blotch_cov(&frames, pr, W as usize, H as usize, 16, 4.0));
-    };
-    for m in [1u32, 4, 8] {
-        *hr.app.world_mut().resource_mut::<RestirSettings>() = RestirSettings::default();
-        hr.app.world_mut().resource_mut::<RestirSettings>().gi_initial_samples = m;
-        report_luma(&mut hr, &format!("M{m}"));
-    }
 }
 
 /// Pump `warmup` frames (let the cache + reservoirs converge to the CURRENT config), then collect up to

@@ -164,6 +164,11 @@ python + `perfetto`): `hotspots.py`, `frames.py [--steady]`, `span.py <name>`,
   `Launch process exited. Searching for attachable child processes... Failed to connect`.
   Build `--no-default-features` (drops `fast`) for any injected capture — both `capture.ps1`
   and the interactive F11 launch. The `run-worktree.ps1` profiling launch already does this.
+  **A plain `cargo build` (default features) CLOBBERS `target/debug/adventure.exe` with the dynamic
+  build** → the NEXT capture silently fails to attach and `parse.py` re-emits STALE numbers from the
+  old `BASE/*.xls` (cost an invalid A/B once). Rebuild `--no-default-features --features
+  editor,shader-debug` before capturing; `perf_median.sh` now aborts on "Failed to connect"/"TARGET
+  ERROR" and clears `BASE/` each run instead of trusting stale exports.
   Worse, a failed capture leaves the **previous** `BASE/*.xls` in place, so `parse.py` happily
   prints STALE numbers — clear `.soul/ngfx` (the launcher does) or distrust a `perf.json` whose
   numbers didn't move after a "failed to connect".
