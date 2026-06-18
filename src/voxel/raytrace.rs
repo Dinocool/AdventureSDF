@@ -3168,6 +3168,10 @@ pub struct RestirSettings {
     pub probe_oct_res: u32,
     /// Blend prev-frame probe SH (light temporal accumulation; P3).
     pub probe_temporal: bool,
+    /// Half-resolution GI: trace + run ReSTIR GI at render_res/2 (¼ the bounce traces), then bilaterally upscale
+    /// the half-res reservoirs to full res at shade time (re-resolved per full-res normal → stays sharp). The
+    /// way to afford high M cheaply. See `docs/HALF_RES_GI_PLAN.md`.
+    pub gi_half_res: bool,
 }
 
 impl Default for RestirSettings {
@@ -3208,6 +3212,7 @@ impl Default for RestirSettings {
             probe_size: 16,
             probe_oct_res: 8,
             probe_temporal: true,
+            gi_half_res: false,
         }
     }
 }

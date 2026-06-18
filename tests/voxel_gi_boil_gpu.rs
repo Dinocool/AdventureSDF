@@ -259,6 +259,69 @@ fn gi_sponza_blotch() {
     report(&mut hr, "probes 8px oct8 +temporal");
 }
 
+/// **Probe SPATIAL diagnostic** — the aggregate CoV/luma metric is blind to spatial correctness (a flat/wrong GI
+/// can have low variance + right average). Prints a coarse region-luma grid of the GI-only image for the per-
+/// pixel ReSTIR reference vs the probe GI, so we can SEE whether the probe matches the reference's spatial
+/// pattern or is flat/wrong. Run: `... cargo test --test voxel_gi_boil_gpu gi_probe_spatial_diag -- --nocapture`.
+#[test]
+fn gi_probe_spatial_diag() {
+    if !std::path::Path::new(SPONZA_VOX_PATH).exists() {
+        eprintln!("no {SPONZA_VOX_PATH} — skipping");
+        return;
+    }
+    let Some(mut hr) = HeadlessRender::new(W, H) else {
+        eprintln!("no ray-query device — skipping");
+        return;
+    };
+    hr.app.insert_resource(VoxelScene::Sponza);
+    hr.spawn_camera(Vec3::new(2.566, 3.498, -0.647), Vec3::new(7.532, 2.944, -0.468), "diag");
+    hr.finalize();
+    let pr = hr.padded_row();
+    let need = pr * hr.h as usize;
+    let grab = |hr: &mut HeadlessRender| -> Vec<u8> {
+        let mut last = vec![0u8; need];
+        for _ in 0..420 {
+            set_gi_only(hr);
+            hr.app.update();
+            if let Some(b) = hr.latest.0.lock().unwrap().clone() {
+                if b.len() >= need {
+                    last = b;
+                }
+            }
+        }
+        last
+    };
+    let grid = |hr: &HeadlessRender, b: &[u8]| -> String {
+        let (gw, gh) = (8usize, 6usize);
+        let mut out = String::new();
+        for gy in 0..gh {
+            for gx in 0..gw {
+                let x0 = gx * W as usize / gw;
+                let x1 = (gx + 1) * W as usize / gw;
+                let y0 = gy * H as usize / gh;
+                let y1 = (gy + 1) * H as usize / gh;
+                let (r, g, bl) = hr.region_mean(b, x0, x1, y0, y1);
+                let l = 0.2126 * r + 0.7152 * g + 0.0722 * bl;
+                out += &format!("{l:6.1}");
+            }
+            out += "\n";
+        }
+        out
+    };
+    *hr.app.world_mut().resource_mut::<RestirSettings>() = RestirSettings::default();
+    let restir = grab(&mut hr);
+    eprintln!("=== RESTIR GI region luma (reference) ===\n{}", grid(&hr, &restir));
+    {
+        let mut r = hr.app.world_mut().resource_mut::<RestirSettings>();
+        r.screen_probes = true;
+        r.probe_size = 16;
+        r.probe_oct_res = 16;
+        r.probe_temporal = true;
+    }
+    let probe = grab(&mut hr);
+    eprintln!("=== PROBE GI region luma (16px oct16) ===\n{}", grid(&hr, &probe));
+}
+
 /// **Blotch sweep** — measures BOTH the fine per-pixel grain (`boil_stats`) AND the low-freq blotch
 /// (`blotch_cov`) over a LONG window, for spatial reuse ON vs OFF, to settle whether GI spatial reuse is what
 /// turns per-pixel grain into the slow low-freq blotch DLSS-RR can't clean. Prints; the headline is the blotch
