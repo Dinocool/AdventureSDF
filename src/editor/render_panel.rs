@@ -13,7 +13,7 @@ use crate::voxel::raytrace::{
 };
 
 /// Labels for `LightingUniformData.debug_view` (index == the u32 value the shader branches on).
-const DEBUG_LABELS: [&str; 8] = [
+const DEBUG_LABELS: [&str; 10] = [
     "Lit (normal)",
     "Normals",
     "Depth",
@@ -22,6 +22,8 @@ const DEBUG_LABELS: [&str; 8] = [
     "GI only",
     "Face orient (red = BACK face)",
     "LOD (ring colour)",
+    "DI only (emitter direct)",
+    "Motion vectors (DLSS, px)",
 ];
 
 /// The panel body. Registered via `editor::panels::register_panel`.
@@ -148,6 +150,13 @@ pub fn render_gi_panel(world: &mut World, ui: &mut egui::Ui) {
                 ui.add(egui::Slider::new(&mut s.spatial_samples, 0..=8).text("spatial search taps"));
                 ui.add(egui::Slider::new(&mut s.spatial_radius, 1.0..=48.0).text("spatial radius (px)"));
                 ui.add(egui::Slider::new(&mut s.confidence_cap, 1.0..=32.0).text("history cap (frames)"));
+                ui.add(egui::Slider::new(&mut s.gi_initial_samples, 1..=16).text("GI initial samples / frame (M)"));
+            });
+            // GI 4.0: screen-space ReSTIR DI (emissive-voxel direct light) — the emitter-boil fix.
+            ui.checkbox(&mut s.di_enabled, "ReSTIR DI (emissive-voxel direct light)");
+            ui.add_enabled_ui(on && s.di_enabled, |ui| {
+                ui.add(egui::Slider::new(&mut s.di_initial_samples, 1..=32).text("DI initial RIS candidates"));
+                ui.add(egui::Slider::new(&mut s.di_confidence_cap, 1.0..=40.0).text("DI history cap (frames)"));
             });
             ui.label(
                 egui::RichText::new(

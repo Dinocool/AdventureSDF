@@ -723,6 +723,17 @@ fn sky_radiance(dir: vec3<f32>) -> vec3<f32> {
     return (grad + sun) * sky.intensity;
 }
 
+// The sky radiance a GI BOUNCE sees on a miss — the gradient ONLY, sun DISK EXCLUDED (the directional sun's GI
+// is delivered through the cache's `wc_sun_direct`, so a GI bounce toward the sun must not double-count the
+// disk). The PRIMARY camera miss still uses the full `sky_radiance`; only GI bounces use this.
+fn sky_radiance_no_sun(dir: vec3<f32>) -> vec3<f32> {
+    let up = clamp(dir.y, -1.0, 1.0);
+    if (up >= 0.0) {
+        return mix(sky.horizon_color, sky.zenith_color, up) * sky.intensity;
+    }
+    return mix(sky.horizon_color, sky.ground_color, -up) * sky.intensity;
+}
+
 // Build an orthonormal basis (tangent, bitangent) around unit normal `n` (Frisvad / Duff branchless).
 fn onb(n: vec3<f32>) -> mat2x3<f32> {
     let s = select(-1.0, 1.0, n.z >= 0.0);
@@ -947,8 +958,8 @@ fn debug_overlay_color(r: TraceResult, ro: vec3<f32>, rd: vec3<f32>, gi: vec3<f3
         return r.color.rgb;                                      // raw palette albedo
     } else if (light.debug_view == 4u) {
         return vec3<f32>(ambient_occlusion(origin, r.normal));   // AO only
-    } else if (light.debug_view == 5u) {
-        return gi;                                               // indirect (GI) only — caller's estimator
+    } else if (light.debug_view == 5u || light.debug_view == 8u) {
+        return gi;                                               // 5 = indirect (GI) only; 8 = DI only — the caller chooses what it puts in `gi`
     } else if (light.debug_view == 6u) {
         // Face orientation: GREEN = front face (normal opposes the ray); RED = BACK face (normal along the
         // ray — i.e. we hit the inside/back of a voxel = the show-through bug).
@@ -1250,38 +1261,38 @@ fn reservoir_from_bounce(world_position: vec3<f32>, world_normal: vec3<f32>, dir
 //                   cached (it has no surface to anchor a cell), so a distant sky sample is recorded directly.
 //
 // `rng` is a mutating PCG stream the query uses for its stochastic cell-LOD rounding + tangent-plane jitter.
-fn reservoir_from_bounce_cached(world_position: vec3<f32>, world_normal: vec3<f32>, dir: vec3<f32>, rng: ptr<function, u32>) -> Reservoir {
+fn reservoir_from_bounce_cached(world_position: vec3<f32>, world_normal: vec3<f32>, dir: vec3<f32>, drop_emissive: bool, rng: ptr<function, u32>) -> Reservoir {
     var reservoir = empty_reservoir();
     let origin = world_position + world_normal * light.shadow_bias;
     let r = trace(origin, dir, 0.0, light.gi_bounce_dist);
     if (r.hit == 0u) {
-        // Distant sky sample (unchanged from the fresh path) — the sky has no cache cell.
+        // Distant sky sample — GRADIENT only (sun disk excluded; the sun's GI is delivered through the cache via
+        // `wc_sun_direct`, so a bounce toward the sun must not also see the disk). The sky has no cache cell.
         reservoir.sample_point_world_position = origin + dir * light.gi_bounce_dist;
         reservoir.sample_point_world_normal = -dir;
         reservoir.confidence_weight = 1.0;
-        reservoir.radiance = sky_radiance(dir) * sky.gi_sky_intensity;
+        reservoir.radiance = sky_radiance_no_sun(dir) * sky.gi_sky_intensity;
     } else {
         let hp = origin + dir * r.t;
         reservoir.sample_point_world_position = hp;
         reservoir.sample_point_world_normal = r.normal;
         reservoir.confidence_weight = 1.0;
-        // True OUTGOING radiance of the bounce surface toward the shading point — the full single-bounce-
-        // plus-cache rendering equation L_o(hp):
-        //     L_o(hp) = emissive(hp) + direct_lighting(hp) + albedo(hp)·cache(hp)
-        // The first two terms are IDENTICAL to the fresh path (`reservoir_from_bounce`): direct_lighting
-        // already folds in albedo, and emissive is added raw. The THIRD term is the one reflected indirect
-        // bounce the cache supplies: our 2.1 world cache stores, per cell x, the cosine-weighted mean of the
-        // NEIGHBORS' (direct+emissive) outgoing radiance, i.e. cache(x) == the indirect incoming radiance to
-        // x already divided by π (the cosine gather bakes the 1/π in). So the reflected indirect is
-        // albedo·cache with NO further /π — UNLIKE Solari's restir_gi.wgsl:119-120, which multiplies by
-        // base_color/π because ITS cache stores raw irradiance E and it has a SEPARATE DI pass for the
-        // direct+emissive term (we fold direct+emissive inline here). Reading the cache RAW (the prior bug)
-        // dropped both albedo and the surface's own direct+emissive — wrong energy. Multiplying by albedo
-        // only (a prior reviewer's suggestion) dropped direct+emissive — also wrong. The cache lazy-inserts
-        // on an empty cell → returns 0 (fills over the next frames), so cache-off degrades to the fresh
-        // single-bounce direct+emissive and cache-on adds the reflected indirect on top.
-        reservoir.radiance = direct_lighting(r.color.rgb, r.normal, hp)
-            + r.emissive * light.emissive_strength
+        // OUTGOING radiance of the bounce surface toward the shading point, read ENTIRELY from the world cache
+        // (Solari `restir_gi`): L_o(hp) = emissive(hp) + albedo(hp)·cache(hp), where cache(hp) holds hp's TOTAL
+        // incoming radiance — its own DIRECT (sun via `wc_sun_direct` + emitters via NEE) PLUS indirect — all
+        // multi-frame-averaged in `world_cache_update`. We NO LONGER recompute `direct_lighting(hp)` FRESH here.
+        //
+        // THIS IS THE BOIL FIX (GI 5.0): the fresh per-frame `direct_lighting(hp)` carried the HARD sun-shadow at
+        // the bounce hit — a high-dynamic-range term that made the ReSTIR candidate's target function swing ~10×
+        // between sun-lit and shadowed bounces, so RIS kept SWITCHING the held sample to whatever bright bounce it
+        // found (a switch the confidence cap can't damp — it's driven by the target RATIO). That switching is the
+        // low-frequency "boil" DLSS-RR exposes (the heavy non-RR accumulator hid it). Reading the bounce radiance
+        // from the SMOOTH, temporally-averaged cache makes the candidate target ~constant across bounce
+        // directions → the reservoir stops switching → it converges. Pure Solari alignment. Cosine-pre-divided
+        // cache ⇒ albedo only (no /π). The cache lazy-inserts on first sight (returns 0, fills over ~1-2 frames),
+        // so a freshly-disoccluded pixel can be briefly dark until it fills (acceptable; static views are clean).
+        let emit_term = select(r.emissive * light.emissive_strength, vec3<f32>(0.0), drop_emissive);
+        reservoir.radiance = emit_term
             + r.color.rgb * query_world_cache(hp, r.normal, camera.cam_pos, r.t, wc.cell_lifetime, rng);
     }
     reservoir.unbiased_contribution_weight = uniform_hemisphere_inverse_pdf();
@@ -1331,6 +1342,29 @@ struct ReservoirMergeResult {
     merged_reservoir: Reservoir,
     selected_sample_radiance: vec3<f32>,
     wi: vec3<f32>,
+}
+
+// --- Defensive pairwise-MIS helpers (RTXDI / Wyman 2023 "A Gentle Introduction to ReSTIR", Algo 7) ----------
+// The GI target function p̂ of a sample carrying outgoing radiance `radiance` at `sample_pos`, evaluated at a
+// receiver (`recv_pos`, `recv_n`): luminance(L_o)·cosθ (brdf = 1, receiver albedo applied by the caller). The
+// Jacobian for a cross-receiver shift is applied by the CALLER (multiplied onto this scalar).
+fn restir_target_at(radiance: vec3<f32>, sample_pos: vec3<f32>, recv_pos: vec3<f32>, recv_n: vec3<f32>) -> f32 {
+    let wi = normalize(sample_pos - recv_pos);
+    return restir_luminance(radiance) * saturate(dot(wi, recv_n));
+}
+
+// Generalized pairwise balance-heuristic weight (RTXDI `RTXDI_PairwiseMisWeight`): m0·w0 / (m0·w0 + m1·w1),
+// 0-guarded. `w0`/`w1` are the two techniques' target functions, `m0`/`m1` their confidence weights.
+fn pairwise_mis(w0: f32, w1: f32, m0: f32, m1: f32) -> f32 {
+    let denom = m0 * w0 + m1 * w1;
+    return select(0.0, max(0.0, m0 * w0) / denom, denom > 0.0);
+}
+
+// Confidence attenuation for a shifted neighbour (RTXDI `RTXDI_MFactor`): down-weights a neighbour's M
+// contribution when its target at the OTHER receiver is much smaller than at its own (a poorly-shifted /
+// dissimilar sample), preventing confidence inflation. 1 when the native target is 0.
+fn mis_m_factor(q0: f32, q1: f32) -> f32 {
+    return select(clamp(pow(min(q1 / q0, 1.0), 8.0), 0.0, 1.0), 1.0, q0 <= 0.0);
 }
 
 // Pairwise RIS merge of a canonical reservoir with another (temporal or spatial), with balance-heuristic
@@ -1480,7 +1514,10 @@ fn restir_probe(@builtin(global_invocation_id) gid: vec3<u32>) {
 // Runtime ReSTIR knobs (group-2 uniform; editor-driven, knobs-as-uniforms). `spatial_samples` neighbours are
 // merged per pixel from last frame's reservoirs (smooths dark/shadow regions where the temporal permute alone
 // is too slow); `spatial_radius` is the disk radius in pixels; `confidence_weight_cap` bounds temporal/spatial
-// history (lag vs stability). 32 bytes (2×vec4).
+// history (lag vs stability). The final row holds the GI 4.0 screen-space ReSTIR DI knobs (emissive-voxel
+// direct light): `di_enabled` gates the DI pass; `di_confidence_cap` is the DI temporal history cap (Solari DI
+// uses 20, higher than GI's because DI samples are cheaper/more stable); `di_initial_samples` = RIS candidates
+// drawn per pixel per frame (Solari 8). 48 bytes (3×vec4).
 struct RestirParams {
     reset: u32,
     frame_index: u32,
@@ -1489,7 +1526,14 @@ struct RestirParams {
     spatial_samples: u32,
     confidence_weight_cap: f32,
     spatial_radius: f32,
-    _pad: u32,
+    di_enabled: u32,
+    di_confidence_cap: f32,
+    di_initial_samples: u32,
+    // GI 6.0: INITIAL RIS candidate count per pixel per frame (M). 1 = canonical single-bounce ReSTIR; >1
+    // traces M bounces and RIS-merges them BEFORE the temporal/spatial reuse → the per-frame estimate variance
+    // drops ~1/M directly. Costs M× the GI bounce trace. The fix for severely under-sampled scenes (Sponza).
+    gi_initial_samples: u32,
+    _pad1: u32,
 };
 // Per-pixel RECEIVER surface (world pos + face normal) — needed so a temporal/neighbour reservoir can be
 // merged with the correct Jacobian + rejected when it lands on a dissimilar surface (port of Solari's
@@ -1505,6 +1549,261 @@ struct PixelSurface { world_position: vec3<f32>, valid: f32, world_normal: vec3<
 @group(2) @binding(2) var<uniform> restir_params: RestirParams;
 @group(2) @binding(3) var<storage, read_write> surfaces_cur: array<PixelSurface>;
 @group(2) @binding(4) var<storage, read_write> surfaces_prev: array<PixelSurface>;
+
+// ====================================================================================================
+// GI 4.0 — SCREEN-SPACE ReSTIR DI (direct light from the emissive-voxel list). Port of bevy_solari's
+// `restir_di.wgsl` adapted to our engine: our LIGHT LIST is the per-voxel `voxel_lights` + power-weighted
+// `voxel_light_alias` (group 3) — NOT Solari's triangle `light_sources`. The dominant EMITTER-scene boil is
+// the emitter being found only when a random GI bounce HITS it (`emissive(hit)`, hit-or-miss → high variance,
+// docs/GI_BOIL_PLAN.md §6). DI replaces that with a RESAMPLED, temporally+spatially reused, visibility-checked
+// direct estimate at the PRIMARY surface — low variance by construction (Bitterli 2020 / RTXDI). When DI is
+// on, the GI bounce DROPS its raw `emissive(hit)` term (now DI's job) so there is no double-count; the cache's
+// emitter NEE still carries INDIRECT (emitter→wall→eye) bounces, which DI does not.
+//
+// A DI reservoir stores the SELECTED light as (light_index, seed) — the seed regenerates the face-jitter point
+// deterministically (Solari's light_id+seed scheme), so reuse across pixels/frames needs only 16 B/pixel. Two
+// fixed-role buffers ping-pong like the GI reservoirs: `di_reservoirs_a` = final/history, `di_reservoirs_b` =
+// post-temporal (pass-1 → pass-2). No light-tile presampling yet (a memory-coherence optimization for LARGE
+// light counts; our scenes have few emitters — the variance win is the reservoir, not the tiles; tiles are a
+// documented scalability follow-up).
+struct DiReservoir {
+    light_index: u32,                  // index into voxel_lights; DI_NULL = invalid/empty
+    seed: u32,                         // RNG seed → regenerates the face-jitter sample point (deterministic)
+    confidence_weight: f32,            // ~ effective sample count M (capped at di_confidence_cap)
+    unbiased_contribution_weight: f32, // RIS contribution weight W
+};
+const DI_NULL: u32 = 0xFFFFFFFFu;
+@group(2) @binding(5) var<storage, read_write> di_reservoirs_a: array<DiReservoir>;
+@group(2) @binding(6) var<storage, read_write> di_reservoirs_b: array<DiReservoir>;
+// Spatiotemporal blue noise (Bevy `stbn.ktx2`): `.xy` is a blue-noise-in-space-AND-time uniform value in
+// [0,1)², indexed by frame → array layer. A 1×1 dummy is bound until it's resident (the `dims > 1` guard in
+// `stbn_rotation` then uses white noise). Sampled by `restir_p1_core` for the GI sample-direction rotation.
+@group(2) @binding(7) var stbn_tex: texture_2d_array<f32>;
+
+fn di_empty() -> DiReservoir { return DiReservoir(DI_NULL, 0u, 0.0, 0.0); }
+fn di_valid(r: DiReservoir) -> bool { return r.light_index != DI_NULL; }
+
+// Resolve a (light_index, seed) to a concrete sample POINT on the emitter's face + its radiance + area
+// inverse-pdf. RECEIVER-INDEPENDENT (a fixed jitter basis, NOT the receiver-facing one `wc_sample_light_nee`
+// uses) so the SAME (light_index, seed) yields the SAME point at every pixel that reuses it — required for
+// unbiased spatial/temporal reuse. `radiance` already folds the `emissive_strength` knob. Isotropic voxel
+// emitter (cos_light = 1), matching the NEE model so the alias `inv_pdf` is self-consistent.
+struct DiLightSample { pos: vec3<f32>, radiance: vec3<f32>, inv_pdf: f32 };
+fn di_resolve(light_index: u32, seed: u32) -> DiLightSample {
+    let lgt = voxel_lights[light_index];
+    var rng = seed;
+    let half = sqrt(lgt.area) * 0.5;
+    let basis = onb(vec3<f32>(0.5773502691, 0.5773502691, 0.5773502691)); // fixed axis ⇒ receiver-independent
+    let j = (vec2<f32>(rand_next(&rng), rand_next(&rng)) * 2.0 - 1.0) * half;
+    let pos = lgt.pos + basis[0] * j.x + basis[1] * j.y;
+    return DiLightSample(pos, lgt.radiance * light.emissive_strength, lgt.inv_pdf);
+}
+
+// The unshadowed contribution of a resolved light sample at a receiver (pos, normal): the reflected-radiance
+// colour (brdf factored to 1 — receiver albedo applied by the caller, matching the GI/sun convention) and the
+// scalar RIS target function. ENGINE CONVENTION: irradiance E = radiance·cos_recv·cos_light/dist² with NO 1/π
+// (the whole direct path — sun in `shade_restir_p2`, emitter glow — omits 1/π; matching it keeps DI consistent
+// with the direct sun). `inv_pdf` (area-measure) converts the single sample to an unbiased E estimate.
+struct DiContribution { radiance: vec3<f32>, tf: f32, wi: vec3<f32>, dist: f32 };
+fn di_contribution(smp: DiLightSample, recv_pos: vec3<f32>, recv_normal: vec3<f32>) -> DiContribution {
+    let to_light = smp.pos - recv_pos;
+    let dist2 = max(dot(to_light, to_light), 1.0e-8);
+    let dist = sqrt(dist2);
+    let wi = to_light / dist;
+    let cos_recv = max(dot(recv_normal, wi), 0.0);
+    // Single-sample unbiased estimate of the reflected radiance from this light (brdf = 1, cos_light = 1):
+    let contrib = smp.radiance * (cos_recv / dist2) * smp.inv_pdf;
+    return DiContribution(contrib, restir_luminance(contrib), wi, dist);
+}
+
+// Trace a shadow ray from the receiver to the light sample point; 1.0 if visible, 0.0 if occluded. Stops ONE
+// emitter-cell short (the light point sits ~half a cell inside the solid emissive voxel, like the cache NEE) so
+// the emitter's own body doesn't self-shadow every sample.
+fn di_visibility(recv_pos: vec3<f32>, recv_normal: vec3<f32>, light_pos: vec3<f32>, light_index: u32) -> f32 {
+    let origin = recv_pos + recv_normal * light.shadow_bias;
+    let to_light = light_pos - origin;
+    let dist = length(to_light);
+    if (dist <= 1.0e-6) { return 1.0; }
+    let cell = sqrt(voxel_lights[light_index].area);
+    let t_max = dist - cell;
+    if (t_max <= light.shadow_bias) { return 1.0; } // adjacent emitter — no room for an occluder
+    if (trace_occluded(origin, to_light / dist, light.shadow_bias, t_max)) { return 0.0; }
+    return 1.0;
+}
+
+// Draw ONE power-weighted light via the alias table, returning (light_index, seed-for-its-jitter). Advances rng.
+fn di_pick_light(rng: ptr<function, u32>) -> vec2<u32> {
+    let slot = min(u32(rand_next(rng) * f32(wc.light_count)), wc.light_count - 1u);
+    let entry = voxel_light_alias[slot];
+    var li = slot;
+    if (rand_next(rng) >= entry.prob) { li = entry.alias_idx; }
+    let seed = *rng; // a deterministic seed for THIS candidate's face jitter (distinct per candidate)
+    rand_next(rng);  // advance so the next candidate's seed differs
+    return vec2<u32>(li, seed);
+}
+
+// INITIAL + RIS: draw `di_initial_samples` power-weighted candidates, resample one by its target function
+// (Solari `generate_initial_reservoir`). No per-candidate visibility (that would be N shadow rays); the
+// selected sample's visibility is folded into the resolve in pass 2 (we store the UNSHADOWED reservoir so
+// neighbours reuse an unbiased estimate, then shade with per-receiver visibility — same contract as our GI).
+fn di_generate_initial(recv_pos: vec3<f32>, recv_normal: vec3<f32>, rng: ptr<function, u32>) -> DiReservoir {
+    var res = di_empty();
+    if (wc.light_count == 0u) { return res; }
+    let m = max(restir_params.di_initial_samples, 1u);
+    let mis_weight = 1.0 / f32(m);
+    var weight_sum = 0.0;
+    var sel_target = 0.0;
+    for (var i = 0u; i < m; i = i + 1u) {
+        let pick = di_pick_light(rng);
+        let smp = di_resolve(pick.x, pick.y);
+        let c = di_contribution(smp, recv_pos, recv_normal);
+        // The candidate is already a 1/pdf-weighted single-sample E estimate, so its target IS its luminance;
+        // mis_weight (1/m) makes the M candidates a balanced mixture (Solari).
+        let resampling_weight = mis_weight * c.tf;
+        weight_sum += resampling_weight;
+        if (rand_next(rng) < resampling_weight / max(weight_sum, 1e-12)) {
+            sel_target = c.tf;
+            res.light_index = pick.x;
+            res.seed = pick.y;
+        }
+    }
+    if (sel_target > 0.0) {
+        res.unbiased_contribution_weight = weight_sum / sel_target;
+        // CRUCIAL (Solari `generate_initial_reservoir`): fold the SELECTED sample's visibility into the ucw, so
+        // the stored reservoir is VISIBILITY-AWARE. Without this, ReSTIR keeps an occluded-but-bright light in
+        // the reservoir and the per-frame shade-time visibility ray flickers 0↔1 as the selected light changes
+        // → the dominant DI boil (measured CoV ~1.25 before this). With it, an occluded light's ucw collapses to
+        // 0 so it is dropped from temporal/spatial reuse. The pass-2 shade still traces a per-receiver visibility
+        // for the final (a reused neighbour's light may be occluded HERE).
+        let sel_smp = di_resolve(res.light_index, res.seed);
+        res.unbiased_contribution_weight *= di_visibility(recv_pos, recv_normal, sel_smp.pos, res.light_index);
+    }
+    res.confidence_weight = 1.0;
+    return res;
+}
+
+struct DiMergeResult { reservoir: DiReservoir, radiance: vec3<f32>, wi: vec3<f32>, dist: f32, light_pos: vec3<f32> };
+
+// Pairwise balance-heuristic MIS merge of two DI reservoirs at the canonical receiver (mirrors our GI
+// `merge_reservoirs` / Solari DI merge). Each light sample is resolved + evaluated at both the canonical and
+// the other receiver for the MIS partition; the target function is the contribution luminance.
+fn di_merge(
+    canonical: DiReservoir, canon_pos: vec3<f32>, canon_n: vec3<f32>,
+    other: DiReservoir, other_pos: vec3<f32>, other_n: vec3<f32>,
+    rng: ptr<function, u32>,
+) -> DiMergeResult {
+    // Resolve each reservoir's sample once.
+    var canon_smp: DiLightSample;
+    var other_smp: DiLightSample;
+    if (di_valid(canonical)) { canon_smp = di_resolve(canonical.light_index, canonical.seed); }
+    if (di_valid(other))     { other_smp = di_resolve(other.light_index, other.seed); }
+
+    // Contributions at the canonical receiver (for resampling) and the other receiver (for MIS).
+    var c_at_c: DiContribution; var o_at_c: DiContribution; var c_at_o: DiContribution; var o_at_o: DiContribution;
+    if (di_valid(canonical)) { c_at_c = di_contribution(canon_smp, canon_pos, canon_n); c_at_o = di_contribution(canon_smp, other_pos, other_n); }
+    if (di_valid(other))     { o_at_c = di_contribution(other_smp, canon_pos, canon_n); o_at_o = di_contribution(other_smp, other_pos, other_n); }
+
+    let canon_mis = balance_heuristic(canonical.confidence_weight * c_at_c.tf, other.confidence_weight * c_at_o.tf);
+    let canon_w = canon_mis * c_at_c.tf * canonical.unbiased_contribution_weight;
+    let other_mis = balance_heuristic(other.confidence_weight * o_at_o.tf, canonical.confidence_weight * o_at_c.tf);
+    let other_w = other_mis * o_at_c.tf * other.unbiased_contribution_weight;
+
+    var combined = di_empty();
+    combined.confidence_weight = canonical.confidence_weight + other.confidence_weight;
+    let wsum = canon_w + other_w;
+
+    if (di_valid(other) && rand_next(rng) < other_w / max(wsum, 1e-12)) {
+        combined.light_index = other.light_index;
+        combined.seed = other.seed;
+        let inv_tf = select(0.0, 1.0 / o_at_c.tf, o_at_c.tf > 0.0);
+        combined.unbiased_contribution_weight = wsum * inv_tf;
+        return DiMergeResult(combined, o_at_c.radiance, o_at_c.wi, o_at_c.dist, other_smp.pos);
+    } else {
+        combined.light_index = canonical.light_index;
+        combined.seed = canonical.seed;
+        let inv_tf = select(0.0, 1.0 / c_at_c.tf, c_at_c.tf > 0.0);
+        combined.unbiased_contribution_weight = wsum * inv_tf;
+        return DiMergeResult(combined, c_at_c.radiance, c_at_c.wi, c_at_c.dist, canon_smp.pos);
+    }
+}
+
+// PASS 1 (DI): initial RIS + temporal reuse → di_reservoirs_b. Reads the PERMUTED reprojected previous-frame
+// final (di_reservoirs_a) for this surface, capped at `di_confidence_cap`. Shares `surfaces_*` + the reproject
+// /permute/dissimilar machinery with the GI pass. `seed` is offset so the DI rng stream decorrelates from GI.
+fn di_p1_core(n: vec3<f32>, p: vec3<f32>, pix: vec2<u32>, temporal_base: vec2<i32>, seed: u32) {
+    let vp = vec2<u32>(restir_params.viewport_x, restir_params.viewport_y);
+    let idx = pix.y * vp.x + pix.x;
+    if (restir_params.di_enabled == 0u || wc.light_count == 0u) { di_reservoirs_b[idx] = di_empty(); return; }
+    var rng = seed ^ 0x9E3779B9u;
+    var res = di_generate_initial(p, n, &rng);
+
+    if (restir_params.reset == 0u) {
+        // SAME-PIXEL (reprojected, NOT permuted) temporal tap. The GI pass permutes its temporal tap to keep
+        // EXPLORING bounce directions (continuous radiance); DI is the OPPOSITE — its sample is a DISCRETE light,
+        // and we WANT each pixel to CONVERGE onto and HOLD one good visible light. Permuting reads a different
+        // neighbour's (different) light every frame, so the held light keeps getting swapped → the contribution
+        // jitters frame-to-frame (measured: permuted DI CoV ~0.30; same-pixel collapses it). Spatial reuse still
+        // shares lights across pixels. Off-screen reprojection falls back to the current pixel.
+        var tb = temporal_base;
+        if (tb.x < 0 || tb.y < 0 || tb.x >= i32(vp.x) || tb.y >= i32(vp.y)) { tb = vec2<i32>(pix); }
+        let tidx = u32(tb.y) * vp.x + u32(tb.x);
+        let surf = surfaces_prev[tidx];
+        if (surf.valid > 0.5 && !surfaces_dissimilar(p, n, surf.world_position, surf.world_normal)) {
+            var temporal = di_reservoirs_a[tidx];
+            temporal.confidence_weight = min(temporal.confidence_weight, restir_params.di_confidence_cap);
+            res = di_merge(res, p, n, temporal, surf.world_position, surf.world_normal, &rng).reservoir;
+        }
+    }
+    if (restir_isnan(res.unbiased_contribution_weight) || restir_isinf(res.unbiased_contribution_weight)) {
+        res.unbiased_contribution_weight = 0.0;
+    }
+    di_reservoirs_b[idx] = res;
+}
+
+// PASS 2 (DI): one same-frame spatial neighbour merge (from di_reservoirs_b) → store final to di_reservoirs_a,
+// then resolve the selected light at THIS receiver, trace ONE visibility ray, and return the reflected DIRECT
+// emitter radiance (× receiver albedo by the caller). Store-before-visibility (the unbiased contract: the
+// stored reservoir stays an unshadowed estimate neighbours can reuse; visibility is a per-receiver shading
+// correction). Returns 0 when DI is off / no lights / miss.
+fn di_p2_core(n: vec3<f32>, p: vec3<f32>, pix: vec2<u32>, seed: u32) -> vec3<f32> {
+    if (restir_params.di_enabled == 0u || wc.light_count == 0u) { return vec3<f32>(0.0); }
+    let vp = vec2<u32>(restir_params.viewport_x, restir_params.viewport_y);
+    let idx = pix.y * vp.x + pix.x;
+    var rng = (seed ^ 0x9E3779B9u) ^ 0xD2511F53u;
+    var res = di_reservoirs_b[idx];
+
+    // DI is TEMPORAL-ONLY (no spatial neighbour merge). Spatial reuse of a CONTINUOUS GI radiance averages
+    // smoothly, but merging two pixels' DISCRETE light choices picks ONE ~50/50 and OSCILLATES the held light
+    // frame-to-frame → boil (measured: with spatial, DI CoV ~0.26; temporal-only collapses it). The temporal
+    // reservoir alone accumulates enough effective samples for a stable per-pixel light. (`spatial_samples`
+    // still drives the GI pass.) A discrete-light-aware spatial scheme (light-tile presampling) is the upgrade.
+    let DI_SPATIAL = 0u;
+    for (var s = 0u; s < DI_SPATIAL; s = s + 1u) {
+        let off = sample_disk(restir_params.spatial_radius, &rng);
+        let npix = vec2<i32>(pix) + vec2<i32>(i32(round(off.x)), i32(round(off.y)));
+        if (npix.x < 0 || npix.y < 0 || npix.x >= i32(vp.x) || npix.y >= i32(vp.y)) { continue; }
+        let nidx = u32(npix.y) * vp.x + u32(npix.x);
+        if (nidx == idx) { continue; }
+        let nsurf = surfaces_cur[nidx];
+        if (nsurf.valid > 0.5 && !surfaces_dissimilar(p, n, nsurf.world_position, nsurf.world_normal)) {
+            var nres = di_reservoirs_b[nidx];
+            nres.confidence_weight = min(nres.confidence_weight, restir_params.di_confidence_cap);
+            res = di_merge(res, p, n, nres, nsurf.world_position, nsurf.world_normal, &rng).reservoir;
+            break;
+        }
+    }
+    if (restir_isnan(res.unbiased_contribution_weight) || restir_isinf(res.unbiased_contribution_weight)) {
+        res.unbiased_contribution_weight = 0.0;
+    }
+    di_reservoirs_a[idx] = res; // FINAL → next frame's pass-1 temporal tap
+
+    if (!di_valid(res) || res.unbiased_contribution_weight <= 0.0) { return vec3<f32>(0.0); }
+    let smp = di_resolve(res.light_index, res.seed);
+    let c = di_contribution(smp, p, n);
+    let vis = di_visibility(p, n, smp.pos, res.light_index);
+    // E estimate × visibility. `c.radiance` already folds cos_recv/dist²·inv_pdf·emissive_strength (no /π).
+    return c.radiance * (res.unbiased_contribution_weight * vis) * light.gi_intensity;
+}
 
 // Frame-dependent in-4×4-block pixel shuffle (Solari `permute_pixel`). Decorrelates the temporal tap so a
 // pixel doesn't re-consult ITS OWN previous reservoir every frame (which freezes it onto an early sample →
@@ -1548,6 +1847,19 @@ fn sample_disk(radius: f32, rng: ptr<function, u32>) -> vec2<f32> {
     return vec2<f32>(r * cos(a), r * sin(a));
 }
 
+// Spatiotemporal-blue-noise value for the GI sample-direction Cranley–Patterson rotation. Returns the STBN
+// `.xy` (uniform in [0,1)², blue in space AND time), indexed by pixel (wrapped to the mask) and frame (→ array
+// layer). Mirrors `bevy_pbr::ssr`'s access. Falls back to white noise when the dummy 1×1 texture is bound (the
+// real `stbn.ktx2` not yet resident) so the result is always well-defined.
+fn stbn_rotation(pix: vec2<u32>, frame: u32, seed: u32) -> vec2<f32> {
+    let dims = textureDimensions(stbn_tex);
+    if (all(dims > vec2<u32>(1u))) {
+        let layers = textureNumLayers(stbn_tex);
+        return textureLoad(stbn_tex, pix % dims, i32(frame % layers), 0).xy;
+    }
+    return vec2<f32>(rand01(seed * 2u + 1u), rand01(seed * 2u + 2u));
+}
+
 // PASS 1 (Solari `initial_and_temporal`): generate the initial RIS candidate, merge LAST frame's final
 // reservoir for this surface (reprojected+permuted tap into `reservoirs_a`), and write the POST-TEMPORAL
 // reservoir to `reservoirs_b` + this pixel's receiver surface to `surfaces_cur`. NO spatial reuse, NO shading
@@ -1565,23 +1877,82 @@ fn restir_p1_core(n: vec3<f32>, p: vec3<f32>, pix: vec2<u32>, temporal_base: vec
     // sample count is built by the temporal + spatial reservoir REUSE below, NOT by a per-pixel RIS loop: that
     // is what ReSTIR is. Tracing exactly one bounce here (vs the old `gi_rays`-deep inlined trace/shade tree)
     // collapses the register pressure that bound this occupancy-limited pass — same converged GI, far higher
-    // occupancy. The candidate counts as ONE frame (confidence 1) so the temporal reuse stays strong. The LD
-    // direction is deterministic given (pixel, frame); `rng` drives the merges' stochastic selection.
-    let rot = vec2<f32>(rand01(seed * 2u + 1u), rand01(seed * 2u + 2u));
+    // occupancy. The candidate counts as ONE frame (confidence 1) so the temporal reuse stays strong. `rng`
+    // drives the merges' stochastic selection.
+    //
+    // SPATIOTEMPORAL BLUE NOISE rotation (Bevy `stbn.ktx2`). The Cranley–Patterson rotation of the GI sample
+    // direction is drawn from an STBN mask — blue in space AND time. Blue-in-space decorrelates neighbours (so
+    // spatial reuse integrates cleanly); blue-in-time makes each pixel's frame-to-frame sequence low-discrepancy
+    // with NO coherent drift, so temporal reuse + DLSS-RR average it to a stable estimate instead of the
+    // wandering mean white noise produced (the boil). (An earlier additive-R2 shortcut shifted EVERY pixel by the
+    // same per-frame constant → the whole field drifted coherently and read as boil; a real STBN mask doesn't.)
+    // Falls back to white noise when the texture isn't resident yet (`stbn_rotation`'s `dims > 1` guard).
+    let rot = stbn_rotation(pix, restir_params.frame_index, seed);
     // A/B gate (2.2): when `wc.use_world_cache` is on (default), the bounce-HIT radiance is read from the
     // world-space radiance cache (pre-accumulated → low variance, multi-bounce in 2.3) instead of a fresh
     // single trace. The query LAZY-INSERTS, so this live path is ALSO what populates the cache (Solari's
     // query-driven fill). When off, the FRESH `reservoir_from_bounce` path runs — identical to pre-2.2
     // behaviour (minus the now-removed firefly clamp), and no query marks any cell alive, so the cache stays
     // idle (update/blend no-op) exactly like Phase 2.1. The LD direction stratifies the sampling either way.
+    // GI 6.0: trace `gi_initial_samples` (M) candidates and combine them into ONE initial reservoir with a
+    // CHEAP same-receiver streaming RIS. M>1 cuts the per-frame estimate variance — the direct fix for severely
+    // under-sampled scenes (Sponza: 1-spp GI fine_CoV ~0.7) — BEFORE the temporal/spatial reuse.
+    //
+    // This is `merge_reservoirs` ALGEBRAICALLY SPECIALISED to the same receiver, NOT a different one: there the
+    // shift Jacobian is identically 1 and the "other receiver" target evals equal the canonical ones, so the
+    // GRIS reuse merge (4 target evals + 2 Jacobians + 2 balance heuristics + a full second reservoir's live
+    // state per candidate) collapses to — carrying the selected target `sel_tf` across iterations — exactly ONE
+    // new target eval and a scalar reservoir update per candidate. The result is BIT-FOR-BIT the confidence-
+    // weighted balance-heuristic combine `merge_reservoirs` would produce (the accumulated confidence `c` weights
+    // the running estimate vs. the fresh candidate: m_canon = c/(c+1), m_cand = 1/(c+1)), so it keeps that
+    // merge's lower variance — but at a fraction of the ALU AND, decisively, far less live register state. This
+    // pass is occupancy/register-pressure bound, so the naive merge-based loop cost SUPER-linearly in M; this
+    // makes the per-candidate cost ~free, leaving only the irreducible M× bounce trace. Confidence accumulates to
+    // M (the reservoir's true effective sample count) so the temporal reuse leans on this low-variance fresh
+    // estimate, not the correlated history — that confidence (not 1) is what carries the variance win downstream.
     let use_cache = wc.use_world_cache != 0u;
-    var res: Reservoir;
-    if (use_cache) {
-        res = reservoir_from_bounce_cached(p, n, ld_uniform_hemisphere(n, 0u, 1u, rot), &rng);
-    } else {
-        res = reservoir_from_bounce(p, n, ld_uniform_hemisphere(n, 0u, 1u, rot));
+    let drop_emissive = restir_params.di_enabled != 0u && wc.light_count != 0u;
+    let m = max(restir_params.gi_initial_samples, 1u);
+    var res = empty_reservoir();
+    var sel_tf = 0.0; // luminance target of res's currently-selected sample, carried across iterations
+    for (var i = 0u; i < m; i = i + 1u) {
+        let dir = ld_uniform_hemisphere(n, i, m, rot);
+        var cand: Reservoir;
+        if (use_cache) {
+            cand = reservoir_from_bounce_cached(p, n, dir, drop_emissive, &rng);
+        } else {
+            cand = reservoir_from_bounce(p, n, dir);
+        }
+        // Candidate target = luminance(L_o · cosθ) (brdf = 1: receiver albedo applied by the caller, the resolve
+        // carries 1/π). Source weight = 1/pdf = 2π (`unbiased_contribution_weight`).
+        let cwi = normalize(cand.sample_point_world_position - p);
+        let cand_tf = restir_luminance(cand.radiance * saturate(dot(cwi, n)));
+        if (i == 0u) {
+            res.sample_point_world_position = cand.sample_point_world_position;
+            res.sample_point_world_normal = cand.sample_point_world_normal;
+            res.radiance = cand.radiance;
+            res.confidence_weight = 1.0;
+            res.weight_sum = cand_tf * cand.unbiased_contribution_weight;
+            res.unbiased_contribution_weight = cand.unbiased_contribution_weight; // = wsum/tf = 2π
+            sel_tf = cand_tf;
+        } else {
+            let c = res.confidence_weight;
+            let canon_w = (c / (c + 1.0)) * sel_tf * res.unbiased_contribution_weight;
+            let other_w = (1.0 / (c + 1.0)) * cand_tf * cand.unbiased_contribution_weight;
+            let wsum = canon_w + other_w;
+            res.confidence_weight = c + 1.0;
+            res.weight_sum = wsum;
+            if (rand_next(&rng) < other_w / max(wsum, 1e-12)) {
+                res.sample_point_world_position = cand.sample_point_world_position;
+                res.sample_point_world_normal = cand.sample_point_world_normal;
+                res.radiance = cand.radiance;
+                sel_tf = cand_tf;
+            }
+            // ucw W = weight_sum / target(selected) ⇒ `radiance · W · cosθ / π` is an unbiased irradiance
+            // estimate; 0 if the selected target is 0 (all-black / back-facing) — a correct zero contribution.
+            res.unbiased_contribution_weight = select(0.0, wsum / sel_tf, sel_tf > 0.0);
+        }
     }
-    res.confidence_weight = 1.0;
 
     // TEMPORAL reuse. CRUCIAL: read a PERMUTED previous-frame neighbour, NOT this pixel's own previous
     // reservoir — same-pixel feedback freezes each pixel onto an early sample (grain that fades in); the
@@ -1631,36 +2002,93 @@ fn restir_p1_core(n: vec3<f32>, p: vec3<f32>, pix: vec2<u32>, temporal_base: vec
 fn restir_p2_core(n: vec3<f32>, p: vec3<f32>, pix: vec2<u32>, seed: u32) -> vec3<f32> {
     let vp = vec2<u32>(restir_params.viewport_x, restir_params.viewport_y);
     let idx = pix.y * vp.x + pix.x;
-    // Offset the rng so the spatial disk taps decorrelate from pass 1's candidate/temporal stream.
-    var rng = seed ^ 0xA511E9B3u;
-    let brdf = vec3<f32>(1.0); // receiver albedo factored out (applied by the caller)
     var res = reservoirs_b[idx]; // this pixel's post-temporal reservoir (written by pass 1, this frame)
 
-    // SPATIAL reuse: merge exactly ONE valid neighbour from the SAME-FRAME post-temporal pool (Solari
-    // `load_spatial_reservoir` / RTXDI / Wyman-2023). `spatial_samples` is the SEARCH BUDGET — how many disk
-    // taps to try to find a geometrically-valid neighbour — NOT an accumulation count. Merging many neighbours
-    // via iterated pairwise merges is biased (the balance-heuristic MIS partition Σm_i=1 only holds for two
-    // reservoirs) and inflates the combined confidence unboundedly, which AMPLIFIES variance with more samples
-    // (the "more spatial → more boil" bug). The effective sample count is built by TEMPORAL accumulation; one
-    // clean 2-reservoir spatial merge per frame keeps confidence bounded and variance falling. Reads
-    // `surfaces_cur` + `reservoirs_b` — both written this frame by pass 1 (so it's valid even on reset).
+    // SPATIAL reuse via DEFENSIVE PAIRWISE MIS (RTXDI / Wyman 2023 course, Algo 7). The OLD path merged exactly
+    // ONE neighbour because iterated pairwise *balance* merges double-count the canonical and amplify variance as
+    // neighbours are added (the "more spatial → more boil" bug). Pairwise MIS instead forms ONE valid MIS
+    // partition over {canonical + K neighbours} (Σm = 1 across the whole set), so combining K neighbours REDUCES
+    // variance. Each neighbour is an ALREADY-TRACED reservoir, so this adds ~K effective samples per frame for
+    // FREE — the cheap analogue of raising the initial sample count M. Two passes over the SAME disk-tap sequence
+    // (re-seeded `rng`): pass A counts valid neighbours `n` (needed for the `M_i·n` balance scaling), pass B
+    // streams them. A separate `rng_sel` drives reservoir selection so it can't desync the tap sequence.
+    let canonical = res;
+    let p_cc = restir_target_at(canonical.radiance, canonical.sample_point_world_position, p, n); // p̂_c(X_c)
+    let m_c = canonical.confidence_weight;
+    let spatial_seed = seed ^ 0x9E3779B9u;
+    var rng_tap = spatial_seed;
+    var valid_n = 0u;
     for (var s = 0u; s < restir_params.spatial_samples; s = s + 1u) {
-        let off = sample_disk(restir_params.spatial_radius, &rng);
+        let off = sample_disk(restir_params.spatial_radius, &rng_tap);
         let npix = vec2<i32>(pix) + vec2<i32>(i32(round(off.x)), i32(round(off.y)));
-        if (npix.x < 0 || npix.y < 0 || npix.x >= i32(vp.x) || npix.y >= i32(vp.y)) {
-            continue;
-        }
+        if (npix.x < 0 || npix.y < 0 || npix.x >= i32(vp.x) || npix.y >= i32(vp.y)) { continue; }
         let nidx = u32(npix.y) * vp.x + u32(npix.x);
-        if (nidx == idx) { continue; } // skip self (already the starting reservoir)
+        if (nidx == idx) { continue; }
         let nsurf = surfaces_cur[nidx];
         if (nsurf.valid > 0.5 && !surfaces_dissimilar(p, n, nsurf.world_position, nsurf.world_normal)) {
-            var nres = reservoirs_b[nidx];
-            nres.confidence_weight = min(nres.confidence_weight, restir_params.confidence_weight_cap);
-            let merged =
-                merge_reservoirs(res, p, n, brdf, nres, nsurf.world_position, nsurf.world_normal, brdf, &rng);
-            res = merged.merged_reservoir;
-            break; // one neighbour only — temporal accumulation provides the rest
+            valid_n = valid_n + 1u;
         }
+    }
+    if (valid_n > 0u) {
+        let nf = f32(valid_n);
+        var weight_sum = 0.0;
+        var sel_target = 0.0;
+        var m_total = 0.0;
+        var canonical_weight = 0.0;
+        var sel_pos = canonical.sample_point_world_position;
+        var sel_nrm = canonical.sample_point_world_normal;
+        var sel_rad = canonical.radiance;
+        rng_tap = spatial_seed;          // re-seed → identical tap sequence
+        var rng_sel = seed ^ 0x68E31DA4u; // independent selection stream
+        for (var s = 0u; s < restir_params.spatial_samples; s = s + 1u) {
+            let off = sample_disk(restir_params.spatial_radius, &rng_tap);
+            let npix = vec2<i32>(pix) + vec2<i32>(i32(round(off.x)), i32(round(off.y)));
+            if (npix.x < 0 || npix.y < 0 || npix.x >= i32(vp.x) || npix.y >= i32(vp.y)) { continue; }
+            let nidx = u32(npix.y) * vp.x + u32(npix.x);
+            if (nidx == idx) { continue; }
+            let nsurf = surfaces_cur[nidx];
+            if (!(nsurf.valid > 0.5) || surfaces_dissimilar(p, n, nsurf.world_position, nsurf.world_normal)) { continue; }
+            let nb = reservoirs_b[nidx];
+            let m_i = min(nb.confidence_weight, restir_params.confidence_weight_cap);
+            let nb_pos = nsurf.world_position;
+            let nb_n = nsurf.world_normal;
+            // Four target evaluations; the Jacobian multiplies the two CROSS-receiver shifts only.
+            let p_nn = restir_target_at(nb.radiance, nb.sample_point_world_position, nb_pos, nb_n);          // neighbour@neighbour
+            let j_n = restir_jacobian(p, nb_pos, nb.sample_point_world_position, nb.sample_point_world_normal);
+            let p_nc = restir_target_at(nb.radiance, nb.sample_point_world_position, p, n) * j_n;            // neighbour@canonical
+            let j_c = restir_jacobian(nb_pos, p, canonical.sample_point_world_position, canonical.sample_point_world_normal);
+            let p_cn = restir_target_at(canonical.radiance, canonical.sample_point_world_position, nb_pos, nb_n) * j_c; // canonical@neighbour
+            let w0 = pairwise_mis(p_nn, p_nc, m_i * nf, m_c); // neighbour's MIS weight
+            let w1 = pairwise_mis(p_cn, p_cc, m_i * nf, m_c); // canonical's per-pair share complement
+            // Stream the neighbour (ris = m_i_weight · W_i · p̂_c(X_i)).
+            let ris = w0 * nb.unbiased_contribution_weight * p_nc;
+            weight_sum = weight_sum + ris;
+            m_total = m_total + m_i * min(mis_m_factor(p_nn, p_nc), mis_m_factor(p_cn, p_cc));
+            if (rand_next(&rng_sel) * weight_sum < ris) {
+                sel_pos = nb.sample_point_world_position;
+                sel_nrm = nb.sample_point_world_normal;
+                sel_rad = nb.radiance;
+                sel_target = p_nc;
+            }
+            canonical_weight = canonical_weight + (1.0 - w1);
+        }
+        // Stream the canonical LAST (its MIS weight = the accumulated per-pair shares).
+        let ris_c = canonical_weight * canonical.unbiased_contribution_weight * p_cc;
+        weight_sum = weight_sum + ris_c;
+        m_total = m_total + m_c;
+        if (rand_next(&rng_sel) * weight_sum < ris_c) {
+            sel_pos = canonical.sample_point_world_position;
+            sel_nrm = canonical.sample_point_world_normal;
+            sel_rad = canonical.radiance;
+            sel_target = p_cc;
+        }
+        res.sample_point_world_position = sel_pos;
+        res.sample_point_world_normal = sel_nrm;
+        res.radiance = sel_rad;
+        res.confidence_weight = m_total;
+        res.weight_sum = weight_sum;
+        // Unbiased ucw: weight_sum / (p̂_selected · n)  — the `1/n` removes the `M_i·n` spread in the balance.
+        res.unbiased_contribution_weight = select(0.0, weight_sum / (sel_target * nf), sel_target > 0.0);
     }
 
     // Store the UNBIASED reservoir (true ucw) BEFORE the visibility test — Solari's unbiased path. The stored
@@ -1704,9 +2132,13 @@ fn shade_restir_p2(albedo: vec3<f32>, n: vec3<f32>, p: vec3<f32>, emissive: vec3
     }
     let direct = light.sun_color * (light.sun_intensity * ndotl * shadow);
     let indirect = restir_p2_core(n, p, pix, seed) * albedo;
+    // GI 4.0: DIRECT emissive-voxel light via screen-space ReSTIR DI (low variance — resampled + reused +
+    // visibility-checked), replacing the high-variance `emissive(hit)`-via-random-bounce. `di_p2_core` returns
+    // the reflected E (brdf factored out), so apply the receiver albedo here like the sun direct. 0 when DI off.
+    let direct_emitter = di_p2_core(n, p, pix, seed);
     let glow = emissive * light.emissive_strength;
     // No flat ambient (see `shade`): the ReSTIR GI provides the fill; occluded → dark, matching Solari.
-    return albedo * direct + indirect + glow;
+    return albedo * (direct + direct_emitter) + indirect + glow;
 }
 
 // Screen-space reprojection: the previous-frame pixel that the world point `p` projected to, using the
@@ -1744,6 +2176,7 @@ fn restir_p1(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (gid.x >= camera.viewport.x || gid.y >= camera.viewport.y) { return; }
     let idx = gid.y * camera.viewport.x + gid.x;
     reservoirs_b[idx] = empty_reservoir(); // default for misses / debug; overwritten for lit hits
+    di_reservoirs_b[idx] = di_empty();     // DI default for misses
     surfaces_cur[idx] = PixelSurface(vec3<f32>(0.0), 0.0, vec3<f32>(0.0), 0.0); // invalid until a lit hit
     let ray = restir_primary_ray(gid);
     let r = trace(ray[0], ray[1], 0.0, camera.t_max);
@@ -1752,6 +2185,7 @@ fn restir_p1(@builtin(global_invocation_id) gid: vec3<u32>) {
         let seed = (gid.x * 1973u + gid.y * 9277u + light.frame_index * 26699u) | 1u;
         let temporal_base = reproject_pixel(p, camera.prev_clip_from_world, camera.viewport);
         restir_p1_core(r.normal, p, gid.xy, temporal_base, seed);
+        di_p1_core(r.normal, p, gid.xy, temporal_base, seed);
     }
 }
 
@@ -1762,6 +2196,7 @@ fn restir_dlss_p1(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (gid.x >= camera.viewport.x || gid.y >= camera.viewport.y) { return; }
     let idx = gid.y * camera.viewport.x + gid.x;
     reservoirs_b[idx] = empty_reservoir();
+    di_reservoirs_b[idx] = di_empty();
     surfaces_cur[idx] = PixelSurface(vec3<f32>(0.0), 0.0, vec3<f32>(0.0), 0.0);
     let ray = restir_primary_ray(gid);
     let r = trace(ray[0], ray[1], 0.0, camera.t_max);
@@ -1770,6 +2205,7 @@ fn restir_dlss_p1(@builtin(global_invocation_id) gid: vec3<u32>) {
         let seed = (gid.x * 1973u + gid.y * 9277u + light.frame_index * 26699u) | 1u;
         let temporal_base = reproject_pixel(p, dlss_cam.motion_prev, camera.viewport);
         restir_p1_core(r.normal, p, gid.xy, temporal_base, seed);
+        di_p1_core(r.normal, p, gid.xy, temporal_base, seed);
     }
 }
 
@@ -1785,6 +2221,7 @@ fn restir_p2(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (gid.x >= camera.viewport.x || gid.y >= camera.viewport.y) { return; }
     let idx = gid.y * camera.viewport.x + gid.x;
     reservoirs_a[idx] = empty_reservoir(); // default for misses / debug; overwritten for lit hits
+    di_reservoirs_a[idx] = di_empty();
     let ray = restir_primary_ray(gid);
     let ro = ray[0];
     let rd = ray[1];
@@ -1798,6 +2235,10 @@ fn restir_p2(@builtin(global_invocation_id) gid: vec3<u32>) {
             let p = ro + rd * r.t;
             let seed = (gid.x * 1973u + gid.y * 9277u + light.frame_index * 26699u) | 1u;
             gi = restir_p2_core(r.normal, p, gid.xy, seed); // GI-only debug = reservoir estimate
+        } else if (r.hit != 0u && light.debug_view == 8u) {
+            let p = ro + rd * r.t;
+            let seed = (gid.x * 1973u + gid.y * 9277u + light.frame_index * 26699u) | 1u;
+            gi = di_p2_core(r.normal, p, gid.xy, seed); // DI-only debug = the direct-emitter reservoir estimate
         }
         textureStore(out_tex, dpx, vec4<f32>(debug_overlay_color(r, ro, rd, gi), 1.0));
         return;
@@ -1826,6 +2267,7 @@ fn restir_dlss_p2(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (gid.x >= camera.viewport.x || gid.y >= camera.viewport.y) { return; }
     let idx = gid.y * camera.viewport.x + gid.x;
     reservoirs_a[idx] = empty_reservoir();
+    di_reservoirs_a[idx] = di_empty();
     let px = vec2<i32>(i32(gid.x), i32(gid.y));
     let ray = restir_primary_ray(gid);
     let ro = ray[0];
@@ -1837,8 +2279,13 @@ fn restir_dlss_p2(@builtin(global_invocation_id) gid: vec3<u32>) {
         let lit = shade_restir_p2(r.color.rgb, r.normal, p, r.emissive, gid.xy, seed);
         textureStore(out_tex, px, vec4<f32>(lit, 1.0));
         textureStore(out_diffuse_albedo, px, vec4<f32>(r.color.rgb, 1.0));
-        textureStore(out_specular_albedo, px, vec4<f32>(vec3<f32>(0.04), 1.0));
-        textureStore(out_normal_roughness, px, vec4<f32>(r.normal, 1.0));
+        // Specular albedo = 0: this renderer shades DIFFUSE-only (sun direct + ReSTIR GI + DI + emissive, no
+        // specular lobe — see `shade_restir_p2`). The old constant 0.04 told DLSS-RR a dielectric specular lobe
+        // existed and made it demodulate the noisy color by (diffuse + 0.04) instead of diffuse alone — a large
+        // error on DARK surfaces (albedo 0.04 ⇒ divide by 0.08 ⇒ half the lighting attributed), so RR denoised
+        // an inconsistent signal. 0 makes the guide match the actual diffuse-only color: color/albedo = lighting.
+        textureStore(out_specular_albedo, px, vec4<f32>(vec3<f32>(0.0), 1.0));
+        textureStore(out_normal_roughness, px, vec4<f32>(r.normal, 1.0)); // roughness 1.0 (.w): fully diffuse
         // Depth JITTERED (matches the jittered depth prepass); motion UN-JITTERED (geometry only — DLSS adds
         // the jitter), `(cur − prev)·(0.5,−0.5)`. Jittered motion would double-count jitter ⇒ a sub-pixel shake.
         let depth_clip = dlss_cam.depth_clip_from_world * vec4<f32>(p, 1.0);
@@ -1863,13 +2310,31 @@ fn restir_dlss_p2(@builtin(global_invocation_id) gid: vec3<u32>) {
     // `debug_overlay_color` SSOT; GI-only uses the reservoir estimate `restir_p2_core` (matches `restir_p2`).
     // This is the fix for "debug views stopped working" — the default DLSS path ignored `debug_view`.
     if (light.debug_view != 0u) {
-        var gi = vec3<f32>(0.0);
-        if (r.hit != 0u && light.debug_view == 5u) {
+        var dbg: vec3<f32>;
+        // debug_view 9 = DLSS MOTION-VECTOR magnitude in PIXELS (RR-diagnostic): the per-pixel guide motion
+        // scaled by the viewport → 1.0 (white) per pixel of screen motion. On a STATIC camera this MUST be
+        // BLACK everywhere; any non-black means our motion guide is non-zero when it shouldn't be, which makes
+        // DLSS-RR reject history (the "boils even when static under RR" symptom). Red = X motion, green = Y.
+        if (light.debug_view == 9u && r.hit != 0u) {
             let p = ro + rd * r.t;
-            let seed = (gid.x * 1973u + gid.y * 9277u + light.frame_index * 26699u) | 1u;
-            gi = restir_p2_core(r.normal, p, gid.xy, seed);
+            let prev_clip = dlss_cam.motion_prev * vec4<f32>(p, 1.0);
+            let cur_clip = dlss_cam.motion_cur * vec4<f32>(p, 1.0);
+            let mv = (cur_clip.xy / cur_clip.w - prev_clip.xy / prev_clip.w) * vec2<f32>(0.5, -0.5);
+            let mpix = abs(mv) * vec2<f32>(camera.viewport);
+            dbg = vec3<f32>(mpix.x, mpix.y, 0.0);
+        } else {
+            var gi = vec3<f32>(0.0);
+            if (r.hit != 0u && light.debug_view == 5u) {
+                let p = ro + rd * r.t;
+                let seed = (gid.x * 1973u + gid.y * 9277u + light.frame_index * 26699u) | 1u;
+                gi = restir_p2_core(r.normal, p, gid.xy, seed);
+            } else if (r.hit != 0u && light.debug_view == 8u) {
+                let p = ro + rd * r.t;
+                let seed = (gid.x * 1973u + gid.y * 9277u + light.frame_index * 26699u) | 1u;
+                gi = di_p2_core(r.normal, p, gid.xy, seed);
+            }
+            dbg = debug_overlay_color(r, ro, rd, gi);
         }
-        let dbg = debug_overlay_color(r, ro, rd, gi);
         textureStore(out_tex, px, vec4<f32>(dbg, 1.0));
         textureStore(out_diffuse_albedo, px, vec4<f32>(dbg, 1.0));
         textureStore(out_specular_albedo, px, vec4<f32>(vec3<f32>(0.0), 1.0));
@@ -2363,6 +2828,26 @@ fn wc_bounce_emitter_mis(n: vec3<f32>, hit_t: f32, dir: vec3<f32>) -> f32 {
     return balance_heuristic(p_bounce, p_light);
 }
 
+// (GI 5.0) The cell's OWN direct SUN — a delta next-event sample folded into the cache so the GI consumer reads
+// the bounce-hit's sun from the (multi-frame-averaged) cache instead of recomputing the hard sun-shadow FRESH
+// per frame (Solari `sample_di`; the boil fix). One shadow ray from the cell toward the sun; 0 where the face
+// points away or the sun is occluded. CONVENTION: returns the SAME quantity `direct_lighting` uses
+// (sun_color·intensity·cosθ·shadow, NO 1/π — the engine's whole direct path omits it), so `albedo·cache`
+// reproduces the old `direct_lighting` term and the brightness is unchanged. No MIS partner: the sun is a delta
+// light and GI bounces use `sky_radiance_no_sun`, so the cosine bounce never also samples it (no double-count).
+fn wc_sun_direct(world_position: vec3<f32>, n: vec3<f32>) -> vec3<f32> {
+    let to_sun = -light.sun_direction;
+    let ndotl = max(dot(n, to_sun), 0.0);
+    if (ndotl <= 0.0) {
+        return vec3<f32>(0.0);
+    }
+    let origin = world_position + n * light.shadow_bias;
+    if (trace_occluded(origin, to_sun, 0.0, 1.0e4)) {
+        return vec3<f32>(0.0);
+    }
+    return light.sun_color * (light.sun_intensity * ndotl);
+}
+
 // PASS 5 — UPDATE (indirect, one thread per ACTIVE cell). ADAPTATION (Phase 2.5: NEE light list): trace ONE
 // cosine-weighted hemisphere bounce from the cell's stored (pos,normal); the sample radiance = direct lighting
 // at the hit + the hit's emissive glow (MIS-weighted), or the procedural sky (the 1A SSOT) on a miss; PLUS a
@@ -2405,32 +2890,36 @@ fn world_cache_update(@builtin(global_invocation_id) active_cell_id: vec3<u32>) 
 
     let origin = geo.world_position + n * light.shadow_bias;
     let hit = trace(origin, dir, 0.0, wc.gi_ray_distance);
+    // INDIRECT (Solari `sample_gi`): the radiance arriving at THIS cell from one cosine bounce = the bounce-hit's
+    // OUTGOING radiance, read from the cache (`emissive(hit)·mis + albedo·cache(hit)`), NOT a fresh
+    // `direct_lighting(hit)`. The hit's own direct (sun via its `wc_sun_direct`, emitters via its NEE) lives in
+    // cache(hit), so the hard sun-shadow is averaged in the cache instead of re-rolled per frame (the boil fix —
+    // GI 5.0; see `reservoir_from_bounce_cached`).
     var radiance: vec3<f32>;
     if (hit.hit != 0u) {
         let hp = origin + dir * hit.t;
-        // The bounce-hit surface's emissive is ONE of the two estimators of the emitter contribution; weight it
-        // by the MIS bounce-share so it isn't double-counted against NEE (`wc_bounce_emitter_mis` returns 1 when
-        // NEE is off / no lights, recovering the pre-2.5 full emitter term). `direct_lighting` (sun/ambient) is
-        // NOT an emitter term, so it is unweighted.
         let emit_mis = wc_bounce_emitter_mis(n, hit.t, dir);
-        radiance = direct_lighting(hit.color.rgb, hit.normal, hp)
-            + hit.emissive * (light.emissive_strength * emit_mis);
-        // Feed-forward multi-bounce: add the reflected indirect the cache already holds for the hit surface.
-        // `query_world_cache` reads LAST frame's blended radiance (this pass only writes `new_radiance`), so
-        // there is no in-frame recursion; the recursion unrolls one bounce per frame and is stabilised by the
-        // temporal blend. Albedo only (cosine-pre-divided cache convention), mirroring the 2.2 consumer.
+        radiance = hit.emissive * (light.emissive_strength * emit_mis);
+        // Feed-forward multi-bounce: the reflected light the cache holds for the hit (includes the hit's own
+        // direct via its sample_di). Reads LAST frame's blended radiance (no in-frame recursion). With it OFF the
+        // cell still gets its OWN direct (sample_di below) + the hit's emitter glow; the diffuse-sun first bounce
+        // flows via cache(hit) when ON. Albedo only (cosine-pre-divided cache convention).
         if (wc.gi_multibounce != 0u) {
             let cell_life = atomicLoad(&world_cache_life[cell_index]);
             radiance += hit.color.rgb * query_world_cache(hp, hit.normal, wc_view_position(), hit.t, cell_life, &rng);
         }
     } else {
-        radiance = sky_radiance(dir) * sky.gi_sky_intensity;
+        // GI-bounce miss → sky GRADIENT only (sun disk excluded — the sun is handled by `wc_sun_direct`).
+        radiance = sky_radiance_no_sun(dir) * sky.gi_sky_intensity;
     }
 
-    // Phase 2.5 NEE: add the DIRECT emissive-voxel light sample(s), MIS-balanced against the bounce above so the
-    // emitter contribution is unbiased + low-variance with no double-count. Averaged over `nee_samples` shadow
-    // rays (≥1) so a cell can pull down the direct-light variance further at a linear cost. Skipped cleanly when
-    // NEE is off or there are no lights (`wc_sample_light_nee` returns 0).
+    // DIRECT at the cell (Solari `sample_di`), folded into the cache so the GI consumer reads it smoothed: the
+    // SUN as a delta next-event sample (`wc_sun_direct`) + the emissive-voxel NEE below. The sun term is THE one
+    // that, recomputed fresh at the GI bounce hit, produced the sun/sky-lit boil; storing it in the multi-frame-
+    // averaged cache is the fix.
+    radiance += wc_sun_direct(geo.world_position, n);
+
+    // Phase 2.5 NEE: add the DIRECT emissive-voxel light sample(s), MIS-balanced against the bounce above.
     if (wc.nee_enabled != 0u && wc.light_count != 0u) {
         let ns = max(wc.nee_samples, 1u);
         var nee = vec3<f32>(0.0);
@@ -2599,7 +3088,7 @@ fn world_cache_energy_probe(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     // The two REAL builders, same shading point + bounce direction (so they differ only by the cache term).
     let off = reservoir_from_bounce(p, n, dir);
-    let on = reservoir_from_bounce_cached(p, n, dir, &rng);
+    let on = reservoir_from_bounce_cached(p, n, dir, false, &rng); // energy gate: DI off → keep emissive
 
     // Re-trace to recover the bounce-hit geometry the relation references (albedo + the cache cell).
     let origin = p + n * light.shadow_bias;

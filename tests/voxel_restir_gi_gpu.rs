@@ -497,12 +497,12 @@ fn restir_probe_is_valid_unbiased_and_concentrates() {
 /// `restir_dlss_p1` query the group(3) world cache, so they bind 11 storage buffers — over the default 8).
 #[test]
 fn restir_screen_space_entries_compile() {
-    // 8 storage textures (the DLSS variants write colour + 5 guides) AND 16 storage buffers: Phase 2.2's
-    // `restir_p1`/`restir_dlss_p1` query the group(3) world cache, so their auto-derived layout binds 11
-    // storage buffers (3 scene + 4 reservoir/surface + 4 cache) — over wgpu's default of 8. Mirrors the
-    // in-engine `wgpu_settings()` device.
-    let Some((device, _queue)) = common::headless_ray_query_device_with_storage(8, 16) else {
-        eprintln!("no ray-query device with 8 storage textures + 16 storage buffers — skipping restir_screen_space_entries_compile");
+    // 8 storage textures (the DLSS variants write colour + 5 guides) AND 18 storage buffers: Phase 2.2's
+    // `restir_p1`/`restir_dlss_p1` query the group(3) world cache + (GI 4.0) two DI reservoir buffers, so their
+    // auto-derived layout binds 17 storage buffers in one stage (3 scene + 6 reservoir/surface/DI + 8 cache) —
+    // over wgpu's default of 8. Request 18 for headroom. Mirrors the in-engine `wgpu_settings()` device.
+    let Some((device, _queue)) = common::headless_ray_query_device_with_storage(8, 18) else {
+        eprintln!("no ray-query device with 8 storage textures + 18 storage buffers — skipping restir_screen_space_entries_compile");
         return;
     };
     let src = common::voxel_raytrace_shader_src();
