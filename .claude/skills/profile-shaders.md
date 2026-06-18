@@ -45,6 +45,14 @@ cargo build --no-default-features --features editor,shader-debug
 powershell -ExecutionPolicy Bypass -File rdoc/scripts/ngfx/capture.ps1   # [-Frames 240] [-Out .soul/ngfx]
 python rdoc/scripts/ngfx/parse.py .soul/ngfx                            # -> .soul/ngfx/perf.json + summary
 ```
+
+**Pin a representative viewpoint** (the default boot camera is cheap / not inside the scene, so its numbers
+UNDERCOUNT). Fly to the view in the editor, press **F8** (logs `ADVENTURE_CAM=ex,ey,ez,lx,ly,lz`, eye+look_at),
+then pass it to `-Cam` — this boots the in-RAM Sponza bench with the camera pinned each frame:
+```sh
+powershell -ExecutionPolicy Bypass -File rdoc/scripts/ngfx/capture.ps1 -Cam "ex,ey,ez,lx,ly,lz"
+```
+Without `-Cam` the capture uses the default camera (fine for A/B *deltas* on the same view, wrong for absolute cost).
 `capture.ps1` injects via `ngfx --activity "GPU Trace Profiler"`, waits `-Frames` frames so
 the scene settles, traces 1 frame with the SM hardware sampling profiler, auto-exports the
 `BASE/*.xls` TSVs, and the app self-terminates (`ADVENTURE_EXIT_AFTER_FRAMES`, set by the

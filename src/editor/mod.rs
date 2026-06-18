@@ -78,7 +78,7 @@ impl Plugin for EditorPlugin {
             render_panel::render_gi_panel,
         );
 
-        // F6 toggles chrome-trace capture (global).
-        app.add_systems(Update, chrome_trace::toggle_on_f6);
+        // F6 toggles chrome-trace capture; F8 logs the live camera as an `ADVENTURE_CAM=…` bench pin (global).
+        app.add_systems(Update, (chrome_trace::toggle_on_f6, chrome_trace::log_camera_on_f8));
     }
 }
