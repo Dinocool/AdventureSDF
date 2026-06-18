@@ -1,5 +1,6 @@
 pub mod assets;
 pub mod camera;
+pub mod dev_flycam;
 // Legacy WoW gameplay modules — removed in the voxel-RT rebuild (kept on disk, off compilation).
 // pub mod combat;
 pub mod gizmo_render;

@@ -219,9 +219,16 @@ fn fill_halo(neighbour_base: u32, li: u32) {
         let in_core = (cx >= 0 && cx < BRICK_EDGE) && (cy >= 0 && cy < BRICK_EDGE) && (cz >= 0 && cz < BRICK_EDGE);
         var block: u32 = 0u; // AIR default (BlockId::AIR == 0)
         if (in_core) {
-            // The centre core is neighbour slot 13 = (0+1)*9 + (0+1)*3 + (0+1).
+            // The centre core is neighbour slot 13 = (0+1)*9 + (0+1)*3 + (0+1). GUARD it for NEIGHBOUR_ABSENT just
+            // like the border neighbours below: a resident brick can still have an UNPAGED core (the demand pager
+            // hasn't supplied it yet under fast motion), in which case `core_lookup` returned NEIGHBOUR_ABSENT. Reading
+            // `cores[NEIGHBOUR_ABSENT * …]` would fetch out-of-bounds garbage → garbage block ids → a BLACK cube. So
+            // an absent centre core packs as AIR (the brick is transparent / a 1-frame hole until its core pages in),
+            // never black.
             let core = neighbour_indices[neighbour_base + 13u];
-            block = cores[core * CORE_CELLS + voxel_index(cx, cy, cz)];
+            if (core != NEIGHBOUR_ABSENT) {
+                block = cores[core * CORE_CELLS + voxel_index(cx, cy, cz)];
+            }
         } else {
             // Resolve the owning same-LOD neighbour (mirror of `neighbour_border_cell`).
             let dx = nbr_off(cx);

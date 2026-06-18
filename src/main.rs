@@ -202,6 +202,7 @@ fn main() {
     // soul-scene format, node tree, gizmo overlay, free-fly camera + worldgen) is registered here.
     app.add_plugins(default_plugins)
     .add_plugins(WireframePlugin::default())
+    .add_plugins(adventure::dev_flycam::DevFlycamPlugin)
     .add_plugins(adventure::node::NodePlugin)
     .add_plugins(adventure::scene_manager::SceneManagerPlugin)
     .add_plugins(adventure::soul_scene::SoulScenePlugin)
