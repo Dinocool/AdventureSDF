@@ -1189,6 +1189,14 @@ fn balance_heuristic(a: f32, b: f32) -> f32 {
 
 fn restir_isinf(x: f32) -> bool { return (bitcast<u32>(x) & 0x7fffffffu) == 0x7f800000u; }
 fn restir_isnan(x: f32) -> bool { return (bitcast<u32>(x) & 0x7fffffffu) > 0x7f800000u; }
+// Replace any NaN/Inf component of a radiance triple with 0 — a robustness chokepoint so a single bad value
+// (a div-by-near-zero, a coincident-point normalize, a degenerate cache cell) can NEVER be STORED into a
+// reservoir / the world cache (where it would poison spatial+temporal neighbours forever) or reach out_tex.
+fn sanitize3(v: vec3<f32>) -> vec3<f32> {
+    let bad = restir_isnan(v.x) || restir_isnan(v.y) || restir_isnan(v.z) ||
+              restir_isinf(v.x) || restir_isinf(v.y) || restir_isinf(v.z);
+    return select(v, vec3<f32>(0.0), bad);
+}
 
 // A mutating PCG RNG (ReSTIR needs a stream: candidate dir + stochastic reservoir selection + neighbours).
 fn rand_next(rng: ptr<function, u32>) -> f32 {
@@ -1442,7 +1450,9 @@ fn restir_resolve_irradiance(res: Reservoir, recv_pos: vec3<f32>, recv_normal: v
     if (res.confidence_weight <= 0.0) { return vec3<f32>(0.0); }
     let wi = normalize(res.sample_point_world_position - recv_pos);
     let cos = saturate(dot(wi, recv_normal));
-    return res.radiance * res.unbiased_contribution_weight * cos * (1.0 / RESTIR_PI) * light.gi_intensity;
+    // Backstop: guard radiance (only `unbiased_contribution_weight` is checked at the merge sites) so a NaN/Inf
+    // radiance × a finite weight can't reach out_tex or DLSS-RR (which would smear the firefly across the frame).
+    return sanitize3(res.radiance * res.unbiased_contribution_weight * cos * (1.0 / RESTIR_PI) * light.gi_intensity);
 }
 
 // --- R0 headless probe test entry -------------------------------------------------------------------
@@ -1538,7 +1548,12 @@ struct RestirParams {
     gi_half: u32,
     gi_half_x: u32,
     gi_half_y: u32,
-    _pad2: u32,
+    // Caps the view-distance used in `surfaces_dissimilar`'s RELATIVE tangent-plane reject (0 = uncapped / pure
+    // Solari). Beyond this distance the threshold stops loosening, becoming an ABSOLUTE tangent cap
+    // (≈ 0.003·cap_dist) — which rejects far-side-of-a-thin-wall spatial-reuse neighbours that the relative test
+    // lets through at distance (GI leaking through thin walls). Tunable: lower = catches thinner walls farther
+    // out but risks over-rejecting genuine slope reuse; raise toward off if it adds boil on terrain.
+    gi_dissim_cap_dist: f32,
     _pad3: u32,
 };
 // Per-pixel RECEIVER surface (world pos + face normal) — needed so a temporal/neighbour reservoir can be
@@ -1794,7 +1809,7 @@ fn di_p2_core(n: vec3<f32>, p: vec3<f32>, pix: vec2<u32>, seed: u32) -> vec3<f32
     let c = di_contribution(smp, p, n);
     let vis = di_visibility(p, n, smp.pos, res.light_index);
     // E estimate × visibility. `c.radiance` already folds cos_recv/dist²·inv_pdf·emissive_strength (no /π).
-    return c.radiance * (res.unbiased_contribution_weight * vis) * light.gi_intensity;
+    return sanitize3(c.radiance * (res.unbiased_contribution_weight * vis) * light.gi_intensity);
 }
 
 // Frame-dependent in-4×4-block pixel shuffle (Solari `permute_pixel`). Decorrelates the temporal tap so a
@@ -1815,7 +1830,10 @@ fn permute_pixel(pixel_id: vec2<u32>, frame_index: u32, vp: vec2<u32>) -> vec2<u
 // wall/face (smooths grain) but never leaks GI across depth/normal edges.
 fn surfaces_dissimilar(p: vec3<f32>, n: vec3<f32>, op: vec3<f32>, on: vec3<f32>) -> bool {
     let tangent_plane_distance = abs(dot(n, op - p));
-    let view_dist = max(length(p - camera.cam_pos), 1.0e-3);
+    // Cap the view-distance (if `gi_dissim_cap_dist > 0`) so the relative tangent threshold becomes ABSOLUTE
+    // beyond that range — closes the thin-wall reuse leak at distance (see the field doc). 0 = uncapped Solari.
+    let cap = select(1.0e30, restir_params.gi_dissim_cap_dist, restir_params.gi_dissim_cap_dist > 0.0);
+    let view_dist = clamp(length(p - camera.cam_pos), 1.0e-3, cap);
     // Solari thresholds (gbuffer_utils.wgsl:45 parity): reject if the neighbour is >0.3% of view-distance out
     // of the tangent plane, or its normal is >90° away (`dot < 0`).
     //
@@ -1825,10 +1843,10 @@ fn surfaces_dissimilar(p: vec3<f32>, n: vec3<f32>, op: vec3<f32>, on: vec3<f32>)
     // reach) a far-side-of-a-thin-wall neighbour is NOT rejected by this test → ReSTIR spatial reuse can leak GI
     // across a thin wall at distance. The world-cache thin-wall leak is handled at its source by the first-bounce
     // cell-size clamp in `query_world_cache`; this ReSTIR-reuse leak is a SEPARATE, currently-unguarded path.
-    // We deliberately do NOT blind-tune the canonical Solari threshold here — an absolute thin-wall cap risks
-    // over-rejecting genuinely co-planar same-surface reuse (INCREASING boil) and needs a MEASURED value (see
-    // the voxel-rt-gi-noise 2.2.1 lessons). Left as a documented follow-up:
-    // TODO(D-GI): thin-wall reuse leak at distance under the 64 m reach — needs a measured absolute threshold cap.
+    // The `gi_dissim_cap_dist` clamp above turns the relative threshold into an absolute tangent cap beyond that
+    // range (≈0.003·cap), closing this leak. It's a TUNABLE (editor slider) defaulted conservatively, because an
+    // absolute cap can over-reject genuine co-planar/slope reuse (increasing boil) — so the value wants eyeballing
+    // on terrain (the voxel-rt-gi-noise 2.2.1 lessons); 0 restores the pure-Solari uncapped behaviour.
     return tangent_plane_distance / view_dist > 0.003 || dot(n, on) < 0.0;
 }
 
@@ -2098,7 +2116,9 @@ fn restir_p2_core(n: vec3<f32>, p: vec3<f32>, pix: vec2<u32>, seed: u32) -> vec3
         res.confidence_weight = m_total;
         res.weight_sum = weight_sum;
         // Unbiased ucw: weight_sum / (p̂_selected · n)  — the `1/n` removes the `M_i·n` spread in the balance.
-        res.unbiased_contribution_weight = select(0.0, weight_sum / (sel_target * nf), sel_target > 0.0);
+        // Floor the divisor: a grazing-angle selected sample gives a tiny-but-positive denormal `sel_target` that
+        // passes `> 0` yet makes a huge finite ucw spike (a firefly the NaN/Inf guards don't catch). `1e-12` caps it.
+        res.unbiased_contribution_weight = select(0.0, weight_sum / max(sel_target * nf, 1e-12), sel_target > 0.0);
     }
 
     // Store the UNBIASED reservoir (true ucw) BEFORE the visibility test — Solari's unbiased path. The stored
@@ -2883,7 +2903,19 @@ fn wc_get_cell_size(world_position: vec3<f32>, view_position: vec3<f32>, rng: pt
 }
 
 fn wc_quantize_position(world_position: vec3<f32>, quantization_factor: f32) -> vec3<f32> {
-    return floor(world_position / quantization_factor + 0.0001);
+    // CAMERA-RELATIVE quantization: `floor(world_position/qf + eps)` directly loses f32 precision when the world
+    // coordinate is large (a streamed scene placed far from the origin) — the `world/qf` dividend exceeds the f32
+    // integer-exact range and adjacent fine cells collapse / the eps bias is lost, leaking GI across the hash.
+    // Computing the cell index RELATIVE to the camera's cell keeps the dividend small (≈ view radius / qf), so
+    // precision holds near the camera (where the fine cells live) regardless of absolute world position. The key
+    // is algebraically identical (`cam_cell + floor(local) == floor(world/qf)`), so cells stay world-stable as
+    // the camera moves. (Full precision at >~1e5 m still needs CPU-side f64 world-rebasing; this is the GPU-side
+    // mitigation that covers the realistic streamed-scene range.)
+    // Use `wc.view_*` (the cache uniform's camera position) NOT `camera.cam_pos`: the world-cache compute passes
+    // bind the cache uniform (group 3) but NOT the camera uniform (group 1), and they call this too.
+    let cam = vec3<f32>(wc.view_x, wc.view_y, wc.view_z);
+    let cam_cell = floor(cam / quantization_factor);
+    return cam_cell + floor((world_position - cam_cell * quantization_factor) / quantization_factor + 0.0001);
 }
 
 fn wc_quantize_normal(world_normal: vec3<f32>) -> vec3<f32> {
@@ -3297,7 +3329,9 @@ fn world_cache_update(@builtin(global_invocation_id) active_cell_id: vec3<u32>) 
         radiance += nee / f32(ns);
     }
 
-    world_cache_active_cells_new_radiance[active_cell_id.x] = radiance;
+    // Finite-guard: a NEE near-singularity or degenerate bounce must never write a NaN/Inf cell — a poisoned
+    // cell is read by every querier and (since an actively-queried cell never decays) would persist forever.
+    world_cache_active_cells_new_radiance[active_cell_id.x] = sanitize3(radiance);
 }
 
 // PASS 6 — BLEND (indirect, one thread per ACTIVE cell). Solari's adaptive temporal blend: an exponential
@@ -3327,7 +3361,7 @@ fn world_cache_blend(@builtin(global_invocation_id) active_cell_id: vec3<u32>) {
         blend_amount = 1.0;
     }
 
-    let blended_radiance = mix(old_radiance.rgb, new_radiance, blend_amount);
+    let blended_radiance = sanitize3(mix(old_radiance.rgb, new_radiance, blend_amount));
     let new_delta = mix(luminance_delta, restir_luminance(blended_radiance) - restir_luminance(old_radiance.rgb), 1.0 / 8.0);
     let blended_luminance_delta = select(new_delta, 0.0, wc.reset != 0u);
 

@@ -1595,10 +1595,19 @@ struct VoxelRtResources {
     /// jittered, so the current frame's `clip_from_world` IS its un-jittered clip. `None` on the first frame
     /// (then `prev == cur`, so the reprojection returns the current pixel).
     prev_clip_from_world: Option<[[f32; 4]; 4]>,
-    /// `(viewport, built_generation)` at the last non-DLSS frame — drives the ReSTIR `reset` flag. Reset fires
-    /// ONLY on the first frame or a viewport (resolution) change; camera motion is handled by motion-vector
-    /// reprojection and an edit ADAPTS locally (never full-clears the reservoirs). `None` until the first frame.
-    restir_prev: Option<(UVec2, Option<u64>)>,
+    /// `(viewport, scene_epoch, gi_half)` at the last non-DLSS frame — drives the ReSTIR `reset` flag. Reset
+    /// fires on the first frame, a viewport (resolution) change, a SCENE SWITCH (epoch change — clears the
+    /// previous scene's stale reservoir history, which `surfaces_dissimilar` alone can let bleed through when the
+    /// new scene has similar-depth surfaces), or a half-res toggle (the reservoir buffer indexing changes).
+    /// Camera motion is handled by motion-vector reprojection and an EDIT adapts locally (epoch is unchanged on
+    /// an edit — only `generation` is — so edits still never full-clear). `None` until the first frame.
+    restir_prev: Option<(UVec2, Option<u64>, bool)>,
+    /// Previous-frame camera world position — drives the TELEPORT reservoir reset. A camera CUT/teleport (frame-
+    /// selected, scene-load reposition, a jump > [`TELEPORT_RESET_DIST`]) leaves the reservoirs reprojecting via
+    /// stale motion onto unrelated surfaces that `surfaces_dissimilar` can't all reject → a multi-frame smear
+    /// (worst under DLSS-RR, which is told `reset=false`). A big single-frame jump forces a clean reservoir reset.
+    /// Continuous motion (even fast flight, ≪ the threshold per frame) is handled by motion-vector reprojection.
+    prev_cam_pos: Option<Vec3>,
 
     // --- Phase 2.1 world-space radiance cache (PERSISTENT; allocated ONCE, never realloc'd on resize) ---
     /// The 11 persistent cache buffers + the bind group over them. The cache is WORLD-space /
@@ -1660,10 +1669,10 @@ struct VoxelRtResources {
     /// DLSS-path per-pixel surface buffers (cur/prev), sized to the full render res (like dlss_reservoirs).
     #[cfg(feature = "dlss")]
     dlss_surfaces: Option<(wgpu::Buffer, wgpu::Buffer, UVec2)>,
-    /// (render_res, clip_from_world, built_generation) at the last DLSS frame — drives the ReSTIR `reset`
-    /// (a camera move, a resolution change, or a geometry re-pack invalidates the same-pixel reservoirs).
+    /// (render_res, scene_epoch, gi_half) at the last DLSS frame — drives the ReSTIR `reset`: first frame /
+    /// resolution change / SCENE SWITCH (epoch) / half-res toggle. An edit adapts locally (epoch unchanged).
     #[cfg(feature = "dlss")]
-    dlss_restir_prev: Option<(UVec2, [[f32; 4]; 4], Option<u64>)>,
+    dlss_restir_prev: Option<(UVec2, Option<u64>, bool)>,
 }
 
 /// The persistent GPU scene objects the bind group / TLAS reference, retained so they outlive the bind group
@@ -3146,7 +3155,7 @@ struct RestirParamsData {
     gi_half: u32,
     gi_half_x: u32,
     gi_half_y: u32,
-    _pad2: u32,
+    gi_dissim_cap_dist: f32,
     _pad3: u32,
 }
 
@@ -3203,6 +3212,10 @@ pub struct RestirSettings {
     /// the half-res reservoirs to full res at shade time (re-resolved per full-res normal → stays sharp). The
     /// way to afford high M cheaply. See `docs/HALF_RES_GI_PLAN.md`.
     pub gi_half_res: bool,
+    /// View-distance cap (metres) for the `surfaces_dissimilar` tangent-plane reject (0 = uncapped / pure Solari).
+    /// Beyond this the relative threshold becomes an ABSOLUTE tangent cap (≈0.003·cap), rejecting far thin-wall
+    /// spatial-reuse leaks. Conservative default; an editor slider — raise toward off if it adds boil on slopes.
+    pub gi_dissim_cap_dist: f32,
 }
 
 impl Default for RestirSettings {
@@ -3245,6 +3258,9 @@ impl Default for RestirSettings {
             probe_oct_res: 8,
             probe_temporal: true,
             gi_half_res: false,
+            // Cap at 25 m ⇒ absolute tangent reject ≈0.075 m beyond 25 m (catches far thin-wall GI leaks with
+            // low slope-over-reject risk). 0 = pure Solari. Tunable via the editor slider.
+            gi_dissim_cap_dist: 25.0,
         }
     }
 }
@@ -4610,6 +4626,11 @@ fn resolve_stbn_view(
     view
 }
 
+/// Single-frame camera-position jump (metres) above which the ReSTIR reservoirs are force-reset (a teleport /
+/// camera cut). Far above any continuous-flight per-frame delta (~sub-metre at 60 fps), so normal motion — handled
+/// by motion-vector reprojection — never trips it; only a discontinuous jump (frame-selected, scene reposition).
+const TELEPORT_RESET_DIST: f32 = 8.0;
+
 /// [`Core3d`]/[`Core3dSystems::MainPass`]: when the toggle is on and the scene is built, dispatch the
 /// raymarch compute pass into a per-view output texture, then composite it over the [`ViewTarget`]. When
 /// off, returns immediately so the Stage-1 cubes render unchanged.
@@ -4868,12 +4889,15 @@ fn voxel_rt_pass(
     // samples, dissimilarity rejects moved surfaces) — never a full clear. This mirrors the DLSS path's
     // `reset_restir` keying. (The on-top history TEXTURE accumulator above still resets on a move/`geometry_changed`
     // — that just shows the fresh frame, it is NOT a reservoir clear.)
+    let gi_half = restir_settings.gi_half_res;
+    let cur_epoch = resources.built_epoch;
+    let teleported = resources.prev_cam_pos.is_some_and(|pp| pp.distance(cam_pos) > TELEPORT_RESET_DIST);
+    resources.prev_cam_pos = Some(cam_pos);
     let reset_restir = match resources.restir_prev {
         None => true,
-        Some((vp, _g)) => vp != viewport,
+        Some((vp, ep, gh)) => vp != viewport || ep != cur_epoch || gh != gi_half || teleported,
     };
-    resources.restir_prev = Some((viewport, cur_generation));
-    let gi_half = restir_settings.gi_half_res;
+    resources.restir_prev = Some((viewport, cur_epoch, gi_half));
     let gi_half_dims = if gi_half {
         UVec2::new(viewport.x.div_ceil(2), viewport.y.div_ceil(2))
     } else {
@@ -4894,7 +4918,7 @@ fn voxel_rt_pass(
         gi_half: u32::from(gi_half),
         gi_half_x: gi_half_dims.x,
         gi_half_y: gi_half_dims.y,
-        _pad2: 0,
+        gi_dissim_cap_dist: restir_settings.gi_dissim_cap_dist,
         _pad3: 0,
     };
     let restir_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -5413,12 +5437,17 @@ fn voxel_rt_dlss_pass(
     // the world-space reservoirs adapt locally (fresh candidates re-trace the new geometry, the visibility
     // trace drops now-occluded samples, dissimilarity rejects moved surfaces), so editing terrain makes the
     // GI smoothly follow the change over a few frames instead of full-screen clearing.
-    let built_gen = resources.built_generation;
+    // Reset on first frame / resolution change / SCENE SWITCH (epoch — clears the previous scene's stale
+    // reservoir history) / half-res toggle. An EDIT bumps `generation` not `epoch`, so edits still adapt locally.
+    let cur_epoch = resources.built_epoch;
+    let dlss_gi_half = restir_settings.gi_half_res;
+    let teleported = resources.prev_cam_pos.is_some_and(|pp| pp.distance(cam_pos) > TELEPORT_RESET_DIST);
+    resources.prev_cam_pos = Some(cam_pos);
     let reset_restir = match resources.dlss_restir_prev {
         None => true,
-        Some((r, _vp, _g)) => r != render_res,
+        Some((r, ep, gh)) => r != render_res || ep != cur_epoch || gh != dlss_gi_half || teleported,
     };
-    resources.dlss_restir_prev = Some((render_res, clip_from_world_arr, built_gen));
+    resources.dlss_restir_prev = Some((render_res, cur_epoch, dlss_gi_half));
 
     let color_view = &resources.dlss_color.as_ref().expect("just allocated").1;
     let depth_view = &resources.dlss_depth.as_ref().expect("just allocated").1;
@@ -5477,7 +5506,7 @@ fn voxel_rt_dlss_pass(
         gi_half: u32::from(dlss_gi_half),
         gi_half_x: dlss_gi_dim.x,
         gi_half_y: dlss_gi_dim.y,
-        _pad2: 0,
+        gi_dissim_cap_dist: restir_settings.gi_dissim_cap_dist,
         _pad3: 0,
     };
     let restir_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
