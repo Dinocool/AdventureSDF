@@ -230,33 +230,33 @@ fn gi_sponza_blotch() {
         );
     };
 
-    // Root-cause probe: at M=1, does raising the temporal cap / spatial samples REDUCE blotch (good — more
-    // accumulation) or INCREASE it (the correlation boil that forced the low cap)? If raising them still hurts,
-    // the reuse needs defensive/pairwise MIS before the cap can go up. M=4 baseline for the target (~0.036).
-    let set = |hr: &mut HeadlessRender, m: u32, cap: f32, sp: u32, rad: f32| {
+    // Screen-probe GI (P1/P2) vs the M4 per-pixel reference. Validate: probe luma ≈ M4 luma (energy correct, not
+    // biased) + blotch. Temporal OFF here (P1/P2) — single-frame probe variance ≥ M1; the win is the SH low-pass
+    // + (P3) temporal. M4 = the boil-free reference (~0.036).
+    let set_probe = |hr: &mut HeadlessRender, on: bool, psize: u32, oct: u32, temporal: bool| {
         *hr.app.world_mut().resource_mut::<RestirSettings>() = RestirSettings::default();
         let mut r = hr.app.world_mut().resource_mut::<RestirSettings>();
-        r.gi_initial_samples = m;
-        r.confidence_cap = cap;
-        r.spatial_samples = sp;
-        r.spatial_radius = rad;
+        r.screen_probes = on;
+        r.probe_size = psize;
+        r.probe_oct_res = oct;
+        r.probe_temporal = temporal;
+        if on {
+            r.gi_initial_samples = 1; // probes drive the diffuse GI; skip the wasted per-pixel M traces
+        }
     };
-    // Pairwise-MIS spatial check: at M=1 cap16, raising spatial samples should now REDUCE blotch (free effective
-    // samples) with STABLE luma — the OLD iterated-merge path INCREASED blotch + darkened. M4 = the target.
-    // FIXED radius 12 — isolate neighbour COUNT from radius. With pairwise MIS, more neighbors should reduce
-    // blotch with stable luma (unbiased). Luma drifting with count would flag a remaining bias.
-    set(&mut hr, 1, 16.0, 0, 12.0);
-    report(&mut hr, "M1 sp0 (no spatial)");
-    set(&mut hr, 1, 16.0, 2, 12.0);
-    report(&mut hr, "M1 sp2 r12");
-    set(&mut hr, 1, 16.0, 4, 12.0);
-    report(&mut hr, "M1 sp4 r12");
-    set(&mut hr, 1, 16.0, 8, 12.0);
-    report(&mut hr, "M1 sp8 r12");
-    set(&mut hr, 1, 16.0, 16, 12.0);
-    report(&mut hr, "M1 sp16 r12");
-    set(&mut hr, 4, 16.0, 4, 12.0);
-    report(&mut hr, "M4 sp4 (target)");
+    // M1 = the unbiased per-pixel reference (probe energy should match THIS, not the over-bright M4).
+    set_probe(&mut hr, false, 16, 8, false);
+    {
+        let mut r = hr.app.world_mut().resource_mut::<RestirSettings>();
+        r.gi_initial_samples = 1;
+    }
+    report(&mut hr, "M1 (unbiased ref)");
+    set_probe(&mut hr, true, 16, 8, false);
+    report(&mut hr, "probes 16px oct8 (no temporal)");
+    set_probe(&mut hr, true, 16, 8, true);
+    report(&mut hr, "probes 16px oct8 +temporal");
+    set_probe(&mut hr, true, 8, 8, true);
+    report(&mut hr, "probes 8px oct8 +temporal");
 }
 
 /// **Blotch sweep** — measures BOTH the fine per-pixel grain (`boil_stats`) AND the low-freq blotch

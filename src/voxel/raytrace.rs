@@ -1413,6 +1413,13 @@ struct VoxelRtPipelines {
     /// A 1×1 `D2Array` fallback bound to reservoir binding 7 when the real STBN texture isn't resident yet
     /// (the shader's `dims > 1` guard then uses white noise). Created once — the texture never changes.
     stbn_dummy_view: wgpu::TextureView,
+    /// `group(4)` screen-probe layout: probe params uniform + headers + SH current + SH history. Bound to the
+    /// restir pipeline layouts (so `shade_restir_p2` reads the SH) and used by `screen_probe_trace`.
+    probe_layout: wgpu::BindGroupLayout,
+    /// Screen-probe trace+SH pass (one thread per probe), non-DLSS / DLSS variants (share the WGSL entry).
+    probe_trace: wgpu::ComputePipeline,
+    #[cfg(feature = "dlss")]
+    probe_trace_dlss: wgpu::ComputePipeline,
     /// The `raymarch` compute pipeline (legacy `gather_gi` GI). Dispatched when `RestirSettings.restir` is
     /// off — the `gi_mode` A/B toggle (legacy vs ReSTIR in one build).
     raymarch: wgpu::ComputePipeline,
@@ -1560,6 +1567,10 @@ struct VoxelRtResources {
     /// pass 1 writes `cur` (this frame) + reads `prev` (last frame) for the temporal Jacobian + dissimilarity
     /// reject; pass 2 reads `cur` (same-frame) for the spatial neighbour. Non-DLSS path.
     surfaces: Option<(wgpu::Buffer, wgpu::Buffer, UVec2)>,
+    /// Screen-probe GI: (headers, SH current, SH history) storage buffers + the probe grid dims they're sized
+    /// for. Reallocated when the grid changes; history reset on realloc. Shared by both render paths (only one
+    /// runs per frame). `group(4)`. See `docs/SCREEN_PROBE_PLAN.md`.
+    screen_probes: Option<(wgpu::Buffer, wgpu::Buffer, wgpu::Buffer, UVec2)>,
     /// The composite render pipeline, keyed by the view-target format it was built for.
     composite: Option<(wgpu::TextureFormat, wgpu::RenderPipeline)>,
     /// Monotonic per-frame counter written into the lighting uniform's `frame_index` so the GI bounce
@@ -2574,10 +2585,17 @@ fn init_voxel_rt(mut commands: Commands, render_device: Res<RenderDevice>) {
             storage_ro(16),
         ],
     });
+    // group(4) screen-probe layout: probe params uniform (0) + headers (1) + SH current (2) + SH history (3).
+    // Bound to the restir pipeline layout so `shade_restir_p2` can read the SH; also used by `screen_probe_trace`.
+    let probe_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("voxel_rt_probe_layout"),
+        entries: &[uniform_buf(0), storage_rw(1), storage_rw(2), storage_rw(3)],
+    });
     // The two-pass ReSTIR pipeline layout. group(3) = the world cache: `restir_p1` queries it (read_write — the
     // query lazy-inserts), and `restir_p2` shares the layout (it never touches the cache; binding an unused
     // group is legal). The cache `group(3)` bind group set by the world-cache passes (which run earlier in the
     // same compute pass) stays bound through both restir passes, so no extra `set_bind_group(3, ...)` is needed.
+    // group(4) = the screen-probe data (shade reads the SH; `screen_probe_trace` writes it).
     let restir_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: Some("voxel_rt_raymarch_restir_pl"),
         bind_group_layouts: &[
@@ -2585,6 +2603,7 @@ fn init_voxel_rt(mut commands: Commands, render_device: Res<RenderDevice>) {
             Some(&view_layout),
             Some(&reservoir_layout),
             Some(&world_cache_layout),
+            Some(&probe_layout),
         ],
         immediate_size: 0,
     });
@@ -2601,6 +2620,14 @@ fn init_voxel_rt(mut commands: Commands, render_device: Res<RenderDevice>) {
         layout: Some(&restir_pl),
         module: &raymarch_module,
         entry_point: Some("restir_p2"),
+        compilation_options: Default::default(),
+        cache: None,
+    });
+    let probe_trace = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+        label: Some("voxel_rt_screen_probe_trace"),
+        layout: Some(&restir_pl),
+        module: &raymarch_module,
+        entry_point: Some("screen_probe_trace"),
         compilation_options: Default::default(),
         cache: None,
     });
@@ -2784,15 +2811,22 @@ fn init_voxel_rt(mut commands: Commands, render_device: Res<RenderDevice>) {
 
     // --- DLSS-RR (Stage 4c) pipelines + layouts ---
     #[cfg(feature = "dlss")]
-    let (raymarch_dlss, restir_dlss_p1, restir_dlss_p2, dlss_view_layout, dlss_resolve_layout) =
-        init_dlss_pipelines(
-            device,
-            &scene_layout,
-            &reservoir_layout,
-            &world_cache_layout,
-            &raymarch_module,
-            &composite_module,
-        );
+    let (
+        raymarch_dlss,
+        restir_dlss_p1,
+        restir_dlss_p2,
+        probe_trace_dlss,
+        dlss_view_layout,
+        dlss_resolve_layout,
+    ) = init_dlss_pipelines(
+        device,
+        &scene_layout,
+        &reservoir_layout,
+        &world_cache_layout,
+        &probe_layout,
+        &raymarch_module,
+        &composite_module,
+    );
 
     // 1×1 dummy STBN (a single-layer D2Array view) — bound to reservoir binding 7 until the real `stbn.ktx2`
     // is resident in the render world. The shader checks `textureDimensions > 1` and falls back to white noise.
@@ -2817,6 +2851,10 @@ fn init_voxel_rt(mut commands: Commands, render_device: Res<RenderDevice>) {
         view_layout,
         reservoir_layout,
         stbn_dummy_view,
+        probe_layout,
+        probe_trace,
+        #[cfg(feature = "dlss")]
+        probe_trace_dlss,
         raymarch,
         restir_p1,
         restir_p2,
@@ -2861,9 +2899,11 @@ fn init_dlss_pipelines(
     scene_layout: &wgpu::BindGroupLayout,
     reservoir_layout: &wgpu::BindGroupLayout,
     world_cache_layout: &wgpu::BindGroupLayout,
+    probe_layout: &wgpu::BindGroupLayout,
     raymarch_module: &wgpu::ShaderModule,
     composite_module: &wgpu::ShaderModule,
 ) -> (
+    wgpu::ComputePipeline,
     wgpu::ComputePipeline,
     wgpu::ComputePipeline,
     wgpu::ComputePipeline,
@@ -2928,6 +2968,7 @@ fn init_dlss_pipelines(
             Some(&dlss_view_layout),
             Some(reservoir_layout),
             Some(world_cache_layout),
+            Some(probe_layout),
         ],
         immediate_size: 0,
     });
@@ -2944,6 +2985,14 @@ fn init_dlss_pipelines(
         layout: Some(&dlss_restir_pl),
         module: raymarch_module,
         entry_point: Some("restir_dlss_p2"),
+        compilation_options: Default::default(),
+        cache: None,
+    });
+    let probe_trace_dlss = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+        label: Some("voxel_rt_screen_probe_trace_dlss"),
+        layout: Some(&dlss_restir_pl),
+        module: raymarch_module,
+        entry_point: Some("screen_probe_trace"),
         compilation_options: Default::default(),
         cache: None,
     });
@@ -2973,7 +3022,14 @@ fn init_dlss_pipelines(
         ],
     });
     let _ = composite_module; // resolve render pipeline is built lazily (format-keyed) in the pass
-    (raymarch_dlss, restir_dlss_p1, restir_dlss_p2, dlss_view_layout, dlss_resolve_layout)
+    (
+        raymarch_dlss,
+        restir_dlss_p1,
+        restir_dlss_p2,
+        probe_trace_dlss,
+        dlss_view_layout,
+        dlss_resolve_layout,
+    )
 }
 
 /// True iff two column-major 4×4 matrices are equal within a tight tolerance — the camera-move test for
@@ -3063,6 +3119,24 @@ struct RestirParamsData {
     _pad1: u32,
 }
 
+/// Screen-probe GI uniform (group 4 binding 0) — mirrors `ScreenProbeParams` in the WGSL. 48 bytes.
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct ScreenProbeParamsData {
+    grid_x: u32,
+    grid_y: u32,
+    probe_size: u32,
+    oct_res: u32,
+    viewport_x: u32,
+    viewport_y: u32,
+    reset: u32,
+    frame_index: u32,
+    enabled: u32,
+    temporal: u32,
+    _pad0: u32,
+    _pad1: u32,
+}
+
 /// **SSOT for the editor-tunable ReSTIR knobs** (knobs-as-uniforms). Drives `RestirParamsData` each frame; the
 /// Render/GI panel writes it. `gi_mode` selects the live GI path: `false` = legacy `gather_gi`, `true` = ReSTIR
 /// (the A/B toggle). Extracted to the render world.
@@ -3086,6 +3160,14 @@ pub struct RestirSettings {
     /// GI 6.0: INITIAL GI bounce candidates per pixel per frame (M). 1 = canonical single-bounce ReSTIR; >1 cuts
     /// the per-frame estimate variance ~1/M (the fix for under-sampled scenes like Sponza) at M× the bounce cost.
     pub gi_initial_samples: u32,
+    /// gi_mode: `true` = Lumen-style screen-space radiance probes drive diffuse GI; `false` = per-pixel ReSTIR.
+    pub screen_probes: bool,
+    /// Probe grid spacing in pixels (1 probe per `probe_size`² pixels). 16 = Lumen default.
+    pub probe_size: u32,
+    /// Octahedral resolution per probe; directions traced per probe = `probe_oct_res`².
+    pub probe_oct_res: u32,
+    /// Blend prev-frame probe SH (light temporal accumulation; P3).
+    pub probe_temporal: bool,
 }
 
 impl Default for RestirSettings {
@@ -3121,6 +3203,11 @@ impl Default for RestirSettings {
             // GI 6.0 initial GI samples (M): RIS-merge 4 bounces/frame — cuts the Sponza blotch ~34%, the big lever
             // for under-sampled scenes. M× the bounce cost; a live slider — raise to 8/16 for cleaner GI.
             gi_initial_samples: 4,
+            // Screen-probe GI (off by default during bring-up; the A/B knob). 16px grid, 8×8 octa = 64 dirs/probe.
+            screen_probes: false,
+            probe_size: 16,
+            probe_oct_res: 8,
+            probe_temporal: true,
         }
     }
 }
@@ -4388,6 +4475,77 @@ fn dispatch_world_cache_passes(
     }
 }
 
+/// (Re)allocate the screen-probe buffers (sized to the FULL-derived grid; minimal when disabled) and build the
+/// `group(4)` probe bind group + the per-frame params uniform. Returns the bind group and `Some(grid)` to
+/// dispatch `screen_probe_trace` over when probes are enabled (else `None` → no dispatch, but the bind group is
+/// still bound because it's part of the restir pipeline layout). `render_res` is the dispatch viewport (probes
+/// whose centre pixel falls outside it self-invalidate). See `docs/SCREEN_PROBE_PLAN.md`.
+#[allow(clippy::too_many_arguments)]
+fn prepare_screen_probes(
+    device: &wgpu::Device,
+    pipelines: &VoxelRtPipelines,
+    resources: &mut VoxelRtResources,
+    settings: &RestirSettings,
+    full: UVec2,
+    render_res: UVec2,
+    frame_index: u32,
+    reset: bool,
+) -> (wgpu::BindGroup, Option<UVec2>) {
+    let probe_size = settings.probe_size.max(1);
+    let grid = if settings.screen_probes {
+        UVec2::new(full.x.div_ceil(probe_size), full.y.div_ceil(probe_size)).max(UVec2::ONE)
+    } else {
+        UVec2::ONE
+    };
+    let need = resources.screen_probes.as_ref().map(|(.., g)| *g) != Some(grid);
+    if need {
+        let n = (grid.x as u64) * (grid.y as u64);
+        let mk = |label: &'static str, bytes: u64| {
+            device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(label),
+                size: bytes.max(16),
+                usage: wgpu::BufferUsages::STORAGE,
+                mapped_at_creation: false,
+            })
+        };
+        let headers = mk("voxel_rt_probe_headers", n * 32); // ScreenProbeHeader = 2×vec4
+        let sh = mk("voxel_rt_probe_sh", n * 9 * 16); // 9 order-2 coeffs × vec4
+        let sh_hist = mk("voxel_rt_probe_sh_history", n * 9 * 16);
+        resources.screen_probes = Some((headers, sh, sh_hist, grid));
+    }
+    let (headers, sh, sh_hist, _) = resources.screen_probes.as_ref().unwrap();
+    let params = ScreenProbeParamsData {
+        grid_x: grid.x,
+        grid_y: grid.y,
+        probe_size,
+        oct_res: settings.probe_oct_res.max(1),
+        viewport_x: render_res.x,
+        viewport_y: render_res.y,
+        reset: reset as u32,
+        frame_index,
+        enabled: settings.screen_probes as u32,
+        temporal: settings.probe_temporal as u32,
+        _pad0: 0,
+        _pad1: 0,
+    };
+    let params_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("voxel_rt_probe_params"),
+        contents: bytemuck::bytes_of(&params),
+        usage: wgpu::BufferUsages::UNIFORM,
+    });
+    let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("voxel_rt_probe_bg"),
+        layout: &pipelines.probe_layout,
+        entries: &[
+            wgpu::BindGroupEntry { binding: 0, resource: params_buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 1, resource: headers.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 2, resource: sh.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 3, resource: sh_hist.as_entire_binding() },
+        ],
+    });
+    (bg, settings.screen_probes.then_some(grid))
+}
+
 /// Resolve the spatiotemporal blue-noise texture to a `D2Array` view (mirrors `bevy_pbr::ssr`): the real
 /// `Bluenoise` texture once it's resident in the render world, else `None` so the caller binds the 1×1 dummy.
 /// The ReSTIR shader checks `textureDimensions > 1` and falls back to white noise for the dummy.
@@ -4723,6 +4881,18 @@ fn voxel_rt_pass(
             wgpu::BindGroupEntry { binding: 7, resource: wgpu::BindingResource::TextureView(stbn_view) },
         ],
     });
+    // Screen-probe GI group(4) (non-DLSS: render_res == viewport). Always builds the bind group (it's part of
+    // the restir pipeline layout); `probe_dispatch` is Some(grid) only when probes drive the GI.
+    let (probe_bg, probe_dispatch) = prepare_screen_probes(
+        device,
+        &pipelines,
+        &mut resources,
+        &restir_settings,
+        viewport,
+        viewport,
+        frame_index,
+        reset_restir,
+    );
 
     // Phase 2.1 world-space radiance cache: allocate the persistent buffers (once) + build the cache bind
     // groups. Dispatched BEFORE the live raymarch/restir, but it does NOT feed the live image this stage — the
@@ -4799,6 +4969,13 @@ fn voxel_rt_pass(
             // the query is what POPULATES the cache). Re-set explicitly even though the cache passes left it
             // bound — rebinding group 2 above can invalidate inheritance of higher-indexed groups.
             cpass.set_bind_group(3, &wc_prepared.cache_bg, &[]);
+            cpass.set_bind_group(4, &probe_bg, &[]); // screen-probe data (shade reads SH; probe trace writes it)
+            // Screen-probe trace (one thread per probe) runs BEFORE the restir passes so the SH is ready for
+            // `shade_restir_p2`. Only when probes drive the GI; the world cache (group 3) is already bound.
+            if let Some(grid) = probe_dispatch {
+                cpass.set_pipeline(&pipelines.probe_trace);
+                cpass.dispatch_workgroups(grid.x.div_ceil(8), grid.y.div_ceil(8), 1);
+            }
             #[cfg(feature = "editor")]
             if let Some(t) = gpu_timer.as_ref() {
                 t.begin(&mut cpass, 4);
@@ -5304,6 +5481,18 @@ fn voxel_rt_dlss_pass(
             wgpu::BindGroupEntry { binding: 7, resource: wgpu::BindingResource::TextureView(stbn_view) },
         ],
     });
+    // Screen-probe GI group(4): probe grid sized to FULL (dispatched over the render_res subrect — probes whose
+    // centre pixel exceeds render_res self-invalidate). Always built (part of the restir pipeline layout).
+    let (probe_bg, probe_dispatch) = prepare_screen_probes(
+        device,
+        &pipelines,
+        &mut resources,
+        &restir_settings,
+        full,
+        render_res,
+        frame_index,
+        reset_restir,
+    );
 
     let scene_bg = resources.scene_bind_group.as_ref().expect("checked above");
     // `gi_mode` A/B: two-pass ReSTIR GI (group-2 reservoirs) vs the legacy `gather_gi` DLSS raymarch (no group 2).
@@ -5340,6 +5529,11 @@ fn voxel_rt_dlss_pass(
             // group(3) = the world cache (Phase 2.2): `restir_dlss_p1`'s initial reservoir queries it
             // (lazy-insert → populates the cache). Re-set explicitly (rebinding group 2 can drop higher groups).
             cpass.set_bind_group(3, &wc_prepared.cache_bg, &[]);
+            cpass.set_bind_group(4, &probe_bg, &[]); // screen-probe data (shade reads SH; probe trace writes it)
+            if let Some(grid) = probe_dispatch {
+                cpass.set_pipeline(&pipelines.probe_trace_dlss);
+                cpass.dispatch_workgroups(grid.x.div_ceil(8), grid.y.div_ceil(8), 1);
+            }
             #[cfg(feature = "editor")]
             if let Some(t) = gpu_timer.as_ref() {
                 t.begin(&mut cpass, 4);

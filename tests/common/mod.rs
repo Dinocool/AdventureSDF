@@ -167,6 +167,7 @@ pub fn headless_compute_device_with_storage(
     limits.max_compute_workgroup_size_x = limits.max_compute_workgroup_size_x.max(min_invocations);
     limits.max_storage_buffers_per_shader_stage =
         limits.max_storage_buffers_per_shader_stage.max(min_storage_buffers);
+    limits.max_bind_groups = limits.max_bind_groups.max(5); // group(4) = screen-probe data
     block_on(adapter.request_device(&wgpu::DeviceDescriptor {
         label: Some("voxel_diff_test_device"),
         required_features: wgpu::Features::empty(),
@@ -228,6 +229,7 @@ fn request_ray_query_device(
         limits.max_storage_textures_per_shader_stage.max(min_storage_textures);
     limits.max_storage_buffers_per_shader_stage =
         limits.max_storage_buffers_per_shader_stage.max(min_storage_buffers);
+    limits.max_bind_groups = limits.max_bind_groups.max(5); // group(4) = screen-probe data
     // The world-cache decay/compaction passes use `@workgroup_size(1024)` (the prefix-sum scan width). wgpu's
     // default caps invocations-per-workgroup + workgroup_size_x at 256, so raise both to 1024 (desktop RTX
     // supports it; mirrors the renderer's `wgpu_settings()` bump).
@@ -308,8 +310,11 @@ pub fn headless_ray_query_device() -> Option<(wgpu::Device, wgpu::Queue)> {
     block_on(adapter.request_device(&wgpu::DeviceDescriptor {
         label: Some("voxel_rt_test_device"),
         required_features: wgpu::Features::EXPERIMENTAL_RAY_QUERY,
-        required_limits: wgpu::Limits::default()
-            .using_minimum_supported_acceleration_structure_values(),
+        required_limits: {
+            let mut l = wgpu::Limits::default().using_minimum_supported_acceleration_structure_values();
+            l.max_bind_groups = l.max_bind_groups.max(5); // group(4) = screen-probe data
+            l
+        },
         memory_hints: Default::default(),
         trace: wgpu::Trace::Off,
         experimental_features: unsafe { wgpu::ExperimentalFeatures::enabled() },

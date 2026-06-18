@@ -94,6 +94,37 @@ Extend `tests/voxel_gi_boil_gpu.rs`: a `gi_probe_*` group measuring blotch/luma 
 reference. Headless can't see DLSS-RR — the user eyeballs each phase on Sponza (the meter gates energy +
 fine/blotch CoV only). Perf: a headless probe-trace timing vs the per-pixel M4 path.
 
+## RESULTS — P0–P4 IMPLEMENTED + VALIDATED (2026-06-18, headless Sponza meter)
+
+Measured on the captured worst-boil Sponza viewpoint (`gi_sponza_blotch`), probes vs the per-pixel reference:
+
+| config | luma | fine_CoV | blotch_CoV |
+|---|---|---|---|
+| M1 (unbiased per-pixel ref) | 56.5 | 0.62 | 0.052 |
+| probes 16px oct8, no temporal | 66.8 | 0.16 | 0.10 |
+| **probes 16px oct8 +temporal** | 67.2 | **0.055** | **0.037** |
+| **probes 8px oct8 +temporal** | 70.1 | **0.041** | **0.020** |
+
+- **Energy correct/unbiased:** probe luma ~67–70 matches the converged high-M value (M1's 57 is biased LOW;
+  M-merge's 68 was biased high). The direct MC+SH probe is the unbiased reference.
+- **SH low-pass crushes per-pixel grain:** fine_CoV 0.62 → 0.04–0.05 (~15×).
+- **Temporal crushes the blotch (the boil):** 8px = **0.020**, 16px = **0.037** — at/below M4's 0.036 (the
+  previous best), at CORRECT brightness.
+- **Perf:** probe trace = (res/probe_size)² × oct_res² rays. 16px/oct8 = **0.25 ray/px** (16× fewer than M4's
+  4 ray/px) for ≈M4 blotch; 8px/oct8 = 1 ray/px for 2× better blotch. The per-pixel ReSTIR GI is RETIRED when
+  probes drive the diffuse (`restir_p1_core` gated off; DI still runs), so the wasted M-bounces are skipped.
+
+**Implemented:** P0 scaffolding (group-4 probe layout/buffers/uniform, `gi_mode` knob, editor sliders) · P1
+placement + equal-area **Fibonacci-sphere** trace (octahedral was area-biased) · P2 order-2 SH projection +
+bilateral 2×2 integration · P3 light temporal (pos/normal-validity reject, no-reproject → no smear, packed in SH
+`.w` lanes) · P4 edge fallback (nearest valid probe in 5×5) + retire per-pixel GI. Knob: `RestirSettings`
+`screen_probes`/`probe_size`/`probe_oct_res`/`probe_temporal` (default OFF — A/B).
+
+**Deferred refinements (not blocking):** full *adaptive* edge-probe placement (the fallback substitutes); true
+world-position reprojection for temporal accumulation UNDER motion (currently rejects→fresh on motion, safe but
+noisier — DLSS-RR cleans); octa spatial filtering between probes; SH negative-lobe clamp. **User live check
+pending:** boil + ghosting under motion with DLSS-RR (headless can't see RR); dark-edge quality.
+
 ## Resolved by review (were open questions)
 - Octahedral: **full-sphere, fixed shared frame** (not normal-aligned hemisphere) — cosine applied at SH
   integration, not storage. (C2)

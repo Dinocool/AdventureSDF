@@ -152,6 +152,14 @@ pub fn render_gi_panel(world: &mut World, ui: &mut egui::Ui) {
                 ui.add(egui::Slider::new(&mut s.confidence_cap, 1.0..=32.0).text("history cap (frames)"));
                 ui.add(egui::Slider::new(&mut s.gi_initial_samples, 1..=16).text("GI initial samples / frame (M)"));
             });
+            // Screen-space radiance probes (Lumen-style): downsampled SH GI — kills the boil at a fraction of
+            // the per-pixel trace cost. Replaces the per-pixel ReSTIR diffuse gather when on.
+            ui.checkbox(&mut s.screen_probes, "Screen-probe GI (Lumen-style; replaces per-pixel diffuse)");
+            ui.add_enabled_ui(on && s.screen_probes, |ui| {
+                ui.add(egui::Slider::new(&mut s.probe_size, 4..=32).text("probe spacing (px)"));
+                ui.add(egui::Slider::new(&mut s.probe_oct_res, 4..=16).text("probe directions √N (oct res)"));
+                ui.checkbox(&mut s.probe_temporal, "probe temporal accumulation (light)");
+            });
             // GI 4.0: screen-space ReSTIR DI (emissive-voxel direct light) — the emitter-boil fix.
             ui.checkbox(&mut s.di_enabled, "ReSTIR DI (emissive-voxel direct light)");
             ui.add_enabled_ui(on && s.di_enabled, |ui| {
