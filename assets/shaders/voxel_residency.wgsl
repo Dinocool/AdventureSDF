@@ -1033,6 +1033,12 @@ fn diff_drop_apply(@builtin(global_invocation_id) gid: vec3<u32>) {
 // =====================================================================================================
 
 const NEIGHBOUR_ABSENT: u32 = 0xFFFFFFFFu;
+// A neighbour that is OCCUPIED (per the occupancy structure) but has no resident CORE (a face-culled interior
+// brick, or a surface brick not yet entered this frame during streaming). The halo must treat it as SOLID — NOT
+// air — so a brick's face toward it reads correctly BURIED (the normal/exposed-face test). Treating it as air was
+// the motion-only "black cube" (wrong-normal speck): a streaming brick whose neighbour hadn't entered yet baked a
+// spurious exposed face. `fill_halo` fills these border cells with a solid marker instead of reading a core.
+const NEIGHBOUR_SOLID: u32 = 0xFFFFFFFEu;
 const NEIGHBOUR_COUNT: u32 = 27u;     // the 27-entry neighbour table per command (brick + its 26 neighbours)
 const BRICK_EDGE_D: i32 = 8;
 const BRICK_VOXELS_D: u32 = 512u;     // BRICK_EDGE³ — one core's u32 count
@@ -1437,15 +1443,20 @@ fn pack_build_neighbours(@builtin(global_invocation_id) gid: vec3<u32>) {
             for (var dx = -1; dx <= 1; dx = dx + 1) {
                 let nslot = u32((dz + 1) * 9 + (dy + 1) * 3 + (dx + 1));
                 let nbr = coord + vec3<i32>(dx, dy, dz);
-                // CRITICAL: the halo reads only RESIDENT same-LOD neighbours (mirror of `build_neighbour_table`'s
-                // `new_by_key.get(&nkey)` over the RESIDENT set — NOT every OCCUPIED brick). A face-culled
-                // INTERIOR neighbour is occupied in the core store but NOT resident, so its halo contribution is
-                // AIR (NEIGHBOUR_ABSENT). Gate on the slot_table (residency), THEN resolve the core via the store.
+                // The halo reflects the true GEOMETRY (occupancy), not residency: a RESIDENT neighbour contributes
+                // its real core voxels; an OCCUPIED-but-not-resident neighbour (a face-culled interior brick, or a
+                // surface brick not yet entered this streaming frame) contributes a SOLID border; only a genuinely
+                // EMPTY neighbour is AIR. Gating on residency alone baked a spurious exposed face whenever a solid
+                // neighbour wasn't resident yet — the motion-only wrong-normal / black-cube speck. `is_occupied` is
+                // the same full-occupancy structure the enumerate face-culls against, so this is consistent.
+                var idx = NEIGHBOUR_ABSENT;
                 if (slot_lookup(nbr, lod) != SLOT_ABSENT) {
-                    neighbour_indices[base + nslot] = core_lookup(nbr, lod);
-                } else {
-                    neighbour_indices[base + nslot] = NEIGHBOUR_ABSENT;
+                    idx = core_lookup(nbr, lod); // resident: real core (may still be ABSENT if its core not paged)
                 }
+                if (idx == NEIGHBOUR_ABSENT && is_occupied(nbr, lod)) {
+                    idx = NEIGHBOUR_SOLID; // occupied but no resident core → solid border (buried face)
+                }
+                neighbour_indices[base + nslot] = idx;
             }
         }
     }

@@ -66,17 +66,6 @@ pub struct StreamedResidencyPager {
     /// The DEMAND-PAGED GPU core store (§8.3): incremental insert-on-page / evict-on-drop.
     core_store: PagedBrickCoreStore,
 
-    /// Per resident-region: the core KEYS `(world_coord, lod)` it REQUIRES (its surface bricks + their 26-halo).
-    /// Computed ONCE at the region's page-in (against the occupancy then), refcounted across regions so a halo
-    /// neighbour shared by two regions is freed only by the last. This makes core paging INCREMENTAL (Θ(delta
-    /// regions), not Θ(all resident) per crossing) — the per-crossing whole re-classify of every resident brick
-    /// was the freeze.
-    region_core_keys: FxHashMap<RegionKey, Vec<(IVec3, u32)>>,
-    /// How many resident regions REQUIRE each core key (a key freed from the GPU store only when this hits 0).
-    core_refcount: FxHashMap<(IVec3, u32), u32>,
-    /// The asset index owning each required core key (for the lazy core decode on a new key).
-    core_key_asset: FxHashMap<(IVec3, u32), usize>,
-
     /// Whether the GPU stores have been (re)bound since the last structural change — the caller rebinds the front
     /// end's bind group when `occ_buffers`/`core_store` buffers change identity (they don't here — both are
     /// in-place re-uploaded — so a rebind is needed only ONCE after construction).
@@ -125,9 +114,6 @@ impl StreamedResidencyPager {
             occ_buffers,
             occ_capacity,
             core_store: PagedBrickCoreStore::new(device, queue, core_cap),
-            region_core_keys: FxHashMap::default(),
-            core_refcount: FxHashMap::default(),
-            core_key_asset: FxHashMap::default(),
             needs_rebind: true,
         }
     }
@@ -229,34 +215,26 @@ impl StreamedResidencyPager {
         self.resident = desired;
         let t_decode = t0.elapsed();
 
-        // §8.2 — rebuild the OCCUPANCY whole from the resident regions (presence + full bits; no voxel decode) and
-        // re-upload the pre-sized buffer in place (no realloc/rebind). Cheap (~MB, ~tens of ms) — the per-crossing
-        // transient the bench criterion explicitly allows (NOT the 317 ms classify). The CPU occupancy is also the
-        // SSOT for the surface classify in the incremental core paging below.
+        // §8.2/§8.3 — rebuild the OCCUPANCY whole, then re-derive the FULL surface+halo CORE set and sync the
+        // core store to it. Recomputing the full set each crossing (NOT an incremental refcount delta) is the
+        // COVERAGE FIX: the resident core set is, by construction, exactly the surface+halo of the CURRENT
+        // occupancy, so the front end can never enter a brick whose neighbour core is absent (the stale-halo
+        // wrong-normal / "black cube" bug, which the refcount delta let drift out of sync with the rebuilt
+        // occupancy). It is Θ(resident bricks) per crossing — the same scan the occupancy rebuild already makes,
+        // and the bench-allowed per-crossing transient; `sync_to_keys` decodes ONLY the newly-needed cores.
         let occ = self.rebuild_occupancy(queue);
         let t_occ = t0.elapsed();
-
-        // §8.3 — INCREMENTALLY page the CORE store: only the DELTA regions touch the GPU store (Θ(delta), NOT the
-        // Θ(all-resident) whole-reclassify that froze the frame). Drop departed regions' core refs first (a key
-        // freed at refcount 0), then re-derive the surviving NEIGHBOURS of dropped regions (a buried brick can be
-        // EXPOSED — become surface — when its occluder region drops → it now needs a core; correctness), then add
-        // the newly-paged regions' surface+halo cores. The whole-occupancy SSOT (`occ`) classifies each.
-        let mut pending_insert: Vec<(IVec3, u32)> = Vec::new();
-        let mut pending_evict: Vec<(IVec3, u32)> = Vec::new();
-        let mut neighbours_to_refresh: FxHashSet<RegionKey> = FxHashSet::default();
-        for &key in &to_drop {
-            self.drop_region_cores(key, &mut neighbours_to_refresh, &mut pending_evict);
+        let (desired_cores, key_asset) = self.collect_surface_halo_keys(&occ);
+        {
+            let Self { core_store, source, decoded, .. } = &mut *self;
+            core_store.sync_to_keys(queue, &desired_cores, |world, lod| {
+                let ai = *key_asset.get(&(world, lod))?;
+                let asset = &source.placed_assets()[ai];
+                let rc = asset.source.region_of_world(lod, world);
+                let region = decoded.get(&(ai, lod, rc))?;
+                asset.source.core_at_world(lod, world, region)
+            });
         }
-        // Re-derive the surviving neighbours of dropped regions (their surface set may have grown).
-        for nbr in neighbours_to_refresh {
-            if self.resident.contains(&nbr) && !to_add.contains(&nbr) {
-                self.refresh_region_cores(nbr, &occ, &mut pending_insert, &mut pending_evict);
-            }
-        }
-        for &key in &to_add {
-            self.add_region_cores(key, &occ, &mut pending_insert);
-        }
-        self.flush_cores(queue, &pending_insert, &pending_evict);
         let total = t0.elapsed();
         if total.as_millis() > 30 {
             bevy::log::debug!(
@@ -274,7 +252,7 @@ impl StreamedResidencyPager {
     }
 
     /// Rebuild the occupancy hash from all resident regions' bricks + re-upload it in place (§8.2). Returns the CPU
-    /// [`SectorOccupancy`] (so the incremental core paging can `classify_surface` without a second build).
+    /// [`SectorOccupancy`] (so `collect_surface_halo_keys` can `classify_surface` without a second build).
     fn rebuild_occupancy(&mut self, queue: &wgpu::Queue) -> SectorOccupancy {
         let mut occupied: Vec<(IVec3, u32, bool)> = Vec::new();
         for (&(ai, lod, _rc), region) in &self.decoded {
@@ -288,123 +266,35 @@ impl StreamedResidencyPager {
         occ
     }
 
-    /// The core KEYS a resident region REQUIRES: its SURFACE bricks (`occ.classify_surface` — the enterable set)
-    /// plus each surface brick's 26 PRESENT halo neighbours (the cores the GPU halo-fill reads). Θ(region bricks).
-    fn region_required_keys(&self, key: RegionKey, occ: &SectorOccupancy) -> Vec<(IVec3, u32)> {
-        let (ai, lod, _rc) = key;
-        let Some(region) = self.decoded.get(&key) else {
-            return Vec::new();
-        };
-        let asset = &self.source.placed_assets()[ai];
-        let mut keys: FxHashSet<(IVec3, u32)> = FxHashSet::default();
-        asset.source.for_each_region_brick_occ(lod, region, |world, l, _is_full| {
-            if occ.classify_surface(world, l) {
-                keys.insert((world, l));
-                for off in N26 {
-                    let n = world + off;
-                    if occ.is_occupied(n, l) {
-                        keys.insert((n, l));
+    /// The FULL surface+halo core KEY set for the CURRENT resident occupancy, paired with each key's owning asset
+    /// (for the lazy core decode). Every SURFACE brick (`occ.classify_surface` — the front end's enterable set)
+    /// plus each surface brick's 26 PRESENT halo neighbours (the cores the GPU halo-fill reads). Θ(resident bricks).
+    /// Because the gallery spaces assets DISJOINT with a gap ≥ 1 brick, a ±1 halo neighbour is always in the SAME
+    /// asset, so `key_asset` for a halo key is that surface brick's asset. The SSOT that keeps the core set in
+    /// lock-step with the occupancy each crossing (the coverage invariant).
+    fn collect_surface_halo_keys(
+        &self,
+        occ: &SectorOccupancy,
+    ) -> (FxHashSet<(IVec3, u32)>, FxHashMap<(IVec3, u32), usize>) {
+        let mut desired: FxHashSet<(IVec3, u32)> = FxHashSet::default();
+        let mut key_asset: FxHashMap<(IVec3, u32), usize> = FxHashMap::default();
+        for (&(ai, lod, _rc), region) in &self.decoded {
+            let asset = &self.source.placed_assets()[ai];
+            asset.source.for_each_region_brick_occ(lod, region, |world, l, _is_full| {
+                if occ.classify_surface(world, l) {
+                    desired.insert((world, l));
+                    key_asset.insert((world, l), ai);
+                    for off in N26 {
+                        let n = world + off;
+                        if occ.is_occupied(n, l) {
+                            desired.insert((n, l));
+                            key_asset.entry((n, l)).or_insert(ai);
+                        }
                     }
                 }
-            }
-        });
-        keys.into_iter().collect()
-    }
-
-    /// Bump a core key's refcount; if it transitions 0→1 it newly enters the GPU store → push to `pending_insert`.
-    fn core_ref_up(&mut self, coord: IVec3, lod: u32, ai: usize, pending_insert: &mut Vec<(IVec3, u32)>) {
-        let rc = self.core_refcount.entry((coord, lod)).or_insert(0);
-        *rc += 1;
-        if *rc == 1 {
-            self.core_key_asset.insert((coord, lod), ai);
-            pending_insert.push((coord, lod));
+            });
         }
-    }
-
-    /// Drop a core key's refcount; 1→0 frees it from the GPU store → push to `pending_evict`.
-    fn core_ref_down(&mut self, coord: IVec3, lod: u32, pending_evict: &mut Vec<(IVec3, u32)>) {
-        if let Some(rc) = self.core_refcount.get_mut(&(coord, lod)) {
-            *rc -= 1;
-            if *rc == 0 {
-                self.core_refcount.remove(&(coord, lod));
-                self.core_key_asset.remove(&(coord, lod));
-                pending_evict.push((coord, lod));
-            }
-        }
-    }
-
-    /// Record a newly-paged region's required core keys (refcount each; collect 0→1 transitions into the insert
-    /// delta). Θ(region bricks) — the incremental add (NOT a whole re-scan).
-    fn add_region_cores(&mut self, key: RegionKey, occ: &SectorOccupancy, pending_insert: &mut Vec<(IVec3, u32)>) {
-        let keys = self.region_required_keys(key, occ);
-        for &(coord, lod) in &keys {
-            self.core_ref_up(coord, lod, key.0, pending_insert);
-        }
-        self.region_core_keys.insert(key, keys);
-    }
-
-    /// Drop a departed region's core-key refs (collect 1→0 transitions into the evict delta). Collects the dropped
-    /// region's 26 NEIGHBOUR region keys into `refresh` so the caller re-derives them (a brick they buried may now
-    /// be exposed → surface → newly needs a core; the correctness fix for keep-no-hole on a region drop).
-    fn drop_region_cores(&mut self, key: RegionKey, refresh: &mut FxHashSet<RegionKey>, pending_evict: &mut Vec<(IVec3, u32)>) {
-        if let Some(keys) = self.region_core_keys.remove(&key) {
-            for (coord, lod) in keys {
-                self.core_ref_down(coord, lod, pending_evict);
-            }
-        }
-        let (ai, lod, rc) = key;
-        for off in N26 {
-            refresh.insert((ai, lod, rc + off));
-        }
-    }
-
-    /// Re-derive a surviving region's required core keys (after a neighbour dropped). Diffs against its recorded
-    /// keys: refcount-up the newly-required (insert delta), refcount-down the no-longer (evict delta). Θ(region).
-    fn refresh_region_cores(
-        &mut self,
-        key: RegionKey,
-        occ: &SectorOccupancy,
-        pending_insert: &mut Vec<(IVec3, u32)>,
-        pending_evict: &mut Vec<(IVec3, u32)>,
-    ) {
-        let new_keys: FxHashSet<(IVec3, u32)> = self.region_required_keys(key, occ).into_iter().collect();
-        let old_keys: FxHashSet<(IVec3, u32)> =
-            self.region_core_keys.get(&key).map(|v| v.iter().copied().collect()).unwrap_or_default();
-        for &(coord, lod) in new_keys.difference(&old_keys) {
-            self.core_ref_up(coord, lod, key.0, pending_insert);
-        }
-        for &(coord, lod) in old_keys.difference(&new_keys) {
-            self.core_ref_down(coord, lod, pending_evict);
-        }
-        self.region_core_keys.insert(key, new_keys.into_iter().collect());
-    }
-
-    /// Apply the per-crossing core DELTA to the GPU store: EVICT the 1→0 keys, INSERT the 0→1 keys (decoding each
-    /// core lazily). Θ(delta) — NOT Θ(all resident). The insert may gracefully drop at the bounded-buffer ceiling.
-    fn flush_cores(&mut self, queue: &wgpu::Queue, pending_insert: &[(IVec3, u32)], pending_evict: &[(IVec3, u32)]) {
-        // Filter the delta by the FINAL refcount so a key that churned 0→1→0 (or 1→0→1) within this crossing
-        // resolves to its true end state (insert iff still required; evict iff truly gone) — order-independent.
-        let inserts: Vec<(IVec3, u32)> =
-            pending_insert.iter().copied().filter(|k| self.core_refcount.contains_key(k)).collect();
-        let evicts: Vec<(IVec3, u32)> =
-            pending_evict.iter().copied().filter(|k| !self.core_refcount.contains_key(k)).collect();
-        let source = &self.source;
-        let decoded = &self.decoded;
-        let key_asset = &self.core_key_asset;
-        self.core_store.apply_delta(
-            queue,
-            &inserts,
-            &evicts,
-            |world, lod| {
-                let ai = *key_asset.get(&(world, lod))?;
-                let asset = &source.placed_assets()[ai];
-                // Resolve the owning region through the asset's world↔local SSOT (same transform as the desired
-                // set + occupancy), so a non-zero placement maps the core to the SAME region the prefetcher paged.
-                let region_coord = asset.source.region_of_world(lod, world);
-                let region = decoded.get(&(ai, lod, region_coord))?;
-                asset.source.core_at_world(lod, world, region)
-            },
-        );
+        (desired, key_asset)
     }
 }
 

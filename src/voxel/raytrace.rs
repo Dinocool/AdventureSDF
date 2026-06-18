@@ -1374,7 +1374,8 @@ fn sync_dlss_camera(
     supported: Option<Res<DlssRayReconstructionSupported>>,
     mut cams: Query<(Entity, Option<&mut Dlss<DlssRayReconstructionFeature>>), With<SdfCamera>>,
 ) {
-    let want = supported.is_some() && settings.enabled;
+    // Dev: `ADVENTURE_NO_DLSS` force-disables RR (to isolate DLSS-disocclusion artifacts from gbuffer artifacts).
+    let want = supported.is_some() && settings.enabled && std::env::var("ADVENTURE_NO_DLSS").is_err();
     for (cam, dlss) in &mut cams {
         match (want, dlss) {
             (true, Some(mut d)) => {

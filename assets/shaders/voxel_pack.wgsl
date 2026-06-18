@@ -79,6 +79,12 @@ struct PackCommand {
 // NEIGHBOUR_ABSENT — a `neighbour_indices` entry meaning the neighbour is not resident (halo → AIR). Mirror of
 // `NEIGHBOUR_ABSENT` in src/voxel/incremental.rs.
 const NEIGHBOUR_ABSENT: u32 = 0xFFFFFFFFu;
+// A neighbour that is OCCUPIED but has no resident core (interior / not-yet-entered) — its halo border is SOLID
+// (a non-air marker) so the centre brick's face toward it reads BURIED, not exposed. Mirror of
+// `voxel_residency.wgsl::NEIGHBOUR_SOLID`. `HALO_SOLID_BLOCK` is the synthetic solid id written into the border
+// (only its air-vs-solid status matters — border cells are never committed hits / never gathered as lights).
+const NEIGHBOUR_SOLID: u32 = 0xFFFFFFFEu;
+const HALO_SOLID_BLOCK: u32 = 1u;
 
 // **Stage G-b — one per-CHANGED-slot AABB command** (mirrors `GpuAabbCommand` in src/voxel/incremental.rs
 // FIELD-FOR-FIELD). A FLAT 8-u32 (32 B) record — every field a scalar (no `vec3`, whose 16-byte WGSL alignment
@@ -226,7 +232,9 @@ fn fill_halo(neighbour_base: u32, li: u32) {
             // an absent centre core packs as AIR (the brick is transparent / a 1-frame hole until its core pages in),
             // never black.
             let core = neighbour_indices[neighbour_base + 13u];
-            if (core != NEIGHBOUR_ABSENT) {
+            if (core == NEIGHBOUR_SOLID) {
+                block = HALO_SOLID_BLOCK; // own core occupied but unpaged → solid (avoids an OOB cores[] read)
+            } else if (core != NEIGHBOUR_ABSENT) {
                 block = cores[core * CORE_CELLS + voxel_index(cx, cy, cz)];
             }
         } else {
@@ -236,13 +244,15 @@ fn fill_halo(neighbour_base: u32, li: u32) {
             let dz = nbr_off(cz);
             let nslot = u32((dz + 1) * 9 + (dy + 1) * 3 + (dx + 1));
             let core = neighbour_indices[neighbour_base + nslot];
-            if (core != NEIGHBOUR_ABSENT) {
+            if (core == NEIGHBOUR_SOLID) {
+                block = HALO_SOLID_BLOCK; // occupied-but-no-core neighbour → SOLID border (buried face — the fix)
+            } else if (core != NEIGHBOUR_ABSENT) {
                 let lx = nbr_local(cx);
                 let ly = nbr_local(cy);
                 let lz = nbr_local(cz);
                 block = cores[core * CORE_CELLS + voxel_index(lx, ly, lz)];
             }
-            // else: neighbour absent (or a shell boundary) → AIR, the conservative pre-halo behaviour.
+            // else: neighbour genuinely EMPTY → AIR.
         }
         halo[cell] = block;
     }
