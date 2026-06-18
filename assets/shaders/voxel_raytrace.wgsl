@@ -1533,7 +1533,14 @@ struct RestirParams {
     // traces M bounces and RIS-merges them BEFORE the temporal/spatial reuse → the per-frame estimate variance
     // drops ~1/M directly. Costs M× the GI bounce trace. The fix for severely under-sampled scenes (Sponza).
     gi_initial_samples: u32,
-    _pad1: u32,
+    // Half-resolution GI: `gi_half` = 1 → restir_p1 + the GI spatial pass run at (gi_half_x, gi_half_y) =
+    // render_res/2; the full-res shade reservoir-resolve-gathers the half-res finals. The GI cores index
+    // reservoirs at the half-res dims when this is set; DI/shade stay full-res (viewport_*).
+    gi_half: u32,
+    gi_half_x: u32,
+    gi_half_y: u32,
+    _pad2: u32,
+    _pad3: u32,
 };
 // Per-pixel RECEIVER surface (world pos + face normal) — needed so a temporal/neighbour reservoir can be
 // merged with the correct Jacobian + rejected when it lands on a dissimilar surface (port of Solari's
@@ -1860,6 +1867,24 @@ fn stbn_rotation(pix: vec2<u32>, frame: u32, seed: u32) -> vec2<f32> {
     return vec2<f32>(rand01(seed * 2u + 1u), rand01(seed * 2u + 2u));
 }
 
+// The GI dispatch viewport — half-res (gi_half_x/y) when half-res GI is on, else the full render viewport. The
+// GI reservoir/surface buffers are indexed at THIS resolution (so the GI cores work at either res unchanged).
+fn gi_vp() -> vec2<u32> {
+    if (restir_params.gi_half != 0u) {
+        return vec2<u32>(restir_params.gi_half_x, restir_params.gi_half_y);
+    }
+    return vec2<u32>(restir_params.viewport_x, restir_params.viewport_y);
+}
+
+// In-pixel sample offset for the half-res primary ray. Measured: a ROTATING 2×2 offset (one quadrant per frame)
+// recovers spatial detail over ~4 frames BUT injects temporal variance (+~20% blotch on the boil meter); since
+// the boil is the priority here and DLSS-RR recovers detail downstream, we sample the CENTRE (stable). The
+// rotating variant `vec2(select(0.25,0.75,(frame&1)!=0), select(0.25,0.75,(frame&2)!=0))` is kept as a future
+// knob for detail-over-boil scenes.
+fn half_res_jitter(frame: u32) -> vec2<f32> {
+    return vec2<f32>(0.5);
+}
+
 // PASS 1 (Solari `initial_and_temporal`): generate the initial RIS candidate, merge LAST frame's final
 // reservoir for this surface (reprojected+permuted tap into `reservoirs_a`), and write the POST-TEMPORAL
 // reservoir to `reservoirs_b` + this pixel's receiver surface to `surfaces_cur`. NO spatial reuse, NO shading
@@ -1867,7 +1892,7 @@ fn stbn_rotation(pix: vec2<u32>, frame: u32, seed: u32) -> vec2<f32> {
 // frame pixel this surface reprojects to (== `pix` for a still camera / the non-DLSS path); reprojection lets
 // accumulation CONTINUE through motion (disocclusions are caught by the dissimilarity reject).
 fn restir_p1_core(n: vec3<f32>, p: vec3<f32>, pix: vec2<u32>, temporal_base: vec2<i32>, seed: u32) {
-    let vp = vec2<u32>(restir_params.viewport_x, restir_params.viewport_y);
+    let vp = gi_vp(); // half-res when gi_half (the GI reservoirs/surfaces are indexed at this resolution)
     let idx = pix.y * vp.x + pix.x;
     surfaces_cur[idx] = PixelSurface(p, 1.0, n, 0.0); // this pixel's receiver surface (for neighbours/next frame)
     var rng = seed;
@@ -2000,7 +2025,7 @@ fn restir_p1_core(n: vec3<f32>, p: vec3<f32>, pix: vec2<u32>, temporal_base: vec
 // the SAME-FRAME post-temporal pool — rather than last frame's finals — decorrelates spatial reuse and
 // converges shadows faster (no recursive last-frame feedback). Returns 0 for GI-off / misses.
 fn restir_p2_core(n: vec3<f32>, p: vec3<f32>, pix: vec2<u32>, seed: u32) -> vec3<f32> {
-    let vp = vec2<u32>(restir_params.viewport_x, restir_params.viewport_y);
+    let vp = gi_vp(); // half-res when gi_half — the half-res GI spatial pass stores reservoirs_a at this res
     let idx = pix.y * vp.x + pix.x;
     var res = reservoirs_b[idx]; // this pixel's post-temporal reservoir (written by pass 1, this frame)
 
@@ -2332,6 +2357,63 @@ fn screen_probe_trace(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
 }
 
+// HALF-RES GI resolve (SOTA, not bilateral-on-color): for a FULL-res pixel, bilinearly gather the 2×2 half-res
+// final GI reservoirs (`reservoirs_a`) and RE-RESOLVE each against THIS pixel's own normal/position — the real
+// sample direction's cosθ — weighted by depth/normal similarity. Reconstructs from samples → stays sharp (no
+// SH/colour smoothing). Half-res surfaces (`surfaces_cur`, written by the half-res pass-1) supply the geometry.
+fn restir_gi_gather(n: vec3<f32>, p: vec3<f32>, pix: vec2<u32>) -> vec3<f32> {
+    let hvp = vec2<u32>(restir_params.gi_half_x, restir_params.gi_half_y);
+    let hc = (vec2<f32>(pix) - 0.5) * 0.5; // full-res pixel → continuous half-res grid coord
+    let base = vec2<i32>(floor(hc));
+    let fr = hc - floor(hc);
+    let recv_z = max(length(camera.cam_pos - p), 0.1);
+    let origin = p + n * light.shadow_bias;
+    var acc = vec3<f32>(0.0);
+    var wsum = 0.0;
+    for (var dj = 0; dj < 2; dj = dj + 1) {
+        for (var di = 0; di < 2; di = di + 1) {
+            let cell = base + vec2<i32>(di, dj);
+            if (cell.x < 0 || cell.y < 0 || cell.x >= i32(hvp.x) || cell.y >= i32(hvp.y)) { continue; }
+            let hidx = u32(cell.y) * hvp.x + u32(cell.x);
+            let surf = surfaces_cur[hidx];
+            if (surf.valid < 0.5) { continue; }
+            let bw = select(1.0 - fr.x, fr.x, di == 1) * select(1.0 - fr.y, fr.y, dj == 1);
+            let nw = max(0.0, dot(surf.world_normal, n));
+            let plane = abs(dot(surf.world_position - p, n)) / recv_z;
+            let w = bw * nw * nw * exp(-plane * 16.0);
+            if (w <= 0.0) { continue; }
+            // Per-full-res-pixel visibility per reservoir (the full-res path shadow-tests its resolve too): keeps
+            // contact shadows sharp + stops GI leaking through occluders the half-res sample didn't see. Occlusion
+            // rays are cheap vs the GI bounces we saved (3/4 at half-res).
+            let res = reservoirs_a[hidx];
+            let to_s = res.sample_point_world_position - origin;
+            let ds = length(to_s);
+            var vis = 1.0;
+            if (ds > 0.0 && trace_occluded(origin, to_s / ds, 0.0, ds * (1.0 - 1.0e-3))) { vis = 0.0; }
+            acc += restir_resolve_irradiance(res, p, n) * (w * vis); // reservoir-aware: resolve per full-res n
+            wsum += w;
+        }
+    }
+    if (wsum <= 0.0) {
+        // Fallback: nearest same-orientation valid half-res reservoir in a 4×4, re-resolved here (no black edges).
+        var best = 1.0e30;
+        var out = vec3<f32>(0.0);
+        for (var dj = -1; dj <= 2; dj = dj + 1) {
+            for (var di = -1; di <= 2; di = di + 1) {
+                let cell = base + vec2<i32>(di, dj);
+                if (cell.x < 0 || cell.y < 0 || cell.x >= i32(hvp.x) || cell.y >= i32(hvp.y)) { continue; }
+                let hidx = u32(cell.y) * hvp.x + u32(cell.x);
+                let surf = surfaces_cur[hidx];
+                if (surf.valid < 0.5 || dot(surf.world_normal, n) < 0.5) { continue; }
+                let d = length(surf.world_position - p);
+                if (d < best) { best = d; out = restir_resolve_irradiance(reservoirs_a[hidx], p, n); }
+            }
+        }
+        return out;
+    }
+    return acc / wsum;
+}
+
 // Like `shade`, but the indirect term comes from pass 2's reservoir resolve (`restir_p2_core`) instead of
 // `gather_gi`. Direct sun + AO + emissive glow are unchanged. Called from the pass-2 entries only (pass 1 has
 // already filled the reservoir + surface for this pixel this frame).
@@ -2351,13 +2433,19 @@ fn shade_restir_p2(albedo: vec3<f32>, n: vec3<f32>, p: vec3<f32>, emissive: vec3
     var indirect: vec3<f32>;
     if (probe_params.enabled != 0u) {
         indirect = screen_probe_integrate(n, p, length(camera.cam_pos - p), pix) * albedo;
+    } else if (restir_params.gi_half != 0u) {
+        indirect = restir_gi_gather(n, p, pix) * albedo; // half-res reservoirs, re-resolved at full-res
     } else {
         indirect = restir_p2_core(n, p, pix, seed) * albedo;
     }
     // GI 4.0: DIRECT emissive-voxel light via screen-space ReSTIR DI (low variance — resampled + reused +
     // visibility-checked), replacing the high-variance `emissive(hit)`-via-random-bounce. `di_p2_core` returns
     // the reflected E (brdf factored out), so apply the receiver albedo here like the sun direct. 0 when DI off.
-    let direct_emitter = di_p2_core(n, p, pix, seed);
+    // DI is skipped under half-res GI (v1: GI-only at half-res; DI stays full-res in a later promotion).
+    var direct_emitter = vec3<f32>(0.0);
+    if (restir_params.gi_half == 0u) {
+        direct_emitter = di_p2_core(n, p, pix, seed);
+    }
     let glow = emissive * light.emissive_strength;
     // No flat ambient (see `shade`): the ReSTIR GI provides the fill; occluded → dark, matching Solari.
     return albedo * (direct + direct_emitter) + indirect + glow;
@@ -2376,14 +2464,20 @@ fn reproject_pixel(p: vec3<f32>, prev_clip_from_world: mat4x4<f32>, vp: vec2<u32
     return vec2<i32>(round(prev_uv * vec2<f32>(vp) - vec2<f32>(0.5)));
 }
 
-// Shared primary-ray setup for the ReSTIR entries: returns [origin, direction] for this pixel's camera ray.
-fn restir_primary_ray(gid: vec3<u32>) -> array<vec3<f32>, 2> {
-    let uv = (vec2<f32>(f32(gid.x), f32(gid.y)) + 0.5) / vec2<f32>(camera.viewport);
+// Primary ray for a pixel in a viewport `vp` with an in-pixel sample `offset` (0.5 = centre). Half-res GI passes
+// pass `vp = gi_vp()` and a ROTATING `offset` (different sub-pixel of the 2×2 each frame) so temporal reuse
+// recovers TRUE full-res detail over ~4 frames (kajiya), not interpolation.
+fn restir_primary_ray_vp(gid: vec3<u32>, vp: vec2<u32>, offset: vec2<f32>) -> array<vec3<f32>, 2> {
+    let uv = (vec2<f32>(f32(gid.x), f32(gid.y)) + offset) / vec2<f32>(vp);
     let ndc = vec2<f32>(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0);
     let near = camera.world_from_clip * vec4<f32>(ndc, 1.0, 1.0);
     let world_near = near.xyz / near.w;
-    let ro = camera.cam_pos;
-    return array<vec3<f32>, 2>(ro, normalize(world_near - ro));
+    return array<vec3<f32>, 2>(camera.cam_pos, normalize(world_near - camera.cam_pos));
+}
+
+// Shared primary-ray setup for the full-res ReSTIR entries (pixel centre, full viewport).
+fn restir_primary_ray(gid: vec3<u32>) -> array<vec3<f32>, 2> {
+    return restir_primary_ray_vp(gid, camera.viewport, vec2<f32>(0.5));
 }
 
 // ===== PASS 1 entries: trace the primary ray, fill `reservoirs_b` (post-temporal) + `surfaces_cur`. No
@@ -2395,23 +2489,49 @@ fn restir_primary_ray(gid: vec3<u32>) -> array<vec3<f32>, 2> {
 // without DLSS jitter. The reservoir `reset` flag now fires only on first-frame / resolution change.
 @compute @workgroup_size(8, 8, 1)
 fn restir_p1(@builtin(global_invocation_id) gid: vec3<u32>) {
-    if (gid.x >= camera.viewport.x || gid.y >= camera.viewport.y) { return; }
-    let idx = gid.y * camera.viewport.x + gid.x;
+    let vp = gi_vp(); // half-res when gi_half (dispatched at gi_vp; the GI buffers are indexed at this res)
+    if (gid.x >= vp.x || gid.y >= vp.y) { return; }
+    let idx = gid.y * vp.x + gid.x;
     reservoirs_b[idx] = empty_reservoir(); // default for misses / debug; overwritten for lit hits
     di_reservoirs_b[idx] = di_empty();     // DI default for misses
     surfaces_cur[idx] = PixelSurface(vec3<f32>(0.0), 0.0, vec3<f32>(0.0), 0.0); // invalid until a lit hit
-    let ray = restir_primary_ray(gid);
+    // Half-res: ROTATE the in-pixel sample across the 2×2 per frame so temporal reuse recovers full-res detail.
+    let off = select(vec2<f32>(0.5), half_res_jitter(light.frame_index), restir_params.gi_half != 0u);
+    let ray = restir_primary_ray_vp(gid, vp, off);
     let r = trace(ray[0], ray[1], 0.0, camera.t_max);
     if (r.hit != 0u) {
         let p = ray[0] + ray[1] * r.t;
         let seed = (gid.x * 1973u + gid.y * 9277u + light.frame_index * 26699u) | 1u;
-        let temporal_base = reproject_pixel(p, camera.prev_clip_from_world, camera.viewport);
+        let temporal_base = reproject_pixel(p, camera.prev_clip_from_world, vp);
         // Skip the per-pixel ReSTIR GI (the M-bounce candidate gen) when screen probes drive the diffuse — shade
         // reads the probe SH instead, so the reservoir work is pure waste. DI still runs (probes are diffuse-only).
         if (probe_params.enabled == 0u) {
             restir_p1_core(r.normal, p, gid.xy, temporal_base, seed);
         }
-        di_p1_core(r.normal, p, gid.xy, temporal_base, seed);
+        // DI runs full-res; it is SKIPPED in the half-res GI pass (v1 — promoted to a full-res DI pass later).
+        if (restir_params.gi_half == 0u) {
+            di_p1_core(r.normal, p, gid.xy, temporal_base, seed);
+        }
+    }
+}
+
+// PASS 1.5 (half-res GI only): same-frame spatial reuse at HALF res → store the final GI reservoir to
+// `reservoirs_a`. Runs ONLY in half-res mode (full-res does the spatial inline in pass 2). The full-res shade
+// then reservoir-resolve-gathers these. Re-traces the (jittered) half-res primary to recover this pixel's n/p.
+@compute @workgroup_size(8, 8, 1)
+fn restir_gi_spatial(@builtin(global_invocation_id) gid: vec3<u32>) {
+    if (restir_params.gi_half == 0u) { return; }
+    let vp = gi_vp();
+    if (gid.x >= vp.x || gid.y >= vp.y) { return; }
+    let idx = gid.y * vp.x + gid.x;
+    reservoirs_a[idx] = empty_reservoir();
+    if (probe_params.enabled != 0u) { return; }
+    let ray = restir_primary_ray_vp(gid, vp, half_res_jitter(light.frame_index));
+    let r = trace(ray[0], ray[1], 0.0, camera.t_max);
+    if (r.hit != 0u) {
+        let p = ray[0] + ray[1] * r.t;
+        let seed = (gid.x * 1973u + gid.y * 9277u + light.frame_index * 26699u) | 1u;
+        _ = restir_p2_core(r.normal, p, gid.xy, seed); // stores reservoirs_a[idx] (final); resolve ignored
     }
 }
 
@@ -2448,8 +2568,12 @@ fn restir_dlss_p1(@builtin(global_invocation_id) gid: vec3<u32>) {
 fn restir_p2(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (gid.x >= camera.viewport.x || gid.y >= camera.viewport.y) { return; }
     let idx = gid.y * camera.viewport.x + gid.x;
-    reservoirs_a[idx] = empty_reservoir(); // default for misses / debug; overwritten for lit hits
-    di_reservoirs_a[idx] = di_empty();
+    // Under half-res GI, `reservoirs_a` holds the HALF-res finals (written by `restir_gi_spatial`); the full-res
+    // shade only READS them via the gather, so must NOT clear them here (the full-res idx range overlaps).
+    if (restir_params.gi_half == 0u) {
+        reservoirs_a[idx] = empty_reservoir(); // default for misses / debug; overwritten for lit hits
+        di_reservoirs_a[idx] = di_empty();
+    }
     let ray = restir_primary_ray(gid);
     let ro = ray[0];
     let rd = ray[1];
@@ -2462,9 +2586,11 @@ fn restir_p2(@builtin(global_invocation_id) gid: vec3<u32>) {
         if (r.hit != 0u && light.debug_view == 5u) {
             let p = ro + rd * r.t;
             let seed = (gid.x * 1973u + gid.y * 9277u + light.frame_index * 26699u) | 1u;
-            // GI-only debug = the LIVE diffuse path: screen probes (gi_mode) or the reservoir estimate.
+            // GI-only debug = the LIVE diffuse path: probes (gi_mode) / half-res gather / full-res reservoir.
             if (probe_params.enabled != 0u) {
                 gi = screen_probe_integrate(r.normal, p, length(camera.cam_pos - p), gid.xy);
+            } else if (restir_params.gi_half != 0u) {
+                gi = restir_gi_gather(r.normal, p, gid.xy);
             } else {
                 gi = restir_p2_core(r.normal, p, gid.xy, seed);
             }

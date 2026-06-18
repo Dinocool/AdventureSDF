@@ -152,9 +152,13 @@ pub fn render_gi_panel(world: &mut World, ui: &mut egui::Ui) {
                 ui.add(egui::Slider::new(&mut s.confidence_cap, 1.0..=32.0).text("history cap (frames)"));
                 ui.add(egui::Slider::new(&mut s.gi_initial_samples, 1..=16).text("GI initial samples / frame (M)"));
             });
+            // Half-resolution ReSTIR GI: trace GI at render_res/2 (¼ the bounce traces), full-res reservoir-
+            // resolve gather. SHARP (re-resolved per full-res normal) but ~2× boilier pre-DLSS-RR (¼ the samples);
+            // a perf/quality trade that leans on RR to clean it.
+            ui.checkbox(&mut s.gi_half_res, "Half-res GI (¼ traces; sharp but boilier — needs DLSS-RR)");
             // Screen-space radiance probes (Lumen-style): downsampled SH GI — kills the boil at a fraction of
-            // the per-pixel trace cost. Replaces the per-pixel ReSTIR diffuse gather when on.
-            ui.checkbox(&mut s.screen_probes, "Screen-probe GI (Lumen-style; replaces per-pixel diffuse)");
+            // the per-pixel trace cost. Replaces the per-pixel ReSTIR diffuse gather when on. SHELVED (flat).
+            ui.checkbox(&mut s.screen_probes, "Screen-probe GI (Lumen-style — SHELVED, flat)");
             ui.add_enabled_ui(on && s.screen_probes, |ui| {
                 ui.add(egui::Slider::new(&mut s.probe_size, 4..=32).text("probe spacing (px)"));
                 ui.add(egui::Slider::new(&mut s.probe_oct_res, 4..=16).text("probe directions √N (oct res)"));

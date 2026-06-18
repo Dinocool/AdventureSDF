@@ -233,30 +233,22 @@ fn gi_sponza_blotch() {
     // Screen-probe GI (P1/P2) vs the M4 per-pixel reference. Validate: probe luma ≈ M4 luma (energy correct, not
     // biased) + blotch. Temporal OFF here (P1/P2) — single-frame probe variance ≥ M1; the win is the SH low-pass
     // + (P3) temporal. M4 = the boil-free reference (~0.036).
-    let set_probe = |hr: &mut HeadlessRender, on: bool, psize: u32, oct: u32, temporal: bool| {
+    // Half-res ReSTIR GI vs the full-res reference (both M4). Half-res traces ¼ the GI bounces; the full-res
+    // shade reservoir-resolve-gathers. Target: blotch ≤ full-res at the reduced trace cost.
+    let set = |hr: &mut HeadlessRender, half: bool, m: u32| {
         *hr.app.world_mut().resource_mut::<RestirSettings>() = RestirSettings::default();
         let mut r = hr.app.world_mut().resource_mut::<RestirSettings>();
-        r.screen_probes = on;
-        r.probe_size = psize;
-        r.probe_oct_res = oct;
-        r.probe_temporal = temporal;
-        if on {
-            r.gi_initial_samples = 1; // probes drive the diffuse GI; skip the wasted per-pixel M traces
-        }
+        r.gi_half_res = half;
+        r.gi_initial_samples = m;
     };
-    // M1 = the unbiased per-pixel reference (probe energy should match THIS, not the over-bright M4).
-    set_probe(&mut hr, false, 16, 8, false);
-    {
-        let mut r = hr.app.world_mut().resource_mut::<RestirSettings>();
-        r.gi_initial_samples = 1;
-    }
-    report(&mut hr, "M1 (unbiased ref)");
-    set_probe(&mut hr, true, 16, 8, false);
-    report(&mut hr, "probes 16px oct8 (no temporal)");
-    set_probe(&mut hr, true, 16, 8, true);
-    report(&mut hr, "probes 16px oct8 +temporal");
-    set_probe(&mut hr, true, 8, 8, true);
-    report(&mut hr, "probes 8px oct8 +temporal");
+    set(&mut hr, false, 4);
+    report(&mut hr, "full-res M4 (reference)");
+    set(&mut hr, true, 4);
+    report(&mut hr, "HALF-res M4");
+    set(&mut hr, true, 8);
+    report(&mut hr, "HALF-res M8");
+    set(&mut hr, false, 1);
+    report(&mut hr, "full-res M1");
 }
 
 /// **Probe SPATIAL diagnostic** — the aggregate CoV/luma metric is blind to spatial correctness (a flat/wrong GI
@@ -283,10 +275,10 @@ fn gi_probe_spatial_diag() {
         for _ in 0..420 {
             set_gi_only(hr);
             hr.app.update();
-            if let Some(b) = hr.latest.0.lock().unwrap().clone() {
-                if b.len() >= need {
-                    last = b;
-                }
+            if let Some(b) = hr.latest.0.lock().unwrap().clone()
+                && b.len() >= need
+            {
+                last = b;
             }
         }
         last
@@ -310,16 +302,13 @@ fn gi_probe_spatial_diag() {
     };
     *hr.app.world_mut().resource_mut::<RestirSettings>() = RestirSettings::default();
     let restir = grab(&mut hr);
-    eprintln!("=== RESTIR GI region luma (reference) ===\n{}", grid(&hr, &restir));
+    eprintln!("=== FULL-RES RESTIR GI region luma (reference) ===\n{}", grid(&hr, &restir));
     {
         let mut r = hr.app.world_mut().resource_mut::<RestirSettings>();
-        r.screen_probes = true;
-        r.probe_size = 16;
-        r.probe_oct_res = 16;
-        r.probe_temporal = true;
+        r.gi_half_res = true;
     }
-    let probe = grab(&mut hr);
-    eprintln!("=== PROBE GI region luma (16px oct16) ===\n{}", grid(&hr, &probe));
+    let half = grab(&mut hr);
+    eprintln!("=== HALF-RES GI region luma (must MATCH reference — sharp) ===\n{}", grid(&hr, &half));
 }
 
 /// **Blotch sweep** — measures BOTH the fine per-pixel grain (`boil_stats`) AND the low-freq blotch

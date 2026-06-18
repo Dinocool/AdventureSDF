@@ -50,6 +50,27 @@ The aggregate CoV metric was MISLEADING for probes (blind to flatness). Gate on 
 region grid** (reused/renamed): half-res GI region luma must MATCH the full-res restir reference (sharp, same
 contrast — NOT lifted darks), AND blotch ≤ the M-per-pixel reference at the reduced trace cost. Then user live.
 
+## RESULTS (2026-06-18, headless Sponza) — IMPLEMENTED, honest findings
+
+Implemented (non-DLSS path; `gi_half_res` knob, default off): restir_p1 + a new `restir_gi_spatial` pass at
+render_res/2 → half-res final reservoirs; full-res `restir_gi_gather` bilinearly gathers the 2×2 half-res
+reservoirs and RE-RESOLVES each per the full-res normal + per-pixel visibility. RestirParams grew `gi_half`/
+`gi_half_x/y`; `max_bind_groups` already raised for probes.
+
+- **SHARP — the win vs probes (region-grid diag):** half-res tracks the full-res reference AND PRESERVES dark
+  contact shadows (dark center 18–27 vs ref 27–34 — *more* contrast, not the probe's lifted 45). The
+  reservoir-resolve (re-evaluate per full-res normal, not SH/colour blur) keeps it sharp. Flatness SOLVED.
+- **But BOILIER, not cleaner (the honest result):** blotch_CoV half-res M4 **0.074** (no jitter) / 0.088
+  (rotating) vs full-res M4 **0.036**; half-res M8 0.058. Fundamental: ¼ the pixels = ¼ the samples = noisier;
+  the gather interpolates but cannot manufacture samples. The boil is sample-count-limited, so reducing samples
+  raises it. Perf win (¼ GI bounce traces) is real, but it trades MORE pre-RR boil for it.
+- **Rotating jitter:** recovers spatial detail over frames but adds ~20% blotch → defaulted OFF (centre sample);
+  kept as a future knob. DLSS-RR is expected to recover detail downstream instead.
+
+**Open question only the live DLSS-RR test answers:** does RR clean the half-res boil to acceptable? The meter
+is DLSS-off (blind to RR), like demod/STBN/probes were. If RR cleans it, half-res = M4 quality at ¼ trace cost.
+If not, full-res M4 (clean, 4× cost) stands. **Needs the user's live A/B (toggle "Half-res GI") on Sponza.**
+
 ## Phases
 - H0: knob + half-res reservoir/surface buffers (reuse existing, sized full, dispatched/indexed at half-res).
 - H1: dispatch restir_p1/p2 GI at half-res; full-res shade bilateral-gathers half-res reservoirs_a. Validate

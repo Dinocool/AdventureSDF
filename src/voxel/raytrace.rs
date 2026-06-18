@@ -1429,6 +1429,8 @@ struct VoxelRtPipelines {
     /// pass-1-writes-b before pass-2-reads-b). The live GI path.
     restir_p1: wgpu::ComputePipeline,
     restir_p2: wgpu::ComputePipeline,
+    /// Half-res GI spatial pass (non-DLSS): dispatched at half-res between p1 and the full-res shade.
+    restir_gi_spatial: wgpu::ComputePipeline,
     /// `group(3)` (Phase 2.1 world-cache): the cache uniform (`wc`) + the 11 persistent cache storage buffers.
     /// A DEDICATED bind group (not group 2) so `restir_p1` is never forced to bind all of them — in 2.2 the
     /// reservoir path will add this group ALONGSIDE group 2, not merge into it.
@@ -2631,6 +2633,15 @@ fn init_voxel_rt(mut commands: Commands, render_device: Res<RenderDevice>) {
         compilation_options: Default::default(),
         cache: None,
     });
+    // Half-res GI spatial pass (non-DLSS): dispatched at half-res between p1 and the full-res shade.
+    let restir_gi_spatial = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+        label: Some("voxel_rt_restir_gi_spatial"),
+        layout: Some(&restir_pl),
+        module: &raymarch_module,
+        entry_point: Some("restir_gi_spatial"),
+        compilation_options: Default::default(),
+        cache: None,
+    });
 
     // --- Phase 2.1 world-cache: the 6 compute pipelines (the group(3) `world_cache_layout` is created above,
     // shared with `restir_pl` so Phase 2.2's initial reservoir can query the cache). ---
@@ -2858,6 +2869,7 @@ fn init_voxel_rt(mut commands: Commands, render_device: Res<RenderDevice>) {
         raymarch,
         restir_p1,
         restir_p2,
+        restir_gi_spatial,
         world_cache_layout,
         world_cache_view_layout,
         world_cache_dispatch_layout,
@@ -3116,7 +3128,11 @@ struct RestirParamsData {
     di_confidence_cap: f32,
     di_initial_samples: u32,
     gi_initial_samples: u32,
-    _pad1: u32,
+    gi_half: u32,
+    gi_half_x: u32,
+    gi_half_y: u32,
+    _pad2: u32,
+    _pad3: u32,
 }
 
 /// Screen-probe GI uniform (group 4 binding 0) — mirrors `ScreenProbeParams` in the WGSL. 48 bytes.
@@ -4841,6 +4857,12 @@ fn voxel_rt_pass(
         Some((vp, _g)) => vp != viewport,
     };
     resources.restir_prev = Some((viewport, cur_generation));
+    let gi_half = restir_settings.gi_half_res;
+    let gi_half_dims = if gi_half {
+        UVec2::new(viewport.x.div_ceil(2), viewport.y.div_ceil(2))
+    } else {
+        viewport
+    };
     let restir_params = RestirParamsData {
         reset: u32::from(reset_restir),
         frame_index,
@@ -4853,7 +4875,11 @@ fn voxel_rt_pass(
         di_confidence_cap: restir_settings.di_confidence_cap,
         di_initial_samples: restir_settings.di_initial_samples,
         gi_initial_samples: restir_settings.gi_initial_samples,
-        _pad1: 0,
+        gi_half: u32::from(gi_half),
+        gi_half_x: gi_half_dims.x,
+        gi_half_y: gi_half_dims.y,
+        _pad2: 0,
+        _pad3: 0,
     };
     let restir_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("voxel_rt_restir_params"),
@@ -4965,6 +4991,14 @@ fn voxel_rt_pass(
         );
         cpass.set_bind_group(1, &view_bg, &[]);
         let groups = (viewport.x.div_ceil(8), viewport.y.div_ceil(8), 1);
+        // GI dispatch grid — half-res when gi_half_res (the GI passes p1 + gi_spatial run here; the shade p2 is
+        // always full-res `groups`).
+        let gi_dim = if restir_settings.gi_half_res {
+            UVec2::new(viewport.x.div_ceil(2), viewport.y.div_ceil(2))
+        } else {
+            viewport
+        };
+        let gi_groups = (gi_dim.x.div_ceil(8), gi_dim.y.div_ceil(8), 1);
         if use_restir {
             // Two-pass ReSTIR: pass 1 (initial + temporal → reservoirs_b) then pass 2 (same-frame spatial →
             // reservoirs_a + shade → out_tex), back-to-back. The intra-pass storage barrier orders p1's writes
@@ -4985,8 +5019,14 @@ fn voxel_rt_pass(
             if let Some(t) = gpu_timer.as_ref() {
                 t.begin(&mut cpass, 4);
             }
+            // Pass 1 (GI candidate + temporal) at the GI res (half when gi_half_res).
             cpass.set_pipeline(&pipelines.restir_p1);
-            cpass.dispatch_workgroups(groups.0, groups.1, groups.2);
+            cpass.dispatch_workgroups(gi_groups.0, gi_groups.1, gi_groups.2);
+            // Half-res only: the GI spatial pass (full final reservoirs at half-res) before the full-res shade.
+            if restir_settings.gi_half_res {
+                cpass.set_pipeline(&pipelines.restir_gi_spatial);
+                cpass.dispatch_workgroups(gi_groups.0, gi_groups.1, gi_groups.2);
+            }
             #[cfg(feature = "editor")]
             if let Some(t) = gpu_timer.as_ref() {
                 t.end(&mut cpass, 4); // restir p1
@@ -5418,7 +5458,13 @@ fn voxel_rt_dlss_pass(
         di_confidence_cap: restir_settings.di_confidence_cap,
         di_initial_samples: restir_settings.di_initial_samples,
         gi_initial_samples: restir_settings.gi_initial_samples,
-        _pad1: 0,
+        // Half-res GI is wired on the non-DLSS path first (headless-validated); DLSS path follows once the
+        // resolve is proven. Keep it 0 here so the DLSS shade never gathers unfilled half-res reservoirs.
+        gi_half: 0,
+        gi_half_x: render_res.x,
+        gi_half_y: render_res.y,
+        _pad2: 0,
+        _pad3: 0,
     };
     let restir_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("voxel_rt_dlss_restir_params"),
