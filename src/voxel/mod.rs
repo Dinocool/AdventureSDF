@@ -28,6 +28,7 @@ pub mod gpu;
 /// shader + flatten the worldgen library/registry/brick into its uniform. Correctness-only (not yet live).
 pub mod gpu_voxelize;
 pub mod incremental;
+pub mod light_build;
 pub mod palette;
 /// Stage 6 — voxel physics (the player walks the cubes). Feature-gated on `physics` (pulls `rapier3d`).
 #[cfg(feature = "physics")]

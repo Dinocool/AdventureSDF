@@ -157,13 +157,16 @@ pub struct VoxelRtPatch {
     /// The scene EPOCH id — incremented on every scene switch (fresh packer). The render world REALLOCATES the
     /// fixed-cap buffers when this changes (a `StreamSnapshot`/`Snapshot` always carries a new epoch).
     pub epoch: u64,
+    /// **Stage 2** — whether the current scene's registry has emitters (set on every pack/switch). Gates the GPU
+    /// light build so a non-emissive scene (worldgen / Sponza) skips the resident-pool scan entirely.
+    pub has_emitters: bool,
 }
 
 impl Default for VoxelRtPatch {
     fn default() -> Self {
         // An empty contiguous snapshot at generation/epoch 0 — `prepare_voxel_rt` keeps the old (none) scene
         // until the first real pack ships.
-        Self { upload: VoxelRtUpload::Snapshot(GpuBrickPatch::default()), generation: 0, epoch: 0 }
+        Self { upload: VoxelRtUpload::Snapshot(GpuBrickPatch::default()), generation: 0, epoch: 0, has_emitters: false }
     }
 }
 
@@ -211,6 +214,9 @@ pub struct VoxelRtResidencyParams {
     pub max_resident: u32,
     /// True iff a camera exists AND the live scene is a GPU-residency-eligible streamed scene this frame.
     pub valid: bool,
+    /// **Stage 2** — whether the live streamed scene's registry has emitters (gates the GPU light build so a
+    /// non-emissive streamed scene skips the resident-pool scan).
+    pub has_emitters: bool,
 }
 
 impl VoxelRtPatch {
@@ -564,6 +570,7 @@ fn stream_voxel_rt_residency(
             patch_res.upload = VoxelRtUpload::Snapshot(patch);
             patch_res.generation = patch_res.generation.wrapping_add(1);
             patch_res.epoch = streaming.epoch;
+            patch_res.has_emitters = streaming.cornell_registry.has_emitters();
             // Cornell lighting: the box is closed (only the −Z front is open), so the sun can't fill it — the
             // EMISSIVE ceiling panel is the dominant light. Use plenty of GI rays for clear colour bleed, a
             // dim ambient (so the room isn't pitch black before GI converges), and a weak sun angled in
@@ -688,6 +695,7 @@ fn stream_voxel_rt_residency(
             patch_res.upload = VoxelRtUpload::Snapshot(patch);
             patch_res.generation = patch_res.generation.wrapping_add(1);
             patch_res.epoch = streaming.epoch;
+            patch_res.has_emitters = streaming.cornell_registry.has_emitters();
             lighting.data = LightingUniformData::cornell();
             sky.data = SkyUniformData::default();
             streaming.packed_scene = Some(*scene);
@@ -860,12 +868,16 @@ fn stream_voxel_rt_residency(
     // scene). The render-world drive REPLACES the CPU classify when on; the CPU path below still runs to keep the
     // resident-set mirror warm (stats / lights / a toggle-off flip), but does NOT block the GPU drive.
     if let Some(rp) = residency_params.as_mut() {
+        // The front end only drives `.vxo` (streamed) scenes, so emitter-gating reads the streamed source's
+        // merged registry (the only producer the front-end light build scans). `false` for the `.vox` fallback.
+        let has_emitters = streaming.streamed_vxo.as_ref().is_some_and(|(_, reg)| reg.has_emitters());
         **rp = VoxelRtResidencyParams {
             cam_world,
             clip_half_bricks: streaming.cfg.clip_half_bricks,
             epoch: streaming.epoch,
             max_resident: streaming.cfg.max_resident_bricks as u32,
             valid: true,
+            has_emitters,
         };
     }
 
@@ -1113,6 +1125,7 @@ fn stream_voxel_rt_residency(
         patch_res.upload = upload;
         patch_res.generation = patch_res.generation.wrapping_add(1);
         patch_res.epoch = *epoch;
+        patch_res.has_emitters = active_registry.has_emitters();
         *worldgen_dirty_pending = false;
         *worldgen_frames_since_pack = 0;
         debug!(
@@ -1540,6 +1553,12 @@ struct VoxelRtResources {
     /// squares from a slot reused under a not-yet-rebuilt chunk). The WINDOW bounds the per-frame build so the cold-
     /// fill's large initial dirty set can't overrun the backend's whole-set AABB-BLAS build limit (~60k prims).
     pending_blas_chunks: std::collections::BTreeSet<usize>,
+    /// **Stage 2** — the LIVE GPU emissive light-list builder (`light_build.rs`): scans the resident pool each
+    /// pool-change → writes the persistent `lights`/`alias` buffers the world-cache bind group binds (15/16) +
+    /// the 1-frame-late light count. Replaces the CPU NEE bake. Built once; rebound on an epoch change.
+    light_builder: Option<super::light_build::GpuLightBuilder>,
+    /// The scene EPOCH the light builder is bound to (rebind on change).
+    light_builder_epoch: Option<u64>,
     /// **Phase G "G-c.4-paging"** — the STREAMED `.vxo` region PREFETCHER + its demand-paged GPU occupancy / core
     /// store (`residency_pager.rs` §8). Present only for the live STREAMED scene (Bistro / the `.vxo` Gallery),
     /// built from the extracted [`VoxelRtResidencyUpload::streamed_source`] on the scene/epoch switch. Each frame
@@ -1599,12 +1618,6 @@ struct VoxelRtResources {
     /// edit / camera move).
     world_cache_initialized: bool,
 
-    /// Phase 2.5 NEE: the emissive-voxel LIGHT LIST + its power-weighted alias table as GPU storage buffers,
-    /// plus the live light COUNT and the patch generation they were built for. Rebuilt (in `prepare_voxel_rt`)
-    /// whenever the patch generation changes — the lights are derived from the resident set, so they follow the
-    /// streamed/edited geometry. `count == 0` ⇒ no emitters ⇒ NEE is skipped (the buffers are 1-long dummies so
-    /// the bind group is always valid; the shader never indexes them). `None` until the first non-empty patch.
-    world_cache_lights: Option<WorldCacheLights>,
 
     /// Phase 2.4 GPU per-pass timing (editor only): the persistent timestamp QuerySet + resolve/read-back
     /// buffers. `None` until the first timed frame allocates it — OR permanently `None` if the device lacks the
@@ -1734,57 +1747,6 @@ struct WorldCacheBuffers {
     active_cells_dispatch: wgpu::Buffer,
 }
 
-/// Phase 2.5 NEE: the emissive-voxel LIGHT LIST GPU buffers (light array + power-weighted alias table) + the
-/// live light count + the patch generation they were built for. Unlike the persistent world-cache buffers
-/// (allocated once, world-space), these are REBUILT whenever the patch generation changes — the lights are
-/// derived from the resident set, so they track the streamed/edited geometry. When the scene has NO emitters
-/// the buffers are 1-long dummies (count 0) so the cache bind group is always valid; the shader skips NEE.
-struct WorldCacheLights {
-    lights: wgpu::Buffer,
-    alias: wgpu::Buffer,
-    /// Number of lights (== `patch.lights.len()`); stamped into `WorldCacheUniform.light_count`. 0 ⇒ NEE off.
-    count: u32,
-}
-
-impl WorldCacheLights {
-    /// Build the light-list buffers from a packed patch's `lights` + `alias`. An EMPTY list (no emitters) is
-    /// uploaded as a single zeroed dummy element each so the storage bindings are never zero-length (wgpu
-    /// rejects a 0-byte storage binding) — `count == 0` makes the shader skip NEE so the dummies are never read.
-    fn new(device: &wgpu::Device, patch: &GpuBrickPatch) -> Self {
-        Self::from_lists(device, &patch.lights, &patch.alias)
-    }
-
-    /// Build the light-list buffers from raw light + alias slices (storage plan A1 — the streamed Delta path
-    /// ships `lights`/`alias` vecs, not a contiguous patch). An EMPTY list (no emitters) is uploaded as a single
-    /// zeroed dummy each so the storage bindings are never zero-length; `count == 0` makes the shader skip NEE.
-    fn from_lists(device: &wgpu::Device, lights_in: &[GpuVoxelLight], alias_in: &[GpuAliasEntry]) -> Self {
-        let count = lights_in.len() as u32;
-        let dummy_light = GpuVoxelLight { pos: [0.0; 3], area: 0.0, radiance: [0.0; 3], inv_pdf: 0.0 };
-        let dummy_alias = GpuAliasEntry { prob: 1.0, alias: 0 };
-        let lights_bytes: Vec<u8> = if lights_in.is_empty() {
-            bytemuck::bytes_of(&dummy_light).to_vec()
-        } else {
-            bytemuck::cast_slice(lights_in).to_vec()
-        };
-        let alias_bytes: Vec<u8> = if alias_in.is_empty() {
-            bytemuck::bytes_of(&dummy_alias).to_vec()
-        } else {
-            bytemuck::cast_slice(alias_in).to_vec()
-        };
-        let lights = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("voxel_rt_nee_lights"),
-            contents: &lights_bytes,
-            usage: wgpu::BufferUsages::STORAGE,
-        });
-        let alias = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("voxel_rt_nee_alias"),
-            contents: &alias_bytes,
-            usage: wgpu::BufferUsages::STORAGE,
-        });
-        Self { lights, alias, count }
-    }
-}
-
 impl WorldCacheBuffers {
     /// Allocate the persistent cache buffers, ZERO-INITIALISED (`mapped_at_creation` zero-fill via wgpu's
     /// default-zeroed mapping is not guaranteed, so we create them un-mapped — wgpu zeroes new buffers — and
@@ -1830,7 +1792,8 @@ impl WorldCacheBuffers {
         device: &wgpu::Device,
         layout: &wgpu::BindGroupLayout,
         wc_uniform: &wgpu::Buffer,
-        lights: &WorldCacheLights,
+        lights_buf: &wgpu::Buffer,
+        alias_buf: &wgpu::Buffer,
     ) -> wgpu::BindGroup {
         device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("voxel_rt_world_cache_bg"),
@@ -1847,8 +1810,8 @@ impl WorldCacheBuffers {
                 wgpu::BindGroupEntry { binding: 8, resource: self.b.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 9, resource: self.active_cell_indices.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 10, resource: self.active_cells_count.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 15, resource: lights.lights.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 16, resource: lights.alias.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 15, resource: lights_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 16, resource: alias_buf.as_entire_binding() },
             ],
         })
     }
@@ -3126,10 +3089,8 @@ fn prepare_voxel_rt(
                 patch.brick_count() as u32,
                 false,
             );
-            // NEE lights from the contiguous patch (R2b path).
-            resources.world_cache_lights = Some(WorldCacheLights::new(device, patch));
         }
-        VoxelRtUpload::StreamSnapshot { buffers, lights, alias } => {
+        VoxelRtUpload::StreamSnapshot { buffers, .. } => {
             // STREAMED epoch start (or an index-arena grow): (re)allocate the FIXED-CAPACITY paletted-slab buffers
             // (with COPY_DST) + a BLAS over `capacity` primitives (degenerate AABBs for free slots). A4.4 — the
             // voxel buffer holds the bit-packed INDEX slabs and `brick_palettes` the real per-brick palettes (the
@@ -3174,18 +3135,16 @@ fn prepare_voxel_rt(
                 buffers.brick_count,
                 true,
             );
-            resources.world_cache_lights = Some(WorldCacheLights::from_lists(device, lights, alias));
             debug!(
-                "voxel-RT A4.4: StreamSnapshot epoch {} gen {} — cap {capacity}, {} resident bricks, {} index u32, {} palette u32, {} lights",
+                "voxel-RT A4.4: StreamSnapshot epoch {} gen {} — cap {capacity}, {} resident bricks, {} index u32, {} palette u32 (NEE lights GPU-built)",
                 patch_res.epoch,
                 patch_res.generation,
                 buffers.brick_count,
                 buffers.indices.len(),
                 buffers.brick_palettes.len(),
-                lights.len(),
             );
         }
-        VoxelRtUpload::Delta { delta, brick_count, lights, alias } => {
+        VoxelRtUpload::Delta { delta, brick_count, .. } => {
             // STREAMED incremental move: patch ONLY the changed slots into the persistent fixed-cap buffers. The
             // scene must already exist for this epoch (the first re-pack shipped a StreamSnapshot). If the epoch
             // doesn't match (a defensive race — a Delta arrived before its epoch's snapshot built) skip and keep
@@ -3204,7 +3163,6 @@ fn prepare_voxel_rt(
             // streamed-Bistro bug). Skip it (mirror of the `GpuPack` arm's guard); refresh the lights + bookkeeping
             // only. The GPU front end is the sole pool writer once it is the live driver.
             if front_end_active {
-                resources.world_cache_lights = Some(WorldCacheLights::from_lists(device, lights, alias));
                 resources.brick_count = *brick_count;
                 resources.built_generation = Some(patch_res.generation);
                 resources.built_epoch = Some(patch_res.epoch);
@@ -3220,7 +3178,6 @@ fn prepare_voxel_rt(
             apply_delta(device, &render_queue, scene, delta);
             // The buffers were patched in place; the bind group (which references the SAME TLAS/meta/voxel/palette
             // handles) is unchanged. Rebuild the NEE light list (it follows the resident set's emissive surface).
-            resources.world_cache_lights = Some(WorldCacheLights::from_lists(device, lights, alias));
             resources.brick_count = *brick_count;
             debug!(
                 "voxel-RT A1: Delta epoch {} gen {} — {} changed slots, {} freed, topology_changed={}, {} bricks",
@@ -3232,7 +3189,7 @@ fn prepare_voxel_rt(
                 brick_count,
             );
         }
-        VoxelRtUpload::GpuPack { batch, brick_count, lights, alias } => {
+        VoxelRtUpload::GpuPack { batch, brick_count, .. } => {
             // Phase G Stage G-a — the GPU PACK arm (A/B-gated). Like `Delta` but the dense bricks' index/palette/
             // meta are encoded by the `voxel_pack` compute dispatch (the CPU only wrote the uniform/freed metas +
             // the AABBs). Same epoch-existence guards as `Delta`.
@@ -3271,7 +3228,6 @@ fn prepare_voxel_rt(
             // GPU-decided residency). We still refresh the lights from the CPU mirror (cheap, and the GI/NEE light
             // list is not yet GPU-driven) + record the brick_count, but the geometry is the GPU front end's.
             if front_end_active {
-                resources.world_cache_lights = Some(WorldCacheLights::from_lists(device, lights, alias));
                 resources.brick_count = *brick_count;
                 resources.built_generation = Some(patch_res.generation);
                 resources.built_epoch = Some(patch_res.epoch);
@@ -3287,7 +3243,6 @@ fn prepare_voxel_rt(
                 );
             }
             apply_gpu_pack(device, &render_queue, &pipelines, scene, batch);
-            resources.world_cache_lights = Some(WorldCacheLights::from_lists(device, lights, alias));
             resources.brick_count = *brick_count;
             debug!(
                 "voxel-RT G-a: GpuPack epoch {} gen {} — {} dense commands, {} cpu writes, topology_changed={}, {} bricks",
@@ -3303,6 +3258,14 @@ fn prepare_voxel_rt(
 
     resources.built_generation = Some(patch_res.generation);
     resources.built_epoch = Some(patch_res.epoch);
+
+    // **Stage 2 — GPU light build on the CPU-apply path.** This apply ran because the pool was (re)built this
+    // generation (Cornell static Snapshot, worldgen re-pack, or a streamed scene's first StreamSnapshot), so rebuild
+    // the NEE light list GPU-side over the new pool. Gated on `has_emitters` so a non-emissive scene skips the scan.
+    // (Subsequent front-end-driven frames rebuild lights inside `drive_gpu_residency_front_end`.)
+    if patch_res.has_emitters {
+        run_gpu_light_build(device, render_queue.0.as_ref(), &mut resources, patch_res.epoch);
+    }
 }
 
 /// Create one chunk BLAS (A3 Stage 3 slot-band) sized for `prim_count` AABB primitives. The single SSOT for the
@@ -3831,6 +3794,7 @@ fn drive_gpu_residency_front_end(
     //     brick's AABB) aliases the slot's new meta ⇒ a BLACK cube. Draining whole means every changed chunk's BLAS
     //     is rebuilt next frame reading the CURRENT pool, so the quarantine (≥1 frame) always outlasts the rebuild
     //     latency ⇒ no slot is ever traced with a stale BLAS.
+    let mut pool_changed = false;
     {
         let n_chunks = resources.scene.as_ref().map(|s| s.chunks.len()).unwrap_or(0);
         // Per-CALL batch bound (well under the ≈60k-prim overrun: 96 × 512 = 49152). The whole dirty set is still
@@ -3838,6 +3802,7 @@ fn drive_gpu_residency_front_end(
         const BLAS_BUILD_BATCH: usize = 96;
         resources.pending_blas_chunks.retain(|&i| i < n_chunks); // drop stale out-of-range indices (shrunk pool)
         if n_chunks > 0 && !resources.pending_blas_chunks.is_empty() {
+            pool_changed = true;
             let _b = info_span!("vox_blas_residency").entered();
             let aabb_stride = core::mem::size_of::<GpuBrickAabb>() as u64;
             let todo: Vec<usize> = std::mem::take(&mut resources.pending_blas_chunks).into_iter().collect();
@@ -3890,6 +3855,14 @@ fn drive_gpu_residency_front_end(
             }
             render_queue.submit(core::iter::once(encoder.finish()));
         }
+    }
+
+    // **Stage 2 — the LIVE GPU emissive light build.** When the resident pool changed this frame AND the scene has
+    // emitters, rebuild the NEE light list GPU-side over the just-packed pool (the persistent `lights`/`alias`
+    // buffers the world-cache binds). Gated on `pool_changed` so a converged camera does no light work; gated on
+    // `has_emitters` so a non-emissive streamed scene never scans the pool. Replaces the CPU NEE bake on this path.
+    if pool_changed && params.has_emitters {
+        run_gpu_light_build(device, render_queue.0.as_ref(), resources, params.epoch);
     }
 
     // **Diagnostic** (env-gated, blocking — dev only): every ~64 frames dump the front end's resident count + the
@@ -3973,6 +3946,37 @@ fn drive_gpu_residency_front_end(
     // Advance the staging ring so the NEXT frame's poll reads THIS frame's change_count copy.
     resources.gpu_front_end.as_mut().expect("built").advance_ring();
     true
+}
+
+/// **Stage 2** — run the GPU emissive light build over the live resident pool (`light_build::GpuLightBuilder`):
+/// (re)bind to the scene pool on an epoch change, poll the previous frame's light count, record + submit the 3
+/// passes (writing the persistent `lights`/`alias` buffers the world-cache binds), advance the count ring. The
+/// CALLER gates this on the pool having changed + the scene having emitters. Replaces the CPU NEE bake.
+fn run_gpu_light_build(device: &wgpu::Device, queue: &wgpu::Queue, resources: &mut VoxelRtResources, epoch: u64) {
+    let brick_count = resources.brick_count;
+    if brick_count == 0 || resources.scene.is_none() {
+        return;
+    }
+    if resources.light_builder.is_none() {
+        resources.light_builder = Some(super::light_build::GpuLightBuilder::new(device));
+        resources.light_builder_epoch = None;
+    }
+    // (Re)bind to the current scene pool buffers on an epoch change (fresh scene / reallocated pool).
+    if resources.light_builder_epoch != Some(epoch) {
+        let scene = resources.scene.as_ref().expect("checked above");
+        let meta = scene.meta_buf.clone();
+        let voxel = scene.voxel_buf.clone();
+        let bpal = scene.brick_palettes_buf.clone();
+        let pal = scene._palette_buf.clone();
+        resources.light_builder.as_mut().expect("built").rebind(device, &meta, &voxel, &bpal, &pal);
+        resources.light_builder_epoch = Some(epoch);
+    }
+    let lb = resources.light_builder.as_mut().expect("built");
+    lb.poll_count(device);
+    let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("voxel_rt_light_build") });
+    lb.record(queue, &mut enc, brick_count);
+    queue.submit(core::iter::once(enc.finish()));
+    lb.advance_ring();
 }
 
 /// **Phase G Stage G-b — apply a [`GpuPackBatch`]** to the persistent fixed-cap scene buffers (the A/B-gated
@@ -4173,23 +4177,26 @@ fn prepare_world_cache(
     // Stamp the camera position so the multi-bounce update-pass cache query (`wc_view_position`) uses the same
     // distance-adaptive cell LOD as the live `reservoir_from_bounce_cached` consumer (which reads `camera`).
     [wc.view_x, wc.view_y, wc.view_z] = cam_pos;
-    // Phase 2.5 NEE: stamp the live light count from the packed list. 0 (no emitters, or the list not yet built)
-    // ⇒ the shader skips NEE cleanly. The `nee_enabled`/`nee_samples` knobs ride in from `settings.data`.
-    wc.light_count = resources.world_cache_lights.as_ref().map(|l| l.count).unwrap_or(0);
+    // Phase 2.5 NEE: stamp the live light count from the GPU-built list (`GpuLightBuilder.count`, the 1-frame-late
+    // mirror). 0 (no emitters, or the list not yet built) ⇒ the shader skips NEE cleanly. Ensure the builder exists
+    // (it owns the persistent lights/alias buffers the bind group binds, even before the first build → count 0).
+    if resources.light_builder.is_none() {
+        resources.light_builder = Some(super::light_build::GpuLightBuilder::new(device));
+    }
+    wc.light_count = resources.light_builder.as_ref().map(|b| b.count).unwrap_or(0);
     let wc_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("voxel_rt_world_cache_uniform"),
         contents: bytemuck::bytes_of(&wc),
         usage: wgpu::BufferUsages::UNIFORM,
     });
 
-    // The NEE light buffers (bound at cache bindings 15/16). On the very first frames (cache allocated before
-    // the first patch is packed) the list may not exist yet — bind a zeroed dummy so the bind group is valid;
-    // `light_count == 0` then keeps the shader off the dummy. The real list swaps in on the next packed gen.
-    if resources.world_cache_lights.is_none() {
-        resources.world_cache_lights = Some(WorldCacheLights::new(device, &GpuBrickPatch::default()));
-    }
+    // The NEE light buffers (bound at cache bindings 15/16) are the GPU light builder's PERSISTENT buffers — valid
+    // (allocated, ≥1-long) even before the first build, so the binding is always live; `light_count == 0` keeps the
+    // shader off them until a real list is built. The GPU build (`run_gpu_light_build`) fills them readback-free.
+    let lb = resources.light_builder.as_ref().expect("ensured above");
+    let lights_buf = lb.lights.clone();
+    let alias_buf = lb.alias.clone();
     let cache = resources.world_cache.as_ref().expect("just allocated");
-    let lights = resources.world_cache_lights.as_ref().expect("just ensured");
     let view_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("voxel_rt_world_cache_view_bg"),
         layout: &pipelines.world_cache_view_layout,
@@ -4199,7 +4206,7 @@ fn prepare_world_cache(
         ],
     });
     let dispatch_bg = cache.dispatch_bg(device, &pipelines.world_cache_dispatch_layout);
-    let cache_bg = cache.bind_group(device, &pipelines.world_cache_layout, &wc_buf, lights);
+    let cache_bg = cache.bind_group(device, &pipelines.world_cache_layout, &wc_buf, &lights_buf, &alias_buf);
     let dispatch_buf = cache.active_cells_dispatch.clone();
     WorldCachePrepared { view_bg, dispatch_bg, cache_bg, dispatch_buf }
 }
