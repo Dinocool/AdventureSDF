@@ -40,7 +40,7 @@ const TEST_WORLD_CACHE_SIZE: u32 = 1 << 12;
 const RESERVOIR_SIZE: u64 = 48;
 const SURFACE_SIZE: u64 = 32;
 
-/// Mirror of the WGSL `RestirParams` (group 2, binding 2): reset + frame + viewport + the ReSTIR knobs. 32 bytes.
+/// Mirror of the WGSL `RestirParams` (group 2, binding 2): reset + frame + viewport + the ReSTIR knobs. 64 bytes.
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct RestirParams {
@@ -55,9 +55,9 @@ struct RestirParams {
     di_confidence_cap: f32,
     di_initial_samples: u32,
     _pad_gi: u32,
-    gi_half: u32,
-    gi_half_x: u32,
-    gi_half_y: u32,
+    _pad0: u32, // (was gi_half/gi_half_x/gi_half_y — half-res removed)
+    _pad1: u32,
+    _pad2: u32,
     gi_dissim_cap_dist: f32,
     _pad3: u32,
 }
@@ -520,9 +520,9 @@ fn dlss_guides_populated_where_voxels_hit() {
         di_confidence_cap: 8.0,
         di_initial_samples: 1,
         _pad_gi: 0,
-        gi_half: 0, // full-res GI
-        gi_half_x: W,
-        gi_half_y: H,
+        _pad0: 0,
+        _pad1: 0,
+        _pad2: 0,
         gi_dissim_cap_dist: 0.0, // uncapped (pure Solari relative reject)
         _pad3: 0,
     };

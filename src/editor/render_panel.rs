@@ -152,10 +152,6 @@ pub fn render_gi_panel(world: &mut World, ui: &mut egui::Ui) {
             // 0 = uncapped (pure Solari); >0 caps the dissimilarity view-distance → absolute tangent reject
             // beyond it, closing far thin-wall GI leaks. Raise toward off if it adds boil on slopes/terrain.
             ui.add(egui::Slider::new(&mut s.gi_dissim_cap_dist, 0.0..=80.0).text("thin-wall reject cap dist (m, 0=off)"));
-            // Half-resolution ReSTIR GI: trace GI at render_res/2 (¼ the bounce traces), full-res reservoir-
-            // resolve gather. SHARP (re-resolved per full-res normal) but ~2× boilier pre-DLSS-RR (¼ the samples);
-            // a perf/quality trade that leans on RR to clean it.
-            ui.checkbox(&mut s.gi_half_res, "Half-res GI (¼ traces; sharp but boilier — needs DLSS-RR)");
             // Screen-space radiance probes (Lumen-style): downsampled SH GI — kills the boil at a fraction of
             // the per-pixel trace cost. Replaces the per-pixel ReSTIR diffuse gather when on. SHELVED (flat).
             ui.checkbox(&mut s.screen_probes, "Screen-probe GI (Lumen-style — SHELVED, flat)");

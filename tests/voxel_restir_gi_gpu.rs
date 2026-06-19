@@ -510,7 +510,18 @@ fn restir_screen_space_entries_compile() {
         label: Some("voxel_raytrace"),
         source: wgpu::ShaderSource::Wgsl(src.into()),
     });
-    for entry in ["restir_p1", "restir_p2", "restir_dlss_p1", "restir_dlss_p2"] {
+    for entry in [
+        "restir_p1",
+        "restir_p2",
+        "restir_dlss_p1",
+        "restir_dlss_p2",
+        "di_p1",
+        "di_dlss_p1",
+        "restir_gi_spatial",
+        "restir_debug",
+        "restir_dlss_debug",
+        "screen_probe_trace",
+    ] {
         let _pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some(entry),
             layout: None, // auto layout from reflection — validates the entry + its bindings compile
