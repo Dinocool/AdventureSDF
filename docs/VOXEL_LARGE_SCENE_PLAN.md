@@ -1,5 +1,11 @@
 # Voxel Large-Scene / Far-View Residency — Design Plan
 
+> **SUPERSEDED for execution by `docs/DYNAMIC_LARGE_SCENE_PLAN.md`** (the actionable 5-phase plan on the
+> current readback-free GPU front end). This doc's **§2 (SOTA survey)** and **§3 (cubic→quadratic math)** remain
+> valid and are referenced from there. Its **§1/§4/§5 file references are the OLD CPU path**
+> (`ResidencyManager`/`pack_resident_set`/`clip_half=8`/`max_resident=60k`) — surface classification is now
+> already live at sector granularity on the GPU; see the execution doc's §1 for current ground truth.
+
 Status: DESIGN (no engine code changed by this doc). Worktree: `voxel-rt`. Read-only survey of `src/voxel/**`
 + a phased plan. Target: Bevy 0.19 + forked wgpu-trunk, RTX 4090 / Vulkan. Extends the HW-ray-traced brickmap
 path (`src/voxel/{brickmap,gpu,streaming,raytrace}.rs` + `assets/shaders/voxel_raytrace.wgsl`).
