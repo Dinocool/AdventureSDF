@@ -463,14 +463,12 @@ fn enumerate_shells(
     if (!level_resident(coord, lod, half)) {
         return;
     }
-    // DESIRED-MEMBERSHIP superset: occupied-in-shell (the CPU `desired_clipmap_surface` set). Emitted FIRST so the
-    // present-flag (Pass C0) covers every brick `safe_to_drop` may test, incl. the buried Interior bricks the
-    // face cull below drops from the resident-target set.
+    // Desired-set membership (occupied-in-shell) is no longer MATERIALIZED into a list — `present_contains` now
+    // computes `level_resident ∩ is_occupied` directly (so drop is enumeration-independent). The `is_occupied`
+    // gate stays: it (with `classify_surface`) selects the RESIDENT-TARGET candidates emitted below.
     if (!is_occupied(coord, lod)) {
         return;
     }
-    let d_slot = atomicAdd(&desired_count, 1u);
-    desired_list[d_slot] = vec4<i32>(coord.x, coord.y, coord.z, i32(lod));
     // RESIDENT-TARGET set: also passes the 6-face occlusion cull ⇒ a surface brick.
     if (!classify_surface(coord, lod)) {
         return;

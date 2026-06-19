@@ -260,7 +260,6 @@ pub struct GpuResidencyFrontEnd {
     p_clear: wgpu::ComputePipeline,
     p_b0: wgpu::ComputePipeline,
     p_b: wgpu::ComputePipeline,
-    p_present: wgpu::ComputePipeline,
     p_mark: wgpu::ComputePipeline,
     p_apply: wgpu::ComputePipeline,
     p_cap_hist: wgpu::ComputePipeline,
@@ -472,7 +471,6 @@ impl GpuResidencyFrontEnd {
         let p_clear = mk_res("clear_per_frame_hashes");
         let p_b0 = mk_res("prepare_shell_dispatch");
         let p_b = mk_res("enumerate_shells");
-        let p_present = mk_res("build_present_flag");
         let p_mark = mk_res("diff_drop_mark");
         let p_apply = mk_res("diff_drop_apply");
         let p_cap_hist = mk_res("enter_cap_histogram");
@@ -610,7 +608,6 @@ impl GpuResidencyFrontEnd {
             p_clear,
             p_b0,
             p_b,
-            p_present,
             p_mark,
             p_apply,
             p_cap_hist,
@@ -845,8 +842,9 @@ impl GpuResidencyFrontEnd {
         compute(enc, &self.p_fin_shell, bg, 1);
         // Pass B — enumerate (INDIRECT over the GPU-written shell_dispatch).
         record_indirect(enc, &self.p_b, bg, &self.shell_dispatch);
-        // Pass C — present-flag, drop-mark, drop-apply, enter (sized over the LIST CAP / slot-table, no readback).
-        compute(enc, &self.p_present, bg, list_wgs);
+        // Pass C — drop-mark, drop-apply, enter (sized over the LIST CAP / slot-table, no readback). The old
+        // present-flag build pass is gone: `present_contains` computes desired membership directly (drop is
+        // enumeration-independent), so no per-frame desired hash is built.
         compute(enc, &self.p_mark, bg, self.slot_table_size.div_ceil(RES_WG).max(1));
         compute(enc, &self.p_apply, bg, self.slot_table_size.div_ceil(RES_WG).max(1));
         // Enter-cap (BUG-2 nearest-priority): build the candidate distance histogram, compute the cut bucket from
