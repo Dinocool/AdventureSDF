@@ -108,13 +108,36 @@ cap regardless of brick/cell count**. This FIXES a real correctness ceiling — 
 `max_storage_buffer_binding_size` — runs on an 8 GB device with no limit raise). Gate: `enumerate_parity`
 green; `paged_front_end_render` + `pack_parity` unchanged.
 
-**Phase 2b — Tile the shell enumeration (the memory-efficient view-distance lever).** Process the `total_cells`
-shell union in **`LIST_CAP`-sized windows** so a far view (big `clip_half`/`MAX_LOD`) needs **bounded** transient
-VRAM, not a bigger cap. Replace the `would_overflow` whole-drive bail with windowed enumeration (loss-less —
-never silently truncate, [[feedback-no-silent-layer-miss]]). The diff/present-flag membership must still see the
-full desired set across windows (the hard part — likely a two-pass: accumulate desired-membership hash across
-windows, then diff). *Acceptance:* sweep `clip_half ∈ {160, 240, 320}`, drive converges (no thrash/blank) with
-**flat transient VRAM**; resident count grows ~Θ(H²); report peak transient + resident VRAM (8 GB budget gate).
+**Phase 2b — Tile the shell enumeration (the memory-efficient view-distance lever).** Process the shell union in
+**bounded windows** so a far view (big `clip_half`/`MAX_LOD`, or a huge scene) needs **bounded** transient VRAM,
+not a bigger cap — turning the current "candidate set > LIST_CAP ⇒ `would_overflow` skips the drive (blank/freeze)"
+into "render the nearest pool-worth."
+
+*Foundation already landed (commits `07d66ae`, `99bede5`):* the **drop** decision is now enumeration-independent
+— `present_contains` computes `level_resident ∩ is_occupied` directly, so drop just scans the bounded slot_table;
+no per-frame desired-set materialization. So tiling only has to window the **enter** (candidate) side.
+
+*The enter side is already nearest-priority via a global distance histogram* (`enter_cap_histogram` →
+`enter_cap_compute` cut from pool `room` → `diff_enter_scan` admits buckets below the cut). Tiling = run that in
+two passes over windows, keeping the histogram (4096 buckets, tiny) GLOBAL:
+  1. **Pass 1 (histogram):** for each window, enumerate its candidates into the LIST_CAP-sized `candidate_list`,
+     fold into the GLOBAL `enter_hist` (do NOT clear between windows). After all windows the histogram is the full
+     distance distribution.
+  2. **`enter_cap_compute`** → the global cut bucket (≤ `room` nearest), unchanged.
+  3. **Pass 2 (enter):** for each window, re-enumerate + `diff_enter_scan` admitting buckets below the global cut.
+     Total entered = global count below the cut ≤ `room` — correct across windows by construction (no nearest
+     brick dropped; contrast the simpler "near-first + clamp" heuristic, REJECTED — within-LOD flat order isn't
+     distance order, so it can hole).
+Window the **solid-cell list** (`shell_wg_indices`) in batches of `B` cells (each ≤ `B·512` candidates ≤ LIST_CAP
+⇒ `B ≈ LIST_CAP/512`); the CPU drives the window loop (the permitted CPU↔GPU control). **Open tension to resolve
+in design:** small `B` is overflow-safe but many dispatches (2 passes × ⌈cells/B⌉); validate the dispatch-count /
+re-enumeration cost and consider a coarser `B` with a per-window candidate-overflow guard. Needs a NEW gate: a
+small-`B` multi-window test (a modest scene spanning several windows) — the existing tests run a single window.
+
+*Acceptance:* sweep `clip_half ∈ {160, 240, 320}` (and a >LIST_CAP-candidate scene), drive converges (no
+thrash/blank) at **flat transient VRAM**, rendering the nearest pool-worth; resident count ~Θ(H²); report peak
+transient + resident VRAM (8 GB gate). **Scope: a real subsystem (window loop + 2-pass + new test) — implement
+with fresh focus, not as a tail-end edit.**
 
 ### Phase 3 — Break C1 (split/tiled pools past 2 GiB)
 **Goal.** Let the resident *surface* set exceed ~900k bricks — the "3–10× Bistro, loaded whole" target.
