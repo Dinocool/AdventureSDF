@@ -576,31 +576,19 @@ fn hash_key(coord: vec3<i32>, lod: u32) -> u32 {
     return h;
 }
 
-// --- present_flag (desired-set membership) ---
+// --- desired-set membership (computed DIRECTLY, no per-frame hash) ---
 
-// Is `(coord, lod)` in the desired set (present-flag)? Linear-probe; a free slot before a match ⇒ absent.
+// Is `(coord, lod)` in the DESIRED set? The desired set is EXACTLY `level_resident ∩ occupied` — the same
+// condition the enumerate's `desired_list` was built from (`level_resident` = the clipmap shell `level_box \
+// level_hole`; `is_occupied` = the static per-scene sector mask). Computing it DIRECTLY (both are cheap pure
+// functions) rather than probing a per-frame `present_flag` hash:
+//   * removes a LIST_CAP-sized buffer + the Pass-C0 build pass (memory + a pass; the 8 GB budget),
+//   * is STRICTLY more correct — a hash built from a capped `desired_list` is INCOMPLETE when the desired set
+//     overflows the cap (the G-c.4 BUG-2 drop/re-enter THRASH); a direct query never is,
+//   * DECOUPLES the drop decision from enumeration (drop scans only the bounded slot_table) — the enabler for
+//     TILING the enumeration at bounded transient memory (docs/DYNAMIC_LARGE_SCENE_PLAN.md Phase 2b).
 fn present_contains(coord: vec3<i32>, lod: u32) -> bool {
-    let size = diff_cfg.present_size;
-    if (size == 0u) {
-        return false;
-    }
-    let mask = size - 1u;
-    var slot = hash_key(coord, lod) & mask;
-    for (var i = 0u; i < size; i = i + 1u) {
-        let base = slot * PRESENT_WORDS;
-        let e_lod = atomicLoad(&present_flag[base + 3u]);
-        if (e_lod == EMPTY_LOD) {
-            return false;
-        }
-        if (e_lod == lod
-            && bitcast<i32>(atomicLoad(&present_flag[base + 0u])) == coord.x
-            && bitcast<i32>(atomicLoad(&present_flag[base + 1u])) == coord.y
-            && bitcast<i32>(atomicLoad(&present_flag[base + 2u])) == coord.z) {
-            return true;
-        }
-        slot = (slot + 1u) & mask;
-    }
-    return false;
+    return level_resident(coord, lod, params.clip_half_bricks) && is_occupied(coord, lod);
 }
 
 // **Pass C0 — build the present-flag** from `desired_list`. One invocation per desired key: atomic linear-probe
