@@ -121,7 +121,15 @@ impl Default for StreamingConfig {
             // Buffers are committed at capacity, so this reserves ~3.7 GiB VRAM regardless of the live count — fine
             // on the target dGPU; if a tighter budget is needed, screen-error LOD admission (the SOTA follow-up)
             // shrinks the resident set instead of growing the pool.
-            max_resident_bricks: 900_000,
+            // `ADVENTURE_MAX_RESIDENT=N` overrides the resident cap for large scenes (Bistro's clipmap wants
+            // ~910k surface bricks, just over the 900k default). HARD-clamped to 1_048_576: a single wgpu storage
+            // buffer maxes at ~2 GiB and the index pool is `max_resident · 512 · 4 B`, so 2 GiB / (512·4) = 1_048_576
+            // slots is the ceiling for the single-buffer-per-pool layout (going higher needs split/tiled pools).
+            max_resident_bricks: std::env::var("ADVENTURE_MAX_RESIDENT")
+                .ok()
+                .and_then(|s| s.parse::<usize>().ok())
+                .unwrap_or(900_000)
+                .min(1_048_576),
             max_bricks_per_frame: 256,
         }
     }

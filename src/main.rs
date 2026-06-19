@@ -272,6 +272,13 @@ fn main() {
         app.insert_resource(adventure::voxel::VoxelScene::Gallery);
     }
 
+    // FREE-FLY BISTRO (default; opt out with `ADVENTURE_NO_BISTRO=1`): boot the streamed GALLERY scene, which
+    // loads Bistro ALONE at origin (see raytrace::stream_voxel_rt_residency) — a large single scene for visual
+    // validation, with the camera left fully controllable (unlike the bench harness below, which pins it).
+    if std::env::var("ADVENTURE_NO_BISTRO").is_err() {
+        app.insert_resource(adventure::voxel::VoxelScene::Gallery);
+    }
+
     // BISTRO FPS BENCH HARNESS (`ADVENTURE_BENCH_BISTRO=1`, editor-only, additive). Measures the steady-state
     // interior raymarch FPS — the gate for the "165 FPS" perf goal. Pairs with `ADVENTURE_EXIT_AFTER_SECS=N`
     // (clean self-exit) + `ADVENTURE_CAM="tx,ty,tz,dist,yaw,pitch"` (a fixed interior view). It (a) boots the

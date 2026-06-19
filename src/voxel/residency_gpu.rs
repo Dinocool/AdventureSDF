@@ -759,6 +759,14 @@ impl PagedBrickCoreStore {
         }
     }
 
+    /// DEBUG (F9 dump): is `(coord, lod)`'s core LIVE in the GPU store right now? The CPU `keys` mirror is
+    /// bit-identical to the GPU table, so this is the exact `core_lookup != ABSENT` the pack shader would see.
+    /// Splits a content mismatch into "core absent in store" (a sync miss / evicted-while-resident — audit #1/#4)
+    /// vs "core present in store but pool content wrong" (a pack bug).
+    pub fn debug_core_resident(&self, coord: IVec3, lod: u32) -> bool {
+        self.keys.contains_key(&(coord, lod))
+    }
+
     /// Probe the CPU table for `key`'s LIVE slot (matching `(x,y,z,lod)`), or `None` if absent. Stops at the first
     /// [`EMPTY_LOD`] (matching the WGSL); SKIPS tombstones (continues). Bounded by `table_size`.
     fn find_slot(&self, coord: IVec3, lod: u32) -> Option<u32> {

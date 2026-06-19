@@ -96,8 +96,8 @@ struct DiffConfig {
 struct PackConfig {
     core_table_size: u32,
     max_resident: u32,
-    _pad0: u32,
-    _pad1: u32,
+    index_stride: u32,   // WORDS per slot in the index pool (fixed per-slot slab; = RESERVE_INDEX_WORDS_PER_BRICK)
+    palette_stride: u32, // WORDS per slot in the palette pool
 }
 
 fn build_params(cam: [f32; 3], half: i32) -> ResidencyParams {
@@ -306,7 +306,8 @@ impl GpuDrive {
         let params_buf = buf_init(&device, "params", bytemuck::bytes_of(&params), wgpu::BufferUsages::UNIFORM);
         let diff_cfg = DiffConfig { slot_table_size, present_size, max_resident, refine_descent_cap: REFINE_DESCENT_CAP };
         let diff_cfg_buf = buf_init(&device, "diff_cfg", bytemuck::bytes_of(&diff_cfg), wgpu::BufferUsages::UNIFORM);
-        let pack_cfg = PackConfig { core_table_size: cores.table_size, max_resident, _pad0: 0, _pad1: 0 };
+        // index/palette per-slot strides MUST match the pool sizing below (512/256 words/slot, fixed per-slot slabs).
+        let pack_cfg = PackConfig { core_table_size: cores.table_size, max_resident, index_stride: 512, palette_stride: 256 };
         let pack_cfg_buf = buf_init(&device, "pack_cfg", bytemuck::bytes_of(&pack_cfg), wgpu::BufferUsages::UNIFORM);
 
         // --- Pass C persistent state ---
@@ -354,11 +355,14 @@ impl GpuDrive {
         let classify_commands = storage_buf(&device, "classify_commands", (list_cap * 16) as u64);
         let neighbour_indices = storage_buf(&device, "neighbour_indices", (list_cap as u64) * 27 * 4);
 
-        // The persistent POOL (meta/voxel/palette) — sized like the CPU snapshot. Index/palette pools sized to
-        // the fixed-cap RESERVE means (mirror of `RESERVE_INDEX_WORDS_PER_BRICK`/`RESERVE_PALETTE_WORDS_PER_BRICK`).
+        // The persistent POOL (meta/voxel/palette). The GPU front end now uses FIXED PER-SLOT slabs (slot·stride),
+        // so the pools MUST be sized worst-case-per-slot (mirror `RESERVE_INDEX_WORDS_PER_BRICK`=512 / index_bits=16's
+        // 500w, `RESERVE_PALETTE_WORDS_PER_BRICK`=256 / index_bits=8's max) — each slot owns its own region.
+        const INDEX_STRIDE: usize = 512;
+        const PALETTE_STRIDE: usize = 256;
         let meta_words = max_resident as usize * META_WORDS;
-        let index_pool_words = (max_resident as usize * 192).max(512);
-        let palette_pool_words = (max_resident as usize * 16).max(64);
+        let index_pool_words = (max_resident as usize * INDEX_STRIDE).max(INDEX_STRIDE);
+        let palette_pool_words = (max_resident as usize * PALETTE_STRIDE).max(PALETTE_STRIDE);
         let meta_buf = storage_buf(&device, "meta_buf", (meta_words * 4) as u64);
         let voxel_buf = storage_buf(&device, "voxel_buf", (index_pool_words * 4) as u64);
         let palette_buf = storage_buf(&device, "palette_buf", (palette_pool_words * 4) as u64);
@@ -380,21 +384,13 @@ impl GpuDrive {
         //     a per-class free-list. ctrl layout = [shared_hw, (head,tail)×N_classes]. The pools are a SINGLE
         //     shared bump region (classes interleave by alloc order, exactly as the CPU), sized to the
         //     aggregate reserve above; the pool base is 0 (the pools start at word 0).
-        let index_ctrl_init = vec![0u32; 1 + 5 * 2];
-        let index_slab_ctrl = buf_init(&device, "index_slab_ctrl", bytemuck::cast_slice(&index_ctrl_init), storage_usage());
-        let index_slab_free = storage_buf(&device, "index_slab_free", (5 * max_resident as u64) * 4);
-        let palette_ctrl_init = vec![0u32; 1 + 16 * 2];
-        let palette_slab_ctrl =
-            buf_init(&device, "palette_slab_ctrl", bytemuck::cast_slice(&palette_ctrl_init), storage_usage());
-        let palette_slab_free = storage_buf(&device, "palette_slab_free", (16 * max_resident as u64) * 4);
+        // FIXED per-slot slabs: the pools start at word 0; Pass D3 writes `slot·stride` directly (no allocator
+        // buffers, no DenseSlot table). `index_pool_base[0]`/`palette_pool_base[0]` are the pool word bases (0).
         let index_pool_base =
             buf_init(&device, "index_pool_base", bytemuck::cast_slice(&[0u32]), wgpu::BufferUsages::STORAGE);
         let palette_pool_base =
             buf_init(&device, "palette_pool_base", bytemuck::cast_slice(&[0u32]), wgpu::BufferUsages::STORAGE);
-        let _ = index_class_words; // (the per-class word sizes live in the WGSL `index_class_words_d` SSOT)
-        // G-c.4: the GPU DenseSlot table + the enter-cap histogram/cut (cold-fill: never frees / never caps, but
-        // the shared enter/D3/D0 passes now reference these bindings, so they must be present).
-        let slab_state = storage_buf(&device, "slab_state", (max_resident as u64) * 4 * 4);
+        let _ = index_class_words; // (kept imported for the pool-sizing comment; per-class sizing no longer used)
         let enter_hist = storage_buf(&device, "enter_hist", (HIST_BUCKETS as u64) * 4);
         let enter_cap = buf_init(&device, "enter_cap", bytemuck::cast_slice(&[HIST_BUCKETS, 0u32]), storage_usage());
 
@@ -456,14 +452,9 @@ impl GpuDrive {
                 storage_entry(38, false), // pack_dispatch
                 storage_entry(39, false), // aabb_dispatch
                 storage_entry(40, false), // classify_dispatch
-                storage_entry(41, false), // index_slab_ctrl
-                storage_entry(42, false), // index_slab_free
-                storage_entry(43, false), // palette_slab_ctrl
-                storage_entry(44, false), // palette_slab_free
-                storage_entry(45, true),  // index_class_base
-                storage_entry(46, true),  // palette_class_base
+                storage_entry(45, true),  // index_pool_base
+                storage_entry(46, true),  // palette_pool_base
                 storage_entry(47, true),  // classify_out
-                storage_entry(49, false), // slab_state
                 storage_entry(50, false), // enter_hist
                 storage_entry(51, false), // enter_cap
             ],
@@ -551,14 +542,9 @@ impl GpuDrive {
                     bind(38, &pack_dispatch),
                     bind(39, &aabb_dispatch),
                     bind(40, &classify_dispatch),
-                    bind(41, &index_slab_ctrl),
-                    bind(42, &index_slab_free),
-                    bind(43, &palette_slab_ctrl),
-                    bind(44, &palette_slab_free),
                     bind(45, &index_pool_base),
                     bind(46, &palette_pool_base),
                     bind(47, &classify_out),
-                    bind(49, &slab_state),
                     bind(50, &enter_hist),
                     bind(51, &enter_cap),
                 ]
@@ -610,6 +596,7 @@ impl GpuDrive {
                 storage_entry(3, false),
                 storage_entry(4, false),
                 storage_entry(5, false),
+                storage_entry(12, true), // pack_cmd_count (2D-dispatch over-run guard)
             ],
         });
         let pack_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -635,6 +622,7 @@ impl GpuDrive {
                 bind(3, &voxel_buf),
                 bind(4, &palette_buf),
                 bind(5, &meta_buf),
+                bind(12, &pack_count), // pack_brick gates on this exact count (the 2D-dispatch over-run guard)
             ],
         });
 
@@ -933,14 +921,24 @@ fn gpu_driven_pack_per_key_content_matches_cpu() {
     // here we use the GPU resident set as the key universe and oracle each key's content via pack_one).
     assert!(!gpu.pools.slot_of.is_empty(), "the GPU front end produced an empty resident set");
 
-    // The CPU SSOT content per key: pack_one over the resident set (the canonical haloed cells). Build the
-    // resident-brick entries from the GPU resident keys (which the diff gate proves == the CPU manager set).
+    // The CPU SSOT content per key: pack_one over the resident set (the canonical haloed cells). The entries we
+    // ITERATE for the comparison are the GPU resident keys (which the diff gate proves == the CPU manager set).
     let resident_keys: Vec<(IVec3, u32)> = gpu.pools.slot_of.keys().copied().collect();
     let bricks: Vec<(IVec3, u32, Brick)> =
         resident_keys.iter().map(|&(c, l)| (c, l, source.brick(c, l, &reg))).collect();
     let entries: Vec<ResidentBrick> =
         bricks.iter().map(|(c, l, b)| ResidentBrick { coord: *c, brick: b, lod: *l }).collect();
-    let by_key = build_by_key(&entries);
+    // `by_key` (the halo dictionary `pack_one` reads each key's NEIGHBOUR cores from) MUST cover the full OCCUPIED
+    // set, not just the resident keys: the GPU halo reads the actual neighbour core from the core store (which holds
+    // every occupied brick here), so an occupied-but-not-resident neighbour contributes its REAL boundary voxels.
+    // Building `by_key` over resident-only made `pack_one` pack AIR for those neighbours (the old residency-only
+    // halo) and falsely diverge from the occupancy-correct GPU. (SSOT = the actual geometry, not the resident slice.)
+    let all_keys: Vec<(IVec3, u32)> = source.occupied_keys().collect();
+    let all_bricks: Vec<(IVec3, u32, Brick)> =
+        all_keys.iter().map(|&(c, l)| (c, l, source.brick(c, l, &reg))).collect();
+    let all_entries: Vec<ResidentBrick> =
+        all_bricks.iter().map(|(c, l, b)| ResidentBrick { coord: *c, brick: b, lod: *l }).collect();
+    let by_key = build_by_key(&all_entries);
 
     // The GPU pool as a GpuBrickPatch for `cell_block` decode.
     let gpu_patch = GpuBrickPatch {

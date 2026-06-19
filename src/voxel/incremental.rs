@@ -542,10 +542,20 @@ fn index_slab_words(index_bits: u8) -> u32 {
 /// simply leaves the pre-sized pool partly unused. (Was 192 ≈ the MEASURED MEAN — too small for a worst-case mix.)
 const RESERVE_INDEX_WORDS_PER_BRICK: u32 = 512;
 
-/// **Pre-size estimate — the MEAN per-brick PALETTE words a RESIDENT brick costs** (the palette-arena pre-grow per
-/// brick). MEASURED on the A4.4 worldgen slice: **0.41 MB / 10 k ≈ 10 words/brick**; we reserve **16 words/brick**
-/// (≈1.6× headroom; a high-registry `.vox` scene with larger per-brick palettes still grows safely past it).
-const RESERVE_PALETTE_WORDS_PER_BRICK: u32 = 16;
+/// **Pre-size bound — the per-brick PALETTE words pool reserve.** This is NOT a soft mean estimate: on the GPU
+/// residency path the palette pool is a HARD-CAPPED bump arena (`voxel_residency.wgsl::alloc_palette_slab`) sized
+/// EXACTLY `max_resident_bricks · this · 4 B`, and the GPU bump has no readback to grow it. The old MEAN value (16
+/// words ≈ the measured low-entropy worldgen mean) was a latent OOB: an `index_bits=8` brick (a high-registry
+/// `.vox`/voxelized scene — Sponza/Sibenik/etc.) carries up to a 256-word palette, so once enough rich-palette
+/// bricks are concurrently resident the bump high-water ran PAST the pool → overlapping/OOB palette slabs → bricks
+/// decode through a WRONG palette → garbage-content cubes (the user's coarse-LOD "jumbled colours", repro'd by
+/// `tests/voxel_paged_front_end_render.rs::rich_palette_pool_no_content_corruption`). We now reserve the
+/// `index_bits ≤ 8` WORST case (256 words/brick), MIRRORING the index pool's worst-case `RESERVE_INDEX_WORDS_PER_BRICK`
+/// (512 = the `index_bits=16` block) — so a scene of all-`index_bits=8` bricks can NEVER overflow by construction. A
+/// pathological `index_bits=16` brick (>256 distinct ids, up to a 1024-word palette) is the ONLY remaining overflow
+/// path; `alloc_palette_slab`'s capacity GUARD degrades it to uniform rather than corrupting (a hard backstop, not a
+/// floor — it is unreachable for the ≤8 scenes this reserve covers).
+const RESERVE_PALETTE_WORDS_PER_BRICK: u32 = 256;
 
 /// A DEGENERATE BLAS AABB (min > max on every axis) for an UNUSED slot: the BLAS build never reports a
 /// candidate for it, so a freed slot is invisible to the trace. `primitive_index = slot` is preserved (the

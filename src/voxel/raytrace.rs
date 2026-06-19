@@ -50,7 +50,7 @@ use super::gpu::{
     build_lights_from_entries, pack_brickmap, pack_resident_set,
 };
 use super::incremental::{
-    GpuPackBatch, RepackDelta, ResidentPacker, SnapshotBuffers,
+    GpuPackBatch, RepackDelta, ResidentPacker, SnapshotBuffers, degenerate_aabb,
 };
 use super::palette::{BlockId, BlockRegistry, CornellBlock};
 use super::source::{BrickSource, StaticVoxSource, WorldgenSource};
@@ -219,6 +219,19 @@ pub struct VoxelRtResidencyParams {
     pub has_emitters: bool,
 }
 
+/// **Residency debug-dump request** (the F9 hotkey). The main world bumps `counter` on each key press; the render
+/// world's [`dump_residency_debug`] sees the change and reads back the LIVE residency pool (meta + AABB) to a
+/// report on disk for offline analysis. Extracted main→render each frame; the render side tracks the last counter
+/// it dumped (a `Local`) so each press dumps exactly once. Zero cost until pressed.
+#[derive(Resource, Clone, Copy, ExtractResource, Default)]
+pub struct VoxelDebugDump {
+    /// F9 — bumped to request a residency pool dump (+ screenshot).
+    pub counter: u32,
+    /// F10 — bumped to force a FULL BLAS rebuild of every chunk next frame. Diagnostic for stale-BLAS: if pressing
+    /// it CLEARS a stuck cube, the cube was stale BLAS geometry (a lost dirty-chunk rebuild), not a pool defect.
+    pub force_blas_rebuild: u32,
+}
+
 impl VoxelRtPatch {
     /// A device-free [`StorageReport`](super::gpu::StorageReport) of the current upload, for the editor VRAM
     /// panel. Only the contiguous static `Snapshot` (R2b) carries one — the streamed raw-arena
@@ -379,6 +392,9 @@ impl Plugin for VoxelRtPlugin {
             // Phase G "G-c.4" — the LIVE per-frame residency params (camera + clip_half), the only per-frame
             // CPU→GPU residency traffic for the GPU-driven front end.
             .init_resource::<VoxelRtResidencyParams>()
+            .init_resource::<VoxelDebugDump>()
+            .add_systems(Update, request_residency_debug_dump)
+            .add_plugins(ExtractResourcePlugin::<VoxelDebugDump>::default())
             .add_plugins(ExtractResourcePlugin::<VoxelRtToggle>::default())
             .add_plugins(ExtractResourcePlugin::<VoxelRtResidencyUpload>::default())
             .add_plugins(ExtractResourcePlugin::<VoxelRtResidencyParams>::default())
@@ -408,6 +424,13 @@ impl Plugin for VoxelRtPlugin {
         render_app
             .add_systems(RenderStartup, init_voxel_rt)
             .add_systems(Render, prepare_voxel_rt.in_set(RenderSystems::PrepareResources))
+            // The residency debug-dump (F9): runs right AFTER the residency drive so it reads the just-written pool.
+            .add_systems(
+                Render,
+                dump_residency_debug
+                    .in_set(RenderSystems::PrepareResources)
+                    .after(prepare_voxel_rt),
+            )
             // The composite MUST run AFTER the main opaque/transparent passes (so it loads onto the
             // already-cleared, already-rendered view target instead of being wiped by the opaque pass's
             // first-call `LoadOp::Clear`) and BEFORE tonemapping (`Core3dSystems::PostProcess`) so it writes
@@ -646,15 +669,14 @@ fn stream_voxel_rt_residency(
         {
             // BENCH HARNESS (`ADVENTURE_BENCH_BISTRO=1`, dev-only): instead of the 4-scene corpus, build the
             // MergedSource from JUST `bistro.vxo` at offset (0,0,0) so Bistro sits at the world origin (centred
-            // X/Z, floor y=0) — a deterministic single-scene FPS benchmark target. The normal gallery path runs
-            // when the env is unset. See `bistro_bench_placements`.
-            let bench_bistro = std::env::var("ADVENTURE_BENCH_BISTRO").is_ok();
-            let placements = if bench_bistro {
+            // X/Z, floor y=0) — a deterministic single-scene FPS benchmark target. See `bistro_bench_placements`.
+            // Load Bistro ALONE at origin by default (opt out with `ADVENTURE_NO_BISTRO=1` for the full 4-scene
+            // gallery corpus). `ADVENTURE_BENCH_BISTRO` also forces Bistro-alone AND pins the camera; the default
+            // free-fly path keeps the camera controllable for visual validation of a large streamed scene.
+            let bistro_alone = std::env::var("ADVENTURE_BENCH_BISTRO").is_ok() || std::env::var("ADVENTURE_NO_BISTRO").is_err();
+            let placements = if bistro_alone {
                 let p = super::gallery::bistro_bench_placements();
-                info!(
-                    "voxel-RT: ADVENTURE_BENCH_BISTRO set — loading Bistro ALONE at origin ({} placement)",
-                    p.len()
-                );
+                info!("voxel-RT: loading Bistro ALONE at origin ({} placement)", p.len());
                 p
             } else {
                 vxo_gallery_placements(GALLERY_SCENES)
@@ -1073,10 +1095,19 @@ fn stream_voxel_rt_residency(
                         let _rb = info_span!("vox_pack_repopulate_shadow").entered();
                         p.repopulate_last_voxels(&entries);
                     }
-                    let buffers = {
+                    let mut buffers = {
                         let _ss = info_span!("vox_pack_snapshot").entered();
                         p.snapshot_buffers(active_registry)
                     };
+                    // ONE GPU RESIDENCY PATH: when the GPU front end will drive, the snapshot must seed NO content —
+                    // only ALLOCATE the (correctly-sized) empty pool. The front end cold-fills it from the pager via
+                    // the GPU pack (the single path that applies the surface/halo/has_air rules). The CPU `pack_one`
+                    // here packs the WHOLE resident set incl. bricks the front end's `classify_surface` never enters
+                    // (and all-solid stragglers) with LIVE AABBs — those bypass every GPU fix and persist as stuck
+                    // flat/black cubes. Emptying the content (keeping the buffer SIZES) eliminates that CPU seed.
+                    if front_end_will_drive {
+                        empty_snapshot_for_cold_fill(&mut buffers);
+                    }
                     *epoch_snapshotted = true;
                     VoxelRtUpload::StreamSnapshot { buffers, lights, alias }
                 } else if !batch.is_empty() {
@@ -1099,10 +1130,15 @@ fn stream_voxel_rt_residency(
                 // `update`'s allocations and cleared by `snapshot_buffers`.
                 if !*epoch_snapshotted || p.grew() {
                     // First pack of this epoch (or a grow): snapshot the fixed-cap buffers (allocate once / resize).
-                    let buffers = {
+                    let mut buffers = {
                         let _ss = info_span!("vox_pack_snapshot").entered();
                         p.snapshot_buffers(active_registry)
                     };
+                    // ONE GPU RESIDENCY PATH — empty the CPU-packed content when the front end will drive (see the
+                    // gpu_pack arm above): the GPU cold-fill is the only path that may seed the pool.
+                    if front_end_will_drive {
+                        empty_snapshot_for_cold_fill(&mut buffers);
+                    }
                     *epoch_snapshotted = true;
                     VoxelRtUpload::StreamSnapshot { buffers, lights, alias }
                 } else if !delta.is_empty() {
@@ -1191,6 +1227,28 @@ fn toggle_voxel_rt_input(keys: Res<ButtonInput<KeyCode>>, mut toggle: ResMut<Vox
             toggle.enabled = !toggle.enabled;
             info!("voxel-RT view: {}", if toggle.enabled { "ON (HW ray tracing)" } else { "OFF (clear only)" });
         }
+    }
+}
+
+/// **F9 — request a residency debug dump.** Main-world: bump the [`VoxelDebugDump`] counter; the render world
+/// reads back the live residency pool to a report on disk (see [`dump_residency_debug`]). For diagnosing the
+/// streaming/LOD black-cube artifacts: reproduce, then press F9 to capture the exact live GPU state.
+fn request_residency_debug_dump(
+    keys: Res<ButtonInput<KeyCode>>,
+    mut dump: ResMut<VoxelDebugDump>,
+    mut commands: Commands,
+) {
+    if keys.just_pressed(KeyCode::F9) {
+        dump.counter = dump.counter.wrapping_add(1);
+        // Pair the pool dump with a screenshot so the live GPU state can be correlated with the visible artifact.
+        let shot = format!("D:/tmp_test/dump_shot_{}.png", dump.counter);
+        commands.spawn(bevy::render::view::window::screenshot::Screenshot::primary_window())
+            .observe(bevy::render::view::window::screenshot::save_to_disk(shot));
+        info!("voxel-RT: residency dump #{} (F9) → D:/tmp_test/residency_dump_*.txt + dump_shot_*.png", dump.counter);
+    }
+    if keys.just_pressed(KeyCode::F10) {
+        dump.force_blas_rebuild = dump.force_blas_rebuild.wrapping_add(1);
+        info!("voxel-RT: FORCE full BLAS rebuild (F10) — if this clears a stuck cube it was stale BLAS geometry");
     }
 }
 
@@ -2633,6 +2691,7 @@ fn init_voxel_rt(mut commands: Commands, render_device: Res<RenderDevice>) {
             pack_storage(3, false), // voxel_buf (index stream)
             pack_storage(4, false), // brick_palettes_buf
             pack_storage(5, false), // meta_buf
+            pack_storage(12, true), // pack_cmd_count (the 2D-dispatch over-run guard)
         ],
     });
     let pack_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -3269,6 +3328,423 @@ fn prepare_voxel_rt(
     }
 }
 
+/// **ONE GPU RESIDENCY PATH** — strip a `StreamSnapshot`'s CPU-packed CONTENT, keeping only the (correctly-sized)
+/// EMPTY pool: every meta zeroed, every AABB degenerate (a BLAS non-candidate), the index/palette arenas zeroed,
+/// `brick_count = 0`. The GPU front end then cold-fills the pool from the pager via the single GPU pack path (which
+/// alone applies the `classify_surface` / halo / `has_air`-degenerate rules). The CPU `pack_one` content this drops
+/// otherwise seeds bricks the front end never re-packs (buried / all-solid stragglers with live AABBs) ⇒ stuck
+/// flat/black cubes — the artifact this removes. The buffer LENGTHS are preserved so the front-end slab arenas fit.
+fn empty_snapshot_for_cold_fill(b: &mut SnapshotBuffers) {
+    for m in &mut b.metas {
+        *m = GpuBrickMeta::zeroed();
+    }
+    for a in &mut b.aabbs {
+        *a = degenerate_aabb();
+    }
+    b.indices.iter_mut().for_each(|w| *w = 0);
+    b.brick_palettes.iter_mut().for_each(|w| *w = 0);
+    // KEEP `brick_count` non-zero: `VoxelRtUpload::is_empty()` gates on it, and an "empty" upload is SKIPPED by the
+    // render world — which would leave the pool UN-allocated (blank). The content is empty (the front end cold-fills);
+    // brick_count stays the CPU pack's count purely as the apply-gate + a diagnostic (the live count converges as the
+    // front end fills). If the CPU pack found zero bricks, force ≥1 so the empty pool is still allocated.
+    b.brick_count = b.brick_count.max(1);
+}
+
+/// Blocking dev readback of a whole storage buffer into `Vec<u32>` (residency debug dump only — never the hot path).
+fn dbg_readback_u32(device: &wgpu::Device, queue: &wgpu::Queue, buf: &wgpu::Buffer) -> Vec<u32> {
+    let size = buf.size();
+    let staging = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("residency_dbg_rb"),
+        size,
+        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+        mapped_at_creation: false,
+    });
+    let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("residency_dbg") });
+    enc.copy_buffer_to_buffer(buf, 0, &staging, 0, size);
+    queue.submit(core::iter::once(enc.finish()));
+    let _ = device.poll(wgpu::PollType::wait_indefinitely());
+    staging.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+    let _ = device.poll(wgpu::PollType::wait_indefinitely());
+    let out = match staging.slice(..).get_mapped_range() {
+        Ok(d) => bytemuck::cast_slice::<u8, u32>(&d).to_vec(),
+        Err(_) => Vec::new(),
+    };
+    staging.unmap();
+    out
+}
+
+/// **Residency debug dump (F9).** On a new [`VoxelDebugDump::counter`], read back the LIVE residency pool (the
+/// meta + AABB buffers the front end just wrote, plus the BLAS chunk layout + pager state) and write an analyzable
+/// report to `D:/tmp_test/residency_dump_<n>.txt`. This captures the exact live GPU state at the moment a
+/// streaming/LOD artifact is on screen — the thing a synchronous CPU harness can't reproduce. It cross-checks the
+/// meta pool against the AABB pool (what the BLAS actually traces): the KEY signatures it surfaces are
+///   * **FREED-meta-but-LIVE-AABB** — a dropped slot whose AABB wasn't degenerated ⇒ the BLAS still traces stale
+///     geometry there ⇒ a STUCK BLACK CUBE; and
+///   * **cross-LOD overlapping live AABBs** — a coarse brick not dropped when its region refined; and
+///   * **live AABBs in a chunk index ≥ n_chunks** — a dirty-chunk drop (BLAS never rebuilt for that band).
+/// Set `ADVENTURE_DUMP_RAW=1` to ALSO dump the raw meta+aabb buffers (`.bin`) for deeper offline analysis.
+#[allow(clippy::too_many_lines)]
+fn dump_residency_debug(
+    mut resources: ResMut<VoxelRtResources>,
+    params: Res<VoxelRtResidencyParams>,
+    render_device: Res<RenderDevice>,
+    render_queue: Res<RenderQueue>,
+    dump: Res<VoxelDebugDump>,
+    mut last: Local<u32>,
+    mut last_force: Local<u32>,
+) {
+    // F10 — force a FULL BLAS rebuild: queue every chunk for rebuild next frame (the drive drains pending_blas_chunks).
+    if dump.force_blas_rebuild != *last_force {
+        *last_force = dump.force_blas_rebuild;
+        let n = resources.scene.as_ref().map(|s| s.chunks.len()).unwrap_or(0);
+        resources.pending_blas_chunks.extend(0..n);
+        info!("voxel-RT: F10 queued FULL BLAS rebuild of {n} chunks");
+    }
+    if dump.counter == *last {
+        return;
+    }
+    *last = dump.counter;
+    let n = dump.counter;
+    let device = render_device.wgpu_device();
+    let queue = render_queue.0.as_ref();
+
+    let Some(scene) = resources.scene.as_ref() else {
+        warn!("residency dump #{n}: no live scene — nothing to dump");
+        return;
+    };
+    let max_resident = (scene.meta_buf.size() / core::mem::size_of::<GpuBrickMeta>() as u64) as usize;
+    let n_chunks = scene.chunks.len();
+
+    let metas_raw = dbg_readback_u32(device, queue, &scene.meta_buf);
+    let aabb_raw = dbg_readback_u32(device, queue, &scene.aabb_buf);
+    let metas: &[GpuBrickMeta] = bytemuck::cast_slice(&metas_raw);
+    let aabbs: &[GpuBrickAabb] = bytemuck::cast_slice(&aabb_raw);
+    let zero = GpuBrickMeta::zeroed();
+    let n_slots = metas.len().min(aabbs.len());
+
+    // Per-slot classification (meta-vs-AABB consistency = what the BLAS traces vs what the pool says is resident).
+    let (mut live_live, mut live_degen, mut freed_live, mut freed_degen) = (0usize, 0usize, 0usize, 0usize);
+    let mut freed_live_examples: Vec<String> = Vec::new();
+    let mut per_lod = [0usize; 8];
+    let mut live: Vec<(usize, u32, [f32; 3], [f32; 3])> = Vec::new(); // (slot, lod, min, max)
+    let mut max_live_chunk = 0usize;
+    let mut live_beyond_chunks = 0usize;
+    for slot in 0..n_slots {
+        let m = &metas[slot];
+        let a = &aabbs[slot];
+        let meta_live = *m != zero;
+        let aabb_degen = a.min[0] > a.max[0] || a.min[1] > a.max[1] || a.min[2] > a.max[2];
+        match (meta_live, aabb_degen) {
+            (true, false) => live_live += 1,
+            (true, true) => live_degen += 1,
+            (false, false) => {
+                freed_live += 1;
+                if freed_live_examples.len() < 12 {
+                    freed_live_examples.push(format!("slot {slot} (chunk {}): aabb [{:?}..{:?}]", slot / CHUNK_SLOTS as usize, a.min, a.max));
+                }
+            }
+            (false, true) => freed_degen += 1,
+        }
+        if !aabb_degen {
+            let chunk = slot / CHUNK_SLOTS as usize;
+            max_live_chunk = max_live_chunk.max(chunk);
+            if chunk >= n_chunks {
+                live_beyond_chunks += 1;
+            }
+            let lod = if meta_live { m.lod() } else { u32::MAX };
+            if (lod as usize) < 8 {
+                per_lod[lod as usize] += 1;
+            }
+            live.push((slot, lod, a.min, a.max));
+        }
+    }
+
+    // Cross-LOD overlapping LIVE AABBs (a coarse brick not dropped when its region refined). O(n²) capped for cost.
+    let eps = 1e-4f32;
+    let mut overlaps = 0usize;
+    let mut overlap_examples: Vec<String> = Vec::new();
+    let cap = live.len().min(4000); // bound the pairwise scan in a huge pool (dev dump)
+    for i in 0..cap {
+        for j in (i + 1)..cap {
+            if live[i].1 != live[j].1
+                && live[i].1 != u32::MAX
+                && live[j].1 != u32::MAX
+                && (0..3).all(|k| live[i].2[k] + eps < live[j].3[k] && live[j].2[k] + eps < live[i].3[k])
+            {
+                overlaps += 1;
+                if overlap_examples.len() < 12 {
+                    overlap_examples.push(format!(
+                        "lod{} slot{} [{:?}..{:?}] ∩ lod{} slot{} [{:?}..{:?}]",
+                        live[i].1, live[i].0, live[i].2, live[i].3, live[j].1, live[j].0, live[j].2, live[j].3
+                    ));
+                }
+            }
+        }
+    }
+
+    let (pager_regions, pager_cores) = resources
+        .streamed_pager
+        .as_ref()
+        .map(|p| (p.resident_region_count(), p.resident_core_count()))
+        .unwrap_or((0, 0));
+    let fe_resident = resources
+        .gpu_front_end
+        .as_ref()
+        .map(|fe| fe.diag_resident_count(device, queue))
+        .unwrap_or(u32::MAX);
+    let pending_blas = resources.pending_blas_chunks.len();
+
+    // OPTIONAL halo-content decode (ADVENTURE_DUMP_HALO=1): the meta+AABB can be correct while a brick's VOXEL data
+    // (the haloed grid the normal gradient reads) is wrong ⇒ a degenerate normal ⇒ a black cube the meta/AABB checks
+    // can't see. Decode each live dense brick's 10³ halo (the SSOT `cell_block`) and flag the degenerate-normal
+    // signatures: an all-AIR core (resident brick with nothing to hit), and an all-SOLID halo (a buried/uniform-ish
+    // brick whose gradient is zero). Heavy (reads the whole voxel arena), so opt-in.
+    let mut halo_report = String::new();
+    // Default ON (the F9 dump is a one-shot, so the heavy voxel-arena readback is acceptable); set
+    // ADVENTURE_NO_DUMP_HALO=1 to skip it if it ever stalls too long on a huge pool.
+    if std::env::var("ADVENTURE_NO_DUMP_HALO").is_err() {
+        use std::fmt::Write as _;
+        let voxels = dbg_readback_u32(device, queue, &scene.voxel_buf);
+        let palettes = dbg_readback_u32(device, queue, &scene.brick_palettes_buf);
+        let hedge = 10i32;
+        let cell = |m: &GpuBrickMeta, x: i32, y: i32, z: i32| -> u32 {
+            if m.is_uniform() {
+                return m.uniform_block().0 as u32;
+            }
+            let ci = (x + y * hedge + z * hedge * hedge) as usize;
+            let bits = m.index_bits() as u32;
+            if bits == 0 {
+                return *voxels.get(m.dense_offset() as usize + ci).unwrap_or(&0);
+            }
+            let bit = ci as u32 * bits;
+            let word = *voxels.get(m.dense_offset() as usize + (bit / 32) as usize).unwrap_or(&0);
+            let mask = if bits == 32 { 0xFFFF_FFFF } else { (1u32 << bits) - 1 };
+            let local = (word >> (bit % 32)) & mask;
+            *palettes.get(m.palette_base as usize + local as usize).unwrap_or(&0)
+        };
+        let (mut empty_core, mut all_solid_halo, mut uniform_n) = (0usize, 0usize, 0usize);
+        let mut all_solid_live_aabb = 0usize;
+        // CONTENT INTEGRITY: GPU-pool brick core vs the pager SOURCE core. A mismatch ⇒ the pack/pager corrupted the
+        // brick (garbage normals) — pins the cube to the pool, not the render. Per-LOD so a coarse-only bug shows.
+        let mut content_checked = [0usize; 8];
+        let mut content_mismatch = [0usize; 8];
+        let mut first_mismatch = String::new();
+        let mut examples: Vec<String> = Vec::new();
+        // DISAMBIGUATORS for the mismatch CAUSE: (a) palette-pool overflow (the index_bits=8 reserve bug) vs (b) a
+        // core-miss / wrong-content cause (the brick packed before its core paged in). Track the palette high-water
+        // (max palette_base+slab over resident dense bricks) vs the pool size; per-mismatch index_bits histogram; and
+        // whether the differing voxels are GPU-AIR (0) [core-miss → packed as air] vs wrong-NONZERO [palette garbage].
+        let palette_pool_words = palettes.len();
+        let mut max_palette_end = 0usize; // high-water of palette_base + class-bound over ALL resident dense bricks
+        let mut mismatch_index_bits = [0usize; 17]; // histogram by index_bits (0,1,2,4,8,16 used)
+        let mut mismatch_palette_oob = 0usize; // mismatch bricks whose palette slab extends past the pool
+        let mut mismatch_gpu_air_dominant = 0usize; // mismatch bricks where most differing voxels are GPU-air (core-miss)
+        let mut mismatch_core_in_store = 0usize; // mismatch bricks whose core IS resident in the GPU store (pack bug)
+        let mut mismatch_core_absent = 0usize; // mismatch bricks whose core is ABSENT in the store (sync miss / evict)
+        for slot in 0..n_slots {
+            let m = &metas[slot];
+            if *m == zero {
+                continue;
+            }
+            if m.is_uniform() {
+                uniform_n += 1;
+                continue;
+            }
+            // Track the palette high-water: a dense brick's palette slab is `palette_base .. +class_words`. The class
+            // upper bound from index_bits (≤16 for bits≤4, ≤256 for bits=8, ≤65536 for bits=16) over-estimates the
+            // exact `k` but is enough to flag OOB. If this exceeds the pool the bump allocator OVERFLOWED.
+            let ibits = m.index_bits();
+            let pal_class_cap = if ibits == 0 { 0 } else if ibits <= 4 { 16 } else if ibits <= 8 { 256 } else { 65536 };
+            max_palette_end = max_palette_end.max(m.palette_base as usize + pal_class_cap);
+            // Compare this brick's GPU-decoded 8³ core to the pager's SOURCE core (cap the work per LOD).
+            let lod = m.lod();
+            if (lod as usize) < 8 && content_checked[lod as usize] < 300 {
+                if let Some(pager) = resources.streamed_pager.as_ref() {
+                    let span = super::brickmap::brick_span(lod);
+                    let coord = bevy::math::IVec3::new(
+                        (m.world_min[0] / span).round() as i32,
+                        (m.world_min[1] / span).round() as i32,
+                        (m.world_min[2] / span).round() as i32,
+                    );
+                    if let Some(src) = pager.debug_source_core(coord, lod) {
+                        content_checked[lod as usize] += 1;
+                        let mut diff = 0u32;
+                        let mut diff_gpu_air = 0u32; // of the differing voxels, how many are GPU-AIR (0)
+                        for cz in 0..8i32 {
+                            for cy in 0..8i32 {
+                                for cx in 0..8i32 {
+                                    let gpu = cell(m, cx + 1, cy + 1, cz + 1); // core cell = halo index +1
+                                    let s = src[super::brickmap::voxel_index(cx, cy, cz)];
+                                    if gpu != s {
+                                        diff += 1;
+                                        if gpu == 0 {
+                                            diff_gpu_air += 1;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        if diff > 0 {
+                            content_mismatch[lod as usize] += 1;
+                            mismatch_index_bits[(ibits as usize).min(16)] += 1;
+                            if m.palette_base as usize + pal_class_cap > palette_pool_words {
+                                mismatch_palette_oob += 1;
+                            }
+                            if diff_gpu_air * 2 > diff {
+                                mismatch_gpu_air_dominant += 1; // >50% of the wrong voxels are AIR ⇒ core-miss signature
+                            }
+                            if pager.debug_core_in_store(coord, lod) {
+                                mismatch_core_in_store += 1; // core IS in the GPU store ⇒ the PACK mis-decoded it (pack bug)
+                            } else {
+                                mismatch_core_absent += 1; // core ABSENT in the store ⇒ sync miss / evicted-while-resident
+                            }
+                            if first_mismatch.is_empty() {
+                                first_mismatch = format!(
+                                    "slot {slot} lod{lod} coord {coord:?}: {diff}/512 differ (index_bits={ibits}, {diff_gpu_air} of the diffs are GPU-AIR, palette_base={})",
+                                    m.palette_base
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+            let mut core_solid = 0u32;
+            let mut halo_air = 0u32;
+            for z in 0..hedge {
+                for y in 0..hedge {
+                    for x in 0..hedge {
+                        let air = cell(m, x, y, z) == 0;
+                        if air {
+                            halo_air += 1;
+                        }
+                        let in_core = (1..=8).contains(&x) && (1..=8).contains(&y) && (1..=8).contains(&z);
+                        if in_core && !air {
+                            core_solid += 1;
+                        }
+                    }
+                }
+            }
+            if core_solid == 0 {
+                empty_core += 1;
+                if examples.len() < 12 {
+                    examples.push(format!("slot {slot} lod{} EMPTY CORE (aabb-live, no solid to hit)", m.lod()));
+                }
+            }
+            if halo_air == 0 {
+                all_solid_halo += 1;
+                // Is this buried brick still RENDERED (live AABB)? With the has_air→degenerate fix it must be
+                // degenerate (not traced). A LIVE AABB here = the fix didn't reach this brick.
+                let a = &aabbs[slot];
+                let aabb_live = a.min[0] <= a.max[0] && a.min[1] <= a.max[1] && a.min[2] <= a.max[2];
+                if aabb_live {
+                    all_solid_live_aabb += 1;
+                }
+                if examples.len() < 12 {
+                    examples.push(format!(
+                        "slot {slot} lod{} ALL-SOLID halo — aabb_live={aabb_live} uniform={} index_bits={} (chunk {})",
+                        m.lod(), m.is_uniform(), m.index_bits(), slot / CHUNK_SLOTS as usize
+                    ));
+                }
+            }
+        }
+        let _ = writeln!(halo_report, "\n--- halo content (ADVENTURE_DUMP_HALO) ---");
+        let _ = writeln!(halo_report, "uniform bricks = {uniform_n}");
+        let _ = writeln!(halo_report, "dense bricks with EMPTY CORE (resident but nothing to hit) = {empty_core}   <== should be 0");
+        let _ = writeln!(halo_report, "dense bricks with ALL-SOLID halo = {all_solid_halo}  (of these, STILL-RENDERED/live-AABB = {all_solid_live_aabb}  <== should be 0)");
+        let _ = writeln!(halo_report, "content vs SOURCE: checked/lod={content_checked:?}  MISMATCH/lod={content_mismatch:?}  <== all should be 0");
+        let _ = writeln!(
+            halo_report,
+            "  palette pool: {palette_pool_words} words; resident high-water (palette_base+class) = {max_palette_end}  {}",
+            if max_palette_end > palette_pool_words { "<== OVERFLOW (palette reserve too small / bug)" } else { "(within pool — palette OK)" }
+        );
+        let _ = writeln!(
+            halo_report,
+            "  mismatch CAUSE: index_bits histogram [b1={} b2={} b4={} b8={} b16={}]; palette-OOB bricks={mismatch_palette_oob}; GPU-air-dominant (core-miss sig)={mismatch_gpu_air_dominant}",
+            mismatch_index_bits[1], mismatch_index_bits[2], mismatch_index_bits[4], mismatch_index_bits[8], mismatch_index_bits[16]
+        );
+        let _ = writeln!(
+            halo_report,
+            "  mismatch CORE STORE: core-present-in-store (⇒ PACK bug) = {mismatch_core_in_store}; core-ABSENT-in-store (⇒ sync miss / evicted-while-resident) = {mismatch_core_absent}"
+        );
+        // DEFINITIVE SLAB-ALIASING detector: over ALL resident DENSE bricks, count how many SHARE a palette_base or a
+        // dense_offset with ANOTHER brick. Two live bricks at the same slab offset == the free-list race (an alloc
+        // popped a slot mid-write ⇒ two bricks alias one slab ⇒ one reads the other's content). MUST be 0.
+        {
+            use std::collections::HashMap;
+            let mut pal: HashMap<u32, u32> = HashMap::new();
+            let mut idx: HashMap<u32, u32> = HashMap::new();
+            for m in metas.iter() {
+                if *m == zero || m.is_uniform() {
+                    continue;
+                }
+                *pal.entry(m.palette_base).or_insert(0) += 1;
+                *idx.entry(m.dense_offset()).or_insert(0) += 1;
+            }
+            let pal_aliased: u32 = pal.values().filter(|&&c| c > 1).map(|&c| c).sum();
+            let idx_aliased: u32 = idx.values().filter(|&&c| c > 1).map(|&c| c).sum();
+            let pal_groups = pal.values().filter(|&&c| c > 1).count();
+            let idx_groups = idx.values().filter(|&&c| c > 1).count();
+            let _ = writeln!(
+                halo_report,
+                "  SLAB ALIASING: palette_base shared by {pal_aliased} bricks in {pal_groups} groups; dense_offset shared by {idx_aliased} bricks in {idx_groups} groups  <== both should be 0 (else the free-list race)"
+            );
+        }
+        if !first_mismatch.is_empty() {
+            let _ = writeln!(halo_report, "  first mismatch: {first_mismatch}");
+        }
+        for e in &examples {
+            let _ = writeln!(halo_report, "  {e}");
+        }
+    }
+
+    let mut report = String::new();
+    use std::fmt::Write as _;
+    let _ = writeln!(report, "=== RESIDENCY DEBUG DUMP #{n} ===");
+    let _ = writeln!(report, "cam_world          = {:?}", params.cam_world);
+    let _ = writeln!(report, "clip_half_bricks   = {}", params.clip_half_bricks);
+    let _ = writeln!(report, "epoch / has_emit   = {} / {}", params.epoch, params.has_emitters);
+    let _ = writeln!(report, "max_resident slots = {max_resident}");
+    let _ = writeln!(report, "n_chunks (CHUNK={CHUNK_SLOTS}) = {n_chunks}  (covers slots 0..{})", n_chunks * CHUNK_SLOTS as usize);
+    let _ = writeln!(report, "front-end resident_count = {fe_resident}");
+    let _ = writeln!(report, "pager: resident_regions={pager_regions}  resident_cores={pager_cores}");
+    let _ = writeln!(report, "pending_blas_chunks (backlog) = {pending_blas}");
+    let _ = writeln!(report, "");
+    let _ = writeln!(report, "--- meta vs AABB consistency (what the BLAS traces) ---");
+    let _ = writeln!(report, "live meta + live  AABB = {live_live}   (normal resident bricks)");
+    let _ = writeln!(report, "live meta + degen AABB = {live_degen}   (resident but no BLAS prim — a HOLE; should be ~0)");
+    let _ = writeln!(report, "FREED meta + LIVE AABB = {freed_live}   <== STALE BLAS GEOMETRY (stuck black cube) — should be 0");
+    let _ = writeln!(report, "freed meta + degen AABB = {freed_degen}  (clean free slots)");
+    let _ = writeln!(report, "live AABBs per lod = {per_lod:?}");
+    let _ = writeln!(report, "max live chunk = {max_live_chunk}  (n_chunks={n_chunks})");
+    let _ = writeln!(report, "live AABBs in chunk >= n_chunks (dropped-dirty bug) = {live_beyond_chunks}   <== should be 0");
+    let _ = writeln!(report, "cross-LOD overlapping live AABBs (first {cap} live, capped) = {overlaps}   <== should be 0");
+    if !freed_live_examples.is_empty() {
+        let _ = writeln!(report, "\n[FREED-meta-but-LIVE-AABB examples]");
+        for e in &freed_live_examples {
+            let _ = writeln!(report, "  {e}");
+        }
+    }
+    if !overlap_examples.is_empty() {
+        let _ = writeln!(report, "\n[cross-LOD overlap examples]");
+        for e in &overlap_examples {
+            let _ = writeln!(report, "  {e}");
+        }
+    }
+
+    report.push_str(&halo_report);
+
+    let path = format!("D:/tmp_test/residency_dump_{n}.txt");
+    let _ = std::fs::create_dir_all("D:/tmp_test");
+    match std::fs::write(&path, &report) {
+        Ok(()) => info!("residency dump #{n} written → {path}\n{report}"),
+        Err(e) => warn!("residency dump #{n}: write failed: {e}\n{report}"),
+    }
+    if std::env::var("ADVENTURE_DUMP_RAW").is_ok() {
+        let _ = std::fs::write(format!("D:/tmp_test/residency_dump_{n}_meta.bin"), bytemuck::cast_slice::<u32, u8>(&metas_raw));
+        let _ = std::fs::write(format!("D:/tmp_test/residency_dump_{n}_aabb.bin"), bytemuck::cast_slice::<u32, u8>(&aabb_raw));
+    }
+}
+
 /// Create one chunk BLAS (A3 Stage 3 slot-band) sized for `prim_count` AABB primitives. The single SSOT for the
 /// chunk BLAS descriptor, shared by [`build_scene_full`]'s initial creation and [`apply_delta`]'s dirty-chunk
 /// rebuild (which recreates the handle ⇒ a fresh full `Build`).
@@ -3328,13 +3804,15 @@ fn build_scene_full(
     });
     let meta_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("voxel_rt_metas"),
+        // COPY_SRC: the residency debug-dump (F9) reads the live meta pool back to disk for offline analysis.
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
         contents: meta_bytes,
-        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
     });
     let voxel_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("voxel_rt_voxel_indices"),
+        // COPY_SRC: the F9 residency dump decodes live bricks' halo content (ADVENTURE_DUMP_HALO=1).
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
         contents: voxel_bytes,
-        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
     });
     let palette_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("voxel_rt_palette"),
@@ -3343,8 +3821,8 @@ fn build_scene_full(
     });
     let brick_palettes_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("voxel_rt_brick_palettes"),
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
         contents: brick_palettes_bytes,
-        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
     });
     // A3 Stage 3 — partition the `blas_primitives` slots into SLOT-BAND CHUNKS of `CHUNK_SLOTS` each. One BLAS
     // per chunk (reading its band as a slice of the shared `aabb_buf` via `primitive_offset`), one identity TLAS
@@ -3877,7 +4355,6 @@ fn drive_gpu_residency_front_end(
             let fe = resources.gpu_front_end.as_ref().expect("built");
             let resident = fe.diag_resident_count(device, queue);
             let (a_cnt, p_cnt, c_cnt, d_cnt, chg) = fe.diag_counts(device, queue);
-            let (idx_hw, pal_hw) = fe.diag_slab_highwater(device, queue);
             let max_resident_diag = fe.max_resident_diag();
             // Pager (demand-paged core store) stats — if `cores` climbs toward the cap during motion, the core
             // store is overflowing (entered bricks then pack with an absent core ⇒ black cube).
@@ -3886,10 +4363,6 @@ fn drive_gpu_residency_front_end(
                 .as_ref()
                 .map(|p| (p.resident_region_count(), p.resident_core_count()))
                 .unwrap_or((0, 0));
-            let (idx_cap, pal_cap) = {
-                let s = resources.scene.as_ref().expect("checked above");
-                (s.voxel_buf.size() / 4, s.brick_palettes_buf.size() / 4)
-            };
             // Read back the LIVE scene aabb_buf (now COPY_SRC): how many live / origin-collapsed / degenerate.
             let scene = resources.scene.as_ref().expect("checked above");
             let staging = device.create_buffer(&wgpu::BufferDescriptor {
@@ -3933,7 +4406,7 @@ fn drive_gpu_residency_front_end(
             let blas_pending = resources.pending_blas_chunks.len();
             let blas_n_chunks = resources.scene.as_ref().map(|s| s.chunks.len()).unwrap_or(0);
             let line = format!(
-                "PAGED-DIAG frame {n}: fe_resident={resident}/{max_resident_diag} prev_change={prev_change:?} | counts aabb={a_cnt} pack={p_cnt} cand={c_cnt} desired={d_cnt} change={chg} | scene_aabb live={live} origin={origin} degen={degen} bad={bad} bbox=[{:.1},{:.1},{:.1}]..[{:.1},{:.1},{:.1}] | pager regions={pager_regions} cores={pager_cores} | slab idx_hw={idx_hw}/{idx_cap} pal_hw={pal_hw}/{pal_cap} | blas_pending={blas_pending}/{blas_n_chunks}\n",
+                "PAGED-DIAG frame {n}: fe_resident={resident}/{max_resident_diag} prev_change={prev_change:?} | counts aabb={a_cnt} pack={p_cnt} cand={c_cnt} desired={d_cnt} change={chg} | scene_aabb live={live} origin={origin} degen={degen} bad={bad} bbox=[{:.1},{:.1},{:.1}]..[{:.1},{:.1},{:.1}] | pager regions={pager_regions} cores={pager_cores} | blas_pending={blas_pending}/{blas_n_chunks}\n",
                 lo[0], lo[1], lo[2], hi[0], hi[1], hi[2]
             );
             info!("{}", line.trim_end());
@@ -4034,6 +4507,13 @@ fn apply_gpu_pack(
             contents: bytemuck::cast_slice(nbr_data),
             usage: wgpu::BufferUsages::STORAGE,
         });
+        // The 2D-dispatch over-run guard: `pack_brick` gates on this exact count (this batch is exactly sized, so it
+        // equals `commands.len()`). With the 2D grid `pack_brick` recovers `cmd_idx = wg.x + wg.y*65535`.
+        let count_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("voxel_rt_pack_count"),
+            contents: bytemuck::cast_slice(&[batch.commands.len() as u32]),
+            usage: wgpu::BufferUsages::STORAGE,
+        });
         let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("voxel_rt_pack_bg"),
             layout: &pipelines.pack_layout,
@@ -4044,10 +4524,11 @@ fn apply_gpu_pack(
                 wgpu::BindGroupEntry { binding: 3, resource: scene.voxel_buf.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 4, resource: scene.brick_palettes_buf.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 5, resource: scene.meta_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 12, resource: count_buf.as_entire_binding() },
             ],
         });
         // Keep the buffers alive alongside the bind group.
-        (bg, commands_buf, cores_buf, nbr_buf)
+        (bg, commands_buf, cores_buf, nbr_buf, count_buf)
     });
 
     // (2b) The AABB-pass scratch + bind group (only when there are aabb commands). One invocation per changed slot.
@@ -4077,7 +4558,10 @@ fn apply_gpu_pack(
         if let Some((bg, ..)) = &pack_scratch {
             pass.set_pipeline(&pipelines.pack);
             pass.set_bind_group(0, bg, &[]);
-            pass.dispatch_workgroups(batch.commands.len() as u32, 1, 1);
+            // 2D grid so a per-brick (1 workgroup/brick) dispatch can exceed the 65535 workgroups-per-dimension
+            // limit (worldgen cold-fills can be >65535 bricks). `pack_brick` recovers cmd_idx = wg.x + wg.y*65535.
+            let n = batch.commands.len() as u32;
+            pass.dispatch_workgroups(n.min(65535), n.div_ceil(65535), 1);
         }
         if let Some((bg, _)) = &aabb_scratch {
             pass.set_pipeline(&pipelines.pack_aabb);

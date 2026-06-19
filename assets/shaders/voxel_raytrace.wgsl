@@ -360,6 +360,22 @@ fn dda_brick(prim: u32, ro: vec3<f32>, rd: vec3<f32>, t_enter: f32, t_exit: f32)
             }
         }
     }
+    // FALLBACK — no exposed face found (every neighbour of the hit cell is solid): a UNIFORM / all-solid brick the
+    // ray nonetheless committed (e.g. a coarse brick exposed at a clipmap boundary, or a halo that packed solid).
+    // A committed hit ALWAYS crossed an entry face, so use that face's normal — never the degenerate zero gradient
+    // (`dh_normal` would return vec3(0) ⇒ a BLACK cube in the normals/shaded view). `step[last_axis]` is non-zero
+    // for the crossed axis, so this is a valid unit normal.
+    if (grad.x == 0 && grad.y == 0 && grad.z == 0) {
+        if (step[last_axis] != 0) {
+            grad[last_axis] = -step[last_axis];
+        } else {
+            // Entry axis is ray-parallel (step 0) — use the dominant ray axis, pointing back toward the origin.
+            let ar = abs(rd);
+            if (ar.x >= ar.y && ar.x >= ar.z) { grad.x = -i32(sign(rd.x)); }
+            else if (ar.y >= ar.z) { grad.y = -i32(sign(rd.y)); }
+            else { grad.z = -i32(sign(rd.z)); }
+        }
+    }
     let code = (grad.x + 1) + (grad.y + 1) * 3 + (grad.z + 1) * 9;
 
     return vec4<f32>(select(0.0, 1.0, found), hit_t, f32(hit_id), f32(code));

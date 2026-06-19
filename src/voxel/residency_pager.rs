@@ -149,10 +149,33 @@ impl StreamedResidencyPager {
         self.resident.len()
     }
 
+    /// TEST/DEBUG: fetch the SOURCE core for `(coord, lod)` — the exact 8³ core (voxel_index order) the GPU pack
+    /// should have produced for this brick. Used by the F9 dump's content-integrity check (compare GPU-pool content
+    /// vs this) to localize garbage content to the pack/pager vs the render side. Returns None if the brick's region
+    /// isn't decoded.
+    pub fn debug_source_core(&self, coord: IVec3, lod: u32) -> Option<[u32; crate::voxel::brickmap::BRICK_VOXELS]> {
+        for (ai, asset) in self.source.placed_assets().iter().enumerate() {
+            let rc = asset.source.region_of_world(lod, coord);
+            if let Some(region) = self.decoded.get(&(ai, lod, rc)) {
+                if let Some(core) = asset.source.core_at_world(lod, coord, region) {
+                    return Some(core);
+                }
+            }
+        }
+        None
+    }
+
     /// The number of resident cores (distinct paged bricks) — a constant-RAM / coverage diagnostic.
     #[inline]
     pub fn resident_core_count(&self) -> usize {
         self.core_store.resident_cores()
+    }
+
+    /// DEBUG (F9 dump): is `(coord, lod)`'s core LIVE in the GPU core store right now (what the pack `core_lookup`
+    /// sees)? Splits a content mismatch into core-absent-in-store (sync miss / evicted-while-resident) vs
+    /// core-present-but-pool-wrong (a pack bug). [`Self::debug_source_core`] separately confirms the SOURCE has it.
+    pub fn debug_core_in_store(&self, coord: IVec3, lod: u32) -> bool {
+        self.core_store.debug_core_resident(coord, lod)
     }
 
     /// Compute the CLIPMAP-COVERING present region set for `cam` (the desired resident set): per LOD, the

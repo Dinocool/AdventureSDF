@@ -145,6 +145,19 @@ fn brick_aabb_epsilon(lod: u32) -> f32 {
 // `raytrace.rs::CHUNK_SLOTS`. Bound only to the `write_aabb` pipeline (its own bind group).
 const CHUNK_SLOTS: u32 = 512u;
 @group(0) @binding(10) var<storage, read_write> dirty_chunk: array<atomic<u32>>;
+// The LIVE per-frame AABB-command COUNT (`[0]`), bound only to the front-end `write_aabb_dirty` pipeline. The
+// indirect dispatch rounds the invocation count UP to a workgroup multiple, so `write_aabb_dirty` MUST gate on this
+// real count — NOT `arrayLength(&aabb_commands)` (the whole capacity): the rounding tail would otherwise process
+// STALE commands left in the never-cleared buffer from prior frames, writing live AABBs (+ dirtying their chunks)
+// onto FREED slots ⇒ freed-meta-but-live-AABB stale BLAS geometry (a stuck black cube) that grows every frame.
+@group(0) @binding(11) var<storage, read> aabb_count_buf: array<u32>;
+// The LIVE per-command COUNT for `pack_brick` (`[0]`). The pack dispatch is 2D — `x = min(n, 65535), y = ceil(n /
+// 65535)` — so a per-brick (1 workgroup/brick) dispatch can exceed the 65535 workgroups-per-dimension cap (Bistro
+// needs ~610k). `pack_brick` recovers `cmd_idx = wg.x + wg.y*65535` and MUST gate on this real count, NOT
+// `arrayLength(&commands)` (the over-sized pool capacity): the 2D grid's partial last row over-runs `n`, and
+// processing the stale commands beyond it would overwrite live slots. Both pack paths bind it (front end = the
+// atomic `pack_count`; the CPU-batch path = `commands.len()`).
+@group(0) @binding(12) var<storage, read> pack_cmd_count: array<u32>;
 // **Stage G4 — the classify pass output.** One [`ClassifyOut`] (4 u32 / 16 B) per `commands` entry, written by
 // `classify_brick` (its OWN pipeline/bind-group — `pack_brick`/`write_aabb` ignore it). The CPU reads this back to
 // drive the EXISTING `SlabArena` allocation WITHOUT the CPU `pack_one` (that is the G4 win). Mirrors `GpuClassifyOut`
@@ -263,8 +276,10 @@ fn pack_brick(
     @builtin(workgroup_id) wg: vec3<u32>,
     @builtin(local_invocation_id) lid: vec3<u32>,
 ) {
-    let cmd_idx = wg.x;
-    if (cmd_idx >= arrayLength(&commands)) {
+    // 2D grid (size-agnostic): cmd_idx = wg.x + wg.y·65535 so a per-brick dispatch can exceed the 65535
+    // workgroups-per-dimension cap. For a 1D dispatch (wg.y == 0) this reduces to wg.x. Gate on the REAL count.
+    let cmd_idx = wg.x + wg.y * 65535u;
+    if (cmd_idx >= pack_cmd_count[0u]) {
         return;
     }
     let cmd = commands[cmd_idx];
@@ -400,10 +415,14 @@ fn write_aabb(@builtin(global_invocation_id) gid: vec3<u32>) {
 @compute @workgroup_size(64)
 fn write_aabb_dirty(@builtin(global_invocation_id) gid: vec3<u32>) {
     let i = gid.x;
-    if (i < arrayLength(&aabb_commands)) {
-        let chunk = aabb_commands[i].slot / CHUNK_SLOTS;
-        atomicOr(&dirty_chunk[chunk / 32u], 1u << (chunk % 32u));
+    // Gate on the REAL command count (see `aabb_count_buf`): the indirect dispatch over-runs to a workgroup
+    // multiple, and processing a stale command past the count writes a live AABB onto a freed slot (a stuck black
+    // cube). Skipping the tail keeps the meta pool and the AABB pool consistent (freed slot ⇒ degenerate AABB).
+    if (i >= aabb_count_buf[0]) {
+        return;
     }
+    let chunk = aabb_commands[i].slot / CHUNK_SLOTS;
+    atomicOr(&dirty_chunk[chunk / 32u], 1u << (chunk % 32u));
     write_aabb_slot(i);
 }
 
@@ -438,7 +457,10 @@ fn classify_brick(
     @builtin(workgroup_id) wg: vec3<u32>,
     @builtin(local_invocation_id) lid: vec3<u32>,
 ) {
-    let cmd_idx = wg.x;
+    // 2D grid (size-agnostic, mirror of pack_brick): cmd_idx = wg.x + wg.y·65535. The over-run past dirty_count
+    // (the 2D grid's partial last row) writes only `classify_out[cmd_idx]`, which Pass D3 never reads beyond
+    // dirty_count, so the `arrayLength` bound is sufficient here (no separate count buffer needed).
+    let cmd_idx = wg.x + wg.y * 65535u;
     if (cmd_idx >= arrayLength(&classify_commands)) {
         return;
     }
@@ -454,12 +476,16 @@ fn classify_brick(
     if (li == 0u) {
         let first = halo[0];
         var all_equal = true;
+        var any_air = false; // any AIR cell in the haloed grid ⇒ the brick has a VISIBLE surface voxel
         // First-seen palette, reused only to COUNT k (order discarded — the alloc needs the size class only).
         var k: u32 = 0u;
         for (var cell = 0u; cell < HALO_CELLS; cell = cell + 1u) {
             let id = halo[cell];
             if (id != first) {
                 all_equal = false;
+            }
+            if (id == 0u) {
+                any_air = true;
             }
             var found = false;
             for (var p = 0u; p < k; p = p + 1u) {
@@ -475,14 +501,21 @@ fn classify_brick(
         }
         // Uniform-incl-halo IFF all 1000 cells equal a SINGLE NON-AIR id (BlockId::AIR == 0). Else DENSE.
         let is_uniform = all_equal && (first != 0u);
+        // `has_air` (bit 1 of word 0): the brick has at least one AIR cell ⇒ a real exposed surface voxel. A brick
+        // with NO air (uniform-incl-halo, or a dense brick fully surrounded by solid) is BURIED — never a visible
+        // surface; D3 gives it a DEGENERATE AABB so the ray never commits it (all-solid neighbourhood ⇒ degenerate
+        // normal ⇒ a flat/black cube reached through the shell). The brick stays RESIDENT (its core still feeds
+        // neighbours' halos via the pager), it just isn't a BLAS primitive. Packed into bit 1 so the stride is
+        // unchanged; D3 masks `is_uniform` with `& 1`.
+        let has_air_bit = select(0u, 2u, any_air);
         let base = cmd_idx * 4u;
         if (is_uniform) {
-            classify_out[base + 0u] = 1u;     // is_uniform
+            classify_out[base + 0u] = 1u | has_air_bit; // is_uniform (+ has_air bit; uniform ⇒ never any_air ⇒ buried)
             classify_out[base + 1u] = first;  // uniform_block (the single solid id)
             classify_out[base + 2u] = 0u;     // palette_k (unused for uniform)
             classify_out[base + 3u] = 0u;     // index_bits (unused for uniform)
         } else {
-            classify_out[base + 0u] = 0u;             // is_uniform = dense
+            classify_out[base + 0u] = 0u | has_air_bit; // is_uniform = dense (+ has_air bit)
             classify_out[base + 1u] = 0u;             // uniform_block (unused for dense)
             classify_out[base + 2u] = k;              // palette_k (distinct-id count)
             classify_out[base + 3u] = pow2_index_bits(k); // index_bits ∈ {1,2,4,8,16}

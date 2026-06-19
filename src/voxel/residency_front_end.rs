@@ -87,8 +87,8 @@ struct DiffConfig {
 struct PackConfig {
     core_table_size: u32,
     max_resident: u32,
-    _pad0: u32,
-    _pad1: u32,
+    index_stride: u32,   // WORDS per slot in the index (voxel) pool — fixed per-slot slab (no allocator)
+    palette_stride: u32, // WORDS per slot in the palette pool
 }
 
 /// Build the per-frame [`ResidencyParams`] from the live camera world position + clip half-extent. The per-LOD
@@ -217,15 +217,6 @@ pub struct GpuResidencyFrontEnd {
     aabb_dispatch: wgpu::Buffer,
     classify_dispatch: wgpu::Buffer,
 
-    // --- the persistent slab allocators (the POOL itself is external — the scene's) ---
-    index_slab_ctrl: wgpu::Buffer,
-    index_slab_free: wgpu::Buffer,
-    palette_slab_ctrl: wgpu::Buffer,
-    palette_slab_free: wgpu::Buffer,
-    /// The GPU `DenseSlot` table (binding 49): per resident slot, its current dense slab offsets + size selectors
-    /// `[index_off, index_bits, palette_off, palette_k]` — read+updated by Pass D3/D0 to REUSE-in-place / FREE the
-    /// OLD slab on re-pack/drop (the bound on the slab high-water). Mirror of the CPU `SlotState::dense`.
-    slab_state: wgpu::Buffer,
     /// ENTER-CAP (binding 50): the per-frame candidate distance histogram (`HIST_BUCKETS` u32, cleared each frame).
     enter_hist: wgpu::Buffer,
     /// ENTER-CAP (binding 51): `[cut_bucket, room]` — the nearest-priority admission cut (computed each frame).
@@ -280,6 +271,8 @@ pub struct GpuResidencyFrontEnd {
     p_classify: wgpu::ComputePipeline,
     p_pack: wgpu::ComputePipeline,
     p_aabb: wgpu::ComputePipeline,
+    p_fin_classify: wgpu::ComputePipeline,
+    p_fin_pack: wgpu::ComputePipeline,
 
     // --- the per-epoch occupancy/core bind group + the pool-dependent pack bind groups (rebuilt by `rebind_pool`) ---
     bound: Option<BoundScene>,
@@ -317,7 +310,7 @@ impl GpuResidencyFrontEnd {
         let diff_cfg = DiffConfig { slot_table_size, present_size, max_resident, refine_descent_cap: REFINE_DESCENT_CAP };
         let diff_cfg_buf = buf_init(device, "res_diff_cfg", bytemuck::bytes_of(&diff_cfg), wgpu::BufferUsages::UNIFORM);
         // core_table_size is filled by rebind_pool (it depends on the per-epoch core store); start at 2 (a valid pow2).
-        let pack_cfg = PackConfig { core_table_size: 2, max_resident, _pad0: 0, _pad1: 0 };
+        let pack_cfg = PackConfig { core_table_size: 2, max_resident, index_stride: 0, palette_stride: 0 };
         let pack_cfg_buf = buf_init(device, "res_pack_cfg", bytemuck::bytes_of(&pack_cfg), wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST);
         let index_pool_base = buf_init(device, "res_index_pool_base", bytemuck::cast_slice(&[0u32]), wgpu::BufferUsages::STORAGE);
         let palette_pool_base = buf_init(device, "res_palette_pool_base", bytemuck::cast_slice(&[0u32]), wgpu::BufferUsages::STORAGE);
@@ -370,15 +363,6 @@ impl GpuResidencyFrontEnd {
         let aabb_dispatch = buf_init(device, "res_aabb_dispatch", bytemuck::cast_slice(&[0u32, 1, 1]), dispatch_usage());
         let classify_dispatch = buf_init(device, "res_classify_dispatch", bytemuck::cast_slice(&[0u32, 1, 1]), dispatch_usage());
 
-        // slab allocators (the index/palette arenas — bump+free-list per size class, pre-sized to capacity).
-        let index_ctrl_init = vec![0u32; 1 + 5 * 2];
-        let index_slab_ctrl = buf_init(device, "res_index_slab_ctrl", bytemuck::cast_slice(&index_ctrl_init), storage_usage());
-        let index_slab_free = storage_buf(device, "res_index_slab_free", (5 * max_resident as u64) * 4);
-        let palette_ctrl_init = vec![0u32; 1 + 16 * 2];
-        let palette_slab_ctrl = buf_init(device, "res_palette_slab_ctrl", bytemuck::cast_slice(&palette_ctrl_init), storage_usage());
-        let palette_slab_free = storage_buf(device, "res_palette_slab_free", (16 * max_resident as u64) * 4);
-        // The GPU DenseSlot table — 4 u32 / slot, all 0 (no slot has a dense slab yet).
-        let slab_state = storage_buf(device, "res_slab_state", (max_resident as u64) * 4 * 4);
         // ENTER-CAP — the candidate distance histogram + the `[cut_bucket, room]` cut.
         let enter_hist = storage_buf(device, "res_enter_hist", (HIST_BUCKETS as u64) * 4);
         let enter_cap = buf_init(device, "res_enter_cap", bytemuck::cast_slice(&[HIST_BUCKETS, 0u32]), storage_usage());
@@ -446,14 +430,13 @@ impl GpuResidencyFrontEnd {
         entries.push(uniform_entry(24));
         entries.push(storage_entry(25, true));
         entries.push(storage_entry(26, true));
-        for b in 27..=44 {
+        for b in 27..=40 {
             entries.push(storage_entry(b, false));
         }
-        entries.push(storage_entry(45, true));
-        entries.push(storage_entry(46, true));
+        entries.push(storage_entry(45, true)); // index_pool_base (word base of the fixed per-slot index pool)
+        entries.push(storage_entry(46, true)); // palette_pool_base
         entries.push(storage_entry(47, true));
         entries.push(storage_entry(48, false));
-        entries.push(storage_entry(49, false)); // slab_state (GPU DenseSlot table — read+write in Pass D3/D0)
         entries.push(storage_entry(50, false)); // enter_hist (enter-cap distance histogram)
         entries.push(storage_entry(51, false)); // enter_cap ([cut_bucket, room])
         let res_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -491,6 +474,10 @@ impl GpuResidencyFrontEnd {
         let p_d_nbr = mk_res("pack_build_neighbours");
         let p_d_cmd = mk_res("pack_build_commands");
         let p_d_drops = mk_res("pack_build_drops");
+        // Convert the per-brick classify/pack indirect dispatches from [count,1,1] to a 2D [x,y,1] grid so they can
+        // exceed the 65535 workgroups-per-dimension limit (large scenes — Bistro ~610k bricks). 1 invocation each.
+        let p_fin_classify = mk_res("finalize_classify_dispatch_2d");
+        let p_fin_pack = mk_res("finalize_pack_dispatch_2d");
 
         // pack shader pipelines (their bind GROUPS are pool-dependent → built in rebind_pool).
         let cls_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -519,6 +506,7 @@ impl GpuResidencyFrontEnd {
                 storage_entry(3, false),
                 storage_entry(4, false),
                 storage_entry(5, false),
+                storage_entry(12, true), // pack_cmd_count (read) — the 2D-dispatch over-run guard
             ],
         });
         let pack_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -536,7 +524,8 @@ impl GpuResidencyFrontEnd {
         });
         let aabb_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("res_aabb_bgl"),
-            entries: &[storage_entry(6, false), storage_entry(7, true), storage_entry(10, false)],
+            // 11 = aabb_count (read): write_aabb_dirty gates on the real command count, not the buffer capacity.
+            entries: &[storage_entry(6, false), storage_entry(7, true), storage_entry(10, false), storage_entry(11, true)],
         });
         let aabb_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("res_aabb_pl"),
@@ -593,11 +582,6 @@ impl GpuResidencyFrontEnd {
             pack_dispatch,
             aabb_dispatch,
             classify_dispatch,
-            index_slab_ctrl,
-            index_slab_free,
-            palette_slab_ctrl,
-            palette_slab_free,
-            slab_state,
             enter_hist,
             enter_cap,
             change_count_buf,
@@ -633,6 +617,8 @@ impl GpuResidencyFrontEnd {
             p_classify,
             p_pack,
             p_aabb,
+            p_fin_classify,
+            p_fin_pack,
             bound: None,
         }
     }
@@ -655,8 +641,13 @@ impl GpuResidencyFrontEnd {
         brick_palettes: &wgpu::Buffer,
         aabb: &wgpu::Buffer,
     ) {
-        // Patch pack_cfg.core_table_size for the new core store.
-        let pack_cfg = PackConfig { core_table_size: core.table_size, max_resident: self.max_resident, _pad0: 0, _pad1: 0 };
+        // Patch pack_cfg for the new core store + the per-slot slab strides. The index/palette pools are
+        // FIXED-per-slot (each slot owns `stride` words at `slot·stride`) — derive the stride from the ACTUAL pool
+        // buffer size ÷ max_resident so it always matches the allocation (mirrors RESERVE_*_WORDS_PER_BRICK). This
+        // replaces the shared bump+free-list allocator (which raced ⇒ two live bricks aliasing one slab ⇒ garbage).
+        let index_stride = (voxel.size() as u32 / 4) / self.max_resident;
+        let palette_stride = (brick_palettes.size() as u32 / 4) / self.max_resident;
+        let pack_cfg = PackConfig { core_table_size: core.table_size, max_resident: self.max_resident, index_stride, palette_stride };
         queue.write_buffer(&self.pack_cfg_buf, 0, bytemuck::bytes_of(&pack_cfg));
 
         // Reset the persistent diff state to EMPTY (cold-stream the new scene). The slab allocators reset too so
@@ -685,12 +676,13 @@ impl GpuResidencyFrontEnd {
                 bind(3, voxel),
                 bind(4, brick_palettes),
                 bind(5, meta),
+                bind(12, &self.pack_count), // pack_brick's 2D-dispatch over-run guard (gate on the real count)
             ],
         });
         let aabb_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("res_aabb_bg"),
             layout: &self.aabb_bgl,
-            entries: &[bind(6, aabb), bind(7, &self.aabb_commands), bind(10, &self.dirty_chunk_buf)],
+            entries: &[bind(6, aabb), bind(7, &self.aabb_commands), bind(10, &self.dirty_chunk_buf), bind(11, &self.aabb_count)],
         });
         self.bound = Some(BoundScene { res_bg, res_bg_b0, cls_bg, pack_bg, aabb_bg, params_buf });
     }
@@ -731,13 +723,6 @@ impl GpuResidencyFrontEnd {
         queue.write_buffer(&self.present_flag, 0, bytemuck::cast_slice(&present_init));
         let dirty_init = vec![EMPTY_LOD; self.slot_table_size as usize * 4];
         queue.write_buffer(&self.dirty_flag, 0, bytemuck::cast_slice(&dirty_init));
-        let index_ctrl_init = vec![0u32; 1 + 5 * 2];
-        queue.write_buffer(&self.index_slab_ctrl, 0, bytemuck::cast_slice(&index_ctrl_init));
-        let palette_ctrl_init = vec![0u32; 1 + 16 * 2];
-        queue.write_buffer(&self.palette_slab_ctrl, 0, bytemuck::cast_slice(&palette_ctrl_init));
-        // Zero the GPU DenseSlot table (no slot has a dense slab in a freshly cold-started scene).
-        let slab_state_init = vec![0u32; self.max_resident as usize * 4];
-        queue.write_buffer(&self.slab_state, 0, bytemuck::cast_slice(&slab_state_init));
         queue.write_buffer(&self.change_count_buf, 0, bytemuck::bytes_of(&0u32));
     }
 
@@ -797,15 +782,10 @@ impl GpuResidencyFrontEnd {
                 bind(38, &self.pack_dispatch),
                 bind(39, &self.aabb_dispatch),
                 bind(40, &self.classify_dispatch),
-                bind(41, &self.index_slab_ctrl),
-                bind(42, &self.index_slab_free),
-                bind(43, &self.palette_slab_ctrl),
-                bind(44, &self.palette_slab_free),
                 bind(45, &self.index_pool_base),
                 bind(46, &self.palette_pool_base),
                 bind(47, &self.classify_out),
                 bind(48, &self.change_count_buf),
-                bind(49, &self.slab_state),
                 bind(50, &self.enter_hist),
                 bind(51, &self.enter_cap),
             ],
@@ -861,8 +841,10 @@ impl GpuResidencyFrontEnd {
         compute(enc, &self.p_d_dirty, bg, list_wgs);
         compute(enc, &self.p_d_drops, bg, list_wgs);
         compute(enc, &self.p_d_nbr, bg, list_wgs);
+        compute(enc, &self.p_fin_classify, bg, 1); // classify_dispatch [n,1,1] → 2D [x,y,1] (size-agnostic)
         record_indirect(enc, &self.p_classify, &bound.cls_bg, &self.classify_dispatch);
         compute(enc, &self.p_d_cmd, bg, list_wgs);
+        compute(enc, &self.p_fin_pack, bg, 1); // pack_dispatch [n,1,1] → 2D [x,y,1] (size-agnostic)
         record_indirect(enc, &self.p_pack, &bound.pack_bg, &self.pack_dispatch);
         record_indirect(enc, &self.p_aabb, &bound.aabb_bg, &self.aabb_dispatch);
 
@@ -963,32 +945,6 @@ impl GpuResidencyFrontEnd {
         self.max_resident
     }
 
-    /// **Diagnostic ONLY** (blocking) — the index + palette slab high-water marks (WORDS used) vs the pool reserve.
-    /// An overflow (high-water > the live scene pool's word capacity) ⇒ the GPU slab allocator wrote out of bounds.
-    pub fn diag_slab_highwater(&self, device: &wgpu::Device, queue: &wgpu::Queue) -> (u32, u32) {
-        let rb = |b: &wgpu::Buffer| -> u32 {
-            let staging = device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("res_diag_slab_rb"),
-                size: 4,
-                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-                mapped_at_creation: false,
-            });
-            let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("res_diag_slab") });
-            enc.copy_buffer_to_buffer(b, 0, &staging, 0, 4);
-            queue.submit(core::iter::once(enc.finish()));
-            let _ = device.poll(wgpu::PollType::wait_indefinitely());
-            staging.slice(..).map_async(wgpu::MapMode::Read, |_| {});
-            let _ = device.poll(wgpu::PollType::wait_indefinitely());
-            let v = match staging.slice(..).get_mapped_range() {
-                Ok(d) => u32::from_le_bytes([d[0], d[1], d[2], d[3]]),
-                Err(_) => u32::MAX,
-            };
-            staging.unmap();
-            v
-        };
-        (rb(&self.index_slab_ctrl), rb(&self.palette_slab_ctrl))
-    }
-
     /// **Diagnostic ONLY** (blocking) — read back the per-frame counts (aabb_count, pack_count, enter, drop, change)
     /// after a recorded frame. Localizes whether Pass B/C/D produced work. Returns (aabb, pack, cand, desired, change).
     pub fn diag_counts(&self, device: &wgpu::Device, queue: &wgpu::Queue) -> (u32, u32, u32, u32, u32) {
@@ -1045,8 +1001,10 @@ impl GpuResidencyFrontEnd {
         };
         let words_u32: &[u32] = bytemuck::cast_slice(&data);
         let mut live = 0u32;
+        // A live key has lod ∈ 0..=MAX_LOD; EMPTY_LOD (free) and EMPTY_LOD-1 (TOMBSTONE, a deleted-key hole) are not.
+        const TOMBSTONE_LOD: u32 = EMPTY_LOD - 1;
         for s in words_u32.chunks_exact(5) {
-            if s[3] != EMPTY_LOD {
+            if s[3] != EMPTY_LOD && s[3] != TOMBSTONE_LOD {
                 live += 1;
             }
         }
@@ -1054,6 +1012,7 @@ impl GpuResidencyFrontEnd {
         staging.unmap();
         live
     }
+
 }
 
 // =========================================================================================================

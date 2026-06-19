@@ -19,6 +19,13 @@
 
 const SECTOR_EDGE: i32 = 4;
 const EMPTY_LOD: u32 = 0xffffffffu;
+// The persistent `slot_table` DELETE marker — a dropped key's hole. DISTINCT from `EMPTY_LOD`: `slot_lookup` stops
+// only at `EMPTY_LOD` and probes THROUGH a tombstone, so deleting a key never breaks another key's linear-probe
+// chain. Using `EMPTY_LOD` for a drop (the original bug) punched a hole that made `slot_lookup` report a still-
+// resident key as ABSENT → it re-entered into a 2nd slot, orphaning the 1st (stale meta+AABB = a stuck black cube).
+// Mirror of `residency_gpu.rs::TOMBSTONE_LOD` (= EMPTY_LOD - 1). Only the persistent slot_table needs it; the
+// per-frame present_flag/dirty_flag hashes are cleared every frame so they never accumulate tombstones.
+const TOMBSTONE_LOD: u32 = 0xfffffffeu;
 // MUST match `src/voxel/brickmap.rs` MAX_LOD (the clipmap's coarsest level). 8 levels: 0..=7.
 const MAX_LOD: u32 = 7u;
 
@@ -681,8 +688,13 @@ fn region_replacement_resident(coord0: vec3<i32>, lod0: u32, depth0: u32) -> boo
         let lod = stack_lod[sp];
         let depth = stack_depth[sp];
         if (present_contains(coord, lod)) {
-            // Desired here: this sub-region needs THIS brick resident (don't descend further).
-            if (!is_resident(coord, lod)) {
+            // Desired here (don't descend further). But only a SURFACE brick is ever ENTERED — the candidate face
+            // cull drops buried INTERIOR bricks from the resident-target set, so an interior brick is desired yet
+            // never resident AND never rendered. Requiring it resident (the original bug) made `safe_to_drop` FALSE
+            // forever for any region with buried interior ⇒ a refined-away coarse brick was NEVER dropped → a stuck
+            // coarse AABB overlapping the fine bricks (the LOD-transition black cube). A surface descendant must be
+            // resident (it carries the visible surface); an interior one is "covered" by being buried — skip it.
+            if (classify_surface(coord, lod) && !is_resident(coord, lod)) {
                 return false;
             }
             continue;
@@ -907,8 +919,15 @@ fn diff_enter_scan(@builtin(global_invocation_id) gid: vec3<u32>) {
     var t = hash_key(coord, lod) & mask;
     for (var p = 0u; p < size; p = p + 1u) {
         let base = t * SLOT_WORDS;
+        // Claim the first EMPTY **or TOMBSTONE** slot on the probe chain (the key is verified absent above, so this
+        // never duplicates — and reusing tombstones keeps them from accumulating unbounded under churn, mirror of the
+        // reference `PagedBrickCoreStore::insert_slot`). Try EMPTY first; if the slot is a tombstone, claim that.
         let prev = atomicCompareExchangeWeak(&slot_table[base + 3u], EMPTY_LOD, lod);
-        if (prev.exchanged) {
+        var claimed = prev.exchanged;
+        if (!claimed && prev.old_value == TOMBSTONE_LOD) {
+            claimed = atomicCompareExchangeWeak(&slot_table[base + 3u], TOMBSTONE_LOD, lod).exchanged;
+        }
+        if (claimed) {
             atomicStore(&slot_table[base + 0u], bitcast<u32>(coord.x));
             atomicStore(&slot_table[base + 1u], bitcast<u32>(coord.y));
             atomicStore(&slot_table[base + 2u], bitcast<u32>(coord.z));
@@ -941,8 +960,8 @@ fn diff_drop_mark(@builtin(global_invocation_id) gid: vec3<u32>) {
     drop_decision[slot_idx] = 0u;
     let base = slot_idx * SLOT_WORDS;
     let e_lod = atomicLoad(&slot_table[base + 3u]);
-    if (e_lod == EMPTY_LOD) {
-        return; // free slot
+    if (e_lod == EMPTY_LOD || e_lod == TOMBSTONE_LOD) {
+        return; // free slot (EMPTY) or a deleted-key hole (TOMBSTONE) — neither holds a live key to drop
     }
     let coord = vec3<i32>(
         bitcast<i32>(atomicLoad(&slot_table[base + 0u])),
@@ -950,8 +969,15 @@ fn diff_drop_mark(@builtin(global_invocation_id) gid: vec3<u32>) {
         bitcast<i32>(atomicLoad(&slot_table[base + 2u])),
     );
     let lod = e_lod;
-    if (present_contains(coord, lod)) {
-        return; // still desired — keep
+    // Keep ONLY a brick that is still a desired SURFACE candidate (the ENTERED set = present ∧ `classify_surface`).
+    // A brick that became BURIED (all 6 face-neighbours occupied ⇒ `classify_surface` false) is INTERIOR — never a
+    // visible surface — so drop it even though it's still "present" in the occupied-in-shell desired superset.
+    // Leaving buried bricks resident let them accumulate as all-solid-halo bricks that render as flat/degenerate
+    // cubes when the ray reaches them through the shell (the stuck-cube-at-LOD-transition bug). A clip-boundary
+    // brick still has an AIR neighbour beyond the +1 occupancy pad ⇒ stays `classify_surface` ⇒ kept, so this never
+    // holes the loaded-region boundary. (`safe_to_drop` still gates the removal — keep-old-until-revealed.)
+    if (present_contains(coord, lod) && classify_surface(coord, lod)) {
+        return; // still a desired surface candidate — keep
     }
     if (!safe_to_drop(coord, lod)) {
         return; // keep-old-until-revealed: its replacement is not resident yet
@@ -981,7 +1007,7 @@ fn diff_drop_apply(@builtin(global_invocation_id) gid: vec3<u32>) {
     let cap = diff_cfg.max_resident;
     let q = atomicAdd(&quarantine_ctrl[1], 1u);
     quarantine_ring[q % cap] = atomicLoad(&slot_table[base + 4u]);
-    atomicStore(&slot_table[base + 3u], EMPTY_LOD); // mark the table slot free
+    atomicStore(&slot_table[base + 3u], TOMBSTONE_LOD); // TOMBSTONE (not EMPTY) — preserve other keys' probe chains
     let d = atomicAdd(&drop_count, 1u);
     drop_list[d] = vec4<i32>(coord.x, coord.y, coord.z, i32(lod));
 }
@@ -1096,8 +1122,8 @@ struct ClassifyCommandD {
 struct PackConfigD {
     core_table_size: u32,   // power of two (probe mask = size - 1)
     max_resident: u32,
-    _pad0: u32,
-    _pad1: u32,
+    index_stride: u32,      // WORDS per slot in the index pool (= RESERVE_INDEX_WORDS_PER_BRICK; fixed per-slot slab)
+    palette_stride: u32,    // WORDS per slot in the palette pool (= RESERVE_PALETTE_WORDS_PER_BRICK)
 }
 @group(0) @binding(24) var<uniform> pack_cfg: PackConfigD;
 @group(0) @binding(25) var<storage, read> core_table: array<u32>;        // 5 u32/slot: [x,y,z,lod,core_index]
@@ -1124,35 +1150,15 @@ struct PackConfigD {
 @group(0) @binding(39) var<storage, read_write> aabb_dispatch: array<atomic<u32>>;    // [x,1,1]
 @group(0) @binding(40) var<storage, read_write> classify_dispatch: array<atomic<u32>>;// [x,1,1]
 
-// The GPU slab allocators (§2.3) — EXACT mirror of the CPU `SlabArena` (incremental.rs): ONE shared bump
-// high-water per pool (classes INTERLEAVE in allocation order, NOT per-class fixed regions) + a per-class
-// free-list ring (LIFO). Layout of `*_slab_ctrl`:
-//   ctrl[0]            = the shared bump high-water (WORDS).
-//   ctrl[1 + cls*2]    = free_head[cls], ctrl[2 + cls*2] = free_tail[cls] (a freed slab pushes free_tail++).
-// `*_slab_free[cls*max_resident + (i % max_resident)]` = a freed word-offset of class `cls`. An alloc takes the
-// smallest class ≥ the request: pop the class free-list (tail-1, LIFO — `SlabArena::alloc` pops `free[cls]`)
-// else `atomicAdd(shared_high_water, class_words)`. NO per-class base (the CPU bumps a single shared
-// `high_water`), so the pool is sized to the AGGREGATE reserve (the RESERVE_* means), not per-class × cap.
-// `index_class_words`/`palette_classes` MUST match `src/voxel/incremental.rs`.
-const INDEX_CLASSES: u32 = 5u;
-const PALETTE_CLASSES: u32 = 16u;
-@group(0) @binding(41) var<storage, read_write> index_slab_ctrl: array<atomic<u32>>;   // [hw, (head,tail)×5]
-@group(0) @binding(42) var<storage, read_write> index_slab_free: array<u32>;
-@group(0) @binding(43) var<storage, read_write> palette_slab_ctrl: array<atomic<u32>>; // [hw, (head,tail)×16]
-@group(0) @binding(44) var<storage, read_write> palette_slab_free: array<u32>;
+// FIXED PER-SLOT SLABS (§2.3) — the index + palette pools are reserved worst-case-per-slot (incremental.rs
+// RESERVE_INDEX_WORDS_PER_BRICK / RESERVE_PALETTE_WORDS_PER_BRICK, passed as `pack_cfg.index_stride` /
+// `palette_stride`), so slot `s` OWNS the region `[s·stride, (s+1)·stride)`. Pass D3 writes a brick's slab at
+// `pool_base + slot·stride` directly — NO allocator, NO free-list, NO per-slot state. (This replaced a shared
+// bump+free-list allocator whose `free` published a ring slot via `atomicAdd(tail)` BEFORE writing its offset, so
+// a concurrent `alloc` pop could read the slot mid-write ⇒ two live bricks alias one slab ⇒ garbage content. With
+// both pools worst-case-per-slot the allocator gave ZERO VRAM benefit, so fixed offsets are strictly better.)
 @group(0) @binding(45) var<storage, read> index_pool_base: array<u32>;   // [0] = the index pool's word base
 @group(0) @binding(46) var<storage, read> palette_pool_base: array<u32>; // [0] = the palette pool's word base
-
-// **The GPU `DenseSlot` table (G-c.4 slab-reuse fix)** — the exact analogue of the CPU `SlotState::dense`
-// (`incremental.rs`). Per RESIDENT slot, the slab offsets + size selectors of its CURRENTLY-PACKED dense block:
-//   slab_state[slot*4 + 0] = index word offset (the slab `voxel_offset`),
-//   slab_state[slot*4 + 1] = index_bits ∈ {1,2,4,8,16}  (0 ⇒ this slot has NO dense slab: fresh/uniform/freed),
-//   slab_state[slot*4 + 2] = palette word offset,
-//   slab_state[slot*4 + 3] = palette_k (distinct-id count the palette slab was sized for; 0 ⇒ no palette slab).
-// Pass D3/D0 read this BEFORE (re)packing/dropping a slot to REUSE-in-place (same class) or FREE the OLD slab
-// (the bound on the slab high-water), then write the slot's NEW state. SSOT mirror: `update_inner`'s
-// reuse-iff-class-matches-else-quarantine-and-realloc (incremental.rs:1144-1165) + the drop free (1001-1008).
-@group(0) @binding(49) var<storage, read_write> slab_state: array<u32>;  // 4 u32 / slot
 
 // --- core_table lookup (key -> deduped core-pool index, or NEIGHBOUR_ABSENT) ---
 fn core_lookup(coord: vec3<i32>, lod: u32) -> u32 {
@@ -1177,99 +1183,6 @@ fn core_lookup(coord: vec3<i32>, lod: u32) -> u32 {
         slot = (slot + 1u) & mask;
     }
     return NEIGHBOUR_ABSENT;
-}
-
-// --- the GPU SLAB ALLOCATOR (§2.3) — mirror of `SlabArena::alloc` (pop class free-list LIFO, else bump). ---
-// The 5 INDEX size classes in WORDS — `index_class_words({1,2,4,8,16})` (incremental.rs). MUST match exactly.
-fn index_class_words_d(cls: u32) -> u32 {
-    // ceil(1000 * bits / 32) for bits ∈ {1,2,4,8,16} = {32,63,125,250,500}.
-    switch (cls) {
-        case 0u: { return 32u; }
-        case 1u: { return 63u; }
-        case 2u: { return 125u; }
-        case 3u: { return 250u; }
-        default: { return 500u; }
-    }
-}
-// index_bits ∈ {1,2,4,8,16} -> class index 0..4.
-fn index_bits_class(index_bits: u32) -> u32 {
-    switch (index_bits) {
-        case 1u: { return 0u; }
-        case 2u: { return 1u; }
-        case 4u: { return 2u; }
-        case 8u: { return 3u; }
-        default: { return 4u; }
-    }
-}
-// The PALETTE power-of-2 ladder class for `k` distinct ids: smallest 2^(cls+1) >= k (classes {2,4,…,65536}).
-fn palette_class_of(k: u32) -> u32 {
-    for (var cls = 0u; cls < PALETTE_CLASSES; cls = cls + 1u) {
-        if ((1u << (cls + 1u)) >= k) {
-            return cls;
-        }
-    }
-    return PALETTE_CLASSES - 1u;
-}
-
-// Allocate one INDEX slab of `index_bits`'s class: pop the class free-list (LIFO) else bump the SHARED
-// high-water by the class size. Returns the WORD offset (pool base + bump). Mirror of `SlabArena::alloc`.
-fn alloc_index_slab(index_bits: u32) -> u32 {
-    let cls = index_bits_class(index_bits);
-    // Pop LIFO RACE-SAFELY via a CAS loop on the class free TAIL (NO speculative atomicSub — that underflows when
-    // the list is empty and multiple poppers race, handing out bogus offsets). Read the tail; if > 0 try to CAS it
-    // to tail-1 (claim slot tail-1); retry on contention; fall through to the shared bump when the list is empty.
-    loop {
-        let tail = atomicLoad(&index_slab_ctrl[2u + cls * 2u]);
-        if (tail == 0u) {
-            break; // empty free-list ⇒ bump the shared high-water
-        }
-        let r = atomicCompareExchangeWeak(&index_slab_ctrl[2u + cls * 2u], tail, tail - 1u);
-        if (r.exchanged) {
-            let t = tail - 1u;
-            return index_slab_free[cls * pack_cfg.max_resident + (t % pack_cfg.max_resident)];
-        }
-    }
-    let off = atomicAdd(&index_slab_ctrl[0u], index_class_words_d(cls)); // shared bump
-    return index_pool_base[0] + off;
-}
-
-// Allocate one PALETTE slab of `k`'s class: pop the class free-list else bump the shared high-water. Mirror
-// of `SlabArena::alloc` (the palette ladder class size = 2^(cls+1)).
-fn alloc_palette_slab(k: u32) -> u32 {
-    let cls = palette_class_of(k);
-    // Pop LIFO race-safely via a CAS loop (see `alloc_index_slab` — no speculative atomicSub underflow).
-    loop {
-        let tail = atomicLoad(&palette_slab_ctrl[2u + cls * 2u]);
-        if (tail == 0u) {
-            break;
-        }
-        let r = atomicCompareExchangeWeak(&palette_slab_ctrl[2u + cls * 2u], tail, tail - 1u);
-        if (r.exchanged) {
-            let t = tail - 1u;
-            return palette_slab_free[cls * pack_cfg.max_resident + (t % pack_cfg.max_resident)];
-        }
-    }
-    let words = 1u << (cls + 1u); // 2^(cls+1)
-    let off = atomicAdd(&palette_slab_ctrl[0u], words); // shared bump
-    return palette_pool_base[0] + off;
-}
-
-// Free one INDEX slab back to its class free-list (the GPU port of `SlabArena::free_block`): push the word
-// offset onto the class ring and advance the class free TAIL. The matching `alloc_index_slab` pops it LIFO.
-// This is what BOUNDS the index slab high-water under re-pack churn — a re-packed brick frees its OLD slab so
-// the bump high-water never grows past the live reserve (CPU `update_gpu`'s quarantine→`free_block` SSOT).
-fn free_index_slab(off: u32, index_bits: u32) {
-    let cls = index_bits_class(index_bits);
-    let t = atomicAdd(&index_slab_ctrl[2u + cls * 2u], 1u); // append at the class free TAIL
-    index_slab_free[cls * pack_cfg.max_resident + (t % pack_cfg.max_resident)] = off;
-}
-
-// Free one PALETTE slab back to its class free-list (mirror of `SlabArena::free_block`). `k` is the palette
-// word COUNT the slab was allocated for (it picks the same class `alloc_palette_slab(k)` used).
-fn free_palette_slab(off: u32, k: u32) {
-    let cls = palette_class_of(k);
-    let t = atomicAdd(&palette_slab_ctrl[2u + cls * 2u], 1u);
-    palette_slab_free[cls * pack_cfg.max_resident + (t % pack_cfg.max_resident)] = off;
 }
 
 // --- per-brick GEOMETRY (mirror of `BrickGeom::of` / brickmap `brick_span`) — pure function of the key. ---
@@ -1322,17 +1235,8 @@ fn pack_build_drops(@builtin(global_invocation_id) gid: vec3<u32>) {
     // frame's pushes start at 0), so quarantine_ring[i] is drop i's slot.
     let cap = diff_cfg.max_resident;
     let slot = quarantine_ring[i % cap];
-    // FREE the dropped slot's dense slab back to the free-lists BEFORE zeroing its state (mirror of the CPU drop's
-    // quarantine push, incremental.rs:1001-1008) — else a dropped brick's slab leaks the high-water forever.
-    let sbase = slot * 4u;
-    if (slab_state[sbase + 1u] != 0u) {
-        free_index_slab(slab_state[sbase + 0u], slab_state[sbase + 1u]);
-        free_palette_slab(slab_state[sbase + 2u], slab_state[sbase + 3u]);
-    }
-    slab_state[sbase + 0u] = 0u;
-    slab_state[sbase + 1u] = 0u;
-    slab_state[sbase + 2u] = 0u;
-    slab_state[sbase + 3u] = 0u;
+    // With FIXED per-slot slabs there is nothing to free on a drop (the slot's [slot·stride] region stays its own;
+    // a future re-enter overwrites it in place) — just zero the meta so the slot reads as freed.
     write_zeroed_meta(slot);
     let a = atomicAdd(&aabb_count, 1u);
     aabb_commands[a] = AabbCommandD(slot, 0u, 0u, 0u, 0.0, 0.0, 0.0, 0u);
@@ -1443,20 +1347,17 @@ fn pack_build_neighbours(@builtin(global_invocation_id) gid: vec3<u32>) {
             for (var dx = -1; dx <= 1; dx = dx + 1) {
                 let nslot = u32((dz + 1) * 9 + (dy + 1) * 3 + (dx + 1));
                 let nbr = coord + vec3<i32>(dx, dy, dz);
-                // The halo reflects the true GEOMETRY (occupancy), not residency: a RESIDENT neighbour contributes
-                // its real core voxels; an OCCUPIED-but-not-resident neighbour (a face-culled interior brick, or a
-                // surface brick not yet entered this streaming frame) contributes a SOLID border; only a genuinely
-                // EMPTY neighbour is AIR. Gating on residency alone baked a spurious exposed face whenever a solid
-                // neighbour wasn't resident yet — the motion-only wrong-normal / black-cube speck. `is_occupied` is
-                // the same full-occupancy structure the enumerate face-culls against, so this is consistent.
-                var idx = NEIGHBOUR_ABSENT;
-                if (slot_lookup(nbr, lod) != SLOT_ABSENT) {
-                    idx = core_lookup(nbr, lod); // resident: real core (may still be ABSENT if its core not paged)
-                }
-                if (idx == NEIGHBOUR_ABSENT && is_occupied(nbr, lod)) {
-                    idx = NEIGHBOUR_SOLID; // occupied but no resident core → solid border (buried face)
-                }
-                neighbour_indices[base + nslot] = idx;
+                // The halo reflects ACTUAL RESIDENT geometry only: the neighbour's real core if it's paged (the core
+                // store holds both entered bricks AND the +1-halo-ring cores the pager pages for occupied neighbours),
+                // else AIR. A neighbour with NO resident core has no geometry the ray can hit, so its face is EXPOSED
+                // from the ray's point of view — the ray reaches THIS brick through the empty neighbour space. Packing
+                // that face SOLID (the old `NEIGHBOUR_SOLID`/`is_full` guess) buried a face the ray then hit anyway,
+                // giving an all-solid neighbourhood ⇒ zero occupancy gradient ⇒ a degenerate normal (a flat/black
+                // cube), and it STUCK at coarse-LOD coverage gaps where the guessed neighbour never pages in. AIR is
+                // correct: a real exposed face (valid normal), and if the neighbour's core later pages in this brick
+                // re-packs to its true boundary. (If the neighbour IS resident with geometry, the ray hits IT first,
+                // so this brick's face is never primary-hit — AIR there is invisible.)
+                neighbour_indices[base + nslot] = core_lookup(nbr, lod);
             }
         }
     }
@@ -1475,6 +1376,7 @@ fn pack_build_neighbours(@builtin(global_invocation_id) gid: vec3<u32>) {
 // top of the frame. G-c.4's non-blocking 1-frame-late CPU mirror will `map_async` a `COPY_SRC` staging copy of it
 // to decide whether to RECORD the AS build (no indirect AS on the fork). NOT wired to gate the AS build here.
 @group(0) @binding(48) var<storage, read_write> change_count: atomic<u32>;
+
 @compute @workgroup_size(64)
 fn pack_build_commands(@builtin(global_invocation_id) gid: vec3<u32>) {
     let i = gid.x;
@@ -1486,61 +1388,45 @@ fn pack_build_commands(@builtin(global_invocation_id) gid: vec3<u32>) {
     let lod = u32(k.w);
     let slot = dirty_slot[i];
     let base = i * 4u;
-    let is_uniform = classify_out[base + 0u];
+    // word 0 packs is_uniform (bit 0) + has_air (bit 1, from classify_brick). A brick with NO air anywhere in its
+    // haloed grid is BURIED (uniform-incl-halo, or dense fully surrounded by solid) — it has no visible surface, so
+    // it gets a DEGENERATE (freed) AABB and is never traced: rendering it gave an all-solid-neighbourhood hit ⇒
+    // degenerate normal ⇒ a flat/black cube when the ray reached it through the shell. It stays RESIDENT (its core
+    // still feeds neighbours' halos via the pager); only its BLAS primitive is suppressed.
+    let is_uniform = classify_out[base + 0u] & 1u;
+    let has_air = (classify_out[base + 0u] >> 1u) & 1u;
+    let palette_k = classify_out[base + 2u];
+    let index_bits = classify_out[base + 3u];
+    // FIXED PER-SLOT SLABS (replaces the shared bump+free-list allocator, which RACED — an alloc could pop a
+    // free-list slot mid-write ⇒ two LIVE bricks share one slab offset ⇒ one reads the other's content ⇒ garbage
+    // cubes). Each slot OWNS a unique [slot·stride, (slot+1)·stride) region in BOTH pools, reserved worst-case-
+    // per-slot (incremental.rs RESERVE_INDEX_WORDS_PER_BRICK / RESERVE_PALETTE_WORDS_PER_BRICK = the strides). So
+    // two bricks can NEVER alias a slab — the race is gone by construction. The ONE case a fixed slot can't hold
+    // is an `index_bits=16` brick (>256-entry palette > the 256-word palette stride): treat it as BURIED (degenerate
+    // AABB, no pool write) rather than overflow into the next slot — real `index_bits ≤ 8` scenes never hit this.
+    let palette_fits = index_bits != 16u;
+    let buried = (is_uniform != 0u) || (has_air == 0u) || (!palette_fits);
     let span = brick_span_d(lod);
     let world_min = vec3<f32>(f32(coord.x) * span, f32(coord.y) * span, f32(coord.z) * span);
 
-    // Every resident brick gets a resident AABB command (the AABB is a pure function of world_min/lod).
+    // AABB command: resident (flag 1) for a brick with a visible surface that FITS; freed/degenerate (flag 0) for a
+    // BURIED brick (no air ⇒ never a primary-hit surface) or a non-fitting one. write_aabb_slot writes degenerate for 0.
     let a = atomicAdd(&aabb_count, 1u);
-    aabb_commands[a] = AabbCommandD(slot, lod, 1u, 0u, world_min.x, world_min.y, world_min.z, 0u);
+    let aabb_flag = select(1u, 0u, buried);
+    aabb_commands[a] = AabbCommandD(slot, lod, aabb_flag, 0u, world_min.x, world_min.y, world_min.z, 0u);
     atomicMax(&aabb_dispatch[0], (a + 1u + 63u) / 64u);
 
-    // The slot's CURRENTLY-PACKED dense slab state (its previous frame's allocation), 0/0/0/0 if it has none
-    // (fresh-entered, previously-uniform, or freed). The SSOT for reuse-or-free below (mirror of `SlotState`).
-    let sbase = slot * 4u;
-    let old_index_bits = slab_state[sbase + 1u];
-    let old_palette_k = slab_state[sbase + 3u];
-    let had_dense = old_index_bits != 0u;
-
-    if (is_uniform != 0u) {
-        // UNIFORM — GPU-write the meta straight (the landed pack_brick never touches a uniform slot). If this slot
-        // was DENSE before (dense→uniform re-pack), FREE its old slabs back to the free-lists (else they leak).
-        if (had_dense) {
-            free_index_slab(slab_state[sbase + 0u], old_index_bits);
-            free_palette_slab(slab_state[sbase + 2u], old_palette_k);
-        }
-        slab_state[sbase + 0u] = 0u;
-        slab_state[sbase + 1u] = 0u; // no dense slab now
-        slab_state[sbase + 2u] = 0u;
-        slab_state[sbase + 3u] = 0u;
-        write_uniform_meta(slot, coord, lod, classify_out[base + 1u]);
+    if (is_uniform != 0u || !palette_fits) {
+        // UNIFORM (or a non-fitting index_bits=16 brick degraded to empty) — GPU-write the meta straight; the slot
+        // holds no dense pool data (fixed per-slot ⇒ no slab to free, nothing to track).
+        let ublock = select(0u, classify_out[base + 1u], is_uniform != 0u); // !fits ⇒ uniform-AIR (empty, degenerate)
+        write_uniform_meta(slot, coord, lod, ublock);
         return;
     }
-    // DENSE — REUSE the existing slab in place iff its size class already matches (no churn / no high-water bump,
-    // mirror of `update_inner`'s reuse-iff-class-matches), ELSE free the old slab and claim a new one. This is what
-    // BOUNDS the slab high-water: a re-pack that keeps the same class allocates NOTHING; a class change frees-then-
-    // allocs (net zero growth). Only a genuine NEW resident brick bumps the high-water — bounded by `max_resident`.
-    let palette_k = classify_out[base + 2u];
-    let index_bits = classify_out[base + 3u];
-    var index_off: u32;
-    if (had_dense && old_index_bits == index_bits) {
-        index_off = slab_state[sbase + 0u]; // same INDEX class ⇒ reuse in place (1:1 class↔index_bits)
-    } else {
-        if (had_dense) { free_index_slab(slab_state[sbase + 0u], old_index_bits); }
-        index_off = alloc_index_slab(index_bits);
-    }
-    var palette_off: u32;
-    if (had_dense && palette_class_of(old_palette_k) == palette_class_of(palette_k)) {
-        palette_off = slab_state[sbase + 2u]; // same PALETTE class ⇒ reuse in place
-    } else {
-        if (had_dense) { free_palette_slab(slab_state[sbase + 2u], old_palette_k); }
-        palette_off = alloc_palette_slab(palette_k);
-    }
-    // Record the slot's NEW dense state for the next re-pack's reuse/free decision.
-    slab_state[sbase + 0u] = index_off;
-    slab_state[sbase + 1u] = index_bits;
-    slab_state[sbase + 2u] = palette_off;
-    slab_state[sbase + 3u] = palette_k;
+    // DENSE — fixed per-slot offsets. `pack_brick` writes the index stream at `index_off` and the palette at
+    // `palette_off`; the brick reuses the SAME region every re-pack (no churn, no high-water, no aliasing).
+    let index_off = index_pool_base[0] + slot * pack_cfg.index_stride;
+    let palette_off = palette_pool_base[0] + slot * pack_cfg.palette_stride;
     let p = atomicAdd(&pack_count, 1u);
     pack_commands[p] = PackCommandD(
         coord.x * BRICK_EDGE_D, coord.y * BRICK_EDGE_D, coord.z * BRICK_EDGE_D, slot,
@@ -1549,4 +1435,23 @@ fn pack_build_commands(@builtin(global_invocation_id) gid: vec3<u32>) {
         i * NEIGHBOUR_COUNT, 0u, 0u, 0u,
     );
     atomicMax(&pack_dispatch[0], p + 1u); // 1 workgroup per dense pack command (pack_brick)
+}
+
+// Convert a per-item indirect dispatch (built as `[count, 1, 1]` by the atomicMax above / `try_mark_dirty`) into a
+// 2D `[x, y, 1]` grid: `x = min(count, 65535)`, `y = ceil(count / 65535)`. A per-brick pass (1 workgroup/brick)
+// otherwise can't exceed the 65535 workgroups-per-dimension limit (Bistro needs ~610k). The kernel recovers
+// `cmd_idx = wg.x + wg.y*65535`. Run (1 invocation) AFTER the count is final, BEFORE the indirect dispatch.
+@compute @workgroup_size(1)
+fn finalize_pack_dispatch_2d() {
+    let n = atomicLoad(&pack_dispatch[0u]);
+    atomicStore(&pack_dispatch[0u], select(n, 65535u, n > 65535u));
+    atomicStore(&pack_dispatch[1u], (n + 65534u) / 65535u);
+    atomicStore(&pack_dispatch[2u], 1u);
+}
+@compute @workgroup_size(1)
+fn finalize_classify_dispatch_2d() {
+    let n = atomicLoad(&classify_dispatch[0u]);
+    atomicStore(&classify_dispatch[0u], select(n, 65535u, n > 65535u));
+    atomicStore(&classify_dispatch[1u], (n + 65534u) / 65535u);
+    atomicStore(&classify_dispatch[2u], 1u);
 }
