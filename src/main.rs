@@ -141,7 +141,7 @@ fn wgpu_settings() -> WgpuSettings {
     // DLSS (via `dlss_wgpu`) only works on the Vulkan backend, so pin to Vulkan when built with
     // `--features dlss`. The HW-RT voxel path (AABB-BLAS `ray_query`) is fully supported on Vulkan, so
     // this is safe — it just drops the DX12 fallback that DLSS can't use anyway. We also RAISE
-    // `max_storage_textures_per_shader_stage` (wgpu's default is 4): the DLSS-RR `raymarch_dlss` compute
+    // `max_storage_textures_per_shader_stage` (wgpu's default is 4): the DLSS-RR `restir_dlss_p2` compute
     // writes 6 storage textures in one stage (colour + diffuse/specular albedo + normal/roughness + depth +
     // motion). RTX GPUs support far more; bump to 8.
     #[cfg(feature = "dlss")]

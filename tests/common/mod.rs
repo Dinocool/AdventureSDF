@@ -34,7 +34,7 @@ pub fn instance_descriptors_buffer(device: &wgpu::Device) -> wgpu::Buffer {
 }
 
 /// A UNIFORM buffer holding the default [`SkyUniformData`] (group 1 binding 11 of `voxel_raytrace.wgsl`).
-/// Every entry point that shades or bounces (`trace_one`, `restir_probe`, `raymarch_dlss`, …) now references
+/// Every entry point that shades or bounces (`trace_one`, `restir_probe`, `restir_dlss_p2`, …) now references
 /// the `Sky` uniform via `sky_radiance`, so wgpu's auto-derived group(1) layout includes binding 11 — the
 /// test's group(1) bind group MUST supply it or pipeline-creation/validation fails. The defaults preserve the
 /// previous inline sky look, so behaviour-asserting tests are unaffected. Single SSOT for the test sky buffer.
@@ -248,7 +248,7 @@ fn request_ray_query_device(
 
 /// Like [`headless_ray_query_device`] but raises `max_storage_textures_per_shader_stage` to `min_storage`
 /// (wgpu's default is 4) so a G-buffer-style compute that storage-writes more than 4 textures in one stage —
-/// e.g. the DLSS-RR `raymarch_dlss` entry (6: colour + diffuse/specular albedo + normal/roughness + depth +
+/// e.g. the DLSS-RR `restir_dlss_p2` entry (6: colour + diffuse/specular albedo + normal/roughness + depth +
 /// motion) — can create its pipeline. Mirrors the renderer's `wgpu_settings()` bump under `--features dlss`.
 /// Keeps the default storage-BUFFER limit (8); use [`headless_ray_query_device_with_storage`] if an entry also
 /// binds more than 8 storage buffers (e.g. `restir_p1` once it queries the group(3) world cache — Phase 2.2).
