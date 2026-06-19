@@ -359,7 +359,7 @@ fn decode_cell(idx: u32) -> CellKey {
 // cell's sectors — the cell is 8³ bricks = 8 sectors of 4³). Kept cells are atomic-appended to
 // `shell_wg_indices` and `atomicMax` the Pass-B indirect dispatch. Mirrors re-flora
 // `prepare_sparse_surface_dispatch.comp`. **Bounds the work by the OCCUPIED surface, not the H³ cube.**
-@compute @workgroup_size(64)
+@compute @workgroup_size(256)
 fn prepare_shell_dispatch(@builtin(global_invocation_id) gid: vec3<u32>) {
     let idx = gid.x;
     if (idx >= params.total_cells) {
@@ -410,7 +410,12 @@ fn prepare_shell_dispatch(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     let slot = atomicAdd(&shell_count, 1u);
     shell_wg_indices[slot] = idx;
-    atomicMax(&shell_dispatch[0], slot + 1u); // wg_x ≥ #solid cells (one workgroup per solid cell)
+    // 1D dispatch dim = #solid cells (one workgroup per cell). VALID as-is when #cells <= 65535;
+    // `finalize_shell_dispatch_2d` (live path) then UPGRADES this to a 2D [x, y, 1] grid so the indirect
+    // enumerate is size-agnostic past the 65535 workgroup-per-dimension cap. (`enumerate_shells` recovers
+    // wg = wid.x + wid.y·65535, which equals wid.x when the dim is 1D — so a harness that skips the finalize
+    // pass still enumerates correctly at <= 65535 cells.)
+    atomicMax(&shell_dispatch[0], slot + 1u);
 }
 
 // **Pass B — `enumerate_shells`** (`record_indirect` over Pass B0's `shell_dispatch`). One WORKGROUP per solid
@@ -436,7 +441,10 @@ fn enumerate_shells(
     @builtin(workgroup_id) wid: vec3<u32>,
     @builtin(local_invocation_index) lidx: u32,
 ) {
-    let wg = wid.x;
+    // 2D grid (size-agnostic): wg = wid.x + wid.y·65535 (mirror of pack_brick). When shell_count <= 65535 the
+    // dispatch is [n,1,1] ⇒ wid.y == 0 ⇒ wg == wid.x; above it the stride is 65535 and the count guard below
+    // skips the partial last row.
+    let wg = wid.x + wid.y * 65535u;
     if (wg >= atomicLoad(&shell_count)) {
         return;
     }
@@ -599,7 +607,7 @@ fn present_contains(coord: vec3<i32>, lod: u32) -> bool {
 // insert into `present_flag` (CAS the `lod` word from EMPTY_LOD to claim a slot). The desired set is DEDUPED by
 // Pass B already (one emit per brick), so there are no duplicate keys to race; the CAS only guards two DIFFERENT
 // keys probing the same start slot.
-@compute @workgroup_size(64)
+@compute @workgroup_size(256)
 fn build_present_flag(@builtin(global_invocation_id) gid: vec3<u32>) {
     let i = gid.x;
     if (i >= atomicLoad(&desired_count)) {
@@ -810,7 +818,7 @@ fn seed_frame() {
 // SEPARATE parallel pass (one invocation per MAX(present, dirty) slot). It ALSO zeroes `change_count` (the G-c.4
 // mirror signal) on invocation 0 so a stale value never leaks into the out-of-band read. GPU-timeline, readback-
 // free — the persistent-buffer drive calls this each frame instead of re-uploading zeroed hashes from the host.
-@compute @workgroup_size(64)
+@compute @workgroup_size(256)
 fn clear_per_frame_hashes(@builtin(global_invocation_id) gid: vec3<u32>) {
     let i = gid.x;
     if (i == 0u) {
@@ -841,7 +849,7 @@ fn write_change_count() {
 // **Pass C-cap.A — build the candidate distance HISTOGRAM** (BUG-2 nearest-priority cap). One invocation per
 // candidate; bins the NON-resident candidates (only those can enter, mirror of the CPU `to_classify` filter that
 // excludes the resident set) by world distance. The histogram drives the cut radius (Pass C-cap.B).
-@compute @workgroup_size(64)
+@compute @workgroup_size(256)
 fn enter_cap_histogram(@builtin(global_invocation_id) gid: vec3<u32>) {
     let i = gid.x;
     if (i >= atomicLoad(&candidate_count)) {
@@ -885,7 +893,7 @@ fn enter_cap_compute() {
 // free-list ring), insert the key→slot into the slot table, and atomic-append to `enter_list` (+ `enter_count`).
 // Mirrors design §1 Pass C1 + `ResidencyManager::update`'s "enqueue desired-but-not-resident" +
 // `SlotAllocator::claim` (incremental.rs:595) + the nearest-`room` cap (streaming.rs:783-806).
-@compute @workgroup_size(64)
+@compute @workgroup_size(256)
 fn diff_enter_scan(@builtin(global_invocation_id) gid: vec3<u32>) {
     let i = gid.x;
     if (i >= atomicLoad(&candidate_count)) {
@@ -951,7 +959,7 @@ fn diff_enter_scan(@builtin(global_invocation_id) gid: vec3<u32>) {
 // slot's key drops: occupied AND not present (not desired) AND `safe_to_drop` (keep-old-until-revealed). Writes
 // the verdict to `drop_decision[slot_idx]`. All invocations read the SAME pre-drop slot table + present-flag, so
 // the residency tests inside `safe_to_drop` are consistent (the CPU evaluates them over the pre-drop set too).
-@compute @workgroup_size(64)
+@compute @workgroup_size(256)
 fn diff_drop_mark(@builtin(global_invocation_id) gid: vec3<u32>) {
     let slot_idx = gid.x;
     if (slot_idx >= diff_cfg.slot_table_size) {
@@ -988,7 +996,7 @@ fn diff_drop_mark(@builtin(global_invocation_id) gid: vec3<u32>) {
 // **Pass C2b — drop APPLY.** One invocation per slot. For each slot Pass C2a marked, release its slot id to the
 // QUARANTINE (freed next frame's Pass A, incremental.rs:755), clear the table entry, and atomic-append to
 // `drop_list` (+ `drop_count`). Mirrors `ResidencyManager::update`'s drop loop + `SlotAllocator::release`.
-@compute @workgroup_size(64)
+@compute @workgroup_size(256)
 fn diff_drop_apply(@builtin(global_invocation_id) gid: vec3<u32>) {
     let slot_idx = gid.x;
     if (slot_idx >= diff_cfg.slot_table_size) {
@@ -1224,7 +1232,7 @@ fn write_zeroed_meta(slot: u32) {
 // Pass C unchanged we instead pass the freed slot via `drop_list.w`? The CPU path knows the slot. SIMPLER: the
 // drop's meta is zeroed by re-using the quarantine ring (the slots Pass C2b pushed). One invocation per
 // quarantine entry pushed THIS frame.
-@compute @workgroup_size(64)
+@compute @workgroup_size(256)
 fn pack_build_drops(@builtin(global_invocation_id) gid: vec3<u32>) {
     let i = gid.x;
     if (i >= atomicLoad(&drop_count)) {
@@ -1291,7 +1299,7 @@ fn try_mark_dirty(coord: vec3<i32>, lod: u32) {
     }
 }
 
-@compute @workgroup_size(64)
+@compute @workgroup_size(256)
 fn pack_build_dirty(@builtin(global_invocation_id) gid: vec3<u32>) {
     let n_enter = atomicLoad(&enter_count);
     let n_drop = atomicLoad(&drop_count);
@@ -1332,7 +1340,7 @@ fn pack_build_dirty(@builtin(global_invocation_id) gid: vec3<u32>) {
 
 // **Pass D2 — build the 27-neighbour table + the classify command** per dirty key. `neighbour_base = i*27`
 // (the table is laid out command-major, mirror of `build_neighbour_table`). Slot 13 is the brick itself.
-@compute @workgroup_size(64)
+@compute @workgroup_size(256)
 fn pack_build_neighbours(@builtin(global_invocation_id) gid: vec3<u32>) {
     let i = gid.x;
     if (i >= atomicLoad(&dirty_count)) {
@@ -1377,7 +1385,7 @@ fn pack_build_neighbours(@builtin(global_invocation_id) gid: vec3<u32>) {
 // to decide whether to RECORD the AS build (no indirect AS on the fork). NOT wired to gate the AS build here.
 @group(0) @binding(48) var<storage, read_write> change_count: atomic<u32>;
 
-@compute @workgroup_size(64)
+@compute @workgroup_size(256)
 fn pack_build_commands(@builtin(global_invocation_id) gid: vec3<u32>) {
     let i = gid.x;
     if (i >= atomicLoad(&dirty_count)) {
@@ -1441,6 +1449,13 @@ fn pack_build_commands(@builtin(global_invocation_id) gid: vec3<u32>) {
 // 2D `[x, y, 1]` grid: `x = min(count, 65535)`, `y = ceil(count / 65535)`. A per-brick pass (1 workgroup/brick)
 // otherwise can't exceed the 65535 workgroups-per-dimension limit (Bistro needs ~610k). The kernel recovers
 // `cmd_idx = wg.x + wg.y*65535`. Run (1 invocation) AFTER the count is final, BEFORE the indirect dispatch.
+@compute @workgroup_size(1)
+fn finalize_shell_dispatch_2d() {
+    let n = atomicLoad(&shell_count);
+    atomicStore(&shell_dispatch[0u], select(n, 65535u, n > 65535u));
+    atomicStore(&shell_dispatch[1u], (n + 65534u) / 65535u);
+    atomicStore(&shell_dispatch[2u], 1u);
+}
 @compute @workgroup_size(1)
 fn finalize_pack_dispatch_2d() {
     let n = atomicLoad(&pack_dispatch[0u]);

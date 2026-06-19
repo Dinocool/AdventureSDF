@@ -40,16 +40,20 @@ struct LevelParams {
     cell_count: u32,
 }
 
-/// The clipmap uniform — MUST match the WGSL `ResidencyParams` (8×48 + 16 = 400 B). std140 array stride of the
-/// 48-B `LevelParams` is 48 (a multiple of 16), so the layout is exact.
+/// The clipmap uniform — MUST match the WGSL `ResidencyParams` (8×48 + 32 = 416 B). std140 array stride of the
+/// 48-B `LevelParams` is 48 (a multiple of 16), so the layout is exact. The enter-cap fields
+/// (`hist_scale`/`cam_world`) are unused by the enumerate passes but MUST be present so the uniform's size
+/// matches the shader (else a bind-size validation error).
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct ResidencyParams {
     levels: [LevelParams; LODS],
     clip_half_bricks: i32,
     total_cells: u32,
-    _pad0: u32,
+    hist_scale: f32,
     _pad1: u32,
+    cam_world: [f32; 3],
+    _pad2: u32,
 }
 
 /// The WG-cell grid edge in bricks — the WGSL Pass B0/B tile 8³-brick cells (`workgroup_size = 512`).
@@ -90,7 +94,15 @@ fn build_params(cam: [f32; 3], cfg: &StreamingConfig) -> ResidencyParams {
         };
         offset += count;
     }
-    ResidencyParams { levels, clip_half_bricks: half, total_cells: offset, _pad0: 0, _pad1: 0 }
+    ResidencyParams {
+        levels,
+        clip_half_bricks: half,
+        total_cells: offset,
+        hist_scale: 0.0, // enter-cap unused by the enumerate passes
+        _pad1: 0,
+        cam_world: cam,
+        _pad2: 0,
+    }
 }
 
 /// Dispatch the GPU Pass B0 + Pass B over the uploaded occupancy `occ` with the clipmap `params`, and read back
@@ -170,9 +182,11 @@ fn gpu_candidate_set(
         })
     };
     let p_b0 = make_pipeline("prepare_shell_dispatch");
+    let p_fin = make_pipeline("finalize_shell_dispatch_2d");
     let p_b = make_pipeline("enumerate_shells");
 
-    // Pass B0's bind group binds the REAL `shell_dispatch` at binding 7 (it `atomicMax`es it). Pass B uses
+    // Pass B0's bind group binds the REAL `shell_dispatch` at binding 7 (so `finalize_shell_dispatch_2d`, which
+    // runs with this same bind group, can write the 2D indirect dims from `shell_count`). Pass B uses
     // `shell_dispatch` ONLY as the INDIRECT source — so its bind group binds a DUMMY at 7 (Pass B's shader does
     // not reference binding 7), avoiding the "same buffer as STORAGE + INDIRECT in one dispatch" conflict.
     let dummy_dispatch = storage_buf(device, "dummy_dispatch", 16);
@@ -206,10 +220,15 @@ fn gpu_candidate_set(
             .begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("b0"), timestamp_writes: None });
         pass.set_pipeline(&p_b0);
         pass.set_bind_group(0, &bg_b0, &[]);
-        pass.dispatch_workgroups(params.total_cells.div_ceil(64).max(1), 1, 1);
+        // prepare_shell_dispatch runs at @workgroup_size(256) (size-agnostic — mirror of the live front end).
+        pass.dispatch_workgroups(params.total_cells.div_ceil(256).max(1), 1, 1);
+        // Finalize the indirect dims: shell_dispatch [shell_count,1,1] → 2D [x,y,1] (so enumerate_shells is
+        // size-agnostic past the 65535 workgroup-per-dim cap). Uses bg_b0 (real shell_dispatch at binding 7).
+        pass.set_pipeline(&p_fin);
+        pass.dispatch_workgroups(1, 1, 1);
     }
     {
-        // Pass B is `record_indirect` over Pass B0's GPU-written dispatch — exactly the design's record_indirect.
+        // Pass B is `record_indirect` over Pass B0's GPU-written 2D dispatch — exactly the design's record_indirect.
         let mut pass = encoder
             .begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("b"), timestamp_writes: None });
         pass.set_pipeline(&p_b);

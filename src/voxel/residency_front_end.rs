@@ -142,19 +142,27 @@ const HIST_BUCKETS: u32 = 4096;
 
 /// The maximum `total_cells` (shell WG-cells across all LODs) the front end's `shell_idx`/list buffers are sized
 /// for, AND the candidate/enter/drop/pack/aabb list capacity. It bounds the transient per-frame work, NOT the
-/// resident pool (that is `max_resident`). At clip_half=160 a measured cold-fill settles to ~143k resident
-/// surface bricks; the per-frame candidate set (surface + halo) and the shell WG-cell union across 8 LODs stay
-/// well under this. **Capped so the derived `present_size = next_pow2(2·LIST_CAP)` clear dispatch stays within the
-/// 65535-workgroup 1D limit:** `present_size ≤ 2^21` ⇒ `present_size/64 = 32768 ≤ 65535`. The residency passes
-/// index `gid.x` LINEARLY (no 2D fold), so every per-frame dispatch MUST be `≤ 65535` workgroups — the binding
-/// constraint here. 1_000_000 ⇒ `present_size = next_pow2(2M) = 2^21`, list clear `= 1M/64 = 15625` WGs.
+/// resident pool (that is `max_resident`).
 ///
-/// **Sized to fit the FULL per-frame DESIRED + CANDIDATE sets at the widest clip_half (160, Bistro).** At
-/// clip_half=160 the Bistro `desired` (occupied-in-shell superset) measures ~870k and `cand` (surface) ~615k.
-/// `desired_list`/`cand_list` MUST hold the WHOLE set — if `desired` overflows this cap, `build_present_flag`
-/// (which runs over `LIST_CAP` invocations) never registers the tail of the desired set, so the resident bricks
-/// beyond the cap fail `present_contains`, get DROPPED, and re-enter next frame ⇒ permanent THRASH (the G-c.4 BUG-2
-/// non-convergence). 1M covers both with headroom while keeping `present_size = 2^21` (clear dispatch 32768 WGs).
+/// **Size-agnostic dispatch (memory-neutral):** the per-frame residency passes run at @workgroup_size(256) and
+/// the indirect shell enumerate (`enumerate_shells`) is 2D-folded (`finalize_shell_dispatch_2d`), so no per-frame
+/// dispatch hits the 65535-workgroup-per-dimension cap regardless of how many cells/bricks a frame touches. This
+/// FIXES a real correctness ceiling: a dense scene with > 65535 solid 8³ WG-cells previously under-ran the 1D
+/// enumerate dispatch (silent holes). It costs ZERO extra memory — it removes a dispatch limit, not a size cap.
+///
+/// **Why LIST_CAP stays 1M (memory budget — must run on 8 GB VRAM):** the transient lists scale with LIST_CAP;
+/// the largest, `neighbour_indices`, is 27 u32/entry = `LIST_CAP·108 B` = 108 MB at 1M (fits wgpu's DEFAULT
+/// 128 MB `max_storage_buffer_binding_size` — no device-limit raise needed anywhere). Growing LIST_CAP to widen
+/// the view would balloon transient VRAM (4M ⇒ 432 MB for this one buffer) — the WRONG lever on an 8 GB device.
+/// A wider view at BOUNDED transient memory comes from TILING the shell enumeration (process the cell union in
+/// LIST_CAP-sized windows), and a scene-size-independent resident set from demand/LRU streaming — see
+/// docs/DYNAMIC_LARGE_SCENE_PLAN.md (Phases 2-tiling / 4-demand). NOT from a bigger transient cap.
+///
+/// `desired_list`/`cand_list` MUST hold the WHOLE per-frame desired+candidate set — if `desired` overflows this
+/// cap, `build_present_flag` never registers the tail of the desired set, so resident bricks beyond the cap fail
+/// `present_contains`, get DROPPED, and re-enter next frame ⇒ permanent THRASH (the G-c.4 BUG-2 non-convergence).
+/// At clip_half=160 Bistro measures `desired` ~870k / `cand` ~615k — under 1M. `would_overflow` skips the drive
+/// (never silently truncates) rather than exceed this; tiling will replace that skip with windowed enumeration.
 const LIST_CAP: usize = 1_000_000;
 
 // =========================================================================================================
@@ -273,6 +281,7 @@ pub struct GpuResidencyFrontEnd {
     p_aabb: wgpu::ComputePipeline,
     p_fin_classify: wgpu::ComputePipeline,
     p_fin_pack: wgpu::ComputePipeline,
+    p_fin_shell: wgpu::ComputePipeline,
 
     // --- the per-epoch occupancy/core bind group + the pool-dependent pack bind groups (rebuilt by `rebind_pool`) ---
     bound: Option<BoundScene>,
@@ -478,6 +487,7 @@ impl GpuResidencyFrontEnd {
         // exceed the 65535 workgroups-per-dimension limit (large scenes — Bistro ~610k bricks). 1 invocation each.
         let p_fin_classify = mk_res("finalize_classify_dispatch_2d");
         let p_fin_pack = mk_res("finalize_pack_dispatch_2d");
+        let p_fin_shell = mk_res("finalize_shell_dispatch_2d");
 
         // pack shader pipelines (their bind GROUPS are pool-dependent → built in rebind_pool).
         let cls_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -619,6 +629,7 @@ impl GpuResidencyFrontEnd {
             p_aabb,
             p_fin_classify,
             p_fin_pack,
+            p_fin_shell,
             bound: None,
         }
     }
@@ -698,7 +709,9 @@ impl GpuResidencyFrontEnd {
     /// the in-RAM scenes the front end binds today this never trips; it is the guard for the future streamed path.)
     pub fn would_overflow(&self, cam: [f32; 3]) -> bool {
         let params = build_params(cam, self.half);
-        let b0_wgs = params.total_cells.div_ceil(64);
+        // Pass B0 (`prepare_shell_dispatch`) runs at @workgroup_size(256); its 1D dispatch must stay within the
+        // 65535-workgroup limit (the LIST_CAP guard below keeps total_cells well under that, so this is defensive).
+        let b0_wgs = params.total_cells.div_ceil(256);
         params.total_cells as usize > LIST_CAP || b0_wgs > 65535
     }
 
@@ -811,8 +824,12 @@ impl GpuResidencyFrontEnd {
         // submit), so `write_aabb`'s atomicOrs accumulate only THIS frame's changed chunks.
         queue.write_buffer(&self.dirty_chunk_buf, 0, bytemuck::cast_slice(&vec![0u32; self.dirty_mask_words as usize]));
 
-        let clear_wgs = self.slot_table_size.max(self.present_size).div_ceil(64).max(1);
-        let list_wgs = (LIST_CAP as u32).div_ceil(64).max(1);
+        // The per-frame residency passes run at @workgroup_size(256) (size-agnostic headroom: a 4× higher
+        // workgroup-count ceiling than the old 64, so LIST_CAP can grow to 4M while every 1D dispatch stays
+        // <= the 65535-workgroup limit). MUST match the WGSL @workgroup_size on these entry points.
+        const RES_WG: u32 = 256;
+        let clear_wgs = self.slot_table_size.max(self.present_size).div_ceil(RES_WG).max(1);
+        let list_wgs = (LIST_CAP as u32).div_ceil(RES_WG).max(1);
         let bg = &bound.res_bg;
         let bg_b0 = &bound.res_bg_b0;
 
@@ -823,13 +840,15 @@ impl GpuResidencyFrontEnd {
         // Pass A2 — clear the per-frame hashes + change_count.
         compute(enc, &self.p_clear, bg, clear_wgs);
         // Pass B0 — shell dispatch prep (binds the real shell_dispatch at 7).
-        compute(enc, &self.p_b0, bg_b0, params.total_cells.div_ceil(64).max(1));
+        compute(enc, &self.p_b0, bg_b0, params.total_cells.div_ceil(RES_WG).max(1));
+        // shell_dispatch [n,1,1] → 2D [x,y,1] (size-agnostic past the 65535 workgroup-per-dim cap).
+        compute(enc, &self.p_fin_shell, bg, 1);
         // Pass B — enumerate (INDIRECT over the GPU-written shell_dispatch).
         record_indirect(enc, &self.p_b, bg, &self.shell_dispatch);
         // Pass C — present-flag, drop-mark, drop-apply, enter (sized over the LIST CAP / slot-table, no readback).
         compute(enc, &self.p_present, bg, list_wgs);
-        compute(enc, &self.p_mark, bg, self.slot_table_size.div_ceil(64).max(1));
-        compute(enc, &self.p_apply, bg, self.slot_table_size.div_ceil(64).max(1));
+        compute(enc, &self.p_mark, bg, self.slot_table_size.div_ceil(RES_WG).max(1));
+        compute(enc, &self.p_apply, bg, self.slot_table_size.div_ceil(RES_WG).max(1));
         // Enter-cap (BUG-2 nearest-priority): build the candidate distance histogram, compute the cut bucket from
         // the live pool room, THEN enter only the nearest-`room` candidates (≤ pool cap, stable ⇒ converges).
         compute(enc, &self.p_cap_hist, bg, list_wgs);

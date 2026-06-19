@@ -30,10 +30,19 @@ The architecture has moved far past the old CPU plan. Verified against the code 
   occupancy mask + the per-sector FULL mask of the brick AND its 6 face-neighbours (`is_occupied`/`is_full`,
   ~177-180; sector masks built once at scene-load). **This is why Bistro is ~615k surface bricks resident, not
   its full volume.** The old plan's "Phase A surface-only" is *partly done* — coarsely.
-- **Per-brick `any_air` is computed but UNUSED for residency.** `classify_brick` (`voxel_pack.wgsl:479,510`)
-  scans all 1000 haloed cells and sets `any_air` (→ `has_air_bit`, bit 1 of `classify_out[0]`). A brick with
-  `any_air == false` is provably enclosed (no ray reaches it). **This finer signal is currently never checked
-  in the enter/AABB decision** — the gap Phase 1 closes.
+- **Per-brick enclosed cull is ALREADY WIRED (Phase 1 is done).** Two layers, both live:
+  - *Enter cull* — `classify_surface` (`voxel_residency.wgsl:192-207`) is a per-brick 6-face occlusion test
+    using the per-brick `full` mask of the brick + its 6 neighbours; only bricks passing it enter
+    `candidate_list` (the resident-target set, `:467`), and a brick that *becomes* enclosed is dropped
+    (`:972-981`). Enclosed bricks **never get a residency slot**.
+  - *AABB cull* — D3 `pack_build_commands` (`voxel_residency.wgsl:1396-1416`): even an entered surface brick
+    with `has_air == 0` (`classify_brick` `voxel_pack.wgsl:510`) gets `buried = true` → degenerate AABB (no
+    BLAS primitive), while staying resident to feed neighbours' halos.
+  The resident set is therefore already Θ(H²) surface-only. (The original Phase-1 framing here was based on a
+  research pass that read the CPU `incremental.rs` and missed D3 in `voxel_residency.wgsl`.) The remaining
+  Phase-1-adjacent refinement — *freeing the pool slot* of a per-brick-buried dense brick (not just its BLAS
+  primitive) — is entangled (the buried fact is known only after pack, and the core still feeds halos) and is
+  low-value vs. C1/C2; deferred.
 - **Halo = the 6 neighbours, already on-GPU.** `fill_halo` (`voxel_pack.wgsl:227-272`) reads all 27 same-LOD
   neighbours, with `NEIGHBOUR_ABSENT`→AIR and `NEIGHBOUR_SOLID`→synthetic-solid for occupied-but-unpaged
   neighbours. Shared SSOT between classify and pack. An enclosed predicate can ride this with no second fill.
@@ -74,49 +83,38 @@ specialist → ≥2 adversarial reviewers vs. the GPU ground truth → benchmark
 ([[feedback-agent-team-qa-per-stage]], [[feedback-benchmark-deliveries]]); design to the SOTA target, rip out
 band-aids ([[feedback-plan-to-best-practice]]).
 
-### Phase 1 — Per-brick enclosed cull (tighten surface-only)
-**Goal.** Don't make a provably-enclosed brick resident at all — finer than today's sector-level cull. Frees
-C1 pool headroom *and* shrinks the BLAS (faster trace + faster dirty-chunk rebuild). The prerequisite
-measurement for every later phase (you want the minimal surface set before sizing pools or deciding if
-demand/LRU is even needed).
+### Phase 1 — Per-brick enclosed cull (tighten surface-only) — **ALREADY DONE**
+Verified live (see §1): the enter cull (`classify_surface`, per-brick `full` mask of brick + 6 neighbours,
+`voxel_residency.wgsl:467`) keeps enclosed bricks out of the resident set, and D3's `has_air` test
+(`voxel_residency.wgsl:1408`) gives any remaining buried surface brick a degenerate AABB. Resident set is
+Θ(H²) surface-only; edit-exposure handled by the 26-neighbour dirty expansion (`incremental.rs:573`). No work
+needed. Deferred refinement (low value): free the *pool slot* of a per-brick-buried dense brick, not just its
+BLAS primitive — entangled (buried-ness known only post-pack; the core still feeds halos), revisit only if the
+C1 pool wall proves tight after Phases 2–3.
 
-**What changes (all GPU-side, readback-free).**
-- Promote the `any_air` signal from "computed but unused" to the **enter/AABB decision**: an entered brick with
-  `any_air == false` AND all 6 face-neighbours full (via the halo's `NEIGHBOUR_SOLID`/occupancy info) →
-  **degenerate AABB + no pool slot** rather than a real primitive. Reuse `write_aabb_dirty`'s existing `flag`
-  and the `fill_halo` neighbour table; no new buffer, no CPU readback.
-- Refinement over the sector cull: catches bricks the *sector* classifier called surface but are actually
-  enclosed (e.g. a brick straddling a sector boundary). Unify with R1's uniform-incl-halo collapse on the one
-  enclosed predicate (uniform-incl-halo ⊂ enclosed) per `VOXEL_LARGE_SCENE_PLAN.md` §4.2.
-- Decide per-brick vs per-face fullness: start with the existing per-brick `is_full` (conservative toward
-  keeping — never culls a possibly-exposed brick); upgrade to a per-face 64-bit plane test if the measured
-  enclosed fraction warrants the extra ~6m²/m³.
+### Phase 2 — Break C2 (decouple view distance from `LIST_CAP`) — split into 2a (done) + 2b (tiling)
 
-**Correctness.** Exact for a first-hit DDA (enclosed ⇒ unreachable). Boundary safety: a missing/different-LOD
-neighbour reads AIR → brick stays resident (conservative toward keeping). Edit-exposure: already covered by the
-26-neighbour dirty expansion (§1).
+**MEMORY CONSTRAINT (user, 2026-06-20):** target devices include **8 GB VRAM** — be memory-efficient. This
+*rules out* the naive "raise `LIST_CAP`" lever: the transient lists scale with it (`neighbour_indices` alone is
+`LIST_CAP·108 B` — 432 MB at 4M). View distance must grow at **bounded transient memory**, i.e. by *tiling*,
+not by a bigger cap.
 
-**Acceptance + benchmark.** GPU oracle pixel-identical to today on Bistro + a solid building + Cornell; BLAS
-primitive count + AABB/pool VRAM drop by the enclosed fraction; a dig exposes the interior brick in 1 frame
-(promote test); a place that seals a face drops it (demote test). Report enclosed-fraction and resident-count
-delta in the perf harness.
+**Phase 2a — Size-agnostic dispatch (DONE, memory-neutral).** The per-frame residency passes run at
+`@workgroup_size(256)` and the indirect shell enumerate is 2D-folded (`finalize_shell_dispatch_2d`;
+`enumerate_shells` recovers `wg = wid.x + wid.y·65535`), so **no dispatch hits the 65535-workgroup-per-dimension
+cap regardless of brick/cell count**. This FIXES a real correctness ceiling — a dense scene with >65 535 solid
+8³ WG-cells previously under-ran the 1D enumerate (silent holes) — at **zero extra memory** (it removes a
+*dispatch* limit, not a size cap). `LIST_CAP` stays **1M** (108 MB `neighbour_indices`, fits the default 128 MB
+`max_storage_buffer_binding_size` — runs on an 8 GB device with no limit raise). Gate: `enumerate_parity`
+green; `paged_front_end_render` + `pack_parity` unchanged.
 
-### Phase 2 — Break C2 (decouple view distance from `LIST_CAP`)
-**Goal.** Let `clip_half`/`MAX_LOD` grow past Bistro reach so we can *see farther* without the drive bailing.
-
-**What changes.**
-- 2D-fold every remaining `LIST_CAP`-sized dispatch (same pattern as the landed pack/classify fix), and
-  remove the `total_cells > LIST_CAP` / `b0_wgs > 65535` whole-drive bail (`residency_front_end.rs:699`).
-- **Tile the shell enumeration** so `total_cells` is processed in bounded windows instead of one ≤1M list →
-  the transient per-frame work is bounded by *window* size, not by view distance. Decouple `present_size`
-  (the per-frame hash) from `LIST_CAP`.
-- Keep the convergence guarantee: the desired/candidate lists must never silently truncate (that's the
-  permanent-thrash BUG-2 the cap currently prevents) — tiling must be loss-less or explicitly logged
-  ([[feedback-no-silent-layer-miss]]).
-
-**Acceptance + benchmark.** Sweep `clip_half ∈ {160, 240, 320, …}` and confirm the drive converges (no thrash,
-no blank) with resident count growing ~Θ(H²) (surface) not Θ(H³); fit the exponent (the cubic→quadratic claim
-from `VOXEL_LARGE_SCENE_PLAN.md` §3, *measured*). Report max stable view distance.
+**Phase 2b — Tile the shell enumeration (the memory-efficient view-distance lever).** Process the `total_cells`
+shell union in **`LIST_CAP`-sized windows** so a far view (big `clip_half`/`MAX_LOD`) needs **bounded** transient
+VRAM, not a bigger cap. Replace the `would_overflow` whole-drive bail with windowed enumeration (loss-less —
+never silently truncate, [[feedback-no-silent-layer-miss]]). The diff/present-flag membership must still see the
+full desired set across windows (the hard part — likely a two-pass: accumulate desired-membership hash across
+windows, then diff). *Acceptance:* sweep `clip_half ∈ {160, 240, 320}`, drive converges (no thrash/blank) with
+**flat transient VRAM**; resident count grows ~Θ(H²); report peak transient + resident VRAM (8 GB budget gate).
 
 ### Phase 3 — Break C1 (split/tiled pools past 2 GiB)
 **Goal.** Let the resident *surface* set exceed ~900k bricks — the "3–10× Bistro, loaded whole" target.
@@ -166,6 +164,13 @@ distance-only LOD; report resident count + a perceptual/SSIM delta at matched bu
 
 ## 4. Cross-cutting
 
+- **Memory budget — must run on 8 GB VRAM (user, 2026-06-20).** Be memory-efficient: scaling levers must NOT
+  balloon VRAM. This rules out "raise `LIST_CAP`" (transient lists scale with it) and "raise `max_resident`
+  blindly" (pools scale with it). The memory-efficient levers are: surface-only residency (done — Θ(H²) not
+  Θ(H³)), R1 uniform-collapse-into-VRAM (bytes/brick), TILING the enumeration (bounded transient), and
+  demand/LRU (bounded resident set at a fixed budget). Every phase reports peak transient + pool VRAM and gates
+  on an 8 GB ceiling, not just correctness. Size-agnostic *dispatch* (Phase 2a) is the model: remove a *limit*
+  without growing a *buffer*.
 - **One GPU path.** Every phase is readback-free and universal (no per-scene fork, no CPU fallback, no env
   gate) — [[feedback-one-gpu-residency-path]], [[feedback-gpu-readback-free-correct]]. Any slowness vs. the
   reference (GigaVoxels/Aokana) is OUR divergence, fixed by aligning, never a workaround.
@@ -174,9 +179,10 @@ distance-only LOD; report resident count + a perceptual/SSIM delta at matched bu
 - **Benchmark harness.** Extend the residency perf rig with a **resident-count-vs-view-distance sweep** + a
   **VRAM-budget binary search** ("how far can we see / how big a surface at budget B"). Every phase gates on it
   ([[feedback-benchmark-deliveries]]). Measure the cubic→quadratic exponent, don't assert it.
-- **Order recap:** 1 enclosed-cull (free headroom, smallest set) → 2 see-farther (C2) → 3 bigger-set (C1
-  tiled pools) → 4 demand/LRU (unbounded, on the tiled pool) → 5 screen-error LOD (polish). Each de-risks the
-  next; nothing is skipped.
+- **Order recap + status:** **1 enclosed-cull = DONE** (surface-only, Θ(H²)); **2a size-agnostic dispatch =
+  DONE** (memory-neutral, removes the 65535 cap / fixes dense-scene enumerate); **2b tiling** (memory-efficient
+  see-farther) → **3** bigger-set (C1 tiled pools + R1-into-VRAM) → **4** demand/LRU (unbounded, bounded VRAM) →
+  **5** screen-error LOD (polish). Each de-risks the next; nothing is skipped; every step holds the 8 GB budget.
 
 ---
 

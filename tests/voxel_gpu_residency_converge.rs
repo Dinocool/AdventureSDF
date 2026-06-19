@@ -536,6 +536,7 @@ impl GpuFrontEnd {
                 storage_entry(3, false),
                 storage_entry(4, false),
                 storage_entry(5, false),
+                storage_entry(12, true), // pack_cmd_count (2D-dispatch over-run guard)
             ],
         });
         let pack_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -561,6 +562,7 @@ impl GpuFrontEnd {
                 bind(3, &voxel_buf),
                 bind(4, &palette_buf),
                 bind(5, &meta_buf),
+                bind(12, &pack_count), // pack_brick gates on this exact count (the 2D-dispatch over-run guard)
             ],
         });
 
