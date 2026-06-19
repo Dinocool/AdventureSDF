@@ -112,6 +112,9 @@ fn wgpu_settings() -> WgpuSettings {
     // render device, so the floor must clear 48 (the headless residency gates request exactly 48 too).
     settings.limits.max_storage_buffers_per_shader_stage =
         settings.limits.max_storage_buffers_per_shader_stage.max(48);
+    // The ReSTIR/probe pipeline binds 5 groups (scene/view/reservoir/cache + group 4 screen-probe data); wgpu's
+    // default `max_bind_groups` is 4. Desktop GPUs support 8.
+    settings.limits.max_bind_groups = settings.limits.max_bind_groups.max(5);
     // The cache decay/compaction passes use `@workgroup_size(1024)` (the prefix-sum scan width). wgpu's
     // default caps invocations-per-workgroup + workgroup_size_x at 256, so raise both to 1024.
     settings.limits.max_compute_invocations_per_workgroup =

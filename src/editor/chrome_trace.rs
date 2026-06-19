@@ -90,6 +90,30 @@ pub fn toggle_on_f6(keyboard: Res<ButtonInput<KeyCode>>, file: Option<Res<Chrome
     }
 }
 
+/// F8 → log the live editor camera as a ready-to-paste `ADVENTURE_CAM=ex,ey,ez,lx,ly,lz` (eye + look-at).
+/// Fly to the viewpoint you want profiled, press F8, and hand the line to `capture.ps1 -Cam "<…>"` to pin the
+/// headless Nsight Sponza bench to EXACTLY that view — so the closed-loop perf numbers reflect the real cost,
+/// not the cheap default boot camera. Global hotkey (sibling to F6/F7/F11), works in any editor build.
+pub fn log_camera_on_f8(
+    keyboard: Res<ButtonInput<KeyCode>>,
+    cam: Query<&GlobalTransform, With<crate::sdf_render::SdfCamera>>,
+) {
+    if !keyboard.just_pressed(KeyCode::F8) {
+        return;
+    }
+    let Ok(t) = cam.single() else {
+        info!("F8: no SdfCamera in the scene — can't log a camera pin");
+        return;
+    };
+    let e = t.translation();
+    let f = t.forward();
+    let l = e + Vec3::new(f.x, f.y, f.z);
+    info!(
+        "F8 camera pin → ADVENTURE_CAM={:.2},{:.2},{:.2},{:.2},{:.2},{:.2}  (eye+look_at; paste to capture.ps1 -Cam)",
+        e.x, e.y, e.z, l.x, l.y, l.z
+    );
+}
+
 /// The capture toggle shown in the editor's Performance panel: a checkbox plus the target
 /// file and a reminder of how to read it. The checkbox drives the global flag directly.
 pub fn capture_ui(world: &mut World, ui: &mut egui::Ui) {

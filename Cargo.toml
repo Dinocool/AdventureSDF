@@ -109,6 +109,10 @@ bevy = { path = "D:/bevy-fork", default-features = false, features = [
     "3d_api", "bevy_render", "bevy_core_pipeline", "bevy_anti_alias",
     "bevy_post_process", "bevy_pbr", "bevy_gizmos", "bevy_gizmos_render",
     "tonemapping_luts",
+    # Spatiotemporal blue noise: embeds Bevy's `stbn.ktx2` (loaded into the `Bluenoise` resource) — the voxel-RT
+    # ReSTIR GI samples it for the per-pixel/frame rotation (blue in space AND time → reuse + DLSS-RR integrate
+    # it cleanly instead of the white-noise wandering that drives boil). Pulls `ktx2` + `bevy_image/zstd`.
+    "bluenoise_texture",
     # UI + text
     "common_api", "bevy_ui", "bevy_ui_render", "bevy_text",
     # scene + picking (mesh raycast for the camera; no 2D sprite picking)

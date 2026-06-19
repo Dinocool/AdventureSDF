@@ -45,6 +45,14 @@ cargo build --no-default-features --features editor,shader-debug
 powershell -ExecutionPolicy Bypass -File rdoc/scripts/ngfx/capture.ps1   # [-Frames 240] [-Out .soul/ngfx]
 python rdoc/scripts/ngfx/parse.py .soul/ngfx                            # -> .soul/ngfx/perf.json + summary
 ```
+
+**Pin a representative viewpoint** (the default boot camera is cheap / not inside the scene, so its numbers
+UNDERCOUNT). Fly to the view in the editor, press **F8** (logs `ADVENTURE_CAM=ex,ey,ez,lx,ly,lz`, eye+look_at),
+then pass it to `-Cam` — this boots the in-RAM Sponza bench with the camera pinned each frame:
+```sh
+powershell -ExecutionPolicy Bypass -File rdoc/scripts/ngfx/capture.ps1 -Cam "ex,ey,ez,lx,ly,lz"
+```
+Without `-Cam` the capture uses the default camera (fine for A/B *deltas* on the same view, wrong for absolute cost).
 `capture.ps1` injects via `ngfx --activity "GPU Trace Profiler"`, waits `-Frames` frames so
 the scene settles, traces 1 frame with the SM hardware sampling profiler, auto-exports the
 `BASE/*.xls` TSVs, and the app self-terminates (`ADVENTURE_EXIT_AFTER_FRAMES`, set by the
@@ -105,9 +113,22 @@ at `cs_warps_active 1.98%`, all pipes <5%, texture stall 0.06% → purely **occu
 
 ### The A/B measurement loop
 1. Fix a camera/scene (deterministic frame). 2. Capture + parse → baseline `perf.json`.
-3. Make the shader change + rebuild. 4. Re-capture → diff `gpu_time_us` + throughputs +
-step/inst counts per pass. `--set-gpu-clocks base` (in `capture.ps1`) locks clocks so numbers
-are comparable across runs.
+3. Make the shader change (wgsl is **runtime-loaded** — no rebuild needed for shader-only edits).
+4. Re-capture → diff `gpu_time_us` + throughputs + step/inst counts per pass. `--set-gpu-clocks base`
+(in `capture.ps1`) locks clocks so numbers are comparable across runs.
+
+**NOISE CONTROL (learned the hard way — single captures are NOT reliable for fine A/B):**
+- Use **`capture.ps1 -Light`** — drops the per-line `--real-time-shader-profiler`, which overflows the
+  timestamp buffer on a heavy (8-11ms) pass ("Timestamp overflow, trace may be missing data") and makes
+  `gpu_time` swing **±30%** run-to-run. `-Light` keeps throughput/occupancy/per-pass-time (metric-set 0) and
+  is stable (±1-2%). Only omit `-Light` for the per-WGSL-line shader-source export (a GUI step).
+- **Capture PAST world-load.** At low `-Frames` the streamed scene (Sponza) isn't resident → the capture
+  undercounts. The bench logs `resident_bricks=N`; it must reach its converged max (34347 for the in-RAM
+  Sponza) before the capture frame. `-Frames 2400` ≈ load-complete for Sponza at the F8 atrium pin.
+- **Median-of-N**: even loaded + `-Light`, the stochastic GI does different per-frame work (time spread
+  ±15%). Use `rdoc/scripts/ngfx/perf_median.sh <label> [N] [Frames] [Cam]` — it runs N independent captures,
+  verifies `resident_bricks` converged each run, and reports the MEDIAN time + occupancy. **Occupancy is the
+  more stable + meaningful metric** (it IS the limiter here); weight it over the noisier `gpu_time`.
 
 ### Per-WGSL-line cost — source mapping WORKS (with decoupled_naga); export is one GUI click
 With the `shader-debug` build (now incl. `decoupled_naga`, see prereq 3) the `.ngfx-gputrace`
@@ -143,6 +164,11 @@ python + `perfetto`): `hotspots.py`, `frames.py [--steady]`, `span.py <name>`,
   `Launch process exited. Searching for attachable child processes... Failed to connect`.
   Build `--no-default-features` (drops `fast`) for any injected capture — both `capture.ps1`
   and the interactive F11 launch. The `run-worktree.ps1` profiling launch already does this.
+  **A plain `cargo build` (default features) CLOBBERS `target/debug/adventure.exe` with the dynamic
+  build** → the NEXT capture silently fails to attach and `parse.py` re-emits STALE numbers from the
+  old `BASE/*.xls` (cost an invalid A/B once). Rebuild `--no-default-features --features
+  editor,shader-debug` before capturing; `perf_median.sh` now aborts on "Failed to connect"/"TARGET
+  ERROR" and clears `BASE/` each run instead of trusting stale exports.
   Worse, a failed capture leaves the **previous** `BASE/*.xls` in place, so `parse.py` happily
   prints STALE numbers — clear `.soul/ngfx` (the launcher does) or distrust a `perf.json` whose
   numbers didn't move after a "failed to connect".

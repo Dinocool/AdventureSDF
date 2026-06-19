@@ -13,7 +13,7 @@ use crate::voxel::raytrace::{
 };
 
 /// Labels for `LightingUniformData.debug_view` (index == the u32 value the shader branches on).
-const DEBUG_LABELS: [&str; 8] = [
+const DEBUG_LABELS: [&str; 10] = [
     "Lit (normal)",
     "Normals",
     "Depth",
@@ -22,6 +22,8 @@ const DEBUG_LABELS: [&str; 8] = [
     "GI only",
     "Face orient (red = BACK face)",
     "LOD (ring colour)",
+    "DI only (emitter direct)",
+    "Motion vectors (DLSS, px)",
 ];
 
 /// The panel body. Registered via `editor::panels::register_panel`.
@@ -142,9 +144,34 @@ pub fn render_gi_panel(world: &mut World, ui: &mut egui::Ui) {
         ui.separator();
         ui.label(egui::RichText::new("ReSTIR GI").strong());
         if let Some(mut s) = world.get_resource_mut::<crate::voxel::raytrace::RestirSettings>() {
-            ui.add(egui::Slider::new(&mut s.spatial_samples, 0..=8).text("spatial search taps"));
-            ui.add(egui::Slider::new(&mut s.spatial_radius, 1.0..=48.0).text("spatial radius (px)"));
-            ui.add(egui::Slider::new(&mut s.confidence_cap, 1.0..=32.0).text("history cap (frames)"));
+            ui.checkbox(&mut s.restir, "ReSTIR GI (off = legacy gather_gi)");
+            let on = s.restir;
+            ui.add_enabled_ui(on, |ui| {
+                ui.add(egui::Slider::new(&mut s.spatial_samples, 0..=8).text("spatial search taps"));
+                ui.add(egui::Slider::new(&mut s.spatial_radius, 1.0..=48.0).text("spatial radius (px)"));
+                ui.add(egui::Slider::new(&mut s.confidence_cap, 1.0..=32.0).text("history cap (frames)"));
+                // 0 = uncapped (pure Solari); >0 caps the dissimilarity view-distance → absolute tangent reject
+                // beyond it, closing far thin-wall GI leaks. Raise toward off if it adds boil on slopes/terrain.
+                ui.add(egui::Slider::new(&mut s.gi_dissim_cap_dist, 0.0..=80.0).text("thin-wall reject cap dist (m, 0=off)"));
+            });
+            // Half-resolution ReSTIR GI: trace GI at render_res/2 (¼ the bounce traces), full-res reservoir-
+            // resolve gather. SHARP (re-resolved per full-res normal) but ~2× boilier pre-DLSS-RR (¼ the samples);
+            // a perf/quality trade that leans on RR to clean it.
+            ui.checkbox(&mut s.gi_half_res, "Half-res GI (¼ traces; sharp but boilier — needs DLSS-RR)");
+            // Screen-space radiance probes (Lumen-style): downsampled SH GI — kills the boil at a fraction of
+            // the per-pixel trace cost. Replaces the per-pixel ReSTIR diffuse gather when on. SHELVED (flat).
+            ui.checkbox(&mut s.screen_probes, "Screen-probe GI (Lumen-style — SHELVED, flat)");
+            ui.add_enabled_ui(on && s.screen_probes, |ui| {
+                ui.add(egui::Slider::new(&mut s.probe_size, 4..=32).text("probe spacing (px)"));
+                ui.add(egui::Slider::new(&mut s.probe_oct_res, 4..=16).text("probe directions √N (oct res)"));
+                ui.checkbox(&mut s.probe_temporal, "probe temporal accumulation (light)");
+            });
+            // GI 4.0: screen-space ReSTIR DI (emissive-voxel direct light) — the emitter-boil fix.
+            ui.checkbox(&mut s.di_enabled, "ReSTIR DI (emissive-voxel direct light)");
+            ui.add_enabled_ui(on && s.di_enabled, |ui| {
+                ui.add(egui::Slider::new(&mut s.di_initial_samples, 1..=32).text("DI initial RIS candidates"));
+                ui.add(egui::Slider::new(&mut s.di_confidence_cap, 1.0..=40.0).text("DI history cap (frames)"));
+            });
             ui.label(
                 egui::RichText::new(
                     "search taps = disk samples tried to find ONE valid neighbour/frame (not accumulated); \

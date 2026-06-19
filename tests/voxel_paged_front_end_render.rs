@@ -1197,7 +1197,7 @@ fn paged_front_end_no_leak_growth_across_lod_oscillation() {
     let mut fe = GpuResidencyFrontEnd::new(&device, clip_half, max_resident);
     let mut bound = false;
 
-    let mut drive = |pager: &mut StreamedResidencyPager, fe: &mut GpuResidencyFrontEnd, bound: &mut bool, cam: [f32; 3]| {
+    let drive = |pager: &mut StreamedResidencyPager, fe: &mut GpuResidencyFrontEnd, bound: &mut bool, cam: [f32; 3]| {
         pager.update(&queue, cam);
         if pager.take_needs_rebind() || !*bound {
             let occ = pager.occupancy();
