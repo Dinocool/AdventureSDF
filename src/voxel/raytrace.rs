@@ -3834,6 +3834,12 @@ fn dump_residency_debug(
         let palette_pool_words = palettes.len();
         let mut max_palette_end = 0usize; // high-water of palette_base + class-bound over ALL resident dense bricks
         let mut mismatch_index_bits = [0usize; 17]; // histogram by index_bits (0,1,2,4,8,16 used)
+        // ALL-bricks index_bits distribution + actual palette usage — the Phase-3 pool-sizing measurement: it
+        // tells whether the 256-word palette/index strides can shrink (e.g. mostly index_bits<=4 ⇒ palette_k<=16
+        // ⇒ a 16-word palette stride) without degenerating real bricks. (index_bits<=4 ⇒ palette<=16,
+        // index_bits=8 ⇒ palette<=256.) `dense_n` excludes uniforms (which use no dense/palette pool slab).
+        let mut index_bits_hist = [0usize; 17];
+        let mut dense_n = 0usize;
         let mut mismatch_palette_oob = 0usize; // mismatch bricks whose palette slab extends past the pool
         let mut mismatch_gpu_air_dominant = 0usize; // mismatch bricks where most differing voxels are GPU-air (core-miss)
         let mut mismatch_core_in_store = 0usize; // mismatch bricks whose core IS resident in the GPU store (pack bug)
@@ -3843,10 +3849,12 @@ fn dump_residency_debug(
             if *m == zero {
                 continue;
             }
+            index_bits_hist[(m.index_bits() as usize).min(16)] += 1;
             if m.is_uniform() {
                 uniform_n += 1;
                 continue;
             }
+            dense_n += 1;
             // Track the palette high-water: a dense brick's palette slab is `palette_base .. +class_words`. The class
             // upper bound from index_bits (≤16 for bits≤4, ≤256 for bits=8, ≤65536 for bits=16) over-estimates the
             // exact `k` but is enough to flag OOB. If this exceeds the pool the bump allocator OVERFLOWED.
@@ -3946,6 +3954,18 @@ fn dump_residency_debug(
         }
         let _ = writeln!(halo_report, "\n--- halo content (ADVENTURE_DUMP_HALO) ---");
         let _ = writeln!(halo_report, "uniform bricks = {uniform_n}");
+        // PHASE-3 POOL-SIZING measurement (all resident bricks). The index/palette pools are sized
+        // max_resident*256 words/slot; this shows how much of that 256 is actually used:
+        //   index_bits 0=uniform (no slab), 1/2/4 ⇒ palette_k<=16, 8 ⇒ palette_k<=256.
+        //   index words = ceil(1000*bits/32): b1=32 b2=63 b4=125 b8=250.
+        // If the b8 share is tiny, a smaller palette/index stride (degenerating the rare b8 via the D3 fits
+        // guard) reclaims most of the ~0.9 GB palette pool. The actual palette high-water (below) is the upper
+        // bound on a safe palette stride.
+        let _ = writeln!(
+            halo_report,
+            "PHASE3 index_bits dist (all resident): b0/uniform={} b1={} b2={} b4={} b8={} b16={}  (dense total={dense_n}); index/palette stride=256",
+            index_bits_hist[0], index_bits_hist[1], index_bits_hist[2], index_bits_hist[4], index_bits_hist[8], index_bits_hist[16]
+        );
         let _ = writeln!(halo_report, "dense bricks with EMPTY CORE (resident but nothing to hit) = {empty_core}   <== should be 0");
         let _ = writeln!(halo_report, "dense bricks with ALL-SOLID halo = {all_solid_halo}  (of these, STILL-RENDERED/live-AABB = {all_solid_live_aabb}  <== should be 0)");
         let _ = writeln!(halo_report, "content vs SOURCE: checked/lod={content_checked:?}  MISMATCH/lod={content_mismatch:?}  <== all should be 0");
