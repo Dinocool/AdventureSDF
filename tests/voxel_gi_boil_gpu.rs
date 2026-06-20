@@ -7,9 +7,10 @@
 //! DLSS-RR research in `docs/GI_BOIL_PLAN.md`).
 //!
 //! Method: boot the full `VoxelRtPlugin` on the static Cornell box, force **debug view 5 (GI-only)** — which
-//! writes the RAW per-frame ReSTIR GI estimate to the output BEFORE any temporal-accumulation blend (see
-//! `restir_p2`/`restir_dlss_p2`: the `debug_view != 0` branch returns before the history mix), so we read the
-//! true reservoir variance with nothing masking it. Hold the camera still, warm up `WARMUP` frames (cache +
+//! writes the RAW per-frame ReSTIR GI estimate to the output BEFORE any temporal-accumulation blend (the
+//! dedicated `restir_debug`/`restir_dlss_debug` pass overwrites `out_tex` with the raw GI-only resolve, with no
+//! history mix), so we read the true reservoir variance with nothing masking it. Hold the camera still, warm up
+//! `WARMUP` frames (cache +
 //! reservoirs converge), then collect `MEASURE` distinct frames and compute the **per-pixel temporal
 //! coefficient of variation** `CoV = stddev_t(luma) / mean_t(luma)` over the lit GI pixels; report the mean
 //! and 95th-percentile CoV as the **boil score** (lower = less boil).
@@ -297,12 +298,6 @@ fn gi_probe_spatial_diag() {
     *hr.app.world_mut().resource_mut::<RestirSettings>() = RestirSettings::default();
     let restir = grab(&mut hr);
     eprintln!("=== FULL-RES RESTIR GI region luma (reference) ===\n{}", grid(&hr, &restir));
-    {
-        let mut r = hr.app.world_mut().resource_mut::<RestirSettings>();
-        r.gi_half_res = true;
-    }
-    let half = grab(&mut hr);
-    eprintln!("=== HALF-RES GI region luma (must MATCH reference — sharp) ===\n{}", grid(&hr, &half));
 }
 
 /// **Blotch sweep** — measures BOTH the fine per-pixel grain (`boil_stats`) AND the low-freq blotch
@@ -444,7 +439,7 @@ fn gi_boil_meter_cornell() {
     assert!(stats.mean_cov < 0.30, "GI boil regressed: mean_CoV {:.4} exceeds the 0.30 ceiling", stats.mean_cov);
 }
 
-/// **Spatial-reuse UNBIASEDNESS gate.** Our screen-space spatial reuse (`restir_p2_core`) is a hand-derived
+/// **Spatial-reuse UNBIASEDNESS gate.** Our screen-space spatial reuse (`restir_gi_spatial_core`) is a hand-derived
 /// defensive/pairwise-MIS estimator (RTXDI Algo 7), NOT a literal port of Solari's single-neighbour
 /// `merge_reservoirs` — so its `mis_m_factor` confidence attenuation + the `1/n` debias are the one place a
 /// systematic bias could hide (flagged by the GI correctness audit). A CORRECT estimator changes only the

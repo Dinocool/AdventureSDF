@@ -1,9 +1,79 @@
 # Screen-Space Radiance Probes (Lumen-style GI) — Plan of Record
 
-Status: **PLANNING** (gi-boil branch, after checkpoint `edb0637`).
-Goal: replace the per-pixel ReSTIR diffuse-GI gather with a **downsampled screen-probe** gather so we get the
-boil-killing effect of high M (many *independent* samples) at a *fraction* of the ray cost — the one thing the
-whole boil investigation proved actually works (see `docs/GI_BOIL_PLAN.md` §7, 2026-06-18).
+Status: **REBUILD APPROVED** (2026-06-20) — the P0–P4 impl below (`## RESULTS`) shipped a SH-only shortcut that
+looks **flat** and leaks at silhouettes; user confirmed "the implementation was wrong." This top section is the
+corrected, SOTA-validated plan of record (the rest of the doc is retained for history). Goal unchanged: replace
+the per-pixel ReSTIR diffuse-GI bounce (62% of GI time, ~4 ms on Sponza — the dominant `restir_p1` cost) with a
+**downsampled screen-probe** gather: high-M-equivalent independent samples at a *fraction* of the ray cost.
+
+---
+
+## CORRECTED REBUILD — GI-1.0-aligned (supersedes the SH-only impl)
+
+**Our pipeline (HW-traced screen probes + a world-space radiance cache as level-2) IS AMD GI-1.0 /
+FidelityFX Brixelizer-GI** — that is the canonical reference to align to (not just Lumen). Refs: AMD GI-1.0 paper
+(GPUOpen 2022), FidelityFX Brixelizer-GI docs, UE5 Lumen ScreenProbeGather.
+
+### Diagnosis of the flat/leaky SH-only impl (what to fix)
+1. **SH-only radiance storage = flat.** `screen_probe_trace` projects each probe's bounce radiance straight into
+   **order-2 SH (9 coeffs)** and discards the directional samples; `screen_probe_integrate` bilinearly blends
+   those 9 coeffs over the 16 px grid + one SH·cosine dot. Order-2 SH ≈ one cosine lobe of angular bandwidth →
+   double low-pass (angular + 16 px spatial) → a smooth ambient field with no contact GI / directional bounce /
+   local gradient. **The boil-meter PASSED precisely because the double low-pass crushes all variance —
+   including the signal.** (`voxel_raytrace.wgsl` ~`screen_probe_trace`/`screen_probe_integrate`.)
+2. **SH is used for the wrong thing.** In Lumen/GI-1.0 the per-probe SH drives **ray-direction importance
+   sampling** (BRDF-PDF) + bent-normal/contact-shadow — the per-pixel *integrate* samples the **octahedral
+   radiance atlas**, not SH. Our impl inverted this (SH as the only radiance representation).
+3. **No edge/adaptive probes = leaks.** Uniform 16 px placement + a 5×5 "nearest valid probe" fallback that
+   grabs a *foreign* probe's SH at silhouettes → smears one wall's irradiance onto another. The plan said
+   "adaptive edge probes are NOT deferrable" — they were deferred.
+
+### Corrected architecture (the SSOT for the rebuild)
+- **Octahedral radiance atlas is the radiance SSOT.** Per probe: an **8×8 = 64-texel full-sphere octahedral
+  map in a FIXED SHARED world frame** (neighbour probes + temporal history share texel directions → texel-aligned
+  filter/reproject). Storage **buffer** `probe_octa: array<vec4<f32>>` (`pidx*64 + texel`, `.xyz`=RGB). ~1 KB/probe
+  → ~8 MB+history at 16 px/1080p (cheap). **Stop projecting to SH in the trace.** SH is OPTIONAL (atlas-only for
+  v1; add SH-for-importance-sampling later if probe-ray noise needs it).
+- **Trace** = one cache-read bounce per octa texel: one thread/probe traces its 64 octahedral directions, each
+  `reservoir_from_bounce_cached` → `query_world_cache` (level-2 far field + multi-bounce), writes the texel.
+- **Per-pixel integrate** (Lumen "downsampled indirect × full-res material"): bilateral 2×2 neighbour-probe gather
+  (same depth/normal reject), but integrate each neighbour's **octa atlas against THIS pixel's full-res normal**:
+  `E = Σ_neighbour bw · Σ_texel radiance[t]·max(dot(n,dir_t),0)·dΩ_t`, then `indirect = (E/π)·gi_intensity`,
+  `× full-res albedo` at shade. The full-res `n` selecting texels is the directional/spatial detail SH-cosine
+  loses. v1 = full 64-tap reference; optimize to bilinear-octa (≈4 taps) later, gated on not re-flattening.
+- **Edge fix (leak-free by construction):** DELETE the foreign-probe 5×5 fallback; when the bilateral 2×2 fully
+  rejects, fall back to **`query_world_cache(p, n, …)` directly** (already bound, anchored to `p`). Disoccluded/
+  silhouette pixels get the smoother world-cache irradiance — never black, never leak. Adaptive edge probes
+  (GI-1.0 structured probes appended to the atlas) are a later phase; the cache fallback ships P3 without them.
+- **Temporal/spatial (LIGHT — DLSS-RR does the heavy lift; double-temporal = ghosting):** light spatial = a 3×3
+  depth/normal-weighted blur **on the octa atlas texels** (texel-aligned via the fixed frame — replaces SH as the
+  variance reducer WITHOUT killing angular detail); temporal = the existing light, world-pos-validated, ~10-frame
+  atlas-texel blend. NO à-trous/SVGF on the final GI (turns RR-removable HF noise into RR-unremovable LF blotch).
+- **World-cache coupling (confirmed correct):** probe = level-1 (1 bounce), world cache = level-2. Today the cache
+  is fed by its own update loop + ReSTIR, NOT by probes → no probe→cache→probe circularity. If P4 retires
+  per-pixel ReSTIR, KEEP the cache update pass running. If we ever add probe→cache projection (GI-1.0, real
+  multi-bounce win), use the PREVIOUS frame's cache for probe rays to break the loop.
+
+### Phased rollout (each phase: anti-flat gate = region-luma CORRELATION vs the per-pixel ReSTIR reference, NOT
+just a variance bound — the SH version passed the variance meter BY going flat; + a live DLSS-RR eyeball)
+- **P0 — atlas scaffolding, no visual change.** Swap `probe_sh`/`_history` → `probe_octa`/`_history` (64 vec4),
+  grow alloc + group(4) layout + struct. Gate: builds both configs, zero warnings, probes-OFF byte-identical.
+- **P1 — octa trace.** Trace writes 64 per-texel radiances (drop SH projection); debug-view a probe's octa map.
+  Gate: atlas mean ≈ ReSTIR GI mean (energy ±15%); per-probe octa texel variance > 0 (not flat).
+- **P2 — octa per-pixel integrate.** 64-tap cosine integral vs full-res `n` (replace the SH dot). Gate (anti-flat):
+  `gi_probe_spatial_diag` region-luma grid CORRELATES with the ReSTIR reference (Pearson r > 0.9 — add this
+  assert); `blotch_CoV` ≤ M4 (0.036) at correct brightness. **Live RR check.**
+- **P3 — light temporal + 3×3 atlas blur + world-cache edge fallback** (delete foreign-probe fallback). Gate:
+  blotch keeps falling; silhouette region-luma no longer equals the adjacent wall (add a Sponza arch-edge check).
+  **Live: no double-temporal ghosting under motion.**
+- **P4 — adaptive edge probes + perf + retire per-pixel diffuse ReSTIR.** Adaptive probe-list pass; optional
+  SH-for-importance-sampling; optional world-pos reprojection (knob-gated). Gate: probe-trace ms ≤ M4 diffuse
+  cost; edge + flat region-luma match reference. **Live final.**
+
+**Boil-meter is BLIND to:** motion ghosting (RR temporal), human flat-vs-detailed judgment, sub-probe contact GI,
+small edge halos, the LF-blotch-from-prefilter failure — all gate on the user's live Sponza eyeball per phase.
+
+---
 
 ## Why this and not more per-pixel ReSTIR
 

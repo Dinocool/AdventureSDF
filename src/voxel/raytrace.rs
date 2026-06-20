@@ -1534,17 +1534,21 @@ struct VoxelRtPipelines {
     probe_trace: wgpu::ComputePipeline,
     #[cfg(feature = "dlss")]
     probe_trace_dlss: wgpu::ComputePipeline,
-    /// The `raymarch` compute pipeline (legacy `gather_gi` GI). Dispatched when `RestirSettings.restir` is
-    /// off — the `gi_mode` A/B toggle (legacy vs ReSTIR in one build).
-    raymarch: wgpu::ComputePipeline,
     /// Two-pass ReSTIR (non-DLSS). Pass 1 (`restir_p1`) = initial RIS + temporal → `reservoirs_b` + surface;
     /// pass 2 (`restir_p2`) = same-frame spatial from `reservoirs_b` → `reservoirs_a` + shade → out_tex. Both
     /// share `restir_pl`; dispatched back-to-back in one compute pass (the intra-pass storage barrier orders
     /// pass-1-writes-b before pass-2-reads-b). The live GI path.
     restir_p1: wgpu::ComputePipeline,
     restir_p2: wgpu::ComputePipeline,
-    /// Half-res GI spatial pass (non-DLSS): dispatched at half-res between p1 and the full-res shade.
+    /// GI spatial-reuse pass (non-DLSS, L3): dispatched between `restir_p1` and the shade `restir_p2` — reads
+    /// the per-pixel surface + merges spatial neighbours from `reservoirs_b` → the post-spatial `reservoirs_a`.
     restir_gi_spatial: wgpu::ComputePipeline,
+    /// DI pass 1 (non-DLSS, L1): the screen-space ReSTIR DI initial+temporal resampling, split out of the GI
+    /// `restir_p1` so the DI RIS candidate loop + visibility rays don't pin the GI kernel's occupancy.
+    di_p1: wgpu::ComputePipeline,
+    /// Debug-overlay pass (non-DLSS, L2): dispatched ONLY when `debug_view != 0`, AFTER `restir_p2` — keeps the
+    /// debug branches out of the shipping shade kernel.
+    restir_debug: wgpu::ComputePipeline,
     /// `group(3)` (Phase 2.1 world-cache): the cache uniform (`wc`) + the 11 persistent cache storage buffers.
     /// A DEDICATED bind group (not group 2) so `restir_p1` is never forced to bind all of them — in 2.2 the
     /// reservoir path will add this group ALONGSIDE group 2, not merge into it.
@@ -1581,9 +1585,6 @@ struct VoxelRtPipelines {
     /// DLSS-RR (Stage 4c): the `group(1)` DLSS view layout, and the resolve render pass's bind-group layout
     /// (samples the colour/depth/motion storage textures → view target + prepass depth/motion). The resolve
     /// render pipeline itself is built lazily (format-keyed) in the pass.
-    /// Legacy DLSS guide-writing pass (`gather_gi` GI). Dispatched when `RestirSettings.restir` is off (A/B).
-    #[cfg(feature = "dlss")]
-    raymarch_dlss: wgpu::ComputePipeline,
     /// Two-pass ReSTIR (DLSS). `restir_dlss_p1` = initial RIS + reprojected temporal → `reservoirs_b` +
     /// surface (no guides); `restir_dlss_p2` = same-frame spatial → `reservoirs_a` + shade → out_tex + the 5
     /// DLSS-RR guides. Both share the DLSS restir pipeline layout; dispatched back-to-back in one pass.
@@ -1593,6 +1594,11 @@ struct VoxelRtPipelines {
     restir_dlss_p2: wgpu::ComputePipeline,
     #[cfg(feature = "dlss")]
     restir_gi_spatial_dlss: wgpu::ComputePipeline,
+    /// DI pass 1 (DLSS, L1) + the DLSS debug-overlay pass (L2) — see the non-DLSS `di_p1`/`restir_debug`.
+    #[cfg(feature = "dlss")]
+    di_dlss_p1: wgpu::ComputePipeline,
+    #[cfg(feature = "dlss")]
+    restir_dlss_debug: wgpu::ComputePipeline,
     #[cfg(feature = "dlss")]
     dlss_view_layout: wgpu::BindGroupLayout,
     #[cfg(feature = "dlss")]
@@ -1693,7 +1699,10 @@ struct VoxelRtResources {
     /// Screen-probe GI: (headers, SH current, SH history) storage buffers + the probe grid dims they're sized
     /// for. Reallocated when the grid changes; history reset on realloc. Shared by both render paths (only one
     /// runs per frame). `group(4)`. See `docs/SCREEN_PROBE_PLAN.md`.
-    screen_probes: Option<(wgpu::Buffer, wgpu::Buffer, wgpu::Buffer, UVec2)>,
+    /// `(headers, radiance_atlas, radiance_atlas_history, grid, oct_res)` — the screen-probe buffers. Re-keyed
+    /// on BOTH the grid AND `oct_res` (the atlas is `oct_res²` directional bins per probe, so a probe-density
+    /// change resizes it).
+    screen_probes: Option<(wgpu::Buffer, wgpu::Buffer, wgpu::Buffer, UVec2, u32)>,
     /// The composite render pipeline, keyed by the view-target format it was built for.
     composite: Option<(wgpu::TextureFormat, wgpu::RenderPipeline)>,
     /// Monotonic per-frame counter written into the lighting uniform's `frame_index` so the GI bounce
@@ -1714,13 +1723,13 @@ struct VoxelRtResources {
     /// jittered, so the current frame's `clip_from_world` IS its un-jittered clip. `None` on the first frame
     /// (then `prev == cur`, so the reprojection returns the current pixel).
     prev_clip_from_world: Option<[[f32; 4]; 4]>,
-    /// `(viewport, scene_epoch, gi_half)` at the last non-DLSS frame — drives the ReSTIR `reset` flag. Reset
-    /// fires on the first frame, a viewport (resolution) change, a SCENE SWITCH (epoch change — clears the
-    /// previous scene's stale reservoir history, which `surfaces_dissimilar` alone can let bleed through when the
-    /// new scene has similar-depth surfaces), or a half-res toggle (the reservoir buffer indexing changes).
-    /// Camera motion is handled by motion-vector reprojection and an EDIT adapts locally (epoch is unchanged on
-    /// an edit — only `generation` is — so edits still never full-clear). `None` until the first frame.
-    restir_prev: Option<(UVec2, Option<u64>, bool)>,
+    /// `(viewport, scene_epoch)` at the last non-DLSS frame — drives the ReSTIR `reset` flag. Reset fires on the
+    /// first frame, a viewport (resolution) change, or a SCENE SWITCH (epoch change — clears the previous scene's
+    /// stale reservoir history, which `surfaces_dissimilar` alone can let bleed through when the new scene has
+    /// similar-depth surfaces). Camera motion is handled by motion-vector reprojection and an EDIT adapts locally
+    /// (epoch is unchanged on an edit — only `generation` is — so edits still never full-clear). `None` until the
+    /// first frame.
+    restir_prev: Option<(UVec2, Option<u64>)>,
     /// Previous-frame camera world position — drives the TELEPORT reservoir reset. A camera CUT/teleport (frame-
     /// selected, scene-load reposition, a jump > [`TELEPORT_RESET_DIST`]) leaves the reservoirs reprojecting via
     /// stale motion onto unrelated surfaces that `surfaces_dissimilar` can't all reject → a multi-frame smear
@@ -1782,10 +1791,10 @@ struct VoxelRtResources {
     /// DLSS-path per-pixel surface buffers (cur/prev), sized to the full render res (like dlss_reservoirs).
     #[cfg(feature = "dlss")]
     dlss_surfaces: Option<(wgpu::Buffer, wgpu::Buffer, UVec2)>,
-    /// (render_res, scene_epoch, gi_half) at the last DLSS frame — drives the ReSTIR `reset`: first frame /
-    /// resolution change / SCENE SWITCH (epoch) / half-res toggle. An edit adapts locally (epoch unchanged).
+    /// (render_res, scene_epoch) at the last DLSS frame — drives the ReSTIR `reset`: first frame / resolution
+    /// change / SCENE SWITCH (epoch) / teleport. An edit adapts locally (epoch unchanged).
     #[cfg(feature = "dlss")]
-    dlss_restir_prev: Option<(UVec2, Option<u64>, bool)>,
+    dlss_restir_prev: Option<(UVec2, Option<u64>)>,
 }
 
 /// The persistent GPU scene objects the bind group / TLAS reference, retained so they outlive the bind group
@@ -2593,19 +2602,6 @@ fn init_voxel_rt(mut commands: Commands, render_device: Res<RenderDevice>) {
         label: Some("voxel_raytrace"),
         source: wgpu::ShaderSource::Wgsl(raymarch_src.into()),
     });
-    let raymarch_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-        label: Some("voxel_rt_raymarch_pl"),
-        bind_group_layouts: &[Some(&scene_layout), Some(&view_layout)],
-        immediate_size: 0,
-    });
-    let raymarch = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-        label: Some("voxel_rt_raymarch"),
-        layout: Some(&raymarch_pl),
-        module: &raymarch_module,
-        entry_point: Some("raymarch"),
-        compilation_options: Default::default(),
-        cache: None,
-    });
 
     // ReSTIR group(2): reservoir storage buffers (cur/prev) + restir params uniform + per-pixel receiver
     // surface buffers (cur/prev) for neighbour-reuse Jacobian + dissimilarity rejection.
@@ -2707,12 +2703,30 @@ fn init_voxel_rt(mut commands: Commands, render_device: Res<RenderDevice>) {
         compilation_options: Default::default(),
         cache: None,
     });
-    // Half-res GI spatial pass (non-DLSS): dispatched at half-res between p1 and the full-res shade.
+    // GI spatial-reuse pass (non-DLSS, L3): dispatched between p1 and the shade p2.
     let restir_gi_spatial = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
         label: Some("voxel_rt_restir_gi_spatial"),
         layout: Some(&restir_pl),
         module: &raymarch_module,
         entry_point: Some("restir_gi_spatial"),
+        compilation_options: Default::default(),
+        cache: None,
+    });
+    // DI pass 1 (non-DLSS, L1): split out of restir_p1.
+    let di_p1 = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+        label: Some("voxel_rt_di_p1"),
+        layout: Some(&restir_pl),
+        module: &raymarch_module,
+        entry_point: Some("di_p1"),
+        compilation_options: Default::default(),
+        cache: None,
+    });
+    // Debug-overlay pass (non-DLSS, L2): dispatched only when debug_view != 0.
+    let restir_debug = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+        label: Some("voxel_rt_restir_debug"),
+        layout: Some(&restir_pl),
+        module: &raymarch_module,
+        entry_point: Some("restir_debug"),
         compilation_options: Default::default(),
         cache: None,
     });
@@ -2898,11 +2912,12 @@ fn init_voxel_rt(mut commands: Commands, render_device: Res<RenderDevice>) {
     // --- DLSS-RR (Stage 4c) pipelines + layouts ---
     #[cfg(feature = "dlss")]
     let (
-        raymarch_dlss,
         restir_dlss_p1,
         restir_dlss_p2,
         probe_trace_dlss,
         restir_gi_spatial_dlss,
+        di_dlss_p1,
+        restir_dlss_debug,
         dlss_view_layout,
         dlss_resolve_layout,
     ) = init_dlss_pipelines(
@@ -2942,10 +2957,11 @@ fn init_voxel_rt(mut commands: Commands, render_device: Res<RenderDevice>) {
         probe_trace,
         #[cfg(feature = "dlss")]
         probe_trace_dlss,
-        raymarch,
         restir_p1,
         restir_p2,
         restir_gi_spatial,
+        di_p1,
+        restir_debug,
         world_cache_layout,
         world_cache_view_layout,
         world_cache_dispatch_layout,
@@ -2963,13 +2979,15 @@ fn init_voxel_rt(mut commands: Commands, render_device: Res<RenderDevice>) {
         composite_layout,
         composite_sampler,
         #[cfg(feature = "dlss")]
-        raymarch_dlss,
-        #[cfg(feature = "dlss")]
         restir_dlss_p1,
         #[cfg(feature = "dlss")]
         restir_dlss_p2,
         #[cfg(feature = "dlss")]
         restir_gi_spatial_dlss,
+        #[cfg(feature = "dlss")]
+        di_dlss_p1,
+        #[cfg(feature = "dlss")]
+        restir_dlss_debug,
         #[cfg(feature = "dlss")]
         dlss_view_layout,
         #[cfg(feature = "dlss")]
@@ -2993,6 +3011,7 @@ fn init_dlss_pipelines(
     raymarch_module: &wgpu::ShaderModule,
     composite_module: &wgpu::ShaderModule,
 ) -> (
+    wgpu::ComputePipeline,
     wgpu::ComputePipeline,
     wgpu::ComputePipeline,
     wgpu::ComputePipeline,
@@ -3035,19 +3054,6 @@ fn init_dlss_pipelines(
             uniform(10),                                                // dlss_cam (prev/cur view-proj)
             uniform(11),                                                // sky (procedural-sky uniform, one SSOT)
         ],
-    });
-    let dlss_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-        label: Some("voxel_rt_raymarch_dlss_pl"),
-        bind_group_layouts: &[Some(scene_layout), Some(&dlss_view_layout)],
-        immediate_size: 0,
-    });
-    let raymarch_dlss = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-        label: Some("voxel_rt_raymarch_dlss"),
-        layout: Some(&dlss_pl),
-        module: raymarch_module,
-        entry_point: Some("raymarch_dlss"),
-        compilation_options: Default::default(),
-        cache: None,
     });
     // The two-pass ReSTIR variant: same DLSS guide layout + the group(2) reservoir buffers + group(3) world
     // cache, two entries. group(3) lets `restir_dlss_p1`'s initial reservoir `query_world_cache` (lazy-insert
@@ -3095,6 +3101,22 @@ fn init_dlss_pipelines(
         compilation_options: Default::default(),
         cache: None,
     });
+    let di_dlss_p1 = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+        label: Some("voxel_rt_di_dlss_p1"),
+        layout: Some(&dlss_restir_pl),
+        module: raymarch_module,
+        entry_point: Some("di_dlss_p1"),
+        compilation_options: Default::default(),
+        cache: None,
+    });
+    let restir_dlss_debug = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+        label: Some("voxel_rt_restir_dlss_debug"),
+        layout: Some(&dlss_restir_pl),
+        module: raymarch_module,
+        entry_point: Some("restir_dlss_debug"),
+        compilation_options: Default::default(),
+        cache: None,
+    });
 
     let sampled = |binding: u32| wgpu::BindGroupLayoutEntry {
         binding,
@@ -3122,11 +3144,12 @@ fn init_dlss_pipelines(
     });
     let _ = composite_module; // resolve render pipeline is built lazily (format-keyed) in the pass
     (
-        raymarch_dlss,
         restir_dlss_p1,
         restir_dlss_p2,
         probe_trace_dlss,
         restir_gi_spatial_dlss,
+        di_dlss_p1,
+        restir_dlss_debug,
         dlss_view_layout,
         dlss_resolve_layout,
     )
@@ -3216,9 +3239,11 @@ struct RestirParamsData {
     di_confidence_cap: f32,
     di_initial_samples: u32,
     _pad_gi: u32, // was gi_initial_samples (M); restir_p1 is now straight-line M=1 — kept as layout padding
-    gi_half: u32,
-    gi_half_x: u32,
-    gi_half_y: u32,
+    // Reserved padding (was the half-resolution GI knobs gi_half/gi_half_x/gi_half_y — half-res removed; GI
+    // always runs at full render resolution). Kept as padding so `gi_dissim_cap_dist` stays at offset 56.
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
     gi_dissim_cap_dist: f32,
     _pad3: u32,
 }
@@ -3245,8 +3270,6 @@ struct ScreenProbeParamsData {
 /// Render/GI panel writes it. ReSTIR GI is the live path unconditionally. Extracted to the render world.
 #[derive(Resource, Clone, Copy, ExtractResource)]
 pub struct RestirSettings {
-    /// `true` = ReSTIR GI (default), `false` = legacy `gather_gi` (for A/B comparison).
-    pub restir: bool,
     /// Spatial reuse SEARCH budget: disk taps tried per pixel to find ONE valid neighbour to merge (0 =
     /// temporal-only). NOT an accumulation count — one neighbour is merged per frame (variance-stable).
     pub spatial_samples: u32,
@@ -3268,10 +3291,6 @@ pub struct RestirSettings {
     pub probe_oct_res: u32,
     /// Blend prev-frame probe SH (light temporal accumulation; P3).
     pub probe_temporal: bool,
-    /// Half-resolution GI: trace + run ReSTIR GI at render_res/2 (¼ the bounce traces), then bilaterally upscale
-    /// the half-res reservoirs to full res at shade time (re-resolved per full-res normal → stays sharp). The
-    /// way to afford high M cheaply. See `docs/HALF_RES_GI_PLAN.md`.
-    pub gi_half_res: bool,
     /// View-distance cap (metres) for the `surfaces_dissimilar` tangent-plane reject (0 = uncapped / pure Solari).
     /// Beyond this the relative threshold becomes an ABSOLUTE tangent cap (≈0.003·cap), rejecting far thin-wall
     /// spatial-reuse leaks. Conservative default; an editor slider — raise toward off if it adds boil on slopes.
@@ -3300,7 +3319,6 @@ impl Default for RestirSettings {
         //   * confidence_cap 16: higher cap helps Sponza (more accumulation outweighs correlation at high variance);
         //     blotch min at ~16 (cap5 0.063 → cap16 0.054 → cap48 0.063 again).
         Self {
-            restir: true,
             spatial_samples: 4,
             spatial_radius: 12.0,
             confidence_cap: 16.0,
@@ -3313,7 +3331,6 @@ impl Default for RestirSettings {
             probe_size: 16,
             probe_oct_res: 8,
             probe_temporal: true,
-            gi_half_res: false,
             // Cap at 25 m ⇒ absolute tangent reject ≈0.075 m beyond 25 m (catches far thin-wall GI leaks with
             // low slope-over-reject risk). 0 = pure Solari. Tunable via the editor slider.
             gi_dissim_cap_dist: 25.0,
@@ -5078,9 +5095,12 @@ fn prepare_screen_probes(
     } else {
         UVec2::ONE
     };
-    let need = resources.screen_probes.as_ref().map(|(.., g)| *g) != Some(grid);
+    // The radiance atlas is `oct_res²` directional bins per probe → re-key on (grid, oct_res).
+    let oct_res = settings.probe_oct_res.max(1);
+    let need = resources.screen_probes.as_ref().map(|(.., g, o)| (*g, *o)) != Some((grid, oct_res));
     if need {
         let n = (grid.x as u64) * (grid.y as u64);
+        let bins = (oct_res as u64) * (oct_res as u64); // directional radiance bins per probe
         let mk = |label: &'static str, bytes: u64| {
             device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some(label),
@@ -5090,11 +5110,11 @@ fn prepare_screen_probes(
             })
         };
         let headers = mk("voxel_rt_probe_headers", n * 32); // ScreenProbeHeader = 2×vec4
-        let sh = mk("voxel_rt_probe_sh", n * 9 * 16); // 9 order-2 coeffs × vec4
-        let sh_hist = mk("voxel_rt_probe_sh_history", n * 9 * 16);
-        resources.screen_probes = Some((headers, sh, sh_hist, grid));
+        let radiance = mk("voxel_rt_probe_radiance", n * bins * 16); // oct_res² × vec4 atlas
+        let radiance_hist = mk("voxel_rt_probe_radiance_history", n * bins * 16);
+        resources.screen_probes = Some((headers, radiance, radiance_hist, grid, oct_res));
     }
-    let (headers, sh, sh_hist, _) = resources.screen_probes.as_ref().unwrap();
+    let (headers, radiance, radiance_hist, ..) = resources.screen_probes.as_ref().unwrap();
     let params = ScreenProbeParamsData {
         grid_x: grid.x,
         grid_y: grid.y,
@@ -5120,8 +5140,8 @@ fn prepare_screen_probes(
         entries: &[
             wgpu::BindGroupEntry { binding: 0, resource: params_buf.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 1, resource: headers.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 2, resource: sh.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 3, resource: sh_hist.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 2, resource: radiance.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 3, resource: radiance_hist.as_entire_binding() },
         ],
     });
     (bg, settings.screen_probes.then_some(grid))
@@ -5417,20 +5437,14 @@ fn voxel_rt_pass(
     // samples, dissimilarity rejects moved surfaces) — never a full clear. This mirrors the DLSS path's
     // `reset_restir` keying. (The on-top history TEXTURE accumulator above still resets on a move/`geometry_changed`
     // — that just shows the fresh frame, it is NOT a reservoir clear.)
-    let gi_half = restir_settings.gi_half_res;
     let cur_epoch = resources.built_epoch;
     let teleported = resources.prev_cam_pos.is_some_and(|pp| pp.distance(cam_pos) > TELEPORT_RESET_DIST);
     resources.prev_cam_pos = Some(cam_pos);
     let reset_restir = match resources.restir_prev {
         None => true,
-        Some((vp, ep, gh)) => vp != viewport || ep != cur_epoch || gh != gi_half || teleported,
+        Some((vp, ep)) => vp != viewport || ep != cur_epoch || teleported,
     };
-    resources.restir_prev = Some((viewport, cur_epoch, gi_half));
-    let gi_half_dims = if gi_half {
-        UVec2::new(viewport.x.div_ceil(2), viewport.y.div_ceil(2))
-    } else {
-        viewport
-    };
+    resources.restir_prev = Some((viewport, cur_epoch));
     let restir_params = RestirParamsData {
         reset: u32::from(reset_restir),
         frame_index,
@@ -5443,9 +5457,9 @@ fn voxel_rt_pass(
         di_confidence_cap: restir_settings.di_confidence_cap,
         di_initial_samples: restir_settings.di_initial_samples,
         _pad_gi: 0,
-        gi_half: u32::from(gi_half),
-        gi_half_x: gi_half_dims.x,
-        gi_half_y: gi_half_dims.y,
+        _pad0: 0,
+        _pad1: 0,
+        _pad2: 0,
         gi_dissim_cap_dist: restir_settings.gi_dissim_cap_dist,
         _pad3: 0,
     };
@@ -5531,8 +5545,6 @@ fn voxel_rt_pass(
     };
 
     let scene_bg = resources.scene_bind_group.as_ref().expect("checked above");
-    // `gi_mode` A/B: ReSTIR GI (group-2 reservoirs, two passes) vs the legacy `gather_gi` raymarch (no group 2).
-    let use_restir = restir_settings.restir;
     let composite = &resources.composite.as_ref().expect("just built").1;
     let main_view = target.main_texture_view();
     // Texture handles for the post-pass output→history copy (the accumulator feedback).
@@ -5563,18 +5575,13 @@ fn voxel_rt_pass(
         cpass.pop_debug_group();
         cpass.set_bind_group(1, &view_bg, &[]);
         let groups = (viewport.x.div_ceil(8), viewport.y.div_ceil(8), 1);
-        // GI dispatch grid — half-res when gi_half_res (the GI passes p1 + gi_spatial run here; the shade p2 is
-        // always full-res `groups`).
-        let gi_dim = if restir_settings.gi_half_res {
-            UVec2::new(viewport.x.div_ceil(2), viewport.y.div_ceil(2))
-        } else {
-            viewport
-        };
-        let gi_groups = (gi_dim.x.div_ceil(8), gi_dim.y.div_ceil(8), 1);
-        if use_restir {
-            // Two-pass ReSTIR: pass 1 (initial + temporal → reservoirs_b) then pass 2 (same-frame spatial →
-            // reservoirs_a + shade → out_tex), back-to-back. The intra-pass storage barrier orders p1's writes
-            // to reservoirs_b before p2 reads them (WebGPU guarantees inter-dispatch storage visibility).
+        // ReSTIR is the only GI path (the legacy raymarch/gather_gi RUNTIME path was removed; gather_gi survives
+        // as the test-only estimator oracle in `voxel_restir_gi_gpu`). GI always runs at full render resolution.
+        {
+            // Split-kernel ReSTIR (one compute pass, back-to-back dispatches ordered by the intra-pass storage
+            // barrier — WebGPU guarantees inter-dispatch storage visibility): GI pass 1 (initial + temporal →
+            // reservoirs_b + surface) → DI pass 1 (own kernel, L1) → GI spatial (reservoirs_b → reservoirs_a, L3)
+            // → shade (resolve reservoirs_a + DI + composite). The debug overlay is a separate trailing dispatch.
             cpass.set_bind_group(2, &reservoir_bg, &[]);
             // group(3) = the world cache (Phase 2.2): `restir_p1`'s initial reservoir queries it (lazy-insert →
             // the query is what POPULATES the cache). Re-set explicitly even though the cache passes left it
@@ -5591,21 +5598,25 @@ fn voxel_rt_pass(
             if let Some(t) = gpu_timer.as_ref() {
                 t.begin(&mut cpass, 4);
             }
-            // Pass 1 (GI candidate + temporal) at the GI res (half when gi_half_res).
+            // Pass 1 (GI candidate + temporal) + surface write.
             cpass.push_debug_group("gi_restir_p1");
             cpass.set_pipeline(&pipelines.restir_p1);
-            cpass.dispatch_workgroups(gi_groups.0, gi_groups.1, gi_groups.2);
+            cpass.dispatch_workgroups(groups.0, groups.1, groups.2);
             cpass.pop_debug_group();
-            // GI spatial pass → POST-SPATIAL final reservoirs (reservoirs_a): half-res (at half-res) AND the
-            // full-res spatial-average filter (the shade averages these post-spatial finals to kill the boil).
-            if restir_settings.gi_half_res {
-                cpass.set_pipeline(&pipelines.restir_gi_spatial);
-                cpass.dispatch_workgroups(gi_groups.0, gi_groups.1, gi_groups.2);
-            }
+            // DI pass 1 (initial + temporal RIS) — its own kernel (L1), reads the surface written above.
+            cpass.push_debug_group("gi_di_p1");
+            cpass.set_pipeline(&pipelines.di_p1);
+            cpass.dispatch_workgroups(groups.0, groups.1, groups.2);
+            cpass.pop_debug_group();
+            // GI spatial reuse → POST-SPATIAL final reservoirs (reservoirs_a), always (L3).
+            cpass.push_debug_group("gi_restir_spatial");
+            cpass.set_pipeline(&pipelines.restir_gi_spatial);
+            cpass.dispatch_workgroups(groups.0, groups.1, groups.2);
+            cpass.pop_debug_group();
             #[cfg(feature = "editor")]
             if let Some(t) = gpu_timer.as_ref() {
-                t.end(&mut cpass, 4); // restir p1
-                t.begin(&mut cpass, 5); // restir p2
+                t.end(&mut cpass, 4); // restir p1 + di p1 + spatial
+                t.begin(&mut cpass, 5); // restir p2 (shade)
             }
             cpass.push_debug_group("gi_restir_p2");
             cpass.set_pipeline(&pipelines.restir_p2);
@@ -5615,9 +5626,14 @@ fn voxel_rt_pass(
             if let Some(t) = gpu_timer.as_ref() {
                 t.end(&mut cpass, 5); // restir p2
             }
-        } else {
-            cpass.set_pipeline(&pipelines.raymarch);
-            cpass.dispatch_workgroups(groups.0, groups.1, groups.2);
+            // Debug overlay (L2): a trailing dispatch that overwrites out_tex — ONLY when a debug view is active,
+            // so the shipping shade kernel above carries no debug branching.
+            if lighting.data.debug_view != 0 {
+                cpass.push_debug_group("gi_restir_debug");
+                cpass.set_pipeline(&pipelines.restir_debug);
+                cpass.dispatch_workgroups(groups.0, groups.1, groups.2);
+                cpass.pop_debug_group();
+            }
         }
     }
     // Phase 2.4: resolve this frame's world-cache/ReSTIR timestamps into the read-back buffer (mapped + read
@@ -5974,16 +5990,15 @@ fn voxel_rt_dlss_pass(
     // trace drops now-occluded samples, dissimilarity rejects moved surfaces), so editing terrain makes the
     // GI smoothly follow the change over a few frames instead of full-screen clearing.
     // Reset on first frame / resolution change / SCENE SWITCH (epoch — clears the previous scene's stale
-    // reservoir history) / half-res toggle. An EDIT bumps `generation` not `epoch`, so edits still adapt locally.
+    // reservoir history) / teleport. An EDIT bumps `generation` not `epoch`, so edits still adapt locally.
     let cur_epoch = resources.built_epoch;
-    let dlss_gi_half = restir_settings.gi_half_res;
     let teleported = resources.prev_cam_pos.is_some_and(|pp| pp.distance(cam_pos) > TELEPORT_RESET_DIST);
     resources.prev_cam_pos = Some(cam_pos);
     let reset_restir = match resources.dlss_restir_prev {
         None => true,
-        Some((r, ep, gh)) => r != render_res || ep != cur_epoch || gh != dlss_gi_half || teleported,
+        Some((r, ep)) => r != render_res || ep != cur_epoch || teleported,
     };
-    resources.dlss_restir_prev = Some((render_res, cur_epoch, dlss_gi_half));
+    resources.dlss_restir_prev = Some((render_res, cur_epoch));
 
     let color_view = &resources.dlss_color.as_ref().expect("just allocated").1;
     let depth_view = &resources.dlss_depth.as_ref().expect("just allocated").1;
@@ -6020,12 +6035,6 @@ fn voxel_rt_dlss_pass(
     // Scale the spatial-reuse radius by the upscale factor so it covers a constant WORLD/output area at
     // upscaling DLSS modes (the knob is in output pixels; the dispatch is at render_res). At DLAA this is 1.0.
     let upscale = full.x as f32 / render_res.x.max(1) as f32;
-    let dlss_gi_half = restir_settings.gi_half_res;
-    let dlss_gi_dim = if dlss_gi_half {
-        UVec2::new(render_res.x.div_ceil(2), render_res.y.div_ceil(2))
-    } else {
-        render_res
-    };
     let restir_params = RestirParamsData {
         reset: u32::from(reset_restir),
         frame_index,
@@ -6038,10 +6047,9 @@ fn voxel_rt_dlss_pass(
         di_confidence_cap: restir_settings.di_confidence_cap,
         di_initial_samples: restir_settings.di_initial_samples,
         _pad_gi: 0,
-        // Half-res GI at render_res/2 (the GI passes index reservoirs here; the full-res shade gathers them).
-        gi_half: u32::from(dlss_gi_half),
-        gi_half_x: dlss_gi_dim.x,
-        gi_half_y: dlss_gi_dim.y,
+        _pad0: 0,
+        _pad1: 0,
+        _pad2: 0,
         gi_dissim_cap_dist: restir_settings.gi_dissim_cap_dist,
         _pad3: 0,
     };
@@ -6125,8 +6133,6 @@ fn voxel_rt_dlss_pass(
     );
 
     let scene_bg = resources.scene_bind_group.as_ref().expect("checked above");
-    // `gi_mode` A/B: two-pass ReSTIR GI (group-2 reservoirs) vs the legacy `gather_gi` DLSS raymarch (no group 2).
-    let use_restir = restir_settings.restir;
     let resolve = &resources.dlss_resolve.as_ref().expect("just built").1;
     let main_view = target.main_texture_view();
     let depth_target = &depth_attach.texture.default_view;
@@ -6151,17 +6157,12 @@ fn voxel_rt_dlss_pass(
         );
         cpass.set_bind_group(1, &view_bg, &[]);
         let groups = (render_res.x.div_ceil(8), render_res.y.div_ceil(8), 1);
-        // GI dispatch grid — half-res when gi_half_res (p1 + gi_spatial run here; the shade p2 stays full-res).
-        let gi_dim = if restir_settings.gi_half_res {
-            UVec2::new(render_res.x.div_ceil(2), render_res.y.div_ceil(2))
-        } else {
-            render_res
-        };
-        let gi_groups = (gi_dim.x.div_ceil(8), gi_dim.y.div_ceil(8), 1);
-        if use_restir {
-            // Two-pass ReSTIR: pass 1 (initial + reprojected temporal → reservoirs_b + surface) then pass 2
-            // (same-frame spatial → reservoirs_a + shade → out_tex + DLSS guides), back-to-back. The intra-pass
-            // storage barrier orders p1's reservoirs_b writes before p2 reads them.
+        // ReSTIR is the only GI path (legacy raymarch removed; gather_gi kept as the test oracle). GI runs at the
+        // full render resolution.
+        {
+            // Split-kernel ReSTIR (one compute pass, barrier-ordered dispatches): GI pass 1 (initial + reprojected
+            // temporal → reservoirs_b + surface) → DI pass 1 (own kernel, L1) → GI spatial (→ reservoirs_a, L3) →
+            // shade (resolve reservoirs_a + DI → out_tex + DLSS guides). Debug overlay is a trailing dispatch.
             cpass.set_bind_group(2, &reservoir_bg, &[]);
             // group(3) = the world cache (Phase 2.2): `restir_dlss_p1`'s initial reservoir queries it
             // (lazy-insert → populates the cache). Re-set explicitly (rebinding group 2 can drop higher groups).
@@ -6176,16 +6177,15 @@ fn voxel_rt_dlss_pass(
                 t.begin(&mut cpass, 4);
             }
             cpass.set_pipeline(&pipelines.restir_dlss_p1);
-            cpass.dispatch_workgroups(gi_groups.0, gi_groups.1, gi_groups.2);
-            // GI spatial pass → post-spatial final reservoirs: half-res AND the full-res spatial-average filter.
-            if restir_settings.gi_half_res {
-                cpass.set_pipeline(&pipelines.restir_gi_spatial_dlss);
-                cpass.dispatch_workgroups(gi_groups.0, gi_groups.1, gi_groups.2);
-            }
+            cpass.dispatch_workgroups(groups.0, groups.1, groups.2);
+            cpass.set_pipeline(&pipelines.di_dlss_p1); // DI pass 1 (L1)
+            cpass.dispatch_workgroups(groups.0, groups.1, groups.2);
+            cpass.set_pipeline(&pipelines.restir_gi_spatial_dlss); // GI spatial (L3), always
+            cpass.dispatch_workgroups(groups.0, groups.1, groups.2);
             #[cfg(feature = "editor")]
             if let Some(t) = gpu_timer.as_ref() {
-                t.end(&mut cpass, 4); // restir p1
-                t.begin(&mut cpass, 5); // restir p2
+                t.end(&mut cpass, 4); // restir p1 + di p1 + spatial
+                t.begin(&mut cpass, 5); // restir p2 (shade + guides)
             }
             cpass.set_pipeline(&pipelines.restir_dlss_p2);
             cpass.dispatch_workgroups(groups.0, groups.1, groups.2);
@@ -6193,9 +6193,11 @@ fn voxel_rt_dlss_pass(
             if let Some(t) = gpu_timer.as_ref() {
                 t.end(&mut cpass, 5); // restir p2
             }
-        } else {
-            cpass.set_pipeline(&pipelines.raymarch_dlss);
-            cpass.dispatch_workgroups(groups.0, groups.1, groups.2);
+            // Debug overlay (L2): trailing dispatch, overwrites out_tex + albedo, only when a debug view is active.
+            if lighting.data.debug_view != 0 {
+                cpass.set_pipeline(&pipelines.restir_dlss_debug);
+                cpass.dispatch_workgroups(groups.0, groups.1, groups.2);
+            }
         }
     }
     // Phase 2.4: resolve this frame's timestamps (mapped + read next frame). Additive — no GI-math change.

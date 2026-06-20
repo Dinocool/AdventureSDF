@@ -40,7 +40,7 @@ const TEST_WORLD_CACHE_SIZE: u32 = 1 << 12;
 const RESERVOIR_SIZE: u64 = 48;
 const SURFACE_SIZE: u64 = 32;
 
-/// Mirror of the WGSL `RestirParams` (group 2, binding 2): reset + frame + viewport + the ReSTIR knobs. 32 bytes.
+/// Mirror of the WGSL `RestirParams` (group 2, binding 2): reset + frame + viewport + the ReSTIR knobs. 64 bytes.
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct RestirParams {
@@ -51,7 +51,15 @@ struct RestirParams {
     spatial_samples: u32,
     confidence_weight_cap: f32,
     spatial_radius: f32,
-    _pad: u32,
+    di_enabled: u32,
+    di_confidence_cap: f32,
+    di_initial_samples: u32,
+    _pad_gi: u32,
+    _pad0: u32, // (was gi_half/gi_half_x/gi_half_y — half-res removed)
+    _pad1: u32,
+    _pad2: u32,
+    gi_dissim_cap_dist: f32,
+    _pad3: u32,
 }
 
 /// Mirror of the WGSL `WorldCacheUniform` (group 3, binding 0): 64 bytes. `use_world_cache = 0` here — the
@@ -154,7 +162,7 @@ fn dlss_guides_populated_where_voxels_hit() {
     // `restir_dlss_p2` writes 6 storage textures in one stage (wgpu's default limit is 4) AND the ReSTIR
     // pipeline layout binds 21 storage buffers (5 scene + 4 reservoir/surface + 12 group(3) cache); the
     // renderer's `wgpu_settings()` raises both the same way (it lifts storage buffers to 48 under the RT path).
-    let Some((device, queue)) = common::headless_ray_query_device_with_storage(6, 24) else {
+    let Some((device, queue)) = common::headless_ray_query_device_with_storage(6, 32) else {
         eprintln!("no ray-query / 6-storage-texture+24-buffer device — skipping dlss_guides_populated_where_voxels_hit");
         return;
     };
@@ -378,10 +386,37 @@ fn dlss_guides_populated_where_voxels_hit() {
             uniform(11),                                         // sky
         ],
     });
-    // group(2): the ReSTIR reservoir buffers + params + surfaces (mirror of the engine's `reservoir_layout`).
+    // group(2): the ReSTIR reservoir buffers + params + surfaces + DI reservoirs (5/6) + STBN texture (7),
+    // an exact mirror of the engine's `reservoir_layout` (`voxel_rt_reservoir_layout`).
+    let stbn_tex_entry = wgpu::BindGroupLayoutEntry {
+        binding: 7,
+        visibility: wgpu::ShaderStages::COMPUTE,
+        ty: wgpu::BindingType::Texture {
+            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+            view_dimension: wgpu::TextureViewDimension::D2Array,
+            multisampled: false,
+        },
+        count: None,
+    };
     let reservoir_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
         label: Some("reservoir_layout"),
-        entries: &[storage(0, false), storage(1, false), uniform(2), storage(3, false), storage(4, false)],
+        entries: &[
+            storage(0, false),
+            storage(1, false),
+            uniform(2),
+            storage(3, false),
+            storage(4, false),
+            storage(5, false), // DI reservoirs a (GI 4.0)
+            storage(6, false), // DI reservoirs b
+            stbn_tex_entry,    // 7 = spatiotemporal blue noise texture array
+        ],
+    });
+    // group(4): the screen-probe layout (`voxel_rt_probe_layout`). `restir_dlss_p2` statically reaches
+    // `screen_probe_integrate`, so the pipeline layout must declare it even though the probes are disabled
+    // (`probe_params.enabled = 0`) and never executed here.
+    let probe_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("probe_layout"),
+        entries: &[uniform(0), storage(1, false), storage(2, false), storage(3, false)],
     });
     // group(3): the world-cache layout the engine binds to the ReSTIR passes (`world_cache_layout`): the wc
     // uniform + the 10 persistent storage buffers + the NEE light list / alias table (read-only).
@@ -410,6 +445,7 @@ fn dlss_guides_populated_where_voxels_hit() {
             Some(&dlss_view_layout),
             Some(&reservoir_layout),
             Some(&world_cache_layout),
+            Some(&probe_layout),
         ],
         immediate_size: 0,
     });
@@ -443,6 +479,35 @@ fn dlss_guides_populated_where_voxels_hit() {
     let res_b = zero_storage("reservoirs_b", px_count * RESERVOIR_SIZE);
     let surf_cur = zero_storage("surfaces_cur", px_count * SURFACE_SIZE);
     let surf_prev = zero_storage("surfaces_prev", px_count * SURFACE_SIZE);
+    // DI reservoirs (group 2, bindings 5/6) — 16 bytes/pixel, mirror of the engine's `DI_RESERVOIR_SIZE`.
+    let di_a = zero_storage("di_reservoirs_a", px_count * 16);
+    let di_b = zero_storage("di_reservoirs_b", px_count * 16);
+    // STBN (group 2, binding 7): a 1×1×1 D2Array dummy — the shader's `dims > 1` guard falls back to white
+    // noise, so the contents are irrelevant; it only needs to be bindable.
+    let stbn_tex = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("stbn_dummy"),
+        size: wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8Unorm,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING,
+        view_formats: &[],
+    });
+    let stbn_view = stbn_tex.create_view(&wgpu::TextureViewDescriptor {
+        dimension: Some(wgpu::TextureViewDimension::D2Array),
+        ..Default::default()
+    });
+    // group(4) screen probes — disabled (`enabled = 0`), so 1-element storage buffers suffice.
+    let probe_params_buf = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("probe_params"),
+        size: 48, // ScreenProbeParamsData = 12×u32
+        usage: wgpu::BufferUsages::UNIFORM,
+        mapped_at_creation: false,
+    });
+    let probe_headers = zero_storage("probe_headers", 32);
+    let probe_sh = zero_storage("probe_sh", 9 * 16);
+    let probe_sh_hist = zero_storage("probe_sh_history", 9 * 16);
     let restir_params = RestirParams {
         reset: 1, // first frame — no temporal history
         frame_index: 0,
@@ -451,7 +516,15 @@ fn dlss_guides_populated_where_voxels_hit() {
         spatial_samples: 0, // pass 2 spatial reuse off — guides don't depend on it
         confidence_weight_cap: 8.0,
         spatial_radius: 16.0,
-        _pad: 0,
+        di_enabled: 0, // DI off — guides come from the GI/primary trace
+        di_confidence_cap: 8.0,
+        di_initial_samples: 1,
+        _pad_gi: 0,
+        _pad0: 0,
+        _pad1: 0,
+        _pad2: 0,
+        gi_dissim_cap_dist: 0.0, // uncapped (pure Solari relative reject)
+        _pad3: 0,
     };
     let restir_params_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("restir_params"),
@@ -535,6 +608,19 @@ fn dlss_guides_populated_where_voxels_hit() {
             wgpu::BindGroupEntry { binding: 2, resource: restir_params_buf.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 3, resource: surf_cur.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 4, resource: surf_prev.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 5, resource: di_a.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 6, resource: di_b.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 7, resource: wgpu::BindingResource::TextureView(&stbn_view) },
+        ],
+    });
+    let probe_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("probe_bg"),
+        layout: &probe_layout,
+        entries: &[
+            wgpu::BindGroupEntry { binding: 0, resource: probe_params_buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 1, resource: probe_headers.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 2, resource: probe_sh.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 3, resource: probe_sh_hist.as_entire_binding() },
         ],
     });
     let cache_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -567,6 +653,7 @@ fn dlss_guides_populated_where_voxels_hit() {
         cpass.set_bind_group(1, Some(&view_bg), &[]);
         cpass.set_bind_group(2, Some(&reservoir_bg), &[]);
         cpass.set_bind_group(3, Some(&cache_bg), &[]);
+        cpass.set_bind_group(4, Some(&probe_bg), &[]);
         // Pass 1 fills reservoirs_b (irrelevant to the guides), pass 2 re-traces + writes the DLSS guides.
         cpass.set_pipeline(&p1);
         cpass.dispatch_workgroups(W.div_ceil(8), H.div_ceil(8), 1);
