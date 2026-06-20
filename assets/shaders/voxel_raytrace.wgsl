@@ -1954,72 +1954,65 @@ fn restir_gi_resolve(n: vec3<f32>, p: vec3<f32>, pix: vec2<u32>) -> vec3<f32> {
     return restir_resolve_irradiance(shaded, p, n);
 }
 
-// ===== Screen-space radiance probes (group 4) — Lumen-style downsampled diffuse GI ============================
-// Independent samples in a downsampled domain: each probe traces its OWN octahedral ray set (full sphere, fixed
-// world frame) and projects to order-2 spherical harmonics. The SH projection IS the variance-reduction
-// mechanism (a low-pass that discards the angular noise the boil meter measures), NOT an optimisation. Per pixel
-// we bilaterally blend the 2×2 neighbour probes' SH and do ONE SH·cosine-lobe dot product. The probe ray is one
-// bounce -> world radiance cache (the level-2 cache) so it's cheap + multi-bounce. docs/SCREEN_PROBE_PLAN.md.
+// ===== Screen-space radiance probes (group 4) — GI-1.0 / Brixelizer-GI downsampled diffuse GI ==================
+// Independent samples in a downsampled domain: each probe traces its OWN equal-area directional radiance set
+// (oct_res² spherical-Fibonacci dirs, fixed WORLD frame) and stores the per-direction RADIANCE into an ATLAS
+// (`probe_radiance`, one vec4 per dir per probe) — NOT an SH projection. Per pixel we bilaterally gather the 2×2
+// neighbour probes and integrate each probe's atlas against THIS pixel's FULL-RES normal (a cosine-weighted
+// hemisphere sum) — so directional + spatial GI detail survives (the SH-only version low-passed it to a flat
+// ambient field). The probe ray is ONE bounce → world radiance cache (the level-2 far field, multi-bounce). At
+// edges the gather falls back to the world cache directly (leak-free), never a foreign probe. docs/SCREEN_PROBE_PLAN.md.
 //
-// NOT to be confused with the test-only `restir_probe`/`ProbePoint` estimator (group-0 8..11) — different thing.
+// bin i ↔ a FIXED world direction `probe_dir(i, N)` (deterministic in (i,N)) → every probe + frame shares texel
+// directions, so neighbour/temporal blends are texel-aligned. NOT the test-only `restir_probe`/`ProbePoint`.
 struct ScreenProbeParams {
     grid_x: u32,        // probe grid dims = ceil(viewport / probe_size)
     grid_y: u32,
     probe_size: u32,    // pixels per probe cell
-    oct_res: u32,       // octahedral resolution; dirs traced per probe = oct_res²
+    oct_res: u32,       // dirs traced per probe = oct_res² (the radiance-atlas size per probe)
     viewport_x: u32,
     viewport_y: u32,
     reset: u32,
     frame_index: u32,
     enabled: u32,       // gi_mode: 1 = probes drive diffuse GI, 0 = ReSTIR
-    temporal: u32,      // 1 = blend prev-frame SH history (P3)
+    temporal: u32,      // 1 = blend prev-frame atlas history (light, ~10-frame)
     _pad0: u32,
     _pad1: u32,
 };
 @group(4) @binding(0) var<uniform> probe_params: ScreenProbeParams;
 struct ScreenProbeHeader { world_pos: vec3<f32>, valid: f32, world_normal: vec3<f32>, view_z: f32 };
 @group(4) @binding(1) var<storage, read_write> probe_headers: array<ScreenProbeHeader>;
-@group(4) @binding(2) var<storage, read_write> probe_sh: array<vec4<f32>>;          // 9 coeffs/probe (.xyz=RGB)
-@group(4) @binding(3) var<storage, read_write> probe_sh_history: array<vec4<f32>>;  // prev frame (temporal reuse)
+// Radiance ATLAS: `oct_res²` directional bins per probe (`pidx*N + i`), `.xyz` = incoming radiance along dir i.
+@group(4) @binding(2) var<storage, read_write> probe_radiance: array<vec4<f32>>;
+// Prev-frame atlas (temporal reuse). `.w` of bins 0..3 packs the validity meta (prev view_z + prev normal).
+@group(4) @binding(3) var<storage, read_write> probe_radiance_history: array<vec4<f32>>;
 
-// Order-2 real SH basis (9 coeffs) for a unit direction.
-fn sh9(d: vec3<f32>) -> array<f32, 9> {
-    return array<f32, 9>(
-        0.282095,
-        0.488603 * d.y,
-        0.488603 * d.z,
-        0.488603 * d.x,
-        1.092548 * d.x * d.y,
-        1.092548 * d.y * d.z,
-        0.315392 * (3.0 * d.z * d.z - 1.0),
-        1.092548 * d.x * d.z,
-        0.546274 * (d.x * d.x - d.y * d.y),
-    );
+// Spherical-Fibonacci direction for bin i of N — equal-area (exact 4π/N solid angle) and deterministic in (i,N),
+// so it is a FIXED shared world frame across probes + frames (neighbour/temporal texels align). The SSOT shared
+// by `screen_probe_trace` (which writes radiance along it) and `screen_probe_integrate` (which weights by it).
+fn probe_dir(i: u32, n: u32) -> vec3<f32> {
+    let inv_n = 1.0 / f32(n);
+    let z = 1.0 - (2.0 * f32(i) + 1.0) * inv_n;
+    let rr = sqrt(max(0.0, 1.0 - z * z));
+    let phi = f32(i) * 2.39996323; // golden angle
+    return vec3<f32>(rr * cos(phi), rr * sin(phi), z);
 }
 
-// Diffuse irradiance E(n) from 9 incoming-radiance SH coeffs via the cosine-lobe convolution (Ramamoorthi:
-// A0=π, A1..3=2π/3, A4..8=π/4). E = ∫ L(d)·max(cosθ,0) dω. `c` = the 9 blended coeffs.
-fn sh_irradiance_local(c: array<vec4<f32>, 9>, n: vec3<f32>) -> vec3<f32> {
-    let y = sh9(n);
-    var e = 3.14159265 * c[0].xyz * y[0];
-    e += 2.0943951 * (c[1].xyz * y[1] + c[2].xyz * y[2] + c[3].xyz * y[3]);
-    e += 0.785398163 * (c[4].xyz * y[4] + c[5].xyz * y[5] + c[6].xyz * y[6]
-                      + c[7].xyz * y[7] + c[8].xyz * y[8]);
-    return e;
-}
-
-// Per-pixel probe integration (called from shade): bilinear 2×2 probe gather, bilateral depth/normal reject,
-// SH·cosine-lobe. Returns indirect irradiance/π × gi_intensity — the SAME contract as `restir_gi_resolve` (the
-// caller multiplies receiver albedo). Falls back to 0 when no nearby probe is valid (edge — P4 adaptive fills).
+// Per-pixel probe integration (called from shade): bilinear 2×2 probe gather, bilateral depth/normal reject, and
+// for each accepted probe a COSINE-WEIGHTED hemisphere integral of its radiance atlas against THIS pixel's
+// full-res normal `n` (the directional detail SH-cosine threw away). Returns indirect irradiance/π × gi_intensity
+// — the SAME contract as `restir_gi_resolve` (the caller multiplies receiver albedo). When the 2×2 fully rejects
+// (silhouette / disocclusion) it falls back to the world radiance cache anchored at `p` (leak-free; never a
+// foreign probe). `rng_seed` decorrelates the cache fallback's stochastic LOD rounding.
 fn screen_probe_integrate(n: vec3<f32>, p: vec3<f32>, view_z: f32, pix: vec2<u32>) -> vec3<f32> {
+    let nd = probe_params.oct_res * probe_params.oct_res;
+    let inv_dw = 12.566370614 / f32(nd); // 4π / N — exact (equal-area Fibonacci dirs)
     let ps = f32(probe_params.probe_size);
     // Probe cell c is centred at pixel c*ps + ps/2 → this pixel's continuous probe-grid coord:
     let pc = (vec2<f32>(pix) - vec2<f32>(ps * 0.5)) / ps;
     let base = vec2<i32>(floor(pc));
     let fr = pc - floor(pc);
-    var acc = array<vec4<f32>, 9>(
-        vec4<f32>(0.0), vec4<f32>(0.0), vec4<f32>(0.0), vec4<f32>(0.0), vec4<f32>(0.0),
-        vec4<f32>(0.0), vec4<f32>(0.0), vec4<f32>(0.0), vec4<f32>(0.0));
+    var e = vec3<f32>(0.0); // accumulated irradiance E(n) = ∫ L·cosθ dω, bilinearly blended across probes
     var wsum = 0.0;
     for (var dj = 0; dj < 2; dj = dj + 1) {
         for (var di = 0; di < 2; di = di + 1) {
@@ -2037,51 +2030,41 @@ fn screen_probe_integrate(n: vec3<f32>, p: vec3<f32>, view_z: f32, pix: vec2<u32
             let dw = exp(-plane * 8.0);
             let w = bw * nw * nw * dw;
             if (w <= 0.0) { continue; }
-            for (var c = 0u; c < 9u; c = c + 1u) {
-                acc[c] = acc[c] + probe_sh[pidx * 9u + c] * w;
+            // N-tap cosine-weighted hemisphere integral of THIS probe's atlas against the PIXEL normal n.
+            let pbase = pidx * nd;
+            var ep = vec3<f32>(0.0);
+            for (var i = 0u; i < nd; i = i + 1u) {
+                let cosNL = max(dot(n, probe_dir(i, nd)), 0.0);
+                if (cosNL <= 0.0) { continue; }
+                ep = ep + probe_radiance[pbase + i].xyz * (cosNL * inv_dw);
             }
+            e = e + ep * w;
             wsum = wsum + w;
         }
     }
-    // Edge fallback (M3): the bilinear 2×2 may have NO valid probe (silhouette / disocclusion). Widen to a 5×5
-    // search for the nearest normal-matching valid probe and use its SH directly, so edges aren't black (until
-    // P4 adaptive probes place dedicated edge probes).
+    // Edge fallback: the bilinear 2×2 fully rejected (silhouette / disocclusion). Read the world radiance cache
+    // DIRECTLY at p (already cosine-pre-divided incoming irradiance/π, the same contract) — anchored to THIS
+    // pixel, so it is leak-free by construction (never substitutes a neighbouring surface's probe). A graceful
+    // LOD drop to the smoother far-field cache until an adaptive edge probe covers the pixel (P4).
     if (wsum <= 0.0) {
-        var best = 1.0e30;
-        var found = false;
-        for (var dj = -2; dj <= 2; dj = dj + 1) {
-            for (var di = -2; di <= 2; di = di + 1) {
-                let cell = base + vec2<i32>(di, dj);
-                if (cell.x < 0 || cell.y < 0 || cell.x >= i32(probe_params.grid_x) || cell.y >= i32(probe_params.grid_y)) {
-                    continue;
-                }
-                let pidx = u32(cell.y) * probe_params.grid_x + u32(cell.x);
-                let h = probe_headers[pidx];
-                if (h.valid < 0.5 || dot(h.world_normal, n) < 0.5) { continue; }
-                let d = length(h.world_pos - p);
-                if (d < best) {
-                    best = d;
-                    found = true;
-                    for (var c = 0u; c < 9u; c = c + 1u) { acc[c] = probe_sh[pidx * 9u + c]; }
-                }
-            }
-        }
-        if (!found) { return vec3<f32>(0.0); }
-        return (sh_irradiance_local(acc, n) / 3.14159265) * light.gi_intensity;
+        var rng = (pix.x * 1973u + pix.y * 9277u + light.frame_index * 26699u) | 1u;
+        let cache = query_world_cache(p, n, camera.cam_pos, max(view_z, 0.1), wc.cell_lifetime, &rng);
+        return cache * light.gi_intensity;
     }
-    let inv = 1.0 / wsum;
-    for (var c = 0u; c < 9u; c = c + 1u) { acc[c] = acc[c] * inv; }
-    return (sh_irradiance_local(acc, n) / 3.14159265) * light.gi_intensity;
+    return (e / wsum / 3.14159265) * light.gi_intensity;
 }
 
 // PASS (screen probes): one thread per probe cell. Place the probe on the surface at the cell's centre pixel,
-// trace oct_res² full-sphere directions (upper hemisphere contributes), and project incoming radiance to order-2
-// SH. Each direction = ONE bounce reading the world cache (`reservoir_from_bounce_cached`) — independent samples.
+// trace oct_res² equal-area directions, and store the per-direction RADIANCE into the atlas (`probe_radiance`).
+// Each direction = ONE bounce reading the world cache (`reservoir_from_bounce_cached`) — independent samples. The
+// lower hemisphere of the PROBE normal isn't traced (cosθ≤0 → never weighted by a coplanar pixel); those bins
+// stay 0 (edge pixels whose normal differs use the world-cache fallback in `screen_probe_integrate`).
 @compute @workgroup_size(8, 8, 1)
 fn screen_probe_trace(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (gid.x >= probe_params.grid_x || gid.y >= probe_params.grid_y) { return; }
     let pidx = gid.y * probe_params.grid_x + gid.x;
-    let b = pidx * 9u;
+    let nd = probe_params.oct_res * probe_params.oct_res;
+    let pbase = pidx * nd;
     let ps = probe_params.probe_size;
     let cx = gid.x * ps + ps / 2u;
     let cy = gid.y * ps + ps / 2u;
@@ -2097,74 +2080,45 @@ fn screen_probe_trace(@builtin(global_invocation_id) gid: vec3<u32>) {
             hdr.world_normal = n;
             hdr.view_z = r.t;
             hdr.valid = 1.0;
-            let ores = probe_params.oct_res;
-            let nd = ores * ores;
-            let inv_n = 1.0 / f32(nd);
-            let inv_dw = 12.566370614 * inv_n; // 4π / N — EXACT, because the Fibonacci sphere is equal-area
             let drop_emissive = restir_params.di_enabled != 0u && wc.light_count != 0u;
             var rng = (pidx * 9781u + probe_params.frame_index * 26699u) | 1u;
-            var c0 = vec3<f32>(0.0); var c1 = vec3<f32>(0.0); var c2 = vec3<f32>(0.0);
-            var c3 = vec3<f32>(0.0); var c4 = vec3<f32>(0.0); var c5 = vec3<f32>(0.0);
-            var c6 = vec3<f32>(0.0); var c7 = vec3<f32>(0.0); var c8 = vec3<f32>(0.0);
-            for (var i = 0u; i < nd; i = i + 1u) {
-                // Spherical Fibonacci direction (equal-area by construction → the 4π/N weight is exact, no
-                // octahedral area distortion). Fixed world frame (shared across probes/frames for P3 filtering).
-                let z = 1.0 - (2.0 * f32(i) + 1.0) * inv_n;
-                let rr = sqrt(max(0.0, 1.0 - z * z));
-                let phi = f32(i) * 2.39996323; // golden angle
-                let dir = vec3<f32>(rr * cos(phi), rr * sin(phi), z);
-                if (dot(dir, n) <= 0.0) { continue; }
-                let L = reservoir_from_bounce_cached(p, n, dir, drop_emissive, &rng).radiance;
-                let y = sh9(dir);
-                c0 += L * (y[0] * inv_dw); c1 += L * (y[1] * inv_dw); c2 += L * (y[2] * inv_dw);
-                c3 += L * (y[3] * inv_dw); c4 += L * (y[4] * inv_dw); c5 += L * (y[5] * inv_dw);
-                c6 += L * (y[6] * inv_dw); c7 += L * (y[7] * inv_dw); c8 += L * (y[8] * inv_dw);
-            }
-            // Light TEMPORAL accumulation: blend the prev-frame SH (probe_sh_history at this cell) into the raw
-            // SH when the surface matches (a position/normal validity reject — NOT reprojected, so on camera
-            // motion the cell's world point changes, the reject fires, and the probe falls back to fresh: no
-            // smear/ghosting, just noisier during motion which DLSS-RR cleans). Validity meta (view_z, normal) is
-            // packed into the unused SH `.w` lanes of the history — no extra buffer. Reset → fresh.
-            var a = 1.0; // history weight of the NEW sample (1 = no temporal)
+            // Light TEMPORAL: blend prev-frame atlas (probe_radiance_history) when the surface matches — a
+            // position/normal validity reject (NOT reprojected, so on camera motion the cell's world point
+            // changes, the reject fires, the probe falls back to fresh: noisier-during-motion which DLSS-RR
+            // cleans, no smear/ghosting). Prev meta (view_z + normal) is packed in history bins 0..3 `.w`.
+            var a = 1.0; // weight of the NEW sample (1 = no temporal blend)
             if (probe_params.temporal != 0u && probe_params.reset == 0u) {
-                let h0 = probe_sh_history[b + 0u];
-                let prev_vz = h0.w;
-                let prev_n = vec3<f32>(probe_sh_history[b + 1u].w, probe_sh_history[b + 2u].w, probe_sh_history[b + 3u].w);
-                let z_ok = prev_vz > 0.0 && abs(prev_vz - r.t) < 0.05 * r.t;
-                if (z_ok && dot(prev_n, n) > 0.9) {
-                    a = 0.1; // ~10-frame light history; DLSS-RR does the rest of the temporal lift (anti-ghost)
-                    c0 = mix(probe_sh_history[b + 0u].xyz, c0, a);
-                    c1 = mix(probe_sh_history[b + 1u].xyz, c1, a);
-                    c2 = mix(probe_sh_history[b + 2u].xyz, c2, a);
-                    c3 = mix(probe_sh_history[b + 3u].xyz, c3, a);
-                    c4 = mix(probe_sh_history[b + 4u].xyz, c4, a);
-                    c5 = mix(probe_sh_history[b + 5u].xyz, c5, a);
-                    c6 = mix(probe_sh_history[b + 6u].xyz, c6, a);
-                    c7 = mix(probe_sh_history[b + 7u].xyz, c7, a);
-                    c8 = mix(probe_sh_history[b + 8u].xyz, c8, a);
+                let prev_vz = probe_radiance_history[pbase + 0u].w;
+                let prev_n = vec3<f32>(probe_radiance_history[pbase + 1u].w,
+                                       probe_radiance_history[pbase + 2u].w,
+                                       probe_radiance_history[pbase + 3u].w);
+                if (prev_vz > 0.0 && abs(prev_vz - r.t) < 0.05 * r.t && dot(prev_n, n) > 0.9) {
+                    a = 0.1; // ~10-frame light history; DLSS-RR does the rest of the temporal lift
                 }
             }
-            // Write the FINAL SH to probe_sh (integration reads it) + history (next frame), with validity meta
-            // (view_z + normal) in the .w lanes of coeffs 0..3.
-            probe_sh[b + 0u] = vec4<f32>(c0, 0.0); probe_sh[b + 1u] = vec4<f32>(c1, 0.0);
-            probe_sh[b + 2u] = vec4<f32>(c2, 0.0); probe_sh[b + 3u] = vec4<f32>(c3, 0.0);
-            probe_sh[b + 4u] = vec4<f32>(c4, 0.0); probe_sh[b + 5u] = vec4<f32>(c5, 0.0);
-            probe_sh[b + 6u] = vec4<f32>(c6, 0.0); probe_sh[b + 7u] = vec4<f32>(c7, 0.0);
-            probe_sh[b + 8u] = vec4<f32>(c8, 0.0);
-            probe_sh_history[b + 0u] = vec4<f32>(c0, r.t);
-            probe_sh_history[b + 1u] = vec4<f32>(c1, n.x);
-            probe_sh_history[b + 2u] = vec4<f32>(c2, n.y);
-            probe_sh_history[b + 3u] = vec4<f32>(c3, n.z);
-            probe_sh_history[b + 4u] = vec4<f32>(c4, 0.0); probe_sh_history[b + 5u] = vec4<f32>(c5, 0.0);
-            probe_sh_history[b + 6u] = vec4<f32>(c6, 0.0); probe_sh_history[b + 7u] = vec4<f32>(c7, 0.0);
-            probe_sh_history[b + 8u] = vec4<f32>(c8, 0.0);
+            // Trace each equal-area direction (probe upper hemisphere) → ONE cache-read bounce → store the
+            // per-direction RADIANCE in the atlas. Lower-hemisphere bins stay 0 (never weighted by a coplanar
+            // pixel). Temporal-blend each bin with its history texel; pack the validity meta into bins 0..3 `.w`.
+            for (var i = 0u; i < nd; i = i + 1u) {
+                let dir = probe_dir(i, nd);
+                var L = vec3<f32>(0.0);
+                if (dot(dir, n) > 0.0) {
+                    L = reservoir_from_bounce_cached(p, n, dir, drop_emissive, &rng).radiance;
+                }
+                let blended = mix(probe_radiance_history[pbase + i].xyz, L, a);
+                probe_radiance[pbase + i] = vec4<f32>(blended, 0.0);
+                var hist_w = 0.0; // validity meta packed into bins 0..3 `.w` (prev view_z + prev normal)
+                if (i == 0u) { hist_w = r.t; } else if (i == 1u) { hist_w = n.x; }
+                else if (i == 2u) { hist_w = n.y; } else if (i == 3u) { hist_w = n.z; }
+                probe_radiance_history[pbase + i] = vec4<f32>(blended, hist_w);
+            }
         }
     }
     probe_headers[pidx] = hdr;
     if (hdr.valid < 0.5) {
-        for (var c = 0u; c < 9u; c = c + 1u) {
-            probe_sh[b + c] = vec4<f32>(0.0);
-            probe_sh_history[b + c] = vec4<f32>(0.0);
+        for (var i = 0u; i < nd; i = i + 1u) {
+            probe_radiance[pbase + i] = vec4<f32>(0.0);
+            probe_radiance_history[pbase + i] = vec4<f32>(0.0);
         }
     }
 }

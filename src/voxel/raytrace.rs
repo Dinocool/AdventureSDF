@@ -1602,7 +1602,10 @@ struct VoxelRtResources {
     /// Screen-probe GI: (headers, SH current, SH history) storage buffers + the probe grid dims they're sized
     /// for. Reallocated when the grid changes; history reset on realloc. Shared by both render paths (only one
     /// runs per frame). `group(4)`. See `docs/SCREEN_PROBE_PLAN.md`.
-    screen_probes: Option<(wgpu::Buffer, wgpu::Buffer, wgpu::Buffer, UVec2)>,
+    /// `(headers, radiance_atlas, radiance_atlas_history, grid, oct_res)` — the screen-probe buffers. Re-keyed
+    /// on BOTH the grid AND `oct_res` (the atlas is `oct_res²` directional bins per probe, so a probe-density
+    /// change resizes it).
+    screen_probes: Option<(wgpu::Buffer, wgpu::Buffer, wgpu::Buffer, UVec2, u32)>,
     /// The composite render pipeline, keyed by the view-target format it was built for.
     composite: Option<(wgpu::TextureFormat, wgpu::RenderPipeline)>,
     /// Monotonic per-frame counter written into the lighting uniform's `frame_index` so the GI bounce
@@ -4577,9 +4580,12 @@ fn prepare_screen_probes(
     } else {
         UVec2::ONE
     };
-    let need = resources.screen_probes.as_ref().map(|(.., g)| *g) != Some(grid);
+    // The radiance atlas is `oct_res²` directional bins per probe → re-key on (grid, oct_res).
+    let oct_res = settings.probe_oct_res.max(1);
+    let need = resources.screen_probes.as_ref().map(|(.., g, o)| (*g, *o)) != Some((grid, oct_res));
     if need {
         let n = (grid.x as u64) * (grid.y as u64);
+        let bins = (oct_res as u64) * (oct_res as u64); // directional radiance bins per probe
         let mk = |label: &'static str, bytes: u64| {
             device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some(label),
@@ -4589,11 +4595,11 @@ fn prepare_screen_probes(
             })
         };
         let headers = mk("voxel_rt_probe_headers", n * 32); // ScreenProbeHeader = 2×vec4
-        let sh = mk("voxel_rt_probe_sh", n * 9 * 16); // 9 order-2 coeffs × vec4
-        let sh_hist = mk("voxel_rt_probe_sh_history", n * 9 * 16);
-        resources.screen_probes = Some((headers, sh, sh_hist, grid));
+        let radiance = mk("voxel_rt_probe_radiance", n * bins * 16); // oct_res² × vec4 atlas
+        let radiance_hist = mk("voxel_rt_probe_radiance_history", n * bins * 16);
+        resources.screen_probes = Some((headers, radiance, radiance_hist, grid, oct_res));
     }
-    let (headers, sh, sh_hist, _) = resources.screen_probes.as_ref().unwrap();
+    let (headers, radiance, radiance_hist, ..) = resources.screen_probes.as_ref().unwrap();
     let params = ScreenProbeParamsData {
         grid_x: grid.x,
         grid_y: grid.y,
@@ -4619,8 +4625,8 @@ fn prepare_screen_probes(
         entries: &[
             wgpu::BindGroupEntry { binding: 0, resource: params_buf.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 1, resource: headers.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 2, resource: sh.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 3, resource: sh_hist.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 2, resource: radiance.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 3, resource: radiance_hist.as_entire_binding() },
         ],
     });
     (bg, settings.screen_probes.then_some(grid))
