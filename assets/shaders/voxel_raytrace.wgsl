@@ -2010,39 +2010,57 @@ fn screen_probe_integrate(n: vec3<f32>, p: vec3<f32>, view_z: f32, pix: vec2<u32
     let ps = f32(probe_params.probe_size);
     // Probe cell c is centred at pixel c*ps + ps/2 → this pixel's continuous probe-grid coord:
     let pc = (vec2<f32>(pix) - vec2<f32>(ps * 0.5)) / ps;
-    let base = vec2<i32>(floor(pc));
-    let fr = pc - floor(pc);
-    var e = vec3<f32>(0.0); // accumulated irradiance E(n) = ∫ L·cosθ dω, bilinearly blended across probes
+    let centre = vec2<i32>(round(pc));
+    // SPATIAL FILTER (P3): gather a 3×3 probe neighbourhood with a SMOOTH spatial tent + a bilateral depth/normal
+    // reject, then average the accepted probes' radiance PER DIRECTION BIN and cosine-integrate the averaged
+    // atlas. Averaging the radiance spatially across 9 probes (vs a 2×2 bilinear of 4) removes the coarse-probe
+    // FACETING without touching the per-direction angular detail. Foreground geometry (a box in front of a wall,
+    // same axis-aligned normal) is rejected by the steep tangent-plane falloff so it can't leak its atlas in.
+    var cell_pbase = array<u32, 9>(0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u);
+    var cell_w = array<f32, 9>(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+    var ncell = 0u;
     var wsum = 0.0;
-    for (var dj = 0; dj < 2; dj = dj + 1) {
-        for (var di = 0; di < 2; di = di + 1) {
-            let cell = base + vec2<i32>(di, dj);
+    for (var dj = -1; dj <= 1; dj = dj + 1) {
+        for (var di = -1; di <= 1; di = di + 1) {
+            let cell = centre + vec2<i32>(di, dj);
             if (cell.x < 0 || cell.y < 0 || cell.x >= i32(probe_params.grid_x) || cell.y >= i32(probe_params.grid_y)) {
                 continue;
             }
             let pidx = u32(cell.y) * probe_params.grid_x + u32(cell.x);
             let h = probe_headers[pidx];
             if (h.valid < 0.5) { continue; }
-            let bw = select(1.0 - fr.x, fr.x, di == 1) * select(1.0 - fr.y, fr.y, dj == 1);
+            // Smooth spatial tent over the 3×3 by the continuous-grid distance (no hard bilinear edges).
+            let sw = max(0.0, 1.0 - 0.6 * length(pc - vec2<f32>(cell)));
+            // Normal reject (nw⁴ — tighter than nw² so a foreground face at a slightly different tilt is dropped).
             let nw = max(0.0, dot(h.world_normal, n));
-            // depth/plane reject: distance of p from the probe's tangent plane, relative to view depth.
+            let nw2 = nw * nw;
+            // DEPTH/PLANE reject: a probe a clear step off this pixel's tangent plane (foreground occluder) gets
+            // an exponentially tiny weight — steep enough that a Cornell box ~1 m in front of a 5 m-deep wall is
+            // killed, smooth enough not to inject its own hard facet edges.
             let plane = abs(dot(h.world_pos - p, h.world_normal)) / max(abs(view_z), 0.1);
-            let dw = exp(-plane * 8.0);
-            let w = bw * nw * nw * dw;
-            if (w <= 0.0) { continue; }
-            // N-tap cosine-weighted hemisphere integral of THIS probe's atlas against the PIXEL normal n.
-            let pbase = pidx * nd;
-            var ep = vec3<f32>(0.0);
-            for (var i = 0u; i < nd; i = i + 1u) {
-                let cosNL = max(dot(n, probe_dir(i, nd)), 0.0);
-                if (cosNL <= 0.0) { continue; }
-                ep = ep + probe_radiance[pbase + i].xyz * (cosNL * inv_dw);
-            }
-            e = e + ep * w;
+            let dw = exp(-plane * 48.0);
+            let w = sw * nw2 * nw2 * dw;
+            if (w <= 1.0e-4) { continue; }
+            cell_pbase[ncell] = pidx * nd;
+            cell_w[ncell] = w;
             wsum = wsum + w;
+            ncell = ncell + 1u;
         }
     }
-    // Edge fallback: the bilinear 2×2 fully rejected (silhouette / disocclusion). Read the world radiance cache
+    var e = vec3<f32>(0.0); // irradiance E(n) = ∫ L·cosθ dω of the spatially-averaged atlas
+    if (wsum > 0.0) {
+        for (var i = 0u; i < nd; i = i + 1u) {
+            let cosNL = max(dot(n, probe_dir(i, nd)), 0.0);
+            if (cosNL <= 0.0) { continue; }
+            // Spatial average of bin i across the accepted probes, then cosine-weight.
+            var binsum = vec3<f32>(0.0);
+            for (var k = 0u; k < ncell; k = k + 1u) {
+                binsum = binsum + probe_radiance[cell_pbase[k] + i].xyz * cell_w[k];
+            }
+            e = e + binsum * (cosNL * inv_dw);
+        }
+    }
+    // Edge fallback: the 3×3 neighbourhood fully rejected (silhouette / disocclusion). Read the world radiance cache
     // DIRECTLY at p (already cosine-pre-divided incoming irradiance/π, the same contract) — anchored to THIS
     // pixel, so it is leak-free by construction (never substitutes a neighbouring surface's probe). A graceful
     // LOD drop to the smoother far-field cache until an adaptive edge probe covers the pixel (P4).
@@ -2096,15 +2114,16 @@ fn screen_probe_trace(@builtin(global_invocation_id) gid: vec3<u32>) {
                     a = 0.1; // ~10-frame light history; DLSS-RR does the rest of the temporal lift
                 }
             }
-            // Trace each equal-area direction (probe upper hemisphere) → ONE cache-read bounce → store the
-            // per-direction RADIANCE in the atlas. Lower-hemisphere bins stay 0 (never weighted by a coplanar
-            // pixel). Temporal-blend each bin with its history texel; pack the validity meta into bins 0..3 `.w`.
+            // Trace each equal-area direction over the FULL SPHERE → ONE cache-read bounce → store the
+            // per-direction RADIANCE in the atlas. Full-sphere (NOT just the probe's upper hemisphere) is
+            // required: a nearby pixel whose normal differs from the probe's integrates its OWN hemisphere, which
+            // includes directions in the probe's LOWER hemisphere — leaving those bins 0 (the SH version hid this
+            // by extrapolating; the atlas does not → patchy/dark GI on varying-normal geometry). Lower-hemisphere
+            // dirs trace into/below the local surface (correctly returning the nearby occluded/surface radiance).
+            // Temporal-blend each bin with its history texel; pack the validity meta into bins 0..3 `.w`.
             for (var i = 0u; i < nd; i = i + 1u) {
                 let dir = probe_dir(i, nd);
-                var L = vec3<f32>(0.0);
-                if (dot(dir, n) > 0.0) {
-                    L = reservoir_from_bounce_cached(p, n, dir, drop_emissive, &rng).radiance;
-                }
+                let L = reservoir_from_bounce_cached(p, n, dir, drop_emissive, &rng).radiance;
                 let blended = mix(probe_radiance_history[pbase + i].xyz, L, a);
                 probe_radiance[pbase + i] = vec4<f32>(blended, 0.0);
                 var hist_w = 0.0; // validity meta packed into bins 0..3 `.w` (prev view_z + prev normal)

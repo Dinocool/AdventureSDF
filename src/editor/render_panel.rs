@@ -152,9 +152,10 @@ pub fn render_gi_panel(world: &mut World, ui: &mut egui::Ui) {
             // 0 = uncapped (pure Solari); >0 caps the dissimilarity view-distance → absolute tangent reject
             // beyond it, closing far thin-wall GI leaks. Raise toward off if it adds boil on slopes/terrain.
             ui.add(egui::Slider::new(&mut s.gi_dissim_cap_dist, 0.0..=80.0).text("thin-wall reject cap dist (m, 0=off)"));
-            // Screen-space radiance probes (Lumen-style): downsampled SH GI — kills the boil at a fraction of
-            // the per-pixel trace cost. Replaces the per-pixel ReSTIR diffuse gather when on. SHELVED (flat).
-            ui.checkbox(&mut s.screen_probes, "Screen-probe GI (Lumen-style — SHELVED, flat)");
+            // Screen-space radiance probes (GI-1.0 / Brixelizer-GI): downsampled octahedral-atlas GI integrated
+            // against the full-res normal — replaces the per-pixel ReSTIR diffuse gather when on (the probe-rate
+            // perf path). Rebuilt from the flat SH-only version (P0-P2); P3 blur / P4 adaptive-probes pending.
+            ui.checkbox(&mut s.screen_probes, "Screen-probe GI (GI-1.0 octa atlas — WIP rebuild)");
             ui.add_enabled_ui(s.screen_probes, |ui| {
                 ui.add(egui::Slider::new(&mut s.probe_size, 4..=32).text("probe spacing (px)"));
                 ui.add(egui::Slider::new(&mut s.probe_oct_res, 4..=16).text("probe directions √N (oct res)"));
