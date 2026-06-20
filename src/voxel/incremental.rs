@@ -534,13 +534,15 @@ fn index_slab_words(index_bits: u8) -> u32 {
 /// correct-by-construction for ANY brick mix: every dense brick costs ≤ 500 ≤ 512 index words, so a converged set
 /// of `max_resident` bricks NEVER overflows `max_resident · 512` — true for the CPU grow path AND, critically, for
 /// the FIXED (no-grow) GPU residency FRONT END pool (`residency_front_end.rs`), which binds this buffer once and
-/// writes the whole GPU-decided set into it. A dense scene like Bistro at clip_half=160 converges to ~517 index
-/// words/brick (essentially ALL 16-bit bricks) — at the old 192-word reserve the front end's index slab high-water
-/// (~198 M words) overflowed the 76.8 M pool 2.6× ⇒ out-of-bounds GPU writes ⇒ corruption. 512 bounds it by
-/// construction. NOTE the cost: the index GPU buffer is committed at `max_resident_bricks · 512 · 4 B` (the
-/// `max_resident_bricks` cap is the documented VRAM safety bound) regardless of the live count; a low-entropy scene
-/// simply leaves the pre-sized pool partly unused. (Was 192 ≈ the MEASURED MEAN — too small for a worst-case mix.)
-const RESERVE_INDEX_WORDS_PER_BRICK: u32 = 512;
+/// writes the whole GPU-decided set into it. The index stream is `ceil(1000·index_bits/32)` words (1000 = the 10³
+/// haloed grid); the MAX SUPPORTED width is `index_bits=8` ⇒ **250 words** — `index_bits=16` (500 words) is
+/// DEGENERATED to empty by the pack (`voxel_residency.wgsl` D3 `fits` guard: a brick whose index/palette overflows
+/// its slab gets a degenerate AABB, never spills). So **256 bounds every packable brick by construction** (the
+/// guard makes it robust at any stride — an over-large brick is dropped, never corrupts). Halved from the earlier
+/// 512 (which was sized for `index_bits=16` BEFORE the pack degenerated it — stale). Cost: the index GPU buffer is
+/// committed at `max_resident_bricks · 256 · 4 B` regardless of the live count; a low-entropy scene leaves it
+/// partly unused. (8 GB budget: this halves the index pool, ~1.84 GB → ~0.92 GB at max_resident=900k.)
+const RESERVE_INDEX_WORDS_PER_BRICK: u32 = 256;
 
 /// **Pre-size bound — the per-brick PALETTE words pool reserve.** This is NOT a soft mean estimate: on the GPU
 /// residency path the palette pool is a HARD-CAPPED bump arena (`voxel_residency.wgsl::alloc_palette_slab`) sized

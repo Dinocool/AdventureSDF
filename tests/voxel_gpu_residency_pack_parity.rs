@@ -306,8 +306,8 @@ impl GpuDrive {
         let params_buf = buf_init(&device, "params", bytemuck::bytes_of(&params), wgpu::BufferUsages::UNIFORM);
         let diff_cfg = DiffConfig { slot_table_size, present_size, max_resident, refine_descent_cap: REFINE_DESCENT_CAP };
         let diff_cfg_buf = buf_init(&device, "diff_cfg", bytemuck::bytes_of(&diff_cfg), wgpu::BufferUsages::UNIFORM);
-        // index/palette per-slot strides MUST match the pool sizing below (512/256 words/slot, fixed per-slot slabs).
-        let pack_cfg = PackConfig { core_table_size: cores.table_size, max_resident, index_stride: 512, palette_stride: 256 };
+        // index/palette per-slot strides MUST match the pool sizing below (256/256 words/slot, fixed per-slot slabs).
+        let pack_cfg = PackConfig { core_table_size: cores.table_size, max_resident, index_stride: 256, palette_stride: 256 };
         let pack_cfg_buf = buf_init(&device, "pack_cfg", bytemuck::bytes_of(&pack_cfg), wgpu::BufferUsages::UNIFORM);
 
         // --- Pass C persistent state ---
@@ -355,10 +355,11 @@ impl GpuDrive {
         let classify_commands = storage_buf(&device, "classify_commands", (list_cap * 16) as u64);
         let neighbour_indices = storage_buf(&device, "neighbour_indices", (list_cap as u64) * 27 * 4);
 
-        // The persistent POOL (meta/voxel/palette). The GPU front end now uses FIXED PER-SLOT slabs (slot·stride),
-        // so the pools MUST be sized worst-case-per-slot (mirror `RESERVE_INDEX_WORDS_PER_BRICK`=512 / index_bits=16's
-        // 500w, `RESERVE_PALETTE_WORDS_PER_BRICK`=256 / index_bits=8's max) — each slot owns its own region.
-        const INDEX_STRIDE: usize = 512;
+        // The persistent POOL (meta/voxel/palette). The GPU front end uses FIXED PER-SLOT slabs (slot·stride), so
+        // the pools are sized per-slot to the MAX SUPPORTED width (mirror `RESERVE_INDEX_WORDS_PER_BRICK`=256 /
+        // index_bits=8's 250w, `RESERVE_PALETTE_WORDS_PER_BRICK`=256 / index_bits=8's max). index_bits=16 bricks
+        // degenerate (D3 `fits` guard), so 256 holds every packable brick — each slot owns its own region.
+        const INDEX_STRIDE: usize = 256;
         const PALETTE_STRIDE: usize = 256;
         let meta_words = max_resident as usize * META_WORDS;
         let index_pool_words = (max_resident as usize * INDEX_STRIDE).max(INDEX_STRIDE);

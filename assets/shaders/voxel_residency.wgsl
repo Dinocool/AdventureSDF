@@ -1464,13 +1464,17 @@ fn pack_build_commands(@builtin(global_invocation_id) gid: vec3<u32>) {
     let index_bits = classify_out[base + 3u];
     // FIXED PER-SLOT SLABS (replaces the shared bump+free-list allocator, which RACED — an alloc could pop a
     // free-list slot mid-write ⇒ two LIVE bricks share one slab offset ⇒ one reads the other's content ⇒ garbage
-    // cubes). Each slot OWNS a unique [slot·stride, (slot+1)·stride) region in BOTH pools, reserved worst-case-
-    // per-slot (incremental.rs RESERVE_INDEX_WORDS_PER_BRICK / RESERVE_PALETTE_WORDS_PER_BRICK = the strides). So
-    // two bricks can NEVER alias a slab — the race is gone by construction. The ONE case a fixed slot can't hold
-    // is an `index_bits=16` brick (>256-entry palette > the 256-word palette stride): treat it as BURIED (degenerate
-    // AABB, no pool write) rather than overflow into the next slot — real `index_bits ≤ 8` scenes never hit this.
-    let palette_fits = index_bits != 16u;
-    let buried = (is_uniform != 0u) || (has_air == 0u) || (!palette_fits);
+    // cubes). Each slot OWNS a unique [slot·stride, (slot+1)·stride) region in BOTH pools (strides =
+    // incremental.rs RESERVE_INDEX_WORDS_PER_BRICK / RESERVE_PALETTE_WORDS_PER_BRICK), so two bricks can NEVER
+    // alias — the race is gone by construction.
+    // FITS GUARD (robust at ANY stride): a dense brick must fit BOTH its slabs — the index stream
+    // (ceil(1000·bits/32) words) ≤ the index stride, AND the palette (≤ the palette stride; index_bits=16 ⇒ a
+    // >256-entry palette > the 256-word stride). Either overflow ⇒ treat as BURIED (degenerate AABB, no pool
+    // write) rather than spilling into the next slot. index_bits ≤ 8 (≤ 250 index words, ≤ 256 palette) fits the
+    // 256/256 strides; only index_bits=16 ever degenerates — so real ≤8-bit scenes lose nothing.
+    let index_words = (1000u * index_bits + 31u) / 32u; // ceil(1000·bits/32); 1000 = 10³ haloed grid (pack SSOT)
+    let fits = (index_bits != 16u) && (index_words <= pack_cfg.index_stride);
+    let buried = (is_uniform != 0u) || (has_air == 0u) || (!fits);
     let span = brick_span_d(lod);
     let world_min = vec3<f32>(f32(coord.x) * span, f32(coord.y) * span, f32(coord.z) * span);
 
@@ -1481,9 +1485,9 @@ fn pack_build_commands(@builtin(global_invocation_id) gid: vec3<u32>) {
     aabb_commands[a] = AabbCommandD(slot, lod, aabb_flag, 0u, world_min.x, world_min.y, world_min.z, 0u);
     atomicMax(&aabb_dispatch[0], (a + 1u + 63u) / 64u);
 
-    if (is_uniform != 0u || !palette_fits) {
-        // UNIFORM (or a non-fitting index_bits=16 brick degraded to empty) — GPU-write the meta straight; the slot
-        // holds no dense pool data (fixed per-slot ⇒ no slab to free, nothing to track).
+    if (is_uniform != 0u || !fits) {
+        // UNIFORM (or a non-fitting brick degraded to empty) — GPU-write the meta straight; the slot holds no
+        // dense pool data (fixed per-slot ⇒ no slab to free, nothing to track).
         let ublock = select(0u, classify_out[base + 1u], is_uniform != 0u); // !fits ⇒ uniform-AIR (empty, degenerate)
         write_uniform_meta(slot, coord, lod, ublock);
         return;

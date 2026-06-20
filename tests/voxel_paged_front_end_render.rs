@@ -114,13 +114,13 @@ fn make_pool(device: &wgpu::Device, max_resident: u32) -> Pool {
         usage,
         mapped_at_creation: false,
     });
-    // Mirror the PRODUCTION pool reserves (incremental.rs `RESERVE_INDEX_WORDS_PER_BRICK`=512 worst-case index_bits=16
-    // = 500w, `RESERVE_PALETTE_WORDS_PER_BRICK`=256 worst-case index_bits=8). The uniform-scene gates never approach
-    // these (index_bits=0), but a rich index_bits=8 brick needs 250 index + ≤256 palette words — under the OLD 192/16
-    // sizes BOTH pools overflowed (the corruption this gate reproduces). Keep them = the app so the test pool is faithful.
+    // Mirror the PRODUCTION pool reserves (incremental.rs `RESERVE_INDEX_WORDS_PER_BRICK`=256 / index_bits=8's 250w,
+    // `RESERVE_PALETTE_WORDS_PER_BRICK`=256 / index_bits=8's max). index_bits=16 bricks degenerate (D3 `fits` guard),
+    // so 256 holds every packable brick. A rich index_bits=8 brick needs 250 index + ≤256 palette words — under the
+    // OLD 192/16 sizes BOTH pools overflowed (the corruption this gate reproduces). Keep them = the app so faithful.
     let voxel = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("pool_voxel"),
-        size: ((max_resident as usize * 512).max(512) as u64) * 4,
+        size: ((max_resident as usize * 256).max(256) as u64) * 4,
         usage,
         mapped_at_creation: false,
     });
