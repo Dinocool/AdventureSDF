@@ -841,17 +841,19 @@ impl GpuResidencyFrontEnd {
         compute(enc, &self.p_b0, bg_b0, params.total_cells.div_ceil(RES_WG).max(1));
         // shell_dispatch [n,1,1] → 2D [x,y,1] (size-agnostic past the 65535 workgroup-per-dim cap).
         compute(enc, &self.p_fin_shell, bg, 1);
-        // Pass C — drop-mark, drop-apply (no readback). `present_contains` computes desired membership directly,
-        // so drop scans only the slot_table — enumeration-independent.
-        compute(enc, &self.p_mark, bg, self.slot_table_size.div_ceil(RES_WG).max(1));
-        compute(enc, &self.p_apply, bg, self.slot_table_size.div_ceil(RES_WG).max(1));
-        // ENTER (FUSED — no candidate_list, so the view is bounded by the surface-CELL count, not a per-frame
-        // candidate cap; 8 GB-friendly). Two enumerate passes over the SAME shell cells (INDIRECT over
-        // shell_dispatch): Pass A bins every non-resident surface brick into the GLOBAL enter_hist (cleared by
-        // p_clear); enter_cap_compute derives the nearest-`room` cut bucket; Pass B re-enumerates + enters each
-        // surface brick the cut admits — correct by construction (no nearest brick dropped for list capacity).
+        // BUDGET cut FIRST (Phase 4): Pass A bins EVERY desired surface brick (resident + non-resident) into the
+        // GLOBAL enter_hist (cleared by p_clear); enter_cap_compute derives the nearest-`max_resident` cut radius.
+        // Must precede drop/enter — both read the cut: drop EVICTS resident bricks beyond it, enter ADMITS
+        // non-resident below it. (FUSED — no candidate_list, so the view is bounded by the surface-CELL count.)
         record_indirect(enc, &self.p_enum_hist, bg, &self.shell_dispatch);
         compute(enc, &self.p_cap_compute, bg, 1);
+        // Pass C — drop-mark, drop-apply (no readback): drops left-clipmap bricks (keep-old-until-revealed) AND
+        // evicts desired bricks beyond the budget cut. Scans only the slot_table (enumeration-independent).
+        // Freed slots go to quarantine (released next frame) so the evict→enter handoff is 1-frame-lagged.
+        compute(enc, &self.p_mark, bg, self.slot_table_size.div_ceil(RES_WG).max(1));
+        compute(enc, &self.p_apply, bg, self.slot_table_size.div_ceil(RES_WG).max(1));
+        // ENTER (FUSED Pass B): re-enumerate; enter each non-resident surface brick the cut admits — correct by
+        // construction (no nearest brick dropped for list capacity).
         record_indirect(enc, &self.p_enum_enter, bg, &self.shell_dispatch);
         // publish change_count (= enter + drop).
         compute(enc, &self.p_chg, bg, 1);

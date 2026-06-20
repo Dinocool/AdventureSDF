@@ -883,9 +883,12 @@ fn enter_cap_histogram(@builtin(global_invocation_id) gid: vec3<u32>) {
 // static camera converges. Mirror of `surface_candidates.select_nth_unstable_by(room, dist)` (streaming.rs:798).
 @compute @workgroup_size(1)
 fn enter_cap_compute() {
-    let head = atomicLoad(&free_ctrl[0]);
-    let tail = atomicLoad(&free_ctrl[1]);
-    let room = select(0u, tail - head, tail > head);
+    // BUDGET (Phase 4): the cut is the nearest-`max_resident` radius over the WHOLE desired set (the histogram now
+    // counts resident + non-resident). `room` = the pool BUDGET (max_resident), NOT free slots — so the cut both
+    // admits non-resident bricks below it (ENTER) and marks resident bricks beyond it for EVICTION
+    // (`diff_drop_mark`). When desired <= max_resident the loop never exceeds room ⇒ cut = no-cut ⇒ enter all,
+    // evict none (behaviour-identical to pre-Phase-4).
+    let room = diff_cfg.max_resident;
     var acc = 0u;
     var cut = HIST_BUCKETS; // default: no cut (all candidates fit)
     for (var b = 0u; b < HIST_BUCKETS; b = b + 1u) {
@@ -985,9 +988,11 @@ fn enumerate_histogram(
     if (!b.valid) {
         return;
     }
-    if (is_resident(b.coord, b.lod)) {
-        return; // resident candidates never enter + never count against `room` (mirror of the CPU exclude)
-    }
+    // BUDGET histogram (Phase 4): bin EVERY desired surface brick — resident AND non-resident — by distance. The
+    // cut (`enter_cap_compute`, room = max_resident) is then the nearest-`max_resident` radius over the WHOLE
+    // desired set, so it governs BOTH which non-resident bricks ENTER (below cut) and which resident bricks EVICT
+    // (beyond cut, `diff_drop_mark`). Counting only non-resident (the pre-Phase-4 behaviour) would size the cut to
+    // free slots, never evicting — so a full pool + camera motion left near holes.
     atomicAdd(&enter_hist[dist_bucket(cand_world_dist(b.coord, b.lod))], 1u);
 }
 
@@ -1042,7 +1047,16 @@ fn diff_drop_mark(@builtin(global_invocation_id) gid: vec3<u32>) {
     // brick still has an AIR neighbour beyond the +1 occupancy pad ⇒ stays `classify_surface` ⇒ kept, so this never
     // holes the loaded-region boundary. (`safe_to_drop` still gates the removal — keep-old-until-revealed.)
     if (present_contains(coord, lod) && classify_surface(coord, lod)) {
-        return; // still a desired surface candidate — keep
+        // Still a desired surface candidate. BUDGET EVICTION (Phase 4): if it is BEYOND the nearest-`max_resident`
+        // cut radius, evict it to make room for nearer bricks (distance-priority, deterministic ⇒ converges; it
+        // re-enters when the camera approaches). The clipmap shells are distance-ordered, so the kept set is the
+        // nearest budget-radius — the near region is fully covered; only the far edge is bounded (unloaded beyond,
+        // not a hole). No `safe_to_drop` gate: this is a budget radius, not a LOD transition with a replacement.
+        if (dist_bucket(cand_world_dist(coord, lod)) < enter_cap[0]) {
+            return; // within the budget cut — keep
+        }
+        drop_decision[slot_idx] = 1u; // beyond budget — evict
+        return;
     }
     if (!safe_to_drop(coord, lod)) {
         return; // keep-old-until-revealed: its replacement is not resident yet

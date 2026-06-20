@@ -315,6 +315,63 @@ fn paged_front_end_drive_renders_like_eager() {
     assert!(live_metas > 0, "paged pool has zero live metas (blank)");
 }
 
+/// **Phase 4 BUDGET EVICTION.** When the desired surface set EXCEEDS `max_resident`, the front end must keep the
+/// NEAREST `max_resident` bricks and EVICT the rest (distance-priority) — bounding VRAM at any view/scene size.
+/// Drives the in-RAM eager path (the front-end diff is what evicts) at a budget far below the scene's surface,
+/// and asserts: (1) resident NEVER exceeds the budget, (2) eviction actually happened (resident < the full
+/// desired set), (3) the resident set is a valid SUBSET of the desired, (4) it converges (no thrash), and
+/// (5) it ADAPTS to camera motion (the resident set shifts, still bounded — no leak/thrash).
+#[test]
+fn paged_front_end_budget_eviction_keeps_nearest() {
+    let Some((device, queue)) = common::headless_compute_device_with_storage(512, 48) else {
+        eprintln!("[skip] no GPU adapter — budget eviction gate skipped");
+        return;
+    };
+    let map = scene();
+    let reg = registry();
+    let static_src = StaticVoxSource::new(&map);
+    let occ_bufs = SectorOccupancy::from_occupied_full(static_src.occupied_keys_full()).upload(&device);
+    let core_bufs = BrickCoreStore::from_cores(
+        static_src.occupied_keys().map(|(c, l)| (c, l, eager_core(&static_src, &reg, c, l))),
+    )
+    .upload(&device);
+    let clip_half = 8i32;
+    let span0 = brick_span(0);
+    let cam = [0.5 * span0, 1.5 * span0, 0.5 * span0];
+
+    // The FULL desired set (huge budget = no eviction) — the reference the eviction must stay a subset of.
+    let full = {
+        let pool = make_pool(&device, 16384);
+        let mut fe = GpuResidencyFrontEnd::new(&device, clip_half, 16384);
+        fe.rebind_pool(&device, &queue, &occ_bufs, &core_bufs, &pool.meta, &pool.voxel, &pool.palette, &pool.aabb);
+        drive_to_convergence(&mut fe, &device, &queue, cam, "full-budget");
+        live_brick_set(&device, &queue, &pool)
+    };
+    let budget = 64u32;
+    assert!(
+        full.len() > budget as usize,
+        "scene must exceed the budget to exercise eviction (full desired = {}, budget = {budget})",
+        full.len()
+    );
+
+    // TINY budget — eviction must keep the nearest `budget`.
+    let pool = make_pool(&device, budget);
+    let mut fe = GpuResidencyFrontEnd::new(&device, clip_half, budget);
+    fe.rebind_pool(&device, &queue, &occ_bufs, &core_bufs, &pool.meta, &pool.voxel, &pool.palette, &pool.aabb);
+    drive_to_convergence(&mut fe, &device, &queue, cam, "budget-cold");
+    let set = live_brick_set(&device, &queue, &pool);
+    assert!(set.len() <= budget as usize, "resident {} EXCEEDED the budget {budget}", set.len());
+    assert!(set.len() < full.len(), "no eviction happened (resident {} == full {})", set.len(), full.len());
+    assert!(set.is_subset(&full), "the evicted resident set must be a SUBSET of the desired set");
+
+    // Camera move → re-converge, still bounded, and the set SHIFTS (eviction adapts; no leak/thrash).
+    let cam2 = [4.5 * span0, 1.5 * span0, 4.5 * span0];
+    drive_to_convergence(&mut fe, &device, &queue, cam2, "budget-moved");
+    let set2 = live_brick_set(&device, &queue, &pool);
+    assert!(set2.len() <= budget as usize, "resident {} EXCEEDED the budget {budget} after move", set2.len());
+    assert!(set2 != set, "eviction did not adapt to camera motion (resident set unchanged)");
+}
+
 /// **MULTI-ASSET paged drive (the gallery reproduction).** Two copies of the scene placed at DIFFERENT +X
 /// offsets in one `MergedSource` (exactly the gallery's per-asset offset layout the single-asset gate never
 /// exercises). Drive the REAL front end over the REAL pager with the camera AT THE FAR asset, then assert the
