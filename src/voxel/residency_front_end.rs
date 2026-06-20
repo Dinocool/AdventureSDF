@@ -259,12 +259,13 @@ pub struct GpuResidencyFrontEnd {
     p_release: wgpu::ComputePipeline,
     p_clear: wgpu::ComputePipeline,
     p_b0: wgpu::ComputePipeline,
-    p_b: wgpu::ComputePipeline,
     p_mark: wgpu::ComputePipeline,
     p_apply: wgpu::ComputePipeline,
-    p_cap_hist: wgpu::ComputePipeline,
     p_cap_compute: wgpu::ComputePipeline,
-    p_enter: wgpu::ComputePipeline,
+    /// FUSED enter side (live): enumerate surface bricks → global histogram (Pass A) / enter below cut (Pass B).
+    /// No candidate_list — the view is bounded by the surface-cell count, not a per-frame candidate cap.
+    p_enum_hist: wgpu::ComputePipeline,
+    p_enum_enter: wgpu::ComputePipeline,
     p_chg: wgpu::ComputePipeline,
     p_d_dirty: wgpu::ComputePipeline,
     p_d_nbr: wgpu::ComputePipeline,
@@ -470,12 +471,11 @@ impl GpuResidencyFrontEnd {
         let p_release = mk_res("diff_release_quarantine");
         let p_clear = mk_res("clear_per_frame_hashes");
         let p_b0 = mk_res("prepare_shell_dispatch");
-        let p_b = mk_res("enumerate_shells");
         let p_mark = mk_res("diff_drop_mark");
         let p_apply = mk_res("diff_drop_apply");
-        let p_cap_hist = mk_res("enter_cap_histogram");
         let p_cap_compute = mk_res("enter_cap_compute");
-        let p_enter = mk_res("diff_enter_scan");
+        let p_enum_hist = mk_res("enumerate_histogram");
+        let p_enum_enter = mk_res("enumerate_enter");
         let p_chg = mk_res("write_change_count");
         let p_d_dirty = mk_res("pack_build_dirty");
         let p_d_nbr = mk_res("pack_build_neighbours");
@@ -607,12 +607,11 @@ impl GpuResidencyFrontEnd {
             p_release,
             p_clear,
             p_b0,
-            p_b,
             p_mark,
             p_apply,
-            p_cap_hist,
             p_cap_compute,
-            p_enter,
+            p_enum_hist,
+            p_enum_enter,
             p_chg,
             p_d_dirty,
             p_d_nbr,
@@ -700,16 +699,18 @@ impl GpuResidencyFrontEnd {
         self.bound = None;
     }
 
-    /// Would driving `cam` this frame OVERFLOW the transient list/dispatch capacity (the shell WG-cell union >
-    /// `LIST_CAP`, or a per-frame dispatch > the 65535-workgroup 1D limit)? The caller skips the GPU drive (CPU
-    /// fallback) when true, so an over-wide clip_half / over-large scene never submits an invalid dispatch. (For
-    /// the in-RAM scenes the front end binds today this never trips; it is the guard for the future streamed path.)
+    /// Would driving `cam` this frame exceed the ONE remaining hard dispatch limit — Pass B0
+    /// (`prepare_shell_dispatch`) at @workgroup_size(256) over `total_cells` exceeding the 65535-workgroup 1D cap
+    /// (i.e. `total_cells > ~16.7M` RAW shell cells)? The caller skips the GPU drive when true.
+    ///
+    /// NOTE: the old `total_cells > LIST_CAP` bail is GONE — the enter side is now candidate-list-free (the fused
+    /// `enumerate_histogram`/`enumerate_enter` consume surface bricks on the fly), so a far view / large scene is
+    /// bounded by the SURFACE-CELL count (`shell_wg_indices`, OOB-guarded + clamped in `prepare_shell_dispatch`),
+    /// not a per-frame candidate cap. A view with ≤ `shell_wg_indices` solid cells renders the nearest pool-worth;
+    /// only an enormous (> the solid-cell buffer, or > 16.7M raw cells) view is skipped. (`docs/DYNAMIC_LARGE_SCENE_PLAN.md` Phase 2b.)
     pub fn would_overflow(&self, cam: [f32; 3]) -> bool {
         let params = build_params(cam, self.half);
-        // Pass B0 (`prepare_shell_dispatch`) runs at @workgroup_size(256); its 1D dispatch must stay within the
-        // 65535-workgroup limit (the LIST_CAP guard below keeps total_cells well under that, so this is defensive).
-        let b0_wgs = params.total_cells.div_ceil(256);
-        params.total_cells as usize > LIST_CAP || b0_wgs > 65535
+        params.total_cells.div_ceil(256) > 65535
     }
 
     /// Whether the front end currently has a scene bound (occupancy + core + pool).
@@ -840,18 +841,18 @@ impl GpuResidencyFrontEnd {
         compute(enc, &self.p_b0, bg_b0, params.total_cells.div_ceil(RES_WG).max(1));
         // shell_dispatch [n,1,1] → 2D [x,y,1] (size-agnostic past the 65535 workgroup-per-dim cap).
         compute(enc, &self.p_fin_shell, bg, 1);
-        // Pass B — enumerate (INDIRECT over the GPU-written shell_dispatch).
-        record_indirect(enc, &self.p_b, bg, &self.shell_dispatch);
-        // Pass C — drop-mark, drop-apply, enter (sized over the LIST CAP / slot-table, no readback). The old
-        // present-flag build pass is gone: `present_contains` computes desired membership directly (drop is
-        // enumeration-independent), so no per-frame desired hash is built.
+        // Pass C — drop-mark, drop-apply (no readback). `present_contains` computes desired membership directly,
+        // so drop scans only the slot_table — enumeration-independent.
         compute(enc, &self.p_mark, bg, self.slot_table_size.div_ceil(RES_WG).max(1));
         compute(enc, &self.p_apply, bg, self.slot_table_size.div_ceil(RES_WG).max(1));
-        // Enter-cap (BUG-2 nearest-priority): build the candidate distance histogram, compute the cut bucket from
-        // the live pool room, THEN enter only the nearest-`room` candidates (≤ pool cap, stable ⇒ converges).
-        compute(enc, &self.p_cap_hist, bg, list_wgs);
+        // ENTER (FUSED — no candidate_list, so the view is bounded by the surface-CELL count, not a per-frame
+        // candidate cap; 8 GB-friendly). Two enumerate passes over the SAME shell cells (INDIRECT over
+        // shell_dispatch): Pass A bins every non-resident surface brick into the GLOBAL enter_hist (cleared by
+        // p_clear); enter_cap_compute derives the nearest-`room` cut bucket; Pass B re-enumerates + enters each
+        // surface brick the cut admits — correct by construction (no nearest brick dropped for list capacity).
+        record_indirect(enc, &self.p_enum_hist, bg, &self.shell_dispatch);
         compute(enc, &self.p_cap_compute, bg, 1);
-        compute(enc, &self.p_enter, bg, list_wgs);
+        record_indirect(enc, &self.p_enum_enter, bg, &self.shell_dispatch);
         // publish change_count (= enter + drop).
         compute(enc, &self.p_chg, bg, 1);
         // Pass D — dirty build, drops, neighbours, then classify/pack/write_aabb INDIRECT (the self-gating tail).

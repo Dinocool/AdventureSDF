@@ -409,6 +409,13 @@ fn prepare_shell_dispatch(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
 
     let slot = atomicAdd(&shell_count, 1u);
+    // CAPACITY GUARD: the solid-cell list is the only view-distance bound now (the enter side is candidate-list-
+    // free). A view whose surface exceeds the buffer (> ~1M solid cells = an enormous surface) clamps here rather
+    // than writing OOB; `finalize_shell_dispatch_2d` clamps the dispatch to the same bound. (shell_count still
+    // counts the attempts — a future windowed enumerate can use it to detect + page the overflow.)
+    if (slot >= arrayLength(&shell_wg_indices)) {
+        return;
+    }
     shell_wg_indices[slot] = idx;
     // 1D dispatch dim = #solid cells (one workgroup per cell). VALID as-is when #cells <= 65535;
     // `finalize_shell_dispatch_2d` (live path) then UPGRADES this to a 2D [x, y, 1] grid so the indirect
@@ -436,21 +443,28 @@ fn prepare_shell_dispatch(@builtin(global_invocation_id) gid: vec3<u32>) {
 @group(0) @binding(10) var<storage, read_write> desired_count: atomic<u32>;
 @group(0) @binding(11) var<storage, read_write> desired_list: array<vec4<i32>>; // (x, y, z, lod) — occupied-in-shell
 
-@compute @workgroup_size(512)
-fn enumerate_shells(
-    @builtin(workgroup_id) wid: vec3<u32>,
-    @builtin(local_invocation_index) lidx: u32,
-) {
-    // 2D grid (size-agnostic): wg = wid.x + wid.y·65535 (mirror of pack_brick). When shell_count <= 65535 the
-    // dispatch is [n,1,1] ⇒ wid.y == 0 ⇒ wg == wid.x; above it the stride is 65535 and the count guard below
-    // skips the partial last row.
+// The SURFACE-BRICK SELECTOR shared by the enumerate entry points: decode the 8³ cell `wg` owns, the brick this
+// invocation `lidx` owns within it, and return it IFF it is a RESIDENT-TARGET surface brick (`level_resident ∩
+// is_occupied ∩ classify_surface` — the clipmap shell, occupied, with an exposed face). `valid == false` for an
+// out-of-range workgroup / interior / air brick. SSOT so `enumerate_shells` (the parity-test list emit) and the
+// FUSED `enumerate_histogram`/`enumerate_enter` (the live path — no `candidate_list`, so the enter side is
+// bounded by the SURFACE-CELL count, not a per-frame candidate cap) can never disagree on the surface set.
+struct EnumBrick { valid: bool, coord: vec3<i32>, lod: u32 }
+
+fn surface_brick(wid: vec3<u32>, lidx: u32) -> EnumBrick {
+    var r: EnumBrick;
+    r.valid = false;
+    r.coord = vec3<i32>(0, 0, 0);
+    r.lod = 0u;
+    // 2D grid (size-agnostic): wg = wid.x + wid.y·65535. When shell_count <= 65535 the dispatch is [n,1,1] ⇒
+    // wid.y == 0 ⇒ wg == wid.x; above it the stride is 65535 and the count guard skips the partial last row.
     let wg = wid.x + wid.y * 65535u;
     if (wg >= atomicLoad(&shell_count)) {
-        return;
+        return r;
     }
     let key = decode_cell(shell_wg_indices[wg]);
     if (!key.valid) {
-        return;
+        return r;
     }
     // The brick within the 8³ cell this invocation owns (X fastest, then Y, then Z).
     let lx = i32(lidx % 8u);
@@ -458,23 +472,35 @@ fn enumerate_shells(
     let lz = i32(lidx / 64u);
     let coord = key.cell + vec3<i32>(lx, ly, lz);
     let lod = key.lod;
-    let half = params.clip_half_bricks;
-
-    if (!level_resident(coord, lod, half)) {
-        return;
+    if (!level_resident(coord, lod, params.clip_half_bricks)) {
+        return r;
     }
-    // Desired-set membership (occupied-in-shell) is no longer MATERIALIZED into a list — `present_contains` now
-    // computes `level_resident ∩ is_occupied` directly (so drop is enumeration-independent). The `is_occupied`
-    // gate stays: it (with `classify_surface`) selects the RESIDENT-TARGET candidates emitted below.
+    // `is_occupied` (with `classify_surface`'s 6-face cull) selects the RESIDENT-TARGET surface set. (Desired-set
+    // membership is no longer materialized into a list — `present_contains` computes it directly, so drop is
+    // enumeration-independent.)
     if (!is_occupied(coord, lod)) {
-        return;
+        return r;
     }
-    // RESIDENT-TARGET set: also passes the 6-face occlusion cull ⇒ a surface brick.
     if (!classify_surface(coord, lod)) {
+        return r;
+    }
+    r.valid = true;
+    r.coord = coord;
+    r.lod = lod;
+    return r;
+}
+
+@compute @workgroup_size(512)
+fn enumerate_shells(
+    @builtin(workgroup_id) wid: vec3<u32>,
+    @builtin(local_invocation_index) lidx: u32,
+) {
+    let b = surface_brick(wid, lidx);
+    if (!b.valid) {
         return;
     }
     let slot = atomicAdd(&candidate_count, 1u);
-    candidate_list[slot] = vec4<i32>(coord.x, coord.y, coord.z, i32(lod));
+    candidate_list[slot] = vec4<i32>(b.coord.x, b.coord.y, b.coord.z, i32(b.lod));
 }
 
 // =====================================================================================================
@@ -874,35 +900,18 @@ fn enter_cap_compute() {
     enter_cap[1] = room;
 }
 
-// **Pass C1 — enter scan.** One invocation per candidate (the surface resident-target set). If `slot_table[key]`
-// is absent AND its distance bucket is within the cut (BUG-2 nearest cap), claim a free slot (atomic pop the
-// free-list ring), insert the key→slot into the slot table, and atomic-append to `enter_list` (+ `enter_count`).
-// Mirrors design §1 Pass C1 + `ResidencyManager::update`'s "enqueue desired-but-not-resident" +
-// `SlotAllocator::claim` (incremental.rs:595) + the nearest-`room` cap (streaming.rs:783-806).
-@compute @workgroup_size(256)
-fn diff_enter_scan(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let i = gid.x;
-    if (i >= atomicLoad(&candidate_count)) {
-        return;
-    }
-    let k = candidate_list[i];
-    let coord = vec3<i32>(k.x, k.y, k.z);
-    let lod = u32(k.w);
-    if (is_resident(coord, lod)) {
-        return; // already resident — no change
-    }
-    // NEAREST-priority cap: skip candidates at/after the cut bucket (the farthest, beyond `room`) — keeps the
-    // nearest `room`, deterministic + stable ⇒ converges. (cut == HIST_BUCKETS ⇒ everything fits, no cap.)
-    if (dist_bucket(cand_world_dist(coord, lod)) >= enter_cap[0]) {
-        return;
-    }
+// ENTER a verified-absent, within-cut `(coord, lod)`: claim a free slot (atomic pop the free-list ring), insert
+// the key→slot into the slot table, and atomic-append to `enter_list` (+ `enter_count`). SSOT shared by the
+// candidate-list `diff_enter_scan` (parity test) and the fused live `enumerate_enter`. Mirrors
+// `SlotAllocator::claim` (incremental.rs:595).
+fn try_enter(coord: vec3<i32>, lod: u32) {
     // Claim a free slot: atomically advance the free-list head ring index, read the slot id at that index.
     let cap = diff_cfg.max_resident;
     let head = atomicAdd(&free_ctrl[0], 1u);
     let tail = atomicLoad(&free_ctrl[1]);
     if (head >= tail) {
-        // Out of slots (would exceed `max_resident`) — undo the claim and skip (the CPU cap drops farthest; here
-        // the test sizes the ring to fit the whole resident set, so this never triggers).
+        // Out of slots (would exceed `max_resident`) — undo the claim and skip. With the nearest-cut cap the total
+        // admitted is <= `room` (= free slots), so this is the belt-and-braces guard, not the common path.
         atomicSub(&free_ctrl[0], 1u);
         return;
     }
@@ -913,9 +922,9 @@ fn diff_enter_scan(@builtin(global_invocation_id) gid: vec3<u32>) {
     var t = hash_key(coord, lod) & mask;
     for (var p = 0u; p < size; p = p + 1u) {
         let base = t * SLOT_WORDS;
-        // Claim the first EMPTY **or TOMBSTONE** slot on the probe chain (the key is verified absent above, so this
-        // never duplicates — and reusing tombstones keeps them from accumulating unbounded under churn, mirror of the
-        // reference `PagedBrickCoreStore::insert_slot`). Try EMPTY first; if the slot is a tombstone, claim that.
+        // Claim the first EMPTY **or TOMBSTONE** slot on the probe chain (the key is verified absent by the caller,
+        // so this never duplicates — and reusing tombstones keeps them from accumulating unbounded under churn,
+        // mirror of `PagedBrickCoreStore::insert_slot`). Try EMPTY first; if the slot is a tombstone, claim that.
         let prev = atomicCompareExchangeWeak(&slot_table[base + 3u], EMPTY_LOD, lod);
         var claimed = prev.exchanged;
         if (!claimed && prev.old_value == TOMBSTONE_LOD) {
@@ -931,6 +940,68 @@ fn diff_enter_scan(@builtin(global_invocation_id) gid: vec3<u32>) {
             return;
         }
         t = (t + 1u) & mask;
+    }
+}
+
+// True iff `(coord, lod)` may enter THIS frame: non-resident AND within the nearest-`room` cut bucket (BUG-2
+// nearest-priority cap; cut == HIST_BUCKETS ⇒ everything fits). SSOT for both enter paths.
+fn enter_admits(coord: vec3<i32>, lod: u32) -> bool {
+    if (is_resident(coord, lod)) {
+        return false;
+    }
+    return dist_bucket(cand_world_dist(coord, lod)) < enter_cap[0];
+}
+
+// **Pass C1 — enter scan (candidate-list variant, parity test).** One invocation per candidate; the live path
+// uses the fused `enumerate_enter` (no candidate_list).
+@compute @workgroup_size(256)
+fn diff_enter_scan(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    if (i >= atomicLoad(&candidate_count)) {
+        return;
+    }
+    let k = candidate_list[i];
+    let coord = vec3<i32>(k.x, k.y, k.z);
+    let lod = u32(k.w);
+    if (enter_admits(coord, lod)) {
+        try_enter(coord, lod);
+    }
+}
+
+// **FUSED enter side (the LIVE path) — no candidate_list, so the view/scene is bounded by the SURFACE-CELL count
+// (shell_wg_indices), not a per-frame candidate cap.** Two enumerate passes over the SAME `shell_wg_indices`,
+// consuming each surface brick on the fly:
+//   * `enumerate_histogram` (Pass A): bin every non-resident surface brick by distance into the GLOBAL
+//     `enter_hist` (cleared once per frame). The histogram is COMPLETE regardless of candidate count.
+//   * `enter_cap_compute` then derives the cut bucket (nearest `room`).
+//   * `enumerate_enter` (Pass B): re-enumerate; ENTER each surface brick the cut admits. Correct by construction —
+//     no nearest brick is ever dropped for lack of list capacity (contrast a near-first+clamp heuristic).
+@compute @workgroup_size(512)
+fn enumerate_histogram(
+    @builtin(workgroup_id) wid: vec3<u32>,
+    @builtin(local_invocation_index) lidx: u32,
+) {
+    let b = surface_brick(wid, lidx);
+    if (!b.valid) {
+        return;
+    }
+    if (is_resident(b.coord, b.lod)) {
+        return; // resident candidates never enter + never count against `room` (mirror of the CPU exclude)
+    }
+    atomicAdd(&enter_hist[dist_bucket(cand_world_dist(b.coord, b.lod))], 1u);
+}
+
+@compute @workgroup_size(512)
+fn enumerate_enter(
+    @builtin(workgroup_id) wid: vec3<u32>,
+    @builtin(local_invocation_index) lidx: u32,
+) {
+    let b = surface_brick(wid, lidx);
+    if (!b.valid) {
+        return;
+    }
+    if (enter_admits(b.coord, b.lod)) {
+        try_enter(b.coord, b.lod);
     }
 }
 
@@ -1437,7 +1508,9 @@ fn pack_build_commands(@builtin(global_invocation_id) gid: vec3<u32>) {
 // `cmd_idx = wg.x + wg.y*65535`. Run (1 invocation) AFTER the count is final, BEFORE the indirect dispatch.
 @compute @workgroup_size(1)
 fn finalize_shell_dispatch_2d() {
-    let n = atomicLoad(&shell_count);
+    // Clamp to the solid-cell buffer capacity (the append guard drops cells past it) so the dispatch never covers
+    // an unwritten slot, then fold to a 2D [x, y, 1] grid (size-agnostic past the 65535 workgroup-per-dim cap).
+    let n = min(atomicLoad(&shell_count), arrayLength(&shell_wg_indices));
     atomicStore(&shell_dispatch[0u], select(n, 65535u, n > 65535u));
     atomicStore(&shell_dispatch[1u], (n + 65534u) / 65535u);
     atomicStore(&shell_dispatch[2u], 1u);
