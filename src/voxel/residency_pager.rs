@@ -250,7 +250,7 @@ impl StreamedResidencyPager {
         let (desired_cores, key_asset) = self.collect_surface_halo_keys(&occ);
         {
             let Self { core_store, source, decoded, .. } = &mut *self;
-            core_store.sync_to_keys(queue, &desired_cores, |world, lod| {
+            core_store.sync_to_keys(queue, &desired_cores, cam, |world, lod| {
                 let ai = *key_asset.get(&(world, lod))?;
                 let asset = &source.placed_assets()[ai];
                 let rc = asset.source.region_of_world(lod, world);

@@ -914,7 +914,8 @@ impl PagedBrickCoreStore {
         queue: &wgpu::Queue,
         desired: &rustc_hash::FxHashMap<(IVec3, u32), [u32; CORE_WORDS]>,
     ) {
-        self.sync_to_keys(queue, &desired.keys().copied().collect(), |c, l| desired.get(&(c, l)).copied());
+        // `desired.len() <= core_cap` (all fit), so the nearest-first order is immaterial here — pass a neutral cam.
+        self.sync_to_keys(queue, &desired.keys().copied().collect(), [0.0; 3], |c, l| desired.get(&(c, l)).copied());
     }
 
     /// **Phase G "G-c.4-paging" (§8.3)** — INCREMENTAL set-diff sync to a desired KEY set, decoding a new key's
@@ -927,6 +928,7 @@ impl PagedBrickCoreStore {
         &mut self,
         queue: &wgpu::Queue,
         desired: &rustc_hash::FxHashSet<(IVec3, u32)>,
+        cam: [f32; 3],
         mut fetch: impl FnMut(IVec3, u32) -> Option<[u32; CORE_WORDS]>,
     ) {
         // Evict the resident keys no longer desired.
@@ -935,11 +937,20 @@ impl PagedBrickCoreStore {
             self.refcount.insert((coord, lod), 1); // set-diff mode: each key held once
             self.evict_brick(queue, coord, lod);
         }
-        // Insert the desired keys not yet resident — decode the core ONLY now (lazy, incremental).
-        for &(coord, lod) in desired {
-            if !self.keys.contains_key(&(coord, lod))
-                && let Some(core) = fetch(coord, lod)
-            {
+        // Insert the desired keys not yet resident — decode the core ONLY now (lazy, incremental). **Phase 4b:
+        // insert NEAREST-FIRST.** When the desired core set EXCEEDS `core_cap` (a budget below the clipmap extent —
+        // 8 GB / small `max_resident`), `insert_brick` drops the overflow at the bounded-buffer ceiling
+        // (`free_cores` empty). Nearest-first ⇒ the store keeps the cores NEAREST the camera — exactly the ones the
+        // front end's nearest-`max_resident` brick cut (Phase 4a) enters — and drops only the FARTHEST, which are
+        // beyond that cut (non-resident), so a resident brick never lacks its core. (Below the budget the order is
+        // immaterial — all fit.)
+        let mut to_insert: Vec<(IVec3, u32)> =
+            desired.iter().filter(|k| !self.keys.contains_key(k)).copied().collect();
+        to_insert.sort_unstable_by(|a, b| {
+            core_dist2(*a, cam).partial_cmp(&core_dist2(*b, cam)).unwrap_or(std::cmp::Ordering::Equal)
+        });
+        for (coord, lod) in to_insert {
+            if let Some(core) = fetch(coord, lod) {
                 let _ = self.insert_brick(queue, coord, lod, &core);
             }
         }
@@ -976,6 +987,18 @@ impl PagedBrickCoreStore {
     pub fn contains(&self, coord: IVec3, lod: u32) -> bool {
         self.find_slot(coord, lod).is_some()
     }
+}
+
+/// Squared world distance from a brick's CENTRE to the camera — the nearest-first key for `sync_to_keys` (Phase
+/// 4b). Brick centre = `(coord + 0.5) · brick_span(lod)`; matches the front end's `cand_world_dist` SSOT so the
+/// pager's kept-core set and the GPU brick cut agree on "nearest" (the F-C coherence invariant).
+fn core_dist2(key: (IVec3, u32), cam: [f32; 3]) -> f32 {
+    let (coord, lod) = key;
+    let span = super::brickmap::brick_span(lod);
+    let dx = (coord.x as f32 + 0.5) * span - cam[0];
+    let dy = (coord.y as f32 + 0.5) * span - cam[1];
+    let dz = (coord.z as f32 + 0.5) * span - cam[2];
+    dx * dx + dy * dy + dz * dz
 }
 
 #[cfg(test)]
