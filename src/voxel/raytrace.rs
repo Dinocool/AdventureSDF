@@ -52,9 +52,7 @@ use super::gpu::{
     GpuAliasEntry, GpuBrickAabb, GpuBrickMeta, GpuBrickPatch, GpuInstanceDescriptor, GpuVoxelLight,
     build_lights_from_entries, pack_brickmap, pack_resident_set,
 };
-use super::incremental::{
-    GpuPackBatch, RepackDelta, ResidentPacker, SnapshotBuffers, degenerate_aabb,
-};
+use super::incremental::{GpuPackBatch, RepackDelta, ResidentPacker, SnapshotBuffers};
 use super::palette::{BlockId, BlockRegistry, CornellBlock};
 use super::source::{BrickSource, StaticVoxSource, WorldgenSource};
 use super::streaming::{BrickKey, ResidencyManager, StreamingConfig, camera_brick_coord, region_half_extent_m};
@@ -928,12 +926,24 @@ fn stream_voxel_rt_residency(
         };
     }
 
+    // ONE GPU RESIDENCY PATH — does the readback-free GPU residency FRONT END own streaming this epoch? It drives
+    // iff `gpu_residency` is on AND a residency store is bound for THIS epoch: an EAGER in-RAM store (Sponza / the
+    // `.vox` Gallery) OR a PAGED store (the streamed `.vxo` Gallery / Bistro — its demand-paged drive is the live
+    // path, no env gate). When it drives, the CPU `ResidencyManager`/`ResidentPacker` do NO per-frame work: the edit
+    // re-queue, the O(resident) classify (`manager.update`), the source drain, and the CPU pack are ALL skipped (the
+    // early-out below, after the source/registry are resolved). The GPU front end is the sole residency authority.
+    // Worldgen has neither store (no eager store, no `.vxo`), so it is always `false` and keeps the CPU path.
+    let eager_store_ready = streaming.gpu_residency.as_ref().is_some_and(|(e, _)| *e == streaming.epoch)
+        && streaming.gpu_core_store.as_ref().is_some_and(|(e, _)| *e == streaming.epoch);
+    let paged_drive_ready = streaming.streamed_vxo.is_some();
+    let front_end_will_drive = toggle.gpu_residency && (eager_store_ready || paged_drive_ready);
+
     // An EDIT (build/destroy) re-queues exactly the affected resident bricks so the change re-sources +
     // re-packs LOCALLY (it ADAPTS — the resident set, GI reservoirs, and world cache all stay; never a full
     // clear, see [[feedback-gi-adapt-not-reset]]). Detected by the delta generation changing since the last
     // pack. Works for EVERY streamed scene through the shared `apply_edit_overlay` in `drain_work_from`.
     let edits_changed = streaming.packed_edit_gen != Some(edits.generation());
-    if edits_changed {
+    if edits_changed && !front_end_will_drive {
         let dirty = affected_resident_keys(&edits);
         // Mark the affected bricks REWRITTEN in the incremental packer too, so the edit re-packs exactly those
         // bricks + their 26-neighbourhood next re-pack (the edit/dig path stays incremental — it ADAPTS, never
@@ -952,22 +962,6 @@ fn stream_voxel_rt_residency(
     // light gather) and the pack below use that registry — never the worldgen one — or the colours would be
     // wrong.
     let scene_now = *scene;
-    // CPU-PACK GATE INPUT — will the readback-free GPU residency FRONT END actually OWN streaming this epoch?
-    // The gate below skips the CPU re-pack ONLY when the front end genuinely drives, so it must mirror exactly the
-    // render-world `drive_gpu_residency_front_end` decision (else the CPU pack is cut off while NOTHING streams —
-    // the partial-load regression, see commit 25f56074). The front end drives this scene iff `gpu_residency` is on
-    // AND it has a residency store bound for THIS epoch:
-    //   * EAGER store — built ONLY for the IN-RAM static scenes (Sponza / the legacy `.vox` Gallery): both
-    //     `gpu_residency` + `gpu_core_store` are `Some` for the current epoch (see the G-c.0/2b build on the switch).
-    //   * PAGED store — the STREAMED `.vxo` path (Sponza / the multi-asset Gallery / Bistro) carries NO eager store;
-    //     its demand-paged drive is the LIVE path (no env gate). When a streamed `.vxo` source exists for this epoch
-    //     the front end drives it, so after the one-time StreamSnapshot the CPU re-pack is skipped (the GPU owns it).
-    // The one-time StreamSnapshot (allocate pool + BLAS topology) still runs on the CPU regardless (gated below on
-    // `epoch_snapshotted`), so the front end always has a pool to write.
-    let eager_store_ready = streaming.gpu_residency.as_ref().is_some_and(|(e, _)| *e == streaming.epoch)
-        && streaming.gpu_core_store.as_ref().is_some_and(|(e, _)| *e == streaming.epoch);
-    let paged_drive_ready = streaming.streamed_vxo.is_some();
-    let front_end_will_drive = toggle.gpu_residency && (eager_store_ready || paged_drive_ready);
     let VoxelRtStreaming {
         manager,
         cfg,
@@ -1017,6 +1011,43 @@ fn stream_voxel_rt_residency(
         _ => (&worldgen_source, registry),
     };
 
+    // ONE GPU RESIDENCY PATH — the GPU front end OWNS residency for this scene, so the CPU `ResidencyManager`/
+    // `ResidentPacker` do ZERO per-frame work: we skip the O(resident) classify (`manager.update` — the
+    // `vox_residency_classify` hitch), the source drain, and the CPU pack entirely. The ONLY CPU step is the
+    // ONE-TIME empty-pool `StreamSnapshot` that ALLOCATES the fixed-cap buffers + BLAS topology the front end
+    // cold-fills (it cannot create the pool itself yet — see `drive_gpu_residency_front_end`). We snapshot the
+    // FRESH (never-packed) packer — pre-sized at construction to `max_resident` (`SlabArena::reserve` +
+    // `SlotAllocator::new`) — so `snapshot_buffers` yields the correctly-sized EMPTY pool BY CONSTRUCTION: every
+    // meta zeroed, every AABB degenerate, the index/palette slabs zeroed, `brick_count = 0`. No `pack_one`, no
+    // resident set. NEE lights are GPU-built each frame (`run_gpu_light_build`) and the `StreamSnapshot` apply
+    // ignores CPU `lights`/`alias`, so we ship none. This is the readback-free residency path; the CPU pack below
+    // is reached ONLY by the non-front-end scenes (worldgen / Cornell via `apply_gpu_pack`).
+    if front_end_will_drive {
+        if !*epoch_snapshotted {
+            let mut buffers = packer
+                .as_mut()
+                .expect("a streamed scene has a packer (built on the scene switch)")
+                .snapshot_buffers(active_registry);
+            // KEEP `brick_count` ≥ 1: `VoxelRtUpload::is_empty()` gates on it and an "empty" upload is SKIPPED by
+            // the render world — which would leave the pool UN-allocated (blank). The content is empty (the front
+            // end cold-fills); this only forces the one-time allocation to happen.
+            buffers.brick_count = buffers.brick_count.max(1);
+            patch_res.upload = VoxelRtUpload::StreamSnapshot { buffers, lights: Vec::new(), alias: Vec::new() };
+            patch_res.generation = patch_res.generation.wrapping_add(1);
+            patch_res.epoch = *epoch;
+            patch_res.has_emitters = active_registry.has_emitters();
+            *epoch_snapshotted = true;
+            debug!(
+                "voxel-RT G-c.4: shipped the EMPTY cold-fill pool for epoch {} (GPU front end drives — CPU residency idle)",
+                *epoch
+            );
+        }
+        // The CPU residency is idle for this scene; keep `last_cam_brick` current so a later toggle-off flip to the
+        // CPU path doesn't think the camera teleported.
+        *last_cam_brick = Some(cam_brick);
+        return;
+    }
+
     // Reconcile only when the camera crosses into a new LOD0 brick (a shell could shift), an edit re-queued
     // bricks, OR there is still pending work to drain. This avoids recomputing the clipmap every idle frame.
     // The per-move enqueue/drop is O(shell) — only the LOD0 face-slab shifts on a small move; coarse shells
@@ -1051,26 +1082,10 @@ fn stream_voxel_rt_residency(
     }
     *worldgen_frames_since_pack = worldgen_frames_since_pack.saturating_add(1);
     let settled = manager.pending() == 0;
-    // CPU-PACK GATE (audit finding / trace-confirmed: `vox_pack_update_gpu` ~3.79 s over 38 calls on a Gallery
-    // load). When the readback-free GPU residency front end DRIVES this scene, the GPU owns residency AND the
-    // pool, so this CPU re-pack would only produce an upload the render world SKIPS (`front_end_active` gates the
-    // apply) — pure wasted work + the streaming spikes. So skip it ONLY once two things hold:
-    //   1. the front end will ACTUALLY drive this scene (`front_end_will_drive`, computed above — mirrors the
-    //      render-world `drive_gpu_residency_front_end` decision: `gpu_residency` on AND an eager OR paged store
-    //      bound for this epoch). For the default streamed `.vxo` Gallery this is FALSE (no eager store + paged
-    //      drive opt-in), so the CPU pack keeps streaming the whole scene in — fixing the partial-load regression.
-    //   2. the epoch's pool is already allocated (`epoch_snapshotted`) — the one-time StreamSnapshot MUST still run
-    //      on the CPU (it allocates the fixed-cap pool + BLAS topology + initial NEE lights the front end writes
-    //      INTO), so `!epoch_snapshotted` always keeps that first pack.
-    // The cheap source drain above still runs (keeps the resident-set mirror warm for stats / a toggle-off flip).
-    // FOLLOW-UP: when the front end DOES drive (eager in-RAM scenes today), NEE lights are built only at the
-    // snapshot; emitters that stream in AFTER the cold-fill won't refresh the light list until front-end light
-    // derivation lands. Fine for those scenes (they cold-fill ~fully).
-    let front_end_drives = front_end_will_drive && *epoch_snapshotted;
-    if *worldgen_dirty_pending
-        && (settled || *worldgen_frames_since_pack >= WORLDGEN_REPACK_INTERVAL)
-        && !front_end_drives
-    {
+    // CPU pack (worldgen / Cornell / a `.vox` scene with the front end toggled off — the front-end-driven scenes
+    // returned above). AMORTIZED: pack only on a SETTLE (queue drained) OR every WORLDGEN_REPACK_INTERVAL frames
+    // during a long stream — never on every dirty drain.
+    if *worldgen_dirty_pending && (settled || *worldgen_frames_since_pack >= WORLDGEN_REPACK_INTERVAL) {
         let _s = info_span!("vox_repack").entered();
         let entries = manager.resident_entries();
         // STORAGE PLAN A1 — the O(changed) GPU upload. `update` re-`pack_one`s ONLY the entered/dropped bricks +
@@ -1120,19 +1135,10 @@ fn stream_voxel_rt_residency(
                         let _rb = info_span!("vox_pack_repopulate_shadow").entered();
                         p.repopulate_last_voxels(&entries);
                     }
-                    let mut buffers = {
+                    let buffers = {
                         let _ss = info_span!("vox_pack_snapshot").entered();
                         p.snapshot_buffers(active_registry)
                     };
-                    // ONE GPU RESIDENCY PATH: when the GPU front end will drive, the snapshot must seed NO content —
-                    // only ALLOCATE the (correctly-sized) empty pool. The front end cold-fills it from the pager via
-                    // the GPU pack (the single path that applies the surface/halo/has_air rules). The CPU `pack_one`
-                    // here packs the WHOLE resident set incl. bricks the front end's `classify_surface` never enters
-                    // (and all-solid stragglers) with LIVE AABBs — those bypass every GPU fix and persist as stuck
-                    // flat/black cubes. Emptying the content (keeping the buffer SIZES) eliminates that CPU seed.
-                    if front_end_will_drive {
-                        empty_snapshot_for_cold_fill(&mut buffers);
-                    }
                     *epoch_snapshotted = true;
                     VoxelRtUpload::StreamSnapshot { buffers, lights, alias }
                 } else if !batch.is_empty() {
@@ -1155,15 +1161,10 @@ fn stream_voxel_rt_residency(
                 // `update`'s allocations and cleared by `snapshot_buffers`.
                 if !*epoch_snapshotted || p.grew() {
                     // First pack of this epoch (or a grow): snapshot the fixed-cap buffers (allocate once / resize).
-                    let mut buffers = {
+                    let buffers = {
                         let _ss = info_span!("vox_pack_snapshot").entered();
                         p.snapshot_buffers(active_registry)
                     };
-                    // ONE GPU RESIDENCY PATH — empty the CPU-packed content when the front end will drive (see the
-                    // gpu_pack arm above): the GPU cold-fill is the only path that may seed the pool.
-                    if front_end_will_drive {
-                        empty_snapshot_for_cold_fill(&mut buffers);
-                    }
                     *epoch_snapshotted = true;
                     VoxelRtUpload::StreamSnapshot { buffers, lights, alias }
                 } else if !delta.is_empty() {
@@ -3623,28 +3624,6 @@ fn prepare_voxel_rt(
     if patch_res.has_emitters {
         run_gpu_light_build(device, render_queue.0.as_ref(), &mut resources, patch_res.epoch);
     }
-}
-
-/// **ONE GPU RESIDENCY PATH** — strip a `StreamSnapshot`'s CPU-packed CONTENT, keeping only the (correctly-sized)
-/// EMPTY pool: every meta zeroed, every AABB degenerate (a BLAS non-candidate), the index/palette arenas zeroed,
-/// `brick_count = 0`. The GPU front end then cold-fills the pool from the pager via the single GPU pack path (which
-/// alone applies the `classify_surface` / halo / `has_air`-degenerate rules). The CPU `pack_one` content this drops
-/// otherwise seeds bricks the front end never re-packs (buried / all-solid stragglers with live AABBs) ⇒ stuck
-/// flat/black cubes — the artifact this removes. The buffer LENGTHS are preserved so the front-end slab arenas fit.
-fn empty_snapshot_for_cold_fill(b: &mut SnapshotBuffers) {
-    for m in &mut b.metas {
-        *m = GpuBrickMeta::zeroed();
-    }
-    for a in &mut b.aabbs {
-        *a = degenerate_aabb();
-    }
-    b.indices.iter_mut().for_each(|w| *w = 0);
-    b.brick_palettes.iter_mut().for_each(|w| *w = 0);
-    // KEEP `brick_count` non-zero: `VoxelRtUpload::is_empty()` gates on it, and an "empty" upload is SKIPPED by the
-    // render world — which would leave the pool UN-allocated (blank). The content is empty (the front end cold-fills);
-    // brick_count stays the CPU pack's count purely as the apply-gate + a diagnostic (the live count converges as the
-    // front end fills). If the CPU pack found zero bricks, force ≥1 so the empty pool is still allocated.
-    b.brick_count = b.brick_count.max(1);
 }
 
 /// Blocking dev readback of a whole storage buffer into `Vec<u32>` (residency debug dump only — never the hot path).
