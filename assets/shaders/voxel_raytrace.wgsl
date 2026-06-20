@@ -1987,16 +1987,21 @@ struct ScreenProbeHeader { world_pos: vec3<f32>, valid: f32, world_normal: vec3<
 // Prev-frame atlas (temporal reuse). `.w` of bins 0..3 packs the validity meta (prev view_z + prev normal).
 @group(4) @binding(3) var<storage, read_write> probe_radiance_history: array<vec4<f32>>;
 
-// Spherical-Fibonacci direction for bin i of N — equal-area (exact 4π/N solid angle) and deterministic in (i,N),
-// so it is a FIXED shared world frame across probes + frames (neighbour/temporal texels align). The SSOT shared
-// by `screen_probe_trace` (which writes radiance along it) and `screen_probe_integrate` (which weights by it).
-fn probe_dir(i: u32, n: u32) -> vec3<f32> {
+// Spherical-Fibonacci direction for a (possibly fractional) bin index `fi` of N — equal-area (exact 4π/N solid
+// angle). Integer `fi` = the FIXED shared world frame across probes + frames (neighbour/temporal texels align,
+// used by the integrate's cosine weight). The TRACE perturbs `fi` by a per-frame sub-bin offset so each bin
+// samples a slightly DIFFERENT ray every frame → the temporal accumulation averages across world-cache cells
+// (the way the per-pixel ReSTIR's STBN-rotated direction does) instead of freezing onto the same coarse cells
+// (the cause of the static GI faceting). `fi` stays within ~1 bin of its nominal direction, so the integrate's
+// unjittered cosine weight is still ~correct.
+fn probe_dir_f(fi: f32, n: u32) -> vec3<f32> {
     let inv_n = 1.0 / f32(n);
-    let z = 1.0 - (2.0 * f32(i) + 1.0) * inv_n;
+    let z = clamp(1.0 - (2.0 * fi + 1.0) * inv_n, -1.0, 1.0);
     let rr = sqrt(max(0.0, 1.0 - z * z));
-    let phi = f32(i) * 2.39996323; // golden angle
+    let phi = fi * 2.39996323; // golden angle
     return vec3<f32>(rr * cos(phi), rr * sin(phi), z);
 }
+fn probe_dir(i: u32, n: u32) -> vec3<f32> { return probe_dir_f(f32(i), n); }
 
 // Per-pixel probe integration (called from shade): bilinear 2×2 probe gather, bilateral depth/normal reject, and
 // for each accepted probe a COSINE-WEIGHTED hemisphere integral of its radiance atlas against THIS pixel's
@@ -2120,9 +2125,14 @@ fn screen_probe_trace(@builtin(global_invocation_id) gid: vec3<u32>) {
             // includes directions in the probe's LOWER hemisphere — leaving those bins 0 (the SH version hid this
             // by extrapolating; the atlas does not → patchy/dark GI on varying-normal geometry). Lower-hemisphere
             // dirs trace into/below the local surface (correctly returning the nearby occluded/surface radiance).
+            // Per-frame sub-bin jitter of the ray index → each bin samples a different ray (hence different
+            // world-cache cells) every frame, so the temporal blend below AVERAGES the coarse cache cells instead
+            // of freezing onto them (the GI-faceting fix; mirrors the per-pixel ReSTIR's per-frame STBN rotation).
+            // Low-discrepancy per-frame offset in [0,1); a small per-probe term decorrelates neighbour probes.
+            let jf = fract(f32(probe_params.frame_index) * 0.6180339887 + f32(pidx) * 0.7548776662);
             // Temporal-blend each bin with its history texel; pack the validity meta into bins 0..3 `.w`.
             for (var i = 0u; i < nd; i = i + 1u) {
-                let dir = probe_dir(i, nd);
+                let dir = probe_dir_f(f32(i) + jf, nd);
                 let L = reservoir_from_bounce_cached(p, n, dir, drop_emissive, &rng).radiance;
                 let blended = mix(probe_radiance_history[pbase + i].xyz, L, a);
                 probe_radiance[pbase + i] = vec4<f32>(blended, 0.0);
