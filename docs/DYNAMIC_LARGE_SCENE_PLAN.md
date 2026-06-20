@@ -92,7 +92,17 @@ needed. Deferred refinement (low value): free the *pool slot* of a per-brick-bur
 BLAS primitive — entangled (buried-ness known only post-pack; the core still feeds halos), revisit only if the
 C1 pool wall proves tight after Phases 2–3.
 
-### Phase 2 — Break C2 (decouple view distance from `LIST_CAP`) — split into 2a (done) + 2b (tiling)
+### Phase 2 — Break C2 (decouple view distance from `LIST_CAP`) — 2a + 2b **DONE**
+
+> **Implemented (2026-06-20):** 2a size-agnostic dispatch + 2b candidate-list-free **FUSED** enter (commits up to
+> `748d1f2`). The original 2b sketch below was *windowed* enumeration; the shipped design is better — instead of
+> windowing the candidate list, the enter side no longer MATERIALIZES candidates at all (the consumers are fused
+> into the enumerate), so there's nothing to window. The view is bounded by the surface-CELL count
+> (`shell_wg_indices`, OOB-guarded), not a per-frame candidate cap; `would_overflow` only trips past ~16.7M raw
+> cells. Drop was first decoupled from enumeration (direct `present_contains`). Gates green; runs on 8 GB (no
+> limit raise). Remaining tail (deferred): >`shell_wg_indices` solid cells clamps (would need windowing/enlarge);
+> retire the stale `converge`/`diff_parity` harnesses; delete the residual dead `present_flag`/`candidate_list`
+> buffers.
 
 **MEMORY CONSTRAINT (user, 2026-06-20):** target devices include **8 GB VRAM** — be memory-efficient. This
 *rules out* the naive "raise `LIST_CAP`" lever: the transient lists scale with it (`neighbour_indices` alone is
@@ -203,9 +213,10 @@ distance-only LOD; report resident count + a perceptual/SSIM delta at matched bu
   **VRAM-budget binary search** ("how far can we see / how big a surface at budget B"). Every phase gates on it
   ([[feedback-benchmark-deliveries]]). Measure the cubic→quadratic exponent, don't assert it.
 - **Order recap + status:** **1 enclosed-cull = DONE** (surface-only, Θ(H²)); **2a size-agnostic dispatch =
-  DONE** (memory-neutral, removes the 65535 cap / fixes dense-scene enumerate); **2b tiling** (memory-efficient
-  see-farther) → **3** bigger-set (C1 tiled pools + R1-into-VRAM) → **4** demand/LRU (unbounded, bounded VRAM) →
-  **5** screen-error LOD (polish). Each de-risks the next; nothing is skipped; every step holds the 8 GB budget.
+  DONE**; **2b candidate-list-free fused enter = DONE** (far view at bounded transient VRAM) → **3** bigger-set
+  (C1 tiled pools + R1-into-VRAM — the *actual* 8 GB-decisive lever: the ~4.6 GB pools) → **4** demand/LRU
+  (unbounded, bounded VRAM, on the tiled pool) → **5** screen-error LOD (polish). Each de-risks the next; nothing
+  is skipped; every step holds the 8 GB budget.
 
 ---
 
