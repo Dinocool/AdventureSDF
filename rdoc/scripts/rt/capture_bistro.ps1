@@ -8,6 +8,8 @@ param(
   [string]$Exe = "target/debug/adventure.exe",
   [string]$Cam = "-52,12,-40,-12.8,13.6,-32.8",  # eye + look_at, interior street view (inside geom_aabb)
   [int]$ClipHalf = 64,
+  [int]$Wc = -1,                 # -1 = leave default; 0/1 = force ADVENTURE_WC (world-cache off/on) for attribution
+  [int]$DebugView = -1,          # -1 = leave default; else force ADVENTURE_DEBUG_VIEW
   [switch]$Heavy                 # add --real-time-shader-profiler (per-line); default off = stable timing
 )
 $ErrorActionPreference = "Stop"
@@ -22,6 +24,8 @@ $outAbs = (Resolve-Path $Out).Path
 $exitAt = $Frames + 180
 
 $envStr = "ADVENTURE_EXIT_AFTER_FRAMES=$exitAt; WGPU_BACKEND=vulkan; BEVY_ASSET_ROOT=$proj; ADVENTURE_BENCH_BISTRO=1; ADVENTURE_CAM=$Cam; ADVENTURE_CLIP_HALF=$ClipHalf; ADVENTURE_EXIT_AFTER_SECS=9999;"
+if ($Wc -ge 0) { $envStr += " ADVENTURE_WC=$Wc;"; Write-Host "wc   : $Wc" }
+if ($DebugView -ge 0) { $envStr += " ADVENTURE_DEBUG_VIEW=$DebugView;"; Write-Host "dv   : $DebugView" }
 Write-Host "ngfx : $($ngfx.FullName)"
 Write-Host "exe  : $exePath"
 Write-Host "out  : $outAbs"
