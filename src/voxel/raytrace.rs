@@ -220,6 +220,30 @@ pub struct VoxelRtResidencyParams {
     pub has_emitters: bool,
 }
 
+/// **SSOT for the editor-tunable Phase-4 dynamic-residency knobs** (knobs-as-uniforms). The Render panel writes it;
+/// `drive_gpu_residency_front_end` reads it each frame and feeds the front end + pager + the `ResidencyParams`
+/// uniform — so all four levers are LIVE. Extracted to the render world. Defaults = OFF (identical to pre-Phase-4).
+#[derive(Resource, Clone, Copy, ExtractResource)]
+pub struct VoxelRtResidencySettings {
+    /// 4-S2/S3: ray-guided keep + LRU master toggle. When off the residency uses the pure distance/budget cut.
+    pub demand: bool,
+    /// 4-S1/S4: LODs >= this are the pinned coarse BACKDROP (exempt from the budget cut, reach-extended). `MAX_LOD+1`
+    /// (= `LODS`) = OFF (no backdrop). Lower ⇒ more coarse LODs pinned + extended.
+    pub backdrop_lod: u32,
+    /// 4-S4: backdrop LODs page/render out to `clip_half · backdrop_reach` (see far beyond the fine clipmap). 1 = no extension.
+    pub backdrop_reach: u32,
+    /// 4-S2/S3: a brick ray-hit within this many frames is KEPT beyond the distance cut (ray-guided). Higher = stickier.
+    pub ray_keep_frames: u32,
+}
+
+impl Default for VoxelRtResidencySettings {
+    fn default() -> Self {
+        // OFF by default: backdrop_lod past MAX_LOD ⇒ no brick qualifies; demand off ⇒ last_used ignored. Identical
+        // to the pre-Phase-4 distance/budget cut. The user enables + tunes from the Render panel.
+        Self { demand: false, backdrop_lod: crate::voxel::brickmap::MAX_LOD + 1, backdrop_reach: 4, ray_keep_frames: 30 }
+    }
+}
+
 /// **Residency debug-dump request** (the F9 hotkey). The main world bumps `counter` on each key press; the render
 /// world's [`dump_residency_debug`] sees the change and reads back the LIVE residency pool (meta + AABB) to a
 /// report on disk for offline analysis. Extracted main→render each frame; the render side tracks the last counter
@@ -393,12 +417,14 @@ impl Plugin for VoxelRtPlugin {
             // Phase G "G-c.4" — the LIVE per-frame residency params (camera + clip_half), the only per-frame
             // CPU→GPU residency traffic for the GPU-driven front end.
             .init_resource::<VoxelRtResidencyParams>()
+            .init_resource::<VoxelRtResidencySettings>()
             .init_resource::<VoxelDebugDump>()
             .add_systems(Update, request_residency_debug_dump)
             .add_plugins(ExtractResourcePlugin::<VoxelDebugDump>::default())
             .add_plugins(ExtractResourcePlugin::<VoxelRtToggle>::default())
             .add_plugins(ExtractResourcePlugin::<VoxelRtResidencyUpload>::default())
             .add_plugins(ExtractResourcePlugin::<VoxelRtResidencyParams>::default())
+            .add_plugins(ExtractResourcePlugin::<VoxelRtResidencySettings>::default())
             .add_plugins(ExtractResourcePlugin::<VoxelRtPatch>::default())
             .add_plugins(ExtractResourcePlugin::<VoxelRtLighting>::default())
             .add_plugins(ExtractResourcePlugin::<VoxelRtSky>::default())
@@ -1870,13 +1896,6 @@ struct SceneKeepAlive {
     /// True iff this scene is a STREAMED fixed-cap epoch (a `Delta` can patch it). False for a static contiguous
     /// `Snapshot` (every generation re-creates).
     streamed: bool,
-}
-
-/// 4-S2/S3/S4 — is the ray-guided demand-residency feature ON? Gates the per-slot `last_used` feedback buffer
-/// (CAPACITY vs a 1-element dummy) + the residency's ray-guided-keep / LRU paths. OFF by default (the trace's
-/// `arrayLength > 1` guard then never writes ⇒ zero behaviour change). Dev knob `ADVENTURE_DEMAND=1`.
-fn voxel_demand_enabled() -> bool {
-    std::env::var("ADVENTURE_DEMAND").is_ok_and(|v| v != "0" && !v.is_empty())
 }
 
 /// The PERSISTENT world-space radiance-cache GPU state (Phase 2.1): the 11 storage buffers + the `group(3)`
@@ -3390,6 +3409,8 @@ fn prepare_voxel_rt(
     residency_upload: Option<Res<VoxelRtResidencyUpload>>,
     // Phase G "G-c.4" — the LIVE per-frame residency params (camera + clip_half) for the GPU-driven front end.
     residency_params: Option<Res<VoxelRtResidencyParams>>,
+    // Phase 4 — the editor-tunable dynamic-residency levers (backdrop / demand / LRU). Live each frame.
+    residency_settings: Option<Res<VoxelRtResidencySettings>>,
 ) {
     // Phase G "G-c.0" — upload the GPU-resident sparse OCCUPANCY ONCE per scene epoch (not per frame, not gated
     // on the toggle/patch). Built in the main world; here it becomes two PERSISTENT storage buffers on
@@ -3448,6 +3469,7 @@ fn prepare_voxel_rt(
         &mut resources,
         residency_params.as_deref(),
         residency_upload.as_deref(),
+        residency_settings.as_deref().copied().unwrap_or_default(),
     );
 
     let (Some(patch_res), Some(pipelines)) = (patch_res, pipelines) else {
@@ -4159,11 +4181,11 @@ fn build_scene_full(
         contents: brick_palettes_bytes,
     });
     // 4-S2/S3: per-slot `last_used_frame` — the GI trace `atomicMax`es it on a hit; the residency reads it for
-    // ray-guided KEEP (a recently-hit brick survives the distance cut) + LRU eviction. CAPACITY-sized (one u32 per
-    // slot) when demand is ON, else a 1-element DUMMY so the trace's `arrayLength(&last_used) > 1` guard never
-    // fires (zero behaviour change). Bound to BOTH the scene bind group (trace WRITE) and the residency front end
-    // (READ, via rebind_pool) — the same buffer feeds the feedback loop, readback-free.
-    let last_used_len = if voxel_demand_enabled() { blas_primitives.max(1) } else { 1 };
+    // ray-guided KEEP (a recently-hit brick survives the distance cut) + LRU eviction. ALWAYS capacity-sized (one
+    // u32/slot, ~negligible VRAM) so the LIVE `demand` editor toggle takes effect with no scene rebuild — the
+    // trace always stamps (cheap), and the residency's `demand_on()` (uniform) decides whether to USE it. Bound to
+    // BOTH the scene bind group (trace WRITE) and the residency front end (READ, via rebind_pool), readback-free.
+    let last_used_len = blas_primitives.max(1);
     let last_used_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("voxel_rt_last_used"),
         contents: bytemuck::cast_slice(&vec![0u32; last_used_len as usize]),
@@ -4401,6 +4423,7 @@ fn drive_gpu_residency_front_end(
     resources: &mut VoxelRtResources,
     params: Option<&VoxelRtResidencyParams>,
     upload: Option<&VoxelRtResidencyUpload>,
+    settings: VoxelRtResidencySettings,
 ) -> bool {
     if !toggle.enabled || !toggle.gpu_residency {
         // Toggle off: ensure the front end is unbound so a later flip-on cold-rebinds against the current scene.
@@ -4482,6 +4505,9 @@ fn drive_gpu_residency_front_end(
     if have_paged {
         let pager = resources.streamed_pager.as_mut().expect("checked have_paged");
         let _p = info_span!("vox_residency_prefetch").entered();
+        // Phase 4 — push the live backdrop levers so the pager pages the extended coarse reach (a change re-pages
+        // on the next crossing via the set-diff). Off by default (backdrop_lod past MAX_LOD ⇒ no extension).
+        pager.set_backdrop(settings.backdrop_lod, settings.backdrop_reach);
         let crossed = pager.update(queue, params.cam_world);
         if crossed {
             debug!(
@@ -4508,6 +4534,13 @@ fn drive_gpu_residency_front_end(
             half, max_resident
         );
     }
+    // Phase 4 — push the LIVE editor levers (demand / backdrop / reach / ray-keep) into the front end BEFORE
+    // `would_overflow` + `record_frame` (both build the ResidencyParams from them). Per-frame ⇒ panel edits are live.
+    resources
+        .gpu_front_end
+        .as_mut()
+        .expect("just built")
+        .set_residency_levers(settings.demand, settings.backdrop_lod, settings.backdrop_reach, settings.ray_keep_frames);
 
     // (Re)bind the front end to the CURRENT scene pool + the residency stores (eager OR paged) on an epoch change
     // (a scene switch / fresh stream) or when the pager's stores were just (re)allocated. Cold-resets the

@@ -271,13 +271,12 @@ struct ResidencyParams {
     backdrop_lod: u32,           // 4-S1: LODs >= this are the always-resident coarse BACKDROP (exempt from the
                                  // distance-budget cut; reserved from `room`). MAX_LOD+1 ⇒ OFF (identical behaviour).
     cam_world: vec3<f32>,         // ENTER-CAP: the camera world position (for the nearest-priority distance rank)
-    frame: u32,                  // 4-S2/S3: current frame counter — age `last_used` for ray-guided keep + LRU (0 = demand off)
+    frame: u32,                  // 4-S2/S3: current frame counter — age `last_used` for ray-guided keep + LRU
+    demand: u32,                 // 4-S2/S3: ray-guided keep + LRU master toggle (live editor lever; 0 = off)
+    backdrop_reach: u32,         // 4-S4: backdrop LODs reach clip_half*backdrop_reach (live editor lever)
+    ray_keep_frames: u32,        // 4-S2/S3: ray-keep window in frames (live editor lever)
+    _pad3: u32,
 }
-
-// 4-S2/S3 — how many frames a ray-hit brick is KEPT (exempt from the distance cut) after its last hit. The trace
-// stamps `last_used[slot] = frame` on every primary hit; `try_enter` stamps it at enter (so a fresh brick isn't
-// instantly "stale"). A brick not hit for longer than this falls back under the normal distance/budget cut (LRU).
-const RAY_KEEP_FRAMES: u32 = 30u;
 
 // 4-S1 — is `lod` part of the always-resident coarse backdrop? The backdrop is the coarsest LOD band the camera
 // keeps out to `clip_half` REGARDLESS of the nearest-`max_resident` budget cut, so distant terrain stays visible
@@ -300,12 +299,12 @@ fn snap_odd(v: i32) -> i32 { return v | 1; }
 
 // Level `lod`'s INCLUSIVE resident AABB on grid `lod` (`level_box`, streaming.rs:168): a cube of half-extent
 // `half` around the camera's brick on that grid, snapped per axis to the 2×-coarser grid.
-// 4-S4 — the BACKDROP LODs reach `BACKDROP_REACH×` farther than `clip_half` so the cheap coarse backdrop extends
-// WELL BEYOND the fine clipmap (see-far at a fixed fine budget). MUST match `residency_front_end.rs::BACKDROP_REACH`
+// 4-S4 — the BACKDROP LODs reach `params.backdrop_reach×` farther than `clip_half` so the cheap coarse backdrop
+// extends WELL BEYOND the fine clipmap (see-far at a fixed fine budget). LIVE editor lever (must match the CPU
+// `residency_front_end::lod_clip_half` + the pager's desired_regions). `1` (or backdrop off) ⇒ no extension.
 // + the pager's. `1` (or backdrop off) ⇒ no extension.
-const BACKDROP_REACH: i32 = 4;
 fn lod_half(lod: u32, half: i32) -> i32 {
-    return select(half, half * BACKDROP_REACH, is_backdrop(lod));
+    return select(half, half * max(i32(params.backdrop_reach), 1), is_backdrop(lod));
 }
 fn level_box_lo(lod: u32, half: i32) -> vec3<i32> {
     let h = lod_half(lod, half);
@@ -604,20 +603,20 @@ const HIST_BUCKETS: u32 = 4096u;
 // enter). A 1-element DUMMY when demand is off — `demand_on()` gates all reads/writes (zero behaviour change).
 @group(0) @binding(52) var<storage, read_write> last_used: array<atomic<u32>>;
 
-// 4-S2/S3 — is the ray-guided demand feature ON this frame? Gated by buffer size (CAPACITY vs 1-elem dummy) AND a
-// non-zero frame counter, so an off build does ZERO last_used work (the distance/budget cut alone, as before).
+// 4-S2/S3 — is the ray-guided demand feature ON this frame? The LIVE editor toggle (`params.demand`), guarded by a
+// non-zero frame + a real (non-dummy) last_used buffer. Off ⇒ the residency uses the pure distance/budget cut.
 fn demand_on() -> bool {
-    return params.frame != 0u && arrayLength(&last_used) > 1u;
+    return params.demand != 0u && params.frame != 0u && arrayLength(&last_used) > 1u;
 }
 
-// 4-S2/S3 — was `slot`'s brick ray-hit (or entered) within the last RAY_KEEP_FRAMES? Such a brick is KEPT even
-// beyond the distance/budget cut (ray-guided residency) and counts as recently-used for the LRU.
+// 4-S2/S3 — was `slot`'s brick ray-hit (or entered) within the last `params.ray_keep_frames`? Such a brick is KEPT
+// even beyond the distance/budget cut (ray-guided residency) and counts as recently-used for the LRU.
 fn ray_recently_used(slot: u32) -> bool {
     if (!demand_on()) {
         return false;
     }
     let lu = atomicLoad(&last_used[slot]);
-    return lu != 0u && (params.frame - lu) < RAY_KEEP_FRAMES;
+    return lu != 0u && (params.frame - lu) < params.ray_keep_frames;
 }
 
 // The world-distance of candidate `(coord,lod)`'s CENTRE to the camera (SSOT mirror of `brick_world_dist`).

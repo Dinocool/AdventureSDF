@@ -85,7 +85,11 @@ struct ResidencyParams {
     hist_scale: f32,
     _pad1: u32,
     cam_world: [f32; 3],
-    _pad2: u32,
+    _pad2: u32, // = frame (4-S2/S3)
+    demand: u32,
+    backdrop_reach: u32,
+    ray_keep_frames: u32,
+    _pad3: u32,
 }
 
 /// Enter-cap distance histogram buckets — MUST equal `HIST_BUCKETS` in `voxel_residency.wgsl`.
@@ -145,6 +149,10 @@ fn build_params(cam: [f32; 3], half: i32) -> ResidencyParams {
         _pad1: MAX_LOD + 1, // 4-S1: this u32 is `backdrop_lod` in the WGSL now — MAX_LOD+1 = backdrop OFF
         cam_world: cam,
         _pad2: 0,
+        demand: 0,
+        backdrop_reach: 1,
+        ray_keep_frames: 0,
+        _pad3: 0,
     }
 }
 

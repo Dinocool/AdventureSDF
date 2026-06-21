@@ -74,6 +74,13 @@ struct ResidencyParams {
     /// 4-S2/S3: the current frame counter (rides the old `_pad2`; no layout change). The residency reads
     /// `frame - last_used[slot]` to keep ray-recently-used bricks (ray-guided) + age the LRU. 0 when demand is off.
     frame: u32,
+    /// 4-S2/S3: ray-guided keep + LRU master toggle (1 = on). When 0 the residency ignores `last_used` (distance cut).
+    demand: u32,
+    /// 4-S4: backdrop LODs reach `clip_half · backdrop_reach` (live; 1 = no extension).
+    backdrop_reach: u32,
+    /// 4-S2/S3: a brick ray-hit within this many frames is kept beyond the cut (live ray-keep window).
+    ray_keep_frames: u32,
+    _pad3: u32,
 }
 
 #[repr(C)]
@@ -97,14 +104,23 @@ struct PackConfig {
 /// Build the per-frame [`ResidencyParams`] from the live camera world position + clip half-extent. The per-LOD
 /// `level_box` (the clipmap shell on each grid) + the WG-cell tiling of it are computed here (the only per-frame
 /// CPU work) — bit-identical to the converge gate's `build_params` SSOT.
-fn build_params(cam: [f32; 3], half: i32, backdrop_lod: u32, frame: u32) -> ResidencyParams {
+#[allow(clippy::too_many_arguments)]
+fn build_params(
+    cam: [f32; 3],
+    half: i32,
+    backdrop_lod: u32,
+    frame: u32,
+    demand: bool,
+    backdrop_reach: u32,
+    ray_keep_frames: u32,
+) -> ResidencyParams {
     let mut levels = [LevelParams::zeroed(); LODS];
     let mut offset = 0u32;
     for lod in 0..=MAX_LOD {
         // 4-S4: backdrop LODs use the extended reach so the CPU cell grid covers exactly what the WGSL
-        // `level_resident` (which applies `BACKDROP_REACH` internally) accepts — else the extra backdrop bricks
+        // `level_resident` (which applies `backdrop_reach` internally) accepts — else the extra backdrop bricks
         // would never be enumerated/entered.
-        let (lo, hi) = level_box_pub(cam, lod, lod_clip_half(lod, half, backdrop_lod));
+        let (lo, hi) = level_box_pub(cam, lod, lod_clip_half(lod, half, backdrop_lod, backdrop_reach));
         let cam_brick = camera_brick_coord_lod(cam, lod);
         let cell_lo = IVec3::new(
             lo.x.div_euclid(WG_CELL) * WG_CELL,
@@ -140,21 +156,23 @@ fn build_params(cam: [f32; 3], half: i32, backdrop_lod: u32, frame: u32) -> Resi
         backdrop_lod,
         cam_world: cam,
         frame,
+        demand: u32::from(demand),
+        backdrop_reach: backdrop_reach.max(1),
+        ray_keep_frames,
+        _pad3: 0,
     }
 }
 
 /// Enter-cap distance histogram buckets — MUST equal `HIST_BUCKETS` in `voxel_residency.wgsl`.
 const HIST_BUCKETS: u32 = 4096;
 
-/// 4-S4 — backdrop LODs reach `BACKDROP_REACH×` farther than `clip_half` (cheap coarse extends beyond the fine
-/// clipmap = see-far). MUST match `voxel_residency.wgsl::BACKDROP_REACH` + the pager's `desired_regions`.
-pub const BACKDROP_REACH: i32 = 4;
-
-/// 4-S4 — the effective clip half-extent for `lod`: `clip_half` for fine LODs, `clip_half · BACKDROP_REACH` for the
+/// 4-S4 — the effective clip half-extent for `lod`: `clip_half` for fine LODs, `clip_half · backdrop_reach` for the
 /// pinned coarse backdrop (LODs >= `backdrop_lod`). `backdrop_lod > MAX_LOD` (off) ⇒ always `half` (no extension).
+/// `backdrop_reach` is the LIVE editor lever (`VoxelRtResidencySettings`); MUST match the WGSL `lod_half` (which uses
+/// `params.backdrop_reach`) + the pager's `desired_regions`.
 #[inline]
-pub fn lod_clip_half(lod: u32, half: i32, backdrop_lod: u32) -> i32 {
-    if lod >= backdrop_lod { half * BACKDROP_REACH } else { half }
+pub fn lod_clip_half(lod: u32, half: i32, backdrop_lod: u32, backdrop_reach: u32) -> i32 {
+    if lod >= backdrop_lod { half * backdrop_reach.max(1) as i32 } else { half }
 }
 
 /// The maximum `total_cells` (shell WG-cells across all LODs) the front end's `shell_idx`/list buffers are sized
@@ -195,6 +213,12 @@ pub struct GpuResidencyFrontEnd {
     /// 4-S1: the coarse-backdrop LOD threshold (LODs >= this are pinned, exempt from the budget cut). Set once at
     /// construction from `ADVENTURE_BACKDROP_LOD` (default `MAX_LOD + 1` = OFF). Fed into `ResidencyParams` per frame.
     backdrop_lod: u32,
+    /// 4-S2/S3: ray-guided keep + LRU master toggle (live; set per-frame from `VoxelRtResidencySettings`).
+    demand: bool,
+    /// 4-S4: live backdrop reach multiplier.
+    backdrop_reach: u32,
+    /// 4-S2/S3: live ray-keep window (frames).
+    ray_keep_frames: u32,
     /// 4-S2/S3: frame counter (bumped per `record_frame`), fed into `ResidencyParams` to age `last_used`.
     frame: u32,
     max_resident: u32,
@@ -337,13 +361,9 @@ impl GpuResidencyFrontEnd {
         let slot_table_size = (max_resident as usize * 2).max(2).next_power_of_two() as u32;
         let present_size = (LIST_CAP * 2).max(2).next_power_of_two() as u32;
         let list_cap = LIST_CAP;
-        // 4-S1: the coarse-backdrop LOD threshold (LODs >= this are pinned, exempt from the budget cut). Default
-        // `MAX_LOD + 1` = OFF (behaviour identical). Dev knob `ADVENTURE_BACKDROP_LOD` (a per-frame uniform; an
-        // editor slider is a follow-up to honour knobs-as-uniforms).
-        let backdrop_lod = std::env::var("ADVENTURE_BACKDROP_LOD")
-            .ok()
-            .and_then(|s| s.parse::<u32>().ok())
-            .unwrap_or(MAX_LOD + 1);
+        // Phase 4: the dynamic-residency levers are driven LIVE per-frame from `VoxelRtResidencySettings` (the editor
+        // panel) via `set_residency_levers`. Initialise OFF (identical to pre-Phase-4) until the first frame sets them.
+        let backdrop_lod = MAX_LOD + 1;
 
         let diff_cfg = DiffConfig { slot_table_size, present_size, max_resident, refine_descent_cap: REFINE_DESCENT_CAP };
         let diff_cfg_buf = buf_init(device, "res_diff_cfg", bytemuck::bytes_of(&diff_cfg), wgpu::BufferUsages::UNIFORM);
@@ -583,6 +603,9 @@ impl GpuResidencyFrontEnd {
         Self {
             half,
             backdrop_lod,
+            demand: false,
+            backdrop_reach: 4,
+            ray_keep_frames: 30,
             frame: 0,
             max_resident,
             slot_table_size,
@@ -696,7 +719,7 @@ impl GpuResidencyFrontEnd {
         self.reset_state(queue);
 
         // The params uniform is uploaded per frame; create a placeholder so the bind group is valid pre-first-frame.
-        let placeholder = build_params([0.0; 3], self.half, self.backdrop_lod, 0);
+        let placeholder = build_params([0.0; 3], self.half, self.backdrop_lod, 0, self.demand, self.backdrop_reach, self.ray_keep_frames);
         let params_buf = buf_init(device, "res_params", bytemuck::bytes_of(&placeholder), wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST);
 
         let res_bg = self.build_res_bg(device, occ, &params_buf, &self.dummy_dispatch, core, meta, last_used);
@@ -742,8 +765,17 @@ impl GpuResidencyFrontEnd {
     /// bounded by the SURFACE-CELL count (`shell_wg_indices`, OOB-guarded + clamped in `prepare_shell_dispatch`),
     /// not a per-frame candidate cap. A view with ≤ `shell_wg_indices` solid cells renders the nearest pool-worth;
     /// only an enormous (> the solid-cell buffer, or > 16.7M raw cells) view is skipped. (`docs/DYNAMIC_LARGE_SCENE_PLAN.md` Phase 2b.)
+    /// Phase 4 — push the editor's dynamic-residency levers (live, per-frame, from `VoxelRtResidencySettings`).
+    /// Must be called BEFORE `would_overflow`/`record_frame` each frame (both build the params from these).
+    pub fn set_residency_levers(&mut self, demand: bool, backdrop_lod: u32, backdrop_reach: u32, ray_keep_frames: u32) {
+        self.demand = demand;
+        self.backdrop_lod = backdrop_lod;
+        self.backdrop_reach = backdrop_reach.max(1);
+        self.ray_keep_frames = ray_keep_frames.max(1);
+    }
+
     pub fn would_overflow(&self, cam: [f32; 3]) -> bool {
-        let params = build_params(cam, self.half, self.backdrop_lod, self.frame);
+        let params = build_params(cam, self.half, self.backdrop_lod, self.frame, self.demand, self.backdrop_reach, self.ray_keep_frames);
         params.total_cells.div_ceil(256) > 65535
     }
 
@@ -849,7 +881,7 @@ impl GpuResidencyFrontEnd {
     pub fn record_frame(&mut self, queue: &wgpu::Queue, enc: &mut wgpu::CommandEncoder, cam: [f32; 3]) -> u32 {
         self.frame = self.frame.wrapping_add(1); // 4-S2/S3: age clock for ray-guided keep + LRU (bump BEFORE the borrow)
         let bound = self.bound.as_ref().expect("record_frame without a bound scene (call rebind_pool)");
-        let params = build_params(cam, self.half, self.backdrop_lod, self.frame);
+        let params = build_params(cam, self.half, self.backdrop_lod, self.frame, self.demand, self.backdrop_reach, self.ray_keep_frames);
         // The shell WG-cell union must fit `shell_idx` (sized to LIST_CAP). If a (very wide clip_half / very large
         // scene) frame would overflow, the caller's `total_cells > LIST_CAP` check (see `record_frame`'s return)
         // skips the GPU drive for this frame — here we still record but the B0 dispatch is clamped by its own

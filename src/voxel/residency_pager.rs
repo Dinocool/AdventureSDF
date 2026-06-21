@@ -52,9 +52,11 @@ pub struct StreamedResidencyPager {
     epoch: u64,
     /// The clip half-extent in bricks (the prefetcher's per-LOD `level_box` reach). Fixed for the epoch.
     clip_half: i32,
-    /// 4-S4: the coarse-backdrop LOD threshold (LODs >= this page out to `clip_half · BACKDROP_REACH` so the cheap
-    /// coarse backdrop extends beyond the fine clipmap). Read from `ADVENTURE_BACKDROP_LOD` (default off = no extension).
+    /// 4-S4: the coarse-backdrop LOD threshold + reach (LODs >= `backdrop_lod` page out to `clip_half · backdrop_reach`
+    /// so the cheap coarse backdrop extends beyond the fine clipmap). LIVE editor levers, set per-frame via
+    /// [`ResidencyProducer::set_backdrop`]. Default off (`backdrop_lod > MAX_LOD` = no extension).
     backdrop_lod: u32,
+    backdrop_reach: u32,
 
     /// The currently-paged region set (so a frame's update is a SET DIFF — page in newly-covered, drop uncovered).
     resident: FxHashSet<RegionKey>,
@@ -109,18 +111,13 @@ impl StreamedResidencyPager {
         // (one bounded buffer), and a brick beyond it is simply not core-resident (a graceful far-detail drop, not
         // a crash; the free-list panic would be a mis-size — `MAX_CORE_BUFFER_CORES` keeps us under the limit).
         let core_cap = max_resident.saturating_mul(2).clamp(1, MAX_CORE_BUFFER_CORES);
-        // 4-S4: match the front end's backdrop threshold (default MAX_LOD+1 = off) so the pager pages the extended
-        // coarse-backdrop regions the front end will enumerate beyond `clip_half`.
-        let backdrop_lod = std::env::var("ADVENTURE_BACKDROP_LOD")
-            .ok()
-            .and_then(|s| s.parse::<u32>().ok())
-            .unwrap_or(MAX_LOD + 1);
-
         Self {
             source,
             epoch,
             clip_half,
-            backdrop_lod,
+            // 4-S4: off until the drive pushes the live editor levers via `set_backdrop` each frame.
+            backdrop_lod: MAX_LOD + 1,
+            backdrop_reach: 4,
             resident: FxHashSet::default(),
             decoded: FxHashMap::default(),
             occ_buffers,
@@ -137,9 +134,13 @@ impl StreamedResidencyPager {
         let mut desired = FxHashSet::default();
         let mut scratch: Vec<IVec3> = Vec::new();
         for lod in 0..=MAX_LOD {
-            // 4-S4: backdrop LODs reach BACKDROP_REACH× farther (page the extended coarse backdrop the front end
-            // enumerates beyond clip_half). Matches `residency_front_end::lod_clip_half` + the WGSL.
-            let (wlo, whi) = level_box_pub(cam, lod, super::residency_front_end::lod_clip_half(lod, self.clip_half, self.backdrop_lod));
+            // 4-S4: backdrop LODs reach `backdrop_reach×` farther (page the extended coarse backdrop the front end
+            // enumerates beyond clip_half). Matches `residency_front_end::lod_clip_half` + the WGSL `lod_half`.
+            let (wlo, whi) = level_box_pub(
+                cam,
+                lod,
+                super::residency_front_end::lod_clip_half(lod, self.clip_half, self.backdrop_lod, self.backdrop_reach),
+            );
             for (ai, asset) in self.source.placed_assets().iter().enumerate() {
                 // Clip the world clipmap box to the asset's placed bounds (on the LOD-lod grid), then to LOCAL.
                 let (alo, ahi) = self.source.asset_lod_bounds(ai, lod);
@@ -323,6 +324,12 @@ impl ResidencyProducer for StreamedResidencyPager {
     #[inline]
     fn debug_core_in_store(&self, coord: IVec3, lod: u32) -> bool {
         self.core_store.debug_core_resident(coord, lod)
+    }
+
+    #[inline]
+    fn set_backdrop(&mut self, backdrop_lod: u32, backdrop_reach: u32) {
+        self.backdrop_lod = backdrop_lod;
+        self.backdrop_reach = backdrop_reach.max(1);
     }
 }
 

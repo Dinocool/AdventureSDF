@@ -670,6 +670,11 @@ pub trait ResidencyProducer: Send + Sync {
     fn debug_source_core(&self, coord: IVec3, lod: u32) -> Option<[u32; super::brickmap::BRICK_VOXELS]>;
     /// DEBUG (F9 dump): is `(coord, lod)`'s core LIVE in this producer's GPU core store right now?
     fn debug_core_in_store(&self, coord: IVec3, lod: u32) -> bool;
+    /// **Phase 4** — set the LIVE coarse-backdrop levers (the editor's `VoxelRtResidencySettings`): LODs >=
+    /// `backdrop_lod` page out to `clip_half · backdrop_reach` so the cheap coarse backdrop extends beyond the fine
+    /// clipmap. `backdrop_lod > MAX_LOD` ⇒ off. Called each frame before [`update`](Self::update) (a change re-pages
+    /// on the next crossing via the set-diff).
+    fn set_backdrop(&mut self, backdrop_lod: u32, backdrop_reach: u32);
 }
 
 /// `u32` words per `8³` brick core (= [`super::brickmap::BRICK_VOXELS`] = 512).
