@@ -268,10 +268,23 @@ struct ResidencyParams {
     clip_half_bricks: i32,
     total_cells: u32,              // Σ_lod cell_count — the Pass B0 dispatch invocation count
     hist_scale: f32,              // ENTER-CAP: candidate distance → histogram bucket = floor(dist * hist_scale)
-    _pad1: u32,
+    backdrop_lod: u32,           // 4-S1: LODs >= this are the always-resident coarse BACKDROP (exempt from the
+                                 // distance-budget cut; reserved from `room`). MAX_LOD+1 ⇒ OFF (identical behaviour).
     cam_world: vec3<f32>,         // ENTER-CAP: the camera world position (for the nearest-priority distance rank)
     _pad2: u32,
 }
+
+// 4-S1 — is `lod` part of the always-resident coarse backdrop? The backdrop is the coarsest LOD band the camera
+// keeps out to `clip_half` REGARDLESS of the nearest-`max_resident` budget cut, so distant terrain stays visible
+// (coarse, cheap) instead of ending at a hard budget radius. The fine LODs below it stay budgeted.
+fn is_backdrop(lod: u32) -> bool {
+    return lod >= params.backdrop_lod;
+}
+
+// 4-S1 — index of the backdrop-reserve counter in `enter_hist` (one slot past the `HIST_BUCKETS` distance bins;
+// the buffer is sized `HIST_BUCKETS + 1`). `enumerate_histogram` counts backdrop bricks here instead of binning
+// them by distance, and `enter_cap_compute` subtracts it from `room` so the backdrop's slots are reserved.
+const BACKDROP_RESERVE_SLOT: u32 = HIST_BUCKETS;
 
 // --- clipmap math (SSOT port of streaming.rs) ---
 
@@ -847,6 +860,10 @@ fn clear_per_frame_hashes(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (i < HIST_BUCKETS) {
         atomicStore(&enter_hist[i], 0u);
     }
+    // 4-S1: clear the backdrop-reserve counter (one slot past the distance bins).
+    if (i == 0u) {
+        atomicStore(&enter_hist[BACKDROP_RESERVE_SLOT], 0u);
+    }
 }
 
 // --- Pass C-tail — publish the change_count signal (G-c.4's non-blocking, 1-frame-late CPU mirror reads this). ---
@@ -888,7 +905,10 @@ fn enter_cap_compute() {
     // admits non-resident bricks below it (ENTER) and marks resident bricks beyond it for EVICTION
     // (`diff_drop_mark`). When desired <= max_resident the loop never exceeds room ⇒ cut = no-cut ⇒ enter all,
     // evict none (behaviour-identical to pre-Phase-4).
-    let room = diff_cfg.max_resident;
+    // 4-S1: reserve the backdrop bricks' slots — they're always kept (exempt from the cut), so the FINE budget is
+    // `max_resident` MINUS the backdrop count. OFF by default (reserve slot is 0 ⇒ room == max_resident).
+    let backdrop = atomicLoad(&enter_hist[BACKDROP_RESERVE_SLOT]);
+    let room = select(0u, diff_cfg.max_resident - backdrop, backdrop < diff_cfg.max_resident);
     var acc = 0u;
     var cut = HIST_BUCKETS; // default: no cut (all candidates fit)
     for (var b = 0u; b < HIST_BUCKETS; b = b + 1u) {
@@ -952,6 +972,9 @@ fn enter_admits(coord: vec3<i32>, lod: u32) -> bool {
     if (is_resident(coord, lod)) {
         return false;
     }
+    if (is_backdrop(lod)) {
+        return true; // 4-S1: backdrop always admitted (exempt from the nearest-`room` cut)
+    }
     return dist_bucket(cand_world_dist(coord, lod)) < enter_cap[0];
 }
 
@@ -986,6 +1009,13 @@ fn enumerate_histogram(
 ) {
     let b = surface_brick(wid, lidx);
     if (!b.valid) {
+        return;
+    }
+    // 4-S1: a BACKDROP brick is exempt from the distance cut (always kept). Count it in the reserve slot so
+    // `enter_cap_compute` subtracts it from `room`, instead of binning it by distance (where the far backdrop
+    // would fall beyond the cut). OFF by default (`backdrop_lod == MAX_LOD+1` ⇒ this never fires).
+    if (is_backdrop(b.lod)) {
+        atomicAdd(&enter_hist[BACKDROP_RESERVE_SLOT], 1u);
         return;
     }
     // BUDGET histogram (Phase 4): bin EVERY desired surface brick — resident AND non-resident — by distance. The
@@ -1047,6 +1077,9 @@ fn diff_drop_mark(@builtin(global_invocation_id) gid: vec3<u32>) {
     // brick still has an AIR neighbour beyond the +1 occupancy pad ⇒ stays `classify_surface` ⇒ kept, so this never
     // holes the loaded-region boundary. (`safe_to_drop` still gates the removal — keep-old-until-revealed.)
     if (present_contains(coord, lod) && classify_surface(coord, lod)) {
+        if (is_backdrop(lod)) {
+            return; // 4-S1: backdrop bricks are pinned — never evicted for distance (kept out to clip_half)
+        }
         // Still a desired surface candidate. BUDGET EVICTION (Phase 4): if it is BEYOND the nearest-`max_resident`
         // cut radius, evict it to make room for nearer bricks (distance-priority, deterministic ⇒ converges; it
         // re-enters when the camera approaches). The clipmap shells are distance-ordered, so the kept set is the

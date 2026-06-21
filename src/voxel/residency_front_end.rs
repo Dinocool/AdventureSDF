@@ -67,7 +67,8 @@ struct ResidencyParams {
     total_cells: u32,
     /// ENTER-CAP: candidate distance → histogram bucket = `floor(dist * hist_scale)`.
     hist_scale: f32,
-    _pad1: u32,
+    /// 4-S1: LODs >= this are the always-resident coarse BACKDROP (exempt from the budget cut). `MAX_LOD + 1` = OFF.
+    backdrop_lod: u32,
     /// ENTER-CAP: the camera world position (the nearest-priority distance rank centre).
     cam_world: [f32; 3],
     _pad2: u32,
@@ -94,7 +95,7 @@ struct PackConfig {
 /// Build the per-frame [`ResidencyParams`] from the live camera world position + clip half-extent. The per-LOD
 /// `level_box` (the clipmap shell on each grid) + the WG-cell tiling of it are computed here (the only per-frame
 /// CPU work) — bit-identical to the converge gate's `build_params` SSOT.
-fn build_params(cam: [f32; 3], half: i32) -> ResidencyParams {
+fn build_params(cam: [f32; 3], half: i32, backdrop_lod: u32) -> ResidencyParams {
     let mut levels = [LevelParams::zeroed(); LODS];
     let mut offset = 0u32;
     for lod in 0..=MAX_LOD {
@@ -131,7 +132,7 @@ fn build_params(cam: [f32; 3], half: i32) -> ResidencyParams {
         clip_half_bricks: half,
         total_cells: offset,
         hist_scale,
-        _pad1: 0,
+        backdrop_lod,
         cam_world: cam,
         _pad2: 0,
     }
@@ -175,6 +176,9 @@ const LIST_CAP: usize = 1_000_000;
 /// the caller's encoder.
 pub struct GpuResidencyFrontEnd {
     half: i32,
+    /// 4-S1: the coarse-backdrop LOD threshold (LODs >= this are pinned, exempt from the budget cut). Set once at
+    /// construction from `ADVENTURE_BACKDROP_LOD` (default `MAX_LOD + 1` = OFF). Fed into `ResidencyParams` per frame.
+    backdrop_lod: u32,
     max_resident: u32,
     slot_table_size: u32,
     present_size: u32,
@@ -315,6 +319,13 @@ impl GpuResidencyFrontEnd {
         let slot_table_size = (max_resident as usize * 2).max(2).next_power_of_two() as u32;
         let present_size = (LIST_CAP * 2).max(2).next_power_of_two() as u32;
         let list_cap = LIST_CAP;
+        // 4-S1: the coarse-backdrop LOD threshold (LODs >= this are pinned, exempt from the budget cut). Default
+        // `MAX_LOD + 1` = OFF (behaviour identical). Dev knob `ADVENTURE_BACKDROP_LOD` (a per-frame uniform; an
+        // editor slider is a follow-up to honour knobs-as-uniforms).
+        let backdrop_lod = std::env::var("ADVENTURE_BACKDROP_LOD")
+            .ok()
+            .and_then(|s| s.parse::<u32>().ok())
+            .unwrap_or(MAX_LOD + 1);
 
         let diff_cfg = DiffConfig { slot_table_size, present_size, max_resident, refine_descent_cap: REFINE_DESCENT_CAP };
         let diff_cfg_buf = buf_init(device, "res_diff_cfg", bytemuck::bytes_of(&diff_cfg), wgpu::BufferUsages::UNIFORM);
@@ -373,7 +384,8 @@ impl GpuResidencyFrontEnd {
         let classify_dispatch = buf_init(device, "res_classify_dispatch", bytemuck::cast_slice(&[0u32, 1, 1]), dispatch_usage());
 
         // ENTER-CAP — the candidate distance histogram + the `[cut_bucket, room]` cut.
-        let enter_hist = storage_buf(device, "res_enter_hist", (HIST_BUCKETS as u64) * 4);
+        // HIST_BUCKETS distance bins + 1 trailing slot = the 4-S1 backdrop-reserve counter (BACKDROP_RESERVE_SLOT).
+        let enter_hist = storage_buf(device, "res_enter_hist", (HIST_BUCKETS as u64 + 1) * 4);
         let enter_cap = buf_init(device, "res_enter_cap", bytemuck::cast_slice(&[HIST_BUCKETS, 0u32]), storage_usage());
 
         // the change_count signal + a 2-deep mappable staging ring (the non-blocking mirror).
@@ -551,6 +563,7 @@ impl GpuResidencyFrontEnd {
 
         Self {
             half,
+            backdrop_lod,
             max_resident,
             slot_table_size,
             present_size,
@@ -662,7 +675,7 @@ impl GpuResidencyFrontEnd {
         self.reset_state(queue);
 
         // The params uniform is uploaded per frame; create a placeholder so the bind group is valid pre-first-frame.
-        let placeholder = build_params([0.0; 3], self.half);
+        let placeholder = build_params([0.0; 3], self.half, self.backdrop_lod);
         let params_buf = buf_init(device, "res_params", bytemuck::bytes_of(&placeholder), wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST);
 
         let res_bg = self.build_res_bg(device, occ, &params_buf, &self.dummy_dispatch, core, meta);
@@ -709,7 +722,7 @@ impl GpuResidencyFrontEnd {
     /// not a per-frame candidate cap. A view with ≤ `shell_wg_indices` solid cells renders the nearest pool-worth;
     /// only an enormous (> the solid-cell buffer, or > 16.7M raw cells) view is skipped. (`docs/DYNAMIC_LARGE_SCENE_PLAN.md` Phase 2b.)
     pub fn would_overflow(&self, cam: [f32; 3]) -> bool {
-        let params = build_params(cam, self.half);
+        let params = build_params(cam, self.half, self.backdrop_lod);
         params.total_cells.div_ceil(256) > 65535
     }
 
@@ -812,7 +825,7 @@ impl GpuResidencyFrontEnd {
     /// Caller MUST have called [`rebind_pool`] (asserts otherwise — a programming error).
     pub fn record_frame(&mut self, queue: &wgpu::Queue, enc: &mut wgpu::CommandEncoder, cam: [f32; 3]) -> u32 {
         let bound = self.bound.as_ref().expect("record_frame without a bound scene (call rebind_pool)");
-        let params = build_params(cam, self.half);
+        let params = build_params(cam, self.half, self.backdrop_lod);
         // The shell WG-cell union must fit `shell_idx` (sized to LIST_CAP). If a (very wide clip_half / very large
         // scene) frame would overflow, the caller's `total_cells > LIST_CAP` check (see `record_frame`'s return)
         // skips the GPU drive for this frame — here we still record but the B0 dispatch is clamped by its own

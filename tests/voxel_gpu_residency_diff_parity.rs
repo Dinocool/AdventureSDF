@@ -120,7 +120,7 @@ fn build_params(cam: [f32; 3], cfg: &StreamingConfig) -> ResidencyParams {
         clip_half_bricks: half,
         total_cells: offset,
         hist_scale: HIST_BUCKETS as f32 / max_dist,
-        _pad1: 0,
+        _pad1: MAX_LOD + 1, // 4-S1: this u32 is `backdrop_lod` in the WGSL now — MAX_LOD+1 = backdrop OFF
         cam_world: cam,
         _pad2: 0,
     }
