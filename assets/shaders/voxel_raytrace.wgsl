@@ -551,6 +551,7 @@ fn trace(ro: vec3<f32>, rd: vec3<f32>, t_min: f32, t_max: f32) -> TraceResult {
 fn trace_occluded(ro: vec3<f32>, rd: vec3<f32>, t_min: f32, t_max: f32) -> bool {
     var rq: ray_query;
     rayQueryInitialize(&rq, acc, RayDesc(0u, 0xFFu, t_min, t_max, ro, rd));
+    var occluded = false; // CLOSEST-HIT PRUNE (occlusion form): once ANY occluder is found, stop DDA-marching
     loop {
         if (!rayQueryProceed(&rq)) { break; }
         let c = rayQueryGetCandidateIntersection(&rq);
@@ -573,17 +574,19 @@ fn trace_occluded(ro: vec3<f32>, rd: vec3<f32>, t_min: f32, t_max: f32) -> bool 
             let tb = (bmax - ro_l) * inv;
             let t_enter = max(max(min(ta.x, tb.x), min(ta.y, tb.y)), min(ta.z, tb.z));
             let t_exit  = min(min(max(ta.x, tb.x), max(ta.y, tb.y)), max(ta.z, tb.z));
-            if (t_enter <= t_exit && t_exit * d.inv_scale >= t_min) {
+            // Skip the DDA once we already have an occluder (boolean visibility needs only ONE hit) — the rest
+            // of the candidate bricks the BVH hands back (incl. ones behind the occluder) are pure waste.
+            if (!occluded && t_enter <= t_exit && t_exit * d.inv_scale >= t_min) {
                 let bh = dda_brick_march(prim, ro_l, rd_l, t_enter, t_exit); // lean: no per-candidate normal
                 let world_t = bh.hit_t * d.inv_scale; // local-t → WORLD-t for the t_max occlusion gate
                 if (bh.found && world_t <= t_max) {
+                    occluded = true;
                     rayQueryGenerateIntersection(&rq, world_t);
                 }
             }
         }
     }
-    let committed = rayQueryGetCommittedIntersection(&rq);
-    return committed.kind != RAY_QUERY_INTERSECTION_NONE;
+    return occluded; // set the moment a within-range occluder is committed; equivalent to the committed check
 }
 
 // --- test entry point: one ray from a uniform → a Hit buffer ----------------------------------------
