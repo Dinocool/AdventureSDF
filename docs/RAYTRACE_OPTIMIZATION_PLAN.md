@@ -22,17 +22,28 @@ tonemap, clustering) < 0.4 ms total. Per-dispatch (clip_half=64, pre-optimizatio
 REGISTER-LIMITED**, not ALU- or memory-bound (DRAM ~3%, L1 hit ~70%). The lever is REDUCING LIVE REGISTER
 STATE / SPLITTING KERNELS, not cutting FLOPs (instruction micro-cuts regressed 25-35% in the past).
 
-## Done
+## Done (all committed on `rt-optimize`)
 
-- **Deferred G-buffer (committed f1e5e79a).** Primary ray was traced TWICE/frame (p1 seeds receiver, p2
+- **Deferred G-buffer for shade (f1e5e79a).** Primary ray was traced TWICE/frame (p1 seeds receiver, p2
   refetches albedo/emissive). `PixelSurface` 32→64 B (+albedo+emissive); shade reads it instead of re-tracing.
-  Nsight: gi_restir_p2 7.19→4.19 ms (−42%), whole raytrace −17%. All 4 SOTA agents independently validated this
-  as the correct Solari/kajiya "G-buffer resolve" structure.
-- **Dedicated primary G-buffer pass (sub-step 2, uncommitted, measuring).** A standalone `gbuffer`/`gbuffer_dlss`
-  kernel traces the primary once → `surfaces_cur`; p1/di/spatial/p2 all read it. p1 now carries ONE ray-query
-  (the GI bounce). Single-capture showed p1 12.5→3.54 ms @ SM 21.7→37.1% + gbuffer 4.71 ms (the primary at high
-  occupancy) = 8.25 ms for the same primary+bounce work that was 12.5 ms — but p2 read noisy; median-of-3 in
-  progress to confirm.
+  Nsight: gi_restir_p2 7.19→4.19 ms (−42%), whole raytrace −17%. All 4 SOTA agents validated this as the correct
+  Solari/kajiya "G-buffer resolve" structure.
+- **Dedicated primary G-buffer pass + per-candidate normal elimination (T1) (44359dfe).** (a) standalone
+  `gbuffer`/`gbuffer_dlss` kernel traces the primary once → `surfaces_cur`; p1 now carries ONE ray-query (the GI
+  bounce); occupancy 21.7→37.1%. (b) `dda_brick` split into a lean `dda_brick_march` (found+t) for the candidate
+  loops, with the face-normal reconstruction kept ONLY in the winner re-walk (it was computed per-candidate,
+  used once). Bit-identical. **Nsight min-of-3 (clip_half=48): gi_restir_p1 5.52→3.33 ms (−40%), gi_gbuffer
+  3.79→3.15 ms (−17%), GI total 12.4→9.83 ms (−21%).**
+- **Measurement note:** Bistro's rate-limited `.vxo` streaming never converges in a capturable window, so
+  single Nsight frames randomly hit streaming hitches (28× spread). Hitches only ADD time → **MIN-of-N is the
+  clean steady-state estimator** (perf_median.ps1 reports it). Median is corrupted by hitches.
+
+## Rejected after analysis
+
+- **T2 (fold winner attrs into candidate loop, kill `brick_hit_at` re-walk).** The re-walk runs AFTER the
+  ray-query loop closes — at FULL occupancy (no ray state live) — so its 2nd brick-DDA is already cheap. T2 would
+  either move the normal work INTO the low-occupancy traversal loop or hold ~8 extra live registers across it,
+  likely REGRESSING the register-bound kernel. Skipped (agent 2 had flagged it as Nsight-gated).
 
 ## Validated ALREADY-CORRECT (do NOT redo / regress)
 
@@ -43,20 +54,7 @@ unbiased store-before-visibility reservoirs; balance-heuristic NaN-safe MIS. re-
 rendering axis (software DDA, 1-bounce sun-only, no ReSTIR/cache/LOD); its only transferable asset is the
 readback-free GPU BUILD pipeline (→ GPU-worldgen track, orthogonal to GI perf).
 
-## Backlog (ranked by occupancy-impact × confidence)
-
-### T1 — Trim per-candidate work in `dda_brick` (bit-identical, lowest risk) [agents 2,4]
-`dda_brick` computes the full face-normal tail (grad/exposed-face scan, ~6 extra `cell_block` fetches +
-packed-axis encode, voxel_raytrace.wgsl:337-379) on EVERY candidate brick, but the candidate loop only uses
-`(found, t)` — the normal is recomputed for the winner in `brick_hit_at`. Split into a lean `dda_brick_find`
-(no normal) for the candidate loop; keep the normal tail for the winner re-walk only. Helps EVERY `trace()`
-call (gbuffer primary + GI bounce + shadow + DI). Image bit-identical. **DO FIRST.**
-
-### T2 — Fold winner attrs into the candidate loop; kill the `brick_hit_at` re-walk [agent 2]
-The winner re-walk (`brick_hit_at`, :390) runs a SECOND full slab+DDA of the winning brick for zero new info.
-Capture `(best_id, best_axis, best_cell)` when `ht < best_t` commits, then run only the normal tail on the
-winner. Halves the winning-brick DDA; adds ~2-3 live registers across the loop → Nsight-gate. Must reproduce
-the exact committed cell (seam-fix invariant; validate tests/voxel_show_through.rs).
+## Backlog (ranked by occupancy-impact × confidence) — T1 done, T2 rejected (above)
 
 ### T3 — Wavefront split of `restir_p1`: bounce-trace kernel → hit-sample buffer → temporal-merge kernel [agents 1,3,4 — CONSENSUS biggest lever]
 The reservoir + `merge_reservoirs` + world-cache-query RNG are live ACROSS the heavy bounce `trace()` in p1.
