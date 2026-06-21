@@ -103,6 +103,9 @@ struct Pool {
     voxel: wgpu::Buffer,
     palette: wgpu::Buffer,
     aabb: wgpu::Buffer,
+    /// 4-S2/S3: per-slot last_used_frame. The trace would write it live; in this headless harness it stays 0
+    /// (demand off — the residency's `demand_on()` gates on `params.frame != 0`), so behaviour is the distance cut.
+    last_used: wgpu::Buffer,
     max_resident: u32,
 }
 
@@ -143,7 +146,13 @@ fn make_pool(device: &wgpu::Device, max_resident: u32) -> Pool {
         contents: bytemuck::cast_slice(&aabb_host),
         usage,
     });
-    Pool { meta, voxel, palette, aabb, max_resident }
+    let last_used = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("pool_last_used"),
+        size: (max_resident as u64) * 4,
+        usage,
+        mapped_at_creation: false,
+    });
+    Pool { meta, voxel, palette, aabb, last_used, max_resident }
 }
 
 /// Count LIVE AABBs (min <= max on all axes) AND distinct degenerate vs origin-collapsed counts.
@@ -237,7 +246,7 @@ fn paged_front_end_drive_renders_like_eager() {
         let core_bufs: GpuBrickCoreBuffers = eager_cores.upload(&device);
         let pool = make_pool(&device, max_resident);
         let mut fe = GpuResidencyFrontEnd::new(&device, clip_half, max_resident);
-        fe.rebind_pool(&device, &queue, &occ_bufs, &core_bufs, &pool.meta, &pool.voxel, &pool.palette, &pool.aabb);
+        fe.rebind_pool(&device, &queue, &occ_bufs, &core_bufs, &pool.meta, &pool.voxel, &pool.palette, &pool.aabb, &pool.last_used);
         let frames = drive_to_convergence(&mut fe, &device, &queue, cam, "eager");
         let (live, origin, _degen) = aabb_stats(&device, &queue, &pool);
         eprintln!("[eager] converged in {frames} frames — {live} live AABBs ({origin} origin-collapsed)");
@@ -273,7 +282,7 @@ fn paged_front_end_drive_renders_like_eager() {
                 table_size: occ.table_size,
             };
             let core_owned = pager.core_buffers();
-            fe.rebind_pool(&device, &queue, &occ_owned, &core_owned, &pool.meta, &pool.voxel, &pool.palette, &pool.aabb);
+            fe.rebind_pool(&device, &queue, &occ_owned, &core_owned, &pool.meta, &pool.voxel, &pool.palette, &pool.aabb, &pool.last_used);
             bound = true;
         }
         let prev = fe.poll_change_count(&device);
@@ -343,7 +352,7 @@ fn paged_front_end_budget_eviction_keeps_nearest() {
     let full = {
         let pool = make_pool(&device, 16384);
         let mut fe = GpuResidencyFrontEnd::new(&device, clip_half, 16384);
-        fe.rebind_pool(&device, &queue, &occ_bufs, &core_bufs, &pool.meta, &pool.voxel, &pool.palette, &pool.aabb);
+        fe.rebind_pool(&device, &queue, &occ_bufs, &core_bufs, &pool.meta, &pool.voxel, &pool.palette, &pool.aabb, &pool.last_used);
         drive_to_convergence(&mut fe, &device, &queue, cam, "full-budget");
         live_brick_set(&device, &queue, &pool)
     };
@@ -357,7 +366,7 @@ fn paged_front_end_budget_eviction_keeps_nearest() {
     // TINY budget — eviction must keep the nearest `budget`.
     let pool = make_pool(&device, budget);
     let mut fe = GpuResidencyFrontEnd::new(&device, clip_half, budget);
-    fe.rebind_pool(&device, &queue, &occ_bufs, &core_bufs, &pool.meta, &pool.voxel, &pool.palette, &pool.aabb);
+    fe.rebind_pool(&device, &queue, &occ_bufs, &core_bufs, &pool.meta, &pool.voxel, &pool.palette, &pool.aabb, &pool.last_used);
     drive_to_convergence(&mut fe, &device, &queue, cam, "budget-cold");
     let set = live_brick_set(&device, &queue, &pool);
     assert!(set.len() <= budget as usize, "resident {} EXCEEDED the budget {budget}", set.len());
@@ -422,7 +431,7 @@ fn paged_front_end_multi_asset_far_asset_packs() {
                 table_size: occ.table_size,
             };
             let core_owned = pager.core_buffers();
-            fe.rebind_pool(&device, &queue, &occ_owned, &core_owned, &pool.meta, &pool.voxel, &pool.palette, &pool.aabb);
+            fe.rebind_pool(&device, &queue, &occ_owned, &core_owned, &pool.meta, &pool.voxel, &pool.palette, &pool.aabb, &pool.last_used);
             bound = true;
         }
         let _prev = fe.poll_change_count(&device);
@@ -641,7 +650,7 @@ fn paged_front_end_halo_no_spurious_air() {
                 table_size: occ.table_size,
             };
             let core_owned = pager.core_buffers();
-            fe.rebind_pool(&device, &queue, &occ_owned, &core_owned, &pool.meta, &pool.voxel, &pool.palette, &pool.aabb);
+            fe.rebind_pool(&device, &queue, &occ_owned, &core_owned, &pool.meta, &pool.voxel, &pool.palette, &pool.aabb, &pool.last_used);
             bound = true;
         }
         let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("halo_frame") });
@@ -924,7 +933,7 @@ fn paged_front_end_halo_no_spurious_air_under_motion() {
                 table_size: occ.table_size,
             };
             let core_owned = pager.core_buffers();
-            fe.rebind_pool(&device, &queue, &occ_owned, &core_owned, &pool.meta, &pool.voxel, &pool.palette, &pool.aabb);
+            fe.rebind_pool(&device, &queue, &occ_owned, &core_owned, &pool.meta, &pool.voxel, &pool.palette, &pool.aabb, &pool.last_used);
             bound = true;
         }
         let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("halo_motion_frame") });
@@ -956,7 +965,7 @@ fn paged_front_end_halo_no_spurious_air_under_motion() {
                 table_size: occ.table_size,
             };
             let core_owned = pager.core_buffers();
-            fe.rebind_pool(&device, &queue, &occ_owned, &core_owned, &pool.meta, &pool.voxel, &pool.palette, &pool.aabb);
+            fe.rebind_pool(&device, &queue, &occ_owned, &core_owned, &pool.meta, &pool.voxel, &pool.palette, &pool.aabb, &pool.last_used);
         }
         let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("halo_settle_frame") });
         fe.record_frame(&queue, &mut enc, last_cam);
@@ -1023,7 +1032,7 @@ fn paged_front_end_halo_partial_neighbour_no_overfill() {
     let core_bufs: GpuBrickCoreBuffers = cores.upload(&device);
     let pool = make_pool(&device, max_resident);
     let mut fe = GpuResidencyFrontEnd::new(&device, clip_half, max_resident);
-    fe.rebind_pool(&device, &queue, &occ_bufs, &core_bufs, &pool.meta, &pool.voxel, &pool.palette, &pool.aabb);
+    fe.rebind_pool(&device, &queue, &occ_bufs, &core_bufs, &pool.meta, &pool.voxel, &pool.palette, &pool.aabb, &pool.last_used);
     drive_to_convergence(&mut fe, &device, &queue, cam, "overfill");
 
     // Decode A's haloed meta.
@@ -1142,7 +1151,7 @@ fn paged_front_end_no_stuck_overlap_after_lod_transition() {
                 table_size: occ.table_size,
             };
             let core_owned = pager.core_buffers();
-            fe.rebind_pool(&device, &queue, &occ_owned, &core_owned, &pool.meta, &pool.voxel, &pool.palette, &pool.aabb);
+            fe.rebind_pool(&device, &queue, &occ_owned, &core_owned, &pool.meta, &pool.voxel, &pool.palette, &pool.aabb, &pool.last_used);
             bound = true;
         }
         let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("lod_leak_frame") });
@@ -1264,7 +1273,7 @@ fn paged_front_end_no_leak_growth_across_lod_oscillation() {
                 table_size: occ.table_size,
             };
             let core_owned = pager.core_buffers();
-            fe.rebind_pool(&device, &queue, &occ_owned, &core_owned, &pool.meta, &pool.voxel, &pool.palette, &pool.aabb);
+            fe.rebind_pool(&device, &queue, &occ_owned, &core_owned, &pool.meta, &pool.voxel, &pool.palette, &pool.aabb, &pool.last_used);
             *bound = true;
         }
         let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("lod_osc_frame") });
@@ -1384,7 +1393,7 @@ fn gpu_cold_fill_renders_surface_only_no_buried() {
     let core_bufs: GpuBrickCoreBuffers = cores.upload(&device);
     let pool = make_pool(&device, max_resident);
     let mut fe = GpuResidencyFrontEnd::new(&device, clip_half, max_resident);
-    fe.rebind_pool(&device, &queue, &occ_bufs, &core_bufs, &pool.meta, &pool.voxel, &pool.palette, &pool.aabb);
+    fe.rebind_pool(&device, &queue, &occ_bufs, &core_bufs, &pool.meta, &pool.voxel, &pool.palette, &pool.aabb, &pool.last_used);
     drive_to_convergence(&mut fe, &device, &queue, cam, "cold-fill");
 
     let metas_raw = read_u32(&device, &queue, &pool.meta, max_resident as usize * META_WORDS);
@@ -1513,7 +1522,7 @@ fn rich_palette_pool_no_content_corruption() {
     let core_bufs: GpuBrickCoreBuffers = cores.upload(&device);
     let pool = make_pool(&device, max_resident);
     let mut fe = GpuResidencyFrontEnd::new(&device, clip_half, max_resident);
-    fe.rebind_pool(&device, &queue, &occ_bufs, &core_bufs, &pool.meta, &pool.voxel, &pool.palette, &pool.aabb);
+    fe.rebind_pool(&device, &queue, &occ_bufs, &core_bufs, &pool.meta, &pool.voxel, &pool.palette, &pool.aabb, &pool.last_used);
     drive_to_convergence(&mut fe, &device, &queue, cam, "rich-palette");
 
     let metas_raw = read_u32(&device, &queue, &pool.meta, max_resident as usize * META_WORDS);

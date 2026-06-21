@@ -1863,9 +1863,20 @@ struct SceneKeepAlive {
     /// A3 — the per-CHUNK DESCRIPTOR buffer (group 0 binding 13): one identity descriptor per chunk, each with
     /// `meta_base = chunk·CHUNK_SLOTS`. Keep-alive only (the bind group's Arc references it).
     _descriptors_buf: wgpu::Buffer,
+    /// 4-S2/S3 — per-slot `last_used_frame` (group 0 binding 14): the GI trace `atomicMax`es it on a hit; the
+    /// residency front end reads it (bound via `rebind_pool`) for ray-guided keep + LRU eviction. CAPACITY-sized
+    /// when demand is on, else a 1-element dummy ([`voxel_demand_enabled`]).
+    last_used_buf: wgpu::Buffer,
     /// True iff this scene is a STREAMED fixed-cap epoch (a `Delta` can patch it). False for a static contiguous
     /// `Snapshot` (every generation re-creates).
     streamed: bool,
+}
+
+/// 4-S2/S3/S4 — is the ray-guided demand-residency feature ON? Gates the per-slot `last_used` feedback buffer
+/// (CAPACITY vs a 1-element dummy) + the residency's ray-guided-keep / LRU paths. OFF by default (the trace's
+/// `arrayLength > 1` guard then never writes ⇒ zero behaviour change). Dev knob `ADVENTURE_DEMAND=1`.
+fn voxel_demand_enabled() -> bool {
+    std::env::var("ADVENTURE_DEMAND").is_ok_and(|v| v != "0" && !v.is_empty())
 }
 
 /// The PERSISTENT world-space radiance-cache GPU state (Phase 2.1): the 11 storage buffers + the `group(3)`
@@ -2535,6 +2546,9 @@ fn init_voxel_rt(mut commands: Commands, render_device: Res<RenderDevice>) {
             storage_ro(3),  // palette (block id → colour)
             storage_ro(12), // brick_palettes (R2b per-brick palettes)
             storage_ro(13), // A3: instance descriptors (per-instance/per-chunk transform + base offsets)
+            storage_rw(14), // 4-S2/S3: last_used_frame per slot (trace atomicMaxes on hit; residency reads for
+                            // ray-guided keep + LRU eviction). A 1-elem DUMMY when demand is off ⇒ the trace's
+                            // `arrayLength > 1` guard never writes ⇒ zero behaviour change.
         ],
     });
     let view_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -4144,6 +4158,17 @@ fn build_scene_full(
         usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
         contents: brick_palettes_bytes,
     });
+    // 4-S2/S3: per-slot `last_used_frame` — the GI trace `atomicMax`es it on a hit; the residency reads it for
+    // ray-guided KEEP (a recently-hit brick survives the distance cut) + LRU eviction. CAPACITY-sized (one u32 per
+    // slot) when demand is ON, else a 1-element DUMMY so the trace's `arrayLength(&last_used) > 1` guard never
+    // fires (zero behaviour change). Bound to BOTH the scene bind group (trace WRITE) and the residency front end
+    // (READ, via rebind_pool) — the same buffer feeds the feedback loop, readback-free.
+    let last_used_len = if voxel_demand_enabled() { blas_primitives.max(1) } else { 1 };
+    let last_used_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("voxel_rt_last_used"),
+        contents: bytemuck::cast_slice(&vec![0u32; last_used_len as usize]),
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+    });
     // A3 Stage 3 — partition the `blas_primitives` slots into SLOT-BAND CHUNKS of `CHUNK_SLOTS` each. One BLAS
     // per chunk (reading its band as a slice of the shared `aabb_buf` via `primitive_offset`), one identity TLAS
     // instance per chunk (`custom_index = chunk index → descriptor`), one identity descriptor per chunk with
@@ -4224,6 +4249,7 @@ fn build_scene_full(
             wgpu::BindGroupEntry { binding: 3, resource: palette_buf.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 12, resource: brick_palettes_buf.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 13, resource: descriptors_buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 14, resource: last_used_buf.as_entire_binding() },
         ],
     });
 
@@ -4240,6 +4266,7 @@ fn build_scene_full(
         _palette_buf: palette_buf,
         brick_palettes_buf,
         _descriptors_buf: descriptors_buf,
+        last_used_buf,
         streamed,
     });
 }
@@ -4495,6 +4522,7 @@ fn drive_gpu_residency_front_end(
         let voxel = scene.voxel_buf.clone();
         let palettes = scene.brick_palettes_buf.clone();
         let aabb = scene.aabb_buf.clone();
+        let last_used = scene.last_used_buf.clone(); // 4-S2/S3: the trace-written per-slot last_used (ray-keep + LRU)
         // Build OWNED buffer-handle copies (the `wgpu::Buffer`s are cheap `Arc`-backed clones) so the immutable
         // borrow of `resources`'s stores ends before the mutable front-end borrow (no overlap). Both the pager's
         // and the eager upload's stores expose the SAME `GpuResidencyBuffers`/`GpuBrickCoreBuffers` shape.
@@ -4529,7 +4557,7 @@ fn drive_gpu_residency_front_end(
             )
         };
         let fe = resources.gpu_front_end.as_mut().expect("just built");
-        fe.rebind_pool(device, queue, &occ_owned, &core_owned, &meta, &voxel, &palettes, &aabb);
+        fe.rebind_pool(device, queue, &occ_owned, &core_owned, &meta, &voxel, &palettes, &aabb, &last_used);
         resources.gpu_front_end_epoch = Some(params.epoch);
         // Fresh pool/chunks for this epoch — drop any stale dirty-chunk indices from the previous scene. The cold
         // re-stream re-marks every chunk it touches, so the new scene's BLAS rebuilds from scratch correctly.

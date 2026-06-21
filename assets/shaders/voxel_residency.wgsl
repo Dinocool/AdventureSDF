@@ -271,8 +271,13 @@ struct ResidencyParams {
     backdrop_lod: u32,           // 4-S1: LODs >= this are the always-resident coarse BACKDROP (exempt from the
                                  // distance-budget cut; reserved from `room`). MAX_LOD+1 ⇒ OFF (identical behaviour).
     cam_world: vec3<f32>,         // ENTER-CAP: the camera world position (for the nearest-priority distance rank)
-    _pad2: u32,
+    frame: u32,                  // 4-S2/S3: current frame counter — age `last_used` for ray-guided keep + LRU (0 = demand off)
 }
+
+// 4-S2/S3 — how many frames a ray-hit brick is KEPT (exempt from the distance cut) after its last hit. The trace
+// stamps `last_used[slot] = frame` on every primary hit; `try_enter` stamps it at enter (so a fresh brick isn't
+// instantly "stale"). A brick not hit for longer than this falls back under the normal distance/budget cut (LRU).
+const RAY_KEEP_FRAMES: u32 = 30u;
 
 // 4-S1 — is `lod` part of the always-resident coarse backdrop? The backdrop is the coarsest LOD band the camera
 // keeps out to `clip_half` REGARDLESS of the nearest-`max_resident` budget cut, so distant terrain stays visible
@@ -586,6 +591,25 @@ const PRESENT_WORDS: u32 = 4u;
 const HIST_BUCKETS: u32 = 4096u;
 @group(0) @binding(50) var<storage, read_write> enter_hist: array<atomic<u32>>;
 @group(0) @binding(51) var<storage, read_write> enter_cap: array<u32>; // [cut_bucket, room]
+// 4-S2/S3: the SCENE's per-slot last_used_frame (the GI trace atomicMaxes it on a hit; `try_enter` stamps it at
+// enter). A 1-element DUMMY when demand is off — `demand_on()` gates all reads/writes (zero behaviour change).
+@group(0) @binding(52) var<storage, read_write> last_used: array<atomic<u32>>;
+
+// 4-S2/S3 — is the ray-guided demand feature ON this frame? Gated by buffer size (CAPACITY vs 1-elem dummy) AND a
+// non-zero frame counter, so an off build does ZERO last_used work (the distance/budget cut alone, as before).
+fn demand_on() -> bool {
+    return params.frame != 0u && arrayLength(&last_used) > 1u;
+}
+
+// 4-S2/S3 — was `slot`'s brick ray-hit (or entered) within the last RAY_KEEP_FRAMES? Such a brick is KEPT even
+// beyond the distance/budget cut (ray-guided residency) and counts as recently-used for the LRU.
+fn ray_recently_used(slot: u32) -> bool {
+    if (!demand_on()) {
+        return false;
+    }
+    let lu = atomicLoad(&last_used[slot]);
+    return lu != 0u && (params.frame - lu) < RAY_KEEP_FRAMES;
+}
 
 // The world-distance of candidate `(coord,lod)`'s CENTRE to the camera (SSOT mirror of `brick_world_dist`).
 fn cand_world_dist(coord: vec3<i32>, lod: u32) -> f32 {
@@ -939,6 +963,9 @@ fn try_enter(coord: vec3<i32>, lod: u32) {
         return;
     }
     let slot = free_ring[head % cap];
+    // 4-S2/S3: stamp the freshly-entered brick as used THIS frame so the LRU doesn't evict it before the trace
+    // ever ray-hits it (a brick entered but not-yet-rendered would otherwise read last_used == 0 = stale).
+    if (demand_on()) { atomicStore(&last_used[slot], params.frame); }
     // Insert (coord,lod)->slot into the slot table (atomic linear-probe claim of an EMPTY slot).
     let size = diff_cfg.slot_table_size;
     let mask = size - 1u;
@@ -1079,6 +1106,11 @@ fn diff_drop_mark(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (present_contains(coord, lod) && classify_surface(coord, lod)) {
         if (is_backdrop(lod)) {
             return; // 4-S1: backdrop bricks are pinned — never evicted for distance (kept out to clip_half)
+        }
+        // 4-S2/S3: ray-guided KEEP — a brick the GI trace hit within the last RAY_KEEP_FRAMES survives the distance
+        // cut (residency follows where the rays actually look; not-recently-used bricks fall back to the cut = LRU).
+        if (ray_recently_used(atomicLoad(&slot_table[base + 4u]))) {
+            return; // keep — recently ray-used
         }
         // Still a desired surface candidate. BUDGET EVICTION (Phase 4): if it is BEYOND the nearest-`max_resident`
         // cut radius, evict it to make room for nearer bricks (distance-priority, deterministic ⇒ converges; it

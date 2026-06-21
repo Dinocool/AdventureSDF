@@ -392,8 +392,12 @@ impl GpuDrive {
         let palette_pool_base =
             buf_init(&device, "palette_pool_base", bytemuck::cast_slice(&[0u32]), wgpu::BufferUsages::STORAGE);
         let _ = index_class_words; // (kept imported for the pool-sizing comment; per-class sizing no longer used)
-        let enter_hist = storage_buf(&device, "enter_hist", (HIST_BUCKETS as u64) * 4);
+        // +1: the trailing slot is the 4-S1 backdrop-reserve counter (clear_per_frame_hashes always clears it).
+        let enter_hist = storage_buf(&device, "enter_hist", (HIST_BUCKETS as u64 + 1) * 4);
         let enter_cap = buf_init(&device, "enter_cap", bytemuck::cast_slice(&[HIST_BUCKETS, 0u32]), storage_usage());
+        // 4-S2/S3: per-slot last_used (binding 52). Zeroed dummy — with the mirror's frame=0, `demand_on()` is false
+        // so the residency never reads/writes it (behaviour = the distance cut). Sized to the pool slot count.
+        let last_used = storage_buf(&device, "last_used", (max_resident as u64) * 4);
 
         // --- the residency shader (Pass A–D) + the pack shader (classify/pack/write_aabb) ---
         let res_src = std::fs::read_to_string("assets/shaders/voxel_residency.wgsl").expect("read residency");
@@ -458,6 +462,7 @@ impl GpuDrive {
                 storage_entry(47, true),  // classify_out
                 storage_entry(50, false), // enter_hist
                 storage_entry(51, false), // enter_cap
+                storage_entry(52, false), // 4-S2/S3 last_used
             ],
         });
         let res_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -548,6 +553,7 @@ impl GpuDrive {
                     bind(47, &classify_out),
                     bind(50, &enter_hist),
                     bind(51, &enter_cap),
+                    bind(52, &last_used),
                 ]
             };
         }

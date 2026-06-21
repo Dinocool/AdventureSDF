@@ -193,6 +193,10 @@ fn affine_dir(r0: vec4<f32>, r1: vec4<f32>, r2: vec4<f32>, v: vec3<f32>) -> vec3
 // A3 — the per-instance descriptor table (group 0, binding 13). Indexed by `instance_custom_data`. For the
 // streamed world it holds ONE identity descriptor 0 (Stage 1) / one per CHUNK (Stage 3), all identity-transform.
 @group(0) @binding(13) var<storage, read> descriptors: array<InstanceDescriptor>;
+// 4-S2/S3: per-slot `last_used_frame`. The primary trace `atomicMax`es the current frame here on a hit; the
+// residency front end reads it for ray-guided KEEP (a recently-hit brick survives the distance cut) + LRU eviction.
+// A 1-element DUMMY buffer when demand is off — the `arrayLength(&last_used) > 1u` guard then never writes (zero cost).
+@group(0) @binding(14) var<storage, read_write> last_used: array<atomic<u32>>;
 @group(0) @binding(1) var<storage, read> metas: array<BrickMeta>;
 // Storage plan R2b — the bit-packed INDEX STREAM (was a raw `u32`-per-cell id buffer). A dense brick's indices
 // begin at `metas[].voxel_offset`, are `metas[].index_bits()`-wide, and reference the per-brick palette below.
@@ -2247,6 +2251,8 @@ fn restir_p1(@builtin(global_invocation_id) gid: vec3<u32>) {
         // Receiver surface for THIS pixel — written on every hit (independent of probes/GI) so the DI + spatial
         // dispatches that follow can recover (n, p) from the buffer instead of re-tracing the primary ray.
         surfaces_cur[idx] = PixelSurface(p, 1.0, r.normal, 0.0);
+        // 4-S2/S3: stamp the hit brick as ray-used THIS frame (ray-guided keep + LRU). Gated by buffer size (dummy = off).
+        if (arrayLength(&last_used) > 1u) { atomicMax(&last_used[r.prim], light.frame_index); }
         // Skip the per-pixel ReSTIR GI candidate gen when screen probes drive the diffuse — shade reads the probe
         // SH instead, so the reservoir work is pure waste. DI (di_p1) still runs (probes are diffuse-only).
         if (probe_params.enabled == 0u) {
@@ -2270,6 +2276,8 @@ fn restir_dlss_p1(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (r.hit != 0u) {
         let p = ray[0] + ray[1] * r.t;
         surfaces_cur[idx] = PixelSurface(p, 1.0, r.normal, 0.0);
+        // 4-S2/S3: stamp the hit brick as ray-used THIS frame (ray-guided keep + LRU). Gated by buffer size (dummy = off).
+        if (arrayLength(&last_used) > 1u) { atomicMax(&last_used[r.prim], light.frame_index); }
         if (probe_params.enabled == 0u) {
             let seed = (gid.x * 1973u + gid.y * 9277u + light.frame_index * 26699u) | 1u;
             let temporal_base = reproject_pixel(p, dlss_cam.motion_prev, vp);
