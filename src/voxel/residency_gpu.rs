@@ -640,6 +640,38 @@ pub struct GpuBrickCoreBuffers {
     pub table_size: u32,
 }
 
+/// **The GPU residency PRODUCER abstraction** — fills the GPU sector-occupancy + brick-core stores the
+/// readback-free front end ([`super::residency_front_end::GpuResidencyFrontEnd`]) face-culls + halo-fills against,
+/// for the camera's resident set. The streamed `.vxo` prefetcher
+/// ([`super::residency_pager::StreamedResidencyPager`]) is the canonical impl; worldgen (procedural, eventually
+/// GPU-filled) is a future impl. The front end is PRODUCER-AGNOSTIC — it consumes ONLY this trait, so adding a new
+/// source means adding a `ResidencyProducer`, not branching the drive. ONE GPU residency path, MANY producers
+/// (the docs/UNIFIED_GPU_RESIDENCY_PLAN.md +1 directive). `Send + Sync` so it can live in a render-world resource.
+pub trait ResidencyProducer: Send + Sync {
+    /// The scene epoch this producer fills residency for (matched against the live params epoch by the caller).
+    fn epoch(&self) -> u64;
+    /// Page the camera's resident set in/out for THIS frame (camera-driven, readback-free). Returns `true` on a
+    /// structural crossing (the caller logs/diagnoses); buffer identity is unchanged — see [`take_needs_rebind`].
+    ///
+    /// [`take_needs_rebind`]: Self::take_needs_rebind
+    fn update(&mut self, queue: &wgpu::Queue, cam: [f32; 3]) -> bool;
+    /// The GPU sector-occupancy the front end's enumerate face-culls against.
+    fn occupancy(&self) -> &GpuResidencyBuffers;
+    /// A cheap cloned-handle view of the GPU brick-core store the front end halo-fills from.
+    fn core_buffers(&self) -> GpuBrickCoreBuffers;
+    /// `true` once after a (re)allocation of this producer's stores — forces the front-end bind-group rebind.
+    fn take_needs_rebind(&mut self) -> bool;
+    /// DIAGNOSTIC (`ADVENTURE_PAGED_DIAG` / F9 dump): resident region + core counts.
+    fn resident_region_count(&self) -> usize;
+    /// DIAGNOSTIC: resident (distinct paged) core count.
+    fn resident_core_count(&self) -> usize;
+    /// DEBUG (F9 dump): the SOURCE core for `(coord, lod)` if this producer can supply it (the exact `8³` core the
+    /// GPU pack should have produced), else `None`.
+    fn debug_source_core(&self, coord: IVec3, lod: u32) -> Option<[u32; super::brickmap::BRICK_VOXELS]>;
+    /// DEBUG (F9 dump): is `(coord, lod)`'s core LIVE in this producer's GPU core store right now?
+    fn debug_core_in_store(&self, coord: IVec3, lod: u32) -> bool;
+}
+
 /// `u32` words per `8³` brick core (= [`super::brickmap::BRICK_VOXELS`] = 512).
 const CORE_WORDS: usize = super::brickmap::BRICK_VOXELS;
 

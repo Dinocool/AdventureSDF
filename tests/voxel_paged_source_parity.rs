@@ -23,7 +23,7 @@
 use adventure::voxel::brickmap::{BRICK_EDGE, BRICK_VOXELS, Brick, BrickMap};
 use adventure::voxel::edits::VoxelEdits;
 use adventure::voxel::palette::{BlockId, BlockRegistry};
-use adventure::voxel::residency_gpu::{BrickCoreStore, SectorOccupancy, brick_key_hash};
+use adventure::voxel::residency_gpu::{BrickCoreStore, ResidencyProducer, SectorOccupancy, brick_key_hash};
 use adventure::voxel::residency_pager::StreamedResidencyPager;
 use adventure::voxel::source::{BrickSource, StaticVoxSource};
 use adventure::voxel::streaming::{ResidencyManager, StreamingConfig};

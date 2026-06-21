@@ -1676,7 +1676,14 @@ struct VoxelRtResources {
     /// the prefetcher pages the clipmap-covering present regions in/out (camera-driven, constant-RAM,
     /// readback-free), and the front end binds to ITS occupancy + core buffers (not the eager in-RAM ones). `None`
     /// for an in-RAM scene (Sponza / `.vox` Gallery — which use the eager `gpu_residency`/`gpu_core_store`).
-    streamed_pager: Option<super::residency_pager::StreamedResidencyPager>,
+    ///
+    /// Typed as the [`ResidencyProducer`] abstraction (not the concrete pager): the front-end drive consumes ONLY
+    /// the trait, so a future producer (e.g. worldgen) is a drop-in here with no drive change. The streamed `.vxo`
+    /// [`StreamedResidencyPager`] is the only impl today.
+    ///
+    /// [`ResidencyProducer`]: super::residency_gpu::ResidencyProducer
+    /// [`StreamedResidencyPager`]: super::residency_pager::StreamedResidencyPager
+    streamed_pager: Option<Box<dyn super::residency_gpu::ResidencyProducer>>,
     /// Output storage texture (rgba16float) + view + size; reallocated on view resize.
     output: Option<(wgpu::Texture, wgpu::TextureView, UVec2)>,
     /// The TEMPORAL-ACCUMULATION history texture (rgba16float) + view: the previous frame's accumulated
@@ -4401,14 +4408,14 @@ fn drive_gpu_residency_front_end(
         // allocates its own GPU stores.
         let stale = resources.streamed_pager.as_ref().map(|p| p.epoch()) != Some(*epoch);
         if stale {
-            resources.streamed_pager = Some(super::residency_pager::StreamedResidencyPager::new(
+            resources.streamed_pager = Some(Box::new(super::residency_pager::StreamedResidencyPager::new(
                 device,
                 queue,
                 std::sync::Arc::clone(src),
                 *epoch,
                 params.clip_half_bricks,
                 params.max_resident.max(1),
-            ));
+            )));
             resources.gpu_front_end_epoch = None; // force a rebind against the new pager stores
             info!("voxel-RT G-c.4-paging: built the streamed region prefetcher for epoch {epoch}");
         }

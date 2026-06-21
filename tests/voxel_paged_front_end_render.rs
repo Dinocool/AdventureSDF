@@ -18,7 +18,7 @@ use adventure::voxel::incremental::degenerate_aabb;
 use adventure::voxel::palette::{BlockId, BlockRegistry};
 use adventure::voxel::residency_front_end::GpuResidencyFrontEnd;
 use adventure::voxel::residency_gpu::{
-    BrickCoreStore, GpuBrickCoreBuffers, GpuResidencyBuffers, SectorOccupancy,
+    BrickCoreStore, GpuBrickCoreBuffers, GpuResidencyBuffers, ResidencyProducer, SectorOccupancy,
 };
 use adventure::voxel::residency_pager::StreamedResidencyPager;
 use adventure::voxel::source::{BrickSource, StaticVoxSource};
