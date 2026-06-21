@@ -101,7 +101,10 @@ fn build_params(cam: [f32; 3], half: i32, backdrop_lod: u32, frame: u32) -> Resi
     let mut levels = [LevelParams::zeroed(); LODS];
     let mut offset = 0u32;
     for lod in 0..=MAX_LOD {
-        let (lo, hi) = level_box_pub(cam, lod, half);
+        // 4-S4: backdrop LODs use the extended reach so the CPU cell grid covers exactly what the WGSL
+        // `level_resident` (which applies `BACKDROP_REACH` internally) accepts — else the extra backdrop bricks
+        // would never be enumerated/entered.
+        let (lo, hi) = level_box_pub(cam, lod, lod_clip_half(lod, half, backdrop_lod));
         let cam_brick = camera_brick_coord_lod(cam, lod);
         let cell_lo = IVec3::new(
             lo.x.div_euclid(WG_CELL) * WG_CELL,
@@ -142,6 +145,17 @@ fn build_params(cam: [f32; 3], half: i32, backdrop_lod: u32, frame: u32) -> Resi
 
 /// Enter-cap distance histogram buckets — MUST equal `HIST_BUCKETS` in `voxel_residency.wgsl`.
 const HIST_BUCKETS: u32 = 4096;
+
+/// 4-S4 — backdrop LODs reach `BACKDROP_REACH×` farther than `clip_half` (cheap coarse extends beyond the fine
+/// clipmap = see-far). MUST match `voxel_residency.wgsl::BACKDROP_REACH` + the pager's `desired_regions`.
+pub const BACKDROP_REACH: i32 = 4;
+
+/// 4-S4 — the effective clip half-extent for `lod`: `clip_half` for fine LODs, `clip_half · BACKDROP_REACH` for the
+/// pinned coarse backdrop (LODs >= `backdrop_lod`). `backdrop_lod > MAX_LOD` (off) ⇒ always `half` (no extension).
+#[inline]
+pub fn lod_clip_half(lod: u32, half: i32, backdrop_lod: u32) -> i32 {
+    if lod >= backdrop_lod { half * BACKDROP_REACH } else { half }
+}
 
 /// The maximum `total_cells` (shell WG-cells across all LODs) the front end's `shell_idx`/list buffers are sized
 /// for, AND the candidate/enter/drop/pack/aabb list capacity. It bounds the transient per-frame work, NOT the

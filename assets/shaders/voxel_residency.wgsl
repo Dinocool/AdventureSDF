@@ -300,13 +300,22 @@ fn snap_odd(v: i32) -> i32 { return v | 1; }
 
 // Level `lod`'s INCLUSIVE resident AABB on grid `lod` (`level_box`, streaming.rs:168): a cube of half-extent
 // `half` around the camera's brick on that grid, snapped per axis to the 2×-coarser grid.
+// 4-S4 — the BACKDROP LODs reach `BACKDROP_REACH×` farther than `clip_half` so the cheap coarse backdrop extends
+// WELL BEYOND the fine clipmap (see-far at a fixed fine budget). MUST match `residency_front_end.rs::BACKDROP_REACH`
+// + the pager's. `1` (or backdrop off) ⇒ no extension.
+const BACKDROP_REACH: i32 = 4;
+fn lod_half(lod: u32, half: i32) -> i32 {
+    return select(half, half * BACKDROP_REACH, is_backdrop(lod));
+}
 fn level_box_lo(lod: u32, half: i32) -> vec3<i32> {
+    let h = lod_half(lod, half);
     let c = params.levels[lod].cam_brick_coord;
-    return vec3<i32>(snap_even(c.x - half), snap_even(c.y - half), snap_even(c.z - half));
+    return vec3<i32>(snap_even(c.x - h), snap_even(c.y - h), snap_even(c.z - h));
 }
 fn level_box_hi(lod: u32, half: i32) -> vec3<i32> {
+    let h = lod_half(lod, half);
     let c = params.levels[lod].cam_brick_coord;
-    return vec3<i32>(snap_odd(c.x + half), snap_odd(c.y + half), snap_odd(c.z + half));
+    return vec3<i32>(snap_odd(c.x + h), snap_odd(c.y + h), snap_odd(c.z + h));
 }
 
 // The INCLUSIVE hole AABB (on grid `lod`) that level `lod` cedes to the finer level `lod-1` (`level_hole`,

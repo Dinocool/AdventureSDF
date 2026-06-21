@@ -52,6 +52,9 @@ pub struct StreamedResidencyPager {
     epoch: u64,
     /// The clip half-extent in bricks (the prefetcher's per-LOD `level_box` reach). Fixed for the epoch.
     clip_half: i32,
+    /// 4-S4: the coarse-backdrop LOD threshold (LODs >= this page out to `clip_half · BACKDROP_REACH` so the cheap
+    /// coarse backdrop extends beyond the fine clipmap). Read from `ADVENTURE_BACKDROP_LOD` (default off = no extension).
+    backdrop_lod: u32,
 
     /// The currently-paged region set (so a frame's update is a SET DIFF — page in newly-covered, drop uncovered).
     resident: FxHashSet<RegionKey>,
@@ -106,11 +109,18 @@ impl StreamedResidencyPager {
         // (one bounded buffer), and a brick beyond it is simply not core-resident (a graceful far-detail drop, not
         // a crash; the free-list panic would be a mis-size — `MAX_CORE_BUFFER_CORES` keeps us under the limit).
         let core_cap = max_resident.saturating_mul(2).clamp(1, MAX_CORE_BUFFER_CORES);
+        // 4-S4: match the front end's backdrop threshold (default MAX_LOD+1 = off) so the pager pages the extended
+        // coarse-backdrop regions the front end will enumerate beyond `clip_half`.
+        let backdrop_lod = std::env::var("ADVENTURE_BACKDROP_LOD")
+            .ok()
+            .and_then(|s| s.parse::<u32>().ok())
+            .unwrap_or(MAX_LOD + 1);
 
         Self {
             source,
             epoch,
             clip_half,
+            backdrop_lod,
             resident: FxHashSet::default(),
             decoded: FxHashMap::default(),
             occ_buffers,
@@ -127,7 +137,9 @@ impl StreamedResidencyPager {
         let mut desired = FxHashSet::default();
         let mut scratch: Vec<IVec3> = Vec::new();
         for lod in 0..=MAX_LOD {
-            let (wlo, whi) = level_box_pub(cam, lod, self.clip_half);
+            // 4-S4: backdrop LODs reach BACKDROP_REACH× farther (page the extended coarse backdrop the front end
+            // enumerates beyond clip_half). Matches `residency_front_end::lod_clip_half` + the WGSL.
+            let (wlo, whi) = level_box_pub(cam, lod, super::residency_front_end::lod_clip_half(lod, self.clip_half, self.backdrop_lod));
             for (ai, asset) in self.source.placed_assets().iter().enumerate() {
                 // Clip the world clipmap box to the asset's placed bounds (on the LOD-lod grid), then to LOCAL.
                 let (alo, ahi) = self.source.asset_lod_bounds(ai, lod);
