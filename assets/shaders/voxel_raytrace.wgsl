@@ -254,7 +254,20 @@ fn dh_normal(d: vec4<f32>, rd: vec3<f32>) -> vec3<f32> {
 // the solid cell: for the first cell (no step taken yet) it is the AABB-entry face (the largest-near-slab
 // axis); for a later cell it is the axis of the last advance. The SSOT for both the committed intersection
 // distance (the candidate uses the t) and the recovered shading data (colour + normal).
-fn dda_brick(prim: u32, ro: vec3<f32>, rd: vec3<f32>, t_enter: f32, t_exit: f32) -> vec4<f32> {
+// The march's result. The candidate loops (`trace`/`trace_occluded`) consume only `found`+`hit_t`, so they call
+// `dda_brick_march` and SKIP the per-candidate face-normal reconstruction below — that normal work runs ONCE,
+// for the winning brick only, inside `dda_brick` (via `brick_hit_at`'s re-walk). `hit_vox`/`last_axis`/`step`
+// are the inputs the normal tail needs.
+struct BrickMarch {
+    found: bool,
+    hit_t: f32,
+    hit_id: u32,
+    hit_vox: vec3<i32>,
+    last_axis: i32,
+    step: vec3<i32>,
+};
+
+fn dda_brick_march(prim: u32, ro: vec3<f32>, rd: vec3<f32>, t_enter: f32, t_exit: f32) -> BrickMarch {
     let m = metas[prim];
     let core = lod_edge(meta_lod(m));        // CORE grid cells per axis at this brick's LOD
     let hedge = core + 2;                    // STORED grid edge (core + 1-cell halo border each side)
@@ -333,6 +346,23 @@ fn dda_brick(prim: u32, ro: vec3<f32>, rd: vec3<f32>, t_enter: f32, t_exit: f32)
             }
         }
     }
+    return BrickMarch(found, hit_t, hit_id, hit_vox, last_axis, step);
+}
+
+// Full brick hit = the march PLUS the first-solid cell's entry-face normal. The normal reconstruction (the
+// exposed-face scan + up to ~6 extra `cell_block` fetches) runs ONLY here — for the WINNING brick's re-walk
+// (`brick_hit_at`), never per candidate. Returns the packed vec4(found, t, id, normal-code) the `dh_*` decode.
+fn dda_brick(prim: u32, ro: vec3<f32>, rd: vec3<f32>, t_enter: f32, t_exit: f32) -> vec4<f32> {
+    let m = metas[prim];
+    let core = lod_edge(meta_lod(m));
+    let hedge = core + 2;
+    let mh = dda_brick_march(prim, ro, rd, t_enter, t_exit);
+    let found = mh.found;
+    let hit_t = mh.hit_t;
+    let hit_id = mh.hit_id;
+    let hit_vox = mh.hit_vox;
+    let last_axis = mh.last_axis;
+    let step = mh.step;
 
     // Outward FACE NORMAL = the face the ray ENTERED the hit cell through (the crossed axis), so each face of a
     // cube gets its OWN crisp normal and it is camera-INDEPENDENT per face (no whole-flat-face "normal swap").
@@ -447,9 +477,9 @@ fn trace(ro: vec3<f32>, rd: vec3<f32>, t_min: f32, t_max: f32) -> TraceResult {
             let t_exit  = min(min(max(ta.x, tb.x), max(ta.y, tb.y)), max(ta.z, tb.z));
             // The slab t-range is in OBJECT space; the t_min/t_exit gate is against the WORLD t (× inv_scale).
             if (t_enter <= t_exit && t_exit * d.inv_scale >= t_min) {
-                let bh = dda_brick(prim, ro_l, rd_l, t_enter, t_exit);
-                if (dh_found(bh)) {
-                    let ht = dh_t(bh) * d.inv_scale; // local-t → WORLD-t for the cross-instance nearest compare
+                let bh = dda_brick_march(prim, ro_l, rd_l, t_enter, t_exit); // lean: no per-candidate normal
+                if (bh.found) {
+                    let ht = bh.hit_t * d.inv_scale; // local-t → WORLD-t for the cross-instance nearest compare
                     if (ht < best_t) {
                         best_t = ht;
                         best_prim = prim;
@@ -531,9 +561,9 @@ fn trace_occluded(ro: vec3<f32>, rd: vec3<f32>, t_min: f32, t_max: f32) -> bool 
             let t_enter = max(max(min(ta.x, tb.x), min(ta.y, tb.y)), min(ta.z, tb.z));
             let t_exit  = min(min(max(ta.x, tb.x), max(ta.y, tb.y)), max(ta.z, tb.z));
             if (t_enter <= t_exit && t_exit * d.inv_scale >= t_min) {
-                let bh = dda_brick(prim, ro_l, rd_l, t_enter, t_exit);
-                let world_t = dh_t(bh) * d.inv_scale; // local-t → WORLD-t for the t_max occlusion gate
-                if (dh_found(bh) && world_t <= t_max) {
+                let bh = dda_brick_march(prim, ro_l, rd_l, t_enter, t_exit); // lean: no per-candidate normal
+                let world_t = bh.hit_t * d.inv_scale; // local-t → WORLD-t for the t_max occlusion gate
+                if (bh.found && world_t <= t_max) {
                     rayQueryGenerateIntersection(&rq, world_t);
                 }
             }
@@ -2242,26 +2272,43 @@ fn restir_primary_ray(gid: vec3<u32>) -> array<vec3<f32>, 2> {
 // so reservoir accumulation continues under camera motion instead of resetting (disocclusions on fast motion
 // caught by the `surfaces_dissimilar` reject in `restir_p1_core`). The reservoir `reset` flag fires only on
 // first-frame / resolution change / teleport / scene switch.
+// ===== PRIMARY G-BUFFER pass: trace the primary ray ONCE and write the receiver surface (pos/normal/albedo/
+// emissive) to `surfaces_cur`. Every lighting kernel that follows (restir_p1's GI bounce, di_p1, spatial, the
+// restir_p2 shade) then READS this G-buffer instead of (re-)tracing the primary ray — so the primary is traced
+// exactly ONCE per frame and each lighting kernel carries at most ONE ray-query (its own secondary), which lifts
+// occupancy on the register-limited GI pass. Shared by the DLSS + non-DLSS paths (the primary ray is the same
+// deterministic un-jittered ray on both). Runs FIRST in the compute pass; the inter-dispatch storage barrier
+// makes its writes visible to the readers. =====
+@compute @workgroup_size(8, 8, 1)
+fn gbuffer(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let vp = camera.viewport;
+    if (gid.x >= vp.x || gid.y >= vp.y) { return; }
+    let idx = gid.y * vp.x + gid.x;
+    let ray = restir_primary_ray(gid);
+    let r = trace(ray[0], ray[1], 0.0, camera.t_max);
+    if (r.hit != 0u) {
+        let p = ray[0] + ray[1] * r.t;
+        surfaces_cur[idx] = PixelSurface(p, 1.0, r.normal, 0.0, r.color.rgb, 0.0, r.emissive, 0.0);
+    } else {
+        surfaces_cur[idx] = PixelSurface(vec3<f32>(0.0), 0.0, vec3<f32>(0.0), 0.0, vec3<f32>(0.0), 0.0, vec3<f32>(0.0), 0.0);
+    }
+}
+
 @compute @workgroup_size(8, 8, 1)
 fn restir_p1(@builtin(global_invocation_id) gid: vec3<u32>) {
     let vp = camera.viewport;
     if (gid.x >= vp.x || gid.y >= vp.y) { return; }
     let idx = gid.y * vp.x + gid.x;
     reservoirs_b[idx] = empty_reservoir(); // default for misses; overwritten for lit hits
-    surfaces_cur[idx] = PixelSurface(vec3<f32>(0.0), 0.0, vec3<f32>(0.0), 0.0, vec3<f32>(0.0), 0.0, vec3<f32>(0.0), 0.0); // invalid until a lit hit
-    let ray = restir_primary_ray(gid);
-    let r = trace(ray[0], ray[1], 0.0, camera.t_max);
-    if (r.hit != 0u) {
-        let p = ray[0] + ray[1] * r.t;
-        // Receiver surface for THIS pixel — written on every hit (independent of probes/GI) so the DI + spatial
-        // dispatches that follow can recover (n, p) from the buffer instead of re-tracing the primary ray.
-        surfaces_cur[idx] = PixelSurface(p, 1.0, r.normal, 0.0, r.color.rgb, 0.0, r.emissive, 0.0);
+    // Receiver surface (pos/normal) was traced + written by the `gbuffer` pass — read it back, NO primary trace.
+    let surf = surfaces_cur[idx];
+    if (surf.valid > 0.5) {
         // Skip the per-pixel ReSTIR GI candidate gen when screen probes drive the diffuse — shade reads the probe
         // SH instead, so the reservoir work is pure waste. DI (di_p1) still runs (probes are diffuse-only).
         if (probe_params.enabled == 0u) {
             let seed = (gid.x * 1973u + gid.y * 9277u + light.frame_index * 26699u) | 1u;
-            let temporal_base = reproject_pixel(p, camera.prev_clip_from_world, vp);
-            restir_p1_core(r.normal, p, gid.xy, temporal_base, seed);
+            let temporal_base = reproject_pixel(surf.world_position, camera.prev_clip_from_world, vp);
+            restir_p1_core(surf.world_normal, surf.world_position, gid.xy, temporal_base, seed);
         }
     }
 }
@@ -2273,16 +2320,13 @@ fn restir_dlss_p1(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (gid.x >= vp.x || gid.y >= vp.y) { return; }
     let idx = gid.y * vp.x + gid.x;
     reservoirs_b[idx] = empty_reservoir();
-    surfaces_cur[idx] = PixelSurface(vec3<f32>(0.0), 0.0, vec3<f32>(0.0), 0.0, vec3<f32>(0.0), 0.0, vec3<f32>(0.0), 0.0);
-    let ray = restir_primary_ray(gid); // un-jittered (jitter disabled) → stable per-pixel receiver
-    let r = trace(ray[0], ray[1], 0.0, camera.t_max);
-    if (r.hit != 0u) {
-        let p = ray[0] + ray[1] * r.t;
-        surfaces_cur[idx] = PixelSurface(p, 1.0, r.normal, 0.0, r.color.rgb, 0.0, r.emissive, 0.0);
+    // Receiver surface traced + written by the `gbuffer` pass — read it back, NO primary trace here.
+    let surf = surfaces_cur[idx];
+    if (surf.valid > 0.5) {
         if (probe_params.enabled == 0u) {
             let seed = (gid.x * 1973u + gid.y * 9277u + light.frame_index * 26699u) | 1u;
-            let temporal_base = reproject_pixel(p, dlss_cam.motion_prev, vp);
-            restir_p1_core(r.normal, p, gid.xy, temporal_base, seed);
+            let temporal_base = reproject_pixel(surf.world_position, dlss_cam.motion_prev, vp);
+            restir_p1_core(surf.world_normal, surf.world_position, gid.xy, temporal_base, seed);
         }
     }
 }

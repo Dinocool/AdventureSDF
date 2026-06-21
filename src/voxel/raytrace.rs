@@ -1534,10 +1534,17 @@ struct VoxelRtPipelines {
     probe_trace: wgpu::ComputePipeline,
     #[cfg(feature = "dlss")]
     probe_trace_dlss: wgpu::ComputePipeline,
+    /// DLSS-layout twin of `gbuffer` (same WGSL entry, `dlss_restir_pl` so group 1 = the DLSS view layout).
+    #[cfg(feature = "dlss")]
+    gbuffer_dlss: wgpu::ComputePipeline,
     /// Two-pass ReSTIR (non-DLSS). Pass 1 (`restir_p1`) = initial RIS + temporal → `reservoirs_b` + surface;
     /// pass 2 (`restir_p2`) = same-frame spatial from `reservoirs_b` → `reservoirs_a` + shade → out_tex. Both
     /// share `restir_pl`; dispatched back-to-back in one compute pass (the intra-pass storage barrier orders
     /// pass-1-writes-b before pass-2-reads-b). The live GI path.
+    /// Deferred primary G-buffer pass (shared by DLSS + non-DLSS): traces the primary ray ONCE and writes
+    /// pos/normal/albedo/emissive to `surfaces_cur`; all the lighting kernels read it instead of tracing the
+    /// primary. Dispatched FIRST so p1/di/spatial/p2 each carry at most one (secondary) ray-query.
+    gbuffer: wgpu::ComputePipeline,
     restir_p1: wgpu::ComputePipeline,
     restir_p2: wgpu::ComputePipeline,
     /// GI spatial-reuse pass (non-DLSS, L3): dispatched between `restir_p1` and the shade `restir_p2` — reads
@@ -2679,6 +2686,14 @@ fn init_voxel_rt(mut commands: Commands, render_device: Res<RenderDevice>) {
         ],
         immediate_size: 0,
     });
+    let gbuffer = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+        label: Some("voxel_rt_gbuffer"),
+        layout: Some(&restir_pl),
+        module: &raymarch_module,
+        entry_point: Some("gbuffer"),
+        compilation_options: Default::default(),
+        cache: None,
+    });
     let restir_p1 = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
         label: Some("voxel_rt_restir_p1"),
         layout: Some(&restir_pl),
@@ -2912,6 +2927,7 @@ fn init_voxel_rt(mut commands: Commands, render_device: Res<RenderDevice>) {
     // --- DLSS-RR (Stage 4c) pipelines + layouts ---
     #[cfg(feature = "dlss")]
     let (
+        gbuffer_dlss,
         restir_dlss_p1,
         restir_dlss_p2,
         probe_trace_dlss,
@@ -2957,6 +2973,9 @@ fn init_voxel_rt(mut commands: Commands, render_device: Res<RenderDevice>) {
         probe_trace,
         #[cfg(feature = "dlss")]
         probe_trace_dlss,
+        #[cfg(feature = "dlss")]
+        gbuffer_dlss,
+        gbuffer,
         restir_p1,
         restir_p2,
         restir_gi_spatial,
@@ -3017,6 +3036,7 @@ fn init_dlss_pipelines(
     wgpu::ComputePipeline,
     wgpu::ComputePipeline,
     wgpu::ComputePipeline,
+    wgpu::ComputePipeline,
     wgpu::BindGroupLayout,
     wgpu::BindGroupLayout,
 ) {
@@ -3068,6 +3088,14 @@ fn init_dlss_pipelines(
             Some(probe_layout),
         ],
         immediate_size: 0,
+    });
+    let gbuffer_dlss = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+        label: Some("voxel_rt_gbuffer_dlss"),
+        layout: Some(&dlss_restir_pl),
+        module: raymarch_module,
+        entry_point: Some("gbuffer"),
+        compilation_options: Default::default(),
+        cache: None,
     });
     let restir_dlss_p1 = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
         label: Some("voxel_rt_restir_dlss_p1"),
@@ -3144,6 +3172,7 @@ fn init_dlss_pipelines(
     });
     let _ = composite_module; // resolve render pipeline is built lazily (format-keyed) in the pass
     (
+        gbuffer_dlss,
         restir_dlss_p1,
         restir_dlss_p2,
         probe_trace_dlss,
@@ -5590,6 +5619,12 @@ fn voxel_rt_pass(
             // bound — rebinding group 2 above can invalidate inheritance of higher-indexed groups.
             cpass.set_bind_group(3, &wc_prepared.cache_bg, &[]);
             cpass.set_bind_group(4, &probe_bg, &[]); // screen-probe data (shade reads SH; probe trace writes it)
+            // Deferred primary G-buffer FIRST: trace the primary ray once → surfaces_cur. Every kernel below
+            // (restir_p1 bounce, di, spatial, p2 shade) reads it instead of (re-)tracing the primary.
+            cpass.push_debug_group("gi_gbuffer");
+            cpass.set_pipeline(&pipelines.gbuffer);
+            cpass.dispatch_workgroups(groups.0, groups.1, groups.2);
+            cpass.pop_debug_group();
             // Screen-probe trace (one thread per probe) runs BEFORE the restir passes so the SH is ready for
             // `shade_restir_p2`. Only when probes drive the GI; the world cache (group 3) is already bound.
             if let Some(grid) = probe_dispatch {
@@ -6170,6 +6205,12 @@ fn voxel_rt_dlss_pass(
             // (lazy-insert → populates the cache). Re-set explicitly (rebinding group 2 can drop higher groups).
             cpass.set_bind_group(3, &wc_prepared.cache_bg, &[]);
             cpass.set_bind_group(4, &probe_bg, &[]); // screen-probe data (shade reads SH; probe trace writes it)
+            // Deferred primary G-buffer FIRST: trace the primary ray once → surfaces_cur. Every kernel below
+            // (restir_dlss_p1 bounce, di, spatial, p2 shade) reads it instead of (re-)tracing the primary.
+            cpass.push_debug_group("gi_gbuffer");
+            cpass.set_pipeline(&pipelines.gbuffer_dlss);
+            cpass.dispatch_workgroups(groups.0, groups.1, groups.2);
+            cpass.pop_debug_group();
             if let Some(grid) = probe_dispatch {
                 cpass.push_debug_group("gi_probe_trace");
                 cpass.set_pipeline(&pipelines.probe_trace_dlss);
