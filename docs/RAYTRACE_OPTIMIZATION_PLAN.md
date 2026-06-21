@@ -22,6 +22,26 @@ tonemap, clustering) < 0.4 ms total. Per-dispatch (clip_half=64, pre-optimizatio
 REGISTER-LIMITED**, not ALU- or memory-bound (DRAM ~3%, L1 hit ~70%). The lever is REDUCING LIVE REGISTER
 STATE / SPLITTING KERNELS, not cutting FLOPs (instruction micro-cuts regressed 25-35% in the past).
 
+## THE scaling fix: closest-hit prune (committed 90fa270f + 4954676e)
+
+**Root cause of "perf degrades as brick count grows":** the HW AABB-BVH hands back brick candidates
+OUT OF nearest-first order, and `trace()`/`trace_occluded()` DDA-marched EVERY candidate the ray pierced —
+including bricks in the rooms BEHIND a wall the ray already hit. Diagnosed with a per-ray candidate-count
+heatmap (`TraceResult.cand`, `debug_view 10`): it looked like **x-ray vision** (you could see brick structure
+through walls). The wasted behind-wall marches grow with resident brick density ⇒ frame time degrades as the
+scene fills. **Fix:** skip a candidate's DDA when its AABB ENTRY is already at/beyond the nearest hit so far
+(`t_enter ≥ best_t`); for occlusion, stop after the first occluder. Bit-identical. Heatmap collapsed broad
+20-40 (+64 hotspots) → ~5-15. **Nsight median @ clip_half=160 FULLY LOADED (840k bricks): gi_restir_p1
+40.9→4.5 ms (~9×), gi_gbuffer 16.0→1.3 ms (~12×).** The 40.9 ms p1 is the original ~49 ms GPU-bound frame.
+
+GOTCHA learned: do NOT commit `generateIntersection` only on new-nearest — the fork's BVH culling needs frequent
+commits; restricting it MEASURED ~10× regression. And measurement: Bistro's `.vxo` streaming (256 bricks/frame
+default) never converges in a capture window, so captures hit random streaming hitches. Added
+`ADVENTURE_STREAM_BUDGET` to load the whole clipmap fast → measure the converged 840k-brick state. At that high
+budget the WHOLE-FRAME bench is dominated by per-frame CPU streaming/residency maintenance (a SEPARATE, possibly
+real secondary scaling cost — the residency re-scan over all resident bricks); isolate the GPU GI via Nsight
+per-dispatch, not whole-frame.
+
 ## Done (all committed on `rt-optimize`)
 
 - **Deferred G-buffer for shade (f1e5e79a).** Primary ray was traced TWICE/frame (p1 seeds receiver, p2
