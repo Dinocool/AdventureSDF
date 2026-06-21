@@ -214,6 +214,7 @@ struct TraceResult {
     color: vec4<f32>,  // palette colour of `block_id`
     normal: vec3<f32>, // outward unit face normal at the hit (0,0,0 on a miss)
     emissive: vec3<f32>, // palette emissive radiance of `block_id` (0 on a miss / non-emitter)
+    cand: u32,         // DIAGNOSTIC: # brick-DDA candidates this ray marched (traversal cost proxy; debug_view 10)
 };
 
 // Local cell linear index at grid `edge` (+X fastest, then +Y, then +Z) — MUST match the coarse-edge
@@ -446,6 +447,7 @@ fn trace(ro: vec3<f32>, rd: vec3<f32>, t_min: f32, t_max: f32) -> TraceResult {
     var best_t: f32 = t_max * 2.0;
     var best_prim: u32 = 0xffffffffu;
     var best_inst: u32 = 0u; // A3: the winning candidate's descriptor index (for the object-space re-walk)
+    var cand: u32 = 0u;      // DIAGNOSTIC: count brick-DDA candidates this ray marches (traversal cost proxy)
     loop {
         if (!rayQueryProceed(&rq)) { break; }
         let c = rayQueryGetCandidateIntersection(&rq);
@@ -476,7 +478,13 @@ fn trace(ro: vec3<f32>, rd: vec3<f32>, t_min: f32, t_max: f32) -> TraceResult {
             let t_enter = max(max(min(ta.x, tb.x), min(ta.y, tb.y)), min(ta.z, tb.z));
             let t_exit  = min(min(max(ta.x, tb.x), max(ta.y, tb.y)), max(ta.z, tb.z));
             // The slab t-range is in OBJECT space; the t_min/t_exit gate is against the WORLD t (× inv_scale).
-            if (t_enter <= t_exit && t_exit * d.inv_scale >= t_min) {
+            // CLOSEST-HIT PRUNE: skip the DDA if this brick's AABB ENTRY is already at/beyond the nearest voxel
+            // hit found so far (`t_enter ≥ best_t`) — the whole brick lies behind the closest hit, so it cannot
+            // contain a nearer voxel. The HW AABB-BVH reports candidates OUT OF ORDER (not nearest-first), so
+            // without this we DDA-march bricks BEHIND the wall we already hit (the "x-ray" candidate cost that
+            // scales with resident brick density). Bit-identical: a skipped brick could never have won `best_t`.
+            if (t_enter <= t_exit && t_exit * d.inv_scale >= t_min && t_enter * d.inv_scale < best_t) {
+                cand = cand + 1u; // DIAGNOSTIC: this candidate brick gets a DDA march
                 let bh = dda_brick_march(prim, ro_l, rd_l, t_enter, t_exit); // lean: no per-candidate normal
                 if (bh.found) {
                     let ht = bh.hit_t * d.inv_scale; // local-t → WORLD-t for the cross-instance nearest compare
@@ -485,6 +493,10 @@ fn trace(ro: vec3<f32>, rd: vec3<f32>, t_min: f32, t_max: f32) -> TraceResult {
                         best_prim = prim;
                         best_inst = c.instance_custom_data;
                     }
+                    // Commit EVERY found hit (not just new-nearest): the wgpu-trunk fork's BVH culling relies on
+                    // frequent generateIntersection calls to tighten t_max — restricting to new-nearest MEASURED a
+                    // ~10× regression (109 vs 9.7 ms at clip 160 full load). The `best_t` prune above is the
+                    // software backstop that kills the residual behind-wall DDAs the BVH still hands back.
                     rayQueryGenerateIntersection(&rq, ht);
                 }
             }
@@ -525,6 +537,7 @@ fn trace(ro: vec3<f32>, rd: vec3<f32>, t_min: f32, t_max: f32) -> TraceResult {
         r.emissive = vec3<f32>(0.0);
         r.normal = vec3<f32>(0.0);
     }
+    r.cand = cand;
     return r;
 }
 
@@ -967,6 +980,13 @@ fn lod_color(lod: u32) -> vec3<f32> {
 // so the two entries can NEVER disagree on a debug mode. `gi` is the caller's own GI-only estimate (the
 // post-spatial reservoir resolve `restir_gi_resolve`) — used only for `debug_view == 5`. Returns black on a miss.
 fn debug_overlay_color(r: TraceResult, ro: vec3<f32>, rd: vec3<f32>, gi: vec3<f32>) -> vec3<f32> {
+    // debug_view 10 = TRAVERSAL HEATMAP: # brick-DDA candidates this primary ray marched (the per-ray traversal
+    // cost that scales with resident brick density). Shown for BOTH hits and misses (sky rays that pierce many
+    // resident bricks before exiting are exactly the open-space cost we want to see). blue(0)→green→red(>=64).
+    if (light.debug_view == 10u) {
+        let f = clamp(f32(r.cand) / 64.0, 0.0, 1.0);
+        return vec3<f32>(f, 1.0 - abs(f - 0.5) * 2.0, 1.0 - f); // red=many, green=mid, blue=few
+    }
     if (r.hit == 0u) { return vec3<f32>(0.0); }
     let p = ro + rd * r.t;
     let origin = p + r.normal * light.shadow_bias;

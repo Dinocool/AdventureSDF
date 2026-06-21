@@ -8,6 +8,7 @@ param(
   [int]$Secs = 30,
   [string]$Cam = "",
   [int]$ClipHalf = 0,
+  [int]$Budget = 0,
   [int]$DebugView = -1,
   [int]$GiRays = -1,
   [switch]$GpuResidency,
@@ -33,8 +34,10 @@ Remove-Item Env:\ADVENTURE_CLIP_HALF -ErrorAction SilentlyContinue
 Remove-Item Env:\ADVENTURE_DEBUG_VIEW -ErrorAction SilentlyContinue
 Remove-Item Env:\ADVENTURE_GI_RAYS -ErrorAction SilentlyContinue
 Remove-Item Env:\ADVENTURE_GPU_RESIDENCY -ErrorAction SilentlyContinue
+Remove-Item Env:\ADVENTURE_STREAM_BUDGET -ErrorAction SilentlyContinue
 if ($Cam) { $env:ADVENTURE_CAM = $Cam }
 if ($ClipHalf -gt 0) { $env:ADVENTURE_CLIP_HALF = "$ClipHalf" }
+if ($Budget -gt 0) { $env:ADVENTURE_STREAM_BUDGET = "$Budget" }
 if ($DebugView -ge 0) { $env:ADVENTURE_DEBUG_VIEW = "$DebugView" }
 if ($GiRays -ge 0) { $env:ADVENTURE_GI_RAYS = "$GiRays" }
 if ($GpuResidency) { $env:ADVENTURE_GPU_RESIDENCY = "1" }

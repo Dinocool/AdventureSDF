@@ -109,9 +109,20 @@ pub fn install_bistro_bench(app: &mut App) {
     // which over a dense scene like Bistro means ~300k resident bricks (0.05 m detail 64 m out is invisible) and
     // perpetual streaming churn. A smaller ring converges far faster + cheaper. Inserted before Startup so
     // `init_voxel_rt_streaming` picks it up as the cfg override (the SSOT streaming knob).
-    if let Ok(n) = std::env::var("ADVENTURE_CLIP_HALF").unwrap_or_default().trim().parse::<i32>() {
-        let cfg = crate::voxel::streaming::StreamingConfig { clip_half_bricks: n, ..default() };
-        info!("bench: ADVENTURE_CLIP_HALF override → clip_half_bricks={n}");
+    // ADVENTURE_STREAM_BUDGET=N overrides `max_bricks_per_frame` (default 256). A HIGH value (e.g. 30000) loads
+    // the whole clipmap in a few frames — one big initial hitch, then a FULLY-RESIDENT, STABLE scene so capture
+    // frames measure the converged steady state (NOT a mid-stream frame with a streaming hitch). Essential for
+    // valid perf A/B at high brick counts.
+    let clip = std::env::var("ADVENTURE_CLIP_HALF").ok().and_then(|s| s.trim().parse::<i32>().ok());
+    let budget = std::env::var("ADVENTURE_STREAM_BUDGET").ok().and_then(|s| s.trim().parse::<usize>().ok());
+    if clip.is_some() || budget.is_some() {
+        let mut cfg = crate::voxel::streaming::StreamingConfig::default();
+        if let Some(n) = clip { cfg.clip_half_bricks = n; }
+        if let Some(b) = budget { cfg.max_bricks_per_frame = b; }
+        info!(
+            "bench: streaming override → clip_half_bricks={} max_bricks_per_frame={}",
+            cfg.clip_half_bricks, cfg.max_bricks_per_frame
+        );
         app.insert_resource(cfg);
     }
 

@@ -8,6 +8,7 @@ param(
   [int]$N = 3,
   [int]$Frames = 500,
   [int]$ClipHalf = 48,
+  [int]$Budget = 0,
   [int]$Wc = -1
 )
 # Continue (NOT Stop): the ngfx capture + the python analyzer both write progress to STDERR, which PowerShell
@@ -20,6 +21,7 @@ $collected = @()
 for ($i = 1; $i -le $N; $i++) {
   Write-Host "=== capture $i / $N ($Label) ==="
   $capArgs = @{ Frames = $Frames; ClipHalf = $ClipHalf }
+  if ($Budget -gt 0) { $capArgs['Budget'] = $Budget }
   if ($Wc -ge 0) { $capArgs['Wc'] = $Wc }
   & "rdoc/scripts/rt/capture_bistro.ps1" @capArgs | Out-Null
   # Parse THIS capture's per-dispatch JSON NOW, before the next capture overwrites .soul/ngfx/BASE/*.xls
