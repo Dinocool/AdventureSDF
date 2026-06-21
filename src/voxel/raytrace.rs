@@ -220,6 +220,30 @@ pub struct VoxelRtResidencyParams {
     pub has_emitters: bool,
 }
 
+/// **SSOT for the editor-tunable Phase-4 dynamic-residency knobs** (knobs-as-uniforms). The Render panel writes it;
+/// `drive_gpu_residency_front_end` reads it each frame and feeds the front end + pager + the `ResidencyParams`
+/// uniform — so all four levers are LIVE. Extracted to the render world. Defaults = OFF (identical to pre-Phase-4).
+#[derive(Resource, Clone, Copy, ExtractResource)]
+pub struct VoxelRtResidencySettings {
+    /// 4-S2/S3: ray-guided keep + LRU master toggle. When off the residency uses the pure distance/budget cut.
+    pub demand: bool,
+    /// 4-S1/S4: LODs >= this are the pinned coarse BACKDROP (exempt from the budget cut, reach-extended). `MAX_LOD+1`
+    /// (= `LODS`) = OFF (no backdrop). Lower ⇒ more coarse LODs pinned + extended.
+    pub backdrop_lod: u32,
+    /// 4-S4: backdrop LODs page/render out to `clip_half · backdrop_reach` (see far beyond the fine clipmap). 1 = no extension.
+    pub backdrop_reach: u32,
+    /// 4-S2/S3: a brick ray-hit within this many frames is KEPT beyond the distance cut (ray-guided). Higher = stickier.
+    pub ray_keep_frames: u32,
+}
+
+impl Default for VoxelRtResidencySettings {
+    fn default() -> Self {
+        // OFF by default: backdrop_lod past MAX_LOD ⇒ no brick qualifies; demand off ⇒ last_used ignored. Identical
+        // to the pre-Phase-4 distance/budget cut. The user enables + tunes from the Render panel.
+        Self { demand: false, backdrop_lod: crate::voxel::brickmap::MAX_LOD + 1, backdrop_reach: 4, ray_keep_frames: 30 }
+    }
+}
+
 /// **Residency debug-dump request** (the F9 hotkey). The main world bumps `counter` on each key press; the render
 /// world's [`dump_residency_debug`] sees the change and reads back the LIVE residency pool (meta + AABB) to a
 /// report on disk for offline analysis. Extracted main→render each frame; the render side tracks the last counter
@@ -393,12 +417,14 @@ impl Plugin for VoxelRtPlugin {
             // Phase G "G-c.4" — the LIVE per-frame residency params (camera + clip_half), the only per-frame
             // CPU→GPU residency traffic for the GPU-driven front end.
             .init_resource::<VoxelRtResidencyParams>()
+            .init_resource::<VoxelRtResidencySettings>()
             .init_resource::<VoxelDebugDump>()
             .add_systems(Update, request_residency_debug_dump)
             .add_plugins(ExtractResourcePlugin::<VoxelDebugDump>::default())
             .add_plugins(ExtractResourcePlugin::<VoxelRtToggle>::default())
             .add_plugins(ExtractResourcePlugin::<VoxelRtResidencyUpload>::default())
             .add_plugins(ExtractResourcePlugin::<VoxelRtResidencyParams>::default())
+            .add_plugins(ExtractResourcePlugin::<VoxelRtResidencySettings>::default())
             .add_plugins(ExtractResourcePlugin::<VoxelRtPatch>::default())
             .add_plugins(ExtractResourcePlugin::<VoxelRtLighting>::default())
             .add_plugins(ExtractResourcePlugin::<VoxelRtSky>::default())
@@ -1683,7 +1709,14 @@ struct VoxelRtResources {
     /// the prefetcher pages the clipmap-covering present regions in/out (camera-driven, constant-RAM,
     /// readback-free), and the front end binds to ITS occupancy + core buffers (not the eager in-RAM ones). `None`
     /// for an in-RAM scene (Sponza / `.vox` Gallery — which use the eager `gpu_residency`/`gpu_core_store`).
-    streamed_pager: Option<super::residency_pager::StreamedResidencyPager>,
+    ///
+    /// Typed as the [`ResidencyProducer`] abstraction (not the concrete pager): the front-end drive consumes ONLY
+    /// the trait, so a future producer (e.g. worldgen) is a drop-in here with no drive change. The streamed `.vxo`
+    /// [`StreamedResidencyPager`] is the only impl today.
+    ///
+    /// [`ResidencyProducer`]: super::residency_gpu::ResidencyProducer
+    /// [`StreamedResidencyPager`]: super::residency_pager::StreamedResidencyPager
+    streamed_pager: Option<Box<dyn super::residency_gpu::ResidencyProducer>>,
     /// Output storage texture (rgba16float) + view + size; reallocated on view resize.
     output: Option<(wgpu::Texture, wgpu::TextureView, UVec2)>,
     /// The TEMPORAL-ACCUMULATION history texture (rgba16float) + view: the previous frame's accumulated
@@ -1863,6 +1896,10 @@ struct SceneKeepAlive {
     /// A3 — the per-CHUNK DESCRIPTOR buffer (group 0 binding 13): one identity descriptor per chunk, each with
     /// `meta_base = chunk·CHUNK_SLOTS`. Keep-alive only (the bind group's Arc references it).
     _descriptors_buf: wgpu::Buffer,
+    /// 4-S2/S3 — per-slot `last_used_frame` (group 0 binding 14): the GI trace `atomicMax`es it on a hit; the
+    /// residency front end reads it (bound via `rebind_pool`) for ray-guided keep + LRU eviction. CAPACITY-sized
+    /// when demand is on, else a 1-element dummy ([`voxel_demand_enabled`]).
+    last_used_buf: wgpu::Buffer,
     /// True iff this scene is a STREAMED fixed-cap epoch (a `Delta` can patch it). False for a static contiguous
     /// `Snapshot` (every generation re-creates).
     streamed: bool,
@@ -2535,6 +2572,9 @@ fn init_voxel_rt(mut commands: Commands, render_device: Res<RenderDevice>) {
             storage_ro(3),  // palette (block id → colour)
             storage_ro(12), // brick_palettes (R2b per-brick palettes)
             storage_ro(13), // A3: instance descriptors (per-instance/per-chunk transform + base offsets)
+            storage_rw(14), // 4-S2/S3: last_used_frame per slot (trace atomicMaxes on hit; residency reads for
+                            // ray-guided keep + LRU eviction). A 1-elem DUMMY when demand is off ⇒ the trace's
+                            // `arrayLength > 1` guard never writes ⇒ zero behaviour change.
         ],
     });
     let view_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -3400,6 +3440,8 @@ fn prepare_voxel_rt(
     residency_upload: Option<Res<VoxelRtResidencyUpload>>,
     // Phase G "G-c.4" — the LIVE per-frame residency params (camera + clip_half) for the GPU-driven front end.
     residency_params: Option<Res<VoxelRtResidencyParams>>,
+    // Phase 4 — the editor-tunable dynamic-residency levers (backdrop / demand / LRU). Live each frame.
+    residency_settings: Option<Res<VoxelRtResidencySettings>>,
 ) {
     // Phase G "G-c.0" — upload the GPU-resident sparse OCCUPANCY ONCE per scene epoch (not per frame, not gated
     // on the toggle/patch). Built in the main world; here it becomes two PERSISTENT storage buffers on
@@ -3458,6 +3500,7 @@ fn prepare_voxel_rt(
         &mut resources,
         residency_params.as_deref(),
         residency_upload.as_deref(),
+        residency_settings.as_deref().copied().unwrap_or_default(),
     );
 
     let (Some(patch_res), Some(pipelines)) = (patch_res, pipelines) else {
@@ -4168,6 +4211,17 @@ fn build_scene_full(
         usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
         contents: brick_palettes_bytes,
     });
+    // 4-S2/S3: per-slot `last_used_frame` — the GI trace `atomicMax`es it on a hit; the residency reads it for
+    // ray-guided KEEP (a recently-hit brick survives the distance cut) + LRU eviction. ALWAYS capacity-sized (one
+    // u32/slot, ~negligible VRAM) so the LIVE `demand` editor toggle takes effect with no scene rebuild — the
+    // trace always stamps (cheap), and the residency's `demand_on()` (uniform) decides whether to USE it. Bound to
+    // BOTH the scene bind group (trace WRITE) and the residency front end (READ, via rebind_pool), readback-free.
+    let last_used_len = blas_primitives.max(1);
+    let last_used_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("voxel_rt_last_used"),
+        contents: bytemuck::cast_slice(&vec![0u32; last_used_len as usize]),
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+    });
     // A3 Stage 3 — partition the `blas_primitives` slots into SLOT-BAND CHUNKS of `CHUNK_SLOTS` each. One BLAS
     // per chunk (reading its band as a slice of the shared `aabb_buf` via `primitive_offset`), one identity TLAS
     // instance per chunk (`custom_index = chunk index → descriptor`), one identity descriptor per chunk with
@@ -4248,6 +4302,7 @@ fn build_scene_full(
             wgpu::BindGroupEntry { binding: 3, resource: palette_buf.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 12, resource: brick_palettes_buf.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 13, resource: descriptors_buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 14, resource: last_used_buf.as_entire_binding() },
         ],
     });
 
@@ -4264,6 +4319,7 @@ fn build_scene_full(
         _palette_buf: palette_buf,
         brick_palettes_buf,
         _descriptors_buf: descriptors_buf,
+        last_used_buf,
         streamed,
     });
 }
@@ -4398,6 +4454,7 @@ fn drive_gpu_residency_front_end(
     resources: &mut VoxelRtResources,
     params: Option<&VoxelRtResidencyParams>,
     upload: Option<&VoxelRtResidencyUpload>,
+    settings: VoxelRtResidencySettings,
 ) -> bool {
     if !toggle.enabled || !toggle.gpu_residency {
         // Toggle off: ensure the front end is unbound so a later flip-on cold-rebinds against the current scene.
@@ -4432,14 +4489,14 @@ fn drive_gpu_residency_front_end(
         // allocates its own GPU stores.
         let stale = resources.streamed_pager.as_ref().map(|p| p.epoch()) != Some(*epoch);
         if stale {
-            resources.streamed_pager = Some(super::residency_pager::StreamedResidencyPager::new(
+            resources.streamed_pager = Some(Box::new(super::residency_pager::StreamedResidencyPager::new(
                 device,
                 queue,
                 std::sync::Arc::clone(src),
                 *epoch,
                 params.clip_half_bricks,
                 params.max_resident.max(1),
-            ));
+            )));
             resources.gpu_front_end_epoch = None; // force a rebind against the new pager stores
             info!("voxel-RT G-c.4-paging: built the streamed region prefetcher for epoch {epoch}");
         }
@@ -4479,6 +4536,9 @@ fn drive_gpu_residency_front_end(
     if have_paged {
         let pager = resources.streamed_pager.as_mut().expect("checked have_paged");
         let _p = info_span!("vox_residency_prefetch").entered();
+        // Phase 4 — push the live backdrop levers so the pager pages the extended coarse reach (a change re-pages
+        // on the next crossing via the set-diff). Off by default (backdrop_lod past MAX_LOD ⇒ no extension).
+        pager.set_backdrop(settings.backdrop_lod, settings.backdrop_reach);
         let crossed = pager.update(queue, params.cam_world);
         if crossed {
             debug!(
@@ -4505,6 +4565,13 @@ fn drive_gpu_residency_front_end(
             half, max_resident
         );
     }
+    // Phase 4 — push the LIVE editor levers (demand / backdrop / reach / ray-keep) into the front end BEFORE
+    // `would_overflow` + `record_frame` (both build the ResidencyParams from them). Per-frame ⇒ panel edits are live.
+    resources
+        .gpu_front_end
+        .as_mut()
+        .expect("just built")
+        .set_residency_levers(settings.demand, settings.backdrop_lod, settings.backdrop_reach, settings.ray_keep_frames);
 
     // (Re)bind the front end to the CURRENT scene pool + the residency stores (eager OR paged) on an epoch change
     // (a scene switch / fresh stream) or when the pager's stores were just (re)allocated. Cold-resets the
@@ -4519,6 +4586,7 @@ fn drive_gpu_residency_front_end(
         let voxel = scene.voxel_buf.clone();
         let palettes = scene.brick_palettes_buf.clone();
         let aabb = scene.aabb_buf.clone();
+        let last_used = scene.last_used_buf.clone(); // 4-S2/S3: the trace-written per-slot last_used (ray-keep + LRU)
         // Build OWNED buffer-handle copies (the `wgpu::Buffer`s are cheap `Arc`-backed clones) so the immutable
         // borrow of `resources`'s stores ends before the mutable front-end borrow (no overlap). Both the pager's
         // and the eager upload's stores expose the SAME `GpuResidencyBuffers`/`GpuBrickCoreBuffers` shape.
@@ -4553,7 +4621,7 @@ fn drive_gpu_residency_front_end(
             )
         };
         let fe = resources.gpu_front_end.as_mut().expect("just built");
-        fe.rebind_pool(device, queue, &occ_owned, &core_owned, &meta, &voxel, &palettes, &aabb);
+        fe.rebind_pool(device, queue, &occ_owned, &core_owned, &meta, &voxel, &palettes, &aabb, &last_used);
         resources.gpu_front_end_epoch = Some(params.epoch);
         // Fresh pool/chunks for this epoch — drop any stale dirty-chunk indices from the previous scene. The cold
         // re-stream re-marks every chunk it touches, so the new scene's BLAS rebuilds from scratch correctly.

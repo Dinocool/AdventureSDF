@@ -28,7 +28,9 @@ use bevy::math::IVec3;
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use super::brickmap::MAX_LOD;
-use super::residency_gpu::{GpuResidencyBuffers, PagedBrickCoreStore, SectorOccupancy};
+use super::residency_gpu::{
+    GpuBrickCoreBuffers, GpuResidencyBuffers, PagedBrickCoreStore, ResidencyProducer, SectorOccupancy,
+};
 use super::streaming::level_box_pub;
 use super::vxo::{DecodedRegion, MergedSource};
 
@@ -50,6 +52,11 @@ pub struct StreamedResidencyPager {
     epoch: u64,
     /// The clip half-extent in bricks (the prefetcher's per-LOD `level_box` reach). Fixed for the epoch.
     clip_half: i32,
+    /// 4-S4: the coarse-backdrop LOD threshold + reach (LODs >= `backdrop_lod` page out to `clip_half · backdrop_reach`
+    /// so the cheap coarse backdrop extends beyond the fine clipmap). LIVE editor levers, set per-frame via
+    /// [`ResidencyProducer::set_backdrop`]. Default off (`backdrop_lod > MAX_LOD` = no extension).
+    backdrop_lod: u32,
+    backdrop_reach: u32,
 
     /// The currently-paged region set (so a frame's update is a SET DIFF — page in newly-covered, drop uncovered).
     resident: FxHashSet<RegionKey>,
@@ -104,11 +111,13 @@ impl StreamedResidencyPager {
         // (one bounded buffer), and a brick beyond it is simply not core-resident (a graceful far-detail drop, not
         // a crash; the free-list panic would be a mis-size — `MAX_CORE_BUFFER_CORES` keeps us under the limit).
         let core_cap = max_resident.saturating_mul(2).clamp(1, MAX_CORE_BUFFER_CORES);
-
         Self {
             source,
             epoch,
             clip_half,
+            // 4-S4: off until the drive pushes the live editor levers via `set_backdrop` each frame.
+            backdrop_lod: MAX_LOD + 1,
+            backdrop_reach: 4,
             resident: FxHashSet::default(),
             decoded: FxHashMap::default(),
             occ_buffers,
@@ -118,66 +127,6 @@ impl StreamedResidencyPager {
         }
     }
 
-    /// The scene epoch this pager was built for.
-    #[inline]
-    pub fn epoch(&self) -> u64 {
-        self.epoch
-    }
-
-    /// The GPU occupancy buffers (bound to the front end's enumerate pass).
-    #[inline]
-    pub fn occupancy(&self) -> &GpuResidencyBuffers {
-        &self.occ_buffers
-    }
-
-    /// The GPU core-store buffers view (bound to the front end's Pass-D halo-fill).
-    #[inline]
-    pub fn core_buffers(&self) -> super::residency_gpu::GpuBrickCoreBuffers {
-        self.core_store.buffers()
-    }
-
-    /// Whether the caller must (re)build the front end's bind group against these stores (true once after
-    /// construction; the in-place re-uploads never change buffer identity, so it stays false afterward).
-    #[inline]
-    pub fn take_needs_rebind(&mut self) -> bool {
-        std::mem::take(&mut self.needs_rebind)
-    }
-
-    /// The number of resident (paged) regions — the constant-RAM bound the gates assert.
-    #[inline]
-    pub fn resident_region_count(&self) -> usize {
-        self.resident.len()
-    }
-
-    /// TEST/DEBUG: fetch the SOURCE core for `(coord, lod)` — the exact 8³ core (voxel_index order) the GPU pack
-    /// should have produced for this brick. Used by the F9 dump's content-integrity check (compare GPU-pool content
-    /// vs this) to localize garbage content to the pack/pager vs the render side. Returns None if the brick's region
-    /// isn't decoded.
-    pub fn debug_source_core(&self, coord: IVec3, lod: u32) -> Option<[u32; crate::voxel::brickmap::BRICK_VOXELS]> {
-        for (ai, asset) in self.source.placed_assets().iter().enumerate() {
-            let rc = asset.source.region_of_world(lod, coord);
-            if let Some(region) = self.decoded.get(&(ai, lod, rc)) {
-                if let Some(core) = asset.source.core_at_world(lod, coord, region) {
-                    return Some(core);
-                }
-            }
-        }
-        None
-    }
-
-    /// The number of resident cores (distinct paged bricks) — a constant-RAM / coverage diagnostic.
-    #[inline]
-    pub fn resident_core_count(&self) -> usize {
-        self.core_store.resident_cores()
-    }
-
-    /// DEBUG (F9 dump): is `(coord, lod)`'s core LIVE in the GPU core store right now (what the pack `core_lookup`
-    /// sees)? Splits a content mismatch into core-absent-in-store (sync miss / evicted-while-resident) vs
-    /// core-present-but-pool-wrong (a pack bug). [`Self::debug_source_core`] separately confirms the SOURCE has it.
-    pub fn debug_core_in_store(&self, coord: IVec3, lod: u32) -> bool {
-        self.core_store.debug_core_resident(coord, lod)
-    }
-
     /// Compute the CLIPMAP-COVERING present region set for `cam` (the desired resident set): per LOD, the
     /// `level_box` world brick AABB mapped into each placed asset's local coords, collecting present regions
     /// PADDED +1 brick. Pure read of the in-RAM directories (no decode) — the camera-driven, readback-free driver.
@@ -185,7 +134,13 @@ impl StreamedResidencyPager {
         let mut desired = FxHashSet::default();
         let mut scratch: Vec<IVec3> = Vec::new();
         for lod in 0..=MAX_LOD {
-            let (wlo, whi) = level_box_pub(cam, lod, self.clip_half);
+            // 4-S4: backdrop LODs reach `backdrop_reach×` farther (page the extended coarse backdrop the front end
+            // enumerates beyond clip_half). Matches `residency_front_end::lod_clip_half` + the WGSL `lod_half`.
+            let (wlo, whi) = level_box_pub(
+                cam,
+                lod,
+                super::residency_front_end::lod_clip_half(lod, self.clip_half, self.backdrop_lod, self.backdrop_reach),
+            );
             for (ai, asset) in self.source.placed_assets().iter().enumerate() {
                 // Clip the world clipmap box to the asset's placed bounds (on the LOD-lod grid), then to LOCAL.
                 let (alo, ahi) = self.source.asset_lod_bounds(ai, lod);
@@ -206,12 +161,65 @@ impl StreamedResidencyPager {
         desired
     }
 
+    /// Rebuild the occupancy hash from all resident regions' bricks + re-upload it in place (§8.2). Returns the CPU
+    /// [`SectorOccupancy`] (so `collect_surface_halo_keys` can `classify_surface` without a second build).
+    fn rebuild_occupancy(&mut self, queue: &wgpu::Queue) -> SectorOccupancy {
+        let mut occupied: Vec<(IVec3, u32, bool)> = Vec::new();
+        for (&(ai, lod, _rc), region) in &self.decoded {
+            let asset = &self.source.placed_assets()[ai];
+            asset.source.for_each_region_brick_occ(lod, region, |world, l, is_full| {
+                occupied.push((world, l, is_full));
+            });
+        }
+        let occ = SectorOccupancy::from_occupied_full(occupied);
+        occ.reupload_into(queue, &mut self.occ_buffers, self.occ_capacity);
+        occ
+    }
+
+    /// The FULL surface+halo core KEY set for the CURRENT resident occupancy, paired with each key's owning asset
+    /// (for the lazy core decode). Every SURFACE brick (`occ.classify_surface` — the front end's enterable set)
+    /// plus each surface brick's 26 PRESENT halo neighbours (the cores the GPU halo-fill reads). Θ(resident bricks).
+    /// Because the gallery spaces assets DISJOINT with a gap ≥ 1 brick, a ±1 halo neighbour is always in the SAME
+    /// asset, so `key_asset` for a halo key is that surface brick's asset. The SSOT that keeps the core set in
+    /// lock-step with the occupancy each crossing (the coverage invariant).
+    fn collect_surface_halo_keys(
+        &self,
+        occ: &SectorOccupancy,
+    ) -> (FxHashSet<(IVec3, u32)>, FxHashMap<(IVec3, u32), usize>) {
+        let mut desired: FxHashSet<(IVec3, u32)> = FxHashSet::default();
+        let mut key_asset: FxHashMap<(IVec3, u32), usize> = FxHashMap::default();
+        for (&(ai, lod, _rc), region) in &self.decoded {
+            let asset = &self.source.placed_assets()[ai];
+            asset.source.for_each_region_brick_occ(lod, region, |world, l, _is_full| {
+                if occ.classify_surface(world, l) {
+                    desired.insert((world, l));
+                    key_asset.insert((world, l), ai);
+                    for off in N26 {
+                        let n = world + off;
+                        if occ.is_occupied(n, l) {
+                            desired.insert((n, l));
+                            key_asset.entry((n, l)).or_insert(ai);
+                        }
+                    }
+                }
+            });
+        }
+        (desired, key_asset)
+    }
+}
+
+impl ResidencyProducer for StreamedResidencyPager {
+    #[inline]
+    fn epoch(&self) -> u64 {
+        self.epoch
+    }
+
     /// **The prefetcher (§8.1)** — page the clipmap-covering present regions for `cam`: diff the desired region set
     /// vs the resident one, decode newly-covered regions (drop uncovered). On a crossing, rebuild the OCCUPANCY
     /// whole from the resident regions (§8.2, cheap ~bit/brick) and re-sync the CORE store to the SURFACE shell +
     /// its 26-halo (§8.3, the Θ(H²) footprint — NOT every region brick, which would be ~GBs). Returns `true` iff
     /// the resident region set CHANGED this frame (a crossing) — a diagnostic for the caller's bench logging.
-    pub fn update(&mut self, queue: &wgpu::Queue, cam: [f32; 3]) -> bool {
+    fn update(&mut self, queue: &wgpu::Queue, cam: [f32; 3]) -> bool {
         let t0 = std::time::Instant::now();
         let desired = self.desired_regions(cam);
         if desired == self.resident {
@@ -274,50 +282,54 @@ impl StreamedResidencyPager {
         true
     }
 
-    /// Rebuild the occupancy hash from all resident regions' bricks + re-upload it in place (§8.2). Returns the CPU
-    /// [`SectorOccupancy`] (so `collect_surface_halo_keys` can `classify_surface` without a second build).
-    fn rebuild_occupancy(&mut self, queue: &wgpu::Queue) -> SectorOccupancy {
-        let mut occupied: Vec<(IVec3, u32, bool)> = Vec::new();
-        for (&(ai, lod, _rc), region) in &self.decoded {
-            let asset = &self.source.placed_assets()[ai];
-            asset.source.for_each_region_brick_occ(lod, region, |world, l, is_full| {
-                occupied.push((world, l, is_full));
-            });
-        }
-        let occ = SectorOccupancy::from_occupied_full(occupied);
-        occ.reupload_into(queue, &mut self.occ_buffers, self.occ_capacity);
-        occ
+    #[inline]
+    fn occupancy(&self) -> &GpuResidencyBuffers {
+        &self.occ_buffers
     }
 
-    /// The FULL surface+halo core KEY set for the CURRENT resident occupancy, paired with each key's owning asset
-    /// (for the lazy core decode). Every SURFACE brick (`occ.classify_surface` — the front end's enterable set)
-    /// plus each surface brick's 26 PRESENT halo neighbours (the cores the GPU halo-fill reads). Θ(resident bricks).
-    /// Because the gallery spaces assets DISJOINT with a gap ≥ 1 brick, a ±1 halo neighbour is always in the SAME
-    /// asset, so `key_asset` for a halo key is that surface brick's asset. The SSOT that keeps the core set in
-    /// lock-step with the occupancy each crossing (the coverage invariant).
-    fn collect_surface_halo_keys(
-        &self,
-        occ: &SectorOccupancy,
-    ) -> (FxHashSet<(IVec3, u32)>, FxHashMap<(IVec3, u32), usize>) {
-        let mut desired: FxHashSet<(IVec3, u32)> = FxHashSet::default();
-        let mut key_asset: FxHashMap<(IVec3, u32), usize> = FxHashMap::default();
-        for (&(ai, lod, _rc), region) in &self.decoded {
-            let asset = &self.source.placed_assets()[ai];
-            asset.source.for_each_region_brick_occ(lod, region, |world, l, _is_full| {
-                if occ.classify_surface(world, l) {
-                    desired.insert((world, l));
-                    key_asset.insert((world, l), ai);
-                    for off in N26 {
-                        let n = world + off;
-                        if occ.is_occupied(n, l) {
-                            desired.insert((n, l));
-                            key_asset.entry((n, l)).or_insert(ai);
-                        }
-                    }
+    #[inline]
+    fn core_buffers(&self) -> GpuBrickCoreBuffers {
+        self.core_store.buffers()
+    }
+
+    #[inline]
+    fn take_needs_rebind(&mut self) -> bool {
+        std::mem::take(&mut self.needs_rebind)
+    }
+
+    #[inline]
+    fn resident_region_count(&self) -> usize {
+        self.resident.len()
+    }
+
+    #[inline]
+    fn resident_core_count(&self) -> usize {
+        self.core_store.resident_cores()
+    }
+
+    /// Fetch the SOURCE core for `(coord, lod)` — the exact 8³ core (voxel_index order) the GPU pack should have
+    /// produced for this brick (F9 dump content-integrity check). `None` if the brick's region isn't decoded.
+    fn debug_source_core(&self, coord: IVec3, lod: u32) -> Option<[u32; crate::voxel::brickmap::BRICK_VOXELS]> {
+        for (ai, asset) in self.source.placed_assets().iter().enumerate() {
+            let rc = asset.source.region_of_world(lod, coord);
+            if let Some(region) = self.decoded.get(&(ai, lod, rc)) {
+                if let Some(core) = asset.source.core_at_world(lod, coord, region) {
+                    return Some(core);
                 }
-            });
+            }
         }
-        (desired, key_asset)
+        None
+    }
+
+    #[inline]
+    fn debug_core_in_store(&self, coord: IVec3, lod: u32) -> bool {
+        self.core_store.debug_core_resident(coord, lod)
+    }
+
+    #[inline]
+    fn set_backdrop(&mut self, backdrop_lod: u32, backdrop_reach: u32) {
+        self.backdrop_lod = backdrop_lod;
+        self.backdrop_reach = backdrop_reach.max(1);
     }
 }
 

@@ -193,6 +193,10 @@ fn affine_dir(r0: vec4<f32>, r1: vec4<f32>, r2: vec4<f32>, v: vec3<f32>) -> vec3
 // A3 — the per-instance descriptor table (group 0, binding 13). Indexed by `instance_custom_data`. For the
 // streamed world it holds ONE identity descriptor 0 (Stage 1) / one per CHUNK (Stage 3), all identity-transform.
 @group(0) @binding(13) var<storage, read> descriptors: array<InstanceDescriptor>;
+// 4-S2/S3: per-slot `last_used_frame`. The primary trace `atomicMax`es the current frame here on a hit; the
+// residency front end reads it for ray-guided KEEP (a recently-hit brick survives the distance cut) + LRU eviction.
+// A 1-element DUMMY buffer when demand is off — the `arrayLength(&last_used) > 1u` guard then never writes (zero cost).
+@group(0) @binding(14) var<storage, read_write> last_used: array<atomic<u32>>;
 @group(0) @binding(1) var<storage, read> metas: array<BrickMeta>;
 // Storage plan R2b — the bit-packed INDEX STREAM (was a raw `u32`-per-cell id buffer). A dense brick's indices
 // begin at `metas[].voxel_offset`, are `metas[].index_bits()`-wide, and reference the per-brick palette below.
@@ -2312,6 +2316,10 @@ fn gbuffer(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (r.hit != 0u) {
         let p = ray[0] + ray[1] * r.t;
         surfaces_cur[idx] = PixelSurface(p, 1.0, r.normal, 0.0, r.color.rgb, 0.0, r.emissive, 0.0);
+        // 4-S2/S3: ray-guided keep + LRU — stamp the primary-hit brick as used THIS frame. The gbuffer pass now
+        // owns the primary trace (deferred), so the stamp lives here (was in restir_p1 before the deferral).
+        // Gated by buffer size (dummy 1-element buffer when demand-keep is off ⇒ never writes, zero cost).
+        if (arrayLength(&last_used) > 1u) { atomicMax(&last_used[r.prim], light.frame_index); }
     } else {
         surfaces_cur[idx] = PixelSurface(vec3<f32>(0.0), 0.0, vec3<f32>(0.0), 0.0, vec3<f32>(0.0), 0.0, vec3<f32>(0.0), 0.0);
     }
@@ -2324,6 +2332,7 @@ fn restir_p1(@builtin(global_invocation_id) gid: vec3<u32>) {
     let idx = gid.y * vp.x + gid.x;
     reservoirs_b[idx] = empty_reservoir(); // default for misses; overwritten for lit hits
     // Receiver surface (pos/normal) was traced + written by the `gbuffer` pass — read it back, NO primary trace.
+    // (Phase 4's ray-guided-keep `last_used` stamp moved to the `gbuffer` pass, which now owns the primary hit.)
     let surf = surfaces_cur[idx];
     if (surf.valid > 0.5) {
         // Skip the per-pixel ReSTIR GI candidate gen when screen probes drive the diffuse — shade reads the probe

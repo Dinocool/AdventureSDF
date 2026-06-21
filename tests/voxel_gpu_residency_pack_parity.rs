@@ -76,7 +76,11 @@ struct ResidencyParams {
     hist_scale: f32,
     _pad1: u32,
     cam_world: [f32; 3],
-    _pad2: u32,
+    _pad2: u32, // = frame (4-S2/S3)
+    demand: u32,
+    backdrop_reach: u32,
+    ray_keep_frames: u32,
+    _pad3: u32,
 }
 
 /// Enter-cap distance histogram buckets — MUST equal `HIST_BUCKETS` in `voxel_residency.wgsl`.
@@ -133,9 +137,13 @@ fn build_params(cam: [f32; 3], half: i32) -> ResidencyParams {
         clip_half_bricks: half,
         total_cells: offset,
         hist_scale: HIST_BUCKETS as f32 / max_dist,
-        _pad1: 0,
+        _pad1: MAX_LOD + 1, // 4-S1: this u32 is `backdrop_lod` in the WGSL now — MAX_LOD+1 = backdrop OFF
         cam_world: cam,
         _pad2: 0,
+        demand: 0, // 4-S2/S3 off in this oracle (frame=0 too) ⇒ residency = pure distance cut
+        backdrop_reach: 1,
+        ray_keep_frames: 0,
+        _pad3: 0,
     }
 }
 
@@ -392,8 +400,12 @@ impl GpuDrive {
         let palette_pool_base =
             buf_init(&device, "palette_pool_base", bytemuck::cast_slice(&[0u32]), wgpu::BufferUsages::STORAGE);
         let _ = index_class_words; // (kept imported for the pool-sizing comment; per-class sizing no longer used)
-        let enter_hist = storage_buf(&device, "enter_hist", (HIST_BUCKETS as u64) * 4);
+        // +1: the trailing slot is the 4-S1 backdrop-reserve counter (clear_per_frame_hashes always clears it).
+        let enter_hist = storage_buf(&device, "enter_hist", (HIST_BUCKETS as u64 + 1) * 4);
         let enter_cap = buf_init(&device, "enter_cap", bytemuck::cast_slice(&[HIST_BUCKETS, 0u32]), storage_usage());
+        // 4-S2/S3: per-slot last_used (binding 52). Zeroed dummy — with the mirror's frame=0, `demand_on()` is false
+        // so the residency never reads/writes it (behaviour = the distance cut). Sized to the pool slot count.
+        let last_used = storage_buf(&device, "last_used", (max_resident as u64) * 4);
 
         // --- the residency shader (Pass A–D) + the pack shader (classify/pack/write_aabb) ---
         let res_src = std::fs::read_to_string("assets/shaders/voxel_residency.wgsl").expect("read residency");
@@ -458,6 +470,7 @@ impl GpuDrive {
                 storage_entry(47, true),  // classify_out
                 storage_entry(50, false), // enter_hist
                 storage_entry(51, false), // enter_cap
+                storage_entry(52, false), // 4-S2/S3 last_used
             ],
         });
         let res_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -548,6 +561,7 @@ impl GpuDrive {
                     bind(47, &classify_out),
                     bind(50, &enter_hist),
                     bind(51, &enter_cap),
+                    bind(52, &last_used),
                 ]
             };
         }

@@ -240,6 +240,49 @@ pub fn render_gi_panel(world: &mut World, ui: &mut egui::Ui) {
         }
     }
 
+    // Phase 4 — DYNAMIC RESIDENCY levers (knobs-as-uniforms): the coarse backdrop, see-far reach, and ray-guided
+    // demand keep + LRU. All flow LIVE into the residency front end + pager + the `ResidencyParams` uniform each
+    // frame (`drive_gpu_residency_front_end` reads `VoxelRtResidencySettings`). Defaults = OFF (the pure
+    // distance/budget cut = pre-Phase-4 behaviour). The 8 GB lever: a small `max_resident` (launch config) + the
+    // backdrop pinned ⇒ see far coarse at a bounded fine budget.
+    {
+        ui.separator();
+        egui::CollapsingHeader::new(egui::RichText::new("Dynamic Residency (Phase 4)").strong())
+            .default_open(false)
+            .show(ui, |ui| {
+                if let Some(mut s) =
+                    world.get_resource_mut::<crate::voxel::raytrace::VoxelRtResidencySettings>()
+                {
+                    let off = crate::voxel::brickmap::MAX_LOD + 1;
+                    // 4-S1: coarse backdrop — LODs >= backdrop_lod are pinned (exempt from the nearest-`max_resident`
+                    // budget cut) so distant terrain stays visible at a small budget. `backdrop_lod == off` ⇒ OFF.
+                    ui.add(
+                        egui::Slider::new(&mut s.backdrop_lod, 0..=off)
+                            .text(format!("backdrop LOD ({off} = off)")),
+                    );
+                    ui.add_enabled_ui(s.backdrop_lod <= crate::voxel::brickmap::MAX_LOD, |ui| {
+                        // 4-S4: backdrop reach — the coarse backdrop extends `clip_half · reach` BEYOND the fine
+                        // clipmap (see far without paying for fine detail there).
+                        ui.add(egui::Slider::new(&mut s.backdrop_reach, 1..=16).text("backdrop reach (× clip)"));
+                    });
+                    // 4-S2/S3: ray-guided demand — the residency KEEPS bricks the rays recently hit (beyond the
+                    // distance cut) + LRU-evicts the rest, so residency follows where you actually look.
+                    ui.checkbox(&mut s.demand, "Ray-guided demand (keep what rays hit + LRU)");
+                    ui.add_enabled_ui(s.demand, |ui| {
+                        ui.add(egui::Slider::new(&mut s.ray_keep_frames, 1..=120).text("ray-keep window (frames)"));
+                    });
+                    ui.label(
+                        egui::RichText::new(
+                            "backdrop = pinned coarse LODs (see far at a fixed fine budget); reach = how far past \
+                             the fine clipmap; demand = keep bricks the rays recently hit beyond the budget (LRU)",
+                        )
+                        .weak()
+                        .size(11.0),
+                    );
+                }
+            });
+    }
+
     // World-cache TUNING (Phase 2.4 knobs-as-uniforms): per-tunable sliders on `WorldCacheUniformData`. These
     // mutate `WorldCacheSettings.data` (already extracted + uploaded to the WGSL `WorldCacheUniform` each frame),
     // so tweaks are live. Defaults are byte-identical to the Solari-tuned values the GPU convergence/energy tests

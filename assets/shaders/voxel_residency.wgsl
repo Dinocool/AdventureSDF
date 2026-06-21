@@ -268,10 +268,27 @@ struct ResidencyParams {
     clip_half_bricks: i32,
     total_cells: u32,              // Σ_lod cell_count — the Pass B0 dispatch invocation count
     hist_scale: f32,              // ENTER-CAP: candidate distance → histogram bucket = floor(dist * hist_scale)
-    _pad1: u32,
+    backdrop_lod: u32,           // 4-S1: LODs >= this are the always-resident coarse BACKDROP (exempt from the
+                                 // distance-budget cut; reserved from `room`). MAX_LOD+1 ⇒ OFF (identical behaviour).
     cam_world: vec3<f32>,         // ENTER-CAP: the camera world position (for the nearest-priority distance rank)
-    _pad2: u32,
+    frame: u32,                  // 4-S2/S3: current frame counter — age `last_used` for ray-guided keep + LRU
+    demand: u32,                 // 4-S2/S3: ray-guided keep + LRU master toggle (live editor lever; 0 = off)
+    backdrop_reach: u32,         // 4-S4: backdrop LODs reach clip_half*backdrop_reach (live editor lever)
+    ray_keep_frames: u32,        // 4-S2/S3: ray-keep window in frames (live editor lever)
+    _pad3: u32,
 }
+
+// 4-S1 — is `lod` part of the always-resident coarse backdrop? The backdrop is the coarsest LOD band the camera
+// keeps out to `clip_half` REGARDLESS of the nearest-`max_resident` budget cut, so distant terrain stays visible
+// (coarse, cheap) instead of ending at a hard budget radius. The fine LODs below it stay budgeted.
+fn is_backdrop(lod: u32) -> bool {
+    return lod >= params.backdrop_lod;
+}
+
+// 4-S1 — index of the backdrop-reserve counter in `enter_hist` (one slot past the `HIST_BUCKETS` distance bins;
+// the buffer is sized `HIST_BUCKETS + 1`). `enumerate_histogram` counts backdrop bricks here instead of binning
+// them by distance, and `enter_cap_compute` subtracts it from `room` so the backdrop's slots are reserved.
+const BACKDROP_RESERVE_SLOT: u32 = HIST_BUCKETS;
 
 // --- clipmap math (SSOT port of streaming.rs) ---
 
@@ -282,13 +299,22 @@ fn snap_odd(v: i32) -> i32 { return v | 1; }
 
 // Level `lod`'s INCLUSIVE resident AABB on grid `lod` (`level_box`, streaming.rs:168): a cube of half-extent
 // `half` around the camera's brick on that grid, snapped per axis to the 2×-coarser grid.
+// 4-S4 — the BACKDROP LODs reach `params.backdrop_reach×` farther than `clip_half` so the cheap coarse backdrop
+// extends WELL BEYOND the fine clipmap (see-far at a fixed fine budget). LIVE editor lever (must match the CPU
+// `residency_front_end::lod_clip_half` + the pager's desired_regions). `1` (or backdrop off) ⇒ no extension.
+// + the pager's. `1` (or backdrop off) ⇒ no extension.
+fn lod_half(lod: u32, half: i32) -> i32 {
+    return select(half, half * max(i32(params.backdrop_reach), 1), is_backdrop(lod));
+}
 fn level_box_lo(lod: u32, half: i32) -> vec3<i32> {
+    let h = lod_half(lod, half);
     let c = params.levels[lod].cam_brick_coord;
-    return vec3<i32>(snap_even(c.x - half), snap_even(c.y - half), snap_even(c.z - half));
+    return vec3<i32>(snap_even(c.x - h), snap_even(c.y - h), snap_even(c.z - h));
 }
 fn level_box_hi(lod: u32, half: i32) -> vec3<i32> {
+    let h = lod_half(lod, half);
     let c = params.levels[lod].cam_brick_coord;
-    return vec3<i32>(snap_odd(c.x + half), snap_odd(c.y + half), snap_odd(c.z + half));
+    return vec3<i32>(snap_odd(c.x + h), snap_odd(c.y + h), snap_odd(c.z + h));
 }
 
 // The INCLUSIVE hole AABB (on grid `lod`) that level `lod` cedes to the finer level `lod-1` (`level_hole`,
@@ -573,6 +599,25 @@ const PRESENT_WORDS: u32 = 4u;
 const HIST_BUCKETS: u32 = 4096u;
 @group(0) @binding(50) var<storage, read_write> enter_hist: array<atomic<u32>>;
 @group(0) @binding(51) var<storage, read_write> enter_cap: array<u32>; // [cut_bucket, room]
+// 4-S2/S3: the SCENE's per-slot last_used_frame (the GI trace atomicMaxes it on a hit; `try_enter` stamps it at
+// enter). A 1-element DUMMY when demand is off — `demand_on()` gates all reads/writes (zero behaviour change).
+@group(0) @binding(52) var<storage, read_write> last_used: array<atomic<u32>>;
+
+// 4-S2/S3 — is the ray-guided demand feature ON this frame? The LIVE editor toggle (`params.demand`), guarded by a
+// non-zero frame + a real (non-dummy) last_used buffer. Off ⇒ the residency uses the pure distance/budget cut.
+fn demand_on() -> bool {
+    return params.demand != 0u && params.frame != 0u && arrayLength(&last_used) > 1u;
+}
+
+// 4-S2/S3 — was `slot`'s brick ray-hit (or entered) within the last `params.ray_keep_frames`? Such a brick is KEPT
+// even beyond the distance/budget cut (ray-guided residency) and counts as recently-used for the LRU.
+fn ray_recently_used(slot: u32) -> bool {
+    if (!demand_on()) {
+        return false;
+    }
+    let lu = atomicLoad(&last_used[slot]);
+    return lu != 0u && (params.frame - lu) < params.ray_keep_frames;
+}
 
 // The world-distance of candidate `(coord,lod)`'s CENTRE to the camera (SSOT mirror of `brick_world_dist`).
 fn cand_world_dist(coord: vec3<i32>, lod: u32) -> f32 {
@@ -847,6 +892,10 @@ fn clear_per_frame_hashes(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (i < HIST_BUCKETS) {
         atomicStore(&enter_hist[i], 0u);
     }
+    // 4-S1: clear the backdrop-reserve counter (one slot past the distance bins).
+    if (i == 0u) {
+        atomicStore(&enter_hist[BACKDROP_RESERVE_SLOT], 0u);
+    }
 }
 
 // --- Pass C-tail — publish the change_count signal (G-c.4's non-blocking, 1-frame-late CPU mirror reads this). ---
@@ -888,7 +937,10 @@ fn enter_cap_compute() {
     // admits non-resident bricks below it (ENTER) and marks resident bricks beyond it for EVICTION
     // (`diff_drop_mark`). When desired <= max_resident the loop never exceeds room ⇒ cut = no-cut ⇒ enter all,
     // evict none (behaviour-identical to pre-Phase-4).
-    let room = diff_cfg.max_resident;
+    // 4-S1: reserve the backdrop bricks' slots — they're always kept (exempt from the cut), so the FINE budget is
+    // `max_resident` MINUS the backdrop count. OFF by default (reserve slot is 0 ⇒ room == max_resident).
+    let backdrop = atomicLoad(&enter_hist[BACKDROP_RESERVE_SLOT]);
+    let room = select(0u, diff_cfg.max_resident - backdrop, backdrop < diff_cfg.max_resident);
     var acc = 0u;
     var cut = HIST_BUCKETS; // default: no cut (all candidates fit)
     for (var b = 0u; b < HIST_BUCKETS; b = b + 1u) {
@@ -919,6 +971,9 @@ fn try_enter(coord: vec3<i32>, lod: u32) {
         return;
     }
     let slot = free_ring[head % cap];
+    // 4-S2/S3: stamp the freshly-entered brick as used THIS frame so the LRU doesn't evict it before the trace
+    // ever ray-hits it (a brick entered but not-yet-rendered would otherwise read last_used == 0 = stale).
+    if (demand_on()) { atomicStore(&last_used[slot], params.frame); }
     // Insert (coord,lod)->slot into the slot table (atomic linear-probe claim of an EMPTY slot).
     let size = diff_cfg.slot_table_size;
     let mask = size - 1u;
@@ -951,6 +1006,9 @@ fn try_enter(coord: vec3<i32>, lod: u32) {
 fn enter_admits(coord: vec3<i32>, lod: u32) -> bool {
     if (is_resident(coord, lod)) {
         return false;
+    }
+    if (is_backdrop(lod)) {
+        return true; // 4-S1: backdrop always admitted (exempt from the nearest-`room` cut)
     }
     return dist_bucket(cand_world_dist(coord, lod)) < enter_cap[0];
 }
@@ -986,6 +1044,13 @@ fn enumerate_histogram(
 ) {
     let b = surface_brick(wid, lidx);
     if (!b.valid) {
+        return;
+    }
+    // 4-S1: a BACKDROP brick is exempt from the distance cut (always kept). Count it in the reserve slot so
+    // `enter_cap_compute` subtracts it from `room`, instead of binning it by distance (where the far backdrop
+    // would fall beyond the cut). OFF by default (`backdrop_lod == MAX_LOD+1` ⇒ this never fires).
+    if (is_backdrop(b.lod)) {
+        atomicAdd(&enter_hist[BACKDROP_RESERVE_SLOT], 1u);
         return;
     }
     // BUDGET histogram (Phase 4): bin EVERY desired surface brick — resident AND non-resident — by distance. The
@@ -1047,6 +1112,14 @@ fn diff_drop_mark(@builtin(global_invocation_id) gid: vec3<u32>) {
     // brick still has an AIR neighbour beyond the +1 occupancy pad ⇒ stays `classify_surface` ⇒ kept, so this never
     // holes the loaded-region boundary. (`safe_to_drop` still gates the removal — keep-old-until-revealed.)
     if (present_contains(coord, lod) && classify_surface(coord, lod)) {
+        if (is_backdrop(lod)) {
+            return; // 4-S1: backdrop bricks are pinned — never evicted for distance (kept out to clip_half)
+        }
+        // 4-S2/S3: ray-guided KEEP — a brick the GI trace hit within the last RAY_KEEP_FRAMES survives the distance
+        // cut (residency follows where the rays actually look; not-recently-used bricks fall back to the cut = LRU).
+        if (ray_recently_used(atomicLoad(&slot_table[base + 4u]))) {
+            return; // keep — recently ray-used
+        }
         // Still a desired surface candidate. BUDGET EVICTION (Phase 4): if it is BEYOND the nearest-`max_resident`
         // cut radius, evict it to make room for nearer bricks (distance-priority, deterministic ⇒ converges; it
         // re-enters when the camera approaches). The clipmap shells are distance-ordered, so the kept set is the
