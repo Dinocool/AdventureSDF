@@ -3220,8 +3220,10 @@ const RESERVOIR_SIZE: u64 = 48;
 /// ping-pong buffer (GI 4.0 screen-space ReSTIR DI).
 const DI_RESERVOIR_SIZE: u64 = 16;
 
-/// Bytes per WGSL `PixelSurface` (2×vec4 = 32): world pos + valid flag, world normal + pad.
-const SURFACE_SIZE: u64 = 32;
+/// Bytes per WGSL `PixelSurface` (4×vec4 = 64): world pos + valid, world normal + pad, albedo + pad,
+/// emissive + pad. The deferred G-buffer: pass 1's primary trace stashes albedo/emissive so the shade pass
+/// reads them instead of re-tracing the primary ray (which was traced twice/frame). di_p1/spatial use pos/normal.
+const SURFACE_SIZE: u64 = 64;
 
 /// Mirror of the WGSL `RestirParams` (group 2 binding 2): reset + frame + viewport + the editor ReSTIR knobs.
 #[repr(C)]
@@ -6169,34 +6171,48 @@ fn voxel_rt_dlss_pass(
             cpass.set_bind_group(3, &wc_prepared.cache_bg, &[]);
             cpass.set_bind_group(4, &probe_bg, &[]); // screen-probe data (shade reads SH; probe trace writes it)
             if let Some(grid) = probe_dispatch {
+                cpass.push_debug_group("gi_probe_trace");
                 cpass.set_pipeline(&pipelines.probe_trace_dlss);
                 cpass.dispatch_workgroups(grid.x.div_ceil(8), grid.y.div_ceil(8), 1);
+                cpass.pop_debug_group();
             }
             #[cfg(feature = "editor")]
             if let Some(t) = gpu_timer.as_ref() {
                 t.begin(&mut cpass, 4);
             }
+            // Per-dispatch debug groups so Nsight GPU-Trace attributes occupancy + time to each kernel
+            // (p1 / di / spatial / p2) instead of one lumped `voxel_rt_restir_dlss` marker. Diagnostic only.
+            cpass.push_debug_group("gi_restir_p1");
             cpass.set_pipeline(&pipelines.restir_dlss_p1);
             cpass.dispatch_workgroups(groups.0, groups.1, groups.2);
-            cpass.set_pipeline(&pipelines.di_dlss_p1); // DI pass 1 (L1)
+            cpass.pop_debug_group();
+            cpass.push_debug_group("gi_di_p1"); // DI pass 1 (L1)
+            cpass.set_pipeline(&pipelines.di_dlss_p1);
             cpass.dispatch_workgroups(groups.0, groups.1, groups.2);
-            cpass.set_pipeline(&pipelines.restir_gi_spatial_dlss); // GI spatial (L3), always
+            cpass.pop_debug_group();
+            cpass.push_debug_group("gi_restir_spatial"); // GI spatial (L3), always
+            cpass.set_pipeline(&pipelines.restir_gi_spatial_dlss);
             cpass.dispatch_workgroups(groups.0, groups.1, groups.2);
+            cpass.pop_debug_group();
             #[cfg(feature = "editor")]
             if let Some(t) = gpu_timer.as_ref() {
                 t.end(&mut cpass, 4); // restir p1 + di p1 + spatial
                 t.begin(&mut cpass, 5); // restir p2 (shade + guides)
             }
+            cpass.push_debug_group("gi_restir_p2");
             cpass.set_pipeline(&pipelines.restir_dlss_p2);
             cpass.dispatch_workgroups(groups.0, groups.1, groups.2);
+            cpass.pop_debug_group();
             #[cfg(feature = "editor")]
             if let Some(t) = gpu_timer.as_ref() {
                 t.end(&mut cpass, 5); // restir p2
             }
             // Debug overlay (L2): trailing dispatch, overwrites out_tex + albedo, only when a debug view is active.
             if lighting.data.debug_view != 0 {
+                cpass.push_debug_group("gi_restir_debug");
                 cpass.set_pipeline(&pipelines.restir_dlss_debug);
                 cpass.dispatch_workgroups(groups.0, groups.1, groups.2);
+                cpass.pop_debug_group();
             }
         }
     }

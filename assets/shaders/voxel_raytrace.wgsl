@@ -1420,7 +1420,16 @@ struct RestirParams {
 // Per-pixel RECEIVER surface (world pos + face normal) — needed so a temporal/neighbour reservoir can be
 // merged with the correct Jacobian + rejected when it lands on a dissimilar surface (port of Solari's
 // gbuffer-resolve, but we store pos/normal directly instead of repacking depth).
-struct PixelSurface { world_position: vec3<f32>, valid: f32, world_normal: vec3<f32>, _pad: f32 };
+// Deferred G-buffer (was pos+normal only). The primary `trace()` in pass 1 now ALSO stashes the hit's albedo +
+// emissive here, so the shade pass (`restir_p2`/`restir_dlss_p2`) reads them instead of RE-TRACING the primary
+// ray — the primary was previously traced TWICE per frame (p1 to seed the receiver, p2 to refetch albedo/
+// emissive). 4×vec4 = 64 B (keep `SURFACE_SIZE` in raytrace.rs in sync). di_p1/spatial read only pos/normal.
+struct PixelSurface {
+    world_position: vec3<f32>, valid: f32,
+    world_normal: vec3<f32>, _pad0: f32,
+    albedo: vec3<f32>, _pad1: f32,
+    emissive: vec3<f32>, _pad2: f32,
+};
 // Two-pass split (Solari `initial_and_temporal` → `spatial_and_shade`): FIXED-ROLE reservoir buffers, NOT
 // ping-ponged. `reservoirs_a` = the FINAL/history pool (read by pass 1's temporal tap = last frame's final;
 // written by pass 2 = this frame's final). `reservoirs_b` = the intermediate POST-TEMPORAL pool (written by
@@ -2239,14 +2248,14 @@ fn restir_p1(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (gid.x >= vp.x || gid.y >= vp.y) { return; }
     let idx = gid.y * vp.x + gid.x;
     reservoirs_b[idx] = empty_reservoir(); // default for misses; overwritten for lit hits
-    surfaces_cur[idx] = PixelSurface(vec3<f32>(0.0), 0.0, vec3<f32>(0.0), 0.0); // invalid until a lit hit
+    surfaces_cur[idx] = PixelSurface(vec3<f32>(0.0), 0.0, vec3<f32>(0.0), 0.0, vec3<f32>(0.0), 0.0, vec3<f32>(0.0), 0.0); // invalid until a lit hit
     let ray = restir_primary_ray(gid);
     let r = trace(ray[0], ray[1], 0.0, camera.t_max);
     if (r.hit != 0u) {
         let p = ray[0] + ray[1] * r.t;
         // Receiver surface for THIS pixel — written on every hit (independent of probes/GI) so the DI + spatial
         // dispatches that follow can recover (n, p) from the buffer instead of re-tracing the primary ray.
-        surfaces_cur[idx] = PixelSurface(p, 1.0, r.normal, 0.0);
+        surfaces_cur[idx] = PixelSurface(p, 1.0, r.normal, 0.0, r.color.rgb, 0.0, r.emissive, 0.0);
         // Skip the per-pixel ReSTIR GI candidate gen when screen probes drive the diffuse — shade reads the probe
         // SH instead, so the reservoir work is pure waste. DI (di_p1) still runs (probes are diffuse-only).
         if (probe_params.enabled == 0u) {
@@ -2264,12 +2273,12 @@ fn restir_dlss_p1(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (gid.x >= vp.x || gid.y >= vp.y) { return; }
     let idx = gid.y * vp.x + gid.x;
     reservoirs_b[idx] = empty_reservoir();
-    surfaces_cur[idx] = PixelSurface(vec3<f32>(0.0), 0.0, vec3<f32>(0.0), 0.0);
+    surfaces_cur[idx] = PixelSurface(vec3<f32>(0.0), 0.0, vec3<f32>(0.0), 0.0, vec3<f32>(0.0), 0.0, vec3<f32>(0.0), 0.0);
     let ray = restir_primary_ray(gid); // un-jittered (jitter disabled) → stable per-pixel receiver
     let r = trace(ray[0], ray[1], 0.0, camera.t_max);
     if (r.hit != 0u) {
         let p = ray[0] + ray[1] * r.t;
-        surfaces_cur[idx] = PixelSurface(p, 1.0, r.normal, 0.0);
+        surfaces_cur[idx] = PixelSurface(p, 1.0, r.normal, 0.0, r.color.rgb, 0.0, r.emissive, 0.0);
         if (probe_params.enabled == 0u) {
             let seed = (gid.x * 1973u + gid.y * 9277u + light.frame_index * 26699u) | 1u;
             let temporal_base = reproject_pixel(p, dlss_cam.motion_prev, vp);
@@ -2341,19 +2350,19 @@ fn restir_gi_spatial(@builtin(global_invocation_id) gid: vec3<u32>) {
 @compute @workgroup_size(8, 8, 1)
 fn restir_p2(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (gid.x >= camera.viewport.x || gid.y >= camera.viewport.y) { return; }
-    let ray = restir_primary_ray(gid);
-    let ro = ray[0];
-    let rd = ray[1];
+    let idx = gid.y * camera.viewport.x + gid.x;
     let uv = (vec2<f32>(f32(gid.x), f32(gid.y)) + 0.5) / vec2<f32>(camera.viewport);
-    let r = trace(ro, rd, 0.0, camera.t_max);
+    // Deferred G-buffer: read the primary hit (pos/normal/albedo/emissive) written by `restir_p1` instead of
+    // RE-TRACING the primary ray. Same deterministic primary ray on both passes ⇒ identical hit, so this is
+    // bit-equivalent shading minus one full-screen primary trace per frame.
+    let surf = surfaces_cur[idx];
     var color: vec4<f32>;
-    if (r.hit != 0u) {
-        let p = ro + rd * r.t;
+    if (surf.valid > 0.5) {
         let seed = (gid.x * 1973u + gid.y * 9277u + light.frame_index * 26699u) | 1u;
-        let lit = shade_restir_p2(r.color.rgb, r.normal, p, r.emissive, gid.xy, seed);
+        let lit = shade_restir_p2(surf.albedo, surf.world_normal, surf.world_position, surf.emissive, gid.xy, seed);
         color = vec4<f32>(lit, 1.0);
     } else {
-        color = vec4<f32>(sky_radiance(rd), 1.0);
+        color = vec4<f32>(sky_radiance(restir_primary_ray(gid)[1]), 1.0);
     }
     let prev = textureSampleLevel(history_tex, history_sampler, uv, 0.0).rgb;
     let w = clamp(camera.accum_weight, 0.0, 1.0);
@@ -2396,24 +2405,27 @@ fn restir_dlss_p2(@builtin(global_invocation_id) gid: vec3<u32>) {
     // The GI final `reservoirs_a` is owned by `restir_gi_spatial` (cleared + filled there); DI `di_reservoirs_a`
     // is written by `di_p2_core` in shade. Neither is cleared here.
     let px = vec2<i32>(i32(gid.x), i32(gid.y));
-    let ray = restir_primary_ray(gid); // un-jittered (jitter disabled) — gbuffer/depth/albedo + lighting receiver
-    let ro = ray[0];
-    let rd = ray[1];
-    let r = trace(ro, rd, 0.0, camera.t_max);
-    if (r.hit != 0u) {
-        let p = ro + rd * r.t;
+    let idx = gid.y * camera.viewport.x + gid.x;
+    // Deferred G-buffer: read the primary hit (pos/normal/albedo/emissive) written by `restir_dlss_p1` instead of
+    // RE-TRACING the primary ray. Both passes use the SAME deterministic un-jittered ray ⇒ identical hit, so the
+    // shade + DLSS guides are bit-equivalent, minus one full-screen primary trace per frame.
+    let surf = surfaces_cur[idx];
+    if (surf.valid > 0.5) {
+        let p = surf.world_position;
+        let n = surf.world_normal;
+        let albedo = surf.albedo;
         let seed = (gid.x * 1973u + gid.y * 9277u + light.frame_index * 26699u) | 1u;
         // Un-jittered primary hit = a stable per-pixel point → all lighting (direct + GI + DI) is jitter-free.
-        let lit = shade_restir_p2(r.color.rgb, r.normal, p, r.emissive, gid.xy, seed);
+        let lit = shade_restir_p2(albedo, n, p, surf.emissive, gid.xy, seed);
         textureStore(out_tex, px, vec4<f32>(lit, 1.0));
-        textureStore(out_diffuse_albedo, px, vec4<f32>(r.color.rgb, 1.0));
+        textureStore(out_diffuse_albedo, px, vec4<f32>(albedo, 1.0));
         // Specular albedo = 0: this renderer shades DIFFUSE-only (sun direct + ReSTIR GI + DI + emissive, no
         // specular lobe — see `shade_restir_p2`). The old constant 0.04 told DLSS-RR a dielectric specular lobe
         // existed and made it demodulate the noisy color by (diffuse + 0.04) instead of diffuse alone — a large
         // error on DARK surfaces (albedo 0.04 ⇒ divide by 0.08 ⇒ half the lighting attributed), so RR denoised
         // an inconsistent signal. 0 makes the guide match the actual diffuse-only color: color/albedo = lighting.
         textureStore(out_specular_albedo, px, vec4<f32>(vec3<f32>(0.0), 1.0));
-        textureStore(out_normal_roughness, px, vec4<f32>(r.normal, 1.0)); // roughness 1.0 (.w): fully diffuse
+        textureStore(out_normal_roughness, px, vec4<f32>(n, 1.0)); // roughness 1.0 (.w): fully diffuse
         // Depth + motion are both UN-jittered (this renderer disables camera jitter): motion `(cur−prev)·(0.5,−0.5)`
         // ⇒ exactly zero for a static camera; depth is the reverse-Z `z/w` of the same un-jittered hit.
         let depth_clip = dlss_cam.depth_clip_from_world * vec4<f32>(p, 1.0);
@@ -2425,7 +2437,7 @@ fn restir_dlss_p2(@builtin(global_invocation_id) gid: vec3<u32>) {
         let motion = (cur_ndc - prev_ndc) * vec2<f32>(0.5, -0.5);
         textureStore(out_dlss_motion, px, vec4<f32>(motion, 0.0, 0.0));
     } else {
-        textureStore(out_tex, px, vec4<f32>(sky_radiance(rd), 1.0));
+        textureStore(out_tex, px, vec4<f32>(sky_radiance(restir_primary_ray(gid)[1]), 1.0));
         textureStore(out_diffuse_albedo, px, vec4<f32>(1.0, 1.0, 1.0, 1.0));
         textureStore(out_specular_albedo, px, vec4<f32>(vec3<f32>(0.0), 1.0));
         textureStore(out_normal_roughness, px, vec4<f32>(0.0, 0.0, 0.0, 1.0));
